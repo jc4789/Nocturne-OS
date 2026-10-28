@@ -10,14 +10,15 @@ interpolation-testcommon.js の normalizeValue（数は小数 2 桁、字句の�
 その文字の計算値と比べる。--group gaps では WPT の css-gaps（parsing・animation）の頁を同じ道具で照らす
 （頁の #target の font-size と color を要素に与える）。--group backgrounds では css-backgrounds の背景の層と
 border-image の頁（parsing・animations）、compositing の background-blend-mode、css-masking の mask-border の
-動きの頁を照らす。
+動きの頁を照らす。--group masking では css-masking の mask の層の性質・mask の一括・mask-type・clip・clip-rule の
+parsing と動きの頁を照らす。
 
 guest の WPT の代わりではない。CSSOM の宣言の塊・cascade・var()・時間の模型（animation.c）・
 配置と描画は通らない。数えないもの：test_shorthand_value（CSSOM が shorthand の longhand の
 文字を持つかどうかは宣言の塊の仕事）、補間の端が neutral・CSS 全体の語（cascade の仕事）。
 補間は CSS animation の流儀（離散は 0.5 で入れ替わる）だけを試す。
 
-  python -X utf8 tests/check_css_shapes_native.py [--group shapes|gaps|anchor|lists|backgrounds] [--verbose] [--file 名前の一部] [--out 出力の場所]
+  python -X utf8 tests/check_css_shapes_native.py [--group shapes|gaps|anchor|lists|backgrounds|masking] [--verbose] [--file 名前の一部] [--out 出力の場所]
 """
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -62,8 +63,15 @@ elif group == "backgrounds":
              sorted((wpt / "compositing/parsing").glob("background-blend-mode-*.html")) +
              sorted(p for p in (background / "animations").glob("*.html") if re.match(r"(background-position|border-image)", p.name)) +
              sorted((wpt / "css-masking/animations").glob("mask-border-*.html")))
+elif group == "masking":
+    # CSS Masking 1 の mask の層の性質（mask-image・-mode・-repeat・-position・-clip・-origin・-size・
+    # -composite と mask の一括）、mask-type、clip、clip-rule。clip-path は shapes、mask-border は backgrounds の群
+    masking = wpt / "css-masking"
+    pages = (sorted(p for p in (masking / "parsing").glob("*.html") if re.match(r"(mask-|clip-(computed|valid|invalid|rule))", p.name)) +
+             sorted(p for p in (masking / "animations").glob("*.html") if re.match(r"(mask-(image|no|position)|clip-(interpolation|composition))", p.name)) +
+             [masking / "clip-rule/clip-rule-no-interpolation.html"])
 else:
-    sys.exit(f"群は shapes・gaps・anchor・lists・backgrounds のどれか：{group}")
+    sys.exit(f"群は shapes・gaps・anchor・lists・backgrounds・masking のどれか：{group}")
 out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else root / f"build/check-css-{group}"
 out.mkdir(parents=True, exist_ok=True)
 # the repository's tools (a worktree has them in the main checkout above it)

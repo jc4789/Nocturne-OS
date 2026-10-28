@@ -78,11 +78,12 @@ static int damage_main(void){
     check(damage&&x<=47&&y<=37&&x+w>=173&&y+h>=103,"atomic damage includes shifted spread and Gaussian halo rather than only old two-pixel padding");
     web_free(doc);printf("boxshadow-damage: %d checks, %d failures\n",checks,failed);return failed!=0;
 }
-struct image_association_state {uint64_t red,blue;};
+/* red.svg is two requests: the background's (no CORS) and the mask's (CORS, css-masking-1 §11) */
+struct image_association_state {uint64_t red[4],blue;unsigned reds;};
 static bool association_request(void *opaque,const struct web_request *request){
     if(request->kind!=WEB_RESOURCE_IMAGE)return false;
     struct image_association_state *state=opaque;
-    if(strstr(request->url,"/red.svg"))state->red=request->id;
+    if(strstr(request->url,"/red.svg")){if(state->reds<4)state->red[state->reds++]=request->id;}
     else if(strstr(request->url,"/blue.svg"))state->blue=request->id;
     else return false;return true;
 }
@@ -101,16 +102,17 @@ static int association_main(void){
     node_t *owner=query(doc,"#owner"),*with=query(doc,"#with"),*plain=query(doc,"#plain"),*masked=query(doc,"#mask-child");
     check(owner&&with&&plain&&masked&&!doc->parser,"normal parser supplies actual hover targets");
     if(!owner||!with||!plain||!masked){web_free(doc);return 1;}
-    check(state.red&&state.blue,"native CSS images acquire both actual request claims");
-    association_supply(doc,state.red,"red");association_supply(doc,state.blue,"blue");
+    check(state.reds&&state.blue,"native CSS images acquire both actual request claims");
+    for(unsigned i=0;i<state.reds;i++)association_supply(doc,state.red[i],"red");
+    association_supply(doc,state.blue,"blue");
     for(int i=0;i<8;i++)web_tick(doc,uptime_ms());web_layout(doc,256,160);paint(doc,0);
     check(pixel(25,25)==0x0000ff&&pixel(65,25)==0x008000&&pixel(145,25)==0x0000ff,"initial decoded background/mask scene");
     doc_hover_update(doc,with);web_layout(doc,256,160);paint(doc,0);
     check(with->style->bg_img!=owner->style->bg_img&&pixel(25,25)==0x0000ff,"partial hover restyle does not substitute parent's decoded background handle");
     doc_hover_update(doc,plain);web_layout(doc,256,160);paint(doc,0);
-    check(!plain->style->bg_img&&!plain->style->mask_img&&pixel(65,25)==0x008000,"plain child cannot paint parent's URL after hover");
+    check(!plain->style->bg_img&&!css_mask_layers_set(css_style_mask(plain->style))&&pixel(65,25)==0x008000,"plain child cannot paint parent's URL after hover");
     doc_hover_update(doc,masked);web_layout(doc,256,160);paint(doc,0);
-    check(!masked->style->mask_img&&pixel(145,25)==0x0000ff,"non-inherited mask cannot replace child's background after hover");
+    check(!css_mask_layers_set(css_style_mask(masked->style))&&pixel(145,25)==0x0000ff,"non-inherited mask cannot replace child's background after hover");
     paint(doc,5);paint(doc,0);check(pixel(25,25)==0x0000ff&&pixel(145,25)==0x0000ff,"scroll away and return preserves current image associations");
     web_free(doc);printf("image-association-native: %d checks, %d failures\n",checks,failed);return failed!=0;
 }

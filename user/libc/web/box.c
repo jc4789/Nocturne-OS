@@ -25,7 +25,7 @@ static box_t *nbox(struct bctx *b, int kind, node_t *n, style_t *st) {
     x->st = st;
     x->paint_alpha = kind != B_TEXT && kind != B_BR && st && (st->opacity * (st->filter ? st->filter->opacity : 1) < 1 ||
         (kind != B_INLINE && (css_transform_general(st) || css_style_mask_border(st)->source.url ||
-                              css_style_mask_border(st)->source.gradient)));
+                              css_style_mask_border(st)->source.gradient || css_mask_layers_set(css_style_mask(st)))));
     x->baseline = -1;
     x->colspan = x->rowspan = 1;
     x->epoch = b->epoch;
@@ -239,7 +239,7 @@ void box_counter_text(box_t *t, const char *s, size_t n) {
 }
 void box_counter_marker(web_doc *d, box_t *x, const char *s, size_t n, uint8_t shape) {
     const struct css_image *image = css_style_list(x->st)->image;
-    if (image && image->kind == CSS_IMAGE_URL && !image->img) doc_css_image(d, image);
+    if (image && image->kind == CSS_IMAGE_URL && !image->img) doc_css_image(d, image, WEB_IMAGE_NO_CORS);
     if (x->marker && x->marker_shape == shape && strlen(x->marker) == n && !memcmp(x->marker, s, n)) return;
     arena_t next = {.chunk_size = 64};
     jmp_buf trap;
@@ -607,16 +607,25 @@ struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color) {
     return c;
 }
 
-bool doc_svg_clip_markup(node_t *n, const char *ref, const float box[4], sbuf *out) {
+/* a url() that names an element of the document itself: a fragment alone, or the document's own
+   URL with a fragment */
+bool doc_url_local(const web_doc *d, const char *ref) {
+    const char *fragment = ref ? strchr(ref, '#') : NULL;
+    if (!d || !fragment) return false;
+    if (fragment == ref) return true;
+    size_t prefix = (size_t)(fragment - ref), own = d->url ? strcspn(d->url, "#") : 0;
+    return d->url && prefix == own && !memcmp(ref, d->url, prefix);
+}
+/* the element such a url() names in n's tree (its fragment an ID), or NULL */
+node_t *doc_svg_reference(node_t *n, const char *ref) {
     web_doc *d = n ? n->owner : NULL;
     const char *fragment = ref ? strchr(ref, '#') : NULL;
-    if (!d || !fragment || !fragment[1]) return false;
-    if (fragment != ref) { /* this document's own URL with a fragment names one of its elements */
-        size_t prefix = (size_t)(fragment - ref), own = d->url ? strcspn(d->url, "#") : 0;
-        if (!d->url || prefix != own || memcmp(ref, d->url, prefix)) return false;
-    }
+    if (!fragment || !fragment[1] || !doc_url_local(d, ref)) return NULL;
     node_t *scope = doc_node_root(n, false);
-    node_t *clip = scope ? find_id(scope, fragment + 1) : NULL;
+    return scope ? find_id(scope, fragment + 1) : NULL;
+}
+bool doc_svg_clip_markup(node_t *n, const char *ref, const float box[4], sbuf *out) {
+    node_t *clip = doc_svg_reference(n, ref);
     if (!clip || !clip->foreign || strcmp(clip->name, "clippath")) return false;
     const char *units = node_attr(clip, "clipPathUnits");
     bool bbox = units && !strcmp(units, "objectBoundingBox");
@@ -644,10 +653,12 @@ bool doc_svg_clip_markup(node_t *n, const char *ref, const float box[4], sbuf *o
         }
         const char *transform = svg_css_transform(c, css_transform) ? css_transform : node_attr(c, "transform");
         if (transform) { sb_puts(out, " transform=\""); xml_escape(out, transform, strlen(transform), true); sb_putc(out, '"'); }
+        /* clip-rule (css-masking-1 §5.2): the shape's computed value (inherited, its attribute a
+           presentation hint); a shape without a style its attribute, else the clipPath's */
         const char *rule = node_attr(c, "clip-rule");
         if (!rule) rule = clip_rule;
-        sb_puts(out, rule && !strcmp(rule, "evenodd") ? " fill=\"#000\" stroke=\"none\" fill-rule=\"evenodd\"/>" :
-                                                        " fill=\"#000\" stroke=\"none\"/>");
+        bool evenodd = c->style ? c->style->svg_clip_rule == 1 : rule && !strcmp(rule, "evenodd");
+        sb_puts(out, evenodd ? " fill=\"#000\" stroke=\"none\" fill-rule=\"evenodd\"/>" : " fill=\"#000\" stroke=\"none\"/>");
     }
     sb_puts(out, "</g></svg>");
     return true;
@@ -797,7 +808,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
     is->filter = NULL; is->opacity = 1; /* the element's outer group composites once, and clips once */
     is->clip_path = NULL; memset(&is->clip, 0, sizeof is->clip);
     is->transform=is->rotate=is->scale=NULL;memset(&is->translate,0,sizeof is->translate);is->offset=NULL;
-    is->mask_border = NULL; is->mask_border_img = 0; /* masked with the outer group */
+    is->mask_border = NULL; is->mask_border_img = 0; is->mask = NULL; /* masked with the outer group */
     is->display = inner_kind == B_TABLE ? D_TABLE : inner_kind == B_GRID ? D_GRID : D_FLEX;
     for (int i = 0; i < 4; i++) {
         is->margin[i].kind = LK_LEN;
@@ -1605,7 +1616,7 @@ static bool restyle_derived(box_t *b, style_t *old) {
         next.display=b->kind == B_TABLE ? D_TABLE : b->kind == B_GRID ? D_GRID : D_FLEX;
         next.filter=NULL; next.opacity=1; next.clip_path=NULL; memset(&next.clip,0,sizeof next.clip);
         next.transform=next.rotate=next.scale=NULL;memset(&next.translate,0,sizeof next.translate);next.offset=NULL;
-        next.mask_border=NULL; next.mask_border_img=0;
+        next.mask_border=NULL; next.mask_border_img=0; next.mask=NULL;
         for (int i=0;i<4;i++) {
             next.margin[i].kind=LK_LEN; next.margin[i].px=next.margin[i].pct=0;
         }
@@ -1656,7 +1667,8 @@ static void restyle_boxes(box_t *b,bool inherited_borrow) {
     }
     b->paint_alpha = b->kind != B_TEXT && b->kind != B_BR && b->st &&
         (b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1) < 1 || box_transformed(b) ||
-         (b->kind != B_INLINE && (css_style_mask_border(b->st)->source.url || css_style_mask_border(b->st)->source.gradient)));
+         (b->kind != B_INLINE && (css_style_mask_border(b->st)->source.url || css_style_mask_border(b->st)->source.gradient ||
+                                  css_mask_layers_set(css_style_mask(b->st)))));
     for (box_t *c = b->first; c; c = c->next) { restyle_boxes(c,inherited_borrow||own_borrow); b->paint_alpha |= c->paint_alpha; }
     b->style_sync_dirty=b->style_sync_subtree=false;
 }

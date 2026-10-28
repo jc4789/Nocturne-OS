@@ -132,7 +132,8 @@ static bool mask_border_set(const style_t *st) {
 }
 static bool stacking_context(const box_t *b) {
     if (!b->st || b->kind == B_TEXT || b->kind == B_BR) return false;
-    if (b->st->filter || b->st->opacity < 1 || mask_border_set(b->st) ||
+    /* a mask (§7.1 a mask-image layer other than none, §8.1) makes one */
+    if (b->st->filter || b->st->opacity < 1 || mask_border_set(b->st) || css_mask_layers_set(css_style_mask(b->st)) ||
         (b->kind!=B_INLINE&&css_translation_active(b->st))) return true;
     if (b->kind == B_INLINE) return false;
     /* Opacity groups are atomic even in normal flow. Fixed/sticky boxes also
@@ -1007,67 +1008,6 @@ static float used_radius(const style_t *st, float w, float h) {
     return r;
 }
 
-/* draw img at (x, y) as a mask: col with the image's alpha */
-static void mask_draw(canvas_t *c, const image_t *img, int x, int y, uint32_t col) {
-    int x0 = x > c->cx0 ? x : c->cx0, y0 = y > c->cy0 ? y : c->cy0;
-    int x1 = x + img->w < c->cx1 ? x + img->w : c->cx1, y1 = y + img->h < c->cy1 ? y + img->h : c->cy1;
-    uint32_t ca = col >> 24, rgb = col & 0xFFFFFFu;
-    for (int py = y0; py < y1; py++)
-        for (int px = x0; px < x1; px++) {
-            uint32_t a = (img->px[(size_t)(py - y) * img->w + (px - x)] >> 24) * ca / 255;
-            if (a) gfx_blend_pixel(c, px, py, a << 24 | rgb);
-        }
-}
-
-static void draw_tiles(canvas_t *c, const image_t *img, float px, float py, int TW, int TH, bool rx, bool ry, uint32_t col);
-/* mask-image tinted with col over the padding box, clipped to the border box */
-static void paint_layer(struct pctx *P, int img_idx, uint8_t size_kind, const len_t *size, const len_t *pos,
-                        uint8_t repeat, uint32_t col, float x, float y, float w, float h, const float *bw) {
-    web_doc *d = P->d;
-    int idx = img_idx - 1;
-    if (idx < 0 || idx >= d->images.n) return;
-    struct web_image *im = d->images.v[idx];
-    if (!im->img || im->img->w < 1 || im->img->h < 1) return;
-    float iw = (float)im->img->w, ih = (float)im->img->h;
-    float ax = x + bw[3], ay = y + bw[0], aw = w - bw[1] - bw[3], ah = h - bw[0] - bw[2];
-    if (aw <= 0 || ah <= 0) return;
-    float tw = iw, th = ih;
-    switch (size_kind) {
-    case BSZ_COVER: case BSZ_CONTAIN: {
-        float sx = aw / iw, sy = ah / ih;
-        float s = size_kind == BSZ_COVER ? fmaxf(sx, sy) : fminf(sx, sy);
-        tw = iw * s;
-        th = ih * s;
-        break;
-    }
-    case BSZ_LEN: {
-        bool wa = len_auto(&size[0]), ha = len_auto(&size[1]);
-        if (!wa) tw = len_resolve(&size[0], aw);
-        if (!ha) th = len_resolve(&size[1], ah);
-        if (wa && !ha) tw = th * iw / ih;
-        else if (ha && !wa) th = tw * ih / iw;
-        break;
-    }
-    }
-    int TW = (int)roundf(tw), TH = (int)roundf(th);
-    if (TW < 1 || TH < 1) return;
-    float px = ax + len_resolve(&pos[0], aw - (float)TW), py = ay + len_resolve(&pos[1], ah - (float)TH);
-    canvas_t *c = P->c;
-    int X0 = (int)roundf(x), Y0 = (int)roundf(y);
-    int X1 = (int)roundf(x + w), Y1 = (int)roundf(y + h);
-    if (X0 >= c->cx1 || Y0 >= c->cy1 || X1 <= c->cx0 || Y1 <= c->cy0) return;
-    image_t *img = scaled_image(im, TW, TH, c, X0, Y0, X1-X0, Y1-Y0);
-    if (!img) return;
-    paint_drew(P, !col);
-    int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
-    /* rounded edges, so a box at a fractional position shows no sliver of a neighbouring tile */
-    gfx_clip(c, X0, Y0, (int)roundf(x + w) - X0, (int)roundf(y + h) - Y0);
-    bool rx = repeat == BR_REPEAT || repeat == BR_REPEAT_X;
-    bool ry = repeat == BR_REPEAT || repeat == BR_REPEAT_Y;
-    draw_tiles(c, img, px, py, TW, TH, rx, ry, col);
-    c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
-}
-
 /* ---------------------------------------------------------------- gradients */
 #define NOPOS (-1e30f)
 struct gstops {
@@ -1632,7 +1572,7 @@ static void bg_tile_size(uint8_t kind, const len_t *size, float iw, float ih, fl
     }
 }
 /* image's tiles over the clip, the first at px, py */
-static void draw_tiles(canvas_t *c, const image_t *img, float px, float py, int TW, int TH, bool rx, bool ry, uint32_t col) {
+static void draw_tiles(canvas_t *c, const image_t *img, float px, float py, int TW, int TH, bool rx, bool ry) {
     int x0 = (int)roundf(px), y0 = (int)roundf(py);
     int x1 = x0 + TW, y1 = y0 + TH;
     if (rx) {
@@ -1647,10 +1587,7 @@ static void draw_tiles(canvas_t *c, const image_t *img, float px, float py, int 
     if (ry && y0 + TH <= c->cy0) y0 += (c->cy0 - y0) / TH * TH;
     if (rx && x0 + TW <= c->cx0) x0 += (c->cx0 - x0) / TW * TW;
     for (int ty = y0; ty < y1 && ty < c->cy1; ty += TH)
-        for (int tx = x0; tx < x1 && tx < c->cx1; tx += TW) {
-            if (col) mask_draw(c, img, tx, ty, col);
-            else image_draw(c, img, tx, ty);
-        }
+        for (int tx = x0; tx < x1 && tx < c->cx1; tx += TW) image_draw(c, img, tx, ty);
 }
 /* g drawn over an image of its own, w by h, straight alpha as decoded images are */
 static image_t *gradient_image(const struct gradient *g, uint32_t cur, int w, int h) {
@@ -1681,7 +1618,7 @@ static void gradient_tiles(struct pctx *P, const struct gradient *g, uint32_t cu
         if ((int64_t)TW * TH <= (1 << 20)) {
             image_t *img = gradient_image(g, cur, TW, TH);
             if (!img) { P->failed = true; return; }
-            draw_tiles(c, img, px, py, TW, TH, rx, ry, 0);
+            draw_tiles(c, img, px, py, TW, TH, rx, ry);
             image_free(img);
             return;
         }
@@ -1760,7 +1697,7 @@ static void paint_bg_image(struct bg_paint *G) {
         tw = (float)TW;
         th = (float)TH;
     } else if (!(tw > 0) || !(th > 0) || !isfinite(tw) || !isfinite(th)) return;
-    float px = A[0] + css_bg_offset_px(bg, 0, layer, A[2] - tw), py = A[1] + css_bg_offset_px(bg, 1, layer, A[3] - th);
+    float px = A[0] + css_bg_offset_px(&bg->position[0], layer, A[2] - tw), py = A[1] + css_bg_offset_px(&bg->position[1], layer, A[3] - th);
     bool rx = st->bg_repeat == BR_REPEAT || st->bg_repeat == BR_REPEAT_X;
     bool ry = st->bg_repeat == BR_REPEAT || st->bg_repeat == BR_REPEAT_Y;
     int mode = css_bg_keyword(bg, CSS_BG_BLEND, layer);
@@ -1771,7 +1708,7 @@ static void paint_bg_image(struct bg_paint *G) {
             image_t *img = scaled_image(im, TW, TH, c, c->cx0, c->cy0, c->cx1 - c->cx0, c->cy1 - c->cy0);
             if (img) {
                 paint_drew(P, true);
-                if (mode == CSS_BLEND_NORMAL) draw_tiles(c, img, px, py, TW, TH, rx, ry, 0);
+                if (mode == CSS_BLEND_NORMAL) draw_tiles(c, img, px, py, TW, TH, rx, ry);
                 else blend_tiles(G, img, NULL, roundf(px), roundf(py), tw, th, rx, ry, mode);
             }
         } else if (mode == CSS_BLEND_NORMAL) {
@@ -1982,13 +1919,18 @@ static bool paint_border_image(struct pctx *P, const style_t *st, float x, float
 }
 /* mask-border (css-masking-1 §8): a mask over the pixels (x, y, w, h); the middle part is opaque
    white unless fill draws it, the rest of the area and beyond it masks out */
+/* a mask pixel's value (§7.2, §8.2): its alpha, or with luminance its luminance (by Compositing's
+   coefficients) times its alpha */
+static unsigned mask_value(uint32_t col, bool luminance) {
+    unsigned a = col >> 24;
+    if (luminance)
+        a = a * (unsigned)(.2125f * (float)((col >> 16) & 255) + .7154f * (float)((col >> 8) & 255) + .0721f * (float)(col & 255) + .5f) / 255;
+    return a;
+}
 struct nine_mask { uint8_t *alpha; int x, y, w; uint8_t mode; };
 static void nine_put_mask(void *context, int x, int y, uint32_t col) {
     struct nine_mask *m = context;
-    unsigned a = col >> 24;
-    if (m->mode == CSS_MASK_BORDER_LUMINANCE) /* §8.2: the luminance, by Compositing's coefficients */
-        a = a * (unsigned)(.2125f * (float)((col >> 16) & 255) + .7154f * (float)((col >> 8) & 255) + .0721f * (float)(col & 255) + .5f) / 255;
-    m->alpha[(size_t)(y - m->y) * (size_t)m->w + (size_t)(x - m->x)] = (uint8_t)a;
+    m->alpha[(size_t)(y - m->y) * (size_t)m->w + (size_t)(x - m->x)] = (uint8_t)mask_value(col, m->mode == CSS_MASK_BORDER_LUMINANCE);
 }
 static uint8_t *mask_border_alpha(struct pctx *P, const struct nine_slice *N, int x, int y, int w, int h) {
     uint8_t *alpha = calloc((size_t)w, (size_t)h);
@@ -2002,6 +1944,175 @@ static uint8_t *mask_border_alpha(struct pctx *P, const struct nine_slice *N, in
     struct nine_mask m = {alpha, x, y, w, N->mode};
     if (!nine_slice_draw(P->d, N, x, y, x + w, y + h, nine_put_mask, &m)) { P->failed = true; free(alpha); return NULL; }
     return alpha;
+}
+
+/* ---------------------------------------------------------------- mask layers
+   css-masking-1 §7: each layer's image sized, positioned and repeated over its mask-origin box as a
+   background layer is (css-backgrounds-3 §3.4-§3.9), cut to its mask-clip box, its alpha or
+   luminance the layer's mask; the layers composited from the bottom one up by mask-composite. */
+/* what the layers do to a box: nothing (every layer none), mask it; or wait for an image still
+   loading (the box is not painted until it comes, as browsers do); or a layer that is not drawn
+   yet (a mask element, a conic gradient), which leaves the box unmasked */
+enum { MASK_NONE, MASK_READY, MASK_PENDING, MASK_UNDRAWN };
+/* layer i's image: drawn (*im an image, else *g a gradient), or false a transparent black layer
+   (none, an image that failed, a reference to no mask element: §7.1) */
+static bool mask_layer_source(web_doc *d, const box_t *b, const struct css_image *image, struct web_image **im,
+                              const struct gradient **g, int *state) {
+    *im = NULL;
+    *g = NULL;
+    if (!image) return false;
+    if (image->kind != CSS_IMAGE_URL) {
+        if (image->gradient) { *g = image->gradient; return true; }
+        *state = MASK_UNDRAWN; /* a conic gradient, which no painter draws yet */
+        return false;
+    }
+    if (doc_url_local(d, image->url)) {
+        node_t *n = b->node ? doc_svg_reference(b->node, image->url) : NULL;
+        if (n && n->foreign && !strcmp(n->name, "mask")) *state = MASK_UNDRAWN;
+        return false;
+    }
+    if (!image->img) { *state = MASK_UNDRAWN; return false; } /* a style no image was found for */
+    int idx = image->img - 1;
+    if (idx < 0 || idx >= d->images.n) return false;
+    struct web_image *w = d->images.v[idx];
+    if (w->img && w->img->w > 0 && w->img->h > 0) { *im = w; return true; }
+    if (!w->done && !w->failed && *state != MASK_UNDRAWN) *state = MASK_PENDING;
+    return false;
+}
+static int mask_layers_state(web_doc *d, const box_t *b) {
+    const struct css_mask *m = css_style_mask(b->st);
+    if (!css_mask_layers_set(m)) return MASK_NONE;
+    int state = MASK_READY;
+    for (uint32_t i = 0; i < m->image.n && state != MASK_UNDRAWN; i++) {
+        struct web_image *im;
+        const struct gradient *g;
+        mask_layer_source(d, b, m->image.v[i], &im, &g, &state);
+    }
+    return state;
+}
+/* a <coord-box> of an element with a CSS box: fill-box is its content box, stroke-box and view-box
+   its border box (§7.5) */
+static uint8_t mask_box(uint8_t box) {
+    return box == CSS_BOX_FILL ? CSS_BOX_CONTENT : box > CSS_BOX_CONTENT ? CSS_BOX_BORDER : box;
+}
+/* one axis of an image layer's <repeat-style> (css-backgrounds-3 §3.4), the tile t already rounded
+   for round (§3.9): the first tile's start (*first: the position's, unless space moves it) and the
+   period of the tiles (0: one tile) over the positioning area (start, size). The mask layers use it;
+   background-repeat's space and round are not drawn yet (paint_bg_image repeats them). */
+static void layer_repeat_axis(uint8_t repeat, float start, float size, float t, float *first, float *period) {
+    *period = repeat == CSS_REPEAT || repeat == CSS_REPEAT_ROUND ? t : 0;
+    if (repeat != CSS_REPEAT_SPACE) return;
+    /* space: as many tiles as fit, the first and last touching the edges; one fits: placed by the
+       position */
+    float n = floorf(size / t + 1e-4f);
+    if (n < 2) return;
+    *first = start;
+    *period = t + (size - n * t) / (n - 1);
+}
+/* layer i's mask over the pixels (x, y, w, h) into out (zeroed), the boxes rect (border, padding,
+   content) on the canvas; false when cancelled */
+static bool mask_layer_draw(struct pctx *P, const box_t *b, const struct css_mask *m, uint32_t i, const float rect[3][4],
+                            int x, int y, int w, int h, uint8_t *out) {
+    struct web_image *im;
+    const struct gradient *g;
+    int state = MASK_READY;
+    if (!mask_layer_source(P->d, b, m->image.v[i], &im, &g, &state)) return true;
+    const float *A = rect[mask_box(css_mask_keyword(m, CSS_MASK_ORIGIN, i))];
+    if (!(A[2] > 0) || !(A[3] > 0)) return true;
+    const struct css_layer_size *z = &m->size.v[i % m->size.n];
+    float iw = im ? (float)im->img->w : 0, ih = im ? (float)im->img->h : 0, tw, th;
+    bg_tile_size(z->kind, z->v, iw, ih, A[2], A[3], &tw, &th);
+    uint8_t repeat = css_mask_keyword(m, CSS_MASK_REPEAT, i), rx = repeat >> 2 & 3, ry = repeat & 3;
+    /* round (§3.9): a whole number of tiles; the other axis keeps the ratio when its size is auto */
+    bool auto_w = z->kind == BSZ_AUTO || (z->kind == BSZ_LEN && len_auto(&z->v[0]));
+    bool auto_h = z->kind == BSZ_AUTO || (z->kind == BSZ_LEN && len_auto(&z->v[1]));
+    float tw0 = tw, th0 = th;
+    if (rx == CSS_REPEAT_ROUND && tw > 0) tw = A[2] / fmaxf(1, roundf(A[2] / tw));
+    if (ry == CSS_REPEAT_ROUND && th > 0) th = A[3] / fmaxf(1, roundf(A[3] / th));
+    if (rx == CSS_REPEAT_ROUND && ry != CSS_REPEAT_ROUND && auto_h && tw0 > 0) th = th0 * tw / tw0;
+    if (ry == CSS_REPEAT_ROUND && rx != CSS_REPEAT_ROUND && auto_w && th0 > 0) tw = tw0 * th / th0;
+    if (!(tw > 0) || !(th > 0) || !isfinite(tw) || !isfinite(th)) return true;
+    float px = A[0] + css_bg_offset_px(&m->position[0], i, A[2] - tw), py = A[1] + css_bg_offset_px(&m->position[1], i, A[3] - th);
+    float period_x, period_y;
+    layer_repeat_axis(rx, A[0], A[2], tw, &px, &period_x);
+    layer_repeat_axis(ry, A[1], A[3], th, &py, &period_y);
+    /* the clip: its box's pixels (rounded edges, as a background layer's), or with no-clip all */
+    int X0 = x, Y0 = y, X1 = x + w, Y1 = y + h;
+    uint8_t clip = css_mask_keyword(m, CSS_MASK_CLIP, i);
+    if (clip != CSS_MASK_NO_CLIP) {
+        const float *C = rect[mask_box(clip)];
+        X0 = (int)fmaxf((float)X0, roundf(C[0])); Y0 = (int)fmaxf((float)Y0, roundf(C[1]));
+        X1 = (int)fminf((float)X1, roundf(C[0] + C[2])); Y1 = (int)fminf((float)Y1, roundf(C[1] + C[3]));
+    }
+    /* one tile on an axis that does not repeat */
+    if (!period_x) { X0 = (int)fmaxf((float)X0, ceilf(px - .5f)); X1 = (int)fminf((float)X1, ceilf(px + tw - .5f)); }
+    if (!period_y) { Y0 = (int)fmaxf((float)Y0, ceilf(py - .5f)); Y1 = (int)fminf((float)Y1, ceilf(py + th - .5f)); }
+    if (X0 >= X1 || Y0 >= Y1) return true;
+    const image_t *src = NULL;
+    struct gradient_sampler gs;
+    if (im) {
+        /* the document image's cached size (scaled_image), else its decoded pixels sampled */
+        int TW = (int)fmaxf(1, roundf(tw)), TH = (int)fmaxf(1, roundf(th));
+        src = (int64_t)TW * TH <= IMAGE_MAX_PIXELS ? scaled_image(im, TW, TH, P->c, X0, Y0, X1 - X0, Y1 - Y0) : NULL;
+        if (!src) src = im->img;
+    } else gradient_setup(&gs, g, b->st->color, 0, 0, tw, th);
+    bool luminance = css_mask_keyword(m, CSS_MASK_MODE, i) == CSS_MASK_LUMINANCE; /* match-source: alpha */
+    float sx = src ? (float)src->w / tw : 0, sy = src ? (float)src->h / th : 0;
+    for (int j = Y0; j < Y1; j++) {
+        if (!((j - Y0) & 63) && !web_native_checkpoint(P->d)) return false;
+        float v = (float)j + .5f - py;
+        if (period_y) v -= floorf(v / period_y) * period_y;
+        if (v < 0 || v >= th) continue;
+        uint8_t *row = out + (size_t)(j - y) * (size_t)w;
+        int iy = src ? (int)(v * sy) : 0;
+        if (src && iy >= src->h) iy = src->h - 1;
+        for (int k = X0; k < X1; k++) {
+            float u = (float)k + .5f - px;
+            if (period_x) u -= floorf(u / period_x) * period_x;
+            if (u < 0 || u >= tw) continue;
+            uint32_t col;
+            if (src) {
+                int ix = (int)(u * sx);
+                col = src->px[(size_t)iy * (size_t)src->w + (size_t)(ix < src->w ? ix : src->w - 1)];
+            } else col = gradient_at(&gs, u, v);
+            row[k - x] = (uint8_t)mask_value(col, luminance);
+        }
+    }
+    return true;
+}
+/* mask-composite (§7.8, Compositing 1 §9.1.1): a layer's mask s over the mask d of the layers below
+   it, 0..255 */
+static uint8_t mask_composite(uint8_t op, unsigned s, unsigned d) {
+    unsigned v = op == CSS_COMPOSITE_ADD ? s * 255 + d * (255 - s) :      /* source over */
+                 op == CSS_COMPOSITE_SUBTRACT ? s * (255 - d) :          /* source out */
+                 op == CSS_COMPOSITE_INTERSECT ? s * d :                 /* source in */
+                 s * (255 - d) + d * (255 - s);                          /* xor */
+    return (uint8_t)((v + 127) / 255);
+}
+/* the layers' mask over the pixels (x, y, w, h), 0..255 each, of b whose border box is (bx, by, bw,
+   bh) on the canvas; NULL (P->failed) when there is no memory or the paint is cancelled */
+static uint8_t *mask_layers_alpha(struct pctx *P, const box_t *b, float bx, float by, float bw, float bh, int x, int y,
+                                  int w, int h) {
+    const struct css_mask *m = css_style_mask(b->st);
+    float rect[3][4] = {{bx, by, bw, bh}};
+    rect[1][0] = bx + b->b[3]; rect[1][1] = by + b->b[0];
+    rect[1][2] = fmaxf(0, bw - b->b[1] - b->b[3]); rect[1][3] = fmaxf(0, bh - b->b[0] - b->b[2]);
+    rect[2][0] = rect[1][0] + b->p[3]; rect[2][1] = rect[1][1] + b->p[0];
+    rect[2][2] = fmaxf(0, rect[1][2] - b->p[1] - b->p[3]); rect[2][3] = fmaxf(0, rect[1][3] - b->p[0] - b->p[2]);
+    size_t size = (size_t)w * (size_t)h;
+    uint8_t *result = calloc(size ? size : 1, 1), *layer = m->image.n > 1 ? malloc(size ? size : 1) : NULL;
+    if (!result || (m->image.n > 1 && !layer)) { free(result); free(layer); P->failed = true; return NULL; }
+    /* the bottom layer (the last) is composited onto nothing: its operator is not used (§7.8) */
+    bool ok = mask_layer_draw(P, b, m, m->image.n - 1, rect, x, y, w, h, result);
+    for (uint32_t i = m->image.n - 1; ok && i-- > 0;) {
+        memset(layer, 0, size);
+        if (!(ok = mask_layer_draw(P, b, m, i, rect, x, y, w, h, layer))) break;
+        uint8_t op = css_mask_keyword(m, CSS_MASK_COMPOSITE, i);
+        for (size_t k = 0; k < size; k++) result[k] = mask_composite(op, layer[k], result[k]);
+    }
+    free(layer);
+    if (!ok) { free(result); P->failed = true; return NULL; }
+    return result;
 }
 
 /* background and borders of a border box (x, y, w, h on the canvas), of what T says */
@@ -2023,13 +2134,6 @@ static void paint_bg_border(struct pctx *P, const style_t *st, float x, float y,
     float r = used_radius(st, w, h);
     const struct gfx_mask_clip *previous=c->mask_clip;struct gfx_mask_clip boundary;
     if(rounded&&shown)radius_clip_push(P,rounded[0],&boundary,x,y);
-    if (st->mask_img) { /* an icon: the background colour through the mask, nothing else */
-        uint32_t col = st->has_grad ? st->grad[0] : st->bg_color;
-        if (shown && !skip_bg && (col >> 24))
-            paint_layer(P, st->mask_img, st->mask_size_kind, st->mask_size, st->mask_pos, st->mask_repeat, col, x, y, w,
-                        h, bw);
-        c->mask_clip=previous;return;
-    }
     if (shown) paint_background(P, st, T, x, y, w, h, bw, skip_bg, rounded, r);
     c->mask_clip=previous;
     if(P->failed)return;
@@ -3621,6 +3725,9 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     float group_opacity = st->opacity * (st->filter ? st->filter->opacity : 1);
     /* Transparent auto boxes still participate in hit testing. */
     if (P->mode != M_HIT && group_opacity <= 0) return;
+    /* a mask layer's image still loading: the box shows once it has come (or failed) */
+    if (P->mode == M_PAINT && !P->text_mask && b->kind != B_TEXT && b->kind != B_INLINE && b->kind != B_BR &&
+        mask_layers_state(P->d, b) == MASK_PENDING) return;
     if (P->untransformed != b && box_transformed(b)) { paint_transformed(P, b, layer_root); return; }
     float parent_bounds[4]; bool parent_valid = P->bounds_valid;
     if (P->mode == M_BOUNDS) {
@@ -3703,15 +3810,18 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         if (clipped) clip_pop(c, clip_saved, clip_prior);
         release_layers(&layers,layers_borrowed); return;
     }
-    /* group opacity and mask-border (css-masking-1 §8): paint, then mix the result with what was
-       there, by the opacity and the mask. A mask whose image is not decoded masks nothing (§8.1). */
+    /* group opacity, the mask layers (css-masking-1 §7) and mask-border (§8): paint, then mix the
+       result with what was there, by the opacity and the masks (both multiply). A mask-border whose
+       image is not decoded masks nothing (§8.1). */
     uint32_t *saved = NULL;
     int gx = 0, gy = 0, gw = 0, gh = 0;
     struct nine_slice mask_slice;
-    bool masked = P->mode == M_PAINT && !P->text_mask && b->kind != B_TEXT && b->kind != B_INLINE && b->kind != B_BR &&
-                  mask_border_set(st) && nine_slice_prepare(P->d, css_style_mask_border(st), st->mask_border_img, st->color,
-                                                            P->ox + bx, P->oy + by, bw, bh, b->b, &mask_slice);
-    if (P->mode == M_PAINT && (group_opacity < 1 || masked) && b->kind != B_TEXT) {
+    bool mask_box_kind = P->mode == M_PAINT && !P->text_mask && b->kind != B_TEXT && b->kind != B_INLINE && b->kind != B_BR;
+    bool masked = mask_box_kind && mask_border_set(st) &&
+                  nine_slice_prepare(P->d, css_style_mask_border(st), st->mask_border_img, st->color, P->ox + bx, P->oy + by,
+                                     bw, bh, b->b, &mask_slice);
+    bool mask_layers = mask_box_kind && mask_layers_state(P->d, b) == MASK_READY;
+    if (P->mode == M_PAINT && (group_opacity < 1 || masked || mask_layers) && b->kind != B_TEXT) {
         struct pctx measure = *P; measure.mode = M_BOUNDS; measure.bounds_valid = false;
         paint_box(&measure, b, true);
         if (measure.failed) { P->failed = true; if (clipped) clip_pop(c, clip_saved, clip_prior); release_layers(&layers,layers_borrowed); return; }
@@ -3724,7 +3834,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
                 gx = (int)left; gy = (int)top; gw = (int)(right - left); gh = (int)(bottom - top);
                 /* Group opacity mixes each pixel with what was under it, and
                    nothing else; other filter functions mix neighbours. */
-                if(st->filter||masked)web_avmedia_snapshot_reject_region(c,gx,gy,gw,gh);
+                if(st->filter||masked||mask_layers)web_avmedia_snapshot_reject_region(c,gx,gy,gw,gh);
                 else web_avmedia_snapshot_blend_region(c,gx,gy,gw,gh);
                 if(P->d->profile_enabled){paint_profile.groups++;paint_profile.group_pixels+=(uint64_t)gw*(uint64_t)gh;}
                 if ((size_t)gw > SIZE_MAX / sizeof *saved / (size_t)gh ||
@@ -3814,6 +3924,11 @@ done:
     if (saved) {
         int a = (int)(group_opacity * 255 + 0.5f);
         uint8_t *mask = masked && !P->failed ? mask_border_alpha(P, &mask_slice, gx, gy, gw, gh) : NULL;
+        uint8_t *layers_mask = mask_layers && !P->failed ? mask_layers_alpha(P, b, P->ox + bx, P->oy + by, bw, bh, gx, gy, gw, gh) : NULL;
+        if (layers_mask && mask) { /* both masks: their product */
+            for (size_t k = 0; k < (size_t)gw * (size_t)gh; k++) mask[k] = (uint8_t)((mask[k] * layers_mask[k] + 127) / 255);
+            free(layers_mask);
+        } else if (layers_mask) mask = layers_mask;
         for (int j = 0; !P->failed && j < gh; j++) {
             if (!(j & 63) && !web_native_checkpoint(P->d)) { P->failed = true; break; }
             uint32_t *row = c->px + (size_t)(gy + j) * c->pitch + gx, *old = saved + (size_t)j * gw;

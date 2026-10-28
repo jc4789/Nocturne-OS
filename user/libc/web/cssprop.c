@@ -537,7 +537,7 @@ enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_
        PT_MOTION_LIST, PT_TRANSFORM, PT_TRANSLATE,
        PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_SHAPE, PT_OFFSET, PT_CLIP, PT_COLOR_SCHEME, PT_RULE_LIST,
        PT_RULE_INSET, PT_ANCHOR, PT_COUNTER, PT_QUOTES, PT_LIST_IMAGE,
-       PT_BG_LIST, PT_BG_OFFSET, PT_BI_SOURCE, PT_BI_SLICE, PT_BI_SIDES, PT_BI_REPEAT };
+       PT_BG_LIST, PT_BG_OFFSET, PT_BI_SOURCE, PT_BI_SLICE, PT_BI_SIDES, PT_BI_REPEAT, PT_MASK_POSITION, PT_MASK_REPEAT };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
@@ -545,7 +545,7 @@ enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORD
        SH_LIST_STYLE, SH_FONT, SH_BACKGROUND, SH_FLEX, SH_FLEX_FLOW, SH_GAP, SH_OVERFLOW, SH_TEXT_DECORATION, SH_ALL,
        SH_PLACE_ITEMS, SH_PLACE_SELF, SH_PLACE_CONTENT, SH_GRID_AREA, SH_GRID_ROW, SH_GRID_COLUMN,
        SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_TRANSITION, SH_OUTLINE, SH_OFFSET, SH_GAP_RULE, SH_POSITION_TRY,
-       SH_BACKGROUND_POSITION, SH_BORDER_IMAGE, SH_MASK_BORDER };
+       SH_BACKGROUND_POSITION, SH_BORDER_IMAGE, SH_MASK_BORDER, SH_MASK };
 
 struct propdef {
     const char *name;
@@ -560,11 +560,11 @@ struct propdef {
 /* Web Animations 1 §5.3 animation types that differ from a value type's default */
 enum { AN_TYPE, AN_NONE, AN_DISCRETE, AN_VISIBILITY, AN_DISPLAY };
 /* style_t itself, or a group of rarely set properties it holds by pointer (style_t's float_shape,
-   offset, gap_rules, anchor, counters, list, background, border_image, mask_border). A group holds
-   only properties that are not inherited, but for G_LIST, which holds only inherited ones: a style
-   takes its parent's by the pointer. */
+   offset, gap_rules, anchor, counters, list, background, border_image, mask_border, mask). A group
+   holds only properties that are not inherited, but for G_LIST, which holds only inherited ones: a
+   style takes its parent's by the pointer. */
 enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET, G_GAP_RULE, G_ANCHOR, G_COUNTER, G_LIST, G_BACKGROUND, G_BORDER_IMAGE,
-       G_MASK_BORDER };
+       G_MASK_BORDER, G_MASK };
 /* which sides list a PT_BI_SIDES property holds (its flags) */
 enum { BI_WIDTH, BI_OUTSET };
 /* the gap decoration shorthands (css-gaps-1): propdef flags hold what one sets (GS_*) and on which
@@ -631,6 +631,23 @@ static const struct kw kw_blend[] = {{"normal", CSS_BLEND_NORMAL}, {"multiply", 
 static const struct kw kw_bi_repeat[] = {{"stretch", CSS_BI_STRETCH}, {"repeat", CSS_BI_REPEAT}, {"round", CSS_BI_ROUND},
                                          {"space", CSS_BI_SPACE}, {0}};
 static const struct kw kw_mask_border_mode[] = {{"alpha", CSS_MASK_BORDER_ALPHA}, {"luminance", CSS_MASK_BORDER_LUMINANCE}, {0}};
+/* the mask layers' keywords (css-masking-1 §7.2, §7.5, §7.6, §7.8) and mask-type (§9.2) */
+static const struct kw kw_mask_mode[] = {{"match-source", CSS_MASK_MATCH_SOURCE}, {"alpha", CSS_MASK_ALPHA},
+                                         {"luminance", CSS_MASK_LUMINANCE}, {0}};
+/* <coord-box> (mask-origin); mask-clip also no-clip */
+static const struct kw kw_mask_box[] = {{"border-box", CSS_BOX_BORDER}, {"padding-box", CSS_BOX_PADDING},
+                                        {"content-box", CSS_BOX_CONTENT}, {"fill-box", CSS_BOX_FILL},
+                                        {"stroke-box", CSS_BOX_STROKE}, {"view-box", CSS_BOX_VIEW}, {0}};
+static const struct kw kw_mask_clip[] = {{"border-box", CSS_BOX_BORDER}, {"padding-box", CSS_BOX_PADDING},
+                                         {"content-box", CSS_BOX_CONTENT}, {"fill-box", CSS_BOX_FILL},
+                                         {"stroke-box", CSS_BOX_STROKE}, {"view-box", CSS_BOX_VIEW},
+                                         {"no-clip", CSS_MASK_NO_CLIP}, {0}};
+static const struct kw kw_mask_composite[] = {{"add", CSS_COMPOSITE_ADD}, {"subtract", CSS_COMPOSITE_SUBTRACT},
+                                              {"intersect", CSS_COMPOSITE_INTERSECT}, {"exclude", CSS_COMPOSITE_EXCLUDE}, {0}};
+static const struct kw kw_mask_type[] = {{"luminance", CSS_MASK_TYPE_LUMINANCE}, {"alpha", CSS_MASK_TYPE_ALPHA}, {0}};
+/* one axis of a <repeat-style> (css-backgrounds-3 §3.4) */
+static const struct kw kw_repeat_axis[] = {{"repeat", CSS_REPEAT}, {"space", CSS_REPEAT_SPACE}, {"round", CSS_REPEAT_ROUND},
+                                           {"no-repeat", CSS_REPEAT_NO}, {0}};
 static const struct kw kw_bg_repeat[] = {{"repeat", BR_REPEAT}, {"repeat-x", BR_REPEAT_X}, {"repeat-y", BR_REPEAT_Y},
                                          {"no-repeat", BR_NO_REPEAT}, {"space", BR_REPEAT}, {"round", BR_REPEAT},
                                          {0}};
@@ -699,6 +716,7 @@ static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}
 #define OBG(f) OG(G_BACKGROUND, struct css_background, f)
 #define OBI(f) OG(G_BORDER_IMAGE, struct css_border_image, f)
 #define OMB(f) OG(G_MASK_BORDER, struct css_border_image, f)
+#define OMK(f) OG(G_MASK, struct css_mask, f)
 
 /* sorted by name at first use */
 static struct propdef props[] = {
@@ -854,6 +872,7 @@ static struct propdef props[] = {
     {"filter", PT_FILTER, 0, false, O(filter), NULL, 0, AN_TYPE},
     {"clip", PT_CLIP, 0, false, O(clip), NULL, 0, AN_TYPE},
     {"clip-path", PT_SHAPE, CSS_SHAPE_CLIP_PATH, false, O(clip_path), NULL, 0, AN_TYPE},
+    {"clip-rule", PT_KW, 0, true, O(svg_clip_rule), kw_svg_fill_rule, 0, AN_DISCRETE},
     {"shape-outside", PT_SHAPE, CSS_SHAPE_OUTSIDE, false, OG(G_FLOAT_SHAPE, struct css_float_shape, outside), NULL, 0, AN_TYPE},
     {"shape-margin", PT_LEN, LF_LENGTH, false, OG(G_FLOAT_SHAPE, struct css_float_shape, margin), NULL, 0, AN_TYPE},
     {"shape-image-threshold", PT_OPACITY, 0, false, OG(G_FLOAT_SHAPE, struct css_float_shape, image_threshold), NULL, 0,
@@ -920,12 +939,19 @@ static struct propdef props[] = {
     {"margin-left", PT_LEN, LF_AUTO | LF_NEG | LF_ANCHOR_SIZE, false, O(margin[3]), NULL, 0, AN_TYPE},
     {"margin-right", PT_LEN, LF_AUTO | LF_NEG | LF_ANCHOR_SIZE, false, O(margin[1]), NULL, 0, AN_TYPE},
     {"margin-top", PT_LEN, LF_AUTO | LF_NEG | LF_ANCHOR_SIZE, false, O(margin[0]), NULL, 0, AN_TYPE},
-    {"mask-image", PT_MASK_IMAGE, 0, false, O(mask_image), NULL, 0, AN_TYPE},
-    {"mask-position", PT_BG_POS, 0, false, O(mask_pos), NULL, 0, AN_TYPE},
+    /* the mask layers (css-masking-1 §7; flags: enum css_mask_list) and their shorthand */
+    SH("mask", SH_MASK),
+    {"mask-image", PT_MASK_IMAGE, 0, false, OMK(image), NULL, 0, AN_DISCRETE},
+    {"mask-mode", PT_BG_LIST, CSS_MASK_MODE, false, OMK(list[CSS_MASK_MODE]), kw_mask_mode, 0, AN_DISCRETE},
+    {"mask-repeat", PT_MASK_REPEAT, CSS_MASK_REPEAT, false, OMK(list[CSS_MASK_REPEAT]), kw_repeat_axis, 0, AN_DISCRETE},
+    {"mask-position", PT_MASK_POSITION, 0, false, OMK(position), NULL, 0, AN_TYPE},
+    {"mask-clip", PT_BG_LIST, CSS_MASK_CLIP, false, OMK(list[CSS_MASK_CLIP]), kw_mask_clip, 0, AN_DISCRETE},
+    {"mask-origin", PT_BG_LIST, CSS_MASK_ORIGIN, false, OMK(list[CSS_MASK_ORIGIN]), kw_mask_box, 0, AN_DISCRETE},
+    {"mask-size", PT_MASK_SIZE, 0, false, OMK(size), NULL, 0, AN_TYPE},
+    {"mask-composite", PT_BG_LIST, CSS_MASK_COMPOSITE, false, OMK(list[CSS_MASK_COMPOSITE]), kw_mask_composite, 0, AN_DISCRETE},
+    {"mask-type", PT_KW, 0, false, OMK(type), kw_mask_type, 0, AN_DISCRETE},
     {"object-fit", PT_KW, 0, false, O(object_fit), kw_object_fit, 0, AN_TYPE},
     {"object-position", PT_BG_POS, 0, true, O(object_pos), NULL, 0, AN_TYPE},
-    {"mask-repeat", PT_KW, 0, false, O(mask_repeat), kw_bg_repeat, 0, AN_TYPE},
-    {"mask-size", PT_MASK_SIZE, 0, false, O(mask_size), NULL, 0, AN_TYPE},
     {"max-height", PT_LEN, LF_NONE | LF_ANCHOR_SIZE, false, O(max_height), NULL, 0, AN_TYPE},
     {"max-width", PT_LEN, LF_NONE | LF_ANCHOR_SIZE, false, O(max_width), NULL, 0, AN_TYPE},
     {"min-height", PT_LEN, LF_AUTO | LF_ANCHOR_SIZE, false, O(min_height), NULL, 0, AN_TYPE},
@@ -1054,8 +1080,8 @@ static void init_initial(void) {
     s->justify_self = 255;
     s->z_auto = true;
     s->bg_layers = 1;
-    /* the groups (float_shape, offset, gap_rules, anchor, background, border_image, mask_border) stay
-       NULL: their initial records */
+    /* the groups (float_shape, offset, gap_rules, anchor, background, border_image, mask_border,
+       mask) stay NULL: their initial records */
 }
 
 static void props_init(void) {
@@ -1139,6 +1165,7 @@ static const void *group_of(const style_t *s, uint8_t g) {
     case G_BACKGROUND: return css_style_background(s);
     case G_BORDER_IMAGE: return css_style_border_image(s);
     case G_MASK_BORDER: return css_style_mask_border(s);
+    case G_MASK: return css_style_mask(s);
     }
     return s;
 }
@@ -1151,6 +1178,7 @@ static size_t group_size(uint8_t g) {
     case G_COUNTER: return sizeof(struct css_counters);
     case G_BACKGROUND: return sizeof(struct css_background);
     case G_BORDER_IMAGE: case G_MASK_BORDER: return sizeof(struct css_border_image);
+    case G_MASK: return sizeof(struct css_mask);
     }
     return sizeof(struct css_list);
 }
@@ -1164,6 +1192,7 @@ static bool group_same(const style_t *a, const style_t *b, uint8_t g) {
     case G_BACKGROUND: return a->background == b->background;
     case G_BORDER_IMAGE: return a->border_image == b->border_image;
     case G_MASK_BORDER: return a->mask_border == b->mask_border;
+    case G_MASK: return a->mask == b->mask;
     }
     return a->list == b->list;
 }
@@ -1180,6 +1209,7 @@ static void *group_write(style_t *s, uint8_t g, const void *value, arena_t *a) {
     case G_BACKGROUND: s->background = copy; break;
     case G_BORDER_IMAGE: s->border_image = copy; s->border_image_img = 0; break; /* found again after the cascade */
     case G_MASK_BORDER: s->mask_border = copy; s->mask_border_img = 0; break;
+    case G_MASK: s->mask = copy; break; /* its images keep their documents' images (css_image's img) */
     case G_ANCHOR: s->anchor = copy; break;
     case G_COUNTER: s->counters = copy; break;
     default: s->list = copy;
@@ -1196,6 +1226,7 @@ static void groups_copy(style_t *dst, const style_t *src) {
     dst->background = src->background;
     dst->border_image = src->border_image; dst->border_image_img = src->border_image_img;
     dst->mask_border = src->mask_border; dst->mask_border_img = src->mask_border_img;
+    dst->mask = src->mask;
 }
 /* the property's field in s */
 static const void *field_of(const style_t *s, const struct propdef *p) {
@@ -1214,6 +1245,9 @@ static bool list_specified(const struct propdef *p, const char *v, size_t n, sbu
    serialization, and their shorthands' computed values */
 static bool background_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
 static bool group_shorthand_text(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d);
+/* the mask shorthand's (below): its specified value, and its computed one */
+static bool mask_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
+static bool mask_computed(const style_t *st, sbuf *out, web_doc *d);
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d) {
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return 0;
@@ -1246,6 +1280,7 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
     case PT_MOTION_LIST: case PT_SHAPE: case PT_OFFSET: case PT_ROTATE: case PT_SCALE: case PT_ANCHOR:
     case PT_CONTENT: case PT_LIST_TYPE: case PT_LIST_IMAGE: case PT_QUOTES: case PT_COUNTER:
     case PT_BG_LIST: case PT_BG_OFFSET: case PT_BI_SLICE: case PT_BI_SIDES: case PT_BI_REPEAT:
+    case PT_MASK_IMAGE: case PT_MASK_REPEAT: case PT_MASK_POSITION: case PT_MASK_SIZE: case PT_CLIP:
         return css_computed_value(st, p, out, d) ? 1 : -1;
     case PT_BI_SOURCE: return css_computed_value(st, p, out, d) ? 1 : 0; /* a gradient: not yet serialized */
     case PT_RULE_LIST: case PT_RULE_INSET: return gap_computed(st, p, out, d);
@@ -1254,7 +1289,7 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
         if (p->sh == SH_OFFSET) return css_offset_shorthand_serialize(css_style_offset(st), out, d) ? 1 : -1;
         if (p->sh == SH_GAP_RULE) return gap_computed(st, p, out, d);
         if (p->sh == SH_POSITION_TRY) return position_try_text(css_style_anchor(st), out) ? 1 : -1;
-        if (p->sh == SH_BACKGROUND_POSITION || p->sh == SH_BORDER_IMAGE || p->sh == SH_MASK_BORDER) {
+        if (p->sh == SH_BACKGROUND_POSITION || p->sh == SH_BORDER_IMAGE || p->sh == SH_MASK_BORDER || p->sh == SH_MASK) {
             size_t begin = out->n;
             if (group_shorthand_text(st, p, out, d)) return 1;
             out->n = begin;
@@ -1280,7 +1315,8 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     if (p->type == PT_CONTENT || p->type == PT_LIST_TYPE || p->type == PT_LIST_IMAGE || p->type == PT_QUOTES ||
         p->type == PT_COUNTER || (p->type == PT_SHORT && p->sh == SH_LIST_STYLE))
         return list_specified(p, v, n, out);
-    if (p->group == G_BACKGROUND || p->group == G_BORDER_IMAGE || p->group == G_MASK_BORDER ||
+    if (p->type == PT_SHORT && p->sh == SH_MASK) return mask_specified(p, v, n, out);
+    if (p->group == G_BACKGROUND || p->group == G_BORDER_IMAGE || p->group == G_MASK_BORDER || p->group == G_MASK ||
         (p->type == PT_SHORT && (p->sh == SH_BACKGROUND_POSITION || p->sh == SH_BORDER_IMAGE || p->sh == SH_MASK_BORDER)))
         return background_specified(p, v, n, out);
     /* a length (or a shorthand of lengths) with an anchor function in it; the rest as other lengths */
@@ -1346,7 +1382,8 @@ bool css_prop_reify(const char *name, size_t n, struct css_reify *out) {
         return true;
     }
     out->list = p->type == PT_MOTION_LIST || p->type == PT_BG_IMAGE || p->type == PT_MASK_IMAGE || p->type == PT_BG_POS ||
-                p->type == PT_BG_SIZE || p->type == PT_MASK_SIZE || (p->type == PT_KW && p->kws == kw_bg_repeat);
+                p->type == PT_BG_SIZE || p->type == PT_MASK_SIZE || (p->type == PT_KW && p->kws == kw_bg_repeat) ||
+                p->type == PT_BG_LIST || p->type == PT_BG_OFFSET || p->type == PT_MASK_REPEAT || p->type == PT_MASK_POSITION;
     out->kind = p->type == PT_FONT_FAMILY ? CSS_REIFY_STYLE :
                 p->type == PT_COLOR || p->type == PT_SVG_PAINT ? CSS_REIFY_COLOR :
                 p->type == PT_TRANSFORM ? CSS_REIFY_TRANSFORM :
@@ -1358,7 +1395,7 @@ bool css_prop_reify(const char *name, size_t n, struct css_reify *out) {
     case PT_LEN: accept = CSS_CALC_LENGTH | (p->flags & LF_NOPCT ? 0 : CSS_CALC_PERCENT); break;
     case PT_PX: accept = CSS_CALC_LENGTH; break;
     case PT_FONT_SIZE: case PT_VALIGN: case PT_RADIUS: case PT_TRANSLATE: case PT_BG_SIZE: case PT_MASK_SIZE:
-    case PT_BG_POS: case PT_TRANSFORM_ORIGIN:
+    case PT_BG_POS: case PT_TRANSFORM_ORIGIN: case PT_MASK_POSITION:
         accept = CSS_CALC_LENGTH | CSS_CALC_PERCENT; break;
     case PT_GTEMPLATE: accept = CSS_CALC_LENGTH | CSS_CALC_PERCENT | CSS_CALC_FLEX; break;
     case PT_LINE_HEIGHT: case PT_SVG_WIDTH: accept = CSS_CALC_NUMBER | CSS_CALC_LENGTH | CSS_CALC_PERCENT; break;
@@ -1378,7 +1415,7 @@ bool css_prop_reify(const char *name, size_t n, struct css_reify *out) {
        integer goes with a name or span, a CSSStyleValue (WPT grid-start-end.html) */
     case PT_KW: case PT_DISPLAY: case PT_COLOR: case PT_FONT_FAMILY: case PT_LIST_TYPE: case PT_BG_IMAGE: case PT_OVERFLOW:
     case PT_MASK_IMAGE: case PT_SVG_PAINT: case PT_CONTAINER_NAMES: case PT_TRANSFORM: case PT_GAREAS: case PT_FILTER:
-    case PT_BOX_SHADOW: case PT_CLIP: case PT_COLOR_SCHEME: case PT_GLINE:
+    case PT_BOX_SHADOW: case PT_CLIP: case PT_COLOR_SCHEME: case PT_GLINE: case PT_BG_LIST: case PT_MASK_REPEAT:
         break;
     default: typed = false;
     }
@@ -2963,25 +3000,32 @@ static bool parse_bg_pos(const char *s, size_t n, struct cx *cx, len_t *out) {
     return true;
 }
 
+/* a <bg-size> (css-backgrounds-3 §3.9): cover, contain, or a width and a height (one: the height
+   auto), each a non-negative <length-percentage> or auto */
+static bool layer_size_parse(const char *s, size_t n, struct cx *cx, struct css_layer_size *out) {
+    memset(out, 0, sizeof *out);
+    if (ident_is(s, n, "cover")) { out->kind = BSZ_COVER; return true; }
+    if (ident_is(s, n, "contain")) { out->kind = BSZ_CONTAIN; return true; }
+    const char *t[3];
+    size_t tl[3];
+    int k = split(s, n, t, tl, 3, ' ');
+    if (k < 1 || k > 2) return false;
+    for (int i = 0; i < k; i++)
+        if (!parse_len(t[i], tl[i], cx, &out->v[i], LF_AUTO)) return false;
+    out->kind = out->v[0].kind == LK_AUTO && out->v[1].kind == LK_AUTO ? BSZ_AUTO : BSZ_LEN;
+    return true;
+}
+/* background-size: its first layer's */
 static bool parse_bg_size(const char *s, size_t n, struct cx *cx, len_t *size, uint8_t *kind) {
     const char *layer[8];
     size_t ll[8];
     int layers = split_checked(s, n, layer, ll, 8, ',', cx);
     if (layers < 1 || (cx->supports_probe && layers != 1)) return false;
-    s = layer[0];
-    n = ll[0];
-    memset(size, 0, 2 * sizeof *size);
-    if (ident_is(s, n, "cover")) *kind = BSZ_COVER;
-    else if (ident_is(s, n, "contain")) *kind = BSZ_CONTAIN;
-    else {
-        const char *t[2];
-        size_t tl[2];
-        int k = split_checked(s, n, t, tl, 2, ' ', cx);
-        if (k < 1) return false;
-        for (int i = 0; i < k; i++)
-            if (!parse_len(t[i], tl[i], cx, &size[i], LF_AUTO)) return false;
-        *kind = size[0].kind == LK_AUTO && size[1].kind == LK_AUTO ? BSZ_AUTO : BSZ_LEN;
-    }
+    struct css_layer_size z;
+    trim(&layer[0], &ll[0]);
+    if (!layer_size_parse(layer[0], ll[0], cx, &z)) return false;
+    memcpy(size, z.v, sizeof z.v);
+    *kind = z.kind;
     return true;
 }
 
@@ -3027,27 +3071,6 @@ static bool parse_clip_rect(const char *v,size_t n,struct cx *cx,struct css_clip
         r.edge[i]=edge.px;
     }
     *out=r;return true;
-}
-
-static bool parse_mask_image(const char *s, size_t n, struct cx *cx) {
-    if (ident_is(s, n, "none")) {
-        cx->s->mask_image = NULL;
-        cx->s->mask_img = 0;
-        return true;
-    }
-    const char *t[8];
-    size_t tl[8];
-    int k = split_checked(s, n, t, tl, 8, ',', cx);
-    if (cx->supports_probe && (k != 1 || !strn_ieq(s, "url(", 4))) return false;
-    for (int i = 0; i < k; i++) {
-        const char *u = css_parse_url(t[i], tl[i], cx->a);
-        if (u) {
-            cx->s->mask_image = u;
-            cx->s->mask_img = 0;
-            return true;
-        }
-    }
-    return false;
 }
 
 static bool transform_angle(const char *s, size_t n, struct cx *cx, float *out);
@@ -3205,6 +3228,43 @@ bool css_border_image_equal(const struct css_border_image *a, const struct css_b
            bi_sides_equal(a->outset, b->outset) && a->repeat[0] == b->repeat[0] && a->repeat[1] == b->repeat[1] &&
            a->mode == b->mode;
 }
+/* the mask layers' initial values (css-masking-1 §7.1-§7.8, §9.2) */
+static const uint8_t mask_keyword_initial[CSS_MASK_LISTS] = {CSS_MASK_MATCH_SOURCE, CSS_REPEAT << 2 | CSS_REPEAT,
+                                                             CSS_BOX_BORDER, CSS_BOX_BORDER, CSS_COMPOSITE_ADD};
+static const struct css_image *const mask_image_none = NULL;
+static const struct css_layer_size layer_size_auto = {{{.kind = LK_AUTO}, {.kind = LK_AUTO}}, BSZ_AUTO};
+const struct css_mask css_mask_initial = {
+    {&mask_image_none, 1},
+    {{&mask_keyword_initial[0], 1}, {&mask_keyword_initial[1], 1}, {&mask_keyword_initial[2], 1},
+     {&mask_keyword_initial[3], 1}, {&mask_keyword_initial[4], 1}},
+    {{&bg_offset_initial, 1}, {&bg_offset_initial, 1}}, {&layer_size_auto, 1}, CSS_MASK_TYPE_LUMINANCE};
+static bool image_equal(const struct css_image *a, const struct css_image *b);
+static bool layer_images_equal(const struct css_layer_images *a, const struct css_layer_images *b) {
+    if (a->n != b->n) return false;
+    for (uint32_t i = 0; i < a->n; i++) if (!image_equal(a->v[i], b->v[i])) return false;
+    return true;
+}
+static bool layer_size_equal(const struct css_layer_size *a, const struct css_layer_size *b) {
+    return a->kind == b->kind &&
+           (a->kind != BSZ_LEN || (css_length_equal(&a->v[0], &b->v[0]) && css_length_equal(&a->v[1], &b->v[1])));
+}
+static bool layer_sizes_equal(const struct css_layer_sizes *a, const struct css_layer_sizes *b) {
+    if (a->n != b->n) return false;
+    for (uint32_t i = 0; i < a->n; i++) if (!layer_size_equal(&a->v[i], &b->v[i])) return false;
+    return true;
+}
+bool css_mask_equal(const struct css_mask *a, const struct css_mask *b) {
+    if (!a) a = &css_mask_initial;
+    if (!b) b = &css_mask_initial;
+    if (a == b) return true;
+    for (int l = 0; l < CSS_MASK_LISTS; l++) if (!bg_keywords_equal(&a->list[l], &b->list[l])) return false;
+    return a->type == b->type && layer_images_equal(&a->image, &b->image) && layer_sizes_equal(&a->size, &b->size) &&
+           bg_offsets_equal(&a->position[0], &b->position[0]) && bg_offsets_equal(&a->position[1], &b->position[1]);
+}
+bool css_mask_layers_set(const struct css_mask *m) {
+    for (uint32_t i = 0; i < m->image.n; i++) if (m->image.v[i]) return true;
+    return false;
+}
 /* an offset from the start side: a logical end's complement */
 static len_t bg_offset_from_start(const struct css_bg_offset *o, arena_t *a) {
     if (o->edge != CSS_BG_EDGE_LOGICAL_END) return o->offset;
@@ -3213,8 +3273,7 @@ static len_t bg_offset_from_start(const struct css_bg_offset *o, arena_t *a) {
     if (a) css_length_complement(a, &o->offset, NULL, &r);
     return r;
 }
-float css_bg_offset_px(const struct css_background *bg, int axis, uint32_t layer, float range) {
-    const struct css_bg_offsets *l = &bg->position[axis ? 1 : 0];
+float css_bg_offset_px(const struct css_bg_offsets *l, uint32_t layer, float range) {
     const struct css_bg_offset *o = &l->v[layer % l->n];
     float v = len_resolve(&o->offset, range);
     return o->edge == CSS_BG_EDGE_LOGICAL_END ? range - v : v;
@@ -3280,10 +3339,12 @@ static bool bp_length(const char *t, size_t n, struct cx *cx) {
     len_t l;
     return parse_len(t, n, cx, &l, LF_NEG | LF_LENGTH);
 }
-/* tokens t[0..k) of a <bg-position>: its horizontal and vertical parts */
-static bool bg_position_parts(const char *const *t, const size_t *tl, int k, struct cx *cx, struct bg_part part[2]) {
+/* tokens t[0..k) of a <bg-position>, or (three false) of a <position> (CSS Values 4 §8.3: no
+   three-value form): its horizontal and vertical parts */
+static bool bg_position_parts(const char *const *t, const size_t *tl, int k, bool three, struct cx *cx,
+                              struct bg_part part[2]) {
     memset(part, 0, 2 * sizeof *part);
-    if (k < 1 || k > 4) return false;
+    if (k < 1 || k > 4 || (k == 3 && !three)) return false;
     uint8_t kw[4];
     bool len[4];
     for (int i = 0; i < k; i++) {
@@ -3396,8 +3457,9 @@ static bool parse_bg_offsets(int axis, const char *v, size_t n, struct cx *cx, s
     *out = (struct css_bg_offsets){o, (uint32_t)k};
     return true;
 }
-/* background-position: the -x and -y lists of its layers */
-static bool parse_bg_positions(const char *v, size_t n, struct cx *cx, struct css_bg_offsets out[2]) {
+/* background-position (<bg-position>#) or mask-position (three false: <position>#): the horizontal
+   and vertical lists of its layers */
+static bool parse_bg_positions(const char *v, size_t n, bool three, struct cx *cx, struct css_bg_offsets out[2]) {
     const char **item;
     size_t *il;
     int k = list_split(v, n, cx, &item, &il);
@@ -3408,7 +3470,7 @@ static bool parse_bg_positions(const char *v, size_t n, struct cx *cx, struct cs
         size_t tl[5];
         struct bg_part part[2];
         int m = split(item[i], il[i], t, tl, 5, ' ');
-        if (!bg_position_parts(t, tl, m, cx, part) || !bg_part_offset(&part[0], cx, &o[0][i]) ||
+        if (!bg_position_parts(t, tl, m, three, cx, part) || !bg_part_offset(&part[0], cx, &o[0][i]) ||
             !bg_part_offset(&part[1], cx, &o[1][i])) return false;
     }
     for (int a = 0; a < 2; a++) out[a] = (struct css_bg_offsets){o[a], (uint32_t)k};
@@ -3427,7 +3489,7 @@ static bool parse_bg_keywords(const struct propdef *p, const char *v, size_t n, 
         int m = split(t[i], tl[i], w, wl, 3, ' ');
         if (m == 1 && kw_find(p->kws, w[0], wl[0], &values[i])) continue;
         uint8_t a, b;
-        if (p->flags == CSS_BG_CLIP && m == 2 && kw_find(p->kws, w[0], wl[0], &a) && kw_find(p->kws, w[1], wl[1], &b) &&
+        if (p->kws == kw_bg_clip && m == 2 && kw_find(p->kws, w[0], wl[0], &a) && kw_find(p->kws, w[1], wl[1], &b) &&
             a != b && (a | b) == (CSS_BG_CLIP_AREA | CSS_BG_CLIP_TEXT)) {
             values[i] = a | b;
             continue;
@@ -3459,6 +3521,93 @@ static void bg_group_write(struct cx *cx, const struct css_background *parsed, u
 }
 
 /* border-image-* and mask-border-* (css-backgrounds-3 §6, css-masking-1 §8) */
+/* the mask layers' longhands (css-masking-1 §7.1-§7.7): mask-mode, -clip, -origin and -composite are
+   keyword lists (parse_bg_keywords), mask-position <position>s (parse_bg_positions) */
+/* a <repeat-style> (css-backgrounds-3 §3.4): repeat-x, repeat-y, or one or two of repeat, space, round
+   and no-repeat, the horizontal one first (one: both) */
+static bool repeat_style_parse(const char *s, size_t n, uint8_t *out) {
+    const char *t[3];
+    size_t tl[3];
+    int k = split(s, n, t, tl, 3, ' ');
+    if (k == 1 && ident_is(t[0], tl[0], "repeat-x")) { *out = CSS_REPEAT << 2 | CSS_REPEAT_NO; return true; }
+    if (k == 1 && ident_is(t[0], tl[0], "repeat-y")) { *out = CSS_REPEAT_NO << 2 | CSS_REPEAT; return true; }
+    uint8_t x, y;
+    if (k < 1 || k > 2 || !kw_find(kw_repeat_axis, t[0], tl[0], &x)) return false;
+    y = x;
+    if (k == 2 && !kw_find(kw_repeat_axis, t[1], tl[1], &y)) return false;
+    *out = (uint8_t)(x << 2 | y);
+    return true;
+}
+/* its serialization (CSSOM: repeat-x and repeat-y where they apply, a pair once when the same) */
+static void repeat_style_text(uint8_t r, sbuf *out) {
+    uint8_t x = r >> 2 & 3, y = r & 3;
+    if (x == CSS_REPEAT && y == CSS_REPEAT_NO) { sb_puts(out, "repeat-x"); return; }
+    if (x == CSS_REPEAT_NO && y == CSS_REPEAT) { sb_puts(out, "repeat-y"); return; }
+    sb_puts(out, kw_name(kw_repeat_axis, x));
+    if (y != x) { sb_putc(out, ' '); sb_puts(out, kw_name(kw_repeat_axis, y)); }
+}
+static bool parse_repeat_styles(const char *v, size_t n, struct cx *cx, struct css_bg_keywords *out) {
+    const char **t;
+    size_t *tl;
+    int k = list_split(v, n, cx, &t, &tl);
+    if (!k) return false;
+    uint8_t *values = ar_alloc(cx->a, (size_t)k);
+    for (int i = 0; i < k; i++) if (!repeat_style_parse(t[i], tl[i], &values[i])) return false;
+    *out = (struct css_bg_keywords){values, (uint32_t)k};
+    return true;
+}
+static bool parse_layer_sizes(const char *v, size_t n, struct cx *cx, struct css_layer_sizes *out) {
+    const char **t;
+    size_t *tl;
+    int k = list_split(v, n, cx, &t, &tl);
+    if (!k) return false;
+    struct css_layer_size *z = ar_alloc(cx->a, (size_t)k * sizeof *z);
+    for (int i = 0; i < k; i++) {
+        trim(&t[i], &tl[i]);
+        if (!layer_size_parse(t[i], tl[i], cx, &z[i])) return false;
+    }
+    *out = (struct css_layer_sizes){z, (uint32_t)k};
+    return true;
+}
+static bool layer_size_text(const struct css_layer_size *z, sbuf *out, web_doc *d) {
+    if (z->kind == BSZ_COVER) { sb_puts(out, "cover"); return true; }
+    if (z->kind == BSZ_CONTAIN) { sb_puts(out, "contain"); return true; }
+    if (z->kind == BSZ_AUTO) { sb_puts(out, "auto"); return true; }
+    for (int i = 0; i < 2; i++) {
+        if (i) sb_putc(out, ' ');
+        if (z->v[i].kind == LK_AUTO) sb_puts(out, "auto");
+        else if (!css_length_serialize(&z->v[i], out, d)) return false;
+    }
+    return true;
+}
+/* a <mask-reference> (css-masking-1 §7.1): 1 an <image> or a <mask-source> (a url(), which names a
+   mask element or an image), 0 none, -1 another image function (accepted outside @supports, not
+   drawn), -2 not one */
+static bool parse_image_value(const char *s, size_t n, struct cx *cx, const struct css_image **out);
+static int mask_reference_parse(const char *t, size_t n, struct cx *cx, const struct css_image **out) {
+    *out = NULL;
+    if (ident_is(t, n, "none")) return 0;
+    if (parse_image_value(t, n, cx, out)) return 1;
+    size_t open = 0;
+    while (open < n && t[open] != '(') open++;
+    return open && open < n && t[n - 1] == ')' && !strn_ieq(t, "url(", 4) ? -1 : -2;
+}
+static bool parse_mask_images(const char *v, size_t n, struct cx *cx, struct css_layer_images *out) {
+    const char **t;
+    size_t *tl;
+    int k = list_split(v, n, cx, &t, &tl);
+    if (!k) return false;
+    const struct css_image **items = ar_alloc(cx->a, (size_t)k * sizeof *items);
+    for (int i = 0; i < k; i++) {
+        const char *w[2];
+        size_t wl[2];
+        if (split(t[i], tl[i], w, wl, 2, ' ') != 1) return false;
+        int r = mask_reference_parse(w[0], wl[0], cx, &items[i]);
+        if (r == -2 || (r == -1 && cx->supports_probe)) return false;
+    }
+    *out = (struct css_layer_images){items, (uint32_t)k};
+    return true;
+}
 static const int side_pick[5][4] = {{0}, {0, 0, 0, 0}, {0, 1, 0, 1}, {0, 1, 2, 1}, {0, 1, 2, 3}};
 static void bi_four(struct css_bi_side *side, int k) {
     struct css_bi_side given[4];
@@ -3738,17 +3887,38 @@ static bool background_specified(const struct propdef *p, const char *v, size_t 
                 const char *t[5];
                 size_t tl[5];
                 int m = split(item[i], il[i], t, tl, 5, ' ');
-                if (p->type == PT_SHORT) { /* background-position: the horizontal part, then the vertical one */
+                if (p->type == PT_SHORT || p->type == PT_MASK_POSITION) {
+                    /* background-position (a <bg-position>) and mask-position (a <position>): the
+                       horizontal part, then the vertical one */
                     struct bg_part part[2];
-                    ok = p->sh == SH_BACKGROUND_POSITION && bg_position_parts(t, tl, m, &cx, part);
+                    ok = (p->type == PT_MASK_POSITION || p->sh == SH_BACKGROUND_POSITION) &&
+                         bg_position_parts(t, tl, m, p->type != PT_MASK_POSITION, &cx, part);
                     for (int axis = 0; ok && axis < 2; axis++) {
                         if (axis) sb_putc(out, ' ');
                         if (part[axis].kw) sb_puts(out, kw_name(kw_bg_edge, part[axis].kw));
                         if (part[axis].kw && part[axis].off) sb_putc(out, ' ');
                         if (part[axis].off) spec_token(out, part[axis].off, part[axis].off_n, CSS_CALC_LENGTH | CSS_CALC_PERCENT);
                     }
-                } else if (p->type == PT_BG_LIST && p->flags == CSS_BG_CLIP && m == 2) {
+                } else if (p->type == PT_BG_LIST && p->kws == kw_bg_clip && m == 2) {
                     sb_puts(out, "border-area text");
+                } else if (p->type == PT_MASK_REPEAT) {
+                    uint8_t repeat;
+                    ok = repeat_style_parse(item[i], il[i], &repeat);
+                    if (ok) repeat_style_text(repeat, out);
+                } else if (p->type == PT_MASK_SIZE && m == 1 && !ident_is(t[0], tl[0], "auto") &&
+                           !ident_is(t[0], tl[0], "cover") && !ident_is(t[0], tl[0], "contain")) {
+                    /* one length: the height auto (css-backgrounds-3 §3.9) */
+                    spec_token(out, t[0], tl[0], CSS_CALC_LENGTH | CSS_CALC_PERCENT);
+                    sb_puts(out, " auto");
+                } else if (p->type == PT_MASK_SIZE && m == 2 && ident_is(t[0], tl[0], "auto") && ident_is(t[1], tl[1], "auto")) {
+                    sb_puts(out, "auto");
+                } else if (p->type == PT_MASK_IMAGE) {
+                    const struct css_image *image;
+                    int r = m == 1 ? mask_reference_parse(t[0], tl[0], &cx, &image) : -2;
+                    if (r == 0) sb_puts(out, "none");
+                    else if (r == 1 && image->kind == CSS_IMAGE_URL) url_text(out, image->url);
+                    else if (r != -2) spec_token(out, t[0], tl[0], CSS_CALC_ANY);
+                    else ok = false;
                 } else {
                     for (int j = 0; j < m; j++) {
                         if (j) sb_putc(out, ' ');
@@ -3830,6 +4000,7 @@ static bool border_image_text(const struct css_border_image *b, bool mask, sbuf 
 static bool group_shorthand_text(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d) {
     if (p->sh == SH_BORDER_IMAGE) return border_image_text(css_style_border_image(st), false, out, d);
     if (p->sh == SH_MASK_BORDER) return border_image_text(css_style_mask_border(st), true, out, d);
+    if (p->sh == SH_MASK) return mask_computed(st, out, d);
     if (p->sh != SH_BACKGROUND_POSITION) return false;
     const struct css_background *bg = css_style_background(st);
     uint32_t nx = bg->position[0].n, ny = bg->position[1].n, count = nx > ny ? nx : ny;
@@ -3893,17 +4064,18 @@ static bool bg_position_apply(const char *v, size_t n, bool global, struct cx *c
         return true;
     }
     struct css_background parsed;
-    if (!parse_bg_positions(v, n, cx, parsed.position)) return false;
+    if (!parse_bg_positions(v, n, true, cx, parsed.position)) return false;
     bg_group_write(cx, &parsed, 3u << CSS_BG_LISTS);
     return true;
 }
 
-/* background (css-backgrounds-3 §3.10, css-backgrounds-4 §2.12): a layer's parts as written */
+/* background (css-backgrounds-3 §3.10, css-backgrounds-4 §2.12) and mask (css-masking-1 §7.9): a
+   layer's parts as written */
 struct bg_layer_value {
-    struct bi_span image, position, size, repeat, attachment, color;
+    struct bi_span image, position, size, repeat, attachment, color, composite, mode;
     struct bg_part part[2];
-    uint8_t box[2], nbox; /* the <visual-box>es, in order */
-    uint8_t clip_only;    /* border-area || text */
+    uint8_t box[2], nbox; /* the <visual-box>es (mask: <coord-box>es), in order */
+    uint8_t clip_only;    /* border-area || text; mask: no-clip */
 };
 static bool bg_size_token(const char *t, size_t n, struct cx *cx) {
     len_t l;
@@ -3913,8 +4085,8 @@ static bool bg_position_token(const char *t, size_t n, struct cx *cx) {
     uint8_t kw;
     return kw_find(kw_bg_edge, t, n, &kw) || bp_length(t, n, cx);
 }
-/* <bg-layer>, or with final <final-bg-layer> (a colour allowed) */
-static bool bg_layer_parse(const char *v, size_t n, bool final, struct cx *cx, struct bg_layer_value *L) {
+/* <bg-layer>, or with final <final-bg-layer> (a colour allowed); mask: a <mask-layer> */
+static bool bg_layer_parse(const char *v, size_t n, bool final, bool mask, struct cx *cx, struct bg_layer_value *L) {
     const char *t[48];
     size_t tl[48];
     int k = slash_tokens(v, n, t, tl, 48);
@@ -3926,12 +4098,13 @@ static bool bg_layer_parse(const char *v, size_t n, bool final, struct cx *cx, s
         const char *url;
         const struct gradient *gradient;
         int image;
+        const struct css_image *reference;
         if (slash_at(t, tl, i)) return false;
         if (!L->position.s && bg_position_token(t[i], tl[i], cx)) {
-            /* the longest run that is a <bg-position>, then / and its <bg-size> */
+            /* the longest run that is a <bg-position> (mask: a <position>), then / and its <bg-size> */
             int j = i;
             while (j < k && j - i < 4 && !slash_at(t, tl, j) && bg_position_token(t[j], tl[j], cx)) j++;
-            while (j > i && !bg_position_parts(t + i, tl + i, j - i, cx, L->part)) j--;
+            while (j > i && !bg_position_parts(t + i, tl + i, j - i, !mask, cx, L->part)) j--;
             if (j == i) return false;
             bi_span(&L->position, t, tl, i, j);
             i = j;
@@ -3944,7 +4117,7 @@ static bool bg_layer_parse(const char *v, size_t n, bool final, struct cx *cx, s
                 uint8_t kind;
                 if (!parse_bg_size(L->size.s, L->size.n, cx, size, &kind)) return false;
             }
-        } else if (final && !L->color.s && css_color_checked(t[i], tl[i], &colour, cx)) {
+        } else if (final && !mask && !L->color.s && css_color_checked(t[i], tl[i], &colour, cx)) {
             bi_span(&L->color, t, tl, i, i + 1);
             i++;
         } else if (!L->repeat.s && kw_find(kw_bg_repeat, t[i], tl[i], &kw)) {
@@ -3956,14 +4129,25 @@ static bool bg_layer_parse(const char *v, size_t n, bool final, struct cx *cx, s
                 j++;
             bi_span(&L->repeat, t, tl, i, j);
             i = j;
-        } else if (!L->attachment.s && kw_find(kw_bg_attachment, t[i], tl[i], &kw)) {
+        } else if (!mask && !L->attachment.s && kw_find(kw_bg_attachment, t[i], tl[i], &kw)) {
             bi_span(&L->attachment, t, tl, i, i + 1);
             i++;
-        } else if (kw_find(kw_bg_box, t[i], tl[i], &kw)) {
+        } else if (mask && !L->composite.s && kw_find(kw_mask_composite, t[i], tl[i], &kw)) {
+            bi_span(&L->composite, t, tl, i, i + 1);
+            i++;
+        } else if (mask && !L->mode.s && kw_find(kw_mask_mode, t[i], tl[i], &kw)) {
+            bi_span(&L->mode, t, tl, i, i + 1);
+            i++;
+        } else if (kw_find(mask ? kw_mask_box : kw_bg_box, t[i], tl[i], &kw)) {
             if (L->nbox == 2 || (L->nbox == 1 && L->clip_only)) return false;
             L->box[L->nbox++] = kw;
             i++;
-        } else if (!L->clip_only && kw_find(kw_bg_clip, t[i], tl[i], &kw) && kw >= CSS_BG_CLIP_AREA) {
+        } else if (mask && !L->clip_only && ident_is(t[i], tl[i], "no-clip")) {
+            /* <coord-box> || [ <coord-box> | no-clip ]: no-clip is the second */
+            if (L->nbox == 2) return false;
+            L->clip_only = CSS_MASK_NO_CLIP;
+            i++;
+        } else if (!mask && !L->clip_only && kw_find(kw_bg_clip, t[i], tl[i], &kw) && kw >= CSS_BG_CLIP_AREA) {
             if (L->nbox == 2) return false;
             if (i + 1 < k && kw_find(kw_bg_clip, t[i + 1], tl[i + 1], &other) && other >= CSS_BG_CLIP_AREA && other != kw &&
                 (kw | other) == (CSS_BG_CLIP_AREA | CSS_BG_CLIP_TEXT)) {
@@ -3972,7 +4156,8 @@ static bool bg_layer_parse(const char *v, size_t n, bool final, struct cx *cx, s
             }
             L->clip_only = kw;
             i++;
-        } else if (!L->image.s && (image = bg_image_item(t[i], tl[i], cx, &url, &gradient)) != -2 &&
+        } else if (!L->image.s &&
+                   (image = mask ? mask_reference_parse(t[i], tl[i], cx, &reference) : bg_image_item(t[i], tl[i], cx, &url, &gradient)) != -2 &&
                    !(image == -1 && cx->supports_probe)) {
             bi_span(&L->image, t, tl, i, i + 1);
             i++;
@@ -3995,7 +4180,7 @@ static bool set_background(const char *v, size_t n, struct cx *cx) {
     int k = list_split(v, n, cx, &item, &il);
     if (!k || k > UINT16_MAX) return false;
     struct bg_layer_value *L = ar_alloc(cx->a, (size_t)k * sizeof *L);
-    for (int i = 0; i < k; i++) if (!bg_layer_parse(item[i], il[i], i == k - 1, cx, &L[i])) return false;
+    for (int i = 0; i < k; i++) if (!bg_layer_parse(item[i], il[i], i == k - 1, false, cx, &L[i])) return false;
     /* every layer's position, validated before any longhand is written */
     struct css_background parsed = css_background_initial;
     uint8_t *lists = ar_alloc(cx->a, (size_t)k * 3);
@@ -4046,6 +4231,182 @@ static bool set_background(const char *v, size_t n, struct cx *cx) {
     else set_long("background-size", "auto", 4, cx);
     bg_group_write(cx, &parsed, 1u << CSS_BG_ATTACHMENT | 1u << CSS_BG_CLIP | 1u << CSS_BG_ORIGIN | 3u << CSS_BG_LISTS);
     return true;
+}
+/* mask (css-masking-1 §7.9): the layers' longhands, in its canonical order, then mask-border's, which
+   it resets (§8.7) */
+enum { MK_IMAGE, MK_POSITION, MK_SIZE, MK_REPEAT, MK_ORIGIN, MK_CLIP, MK_COMPOSITE, MK_MODE, MK_LAYER_PARTS,
+       MK_PARTS = MK_LAYER_PARTS + 6 };
+static const char *const mask_names[MK_PARTS] = {
+    "mask-image", "mask-position", "mask-size", "mask-repeat", "mask-origin", "mask-clip", "mask-composite", "mask-mode",
+    "mask-border-source", "mask-border-slice", "mask-border-width", "mask-border-outset", "mask-border-repeat",
+    "mask-border-mode"};
+/* each one's initial value as serialized */
+static const char *const mask_initial_text[MK_PARTS] = {
+    "none", "0% 0%", "auto", "repeat", "border-box", "border-box", "add", "match-source",
+    "none", "0", "auto", "0", "stretch", "alpha"};
+static bool mask_shorthand_apply(const char *v, size_t n, bool global, struct cx *cx) {
+    if (global) {
+        for (int i = 0; i < MK_PARTS; i++) set_long(mask_names[i], v, n, cx);
+        return true;
+    }
+    const char **item;
+    size_t *il;
+    int k = list_split(v, n, cx, &item, &il);
+    if (!k || k > UINT16_MAX) return false;
+    struct bg_layer_value *L = ar_alloc(cx->a, (size_t)k * sizeof *L);
+    for (int i = 0; i < k; i++) if (!bg_layer_parse(item[i], il[i], false, true, cx, &L[i])) return false;
+    /* each longhand's list: a layer's part as written, an omitted one its initial value; one box sets
+       the origin and the clip, two the origin then the clip, no-clip the clip */
+    sbuf text[MK_LAYER_PARTS] = {{0}};
+    for (int i = 0; i < k; i++) {
+        const struct bg_layer_value *x = &L[i];
+        const struct bi_span *given[MK_LAYER_PARTS] = {&x->image, &x->position, &x->size, &x->repeat, NULL, NULL,
+                                                      &x->composite, &x->mode};
+        uint8_t origin = x->nbox ? x->box[0] : CSS_BOX_BORDER;
+        uint8_t clip = x->clip_only ? x->clip_only : x->nbox == 2 ? x->box[1] : origin;
+        for (int part = 0; part < MK_LAYER_PARTS; part++) {
+            if (i) sb_puts(&text[part], ", ");
+            if (part == MK_ORIGIN) sb_puts(&text[part], kw_name(kw_mask_box, origin));
+            else if (part == MK_CLIP) sb_puts(&text[part], kw_name(kw_mask_clip, clip));
+            else if (given[part]->s) sb_put(&text[part], given[part]->s, given[part]->n);
+            else sb_puts(&text[part], mask_initial_text[part]);
+        }
+    }
+    for (int part = 0; part < MK_LAYER_PARTS; part++) {
+        size_t length = text[part].n;
+        char *value = ar_strndup(cx->a, text[part].p ? text[part].p : "", length);
+        sb_free(&text[part]);
+        set_long(mask_names[part], value, length, cx);
+    }
+    for (int part = MK_LAYER_PARTS; part < MK_PARTS; part++)
+        set_long(mask_names[part], mask_initial_text[part], strlen(mask_initial_text[part]), cx);
+    return true;
+}
+/* item i of a comma-separated list (commas outside parentheses and strings), trimmed; false past its
+   end */
+static bool list_item_at(const char *s, size_t n, uint32_t i, const char **item, size_t *length) {
+    size_t start = 0;
+    int depth = 0;
+    char q = 0;
+    for (size_t at = 0; at <= n; at++) {
+        char c = at < n ? s[at] : ',';
+        if (at < n && q) { if (c == '\\') at++; else if (c == q) q = 0; continue; }
+        if (c == '"' || c == '\'') q = c;
+        else if (c == '(') depth++;
+        else if (c == ')') depth--;
+        else if (c == ',' && (depth <= 0 || at == n)) {
+            if (!i--) {
+                *item = s + start;
+                *length = at - start;
+                trim(item, length);
+                return true;
+            }
+            start = at + 1;
+        }
+    }
+    return false;
+}
+static uint32_t list_count(const char *s, size_t n) {
+    uint32_t count = 0;
+    const char *item;
+    size_t length;
+    while (list_item_at(s, n, count, &item, &length)) count++;
+    return count;
+}
+static bool text_same(const char *a, size_t an, const char *b, size_t bn);
+static bool text_word(const char *a, size_t an, const char *word);
+/* mask's value from its longhands' (v, in mask_names' order): each layer's parts in the canonical
+   order, those at their initial values left out (none when all are); false when mask-border is not
+   at its initial value, or (a declared value, !repeat) the lists' lengths differ. repeat: computed
+   lists, layer i taking item i mod n of each (css-backgrounds-3 §2.2) */
+static bool mask_shorthand_text(const char *const *v, const size_t *l, bool repeat, sbuf *out) {
+    for (int part = MK_LAYER_PARTS; part < MK_PARTS; part++)
+        if (!text_word(v[part], l[part], mask_initial_text[part])) return false;
+    uint32_t count[MK_LAYER_PARTS];
+    for (int part = 0; part < MK_LAYER_PARTS; part++) {
+        count[part] = list_count(v[part], l[part]);
+        if (!count[part] || (!repeat && count[part] != count[MK_IMAGE])) return false;
+    }
+    for (uint32_t i = 0; i < count[MK_IMAGE]; i++) {
+        const char *t[MK_LAYER_PARTS];
+        size_t tl[MK_LAYER_PARTS];
+        for (int part = 0; part < MK_LAYER_PARTS; part++)
+            list_item_at(v[part], l[part], i % count[part], &t[part], &tl[part]);
+        if (i) sb_puts(out, ", ");
+        size_t at = out->n;
+#define MASK_PUT(x, xl) do { if (out->n > at) sb_putc(out, ' '); sb_put(out, x, xl); } while (0)
+#define MASK_INITIAL(part) text_word(t[part], tl[part], mask_initial_text[part])
+        if (!MASK_INITIAL(MK_IMAGE)) MASK_PUT(t[MK_IMAGE], tl[MK_IMAGE]);
+        bool sized = !MASK_INITIAL(MK_SIZE);
+        if (sized || !MASK_INITIAL(MK_POSITION)) {
+            MASK_PUT(t[MK_POSITION], tl[MK_POSITION]);
+            if (sized) { sb_puts(out, " / "); sb_put(out, t[MK_SIZE], tl[MK_SIZE]); }
+        }
+        if (!MASK_INITIAL(MK_REPEAT)) MASK_PUT(t[MK_REPEAT], tl[MK_REPEAT]);
+        /* one box for both; no-clip alone over a border-box origin; else the origin, then the clip */
+        if (token_ieq(t[MK_ORIGIN], tl[MK_ORIGIN], t[MK_CLIP], tl[MK_CLIP])) {
+            if (!MASK_INITIAL(MK_ORIGIN)) MASK_PUT(t[MK_ORIGIN], tl[MK_ORIGIN]);
+        } else if (MASK_INITIAL(MK_ORIGIN) && text_word(t[MK_CLIP], tl[MK_CLIP], "no-clip")) {
+            MASK_PUT(t[MK_CLIP], tl[MK_CLIP]);
+        } else {
+            MASK_PUT(t[MK_ORIGIN], tl[MK_ORIGIN]);
+            MASK_PUT(t[MK_CLIP], tl[MK_CLIP]);
+        }
+        if (!MASK_INITIAL(MK_COMPOSITE)) MASK_PUT(t[MK_COMPOSITE], tl[MK_COMPOSITE]);
+        if (!MASK_INITIAL(MK_MODE)) MASK_PUT(t[MK_MODE], tl[MK_MODE]);
+        if (out->n == at) sb_puts(out, "none");
+#undef MASK_INITIAL
+#undef MASK_PUT
+    }
+    return true;
+}
+/* its specified value: its longhands' as specified, put back together */
+struct mask_specified_parts { sbuf text[MK_PARTS]; };
+static void mask_specified_part(void *opaque, const char *name, const char *value, size_t n) {
+    struct mask_specified_parts *parts = opaque;
+    for (int i = 0; i < MK_PARTS; i++) {
+        if (strcmp(name, mask_names[i])) continue;
+        parts->text[i].n = 0;
+        if (!css_specified_longhand(name, value, n, &parts->text[i])) {
+            parts->text[i].n = 0;
+            sb_put(&parts->text[i], value, n);
+        }
+        sb_cstr(&parts->text[i]);
+    }
+}
+static bool mask_specified(const struct propdef *p, const char *v, size_t n, sbuf *out) {
+    struct mask_specified_parts parts;
+    memset(&parts, 0, sizeof parts);
+    bool ok = css_shorthand_expand(p, v, n, mask_specified_part, &parts) == 1;
+    const char *text[MK_PARTS];
+    size_t length[MK_PARTS];
+    for (int i = 0; i < MK_PARTS; i++) {
+        text[i] = parts.text[i].p ? parts.text[i].p : "";
+        length[i] = parts.text[i].n;
+    }
+    size_t begin = out->n;
+    ok = ok && mask_shorthand_text(text, length, false, out);
+    if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    for (int i = 0; i < MK_PARTS; i++) sb_free(&parts.text[i]);
+    return ok;
+}
+/* its computed value: its longhands' computed values put back together */
+static bool mask_computed(const style_t *st, sbuf *out, web_doc *d) {
+    sbuf text[MK_PARTS];
+    memset(text, 0, sizeof text);
+    bool ok = true;
+    for (int i = 0; ok && i < MK_PARTS; i++) {
+        ok = css_computed_value(st, css_prop_lookup(mask_names[i], strlen(mask_names[i])), &text[i], d);
+        sb_cstr(&text[i]);
+    }
+    const char *v[MK_PARTS];
+    size_t l[MK_PARTS];
+    for (int i = 0; i < MK_PARTS; i++) { v[i] = text[i].p ? text[i].p : ""; l[i] = text[i].n; }
+    size_t begin = out->n;
+    ok = ok && mask_shorthand_text(v, l, true, out);
+    if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    for (int i = 0; i < MK_PARTS; i++) sb_free(&text[i]);
+    return ok;
 }
 
 /* ---------------------------------------------------------------- lists, counters and generated content */
@@ -5215,10 +5576,8 @@ static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src,
         dst->grad[0] = src->grad[0];
         dst->grad[1] = src->grad[1];
         break;
-    case PT_MASK_IMAGE: dst->mask_img=src->mask_img;break;
     case PT_ZINDEX: dst->z_auto = src->z_auto; break;
     case PT_BG_SIZE: dst->bg_size_kind = src->bg_size_kind; break;
-    case PT_MASK_SIZE: dst->mask_size_kind = src->mask_size_kind; break;
     case PT_COLOR_SCHEME: dst->color_scheme_text = src->color_scheme_text; break;
     }
 }
@@ -5459,7 +5818,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     /* a group's field: parsed into a copy of the group, which s takes when the value is valid */
     union { struct css_float_shape float_shape; struct css_offset offset; struct css_gap_rules gap_rules;
             struct css_anchor anchor; struct css_counters counters; struct css_list list;
-            struct css_background background; struct css_border_image border_image; } own;
+            struct css_background background; struct css_border_image border_image; struct css_mask mask; } own;
     memcpy(&own, group_of(s, p->group), group_size(p->group));
     if (!apply_value(p, v, n, cx, (char *)&own + p->off)) return false;
     group_write(s, p->group, &own, cx->a);
@@ -5718,8 +6077,10 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
     case PT_BI_SIDES: return parse_bi_sides(p->flags, v, n, cx, (struct css_bi_side *)field);
     case PT_BI_REPEAT: return parse_bi_repeat(v, n, (uint8_t *)field);
     case PT_BG_SIZE: return parse_bg_size(v, n, cx, s->bg_size, &s->bg_size_kind);
-    case PT_MASK_SIZE: return parse_bg_size(v, n, cx, s->mask_size, &s->mask_size_kind);
-    case PT_MASK_IMAGE: return parse_mask_image(v, n, cx);
+    case PT_MASK_IMAGE: return parse_mask_images(v, n, cx, (struct css_layer_images *)field);
+    case PT_MASK_REPEAT: return parse_repeat_styles(v, n, cx, (struct css_bg_keywords *)field);
+    case PT_MASK_POSITION: return parse_bg_positions(v, n, false, cx, (struct css_bg_offsets *)field);
+    case PT_MASK_SIZE: return parse_layer_sizes(v, n, cx, (struct css_layer_sizes *)field);
     case PT_GTEMPLATE: return parse_gtemplate(v, n, cx, (const struct gtemplate **)field);
     case PT_GAREAS: return parse_gareas(v, n, cx, &s->grid_areas);
     case PT_GLINE: return parse_gline(v, n, cx, (struct gline *)field);
@@ -6174,6 +6535,7 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     case SH_BACKGROUND_POSITION: return bg_position_apply(v, n, global, cx);
     case SH_BORDER_IMAGE: return bi_shorthand_apply(false, v, n, global, cx);
     case SH_MASK_BORDER: return bi_shorthand_apply(true, v, n, global, cx);
+    case SH_MASK: return mask_shorthand_apply(v, n, global, cx);
     case SH_FLEX:
         if (global) {
             set_long("flex-grow", v, n, cx);
@@ -6937,6 +7299,15 @@ bool css_shorthand_serialize(const struct propdef *p, const char *const *v, cons
         if (out->n == at) sb_puts(out, "none");
         return true;
     }
+    case SH_MASK: {
+        if (count != MK_PARTS) return false;
+        for (int i = 0; i < MK_PARTS; i++) if (strcmp(names[i], mask_names[i])) return false;
+        size_t at = out->n;
+        if (mask_shorthand_text(v, l, false, out)) return true;
+        out->n = at;
+        if (out->p && at < out->cap) out->p[at] = 0;
+        return false;
+    }
     case SH_GRID_ROW: case SH_GRID_COLUMN:
         if (count != 2) return false;
         sb_put(out, v[0], l[0]);
@@ -7512,13 +7883,43 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
             if (st->text_decoration & TD_LINE_THROUGH) { if (!first) sb_putc(out, ' '); sb_puts(out, "line-through"); }
         }
         break;
-    case PT_BG_IMAGE: case PT_MASK_IMAGE: {
-        const char *url = p->type == PT_BG_IMAGE ? st->bg_image : st->mask_image;
-        if (p->type == PT_BG_IMAGE && st->has_grad) return false;
-        if (!url) { sb_puts(out, "none"); break; }
-        sb_puts(out, "url(\"");
-        for (const char *c = url; *c; c++) { if (*c == '"' || *c == '\\') sb_putc(out, '\\'); sb_putc(out, *c); }
-        sb_puts(out, "\")");
+    case PT_BG_IMAGE: {
+        if (st->has_grad) return false;
+        if (!st->bg_image) { sb_puts(out, "none"); break; }
+        url_text(out, st->bg_image);
+        break;
+    }
+    /* the mask layers' lists (css-masking-1 §7): a gradient as written (its computed form has no
+       serializer yet) */
+    case PT_MASK_IMAGE: {
+        const struct css_layer_images *l = (const struct css_layer_images *)field;
+        for (uint32_t i = 0; i < l->n; i++) {
+            if (i) sb_puts(out, ", ");
+            if (!l->v[i]) sb_puts(out, "none");
+            else if (l->v[i]->kind == CSS_IMAGE_URL) url_text(out, l->v[i]->url ? l->v[i]->url : "");
+            else image_text(l->v[i], out);
+        }
+        break;
+    }
+    case PT_MASK_REPEAT: {
+        const struct css_bg_keywords *l = (const struct css_bg_keywords *)field;
+        for (uint32_t i = 0; i < l->n; i++) { if (i) sb_puts(out, ", "); repeat_style_text(l->v[i], out); }
+        break;
+    }
+    case PT_MASK_POSITION: {
+        const struct css_bg_offsets *l = (const struct css_bg_offsets *)field;
+        uint32_t count = l[0].n > l[1].n ? l[0].n : l[1].n;
+        for (uint32_t i = 0; ok && i < count; i++) {
+            if (i) sb_puts(out, ", ");
+            ok = bg_offset_text(0, &l[0].v[i % l[0].n], out, d);
+            sb_putc(out, ' ');
+            ok = ok && bg_offset_text(1, &l[1].v[i % l[1].n], out, d);
+        }
+        break;
+    }
+    case PT_MASK_SIZE: {
+        const struct css_layer_sizes *l = (const struct css_layer_sizes *)field;
+        for (uint32_t i = 0; ok && i < l->n; i++) { if (i) sb_puts(out, ", "); ok = layer_size_text(&l->v[i], out, d); }
         break;
     }
     case PT_GLINE: {
@@ -7535,12 +7936,12 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
     case PT_BOX_SHADOW: anim_shadow_list_text(out, st); break;
     case PT_RADIUS: ok = anim_pair_text(out, ((const struct css_corner_radius *)field)->axis, d); break;
     case PT_BG_POS: case PT_TRANSFORM_ORIGIN: ok = anim_pair_text(out, (const len_t *)field, d); break;
-    case PT_BG_SIZE: case PT_MASK_SIZE: {
-        uint8_t kind = p->type == PT_BG_SIZE ? st->bg_size_kind : st->mask_size_kind;
+    case PT_BG_SIZE: {
+        uint8_t kind = st->bg_size_kind;
         if (kind == BSZ_COVER) sb_puts(out, "cover");
         else if (kind == BSZ_CONTAIN) sb_puts(out, "contain");
         else if (kind == BSZ_AUTO) sb_puts(out, "auto");
-        else ok = anim_pair_text(out, p->type == PT_BG_SIZE ? st->bg_size : st->mask_size, d);
+        else ok = anim_pair_text(out, st->bg_size, d);
         break;
     }
     case PT_TRANSFORM: ok = tf_pairs(out, st->transform, st->transform, 1, 0, MIX, d); break;
@@ -7631,8 +8032,12 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
     }
     case PT_BG_SIZE: return a->bg_size_kind == b->bg_size_kind && css_length_equal(&a->bg_size[0], &b->bg_size[0]) &&
         css_length_equal(&a->bg_size[1], &b->bg_size[1]);
-    case PT_MASK_SIZE: return a->mask_size_kind == b->mask_size_kind && css_length_equal(&a->mask_size[0], &b->mask_size[0]) &&
-        css_length_equal(&a->mask_size[1], &b->mask_size[1]);
+    case PT_MASK_SIZE: return layer_sizes_equal((const struct css_layer_sizes *)fa, (const struct css_layer_sizes *)fb);
+    case PT_MASK_IMAGE: return layer_images_equal((const struct css_layer_images *)fa, (const struct css_layer_images *)fb);
+    case PT_MASK_REPEAT: return bg_keywords_equal((const struct css_bg_keywords *)fa, (const struct css_bg_keywords *)fb);
+    case PT_MASK_POSITION:
+        return bg_offsets_equal(&((const struct css_bg_offsets *)fa)[0], &((const struct css_bg_offsets *)fb)[0]) &&
+               bg_offsets_equal(&((const struct css_bg_offsets *)fa)[1], &((const struct css_bg_offsets *)fb)[1]);
     case PT_TRANSFORM: case PT_ROTATE: case PT_SCALE:
         return tf_equal(*(const struct css_transform *const *)fa, *(const struct css_transform *const *)fb);
     case PT_TRANSLATE: return a->translate.active == b->translate.active && css_length_equal(&a->translate.xy[0], &b->translate.xy[0]) &&
@@ -7680,7 +8085,6 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
     case PT_QUOTES: return quotes_equal(css_style_list(a)->quotes, css_style_list(b)->quotes);
     case PT_COUNTER: return counter_ops_equal(css_style_counters(a)->ops[p->flags], css_style_counters(b)->ops[p->flags]);
     case PT_BG_IMAGE: return same_text(a->bg_image, b->bg_image) && a->has_grad == b->has_grad && a->gradient == b->gradient;
-    case PT_MASK_IMAGE: return same_text(a->mask_image, b->mask_image);
     case PT_GLINE: {
         const struct gline *x = (const struct gline *)fa, *y = (const struct gline *)fb;
         return x->kind == y->kind && x->n == y->n && same_text(x->name, y->name);
@@ -7847,24 +8251,69 @@ static bool rule_lists_combine(const struct css_anim_ctx *c, int kind, const sty
 
 /* -------- the background and border-image groups (css-backgrounds-3 §3.6, §6.2-§6.4; css-masking-1
    §8.2-§8.4; Web Animations 1 §5.3) */
+/* one offset of a position's axis: a <length-percentage> from the start side */
+static bool bg_offset_mix(const struct css_anim_ctx *c, const struct css_bg_offset *u, const struct css_bg_offset *v,
+                          double ka, double kb, sbuf *out) {
+    len_t lu = bg_offset_from_start(u, c->a), lv = bg_offset_from_start(v, c->a);
+    if (lu.kind == LK_LEN && lv.kind == LK_LEN) { /* a percentage stays one at zero */
+        double px = lu.px * ka + lv.px * kb, pct = lu.pct * ka + lv.pct * kb;
+        if (fabs(px) < 1e-9 && (fabs(pct) >= 1e-9 || (u->percent && ka != 0) || (v->percent && kb != 0))) {
+            anim_unit(out, pct, "%");
+            return true;
+        }
+    }
+    return anim_len(out, &lu, &lv, ka, kb, LF_NEG, c->d);
+}
+static bool anim_cancelled(const struct css_anim_ctx *c, uint64_t i) {
+    return !(i & 1023) && c->d && __atomic_load_n(&c->d->native_cancelled, __ATOMIC_ACQUIRE);
+}
 /* background-position-x, -y: a repeatable list of <length-percentage>s from the start side */
 static bool bg_offsets_combine(const struct css_anim_ctx *c, const struct css_bg_offsets *x, const struct css_bg_offsets *y,
                                double ka, double kb, sbuf *out) {
     uint64_t n = rule_lcm(x->n, y->n);
     if (!n) return false;
     for (uint64_t i = 0; i < n; i++) {
-        if (!(i & 1023) && c->d && __atomic_load_n(&c->d->native_cancelled, __ATOMIC_ACQUIRE)) return false;
-        const struct css_bg_offset *u = &x->v[i % x->n], *v = &y->v[i % y->n];
-        len_t lu = bg_offset_from_start(u, c->a), lv = bg_offset_from_start(v, c->a);
-        if (i && !length_append(out, ", ", 2)) return false;
-        if (lu.kind == LK_LEN && lv.kind == LK_LEN) { /* a percentage stays one at zero */
-            double px = lu.px * ka + lv.px * kb, pct = lu.pct * ka + lv.pct * kb;
-            if (fabs(px) < 1e-9 && (fabs(pct) >= 1e-9 || (u->percent && ka != 0) || (v->percent && kb != 0))) {
-                anim_unit(out, pct, "%");
-                continue;
-            }
+        if (anim_cancelled(c, i) || (i && !length_append(out, ", ", 2))) return false;
+        if (!bg_offset_mix(c, &x->v[i % x->n], &y->v[i % y->n], ka, kb, out)) return false;
+    }
+    return true;
+}
+/* mask-position (css-masking-1 §7.4): a repeatable list of positions, each axis as above */
+static bool mask_positions_combine(const struct css_anim_ctx *c, const struct css_bg_offsets *x, const struct css_bg_offsets *y,
+                                   double ka, double kb, sbuf *out) {
+    uint64_t n = rule_lcm(x[0].n, y[0].n);
+    if (!n || x[1].n != x[0].n || y[1].n != y[0].n) return false;
+    for (uint64_t i = 0; i < n; i++) {
+        if (anim_cancelled(c, i) || (i && !length_append(out, ", ", 2))) return false;
+        for (int axis = 0; axis < 2; axis++)
+            if ((axis && !length_append(out, " ", 1)) ||
+                !bg_offset_mix(c, &x[axis].v[i % x[axis].n], &y[axis].v[i % y[axis].n], ka, kb, out))
+                return false;
+    }
+    return true;
+}
+/* mask-size (§7.7): a repeatable list of <bg-size>s; a width or height auto only with auto, cover and
+   contain only with themselves; otherwise the value is discrete */
+static bool mask_sizes_combine(const struct css_anim_ctx *c, const struct css_layer_sizes *x, const struct css_layer_sizes *y,
+                               double ka, double kb, sbuf *out) {
+    uint64_t n = rule_lcm(x->n, y->n);
+    if (!n) return false;
+    for (uint64_t i = 0; i < n; i++) {
+        if (anim_cancelled(c, i) || (i && !length_append(out, ", ", 2))) return false;
+        const struct css_layer_size *u = &x->v[i % x->n], *v = &y->v[i % y->n];
+        bool lu = u->kind == BSZ_LEN || u->kind == BSZ_AUTO, lv = v->kind == BSZ_LEN || v->kind == BSZ_AUTO;
+        if (!lu || !lv) {
+            if (u->kind != v->kind) return false;
+            if (!layer_size_text(u, out, c->d)) return false;
+            continue;
         }
-        if (!anim_len(out, &lu, &lv, ka, kb, LF_NEG, c->d)) return false;
+        for (int axis = 0; axis < 2; axis++) {
+            if (axis && !length_append(out, " ", 1)) return false;
+            bool au = u->v[axis].kind == LK_AUTO, av = v->v[axis].kind == LK_AUTO;
+            if (au != av) return false;
+            if (au) sb_puts(out, "auto");
+            else if (!anim_len(out, &u->v[axis], &v->v[axis], ka, kb, 0, c->d)) return false;
+        }
     }
     return true;
 }
@@ -7941,16 +8390,19 @@ static bool anim_combine(const struct css_anim_ctx *c, const struct propdef *p, 
         const len_t *x = (const len_t *)fa, *y = (const len_t *)fb;
         return anim_len(out, &x[0], &y[0], ka, kb, LF_NEG, d) && length_append(out, " ", 1) && anim_len(out, &x[1], &y[1], ka, kb, LF_NEG, d);
     }
-    case PT_BG_SIZE: case PT_MASK_SIZE: {
-        bool bg = p->type == PT_BG_SIZE;
-        uint8_t kx = bg ? a->bg_size_kind : a->mask_size_kind, ky = bg ? b->bg_size_kind : b->mask_size_kind;
+    case PT_BG_SIZE: {
+        uint8_t kx = a->bg_size_kind, ky = b->bg_size_kind;
         if (kx != BSZ_LEN || ky != BSZ_LEN) {
             if (kx != ky) return false;
             return css_computed_value(a, p, out, d);
         }
-        const len_t *x = bg ? a->bg_size : a->mask_size, *y = bg ? b->bg_size : b->mask_size;
+        const len_t *x = a->bg_size, *y = b->bg_size;
         return anim_len(out, &x[0], &y[0], ka, kb, 0, d) && length_append(out, " ", 1) && anim_len(out, &x[1], &y[1], ka, kb, 0, d);
     }
+    case PT_MASK_SIZE:
+        return mask_sizes_combine(c, (const struct css_layer_sizes *)fa, (const struct css_layer_sizes *)fb, ka, kb, out);
+    case PT_MASK_POSITION:
+        return mask_positions_combine(c, (const struct css_bg_offsets *)fa, (const struct css_bg_offsets *)fb, ka, kb, out);
     case PT_TRANSFORM: return tf_list(out, a->transform, b->transform, ka, kb, mode, c->box, d);
     case PT_TRANSLATE:
         if (!a->translate.active && !b->translate.active) { sb_puts(out, "none"); return true; }

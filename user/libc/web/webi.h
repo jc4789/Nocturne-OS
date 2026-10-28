@@ -695,10 +695,43 @@ bool css_background_equal(const struct css_background *a, const struct css_backg
 static inline uint8_t css_bg_keyword(const struct css_background *bg, enum css_bg_list list, uint32_t layer) {
     return bg->list[list].v[layer % bg->list[list].n];
 }
-/* layer's position along axis (0 x, 1 y): its offset in px from the left or top, range being the
-   positioning area less the image (what a percentage is of; horizontal-tb, ltr: x-start is left,
-   y-start top) */
-float css_bg_offset_px(const struct css_background *bg, int axis, uint32_t layer, float range);
+/* layer's position along the axis whose offsets l are (background-position-x or -y, one axis of
+   mask-position): its offset in px from the left or top, range being the positioning area less the
+   image (what a percentage is of; horizontal-tb, ltr: x-start is left, y-start top) */
+float css_bg_offset_px(const struct css_bg_offsets *l, uint32_t layer, float range);
+/* CSS Masking 1 §7 (mask-image, -mode, -repeat, -position, -clip, -origin, -size, -composite) and
+   §9.2 (mask-type): the mask layers' values a style holds as one group (style_t's mask), none of
+   them inherited. Each layered one is a list of one value per layer as computed, as the background
+   group's are: the layers are mask-image's, and layer i uses item i mod n of each other list. */
+enum css_mask_list { CSS_MASK_MODE, CSS_MASK_REPEAT, CSS_MASK_CLIP, CSS_MASK_ORIGIN, CSS_MASK_COMPOSITE, CSS_MASK_LISTS };
+enum { CSS_MASK_MATCH_SOURCE, CSS_MASK_ALPHA, CSS_MASK_LUMINANCE };             /* <masking-mode> */
+enum { CSS_COMPOSITE_ADD, CSS_COMPOSITE_SUBTRACT, CSS_COMPOSITE_INTERSECT, CSS_COMPOSITE_EXCLUDE };
+/* origin and clip: a <coord-box> (CSS_BOX_*); clip also no-clip */
+#define CSS_MASK_NO_CLIP 0x10
+/* a <repeat-style> (css-backgrounds-3 §3.4), the item of mask-repeat's list: x << 2 | y */
+enum { CSS_REPEAT, CSS_REPEAT_SPACE, CSS_REPEAT_ROUND, CSS_REPEAT_NO };
+enum { CSS_MASK_TYPE_LUMINANCE, CSS_MASK_TYPE_ALPHA };                          /* mask-type */
+/* a <bg-size> (css-backgrounds-3 §3.9): kind BSZ_*; BSZ_LEN its width and height, LK_AUTO from the
+   other and the image's ratio */
+struct css_layer_size { len_t v[2]; uint8_t kind; };
+struct css_layer_sizes { const struct css_layer_size *v; uint32_t n; };
+/* mask-image's <mask-reference>s: none (NULL), or an <image> (css_image: a url() or a gradient) */
+struct css_layer_images { const struct css_image *const *v; uint32_t n; };
+struct css_mask {
+    struct css_layer_images image;
+    struct css_bg_keywords list[CSS_MASK_LISTS];
+    struct css_bg_offsets position[2]; /* mask-position's horizontal and vertical offsets */
+    struct css_layer_sizes size;
+    uint8_t type; /* mask-type: CSS_MASK_TYPE_* */
+};
+extern const struct css_mask css_mask_initial;
+bool css_mask_equal(const struct css_mask *a, const struct css_mask *b);
+/* some layer's mask-image is not none: the element is masked by its layers and is a stacking
+   context (§7.1, §7.10) */
+bool css_mask_layers_set(const struct css_mask *m);
+static inline uint8_t css_mask_keyword(const struct css_mask *m, enum css_mask_list list, uint32_t layer) {
+    return m->list[list].v[layer % m->list[list].n];
+}
 /* CSS Backgrounds 3 §6 (border-image-*) and CSS Masking 1 §8 (mask-border-*): one record type for
    both groups (style_t's border_image and mask_border), whose initial values differ. */
 enum { CSS_BI_STRETCH, CSS_BI_REPEAT, CSS_BI_ROUND, CSS_BI_SPACE };
@@ -1024,6 +1057,7 @@ typedef struct style {
     float svg_stop_opacity;
     len_t svg_stroke_width;
     uint8_t svg_fill_rule, svg_stroke_cap, svg_stroke_join;
+    uint8_t svg_clip_rule; /* clip-rule (css-masking-1 §5.2): 0 nonzero, 1 evenodd; inherited */
     uint32_t border_color[4];
     float border_width[4];
     uint32_t outline_color;
@@ -1072,11 +1106,8 @@ typedef struct style {
     uint8_t bg_repeat;    /* BR_* */
     uint8_t bg_size_kind; /* BSZ_* */
     len_t bg_size[2];     /* BSZ_LEN: width, height (LK_AUTO: from the other and the ratio) */
-    const char *mask_image; /* mask-image: the background colour shows through this image's alpha */
-    int mask_img;
-    uint8_t mask_repeat, mask_size_kind;
-    len_t mask_pos[2], mask_size[2];
-    uint32_t grad[2];     /* a gradient's first and last colour stops (for things that want one colour) */
+    const struct css_mask *mask; /* the mask layers and mask-type: a group not inherited; NULL: initial */
+    uint32_t grad[2];    /* a gradient's first and last colour stops (for things that want one colour) */
     bool has_grad;
     const struct gradient *gradient; /* the gradient itself, when has_grad */
     const struct gtemplate *grid_cols, *grid_rows, *grid_auto_cols, *grid_auto_rows; /* NULL: none / auto */
@@ -1123,6 +1154,9 @@ static inline const struct css_border_image *css_style_border_image(const style_
 }
 static inline const struct css_border_image *css_style_mask_border(const style_t *s) {
     return s->mask_border ? s->mask_border : &css_mask_border_initial;
+}
+static inline const struct css_mask *css_style_mask(const style_t *s) {
+    return s->mask ? s->mask : &css_mask_initial;
 }
 
 /* ---------------------------------------------------------------- stylesheets */
@@ -1715,6 +1749,11 @@ struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color);
    their clip-rule: clipPathUnits="objectBoundingBox" maps the unit square onto box (x y w h),
    userSpaceOnUse puts the origin at its corner. False when ref names no <clipPath>. */
 bool doc_svg_clip_markup(node_t *n, const char *ref, const float box[4], sbuf *out);
+/* A url() that names an element of d itself (CSS Values 4 §4.5.1: a fragment-only URL, or d's own
+   URL with a fragment): no resource to fetch. doc_svg_reference: the element it names in n's tree
+   (its document or shadow root), NULL when it names none or is not such a reference. */
+bool doc_url_local(const web_doc *d, const char *ref);
+node_t *doc_svg_reference(node_t *n, const char *ref);
 bool box_block_level(const box_t *b);
 
 struct run {
@@ -1787,9 +1826,10 @@ void box_counter_marker(web_doc *d, box_t *item, const char *s, size_t n, uint8_
 /* counter.c: count the document's counters again, after a publication made or retired a
    counting box (d->counters_dirty), and write the texts that changed */
 void web_counters_update(web_doc *d);
-/* an <image> of a style (a marker image): its index in d's images, registering it when first
-   used (doc.c); -1 when it is not a url() or cannot be fetched */
-int doc_css_image(web_doc *d, const struct css_image *image);
+/* an <image> of a style (a marker image, a mask layer): its index in d's images, registering it
+   with the CORS mode cors (WEB_IMAGE_*: masks are fetched "Anonymous", css-masking-1 §7.1) when
+   first used (doc.c); -1 when it is not a url() or cannot be fetched */
+int doc_css_image(web_doc *d, const struct css_image *image, int cors);
 /* A Text node's text box: for each byte of its processed text (white space collapsed,
    transformed), the byte of the node's data it came from, and the data's length at [t->len].
    Allocated in a. NULL when t is not a Text node's box, or the data has changed since. */
