@@ -1412,7 +1412,7 @@ static bool html_image(const node_t *n) { return n && n->type == N_ELEM && !n->f
 static const char *fetch_client_referrer_source(web_doc *document) {
     if(!document||(document->sandbox_flags&SB_ORIGIN))return "";
     const char *effective=web_effective_url(document);
-    if(strncasecmp(effective,"http://",7)&&strncasecmp(effective,"https://",8))return "";
+    if(!web_url_has_scheme(effective,"http")&&!web_url_has_scheme(effective,"https"))return "";
     /* Window client origin must not be opaque. For srcdoc, Referrer Policy
        walks container documents; never return an opaque ancestor's URL. */
     while(document&&document->url&&!strcmp(document->url,"about:srcdoc")){
@@ -1580,9 +1580,9 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     if(!strcmp(p,"fetchClientReferrer"))return JS_NewString(ctx,fetch_client_referrer_source(d));
     if(!strcmp(p,"fetchOrigin")){
         if(d->sandbox_flags&SB_ORIGIN)return JS_NewString(ctx,"null");
-        char *origin=NULL;enum http_url_result status=http_origin_owned(web_effective_url(d),&origin);
-        if(status==HTTP_URL_OOM)return oom(ctx);
-        JSValue value=JS_NewString(ctx,status==HTTP_URL_TUPLE?origin:"null");free(origin);return value;
+        char *origin=NULL;enum web_url_result status=web_url_origin(web_effective_url(d),&origin);
+        if(status==WEB_URL_OOM)return oom(ctx);
+        JSValue value=JS_NewString(ctx,status==WEB_URL_TUPLE?origin:"null");free(origin);return value;
     }
     if (!strcmp(p, "contentType")) return JS_NewString(ctx, d->content_type ? d->content_type : "text/html");
     if (!strcmp(p, "htmlDocument")) return JS_NewBool(ctx, !d->xml); /* DOM "HTML document", node document of n */
@@ -4163,28 +4163,27 @@ uint64_t web_js_input_stream(web_doc *d) {
     return d && d->js ? d->js->stream_generation : 0;
 }
 
-static enum http_url_result make_origin(const char *url, char **out) {
-    return http_origin_owned(url, out);
-}
-/* No prefix comparison or empty-string fallback on parse/allocation failure.
-   Both results are transient native owners, including the failed second parse. */
+/* HTML's same origin of two URLs' origins (web_url_same_origin, the URL record's owner). */
 static bool same_origin_urls(const char *a, const char *b, bool *allocation_failed) {
-    char *x = NULL, *y = NULL;
-    enum http_url_result xr = make_origin(a, &x), yr = make_origin(b, &y);
-    *allocation_failed = xr == HTTP_URL_OOM || yr == HTTP_URL_OOM;
-    bool same = xr == HTTP_URL_TUPLE && yr == HTTP_URL_TUPLE && !strcmp(x, y);
-    free(x); free(y); return same;
+    int same = web_url_same_origin(a, b);
+    *allocation_failed = same < 0;
+    return same == 1;
 }
 #include "js_html_safety_host.h"
 #include "js_pi_native.h"
 #include "js_collections_native.h"
+/* url is a serialization the URL parser gave (a resolved URL or a response's URL). An http(s)
+   URL is permitted when it is a URL without credentials: the engine's requests and navigations
+   never carry a username or password (Fetch's Request constructor turns them down, and nothing
+   here keeps an authentication entry that would send them). */
 static bool permitted_url(struct web_js_state *s, const char *url, bool fetch) {
-    if (!strncasecmp(url, "https://", 8) || !strncasecmp(url, "http://", 7)) {
-        struct url_owned parsed = {0};
-        bool ok = url_parse_owned(url, &parsed) && !strchr(parsed.host, '@');
-        url_owned_free(&parsed); return ok;
+    if (web_url_has_scheme(url, "https") || web_url_has_scheme(url, "http")) {
+        struct web_url record;
+        if (web_url_read(url, strlen(url), &record) != 1) return false;
+        bool ok = !web_url_includes_credentials(&record);
+        web_url_free(&record); return ok;
     }
-    if (fetch || strncasecmp(url, "file://", 7) || strncasecmp(s->doc->url, "file://", 7)) return false;
+    if (fetch || !web_url_has_scheme(url, "file") || !web_url_has_scheme(s->doc->url, "file")) return false;
     /* Resolution already removes dot segments. Encoded path separators and dot
        segments must not create a second, more privileged interpretation. */
     const char *u = url + 7, *base = s->doc->url + 7;
@@ -4197,8 +4196,8 @@ static bool permitted_url(struct web_js_state *s, const char *url, bool fetch) {
  * this does not grant a native fetch, navigation or local-file allowance. */
 static bool permitted_script_url(struct web_js_state *s,const char *url) {
     size_t length=strlen(url);
-    if (!strncasecmp(url,"data:",5)) return length<=JS_DATA_URL_LIMIT;
-    if (!strncasecmp(url,"blob:",5)) return length<=UINT32_MAX;
+    if (web_url_has_scheme(url,"data")) return length<=JS_DATA_URL_LIMIT;
+    if (web_url_has_scheme(url,"blob")) return length<=UINT32_MAX;
     return length<=UINT32_MAX && permitted_url(s,url,false);
 }
 static char *script_data_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]);
@@ -4371,9 +4370,9 @@ static JSValue native_url(JSContext *ctx, JSValueConst this_val, int argc, JSVal
 static const char *opfs_storage_url(JSContext *ctx) { struct web_js_state *s = state(ctx); return s && s->doc ? web_effective_url(s->doc) : NULL; }
 static JSValue native_origin(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     char *out = NULL;
-    enum http_url_result status = make_origin(web_effective_url(state(ctx)->doc), &out);
-    if (status == HTTP_URL_OOM) return JS_ThrowOutOfMemory(ctx);
-    JSValue result = JS_NewString(ctx, status == HTTP_URL_TUPLE ? out : "null");
+    enum web_url_result status = web_url_origin(web_effective_url(state(ctx)->doc), &out);
+    if (status == WEB_URL_OOM) return JS_ThrowOutOfMemory(ctx);
+    JSValue result = JS_NewString(ctx, status == WEB_URL_TUPLE ? out : "null");
     free(out); return result;
 }
 static JSValue native_class_id(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -4509,10 +4508,10 @@ static JSValue native_canvas(JSContext *ctx, JSValueConst this_val, int argc, JS
             for(unsigned i=0;i<sizeof known/sizeof *known;i++)if(!strcmp(type,known[i])) {
                 if(!(s->canvas_probe_seen&(1u<<i))) {
                     s->canvas_probe_seen|=1u<<i;
-                    char *origin=NULL;enum http_url_result parsed=http_origin_owned(web_effective_url(s->doc),&origin);
+                    char *origin=NULL;enum web_url_result parsed=web_url_origin(web_effective_url(s->doc),&origin);
                     char message[320];snprintf(message,sizeof message,
                         "Canvas context request: type=%s frame=%d connected=%d origin=%.160s",
-                        known[i],s->doc->frame_parent!=NULL,connected(s,node),parsed==HTTP_URL_TUPLE?origin:"null");
+                        known[i],s->doc->frame_parent!=NULL,connected(s,node),parsed==WEB_URL_TUPLE?origin:"null");
                     log_text(s,WEB_CONSOLE_TRACE,message);free(origin);
                 }
                 break;
@@ -5569,9 +5568,9 @@ static int pending_destination(const struct js_pending *p) {
 static bool send_request(struct web_js_state *s, struct js_pending *p, int kind, const char *method,
                          const char *headers, const void *body, size_t len) {
     if(s->disabled){pending_error(p,"Browsing context is inactive");return false;}
-    if ((p->kind==P_SCRIPT || p->kind==P_MODULE || p->kind==P_FONT || p->kind==P_CSS) && (!strncasecmp(p->url,"data:",5) || !strncasecmp(p->url,"blob:",5))) {
+    if ((p->kind==P_SCRIPT || p->kind==P_MODULE || p->kind==P_FONT || p->kind==P_CSS) && (web_url_has_scheme(p->url,"data") || web_url_has_scheme(p->url,"blob"))) {
         char mime[128];
-        p->response.body=!strncasecmp(p->url,"data:",5)
+        p->response.body=web_url_has_scheme(p->url,"data")
             ? script_data_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime)
             : script_blob_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime,NULL);
         if (!p->response.body) {
@@ -5680,7 +5679,7 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request, int 
     p->redirect_error = (policy & NJW_LOAD_REDIRECT_ERROR) != 0; p->force_preflight = (policy & NJW_LOAD_PREFLIGHT) != 0;
     p->no_cors = (policy & NJW_LOAD_NO_CORS) != 0; p->no_referrer = (policy & NJW_LOAD_NO_REFERRER) != 0;
     p->keepalive = keepalive; p->streaming = streaming; p->referrer_policy = referrer_policy;
-    bool blob = !strncasecmp(url,"blob:",5);
+    bool blob = web_url_has_scheme(url,"blob");
     if (strlen(url) > UINT32_MAX || (!blob && !permitted_url(s,url,true)) || (blob && kind == 2)) {
         pending_error(p,"Worker resource URL is not permitted"); return true;
     }
@@ -5784,7 +5783,7 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
             JS_FreeCString(ctx, url); return JS_ThrowTypeError(ctx, "Worker context retired during URL conversion");
         }
         bool allocation_failed = false;
-        bool blob = !strncasecmp(url,"blob:",5);
+        bool blob = web_url_has_scheme(url,"blob");
         bool allowed = strlen(url)<=UINT32_MAX && (blob || (permitted_url(s,url,true) &&
             same_origin_urls(web_effective_url(s->doc), url, &allocation_failed)));
         JS_FreeCString(ctx,url);
@@ -5806,9 +5805,9 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
     }
     if(op==0 || op==5){
         char *origin=NULL;
-        enum http_url_result parsed=make_origin(web_effective_url(s->doc),&origin);
-        if(parsed==HTTP_URL_OOM)return oom(ctx);
-        if(op==5 && parsed!=HTTP_URL_TUPLE){free(origin);return history_security_error(ctx,"SharedWorker requires a non-opaque document origin");}
+        enum web_url_result parsed=web_url_origin(web_effective_url(s->doc),&origin);
+        if(parsed==WEB_URL_OOM)return oom(ctx);
+        if(op==5 && parsed!=WEB_URL_TUPLE){free(origin);return history_security_error(ctx,"SharedWorker requires a non-opaque document origin");}
         bool origin_ok=web_worker_set_origin(s->workers,origin?origin:"");free(origin);
         web_worker_set_isolated(s->workers,s->doc->cross_origin_isolated);
         if(!origin_ok)return oom(ctx);
@@ -6367,7 +6366,7 @@ static char *normalize_module(JSContext *ctx, const char *base, const char *name
     }
     const char *resolve_base = base && *base ? base : s->doc->base;
     for (struct js_module *m = s->modules; m; m = m->next) if (!strcmp(m->url, resolve_base)) { resolve_base = m->base; break; }
-    if ((!strncasecmp(resolve_base,"data:",5) || !strncasecmp(resolve_base,"blob:",5)) &&
+    if ((web_url_has_scheme(resolve_base,"data") || web_url_has_scheme(resolve_base,"blob")) &&
         (name[0]=='/' || !strncmp(name,"./",2) || !strncmp(name,"../",3))) {
         JS_ThrowTypeError(ctx,"Relative module imports require a hierarchical base URL"); return NULL;
     }
@@ -6479,7 +6478,7 @@ static bool script_data_checkpoint(void *opaque) {
 /* Source loading shares Fetch's decoder; only the existing source-loader MIME
  * essence contract and its JavaScript-module check belong to this adapter. */
 static char *script_data_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]) {
-    if (!permitted_script_url(s,url) || strncasecmp(url,"data:",5)) {
+    if (!permitted_script_url(s,url) || !web_url_has_scheme(url,"data")) {
         JS_ThrowTypeError(s->ctx,"Data script URL exceeds the URL limit"); return NULL;
     }
     struct web_data_url data;int result=web_data_url_process(url,&data,script_data_checkpoint,s);
@@ -6611,7 +6610,7 @@ static void module_received(struct web_js_state *s,struct js_pending *p) {
     if(!m || !m->fetching || !p->done)return;
     bool ok=!p->response.error[0] && p->response.status>=200 && p->response.status<300 &&
         (!p->response.body_len||p->response.body) &&
-        (!strncasecmp(p->url,"file://",7)||javascript_mime(web_response_headers(&p->response))) &&
+        (web_url_has_scheme(p->url,"file")||javascript_mime(web_response_headers(&p->response))) &&
         (!web_response_url(&p->response)[0]||permitted_url(s,web_response_url(&p->response),false));
     if(ok)ok=module_integrity(s,p->integrity,p->response.body,p->response.body_len);
     if(ok) {
@@ -6674,7 +6673,7 @@ static void module_descendants(struct web_js_state *s,struct js_module *m) {
         char *url=specifier?normalize_module(s->ctx,m->url,specifier,s):NULL;
         JS_FreeCString(s->ctx,specifier);
         if(!url){JS_FreeValue(s->ctx,JS_GetException(s->ctx));continue;}
-        struct js_module *child=strncasecmp(url,"data:",5)&&strncasecmp(url,"blob:",5)&&permitted_script_url(s,url)?
+        struct js_module *child=!web_url_has_scheme(url,"data")&&!web_url_has_scheme(url,"blob")&&permitted_script_url(s,url)?
             request_module(s,url,m->credentials,NULL,m->base,m->referrer_policy):NULL;
         js_free(s->ctx,url);
         if(child){child->users++;children[n++]=child;}
@@ -6772,9 +6771,9 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
         module_received(s,pending);
     }
     if(m && m->fetch_failed){JS_ThrowReferenceError(ctx,"Module fetch failed: %s",url);return NULL;}
-    if (!m && (!strncasecmp(url,"data:",5) || !strncasecmp(url,"blob:",5))) {
+    if (!m && (web_url_has_scheme(url,"data") || web_url_has_scheme(url,"blob"))) {
         size_t length; char mime[128];
-        char *source=!strncasecmp(url,"data:",5)
+        char *source=web_url_has_scheme(url,"data")
             ? script_data_source(s,url,true,&length,mime)
             : script_blob_source(s,url,true,&length,mime,NULL);
         if (!source) return NULL;
@@ -6817,7 +6816,7 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
             web_response_free(r); js_free(ctx,diagnostic);
             JS_ThrowTypeError(ctx,"Module browsing context changed during native loading"); return NULL;
         }
-        bool local = !strncasecmp(url, "file://", 7);
+        bool local = web_url_has_scheme(url, "file");
         if (!ok || r->error[0] || r->status < 200 || r->status >= 300 || r->body_len > JS_SOURCE_LIMIT || (r->body_len && !r->body) ||
             strlen(web_response_headers(r)) > WEB_RESPONSE_HEADERS_MAX ||
             (!local && !javascript_mime(web_response_headers(r))) || (web_response_url(r)[0] && !permitted_url(s, web_response_url(r), false))) {
@@ -6884,7 +6883,7 @@ static int import_module(JSContext *ctx,const char *basename,const char *specifi
     if(!module_context_current(s,s->doc->root)){JS_ThrowTypeError(ctx,"Module browsing context is inactive");return -1;}
     char *url=normalize_module(ctx,basename,specifier,s);
     if(!url)return -1;
-    struct js_module *m=strncasecmp(url,"data:",5)&&strncasecmp(url,"blob:",5)&&permitted_script_url(s,url)?
+    struct js_module *m=!web_url_has_scheme(url,"data")&&!web_url_has_scheme(url,"blob")&&permitted_script_url(s,url)?
         request_module(s,url,1,NULL,NULL,0):NULL;
     js_free(ctx,url);
     struct js_import *p=m&&!module_graph_settled(s,m)?js_mallocz(ctx,sizeof *p):NULL;
@@ -7291,7 +7290,7 @@ static void sync_parser_body_handlers(struct web_js_state *s) {
    goes on; ready_script runs it once that finishes. */
 static void compile_elsewhere(struct web_js_state *s, struct js_script *script) {
     char *origin = NULL;
-    if ((s->doc->sandbox_flags & SB_ORIGIN) || http_origin_owned(web_effective_url(s->doc), &origin) != HTTP_URL_TUPLE) origin = NULL;
+    if ((s->doc->sandbox_flags & SB_ORIGIN) || web_url_origin(web_effective_url(s->doc), &origin) != WEB_URL_TUPLE) origin = NULL;
     script->compile = js_compile_start(script->source, script->len, script->url, origin);
     free(origin);
 }
@@ -7672,7 +7671,7 @@ failed:
    or a network error has neither. */
 static void resource_timing(struct web_js_state *s, struct js_pending *p) {
     if (s->disabled || !JS_IsObject(s->hooks) || p->kind==P_POLICY_REPORT || !p->url ||
-        (strncasecmp(p->url,"https://",8) && strncasecmp(p->url,"http://",7))) return;
+        (!web_url_has_scheme(p->url,"https") && !web_url_has_scheme(p->url,"http"))) return;
     const struct http_fetch_timing *t=&p->response.timing;
     bool failed=p->response.error[0],exposed=p->kind!=P_FRAME || (t->valid && t->redirect_same_origin);
     bool opaque_body;int status=0;char type[sizeof p->timing_type]="";
@@ -7901,7 +7900,7 @@ static bool process_pending(struct web_js_state *s) {
         if (!p->done && now >= p->deadline) { if (s->host.cancel) s->host.cancel(s->host.opaque, p->id); pending_error(p, "Resource request exceeded its deadline"); }
         if (!p->done) { link = &p->next; continue; }
         if (ran_task && !s->disabled && (p->kind == P_FETCH ||
-            (p->kind == P_WORKER && !strncasecmp(p->url,"blob:",5)))) { link = &p->next; continue; }
+            (p->kind == P_WORKER && web_url_has_scheme(p->url,"blob")))) { link = &p->next; continue; }
         *link = p->next;
         if (p->streaming && p->kind == P_WORKER && !s->disabled) {
             worker_fetch_frame(s, p); link = &s->pending; continue;
@@ -7945,7 +7944,7 @@ static bool process_pending(struct web_js_state *s) {
                         if (final) { js_free(s->ctx, script->url); script->url = final; }
                         else { script->failed = true; exception(s); }
                     }
-                    if (!script->failed && (!strncasecmp(script->url, "http://", 7) || !strncasecmp(script->url, "https://", 8))) {
+                    if (!script->failed && (web_url_has_scheme(script->url, "http") || web_url_has_scheme(script->url, "https"))) {
                         bool oom = false;
                         script->muted = !same_origin_urls(script->url, s->doc->url, &oom);
                     }
@@ -7953,7 +7952,7 @@ static bool process_pending(struct web_js_state *s) {
                 }
             }
         } else if (p->kind == P_WORKER && !s->disabled) {
-            if (!strncasecmp(p->url,"blob:",5) && !p->response.body && !p->response.error[0]) {
+            if (web_url_has_scheme(p->url,"blob") && !p->response.body && !p->response.error[0]) {
                 char mime[128];
                 ran_task = true; begin_named_task(s,"Worker object-URL source",p->worker);
                 p->response.body = script_blob_source(s,p->url,true,&p->response.body_len,mime,NULL);
@@ -7964,7 +7963,7 @@ static bool process_pending(struct web_js_state *s) {
                 end_task(s);
             }
             const char *final = web_response_url(&p->response)[0] ? web_response_url(&p->response) : p->url;
-            if (!p->response.error[0] && strncasecmp(p->url,"blob:",5)) {
+            if (!p->response.error[0] && !web_url_has_scheme(p->url,"blob")) {
                 bool valid = permitted_url(s,final,true);
                 bool allocation_failed = false;
                 if (p->worker_kind == 0) valid = valid &&

@@ -137,7 +137,7 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
     f->pending_sandbox_flags=own|s->doc->sandbox_flags;
     if(s->host.debug_js && f->pending_sandbox_flags) {
         char *absolute=NULL,*origin=NULL;const char *desired=f->navigation?f->navigation:src;
-        if(doc_encoding_parse_url(s->doc,desired,&absolute)==1)http_origin_owned(absolute,&origin);
+        if(doc_encoding_parse_url(s->doc,desired,&absolute)==1)web_url_origin(absolute,&origin);
         char message[480];snprintf(message,sizeof message,
             "Frame sandbox policy: allow=[%s] origin=[%.160s] inherited=0x%x pending=0x%x supported=%d",
             known,origin?origin:"null",s->doc->sandbox_flags,f->pending_sandbox_flags,
@@ -194,7 +194,7 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
        navigation's URL is already one). */
     char *url=NULL;
     int resolved=doc_encoding_parse_url(s->doc,desired,&url);
-    if(resolved==1 && !strncasecmp(url,"blob:",5)){frame_blob_commit(s,f,url);free(url);return;}
+    if(resolved==1 && web_url_has_scheme(url,"blob")){frame_blob_commit(s,f,url);free(url);return;}
     bool valid=resolved==1 && permitted_url(s,url,false);
     free(f->navigation);f->navigation=NULL;
     /* The navigation's POST body (a form's) goes with its request. */
@@ -414,11 +414,11 @@ static JSValue frame_message_deliver(JSContext *ctx,JSValueConst this_val,int ar
     if(!task_context_active(s) || !generation || generation->owner!=s->doc || generation!=s->doc->root)return JS_UNDEFINED;
     const char *expected=JS_ToCString(ctx,data[3]);if(!expected)return JS_EXCEPTION;
     char *current=NULL;
-    enum http_url_result origin_status=make_origin(web_effective_url(s->doc),&current);
-    if(origin_status==HTTP_URL_OOM){JS_FreeCString(ctx,expected);return JS_ThrowOutOfMemory(ctx);}
-    bool origin_ok=origin_status==HTTP_URL_TUPLE;
+    enum web_url_result origin_status=web_url_origin(web_effective_url(s->doc),&current);
+    if(origin_status==WEB_URL_OOM){JS_FreeCString(ctx,expected);return JS_ThrowOutOfMemory(ctx);}
+    bool origin_ok=origin_status==WEB_URL_TUPLE;
     const char *sent_origin=JS_ToCString(ctx,data[2]);if(!sent_origin){free(current);JS_FreeCString(ctx,expected);return JS_EXCEPTION;}
-    bool default_match=!strcmp(sent_origin,"null")?origin_status==HTTP_URL_OPAQUE&&sender&&web_frame_same_origin(sender->owner,s->doc):origin_ok&&!strcmp(sent_origin,current);
+    bool default_match=!strcmp(sent_origin,"null")?origin_status==WEB_URL_OPAQUE&&sender&&web_frame_same_origin(sender->owner,s->doc):origin_ok&&!strcmp(sent_origin,current);
     bool allowed=!strcmp(expected,"*") || (!strcmp(expected,"/")?default_match:
         origin_ok&&strcmp(expected,"null")&&!strcmp(expected,current));
     free(current);JS_FreeCString(ctx,sent_origin);
@@ -486,10 +486,10 @@ static JSValue frame_message_send(JSContext *ctx,struct web_js_state *s,struct w
     if(JS_GetRuntime(caller->ctx)!=JS_GetRuntime(target->ctx))return JS_ThrowTypeError(ctx,"Window transfers require the same runtime");
     if(target->posted_count==UINT_MAX)return JS_ThrowRangeError(ctx,"Document posted task count cannot be represented");
     char *origin=NULL;
-    enum http_url_result status=make_origin(web_effective_url(caller->doc),&origin);
-    if(status==HTTP_URL_OOM)return JS_ThrowOutOfMemory(ctx);
-    if(status==HTTP_URL_INVALID)return JS_ThrowTypeError(ctx,"Window message sender origin is unavailable");
-    JSValue sender_origin=JS_NewString(ctx,status==HTTP_URL_TUPLE?origin:"null");
+    enum web_url_result status=web_url_origin(web_effective_url(caller->doc),&origin);
+    if(status==WEB_URL_OOM)return JS_ThrowOutOfMemory(ctx);
+    if(status==WEB_URL_INVALID)return JS_ThrowTypeError(ctx,"Window message sender origin is unavailable");
+    JSValue sender_origin=JS_NewString(ctx,status==WEB_URL_TUPLE?origin:"null");
     free(origin);
     if(JS_IsException(sender_origin))return sender_origin;
     JSValue result=frame_message_send_data(ctx,s,caller,target,document,sender_origin,args,argv);

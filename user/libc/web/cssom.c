@@ -1,6 +1,6 @@
 #include "cssom.h"
 #include <stdio.h>
-#include "http.h"
+#include <weburl.h>
 
 /* ---------------------------------------------------------------- parses
    Every change to a sheet's rules is a change to its text: the text with the
@@ -508,10 +508,10 @@ static int link_origin_clean(web_doc *d,const struct cssom_link_source *source,b
     *clean=false;
     if(!strncasecmp(source->url,"data:",5)){*clean=true;return CSSOM_OK;}
     char *origin=NULL,*request=NULL,*final=NULL;
-    enum http_url_result a=http_origin_owned(web_effective_url(d),&origin),
-        b=http_origin_owned(source->url,&request),c=http_origin_owned(source->base,&final);
-    int error=(a==HTTP_URL_OOM||b==HTTP_URL_OOM||c==HTTP_URL_OOM)?CSSOM_OOM:CSSOM_OK;
-    *clean=!error&&a==HTTP_URL_TUPLE&&b==HTTP_URL_TUPLE&&c==HTTP_URL_TUPLE&&
+    enum web_url_result a=web_url_origin(web_effective_url(d),&origin),
+        b=web_url_origin(source->url,&request),c=web_url_origin(source->base,&final);
+    int error=(a==WEB_URL_OOM||b==WEB_URL_OOM||c==WEB_URL_OOM)?CSSOM_OOM:CSSOM_OK;
+    *clean=!error&&a==WEB_URL_TUPLE&&b==WEB_URL_TUPLE&&c==WEB_URL_TUPLE&&
         !strcmp(origin,request)&&!strcmp(origin,final);
     free(origin);free(request);free(final);return error;
 }

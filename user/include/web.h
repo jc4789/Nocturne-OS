@@ -441,11 +441,7 @@ const char *web_url(web_doc *d);
 /* <meta http-equiv="refresh" content="N; url=...">: the absolute URL, or NULL */
 const char *web_refresh_url(web_doc *d, int *delay_s);
 
-/* The URL Standard's URL parser, UTF-8 for the query: rel against base (NULL, or a
-   base that is not a URL: none). 1: *out is the URL's serialization, malloc'd for
-   the caller to free; 0: rel is not a URL (*out NULL); -1: out of memory. No
-   length limit. */
-int web_resolve_url_owned(const char *base, const char *rel, char **out);
+/* web_resolve_url_owned, the URL parser for a URL against a base, is weburl.h's. */
 
 /* ---- resources ---- */
 const char *web_pending_stylesheet(web_doc *d);                   /* next stylesheet to fetch, or NULL */

@@ -82,10 +82,7 @@ else:
     assert not sys.argv[1:]
 generated = out / (label + "-generated.c")
 generated.write_text(prefix + pieces + cases, encoding="utf-8")
-http = (root / "user/libc/http.c").read_text(encoding="utf-8")
-urls = out / "flex-reverse25-url-generated.c"
-urls.write_text(http[:http.index("enum http_url_result http_origin_owned_n(")], encoding="utf-8")
-cc = root / "tools/msys64/ucrt64/bin/clang.exe"
+cc =root / "tools/msys64/ucrt64/bin/clang.exe"
 abi = out / "flex-reverse25-host-abi"
 abi.mkdir(exist_ok=True)
 (abi / "setjmp.h").write_text('#include "' + (cc.parent.parent / "include/setjmp.h").as_posix() + '"\n', encoding="utf-8")
@@ -93,6 +90,6 @@ env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH",
 exe = out / (label + "-native.exe")
 subprocess.run([str(cc), "-std=gnu11", "-O1", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                 "-I" + str(abi), "-Iuser/include", "-Icommon", "-Iuser/libc/web", str(generated),
-                "user/libc/web/cssprop.c", "user/libc/web/shape.c","user/libc/web/color.c", "user/libc/web/cssmath.c", "user/libc/web/util.c", "user/libc/web/html.c", str(urls), "-o", str(exe)],
+                "user/libc/web/cssprop.c", "user/libc/web/shape.c","user/libc/web/color.c", "user/libc/web/cssmath.c", "user/libc/web/util.c", "user/libc/web/html.c", "-o", str(exe)],
                cwd=root, env=env, check=True)
 subprocess.run([str(exe)], cwd=root, env=env, check=True, timeout=30)

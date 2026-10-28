@@ -6,6 +6,7 @@
  * copy-and-unlink rename is used. Shared journals in the temporary folder publish
  * per-key changes between windows; persistent snapshots remain debounced. */
 #include <webstorage.h>
+#include <weburl.h>
 #include <nocturne.h>
 #include <limits.h>
 #include <stdio.h>
@@ -141,15 +142,10 @@ static bool storage_units(const char *text, size_t len, size_t *out) {
     }
     *out = units; return true;
 }
+/* An area's key: the serialization of an http(s) tuple origin (weburl.h's web_origin_http, the
+ * URL record's owner), under 2048 bytes as an area's file holds it. */
 static bool storage_origin(const char *s) {
-    /* Trust the private WHATWG parser for canonicalization; independently reject
-     * opaque origins, path/userinfo/query fragments and all filesystem syntax. */
-    if (!s || strlen(s) > 2047) return false;
-    const char *h = !strncmp(s, "https://", 8) ? s + 8 : !strncmp(s, "http://", 7) ? s + 7 : NULL;
-    if (!h || !*h) return false;
-    for (const unsigned char *p = (const unsigned char *)h; *p; p++)
-        if (*p <= 32 || *p >= 127 || strchr("/\\@?#%", *p)) return false;
-    return true;
+    return s && strlen(s) < 2048 && web_origin_http(s);
 }
 static void storage_entry_free(struct storage_entry *e) {
     if (e) { free(e->key); free(e->value); free(e); }

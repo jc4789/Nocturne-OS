@@ -764,13 +764,11 @@ static void start_remove(struct http2_connection *c,struct h2_starter *waiter) {
     cnd_broadcast(&c->changed); /* the next starter may have its turn */
 }
 struct http2_stream *http2_start(struct http2_connection *c,const struct http_req *rq,
-    const struct url_owned *url,const char *head,const struct http_stream_hooks *hooks,
+    const struct http_target *url,const char *head,const struct http_stream_hooks *hooks,
     struct http_transport_result *result,char *error,size_t capacity) {
-    struct http2_stream *s=calloc(1,sizeof *s);struct bytes b={0},list={0};char *authority=NULL;
+    struct http2_stream *s=calloc(1,sizeof *s);struct bytes b={0},list={0};
     size_t bound=16; /* worst-case block size: plain literals plus a table-size update */
-    size_t h=strlen(url->host);if(h>SIZE_MAX-8||!(authority=malloc(h+8)))goto invalid;
-    if(url->port==(url->tls?443:80))snprintf(authority,h+8,"%s",url->host);
-    else snprintf(authority,h+8,"%s:%u",url->host,url->port);
+    const char *authority=url->authority;
     const char *method=rq->method?rq->method:"GET";
     if(!s||!field_list(&list,&bound,":method",3+4,method,strlen(method))||
         !field_list(&list,&bound,":scheme",7,url->tls?"https":"http",url->tls?5:4)||
@@ -847,8 +845,8 @@ struct http2_stream *http2_start(struct http2_connection *c,const struct http_re
         bool ok=frame(c,at?9:1,flags,s->id,b.p+at,n);
         if(!ok)break;at+=n;
     }
-    pump(c,0);leave(c);free(b.p);free(list.p);free(authority);return s;
-invalid:free(s);free(b.p);free(list.p);free(authority);snprintf(error,capacity,"cannot open HTTP/2 stream");if(!errno)errno=ENOMEM;return NULL;
+    pump(c,0);leave(c);free(b.p);free(list.p);return s;
+invalid:free(s);free(b.p);free(list.p);snprintf(error,capacity,"cannot open HTTP/2 stream");if(!errno)errno=ENOMEM;return NULL;
 }
 static bool check(struct http2_stream *s,bool cancelled) {
     if(cancelled) {

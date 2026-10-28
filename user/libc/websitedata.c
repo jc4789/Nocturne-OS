@@ -12,23 +12,20 @@
 #include <string.h>
 #include <stdio.h>
 
-/* The host of a serialized origin ("https://www.example.com:8443": www.example.com). */
+/* The host of a serialized origin ("https://www.example.com:8443": www.example.com), as its URL
+   record has it (weburl.h). */
 static bool origin_host(const char *origin, char out[256]) {
-    const char *p = origin ? strstr(origin, "://") : NULL;
-    if (!p) return false;
-    p += 3;
+    struct web_url url;
+    if (!origin || web_url_read(origin, strlen(origin), &url) != 1) return false;
     size_t n;
-    if (*p == '[') {
-        const char *close = strchr(p, ']');
-        if (!close) return false;
-        n = (size_t)(close - p) + 1;
-    } else {
-        n = strcspn(p, ":/");
+    const char *host = web_url_host_text(&url, &n);
+    bool ok = n && n < 256;
+    if (ok) {
+        memcpy(out, host, n);
+        out[n] = 0;
     }
-    if (!n || n > 253) return false;
-    memcpy(out, p, n);
-    out[n] = 0;
-    return true;
+    web_url_free(&url);
+    return ok;
 }
 
 /* Whether host is site or inside it ("" holds every host). */

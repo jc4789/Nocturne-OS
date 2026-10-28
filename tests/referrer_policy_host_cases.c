@@ -3,7 +3,7 @@ static void check(bool condition,const char *label){checks++;if(!condition){fail
 static void clear(struct job *j){free(j->referrer);free(j->referrer_origin);free(j->target_origin);free(j->outgoing.p);*j=(struct job){0};}
 static struct job job(const char *source,const char *target,int policy){
     struct job j={.referrer=strdup(source),.referrer_policy=policy};
-    char *canonical=NULL;check(http_canonical_owned_n(target,strlen(target),&canonical,&j.target_origin)==HTTP_URL_TUPLE,"target native canonicalization");free(canonical);return j;
+    char *canonical=NULL;check(http_url(target,&canonical,&j.target_origin)==WEB_URL_TUPLE,"target native canonicalization");free(canonical);return j;
 }
 static void output(int policy,const char *target,const char *value,const char *label){
     struct job j=job("https://user:pass@Referrer.Test:443/where#private",target,policy);
@@ -36,10 +36,15 @@ int main(void){
     check(prepare_referrer(&j)&&append_referrer(&j,"http://localhost:8080/")&&j.outgoing.length>0,"loopback potentially trustworthy target");clear(&j);
     j=job("https://referrer.test/path","http://127.evil.test/",5);
     check(prepare_referrer(&j)&&append_referrer(&j,"http://127.evil.test/")&&j.outgoing.length==0,"DNS name with 127 prefix still suppresses downgrade referrer");clear(&j);
-    check(potentially_trustworthy("http://127.0.0.1/")&&potentially_trustworthy("http://127.255.255.255:80/"),"all valid IPv4 127/8 literals are trustworthy");
-    check(!potentially_trustworthy("http://127.256.0.1/")&&!potentially_trustworthy("http://127.1.2.3.evil/")&&!potentially_trustworthy("http://127.1/")&&!potentially_trustworthy("http://a.localhost/"),"unsupported native spellings and unguaranteed DNS names not upgraded");
-    check(potentially_trustworthy("http://[::1]:8080/")&&!potentially_trustworthy("http://[::2]/"),"canonical IPv6 loopback trust distinct from transport support");
-    struct url_owned ipv6;check(url_parse_owned_result_n("http://[::1]/",13,&ipv6)==HTTP_URL_INVALID,"existing IPv6 transport rejection remains explicit");
+    check(web_url_potentially_trustworthy("http://127.0.0.1/")&&web_url_potentially_trustworthy("http://127.255.255.255:80/"),"all valid IPv4 127/8 literals are trustworthy");
+    /* Secure Contexts reads the parsed URL: the IPv4 parser reads 127.1 as 127.0.0.1. */
+    check(web_url_potentially_trustworthy("http://127.1/")&&web_url_potentially_trustworthy("http://0x7f.1/"),"every IPv4 spelling of 127/8 is that address");
+    check(!web_url_potentially_trustworthy("http://127.256.0.1/")&&!web_url_potentially_trustworthy("http://127.1.2.3.evil/")&&!web_url_potentially_trustworthy("http://a.localhost/"),"not URLs and unguaranteed DNS names not upgraded");
+    check(web_url_potentially_trustworthy("http://[::1]:8080/")&&web_url_potentially_trustworthy("http://[0:0::1]/")&&!web_url_potentially_trustworthy("http://[::2]/"),"IPv6 loopback in any spelling, nothing else");
+    /* The request layer takes every URL the URL parser gives; the network has no IPv6 (tls.c says so). */
+    struct http_target ipv6;check(http_target_of("http://user:pass@[0:0::1]:8080/a?b#c",&ipv6)==WEB_URL_TUPLE&&!strcmp(ipv6.host,"[::1]")&&
+        !strcmp(ipv6.authority,"[::1]:8080")&&!strcmp(ipv6.path,"/a?b")&&ipv6.port==8080&&!ipv6.tls,"IPv6 target read from the record, without credentials or fragment");
+    http_target_free(&ipv6);
     j=job("https://referrer.test/path","https://target.test/",7);
     check(prepare_referrer(&j)&&append_referrer(&j,"https://target.test/")&&!strcmp(j.referrer,origin),"cross-origin hop reduces stored referrer");
     free(j.target_origin);j.target_origin=strdup("https://referrer.test");j.outgoing.length=0;j.referrer_policy=8;
@@ -50,7 +55,12 @@ int main(void){
     j=job("https://referrer.test/path","https://referrer.test/",8);j.wire.user_navigation=WEBNET_WIRE_NO_REFERRER;
     check(prepare_referrer(&j)&&append_referrer(&j,"https://referrer.test/")&&j.outgoing.length==0,"explicit no-referrer private flag remains authoritative");clear(&j);
     j=job("data:text/plain,none","https://target.test/",8);check(prepare_referrer(&j)&&j.referrer==NULL,"non-HTTP source has no network referrer");clear(&j);
-    j=job("https://referrer.test/\r\nforged","https://target.test/",8);check(!prepare_referrer(&j)&&j.error[0],"private header injection fails native URL validation");clear(&j);
+    /* The URL parser removes every tab and newline, so the header gets the URL without them. */
+    j=job("https://referrer.test/\r\nforged","https://target.test/",8);check(prepare_referrer(&j)&&append_referrer(&j,"https://target.test/")&&
+        !strcmp(j.outgoing.p,"Referer: https://referrer.test/forged\r\n"),"private header injection cannot reach the header");clear(&j);
+    j=job("https://referrer.test/ forged","https://target.test/",8);check(prepare_referrer(&j)&&append_referrer(&j,"https://target.test/")&&
+        !strcmp(j.outgoing.p,"Referer: https://referrer.test/%20forged\r\n"),"a space in the path is percent-encoded");clear(&j);
+    j=job("http://exa mple.test/","https://target.test/",8);check(!prepare_referrer(&j)&&j.error[0],"a referrer that is not a URL fails closed");clear(&j);
     char *long_url=malloc(5000);size_t prefix=strlen("https://referrer.test/");memcpy(long_url,"https://referrer.test/",prefix);memset(long_url+prefix,'x',4999-prefix);long_url[4999]=0;
     j=job(long_url,"https://referrer.test/",8);free(long_url);check(prepare_referrer(&j)&&!strcmp(j.referrer,origin),"over-4096 referrer is reduced to origin per specification");clear(&j);
     int needed;
