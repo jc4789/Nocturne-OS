@@ -29,7 +29,7 @@ const streamBridge=(()=>{
     const ta=Object.getPrototypeOf(U8.prototype),tag=getter(ta,Symbol.toStringTag);
     const length=getter(ta,'byteLength'),buffer=getter(ta,'buffer');
     const set=U8.prototype.set,locked=getter(ReadableStream.prototype,'locked');
-    const getReader=ReadableStream.prototype.getReader,tee=ReadableStream.prototype.tee;
+    const getReader=ReadableStream.prototype.getReader,tee=ReadableStream.prototype.tee,pipeThrough=ReadableStream.prototype.pipeThrough;
     const read=types.ReadableStreamDefaultReader.prototype.read;
     const release=types.ReadableStreamDefaultReader.prototype.releaseLock;
     const cancel=types.ReadableStreamDefaultReader.prototype.cancel;
@@ -231,5 +231,11 @@ const streamBridge=(()=>{
         define(globalThis,Type.name,{value:Type,writable:true,enumerable:false,configurable:true}); // [Exposed=*]
     }
     Object.assign(globalThis,types,{TextEncoderStream,TextDecoderStream});
-    return Object.freeze({brand,disturbed,fromBytes,network,pulled,chunks,collect,locked:v=>apply(locked,v,[]),tee:v=>apply(tee,v,[])});
+    /* Streams "create a proxy": a new stream pulling from v, which becomes locked and disturbed at
+       once (v piped through an identity TransformStream, its pair read without the page's getters). */
+    function proxy(v){
+        const identity=new TransformStream();
+        return apply(pipeThrough,v,[{__proto__:null,readable:apply(transformReadable,identity,[]),writable:apply(transformWritable,identity,[])},{__proto__:null}]);
+    }
+    return Object.freeze({brand,disturbed,fromBytes,network,pulled,chunks,collect,proxy,locked:v=>apply(locked,v,[]),tee:v=>apply(tee,v,[])});
 })();

@@ -121,6 +121,8 @@ struct js_pending {
     char *url,*origin,*integrity,*referrer;
     bool done, aborted, force_preflight, redirect_error, same_origin, keepalive, no_cors, no_referrer;
     bool streaming, headers_delivered, host_accepted;
+    /* P_WORKER streamed: a frame is in the child, its NJW_RESUME not yet taken (worker_resume). */
+    bool worker_paused;
     /* A streamed response's metadata, kept past the frame that clears response
        for Resource Timing and net_log: its status, whether it is an opaque
        response, its Content-Type and the minimized MIME type of it. */
@@ -270,6 +272,7 @@ struct web_js_state {
     struct js_image_pin *image_pins;
     uint64_t next_request, task_deadline, now, stream_generation;
     uint64_t fetch_group;
+    struct js_worker_group *worker_groups; /* each Worker's own fetch group */
     uint64_t window_named_revision;
     char *window_name;
     uint64_t task_started_ms, task_native_wait_ms, diagnostic_task_id;
@@ -5640,20 +5643,57 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
 }
 #include "js_policy_report.h"
 #include "frame_native.h"
+/* Fetch groups (webnet_request.fetch_group): one per environment settings object, a document's
+   (s->fetch_group) or a Worker's (js_worker_group), never reused while a keepalive request of an
+   older one can still be alive. */
+static uint64_t fetch_group_serial;
+static bool fetch_group_new(uint64_t *group) {
+    if (fetch_group_serial == UINT64_MAX) return false;
+    *group = ++fetch_group_serial; return true;
+}
+struct js_worker_group { struct js_worker_group *next; uint32_t worker; uint64_t group; };
+/* The fetch group of this realm's Worker worker, made when it first needs one; 0 when none can be. */
+static uint64_t worker_fetch_group(struct web_js_state *s, uint32_t worker) {
+    for (struct js_worker_group *g = s->worker_groups; g; g = g->next) if (g->worker == worker) return g->group;
+    struct js_worker_group *g = js_mallocz(s->ctx, sizeof *g);
+    if (!g) { JSValue error = JS_GetException(s->ctx); JS_FreeValue(s->ctx, error); return 0; }
+    if (!fetch_group_new(&g->group)) { js_free(s->ctx, g); return 0; }
+    g->worker = worker; g->next = s->worker_groups; s->worker_groups = g; return g->group;
+}
+static void worker_fetch_group_forget(struct web_js_state *s, uint32_t worker) {
+    for (struct js_worker_group **at = &s->worker_groups; *at; at = &(*at)->next)
+        if ((*at)->worker == worker) { struct js_worker_group *g = *at; *at = g->next; js_free(s->ctx, g); return; }
+}
 /* Children have no networking/file host. Parent transport owns cookies, CORS,
-   redirects and generation cancellation; completions only queue native bytes. */
-static bool worker_request(void *opaque, uint32_t worker, uint32_t request,
-                        const char *url, int kind,const char *method,const char *headers,
-                        const void *body,size_t body_len,const char *referrer,int referrer_policy) {
+   redirects and generation cancellation; completions only queue native bytes.
+   A fetch (kind 2) carries its Request's modes in the kind's NJW_LOAD_* flags; this realm checks
+   them as native_fetch does a Window's and hands them to the same transport. */
+static bool worker_request(void *opaque, uint32_t worker, uint32_t request, int kind,
+                           const struct web_worker_fetch *f) {
     struct web_js_state *s = opaque;
-    if (!s || s->disabled || kind < 0 ||
+    if (!s || s->disabled || kind < 0 || !f || !f->url ||
         (kind != 0 && !njw_load_kind_valid((uint32_t)kind))) return false;
     const uint32_t policy = (uint32_t)kind & NJW_LOAD_POLICY_FLAGS;
     kind = (int)((uint32_t)kind & ~NJW_LOAD_POLICY_FLAGS);
-    if(!url||!method||!webnet_method_valid(method)||body_len>WEBNET_BODY_LIMIT||
+    const char *url = f->url, *method = f->method ? f->method : "GET", *headers = f->headers, *referrer = f->referrer;
+    const void *body = f->body; size_t body_len = f->body_len; int referrer_policy = f->referrer_policy;
+    if(!webnet_method_valid(method)||body_len>WEBNET_BODY_LIMIT||
        (!body&&body_len)||strlen(method)>UINT32_MAX||(headers&&strlen(headers)>UINT32_MAX)||
        ((!strcmp(method,"GET")||!strcmp(method,"HEAD"))&&body)||
-       (kind!=2&&(strcmp(method,"GET")||body||body_len||referrer||referrer_policy))||referrer_policy<0||referrer_policy>WEBNET_REFERRER_UNSAFE)return false;
+       (kind!=2&&(strcmp(method,"GET")||body||body_len||referrer||referrer_policy||policy))||referrer_policy<0||referrer_policy>WEBNET_REFERRER_UNSAFE)return false;
+    /* The Request's destination, "" for fetch(). */
+    int destination = WEBNET_DEST_EMPTY;
+    if (kind == 2 && f->destination && f->destination[0]) {
+        destination = -1;
+        for (int i = 0; i < WEBNET_DEST_COUNT; i++) if (!strcmp(webnet_destination_name((enum webnet_destination)i), f->destination)) { destination = i; break; }
+        if (destination < 0) return false;
+    }
+    const int credentials = kind == 2 ? (int)((policy & NJW_LOAD_CREDENTIALS) >> NJW_LOAD_CREDENTIALS_SHIFT) : 1;
+    const int cache_mode = kind == 2 ? (int)((policy & NJW_LOAD_CACHE) >> NJW_LOAD_CACHE_SHIFT) : WEBNET_CACHE_DEFAULT;
+    const bool same_origin = kind == 0 || (policy & NJW_LOAD_SAME_ORIGIN), keepalive = (policy & NJW_LOAD_KEEPALIVE) != 0;
+    const bool streaming = (policy & NJW_LOAD_STREAM) != 0;
+    /* Only a host that can resume streams offered them (NJW_START_STREAMING). */
+    if (streaming && !s->host.resume_request) return false;
     struct js_pending *p = pending_new(s, P_WORKER, url);
     if (!p) {
         /* Loader rejection is reported over Worker IPC. Do not leave an OOM
@@ -5662,6 +5702,10 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request,
         return false;
     }
     p->worker = worker; p->worker_request = request; p->worker_kind = kind;
+    p->credentials = credentials; p->cache_mode = cache_mode; p->same_origin = same_origin; p->destination = destination;
+    p->redirect_error = (policy & NJW_LOAD_REDIRECT_ERROR) != 0; p->force_preflight = (policy & NJW_LOAD_PREFLIGHT) != 0;
+    p->no_cors = (policy & NJW_LOAD_NO_CORS) != 0; p->no_referrer = (policy & NJW_LOAD_NO_REFERRER) != 0;
+    p->keepalive = keepalive; p->streaming = streaming; p->referrer_policy = referrer_policy;
     bool blob = !strncasecmp(url,"blob:",5);
     if (strlen(url) > UINT32_MAX || (!blob && !permitted_url(s,url,true)) || (blob && kind == 2)) {
         pending_error(p,"Worker resource URL is not permitted"); return true;
@@ -5686,27 +5730,46 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request,
         pending_error(p, allocation_failed ? "Out of memory while checking Worker origin" :
             "Worker startup requires a same-origin script"); return true;
     }
+    /* Fetch's main fetch for a Request's mode "same-origin", the cache-only mode's own rule and
+       a keepalive request's fetch group, as native_fetch has them for a Window's Request. */
+    if (kind == 2 && same_origin && !same_origin_urls(web_effective_url(s->doc), url, &allocation_failed)) {
+        pending_error(p, allocation_failed ? "Out of memory while checking the Worker fetch origin" :
+            "Cross-origin fetch is forbidden by same-origin mode"); return true;
+    }
+    if (cache_mode == WEBNET_CACHE_ONLY_IF_CACHED && !same_origin) {
+        pending_error(p, "only-if-cached requires same-origin mode"); return true;
+    }
+    uint64_t group = 0;
+    if (keepalive && (!s->host.release_request || !(group = worker_fetch_group(s, worker)))) {
+        pending_error(p, "Native host cannot retain this Worker's keepalive request"); return true;
+    }
     struct web_request r = {.id=p->id, .kind=kind == 2 ? WEB_RESOURCE_FETCH : WEB_RESOURCE_SCRIPT,
         /* Worker settings inherit the creating realm's origin, including
            about:blank/srcdoc children. Never let the shared host substitute
            the top-level document as the initiator of startup/import/fetch. */
         .url=p->url, .origin=web_effective_url(s->doc), .method=method,
         .headers=headers,.body=body,.body_len=body_len,
-        .credentials=1, .same_origin=kind == 0,
-        .no_cors=(policy & NJW_LOAD_NO_CORS)!=0,
+        .credentials=credentials, .same_origin=same_origin,
+        .force_preflight=p->force_preflight, .redirect_error=p->redirect_error,
+        .no_cors=p->no_cors,
         .referrer=referrer,.referrer_policy=referrer_policy,
-        .no_referrer=(policy & NJW_LOAD_NO_REFERRER)!=0,
+        .no_referrer=p->no_referrer,
+        .cache_mode=cache_mode, .keepalive=keepalive, .fetch_group=group, .stream_response=streaming,
         .require_corp=s->doc->embedder_policy==HTML_COEP_REQUIRE_CORP,
-        .destination=kind==0?WEBNET_DEST_WORKER:kind==1?WEBNET_DEST_SCRIPT:WEBNET_DEST_EMPTY};
+        .destination=kind==0?WEBNET_DEST_WORKER:kind==1?WEBNET_DEST_SCRIPT:destination};
     /* The worker's script is fetched by its creating document, as its client. */
     if(kind==0){r.referrer=fetch_client_referrer_source(s->doc);r.referrer_policy=s->doc->referrer_policy;}
     if (!s->host.request || !s->host.request(s->host.opaque,&r))
         pending_error(p,"The browser rejected the Worker resource request");
+    else p->host_accepted = true;
     return true;
 }
 static bool worker_load(void *opaque,uint32_t worker,uint32_t request,const char *url,int kind){
-    return worker_request(opaque,worker,request,url,kind,"GET",NULL,NULL,0,NULL,0);
+    const struct web_worker_fetch fetch={.url=url,.method="GET"};
+    return worker_request(opaque,worker,request,kind,&fetch);
 }
+/* request 0: the Worker's owner went away, which a keepalive request outlives (release, not
+   cancel). Otherwise the child aborted one fetch. */
 static void worker_cancel(void *opaque,uint32_t worker,uint32_t request) {
     struct web_js_state *s=opaque;if(!s)return;
     for(struct js_pending *p=s->pending;p;p=p->next){
@@ -5715,8 +5778,23 @@ static void worker_cancel(void *opaque,uint32_t worker,uint32_t request) {
         /* The child's request identity never names a parent or sibling fetch.
            Retire before cancellation so a native completion cannot revive it. */
         p->aborted=true;pending_error(p,"The Worker resource was aborted");
-        if(s->host.cancel)s->host.cancel(s->host.opaque,p->id);
+        if(!request)release_pending_request(s,p);
+        else if(s->host.cancel)s->host.cancel(s->host.opaque,p->id);
     }
+    if(!request)worker_fetch_group_forget(s,worker);
+}
+/* The child took a streamed fetch's last frame (NJW_RESUME): one resume per frame, since the
+   transport drops a frame that finds the one before still unread. */
+static void worker_resume(void *opaque,uint32_t worker,uint32_t request) {
+    struct web_js_state *s=opaque;if(!s)return;
+    for(struct js_pending *p=s->pending;p;p=p->next)
+        if(p->kind==P_WORKER&&p->worker==worker&&p->worker_request==request&&p->worker_kind==2){
+            if(p->streaming&&p->worker_paused&&!p->done&&!p->aborted){
+                p->worker_paused=false;
+                if(s->host.resume_request)s->host.resume_request(s->host.opaque,p->id);
+            }
+            return;
+        }
 }
 static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
@@ -5744,7 +5822,7 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
         static uint32_t generation;
         if (!++generation) ++generation;
         s->workers = web_worker_new(ctx,generation,worker_load,s);
-        if(s->workers)web_worker_set_requester(s->workers,worker_request);
+        if(s->workers){web_worker_set_requester(s->workers,worker_request);web_worker_set_resumer(s->workers,s->host.resume_request?worker_resume:NULL);}
         if (!s->workers) return oom(ctx);
         web_worker_set_canceler(s->workers,s->host.cancel?worker_cancel:NULL);
         web_worker_set_reporter(s->workers,js_policy_worker_report,s);
@@ -5802,11 +5880,10 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
                 struct js_pending *p=*link;
                 if (p->kind != P_WORKER || p->worker != id) { link=&p->next; continue; }
                 *link=p->next;
-                if (s->host.cancel) s->host.cancel(s->host.opaque,p->id);
-                JS_FreeValue(ctx,p->resolve); JS_FreeValue(ctx,p->reject);
-                js_free(ctx,p->url); pending_response_release(ctx,p);
-                js_free(ctx,p); s->pending_count--;
+                /* The Worker's keepalive requests outlive it; others are cancelled. */
+                release_pending_request(s,p); pending_free(s,p);
             }
+            worker_fetch_group_forget(s,id);
         }
     }
     return result;
@@ -6124,7 +6201,6 @@ static bool run_automation(struct web_js_state *s) {
     return true;
 }
 static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    static uint64_t fetch_group_serial;
     struct web_js_state *s = state(ctx);
     if(sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Sandbox denied borrowed asynchronous authority");
     if (argc < 4) return JS_ThrowTypeError(ctx, "Invalid fetch request");
@@ -6205,8 +6281,7 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     if (keepalive && !s->fetch_group) {
         /* A pointer or per-runtime request number can be reused after top-level
            navigation while an older native request is still alive. */
-        if (fetch_group_serial == UINT64_MAX) { result = JS_ThrowRangeError(ctx, "Fetch group identity is not representable"); goto out; }
-        s->fetch_group = ++fetch_group_serial;
+        if (!fetch_group_new(&s->fetch_group)) { result = JS_ThrowRangeError(ctx, "Fetch group identity is not representable"); goto out; }
     }
     struct js_pending *p = pending_new(s, P_FETCH, url);
     if (!p) { result = oom(ctx); goto out; }
@@ -7795,6 +7870,50 @@ static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
     }
     end_task(s);
 }
+/* One native frame of a Worker's streamed fetch, queued to its child (NJW_FRAME). No JS runs in
+   this realm. The next frame waits for the child's NJW_RESUME (worker_resume), except an opaque
+   response's chunks: they never enter the child, and the transport resumes at once. */
+static void worker_fetch_frame(struct web_js_state *s, struct js_pending *p) {
+    int event = p->response.event;
+    bool terminal = event == WEBNET_END || p->response.error[0] || p->aborted, queued = true, resume = false;
+    if (event == WEBNET_HEADERS && !terminal) {
+        int flags = fetch_transport_flags(web_response_headers(&p->response));
+        bool opaque = flags >= 0 && (flags & NJW_LOADED_OPAQUE);
+        if (flags < 0 || (opaque && !p->no_cors)) {
+            pending_error(p, "Native Fetch response contradicts its filtering policy"); terminal = true;
+        } else {
+            if (!opaque && p->response.status >= 400) diagnostic_resource(s, p, "unsuccessful HTTP response");
+            streamed_response_metadata(p, opaque);
+            if (s->host.net_log) net_log_response(s, p, "headers", 0);
+            const char *final = web_response_url(&p->response)[0] ? web_response_url(&p->response) : p->url;
+            queued = web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_HEADERS, p->response.status,
+                final, web_response_headers(&p->response), NULL, 0, NULL);
+            p->headers_delivered = queued;
+        }
+    } else if (event == WEBNET_CHUNK && !terminal) {
+        p->streamed_bytes += p->response.body_len;
+        if (p->streamed_opaque) resume = true;
+        else queued = web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_CHUNK, 0, NULL, NULL,
+            p->response.body, p->response.body_len, NULL);
+    } else if (event == WEBNET_UPLOAD && !terminal)
+        queued = web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_UPLOAD, 0, NULL, NULL, NULL,
+            (size_t)p->response.uploaded, NULL);
+    if (!queued) { p->aborted = true; terminal = true; } /* the child is gone */
+    if (terminal) {
+        if (p->response.error[0] && !p->aborted) diagnostic_resource(s, p, p->response.error);
+        if (queued) web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_END, 0, NULL, NULL, NULL, 0,
+            p->response.error[0] ? p->response.error : event == WEBNET_END ? "" : "Worker fetch failed");
+        if (!p->aborted) { begin_named_task(s, "resource timing", p->id); resource_timing(s, p); end_task(s); }
+        if (s->host.net_log) net_log_response(s, p, "done", p->streamed_bytes);
+        if ((event != WEBNET_END || p->response.error[0] || p->aborted) && s->host.cancel) s->host.cancel(s->host.opaque, p->id);
+        pending_free(s, p);
+        return;
+    }
+    pending_response_release(s->ctx, p); p->done = false;
+    p->next = s->pending; s->pending = p;
+    if (resume) { if (s->host.resume_request) s->host.resume_request(s->host.opaque, p->id); }
+    else p->worker_paused = true;
+}
 static bool process_pending(struct web_js_state *s) {
     struct js_pending **link = &s->pending;
     uint64_t now = uptime_ms();
@@ -7810,6 +7929,9 @@ static bool process_pending(struct web_js_state *s) {
         if (ran_task && !s->disabled && (p->kind == P_FETCH ||
             (p->kind == P_WORKER && !strncasecmp(p->url,"blob:",5)))) { link = &p->next; continue; }
         *link = p->next;
+        if (p->streaming && p->kind == P_WORKER && !s->disabled) {
+            worker_fetch_frame(s, p); link = &s->pending; continue;
+        }
         if (p->streaming && !s->disabled) {
             process_fetch_frame(s, p); ran_task = true; link = &s->pending; continue;
         }
@@ -9713,6 +9835,7 @@ void web_js_free(web_doc *d) {
         broadcast_free(s);
         while(s->frame_proxies){struct js_frame_proxy *p=s->frame_proxies;s->frame_proxies=p->next;JS_FreeValue(s->ctx,p->proxy);js_free(s->ctx,p);}
         web_worker_free(s->workers); s->workers = NULL;
+        while (s->worker_groups) { struct js_worker_group *g = s->worker_groups; s->worker_groups = g->next; js_free(s->ctx, g); }
         while (s->sockets) socket_drop(s, s->sockets);
         while (s->automations) { struct js_automation *p = s->automations; s->automations = p->next; automation_free(s, p); }
         release_document_tasks(s);

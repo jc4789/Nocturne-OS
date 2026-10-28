@@ -113,6 +113,8 @@ static bool send_client(struct worker*w,struct client*c,unsigned op,unsigned req
 static bool send_value(struct worker*w,unsigned op,unsigned request,unsigned kind,JSValueConst value){
     if(!w->shared)return send_client(w,NULL,op,request,kind,value);
     if(op==NJW_ERROR||op==NJW_CONSOLE||op==NJW_CLOSE){bool ok=true;for(struct client*c=w->clients;c;c=c->next)if(c->active&&c->established&&!send_client(w,c,op,request,kind,value))ok=false;return ok;}
+    /* A resume goes to the owner of its fetch, which stays pending; an ended one has none. */
+    if(op==NJW_RESUME){struct pending_load*p=w->loads;while(p&&p->id!=request)p=p->next;return !p||!p->client||!p->client->active||send_client(w,p->client,op,request,kind,value);}
     struct client*c=w->network_client;if(!c||!c->active)return false;
     if(op==NJW_LOAD&&request){struct pending_load*p=malloc(sizeof*p);if(!p)return false;*p=(struct pending_load){w->loads,request,c};w->loads=p;c->references++;if(!send_client(w,c,op,request,kind,value)){w->loads=p->next;c->references--;free(p);return false;}return true;}
     if(op==NJW_CANCEL){struct pending_load**at=&w->loads;while(*at&&(*at)->id!=request)at=&(*at)->next;if(*at){struct pending_load*p=*at;c=p->client;*at=p->next;c->references--;free(p);}}
@@ -121,8 +123,8 @@ static bool send_value(struct worker*w,unsigned op,unsigned request,unsigned kin
 static struct deferred *receive(struct worker *w,bool*failed){
     struct deferred *d=record_receive(w,CHANNEL,&w->inbox,failed);if(!d)return NULL;
     if(d->h.magic!=NJW_MAGIC||
-       ((d->h.op==NJW_PORT_MESSAGE||d->h.op==NJW_PORT_CLOSE||d->h.op==NJW_PORT_DRAINED)?d->h.kind>1:d->h.op==NJW_CONNECT?d->h.kind!=NJW_WITH_PORTS:d->h.op==NJW_MESSAGE?(d->h.kind!=0&&d->h.kind!=NJW_WITH_PORTS):d->h.op==NJW_LOADED?!njw_loaded_kind_valid(d->h.kind):d->h.kind!=0)||
-       (d->h.op!=NJW_START&&d->h.op!=NJW_MESSAGE&&d->h.op!=NJW_CONNECT&&d->h.op!=NJW_LOADED&&d->h.op!=NJW_CREDIT&&d->h.op!=NJW_PORT_MESSAGE&&d->h.op!=NJW_PORT_CLOSE&&d->h.op!=NJW_PORT_DRAINED)||(w->established&&d->h.generation!=w->generation)||(!w->established&&d->h.op!=NJW_START)){deferred_free(d);*failed=true;return NULL;}
+       ((d->h.op==NJW_PORT_MESSAGE||d->h.op==NJW_PORT_CLOSE||d->h.op==NJW_PORT_DRAINED)?d->h.kind>1:d->h.op==NJW_CONNECT?d->h.kind!=NJW_WITH_PORTS:d->h.op==NJW_MESSAGE?(d->h.kind!=0&&d->h.kind!=NJW_WITH_PORTS):d->h.op==NJW_LOADED?!njw_loaded_kind_valid(d->h.kind):d->h.op==NJW_FRAME?!njw_frame_kind_valid(d->h.kind):d->h.kind!=0)||
+       (d->h.op!=NJW_START&&d->h.op!=NJW_MESSAGE&&d->h.op!=NJW_CONNECT&&d->h.op!=NJW_LOADED&&d->h.op!=NJW_FRAME&&d->h.op!=NJW_CREDIT&&d->h.op!=NJW_PORT_MESSAGE&&d->h.op!=NJW_PORT_CLOSE&&d->h.op!=NJW_PORT_DRAINED)||(w->established&&d->h.generation!=w->generation)||(!w->established&&d->h.op!=NJW_START)){deferred_free(d);*failed=true;return NULL;}
     if(!w->established){w->generation=d->h.generation;w->established=true;}else if(d->h.op==NJW_START){deferred_free(d);*failed=true;return NULL;}
     return d;
 }
@@ -158,8 +160,8 @@ static void shared_collect(struct worker*w){
 }
 static bool shared_header_valid(const struct njw_header*h){
     bool port=h->op==NJW_PORT_MESSAGE||h->op==NJW_PORT_CLOSE||h->op==NJW_PORT_DRAINED;
-    bool kind=port?h->kind<=1:h->op==NJW_CONNECT?h->kind==NJW_WITH_PORTS:h->op==NJW_LOADED?njw_loaded_kind_valid(h->kind):h->kind==0;
-    return h->magic==NJW_MAGIC&&h->bytes&&kind&&(port||h->op==NJW_CONNECT||h->op==NJW_START||h->op==NJW_LOADED||(h->op==NJW_CREDIT&&!h->request));
+    bool kind=port?h->kind<=1:h->op==NJW_CONNECT?h->kind==NJW_WITH_PORTS:h->op==NJW_LOADED?njw_loaded_kind_valid(h->kind):h->op==NJW_FRAME?njw_frame_kind_valid(h->kind):h->kind==0;
+    return h->magic==NJW_MAGIC&&h->bytes&&kind&&(port||h->op==NJW_CONNECT||h->op==NJW_START||h->op==NJW_LOADED||h->op==NJW_FRAME||(h->op==NJW_CREDIT&&!h->request));
 }
 static bool shared_connect_url(struct worker*w,struct client*c,const struct deferred*d){
     JSValue value=JS_ReadObject(w->ctx,d->data,d->h.bytes,JS_READ_OBJ_REFERENCE),url=JS_IsException(value)?JS_UNDEFINED:JS_GetPropertyUint32(w->ctx,value,2);const char*address=JS_IsString(url)?JS_ToCString(w->ctx,url):NULL;bool ok=address&&!strcmp(address,w->script_url?w->script_url:"");JS_FreeCString(w->ctx,address);JS_FreeValue(w->ctx,url);JS_FreeValue(w->ctx,value);
@@ -233,7 +235,8 @@ static bool shared_incoming(struct worker*w,struct deferred*d){
     if(!d->client)return true;struct client*c=d->client;if(!c->active)return false;
     if(d->normalized)return true;d->normalized=true;
     if(d->h.op==NJW_START){if(w->policy_initialized)return false;w->network_client=c;w->generation=c->generation;return true;}
-    if(d->h.op==NJW_LOADED){struct pending_load**at=&w->loads;while(*at&&((*at)->id!=d->h.request||(*at)->client!=c))at=&(*at)->next;if(!*at)return false;struct pending_load*p=*at;*at=p->next;c->references--;free(p);return true;}
+    if(d->h.op==NJW_LOADED||d->h.op==NJW_FRAME){struct pending_load**at=&w->loads;while(*at&&((*at)->id!=d->h.request||(*at)->client!=c))at=&(*at)->next;if(!*at)return false;
+        if(d->h.op==NJW_FRAME&&(d->h.kind&NJW_FRAME_EVENT)!=NJW_FRAME_END)return true;struct pending_load*p=*at;*at=p->next;c->references--;free(p);return true;}
     if(d->h.op==NJW_PORT_MESSAGE||d->h.op==NJW_PORT_CLOSE||d->h.op==NJW_PORT_DRAINED){struct broker_pair*p=shared_pair(w,c,d->h.request,d->h.kind);if(!p)return false;d->h.request=p->id;}
     return true;
 }
@@ -494,28 +497,55 @@ static JSValue native_eval(JSContext *ctx,JSValueConst thisv,int argc,JSValueCon
     uint64_t saved=w->until;w->until=n_clock_uptime_ms()+NJW_TASK_MS;JSValue code=JS_Eval(ctx,source,n,url,JS_EVAL_TYPE_GLOBAL|JS_EVAL_FLAG_COMPILE_ONLY);JS_FreeCString(ctx,source);JS_FreeCString(ctx,url);w->until=saved;
     if(JS_IsException(code))return code;return JS_EvalFunction(ctx,code);
 }
+/* request(query, stream): a fetch, from js_fetch.js's transport query (the runtime's own record,
+ * without a prototype). Its modes become the NJW_LOAD kind's flags, the rest the packet that
+ * js_worker.c reads: [url, method, headers, body, referrer, referrer policy, destination]. */
 static JSValue native_request(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
     (void)thisv;struct worker *w=state(ctx);
     if(w->closed)return JS_ThrowTypeError(ctx,"Worker closed");
-    if(!argc||!JS_IsString(argv[0]))return JS_ThrowTypeError(ctx,"URL string required");
+    if(!argc||!JS_IsObject(argv[0]))return JS_ThrowTypeError(ctx,"Fetch request record required");
     if(w->request==UINT32_MAX)return JS_ThrowRangeError(ctx,"Worker request identifier space exhausted");
+    static const struct {const char *name;uint32_t flag;} modes[]={{"noCors",NJW_LOAD_NO_CORS},{"noReferrer",NJW_LOAD_NO_REFERRER},
+        {"sameOrigin",NJW_LOAD_SAME_ORIGIN},{"redirectError",NJW_LOAD_REDIRECT_ERROR},{"forcePreflight",NJW_LOAD_PREFLIGHT},{"keepalive",NJW_LOAD_KEEPALIVE}};
     uint32_t kind=2u;
-    if(argc>1&&JS_ToBool(ctx,argv[1]))kind|=NJW_LOAD_NO_CORS;
-    if(argc>2&&JS_ToBool(ctx,argv[2]))kind|=NJW_LOAD_NO_REFERRER;
-    uint32_t id=++w->request;
+    for(unsigned i=0;i<sizeof modes/sizeof *modes;i++){
+        JSValue value=JS_GetPropertyStr(ctx,argv[0],modes[i].name);if(JS_IsException(value))return value;
+        int on=JS_ToBool(ctx,value);JS_FreeValue(ctx,value);if(on<0)return JS_EXCEPTION;if(on)kind|=modes[i].flag;
+    }
+    if(argc>1){int on=JS_ToBool(ctx,argv[1]);if(on<0)return JS_EXCEPTION;if(on)kind|=NJW_LOAD_STREAM;}
+    static const struct {const char *name;int32_t max;unsigned shift;} numbers[]={{"credentials",2,NJW_LOAD_CREDENTIALS_SHIFT},{"cache",5,NJW_LOAD_CACHE_SHIFT}};
+    for(unsigned i=0;i<2;i++){
+        JSValue value=JS_GetPropertyStr(ctx,argv[0],numbers[i].name);if(JS_IsException(value))return value;
+        int32_t n=-1;bool valid=JS_IsNumber(value)&&!JS_ToInt32(ctx,&n,value)&&n>=0&&n<=numbers[i].max;JS_FreeValue(ctx,value);
+        if(!valid)return JS_ThrowTypeError(ctx,"Invalid Worker fetch mode");kind|=(uint32_t)n<<numbers[i].shift;
+    }
+    static const char *const fields[]={"url","method","headers","body","referrer","referrerPolicy","destination"};
     JSValue packet=JS_NewArray(ctx);if(JS_IsException(packet))return packet;
     bool ok=true;
-    for(unsigned i=0;i<6&&ok;i++){
-        JSValue value=i==0?JS_DupValue(ctx,argv[0]):i==1?argc>3?JS_DupValue(ctx,argv[3]):JS_NewString(ctx,"GET"):
-            i==2?argc>4?JS_DupValue(ctx,argv[4]):JS_NewString(ctx,""):i==3?argc>5?JS_DupValue(ctx,argv[5]):JS_NULL:
-            i==4?argc>6?JS_DupValue(ctx,argv[6]):JS_NewString(ctx,w->policy_doc.url?w->policy_doc.url:""):
-            argc>7?JS_DupValue(ctx,argv[7]):JS_NewInt32(ctx,w->policy_doc.referrer_policy);
-        if(JS_IsException(value)||JS_DefinePropertyValueUint32(ctx,packet,i,value,JS_PROP_C_W_E)<0)ok=false;
+    for(unsigned i=0;i<7&&ok;i++){
+        JSValue value=JS_GetPropertyStr(ctx,argv[0],fields[i]);
+        if(JS_IsException(value)){ok=false;break;}
+        size_t bytes=0;
+        bool typed=i==3?JS_IsNull(value)||JS_GetArrayBuffer(ctx,&bytes,value)!=NULL||(!JS_HasException(ctx)&&JS_IsObject(value)&&!bytes):i==5?JS_IsNumber(value):JS_IsString(value);
+        if(!typed){JS_FreeValue(ctx,value);if(!JS_HasException(ctx))JS_ThrowTypeError(ctx,"Invalid Worker fetch request field");ok=false;break;}
+        if(JS_DefinePropertyValueUint32(ctx,packet,i,value,JS_PROP_C_W_E)<0)ok=false;
     }
+    uint32_t id=w->request+1;
     if(ok)ok=send_value(w,NJW_LOAD,id,kind,packet);JS_FreeValue(ctx,packet);
     if(!ok)return JS_HasException(ctx)?JS_EXCEPTION:JS_ThrowTypeError(ctx,"Worker fetch IPC failed");
-    output_flush(w);
+    w->request=id;output_flush(w);
     return JS_NewUint32(ctx,id);
+}
+/* resume(id): the runtime took the last frame of a streamed fetch (NJW_RESUME). */
+static JSValue native_resume(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
+    (void)thisv;struct worker *w=state(ctx);uint32_t id;
+    if(!argc)return JS_ThrowTypeError(ctx,"Worker request identifier required");
+    if(JS_ToUint32(ctx,&id,argv[0]))return JS_EXCEPTION;
+    if(!id)return JS_ThrowTypeError(ctx,"Worker request identifier required");
+    if(w->closed)return JS_UNDEFINED;
+    if(!send_value(w,NJW_RESUME,id,0,JS_NULL)){w->closed=w->output_failed=true;return JS_ThrowTypeError(ctx,"Worker stream IPC failed");}
+    output_flush(w);
+    return JS_UNDEFINED;
 }
 static JSValue native_context_url(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){
     (void)self;(void)argc;(void)argv;struct worker*w=state(ctx);return JS_NewString(ctx,w->policy_doc.url?w->policy_doc.url:"");
@@ -661,7 +691,7 @@ int main(int argc,char**argv){
         JS_CFUNC_DEF("detach",1,native_detach),JS_CFUNC_DEF("transferCommit",1,native_transfer_commit),JS_CFUNC_DEF("portSend",6,native_port_send),
         JS_CFUNC_DEF("bufferTransferable",1,native_buffer_transferable),JS_CFUNC_DEF("pack",1,native_pack),JS_CFUNC_DEF("unpack",1,native_unpack),
         JS_CFUNC_DEF("portLease",3,native_port_lease),JS_CFUNC_DEF("now",0,native_now),JS_CFUNC_DEF("promiseThen",3,native_promise_then),JS_CFUNC_DEF("promiseIsHandled",1,native_promise_is_handled),JS_CFUNC_DEF("url",0,native_context_url),JS_CFUNC_DEF("securityURL",0,native_security_url),JS_CFUNC_DEF("referrerPolicy",0,native_referrer_policy),
-        JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",6,native_request),JS_CFUNC_DEF("dataURL",1,native_data_url),JS_CFUNC_DEF("cancel",1,native_cancel),
+        JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",2,native_request),JS_CFUNC_DEF("resume",1,native_resume),JS_CFUNC_DEF("dataURL",1,native_data_url),JS_CFUNC_DEF("cancel",1,native_cancel),
         JS_CFUNC_DEF("import",1,native_import),JS_CFUNC_DEF("eval",2,native_eval)};
     JS_SetPropertyFunctionList(w.ctx,host,funcs,sizeof funcs/sizeof funcs[0]);
     web_js_encoding_init_isolated(w.ctx,host);web_js_url_init(w.ctx,host);web_js_navigator_init(w.ctx,host);web_js_webidl_init(w.ctx,host);web_js_crypto_init(w.ctx,host);web_js_compression_init(w.ctx,host);web_atomics_host_init(w.ctx,host);web_opfs_host_init(w.ctx,host,opfs_storage_url);web_idb_host_init(w.ctx,host,&worker_idb_realm);web_cache_host_init(w.ctx,host,&worker_idb_realm);web_js_wasm_host_init(w.ctx,host);web_js_webgl_init(w.ctx,host,NULL);
@@ -694,7 +724,7 @@ int main(int argc,char**argv){
         bool received_task=d!=NULL;
         /* The running JS task holds current_client until its checkpoint; the
          * packet's ownership pin is released exactly once by deferred_free. */
-        if(d){w.current_client=d->client;bool allowed=!w.shared||shared_incoming(&w,d);JSValue value=allowed?JS_ReadObject(w.ctx,d->data,d->h.bytes,JS_READ_OBJ_REFERENCE):JS_UNDEFINED;if(JS_IsException(value))exception(&w);else if(allowed&&!native_port_receive(&w,&d->h,value)){JS_FreeValue(w.ctx,value);if(JS_HasException(w.ctx))exception(&w);}else if(allowed){JSValue result;if(d->h.op==NJW_LOADED){JSValue args[]={JS_NewUint32(w.ctx,d->h.request),value,JS_NewUint32(w.ctx,d->h.kind)};result=hook(&w,"loaded",3,args);JS_FreeValue(w.ctx,args[0]);JS_FreeValue(w.ctx,args[2]);}else if(d->h.op==NJW_START)result=worker_policy_start(&w,value)?hook(&w,"start",1,&value):JS_EXCEPTION;else{JSValue args[]={value,JS_NewUint32(w.ctx,d->h.op),JS_NewUint32(w.ctx,d->h.request),JS_NewUint32(w.ctx,d->h.kind)};web_atomics_import_begin(&d->inbox);result=hook(&w,"receive",4,args);web_atomics_import_end();for(unsigned i=1;i<4;i++)JS_FreeValue(w.ctx,args[i]);}if(JS_IsException(result)){exception(&w);if(d->h.op==NJW_START){send_value(&w,NJW_CLOSE,0,0,JS_NULL);w.closed=true;}}else if(w.shared&&d->h.op==NJW_START){if(w.before_start){if(w.tail)w.tail->next=w.before_start;else w.head=w.before_start;w.tail=w.before_start_tail;w.before_start=w.before_start_tail=NULL;}}JS_FreeValue(w.ctx,result);JS_FreeValue(w.ctx,value);}deferred_free(d);w.current_client=NULL;}
+        if(d){w.current_client=d->client;bool allowed=!w.shared||shared_incoming(&w,d);JSValue value=allowed?JS_ReadObject(w.ctx,d->data,d->h.bytes,JS_READ_OBJ_REFERENCE):JS_UNDEFINED;if(JS_IsException(value))exception(&w);else if(allowed&&!native_port_receive(&w,&d->h,value)){JS_FreeValue(w.ctx,value);if(JS_HasException(w.ctx))exception(&w);}else if(allowed){JSValue result;if(d->h.op==NJW_LOADED||d->h.op==NJW_FRAME){JSValue args[]={JS_NewUint32(w.ctx,d->h.request),value,JS_NewUint32(w.ctx,d->h.kind)};result=hook(&w,d->h.op==NJW_FRAME?"frame":"loaded",3,args);JS_FreeValue(w.ctx,args[0]);JS_FreeValue(w.ctx,args[2]);}else if(d->h.op==NJW_START)result=worker_policy_start(&w,value)?hook(&w,"start",1,&value):JS_EXCEPTION;else{JSValue args[]={value,JS_NewUint32(w.ctx,d->h.op),JS_NewUint32(w.ctx,d->h.request),JS_NewUint32(w.ctx,d->h.kind)};web_atomics_import_begin(&d->inbox);result=hook(&w,"receive",4,args);web_atomics_import_end();for(unsigned i=1;i<4;i++)JS_FreeValue(w.ctx,args[i]);}if(JS_IsException(result)){exception(&w);if(d->h.op==NJW_START){send_value(&w,NJW_CLOSE,0,0,JS_NULL);w.closed=true;}}else if(w.shared&&d->h.op==NJW_START){if(w.before_start){if(w.tail)w.tail->next=w.before_start;else w.head=w.before_start;w.tail=w.before_start_tail;w.before_start=w.before_start_tail=NULL;}}JS_FreeValue(w.ctx,result);JS_FreeValue(w.ctx,value);}deferred_free(d);w.current_client=NULL;}
         /* Finish the received task's microtasks before a local port/timer task. */
         if(received_task){jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}
         /* Atomics.waitAsync settlements are tasks of their own. */
