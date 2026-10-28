@@ -242,9 +242,10 @@ static void tool(struct ui_msg *m, const char *icon, bool enabled, uint32_t what
     act(place, what, (uint32_t)language);
 }
 
-static uint32_t button(struct ui_msg *m, const char *text) {
+static uint32_t button(struct ui_msg *m, const char *text, bool enabled) {
     uint32_t place = ui_node(m, "button");
     ui_str(m, "text", text); ui_str(m, "variant", "secondary");
+    if (!enabled) ui_num(m, "disabled", 1);
     ui_end(m);
     return place;
 }
@@ -302,7 +303,7 @@ static void languages_page(struct ui_msg *m) {
             ui_end(m);
         }
         ui_node(m, "row");
-            act(button(m, "Restore default"), ACT_RESTORE, 0);
+            act(button(m, "Restore default", !webprefs_languages_default()), ACT_RESTORE, 0);
         ui_end(m);
     ui_end(m);
 
@@ -392,7 +393,7 @@ static void privacy_page(struct ui_msg *m) {
         ui_end(m);
         for (size_t i = 0; i < sizeof lines / sizeof *lines; i++) say(m, lines[i], NULL, t->textDim);
         ui_node(m, "row");
-            act(button(m, "Clear and disable"), ACT_CLEAR, 0);
+            act(button(m, "Clear and disable", true), ACT_CLEAR, 0);
         ui_end(m);
     ui_end(m);
 }

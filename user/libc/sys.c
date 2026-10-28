@@ -347,7 +347,7 @@ n_result n_channel_receive(n_handle h, void *buf, size_t cap, int flags, n_handl
 n_result n_channel_receive_from(n_handle h, void *buf, size_t cap, int flags, struct n_channel_message *message) {
     return NC5(SYS_CHANNEL_RECEIVE_FROM, h, buf, cap, flags, message);
 }
-n_handle n_app_launch(const char *path, const struct n_launch *launch) {
+static n_handle launch_program(const char *path, const struct n_launch *launch) {
     n_handle app = (n_handle)NC5(SYS_APP_LAUNCH, path, launch, 0, 0, 0);
     if (app != -N_ERR_NOT_PROGRAM || !launch) return app;
     /* a script: its interpreter runs it, with the script's name before the rest */
@@ -365,6 +365,45 @@ n_handle n_app_launch(const char *path, const struct n_launch *launch) {
     l.argument_count = argc ? argc + 1 : 2;
     app = (n_handle)NC5(SYS_APP_LAUNCH, interp, &l, 0, 0, 0);
     free(args);
+    return app;
+}
+
+/* Whether the launch gives the setting name ("NAME=..."). */
+static bool launch_gives(const struct n_launch *l, const char *name) {
+    size_t n = strlen(name);
+    for (uint32_t i = 0; i < l->setting_count; i++)
+        if (l->settings[i] && !strncmp(l->settings[i], name, n) && l->settings[i][n] == '=') return true;
+    return false;
+}
+
+n_handle n_app_launch(const char *path, const struct n_launch *launch) {
+    if (!launch) return launch_program(path, launch);
+    /* A child works for this app's user: it gets this app's USERFOLDER and TEMP unless the launch
+       names its own (the kernel gives the system's to an app launched without them). */
+    static const char *const user[] = {"USERFOLDER", "TEMP"};
+    char *own[2] = {0};
+    const char **settings = NULL;
+    uint32_t owned = 0;
+    struct n_launch l = *launch;
+    n_handle app = -N_ERR_NO_MEMORY;
+    for (int i = 0; i < 2; i++) {
+        const char *v = getenv(user[i]);
+        if (!v || launch_gives(launch, user[i])) continue;
+        size_t n = strlen(user[i]) + strlen(v) + 2;
+        if (!(own[owned] = malloc(n))) goto out;
+        snprintf(own[owned++], n, "%s=%s", user[i], v);
+    }
+    if (owned) {
+        if (!(settings = malloc((launch->setting_count + owned) * sizeof *settings))) goto out;
+        for (uint32_t i = 0; i < launch->setting_count; i++) settings[i] = launch->settings[i];
+        for (uint32_t i = 0; i < owned; i++) settings[launch->setting_count + i] = own[i];
+        l.settings = settings;
+        l.setting_count += owned;
+    }
+    app = launch_program(path, &l);
+out:
+    free(settings);
+    for (uint32_t i = 0; i < owned; i++) free(own[i]);
     return app;
 }
 n_result n_app_result(n_handle app, int64_t timeout_ms, int *status) {

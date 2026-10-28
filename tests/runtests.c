@@ -248,7 +248,7 @@ static const struct test tests[] = {
     {"sandboxprofile", "generation-bound-native-policy", "tcc -IC:\\Tests -o .\\sandboxprofiletest C:\\Tests\\sandboxprofiletest.c && .\\sandboxprofiletest", 0,
      {"sandboxprofiletest: 94 checks, 0 failed"}, "FAIL", 120, false, true},
     {"navigator", "window-worker-identity", "tcc -IC:\\Tests -o .\\navigatortest C:\\Tests\\navigatortest.c && .\\navigatortest", 0,
-     {"Navigator languages=", "navigatortest: 246 checks, 0 failed"}, "FAIL", 120, false, true},
+     {"Navigator languages=", "navigatortest: 264 checks, 0 failed"}, "FAIL", 120, false, true},
     {"browserdeferred", "hover-fifo-boundaries", "tcc -IC:\\Tests -o .\\browserdeferredtest C:\\Tests\\browserdeferredtest.c && .\\browserdeferredtest", 0,
      {"browserdeferred: 27 checks, 0 failed"}, "FAIL", 120, false, true},
     {"canvasgradient", "native-linear-radial-rgba", "tcc -IC:\\Tests -o .\\canvasgradienttest C:\\Tests\\canvasgradienttest.c && .\\canvasgradienttest", 0,
