@@ -74,6 +74,7 @@ async function test(){
     const lateError=await new Promise((ok,bad)=>{late.onsuccess=()=>bad(new Error('a unique index over equal values was built'));late.onerror=e=>ok(e);});
     check('requests before createIndex run without the index; its build aborts with ConstraintError',adds===2&&constraint&&dbErrors===0);
     check('an aborted upgrade answers the open with a new AbortError and no transaction',lateError.target.error.name==='AbortError'&&late.transaction===null);
+    check('the error event of a failed open bubbles and is cancelable though the request has no transaction to reach (idbfactory-open-error-properties)',lateError.type==='error'&&lateError.bubbles===true&&lateError.cancelable===true&&lateError.target===late);
     context.bridge.retire();console.log(`IndexedDB metadata contract: ${checks} checks, 0 failures; ${payloadWrites} changed payload writes`);
 }
 test().catch(e=>{console.error(e);context.bridge.retire();process.exitCode=1;});
