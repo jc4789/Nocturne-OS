@@ -48,7 +48,9 @@ static void test_frame_ui(void){
     step(&fixture);
     test_check("frameset-native-red-paint",(pixels[300*VW+100]&0xffffff)==0xff0000);
     test_check("frameset-native-green-paint",(pixels[300*VW+500]&0xffffff)==0x00ff00);
-    test_check("script-child-target-top-denied",fixture.navigations==0);
+    /* HTML "allowed by sandboxing to navigate": an unsandboxed child may navigate its top-level
+       traversable, so the red frame's script click on its target=_top link navigates the top. */
+    test_check("script-child-target-top-navigates",fixture.navigations==1 && strstr(fixture.navigation,"/forbidden-top.html"));
     web_node *input=web_node_at(fixture.doc,20,25);test_check("frame-input-hit",input!=NULL);
     if(input){
         web_focus(fixture.doc,input);test_check("frame-input-focus",web_focused(fixture.doc)==input);
@@ -69,7 +71,7 @@ static void test_frame_ui(void){
         end=uptime_ms()+5000;
         while(uptime_ms()<end && !has_mark(&fixture,"frame-green-next")){frame_test_deliver();step(&fixture);n_sleep_ms(1);}
         test_check("frame-named-navigation-loaded",has_mark(&fixture,"frame-green-next"));
-        test_check("frame-native-link-no-top-navigation",fixture.navigations==0);
+        test_check("frame-native-link-no-top-navigation",fixture.navigations==1);
     }
     test_check("frame-ui-no-errors",fixture.errors==0 && fixture.js_failures==0);close_case();
 }
