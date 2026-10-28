@@ -2988,7 +2988,7 @@ static bool dom_custom_subtree(node_t *node, bool scoped_only) {
 static bool dom_synchronous_hooks(struct web_js_state *s,int opcode,node_t *n,int argc,JSValueConst *argv) {
     node_t *incoming=argc>2?node_opaque(argv[2]):NULL,*old=argc>3?node_opaque(argv[3]):NULL;
     if(s->face_hooks_active)return true; /* form/id/fieldset changes affect FACE */
-    bool structure=opcode==DOM_insert||opcode==DOM_replace||opcode==DOM_replaceAll||opcode==DOM_remove||opcode==DOM_adopt;
+    bool structure=opcode==DOM_insert||opcode==DOM_move||opcode==DOM_replace||opcode==DOM_replaceAll||opcode==DOM_remove||opcode==DOM_adopt;
     if(s->range_hooks_active&&structure)return true;
     if(opcode==DOM_set&&argc>2&&JS_IsString(argv[2])){
         const char *key=JS_ToCString(s->ctx,argv[2]);
@@ -3126,7 +3126,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     if(dom_authority_denied(s,d))
         return history_security_error(ctx,"Sandbox denied borrowed document authority");
     doc_dom_budget(d);
-    bool mutation = opcode == DOM_shadowAttach || opcode == DOM_slotAssign || opcode == DOM_insert || opcode == DOM_replace || opcode == DOM_replaceAll || opcode == DOM_remove || opcode == DOM_adopt || opcode == DOM_clone || opcode == DOM_import || opcode == DOM_set ||
+    bool mutation = opcode == DOM_shadowAttach || opcode == DOM_slotAssign || opcode == DOM_insert || opcode == DOM_move || opcode == DOM_replace || opcode == DOM_replaceAll || opcode == DOM_remove || opcode == DOM_adopt || opcode == DOM_clone || opcode == DOM_import || opcode == DOM_set ||
                     opcode == DOM_attrSetNode || opcode == DOM_attrRemoveNode ||
                     ((opcode == DOM_attr || opcode == DOM_style) && argc > 3) || (opcode == DOM_attrNS && argc > 4);
     bool synchronous_hooks=mutation&&(s->ce_hooks_active||s->range_hooks_active)&&dom_synchronous_hooks(s,opcode,n,argc,argv);
@@ -3158,7 +3158,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
     }
     if(!n){switch(opcode){
-    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
+    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
         result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");goto dom_complete;
     default:break;
     }}
@@ -3294,6 +3294,13 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         node_t *before = argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3]) ? unwrap(ctx, argv[3]) : NULL;
         if (!n || !child || (argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3]) && !before)) result = JS_ThrowTypeError(ctx, "Node arguments are required");
         else result = JS_NewInt32(ctx, doc_node_insert_validity(n, child, before));
+
+    } break;
+    case DOM_moveStatus: {
+        node_t *child = argc > 2 ? unwrap(ctx, argv[2]) : NULL;
+        node_t *before = argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3]) ? unwrap(ctx, argv[3]) : NULL;
+        if (!child || (argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3]) && !before)) result = JS_ThrowTypeError(ctx, "Node arguments are required");
+        else result = JS_NewInt32(ctx, doc_node_move_validity(n, child, before));
 
     } break;
     case DOM_replacementStatus: {
@@ -3681,6 +3688,13 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             else if(!inserted_roots_capture(s,child,&inserted))result=JS_EXCEPTION;
             else result=doc_node_move(d,n,child,before)?JS_UNDEFINED:oom(ctx);
         }
+
+    } break;
+    case DOM_move: {
+        /* DOM "move": no insertion steps, so nothing here prepares a script or connects a frame */
+        node_t *child = argc > 2 ? unwrap(ctx, argv[2]) : NULL, *before = argc > 3 ? unwrap(ctx, argv[3]) : NULL;
+        if (!child || doc_node_move_validity(n, child, before)) result = JS_ThrowTypeError(ctx, "HierarchyRequestError");
+        else result = doc_node_move_preserving(d, n, child, before) ? JS_UNDEFINED : oom(ctx);
 
     } break;
     case DOM_replace: {

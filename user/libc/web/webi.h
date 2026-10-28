@@ -1619,6 +1619,7 @@ static inline bool doc_html_names(const node_t *n) {
 node_t *doc_doctype_create(web_doc *d, const char *name, size_t name_len,
     const char *public_id, size_t public_len, const char *system_id, size_t system_len);
 int doc_node_insert_validity(node_t *parent, node_t *child, node_t *before);
+int doc_node_move_validity(node_t *parent, node_t *child, node_t *before); /* DOM: pre-move validity */
 int doc_node_replace_validity(node_t *parent, node_t *child, node_t *old);
 int doc_node_replace_all_validity(node_t *parent,node_t *child);
 node_t *doc_node_root(node_t *node, bool composed);
@@ -1652,7 +1653,9 @@ bool doc_attr_remove(web_doc *d, node_t *element, int index);
 bool doc_attr_value(web_doc *d, node_t *attribute, const char *value);
 void doc_attrs_publish(node_t *element, struct attr *attrs, int count);
 void doc_attrs_initial(web_doc *d, node_t *element, struct attr *attrs, int count); /* parser, under its trap */
-bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before);
+bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before); /* remove, then insert */
+/* DOM "move" (moveBefore): child keeps its state; no removing or insertion steps */
+bool doc_node_move_preserving(web_doc *d, node_t *parent, node_t *child, node_t *before);
 enum { HTML_BRIDGE_FIELDS=1, HTML_BRIDGE_LINKS=2, HTML_BRIDGE_CHILDREN=4 };
 void html_bridge_native_changed(node_t *node, unsigned flags);
 void html_bridge_native_retire(node_t *node); /* before allocation ownership ends */

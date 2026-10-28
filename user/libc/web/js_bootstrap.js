@@ -3,7 +3,7 @@
     'use strict';
     delete globalThis.__nocturne_host;
     const domOperations=host.domOperations || Object.fromEntries(
-        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
+        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'move', 'moveStatus', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
     const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
     // Reading never runs custom element reactions: getters go to the native operation directly.
     const domGet=domOperations.get;
@@ -540,6 +540,21 @@
                 dom('replaceAll',this,replacement);
             });
         }
+        /* DOM moveBefore: "move" node into this before child, keeping its state (a frame's
+           document, focus, animations); no removing or insertion steps, only the moving steps */
+        moveBefore(node,child) {
+            const type=rawDom.get(this,'nodeType');
+            if(type!==1&&type!==9&&type!==11)throw new TypeError('ParentNode receiver required');
+            if(arguments.length<2)throw new TypeError("Failed to execute 'moveBefore': 2 arguments required");
+            if(!rawDom.isNode(null,node))throw new TypeError("Failed to execute 'moveBefore': parameter 1 is not of type 'Node'");
+            if(child!=null&&!rawDom.isNode(null,child))throw new TypeError("Failed to execute 'moveBefore': parameter 2 is not of type 'Node'");
+            let reference=child??null;
+            if(reference===node)reference=rawDom.get(node,'nextSibling');
+            const status=rawDom.moveStatus(this,node,reference);
+            if(status)throw new DOMException(status===2?'The reference node is not a child of this node':'The node cannot be moved here',
+                status===2?'NotFoundError':'HierarchyRequestError');
+            dom('move',this,node,reference);
+        }
         before(...nodes) { siblingInsert(this,nodes,false); }
         after(...nodes) { siblingInsert(this,nodes,true); }
         replaceWith(...nodes) { replaceChildNode(this,nodes); }
@@ -938,7 +953,7 @@
     }
     // ParentNode is shared, but attributes and matching belong only to elements.
     const parentMembers = ['children','firstElementChild','lastElementChild','childElementCount',
-        'append','prepend','replaceChildren','querySelector','querySelectorAll'];
+        'append','prepend','replaceChildren','moveBefore','querySelector','querySelectorAll'];
     copyElementMembers(Document.prototype, parentMembers.concat(['getElementsByTagName','getElementsByTagNameNS','getElementsByClassName']));
     copyElementMembers(DocumentFragment.prototype, parentMembers);
     copyElementMembers(CharacterData.prototype, ['nextElementSibling','previousElementSibling','remove','before','after','replaceWith']);
@@ -1387,13 +1402,16 @@
             const ceActive=customElementsBridge.active()&&(['clone','import'].includes(args[0]) || reactionNode && rawDom.get(reactionNode,'scripting') || args[0]==='adopt' && rawDom.get(args[1],'scripting'));
             const ce=ceActive?customElementsBridge.before(...args):null;
             let mutationArgs=reactionArgs;
+            /* a move's live range and NodeIterator updates are those of a removal and insertion */
+            if(args[0]==='move')mutationArgs=['insert',...args.slice(1)];
             if(args[0]==='set' && args[2]==='innerHTML' && args[1] instanceof HTMLTemplateElement)
                 mutationArgs=['set',rawDom.get(args[1],'templateContent'),'innerHTML',args[3]];
             const mutation=mutationBridge.native?null:mutationBridge.before(...mutationArgs);
             const range=rangeBridge.active()?rangeBridge.before(...mutationArgs):null;
-            return ce||mutation||range?{ce,mutation,range,op:args[0]}:null;
+            const traversal=traversalBridge.before(...mutationArgs);
+            return ce||mutation||range||traversal?{ce,mutation,range,traversal,op:args[0]}:null;
         },
-        customElementAfter(token,result){rangeBridge.after(token.range);if(!mutationBridge.native)mutationBridge.after(token.mutation);customElementsBridge.after(token.ce,result);},
+        customElementAfter(token,result){rangeBridge.after(token.range);traversalBridge.after(token.traversal);if(!mutationBridge.native)mutationBridge.after(token.mutation);customElementsBridge.after(token.ce,result);},
         customElementCloneDocuments:customElementsBridge.cloneDocuments,
         mutationFlush(){mutationBridge.flush();},
         customElementScan(){customElementsBridge.upgradeTree(document);customElementsBridge.formRefresh();},
