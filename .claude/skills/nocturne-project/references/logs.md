@@ -59,6 +59,7 @@ fps を直接出す行は無い。一組（wall ≈ 2000 ms）の `draw` の回�
 - `JavaScript stopped: the task exceeded its N second execution budget.`
 - `JavaScript caught exception: <name>: <message> at <関数> (<script>:<行>:<列>)`：頁の try/catch（と await の中の例外）が握りつぶした throw。旗は要らない。同じ説明は文書ごとに一度、192 種まで（最後の一つに「last distinct one traced」）。欠けた API や機能の探りの失敗は、ここにしか出ない（QuickJS の `JS_SetCaughtExceptionHook`、js.c の `caught_exception`）。
 - `JavaScript promise rejected: <理由の説明>`：Promise の拒否のすべて（後で `.catch` が受けるものも）。async 関数の throw と Promise の連なりの失敗はここに出る。上と同じ表で数える。
+- stack の枠：頁から見える `error.stack`（と上の二行・F12 の例外）は、我々の束縛（`nocturne:` で始まる台本、Worker は `nocturne:worker-bindings`）の枠と、そこから呼んだ native の枠を出さない（他のエンジンの束縛と同じ）。束縛の中のどこで投げたかを見るには `--debug-js` で開く（QuickJS の `JS_SetPlatformScriptPrefix`、js.c）。
 
 ## 動画と音（avmedia.c）
 
