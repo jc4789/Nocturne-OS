@@ -287,12 +287,12 @@ static void show_chrome(void);
 
 /* The widgets around the surface. Their events are browser commands that wait their turn
    with the rest of the input (EV_COMMAND), except a field's text, which only the field uses. */
-enum { CMD_BACK = 1, CMD_FORWARD, CMD_RELOAD, CMD_HOME, CMD_HISTORY, CMD_GO, CMD_FIND, CMD_FIND_NEXT,
+enum { CMD_BACK = 1, CMD_FORWARD, CMD_RELOAD, CMD_HOME, CMD_SETTINGS, CMD_GO, CMD_FIND, CMD_FIND_NEXT,
        CMD_EVAL, CMD_FOCUS };
 #define EV_COMMAND 0x100u /* key = CMD_*; CMD_FOCUS: x = F_*, y = got (1) or lost (0) */
 static uint32_t views; /* views sent: an event names the one it refers to */
 static struct chrome {
-    uint32_t view, back, forward, reload, home, history, address, find, console, page;
+    uint32_t view, back, forward, reload, home, settings, address, find, console, page;
 } chrome[32]; /* the recent views: an event names the view it came from, and a handler may send many before it is read */
 static uint8_t *chrome_sent; /* the last view as it went, not sent again */
 static size_t chrome_sent_n;
@@ -329,7 +329,7 @@ static void show_chrome(void) {
             c.forward = tool(&m, "chevron-right", hpos < nhist - 1);
             c.reload = tool(&m, loading ? "close" : "refresh", loading || cur_url[0]);
             c.home = tool(&m, "home", true);
-            c.history = tool(&m, "clock", true);
+            c.settings = tool(&m, "settings", true);
             ui_node(&m, "spacer"); ui_num(&m, "size", 4); ui_end(&m);
             c.address = ui_node(&m, "field");
             ui_str(&m, "value", field_focus == F_ADDR ? addr : cur_url);
@@ -1544,7 +1544,7 @@ static void take_engine_events(void) {
             else if (e.node == c->forward) inbox_command(CMD_FORWARD, 0, 0, 0);
             else if (e.node == c->reload) inbox_command(CMD_RELOAD, 0, 0, 0);
             else if (e.node == c->home) inbox_command(CMD_HOME, 0, 0, 0);
-            else if (e.node == c->history) inbox_command(CMD_HISTORY, 0, 0, 0);
+            else if (e.node == c->settings) inbox_command(CMD_SETTINGS, 0, 0, 0);
             break;
         case UI_EVENT_TEXT:
         case UI_EVENT_SUBMIT:
@@ -2509,9 +2509,6 @@ static void key(const struct gui_event *e) {
     bool ctrl = e->mods & NMOD_CTRL, alt = e->mods & NMOD_ALT;
     uint32_t k = e->key;
     if (k >= 'A' && k <= 'Z' && (ctrl || alt)) k += 32;
-    if (ctrl && (e->mods & NMOD_SHIFT) && k == 'h') {
-        sel_node = NULL; web_autocomplete_settings(); need_paint = true; return;
-    }
     if (k == NKEY_F12) {
         console_open = !console_open;
         if(console_open)focus=F_CONSOLE;else if(focus==F_CONSOLE)focus=F_PAGE;
@@ -2744,6 +2741,33 @@ static void mouse_move(const struct gui_event *e) {
     }
 }
 
+/* The browser's Settings window, a program of its own (browsersettings): this window starts it
+   and keeps it while it runs, starting no second one meanwhile. */
+static void open_settings(void) {
+    static n_handle settings_app = -1;
+    if (settings_app >= 0) {
+        int result;
+        if (n_app_result(settings_app, 0, &result) == -N_ERR_NOT_READY) return;
+        n_handle_close(settings_app);
+        settings_app = -1;
+    }
+    /* Its output and log go where this window's go, if it has them. */
+    const char *args[] = {"browsersettings"};
+    int32_t handles[] = {-1, 1, 2};
+    struct n_launch launch = {.arguments = args, .argument_count = 1, .handles = handles, .handle_count = 3};
+    char path[1024];
+    n_handle app = find_program("browsersettings", path, sizeof path) ? n_app_launch(path, &launch) : -N_ERR_NOT_FOUND;
+    if (app == -N_ERR_NO_HANDLE) { launch.handle_count = 0; app = n_app_launch(path, &launch); }
+    if (app < 0) {
+        char why[160];
+        snprintf(why, sizeof why, "The browser's settings could not be opened: %s", n_result_text(app));
+        console_add("error", why);
+        set_status(why);
+        return;
+    }
+    settings_app = app;
+}
+
 /* What the widgets around the page asked for, in its turn with the rest of the input. */
 static void command(const struct gui_event *e) {
     switch (e->key) {
@@ -2754,7 +2778,7 @@ static void command(const struct gui_event *e) {
         else if (cur_url[0]) navigate(cur_url, NAV_RELOAD);
         break;
     case CMD_HOME: navigate(HOME, NAV_PUSH); break;
-    case CMD_HISTORY: sel_node = NULL; web_autocomplete_settings(); need_paint = true; break;
+    case CMD_SETTINGS: open_settings(); break;
     case CMD_GO: focus = F_PAGE; sel_node = NULL; go_addr(addr); break;
     case CMD_FIND: find_next(find_y >= 0 ? find_y : scroll_y); break;
     case CMD_FIND_NEXT: if (find_buf[0]) find_next(find_y >= 0 ? find_y + 1 : scroll_y); break;

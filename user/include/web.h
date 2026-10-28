@@ -286,8 +286,9 @@ int64_t web_deadline(web_doc *d);
 bool web_rendering_wanted(web_doc *d);
 void web_rendering_now(web_doc *d, double period_ms);
 /* The event queue the browser's main loop waits on. Atomics.waitAsync waiters
- * and the watch on the user's languages (languagechange) report into it; the
- * loop adds its window and transports with its own tokens and hands every
+ * and the watch on the browser's preferences (webprefs.h: the languages, for
+ * languagechange and Accept-Language, and the search history) report into it;
+ * the loop adds its window and transports with its own tokens and hands every
  * report it receives to web_wait_events. */
 n_handle web_wait_queue(void);
 void web_wait_events(const struct n_event *events, size_t count);
@@ -483,7 +484,9 @@ bool web_datalist_choose(web_doc *d, web_node *input, int index);
 int web_autocomplete_options(web_doc *d, web_node *input, const char **labels, int capacity);
 bool web_autocomplete_choose(web_doc *d, web_node *input, int index);
 void web_autocomplete_record(web_doc *d, web_node *submitter, const char *destination);
-void web_autocomplete_settings(void);
+/* Turns the search history off (webprefs.h), then removes every stored search; false when either
+   failed. Whether it is on is the browser's preference, changed in its Settings window. */
+bool web_autocomplete_clear(void);
 web_node *web_label_activation(web_node *target);
 /* document rectangle of an element (its first box), for placing popups */
 bool web_node_rect(web_doc *d, web_node *n, int *x, int *y, int *w, int *h);
