@@ -433,7 +433,8 @@ void box_scroll_clamp(box_t *b) {
 
 /* the transform properties, or an offset transform (motion-1 §2.7) */
 static bool transform_properties(const style_t *s){return s->transform||s->translate.active||s->rotate||s->scale;}
-bool css_translation_active(const style_t *s){return s&&(transform_properties(s)||s->offset.path);}
+static bool offset_path(const style_t *s){return s->offset&&s->offset->path;}
+bool css_translation_active(const style_t *s){return s&&(transform_properties(s)||offset_path(s));}
 /* Row-major 4x4 of one function; translation percentages use w/h. depth: perspective too,
    which orthographic flattening otherwise discards. */
 static void transform_function_matrix(const struct css_transform *t,float w,float h,bool depth,double m[16]){
@@ -487,7 +488,7 @@ static bool transform_function_translates(const struct css_transform *t){
 }
 bool css_transform_general(const style_t *s){
     if(!s)return false;
-    if(s->offset.path)return true; /* the offset transform is box_transform_matrix's */
+    if(offset_path(s))return true; /* the offset transform is box_transform_matrix's */
     if(s->rotate&&!transform_function_translates(s->rotate))return true;
     if(s->scale&&!transform_function_translates(s->scale))return true;
     for(const struct css_transform *t=s->transform;t;t=t->next)if(!transform_function_translates(t))return true;
@@ -524,14 +525,14 @@ static void box_outline(const box_t *b,uint8_t which,float r[4],struct css_shape
    put b, whose transform reference box is (x y w h) and origin (ox, oy). The path's reference box is
    the <coord-box> of the box that establishes b's containing block. */
 static bool box_offset_used(const box_t *b,double x,double y,float w,float h,double ox,double oy,struct offset_used *u){
-    const style_t *st=b->st;
-    const struct css_shape *path=st->offset.path;
+    const struct css_offset *o=css_style_offset(b->st);
+    const struct css_shape *path=o->path;
     float element[4]={box_visual_x(b)-b->p[3]-b->b[3],box_visual_y(b)-b->p[0]-b->b[0],
                       b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3],b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2]};
     const box_t *c=b->cb?b->cb:b->parent;
     float cb[4];
     struct css_shape outline;
-    struct css_offset offset=st->offset;
+    struct css_offset offset=*o;
     if(c&&c->kind!=B_TEXT&&c->kind!=B_BR) {
         uint8_t which=path->box==CSS_BOX_MARGIN?CSS_BOX_BORDER:path->box;
         if(path->kind==CSS_SHAPE_BOX){box_outline(c,which,cb,&outline);offset.path=&outline;}
@@ -552,9 +553,9 @@ static bool box_offset_used(const box_t *b,double x,double y,float w,float h,dou
     double direction;
     if(!css_offset_place(&offset,cb,element,&u->px,&u->py,&direction))return false;
     /* offset-anchor (motion-1 §2.4): auto is transform-origin's point */
-    if(st->offset.anchor[0].kind==LK_AUTO){u->ax=ox;u->ay=oy;}
-    else{u->ax=x+len_resolve(&st->offset.anchor[0],w);u->ay=y+len_resolve(&st->offset.anchor[1],h);}
-    u->angle=(st->offset.rotate.auto_rotate?direction:0)+st->offset.rotate.angle;
+    if(o->anchor[0].kind==LK_AUTO){u->ax=ox;u->ay=oy;}
+    else{u->ax=x+len_resolve(&o->anchor[0],w);u->ay=y+len_resolve(&o->anchor[1],h);}
+    u->angle=(o->rotate.auto_rotate?direction:0)+o->rotate.angle;
     return isfinite(u->ax)&&isfinite(u->ay)&&isfinite(u->angle);
 }
 static bool style_transform_matrix(const style_t *st,double x,double y,float w,float h,const box_t *b,double out[6]);
@@ -585,7 +586,7 @@ static bool style_transform_matrix(const style_t *st,double x,double y,float w,f
     if(st->rotate){transform_function_matrix(st->rotate,w,h,false,f);matrix4_multiply(m,m,f);}
     if(st->scale){transform_function_matrix(st->scale,w,h,false,f);matrix4_multiply(m,m,f);}
     struct offset_used off;
-    if(b&&st->offset.path&&box_offset_used(b,x,y,w,h,ox,oy,&off)){
+    if(b&&offset_path(st)&&box_offset_used(b,x,y,w,h,ox,oy,&off)){
         /* the anchor point to the offset position, rotated around it */
         double a=off.angle*M_PI/180;
         for(int i=0;i<16;i++)f[i]=i%5?0:1;
@@ -824,7 +825,7 @@ static void bfc_add(struct bfc *f, float x, float y, float w, float h, int side,
    margin box; false when the band misses it, and the float leaves those lines alone. */
 static bool float_area(const struct fl *a, float y, float h, float *x0, float *x1) {
     const box_t *b = a->box;
-    const struct css_shape *s = b->st->shape_outside;
+    const struct css_shape *s = css_style_float_shape(b->st)->outside;
     float r[4];
     struct css_shape outline;
     if (s->kind == CSS_SHAPE_BOX) { box_outline(b, s->box, r, &outline); s = &outline; }
@@ -845,8 +846,8 @@ static void bfc_space(const struct bfc *f, float y, float h, float x0, float x1,
         const struct fl *a = &f->v[i];
         if (a->y >= y + h || a->y + a->h <= y || a->h <= 0) continue;
         float left = a->x, right = a->x + a->w;
-        if (lines && a->box && a->box->st && a->box->st->shape_outside && a->box->st->shape_outside->kind != CSS_SHAPE_URL &&
-            !float_area(a, y, h, &left, &right)) continue;
+        const struct css_shape *shape = lines && a->box && a->box->st ? css_style_float_shape(a->box->st)->outside : NULL;
+        if (shape && shape->kind != CSS_SHAPE_URL && !float_area(a, y, h, &left, &right)) continue;
         if (a->side == FL_LEFT) *l = fmaxf_(*l, right);
         else *r = fminf_(*r, left);
     }
@@ -1935,7 +1936,7 @@ static void position_float(box_t *c, float cw, struct bfc *f, float ox, float oy
         y = nb;
     }
     float x = c->st->float_ == FL_LEFT ? l : r - mw;
-    if (f) bfc_add(f, x, y, mw, mh, c->st->float_, c, fmaxf_(0, len_resolve(&c->st->shape_margin, cw)));
+    if (f) bfc_add(f, x, y, mw, mh, c->st->float_, c, fmaxf_(0, len_resolve(&css_style_float_shape(c->st)->margin, cw)));
     c->x = x - ox + c->m[3] + c->b[3] + c->p[3];
     c->y = y - oy + c->m[0] + c->b[0] + c->p[0];
 }

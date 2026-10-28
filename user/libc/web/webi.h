@@ -386,8 +386,17 @@ bool css_shape_equal(const struct css_shape *a, const struct css_shape *b);
    (the caller falls back to discrete, or b replaces) */
 bool css_shape_combine(enum css_shape_property which, const struct css_shape *a, const struct css_shape *b,
                        double t, bool add, sbuf *out, web_doc *d);
+/* CSS Shapes 1 (css-shapes-1#shape-outside-property, #shape-margin-property,
+   #shape-image-threshold-property): the properties that shape a float's area. A style holds them
+   as one group (style_t's float_shape). */
+struct css_float_shape {
+    const struct css_shape *outside; /* shape-outside; NULL: none */
+    len_t margin;                    /* shape-margin */
+    float image_threshold;           /* shape-image-threshold */
+};
 /* Motion Path 1 (motion-1 §2): offset-path (path), offset-distance, offset-position (LK_NORMAL,
-   LK_AUTO or a position), offset-anchor (LK_AUTO or a position), offset-rotate. */
+   LK_AUTO or a position), offset-anchor (LK_AUTO or a position), offset-rotate. A style holds them
+   as one group (style_t's offset). */
 struct css_offset_rotate { float angle; bool auto_rotate; }; /* angle in degrees; reverse is auto 180deg */
 struct css_offset {
     const struct css_shape *path; /* NULL: none */
@@ -395,6 +404,12 @@ struct css_offset {
     len_t position[2], anchor[2];
     struct css_offset_rotate rotate;
 };
+/* the groups' initial values (a style's NULL group), and whether two groups hold the same computed
+   values (NULL: the initial ones) */
+extern const struct css_float_shape css_float_shape_initial;
+extern const struct css_offset css_offset_initial;
+bool css_float_shape_equal(const struct css_float_shape *a, const struct css_float_shape *b);
+bool css_offset_equal(const struct css_offset *a, const struct css_offset *b);
 enum css_offset_property { CSS_OFFSET_POSITION, CSS_OFFSET_ANCHOR, CSS_OFFSET_ROTATE };
 bool css_offset_parse(enum css_offset_property which, const char *v, size_t n, struct cx *cx, void *out, sbuf *specified);
 bool css_offset_serialize(enum css_offset_property which, const void *value, sbuf *out, web_doc *d);
@@ -631,10 +646,13 @@ typedef struct style {
     float border_spacing;
     float opacity;
     const struct css_filter *filter; /* NULL: none; identity effects still establish a context */
-    const struct css_shape *clip_path, *shape_outside; /* NULL: none; computed-arena values */
-    len_t shape_margin;
-    float shape_image_threshold;
-    struct css_offset offset; /* Motion Path */
+    const struct css_shape *clip_path; /* NULL: none; a computed-arena value */
+    /* Groups of rarely set properties that are not inherited, held by pointer so that every
+       element's style does not carry them (css_style_float_shape, css_style_offset read them).
+       NULL: all their values initial. A group is a computed-arena record that no one writes once a
+       style holds it: cssprop.c writes a longhand into a copy and points the style at the copy. */
+    const struct css_float_shape *float_shape; /* shape-outside, shape-margin, shape-image-threshold */
+    const struct css_offset *offset;           /* Motion Path */
     struct css_clip_rect clip;
     const struct css_transform *transform;
     struct css_translate translate;
@@ -669,6 +687,13 @@ typedef struct style {
     struct custom_prop *vars;
     struct style *before, *after, *backdrop, *placeholder;
 } style_t;
+/* a style's float shape and Motion Path values, the initial ones when it holds no group */
+static inline const struct css_float_shape *css_style_float_shape(const style_t *s) {
+    return s->float_shape ? s->float_shape : &css_float_shape_initial;
+}
+static inline const struct css_offset *css_style_offset(const style_t *s) {
+    return s->offset ? s->offset : &css_offset_initial;
+}
 
 /* ---------------------------------------------------------------- stylesheets */
 typedef struct sheet sheet_t;
@@ -1400,10 +1425,15 @@ struct web_doc {
     uint8_t restyle_damage_n;
     bool restyle_damage_lost;
     struct html_parser *parser;
+    struct xml_parser *xml_parser; /* an XML document's, while it loads (xml.h) */
     struct web_js_state *js;
     bool live, dirty, paint_dirty, resources_dirty, images_dirty;
     bool restyle_dirty; /* dirty, but only marked elements' own computed values (CSS animation samples) */
     bool initial_render_done;
+    /* Paint Timing: when this document's first paint, and its first
+       contentful paint, ended (uptime_ms; 0 before). paint.c records each
+       once from a real paint walk; js.c reports them to the timeline. */
+    uint64_t first_paint_ms, first_contentful_paint_ms;
     uint64_t initial_render_deadline; /* paint fallback only: never cancels resources */
     /* HTML Page visibility (interaction.html 6.2). visible is this Document's visibility state
        (false is "hidden", a Document's initial value). A hidden document has no rendering
@@ -1626,6 +1656,7 @@ static inline bool doc_html_names(const node_t *n) {
 node_t *doc_doctype_create(web_doc *d, const char *name, size_t name_len,
     const char *public_id, size_t public_len, const char *system_id, size_t system_len);
 int doc_node_insert_validity(node_t *parent, node_t *child, node_t *before);
+int doc_node_move_validity(node_t *parent, node_t *child, node_t *before); /* DOM: pre-move validity */
 int doc_node_replace_validity(node_t *parent, node_t *child, node_t *old);
 int doc_node_replace_all_validity(node_t *parent,node_t *child);
 node_t *doc_node_root(node_t *node, bool composed);
@@ -1659,7 +1690,9 @@ bool doc_attr_remove(web_doc *d, node_t *element, int index);
 bool doc_attr_value(web_doc *d, node_t *attribute, const char *value);
 void doc_attrs_publish(node_t *element, struct attr *attrs, int count);
 void doc_attrs_initial(web_doc *d, node_t *element, struct attr *attrs, int count); /* parser, under its trap */
-bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before);
+bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before); /* remove, then insert */
+/* DOM "move" (moveBefore): child keeps its state; no removing or insertion steps */
+bool doc_node_move_preserving(web_doc *d, node_t *parent, node_t *child, node_t *before);
 enum { HTML_BRIDGE_FIELDS=1, HTML_BRIDGE_LINKS=2, HTML_BRIDGE_CHILDREN=4 };
 void html_bridge_native_changed(node_t *node, unsigned flags);
 void html_bridge_native_retire(node_t *node); /* before allocation ownership ends */
@@ -1763,7 +1796,17 @@ void web_js_frames_sync(web_doc *d);
 web_doc *web_live_child(const char *html, size_t len, const char *url, const char *charset,
                         const struct web_host *host, web_doc *parent, node_t *frame, web_doc *inherited_origin);
 web_doc *web_live_child_response(const char *html,size_t len,const char *url,const char *charset,
-                        const char *headers,const struct web_host *host,web_doc *parent,node_t *frame,web_doc *inherited_origin);
+                        const char *headers,const char *type,const struct web_host *host,web_doc *parent,node_t *frame,
+                        web_doc *inherited_origin);
+/* The document's parser, the HTML parser (d->parser, which also serves
+   document.open and document.write) or an XML document's XML parser,
+   driven the same way: doc_parser_current names the active one (NULL:
+   parsing is over), doc_parser_resume answers as html_resume,
+   doc_parser_changed as html_import_changed, and doc_parser_stop ends it. */
+const void *doc_parser_current(const web_doc *d);
+int doc_parser_resume(web_doc *d, node_t **script);
+bool doc_parser_changed(const web_doc *d);
+void doc_parser_stop(web_doc *d);
 const char *web_effective_url(web_doc *d);
 void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *r);
 void web_js_socket_event(web_doc *d, uint64_t id, const struct web_socket_event *e);

@@ -160,6 +160,8 @@ struct net_stream {
     uint64_t io_deadline;
     uint64_t bytes_sent;
     struct ns_connection_info connection;
+    /* Fetch's connection timing info, recorded as the connection opened. */
+    struct http_connection_timing timing_info;
     int (*cancelled)(void *);
     void *cancel_ctx;
     char *session_key;
@@ -354,6 +356,7 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     }
     uint32_t first[16],*ips=first;
     struct n_dns_result dns;
+    uint64_t lookup_started=uptime_ms();
     n_result resolved=net_resolve_all(host, first,16,&dns);
     if (resolved < 0) {
         if(timing)timing->resolve_ms=uptime_ms()-resolve_started;
@@ -391,7 +394,8 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
         if(sock!=-N_ERR_TIMEOUT&&sock!=-N_ERR_CONNECTION_REFUSED&&sock!=-N_ERR_UNREACHABLE)break;
     }
     if(ips!=first)free(ips);
-    if(timing){tls_started=uptime_ms();timing->connect_ms=tls_started-connect_started;}
+    uint64_t connected=uptime_ms();
+    if(timing){tls_started=connected;timing->connect_ms=tls_started-connect_started;}
     if (sock < 0) {
         errno=(int)-sock;
         snprintf(err, errlen, "connect to %s:%d: %s", host, port, n_result_text(sock));
@@ -405,6 +409,11 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     }
     s->sock = (n_handle)sock;
     s->connection=(struct ns_connection_info){1,(uint32_t)count,attempts,peer_ip};
+    /* Fetch: the lookup ends as the connection starts; a TLS connection is
+       established when its handshake is done, its secure start just before. */
+    s->timing_info=(struct http_connection_timing){.domain_lookup_start=lookup_started,
+        .domain_lookup_end=connect_started,.connect_start=connect_started,.connect_end=connected,
+        .secure_connection_start=tls?connected:0};
     s->tls = tls;
     s->http_alpn=http;
     s->cancelled=cancelled;s->cancel_ctx=cancel_ctx;
@@ -436,6 +445,8 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     }
     const char *selected=br_ssl_engine_get_selected_protocol(&s->cc.eng);
     s->h2=selected&&!strcmp(selected,"h2");
+    /* Only the IDs offered above can be selected, all shorter than the field. */
+    if(selected&&strlen(selected)<sizeof s->timing_info.protocol)strcpy(s->timing_info.protocol,selected);
     br_ssl_session_parameters negotiated;
     br_ssl_engine_get_session_parameters(&s->cc.eng,&negotiated);
     s->resumed=resume&&offered.session_id_len&&offered.session_id_len==negotiated.session_id_len&&
@@ -457,6 +468,7 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
         }
     }
     session_save(s);
+    s->timing_info.connect_end=uptime_ms();
     if(timing){timing->tls_ms=uptime_ms()-tls_started;
         timing->tls_other_ms=timing->tls_ms>=timing->tls_io_ms?timing->tls_ms-timing->tls_io_ms:0;}
     s->handshaking=false;s->io_limited=false;s->timing=NULL;
@@ -476,6 +488,9 @@ net_stream *ns_open(const char *host,uint16_t port,bool tls,int timeout_ms,char 
 }
 int ns_get_connection_info(const net_stream *s,struct ns_connection_info *out){
     if(!s||!out){errno=EINVAL;return -1;}*out=s->connection;return 0;
+}
+int ns_get_connection_timing(const net_stream *s,struct http_connection_timing *out){
+    if(!s||!out){errno=EINVAL;return -1;}*out=s->timing_info;return 0;
 }
 net_stream *ns_open_timed(const char *host,uint16_t port,bool tls,int timeout_ms,char *err,size_t errlen,
                           struct http_transport_timing *timing) {

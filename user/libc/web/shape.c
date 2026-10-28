@@ -1122,6 +1122,35 @@ bool css_shape_combine(enum css_shape_property which, const struct css_shape *a,
     return ok;
 }
 
+/* ---------------------------------------------------------------- the style's groups */
+/* CSS Shapes 1: shape-outside none, shape-margin 0, shape-image-threshold 0 */
+const struct css_float_shape css_float_shape_initial = {.margin = {.kind = LK_LEN}};
+/* motion-1 §2: offset-path none, offset-distance 0, offset-position normal, offset-anchor auto,
+   offset-rotate auto */
+const struct css_offset css_offset_initial = {
+    .distance = {.kind = LK_LEN},
+    .position = {{.kind = LK_NORMAL}, {.kind = LK_NORMAL}},
+    .anchor = {{.kind = LK_AUTO}, {.kind = LK_AUTO}},
+    .rotate = {0, true},
+};
+bool css_float_shape_equal(const struct css_float_shape *a, const struct css_float_shape *b) {
+    if (a == b) return true;
+    if (!a) a = &css_float_shape_initial;
+    if (!b) b = &css_float_shape_initial;
+    return css_shape_equal(a->outside, b->outside) && len_same(&a->margin, &b->margin) &&
+           a->image_threshold == b->image_threshold;
+}
+bool css_offset_equal(const struct css_offset *a, const struct css_offset *b) {
+    if (a == b) return true;
+    if (!a) a = &css_offset_initial;
+    if (!b) b = &css_offset_initial;
+    if (!css_shape_equal(a->path, b->path) || !len_same(&a->distance, &b->distance) ||
+        a->rotate.angle != b->rotate.angle || a->rotate.auto_rotate != b->rotate.auto_rotate) return false;
+    for (int i = 0; i < 2; i++)
+        if (!len_same(&a->position[i], &b->position[i]) || !len_same(&a->anchor[i], &b->anchor[i])) return false;
+    return true;
+}
+
 /* ---------------------------------------------------------------- Motion Path values */
 static void put_rotate(sbuf *o, const struct css_offset_rotate *r) {
     if (r->auto_rotate) { sb_puts(o, "auto"); if (r->angle != 0) { sb_putc(o, ' '); put_angle(o, r->angle); } }

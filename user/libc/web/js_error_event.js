@@ -1,4 +1,8 @@
 // Shared ErrorEvent construction; private data cannot be forged by prototype.
+// errorEventValues(event): the ErrorEvent's message, filename, lineno, colno and error, read from
+// that private data and never through a getter (HTML's special error event handling), or null for
+// any other value.
+let errorEventValues;
 const ErrorEvent = (() => {
     const data = new WeakMap(), get = WeakMap.prototype.get, set = WeakMap.prototype.set;
     const call = Reflect.apply, text = String, code = String.prototype.charCodeAt, TypeErr = TypeError;
@@ -50,5 +54,6 @@ const ErrorEvent = (() => {
     Object.defineProperty(ErrorEvent.prototype, Symbol.toStringTag, {configurable:true, value:'ErrorEvent'});
     for (const key of ['message','filename','lineno','colno','error'])
         Object.defineProperty(ErrorEvent.prototype, key, {...Object.getOwnPropertyDescriptor(ErrorEvent.prototype, key), enumerable:true});
+    errorEventValues = value => call(get, data, [value]) || null;
     return ErrorEvent;
 })();

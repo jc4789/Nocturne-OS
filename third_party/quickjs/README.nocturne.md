@@ -166,3 +166,27 @@ DOM の集まり（NodeList・HTMLCollection とその派生、`user/libc/web/js
 要る（2026-10-28 に一度、built-ins/Proxy・Reflect/ownKeys・Object の keys・getOwnPropertyNames・
 getOwnPropertySymbols・entries・values・assign・getOwnPropertyDescriptors、
 language/statements/for-in、JSON/stringify の 1398 件を流し、上流の形と同じく全部合格）。
+
+## callback の realm（Web IDL の associated realm）
+
+DOM の「inner invoke」と HTML の event handler processing algorithm は、listener の callback の
+associated realm の global を見る：その Window の current event（`window.event`）を置き直し、
+その Document が fully active でなければ呼ばず、callback が投げたものをその global で報告する。
+枠は同じ runtime の別の JSContext なので（`user/libc/web/js.c` の `runtime_realms`）、host が
+callback の realm を引く口が要る。二つを quickjs.h に出した。
+
+- `JS_GetFunctionRealm`：上流の static の関数を公開しただけで、中身は変えていない（上流の
+  static の前方宣言は除いた）。ECMAScript の GetFunctionRealm：関数の [[Realm]]、bound function と
+  Proxy はその target をたどる。取り消された Proxy では TypeError を残して NULL。
+- `JS_GetObjectRealm`（`CONFIG_NOCTURNE` の下）：呼べない object の realm。ECMAScript は関数にしか
+  realm を記録しないので、prototype の鎖の終わりの %Object.prototype% を持つ realm とする（関数なら
+  `JS_GetFunctionRealm` と同じ）。shape の proto を読むだけで、JavaScript を走らせない。Proxy は
+  target へたどり、`getPrototypeOf` の罠は呼ばない。見つからなければ（prototype が null の object
+  など）ctx。
+
+どちらも context の参照の数を増やさない。取り消された Proxy は作られた realm を覚えていないので、
+呼び出す側（js.c の `native_event_realm`）は今の realm を使う（WPT
+`dom/events/EventListener-handleEvent-cross-realm` の取り消された Proxy の二つは、この理由で
+枠の TypeError にならない）。bindings は listener を足すとき・handler に値を置くときに一度だけ
+引くので、事象の配りの一回ごとの費用にはならない。確かめ方は
+`node tests/js_event_state_hosttest.js`（一つの realm の配り）と、枠を持つ WPT の `dom/events`。

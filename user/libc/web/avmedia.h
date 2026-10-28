@@ -28,6 +28,8 @@ void web_avmedia_free(web_doc *doc);
 void web_avmedia_background(uint64_t now_ms);
 int64_t web_avmedia_background_deadline(uint64_t now_ms);
 bool web_avmedia_paint(web_doc *doc, node_t *node, canvas_t *canvas, int x, int y, int w, int h);
+/* Whether web_avmedia_paint draws a decoded frame of this video element. */
+bool web_avmedia_shows_frame(web_doc *doc, node_t *node);
 bool web_avmedia_size(node_t *node, int *width, int *height);
 /* The next media element owned by d that has native media state, after
  * previous (NULL starts); diagnostics read the registry, not every node. */

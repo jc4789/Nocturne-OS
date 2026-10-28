@@ -930,7 +930,8 @@ static const char *guess_type(const char *path) {
     const char *dot = strrchr(path, '.');
     if (!dot || strpbrk(dot, "\\/")) return "";
     static const char *map[][2] = {
-        {".html", "text/html"}, {".htm", "text/html"}, {".css", "text/css"}, {".png", "image/png"},
+        {".html", "text/html"}, {".htm", "text/html"}, {".xhtml", "application/xhtml+xml"},
+        {".xht", "application/xhtml+xml"}, {".xml", "text/xml"}, {".css", "text/css"}, {".png", "image/png"},
         {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"}, {".gif", "image/gif"}, {".webp", "image/webp"},
         {".svg", "image/svg+xml"}, {".bmp", "image/bmp"}, {".txt", "text/plain"}, {".c", "text/plain"},
         {".h", "text/plain"}, {".sh", "text/plain"}, {".md", "text/plain"}, {".json", "text/plain"},
@@ -1304,6 +1305,10 @@ static enum webnet_kind network_kind(int kind) {
 
 static void response_copy(struct web_response *out, const struct webnet_response *in, enum webnet_kind kind) {
     memset(out, 0, sizeof *out);
+    /* A network error has its timing record too (an entry with its start and end). */
+    if (in->timing && !http_fetch_timing_copy(&out->timing, in->timing)) {
+        strlcpy(out->error, "out of memory copying response timing", sizeof out->error); return;
+    }
     out->status = in->status;
     const char *url = in->final_url ? in->final_url : "";
     if (!web_response_set_url(out, url)) {
@@ -2305,12 +2310,7 @@ static void navigation_completed(webnet *net, uint64_t id, uint64_t gen,
     if (id != tab->navigation_id || gen != tab->navigation_generation) return;
     tab->navigation_id = 0;
     dt_net_update(tab->dt->nav_serial, result);
-    /* This callback observes the complete response, never its first byte.
-       Generation/id checks above prevent a canceled request changing timing. */
-    if (!result->error[0] && result->status > 0) {
-        tab->navigation_timing.response_end_ms = n_clock_uptime_ms();
-        tab->navigation_timing.response_end_valid = true;
-    }
+    /* The response carries the request's own timing record (webnet.c). */
     web_response_free(&tab->navigation_response);
     response_copy(&tab->navigation_response, result, WEBNET_NAVIGATION);
     tab->navigation_ready = true;
@@ -2344,6 +2344,9 @@ static void finish_navigation(void) {
     http_header(&headers, "Content-Type", ctype, sizeof ctype);
     char *html = NULL;
     size_t hlen = 0;
+    /* The Content-Type of html when it is the response's own body; NULL for
+       a page the browser writes (text/html). */
+    const char *document_type = NULL;
     /* The settings are a page of the browser's own, with no document. */
     bool native_page = !f->error[0] && settings_url(web_response_url(f));
     struct settings *page = !native_page ? NULL : tab->settings ? tab->settings : settings_new();
@@ -2354,8 +2357,12 @@ static void finish_navigation(void) {
         html = !strcasecmp(web_response_url(f), HOME) ? home_html() : strdup("<!doctype html><title>blank</title>");
     else {
         bool sniff_html = !ctype[0] && f->body_len && memchr(f->body, '<', MIN(f->body_len, 512));
-        if (has_prefix(ctype, "text/html") || has_prefix(ctype, "application/xhtml") || sniff_html) {
+        /* HTML "load a document": HTML and XML types are documents of their
+           own kind (SVG too); the rest the browser displays its own way. */
+        enum web_document_kind kind = web_document_kind(ctype);
+        if (kind != WEB_DOCUMENT_OTHER || sniff_html) {
             html = f->body; hlen = f->body_len; f->body = NULL;
+            if (kind == WEB_DOCUMENT_XML) document_type = ctype;
             const char *cs = strstr(ctype, "charset=");
             if (cs) {
                 cs += 8; if (*cs == '"') cs++;
@@ -2382,9 +2389,13 @@ static void finish_navigation(void) {
     document_host.net_log = net_log;
     document_host.net_body = net_body;
     document_host.navigation_timing = tab->navigation_timing;
+    /* Borrowed until the document is made; it copies what it keeps. */
+    document_host.navigation_timing.fetch = f->timing;
+    document_host.navigation_timing.status = f->status;
+    document_host.navigation_timing.headers = web_response_headers(f);
     document_host.js_task_budget_ms = js_task_budget_ms;
     document_host.automation = automation_enabled ? host_automation : NULL;
-    nd = web_live_response(html, hlen, final_url, charset, web_response_headers(f), &document_host);
+    nd = web_live_response(html, hlen, final_url, charset, web_response_headers(f), document_type, &document_host);
     free(html);
     if (!nd) { web_response_free(f); free(f); tab->loading = false; set_status("Out of memory creating document"); return; }
     }
@@ -2495,13 +2506,18 @@ static void navigate_inner(const struct navigation_request *r, const char *heade
     tab->navigation_generation = ++next_generation;
     tab->navigation_timing.valid = true;
     tab->navigation_timing.navigation_start_ms = n_clock_uptime_ms();
+    /* Navigation Timing's type: a reload, a history traversal, otherwise navigate. */
+    tab->navigation_timing.type = mode == NAV_RELOAD ? WEB_NAVIGATION_RELOAD :
+        mode == NAV_HISTORY ? WEB_NAVIGATION_BACK_FORWARD : WEB_NAVIGATION_NAVIGATE;
     tab->navigation_mode = mode;
     tab->loading = true;
     char what[256]; snprintf(what, sizeof what, "Loading %.240s", url); set_status(what);
     show_chrome();
     if (has_prefix(url, "about:") || has_prefix(url, "file://")) {
-        tab->navigation_timing.fetch_start_ms = n_clock_uptime_ms();
-        tab->navigation_timing.fetch_valid = true;
+        /* A local fetch: its record has the start and the end, nothing between. */
+        struct http_fetch_timing *timing = &tab->navigation_response.timing;
+        timing->valid = true; timing->redirect_same_origin = timing->timing_allow_passed = true;
+        timing->start_time = timing->post_redirect_start = n_clock_uptime_ms();
         struct fetched *local = calloc(1, sizeof *local);
         if (!local) { strcpy(tab->navigation_response.error, "navigation allocation failed"); tab->navigation_ready = true; return; }
         local->url = strdup(url);
@@ -2514,10 +2530,7 @@ static void navigate_inner(const struct navigation_request *r, const char *heade
             tab->navigation_response.body_len = local->len;
             snprintf(tab->navigation_response.headers, sizeof tab->navigation_response.headers, "Content-Type: %s\r\n", local->ctype);
         }
-        if (!tab->navigation_response.error[0]) {
-            tab->navigation_timing.response_end_ms = n_clock_uptime_ms();
-            tab->navigation_timing.response_end_valid = true;
-        }
+        timing->end_time = n_clock_uptime_ms();
         if (!web_response_set_url(&tab->navigation_response, local->url))
             strlcpy(tab->navigation_response.error, "navigation URL allocation failed", sizeof tab->navigation_response.error);
         if (local->body != tab->navigation_response.body) free(local->body);
@@ -2538,8 +2551,6 @@ static void navigate_inner(const struct navigation_request *r, const char *heade
         .user_activation = r->user_activation || r->browser_ui, .browser_ui = r->browser_ui,
         .report_sent = tab->console_open
     };
-    tab->navigation_timing.fetch_start_ms = n_clock_uptime_ms();
-    tab->navigation_timing.fetch_valid = true;
     dt_net_clear(); /* the Network panel follows the top-level document */
     tab->navigation_id = webnet_submit(network, &rq, navigation_completed, tab);
     if (tab->navigation_id) tab->dt->nav_serial = dt_net_begin(true, tab->navigation_generation, 0, -1, rq.method, url, rq.headers);

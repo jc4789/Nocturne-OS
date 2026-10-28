@@ -1233,6 +1233,24 @@ int doc_node_insert_validity(node_t *p, node_t *c, node_t *before) {
     return insertion_validity(p,c,before,NULL,false);
 }
 
+/* DOM "move", the pre-move validity checks in their order: 0, 1 HierarchyRequestError or
+   2 NotFoundError. One shadow-including root keeps a move within one connectedness. */
+int doc_node_move_validity(node_t *p, node_t *c, node_t *before) {
+    if (!p || !c || (p->type != N_DOC && p->type != N_ELEM && p->type != N_FRAGMENT)) return 1;
+    if (doc_node_root(p, true) != doc_node_root(c, true)) return 1;
+    for (node_t *n = p; n; n = n->parent ? n->parent : n->shadow_host ? n->shadow_host : n->template_host)
+        if (n == c) return 1;
+    if (before && before->parent != p) return 2;
+    if (c->type != N_ELEM && c->type != N_TEXT && c->type != N_COMMENT && c->type != N_PI) return 1;
+    if (c->type == N_TEXT && p->type == N_DOC) return 1;
+    if (p->type == N_DOC && c->type == N_ELEM) {
+        for (node_t *n = p->first; n; n = n->next) if (n->type == N_ELEM) return 1;
+        if (before && before->type == N_DOCTYPE) return 1;
+        for (node_t *n = before ? before->next : NULL; n; n = n->next) if (n->type == N_DOCTYPE) return 1;
+    }
+    return 0;
+}
+
 int doc_node_replace_validity(node_t *p, node_t *c, node_t *old) {
     /* Do not remove Document's old root merely to make insertion validation
        pass. Its exclusion is part of validation, before any tree mutation. */
@@ -1287,8 +1305,12 @@ static void reset_parser_forms(node_t *root) {
         }
     }
 }
-bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
-    if (!d || !p || !c || p->owner != d || doc_node_insert_validity(p, c, before)) return false;
+/* insert c into p before before, first removing it from its parent; preserve: DOM "move", which
+   runs neither the removing steps nor the insertion steps (the frame keeps its document, a modal
+   dialog stays in the top layer), only the moving steps */
+static bool insert_node(web_doc *d, node_t *p, node_t *c, node_t *before, bool preserve) {
+    if (!d || !p || !c || p->owner != d ||
+        (preserve ? doc_node_move_validity(p, c, before) : doc_node_insert_validity(p, c, before))) return false;
     (d->dom_family ? d->dom_family : d)->profile.inserts++;
     if (before == c) return true;
     if (c->type == N_FRAGMENT) {
@@ -1300,7 +1322,7 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
             if (n->type == N_ELEM) elements++;
         }
         if (p->type == N_DOC && elements > 1) return false;
-        while (c->first) if (!doc_node_move(d, p, c->first, before)) return false;
+        while (c->first) if (!insert_node(d, p, c->first, before, false)) return false;
         return true;
     }
     if (!may_insert(p, c)) return false;
@@ -1312,8 +1334,8 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
     assignment_dirty(old_parent, c); assignment_dirty(p, c);
     if (is_slot(old_parent) && !old_parent->slot_assigned_first && doc_node_root(old_parent, false)->shadow_host)
         doc_slot_signal(old_parent);
-    if(old_parent)web_dialog_removed(d,c);
-    if(old_parent)web_frames_detach_tree(d,c);
+    if(old_parent&&!preserve)web_dialog_removed(d,c);
+    if(old_parent&&!preserve)web_frames_detach_tree(d,c);
     detach(c);
     c->parent = p;
     c->next = before;
@@ -1337,6 +1359,10 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
     if (old_select && old_select != new_select) web_select_sync(old_select->owner, old_select, false);
     if (new_select) web_select_sync(new_select->owner, new_select, false);
     return true;
+}
+bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) { return insert_node(d, p, c, before, false); }
+bool doc_node_move_preserving(web_doc *d, node_t *p, node_t *c, node_t *before) {
+    return c && c->parent && insert_node(d, p, c, before, true);
 }
 
 void doc_node_remove(web_doc *d, node_t *n) {

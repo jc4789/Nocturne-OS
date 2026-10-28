@@ -1,6 +1,6 @@
 """ブラウザーのサイトのデータ（user/libc/websitedata.c：設定の窓の一覧と消去、閉じるときに消す）の
 ホストの試験。製品の websitedata.c をそのまま組み、各保存先（Cookie・Web Storage・IndexedDB・
-OPFS）の関数、利用者の選択、プロセスの一覧、一時フォルダーの文書 "windows" を
+OPFS・Cache Storage）の関数、利用者の選択、プロセスの一覧、一時フォルダーの文書 "windows" を
 tests/websitedata_host.c の小さな写しに替える。範囲を限った裏付けで、保存先そのものやゲストの
 ブラウザーでの受け入れではない。
 """

@@ -32,10 +32,23 @@ struct web_idb_realm {
     /* Storage's "obtain a storage key": the serialized origin of the realm's storage key, which
        the caller frees with JS_FreeCString; NULL for an opaque origin, or with an exception. */
     const char *(*origin)(JSContext *ctx);
+    /* The realm's embedder policy (enum html_embedder_policy: 0 unsafe-none, 1 require-corp,
+       2 credentialless), for Cache Storage's cross-origin resource policy check. */
+    int (*embedder_policy)(JSContext *ctx);
 };
 /* Registers host.indexedDB (the broker's operations, each a promise of its result) and
    host.indexedDBStorageKey (whether open and deleteDatabase may obtain a storage key). */
 void web_idb_host_init(JSContext *ctx, JSValueConst host, const struct web_idb_realm *realm);
+/* The realm's broker serves another store too (Cache Storage, js_cachestorage.c): such a request
+   goes to the broker after every request made before it, and its promise settles as theirs do, in
+   its own completion task (web_idb_next), with what convert makes of the result; an exception from
+   convert rejects it. A request the broker cannot take (refused nonzero: that status, without
+   sending) settles at once. */
+typedef JSValue (*web_idb_convert)(JSContext *ctx, struct webidb_async_result *result);
+JSValue web_idb_request(JSContext *ctx, struct web_idb *idb, const struct webidb_async_request *request,
+                        web_idb_convert convert, int refused);
+/* Whether the realm reached its broker at all, for either store: its release is then due. */
+bool web_idb_held(const struct web_idb *idb);
 /* Moves the broker's transport on without waiting: an interrupt handler may call it. */
 void web_idb_pump(struct web_idb *idb);
 bool web_idb_used(const struct web_idb *idb);

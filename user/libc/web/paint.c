@@ -77,6 +77,10 @@ struct pctx {
     const struct gfx_mask_clip *viewport_mask;
     const box_t *untransformed; /* this box's own used transform is being applied by the caller */
     struct hit_stack *stack; /* doc_elements_at: every target the exact walk reaches, bottom first */
+    /* Paint Timing, of a paint walk: it drew something other than the default
+       background (first paint), and something contentful (first contentful
+       paint): text, an image, a canvas bitmap, a video frame, an input's value. */
+    bool painted, contentful;
 };
 struct hit_entry { node_t *node; uint8_t pseudo; };
 struct hit_stack { struct hit_entry *items; size_t count, capacity; bool failed; };
@@ -88,6 +92,18 @@ static struct { uint64_t paints, order_ms, frames_ms, walk_ms, probe_ms, total_m
 static struct { uint64_t commits, boxes, lost_layout, lost_unbounded, lost_room, lost_ink,
     taken_partial, taken_full, taken_none, taken_stale; } damage_profile;
 
+/* What a paint walk drew, for Paint Timing; only a real paint counts. */
+static void paint_drew(struct pctx *P, bool contentful) {
+    if (P->mode != M_PAINT) return;
+    P->painted = true;
+    if (contentful) P->contentful = true;
+}
+/* Paint Timing's non-empty text: a character that is not document white space. */
+static bool contentful_text(const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '\f' && s[i] != '\r') return true;
+    return false;
+}
 static bool positioned(const box_t *b) {
     if (!b->st || b->kind == B_INLINE || b->kind == B_TEXT) return false;
     if (b->st->position != POS_STATIC) return b->st->position != POS_STICKY;
@@ -1025,6 +1041,7 @@ static void paint_layer(struct pctx *P, int img_idx, uint8_t size_kind, const le
     if (X0 >= c->cx1 || Y0 >= c->cy1 || X1 <= c->cx0 || Y1 <= c->cy0) return;
     image_t *img = scaled_image(im, TW, TH, c, X0, Y0, X1-X0, Y1-Y0);
     if (!img) return;
+    paint_drew(P, !col);
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
     /* rounded edges, so a box at a fractional position shows no sliver of a neighbouring tile */
     gfx_clip(c, X0, Y0, (int)roundf(x + w) - X0, (int)roundf(y + h) - Y0);
@@ -1258,6 +1275,7 @@ static void paint_bg_border(struct pctx *P, const style_t *st, float x, float y,
         c->mask_clip=previous;return;
     }
     if (!skip_bg) {
+        if ((st->bg_color >> 24) || (st->has_grad && st->gradient)) paint_drew(P, false);
         if (st->bg_color >> 24) {
             if(rounded&&rounded[0])gfx_fill_blend(c,(int)floorf(x),(int)floorf(y),(int)ceilf(x+w)-(int)floorf(x),(int)ceilf(y+h)-(int)floorf(y),st->bg_color);
             else fill_rrect(c, x, y, w, h, r, st->bg_color, st->bg_color);
@@ -1274,6 +1292,7 @@ static void paint_bg_border(struct pctx *P, const style_t *st, float x, float y,
     for (int i = 0; i < 4; i++)
         if (bw[i] > 0 && (bc[i] >> 24) && st->border_style[i] > BS_HIDDEN) any = true;
     if (!any) return;
+    paint_drew(P, false);
     if(rounded&&rounded[0]) {
         float widths[4];uint32_t colors[4];for(int i=0;i<4;i++){widths[i]=bw[i];colors[i]=st->border_style[i]>BS_HIDDEN?bc[i]:0;}
         paint_corner_border(P,x,y,w,h,widths,colors,rounded[0],rounded[1]);return;
@@ -1327,6 +1346,8 @@ static void paint_run_text(struct pctx *P, const struct run *r, float bx, float 
     wf_metrics(&f, &asc, &desc);
     if (base - asc > P->c->cy1 || base + desc < P->c->cy0) return;
     if (r->highlight) gfx_fill_blend(P->c, (int)x, (int)(base - asc), (int)ceilf(r->w), (int)ceilf(asc + desc), RGB(255, 213, 0));
+    /* Text is contentful even in a transparent colour (Paint Timing). */
+    if (r->n > 0) paint_drew(P, contentful_text(r->s, (size_t)r->n));
     uint32_t col = st->color;
     draw_text(P, st, x, base, r->s, r->n, col);
     if (st->text_decoration) {
@@ -1463,6 +1484,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
         bool pw = t && str_ieq(t, "password") && !placeholder;
         uint32_t col = control_text_color(st, placeholder);
         if (placeholder && !(col >> 24) && b->atomic == AT_INPUT) v = "";
+        if (!placeholder) paint_drew(P, contentful_text(v, strlen(v))); /* an input's value */
         size_t selection_start = !placeholder ? doc_utf16_to_byte(v, n->selection_start, false) : 0;
         size_t selection_end = !placeholder ? doc_utf16_to_byte(v, n->selection_end, true) : 0;
         bool selected = focused && !placeholder && n->selection_start != n->selection_end;
@@ -1515,6 +1537,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     }
     case AT_BUTTON_INPUT: {
         const char *l = web_button_label(n);
+        paint_drew(P, contentful_text(l, strlen(l)));
         float tw = wf_width(&f, l, strlen(l));
         text_in(P, st, x + (w - tw) / 2, y, h, l, st->color);
         break;
@@ -1576,6 +1599,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
         (void)sel;
         const char *txt = s.p ? sb_cstr(&s) : "";
         while (*txt == ' ' || *txt == '\n') txt++;
+        paint_drew(P, contentful_text(txt, strlen(txt)));
         int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
         gfx_clip(c, (int)x, (int)y, (int)w - 12, (int)ceilf(h) + 1);
         text_in(P, st, x, y, h, txt, st->color);
@@ -1591,12 +1615,13 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
         if(web_frame_element(n)&&web_avmedia_snapshot_is_probe())break;
         if(web_frame_paint(n,c,X,Y,W,H))break;
         if (n->tag == T_canvas) {
-            web_canvas_paint(n,st,c,X,Y,W,H);
+            /* A canvas with a context is contentful (Paint Timing). */
+            if (web_canvas_paint(n,st,c,X,Y,W,H)) paint_drew(P, true);
             break;
         }
         if (n->tag == T_audio || n->tag == T_video) {
             paint_debug_reached(n,c,X,Y,W,H);
-            if(web_avmedia_paint(P->d,n,c,X,Y,W,H))break;
+            if(web_avmedia_paint(P->d,n,c,X,Y,W,H)){paint_drew(P,web_avmedia_shows_frame(P->d,n));break;}
         }
         if (n->tag == T_meter || n->tag == T_progress) {
             double value = web_gauge_value(n, "value"), max = web_gauge_value(n, "max"), min = web_gauge_value(n, "min");
@@ -1657,6 +1682,7 @@ static void paint_replaced(struct pctx *P, box_t *b) {
             fitted_w=(int)roundf(fw);fitted_h=(int)roundf(fh);
         }
         image_t *s = im ? scaled_image(im, fitted_w, fitted_h, c, X, Y, W, H) : NULL;
+        paint_drew(P, s != NULL);
         if (s) {
             float dx=len_resolve(&b->st->object_pos[0],(float)(W-fitted_w));
             float dy=len_resolve(&b->st->object_pos[1],(float)(H-fitted_h));
@@ -1690,9 +1716,10 @@ static void paint_replaced(struct pctx *P, box_t *b) {
             sc->w = W;
             sc->h = H;
         }
-        if (sc->img) image_draw(c, sc->img, X, Y);
+        if (sc->img) { paint_drew(P, true); image_draw(c, sc->img, X, Y); }
         return;
     }
+    paint_drew(P, false);
     paint_control(P, b, x, y);
 }
 
@@ -1708,6 +1735,7 @@ static void paint_marker(struct pctx *P, box_t *b) {
     float base = y + bl;
     float fs = st->font_size;
     if (b->marker_shape) {
+        paint_drew(P, false);
         float r = fs * 0.18f;
         if (r < 2) r = 2;
         float mx = x - fs * 0.85f, my = base - fs * 0.32f;
@@ -1721,6 +1749,7 @@ static void paint_marker(struct pctx *P, box_t *b) {
         return;
     }
     const char *m = b->marker;
+    paint_drew(P, contentful_text(m, strlen(m))); /* a ::marker's text */
     float w = wf_width(&f, m, strlen(m));
     draw_text(P, st, x - w, base, m, (int)strlen(m), st->color);
 }
@@ -3011,7 +3040,14 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
         if (!P.canvas_group) gfx_fill_blend(c, x, y, w, h, bg);
     }
     P.canvas_bg_from = (uint32_t)from;
+    if (from) paint_drew(&P, false); /* a non-default canvas background */
     walk(&P);
+    /* Paint Timing "mark paint timing": this rendering update's end, once each. */
+    if (!P.failed && (P.painted || P.contentful)) {
+        uint64_t painted_at = uptime_ms();
+        if (!d->first_paint_ms) d->first_paint_ms = painted_at;
+        if (P.contentful && !d->first_contentful_paint_ms) d->first_contentful_paint_ms = painted_at;
+    }
     if (P.failed && frame_saved)
         for (int row = 0; row < fh; row++) memcpy(c->px + (size_t)(fy + row) * c->pitch + fx,
             frame_saved + (size_t)row * fw, sizeof *frame_saved * (size_t)fw);

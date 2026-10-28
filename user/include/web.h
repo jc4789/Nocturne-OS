@@ -120,6 +120,9 @@ struct web_response {
     char *url_full; /* Complete owned URL for native transports; inline URL remains legacy-compatible. */
     int event; /* webnet_event; zero retains the complete-response contract. */
     size_t uploaded;
+    /* Fetch's timing record of the request (http.h), its Server-Timing values
+       owned (web_response_free); valid only on a complete or ended response. */
+    struct http_fetch_timing timing;
 };
 static inline const char *web_response_url(const struct web_response *r) {
     return r->url_full ? r->url_full : r->url;
@@ -131,12 +134,20 @@ static inline const char *web_response_headers(const struct web_response *r) {
     return r->headers_full ? r->headers_full : r->headers;
 }
 void web_response_free(struct web_response *response);
-/* Navigation observations are copied into the document, not retained as a
-   pointer to a mutable browser request. All values use uptime_ms(), not wall
-   clock time. Unobserved DNS/TLS/first-byte milestones are deliberately absent. */
+/* How a document was navigated to, for its PerformanceNavigationTiming and
+   performance.navigation: navigation start (the time origin), the kind of
+   navigation, and the navigation response's timing record. The document
+   copies it as it is created; fetch.server_timing and headers are borrowed
+   until then. All values use uptime_ms(), not wall clock time. */
+enum web_navigation_type { WEB_NAVIGATION_NAVIGATE, WEB_NAVIGATION_RELOAD, WEB_NAVIGATION_BACK_FORWARD };
 struct web_navigation_timing {
-    bool valid, fetch_valid, response_end_valid;
-    uint64_t navigation_start_ms, fetch_start_ms, response_end_ms;
+    bool valid;
+    uint8_t type; /* enum web_navigation_type */
+    uint64_t navigation_start_ms;
+    struct http_fetch_timing fetch;
+    /* The navigation response's status and header block (its Content-Type). */
+    int status;
+    const char *headers;
 };
 /* Optional native-host cancellation deadline. Normal pages are not rejected
    at an arbitrary 5/15/30-second cutoff. Page code cannot reset it. */
@@ -301,8 +312,17 @@ void web_visibility_event(web_doc *d);
 void web_js_prepare(void);
 web_doc *web_live(const char *html, size_t len, const char *url, const char *charset,
                   const struct web_host *host);
+/* HTML "load a document": the document a response of a Content-Type value
+   (NULL or empty: none) makes. An HTML MIME type an HTML document, an XML
+   MIME type (text/xml, application/xml, a subtype ending in "+xml") an XML
+   document; any other the host displays its own way. */
+enum web_document_kind { WEB_DOCUMENT_OTHER, WEB_DOCUMENT_HTML, WEB_DOCUMENT_XML };
+enum web_document_kind web_document_kind(const char *type);
+/* A browsing context's document from a response: html is its body, headers
+   its header block, type the Content-Type of html (NULL: text/html, as for
+   markup the host writes itself). An XML type loads an XML document. */
 web_doc *web_live_response(const char *html,size_t len,const char *url,const char *charset,
-                         const char *headers,const struct web_host *host);
+                         const char *headers,const char *type,const struct web_host *host);
 void web_tick(web_doc *d, uint64_t now_ms);
 /* Private media/JS-worker children outlive a retired document until nonblocking reap.
  * No document/node callback is retained by this process-lifetime cleanup. */

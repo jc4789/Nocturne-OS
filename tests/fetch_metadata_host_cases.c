@@ -550,6 +550,12 @@ int main(void){
             j=request(WEBNET_WEBSOCKET,WEBNET_DEST_EMPTY,0,0,"https://example.test/");
             free(j.headers);j.headers=strdup("Sec-WebSocket-Protocol: chat\r\n");
             struct url_owned u={0};
+            /* URL Standard の直列化は special な URL の query と fragment の '\' を残す。その前の '\' は
+               解析器が '/' にした後なので、生のまま来れば別の読み方になる。 */
+            check(url_parse_owned("https://example.test/log?a\\b|c#d\\e",&u)&&!strcmp(u.path,"/log?a\\b|c"),"query と fragment の '\\' は要求の対象にそのまま残る");
+            url_owned_free(&u);
+            check(!url_parse_owned("https://example.test/p\\q",&u)&&!url_parse_owned("https://example.test\\@other.test/",&u)&&!url_parse_owned("https://example.test\\?q",&u),
+                  "path と authority の '\\' は拒む");
             check(url_parse_owned("https://www.example.test/socket",&u),"WebSocket の URL を製品の解析が読む");
             struct websocket ws={0};ws.j=&j;socket_sent[0]=0;
             bool ok=ws_handshake(&ws,"https://www.example.test/socket",&u);

@@ -11,6 +11,7 @@ struct web_idb_pending {
     struct web_idb_pending *next;
     uint32_t sequence;
     unsigned operation;
+    web_idb_convert convert; /* NULL: IndexedDB's own (idb_completion) */
     JSValue resolve, reject;
 };
 static const struct web_idb_realm *owner;
@@ -111,6 +112,7 @@ void web_idb_pump(struct web_idb *idb) {
     if(idb&&idb->broker)webidb_async_pump(idb->broker);
 }
 bool web_idb_used(const struct web_idb *idb) {return idb&&idb->used;}
+bool web_idb_held(const struct web_idb *idb) {return idb&&(idb->used||idb->broker||idb->pending||idb->failed);}
 bool web_idb_needs_poll(const struct web_idb *idb) {
     return idb&&idb->pending&&!(idb->broker&&webidb_async_watched(idb->broker));
 }
@@ -149,11 +151,11 @@ void web_idb_complete(JSContext *ctx,struct web_idb *idb) {
     if(!p){webidb_async_result_free(&out);return;}
     *link=p->next;
     if(idb->pending_last==p)idb->pending_last=previous;
-    JSValue value=idb_completion(ctx,&out);
+    JSValue value=p->convert?p->convert(ctx,&out):idb_completion(ctx,&out);
     JSValue fn=p->resolve;
     if(JS_IsException(value)){
         value=JS_GetException(ctx);fn=p->reject;
-        if(out.token&&(out.operation==WEB_IDB_BEGIN||out.operation==WEB_IDB_CONNECT)&&idb->broker){
+        if(!p->convert&&out.token&&(out.operation==WEB_IDB_BEGIN||out.operation==WEB_IDB_CONNECT)&&idb->broker){
             struct webidb_async_request cleanup={.operation=out.operation==WEB_IDB_BEGIN?WEB_IDB_ABORT:WEB_IDB_FORGET,.token=out.token};
             if(!webidb_async_submit(idb->broker,&cleanup))idb_broker_failed(idb);
         }
@@ -262,35 +264,40 @@ static JSValue idb_native(JSContext *ctx,JSValueConst this_val,int argc,JSValueC
     if(owner->state(ctx)!=idb){JS_ThrowTypeError(ctx,"Retired IndexedDB realm");goto done;}
     refused=owner->authority(ctx);
     if(JS_IsException(refused))goto done;
-    JSValue callbacks[2];
-    result=JS_NewPromiseCapability(ctx,callbacks);
-    if(JS_IsException(result))goto done;
-    struct web_idb_pending *pending=js_mallocz(ctx,sizeof *pending);
-    if(!pending){JS_FreeValue(ctx,result);result=JS_EXCEPTION;JS_FreeValue(ctx,callbacks[0]);JS_FreeValue(ctx,callbacks[1]);goto done;}
-    if(!idb->broker&&!idb->failed)idb->broker=webidb_async_create(web_atomics_queue());
     idb->used=true;
+    result=web_idb_request(ctx,idb,&request,NULL,
+        !origin&&(request.operation==WEB_IDB_BEGIN||request.operation==WEB_IDB_DATABASES)?WEB_IDB_SECURITY:0);
+done:
+    for(size_t i=0;i<acquired;i++)JS_FreeCString(ctx,references[i]);js_free(ctx,references);
+    JS_FreeCString(ctx,reference);JS_FreeCString(ctx,name);JS_FreeCString(ctx,origin);return result;
+}
+JSValue web_idb_request(JSContext *ctx,struct web_idb *idb,const struct webidb_async_request *request,
+                        web_idb_convert convert,int refused) {
+    JSValue callbacks[2];
+    JSValue result=JS_NewPromiseCapability(ctx,callbacks);
+    if(JS_IsException(result))return result;
+    struct web_idb_pending *pending=js_mallocz(ctx,sizeof *pending);
+    if(!pending){JS_FreeValue(ctx,result);JS_FreeValue(ctx,callbacks[0]);JS_FreeValue(ctx,callbacks[1]);return JS_EXCEPTION;}
+    if(!refused&&!idb->broker&&!idb->failed)idb->broker=webidb_async_create(web_atomics_queue());
     uint32_t sequence=0;
-    if(idb->broker && (origin||(request.operation!=WEB_IDB_BEGIN&&request.operation!=WEB_IDB_DATABASES)))
-        sequence=webidb_async_submit(idb->broker,&request);
-    if(webidb_async_failed(idb->broker))idb_broker_failed(idb);
+    if(idb->broker&&!refused)sequence=webidb_async_submit(idb->broker,request);
+    if(idb->broker&&webidb_async_failed(idb->broker))idb_broker_failed(idb);
     if(!sequence){
-        struct webidb_async_result out={.operation=request.operation,.status=!origin&&(request.operation==WEB_IDB_BEGIN||request.operation==WEB_IDB_DATABASES)?WEB_IDB_SECURITY:idb->failed?WEB_IDB_IO:WEB_IDB_MEMORY};
-        JSValue value=idb_completion(ctx,&out);
+        struct webidb_async_result out={.operation=request->operation,.status=refused?refused:idb->failed?WEB_IDB_IO:WEB_IDB_MEMORY};
+        JSValue value=convert?convert(ctx,&out):idb_completion(ctx,&out);
         JSValue fn=callbacks[0];
         if(JS_IsException(value)){value=JS_GetException(ctx);fn=callbacks[1];}
         JSValue called=JS_Call(ctx,fn,JS_UNDEFINED,1,&value);
         JS_FreeValue(ctx,value);JS_FreeValue(ctx,callbacks[0]);JS_FreeValue(ctx,callbacks[1]);js_free(ctx,pending);
         if(JS_IsException(called)){JS_FreeValue(ctx,result);result=JS_EXCEPTION;}JS_FreeValue(ctx,called);
     }else{
-        pending->sequence=sequence;pending->operation=request.operation;
+        pending->sequence=sequence;pending->operation=request->operation;pending->convert=convert;
         pending->resolve=callbacks[0];pending->reject=callbacks[1];
         if(idb->pending_last)idb->pending_last->next=pending;
         else idb->pending=pending;
         idb->pending_last=pending;
     }
-done:
-    for(size_t i=0;i<acquired;i++)JS_FreeCString(ctx,references[i]);js_free(ctx,references);
-    JS_FreeCString(ctx,reference);JS_FreeCString(ctx,name);JS_FreeCString(ctx,origin);return result;
+    return result;
 }
 void web_idb_host_init(JSContext *ctx,JSValueConst host,const struct web_idb_realm *realm) {
     static const JSCFunctionListEntry functions[]={
