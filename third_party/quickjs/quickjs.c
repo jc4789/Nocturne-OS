@@ -2378,7 +2378,6 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
 }
 
 #ifdef CONFIG_NOCTURNE
-static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj);
 static JSContext *JS_GetJobCallbackRealm(JSContext *ctx, JSValueConst callback,
                                          BOOL *propagation_only);
 
@@ -21454,7 +21453,8 @@ static JSValue JS_CallFree(JSContext *ctx, JSValue func_obj, JSValueConst this_o
 
 /* warning: the refcount of the context is not incremented. Return
    NULL in case of exception (case of revoked proxy only) */
-static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
+/* Nocturne: public (quickjs.h), for the host's "associated realm" of a callback. */
+JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
 {
     JSObject *p;
     JSContext *realm;
@@ -21507,6 +21507,44 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
     return realm;
     }
 }
+
+#ifdef CONFIG_NOCTURNE
+/* The realm of an object that is not callable (quickjs.h). ECMAScript records
+   a realm only for functions; any other object is given the realm whose
+   %Object.prototype% ends its prototype chain. Only shapes are read and no
+   JavaScript runs: a Proxy is followed to its target, as GetFunctionRealm
+   does, never asked for a prototype. */
+JSContext *JS_GetObjectRealm(JSContext *ctx, JSValueConst obj)
+{
+    struct list_head *el;
+    JSObject *p;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return ctx;
+    if (JS_IsFunction(ctx, obj))
+        return JS_GetFunctionRealm(ctx, obj);
+    p = JS_VALUE_GET_OBJ(obj);
+    for (;;) {
+        if (p->class_id == JS_CLASS_PROXY) {
+            JSProxyData *s = p->u.opaque;
+            if (!s || s->is_revoked || JS_VALUE_GET_TAG(s->target) != JS_TAG_OBJECT)
+                return ctx;
+            p = JS_VALUE_GET_OBJ(s->target);
+            continue;
+        }
+        if (!p->shape->proto)
+            break;
+        p = p->shape->proto;
+    }
+    list_for_each(el, &ctx->rt->context_list) {
+        JSContext *realm = list_entry(el, JSContext, link);
+        JSValueConst proto = realm->class_proto[JS_CLASS_OBJECT];
+        if (JS_VALUE_GET_TAG(proto) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(proto) == p)
+            return realm;
+    }
+    return ctx;
+}
+#endif
 
 static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
                                    int class_id)

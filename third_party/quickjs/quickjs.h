@@ -1102,6 +1102,15 @@ void JS_SetPlatformScriptPrefix(JSRuntime *rt, const char *prefix);
 enum { JS_ATOM_KEY_STRING, JS_ATOM_KEY_INDEX, JS_ATOM_KEY_SYMBOL };
 int JS_AtomKeyKind(JSContext *ctx, JSAtom atom, uint32_t *pindex);
 int JS_ThrowTypeErrorOrFalseStr(JSContext *ctx, int flags, const char *message);
+/* A callback's realm, for the host's Web IDL "associated realm". JS_GetFunctionRealm is
+   ECMAScript's GetFunctionRealm: a function's [[Realm]], through bound functions and Proxies
+   to their targets; ctx for an object with no realm of its own; NULL with a pending TypeError
+   for a revoked Proxy. JS_GetObjectRealm gives a function the same, and any other object the
+   realm whose %Object.prototype% ends its prototype chain (a Proxy is followed to its target
+   and never asked for a prototype), or ctx when none does. Neither runs JavaScript or
+   increments the context's reference count. */
+JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj);
+JSContext *JS_GetObjectRealm(JSContext *ctx, JSValueConst obj);
 
 JS_BOOL JS_IsJobPending(JSRuntime *rt);
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);

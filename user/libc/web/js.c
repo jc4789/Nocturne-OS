@@ -212,6 +212,9 @@ struct web_js_state {
     struct js_history_receiver *history_receiver;
     JSValue hooks, dispatch, response, reject, node_protos[NP_COUNT];
     JSValue webaudio; /* js_webaudio.js's interfaces, once the realm touched one */
+    /* The bindings' invokeListener (native_event_realm), and, in the runtime owner only, the
+       Event state table every realm of the runtime shares (native_event_realm_init). */
+    JSValue event_port, event_states;
     struct js_node_ref *nodes;
     struct js_node_ref *node_buckets[JS_NODE_BUCKETS];
     bool node_cache_syncing, node_cache_failed;
@@ -4885,6 +4888,72 @@ static JSValue native_window_handler(JSContext *ctx, JSValueConst this_val, int 
     if(d->js->rt!=s->rt || !web_frame_same_origin(s->doc,d))return history_security_error(ctx,"Cross-origin event handler access");
     return custom_element_hook(d->js,getter?"bodyHandlerGet":"bodyHandlerSet",argc-1,argv+1);
 }
+/* DOM "inner invoke" (https://dom.spec.whatwg.org/#concept-event-listener-inner-invoke) runs
+   in the bindings (js_bootstrap.js). A listener's callback may belong to any realm of this
+   runtime (the frames' Windows), and part of each invocation belongs to that realm: its current
+   event (window.event), the Get of handleEvent and its TypeError, and the report of what the
+   callback threw. Each realm registers the function that runs that part, its invokeListener
+   ("the port"), here once, and gets the one table of Event state that all the realms of the
+   runtime share, so that a dispatch in one realm reads an Event made in another. */
+static JSValue native_event_realm_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    struct web_js_state *s = state(ctx);
+    if (!s || argc < 2 || !JS_IsFunction(ctx, argv[0]) || !JS_IsObject(argv[1]))
+        return JS_ThrowTypeError(ctx, "An event realm needs its port and an Event state table");
+    struct web_js_state *owner = s->runtime_owner ? s->runtime_owner : s;
+    JS_FreeValue(ctx, s->event_port); s->event_port = JS_DupValue(ctx, argv[0]);
+    if (!JS_IsObject(owner->event_states)) owner->event_states = JS_DupValue(ctx, argv[1]);
+    return JS_DupValue(ctx, owner->event_states);
+}
+/* host.eventRealm(callback): the port of the realm the callback belongs to (Web IDL's
+   "associated realm": a function's realm, and for a { handleEvent } object the realm that made
+   it). The bindings ask once, when the listener is added or the event handler set, never in a
+   dispatch: a callback's realm cannot change. A revoked Proxy has no realm left to follow; it is
+   given the current realm, ECMAScript's fallback. null for a realm that is gone, whose Window
+   can never have a fully active Document again: such a listener never runs. */
+static JSValue native_event_realm(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    JSValueConst callback = argc ? argv[0] : JS_UNDEFINED;
+    JSContext *realm = JS_IsFunction(ctx, callback) ? JS_GetFunctionRealm(ctx, callback) : JS_GetObjectRealm(ctx, callback);
+    if (!realm) { JS_FreeValue(ctx, JS_GetException(ctx)); realm = ctx; }
+    struct web_js_state *r = state(realm); /* every context of a window runtime is a realm's */
+    return r && r->ctx && JS_IsFunction(ctx, r->event_port) ? JS_DupValue(ctx, r->event_port) : JS_NULL;
+}
+/* The Document of the Window an event target's listeners answer to (inner invoke's targetGlobal):
+   for a node, its node document's, which adoption changes; a node document without a Window of
+   its own (DOMParser, createHTMLDocument) has the relevant global of its creator, the realm the
+   wrapper was made in. Any other target's relevant global is the realm it was made in. NULL for
+   a realm that is gone. */
+static web_doc *event_target_document(JSContext *ctx, struct web_js_state *s, JSValueConst target) {
+    node_t *n = node_opaque(target);
+    if (n && n->owner && n->owner->js) return n->owner;
+    if (!JS_IsObject(target)) return s->doc;
+    JSContext *realm = JS_GetObjectRealm(ctx, target);
+    if (!realm) { JS_FreeValue(ctx, JS_GetException(ctx)); return s->doc; }
+    struct web_js_state *r = state(realm);
+    return r ? r->doc : NULL;
+}
+/* host.eventActive(target, port): inner invoke steps 6 to 8 for one listener about to run. False
+   when the target's global object (event_target_document) or the listener's (the port's realm,
+   this realm when port is undefined) is a Window whose associated Document is not fully active.
+   Asked for every listener: an earlier listener can remove the frame or adopt the target into
+   another document. Only native pointers and prototype links are read, no property and no
+   JavaScript, so the check costs a few pointer steps per listener that runs. */
+static JSValue native_event_active(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    struct web_js_state *s = state(ctx);
+    if (!s || !s->doc) return JS_FALSE;
+    web_doc *target = event_target_document(ctx, s, argc > 0 ? argv[0] : JS_UNDEFINED);
+    if (!web_doc_fully_active(target)) return JS_FALSE;
+    web_doc *listener = s->doc;
+    if (argc > 1 && JS_IsFunction(ctx, argv[1])) {
+        JSContext *realm = JS_GetFunctionRealm(ctx, argv[1]); /* a port is the bindings' own function */
+        struct web_js_state *r = realm ? state(realm) : NULL;
+        if (!realm) JS_FreeValue(ctx, JS_GetException(ctx));
+        listener = r ? r->doc : NULL;
+    }
+    return JS_NewBool(ctx, listener == target || web_doc_fully_active(listener));
+}
 static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if (!argc) return JS_UNDEFINED;
     struct web_js_state *s = state(ctx);
@@ -9088,6 +9157,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     timing_record(s, JS_DOM_LOADING, initialized);
     s->observer_turn = true;
     s->hooks = s->dispatch = s->response = s->reject = s->webaudio = JS_UNDEFINED;
+    s->event_port = s->event_states = JS_UNDEFINED;
     for (int i = 0; i < NP_COUNT; i++) s->node_protos[i] = JS_UNDEFINED;
     /* Grow on demand through the real OS allocator. An invented page quota
        must not turn available memory into a JavaScript compatibility failure. */
@@ -9149,6 +9219,8 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("pi",2,native_pi),
         JS_CFUNC_DEF("inline", 1, native_inline),
         JS_CFUNC_DEF("windowHandler", 5, native_window_handler),
+        JS_CFUNC_DEF("eventRealmInit", 2, native_event_realm_init), JS_CFUNC_DEF("eventRealm", 1, native_event_realm),
+        JS_CFUNC_DEF("eventActive", 2, native_event_active),
         JS_CFUNC_DEF("click", 1, native_click), JS_CFUNC_DEF("timer", 4, native_timer), JS_CFUNC_DEF("clear", 1, native_clear),
         JS_CFUNC_DEF("microtask", 1, native_microtask),
         JS_CFUNC_DEF("postTask", 1, native_post_task), JS_CFUNC_DEF("cancelPost", 1, native_cancel_post),
@@ -9311,6 +9383,7 @@ void web_js_free(web_doc *d) {
         node_cache_free(s);
         js_free(s->ctx,s->window_name);s->window_name=NULL;
         JS_FreeValue(s->ctx, s->hooks); JS_FreeValue(s->ctx, s->dispatch); JS_FreeValue(s->ctx, s->response); JS_FreeValue(s->ctx, s->reject);
+        JS_FreeValue(s->ctx, s->event_port); JS_FreeValue(s->ctx, s->event_states);
         for (int i = 0; i < NP_COUNT; i++) JS_FreeValue(s->ctx, s->node_protos[i]);
         web_atomics_release(s->ctx);
         web_opfs_release(s->ctx);
