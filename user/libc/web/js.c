@@ -3112,14 +3112,19 @@ static bool client_bounding_rect(JSContext *ctx,node_t *n,int sx,int sy,double r
     rect[2]=out.first_seen?r[2]-r[0]:0;rect[3]=out.first_seen?r[3]-r[1]:0;
     return true;
 }
+/* Before any native DOM work on d (the operations here and the DOM collections'
+   revision check): a sandboxed actor borrows no other document's authority. */
+static bool dom_authority_denied(struct web_js_state *s, web_doc *d) {
+    return !s->starting && ((sandbox_authority(s)&SB_SCRIPTS) ||
+       (sandbox_actor(s)->doc->sandbox_flags && sandbox_actor(s)->doc!=d));
+}
 static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int opcode) {
     struct web_js_state *s = state(ctx); web_doc *d = s->doc;
     if (argc < 2) return JS_ThrowTypeError(ctx, "DOM operation requires a receiver");
     node_t *n = unwrap(ctx, argv[1]);
     if (!n && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) { return JS_EXCEPTION; }
     if (n && n->owner) d = n->owner;
-    if(!s->starting && ((sandbox_authority(s)&SB_SCRIPTS) ||
-       (sandbox_actor(s)->doc->sandbox_flags && sandbox_actor(s)->doc!=d)))
+    if(dom_authority_denied(s,d))
         return history_security_error(ctx,"Sandbox denied borrowed document authority");
     doc_dom_budget(d);
     bool mutation = opcode == DOM_shadowAttach || opcode == DOM_slotAssign || opcode == DOM_insert || opcode == DOM_replace || opcode == DOM_replaceAll || opcode == DOM_remove || opcode == DOM_adopt || opcode == DOM_clone || opcode == DOM_import || opcode == DOM_set ||
@@ -3996,6 +4001,7 @@ static bool same_origin_urls(const char *a, const char *b, bool *allocation_fail
 }
 #include "js_html_safety_host.h"
 #include "js_pi_native.h"
+#include "js_collections_native.h"
 static bool permitted_url(struct web_js_state *s, const char *url, bool fetch) {
     if (!strncasecmp(url, "https://", 8) || !strncasecmp(url, "http://", 7)) {
         struct url_owned parsed = {0};
@@ -9140,6 +9146,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     web_js_wasm_host_init(s->ctx, api);
     web_js_webgl_init(s->ctx, api, webgl_source);
     web_js_collator_init(s->ctx, api);
+    if (collections_native_init(s->ctx, api) < 0) { JS_FreeValue(s->ctx, api); goto failed; }
     JS_SetPropertyStr(s->ctx, api, "debugCanvasProbe", JS_NewBool(s->ctx,s->host.debug_js));
     JS_SetPropertyStr(s->ctx, api, "document", wrap(s, d->root));
     JSValue global = JS_GetGlobalObject(s->ctx);
