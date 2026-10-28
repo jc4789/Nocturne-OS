@@ -1068,6 +1068,17 @@ struct web_doc {
     bool restyle_dirty; /* dirty, but only marked elements' own computed values (CSS animation samples) */
     bool initial_render_done;
     uint64_t initial_render_deadline; /* paint fallback only: never cancels resources */
+    /* HTML Page visibility (interaction.html 6.2). visible is this Document's visibility state
+       (false is "hidden", a Document's initial value). A hidden document has no rendering
+       opportunity: no animation frames, rendering observers, CSS animation samples or marquee
+       steps, and its timers and idle periods are padded (js.c). On a top-level document,
+       system_visible is its traversable's system visibility state as the host's window_state
+       last gave it (web_visibility_event). visibility_updates counts the queued "update the
+       visibility state" tasks; their states alternate, the newest being visibility_update_last. */
+    bool visible, system_visible, visibility_update_last;
+    unsigned visibility_updates;
+    unsigned (*window_state)(void *opaque); /* the host's (web_host.window_state), or NULL */
+    void *window_opaque;
     double render_head_order; /* root-sheet order after the scanned head */
     pvec css_cache;
     struct css_sheet_reuse *css_reuse; /* immutable live inline ASTs, no DOM ownership */
@@ -1310,14 +1321,22 @@ void web_js_parser_remove(web_doc *d, node_t *node);
 void web_js_console(web_doc *d, int level, const char *message);
 /* The engine's own measurement (WEB_CONSOLE_TRACE): kept out of the page's console. */
 void web_js_trace(web_doc *d, const char *message);
-/* Native trusted link activation only; not exposed as a script popup API. */
-bool web_js_auxiliary_link(web_doc *d,node_t *anchor,const char *url);
+/* A followed hyperlink whose navigable is another top-level traversable: target is "_blank" or
+   the name no frame of the page has. The host chooses (a named tab, or a new one only with
+   activated). Not exposed as a script popup API. */
+bool web_js_auxiliary_link(web_doc *d,node_t *anchor,const char *url,const char *target,bool activated);
 bool web_js_video_present(web_doc *d,const struct web_video_patch *patch);
 /* The display showed a frame of d: its rendering opportunity is now, the next about period_ms
    later (web_rendering_now). */
 void web_js_rendering_now(web_doc *d, double period_ms);
 /* d has animation frames or dirty rendering observers waiting for an opportunity. */
 bool web_js_rendering_wanted(web_doc *d);
+/* The rest of HTML "update the visibility state" once d->visible changed (doc.c): its
+   VisibilityStateEntry and the visibilitychange event, in one task of d's realm. */
+void web_js_visibility_changed(web_doc *d);
+/* d or a document in its frame tree plays sound now: an unmuted media element with its sound
+   stream open, or a running AudioContext. */
+bool web_js_tab_audible(web_doc *d);
 void web_js_focus_control(web_doc *d, node_t *control);
 void web_js_face_reset(web_doc *d, node_t *form);
 node_t *web_autofocus_candidate(web_doc *d);

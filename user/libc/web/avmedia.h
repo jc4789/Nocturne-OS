@@ -20,6 +20,9 @@ void web_avmedia_checkpoint(void);
 void web_avmedia_enter(void);
 void web_avmedia_leave(void);
 int64_t web_avmedia_deadline(web_doc *doc, uint64_t now);
+/* A media element of doc plays sound now: playing, unmuted, with a nonzero volume and its
+   sound stream open. */
+bool web_avmedia_audible(web_doc *doc);
 void web_avmedia_free(web_doc *doc);
 /* Native process-owned child reap: valid even when no document exists. */
 void web_avmedia_background(uint64_t now_ms);

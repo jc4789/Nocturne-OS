@@ -104,8 +104,11 @@ static void position(node_t *n,box_t *b,float content) {
     }
     n->marquee_x=vertical?0:offset;n->marquee_y=vertical?offset:0;
 }
+/* A hidden document has no rendering opportunity (HTML "update the rendering"), so its marquees
+   take no steps and set no deadline. Their clock keeps running: the first step once it is
+   visible again skips every interval that passed while hidden, as below. */
 void web_marquee_tick(web_doc *d,uint64_t now) {
-    if(!d || !d->live || d->inert || d->native_cancelled)return;
+    if(!d || !d->live || d->inert || d->native_cancelled || !d->visible)return;
     for(int i=0;i<d->marquees.n;i++) {
         if(!web_native_checkpoint(d))return;
         node_t *n=d->marquees.v[i];if(!active(d,n))continue;
@@ -153,7 +156,7 @@ void web_marquee_tick(web_doc *d,uint64_t now) {
     }
 }
 int64_t web_marquee_deadline(web_doc *d) {
-    if(!d || d->inert || d->native_cancelled)return -1;
+    if(!d || d->inert || d->native_cancelled || !d->visible)return -1;
     uint64_t best=UINT64_MAX;
     for(int i=0;i<d->marquees.n;i++) {
         node_t *n=d->marquees.v[i];if(!active(d,n))continue;

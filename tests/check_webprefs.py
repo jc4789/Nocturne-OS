@@ -27,7 +27,12 @@ names = re.findall(r'\b(webprefs_\w+)\s*\(', header)
 expected = ['webprefs_catalog', 'webprefs_watch', 'webprefs_events', 'webprefs_sync',
             'webprefs_languages_generation', 'webprefs_languages', 'webprefs_languages_default', 'webprefs_accept_language',
             'webprefs_languages_fit', 'webprefs_search_history', 'webprefs_set_languages',
-            'webprefs_reset_languages', 'webprefs_set_search_history']
+            'webprefs_reset_languages', 'webprefs_set_search_history',
+            # サイトのデータの例外と「閉じるときに消す」（その試験は check_webprefs_sites.py）
+            'webprefs_site_rule', 'webprefs_site_rule_url', 'webprefs_storage_allowed', 'webprefs_site_kept',
+            'webprefs_site_data_transient', 'webprefs_clear_on_close', 'webprefs_cookie_rule',
+            'webprefs_site_generation', 'webprefs_site_exceptions', 'webprefs_site_host',
+            'webprefs_set_clear_on_close', 'webprefs_set_site_rule']
 problems = []
 if sorted(set(names)) != sorted(expected):
     problems.append('webprefs.h の関数が試験の知る一覧と違う：' + ' '.join(sorted(set(names) ^ set(expected))))

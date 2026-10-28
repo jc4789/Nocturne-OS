@@ -1,6 +1,7 @@
 #include "webnet.h"
 #include "webnet_wire.h"
 #include "webprefs.h"
+#include "webstorage.h"
 #include "http.h"
 #include "nocturne.h"
 #include <stdlib.h>
@@ -71,6 +72,12 @@ struct slot { struct request *rq; n_handle channel; uint32_t watched; struct slo
 /* Tokens of webnet's watches in the caller's wait queue and its own probe. */
 #define WEBNET_TOKEN (UINT64_C(0x57) << 56)
 #define WEBNET_SEND_TOKEN (UINT64_C(0x58) << 56)
+/* The cookie store's watch (cookie_sync) in the caller's wait queue. */
+#define WEBNET_COOKIE_TOKEN (UINT64_C(0x63) << 56)
+/* The jar's changes are saved this long after the first of them (one save for a burst of
+   Set-Cookie fields), and tried again this long after a failed save. */
+#define COOKIE_SAVE_MS 1000u
+#define COOKIE_RETRY_MS 5000u
 /* A WebSocket's own service channel. It never occupies a fetch worker slot:
    its lifetime is the page's, not a request's. */
 struct wsock {
@@ -111,6 +118,14 @@ struct webnet {
     size_t queued_bytes;
     webcookie_jar *cookies;
     struct wsock *sockets;
+    /* The cookie store (cookie_sync): its document, its watch and the queue the watch is in
+       (-1: none tried there yet), whether another process saved it since it was read, when the
+       jar's changes are saved (0: none wait), and the generation of the user's rule the jar
+       last saw (webprefs_site_generation). */
+    char cookie_path[1024];
+    n_handle cookie_watch, cookie_queue;
+    bool cookie_stale;
+    uint64_t cookie_due, cookie_rules;
 };
 
 n_result webnet_wire_read(n_handle h, struct webnet_wire_in *in, void *dest, size_t n, int flags) {
@@ -167,6 +182,148 @@ static void load_cookie_psl(webcookie_jar *jar) {
     char *text = malloc(WEBCOOKIE_PSL_MAX + 1);
     if (text) { size_t n = fread(text, 1, WEBCOOKIE_PSL_MAX + 1, f); if (n <= WEBCOOKIE_PSL_MAX) webcookie_psl_load(jar, text, n); free(text); }
     fclose(f);
+}
+/* The cookie store: the persistent cookies every browser process (window) shares, in the
+   document "cookies" of the browser's profile folder, written whole (webcookie_save). A process
+   reads it when it starts and again whenever its watch says another process saved it; it saves
+   its own changes COOKIE_SAVE_MS after the first of them and when it ends (webnet_free), under
+   the document's claim and after reading what is there: a change another process saved meanwhile
+   stays, and so does a clear it made (webcookie_clear), of its session cookies too. Session
+   cookies and those of hosts whose data is not kept (webprefs_site_kept) are never saved, so each
+   process's are its own and end with it (RFC 6265bis §5.7, §7.3). Changes made in the last
+   COOKIE_SAVE_MS before a process is killed are lost. */
+static bool cookie_path_ready(webnet *n) {
+    if (n->cookie_path[0]) return true;
+    const char *folder = web_profile_folder(false);
+    if (folder && n_path_join(folder, "cookies", n->cookie_path, sizeof n->cookie_path) >= 0) return true;
+    n->cookie_path[0] = 0;
+    return false;
+}
+/* The store's bytes, malloc'd (NULL and 0 when it is empty): 0; 1 for a document larger than any
+   store (malformed); or the failure. */
+static n_result cookie_read(n_handle h, unsigned char **out, size_t *len) {
+    *out = NULL; *len = 0;
+    n_result size = n_document_size(h);
+    if (size <= 0) return size;
+    if ((uint64_t)size > WEBCOOKIE_STORE_MAX) return 1;
+    unsigned char *b = malloc((size_t)size);
+    if (!b) return -N_ERR_NO_MEMORY;
+    size_t at = 0;
+    while (at < (size_t)size) {
+        n_result got = n_document_read_at(h, at, b + at, (size_t)size - at);
+        if (got < 0) { free(b); return got; }
+        if (!got) break;
+        at += (size_t)got;
+    }
+    *out = b; *len = at;
+    return 0;
+}
+/* Merges the store into the jar and, with save and changes waiting, writes the jar's store back,
+   claiming the document from the read to the save. 0, or the failure: the jar keeps its changes
+   for the next try. A store this build cannot read is replaced by the jar's when saving. */
+static n_result cookie_sync(webnet *n, bool save) {
+    if (!cookie_path_ready(n)) return -N_ERR_NOT_FOUND;
+    int64_t now = time(NULL);
+    save = save && webcookie_changed(n->cookies);
+    n_handle h = n_document_open(n->cookie_path, save ? N_DOCUMENT_EDIT : N_DOCUMENT_READ);
+    if (h == -N_ERR_NOT_FOUND) {
+        if (!save) return webcookie_load(n->cookies, NULL, 0, now) < 0 ? -N_ERR_NO_MEMORY : 0;
+        h = n_document_open(n->cookie_path, N_DOCUMENT_CREATE);
+        if (h == -N_ERR_NOT_FOUND) { /* the profile folder was removed: only it is made again */
+            const char *folder = web_profile_folder(false);
+            n_result made = folder ? n_folder_create(folder) : -N_ERR_NOT_FOUND;
+            h = made >= 0 || made == -N_ERR_EXISTS ? n_document_open(n->cookie_path, N_DOCUMENT_CREATE) : made;
+        }
+        if (h == -N_ERR_EXISTS) h = n_document_open(n->cookie_path, N_DOCUMENT_EDIT); /* made meanwhile */
+    }
+    if (h < 0) return h;
+    n_result r = save ? n_document_claim(h, true) : 0;
+    if (r >= 0) {
+        /* What is read below is the latest: changes the watch reported until now are in it. */
+        if (n->cookie_watch >= 0) (void)n_watch_take(n->cookie_watch);
+        unsigned char *data = NULL, *out = NULL;
+        size_t len = 0;
+        r = cookie_read(h, &data, &len);
+        bool malformed = r == 1;
+        if (!r) {
+            int loaded = webcookie_load(n->cookies, data, len, now);
+            if (loaded < 0) r = -N_ERR_NO_MEMORY;
+            malformed = !loaded;
+        }
+        if (r > 0) r = 0;
+        if (!r && save) {
+            long size = webcookie_save(n->cookies, NULL, 0, now);
+            if (size < 0 || !(out = malloc(size ? (size_t)size : 1))) r = -N_ERR_NO_MEMORY;
+            else if (webcookie_save(n->cookies, out, (size_t)size, now) != size) r = -N_ERR_NO_MEMORY;
+            else if ((r = n_document_save(n->cookie_path, out, (size_t)size)) >= 0) {
+                r = 0;
+                webcookie_saved(n->cookies);
+                /* This process's own save: nothing to read again. Under the claim no other
+                   process saved since the read. */
+                if (n->cookie_watch >= 0) (void)n_watch_take(n->cookie_watch);
+            }
+        } else if (!r && malformed && n->debug) {
+            fprintf(stderr, "[webnet] cookie store unreadable; the next save replaces it\n");
+        }
+        free(data); free(out);
+        if (save) n_document_release(h);
+    }
+    n_handle_close(h);
+    return r;
+}
+/* The store's watch in queue: the first wait in a queue opens it, and reads the store once more
+   (a save between the read webnet_create made and the watch would tell nothing). Without watches
+   on C: (or without the profile folder, until a save makes it) other processes' saves are seen
+   only at this process's own next save. */
+static void cookie_watch_close(webnet *n) {
+    if (n->cookie_watch >= 0) {
+        if (n->cookie_queue >= 0) n_events_unwatch(n->cookie_queue, WEBNET_COOKIE_TOKEN);
+        n_handle_close(n->cookie_watch);
+    }
+    n->cookie_watch = -1;
+}
+static void cookie_watch_open(webnet *n, n_handle queue) {
+    if (n->cookie_queue == queue) return;
+    cookie_watch_close(n);
+    n->cookie_queue = queue;
+    n_handle w = cookie_path_ready(n) ? n_entry_watch(n->cookie_path, N_WATCH_NAME) : -N_ERR_NOT_FOUND;
+    if (w < 0) return;
+    if (n_events_watch(queue, w, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, WEBNET_COOKIE_TOKEN) < 0) { n_handle_close(w); return; }
+    n->cookie_watch = w;
+    n->cookie_stale = true;
+}
+/* The reports of a wait: the store's watch says another process saved; when the watch ended (the
+   folder was removed) it is opened again at the next wait. */
+static void cookie_reports(webnet *n, const struct n_event *events, int count) {
+    for (int i = 0; i < count; i++) {
+        if (events[i].token != WEBNET_COOKIE_TOKEN) continue;
+        n->cookie_stale = true;
+        if (events[i].events & N_EVENT_CLOSED) { cookie_watch_close(n); n->cookie_queue = -1; }
+    }
+}
+/* The jar's changes wait COOKIE_SAVE_MS for the next ones. */
+static void cookie_note(webnet *n, uint64_t now) {
+    if (!n->cookie_due && webcookie_changed(n->cookies)) n->cookie_due = now + COOKIE_SAVE_MS;
+}
+/* In the pump: the user's rule changed (what is kept is saved, what no longer is leaves the
+   store), another process saved, or the jar's changes are due. */
+static void cookie_pump(webnet *n, uint64_t now) {
+    uint64_t rules = webprefs_site_generation();
+    if (rules != n->cookie_rules) {
+        n->cookie_rules = rules;
+        webcookie_rule_changed(n->cookies);
+    }
+    if (n->cookie_stale) {
+        n->cookie_stale = false;
+        (void)cookie_sync(n, false); /* a failed read: the next save reads it again */
+    }
+    cookie_note(n, now);
+    if (n->cookie_due && now >= n->cookie_due) {
+        bool watched = n->cookie_watch >= 0;
+        n_result r = cookie_sync(n, true);
+        n->cookie_due = r < 0 && webcookie_changed(n->cookies) ? now + COOKIE_RETRY_MS : 0;
+        if (r >= 0 && !watched) n->cookie_queue = -1; /* the folder may be there now: watch again */
+    }
 }
 /* Closing the end also ends its watches. */
 static void slot_close(struct slot *s) {
@@ -234,9 +391,19 @@ webnet *webnet_create(void) {
     webnet *n = calloc(1, sizeof *n);
     if (n) {
         n->service = n->service_listener = n->probe = n->watch_queue = -1;
+        n->cookie_watch = n->cookie_queue = -1;
         n->cookies = webcookie_create();
         if (!n->cookies) { free(n); return NULL; }
         load_cookie_psl(n->cookies);
+        /* The window process's jar is kept (cookie_sync); the user's rule decides what is set,
+           sent and kept. What the store holds of hosts the rule no longer keeps (a process ended
+           before it saved that change) leaves it at the first save. */
+        webcookie_track(n->cookies);
+        webcookie_set_rule(n->cookies, webprefs_cookie_rule, NULL);
+        n->cookie_rules = webprefs_site_generation();
+        (void)cookie_sync(n, false);
+        webcookie_rule_changed(n->cookies);
+        cookie_note(n, uptime_ms());
         n->worker_limit=worker_budget();
         for (int i = 0; i < WORKERS; i++) n->slots[i].channel = -1;
     }
@@ -257,6 +424,10 @@ void webnet_free(webnet *n) {
     if(n->probe>=0)n_handle_close(n->probe);
     while (n->queue) { struct request *r = n->queue; n->queue = r->next; request_free(r); }
     while(n->sockets){struct wsock *s=n->sockets;n->sockets=s->next;wsock_free(s);}
+    /* What waits is saved now; the rule may have changed since the last pump. */
+    if (n->cookie_rules != webprefs_site_generation()) webcookie_rule_changed(n->cookies);
+    (void)cookie_sync(n, true);
+    cookie_watch_close(n);
     webcookie_free(n->cookies); free(n);
 }
 long webnet_cookie_get_site(webnet *n,const char *url,const char *top_level_url,char *out,size_t cap) {
@@ -265,7 +436,37 @@ long webnet_cookie_get_site(webnet *n,const char *url,const char *top_level_url,
 }
 int webnet_cookie_set_site(webnet *n,const char *url,const char *top_level_url,const char *value) {
     struct webcookie_context c = {url, top_level_url?top_level_url:url, "GET", false, false, false};
-    return n && value ? webcookie_set(n->cookies, &c, value, strlen(value), time(NULL)) : -1;
+    if (!n || !value) return -1;
+    int r = webcookie_set(n->cookies, &c, value, strlen(value), time(NULL));
+    cookie_note(n, uptime_ms());
+    return r;
+}
+long webnet_cookie_sites(webnet *n, struct webcookie_site **out) {
+    if (out) *out = NULL;
+    if (!n || !out) return -1;
+    if (n->cookie_stale) { n->cookie_stale = false; (void)cookie_sync(n, false); } /* what other windows saved */
+    return webcookie_sites(n->cookies, out, time(NULL));
+}
+long webnet_cookie_clear(webnet *n, const char *site) {
+    if (!n) return -N_ERR_INVALID;
+    size_t removed = webcookie_clear(n->cookies, site);
+    n_result r = cookie_sync(n, true); /* at once: other windows remove theirs when they read it */
+    n->cookie_due = r < 0 && webcookie_changed(n->cookies) ? uptime_ms() + COOKIE_RETRY_MS : 0;
+    return r < 0 ? r : (long)removed;
+}
+bool webnet_site(const webnet *n, const char *host, char *out, size_t cap) {
+    if (!n || !host || !out || !cap) return false;
+    char key[256];
+    size_t len = strlen(host);
+    if (len && host[len - 1] == '.') len--;
+    if (!len || len >= sizeof key) return false;
+    for (size_t i = 0; i < len; i++) key[i] = host[i] >= 'A' && host[i] <= 'Z' ? (char)(host[i] + 32) : host[i];
+    key[len] = 0;
+    const char *site = webcookie_site_of(n->cookies, key);
+    size_t sl = strlen(site);
+    if (sl >= cap) return false;
+    memcpy(out, site, sl + 1);
+    return true;
 }
 long webnet_cookie_get(webnet *n,const char *url,char *out,size_t cap){return webnet_cookie_get_site(n,url,NULL,out,cap);}
 int webnet_cookie_set(webnet *n,const char *url,const char *value){return webnet_cookie_set_site(n,url,NULL,value);}
@@ -1157,6 +1358,8 @@ static void pump(webnet *n,uint64_t now,bool callbacks){
        share of the concurrency the queue was waiting for. */
     for(unsigned i=0;i<WORKERS&&n->queue;i++)admit(n,&n->slots[i],i,now,NULL);
     sockets_pump(n,callbacks);
+    /* Set-Cookie of responses and handshakes: saved by the pump that delivers callbacks. */
+    if(callbacks)cookie_pump(n,now);else cookie_note(n,now);
     n->pumping=false;
 }
 void webnet_pump(webnet *n,uint64_t now){pump(n,now,true);}
@@ -1175,12 +1378,21 @@ static int active_due(const struct request *r, uint64_t now, int ms) {
     if (!r->paused && r->merge_len) ms = (int)MIN((uint64_t)ms, merge_hold(r, now));
     return ms;
 }
+/* When the cookie store needs the pump: another process saved, the user's rule changed, or the
+   jar's changes are due (a change the pump has not seen yet: COOKIE_SAVE_MS from now). -1: never. */
+static int cookie_due(const webnet *n, uint64_t now) {
+    if (n->cookie_stale || n->cookie_rules != webprefs_site_generation()) return 0;
+    if (!n->cookie_due) return webcookie_changed(n->cookies) ? (int)COOKIE_SAVE_MS : -1;
+    return now >= n->cookie_due ? 0 : (int)MIN(n->cookie_due - now, (uint64_t)INT_MAX);
+}
 int webnet_timeout(const webnet *n, uint64_t now) {
     if (!n) return -1;
     /* Socket records left in a taken message wait on the pump, not the channel. */
     for (const struct wsock *s = n->sockets; s; s = s->next) if (!s->ended && s->in.at < s->in.length) return 0;
-    if (!webnet_busy(n)) return -1;
-    int ms = INT_MAX;
+    int cookies = cookie_due(n, now);
+    if (!cookies) return 0;
+    if (!webnet_busy(n)) return cookies;
+    int ms = cookies < 0 ? INT_MAX : cookies;
     for (const struct request *r = n->queue; r; r = r->next) {
         if (now >= r->deadline) return 0;
         if (r->deadline - now < (uint64_t)ms) ms = (int)(r->deadline - now);
@@ -1230,8 +1442,12 @@ int webnet_wait(webnet *n,n_handle queue,int timeout_ms,struct n_event *events,s
         for(struct slot *s=n->parked;s;s=s->next)if(s->channel>=0)
             watched&=watch(queue,s->channel,&s->watched,slot_interest(s));
         if(!watched)timeout_ms=0; /* the pump looks again instead */
+        cookie_watch_open(n,queue);
+        if(n->cookie_stale)timeout_ms=0;
     }
-    return (int)n_events_wait(queue,events,max,timeout_ms);
+    int got=(int)n_events_wait(queue,events,max,timeout_ms);
+    if(n&&got>0)cookie_reports(n,events,got);
+    return got;
 }
 static void cancel(webnet *n, uint64_t key, bool generation) {
     if (!n) return;

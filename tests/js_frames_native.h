@@ -65,7 +65,7 @@ static void test_frame_ui(void){
         const char *probe="console.log(frames[0].document._clickX===12?'OK frame-local-click-coordinate':'FAIL frame-local-click-coordinate');";
         test_check("frame-native-coordinate-eval",web_console_eval(fixture.doc,probe,strlen(probe)));
         test_check("frame-local-click-coordinate",has_mark(&fixture,"frame-local-click-coordinate"));
-        test_check("frame-named-native-navigation",web_frame_navigate(fixture.doc,anchor,hit.href));
+        test_check("frame-named-native-navigation",web_frame_navigate(fixture.doc,anchor,hit.href,true));
         end=uptime_ms()+5000;
         while(uptime_ms()<end && !has_mark(&fixture,"frame-green-next")){frame_test_deliver();step(&fixture);n_sleep_ms(1);}
         test_check("frame-named-navigation-loaded",has_mark(&fixture,"frame-green-next"));

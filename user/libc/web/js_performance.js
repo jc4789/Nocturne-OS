@@ -24,8 +24,8 @@ const performanceBridge = (() => {
     const active=new Set(),setAdd=Set.prototype.add,setDelete=Set.prototype.delete;
     const eachSet=Set.prototype.forEach;
     const activeList=()=>{const a=[];call(eachSet,active,[x=>append(a,x)]);return a;};
-    const token={},supported=Object.freeze(isWindow?['mark','measure','resource']:['mark','measure']);
-    const observable=type=>type==='mark'||type==='measure'||isWindow&&type==='resource';
+    const token={},supported=Object.freeze(isWindow?['mark','measure','resource','visibility-state']:['mark','measure']);
+    const observable=type=>type==='mark'||type==='measure'||isWindow&&(type==='resource'||type==='visibility-state');
     const timingNames=('navigationStart unloadEventStart unloadEventEnd redirectStart redirectEnd '+
         'fetchStart domainLookupStart domainLookupEnd connectStart connectEnd secureConnectionStart '+
         'requestStart responseStart responseEnd domLoading domInteractive domContentLoadedEventStart '+
@@ -125,6 +125,23 @@ const performanceBridge = (() => {
         define(PerformanceResourceTiming.prototype,name,{configurable:true,get(){
             const s=slot(entries,this);if(s.entryType!=='resource')throw new TypeErr('Illegal invocation');return s[name];
         }});
+    }
+    // HTML 6.2 VisibilityStateEntry (Window only): one per "update the visibility state" of the
+    // document, and one for its initial state at time 0. Its registry entry keeps at most 50 in
+    // the performance timeline (maxBufferSize); observers still receive the rest.
+    class VisibilityStateEntry extends PerformanceEntry {
+        constructor(key){super(key);if(key!==token)throw new TypeErr('Illegal constructor');}
+        get name(){const s=slot(entries,this);if(s.entryType!=='visibility-state')throw new TypeErr('Illegal invocation');return s.name;}
+        get entryType(){const s=slot(entries,this);if(s.entryType!=='visibility-state')throw new TypeErr('Illegal invocation');return s.entryType;}
+        get startTime(){const s=slot(entries,this);if(s.entryType!=='visibility-state')throw new TypeErr('Illegal invocation');return s.startTime;}
+        get duration(){const s=slot(entries,this);if(s.entryType!=='visibility-state')throw new TypeErr('Illegal invocation');return 0;}
+    }
+    const visibilityLimit=50;let visibilityCount=0;
+    function visibility(state,startTime){
+        const entry=create(VisibilityStateEntry.prototype);
+        put(entries,entry,{name:string(state),entryType:'visibility-state',startTime,duration:0,sequence:0});
+        const fits=visibilityCount<visibilityLimit;if(fits)visibilityCount++;
+        record(entry,fits);
     }
     // fetch() and XMLHttpRequest share the native fetch transport.
     const initiators=new Map(),mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapDelete=Map.prototype.delete;
@@ -299,13 +316,13 @@ const performanceBridge = (() => {
             try{call(s.callback,observer,[list,observer,options]);}catch(e){report(e);}
         }
     }
-    for(const ctor of [Performance,PerformanceTiming,PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceResourceTiming,PerformanceObserver,PerformanceObserverEntryList]){
+    for(const ctor of [Performance,PerformanceTiming,PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceResourceTiming,VisibilityStateEntry,PerformanceObserver,PerformanceObserverEntryList]){
         define(ctor.prototype,Symbol.toStringTag,{value:ctor.name,configurable:true});
         for(const key of Object.getOwnPropertyNames(ctor.prototype))if(key!=='constructor'){
             const d=Object.getOwnPropertyDescriptor(ctor.prototype,key);d.enumerable=true;define(ctor.prototype,key,d);
         }
     }
-    for(const ctor of [Performance,PerformanceEntry,PerformanceMeasure,PerformanceResourceTiming])define(ctor,'length',{value:0,configurable:true});
+    for(const ctor of [Performance,PerformanceEntry,PerformanceMeasure,PerformanceResourceTiming,VisibilityStateEntry])define(ctor,'length',{value:0,configurable:true});
     for(const key of ['clearMarks','clearMeasures'])define(Performance.prototype[key],'length',{value:0,configurable:true});
     define(Performance.prototype.getEntriesByName,'length',{value:1,configurable:true});
     define(PerformanceObserverEntryList.prototype.getEntriesByName,'length',{value:1,configurable:true});
@@ -315,9 +332,11 @@ const performanceBridge = (() => {
     if(isWindow)globalThis.PerformanceTiming=PerformanceTiming;else delete Performance.prototype.timing;
     performanceObject=new Performance(token);
     Object.assign(globalThis,{Performance,PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceResourceTiming,PerformanceObserver,PerformanceObserverEntryList,performance:performanceObject});
+    // HTML "set the initial visibility state" queues the first entry with timestamp 0.
+    if(isWindow&&typeof host.visible==='function'){globalThis.VisibilityStateEntry=VisibilityStateEntry;visibility(host.visible()?'visible':'hidden',0);}
     // An aborted request never completes; its registration is dropped with the
     // oldest rather than kept for the document's lifetime.
-    return {resource,initiator(id,type){
+    return {resource,visibility,initiator(id,type){
         if(initiators.size>=4096)for(const key of initiators.keys()){call(mapDelete,initiators,[key]);break;}
         call(mapSet,initiators,[id,type]);
     }};

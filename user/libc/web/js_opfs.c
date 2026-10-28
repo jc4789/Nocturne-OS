@@ -4,6 +4,7 @@
 #include "http.h"
 #include "nocturne.h"
 #include <webstorage.h>
+#include <webprefs.h>
 #include <bearssl_hash.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -47,15 +48,39 @@ static bool ensure_directory(const char *path) {
     return n_folder_create(path) >= 0 || (n_entry_info(path, &e) >= 0 && e.kind == N_KIND_FOLDER);
 }
 
+/* opfs in the browser's profile folder (not made); false when it cannot be found. */
+static bool opfs_folder(char *out, size_t size) {
+    const char *profile = web_profile_folder(false);
+    return profile && n_path_join(profile, "opfs", out, size) >= 0;
+}
+
+/* Beside each origin's directory <digest>, the document <digest>.origin holds the origin, for the
+ * Settings window's site data (web_opfs_usage). Written when missing, checked once a process for
+ * the last directory it confirmed. */
+static void origin_note(const char *folder, const char *name, const char *origin) {
+    static char confirmed[65];
+    if (!strcmp(confirmed, name)) return;
+    char path[OPFS_PATH], leaf[80];
+    snprintf(leaf, sizeof leaf, "%s.origin", name);
+    if (n_path_join(folder, leaf, path, sizeof path) < 0) return;
+    struct n_entry e;
+    n_result found = n_entry_info(path, &e);
+    if (found == -N_ERR_NOT_FOUND) found = n_document_save(path, origin, strlen(origin));
+    if (found >= 0) snprintf(confirmed, sizeof confirmed, "%s", name);
+}
+
 /* The origin's directory. Storage keys are tuple origins of HTTP(S) URLs;
  * an opaque origin (data:, sandboxed, about:blank without a creator) has
- * none. A length prefix keeps the digest input unambiguous. */
+ * none, and neither has one whose host the user blocked (webprefs: the
+ * Storage Standard's "the user has disabled storage"). A length prefix
+ * keeps the digest input unambiguous. */
 static int opfs_root(JSContext *ctx, char *out, size_t size) {
     const char *url = context_url ? context_url(ctx) : NULL;
     char *origin = NULL;
     enum http_url_result r = url ? http_origin_owned(url, &origin) : HTTP_URL_INVALID;
     if (r == HTTP_URL_OOM) return OPFS_MEMORY;
-    if (r != HTTP_URL_TUPLE || (strncmp(origin, "http://", 7) && strncmp(origin, "https://", 8))) {
+    if (r != HTTP_URL_TUPLE || (strncmp(origin, "http://", 7) && strncmp(origin, "https://", 8)) ||
+        !webprefs_storage_allowed(origin)) {
         free(origin);
         return OPFS_SECURITY;
     }
@@ -67,14 +92,16 @@ static int opfs_root(JSContext *ctx, char *out, size_t size) {
     br_sha256_update(&h, length, sizeof length);
     br_sha256_update(&h, origin, n);
     br_sha256_out(&h, digest);
-    free(origin);
     char name[65], folder[OPFS_PATH];
     for (int i = 0; i < 32; i++) snprintf(name + i * 2, 3, "%02x", digest[i]);
     /* opfs in the browser's profile folder, made when absent */
-    const char *profile = web_profile_folder(false);
-    if (!profile || n_path_join(profile, "opfs", folder, sizeof folder) < 0 ||
-        n_path_join(folder, name, out, size) < 0 || !ensure_directory(folder) || !ensure_directory(out))
+    if (!opfs_folder(folder, sizeof folder) || n_path_join(folder, name, out, size) < 0 ||
+        !ensure_directory(folder) || !ensure_directory(out)) {
+        free(origin);
         return OPFS_IO;
+    }
+    origin_note(folder, name, origin);
+    free(origin);
     return 0;
 }
 
@@ -569,6 +596,102 @@ static JSValue opfs_usage(JSContext *ctx, JSValueConst self, int argc, JSValueCo
     char path[OPFS_PATH];
     int r = opfs_root(ctx, path, sizeof path);
     return opfs_result(ctx, r ? r : tree_usage(path, sizeof path));
+}
+
+/* The Settings window's site data: the origin directories in the profile's opfs folder. */
+static bool digest_name(const char *name) {
+    if (strlen(name) != 64) return false;
+    for (int i = 0; i < 64; i++) if (hex_digit(name[i]) < 0 || (name[i] >= 'A' && name[i] <= 'F')) return false;
+    return true;
+}
+
+/* The origin <digest>.origin names, malloc'd ("" for a directory made before it was kept). */
+static char *directory_origin(const char *folder, const char *name) {
+    char path[OPFS_PATH], leaf[80];
+    snprintf(leaf, sizeof leaf, "%s.origin", name);
+    char *origin = NULL;
+    if (n_path_join(folder, leaf, path, sizeof path) >= 0) {
+        n_handle h = n_document_open(path, N_DOCUMENT_READ);
+        n_result size = h >= 0 ? n_document_size(h) : -N_ERR_NOT_FOUND;
+        if (size > 0 && size < OPFS_PATH && (origin = malloc((size_t)size + 1))) {
+            size_t done = 0;
+            if (full_io(h, 0, origin, (size_t)size, false, &done) || done != (size_t)size || memchr(origin, 0, done)) done = 0;
+            origin[done] = 0;
+        }
+        if (h >= 0) n_handle_close(h);
+    }
+    return origin ? origin : calloc(1, 1);
+}
+
+/* Whether every document under path is free of sync access handles (file_free); 0 or the result. */
+static int tree_free(char *path, size_t size) {
+    int kind = kind_of(path);
+    if (kind <= 0) return kind;
+    if (kind == 1) return file_free(path);
+    char *names;
+    size_t bytes;
+    int r = list_raw(path, &names, &bytes);
+    size_t base = strlen(path);
+    for (size_t at = 0; !r && at < bytes; at += strlen(names + at) + 1) {
+        size_t n = strlen(names + at);
+        if (base + 1 + n >= size) { r = OPFS_IO; break; }
+        path[base] = '\\';
+        memcpy(path + base + 1, names + at, n + 1);
+        r = tree_free(path, size);
+        path[base] = 0;
+    }
+    free(names);
+    return r;
+}
+
+static n_result opfs_n_result(int r) {
+    return !r ? 0 : r == OPFS_LOCKED ? -N_ERR_BUSY : r == OPFS_MEMORY ? -N_ERR_NO_MEMORY : -N_ERR_IO;
+}
+
+/* Each origin directory: with remove, those match accepts are removed whole, or left whole while
+ * a document in them has a sync access handle (busy). */
+static n_result opfs_sites(void (*each)(void *, const char *, uint64_t), bool (*match)(void *, const char *),
+                           void *opaque, bool remove) {
+    char folder[OPFS_PATH];
+    if (!opfs_folder(folder, sizeof folder)) return -N_ERR_NOT_FOUND;
+    struct n_entry *entries = NULL;
+    n_result count = n_folder_entries(folder, &entries);
+    if (count < 0) return count == -N_ERR_NOT_FOUND ? 0 : count;
+    n_result result = 0;
+    bool busy = false;
+    for (n_result i = 0; i < count && !result; i++) {
+        const struct n_entry *e = &entries[i];
+        if (e->kind != N_KIND_FOLDER || !digest_name(e->name)) continue;
+        char *origin = directory_origin(folder, e->name), path[OPFS_PATH];
+        if (!origin) { result = -N_ERR_NO_MEMORY; break; }
+        if (n_path_join(folder, e->name, path, sizeof path) < 0) { free(origin); continue; }
+        if (!remove) {
+            int64_t bytes = tree_usage(path, sizeof path);
+            if (bytes < 0) result = opfs_n_result((int)bytes);
+            else each(opaque, origin, (uint64_t)bytes);
+        } else if (!match || match(opaque, origin)) {
+            int r = tree_free(path, sizeof path);
+            if (!r) r = remove_tree(path, sizeof path, true);
+            if (r == OPFS_LOCKED) busy = true;
+            else if (r) result = opfs_n_result(r);
+            else {
+                char leaf[80], note[OPFS_PATH];
+                snprintf(leaf, sizeof leaf, "%s.origin", e->name);
+                if (n_path_join(folder, leaf, note, sizeof note) >= 0) (void)n_entry_remove(note);
+            }
+        }
+        free(origin);
+    }
+    free(entries);
+    return result ? result : busy ? -N_ERR_BUSY : 0;
+}
+
+n_result web_opfs_usage(void (*each)(void *opaque, const char *origin, uint64_t bytes), void *opaque) {
+    return each ? opfs_sites(each, NULL, opaque, false) : 0;
+}
+
+n_result web_opfs_clear(bool (*match)(void *opaque, const char *origin), void *opaque) {
+    return opfs_sites(NULL, match, opaque, true);
 }
 
 void web_opfs_host_init(JSContext *ctx, JSValueConst host, const char *(*url)(JSContext *ctx)) {

@@ -1505,6 +1505,11 @@ void web_avmedia_snapshot_finish(void) {
 }
 void web_avmedia_background(uint64_t now){nmedia_worker_background(now);nmedia_mse_worker_background(now);}
 int64_t web_avmedia_background_deadline(uint64_t now){int64_t a=nmedia_worker_deadline(now),b=nmedia_mse_worker_deadline(now);return a<0?b:b<0?a:MIN(a,b);}
+bool web_avmedia_audible(web_doc *d){
+    for(struct web_avmedia *s=streams;s;s=s->next)
+        if(s->doc==d&&s->playing&&s->sink>=0&&!s->muted&&s->volume>0)return true;
+    return false;
+}
 int64_t web_avmedia_deadline(web_doc *d,uint64_t now){
     int64_t next=-1;
     for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d&&(s->playing||s->range_waiting)){

@@ -869,6 +869,12 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
     d->input_identity=__atomic_add_fetch(&input_serial,1,__ATOMIC_RELAXED);
     d->initial_render_deadline=uptime_ms()+3000;
     d->frame_parent=parent;d->frame_element=frame;
+    /* HTML "activate history entry" (and "initialize the navigable" for a new navigable's
+       first document) sets the initial visibility state to the traversable's system visibility
+       state: the host's for a top-level document, the one its top document holds for a frame. */
+    if(host && host->window_state){d->window_state=host->window_state;d->window_opaque=host->opaque;}
+    if(parent){web_doc *top=parent;while(top->frame_parent)top=top->frame_parent;d->visible=top->system_visible;}
+    else d->visible=d->system_visible=!d->window_state || (d->window_state(d->window_opaque)&WEB_WINDOW_VISIBLE);
     /* A frame whose own policy disables scripting but keeps its origin
        (sandbox="allow-same-origin" without allow-scripts) still has a Window
        realm the same-origin embedder may use; its own scripts, handlers and
@@ -1148,9 +1154,9 @@ int64_t web_media_background_deadline(uint64_t now) {
 }
 /* --debug-js: which step of the turns since the last web_tick_report() left the document to lay
    out again (main thread only). A step is named when the flag was clear before it and set after. */
-enum { TICK_RENDER, TICK_RESCAN, TICK_MEDIA, TICK_MOTION, TICK_MARQUEE, TICK_SCRIPT, TICK_FRAMES, TICK_STEPS };
+enum { TICK_RENDER, TICK_RESCAN, TICK_VISIBILITY, TICK_MEDIA, TICK_MOTION, TICK_MARQUEE, TICK_SCRIPT, TICK_FRAMES, TICK_STEPS };
 /* Which source set each web_deadline(): what wakes an otherwise idle window. */
-enum { DUE_NONE, DUE_BACKGROUND, DUE_RENDER, DUE_SCRIPT, DUE_MEDIA, DUE_MOTION, DUE_MARQUEE, DUE_FRAMES, DUE_SOURCES };
+enum { DUE_NONE, DUE_BACKGROUND, DUE_RENDER, DUE_VISIBILITY, DUE_SCRIPT, DUE_MEDIA, DUE_MOTION, DUE_MARQUEE, DUE_FRAMES, DUE_SOURCES };
 static struct { uint64_t turns, dirty[TICK_STEPS], style[TICK_STEPS], due[DUE_SOURCES]; } tick_profile;
 static void tick_step(const web_doc *d, int step, bool dirty, bool style) {
     if (!d->profile_enabled) return;
@@ -1159,13 +1165,13 @@ static void tick_step(const web_doc *d, int step, bool dirty, bool style) {
 }
 int web_tick_report(char *out, size_t size) {
     if (!tick_profile.turns) return 0;
-    static const char *const names[TICK_STEPS] = {"first render", "rescan", "media", "CSS motion", "marquee", "script", "frames"};
+    static const char *const names[TICK_STEPS] = {"first render", "rescan", "visibility", "media", "CSS motion", "marquee", "script", "frames"};
     int n = snprintf(out, size, "Document tick profile: turns %lu; dirtied (layout and paint)/restyle by",
                      (unsigned long)tick_profile.turns);
     for (int i = 0; i < TICK_STEPS && n >= 0 && (size_t)n < size; i++)
         n += snprintf(out + n, size - (size_t)n, "%s %s %lu/%lu", i ? "," : "", names[i],
                       (unsigned long)tick_profile.dirty[i], (unsigned long)tick_profile.style[i]);
-    static const char *const due_names[DUE_SOURCES] = {"none", "background", "first render", "script", "media", "CSS motion", "marquee", "frames"};
+    static const char *const due_names[DUE_SOURCES] = {"none", "background", "first render", "visibility", "script", "media", "CSS motion", "marquee", "frames"};
     for (int i = 0; i < DUE_SOURCES && n >= 0 && (size_t)n < size; i++)
         n += snprintf(out + n, size - (size_t)n, "%s %s %lu", i ? "," : "; deadlines from", due_names[i],
                       (unsigned long)tick_profile.due[i]);
@@ -1219,6 +1225,37 @@ int web_memory_report(web_doc *d, char *out, size_t size) {
     }
     return n;
 }
+/* HTML 6.2: queue one "update the visibility state" task on d, to newState. The queue holds
+   only alternating states (the system state changes before each), so a count and the newest
+   state are all of it; at the count's limit the oldest is dropped, which keeps them alternating. */
+static void visibility_queue(web_doc *d, bool visible) {
+    if (d->visibility_updates < UINT_MAX) d->visibility_updates++;
+    d->visibility_update_last = visible;
+}
+void web_visibility_event(web_doc *d) {
+    while (d && d->frame_parent) d = d->frame_parent;
+    if (!d || !d->live) return;
+    bool visible = !d->window_state || (d->window_state(d->window_opaque) & WEB_WINDOW_VISIBLE);
+    if (visible == d->system_visible) return;
+    /* The system visibility state of the traversable changed: a task for each inclusive
+       descendant navigable's active document, on the user interaction task source. */
+    d->system_visible = visible;
+    visibility_queue(d, visible);
+    for (struct web_frame *f = d->frames; f; f = web_frame_walk_next(d, f, true))
+        if (f->document && !f->detached && f->document->live) visibility_queue(f->document, visible);
+}
+/* One queued task, oldest first: "update the visibility state of document to newState". The
+   rest of the steps (the VisibilityStateEntry, visibilitychange) belong to the realm. A hidden
+   document's work stops by itself: each clock (CSS motion, marquee, rendering, timers, idle
+   periods) reads d->visible when it next asks to run. */
+static void visibility_step(web_doc *d) {
+    if (!d->visibility_updates || web_js_running(d)) return;
+    bool visible = d->visibility_update_last ^ ((d->visibility_updates - 1) & 1u);
+    d->visibility_updates--;
+    if (visible == d->visible) return;
+    d->visible = visible;
+    web_js_visibility_changed(d);
+}
 #define TICK_STEP(d, step, call) do { bool dirty_ = (d)->dirty, style_ = (d)->need_style; call; tick_step(d, step, dirty_, style_); } while (0)
 void web_tick(web_doc *d, uint64_t now) {
     web_media_background(now);
@@ -1239,6 +1276,8 @@ void web_tick(web_doc *d, uint64_t now) {
         if(d->native_recovery_pending || d->native_cancelled || !d->layout_valid)return;
     }
     TICK_STEP(d, TICK_RESCAN, doc_rescan(d));
+    if(d->native_cancelled)return;
+    TICK_STEP(d, TICK_VISIBILITY, visibility_step(d));
     if(d->native_cancelled)return;
     TICK_STEP(d, TICK_MEDIA, web_avmedia_tick(d, now));
     if(d->native_cancelled)return;
@@ -1282,6 +1321,7 @@ int64_t web_deadline(web_doc *d) {
     if (!d || !d->live) return background;
     const int64_t sources[DUE_SOURCES] = {-1, background,
         !d->initial_render_done && now < d->initial_render_deadline ? (int64_t)d->initial_render_deadline : -1,
+        d->visibility_updates ? (int64_t)now : -1,
         web_js_deadline(d), web_avmedia_deadline(d, now), css_motion_deadline(d), web_marquee_deadline(d),
         web_frames_deadline(d)};
     int64_t deadline = -1; int from = DUE_NONE;

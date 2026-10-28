@@ -49,6 +49,9 @@
     const globalHandlerTypes = new Set(('abort beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout formdata input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
     const windowHandlerTypes = new Set(('afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pageswap pagehide pagereveal pageshow popstate rejectionhandled storage unhandledrejection unload').split(' '));
     const bodyWindowTypes=new Set([...windowHandlerTypes,'blur','error','focus','load','resize','scroll']);
+    // HTML: event handler IDL attributes of Document objects only, with no content attribute
+    // on any element (onreadystatechange belongs here too once readystatechange fires).
+    const documentHandlerTypes=new Set(['visibilitychange']);
     const bodyWindowBrands=new WeakMap();
     const parsedBodyHandlers=new WeakSet();
     const state = new WeakMap();
@@ -182,6 +185,8 @@
             const handlers=new Map();
             for(const type of globalHandlerTypes)if(handlerTarget(target,type))
                 handlers.set(type,{value:null,text:null,compiled:true,entry:null});
+            for(const type of documentHandlerTypes)if(handlerTarget(target,type))
+                handlers.set(type,{value:null,text:null,compiled:true,entry:null});
             if(target===globalThis)for(const type of windowHandlerTypes)
                 handlers.set(type,{value:null,text:null,compiled:true,entry:null});
             handlerMap.set(target,handlers);inlineMap.delete(target);
@@ -229,7 +234,7 @@
     }
     function handlerTarget(target,type) {
         return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document || svgHandlerTarget(target))) ||
-            (windowHandlerTypes.has(type) && target===globalThis) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type) || socketHandlerTarget(target,type) || audioHandlerTarget(target,type);
+            (windowHandlerTypes.has(type) && target===globalThis) || (documentHandlerTypes.has(type) && target instanceof Document) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type) || socketHandlerTarget(target,type) || audioHandlerTarget(target,type);
     }
     function bodyWindowHandler(target,type){
         if(!bodyWindowTypes.has(type) || target===globalThis)return false;
@@ -1030,6 +1035,7 @@
     }
     installHandlers(HTMLElement.prototype,globalHandlerTypes);
     installHandlers(Document.prototype,globalHandlerTypes);
+    installHandlers(Document.prototype,documentHandlerTypes);
     installHandlers(globalThis,globalHandlerTypes);
     installHandlers(globalThis,windowHandlerTypes);
     Object.defineProperties(globalThis,{innerWidth:{get(){return dom('viewport',null,0);}},innerHeight:{get(){return dom('viewport',null,1);}}});
@@ -1318,6 +1324,11 @@
         storageOrigin:storageBridge.origin,
         storageEvent:storageBridge.deliver,
         languageChange(){if(!languagesChanged())return;const event=new Event('languagechange');eventState(event).isTrusted=true;dispatch(globalThis,event);},
+        // HTML "update the visibility state" steps 3 and 7 (js.c web_js_visibility_changed).
+        visibilityChange(visibility,time){
+            performanceBridge.visibility(visibility,time);
+            const event=new Event('visibilitychange',{bubbles:true});eventState(event).isTrusted=true;dispatch(document,event);
+        },
         indexedDBTaskEnd:indexedDBBridge.taskEnd,
         promiseRejection:rejectionBridge.unhandled,
         promiseRejectionHandled:rejectionBridge.handled,

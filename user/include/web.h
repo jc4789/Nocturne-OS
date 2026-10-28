@@ -185,7 +185,11 @@ struct web_host {
     void (*console)(void *opaque, int level, const char *message);
     void (*scroll)(void *opaque, int *x, int *y);
     void (*scroll_to)(void *opaque, int x, int y);
-    unsigned (*window_state)(void *opaque); /* actual host visibility/page focus; optional */
+    /* WEB_WINDOW_VISIBLE: the system visibility state of the top-level traversable this host
+       shows (HTML 6.2): whether its page is on screen at all, so false for a minimized or
+       hidden window and for a tab that is not the front one. WEB_WINDOW_FOCUSED: system focus.
+       Optional; without it the documents count as visible and without focus. */
+    unsigned (*window_state)(void *opaque);
     /* Browser window size including its own toolbar; optional. */
     void (*window_size)(void *opaque, int *width, int *height);
     /* Native-only getter: a queued navigation/close cancels stale default edits. */
@@ -201,8 +205,9 @@ struct web_host {
     /* The host owns the cookie jar; returned text is malloc'd, never HttpOnly. */
     char *(*cookie_get)(void *opaque, const char *url);
     void (*cookie_set)(void *opaque, const char *url, const char *value);
-    /* Actual runtime cookie-jar capability; NULL means unavailable/unknown. */
-    bool (*cookie_enabled)(void *opaque);
+    /* Whether the document at url (its effective URL, a frame's own) may use cookies: there is a
+       jar and the user did not block the site. NULL means unavailable/unknown. */
+    bool (*cookie_enabled)(void *opaque, const char *url);
     /* origin is derived from the native document URL by the private URL parser,
        never a page-selected directory. Output text transfers malloc ownership. */
     int (*storage)(void *opaque, const char *origin, const struct web_storage_request *request,
@@ -260,6 +265,12 @@ void web_socket_event(web_doc *d, uint64_t id, const struct web_socket_event *ev
 bool web_set_url(web_doc *d, const char *url);
 /* Call between JS tasks, after the host history position and document URL change. */
 void web_history_event(web_doc *d, const char *old_url, bool popstate);
+/* The host's window_state for d's top-level document may have changed its WEB_WINDOW_VISIBLE
+   bit: the tab became the front one or stopped being it, or the window was shown, minimized or
+   hidden. If the system visibility state did change, d's top document and each document in its
+   frame tree get a queued task (run by web_tick) that sets its visibilityState and fires
+   visibilitychange; web_deadline is then due at once. A call that finds no change does nothing,
+   so the host may call it for every tab whose state might have moved. It runs no script. */
 void web_visibility_event(web_doc *d);
 /* Optional, once at startup: compiles the platform's script bindings on another
    CPU while the host opens its window and fetches the first page, so that the
@@ -370,9 +381,13 @@ bool web_node_action(web_doc *d, web_node *target, struct web_hit *hit);
    Detached HTML anchors can navigate; their owner must still be the active d. */
 web_node *web_link_activation_anchor(web_doc *d, web_node *target);
 bool web_link_action(web_doc *d, web_node *anchor, struct web_hit *hit);
-/* Trusted native link activation: true when a child-frame destination consumed
-   the navigation. Script location changes use their own, stricter child path. */
-bool web_frame_navigate(web_doc *top, web_node *anchor, const char *url);
+/* HTML "follow the hyperlink" for anchor in top's tree, from a user's click or the page's
+   click(): its target (or the base element's) chooses the navigable. True when that was not top:
+   a child frame, another top-level traversable (_blank, or a name no frame here has: the host's
+   navigate with that target) or nothing; false leaves top's own navigation to the caller.
+   activated: the source has the user's activation (a click the user made is one).
+   Script location changes use their own, stricter child path. */
+bool web_frame_navigate(web_doc *top, web_node *anchor, const char *url, bool activated);
 /* Actual active child URL for native chrome only. The parent URL is unchanged.
    Selection validates the complete live embedding chain; no author callbacks. */
 const char *web_frame_address(web_doc *top);

@@ -16,10 +16,10 @@
 | `kernel/src/vm/` | VM だけの処理のすべて（下の「境界」） | K |
 | `kernel/src/{boot,init}.c` | `kmain`（boot.c）→ `kmain_late`（init.c）→ `C:\Nocturne\System\init` | K |
 | `common/` | 核と libc の共有：`abi.h`、`display_abi.h`、`gpu_abi.h`、`store_format.h`、`edid.h`、`gfx.c`、Unifont | K+L |
-| `user/libc/` | ISO C と ABI の包み（`sys.c`）、`gui.c`・`ui.c`、字体・画像、`media*.c`、`net.c`・`http*.c`・`tls.c`・`webnet.c`、`webstorage.c`・`webidb*.c`・`webcookie.c`、`webprefs.c`（ブラウザーの好み `AppData\Browser\preferences`：言語の一覧と検索の履歴。各プロセスが見張る）、`parallel.c` | L |
+| `user/libc/` | ISO C と ABI の包み（`sys.c`）、`gui.c`・`ui.c`、字体・画像、`media*.c`、`net.c`・`http*.c`・`tls.c`・`webnet.c`、`webstorage.c`・`webidb*.c`・`webcookie.c`、`webprefs.c`（ブラウザーの好み `AppData\Browser\preferences`：言語の一覧、検索の履歴、サイトのデータの例外と「閉じるときに消す」。各プロセスが見張る）、`websitedata.c`（設定の窓のサイトのデータ：保存先ごとの量と消去をサイトでまとめ、閉じるときに消す。窓の数は一時フォルダーの `windows`）、`parallel.c` | L |
 | `user/libc/web/` | ブラウザーのエンジン（約 200 ファイル。下の「ブラウザーの流れ」） | L |
 | `user/include/` | 公開の見出し（`nocturne.h`、`web.h`、`webnet.h`、`ui.h` …）。SDK にも入る | L |
-| `user/apps/` | システムのプログラム（`browser*.c`（設定の窓 `browsersettings.c` を含む）・`webfetch.c`・`uihost.c`・`init.c`・`sh.c`・`agent.c`、`*.cpp`、`*.ts`→`System\*.js`） | A |
+| `user/apps/` | システムのプログラム（`browser*.c`（タブは `browser.c` の `struct tab`、設定の頁 `about:settings` は `browser_settings.h`）・`webfetch.c`・`uihost.c`・`init.c`・`sh.c`・`agent.c`、`*.cpp`、`*.ts`→`System\*.js`） | A |
 | `ports/<名>/` | 移植の差分・設定：ffmpeg、freetype、go、lexbor、llvm、mesa（`nocturne_gl.c`）、nvidia（RM をアプリ `nvrm` にする OS 層）、rust、tcc、typescript、virgl（ホストの QEMU の DLL だけ）、wabt | P |
 | `third_party/<名>/` | 取り込んだ上流：quickjs、lexbor、bearssl・ca、ffmpeg、freetype・brotli・img、mesa、nvidia-open（615.78.08）、tinycc、wabt、uacpi、unicode・formatjs、unifont、web_streams | P |
 | `host/` | `store/store.c`（C: を作る・詰める・検査する）、`limine/` | H |
@@ -65,7 +65,7 @@ user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
 | 媒体 | `avmedia.c` → `user/libc/media*.c` → 子 `browsermediaworker`・`browsermseworker`。`js_canvas.c`、`js_webgl.c` → `ports/mesa/nocturne_gl.c` | `web_avmedia_tick` |
 | Web Audio | `webaudio.c`、`webaudio_dsp.c`、`js_webaudio.c`・`.js`。出口は `n_audio_submit` | — |
 | Worker・WASM | `js_worker.c` → 子 `browserjsworker`／`js_wasm.cpp`（wabt） | — |
-| 保存 | `webstorage.c`、`webidb*.c` → 子 `browserstorageworker`、`webcookie.c`、`js_opfs.c` | — |
+| 保存 | `webstorage.c`、`webidb*.c` → 子 `browserstorageworker`、`webcookie.c`（永続の Cookie は webnet.c の `cookie_sync` が `AppData\Browser\cookies` へ。窓どうしは見張りで読み直す）、`js_opfs.c`、まとめは `websitedata.c` | — |
 | F12・ログ | `user/apps/browser_devtools.h`＋`web/inspect.c`。console の行は `web_js_console`（js.c）→ `host_console`→`console_add`（browser.c）。`--log-console`／`--debug-js` で serial へ `[browser <level> @秒.ms] …` | — |
 
 ## ビルド・媒体・試験（手順は `nocturne-project` スキル）

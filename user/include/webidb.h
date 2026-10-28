@@ -1,6 +1,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 /* Browser-private IndexedDB snapshots. Native vnode leases are released on
  * abort, retirement, and task death. No caller-selected filesystem paths. */
 typedef struct webidb webidb;
@@ -23,3 +24,11 @@ int webidb_connect(webidb *db,uint32_t token,uint64_t version,uint32_t *connecti
 int webidb_poll(webidb *db,uint32_t connection,int *pending,uint64_t *desired_version);
 int webidb_disconnect(webidb *db,uint32_t connection);
 int webidb_forget_connection(webidb *db,uint32_t connection);
+/* The Settings window's site data, from any browser process. usage: each database in the
+ * profile, whatever its origin, to each: the origin its catalog names ("" when neither slot can
+ * be read) and the bytes of all its files. clear: removes every database whose origin match
+ * accepts (match NULL: all) whole, as the Storage Standard clears a bucket. One in a transaction
+ * now is left (its lease is held): WEB_IDB_BUSY once the rest is removed; a connection another
+ * window holds open is not closed and finds the database empty at its next transaction. */
+int webidb_usage(void (*each)(void *opaque,const char *origin,uint64_t bytes),void *opaque);
+int webidb_clear(bool (*match)(void *opaque,const char *origin),void *opaque);

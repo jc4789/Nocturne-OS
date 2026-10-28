@@ -137,9 +137,11 @@
         Document.prototype.adoptNode=function(node){if(!arguments.length)throw new TypeError('Missing node');return transfer(this,node,false,true);};
         const createEvent=document.createEvent;
         Document.prototype.hasFocus=function(){brand(this);return this===document && !!(host.windowState()&2);};
+        /* HTML 6.2: the Document's visibility state, which only the "update the visibility state"
+           task changes (host.visible); a document without a browsing context stays "hidden". */
         Object.defineProperties(Document.prototype,{
-            hidden:{configurable:true,enumerable:true,get(){brand(this);return this!==document || !(host.windowState()&1);}},
-            visibilityState:{configurable:true,enumerable:true,get(){brand(this);return this!==document || !(host.windowState()&1)?'hidden':'visible';}}
+            hidden:{configurable:true,enumerable:true,get(){brand(this);return this!==document || !host.visible();}},
+            visibilityState:{configurable:true,enumerable:true,get(){brand(this);return this===document && host.visible()?'visible':'hidden';}}
         });
         Document.prototype.createEvent=function(...args){brand(this);return apply(createEvent,this,args);};
         for(const method of ['write','writeln'])Document.prototype[method]=function(){brand(this);throw new DOMException('Writing to an inactive document is not implemented','NotSupportedError');};

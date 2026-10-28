@@ -4,7 +4,7 @@
 const indexedDBBridge=(()=>{
     'use strict';
     const {Date,Uint8Array,ArrayBuffer,Array,Number,String,Object,Set,Map,WeakMap,DOMException,TypeError,Reflect}=globalThis;
-    const native=host.indexedDB,pack=host.pack,unpack=host.unpack;
+    const native=host.indexedDB,storageKey=host.indexedDBStorageKey,pack=host.pack,unpack=host.unpack;
     if(typeof native!=='function')return null;
     const invoke=Reflect.apply,wmGet=WeakMap.prototype.get,wmSet=WeakMap.prototype.set,wmHas=WeakMap.prototype.has;
     const setAdd=Set.prototype.add,setClear=Set.prototype.clear,setValues=Set.prototype.values;
@@ -359,7 +359,10 @@ const indexedDBBridge=(()=>{
         createObjectStore(name,options={}){const r=get(this,'IDBDatabase');if(!r.upgrade)fail('InvalidStateError');const tx=live(r.upgrade,true);name=strings(name);if(tx.data.stores.some(s=>s.name===name))fail('ConstraintError');const p=keyPath(options.keyPath===undefined?null:options.keyPath);if(options.autoIncrement&&(p===''||Array.isArray(p)))fail('InvalidAccessError');tx.data.stores.push({name,keyPath:p,autoIncrement:!!options.autoIncrement,generator:1,records:[],indexes:[]});tx.scope.push(name);return r.upgrade.objectStore(name);}
         deleteObjectStore(name){const r=get(this,'IDBDatabase');if(!r.upgrade)fail('InvalidStateError');const tx=live(r.upgrade,true);name=strings(name);const i=tx.data.stores.findIndex(s=>s.name===name);if(i<0)fail('NotFoundError');tx.data.stores.splice(i,1);tx.scope.splice(tx.scope.indexOf(name),1);}
     }
-    function open(name,version,deleting=false){name=strings(name);if(version!==undefined){version=Number(version);if(!Number.isSafeInteger(version)||version<=0)throw new TypeError('Invalid database version');}const request=new IDBOpenDBRequest(token);let blocked=false;
+    function open(name,version,deleting=false){name=strings(name);if(version!==undefined){version=Number(version);if(!Number.isSafeInteger(version)||version<=0)throw new TypeError('Invalid database version');}
+        /* "obtain a storage key": failure throws now, before a request exists. */
+        if(typeof storageKey==='function'&&!storageKey())throw new DOMException('Storage is not available to this origin','SecurityError');
+        const request=new IDBOpenDBRequest(token);let blocked=false;
         async function attempt(){let a;try{a=await native('begin',name);if(retired){if(a[0]===0)discard(a[1]);return;}if(a[0]===1){later(attempt,5);return;}status(a[0]);const data=a[2]===null?{version:0,stores:[]}:unpack(a[2]),wanted=deleting?0:version===undefined?data.version||1:version;
                 if(!deleting&&wanted<data.version){await native('abort',a[1]);finish(request,undefined,new DOMException('Requested version is older','VersionError'));return;}
                 const list=connections.get(name)||[];

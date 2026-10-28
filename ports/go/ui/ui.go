@@ -46,19 +46,27 @@ type Props map[string]any
 
 // Widget is one node of a view.
 type Widget struct {
-	kind      string
-	props     Props
-	children  []*Widget
-	onClick   func()
-	onToggle  func(bool)
-	onSlide   func(float64, bool)
-	onChoose  func(int)
-	onText    func(string)
-	onSubmit  func(string)
-	onPointer func(Pointer)
-	onWheel   func(float64)
-	onFocus   func(focused, cancelled bool)
-	draw      func(p *Painter, width, height float64)
+	kind          string
+	props         Props
+	children      []*Widget
+	menu          *Widget
+	onClick       func()
+	onRightClick  func(x, y float64)
+	onMiddleClick func(x, y float64)
+	onToggle      func(bool)
+	onSlide       func(float64, bool)
+	onChoose      func(int)
+	onSelect      func()
+	onClose       func()
+	onDismiss     func(Dismissal)
+	onAdd         func()
+	onMove        func(from, to int)
+	onText        func(string)
+	onSubmit      func(string)
+	onPointer     func(Pointer)
+	onWheel       func(float64)
+	onFocus       func(focused, cancelled bool)
+	draw          func(p *Painter, width, height float64)
 }
 
 func newWidget(kind string, p Props, kids []*Widget) *Widget {
@@ -100,6 +108,40 @@ func (w *Widget) OnWheel(f func(notches float64)) *Widget { w.onWheel = f; retur
 // up; "reveal" (any widget) scrolls the scroll view it is in until it can be seen whenever its
 // value changes.
 func (w *Widget) OnFocus(f func(focused, cancelled bool)) *Widget { w.onFocus = f; return w }
+
+// OnRightClick makes the right button click the widget too (x, y: where, in the widget), as for
+// a menu of its own (WithMenu with "at": []float64{x, y}).
+func (w *Widget) OnRightClick(f func(x, y float64)) *Widget { w.onRightClick = f; return w }
+
+// OnMiddleClick makes the middle button click the widget too.
+func (w *Widget) OnMiddleClick(f func(x, y float64)) *Widget { w.onMiddleClick = f; return w }
+
+// OnClose is a tab's close button or a middle click on it: close it.
+func (w *Widget) OnClose(f func()) *Widget { w.onClose = f; return w }
+
+// OnMove is a tab dragged from place from to place to of its strip: put it there (give the
+// tabs a "key" each, so that they keep hover and animations).
+func (w *Widget) OnMove(f func(from, to int)) *Widget { w.onMove = f; return w }
+
+// OnAdd is the "+" of a strip of tabs: a new tab.
+func (w *Widget) OnAdd(f func()) *Widget { w.onAdd = f; return w }
+
+// Dismissal is why a menu should be left out of the view.
+type Dismissal int
+
+const (
+	DismissOutside Dismissal = iota // a press outside the menus, or the window lost the keyboard
+	DismissChosen                   // an item was chosen (after its click)
+	DismissEscape
+)
+
+// OnDismiss is a menu that should be left out of the next view (the engine keeps showing it
+// until then).
+func (w *Widget) OnDismiss(f func(why Dismissal)) *Widget { w.onDismiss = f; return w }
+
+// WithMenu shows m (a Menu) over the window next to the widget while the view has it; on a
+// MenuItem, m is its submenu.
+func (w *Widget) WithMenu(m *Widget) *Widget { w.menu = m; return w }
 
 // Pointer is the pointer over a canvas or surface view.
 type Pointer struct {
@@ -218,6 +260,35 @@ func Progress(value float64, p Props) *Widget {
 func Canvas(draw func(p *Painter, width, height float64), p Props) *Widget {
 	w := newWidget("canvas", p, nil)
 	w.draw = draw
+	return w
+}
+
+// Tabs is a strip of tabs (Tab widgets) with a "+" after them (OnAdd; "add": false leaves it
+// out). Its tabs share its width, at most "tabWidth" each; below "tabMinWidth" it scrolls.
+func Tabs(p Props, tabs ...*Widget) *Widget { return newWidget("tabs", p, tabs) }
+
+// Tab is a tab of a strip; onSelect comes when it is pressed (it was not the chosen one).
+// Props: "icon", "loading" (a spinner instead of the icon), "key".
+func Tab(title string, selected bool, onSelect func(), p Props) *Widget {
+	w := newWidget("tab", p, nil)
+	w.props["text"] = title
+	w.props["selected"] = selected
+	w.onSelect = onSelect
+	return w
+}
+
+// Menu is a menu shown over the window next to the widget it is given to (WithMenu): MenuItems,
+// Dividers and other widgets to show. Props: "edge" ("end": its right edge on the widget's),
+// "at" ([]float64{x, y}: at that point of the widget), "minWidth", "maxHeight". While it is shown
+// it takes the pointer and the arrows, Home, End, Enter, Space and Escape.
+func Menu(p Props, items ...*Widget) *Widget { return newWidget("menu", p, items) }
+
+// MenuItem is an item of a menu. Props: "shortcut" (the keys shown on the right), "icon",
+// "disabled"; WithMenu gives it a submenu.
+func MenuItem(label string, onClick func(), p Props) *Widget {
+	w := newWidget("item", p, nil)
+	w.props["text"] = label
+	w.onClick = onClick
 	return w
 }
 
@@ -694,6 +765,9 @@ const (
 	eventFocus
 	eventDirect
 	eventFrame
+	eventDismiss
+	eventAdd
+	eventMove
 )
 
 // Key is a key press that no focused text field took.
@@ -887,14 +961,19 @@ func canvasKey(w *Widget, index int) any {
 	return index
 }
 
-// encode writes w and its children in pre-order; handlers[i] is the widget at place i.
+// encode writes w and its children in pre-order; handlers[i] is the widget at place i. Its menu
+// goes after its children (the engine shows it over the window, not among them).
 func (a *App) encode(out *writer, w *Widget, handlers *[]*Widget) {
 	index := len(*handlers)
 	*handlers = append(*handlers, w)
+	kids := w.children
+	if w.menu != nil {
+		kids = append(kids[:len(kids):len(kids)], w.menu)
+	}
 	out.name(w.kind)
 	at := len(*out)
 	out.u16(0)
-	out.u16(uint16(len(w.children)))
+	out.u16(uint16(len(kids)))
 	n := 0
 	for k, v := range w.props {
 		if prop(out, k, v) {
@@ -903,6 +982,17 @@ func (a *App) encode(out *writer, w *Widget, handlers *[]*Widget) {
 	}
 	if w.onPointer != nil || w.onWheel != nil {
 		prop(out, "pointer", 1)
+		n++
+	}
+	if _, set := w.props["buttons"]; !set && (w.onRightClick != nil || w.onMiddleClick != nil) {
+		buttons := 0
+		if w.onRightClick != nil {
+			buttons |= 2
+		}
+		if w.onMiddleClick != nil {
+			buttons |= 4
+		}
+		prop(out, "buttons", buttons)
 		n++
 	}
 	if w.onClick != nil && (w.kind == "column" || w.kind == "row" || w.kind == "scroll" || w.kind == "card") {
@@ -920,7 +1010,7 @@ func (a *App) encode(out *writer, w *Widget, handlers *[]*Widget) {
 		n += 2
 	}
 	binary.LittleEndian.PutUint16((*out)[at:], uint16(n))
-	for _, c := range w.children {
+	for _, c := range kids {
 		a.encode(out, c, handlers)
 	}
 }
@@ -958,8 +1048,14 @@ func (a *App) event(r *reader) {
 		w = &Widget{}
 	}
 	switch typ {
-	case eventClick:
-		if w.onClick != nil {
+	case eventClick: // the button in flags: 2 right, 4 middle (x, y: where), else the left one or keys
+		// An item of a menu is chosen with any button: without a handler for it, onClick.
+		button := flags >> 8 & 0xFF
+		if button == 2 && w.onRightClick != nil {
+			w.onRightClick(x, y)
+		} else if button == 4 && w.onMiddleClick != nil {
+			w.onMiddleClick(x, y)
+		} else if w.onClick != nil {
 			w.onClick()
 		}
 	case eventToggle:
@@ -971,8 +1067,32 @@ func (a *App) event(r *reader) {
 			w.onSlide(x, flags&1 != 0)
 		}
 	case eventChoose:
-		if w.onChoose != nil {
+		if w.kind == "tab" {
+			if w.onSelect != nil {
+				w.onSelect()
+			}
+		} else if w.onChoose != nil {
 			w.onChoose(int(x))
+		}
+	case eventDismiss: // a tab's close; a menu that should be left out of the view
+		if w.kind == "menu" && w.onDismiss != nil {
+			why := DismissOutside
+			if flags&1 != 0 {
+				why = DismissChosen
+			} else if flags&16 != 0 {
+				why = DismissEscape
+			}
+			w.onDismiss(why)
+		} else if w.onClose != nil {
+			w.onClose()
+		}
+	case eventAdd:
+		if w.onAdd != nil {
+			w.onAdd()
+		}
+	case eventMove:
+		if w.onMove != nil {
+			w.onMove(int(x), int(y))
 		}
 	case eventText:
 		if w.onText != nil {

@@ -267,36 +267,51 @@ static uint32_t mixc(uint32_t a, uint32_t b, float t) {
 
 /* -- views -- */
 enum { K_NONE, K_COLUMN, K_ROW, K_SCROLL, K_CARD, K_TEXT, K_BUTTON, K_TOGGLE, K_CHECKBOX, K_SLIDER, K_PROGRESS,
-       K_SEGMENTED, K_FIELD, K_ITEM, K_ICON, K_DIVIDER, K_SPACER, K_CANVAS, K_SURFACE, K_COUNT };
+       K_SEGMENTED, K_FIELD, K_ITEM, K_ICON, K_DIVIDER, K_SPACER, K_CANVAS, K_SURFACE, K_TABS, K_TAB, K_MENU, K_COUNT };
 static const char *const kind_names[K_COUNT] = {
     [K_COLUMN] = "column", [K_ROW] = "row", [K_SCROLL] = "scroll", [K_CARD] = "card", [K_TEXT] = "text",
     [K_BUTTON] = "button", [K_TOGGLE] = "toggle", [K_CHECKBOX] = "checkbox", [K_SLIDER] = "slider",
     [K_PROGRESS] = "progress", [K_SEGMENTED] = "segmented", [K_FIELD] = "field", [K_ITEM] = "item",
     [K_ICON] = "icon", [K_DIVIDER] = "divider", [K_SPACER] = "spacer", [K_CANVAS] = "canvas", [K_SURFACE] = "surface",
+    [K_TABS] = "tabs", [K_TAB] = "tab", [K_MENU] = "menu",
 };
 enum { A_NONE, A_START, A_CENTER, A_END, A_STRETCH, A_BETWEEN };
 enum { SZ_NONE, SZ_NUM, SZ_FILL };
 enum { V_SECONDARY, V_PRIMARY, V_GHOST };
 enum { S_NONE, S_HEADING, S_TITLE, S_CAPTION };
 /* which optional colours a node has */
-enum { HAS_BACKGROUND = 1, HAS_BORDER = 2, HAS_HOVER = 4, HAS_PRESSED = 8, HAS_COLOUR = 16 };
+enum { HAS_BACKGROUND = 1, HAS_BORDER = 2, HAS_HOVER = 4, HAS_PRESSED = 8, HAS_COLOUR = 16, HAS_CHOSEN = 32 };
 
 struct node {
     uint8_t kind, align, self, justify, wmode, hmode, variant, text_align, style, weight, has;
+    uint8_t buttons;                /* the other buttons that click it: 2 right, 4 middle ("buttons") */
+    uint8_t edge;                   /* a menu: which edge of its anchor it lines up with ("edge") */
+    uint8_t layer;                  /* 0, or how many menus deep it is (a menu counts itself) */
     bool disabled, shadow, clickable, compact, secret, on, wrap, padded, pointer, select_on_focus, ellipsis, mono;
-    uint32_t background, border, hover, pressed, colour, surface;
+    bool loading, add, has_at;      /* a tab loading; tabs with their "+"; a menu with "at" */
+    uint32_t background, border, hover, pressed, colour, surface, chosen;
     float width, height, min_w, min_h, grow, pad[4], gap, radius, max_h, size, line_height;
     float step, wheel_step, length, value, min, max, selected, drawn_w, drawn_h;
     float focus_req, reveal;        /* "focus" and "reveal": act when they change (see ui.h) */
-    struct str text, icon, placeholder, draw;
+    float tab_w, tab_min, at_x, at_y; /* tabs: the widest and narrowest a tab is; a menu: where it opens on its anchor */
+    struct str text, icon, placeholder, draw, shortcut;
     uint32_t opt, nopts;            /* options: w->strs[opt .. opt + nopts) */
     uint32_t first, next, count;    /* first child, next sibling (0: none), number of children */
+    /* its parent (the root: itself), the place after its last descendant, its menu (0: none; a menu is
+       not among the children: it opens over the window, lined up with the node it belongs to), a tab's
+       place among the tabs of its strip, and the number of tabs of a strip */
+    uint32_t parent, end, menu, ord, ntabs;
     uint64_t key, id;
     float x, y, w, h, scroll_max;
     float vis[4];                   /* the part of the window it can be seen in: x0, y0, x1, y1 */
     float nat_in, nat_w, nat_h;     /* the last natural size and the width it was asked for */
     bool nat_ok;
     float lay_w, lay_h, lay_g;      /* scratch while its parent places it */
+    /* a strip of tabs as placed: the part its tabs are seen in, each tab's width, where its "+" is,
+       whether its tabs do not fit (it scrolls, with arrows at its ends); a menu: whether an item has
+       an icon (all their text then starts after the icons) */
+    float area0, area1, tab_each, plus_x;
+    bool overflow, icons;
 };
 
 struct state {
@@ -305,6 +320,9 @@ struct state {
     int req_w, req_h;
     float shift;                    /* a focused field: how far its text is scrolled left */
     float focus_seen, reveal_seen;  /* the last "focus" and "reveal" acted on */
+    /* a menu: the item lit (by the pointer or the keys) and the item whose submenu is open;
+       tabs: the chosen tab last scrolled into sight */
+    uint64_t lit, open;
 };
 struct anim { uint64_t key, node; float from, to, ms; uint64_t start; bool seen; }; /* node: whose it is */
 
@@ -348,6 +366,27 @@ struct uiwin {
     uint32_t nsent;
     bool selecting;          /* the pointer is dragging out a selection in the focused field */
     uint32_t keys[8], nkeys; /* keys down whose press went to the app (their release goes too) */
+    uint32_t held;           /* the pointer's buttons held, as its last event said */
+    uint64_t pressed2;       /* a node that takes the right or middle button ("buttons"), pressed with it */
+    uint32_t button2;        /* and that button (2 or 4) */
+    float press_x, grab;     /* where the left button went down; a dragged tab: where on it it was taken */
+    float drag_draw;         /* where the dragged tab is drawn */
+    uint32_t drag_to;        /* the place among the tabs the dragged tab would go to */
+    /* A tab dropped at another place: shown there until the app sends a view (which has it there,
+       or not, as the app decided on UI_EVENT_MOVE). */
+    uint64_t moved;          /* its strip */
+    uint32_t moved_from, moved_to, moved_view;
+    /* The menus shown over the window, the places of their nodes: the menus of nodes first, then the
+       submenus open in them. While there are any, the pointer and the keys are theirs. */
+    uint32_t menus[16], nmenus;
+    uint64_t menu_ids[16];   /* the ids of the menus shown, to tell a menu that has just come */
+    uint32_t nmenu_ids;
+    bool menu_press;         /* the button held went down in a menu */
+    /* The pointer rests on an item: at menu_at the menu menu_wait opens the submenu of menu_item
+       (0: closes the one it has open). */
+    uint64_t menu_wait, menu_item, menu_at;
+    bool spin;               /* a tab loading is seen: its spinner turns */
+    uint64_t spin_step;      /* the step of the spinners in the last picture (uptime / 33 ms) */
     /* What the window shows, so that a picture paints only what changed: each node's signature
        (all its painting depends on) and box, by id; the boxes surfaces changed meanwhile; and
        the canvas and deep plane the last picture went into (a new one is painted whole). */
@@ -443,6 +482,14 @@ static struct state *state_of(struct uiwin *w, uint64_t id) {
     return &w->states[j];
 }
 
+/* The state of an identity if it has one, without making it. */
+static const struct state *state_find(const struct uiwin *w, uint64_t id) {
+    if (!w->capstates) return NULL;
+    uint32_t j = (uint32_t)id & (w->capstates - 1);
+    while (w->states[j].id && w->states[j].id != id) j = (j + 1) & (w->capstates - 1);
+    return w->states[j].id ? &w->states[j] : NULL;
+}
+
 static struct anim *anim_slot(struct anim *t, uint32_t cap, uint64_t key) {
     uint32_t j = (uint32_t)key & (cap - 1);
     while (t[j].key && t[j].key != key) j = (j + 1) & (cap - 1);
@@ -488,6 +535,18 @@ static float animate(struct uiwin *w, const struct node *n, char what, float tar
     return a->from + (a->to - a->from) * ease(t);
 }
 
+/* Puts a value of node n where it is now, without easing (a tab that follows the pointer): the
+   next animate() eases from there. */
+static void anim_set(struct uiwin *w, const struct node *n, char what, float value) {
+    animate(w, n, what, value, 1);
+    if (!w->capanims) return;
+    struct anim *a = anim_slot(w->anims, w->capanims, mix(n->id, (uint8_t)what));
+    if (a->key) {
+        a->from = a->to = value;
+        a->start = w->now;
+    }
+}
+
 /* Drops the animations of nodes that are gone (find_damage and paint mark the others seen). */
 static void prune_anims(struct uiwin *w) {
     if (!w->capanims) return;
@@ -524,8 +583,10 @@ static void node_init(struct node *n, uint8_t kind) {
     n->width = n->height = NAN;
     n->grow = n->gap = n->radius = n->max_h = n->size = n->line_height = NAN;
     n->step = n->wheel_step = n->length = n->min = n->max = n->focus_req = n->reveal = NAN;
+    n->tab_w = n->tab_min = NAN;
     n->selected = -1;
-    n->text = n->icon = n->placeholder = n->draw = (struct str){"", 0};
+    n->add = true;
+    n->text = n->icon = n->placeholder = n->draw = n->shortcut = (struct str){"", 0};
 }
 
 static void parse_prop(struct uiwin *w, struct node *n, struct rd *r) {
@@ -601,17 +662,30 @@ static void parse_prop(struct uiwin *w, struct node *n, struct rd *r) {
         }
     }
     else if (str_is(name, "surface")) { if (type == 1 && num >= 0) n->surface = (uint32_t)num; }
+    else if (str_is(name, "buttons")) { if (type == 1 && num > 0 && num < 256) n->buttons = (uint8_t)num & 6; }
+    else if (str_is(name, "edge")) { if (type == 2) n->edge = word(s, align_names, 4); }
+    else if (str_is(name, "at")) {
+        if (type == 3 && count == 2) {
+            double v[2];
+            memcpy(v, nums, 16);
+            n->at_x = (float)v[0];
+            n->at_y = (float)v[1];
+            n->has_at = true;
+        }
+    }
     NUMBER("minWidth", min_w) NUMBER("minHeight", min_h) NUMBER("maxHeight", max_h) NUMBER("lineHeight", line_height)
     NUMBER("wheelStep", wheel_step) NUMBER("grow", grow) NUMBER("gap", gap) NUMBER("radius", radius)
     NUMBER("size", size) NUMBER("step", step) NUMBER("length", length) NUMBER("min", min) NUMBER("max", max)
     NUMBER("selected", selected) NUMBER("focus", focus_req) NUMBER("reveal", reveal)
+    NUMBER("tabWidth", tab_w) NUMBER("tabMinWidth", tab_min)
     COLOUR("background", background, HAS_BACKGROUND) COLOUR("border", border, HAS_BORDER)
     COLOUR("colour", colour, HAS_COLOUR) COLOUR("hoverBackground", hover, HAS_HOVER)
-    COLOUR("pressedBackground", pressed, HAS_PRESSED)
+    COLOUR("pressedBackground", pressed, HAS_PRESSED) COLOUR("selectedBackground", chosen, HAS_CHOSEN)
     FLAG("disabled", disabled) FLAG("shadow", shadow) FLAG("clickable", clickable) FLAG("compact", compact)
     FLAG("secret", secret) FLAG("on", on) FLAG("wrap", wrap) FLAG("pointer", pointer)
     FLAG("selectOnFocus", select_on_focus) FLAG("ellipsis", ellipsis) FLAG("mono", mono)
-    TEXT("text", text) TEXT("icon", icon) TEXT("placeholder", placeholder)
+    FLAG("loading", loading) FLAG("add", add)
+    TEXT("text", text) TEXT("icon", icon) TEXT("placeholder", placeholder) TEXT("shortcut", shortcut)
 #undef NUMBER
 #undef COLOUR
 #undef FLAG
@@ -660,8 +734,26 @@ static void node_defaults(struct node *n, const struct node *parent) {
         if (n->wmode == SZ_NONE) { n->wmode = SZ_NUM; n->width = 100; }
         if (n->hmode == SZ_NONE) { n->hmode = SZ_NUM; n->height = 100; }
         break;
+    case K_TABS:
+        if (!(n->tab_w > 0)) n->tab_w = 240;
+        if (!(n->tab_min > 0)) n->tab_min = 100;
+        n->tab_w = floorf(fmaxf(n->tab_w, 24));
+        n->tab_min = floorf(fminf(fmaxf(n->tab_min, 24), n->tab_w));
+        if (isnan(n->radius)) n->radius = 0;
+        break;
+    case K_TAB:
+        if (isnan(n->size)) n->size = 13;
+        break;
+    case K_MENU:
+        if (!n->padded) n->pad[0] = n->pad[1] = n->pad[2] = n->pad[3] = 6;
+        if (!(n->has & HAS_BACKGROUND)) { n->background = t->surface; n->has |= HAS_BACKGROUND; }
+        if (!(n->has & HAS_BORDER)) { n->border = t->border; n->has |= HAS_BORDER; }
+        if (isnan(n->radius)) n->radius = t->radius;
+        if (!(n->min_w > 0)) n->min_w = 220;
+        n->shadow = true;
+        break;
     }
-    if (n->kind == K_COLUMN || n->kind == K_ROW || n->kind == K_SCROLL) {
+    if (n->kind == K_COLUMN || n->kind == K_ROW || n->kind == K_SCROLL || n->kind == K_MENU) {
         if (isnan(n->gap)) n->gap = n->kind == K_ROW ? 8 : 0;
         if (!n->align) n->align = n->kind == K_ROW ? A_CENTER : A_STRETCH;
         if (isnan(n->radius)) n->radius = 0;
@@ -684,16 +776,29 @@ static uint32_t parse_node(struct uiwin *w, struct rd *r, uint32_t parent, int d
     node_init(&w->nodes[i], word((struct str){(const char *)kp, kl}, kind_names, K_COUNT));
     for (uint16_t k = 0; k < nprops && !r->bad; k++) parse_prop(w, &w->nodes[i], r);
     node_defaults(&w->nodes[i], depth ? &w->nodes[parent] : NULL);
+    w->nodes[i].parent = depth ? parent : i;
+    w->nodes[i].layer = depth ? w->nodes[parent].layer + (w->nodes[i].kind == K_MENU) : 0;
     uint32_t last = 0;
     for (uint16_t k = 0; k < nkids && !r->bad; k++) {
         uint32_t c = parse_node(w, r, i, depth + 1);
         if (r->bad) break;
+        if (w->nodes[c].kind == K_MENU) { /* not a child: it opens over the window (its first one) */
+            if (!w->nodes[i].menu) w->nodes[i].menu = c;
+            continue;
+        }
         if (last) w->nodes[last].next = c;
         else w->nodes[i].first = c;
         last = c;
         w->nodes[i].count++;
+        if (w->nodes[i].kind == K_TABS && w->nodes[c].kind == K_TAB) w->nodes[c].ord = w->nodes[i].ntabs++;
     }
+    w->nodes[i].end = w->n;
     return i;
+}
+
+/* An item or divider of a menu (painted and sized as one). */
+static bool in_menu(const struct uiwin *w, const struct node *n) {
+    return n->layer && w->nodes[n->parent].kind == K_MENU;
 }
 
 /* -- text -- */
@@ -799,7 +904,7 @@ static void natural(struct uiwin *w, struct node *n, float width, float *ow, flo
     const struct ui_theme *t = &ui_theme;
     float sw = 0, sh = 0, cw, ch;
     switch (n->kind) {
-    case K_COLUMN: case K_ROW: case K_SCROLL: {
+    case K_COLUMN: case K_ROW: case K_SCROLL: case K_MENU: {
         float l = n->pad[3], r = n->pad[1], gap = n->gap;
         float inner = fmaxf(0, (n->wmode == SZ_NUM ? n->width : width) - l - r);
         if (n->kind == K_ROW) {
@@ -868,11 +973,22 @@ static void natural(struct uiwin *w, struct node *n, float width, float *ow, flo
         sh = n->kind == K_SLIDER ? 28 : n->kind == K_PROGRESS ? 8 : control_height + 2;
         break;
     case K_ITEM:
+        if (in_menu(w, n)) { /* [icon] text ... shortcut, or the chevron of its submenu */
+            sw = 24 + (w->nodes[n->parent].icons ? 28 : 0) + ceilf(measure(n->text.p, n->text.n, t->fontSize, 0));
+            if (n->menu) sw += 32;
+            else if (n->shortcut.n) sw += 40 + ceilf(measure(n->shortcut.p, n->shortcut.n, t->smallSize, 0));
+            sh = 32;
+            break;
+        }
         sw = ceilf(measure(n->text.p, n->text.n, t->fontSize, n->selected > 0)) + (n->icon.n ? 28 : 0) + 28;
         sh = 38;
         break;
+    case K_TABS:
+        sw = (float)n->ntabs * n->tab_w + (n->add ? 36 : 0) + n->pad[1] + n->pad[3];
+        sh = 40;
+        break;
     case K_ICON: sw = sh = n->size; break;
-    case K_DIVIDER: sw = sh = 1; break;
+    case K_DIVIDER: sw = 1; sh = in_menu(w, n) ? 9 : 1; break;
     case K_SPACER: sw = sh = isnan(n->size) ? 0 : n->size; break;
     }
     if (n->wmode == SZ_NUM) sw = n->width;
@@ -887,6 +1003,7 @@ static void natural(struct uiwin *w, struct node *n, float width, float *ow, flo
 
 static void place(struct uiwin *w, struct node *n, float x, float y, float ww, float hh, uint64_t parent,
                   uint32_t index, const float *clip);
+static void place_tabs(struct uiwin *w, struct node *n, const float *clip);
 
 /* Lays the children of n along a column (vertical) or a row inside the box. */
 static void place_children(struct uiwin *w, struct node *n, bool vertical, float ix, float iy, float iw, float ih,
@@ -942,7 +1059,8 @@ static void place(struct uiwin *w, struct node *n, float x, float y, float ww, f
     n->h = hh;
     memcpy(n->vis, clip, sizeof n->vis);
     float t = n->pad[0], r = n->pad[1], b = n->pad[2], l = n->pad[3];
-    if (n->kind == K_SCROLL) {
+    if (n->kind == K_TABS) { place_tabs(w, n, clip); return; }
+    if (n->kind == K_SCROLL || n->kind == K_MENU) {
         float inner = ww - l - r, needed = 0, cw, ch;
         for (uint32_t c = n->first; c; c = w->nodes[c].next) {
             natural(w, &w->nodes[c], inner, &cw, &ch);
@@ -959,6 +1077,163 @@ static void place(struct uiwin *w, struct node *n, float x, float y, float ww, f
     }
     if (n->kind == K_COLUMN || n->kind == K_ROW)
         place_children(w, n, n->kind == K_COLUMN, x + l, y + t, fmaxf(0, ww - l - r), fmaxf(0, hh - t - b), n->id, clip);
+}
+
+/* -- tabs --
+   A strip gives its tabs one width, at most tabWidth; when they do not fit at tabMinWidth they keep
+   that width and the strip scrolls (the wheel, the arrows at its ends), keeping the chosen tab in
+   sight. A tab pressed with the left button is chosen at once and can be dragged along the strip:
+   the others make room, and where it is let go it asks for its new place (UI_EVENT_MOVE). Its
+   place on the screen eases to where it is laid out, so tabs that come, go or move slide there. */
+enum { TAB_ARROW = 28, TAB_PLUS = 36, TAB_BUTTON = 28, TAB_CLOSE = 20 };
+/* the parts of a strip and of a tab that take the pointer, by their own ids */
+enum { PART_CLOSE = 1, PART_ADD, PART_LEFT, PART_RIGHT };
+static uint64_t part_id(uint64_t id, uint32_t part) { return mix(id ^ 0x7061727473ull, part); }
+
+/* Where tab i is shown while tab from goes to place to (from UINT32_MAX: none moves). */
+static uint32_t tab_slot(uint32_t i, uint32_t from, uint32_t to) {
+    if (from == UINT32_MAX) return i;
+    if (i == from) return to;
+    if (from < to && i > from && i <= to) return i - 1;
+    if (from > to && i >= to && i < from) return i + 1;
+    return i;
+}
+
+static void place_tabs(struct uiwin *w, struct node *n, const float *clip) {
+    float l = n->x + n->pad[3], r = n->x + n->w - n->pad[1], plus = n->add ? TAB_PLUS : 0;
+    uint32_t count = n->ntabs;
+    float avail = fmaxf(0, r - l - plus), each = count ? floorf(avail / (float)count) : n->tab_w;
+    each = fminf(each, n->tab_w);
+    n->overflow = count && each < n->tab_min;
+    if (n->overflow) {
+        each = n->tab_min;
+        n->area0 = l + TAB_ARROW;
+        n->area1 = fmaxf(n->area0, r - plus - TAB_ARROW);
+    } else {
+        n->area0 = l;
+        n->area1 = l + each * (float)count;
+    }
+    n->tab_each = each;
+    n->plus_x = (n->overflow ? r - plus : n->area1) + (TAB_PLUS - TAB_BUTTON) / 2;
+    float view = n->area1 - n->area0, max = n->overflow ? fmaxf(0, each * (float)count - view) : 0;
+    uint64_t base = mix(n->id, 0x7AB5), sel_id = 0;
+    struct node *sel = NULL, *moving = NULL;
+    for (uint32_t c = n->first; c; c = w->nodes[c].next) {
+        struct node *k = &w->nodes[c];
+        if (k->kind != K_TAB) continue;
+        uint64_t id = k->key ? mix(base, k->key) : mix(base, k->ord + 1); /* as place() gives it */
+        if (!sel && k->selected > 0) { sel = k; sel_id = id; }
+        if (w->dragging && id == w->dragging) moving = k;
+    }
+    struct state *st = state_of(w, n->id);
+    float scroll = st ? st->scroll : 0;
+    /* the tab dragged, or the one dropped whose move the app has not answered yet, and where it goes */
+    uint32_t from = UINT32_MAX, to = 0;
+    if (moving && count) {
+        from = moving->ord;
+        w->drag_draw = fminf(fmaxf(w->px - w->grab, n->area0), fmaxf(n->area0, n->area1 - each));
+        float at = each > 0 ? roundf((w->drag_draw - n->area0 + scroll) / each) : 0;
+        to = w->drag_to = (uint32_t)fminf(fmaxf(at, 0), (float)(count - 1));
+    } else if (w->moved == n->id && w->moved_view == w->view && w->moved_from < count && w->moved_to < count) {
+        from = w->moved_from;
+        to = w->moved_to;
+    }
+    if (sel && st && st->open != sel_id) { /* a tab newly chosen comes into sight */
+        st->open = sel_id;
+        float sx = (float)tab_slot(sel->ord, from, to) * each;
+        if (sx < scroll) scroll = sx;
+        else if (sx + each > scroll + view) scroll = sx + each - view;
+    }
+    scroll = fminf(fmaxf(scroll, 0), max);
+    if (st) st->scroll = scroll;
+    float seen[4] = {fmaxf(clip[0], n->area0), fmaxf(clip[1], n->y), fminf(clip[2], n->overflow ? n->area1 : r),
+                     fminf(clip[3], n->y + n->h)};
+    for (uint32_t c = n->first; c; c = w->nodes[c].next) {
+        struct node *k = &w->nodes[c];
+        if (k->kind != K_TAB) continue;
+        float x = n->area0 + (float)tab_slot(k->ord, from, to) * each - scroll;
+        place(w, k, roundf(x), n->y, each, n->h, base, k->ord, seen);
+    }
+    if (moving) anim_set(w, moving, 'x', w->drag_draw);
+}
+
+/* -- menus --
+   A menu belongs to the node it is a child of (its anchor) and is shown over the window next to it:
+   below it (above when there is no room), its start edge on the anchor's ("edge": "end" puts its end
+   edge on the anchor's), or with "at" at that point of the anchor; a submenu (the menu of an item of
+   a menu) beside its item. Menus are placed after the tree and painted over it. */
+enum { MENU_MARGIN = 8 };
+
+static void place_menu(struct uiwin *w, uint32_t mi, const uint64_t *was, uint32_t nwas) {
+    struct node *m = &w->nodes[mi], *a = &w->nodes[m->parent];
+    if (!a->id || w->nmenus == sizeof w->menus / sizeof *w->menus) return;
+    m->icons = false;
+    for (uint32_t c = m->first; c; c = w->nodes[c].next)
+        if (w->nodes[c].kind == K_ITEM && w->nodes[c].icon.n) m->icons = true;
+    float W = (float)w->win->w, H = (float)w->win->h, room = fmaxf(0, W - 2 * MENU_MARGIN), nw, nh;
+    natural(w, m, room, &nw, &nh);
+    nw = fminf(ceilf(nw), room);
+    nh = fminf(ceilf(nh), fmaxf(0, H - 2 * MENU_MARGIN));
+    if (!isnan(m->max_h)) nh = fminf(nh, m->max_h);
+    float x, y;
+    if (m->layer > 1) { /* beside its item, on the right of its menu or else on the left */
+        const struct node *pm = &w->nodes[a->parent];
+        x = pm->x + pm->w - 4;
+        y = a->y - m->pad[0];
+        if (x + nw > W - MENU_MARGIN && pm->x + 4 - nw >= MENU_MARGIN) x = pm->x + 4 - nw;
+    } else if (m->has_at) {
+        x = a->x + m->at_x;
+        y = a->y + m->at_y;
+        if (x + nw > W - MENU_MARGIN && x - nw >= MENU_MARGIN) x -= nw;
+        if (y + nh > H - MENU_MARGIN && y - nh >= MENU_MARGIN) y -= nh;
+    } else {
+        x = m->edge == A_END ? a->x + a->w - nw : m->edge == A_CENTER ? a->x + (a->w - nw) / 2 : a->x;
+        y = a->y + a->h + 4;
+        if (y + nh > H - MENU_MARGIN && a->y - 4 - nh >= MENU_MARGIN) y = a->y - 4 - nh;
+    }
+    x = fmaxf(MENU_MARGIN, fminf(x, W - MENU_MARGIN - nw));
+    y = fmaxf(MENU_MARGIN, fminf(y, H - MENU_MARGIN - nh));
+    uint64_t parent = mix(a->id, 0x6D656E75), id = m->key ? mix(parent, m->key) : mix(parent, 1);
+    bool shown = false;
+    for (uint32_t k = 0; k < nwas; k++) shown |= was[k] == id;
+    struct state *st = state_of(w, id);
+    if (st && !shown) st->lit = st->open = 0, st->scroll = 0; /* it has just come: as new */
+    float clip[4] = {0, 0, W, H};
+    place(w, m, roundf(x), roundf(y), nw, nh, parent, 0, clip);
+    w->menus[w->nmenus++] = mi;
+    st = state_of(w, id); /* place() may have moved the table */
+    if (!st || !st->open) return;
+    uint32_t sub = 0;
+    for (uint32_t c = m->first; c; c = w->nodes[c].next) {
+        const struct node *k = &w->nodes[c];
+        if (k->kind == K_ITEM && k->id == st->open && k->menu && !k->disabled) sub = k->menu;
+    }
+    if (sub) place_menu(w, sub, was, nwas);
+    else st->open = 0; /* its item is gone */
+}
+
+static void place_menus(struct uiwin *w) {
+    uint64_t was[sizeof w->menu_ids / sizeof *w->menu_ids];
+    uint32_t nwas = w->nmenu_ids;
+    memcpy(was, w->menu_ids, sizeof was);
+    /* what is in menus is placed again only where a menu is shown now (a submenu closed since the
+       last picture keeps no place: it is not recorded as shown, so where it was is painted again) */
+    for (uint32_t i = 1; i < w->n; i++)
+        if (w->nodes[i].layer) {
+            w->nodes[i].id = 0;
+            memset(w->nodes[i].vis, 0, sizeof w->nodes[i].vis);
+        }
+    w->nmenus = 0;
+    for (uint32_t i = 1; i < w->n; i++) {
+        const struct node *m = &w->nodes[i];
+        if (m->kind == K_MENU && m->layer == 1 && w->nodes[m->parent].menu == i) place_menu(w, i, was, nwas);
+    }
+    w->nmenu_ids = w->nmenus;
+    for (uint32_t k = 0; k < w->nmenus; k++) w->menu_ids[k] = w->nodes[w->menus[k]].id;
+    if (!w->nmenus) {
+        w->menu_at = 0;
+        w->menu_press = false;
+    }
 }
 
 /* -- painting -- */
@@ -1015,6 +1290,20 @@ static void draw_icon(canvas_t *c, struct str name, float x, float y, float size
         L(6, 20, 18, 20, 1.8); L(10, 20, 10, 14.5, 1.8); L(10, 14.5, 14, 14.5, 1.8); L(14, 14.5, 14, 20, 1.8);
     }
     else if (str_is(name, "search")) { BOX(4, 4, 12, 12, 6); L(14.5, 14.5, 20, 20, 2.2); }
+    else if (str_is(name, "menu")) { L(4.5, 7, 19.5, 7, 2); L(4.5, 12, 19.5, 12, 2); L(4.5, 17, 19.5, 17, 2); }
+    else if (str_is(name, "lock")) {
+        for (int i = 0; i < 8; i++) { /* the shackle: half a circle over the body */
+            float a0 = 3.14159265f * (1 + (float)i / 8), a1 = 3.14159265f * (1 + (float)(i + 1) / 8);
+            L(12 + cosf(a0) * 4, 8.5f + sinf(a0) * 4, 12 + cosf(a1) * 4, 8.5f + sinf(a1) * 4, 1.8);
+        }
+        L(8, 8.5, 8, 10.5, 1.8); L(16, 8.5, 16, 10.5, 1.8);
+        BOX(4.5, 10.5, 15, 10.5, 2.5); DOT(12, 15, 1.3f); L(12, 15.5, 12, 17.5, 1.8);
+    }
+    else if (str_is(name, "trash")) {
+        L(4, 6.5, 20, 6.5, 1.8); L(9.5, 6.5, 9.5, 4, 1.8); L(9.5, 4, 14.5, 4, 1.8); L(14.5, 4, 14.5, 6.5, 1.8);
+        L(6, 6.5, 7.2, 20, 1.8); L(7.2, 20, 16.8, 20, 1.8); L(16.8, 20, 18, 6.5, 1.8);
+        L(10, 10, 10, 16.5, 1.6); L(14, 10, 14, 16.5, 1.6);
+    }
     else if (str_is(name, "backspace")) {
         L(2.5, 12, 8, 5.5, 1.8); L(8, 5.5, 21.5, 5.5, 1.8); L(21.5, 5.5, 21.5, 18.5, 1.8);
         L(21.5, 18.5, 8, 18.5, 1.8); L(8, 18.5, 2.5, 12, 1.8); L(11.5, 9, 17.5, 15, 1.8); L(17.5, 9, 11.5, 15, 1.8);
@@ -1104,6 +1393,162 @@ static void ask_size(struct uiwin *w, struct node *n, float have_w, float have_h
     w->hold = true;
 }
 
+/* Text on one line at most room wide: what does not fit is cut with "…". */
+static void text_fit(canvas_t *c, struct str s, float x, float y, float room, float size, int weight, uint32_t col) {
+    if (!(room > 0) || !s.n) return;
+    if (measure(s.p, s.n, size, weight) <= room + 0.5f) { ui_text(c, x, y, s.p, s.n, size, weight, col); return; }
+    /* the longest start that fits with "…" after it */
+    float dots = measure("\xE2\x80\xA6", 3, size, weight), at = 0;
+    uint32_t cut = 0;
+    for (uint32_t i = 0; i < s.n;) {
+        uint32_t j = next_char(s.p, s.n, i);
+        at += measure(s.p + i, j - i, size, weight);
+        if (at + dots > room + 0.5f) break;
+        cut = i = j;
+    }
+    ui_text(c, x, y, s.p, cut, size, weight, col);
+    ui_text(c, x + measure(s.p, cut, size, weight), y, "\xE2\x80\xA6", 3, size, weight, col);
+}
+
+/* The turning arc of a tab that is loading, phase 0 to 1 of a turn, over a faint ring. */
+static void spinner(canvas_t *c, float x, float y, float size, float phase, uint32_t col) {
+    float cx = x + size / 2, cy = y + size / 2, r = size / 2 - 1.5f;
+    ui_round_stroke(c, cx - r - 1, cy - r - 1, 2 * r + 2, 2 * r + 2, r + 1, 2, with_alpha(col, 0.22f));
+    float a = phase * 6.2831853f, px = cx + cosf(a) * r, py = cy + sinf(a) * r;
+    for (int i = 1; i <= 10; i++) {
+        float b = a + 4.2f * (float)i / 10, qx = cx + cosf(b) * r, qy = cy + sinf(b) * r;
+        ui_line(c, px, py, qx, qy, 2, col);
+        px = qx;
+        py = qy;
+    }
+}
+/* where a spinner is: it turns a step every 33 ms (find_damage repaints its tab then) */
+static float spin_phase(uint64_t now) { return (float)(now / 33 % 30) / 30; }
+
+/* A button of a strip of tabs (its "+", its arrows): part of node n, hover eased under what. */
+static void glyph(struct uiwin *w, const struct node *n, char what, uint32_t part, const char *icon, float x, float y,
+                  bool enabled) {
+    const struct ui_theme *t = &ui_theme;
+    canvas_t *c = &w->win->c;
+    uint64_t id = part_id(n->id, part);
+    enabled = enabled && !n->disabled;
+    bool hot = enabled && w->hot == id, down = hot && w->pressed == id;
+    float h = animate(w, n, what, hot ? 1 : 0, 110), s = TAB_BUTTON;
+    if (h > 0) ui_round_fill(c, x, y, s, s, t->controlRadius, with_alpha(t->text, (down ? 0.16f : 0.09f) * h));
+    draw_icon(c, (struct str){icon, (uint32_t)strlen(icon)}, x + (s - 16) / 2, y + (s - 16) / 2, 16,
+              !enabled ? t->textFaint : hot ? t->text : t->textDim);
+}
+
+/* Where a tab drawn at tx, tw wide shows its close button (TAB_CLOSE square), if it shows one: the
+   chosen tab always, the others while they are wide enough; a narrow chosen tab shows nothing else. */
+static bool tab_close(const struct node *k, float tx, float tw, float *cx, float *cy) {
+    if (tw < 36 || (!(k->selected > 0) && tw < 100)) return false;
+    *cx = tw < 64 ? tx + (tw - TAB_CLOSE) / 2 : tx + tw - 10 - TAB_CLOSE;
+    *cy = k->y + (k->h - TAB_CLOSE) / 2;
+    return true;
+}
+
+/* A tab of strip s, where it is on its way to (or where the pointer holds it), if it is in seen. */
+static void paint_tab(struct uiwin *w, const struct node *s, struct node *k, const float *seen) {
+    const struct ui_theme *t = &ui_theme;
+    canvas_t *c = &w->win->c;
+    bool chosen = k->selected > 0;
+    float tx = w->dragging == k->id ? w->drag_draw : animate(w, k, 'x', k->x, 160), tw = animate(w, k, 'w', k->w, 160);
+    uint64_t close = part_id(k->id, PART_CLOSE);
+    bool hot = !k->disabled && (w->hot == k->id || w->hot == close);
+    float h = animate(w, k, 'h', hot ? 1 : 0, 110);
+    float cx = 0, cy = 0;
+    bool closes = tab_close(k, tx, tw, &cx, &cy);
+    float ch = closes ? animate(w, k, 'c', w->hot == close ? 1 : 0, 110) : 0;
+    if (tx > seen[2] || tx + tw < seen[0]) return;
+    float bx = tx + 2, by = k->y + 4, bw = tw - 4, bh = k->h - 8;
+    if (chosen) {
+        ui_round_shadow(c, bx, by + 1, bw, bh, t->controlRadius, 4, 0x38000000u);
+        ui_round_fill(c, bx, by, bw, bh, t->controlRadius, s->has & HAS_CHOSEN ? s->chosen : t->surfaceActive);
+    } else if (h > 0) {
+        uint32_t hover = s->has & HAS_HOVER ? s->hover : t->surfaceHover;
+        ui_round_fill(c, bx, by, bw, bh, t->controlRadius, with_alpha(hover, (float)(hover >> 24) / 255 * h));
+    }
+    uint32_t fg = k->disabled ? t->textFaint : chosen || hot ? t->text : t->textDim;
+    float iy = k->y + (k->h - 16) / 2, lh = ui_line_height(k->size, 0, NULL);
+    if (tw < 64) { /* the close button of the chosen tab, or the icon */
+        if (!closes && k->loading) spinner(c, tx + (tw - 16) / 2, iy, 16, spin_phase(w->now), t->accent);
+        else if (!closes && k->icon.n) draw_icon(c, k->icon, tx + (tw - 16) / 2, iy, 16, fg);
+    } else {
+        float lx = tx + 12;
+        if (k->loading) { spinner(c, lx, iy, 16, spin_phase(w->now), t->accent); lx += 24; }
+        else if (k->icon.n) { draw_icon(c, k->icon, lx, iy, 16, fg); lx += 24; }
+        float right = closes ? cx - 4 : tx + tw - 12;
+        text_fit(c, (struct str){k->text.p, first_line(k->text)}, roundf(lx), roundf(k->y + (k->h - lh) / 2), right - lx,
+                 k->size, 0, fg);
+    }
+    if (closes) {
+        bool down = w->hot == close && w->pressed == close;
+        if (ch > 0) ui_round_fill(c, cx, cy, TAB_CLOSE, TAB_CLOSE, TAB_CLOSE / 2, with_alpha(t->text, (down ? 0.2f : 0.12f) * ch));
+        draw_icon(c, (struct str){"close", 5}, cx + 4, cy + 4, TAB_CLOSE - 8, fg);
+    }
+}
+
+/* A strip of tabs: the chosen tab over the others, the one dragged over all; its arrows and "+". */
+static void paint_tabs(struct uiwin *w, struct node *n, const float *clip) {
+    canvas_t *c = &w->win->c;
+    if (n->has & HAS_BACKGROUND) ui_round_fill(c, n->x, n->y, n->w, n->h, n->radius, n->background);
+    float r = n->x + n->w - n->pad[1];
+    float seen[4] = {fmaxf(clip[0], n->area0), fmaxf(clip[1], n->y), fminf(clip[2], n->overflow ? n->area1 : r),
+                     fminf(clip[3], n->y + n->h)};
+    if (seen[0] < seen[2] && seen[1] < seen[3]) {
+        set_clip(c, seen);
+        struct node *chosen = NULL, *dragged = NULL;
+        for (uint32_t i = n->first; i; i = w->nodes[i].next) {
+            struct node *k = &w->nodes[i];
+            if (k->kind != K_TAB || !k->id) continue;
+            if (k->id == w->dragging) dragged = k;
+            else if (k->selected > 0 && !chosen) chosen = k;
+            else paint_tab(w, n, k, seen);
+        }
+        if (chosen) paint_tab(w, n, chosen, seen);
+        if (dragged) paint_tab(w, n, dragged, seen);
+        set_clip(c, clip);
+    }
+    float by = n->y + (n->h - TAB_BUTTON) / 2;
+    if (n->overflow) {
+        const struct state *st = state_find(w, n->id);
+        float scroll = st ? st->scroll : 0, max = n->tab_each * (float)n->ntabs - (n->area1 - n->area0);
+        glyph(w, n, '<', PART_LEFT, "chevron-left", n->area0 - TAB_ARROW, by, scroll > 0.5f);
+        glyph(w, n, '>', PART_RIGHT, "chevron-right", n->area1, by, scroll < max - 0.5f);
+    }
+    if (n->add) glyph(w, n, '+', PART_ADD, "plus", animate(w, n, 'p', n->plus_x, 160), by, true);
+}
+
+/* An item of a menu: lit while the pointer or the keys are on it or its submenu is open; its key on
+   the right, or the chevron of its submenu. */
+static void paint_menu_item(struct uiwin *w, struct node *n) {
+    const struct ui_theme *t = &ui_theme;
+    canvas_t *c = &w->win->c;
+    const struct node *m = &w->nodes[n->parent];
+    const struct state *ms = state_find(w, m->id);
+    bool lit = !n->disabled && ms && (ms->lit == n->id || ms->open == n->id);
+    float x = n->x, y = n->y, ww = n->w, hh = n->h, h = animate(w, n, 'h', lit ? 1 : 0, 80);
+    if (h > 0) ui_round_fill(c, x, y, ww, hh, t->controlRadius - 2, with_alpha(t->surfaceActive, h));
+    uint32_t fg = n->disabled ? t->textFaint : t->text, dim = n->disabled ? t->textFaint : t->textDim;
+    float lx = x + 12, right = x + ww - 12;
+    if (m->icons) {
+        if (n->icon.n) draw_icon(c, n->icon, lx, y + (hh - 18) / 2, 18, lit ? t->text : dim);
+        lx += 28;
+    }
+    if (n->menu) {
+        draw_icon(c, (struct str){"chevron-right", 13}, right - 16, y + (hh - 16) / 2, 16, dim);
+        right -= 24;
+    } else if (n->shortcut.n) {
+        float sw = measure(n->shortcut.p, n->shortcut.n, t->smallSize, 0), slh = ui_line_height(t->smallSize, 0, NULL);
+        ui_text(c, roundf(right - sw), roundf(y + (hh - slh) / 2), n->shortcut.p, n->shortcut.n, t->smallSize, 0, dim);
+        right -= sw + 24;
+    }
+    float lh = ui_line_height(t->fontSize, 0, NULL);
+    text_fit(c, (struct str){n->text.p, first_line(n->text)}, roundf(lx), roundf(y + (hh - lh) / 2), right - lx,
+             t->fontSize, 0, fg);
+}
+
 static void paint(struct uiwin *w, struct node *n, const float *clip) {
     const struct ui_theme *t = &ui_theme;
     canvas_t *c = &w->win->c;
@@ -1111,7 +1556,7 @@ static void paint(struct uiwin *w, struct node *n, const float *clip) {
     if (x > clip[2] || y > clip[3] || x + ww < clip[0] || y + hh < clip[1]) return;
     bool hot = w->hot == n->id, pressed = hot && w->pressed == n->id, disabled = n->disabled;
     switch (n->kind) {
-    case K_COLUMN: case K_ROW: case K_SCROLL: {
+    case K_COLUMN: case K_ROW: case K_SCROLL: case K_MENU: {
         float radius = n->radius;
         if (n->shadow) ui_round_shadow(c, x, y + 4, ww, hh, radius, 14, t->shadow);
         uint32_t bg = n->has & HAS_BACKGROUND ? n->background : 0;
@@ -1123,7 +1568,7 @@ static void paint(struct uiwin *w, struct node *n, const float *clip) {
         }
         if (bg >> 24) ui_round_fill(c, x, y, ww, hh, radius, bg);
         if (n->has & HAS_BORDER) ui_round_stroke(c, x, y, ww, hh, radius, 1, n->border);
-        if (n->kind == K_SCROLL) {
+        if (n->kind == K_SCROLL || n->kind == K_MENU) {
             float seen[4] = {fmaxf(clip[0], x), fmaxf(clip[1], y), fminf(clip[2], x + ww), fminf(clip[3], y + hh)};
             set_clip(c, seen);
             for (uint32_t k = n->first; k; k = w->nodes[k].next) paint(w, &w->nodes[k], seen);
@@ -1147,17 +1592,7 @@ static void paint(struct uiwin *w, struct node *n, const float *clip) {
             struct str s = {n->text.p, first_line(n->text)};
             float full = measure(s.p, s.n, n->size, n->weight), lx = x;
             if (full > ww + 0.5f) {
-                /* the longest start that fits with "…" after it */
-                float dots = measure("\xE2\x80\xA6", 3, n->size, n->weight), at = 0;
-                uint32_t cut = 0;
-                for (uint32_t i = 0; i < s.n;) {
-                    uint32_t j = next_char(s.p, s.n, i);
-                    at += measure(s.p + i, j - i, n->size, n->weight);
-                    if (at + dots > ww + 0.5f) break;
-                    cut = i = j;
-                }
-                ui_text(c, x, y, s.p, cut, n->size, n->weight, col);
-                ui_text(c, x + measure(s.p, cut, n->size, n->weight), y, "\xE2\x80\xA6", 3, n->size, n->weight, col);
+                text_fit(c, s, x, y, ww, n->size, n->weight, col);
                 return;
             }
             if (n->text_align == A_CENTER) lx = x + (ww - full) / 2;
@@ -1312,7 +1747,13 @@ static void paint(struct uiwin *w, struct node *n, const float *clip) {
         set_clip(c, clip);
         return;
     }
+    case K_TABS:
+        paint_tabs(w, n, clip);
+        return;
+    case K_TAB: /* painted by its strip */
+        return;
     case K_ITEM: {
+        if (in_menu(w, n)) { paint_menu_item(w, n); return; }
         bool selected = n->selected > 0;
         float h = animate(w, n, 'h', hot ? 1 : 0, 110), s = animate(w, n, 's', selected ? 1 : 0, 140);
         uint32_t bg = mixc(with_alpha(t->surfaceHover, 0.75f * h), t->surfaceActive, s);
@@ -1329,7 +1770,8 @@ static void paint(struct uiwin *w, struct node *n, const float *clip) {
         draw_icon(c, n->icon, x, y, fminf(ww, hh), n->has & HAS_COLOUR ? n->colour : t->textDim);
         return;
     case K_DIVIDER:
-        fill_rect(c, x, y, ww, hh, n->has & HAS_COLOUR ? n->colour : t->divider);
+        if (in_menu(w, n)) fill_rect(c, x, y + floorf(hh / 2), ww, 1, n->has & HAS_COLOUR ? n->colour : t->divider);
+        else fill_rect(c, x, y, ww, hh, n->has & HAS_COLOUR ? n->colour : t->divider);
         return;
     case K_CANVAS: {
         float seen[4] = {fmaxf(clip[0], x), fmaxf(clip[1], y), fminf(clip[2], x + ww), fminf(clip[3], y + hh)};
@@ -1361,11 +1803,52 @@ static bool inside(const struct node *n, float x, float y) {
            x < n->vis[2] && y < n->vis[3];
 }
 
+/* While menus are shown: the item of the topmost menu under the pointer, or that menu (with id 0) when
+   it is on no item, or nothing when it is outside them all. */
+static struct hit hit_menus(struct uiwin *w, float x, float y) {
+    for (uint32_t k = w->nmenus; k-- > 0;) {
+        uint32_t mi = w->menus[k];
+        struct node *m = &w->nodes[mi];
+        if (!inside(m, x, y)) continue;
+        for (uint32_t i = m->end; i-- > mi + 1;) {
+            struct node *n = &w->nodes[i];
+            if (n->parent != mi || n->kind != K_ITEM || !inside(n, x, y)) continue;
+            return n->disabled ? (struct hit){m, 0, -1} : (struct hit){n, n->id, -1};
+        }
+        return (struct hit){m, 0, -1};
+    }
+    return (struct hit){0};
+}
+
+/* The parts of a strip of tabs other than its tabs: its "+" and its arrows. */
+static struct hit tabs_part(struct uiwin *w, struct node *n, float x, float y) {
+    float by = n->y + (n->h - TAB_BUTTON) / 2;
+    if (n->add && x >= n->plus_x && x < n->plus_x + TAB_BUTTON && y >= by && y < by + TAB_BUTTON)
+        return (struct hit){n, part_id(n->id, PART_ADD), -1};
+    if (n->overflow && x >= n->area0 - TAB_ARROW && x < n->area0) return (struct hit){n, part_id(n->id, PART_LEFT), -1};
+    if (n->overflow && x >= n->area1 && x < n->area1 + TAB_ARROW) return (struct hit){n, part_id(n->id, PART_RIGHT), -1};
+    return (struct hit){0};
+}
+
 /* The widget under the pointer that takes input, and the option within it. */
 static struct hit hit_test(struct uiwin *w, float x, float y) {
+    if (w->nmenus) return hit_menus(w, x, y);
     for (uint32_t i = w->n; i-- > 0;) {
         struct node *n = &w->nodes[i];
-        if (!inside(n, x, y)) continue;
+        if (n->layer || !inside(n, x, y)) continue;
+        if (n->kind == K_TAB) {
+            if (w->nodes[n->parent].kind != K_TABS) continue;
+            if (n->disabled) return (struct hit){0};
+            float cx, cy;
+            if (tab_close(n, n->x, n->w, &cx, &cy) && x >= cx && x < cx + TAB_CLOSE && y >= cy && y < cy + TAB_CLOSE)
+                return (struct hit){n, part_id(n->id, PART_CLOSE), -1};
+            return (struct hit){n, n->id, -1};
+        }
+        if (n->kind == K_TABS) {
+            struct hit h = tabs_part(w, n, x, y);
+            if (h.n) return n->disabled ? (struct hit){0} : h;
+            continue;
+        }
         if (n->kind == K_SEGMENTED && n->nopts) {
             if (n->disabled) return (struct hit){0};
             for (uint32_t j = 0; j < n->nopts; j++) {
@@ -1377,6 +1860,18 @@ static struct hit hit_test(struct uiwin *w, float x, float y) {
         bool takes = n->kind == K_BUTTON || n->kind == K_TOGGLE || n->kind == K_CHECKBOX || n->kind == K_SLIDER ||
                      n->kind == K_FIELD || n->kind == K_ITEM || n->clickable || n->pointer;
         if (takes) return n->disabled ? (struct hit){0} : (struct hit){n, n->id, -1};
+    }
+    return (struct hit){0};
+}
+
+/* The node under the pointer that takes the right (2) or middle (4) button: one that asked for it
+   ("buttons"), or a tab for the middle one (which closes it). */
+static struct hit hit_button(struct uiwin *w, float x, float y, uint32_t button) {
+    for (uint32_t i = w->n; i-- > 0;) {
+        struct node *n = &w->nodes[i];
+        if (n->layer || !inside(n, x, y)) continue;
+        bool tab = n->kind == K_TAB && w->nodes[n->parent].kind == K_TABS;
+        if (n->buttons & button || (tab && button == 4)) return n->disabled ? (struct hit){0} : (struct hit){n, n->id, -1};
     }
     return (struct hit){0};
 }
@@ -1401,10 +1896,237 @@ static void slide(struct uiwin *w, struct node *n, float x, bool done) {
     emit(w, UI_EVENT_SLIDE, n, 0, done ? UI_DONE : 0, v, 0, NULL, 0);
 }
 
+static void layout(struct uiwin *w);
+
 static void end_drag(struct uiwin *w) {
     struct node *n = find(w, w->dragging);
+    if (n && n->kind == K_TAB) {
+        layout(w); /* where it goes, from where the pointer is now */
+        n = find(w, w->dragging);
+    }
     w->dragging = 0;
     if (n && n->kind == K_SLIDER) slide(w, n, w->px, true);
+    else if (n && n->kind == K_TAB) {
+        /* it eases from where it was let go to its place; there it stays until the app's next view */
+        const struct node *s = &w->nodes[n->parent];
+        anim_set(w, n, 'x', w->drag_draw);
+        if (w->drag_to != n->ord && w->drag_to < s->ntabs) {
+            w->moved = s->id;
+            w->moved_from = n->ord;
+            w->moved_to = w->drag_to;
+            w->moved_view = w->view;
+            emit(w, UI_EVENT_MOVE, n, 0, 0, n->ord, w->drag_to, NULL, 0);
+        }
+        w->dirty = true;
+    }
+}
+
+/* A dragged tab near an end of a strip that scrolls takes the strip along. */
+static void tab_drag_scroll(struct uiwin *w, struct node *k) {
+    struct node *s = &w->nodes[k->parent];
+    struct state *st = s->overflow ? state_of(w, s->id) : NULL;
+    float at = w->px - w->grab;
+    if (st && at < s->area0) st->scroll -= s->area0 - at;
+    else if (st && at + s->tab_each > s->area1) st->scroll += at + s->tab_each - s->area1;
+}
+
+/* -- menus: the pointer and the keys -- */
+/* The menu shown that n is in (the menu of a node, not a submenu). */
+static struct node *menu_top(struct uiwin *w, struct node *n) {
+    while ((n->layer > 1 || n->kind != K_MENU) && n->parent != (uint32_t)(n - w->nodes)) n = &w->nodes[n->parent];
+    return n;
+}
+
+/* Every menu shown asks to be closed (UI_EVENT_DISMISS); the app takes it out of its view. */
+static void dismiss_menus(struct uiwin *w, uint32_t mods, uint32_t flags) {
+    for (uint32_t k = 0; k < w->nmenus; k++) {
+        struct node *m = &w->nodes[w->menus[k]];
+        if (m->layer == 1) emit(w, UI_EVENT_DISMISS, m, mods, flags, 0, 0, NULL, 0);
+    }
+    w->menu_at = 0;
+}
+
+/* The next item of menu m that can be chosen after the one with id from (dir 1) or before it (-1),
+   round the ends; from none (0 or gone): the first or the last. */
+static struct node *menu_step(struct uiwin *w, struct node *m, uint64_t from, int dir) {
+    struct node *first = NULL, *last = NULL, *before = NULL, *cur = NULL, *after = NULL;
+    for (uint32_t c = m->first; c; c = w->nodes[c].next) {
+        struct node *k = &w->nodes[c];
+        if (k->kind != K_ITEM || k->disabled || !k->id) continue;
+        if (!first) first = k;
+        if (cur && !after) after = k;
+        if (!cur && k->id == from) { cur = k; before = last; }
+        last = k;
+    }
+    if (!cur) return dir > 0 ? first : last;
+    return dir > 0 ? (after ? after : first) : (before ? before : last);
+}
+
+/* Scrolls a menu taller than the window until item k is seen. */
+static void menu_reveal(struct uiwin *w, struct node *m, const struct node *k) {
+    struct state *st = state_of(w, m->id);
+    float top = m->y + m->pad[0], bottom = m->y + m->h - m->pad[2];
+    if (st && k->y < top) st->scroll -= top - k->y;
+    else if (st && k->y + k->h > bottom) st->scroll += k->y + k->h - bottom;
+}
+
+/* Opens the submenu of item k of menu m, with its first item lit when the keys opened it. */
+static void menu_open(struct uiwin *w, struct node *m, struct node *k, bool keys) {
+    struct state *st = state_of(w, m->id);
+    if (!st || !k->menu || k->disabled) return;
+    st->open = st->lit = k->id;
+    w->menu_at = 0;
+    layout(w); /* the submenu is placed: its items have their ids */
+    struct node *sub = &w->nodes[k->menu], *first = sub->id ? menu_step(w, sub, 0, 1) : NULL;
+    struct state *ss = keys && first ? state_of(w, sub->id) : NULL;
+    if (ss) ss->lit = first->id;
+    w->dirty = true;
+}
+
+/* Closes submenu sub, keeping its item lit. */
+static void menu_close(struct uiwin *w, struct node *sub) {
+    struct node *k = &w->nodes[sub->parent];
+    struct state *st = state_of(w, w->nodes[k->parent].id);
+    if (st) { st->open = 0; st->lit = k->id; }
+    w->menu_at = 0;
+    w->dirty = true;
+}
+
+/* Item k was chosen (button 0: by the keys): its click, then its menu asks to be closed. */
+static void menu_choose(struct uiwin *w, struct node *k, uint32_t button, uint32_t mods) {
+    float a = button ? w->px - k->x : 0, b = button ? w->py - k->y : 0;
+    emit(w, UI_EVENT_CLICK, k, mods, button << 8, a, b, NULL, 0);
+    emit(w, UI_EVENT_DISMISS, menu_top(w, k), mods, UI_DONE, 0, 0, NULL, 0);
+    w->menu_at = 0;
+}
+
+/* The pointer moved while menus are shown: the item under it is lit (in the others, the item of
+   their open submenu), and resting on an item opens its submenu, or closes the one its menu has
+   open, a moment later (so that the pointer can cross other items on its way to a submenu). */
+static void menu_hover(struct uiwin *w) {
+    struct hit h = hit_menus(w, w->px, w->py);
+    struct node *item = h.id ? h.n : NULL, *under = item ? &w->nodes[item->parent] : h.n;
+    for (uint32_t k = 0; k < w->nmenus; k++) {
+        struct node *m = &w->nodes[w->menus[k]];
+        struct state *st = state_of(w, m->id);
+        if (!st) continue;
+        uint64_t lit = m == under && item ? item->id : st->open;
+        if (st->lit != lit) { st->lit = lit; w->dirty = true; }
+    }
+    if (!under) { w->menu_at = 0; return; }
+    struct state *st = state_of(w, under->id);
+    uint64_t want = item && item->menu ? item->id : 0;
+    if (!st || st->open == want || (!item && st->open)) { w->menu_at = 0; return; }
+    if (w->menu_at && w->menu_wait == under->id && w->menu_item == want) return;
+    w->menu_wait = under->id;
+    w->menu_item = want;
+    w->menu_at = w->now + 200;
+}
+
+/* The moment of menu_hover has come. */
+static void menu_timer(struct uiwin *w) {
+    w->menu_at = 0;
+    struct node *m = find(w, w->menu_wait);
+    struct state *st = m && m->kind == K_MENU ? state_of(w, m->id) : NULL;
+    if (!st) return;
+    st->open = w->menu_item;
+    if (w->menu_item) st->lit = w->menu_item;
+    w->dirty = true;
+}
+
+static void menu_down(struct uiwin *w, const struct gui_event *e) {
+    struct hit h = hit_menus(w, w->px, w->py);
+    if (!h.n) { /* outside them all: they close, and the press goes no further */
+        w->menu_press = false;
+        w->pressed = 0;
+        dismiss_menus(w, e->mods, 0);
+        return;
+    }
+    w->menu_press = true;
+    w->pressed = h.id;
+    if (h.id && h.n->menu) menu_open(w, &w->nodes[h.n->parent], h.n, false);
+    else if (!h.id && h.n->kind == K_MENU && h.n->scroll_max > 0 && w->px >= h.n->x + h.n->w - 12) {
+        struct state *st = state_of(w, h.n->id); /* its scroll bar */
+        if (st) {
+            w->dragging = h.n->id;
+            st->drag_from = st->scroll;
+            st->drag_y = w->py;
+        }
+    }
+    w->dirty = true;
+}
+
+/* A button let go while menus are shown: on an item when the press began in a menu, it is chosen. */
+static void menu_up(struct uiwin *w, const struct gui_event *e, uint32_t gone) {
+    bool began = w->menu_press;
+    w->menu_press = false;
+    w->pressed = 0;
+    if (w->dragging) { w->dragging = 0; w->dirty = true; return; }
+    struct hit h = hit_menus(w, w->px, w->py);
+    if (began && h.id && !h.n->menu) menu_choose(w, h.n, gone & 1 ? 1 : gone & 2 ? 2 : 4, e->mods);
+    w->dirty = true;
+}
+
+/* A key pressed while menus are shown: the deepest menu takes the arrows, Home, End, Enter, Space and
+   Escape; false for the others (they go to the app, not to a field). */
+static bool menu_key(struct uiwin *w, const struct gui_event *e) {
+    struct node *m = &w->nodes[w->menus[w->nmenus - 1]];
+    struct state *st = state_of(w, m->id);
+    if (!st || e->mods & (NMOD_CTRL | NMOD_ALT)) return false;
+    struct node *cur = find(w, st->lit);
+    if (cur && (cur->parent != (uint32_t)(m - w->nodes) || cur->kind != K_ITEM)) cur = NULL;
+    switch (e->key) {
+    case NKEY_UP: case NKEY_DOWN: case NKEY_HOME: case NKEY_END: {
+        struct node *to = e->key == NKEY_HOME ? menu_step(w, m, 0, 1) : e->key == NKEY_END ? menu_step(w, m, 0, -1)
+                        : menu_step(w, m, cur ? cur->id : 0, e->key == NKEY_DOWN ? 1 : -1);
+        if (to) {
+            st->lit = to->id;
+            menu_reveal(w, m, to);
+        }
+        w->menu_at = 0;
+        break;
+    }
+    case NKEY_RIGHT:
+        if (cur && cur->menu) menu_open(w, m, cur, true);
+        break;
+    case NKEY_LEFT:
+        if (m->layer > 1) menu_close(w, m);
+        break;
+    case NKEY_ENTER: case ' ':
+        if (cur && cur->menu) menu_open(w, m, cur, true);
+        else if (cur) menu_choose(w, cur, 0, e->mods);
+        break;
+    case NKEY_ESC:
+        if (m->layer > 1) menu_close(w, m);
+        else dismiss_menus(w, e->mods, UI_CANCEL);
+        break;
+    default:
+        return false;
+    }
+    w->dirty = true;
+    return true;
+}
+
+/* A right or middle press (bits) on a node that takes it; its click comes when it is let go on it. */
+static void other_down(struct uiwin *w, uint32_t bits) {
+    for (uint32_t b = 2; b <= 4; b <<= 1) {
+        if (!(bits & b)) continue;
+        struct hit h = hit_button(w, w->px, w->py, b);
+        if (!h.n) continue;
+        w->pressed2 = h.id;
+        w->button2 = b;
+    }
+}
+
+static void other_up(struct uiwin *w, const struct gui_event *e, uint32_t bits) {
+    if (!w->pressed2 || !(bits & w->button2)) return;
+    uint32_t b = w->button2;
+    uint64_t id = w->pressed2;
+    w->pressed2 = 0;
+    struct hit h = hit_button(w, w->px, w->py, b);
+    if (!h.n || h.id != id) return;
+    if (b == 4 && h.n->kind == K_TAB) emit(w, UI_EVENT_DISMISS, h.n, e->mods, 0, h.n->ord, 0, NULL, 0);
+    else emit(w, UI_EVENT_CLICK, h.n, e->mods, b << 8, w->px - h.n->x, w->py - h.n->y, NULL, 0);
 }
 
 static size_t utf8_put(char *out, uint32_t cp) {
@@ -1531,7 +2253,11 @@ static void sync_focus(struct uiwin *w) {
             memmove(w->sent, w->sent + i + 1, w->nsent * sizeof *w->sent);
             return;
         }
-    if (!edit_take(w, n)) set_focus(w, NULL, false);
+    /* A selection over the whole old value (a field given the keyboard to be replaced, still
+       untouched) covers the whole new one; any other caret keeps its place. */
+    bool whole = (w->anchor == 0 && w->caret == w->edit_n) || (w->caret == 0 && w->anchor == w->edit_n);
+    if (!edit_take(w, n)) { set_focus(w, NULL, false); return; }
+    if (whole) { w->anchor = 0; w->caret = w->edit_n; }
 }
 
 /* Replaces the selection with text, puts the caret after it and tells the app the field's new value. */
@@ -1635,6 +2361,25 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
     case EV_MOUSE_MOVE: {
         w->px = (float)e->x;
         w->py = (float)e->y;
+        w->held = e->buttons;
+        if (w->pressed2 && !(e->buttons & w->button2)) w->pressed2 = 0; /* let go outside the window */
+        if (w->nmenus) { /* the menus have the pointer: no pointer events, hover or drags below them */
+            struct node *d = find(w, w->dragging);
+            if (d && d->kind == K_MENU && d->h > 0) {
+                struct state *st = state_of(w, d->id);
+                if (st) st->scroll = st->drag_from + (w->py - st->drag_y) * (d->h + d->scroll_max) / d->h;
+                w->dirty = true;
+            }
+            menu_hover(w);
+            sync_hot(w);
+            break;
+        }
+        struct node *pt = find(w, w->pressed);
+        if (!w->dragging && pt && pt->kind == K_TAB && pt->id == w->pressed && (e->buttons & 1) &&
+            fabsf(w->px - w->press_x) > 6) { /* a tab held and moved: it is dragged */
+            w->dragging = pt->id;
+            w->drag_draw = pt->x;
+        }
         struct node *held = find(w, w->pressed), *target = held && held->pointer ? held : NULL;
         if (!held) {
             struct hit h = hit_test(w, w->px, w->py);
@@ -1657,6 +2402,9 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
             struct state *st = state_of(w, n->id);
             if (st) st->scroll = st->drag_from + (w->py - st->drag_y) * (n->h + n->scroll_max) / n->h;
             w->dirty = true;
+        } else if (n && n->kind == K_TAB) {
+            tab_drag_scroll(w, n);
+            w->dirty = true;
         }
         sync_hot(w);
         break;
@@ -1664,6 +2412,13 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
     case EV_MOUSE_DOWN: {
         w->px = (float)e->x;
         w->py = (float)e->y;
+        uint32_t went = e->buttons & ~w->held; /* the button that went down */
+        if (!went) went = e->buttons;
+        w->held = e->buttons;
+        if (w->nmenus) {
+            menu_down(w, e);
+            break;
+        }
         struct node *held = find(w, w->pressed);
         struct hit h = held && held->pointer ? (struct hit){held, held->id, -1} : hit_test(w, w->px, w->py);
         if (h.n && h.n->pointer) {
@@ -1673,8 +2428,19 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
             pointer(w, h.n, UI_DOWN, e);
             break;
         }
-        if (!(e->buttons & 1)) break;
+        if (went & 6) other_down(w, went & 6);
+        if (!(went & 1)) break;
         w->pressed = h.id;
+        if (h.n && h.n->kind == K_TAB && h.id == h.n->id) {
+            /* chosen as it is pressed, and held to be dragged */
+            w->press_x = w->px;
+            w->grab = w->px - h.n->x;
+            if (!(h.n->selected > 0)) emit(w, UI_EVENT_CHOOSE, h.n, e->mods, 0, h.n->ord, 0, NULL, 0);
+        } else if (h.n && h.n->kind == K_TABS && h.id != part_id(h.n->id, PART_ADD)) {
+            struct state *st = state_of(w, h.n->id); /* an arrow: the strip scrolls */
+            float step = fmaxf(h.n->tab_each, (h.n->area1 - h.n->area0) / 2);
+            if (st) st->scroll += h.id == part_id(h.n->id, PART_LEFT) ? -step : step;
+        }
         if (h.n && h.n->kind == K_FIELD) {
             /* a click places the caret (Shift: extends the selection) and a drag selects; a field with
                "selectOnFocus" selects all of its text on the click that focuses it */
@@ -1707,6 +2473,14 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
     case EV_MOUSE_UP: {
         w->px = (float)e->x;
         w->py = (float)e->y;
+        uint32_t gone = w->held & ~e->buttons; /* the button let go */
+        if (!gone) gone = ~e->buttons & 7;
+        w->held = e->buttons;
+        if (w->nmenus) {
+            menu_up(w, e, gone);
+            sync_hot(w);
+            break;
+        }
         struct node *held = find(w, w->pressed);
         if (held && held->pointer) {
             pointer(w, held, UI_UP, e);
@@ -1714,6 +2488,8 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
             sync_hot(w);
             break;
         }
+        if (gone & 6) other_up(w, e, gone & 6);
+        if (!(gone & 1)) break;
         struct hit h = hit_test(w, w->px, w->py);
         uint64_t pressed = w->pressed;
         w->pressed = 0;
@@ -1725,8 +2501,12 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
                 if ((float)h.index != n->selected) emit(w, UI_EVENT_CHOOSE, n, e->mods, 0, h.index, 0, NULL, 0);
             } else if (n->kind == K_TOGGLE || n->kind == K_CHECKBOX) {
                 emit(w, UI_EVENT_TOGGLE, n, e->mods, 0, n->on ? 0 : 1, 0, NULL, 0);
+            } else if (n->kind == K_TAB) { /* chosen when pressed; its close button closes it */
+                if (h.id == part_id(n->id, PART_CLOSE)) emit(w, UI_EVENT_DISMISS, n, e->mods, 0, n->ord, 0, NULL, 0);
+            } else if (n->kind == K_TABS) {
+                if (h.id == part_id(n->id, PART_ADD)) emit(w, UI_EVENT_ADD, n, e->mods, 0, 0, 0, NULL, 0);
             } else if (n->kind != K_FIELD && n->kind != K_SLIDER) {
-                emit(w, UI_EVENT_CLICK, n, e->mods, 0, 0, 0, NULL, 0);
+                emit(w, UI_EVENT_CLICK, n, e->mods, 1u << 8, w->px - n->x, w->py - n->y, NULL, 0);
             }
         }
         sync_hot(w);
@@ -1734,6 +2514,14 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
         break;
     }
     case EV_WHEEL:
+        if (w->nmenus) { /* a menu under the pointer scrolls when it is taller than the window; nothing else does */
+            struct hit h = hit_menus(w, (float)e->x, (float)e->y);
+            struct node *m = h.n && h.n->kind != K_MENU ? &w->nodes[h.n->parent] : h.n;
+            struct state *st = m && m->scroll_max > 0 ? state_of(w, m->id) : NULL;
+            if (st) st->scroll += (float)e->wheel * 48;
+            w->dirty = true;
+            break;
+        }
         for (uint32_t i = w->n; i-- > 0;) {
             struct node *n = &w->nodes[i];
             if (!inside(n, (float)e->x, (float)e->y) || n->disabled) continue;
@@ -1752,6 +2540,11 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
                 if (st) st->scroll += (float)e->wheel * 48;
                 break;
             }
+            if (n->kind == K_TABS && n->overflow) { /* a notch: a tab along */
+                struct state *st = state_of(w, n->id);
+                if (st) st->scroll += (float)e->wheel * n->tab_each;
+                break;
+            }
         }
         w->dirty = true;
         break;
@@ -1760,15 +2553,18 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
         const char *name = key_name(e->key, buf);
         struct node *field = find(w, w->focus);
         bool field_on = field && field->kind == K_FIELD;
-        /* the keys a field takes are its own, presses and releases; the rest go to the app */
+        /* the keys a field takes are its own, presses and releases; while menus are shown, the keys
+           they take are theirs; the rest go to the app */
         uint32_t i = 0;
         while (i < w->nkeys && w->keys[i] != e->key) i++;
         if (e->pressed) {
-            if (field_on && field_key(w, field, e)) break;
+            if (w->nmenus) {
+                if (menu_key(w, e)) break;
+            } else if (field_on && field_key(w, field, e)) break;
             if (i == w->nkeys && w->nkeys < sizeof w->keys / sizeof *w->keys) w->keys[w->nkeys++] = e->key;
         } else if (i < w->nkeys) {
             w->keys[i] = w->keys[--w->nkeys];
-        } else if (field_on) {
+        } else if (field_on || w->nmenus) {
             break;
         }
         emit(w, UI_EVENT_KEY, NULL, e->mods, e->pressed ? 0 : UI_UP, e->key, 0, name, strlen(name));
@@ -1779,8 +2575,12 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
         break;
     case EV_UNFOCUS: {
         emit(w, UI_EVENT_FOCUS, NULL, 0, 0, 0, 0, NULL, 0);
+        if (w->nmenus) dismiss_menus(w, 0, 0); /* menus close with the window's keyboard */
         w->nkeys = 0;
         w->selecting = false;
+        w->held = 0;
+        w->pressed2 = 0;
+        w->menu_press = false;
         if (w->dragging) end_drag(w);
         struct node *held = find(w, w->pressed);
         if (held && held->pointer) emit(w, UI_EVENT_POINTER, held, 0, UI_UP, w->px - held->x, w->py - held->y, NULL, 0);
@@ -1842,11 +2642,15 @@ static bool requests(struct uiwin *w, struct node *n, struct node *scroll) {
 
 /* Gives every node its box and identity, then acts on what the view asked for. */
 static void layout(struct uiwin *w) {
-    if (!w->n || !w->win) return;
+    if (!w->n || !w->win) { w->nmenus = 0; return; }
     float clip[4] = {0, 0, (float)w->win->w, (float)w->win->h};
     place(w, &w->nodes[0], 0, 0, clip[2], clip[3], 0x726F6F74, 0, clip);
+    place_menus(w);
     sync_focus(w);
-    if (requests(w, &w->nodes[0], NULL)) place(w, &w->nodes[0], 0, 0, clip[2], clip[3], 0x726F6F74, 0, clip);
+    if (requests(w, &w->nodes[0], NULL)) {
+        place(w, &w->nodes[0], 0, 0, clip[2], clip[3], 0x726F6F74, 0, clip);
+        place_menus(w);
+    }
 }
 
 /* -- what changed --
@@ -1864,13 +2668,6 @@ static uint64_t mix_float(uint64_t h, float f) {
     return mix(h, u);
 }
 static uint64_t mix_str(uint64_t h, struct str s) { return mix(h, hash_bytes(s.p, s.n)); }
-
-static const struct state *state_find(const struct uiwin *w, uint64_t id) {
-    if (!w->capstates) return NULL;
-    uint32_t j = (uint32_t)id & (w->capstates - 1);
-    while (w->states[j].id && w->states[j].id != id) j = (j + 1) & (w->capstates - 1);
-    return w->states[j].id ? &w->states[j] : NULL;
-}
 
 static struct shown *shown_slot(struct shown *t, uint32_t cap, uint64_t id) {
     uint32_t j = (uint32_t)id & (cap - 1);
@@ -1901,6 +2698,23 @@ static uint64_t node_sig(struct uiwin *w, const struct node *n) {
         const struct surface *sf = surface_of(w->s, n->surface);
         h = mix(h, sf ? (uint64_t)(uintptr_t)sf->c.px ^ (uint64_t)sf->c.w << 32 ^ (uint64_t)sf->c.h : 0);
     }
+    h = mix_str(h, n->shortcut);
+    if (n->kind == K_TABS) { /* where its parts are, and the pointer on them */
+        const float parts[] = {n->area0, n->area1, n->tab_each, n->plus_x, (float)n->overflow};
+        h = mix(h, hash_bytes(parts, sizeof parts));
+        for (uint32_t p = PART_ADD; p <= PART_RIGHT; p++)
+            h = mix(h, (uint64_t)(w->hot == part_id(n->id, p)) | (uint64_t)(w->pressed == part_id(n->id, p)) << 1);
+    }
+    if (n->kind == K_TAB) { /* (the turns of its spinner are damage of its own: find_damage) */
+        uint64_t close = part_id(n->id, PART_CLOSE);
+        h = mix(h, (uint64_t)(w->hot == close) | (uint64_t)(w->pressed == close) << 1);
+    }
+    if (n->kind == K_ITEM && in_menu(w, n)) { /* lit in its menu, and how its menu sets its items */
+        const struct node *m = &w->nodes[n->parent];
+        const struct state *ms = state_find(w, m->id);
+        h = mix(h, ms ? (uint64_t)(ms->lit == n->id) | (uint64_t)(ms->open == n->id) << 1 : 0);
+        h = mix(h, (uint64_t)m->icons << 1 | (n->menu != 0));
+    }
     return h;
 }
 
@@ -1919,15 +2733,30 @@ static bool find_damage(struct uiwin *w) {
     }
     /* a margin for what a node paints around its box: shadows, anti-aliased edges */
     const float m = 20;
+    float *d = w->damage;
+    /* a step of the spinners (spin_phase) since the last picture: the tabs loading are painted again */
+    uint64_t step = w->now / 33;
+    bool turn = step != w->spin_step;
+    w->spin_step = step;
+    w->spin = false;
     for (uint32_t i = 0; i < w->n; i++) {
         const struct node *n = &w->nodes[i];
+        if (!n->id) continue; /* not placed (a submenu not open, a tab without its strip): not shown */
         struct shown *e = shown_slot(t, cap, n->id);
         e->id = n->id;
         e->sig = mix(e->sig, node_sig(w, n));
-        e->box[0] = fmaxf(n->x - m, n->vis[0]);
-        e->box[1] = fmaxf(n->y - m, n->vis[1]);
-        e->box[2] = fminf(n->x + n->w + m, n->vis[2]);
-        e->box[3] = fminf(n->y + n->h + m, n->vis[3]);
+        /* a tab is drawn anywhere along its strip on its way to its place */
+        const struct node *b = n->kind == K_TAB ? &w->nodes[n->parent] : n;
+        e->box[0] = fmaxf(b->x - m, b->vis[0]);
+        e->box[1] = fmaxf(b->y - m, b->vis[1]);
+        e->box[2] = fminf(b->x + b->w + m, b->vis[2]);
+        e->box[3] = fminf(b->y + b->h + m, b->vis[3]);
+        if (n->kind == K_TAB && n->loading && n->vis[0] < n->vis[2] && n->x < n->vis[2] && n->x + n->w > n->vis[0]) {
+            w->spin = true;
+            if (turn)
+                add_damage(d, fmaxf(n->x, n->vis[0]), fmaxf(n->y, n->vis[1]), fminf(n->x + n->w, n->vis[2]),
+                           fminf(n->y + n->h, n->vis[3]));
+        }
     }
     for (uint32_t i = 0; i < w->capanims; i++) {
         struct anim *a = &w->anims[i];
@@ -1938,7 +2767,6 @@ static bool find_damage(struct uiwin *w) {
         if (a->from != a->to && (float)(w->now - a->start) < a->ms) w->animating = true;
         a->seen = true;
     }
-    float *d = w->damage;
     for (uint32_t i = 0; i < cap; i++) {
         const struct shown *e = &t[i];
         if (!e->id) continue;
@@ -1955,6 +2783,28 @@ static bool find_damage(struct uiwin *w) {
     w->shown = t;
     w->capshown = cap;
     return true;
+}
+
+/* When the window needs its next picture (0: when something changes). */
+static uint64_t next_picture(const struct uiwin *w) {
+    if (w->hold) return w->now + 100;
+    if (w->animating) return w->now + 16;
+    if (w->spin) return w->now + 33 - w->now % 33; /* the next step of a spinner */
+    return 0;
+}
+
+/* The menus over the window, in the part clip; the deep plane under them is 8-bit content too. */
+static void paint_menus(struct uiwin *w, const float *clip) {
+    canvas_t *c = &w->win->c;
+    for (uint32_t k = 0; k < w->nmenus; k++) {
+        struct node *m = &w->nodes[w->menus[k]];
+        if (w->deep) {
+            int x0 = (int)fmaxf(floorf(m->x - 20), clip[0]), y0 = (int)fmaxf(floorf(m->y - 20), clip[1]);
+            int x1 = (int)fminf(ceilf(m->x + m->w + 20), clip[2]), y1 = (int)fminf(ceilf(m->y + m->h + 20), clip[3]);
+            for (int y = y0; y < y1 && x0 < x1; y++) memset(w->deep + (size_t)y * (size_t)c->w + x0, 0, (size_t)(x1 - x0));
+        }
+        paint(w, m, clip);
+    }
 }
 
 static void render(struct uiwin *w) {
@@ -1980,7 +2830,7 @@ static void render(struct uiwin *w) {
     if (!whole) {
         if (d[0] >= d[2]) { /* nothing to paint */
             prune_anims(w);
-            w->redraw_at = w->animating ? w->now + 16 : 0;
+            w->redraw_at = next_picture(w);
             sync_hot(w);
             return;
         }
@@ -1996,7 +2846,10 @@ static void render(struct uiwin *w) {
         for (int y = y0; y < y1; y++) memset(w->deep + (size_t)y * (size_t)c->w + x0, 0, (size_t)(x1 - x0));
     set_clip(c, clip);
     gfx_fill(c, x0, y0, x1 - x0, y1 - y0, w->background);
-    if (w->n) paint(w, &w->nodes[0], clip);
+    if (w->n) {
+        paint(w, &w->nodes[0], clip);
+        paint_menus(w, clip);
+    }
     prune_anims(w);
     gfx_noclip(c);
     /* a canvas that asked for its size is shown when the app has drawn it again (or does not answer);
@@ -2004,7 +2857,7 @@ static void render(struct uiwin *w) {
     if (w->hold) w->shown_px = NULL;
     else if (whole) win_update(w->win);
     else win_update_rect(w->win, x0, y0, x1 - x0, y1 - y0);
-    w->redraw_at = w->hold ? w->now + 100 : w->animating ? w->now + 16 : 0;
+    w->redraw_at = next_picture(w);
     sync_hot(w);
 }
 
@@ -2185,6 +3038,10 @@ static bool show_surface(struct uiwin *w, const struct node *n, const struct sur
     y0 = (int)fmaxf(fmaxf((float)y0, n->vis[1]), 0);
     x1 = (int)fminf(fminf((float)x1, n->vis[2]), (float)w->win->w);
     y1 = (int)fminf(fminf((float)y1, n->vis[3]), (float)w->win->h);
+    for (uint32_t k = 0; k < w->nmenus; k++) { /* a menu over it (or its shadow): painted again, menu on top */
+        const struct node *m = &w->nodes[w->menus[k]];
+        if (x0 < m->x + m->w + 20 && x1 > m->x - 20 && y0 < m->y + m->h + 20 && y1 > m->y - 20) return false;
+    }
     w->deep = win_deep(w->win);
     copy_surface(w, sf, sx, sy, x0, y0, x1, y1);
     if (x1 > x0 && y1 > y0) win_update_rect(w->win, x0, y0, x1 - x0, y1 - y0);
@@ -2364,6 +3221,10 @@ int ui_session_timeout(struct ui_session *s) {
                 int64_t c = w->caret_at > now ? (int64_t)(w->caret_at - now) : 0;
                 if (t < 0 || c < t) t = c;
             }
+            if (w->menu_at) {
+                int64_t m = w->menu_at > now ? (int64_t)(w->menu_at - now) : 0;
+                if (t < 0 || m < t) t = m;
+            }
         }
         if (t >= 0 && (best < 0 || t < best)) best = t;
     }
@@ -2390,6 +3251,7 @@ void ui_session_pump(struct ui_session *s) {
             w->caret_at = now + 530;
             w->dirty = true;
         }
+        if (w->menu_at && now >= w->menu_at) menu_timer(w);
         if (w->redraw_at && now >= w->redraw_at) w->dirty = true;
         if (w->dirty) render(w);
     }

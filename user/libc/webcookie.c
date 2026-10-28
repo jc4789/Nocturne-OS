@@ -1,35 +1,57 @@
 /* Cookie policy follows RFC 6265bis section 5 (HTTPWG, September 2026).
-   Restrictive choices: 256 cookies / 64 per domain, 256 KiB snapshot, 400-day
-   lifetime, no Lax-allowing-unsafe grace, no partitioned-cookie emulation.
-   URLs must already use ASCII/A-label hosts, as Nocturne's HTTP worker does. */
+   Limits: WEBCOOKIE_DOMAIN_MAX per domain field and WEBCOOKIE_TOTAL_MAX in all (webcookie.h), a
+   400-day lifetime; no Lax-allowing-unsafe grace, no partitioned-cookie emulation.
+   URLs must already use ASCII/A-label hosts, as Nocturne's HTTP worker does.
+
+   The window process's jar tracks its changes for the saved store (webnet.c keeps the document):
+   every set or removal of a cookie the store would hold, and every clear, goes into an ordered
+   list of changes, one entry per cookie (the later replaces the earlier), until webcookie_saved.
+   Merging a store another process wrote (webcookie_load) takes the store's cookies, applies that
+   list on top, and keeps the jar's own session cookies, so neither process loses the other's
+   writes. A cookie's saved flag says the store or the list holds it. */
 #include "webcookie.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
-#define COOKIE_MAX 256
 #define DOMAIN_MAX 253
 #define COOKIE_PATH_MAX 1024
 #define COOKIE_DAYS (400LL * 86400LL)
 #define RECORD_SIZE 40u
 #define SNAP_HEADER 24u
+#define STORE_HEADER 48u
 #define NEVER INT64_MAX
+_Static_assert(RECORD_SIZE + 4096u + DOMAIN_MAX + COOKIE_PATH_MAX == WEBCOOKIE_RECORD_MAX, "record bound");
+_Static_assert(WEBCOOKIE_TOTAL_MAX <= 0xffffu, "snapshot count is 16 bits");
 enum { S_LAX, S_STRICT, S_NONE };
 enum { F_HOST = 1, F_SECURE = 2, F_HTTP = 4, F_PERSIST = 8 };
 struct cookie {
     char *name, *value, *domain, *path;
     uint16_t nl, vl, dl, pl;
     unsigned flags, same;
+    bool saved, doomed;
     int64_t expires;
     uint64_t created, access;
     char data[];
 };
+enum { CHANGE_SET, CHANGE_DELETE, CHANGE_CLEAR };
+/* SET: an owned copy of the cookie. DELETE: an owned copy giving the key. CLEAR: site ("" all). */
+struct change { unsigned kind; struct cookie *cookie; char site[DOMAIN_MAX + 1]; };
+struct clear { uint64_t serial; char site[DOMAIN_MAX + 1]; };
 struct webcookie_jar {
-    struct cookie *cookies[COOKIE_MAX];
-    size_t count, bytes;
+    struct cookie **cookies;
+    size_t count, cap, bytes;
     uint64_t serial;
     char *psl_text, **rules;
     size_t rule_count;
+    webcookie_rule rule;
+    void *rule_opaque;
+    bool tracking, overflow; /* overflow: a change could not be listed; every kept cookie is one */
+    struct change *changes;
+    size_t change_count, change_cap;
+    struct clear *clears; /* the store's, oldest first */
+    size_t clear_count;
+    uint64_t clear_top, clear_seen;
 };
 struct address { char host[DOMAIN_MAX + 1]; const char *path; size_t path_len; bool secure, ip; };
 
@@ -103,13 +125,20 @@ static unsigned suffix_labels(const webcookie_jar *j, const char *host) {
     }
     return best;
 }
-static const char *site_host(const webcookie_jar *j, const struct address *a) {
-    if (!j || !j->rule_count || a->ip) return a->host;
-    unsigned total = labels(a->host), suffix = suffix_labels(j, a->host);
-    if (total <= suffix) return a->host;
-    const char *p = a->host;
+const char *webcookie_site_of(const webcookie_jar *j, const char *host) {
+    if (!host) return host;
+    size_t n = strlen(host);
+    bool ip = true;
+    for (const char *p = host; *p; p++) if (!digit((unsigned char)*p) && *p != '.') ip = false;
+    if (!j || !j->rule_count || ip || !n || n > DOMAIN_MAX) return host;
+    unsigned total = labels(host), suffix = suffix_labels(j, host);
+    if (total <= suffix) return host;
+    const char *p = host;
     for (unsigned i = total; i > suffix + 1; i--) p = strchr(p, '.') + 1;
     return p;
+}
+static const char *site_host(const webcookie_jar *j, const struct address *a) {
+    return a->ip ? a->host : webcookie_site_of(j, a->host);
 }
 bool webcookie_same_site(const webcookie_jar *j, const char *x, const char *y) {
     struct address a, b;
@@ -118,12 +147,41 @@ bool webcookie_same_site(const webcookie_jar *j, const char *x, const char *y) {
 static bool same_context(const webcookie_jar *j, const struct webcookie_context *c) {
     return !c->redirect_cross_site && (c->site_url ? webcookie_same_site(j, c->url, c->site_url) : c->http && c->top_level);
 }
+static unsigned policy(const webcookie_jar *j, const char *host) {
+    return j->rule ? j->rule(j->rule_opaque, host) : WEBCOOKIE_ALLOW;
+}
+/* Whether the store holds c: persistent, of a host the rule keeps. */
+static bool kept(const webcookie_jar *j, const struct cookie *c) {
+    return (c->flags & F_PERSIST) && !(policy(j, c->domain) & WEBCOOKIE_TRANSIENT);
+}
+/* A creation or access time: the UTC second in the high bits, so that jars of different
+   processes order their cookies alike, and a count within the second. */
+static uint64_t stamp(webcookie_jar *j, int64_t now) {
+    uint64_t base = now > 0 && now < (INT64_C(1) << 43) ? (uint64_t)now << 20 : 0;
+    j->serial = j->serial + 1 > base ? j->serial + 1 : base;
+    return j->serial;
+}
+static bool reserve(struct cookie ***list, size_t *cap, size_t need) {
+    if (need <= *cap) return true;
+    size_t n = *cap ? *cap : 16;
+    while (n < need) { if (n > SIZE_MAX / 2 / sizeof **list) return false; n *= 2; }
+    struct cookie **grown = realloc(*list, n * sizeof *grown);
+    if (!grown) return false;
+    *list = grown; *cap = n; return true;
+}
 webcookie_jar *webcookie_create(void) { return calloc(1, sizeof(webcookie_jar)); }
+static void changes_free(webcookie_jar *j) {
+    for (size_t i = 0; i < j->change_count; i++) free(j->changes[i].cookie);
+    free(j->changes); j->changes = NULL; j->change_count = j->change_cap = 0;
+}
 void webcookie_free(webcookie_jar *j) {
     if (!j) return;
     for (size_t i = 0; i < j->count; i++) free(j->cookies[i]);
-    free(j->rules); free(j->psl_text); free(j);
+    changes_free(j);
+    free(j->cookies); free(j->clears); free(j->rules); free(j->psl_text); free(j);
 }
+void webcookie_set_rule(webcookie_jar *j, webcookie_rule r, void *opaque) { if (j) { j->rule = r; j->rule_opaque = opaque; } }
+void webcookie_track(webcookie_jar *j) { if (j) j->tracking = true; }
 bool webcookie_psl_load(webcookie_jar *j, const char *text, size_t len) {
     if (!j || !text || !len || len > WEBCOOKIE_PSL_MAX || memchr(text, 0, len)) return false;
     char *copy = malloc(len+1); char **rules = malloc(20000 * sizeof *rules);
@@ -216,9 +274,120 @@ static struct cookie *make_cookie(const char *name, const char *value, const cha
     for (int i=0;i<4;i++) { *fields[i]=dst; memcpy(dst,src[i],sizes[i]+1); dst+=sizes[i]+1; }
     c->nl=sizes[0]; c->vl=sizes[1]; c->dl=sizes[2]; c->pl=sizes[3]; return c;
 }
+static struct cookie *copy_cookie(const struct cookie *from) {
+    struct cookie *c = make_cookie(from->name, from->value, from->domain, from->path);
+    if (!c) return NULL;
+    c->flags = from->flags; c->same = from->same; c->expires = from->expires;
+    c->created = from->created; c->access = from->access;
+    return c;
+}
+
+/* The identity of a cookie (RFC 6265bis §5.7 step 23): name, domain, path, host-only. */
+static bool same_key(const struct cookie *a, const struct cookie *b) {
+    return a->nl == b->nl && a->dl == b->dl && a->pl == b->pl && !((a->flags ^ b->flags) & F_HOST) &&
+           !memcmp(a->name, b->name, a->nl) && !memcmp(a->domain, b->domain, a->dl) && !memcmp(a->path, b->path, a->pl);
+}
+static uint64_t key_hash(const struct cookie *c) {
+    uint64_t h = UINT64_C(1469598103934665603) ^ (c->flags & F_HOST);
+    const char *parts[3] = {c->name, c->domain, c->path};
+    size_t sizes[3] = {c->nl, c->dl, c->pl};
+    for (int k = 0; k < 3; k++) {
+        for (size_t i = 0; i < sizes[k]; i++) { h ^= (unsigned char)parts[k][i]; h *= UINT64_C(1099511628211); }
+        h ^= 0x100; h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+/* Positions of a list's cookies by key: a slot holds 0 (empty), TOMB, or the position + 1. It is
+   made for at most limit insertions, so a probe always ends at an empty slot. */
+#define TOMB SIZE_MAX
+struct index { size_t *slots, mask; };
+static bool index_make(struct index *x, size_t limit) {
+    size_t size = 16;
+    while (size < limit * 2 + 2) { if (size > SIZE_MAX / 4 / sizeof *x->slots) return false; size *= 2; }
+    x->slots = calloc(size, sizeof *x->slots); x->mask = size - 1;
+    return x->slots != NULL;
+}
+/* The slot holding c's key, or the one to put it in; *found says which. */
+static size_t *index_slot(const struct index *x, struct cookie *const *list, const struct cookie *c, bool *found) {
+    size_t *tomb = NULL;
+    for (size_t i = (size_t)key_hash(c) & x->mask;; i = (i + 1) & x->mask) {
+        size_t *s = &x->slots[i];
+        if (!*s) { *found = false; return tomb ? tomb : s; }
+        if (*s == TOMB) { if (!tomb) tomb = s; continue; }
+        if (same_key(list[*s - 1], c)) { *found = true; return s; }
+    }
+}
+
+/* The list of changes (tracking jars only). Each cookie's latest change replaces its earlier one
+   wherever that was: applied in order, the result is the same. */
+static void change_drop(webcookie_jar *j, size_t i) {
+    free(j->changes[i].cookie);
+    memmove(j->changes + i, j->changes + i + 1, (j->change_count - i - 1) * sizeof *j->changes);
+    j->change_count--;
+}
+static struct change *change_add(webcookie_jar *j) {
+    if (j->change_count == j->change_cap) {
+        size_t n = j->change_cap ? j->change_cap * 2 : 16;
+        struct change *grown = n <= SIZE_MAX / sizeof *grown ? realloc(j->changes, n * sizeof *grown) : NULL;
+        if (!grown) { j->overflow = true; return NULL; }
+        j->changes = grown; j->change_cap = n;
+    }
+    struct change *ch = &j->changes[j->change_count++];
+    memset(ch, 0, sizeof *ch);
+    return ch;
+}
+static void note(webcookie_jar *j, unsigned kind, const struct cookie *c) {
+    if (!j->tracking) return;
+    for (size_t i = 0; i < j->change_count;)
+        if (j->changes[i].kind != CHANGE_CLEAR && same_key(j->changes[i].cookie, c)) change_drop(j, i);
+        else i++;
+    struct cookie *copy = copy_cookie(c);
+    if (!copy) { j->overflow = true; return; }
+    struct change *ch = change_add(j);
+    if (!ch) { free(copy); return; }
+    ch->kind = kind; ch->cookie = copy;
+}
+static void note_clear(webcookie_jar *j, const char *site) {
+    if (!j->tracking) return;
+    for (size_t i = 0; i < j->change_count;) {
+        const struct change *ch = &j->changes[i];
+        bool covered = !*site || (ch->kind == CHANGE_CLEAR ? *ch->site && domain_match(ch->site, site) : domain_match(ch->cookie->domain, site));
+        if (covered) change_drop(j, i); else i++;
+    }
+    struct change *ch = change_add(j);
+    if (ch) { ch->kind = CHANGE_CLEAR; strcpy(ch->site, site); }
+}
+/* A cookie leaves the jar: the store forgets it too. */
+static void forget(webcookie_jar *j, const struct cookie *c) { if (c->saved) note(j, CHANGE_DELETE, c); }
+static void evict(webcookie_jar *j, size_t i) { forget(j, j->cookies[i]); remove_cookie(j, i); }
+/* §5.7: before c joins, a domain field at its bound loses its least recently used non-Secure
+   cookie (then Secure), and a full jar its least recently used. */
+static void make_room(webcookie_jar *j, const struct cookie *c) {
+    size_t same = 0;
+    for (size_t i = 0; i < j->count; i++) same += !strcmp(j->cookies[i]->domain, c->domain);
+    while (same >= WEBCOOKIE_DOMAIN_MAX) {
+        size_t victim = j->count;
+        for (size_t i = 0; i < j->count; i++) {
+            const struct cookie *x = j->cookies[i];
+            if (strcmp(x->domain, c->domain)) continue;
+            if (victim == j->count) { victim = i; continue; }
+            const struct cookie *v = j->cookies[victim];
+            bool xs = x->flags & F_SECURE, vs = v->flags & F_SECURE;
+            if ((vs && !xs) || (xs == vs && x->access < v->access)) victim = i;
+        }
+        if (victim == j->count) break;
+        evict(j, victim); same--;
+    }
+    while (j->count >= WEBCOOKIE_TOTAL_MAX) {
+        size_t victim = 0;
+        for (size_t i = 1; i < j->count; i++) if (j->cookies[i]->access < j->cookies[victim]->access) victim = i;
+        evict(j, victim);
+    }
+}
 int webcookie_set(webcookie_jar *j, const struct webcookie_context *ctx, const char *input, size_t len, int64_t now) {
     if (!j || !ctx || !input || now < 0 || now > NEVER-COOKIE_DAYS || len > WEBCOOKIE_FIELD_MAX) return -1;
     struct address a; if (!address(ctx->url,&a)) return 0;
+    if (policy(j, a.host) & WEBCOOKIE_BLOCK) return 0; /* the user's choice (§5.3, §7.2) */
     if (memchr(input,0,len) || !clean(input,len)) return 0;
     char *copy=malloc(len+1); if (!copy) return -1; memcpy(copy,input,len); copy[len]=0;
     char *attrs=strchr(copy,';'); if (attrs) *attrs++=0;
@@ -276,24 +445,16 @@ int webcookie_set(webcookie_jar *j, const struct webcookie_context *ctx, const c
     if (bad) { free(copy); return 0; }
     if (age) { expires=age_time; persistent=true; }
     if (persistent && expires>now+COOKIE_DAYS) expires=now+COOKIE_DAYS;
-    if (expires<=now) { if (old<j->count) remove_cookie(j,old); free(copy); return 1; }
+    if (expires<=now) { if (old<j->count) evict(j,old); free(copy); return 1; }
     struct cookie *c=make_cookie(name,value,domain,path); free(copy); if (!c) return -1;
     c->flags=(host_only?F_HOST:0)|(secure?F_SECURE:0)|(http_only?F_HTTP:0)|(persistent?F_PERSIST:0); c->same=same; c->expires=expires;
-    c->created=old<j->count ? j->cookies[old]->created : ++j->serial; c->access=++j->serial;
+    c->created=old<j->count ? j->cookies[old]->created : stamp(j,now); c->access=stamp(j,now);
+    bool was_saved = old<j->count && j->cookies[old]->saved;
     if (old<j->count) remove_cookie(j,old);
-    size_t domain_count=0; for (size_t i=0;i<j->count;i++) domain_count+=!strcmp(j->cookies[i]->domain,c->domain);
-    while (domain_count>=64 || j->count>=COOKIE_MAX || j->bytes+record_bytes(c)+SNAP_HEADER>WEBCOOKIE_SNAPSHOT_MAX) {
-        size_t victim=j->count;
-        for (size_t i=0;i<j->count;i++) {
-            struct cookie *candidate=j->cookies[i];
-            if (domain_count>=64 && strcmp(candidate->domain,c->domain)) continue;
-            if (victim==j->count || ((j->cookies[victim]->flags&F_SECURE) && !(candidate->flags&F_SECURE)) ||
-                (!!(candidate->flags&F_SECURE)==!!(j->cookies[victim]->flags&F_SECURE) && candidate->access<j->cookies[victim]->access)) victim=i;
-        }
-        if (victim==j->count) { free(c); return -1; }
-        if (!strcmp(j->cookies[victim]->domain,c->domain)) domain_count--;
-        remove_cookie(j,victim);
-    }
+    make_room(j,c);
+    if (!reserve(&j->cookies,&j->cap,j->count+1)) { if (was_saved) note(j,CHANGE_DELETE,c); free(c); return -1; }
+    if (j->tracking && kept(j,c)) { c->saved=true; note(j,CHANGE_SET,c); }
+    else if (was_saved) note(j,CHANGE_DELETE,c);
     j->cookies[j->count++]=c; j->bytes+=record_bytes(c); return 1;
 }
 static int send_order(const void *a,const void *b) {
@@ -304,7 +465,11 @@ static int send_order(const void *a,const void *b) {
 long webcookie_get(webcookie_jar *j,const struct webcookie_context *ctx,char *out,size_t cap,int64_t now) {
     if (out && cap) out[0]=0;
     struct address a; if (!j || !ctx || (out&&!cap) || !address(ctx->url,&a)) return -1;
-    purge(j,now); struct cookie *list[COOKIE_MAX]; size_t count=0,len=0;
+    purge(j,now);
+    if (policy(j,a.host) & WEBCOOKIE_BLOCK) return 0; /* §5.8.1: the field is omitted */
+    struct cookie **list=j->count?malloc(j->count*sizeof *list):NULL;
+    if (j->count && !list) return -1;
+    size_t count=0,len=0;
     bool same=same_context(j,ctx);
     const char *method=ctx->method?ctx->method:"GET";
     bool safe=!strcmp(method,"GET")||!strcmp(method,"HEAD")||!strcmp(method,"OPTIONS")||!strcmp(method,"TRACE");
@@ -315,51 +480,298 @@ long webcookie_get(webcookie_jar *j,const struct webcookie_context *ctx,char *ou
         if (!same && c->same!=S_NONE && !(c->same==S_LAX && ctx->http && ctx->top_level && safe)) continue;
         list[count++]=c; len+=c->nl+c->vl+(c->nl?1:0)+(count>1?2:0);
     }
-    if (len>WEBCOOKIE_OUTPUT_MAX) return -1;
-    if (!out) return (long)len;
-    if (len>=cap) return -1;
+    if (len>WEBCOOKIE_OUTPUT_MAX || (out && len>=cap)) { free(list); return -1; }
+    if (!out) { free(list); return (long)len; }
     qsort(list,count,sizeof *list,send_order); size_t pos=0;
     for (size_t i=0;i<count;i++) {
         struct cookie *c=list[i]; if (i) { out[pos++]=';';out[pos++]=' '; }
         if (c->nl) { memcpy(out+pos,c->name,c->nl);pos+=c->nl;out[pos++]='='; }
-        memcpy(out+pos,c->value,c->vl);pos+=c->vl;c->access=++j->serial;
+        memcpy(out+pos,c->value,c->vl);pos+=c->vl;c->access=stamp(j,now);
     }
+    free(list);
     out[pos]=0;return (long)pos;
 }
 
 static void put16(unsigned char *p,unsigned n){p[0]=(unsigned char)n;p[1]=(unsigned char)(n>>8);}
 static unsigned get16(const unsigned char *p){return (unsigned)p[0]|(unsigned)p[1]<<8;}
+static void put32(unsigned char *p,uint32_t n){for(int i=0;i<4;i++)p[i]=(unsigned char)(n>>(i*8));}
+static uint32_t get32(const unsigned char *p){uint32_t n=0;for(int i=0;i<4;i++)n|=(uint32_t)p[i]<<(i*8);return n;}
 static void put64(unsigned char *p,uint64_t n){for(int i=0;i<8;i++)p[i]=(unsigned char)(n>>(i*8));}
 static uint64_t get64(const unsigned char *p){uint64_t n=0;for(int i=0;i<8;i++)n|=(uint64_t)p[i]<<(i*8);return n;}
+static unsigned char *put_record(unsigned char *p,const struct cookie *c){
+    memset(p,0,RECORD_SIZE);put16(p,c->nl);put16(p+2,c->vl);put16(p+4,c->dl);put16(p+6,c->pl);
+    p[8]=(unsigned char)c->flags;p[9]=(unsigned char)c->same;put64(p+16,(uint64_t)c->expires);put64(p+24,c->created);put64(p+32,c->access);p+=RECORD_SIZE;
+    memcpy(p,c->name,c->nl);p+=c->nl;memcpy(p,c->value,c->vl);p+=c->vl;memcpy(p,c->domain,c->dl);p+=c->dl;memcpy(p,c->path,c->pl);return p+c->pl;
+}
+/* One record at *at: 1 with a new cookie in *out; 0 a record the policy refuses (skipped); -1 the
+   bytes end inside it; -2 no memory. */
+static int parse_record(const webcookie_jar *j,const unsigned char **at,const unsigned char *end,uint64_t serial,struct cookie **out){
+    const unsigned char *p=*at;*out=NULL;
+    if((size_t)(end-p)<RECORD_SIZE)return -1;
+    unsigned nl=get16(p),vl=get16(p+2),dl=get16(p+4),pl=get16(p+6),flags=p[8],same=p[9];
+    int64_t expires=(int64_t)get64(p+16);uint64_t created=get64(p+24),access=get64(p+32);p+=RECORD_SIZE;
+    size_t size=(size_t)nl+vl+dl+pl;
+    if(size>(size_t)(end-p))return -1;
+    *at=p+size;
+    if(nl+vl>4096||!dl||dl>DOMAIN_MAX||!pl||pl>COOKIE_PATH_MAX||flags>15||same>S_NONE||created>serial||access>serial||expires<0||memchr(p,0,size)||!clean((const char*)p,size))return 0;
+    char fields[4096+DOMAIN_MAX+COOKIE_PATH_MAX+4],*f=fields;const char *parts[4];unsigned sizes[4]={nl,vl,dl,pl};
+    for(int k=0;k<4;k++){parts[k]=f;memcpy(f,p,sizes[k]);f[sizes[k]]=0;p+=sizes[k];f+=sizes[k]+1;}
+    char domain[DOMAIN_MAX+1];if(!name_ok(parts[0])||strchr(parts[1],';')||!ascii_host(domain,parts[2],dl)||strcmp(domain,parts[2])||parts[3][0]!='/')return 0;
+    if(!(flags&F_HOST)&&(!j->rule_count||suffix_labels(j,domain)==labels(domain)))return 0;
+    struct cookie *c=make_cookie(parts[0],parts[1],parts[2],parts[3]);if(!c)return -2;
+    c->flags=flags;c->same=same;c->expires=expires;c->created=created;c->access=access;*out=c;return 1;
+}
 long webcookie_export(webcookie_jar *j,void *output,size_t cap,int64_t now){
     if(!j)return -1;purge(j,now);size_t n=SNAP_HEADER+j->bytes;if(!output)return (long)n;if(cap<n)return -1;
     unsigned char *p=output;memset(p,0,SNAP_HEADER);memcpy(p,"NCK1",4);put16(p+4,(unsigned)j->count);put64(p+8,j->serial);p+=SNAP_HEADER;
-    for(size_t i=0;i<j->count;i++){
-        struct cookie *c=j->cookies[i];memset(p,0,RECORD_SIZE);put16(p,c->nl);put16(p+2,c->vl);put16(p+4,c->dl);put16(p+6,c->pl);
-        p[8]=(unsigned char)c->flags;p[9]=(unsigned char)c->same;put64(p+16,(uint64_t)c->expires);put64(p+24,c->created);put64(p+32,c->access);p+=RECORD_SIZE;
-        memcpy(p,c->name,c->nl);p+=c->nl;memcpy(p,c->value,c->vl);p+=c->vl;memcpy(p,c->domain,c->dl);p+=c->dl;memcpy(p,c->path,c->pl);p+=c->pl;
-    }return (long)n;
+    for(size_t i=0;i<j->count;i++)p=put_record(p,j->cookies[i]);
+    return (long)n;
 }
 bool webcookie_import(webcookie_jar *j,const void *input,size_t len,int64_t now){
     if(!j||j->count||!input||len<SNAP_HEADER||len>WEBCOOKIE_SNAPSHOT_MAX)return false;
-    const unsigned char *p=input,*end=p+len;if(memcmp(p,"NCK1",4)||get16(p+4)>COOKIE_MAX)return false;
-    size_t count=get16(p+4);uint64_t serial=get64(p+8);p+=SNAP_HEADER;webcookie_jar *temp=webcookie_create();if(!temp)return false;
-    bool ok=false;
+    const unsigned char *p=input,*end=p+len;if(memcmp(p,"NCK1",4)||get16(p+4)>WEBCOOKIE_TOTAL_MAX)return false;
+    size_t count=get16(p+4);uint64_t serial=get64(p+8);p+=SNAP_HEADER;
+    struct cookie **list=count?calloc(count,sizeof *list):NULL;struct index x={0};
+    if((count&&!list)||!index_make(&x,count)){free(list);return false;}
+    size_t n=0,bytes=0;bool ok=false;
     for(size_t i=0;i<count;i++){
-        if((size_t)(end-p)<RECORD_SIZE)goto done;
-        unsigned nl=get16(p),vl=get16(p+2),dl=get16(p+4),pl=get16(p+6),flags=p[8],same=p[9];
-        int64_t expires=(int64_t)get64(p+16);uint64_t created=get64(p+24),access=get64(p+32);p+=RECORD_SIZE;
-        size_t size=(size_t)nl+vl+dl+pl;
-        if(nl+vl>4096||!dl||dl>DOMAIN_MAX||!pl||pl>COOKIE_PATH_MAX||size>(size_t)(end-p)||flags>15||same>S_NONE||created>serial||access>serial||expires<0||memchr(p,0,size)||!clean((const char*)p,size))goto done;
-        char fields[4096+DOMAIN_MAX+COOKIE_PATH_MAX+4],*f=fields;const char *parts[4];unsigned sizes[4]={nl,vl,dl,pl};
-        for(int k=0;k<4;k++){parts[k]=f;memcpy(f,p,sizes[k]);f[sizes[k]]=0;p+=sizes[k];f+=sizes[k]+1;}
-        char domain[DOMAIN_MAX+1];if(!name_ok(parts[0])||strchr(parts[1],';')||!ascii_host(domain,parts[2],dl)||strcmp(domain,parts[2])||parts[3][0]!='/')goto done;
-        if(!(flags&F_HOST)&&(!j->rule_count||suffix_labels(j,domain)==labels(domain)))goto done;
-        for(size_t k=0;k<temp->count;k++){struct cookie *c=temp->cookies[k];if(!strcmp(c->name,parts[0])&&!strcmp(c->domain,parts[2])&&!strcmp(c->path,parts[3])&&!!(c->flags&F_HOST)==!!(flags&F_HOST))goto done;}
-        struct cookie *c=make_cookie(parts[0],parts[1],parts[2],parts[3]);if(!c)goto done;
-        c->flags=flags;c->same=same;c->expires=expires;c->created=created;c->access=access;temp->cookies[temp->count++]=c;temp->bytes+=record_bytes(c);
+        struct cookie *c;if(parse_record(j,&p,end,serial,&c)!=1)goto done;
+        bool found;size_t *slot=index_slot(&x,list,c,&found);
+        if(found){free(c);goto done;}
+        list[n++]=c;*slot=n;bytes+=record_bytes(c);
     }
     if(p!=end)goto done;
-    purge(temp,now);memcpy(j->cookies,temp->cookies,temp->count*sizeof *j->cookies);j->count=temp->count;j->bytes=temp->bytes;j->serial=serial;temp->count=0;ok=true;
-done:webcookie_free(temp);return ok;
+    free(j->cookies);j->cookies=list;j->cap=count;j->count=n;j->bytes=bytes;j->serial=serial;list=NULL;n=0;purge(j,now);ok=true;
+done:
+    for(size_t i=0;i<n;i++)free(list[i]);
+    free(list);free(x.slots);return ok;
+}
+
+/* The saved store: a header, the clears (oldest first), the cookies.
+   header: "NCS1", 4 zero bytes, the writer's stamp (8), the cookie count (4), the clear count (4),
+   the newest clear's serial (8), 16 zero bytes. A clear: its serial (8), the site's length (2),
+   the site. A cookie: as in a snapshot. Persistent cookies only. */
+static int domain_order(const void *a,const void *b){
+    const struct cookie *x=*(const struct cookie *const *)a,*y=*(const struct cookie *const *)b;
+    int c=strcmp(x->domain,y->domain);if(c)return c;
+    unsigned xs=x->flags&F_SECURE,ys=y->flags&F_SECURE;if(xs!=ys)return xs<ys?-1:1;
+    return x->access<y->access?-1:x->access>y->access?1:0;
+}
+static int access_order(const void *a,const void *b){
+    const struct cookie *x=*(const struct cookie *const *)a,*y=*(const struct cookie *const *)b;
+    return x->access<y->access?-1:x->access>y->access?1:0;
+}
+/* §5.7's bounds over a merged list (NULL entries already gone): per domain field the least
+   recently used non-Secure cookies first, then Secure, then in all the least recently used. */
+static void enforce(webcookie_jar *j,struct cookie **m,size_t *mn){
+    size_t n=*mn;
+    if(n<=WEBCOOKIE_DOMAIN_MAX&&n<=WEBCOOKIE_TOTAL_MAX)return;
+    struct cookie **order=malloc(n*sizeof *order);if(!order)return;
+    memcpy(order,m,n*sizeof *m);qsort(order,n,sizeof *order,domain_order);
+    size_t left=n;
+    for(size_t a=0;a<n;){
+        size_t b=a;while(b<n&&!strcmp(order[b]->domain,order[a]->domain))b++;
+        for(size_t k=a;b-a>WEBCOOKIE_DOMAIN_MAX&&k<b-WEBCOOKIE_DOMAIN_MAX;k++){order[k]->doomed=true;left--;}
+        a=b;
+    }
+    if(left>WEBCOOKIE_TOTAL_MAX){
+        size_t k=0;for(size_t i=0;i<n;i++)if(!m[i]->doomed)order[k++]=m[i];
+        qsort(order,k,sizeof *order,access_order);
+        for(size_t i=0;i<k-WEBCOOKIE_TOTAL_MAX;i++)order[i]->doomed=true;
+    }
+    free(order);
+    size_t k=0;
+    for(size_t i=0;i<n;i++){if(m[i]->doomed){forget(j,m[i]);free(m[i]);}else m[k++]=m[i];}
+    *mn=k;
+}
+/* Removes from the merged list the cookie with c's key. */
+static void merged_remove(struct index *x,struct cookie **m,const struct cookie *c){
+    bool found;size_t *slot=index_slot(x,m,c,&found);
+    if(found){free(m[*slot-1]);m[*slot-1]=NULL;*slot=TOMB;}
+}
+static bool merged_add(struct index *x,struct cookie ***m,size_t *mn,size_t *mcap,struct cookie *c){
+    if(!reserve(m,mcap,*mn+1))return false;
+    bool found;size_t *slot=index_slot(x,*m,c,&found);
+    if(found){free((*m)[*slot-1]);(*m)[*slot-1]=c;return true;}
+    (*m)[(*mn)++]=c;*slot=*mn;return true;
+}
+static void merged_clear(struct index *x,struct cookie **m,size_t mn,const char *site){
+    for(size_t i=0;i<mn;i++)if(m[i]&&(!*site||domain_match(m[i]->domain,site))){
+        bool found;size_t *slot=index_slot(x,m,m[i],&found);
+        if(found)*slot=TOMB;
+        free(m[i]);m[i]=NULL;
+    }
+}
+static bool clear_site_ok(const char *site,size_t n){char host[DOMAIN_MAX+1];return !n||(ascii_host(host,site,n)&&!memcmp(host,site,n));}
+int webcookie_load(webcookie_jar *j,const void *data,size_t len,int64_t now){
+    if(!j||(len&&!data))return 0;
+    const unsigned char *p=data,*end=p+len;
+    size_t ncookies=0,nclears=0;uint64_t serial=0,top=0;
+    if(len){
+        if(len<STORE_HEADER||memcmp(p,"NCS1",4))return 0;
+        serial=get64(p+8);ncookies=get32(p+16);nclears=get32(p+20);top=get64(p+24);
+        if(nclears>WEBCOOKIE_CLEARS_KEPT||ncookies>(len-STORE_HEADER)/RECORD_SIZE)return 0;
+        p+=STORE_HEADER;
+    }
+    struct clear *clears=nclears?calloc(nclears,sizeof *clears):NULL;
+    /* Every insertion below: the store's cookies, the changes, and the jar's own twice at most. */
+    size_t limit=ncookies+j->change_count+2*j->count+1,mn=0,mcap=0;
+    struct cookie **m=NULL;struct index x={0};int result=-1; /* -1 no memory, 0 malformed */
+    if((nclears&&!clears)||!index_make(&x,limit))goto fail;
+    for(size_t k=0;k<nclears;k++){
+        if((size_t)(end-p)<10)goto bad;
+        uint64_t s=get64(p);unsigned n=get16(p+8);p+=10;
+        if(n>DOMAIN_MAX||n>(size_t)(end-p)||s>top||!clear_site_ok((const char*)p,n)||(k&&s<=clears[k-1].serial))goto bad;
+        clears[k].serial=s;memcpy(clears[k].site,p,n);clears[k].site[n]=0;p+=n;
+    }
+    for(size_t k=0;k<ncookies;k++){
+        struct cookie *c;int r=parse_record(j,&p,end,serial,&c);
+        if(r==-2)goto fail;
+        if(r<0)goto bad;
+        if(!r)continue;
+        if(!(c->flags&F_PERSIST)||c->expires<=now){free(c);continue;}
+        bool found;index_slot(&x,m,c,&found);
+        if(found||!merged_add(&x,&m,&mn,&mcap,c)){free(c);if(found)continue;goto fail;}
+        c->saved=true;
+    }
+    if(p!=end)goto bad;
+    /* The jar's unsaved changes, in order, on top. */
+    for(size_t i=0;i<j->change_count;i++){
+        const struct change *ch=&j->changes[i];
+        if(ch->kind==CHANGE_CLEAR){merged_clear(&x,m,mn,ch->site);continue;}
+        merged_remove(&x,m,ch->cookie);
+        if(ch->kind!=CHANGE_SET||ch->cookie->expires<=now)continue;
+        struct cookie *c=copy_cookie(ch->cookie);
+        if(!c||!merged_add(&x,&m,&mn,&mcap,c)){free(c);goto fail;}
+        c->saved=true;
+    }
+    if(j->overflow)for(size_t i=0;i<j->count;i++){
+        const struct cookie *mine=j->cookies[i];
+        if(!kept(j,mine)||mine->expires<=now)continue;
+        struct cookie *c=copy_cookie(mine);
+        if(!c||!merged_add(&x,&m,&mn,&mcap,c)){free(c);goto fail;}
+        c->saved=true;
+    }
+    if(!reserve(&m,&mcap,mn+j->count))goto fail;
+    /* What the store holds replaces the jar's saved cookies (keeping the later use of the same
+       cookie); the jar's session and transient cookies stay, unless a clear recorded since the
+       jar last looked or the store's same cookie takes their place. */
+    bool *moved=j->count?calloc(j->count,sizeof *moved):NULL;
+    if(j->count&&!moved)goto fail;
+    for(size_t i=0;i<j->count;i++){
+        struct cookie *mine=j->cookies[i];bool found;size_t *slot=index_slot(&x,m,mine,&found);
+        if(mine->saved){
+            if(found&&m[*slot-1]->created==mine->created&&m[*slot-1]->access<mine->access)m[*slot-1]->access=mine->access;
+            continue;
+        }
+        if(found||mine->expires<=now)continue;
+        bool cleared=false;
+        for(size_t k=0;k<nclears&&!cleared;k++)cleared=clears[k].serial>j->clear_seen&&(!*clears[k].site||domain_match(mine->domain,clears[k].site));
+        if(cleared)continue;
+        m[mn++]=mine;*slot=mn;moved[i]=true;
+    }
+    size_t k=0;for(size_t i=0;i<mn;i++)if(m[i])m[k++]=m[i];mn=k;
+    enforce(j,m,&mn);
+    for(size_t i=0;i<j->count;i++)if(!moved[i])free(j->cookies[i]);
+    free(moved);free(j->cookies);free(x.slots);
+    j->cookies=m;j->count=mn;j->cap=mcap;j->bytes=0;
+    if(serial>j->serial)j->serial=serial;
+    for(size_t i=0;i<mn;i++){
+        j->bytes+=record_bytes(m[i]);
+        if(m[i]->created>j->serial)j->serial=m[i]->created;
+        if(m[i]->access>j->serial)j->serial=m[i]->access;
+    }
+    free(j->clears);j->clears=clears;j->clear_count=nclears;j->clear_top=top;
+    if(top>j->clear_seen)j->clear_seen=top;
+    return 1;
+bad:
+    result=0;
+fail:
+    for(size_t i=0;i<mn;i++)free(m[i]);
+    free(m);free(x.slots);free(clears);return result;
+}
+/* The clears the store will hold: the newest WEBCOOKIE_CLEARS_KEPT of the store's and the jar's
+   pending ones (serials after the store's newest). Their count and the newest serial. */
+static size_t pending_clears(const webcookie_jar *j){size_t n=0;for(size_t i=0;i<j->change_count;i++)n+=j->changes[i].kind==CHANGE_CLEAR;return n;}
+long webcookie_save(webcookie_jar *j,void *output,size_t cap,int64_t now){
+    if(!j||!j->tracking)return -1;
+    size_t pending=pending_clears(j),total=j->clear_count+pending,skip=total>WEBCOOKIE_CLEARS_KEPT?total-WEBCOOKIE_CLEARS_KEPT:0;
+    size_t n=STORE_HEADER,count=0;
+    for(size_t i=skip;i<j->clear_count;i++)n+=10+strlen(j->clears[i].site);
+    size_t seen=0;
+    for(size_t i=0;i<j->change_count;i++)if(j->changes[i].kind==CHANGE_CLEAR&&j->clear_count+seen++>=skip)n+=10+strlen(j->changes[i].site);
+    for(size_t i=0;i<j->count;i++)if(kept(j,j->cookies[i])&&j->cookies[i]->expires>now){n+=record_bytes(j->cookies[i]);count++;}
+    if(!output)return n>(size_t)INT32_MAX?-1:(long)n;
+    if(cap<n)return -1;
+    unsigned char *p=output;memset(p,0,STORE_HEADER);memcpy(p,"NCS1",4);put64(p+8,j->serial);put32(p+16,(uint32_t)count);
+    put32(p+20,(uint32_t)(total-skip));put64(p+24,j->clear_top+pending);p+=STORE_HEADER;
+    uint64_t serial=j->clear_top;
+    for(size_t i=skip;i<j->clear_count;i++){size_t l=strlen(j->clears[i].site);put64(p,j->clears[i].serial);put16(p+8,(unsigned)l);memcpy(p+10,j->clears[i].site,l);p+=10+l;}
+    seen=0;
+    for(size_t i=0;i<j->change_count;i++){
+        if(j->changes[i].kind!=CHANGE_CLEAR)continue;
+        serial++;
+        if(j->clear_count+seen++<skip)continue;
+        size_t l=strlen(j->changes[i].site);put64(p,serial);put16(p+8,(unsigned)l);memcpy(p+10,j->changes[i].site,l);p+=10+l;
+    }
+    for(size_t i=0;i<j->count;i++)if(kept(j,j->cookies[i])&&j->cookies[i]->expires>now)p=put_record(p,j->cookies[i]);
+    return (long)n;
+}
+void webcookie_saved(webcookie_jar *j){
+    if(!j||!j->tracking)return;
+    size_t pending=pending_clears(j),total=j->clear_count+pending,skip=total>WEBCOOKIE_CLEARS_KEPT?total-WEBCOOKIE_CLEARS_KEPT:0;
+    struct clear *clears=total-skip?calloc(total-skip,sizeof *clears):NULL;
+    if(clears){
+        size_t k=0,at=0;uint64_t serial=j->clear_top;
+        for(size_t i=0;i<j->clear_count;i++,at++)if(at>=skip)clears[k++]=j->clears[i];
+        for(size_t i=0;i<j->change_count;i++){
+            if(j->changes[i].kind!=CHANGE_CLEAR)continue;
+            serial++;
+            if(at++>=skip){clears[k].serial=serial;strcpy(clears[k].site,j->changes[i].site);k++;}
+        }
+        free(j->clears);j->clears=clears;j->clear_count=k;
+    }
+    j->clear_top+=pending;
+    if(j->clear_top>j->clear_seen)j->clear_seen=j->clear_top;
+    changes_free(j);j->overflow=false;
+    for(size_t i=0;i<j->count;i++)j->cookies[i]->saved=kept(j,j->cookies[i]);
+}
+bool webcookie_changed(const webcookie_jar *j){return j&&(j->change_count||j->overflow);}
+void webcookie_rule_changed(webcookie_jar *j){
+    if(!j||!j->tracking)return;
+    for(size_t i=0;i<j->count;i++){
+        struct cookie *c=j->cookies[i];bool k=kept(j,c);
+        if(k&&!c->saved){c->saved=true;note(j,CHANGE_SET,c);}
+        else if(!k&&c->saved){note(j,CHANGE_DELETE,c);c->saved=false;}
+    }
+}
+void webcookie_session_end(webcookie_jar *j){
+    if(!j)return;
+    for(size_t i=0;i<j->count;)if(!kept(j,j->cookies[i]))evict(j,i);else i++;
+}
+struct site_entry{const char *site;const struct cookie *c;};
+static int site_order(const void *a,const void *b){return strcmp(((const struct site_entry*)a)->site,((const struct site_entry*)b)->site);}
+long webcookie_sites(webcookie_jar *j,struct webcookie_site **out,int64_t now){
+    if(!out)return -1;
+    *out=NULL;if(!j)return -1;
+    purge(j,now);if(!j->count)return 0;
+    struct site_entry *e=malloc(j->count*sizeof *e);struct webcookie_site *s=calloc(j->count,sizeof *s);
+    if(!e||!s){free(e);free(s);return -1;}
+    for(size_t i=0;i<j->count;i++){e[i].c=j->cookies[i];e[i].site=webcookie_site_of(j,j->cookies[i]->domain);}
+    qsort(e,j->count,sizeof *e,site_order);
+    size_t n=0;
+    for(size_t i=0;i<j->count;i++){
+        if(!n||strcmp(s[n-1].site,e[i].site))snprintf(s[n++].site,sizeof s->site,"%s",e[i].site);
+        s[n-1].cookies++;s[n-1].bytes+=e[i].c->nl+e[i].c->vl+e[i].c->dl+e[i].c->pl;
+    }
+    free(e);*out=s;return (long)n;
+}
+size_t webcookie_clear(webcookie_jar *j,const char *site){
+    if(!j)return 0;
+    char host[DOMAIN_MAX+1]="";
+    if(site&&*site&&!ascii_host(host,site,strlen(site)))return 0;
+    size_t removed=0;
+    for(size_t i=0;i<j->count;)if(!*host||domain_match(j->cookies[i]->domain,host)){remove_cookie(j,i);removed++;}else i++;
+    note_clear(j,host);
+    return removed;
 }

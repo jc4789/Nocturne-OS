@@ -108,6 +108,14 @@ const char *web_profile_folder(bool temporary){const char *folder=temporary?TEMP
 #undef put64
 #undef hash
 static void check(const char *label,int yes){checks++;if(!yes){failures++;printf("FAIL %s\n",label);}}
+/* The Settings window's site data (webidb_usage, webidb_clear). */
+struct usage_seen {uint64_t idb,other,unknown;size_t count;};
+static void usage_each(void *opaque,const char *origin,uint64_t bytes){
+    struct usage_seen *u=opaque;u->count++;
+    if(!strcmp(origin,"https://idb.test"))u->idb+=bytes;else if(!strcmp(origin,"https://other.test"))u->other+=bytes;else u->unknown+=bytes;
+}
+static struct usage_seen usage_now(void){struct usage_seen u={0};int r=webidb_usage(usage_each,&u);if(r)u.count=(size_t)-1;return u;}
+static bool origin_is(void *opaque,const char *origin){return !strcmp(origin,(const char *)opaque);}
 int main(void){fixture_serial=(unsigned)_getpid();char dir[100];snprintf(dir,sizeof dir,"build/idb-native-%u",fixture_serial);_mkdir(dir);
     webidb *a=webidb_create(),*b=webidb_create();uint32_t ta=0,tb=0;uint8_t *meta=NULL,*bytes=NULL;size_t n=0,bn=0;char ref[65],unused[65];const char *refs[1]={ref};
     check("native-origin-security",webidb_begin(a,"file://","db",2,&ta,&meta,&n)==WEB_IDB_SECURITY);
@@ -159,6 +167,19 @@ int main(void){fixture_serial=(unsigned)_getpid();char dir[100];snprintf(dir,siz
     }
     check("journal-compaction-publishes-all-generations",compact_ok);webidb_free(a);a=webidb_create();
     check("compacted-cold-snapshot-reconstructs",webidb_begin(a,"https://idb.test","compact",7,&ta,&meta,&n)==0&&n==sizeof compact&&!memcmp(meta,compact,n));free(meta);webidb_abort(a,ta);
+    /* Site data: each database's origin and bytes; clearing one origin's whole, a database in a
+       transaction left (BUSY), the other origin untouched. */
+    check("site-data-keep-other-origin",webidb_begin(b,"https://other.test","keep",4,&tb,&meta,&n)==0&&webidb_commit(b,tb,(const uint8_t *)"kept",4,NULL,0,1)==0);free(meta);
+    struct usage_seen u=usage_now();
+    check("site-data-usage-per-origin",u.count!=(size_t)-1&&u.idb>=1024*1024&&u.other>0&&u.unknown==0);
+    check("site-data-busy-database-left",webidb_begin(a,"https://idb.test","db",2,&ta,&meta,&n)==0&&webidb_clear(origin_is,"https://idb.test")==WEB_IDB_BUSY);free(meta);webidb_abort(a,ta);
+    u=usage_now();check("site-data-busy-database-kept",u.idb>=1024*1024&&u.other>0);
+    check("site-data-clear-origin",webidb_clear(origin_is,"https://idb.test")==WEB_IDB_OK);
+    u=usage_now();check("site-data-cleared-whole",u.count!=(size_t)-1&&u.idb==0&&u.other>0&&u.unknown==0);
+    check("site-data-cleared-catalog",webidb_databases(a,"https://idb.test",&catalog_items,&catalog_count)==0&&catalog_count==0);webidb_databases_free(catalog_items,catalog_count);
+    check("site-data-cleared-database-empty",webidb_begin(a,"https://idb.test","journal",7,&ta,&meta,&n)==0&&!meta&&n==0);webidb_abort(a,ta);
+    check("site-data-other-origin-intact",webidb_databases(b,"https://other.test",&catalog_items,&catalog_count)==0&&catalog_count==1&&catalog_items[0].version==1);webidb_databases_free(catalog_items,catalog_count);
+    check("site-data-clear-all",webidb_clear(NULL,NULL)==WEB_IDB_OK&&(u=usage_now(),u.count==0));
     free(snapshot);free(large);webidb_free(a);webidb_free(b);
     printf("native IndexedDB: %d checks, %d failures\n",checks,failures);return failures?1:0;
 }

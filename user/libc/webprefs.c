@@ -7,6 +7,7 @@
    wait for the document only until it has been read. io is taken before state, never after. */
 #include <webprefs.h>
 #include <webstorage.h>
+#include <webcookie.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
@@ -20,7 +21,7 @@
 /* The most tags a list holds: its Accept-Language fits, and the shortest tag has two letters. */
 #define LIST_TAGS ((ACCEPT_MAX - 2) / (2 + WEIGHT_BYTES) + 1)
 
-/* What the browser's Settings window offers: tags of registered subtags (RFC 5646 §2.2.9's valid
+/* What the browser's settings page offers: tags of registered subtags (RFC 5646 §2.2.9's valid
    tags) in their usual case, alphabetical. The table the system's Settings window had (a51c4398). */
 static const struct webprefs_language catalog[] = {
     {"af", "Afrikaans", "Afrikaans"},
@@ -201,13 +202,135 @@ bool webprefs_languages_fit(const char *const *tags, size_t count) {
 struct prefs {
     char languages[ACCEPT_MAX + 1]; /* a list's text, never empty */
     size_t languages_length;
-    bool search_history;
+    bool search_history, clear_on_close;
+    struct webprefs_site_exception *sites; /* malloc'd, sorted by host, each host once */
+    size_t site_count;
 };
 
 static void prefs_default(struct prefs *p) {
     memcpy(p->languages, DEFAULT_LANGUAGES, sizeof DEFAULT_LANGUAGES);
     p->languages_length = sizeof DEFAULT_LANGUAGES - 1;
-    p->search_history = false;
+    p->search_history = p->clear_on_close = false;
+    p->sites = NULL;
+    p->site_count = 0;
+}
+
+/* The site exceptions. A host: lowercase LDH labels of 1 to 63 bytes between dots (A-labels for
+   Unicode names), at most WEBPREFS_HOST_MAX bytes; or an [IPv6] address. */
+static bool host_valid(const char *h, size_t n) {
+    if (!n || n > WEBPREFS_HOST_MAX) return false;
+    if (h[0] == '[') {
+        if (n < 3 || h[n - 1] != ']') return false;
+        for (size_t i = 1; i + 1 < n; i++)
+            if (!((h[i] >= '0' && h[i] <= '9') || (h[i] >= 'a' && h[i] <= 'f') || h[i] == ':' || h[i] == '.')) return false;
+        return true;
+    }
+    size_t label = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = h[i];
+        if (c == '.') {
+            if (!label || h[i - 1] == '-') return false;
+            label = 0;
+        } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (c == '-' && label)) {
+            if (++label > 63) return false;
+        } else {
+            return false;
+        }
+    }
+    return label && h[n - 1] != '-';
+}
+
+/* An IPv4 or [IPv6] address: an exception for it covers only itself. */
+static bool host_address(const char *h) {
+    if (h[0] == '[') return true;
+    for (; *h; h++)
+        if (!(*h >= '0' && *h <= '9') && *h != '.') return false;
+    return true;
+}
+
+static const char *const rule_names[] = {"", "allow", "session", "block"};
+
+static int site_compare(const void *a, const void *b) {
+    return strcmp(((const struct webprefs_site_exception *)a)->host, ((const struct webprefs_site_exception *)b)->host);
+}
+
+/* The value of site-data-exceptions=: "rule:host" items between spaces. An item that is not one
+   is left out, as is a host there already (the first counts). false: no memory. */
+static bool sites_read(const char *value, size_t n, struct prefs *p) {
+    size_t items = 0;
+    for (size_t i = 0; i < n; i++) items += value[i] == ':';
+    if (!items) return true;
+    struct webprefs_site_exception *sites = calloc(items, sizeof *sites);
+    if (!sites) return false;
+    size_t count = 0;
+    for (size_t at = 0; at < n;) {
+        while (at < n && (value[at] == ' ' || value[at] == '\t')) at++;
+        size_t end = at;
+        while (end < n && value[end] != ' ' && value[end] != '\t') end++;
+        const char *item = value + at, *colon = memchr(item, ':', end - at);
+        at = end;
+        if (!colon) continue;
+        size_t rn = (size_t)(colon - item), hn = (size_t)(value + end - colon - 1);
+        enum webprefs_site_rule rule = WEBPREFS_SITE_DEFAULT;
+        for (int r = WEBPREFS_SITE_ALLOW; r <= WEBPREFS_SITE_BLOCK; r++)
+            if (strlen(rule_names[r]) == rn && !memcmp(item, rule_names[r], rn)) rule = (enum webprefs_site_rule)r;
+        if (!rule || !host_valid(colon + 1, hn)) continue;
+        memcpy(sites[count].host, colon + 1, hn);
+        sites[count].host[hn] = 0;
+        sites[count].rule = rule;
+        bool twice = false;
+        for (size_t k = 0; k < count && !twice; k++) twice = !strcmp(sites[k].host, sites[count].host);
+        if (!twice) count++;
+    }
+    if (!count) {
+        free(sites);
+        return true;
+    }
+    qsort(sites, count, sizeof *sites, site_compare);
+    p->sites = sites;
+    p->site_count = count;
+    return true;
+}
+
+/* The value of site-data-exceptions= for a list: malloc'd; NULL with *none for an empty list
+   (the line is removed). */
+static char *sites_write(const struct webprefs_site_exception *sites, size_t count, bool *none) {
+    *none = !count;
+    if (!count) return NULL;
+    size_t room = 1;
+    for (size_t i = 0; i < count; i++) room += strlen(rule_names[sites[i].rule]) + 2 + strlen(sites[i].host);
+    char *text = malloc(room);
+    if (!text) return NULL;
+    size_t at = 0;
+    for (size_t i = 0; i < count; i++) {
+        size_t rn = strlen(rule_names[sites[i].rule]), hn = strlen(sites[i].host);
+        if (i) text[at++] = ' ';
+        memcpy(text + at, rule_names[sites[i].rule], rn);
+        text[at + rn] = ':';
+        memcpy(text + at + rn + 1, sites[i].host, hn);
+        at += rn + 1 + hn;
+    }
+    text[at] = 0;
+    return text;
+}
+
+/* The rule of host in a list: its own exception, else its nearest parent domain's. */
+static enum webprefs_site_rule sites_rule(const struct webprefs_site_exception *sites, size_t count, const char *host) {
+    bool address = host_address(host);
+    for (const char *h = host; h && *h;) {
+        size_t lo = 0, hi = count;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            int c = strcmp(h, sites[mid].host);
+            if (!c) return sites[mid].rule;
+            if (c < 0) hi = mid;
+            else lo = mid + 1;
+        }
+        if (address) break;
+        const char *dot = strchr(h, '.');
+        h = dot ? dot + 1 : NULL;
+    }
+    return WEBPREFS_SITE_DEFAULT;
 }
 
 /* The value of languages=: tags between commas, spaces and tabs around them allowed, each made the
@@ -262,12 +385,12 @@ static bool line_value(const char *line, size_t length, const char *name, const 
 }
 
 /* What a document says. Another first line: every default. Of the lines of a name, the first
-   counts; a bad value leaves that one's default. */
-static void prefs_parse(const char *bytes, size_t n, struct prefs *p) {
+   counts; a bad value leaves that one's default. false: no memory (*p holds nothing to free). */
+static bool prefs_parse(const char *bytes, size_t n, struct prefs *p) {
     prefs_default(p);
     size_t h = header_of(bytes, n);
-    if (!h) return;
-    bool languages = false, history = false;
+    if (!h) return true;
+    bool languages = false, history = false, close = false, sites = false;
     struct lines it = {bytes, n, h + 1};
     const char *line, *value;
     size_t length, vn;
@@ -278,8 +401,15 @@ static void prefs_parse(const char *bytes, size_t n, struct prefs *p) {
         } else if (!history && line_value(line, length, "search-history", &value, &vn)) {
             history = true;
             p->search_history = vn == 2 && !memcmp(value, "on", 2); /* "off", or the default (off) */
+        } else if (!close && line_value(line, length, "clear-site-data-on-close", &value, &vn)) {
+            close = true;
+            p->clear_on_close = vn == 2 && !memcmp(value, "on", 2);
+        } else if (!sites && line_value(line, length, "site-data-exceptions", &value, &vn)) {
+            sites = true;
+            if (!sites_read(value, vn, p)) return false;
         }
     }
+    return true;
 }
 
 /* The document whose line of name is "name=value" (value NULL: it has none), in *out (free it) and
@@ -365,7 +495,7 @@ static n_handle watch = -1, queue = -1;
    valid: what the process holds is the document's, and no watch is wanted and missing. */
 static struct prefs current = {.languages = DEFAULT_LANGUAGES, .languages_length = sizeof DEFAULT_LANGUAGES - 1};
 static bool seen, valid;
-static uint64_t generation;
+static uint64_t generation, site_generation;
 
 static bool path_ready(void) {
     if (path[0]) return true;
@@ -375,14 +505,22 @@ static bool path_ready(void) {
     return false;
 }
 
-/* Makes p what the process holds. The list's generation grows when it differs from a list a
-   reader was given: before any was given, no change can be seen. Under io. */
-static void apply(const struct prefs *p) {
+/* Makes p what the process holds; its exceptions become the process's (p keeps none). The list's
+   generation grows when it differs from a list a reader was given: before any was given, no
+   change can be seen. The sites' generation grows with any change of theirs. Under io. */
+static void apply(struct prefs *p) {
     mtx_lock(&state);
     if (seen && (p->languages_length != current.languages_length ||
                  memcmp(p->languages, current.languages, p->languages_length)))
         __atomic_store_n(&generation, generation + 1, __ATOMIC_RELEASE);
+    bool sites_same = p->clear_on_close == current.clear_on_close && p->site_count == current.site_count;
+    for (size_t i = 0; sites_same && i < p->site_count; i++)
+        sites_same = p->sites[i].rule == current.sites[i].rule && !strcmp(p->sites[i].host, current.sites[i].host);
+    if (!sites_same) __atomic_store_n(&site_generation, site_generation + 1, __ATOMIC_RELEASE);
+    free(current.sites);
     current = *p;
+    p->sites = NULL;
+    p->site_count = 0;
     mtx_unlock(&state);
 }
 
@@ -398,7 +536,7 @@ static n_result document_read(struct prefs *p) {
     size_t n;
     n_result r = read_all(h, &bytes, &n);
     n_handle_close(h);
-    if (r > 0) prefs_parse(bytes, n, p);
+    if (r > 0 && !prefs_parse(bytes, n, p)) r = -N_ERR_NO_MEMORY;
     free(bytes);
     return r < 0 ? r : 0;
 }
@@ -567,18 +705,38 @@ bool webprefs_search_history(void) {
     return on;
 }
 
+/* The new value of a line, made from the document as it is when claimed (old: its on bytes, NULL
+   when there is none): malloc'd in *value, or NULL to remove the line. 0 or the failure. */
+typedef n_result (*value_of)(const char *old, size_t on, const void *arg, char **value);
+
+static n_result fixed_value(const char *old, size_t on, const void *arg, char **value) {
+    (void)old;
+    (void)on;
+    *value = NULL;
+    if (!arg) return 0;
+    size_t n = strlen(arg) + 1;
+    if (!(*value = malloc(n))) return -N_ERR_NO_MEMORY;
+    memcpy(*value, arg, n);
+    return 0;
+}
+
 /* One change, written at once: the document is opened (made when missing), claimed, read again,
    given the line of name and saved whole, and what it now says is the process's. As
    n_document_save keeps the document the name had, a writer waiting for the claim reads this
    change before its own. Under io. */
-static n_result edit_locked(const char *name, const char *value) {
+static n_result edit_locked(const char *name, value_of make, const void *arg) {
     if (!path_ready()) return -N_ERR_NOT_FOUND;
     n_handle h = n_document_open(path, N_DOCUMENT_EDIT);
-    if (h == -N_ERR_NOT_FOUND && !value) {
-        refresh_locked(); /* no line to remove: the default applies */
-        return 0;
-    }
     if (h == -N_ERR_NOT_FOUND) {
+        char *value = NULL;
+        n_result r = make(NULL, 0, arg, &value);
+        bool none = !value;
+        free(value);
+        if (r < 0) return r;
+        if (none) {
+            refresh_locked(); /* no line to remove: the default applies */
+            return 0;
+        }
         h = n_document_open(path, N_DOCUMENT_CREATE);
         if (h == -N_ERR_NOT_FOUND) { /* the profile folder was removed: only it is made again */
             const char *folder = web_profile_folder(false);
@@ -590,31 +748,40 @@ static n_result edit_locked(const char *name, const char *value) {
     if (h < 0) return h;
     n_result r = n_document_claim(h, true);
     struct prefs now;
+    bool parsed = false;
     if (r >= 0) {
-        char *old = NULL, *next = NULL;
+        char *old = NULL, *next = NULL, *value = NULL;
         size_t on = 0, nn = 0;
         r = read_all(h, &old, &on);
+        if (r >= 0) r = make(old, on, arg, &value);
         if (r >= 0) r = document_make(old, on, name, value, &next, &nn);
         if (r >= 0 && (nn != on || memcmp(next, old, nn))) r = n_document_save(path, next, nn);
-        if (r >= 0) prefs_parse(next, nn, &now);
+        if (r >= 0) parsed = prefs_parse(next, nn, &now);
         free(old);
         free(next);
+        free(value);
         n_document_release(h);
     }
     n_handle_close(h);
     if (r < 0) return r;
-    apply(&now);
     if (queue >= 0 && watch < 0) (void)watch_open_locked(); /* its folder may be there again */
+    if (!parsed) { /* saved, but no memory to hold it: the next use reads it */
+        __atomic_store_n(&valid, false, __ATOMIC_RELEASE);
+        return 0;
+    }
+    apply(&now);
     __atomic_store_n(&valid, queue < 0 || watch >= 0, __ATOMIC_RELEASE);
     return 0;
 }
 
-static n_result edit(const char *name, const char *value) {
+static n_result edit_with(const char *name, value_of make, const void *arg) {
     mtx_lock(&io);
-    n_result r = edit_locked(name, value);
+    n_result r = edit_locked(name, make, arg);
     mtx_unlock(&io);
     return r;
 }
+
+static n_result edit(const char *name, const char *value) { return edit_with(name, fixed_value, value); }
 
 n_result webprefs_set_languages(const char *const *tags, size_t count) {
     struct list l;
@@ -625,3 +792,186 @@ n_result webprefs_set_languages(const char *const *tags, size_t count) {
 n_result webprefs_reset_languages(void) { return edit("languages", NULL); }
 
 n_result webprefs_set_search_history(bool on) { return edit("search-history", on ? "on" : "off"); }
+
+n_result webprefs_set_clear_on_close(bool on) { return edit("clear-site-data-on-close", on ? "on" : "off"); }
+
+/* The value of site-data-exceptions= once the document old has host's rule changed. */
+struct site_change {
+    const char *host;
+    enum webprefs_site_rule rule;
+};
+
+static n_result sites_value(const char *old, size_t on, const void *arg, char **value) {
+    const struct site_change *change = arg;
+    struct prefs p;
+    if (!prefs_parse(old, on, &p)) return -N_ERR_NO_MEMORY;
+    struct webprefs_site_exception *sites = p.sites;
+    size_t count = p.site_count, at = count;
+    for (size_t i = 0; i < count; i++)
+        if (!strcmp(sites[i].host, change->host)) at = i;
+    if (change->rule == WEBPREFS_SITE_DEFAULT) {
+        if (at < count) {
+            memmove(sites + at, sites + at + 1, (count - at - 1) * sizeof *sites);
+            count--;
+        }
+    } else if (at < count) {
+        sites[at].rule = change->rule;
+    } else {
+        struct webprefs_site_exception *grown = realloc(sites, (count + 1) * sizeof *grown);
+        if (!grown) {
+            free(sites);
+            return -N_ERR_NO_MEMORY;
+        }
+        sites = grown;
+        memset(&sites[count], 0, sizeof *sites);
+        memcpy(sites[count].host, change->host, strlen(change->host) + 1);
+        sites[count++].rule = change->rule;
+        qsort(sites, count, sizeof *sites, site_compare);
+    }
+    bool none;
+    *value = sites_write(sites, count, &none);
+    free(sites);
+    return *value || none ? 0 : -N_ERR_NO_MEMORY;
+}
+
+n_result webprefs_set_site_rule(const char *host, enum webprefs_site_rule rule) {
+    if (!host || !host_valid(host, strlen(host)) || rule < WEBPREFS_SITE_DEFAULT || rule > WEBPREFS_SITE_BLOCK)
+        return -N_ERR_INVALID;
+    struct site_change change = {host, rule};
+    return edit_with("site-data-exceptions", sites_value, &change);
+}
+
+/* host as the exceptions hold hosts, in out: lowercase, without a final dot. */
+static bool host_key(const char *host, size_t n, char out[WEBPREFS_HOST_MAX + 1]) {
+    if (n && host[n - 1] == '.') n--;
+    if (!n || n > WEBPREFS_HOST_MAX) return false;
+    for (size_t i = 0; i < n; i++) out[i] = lower(host[i]);
+    out[n] = 0;
+    return true;
+}
+
+/* The host of an authority ("user@host:port", up to '/', '?', '#' or '\\') in out. */
+static bool authority_host(const char *p, char out[WEBPREFS_HOST_MAX + 1]) {
+    size_t end = strcspn(p, "/?#\\");
+    for (size_t i = end; i-- > 0;)
+        if (p[i] == '@') {
+            p += i + 1;
+            end -= i + 1;
+            break;
+        }
+    size_t n = end;
+    if (n && p[0] == '[') {
+        const char *close = memchr(p, ']', end);
+        if (!close) return false;
+        n = (size_t)(close - p) + 1;
+    } else {
+        const char *colon = memchr(p, ':', end);
+        if (colon) n = (size_t)(colon - p);
+    }
+    return host_key(p, n, out);
+}
+
+/* The host of an http(s) or ws(s) URL in out. */
+static bool url_host(const char *url, char out[WEBPREFS_HOST_MAX + 1]) {
+    static const char *const schemes[] = {"http://", "https://", "ws://", "wss://"};
+    for (size_t i = 0; url && i < sizeof schemes / sizeof *schemes; i++) {
+        size_t k = strlen(schemes[i]), m = 0;
+        while (m < k && lower(url[m]) == schemes[i][m]) m++;
+        if (m == k) return authority_host(url + k, out);
+    }
+    return false;
+}
+
+n_result webprefs_site_host(const char *input, char out[WEBPREFS_HOST_MAX + 1]) {
+    if (!input || !out) return -N_ERR_INVALID;
+    while (*input == ' ' || *input == '\t') input++;
+    const char *scheme = strstr(input, "://");
+    const char *p = scheme ? scheme + 3 : input;
+    while (*p == '*' && p[1] == '.') p += 2; /* "*.example.com": the exception covers subdomains anyway */
+    if (*p == '.') p++;
+    char host[WEBPREFS_HOST_MAX + 1];
+    size_t n = strcspn(p, " \t");
+    char text[WEBPREFS_HOST_MAX * 4 + 64];
+    if (n >= sizeof text) return -N_ERR_INVALID;
+    memcpy(text, p, n);
+    text[n] = 0;
+    if (!authority_host(text, host) || !host_valid(host, strlen(host))) return -N_ERR_INVALID;
+    memcpy(out, host, strlen(host) + 1);
+    return 0;
+}
+
+/* Under state: the rule of host (a key) and whether its data outlives the session. */
+static enum webprefs_site_rule site_locked(const char *key, bool *kept) {
+    enum webprefs_site_rule r = sites_rule(current.sites, current.site_count, key);
+    *kept = r == WEBPREFS_SITE_ALLOW || (r != WEBPREFS_SITE_SESSION && !current.clear_on_close);
+    return r;
+}
+
+static enum webprefs_site_rule site_of_key(const char *key, bool *kept) {
+    ensure();
+    mtx_lock(&state);
+    enum webprefs_site_rule r = site_locked(key, kept);
+    mtx_unlock(&state);
+    return r;
+}
+
+enum webprefs_site_rule webprefs_site_rule(const char *host) {
+    char key[WEBPREFS_HOST_MAX + 1];
+    bool kept;
+    return host && host_key(host, strlen(host), key) ? site_of_key(key, &kept) : WEBPREFS_SITE_DEFAULT;
+}
+
+enum webprefs_site_rule webprefs_site_rule_url(const char *url) {
+    char key[WEBPREFS_HOST_MAX + 1];
+    bool kept;
+    return url_host(url, key) ? site_of_key(key, &kept) : WEBPREFS_SITE_DEFAULT;
+}
+
+bool webprefs_storage_allowed(const char *url) { return webprefs_site_rule_url(url) != WEBPREFS_SITE_BLOCK; }
+
+bool webprefs_site_kept(const char *host) {
+    char key[WEBPREFS_HOST_MAX + 1];
+    bool kept = true;
+    if (host && host_key(host, strlen(host), key)) site_of_key(key, &kept);
+    else kept = !webprefs_clear_on_close();
+    return kept;
+}
+
+unsigned webprefs_cookie_rule(void *opaque, const char *host) {
+    (void)opaque;
+    char key[WEBPREFS_HOST_MAX + 1];
+    bool kept = true;
+    enum webprefs_site_rule r = host && host_key(host, strlen(host), key) ? site_of_key(key, &kept) : WEBPREFS_SITE_DEFAULT;
+    return (r == WEBPREFS_SITE_BLOCK ? WEBCOOKIE_BLOCK : 0u) | (kept ? 0u : WEBCOOKIE_TRANSIENT);
+}
+
+bool webprefs_clear_on_close(void) {
+    ensure();
+    mtx_lock(&state);
+    bool on = current.clear_on_close;
+    mtx_unlock(&state);
+    return on;
+}
+
+bool webprefs_site_data_transient(void) {
+    ensure();
+    mtx_lock(&state);
+    bool any = current.clear_on_close;
+    for (size_t i = 0; !any && i < current.site_count; i++) any = current.sites[i].rule == WEBPREFS_SITE_SESSION;
+    mtx_unlock(&state);
+    return any;
+}
+
+uint64_t webprefs_site_generation(void) {
+    ensure();
+    return __atomic_load_n(&site_generation, __ATOMIC_ACQUIRE);
+}
+
+size_t webprefs_site_exceptions(struct webprefs_site_exception *out, size_t cap) {
+    ensure();
+    mtx_lock(&state);
+    size_t count = current.site_count;
+    if (out) memcpy(out, current.sites, (cap < count ? cap : count) * sizeof *out);
+    mtx_unlock(&state);
+    return count;
+}

@@ -9,7 +9,8 @@
 #include "webi.h"
 #include "frame.h"
 
-static int checks,failures,errors,navigations,auxiliary,policy_logs;
+static int checks,failures,errors,navigations,auxiliary,in_place,policy_logs;
+static char last_target[32];static bool last_activation;
 static bool policy_private=true,child_timer,child_promise,child_fetch,child_message;
 static struct {uint64_t id;int kind;char url[256];bool used;} queued[32];
 static web_doc *top;
@@ -34,6 +35,8 @@ static bool request(void *unused,const struct web_request *r){
 static void cancel(void *unused,uint64_t id){for(unsigned i=0;i<32;i++)if(queued[i].id==id)queued[i].used=false;}
 static void navigate(void *unused,const struct web_navigation *n){
     if(n->target&&!strcmp(n->target,"_blank"))auxiliary++;else navigations++;
+    if(!n->target||!*n->target)in_place++;
+    snprintf(last_target,sizeof last_target,"%s",n->target?n->target:"");last_activation=n->user_activation;
 }
 static node_t *find_id(web_doc *d,const char *id){
     for(node_t *n=d->root;n;){if(n->type==N_ELEM && node_attr(n,"id") && !strcmp(node_attr(n,"id"),id))return n;
@@ -160,12 +163,12 @@ int main(void){
     check("explicit-top-trusted-allowed",granted&&web_sandbox_navigation_allowed(granted,top,true));
     check("auxiliary-default-denied",active&&!web_sandbox_auxiliary_allowed(active));
     check("auxiliary-explicit-escape-allowed",granted&&web_sandbox_auxiliary_allowed(granted));
-    check("default-top-native-link-consumed",active&&web_frame_navigate(top,find_id(active,"top"),"https://root.test/denied"));
-    check("default-popup-native-link-consumed",active&&web_frame_navigate(top,find_id(active,"blank"),"https://destination.test/denied"));
-    check("default-download-native-link-consumed",active&&web_frame_navigate(top,find_id(active,"download"),"https://destination.test/file"));
+    check("default-top-native-link-consumed",active&&web_frame_navigate(top,find_id(active,"top"),"https://root.test/denied",true));
+    check("default-popup-native-link-consumed",active&&web_frame_navigate(top,find_id(active,"blank"),"https://destination.test/denied",true));
+    check("default-download-native-link-consumed",active&&web_frame_navigate(top,find_id(active,"download"),"https://destination.test/file",true));
     check("restricted-actions-no-host-escape",navigations==0&&auxiliary==0);
-    check("explicit-top-native-host-fallback",granted&&!web_frame_navigate(top,find_id(granted,"top"),"https://root.test/allowed"));
-    check("explicit-popup-native-link",granted&&web_frame_navigate(top,find_id(granted,"blank"),"https://destination.test/allowed"));
+    check("explicit-top-native-host-fallback",granted&&!web_frame_navigate(top,find_id(granted,"top"),"https://root.test/allowed",true));
+    check("explicit-popup-native-link",granted&&web_frame_navigate(top,find_id(granted,"blank"),"https://destination.test/allowed",true));
     check("explicit-popup-one-host-window",auxiliary==1);
     struct web_event click={.type="click",.bubbles=true,.cancelable=true,.synthetic=true};
     if(granted)web_dispatch(granted,find_id(granted,"top"),&click);
@@ -182,6 +185,15 @@ int main(void){
     check("retired-document-cannot-run",active&&!active->live&&!web_console_eval(active,"1",1));
     check("retired-document-cannot-submit",active&&!web_sandbox_form_submission_allowed(top,find_id(active,"form")));
     check("native-policy-snapshot-redacts-author-secrets",policy_logs>=8&&policy_private);
+    /* The page's own click() follows the link's target as the user's click does: without the
+       user's activation the host is asked for another top-level traversable (which it may
+       refuse, as a popup), never this one. */
+    int asked=auxiliary,stayed=in_place;
+    eval(top,"for(const t of ['_blank','results']){const a=document.createElement('a');a.href='https://destination.test/'+t;"
+             "a.target=t;document.body.append(a);a.click();a.remove();}");
+    check("scripted-blank-link-asks-host",auxiliary==asked+1);
+    check("scripted-named-link-asks-host",!strcmp(last_target,"results")&&!last_activation);
+    check("scripted-target-link-keeps-this-document",in_place==stayed);
     check("no-unexpected-runtime-error",errors==0);
     web_free(top);printf("sandboxprofiletest: %d checks, %d failed\n",checks,failures);return failures?1:0;
 }

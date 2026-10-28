@@ -3810,6 +3810,13 @@ void css_motion_tick(web_doc *d,uint64_t now) {
         struct css_motion_state *s=*slot;
         if(!s->node){*slot=s->next;free(s->name);free(s);continue;}
         slot=&s->next;
+        /* HTML "update the rendering" leaves a hidden document out of "update animations and
+           send events", so nothing samples its animations. Their timeline does not stop
+           (Web Animations: the document timeline's current time follows the "now" timestamp
+           and changes only when animations are updated): the first sample after the document
+           is visible again adds the whole hidden interval to elapsed (motion_sample), so the
+           animation stands where its start time puts it, not where it was hidden. */
+        if(!d->visible)continue;
         if(!s->node || !s->running || s->requested || now<s->last || now-s->last<16)continue;
         if(doc_node_root(s->node,true)!=d->root){css_motion_reset(s->node);continue;}
         /* A sample changes the element's own values, never what any selector
@@ -3819,7 +3826,7 @@ void css_motion_tick(web_doc *d,uint64_t now) {
     }
 }
 int64_t css_motion_deadline(web_doc *d) {
-    if(!d || __atomic_load_n(&d->native_cancelled,__ATOMIC_ACQUIRE))return -1;
+    if(!d || !d->visible || __atomic_load_n(&d->native_cancelled,__ATOMIC_ACQUIRE))return -1; /* css_motion_tick */
     uint64_t deadline=UINT64_MAX;
     for(struct css_motion_state *s=d->css_motions;s;s=s->next)if(s->node && s->running && !s->requested) {
         uint64_t due=s->last>UINT64_MAX-16?UINT64_MAX:s->last+16;

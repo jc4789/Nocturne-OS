@@ -11,6 +11,7 @@
 #include <parallel.h>
 #include <webidb.h>
 #include <webidb_async.h>
+#include <webprefs.h>
 #include <quickjs.h>
 #include "webi.h"
 #include "web_dialog.h"
@@ -241,7 +242,7 @@ struct web_js_state {
     struct js_idle_task *idle_pending, *last_idle_pending, *idle_runnable, *last_idle_runnable;
     unsigned idle_count, idle_period_callbacks;
     uint32_t next_idle;
-    uint64_t idle_period_end;
+    uint64_t idle_period_end, idle_period_start;
     bool idle_timeout_turn, idle_period_stopped;
     bool scroll_input_turn;
     bool scroll_viewport_turn;
@@ -513,13 +514,14 @@ void web_js_console(web_doc *d, int level, const char *message) {
     if (d && d->js) log_text(d->js, level, message);
 }
 void web_js_trace(web_doc *d, const char *message) { web_js_console(d, WEB_CONSOLE_TRACE, message); }
-bool web_js_auxiliary_link(web_doc *d,node_t *anchor,const char *url) {
-    /* The native click path has applied sandbox and opener policy. This GET
-       uses the host's real new-window spawn, with no opener. */
-    if(!d || !d->live || d->inert || !d->js || !d->js->host.navigate || !url || !web_sandbox_auxiliary_allowed(d))return false;
+bool web_js_auxiliary_link(web_doc *d,node_t *anchor,const char *url,const char *target,bool activated) {
+    /* web_frame_navigate has applied sandbox and opener policy. This GET goes to the host's
+       top-level traversables, with no opener. */
+    if(!d || !d->live || d->inert || !d->js || !d->js->host.navigate || !url || !target || !web_sandbox_auxiliary_allowed(d))return false;
     if(strncmp(url,"https://",8) && strncmp(url,"http://",7))return false;
-    struct web_navigation navigation={.url=url,.history=WEB_NAVIGATE_PUSH,.target="_blank"};
+    struct web_navigation navigation={.url=url,.history=WEB_NAVIGATE_PUSH,.target=target};
     web_navigation_source(d,anchor,&navigation);
+    navigation.user_activation=activated;
     d->js->host.navigate(d->js->host.opaque,&navigation);
     return true; /* Accepted by host, not a promise that native spawn succeeded. */
 }
@@ -532,14 +534,18 @@ void web_js_rendering_now(web_doc *d, double period_ms) {
     /* The display showed a frame: the rendering opportunity is now, so animation
        frames follow the display, and the next frame comes a period later. */
     struct web_js_state *s = d ? d->js : NULL;
-    if (!s || s->disabled) return;
+    if (!s || s->disabled || !d->visible) return;
     if (period_ms >= 1 && period_ms <= 1000) s->rendering_period_ms = (uint64_t)period_ms;
     s->rendering_due = uptime_ms();
     s->rendering_next = s->rendering_due + s->rendering_period_ms;
 }
 static bool observers_dirty(struct web_js_state *s);
-/* Animation frames or dirty rendering observers wait for a rendering opportunity. */
+/* Animation frames or dirty rendering observers wait for a rendering opportunity. A hidden
+   document has none: HTML "update the rendering" filters out a document whose visibility state
+   is "hidden" ("non-renderable documents"), so it neither asks for the display's frame nor
+   shortens an idle period before one. */
 static bool rendering_wanted(struct web_js_state *s) {
+    if (!s->doc->visible) return false;
     for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && s->timers[i].kind == 2) return true;
     return observers_dirty(s);
 }
@@ -4021,6 +4027,12 @@ static JSValue native_window_state(JSContext *ctx,JSValueConst this_val,int argc
     struct web_js_state *s=state(ctx);
     return JS_NewUint32(ctx,s->host.window_state?s->host.window_state(s->host.opaque):0);
 }
+/* The realm's Document's visibility state (HTML 6.2): it changes only in the "update the
+   visibility state" task (doc.c), never directly when the host's window state does. */
+static JSValue native_visible(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
+    struct web_js_state *s=state(ctx);
+    return JS_NewBool(ctx,s && s->doc && s->doc->visible);
+}
 /* CSSOM View outerWidth/outerHeight: the browser window, never smaller than
    the top-level viewport. */
 static JSValue native_window_size(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
@@ -4436,7 +4448,7 @@ static JSValue native_observers(JSContext *ctx, JSValueConst this_val, int argc,
 static JSValue native_cookie_enabled(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
     return JS_NewBool(ctx,s->host.cookie_get && s->host.cookie_set &&
-        s->host.cookie_enabled && s->host.cookie_enabled(s->host.opaque));
+        s->host.cookie_enabled && s->host.cookie_enabled(s->host.opaque, web_effective_url(s->doc)));
 }
 static JSValue native_cookie_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx);
@@ -4662,6 +4674,18 @@ static const char *indexed_db_origin(JSContext *ctx,struct web_js_state *s) {
     JS_FreeValue(ctx,fn);JS_FreeValue(ctx,url);
     const char *origin=JS_IsException(value)||JS_IsNull(value)?NULL:JS_ToCString(ctx,value);
     JS_FreeValue(ctx,value);return origin;
+}
+/* IndexedDB "obtain a storage key" for open and deleteDatabase, which throw SecurityError at once
+   when it fails: an opaque origin (a sandbox without allow-same-origin, a data: URL), or a site
+   whose storage the user blocked (webprefs.h). */
+static JSValue native_indexed_db_storage_key(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
+    struct web_js_state *s=state(ctx);
+    if(!s||!s->doc||(sandbox_authority(s)&SB_ORIGIN))return JS_FALSE;
+    const char *origin=indexed_db_origin(ctx,s);
+    if(JS_HasException(ctx)){if(origin)JS_FreeCString(ctx,origin);return JS_EXCEPTION;}
+    bool allowed=origin&&webprefs_storage_allowed(origin);
+    if(origin)JS_FreeCString(ctx,origin);
+    return JS_NewBool(ctx,allowed);
 }
 static void indexed_db_buffer_free(JSRuntime *runtime,void *opaque,void *bytes) {
     (void)runtime;(void)opaque;free(bytes);
@@ -5046,7 +5070,9 @@ static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc
                 struct web_frame *f=web_frame_find(s->doc->frame_parent,s->doc->frame_element);
                 if(target && *target && strcasecmp(target,"_self"))log_text(s,1,"Scripted child link activation cannot navigate another browsing context");
                 else if(!web_frame_set_navigation(f,action.href,s->doc))return oom(ctx);
-            }else if(s->host.navigate){
+            }else if(!web_frame_navigate(s->doc,anchor,action.href,s->doc->sandbox_activation_until>uptime_ms()) && s->host.navigate){
+                /* A top-level document follows the hyperlink as a click the user made does
+                   (frame.c: its target chooses the navigable), with its own activation. */
                 struct web_navigation navigation={.url=action.href,.history=WEB_NAVIGATE_PUSH};
                 web_navigation_source(s->doc,anchor,&navigation);
                 s->host.navigate(s->host.opaque,&navigation);
@@ -7581,6 +7607,25 @@ static bool images_wanted(web_doc *d) {
     for (int i = 0; i < web_image_count(d); i++) if (web_image_wanted(d, i)) return true;
     return false;
 }
+/* HTML "run steps after a timeout" step 4.3: the user agent may "optionally, wait a further
+   implementation-defined length of time", which the specification notes lets it pad timeouts to
+   optimize the power usage of the device. A hidden document's timers wait for the next whole
+   second of the uptime clock, so hidden pages wake together, at most once a second; not while
+   its page plays sound (web_js_tab_audible). Step 4.2's order holds: the padded time never
+   decreases as the timer's own time grows, and run_timer takes the earliest by its own time. */
+#define JS_HIDDEN_TIMER_ALIGN_MS 1000u
+static bool timers_padded(struct web_js_state *s) {
+    return !s->doc->visible && !web_js_tab_audible(s->doc);
+}
+/* When a timer's task may run. An animation-frame callback is registered with due=now but runs
+   only at the next rendering opportunity, never in a hidden document (rendering_wanted); a
+   continuously re-armed rAF loop (any playing video UI) is not an always-overdue task that
+   forbids idle periods. */
+static uint64_t timer_task_due(const struct web_js_state *s, const struct js_timer *t, bool padded) {
+    if (t->kind == 2) return !s->doc->visible ? UINT64_MAX : t->due < s->rendering_due ? s->rendering_due : t->due;
+    if (!padded || t->due > UINT64_MAX - JS_HIDDEN_TIMER_ALIGN_MS) return t->due;
+    return (t->due + JS_HIDDEN_TIMER_ALIGN_MS - 1) / JS_HIDDEN_TIMER_ALIGN_MS * JS_HIDDEN_TIMER_ALIGN_MS;
+}
 static bool run_timer_index(struct web_js_state *s, unsigned timer_index, uint64_t now) {
     struct js_timer *timer=&s->timers[timer_index];
     uint32_t timer_id = timer->id;
@@ -7654,9 +7699,10 @@ static bool run_timer_index(struct web_js_state *s, unsigned timer_index, uint64
 }
 static bool run_timer(struct web_js_state *s, uint64_t now) {
     struct js_timer *timer=NULL;unsigned index=0;
+    bool padded=timers_padded(s);
     for(unsigned i=0;i<s->timer_capacity;i++){
         struct js_timer *candidate=&s->timers[i];
-        if(candidate->id && candidate->kind!=2 && candidate->due<=now &&
+        if(candidate->id && candidate->kind!=2 && timer_task_due(s,candidate,padded)<=now &&
            (!timer || candidate->due<timer->due ||
             (candidate->due==timer->due && candidate->order<timer->order))){
             timer=candidate;index=i;
@@ -8046,7 +8092,8 @@ static int frame_callback_order(const void *left,const void *right){
     return a->order<b->order?-1:a->order>b->order;
 }
 static bool run_rendering(struct web_js_state *s,uint64_t now){
-    if(s->disabled || s->running || now<s->rendering_due)return false;
+    /* A hidden document is not rendered (rendering_wanted): its animation frames wait. */
+    if(s->disabled || s->running || now<s->rendering_due || !s->doc->visible)return false;
     size_t count=0;
     for(unsigned i=0;i<s->timer_capacity;i++)
         if(s->timers[i].id && s->timers[i].kind==2 && s->timers[i].due<=now)count++;
@@ -8158,12 +8205,6 @@ static bool run_idle_timeout(struct web_js_state *s, uint64_t now) {
     s->idle_period_stopped = true;
     return invoke_idle(s, id, now, true);
 }
-/* An animation-frame callback is registered with due=now but runs only at
-   the next rendering opportunity; a continuously re-armed rAF loop (any
-   playing video UI) is not an always-overdue task that forbids idle periods. */
-static uint64_t timer_task_due(const struct web_js_state *s, const struct js_timer *t) {
-    return t->kind == 2 && t->due < s->rendering_due ? s->rendering_due : t->due;
-}
 static bool idle_eligible(struct web_js_state *s, uint64_t now) {
     web_doc *d = s->doc, *family = d->dom_family ? d->dom_family : d;
     struct js_script *script;
@@ -8171,12 +8212,13 @@ static bool idle_eligible(struct web_js_state *s, uint64_t now) {
         s->events || s->posted || s->media_width != d->width || s->media_height != d->height ||
         family->shadow_slots_pending || family->details_toggle_first || JS_IsJobPending(s->rt) ||
         web_worker_runnable(s->workers) || ready_script(s, &script)) return false;
-    if (observers_dirty(s) && s->rendering_due <= now) return false;
+    if (d->visible && observers_dirty(s) && s->rendering_due <= now) return false;
     int64_t atomics = web_atomics_deadline(s->ctx, now);
     if (atomics >= 0 && (uint64_t)atomics <= now) return false;
     if (web_audio_ready(s->ctx)) return false;
     for (struct js_pending *p = s->pending; p; p = p->next) if (p->done || p->deadline <= now) return false;
-    for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && timer_task_due(s, &s->timers[i]) <= now) return false;
+    bool padded = s->timer_capacity && timers_padded(s);
+    for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && timer_task_due(s, &s->timers[i], padded) <= now) return false;
     for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) return false;
     return true;
 }
@@ -8187,7 +8229,9 @@ static uint64_t idle_period_deadline(struct web_js_state *s, uint64_t now) {
        task: PCM refill and frame presentation run at the native safepoints of
        any author callback (interrupt/layout flush), so its 1ms polling wakeups
        must not shrink every idle period of a playing page to nothing. */
-    for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && timer_task_due(s, &s->timers[i]) < end) end = timer_task_due(s, &s->timers[i]);
+    bool padded = s->timer_capacity && timers_padded(s);
+    for (unsigned i = 0; i < s->timer_capacity; i++)
+        if (s->timers[i].id && timer_task_due(s, &s->timers[i], padded) < end) end = timer_task_due(s, &s->timers[i], padded);
     for (struct js_pending *p = s->pending; p; p = p->next) if (p->deadline < end) end = p->deadline;
     if (rendering_wanted(s)) { uint64_t next = rendering_expected(s, now); if (next < end) end = next; }
     int64_t worker = web_worker_deadline(s->workers,now);
@@ -8198,11 +8242,21 @@ static uint64_t idle_period_deadline(struct web_js_state *s, uint64_t now) {
     if (audio >= 0 && (uint64_t)audio < end) end = (uint64_t)audio;
     return end;
 }
+/* When a hidden document may start its next idle period. requestIdleCallback, "start an idle
+   period algorithm": when the Document's visibility state is "hidden" the user agent can
+   throttle idle period generation, "for example limiting the Document to one idle period every
+   10 seconds to optimize for power usage". 0: now. */
+#define JS_IDLE_HIDDEN_INTERVAL_MS 10000u
+static uint64_t idle_hidden_start(const struct web_js_state *s) {
+    return s->doc->visible || !s->idle_period_start ? 0 : s->idle_period_start + JS_IDLE_HIDDEN_INTERVAL_MS;
+}
 static bool run_idle_period(struct web_js_state *s, uint64_t now) {
     if (!s->idle_count) return false;
     if (!idle_eligible(s, now)) { s->idle_period_stopped = true; return false; }
     if (now >= s->idle_period_end) {
+        if (now < idle_hidden_start(s)) return false;
         uint64_t end = idle_period_deadline(s, now); if (end <= now) return false;
+        s->idle_period_start = now;
         if (s->idle_pending) {
             if (s->last_idle_runnable) s->last_idle_runnable->next = s->idle_pending; else s->idle_runnable = s->idle_pending;
             s->last_idle_runnable = s->last_idle_pending;
@@ -8486,7 +8540,8 @@ static int64_t js_deadline(web_doc *d, int *why) {
         if (JS_IsJobPending(s->rt)) DUE_NOW();
         int64_t audio_deadline = web_audio_deadline(s->ctx, now);
         if (audio_deadline >= 0) EARLIER((uint64_t)audio_deadline, JD_WEB_AUDIO);
-        if (observers_dirty(s)) EARLIER(s->rendering_due, JD_OBSERVERS);
+        /* A hidden document has no rendering opportunity, so its observers wait for it. */
+        if (d->visible && observers_dirty(s)) EARLIER(s->rendering_due, JD_OBSERVERS);
         if (s->storage_origin && storage_listening(s) && (s->storage_subscribed[0]||s->storage_subscribed[1])) EARLIER(s->storage_poll_due, JD_STORAGE);
         if(s->indexed_db_failed&&s->indexed_db_pending)DUE_NOW();
         if(web_presentation_event_peek(d))DUE_NOW();
@@ -8501,8 +8556,9 @@ static int64_t js_deadline(web_doc *d, int *why) {
         for (struct js_script *p = s->scripts; p; p = p->next)
             if (p->compile && !p->executed && !js_compile_done(p->compile) && !js_compile_watch(p->compile, web_wait_queue()))
                 DUE_NOW();
+        bool padded = s->timer_capacity && timers_padded(s);
         for (unsigned i = 0; i < s->timer_capacity; i++)if(s->timers[i].id){
-            EARLIER(timer_task_due(s,&s->timers[i]), s->timers[i].kind == 2 ? JD_ANIMATION_FRAME : JD_TIMER);
+            EARLIER(timer_task_due(s, &s->timers[i], padded), s->timers[i].kind == 2 ? JD_ANIMATION_FRAME : JD_TIMER);
         }
         for (struct js_script *p = s->scripts; p; p = p->next) if (p->module && p->parser_released && !p->notified) DUE_NOW();
         EARLIER(idle_timeout_due(s), JD_IDLE_TIMEOUT);
@@ -8510,6 +8566,10 @@ static int64_t js_deadline(web_doc *d, int *why) {
             uint64_t idle_wake = now;
             if (now < s->idle_period_end && (s->idle_period_stopped || !s->idle_runnable || s->idle_period_callbacks >= JS_IDLE_PERIOD_CALLBACKS))
                 idle_wake = s->idle_period_end;
+            if (!d->visible && idle_wake >= s->idle_period_end) {
+                uint64_t hidden_start = idle_hidden_start(s);
+                if (hidden_start > idle_wake) idle_wake = hidden_start;
+            }
             EARLIER(idle_wake, JD_IDLE_PERIOD);
         }
     }
@@ -8625,10 +8685,35 @@ void web_document_scroll(web_doc *d) {
     struct web_event e = {.type="scroll", .bubbles=true};
     web_js_dispatch(d, d->root, &e);
 }
-void web_visibility_event(web_doc *d) {
-    if(!d || !d->js || d->js->running)return;
-    struct web_event e={.type="visibilitychange",.bubbles=true};
-    web_js_dispatch(d,d->root,&e);
+/* HTML "update the visibility state" after its step 2 (doc.c set d->visible): step 3 queues a
+   VisibilityStateEntry at the current high resolution time, step 7 fires visibilitychange at
+   the Document with bubbles (not cancelable). Steps 4-6 name specifications this engine does not
+   have (Screen Orientation, View Transitions, Device Posture, Web NFC). One task of the realm's,
+   with its microtask checkpoint. */
+void web_js_visibility_changed(web_doc *d) {
+    struct web_js_state *s = d ? d->js : NULL;
+    if (!task_context_active(s) || s->running) return;
+    begin_named_task(s, "visibilitychange", 0);
+    JSValue args[] = {JS_NewString(s->ctx, d->visible ? "visible" : "hidden"),
+                      JS_NewFloat64(s->ctx, (double)relative_time(s, uptime_ms()))};
+    JSValue result = JS_IsException(args[0]) ? JS_EXCEPTION : custom_element_hook(s, "visibilityChange", 2, args);
+    if (JS_IsException(result)) exception(s); else JS_FreeValue(s->ctx, result);
+    JS_FreeValue(s->ctx, args[0]); JS_FreeValue(s->ctx, args[1]);
+    end_task(s);
+}
+/* Whether the page plays sound now, for the timers of its hidden documents: any document of
+   d's frame tree with an unmuted media element whose sound stream is open, or a running
+   AudioContext. */
+static bool document_audible(web_doc *d) {
+    return web_avmedia_audible(d) || (d->js && d->js->ctx && web_audio_audible(d->js->ctx));
+}
+bool web_js_tab_audible(web_doc *d) {
+    while (d && d->frame_parent) d = d->frame_parent;
+    if (!d || !d->live) return false;
+    if (document_audible(d)) return true;
+    for (struct web_frame *f = d->frames; f; f = web_frame_walk_next(d, f, true))
+        if (f->document && !f->detached && f->document->live && document_audible(f->document)) return true;
+    return false;
 }
 static void platform_prepare(struct platform_program *p) {
     if (!p->bytecode && !p->job) p->job = js_compile_platform(p->source, p->len, p->name);
@@ -8797,6 +8882,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("now", 0, native_now), JS_CFUNC_DEF("timing", 1, native_timing), JS_CFUNC_DEF("url", 0, native_url), JS_CFUNC_DEF("origin", 0, native_origin),
         JS_CFUNC_DEF("screen", 0, native_screen),
         JS_CFUNC_DEF("windowState",0,native_window_state),JS_CFUNC_DEF("windowSize",1,native_window_size),
+        JS_CFUNC_DEF("visible",0,native_visible),
         JS_CFUNC_DEF("cookieEnabled",0,native_cookie_enabled),
         JS_CFUNC_DEF("pack", 1, native_pack), JS_CFUNC_DEF("unpack", 1, native_unpack),
         JS_CFUNC_DEF("classID", 1, native_class_id), JS_CFUNC_DEF("detach", 1, native_detach),
@@ -8824,6 +8910,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("cssProperties", 1, native_css_properties),
         JS_CFUNC_DEF("storage", 5, native_storage),
         JS_CFUNC_DEF("indexedDB", 5, native_indexed_db),
+        JS_CFUNC_DEF("indexedDBStorageKey", 0, native_indexed_db_storage_key),
         JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("socketOpen", 3, native_socket_open),
         JS_CFUNC_DEF("socketSend", 2, native_socket_send), JS_CFUNC_DEF("socketClose", 3, native_socket_close),
         JS_CFUNC_DEF("socketBuffered", 1, native_socket_buffered), JS_CFUNC_DEF("socketRelease", 1, native_socket_release),

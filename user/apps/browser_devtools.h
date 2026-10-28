@@ -31,14 +31,44 @@ static const uint32_t dt_palette[C_COUNT] = {
     RGB(137, 137, 137), RGB(92, 213, 251), RGB(253, 214, 99), RGB(242, 139, 130)
 };
 
-static int dt_tab = DT_CONSOLE, dt_sub = DT_STYLES;
-static bool dt_picking, dt_swallow_up, dt_resizing;
+/* The panel's divider and a press it took, the window's like the panel's height. */
+static bool dt_swallow_up, dt_resizing;
 
 /* ---------------------------------------------------------------- lines */
 enum { DT_EXPANDABLE = 1, DT_OPEN = 2, DT_CLOSING = 4, DT_STRIKE = 8, DT_HEADER = 16 };
 struct dt_line { web_node *node; char *text, *right; int depth; unsigned flags; };
 struct dt_lines { struct dt_line *v; int n, capacity, top; };
-static struct dt_lines dt_tree, dt_side, dt_detail;
+
+struct dt_request {
+    uint64_t serial, generation, resource, start, end;
+    char *method, *url, *request_headers, *response_headers, *error, *mime;
+    char *sent_headers; /* the fields the final hop sent (webnet's report_sent) */
+    size_t size;
+    int kind, status;
+    bool navigation, done, streamed;
+};
+
+/* Each tab has DevTools of its own: the panel it shows, the cached tree and boxes of its
+   document, and the requests it recorded. */
+struct devtools {
+    int panel, sub; /* DT_ELEMENTS..., DT_STYLES... */
+    bool picking;
+    struct dt_lines tree, side, detail;
+    /* tree state */
+    web_doc *doc;
+    uint64_t generation, tree_at, side_at;
+    web_node *selected, *hovered;
+    bool auto_open;
+    struct web_inspect_box overlay, sel_box;
+    bool overlay_valid, sel_valid;
+    char overlay_label[160];
+    uintptr_t *open;              /* sorted expanded-node set */
+    size_t open_n, open_capacity;
+    /* network */
+    struct dt_request *net;
+    int net_n, net_capacity, net_top, net_selected;
+    uint64_t net_serial, nav_serial;
+};
 
 static void dt_lines_clear(struct dt_lines *l) {
     for (int i = 0; i < l->n; i++) { free(l->v[i].text); free(l->v[i].right); }
@@ -99,49 +129,40 @@ static void dt_clamp_top(struct dt_lines *l, int rows) { l->top = MAX(0, MIN(l->
 static void dt_draw_lines(canvas_t *c, struct dt_lines *l, int x, int y, int width, int height, bool tree);
 
 /* ---------------------------------------------------------------- tree state */
-static web_doc *dt_doc;
-static uint64_t dt_generation, dt_tree_at, dt_side_at;
-static web_node *dt_selected, *dt_hovered;
-static bool dt_auto_open;
-static struct web_inspect_box dt_overlay, dt_sel_box;
-static bool dt_overlay_valid, dt_sel_valid;
-static char dt_overlay_label[160];
-static uintptr_t *dt_open;              /* sorted expanded-node set */
-static size_t dt_open_n, dt_open_capacity;
 
 static size_t dt_open_slot(web_node *n, bool *found) {
     uintptr_t key = (uintptr_t)n;
-    size_t lo = 0, hi = dt_open_n;
+    size_t lo = 0, hi = tab->dt->open_n;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (dt_open[mid] < key) lo = mid + 1; else hi = mid;
+        if (tab->dt->open[mid] < key) lo = mid + 1; else hi = mid;
     }
-    *found = lo < dt_open_n && dt_open[lo] == key;
+    *found = lo < tab->dt->open_n && tab->dt->open[lo] == key;
     return lo;
 }
 static bool dt_is_open(web_node *n) { bool found; (void)dt_open_slot(n, &found); return found; }
 static void dt_set_open(web_node *n, bool open) {
     bool found; size_t i = dt_open_slot(n, &found);
     if (open == found) return;
-    if (!open) { memmove(dt_open + i, dt_open + i + 1, (dt_open_n - i - 1) * sizeof *dt_open); dt_open_n--; return; }
-    if (dt_open_n == dt_open_capacity) {
-        size_t capacity = dt_open_capacity ? dt_open_capacity * 2 : 64;
-        void *grown = realloc(dt_open, capacity * sizeof *dt_open);
+    if (!open) { memmove(tab->dt->open + i, tab->dt->open + i + 1, (tab->dt->open_n - i - 1) * sizeof *tab->dt->open); tab->dt->open_n--; return; }
+    if (tab->dt->open_n == tab->dt->open_capacity) {
+        size_t capacity = tab->dt->open_capacity ? tab->dt->open_capacity * 2 : 64;
+        void *grown = realloc(tab->dt->open, capacity * sizeof *tab->dt->open);
         if (!grown) return;
-        dt_open = grown; dt_open_capacity = capacity;
+        tab->dt->open = grown; tab->dt->open_capacity = capacity;
     }
-    memmove(dt_open + i + 1, dt_open + i, (dt_open_n - i) * sizeof *dt_open);
-    dt_open[i] = (uintptr_t)n; dt_open_n++;
+    memmove(tab->dt->open + i + 1, tab->dt->open + i, (tab->dt->open_n - i) * sizeof *tab->dt->open);
+    tab->dt->open[i] = (uintptr_t)n; tab->dt->open_n++;
 }
 static void dt_sync_doc(void) {
-    if (dt_doc == doc && dt_generation == generation) return;
-    dt_doc = doc; dt_generation = generation;
-    dt_selected = dt_hovered = NULL;
-    dt_overlay_valid = dt_sel_valid = false;
-    dt_open_n = 0; dt_auto_open = true;
-    dt_lines_clear(&dt_tree); dt_lines_clear(&dt_side);
-    dt_tree.top = dt_side.top = 0;
-    dt_tree_at = dt_side_at = 0;
+    if (tab->dt->doc == tab->doc && tab->dt->generation == tab->generation) return;
+    tab->dt->doc = tab->doc; tab->dt->generation = tab->generation;
+    tab->dt->selected = tab->dt->hovered = NULL;
+    tab->dt->overlay_valid = tab->dt->sel_valid = false;
+    tab->dt->open_n = 0; tab->dt->auto_open = true;
+    dt_lines_clear(&tab->dt->tree); dt_lines_clear(&tab->dt->side);
+    tab->dt->tree.top = tab->dt->side.top = 0;
+    tab->dt->tree_at = tab->dt->side_at = 0;
 }
 
 static void dt_trimmed(web_node *n, const char **text, size_t *length) {
@@ -187,11 +208,11 @@ static void dt_add_node(web_node *n, int depth) {
         if (short_text) { dt_put(&s, C_TEXT, text, length); dt_close_tag(&s, n); }
         else if (expandable && !open) { dt_puts(&s, C_DIM, "\xe2\x80\xa6"); dt_close_tag(&s, n); }
         else if (!first && !dt_void_element(web_inspect_name(n))) dt_close_tag(&s, n);
-        dt_line_add(&dt_tree, n, depth, (expandable ? DT_EXPANDABLE : 0) | (open ? DT_OPEN : 0), &s, NULL);
+        dt_line_add(&tab->dt->tree, n, depth, (expandable ? DT_EXPANDABLE : 0) | (open ? DT_OPEN : 0), &s, NULL);
         if (!open) return;
         for (web_node *c = first; c; c = web_inspect_next(c)) dt_add_node(c, depth + 1);
         dt_close_tag(&s, n);
-        dt_line_add(&dt_tree, n, depth, DT_CLOSING, &s, NULL);
+        dt_line_add(&tab->dt->tree, n, depth, DT_CLOSING, &s, NULL);
         return;
     }
     case WEB_INSPECT_TEXT:
@@ -210,13 +231,13 @@ static void dt_add_node(web_node *n, int depth) {
         web_node *first = web_inspect_first(n);
         bool open = first && dt_is_open(n);
         dt_puts(&s, C_DIM, "#shadow-root ("); dt_puts(&s, C_DIM, web_inspect_text(n, NULL)); dt_puts(&s, C_DIM, ")");
-        dt_line_add(&dt_tree, n, depth, (first ? DT_EXPANDABLE : 0) | (open ? DT_OPEN : 0), &s, NULL);
+        dt_line_add(&tab->dt->tree, n, depth, (first ? DT_EXPANDABLE : 0) | (open ? DT_OPEN : 0), &s, NULL);
         if (open) for (web_node *c = first; c; c = web_inspect_next(c)) dt_add_node(c, depth + 1);
         return;
     }
     default: return;
     }
-    dt_line_add(&dt_tree, n, depth, 0, &s, NULL);
+    dt_line_add(&tab->dt->tree, n, depth, 0, &s, NULL);
 }
 static web_node *dt_child_named(web_node *parent, const char *name) {
     for (web_node *c = web_inspect_first(parent); c; c = web_inspect_next(c))
@@ -224,17 +245,17 @@ static web_node *dt_child_named(web_node *parent, const char *name) {
     return NULL;
 }
 static void dt_build_tree(void) {
-    web_node *root = web_inspect_root(doc);
-    if (dt_auto_open && root) {     /* <html> and <body> start expanded */
+    web_node *root = web_inspect_root(tab->doc);
+    if (tab->dt->auto_open && root) {     /* <html> and <body> start expanded */
         web_node *html = dt_child_named(root, "html"), *body = html ? dt_child_named(html, "body") : NULL;
         if (html) dt_set_open(html, true);
-        if (body) { dt_set_open(body, true); dt_auto_open = false; }
+        if (body) { dt_set_open(body, true); tab->dt->auto_open = false; }
     }
-    dt_lines_clear(&dt_tree);
+    dt_lines_clear(&tab->dt->tree);
     for (web_node *c = web_inspect_first(root); c; c = web_inspect_next(c)) dt_add_node(c, 0);
 }
 static int dt_row_of(web_node *n) {
-    for (int i = 0; i < dt_tree.n; i++) if (dt_tree.v[i].node == n && !(dt_tree.v[i].flags & DT_CLOSING)) return i;
+    for (int i = 0; i < tab->dt->tree.n; i++) if (tab->dt->tree.v[i].node == n && !(tab->dt->tree.v[i].flags & DT_CLOSING)) return i;
     return -1;
 }
 static int dt_panel_rows(void) { return dt_rows_in(console_h() - DT_TABH); }
@@ -275,19 +296,19 @@ static void dt_basename(const char *url, char *out, size_t capacity) {
     else snprintf(out, capacity, "%.*s", (int)(host_end - (size_t)(host - url)), host);
 }
 static void dt_refresh_side(void) {
-    dt_lines_clear(&dt_side);
-    dt_side_at = n_clock_uptime_ms();
+    dt_lines_clear(&tab->dt->side);
+    tab->dt->side_at = n_clock_uptime_ms();
     struct sb s = {0};
-    if (!dt_selected || web_inspect_kind(dt_selected) != WEB_INSPECT_ELEMENT) {
-        dt_puts(&s, C_DIM, dt_selected ? "Styles apply to elements only." : "Select an element in the tree, or pick one with Ctrl+Shift+C.");
-        dt_line_add(&dt_side, NULL, 0, 0, &s, NULL);
+    if (!tab->dt->selected || web_inspect_kind(tab->dt->selected) != WEB_INSPECT_ELEMENT) {
+        dt_puts(&s, C_DIM, tab->dt->selected ? "Styles apply to elements only." : "Select an element in the tree, or pick one with Ctrl+Shift+C.");
+        dt_line_add(&tab->dt->side, NULL, 0, 0, &s, NULL);
         return;
     }
-    if (dt_sub == DT_STYLES) {
+    if (tab->dt->sub == DT_STYLES) {
         struct web_inspect_styles styles;
-        if (!web_inspect_styles(doc, dt_selected, &styles)) {
+        if (!web_inspect_styles(tab->doc, tab->dt->selected, &styles)) {
             dt_puts(&s, C_ERROR, "Styles are unavailable (allocation failed).");
-            dt_line_add(&dt_side, NULL, 0, 0, &s, NULL);
+            dt_line_add(&tab->dt->side, NULL, 0, 0, &s, NULL);
             return;
         }
         web_node *section = NULL;
@@ -296,30 +317,30 @@ static void dt_refresh_side(void) {
             if (r->inherited_from && r->inherited_from != section) {
                 section = r->inherited_from;
                 dt_puts(&s, C_DIM, "Inherited from "); dt_node_label(&s, section);
-                dt_line_add(&dt_side, section, 0, DT_HEADER, &s, NULL);
+                dt_line_add(&tab->dt->side, section, 0, DT_HEADER, &s, NULL);
             }
             char source[96];
             dt_basename(r->source, source, sizeof source);
             dt_puts(&s, r->ua ? C_DIM : C_TEXT, r->selector); dt_puts(&s, C_TEXT, " {");
-            dt_line_add(&dt_side, NULL, 0, 0, &s, source);
+            dt_line_add(&tab->dt->side, NULL, 0, 0, &s, source);
             for (int k = 0; k < r->count; k++) {
                 const struct web_inspect_decl *x = &r->decls[k];
                 dt_puts(&s, C_PROP, x->name); dt_puts(&s, C_TEXT, ": ");
                 dt_put_limited(&s, C_TEXT, x->value, strlen(x->value), 300);
                 if (x->important) dt_puts(&s, C_ACCENT, " !important");
                 dt_puts(&s, C_TEXT, ";");
-                dt_line_add(&dt_side, NULL, 1, x->overridden ? DT_STRIKE : 0, &s, NULL);
+                dt_line_add(&tab->dt->side, NULL, 1, x->overridden ? DT_STRIKE : 0, &s, NULL);
             }
             dt_puts(&s, C_TEXT, "}");
-            dt_line_add(&dt_side, NULL, 0, 0, &s, NULL);
+            dt_line_add(&tab->dt->side, NULL, 0, 0, &s, NULL);
         }
-        if (!styles.count) { dt_puts(&s, C_DIM, "No matching rules."); dt_line_add(&dt_side, NULL, 0, 0, &s, NULL); }
+        if (!styles.count) { dt_puts(&s, C_DIM, "No matching rules."); dt_line_add(&tab->dt->side, NULL, 0, 0, &s, NULL); }
         web_inspect_styles_free(&styles);
-    } else if (dt_sub == DT_COMPUTED) {
-        char *computed = web_inspect_computed(doc, dt_selected);
+    } else if (tab->dt->sub == DT_COMPUTED) {
+        char *computed = web_inspect_computed(tab->doc, tab->dt->selected);
         if (!computed) {
             dt_puts(&s, C_DIM, "Computed style is unavailable while the page runtime is busy.");
-            dt_line_add(&dt_side, NULL, 0, 0, &s, NULL);
+            dt_line_add(&tab->dt->side, NULL, 0, 0, &s, NULL);
             return;
         }
         for (char *p = computed; *p;) {
@@ -328,7 +349,7 @@ static void dt_refresh_side(void) {
             if (colon) {
                 dt_put(&s, C_PROP, p, (size_t)(colon - p)); dt_puts(&s, C_TEXT, ":");
                 dt_put_limited(&s, C_TEXT, colon + 1, n - (size_t)(colon + 1 - p), 300);
-                dt_line_add(&dt_side, NULL, 0, 0, &s, NULL);
+                dt_line_add(&tab->dt->side, NULL, 0, 0, &s, NULL);
             }
             p += n; if (*p) p++;
         }
@@ -336,103 +357,104 @@ static void dt_refresh_side(void) {
     }
 }
 static void dt_measure(void) {
-    dt_overlay_valid = dt_hovered && doc && web_inspect_box(doc, dt_hovered, &dt_overlay);
-    if (dt_overlay_valid) {
+    tab->dt->overlay_valid = tab->dt->hovered && tab->doc && web_inspect_box(tab->doc, tab->dt->hovered, &tab->dt->overlay);
+    if (tab->dt->overlay_valid) {
         struct sb s = {0};
-        dt_node_label(&s, dt_hovered);
+        dt_node_label(&s, tab->dt->hovered);
         char size[48];
-        snprintf(size, sizeof size, "  %d \xc3\x97 %d", dt_overlay.w, dt_overlay.h);
+        snprintf(size, sizeof size, "  %d \xc3\x97 %d", tab->dt->overlay.w, tab->dt->overlay.h);
         dt_puts(&s, C_TEXT, size);
-        strlcpy(dt_overlay_label, s.b ? s.b : "", sizeof dt_overlay_label);
+        strlcpy(tab->dt->overlay_label, s.b ? s.b : "", sizeof tab->dt->overlay_label);
         free(s.b);
     }
-    dt_sel_valid = dt_selected && doc && web_inspect_box(doc, dt_selected, &dt_sel_box);
+    tab->dt->sel_valid = tab->dt->selected && tab->doc && web_inspect_box(tab->doc, tab->dt->selected, &tab->dt->sel_box);
 }
 
 /* Main-loop entry: a layout just finished, or DevTools input needs fresh
    state. Layout-driven rebuilds are paced; input-driven ones are immediate. */
 static void devtools_refresh(bool force) {
-    if (!console_open || browser_fullscreen) return;
+    if (!tab->console_open || browser_fullscreen || tab != front) return;
     dt_sync_doc();
-    if (!doc || native_wait || web_script_running(doc)) return;
-    web_node *root = web_inspect_root(doc);
-    if (dt_selected && !web_inspect_contains(root, dt_selected)) { dt_selected = NULL; dt_side_at = 0; }
-    if (dt_hovered && !web_inspect_contains(root, dt_hovered)) dt_hovered = NULL;
-    if (dt_tab != DT_ELEMENTS) { dt_measure(); return; }
+    if (!tab->doc || tab->native_wait || web_script_running(tab->doc)) return;
+    web_node *root = web_inspect_root(tab->doc);
+    if (tab->dt->selected && !web_inspect_contains(root, tab->dt->selected)) { tab->dt->selected = NULL; tab->dt->side_at = 0; }
+    if (tab->dt->hovered && !web_inspect_contains(root, tab->dt->hovered)) tab->dt->hovered = NULL;
+    if (tab->dt->panel != DT_ELEMENTS) { dt_measure(); return; }
     uint64_t now = n_clock_uptime_ms();
-    if (force || now - dt_tree_at >= 250) { dt_build_tree(); dt_tree_at = now; console_dirty = true; }
-    if (force || !dt_side_at || now - dt_side_at >= 1000) { dt_refresh_side(); console_dirty = true; }
+    if (force || now - tab->dt->tree_at >= 250) { dt_build_tree(); tab->dt->tree_at = now; tab->console_dirty = true; }
+    if (force || !tab->dt->side_at || now - tab->dt->side_at >= 1000) { dt_refresh_side(); tab->console_dirty = true; }
     dt_measure();
 }
 static void dt_select(web_node *n) {
     if (n && web_inspect_kind(n) == WEB_INSPECT_TEXT && web_inspect_parent(n)) n = web_inspect_parent(n);
-    dt_selected = n;
-    dt_side.top = 0;
+    tab->dt->selected = n;
+    tab->dt->side.top = 0;
     if (n) for (web_node *p = web_inspect_parent(n); p && web_inspect_kind(p) != WEB_INSPECT_DOCUMENT; p = web_inspect_parent(p))
         dt_set_open(p, true);
     devtools_refresh(true);
-    dt_scroll_to_row(&dt_tree, dt_row_of(n), dt_panel_rows());
+    dt_scroll_to_row(&tab->dt->tree, dt_row_of(n), dt_panel_rows());
 }
 
 /* ---------------------------------------------------------------- network */
-struct dt_request {
-    uint64_t serial, generation, resource, start, end;
-    char *method, *url, *request_headers, *response_headers, *error, *mime;
-    char *sent_headers; /* the fields the final hop sent (webnet's report_sent) */
-    size_t size;
-    int kind, status;
-    bool navigation, done, streamed;
-};
 #define DT_NET_MAX 20000
-static struct dt_request *dt_net;
-static int dt_net_n, dt_net_capacity, dt_net_top, dt_net_selected = -1;
-static uint64_t dt_net_serial, dt_nav_serial;
 
 static void dt_request_free(struct dt_request *r) {
     free(r->method); free(r->url); free(r->request_headers); free(r->response_headers); free(r->error); free(r->mime); free(r->sent_headers);
 }
+static struct devtools *devtools_new(void) {
+    struct devtools *d = calloc(1, sizeof *d);
+    if (d) { d->panel = DT_CONSOLE; d->sub = DT_STYLES; d->net_selected = -1; }
+    return d;
+}
+static void devtools_free(struct devtools *d) {
+    if (!d) return;
+    struct dt_lines *lines[] = {&d->tree, &d->side, &d->detail};
+    for (size_t i = 0; i < 3; i++) { dt_lines_clear(lines[i]); free(lines[i]->v); }
+    for (int i = 0; i < d->net_n; i++) dt_request_free(&d->net[i]);
+    free(d->net); free(d->open); free(d);
+}
 static void dt_net_clear(void) {
-    for (int i = 0; i < dt_net_n; i++) dt_request_free(&dt_net[i]);
-    dt_net_n = dt_net_top = 0; dt_net_selected = -1; dt_nav_serial = 0;
-    dt_lines_clear(&dt_detail);
-    console_dirty = true;
+    for (int i = 0; i < tab->dt->net_n; i++) dt_request_free(&tab->dt->net[i]);
+    tab->dt->net_n = tab->dt->net_top = 0; tab->dt->net_selected = -1; tab->dt->nav_serial = 0;
+    dt_lines_clear(&tab->dt->detail);
+    tab->console_dirty = true;
 }
 /* Requests are recorded while DevTools is open, as in other browsers. */
 static uint64_t dt_net_begin(bool navigation, uint64_t gen, uint64_t resource, int kind,
                              const char *method, const char *url, const char *headers) {
-    if (!console_open) return 0;
-    if (dt_net_n == DT_NET_MAX) {      /* keep the newer half of a very long session */
+    if (!tab->console_open) return 0;
+    if (tab->dt->net_n == DT_NET_MAX) {      /* keep the newer half of a very long session */
         int drop = DT_NET_MAX / 2;
-        for (int i = 0; i < drop; i++) dt_request_free(&dt_net[i]);
-        memmove(dt_net, dt_net + drop, (size_t)(dt_net_n - drop) * sizeof *dt_net);
-        dt_net_n -= drop;
-        dt_net_selected = dt_net_selected >= drop ? dt_net_selected - drop : -1;
-        dt_net_top = MAX(0, dt_net_top - drop);
+        for (int i = 0; i < drop; i++) dt_request_free(&tab->dt->net[i]);
+        memmove(tab->dt->net, tab->dt->net + drop, (size_t)(tab->dt->net_n - drop) * sizeof *tab->dt->net);
+        tab->dt->net_n -= drop;
+        tab->dt->net_selected = tab->dt->net_selected >= drop ? tab->dt->net_selected - drop : -1;
+        tab->dt->net_top = MAX(0, tab->dt->net_top - drop);
     }
-    if (dt_net_n == dt_net_capacity) {
-        int capacity = dt_net_capacity ? dt_net_capacity * 2 : 256;
-        void *grown = realloc(dt_net, (size_t)capacity * sizeof *dt_net);
+    if (tab->dt->net_n == tab->dt->net_capacity) {
+        int capacity = tab->dt->net_capacity ? tab->dt->net_capacity * 2 : 256;
+        void *grown = realloc(tab->dt->net, (size_t)capacity * sizeof *tab->dt->net);
         if (!grown) return 0;
-        dt_net = grown; dt_net_capacity = capacity;
+        tab->dt->net = grown; tab->dt->net_capacity = capacity;
     }
-    struct dt_request *r = &dt_net[dt_net_n];
+    struct dt_request *r = &tab->dt->net[tab->dt->net_n];
     memset(r, 0, sizeof *r);
-    r->serial = ++dt_net_serial; r->generation = gen; r->resource = resource; r->kind = kind;
+    r->serial = ++tab->dt->net_serial; r->generation = gen; r->resource = resource; r->kind = kind;
     r->navigation = navigation; r->start = n_clock_uptime_ms();
     r->method = strdup(method ? method : "GET"); r->url = strdup(url ? url : "");
     r->request_headers = headers ? strdup(headers) : NULL;
     if (!r->method || !r->url) { dt_request_free(r); return 0; }
-    dt_net_n++;
-    console_dirty = true;
+    tab->dt->net_n++;
+    tab->console_dirty = true;
     return r->serial;
 }
 static struct dt_request *dt_net_find(uint64_t serial) {
-    int lo = 0, hi = dt_net_n;
+    int lo = 0, hi = tab->dt->net_n;
     while (serial && lo < hi) {
         int mid = lo + (hi - lo) / 2;
-        if (dt_net[mid].serial < serial) lo = mid + 1; else hi = mid;
+        if (tab->dt->net[mid].serial < serial) lo = mid + 1; else hi = mid;
     }
-    return serial && lo < dt_net_n && dt_net[lo].serial == serial ? &dt_net[lo] : NULL;
+    return serial && lo < tab->dt->net_n && tab->dt->net[lo].serial == serial ? &tab->dt->net[lo] : NULL;
 }
 static char *dt_header_value(const char *headers, const char *name) {
     size_t n = strlen(name);
@@ -472,8 +494,8 @@ static void dt_net_update(uint64_t serial, const struct webnet_response *result)
         r->done = true; r->end = n_clock_uptime_ms();
         if (result->error && result->error[0] && !r->error) r->error = strdup(result->error);
     }
-    if (dt_net_selected >= 0 && &dt_net[dt_net_selected] == r) dt_net_detail_build();
-    if (console_open && dt_tab == DT_NETWORK) console_dirty = true;
+    if (tab->dt->net_selected >= 0 && &tab->dt->net[tab->dt->net_selected] == r) dt_net_detail_build();
+    if (tab->console_open && tab->dt->panel == DT_NETWORK) tab->console_dirty = true;
 }
 static const char *dt_request_type(const struct dt_request *r) {
     const char *mime = r->mime ? r->mime : "";
@@ -518,15 +540,15 @@ static void dt_detail_add(const char *name, const char *value, int width) {
         }
         if (!n && *p) n = 1;
         dt_put(&s, C_TEXT, p, n);
-        dt_line_add(&dt_detail, NULL, used ? 0 : 1, 0, &s, NULL);
+        dt_line_add(&tab->dt->detail, NULL, used ? 0 : 1, 0, &s, NULL);
         p += n; used = 0;
     } while (*p);
 }
 static void dt_detail_headers(const char *title, const char *headers, int width) {
     struct sb s = {0};
     dt_puts(&s, C_ACCENT, title);
-    dt_line_add(&dt_detail, NULL, 0, DT_HEADER, &s, NULL);
-    if (!headers || !*headers) { dt_puts(&s, C_DIM, "(none)"); dt_line_add(&dt_detail, NULL, 0, 0, &s, NULL); return; }
+    dt_line_add(&tab->dt->detail, NULL, 0, DT_HEADER, &s, NULL);
+    if (!headers || !*headers) { dt_puts(&s, C_DIM, "(none)"); dt_line_add(&tab->dt->detail, NULL, 0, 0, &s, NULL); return; }
     for (const char *p = headers; *p;) {
         size_t line = strcspn(p, "\r\n");
         const char *colon = memchr(p, ':', line);
@@ -541,16 +563,16 @@ static void dt_detail_headers(const char *title, const char *headers, int width)
         while (*p == '\r' || *p == '\n') p++;
     }
 }
-static int dt_net_list_w(void) { return dt_net_selected >= 0 ? view.w * 9 / 20 : view.w; }
+static int dt_net_list_w(void) { return tab->dt->net_selected >= 0 ? view.w * 9 / 20 : view.w; }
 static void dt_net_detail_build(void) {
-    dt_lines_clear(&dt_detail);
-    if (dt_net_selected < 0 || dt_net_selected >= dt_net_n) return;
-    const struct dt_request *r = &dt_net[dt_net_selected];
+    dt_lines_clear(&tab->dt->detail);
+    if (tab->dt->net_selected < 0 || tab->dt->net_selected >= tab->dt->net_n) return;
+    const struct dt_request *r = &tab->dt->net[tab->dt->net_selected];
     int width = view.w - dt_net_list_w();
     char text[64];
     struct sb s = {0};
     dt_puts(&s, C_ACCENT, "General");
-    dt_line_add(&dt_detail, NULL, 0, DT_HEADER, &s, NULL);
+    dt_line_add(&tab->dt->detail, NULL, 0, DT_HEADER, &s, NULL);
     dt_detail_add("Request URL", r->url, width);
     dt_detail_add("Request Method", r->method, width);
     if (r->status) { snprintf(text, sizeof text, "%d", r->status); dt_detail_add("Status Code", text, width); }
@@ -566,23 +588,23 @@ static void dt_net_detail_build(void) {
     else dt_detail_headers(r->navigation ? "Request Headers" : "Request Headers (set by the page)", r->request_headers, width);
 }
 static void dt_net_select(int index) {
-    dt_net_selected = index >= 0 && index < dt_net_n ? index : -1;
-    dt_detail.top = 0;
+    tab->dt->net_selected = index >= 0 && index < tab->dt->net_n ? index : -1;
+    tab->dt->detail.top = 0;
     dt_net_detail_build();
-    if (dt_net_selected >= 0) {
+    if (tab->dt->net_selected >= 0) {
         int rows = dt_rows_in(console_h() - DT_TABH - DT_NET_HEAD);
-        if (dt_net_selected < dt_net_top) dt_net_top = dt_net_selected;
-        else if (dt_net_selected >= dt_net_top + rows) dt_net_top = dt_net_selected - rows + 1;
+        if (tab->dt->net_selected < tab->dt->net_top) tab->dt->net_top = tab->dt->net_selected;
+        else if (tab->dt->net_selected >= tab->dt->net_top + rows) tab->dt->net_top = tab->dt->net_selected - rows + 1;
     }
-    console_dirty = true;
+    tab->console_dirty = true;
 }
 
 /* ---------------------------------------------------------------- drawing */
 static const char *const dt_tab_names[DT_NTABS] = {"Elements", "Console", "Network", "Trace"};
 static const char *const dt_sub_names[DT_NSUB] = {"Styles", "Computed", "Layout"};
-static int dt_tab_x(int tab) {
+static int dt_tab_x(int panel) {
     int x = 36;
-    for (int i = 0; i < tab; i++) x += gfx_text_width(dt_tab_names[i], FONT_SMALL) + 28;
+    for (int i = 0; i < panel; i++) x += gfx_text_width(dt_tab_names[i], FONT_SMALL) + 28;
     return x;
 }
 static int dt_sub_x(int split, int sub) {
@@ -600,8 +622,8 @@ static void dt_draw_lines(canvas_t *c, struct dt_lines *l, int x, int y, int wid
     for (int i = 0; i < rows && l->top + i < l->n; i++) {
         const struct dt_line *line = &l->v[l->top + i];
         int ly = y + i * DT_ROWH;
-        if (tree && line->node && line->node == dt_selected) gfx_fill(&clip, x, ly, width, DT_ROWH, DT_SELECT);
-        else if (tree && line->node && line->node == dt_hovered) gfx_fill(&clip, x, ly, width, DT_ROWH, DT_HOVER);
+        if (tree && line->node && line->node == tab->dt->selected) gfx_fill(&clip, x, ly, width, DT_ROWH, DT_SELECT);
+        else if (tree && line->node && line->node == tab->dt->hovered) gfx_fill(&clip, x, ly, width, DT_ROWH, DT_HOVER);
         else if (line->flags & DT_HEADER) gfx_fill(&clip, x, ly, width, DT_ROWH, DT_BAR);
         int lx = x + 4 + line->depth * 14;
         if (line->flags & DT_EXPANDABLE) {
@@ -627,23 +649,23 @@ static void dt_draw_tabs(canvas_t *c, int top) {
     gfx_hline(c, 0, top, view.w, DT_RULE);
     gfx_hline(c, 0, top + DT_TABH - 1, view.w, DT_RULE);
     /* element picker: a box with a pointer */
-    uint32_t picker = dt_picking ? DT_BLUE : dt_palette[C_DIM];
+    uint32_t picker = tab->dt->picking ? DT_BLUE : dt_palette[C_DIM];
     gfx_rect(c, 9, top + 6, 11, 11, picker);
     gfx_triangle(c, 15, top + 11, 24, top + 15, 18, top + 19, picker);
     gfx_vline(c, 30, top + 4, DT_TABH - 8, DT_RULE);
     for (int i = 0; i < DT_NTABS; i++) {
         int x = dt_tab_x(i), tw = gfx_text_width(dt_tab_names[i], FONT_SMALL);
-        gfx_text(c, x, top + 4, dt_tab_names[i], i == dt_tab ? RGB(232, 234, 237) : dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
-        if (i == dt_tab) gfx_fill(c, x - 6, top + DT_TABH - 3, tw + 12, 2, DT_BLUE);
+        gfx_text(c, x, top + 4, dt_tab_names[i], i == tab->dt->panel ? RGB(232, 234, 237) : dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
+        if (i == tab->dt->panel) gfx_fill(c, x - 6, top + DT_TABH - 3, tw + 12, 2, DT_BLUE);
     }
     char hint[128];
-    if (dt_tab == DT_ELEMENTS) snprintf(hint, sizeof hint, "%s", dt_picking ? "Click an element on the page (Esc: cancel)" : "Ctrl+Shift+C: pick   \xe2\x86\x90\xe2\x86\x92: collapse/expand");
-    else if (dt_tab == DT_NETWORK) {
-        size_t total = 0; for (int i = 0; i < dt_net_n; i++) total += dt_net[i].size;
+    if (tab->dt->panel == DT_ELEMENTS) snprintf(hint, sizeof hint, "%s", tab->dt->picking ? "Click an element on the page (Esc: cancel)" : "Ctrl+Shift+C: pick   \xe2\x86\x90\xe2\x86\x92: collapse/expand");
+    else if (tab->dt->panel == DT_NETWORK) {
+        size_t total = 0; for (int i = 0; i < tab->dt->net_n; i++) total += tab->dt->net[i].size;
         char size[32]; dt_format_size(size, sizeof size, total);
-        snprintf(hint, sizeof hint, "%d requests   %s transferred   Ctrl+K: clear", dt_net_n, size);
-    } else if (dt_tab == DT_TRACE) snprintf(hint, sizeof hint, "%d trace lines", console_trace.n);
-    else snprintf(hint, sizeof hint, "%d messages", console_page.n);
+        snprintf(hint, sizeof hint, "%d requests   %s transferred   Ctrl+K: clear", tab->dt->net_n, size);
+    } else if (tab->dt->panel == DT_TRACE) snprintf(hint, sizeof hint, "%d trace lines", tab->console_trace.n);
+    else snprintf(hint, sizeof hint, "%d messages", tab->console_page.n);
     int hw = gfx_text_width(hint, FONT_SMALL), hx = view.w - hw - 12;
     if (hx > dt_tab_x(DT_NTABS)) gfx_text(c, hx, top + 4, hint, dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
 }
@@ -662,12 +684,12 @@ static void dt_box_numbers(canvas_t *c, int x, int y, int width, int height, con
 static void dt_draw_box_model(canvas_t *c, int x, int y, int width, int height) {
     canvas_t clip = *c;
     gfx_clip(&clip, x, y, width, height);
-    if (!dt_sel_valid) {
-        gfx_text(&clip, x + 12, y + 8, dt_selected ? "This element generates no box (display: none, or not rendered)." :
+    if (!tab->dt->sel_valid) {
+        gfx_text(&clip, x + 12, y + 8, tab->dt->selected ? "This element generates no box (display: none, or not rendered)." :
                  "Select an element to see its box model.", dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
         return;
     }
-    const struct web_inspect_box *b = &dt_sel_box;
+    const struct web_inspect_box *b = &tab->dt->sel_box;
     int bw = MIN(width - 24, 420), bh = MIN(height - 60, 220);
     if (bw < 200 || bh < 140) { bw = MAX(bw, 200); bh = MAX(bh, 140); }
     int ox = x + (width - bw) / 2, oy = y + 10;
@@ -694,18 +716,18 @@ static void dt_draw_box_model(canvas_t *c, int x, int y, int width, int height) 
 }
 static void dt_draw_elements(canvas_t *c, int top, int h) {
     int split = dt_split();
-    if (!dt_tree.n) gfx_text(c, 12, top + 6, doc ? "Waiting for the document layout..." : "No document.", dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
-    else dt_draw_lines(c, &dt_tree, 0, top, split, h, true);
+    if (!tab->dt->tree.n) gfx_text(c, 12, top + 6, tab->doc ? "Waiting for the document layout..." : "No document.", dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
+    else dt_draw_lines(c, &tab->dt->tree, 0, top, split, h, true);
     gfx_vline(c, split, top, h, DT_RULE);
     gfx_fill(c, split + 1, top, view.w - split - 1, DT_SUBH, DT_BAR);
     gfx_hline(c, split + 1, top + DT_SUBH - 1, view.w - split - 1, DT_RULE);
     for (int i = 0; i < DT_NSUB; i++) {
         int x = dt_sub_x(split, i), tw = gfx_text_width(dt_sub_names[i], FONT_SMALL);
-        gfx_text(c, x, top + 3, dt_sub_names[i], i == dt_sub ? RGB(232, 234, 237) : dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
-        if (i == dt_sub) gfx_fill(c, x - 4, top + DT_SUBH - 3, tw + 8, 2, DT_BLUE);
+        gfx_text(c, x, top + 3, dt_sub_names[i], i == tab->dt->sub ? RGB(232, 234, 237) : dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
+        if (i == tab->dt->sub) gfx_fill(c, x - 4, top + DT_SUBH - 3, tw + 8, 2, DT_BLUE);
     }
-    if (dt_sub == DT_LAYOUT) dt_draw_box_model(c, split + 1, top + DT_SUBH, view.w - split - 1, h - DT_SUBH);
-    else dt_draw_lines(c, &dt_side, split + 1, top + DT_SUBH + 2, view.w - split - 1, h - DT_SUBH - 2, false);
+    if (tab->dt->sub == DT_LAYOUT) dt_draw_box_model(c, split + 1, top + DT_SUBH, view.w - split - 1, h - DT_SUBH);
+    else dt_draw_lines(c, &tab->dt->side, split + 1, top + DT_SUBH + 2, view.w - split - 1, h - DT_SUBH - 2, false);
 }
 static uint32_t dt_type_color(const char *type) {
     if (!strcmp(type, "document")) return RGB(138, 180, 248);
@@ -720,7 +742,7 @@ static void dt_draw_network(canvas_t *c, int top, int h) {
     static const char *const heads[] = {"Name", "Status", "Type", "Size", "Time", "Waterfall"};
     int name_w = MAX(list_w * 2 / 5, 120);
     int cols[7] = {0, name_w, name_w + 64, name_w + 150, name_w + 230, name_w + 300, list_w};
-    bool compact = dt_net_selected >= 0;
+    bool compact = tab->dt->net_selected >= 0;
     int ncols = compact ? 3 : 6;
     if (compact) cols[1] = list_w - 150, cols[2] = list_w - 80, cols[3] = list_w;
     gfx_fill(c, 0, top, list_w, DT_NET_HEAD, DT_BAR);
@@ -730,18 +752,18 @@ static void dt_draw_network(canvas_t *c, int top, int h) {
         if (i) gfx_vline(c, cols[i], top, h, DT_RULE);
     }
     int y = top + DT_NET_HEAD, rows = dt_rows_in(h - DT_NET_HEAD);
-    dt_net_top = MAX(0, MIN(dt_net_top, dt_net_n - rows));
-    if (!dt_net_n) {
+    tab->dt->net_top = MAX(0, MIN(tab->dt->net_top, tab->dt->net_n - rows));
+    if (!tab->dt->net_n) {
         gfx_text(c, 12, y + 8, "Recording network activity. Reload the page (F5) to record its requests.", dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
     }
-    uint64_t now = n_clock_uptime_ms(), first = dt_net_n ? dt_net[0].start : now, last = first + 1;
-    for (int i = 0; i < dt_net_n; i++) last = MAX(last, dt_net[i].done ? dt_net[i].end : now);
-    for (int i = 0; i < rows && dt_net_top + i < dt_net_n; i++) {
-        const struct dt_request *r = &dt_net[dt_net_top + i];
+    uint64_t now = n_clock_uptime_ms(), first = tab->dt->net_n ? tab->dt->net[0].start : now, last = first + 1;
+    for (int i = 0; i < tab->dt->net_n; i++) last = MAX(last, tab->dt->net[i].done ? tab->dt->net[i].end : now);
+    for (int i = 0; i < rows && tab->dt->net_top + i < tab->dt->net_n; i++) {
+        const struct dt_request *r = &tab->dt->net[tab->dt->net_top + i];
         int ry = y + i * DT_ROWH;
         bool failed = r->error || r->status >= 400 || (r->done && !r->status);
-        if (dt_net_top + i == dt_net_selected) gfx_fill(c, 0, ry, list_w, DT_ROWH, DT_SELECT);
-        else if ((dt_net_top + i) & 1) gfx_fill(c, 0, ry, list_w, DT_ROWH, RGB(36, 37, 40));
+        if (tab->dt->net_top + i == tab->dt->net_selected) gfx_fill(c, 0, ry, list_w, DT_ROWH, DT_SELECT);
+        else if ((tab->dt->net_top + i) & 1) gfx_fill(c, 0, ry, list_w, DT_ROWH, RGB(36, 37, 40));
         char name[160], text[48];
         dt_basename(r->url, name, sizeof name);
         if (!name[0]) strlcpy(name, r->url, sizeof name);
@@ -780,7 +802,7 @@ static void dt_draw_network(canvas_t *c, int top, int h) {
         gfx_text(c, dx + 8, top + 2, "\xc3\x97", dt_palette[C_TEXT], TRANSPARENT, FONT_SMALL);
         gfx_text(c, dx + 30, top + 2, "Headers", RGB(232, 234, 237), TRANSPARENT, FONT_SMALL);
         gfx_fill(c, dx + 26, top + DT_NET_HEAD - 3, gfx_text_width("Headers", FONT_SMALL) + 8, 2, DT_BLUE);
-        dt_draw_lines(c, &dt_detail, dx, top + DT_NET_HEAD + 2, dw, h - DT_NET_HEAD - 2, false);
+        dt_draw_lines(c, &tab->dt->detail, dx, top + DT_NET_HEAD + 2, dw, h - DT_NET_HEAD - 2, false);
     }
 }
 static void devtools_draw(canvas_t *c, int top, int h) {
@@ -788,12 +810,12 @@ static void devtools_draw(canvas_t *c, int top, int h) {
     canvas_t body = *c;
     gfx_clip(&body, 0, top + DT_TABH, view.w, h - DT_TABH);
     gfx_fill(&body, 0, top + DT_TABH, view.w, h - DT_TABH, DT_BG);
-    if (dt_tab == DT_ELEMENTS) dt_draw_elements(&body, top + DT_TABH, h - DT_TABH);
-    else if (dt_tab == DT_NETWORK) dt_draw_network(&body, top + DT_TABH, h - DT_TABH);
+    if (tab->dt->panel == DT_ELEMENTS) dt_draw_elements(&body, top + DT_TABH, h - DT_TABH);
+    else if (tab->dt->panel == DT_NETWORK) dt_draw_network(&body, top + DT_TABH, h - DT_TABH);
 }
 
 /* ---------------------------------------------------------------- page highlight */
-static bool devtools_overlay_visible(void) { return console_open && !browser_fullscreen && dt_overlay_valid; }
+static bool devtools_overlay_visible(void) { return tab->console_open && !browser_fullscreen && tab->dt->overlay_valid; }
 static void dt_band(canvas_t *c, int ox, int oy, int ow, int oh, int ix, int iy, int iw, int ih, uint32_t argb) {
     if (iy > oy) gfx_fill_blend(c, ox, oy, ow, iy - oy, argb);
     if (oy + oh > iy + ih) gfx_fill_blend(c, ox, iy + ih, ow, oy + oh - iy - ih, argb);
@@ -805,8 +827,8 @@ static void devtools_draw_overlay(canvas_t *page) {
     if (!devtools_overlay_visible()) return;
     canvas_t c = *page;
     gfx_clip(&c, 0, 0, page_w(), page_h());
-    const struct web_inspect_box *b = &dt_overlay;
-    int bx = b->x - scroll_x, by = b->y - scroll_y;
+    const struct web_inspect_box *b = &tab->dt->overlay;
+    int bx = b->x - tab->scroll_x, by = b->y - tab->scroll_y;
     int mt = dt_px(b->margin[0]), mr = dt_px(b->margin[1]), mb = dt_px(b->margin[2]), ml = dt_px(b->margin[3]);
     int bt = dt_px(b->border[0]), br = dt_px(b->border[1]), bb = dt_px(b->border[2]), bl = dt_px(b->border[3]);
     int pt = dt_px(b->padding[0]), pr = dt_px(b->padding[1]), pb = dt_px(b->padding[2]), pl = dt_px(b->padding[3]);
@@ -818,7 +840,7 @@ static void devtools_draw_overlay(canvas_t *page) {
     gfx_fill_blend(&c, cx, cy, cw, ch, ARGB(110, 111, 168, 220));
     /* tooltip under the box, or above it near the bottom of the page */
     int tw = 0;
-    for (const char *p = dt_overlay_label; *p;) {
+    for (const char *p = tab->dt->overlay_label; *p;) {
         if ((unsigned char)*p < 0x20) { p++; continue; }
         uint32_t cp; int k = gfx_utf8_decode(p, &cp); if (k <= 0) break;
         tw += MAX(gfx_codepoint_width(cp, FONT_SMALL), 0); p += k;
@@ -827,125 +849,125 @@ static void devtools_draw_overlay(canvas_t *page) {
     if (ty + 22 > page_h()) ty = by - mt - 28;
     ty = MAX(2, ty);
     gfx_fill_round(&c, tx, ty, tw + 16, 22, 4, RGB(48, 50, 54));
-    dt_draw_text(&c, tx + 8, ty + 3, dt_overlay_label, dt_palette[C_TEXT]);
+    dt_draw_text(&c, tx + 8, ty + 3, tab->dt->overlay_label, dt_palette[C_TEXT]);
 }
 
 /* ---------------------------------------------------------------- input */
 static void dt_set_hover(web_node *n) {
     if (n && web_inspect_kind(n) == WEB_INSPECT_TEXT) n = web_inspect_parent(n);
-    if (n == dt_hovered) return;
-    bool had = dt_overlay_valid;
-    dt_hovered = n;
+    if (n == tab->dt->hovered) return;
+    bool had = tab->dt->overlay_valid;
+    tab->dt->hovered = n;
     dt_measure();
-    if (had || dt_overlay_valid) need_paint = true;
-    console_dirty = true;
+    if (had || tab->dt->overlay_valid) tab->need_paint = true;
+    tab->console_dirty = true;
 }
-static void devtools_set_tab(int tab) {
-    if (tab == dt_tab) return;
-    dt_tab = tab;
-    if (tab != DT_ELEMENTS) dt_picking = false;
-    focus = F_CONSOLE;
+static void devtools_set_tab(int panel) {
+    if (panel == tab->dt->panel) return;
+    tab->dt->panel = panel;
+    if (panel != DT_ELEMENTS) tab->dt->picking = false;
+    tab->focus = F_CONSOLE;
     devtools_refresh(true);
-    console_dirty = true;
+    tab->console_dirty = true;
     show_chrome(); /* the console's line is a field of the window, only under its own tab */
 }
 /* Global DevTools shortcuts: Ctrl+Shift+I toggles, J opens the console,
    C opens Elements with the picker. */
 static void devtools_shortcut(uint32_t key) {
-    if (key == 'i') { console_open = !console_open; }
+    if (key == 'i') { tab->console_open = !tab->console_open; }
     else {
-        console_open = true;
-        dt_tab = key == 'j' ? DT_CONSOLE : DT_ELEMENTS;
-        dt_picking = key == 'c' ? !dt_picking : false;
+        tab->console_open = true;
+        tab->dt->panel = key == 'j' ? DT_CONSOLE : DT_ELEMENTS;
+        tab->dt->picking = key == 'c' ? !tab->dt->picking : false;
     }
-    if (console_open) focus = F_CONSOLE;
-    else { if (focus == F_CONSOLE) focus = F_PAGE; dt_picking = false; dt_set_hover(NULL); }
-    need_layout = need_paint = true;
+    if (tab->console_open) tab->focus = F_CONSOLE;
+    else { if (tab->focus == F_CONSOLE) tab->focus = F_PAGE; tab->dt->picking = false; dt_set_hover(NULL); }
+    tab->need_layout = tab->need_paint = true;
 }
 static void devtools_clear(void) {
-    if (dt_tab == DT_NETWORK) dt_net_clear();
-    else if (dt_tab == DT_TRACE) { console_trace.n = console_trace.skip = 0; console_dirty = true; }
-    else { console_page.n = console_page.skip = 0; console_dirty = true; }
+    if (tab->dt->panel == DT_NETWORK) dt_net_clear();
+    else if (tab->dt->panel == DT_TRACE) { tab->console_trace.n = tab->console_trace.skip = 0; tab->console_dirty = true; }
+    else { tab->console_page.n = tab->console_page.skip = 0; tab->console_dirty = true; }
 }
 static void dt_toggle(int row) {
-    if (row < 0 || row >= dt_tree.n || !(dt_tree.v[row].flags & DT_EXPANDABLE)) return;
-    dt_set_open(dt_tree.v[row].node, !(dt_tree.v[row].flags & DT_OPEN));
+    if (row < 0 || row >= tab->dt->tree.n || !(tab->dt->tree.v[row].flags & DT_EXPANDABLE)) return;
+    dt_set_open(tab->dt->tree.v[row].node, !(tab->dt->tree.v[row].flags & DT_OPEN));
     devtools_refresh(true);
 }
 /* Keys while DevTools has focus on a tab other than Console. */
 static void devtools_key(const struct gui_event *e) {
     uint32_t k = e->key;
     bool ctrl = e->mods & NMOD_CTRL;
-    if (ctrl && (k == '[' || k == ']')) { devtools_set_tab((dt_tab + (k == ']' ? 1 : DT_NTABS - 1)) % DT_NTABS); return; }
+    if (ctrl && (k == '[' || k == ']')) { devtools_set_tab((tab->dt->panel + (k == ']' ? 1 : DT_NTABS - 1)) % DT_NTABS); return; }
     if (k == NKEY_ESC) {
-        if (dt_picking) { dt_picking = false; dt_set_hover(NULL); }
-        else if (dt_tab == DT_NETWORK && dt_net_selected >= 0) dt_net_select(-1);
-        else focus = F_PAGE;
-        console_dirty = true;
+        if (tab->dt->picking) { tab->dt->picking = false; dt_set_hover(NULL); }
+        else if (tab->dt->panel == DT_NETWORK && tab->dt->net_selected >= 0) dt_net_select(-1);
+        else tab->focus = F_PAGE;
+        tab->console_dirty = true;
         return;
     }
     int rows = dt_panel_rows();
-    if (dt_tab == DT_NETWORK) {
+    if (tab->dt->panel == DT_NETWORK) {
         int list_rows = dt_rows_in(console_h() - DT_TABH - DT_NET_HEAD);
-        if (k == NKEY_UP) dt_net_select(dt_net_selected < 0 ? dt_net_n - 1 : MAX(0, dt_net_selected - 1));
-        else if (k == NKEY_DOWN) dt_net_select(MIN(dt_net_n - 1, dt_net_selected + 1));
-        else if (k == NKEY_PGUP) dt_net_top = MAX(0, dt_net_top - list_rows);
-        else if (k == NKEY_PGDN) dt_net_top += list_rows;
-        console_dirty = true;
+        if (k == NKEY_UP) dt_net_select(tab->dt->net_selected < 0 ? tab->dt->net_n - 1 : MAX(0, tab->dt->net_selected - 1));
+        else if (k == NKEY_DOWN) dt_net_select(MIN(tab->dt->net_n - 1, tab->dt->net_selected + 1));
+        else if (k == NKEY_PGUP) tab->dt->net_top = MAX(0, tab->dt->net_top - list_rows);
+        else if (k == NKEY_PGDN) tab->dt->net_top += list_rows;
+        tab->console_dirty = true;
         return;
     }
-    if (k == NKEY_PGUP) { dt_tree.top -= rows; console_dirty = true; return; }
-    if (k == NKEY_PGDN) { dt_tree.top += rows; console_dirty = true; return; }
-    int row = dt_row_of(dt_selected);
+    if (k == NKEY_PGUP) { tab->dt->tree.top -= rows; tab->console_dirty = true; return; }
+    if (k == NKEY_PGDN) { tab->dt->tree.top += rows; tab->console_dirty = true; return; }
+    int row = dt_row_of(tab->dt->selected);
     web_node *next = NULL;
-    if (k == NKEY_UP) next = row > 0 ? dt_tree.v[row - 1].node : dt_tree.n ? dt_tree.v[0].node : NULL;
+    if (k == NKEY_UP) next = row > 0 ? tab->dt->tree.v[row - 1].node : tab->dt->tree.n ? tab->dt->tree.v[0].node : NULL;
     else if (k == NKEY_DOWN) {
         int i = row + 1;
-        while (i < dt_tree.n && (dt_tree.v[i].flags & DT_CLOSING)) i++;
-        next = i < dt_tree.n ? dt_tree.v[i].node : dt_selected;
+        while (i < tab->dt->tree.n && (tab->dt->tree.v[i].flags & DT_CLOSING)) i++;
+        next = i < tab->dt->tree.n ? tab->dt->tree.v[i].node : tab->dt->selected;
     } else if (k == NKEY_LEFT && row >= 0) {
-        if (dt_tree.v[row].flags & DT_OPEN) { dt_toggle(row); return; }
-        web_node *parent = web_inspect_parent(dt_selected);
+        if (tab->dt->tree.v[row].flags & DT_OPEN) { dt_toggle(row); return; }
+        web_node *parent = web_inspect_parent(tab->dt->selected);
         if (parent && web_inspect_kind(parent) != WEB_INSPECT_DOCUMENT) next = parent;
     } else if (k == NKEY_RIGHT && row >= 0) {
-        if ((dt_tree.v[row].flags & DT_EXPANDABLE) && !(dt_tree.v[row].flags & DT_OPEN)) { dt_toggle(row); return; }
-        if (row + 1 < dt_tree.n && dt_tree.v[row + 1].depth > dt_tree.v[row].depth) next = dt_tree.v[row + 1].node;
+        if ((tab->dt->tree.v[row].flags & DT_EXPANDABLE) && !(tab->dt->tree.v[row].flags & DT_OPEN)) { dt_toggle(row); return; }
+        if (row + 1 < tab->dt->tree.n && tab->dt->tree.v[row + 1].depth > tab->dt->tree.v[row].depth) next = tab->dt->tree.v[row + 1].node;
     }
-    if (next && next != dt_selected) { dt_select(next); dt_set_hover(next); }
-    console_dirty = true;
+    if (next && next != tab->dt->selected) { dt_select(next); dt_set_hover(next); }
+    tab->console_dirty = true;
 }
 /* Scrolls whichever DevTools list is under the pointer. Cache-only. */
 static void devtools_wheel(int x, int y, int wheel) {
     (void)y;
-    if (dt_tab == DT_CONSOLE || dt_tab == DT_TRACE) { console_scroll(dt_tab == DT_TRACE ? &console_trace : &console_page, -wheel * 3); return; }
-    if (dt_tab == DT_ELEMENTS) { struct dt_lines *l = x < dt_split() ? &dt_tree : &dt_side; l->top = MAX(0, l->top - wheel * 3); }
-    else if (x < dt_net_list_w()) dt_net_top = MAX(0, dt_net_top - wheel * 3);
-    else dt_detail.top = MAX(0, dt_detail.top - wheel * 3);
-    console_dirty = true;
+    if (tab->dt->panel == DT_CONSOLE || tab->dt->panel == DT_TRACE) { console_scroll(tab->dt->panel == DT_TRACE ? &tab->console_trace : &tab->console_page, -wheel * 3); return; }
+    if (tab->dt->panel == DT_ELEMENTS) { struct dt_lines *l = x < dt_split() ? &tab->dt->tree : &tab->dt->side; l->top = MAX(0, l->top - wheel * 3); }
+    else if (x < dt_net_list_w()) tab->dt->net_top = MAX(0, tab->dt->net_top - wheel * 3);
+    else tab->dt->detail.top = MAX(0, tab->dt->detail.top - wheel * 3);
+    tab->console_dirty = true;
 }
 static bool dt_in_page(int x, int y) { return y >= 0 && y < page_h() && x >= 0 && x < page_w(); }
 /* Primary press: the resize edge, a picked page element, or the panel.
    Returns true when DevTools consumed the press. */
 static bool devtools_pointer_down(int x, int y) {
-    if (!console_open || browser_fullscreen) return false;
+    if (!tab->console_open || browser_fullscreen) return false;
     int top = page_h();
     dt_sync_doc();
     if (y >= top - 3 && y < top + 3 && y < view.h) { dt_resizing = true; return true; }
-    if (dt_picking && doc && dt_in_page(x, y)) {
-        web_node *n = web_node_at(doc, document_x(x), y + scroll_y);
-        dt_picking = false;
+    if (tab->dt->picking && tab->doc && dt_in_page(x, y)) {
+        web_node *n = web_node_at(tab->doc, document_x(x), y + tab->scroll_y);
+        tab->dt->picking = false;
         dt_swallow_up = true;
-        dt_tab = DT_ELEMENTS; focus = F_CONSOLE;
+        tab->dt->panel = DT_ELEMENTS; tab->focus = F_CONSOLE;
         if (n) dt_select(n);
         dt_set_hover(NULL);
-        need_paint = true;
+        tab->need_paint = true;
         return true;
     }
     if (y < top || y >= view.h) return false;
-    focus = F_CONSOLE;
-    console_dirty = true;
+    tab->focus = F_CONSOLE;
+    tab->console_dirty = true;
     if (y < top + DT_TABH) {
-        if (x < 30) { dt_picking = !dt_picking; if (dt_picking) devtools_set_tab(DT_ELEMENTS); else dt_set_hover(NULL); return true; }
+        if (x < 30) { tab->dt->picking = !tab->dt->picking; if (tab->dt->picking) devtools_set_tab(DT_ELEMENTS); else dt_set_hover(NULL); return true; }
         for (int i = 0; i < DT_NTABS; i++) {
             int tx = dt_tab_x(i), tw = gfx_text_width(dt_tab_names[i], FONT_SMALL);
             if (x >= tx - 12 && x < tx + tw + 12) { devtools_set_tab(i); break; }
@@ -953,29 +975,29 @@ static bool devtools_pointer_down(int x, int y) {
         return true;
     }
     int body = top + DT_TABH;
-    if (dt_tab == DT_ELEMENTS) {
+    if (tab->dt->panel == DT_ELEMENTS) {
         int split = dt_split();
         if (x < split) {
-            int row = dt_tree.top + (y - body) / DT_ROWH;
-            if (row < 0 || row >= dt_tree.n) return true;
-            const struct dt_line *line = &dt_tree.v[row];
+            int row = tab->dt->tree.top + (y - body) / DT_ROWH;
+            if (row < 0 || row >= tab->dt->tree.n) return true;
+            const struct dt_line *line = &tab->dt->tree.v[row];
             int lx = 4 + line->depth * 14;
             if ((line->flags & DT_EXPANDABLE) && x >= lx - 2 && x < lx + 12) dt_toggle(row);
             else dt_select(line->node);
         } else if (y < body + DT_SUBH) {
             for (int i = 0; i < DT_NSUB; i++) {
                 int sx = dt_sub_x(split, i), sw = gfx_text_width(dt_sub_names[i], FONT_SMALL);
-                if (x >= sx - 8 && x < sx + sw + 8 && i != dt_sub) { dt_sub = i; dt_side.top = 0; devtools_refresh(true); dt_refresh_side(); }
+                if (x >= sx - 8 && x < sx + sw + 8 && i != tab->dt->sub) { tab->dt->sub = i; tab->dt->side.top = 0; devtools_refresh(true); dt_refresh_side(); }
             }
         }
         return true;
     }
-    if (dt_tab == DT_NETWORK) {
+    if (tab->dt->panel == DT_NETWORK) {
         int list_w = dt_net_list_w();
         if (x >= list_w) { if (y < body + DT_NET_HEAD && x < list_w + 24) dt_net_select(-1); return true; }
         if (y >= body + DT_NET_HEAD) {
-            int row = dt_net_top + (y - body - DT_NET_HEAD) / DT_ROWH;
-            if (row >= 0 && row < dt_net_n) dt_net_select(row);
+            int row = tab->dt->net_top + (y - body - DT_NET_HEAD) / DT_ROWH;
+            if (row >= 0 && row < tab->dt->net_n) dt_net_select(row);
         }
         return true;
     }
@@ -983,21 +1005,21 @@ static bool devtools_pointer_down(int x, int y) {
 }
 /* Pointer motion: resizing (consumed), row hover and picker hover. */
 static bool devtools_pointer_move(int x, int y) {
-    if (!console_open || browser_fullscreen) return false;
+    if (!tab->console_open || browser_fullscreen) return false;
     if (dt_resizing) {
         int room = view.h;
         devtools_height = MAX(MIN(view.h - y, room - 60), MIN(120, room / 2));
-        need_layout = need_paint = true;
+        tab->need_layout = tab->need_paint = true;
         return true;
     }
     dt_sync_doc();
     int top = page_h();
-    if (dt_picking && doc && dt_in_page(x, y)) { dt_set_hover(web_node_at(doc, document_x(x), y + scroll_y)); return false; }
-    if (dt_tab == DT_ELEMENTS && y >= top + DT_TABH && y < view.h && x < dt_split()) {
-        int row = dt_tree.top + (y - top - DT_TABH) / DT_ROWH;
-        dt_set_hover(row >= 0 && row < dt_tree.n ? dt_tree.v[row].node : NULL);
+    if (tab->dt->picking && tab->doc && dt_in_page(x, y)) { dt_set_hover(web_node_at(tab->doc, document_x(x), y + tab->scroll_y)); return false; }
+    if (tab->dt->panel == DT_ELEMENTS && y >= top + DT_TABH && y < view.h && x < dt_split()) {
+        int row = tab->dt->tree.top + (y - top - DT_TABH) / DT_ROWH;
+        dt_set_hover(row >= 0 && row < tab->dt->tree.n ? tab->dt->tree.v[row].node : NULL);
         return false;
     }
-    if (dt_hovered) dt_set_hover(NULL);
+    if (tab->dt->hovered) dt_set_hover(NULL);
     return false;
 }

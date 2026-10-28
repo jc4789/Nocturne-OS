@@ -13,6 +13,23 @@ async function runPerformanceCases() {
     const throws=(name,error,fn)=>{let caught;try{fn();}catch(e){caught=e;}ok(name,!!caught&&(typeof error==='string'?caught.name===error:caught instanceof error));};
     const tick=()=>new Promise(resolve=>setTimeout(resolve,8));
     performance.clearMarks();performance.clearMeasures();
+    // HTML 6.2: the initial visibility state is in the timeline at time 0, and no clear removes it.
+    const visibilityEntries=performance.getEntriesByType('visibility-state');
+    eq('初期visibility-state項目',visibilityEntries.length,1);
+    const initialVisibility=visibilityEntries[0];
+    ok('VisibilityStateEntry型',initialVisibility instanceof VisibilityStateEntry&&initialVisibility instanceof PerformanceEntry);
+    eq('初期visibility名',initialVisibility.name,document.visibilityState);eq('初期visibility時刻',initialVisibility.startTime,0);
+    eq('visibility duration',initialVisibility.duration,0);eq('visibility entryType',initialVisibility.entryType,'visibility-state');
+    eq('VisibilityStateEntryタグ',Object.prototype.toString.call(initialVisibility),'[object VisibilityStateEntry]');
+    throws('VisibilityStateEntry構築不可',TypeError,()=>new VisibilityStateEntry());
+    throws('VisibilityStateEntry getter receiver',TypeError,()=>Object.getOwnPropertyDescriptor(VisibilityStateEntry.prototype,'name').get.call(performance.mark('not-visibility')));
+    performance.clearMarks();
+    const timeline=()=>performance.getEntries().filter(entry=>entry.entryType!=='visibility-state');
+    eq('visibility項目は時系列先頭',performance.getEntries()[0],initialVisibility);
+    ok('文書だけのonvisibilitychange',Object.getOwnPropertyDescriptor(Document.prototype,'onvisibilitychange')&&document.onvisibilitychange===null&&
+        !('onvisibilitychange' in HTMLElement.prototype)&&!('onvisibilitychange' in window));
+    let handled=0;document.onvisibilitychange=()=>handled++;document.dispatchEvent(new Event('visibilitychange'));
+    eq('onvisibilitychange処理器',handled,1);document.onvisibilitychange=null;
     ok('Performance継承',performance instanceof Performance&&performance instanceof EventTarget);
     eq('Performanceタグ',Object.prototype.toString.call(performance),'[object Performance]');
     throws('Performance構築不可',TypeError,()=>new Performance());
@@ -56,11 +73,11 @@ async function runPerformanceCases() {
     eq('DOMString undefined',performance.getEntriesByName(undefined).length,2);
     eq('DOMString null',performance.getEntriesByName(null).length,1);
     eq('空名',performance.getEntriesByName('').length,1);
-    performance.clearMarks(undefined);eq('undefined clear全消去',performance.getEntries().length,0);
+    performance.clearMarks(undefined);eq('undefined clear全消去',timeline().length,0);
     const late=performance.mark('same',{startTime:30}),early=performance.mark('same',{startTime:10});
     performance.mark('same',{startTime:10});
     const a=performance.getEntriesByType('mark');ok('時系列安定順序',a[0]===early&&a[2]===late);
-    a.length=0;eq('取得配列独立',performance.getEntries().length,3);
+    a.length=0;eq('取得配列独立',timeline().length,3);
     const between=performance.measure('between','same','same');
     ok('measure型',between instanceof PerformanceMeasure&&between instanceof PerformanceEntry);
     eq('直近発生mark選択',between.startTime,10);eq('between期間',between.duration,0);
@@ -103,10 +120,11 @@ async function runPerformanceCases() {
     performance.clearMarks('same');eq('特定mark消去',performance.getEntriesByName('same').length,0);
     eq('mark消去はmeasure保持',performance.getEntriesByType('measure').length,measures);
     performance.clearMeasures('between');eq('特定measure消去',performance.getEntriesByName('between').length,0);
-    performance.clearMarks();performance.clearMeasures();eq('全消去',performance.getEntries().length,0);
+    performance.clearMarks();performance.clearMeasures();eq('全消去',timeline().length,0);
+    eq('clearはvisibility保持',performance.getEntriesByType('visibility-state')[0],initialVisibility);
 
     const types=PerformanceObserver.supportedEntryTypes;
-    eq('実装する型だけ広告',types.join(','),'mark,measure,resource');eq('SameObject型配列',types,PerformanceObserver.supportedEntryTypes);
+    eq('実装する型だけ広告',types.join(','),'mark,measure,resource,visibility-state');eq('SameObject型配列',types,PerformanceObserver.supportedEntryTypes);
     ok('型配列凍結',Object.isFrozen(types));
     throws('callback必須',TypeError,()=>new PerformanceObserver());
     const invalid=new PerformanceObserver(()=>{});

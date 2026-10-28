@@ -56,6 +56,12 @@ export interface Common {
     key?: string | number;
     /** Scrolls the scroll box it is in until it can be seen, whenever this value changes (count up to ask again). */
     reveal?: number;
+    /** The right button clicks it too (x, y: where, in the widget), as for a menu of its own. */
+    onRightClick?: (x: number, y: number) => void;
+    /** The middle button clicks it too. */
+    onMiddleClick?: (x: number, y: number) => void;
+    /** A menu (menu(...)) shown over the window next to this widget, while the view has it; on a menuItem, its submenu. */
+    menu?: Widget;
 }
 
 export interface BoxProps extends Common {
@@ -101,7 +107,7 @@ export interface TextProps extends Common {
 
 export type IconName = "display" | "mouse" | "sound" | "language" | "info" | "check" | "plus" | "minus" | "close" |
     "chevron-right" | "chevron-left" | "chevron-up" | "chevron-down" | "settings" | "folder" | "clock" | "refresh" |
-    "backspace" | "home" | "search";
+    "backspace" | "home" | "search" | "menu" | "lock" | "trash";
 
 export interface ButtonProps extends Common {
     /** primary: the accent colour; secondary (default): a framed button; ghost: no frame. */
@@ -147,6 +153,61 @@ export interface FieldProps extends Common {
 export interface ItemProps extends Common { icon?: IconName; }
 
 export interface IconProps extends Common { size?: number; colour?: Colour; }
+
+export interface TabsProps extends Common {
+    /** The widest a tab is (default 240): tabs share the strip's width up to this. */
+    tabWidth?: number;
+    /** The narrowest a tab gets (default 100); below it the strip scrolls (wheel, arrows at its ends). */
+    tabMinWidth?: number;
+    /** Shows the "+" after the tabs (default true). */
+    add?: boolean;
+    /** The "+" was clicked: a new tab. */
+    onAdd?: () => void;
+    /** The strip. */
+    background?: Colour;
+    /** The chosen tab. */
+    selectedBackground?: Colour;
+    /** A tab under the pointer. */
+    hoverBackground?: Colour;
+    padding?: Padding;
+}
+
+export interface TabProps extends Common {
+    /** The chosen tab of its strip. */
+    selected?: boolean;
+    icon?: IconName;
+    /** A turning spinner in place of the icon. */
+    loading?: boolean;
+    /** Pixels per em of the title (default 13). */
+    size?: number;
+    /** The tab was pressed (it was not the chosen one). */
+    onSelect?: () => void;
+    /** Its close button or the middle button: close it. */
+    onClose?: () => void;
+    /** It was dragged from place from to place to of its strip: put it there (give tabs a key each). */
+    onMove?: (from: number, to: number) => void;
+}
+
+export interface MenuProps extends Common {
+    /** Which edge of the widget it lines up with, below it (or above when there is no room). */
+    edge?: "start" | "center" | "end";
+    /** Opens at this point of the widget instead ([x, y] in the widget, as from onRightClick). */
+    at?: readonly [number, number];
+    maxHeight?: number;
+    padding?: Padding;
+    background?: Colour;
+    border?: Colour;
+    radius?: number;
+    /** It should be left out of the next view: an item was chosen (after its onClick), Escape, or a
+        press outside the menus (or the window lost the keyboard). The view keeps showing it until then. */
+    onClose?: (reason: "chosen" | "escape" | "outside") => void;
+}
+
+export interface MenuItemProps extends Common {
+    icon?: IconName;
+    /** The keys that do the same, shown on the right ("Ctrl+T"). */
+    shortcut?: string;
+}
 
 /** A key press that no focused text field took. */
 export interface KeyEvent {
@@ -228,6 +289,18 @@ export function divider(props?: Common & {colour?: Colour}): Widget;
 export function spacer(size?: number): Widget;
 /** A bar filled to value (0 to 1). */
 export function progress(value: number, props?: Common & {length?: number}): Widget;
+/** A strip of tabs (tab(...) children) with a "+" after them; tabs are chosen when pressed, closed
+    by their button or the middle button, and dragged to other places. */
+export function tabs(props: TabsProps, ...tabs: Child[]): Widget;
+export function tabs(...tabs: Child[]): Widget;
+export function tab(title: string, props?: TabProps): Widget;
+/** A menu over the window, shown next to the widget whose `menu` it is: menuItem()s, divider()s and
+    other widgets to show. While it is shown it takes the pointer and the arrows, Home, End, Enter,
+    Space and Escape. */
+export function menu(props: MenuProps, ...items: Child[]): Widget;
+export function menu(...items: Child[]): Widget;
+/** An item of a menu (its `menu`: a submenu). */
+export function menuItem(label: string, onClick: () => void, props?: MenuItemProps): Widget;
 
 /** The colours and sizes the widgets use. */
 export const theme: {

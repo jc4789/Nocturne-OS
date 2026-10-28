@@ -18,6 +18,111 @@ static void get(webcookie_jar *j,const char *url,bool http,const char *expected)
     CHECK(n==(long)strlen(expected));CHECK(n>=0&&!strcmp(out,expected));
 }
 static webcookie_jar *jar(void) {webcookie_jar *j=webcookie_create();CHECK(j!=NULL);CHECK(webcookie_psl_load(j,psl,sizeof psl-1));return j;}
+/* Whether a Cookie value names name (at its start or after "; "). */
+static bool has(const char *out,const char *name) {
+    size_t n=strlen(name);
+    for(const char *p=out;(p=strstr(p,name));p++)if((p==out||(p>=out+2&&p[-2]==';'&&p[-1]==' '))&&p[n]=='=')return true;
+    return false;
+}
+static bool sends(webcookie_jar *j,const char *url,const char *name) {
+    struct webcookie_context c=context(url,true);static char out[WEBCOOKIE_OUTPUT_MAX+1];
+    return webcookie_get(j,&c,out,sizeof out,now)>=0&&has(out,name);
+}
+/* The store as jar would write it now (webcookie_load with the document first, as webnet does). */
+static unsigned char *save(webcookie_jar *j,const unsigned char *document,long length,long *out) {
+    CHECK(webcookie_load(j,document,length>0?(size_t)length:0,now)==1);
+    long n=webcookie_save(j,NULL,0,now);CHECK(n>=48);
+    unsigned char *bytes=n>0?malloc((size_t)n):NULL;CHECK(bytes!=NULL);
+    if(bytes){CHECK(webcookie_save(j,bytes,(size_t)n,now)==n);webcookie_saved(j);}
+    *out=n;return bytes;
+}
+static void limits(void) {
+    /* §5.7 in all: past WEBCOOKIE_TOTAL_MAX the least recently used cookie of any domain goes. */
+    webcookie_jar *j=jar();
+    for(int i=0;i<(int)WEBCOOKIE_TOTAL_MAX+100;i++){char url[64];snprintf(url,sizeof url,"https://h%d.example.com/",i);CHECK(set(j,url,"t=1",true)==1);}
+    CHECK(!sends(j,"https://h0.example.com/","t"));CHECK(!sends(j,"https://h99.example.com/","t"));
+    CHECK(sends(j,"https://h100.example.com/","t"));CHECK(sends(j,"https://h3099.example.com/","t"));
+    long n=webcookie_export(j,NULL,0,now);CHECK(n>0&&(size_t)n<=WEBCOOKIE_SNAPSHOT_MAX);
+    void *snapshot=malloc((size_t)n);CHECK(snapshot!=NULL);
+    if(snapshot){CHECK(webcookie_export(j,snapshot,(size_t)n,now)==n);webcookie_jar *k=jar();CHECK(webcookie_import(k,snapshot,(size_t)n,now));
+        CHECK(sends(k,"https://h3099.example.com/","t"));webcookie_free(k);free(snapshot);}
+    webcookie_free(j);
+    /* Per domain field the non-Secure cookie goes before an older Secure one. */
+    j=jar();CHECK(set(j,"https://example.com/","s0=1; Secure",true)==1);CHECK(set(j,"https://example.com/","n1=1",true)==1);
+    for(int i=2;i<(int)WEBCOOKIE_DOMAIN_MAX+1;i++){char value[32];snprintf(value,sizeof value,"s%d=1; Secure",i);CHECK(set(j,"https://example.com/",value,true)==1);}
+    CHECK(sends(j,"https://example.com/","s0"));CHECK(!sends(j,"https://example.com/","n1"));CHECK(sends(j,"https://example.com/","s180"));
+    webcookie_free(j);
+}
+static unsigned test_rule(void *opaque,const char *host) {
+    (void)opaque;size_t n=strlen(host);
+    static const char *const names[]={"blocked.com","temp.com"};
+    for(unsigned k=0;k<2;k++){size_t m=strlen(names[k]);
+        if(n>=m&&!strcmp(host+n-m,names[k])&&(n==m||host[n-m-1]=='.'))return k?WEBCOOKIE_TRANSIENT:WEBCOOKIE_BLOCK;}
+    return WEBCOOKIE_ALLOW;
+}
+static void rules(void) {
+    webcookie_jar *j=jar();
+    CHECK(set(j,"https://www.blocked.com/","a=1; Max-Age=100",true)==1);
+    CHECK(set(j,"https://www.temp.com/","b=1; Max-Age=100",true)==1);
+    CHECK(set(j,"https://example.com/","c=1; Max-Age=100",true)==1);
+    webcookie_set_rule(j,test_rule,NULL);
+    /* Blocked: none set (HTTP or document.cookie), none sent, even one set before. */
+    CHECK(set(j,"https://www.blocked.com/","d=1; Max-Age=100",true)==0);
+    CHECK(set(j,"https://www.blocked.com/","d=1; Max-Age=100",false)==0);
+    get(j,"https://www.blocked.com/",true,"");get(j,"https://www.blocked.com/",false,"");
+    CHECK(sends(j,"https://www.temp.com/","b"));CHECK(sends(j,"https://example.com/","c"));
+    webcookie_free(j);
+}
+static void store(void) {
+    /* Two processes: each jar tracks its changes and merges the other's saved store. */
+    webcookie_jar *a=jar(),*b=jar();webcookie_track(a);webcookie_track(b);
+    webcookie_set_rule(a,test_rule,NULL);webcookie_set_rule(b,test_rule,NULL);
+    CHECK(set(a,"https://example.com/","p=1; Max-Age=1000",true)==1);
+    CHECK(set(a,"https://example.com/","s=1",true)==1);
+    CHECK(set(a,"https://www.temp.com/","t=1; Max-Age=1000",true)==1);
+    CHECK(webcookie_changed(a));
+    long n0;unsigned char *file=save(a,NULL,0,&n0);CHECK(!webcookie_changed(a));
+    /* The session cookie and the transient one stay in a's memory, not in the store. */
+    CHECK(webcookie_load(b,file,(size_t)n0,now)==1);
+    CHECK(sends(b,"https://example.com/","p"));CHECK(!sends(b,"https://example.com/","s"));CHECK(!sends(b,"https://www.temp.com/","t"));
+    CHECK(sends(a,"https://example.com/","s"));CHECK(sends(a,"https://www.temp.com/","t"));
+    /* Both change before seeing the other's change: neither change is lost. */
+    CHECK(set(b,"https://example.com/","q=2; Max-Age=1000",true)==1);
+    CHECK(set(a,"https://example.com/","r=3; Max-Age=1000",true)==1);
+    long n1;unsigned char *file1=save(b,file,n0,&n1);free(file);
+    long n2;unsigned char *file2=save(a,file1,n1,&n2);free(file1);
+    CHECK(sends(a,"https://example.com/","p")&&sends(a,"https://example.com/","q")&&sends(a,"https://example.com/","r")&&sends(a,"https://example.com/","s"));
+    CHECK(webcookie_load(b,file2,(size_t)n2,now)==1);
+    CHECK(sends(b,"https://example.com/","p")&&sends(b,"https://example.com/","q")&&sends(b,"https://example.com/","r"));
+    /* A deletion reaches the other process. */
+    CHECK(set(a,"https://example.com/","p=; Max-Age=0",true)==1);
+    long n3;unsigned char *file3=save(a,file2,n2,&n3);free(file2);
+    CHECK(webcookie_load(b,file3,(size_t)n3,now)==1);CHECK(!sends(b,"https://example.com/","p"));CHECK(sends(b,"https://example.com/","q"));
+    /* A clear reaches the other process's session cookies too, once. */
+    CHECK(set(b,"https://www.example.com/","z=1; Domain=example.com",true)==1);
+    CHECK(set(b,"https://other.org/","o=1",true)==1);
+    CHECK(webcookie_clear(a,"example.com")>=2);
+    long n4;unsigned char *file4=save(a,file3,n3,&n4);free(file3);
+    CHECK(webcookie_load(b,file4,(size_t)n4,now)==1);
+    CHECK(!sends(b,"https://www.example.com/","z"));CHECK(!sends(b,"https://example.com/","q"));CHECK(sends(b,"https://other.org/","o"));
+    CHECK(set(b,"https://www.example.com/","z=2; Domain=example.com",true)==1);
+    CHECK(webcookie_load(b,file4,(size_t)n4,now)==1);CHECK(sends(b,"https://www.example.com/","z"));
+    /* Sites and their bytes: name, value, domain and path. */
+    CHECK(set(b,"https://a.other.org/","x=1; Max-Age=1000",true)==1);
+    struct webcookie_site *sites=NULL;long count=webcookie_sites(b,&sites,now);
+    CHECK(count==2&&sites&&!strcmp(sites[0].site,"example.com")&&sites[0].cookies==1&&!strcmp(sites[1].site,"other.org")&&sites[1].cookies==2);
+    CHECK(count==2&&sites&&sites[1].bytes==(uint64_t)(1+1+9+1)+(1+1+11+1));
+    free(sites);
+    /* The session's end: session and transient cookies go, persistent ones stay. */
+    webcookie_session_end(a);
+    CHECK(!sends(a,"https://www.temp.com/","t"));CHECK(!sends(a,"https://example.com/","s"));
+    CHECK(set(a,"https://example.com/","k=1; Max-Age=1000",true)==1);
+    webcookie_session_end(a);CHECK(sends(a,"https://example.com/","k"));
+    /* A store that does not parse leaves the jar as it was. */
+    unsigned char bad[48]={'N','C','S','1'};bad[16]=200;
+    CHECK(webcookie_load(a,bad,sizeof bad,now)==0);CHECK(sends(a,"https://example.com/","k"));
+    free(file4);webcookie_free(a);webcookie_free(b);
+}
 int main(int argc,char **argv) {
     webcookie_jar *j=jar();
     CHECK(set(j,"https://www.example.com/a/b?x=y","first=1",true)==1);
@@ -153,12 +258,12 @@ int main(int argc,char **argv) {
     get(j,"https://b.a.example.com/",true,"");CHECK(!webcookie_same_site(j,"https://a.example.com/","https://b.example.com/"));
     CHECK(!webcookie_psl_load(j,"com\n\xc3\xa9.com\n",11));webcookie_free(j);
 
-    j=jar();for(int i=0;i<70;i++){char value[32];snprintf(value,sizeof value,"c%d=1",i);CHECK(set(j,"https://example.com/",value,true)==1);}
-    c=context("https://example.com/",true);CHECK(webcookie_get(j,&c,out,sizeof out,now)>0&&!strstr(out,"c0=")&&strstr(out,"c69="));
+    /* RFC 6265bis §5.7 per domain field: past WEBCOOKIE_DOMAIN_MAX the least recently used goes. */
+    j=jar();for(int i=0;i<(int)WEBCOOKIE_DOMAIN_MAX+20;i++){char value[32];snprintf(value,sizeof value,"c%d=1",i);CHECK(set(j,"https://example.com/",value,true)==1);}
+    c=context("https://example.com/",true);CHECK(webcookie_get(j,&c,out,sizeof out,now)>0&&!has(out,"c0")&&!has(out,"c19")&&has(out,"c20")&&has(out,"c199"));
     char huge[WEBCOOKIE_FIELD_MAX+2];memset(huge,'a',sizeof huge);huge[1]='=';huge[sizeof huge-1]=0;
     CHECK(webcookie_set(j,&c,huge,sizeof huge-1,now)==-1);webcookie_free(j);
-    /* Snapshot quota eviction must preserve export/import validity, not leave
-       stale count/byte bookkeeping. Exercise a payload near the transport cap. */
+    /* Large cookies are not evicted by their bytes: the snapshot of a jar always reaches a worker. */
     j=jar();char dense[4097];memset(dense,'a',sizeof dense-1);dense[0]='q';dense[1]='=';dense[sizeof dense-1]=0;
     for(int i=0;i<70;i++){
         char url[64];snprintf(url,sizeof url,"https://h%d.example.com/",i);
@@ -170,10 +275,13 @@ int main(int argc,char **argv) {
         CHECK(webcookie_export(j,snapshot,(size_t)n,now)==n);
         other=jar();CHECK(webcookie_import(other,snapshot,(size_t)n,now));
         get(other,"https://h69.example.com/",true,dense);
-        get(other,"https://h0.example.com/",true,"");
+        get(other,"https://h0.example.com/",true,dense);
         webcookie_free(other);free(snapshot);
     }
     webcookie_free(j);
+    limits();
+    rules();
+    store();
     /* The deployed complete PSL, not merely the small policy-unit table. */
     FILE *f=fopen(argc>1?argv[1]:"C:\\Nocturne\\Web\\public_suffix_list.dat","r");
     CHECK(f!=NULL);

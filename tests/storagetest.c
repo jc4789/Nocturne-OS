@@ -13,12 +13,13 @@
 #include "webstorage.h"
 
 static webstorage *store;
+static uint64_t tab; /* the one tab of each store: its sessionStorage */
 static int checks, failed, js_errors, calls;
 static bool done;
 static char fixture_origin[160];
 static void check(bool ok,const char *name){checks++;if(!ok){failed++;printf("FAIL storage %s\n",name);}}
 static int access_store(void *opaque,const char *origin,const struct web_storage_request *r,struct web_storage_result *out){
-    (void)opaque;calls++;return webstorage_access(store,origin,r,out);
+    (void)opaque;calls++;return webstorage_access(store,tab,origin,r,out);
 }
 static bool request(void *opaque,const struct web_request *r){(void)opaque;(void)r;check(false,"unexpected network request");return false;}
 static void message(void *opaque,int level,const char *text){
@@ -43,7 +44,7 @@ static bool script(const char *url,const char *code){
 static int direct(const char *origin,int kind,int op,const char *key,const char *value,struct web_storage_result *out){
     struct web_storage_request r={.kind=kind,.operation=op,.key=key,.value=value,
         .key_len=key?strlen(key):0,.value_len=value?strlen(value):0};
-    return webstorage_access(store,origin,&r,out);
+    return webstorage_access(store,tab,origin,&r,out);
 }
 static void expect(const char *origin,int kind,const char *key,const char *value,const char *name){
     struct web_storage_result out={0};int status=direct(origin,kind,WEB_STORAGE_GET,key,NULL,&out);
@@ -77,6 +78,7 @@ int main(int argc,char **argv){
     if(argc!=2 || strcmp(argv[1],"--isolated-scratch")){puts("REFUSE: an isolated QEMU scratch disk is required; pass --isolated-scratch only there");return 2;}
     snprintf(fixture_origin,sizeof fixture_origin,"https://storage-fixture-%d-%llu.invalid",(int)n_app_self(),(unsigned long long)uptime_ms());
     store=webstorage_create();check(store!=NULL,"backend allocation");if(!store)return 1;
+    tab=webstorage_session_open(store);check(tab!=0,"tab session allocation");
     FILE *file=fopen("C:\\Tests\\js_storage_cases.js","rb");check(file!=NULL,"JS fixture present");
     if(file){
         fseek(file,0,SEEK_END);long length=ftell(file);rewind(file);
@@ -99,7 +101,7 @@ int main(int argc,char **argv){
     script("file:///C:/Users/User/storage-fixture.html","for(const key of ['localStorage','sessionStorage']){let ok=false;try{globalThis[key];}catch(e){ok=e.name==='SecurityError';}if(!ok)console.log('FAIL opaque storage '+key);}console.log('STORAGE-DONE opaque');");
     check(calls==oldcalls,"opaque origins never reach backend");
     expect(fixture_origin,WEB_STORAGE_SESSION,"navigation","kept","session survives document navigation");
-    webstorage_free(store);cold_fixture(fixture_origin);store=webstorage_create();
+    webstorage_free(store);cold_fixture(fixture_origin);store=webstorage_create();tab=webstorage_session_open(store);
     expect(fixture_origin,WEB_STORAGE_LOCAL,"persistent","yes","local persists across backend recreation");
     expect(fixture_origin,WEB_STORAGE_SESSION,"navigation",NULL,"fresh window session is empty");
     struct web_storage_result out={0};
@@ -112,11 +114,11 @@ int main(int argc,char **argv){
     check(webstorage_flush(store,true,&out)==WEB_STORAGE_OK,"flush generation one");
     check(direct(corrupt_origin,WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"key","two",&out)==WEB_STORAGE_OK,"snapshot generation two");
     check(webstorage_flush(store,true,&out)==WEB_STORAGE_OK,"flush generation two");
-    corrupt(corrupt_origin,1);webstorage_free(store);cold_fixture(corrupt_origin);store=webstorage_create();
+    corrupt(corrupt_origin,1);webstorage_free(store);cold_fixture(corrupt_origin);store=webstorage_create();tab=webstorage_session_open(store);
     expect(corrupt_origin,WEB_STORAGE_LOCAL,"key","one","invalid new slot recovers previous snapshot");
     check(direct(corrupt_origin,WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"key","three",&out)==WEB_STORAGE_OK,"write repairs inactive slot");
-    webstorage_free(store);cold_fixture(corrupt_origin);store=webstorage_create();expect(corrupt_origin,WEB_STORAGE_LOCAL,"key","three","repaired snapshot persists");
-    corrupt(corrupt_origin,0);corrupt(corrupt_origin,1);webstorage_free(store);cold_fixture(corrupt_origin);store=webstorage_create();
+    webstorage_free(store);cold_fixture(corrupt_origin);store=webstorage_create();tab=webstorage_session_open(store);expect(corrupt_origin,WEB_STORAGE_LOCAL,"key","three","repaired snapshot persists");
+    corrupt(corrupt_origin,0);corrupt(corrupt_origin,1);webstorage_free(store);cold_fixture(corrupt_origin);store=webstorage_create();tab=webstorage_session_open(store);
     check(direct(corrupt_origin,WEB_STORAGE_LOCAL,WEB_STORAGE_GET,"key",NULL,&out)==WEB_STORAGE_IO,"all snapshots corrupt: explicit failure, not reset");
     script(corrupt_origin,"let error;try{localStorage;}catch(e){error=e;}if(!error||error.name!=='UnknownError')console.log('FAIL corrupt storage error');console.log('STORAGE-DONE corrupt');");
     expect(fixture_origin,WEB_STORAGE_LOCAL,"persistent","yes","other origin preserved after corruption");

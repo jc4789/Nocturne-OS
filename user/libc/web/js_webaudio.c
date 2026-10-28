@@ -74,6 +74,7 @@ struct audio_context {
     uint32_t seen;        /* *wa_context_posted when the queue last caught up with it */
     uint64_t token;       /* its watch on web_wait_queue */
     bool watching;
+    bool offline;         /* an OfflineAudioContext: it renders into a buffer, never to sound */
 };
 static struct audio_context *contexts;
 
@@ -304,6 +305,7 @@ static JSValue js_context(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     if (a) a->c = wa_context_new((float)rate, channels, (uint64_t)length);
     if (!a || !a->c) { free(a); JS_FreeValue(ctx, token); return JS_ThrowOutOfMemory(ctx); }
     a->realm = ctx;
+    a->offline = length > 0;
     a->callback = JS_DupValue(ctx, argv[3]);
     a->refs = 1;
     a->token = WEB_AUDIO_TOKEN | (++next_token & TOKEN_MASK);
@@ -1056,6 +1058,16 @@ int web_audio_run(JSContext *ctx) {
         }
     }
     return 0;
+}
+
+bool web_audio_audible(JSContext *ctx) {
+    for (struct audio_context *a = contexts; a; a = a->next) {
+        if (a->realm != ctx || a->offline) continue;
+        struct wa_context_status st;
+        wa_context_status(a->c, &st);
+        if (st.state == WA_RUNNING) return true;
+    }
+    return false;
 }
 
 int64_t web_audio_deadline(JSContext *ctx, uint64_t now) {

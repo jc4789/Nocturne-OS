@@ -178,6 +178,22 @@ int webnet_cookie_set(webnet *, const char *url, const char *value);
    same-site caller policy; an explicit empty URL denotes an opaque top site. */
 long webnet_cookie_get_site(webnet *,const char *url,const char *top_level_url,char *out,size_t cap);
 int webnet_cookie_set_site(webnet *,const char *url,const char *top_level_url,const char *value);
+/* The jar is the window process's; its persistent cookies are kept in the document "cookies" of
+   the browser's profile folder, which every window shares (webnet.c, cookie_sync): read at
+   webnet_create and whenever another window saves it, saved a second after a change and at
+   webnet_free. Session cookies and those of hosts the user's choices do not keep (webprefs.h)
+   stay the process's own. The user's exceptions apply to every cookie set and sent. */
+struct webcookie_site;
+/* What the jar holds of each site (registrable domain), sorted: a malloc'd array (free it) in
+   *out and its length, or -1 (no memory). Includes what other windows saved. */
+long webnet_cookie_sites(webnet *, struct webcookie_site **out);
+/* Removes the cookies of site and its subdomains (NULL or "": all), session ones too, and saves
+   at once; other windows remove theirs when they read the store. The count removed, or the
+   store's failure (negative n_result; the clear is saved at a later try). */
+long webnet_cookie_clear(webnet *, const char *site);
+/* The site (registrable domain, by the Public Suffix List the jar uses) of a host, in out: the
+   key the settings page groups a site's cookies and storage by. false when it does not fit. */
+bool webnet_site(const webnet *, const char *host, char *out, size_t cap);
 /* Copies all request data; 0 means invalid request, queue full, or allocation failure. */
 uint64_t webnet_submit(webnet *, const struct webnet_request *, webnet_callback, void *opaque);
 /* Dispatches completions only here. Response pointers remain valid until callback returns.

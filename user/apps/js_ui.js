@@ -173,10 +173,19 @@ function spacer(size) { return widget('spacer', size === undefined ? {} : {size}
 function progress(value, props) { return widget('progress', {...props, value}); }
 /* Free drawing: draw(painter, width, height) records what to paint inside the widget's box. */
 function canvas(draw, props) { return widget('canvas', {...props, draw}); }
+/* A strip of tab() children; onAdd: its "+". */
+const tabs = container('tabs');
+/* A tab: onSelect when it is pressed, onClose (its close button, the middle button), onMove(from, to)
+   when it is dragged to another place of its strip. */
+function tab(label, props) { return widget('tab', {...props, text: String(label)}); }
+/* A menu shown over the window next to the widget whose `menu` property it is; onClose(reason). */
+const menu = container('menu');
+function menuItem(label, onClick, props) { return widget('item', {...props, text: String(label), onClick}); }
 
 /* ---- encoding ---- */
 const CONTAINERS = new Set(['column', 'row', 'scroll', 'card']);
-const SKIP = new Set(['draw', 'choices']);
+const SKIP = new Set(['draw', 'choices', 'menu']);
+const isWidget = value => value !== null && typeof value === 'object' && 'kind' in value;
 
 function prop(w, name, value) {
     if (typeof value === 'boolean') value = value ? 1 : 0;
@@ -213,14 +222,16 @@ function painter(ops) {
     });
 }
 
-/* Writes a widget and its children in pre-order; handlers[i] is the widget at place i. */
+/* Writes a widget and its children in pre-order; handlers[i] is the widget at place i. A widget's
+   menu goes after its children (the engine shows it over the window, not among them). */
 function encode(w, node, handlers, app) {
     const index = handlers.length;
     handlers.push(node);
     const p = node.props;
+    const kids = isWidget(p.menu) ? [...node.children, p.menu] : node.children;
     w.name(node.kind);
     const counts = w.length;
-    w.u16(0).u16(node.children.length);
+    w.u16(0).u16(kids.length);
     let n = 0;
     for (const key in p) {
         const value = p[key];
@@ -228,6 +239,8 @@ function encode(w, node, handlers, app) {
         n += prop(w, key === 'align' && !CONTAINERS.has(node.kind) ? 'self' : key, value);
     }
     if (p.onClick && CONTAINERS.has(node.kind)) n += prop(w, 'clickable', 1);
+    const buttons = (p.onRightClick ? 2 : 0) | (p.onMiddleClick ? 4 : 0);
+    if (buttons && p.buttons === undefined) n += prop(w, 'buttons', buttons);
     if (node.kind === 'segmented') {
         n += prop(w, 'options', p.choices.map(o => o.label));
         n += prop(w, 'selected', p.choices.findIndex(o => Object.is(o.value, p.value)));
@@ -242,11 +255,12 @@ function encode(w, node, handlers, app) {
         n += 1 + prop(w, 'drawn', size);
     }
     w.patch16(counts, n);
-    for (const child of node.children) encode(w, child, handlers, app);
+    for (const child of kids) encode(w, child, handlers, app);
 }
 
 /* ---- apps ---- */
-const EVENT = {CLICK: 1, TOGGLE: 2, SLIDE: 3, CHOOSE: 4, TEXT: 5, SUBMIT: 6, KEY: 7, CLOSE: 8, CANVAS: 9, RESIZE: 10, POINTER: 11, WHEEL: 12, FOCUS: 13};
+const EVENT = {CLICK: 1, TOGGLE: 2, SLIDE: 3, CHOOSE: 4, TEXT: 5, SUBMIT: 6, KEY: 7, CLOSE: 8, CANVAS: 9, RESIZE: 10, POINTER: 11, WHEEL: 12, FOCUS: 13,
+               DIRECT: 14, FRAME: 15, DISMISS: 16, ADD: 17, MOVE: 18};
 const MOD_SHIFT = 1, MOD_CTRL = 2, MOD_ALT = 4, DONE = 1, GONE = 2, DOWN = 4, UP = 8, CANCEL = 16;
 const windows = new Map();
 let nextWindow = 1;
@@ -302,10 +316,26 @@ class App {
         const a = r.f64(), b = r.f64(), str = r.str();
         const node = this.#views.get(view)?.[index], p = node?.props ?? {};
         switch (type) {
-        case EVENT.CLICK: p.onClick?.(); break;
+        case EVENT.CLICK: { /* the button in flags: 2 right, 4 middle (a, b: where), else the left one or keys.
+                               An item of a menu is chosen with any button: without a handler for it, onClick. */
+            const button = flags >> 8 & 255;
+            if (button === 2 && p.onRightClick) p.onRightClick(a, b);
+            else if (button === 4 && p.onMiddleClick) p.onMiddleClick(a, b);
+            else p.onClick?.();
+            break;
+        }
         case EVENT.TOGGLE: p.onChange?.(!!a); break;
         case EVENT.SLIDE: p.onChange?.(a, !!(flags & DONE)); break;
-        case EVENT.CHOOSE: { const o = p.choices?.[a]; if (o) p.onChange?.(o.value); break; }
+        case EVENT.CHOOSE:
+            if (node?.kind === 'tab') p.onSelect?.();
+            else { const o = p.choices?.[a]; if (o) p.onChange?.(o.value); }
+            break;
+        case EVENT.DISMISS: /* a tab's close; a menu that should be left out of the view */
+            if (node?.kind === 'menu') p.onClose?.(flags & DONE ? 'chosen' : flags & CANCEL ? 'escape' : 'outside');
+            else p.onClose?.();
+            break;
+        case EVENT.ADD: p.onAdd?.(); break;
+        case EVENT.MOVE: p.onMove?.(a, b); break;
         case EVENT.TEXT: p.onChange?.(str); break;
         case EVENT.SUBMIT: p.onSubmit?.(str); break;
         case EVENT.KEY: {
@@ -380,7 +410,7 @@ function watchSystem(listener) {
 internal.ui = Object.freeze({
     run, theme, mix, withAlpha,
     column, row, scroll, card, text, heading, title, caption, button, toggle, checkbox, slider, segmented,
-    textField, listItem, icon, divider, spacer, progress, canvas,
+    textField, listItem, icon, divider, spacer, progress, canvas, tabs, tab, menu, menuItem,
     /* The computer: processor, memory, uptime and running tasks (null if the system will not say). */
     systemInfo: () => host.systemInfo(),
     launch: (path, arg) => host.uiLaunch(String(path), arg === undefined ? undefined : String(arg)),

@@ -1,4 +1,4 @@
-/* The browser's preferences: what the user chose in the browser's Settings window, kept in the
+/* The browser's preferences: what the user chose on the browser's settings page, kept in the
    document "preferences" of the browser's profile folder (web_profile_folder, webstorage.h). Every
    browser process reads them here and hears of a change through a watch on that document in the
    queue its loop waits on; only the functions here write the document. They are the browser's,
@@ -18,7 +18,7 @@
    choice, 2026-10-28). Catalog tags, commas between. */
 #define WEBPREFS_DEFAULT_LANGUAGES "ja,zh"
 
-/* A language the Settings window offers: a valid BCP 47 tag (RFC 5646, registered subtags) in its
+/* A language the settings page offers: a valid BCP 47 tag (RFC 5646, registered subtags) in its
    usual case (§2.1.1), its own name, its name in English. The list holds only these. */
 struct webprefs_language {
     const char *tag, *own, *english;
@@ -52,9 +52,57 @@ bool webprefs_languages_fit(const char *const *tags, size_t count);
 /* Whether the user turned the search history on (off until then). */
 bool webprefs_search_history(void);
 
+/* Cookies and site data. A site's data is its cookies (webnet.c) and its storage (localStorage,
+   IndexedDB, OPFS). The user's exceptions name hosts: one covers the host and its subdomains, and
+   of several the most specific (longest) applies; an IP address or [IPv6] only itself. Lines:
+   "clear-site-data-on-close=on|off" (off by default) and "site-data-exceptions=" items
+   "rule:host" (rule allow, session or block) between spaces. */
+enum webprefs_site_rule {
+    WEBPREFS_SITE_DEFAULT, /* no exception: kept, unless the browser clears site data when it closes */
+    WEBPREFS_SITE_ALLOW,   /* kept, even when the browser clears site data when it closes */
+    WEBPREFS_SITE_SESSION, /* cleared when the browser closes */
+    WEBPREFS_SITE_BLOCK,   /* no cookie set or sent (RFC 6265bis §7.2); storage refused, as the
+                              Storage Standard's "the user has disabled storage" (SecurityError) */
+};
+#define WEBPREFS_HOST_MAX 253u
+struct webprefs_site_exception {
+    char host[WEBPREFS_HOST_MAX + 1]; /* lowercase ASCII (A-labels), no port */
+    enum webprefs_site_rule rule;
+};
+/* The rule for a host (ASCII, any case, a final dot ignored); DEFAULT for none. */
+enum webprefs_site_rule webprefs_site_rule(const char *host);
+/* The rule for the host of an http(s) or ws(s) URL; DEFAULT for any other URL. */
+enum webprefs_site_rule webprefs_site_rule_url(const char *url);
+/* Whether a document or worker of url may use storage and cookies: not when its host is blocked.
+   (A URL without a host is the storage owners' own refusal, opaque origins.) */
+bool webprefs_storage_allowed(const char *url);
+/* Whether the data of host outlives the browser session: ALLOW, or DEFAULT and BLOCK while the
+   browser does not clear site data when it closes. */
+bool webprefs_site_kept(const char *host);
+/* Whether closing the browser clears anything: the choice is on, or an exception is SESSION. */
+bool webprefs_site_data_transient(void);
+bool webprefs_clear_on_close(void);
+/* The cookie jar's rule (webcookie_set_rule's webcookie_rule; opaque unused): WEBCOOKIE_BLOCK for
+   a blocked host, WEBCOOKIE_TRANSIENT for a host whose data is not kept. */
+unsigned webprefs_cookie_rule(void *opaque, const char *host);
+/* Grows each time this process's exceptions or the choice to clear on close change. */
+uint64_t webprefs_site_generation(void);
+/* The exceptions, sorted by host: at most cap of them in out, and how many there are. */
+size_t webprefs_site_exceptions(struct webprefs_site_exception *out, size_t cap);
+/* The host of what the user typed: a URL ("https://www.example.com:8080/a" gives www.example.com)
+   or a host ("Example.COM." gives example.com, "*.example.com" or ".example.com" example.com), in
+   out. 0, or -N_ERR_INVALID (no host of ASCII letters, digits, '-' and '.', IPv4 or [IPv6]:
+   a Unicode name must come here as its A-labels). */
+n_result webprefs_site_host(const char *input, char out[WEBPREFS_HOST_MAX + 1]);
+
 /* Each change is written at once: the document is claimed, read again, changed in that one line
    and saved whole (lines this build does not know are kept). 0, -N_ERR_INVALID (not in the
    catalog, empty, a tag twice, does not fit), or the document's failure. */
 n_result webprefs_set_languages(const char *const *tags, size_t count);
 n_result webprefs_reset_languages(void); /* removes the line: the default applies */
 n_result webprefs_set_search_history(bool on);
+n_result webprefs_set_clear_on_close(bool on);
+/* host's exception (webprefs_site_host's form, -N_ERR_INVALID otherwise); DEFAULT removes it. The
+   change is made to the exceptions the document holds when it is claimed, so another process's
+   change made meanwhile stays. -N_ERR_TOO_LARGE when the document would pass 64 KiB. */
+n_result webprefs_set_site_rule(const char *host, enum webprefs_site_rule rule);

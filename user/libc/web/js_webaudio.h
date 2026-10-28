@@ -21,6 +21,8 @@ int web_audio_run(JSContext *ctx);
 /* now when a task is ready; otherwise -1, with the renderers' event words and the
  * resampling threads watched on web_wait_queue so their news wakes the browser. */
 int64_t web_audio_deadline(JSContext *ctx, uint64_t now);
+/* An AudioContext (not an OfflineAudioContext) of the realm is running: it sends sound out. */
+bool web_audio_audible(JSContext *ctx);
 /* The realm's Document is no longer fully active (its browsing context was retired): its
  * contexts close, its decodes are dropped, and no new context starts in it. */
 void web_audio_realm_end(JSContext *ctx);

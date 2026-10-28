@@ -481,7 +481,7 @@ static bool frame_auxiliary_allowed(web_doc *source) {
     if(!web_sandbox_auxiliary_allowed(source)){web_js_console(source,1,"Sandbox auxiliary policy denied link navigation");return false;}
     return true;
 }
-bool web_frame_navigate(web_doc *top,web_node *anchor,const char *url) {
+bool web_frame_navigate(web_doc *top,web_node *anchor,const char *url,bool activated) {
     web_doc *source=anchor?anchor->owner:NULL;
     if(!top || !source || !url)return false;
     if(!source->live){web_js_console(source,1,"Inactive document link navigation discarded");return true;}
@@ -498,12 +498,18 @@ bool web_frame_navigate(web_doc *top,web_node *anchor,const char *url) {
             if(frame_link_token(rel,"opener") && !frame_link_token(rel,"noopener") && !frame_link_token(rel,"noreferrer")){
                 web_js_console(source,1,"Auxiliary link opener relationships are not implemented");return true;
             }
-            if(!web_js_auxiliary_link(source,anchor,url))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
+            if(!web_js_auxiliary_link(source,anchor,url,"_blank",activated))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
             return true;
         }
-        else {destination=named_frame(top,target);if(!destination){web_js_console(source,1,"Named link target has no browsing context");return true;}}
+        else if(!(destination=named_frame(top,target))) {
+            /* No frame of this page has the name: another top-level traversable may (the
+               host's tab of that name), or a new one takes it as a popup would. */
+            if(!frame_auxiliary_allowed(source))return true;
+            if(!web_js_auxiliary_link(source,anchor,url,target,activated))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
+            return true;
+        }
     }
-    if(!web_sandbox_navigation_allowed(source,destination,true)){web_js_console(source,1,"Sandbox destination policy denied link navigation");return true;}
+    if(!web_sandbox_navigation_allowed(source,destination,activated)){web_js_console(source,1,"Sandbox destination policy denied link navigation");return true;}
     if(destination==top)return false;
     struct web_frame *frame=web_frame_find(destination->frame_parent,destination->frame_element);
     if(!web_frame_set_navigation(frame,url,source)){web_js_console(source,2,"Child link navigation could not retain its URL and initiator");return true;}

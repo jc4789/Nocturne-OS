@@ -4,6 +4,7 @@
  * command is outstanding, so a send always finds the worker's queue empty. */
 #include <webidb_async.h>
 #include <nocturne.h>
+#include <webprefs.h>
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
@@ -16,6 +17,10 @@ struct idb_packet {
     uint8_t *body; /* room for the command, then length payload bytes */
     size_t length;
     bool sent;
+    /* Refused here, never sent: the user blocked the origin's host (webprefs), the Storage
+       Standard's "the user has disabled storage", so obtaining its storage key fails
+       (SecurityError). Its result comes in its turn, after those submitted before it. */
+    bool refused;
 };
 struct webidb_async {
     struct webidb_async *next;
@@ -117,7 +122,9 @@ uint32_t webidb_async_submit(webidb_async *db,const struct webidb_async_request 
         .name_length=name_length,.payload_length=value_length,.reference_count=request->reference_count
     };
     p->length=total;
-    if(db->app<0&&!spawn_broker(db)){packet_free(p);return 0;}
+    p->refused=(request->operation==WEB_IDB_BEGIN||request->operation==WEB_IDB_DATABASES)&&
+        !webprefs_storage_allowed(request->origin);
+    if(!p->refused&&db->app<0&&!spawn_broker(db)){packet_free(p);return 0;}
     if(db->last)db->last->next=p;
     else db->first=p;
     db->last=p;
@@ -126,6 +133,11 @@ uint32_t webidb_async_submit(webidb_async *db,const struct webidb_async_request 
 void webidb_async_pump(webidb_async *db) {
     if(!db||db->failed||db->ready||!db->first)return;
     struct idb_packet *p=db->first;
+    if(p->refused){
+        db->response=(struct webidb_wire_result){.magic=WEB_IDB_WIRE_MAGIC,.operation=p->command.operation,
+            .sequence=p->command.sequence,.status=WEB_IDB_SECURITY};
+        db->ready=true;return;
+    }
     if(!p->sent){
         memcpy(p->body,&p->command,sizeof p->command);
         if(n_channel_send(db->channel,p->body,sizeof p->command+p->length,-1)<0){stop(db);return;}

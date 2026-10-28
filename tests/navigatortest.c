@@ -22,16 +22,16 @@ static void log_line(void *opaque,int level,const char *text){
     else if(!strncmp(text,"FAIL ",5)){f->checks++;f->failed++;printf("%s\n",text);}
     else if(level==2){f->errors++;printf("ERROR %s\n",text);}
 }
-static bool cookies_enabled(void *opaque){struct fixture *f=opaque;return f->jar&&f->enabled;}
+static bool cookies_enabled(void *opaque,const char *url){(void)url;struct fixture *f=opaque;return f->jar&&f->enabled;}
 static char *cookies_get(void *opaque,const char *url){
-    struct fixture *f=opaque;if(!cookies_enabled(f))return NULL;
+    struct fixture *f=opaque;if(!cookies_enabled(f,url))return NULL;
     struct webcookie_context context={.url=url,.site_url=url,.method="GET"};
     long length=webcookie_get(f->jar,&context,NULL,0,time(NULL));if(length<0)return NULL;
     char *value=malloc((size_t)length+1);if(!value)return NULL;
     if(webcookie_get(f->jar,&context,value,(size_t)length+1,time(NULL))<0){free(value);return NULL;}return value;
 }
 static void cookies_set(void *opaque,const char *url,const char *value){
-    struct fixture *f=opaque;if(!cookies_enabled(f))return;
+    struct fixture *f=opaque;if(!cookies_enabled(f,url))return;
     struct webcookie_context context={.url=url,.site_url=url,.method="GET"};
     webcookie_set(f->jar,&context,value,strlen(value),time(NULL));
 }

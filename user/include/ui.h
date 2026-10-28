@@ -74,10 +74,13 @@ extern const struct ui_theme ui_theme;
      's' u32 surface, i32 result, u32 width, u32 height; through uihost the
          message carries the surface's shared pages (n_shared_map them) */
 enum {
-    UI_EVENT_CLICK = 1,  /* button, list item, box with "clickable" */
+    UI_EVENT_CLICK = 1,  /* button, list item, box with "clickable", item of a menu; a node with "buttons" for the right
+                            or middle button. UI_BUTTONS(flags) = the button (1 left, 2 right, 4 middle; an item of a
+                            menu is chosen with any of them, 0: with the keys), a, b = where the pointer was in the node */
     UI_EVENT_TOGGLE,     /* toggle, checkbox: a = the new state (0 or 1) */
     UI_EVENT_SLIDE,      /* slider: a = value; flags UI_DONE when the drag ended */
-    UI_EVENT_CHOOSE,     /* segmented: a = the option's index */
+    UI_EVENT_CHOOSE,     /* segmented: a = the option's index; tab: pressed (it was not the chosen one), a = its index
+                            among the tabs of its strip */
     UI_EVENT_TEXT,       /* field: text = what it should hold now */
     UI_EVENT_SUBMIT,     /* field: Enter, text = its value */
     UI_EVENT_KEY,        /* a key no widget took: text = "Escape", "Enter", "ArrowUp"..., "F12" or the character,
@@ -100,15 +103,45 @@ enum {
                             comes at the display's pace (WIN_FRAME_EVENTS), so an animation that draws its next
                             picture on it draws once a frame at any refresh rate; while the window is not shown
                             it waits */
+    UI_EVENT_DISMISS,    /* tab: its close button or a middle click asks to close it, a = its index among the tabs;
+                            menu: it should be taken out of the view: an item was chosen (flags UI_DONE, after the
+                            item's click), Escape (UI_CANCEL), a press outside the menus or the window lost the
+                            keyboard (0). The engine does not hide a menu itself: the app's next view leaves it out */
+    UI_EVENT_ADD,        /* tabs: its "+" (a new tab) */
+    UI_EVENT_MOVE,       /* tab: dragged along its strip and let go at another place: a = its index, b = the index it
+                            goes to. The engine shows it there until the app's next view, which has the tabs in the
+                            new order (with a "key" each, so that they keep their identity) */
 };
 /* A field holds its caret and selection itself (arrows, Home/End, Shift, Ctrl for words, Ctrl+A/C/X/V,
-   clicks and drags); the keys it has no use for come as UI_EVENT_KEY. Some properties act when their
+   clicks and drags); the keys it has no use for come as UI_EVENT_KEY. When the app changes the
+   "value" of the field that has the keyboard, the caret keeps its place, or, when all of the old
+   value was selected, all of the new one is. Some properties act when their
    value changes from one view to the next, so an app counts up to ask again:
      "focus" (field)   a positive number: take the keyboard (caret at the end); zero or less: give it up
      "reveal" (any)    scroll the scroll box it is in until it can be seen
    and "selectOnFocus" (field) selects all its text when it gets the keyboard; "ellipsis" (text)
    keeps it on one line and cuts what does not fit with "…"; "mono" (text, field) sets it in the
-   monospaced face. */
+   monospaced face.
+
+   Only the left button clicks, unless a node asks for others with "buttons" (2 right, 4 middle, or
+   both): a press and release of that button on it is a UI_EVENT_CLICK with the button in flags.
+
+   "tabs" is a strip of "tab" children ("text", "icon", "loading": a turning spinner instead of the
+   icon, "selected": the chosen one). Its tabs share its width, at most "tabWidth" (240) each; below
+   "tabMinWidth" (100) the strip scrolls with the wheel and arrows at its ends. Each tab has a close
+   button (narrow tabs: the chosen one only); "add" 0 leaves out the "+" after the tabs. Colours:
+   "background" (the strip), "selectedBackground" (the chosen tab), "hoverBackground". A tab is
+   chosen when pressed (UI_EVENT_CHOOSE), closed by its button or the middle button (UI_EVENT_DISMISS)
+   and can be dragged to another place (UI_EVENT_MOVE); "+" is UI_EVENT_ADD.
+
+   A "menu" child of any node is not laid out with the other children: it opens over the window
+   next to that node (below it, or above when there is no room; "edge" "end" lines up its right
+   edges; "at" [x, y] opens it at that point of the node, as for a menu of the right button), over
+   every widget and surface. It holds "item"s ("text", "icon", "shortcut": the keys shown on the
+   right, "disabled", and a "menu" child: a submenu, opened by resting on the item, clicking it or
+   ArrowRight), "divider"s and other widgets to show. While a menu is shown it has the pointer and
+   the arrows, Home, End, Enter, Space and Escape; other keys go to the app as UI_EVENT_KEY. An item
+   chosen is a UI_EVENT_CLICK on it, then a UI_EVENT_DISMISS of its menu. */
 #define UI_DONE 1u  /* slide: the drag ended */
 #define UI_GONE 2u  /* close: the window is already gone */
 #define UI_DOWN 4u  /* pointer: a button went down */

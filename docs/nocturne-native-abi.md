@@ -867,7 +867,8 @@ GUIの部品（ボタン、入力欄、一覧、スライダー等）は、libc 
 前順で数えた番号（0から）で、イベントはこの番号で部品を指す。
 
 種類：`column` `row` `scroll` `card` `text` `button` `toggle` `checkbox` `slider`
-`progress` `segmented` `field` `item` `icon` `divider` `spacer` `canvas` `surface`。
+`progress` `segmented` `field` `item` `icon` `divider` `spacer` `canvas` `surface` `tabs`
+`tab` `menu`。
 
 プロパティ：
 
@@ -881,13 +882,28 @@ GUIの部品（ボタン、入力欄、一覧、スライダー等）は、libc 
 - 文字：`text`、`size`、`weight`（0 通常、1 太字）、`style`（`"heading"` `"title"`
   `"caption"`）、`textAlign`、`lineHeight`、`wrap`、`ellipsis`、`mono`。書体は Noto Sans、`mono` では Maple Mono（どちらも CJK を含む）。
 - ボタン：`text`、`icon`、`variant`（`"primary"` `"secondary"` `"ghost"`）、`compact`、
-  `disabled`。どの箱も `clickable` で押せる。
+  `disabled`。どの箱も `clickable` で押せる。押すのは左ボタンだけで、`buttons`（2 右、4 中、
+  6 両方）を付けた部品はそのボタンの押下と離しでも CLICK になる（付けない部品は今までどおり
+  左だけ）。
 - `toggle`／`checkbox`：`on`、`text`。`slider`／`progress`：`value`、`min`、`max`、
   `step`、`wheelStep`、`length`。`segmented`：`options`（型4）、`selected`。
 - `field`：`value`（文字列）、`placeholder`、`secret`。`item`：`text`、`icon`、`selected`。
+- `tabs`：子の `tab` の帯と、その後の「+」。`tabWidth`（一つのタブの幅の上限、既定 240）、
+  `tabMinWidth`（これより狭くなると帯が横に送られる。既定 100。送りは両端の矢印とホイール）、
+  `add`（0 で「+」を出さない）、`background`（帯）、`selectedBackground`（選んだタブ）、
+  `hoverBackground`。タブは帯の幅を等しく分ける。
+- `tab`：`text`（題名。入らなければ「…」）、`icon`、`loading`（1：アイコンの代わりに回る印）、
+  `selected`（1：選ばれたタブ）、`key`（並べ替えても同じタブだと分かるように、どのタブにも付ける）。
+  各タブに閉じるボタン（×）がある（狭いタブでは選んだタブだけ）。
+- `menu`：どの部品の子にも置ける浮いた一覧。ほかの子と一緒には配置されず、その部品（錨）の下に
+  （入らなければ上に）窓の上へ重ねて出る。`edge`（`"start"` 既定：左端をそろえる、`"center"`、
+  `"end"`：右端をそろえる）、`at`（型3の［x、y］：錨の中のその点に出す。右ボタンの一覧など）、
+  `minWidth`（既定 220）、`maxHeight`（超えるとスクロール）、`padding`、`background`、`border`、
+  `radius`。子は `item`（`text`、`icon`、`shortcut`：右に出すキーの文字、`disabled`、子の `menu`：
+  その下の一覧）、`divider`、ほかの部品。
 - `icon`：`display` `mouse` `sound` `language` `info` `check` `plus` `minus` `close`
   `chevron-right` `chevron-left` `chevron-up` `chevron-down` `settings` `folder` `clock` `refresh`
-  `backspace` `home` `search`。
+  `backspace` `home` `search` `menu`（三本線）`lock`（錠前）`trash`（ごみ箱）。
 - `canvas`：`draw`（型5の描画命令）、`drawn`（型3の［幅、高さ］：命令を作った大きさ）。
 - `surface`：`surface`（サーフェスの番号）、`pointer`（1：ポインターとホイールをアプリへ）。
   `canvas` にも `pointer` を付けられる。
@@ -921,10 +937,10 @@ GUIの部品（ボタン、入力欄、一覧、スライダー等）は、libc 
 
 | 番号 | 名前 | 内容 |
 |---|---|---|
-| 1 | CLICK | ボタン、一覧の項目、`clickable` の箱 |
+| 1 | CLICK | ボタン、一覧の項目、`clickable` の箱、一覧（`menu`）の項目。押したボタンは `(flags >> 8) & 0xFF`（`UI_BUTTONS`。1 左、2 右、4 中。一覧の項目はどのボタンでも選ばれ、キーで選んだ時は 0）、a、b＝その部品の中のポインターの位置 |
 | 2 | TOGGLE | a＝新しい状態（0/1） |
 | 3 | SLIDE | a＝値。ドラッグが終わると flags に `UI_DONE`（1） |
-| 4 | CHOOSE | a＝選んだ項目の番号 |
+| 4 | CHOOSE | a＝選んだ項目の番号。`tab` では、選ばれていないタブが押された（a＝帯の中の番号） |
 | 5 | TEXT | 文字列＝入力欄が今持つべき値（次の木で `value` として送り返す） |
 | 6 | SUBMIT | 入力欄で Enter。文字列＝その値 |
 | 7 | KEY | 部品が使わなかったキー。文字列＝`"Escape"` `"Enter"` `"ArrowUp"` … `"F12"` か文字、a＝NKEY_ の番号か文字、離した時は flags に `UI_UP`（8） |
@@ -936,6 +952,9 @@ GUIの部品（ボタン、入力欄、一覧、スライダー等）は、libc 
 | 13 | FOCUS | 入力欄がキーボードを得た（a＝1）／失った（a＝0。Escape で手放した時は flags に `UI_CANCEL`（16））。場所が窓（0xFFFFFFFF）なら窓のこと |
 | 14 | DIRECT | 場所は窓（0xFFFFFFFF）。`win_direct` を望んだ窓の直接表示が始まった（a＝1）／終わった（a＝0）（`EV_DIRECT`）。終わるとエンジンは窓を全体から描き直す |
 | 15 | FRAME | 場所は窓（0xFFFFFFFF）。`'P'` で見せた絵を画面のフレームが取り込んだ、または `'F'` の後の次のフレームが来た。間に何度変えても頼んでも一つ。a は表示のフレームの周期（ms）で、次のフレームはおよそその後に来る。表示の歩調（垂直帰線、無ければモードのリフレッシュ）で来るので、これを受けて次の絵を描くアニメーションはどのリフレッシュでもフレームごとに一枚描く。窓が表示されていない間は、表示されるまで待つ |
+| 16 | DISMISS | `tab`：閉じるボタンか中ボタンで閉じてほしい（a＝帯の中の番号）。`menu`：次の木から外してほしい。項目を選んだ（flags に `UI_DONE`。項目の CLICK の後）、Escape（`UI_CANCEL`）、一覧の外を押した・窓がキーボードを失った（0） |
+| 17 | ADD | `tabs`：「+」が押された（新しいタブ） |
+| 18 | MOVE | `tab`：帯の上でドラッグされ、別の場所で離された。a＝今の番号、b＝移る先の番号。次の木が新しい順で来るまで、エンジンはその順で見せる |
 
 入力欄はカーソルと選択範囲をエンジン側で持つ（←→、Home／End、Shift で選択、Ctrl で単語
 単位、Ctrl+A／C／X／V、クリックとドラッグ）。入力欄が使わないキーは KEY としてアプリへ
@@ -947,10 +966,20 @@ GUIの部品（ボタン、入力欄、一覧、スライダー等）は、libc 
 - `focus`（入力欄）：正の数ならキーボードを取る（カーソルは末尾）。0以下なら手放す。
 - `reveal`（どの部品にも）：入っているスクロール箱を、それが見える位置までスクロールする。
 
-`selectOnFocus`（入力欄）は、クリックや `focus` でキーボードを得た時に全選択する。`ellipsis`（文字列）は
+`selectOnFocus`（入力欄）は、クリックや `focus` でキーボードを得た時に全選択する。キーボードを持つ入力欄の
+`value` をアプリが変えると、カーソルは元の位置に残る。ただし前の値が全部選ばれていたときは、新しい値を全部選ぶ。`ellipsis`（文字列）は
 一行に収め、入らない部分を「…」で切る。`mono`（文字列、入力欄）は等幅の Maple Mono で描く。
 フォーカスのある入力欄が木から消えると、
 フォーカスも消える。
+
+`menu` は木にある間だけ出ていて、エンジンは自分では消さない：DISMISS を受けたアプリが次の木から
+外す。出ている間はポインターと、↑↓、Home／End、Enter／Space、→（その下の一覧を開く）、←（閉じる）、
+Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く。項目に止まると 200 ms でその下の一覧が
+開く。一覧はほかのどの部品より上に描かれ、`'P'` の直接の写し（`surface`）とも重なれば写さずに
+描き直すので、消されない。一覧を加えると、その後のノードの場所（前順の番号）がずれる。
+
+タブのドラッグは 6 ピクセル動いてから始まり、帯の端の外へ出ると帯が送られる。離すと MOVE が来て、
+アプリが新しい順の木を送るまで、エンジンはその順で見せる（タブには `key` が要る）。
 
 ## 12. システムの状態の保存と見張り
 

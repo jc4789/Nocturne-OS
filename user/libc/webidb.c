@@ -320,26 +320,32 @@ int webidb_commit(webidb *db,uint32_t token,const uint8_t *bytes,size_t length,c
     return webidb_abort(db,token);
 }
 
-static int catalog(const char *base,int slot,const char *origin,struct webidb_database *item,uint64_t *generation){
+/* A slot's catalog: the database's name and version, when it is origin's (origin NULL: any, its
+   origin then malloc'd in *named). 1, 0 missing or another origin's, -1 invalid, -2 no memory. */
+static int catalog(const char *base,int slot,const char *origin,struct webidb_database *item,uint64_t *generation,char **named){
     uint8_t *data=NULL;size_t size=0;
     int loaded=webidb_journal_read(base,slot,&data,&size);if(loaded!=1)return loaded;
     if(size<IDB_CATALOG_HEAD||memcmp(data,"NIDB0003",8)){free(data);return 0;}
     uint64_t on=u64(data+96),nn=u64(data+104),refs=u64(data+88),meta=u64(data+80);
     size_t remaining=size-IDB_CATALOG_HEAD;
     if(on>remaining||nn>remaining-on||refs>(remaining-on-nn)/32||meta!=remaining-on-nn-refs*32||
-       on!=strlen(origin)||nn>SIZE_MAX-1){free(data);return -1;}
+       (origin&&on!=strlen(origin))||nn>SIZE_MAX-1){free(data);return -1;}
     size_t n=IDB_CATALOG_HEAD+(size_t)on+(size_t)nn;uint8_t digest[32];
     hash(data+72,n-72,digest);
     int ok=!memcmp(digest,data+40,32)&&u64(data+72)>0;
-    if(ok&&memcmp(data+IDB_CATALOG_HEAD,origin,(size_t)on)){free(data);return 0;}
+    if(ok&&origin&&memcmp(data+IDB_CATALOG_HEAD,origin,(size_t)on)){free(data);return 0;}
     /* Validate reconstructed metadata and both checksums, never opening an
        immutable value payload. Warm catalog checks reuse the broker cache. */
     if(ok){hash(data+72,size-72,digest);ok=!memcmp(digest,data+8,32);}
     if(!ok){free(data);return -1;}
     /* Bind catalog names back to their private hashed filename, preventing
      * a malformed header from becoming a cross-origin database alias. */
-    br_sha256_context h;br_sha256_init(&h);uint8_t len[8];put64(len,on);br_sha256_update(&h,len,8);br_sha256_update(&h,origin,(size_t)on);put64(len,nn);br_sha256_update(&h,len,8);br_sha256_update(&h,data+IDB_CATALOG_HEAD+on,(size_t)nn);br_sha256_out(&h,digest);char text[65];hex(digest,text);if(strcmp(n_path_name(base),text)){free(data);return -1;}
+    br_sha256_context h;br_sha256_init(&h);uint8_t len[8];put64(len,on);br_sha256_update(&h,len,8);br_sha256_update(&h,data+IDB_CATALOG_HEAD,(size_t)on);put64(len,nn);br_sha256_update(&h,len,8);br_sha256_update(&h,data+IDB_CATALOG_HEAD+on,(size_t)nn);br_sha256_out(&h,digest);char text[65];hex(digest,text);if(strcmp(n_path_name(base),text)){free(data);return -1;}
     item->name=malloc((size_t)nn+1);if(!item->name){free(data);return -2;}
+    if(named){
+        if(!(*named=malloc((size_t)on+1))){free(item->name);item->name=NULL;free(data);return -2;}
+        memcpy(*named,data+IDB_CATALOG_HEAD,(size_t)on);(*named)[on]=0;
+    }
     memcpy(item->name,data+IDB_CATALOG_HEAD+on,(size_t)nn);item->name[nn]=0;
     item->name_length=(size_t)nn;item->version=u64(data+112);*generation=u64(data+72);free(data);return 1;
 }
@@ -362,7 +368,7 @@ static int catalog_scan(const char *directory_path,const char *origin,struct web
         n_handle lease=document(lock);if(lease<0){result=WEB_IDB_IO;break;}
         n_result claimed=n_document_claim(lease,false);
         if(claimed<0){result=claimed==-N_ERR_NOT_READY?WEB_IDB_BUSY:WEB_IDB_IO;n_handle_close(lease);break;}
-        struct webidb_database a={0},b={0};uint64_t ag=0,bg=0;int ar=catalog(base,0,origin,&a,&ag),br=catalog(base,1,origin,&b,&bg);n_handle_close(lease);if(ar==-2||br==-2){free(a.name);free(b.name);result=WEB_IDB_MEMORY;break;}struct webidb_database chosen={0};if(ar==1&&(br!=1||ag>=bg)){chosen=a;free(b.name);}else if(br==1){chosen=b;free(a.name);}else{free(a.name);free(b.name);continue;}if(!chosen.version){free(chosen.name);continue;}int duplicate=0;for(size_t i=0;i<*count;i++)if((*items)[i].name_length==chosen.name_length&&!memcmp((*items)[i].name,chosen.name,chosen.name_length)){duplicate=1;break;}if(duplicate){free(chosen.name);continue;}if(*count>=SIZE_MAX/sizeof **items){free(chosen.name);result=WEB_IDB_MEMORY;break;}struct webidb_database *more=realloc(*items,(*count+1)*sizeof **items);if(!more){free(chosen.name);result=WEB_IDB_MEMORY;break;}*items=more;(*items)[(*count)++]=chosen;
+        struct webidb_database a={0},b={0};uint64_t ag=0,bg=0;int ar=catalog(base,0,origin,&a,&ag,NULL),br=catalog(base,1,origin,&b,&bg,NULL);n_handle_close(lease);if(ar==-2||br==-2){free(a.name);free(b.name);result=WEB_IDB_MEMORY;break;}struct webidb_database chosen={0};if(ar==1&&(br!=1||ag>=bg)){chosen=a;free(b.name);}else if(br==1){chosen=b;free(a.name);}else{free(a.name);free(b.name);continue;}if(!chosen.version){free(chosen.name);continue;}int duplicate=0;for(size_t i=0;i<*count;i++)if((*items)[i].name_length==chosen.name_length&&!memcmp((*items)[i].name,chosen.name,chosen.name_length)){duplicate=1;break;}if(duplicate){free(chosen.name);continue;}if(*count>=SIZE_MAX/sizeof **items){free(chosen.name);result=WEB_IDB_MEMORY;break;}struct webidb_database *more=realloc(*items,(*count+1)*sizeof **items);if(!more){free(chosen.name);result=WEB_IDB_MEMORY;break;}*items=more;(*items)[(*count)++]=chosen;
     }
     free(entries);if(result){webidb_databases_free(*items,*count);*items=NULL;*count=0;}return result;
 }
@@ -371,6 +377,99 @@ int webidb_databases(webidb *db,const char *origin,struct webidb_database **item
     if(!db||!origin||(strncmp(origin,"http://",7)&&strncmp(origin,"https://",8)))return WEB_IDB_SECURITY;
     char root[WEBIDB_BASE_MAX];
     return idb_root(root)?catalog_scan(root,origin,items,count,true):WEB_IDB_IO;
+}
+
+/* The Settings window's view of the databases, whatever their origin. A database's files hang
+   from its base (folder\<digest>): the slots .0 and .1, .journal0 and .journal1, .lock, .pending,
+   the payloads in .values (two levels) and the older .v<digest>; its catalog names its origin. */
+static int files_tree(const char *path,bool remove,uint64_t *bytes){
+    struct n_entry *entries=NULL;n_result listed=n_folder_entries(path,&entries);
+    if(listed<0)return listed==-N_ERR_NOT_FOUND?WEB_IDB_OK:listed==-N_ERR_NO_MEMORY?WEB_IDB_MEMORY:WEB_IDB_IO;
+    int result=WEB_IDB_OK;
+    for(n_result i=0;i<listed&&!result;i++){
+        char child[WEBIDB_FILE_MAX];
+        if(n_path_join(path,entries[i].name,child,sizeof child)<0){result=WEB_IDB_IO;break;}
+        if(entries[i].kind==N_KIND_FOLDER)result=files_tree(child,remove,bytes);
+        else{*bytes+=entries[i].size;if(remove&&n_entry_remove(child)<0)result=WEB_IDB_IO;}
+    }
+    free(entries);
+    if(!result&&remove&&n_entry_remove(path)<0)result=WEB_IDB_IO;
+    return result;
+}
+struct idb_visit {
+    void (*each)(void *opaque,const char *origin,uint64_t bytes);
+    bool (*match)(void *opaque,const char *origin);
+    void *opaque;
+    bool busy;
+};
+/* The origin the newer readable slot of base names, malloc'd ("" when neither can be read). */
+static int base_origin(const char *base,char **origin){
+    struct webidb_database a={0},b={0};uint64_t ag=0,bg=0;char *ao=NULL,*bo=NULL;
+    int ar=catalog(base,0,NULL,&a,&ag,&ao),br=catalog(base,1,NULL,&b,&bg,&bo);
+    free(a.name);free(b.name);
+    if(ar==-2||br==-2){free(ao);free(bo);return WEB_IDB_MEMORY;}
+    if(ar==1&&(br!=1||ag>=bg)){*origin=ao;free(bo);}
+    else if(br==1){*origin=bo;free(ao);}
+    else{free(ao);free(bo);*origin=calloc(1,1);}
+    return *origin?WEB_IDB_OK:WEB_IDB_MEMORY;
+}
+/* One database: its bytes, and with remove its files (under its lease: a transaction now leaves it). */
+static int database_visit(const char *folder,const struct n_entry *entries,n_result listed,const char *text,struct idb_visit *v,bool remove){
+    char base[WEBIDB_BASE_MAX];if(n_path_join(folder,text,base,sizeof base)<0)return WEB_IDB_IO;
+    char *origin=NULL;int result=base_origin(base,&origin);if(result)return result;
+    if(v->match&&!v->match(v->opaque,origin)){free(origin);return WEB_IDB_OK;}
+    n_handle lease=-1;
+    if(remove){
+        char lock[WEBIDB_FILE_MAX];snprintf(lock,sizeof lock,"%s.lock",base);
+        lease=document(lock);
+        n_result claimed=lease<0?lease:n_document_claim(lease,false);
+        if(claimed<0){if(lease>=0)n_handle_close(lease);free(origin);if(claimed!=-N_ERR_NOT_READY)return WEB_IDB_IO;v->busy=true;return WEB_IDB_OK;}
+    }
+    uint64_t bytes=0;
+    for(n_result i=0;i<listed&&!result;i++){
+        const struct n_entry *e=&entries[i];
+        if(strncmp(e->name,text,64)||e->name[64]!='.')continue;
+        char path[WEBIDB_FILE_MAX];if(n_path_join(folder,e->name,path,sizeof path)<0){result=WEB_IDB_IO;break;}
+        if(e->kind==N_KIND_FOLDER)result=files_tree(path,remove,&bytes);
+        else{bytes+=e->size;if(remove&&strcmp(e->name+64,".lock")&&n_entry_remove(path)<0)result=WEB_IDB_IO;}
+    }
+    /* The lease document stays (empty): a transaction that opened it meanwhile would otherwise
+       hold a removed document while the next one claims a new one. */
+    if(lease>=0){n_document_release(lease);n_handle_close(lease);}
+    if(!result&&v->each&&(*origin||bytes))v->each(v->opaque,origin,bytes); /* not a lease alone */
+    free(origin);return result;
+}
+static int databases_in(const char *folder,struct idb_visit *v,bool shards,bool remove){
+    struct n_entry *entries=NULL;n_result listed=n_folder_entries(folder,&entries);
+    if(listed<0)return listed==-N_ERR_NOT_FOUND?WEB_IDB_OK:listed==-N_ERR_NO_MEMORY?WEB_IDB_MEMORY:WEB_IDB_IO;
+    int result=WEB_IDB_OK;
+    for(n_result i=0;i<listed&&!result;i++){
+        const struct n_entry *e=&entries[i];
+        if(shards&&e->kind==N_KIND_FOLDER&&shard_name(e->name)){
+            char child[WEBIDB_BASE_MAX];if(n_path_join(folder,e->name,child,sizeof child)<0)continue;
+            result=databases_in(child,v,false,remove);continue;
+        }
+        char text[65];uint8_t digest[32];
+        if(strlen(e->name)<66||e->name[64]!='.')continue;
+        memcpy(text,e->name,64);text[64]=0;if(!unhex(text,digest))continue;
+        bool first=true; /* each database once, at its first entry */
+        for(n_result k=0;k<i&&first;k++)first=strncmp(entries[k].name,text,64)||entries[k].name[64]!='.';
+        if(first)result=database_visit(folder,entries,listed,text,v,remove);
+    }
+    free(entries);return result;
+}
+static int databases_visit(struct idb_visit *v,bool remove){
+    char root[WEBIDB_BASE_MAX];if(!idb_root(root))return WEB_IDB_IO;
+    int result=databases_in(root,v,true,remove);
+    return result?result:v->busy?WEB_IDB_BUSY:WEB_IDB_OK;
+}
+int webidb_usage(void (*each)(void *opaque,const char *origin,uint64_t bytes),void *opaque){
+    struct idb_visit v={.each=each,.opaque=opaque};
+    return each?databases_visit(&v,false):WEB_IDB_OK;
+}
+int webidb_clear(bool (*match)(void *opaque,const char *origin),void *opaque){
+    struct idb_visit v={.match=match,.opaque=opaque};
+    return databases_visit(&v,true);
 }
 
 /* Registry in indexeddb in the profile's temporary folder, so connection leases/notifications never

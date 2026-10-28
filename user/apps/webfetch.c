@@ -3,6 +3,7 @@
 #include "http.h"
 #include "web.h"
 #include "webnet_wire.h"
+#include "webprefs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2109,6 +2110,9 @@ static int run_one(n_handle input,n_handle output) {
     else cookie_snapshot[w->cookie_len]=0;
     j->cookies=webcookie_create();
     const char *cookie_psl_error="PSL open failed";
+    /* The user's exceptions hold on every hop, a redirect's to another host too: no cookie set by
+       or sent to a blocked host (RFC 6265bis §7.2). The service watches the preferences (main). */
+    if(j->cookies)webcookie_set_rule(j->cookies,webprefs_cookie_rule,NULL);
     if(j->cookies){
         FILE *f=fopen("C:\\Nocturne\\Web\\public_suffix_list.dat","r");
         if(f){
@@ -2217,6 +2221,8 @@ int main(int argc,char **argv) {
     n_handle parent=n_app_open(n_app_parent());
     if(parent>=0&&n_events_watch(events,parent,N_EVENT_APP_ENDED,1)<0)return 1;
     struct service_slot *slots=NULL;
+    /* The browser's preferences (the user's cookie exceptions), read again when they change. */
+    (void)webprefs_watch(events);
     for(bool running=true;running;){
         for(struct service_slot **at=&slots;*at;){
             struct service_slot *s=*at;
@@ -2224,10 +2230,11 @@ int main(int argc,char **argv) {
             else at=&s->next;
         }
         /* The timeout only reclaims finished request threads. */
-        struct n_event reports[2];
-        n_result got=n_events_wait(events,reports,2,100);
+        struct n_event reports[3];
+        n_result got=n_events_wait(events,reports,3,100);
         if(got<0)break;
         for(n_result i=0;i<got;i++)if(reports[i].token==1)running=false;
+        webprefs_events(reports,(size_t)got);
         while(running){
             n_handle channel=n_channel_accept(0);
             if(channel==-N_ERR_NOT_READY)break;

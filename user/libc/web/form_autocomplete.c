@@ -2,7 +2,7 @@
    page has no history API and receives a past value only after the user chooses
    it. This is not a password manager or personal/contact/payment autofill. Whether
    it is on is one of the browser's preferences (webprefs.h), which the browser's
-   Settings window (browsersettings) changes. */
+   settings page (about:settings, user/apps/browser_settings.h) changes. */
 #include <stdio.h>
 #include <nocturne.h>
 #include <bearssl_hash.h>
@@ -147,7 +147,7 @@ static bool history_path(int slot, char path[HISTORY_PATH]) {
 }
 static bool history_enabled(void) {
     /* For every native operation, a change that waits is taken first: turning the history off
-       in the Settings window must not leave this process recording or offering. Off until the
+       on the settings page must not leave this process recording or offering. Off until the
        user turned it on. */
     webprefs_sync();
     return webprefs_search_history();
