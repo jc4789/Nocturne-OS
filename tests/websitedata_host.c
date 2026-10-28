@@ -1,5 +1,5 @@
 /* user/libc/websitedata.c as it is, with each store's functions (webnet, webstorage, webidb,
-   js_opfs), the user's choices (webprefs), the process list and the temporary folder's document
+   js_opfs, webcache), the user's choices (webprefs), the process list and the temporary folder's document
    "windows" replaced by small fakes: the sites put together, a site's clear reaching every store,
    and the browser session's first and last window. A bounded proof (check_websitedata.py): not
    the stores themselves, not a guest browser. */
@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <websitedata.h>
+#include <webcache.h>
 #include <webcookie.h>
 #include <webidb.h>
 #include <webprefs.h>
@@ -18,9 +19,9 @@ static bool within(const char *host, const char *site) {
     size_t h = strlen(host), s = strlen(site);
     return h == s ? !strcmp(host, site) : h > s && host[h - s - 1] == '.' && !strcmp(host + h - s, site);
 }
-static char cleared[16][64];
+static char cleared[24][64];
 static int cleared_n;
-static void note(const char *what, const char *arg) { if (cleared_n < 16) snprintf(cleared[cleared_n++], 64, "%s:%s", what, arg); }
+static void note(const char *what, const char *arg) { if (cleared_n < 24) snprintf(cleared[cleared_n++], 64, "%s:%s", what, arg); }
 static bool was(const char *what) { for (int i = 0; i < cleared_n; i++) if (!strcmp(cleared[i], what)) return true; return false; }
 
 /* Cookies. */
@@ -71,6 +72,17 @@ n_result web_opfs_clear(bool (*match)(void *, const char *), void *opaque) {
     for (size_t i = 0; i < 2; i++) if (!match || match(opaque, opfs_origins[i])) note("opfs", *opfs_origins[i] ? opfs_origins[i] : "?");
     return match && match(opaque, "https://a.test") ? -N_ERR_BUSY : 0; /* a.test has a file open for sync access */
 }
+/* Cache Storage: purge is the first window's. */
+static const char *const cache_origins[] = {"https://a.test", "https://c.test:444"};
+int webcache_usage(void (*each)(void *, const char *, uint64_t), void *opaque) {
+    each(opaque, cache_origins[0], 50); each(opaque, cache_origins[1], 9);
+    return WEB_CACHE_OK;
+}
+int webcache_clear(bool (*match)(void *, const char *), void *opaque) {
+    for (size_t i = 0; i < 2; i++) if (!match || match(opaque, cache_origins[i])) note("cache", cache_origins[i]);
+    return WEB_CACHE_OK;
+}
+int webcache_purge(void) { note("purge", ""); return WEB_CACHE_OK; }
 /* The user's choices: c.test's data goes when the browser closes, keep.c.test's stays. */
 static bool clear_on_close;
 void webprefs_sync(void) {}
@@ -125,21 +137,22 @@ int main(void) {
     if (n == 4) {
         CHECK(!strcmp(sites[0].site, "") && sites[0].opfs_bytes == 7);
         CHECK(!strcmp(sites[1].site, "a.test") && sites[1].cookies == 2 && sites[1].cookie_bytes == 100 &&
-              sites[1].storage_bytes == 15 && sites[1].indexeddb_bytes == 1000 && sites[1].opfs_bytes == 20);
-        CHECK(websitedata_bytes(&sites[1]) == 1135);
-        CHECK(!strcmp(sites[2].site, "b.test") && sites[2].cookies == 1 && sites[2].indexeddb_bytes == 300);
-        CHECK(!strcmp(sites[3].site, "c.test") && sites[3].storage_bytes == 45 && sites[3].indexeddb_bytes == 1);
+              sites[1].storage_bytes == 15 && sites[1].indexeddb_bytes == 1000 && sites[1].opfs_bytes == 20 && sites[1].cache_bytes == 50);
+        CHECK(websitedata_bytes(&sites[1]) == 1185);
+        CHECK(!strcmp(sites[2].site, "b.test") && sites[2].cookies == 1 && sites[2].indexeddb_bytes == 300 && !sites[2].cache_bytes);
+        CHECK(!strcmp(sites[3].site, "c.test") && sites[3].storage_bytes == 45 && sites[3].indexeddb_bytes == 1 && sites[3].cache_bytes == 9);
     }
     free(sites);
 
     /* One site's clear reaches each store, and only that site's origins; something in use: busy. */
     CHECK(websitedata_clear(net, store, "a.test") == -N_ERR_BUSY);
-    CHECK(was("cookies:a.test") && was("storage:a.test") && was("idb:https://a.test") && was("opfs:https://a.test"));
-    CHECK(!was("idb:http://x.b.test:8080") && !was("idb:https://c.test") && !was("opfs:?"));
+    CHECK(was("cookies:a.test") && was("storage:a.test") && was("idb:https://a.test") && was("opfs:https://a.test") && was("cache:https://a.test"));
+    CHECK(!was("idb:http://x.b.test:8080") && !was("idb:https://c.test") && !was("opfs:?") && !was("cache:https://c.test:444"));
     cleared_n = 0;
     CHECK(websitedata_clear(net, store, "b.test") == 0 && was("idb:http://x.b.test:8080") && cleared_n == 3);
     cleared_n = 0;
-    CHECK(websitedata_clear(net, store, NULL) == -N_ERR_BUSY && was("cookies:") && was("storage:*") && was("opfs:?") && cleared_n == 7);
+    CHECK(websitedata_clear(net, store, NULL) == -N_ERR_BUSY && was("cookies:") && was("storage:*") && was("opfs:?") &&
+          was("cache:https://a.test") && was("cache:https://c.test:444") && cleared_n == 9);
 
     /* The session: the first window clears what the last session left, the last clears on close. */
     cleared_n = 0;
@@ -148,11 +161,12 @@ int main(void) {
     websitedata_session_begin(store);
     CHECK(session_cleared() && windows_n == 16 && !opened && !claimed);
     CHECK(was("storage:d.c.test") && !was("storage:c.test") && !was("storage:keep.c.test") && !was("idb:https://a.test"));
+    CHECK(was("cache:https://c.test:444") && !was("cache:https://a.test") && was("purge:"));
     cleared_n = 0;
     run(11, 200);
     self = 11;
     websitedata_session_begin(store);
-    CHECK(!session_cleared() && windows_n == 32);
+    CHECK(!session_cleared() && windows_n == 32 && !was("purge:"));
     self = 10;
     websitedata_session_end(store);
     end(10);
@@ -160,7 +174,7 @@ int main(void) {
     self = 11;
     websitedata_session_end(store);
     end(11);
-    CHECK(session_cleared() && windows_n == 0);
+    CHECK(session_cleared() && windows_n == 0 && was("cache:https://c.test:444") && !was("purge:"));
 
     /* A window that was killed leaves its row: an ended process's row counts for nothing. */
     cleared_n = 0;

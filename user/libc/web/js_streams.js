@@ -64,6 +64,26 @@ const streamBridge=(()=>{
             error(reason){if(!ended){ended=true;apply(error,controller,[reason]);}}
         });
     }
+    /* A body read on demand (Cache Storage's stored bodies): next is asked for the next piece only
+       while a read waits for one, and answers an ArrayBuffer, or null at the end. */
+    function pulled(next,cancelSource){
+        return new ReadableStream({type:'bytes',async pull(c){
+            const bytes=await next();
+            if(bytes===null){apply(close,c,[]);return;}
+            apply(enqueue,c,[new U8(bytes)]);
+        },cancel(reason){return cancelSource(reason);}},{highWaterMark:0});
+    }
+    /* A body's pieces one at a time, copied, from a reader the stream stays locked to (Fetch's "read
+       all bytes" keeps its reader): next answers a Uint8Array, or null at the end. */
+    function chunks(stream){
+        const reader=apply(getReader,stream,[]);
+        return Object.freeze({async next(){
+            const item=await apply(read,reader,[]);
+            if(item.done)return null;
+            if(apply(tag,item.value,[])!=='Uint8Array')throw new TypeError('Body stream must contain Uint8Array chunks');
+            const n=apply(length,item.value,[]),copy=new U8(n);apply(set,copy,[item.value]);return copy;
+        }});
+    }
     async function collect(stream){
         const reader=apply(getReader,stream,[]),chunks=[];let total=0;
         try{for(;;){const item=await apply(read,reader,[]);if(item.done)break;
@@ -211,5 +231,5 @@ const streamBridge=(()=>{
         define(globalThis,Type.name,{value:Type,writable:true,enumerable:false,configurable:true}); // [Exposed=*]
     }
     Object.assign(globalThis,types,{TextEncoderStream,TextDecoderStream});
-    return Object.freeze({brand,disturbed,fromBytes,network,collect,locked:v=>apply(locked,v,[]),tee:v=>apply(tee,v,[])});
+    return Object.freeze({brand,disturbed,fromBytes,network,pulled,chunks,collect,locked:v=>apply(locked,v,[]),tee:v=>apply(tee,v,[])});
 })();
