@@ -8248,7 +8248,8 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     }
     int depth = scope_depth(doc_node_root(e, false));
     for (int i = 0; i < h.n; i++) add_dent(&h.d[i], 1ull << 62, PE_NONE, depth);
-    const char *sa = node_attr(e, "style");
+    /* A style attribute CSP blocked is not applied (dom.c's csp_style_attribute). */
+    const char *sa = e->csp_style_attribute == 2 ? NULL : node_attr(e, "style");
     struct css_declarations *inline_block = declarations_get(&e->style_declarations, sa, d->base, c->a);
     if (inline_block) {
         struct decl *ds = inline_block->values; int nd = inline_block->count;

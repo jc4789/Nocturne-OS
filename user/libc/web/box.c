@@ -346,7 +346,7 @@ static void svg_computed_style(sbuf *b, node_t *n, bool root) {
     const style_t *st = n->style;
     if (!st) return;
     sb_puts(b, " style=\"");
-    const char *original = node_attr(n, "style");
+    const char *original = n->csp_style_attribute == 2 ? NULL : node_attr(n, "style");
     /* Preserve codec-supported properties not yet represented by native CSS
        (e.g. stroke dashes), then override only our computed painting subset. */
     if (original) xml_escape(b, original, strlen(original), true);

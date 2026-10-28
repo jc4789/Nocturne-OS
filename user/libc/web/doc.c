@@ -438,7 +438,7 @@ bool doc_style_csp_allowed(web_doc *d,node_t *n,const char *text,size_t length) 
     }
     bool allowed;
     if(!element_csp_checked(n,text,length,&allowed))
-        allowed=element_csp_answer(n,web_js_csp_style_allowed(d,n,text,length));
+        allowed=element_csp_answer(n,web_js_csp_style_allowed(d,n,false,text,length));
     sb_free(&b);return allowed;
 }
 static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int preferred,bool image_upgrade,int cors,int referrer_policy) {

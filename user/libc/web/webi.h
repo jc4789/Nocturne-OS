@@ -273,6 +273,11 @@ typedef struct node {
        0 none yet, 1 allowed, 2 blocked. A check runs (and reports) once for
        each new text, not on every resource scan. */
     uint64_t csp_checked_hash; size_t csp_checked_length; uint8_t csp_checked;
+    /* CSP for the style attribute (HTML: its value applies only when the
+       inline check allows it): 0 not checked (applies), 1 allowed, 2 blocked
+       (neither the cascade nor CSSOM reads it), 3 CSSOM is writing it (its
+       updating flag: the attribute change steps neither parse nor check it). */
+    uint8_t csp_style_attribute;
     struct cssom_sheet *cssom_sheets, *cssom_current; /* native owner/source/AST, allocation-owned */
     uint32_t cssom_serial;
     struct cssom_sheet **adopted_sheets;
@@ -1954,8 +1959,11 @@ struct cached_css *doc_css_request_next(web_doc *d, size_t *cursor, node_t **ele
 bool doc_style_csp_allowed(web_doc *d, node_t *style, const char *text, size_t length);
 /* CSP checks for elements of d, reported through d's realm (without one,
    still decided): a style element's inline text, and Is base allowed. */
-bool web_js_csp_style_allowed(web_doc *d, node_t *style, const char *text, size_t length);
+bool web_js_csp_style_allowed(web_doc *d, node_t *element, bool attribute, const char *text, size_t length);
 bool web_js_csp_base_allowed(web_doc *d, node_t *base, const char *url);
+/* HTML's style attribute was set to value (NULL: removed) by a parser or the
+   attribute change steps: CSP's inline check decides whether it applies. */
+void doc_style_attribute_changed(web_doc *d, node_t *n, const char *value);
 void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const char *css, size_t n);
 bool doc_link_load_current(web_doc *d, node_t *n, uint64_t generation);
 bool web_js_stylesheet_event(web_doc *d, node_t *n, bool failed);

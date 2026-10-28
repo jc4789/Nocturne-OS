@@ -134,13 +134,14 @@ static bool csp_script_allowed(struct web_js_state *s,node_t *n,bool parser_inse
     struct csp_site site={s,n};
     return html_policy_inline_allowed(s->doc,HTML_CSP_SCRIPT,&element,text,length,csp_report,&site);
 }
-/* HTML "update a style block": the inline check for a style element's child
-   text. A document without a realm (scripting off) is checked, unreported. */
-bool web_js_csp_style_allowed(web_doc *d,node_t *n,const char *text,size_t length){
+/* HTML "update a style block" (a style element's child text) and the style
+   attribute's value: CSP's inline checks "style" and "style attribute". A
+   document without a realm (scripting off) is checked, unreported. */
+bool web_js_csp_style_allowed(web_doc *d,node_t *n,bool attribute,const char *text,size_t length){
     if(!d || !d->html_policy || !d->html_policy->first)return true;
     struct html_csp_element element={.nonce=node_attr(n,"nonce"),.nonceable=html_policy_nonceable(n)};
     struct csp_site site={d->js,n};
-    return html_policy_inline_allowed(d,HTML_CSP_STYLE,&element,text?text:"",length,csp_report,&site);
+    return html_policy_inline_allowed(d,attribute?HTML_CSP_STYLE_ATTRIBUTE:HTML_CSP_STYLE,&element,text?text:"",length,csp_report,&site);
 }
 /* HTML "set the frozen base URL": CSP3 §6.3.1.1 for the base element's URL. */
 bool web_js_csp_base_allowed(web_doc *d,node_t *base,const char *url){

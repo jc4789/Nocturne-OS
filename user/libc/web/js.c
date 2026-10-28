@@ -1953,7 +1953,8 @@ static void style_memo_store(struct web_js_state *s, const node_t *n, const char
     *m = (struct js_style_memo){a, b, source_n, block_n};
 }
 static bool style_memo_block(struct web_js_state *s, node_t *n, sbuf *block) {
-    const char *css = node_attr(n, "style"); if (!css) css = "";
+    /* A style attribute CSP blocked gives no declarations. */
+    const char *css = n->csp_style_attribute == 2 ? NULL : node_attr(n, "style"); if (!css) css = "";
     size_t length = strlen(css);
     struct js_style_memo *m = style_memo_slot(s, n);
     if (m->source && m->source_n == length && !memcmp(m->source, css, length)) {
@@ -1968,7 +1969,13 @@ static bool style_memo_block(struct web_js_state *s, node_t *n, sbuf *block) {
    attribute now stands for (CSSOM's mutate flag: the attribute is not parsed
    again) */
 static bool style_attribute_set(struct web_js_state *s, node_t *n, const sbuf *block) {
-    if (!doc_attr_set_ns(n->owner ? n->owner : s->doc, n, NULL, NULL, "style", sb_cstr((sbuf *)block))) return false;
+    /* CSSOM's updating flag: the attribute change steps neither parse the
+       value again nor run CSP's check on it; the block applies. */
+    uint8_t state = n->csp_style_attribute;
+    n->csp_style_attribute = 3;
+    bool set = doc_attr_set_ns(n->owner ? n->owner : s->doc, n, NULL, NULL, "style", sb_cstr((sbuf *)block));
+    n->csp_style_attribute = set ? 1 : state;
+    if (!set) return false;
     style_memo_store(s, n, block->p ? block->p : "", block->n, block->p ? block->p : "", block->n);
     return true;
 }
