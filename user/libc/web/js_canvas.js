@@ -351,7 +351,7 @@ const canvasBridge = (() => {
     class OffscreenCanvasRenderingContext2D {constructor(){throw new TypeError('Illegal OffscreenCanvasRenderingContext2D constructor');}}
     for(const [property,key,colorkey] of [['fillStyle','fill','fillColor'],['strokeStyle','stroke','strokeColor']])define(CanvasRenderingContext2D.prototype,property,{enumerable:true,configurable:true,
         get(){return state(this)[key];},set(value){state(this);if(gradients.has(value)){state(this)[key]=value;return;}
-            const text=string(value),s=state(this),c=native(s.canvas,'color',text);if(c!==null){s[key]=text;s[colorkey]=c>>>0;}}});
+            const text=string(value),s=state(this),c=native(s.canvas,'color',text);if(c!==null){s[key]=c[1];s[colorkey]=c[0]>>>0;}}});
     define(CanvasRenderingContext2D.prototype,'globalAlpha',{enumerable:true,configurable:true,get(){return state(this).alpha;},set(value){const s=state(this),v=number(value);if(finite(v)&&v>=0&&v<=1)s.alpha=v;}});
     define(CanvasRenderingContext2D.prototype,'lineWidth',{enumerable:true,configurable:true,get(){return state(this).lineWidth;},set(value){const s=state(this),v=number(value);if(finite(v)&&v>0)s.lineWidth=v;}});
     define(CanvasRenderingContext2D.prototype,'lineDashOffset',{enumerable:true,configurable:true,get(){return state(this).dashOffset;},set(value){state(this);const v=+value,s=state(this);if(finite(v))s.dashOffset=v;}});

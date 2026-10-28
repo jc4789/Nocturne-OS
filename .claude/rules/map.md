@@ -57,7 +57,7 @@ user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
 | 文書・公開 API | `web/doc.c`（`web.h` の実装） | `web_live`・`web_parse`、`web_tick`（媒体→`web_js_tick`→`web_frames_tick`）、`web_layout`（`css_cascade`→`boxes_build`→`layout_doc`） |
 | 解析 | `web/html_lexbor.c`・`html_lexbor_bridge.c`（Lexbor は木構築の状態だけ）、`html.c`（tag ID） | `html_begin`、`html_resume`、`html_fragment` |
 | DOM | `web/dom.c`（`node_t` は文書の持ち物）、`html_serialize.c`、`elements.c` | — |
-| CSS | `css.c`（解析・selector・cascade）、`cssprop.c`（性質と UA の表）、`cssom.c` | `css_cascade` |
+| CSS | `css.c`（解析・selector・cascade）、`cssprop.c`（性質と UA の表）、`color.c`（色の値の型 `struct css_color`：解析・計算値・直列化・色域の写像・補間。描画は装いの 8 ビットの欄、正確な値は `color_inherited`・`color_own`）、`cssom.c` | `css_cascade`、`css_color_interpolate` |
 | 箱・配置 | `box.c`／`layout.c`（block・inline・table・flex・grid・abs） | `boxes_build`・`boxes_rebuild_local`／`layout_doc` |
 | 描画 | `paint.c`（描画・当たり・ページ内検索） | `web_paint`、`web_hit_test` |
 | JS | `js.c`（QuickJS の host）＋`js_*.c`・`js_*.js`（`js_bootstrap.inc` に埋込み）。Web IDL の形（interface object・prototype・member の名と length・列挙・定数）は束縛が組み上がった後に `js_webidl.c` が `webidl_data.inc` の表から一度に与える。窓と Worker の両方の realm に入る定義：`js_geometry.js`（DOMPoint・DOMRect・DOMQuad・DOMMatrix）、`js_custom_event.js`、`js_clone.js`（`registerSerializable`）、`js_compression.c`（Compression Streams、`deflate.c`・`brotli_codec.h`） | `web_js_start`、`web_js_tick`、`web_console_eval` |
@@ -88,4 +88,4 @@ user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
 ## 古い記述（直すまで信じない）
 
 - README.md:51 の起動メニュー 3 項目と解像度 → `boot/limine.conf` は 2 項目で解像度を持たない。README.md:268 の tools 一覧 → llvm・rust・go・TypeScript もある。README.md:660 の `hv/`・`rdp/`・e1000・tulip・ATA の置き場所 → どれも `kernel/src/vm/`。README.md:668 の ports 一覧に llvm が無い。
-- `scripts/test.py:20` の群の一覧（13 群）→ `tests/runtests.c` は 114 群。`user/libc/web/webi.h:3`「html.c は tokenizer と tree builder」→ `html.c` は tag ID だけで、木の構築は `html_lexbor.c`。
+- `scripts/test.py:20` の群の一覧（13 群）→ `tests/runtests.c` は 114 群。

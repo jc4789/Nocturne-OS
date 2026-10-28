@@ -254,7 +254,7 @@ bool css_length_equal(const len_t *a,const len_t *b){
 enum { LF_AUTO = 1, LF_NONE = 2, LF_NEG = 4, LF_NORMAL = 8, LF_NOPCT = 16, LF_LENGTH = 32 };
 
 /* a dimension: number + unit; false if the unit is unknown */
-static bool unit_px(const char *u, size_t un, float v, const struct cx *cx, float *px, float *pct, bool *num) {
+bool css_unit_px(const char *u, size_t un, float v, const struct cx *cx, float *px, float *pct, bool *num) {
     *px = *pct = 0;
     *num = false;
     if (!un) {
@@ -397,7 +397,7 @@ static struct cexpr *calc_value(const char **s, const char *e, struct cx *cx) {
     const char *u = *s;
     while (*s < e && (isalpha((unsigned char)**s) || **s == '%')) (*s)++;
     struct cexpr *x = cnode(cx, 'v', NULL, NULL);
-    if (!unit_px(u, (size_t)(*s - u), v, cx, &x->px, &x->pct, &x->num)) return NULL;
+    if (!css_unit_px(u, (size_t)(*s - u), v, cx, &x->px, &x->pct, &x->num)) return NULL;
     return x;
 }
 
@@ -551,12 +551,8 @@ bool css_shadow_serialize(const struct css_box_shadow *shadow, sbuf *out, web_do
     size_t count = 0;
     for (; shadow && success; shadow = shadow->next, count++) {
         if (!(count & 63) && d && !web_native_checkpoint(d)) { success = false; break; }
-        char color[96]; unsigned a = shadow->color >> 24;
-        int n = a == 255 ? snprintf(color, sizeof color, "rgb(%u, %u, %u) ", (shadow->color >> 16) & 255,
-            (shadow->color >> 8) & 255, shadow->color & 255) : snprintf(color, sizeof color, "rgba(%u, %u, %u, %.9g) ",
-            (shadow->color >> 16) & 255, (shadow->color >> 8) & 255, shadow->color & 255, (double)a / 255);
-        success = n > 0 && (size_t)n < sizeof color && (!count || length_append(out, ", ", 2)) &&
-            length_append(out, color, (size_t)n) &&
+        success = (!count || length_append(out, ", ", 2)) &&
+            css_color_value_text(shadow->color_value, shadow->color, out) && length_append(out, " ", 1) &&
             length_number(out, shadow->x, "px") && length_append(out, " ", 1) && length_number(out, shadow->y, "px") &&
             length_append(out, " ", 1) && length_number(out, shadow->blur, "px") && length_append(out, " ", 1) &&
             length_number(out, shadow->spread, "px") && (!shadow->inset || length_append(out, " inset", 6));
@@ -746,7 +742,7 @@ static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int fl
     float v;
     if (!parse_number(&p, s + n, &v)) return false;
     bool num;
-    if (!unit_px(p, (size_t)(s + n - p), v, cx, &out->px, &out->pct, &num)) return false;
+    if (!css_unit_px(p, (size_t)(s + n - p), v, cx, &out->px, &out->pct, &num)) return false;
     if((flags&LF_LENGTH)&&num&&v!=0)return false;
     if ((flags & LF_NOPCT) && out->pct) return false;
     if (!(flags & LF_NEG) && v < 0) return false;
@@ -769,262 +765,10 @@ static bool parse_number_value(const char *v, size_t n, struct cx *cx, float *ou
            cfold(x, &number, out, &pct) && number && isfinite(*out);
 }
 
-/* ---------------------------------------------------------------- colours */
-static const struct {
-    const char *name;
-    uint32_t rgb;
-} named[] = {
-    {"aliceblue", 0xF0F8FF}, {"antiquewhite", 0xFAEBD7}, {"aqua", 0x00FFFF}, {"aquamarine", 0x7FFFD4},
-    {"azure", 0xF0FFFF}, {"beige", 0xF5F5DC}, {"bisque", 0xFFE4C4}, {"black", 0x000000},
-    {"blanchedalmond", 0xFFEBCD}, {"blue", 0x0000FF}, {"blueviolet", 0x8A2BE2}, {"brown", 0xA52A2A},
-    {"burlywood", 0xDEB887}, {"buttonface", 0xEFEFEF}, {"buttontext", 0x000000}, {"cadetblue", 0x5F9EA0},
-    {"canvas", 0xFFFFFF}, {"canvastext", 0x000000}, {"chartreuse", 0x7FFF00}, {"chocolate", 0xD2691E},
-    {"coral", 0xFF7F50}, {"cornflowerblue", 0x6495ED}, {"cornsilk", 0xFFF8DC}, {"crimson", 0xDC143C},
-    {"cyan", 0x00FFFF}, {"darkblue", 0x00008B}, {"darkcyan", 0x008B8B}, {"darkgoldenrod", 0xB8860B},
-    {"darkgray", 0xA9A9A9}, {"darkgreen", 0x006400}, {"darkgrey", 0xA9A9A9}, {"darkkhaki", 0xBDB76B},
-    {"darkmagenta", 0x8B008B}, {"darkolivegreen", 0x556B2F}, {"darkorange", 0xFF8C00}, {"darkorchid", 0x9932CC},
-    {"darkred", 0x8B0000}, {"darksalmon", 0xE9967A}, {"darkseagreen", 0x8FBC8F}, {"darkslateblue", 0x483D8B},
-    {"darkslategray", 0x2F4F4F}, {"darkslategrey", 0x2F4F4F}, {"darkturquoise", 0x00CED1}, {"darkviolet", 0x9400D3},
-    {"deeppink", 0xFF1493}, {"deepskyblue", 0x00BFFF}, {"dimgray", 0x696969}, {"dimgrey", 0x696969},
-    {"dodgerblue", 0x1E90FF}, {"field", 0xFFFFFF}, {"fieldtext", 0x000000}, {"firebrick", 0xB22222},
-    {"floralwhite", 0xFFFAF0}, {"forestgreen", 0x228B22}, {"fuchsia", 0xFF00FF}, {"gainsboro", 0xDCDCDC},
-    {"ghostwhite", 0xF8F8FF}, {"gold", 0xFFD700}, {"goldenrod", 0xDAA520}, {"gray", 0x808080},
-    {"graytext", 0x808080}, {"green", 0x008000}, {"greenyellow", 0xADFF2F}, {"grey", 0x808080},
-    {"highlight", 0x3390FF}, {"highlighttext", 0xFFFFFF}, {"honeydew", 0xF0FFF0}, {"hotpink", 0xFF69B4},
-    {"indianred", 0xCD5C5C}, {"indigo", 0x4B0082}, {"ivory", 0xFFFFF0}, {"khaki", 0xF0E68C},
-    {"lavender", 0xE6E6FA}, {"lavenderblush", 0xFFF0F5}, {"lawngreen", 0x7CFC00}, {"lemonchiffon", 0xFFFACD},
-    {"lightblue", 0xADD8E6}, {"lightcoral", 0xF08080}, {"lightcyan", 0xE0FFFF}, {"lightgoldenrodyellow", 0xFAFAD2},
-    {"lightgray", 0xD3D3D3}, {"lightgreen", 0x90EE90}, {"lightgrey", 0xD3D3D3}, {"lightpink", 0xFFB6C1},
-    {"lightsalmon", 0xFFA07A}, {"lightseagreen", 0x20B2AA}, {"lightskyblue", 0x87CEFA}, {"lightslategray", 0x778899},
-    {"lightslategrey", 0x778899}, {"lightsteelblue", 0xB0C4DE}, {"lightyellow", 0xFFFFE0}, {"lime", 0x00FF00},
-    {"limegreen", 0x32CD32}, {"linen", 0xFAF0E6}, {"linktext", 0x0000EE}, {"magenta", 0xFF00FF},
-    {"maroon", 0x800000}, {"mediumaquamarine", 0x66CDAA}, {"mediumblue", 0x0000CD}, {"mediumorchid", 0xBA55D3},
-    {"mediumpurple", 0x9370DB}, {"mediumseagreen", 0x3CB371}, {"mediumslateblue", 0x7B68EE},
-    {"mediumspringgreen", 0x00FA9A}, {"mediumturquoise", 0x48D1CC}, {"mediumvioletred", 0xC71585},
-    {"midnightblue", 0x191970}, {"mintcream", 0xF5FFFA}, {"mistyrose", 0xFFE4E1}, {"moccasin", 0xFFE4B5},
-    {"navajowhite", 0xFFDEAD}, {"navy", 0x000080}, {"oldlace", 0xFDF5E6}, {"olive", 0x808000},
-    {"olivedrab", 0x6B8E23}, {"orange", 0xFFA500}, {"orangered", 0xFF4500}, {"orchid", 0xDA70D6},
-    {"palegoldenrod", 0xEEE8AA}, {"palegreen", 0x98FB98}, {"paleturquoise", 0xAFEEEE}, {"palevioletred", 0xDB7093},
-    {"papayawhip", 0xFFEFD5}, {"peachpuff", 0xFFDAB9}, {"peru", 0xCD853F}, {"pink", 0xFFC0CB},
-    {"plum", 0xDDA0DD}, {"powderblue", 0xB0E0E6}, {"purple", 0x800080}, {"rebeccapurple", 0x663399},
-    {"red", 0xFF0000}, {"rosybrown", 0xBC8F8F}, {"royalblue", 0x4169E1}, {"saddlebrown", 0x8B4513},
-    {"salmon", 0xFA8072}, {"sandybrown", 0xF4A460}, {"seagreen", 0x2E8B57}, {"seashell", 0xFFF5EE},
-    {"sienna", 0xA0522D}, {"silver", 0xC0C0C0}, {"skyblue", 0x87CEEB}, {"slateblue", 0x6A5ACD},
-    {"slategray", 0x708090}, {"slategrey", 0x708090}, {"snow", 0xFFFAFA}, {"springgreen", 0x00FF7F},
-    {"steelblue", 0x4682B4}, {"tan", 0xD2B48C}, {"teal", 0x008080}, {"thistle", 0xD8BFD8},
-    {"tomato", 0xFF6347}, {"turquoise", 0x40E0D0}, {"violet", 0xEE82EE}, {"wheat", 0xF5DEB3},
-    {"white", 0xFFFFFF}, {"whitesmoke", 0xF5F5F5}, {"window", 0xFFFFFF}, {"windowtext", 0x000000},
-    {"yellow", 0xFFFF00}, {"yellowgreen", 0x9ACD32},
-};
-
-static int hexd(int c) {
-    c |= 32;
-    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
-}
-
-static uint8_t clamp255(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_t)(v + 0.5f); }
-
-/* a colour component: a number scaled by full (for 100%), or 'none' */
-static bool comp(const char *s, size_t n, float full, float *out) {
-    if (ident_is(s, n, "none")) {
-        *out = 0;
-        return true;
-    }
-    const char *p = s;
-    float v;
-    if (!parse_number(&p, s + n, &v)) return false;
-    size_t un = (size_t)(s + n - p);
-    if (un == 1 && *p == '%') v = v * full / 100;
-    else if (un) {
-        /* angles */
-        if (ident_is(p, un, "deg")) {
-        } else if (ident_is(p, un, "turn")) v *= 360;
-        else if (ident_is(p, un, "rad")) v = v * 180 / (float)M_PI;
-        else if (ident_is(p, un, "grad")) v *= 0.9f;
-        else return false;
-    }
-    *out = v;
-    return true;
-}
-
-static float hue2rgb(float p, float q, float t) {
-    if (t < 0) t += 1;
-    if (t > 1) t -= 1;
-    if (t < 1.0f / 6) return p + (q - p) * 6 * t;
-    if (t < 0.5f) return q;
-    if (t < 2.0f / 3) return p + (q - p) * (2.0f / 3 - t) * 6;
-    return p;
-}
-
-static float srgb_gamma(float x) {
-    if (x <= 0.0031308f) return 12.92f * x;
-    return 1.055f * (float)pow(x, 1 / 2.4) - 0.055f;
-}
-
-static bool css_color_impl(const char *s, size_t n, uint32_t *out, bool strict, int depth) {
-    if (depth > 32) return false;
-    trim(&s, &n);
-    if (!n) return false;
-    if (s[0] == '#') {
-        int d[8];
-        size_t k = n - 1;
-        if (k != 3 && k != 4 && k != 6 && k != 8) return false;
-        for (size_t i = 0; i < k; i++)
-            if ((d[i] = hexd((unsigned char)s[1 + i])) < 0) return false;
-        uint32_t r, g, b, a = 255;
-        if (k <= 4) {
-            r = (uint32_t)d[0] * 17, g = (uint32_t)d[1] * 17, b = (uint32_t)d[2] * 17;
-            if (k == 4) a = (uint32_t)d[3] * 17;
-        } else {
-            r = (uint32_t)(d[0] * 16 + d[1]), g = (uint32_t)(d[2] * 16 + d[3]), b = (uint32_t)(d[4] * 16 + d[5]);
-            if (k == 8) a = (uint32_t)(d[6] * 16 + d[7]);
-        }
-        *out = ARGB(a, r, g, b);
-        return true;
-    }
-    if (s[n - 1] == ')') {
-        size_t fl = 0;
-        while (fl < n && s[fl] != '(') fl++;
-        if (fl == n) return false;
-        const char *args = s + fl + 1;
-        size_t an = n - fl - 2;
-        if (ident_is(s, fl, "light-dark")) {
-            if (strict) return false; /* current engine always picks the light branch */
-            const char *t[2];
-            size_t tl[2];
-            if (split(args, an, t, tl, 2, ',') < 1) return false;
-            return css_color_impl(t[0], tl[0], out, strict, depth + 1);
-        }
-        if (ident_is(s, fl, "color-mix")) {
-            const char *t[3];
-            size_t tl[3];
-            if (split(args, an, t, tl, 3, ',') != 3) return false;
-            if (strict) {
-                const char *end = t[2] + tl[2];
-                while (end < args + an && is_space((unsigned char)*end)) end++;
-                if (end != args + an || !ident_is(t[0],tl[0],"in srgb")) return false;
-            }
-            uint32_t c[2];
-            float p[2] = {-1, -1};
-            for (int i = 0; i < 2; i++) {
-                const char *u[2];
-                size_t ul[2];
-                int k = split(t[i + 1], tl[i + 1], u, ul, 2, ' ');
-                int ci = 0;
-                if (k == 2 && u[0][ul[0] - 1] == '%') ci = 1;
-                if (!k || !css_color_impl(u[ci], ul[ci], &c[i], strict, depth + 1)) return false;
-                if (k == 2) {
-                    const char *q = u[1 - ci];
-                    if (!parse_number(&q, u[1 - ci] + ul[1 - ci], &p[i])) return false;
-                }
-            }
-            if (p[0] < 0 && p[1] < 0) p[0] = p[1] = 50;
-            else if (p[0] < 0) p[0] = 100 - p[1];
-            else if (p[1] < 0) p[1] = 100 - p[0];
-            float tot = p[0] + p[1];
-            if (tot <= 0) return false;
-            float w = p[1] / tot;
-            float ch[4];
-            for (int k = 0; k < 4; k++) {
-                float a = (float)(c[0] >> (24 - 8 * k) & 255), b = (float)(c[1] >> (24 - 8 * k) & 255);
-                ch[k] = a + (b - a) * w;
-            }
-            float alpha = ch[0] * (tot < 100 ? tot / 100 : 1);
-            *out = ARGB(clamp255(alpha), clamp255(ch[1]), clamp255(ch[2]), clamp255(ch[3]));
-            return true;
-        }
-        /* rgb(), hsl(), oklch(), oklab(): components separated by commas or spaces, alpha after / */
-        char buf[256];
-        if (an >= sizeof buf) return false;
-        for (size_t i = 0; i < an; i++) buf[i] = args[i] == ',' || args[i] == '/' ? ' ' : args[i];
-        const char *t[4];
-        size_t tl[4];
-        int k = split(buf, an, t, tl, 4, ' ');
-        if (k < 3) return false;
-        if (strict) {
-            const char *end = t[k - 1] + tl[k - 1];
-            while (end < buf + an && is_space((unsigned char)*end)) end++;
-            if (end != buf + an) return false;
-            bool commas = memchr(args, ',', an) != NULL;
-            const char *slash = memchr(args, '/', an);
-            if (commas && slash) return false;
-            if (!commas && k == 4 && !slash) return false;
-            if (slash && memchr(slash + 1, '/', (size_t)(args + an - slash - 1))) return false;
-            if (commas) {
-                const char *parts[5]; size_t lengths[5];
-                int count = split(args,an,parts,lengths,5,',');
-                if (count != k) return false;
-                for (int i=0;i<count;i++) if (!lengths[i]) return false;
-            }
-        }
-        float alpha = 1;
-        if (k == 4 && !comp(t[3], tl[3], 1, &alpha)) return false;
-        float c0, c1, c2;
-        if (ident_is(s, fl, "rgb") || ident_is(s, fl, "rgba")) {
-            if (!comp(t[0], tl[0], 255, &c0) || !comp(t[1], tl[1], 255, &c1) || !comp(t[2], tl[2], 255, &c2))
-                return false;
-        } else if (ident_is(s, fl, "hsl") || ident_is(s, fl, "hsla")) {
-            float h, sat, l;
-            if (!comp(t[0], tl[0], 360, &h) || !comp(t[1], tl[1], 100, &sat) || !comp(t[2], tl[2], 100, &l))
-                return false;
-            h = (float)fmod(h, 360) / 360;
-            if (h < 0) h += 1;
-            sat /= 100, l /= 100;
-            float q = l < 0.5f ? l * (1 + sat) : l + sat - l * sat, p = 2 * l - q;
-            c0 = hue2rgb(p, q, h + 1.0f / 3) * 255;
-            c1 = hue2rgb(p, q, h) * 255;
-            c2 = hue2rgb(p, q, h - 1.0f / 3) * 255;
-        } else if (ident_is(s, fl, "oklch") || ident_is(s, fl, "oklab")) {
-            float L, a, b;
-            bool lch = ident_is(s, fl, "oklch");
-            if (!comp(t[0], tl[0], 1, &L)) return false;
-            if (lch) {
-                float C, H;
-                if (!comp(t[1], tl[1], 0.4f, &C) || !comp(t[2], tl[2], 360, &H)) return false;
-                a = C * cosf(H * (float)M_PI / 180);
-                b = C * sinf(H * (float)M_PI / 180);
-            } else if (!comp(t[1], tl[1], 0.4f, &a) || !comp(t[2], tl[2], 0.4f, &b)) return false;
-            float l_ = L + 0.3963377774f * a + 0.2158037573f * b;
-            float m_ = L - 0.1055613458f * a - 0.0638541728f * b;
-            float s_ = L - 0.0894841775f * a - 1.2914855480f * b;
-            float l3 = l_ * l_ * l_, m3 = m_ * m_ * m_, s3 = s_ * s_ * s_;
-            c0 = srgb_gamma(4.0767416621f * l3 - 3.3077115913f * m3 + 0.2309699292f * s3) * 255;
-            c1 = srgb_gamma(-1.2684380046f * l3 + 2.6097574011f * m3 - 0.3413193965f * s3) * 255;
-            c2 = srgb_gamma(-0.0041960863f * l3 - 0.7034186147f * m3 + 1.7076147010f * s3) * 255;
-        } else return false;
-        *out = ARGB(clamp255(alpha * 255), clamp255(c0), clamp255(c1), clamp255(c2));
-        return true;
-    }
-    if (ident_is(s, n, "transparent")) {
-        *out = 0;
-        return true;
-    }
-    if (ident_is(s, n, "currentcolor")) {
-        *out = COLOR_CURRENT;
-        return true;
-    }
-    int lo = 0, hi = (int)(sizeof named / sizeof *named) - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        const char *nm = named[mid].name;
-        int c = 0;
-        size_t i = 0;
-        for (; i < n && nm[i]; i++)
-            if ((c = lower((unsigned char)s[i]) - nm[i])) break;
-        if (!c) c = i < n ? 1 : nm[i] ? -1 : 0;
-        if (!c) {
-            *out = 0xFF000000u | named[mid].rgb;
-            return true;
-        }
-        if (c < 0) hi = mid - 1;
-        else lo = mid + 1;
-    }
-    return false;
-}
-
-bool css_color(const char *s, size_t n, uint32_t *out) { return css_color_impl(s,n,out,false,0); }
+/* ---------------------------------------------------------------- colours (color.c owns them) */
+/* a <color> for a property that keeps only the 8-bit used value (COLOR_CURRENT for currentcolor) */
 static bool css_color_checked(const char *s, size_t n, uint32_t *out, struct cx *cx) {
-    return css_color_impl(s,n,out,cx->supports_probe,0);
+    return css_color_value_compute(s, n, cx, NULL, out, NULL);
 }
 
 /* ---------------------------------------------------------------- the property table */
@@ -1066,10 +810,12 @@ static bool parse_box_shadows(const char *value, size_t length, struct cx *cx, c
         int color_token = -1, length_tokens[4];
         for (int i = 0; i < count; i++) {
             uint32_t candidate;
+            const struct css_color_value *exact;
             if (ident_is(tokens[i], sizes[i], "inset")) {
                 if (inset) return false; inset = shadow.inset = true; lengths_closed |= lengths != 0;
-            } else if (css_color_checked(tokens[i], sizes[i], &candidate, cx)) {
-                if (color) return false; color = true; shadow.color = candidate; color_token=i; lengths_closed |= lengths != 0;
+            } else if (css_color_value_compute(tokens[i], sizes[i], cx, NULL, &candidate, &exact)) {
+                if (color) return false; color = true; shadow.color = candidate; shadow.color_value = exact;
+                color_token=i; lengths_closed |= lengths != 0;
             } else {
                 if (lengths_closed || lengths == 4 || memchr(tokens[i], '%', sizes[i])) return false;
                 len_t dimension;
@@ -1082,7 +828,7 @@ static bool parse_box_shadows(const char *value, size_t length, struct cx *cx, c
         if (lengths < 2) return false;
         if (specified) {
             if (first && !length_append(specified,", ",2)) return false;
-            if (color_token >= 0 && (!length_append(specified,tokens[color_token],sizes[color_token]) ||
+            if (color_token >= 0 && (!css_color_specified(tokens[color_token],sizes[color_token],specified) ||
                 !length_append(specified," ",1))) return false;
             for (unsigned i=0;i<lengths;i++) {
                 int token=length_tokens[i];
@@ -1255,7 +1001,7 @@ enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
        PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_BOX_SHADOW, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
        PT_MOTION_LIST, PT_TRANSFORM, PT_TRANSLATE,
-       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_CLIP_PATH, PT_CLIP };
+       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_CLIP_PATH, PT_CLIP, PT_COLOR_SCHEME };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
@@ -1436,6 +1182,7 @@ static struct propdef props[] = {
     {"caption-side", PT_KW, 0, true, O(caption_bottom), kw_capside, 0, AN_TYPE},
     {"clear", PT_KW, 0, false, O(clear), kw_clear, 0, AN_TYPE},
     {"color", PT_COLOR, 0, true, O(color), NULL, 0, AN_TYPE},
+    {"color-scheme", PT_COLOR_SCHEME, 0, true, O(color_scheme), NULL, 0, AN_DISCRETE},
     {"column-gap", PT_PX, LF_NOPCT, false, O(gap_col), kw_normal0, 0, AN_TYPE},
     {"content", PT_CONTENT, 0, false, O(content), NULL, 0, AN_TYPE},
     {"content-visibility", PT_KW, 0, false, O(content_visibility), kw_content_visibility, 0, AN_DISPLAY},
@@ -1681,14 +1428,27 @@ const char *css_prop_name(int index,bool *longhand) {
 }
 int css_prop_index(const struct propdef *p) { return (int)(p - props); }
 const struct propdef *css_prop_at(int index) { return index >= 0 && index < NPROPS ? &props[index] : NULL; }
-bool css_prop_is_font(const struct propdef *p) {
-    return (p->type == PT_FONT_SIZE) || (p->type == PT_SHORT && (p->sh == SH_FONT || p->sh == SH_ALL));
+/* font-size gives em, color-scheme the system colours and light-dark() */
+static bool early(const struct propdef *p) { return p->type == PT_FONT_SIZE || p->type == PT_COLOR_SCHEME; }
+bool css_prop_is_early(const struct propdef *p) {
+    return early(p) || (p->type == PT_SHORT && (p->sh == SH_FONT || p->sh == SH_ALL));
 }
 bool css_prop_is_motion(const struct propdef *p) {
     return p && (p->type == PT_MOTION_LIST || (p->type == PT_SHORT && (p->sh == SH_ANIMATION || p->sh == SH_TRANSITION)));
 }
 bool css_prop_inherited(const struct propdef *p) { return p && p->inherited; }
-int css_computed_longhand(const style_t *st, const char *name, sbuf *out, uint32_t *color, web_doc *d) {
+/* the colour slot (color.c) of a PT_COLOR or PT_SVG_PAINT property */
+static enum css_color_slot color_slot(const struct propdef *p) {
+    size_t off = p->off;
+    if (off == offsetof(style_t, color)) return CSS_SLOT_COLOR;
+    if (off == offsetof(style_t, svg_fill)) return CSS_SLOT_FILL;
+    if (off == offsetof(style_t, svg_stroke)) return CSS_SLOT_STROKE;
+    if (off == offsetof(style_t, bg_color)) return CSS_SLOT_BACKGROUND;
+    if (off == offsetof(style_t, outline_color)) return CSS_SLOT_OUTLINE;
+    if (off == offsetof(style_t, svg_stop_color)) return CSS_SLOT_STOP;
+    return (enum css_color_slot)(CSS_SLOT_BORDER_TOP + (off - offsetof(style_t, border_color)) / sizeof(uint32_t));
+}
+int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d) {
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return 0;
     const void *field = (const char *)st + p->off;
@@ -1715,14 +1475,36 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, uint32
     case PT_INT:
         if (p->size != sizeof(int32_t)) return 0;
         snprintf(text, sizeof text, "%d", (int)*(const int32_t *)field); sb_puts(out, text); return 1;
-    case PT_COLOR: {
-        uint32_t c = *(const uint32_t *)field;
-        *color = c == COLOR_CURRENT ? st->color : c;
-        return 2;
-    }
+    case PT_COLOR: return css_style_color_text(st, color_slot(p), out) ? 1 : -1;
+    case PT_COLOR_SCHEME: sb_puts(out, st->color_scheme_text ? st->color_scheme_text : "normal"); return 1;
     case PT_MOTION_LIST: return css_computed_value(st, p, out, d) ? 1 : -1;
     }
     return 0;
+}
+/* CSSOM: a declared value's specified serialization for the properties whose
+   values the table serializes itself; false leaves the authored text */
+static bool apply_long(const struct propdef *p, const char *v, size_t n, struct cx *cx);
+bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out) {
+    const struct propdef *p = css_prop_lookup(name, strlen(name));
+    if (!p) return false;
+    trim(&v, &n);
+    if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
+    if (p->type != PT_COLOR_SCHEME) return false;
+    arena_t a = {.chunk_size = 1024};
+    jmp_buf trap;
+    a.trap = &trap;
+    bool ok = false;
+    if (!setjmp(trap)) {
+        style_t scratch = {0};
+        uint8_t set[1] = {0};
+        struct cx cx = {.s = &scratch, .a = &a, .set = set, .supports_probe = true};
+        if (apply_long(p, v, n, &cx)) {
+            sb_puts(out, scratch.color_scheme_text ? scratch.color_scheme_text : "normal");
+            ok = true;
+        }
+    }
+    ar_free(&a);
+    return ok;
 }
 
 /* ---------------------------------------------------------------- longhand values */
@@ -2277,6 +2059,7 @@ static bool parse_mask_image(const char *s, size_t n, struct cx *cx) {
     return false;
 }
 
+static bool transform_angle(const char *s, size_t n, float *out);
 /* linear-gradient(), radial-gradient() and their repeating- forms; NULL if it is not one */
 static const struct gradient *parse_gradient(const char *s, size_t n, struct cx *cx) {
     size_t fl = 0;
@@ -2305,11 +2088,13 @@ static const struct gradient *parse_gradient(const char *s, size_t n, struct cx 
         size_t cl[8];
         int q = split_checked(a[j], al[j], c, cl, 8, ' ', cx);
         uint32_t col;
-        if (q >= 1 && css_color_checked(c[0], cl[0], &col, cx)) { /* a colour stop: colour [pos [pos]] */
+        const struct css_color_value *exact;
+        if (q >= 1 && css_color_value_compute(c[0], cl[0], cx, NULL, &col, &exact)) { /* a colour stop: colour [pos [pos]] */
             if (cx->supports_probe && q > 3) return NULL;
             for (int z = 0; z < 2 && g.n < GRAD_MAX; z++) {
                 if (z == 1 && q < 3) break;
                 g.col[g.n] = col;
+                g.col_value[g.n] = col == COLOR_CURRENT ? exact : NULL;
                 g.pos[g.n].kind = LK_AUTO;
                 if (q > 1 + z && !parse_len(c[1 + z], cl[1 + z], cx, &g.pos[g.n], 0)) {
                     if (cx->supports_probe) return NULL;
@@ -2339,7 +2124,7 @@ static const struct gradient *parse_gradient(const char *s, size_t n, struct cx 
                     g.angle = g.to_y < 0 ? 0 : g.to_x > 0 ? 90 : g.to_y > 0 ? 180 : 270;
                     g.to_x = g.to_y = 0;
                 }
-            } else if (q == 1 && comp(c[0], cl[0], 0, &deg)) g.angle = deg;
+            } else if (q == 1 && transform_angle(c[0], cl[0], &deg)) g.angle = deg * 180 / (float)M_PI;
             else return NULL;
             continue;
         }
@@ -2985,6 +2770,7 @@ static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src)
     case PT_ZINDEX: dst->z_auto = src->z_auto; break;
     case PT_BG_SIZE: dst->bg_size_kind = src->bg_size_kind; break;
     case PT_MASK_SIZE: dst->mask_size_kind = src->mask_size_kind; break;
+    case PT_COLOR_SCHEME: dst->color_scheme_text = src->color_scheme_text; break;
     }
 }
 
@@ -3205,17 +2991,16 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     style_t *s = cx->s;
     char *field = (char *)s + p->off;
     const style_t *par = cx->parent ? cx->parent : &initial;
-    if (ident_is(v, n, "inherit")) {
-        copy_prop(p, s, par);
-        if (!p->inherited) s->explicit_inherit = true;
-        return true;
-    }
-    if (ident_is(v, n, "initial")) {
-        copy_prop(p, s, &initial);
-        return true;
-    }
-    if (ident_is(v, n, "unset") || ident_is(v, n, "revert") || ident_is(v, n, "revert-layer")) {
-        copy_prop(p, s, p->inherited ? par : &initial);
+    bool colour = p->type == PT_COLOR || p->type == PT_SVG_PAINT;
+    const style_t *from = ident_is(v, n, "inherit") ? par : ident_is(v, n, "initial") ? &initial :
+        ident_is(v, n, "unset") || ident_is(v, n, "revert") || ident_is(v, n, "revert-layer") ?
+        p->inherited ? par : &initial : NULL;
+    /* the initial colour is CanvasText, which follows color-scheme */
+    if (from == &initial && colour && color_slot(p) == CSS_SLOT_COLOR) return css_color_apply("canvastext", 10, cx, CSS_SLOT_COLOR);
+    if (from) {
+        copy_prop(p, s, from);
+        if (colour && !cx->supports_probe) css_color_slot_copy(s, from, color_slot(p), cx->a);
+        if (from == par && !p->inherited && ident_is(v, n, "inherit")) s->explicit_inherit = true;
         return true;
     }
     switch (p->type) {
@@ -3294,11 +3079,44 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         *(struct css_corner_radius *)field=parsed;
         return true;
     }
-    case PT_COLOR: {
-        uint32_t c;
-        if (!css_color_checked(v, n, &c, cx)) return false;
-        if (c == COLOR_CURRENT && p->off == offsetof(style_t, color)) c = par->color;
-        *(uint32_t *)field = c;
+    case PT_COLOR: return css_color_apply(v, n, cx, color_slot(p));
+    case PT_COLOR_SCHEME: {
+        /* CSS Color Adjust 1, 2.1: normal | [ light | dark | <custom-ident> ]+ && only? */
+        if (ident_is(v, n, "normal")) {
+            s->color_scheme = 0;
+            s->color_scheme_text = NULL;
+        } else {
+            uint8_t bits = 0;
+            size_t names = 0;
+            char *text = ar_alloc(cx->a, n + 6), *t = text;
+            for (const char *q = v, *e = v + n; q < e;) {
+                while (q < e && is_space((unsigned char)*q)) q++;
+                const char *w = q;
+                while (q < e && !is_space((unsigned char)*q)) q++;
+                size_t wn = (size_t)(q - w);
+                if (!wn) break;
+                /* only once, first or last */
+                if (ident_is(w, wn, "only")) {
+                    if ((bits & CSS_SCHEME_ONLY) || (names && q != e)) return false;
+                    bits |= CSS_SCHEME_ONLY;
+                    continue;
+                }
+                if (ident_is(w, wn, "normal") || !motion_name(w, wn)) return false; /* a <custom-ident> */
+                bool light = ident_is(w, wn, "light"), dark = ident_is(w, wn, "dark");
+                bits |= light ? CSS_SCHEME_LIGHT : dark ? CSS_SCHEME_DARK : 0;
+                if (names++) *t++ = ' ';
+                if (light || dark) { memcpy(t, light ? "light" : "dark", light ? 5 : 4); t += light ? 5 : 4; }
+                else { memcpy(t, w, wn); t += wn; }
+            }
+            if (!names) return false;
+            if (bits & CSS_SCHEME_ONLY) { memcpy(t, " only", 5); t += 5; }
+            *t = 0;
+            s->color_scheme = bits;
+            s->color_scheme_text = text;
+        }
+        /* the root's initial colour follows its scheme until color is declared */
+        if (!cx->parent && !cx->supports_probe && !cx->set[css_prop_index(find_prop("color", 5))])
+            css_color_apply("canvastext", 10, cx, CSS_SLOT_COLOR);
         return true;
     }
     case PT_SVG_WIDTH: {
@@ -3311,8 +3129,9 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     }
     case PT_SVG_PAINT: {
         struct svg_paint paint = {0};
+        const struct css_color_value *exact = NULL;
         if (ident_is(v, n, "none")) paint.kind = SVG_PAINT_NONE;
-        else if (css_color_checked(v, n, &paint.color, cx)) paint.kind = SVG_PAINT_COLOR;
+        else if (css_color_value_compute(v, n, cx, NULL, &paint.color, &exact)) paint.kind = SVG_PAINT_COLOR;
         else {
             /* The rasterizer can resolve local SVG gradients, not external
                paint servers or context paints. Do not claim those in supports(). */
@@ -3333,6 +3152,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
             paint.kind = SVG_PAINT_REF; paint.ref = ref;
         }
         *(struct svg_paint *)field = paint;
+        if (!cx->supports_probe) css_color_slot_set(s, color_slot(p), exact, cx->a);
         return true;
     }
     case PT_NUM: {
@@ -3441,7 +3261,7 @@ static bool set_long(const char *name, const char *v, size_t n, struct cx *cx) {
     if (!p) { if (cx->supports_probe) cx->invalid = true; return false; }
     int i = css_prop_index(p);
     if (cx->set[i]) return true;
-    if (cx->font_pass && p->type != PT_FONT_SIZE) return true;
+    if (cx->font_pass && !early(p)) return true;
     if (!apply_long(p, v, n, cx)) { if (cx->supports_probe) cx->invalid = true; return false; }
     cx->set[i] = 1;
     return true;
@@ -4093,7 +3913,7 @@ bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx) 
     if (p->type == PT_SHORT) return apply_short(p, v, n, cx);
     int i = css_prop_index(p);
     if (cx->set[i]) return true;
-    if (cx->font_pass && p->type != PT_FONT_SIZE) return true;
+    if (cx->font_pass && !early(p)) return true;
     if (!apply_long(p, v, n, cx)) return false;
     cx->set[i] = 1;
     return true;
@@ -4135,6 +3955,7 @@ void css_style_init(style_t *s, const style_t *parent) {
     s->border_radius=0; /* legacy native-only radius is not inherited */
     for (int i = 0; i < NPROPS; i++)
         if (props[i].type != PT_SHORT && !props[i].inherited) copy_prop(&props[i], s, &initial);
+    s->color_own = NULL;
     s->before = s->after = s->backdrop = s->placeholder = NULL;
     s->before_generated = s->after_generated = s->explicit_inherit = false;
 }
@@ -4147,6 +3968,7 @@ void css_style_adopt_inherited(style_t *s, const style_t *from) {
     for (int i = 0; i < NPROPS; i++)
         if (props[i].type != PT_SHORT && !props[i].inherited) copy_prop(&props[i], s, &own);
     s->border_radius = own.border_radius;
+    s->color_own = own.color_own;
     s->before = own.before; s->after = own.after; s->backdrop = own.backdrop; s->placeholder = own.placeholder;
     s->before_generated = own.before_generated; s->after_generated = own.after_generated;
     s->explicit_inherit = own.explicit_inherit;
@@ -4154,9 +3976,11 @@ void css_style_adopt_inherited(style_t *s, const style_t *from) {
 
 void css_style_finish(style_t *s, const style_t *parent, bool root) {
     if (s->color == COLOR_CURRENT) s->color = parent ? parent->color : 0xFF000000u;
+    css_color_finish(s);
     if (s->bg_color == COLOR_CURRENT) s->bg_color = s->color;
     for (struct css_box_shadow *shadow = (struct css_box_shadow *)s->box_shadow; shadow; shadow = shadow->next)
-        if (shadow->color == COLOR_CURRENT) shadow->color = s->color;
+        if (shadow->color == COLOR_CURRENT)
+            shadow->color = shadow->color_value ? css_color_value_argb(shadow->color_value, s->color) : s->color;
     for (int i = 0; i < 4; i++) {
         if (s->border_color[i] == COLOR_CURRENT) s->border_color[i] = s->color;
         if (s->border_style[i] == BS_NONE || s->border_style[i] == BS_HIDDEN) s->border_width[i] = 0;
@@ -4164,8 +3988,11 @@ void css_style_finish(style_t *s, const style_t *parent, bool root) {
     if (s->outline_color == COLOR_CURRENT) s->outline_color = s->color;
     if (s->outline_style == BS_NONE) s->outline_width = 0;
     if (s->has_grad) {
-        for (int i = 0; i < 2; i++)
-            if (s->grad[i] == COLOR_CURRENT) s->grad[i] = s->color;
+        const struct gradient *g = s->gradient;
+        for (int i = 0; i < 2; i++) {
+            const struct css_color_value *exact = g && g->n ? g->col_value[i ? g->n - 1 : 0] : NULL;
+            if (s->grad[i] == COLOR_CURRENT) s->grad[i] = exact ? css_color_value_argb(exact, s->color) : s->color;
+        }
     }
     if (s->position == POS_ABSOLUTE || s->position == POS_FIXED) s->float_ = FL_NONE;
     /* floated, absolutely positioned, root and flex items are blockified */
@@ -4871,7 +4698,7 @@ bool css_anim_parse(const struct css_anim_ctx *c, const struct propdef *p, const
     struct cx cx = {.s = out, .parent = parent, .node = c->node, .em = parent ? parent->font_size : 16, .rem = c->rem,
                     .vw = c->vw, .vh = c->vh, .a = c->a, .set = set, .font_pass = true};
     /* font-size first, against the parent's, as the cascade does; then the rest against it */
-    if (css_prop_is_font(p) && !css_apply(p, v, n, &cx)) return false;
+    if (css_prop_is_early(p) && !css_apply(p, v, n, &cx)) return false;
     cx.font_pass = false;
     cx.em = out->font_size;
     return css_apply(p, v, n, &cx) && !cx.invalid;
