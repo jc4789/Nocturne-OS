@@ -163,17 +163,8 @@ static JSValue native_safety(JSContext *ctx,JSValueConst this_value,int argc,JSV
         /* HTML timer initialization steps: a string handler, after its Trusted
            Types step, is EnsureCSPDoesNotBlockStringCompilation's "timer"
            codeString; blocked, setTimeout returns 0 (null here). */
-        size_t length=0;const char *text=argc>2?JS_ToCStringLen(ctx,&length,argv[2]):NULL;
-        if(!text)result=JS_EXCEPTION;
-        else{
-            struct csp_site site={s,NULL};
-            if(!html_policy_eval_allowed(s->doc,text,length,csp_report,&site))result=JS_NULL;
-            else{
-                sbuf b={0};sb_puts(&b,"(function(){\n");sb_put(&b,text,length);sb_puts(&b,"\n})");
-                result=JS_Eval(ctx,sb_cstr(&b),b.n,s->doc->url,JS_EVAL_TYPE_GLOBAL);sb_free(&b);
-            }
-            JS_FreeCString(ctx,text);
-        }
+        struct csp_site site={s,NULL};
+        result=argc>2?csp_timer_code(ctx,s->doc,argv[2],s->doc->url,csp_report,&site):JS_ThrowTypeError(ctx,"Timer handler required");
     }else result=JS_ThrowTypeError(ctx,"Unknown HTML safety operation");
     JS_FreeCString(ctx,op);return result;
 }

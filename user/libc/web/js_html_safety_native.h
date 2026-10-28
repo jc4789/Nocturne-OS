@@ -77,6 +77,22 @@ static JSValue csp_compile_check(JSContext *ctx,web_doc *document,JSValue code,b
     JS_FreeValue(ctx,code);
     return JS_ThrowEvalError(ctx,"Code generation from strings disallowed by Content Security Policy");
 }
+/* HTML timer initialization steps for a string handler, after its Trusted
+   Types step: EnsureCSPDoesNotBlockStringCompilation's "timer" codeString.
+   Blocked, null (setTimeout then returns 0); otherwise the handler compiled
+   as a function, in the global scope, named for the realm's script URL. */
+static JSValue csp_timer_code(JSContext *ctx,web_doc *document,JSValueConst handler,const char *url,
+                              html_csp_reporter report,void *opaque){
+    size_t length=0;const char *text=JS_ToCStringLen(ctx,&length,handler);
+    if(!text)return JS_EXCEPTION;
+    JSValue result=JS_NULL;
+    if(html_policy_eval_allowed(document,text,length,report,opaque)){
+        /* JS_Eval reads up to the terminating NUL (quickjs.h), which sb_cstr keeps. */
+        sbuf b={0};sb_puts(&b,"(function(){\n");sb_put(&b,text,length);sb_puts(&b,"\n})");
+        result=JS_Eval(ctx,sb_cstr(&b),b.n,url?url:"",JS_EVAL_TYPE_GLOBAL);sb_free(&b);
+    }
+    JS_FreeCString(ctx,text);return result;
+}
 /* §4.5.1's violation: script-src, resource "wasm-eval". */
 static JSValue wasm_policy_violation_init(JSContext *ctx,web_doc *document,struct web_html_policy_rule *rule,int status) {
     struct html_csp_violation violation={.policy=rule,.directive="script-src",.resource="wasm-eval"};
