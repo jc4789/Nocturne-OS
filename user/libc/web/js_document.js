@@ -206,7 +206,12 @@
             visibilityState:{configurable:true,enumerable:true,get(){brand(this);return this===document && host.visible()?'visible':'hidden';}}
         });
         Document.prototype.createEvent=function(...args){brand(this);return apply(createEvent,this,args);};
-        for(const method of ['write','writeln'])Document.prototype[method]=function(){brand(this);throw new DOMException('Writing to an inactive document is not implemented','NotSupportedError');};
+        // HTML "document write steps": an XML document has no input stream.
+        for(const method of ['write','writeln'])Document.prototype[method]=function(){
+            brand(this);
+            if(!rawDom.get(this,'htmlDocument'))throw new DOMException('An XML document cannot be written to','InvalidStateError');
+            throw new DOMException('Writing to an inactive document is not implemented','NotSupportedError');
+        };
         Object.assign(globalThis,{DOMParser,XMLSerializer,DOMImplementation,XMLDocument});
         return {brand,xmlDocumentPrototype:XMLDocument.prototype};
     })();

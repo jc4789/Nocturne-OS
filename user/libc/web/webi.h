@@ -1304,6 +1304,7 @@ struct web_doc {
     uint8_t restyle_damage_n;
     bool restyle_damage_lost;
     struct html_parser *parser;
+    struct xml_parser *xml_parser; /* an XML document's, while it loads (xml.h) */
     struct web_js_state *js;
     bool live, dirty, paint_dirty, resources_dirty, images_dirty;
     bool restyle_dirty; /* dirty, but only marked elements' own computed values (CSS animation samples) */
@@ -1647,7 +1648,17 @@ void web_js_frames_sync(web_doc *d);
 web_doc *web_live_child(const char *html, size_t len, const char *url, const char *charset,
                         const struct web_host *host, web_doc *parent, node_t *frame, web_doc *inherited_origin);
 web_doc *web_live_child_response(const char *html,size_t len,const char *url,const char *charset,
-                        const char *headers,const struct web_host *host,web_doc *parent,node_t *frame,web_doc *inherited_origin);
+                        const char *headers,const char *type,const struct web_host *host,web_doc *parent,node_t *frame,
+                        web_doc *inherited_origin);
+/* The document's parser, the HTML parser (d->parser, which also serves
+   document.open and document.write) or an XML document's XML parser,
+   driven the same way: doc_parser_current names the active one (NULL:
+   parsing is over), doc_parser_resume answers as html_resume,
+   doc_parser_changed as html_import_changed, and doc_parser_stop ends it. */
+const void *doc_parser_current(const web_doc *d);
+int doc_parser_resume(web_doc *d, node_t **script);
+bool doc_parser_changed(const web_doc *d);
+void doc_parser_stop(web_doc *d);
 const char *web_effective_url(web_doc *d);
 void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *r);
 void web_js_socket_event(web_doc *d, uint64_t id, const struct web_socket_event *e);

@@ -907,7 +907,9 @@
         Object.defineProperty(proto,Symbol.unscopables,{configurable:true,value:unscopables});
     }
     const document=host.document;
-    Object.setPrototypeOf(document,HTMLDocument.prototype);
+    /* HTML "create and initialize a Document": a document of type "xml" is a
+       Document, not an HTMLDocument. */
+    Object.setPrototypeOf(document,domGet(document,'htmlDocument')?HTMLDocument.prototype:Document.prototype);
     /* Configurable: these move to Document.prototype at the end of bootstrap. */
     Object.defineProperties(document, {
         documentElement:{configurable:true,get(){return domGet(document,'documentElement');}},
