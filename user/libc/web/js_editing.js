@@ -48,9 +48,36 @@ function fontSizePixels(size) {
     var match = /^([0-9]+(?:\.[0-9]+)?)(cm|mm|in|pt|pc|px)$/.exec(size);
     return match ? Number(match[1]) * absoluteUnitPixels[match[2]] : NaN;
 }
-// HTML's "editing host" and "editable" (js_document_commands.js).
-const editingHost = bridge.editingHost;
-const editable = bridge.editable;
+// HTML's "editing host" and "editable" (js_document_commands.js), as the
+// commands read them: less the option data of the controls that hold options.
+// An option or optgroup element, wherever it is, and everything in a select or
+// a datalist, are the control's data, not content the user edits: the user
+// puts no caret in them, and a command that edited them would lose the user's
+// choices (WPT editing/other/editing-around-select-element.tentative.html: no
+// command changes them).  A select in an editable parent is still editable, so
+// a command can remove it as a whole.
+function isOptionData(node) {
+    for (var n = node; n; n = n.parentNode) {
+        if (n.nodeType == Node.ELEMENT_NODE && n.namespaceURI == "http://www.w3.org/1999/xhtml"
+        && (n.localName == "option" || n.localName == "optgroup"
+        || (n != node && (n.localName == "select" || n.localName == "datalist")))) {
+            return true;
+        }
+    }
+    return false;
+}
+// A select or datalist: a boundary point in it is among its option data.
+function holdsOptionData(node) {
+    return node && node.nodeType == Node.ELEMENT_NODE
+        && node.namespaceURI == "http://www.w3.org/1999/xhtml"
+        && (node.localName == "select" || node.localName == "datalist");
+}
+function editingHost(node) {
+    return bridge.editingHost(node) && !holdsOptionData(node) && !isOptionData(node);
+}
+function editable(node) {
+    return bridge.editable(node) && !isOptionData(node);
+}
 
 /* @editing-implementation */
 
@@ -117,6 +144,411 @@ function getAffectedEditingHost() {
         }
     }
     return null;
+}
+
+// HTML: an editing host in the Plaintext-Only state: "Only the element's raw
+// text content is editable; rich formatting is disabled."  The editing host
+// whose state decides is the outermost one of the affected editing host's run
+// of editable ancestors: an editing host whose parent is editable is edited as
+// part of its parent's (WPT editing/plaintext-only/
+// nested-with-contenteditable-true.html, plaintext-only-in-designMode.html).
+function getGoverningEditingHost() {
+    var host = getAffectedEditingHost();
+    while (host && host.parentNode
+    && (isEditable(host.parentNode) || isEditingHost(host.parentNode))) {
+        host = getEditingHostOf(host.parentNode);
+    }
+    return host;
+}
+
+function isPlaintextOnly() {
+    var host = getGoverningEditingHost();
+    return host !== null && bridge.editableState(host) == "plaintext-only";
+}
+
+// The commands a Plaintext-Only editing host takes besides the miscellaneous
+// ones: those that edit its text and line breaks.  The others make or change
+// markup (the inline formatting commands; formatBlock, indent, outdent, the
+// list and justify commands, insertHorizontalRule, insertImage) and are not
+// enabled there (WPT editing/plaintext-only/styling-commands.html).
+var plainTextCommands = Object.assign(Object.create(null), {
+    "delete": true, forwarddelete: true, inserthtml: true,
+    insertlinebreak: true, insertparagraph: true, inserttext: true,
+});
+
+// The selection's range, not the draft's cached active range.
+function selectionRange() {
+    var selection = getSelection();
+    return selection && selection.rangeCount ? selection.getRangeAt(0) : null;
+}
+
+// Whether white-space keeps the line feeds of node's text (CSS Text:
+// white-space-collapse preserve, preserve-breaks or break-spaces).
+function keepsLineFeeds(node) {
+    var element = node.nodeType == Node.ELEMENT_NODE ? node : node.parentNode;
+    if (!element || element.nodeType != Node.ELEMENT_NODE) {
+        return false;
+    }
+    var style = getComputedStyle(element);
+    var collapse = style.whiteSpaceCollapse;
+    if (typeof collapse == "string" && collapse != "") {
+        return ["preserve", "preserve-breaks", "break-spaces"].indexOf(collapse) != -1;
+    }
+    return ["pre", "pre-wrap", "pre-line", "break-spaces"].indexOf(style.whiteSpace) != -1;
+}
+
+// Whether something after (node, offset) in its block makes a line after a
+// line break there: text, a br or an img before the block ends.
+function hasLineContentAfter(node, offset) {
+    if (node.nodeType == Node.TEXT_NODE && offset < node.length) {
+        return true;
+    }
+    var block = node.nodeType == Node.TEXT_NODE ? node.parentNode : node;
+    while (!isBlockNode(block) && !isEditingHost(block) && block.parentNode) {
+        block = block.parentNode;
+    }
+    var next = node.nodeType != Node.TEXT_NODE && offset < node.childNodes.length
+        ? node.childNodes[offset] : nextNodeDescendants(node);
+    for (; next && isDescendant(next, block); next = nextNode(next)) {
+        if (isBlockNode(next)) {
+            return false;
+        }
+        if ((next.nodeType == Node.TEXT_NODE && next.length && isVisible(next))
+        || isHtmlElement(next, ["br", "img"])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A line break in a Plaintext-Only editing host: where white-space keeps line
+// feeds, a preformatted line feed, which the text content has; elsewhere, and
+// for the padding an empty last line needs, a br (WPT
+// editing/plaintext-only/insertLineBreak.html).  The draft's insertLineBreak
+// otherwise.  pad false: text follows at once, so no padding.
+function insertPlainLineBreak(pad) {
+    deleteSelection({stripWrappers: false});
+    var range = getActiveRange();
+    var node = range.startContainer, offset = range.startOffset;
+    if ((!isEditable(node) && !isEditingHost(node)) || !keepsLineFeeds(node)
+    || (node.nodeType == Node.ELEMENT_NODE && !isAllowedChild("br", node))) {
+        return commands.insertlinebreak.action("");
+    }
+    var text = node;
+    if (node.nodeType == Node.TEXT_NODE) {
+        node.insertData(offset, "\n");
+        offset++;
+    } else {
+        text = document.createTextNode("\n");
+        range.insertNode(text);
+        offset = 1;
+    }
+    getSelection().collapse(text, offset);
+    range.setStart(text, offset);
+    range.setEnd(text, offset);
+    if (pad !== false && !hasLineContentAfter(text, offset)) {
+        text.parentNode.insertBefore(document.createElement("br"), text.nextSibling);
+        getSelection().collapse(text, offset);
+        range.setStart(text, offset);
+        range.setEnd(text, offset);
+    }
+    return true;
+}
+
+// The line break right after (node, offset): a br, or a line feed that
+// white-space keeps (as its Text node and its index there), or null.
+function getLineBreakAfter(node, offset) {
+    if (node.nodeType == Node.TEXT_NODE) {
+        if (offset < node.length) {
+            return node.data[offset] == "\n" && keepsLineFeeds(node)
+                ? {node: node, index: offset} : null;
+        }
+        offset = getNodeIndex(node) + 1;
+        node = node.parentNode;
+    }
+    var next = node ? node.childNodes[offset] : null;
+    if (next && isHtmlElement(next, "br")) {
+        return {node: next, index: -1};
+    }
+    if (next && next.nodeType == Node.TEXT_NODE && next.data[0] == "\n" && keepsLineFeeds(next)) {
+        return {node: next, index: 0};
+    }
+    return null;
+}
+
+// Whether removing that line break would not change the layout: the draft's
+// extraneous line break, or a kept line feed that ends its block's last line
+// (like a br, it puts no line after it when nothing follows before the block
+// ends) after something on that line.
+function isExtraneousBreak(lineBreak) {
+    if (lineBreak.index < 0) {
+        return isExtraneousLineBreak(lineBreak.node);
+    }
+    var text = lineBreak.node, block = getLineBlockOf(text);
+    if (lineBreak.index != text.length - 1 || hasLineContentBeside(text, block, true)) {
+        return false;
+    }
+    return lineBreak.index > 0
+        ? text.data[lineBreak.index - 1] != "\n"
+        : hasLineContentBeside(text, block, false);
+}
+
+// Text in a Plaintext-Only editing host: the insertText action for each line,
+// and a line break for each line feed, padded only when the last line is
+// empty.  The line break after the text, when the text made it extraneous,
+// is removed: the padding of the empty line the text now fills (a br or a
+// kept line feed; WPT editing/plaintext-only/insertText.html), or the padding
+// the draft's insertLineBreak put after a br that ended its block.  A line
+// break that was extraneous before stays.
+function insertPlainText(text) {
+    if (!getActiveRange().collapsed) {
+        deleteSelection({stripWrappers: false});
+    }
+    var range = getActiveRange();
+    var before = getLineBreakAfter(range.startContainer, range.startOffset);
+    var wasExtraneous = before != null && isExtraneousBreak(before);
+    var lines = text.split("\n");
+    for (var i = 0; i < lines.length; i++) {
+        if (i) {
+            insertPlainLineBreak(i == lines.length - 1 && lines[i] == "");
+        }
+        if (lines[i] != "" || lines.length == 1) {
+            commands.inserttext.action(lines[i]);
+        }
+    }
+    if (lines[lines.length - 1] == "") {
+        return true;
+    }
+    range = getActiveRange();
+    var after = getLineBreakAfter(range.endContainer, range.endOffset);
+    if (!after || (wasExtraneous && after.node == before.node) || !isExtraneousBreak(after)) {
+        return true;
+    }
+    if (after.index < 0) {
+        after.node.parentNode.removeChild(after.node);
+    } else {
+        after.node.deleteData(after.index, 1);
+    }
+    return true;
+}
+
+// The text of markup, for a Plaintext-Only editing host: HTML's rendered text
+// collection steps (the innerText getter's) over the markup, parsed in an
+// inert document so that nothing of it loads or runs.  Nothing of it is
+// rendered, so an element's display and white-space are its style
+// attribute's, else the UA style sheet's (HTML's rendering section).  noscript
+// is hidden: the document the text goes into has scripting (WPT
+// editing/plaintext-only/insertHTML.html).
+var markupHidden = ["area", "base", "basefont", "datalist", "head", "link",
+    "meta", "noembed", "noframes", "param", "rp", "script", "style",
+    "template", "title"];
+var markupBlocks = ["address", "article", "aside", "blockquote", "body",
+    "center", "dd", "details", "dialog", "dir", "div", "dl", "dt", "fieldset",
+    "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5",
+    "h6", "header", "hgroup", "hr", "html", "legend", "listing", "main", "menu",
+    "nav", "ol", "optgroup", "option", "p", "plaintext", "pre", "search",
+    "section", "summary", "ul", "xmp"];
+
+function getMarkupDisplay(element) {
+    var name = element.localName;
+    var html = element.namespaceURI == "http://www.w3.org/1999/xhtml";
+    // The UA style sheet's !important rules first: no style attribute wins.
+    if (html && (name == "noscript"
+    || (name == "input" && /^hidden$/i.test(element.getAttribute("type") || "")))) {
+        return "none";
+    }
+    var own = element.style ? element.style.getPropertyValue("display").trim().toLowerCase() : "";
+    if (own) {
+        return own;
+    }
+    if (!html) {
+        return "inline";
+    }
+    if ((element.hasAttribute("hidden") && name != "embed")
+    || markupHidden.indexOf(name) != -1
+    || (name == "dialog" && !element.hasAttribute("open"))) {
+        return "none";
+    }
+    return {li: "list-item", table: "table", caption: "table-caption",
+        tr: "table-row", td: "table-cell", th: "table-cell"}[name]
+        || (markupBlocks.indexOf(name) != -1 ? "block" : "inline");
+}
+
+function isBlockLevelDisplay(display) {
+    return /^(block|list-item|table|flex|grid|flow-root)$/.test(display)
+        || /^block\b/.test(display) || /\blist-item$/.test(display);
+}
+
+function getMarkupWhiteSpace(element, inherited) {
+    var own = element.style ? element.style.getPropertyValue("white-space").trim().toLowerCase() : "";
+    if (own) {
+        return own;
+    }
+    if (isHtmlElement(element, ["listing", "plaintext", "pre", "xmp"])) {
+        return "pre";
+    }
+    return isHtmlElement(element, "textarea") ? "pre-wrap" : inherited;
+}
+
+// "If node's CSS box is not the last 'table-cell' box of its enclosing
+// 'table-row' box" / "not the last 'table-row' box of the nearest ancestor
+// 'table' box".
+function hasLaterMarkupBox(element, display, container) {
+    for (var n = nextNodeDescendants(element); n && (!container || isDescendant(n, container)); n = nextNode(n)) {
+        if (n.nodeType == Node.ELEMENT_NODE && getMarkupDisplay(n) == display) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function collectMarkupText(node, whiteSpace, items) {
+    if (node.nodeType == Node.TEXT_NODE) {
+        items.push({text: node.data, whiteSpace: whiteSpace});
+        return;
+    }
+    if (node.nodeType != Node.ELEMENT_NODE) {
+        if (node.nodeType == Node.DOCUMENT_FRAGMENT_NODE) {
+            for (var child = node.firstChild; child; child = child.nextSibling) {
+                collectMarkupText(child, whiteSpace, items);
+            }
+        }
+        return;
+    }
+    var display = getMarkupDisplay(node);
+    if (display == "none") {
+        return;
+    }
+    if (isHtmlElement(node, "br")) {
+        items.push({text: "\n", lineEnd: true});
+        return;
+    }
+    whiteSpace = getMarkupWhiteSpace(node, whiteSpace);
+    var start = items.length;
+    for (var child = node.firstChild; child; child = child.nextSibling) {
+        collectMarkupText(child, whiteSpace, items);
+    }
+    if (display == "table-cell") {
+        var row = node.parentNode;
+        while (row && !(row.nodeType == Node.ELEMENT_NODE && getMarkupDisplay(row) == "table-row")) {
+            row = row.parentNode;
+        }
+        if (hasLaterMarkupBox(node, "table-cell", row)) {
+            items.push({text: "\t"});
+        }
+    }
+    if (display == "table-row") {
+        var table = node.parentNode;
+        while (table && !(table.nodeType == Node.ELEMENT_NODE && getMarkupDisplay(table) == "table")) {
+            table = table.parentNode;
+        }
+        if (hasLaterMarkupBox(node, "table-row", table)) {
+            items.push({text: "\n", lineEnd: true});
+        }
+    }
+    var count = isHtmlElement(node, "p") ? 2
+        : isBlockLevelDisplay(display) || display == "table-caption" ? 1 : 0;
+    if (count) {
+        items.splice(start, 0, count);
+        items.push(count);
+    }
+}
+
+function getMarkupText(value) {
+    var inert = document.implementation.createHTMLDocument("");
+    var range = inert.createRange();
+    range.selectNodeContents(inert.body);
+    var items = [];
+    collectMarkupText(range.createContextualFragment(value), "normal", items);
+
+    // CSS white space processing: collapsible white space collapsed to one
+    // space, and removed after another or at the start or end of a line.
+    var results = [], lineStart = true, spaceAt = -1;
+    function endLine() {
+        if (spaceAt != -1) {
+            results[spaceAt] = results[spaceAt].slice(0, -1);
+        }
+        spaceAt = -1;
+        lineStart = true;
+    }
+    items.forEach(function(item) {
+        if (typeof item == "number") {
+            endLine();
+            results.push(item);
+            return;
+        }
+        if (item.lineEnd) {
+            endLine();
+            results.push("\n");
+            return;
+        }
+        var text = item.text, mode = item.whiteSpace || "pre";
+        if (mode == "pre" || mode == "pre-wrap" || mode == "break-spaces") {
+            if (text != "") {
+                results.push(text);
+                spaceAt = -1;
+                lineStart = text[text.length - 1] == "\n";
+            }
+            return;
+        }
+        var segments = mode == "pre-line"
+            ? text.replace(/[\t\f\r ]*\n[\t\f\r ]*/g, "\n").split("\n") : [text];
+        segments.forEach(function(segment, index) {
+            if (index) {
+                endLine();
+                results.push("\n");
+            }
+            segment = segment.replace(/[\t\n\f\r ]+/g, " ");
+            if (lineStart || spaceAt != -1) {
+                segment = segment.replace(/^ /, "");
+            }
+            if (segment != "") {
+                results.push(segment);
+                lineStart = false;
+                spaceAt = segment[segment.length - 1] == " " ? results.length - 1 : -1;
+            }
+        });
+    });
+    endLine();
+
+    // The innerText getter: "Remove any items from results that are the empty
+    // string.  Remove any runs of consecutive required line break count items
+    // at the start or end of results.  Replace each remaining run of
+    // consecutive required line break count items with a string consisting of
+    // as many U+000A LF code points as the maximum of the values in the
+    // required line break count items."
+    results = results.filter(function(item) { return item !== ""; });
+    while (typeof results[0] == "number") {
+        results.shift();
+    }
+    while (typeof results[results.length - 1] == "number") {
+        results.pop();
+    }
+    var text = "", count = 0;
+    results.forEach(function(item) {
+        if (typeof item == "number") {
+            count = Math.max(count, item);
+            return;
+        }
+        text += "\n".repeat(count) + item;
+        count = 0;
+    });
+    return text;
+}
+
+// The action for command, as the active range's editing host takes it: the
+// draft's, or in a Plaintext-Only editing host, text and line breaks in place
+// of the markup the draft's insertHTML, insertLineBreak and insertText insert.
+function act(command, showUi, value) {
+    if ((command == "inserthtml" || command == "insertlinebreak" || command == "inserttext")
+    && isPlaintextOnly()) {
+        return editCommandMethod(command, undefined, function() {
+            return command == "inserthtml" ? insertPlainText(getMarkupText(value))
+                : command == "insertlinebreak" ? insertPlainLineBreak()
+                : insertPlainText(value);
+        });
+    }
+    return myExecCommand(command, showUi, value);
 }
 
 // The undo history: transactions of mutation records, each with the
@@ -320,7 +752,20 @@ function enabled(command) {
     if (command == "redo") {
         return redoStack.length != 0;
     }
-    return guarded(function() { return myQueryCommandEnabled(command); }, false);
+    return guarded(function() {
+        if (command in commands && miscellaneousCommands.indexOf(command) == -1) {
+            // A boundary point in a select or datalist is among its option
+            // data, which no command edits (see isOptionData).
+            var range = selectionRange();
+            if (range && (holdsOptionData(range.startContainer) || holdsOptionData(range.endContainer))) {
+                return false;
+            }
+            if (!plainTextCommands[command] && isPlaintextOnly()) {
+                return false;
+            }
+        }
+        return myQueryCommandEnabled(command);
+    }, false);
 }
 
 // execCommand(command, showUI, value), after the bindings' steps.
@@ -340,7 +785,7 @@ function exec(command, showUi, value) {
     var miscellaneous = miscellaneousCommands.indexOf(command) != -1;
     var host = miscellaneous ? null : getAffectedEditingHost();
     var run = recordAction(function() {
-        return myExecCommand(command, showUi, value);
+        return act(command, showUi, value);
     }, host, null);
     if (run.result && run.changed && host) {
         bridge.event(host, "input", inputData(command, value), inputTypes[command] || "");
@@ -379,9 +824,17 @@ function userEdit(inputType, data) {
     if (!command) {
         return false;
     }
-    // A plaintext-only editing host takes no formatting.
-    if (/^format/.test(inputType) && bridge.editableState(host) == "plaintext-only") {
-        return true;
+    if (isPlaintextOnly()) {
+        // Enter in a Plaintext-Only editing host is a line break (WPT
+        // editing/plaintext-only/insertLineBreak.html), and it takes no
+        // formatting.
+        if (inputType == "insertParagraph") {
+            inputType = "insertLineBreak";
+            command = "insertlinebreak";
+        }
+        if (!plainTextCommands[command]) {
+            return true;
+        }
     }
     var value = data === null ? "" : data.replace(/\r\n?/g, "\n");
     if (inputType == "deleteByCut" && getActiveRange().collapsed) {
@@ -399,7 +852,7 @@ function userEdit(inputType, data) {
     }
     host = getAffectedEditingHost();
     var run = recordAction(function() {
-        return myExecCommand(command, false, value);
+        return act(command, false, value);
     }, host, inputType == "insertText" ? "typing" : null);
     if (run.changed && host && isConnected(host)) {
         bridge.event(host, "input", eventData, inputType);

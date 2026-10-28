@@ -7,8 +7,9 @@
                       fetch(query, notify) -> {id, promise}, resume(id), cancel(id), and
                       keepaliveRoom() (the bytes the realm's fetch group can still take into its
                       inflight keepalive bodies; a Window's only, for Beacon), fetchSync(query,
-                      timeout, initiator) -> a Response or null (a Worker's only: its event loop
-                      pauses for a synchronous XMLHttpRequest; initiator(id) as realm.initiator),
+                      timeout, initiator) -> a Response or null (its event loop pauses for a
+                      synchronous XMLHttpRequest: a Worker's, and a Window's when its host can
+                      serve the network alone; initiator(id) as realm.initiator),
                       and obtainBlob(url[, timeout]) (a Worker's only: FileAPI "obtain a blob
                       object" from its parent document's store, {id, promise} -> [bytes, type],
                       or with a timeout [bytes, type] or null). A Window's is js.c's (host.fetch); a Worker's
@@ -18,7 +19,8 @@
                       the realm's settings object: API base URL, origin, the "client" referrer
                       source and its referrer policy (enum webnet_referrer_policy).
      realm.dataURL(url) -> [bytes, type], task(fn) -> id, clearTask(id), digest(algorithm, bytes),
-     realm.initiator(id) (optional: XHR's Resource Timing initiator).
+     realm.initiator(id, type) (optional: a request's Resource Timing initiator type, set by the
+                      caller that has one: "xmlhttprequest" for XHR, "beacon" for sendBeacon).
    CORS and its preflight, cookies and the credentials mode, Mixed Content, the redirect modes,
    the HTTP cache modes, opaque filtering and the Cross-Origin-Resource-Policy check are the
    native transport's (webnet.c, webfetch.c): this layer sends a request's modes with it and
@@ -711,7 +713,7 @@ function fetchInterfaces(realm) {
        sync: a synchronous XMLHttpRequest's {timeout} (ms, 0 for none). The realm's event loop
        pauses in transport.fetchSync until the response is whole; the result is the Response, null
        when timeout passed first, and a network error throws. */
-    function fetchCore(input,init,observer,forcePreflight=false,destination='',prepared=false,sync=null) {
+    function fetchCore(input,init,observer,forcePreflight=false,destination='',prepared=false,sync=null,initiatorType='') {
         let r,s,b,integrity;
         try {
             r=prepared?input:new Request(input,init);s=requestSlots.get(r);b=bodySlots.get(r);
@@ -796,13 +798,13 @@ function fetchInterfaces(realm) {
             if(sync){
                 if(!transport.fetchSync)throw notSupported('This realm cannot pause for a synchronous fetch');
                 if(b.bytes!==null)b.used=true;
-                /* realm.initiator: the request's initiator type, as for an observed fetch below. */
-                const response=transport.fetchSync(query,sync.timeout,realm.initiator);
+                /* realm.initiator: the request's initiator type, as for an asynchronous fetch below. */
+                const response=transport.fetchSync(query,sync.timeout,initiatorType&&realm.initiator?id=>realm.initiator(id,initiatorType):undefined);
                 return response===null?null:settle(response);
             }
             started=transport.fetch(query,notify);
             transportId=started.id;const transportPromise=started.promise;started=null;
-            if(observer&&realm.initiator)realm.initiator(transportId);
+            if(initiatorType&&realm.initiator)realm.initiator(transportId,initiatorType);
             if(b.bytes!==null)b.used=true;
             return new NativePromise((resolve,reject)=>{
                 let finished=false,pendingReject=reject,unfollow=()=>{};
@@ -854,7 +856,8 @@ function fetchInterfaces(realm) {
             if(body!==null&&apply(abLength,body,[])>transport.keepaliveRoom())return false;
             const headers=type===null?undefined:record({'content-type':type});
             const mode=type!==null&&!noCorsSafe('content-type',type)?'cors':'no-cors';
-            const started=fetchCore(href(target),record({method:'POST',body:body===null?undefined:body,headers,keepalive:true,credentials:'include',mode}));
+            const started=fetchCore(href(target),record({method:'POST',body:body===null?undefined:body,headers,keepalive:true,credentials:'include',mode}),
+                undefined,false,'',false,null,'beacon');
             apply(then,started,[undefined,()=>{}]);
             return true;
         },
@@ -889,14 +892,14 @@ function fetchInterfaces(realm) {
             const c=signals.controller(),q=record({...init,signal:c.signal});
             if(q.headers!==null&&typeof q.headers==='object')q.headers=record({...q.headers});
             const observed=beginsWith(url,'data:')||(!(objectURLAPI&&beginsWith(url,'blob:'))&&transport.streaming()&&!!streams);
-            return {promise:fetchCore(url,q,observer,forcePreflight),cancel(){c.abort();},observed};
+            return {promise:fetchCore(url,q,observer,forcePreflight,'',false,null,'xmlhttprequest'),cancel(){c.abort();},observed};
         },
         /* A synchronous XHR's request (fetchCore's sync): the Response, null when timeout ms passed
            first. Only a realm whose transport has fetchSync can pause for it. */
         xhrFetchSync(url,init,forcePreflight,timeout){
             const q=record({...init,signal:signals.controller().signal});
             if(q.headers!==null&&typeof q.headers==='object')q.headers=record({...q.headers});
-            return fetchCore(url,q,undefined,forcePreflight,'',false,record({timeout}));
+            return fetchCore(url,q,undefined,forcePreflight,'',false,record({timeout}),'xmlhttprequest');
         },
         xhrMetadata(response){const s=slot(responseSlots,response,'Response');return {status:s.status,statusText:s.statusText,url:s.url,headers:s.headers};},
         /* Cache Storage's view of this realm's Fetch objects (js_cache_storage.js): a record of a

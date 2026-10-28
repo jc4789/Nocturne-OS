@@ -37,6 +37,7 @@
 #include "elements.h"
 #include "js_crypto.h"
 #include "js_compression.h"
+#include "js_typed_om.h"
 #include "js_encoding.h"
 #include "js_url.h"
 #include "js_atomics.h"
@@ -129,6 +130,9 @@ struct js_pending {
     node_t *element; /* CSP: P_CSS, the link element a violation targets */
     bool done, aborted, force_preflight, redirect_error, redirect_manual, same_origin, keepalive, no_cors, no_referrer;
     bool streaming, headers_delivered, host_accepted;
+    /* P_FETCH: a Window's synchronous XMLHttpRequest's, which native_fetch_wait takes when it
+       completes; process_pending never settles it. */
+    bool synchronous;
     /* P_WORKER streamed: a frame is in the child, its NJW_RESUME not yet taken (worker_resume). */
     bool worker_paused;
     /* A streamed response's metadata, kept past the frame that clears response
@@ -242,9 +246,14 @@ struct web_js_state {
     struct js_node_ref *node_buckets[JS_NODE_BUCKETS];
     bool node_cache_syncing, node_cache_failed;
     struct web_js_state *node_cache_next, **node_cache_prev;
-    /* style attributes' declaration blocks: a text and its serialization, by
-       element (style_memo_block) */
-    struct js_style_memo { char *source, *block; size_t source_n, block_n; } style_memo[JS_STYLE_MEMO];
+    /* inline styles' declaration blocks, by element (style_memo_get): an
+       attribute's text and the block it parses to, or (own) the block CSSOM
+       wrote; the block's serialization and names */
+    struct js_style_memo {
+        char *source, *block, *serialized, *names;
+        size_t source_n, block_n, serialized_n, names_n;
+        bool own;
+    } style_memo[JS_STYLE_MEMO];
     struct js_script *scripts, *last_script, *blocker;
     uint64_t dynamic_scan_revision;
     bool dynamic_scan_valid;
@@ -1894,30 +1903,26 @@ static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValue
 }
 
 /* A CSSOM declaration block, which an element's style attribute or a rule's
-   declarations (js_cssom.h) stand for as text. Its declarations are the ones
-   the text parses to (css.c's css_decl_serialize keeps the valid ones in their
-   block, check), so every read is of the block's serialization; a change
-   writes the whole block's serialization ("update style attribute", CSSOM
-   6.7). */
-/* the text as CSS reads it (no comments), serialized as a block */
-static bool style_serialize(const char *css, size_t n, css_decl_check *check, sbuf *out, sbuf *names) {
-    size_t clean_n;
-    char *clean = css_preprocess(css, n, &clean_n);
-    bool ok = clean && css_decl_serialize(clean, clean_n, check, out, names);
-    free(clean);
-    return ok;
-}
-/* get or set a property of a serialized block; a set writes the block's new
-   serialization into out, *write when it differs */
+   declarations (js_cssom.h) stand for. Its declarations are held as a block's
+   text (css.c's css_decl_block: its longhands with the values they were given,
+   and a shorthand kept whole where no longhand can hold its value);
+   getPropertyValue() reads the block (a shorthand from its longhands), cssText
+   and the names its serialization, and a change writes the block's
+   serialization into the attribute ("update style attribute", CSSOM 6.7). */
+/* get or set a property of a block's text; a set writes the block's new text
+   into out, *write when it differs */
 static JSValue style_text_access(JSContext *ctx, const char *block, size_t n, const char *property, bool set,
                                  JSValueConst value, JSValueConst priority, bool priority_only,
                                  css_decl_check *check, sbuf *out, bool *write) {
     *write = false;
     if (!set) {
-        const char *v; size_t vn; bool important;
-        bool found = css_decl_find(block, n, property, &v, &vn, &important);
-        return priority_only ? JS_NewString(ctx, found && important ? "important" : "") :
-            JS_NewStringLen(ctx, found ? v : "", found ? vn : 0);
+        sbuf v = {0};
+        bool important;
+        if (!css_decl_get(block, n, property, check, &v, &important)) { sb_free(&v); return JS_ThrowOutOfMemory(ctx); }
+        JSValue result = priority_only ? JS_NewString(ctx, important ? "important" : "") :
+            JS_NewStringLen(ctx, v.p ? v.p : "", v.n);
+        sb_free(&v);
+        return result;
     }
     const char *v = JS_ToCString(ctx, value), *prio = JS_IsUndefined(priority) ? NULL : JS_ToCString(ctx, priority);
     if (!v || (!JS_IsUndefined(priority) && !prio)) {
@@ -1930,74 +1935,104 @@ static JSValue style_text_access(JSContext *ctx, const char *block, size_t n, co
     *write = status > 0 && (out->n != n || (n && memcmp(out->p, block, n)));
     return JS_UNDEFINED;
 }
-/* a serialized block's cssText and its declarations' names: [cssText, name...] */
-static JSValue style_text_block(JSContext *ctx, const char *block, size_t n) {
-    sbuf names = {0};
-    css_decl_names(block, n, &names);
+/* a block's cssText and its declarations' names (each NUL-terminated):
+   [cssText, name...] */
+static JSValue style_text_block(JSContext *ctx, const char *text, size_t n, const char *names, size_t names_n) {
     JSValue list = JS_NewArray(ctx);
     uint32_t i = 0;
-    bool ok = !JS_IsException(list) && JS_SetPropertyUint32(ctx, list, i++, JS_NewStringLen(ctx, block, n)) >= 0;
-    for (size_t at = 0; ok && at < names.n; at += strlen(names.p + at) + 1)
-        ok = JS_SetPropertyUint32(ctx, list, i++, JS_NewString(ctx, names.p + at)) >= 0;
-    sb_free(&names);
+    bool ok = !JS_IsException(list) && JS_SetPropertyUint32(ctx, list, i++, JS_NewStringLen(ctx, text, n)) >= 0;
+    for (size_t at = 0; ok && at < names_n; at += strlen(names + at) + 1)
+        ok = JS_SetPropertyUint32(ctx, list, i++, JS_NewString(ctx, names + at)) >= 0;
     if (!ok) { JS_FreeValue(ctx, list); return JS_EXCEPTION; }
     return list;
 }
-/* An element's style attribute as a serialized block. The serialization is a
-   function of the text alone, so the last text each slot saw and its block
-   stand for any element whose attribute is that text: reading a style or
-   setting one property does not parse every declaration again. */
+/* An element's inline style as a block: the one CSSOM wrote (css.c's
+   css_inline_block), or the one its attribute parses to, a function of the text
+   alone. The last block each slot saw, its serialization and names stand for
+   any element whose block that is: reading a style or setting one property
+   does not parse every declaration again. */
 static struct js_style_memo *style_memo_slot(struct web_js_state *s, const node_t *n) {
     uint32_t h = (uint32_t)((uintptr_t)n >> 4) * 2654435761u;
     return &s->style_memo[h >> 26 & (JS_STYLE_MEMO - 1)];
 }
-static void style_memo_store(struct web_js_state *s, const node_t *n, const char *source, size_t source_n,
-                             const char *block, size_t block_n) {
-    struct js_style_memo *m = style_memo_slot(s, n);
-    char *a = malloc(source_n + 1), *b = malloc(block_n + 1);
-    free(m->source); free(m->block);
+static void style_memo_clear(struct js_style_memo *m) {
+    free(m->source); free(m->block); free(m->serialized); free(m->names);
     *m = (struct js_style_memo){0};
-    if (!a || !b) { free(a); free(b); return; }
-    memcpy(a, source, source_n); a[source_n] = 0;
-    memcpy(b, block, block_n); b[block_n] = 0;
-    *m = (struct js_style_memo){a, b, source_n, block_n};
 }
-static bool style_memo_block(struct web_js_state *s, node_t *n, sbuf *block) {
-    /* A style attribute CSP blocked gives no declarations. */
-    const char *css = n->csp_style_attribute == 2 ? NULL : node_attr(n, "style"); if (!css) css = "";
-    size_t length = strlen(css);
+static char *style_copy(const char *p, size_t n) {
+    char *copy = malloc(n + 1);
+    if (copy) { if (n) memcpy(copy, p, n); copy[n] = 0; }
+    return copy;
+}
+static struct js_style_memo *style_memo_get(struct web_js_state *s, node_t *n) {
     struct js_style_memo *m = style_memo_slot(s, n);
-    if (m->source && m->source_n == length && !memcmp(m->source, css, length)) {
-        sb_put(block, m->block, m->block_n);
-        return true;
+    const char *own = css_inline_block(n), *css = NULL;
+    size_t length;
+    if (own) {
+        length = strlen(own);
+        if (m->own && m->block_n == length && !memcmp(m->block, own, length)) return m;
+    } else {
+        /* a style attribute CSP blocked gives no declarations */
+        css = n->csp_style_attribute == 2 ? NULL : node_attr(n, "style");
+        if (!css) css = "";
+        length = strlen(css);
+        if (m->source && !m->own && m->source_n == length && !memcmp(m->source, css, length)) return m;
     }
-    if (!style_serialize(css, length, NULL, block, NULL)) return false;
-    style_memo_store(s, n, css, length, block->p ? block->p : "", block->n);
-    return true;
+    sbuf block = {0}, text = {0}, names = {0};
+    bool ok = true;
+    if (own) sb_put(&block, own, length);
+    else {
+        size_t clean_n;
+        char *clean = css_preprocess(css, length, &clean_n);
+        ok = clean && css_decl_block(clean, clean_n, NULL, &block);
+        free(clean);
+    }
+    ok = ok && css_decl_block_serialize(block.p ? block.p : "", block.n, NULL, &text, &names);
+    struct js_style_memo next = {style_copy(own ? "" : css, own ? 0 : length), style_copy(block.p, block.n),
+                                 style_copy(text.p, text.n), style_copy(names.p, names.n),
+                                 own ? 0 : length, block.n, text.n, names.n, own != NULL};
+    sb_free(&block); sb_free(&text); sb_free(&names);
+    style_memo_clear(m);
+    if (!ok || !next.source || !next.block || !next.serialized || !next.names) { style_memo_clear(&next); return NULL; }
+    *m = next;
+    return m;
 }
-/* the attribute becomes a block's serialization; the block is what the
-   attribute now stands for (CSSOM's mutate flag: the attribute is not parsed
-   again) */
-static bool style_attribute_set(struct web_js_state *s, node_t *n, const sbuf *block) {
+/* the attribute becomes the declarations' serialization (CSSOM's mutate flag:
+   the attribute is not parsed again); reads and the cascade see the
+   declarations css_inline_set or css_inline_replace kept as given */
+static bool style_attribute_set(struct web_js_state *s, node_t *n, const sbuf *attribute) {
     /* CSSOM's updating flag: the attribute change steps neither parse the
        value again nor run CSP's check on it; the block applies. */
     uint8_t state = n->csp_style_attribute;
     n->csp_style_attribute = 3;
-    bool set = doc_attr_set_ns(n->owner ? n->owner : s->doc, n, NULL, NULL, "style", sb_cstr((sbuf *)block));
+    bool set = doc_attr_set_ns(n->owner ? n->owner : s->doc, n, NULL, NULL, "style", sb_cstr((sbuf *)attribute));
     n->csp_style_attribute = set ? 1 : state;
-    if (!set) return false;
-    style_memo_store(s, n, block->p ? block->p : "", block->n, block->p ? block->p : "", block->n);
-    return true;
+    return set;
 }
 static JSValue style_access(struct web_js_state *s, node_t *n, const char *property,
                             bool set, JSValueConst value, JSValueConst priority, bool priority_only) {
     JSContext *ctx = s->ctx;
+    struct js_style_memo *m = style_memo_get(s, n);
+    if (!m) return oom(ctx);
+    /* the block stays the caller's while the value converts (which can run script) */
     sbuf block = {0}, b = {0};
-    if (!style_memo_block(s, n, &block)) { sb_free(&block); return oom(ctx); }
-    bool write;
-    JSValue result = style_text_access(ctx, block.p ? block.p : "", block.n, property, set, value, priority, priority_only,
-                                       NULL, &b, &write);
-    if (write && !style_attribute_set(s, n, &b)) result = oom(ctx);
+    sb_put(&block, m->block, m->block_n);
+    JSValue result;
+    if (!set) {
+        bool write;
+        result = style_text_access(ctx, block.p ? block.p : "", block.n, property, false, value, priority, priority_only,
+                                   NULL, &b, &write);
+    } else {
+        /* the declarations change as given and the attribute becomes their serialization (css.c's
+           css_inline_set): the cascade does not parse a rounded value again */
+        const char *v = JS_ToCString(ctx, value), *prio = JS_IsUndefined(priority) ? NULL : JS_ToCString(ctx, priority);
+        int status = !v || (!JS_IsUndefined(priority) && !prio) ? -3 :
+            css_inline_set(n->owner, n, block.p ? block.p : "", block.n, property, v, prio, &b);
+        JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio);
+        result = status == -3 ? JS_EXCEPTION : status == -2 ? JS_ThrowOutOfMemory(ctx) :
+                 status == -1 ? JS_ThrowTypeError(ctx, "Invalid CSS property name") : JS_UNDEFINED;
+        if (status > 0 && !style_attribute_set(s, n, &b)) result = oom(ctx);
+    }
     sb_free(&b); sb_free(&block);
     return result;
 }
@@ -2005,16 +2040,15 @@ static JSValue style_access(struct web_js_state *s, node_t *n, const char *prope
    setter (the attribute becomes the serialization of what text parses to) */
 static JSValue style_block_access(struct web_js_state *s, node_t *n, int argc, JSValueConst *argv) {
     JSContext *ctx = s->ctx;
-    sbuf b = {0};
     if (argc <= 2) {
-        JSValue result = style_memo_block(s, n, &b) ? style_text_block(ctx, b.p ? b.p : "", b.n) : oom(ctx);
-        sb_free(&b);
-        return result;
+        struct js_style_memo *m = style_memo_get(s, n);
+        return m ? style_text_block(ctx, m->serialized, m->serialized_n, m->names, m->names_n) : oom(ctx);
     }
     size_t length;
     const char *text = JS_ToCStringLen(ctx, &length, argv[2]);
     if (!text) return JS_EXCEPTION;
-    bool ok = style_serialize(text, length, NULL, &b, NULL);
+    sbuf b = {0};
+    bool ok = css_inline_replace(n->owner, n, text, length, &b);
     JS_FreeCString(ctx, text);
     JSValue result = !ok ? JS_ThrowOutOfMemory(ctx) : style_attribute_set(s, n, &b) ? JS_UNDEFINED : oom(ctx);
     sb_free(&b);
@@ -2368,7 +2402,10 @@ static style_t *computed_pseudo_style(node_t *n,int pseudo,style_t *fallback) {
     if(pseudo==PE_BEFORE || pseudo==PE_AFTER)fallback->content=&css_content_none;
     return fallback;
 }
-static JSValue computed(struct web_js_state *s, node_t *n, const char *property,int pseudo) {
+/* An element's value of property: the resolved value getComputedStyle() reads (CSSOM), or with
+   cascade the computed value (CSS Cascade 5 §4.4) CSS Typed OM's computedStyleMap() reifies; the
+   two differ where the resolved value is the used one (width, margins) or a matrix (transform). */
+static JSValue computed(struct web_js_state *s, node_t *n, const char *property,int pseudo,bool cascade) {
     JSContext *ctx = s->ctx;
     if (!n || n->type != N_ELEM) return JS_ThrowTypeError(ctx, "Computed style requires an element");
     struct web_js_state *owner = n->owner ? geometry_owner(s, n->owner) : NULL;
@@ -2386,6 +2423,15 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     if(property[0]=='-'&&property[1]=='-') {
         const struct custom_prop *p=css_custom_property(st,property);
         return JS_NewString(ctx,p&&p->value?p->value:"");
+    }
+    if (cascade) {
+        /* the longhands the property table stores whole serialize their computed value */
+        sbuf text={0};
+        int kind=css_computed_longhand(st,property,&text,d);
+        if(kind<0){sb_free(&text);return oom(ctx);}
+        JSValue result=kind==1?JS_NewStringLen(ctx,text.p?text.p:"",text.n):JS_UNDEFINED;
+        sb_free(&text);
+        if(kind==1)return result;
     }
     static const char *const radius_names[]={"border-top-left-radius","border-top-right-radius","border-bottom-right-radius","border-bottom-left-radius"};
     int radius_corner=-2;if(!strcmp(property,"border-radius"))radius_corner=-1;
@@ -3302,7 +3348,8 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     doc_dom_budget(d);
     bool mutation = opcode == DOM_shadowAttach || opcode == DOM_slotAssign || opcode == DOM_insert || opcode == DOM_move || opcode == DOM_replace || opcode == DOM_replaceAll || opcode == DOM_remove || opcode == DOM_adopt || opcode == DOM_clone || opcode == DOM_import || opcode == DOM_set ||
                     opcode == DOM_attrSetNode || opcode == DOM_attrRemoveNode ||
-                    ((opcode == DOM_attr || opcode == DOM_style) && argc > 3) || (opcode == DOM_attrNS && argc > 4);
+                    ((opcode == DOM_attr || opcode == DOM_style) && argc > 3) || (opcode == DOM_styleBlock && argc > 2) ||
+                    (opcode == DOM_attrNS && argc > 4);
     bool synchronous_hooks=mutation&&(s->ce_hooks_active||s->ce_scoped_active||s->range_hooks_active)&&dom_synchronous_hooks(s,opcode,n,argc,argv);
     JSValue operation=synchronous_hooks ? JS_NewString(ctx,dom_opcode_names[opcode]) : JS_UNDEFINED;
     if(JS_IsException(operation))return operation;
@@ -4138,7 +4185,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     case DOM_computed: {
         const char *pseudo=argc>3&&!JS_IsNull(argv[3])&&!JS_IsUndefined(argv[3])?JS_ToCString(ctx,argv[3]):NULL;
         if(argc>3&&!JS_IsNull(argv[3])&&!JS_IsUndefined(argv[3])&&!pseudo)result=JS_EXCEPTION;
-        else result=computed(s,n,p,computed_pseudo(pseudo));
+        else result=computed(s,n,p,computed_pseudo(pseudo),argc>4&&JS_ToBool(ctx,argv[4])>0);
         JS_FreeCString(ctx,pseudo);
     } break;
     case DOM_geometry: {result = geometry(s, n, p);
@@ -6534,6 +6581,18 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     p->no_referrer = argc > 11 && JS_ToBool(ctx, argv[11]) > 0;
     p->referrer_policy=referrer_policy;
     if(referrer){p->referrer=js_strndup(ctx,referrer,referrer_length);if(!p->referrer){pending_error(p,"Out of memory preparing referrer policy");result=oom(ctx);goto out;}}
+    /* argv[16]: a Window's synchronous XMLHttpRequest's request, taken by fetchWait: no
+       promise and no stream. */
+    p->synchronous = argc > 16 && JS_ToBool(ctx, argv[16]) > 0;
+    if (p->synchronous && !s->host.wait_request) { pending_error(p, "This host cannot pause for a synchronous request"); result = JS_ThrowTypeError(ctx, "This realm cannot pause for a synchronous fetch"); goto out; }
+    if (p->synchronous) {
+        result = JS_NewObject(ctx);
+        if (JS_IsException(result) || JS_DefinePropertyValueStr(ctx, result, "id", JS_NewInt64(ctx, (int64_t)p->id), JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, result); result = JS_EXCEPTION; pending_error(p, "Out of memory preparing fetch result"); goto out;
+        }
+        send_request(s, p, WEB_RESOURCE_FETCH, method, headers, body, n);
+        goto out;
+    }
     p->streaming = argc > 12 && JS_IsFunction(ctx, argv[12]) && s->host.resume_request;
     if (p->streaming) p->stream_callback = JS_DupValue(ctx, argv[12]);
     JSValue funcs[2]; JSValue promise = JS_NewPromiseCapability(ctx, funcs);
@@ -8251,6 +8310,46 @@ static void worker_fetch_frame(struct web_js_state *s, struct js_pending *p) {
     if (resume) { if (s->host.resume_request) s->host.resume_request(s->host.opaque, p->id); }
     else p->worker_paused = true;
 }
+/* A finished P_FETCH request's settlement: the Response this realm's Fetch makes of its response
+   (*settled true), or the error its fetch rejects with. */
+static JSValue fetch_settlement(struct web_js_state *s, struct js_pending *p, bool *settled) {
+    JSValue value;
+    bool success = !p->response.error[0];
+    int transport=njw_transport_flags(web_response_headers(&p->response));
+    bool opaque=transport>=0&&(transport & NJW_LOADED_OPAQUE)!=0,manual=transport>=0&&(transport & NJW_LOADED_OPAQUE_REDIRECT)!=0;
+    if(success&&((opaque&&!p->no_cors)||(manual&&!p->redirect_manual)||(p->no_cors&&transport<0))){
+        pending_error(p,"Native Fetch response is missing or contradicts its filtering policy");success=false;
+    }
+    if (success) {
+        /* Transfer the already runtime-charged native snapshot. The
+           current QuickJS adopts external data only on success;
+           construction failure leaves pending_free as its owner. */
+        const bool hidden=opaque||manual;
+        JSValue bytes = hidden?JS_NULL:JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body,
+            p->response.body_len, fetch_body_free, NULL, false);
+        if (!hidden&&!JS_IsException(bytes)) p->response.body = NULL;
+        /* Response decodes bytes only when its consumer asks for text.
+           The old fourth argument was unused and eagerly expanded
+           every binary media fragment into a large JS string. */
+        bool redirected=transport>=0?(transport & NJW_LOADED_REDIRECTED)!=0:
+            web_response_url(&p->response)[0]&&strcmp(p->url,web_response_url(&p->response));
+        JSValue type=opaque?JS_NewString(s->ctx,"opaque"):manual?JS_NewString(s->ctx,"opaqueredirect"):transport<0?JS_UNDEFINED:
+            JS_NewString(s->ctx,(transport & NJW_LOADED_CORS)?"cors":"basic");
+        /* An opaque-redirect filtered response: the redirect's URL, nothing else. */
+        JSValue args[] = {JS_NewInt32(s->ctx,hidden?0:p->response.status),
+            JS_NewString(s->ctx,opaque?"":web_response_url(&p->response)[0]?web_response_url(&p->response):p->url),
+            JS_NewString(s->ctx,hidden?"":web_response_headers(&p->response)),JS_UNDEFINED,bytes,
+            JS_NewBool(s->ctx,!hidden&&redirected),JS_UNDEFINED,type,
+            opaque?JS_NewInt32(s->ctx,fetch_resource_bits(transport)):JS_UNDEFINED};
+        bool valid_args = true;
+        for (int i = 0; i < 9; ++i) if (JS_IsException(args[i])) valid_args = false;
+        value = valid_args ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 9, args) : JS_EXCEPTION;
+        for (int i = 0; i < 9; ++i) JS_FreeValue(s->ctx, args[i]);
+        if (JS_IsException(value)) { exception(s); success = false; value = JS_NewString(s->ctx, "Could not construct fetch response"); }
+    } else { JSValue args[] = {JS_NewString(s->ctx, p->response.error), JS_NewBool(s->ctx, p->aborted)}; value = JS_Call(s->ctx, s->reject, JS_UNDEFINED, 2, args); JS_FreeValue(s->ctx, args[0]); JS_FreeValue(s->ctx, args[1]); }
+    *settled = success;
+    return value;
+}
 static bool process_pending(struct web_js_state *s) {
     struct js_pending **link = &s->pending;
     uint64_t now = uptime_ms();
@@ -8260,6 +8359,12 @@ static bool process_pending(struct web_js_state *s) {
         if(document_resource_kind(p->kind) && p->stream_generation!=s->stream_generation){
             imports_waiting|=p->kind==P_MODULE; /* its module failed with the old stream */
             *link=p->next;pending_free(s,p);continue;
+        }
+        /* fetchWait takes a synchronous request in the task that made it; one still here was
+           left by that task (its initiator threw). */
+        if (p->synchronous) {
+            if (!p->done && s->host.cancel) s->host.cancel(s->host.opaque, p->id);
+            *link = p->next; pending_free(s, p); continue;
         }
         if (!p->done && now >= p->deadline) { if (s->host.cancel) s->host.cancel(s->host.opaque, p->id); pending_error(p, "Resource request exceeded its deadline"); }
         if (!p->done) { link = &p->next; continue; }
@@ -8366,40 +8471,8 @@ static bool process_pending(struct web_js_state *s) {
         } else if (!s->disabled && p->kind == P_FETCH) {
             ran_task = true;
             begin_task(s);
-            JSValue value;
-            bool success = !p->response.error[0];
-            int transport=njw_transport_flags(web_response_headers(&p->response));
-            bool opaque=transport>=0&&(transport & NJW_LOADED_OPAQUE)!=0,manual=transport>=0&&(transport & NJW_LOADED_OPAQUE_REDIRECT)!=0;
-            if(success&&((opaque&&!p->no_cors)||(manual&&!p->redirect_manual)||(p->no_cors&&transport<0))){
-                pending_error(p,"Native Fetch response is missing or contradicts its filtering policy");success=false;
-            }
-            if (success) {
-                /* Transfer the already runtime-charged native snapshot. The
-                   current QuickJS adopts external data only on success;
-                   construction failure leaves pending_free as its owner. */
-                const bool hidden=opaque||manual;
-                JSValue bytes = hidden?JS_NULL:JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body,
-                    p->response.body_len, fetch_body_free, NULL, false);
-                if (!hidden&&!JS_IsException(bytes)) p->response.body = NULL;
-                /* Response decodes bytes only when its consumer asks for text.
-                   The old fourth argument was unused and eagerly expanded
-                   every binary media fragment into a large JS string. */
-                bool redirected=transport>=0?(transport & NJW_LOADED_REDIRECTED)!=0:
-                    web_response_url(&p->response)[0]&&strcmp(p->url,web_response_url(&p->response));
-                JSValue type=opaque?JS_NewString(s->ctx,"opaque"):manual?JS_NewString(s->ctx,"opaqueredirect"):transport<0?JS_UNDEFINED:
-                    JS_NewString(s->ctx,(transport & NJW_LOADED_CORS)?"cors":"basic");
-                /* An opaque-redirect filtered response: the redirect's URL, nothing else. */
-                JSValue args[] = {JS_NewInt32(s->ctx,hidden?0:p->response.status),
-                    JS_NewString(s->ctx,opaque?"":web_response_url(&p->response)[0]?web_response_url(&p->response):p->url),
-                    JS_NewString(s->ctx,hidden?"":web_response_headers(&p->response)),JS_UNDEFINED,bytes,
-                    JS_NewBool(s->ctx,!hidden&&redirected),JS_UNDEFINED,type,
-                    opaque?JS_NewInt32(s->ctx,fetch_resource_bits(transport)):JS_UNDEFINED};
-                bool valid_args = true;
-                for (int i = 0; i < 9; ++i) if (JS_IsException(args[i])) valid_args = false;
-                value = valid_args ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 9, args) : JS_EXCEPTION;
-                for (int i = 0; i < 9; ++i) JS_FreeValue(s->ctx, args[i]);
-                if (JS_IsException(value)) { exception(s); success = false; value = JS_NewString(s->ctx, "Could not construct fetch response"); }
-            } else { JSValue args[] = {JS_NewString(s->ctx, p->response.error), JS_NewBool(s->ctx, p->aborted)}; value = JS_Call(s->ctx, s->reject, JS_UNDEFINED, 2, args); JS_FreeValue(s->ctx, args[0]); JS_FreeValue(s->ctx, args[1]); }
+            bool success;
+            JSValue value = fetch_settlement(s, p, &success);
             JSValue r = JS_Call(s->ctx, success ? p->resolve : p->reject, JS_UNDEFINED, 1, &value);
             JS_FreeValue(s->ctx, value); if (JS_IsException(r)) exception(s); else JS_FreeValue(s->ctx, r);
             end_task(s);
@@ -8408,6 +8481,46 @@ static bool process_pending(struct web_js_state *s) {
     }
     if(imports_waiting&&module_imports_advance(s))ran_task=true;
     return ran_task;
+}
+
+/* host.fetchWait(id): a Window's synchronous XMLHttpRequest (XHR send() with the synchronous
+   flag). This realm's event loop pauses, no task or microtask running, while the host serves only
+   the network and the window (host.wait_request) until the request host.fetch(..., true) started
+   is done. The Response is returned and the error it ends with thrown; a pause that the user, the
+   window or a navigation ended is a network error. */
+static JSValue native_fetch_wait(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    int64_t id; if (!argc || JS_ToInt64(ctx, &id, argv[0])) return JS_EXCEPTION;
+    struct web_js_state *s = state(ctx);
+    struct js_pending *p = s->pending;
+    while (p && !(p->id == (uint64_t)id && p->kind == P_FETCH && p->synchronous)) p = p->next;
+    if (!p) return JS_ThrowTypeError(ctx, "No synchronous request has this id");
+    if (!p->done) {
+        uint64_t before = uptime_ms();
+        bool completed = s->host.wait_request && s->host.wait_request(s->host.opaque, p->id, &p->done);
+        /* The network wait is not JavaScript execution, as a synchronously loaded module's. */
+        uint64_t waited = uptime_ms() - before;
+        for (struct web_js_state *active = s; active; active = active->runtime_previous)
+            if (active->running) { active->task_deadline += waited; active->task_native_wait_ms += waited; }
+        if (s->compiling) s->compile_wait_ms += waited;
+        if (!completed || !p->done) {
+            if (!p->done && s->host.cancel) s->host.cancel(s->host.opaque, p->id);
+            p->aborted = true; pending_error(p, "The synchronous request was interrupted");
+        }
+    }
+    /* The host delivered other requests while it waited; take this one out of the list as it is now. */
+    for (struct js_pending **link = &s->pending; *link; link = &(*link)->next)
+        if (*link == p) { *link = p->next; break; }
+    bool ok = !p->response.error[0] && p->response.status >= 200 && p->response.status < 300;
+    if (!ok && (p->response.error[0] || p->response.status >= 400))
+        diagnostic_resource(s,p,p->aborted?"aborted":p->response.error[0]?p->response.error:"unsuccessful HTTP response");
+    if (!p->aborted && !s->disabled) resource_timing(s, p);
+    if (s->host.net_log) net_log_response(s,p,"done",p->response.body_len);
+    if (s->disabled) { pending_free(s, p); return JS_ThrowTypeError(ctx, "Scripting was disabled during the synchronous request"); }
+    bool success;
+    JSValue value = fetch_settlement(s, p, &success);
+    pending_free(s, p);
+    return success ? value : JS_Throw(ctx, value);
 }
 
 static bool pending_kind(struct web_js_state *s, int kind) {
@@ -9766,7 +9879,7 @@ char *web_js_inspect_computed(web_doc *d,node_t *n){
     for(int i=0,count=css_prop_count();i<count;i++){
         bool longhand=false;const char *name=css_prop_name(i,&longhand);
         if(!name||!longhand)continue;
-        JSValue value=computed(s,n,name,PE_NONE);
+        JSValue value=computed(s,n,name,PE_NONE,false);
         if(JS_IsException(value)){JS_FreeValue(s->ctx,JS_GetException(s->ctx));continue;}
         const char *text=JS_ToCString(s->ctx,value);JS_FreeValue(s->ctx,value);
         if(!text){JS_FreeValue(s->ctx,JS_GetException(s->ctx));continue;}
@@ -10073,6 +10186,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("socketBuffered", 1, native_socket_buffered), JS_CFUNC_DEF("socketRelease", 1, native_socket_release),
 JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_cancel),
         JS_CFUNC_DEF("resumeFetch", 1, native_resume_fetch), JS_CFUNC_DEF("keepaliveRoom", 0, native_keepalive_room),
+        JS_CFUNC_DEF("fetchWait", 1, native_fetch_wait),
         JS_CFUNC_DEF("promiseThen", 3, native_promise_then),
         JS_CFUNC_DEF("promiseIsHandled", 1, native_promise_is_handled)
     };
@@ -10084,6 +10198,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     JS_SetPropertyStr(s->ctx,api,"domOperations",operations);
     JS_SetPropertyStr(s->ctx,api,"noCorsFetch",JS_TRUE);
     JS_SetPropertyStr(s->ctx,api,"streamingFetch",JS_NewBool(s->ctx,s->host.resume_request != NULL));
+    JS_SetPropertyStr(s->ctx,api,"syncFetch",JS_NewBool(s->ctx,s->host.wait_request != NULL)); /* fetchWait */
     JS_SetPropertyStr(s->ctx,api,"automation",JS_NewBool(s->ctx,s->host.automation != NULL)); /* navigator.webdriver */
     /* Watch before the realm first reads the languages, so no change falls between
        (web_wait_queue watches the preferences once for the process). */
@@ -10093,6 +10208,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     web_js_webidl_init(s->ctx,api);
     web_js_crypto_init(s->ctx, api);
     web_js_compression_init(s->ctx, api);
+    web_js_typed_om_init(s->ctx, api);
     web_js_encoding_init(s->ctx, api);
     web_js_url_init(s->ctx, api);
     web_atomics_host_init(s->ctx, api);
@@ -10224,7 +10340,10 @@ void web_js_free(web_doc *d) {
             JS_FreeValue(s->ctx,p->promise);JS_FreeValue(s->ctx,p->reason);js_free(s->ctx,p);}
         s->last_handled_rejection=NULL;
         node_cache_free(s);
-        for (int i = 0; i < JS_STYLE_MEMO; i++) { free(s->style_memo[i].source); free(s->style_memo[i].block); }
+        for (int i = 0; i < JS_STYLE_MEMO; i++) {
+            free(s->style_memo[i].source); free(s->style_memo[i].block);
+            free(s->style_memo[i].serialized); free(s->style_memo[i].names);
+        }
         js_free(s->ctx,s->window_name);s->window_name=NULL;
         JS_FreeValue(s->ctx, s->hooks); JS_FreeValue(s->ctx, s->dispatch); JS_FreeValue(s->ctx, s->response); JS_FreeValue(s->ctx, s->reject);
         JS_FreeValue(s->ctx, s->event_port); JS_FreeValue(s->ctx, s->event_states);

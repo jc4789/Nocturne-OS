@@ -14,14 +14,14 @@
  * their Python (query values percent-decoded to bytes, as wptserve's request.GET). It delivers
  * frames as js.c (Window: host.fetch's notify) and js_worker.c (Worker: NJW_FRAME through
  * workerFetchTransport.frame) do, from the event loop, one per resume. The Worker's requestWait
- * (browserjsworker.c's pause for a synchronous request) answers at once from the same server,
- * null when the response would take longer than the timeout. Text decoding is node's TextDecoder
+ * (browserjsworker.c's pause for a synchronous request) and the Window's host.fetchWait (js.c's
+ * native_fetch_wait over the host's wait_request) answer at once from the same server, the
+ * Worker's null when the response would take longer than the timeout. Text decoding is node's TextDecoder
  * behind the native decoder's contract (decode's BOM sniffing, an unknown label as UTF-8, the
  * replacement decoder), labels from WPT's encoding/resources/encodings.js. No CORS, cookies,
  * redirects or CSP: those are webnet.c's and js.c's, not here. This is not the guest browser and
  * not wptrunner. It shows what the two realms pass, fails when a subtest the Window passes does not
- * pass in the Worker (one owner; the Window's synchronous requests are NotSupportedError, a Window
- * cannot pause, so those differ the other way and are listed), and, with --base=REV, fails when
+ * pass in the Worker (one owner; what differs the other way is listed), and, with --base=REV, fails when
  * either realm no longer passes a subtest REV's did (REV's sources through the same doubles).
  * Run: node tests/xhr_wpt_contract.cjs [--base=REV] [--wpt=DIR] [--verbose] [--only=FILE] */
 'use strict';
@@ -305,14 +305,19 @@ const realms = {
 };
 /* js.c's side for a Window: host.fetch(url, method, headers, body, ..., notify, ...) -> {id,
    promise}; notify(1, Response) / (2, ArrayBuffer) / (4, uploaded) / (3, error or undefined), the
-   next frame after notify answers true or host.resumeFetch(id). */
+   next frame after notify answers true or host.resumeFetch(id). A synchronous request
+   (host.fetch's seventeenth argument) is only {id}; host.fetchWait(id), the host's pause, answers
+   it from the server at once with a Response, or throws. */
 function windowTransport(c) {
     const t = {requests: [], controls: new Map(), bridge: null};
     let next = 0;
     t.host = {
-        fetch(url, method, headers, body, sameOrigin, credentials, forcePreflight, redirectError, cache, keepalive, noCors, noReferrer, notify) {
+        syncFetch: true,
+        fetch(url, method, headers, body, sameOrigin, credentials, forcePreflight, redirectError, cache, keepalive, noCors, noReferrer, notify,
+              referrer, referrerPolicy, destination, synchronous) {
             const id = ++next, control = credits();t.controls.set(id, control);
             const req = {method, url, headers: headerMap(headers), body: body ? Buffer.from(body) : null};t.requests.push(req);
+            if (synchronous) { t.controls.set(id, {sync: req}); return {id}; }
             let resolve, reject;const promise = new Promise((a, b) => { resolve = a; reject = b; });
             /* js.c calls notify from its event loop, never inside host.fetch. */
             const frame = (event, value, then) => { setTimeout(() => { if (control.cancelled) return; if (notify(event, value)) control.give(); if (then) then(); }, 0); return control.take(); };
@@ -334,8 +339,15 @@ function windowTransport(c) {
             }, control);
             return {id, promise};
         },
-        resumeFetch(id) { const control = t.controls.get(id); if (control) control.give(); },
+        resumeFetch(id) { const control = t.controls.get(id); if (control && control.give) control.give(); },
         cancel(id) { const control = t.controls.get(id); if (control) control.cancelled = true; },
+        fetchWait(id) {
+            const control = t.controls.get(id);t.controls.delete(id);
+            if (!control || !control.sync) throw new TypeError('No synchronous request has this id');
+            const res = serve(control.sync);
+            if (res.error) throw new TypeError(res.error);
+            return t.bridge.response(res.status, control.sync.url, rawHeaders(res), undefined, c.__arrayBuffer(bodyOf(res)), false, res.statusText, 'basic');
+        },
     };
     return t;
 }

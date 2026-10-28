@@ -128,14 +128,16 @@ static char *decl(const char *text) {
     return sb_cstr(&b);
 }
 /* setProperty on the block a style attribute's text parses to: the attribute's
-   new text ("update style attribute"); the text itself when nothing changes */
+   new text ("update style attribute", the block's serialization); the text's
+   serialization when nothing changes */
 static char *set_decl(const char *text, const char *property, const char *value, const char *priority) {
-    char *block = decl(text);
-    sbuf b = {0};
-    int status = css_decl_set(block, strlen(block), property, value, priority, NULL, &b);
-    if (status <= 0) { sb_free(&b); return status < 0 ? NULL : block; }
-    free(block);
-    return sb_cstr(&b);
+    sbuf block = {0}, b = {0}, out = {0};
+    css_decl_block(text, strlen(text), NULL, &block);
+    int status = css_decl_set(block.p ? block.p : "", block.n, property, value, priority, NULL, &b);
+    const sbuf *result = status > 0 ? &b : &block;
+    if (status >= 0) css_decl_block_serialize(result->p ? result->p : "", result->n, NULL, &out, NULL);
+    sb_free(&block); sb_free(&b);
+    return status < 0 ? NULL : sb_cstr(&out);
 }
 #define NEW_INTERFACE 1
 #else
@@ -457,7 +459,8 @@ static void declarations_and_replace(void) {
     check("setProperty: others re-serialized", set_decl("color:red", "font-weight", "bold", NULL),
           "color: red; font-weight: bold;");
     check("setProperty: important", set_decl("top:1px", "LEFT", "2px", "important"), "top: 1px; left: 2px !important;");
-    check("setProperty: replaces the declaration", set_decl("top:1px;left:2px", "top", "3px", ""), "left: 2px; top: 3px;");
+    /* CSSOM "set a CSS declaration": the declaration changes where it stands (its example steps) */
+    check("setProperty: replaces the declaration in place", set_decl("top:1px;left:2px", "top", "3px", ""), "top: 3px; left: 2px;");
     check("setProperty: comments and space in the value", set_decl("", "opacity", " /*x*/.5 ", NULL), "opacity: 0.5;");
     check("setProperty: an invalid value changes nothing", set_decl("top:1px", "top", "red", NULL), "top: 1px;");
     check("setProperty: an invalid priority changes nothing", set_decl("top:1px", "top", "2px", "wrong"), "top: 1px;");

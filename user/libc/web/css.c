@@ -322,6 +322,18 @@ struct sheet {
     arena_t *arena;
     uint64_t serial;
     struct css_index *index;
+    /* A CSSOM parse whose top-level text put rules into the lists above that
+       no top-level CSSOM rule's span holds (@document, an @font-face with a
+       prelude): only a parse of its whole text can change it. */
+    bool cssom_hidden;
+};
+/* What one top-level rule of a CSSOM parse put into its sheet's lists: the
+   first and last of each, adjacent there (NULL: none). */
+struct css_rule_span {
+    struct rule *rules, *rules_last;
+    struct font_face *fonts, *fonts_last;
+    struct opacity_keyframes *motions, *motions_last;
+    struct css_layer_event *layers, *layers_last;
 };
 
 struct pctx {
@@ -2879,85 +2891,182 @@ bool css_decl_find(const char *css, size_t n, const char *property, const char *
     *value = found; *value_n = found ? (size_t)(found_end - found) : 0; *important = found_important;
     return found != NULL;
 }
-/* the declarations of a serialized block, each trimmed and without its ';' */
-static bool decl_next(const char **at, const char *end, const char **begin, const char **finish, const char **colon) {
-    while (*at < end) {
-        const char *p = *at, *e = decl_separator(p, end, ';');
-        *at = e < end ? e + 1 : end;
-        while (p < e && is_space((unsigned char)*p)) p++;
-        while (e > p && is_space((unsigned char)e[-1])) e--;
-        if (p == e) continue;
-        *begin = p; *finish = e; *colon = decl_separator(p, e, ':');
-        return true;
-    }
-    return false;
+/* ---- a CSS declaration block's declarations (CSSOM 6.6): longhands and custom
+   properties, one per name, in order. A shorthand sets its longhands (cssprop.c's
+   css_shorthand_expand); one whose value the block keeps whole (a var() reference,
+   pending substitution in CSS Variables 1 §3, or a value with no longhand text) is a
+   group its longhands stand in, read as the empty string. Each value is the one it
+   was given (comment-free, trimmed: a longhand's the text its shorthand gave it), what
+   the cascade parses; CSSOM reads it serialized (css_decl_value, a descriptor block's
+   check), which may round (an origin colour's channels, CSS Color 4 §15.2). A block's
+   text (css_decl_block) writes each declaration, a group once where its first
+   longhand stands, so parsing it again gives the same declarations; its
+   serialization (css_decl_serialize) puts longhands back into shorthands (CSSOM
+   "serialize a CSS declaration block"). */
+struct decl_entry { char *name; sbuf value; bool important, live; uint32_t group; /* group index + 1, or 0 */ };
+struct decl_group { char *name; sbuf text; bool important, emitted; };
+struct decl_list {
+    struct decl_entry *v;
+    size_t count, capacity;
+    size_t *slots, mask;   /* a name's live entry: its index + 1; DECL_GONE where one was */
+    struct decl_group *groups;
+    size_t groups_n, groups_capacity;
+    bool failed;           /* no memory */
+};
+#define DECL_GONE SIZE_MAX
+static void decl_list_free(struct decl_list *l) {
+    for (size_t i = 0; i < l->count; i++) { free(l->v[i].name); sb_free(&l->v[i].value); }
+    for (size_t i = 0; i < l->groups_n; i++) { free(l->groups[i].name); sb_free(&l->groups[i].text); }
+    free(l->v); free(l->slots); free(l->groups);
+    memset(l, 0, sizeof *l);
 }
-int css_decl_set(const char *css, size_t n, const char *property, const char *value, const char *priority,
-                 css_decl_check *check, sbuf *out) {
-    if (strchr(property, ':') || strchr(property, ';') || strchr(property, '{') || strchr(property, '}')) return -1;
-    const char *value_end = value + strlen(value);
-    if (*value && ((priority && *priority && strcasecmp(priority, "important")) ||
-                   decl_separator(value, value_end, '!') != value_end ||
-                   decl_separator(value, value_end, ';') != value_end)) return 0;
-    char *name = strdup(property);
-    if (!name) return -2;
-    if (strncmp(name, "--", 2)) for (char *c = name; *c; c++) *c = (char)lower((unsigned char)*c);
-    /* CSSOM setProperty parses the value for the property before changing the
-       block: the value as CSS reads it (no comments), trimmed. Keep
-       syntactically valid but not-yet-rendered values separate from @supports
-       capability reporting; both use the real property grammar and var rules. */
-    sbuf serialized = {0};
-    if (*value) {
-        size_t vn;
-        char *clean = css_preprocess(value, (size_t)(value_end - value), &vn);
-        if (!clean) { free(name); return -2; }
-        const char *v = clean;
-        while (vn && is_space((unsigned char)*v)) v++, vn--;
-        while (vn && is_space((unsigned char)v[vn - 1])) vn--;
-        bool valid = vn && (check ? check(name, v, vn, &serialized) : css_valid_declaration(name, strlen(name), v, vn));
-        if (valid && !check) css_decl_value(name, v, vn, &serialized);
-        free(clean);
-        if (!valid) { sb_free(&serialized); free(name); return 0; }
-    }
-    /* css is a serialized block: the others keep their text and order, and the
-       property's declaration (if any) is replaced by one at the end */
-    bool first = true;
-    const char *at = css, *begin, *finish, *colon;
-    while (decl_next(&at, css + n, &begin, &finish, &colon)) {
-        if (colon < finish && decl_property_equal(begin, colon, name)) continue;
-        if (!first) sb_putc(out, ' ');
-        first = false;
-        sb_put(out, begin, (size_t)(finish - begin)); sb_putc(out, ';');
-    }
-    if (*value) {
-        if (!first) sb_putc(out, ' ');
-        sb_puts(out, name); sb_puts(out, ": ");
-        sb_put(out, serialized.p ? serialized.p : "", serialized.n);
-        if (priority && *priority) sb_puts(out, " !important");
-        sb_putc(out, ';');
-    }
-    sb_free(&serialized); free(name);
-    return 1;
-}
-void css_decl_names(const char *css, size_t n, sbuf *names) {
-    const char *at = css, *begin, *finish, *colon;
-    while (decl_next(&at, css + n, &begin, &finish, &colon)) {
-        while (colon > begin && is_space((unsigned char)colon[-1])) colon--;
-        sb_put(names, begin, (size_t)(colon - begin)); sb_putc(names, 0);
+/* name's slot: its live entry's (*entry its index), else the first free one on its probe */
+static size_t decl_slot(const struct decl_list *l, const char *name, size_t *entry) {
+    size_t at = hash_str(name) & l->mask, free_at = SIZE_MAX;
+    *entry = SIZE_MAX;
+    for (;;) {
+        size_t s = l->slots[at];
+        if (!s) return free_at != SIZE_MAX ? free_at : at;
+        if (s == DECL_GONE) { if (free_at == SIZE_MAX) free_at = at; }
+        else if (!strcmp(l->v[s - 1].name, name)) { *entry = s - 1; return at; }
+        at = (at + 1) & l->mask;
     }
 }
-/* CSSOM "serialize a CSS declaration block" of the declarations the block
-   parses to: the valid ones, a later one replacing an earlier one of the same
-   property unless only the earlier is !important. names, when given, gets
-   their property names, each NUL-terminated. false: no memory. The live
-   declaration of each name is found through a table of their indexes, so a
-   long block is not walked again for every declaration. */
-bool css_decl_serialize(const char *css, size_t n, css_decl_check *check, sbuf *out, sbuf *names) {
-    struct entry { char *name; sbuf value; bool important, live; } *list = NULL;
-    size_t count = 0, capacity = 0, *slots = NULL, mask = 0; /* slots: index + 1 of a name's live entry */
-    bool failed = false;
+static size_t decl_find(const struct decl_list *l, const char *name) {
+    size_t entry = SIZE_MAX;
+    if (l->slots) decl_slot(l, name, &entry);
+    return entry;
+}
+static void decl_remove(struct decl_list *l, size_t i) {
+    size_t entry, at = decl_slot(l, l->v[i].name, &entry);
+    if (entry == i) l->slots[at] = DECL_GONE;
+    l->v[i].live = false;
+}
+/* append a declaration in place of the live one of its name; name and value move in */
+static bool decl_append(struct decl_list *l, char *name, sbuf *value, bool important, uint32_t group) {
+    if (l->failed) { free(name); sb_free(value); return false; }
+    if (l->count == l->capacity) {
+        /* the slots are at most half used (each entry has had at most one), so a probe ends */
+        size_t grown = l->capacity ? l->capacity * 2 : 16;
+        struct decl_entry *more = grown <= SIZE_MAX / sizeof *more ? realloc(l->v, grown * sizeof *more) : NULL;
+        size_t *table = grown <= SIZE_MAX / (2 * sizeof *table) ? calloc(grown * 2, sizeof *table) : NULL;
+        if (more) l->v = more;
+        if (!more || !table) { free(table); free(name); sb_free(value); l->failed = true; return false; }
+        l->capacity = grown;
+        free(l->slots); l->slots = table; l->mask = grown * 2 - 1;
+        for (size_t i = 0; i < l->count; i++) if (l->v[i].live) {
+            size_t at = hash_str(l->v[i].name) & l->mask;
+            while (l->slots[at]) at = (at + 1) & l->mask;
+            l->slots[at] = i + 1;
+        }
+    }
+    size_t entry, at = decl_slot(l, name, &entry);
+    if (entry != SIZE_MAX) l->v[entry].live = false;
+    l->slots[at] = l->count + 1;
+    l->v[l->count++] = (struct decl_entry){name, *value, important, true, group};
+    *value = (sbuf){0};
+    return true;
+}
+/* a declaration as parsed: the block keeps the later of two of one name, unless
+   only the earlier is !important */
+static bool decl_parsed(struct decl_list *l, char *name, sbuf *value, bool important, uint32_t group) {
+    size_t i = decl_find(l, name);
+    if (i != SIZE_MAX && l->v[i].important && !important) { free(name); sb_free(value); return true; }
+    return decl_append(l, name, value, important, group);
+}
+/* CSSOM "set a CSS declaration" (its example steps): the declaration of the name
+   changes in place, unless a later one in its logical property group maps the
+   other way (CSS Logical 1), which it must then follow */
+static bool decl_set_one(struct decl_list *l, char *name, sbuf *value, bool important) {
+    size_t i = decl_find(l, name);
+    if (i != SIZE_MAX && !l->v[i].group) {
+        char group[32], other[32];
+        bool logical, other_logical, after = false;
+        if (css_prop_logical_group(name, group, sizeof group, &logical))
+            for (size_t k = i + 1; k < l->count && !after; k++)
+                after = l->v[k].live && css_prop_logical_group(l->v[k].name, other, sizeof other, &other_logical) &&
+                        !strcmp(group, other) && other_logical != logical;
+        if (!after) {
+            sb_free(&l->v[i].value);
+            l->v[i].value = *value; *value = (sbuf){0};
+            l->v[i].important = important;
+            free(name);
+            return true;
+        }
+    }
+    return decl_append(l, name, value, important, 0);
+}
+/* a shorthand kept whole: the group, and its longhands standing in it */
+static bool decl_whole(struct decl_list *l, const struct propdef *p, const char *name, sbuf *text, bool important,
+                       bool parsed) {
+    if (l->groups_n == l->groups_capacity) {
+        size_t grown = l->groups_capacity ? l->groups_capacity * 2 : 4;
+        struct decl_group *more = grown <= SIZE_MAX / sizeof *more ? realloc(l->groups, grown * sizeof *more) : NULL;
+        if (!more) { sb_free(text); l->failed = true; return false; }
+        l->groups = more; l->groups_capacity = grown;
+    }
+    char *own = strdup(name);
+    if (!own) { sb_free(text); l->failed = true; return false; }
+    l->groups[l->groups_n++] = (struct decl_group){own, *text, important, false};
+    *text = (sbuf){0};
+    uint32_t group = (uint32_t)l->groups_n;
+    const char *const *names;
+    int count = css_shorthand_longhands(p, &names);
+    for (int i = 0; i < count; i++) {
+        char *longhand = strdup(names[i]);
+        sbuf none = {0};
+        if (!longhand) { l->failed = true; return false; }
+        if (!(parsed ? decl_parsed(l, longhand, &none, important, group) : decl_append(l, longhand, &none, important, group)))
+            return false;
+    }
+    return true;
+}
+struct decl_expansion { struct decl_list *l; bool important, parsed; };
+static void decl_longhand(void *opaque, const char *name, const char *value, size_t n) {
+    struct decl_expansion *x = opaque;
+    if (x->l->failed) return;
+    char *longhand = strdup(name);
+    sbuf text = {0};
+    if (!longhand) { x->l->failed = true; return; }
+    sb_put(&text, value, n);
+    if (x->parsed) decl_parsed(x->l, longhand, &text, x->important, 0);
+    else decl_set_one(x->l, longhand, &text, x->important);
+}
+/* the shorthand a (lowercased) name is, or NULL */
+static const struct propdef *decl_shorthand_of(const char *name) {
+    const struct propdef *p = strncmp(name, "--", 2) ? css_prop_lookup(name, strlen(name)) : NULL;
+    bool longhand = true;
+    return p && css_prop_name(css_prop_index(p), &longhand) && !longhand ? p : NULL;
+}
+static bool value_has_var(const char *v, size_t n) {
+    arena_t a = {0};
+    jmp_buf trap;
+    a.trap = &trap;
+    bool has = false;
+    if (!setjmp(trap) && !supports_vars(&a, v, v + n, &has)) has = false;
+    ar_free(&a);
+    return has;
+}
+/* a shorthand's declaration (valid): its longhands, or the group of a value kept whole */
+static bool decl_shorthand(struct decl_list *l, const struct propdef *p, const char *name, const char *v, size_t n,
+                           bool important, bool parsed) {
+    if (!value_has_var(v, n)) {
+        struct decl_expansion x = {l, important, parsed};
+        int result = css_shorthand_expand(p, v, n, decl_longhand, &x);
+        if (result == 1) return !l->failed;
+        if (result == 0) return true;
+        if (result == -2) { l->failed = true; return false; }
+    }
+    sbuf text = {0};
+    sb_put(&text, v, n);
+    return decl_whole(l, p, name, &text, important, parsed);
+}
+/* the declarations css parses to, their values as given. check: a descriptor
+   block's own (its names are not shorthands), NULL for properties. A block's
+   text (trusted) has only valid declarations. */
+static void decl_list_parse(struct decl_list *l, const char *css, size_t n, css_decl_check *check, bool trusted) {
     const char *end = css + n;
-    for (const char *p = css; p < end;) {
+    for (const char *p = css; p < end && !l->failed;) {
         const char *e = decl_separator(p, end, ';'), *colon = decl_separator(p, e, ':');
         const char *ns = p, *ne = colon, *v = colon + 1, *ve = e;
         p = e < end ? e + 1 : end;
@@ -2969,52 +3078,304 @@ bool css_decl_serialize(const char *css, size_t n, css_decl_check *check, sbuf *
         bool important = decl_priority(v, &ve);
         if (ns == ne || v == ve) continue;
         char *name = strndup(ns, (size_t)(ne - ns));
-        if (!name) { failed = true; break; }
-        if (strncmp(name, "--", 2)) for (char *c = name; *c; c++) *c = (char)lower((unsigned char)*c);
+        if (!name) { l->failed = true; break; }
+        bool custom = !strncmp(name, "--", 2);
+        if (!custom) for (char *c = name; *c; c++) *c = (char)lower((unsigned char)*c);
+        size_t vn = (size_t)(ve - v);
+        const struct propdef *shorthand = check || custom ? NULL : decl_shorthand_of(name);
+        if (shorthand) {
+            if (trusted || css_valid_declaration(name, strlen(name), v, vn)) decl_shorthand(l, shorthand, name, v, vn, important, true);
+            free(name);
+            continue;
+        }
+        if (!trusted && !(check ? check(name, v, vn, NULL) : css_valid_declaration(name, strlen(name), v, vn))) {
+            free(name);
+            continue;
+        }
         sbuf value = {0};
-        bool valid = check ? check(name, v, (size_t)(ve - v), &value) : css_valid_declaration(name, strlen(name), v, (size_t)(ve - v));
-        if (valid && !check) css_decl_value(name, v, (size_t)(ve - v), &value);
-        if (!valid) { free(name); sb_free(&value); continue; }
-        if (count == capacity) {
-            size_t grown = capacity ? capacity * 2 : 16;
-            struct entry *more = grown <= SIZE_MAX / sizeof *more ? realloc(list, grown * sizeof *more) : NULL;
-            size_t *table = grown <= SIZE_MAX / (2 * sizeof *table) ? calloc(grown * 2, sizeof *table) : NULL;
-            if (more) list = more;
-            if (!more || !table) { free(table); free(name); sb_free(&value); failed = true; break; }
-            capacity = grown;
-            free(slots); slots = table; mask = grown * 2 - 1;
-            for (size_t i = 0; i < count; i++) if (list[i].live) {
-                size_t at = hash_str(list[i].name) & mask;
-                while (slots[at]) at = (at + 1) & mask;
-                slots[at] = i + 1;
+        sb_put(&value, v, vn);
+        decl_parsed(l, name, &value, important, 0);
+    }
+}
+static void decl_put(sbuf *out, size_t start, const char *name, const sbuf *value, bool important) {
+    if (out->n > start) sb_putc(out, ' ');
+    sb_puts(out, name); sb_puts(out, ": ");
+    sb_put(out, value->p ? value->p : "", value->n);
+    if (important) sb_puts(out, " !important");
+    sb_putc(out, ';');
+}
+static void decl_list_names(const struct decl_list *l, sbuf *names) {
+    for (size_t i = 0; i < l->count; i++)
+        if (l->v[i].live) sb_put(names, l->v[i].name, strlen(l->v[i].name) + 1);
+}
+/* a group, once: at its first longhand that stands; its text, or serialized */
+static void decl_put_group(const struct decl_list *l, uint32_t group, bool serialize, sbuf *out, size_t start) {
+    struct decl_group *g = &l->groups[group - 1];
+    if (g->emitted) return;
+    g->emitted = true;
+    if (!serialize) { decl_put(out, start, g->name, &g->text, g->important); return; }
+    sbuf text = {0};
+    css_decl_value(g->name, g->text.p ? g->text.p : "", g->text.n, &text);
+    decl_put(out, start, g->name, &text, g->important);
+    sb_free(&text);
+}
+static void decl_list_block(const struct decl_list *l, sbuf *out) {
+    size_t start = out->n;
+    for (size_t g = 0; g < l->groups_n; g++) l->groups[g].emitted = false;
+    for (size_t i = 0; i < l->count; i++) {
+        const struct decl_entry *e = &l->v[i];
+        if (!e->live) continue;
+        if (e->group) decl_put_group(l, e->group, false, out, start);
+        else decl_put(out, start, e->name, &e->value, e->important);
+    }
+}
+/* a declaration's value as CSSOM serializes it: a property's specified value, a
+   descriptor's as its block's check writes it */
+static void decl_value_serialize(const char *name, const sbuf *value, css_decl_check *check, sbuf *out) {
+    const char *v = value->p ? value->p : "";
+    if (check) check(name, v, value->n, out);
+    else css_decl_value(name, v, value->n, out);
+}
+/* CSSOM "serialize a CSS declaration block", step 4.3: a declaration between a
+   shorthand's longhands, not one of them, in the logical property group of one of
+   them but mapped the other way keeps them apart */
+static bool decl_intermixed(const struct decl_list *l, const size_t *used, int count, size_t first, size_t last) {
+    if (last <= first + 1) return false;
+    struct { char group[32]; bool logical; } seen[8];
+    int kinds = 0;
+    for (int k = 0; k < count && kinds < 8; k++) {
+        char group[32];
+        bool logical, known = false;
+        if (!css_prop_logical_group(l->v[used[k]].name, group, sizeof group, &logical)) continue;
+        for (int s = 0; s < kinds; s++) known |= !strcmp(seen[s].group, group) && seen[s].logical == logical;
+        if (!known) { memcpy(seen[kinds].group, group, sizeof group); seen[kinds++].logical = logical; }
+    }
+    for (size_t j = first + 1; kinds && j < last; j++) {
+        char group[32];
+        bool logical;
+        if (!l->v[j].live || !css_prop_logical_group(l->v[j].name, group, sizeof group, &logical)) continue;
+        for (int s = 0; s < kinds; s++) if (!strcmp(seen[s].group, group) && seen[s].logical != logical) return true;
+    }
+    return false;
+}
+/* CSSOM "serialize a CSS declaration block": each declaration, or the first
+   shorthand (in preferred order) all of whose longhands are still to write, of one
+   importance, and whose value can be written; a group as its shorthand. A
+   shorthand that cannot be written once cannot later (its reasons stay), so each
+   is tried once. A descriptor block (check) has no shorthands. */
+static bool decl_list_serialize(const struct decl_list *l, css_decl_check *check, sbuf *out) {
+    size_t start = out->n, room = 0;
+    sbuf *serialized = calloc(l->count ? l->count : 1, sizeof *serialized);
+    uint8_t *done = calloc(l->count ? l->count : 1, 1), *tried = calloc((size_t)css_prop_count(), 1);
+    const char **values = NULL;
+    size_t *lengths = NULL, *used = NULL;
+    bool failed = !serialized || !done || !tried;
+    for (size_t i = 0; !failed && i < l->count; i++)
+        if (l->v[i].live && !l->v[i].group) decl_value_serialize(l->v[i].name, &l->v[i].value, check, &serialized[i]);
+    for (size_t g = 0; g < l->groups_n; g++) l->groups[g].emitted = false;
+    for (size_t i = 0; !failed && i < l->count; i++) {
+        const struct decl_entry *e = &l->v[i];
+        if (!e->live || done[i]) continue;
+        done[i] = 1;
+        if (e->group) { decl_put_group(l, e->group, true, out, start); continue; }
+        const struct propdef *const *candidates;
+        int candidate_n = !check && strncmp(e->name, "--", 2) ? css_shorthands_of(e->name, &candidates) : 0;
+        bool written = false;
+        for (int c = 0; c < candidate_n && !written && !failed; c++) {
+            const struct propdef *shorthand = candidates[c];
+            int index = css_prop_index(shorthand);
+            if (tried[index]) continue;
+            tried[index] = 1;
+            const char *const *names;
+            int count = css_shorthand_longhands(shorthand, &names);
+            if (count < 1) continue;
+            if ((size_t)count > room) {
+                const char **v = realloc(values, (size_t)count * sizeof *v);
+                if (v) values = v;
+                size_t *n = v ? realloc(lengths, (size_t)count * sizeof *n) : NULL;
+                if (n) lengths = n;
+                size_t *u = n ? realloc(used, (size_t)count * sizeof *u) : NULL;
+                if (u) used = u;
+                if (!u) { failed = true; break; }
+                room = (size_t)count;
             }
-        }
-        size_t at = hash_str(name) & mask;
-        while (slots[at] && strcmp(list[slots[at] - 1].name, name)) at = (at + 1) & mask;
-        if (slots[at]) {
-            struct entry *earlier = &list[slots[at] - 1];
-            if (earlier->important && !important) { free(name); sb_free(&value); continue; }
-            earlier->live = false;
-        }
-        slots[at] = count + 1;
-        list[count++] = (struct entry){name, value, important, true};
-    }
-    free(slots);
-    bool first = true;
-    for (size_t i = 0; i < count; i++) {
-        if (list[i].live && !failed) {
-            if (!first) sb_putc(out, ' ');
-            first = false;
-            sb_puts(out, list[i].name); sb_puts(out, ": ");
-            sb_put(out, list[i].value.p ? list[i].value.p : "", list[i].value.n);
-            if (list[i].important) sb_puts(out, " !important");
+            bool ok = true, important = e->important;
+            size_t first = i, last = i;
+            for (int k = 0; ok && k < count; k++) {
+                size_t j = decl_find(l, names[k]);
+                ok = j != SIZE_MAX && (j == i || !done[j]) && !l->v[j].group && l->v[j].important == important;
+                if (!ok) break;
+                used[k] = j;
+                values[k] = serialized[j].p ? serialized[j].p : "";
+                lengths[k] = serialized[j].n;
+                if (j < first) first = j;
+                if (j > last) last = j;
+            }
+            if (!ok || decl_intermixed(l, used, count, first, last)) continue;
+            size_t at = out->n;
+            if (out->n > start) sb_putc(out, ' ');
+            sb_puts(out, css_prop_name(index, NULL)); sb_puts(out, ": ");
+            size_t value_at = out->n;
+            if (!css_shorthand_serialize(shorthand, values, lengths, out) || out->n == value_at) { out->n = at; continue; }
+            if (important) sb_puts(out, " !important");
             sb_putc(out, ';');
-            if (names) sb_put(names, list[i].name, strlen(list[i].name) + 1);
+            for (int k = 0; k < count; k++) done[used[k]] = 1;
+            written = true;
         }
-        free(list[i].name); sb_free(&list[i].value);
+        if (!written && !failed) decl_put(out, start, e->name, &serialized[i], e->important);
     }
-    free(list);
+    for (size_t i = 0; serialized && i < l->count; i++) sb_free(&serialized[i]);
+    free(serialized); free(done); free(tried); free(values); free(lengths); free(used);
     return !failed;
+}
+static char *decl_name(const char *property) {
+    char *name = strdup(property);
+    if (name && strncmp(name, "--", 2)) for (char *c = name; *c; c++) *c = (char)lower((unsigned char)*c);
+    return name;
+}
+bool css_decl_block(const char *css, size_t n, css_decl_check *check, sbuf *block) {
+    struct decl_list l = {0};
+    decl_list_parse(&l, css, n, check, false);
+    if (!l.failed) decl_list_block(&l, block);
+    bool ok = !l.failed;
+    decl_list_free(&l);
+    return ok;
+}
+bool css_decl_serialize(const char *css, size_t n, css_decl_check *check, sbuf *out, sbuf *names) {
+    struct decl_list l = {0};
+    decl_list_parse(&l, css, n, check, false);
+    bool ok = !l.failed && decl_list_serialize(&l, check, out);
+    if (ok && names) decl_list_names(&l, names);
+    decl_list_free(&l);
+    return ok;
+}
+bool css_decl_block_serialize(const char *block, size_t n, css_decl_check *check, sbuf *out, sbuf *names) {
+    struct decl_list l = {0};
+    decl_list_parse(&l, block, n, check, true);
+    bool ok = !l.failed && decl_list_serialize(&l, check, out);
+    if (ok && names) decl_list_names(&l, names);
+    decl_list_free(&l);
+    return ok;
+}
+/* CSSOM getPropertyValue() and getPropertyPriority(): a shorthand's value is its
+   longhands' (all of them, of one importance) as the shorthand serializes them, or
+   the text of the group they all stand in; a longhand in a group reads as "" */
+bool css_decl_get(const char *block, size_t n, const char *property, css_decl_check *check, sbuf *value, bool *important) {
+    *important = false;
+    char *name = decl_name(property);
+    if (!name) return false;
+    struct decl_list l = {0};
+    decl_list_parse(&l, block, n, check, true);
+    const struct propdef *shorthand = check ? NULL : decl_shorthand_of(name);
+    bool ok = !l.failed;
+    if (ok && shorthand) {
+        const char *const *names;
+        int count = css_shorthand_longhands(shorthand, &names);
+        const char **values = count > 0 ? malloc((size_t)count * sizeof *values) : NULL;
+        size_t *lengths = count > 0 ? malloc((size_t)count * sizeof *lengths) : NULL;
+        sbuf *serialized = count > 0 ? calloc((size_t)count, sizeof *serialized) : NULL;
+        ok = values && lengths && serialized;
+        bool all = ok, every_important = true, first_important = false, mixed = false, grouped = false;
+        uint32_t group = 0;
+        for (int k = 0; all && k < count; k++) {
+            size_t j = decl_find(&l, names[k]);
+            if (j == SIZE_MAX) { all = false; break; }
+            const struct decl_entry *e = &l.v[j];
+            if (!k) first_important = e->important;
+            every_important &= e->important;
+            mixed |= e->important != first_important;
+            if (e->group) grouped = true;
+            if (!k) group = e->group; else if (e->group != group) group = 0;
+            if (!e->group) decl_value_serialize(names[k], &e->value, NULL, &serialized[k]);
+            values[k] = serialized[k].p ? serialized[k].p : "";
+            lengths[k] = serialized[k].n;
+        }
+        /* longhands of two importances: no value, and not important */
+        if (all && !mixed) {
+            *important = every_important;
+            if (grouped) {
+                const struct decl_group *g = group ? &l.groups[group - 1] : NULL;
+                if (g && !strcmp(g->name, name)) css_decl_value(g->name, g->text.p ? g->text.p : "", g->text.n, value);
+            } else css_shorthand_serialize(shorthand, values, lengths, value);
+        }
+        for (int k = 0; serialized && k < count; k++) sb_free(&serialized[k]);
+        free(serialized); free(values); free(lengths);
+    } else if (ok) {
+        size_t j = decl_find(&l, name);
+        if (j != SIZE_MAX) {
+            const struct decl_entry *e = &l.v[j];
+            *important = e->important;
+            if (!e->group) decl_value_serialize(e->name, &e->value, check, value);
+        }
+    }
+    decl_list_free(&l);
+    free(name);
+    return ok;
+}
+/* CSSOM setProperty() (and removeProperty(), an empty value) on a block's text:
+   out gets the block's new text, the value as given. 1, 0 for a value that is not
+   one of the property (or a priority that is not "important"), -1 a name that
+   cannot be a property's, -2 no memory. */
+int css_decl_set(const char *css, size_t n, const char *property, const char *value, const char *priority,
+                 css_decl_check *check, sbuf *out) {
+    if (strchr(property, ':') || strchr(property, ';') || strchr(property, '{') || strchr(property, '}')) return -1;
+    const char *value_end = value + strlen(value);
+    if (*value && ((priority && *priority && strcasecmp(priority, "important")) ||
+                   decl_separator(value, value_end, '!') != value_end ||
+                   decl_separator(value, value_end, ';') != value_end)) return 0;
+    char *name = decl_name(property);
+    if (!name) return -2;
+    const struct propdef *shorthand = check ? NULL : decl_shorthand_of(name);
+    bool important = priority && *priority;
+    /* CSSOM setProperty parses the value for the property before changing the
+       block: the value as CSS reads it (no comments), trimmed. Keep
+       syntactically valid but not-yet-rendered values separate from @supports
+       capability reporting; both use the real property grammar and var rules. */
+    sbuf exact = {0};
+    char *clean = NULL;
+    const char *v = value;
+    size_t vn = 0;
+    if (*value) {
+        clean = css_preprocess(value, (size_t)(value_end - value), &vn);
+        if (!clean) { free(name); return -2; }
+        v = clean;
+        while (vn && is_space((unsigned char)*v)) v++, vn--;
+        while (vn && is_space((unsigned char)v[vn - 1])) vn--;
+        if (!vn || !(check ? check(name, v, vn, NULL) : css_valid_declaration(name, strlen(name), v, vn))) {
+            free(clean); free(name); return 0;
+        }
+        sb_put(&exact, v, vn);
+    }
+    struct decl_list l = {0};
+    decl_list_parse(&l, css, n, check, true);
+    if (!*value) {
+        /* removeProperty(): the declaration, or each of a shorthand's longhands */
+        const char *const *names;
+        int count = shorthand ? css_shorthand_longhands(shorthand, &names) : 0;
+        for (int k = 0; k < count; k++) { size_t j = decl_find(&l, names[k]); if (j != SIZE_MAX) decl_remove(&l, j); }
+        size_t j = shorthand ? SIZE_MAX : decl_find(&l, name);
+        if (j != SIZE_MAX) decl_remove(&l, j);
+    } else if (shorthand) decl_shorthand(&l, shorthand, name, v, vn, important, false);
+    else {
+        char *own = strdup(name);
+        if (own) decl_set_one(&l, own, &exact, important);
+        else l.failed = true;
+    }
+    if (!l.failed) decl_list_block(&l, out);
+    int status = l.failed ? -2 : 1;
+    decl_list_free(&l);
+    sb_free(&exact); free(clean); free(name);
+    return status;
+}
+void css_decl_drop_important(const char *css, size_t n, sbuf *out) {
+    const char *end = css + n;
+    for (const char *p = css; p < end;) {
+        const char *e = decl_separator(p, end, ';'), *colon = decl_separator(p, e, ':');
+        const char *v = colon < e ? colon + 1 : e, *ve = e;
+        while (ve > v && is_space((unsigned char)ve[-1])) ve--;
+        if (colon >= e || !decl_priority(v, &ve)) { sb_put(out, p, (size_t)(e - p)); if (e < end) sb_putc(out, ';'); }
+        p = e < end ? e + 1 : end;
+    }
 }
 /* whether [s, +n) can stand inside a block: its braces, parentheses and
    brackets balance (as block_end and scan_to count them) and no string is open */
@@ -4184,10 +4545,42 @@ static void cssom_page_rules(struct pctx *pc,const char *s,const char *e) {
     }
 }
 
+/* The lists' ends before a top-level rule of a CSSOM parse, and what the
+   rule added after them: its span. */
+struct span_mark {
+    struct rule *rules; struct font_face *fonts; struct opacity_keyframes *motions;
+    struct css_layer_event *layers; struct css_rule_info *cssom;
+};
+static void span_mark(const sheet_t *sh, struct span_mark *m) {
+    *m = (struct span_mark){sh->last, sh->fonts_last, sh->motions_last, sh->layers_last, sh->cssom_last};
+}
+static void span_close(struct pctx *pc, struct span_mark *m) {
+    sheet_t *sh = pc->sh;
+    struct css_rule_info *rule = sh->cssom_last == m->cssom ? NULL : m->cssom ? m->cssom->next : sh->cssom_first;
+    bool added = sh->last != m->rules || sh->fonts_last != m->fonts || sh->motions_last != m->motions ||
+                 sh->layers_last != m->layers;
+    if (rule && rule == sh->cssom_last) {
+        struct css_rule_span *span = ar_alloc(pc->a, sizeof *span);
+        if (sh->last != m->rules) { span->rules = m->rules ? m->rules->next : sh->first; span->rules_last = sh->last; }
+        if (sh->fonts_last != m->fonts) { span->fonts = m->fonts ? m->fonts->next : sh->fonts; span->fonts_last = sh->fonts_last; }
+        if (sh->motions_last != m->motions) {
+            span->motions = m->motions ? m->motions->next : sh->motions; span->motions_last = sh->motions_last;
+        }
+        if (sh->layers_last != m->layers) {
+            span->layers = m->layers ? m->layers->next : sh->layers_first; span->layers_last = sh->layers_last;
+        }
+        rule->span = span;
+    } else if (rule || added) sh->cssom_hidden = true;
+    span_mark(sh, m);
+}
 static void parse_rules(struct pctx *pc, const char *s, const char *e, const struct mcond *media) {
     pc->rule_depth++;
     bool top = pc->rule_depth == 1;
+    struct span_mark mark;
+    bool spans = top && pc->cssom_tree;
+    if (spans) span_mark(pc->sh, &mark);
     while (s < e) {
+        if (spans) span_close(pc, &mark);
         s = skip_ws(s, e);
         if (s >= e) break;
         if (*s == '@') {
@@ -4389,6 +4782,7 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
         if (native && top) pc->import_allowed = pc->namespace_allowed = false;
         s = be < e ? be + 1 : e;
     }
+    if (spans) span_close(pc, &mark);
     pc->rule_depth--;
 }
 
@@ -4465,16 +4859,23 @@ void css_sheet_import_context(sheet_t *sheet,sheet_t *parent,const struct css_ru
     parent->import_last=sheet;
 }
 
+/* an AST's identity across rescans: never reused, unlike its address */
+static uint64_t sheet_serials;
+/* context: the sheet the text's rules are parsed for (css_parse_cssom_rules) */
 static sheet_t *parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports,
-                            bool cssom_tree, const uint32_t *markers, uint32_t nmarkers) {
-    static uint64_t serials;
-    struct pctx pc = {.a = a, .base = base_url, .imports = imports, .import_allowed = true,
-                      .namespace_allowed = true, .cssom_tree = cssom_tree,
+                            bool cssom_tree, const uint32_t *markers, uint32_t nmarkers, sheet_t *context) {
+    struct pctx pc = {.a = a, .base = base_url, .imports = imports, .import_allowed = !context,
+                      .namespace_allowed = !context, .cssom_tree = cssom_tree,
                       .cssom_markers = markers, .cssom_nmarkers = nmarkers};
     pc.sh = ar_alloc(a, sizeof(sheet_t));
     pc.sh->order = order;
     pc.sh->ast = pc.sh; pc.sh->arena = a;
-    pc.sh->serial = __atomic_add_fetch(&serials, 1, __ATOMIC_RELAXED);
+    pc.sh->serial = __atomic_add_fetch(&sheet_serials, 1, __ATOMIC_RELAXED);
+    if (context) {
+        /* its prefixes, read only: no @namespace parses here */
+        pc.sh->ast = context; pc.sh->order = context->order;
+        pc.sh->namespaces = context->namespaces; pc.sh->layer_count = context->layer_count;
+    }
     size_t cn;
     char *c = strip_comments(a, css, n, &cn);
     pc.sh->cssom_source = pc.cssom_text = c; pc.sh->cssom_length = cn;
@@ -4482,7 +4883,7 @@ static sheet_t *parse_sheet(arena_t *a, const char *css, size_t n, const char *b
     return pc.sh;
 }
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
-    return parse_sheet(a, css, n, base_url, order, imports, false, NULL, 0);
+    return parse_sheet(a, css, n, base_url, order, imports, false, NULL, 0, NULL);
 }
 
 struct sheet_parse_job {
@@ -4496,6 +4897,7 @@ struct sheet_parse_job {
     bool cssom_tree;
     const uint32_t *markers;
     uint32_t nmarkers;
+    sheet_t *context;
 };
 static void sheet_parse_worker(size_t index, void *context) {
     (void)index;
@@ -4505,15 +4907,15 @@ static void sheet_parse_worker(size_t index, void *context) {
     job->arena->trap = &trap;
     job->failed = setjmp(trap);
     if (!job->failed) job->result = parse_sheet(job->arena, job->text, job->length, job->base, job->order, job->imports, job->cssom_tree,
-                                                    job->markers, job->nmarkers);
+                                                    job->markers, job->nmarkers, job->context);
     job->arena->trap = outer;
 }
 static void sheet_parse_service(void *context) { web_native_checkpoint(context); }
 static sheet_t *parse_serviced(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url, double order,
-                               pvec *imports, bool cssom_tree, const uint32_t *markers, uint32_t nmarkers) {
+                               pvec *imports, bool cssom_tree, const uint32_t *markers, uint32_t nmarkers, sheet_t *context) {
     if (!d || !d->live || n < 16384 || parallel_active())
-        return parse_sheet(a,css,n,base_url,order,imports,cssom_tree,markers,nmarkers);
-    struct sheet_parse_job job = {a,css,base_url,n,order,imports,NULL,0,cssom_tree,markers,nmarkers};
+        return parse_sheet(a,css,n,base_url,order,imports,cssom_tree,markers,nmarkers,context);
+    struct sheet_parse_job job = {a,css,base_url,n,order,imports,NULL,0,cssom_tree,markers,nmarkers,context};
     parallel_call_stage(PARALLEL_CSS_PARSE,sheet_parse_worker,&job,sheet_parse_service,d);
     if (job.failed) {
         if (a->trap) longjmp(*a->trap,job.failed);
@@ -4522,12 +4924,17 @@ static sheet_t *parse_serviced(web_doc *d, arena_t *a, const char *css, size_t n
     return job.result;
 }
 sheet_t *css_parse_sheet_serviced(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
-    return parse_serviced(d, a, css, n, base_url, order, imports, false, NULL, 0);
+    return parse_serviced(d, a, css, n, base_url, order, imports, false, NULL, 0, NULL);
 }
 sheet_t *css_parse_cssom_sheet(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url,
                                const uint32_t *markers, uint32_t nmarkers) {
-    return parse_serviced(d, a, css, n, base_url, 0, NULL, true, markers, nmarkers);
+    return parse_serviced(d, a, css, n, base_url, 0, NULL, true, markers, nmarkers, NULL);
 }
+sheet_t *css_parse_cssom_rules(web_doc *d, sheet_t *sheet, const char *css, size_t n, const char *base_url,
+                               const uint32_t *markers, uint32_t nmarkers) {
+    return parse_serviced(d, sheet->arena, css, n, base_url, 0, NULL, true, markers, nmarkers, sheet);
+}
+bool css_cssom_spliceable(const sheet_t *sheet) { return sheet && !sheet->cssom_hidden; }
 
 /* ---------------------------------------------------------------- media queries */
 /* CSS and matchMedia share this explicit-stack parser and device model. Unknown
@@ -4983,6 +5390,8 @@ struct css_index {
     bool containers, siblings;
     const struct mcond **media; /* the distinct @media of its rules */
     uint32_t nmedia, media_cap;
+    const struct mcond *last_media; /* the last rule's, at media[last_media_id - 1] */
+    uint32_t last_media_id;
     struct css_index *relational; /* :has() subjects (ient.has) by their compounds' keys */
     struct css_index *child_list_subjects; /* parent state can affect its outer siblings */
     struct css_index *child_list_parents; /* own state changed by a child-list mutation */
@@ -5512,6 +5921,33 @@ static uint32_t index_media(arena_t *a, struct css_index *x, const struct mcond 
     x->media[x->nmedia++] = m;
     return x->nmedia;
 }
+/* a rule after every rule the index holds */
+static void index_add(web_doc *d, arena_t *a, struct css_index *index, const struct rule *r) {
+    for(const struct mcond *m=r->media;m;m=m->up)if(m->container)index->containers=true;
+    for(int k=0;k<r->ndecls;k++)if(container_units_used(r->decls[k].value))index->containers=true;
+    if (r->ndecls) {
+        /* The rules of one @media block share its condition and are adjacent. */
+        if (r->media != index->last_media) {
+            index->last_media = r->media; index->last_media_id = r->media ? index_media(a, index, r->media) : 0;
+        }
+        for (int k = 0; k < r->sel->n; k++) {
+            index->form_features |= selector_form_features(r->sel->v[k]->right);
+            if(selector_siblings(r->sel->v[k]->right)) {
+                index->siblings=true;
+                for(const struct compound *part=r->sel->v[k]->right;part;part=part->left)
+                    index_child_list_subjects(a,index,part);
+            }
+            for(const struct compound *part=r->sel->v[k]->right;part;part=part->left) {
+                index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_PARENT);
+                index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_SIBLING);
+            }
+            index_rule(a, index, r, r->sel->v[k], index->rules, index->last_media_id);
+            index_features(a, index, r->sel->v[k]);
+            if (d && d->profile_enabled) d->profile.style_index_entries++;
+        }
+    }
+    index->rules++;
+}
 /* NULL when cancelled: a partial index is never published to the AST. */
 static struct css_index *index_sheet(web_doc *d, sheet_t *s) {
     arena_t *a = s->arena;
@@ -5525,32 +5961,59 @@ static struct css_index *index_sheet(web_doc *d, sheet_t *s) {
     ht_init(a, &index->feature_ids, 32);
     ht_init(a, &index->feature_classes, 128);
     ht_init(a, &index->feature_attrs, 32);
-    /* The rules of one @media block share its condition and are adjacent. */
-    const struct mcond *last = NULL; uint32_t media = 0;
-    for (struct rule *r = s->first; r; r = r->next, index->rules++) {
+    for (struct rule *r = s->first; r; r = r->next) {
         if (!web_native_checkpoint(d)) return NULL;
-        for(const struct mcond *m=r->media;m;m=m->up)if(m->container)index->containers=true;
-        for(int k=0;k<r->ndecls;k++)if(container_units_used(r->decls[k].value))index->containers=true;
-        if (!r->ndecls) continue;
-        if (r->media != last) { last = r->media; media = last ? index_media(a, index, last) : 0; }
-        for (int k = 0; k < r->sel->n; k++) {
-            index->form_features |= selector_form_features(r->sel->v[k]->right);
-            if(selector_siblings(r->sel->v[k]->right)) {
-                index->siblings=true;
-                for(const struct compound *part=r->sel->v[k]->right;part;part=part->left)
-                    index_child_list_subjects(a,index,part);
-            }
-            for(const struct compound *part=r->sel->v[k]->right;part;part=part->left) {
-                index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_PARENT);
-                index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_SIBLING);
-            }
-            index_rule(a, index, r, r->sel->v[k], index->rules, media);
-            index_features(a, index, r->sel->v[k]);
-            if (d->profile_enabled) d->profile.style_index_entries++;
-        }
+        index_add(d, a, index, r);
     }
     return index;
 }
+/* One list of an AST with a top-level rule's part replaced: after the last
+   element an earlier top-level rule put there (pred), before what followed
+   the old part (succ). */
+#define SPLICE_LIST(T, head, tail, first, last, moved)                                                    \
+    do {                                                                                                  \
+        T *gone = old && old->span ? old->span->first : NULL, *gone_last = gone ? old->span->last : NULL; \
+        T *in = put ? put->first : NULL, *in_last = in ? put->last : NULL;                                \
+        if (!gone && !in) break;                                                                          \
+        T *pred = NULL;                                                                                   \
+        if (at == count && !old) pred = sheet->tail;                                                      \
+        else for (uint32_t k = at; k-- > 0;)                                                              \
+            if (top[k]->span && top[k]->span->last) { pred = top[k]->span->last; break; }                 \
+        T *succ = gone ? gone_last->next : pred ? pred->next : sheet->head;                               \
+        if (pred) pred->next = in ? in : succ; else sheet->head = in ? in : succ;                         \
+        if (in) in_last->next = succ;                                                                     \
+        if (!succ) sheet->tail = in ? in_last : pred;                                                     \
+        moved = moved || gone || succ;                                                                    \
+    } while (0)
+bool css_cssom_splice(web_doc *d, sheet_t *sheet, struct css_rule_info *const *top, uint32_t count, uint32_t at,
+                      struct css_rule_info *old, sheet_t *fresh) {
+    struct css_rule_info *rule = fresh ? fresh->cssom_first : NULL;
+    const struct css_rule_span *put = rule ? rule->span : NULL;
+    /* moved: style rules other than after all others, which the index orders */
+    bool moved = false, others = false;
+    SPLICE_LIST(struct rule, first, last, rules, rules_last, moved);
+    SPLICE_LIST(struct font_face, fonts, fonts_last, fonts, fonts_last, others);
+    SPLICE_LIST(struct opacity_keyframes, motions, motions_last, motions, motions_last, others);
+    SPLICE_LIST(struct css_layer_event, layers_first, layers_last, layers, layers_last, others);
+    (void)others;
+    struct css_rule_info *prev = at ? top[at - 1] : NULL, *next = old ? old->next : at < count ? top[at] : NULL;
+    if (rule) rule->next = next;
+    if (prev) prev->next = rule ? rule : next; else sheet->cssom_first = rule ? rule : next;
+    if (!next) sheet->cssom_last = rule ? rule : prev;
+    sheet->cssom_count = sheet->cssom_count - (old != NULL) + (rule != NULL);
+    if (fresh && fresh->layer_count > sheet->layer_count) sheet->layer_count = fresh->layer_count;
+    sheet->serial = __atomic_add_fetch(&sheet_serials, 1, __ATOMIC_RELAXED);
+    struct css_index *index = sheet->index;
+    if (!index) return false;
+    /* Rules after all others take the next places of its order; any other
+       change to the rules leaves an index to build again. */
+    if (moved) { sheet->index = NULL; return true; }
+    for (const struct rule *r = put ? put->rules : NULL; r; r = r == put->rules_last ? NULL : r->next)
+        index_add(d, sheet->arena, index, r);
+    index->fonts = sheet->fonts; index->motions = sheet->motions;
+    return false;
+}
+#undef SPLICE_LIST
 /* The rule index of a sheet's AST, shared by every instance of that AST and
    kept across rescans for as long as the AST lives. */
 static struct css_index *sheet_index(web_doc *d, const sheet_t *s) {
@@ -6384,6 +6847,58 @@ static void pres_hints(node_t *e, struct hints *h) {
    cellpadding and border pad and border its cells. */
 static bool hint_reaches_descendants(const node_t *e, const char *name) {
     return !e->foreign && e->tag == T_table && (!strcmp(name, "cellpadding") || !strcmp(name, "border"));
+}
+
+/* ---------------------------------------------------------------- an element's inline declarations */
+const char *css_inline_block(const node_t *e) {
+    const char *attribute = node_attr(e, "style");
+    if (!e->style_cssom || !attribute || strcmp(e->style_cssom, attribute)) return NULL;
+    return e->style_cssom + strlen(e->style_cssom) + 1;
+}
+const char *css_inline_text(const node_t *e) {
+    /* a style attribute CSP blocked gives no declarations (dom.c's csp_style_attribute) */
+    if (e->csp_style_attribute == 2) return NULL;
+    const char *block = css_inline_block(e);
+    return block ? block : node_attr(e, "style");
+}
+/* the declarations (a block's text) stand for the attribute once it is set to
+   attribute, their serialization; an element whose attribute does not change (the
+   same serialization) restyles for the new values here */
+static bool inline_store(web_doc *d, node_t *e, const sbuf *attribute, const sbuf *block) {
+    char *text = malloc(attribute->n + block->n + 2);
+    if (!text) return false;
+    memcpy(text, attribute->p ? attribute->p : "", attribute->n);
+    text[attribute->n] = 0;
+    memcpy(text + attribute->n + 1, block->p ? block->p : "", block->n);
+    text[attribute->n + 1 + block->n] = 0;
+    const char *before = css_inline_text(e);
+    bool same = before && strlen(before) == block->n && !memcmp(before, text + attribute->n + 1, block->n);
+    free(e->style_cssom);
+    e->style_cssom = text;
+    if (!same) css_mark_style_own(d, e);
+    return true;
+}
+int css_inline_set(web_doc *d, node_t *e, const char *block, size_t n, const char *property, const char *value,
+                   const char *priority, sbuf *attribute) {
+    sbuf changed = {0};
+    int status = css_decl_set(block, n, property, value, priority, NULL, &changed);
+    /* CSSOM "set a CSS declaration": the declaration it already has changes nothing */
+    if (status > 0 && changed.n == n && (!n || !memcmp(changed.p, block, n))) status = 0;
+    if (status > 0 && !(css_decl_block_serialize(changed.p ? changed.p : "", changed.n, NULL, attribute, NULL) &&
+                        inline_store(d, e, attribute, &changed))) status = -2;
+    sb_free(&changed);
+    return status;
+}
+bool css_inline_replace(web_doc *d, node_t *e, const char *text, size_t n, sbuf *attribute) {
+    sbuf block = {0};
+    size_t clean_n;
+    char *clean = css_preprocess(text, n, &clean_n);
+    bool ok = clean && css_decl_block(clean, clean_n, NULL, &block) &&
+              css_decl_block_serialize(block.p ? block.p : "", block.n, NULL, attribute, NULL) &&
+              inline_store(d, e, attribute, &block);
+    free(clean);
+    sb_free(&block);
+    return ok;
 }
 
 /* ---------------------------------------------------------------- the cascade */
@@ -7263,6 +7778,7 @@ void css_node_style_free(node_t *n) {
     ar_free(&n->style_mem); ar_free(&n->style_previous_mem); ar_free(&n->style_inherit_mem);
     style_slots_free(&n->style_slots); style_slots_free(&n->style_previous_slots);
     declarations_free(&n->style_declarations);
+    free(n->style_cssom); n->style_cssom = NULL;
     n->style = n->animation_base_style = n->animation_after_style = n->style_previous = NULL;
 }
 
@@ -8370,8 +8886,9 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     }
     int depth = scope_depth(doc_node_root(e, false));
     for (int i = 0; i < h.n; i++) add_dent(&h.d[i], 1ull << 62, PE_NONE, depth);
-    /* A style attribute CSP blocked is not applied (dom.c's csp_style_attribute). */
-    const char *sa = e->csp_style_attribute == 2 ? NULL : node_attr(e, "style");
+    /* the declarations the style attribute stands for: none when CSP blocked it, the exact
+       ones when a CSSOM change wrote it (css_inline_text) */
+    const char *sa = css_inline_text(e);
     struct css_declarations *inline_block = declarations_get(&e->style_declarations, sa, d->base, c->a);
     if (inline_block) {
         struct decl *ds = inline_block->values; int nd = inline_block->count;

@@ -3,36 +3,59 @@
 #include <weburl.h>
 
 /* ---------------------------------------------------------------- parses
-   Every change to a sheet's rules is a change to its text: the text with the
-   change spliced in is parsed again, in one pass, into a new cascade AST and
-   rule tree, and the old tree's ids move to the rules of the new one that
-   stand where they stood. So the cascade can never differ from what CSSOM
-   shows, and other CSSRule objects keep their identity across insertRule and
-   deleteRule. A removed rule a CSSRule object stands for moves to a parse of
-   its own (cssom_tree), where it keeps working without a sheet. */
+   Every change to a sheet's rules is a change to its text. The text of the
+   top-level rule the change falls in, with the change spliced in, is parsed
+   again in the sheet's context (css_parse_cssom_rules), and that rule's part
+   of the cascade AST and of the rule tree is replaced by the new parse's
+   (css_cssom_splice): insertRule at the top parses the one rule it inserts,
+   deleteRule there parses nothing. So the cascade still reads the one parse
+   CSSOM shows, and the old tree's ids move to the rules of the new one that
+   stand where they stood, so other CSSRule objects keep their identity
+   across insertRule and deleteRule. A change the sheet's context cannot hold
+   apart (an @import or @namespace rule, a sheet whose text puts rules into the
+   cascade outside every top-level rule) parses the sheet's whole text again,
+   as does a sheet whose replaced rules' text has outgrown its live rules'
+   (their memory is freed with the old parse). A removed rule a CSSRule object
+   stands for moves to a parse of its own (cssom_tree), where it keeps working
+   without a sheet. */
 static struct css_rule_info *next_rule(struct css_rule_info *r) {
     if (r->first) return r->first;
     while (r && !r->next) r = r->parent;
     return r ? r->next : NULL;
 }
-static size_t rule_at(const struct cssom_parse *p, const struct css_rule_info *r) { return (size_t)(r->text - p->source); }
-static size_t rule_end(const struct cssom_parse *p, const struct css_rule_info *r) { return rule_at(p, r) + r->text_len; }
+/* the rule after r in preorder, within root's subtree */
+static struct css_rule_info *next_in(struct css_rule_info *r, const struct css_rule_info *root) {
+    if (r->first) return r->first;
+    while (r != root && !r->next) r = r->parent;
+    return r == root ? NULL : r->next;
+}
+static struct css_rule_info *top_of(const struct css_rule_info *r) {
+    while (r->parent) r = r->parent;
+    return (struct css_rule_info *)r;
+}
+/* where a rule stands in the text of its top-level rule, which holds its subtree */
+static size_t rule_at(const struct css_rule_info *r) { return (size_t)(r->text - top_of(r)->text); }
+static size_t rule_end(const struct css_rule_info *r) { return rule_at(r) + r->text_len; }
 static struct css_rule_info **children(const struct cssom_parse *p, const struct css_rule_info *r, uint32_t *count) {
     if (!r) { *count = p->count; return p->top; }
     *count = r->child_count; return r->children;
 }
-static void index_children(struct cssom_parse *p) {
-    struct css_rule_info *first = css_sheet_rules(p->ast, &p->count);
-    p->top = p->count ? ar_alloc(&p->arena, (size_t)p->count * sizeof *p->top) : NULL;
-    uint32_t i = 0;
-    for (struct css_rule_info *r = first; r; r = r->next) p->top[i++] = r;
-    for (struct css_rule_info *r = first; r; r = next_rule(r)) if (r->child_count) {
-        r->children = ar_alloc(&p->arena, (size_t)r->child_count * sizeof *r->children);
+static void index_subtree(arena_t *a, struct css_rule_info *root) {
+    for (struct css_rule_info *r = root; r; r = next_in(r, root)) if (r->child_count) {
+        r->children = ar_alloc(a, (size_t)r->child_count * sizeof *r->children);
         uint32_t j = 0;
-        for (struct css_rule_info *c = r->first; c; c = c->next) r->children[j++] = c;
+        for (struct css_rule_info *c = r->first; c; c = c->next) { c->index = j; r->children[j++] = c; }
     }
 }
-static void parse_free(struct cssom_parse *p) { ar_free(&p->arena); memset(p, 0, sizeof *p); }
+static void index_children(struct cssom_parse *p) {
+    struct css_rule_info *first = css_sheet_rules(p->ast, &p->count);
+    p->cap = p->count;
+    p->top = p->count ? malloc((size_t)p->count * sizeof *p->top) : NULL;
+    if (p->count && !p->top) ar_alloc(&p->arena, SIZE_MAX); /* the parse's trap: no memory */
+    uint32_t i = 0;
+    for (struct css_rule_info *r = first; r; r = r->next) { r->index = i; p->top[i++] = r; index_subtree(&p->arena, r); }
+}
+static void parse_free(struct cssom_parse *p) { ar_free(&p->arena); free(p->top); memset(p, 0, sizeof *p); }
 /* the parse now lives at p: the AST names its arena by address */
 static void parse_moved(struct cssom_parse *p) { if (p->ast) css_sheet_arena_moved(p->ast, &p->arena); }
 static int parse_text(web_doc *d, const char *base, struct cssom_parse *out, const char *text, size_t n,
@@ -89,6 +112,41 @@ static int parse_sheet_text(web_doc *d, const char *base, struct cssom_parse *ou
     parse_moved(out);
     return CSSOM_OK;
 }
+/* Comment-free text parsed as top-level rules of s, in its context, into its
+   arena: CSSOM_SYNTAX unless the text is all one rule. A parse that does not
+   take a rule's place is the arena's garbage. */
+static int parse_in(struct cssom_sheet *s, const char *text, size_t n, const uint32_t *markers, uint32_t nmarkers,
+                    sheet_t **out) {
+    *out = NULL;
+    arena_t *arena = &s->p.arena;
+    jmp_buf trap, *outer = arena->trap;
+    arena->trap = &trap;
+    s->garbage += n;
+    if (setjmp(trap)) { arena->trap = outer; return CSSOM_OOM; }
+    sheet_t *fresh = css_parse_cssom_rules(s->document, s->p.ast, n ? text : "", n, s->base, markers, nmarkers);
+    uint32_t count;
+    struct css_rule_info *rule = css_sheet_rules(fresh, &count);
+    size_t length;
+    const char *source = css_sheet_source(fresh, &length);
+    bool one = count == 1 && rule->text == source && rule->text_len == length && css_cssom_spliceable(fresh);
+    if (one) index_subtree(arena, rule);
+    arena->trap = outer;
+    if (!one) return CSSOM_SYNTAX;
+    s->garbage -= n;
+    *out = fresh;
+    return CSSOM_OK;
+}
+static bool top_reserve(struct cssom_parse *p, uint32_t more) {
+    if (p->count <= p->cap && more <= p->cap - p->count) return true;
+    if (more > UINT32_MAX - p->count) return false;
+    size_t cap = p->cap ? p->cap : 16;
+    while (cap < (size_t)p->count + more) cap *= 2;
+    if (cap > UINT32_MAX) cap = UINT32_MAX;
+    struct css_rule_info **top = realloc(p->top, cap * sizeof *top);
+    if (!top) return false;
+    p->top = top; p->cap = (uint32_t)cap;
+    return true;
+}
 
 /* ---------------------------------------------------------------- ids */
 struct cssom_slot { uint32_t id; struct css_rule_info *info; struct cssom_tree *tree; };
@@ -100,31 +158,78 @@ static struct cssom_slot *slot_find(const struct cssom_sheet *s, uint32_t id) {
         if (s->slots[i].id == id) return &s->slots[i];
     }
 }
+static void slot_put(struct cssom_slot *v, uint32_t mask, uint32_t id, struct css_rule_info *info, struct cssom_tree *tree) {
+    uint32_t i = slot_hash(id, mask);
+    while (v[i].id) i = (i + 1) & mask;
+    v[i] = (struct cssom_slot){id, info, tree};
+}
 static size_t parse_ids(const struct cssom_parse *p) {
     size_t n = 0;
     for (struct css_rule_info *r = p->count ? p->top[0] : NULL; r; r = next_rule(r)) n += r->id != 0;
     return n;
 }
 static void slots_put(struct cssom_slot *v, uint32_t mask, const struct cssom_parse *p, struct cssom_tree *tree) {
-    for (struct css_rule_info *r = p->count ? p->top[0] : NULL; r; r = next_rule(r)) if (r->id) {
-        uint32_t i = slot_hash(r->id, mask);
-        while (v[i].id) i = (i + 1) & mask;
-        v[i] = (struct cssom_slot){r->id, r, tree};
-    }
+    for (struct css_rule_info *r = p->count ? p->top[0] : NULL; r; r = next_rule(r))
+        if (r->id) slot_put(v, mask, r->id, r, tree);
+}
+static size_t slot_size(size_t n) {
+    size_t size = 16;
+    while (size < 2 * n + 2) { if (size > UINT32_MAX / 2) return 0; size *= 2; }
+    return size;
 }
 /* the index of every id the sheet and its removed rules hold */
 static bool slots_build(struct cssom_sheet *s) {
     size_t n = parse_ids(&s->p);
     for (struct cssom_tree *t = s->detached; t; t = t->next) n += parse_ids(&t->p);
-    size_t size = 16;
-    while (size < 2 * n + 2) { if (size > UINT32_MAX / 2) return false; size *= 2; }
-    struct cssom_slot *v = calloc(size, sizeof *v);
+    size_t size = slot_size(n);
+    struct cssom_slot *v = size ? calloc(size, sizeof *v) : NULL;
     if (!v) return false;
     slots_put(v, (uint32_t)(size - 1), &s->p, NULL);
     for (struct cssom_tree *t = s->detached; t; t = t->next) slots_put(v, (uint32_t)(size - 1), &t->p, t);
     free(s->slots);
-    s->slots = v; s->slot_mask = (uint32_t)(size - 1);
+    s->slots = v; s->slot_mask = (uint32_t)(size - 1); s->slot_count = (uint32_t)n;
     return true;
+}
+/* room for more ids, the table at most half full, so that setting them cannot fail */
+static bool slots_reserve(struct cssom_sheet *s, size_t more) {
+    size_t size = s->slots ? (size_t)s->slot_mask + 1 : 0, n = s->slot_count;
+    if (more > UINT32_MAX - n) return false;
+    if (s->slots && 2 * (n + more) + 2 <= size) return true;
+    size_t want = slot_size(n + more);
+    struct cssom_slot *v = want ? calloc(want, sizeof *v) : NULL;
+    if (!v) return false;
+    for (size_t i = 0; i < size; i++)
+        if (s->slots[i].id) slot_put(v, (uint32_t)(want - 1), s->slots[i].id, s->slots[i].info, s->slots[i].tree);
+    free(s->slots);
+    s->slots = v; s->slot_mask = (uint32_t)(want - 1);
+    return true;
+}
+static void slot_set(struct cssom_sheet *s, uint32_t id, struct css_rule_info *info, struct cssom_tree *tree) {
+    struct cssom_slot *slot = slot_find(s, id);
+    if (slot) { slot->info = info; slot->tree = tree; return; }
+    slot_put(s->slots, s->slot_mask, id, info, tree);
+    s->slot_count++;
+}
+/* linear probing's removal: the entries after it in its run that may stand
+   in its place move back */
+static void slot_remove(struct cssom_sheet *s, uint32_t id) {
+    struct cssom_slot *slot = slot_find(s, id);
+    if (!slot) return;
+    uint32_t mask = s->slot_mask, i = (uint32_t)(slot - s->slots);
+    s->slot_count--;
+    for (;;) {
+        s->slots[i].id = 0;
+        uint32_t j = i;
+        for (;;) {
+            j = (j + 1) & mask;
+            if (!s->slots[j].id) return;
+            uint32_t home = slot_hash(s->slots[j].id, mask);
+            bool stays = i <= j ? home > i && home <= j : home > i || home <= j;
+            if (!stays) break;
+        }
+        s->slots[i] = s->slots[j];
+        i = j;
+    }
 }
 static bool assign_ids(struct cssom_sheet *s, struct cssom_parse *p) {
     for (struct css_rule_info *r = p->count ? p->top[0] : NULL; r; r = next_rule(r)) {
@@ -176,36 +281,55 @@ static void carry(struct css_rule_info *to, const struct css_rule_info *from) {
 
 /* ---------------------------------------------------------------- edits */
 struct edit { size_t at, end; const char *text; size_t n; size_t marker; /* in text; SIZE_MAX: none */ };
+struct offsets { uint32_t *v; size_t n, cap; };
+static bool offset_push(struct offsets *o, size_t at) {
+    if (at >= UINT32_MAX) return false;
+    if (o->n == o->cap) {
+        size_t cap = o->cap ? o->cap * 2 : 16;
+        uint32_t *v = cap <= SIZE_MAX / sizeof *v ? realloc(o->v, cap * sizeof *v) : NULL;
+        if (!v) return false;
+        o->v = v; o->cap = cap;
+    }
+    o->v[o->n++] = (uint32_t)at;
+    return true;
+}
+/* where the markers of root's subtree (NULL: every rule from first) stand:
+   from base, plus shift */
+static bool markers_of(struct css_rule_info *first, const struct css_rule_info *root, const char *base, size_t shift,
+                       struct offsets *out) {
+    for (struct css_rule_info *r = first; r; r = root ? next_in(r, root) : next_rule(r))
+        if (r->marker && !offset_push(out, shift + (size_t)(r->text - base))) return false;
+    return true;
+}
 static int marker_cmp(const void *a, const void *b) {
     uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
     return x < y ? -1 : x > y;
 }
-/* p's text with the edits (in order, apart) made, and where its markers are */
-static bool apply_edits(const struct cssom_parse *p, const struct edit *e, int count,
+/* src with the edits (in order, apart) made, and where the markers at in
+   (offsets into src) and the edits' own stand in it */
+static bool apply_edits(const char *src, size_t length, const struct offsets *in, const struct edit *e, int count,
                         char **text, size_t *n, uint32_t **markers, uint32_t *nmarkers) {
-    size_t total = p->length;
+    size_t total = length;
     for (int i = 0; i < count; i++) {
         if (e[i].n > SIZE_MAX / 2 || total > SIZE_MAX / 2) return false;
         total = total - (e[i].end - e[i].at) + e[i].n;
     }
     if (total >= UINT32_MAX) return false;
-    size_t old = 0, cap = 0;
-    for (struct css_rule_info *r = p->count ? p->top[0] : NULL; r; r = next_rule(r)) old += r->marker;
-    cap = old + (size_t)count;
+    size_t cap = in->n + (size_t)count;
     uint32_t *m = cap ? malloc(cap * sizeof *m) : NULL;
     char *out = malloc(total + 1);
     if ((cap && !m) || !out) { free(m); free(out); return false; }
     size_t used = 0, pos = 0, k = 0;
     for (int i = 0; i < count; i++) {
-        memcpy(out + used, p->source + pos, e[i].at - pos); used += e[i].at - pos;
+        memcpy(out + used, src + pos, e[i].at - pos); used += e[i].at - pos;
         if (e[i].marker != SIZE_MAX) m[k++] = (uint32_t)(used + e[i].marker);
         if (e[i].n) memcpy(out + used, e[i].text, e[i].n);
         used += e[i].n; pos = e[i].end;
     }
-    memcpy(out + used, p->source + pos, p->length - pos); used += p->length - pos;
+    memcpy(out + used, src + pos, length - pos); used += length - pos;
     out[used] = 0;
-    for (struct css_rule_info *r = p->count ? p->top[0] : NULL; r; r = next_rule(r)) if (r->marker) {
-        size_t at = rule_at(p, r), shifted = at;
+    for (size_t j = 0; j < in->n; j++) {
+        size_t at = in->v[j], shifted = at;
         bool gone = false;
         for (int i = 0; i < count; i++) {
             if (at >= e[i].at && at < e[i].end) gone = true;
@@ -215,6 +339,27 @@ static bool apply_edits(const struct cssom_parse *p, const struct edit *e, int c
     }
     if (k) qsort(m, k, sizeof *m, marker_cmp);
     *text = out; *n = used; *markers = m; *nmarkers = (uint32_t)k;
+    return true;
+}
+/* A parse's whole text, where each top-level rule stands in it (at) and its
+   markers: its source until a change was spliced in, the top-level rules'
+   texts in order since. */
+static bool whole_text(const struct cssom_parse *p, sbuf *text, size_t **at, struct offsets *markers) {
+    size_t *v = p->count ? malloc((size_t)p->count * sizeof *v) : NULL;
+    if (p->count && !v) return false;
+    *at = v;
+    if (!p->spliced) {
+        sb_put(text, p->source ? p->source : "", p->length);
+        for (uint32_t i = 0; i < p->count; i++) v[i] = (size_t)(p->top[i]->text - p->source);
+        return markers_of(p->count ? p->top[0] : NULL, NULL, p->source, 0, markers);
+    }
+    for (uint32_t i = 0; i < p->count; i++) {
+        struct css_rule_info *r = p->top[i];
+        v[i] = text->n;
+        sb_put(text, r->text, r->text_len);
+        sb_putc(text, '\n');
+        if (!markers_of(r, r, r->text, v[i], markers)) return false;
+    }
     return true;
 }
 
@@ -231,6 +376,11 @@ static uint32_t depth_of(const struct css_rule_info *r) {
     for (; r->parent; r = r->parent) depth++;
     return depth;
 }
+/* @import, @namespace and @layer statements: the only rules before the first
+   other one, where every @import and @namespace stands */
+static bool prefix_rule(const struct css_rule_info *r) {
+    return r->type == CSS_RULE_IMPORT || r->type == CSS_RULE_NAMESPACE || r->type == CSS_RULE_LAYER_STATEMENT;
+}
 /* The text a rule of p parses the same in, outside p: the sheet's @namespace
    rules a style rule's selectors may name, then each ancestor's text up to its
    block; *before the length of all that. The caller appends the rule and
@@ -239,7 +389,7 @@ static uint32_t context_text(const struct cssom_parse *p, const struct css_rule_
                              sbuf *out, uint32_t *namespaces) {
     *namespaces = 0;
     if (kind != CSS_RULE_IMPORT && kind != CSS_RULE_NAMESPACE)
-        for (uint32_t i = 0; i < p->count; i++) if (p->top[i]->type == CSS_RULE_NAMESPACE) {
+        for (uint32_t i = 0; i < p->count && prefix_rule(p->top[i]); i++) if (p->top[i]->type == CSS_RULE_NAMESPACE) {
             sb_put(out, p->top[i]->text, p->top[i]->text_len); sb_putc(out, '\n'); ++*namespaces;
         }
     uint32_t depth = parent ? depth_of(parent) + 1 : 0;
@@ -278,7 +428,7 @@ static struct cssom_tree *detach(struct cssom_sheet *s, const struct cssom_parse
         marker_text(&text, root->text + root->decls_at, root->decls_len);
     } else {
         for (size_t i = 0; i < before.n; i++) if (before.v[i]->marker)
-            markers[count++] = (uint32_t)(base + rule_at(old, before.v[i]) - rule_at(old, root));
+            markers[count++] = (uint32_t)(base + (size_t)(before.v[i]->text - root->text));
         sb_put(&text, root->text, root->text_len);
     }
     for (uint32_t i = 0; i < depth; i++) sb_puts(&text, "\n}");
@@ -302,11 +452,22 @@ fail:
     return NULL;
 }
 static void tree_free(struct cssom_tree *t) { parse_free(&t->p); free(t); }
+/* the removed rules of a change: to the tree they moved to, or gone */
+static void slots_removed(struct cssom_sheet *s, struct cssom_tree *tree, const struct flat *o, size_t at, size_t gone) {
+    if (tree) {
+        for (struct css_rule_info *r = tree->p.count ? tree->p.top[0] : NULL; r; r = next_rule(r))
+            if (r->id) slot_set(s, r->id, r, tree);
+        tree->next = s->detached; s->detached = tree;
+    } else for (size_t i = at; i < at + gone; i++) slot_remove(s, o->v[i]->id);
+}
 
 /* ---------------------------------------------------------------- a change, made */
 enum change_kind { CHANGE_SAME, CHANGE_INSERT, CHANGE_DELETE };
 struct change {
     struct cssom_tree *tree;           /* NULL: the sheet's own rules */
+    /* the top-level rule whose text the edits change, at offsets in it; NULL:
+       an insert at the top, whose one edit is the rule's text alone */
+    struct css_rule_info *top;
     struct edit edits[2];
     int count;
     enum change_kind kind;
@@ -315,15 +476,89 @@ struct change {
     uint32_t index;
     const char *prelude;               /* SAME: the rule's new prelude, which its new parse keeps */
     size_t prelude_n;
-    size_t insert_at, insert_n;        /* INSERT: where the new rule's text stands in the new text */
+    size_t insert_at, insert_n;        /* INSERT: where the new rule's text stands in top's new text */
 };
 static bool same_rule(const struct flat *a, size_t i, const struct flat *b, size_t j) {
     return a->depth[i] == b->depth[j] && a->v[i]->type == b->v[j]->type;
 }
-static int rebuild(struct cssom_sheet *s, struct change *c) {
+/* Whether the new rules f are the old o with the change made, and its place:
+   at, where gone old rules (and their subtrees) left and added new ones came,
+   the inserted rule's text at insert_at from text. */
+static bool shape(const struct cssom_parse *p, const struct flat *o, const struct flat *f, const struct change *c,
+                  const char *text, size_t insert_at, size_t *at_out, size_t *gone_out, size_t *added_out) {
+    size_t at = 0, gone = 0;
+    uint32_t depth = 0;
+    if (c->kind == CHANGE_SAME) at = c->node ? flat_find(o, c->node) : 0;
+    else if (c->kind == CHANGE_DELETE) { at = flat_find(o, c->node); if (at != SIZE_MAX) gone = flat_subtree(o, at); }
+    else {
+        uint32_t count;
+        struct css_rule_info **list = children(p, c->container, &count);
+        size_t container = c->container ? flat_find(o, c->container) : SIZE_MAX;
+        if (c->container && container == SIZE_MAX) return false;
+        depth = c->container ? o->depth[container] + 1 : 0;
+        at = c->index < count ? flat_find(o, list[c->index]) :
+             c->container ? container + flat_subtree(o, container) : o->n;
+    }
+    if (at == SIZE_MAX || f->n + gone < o->n) return false;
+    size_t added = f->n + gone - o->n;
+    if ((c->kind == CHANGE_INSERT) != (added != 0)) return false;
+    for (size_t i = 0; i < at; i++) if (!same_rule(o, i, f, i)) return false;
+    for (size_t i = at + gone; i < o->n; i++) if (!same_rule(o, i, f, i - gone + added)) return false;
+    if (added) {
+        /* the inserted rule, whole, where its text went: not a merge with its neighbours */
+        if (f->depth[at] != depth || (size_t)(f->v[at]->text - text) != insert_at || f->v[at]->text_len != c->insert_n)
+            return false;
+        for (size_t j = at + 1; j < at + added; j++) if (f->depth[j] <= depth) return false;
+    }
+    if (c->prelude) {
+        const struct css_rule_info *r = at < f->n ? f->v[at] : NULL;
+        if (!r || r->prelude_len != c->prelude_n || memcmp(r->text + r->prelude_at, c->prelude, c->prelude_n)) return false;
+    }
+    *at_out = at; *gone_out = gone; *added_out = added;
+    return true;
+}
+static bool exposed_in(const struct flat *o, size_t at, size_t gone) {
+    for (size_t i = at; i < at + gone; i++) if (o->v[i]->exposed) return true;
+    return false;
+}
+static void compact(struct cssom_sheet *s);
+/* The change by a parse of the whole text: a removed rule's tree, an
+   @import or @namespace, a sheet the context cannot change rule by rule, and
+   compaction (a SAME change of nothing). */
+static int rebuild_whole(struct cssom_sheet *s, struct change *c) {
     struct cssom_parse *target = c->tree ? &c->tree->p : &s->p;
-    char *text; size_t n; uint32_t *markers; uint32_t nmarkers;
-    if (!apply_edits(target, c->edits, c->count, &text, &n, &markers, &nmarkers)) return CSSOM_OOM;
+    sbuf whole = {0}, b = {0};
+    size_t *at = NULL;
+    struct offsets marks = {0};
+    struct edit e[2];
+    int count = 0;
+    size_t insert_at = c->insert_at;
+    char *text = NULL; size_t n; uint32_t *markers = NULL; uint32_t nmarkers;
+    bool ok = whole_text(target, &whole, &at, &marks);
+    if (ok && c->top) {
+        size_t base = at[c->top->index];
+        for (count = 0; count < c->count; count++) {
+            e[count] = c->edits[count];
+            e[count].at += base; e[count].end += base;
+        }
+        insert_at += base;
+    } else if (ok && c->kind == CHANGE_INSERT) {
+        /* text before it that does not end a declaration or a rule: end it */
+        size_t place = c->index < target->count ? at[c->index] : whole.n, k = place;
+        while (k > 0 && is_space((unsigned char)whole.p[k - 1])) k--;
+        if (k > 0 && !strchr(";{}", whole.p[k - 1])) sb_putc(&b, ';');
+        sb_putc(&b, '\n');
+        size_t prefix = b.n;
+        sb_put(&b, c->edits[0].text, c->edits[0].n);
+        sb_putc(&b, '\n');
+        e[0] = (struct edit){place, place, b.p, b.n, c->edits[0].marker != SIZE_MAX ? prefix + c->edits[0].marker : SIZE_MAX};
+        count = 1;
+        insert_at = place + prefix;
+    }
+    ok = ok && apply_edits(whole.p ? whole.p : "", whole.n, &marks, e, count, &text, &n, &markers, &nmarkers);
+    free(at); free(marks.v); sb_free(&whole);
+    if (!ok) { sb_free(&b); return CSSOM_OOM; }
+    sb_free(&b);
     struct cssom_parse fresh;
     int error = parse_text(s->document, s->base, &fresh, text, n, markers, nmarkers);
     free(text); free(markers);
@@ -333,42 +568,15 @@ static int rebuild(struct cssom_sheet *s, struct change *c) {
     error = CSSOM_OOM;
     if (!flatten(target->count ? target->top[0] : NULL, false, &o) ||
         !flatten(fresh.count ? fresh.top[0] : NULL, false, &f)) goto fail;
-    size_t at = 0, gone = 0;
-    uint32_t depth = 0;
+    size_t place, gone, added;
     error = CSSOM_SYNTAX;
-    if (c->kind == CHANGE_SAME) at = c->node ? flat_find(&o, c->node) : 0;
-    else if (c->kind == CHANGE_DELETE) { at = flat_find(&o, c->node); if (at != SIZE_MAX) gone = flat_subtree(&o, at); }
-    else {
-        uint32_t count;
-        struct css_rule_info **list = children(target, c->container, &count);
-        size_t container = c->container ? flat_find(&o, c->container) : SIZE_MAX;
-        if (c->container && container == SIZE_MAX) goto fail;
-        depth = c->container ? o.depth[container] + 1 : 0;
-        at = c->index < count ? flat_find(&o, list[c->index]) :
-             c->container ? container + flat_subtree(&o, container) : o.n;
-    }
-    if (at == SIZE_MAX || f.n + gone < o.n) goto fail;
-    size_t added = f.n + gone - o.n;
-    if ((c->kind == CHANGE_INSERT) != (added != 0)) goto fail;
-    for (size_t i = 0; i < at; i++) if (!same_rule(&o, i, &f, i)) goto fail;
-    for (size_t i = at + gone; i < o.n; i++) if (!same_rule(&o, i, &f, i - gone + added)) goto fail;
-    if (added) {
-        /* the inserted rule, whole, where its text went: not a merge with its neighbours */
-        if (f.depth[at] != depth || rule_at(&fresh, f.v[at]) != c->insert_at || f.v[at]->text_len != c->insert_n) goto fail;
-        for (size_t j = at + 1; j < at + added; j++) if (f.depth[j] <= depth) goto fail;
-    }
-    if (c->prelude) {
-        const struct css_rule_info *r = at < f.n ? f.v[at] : NULL;
-        if (!r || r->prelude_len != c->prelude_n || memcmp(r->text + r->prelude_at, c->prelude, c->prelude_n)) goto fail;
-    }
+    if (!shape(target, &o, &f, c, fresh.source, insert_at, &place, &gone, &added)) goto fail;
     error = CSSOM_OOM;
     if (added > UINT32_MAX - s->next_rule_id) goto fail;
-    for (size_t i = 0; i < at; i++) carry(f.v[i], o.v[i]);
-    for (size_t i = at + gone; i < o.n; i++) carry(f.v[i - gone + added], o.v[i]);
-    for (size_t j = at; j < at + added; j++) f.v[j]->id = ++s->next_rule_id;
-    bool exposed = false;
-    for (size_t i = at; i < at + gone; i++) exposed |= o.v[i]->exposed;
-    if (exposed) removed = detach(s, target, o.v[at]);
+    for (size_t i = 0; i < place; i++) carry(f.v[i], o.v[i]);
+    for (size_t i = place + gone; i < o.n; i++) carry(f.v[i - gone + added], o.v[i]);
+    for (size_t j = place; j < place + added; j++) f.v[j]->id = ++s->next_rule_id;
+    if (exposed_in(&o, place, gone)) removed = detach(s, target, o.v[place]);
     struct cssom_parse previous = *target;
     *target = fresh; parse_moved(target);
     if (removed) { removed->next = s->detached; s->detached = removed; }
@@ -377,6 +585,7 @@ static int rebuild(struct cssom_sheet *s, struct change *c) {
         fresh = *target; *target = previous; parse_moved(target); parse_moved(&fresh);
         error = CSSOM_OOM; goto fail;
     }
+    if (!c->tree) { s->live = n; s->garbage = 0; }
     /* Unpublish the cascade's borrowed AST pointers before the old AST goes. */
     if (!c->tree) cssom_changed(s);
     parse_free(&previous);
@@ -387,6 +596,108 @@ fail:
     parse_free(&fresh);
     return error;
 }
+/* The change by a parse of its top-level rule's new text alone, in the
+   sheet's context: that rule's part of the AST and of the tree replaced. */
+static int rebuild_rule(struct cssom_sheet *s, struct change *c) {
+    struct cssom_parse *p = &s->p;
+    struct css_rule_info *old = c->top;
+    struct offsets marks = {0};
+    char *text = NULL; size_t n; uint32_t *markers = NULL; uint32_t nmarkers;
+    bool ok = markers_of(old, old, old->text, 0, &marks) &&
+              apply_edits(old->text, old->text_len, &marks, c->edits, c->count, &text, &n, &markers, &nmarkers);
+    free(marks.v);
+    if (!ok) return CSSOM_OOM;
+    sheet_t *fresh;
+    int error = parse_in(s, text, n, markers, nmarkers, &fresh);
+    free(text); free(markers);
+    if (error) return error;
+    struct css_rule_info *rule = css_sheet_rules(fresh, NULL);
+    struct flat o = {0}, f = {0};
+    error = CSSOM_OOM;
+    if (!flatten(old, true, &o) || !flatten(rule, true, &f)) goto fail;
+    size_t at, gone, added;
+    error = CSSOM_SYNTAX;
+    if (!shape(p, &o, &f, c, rule->text, c->insert_at, &at, &gone, &added)) goto fail;
+    error = CSSOM_OOM;
+    if (added > UINT32_MAX - s->next_rule_id || !slots_reserve(s, added)) goto fail;
+    for (size_t i = 0; i < at; i++) carry(f.v[i], o.v[i]);
+    for (size_t i = at + gone; i < o.n; i++) carry(f.v[i - gone + added], o.v[i]);
+    for (size_t j = at; j < at + added; j++) f.v[j]->id = ++s->next_rule_id;
+    struct cssom_tree *removed = exposed_in(&o, at, gone) ? detach(s, p, o.v[at]) : NULL;
+    uint32_t place = old->index;
+    bool dropped = css_cssom_splice(s->document, p->ast, p->top, p->count, place, old, fresh);
+    p->top[place] = rule; rule->index = place; p->spliced = true;
+    for (size_t j = 0; j < f.n; j++) slot_set(s, f.v[j]->id, f.v[j], NULL);
+    slots_removed(s, removed, &o, at, gone);
+    s->live = s->live - old->text_len + n;
+    s->garbage += old->text_len + (dropped ? s->live : 0);
+    cssom_changed(s);
+    flat_free(&o); flat_free(&f);
+    compact(s);
+    return CSSOM_OK;
+fail:
+    flat_free(&o); flat_free(&f);
+    s->garbage += n; /* the new parse took no place */
+    return error;
+}
+static int rebuild(struct cssom_sheet *s, struct change *c) {
+    if (c->tree || !c->top || !css_cssom_spliceable(s->p.ast) ||
+        c->top->type == CSS_RULE_IMPORT || c->top->type == CSS_RULE_NAMESPACE) return rebuild_whole(s, c);
+    return rebuild_rule(s, c);
+}
+/* insertRule at the top of a sheet the context can change rule by rule: the
+   rule (text, clean and closed) parsed alone; CSSOM_UNSUPPORTED: an @import
+   or @namespace, which only the whole text can take */
+static int top_order(const struct cssom_parse *p, uint32_t kind, uint32_t index);
+static int insert_top(struct cssom_sheet *s, const char *text, size_t n, uint32_t index) {
+    struct cssom_parse *p = &s->p;
+    sheet_t *fresh;
+    int error = parse_in(s, text, n, NULL, 0, &fresh);
+    if (error) return error;
+    struct css_rule_info *rule = css_sheet_rules(fresh, NULL);
+    size_t count = 0;
+    for (struct css_rule_info *r = rule; r; r = next_in(r, rule)) count++;
+    error = top_order(p, rule->type, index);
+    if (!error && (count > UINT32_MAX - s->next_rule_id || !top_reserve(p, 1) || !slots_reserve(s, count))) error = CSSOM_OOM;
+    if (error) { s->garbage += n; return error; }
+    for (struct css_rule_info *r = rule; r; r = next_in(r, rule)) r->id = ++s->next_rule_id;
+    bool dropped = css_cssom_splice(s->document, p->ast, p->top, p->count, index, NULL, fresh);
+    memmove(p->top + index + 1, p->top + index, (size_t)(p->count - index) * sizeof *p->top);
+    p->top[index] = rule; p->count++; p->spliced = true;
+    for (uint32_t i = index; i < p->count; i++) p->top[i]->index = i;
+    for (struct css_rule_info *r = rule; r; r = next_in(r, rule)) slot_set(s, r->id, r, NULL);
+    s->live += n;
+    if (dropped) s->garbage += s->live;
+    cssom_changed(s);
+    compact(s);
+    return CSSOM_OK;
+}
+/* deleteRule at the top of such a sheet: nothing parsed */
+static int delete_top(struct cssom_sheet *s, struct css_rule_info *r) {
+    struct cssom_parse *p = &s->p;
+    struct flat o = {0};
+    if (!flatten(r, true, &o)) { flat_free(&o); return CSSOM_OOM; }
+    struct cssom_tree *removed = exposed_in(&o, 0, o.n) ? detach(s, p, r) : NULL;
+    uint32_t index = r->index;
+    bool dropped = css_cssom_splice(s->document, p->ast, p->top, p->count, index, r, NULL);
+    memmove(p->top + index, p->top + index + 1, (size_t)(p->count - index - 1) * sizeof *p->top);
+    p->count--; p->spliced = true;
+    for (uint32_t i = index; i < p->count; i++) p->top[i]->index = i;
+    slots_removed(s, removed, &o, 0, o.n);
+    flat_free(&o);
+    s->live -= r->text_len;
+    s->garbage += r->text_len + (dropped ? s->live : 0);
+    cssom_changed(s);
+    compact(s);
+    return CSSOM_OK;
+}
+/* The replaced rules' memory, once it outgrows the live rules': freed by a
+   parse of the whole text (which keeps every id). */
+static void compact(struct cssom_sheet *s) {
+    if (s->garbage <= s->live + 65536) return;
+    struct change c = {.kind = CHANGE_SAME};
+    rebuild_whole(s, &c);
+}
 
 /* ---------------------------------------------------------------- sheets */
 static void invalidate(web_doc *d) {
@@ -395,6 +706,9 @@ static void invalidate(web_doc *d) {
     d->layout_valid = false;
 }
 void cssom_changed(struct cssom_sheet *s) {
+    /* an @import rule's sheet is in the cascade through the rule's sheet */
+    for (bool attached; s->parent; s = s->parent)
+        if (!cssom_rule(s->parent, s->owner_rule, &attached) || !attached) return;
     if (s->constructed) invalidate(s->document);
     else if (s->associated && s->owner->cssom_current == s && s->owner->owner == s->document)
         invalidate(s->document);
@@ -426,6 +740,7 @@ static int sheet_parse(struct cssom_sheet *s, const char *text, size_t length) {
     if (error) return error;
     parse_moved(&s->p);
     if (!assign_ids(s, &s->p) || !slots_build(s)) { parse_free(&s->p); return CSSOM_OOM; }
+    s->live = s->p.length; s->garbage = 0;
     return CSSOM_OK;
 }
 static void sheet_free(struct cssom_sheet *s) {
@@ -433,13 +748,23 @@ static void sheet_free(struct cssom_sheet *s) {
     parse_free(&s->p); free(s->slots); free(s->base); free(s->media); free(s->dom_media);
     free(s->dom_source); free(s->dom_href); free(s->href); free(s);
 }
-struct cssom_sheet *cssom_construct(web_doc *d, int *error) {
+struct cssom_sheet *cssom_construct(web_doc *d, int *error) { return cssom_construct_based(d, NULL, error); }
+/* CSSOM "create a constructed CSSStyleSheet": its stylesheet base URL is
+   options' baseURL, a URL against the document's base URL. (Its href stays
+   null, as the engines and tests/browserfreezetest.c have it, not the
+   document's base URL the draft names its location.) */
+struct cssom_sheet *cssom_construct_based(web_doc *d, const char *base_url, int *error) {
     *error = CSSOM_OK;
     node_t *owner = d->root;
     if (owner->cssom_serial == UINT32_MAX) { *error = CSSOM_OOM; return NULL; }
+    char *base = NULL;
+    if (base_url) {
+        int resolved = web_resolve_url_owned(d->base ? d->base : "", base_url, &base);
+        if (resolved != 1) { *error = resolved < 0 ? CSSOM_OOM : CSSOM_NOT_ALLOWED; return NULL; }
+    }
     struct cssom_sheet *s = calloc(1, sizeof *s);
-    if (!s) { *error = CSSOM_OOM; return NULL; }
-    s->document = d; s->base = strdup(d->base ? d->base : "");
+    if (!s) { free(base); *error = CSSOM_OOM; return NULL; }
+    s->document = d; s->base = base ? base : strdup(d->base ? d->base : "");
     *error = s->base ? sheet_parse(s, "", 0) : CSSOM_OOM;
     if (*error) { sheet_free(s); return NULL; }
     s->owner = owner; s->id = ++owner->cssom_serial;
@@ -468,10 +793,14 @@ int cssom_replace_sync(struct cssom_sheet *s, const char *text, size_t length) {
     int count = 0;
     for (uint32_t i = 0; i < fresh.count;) {
         for (count = 0; i < fresh.count && count < 64; i++) if (fresh.top[i]->type == CSS_RULE_IMPORT)
-            edits[count++] = (struct edit){rule_at(&fresh, fresh.top[i]), rule_end(&fresh, fresh.top[i]), "", 0, SIZE_MAX};
+            edits[count++] = (struct edit){(size_t)(fresh.top[i]->text - fresh.source),
+                                           (size_t)(fresh.top[i]->text - fresh.source) + fresh.top[i]->text_len, "", 0, SIZE_MAX};
         if (!count) break;
         char *t; size_t n; uint32_t *markers, nmarkers;
-        if (!apply_edits(&fresh, edits, count, &t, &n, &markers, &nmarkers)) { parse_free(&fresh); return CSSOM_OOM; }
+        struct offsets none = {0};
+        if (!apply_edits(fresh.source, fresh.length, &none, edits, count, &t, &n, &markers, &nmarkers)) {
+            parse_free(&fresh); return CSSOM_OOM;
+        }
         struct cssom_parse without;
         error = parse_text(s->document, s->base, &without, t, n, markers, nmarkers);
         free(t); free(markers);
@@ -493,6 +822,7 @@ int cssom_replace_sync(struct cssom_sheet *s, const char *text, size_t length) {
         slots_build(s);
         return CSSOM_OOM;
     }
+    s->live = s->p.length; s->garbage = 0;
     cssom_changed(s); /* unpublish borrowed AST pointers before releasing */
     if (!old) parse_free(&previous);
     return CSSOM_OK;
@@ -514,6 +844,41 @@ static int link_origin_clean(web_doc *d,const struct cssom_link_source *source,b
     *clean=!error&&a==WEB_URL_TUPLE&&b==WEB_URL_TUPLE&&c==WEB_URL_TUPLE&&
         !strcmp(origin,request)&&!strcmp(origin,final);
     free(origin);free(request);free(final);return error;
+}
+struct cssom_sheet *cssom_import_child(const struct cssom_sheet *s, uint32_t rule_id) {
+    for (struct cssom_sheet *c = s->owner ? s->owner->cssom_sheets : NULL; c; c = c->next)
+        if (c->parent == s && c->owner_rule == rule_id) return c;
+    return NULL;
+}
+/* An @import rule's sheet is its resource's text in a sheet of its own (CSS
+   Cascade 5 "fetch an @import": its parent the rule's sheet, its location the
+   rule's URL), kept in the list of the owner of the rule's sheet so that it
+   lives as long as that sheet and the ids of both find it. */
+struct cssom_sheet *cssom_import_sheet(struct cssom_sheet *s, const struct css_rule_info *r, int *error) {
+    *error = CSSOM_OK;
+    if (!r || r->type != CSS_RULE_IMPORT || !r->import || !r->import->url) return NULL;
+    struct cssom_sheet *c = cssom_import_child(s, r->id);
+    node_t *owner = s->owner;
+    if (c || !owner) return c;
+    if (owner->cssom_serial == UINT32_MAX) { *error = CSSOM_OOM; return NULL; }
+    struct cssom_link_source source;
+    int status = doc_cssom_import_source(s->document, r->import->url, &source);
+    if (status) { if (status == CSSOM_OOM) *error = status; return NULL; }
+    c = calloc(1, sizeof *c);
+    if (!c) *error = CSSOM_OOM;
+    else {
+        c->document = s->document;
+        c->base = strdup(source.base ? source.base : "");
+        c->href = strdup(source.url);
+        *error = c->base && c->href ? link_origin_clean(s->document, &source, &c->origin_clean) : CSSOM_OOM;
+        if (!*error) *error = sheet_parse(c, source.text, source.length);
+    }
+    free(source.url); free(source.owned_text);
+    if (*error) { if (c) sheet_free(c); return NULL; }
+    c->owner = owner; c->id = ++owner->cssom_serial;
+    c->parent = s; c->owner_rule = r->id;
+    c->next = owner->cssom_sheets; owner->cssom_sheets = c;
+    return c;
 }
 static bool available(web_doc *d,node_t *n,int *error) {
     if(!active(d,n))return false;
@@ -768,26 +1133,53 @@ static bool nested(const struct css_rule_info *r) {
     }
     return false;
 }
-/* CSSStyleRule.selectorText: the parsed selectors serialized; a nested rule's
-   relative selectors absolutized with the nesting selector (CSS Nesting 3) */
-static void selector_text(const struct css_rule_info *r, sbuf *out) {
-    if (!nested(r)) {
-        size_t at = out->n;
-        css_rule_selector_serialize(r, out);
-        if (out->n == at) prelude(r, out);
-        return;
+/* The nesting selector as the selector serializer takes it: in a forgiving
+   :is(), which keeps an argument it cannot parse as written. Every & of the
+   text goes in so, so every one that comes out was one. */
+#define NESTING_STAND_IN ":is(&)"
+/* s with each & outside strings and escapes replaced by with (with_n bytes) */
+static void put_nesting(sbuf *out, const char *s, size_t n, const char *with, size_t with_n, size_t from_n) {
+    char quote = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == '\\' && i + 1 < n) { sb_put(out, s + i, 2); i++; continue; }
+        if (quote) { if (c == quote) quote = 0; sb_putc(out, c); continue; }
+        if (c == '"' || c == '\'') quote = c;
+        if (!quote && n - i >= from_n && !memcmp(s + i, from_n == 1 ? "&" : NESTING_STAND_IN, from_n)) {
+            sb_put(out, with, with_n);
+            i += from_n - 1;
+        } else sb_putc(out, c);
     }
+}
+/* A nested rule's selectors (CSS Nesting 1): each relative selector made
+   absolute, "& " before one with no nesting selector or that starts with a
+   combinator, and the whole list serialized as a group of selectors in the
+   sheet's namespaces. false: it does not parse so. */
+static bool nested_selector_text(const sheet_t *ast, const struct css_rule_info *r, sbuf *out) {
     const char *t = prelude_text(r);
     size_t n = r->prelude_len;
+    sbuf in = {0}, serialized = {0};
     for (size_t at = 0;;) {
         size_t end = piece_end(t, at, n), a = at, z = end;
         trim(t, &a, &z);
-        if (at) sb_puts(out, ", ");
-        if (!has_char(t + a, z - a, "&")) sb_puts(out, "& ");
-        put_collapsed(out, t + a, z - a);
+        if (at) sb_puts(&in, ", ");
+        if (a < z && (!has_char(t + a, z - a, "&") || strchr("+>~", t[a]))) sb_puts(&in, NESTING_STAND_IN " ");
+        put_nesting(&in, t + a, z - a, NESTING_STAND_IN, strlen(NESTING_STAND_IN), 1);
         if (end >= n) break;
         at = end + 1;
     }
+    bool ok = css_selectors_serialize(ast, in.p ? in.p : "", in.n, &serialized);
+    if (ok) put_nesting(out, serialized.p ? serialized.p : "", serialized.n, "&", 1, strlen(NESTING_STAND_IN));
+    sb_free(&in); sb_free(&serialized);
+    return ok;
+}
+/* CSSStyleRule.selectorText: the parsed selectors serialized; a nested rule's
+   relative selectors absolutized with the nesting selector (CSS Nesting 3) */
+static void selector_text(const sheet_t *ast, const struct css_rule_info *r, sbuf *out) {
+    size_t at = out->n;
+    if (!nested(r)) css_rule_selector_serialize(r, out);
+    else if (nested_selector_text(ast, r, out)) return;
+    if (out->n == at) prelude(r, out);
 }
 /* a media query list as CSSOM serializes it */
 static bool media_of(const char *text, size_t n, sbuf *out) {
@@ -944,11 +1336,25 @@ css_decl_check *cssom_declaration_check(const struct css_rule_info *r) {
     default: return NULL;
     }
 }
-static void declarations(const struct css_rule_info *r, sbuf *out) {
+/* the rule's declarations as a block's text (block) or serialized (out, with
+   their names) */
+static bool rule_block(const struct css_rule_info *r, sbuf *block, sbuf *out, sbuf *names) {
     const char *text; size_t n;
     cssom_declarations(r, &text, &n);
-    css_decl_serialize(text, n, cssom_declaration_check(r), out, NULL);
+    css_decl_check *check = cssom_declaration_check(r);
+    sbuf kept = {0};
+    if (r && r->type == CSS_RULE_KEYFRAME) {
+        /* CSS Animations 1: a keyframe's !important declarations are invalid */
+        css_decl_drop_important(text, n, &kept);
+        text = kept.p ? kept.p : ""; n = kept.n;
+    }
+    bool ok = block ? css_decl_block(text, n, check, block) : css_decl_serialize(text, n, check, out, names);
+    sb_free(&kept);
+    return ok;
 }
+bool cssom_block(const struct css_rule_info *r, sbuf *block) { return rule_block(r, block, NULL, NULL); }
+bool cssom_block_serialize(const struct css_rule_info *r, sbuf *out, sbuf *names) { return rule_block(r, NULL, out, names); }
+static void declarations(const struct css_rule_info *r, sbuf *out) { cssom_block_serialize(r, out, NULL); }
 /* a descriptor's value in a rule's declaration block; false: none */
 static bool descriptor(const struct css_rule_info *r, const char *name, sbuf *out) {
     sbuf block = {0};
@@ -1082,15 +1488,15 @@ static void features_text(const struct features *f, sbuf *out) {
 }
 
 /* ---------------------------------------------------------------- serialize a CSS rule */
-static void serialize(const struct css_rule_info *r, sbuf *out);
+static void serialize(const sheet_t *ast, const struct css_rule_info *r, sbuf *out);
 /* a group rule's block (CSS Conditional 3): each child on a line of its own */
-static void group(const struct css_rule_info *r, sbuf *out) {
+static void group(const sheet_t *ast, const struct css_rule_info *r, sbuf *out) {
     sb_puts(out, " {");
     for (uint32_t i = 0; i < r->child_count; i++) {
         size_t at = out->n;
         sb_puts(out, "\n  ");
         size_t child = out->n;
-        serialize(r->children[i], out);
+        serialize(ast, r->children[i], out);
         if (out->n == child) out->n = at;
     }
     sb_puts(out, "\n}");
@@ -1104,11 +1510,11 @@ static void declaration_block(const struct css_rule_info *r, sbuf *out) {
     if (out->n == at + 1) out->n = at;
     sb_puts(out, " }");
 }
-static void serialize(const struct css_rule_info *r, sbuf *out) {
+static void serialize(const sheet_t *ast, const struct css_rule_info *r, sbuf *out) {
     switch (r->type) {
     case CSS_RULE_STYLE: {
         /* CSSOM 6.4.3, CSSStyleRule */
-        selector_text(r, out);
+        selector_text(ast, r, out);
         sbuf decls = {0};
         declarations(r, &decls);
         if (!r->child_count) {
@@ -1122,7 +1528,7 @@ static void serialize(const struct css_rule_info *r, sbuf *out) {
                 size_t at = out->n;
                 sb_puts(out, "\n  ");
                 size_t child = out->n;
-                serialize(r->children[i], out);
+                serialize(ast, r->children[i], out);
                 if (out->n == child) out->n = at;
             }
             sb_puts(out, "\n}");
@@ -1152,21 +1558,21 @@ static void serialize(const struct css_rule_info *r, sbuf *out) {
     case CSS_RULE_MEDIA:
         sb_puts(out, "@media ");
         media_of(prelude_text(r), r->prelude_len, out);
-        group(r, out);
+        group(ast, r, out);
         break;
-    case CSS_RULE_SUPPORTS: sb_puts(out, "@supports "); prelude(r, out); group(r, out); break;
-    case CSS_RULE_CONTAINER: sb_puts(out, "@container "); prelude(r, out); group(r, out); break;
+    case CSS_RULE_SUPPORTS: sb_puts(out, "@supports "); prelude(r, out); group(ast, r, out); break;
+    case CSS_RULE_CONTAINER: sb_puts(out, "@container "); prelude(r, out); group(ast, r, out); break;
     case CSS_RULE_LAYER_BLOCK:
         sb_puts(out, "@layer");
         if (r->prelude_len) { sb_putc(out, ' '); prelude(r, out); }
-        group(r, out);
+        group(ast, r, out);
         break;
     case CSS_RULE_SCOPE:
         sb_puts(out, "@scope");
         if (r->prelude_len) { sb_putc(out, ' '); prelude(r, out); }
-        group(r, out);
+        group(ast, r, out);
         break;
-    case CSS_RULE_STARTING_STYLE: sb_puts(out, "@starting-style"); group(r, out); break;
+    case CSS_RULE_STARTING_STYLE: sb_puts(out, "@starting-style"); group(ast, r, out); break;
     case CSS_RULE_LAYER_STATEMENT: {
         sb_puts(out, "@layer ");
         const char *t = prelude_text(r);
@@ -1190,7 +1596,7 @@ static void serialize(const struct css_rule_info *r, sbuf *out) {
         sb_putc(out, ' ');
         declarations(r, out);
         if (out->n == at + 1) out->n = at;
-        for (uint32_t i = 0; i < r->child_count; i++) { sb_putc(out, ' '); serialize(r->children[i], out); }
+        for (uint32_t i = 0; i < r->child_count; i++) { sb_putc(out, ' '); serialize(ast, r->children[i], out); }
         sb_puts(out, " }");
         break;
     }
@@ -1201,7 +1607,7 @@ static void serialize(const struct css_rule_info *r, sbuf *out) {
         sb_puts(out, "@keyframes ");
         put_keyframes_name(out, sb_cstr(&name));
         sb_free(&name);
-        group(r, out);
+        group(ast, r, out);
         break;
     }
     case CSS_RULE_KEYFRAME:
@@ -1238,9 +1644,16 @@ static void serialize(const struct css_rule_info *r, sbuf *out) {
     default: break;
     }
 }
+/* the AST of the parse a rule of s stands in (its namespaces); a rule of no
+   sheet (NULL) is read with none */
+static const sheet_t *ast_of(struct cssom_sheet *s, const struct css_rule_info *r) {
+    struct cssom_tree *tree = NULL;
+    if (!s) return NULL;
+    find(s, r->id, &tree);
+    return parse_of(s, tree)->ast;
+}
 void cssom_serialize(struct cssom_sheet *s, const struct css_rule_info *r, sbuf *out) {
-    (void)s;
-    if (r) serialize(r, out);
+    if (r) serialize(ast_of(s, r), r, out);
 }
 
 /* ---------------------------------------------------------------- attributes */
@@ -1298,7 +1711,7 @@ bool cssom_attribute(struct cssom_sheet *s, const struct css_rule_info *r, const
     if (!r) return false;
     uint32_t type = r->type;
     if (!strcmp(name, "selectorText")) {
-        if (type == CSS_RULE_STYLE) selector_text(r, out);
+        if (type == CSS_RULE_STYLE) selector_text(ast_of(s, r), r, out);
         else if (type == CSS_RULE_PAGE) prelude(r, out);
         else return false;
         return true;
@@ -1322,6 +1735,21 @@ bool cssom_attribute(struct cssom_sheet *s, const struct css_rule_info *r, const
     }
     if (!strcmp(name, "basePalette") && type == CSS_RULE_FONT_PALETTE_VALUES) { descriptor(r, "base-palette", out); return true; }
     if (!strcmp(name, "overrideColors") && type == CSS_RULE_FONT_PALETTE_VALUES) { descriptor(r, "override-colors", out); return true; }
+    if (!strcmp(name, "matches")) {
+        /* CSS Conditional 3: the rule's condition now, a media query list against
+           the document as matchMedia() evaluates it, @supports as the cascade */
+        bool matches;
+        if (type == CSS_RULE_MEDIA) {
+            sbuf query = {0};
+            sb_put(&query, prelude_text(r), r->prelude_len);
+            web_doc *d = s->document;
+            matches = css_media_evaluate(sb_cstr(&query), d->width, d->height, web_js_enabled(d), NULL, 0);
+            sb_free(&query);
+        } else if (type == CSS_RULE_SUPPORTS) matches = css_supports_condition(prelude_text(r), r->prelude_len, false);
+        else return false;
+        sb_puts(out, matches ? "true" : "false");
+        return true;
+    }
     if (!strcmp(name, "conditionText")) {
         if (type == CSS_RULE_MEDIA) media_of(prelude_text(r), r->prelude_len, out);
         else if (type == CSS_RULE_SUPPORTS || type == CSS_RULE_CONTAINER) prelude(r, out);
@@ -1393,19 +1821,20 @@ bool cssom_attribute(struct cssom_sheet *s, const struct css_rule_info *r, const
 }
 
 /* ---------------------------------------------------------------- changes to one rule's text */
+/* at, end: in the text of r's top-level rule */
 static int change_text(struct cssom_sheet *s, struct cssom_tree *tree, struct css_rule_info *r, size_t at, size_t end,
                        const char *text, size_t n, const char *prelude_new, size_t prelude_n, bool marker) {
-    struct change c = {.tree = tree, .count = 1, .kind = CHANGE_SAME, .node = r, .prelude = prelude_new, .prelude_n = prelude_n};
+    struct change c = {.tree = tree, .top = top_of(r), .count = 1, .kind = CHANGE_SAME, .node = r,
+                       .prelude = prelude_new, .prelude_n = prelude_n};
     c.edits[0] = (struct edit){at, end, text, n, marker ? 0 : SIZE_MAX};
     return rebuild(s, &c);
 }
 /* a rule's prelude replaced by text (comment-free, trimmed) */
 static int set_prelude(struct cssom_sheet *s, struct cssom_tree *tree, struct css_rule_info *r, const char *text, size_t n) {
-    struct cssom_parse *p = parse_of(s, tree);
-    size_t at = rule_at(p, r) + r->prelude_at;
+    size_t at = rule_at(r) + r->prelude_at;
     /* an empty prelude stands where the name ends: keep the two apart */
     sbuf b = {0};
-    bool apart = !r->prelude_len && n && at > 0 && !is_space((unsigned char)p->source[at - 1]);
+    bool apart = !r->prelude_len && n && r->prelude_at > 0 && !is_space((unsigned char)r->text[r->prelude_at - 1]);
     if (apart) sb_putc(&b, ' ');
     sb_put(&b, text, n);
     if (!r->prelude_len && n && r->block) sb_putc(&b, ' ');
@@ -1457,7 +1886,7 @@ int cssom_set_attribute(struct cssom_sheet *s, uint32_t id, const char *name, co
         const char *d; size_t dn;
         cssom_declarations(r, &d, &dn);
         sbuf block = {0};
-        css_decl_serialize(d, dn, descriptor_check, &block, NULL);
+        css_decl_block(d, dn, descriptor_check, &block);
         int status = css_decl_set(block.p ? block.p : "", block.n, counter_descriptor(name), text, NULL, descriptor_check, &b);
         sb_free(&block);
         if (status > 0) error = cssom_set_declarations(s, id, b.p ? b.p : "", b.n);
@@ -1474,20 +1903,19 @@ int cssom_set_declarations(struct cssom_sheet *s, uint32_t id, const char *value
     char *text = clean_text(value, length, &n);
     if (!text) return CSSOM_OOM;
     sbuf decls = {0};
-    bool ok = css_decl_serialize(text, n, cssom_declaration_check(r), &decls, NULL);
+    bool ok = css_decl_block(text, n, cssom_declaration_check(r), &decls);
     free(text);
     if (!ok) { sb_free(&decls); return CSSOM_OOM; }
     int error = CSSOM_OK;
     if (css_decl_balanced(decls.p ? decls.p : "", decls.n)) {
-        struct cssom_parse *p = parse_of(s, tree);
         if (plain_nested(r)) {
             /* its own text cannot keep it apart once changed: the marker form */
             sbuf m = {0};
             marker_text(&m, decls.p ? decls.p : "", decls.n);
-            error = change_text(s, tree, r, rule_at(p, r), rule_end(p, r), m.p, m.n, NULL, 0, true);
+            error = change_text(s, tree, r, rule_at(r), rule_end(r), m.p, m.n, NULL, 0, true);
             sb_free(&m);
         } else {
-            size_t at = rule_at(p, r) + r->decls_at;
+            size_t at = rule_at(r) + r->decls_at;
             error = change_text(s, tree, r, at, at + r->decls_len, decls.p ? decls.p : "", decls.n, NULL, 0, false);
         }
         if (error == CSSOM_SYNTAX) error = CSSOM_OK;
@@ -1523,10 +1951,9 @@ static int media_store(struct cssom_sheet *s, struct cssom_tree *tree, struct cs
         cssom_changed(s);
         return CSSOM_OK;
     }
-    struct cssom_parse *p = parse_of(s, tree);
     if (r->type == CSS_RULE_MEDIA) {
         /* the prelude, between the name and the block */
-        size_t at = rule_at(p, r) + name_end(r), end = rule_at(p, r) + r->block_at - 1;
+        size_t at = rule_at(r) + name_end(r), end = rule_at(r) + r->block_at - 1;
         sbuf b = {0};
         sb_putc(&b, ' '); sb_put(&b, list, n); sb_putc(&b, ' ');
         int error = change_text(s, tree, r, at, end, b.p, b.n, list, n, false);
@@ -1535,7 +1962,7 @@ static int media_store(struct cssom_sheet *s, struct cssom_tree *tree, struct cs
     }
     sbuf b = {0};
     import_text(r->import, list, n, &b);
-    int error = change_text(s, tree, r, rule_at(p, r), rule_end(p, r), b.p, b.n, NULL, 0, false);
+    int error = change_text(s, tree, r, rule_at(r), rule_end(r), b.p, b.n, NULL, 0, false);
     sb_free(&b);
     return error;
 }
@@ -1624,12 +2051,11 @@ int cssom_set_feature_values(struct cssom_sheet *s, uint32_t id, const char *blo
         sb_free(&list);
     }
     /* the rule's block, rewritten */
-    struct cssom_parse *p = parse_of(s, tree);
     sbuf b = {0};
     features_text(&f, &b);
     sb_putc(&b, ' ');
     features_free(&f);
-    size_t at = rule_at(p, r) + r->block_at;
+    size_t at = rule_at(r) + r->block_at;
     int error = change_text(s, tree, r, at, at + r->block_len, b.p, b.n, NULL, 0, false);
     sb_free(&b);
     return error == CSSOM_SYNTAX ? CSSOM_OK : error;
@@ -1641,44 +2067,55 @@ static bool nested_list(const struct css_rule_info *container) {
     for (const struct css_rule_info *a = container; a; a = a->parent) if (a->type == CSS_RULE_STYLE) return true;
     return false;
 }
-/* parse a CSS rule in the list's place: text closed as end of input would
-   close it, into out; its kind; marker when it became nested declarations */
-static int candidate(struct cssom_sheet *s, const struct cssom_parse *p, const struct css_rule_info *container,
-                     const char *text, size_t length, sbuf *out, uint32_t *kind, bool *marker) {
-    *marker = false; *kind = 0;
+/* a CSS rule's text as insertRule parses it: clean, and closed as end of
+   input would close it */
+static int rule_text(const char *text, size_t length, sbuf *t) {
     size_t n;
     char *clean = clean_text(text, length, &n);
     if (!clean) return CSSOM_OOM;
     if (!n) { free(clean); return CSSOM_SYNTAX; }
-    sbuf t = {0}, tail = {0};
+    sbuf tail = {0};
     bool stray;
-    sb_put(&t, clean, n);
+    sb_put(t, clean, n);
     free(clean);
-    closers(t.p, t.n, &tail, &stray);
-    if (stray) { sb_free(&t); sb_free(&tail); return CSSOM_SYNTAX; }
-    sb_put(&t, tail.p ? tail.p : "", tail.n);
+    closers(t->p, t->n, &tail, &stray);
+    if (stray) { sb_free(&tail); return CSSOM_SYNTAX; }
+    sb_put(t, tail.p ? tail.p : "", tail.n);
     sb_free(&tail);
-    if (t.p[t.n - 1] != '}' && t.p[t.n - 1] != ';') sb_putc(&t, ';');
-    int error;
-    /* @import and @namespace parse only at the top, before other rules */
+    if (t->p[t->n - 1] != '}' && t->p[t->n - 1] != ';') sb_putc(t, ';');
+    return CSSOM_OK;
+}
+/* @import and @namespace parse only at the top, before other rules: the kind
+   of a rule's text when it is one of them, alone (0: neither) */
+static int alone_kind(struct cssom_sheet *s, const sbuf *t, uint32_t *kind) {
+    *kind = 0;
+    if (t->p[0] != '@') return CSSOM_OK;
     struct cssom_parse alone;
-    error = parse_text(s->document, s->base, &alone, t.p, t.n, NULL, 0);
-    if (error) { sb_free(&t); return error; }
-    if (alone.count == 1 && rule_at(&alone, alone.top[0]) == 0 && alone.top[0]->text_len == t.n &&
+    int error = parse_text(s->document, s->base, &alone, t->p, t->n, NULL, 0);
+    if (error) return error;
+    if (alone.count == 1 && alone.top[0]->text == alone.source && alone.top[0]->text_len == t->n &&
         (alone.top[0]->type == CSS_RULE_IMPORT || alone.top[0]->type == CSS_RULE_NAMESPACE))
         *kind = alone.top[0]->type;
     parse_free(&alone);
+    return CSSOM_OK;
+}
+/* parse a CSS rule (t, from rule_text; *kind from alone_kind) in the list's
+   place, into out; its kind; marker when it became nested declarations */
+static int candidate(struct cssom_sheet *s, const struct cssom_parse *p, const struct css_rule_info *container,
+                     const sbuf *t, sbuf *out, uint32_t *kind, bool *marker) {
+    *marker = false;
+    int error;
     if (!*kind) {
         sbuf context = {0};
         uint32_t namespaces, depth = context_text(p, container, 0, &context, &namespaces);
-        if (depth == UINT32_MAX) { sb_free(&t); sb_free(&context); return CSSOM_OOM; }
+        if (depth == UINT32_MAX) { sb_free(&context); return CSSOM_OOM; }
         size_t base = context.n;
-        sb_put(&context, t.p, t.n);
+        sb_put(&context, t->p, t->n);
         for (uint32_t i = 0; i < depth; i++) sb_puts(&context, "\n}");
         struct cssom_parse in;
         error = parse_text(s->document, s->base, &in, context.p, context.n, NULL, 0);
         sb_free(&context);
-        if (error) { sb_free(&t); return error; }
+        if (error) return error;
         struct css_rule_info *const *list = in.top + (namespaces < in.count ? namespaces : in.count);
         uint32_t count = namespaces < in.count ? in.count - namespaces : 0;
         if (container) {
@@ -1686,14 +2123,13 @@ static int candidate(struct cssom_sheet *s, const struct cssom_parse *p, const s
             list = copy ? copy->children : NULL;
             count = copy ? copy->child_count : 0;
         }
-        if (count == 1 && rule_at(&in, list[0]) == base && list[0]->text_len == t.n) *kind = list[0]->type;
+        if (count == 1 && (size_t)(list[0]->text - in.source) == base && list[0]->text_len == t->n) *kind = list[0]->type;
         parse_free(&in);
     }
     if (*kind == CSS_RULE_NESTED_DECLARATIONS || (!*kind && nested_list(container))) {
         /* insert a CSS rule, step 4: nested declarations of what parses as a declaration block */
         sbuf decls = {0};
-        bool ok = css_decl_serialize(t.p, t.n, NULL, &decls, NULL);
-        sb_free(&t);
+        bool ok = css_decl_block(t->p, t->n, NULL, &decls);
         if (!ok) { sb_free(&decls); return CSSOM_OOM; }
         if (!decls.n || !css_decl_balanced(decls.p, decls.n)) { sb_free(&decls); return CSSOM_SYNTAX; }
         marker_text(out, decls.p, decls.n);
@@ -1701,28 +2137,31 @@ static int candidate(struct cssom_sheet *s, const struct cssom_parse *p, const s
         *kind = CSS_RULE_NESTED_DECLARATIONS; *marker = true;
         return CSSOM_OK;
     }
-    if (!*kind) { sb_free(&t); return CSSOM_SYNTAX; }
-    sb_put(out, t.p, t.n);
-    sb_free(&t);
+    if (!*kind) return CSSOM_SYNTAX;
+    sb_put(out, t->p, t->n);
     return CSSOM_OK;
 }
 /* insert a CSS rule, steps 6 and 7, at the top of a sheet (CSS Cascade 5,
    CSS Namespaces 3: @import and @namespace precede every other rule but
-   @layer statements, @import first) */
+   @layer statements, @import first). They stand only before the first other
+   rule, so the rules after it are other rules. */
 static int top_order(const struct cssom_parse *p, uint32_t kind, uint32_t index) {
     bool import_before = false, namespace_before = false, import_after = false, namespace_after = false, other = false;
     for (uint32_t i = 0; i < p->count; i++) {
         uint32_t t = p->top[i]->type;
+        if (!prefix_rule(p->top[i])) {
+            if (i < index && (kind == CSS_RULE_IMPORT || kind == CSS_RULE_NAMESPACE)) return CSSOM_HIERARCHY;
+            other = true;
+            break;
+        }
         if (i < index) {
-            if (kind == CSS_RULE_IMPORT && t != CSS_RULE_IMPORT && t != CSS_RULE_LAYER_STATEMENT) return CSSOM_HIERARCHY;
+            if (kind == CSS_RULE_IMPORT && t == CSS_RULE_NAMESPACE) return CSSOM_HIERARCHY;
             if (kind == CSS_RULE_IMPORT && t == CSS_RULE_LAYER_STATEMENT && import_before) return CSSOM_HIERARCHY;
-            if (kind == CSS_RULE_NAMESPACE && t != CSS_RULE_IMPORT && t != CSS_RULE_NAMESPACE && t != CSS_RULE_LAYER_STATEMENT)
-                return CSSOM_HIERARCHY;
             import_before |= t == CSS_RULE_IMPORT; namespace_before |= t == CSS_RULE_NAMESPACE;
         } else {
             import_after |= t == CSS_RULE_IMPORT; namespace_after |= t == CSS_RULE_NAMESPACE;
         }
-        other |= t != CSS_RULE_IMPORT && t != CSS_RULE_NAMESPACE;
+        other |= t == CSS_RULE_LAYER_STATEMENT;
     }
     if (kind == CSS_RULE_IMPORT) return CSSOM_OK;
     if (kind == CSS_RULE_NAMESPACE) return import_after ? CSSOM_HIERARCHY : other ? CSSOM_INVALID_STATE : CSSOM_OK;
@@ -1741,28 +2180,40 @@ int cssom_insert(struct cssom_sheet *s, uint32_t parent, const char *text, size_
     struct css_rule_info **list = children(p, container, &count);
     if (index > count) return CSSOM_INDEX;
     if (count == UINT32_MAX || s->next_rule_id == UINT32_MAX) return CSSOM_OOM;
-    sbuf rule = {0};
-    uint32_t kind;
-    bool marker;
-    int error = candidate(s, p, container, text, length, &rule, &kind, &marker);
+    sbuf t = {0}, rule = {0};
+    uint32_t kind = 0;
+    bool marker = false;
+    int error = rule_text(text, length, &t);
+    if (!error) error = alone_kind(s, &t, &kind);
+    if (!error && !container && !kind && css_cssom_spliceable(p->ast)) {
+        /* the one rule parsed, alone in the sheet's context */
+        error = insert_top(s, t.p, t.n, index);
+        sb_free(&t);
+        return error;
+    }
+    if (!error) error = candidate(s, p, container, &t, &rule, &kind, &marker);
+    sb_free(&t);
     if (!error && kind == CSS_RULE_IMPORT && s->constructed && !container) error = CSSOM_SYNTAX;
     if (!error && container && (kind == CSS_RULE_IMPORT || kind == CSS_RULE_NAMESPACE)) error = CSSOM_HIERARCHY;
     if (!error && !container) error = top_order(p, kind, index);
     if (error) { sb_free(&rule); return error; }
-    size_t at = index < count ? rule_at(p, list[index]) :
-        container ? rule_at(p, container) + container->block_at + container->block_len : p->length;
-    /* text before it that does not end a declaration or a rule: end it */
-    size_t k = at;
-    while (k > 0 && is_space((unsigned char)p->source[k - 1])) k--;
-    sbuf b = {0};
-    if (k > 0 && !strchr(";{}", p->source[k - 1])) sb_putc(&b, ';');
-    sb_putc(&b, '\n');
-    size_t prefix = b.n;
-    sb_put(&b, rule.p, rule.n);
-    sb_putc(&b, '\n');
     struct change c = {.tree = tree, .count = 1, .kind = CHANGE_INSERT, .container = container, .index = index,
-                       .insert_at = at + prefix, .insert_n = rule.n};
-    c.edits[0] = (struct edit){at, at, b.p, b.n, marker ? prefix : SIZE_MAX};
+                       .insert_n = rule.n};
+    sbuf b = {0};
+    if (container) {
+        struct css_rule_info *top = top_of(container);
+        size_t at = index < count ? rule_at(list[index]) : rule_at(container) + container->block_at + container->block_len;
+        /* text before it that does not end a declaration or a rule: end it */
+        size_t k = at;
+        while (k > 0 && is_space((unsigned char)top->text[k - 1])) k--;
+        if (k > 0 && !strchr(";{}", top->text[k - 1])) sb_putc(&b, ';');
+        sb_putc(&b, '\n');
+        size_t prefix = b.n;
+        sb_put(&b, rule.p, rule.n);
+        sb_putc(&b, '\n');
+        c.top = top; c.insert_at = at + prefix;
+        c.edits[0] = (struct edit){at, at, b.p, b.n, marker ? prefix : SIZE_MAX};
+    } else c.edits[0] = (struct edit){0, 0, rule.p, rule.n, marker ? 0 : SIZE_MAX};
     error = rebuild(s, &c);
     sb_free(&b); sb_free(&rule);
     return error;
@@ -1780,8 +2231,10 @@ int cssom_delete(struct cssom_sheet *s, uint32_t parent, uint32_t index) {
     if (!container && r->type == CSS_RULE_NAMESPACE)
         for (uint32_t i = 0; i < count; i++)
             if (list[i]->type != CSS_RULE_IMPORT && list[i]->type != CSS_RULE_NAMESPACE) return CSSOM_INVALID_STATE;
-    struct change c = {.tree = tree, .count = 1, .kind = CHANGE_DELETE, .node = r};
-    c.edits[0] = (struct edit){rule_at(p, r), rule_end(p, r), "", 0, SIZE_MAX};
+    if (!container && css_cssom_spliceable(p->ast) && r->type != CSS_RULE_IMPORT && r->type != CSS_RULE_NAMESPACE)
+        return delete_top(s, r);
+    struct change c = {.tree = tree, .top = top_of(r), .count = 1, .kind = CHANGE_DELETE, .node = r};
+    c.edits[0] = (struct edit){rule_at(r), rule_end(r), "", 0, SIZE_MAX};
     /* Nested declarations that the removal would bring beside the rule's own
        declarations, or beside other nested declarations, keep apart as the
        marker form. */
@@ -1794,7 +2247,7 @@ int cssom_delete(struct cssom_sheet *s, uint32_t parent, uint32_t index) {
         declarations(next, &decls);
         marker_text(&m, decls.p ? decls.p : "", decls.n);
         sb_free(&decls);
-        c.edits[1] = (struct edit){rule_at(p, next), rule_end(p, next), m.p, m.n, 0};
+        c.edits[1] = (struct edit){rule_at(next), rule_end(next), m.p, m.n, 0};
         c.count = 2;
     }
     int error = rebuild(s, &c);

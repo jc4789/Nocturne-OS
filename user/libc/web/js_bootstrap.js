@@ -1253,7 +1253,11 @@
     function styleNames(value){
         const record=styleRecord(value);
         if(!record.computed)return styleBlock(record).slice(1);
-        const custom=host.cssProperties(record.node,record.pseudo);if(custom===null)return [];
+        return computedNames(record.node,record.pseudo);
+    }
+    /* an element's computed properties: the longhands, then its valid custom properties */
+    function computedNames(node,pseudo){
+        const custom=host.cssProperties(node,pseudo);if(custom===null)return [];
         const names=[],seen=new Set();for(const [name,valid] of custom){if(seen.has(name))continue;seen.add(name);if(valid)names.push(name);}
         return longhandNames().concat(names);
     }
@@ -1354,11 +1358,19 @@
         transport:{noCors:()=>!!host.noCorsFetch,streaming:()=>!!host.streamingFetch,
             fetch:(q,notify)=>host.fetch(q.url,q.method,q.headers,q.body,q.sameOrigin,q.credentials,q.forcePreflight,q.redirectError?1:q.redirectManual?2:0,q.cache,
                 q.keepalive,q.noCors,q.noReferrer,notify,q.referrer,q.referrerPolicy,q.destination),
+            /* A synchronous XMLHttpRequest's: host.fetchWait pauses this event loop until the
+               request is done (js.c native_fetch_wait). */
+            fetchSync:host.syncFetch?(q,timeout,initiator)=>{
+                const id=host.fetch(q.url,q.method,q.headers,q.body,q.sameOrigin,q.credentials,q.forcePreflight,q.redirectError?1:q.redirectManual?2:0,q.cache,
+                    q.keepalive,q.noCors,q.noReferrer,undefined,q.referrer,q.referrerPolicy,q.destination,true).id;
+                if(initiator)initiator(id);
+                return host.fetchWait(id);
+            }:undefined,
             resume:id=>host.resumeFetch(id),cancel:id=>host.cancel(id),keepaliveRoom:()=>host.keepaliveRoom()},
         baseURL:()=>rawDom.get(document,'baseURI'),origin:()=>rawDom.get(document,'fetchOrigin'),
         clientReferrer:()=>rawDom.get(document,'fetchClientReferrer'),referrerPolicy:()=>rawDom.get(document,'referrerPolicy'),
         url:()=>host.url(),dataURL:url=>host.dataURL(url),task:fn=>host.timer(0,fn,0,[]),clearTask:id=>host.clear(id),
-        digest:(algorithm,bytes)=>host.cryptoDigest(algorithm,bytes),initiator:id=>performanceBridge.initiator(id,'xmlhttprequest')});
+        digest:(algorithm,bytes)=>host.cryptoDigest(algorithm,bytes),initiator:(id,type)=>performanceBridge.initiator(id,type)});
     const {Headers,Request,Response,fetch}=fetchBridge;
     const location={assign(url){host.navigate(String(url),0);},replace(url){host.navigate(String(url),2);},reload(){host.navigate(host.url(),1);},toString(){return this.href;}};
     Object.defineProperties(location,{href:{get(){return host.url();},set(v){host.navigate(htmlSafetyBridge.navigationInput(v));}}});
@@ -1445,7 +1457,7 @@
     const xhr=xhrInterfaces({fetch:fetchBridge,
         parseURL:url=>urlBridge.encodingParse(url,rawDom.get(document,'baseURI'),rawDom.get(document,'characterSet')),
         listened(target){const list=listenerList(target);if(list)for(let i=0;i<list.length;i++)if(!list[i].removed)return true;return false;},
-        log:text=>host.log(1,text),synchronous:false,
+        log:text=>host.log(1,text),synchronous:!!host.syncFetch,
         document:{is:value=>value instanceof Document,
             body(value){const html=rawDom.get(value,'htmlDocument');
                 return [html?'text/html;charset=UTF-8':'application/xml;charset=UTF-8',(html?rawDom.get(value,'innerHTML'):rawDom.get(value,'xmlSerialization'))??''];},
@@ -1537,6 +1549,22 @@
     /* @include js_attributes.js */
     /* @include js_shadow.js */
     /* @include js_stylesheets.js */
+    /* @include js_typed_om.js */
+    {
+        /* CSS Typed OM's maps over the declaration blocks above (an inline style's, a rule's) and an
+           element's computed values */
+        const typedOM=typedOMInterfaces({native:host,geometry:geometryBridge,DOMException,css:CSS,declarations:{
+            read:(block,name)=>styleRead(block,name),write:(block,name,text)=>styleWrite(block,name,text),names:block=>styleNames(block),
+            computed:(element,name)=>dom('computed',element,name,null,true),computedNames:element=>computedNames(element,'')}});
+        const elementOf=v=>{if(!rawDom.isNode(null,v)||rawDom.get(v,'nodeType')!==1)throw new TypeError('Expected an Element');return v;};
+        Object.defineProperty(Element.prototype,'attributeStyleMap',{configurable:true,enumerable:true,
+            get:{attributeStyleMap(){return typedOM.declaredMap(inlineStyle(this));}}.attributeStyleMap});
+        Object.defineProperty(Element.prototype,'computedStyleMap',{configurable:true,enumerable:true,writable:true,
+            value:{computedStyleMap(){return typedOM.computedMap(elementOf(this));}}.computedStyleMap});
+        const ruleStyle=Object.getOwnPropertyDescriptor(CSSStyleRule.prototype,'style').get;
+        Object.defineProperty(CSSStyleRule.prototype,'styleMap',{configurable:true,enumerable:true,
+            get:{styleMap(){return typedOM.declaredMap(Reflect.apply(ruleStyle,this,[]));}}.styleMap});
+    }
     /* @include js_font_loading.js */
     /* @include js_animations.js */
     /* @include js_web_legacy.js */
@@ -1721,9 +1749,12 @@
         hover,
         customElementBefore(...args){
             const reactionArgs=args[0]==='adopt' && args[2] && rawDom.get(args[2],'nodeType')!==2?['remove',args[2]]:args;
-            const reactionNode=customElementsBridge.active()?(args[0]==='adopt' && args[2] && rawDom.get(args[2],'nodeType')===2?rawDom.get(args[2],'attrOwner'):reactionArgs[1]):null;
-            const ceActive=customElementsBridge.active()&&(['clone','import'].includes(args[0]) || reactionNode && rawDom.get(reactionNode,'scripting') || args[0]==='adopt' && rawDom.get(args[1],'scripting'));
-            const ce=ceActive?customElementsBridge.before(...args):null;
+            /* HTML and DOM choose custom element reactions by an element's registry and state
+               ("look up a custom element definition", insert, remove, adopt), never by whether
+               its document runs script: a document without a browsing context has a null
+               registry, yet a scoped registry's element inserted there joins that registry's
+               scoped document set and its define upgrades the element. */
+            const ce=customElementsBridge.active()?customElementsBridge.before(...args):null;
             let mutationArgs=reactionArgs;
             /* a move's live range and NodeIterator updates are those of a removal and insertion */
             if(args[0]==='move')mutationArgs=['insert',...args.slice(1)];

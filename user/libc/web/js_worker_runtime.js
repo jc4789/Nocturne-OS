@@ -145,7 +145,9 @@
     Object.defineProperty(globalThis,'FileReaderSync',{value:blobBridge.FileReaderSync,writable:true,configurable:true});
     /* @include js_clone.js */
     /* @include js_geometry.js */
-    geometryInterfaces({});
+    const geometryBridge=geometryInterfaces({});
+    /* @include js_typed_om.js */
+    typedOMInterfaces({native:host,geometry:geometryBridge,DOMException});
     /* @include js_offscreen_canvas.js */
     /* @include js_worker_messaging.js */
     /* @include js_sanitizer_constants.js */
@@ -324,7 +326,7 @@
             baseURL:()=>address,origin,clientReferrer:()=>address,referrerPolicy:()=>apply(referrerPolicy,host,[]),
             url:()=>apply(securityURL,host,[])||address,dataURL:url=>apply(dataURL,host,[url]),
             task:fn=>timer(fn,0,[],false),clearTask:clearTimer,digest:(algorithm,bytes)=>apply(digest,host,[algorithm,bytes]),
-            initiator:id=>performanceBridge.initiator(id,'xmlhttprequest')});
+            initiator:(id,type)=>performanceBridge.initiator(id,type)});
     })();
     fetchBridge.initialize();fetchBridge.initializeStreams(streamBridge);fetchBridge.initializeBlobs(blobBridge);
     const {Headers,Request,Response,fetch}=fetchBridge;

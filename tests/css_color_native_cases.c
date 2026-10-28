@@ -12,14 +12,26 @@
                                        sample, applied as computed() applies a value
      H<TAB>color<TAB>value             a canvas's fillStyle after setting value, the canvas
                                        element's color being color (empty: no element)
+     O<TAB>property<TAB>scheme<TAB>color<TAB>value
+                                       as C, the value set through element.style: CSSOM's
+                                       setProperty on the element's inline declarations
+                                       (css.c's css_inline_set), the style attribute becoming
+                                       their serialization, and the property's value in what
+                                       the cascade parses (css_inline_text)
+     R<TAB>property<TAB>scheme<TAB>color<TAB>value
+                                       as C, the value set through a style rule's style:
+                                       cssText = "property: value" on a CSSStyleRule
+                                       (cssom.c's cssom_set_declarations, the end of
+                                       setProperty too), and the property's value in the
+                                       rule's declarations in the sheet's text, which the
+                                       cascade parses (css.c's one parse of the sheet)
    An invalid value answers <invalid>. */
 #include <stdio.h>
 #include "webi.h"
+#include "cssom.h"
 
 /* reached only from properties these requests do not set */
 bool web_native_checkpoint(web_doc *d) { (void)d; return true; }
-bool css_valid_declaration(const char *p, size_t pn, const char *v, size_t vn) { (void)p; (void)pn; (void)v; (void)vn; return false; }
-bool css_container_names_valid(const char *s, size_t n) { (void)s; (void)n; return false; }
 /* layout.c's, reached only from Geometry's matrix strings and the animation of transform lists */
 void css_transform_list_matrix_3d(const struct css_transform *t, double m[16]) { (void)t; (void)m; abort(); }
 void css_transform_list_matrix(const struct css_transform *t, float w, float h, double m[16]) {
@@ -142,6 +154,61 @@ static bool specified(char *rest, sbuf *out) {
     sb_puts(out, rest);
     return true;
 }
+/* an element with no style attribute: style.setProperty(property, value), then its declarations
+   as the cascade reads them */
+static bool through_cssom(char *rest, sbuf *out) {
+    const char *property = field(&rest), *scheme = field(&rest), *color = field(&rest), *value = rest;
+    node_t e = {.type = N_ELEM};
+    sbuf attribute = {0}, request = {0};
+    bool ok = css_inline_set(NULL, &e, "", 0, property, value, NULL, &attribute) > 0;
+    struct attr style = {.name = "style", .raw = "style", .local = "style", .value = sb_cstr(&attribute)};
+    e.attrs = &style;
+    e.nattrs = 1;
+    const char *text = ok ? css_inline_text(&e) : NULL, *v;
+    size_t vn;
+    bool important;
+    if (text && css_decl_find(text, strlen(text), property, &v, &vn, &important)) {
+        sb_puts(&request, property); sb_putc(&request, '\t');
+        sb_puts(&request, scheme); sb_putc(&request, '\t');
+        sb_puts(&request, color); sb_putc(&request, '\t');
+        sb_put(&request, v, vn);
+        ok = computed((char *)sb_cstr(&request), out);
+    } else ok = false;
+    free(e.style_cssom);
+    sb_free(&attribute);
+    sb_free(&request);
+    return ok;
+}
+/* a style sheet with one style rule: its style's cssText becomes "property: value", then the
+   property's value in the declarations the sheet's text now holds for the rule */
+static bool through_rule(char *rest, sbuf *out) {
+    const char *property = field(&rest), *scheme = field(&rest), *color = field(&rest), *value = rest;
+    static web_doc document_;
+    static node_t root = {.type = N_DOC};
+    document_.root = &root; root.owner = &document_;
+    int error;
+    uint32_t count;
+    struct cssom_sheet *sheet = cssom_construct(&document_, &error);
+    struct css_rule_info *rule = sheet && !cssom_replace_sync(sheet, "a {}", 4) ? cssom_child(sheet, 0, 0, &count) : NULL;
+    sbuf text = {0}, request = {0};
+    sb_puts(&text, property); sb_puts(&text, ": "); sb_puts(&text, value);
+    bool ok = rule && cssom_set_declarations(sheet, rule->id, text.p, text.n) == CSSOM_OK;
+    rule = ok ? cssom_child(sheet, 0, 0, &count) : NULL;
+    const char *declarations = NULL, *v;
+    size_t n = 0, vn;
+    bool important;
+    if (rule) cssom_declarations(rule, &declarations, &n);
+    if (declarations && css_decl_find(declarations, n, property, &v, &vn, &important)) {
+        sb_puts(&request, property); sb_putc(&request, '\t');
+        sb_puts(&request, scheme); sb_putc(&request, '\t');
+        sb_puts(&request, color); sb_putc(&request, '\t');
+        sb_put(&request, v, vn);
+        ok = computed((char *)sb_cstr(&request), out);
+    } else ok = false;
+    sb_free(&text);
+    sb_free(&request);
+    return ok;
+}
 int main(int argc, char **argv) {
     static char line[1 << 16];
     if (argc < 3) return 2;
@@ -155,7 +222,9 @@ int main(int argc, char **argv) {
         bool ok = line[0] == 'S' ? specified(rest, &out) :
                   line[0] == 'C' ? computed(rest, &out) :
                   line[0] == 'I' ? interpolate(rest, &out) :
-                  line[0] == 'H' ? canvas(rest, &out) : false;
+                  line[0] == 'H' ? canvas(rest, &out) :
+                  line[0] == 'O' ? through_cssom(rest, &out) :
+                  line[0] == 'R' ? through_rule(rest, &out) : false;
         fputs(ok ? sb_cstr(&out) : "<invalid>", answers);
         fputs("\n", answers);
         fflush(answers); /* a request that hangs shows as the first one unanswered */

@@ -418,7 +418,7 @@ def prepare_disk(a, test, disk, dns_port, control_port):
             with open(path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(text)
             files.append(("C:\\Tests\\" + name, path))
-        files.append(("C:\\Tests\\wptrunner.c", os.path.join(ROOT, "tests", "wptrunner.c")))
+        files.append(("C:\\Tests\\wptrunner.c", a.runner_source))
         if a.https:  # WPT's certificate authority, trusted by this test disk's system (user/libc/tls.c)
             files.append(("C:\\Nocturne\\Certificates", "-"))
             files.append(("C:\\Nocturne\\Certificates\\web-platform-tests.pem",
@@ -602,6 +602,10 @@ def main():
     ap.add_argument("--resolution", default="1920x1080")
     ap.add_argument("--boot-image", default=os.path.join(BUILD, "nocturne.img"))
     ap.add_argument("--skip-build-check", action="store_true", help="boot an image that is not the current build's")
+    # An older image's browser takes only the options of its own time: it is run by the runner it
+    # was built with (tests/wptrunner.c of that revision), not this tree's.
+    ap.add_argument("--runner-source", default=os.path.join(ROOT, "tests", "wptrunner.c"),
+                    help="the guest runner's C source for this image (default: tests/wptrunner.c)")
     ap.add_argument("--timeout-multiplier", type=int, default=2)
     ap.add_argument("--load-allowance", type=int, default=25, help="seconds beyond the test's own timeout")
     ap.add_argument("--open-timeout", type=int, default=120, help="seconds for a new browser to ask for a test")

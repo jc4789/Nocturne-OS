@@ -39,7 +39,9 @@ Each is marked `Nocturne:` in the file.
 3. `isEditingHost` and `isEditable` are HTML's definitions, owned by the
    bindings, reading the contenteditable attribute's state (Plaintext-Only
    included) and the document's design mode, not the page-replaceable
-   accessors.
+   accessors; `js_editing.js` leaves out of them the option data of the
+   controls that hold options (an option or optgroup anywhere, everything in a
+   select or datalist), which no command edits.
 4. `isCollapsedLineBreak` and `isExtraneousLineBreak` answer from the tree and
    the computed display and white-space (`getLineBlockOf`,
    `getLineContribution`, `hasLineContentBeside`) instead of upstream's
@@ -60,6 +62,16 @@ Each is marked `Nocturne:` in the file.
 8. `insertText` takes `value` a code point at a time, and the `delete` and
    `forwardDelete` actions take a whole surrogate pair; `forwardDelete`'s
    combining marks are the Unicode general category M.
+9. `insertText` with an empty value and a collapsed active range returns true
+   before deleting the selection: there is nothing to delete or insert, and
+   the deletion would canonicalize the whitespace around the caret (WPT
+   `editing/whitespaces/chrome-compat/inserttext.tentative.html` expects the
+   text unchanged).
+10. The next and previous equivalent points do not go into a select or a
+   datalist (`holdsOptionData`): its boundary points are among its option
+   data, not the same place as the points around it, so deleting a range
+   around a select removes the select instead of moving into it (WPT
+   `editing/other/editing-around-select-element.tentative.html`).
 
 ## Where Nocturne follows another standard than the draft
 
@@ -78,6 +90,21 @@ Each is marked `Nocturne:` in the file.
   null.
 - The draft does not define undo and redo; `js_editing.js` keeps a history of
   the mutation records of each command and of the user's edits.
+- The draft predates HTML's Plaintext-Only state ("Only the element's raw text
+  content is editable; rich formatting is disabled").  In `js_editing.js`, the
+  state that decides is the outermost editing host of the active range's run
+  of editable ancestors (an editing host in an editable parent is edited as
+  part of the parent's, as WPT's `editing/plaintext-only` tests have it).  In a
+  Plaintext-Only one, only the commands that edit text and line breaks
+  (delete, forwardDelete, insertHTML, insertLineBreak, insertParagraph,
+  insertText) and the miscellaneous ones are enabled; insertHTML inserts the
+  markup's text (HTML's rendered text collection steps, over the markup parsed
+  in an inert document, with the UA style sheet's display and white-space);
+  insertText's and insertHTML's line feeds are line breaks; a line break is a
+  preformatted line feed where white-space keeps line feeds, with a br for
+  the padding an empty last line needs, which text filling that line removes
+  again (a br or a kept line feed that the text made extraneous); and the
+  user's Enter is insertLineBreak.
 - copy, cut and paste, which the draft lets a user agent leave unsupported,
   are unsupported: they need the Clipboard API's events (ClipboardEvent,
   DataTransfer) and a clipboard reachable with the user's activation.

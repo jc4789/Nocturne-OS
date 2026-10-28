@@ -180,6 +180,9 @@ typedef struct node {
     arena_t style_inherit_mem;
     struct css_style_slot *style_slots, *style_previous_slots;
     struct css_declarations *style_declarations; /* immutable inline declaration snapshot */
+    /* css.c's css_inline_text: "the style attribute\0its exact declarations", written by the
+       last change through CSSOM */
+    char *style_cssom;
     struct style *style_previous;
     struct node *style_retired_next;
     bool style_dirty, style_children_dirty;
@@ -348,7 +351,29 @@ struct css_calc_parse {
     /* LF_ANCHOR, LF_ANCHOR_SIZE: anchor() and anchor-size() are <length>s here (css-anchor-position-1
        §3.2, §5.1; a computed value only, cx set). cssprop.c reads their arguments; each is a leaf */
     uint8_t anchors;
+    /* CSS Typed OM §5.6 "reify a math expression": the tree as written, not simplified (units kept,
+       subtraction a negate, division an invert, a calc() without an operator a sum of one); a math
+       function Typed OM has no object for fails, unrepresentable set. Typed OM reads values this
+       owner serialized, so what it reads is already simplified (§10.10.1). */
+    bool raw, unrepresentable;
 };
+/* a numeric type (CSS Values 4 §10.7, CSS Typed OM §4.3.2): the exponent of each base type in the
+   order length, angle, time, frequency, resolution, flex, percent, and the percent hint (a base, -1) */
+enum { CSS_TYPE_BASES = 7 };
+struct css_calc_type { int8_t e[CSS_TYPE_BASES]; int8_t hint; };
+bool css_calc_type_add(const struct css_calc_type *a, const struct css_calc_type *b, struct css_calc_type *out);
+bool css_calc_type_multiply(const struct css_calc_type *a, const struct css_calc_type *b, struct css_calc_type *out);
+/* the CSS_CALC_* type t is in a context that accepts accept (CSS Typed OM "match"), or 0 */
+unsigned css_calc_type_match(const struct css_calc_type *t, unsigned accept);
+/* the units of the table, 0 .. css_unit_count() - 1: name ("" a number, "%" a percentage), base type
+   (-1 a number, else as in struct css_calc_type), relative (needs an element), canonical factor */
+int css_unit_count(void);
+void css_unit_info(int unit, const char **name, int *base, bool *relative, double *factor);
+/* a tree's shape for a reader outside this owner: CSS_MATH_* and the leaf's value and unit, or the
+   children (clamp()'s none is NULL) */
+enum { CSS_MATH_VALUE, CSS_MATH_SUM, CSS_MATH_PRODUCT, CSS_MATH_NEGATE, CSS_MATH_INVERT, CSS_MATH_MIN,
+       CSS_MATH_MAX, CSS_MATH_CLAMP, CSS_MATH_OTHER };
+int css_calc_shape(const struct css_calc *c, double *v, int *unit, unsigned *n, struct css_calc *const **children);
 bool css_calc_is_math(const char *s, size_t n); /* s starts with a math function */
 /* s..s+n, one math function: its simplified tree, typed against accept (*kind: the CSS_CALC_* type it
    is); NULL if it is not valid there */
@@ -1063,15 +1088,20 @@ struct css_rule_info {
     struct css_rule_info *next;                  /* next sibling */
     struct css_rule_info *parent, *first, *last; /* CSSOM parses only */
     struct css_rule_info **children;             /* cssom.c's index of first..last */
-    /* text: the rule's text_len bytes in its sheet's comment-free source,
-       not terminated. The other ranges are offsets into text: the trimmed
+    /* text: the rule's text_len bytes in the comment-free source of the parse
+       that made it (its sheet's, or its top-level rule's own when cssom.c
+       spliced that in), not terminated. The other ranges are offsets into text: the trimmed
        prelude (selector, key text, at-rule prelude), the block's contents
        between its braces, and the declarations the rule owns itself. */
     const char *text, *selector;
     const struct css_rule_import *import; /* @import only */
     void *native_rule;
+    /* A top-level rule of a CSSOM parse: what it put into the cascade AST's
+       lists, which css_cssom_splice takes out or puts in with the rule. */
+    struct css_rule_span *span;
     uint32_t text_len, type, id, child_count;
     uint32_t prelude_at, prelude_len, block_at, block_len, decls_at, decls_len;
+    uint32_t index;     /* cssom.c: its place among its parent's (or the sheet's) rules */
     bool block, closed; /* has a block; ended by its own '}' or ';', not by end of input */
     bool marker;        /* a nested declarations rule written as CSS_NESTED_DECLARATIONS_MARKER */
     bool exposed;       /* cssom.c: a CSSRule object stands for it */
@@ -1103,10 +1133,26 @@ sheet_t *css_parse_sheet_serviced(web_doc *d, arena_t *a, const char *css, size_
    nested-declarations markers at the sorted offsets markers holds. */
 sheet_t *css_parse_cssom_sheet(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url,
                                const uint32_t *markers, uint32_t nmarkers);
+/* A change to a CSSOM sheet's rules parses only the text of the top-level rule
+   it changes. css_parse_cssom_rules parses comment-free text as top-level rules
+   of sheet, in its context (its @namespace prefixes, its layer ids, never an
+   @import or @namespace), into sheet's arena: a sheet of its own the rules wait
+   in. css_cssom_splice then replaces top[at] (old; NULL: none) of the sheet's
+   top-level rules, the count of them before the change, by fresh's one rule
+   (NULL: none), its span in every list of the AST with them, and patches the
+   rule index of the AST when the rules come after all others (else drops it, to
+   be built again at the next cascade). false: the parse cannot be changed
+   rule by rule (rules in it stand in no top-level CSSOM rule's span). */
+sheet_t *css_parse_cssom_rules(web_doc *d, sheet_t *sheet, const char *css, size_t n, const char *base_url,
+                               const uint32_t *markers, uint32_t nmarkers);
+bool css_cssom_spliceable(const sheet_t *sheet);
+/* the index was dropped (its memory is the arena's garbage) */
+bool css_cssom_splice(web_doc *d, sheet_t *sheet, struct css_rule_info *const *top, uint32_t count, uint32_t at,
+                      struct css_rule_info *old, sheet_t *fresh);
 /* css as the parser reads it: comments out, NUL as U+FFFD (malloc; NULL: no memory).
    A parse of text that went through this has its rules at the same offsets. */
 char *css_preprocess(const char *css, size_t n, size_t *out_n);
-/* The comment-free source every css_rule_info text points into. */
+/* The comment-free source the parse's css_rule_info texts point into. */
 const char *css_sheet_source(const sheet_t *sheet, size_t *length);
 void css_sheet_scope(sheet_t *sheet, node_t *shadow_root);
 /* The arena the sheet was parsed into now lives at another address: the AST's
@@ -1237,6 +1283,16 @@ bool css_prop_is_motion(const struct propdef *p);
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d);
 /* CSSOM specified value of a declared colour or color-scheme; false: keep the authored text */
 bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out);
+/* CSS Typed OM §5: what a property's value reifies as by its grammar (cssprop.c's table): always a
+   CSSStyleValue, a colour (only currentcolor is a keyword), a transform list, an image layer, or by the
+   value (an identifier a keyword, a numeric value of a type accept takes a CSSNumericValue); whether it
+   is a shorthand or list-valued. false: no such property. */
+enum { CSS_REIFY_VALUE, CSS_REIFY_STYLE, CSS_REIFY_COLOR, CSS_REIFY_TRANSFORM, CSS_REIFY_IMAGE };
+/* accept: the CSS_CALC_* types a lone numeric value of the property takes; typed: accept is all of
+   them (0: the grammar takes no lone numeric value), else the grammar is not known that far;
+   integer: a lone number must be an integer */
+struct css_reify { uint8_t kind; bool shorthand, list, typed, integer; unsigned accept; };
+bool css_prop_reify(const char *name, size_t n, struct css_reify *out);
 /* Animation values (cssprop.c). The property table owns each longhand's animation type
    (Web Animations 1 §5.3): not animatable, discrete, by computed value, visibility (visible
    wins inside the interval), or display (the value that is not none/hidden wins inside it;
@@ -1245,6 +1301,21 @@ enum { CSS_ANIM_NONE, CSS_ANIM_DISCRETE, CSS_ANIM_VALUE, CSS_ANIM_VISIBILITY, CS
 int css_prop_animation(const struct propdef *p);
 /* the longhands a property sets (itself, or a shorthand's), as css_prop_index bits in set */
 void css_prop_longhands(const struct propdef *p, uint8_t *set);
+/* CSSOM's shorthands (a declaration block holds longhands). css_shorthand_longhands: the names
+   of the longhands shorthand p maps to, in canonical order (logical ones by their own names),
+   0 for a longhand. css_shorthand_expand: each longhand's name and the text value v gives it;
+   1, 0 invalid, -1 a value with no longhand text (the block keeps the shorthand as one),
+   -2 no memory. css_shorthand_serialize: the shorthand's value from its longhands' values
+   (serialized, in css_shorthand_longhands order); false when it cannot represent them.
+   css_shorthands_of: the shorthands a longhand name is in, in CSSOM's preferred order. */
+typedef void css_longhand_record(void *opaque, const char *name, const char *value, size_t n);
+int css_shorthand_longhands(const struct propdef *p, const char *const **names);
+int css_shorthand_expand(const struct propdef *p, const char *v, size_t n, css_longhand_record *each, void *opaque);
+bool css_shorthand_serialize(const struct propdef *p, const char *const *values, const size_t *lengths, sbuf *out);
+int css_shorthands_of(const char *longhand, const struct propdef *const **shorthands);
+/* the logical property group (CSS Logical 1) of a longhand name into group, and whether its
+   mapping is flow-relative; false: in none */
+bool css_prop_logical_group(const char *name, char *group, size_t size, bool *logical);
 /* p's computed value in st as text css_apply reads back to the same value; false: no serializer */
 bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d);
 /* do a and b hold the same computed value of longhand p */
@@ -1322,6 +1393,8 @@ struct cx {
                               what a style sheet's parse clamps (rgb()'s components) keeps its value */
     uint8_t anchor_functions; /* LF_ANCHOR, LF_ANCHOR_SIZE: the anchor functions the length being parsed may hold */
     uint8_t anchor_depth;     /* the anchor functions' fallbacks the length being parsed is in */
+    css_longhand_record *record; /* when set: each longhand a shorthand gives a value, by name, with its text */
+    void *record_opaque;
 };
 /* apply a declaration (var() already substituted) unless its properties are all set; false if invalid */
 bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx);
@@ -1364,6 +1437,20 @@ bool css_color_parse_used(const char *s, size_t n, const style_t *(*element)(voi
                           struct css_color *out);
 /* CSSOM: the specified value's serialization; false (out unchanged) when s is not a <color> */
 bool css_color_specified(const char *s, size_t n, sbuf *out);
+/* CSS Typed OM §5.7: a <color> as written (color.c). KEYWORD: name (currentcolor, a system colour);
+   a function's channels as authored (a math one's serialization in math at math_at), a hex or named
+   colour RGB with its bytes and its alpha as a unitless fraction; OTHER: relative colours and mixes.
+   false: not a colour */
+enum { CSS_COLOR_REIFY_KEYWORD, CSS_COLOR_REIFY_RGB, CSS_COLOR_REIFY_HSL, CSS_COLOR_REIFY_HWB, CSS_COLOR_REIFY_LAB,
+       CSS_COLOR_REIFY_LCH, CSS_COLOR_REIFY_OKLAB, CSS_COLOR_REIFY_OKLCH, CSS_COLOR_REIFY_COLOR, CSS_COLOR_REIFY_OTHER };
+enum { CSS_COLOR_CHANNEL_ABSENT, CSS_COLOR_CHANNEL_NONE, CSS_COLOR_CHANNEL_VALUE, CSS_COLOR_CHANNEL_MATH };
+struct css_color_channel { uint8_t kind; char unit[7]; double v; size_t math_at, math_n; };
+struct css_color_reified {
+    uint8_t kind;
+    const char *name, *space; /* KEYWORD's name; COLOR's colour space */
+    struct css_color_channel ch[4];
+};
+bool css_color_reify(const char *s, size_t n, struct css_color_reified *out, sbuf *math);
 /* a computed colour held as its 8-bit field argb (COLOR_CURRENT: currentcolor, current the 8-bit
    colour out->color gives it meanwhile) and, when 8 bits cannot hold it, its exact value or
    expression v (a style's slot, a shadow's colour) */
@@ -2241,24 +2328,54 @@ bool css_selectors_serialize(const sheet_t *sheet, const char *selector, size_t 
 void css_serialize_ident(sbuf *out, const char *name);
 void css_serialize_string(sbuf *out, const char *text);
 /* CSSOM declaration blocks as text (an element's style attribute, a rule's
-   declarations). serialize: the block's serialization, with the property names
-   NUL-terminated into names when given; find: a property's last effective value
-   and priority; value: a specified value as CSSOM serializes it; set: on a
-   serialized block, setProperty's (removeProperty's, for an empty value)
-   serialized result into out (1), the value or priority does not parse (0, out
-   unchanged), the name is not a property name (-1), or no memory (-2); names:
-   a serialized block's property names, each NUL-terminated; balanced: the text
-   can stand inside a block. */
+   declarations). A block holds longhands (a shorthand sets each of its own) with
+   the values they were given; its text (block) writes each declaration, so it
+   parses back to the same ones and the cascade reads the given values, and its
+   serialization (serialize) writes each value serialized and longhands as their
+   shorthands where CSSOM's "serialize a CSS declaration block" does.
+   block: the block text css (any declaration text) parses to; serialize: the
+   serialization of what css parses to, with the declarations' (longhand) names
+   NUL-terminated into names when given; block_serialize: the same of a block's
+   text; get: on a block's text, getPropertyValue into value (a shorthand's from
+   its longhands) and getPropertyPriority; find: a name's last effective value and
+   priority as written in css (no shorthands); value: a specified value as CSSOM
+   serializes it; set: on a block's text, setProperty's (removeProperty's, for an
+   empty value) new block text into out (1), the value or priority does not parse
+   (0, out unchanged), the name is not a property name (-1), or no memory (-2);
+   balanced: the text can stand inside a block. A descriptor block (check given)
+   has no shorthands. false: no memory. */
 /* a declaration's validity in its block (name lowercased unless custom), and
    when serialized is given, its value's serialization; NULL: a property's */
 typedef bool css_decl_check(const char *name, const char *value, size_t n, sbuf *serialized);
+bool css_decl_block(const char *css, size_t n, css_decl_check *check, sbuf *block);
+bool css_decl_get(const char *block, size_t n, const char *property, css_decl_check *check, sbuf *value, bool *important);
 bool css_decl_find(const char *css, size_t n, const char *property, const char **value, size_t *value_n, bool *important);
 void css_decl_value(const char *property, const char *value, size_t n, sbuf *out);
-int css_decl_set(const char *css, size_t n, const char *property, const char *value, const char *priority,
+int css_decl_set(const char *block, size_t n, const char *property, const char *value, const char *priority,
                  css_decl_check *check, sbuf *out);
 bool css_decl_serialize(const char *css, size_t n, css_decl_check *check, sbuf *out, sbuf *names);
-void css_decl_names(const char *css, size_t n, sbuf *names);
+bool css_decl_block_serialize(const char *block, size_t n, css_decl_check *check, sbuf *out, sbuf *names);
+/* An element's inline declarations (CSSOM §6.7). A change through CSSOM sets the style attribute
+   to their serialization with the mutate flag: the attribute is not parsed again, and the
+   declarations keep the values they were given (a specified serialization may round, as an
+   origin colour's channels do, CSS Color 4 §15.2). block: those declarations as a block's text
+   (css_decl_block) while the attribute is still their serialization, else NULL (the attribute's
+   text stands for them); text: what the cascade parses, block or else the attribute's text (NULL:
+   none, or CSP blocked the attribute). set: setProperty (removeProperty for an empty value) on
+   block, the element's declarations (css_inline_block, or the block its attribute parses to): 1
+   the declarations changed and attribute gets their serialization, else as css_decl_set (0
+   nothing changed). replace: the cssText setter, attribute gets the serialization of what text
+   parses to; false: no memory. */
+const char *css_inline_block(const node_t *e);
+const char *css_inline_text(const node_t *e);
+int css_inline_set(web_doc *d, node_t *e, const char *block, size_t n, const char *property, const char *value,
+                   const char *priority, sbuf *attribute);
+bool css_inline_replace(web_doc *d, node_t *e, const char *text, size_t n, sbuf *attribute);
 bool css_decl_balanced(const char *text, size_t n);
+/* a declaration list's text (comment-free) without its !important
+   declarations, the others as written: a keyframe's block, where CSS
+   Animations 1 makes them invalid */
+void css_decl_drop_important(const char *css, size_t n, sbuf *out);
 void web_js_start(web_doc *d, const struct web_host *host);
 bool web_js_parser_candidate(web_doc *d, const char *name, const char *is);
 node_t *web_js_parser_element(web_doc *d, node_t *node, const char *is, bool finish);

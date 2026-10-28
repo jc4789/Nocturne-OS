@@ -1237,6 +1237,76 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     ar_free(&a);
     return ok;
 }
+/* CSS Typed OM §5 (css-typed-om-1 "CSSStyleValue reification"): what the property's grammar makes of a
+   value, read from its row: shorthands and font-family are a CSSStyleValue (§5.1), a colour property's
+   keyword is one only for currentcolor, transform and the image layers have their own objects, and a
+   numeric value is a CSSNumericValue where the grammar takes that type. The layered properties
+   (animations, transitions, background and mask layers) are list-valued. The logical shorthands of
+   two sides (margin-block, inset-inline, border-block, ...) and the logical names of the border
+   sides (border-block-start is border-top here) take one value for both, which reifies as one side's
+   longhand does: a length or percentage, or (the borders) a keyword. */
+bool css_prop_reify(const char *name, size_t n, struct css_reify *out) {
+    const struct propdef *p = css_prop_lookup(name, n);
+    if (!p) return false;
+    *out = (struct css_reify){0};
+    if (p->type == PT_SHORT) {
+        bool alias = strlen(p->name) != n || strncasecmp(p->name, name, n);
+        switch (p->sh) {
+        case SH_MARGIN_INLINE: case SH_MARGIN_BLOCK: case SH_PADDING_INLINE: case SH_PADDING_BLOCK:
+        case SH_INSET_INLINE: case SH_INSET_BLOCK:
+            out->kind = CSS_REIFY_VALUE; out->typed = true; out->accept = CSS_CALC_LENGTH | CSS_CALC_PERCENT;
+            return true;
+        case SH_BORDER_INLINE: case SH_BORDER_BLOCK:
+            out->kind = CSS_REIFY_VALUE; out->typed = true;
+            return true;
+        case SH_BORDER_TOP: case SH_BORDER_RIGHT: case SH_BORDER_BOTTOM: case SH_BORDER_LEFT:
+            if (alias) { out->kind = CSS_REIFY_VALUE; out->typed = true; return true; }
+            break;
+        }
+        out->kind = CSS_REIFY_STYLE; out->shorthand = true;
+        return true;
+    }
+    out->list = p->type == PT_MOTION_LIST || p->type == PT_BG_IMAGE || p->type == PT_MASK_IMAGE || p->type == PT_BG_POS ||
+                p->type == PT_BG_SIZE || p->type == PT_MASK_SIZE || (p->type == PT_KW && p->kws == kw_bg_repeat);
+    out->kind = p->type == PT_FONT_FAMILY ? CSS_REIFY_STYLE :
+                p->type == PT_COLOR || p->type == PT_SVG_PAINT ? CSS_REIFY_COLOR :
+                p->type == PT_TRANSFORM ? CSS_REIFY_TRANSFORM :
+                p->type == PT_BG_IMAGE || p->type == PT_MASK_IMAGE ||
+                (p->type == PT_SHAPE && p->flags == CSS_SHAPE_OUTSIDE) ? CSS_REIFY_IMAGE : CSS_REIFY_VALUE;
+    unsigned accept = 0;
+    bool typed = true;
+    switch (p->type) {
+    case PT_LEN: accept = CSS_CALC_LENGTH | (p->flags & LF_NOPCT ? 0 : CSS_CALC_PERCENT); break;
+    case PT_PX: accept = CSS_CALC_LENGTH; break;
+    case PT_FONT_SIZE: case PT_VALIGN: case PT_RADIUS: case PT_TRANSLATE: case PT_BG_SIZE: case PT_MASK_SIZE:
+    case PT_BG_POS: case PT_TRANSFORM_ORIGIN:
+        accept = CSS_CALC_LENGTH | CSS_CALC_PERCENT; break;
+    case PT_GTEMPLATE: accept = CSS_CALC_LENGTH | CSS_CALC_PERCENT | CSS_CALC_FLEX; break;
+    case PT_LINE_HEIGHT: case PT_SVG_WIDTH: accept = CSS_CALC_NUMBER | CSS_CALC_LENGTH | CSS_CALC_PERCENT; break;
+    case PT_INT: case PT_ZINDEX: case PT_LINE_CLAMP: out->integer = true; /* fall through */
+    case PT_NUM: case PT_FONT_WEIGHT: accept = CSS_CALC_NUMBER; break;
+    case PT_OPACITY: case PT_SCALE: accept = CSS_CALC_NUMBER | CSS_CALC_PERCENT; break;
+    case PT_ROTATE: accept = CSS_CALC_ANGLE; break;
+    /* offset-rotate: [auto | reverse] || <angle>; shape-outside: a box, an <image> (a basic shape is
+       not reified in Level 1) */
+    case PT_OFFSET: if (p->flags == CSS_OFFSET_ROTATE) accept = CSS_CALC_ANGLE; else typed = false; break;
+    case PT_SHAPE: if (p->flags != CSS_SHAPE_OUTSIDE) typed = false; break;
+    case PT_MOTION_LIST:
+        accept = p->flags == ML_DURATION || p->flags == ML_DELAY || p->flags == ML_TDURATION || p->flags == ML_TDELAY ?
+                 CSS_CALC_TIME : p->flags == ML_ITERATIONS ? CSS_CALC_NUMBER : 0;
+        break;
+    /* keywords, colours, images, names, shadows and filters: no lone numeric value; a grid line's
+       integer goes with a name or span, a CSSStyleValue (WPT grid-start-end.html) */
+    case PT_KW: case PT_DISPLAY: case PT_COLOR: case PT_FONT_FAMILY: case PT_LIST_TYPE: case PT_BG_IMAGE: case PT_OVERFLOW:
+    case PT_MASK_IMAGE: case PT_SVG_PAINT: case PT_CONTAINER_NAMES: case PT_TRANSFORM: case PT_GAREAS: case PT_FILTER:
+    case PT_BOX_SHADOW: case PT_CLIP: case PT_COLOR_SCHEME: case PT_GLINE:
+        break;
+    default: typed = false;
+    }
+    out->accept = accept;
+    out->typed = typed;
+    return true;
+}
 
 /* ---------------------------------------------------------------- longhand values */
 static bool kw_find(const struct kw *k, const char *s, size_t n, uint8_t *out) {
@@ -4719,21 +4789,28 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
 }
 
 /* ---------------------------------------------------------------- shorthands */
+/* A shorthand gives each of its longhands a value through set_long, by the
+   longhand's own name: a logical one (margin-inline-start) is the table's
+   physical property. cx->record, when set, gets each longhand's name and the
+   text it was given (CSSOM's longhands of a shorthand, css_shorthand_expand). */
 static bool set_long(const char *name, const char *v, size_t n, struct cx *cx) {
     const struct propdef *p = find_prop(name, strlen(name));
+    if (!p) p = css_prop_lookup(name, strlen(name));
     if (!p) { if (cx->supports_probe) cx->invalid = true; return false; }
     int i = css_prop_index(p);
     if (cx->set[i]) return true;
     if (cx->font_pass && !early(p)) return true;
     if (!apply_long(p, v, n, cx)) { if (cx->supports_probe) cx->invalid = true; return false; }
     cx->set[i] = 1;
+    if (cx->record) cx->record(cx->record_opaque, name, v, n);
     return true;
 }
 
 static const char *const side_names[4] = {"top", "right", "bottom", "left"};
+static const char *const inline_sides[2] = {"inline-start", "inline-end"}, *const block_sides[2] = {"block-start", "block-end"};
 
-/* margin: 1-4 values for the four sides */
-static bool set_box(const char *fmt, const char *v, size_t n, struct cx *cx, const int *sides, int nsides) {
+/* margin: 1-4 values for the four sides; margin-inline: 1-2 for its start and end */
+static bool set_box(const char *fmt, const char *v, size_t n, struct cx *cx, const char *const *sides, int nsides) {
     const char *t[4];
     size_t tl[4];
     int k = split_checked(v, n, t, tl, 4, ' ', cx);
@@ -4752,7 +4829,7 @@ static bool set_box(const char *fmt, const char *v, size_t n, struct cx *cx, con
     bool ok = true;
     for (int i = 0; i < nsides; i++) {
         int ti = k > 1 ? i : 0;
-        snprintf(name, sizeof name, fmt, side_names[sides[i]]);
+        snprintf(name, sizeof name, fmt, sides[i]);
         ok &= set_long(name, t[ti], tl[ti], cx);
     }
     return ok;
@@ -4764,8 +4841,9 @@ static bool is_bwidth(const char *s, size_t n, struct cx *cx) {
     return kw_find(kw_bwidth, s, n, &k) || parse_len(s, n, cx, &l, LF_NOPCT);
 }
 
-/* border: width style color, for the given sides */
-static bool set_border(const char *v, size_t n, struct cx *cx, const int *sides, int nsides) {
+/* border: width style color, for the given sides (the widths, then the styles,
+   then the colours: the shorthand's longhands in order) */
+static bool set_border(const char *v, size_t n, struct cx *cx, const char *const *sides, int nsides) {
     const char *t[3];
     size_t tl[3];
     int k = split_checked(v, n, t, tl, 3, ' ', cx);
@@ -4784,15 +4862,9 @@ static bool set_border(const char *v, size_t n, struct cx *cx, const int *sides,
         seen |= bit;
     }
     char name[64];
-    for (int i = 0; i < nsides; i++) {
-        const char *sd = side_names[sides[i]];
-        snprintf(name, sizeof name, "border-%s-width", sd);
-        set_long(name, w, wl, cx);
-        snprintf(name, sizeof name, "border-%s-style", sd);
-        set_long(name, st, sl, cx);
-        snprintf(name, sizeof name, "border-%s-color", sd);
-        set_long(name, c, cl, cx);
-    }
+    for (int i = 0; i < nsides; i++) { snprintf(name, sizeof name, "border-%s-width", sides[i]); set_long(name, w, wl, cx); }
+    for (int i = 0; i < nsides; i++) { snprintf(name, sizeof name, "border-%s-style", sides[i]); set_long(name, st, sl, cx); }
+    for (int i = 0; i < nsides; i++) { snprintf(name, sizeof name, "border-%s-color", sides[i]); set_long(name, c, cl, cx); }
     return true;
 }
 
@@ -4805,9 +4877,9 @@ static bool set_font(const char *v, size_t n, struct cx *cx) {
     if (k == 1)
         for (int i = 0; sys[i]; i++)
             if (ident_is(t[0], tl[0], sys[i])) {
-                set_long("font-size", "13px", 4, cx);
-                set_long("font-weight", "normal", 6, cx);
                 set_long("font-style", "normal", 6, cx);
+                set_long("font-weight", "normal", 6, cx);
+                set_long("font-size", "13px", 4, cx);
                 set_long("line-height", "normal", 6, cx);
                 set_long("font-family", "sans-serif", 10, cx);
                 return true;
@@ -4856,10 +4928,13 @@ static bool set_font(const char *v, size_t n, struct cx *cx) {
         if (cx->supports_probe) cx->invalid = true;
         return false;
     }
+    /* the longhands in their order: style, weight, size, line height, family */
+    if (!cx->font_pass) {
+        set_long("font-style", style, stl, cx);
+        set_long("font-weight", weight, wl, cx);
+    }
     set_long("font-size", sz, szl, cx);
     if (cx->font_pass) return true;
-    set_long("font-style", style, stl, cx);
-    set_long("font-weight", weight, wl, cx);
     set_long("line-height", lh, lhl, cx);
     set_long("font-family", family, family_n, cx);
     return true;
@@ -4879,7 +4954,7 @@ static bool set_background(const char *v, size_t n, struct cx *cx) {
     uint32_t c;
     for (int i = 0; i < m; i++)
         if (css_color_checked(t[i], tl[i], &c, cx)) col = t[i], cl = tl[i];
-    set_long("background-color", col, cl, cx);
+    /* the longhands in their order: image, position, size, repeat, colour */
     /* images: any url() or gradient in any layer */
     bool img = false;
     for (int L = 0; L < k && !img; L++) {
@@ -4932,11 +5007,12 @@ static bool set_background(const char *v, size_t n, struct cx *cx) {
             if (zn + tn + 1 < sizeof size) memcpy(size + zn, tok, tn), zn += tn, size[zn++] = ' ';
         } else if (pn + tn + 1 < sizeof pos) memcpy(pos + pn, tok, tn), pn += tn, pos[pn++] = ' ';
     }
-    set_long("background-repeat", rep, rl, cx);
     if (pn) set_long("background-position", pos, pn - 1, cx);
     else set_long("background-position", "0% 0%", 5, cx);
     if (zn) set_long("background-size", size, zn - 1, cx);
     else set_long("background-size", "auto", 4, cx);
+    set_long("background-repeat", rep, rl, cx);
+    set_long("background-color", col, cl, cx);
     return true;
 }
 
@@ -4989,7 +5065,7 @@ static bool set_flex(const char *v, size_t n, struct cx *cx) {
 }
 
 static bool apply_short(const struct propdef *p, const char *v, size_t n, struct cx *cx) {
-    static const int all[4] = {0, 1, 2, 3}, lr[2] = {3, 1}, tb[2] = {0, 2};
+    const char *const *all = side_names, *const *lr = inline_sides, *const *tb = block_sides;
     bool global = ident_is(v, n, "inherit") || ident_is(v, n, "initial") || ident_is(v, n, "unset") ||
                   ident_is(v, n, "revert") || ident_is(v, n, "revert-layer");
     switch (p->sh) {
@@ -5083,7 +5159,8 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         size_t tl[2];
         int k = split_checked(v, n, t, tl, 2, ' ', cx);
         if (k < 1) return false;
-        const char *a = p->sh == SH_INSET_INLINE ? "left" : "top", *b = p->sh == SH_INSET_INLINE ? "right" : "bottom";
+        bool in = p->sh == SH_INSET_INLINE;
+        const char *a = in ? "inset-inline-start" : "inset-block-start", *b = in ? "inset-inline-end" : "inset-block-end";
         set_long(a, t[0], tl[0], cx);
         set_long(b, t[k - 1], tl[k - 1], cx);
         return true;
@@ -5091,17 +5168,16 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     case SH_BORDER: case SH_BORDER_TOP: case SH_BORDER_RIGHT: case SH_BORDER_BOTTOM: case SH_BORDER_LEFT:
     case SH_BORDER_INLINE: case SH_BORDER_BLOCK: {
         int side = p->sh - SH_BORDER_TOP;
-        const int *sides = p->sh == SH_BORDER ? all : p->sh == SH_BORDER_INLINE ? lr : p->sh == SH_BORDER_BLOCK ? tb : &all[side];
+        const char *const *sides = p->sh == SH_BORDER ? all : p->sh == SH_BORDER_INLINE ? lr : p->sh == SH_BORDER_BLOCK ? tb : &all[side];
         int ns = p->sh == SH_BORDER ? 4 : (p->sh == SH_BORDER_INLINE || p->sh == SH_BORDER_BLOCK) ? 2 : 1;
         if (global) {
             char name[64];
-            for (int i = 0; i < ns; i++) {
-                static const char *const f[3] = {"width", "style", "color"};
-                for (int j = 0; j < 3; j++) {
-                    snprintf(name, sizeof name, "border-%s-%s", side_names[sides[i]], f[j]);
+            static const char *const f[3] = {"width", "style", "color"};
+            for (int j = 0; j < 3; j++)
+                for (int i = 0; i < ns; i++) {
+                    snprintf(name, sizeof name, "border-%s-%s", sides[i], f[j]);
                     set_long(name, v, n, cx);
                 }
-            }
             return true;
         }
         return set_border(v, n, cx, sides, ns);
@@ -5192,10 +5268,12 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     }
     case SH_FONT:
         if (global) {
-            set_long("font-size", v, n, cx);
             if (!cx->font_pass) {
                 set_long("font-style", v, n, cx);
                 set_long("font-weight", v, n, cx);
+            }
+            set_long("font-size", v, n, cx);
+            if (!cx->font_pass) {
                 set_long("line-height", v, n, cx);
                 set_long("font-family", v, n, cx);
             }
@@ -5204,19 +5282,19 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         return set_font(v, n, cx);
     case SH_BACKGROUND:
         if (global) {
-            set_long("background-color", v, n, cx);
             set_long("background-image", v, n, cx);
-            set_long("background-repeat", v, n, cx);
             set_long("background-position", v, n, cx);
             set_long("background-size", v, n, cx);
+            set_long("background-repeat", v, n, cx);
+            set_long("background-color", v, n, cx);
             return true;
         }
         if (ident_is(v, n, "none")) {
-            set_long("background-color", "transparent", 11, cx);
             set_long("background-image", "none", 4, cx);
-            set_long("background-repeat", "repeat", 6, cx);
             set_long("background-position", "0% 0%", 5, cx);
             set_long("background-size", "auto", 4, cx);
+            set_long("background-repeat", "repeat", 6, cx);
+            set_long("background-color", "transparent", 11, cx);
             return true;
         }
         return set_background(v, n, cx);
@@ -5231,14 +5309,21 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     case SH_FLEX_FLOW: {
         const char *t[2];
         size_t tl[2];
+        if (global) return set_long("flex-direction", v, n, cx), set_long("flex-wrap", v, n, cx), true;
         int k = split_checked(v, n, t, tl, 2, ' ', cx);
+        /* an omitted longhand is its initial value */
+        const char *direction = "row", *wrap = "nowrap";
+        size_t dn = 3, wn = 6;
+        bool seen_direction = false, seen_wrap = false;
         for (int i = 0; i < k; i++) {
             uint8_t d;
-            if (kw_find(kw_fdir, t[i], tl[i], &d)) set_long("flex-direction", t[i], tl[i], cx);
-            else if (kw_find(kw_fwrap, t[i], tl[i], &d)) set_long("flex-wrap", t[i], tl[i], cx);
-            else if (global) set_long("flex-direction", v, n, cx), set_long("flex-wrap", v, n, cx);
+            if (!seen_direction && kw_find(kw_fdir, t[i], tl[i], &d)) direction = t[i], dn = tl[i], seen_direction = true;
+            else if (!seen_wrap && kw_find(kw_fwrap, t[i], tl[i], &d)) wrap = t[i], wn = tl[i], seen_wrap = true;
             else return false;
         }
+        if (k < 1) return false;
+        set_long("flex-direction", direction, dn, cx);
+        set_long("flex-wrap", wrap, wn, cx);
         return true;
     }
     case SH_GAP: {
@@ -5284,7 +5369,11 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         size_t tl[2];
         int k = split_checked(v, n, t, tl, 2, ' ', cx);
         if (k < 1) return false;
-        if (p->sh == SH_PLACE_CONTENT) return set_long("justify-content", t[k - 1], tl[k - 1], cx);
+        if (p->sh == SH_PLACE_CONTENT) {
+            /* <'align-content'> <'justify-content'>? */
+            set_long("align-content", t[0], tl[0], cx);
+            return set_long("justify-content", t[k - 1], tl[k - 1], cx);
+        }
         set_long("align-self", t[0], tl[0], cx);
         return set_long("justify-self", t[k - 1], tl[k - 1], cx);
     }
@@ -5315,10 +5404,16 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         return true;
     }
     case SH_GRID_TEMPLATE: case SH_GRID: {
+        /* grid also resets the implicit grid's longhands (CSS Grid 2 §7.8) */
         if (global || ident_is(v, n, "none")) {
             set_long("grid-template-rows", v, n, cx);
             set_long("grid-template-columns", v, n, cx);
             set_long("grid-template-areas", v, n, cx);
+            if (p->sh == SH_GRID) {
+                set_long("grid-auto-rows", global ? v : "auto", global ? n : 4, cx);
+                set_long("grid-auto-columns", global ? v : "auto", global ? n : 4, cx);
+                set_long("grid-auto-flow", global ? v : "row", global ? n : 3, cx);
+            }
             return true;
         }
         const char *t[2];
@@ -5341,18 +5436,24 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
                         break;
                     }
                 size_t rn = (size_t)(t[side] + tl[side] - rest);
+                bool dense = false;
+                for (int i = 0; i < k; i++) if (ident_is(w[i], wl[i], "dense")) dense = true;
+                const char *flow = side ? (dense ? "column dense" : "column") : (dense ? "row dense" : "row");
+                bool other = set_long(side ? "grid-template-rows" : "grid-template-columns", t[1 - side], tl[1 - side], cx);
                 set_long(side ? "grid-template-columns" : "grid-template-rows", "none", 4, cx);
                 set_long("grid-template-areas", "none", 4, cx);
                 set_long(side ? "grid-auto-columns" : "grid-auto-rows", rn ? rest : "auto", rn ? rn : 4, cx);
-                set_long("grid-auto-flow", side ? "column" : "row", side ? 6 : 3, cx);
-                return set_long(side ? "grid-template-rows" : "grid-template-columns", t[1 - side], tl[1 - side], cx);
+                set_long(side ? "grid-auto-rows" : "grid-auto-columns", "auto", 4, cx);
+                set_long("grid-auto-flow", flow, strlen(flow), cx);
+                return other;
             }
         }
+        bool ok;
         if (!memchr(t[0], '"', tl[0]) && !memchr(t[0], '\'', tl[0])) {
             set_long("grid-template-areas", "none", 4, cx);
-            return set_long("grid-template-rows", t[0], tl[0], cx) &&
-                   set_long("grid-template-columns", t[1], tl[1], cx);
-        }
+            ok = set_long("grid-template-rows", t[0], tl[0], cx) &&
+                 set_long("grid-template-columns", t[1], tl[1], cx);
+        } else {
         /* "a b" size "c d" size ... / columns */
         char areas[1024], rows[1024];
         size_t an = 0, rn = 0;
@@ -5382,16 +5483,24 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
             if (rn + 6 > sizeof rows) return false;
             memcpy(rows + rn, "auto ", 5), rn += 5;
         }
-        return set_long("grid-template-areas", areas, an, cx) && set_long("grid-template-rows", rows, rn, cx) &&
-               set_long("grid-template-columns", t[1], tl[1], cx);
+        ok = set_long("grid-template-areas", areas, an, cx) && set_long("grid-template-rows", rows, rn, cx) &&
+             set_long("grid-template-columns", t[1], tl[1], cx);
+        }
+        if (ok && p->sh == SH_GRID) {
+            set_long("grid-auto-rows", "auto", 4, cx);
+            set_long("grid-auto-columns", "auto", 4, cx);
+            set_long("grid-auto-flow", "row", 3, cx);
+        }
+        return ok;
     }
     case SH_PLACE_ITEMS: {
         const char *t[2];
         size_t tl[2];
         int k = split_checked(v, n, t, tl, 2, ' ', cx);
         if (k < 1) return false;
+        bool aligned = set_long("align-items", t[0], tl[0], cx);
         set_long("justify-items", t[k - 1], tl[k - 1], cx);
-        return set_long("align-items", t[0], tl[0], cx);
+        return aligned;
     }
     }
     return false;
@@ -5664,6 +5773,429 @@ void css_prop_longhands(const struct propdef *p, uint8_t *set) {
         __atomic_store_n(&longhand_ready[i], 1, __ATOMIC_RELEASE);
     }
     memcpy(set, longhand_sets[i], NPROPS);
+}
+
+/* ---------------------------------------------------------------- CSSOM shorthands
+   A CSSOM declaration block holds longhands (CSSOM 6.6 "CSS declaration blocks"): setting a
+   shorthand sets each longhand it maps to, and serialization puts them back together. Both
+   directions follow the shorthand's own parser (apply_short): the longhands it maps to are the
+   names it gives a value for "initial" (the expansion css_prop_longhands reads), in that,
+   canonical, order; a value's longhand values are the texts it gives each (set_long, through
+   cx->record), in the strict grammar CSS.supports() reads. */
+struct longhand_names { int count; const char *names[]; };
+static struct longhand_names *longhand_lists[NPROPS];
+static void record_name(void *opaque, const char *name, const char *value, size_t n) {
+    (void)value; (void)n;
+    sbuf *b = opaque;
+    sb_puts(b, name); sb_putc(b, 0);
+}
+int css_shorthand_longhands(const struct propdef *p, const char *const **names) {
+    *names = NULL;
+    if (!p || p->type != PT_SHORT) return 0;
+    int i = css_prop_index(p);
+    struct longhand_names *list = __atomic_load_n(&longhand_lists[i], __ATOMIC_ACQUIRE);
+    if (!list) {
+        sbuf b = {0};
+        arena_t a = {0}; jmp_buf trap; a.trap = &trap;
+        uint8_t bits[NPROPS]; memset(bits, 0, sizeof bits);
+        if (!setjmp(trap)) {
+            style_t st, parent; css_style_init(&parent, NULL); css_style_init(&st, &parent);
+            struct cx cx = {.s=&st, .parent=&parent, .em=16, .rem=16, .vw=800, .vh=600, .a=&a, .set=bits,
+                            .record=record_name, .record_opaque=&b};
+            css_apply(p, "initial", 7, &cx);
+        }
+        ar_free(&a);
+        int count = 0;
+        for (size_t k = 0; k < b.n; k++) if (!b.p[k]) count++;
+        list = malloc(sizeof *list + (size_t)count * sizeof *list->names + b.n);
+        if (!list) { sb_free(&b); return 0; }
+        char *text = (char *)(list->names + count);
+        if (b.n) memcpy(text, b.p, b.n);
+        list->count = count;
+        for (int k = 0; k < count; k++) { list->names[k] = text; text += strlen(text) + 1; }
+        sb_free(&b);
+        struct longhand_names *none = NULL;
+        if (!__atomic_compare_exchange_n(&longhand_lists[i], &none, list, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            free(list); list = none;
+        }
+    }
+    *names = list->names;
+    return list->count;
+}
+
+static bool css_wide_keyword(const char *v, size_t n) {
+    return ident_is(v, n, "inherit") || ident_is(v, n, "initial") || ident_is(v, n, "unset") ||
+           ident_is(v, n, "revert") || ident_is(v, n, "revert-layer");
+}
+/* the four corners' values of border-radius: h, or "h v" when the vertical radius differs */
+static int radius_expand(const struct propdef *p, const char *v, size_t n, const char *const *names,
+                         css_longhand_record *each, void *opaque) {
+    if (!css_value_supported(p, v, n)) return css_value_valid(p, v, n) ? -1 : 0;
+    const char *half[2], *t[2][4];
+    size_t hl[2], tl[2][4];
+    int halves = split(v, n, half, hl, 2, '/'), k[2] = {0, 0};
+    for (int h = 0; h < halves; h++) k[h] = split(half[h], hl[h], t[h], tl[h], 4, ' ');
+    if (halves < 1 || k[0] < 1 || (halves == 2 && k[1] < 1)) return 0;
+    static const int pick[5][4] = {{0}, {0, 0, 0, 0}, {0, 1, 0, 1}, {0, 1, 2, 1}, {0, 1, 2, 3}};
+    sbuf corner = {0};
+    for (int i = 0; i < 4; i++) {
+        int a = pick[k[0]][i];
+        corner.n = 0;
+        sb_put(&corner, t[0][a], tl[0][a]);
+        if (halves == 2) {
+            int b = pick[k[1]][i];
+            if (tl[1][b] != tl[0][a] || memcmp(t[1][b], t[0][a], tl[0][a])) { sb_putc(&corner, ' '); sb_put(&corner, t[1][b], tl[1][b]); }
+        }
+        each(opaque, names[i], corner.p, corner.n);
+    }
+    sb_free(&corner);
+    return 1;
+}
+static void record_value(void *opaque, const char *name, const char *value, size_t n) {
+    sbuf *b = opaque;
+    sb_puts(b, name); sb_putc(b, 0); sb_put(b, value, n); sb_putc(b, 0);
+}
+int css_shorthand_expand(const struct propdef *p, const char *v, size_t n, css_longhand_record *each, void *opaque) {
+    if (!p || p->type != PT_SHORT) return 0;
+    trim(&v, &n);
+    const char *const *names;
+    int count = css_shorthand_longhands(p, &names);
+    if (!n) return 0;
+    if (!count) return -2;
+    if (css_wide_keyword(v, n)) { for (int i = 0; i < count; i++) each(opaque, names[i], v, n); return 1; }
+    if (p->sh == SH_ALL) return 0;
+    /* values whose parser writes no longhand text (motion lists, offset), or
+       loses some of it (grid-template's areas with line names) */
+    if (p->sh == SH_ANIMATION || p->sh == SH_TRANSITION || p->sh == SH_OFFSET ||
+        ((p->sh == SH_GRID || p->sh == SH_GRID_TEMPLATE) && (memchr(v, '"', n) || memchr(v, '\'', n))))
+        return css_value_valid(p, v, n) ? -1 : 0;
+    if (p->sh == SH_BORDER_RADIUS) return radius_expand(p, v, n, names, each, opaque);
+    sbuf given = {0};
+    arena_t *a = calloc(1, sizeof *a);
+    if (!a) return -2;
+    a->limit = 1u << 20;
+    jmp_buf trap;
+    a->trap = &trap;
+    bool ok = false;
+    if (!setjmp(trap)) {
+        style_t st, parent; css_style_init(&parent, NULL); css_style_init(&st, &parent);
+        uint8_t *set = ar_alloc(a, NPROPS);
+        struct cx cx = {.s=&st, .parent=&parent, .em=16, .rem=16, .vw=800, .vh=600, .a=a, .set=set,
+                        .supports_probe=true, .record=record_value, .record_opaque=&given};
+        ok = css_apply(p, v, n, &cx) && !cx.invalid;
+    }
+    ar_free(a); free(a);
+    /* every longhand, or the block keeps the value as the shorthand's own */
+    int found = 0;
+    for (size_t at = 0; ok && at < given.n; found++) { at += strlen(given.p + at) + 1; at += strlen(given.p + at) + 1; }
+    int result = ok && found == count ? 1 : css_value_valid(p, v, n) ? -1 : 0;
+    for (size_t at = 0; result == 1 && at < given.n;) {
+        const char *name = given.p + at; at += strlen(name) + 1;
+        const char *value = given.p + at; at += strlen(value) + 1;
+        each(opaque, name, value, strlen(value));
+    }
+    sb_free(&given);
+    return result;
+}
+
+static bool text_same(const char *a, size_t an, const char *b, size_t bn) { return an == bn && !memcmp(a, b, an); }
+static bool text_word(const char *a, size_t an, const char *word) { return an == strlen(word) && strn_ieq(a, word, an); }
+/* 1-4 values for top, right, bottom, left: the shortest that gives each */
+static void put_box(sbuf *out, const char *const *v, const size_t *l) {
+    int k = 4;
+    if (text_same(v[3], l[3], v[1], l[1])) {
+        k = 3;
+        if (text_same(v[2], l[2], v[0], l[0])) { k = 2; if (text_same(v[1], l[1], v[0], l[0])) k = 1; }
+    }
+    for (int i = 0; i < k; i++) { if (i) sb_putc(out, ' '); sb_put(out, v[i], l[i]); }
+}
+static void put_pair(sbuf *out, const char *a, size_t an, const char *b, size_t bn) {
+    sb_put(out, a, an);
+    if (!text_same(a, an, b, bn)) { sb_putc(out, ' '); sb_put(out, b, bn); }
+}
+/* the values (in order: indexes into v) other than their initial ones; all
+   initial, the one at fallback */
+static void put_given(sbuf *out, const char *const *v, const size_t *l, const int *order, const char *const *initial,
+                      int count, int fallback) {
+    size_t at = out->n;
+    for (int i = 0; i < count; i++) {
+        int j = order[i];
+        if (text_word(v[j], l[j], initial[i])) continue;
+        if (out->n > at) sb_putc(out, ' ');
+        sb_put(out, v[j], l[j]);
+    }
+    if (out->n == at) sb_put(out, v[fallback], l[fallback]);
+}
+static bool equal_groups(const char *const *v, const size_t *l, int groups, int size) {
+    for (int g = 0; g < groups; g++)
+        for (int i = 1; i < size; i++) if (!text_same(v[g * size], l[g * size], v[g * size + i], l[g * size + i])) return false;
+    return true;
+}
+/* a grid line the shorthand implies when it omits one: a custom ident stands for itself, else auto */
+static bool implied_line(const char *line, size_t ln, const char *from, size_t fn) {
+    return is_custom_ident(from, fn) ? text_same(line, ln, from, fn) : text_word(line, ln, "auto");
+}
+bool css_shorthand_serialize(const struct propdef *p, const char *const *v, const size_t *l, sbuf *out) {
+    const char *const *names;
+    int count = css_shorthand_longhands(p, &names);
+    if (!count) return false;
+    /* a CSS-wide keyword stands for the shorthand only when every longhand has it */
+    int wide = 0;
+    for (int i = 0; i < count; i++) wide += css_wide_keyword(v[i], l[i]);
+    if (wide) {
+        if (wide != count) return false;
+        for (int i = 1; i < count; i++) if (!text_same(v[i], l[i], v[0], l[0])) return false;
+        sb_put(out, v[0], l[0]);
+        return true;
+    }
+    static const int wsc[3] = {0, 1, 2}, csw[3] = {2, 1, 0};
+    static const char *const border_initial[3] = {"medium", "none", "currentcolor"};
+    switch (p->sh) {
+    case SH_MARGIN: case SH_PADDING: case SH_INSET: case SH_BORDER_WIDTH: case SH_BORDER_STYLE: case SH_BORDER_COLOR:
+        if (count != 4) return false;
+        put_box(out, v, l);
+        return true;
+    case SH_MARGIN_INLINE: case SH_MARGIN_BLOCK: case SH_PADDING_INLINE: case SH_PADDING_BLOCK: case SH_INSET_INLINE:
+    case SH_INSET_BLOCK: case SH_GAP: case SH_OVERFLOW: case SH_PLACE_ITEMS: case SH_PLACE_SELF: case SH_PLACE_CONTENT:
+        if (count != 2) return false;
+        put_pair(out, v[0], l[0], v[1], l[1]);
+        return true;
+    case SH_BORDER_TOP: case SH_BORDER_RIGHT: case SH_BORDER_BOTTOM: case SH_BORDER_LEFT:
+        if (count != 3) return false;
+        put_given(out, v, l, wsc, border_initial, 3, 1);
+        return true;
+    case SH_BORDER: case SH_BORDER_INLINE: case SH_BORDER_BLOCK: {
+        /* the widths, styles and colours of every side: one value for all of them */
+        int sides = count / 3;
+        if (sides * 3 != count || !equal_groups(v, l, 3, sides)) return false;
+        const char *side[3] = {v[0], v[sides], v[2 * sides]};
+        size_t side_l[3] = {l[0], l[sides], l[2 * sides]};
+        put_given(out, side, side_l, wsc, border_initial, 3, 1);
+        return true;
+    }
+    case SH_OUTLINE: {
+        static const char *const initial[3] = {"currentcolor", "none", "medium"};
+        if (count != 3) return false;
+        put_given(out, v, l, csw, initial, 3, 1);
+        return true;
+    }
+    case SH_LIST_STYLE: {
+        /* position, image, type; a type named inside or outside alone would read back as the
+           position, so the position is written before it (list_style_text does the same) */
+        static const int order[3] = {0, 1, 2};
+        static const char *const initial[3] = {"outside", "none", "disc"};
+        if (count != 3) return false;
+        if (text_word(v[2], l[2], "inside") || text_word(v[2], l[2], "outside")) {
+            sb_put(out, v[0], l[0]);
+            if (!text_word(v[1], l[1], "none")) { sb_putc(out, ' '); sb_put(out, v[1], l[1]); }
+            sb_putc(out, ' ');
+            sb_put(out, v[2], l[2]);
+            return true;
+        }
+        put_given(out, v, l, order, initial, 3, 0);
+        return true;
+    }
+    case SH_FLEX_FLOW: {
+        static const int order[2] = {0, 1};
+        static const char *const initial[2] = {"row", "nowrap"};
+        if (count != 2) return false;
+        put_given(out, v, l, order, initial, 2, 0);
+        return true;
+    }
+    case SH_FLEX:
+        if (count != 3) return false;
+        for (int i = 0; i < 3; i++) { if (i) sb_putc(out, ' '); sb_put(out, v[i], l[i]); }
+        return true;
+    case SH_TEXT_DECORATION:
+        if (count != 1) return false;
+        sb_put(out, v[0], l[0]);
+        return true;
+    case SH_ALL: case SH_ANIMATION: case SH_TRANSITION: case SH_OFFSET:
+        return false; /* only a CSS-wide keyword: their longhands' values are not the shorthand's text */
+    case SH_FONT: {
+        /* style, weight, size, line height, family: [style] [weight] size[ / line-height] family */
+        if (count != 5) return false;
+        for (int i = 0; i < 2; i++) if (!text_word(v[i], l[i], "normal")) { sb_put(out, v[i], l[i]); sb_putc(out, ' '); }
+        sb_put(out, v[2], l[2]);
+        if (!text_word(v[3], l[3], "normal")) { sb_puts(out, " / "); sb_put(out, v[3], l[3]); }
+        sb_putc(out, ' ');
+        sb_put(out, v[4], l[4]);
+        return true;
+    }
+    case SH_BACKGROUND: {
+        /* image, position, size, repeat, colour: [colour] [image] [position[ / size]] [repeat], all initial none */
+        if (count != 5) return false;
+        size_t at = out->n;
+        const char *sep = "";
+        if (!text_word(v[4], l[4], "transparent")) { sb_put(out, v[4], l[4]); sep = " "; }
+        if (!text_word(v[0], l[0], "none")) { sb_puts(out, sep); sb_put(out, v[0], l[0]); sep = " "; }
+        bool sized = !text_word(v[2], l[2], "auto");
+        if (sized || !text_word(v[1], l[1], "0% 0%")) {
+            sb_puts(out, sep); sb_put(out, v[1], l[1]); sep = " ";
+            if (sized) { sb_puts(out, " / "); sb_put(out, v[2], l[2]); }
+        }
+        if (!text_word(v[3], l[3], "repeat")) { sb_puts(out, sep); sb_put(out, v[3], l[3]); }
+        if (out->n == at) sb_puts(out, "none");
+        return true;
+    }
+    case SH_GRID_ROW: case SH_GRID_COLUMN:
+        if (count != 2) return false;
+        sb_put(out, v[0], l[0]);
+        if (!implied_line(v[1], l[1], v[0], l[0])) { sb_puts(out, " / "); sb_put(out, v[1], l[1]); }
+        return true;
+    case SH_GRID_AREA: {
+        /* row-start, column-start, row-end, column-end: the end ones the shorthand implies are left out */
+        if (count != 4) return false;
+        int k = 4;
+        if (implied_line(v[3], l[3], v[1], l[1])) {
+            k = 3;
+            if (implied_line(v[2], l[2], v[0], l[0])) { k = 2; if (implied_line(v[1], l[1], v[0], l[0])) k = 1; }
+        }
+        for (int i = 0; i < k; i++) { if (i) sb_puts(out, " / "); sb_put(out, v[i], l[i]); }
+        return true;
+    }
+    case SH_GRID_TEMPLATE: case SH_GRID: {
+        /* rows, columns, areas (grid: then the implicit grid's rows, columns and flow) */
+        if (count < 3 || !text_word(v[2], l[2], "none")) return false;
+        bool implicit = count == 6 && (!text_word(v[3], l[3], "auto") || !text_word(v[4], l[4], "auto") ||
+                                       !text_word(v[5], l[5], "row"));
+        if (!implicit) {
+            if (text_word(v[0], l[0], "none") && text_word(v[1], l[1], "none")) sb_puts(out, "none");
+            else { sb_put(out, v[0], l[0]); sb_puts(out, " / "); sb_put(out, v[1], l[1]); }
+            return true;
+        }
+        bool dense = l[5] > 5 && (strn_ieq(v[5], "dense ", 6) || (l[5] > 6 && strn_ieq(v[5] + l[5] - 6, " dense", 6)));
+        bool column = l[5] >= 6 && (strn_ieq(v[5], "column", 6) || strn_ieq(v[5] + l[5] - 6, "column", 6));
+        if (!column && text_word(v[0], l[0], "none") && text_word(v[4], l[4], "auto")) {
+            sb_puts(out, dense ? "auto-flow dense" : "auto-flow");
+            if (!text_word(v[3], l[3], "auto")) { sb_putc(out, ' '); sb_put(out, v[3], l[3]); }
+            sb_puts(out, " / "); sb_put(out, v[1], l[1]);
+            return true;
+        }
+        if (column && text_word(v[1], l[1], "none") && text_word(v[3], l[3], "auto")) {
+            sb_put(out, v[0], l[0]); sb_puts(out, dense ? " / auto-flow dense" : " / auto-flow");
+            if (!text_word(v[4], l[4], "auto")) { sb_putc(out, ' '); sb_put(out, v[4], l[4]); }
+            return true;
+        }
+        return false;
+    }
+    case SH_CONTAINER:
+        if (count != 2) return false;
+        sb_put(out, v[0], l[0]);
+        if (!text_word(v[1], l[1], "normal")) { sb_puts(out, " / "); sb_put(out, v[1], l[1]); }
+        return true;
+    case SH_BORDER_RADIUS: {
+        /* each corner "h" or "h v": the horizontal radii, then " / " and the vertical ones when they differ */
+        if (count != 4) return false;
+        const char *h[4], *vv[4], *t[2];
+        size_t hn[4], vn[4], tl[2];
+        bool differ = false;
+        for (int i = 0; i < 4; i++) {
+            int k = split(v[i], l[i], t, tl, 2, ' ');
+            if (k < 1) return false;
+            h[i] = t[0]; hn[i] = tl[0];
+            vv[i] = t[k - 1]; vn[i] = tl[k - 1];
+            differ |= !text_same(h[i], hn[i], vv[i], vn[i]);
+        }
+        put_box(out, h, hn);
+        if (differ) { sb_puts(out, " / "); put_box(out, vv, vn); }
+        return true;
+    }
+    }
+    return false;
+}
+
+/* each longhand name with the shorthands it is in, in CSSOM's preferred order (CSSOM
+   "preferred order": the most longhands first, then by name) */
+struct shorthands_entry { const char *name; int count; const struct propdef *shorthands[8]; };
+struct shorthands_index { int count; struct shorthands_entry entries[]; };
+static struct shorthands_index *shorthands_index;
+static int preferred_cmp(const void *a, const void *b) {
+    const struct propdef *x = *(const struct propdef *const *)a, *y = *(const struct propdef *const *)b;
+    const char *const *names;
+    int xn = css_shorthand_longhands(x, &names), yn = css_shorthand_longhands(y, &names);
+    return xn != yn ? (xn > yn ? -1 : 1) : strcmp(x->name, y->name);
+}
+struct shorthand_pair { const char *name; const struct propdef *shorthand; int order; };
+static int pair_cmp(const void *a, const void *b) {
+    const struct shorthand_pair *x = a, *y = b;
+    int c = strcmp(x->name, y->name);
+    return c ? c : x->order - y->order;
+}
+static int entry_cmp(const void *key, const void *entry) {
+    return strcmp(key, ((const struct shorthands_entry *)entry)->name);
+}
+int css_shorthands_of(const char *longhand, const struct propdef *const **shorthands) {
+    *shorthands = NULL;
+    props_init();
+    struct shorthands_index *index = __atomic_load_n(&shorthands_index, __ATOMIC_ACQUIRE);
+    if (!index) {
+        const struct propdef *list[NPROPS];
+        int n = 0, pairs = 0;
+        for (int i = 0; i < NPROPS; i++) if (props[i].type == PT_SHORT) list[n++] = &props[i];
+        qsort(list, (size_t)n, sizeof *list, preferred_cmp);
+        for (int i = 0; i < n; i++) { const char *const *names; pairs += css_shorthand_longhands(list[i], &names); }
+        struct shorthand_pair *pair = malloc((size_t)(pairs ? pairs : 1) * sizeof *pair);
+        if (!pair) return 0;
+        int k = 0;
+        for (int i = 0; i < n; i++) {
+            const char *const *names;
+            int count = css_shorthand_longhands(list[i], &names);
+            for (int j = 0; j < count; j++, k++) pair[k] = (struct shorthand_pair){names[j], list[i], k};
+        }
+        qsort(pair, (size_t)k, sizeof *pair, pair_cmp);
+        int entries = 0;
+        for (int i = 0; i < k; i++) entries += !i || strcmp(pair[i].name, pair[i - 1].name);
+        index = calloc(1, sizeof *index + (size_t)entries * sizeof *index->entries);
+        if (!index) { free(pair); return 0; }
+        for (int i = 0; i < k; i++) {
+            if (!i || strcmp(pair[i].name, pair[i - 1].name)) index->entries[index->count++].name = pair[i].name;
+            struct shorthands_entry *e = &index->entries[index->count - 1];
+            if (e->count < 8) e->shorthands[e->count++] = pair[i].shorthand;
+        }
+        free(pair);
+        struct shorthands_index *none = NULL;
+        if (!__atomic_compare_exchange_n(&shorthands_index, &none, index, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            free(index); index = none;
+        }
+    }
+    const struct shorthands_entry *e = bsearch(longhand, index->entries, (size_t)index->count, sizeof *index->entries, entry_cmp);
+    if (!e) return 0;
+    *shorthands = e->shorthands;
+    return e->count;
+}
+
+/* CSS Logical 1's logical property groups (the ones the table has): a longhand's group, and
+   whether its mapping is flow-relative (a logical name, the table's alias of the physical
+   property it maps to here). false: in no group. */
+bool css_prop_logical_group(const char *name, char *group, size_t size, bool *logical) {
+    *logical = false;
+    const char *physical = name;
+    for (size_t i = 0; i < sizeof aliases / sizeof *aliases; i++)
+        if (!strcmp(aliases[i].alias, name) && aliases[i].name[0] && (strstr(name, "inline") || strstr(name, "block"))) {
+            physical = aliases[i].name; *logical = true; break;
+        }
+    static const struct { const char *name, *group; } fixed[] = {
+        {"top", "inset"}, {"right", "inset"}, {"bottom", "inset"}, {"left", "inset"}, {"width", "size"}, {"height", "size"},
+        {"min-width", "min-size"}, {"min-height", "min-size"}, {"max-width", "max-size"}, {"max-height", "max-size"}};
+    for (size_t i = 0; i < sizeof fixed / sizeof *fixed; i++)
+        if (!strcmp(physical, fixed[i].name)) { snprintf(group, size, "%s", fixed[i].group); return true; }
+    static const char *const families[] = {"margin-", "padding-", "border-"};
+    for (int f = 0; f < 3; f++) {
+        size_t fl = strlen(families[f]);
+        if (strncmp(physical, families[f], fl)) continue;
+        for (int s = 0; s < 4; s++) {
+            size_t sl = strlen(side_names[s]);
+            const char *rest = physical + fl + sl;
+            if (strncmp(physical + fl, side_names[s], sl)) continue;
+            if (f < 2 && !*rest) { snprintf(group, size, "%.*s", (int)(fl - 1), families[f]); return true; }
+            if (f == 2 && (!strcmp(rest, "-width") || !strcmp(rest, "-style") || !strcmp(rest, "-color"))) {
+                snprintf(group, size, "border%s", rest); return true;
+            }
+        }
+    }
+    *logical = false;
+    return false;
 }
 
 /* Fixed notation within the CSS number grammar, to the precision of the stored floats

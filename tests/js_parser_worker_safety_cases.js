@@ -114,7 +114,7 @@ globalThis.runParserWorkerSafetyCases=async function(config){
                 w.onerror=e=>{clearTimeout(timeout);reject(new Error(e.message));};
                 w.postMessage({mode,importURL:config.importURL});
             });
-            check(mode+' completed',result.checks>=20);check(mode+' assertions',result.errors.length===0);count+=result.checks;
+            check(mode+' completed',result.checks>=20);check(mode+' assertions'+(result.errors.length?': '+result.errors.join('; '):''),result.errors.length===0);count+=result.checks;
         }finally{w.terminate();}
     }
     let authorCalls=0;const poisoned=[];

@@ -20,8 +20,10 @@
                          Worker no body is a Document, responseType "document" is ignored and there
                          is no responseXML ([Exposed=Window]).
      realm.synchronous   whether the realm's event loop can pause for a synchronous request: a
-                         Worker's can (browserjsworker.c waits for the parent's answer); a Window's
-                         cannot, so open() with async false is a NotSupportedError there.
+                         Worker's can (browserjsworker.c waits for the parent's answer), a Window's
+                         when its host can serve the network alone (js.c native_fetch_wait over
+                         web_host.wait_request); otherwise open() with async false is a
+                         NotSupportedError.
    The bootstraps have the rest by the same names, as js_blob.js uses them: Event, EventTarget,
    DOMException, Headers, ProgressEvent, eventState, dispatch, installHandlers, report, blobBridge
    and host.now, timer, clear, textDecoder and textDecode. xhrInterfaces returns the interfaces and
