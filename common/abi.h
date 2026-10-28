@@ -139,7 +139,12 @@ enum {
     SYS_USER_SETTINGS_CHANGES, /* (watch): the N_USER_SETTING_* changed since its last call, 0: none */
     SYS_USER_LANGUAGES,        /* (char *out, cap): the list's length; the list and a zero written */
     SYS_USER_LANGUAGES_SET,    /* (const char *list, length) */
-    SYS_MAX = 208          /* above every number (what syscallfuzz tries) */
+    /* Watches (docs/nocturne-native-abi.md §1): a handle receivable once what it watches has
+       changed, until SYS_WATCH_TAKE takes the count. Each call after it gives one. */
+    SYS_WATCH_TAKE = 207,     /* (watch): the changes since its last take (0: none) */
+    SYS_ENTRY_WATCH,          /* (path, N_WATCH_NAME or N_WATCH_FOLDER): a watch on C: (§3) */
+    SYS_AUDIO_OUTPUT_WATCH,   /* (): a watch on what SYS_AUDIO_OUTPUT reports (§9) */
+    SYS_MAX = 210          /* above every number (what syscallfuzz tries) */
 };
 
 /* ---- native handles ---- */
@@ -155,6 +160,13 @@ enum {
 #define N_KIND_PCI 10       /* the right to drive one PCI function */
 #define N_KIND_PAGER 11     /* the right to supply one paged memory object; never sent */
 #define N_KIND_USER_SETTINGS 12 /* a watch on the user's settings */
+#define N_KIND_WATCH 13     /* a watch (SYS_WATCH_TAKE): receivable once what it watches changed */
+
+/* SYS_ENTRY_WATCH: what is watched on C: */
+#define N_WATCH_NAME 1u   /* the last name of the path in its folder, whether an entry has it or not */
+#define N_WATCH_FOLDER 2u /* every entry directly in the folder the path names */
+/* SYS_WATCH_TAKE counts up to this and stays there until the count is taken */
+#define N_WATCH_CHANGES_MAX 0xffffffffu
 
 /* The user's settings (docs/nocturne-native-abi.md §12). The system keeps them in the user's
    AppData\Nocturne\Settings.conf, which no app writes: each change an app asks for applies at once,

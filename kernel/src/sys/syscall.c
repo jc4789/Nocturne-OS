@@ -11,6 +11,7 @@
 #include "sys/channel.h"
 #include "sys/stream.h"
 #include "sys/usersettings.h"
+#include "sys/watch.h"
 #include "fs/store.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
@@ -29,7 +30,7 @@
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
 
 _Static_assert(sizeof(struct n_gpu_blit) == 32, "GPU blit ABI");
-_Static_assert(SYS_USER_LANGUAGES_SET < SYS_MAX, "every system call number is below SYS_MAX");
+_Static_assert(SYS_WATCH_TAKE == 207 && SYS_AUDIO_OUTPUT_WATCH < SYS_MAX, "every system call number is below SYS_MAX");
 _Static_assert(sizeof(struct n_pager_fault) == 16 && sizeof(struct n_pager_supply) == 32, "pager ABI");
 
 extern char cpu_brand[64];
@@ -2845,6 +2846,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_USER_SETTINGS_CHANGES: ret = user_settings_changes((int)a); break;
     case SYS_USER_LANGUAGES: ret = user_languages((char *)a, b); break;
     case SYS_USER_LANGUAGES_SET: ret = user_languages_set((const char *)a, b); break;
+    case SYS_WATCH_TAKE: ret = watch_take((int)a); break;
     case SYS_PAGER_CREATE: ret = sys_pager_create(a, (int32_t *)b); break;
     case SYS_PAGER_TAKE: ret = sys_pager_take((int)a, (struct n_pager_fault *)b, c, (int64_t)d); break;
     case SYS_PAGER_SUPPLY: ret = sys_pager_supply((int)a, (const struct n_pager_supply *)b, c); break;

@@ -24,6 +24,8 @@ n_result screen_format(struct screen_format *out) {
     return __syscall(SYS_SCREEN_INFO, (long)out, sizeof *out, 0, 0, 0);
 }
 
+n_handle n_screen_watch(void) { return (n_handle)__syscall(SYS_SCREEN_INFO, 0, 0, SCREEN_WATCH, 0, 0); }
+
 int display_bits_per_channel(void) {
     /* not cached: Settings can switch the desktop between 8 and 10 bpc */
     struct screen_format f;

@@ -52,6 +52,13 @@ struct desktop_settings {
    now. A program built before chosen passes SCREEN_MODES_FIRST_BYTES and gets that much. */
 #define SCREEN_MODES_GET 3
 #define SCREEN_MODE_SET 4
+/* SYS_SCREEN_INFO with its third argument SCREEN_WATCH (the first two 0): a watch (N_KIND_WATCH,
+   abi.h), receivable once anything SCREEN_SETTINGS_GET, the struct screen_format reply or
+   SCREEN_MODES_GET reports has changed, whoever changed it: the desktop's size and settings,
+   whether smooth gradients can be shown, the monitor offered and its modes, the mode wanted, a
+   trial beginning or ending, a refusal, the source, the user's choice. A trial's time counting
+   down is no change. */
+#define SCREEN_WATCH 5
 #define SCREEN_MODE_TRIAL_MS 15000u /* a mode tried and not kept goes back after this */
 enum {
     SCREEN_SOURCE_FIRMWARE,       /* the firmware's mode: no display driver has run */

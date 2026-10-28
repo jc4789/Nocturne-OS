@@ -6,6 +6,8 @@
 
 /* The work area and colour format. 0, or a negative n_result. */
 n_result screen_format(struct screen_format *out);
+/* A watch (n_watch_take) on what SYS_SCREEN_INFO reports (SCREEN_WATCH, display_abi.h). */
+n_handle n_screen_watch(void);
 /* Bits per channel the desktop delivers: 8, or 10 on a deep display. */
 int display_bits_per_channel(void);
 /* The deep plane of the window's current canvas (one byte per pixel, pitch

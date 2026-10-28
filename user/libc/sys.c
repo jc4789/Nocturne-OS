@@ -300,6 +300,7 @@ n_result n_entry_info(const char *path, struct n_entry *out) { return NC5(SYS_EN
 n_result n_entry_remove(const char *path) { return NC5(SYS_ENTRY_REMOVE, path, 0, 0, 0, 0); }
 n_result n_entry_move(const char *from, const char *to) { return NC5(SYS_ENTRY_MOVE, from, to, 0, 0, 0); }
 n_result n_entry_replace(const char *from, const char *to) { return NC5(SYS_ENTRY_REPLACE, from, to, 0, 0, 0); }
+n_handle n_entry_watch(const char *path, uint32_t what) { return (n_handle)NC5(SYS_ENTRY_WATCH, path, what, 0, 0, 0); }
 n_result n_folder_create(const char *path) { return NC5(SYS_FOLDER_CREATE, path, 0, 0, 0, 0); }
 n_result n_folder_list(const char *path, struct n_entry *out, size_t max, uint64_t start) {
     return NC5(SYS_FOLDER_LIST_SIZED, path, out, max, start, sizeof *out);
@@ -451,6 +452,8 @@ n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_
 n_result n_audio_status(n_handle a, struct n_audio_status *out) { return NC5(SYS_AUDIO_STATUS, a, out, 0, 0, 0); }
 n_result n_audio_flush(n_handle a) { return NC5(SYS_AUDIO_FLUSH, a, 0, 0, 0, 0); }
 n_result n_audio_output(struct n_audio_output *io, uint32_t set) { return NC5(SYS_AUDIO_OUTPUT, io, set, 0, 0, 0); }
+n_handle n_audio_output_watch(void) { return (n_handle)NC5(SYS_AUDIO_OUTPUT_WATCH, 0, 0, 0, 0, 0); }
+n_result n_watch_take(n_handle watch) { return NC5(SYS_WATCH_TAKE, watch, 0, 0, 0, 0); }
 n_handle n_user_settings_watch(uint32_t interest) { return (n_handle)NC5(SYS_USER_SETTINGS_WATCH, interest, 0, 0, 0, 0); }
 n_result n_user_settings_changes(n_handle watch) { return NC5(SYS_USER_SETTINGS_CHANGES, watch, 0, 0, 0, 0); }
 n_result n_user_languages(char *out, size_t cap) { return NC5(SYS_USER_LANGUAGES, out, cap, 0, 0, 0); }

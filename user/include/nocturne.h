@@ -68,6 +68,15 @@ n_result n_entry_move(const char *from, const char *to); /* never replaces: N_ER
 /* n_entry_move that lets document from take the name of a document, which goes in the same commit
    (as n_entry_remove takes it: its open handles keep it). Any other entry there: N_ERR_EXISTS. */
 n_result n_entry_replace(const char *from, const char *to);
+/* A watch on C: (n_watch_take). N_WATCH_NAME watches the last name of path in its folder, whether
+   an entry has it or not; N_WATCH_FOLDER every entry directly in the folder path names (not what
+   is inside its folders). A change counts once a new opening, n_entry_info or n_folder_list sees
+   it: an entry made, removed, moved in or out, renamed (case too) or replaced (n_entry_replace), or
+   a document's written content taken in (a save, its last writer's close, the system's writer).
+   The folder is held by what it is: moved, it is still watched; removed, the watch turns
+   N_EVENT_CLOSED. Entries not there for the caller (PRIVATE) count nothing. N_ERR_NOT_FOUND
+   without the folder, N_ERR_INVALID for another what. */
+n_handle n_entry_watch(const char *path, uint32_t what);
 n_result n_folder_create(const char *path);
 n_result n_folder_list(const char *path, struct n_entry *out, size_t max, uint64_t start); /* count */
 /* Every entry of a folder in a new array (free it); returns the count. */
@@ -260,6 +269,8 @@ n_result n_audio_flush(n_handle a);
 /* The master volume and muting as set says (N_AUDIO_SET_VOLUME, N_AUDIO_SET_MUTED; 0 only reads),
    then *io filled with them and what plays the sound (struct n_audio_output, abi.h). */
 n_result n_audio_output(struct n_audio_output *io, uint32_t set);
+/* A watch on what n_audio_output reports: the volume, muting and what plays the sound. */
+n_handle n_audio_output_watch(void);
 /* The user's settings (docs/nocturne-native-abi.md §12) belong to the system: it applies a change
    at once and keeps it; no app writes them to a file. n_user_settings_watch gives a watch
    (N_KIND_USER_SETTINGS) on the N_USER_SETTING_* in interest: N_EVENT_RECEIVABLE while one of them
@@ -273,6 +284,11 @@ n_result n_user_languages(char *out, size_t cap);
 /* Makes length bytes of list, tags between commas (spaces around them allowed), the user's
    languages, written as n_user_languages gives them; N_ERR_INVALID when one is not a tag. */
 n_result n_user_languages_set(const char *list, size_t length);
+/* Watches (N_KIND_WATCH, docs/nocturne-native-abi.md §1): N_EVENT_RECEIVABLE once what the watch
+   watches has changed, until n_watch_take takes the changes; it returns how many came since the
+   last take (0: none, at most N_WATCH_CHANGES_MAX). N_EVENT_CLOSED once what it watches is no
+   more; a take then gives what was left, then N_ERR_CLOSED. Wait for one in an event queue. */
+n_result n_watch_take(n_handle watch);
 /* Event queues: level-triggered; a ready handle is reported by every wait. */
 n_handle n_events_create(void);
 n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t token);
