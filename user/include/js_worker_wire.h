@@ -37,9 +37,13 @@ static inline int njw_load_kind_valid(uint32_t kind) {
 #define NJW_LOADED_CORS 1u
 #define NJW_LOADED_REDIRECTED 2u
 #define NJW_LOADED_OPAQUE 4u
-#define NJW_LOADED_FLAGS (NJW_LOADED_CORS | NJW_LOADED_REDIRECTED | NJW_LOADED_OPAQUE)
+/* An opaque response's: what the transport noted of the response it hides (webfetch.c's resource=,
+   shifted by NJW_LOADED_RESOURCE_SHIFT), for Cache Storage's cross-origin resource policy check. */
+#define NJW_LOADED_RESOURCE_SHIFT 3u
+#define NJW_LOADED_RESOURCE (7u << NJW_LOADED_RESOURCE_SHIFT)
+#define NJW_LOADED_FLAGS (NJW_LOADED_CORS | NJW_LOADED_REDIRECTED | NJW_LOADED_OPAQUE | NJW_LOADED_RESOURCE)
 static inline int njw_loaded_kind_valid(uint32_t kind) {
-    return kind <= (NJW_LOADED_CORS | NJW_LOADED_REDIRECTED) || kind == NJW_LOADED_OPAQUE;
+    return kind <= (NJW_LOADED_CORS | NJW_LOADED_REDIRECTED) || (kind & ~NJW_LOADED_RESOURCE) == NJW_LOADED_OPAQUE;
 }
 /* Native Nocturne pipe records, no pointers or engine bytecode. */
 struct njw_header { uint32_t magic,op,generation,request,kind,bytes; };

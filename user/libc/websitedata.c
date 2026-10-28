@@ -1,7 +1,9 @@
 /* The user's site data across the browser's stores (websitedata.h): what the Settings window
    lists and clears, and the clearing that ends a browser session. Each store keeps and clears its
-   own data (webnet.c, webstorage.c, webidb.c, web/js_opfs.c); this puts them together by site. */
+   own data (webnet.c, webstorage.c, webidb.c, web/js_opfs.c, webcache.c); this puts them together
+   by site. */
 #include "websitedata.h"
+#include "webcache.h"
 #include "webcookie.h"
 #include "webidb.h"
 #include "webprefs.h"
@@ -76,6 +78,11 @@ static void opfs_each(void *opaque, const char *origin, uint64_t bytes) {
     if (e) e->opfs_bytes = bytes;
 }
 
+static void cache_each(void *opaque, const char *origin, uint64_t bytes) {
+    struct websitedata_site *e = origin_entry(opaque, origin);
+    if (e) e->cache_bytes = bytes;
+}
+
 static int site_order(const void *a, const void *b) {
     return strcmp(((const struct websitedata_site *)a)->site, ((const struct websitedata_site *)b)->site);
 }
@@ -111,6 +118,10 @@ long websitedata_sites(webnet *net, webstorage *store, struct websitedata_site *
         n_result r = web_opfs_usage(opfs_each, &g);
         if (r < 0 && !g.failed) g.failed = r;
     }
+    if (!g.failed) {
+        int r = webcache_usage(cache_each, &g);
+        if (r && !g.failed) g.failed = r == WEB_CACHE_MEMORY ? -N_ERR_NO_MEMORY : -N_ERR_IO;
+    }
     if (g.failed) { free(g.items); return g.failed; }
     if (!g.count) { free(g.items); return 0; }
     qsort(g.items, g.count, sizeof *g.items, site_order);
@@ -124,6 +135,7 @@ long websitedata_sites(webnet *net, webstorage *store, struct websitedata_site *
             t->storage_bytes += e->storage_bytes;
             t->indexeddb_bytes += e->indexeddb_bytes;
             t->opfs_bytes += e->opfs_bytes;
+            t->cache_bytes += e->cache_bytes;
         } else {
             g.items[k++] = *e;
         }
@@ -133,7 +145,7 @@ long websitedata_sites(webnet *net, webstorage *store, struct websitedata_site *
 }
 
 uint64_t websitedata_bytes(const struct websitedata_site *s) {
-    return s ? s->cookie_bytes + s->storage_bytes + s->indexeddb_bytes + s->opfs_bytes : 0;
+    return s ? s->cookie_bytes + s->storage_bytes + s->indexeddb_bytes + s->opfs_bytes + s->cache_bytes : 0;
 }
 
 static bool origin_in_site(void *opaque, const char *origin) {
@@ -161,6 +173,9 @@ n_result websitedata_clear(webnet *net, webstorage *store, const char *site) {
     n_result o = web_opfs_clear(origin_in_site, (void *)site);
     if (o == -N_ERR_BUSY) busy = true;
     else if (o < 0 && o != -N_ERR_NOT_FOUND && !first) first = o;
+    int c = webcache_clear(origin_in_site, (void *)site);
+    if (c == WEB_CACHE_BUSY) busy = true;
+    else if (c && !first) first = c == WEB_CACHE_MEMORY ? -N_ERR_NO_MEMORY : c == WEB_CACHE_QUOTA ? -N_ERR_NO_SPACE : -N_ERR_IO;
     return first ? first : busy ? -N_ERR_BUSY : 0;
 }
 
@@ -177,6 +192,7 @@ static void clear_transient(webstorage *store) {
     if (!webprefs_site_data_transient()) return;
     (void)webidb_clear(origin_transient, NULL);
     (void)web_opfs_clear(origin_transient, NULL);
+    (void)webcache_clear(origin_transient, NULL);
     if (!store) return;
     /* Web Storage clears a host with the hosts inside it: a host whose data goes is cleared unless
        a host inside it keeps its own (an "allow" exception for a subdomain); that one's stays. */
@@ -262,7 +278,10 @@ static n_result windows_update(bool join) {
 }
 
 void websitedata_session_begin(webstorage *store) {
-    if (!windows_update(true)) clear_transient(store);
+    if (windows_update(true)) return;
+    clear_transient(store);
+    /* No window of an earlier session is left to hold a Cache object of a deleted cache. */
+    (void)webcache_purge();
 }
 
 void websitedata_session_end(webstorage *store) {

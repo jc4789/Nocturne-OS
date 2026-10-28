@@ -292,6 +292,15 @@ typedef struct len {
 float len_resolve(const len_t *l, float base); /* LK_AUTO/LK_NONE resolve to 0 */
 bool css_length_equal(const len_t *,const len_t *); /* semantic computed expression, not arena address */
 bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d); /* fallible/cancellable computed value; append/NUL or restore */
+/* What a value's grammar accepts (cssprop.c): auto, none, normal, negative values, percentages, and
+   LF_LENGTH: unitless numbers other than 0 are not lengths */
+enum { LF_AUTO = 1, LF_NONE = 2, LF_NEG = 4, LF_NORMAL = 8, LF_NOPCT = 16, LF_LENGTH = 32 };
+struct cx;
+bool css_parse_length(const char *s, size_t n, struct cx *cx, len_t *out, int flags);
+bool css_number_token(const char **s, const char *end, float *out); /* a CSS <number-token> at *s */
+const char *css_parse_url(const char *s, size_t n, arena_t *a); /* url(...) (or a string) unescaped; NULL: not one */
+void css_length_complement(arena_t *a, const len_t *x, const len_t *y, len_t *out); /* 100% - x - y (y may be NULL) */
+void css_length_mix(arena_t *a, const len_t *x, const len_t *y, double ka, double kb, len_t *out); /* ka·x + kb·y */
 bool css_query_length(const char *, size_t, float em, float rem, float vw, float vh, double *value);
 struct css_filter_step { float value; bool percentage; };
 struct css_corner_radius { len_t axis[2]; }; /* x resolves against width, y against height */
@@ -319,28 +328,118 @@ struct css_filter {
     struct css_filter_step steps[];
 };
 bool css_filter_serialize(const struct css_filter *filter, sbuf *out, web_doc *d);
-/* clip-path (css-masking-1 §5.1, css-shapes-1 §3): a basic shape in a reference box, the reference
-   box alone, or a reference to an SVG <clipPath>. rect() and xywh() compute to inset(). */
-enum { CLIP_SHAPE_BOX, CLIP_SHAPE_INSET, CLIP_SHAPE_CIRCLE, CLIP_SHAPE_ELLIPSE, CLIP_SHAPE_POLYGON,
-       CLIP_SHAPE_PATH, CLIP_SHAPE_URL };
-enum { CLIP_BOX_BORDER, CLIP_BOX_PADDING, CLIP_BOX_CONTENT, CLIP_BOX_MARGIN, CLIP_BOX_FILL,
-       CLIP_BOX_STROKE, CLIP_BOX_VIEW };
-enum { CLIP_EXTENT_LENGTH, CLIP_EXTENT_CLOSEST, CLIP_EXTENT_FARTHEST };
-struct css_clip_path {
-    uint8_t shape, box;          /* CLIP_SHAPE_*, CLIP_BOX_* */
-    bool evenodd;               /* POLYGON, PATH: the fill rule */
-    uint8_t extent[2];           /* CIRCLE: [0]; ELLIPSE: x, y (CLIP_EXTENT_*) */
-    len_t radius[2];             /* CLIP_EXTENT_LENGTH radii */
-    len_t at[2];                 /* CIRCLE, ELLIPSE: the centre */
+/* The shape values (shape.c): <basic-shape> (css-shapes-1 §3: inset(), circle(), ellipse(),
+   polygon(), path(), shape(), with rect() and xywh() computing to inset()), a reference box
+   alone, ray() (motion-1 §2.1.1) and <url>. clip-path, shape-outside and offset-path hold the
+   same computed value; the property says which of them a value belongs to (its grammar and
+   its default reference box). A zero percentage that must stay a percentage (0%, a
+   keyword's, a percentage sum that cancels) is a LK_LEN whose pct is -0. */
+enum css_shape_property { CSS_SHAPE_CLIP_PATH, CSS_SHAPE_OUTSIDE, CSS_SHAPE_OFFSET_PATH };
+enum { CSS_SHAPE_BOX, CSS_SHAPE_INSET, CSS_SHAPE_CIRCLE, CSS_SHAPE_ELLIPSE, CSS_SHAPE_POLYGON,
+       CSS_SHAPE_PATH, CSS_SHAPE_SHAPE, CSS_SHAPE_RAY, CSS_SHAPE_URL };
+enum { CSS_BOX_BORDER, CSS_BOX_PADDING, CSS_BOX_CONTENT, CSS_BOX_MARGIN, CSS_BOX_FILL,
+       CSS_BOX_STROKE, CSS_BOX_VIEW };
+/* circle()/ellipse() <radial-extent> and ray()'s <ray-size>; LENGTH: radius[] holds it */
+enum { CSS_EXTENT_LENGTH, CSS_EXTENT_CLOSEST_SIDE, CSS_EXTENT_FARTHEST_SIDE, CSS_EXTENT_CLOSEST_CORNER,
+       CSS_EXTENT_FARTHEST_CORNER, CSS_EXTENT_SIDES };
+/* shape() commands; a control point's anchor (CSS_ANCHOR_POSITION: a <position>, from the origin) */
+enum { CSS_CMD_MOVE, CSS_CMD_LINE, CSS_CMD_HLINE, CSS_CMD_VLINE, CSS_CMD_CURVE, CSS_CMD_SMOOTH,
+       CSS_CMD_ARC, CSS_CMD_CLOSE };
+enum { CSS_ANCHOR_POSITION, CSS_ANCHOR_START, CSS_ANCHOR_END, CSS_ANCHOR_ORIGIN };
+struct css_shape_command {
+    uint8_t op, controls, radii; /* CSS_CMD_*; curve 1-2, smooth 0-1 control points; arc 1-2 radii written */
+    uint8_t anchor[2];           /* CSS_ANCHOR_* of each control point */
+    bool by, cw, large;          /* by: relative end point; arc sweep and size */
+    len_t end[2];                /* the end point (HLINE: [0], VLINE: [1]) */
+    len_t control[2][2];
+    len_t radius[2];             /* arc: rx, ry (ry = rx when one was written) */
+    float rotate;                /* arc: degrees */
+};
+struct svg_path_seg;
+struct css_shape {
+    uint8_t kind, box;           /* CSS_SHAPE_*, CSS_BOX_* */
+    bool evenodd;                /* POLYGON, PATH, SHAPE: the fill rule */
+    bool at_given;               /* CIRCLE, ELLIPSE, RAY: a position was written */
+    bool contain;                /* RAY */
+    uint8_t extent[2];           /* CIRCLE: [0]; ELLIPSE: x, y; RAY: [0] (CSS_EXTENT_*) */
+    len_t radius[2];             /* CSS_EXTENT_LENGTH radii */
+    len_t at[2];                 /* CIRCLE, ELLIPSE, RAY: the centre; SHAPE: the from point */
+    float angle;                 /* RAY: degrees */
     len_t inset[4];              /* INSET: top right bottom left */
-    uint8_t inset_percent;       /* bit i: inset[i] serializes as a percentage even when zero */
     struct css_corner_radius corner[4]; /* INSET round: TL TR BR BL; zero without round */
     float round;                 /* POLYGON: the corner rounding, px */
-    const char *text;            /* PATH: the path data; URL: the reference, unescaped */
-    size_t points;               /* POLYGON */
-    len_t point[][2];
+    const char *url;             /* URL: the reference, unescaped */
+    size_t count;                /* POLYGON points, PATH segments, SHAPE commands */
+    union {
+        const len_t (*point)[2];
+        const struct svg_path_seg *seg;
+        const struct css_shape_command *command;
+    };
 };
-bool css_clip_path_serialize(const struct css_clip_path *clip, sbuf *out, web_doc *d);
+struct cx;
+bool css_shape_parse(enum css_shape_property which, const char *v, size_t n, struct cx *cx,
+                     const struct css_shape **out, sbuf *specified);
+/* computed value (none for NULL); false: out of memory or cancelled, out unchanged */
+bool css_shape_serialize(enum css_shape_property which, const struct css_shape *s, sbuf *out, web_doc *d);
+bool css_shape_equal(const struct css_shape *a, const struct css_shape *b);
+/* a·(1-t) + b·t, or (add) b added onto a, as computed-value text; false: they do not combine
+   (the caller falls back to discrete, or b replaces) */
+bool css_shape_combine(enum css_shape_property which, const struct css_shape *a, const struct css_shape *b,
+                       double t, bool add, sbuf *out, web_doc *d);
+/* CSS Shapes 1 (css-shapes-1#shape-outside-property, #shape-margin-property,
+   #shape-image-threshold-property): the properties that shape a float's area. A style holds them
+   as one group (style_t's float_shape). */
+struct css_float_shape {
+    const struct css_shape *outside; /* shape-outside; NULL: none */
+    len_t margin;                    /* shape-margin */
+    float image_threshold;           /* shape-image-threshold */
+};
+/* Motion Path 1 (motion-1 §2): offset-path (path), offset-distance, offset-position (LK_NORMAL,
+   LK_AUTO or a position), offset-anchor (LK_AUTO or a position), offset-rotate. A style holds them
+   as one group (style_t's offset). */
+struct css_offset_rotate { float angle; bool auto_rotate; }; /* angle in degrees; reverse is auto 180deg */
+struct css_offset {
+    const struct css_shape *path; /* NULL: none */
+    len_t distance;
+    len_t position[2], anchor[2];
+    struct css_offset_rotate rotate;
+};
+/* the groups' initial values (a style's NULL group), and whether two groups hold the same computed
+   values (NULL: the initial ones) */
+extern const struct css_float_shape css_float_shape_initial;
+extern const struct css_offset css_offset_initial;
+bool css_float_shape_equal(const struct css_float_shape *a, const struct css_float_shape *b);
+bool css_offset_equal(const struct css_offset *a, const struct css_offset *b);
+enum css_offset_property { CSS_OFFSET_POSITION, CSS_OFFSET_ANCHOR, CSS_OFFSET_ROTATE };
+bool css_offset_parse(enum css_offset_property which, const char *v, size_t n, struct cx *cx, void *out, sbuf *specified);
+bool css_offset_serialize(enum css_offset_property which, const void *value, sbuf *out, web_doc *d);
+bool css_offset_combine(enum css_offset_property which, const void *a, const void *b, double t, bool add,
+                        sbuf *out, web_doc *d);
+/* the offset shorthand (motion-1 §2.6): the longhands it sets, false when v is not one */
+bool css_offset_shorthand(const char *v, size_t n, struct cx *cx, struct css_offset *out, sbuf *specified);
+bool css_offset_shorthand_serialize(const struct css_offset *o, sbuf *out, web_doc *d); /* its computed value */
+/* CSSOM specified value of a declared shape, Motion Path, shape-margin or shape-image-threshold
+   value (name: the property); false leaves the authored text */
+bool css_shape_specified(const char *name, const char *v, size_t n, sbuf *out);
+/* A computed shape's geometry against its reference box r (x y w h, any one space). */
+void css_shape_ellipse(const struct css_shape *s, const float r[4], double centre[2], double radii[2]); /* circle(), ellipse() */
+/* inset(): the inner rectangle (x y w h) and its corner radii TL TR BR BL, scaled to fit (css-backgrounds-3 §5.5) */
+void css_shape_inset(const struct css_shape *s, const float r[4], double rect[4], float rx[4], float ry[4]);
+/* the outline as absolute SVG path data less (ox, oy): polygon() with its rounded corners, path(), shape() */
+bool css_shape_path_data(const struct css_shape *s, const float r[4], double ox, double oy, sbuf *out);
+bool css_shape_bounds(const struct css_shape *s, const float r[4], double out[4]); /* x0 y0 x1 y1; false: no outline */
+/* css-shapes-1 §4 (the float area): the horizontal extent of the shape grown by margin within the band
+   y0..y1; false when the band misses it */
+bool css_shape_band(const struct css_shape *s, const float r[4], float margin, float y0, float y1, float *x0, float *x1);
+/* motion-1 §2.2: the offset position of an element whose border box is element (x y w h) on its
+   offset-path, cb the containing block's reference box for it, and the path's direction there
+   (degrees clockwise from the x axis); false when the path has no geometry */
+bool css_offset_place(const struct css_offset *o, const float cb[4], const float element[4], double *x, double *y,
+                      double *direction);
+struct box;
+/* paint.c: a box's CSS_BOX_* reference box (x y w h from its border box's top left) and the corner
+   radii it takes from the border radii */
+void box_reference_box(const struct box *b, uint8_t which, float r[4], float rx[4], float ry[4]);
 /* clip (css-masking-1 §6.1): rect() offsets from the border box's top left; auto edges are its edges */
 struct css_clip_rect { bool rect; uint8_t auto_edges; float edge[4]; };
 bool css_clip_rect_serialize(const struct css_clip_rect *clip, sbuf *out);
@@ -519,6 +618,9 @@ typedef struct style {
        css_color_slot, the inherited ones and the element's own. NULL when no
        slot needs one; shared and never written, copied on change. */
     const struct css_color_value *const *color_inherited, *const *color_own;
+    /* per enum css_color_slot: the computed value is currentcolor and the 8-bit field holds what
+       css_style_finish resolved it to (CSS Color 4 §4.4: currentcolor computes to itself) */
+    uint16_t color_current;
     uint8_t color_scheme; /* CSS_SCHEME_* of color-scheme; 0: normal */
     const char *color_scheme_text; /* its computed value; NULL: normal */
     struct svg_paint svg_fill, svg_stroke;
@@ -544,7 +646,13 @@ typedef struct style {
     float border_spacing;
     float opacity;
     const struct css_filter *filter; /* NULL: none; identity effects still establish a context */
-    const struct css_clip_path *clip_path; /* NULL: none; computed-arena value */
+    const struct css_shape *clip_path; /* NULL: none; a computed-arena value */
+    /* Groups of rarely set properties that are not inherited, held by pointer so that every
+       element's style does not carry them (css_style_float_shape, css_style_offset read them).
+       NULL: all their values initial. A group is a computed-arena record that no one writes once a
+       style holds it: cssprop.c writes a longhand into a copy and points the style at the copy. */
+    const struct css_float_shape *float_shape; /* shape-outside, shape-margin, shape-image-threshold */
+    const struct css_offset *offset;           /* Motion Path */
     struct css_clip_rect clip;
     const struct css_transform *transform;
     struct css_translate translate;
@@ -579,6 +687,13 @@ typedef struct style {
     struct custom_prop *vars;
     struct style *before, *after, *backdrop, *placeholder;
 } style_t;
+/* a style's float shape and Motion Path values, the initial ones when it holds no group */
+static inline const struct css_float_shape *css_style_float_shape(const style_t *s) {
+    return s->float_shape ? s->float_shape : &css_float_shape_initial;
+}
+static inline const struct css_offset *css_style_offset(const style_t *s) {
+    return s->offset ? s->offset : &css_offset_initial;
+}
 
 /* ---------------------------------------------------------------- stylesheets */
 typedef struct sheet sheet_t;
@@ -716,6 +831,7 @@ bool css_easing_parse(const char *s, size_t n, struct css_easing *out);
 /* css-easing-1 §2: the output progress for input x; before: the before flag of step easing */
 double css_easing_apply(const struct css_easing *e, double x, bool before);
 bool css_easing_serialize(const struct css_easing *e, sbuf *out);
+bool css_easing_same(const struct css_easing *a, const struct css_easing *b); /* the same function, keyword and all */
 /* list's item i, the list repeating (CSS Animations 1 §3: excess values are not used, missing ones
    repeat the list); the initial value when the list is NULL */
 union css_motion_item css_motion_item(const style_t *st, int list, uint32_t i);
@@ -745,8 +861,8 @@ int css_prop_index(const struct propdef *p);
 bool css_prop_is_early(const struct propdef *p);
 bool css_prop_is_motion(const struct propdef *p);
 /* CSSOM computed value of a longhand the table stores whole (keyword, length, pixels, number,
-   integer, colour, color-scheme): 1 with the text in out; -1 out of memory; 0 for any other
-   property, whose value has its own serializer or none. */
+   integer, colour, color-scheme, shape, Motion Path, and the offset shorthand): 1 with the text in
+   out; -1 out of memory; 0 for any other property, whose value has its own serializer or none. */
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d);
 /* CSSOM specified value of a declared colour or color-scheme; false: keep the authored text */
 bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out);
@@ -832,8 +948,11 @@ struct cx {
     float cq_width, cq_height;
     bool cq_width_set, cq_height_set;
     bool absolute_lengths; /* relative lengths and percentages fail (Geometry's matrix strings) */
+    bool time;             /* dimensions are <time>s, in milliseconds; lengths and percentages fail */
     bool computed_text;    /* the value is computed-value text the animation layer wrote (css_anim_parse):
                               what a style sheet's parse clamps (rgb()'s components) keeps its value */
+    bool absolute_units;   /* relative lengths fail, percentages stay (a specified value's calc()) */
+    bool angles;           /* dimensions are <angle>s, in degrees; lengths and percentages fail */
 };
 /* apply a declaration (var() already substituted) unless its properties are all set; false if invalid */
 bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx);
@@ -1304,6 +1423,7 @@ struct web_doc {
     uint8_t restyle_damage_n;
     bool restyle_damage_lost;
     struct html_parser *parser;
+    struct xml_parser *xml_parser; /* an XML document's, while it loads (xml.h) */
     struct web_js_state *js;
     bool live, dirty, paint_dirty, resources_dirty, images_dirty;
     bool restyle_dirty; /* dirty, but only marked elements' own computed values (CSS animation samples) */
@@ -1525,6 +1645,7 @@ static inline bool doc_html_names(const node_t *n) {
 node_t *doc_doctype_create(web_doc *d, const char *name, size_t name_len,
     const char *public_id, size_t public_len, const char *system_id, size_t system_len);
 int doc_node_insert_validity(node_t *parent, node_t *child, node_t *before);
+int doc_node_move_validity(node_t *parent, node_t *child, node_t *before); /* DOM: pre-move validity */
 int doc_node_replace_validity(node_t *parent, node_t *child, node_t *old);
 int doc_node_replace_all_validity(node_t *parent,node_t *child);
 node_t *doc_node_root(node_t *node, bool composed);
@@ -1558,7 +1679,9 @@ bool doc_attr_remove(web_doc *d, node_t *element, int index);
 bool doc_attr_value(web_doc *d, node_t *attribute, const char *value);
 void doc_attrs_publish(node_t *element, struct attr *attrs, int count);
 void doc_attrs_initial(web_doc *d, node_t *element, struct attr *attrs, int count); /* parser, under its trap */
-bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before);
+bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before); /* remove, then insert */
+/* DOM "move" (moveBefore): child keeps its state; no removing or insertion steps */
+bool doc_node_move_preserving(web_doc *d, node_t *parent, node_t *child, node_t *before);
 enum { HTML_BRIDGE_FIELDS=1, HTML_BRIDGE_LINKS=2, HTML_BRIDGE_CHILDREN=4 };
 void html_bridge_native_changed(node_t *node, unsigned flags);
 void html_bridge_native_retire(node_t *node); /* before allocation ownership ends */
@@ -1647,7 +1770,17 @@ void web_js_frames_sync(web_doc *d);
 web_doc *web_live_child(const char *html, size_t len, const char *url, const char *charset,
                         const struct web_host *host, web_doc *parent, node_t *frame, web_doc *inherited_origin);
 web_doc *web_live_child_response(const char *html,size_t len,const char *url,const char *charset,
-                        const char *headers,const struct web_host *host,web_doc *parent,node_t *frame,web_doc *inherited_origin);
+                        const char *headers,const char *type,const struct web_host *host,web_doc *parent,node_t *frame,
+                        web_doc *inherited_origin);
+/* The document's parser, the HTML parser (d->parser, which also serves
+   document.open and document.write) or an XML document's XML parser,
+   driven the same way: doc_parser_current names the active one (NULL:
+   parsing is over), doc_parser_resume answers as html_resume,
+   doc_parser_changed as html_import_changed, and doc_parser_stop ends it. */
+const void *doc_parser_current(const web_doc *d);
+int doc_parser_resume(web_doc *d, node_t **script);
+bool doc_parser_changed(const web_doc *d);
+void doc_parser_stop(web_doc *d);
 const char *web_effective_url(web_doc *d);
 void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *r);
 void web_js_socket_event(web_doc *d, uint64_t id, const struct web_socket_event *e);

@@ -259,7 +259,7 @@ $(BUILD)/u/user/libc/wctype.o: user/libc/wctype_data.h
 third_party/lexbor/source/lexbor/unicode/idna_validity_res.h: scripts/unicode_idna.py scripts/ucd.py third_party/unicode/18.0.0/UnicodeData.txt
 	@$(PY) scripts/unicode_idna.py
 $(BUILD)/lexbor/third_party/lexbor/source/lexbor/unicode/idna.o: third_party/lexbor/source/lexbor/unicode/idna_validity_res.h
-user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_console.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_atob.js user/libc/web/js_error_event.js user/libc/web/js_promise_rejection.js user/libc/web/js_custom_event.js user/libc/web/js_geometry.js user/libc/web/js_performance.js user/libc/web/js_clone.js user/libc/web/js_offscreen_canvas.js user/libc/web/js_opfs.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js user/libc/web/js_wasm.js user/libc/web/js_indexeddb.js user/libc/web/js_wasm.h third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
+user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_console.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_atob.js user/libc/web/js_error_event.js user/libc/web/js_promise_rejection.js user/libc/web/js_custom_event.js user/libc/web/js_geometry.js user/libc/web/js_performance.js user/libc/web/js_clone.js user/libc/web/js_offscreen_canvas.js user/libc/web/js_opfs.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js user/libc/web/js_wasm.js user/libc/web/js_indexeddb.js user/libc/web/js_cache_storage.js user/libc/web/js_wasm.h third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
 	@$(PY) user/libc/web/js_worker_embed.py
 $(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc user/libc/web/js_worker_transfer.h user/libc/web/js_worker_port_lifetime.h
 $(BUILD)/u/user/libc/web/js_worker.o: user/libc/web/js_worker.h user/include/js_worker_wire.h user/libc/web/js_worker_port_lifetime.h
@@ -316,10 +316,15 @@ $(LIBC_RSP): $(LIBC_LINK) $(LLVM_JIT_LIBS) Makefile
 # A unit's check (scripts/link_unit.py) reads the symbols of every other member.
 $(NVK_UNIT): | $(filter-out $(NVK_UNIT),$(LIBC_LINK))
 
+# A program keeps its symbol table beside the build (build/symbols/<name>), so that the address
+# of a fault in a serial log maps to a function (llvm-symbolizer --obj=build/symbols/<name>); the
+# copy C: gets is the same link stripped, at the same addresses.
+SYMBOLS := $(BUILD)/symbols
 $(PROGRAMS)/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
-	@mkdir -p $(dir $@)
+	@mkdir -p $(dir $@) $(SYMBOLS)
 	@echo "  LD   $@"
-	@$(LD) $(ULDFLAGS) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
+	@$(LD) $(filter-out -s,$(ULDFLAGS)) --strip-debug --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $(SYMBOLS)/$*
+	@llvm-objcopy --strip-all $(SYMBOLS)/$* $@
 
 # C++ is an additional host cross-build path; C/TinyCC keep their own flags.
 $(BUILD)/u/tests/media_cenc_test.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)

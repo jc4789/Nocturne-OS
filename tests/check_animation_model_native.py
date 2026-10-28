@@ -21,6 +21,8 @@ bool web_native_checkpoint(web_doc *d){(void)d;return true;}
 void css_transform_list_matrix(const struct css_transform *t,float w,float h,double m[16]){(void)t;(void)w;(void)h;memset(m,0,16*sizeof *m);m[0]=m[5]=m[10]=m[15]=1;}
 /* layout.c's, reached only from Geometry's matrix strings */
 void css_transform_list_matrix_3d(const struct css_transform *t,double m[16]){(void)t;(void)m;abort();}
+/* web_url.c's (Lexbor's URL parser): CSS url() resolution, not reached by these values */
+int web_resolve_url_owned(const char *base,const char *rel,char **out){(void)base;(void)rel;(void)out;abort();}
 uint64_t uptime_ms(void){return 0;}
 static int marks;
 void css_mark_style_own(web_doc *d,node_t *n){(void)d;(void)n;marks++;}
@@ -43,7 +45,13 @@ static const char *sampled(const char *property){for(int i=0;i<nemitted;i++)if(!
 static struct web_keyframe_value kv[4];static struct web_keyframe kf[4];
 static const char *fade_to="1"; /* @keyframes fade{from{opacity:0}to{opacity:<fade_to>}} */
 static const struct web_keyframe *frames_for(void *arg,const char *name,const struct css_easing *easing,uint32_t *count){
-    (void)arg;if(strcmp(name,"fade"))return NULL;
+    (void)arg;
+    if(!strcmp(name,"rise")){ /* @keyframes rise{to{opacity:0.2}} */
+        kv[2]=(struct web_keyframe_value){css_prop_lookup("opacity",7),"0.2"};
+        kf[2]=(struct web_keyframe){.offset=1,.easing=*easing,.composite=WA_COMPOSITE_AUTO,.count=1,.values=&kv[2]};
+        *count=1;return &kf[2];
+    }
+    if(strcmp(name,"fade"))return NULL;
     kv[0]=(struct web_keyframe_value){css_prop_lookup("opacity",7),"0"};kv[1]=(struct web_keyframe_value){css_prop_lookup("opacity",7),(char*)fade_to};
     kf[0]=(struct web_keyframe){.offset=0,.easing=*easing,.composite=WA_COMPOSITE_AUTO,.count=1,.values=&kv[0]};
     kf[1]=(struct web_keyframe){.offset=1,.easing=*easing,.composite=WA_COMPOSITE_AUTO,.count=1,.values=&kv[1]};
@@ -60,6 +68,12 @@ static size_t sample(const style_t *st,bool transitions){
 static void at(uint64_t t){doc.visible=true;web_animations_tick(&doc,t);}
 static style_t styled(const char *property,const char *value){
     struct css_anim_ctx c={.base=&base,.parent=&parent,.rem=16,.vw=800,.vh=600,.a=&arena};style_t s;
+    const struct propdef *p=css_prop_lookup(property,strlen(property));
+    if(!p||!css_anim_parse(&c,p,value,strlen(value),false,&s,NULL))printf("FAIL animation-model parse %s: %s\n",property,value);
+    return s;
+}
+static style_t styled_on(const style_t *on,const char *property,const char *value){
+    struct css_anim_ctx c={.base=on,.parent=&parent,.rem=16,.vw=800,.vh=600,.a=&arena};style_t s;
     const struct propdef *p=css_prop_lookup(property,strlen(property));
     if(!p||!css_anim_parse(&c,p,value,strlen(value),false,&s,NULL))printf("FAIL animation-model parse %s: %s\n",property,value);
     return s;
@@ -227,6 +241,15 @@ int main(void){
     started=false;for(struct web_animation *o=element.owned;o;o=o->owner_next)if(!o->disowned&&o->property==css_prop_lookup("float",5))started=true;
     CHECK(started);
     web_motion_cancel(&element,-1);at(6800);events(types,8);at(6900);
+    /* currentcolor's computed value is currentcolor: a change of color starts no transition of
+       background-color (css-transitions/currentcolor-animation-001.html) */
+    style_t cb=styled("color","red");cb=styled_on(&cb,"background-color","currentcolor");css_style_finish(&cb,&parent,false);
+    style_t ca=styled("color","blue");ca=styled_on(&ca,"background-color","currentcolor");
+    ca=styled_on(&ca,"transition","background-color linear 50s -10s");css_style_finish(&ca,&parent,false);
+    s=site(&ca);web_motion_transitions(&s,&cb,&ca,none_animated);
+    started=false;for(struct web_animation *o=element.owned;o;o=o->owner_next)if(!o->disowned&&o->property==css_prop_lookup("background-color",16))started=true;
+    CHECK(!started);
+    web_motion_cancel(&element,-1);at(6910);events(types,8);at(6920);
 
     /* CSS Animations: created from animation-name, reused while the name stays, canceled when it goes */
     style_t anim=styled("animation","fade 1s linear forwards");
@@ -283,6 +306,44 @@ int main(void){
     CHECK(freed && doc.animations->garbage);
     web_animations_join(&doc);CHECK(!doc.animations->garbage);
 
+    /* CSS Animations 2 §3.2 step 3: a rule with no 0% keyframe starts from the element's computed
+       value, eased by the animation's timing function and replacing (opacity-interpolation.html's
+       CSS Animations from neutral to [0.2], the neutral 0.1; the easing takes progress 0.5 to at) */
+    style_t faint=styled("opacity","0.1");
+    static const struct {const char *easing;double want;} rises[]={
+        {"cubic-bezier(0, -0.566667, 1, -0.566667)",0.07},{"steps(1, end)",0.1},{"cubic-bezier(0, 0.233333, 1, 0.233333)",0.13},
+        {"linear",0.15},{"cubic-bezier(0, 0.633333, 1, 0.633333)",0.16},{"steps(1, start)",0.2},
+        {"cubic-bezier(0, 1.833333, 1, 1.833333)",0.25}};
+    struct web_animation *ra=NULL;
+    for(size_t i=0;i<sizeof rises/sizeof *rises;i++){
+        char text[96];snprintf(text,sizeof text,"rise 100s %s -50s",rises[i].easing);
+        style_t rise=styled_on(&faint,"animation",text);
+        s=site(&rise);web_motion_animations(&s);
+        if(!ra){for(struct web_animation *o=element.owned;o;o=o->owner_next)if(o->kind==WA_CSS_ANIMATION&&!o->disowned)ra=o;
+            web_animations_join(&doc);at(9200);}
+        CHECK(ra && sample(&rise,false)==1 && fabs(strtod(sampled("opacity"),NULL)-rises[i].want)<0.005);
+        if(i==0){
+            /* getKeyframes: the initial keyframe at 0 with the computed value, the animation's
+               easing and composite replace; the rule's own keyframe at 1 stays auto */
+            const struct web_keyframes *k=ra?ra->effect->frames:NULL;
+            struct css_easing e;css_easing_parse(rises[i].easing,strlen(rises[i].easing),&e);
+            CHECK(k && k->count==2 && k->v[0].offset==0 && k->v[0].composite==CM_COMPOSITE_REPLACE && k->v[0].count==1 &&
+                  !strcmp(k->v[0].values[0].text,"0.1") && css_easing_same(&k->v[0].easing,&e) &&
+                  k->v[1].offset==1 && k->v[1].composite==WA_COMPOSITE_AUTO);
+        }
+    }
+    /* the computed value follows the element's style */
+    style_t brighter=styled("opacity","0.15");
+    style_t rise=styled_on(&brighter,"animation","rise 100s linear -50s");
+    s=site(&rise);web_motion_animations(&s);
+    CHECK(ra && !strcmp(ra->effect->frames->v[0].values[0].text,"0.15") && sample(&rise,false)==1 && !strcmp(sampled("opacity"),"0.175"));
+    /* with animation-composition add, the initial keyframe adds too (its composite is the default) */
+    style_t added=styled_on(&faint,"animation","rise 100s linear -50s");added=styled_on(&added,"animation-composition","add");
+    s=site(&added);web_motion_animations(&s);
+    CHECK(ra && ra->effect->frames->v[0].composite==CM_COMPOSITE_ADD);
+    s=site(&gone);web_motion_animations(&s);at(9300);at(9400);CHECK(ra && !ra->owner);
+    web_animations_join(&doc);
+
     web_animations_doc_free(&doc);
     printf("animation-model: %d checks, %d failures\n",checks,failed);
     return failed!=0;
@@ -303,7 +364,7 @@ abi.mkdir(exist_ok=True)
 env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH", ""))
 exe = out / "model.exe"
 command = [str(cc), "-std=gnu11", "-O1", "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include",
-           "-Icommon", "-Iuser/libc", "-Iuser/libc/web", "-Ithird_party/quickjs", str(source), "user/libc/web/cssprop.c",
+           "-Icommon", "-Iuser/libc", "-Iuser/libc/web", "-Ithird_party/quickjs", str(source), "user/libc/web/cssprop.c", "user/libc/web/shape.c",
            "user/libc/web/color.c", "user/libc/web/util.c", "user/libc/web/html.c", str(url), "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 subprocess.run([str(exe)], cwd=root, env=env, check=True, timeout=60)

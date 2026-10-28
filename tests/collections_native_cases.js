@@ -513,6 +513,18 @@ test(function () {
     assert_equals(list.length, 1); assert_equals(list[1], undefined); assert_equals(children.length, 0);
 }, 'NodeList members and liveness');
 test(function () {
+    // Web IDL "iterable declarations": a value iterator's members are the %Array.prototype% functions.
+    for (const key of ['entries', 'keys', 'values', 'forEach']) {
+        assert_equals(NodeList.prototype[key], Array.prototype[key], key);
+        const d = Object.getOwnPropertyDescriptor(NodeList.prototype, key);
+        assert_true(d.writable && d.enumerable && d.configurable, key + ' descriptor');
+    }
+    const d = Object.getOwnPropertyDescriptor(NodeList.prototype, Symbol.iterator);
+    assert_equals(d.value, Array.prototype.values);
+    assert_true(d.writable && !d.enumerable && d.configurable, '@@iterator descriptor');
+    assert_equals(HTMLCollection.prototype.forEach, undefined, 'HTMLCollection has no value iterator');
+}, 'NodeList value iterator members are the Array functions');
+test(function () {
     const root = el('div'), a = el('i', { id: 'café' }), b = el('i', { id: '名前' });
     T.insert(root, a, -1); T.insert(root, b, -1);
     const c = byTag('i', root);

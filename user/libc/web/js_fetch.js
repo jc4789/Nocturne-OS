@@ -482,10 +482,12 @@ const fetchBridge = (() => {
             if(sig.aborted)abort(sig.reason);
         });
     }
-    function fetchCore(input,init,observer,forcePreflight=false,destination='') {
+    /* prepared: input is a Request this bridge made for the fetch (Cache Storage's addAll), fetched
+       as it is, without the Request constructor's steps for init. */
+    function fetchCore(input,init,observer,forcePreflight=false,destination='',prepared=false) {
         let r,s,b,integrity;
         try {
-            r=new Request(input,init);s=requestSlots.get(r);b=bodySlots.get(r);
+            r=prepared?input:new Request(input,init);s=requestSlots.get(r);b=bodySlots.get(r);
             if(destination)s.destination=destination;
             const signal=signalSlots.get(s.signal);if(signal.aborted)return reject(signal.reason);
             integrity=s.integrity?integrityMetadata(s.integrity):null;
@@ -603,18 +605,65 @@ const fetchBridge = (() => {
         },
         xhrFetch(url,init,observer,forcePreflight){const signal=newSignal();return {promise:fetchCore(url,{...init,signal},observer,forcePreflight),cancel(){abortSignal(signal);}};},
         xhrMetadata(response){const s=slot(responseSlots,response,'Response');return {status:s.status,statusText:s.statusText,url:s.url,headers:s.headers};},
-        response(status,url,raw,text,bytes,redirected,statusText,type) {
+        /* Cache Storage's view of this realm's Fetch objects (js_cache_storage.js): a record of a
+           Request's or a Response's own request or response (never its page-mutable getters), the
+           objects a match makes of stored ones (immutable headers, a new signal), and the fetch of
+           add and addAll. A header list is [name, value, ...]; extra is what the broker keeps for
+           this realm to read back. */
+        cache:{
+            isRequest:v=>requestSlots.has(v),isResponse:v=>responseSlots.has(v),
+            newRequest:input=>new Request(input),
+            request(r){
+                const s=slot(requestSlots,r,'Request'),list=headerSlots.get(s.headers).list,headers=[];
+                for(let i=0;i<list.length;i++){headers[headers.length]=list[i][0];headers[headers.length]=list[i][1];}
+                return {url:s.url,method:s.method,headers,extra:stringify({__proto__:null,m:s.mode,c:s.credentials,k:s.cache,r:s.redirect,
+                    f:s.referrer,p:s.referrerPolicy,i:s.integrity,a:s.keepalive,d:s.destination})};
+            },
+            makeRequest(url,method,headers,x){
+                const object=create(Request.prototype),h=makeHeaders(undefined,'immutable'),list=headerSlots.get(h).list;
+                for(let i=0;i+1<headers.length;i+=2)list[list.length]=[headers[i],headers[i+1]];
+                requestSlots.set(object,{url,method,mode:x.m,credentials:x.c,cache:x.k,redirect:x.r,referrer:x.f,referrerPolicy:x.p,
+                    integrity:x.i,keepalive:x.a,destination:x.d,headers:h,signal:newSignal()});
+                storeBody(object,{bytes:null,used:false,abort:null});return object;
+            },
+            response(r){
+                const s=slot(responseSlots,r,'Response'),b=slot(bodySlots,r,'Body'),list=headerSlots.get(s.headers).list,headers=[];
+                for(let i=0;i<list.length;i++){headers[headers.length]=list[i][0];headers[headers.length]=list[i][1];}
+                return {type:s.type,status:s.status,headers,unusable:unusable(b),
+                    extra:stringify({__proto__:null,t:s.type,s:s.status,x:s.statusText,u:s.url,r:s.redirected,c:s.resource})};
+            },
+            /* The body's stream (null for a null body), read by Cache Storage from here on. */
+            takeBody(r){return bodyStream(slot(bodySlots,r,'Body'));},
+            makeResponse(x,headers,stream){
+                const h=makeHeaders(undefined,'immutable'),list=headerSlots.get(h).list;
+                for(let i=0;i+1<headers.length;i+=2)list[list.length]=[headers[i],headers[i+1]];
+                const meta={status:x.s,statusText:x.x,headers:h,url:x.u,redirected:x.r,type:x.t};
+                if(x.t==='opaque')meta.resource=x.c;
+                return responseObject(meta,{bytes:null,stream,used:false,abort:null});
+            },
+            /* A fetch of r as it is, which signal can abort too. */
+            fetch(r,signal){
+                const s=slot(requestSlots,r,'Request'),object=create(Request.prototype);
+                requestSlots.set(object,{...s,headers:makeHeaders(s.headers,headerSlots.get(s.headers).guard),signal:dependentSignal([s.signal,signal])});
+                storeBody(object,cloneBody(slot(bodySlots,r,'Body')));
+                return fetchCore(object,undefined,undefined,false,'',true);
+            },
+            controller(){const signal=newSignal();return {signal,abort(reason){abortSignal(signal,reason);}};}
+        },
+        response(status,url,raw,text,bytes,redirected,statusText,type,resource) {
             // Native completions redact the opaque internals before entering
             // this realm. Do not inspect author-modifiable regex/URL methods.
-            if(type==='opaque')return responseObject({status:0,statusText:'',url:'',headers:makeHeaders(undefined,'immutable'),redirected:false,type:'opaque'},{bytes:null,used:false,abort:null});
+            // resource: the bits Cache Storage's resource policy check needs
+            // of the hidden response (js.c's fetch_resource_bits), private.
+            if(type==='opaque')return responseObject({status:0,statusText:'',url:'',headers:makeHeaders(undefined,'immutable'),redirected:false,type:'opaque',resource:typeof resource==='number'?resource:2},{bytes:null,used:false,abort:null});
             const headers=makeHeaders(undefined,'response');
             for(const line of raw.split(/\r?\n/)){const i=line.indexOf(':');if(i>0&&!line.startsWith('HTTP/'))appendHeader(headerSlots.get(headers),normalizeName(line.slice(0,i)),normalizeValue(line.slice(i+1)));}
             headerSlots.get(headers).guard='immutable';
             if(statusText===undefined){const m=/^HTTP\/\S+\s+\d{3}(?:[ \t]+([^\r\n]*))?/.exec(raw);statusText=m?(m[1]||''):'';}
             // Negotiated native metadata is not an HTTP field: webfetch only
             // copies server fields containing ':', so a server cannot forge it.
-            const transport=type===undefined?/^HTTP\/Nocturne-Meta cors=([01]) redirected=([01])(?: opaque=([01]))?\r?$/m.exec(raw):null;
-            if(transport&&transport[3]==='1')return responseObject({status:0,statusText:'',url:'',headers:makeHeaders(undefined,'immutable'),redirected:false,type:'opaque'},{bytes:null,used:false,abort:null});
+            const transport=type===undefined?/^HTTP\/Nocturne-Meta cors=([01]) redirected=([01])(?: opaque=([01]))?(?: resource=[0-7])?\r?$/m.exec(raw):null;
+            if(transport&&transport[3]==='1')return responseObject({status:0,statusText:'',url:'',headers:makeHeaders(undefined,'immutable'),redirected:false,type:'opaque',resource:2},{bytes:null,used:false,abort:null});
             if(transport){type=transport[1]==='1'?'cors':'basic';redirected=transport[2]==='1';}
             if(type===undefined)type=new NativeURL(url).origin===new NativeURL(host.url()).origin?'basic':'cors';
             return responseObject({status,statusText,url:usv(url).split('#')[0],headers,redirected:!!redirected,type},

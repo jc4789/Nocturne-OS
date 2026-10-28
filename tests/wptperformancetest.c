@@ -273,7 +273,7 @@ static bool run_case(const char *base,const struct original *original,unsigned *
         .resume_request=resume,.console=console,.scroll=scroll_position,.scroll_to=scroll_to,
         .window_state=window_state,.js_task_budget_ms=CASE_MS};
     r.doc=web_live_response(r.navigation.body,r.navigation.body_len,
-        web_response_url(&r.navigation),"utf-8",web_response_headers(&r.navigation),&host);
+        web_response_url(&r.navigation),"utf-8",web_response_headers(&r.navigation),NULL,&host);
     if(!r.doc)goto end;
     r.pixels=calloc((size_t)VIEW_W*VIEW_H,sizeof *r.pixels);if(!r.pixels)goto end;
     /* realm 初期化済み・HTML parser の初回 tick より前。 */
@@ -315,7 +315,7 @@ static bool render_reference(const char *base,const struct original *original,ui
         .console=console,.scroll=scroll_position,.scroll_to=scroll_to,
         .window_state=window_state,.js_task_budget_ms=CASE_MS};
     r.doc=web_live_response(r.navigation.body,r.navigation.body_len,
-        web_response_url(&r.navigation),"utf-8",web_response_headers(&r.navigation),&host);
+        web_response_url(&r.navigation),"utf-8",web_response_headers(&r.navigation),NULL,&host);
     if(!r.doc)goto end;
     r.pixels=calloc((size_t)VIEW_W*VIEW_H,sizeof *r.pixels);if(!r.pixels)goto end;
     if(!web_console_eval(r.doc,reference_observer,sizeof reference_observer-1))goto end;

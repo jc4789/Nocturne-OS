@@ -150,6 +150,9 @@
         /* @include js_crypto.js */
         /* @include js_opfs.js */
         installOriginPrivateFileSystem(host,cryptoSecureContext,WorkerNavigator,!shared);
+        /* @include js_cache_storage.js */
+        installCacheStorage({...workerFetchBridge.cache,secure:cryptoSecureContext,native:host.cacheStorage,
+            embedderPolicy:host.cacheEmbedderPolicy,streams:streamBridge});
         /* @include js_formdata.js */
         cloneData.registerUncloneable(value=>formDataBridge.brand(value));
         return formDataBridge;
@@ -214,7 +217,7 @@
             get signal(){const signal=apply(get,controllers,[this]);if(!signal)throw new TypeError('Illegal AbortController invocation');return signal;}
             abort(reason){const signal=apply(get,controllers,[this]);if(!signal)throw new TypeError('Illegal AbortController invocation');abort(signal,reason);}
         }
-        return {AbortSignal,AbortController,state,brand:signal=>apply(has,slots,[signal]),subscribe(signal,algorithm){const s=state(signal);if(s.aborted)return ()=>{};apply(add,s.algorithms,[algorithm]);retain(signal);return ()=>{apply(remove,s.algorithms,[algorithm]);retain(signal);};}};
+        return {AbortSignal,AbortController,state,brand:signal=>apply(has,slots,[signal]),sources:signal=>size(state(signal).sources),subscribe(signal,algorithm){const s=state(signal);if(s.aborted)return ()=>{};apply(add,s.algorithms,[algorithm]);retain(signal);return ()=>{apply(remove,s.algorithms,[algorithm]);retain(signal);};}};
     })();
     const {AbortSignal,AbortController}=workerAbortBridge;
     const workerFetchBridge=(()=>{
@@ -223,7 +226,10 @@
             mapEntries=Map.prototype.entries,mapKeys=Map.prototype.keys,mapValues=Map.prototype.values,
             create=Object.create,define=Object.defineProperty,string=String,slice=ArrayBuffer.prototype.slice,
             Buffer=ArrayBuffer,isView=ArrayBuffer.isView,Bytes=Uint8Array,Encoder=TextEncoder,Decoder=TextDecoder,NativeMap=Map,
-            entries=Object.entries,isArray=Array.isArray,NativePromise=Promise,rejectPromise=Promise.reject,headerSlots=new WeakMap(),responseSlots=new WeakMap();
+            entries=Object.entries,isArray=Array.isArray,NativePromise=Promise,rejectPromise=Promise.reject,headerSlots=new WeakMap(),responseSlots=new WeakMap(),
+            has=WeakMap.prototype.has,requestSlots=new WeakMap(),stringify=JSON.stringify,wellFormed=String.prototype.toWellFormed,NativeURL=URL,
+            AbortSignalClass=workerAbortBridge.AbortSignal,anySignal=AbortSignalClass.any,AbortControllerClass=workerAbortBridge.AbortController,
+            controllerSignal=Object.getOwnPropertyDescriptor(AbortControllerClass.prototype,'signal').get,controllerAbort=AbortControllerClass.prototype.abort;
         const text=v=>{if(typeof v==='symbol')throw new TypeError('Symbol is not a DOMString');return string(v);};
         const descriptor=(p,k)=>Object.getOwnPropertyDescriptor(p,k).get,typed=Object.getPrototypeOf(Bytes.prototype);
         const abSize=descriptor(Buffer.prototype,'byteLength'),taBuffer=descriptor(typed,'buffer'),taOffset=descriptor(typed,'byteOffset'),taSize=descriptor(typed,'byteLength'),taTag=descriptor(typed,Symbol.toStringTag);
@@ -232,6 +238,7 @@
         const nativeDataURL=host.dataURL;
         const hstate=h=>{const s=apply(get,headerSlots,[h]);if(!s)throw new TypeError('Illegal Headers invocation');return s;};
         const rstate=r=>{const s=apply(get,responseSlots,[r]);if(!s)throw new TypeError('Illegal Response invocation');return s;};
+        const qstate=r=>{const s=apply(get,requestSlots,[r]);if(!s)throw new TypeError('Illegal Request invocation');return s;};
         const name=k=>{k=text(k).toLowerCase();if(!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(k))throw new TypeError('Invalid header name');return k;};
         const value=v=>{v=text(v).replace(/^[\t\r\n ]+|[\t\r\n ]+$/g,'');if(/[\0\r\n\u0100-\uffff]/.test(v))throw new TypeError('Invalid header value');return v;};
         const forbidden=new Set(['accept-charset','accept-encoding','access-control-request-headers','access-control-request-method','connection','content-length','cookie','cookie2','date','dnt','expect','host','keep-alive','origin','referer','set-cookie','te','trailer','transfer-encoding','upgrade','via']);
@@ -276,35 +283,180 @@
         function unusable(s){return bodyUsed(s)||(s.stream&&streamBridge.locked(s.stream));}
         function response(bytes,info,stream=undefined){const r=create(Response.prototype),s={...info,used:false,stream:null};
             s.stream=stream!==undefined?stream:bytes===null?null:streamBridge.fromBytes(bytes,()=>aborted(s));apply(set,responseSlots,[r,s]);return r;}
-        async function consume(r){const s=rstate(r);if(unusable(s))throw new TypeError('Body is disturbed or locked');aborted(s);if(s.stream===null)return new Buffer(0);s.used=true;const bytes=await streamBridge.collect(s.stream);aborted(s);return bytes;}
+        async function consume(s){if(unusable(s))throw new TypeError('Body is disturbed or locked');aborted(s);if(s.stream===null)return new Buffer(0);s.used=true;const bytes=await streamBridge.collect(s.stream);aborted(s);return bytes;}
+        const contentType=s=>apply(mapGet,hstate(s.headers).map,['content-type'])||'';
+        /* Fetch's Body mixin on Request and Response; state is the interface's own record (a
+           stream, null for a null body, and whether it was used). */
+        function installBody(C,state){
+            const members={
+                get body(){return state(this).stream;},
+                get bodyUsed(){return !!bodyUsed(state(this));},
+                async arrayBuffer(){return consume(state(this));},
+                async blob(){const s=state(this);return blobBridge.fromBytes(await consume(s),contentType(s));},
+                async formData(){const s=state(this);return formDataBridge.parse(await consume(s),contentType(s));},
+                async json(){return JSON.parse(apply(decode,new Decoder(),[await consume(state(this))]));},
+                async text(){return apply(decode,new Decoder(),[await consume(state(this))]);}
+            };
+            for(const key of Reflect.ownKeys(members))define(C.prototype,key,{...Object.getOwnPropertyDescriptor(members,key),enumerable:true});
+        }
+        const nullStatus=status=>status===204||status===205||status===304;
+        /* ResponseInit's members, read in their order, and "initialize a response"'s checks. */
+        function responseInit(init){
+            init=init??{};const headerInit=init.headers,statusValue=init.status,textValue=init.statusText;
+            const status=statusValue===undefined?200:(+statusValue>>>0)&65535,statusText=textValue===undefined?'':text(textValue);
+            if(status<200||status>599)throw new RangeError('Invalid Response status');if(/[^\t\x20-\x7e\x80-\xff]/.test(statusText))throw new TypeError('Invalid status text');
+            return {status,statusText,headers:headers(headerInit,'response')};
+        }
+        const usv=v=>apply(wellFormed,text(v),[]);
         class Response{
             constructor(body=null,init={}){
-                init=init??{};const status=init.status===undefined?200:(+init.status>>>0)&65535,statusText=init.statusText===undefined?'':text(init.statusText);
-                if(status<200||status>599)throw new RangeError('Invalid Response status');if(/[^\t\x20-\x7e\x80-\xff]/.test(statusText))throw new TypeError('Invalid status text');
-                if(body!==null&&[204,205,304].includes(status))throw new TypeError('Null-body status cannot have a body');
-                const data=extract(body),h=headers(init.headers,'response');if(data.type&&!apply(mapHas,hstate(h).map,['content-type']))append(h,'content-type',data.type);
-                const s={status,statusText,headers:h,url:'',redirected:false,type:'default',used:false,abort:null,stream:null};s.stream=data.stream??(data.bytes===null?null:streamBridge.fromBytes(data.bytes));apply(set,responseSlots,[this,s]);
+                const i=responseInit(init);
+                if(body!==null&&nullStatus(i.status))throw new TypeError('Null-body status cannot have a body');
+                const data=extract(body);if(data.type&&!apply(mapHas,hstate(i.headers).map,['content-type']))append(i.headers,'content-type',data.type);
+                const s={status:i.status,statusText:i.statusText,headers:i.headers,url:'',redirected:false,type:'default',used:false,abort:null,stream:null};s.stream=data.stream??(data.bytes===null?null:streamBridge.fromBytes(data.bytes));apply(set,responseSlots,[this,s]);
             }
             get status(){return rstate(this).status;}get statusText(){return rstate(this).statusText;}get headers(){return rstate(this).headers;}get url(){return rstate(this).url;}get redirected(){return rstate(this).redirected;}get type(){return rstate(this).type;}
-            get ok(){const s=rstate(this);return s.status>=200&&s.status<300;}get bodyUsed(){return bodyUsed(rstate(this));}get body(){return rstate(this).stream;}
-            async arrayBuffer(){return consume(this);}
-            async text(){return apply(decode,new Decoder(),[await consume(this)]);}async json(){return JSON.parse(apply(decode,new Decoder(),[await consume(this)]));}
-            async formData(){const data=await consume(this),s=rstate(this);return formDataBridge.parse(data,apply(mapGet,hstate(s.headers).map,['content-type'])||'');}
-            async blob(){const data=await consume(this),s=rstate(this);return blobBridge.fromBytes(data,apply(mapGet,hstate(s.headers).map,['content-type'])||'');}
+            get ok(){const s=rstate(this);return s.status>=200&&s.status<300;}
             clone(){const s=rstate(this);if(unusable(s))throw new TypeError('Body is disturbed or locked');let branch=null;if(s.stream!==null){const tee=streamBridge.tee(s.stream);s.stream=tee[0];branch=tee[1];}
-                return response(null,{status:s.status,statusText:s.statusText,headers:headers(s.headers,hstate(s.headers).guard),url:s.url,redirected:s.redirected,type:s.type,abort:s.abort},branch);}
+                return response(null,{status:s.status,statusText:s.statusText,headers:headers(s.headers,hstate(s.headers).guard),url:s.url,redirected:s.redirected,type:s.type,abort:s.abort,resource:s.resource},branch);}
+            static error(){return response(null,{status:0,statusText:'',headers:headers(undefined,'immutable'),url:'',redirected:false,type:'error',abort:null});}
+            static redirect(url,status=302){
+                if(!arguments.length)throw new TypeError('redirect requires URL');const parsed=new NativeURL(usv(url),address);
+                let n=+status;n=Number.isFinite(n)?((Math.trunc(n)%65536)+65536)%65536:0;
+                if(n!==301&&n!==302&&n!==303&&n!==307&&n!==308)throw new RangeError('Invalid redirect status');
+                return response(null,{status:n,statusText:'',headers:headers({location:parsed.href},'immutable'),url:'',redirected:false,type:'default',abort:null});
+            }
+            static json(data,init={}){
+                if(!arguments.length)throw new TypeError('json requires data');
+                const serialized=stringify(data);if(serialized===undefined)throw new TypeError('Value cannot be serialized as JSON');
+                const i=responseInit(init);if(nullStatus(i.status))throw new TypeError('Null-body status cannot have a body');
+                if(!apply(mapHas,hstate(i.headers).map,['content-type']))append(i.headers,'content-type','application/json');
+                return response(apply(taBuffer,apply(encode,new Encoder(),[serialized]),[]),{status:i.status,statusText:i.statusText,headers:i.headers,url:'',redirected:false,type:'default',abort:null});
+            }
         }
+        installBody(Response,rstate);
+        const referrerPolicies=['','no-referrer','no-referrer-when-downgrade','same-origin','origin','strict-origin','origin-when-cross-origin','strict-origin-when-cross-origin','unsafe-url'];
+        const cacheModes=['default','no-store','reload','no-cache','force-cache','only-if-cached'];
+        const byteString=v=>{v=text(v);if(/[^\x00-\xff]/.test(v))throw new TypeError('Invalid ByteString');return v;};
+        const choice=(v,list,what)=>{v=text(v);if(!list.includes(v))throw new TypeError('Invalid '+what);return v;};
+        function methodValue(v){const m=byteString(v),upper=m.toUpperCase();if(!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(m)||upper==='CONNECT'||upper==='TRACE'||upper==='TRACK')throw new TypeError('Invalid or forbidden request method');return ['DELETE','GET','HEAD','OPTIONS','POST','PUT'].includes(upper)?upper:m;}
+        /* RequestInit: Web IDL reads a dictionary's members once, in lexicographic order. */
+        function readInit(value){
+            if(value===undefined||value===null)return {};
+            if(typeof value!=='object'&&typeof value!=='function')throw new TypeError('RequestInit requires an object');
+            const out={};
+            for(const key of ['body','cache','credentials','duplex','headers','integrity','keepalive','method','mode','redirect','referrer','referrerPolicy','signal']){const v=value[key];if(v!==undefined)out[key]=v;}
+            return out;
+        }
+        function cloneBody(s){if(unusable(s))throw new TypeError('Body is disturbed or locked');let stream=null;if(s.stream!==null){const tee=streamBridge.tee(s.stream);s.stream=tee[0];stream=tee[1];}return {stream,bytes:s.bytes===null?null:copy(s.bytes)};}
+        const dependent=list=>apply(anySignal,AbortSignalClass,[list]);
+        function requestObject(s){const r=create(Request.prototype);apply(set,requestSlots,[r,s]);return r;}
+        /* Fetch's Request (https://fetch.spec.whatwg.org/#request-class): its base URL is this
+           worker's URL and its origin the worker's. A body is kept both as the bytes the native
+           transport sends and as the stream the Body mixin reads; using either uses the body. */
+        class Request{
+            constructor(input,init={}){
+                if(!arguments.length)throw new TypeError('Request requires input');
+                const old=apply(get,requestSlots,[input]),source=old?null:usv(input),i=readInit(init);
+                const s=old?{...old}:{url:'',method:'GET',mode:'cors',credentials:'same-origin',cache:'default',redirect:'follow',
+                    referrer:'about:client',referrerPolicy:'',integrity:'',keepalive:false,destination:''};
+                if(!old){const url=new NativeURL(source,address);if(url.username||url.password)throw new TypeError('Request URL cannot contain credentials');s.url=url.href;}
+                if(entries(i).length){s.referrer='about:client';s.referrerPolicy='';}
+                if(i.method!==undefined)s.method=methodValue(i.method);
+                if(i.mode!==undefined)s.mode=choice(i.mode,['cors','same-origin','no-cors','navigate'],'request mode');
+                if(s.mode==='navigate')throw new TypeError('Cannot construct navigate request');
+                if(i.credentials!==undefined)s.credentials=choice(i.credentials,['omit','same-origin','include'],'credentials mode');
+                if(i.cache!==undefined)s.cache=choice(i.cache,cacheModes,'cache mode');
+                if(s.cache==='only-if-cached'&&s.mode!=='same-origin')throw new TypeError('only-if-cached requires same-origin mode');
+                if(i.redirect!==undefined)s.redirect=choice(i.redirect,['follow','error','manual'],'redirect mode');
+                if(i.duplex!==undefined)choice(i.duplex,['half'],'duplex mode');
+                if(i.integrity!==undefined)s.integrity=text(i.integrity);
+                if(i.keepalive!==undefined)s.keepalive=!!i.keepalive;
+                if(i.referrerPolicy!==undefined)s.referrerPolicy=choice(i.referrerPolicy,referrerPolicies,'referrer policy');
+                if(i.referrer!==undefined){
+                    const referrer=usv(i.referrer);
+                    if(referrer==='')s.referrer='';
+                    else{const u=new NativeURL(referrer,address);s.referrer=u.protocol==='about:'&&u.pathname==='client'||u.origin!==new NativeURL(host.securityURL()).origin?'about:client':u.href;}
+                }
+                if(s.mode==='no-cors'&&s.method!=='GET'&&s.method!=='HEAD'&&s.method!=='POST')throw new TypeError('no-cors requires a safelisted method');
+                const signal=i.signal!==undefined?i.signal:old?old.signal:null;
+                if(signal!==null&&!workerAbortBridge.brand(signal))throw new TypeError('Expected AbortSignal');
+                s.headers=headers(i.headers!==undefined?i.headers:old?old.headers:undefined,s.mode==='no-cors'?'request-no-cors':'request');
+                const override=i.body!==undefined&&i.body!==null,inherited=!!old&&old.stream!==null;
+                if((override||inherited)&&(s.method==='GET'||s.method==='HEAD'))throw new TypeError('GET and HEAD cannot have a body');
+                let body={stream:null,bytes:null};
+                if(override){
+                    const data=extract(i.body);if(data.stream)throw new DOMException('Worker streaming uploads are not implemented','NotSupportedError');
+                    if(data.type&&!apply(mapHas,hstate(s.headers).map,['content-type']))append(s.headers,'content-type',data.type);
+                    body={stream:data.bytes===null?null:streamBridge.fromBytes(data.bytes),bytes:data.bytes};
+                }else if(inherited)body=cloneBody(old);
+                s.stream=body.stream;s.bytes=body.bytes;s.used=false;s.abort=null;
+                s.signal=dependent(signal===null?[]:[signal]);
+                // Taking the input's body uses it, unlike clone().
+                if(inherited&&!override)old.used=true;
+                apply(set,requestSlots,[this,s]);
+            }
+            clone(){const s=qstate(this),body=cloneBody(s);return requestObject({...s,headers:headers(s.headers,hstate(s.headers).guard),signal:dependent([s.signal]),stream:body.stream,bytes:body.bytes,used:false});}
+            get duplex(){qstate(this);return 'half';}
+            get isReloadNavigation(){qstate(this);return false;}
+            get isHistoryNavigation(){qstate(this);return false;}
+        }
+        for(const key of ['method','url','headers','destination','referrer','referrerPolicy','mode','credentials','cache','redirect','integrity','keepalive','signal'])
+            define(Request.prototype,key,{configurable:true,enumerable:true,get(){return qstate(this)[key];}});
+        installBody(Request,qstate);
+        const take=id=>{const p=apply(mapGet,fetches,[id]);apply(mapDelete,fetches,[id]);return p;};
+        /* fetch()'s steps from its requestObject on: the worker's native transport, which does not
+           yet carry every mode the Request records (the NotSupportedError below). */
+        function send(r){
+            const s=qstate(r),signal=workerAbortBridge.state(s.signal);
+            if(closed)throw new TypeError('Worker closed');
+            // Integrity remains an explicit existing Worker Fetch limitation;
+            // local data must not silently drop a supplied digest.
+            if(s.integrity!=='')throw new DOMException('Worker Fetch integrity is not supported','NotSupportedError');
+            if(signal.aborted)throw signal.reason;
+            if(s.stream!==null&&unusable(s))throw new TypeError('Request body is disturbed or locked');
+            if(s.url.startsWith('data:'))return dataFetch(s.url,s.method,s.signal);
+            if(s.credentials!=='same-origin'||(s.mode!=='cors'&&s.mode!=='no-cors')||s.redirect!=='follow'||s.cache!=='default'||s.keepalive)throw new DOMException('Worker Fetch currently supports cors/no-cors, same-origin credentials, and follow redirects','NotSupportedError');
+            const cancellable=workerAbortBridge.sources(s.signal)>0;
+            if(cancellable&&!workerCanCancel)throw new DOMException('This Worker host has no native Fetch cancellation','NotSupportedError');
+            const noCors=s.mode==='no-cors',noReferrer=s.referrer===''||s.referrerPolicy==='no-referrer';
+            let referrerURL='';
+            if(!noReferrer){const source=new NativeURL(s.referrer==='about:client'?address:s.referrer);source.username='';source.password='';source.hash='';referrerURL=source.href;}
+            const referrerPolicy=s.referrerPolicy?referrerPolicies.indexOf(s.referrerPolicy):host.referrerPolicy();
+            let lines='';for(const pair of apply(mapEntries,hstate(s.headers).map,[]))lines+=pair[0]+': '+pair[1]+'\r\n';
+            const bytes=s.bytes,method=s.method;if(s.stream!==null)s.used=true;
+            return new NativePromise((resolve,reject)=>{const id=host.request(s.url,noCors,noReferrer,method,lines,bytes,referrerURL,referrerPolicy),p={resolve,reject,noCors,signal:s.signal,method,cleanup:()=>{}};apply(mapSet,fetches,[id,p]);if(cancellable)p.cleanup=workerAbortBridge.subscribe(s.signal,reason=>{if(!take(id))return;p.cleanup();try{host.cancel(id);}finally{reject(reason);}});});
+        }
+        const reject=error=>apply(rejectPromise,NativePromise,[error]);
+        /* A header list as [name, value, ...], and back to immutable headers. */
+        function flat(h){const out=[];for(const pair of apply(mapEntries,hstate(h).map,[])){out[out.length]=pair[0];out[out.length]=pair[1];}return out;}
+        function unflat(list){const h=headers(undefined,'immutable'),map=hstate(h).map;for(let i=0;i+1<list.length;i+=2)apply(mapSet,map,[list[i],list[i+1]]);return h;}
+        /* Cache Storage's view of this realm's Fetch objects (js_cache_storage.js), the same records
+           js_fetch.js gives a Window's: stored by either realm, read by either. */
+        const cache={
+            isRequest:v=>apply(has,requestSlots,[v]),isResponse:v=>apply(has,responseSlots,[v]),
+            newRequest:input=>new Request(input),
+            request(r){const s=qstate(r);return {url:s.url,method:s.method,headers:flat(s.headers),extra:stringify({__proto__:null,m:s.mode,c:s.credentials,k:s.cache,r:s.redirect,
+                f:s.referrer,p:s.referrerPolicy,i:s.integrity,a:s.keepalive,d:s.destination})};},
+            makeRequest(url,method,list,x){return requestObject({url,method,mode:x.m,credentials:x.c,cache:x.k,redirect:x.r,referrer:x.f,referrerPolicy:x.p,
+                integrity:x.i,keepalive:x.a,destination:x.d,headers:unflat(list),signal:dependent([]),stream:null,bytes:null,used:false,abort:null});},
+            response(r){const s=rstate(r);return {type:s.type,status:s.status,headers:flat(s.headers),unusable:!!unusable(s),
+                extra:stringify({__proto__:null,t:s.type,s:s.status,x:s.statusText,u:s.url,r:s.redirected,c:s.resource})};},
+            /* The body's stream (null for a null body), read by Cache Storage from here on. */
+            takeBody(r){return rstate(r).stream;},
+            makeResponse(x,list,stream){return response(null,{status:x.s,statusText:x.x,headers:unflat(list),url:x.u,redirected:x.r,type:x.t,abort:null,resource:x.t==='opaque'?x.c:undefined},stream);},
+            /* A fetch of r as it is, which signal can abort too. */
+            fetch(r,signal){try{const s=qstate(r),body=cloneBody(s);return send(requestObject({...s,headers:headers(s.headers,hstate(s.headers).guard),signal:dependent([s.signal,signal]),stream:body.stream,bytes:body.bytes,used:false}));}catch(error){return reject(error);}},
+            controller(){const c=new AbortControllerClass();return {signal:apply(controllerSignal,c,[]),abort(reason){apply(controllerAbort,c,[reason]);}};}
+        };
         function networkResponse(r,flags,signal,method){
-            if(flags&4)return response(null,{status:0,statusText:'',headers:headers(undefined,'immutable'),url:'',redirected:false,type:'opaque',abort:null});
+            /* The bits Cache Storage's resource policy check needs of the hidden response
+               (NJW_LOADED_RESOURCE), private to this realm. */
+            if(flags&4)return response(null,{status:0,statusText:'',headers:headers(undefined,'immutable'),url:'',redirected:false,type:'opaque',abort:null,resource:(flags>>3)&7});
             /* Native transport has already applied CORS exposure and cookie
                filtering, including redirect taint. Do not filter it twice. */
             const pairs=[];let statusText='';for(const line of text(r[2]).split(/\r?\n/)){if(line.startsWith('HTTP/1.1 ')){const at=line.indexOf(' ',9);if(at>=0)statusText=line.slice(at+1);continue;}const at=line.indexOf(':');if(at>0)pairs.push([line.slice(0,at),line.slice(at+1)]);}
             return response(method==='HEAD'||[204,205,304].includes(r[0])?null:r[3],{status:r[0],statusText,headers:headers(pairs,'immutable'),url:r[1],redirected:!!(flags&2),type:flags&1?'cors':'basic',abort:signal});
-        }
-        function prepare(body,headerInit,method,noCors){if(body!=null&&(method==='GET'||method==='HEAD'))throw new TypeError('GET and HEAD cannot have a body');
-            const data=extract(body);if(data.stream)throw new DOMException('Worker streaming uploads are not implemented','NotSupportedError');
-            const h=headers(headerInit,noCors?'request-no-cors':'request');if(data.type&&!apply(mapHas,hstate(h).map,['content-type']))append(h,'content-type',data.type);
-            let lines='';for(const pair of apply(mapEntries,hstate(h).map,[]))lines+=pair[0]+': '+pair[1]+'\r\n';return {bytes:data.bytes,headers:lines};
         }
         function dataFetch(url,method,signal){
             return new NativePromise((resolve,reject)=>{
@@ -322,50 +474,20 @@
                 if(signal!=null&&workerAbortBridge.state(signal).aborted)fail(workerAbortBridge.state(signal).reason);
             });
         }
-        return {Headers,Response,NativePromise,reject:error=>apply(rejectPromise,NativePromise,[error]),text,prepare,networkResponse,dataFetch,remember:(id,p)=>apply(mapSet,fetches,[id,p]),take:id=>{const p=apply(mapGet,fetches,[id]);apply(mapDelete,fetches,[id]);return p;}};
+        return {Headers,Request,Response,reject,send,networkResponse,cache,take};
     })();
-    const {Headers,Response}=workerFetchBridge,workerFetchURL=URL;
-    function fetch(input,options={}){
+    const {Headers,Request,Response}=workerFetchBridge;
+    /* Fetch's fetch(input, init): the Request constructor's steps, then the transport's. */
+    function fetch(input,init=undefined){
         try{
-            if(closed)throw new TypeError('Worker closed');options=options??{};
-            if(typeof options!=='object'&&typeof options!=='function')throw new TypeError('RequestInit requires an object');
-            const text=workerFetchBridge.text,url=new workerFetchURL(text(input),address),
-                body=options.body,cache=options.cache,credentials=options.credentials,headerInit=options.headers,
-                integrity=options.integrity,keepalive=options.keepalive,method=options.method,mode=options.mode,
-                redirect=options.redirect,referrer=options.referrer,policy=options.referrerPolicy,signal=options.signal,
-                requestMode=mode===undefined?'cors':text(mode),ref=referrer===undefined?'about:client':text(referrer),refPolicy=policy===undefined?'':text(policy);
-            let requestMethod=method===undefined?'GET':text(method);if(!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(requestMethod))throw new TypeError('Invalid request method');
-            const upper=requestMethod.toUpperCase();if(['CONNECT','TRACE','TRACK'].includes(upper))throw new TypeError('Forbidden request method');
-            if(['DELETE','GET','HEAD','OPTIONS','POST','PUT'].includes(upper))requestMethod=upper;
-            if(url.username||url.password)throw new TypeError('Fetch URL cannot contain credentials');
-            if(!['cors','no-cors','same-origin','navigate'].includes(requestMode))throw new TypeError('Invalid request mode');
-            if(!['','no-referrer','no-referrer-when-downgrade','same-origin','origin','strict-origin','origin-when-cross-origin','strict-origin-when-cross-origin','unsafe-url'].includes(refPolicy))throw new TypeError('Invalid referrer policy');
-            let referrerURL=address;
-            if(ref!==''&&ref!=='about:client'){const source=new workerFetchURL(ref,address);referrerURL=source.protocol==='about:'&&source.pathname==='client'||source.origin!==new workerFetchURL(host.securityURL()).origin?address:source.href;}
-            const noReferrer=ref===''||refPolicy==='no-referrer';
-            if(signal!=null&&!workerAbortBridge.brand(signal))throw new TypeError('Expected AbortSignal');
-            const credentialMode=credentials===undefined?'same-origin':text(credentials),redirectMode=redirect===undefined?'follow':text(redirect),cacheMode=cache===undefined?'default':text(cache);
-            if(!['omit','same-origin','include'].includes(credentialMode)||!['follow','error','manual'].includes(redirectMode)||!['default','no-store','reload','no-cache','force-cache','only-if-cached'].includes(cacheMode))throw new TypeError('Invalid Fetch policy');
-            if(requestMode==='navigate')throw new TypeError('Cannot construct navigate request');
-            if(cacheMode==='only-if-cached'&&requestMode!=='same-origin')throw new TypeError('only-if-cached requires same-origin mode');
-            // Integrity remains an explicit existing Worker Fetch limitation;
-            // local data must not silently drop a supplied digest.
-            if(integrity!==undefined&&text(integrity)!=='')throw new DOMException('Worker Fetch integrity is not supported','NotSupportedError');
-            if(noReferrer)referrerURL='';else {const source=new workerFetchURL(referrerURL);source.username='';source.password='';source.hash='';referrerURL=source.href;}
-            const referrerPolicy=refPolicy?['','no-referrer','no-referrer-when-downgrade','same-origin','origin','strict-origin','origin-when-cross-origin','strict-origin-when-cross-origin','unsafe-url'].indexOf(refPolicy):host.referrerPolicy();
-            const noCors=requestMode==='no-cors';if(noCors&&!['GET','HEAD','POST'].includes(requestMethod))throw new TypeError('Method is not CORS-safelisted');
-            const prepared=workerFetchBridge.prepare(body,headerInit,requestMethod,noCors);
-            const requestURL=url.href;if(closed)throw new TypeError('Worker closed');
-            if(signal!=null&&workerAbortBridge.state(signal).aborted)throw workerAbortBridge.state(signal).reason;
-            if(url.protocol==='data:')return workerFetchBridge.dataFetch(requestURL,requestMethod,signal);
-            if(credentialMode!=='same-origin'||(requestMode!=='cors'&&requestMode!=='no-cors')||redirectMode!=='follow'||cacheMode!=='default'||keepalive)throw new DOMException('Worker Fetch currently supports cors/no-cors, same-origin credentials, and follow redirects','NotSupportedError');
-            if(signal!=null&&!workerCanCancel)throw new DOMException('This Worker host has no native Fetch cancellation','NotSupportedError');
-            return new workerFetchBridge.NativePromise((resolve,reject)=>{const id=host.request(requestURL,noCors,noReferrer,requestMethod,prepared.headers,prepared.bytes,referrerURL,referrerPolicy),p={resolve,reject,noCors,signal,method:requestMethod,cleanup:()=>{}};workerFetchBridge.remember(id,p);if(signal!=null)p.cleanup=workerAbortBridge.subscribe(signal,reason=>{if(!workerFetchBridge.take(id))return;p.cleanup();try{host.cancel(id);}finally{reject(reason);}});});
+            if(closed)throw new TypeError('Worker closed');
+            if(!arguments.length)throw new TypeError('fetch requires input');
+            return workerFetchBridge.send(new Request(input,init));
         }catch(error){return workerFetchBridge.reject(error);}
     }
     /* @include js_performance.js */
     /* @include js_console.js */
-    Object.assign(globalThis,{self:globalThis,navigator,WorkerNavigator,postMessage,close,importScripts,Headers,Response,AbortSignal,AbortController,fetch,
+    Object.assign(globalThis,{self:globalThis,navigator,WorkerNavigator,postMessage,close,importScripts,Headers,Request,Response,AbortSignal,AbortController,fetch,
         setTimeout:(fn,ms,...args)=>timer(fn,ms,args,false),setInterval:(fn,ms,...args)=>timer(fn,ms,args,true),
         clearTimeout:clearTimer,clearInterval:clearTimer,
         queueMicrotask:fn=>{if(typeof fn!=='function')throw new TypeError('Callback required');Promise.resolve().then(fn).catch(report);},
@@ -414,7 +536,7 @@
         safetyDynamicCode:htmlSafetyBridge.dynamicCode,
         safetyViolation(init){if(!closed)dispatchNativeWorkerEvent(target,htmlSafetyBridge.violationEvent(init));},
         languageChange(){if(languagesChanged()&&!closed)dispatchNativeWorkerEvent(target,new Event('languagechange'));},
-        start(r){address=r[1];workerName=String(r[5]||"");workerCanCancel=r[6]===true;shared=r[9]===true;installScope(shared);if(shared)delete globalThis.postMessage;host.webidl(shared?'SharedWorkerGlobalScope':'DedicatedWorkerGlobalScope');if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker source failed','NetworkError');const locationURL=new URL(address);Object.defineProperty(globalThis,'location',{value:Object.freeze({href:address,origin:locationURL.origin,protocol:locationURL.protocol,host:locationURL.host,hostname:locationURL.hostname,port:locationURL.port,pathname:locationURL.pathname,search:locationURL.search,hash:locationURL.hash,toString(){return address;}}),configurable:true});if(!formDataBridge)formDataBridge=initializeWorkerFormData();evalSource(new TextDecoder().decode(r[3]),address);},
+        start(r){address=r[1];workerName=String(r[5]||"");workerCanCancel=r[6]===true;shared=r[9]===true;installScope(shared);if(shared)delete globalThis.postMessage;if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker source failed','NetworkError');const locationURL=new URL(address);Object.defineProperty(globalThis,'location',{value:Object.freeze({href:address,origin:locationURL.origin,protocol:locationURL.protocol,host:locationURL.host,hostname:locationURL.hostname,port:locationURL.port,pathname:locationURL.pathname,search:locationURL.search,hash:locationURL.hash,toString(){return address;}}),configurable:true});if(!formDataBridge)formDataBridge=initializeWorkerFormData();host.webidl(shared?'SharedWorkerGlobalScope':'DedicatedWorkerGlobalScope');evalSource(new TextDecoder().decode(r[3]),address);},
         receive(packet,op=2,id=0,kind=0){try{if(op===8||op===9||op===10){workerMessagingBridge.receivePort(id,kind,packet,op!==8);return;}const payload=kind===3?workerMessagingBridge.importExternal(packet):{data:cloneData.deserialize(packet),ports:[]};if(!closed){if(op===13){if(!shared||payload.ports.length!==1)throw new TypeError('Invalid shared worker connection');dispatchNativeWorkerEvent(target,new MessageEvent('connect',{data:'',source:payload.ports[0],ports:payload.ports}));}else dispatchNativeWorkerEvent(target,new MessageEvent('message',{data:payload.data,ports:payload.ports}));}}catch(e){if(!closed)dispatchNativeWorkerEvent(target,new MessageEvent('messageerror'));}},
         loaded(id,r,flags=0){const p=workerFetchBridge.take(id);if(!p||closed)return;p.cleanup();if(r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!p.noCors)){p.reject(new TypeError(r[4]||'Worker fetch failed'));return;}try{p.resolve(workerFetchBridge.networkResponse(r,flags,p.signal,p.method));}catch(error){p.reject(error);}},
         tick(now){if(closed)return false;const ports=workerMessagingBridge.ready();if(ports&&!lastPortTask){lastPortTask=true;return workerMessagingBridge.runOne();}const t=timerHeap[0];if(t&&t.due<=now){lastPortTask=false;if(t.repeat){t.due=now+t.delay;timerFix(0);}else clearTimer(t.id);try{t.fn(...t.args);}catch(e){report(e);}return true;}lastPortTask=ports;return ports?workerMessagingBridge.runOne():false;},
