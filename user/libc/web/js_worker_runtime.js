@@ -42,7 +42,7 @@
     /* @include js_custom_event.js */
     const CustomEvent=customEventInterface(Event,eventState);
     function workerListeners(value){const m=apply(eventGet,listeners,[value]);if(!m)throw new TypeError('Illegal EventTarget receiver');return m;}
-    function removeWorkerListener(list,entry){if(entry.removed)return;entry.removed=true;const index=apply(eventIndexOf,list,[entry]);if(index>=0)apply(eventSplice,list,[index,1]);if(entry.unlisten){entry.unlisten();entry.unlisten=null;}}
+    function removeWorkerListener(target,list,entry){if(entry.removed)return;entry.removed=true;const index=apply(eventIndexOf,list,[entry]);if(index>=0)apply(eventSplice,list,[index,1]);if(entry.unlisten){entry.unlisten();entry.unlisten=null;}if(entry.type==='abort')abortBridge.listen(target,-1);}
     class EventTarget{
         constructor(){apply(eventSet,listeners,[this,new EventMap()]);}
         addEventListener(type,fn,options={}){
@@ -50,17 +50,18 @@
             if(typeof fn!=='function'&&typeof fn!=='object')throw new TypeError('Invalid event listener');
             const capture=typeof options==='boolean'?options:!!options?.capture,once=typeof options==='object'&&!!options?.once,
                 passive=typeof options==='object'&&!!options?.passive,signal=typeof options==='object'?options?.signal:null;
-            if(signal!=null&&!workerAbortBridge.brand(signal))throw new TypeError('Expected AbortSignal');
-            if(signal!=null&&workerAbortBridge.state(signal).aborted)return;
+            if(signal!=null&&!abortBridge.signals.is(signal))throw new TypeError('Expected AbortSignal');
+            if(signal!=null&&abortBridge.signals.aborted(signal))return;
             const list=apply(eventMapGet,m,[type])||[];
             if(list.some(x=>!x.removed&&x.fn===fn&&x.capture===capture))return;
-            const entry={fn,capture,once,passive,removed:false,unlisten:null};list.push(entry);apply(eventMapSet,m,[type,list]);
-            if(signal!=null)entry.unlisten=workerAbortBridge.subscribe(signal,()=>removeWorkerListener(list,entry));
+            const entry={type,fn,capture,once,passive,removed:false,unlisten:null};list.push(entry);apply(eventMapSet,m,[type,list]);
+            if(type==='abort')abortBridge.listen(this,1);
+            if(signal!=null)entry.unlisten=abortBridge.signals.follow(signal,()=>removeWorkerListener(this,list,entry));
         }
         removeEventListener(type,fn,options={}){
             const m=workerListeners(this);type=eventString(type);const capture=typeof options==='boolean'?options:!!options?.capture,
                 list=apply(eventMapGet,m,[type])||[];
-            for(const entry of list)if(!entry.removed&&entry.fn===fn&&entry.capture===capture){removeWorkerListener(list,entry);break;}
+            for(const entry of list)if(!entry.removed&&entry.fn===fn&&entry.capture===capture){removeWorkerListener(this,list,entry);break;}
         }
         dispatchEvent(event){workerListeners(this);const s=eventState(event);if(!s.initialized||s.dispatching)throw new DOMException('Uninitialized or dispatching event','InvalidStateError');s.isTrusted=false;return dispatchWorkerEvent(this,event);}
     }
@@ -80,7 +81,7 @@
             const node=entry.node,current=scope(node),list=apply(eventMapGet,workerListeners(node),[type])||[],listed=apply(eventSlice,list,[]);
             s.target=scope(entry.target);s.path=entry.visible;s.eventPhase=phase;s.currentTarget=current;
             for(const item of listed){
-                if(item.removed||item.capture!==capture)continue;if(item.once)removeWorkerListener(list,item);s.passive=item.passive;
+                if(item.removed||item.capture!==capture)continue;if(item.once)removeWorkerListener(node,list,item);s.passive=item.passive;
                 try{
                     if(typeof item.fn==='function')apply(item.fn,current,[event]);
                     else{const fn=item.fn.handleEvent;if(typeof fn!=='function')throw new TypeError('EventListener handleEvent is not callable');apply(fn,item.fn,[event]);}
@@ -115,13 +116,16 @@
     /* @include js_xhr.js */
     const ProgressEvent=progressEventInterface(Event);
     Object.defineProperty(globalThis,'ProgressEvent',{value:ProgressEvent,writable:true,configurable:true});
-    let blobHandlerTarget=()=>false,indexedDBHandlerTarget=()=>false,xhrHandlerTarget=()=>false;
+    let blobHandlerTarget=()=>false,indexedDBHandlerTarget=()=>false,abortHandlerTarget=()=>false,xhrHandlerTarget=()=>false;
     const fileHandlers=new WeakMap();
     const dispatch=dispatchNativeWorkerEvent;
-    const handlerTarget=(value,type)=>blobHandlerTarget(value,type)||indexedDBHandlerTarget(value,type)||xhrHandlerTarget(value,type);
+    const handlerTarget=(value,type)=>blobHandlerTarget(value,type)||indexedDBHandlerTarget(value,type)||abortHandlerTarget(value,type)||xhrHandlerTarget(value,type);
     function installHandlers(prototype,types){for(const type of types)eventDefine(prototype,'on'+type,{enumerable:true,configurable:true,
         get(){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');return apply(eventGet,fileHandlers,[this])?.[type]||null;},
-        set(value){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');let map=apply(eventGet,fileHandlers,[this]);if(!map){map=eventCreate(null);apply(eventSet,fileHandlers,[this,map]);}map[type]=typeof value==='function'?value:null;}});}
+        set(value){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');let map=apply(eventGet,fileHandlers,[this]);if(!map){map=eventCreate(null);apply(eventSet,fileHandlers,[this,map]);}
+            const had=typeof map[type]==='function';map[type]=typeof value==='function'?value:null;
+            /* An abort handler is an abort listener for AbortSignal's garbage collection rule. */
+            if(type==='abort'&&had!==(map[type]!==null))abortBridge.listen(this,had?-1:1);}});}
     /* Whether one or more event listeners are registered on target, an event handler among them
        (XMLHttpRequest's upload listener flag). */
     function workerListened(target){
@@ -162,6 +166,12 @@
         /* @include js_formdata.js */
         fetchBridge.initializeFormData(formDataBridge);
         cloneData.registerUncloneable(value=>formDataBridge.brand(value));
+        /* @include js_object_url.js */
+        /* This Worker's environment for its blob URL store: its origin (START's, "null" for a
+           data: Worker's opaque one); a Worker creates no blob: document or Worker to inherit a
+           policy container. */
+        const objectURLOrigin=(()=>{try{return new URL(host.securityURL()).origin;}catch(_){return 'null';}})();
+        fetchBridge.initializeObjectURLs(objectURLInterfaces({origin:()=>objectURLOrigin,policy:()=>null}));
         return formDataBridge;
     }
     const errorPayload=e=>({message:String(e?.message||e),filename:address,lineno:0,stack:String(e?.stack||'')});
@@ -177,97 +187,83 @@
     }
     function clearTimer(id){const t=timers.get(Number(id));if(!t)return;timers.delete(t.id);const index=t.index,last=timerHeap.pop();if(index<timerHeap.length){timerHeap[index]=last;last.index=index;timerFix(index);}}
     function timer(fn,ms,args,repeat){if(closed)return 0;if(typeof fn!=='function'){fn=htmlSafetyBridge.timerCode(fn,repeat?'setInterval':'setTimeout');if(fn===null)return 0;}let id;for(let i=0;i<=timers.size;i++){nextTimer=nextTimer===4294967295?1:nextTimer+1;if(!timers.has(nextTimer)){id=nextTimer;break;}}if(id===undefined)throw new RangeError('Worker timer identifier space exhausted');if(timerOrder===9007199254740991){timerOrder=0;for(const t of timers.values())t.order=++timerOrder;for(let i=Math.floor(timerHeap.length/2)-1;i>=0;i--)timerFix(i);}const delay=Math.max(1,Math.min(2147483647,Number(ms)||0)),t={id,order:++timerOrder,fn,args,repeat,delay,due:host.now()+delay,index:timerHeap.length};timers.set(id,t);timerHeap.push(t);timerFix(t.index);return id;}
-    function importScripts(...urls){for(const u of urls){const url=new URL(htmlSafetyBridge.check(u,3,'WorkerGlobalScope importScripts'),address).href;const r=host.import(url);if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker script load failed','NetworkError');evalSource(new TextDecoder().decode(r[3]),r[1]||url);}}
-    const workerAbortBridge=(()=>{
-        const apply=Reflect.apply,get=WeakMap.prototype.get,set=WeakMap.prototype.set,has=WeakMap.prototype.has,
-            add=Set.prototype.add,remove=Set.prototype.delete,values=Set.prototype.values,clear=Set.prototype.clear,
-            NativeSet=Set,Reference=WeakRef,deref=WeakRef.prototype.deref,define=Object.defineProperty,
-            dispatch=EventTarget.prototype.dispatchEvent,listen=EventTarget.prototype.addEventListener,unlisten=EventTarget.prototype.removeEventListener,
-            mapGet=Map.prototype.get,string=String,trunc=Math.trunc,finite=Number.isFinite,
-            slots=new WeakMap(),controllers=new WeakMap(),retained=new NativeSet(),token={};
-        const setSize=Object.getOwnPropertyDescriptor(Set.prototype,'size').get,setNext=Object.getPrototypeOf(apply(values,retained,[])).next;
-        const size=s=>apply(setSize,s,[]),each=(s,fn)=>{const iterator=apply(values,s,[]);for(;;){const item=apply(setNext,iterator,[]);if(item.done)return;fn(item.value);}};
-        const safeReport=error=>{try{report(error);}catch(_){}};
-        const state=signal=>{const s=apply(get,slots,[signal]);if(!s)throw new TypeError('Illegal AbortSignal invocation');return s;};
-        const text=value=>{if(typeof value==='symbol')throw new TypeError('Symbol is not a DOMString');return string(value);};
-        const removeDependencies=list=>{for(let i=0;i<list.length;i++)apply(remove,state(list[i][0]).dependents,[list[i][1]]);};
-        const finalizer=new FinalizationRegistry(removeDependencies),register=FinalizationRegistry.prototype.register,unregister=FinalizationRegistry.prototype.unregister;
-        function retain(signal){const s=state(signal),m=apply(get,listeners,[signal]),events=m&&apply(mapGet,m,['abort']);if(!s.aborted&&size(s.sources)&&(size(s.algorithms)||s.handler||(events&&events.some(entry=>!entry.removed))))apply(add,retained,[signal]);else apply(remove,retained,[signal]);}
-        function clean(signal){const s=state(signal);removeDependencies(s.dependencies);s.dependencies=[];apply(clear,s.sources,[]);apply(unregister,finalizer,[signal]);apply(remove,retained,[signal]);}
-        function run(signal){const s=state(signal);each(s.algorithms,algorithm=>{try{algorithm(s.reason);}catch(error){safeReport(error);}});apply(clear,s.algorithms,[]);clean(signal);const event=new Event('abort');try{dispatchNativeWorkerEvent(signal,event);}catch(error){safeReport(error);}}
-        function abort(signal,reason){
-            const s=state(signal);if(s.aborted)return;s.aborted=true;s.reason=reason===undefined?new DOMException('The operation was aborted','AbortError'):reason;
-            const dependents=[];each(s.dependents,reference=>{const dependent=apply(deref,reference,[]);if(!dependent){apply(remove,s.dependents,[reference]);return;}const d=state(dependent);if(!d.aborted){d.aborted=true;d.reason=s.reason;dependents[dependents.length]=dependent;}});
-            run(signal);for(let i=0;i<dependents.length;i++)run(dependents[i]);apply(clear,s.dependents,[]);
-        }
-        function newSignal(){return new AbortSignal(token);}
-        /* DOM "create a dependent abort signal" from sources: any()'s converted sequence, or an
-           array this realm made (Fetch's Request signals). */
-        function dependent(sources){
-            for(let i=0;i<sources.length;i++)state(sources[i]);
-            const signal=newSignal(),s=state(signal);for(let i=0;i<sources.length;i++){const p=state(sources[i]);if(p.aborted){s.aborted=true;s.reason=p.reason;return signal;}}s.dependent=true;
-            for(let i=0;i<sources.length;i++){const source=sources[i],p=state(source);if(p.dependent)each(p.sources,root=>apply(add,s.sources,[root]));else apply(add,s.sources,[source]);}
-            const reference=new Reference(signal);each(s.sources,source=>{apply(add,state(source).dependents,[reference]);s.dependencies[s.dependencies.length]=[source,reference];});if(s.dependencies.length)apply(register,finalizer,[signal,s.dependencies,signal]);return signal;
-        }
-        class AbortSignal extends EventTarget{
-            constructor(secret){super();if(secret!==token)throw new TypeError('Illegal constructor');apply(set,slots,[this,{aborted:false,reason:undefined,handler:null,dependent:false,algorithms:new NativeSet(),sources:new NativeSet(),dependents:new NativeSet(),dependencies:[]}]);}
-            get aborted(){return state(this).aborted;}get reason(){return state(this).reason;}throwIfAborted(){const s=state(this);if(s.aborted)throw s.reason;}
-            get onabort(){return state(this).handler;}set onabort(value){state(this).handler=typeof value==='function'?value:null;retain(this);}
-            addEventListener(type,fn,options){state(this);apply(listen,this,[text(type),fn,options]);retain(this);}
-            removeEventListener(type,fn){state(this);apply(unlisten,this,[text(type),fn]);retain(this);}
-            static abort(reason){const signal=newSignal(),s=state(signal);s.aborted=true;s.reason=reason===undefined?new DOMException('The operation was aborted','AbortError'):reason;return signal;}
-            static timeout(milliseconds){
-                if(!arguments.length)throw new TypeError('timeout requires milliseconds');const number=+milliseconds,ms=trunc(number);if(!finite(number)||ms<0||ms>=18446744073709551616)throw new TypeError('Timeout is outside unsigned long long range');
-                const signal=newSignal(),started=host.now();function elapsed(){const left=ms-(host.now()-started);if(left>0)timer(elapsed,Math.min(left,2147483647),[],false);else abort(signal,new DOMException('Timed out','TimeoutError'));}timer(elapsed,Math.min(ms,2147483647),[],false);return signal;
-            }
-            static any(input){
-                if(!arguments.length||input==null||(typeof input!=='object'&&typeof input!=='function'))throw new TypeError('any requires a signal sequence');return dependent([...input]);
-            }
-        }
-        class AbortController{
-            constructor(){apply(set,controllers,[this,newSignal()]);}
-            get signal(){const signal=apply(get,controllers,[this]);if(!signal)throw new TypeError('Illegal AbortController invocation');return signal;}
-            abort(reason){const signal=apply(get,controllers,[this]);if(!signal)throw new TypeError('Illegal AbortController invocation');abort(signal,reason);}
-        }
-        function subscribe(signal,algorithm){const s=state(signal);if(s.aborted)return ()=>{};apply(add,s.algorithms,[algorithm]);retain(signal);return ()=>{apply(remove,s.algorithms,[algorithm]);retain(signal);};}
-        return {AbortSignal,AbortController,state,brand:signal=>apply(has,slots,[signal]),sources:signal=>size(state(signal).sources),subscribe,
-            /* What Fetch (js_fetch.js) asks of this realm's signals, as js_abort.js's abortBridge.signals in a Window. */
-            signals:Object.freeze({is:signal=>apply(has,slots,[signal]),aborted:signal=>state(signal).aborted,reason:signal=>state(signal).reason,
-                follow:subscribe,any:dependent,controller(){const signal=newSignal();return {signal,abort(reason){abort(signal,reason);}};}})};
-    })();
-    const {AbortSignal,AbortController}=workerAbortBridge;
+    function importScripts(...urls){for(const u of urls){const url=new URL(htmlSafetyBridge.check(u,3,'WorkerGlobalScope importScripts'),address).href;const r=host.import(url);performanceBridge.monotonicResource(0,IMPORT_REQUEST,url,wireField(r,LOADED_TIMING));if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker script load failed','NetworkError');evalSource(new TextDecoder().decode(r[3]),r[1]||url);}}
+    /* @include js_abort.js */
+    /* This Worker's events for AbortSignal: a trusted abort event through this realm's dispatch,
+       its event handler attributes and timers. */
+    const abortBridge=abortInterfaces({fire:signal=>dispatchNativeWorkerEvent(signal,new Event('abort')),
+        handlers:installHandlers,report,now:()=>host.now(),timer:(fn,ms)=>timer(fn,ms,[],false)});
+    abortHandlerTarget=abortBridge.handlerTarget;
+    const {AbortSignal,AbortController}=abortBridge;
     /* @include js_fetch.js */
     /* This Worker's transport for Fetch: its parent window's native fetch, through
        browserjsworker.c (NJW_LOAD with the Request's modes, NJW_FRAME, NJW_RESUME, NJW_CANCEL) to
        js.c's worker_request, which applies the creating document's CORS, cookies, Mixed Content
        and CSP. An opaque response arrives blank from the parent (js_worker.c); a fetch the
        parent has not ended is in fetches, by its request id. */
+    /* The parent's report timing of this Worker's own request (NJW_LOADED_TIMING, field 7 of an
+       NJW_LOADED record, [1] of an END frame's), with js.c's request kind: 4 (P_WORKER) is
+       importScripts' initiator type "other", 1 (P_FETCH) is fetch()'s "fetch". */
+    const LOADED_TIMING=7,IMPORT_REQUEST=4,FETCH_REQUEST=1,ownProperty=Object.prototype.hasOwnProperty;
+    /* An optional field of a wire record: its own, never one the page put on Array.prototype. */
+    const wireField=(record,index)=>record!==null&&typeof record==='object'&&apply(ownProperty,record,[index])?record[index]:undefined;
     const workerFetchTransport=(()=>{
         const apply=Reflect.apply,mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapDelete=Map.prototype.delete,mapForEach=Map.prototype.forEach,mapClear=Map.prototype.clear,
             setPrototype=Object.setPrototypeOf,NativePromise=Promise,NativeTypeError=TypeError,request=host.request,resume=host.resume,cancel=host.cancel,
-            requestWait=host.requestWait;
+            strIndex=String.prototype.indexOf,strSlice=String.prototype.slice,requestWait=host.requestWait;
         const record=object=>setPrototype(object,null);
         const take=id=>{const p=apply(mapGet,fetches,[id]);apply(mapDelete,fetches,[id]);return p;};
-        /* An NJW_LOADED that is a network error: the parent's reason, no status, or an opaque
-           response to a request that did not ask for no-cors. */
-        const failed=(r,flags,noCors)=>r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!noCors);
+        /* A filtered response the request's modes do not allow: an opaque one for a request not in
+           mode "no-cors", an opaque-redirect for one whose redirect mode is not "manual". */
+        const contradicts=(flags,noCors,manual)=>((flags&4)&&!noCors)||((flags&64)&&!manual);
+        /* An NJW_LOADED that is a network error: the parent's reason, no status (a filtered
+           response has none), or a filtered response the request's modes contradict. */
+        const failed=(r,flags,noCors,manual)=>r[4]||(!(flags&(4|64))&&!r[0])||contradicts(flags,noCors,manual);
         /* A fetch's end: its stream's (notify), then its promise's when no response was published. */
         function end(p,error){if(p.notify)p.notify(3,error);if(!p.published)p.reject(error===undefined?new NativeTypeError('Worker fetch failed'):error);}
         /* The response the parent delivered: NJW_LOADED's [status, url, headers, bytes] or a
-           headers frame's [status, url, headers], its NJW_LOADED_* flags. */
+           headers frame's [status, url, headers], its NJW_LOADED_* flags (4 opaque with its
+           resource bits, 64 an opaque-redirect: its URL only). */
         function response(r,flags,bytes){
             if(flags&4)return fetchBridge.response(0,'','',undefined,null,false,'','opaque',(flags>>3)&7);
+            if(flags&64)return fetchBridge.response(0,r[1],'',undefined,null,false,'','opaqueredirect');
             return fetchBridge.response(r[0],r[1],r[2],undefined,bytes,!!(flags&2),undefined,flags&1?'cors':'basic');
         }
         /* One frame taken: the parent sends the next on this resume, once per frame. */
         function next(id,p,more){if(more&&!p.done)apply(resume,host,[id]);else p.paused=!p.done;}
+        /* Fetch's report timing, once the fetch has ended (as a Window's js.c reports it): the
+           entry in this Worker's performance timeline, by its request id (realm.initiator's). */
+        function timing(p,record){try{performanceBridge.monotonicResource(p.id,FETCH_REQUEST,p.url,record);}catch(error){report(error);}}
+        /* The parent's answer to obtainBlob: the Blob's bytes and its type (the Content-Type field
+           worker_blob writes). */
+        function blobAnswer(r){
+            const headers=typeof r[2]==='string'?r[2]:'',field=apply(strIndex,headers,['Content-Type: ']),end=field<0?-1:apply(strIndex,headers,['\r\n',field]);
+            if(r[4]||r[0]!==200||end<0)throw new NativeTypeError(r[4]||'The blob: URL has no Blob in this Worker\'s partition');
+            return [r[3],apply(strSlice,headers,[field+14,end])];
+        }
         return {
             noCors:()=>true,streaming:()=>workerStreaming,
             fetch(q,notify){
                 if(closed)throw new NativeTypeError('Worker closed');
                 const stream=!!notify&&workerStreaming,id=apply(request,host,[q,stream]);
                 let resolve,reject;const promise=new NativePromise((a,b)=>{resolve=a;reject=b;});
-                apply(mapSet,fetches,[id,record({resolve,reject,notify:stream?notify:undefined,noCors:q.noCors,published:false,paused:false,done:false})]);
+                apply(mapSet,fetches,[id,record({id,resolve,reject,notify:stream?notify:undefined,noCors:q.noCors,manual:q.redirectManual,url:q.url,published:false,paused:false,done:false})]);
+                return record({id,promise});
+            },
+            /* FileAPI "obtain a blob object" for a blob: URL this Worker's store does not hold: the
+               parent's js.c resolves it in its document's store when this Worker is in that
+               document's storage partition (worker_blob). The NJW_LOADED body and its Content-Type
+               field are the Blob's bytes and type; Fetch (js_fetch.js) runs the rest of scheme
+               fetch here, as a Window does. With a timeout (a synchronous XMLHttpRequest's), the
+               event loop pauses for the answer as fetchSync's does: [bytes, type], null when the
+               timeout passed first. */
+            obtainBlob(url,timeout){
+                if(closed)throw new NativeTypeError('Worker closed');
+                const id=apply(request,host,[record({url,method:'GET',headers:'',body:null,sameOrigin:false,credentials:0,forcePreflight:false,
+                    redirectError:false,cache:0,keepalive:false,noCors:false,noReferrer:true,referrer:'',referrerPolicy:0,destination:''}),false]);
+                if(timeout!==undefined){const answer=apply(requestWait,host,[id,timeout]);return answer===null?null:blobAnswer(answer[0]);}
+                let resolve,reject;const promise=new NativePromise((a,b)=>{resolve=a;reject=b;});
+                apply(mapSet,fetches,[id,record({resolve,reject,notify:undefined,noCors:false,url,blob:true,published:false,paused:false,done:false})]);
                 return record({id,promise});
             },
             resume(id){const p=apply(mapGet,fetches,[id]);if(!p||!p.paused||closed)return;p.paused=false;apply(resume,host,[id]);},
@@ -275,17 +271,22 @@
             /* NJW_LOADED: a buffered response, or the error that ends any fetch. */
             loaded(id,r,flags){
                 const p=take(id);if(!p||closed)return;p.done=true;
-                if(failed(r,flags,p.noCors)||p.notify){end(p,new NativeTypeError(r[4]||'Worker fetch failed'));return;}
+                if(p.blob){let blob;try{blob=blobAnswer(r);}catch(error){p.reject(error);return;}p.resolve(blob);return;}
+                timing(p,wireField(r,LOADED_TIMING));
+                if(failed(r,flags,p.noCors,p.manual)||p.notify){end(p,new NativeTypeError(r[4]||'Worker fetch failed'));return;}
                 try{p.published=true;p.resolve(response(r,flags,r[3]));}catch(error){p.reject(error);}
             },
             /* NJW_FRAME: one frame of a streamed fetch (the parent's process_fetch_frame order:
                the stream first, then the promise). */
             frame(id,value,kind){
                 const p=apply(mapGet,fetches,[id]);if(!p||closed||!p.notify)return;
-                const event=(kind>>8)&7,flags=kind&63;
-                if(event===3){take(id);p.done=true;end(p,value?new NativeTypeError(value):undefined);return;}
+                const event=(kind>>8)&7,flags=kind&127;
+                if(event===3){
+                    const error=wireField(value,0);take(id);p.done=true;end(p,error?new NativeTypeError(error):undefined);
+                    timing(p,wireField(value,1));return;
+                }
                 if(event===1){
-                    if((flags&4)&&!p.noCors){take(id);p.done=true;end(p,new NativeTypeError('Native Fetch response contradicts its filtering policy'));return;}
+                    if(contradicts(flags,p.noCors,p.manual)){take(id);p.done=true;end(p,new NativeTypeError('Native Fetch response contradicts its filtering policy'));return;}
                     const published=response(value,flags,new ArrayBuffer(0)),more=p.notify(1,published);
                     p.published=true;p.resolve(published);next(id,p,more);return;
                 }
@@ -300,12 +301,15 @@
                pauses this worker's event loop (other records wait in its task queue) until the
                parent's NJW_LOADED, or until timeout ms (0: none) pass, when it tells the parent to
                cancel and gives null. */
-            fetchSync(q,timeout){
+            fetchSync(q,timeout,initiator){
                 if(closed)throw new NativeTypeError('Worker closed');
-                const answer=apply(requestWait,host,[apply(request,host,[q,false]),timeout]);
+                const id=apply(request,host,[q,false]);
+                if(initiator)initiator(id);
+                const answer=apply(requestWait,host,[id,timeout]);
                 if(answer===null)return null;
                 const r=answer[0],flags=answer[1];
-                if(failed(r,flags,q.noCors))throw new NativeTypeError(r[4]||'Worker fetch failed');
+                timing(record({id,url:q.url}),wireField(r,LOADED_TIMING));
+                if(failed(r,flags,q.noCors,q.redirectManual))throw new NativeTypeError(r[4]||'Worker fetch failed');
                 return response(r,flags,r[3]);
             }
         };
@@ -316,10 +320,11 @@
         const apply=Reflect.apply,NativeURL=URL,urlOrigin=Object.getOwnPropertyDescriptor(URL.prototype,'origin').get,
             dataURL=host.dataURL,digest=host.cryptoDigest,securityURL=host.securityURL,referrerPolicy=host.referrerPolicy;
         const origin=()=>{try{return apply(urlOrigin,new NativeURL(apply(securityURL,host,[])),[]);}catch(_){return 'null';}};
-        return fetchInterfaces({signals:workerAbortBridge.signals,transport:workerFetchTransport,
+        return fetchInterfaces({signals:abortBridge.signals,transport:workerFetchTransport,
             baseURL:()=>address,origin,clientReferrer:()=>address,referrerPolicy:()=>apply(referrerPolicy,host,[]),
             url:()=>apply(securityURL,host,[])||address,dataURL:url=>apply(dataURL,host,[url]),
-            task:fn=>timer(fn,0,[],false),clearTask:clearTimer,digest:(algorithm,bytes)=>apply(digest,host,[algorithm,bytes])});
+            task:fn=>timer(fn,0,[],false),clearTask:clearTimer,digest:(algorithm,bytes)=>apply(digest,host,[algorithm,bytes]),
+            initiator:id=>performanceBridge.initiator(id,'xmlhttprequest')});
     })();
     fetchBridge.initialize();fetchBridge.initializeStreams(streamBridge);fetchBridge.initializeBlobs(blobBridge);
     const {Headers,Request,Response,fetch}=fetchBridge;

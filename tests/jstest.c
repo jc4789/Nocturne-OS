@@ -213,7 +213,7 @@ static bool request(void *opaque, const struct web_request *r) {
                 r->kind==WEB_RESOURCE_MODULE?WEBNET_MODULE:r->kind==WEB_RESOURCE_SCRIPT?WEBNET_CLASSIC:WEBNET_RESOURCE,
                 .generation=1,.url=r->url,.origin=r->origin,.method=r->method,.headers=r->headers,
                 .body=r->body,.body_len=r->body_len,.credentials=(enum webnet_credentials)r->credentials,
-                .same_origin=r->same_origin,.redirect_error=r->redirect_error,
+                .same_origin=r->same_origin,.redirect_error=r->redirect_error,.redirect_manual=r->redirect_manual,
                 .no_cors=r->no_cors,.no_referrer=r->no_referrer,.stream_response=r->stream_response};
             q->transport_id=webnet_submit(f->net,&native,network_complete,q);
             if(!q->transport_id){q->used=false;return false;}

@@ -1413,7 +1413,7 @@ static bool host_request(void *opaque, const struct web_request *request) {
         .url = request->url, .origin = request->origin ? request->origin : web_url(tab->doc), .method = request->method,
         .headers = request->headers, .body = request->body, .body_len = request->body_len,
         .credentials = request->credentials, .force_preflight = request->force_preflight,
-        .redirect_error = request->redirect_error, .same_origin = request->same_origin,
+        .redirect_error = request->redirect_error, .redirect_manual = request->redirect_manual, .same_origin = request->same_origin,
         .no_cors = request->no_cors, .no_referrer = request->no_referrer,
         .referrer=request->referrer,.referrer_policy=request->referrer_policy,
         .image_upgrade = request->kind == WEB_RESOURCE_IMAGE && request->image_upgrade,

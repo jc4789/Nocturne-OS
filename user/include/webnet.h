@@ -122,6 +122,9 @@ struct webnet_request {
     enum webnet_credentials credentials;
     bool force_preflight; /* Fetch use-CORS-preflight flag, not an author request header. */
     bool redirect_error; /* Refuse a redirect before issuing its target request. */
+    /* Fetch's redirect mode "manual" (WEBNET_FETCH only): the first redirect ends the fetch as an
+       opaque-redirect filtered response (WEBNET_WIRE_REDIRECT_MANUAL). */
+    bool redirect_manual;
     bool same_origin; /* Enforced on every redirect hop, not just the initial URL. */
     bool no_cors, no_referrer; /* Safelisted Fetch; opaque response after cross-origin hop. */
     const char *referrer; /* NULL legacy/no source; empty means explicitly no-referrer. */

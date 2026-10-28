@@ -273,7 +273,9 @@ const realms = {
         const c = context('worker', file);
         const runtime = source(rev, web + 'js_worker_runtime.js');
         const xhrLines = lines(runtime, '    /* XMLHttpRequest and ProgressEvent are the Window\'s', '        return found;\n    }', 'worker xhr');
-        const fetchPart = expand(rev, must(lines(runtime, '    const workerAbortBridge=(()=>{', '    const {Headers,Request,Response,fetch}=fetchBridge;', 'worker fetch'), 'worker fetch'));
+        /* Its AbortSignal: js_abort.js (as the Window's), or REV's own copy. */
+        const abortStart = runtime.includes('    /* @include js_abort.js */') ? '    /* @include js_abort.js */' : '    const workerAbortBridge=(()=>{';
+        const fetchPart = expand(rev, must(lines(runtime, abortStart, '    const {Headers,Request,Response,fetch}=fetchBridge;', 'worker fetch'), 'worker fetch'));
         const xhrPort = lines(runtime, '    /* This Worker\'s XMLHttpRequest:', '        Object.defineProperty(globalThis,name,{value:xhr[name],writable:true,configurable:true});', 'worker xhr port');
         const transport = workerTransport(c);
         c.__transport = transport;
@@ -281,6 +283,8 @@ const realms = {
             const apply=Reflect.apply,DOMException=domExceptionBridge.DOMException,QuotaExceededError=domExceptionBridge.QuotaExceededError;
             let closed=false,address=__url,workerCanCancel=true,workerStreaming=true;
             const fetches=new Map();
+            /* The Worker's performance timeline (js_performance.js) is not run here. */
+            const performanceBridge={initiator(){},monotonicResource(){}};
             function report(e){__reported.push(e);}
             function timer(fn,ms,args){return setTimeout(()=>fn(...(args||[])),ms);}
             function clearTimer(id){clearTimeout(id);}

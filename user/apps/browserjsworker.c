@@ -551,7 +551,8 @@ static JSValue native_request(JSContext *ctx,JSValueConst thisv,int argc,JSValue
     if(!argc||!JS_IsObject(argv[0]))return JS_ThrowTypeError(ctx,"Fetch request record required");
     if(w->request==UINT32_MAX)return JS_ThrowRangeError(ctx,"Worker request identifier space exhausted");
     static const struct {const char *name;uint32_t flag;} modes[]={{"noCors",NJW_LOAD_NO_CORS},{"noReferrer",NJW_LOAD_NO_REFERRER},
-        {"sameOrigin",NJW_LOAD_SAME_ORIGIN},{"redirectError",NJW_LOAD_REDIRECT_ERROR},{"forcePreflight",NJW_LOAD_PREFLIGHT},{"keepalive",NJW_LOAD_KEEPALIVE}};
+        {"sameOrigin",NJW_LOAD_SAME_ORIGIN},{"redirectError",NJW_LOAD_REDIRECT_ERROR},{"redirectManual",NJW_LOAD_REDIRECT_MANUAL},
+        {"forcePreflight",NJW_LOAD_PREFLIGHT},{"keepalive",NJW_LOAD_KEEPALIVE}};
     uint32_t kind=2u;
     for(unsigned i=0;i<sizeof modes/sizeof *modes;i++){
         JSValue value=JS_GetPropertyStr(ctx,argv[0],modes[i].name);if(JS_IsException(value))return value;

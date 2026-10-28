@@ -55,6 +55,9 @@ struct job {
        the bytes, unlike fetch()'s opaque response, but they are not
        CORS-same-origin (a canvas or WebGL may not read them). */
     bool resource_opaque;
+    /* Redirect mode "manual" (WEBNET_WIRE_REDIRECT_MANUAL) met a redirect status: that response is
+       the fetch's, an opaque-redirect filtered one. Its fields and body never leave this process. */
+    bool opaque_redirect;
     bool stream_headers_sent, stream_final, upload_finished;
     size_t cookie_start;
     const char *hop_method;
@@ -1286,7 +1289,7 @@ static int body_cb(void *opaque, const char *data, size_t n) {
             if(j->cache_capture){memcpy(b->p+b->length,data,n);b->length+=n;b->p[b->length]=0;}
         }
     }
-    if(j->opaque_tainted||j->wire.kind==WEBNET_REPORT)return 0; /* Retain no opaque/report response bytes. */
+    if(j->opaque_tainted||j->opaque_redirect||j->wire.kind==WEBNET_REPORT)return 0; /* Retain no opaque/report response bytes. */
     if (j->wire.user_navigation & WEBNET_WIRE_STREAM) {
         while (n) {
             size_t count = MIN(n, WEBNET_STREAM_CHUNK_MAX);
@@ -1411,7 +1414,7 @@ static bool exposed_header(const char *headers, const char *name, size_t len, bo
     return false;
 }
 static bool include_response_field(const struct job *j, const char *headers, const char *p, const char *end, bool cross) {
-    if(j->opaque_tainted)return false;
+    if(j->opaque_tainted||j->opaque_redirect)return false;
     const char *colon = memchr(p, ':', (size_t)(end - p));
     if (!colon || colon == p) return false;
     size_t len = (size_t)(colon - p);
@@ -1453,8 +1456,9 @@ static bool response_headers(struct job *j, const struct http_resp *r, bool cros
             snprintf(resource, sizeof resource, " resource=%u", (corp ? 1u : 0u) | (other ? 2u : 0u) | (credentials ? 4u : 0u));
         }
         int a = snprintf(start, sizeof start, "HTTP/1.1 %d ", r->status);
-        int m = snprintf(end, sizeof end, "\r\nHTTP/Nocturne-Meta cors=%d redirected=%d%s%s%s", j->cors_tainted, j->redirected,
-                         j->opaque_tainted||j->resource_opaque?" opaque=1":"", resource, referrer_len?" referrer=":"");
+        int m = snprintf(end, sizeof end, "\r\nHTTP/Nocturne-Meta cors=%d redirected=%d%s%s%s%s", j->cors_tainted, j->redirected,
+                         j->opaque_tainted||j->resource_opaque?" opaque=1":"", resource, j->opaque_redirect?" opaqueredirect=1":"",
+                         referrer_len?" referrer=":"");
         int b = m >= 0 && (size_t)m < sizeof end ? snprintf(end + m, sizeof end - (size_t)m, "\r\n") : -1;
         if (b >= 0) b += m;
         if (b >= 0 && (size_t)b < sizeof end && j->debug_request_measured) {
@@ -1549,8 +1553,11 @@ static int response_start(void *opaque, const struct http_resp *response) {
     bool redirect = status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
     if (redirect) {
         if (j->wire.user_navigation & WEBNET_WIRE_REDIRECT_ERROR) { fail(j, "Redirect forbidden by redirect mode"); return -1; }
+        /* "manual": this response is the fetch's, after its CORS check above, as an
+           opaque-redirect filtered response, with or without a Location. */
+        if (j->wire.user_navigation & WEBNET_WIRE_REDIRECT_MANUAL) j->opaque_redirect = true;
         /* A missing Location is a received response, not a network failure. */
-        if (field_exists(http_response_headers(response), "Location")) return 1;
+        else if (field_exists(http_response_headers(response), "Location")) return 1;
     }
     bool cross = !j->origin || strcmp(j->origin, j->target_origin);
     if (j->opaque_tainted && cross) {
@@ -1571,7 +1578,7 @@ static int response_start(void *opaque, const struct http_resp *response) {
     j->stream_final = true;
     const char *raw=http_response_headers(response);
     bool default_cacheable=status==200||status==203||status==204||status==300||status==404||status==405||status==410||status==414||status==501;
-    j->cache_capture=!j->cache_replay&&!strcmp(j->hop_method,"GET")&&j->partition&&
+    j->cache_capture=!j->cache_replay&&!j->opaque_redirect&&!strcmp(j->hop_method,"GET")&&j->partition&&
         cache_context_allowed(j)&&j->wire.kind!=WEBNET_REPORT&&
         cache_mode(j)!=WEBNET_CACHE_NO_STORE&&!cache_directive(j->headers,"no-store",NULL)&&
         !field_exists(j->headers,"Range")&&!cache_directive(raw,"no-store",NULL)&&
@@ -1657,6 +1664,10 @@ static bool run_http(struct job *j) {
            when a redirect returns to the original document's origin. */
         if (cors_kind(j) && cross) j->cors_tainted = true;
         if(no_cors(j) && cross)j->opaque_tainted=true;
+        /* Fetch's main fetch: a no-cors request to another origin is a network error unless its
+           redirect mode is "follow" (an opaque-redirect would tell where that origin redirects). */
+        if(no_cors(j) && cross && (j->wire.user_navigation & WEBNET_WIRE_REDIRECT_MANUAL))
+            return fail(j,"No-cors request to another origin requires redirect mode follow");
         if(j->wire.kind==WEBNET_RESOURCE && cross)j->resource_opaque=true;
         note_fetch_site(j, current, j->target_origin);
         const char *method = drop_body ? "GET" : j->method;
@@ -2203,7 +2214,7 @@ static int run_one(n_handle input,n_handle output) {
         !w->url_len || w->url_len > webnet_wire_url_limit(w->user_navigation) || w->origin_len > webnet_wire_url_limit(w->user_navigation) ||
         !w->method_len || w->headers_len > webnet_wire_request_header_limit(w->user_navigation) || w->body_len > WEBNET_BODY_LIMIT ||
         w->credentials>WEBNET_CREDENTIALS_INCLUDE || (w->user_navigation & ~WEBNET_WIRE_REQUEST_FLAGS) || w->cookie_len>WEBCOOKIE_SNAPSHOT_MAX ||
-        !webnet_wire_script_flag_valid(w->kind, w->user_navigation) || !webnet_wire_image_flag_valid(w->kind, w->user_navigation) || !webnet_wire_report_flag_valid(w->kind,w->user_navigation,w->credentials) || !webnet_wire_request_payload_size(w, &payload_size) ||
+        !webnet_wire_script_flag_valid(w->kind, w->user_navigation) || !webnet_wire_image_flag_valid(w->kind, w->user_navigation) || !webnet_wire_report_flag_valid(w->kind,w->user_navigation,w->credentials) || !webnet_wire_redirect_flag_valid(w->kind,w->user_navigation) || !webnet_wire_request_payload_size(w, &payload_size) ||
         (w->credentials==WEBNET_CREDENTIALS_OMIT && w->cookie_len) ||
         WEBNET_WIRE_CACHE_MODE(w->user_navigation) > WEBNET_CACHE_ONLY_IF_CACHED ||
         (w->kind != WEBNET_FETCH && (WEBNET_WIRE_CACHE_MODE(w->user_navigation) != WEBNET_CACHE_DEFAULT || (w->user_navigation & (WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER)))) ||

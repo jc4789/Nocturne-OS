@@ -158,8 +158,8 @@ async function runFetchCases() {
     let sync=false,bad;try{bad=fetch('api/json',{headers:{'bad name':'x'}});}catch(_){sync=true;}
     assert(!sync&&bad instanceof Promise,'validation failure is promise');await rejects(bad,'TypeError','validation rejection');
     await rejects(fetch('file:///C:/Users/User/secret'),'TypeError','network local scheme rejected');
-    for(const init of [{redirect:'manual'}])
-        await rejects(fetch('api/json',init),'NotSupportedError','unsupported transport options explicit');
+    const manual=await fetch('api/json',{redirect:'manual'});
+    assert(manual.status===200&&manual.type==='basic'&&(await manual.json()).value===42,'redirect mode manual keeps a response that does not redirect');
     await rejects(fetch('api/json',{integrity:'sha256-test'}),'TypeError','integrity mismatch is a network error');
     const integrityURL=URL.createObjectURL(new Blob(['hello']));
     try {

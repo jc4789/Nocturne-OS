@@ -31,8 +31,9 @@ const performanceBridge = (() => {
     // The registry of entry types this global supports (alphabetical), each with its
     // performance entry buffer: maxBufferSize (Infinity for marks and measures), its
     // entries and the dropped entries count. The resource buffer follows Resource
-    // Timing's own size limit and secondary buffer.
-    const registry=isWindow?{mark:Infinity,measure:Infinity,navigation:1,paint:2,resource:Infinity,'visibility-state':50}:{mark:Infinity,measure:Infinity};
+    // Timing's own size limit and secondary buffer. A Worker has Resource Timing too
+    // (PerformanceResourceTiming is [Exposed=(Window,Worker)]): its own requests' entries.
+    const registry=isWindow?{mark:Infinity,measure:Infinity,navigation:1,paint:2,resource:Infinity,'visibility-state':50}:{mark:Infinity,measure:Infinity,resource:Infinity};
     const typeNames=Object.keys(registry);call(sort,typeNames,[]);
     const supported=freeze(typeNames);
     const tuples=new Map(),mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapDelete=Map.prototype.delete;
@@ -386,7 +387,7 @@ const performanceBridge = (() => {
     const initiators=new Map();
     const initiatorKinds=['script','fetch','link','img','other','iframe','css','other','script'];
     let resourceLimit=250,resourceSecondary=[],resourceFullPending=false,performanceObject=null;
-    const resourceTuple=isWindow?tupleOf('resource'):null;
+    const resourceTuple=tupleOf('resource');
     function addResource(entry){
         if(resourceTuple.buffer.length<resourceLimit&&!resourceFullPending){append(resourceTuple.buffer,entry);return;}
         resourceTuple.dropped++;
@@ -412,6 +413,22 @@ const performanceBridge = (() => {
         const initiatorType=call(mapGet,initiators,[id])||initiatorKinds[requestKind]||'other';call(mapDelete,initiators,[id]);
         const entry=resourceEntry(PerformanceResourceTiming.prototype,string(url),'resource',record,{initiatorType});
         queue(entry,false);addResource(entry);
+    }
+    // A Worker's own request: its parent's transport reports the record (js.c timing_value,
+    // NJW_LOADED_TIMING) in monotonic milliseconds, the clock of host.now(); this realm's time
+    // origin converts each time ("convert fetch timestamp": zero stays zero). The record is
+    // copied into a private one: a wire record has the page's Object.prototype.
+    const recordTimes=['startTime','fetchStart','responseEnd','redirectStart','redirectEnd','domainLookupStart','domainLookupEnd',
+        'connectStart','connectEnd','secureConnectionStart','requestStart','firstInterimResponseStart','finalResponseHeadersStart'];
+    const recordValues=['encodedBodySize','decodedBodySize','responseStatus','redirectCount','legacyRedirectCount',
+        'nextHopProtocol','contentEncoding','contentType','cacheState','serverTiming','timingAllowPassed'];
+    const hasOwn=Object.prototype.hasOwnProperty;
+    function monotonicResource(id,requestKind,url,wire){
+        if(isWindow||wire===null||typeof wire!=='object')return;
+        const record=create(null),own=key=>call(hasOwn,wire,[key])?wire[key]:undefined;
+        for(let i=0;i<recordTimes.length;i++){const at=+own(recordTimes[i]);record[recordTimes[i]]=finite(at)&&at>0?(at>base?at-base:0):0;}
+        for(let i=0;i<recordValues.length;i++)record[recordValues[i]]=own(recordValues[i]);
+        resource(id,requestKind,url,record);
     }
     function queueNotification(){
         if(notificationPending)return;
@@ -485,7 +502,7 @@ const performanceBridge = (() => {
         clearMeasures(name){slot(performances,this);clear('measure',name===undefined?undefined:string(name));}
         // Clear only the resource buffer of the actual private timeline. Marks,
         // measures and previously queued observer records survive.
-        clearResourceTimings(){slot(performances,this);if(resourceTuple)resourceTuple.buffer=[];}
+        clearResourceTimings(){slot(performances,this);resourceTuple.buffer=[];}
         setResourceTimingBufferSize(maxSize){
             slot(performances,this);if(!arguments.length)throw new TypeErr('A buffer size is required');
             resourceLimit=(+maxSize)>>>0; // Web IDL unsigned long: ToUint32 of the number
@@ -606,7 +623,7 @@ const performanceBridge = (() => {
     }
     // An aborted request never completes; its registration is dropped with the
     // oldest rather than kept for the document's lifetime.
-    return {resource,visibility,paint,navigationQueued,initiator(id,type){
+    return {resource,monotonicResource,visibility,paint,navigationQueued,initiator(id,type){
         if(initiators.size>=4096)for(const key of initiators.keys()){call(mapDelete,initiators,[key]);break;}
         call(mapSet,initiators,[id,type]);
     }};

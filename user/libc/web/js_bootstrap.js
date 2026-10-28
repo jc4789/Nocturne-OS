@@ -199,6 +199,7 @@
      * listeners hold scrolling for the page, and only a Window with a storage
      * listener polls the shared storage for other windows' changes. */
     function nativeListenerChange(target,entry,delta) {
+        if(entry.type==='abort'){abortListen(target,delta);return;}
         if(entry.type==='storage'){if(target===inputWindow)host.storageListener(delta);return;}
         if(entry.type!=='wheel' || entry.passive)return;
         if(target===inputWindow)host.inputListener(null,delta);
@@ -241,9 +242,10 @@
         else if(entry.signal)entry.signal.removeEventListener('abort',entry.abort);
         entry.signal=entry.abort=entry.unfollow=null;
     }
-    /* AbortSignal, as js_fetch.js defines it: is(value), aborted(signal), and follow(signal, steps),
-       which adds abort steps (DOM "add an algorithm") and returns their removal. */
-    let abortSignals={is:()=>false,aborted:()=>false,follow:()=>null};
+    /* AbortSignal, as js_abort.js defines it: is(value), aborted(signal), and follow(signal, steps),
+       which adds abort steps (DOM "add an algorithm") and returns their removal; listen(target,
+       delta) counts a signal's abort listeners for its garbage collection rule. */
+    let abortSignals={is:()=>false,aborted:()=>false,follow:()=>null},abortListen=()=>{};
     /* Another realm's AbortSignal: this realm cannot read its slots, so the listener follows its
        abort event instead of its abort algorithms. */
     function foreignSignal(value) {
@@ -1338,13 +1340,19 @@
     /* @include js_tokens.js */
     const DOMTokenList=tokenListBridge.DOMTokenList;
     /* @include js_abort.js */
+    /* This Window's events for AbortSignal: a trusted abort event through this realm's dispatch,
+       its event handler attributes and timers. */
+    const abortBridge=abortInterfaces({fire(signal){const e=new Event('abort');eventState(e).isTrusted=true;dispatch(signal,e);},
+        handlers:installHandlers,report,now:()=>host.now(),timer:(fn,ms)=>host.timer(0,fn,ms,[])});
+    abortHandlerTarget=abortBridge.handlerTarget;abortSignals=abortBridge.signals;abortListen=abortBridge.listen;
+    const {AbortSignal,AbortController}=abortBridge;
     /* @include js_fetch.js */
     /* This Window's settings and transport for Fetch: js.c's native fetch (CORS, cookies, Mixed
        Content, CSP and the HTTP cache are its), the document's base URL, origin, referrer source
        and policy container. */
     const fetchBridge=fetchInterfaces({signals:abortBridge.signals,
         transport:{noCors:()=>!!host.noCorsFetch,streaming:()=>!!host.streamingFetch,
-            fetch:(q,notify)=>host.fetch(q.url,q.method,q.headers,q.body,q.sameOrigin,q.credentials,q.forcePreflight,q.redirectError?1:0,q.cache,
+            fetch:(q,notify)=>host.fetch(q.url,q.method,q.headers,q.body,q.sameOrigin,q.credentials,q.forcePreflight,q.redirectError?1:q.redirectManual?2:0,q.cache,
                 q.keepalive,q.noCors,q.noReferrer,notify,q.referrer,q.referrerPolicy,q.destination),
             resume:id=>host.resumeFetch(id),cancel:id=>host.cancel(id),keepaliveRoom:()=>host.keepaliveRoom()},
         baseURL:()=>rawDom.get(document,'baseURI'),origin:()=>rawDom.get(document,'fetchOrigin'),
@@ -1490,6 +1498,9 @@
     /* @include js_credentials.js */
     /* @include js_navigator_plugins.js */
     /* @include js_object_url.js */
+    /* This document's environment: its origin, and the policy container a blob: document or
+       Worker made from its entries inherits. */
+    const objectURLBridge=objectURLInterfaces({origin:()=>rawDom.get(document,'fetchOrigin'),policy:()=>host.safety('policyHeaders',null)});
     fetchBridge.initializeObjectURLs(objectURLBridge);
     /* @include js_clone.js */
     cloneData.registerUncloneable(formDataBridge.brand,'FormData');

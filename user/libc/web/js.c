@@ -127,7 +127,7 @@ struct js_pending {
     char *nonce; /* CSP: the request's cryptographic nonce metadata */
     bool parser_inserted; /* CSP: the request's parser metadata */
     node_t *element; /* CSP: P_CSS, the link element a violation targets */
-    bool done, aborted, force_preflight, redirect_error, same_origin, keepalive, no_cors, no_referrer;
+    bool done, aborted, force_preflight, redirect_error, redirect_manual, same_origin, keepalive, no_cors, no_referrer;
     bool streaming, headers_delivered, host_accepted;
     /* P_WORKER streamed: a frame is in the child, its NJW_RESUME not yet taken (worker_resume). */
     bool worker_paused;
@@ -4292,6 +4292,7 @@ static bool permitted_script_url(struct web_js_state *s,const char *url) {
 }
 static char *script_data_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]);
 static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],bool *untyped);
+static void worker_blob(struct web_js_state *s,struct js_pending *p);
 /* Console text is author data, not a diagnostic excerpt. Grow on demand and
  * report real allocation failure instead of truncating or aborting the task. */
 static bool console_text_append(sbuf *text, const char *bytes, size_t length) {
@@ -5704,7 +5705,8 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
     struct web_request r = {.id=p->id, .kind=kind, .url=p->url, .method=method, .headers=headers, .body=body, .body_len=len,
         .origin=p->origin?p->origin:web_effective_url(s->doc),
         .credentials=(kind == WEB_RESOURCE_FETCH || kind == WEB_RESOURCE_REPORT || p->kind==P_MODULE) ? p->credentials : kind == WEB_RESOURCE_MODULE ? 1 : 2,
-        .force_preflight=p->force_preflight, .redirect_error=p->redirect_error, .same_origin=p->same_origin,
+        .force_preflight=p->force_preflight, .redirect_error=p->redirect_error, .redirect_manual=p->redirect_manual,
+        .same_origin=p->same_origin,
         .no_cors=p->no_cors, .no_referrer=p->no_referrer,
         /* Fetch's default referrer is "client" (the document) under the
            document's policy; a report is sent with no referrer. */
@@ -5799,6 +5801,7 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request, int 
     p->worker = worker; p->worker_request = request; p->worker_kind = kind;
     p->credentials = credentials; p->cache_mode = cache_mode; p->same_origin = same_origin; p->destination = destination;
     p->redirect_error = (policy & NJW_LOAD_REDIRECT_ERROR) != 0; p->force_preflight = (policy & NJW_LOAD_PREFLIGHT) != 0;
+    p->redirect_manual = (policy & NJW_LOAD_REDIRECT_MANUAL) != 0;
     p->no_cors = (policy & NJW_LOAD_NO_CORS) != 0; p->no_referrer = (policy & NJW_LOAD_NO_REFERRER) != 0;
     p->keepalive = keepalive; p->streaming = streaming; p->referrer_policy = referrer_policy;
     /* The worker's script is fetched by its creating document: its CSP list's
@@ -5809,8 +5812,18 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request, int 
         if (!csp_fetch_allowed(s, &csp, NULL)) { pending_error(p, "Blocked by Content Security Policy"); return true; }
     }
     bool blob = web_url_has_scheme(url,"blob");
-    if (strlen(url) > UINT32_MAX || (!blob && !permitted_url(s,url,true)) || (blob && kind == 2)) {
+    /* Fetch's scheme fetch "blob" takes a GET without a body; the Blob is this document's to
+       give only to a child in its partition. */
+    if (strlen(url) > UINT32_MAX || (!blob && !permitted_url(s,url,true)) ||
+        (blob && kind == 2 && (strcmp(method,"GET") || body || streaming || !web_worker_blob_partition(s->workers,worker)))) {
         pending_error(p,"Worker resource URL is not permitted"); return true;
+    }
+    if (blob && kind == 2) {
+        /* Obtained now when this realm runs (before author code can revoke the URL), otherwise
+           at the next task boundary (process_pending). */
+        p->done = true;
+        if (s->running) worker_blob(s,p);
+        return true;
     }
     if (blob) {
         p->done = true; p->response.status = 200;
@@ -5852,7 +5865,7 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request, int 
         .url=p->url, .origin=web_effective_url(s->doc), .method=method,
         .headers=headers,.body=body,.body_len=body_len,
         .credentials=credentials, .same_origin=same_origin,
-        .force_preflight=p->force_preflight, .redirect_error=p->redirect_error,
+        .force_preflight=p->force_preflight, .redirect_error=p->redirect_error, .redirect_manual=p->redirect_manual,
         .no_cors=p->no_cors,
         .referrer=referrer,.referrer_policy=referrer_policy,
         .no_referrer=p->no_referrer,
@@ -6452,7 +6465,7 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     }
     int32_t credentials = 1, redirect = 0, cache_mode = WEBNET_CACHE_DEFAULT,referrer_policy=WEBNET_REFERRER_DEFAULT;
     if ((argc > 5 && (JS_ToInt32(ctx, &credentials, argv[5]) || credentials < 0 || credentials > 2)) ||
-        (argc > 7 && (JS_ToInt32(ctx, &redirect, argv[7]) || redirect < 0 || redirect > 1)) ||
+        (argc > 7 && (JS_ToInt32(ctx, &redirect, argv[7]) || redirect < 0 || redirect > 2)) ||
         (argc > 8 && (JS_ToInt32(ctx, &cache_mode, argv[8]) || cache_mode < WEBNET_CACHE_DEFAULT || cache_mode > WEBNET_CACHE_ONLY_IF_CACHED)) ||
         (argc > 14 && (JS_ToInt32(ctx,&referrer_policy,argv[14]) || referrer_policy<WEBNET_REFERRER_DEFAULT || referrer_policy>WEBNET_REFERRER_UNSAFE))) {
         result = JS_ThrowTypeError(ctx, "Invalid fetch policy"); goto out;
@@ -6505,7 +6518,8 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     p->keepalive = keepalive;
     p->cache_mode = cache_mode;
     p->same_origin = same_origin;
-    p->redirect_error = redirect == 1;
+    /* Fetch's redirect mode: 0 "follow", 1 "error", 2 "manual" (an opaque-redirect filtered response). */
+    p->redirect_error = redirect == 1; p->redirect_manual = redirect == 2;
     p->force_preflight = argc > 6 && JS_ToBool(ctx, argv[6]) > 0;
     p->no_cors = argc > 10 && JS_ToBool(ctx, argv[10]) > 0;
     p->no_referrer = argc > 11 && JS_ToBool(ctx, argv[11]) > 0;
@@ -6733,40 +6747,83 @@ static char *script_data_source(struct web_js_state *s,const char *url,bool modu
     if(bytes){memcpy(bytes,data.body,data.length+1);*length=data.length;}
     web_data_url_free(&data);return bytes;
 }
-/* The private hook returns only real Blob bytes from this document's live
- * registry, never an author-visible URL property or an OS path. Root its result
- * while allocating the tracked source copy; MIME and byte limits remain native. */
-static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],bool *untyped) {
+/* FileAPI "obtain a blob object" in this document's blob URL store, through the private blobScript
+ * hook: a copy of the Blob's bytes (NUL-terminated, *length without it) and of its type, never an
+ * author-visible URL property or an OS path. Root the hook's result while allocating the copies. */
+static char *blob_url_bytes(struct web_js_state *s,const char *url,size_t *length,char **type,size_t *type_length) {
     JSContext *ctx=s->ctx;
     JSValue value=module_bridge_call(s,"blobScript",url,strlen(url),s->doc->base);
     if (JS_IsException(value)) return NULL;
-    JSValue buffer=JS_GetPropertyUint32(ctx,value,0),type=JS_UNDEFINED;
-    const char *content_type=NULL; char *source=NULL; size_t n=0,tn=0;
+    JSValue buffer=JS_GetPropertyUint32(ctx,value,0),kind=JS_UNDEFINED;
+    const char *text=NULL; char *source=NULL,*copy=NULL; size_t n=0,tn=0;
     if (JS_IsException(buffer)) goto out;
     const uint8_t *bytes=JS_GetArrayBuffer(ctx,&n,buffer);
     if (!bytes && JS_HasException(ctx)) goto out;
-    if (n>JS_BODY_LIMIT) { JS_ThrowRangeError(ctx,"Blob script length is not representable"); goto out; }
-    type=JS_GetPropertyUint32(ctx,value,1);
-    if (JS_IsException(type)) goto out;
-    content_type=JS_ToCStringLen(ctx,&tn,type);
-    if (!content_type) goto out;
-    const char *first=content_type,*end=memchr(first,';',tn);
+    if (n>JS_BODY_LIMIT) { JS_ThrowRangeError(ctx,"Blob length is not representable"); goto out; }
+    kind=JS_GetPropertyUint32(ctx,value,1);
+    if (JS_IsException(kind)) goto out;
+    text=JS_ToCStringLen(ctx,&tn,kind);
+    if (!text) goto out;
+    copy=js_strndup(ctx,text,tn);
+    if (!copy) goto out;
+    web_js_prepare_bytes(ctx,n+1);
+    source=js_malloc(ctx,n+1);
+    if (!source) { js_free(ctx,copy); goto out; }
+    if (n) memcpy(source,bytes,n);
+    source[n]=0; *length=n; *type=copy; *type_length=tn;
+out:
+    JS_FreeCString(ctx,text); JS_FreeValue(ctx,kind);
+    JS_FreeValue(ctx,buffer); JS_FreeValue(ctx,value); return source;
+}
+/* A blob: script's source: the Blob's bytes, with its type's MIME essence in mime (text/plain when
+ * the type is not a valid MIME type; a module requires a JavaScript one). MIME and byte limits
+ * remain native. */
+static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],bool *untyped) {
+    JSContext *ctx=s->ctx; char *type=NULL; size_t n=0,tn=0;
+    char *source=blob_url_bytes(s,url,&n,&type,&tn);
+    if (!source) return NULL;
+    const char *first=type,*end=memchr(first,';',tn);
     if (!end) end=first+tn;
     while (first<end && mime_space((unsigned char)*first)) first++;
     while (end>first && mime_space((unsigned char)end[-1])) end--;
     size_t mn=(size_t)(end-first);
     bool valid=valid_mime_essence(first,end) && mn<128;
     if (module && (!valid || !javascript_essence(first,mn))) {
-        JS_ThrowTypeError(ctx,"Blob module requires a JavaScript MIME type"); goto out;
+        JS_ThrowTypeError(ctx,"Blob module requires a JavaScript MIME type");
+        js_free(ctx,source); js_free(ctx,type); return NULL;
     }
     if (valid) { memcpy(mime,first,mn); mime[mn]=0; } else strcpy(mime,"text/plain");
     if (untyped) *untyped=!mn;
-    web_js_prepare_bytes(ctx,n+1);
-    source=js_malloc(ctx,n+1);
-    if (source) { if (n) memcpy(source,bytes,n); source[n]=0; *length=n; }
-out:
-    JS_FreeCString(ctx,content_type); JS_FreeValue(ctx,type);
-    JS_FreeValue(ctx,buffer); JS_FreeValue(ctx,value); return source;
+    js_free(ctx,type); *length=n; return source;
+}
+/* Fetch's scheme fetch "blob" for a Worker's request (js_worker_runtime.js obtainBlob) whose URL
+ * the Worker's own store does not hold: "obtain a blob object" from this document's store, for a
+ * child in this document's partition (worker_request checked web_worker_blob_partition). The
+ * response is the Blob's bytes with its type as Content-Type; the child runs the rest of scheme
+ * fetch (Range, Content-Length) as a Window does in js_fetch.js. */
+static void worker_blob(struct web_js_state *s,struct js_pending *p) {
+    JSContext *ctx=s->ctx; char *type=NULL; size_t n=0,tn=0;
+    char *bytes=blob_url_bytes(s,p->url,&n,&type,&tn);
+    if (!bytes) {
+        /* A revoked or foreign URL is the child's network error, not this realm's exception. */
+        if (JS_HasException(ctx)) { JSValue error=JS_GetException(ctx); JS_FreeValue(ctx,error); }
+        pending_error(p,"The blob: URL has no Blob in the creating document's store"); return;
+    }
+    static const char name[]="Content-Type: ";
+    const size_t prefix=sizeof name-1;
+    char *block=NULL;
+    /* A Blob's type is ASCII from U+0020 to U+007E (FileAPI's Blob constructor). */
+    bool printable=tn<=WEB_RESPONSE_HEADERS_MAX-prefix-3;
+    for (size_t i=0;printable&&i<tn;i++) printable=(unsigned char)type[i]>=0x20&&(unsigned char)type[i]<0x7f;
+    if (printable) block=prefix+tn+3<=sizeof p->response.headers?p->response.headers:js_malloc(ctx,prefix+tn+3);
+    if (!block) {
+        js_free(ctx,bytes); js_free(ctx,type);
+        pending_error(p,printable?"Out of memory while copying the Blob's type":"The Blob's type is not a header value"); return;
+    }
+    memcpy(block,name,prefix); if (tn) memcpy(block+prefix,type,tn); memcpy(block+prefix+tn,"\r\n",3);
+    if (block!=p->response.headers) p->response.headers_full=block;
+    js_free(ctx,type);
+    p->response.status=200; p->response.body=bytes; p->response.body_len=n;
 }
 /* Only the host's explicit source-preparation boundary gets this allowance.
    COMPILE_ONLY does not run page code. Recursive module preparation is counted
@@ -7891,38 +7948,38 @@ static void streamed_response_metadata(struct js_pending *p, bool opaque) {
     p->streamed_opaque=opaque;
     minimized_content_type(headers,p->timing_type,sizeof p->timing_type);
 }
-static int fetch_transport_flags(const char *headers);
 /* Resource Timing's "convert fetch timestamp": zero stays zero, any other
-   time is relative to the realm's time origin. */
-static double fetch_timestamp(struct web_js_state *s, uint64_t at) { return at ? (double)relative_time(s, at) : 0; }
+   time is relative to the time origin, an uptime_ms value (the realm's
+   s->now; 0 keeps monotonic times, for a Worker's own time origin). */
+static double fetch_timestamp(uint64_t origin, uint64_t at) { return at ? (double)(at >= origin ? at - origin : 0) : 0; }
 /* What a PerformanceResourceTiming or PerformanceNavigationTiming entry holds
    (js_performance.js), from the transport's timing record of one request
    (http.h). opaque_timing is Fetch's opaque timing info: the record keeps its
    start and end, and the cache state is empty (Fetch, fetch finale). An
    opaque response or a network error has an empty body info. A request the
    transport answered with no record (one it never made) starts at started. */
-static JSValue timing_value(struct web_js_state *s, const struct http_fetch_timing *t, uint64_t started,
+static JSValue timing_value(struct web_js_state *s, uint64_t origin, const struct http_fetch_timing *t, uint64_t started,
                             bool opaque_timing, bool opaque_body, int status, const char *content_type) {
     JSContext *ctx=s->ctx;
     struct http_fetch_timing none={0};
     if(!t->valid){none.start_time=none.post_redirect_start=started;none.end_time=uptime_ms();t=&none;opaque_timing=true;}
     const struct http_connection_timing *c=&t->connection;
-    double start=fetch_timestamp(s,t->start_time),fetch_start=opaque_timing?start:fetch_timestamp(s,t->post_redirect_start);
+    double start=fetch_timestamp(origin,t->start_time),fetch_start=opaque_timing?start:fetch_timestamp(origin,t->post_redirect_start);
     /* No connection (a response from the cache): its times are the fetch's start. */
     bool connection=!opaque_timing && t->connection_valid;
     static const char *const cache[]={"","local","validated"};
     struct { const char *name; double value; } numbers[]={
-        {"startTime",start},{"fetchStart",fetch_start},{"responseEnd",fetch_timestamp(s,t->end_time)},
-        {"redirectStart",opaque_timing?0:fetch_timestamp(s,t->redirect_start)},
-        {"redirectEnd",opaque_timing?0:fetch_timestamp(s,t->redirect_end)},
-        {"domainLookupStart",connection?fetch_timestamp(s,c->domain_lookup_start):opaque_timing?0:fetch_start},
-        {"domainLookupEnd",connection?fetch_timestamp(s,c->domain_lookup_end):opaque_timing?0:fetch_start},
-        {"connectStart",connection?fetch_timestamp(s,c->connect_start):opaque_timing?0:fetch_start},
-        {"connectEnd",connection?fetch_timestamp(s,c->connect_end):opaque_timing?0:fetch_start},
-        {"secureConnectionStart",connection?fetch_timestamp(s,c->secure_connection_start):0},
-        {"requestStart",opaque_timing?0:fetch_timestamp(s,t->final_network_request_start)},
-        {"firstInterimResponseStart",opaque_timing?0:fetch_timestamp(s,t->first_interim_network_response_start)},
-        {"finalResponseHeadersStart",opaque_timing?0:fetch_timestamp(s,t->final_network_response_start)},
+        {"startTime",start},{"fetchStart",fetch_start},{"responseEnd",fetch_timestamp(origin,t->end_time)},
+        {"redirectStart",opaque_timing?0:fetch_timestamp(origin,t->redirect_start)},
+        {"redirectEnd",opaque_timing?0:fetch_timestamp(origin,t->redirect_end)},
+        {"domainLookupStart",connection?fetch_timestamp(origin,c->domain_lookup_start):opaque_timing?0:fetch_start},
+        {"domainLookupEnd",connection?fetch_timestamp(origin,c->domain_lookup_end):opaque_timing?0:fetch_start},
+        {"connectStart",connection?fetch_timestamp(origin,c->connect_start):opaque_timing?0:fetch_start},
+        {"connectEnd",connection?fetch_timestamp(origin,c->connect_end):opaque_timing?0:fetch_start},
+        {"secureConnectionStart",connection?fetch_timestamp(origin,c->secure_connection_start):0},
+        {"requestStart",opaque_timing?0:fetch_timestamp(origin,t->final_network_request_start)},
+        {"firstInterimResponseStart",opaque_timing?0:fetch_timestamp(origin,t->first_interim_network_response_start)},
+        {"finalResponseHeadersStart",opaque_timing?0:fetch_timestamp(origin,t->final_network_response_start)},
         {"encodedBodySize",opaque_body?0:(double)t->encoded_body_size},
         {"decodedBodySize",opaque_body?0:(double)t->decoded_body_size},
         {"responseStatus",(double)status},
@@ -7950,14 +8007,17 @@ static JSValue timing_value(struct web_js_state *s, const struct http_fetch_timi
 failed:
     JS_FreeValue(ctx,value);return JS_EXCEPTION;
 }
-/* Fetch's report timing of a request that ended (fetch finale), for its
-   PerformanceResourceTiming entry; the bootstrap's performance timeline
-   owns entries and observers. The status and content type are a navigating
-   request's only when its redirects stayed same-origin; an opaque response
-   or a network error has neither. */
-static void resource_timing(struct web_js_state *s, struct js_pending *p) {
-    if (s->disabled || !JS_IsObject(s->hooks) || p->kind==P_POLICY_REPORT || !p->url ||
-        (!web_url_has_scheme(p->url,"https") && !web_url_has_scheme(p->url,"http"))) return;
+/* A Worker's request whose client is the Worker itself (importScripts, fetch): its report timing
+   belongs to the Worker's performance timeline (Fetch, fetch finale: the request's client's global
+   object), not this document's. The Worker's script (kind 0) is fetched for this document. */
+static bool worker_client_request(const struct js_pending *p) { return p->kind==P_WORKER && p->worker_kind!=0; }
+/* Fetch's report timing of a request that ended (fetch finale): the record of its
+   PerformanceResourceTiming entry, times relative to origin; JS_UNDEFINED for a request with none
+   (not HTTP(S), a policy report). The status and content type are a navigating request's only
+   when its redirects stayed same-origin; an opaque response or a network error has neither. */
+static JSValue report_timing(struct web_js_state *s, struct js_pending *p, uint64_t origin) {
+    if (s->disabled || p->kind==P_POLICY_REPORT || !p->url ||
+        (!web_url_has_scheme(p->url,"https") && !web_url_has_scheme(p->url,"http"))) return JS_UNDEFINED;
     const struct http_fetch_timing *t=&p->response.timing;
     bool failed=p->response.error[0],exposed=p->kind!=P_FRAME || (t->valid && t->redirect_same_origin);
     bool opaque_body;int status=0;char type[sizeof p->timing_type]="";
@@ -7965,17 +8025,34 @@ static void resource_timing(struct web_js_state *s, struct js_pending *p) {
         opaque_body=p->streamed_opaque || !p->headers_delivered;
         if(!opaque_body && exposed){status=p->streamed_status;memcpy(type,p->timing_type,sizeof type);}
     }else{
-        int flags=fetch_transport_flags(web_response_headers(&p->response));
-        opaque_body=failed || (flags>=0 && (flags&NJW_LOADED_OPAQUE));
+        int flags=njw_transport_flags(web_response_headers(&p->response));
+        opaque_body=failed || (flags>=0 && (flags&(NJW_LOADED_OPAQUE|NJW_LOADED_OPAQUE_REDIRECT)));
         if(!opaque_body && exposed){status=p->response.status;minimized_content_type(web_response_headers(&p->response),type,sizeof type);}
     }
-    JSValue args[]={JS_NewFloat64(s->ctx,(double)p->id),JS_NewInt32(s->ctx,p->kind),JS_NewString(s->ctx,p->url),
-        timing_value(s,t,p->started,!t->timing_allow_passed,opaque_body,status,type)};
+    return timing_value(s,origin,t,p->started,!t->timing_allow_passed,opaque_body,status,type);
+}
+/* The report timing of this document's request: its entry in the bootstrap's performance
+   timeline, which owns entries and observers. A Worker's own requests report to the Worker
+   (worker_timing). */
+static void resource_timing(struct web_js_state *s, struct js_pending *p) {
+    if (!JS_IsObject(s->hooks) || worker_client_request(p)) return;
+    JSValue record=report_timing(s,p,s->now);
+    if (JS_IsUndefined(record)) return;
+    JSValue args[]={JS_NewFloat64(s->ctx,(double)p->id),JS_NewInt32(s->ctx,p->kind),JS_NewString(s->ctx,p->url),record};
     JSValue result=JS_IsException(args[2])||JS_IsException(args[3])?JS_EXCEPTION:
         custom_element_hook(s,"resourceTiming",(int)(sizeof args/sizeof args[0]),args);
     if(JS_IsException(result))exception(s);
     JS_FreeValue(s->ctx,result);
     for(size_t i=0;i<sizeof args/sizeof args[0];i++)JS_FreeValue(s->ctx,args[i]);
+}
+/* The report timing a Worker's own request sends its Worker (NJW_LOADED_TIMING), in monotonic
+   times the Worker converts with its time origin. JS_UNDEFINED for an aborted request or one with
+   no report. */
+static JSValue worker_timing(struct web_js_state *s, struct js_pending *p) {
+    if (!worker_client_request(p) || p->aborted) return JS_UNDEFINED;
+    JSValue record=report_timing(s,p,0);
+    if (JS_IsException(record)) { exception(s); return JS_UNDEFINED; }
+    return record;
 }
 /* The document's navigation, for its PerformanceNavigationTiming: HTML gives
    the entry the navigation's full timing info, never an opaque one (create
@@ -7984,7 +8061,7 @@ static void resource_timing(struct web_js_state *s, struct js_pending *p) {
 static JSValue native_navigation_timing(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
     if(!s->navigation_valid)return JS_NULL;
-    JSValue value=timing_value(s,&s->navigation,s->now,false,false,s->navigation_status,s->navigation_content_type);
+    JSValue value=timing_value(s,s->now,&s->navigation,s->now,false,false,s->navigation_status,s->navigation_content_type);
     static const char *const types[]={"navigate","reload","back_forward"};
     if(!JS_IsException(value) && JS_SetPropertyStr(ctx,value,"type",JS_NewString(ctx,types[s->navigation_type<=2?s->navigation_type:0]))<0){
         JS_FreeValue(ctx,value);return JS_EXCEPTION;
@@ -8011,23 +8088,11 @@ static void net_log_response(struct web_js_state *s, struct js_pending *p, const
              !p->aborted&&p->response.error[0]?p->response.error:"",hex);
     log_text(s,WEB_CONSOLE_TRACE,message);
 }
-static int fetch_transport_flags(const char *headers) {
-    /* The HTTP host writes this non-field line; server header fields cannot
-       forge it. Keep security decisions out of mutable author JS built-ins. */
-    const char *meta=headers?strstr(headers,"\r\nHTTP/Nocturne-Meta cors="):NULL;
-    unsigned cors=0,redirected=0,opaque=0;
-    if(!meta||sscanf(meta+2,"HTTP/Nocturne-Meta cors=%u redirected=%u opaque=%u",&cors,&redirected,&opaque)<2||cors>1||redirected>1||opaque>1)return -1;
-    return (cors?NJW_LOADED_CORS:0)|(redirected?NJW_LOADED_REDIRECTED:0)|(opaque?NJW_LOADED_OPAQUE:0);
-}
-/* What the transport noted of the response an opaque one hides (webfetch.c's resource=): 2, a URL of
-   another origin and nothing else known, when it noted nothing. Cache Storage's match checks it
-   against the matching realm's embedder policy (js_cache_storage.js). */
-static int fetch_resource_bits(const char *headers) {
-    const char *meta=headers?strstr(headers,"\r\nHTTP/Nocturne-Meta cors="):NULL;
-    const char *end=meta?strstr(meta+2,"\r\n"):NULL,*at=meta?strstr(meta+2," resource="):NULL;
-    unsigned bits=2;
-    if(at&&end&&at<end&&sscanf(at+10,"%u",&bits)==1&&bits<=7)return (int)bits;
-    return 2;
+/* What the transport noted of the response an opaque one hides (webfetch.c's resource=, in the
+   flags njw_transport_flags read). Cache Storage's match checks it against the matching realm's
+   embedder policy (js_cache_storage.js). */
+static int fetch_resource_bits(int flags) {
+    return (int)(((unsigned)flags & NJW_LOADED_RESOURCE) >> NJW_LOADED_RESOURCE_SHIFT);
 }
 /* Consume exactly one native stream frame in its own task. Metadata/chunks
    are owned by this pending request; no JS callback runs inside network pump. */
@@ -8037,22 +8102,23 @@ static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
     bool terminal = event == WEBNET_END || p->response.error[0] || p->aborted;
     JSValue value = JS_UNDEFINED;
     if (event == WEBNET_HEADERS && !terminal) {
-        int flags = fetch_transport_flags(web_response_headers(&p->response));
-        bool opaque = flags >= 0 && (flags & NJW_LOADED_OPAQUE);
-        if (flags < 0 || (opaque && !p->no_cors)) {
+        int flags = njw_transport_flags(web_response_headers(&p->response));
+        bool opaque = flags >= 0 && (flags & NJW_LOADED_OPAQUE), manual = flags >= 0 && (flags & NJW_LOADED_OPAQUE_REDIRECT);
+        if (flags < 0 || (opaque && !p->no_cors) || (manual && !p->redirect_manual)) {
             pending_error(p, "Native Fetch response contradicts its filtering policy"); terminal = true;
         } else {
             /* Same report as a buffered request: a streamed body hides an
                error status from the console until its reader is drained. */
-            if (!opaque && p->response.status >= 400) diagnostic_resource(s, p, "unsuccessful HTTP response");
-            streamed_response_metadata(p, opaque);
+            if (!opaque && !manual && p->response.status >= 400) diagnostic_resource(s, p, "unsuccessful HTTP response");
+            streamed_response_metadata(p, opaque || manual);
             if (s->host.net_log) net_log_response(s, p, "headers", 0);
-            JSValue args[] = {JS_NewInt32(s->ctx, opaque ? 0 : p->response.status),
+            /* An opaque-redirect filtered response: the redirect's URL, nothing else. */
+            JSValue args[] = {JS_NewInt32(s->ctx, opaque || manual ? 0 : p->response.status),
                 JS_NewString(s->ctx, opaque ? "" : web_response_url(&p->response)),
-                JS_NewString(s->ctx, opaque ? "" : web_response_headers(&p->response)), JS_UNDEFINED,
-                JS_NewArrayBufferCopy(s->ctx, NULL, 0), JS_NewBool(s->ctx, !opaque && (flags & NJW_LOADED_REDIRECTED)),
-                JS_UNDEFINED, JS_NewString(s->ctx, opaque ? "opaque" : (flags & NJW_LOADED_CORS) ? "cors" : "basic"),
-                opaque ? JS_NewInt32(s->ctx, fetch_resource_bits(web_response_headers(&p->response))) : JS_UNDEFINED};
+                JS_NewString(s->ctx, opaque || manual ? "" : web_response_headers(&p->response)), JS_UNDEFINED,
+                JS_NewArrayBufferCopy(s->ctx, NULL, 0), JS_NewBool(s->ctx, !opaque && !manual && (flags & NJW_LOADED_REDIRECTED)),
+                JS_UNDEFINED, JS_NewString(s->ctx, opaque ? "opaque" : manual ? "opaqueredirect" : (flags & NJW_LOADED_CORS) ? "cors" : "basic"),
+                opaque ? JS_NewInt32(s->ctx, fetch_resource_bits(flags)) : JS_UNDEFINED};
             bool valid = true; for (unsigned i = 0; i < 9; i++) if (JS_IsException(args[i])) valid = false;
             value = valid ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 9, args) : JS_EXCEPTION;
             for (unsigned i = 0; i < 9; i++) JS_FreeValue(s->ctx, args[i]);
@@ -8136,33 +8202,36 @@ static void worker_fetch_frame(struct web_js_state *s, struct js_pending *p) {
     int event = p->response.event;
     bool terminal = event == WEBNET_END || p->response.error[0] || p->aborted, queued = true, resume = false;
     if (event == WEBNET_HEADERS && !terminal) {
-        int flags = fetch_transport_flags(web_response_headers(&p->response));
-        bool opaque = flags >= 0 && (flags & NJW_LOADED_OPAQUE);
-        if (flags < 0 || (opaque && !p->no_cors)) {
+        int flags = njw_transport_flags(web_response_headers(&p->response));
+        bool opaque = flags >= 0 && (flags & NJW_LOADED_OPAQUE), manual = flags >= 0 && (flags & NJW_LOADED_OPAQUE_REDIRECT);
+        if (flags < 0 || (opaque && !p->no_cors) || (manual && !p->redirect_manual)) {
             pending_error(p, "Native Fetch response contradicts its filtering policy"); terminal = true;
         } else {
-            if (!opaque && p->response.status >= 400) diagnostic_resource(s, p, "unsuccessful HTTP response");
-            streamed_response_metadata(p, opaque);
+            if (!opaque && !manual && p->response.status >= 400) diagnostic_resource(s, p, "unsuccessful HTTP response");
+            streamed_response_metadata(p, opaque || manual);
             if (s->host.net_log) net_log_response(s, p, "headers", 0);
             const char *final = web_response_url(&p->response)[0] ? web_response_url(&p->response) : p->url;
             queued = web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_HEADERS, p->response.status,
-                final, web_response_headers(&p->response), NULL, 0, NULL);
+                final, web_response_headers(&p->response), NULL, 0, NULL, JS_UNDEFINED);
             p->headers_delivered = queued;
         }
     } else if (event == WEBNET_CHUNK && !terminal) {
         p->streamed_bytes += p->response.body_len;
         if (p->streamed_opaque) resume = true;
         else queued = web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_CHUNK, 0, NULL, NULL,
-            p->response.body, p->response.body_len, NULL);
+            p->response.body, p->response.body_len, NULL, JS_UNDEFINED);
     } else if (event == WEBNET_UPLOAD && !terminal)
         queued = web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_UPLOAD, 0, NULL, NULL, NULL,
-            (size_t)p->response.uploaded, NULL);
+            (size_t)p->response.uploaded, NULL, JS_UNDEFINED);
     if (!queued) { p->aborted = true; terminal = true; } /* the child is gone */
     if (terminal) {
         if (p->response.error[0] && !p->aborted) diagnostic_resource(s, p, p->response.error);
-        if (queued) web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_END, 0, NULL, NULL, NULL, 0,
-            p->response.error[0] ? p->response.error : event == WEBNET_END ? "" : "Worker fetch failed");
-        if (!p->aborted) { begin_named_task(s, "resource timing", p->id); resource_timing(s, p); end_task(s); }
+        if (queued) {
+            JSValue timing = worker_timing(s, p);
+            web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_END, 0, NULL, NULL, NULL, 0,
+                p->response.error[0] ? p->response.error : event == WEBNET_END ? "" : "Worker fetch failed", timing);
+            JS_FreeValue(s->ctx, timing);
+        }
         if (s->host.net_log) net_log_response(s, p, "done", p->streamed_bytes);
         if ((event != WEBNET_END || p->response.error[0] || p->aborted) && s->host.cancel) s->host.cancel(s->host.opaque, p->id);
         pending_free(s, p);
@@ -8241,11 +8310,14 @@ static bool process_pending(struct web_js_state *s) {
             if (web_url_has_scheme(p->url,"blob") && !p->response.body && !p->response.error[0]) {
                 char mime[128];
                 ran_task = true; begin_named_task(s,"Worker object-URL source",p->worker);
-                p->response.body = script_blob_source(s,p->url,true,&p->response.body_len,mime,NULL);
-                if (!p->response.body) {
-                    if (JS_HasException(s->ctx)) exception(s);
-                    pending_error(p,"Worker object URL is unavailable or has an invalid JavaScript MIME type");
-                } else snprintf(p->response.headers,sizeof p->response.headers,"Content-Type: %s\r\n",mime);
+                if (p->worker_kind == 2) worker_blob(s,p);
+                else {
+                    p->response.body = script_blob_source(s,p->url,true,&p->response.body_len,mime,NULL);
+                    if (!p->response.body) {
+                        if (JS_HasException(s->ctx)) exception(s);
+                        pending_error(p,"Worker object URL is unavailable or has an invalid JavaScript MIME type");
+                    } else snprintf(p->response.headers,sizeof p->response.headers,"Content-Type: %s\r\n",mime);
+                }
                 end_task(s);
             }
             const char *final = web_response_url(&p->response)[0] ? web_response_url(&p->response) : p->url;
@@ -8259,8 +8331,10 @@ static bool process_pending(struct web_js_state *s) {
                 if (!valid) pending_error(p, allocation_failed ? "Out of memory while checking Worker response origin" :
                     "Worker response rejected (URL, origin, HTTP status or JavaScript MIME type)");
             }
+            JSValue timing=worker_timing(s,p);
             web_worker_loaded(s->workers,p->worker,p->worker_request,p->response.status,final,
-                web_response_headers(&p->response),p->response.body,p->response.body_len,p->response.error);
+                web_response_headers(&p->response),p->response.body,p->response.body_len,p->response.error,timing);
+            JS_FreeValue(s->ctx,timing);
         } else if (p->kind == P_CSS) {
             if(p->css&&p->css->loading_id==p->id)
                 doc_css_loaded(s->doc,p->url,web_response_url(&p->response)[0]?web_response_url(&p->response):p->url,
@@ -8277,7 +8351,7 @@ static bool process_pending(struct web_js_state *s) {
             bool body=!p->aborted && !p->response.error[0] && p->response.body_len;
             /* Fetch's response tainting decides whether a canvas may read it:
                a no-cors image that left the document's origin is opaque. */
-            int transport=fetch_transport_flags(web_response_headers(&p->response));
+            int transport=njw_transport_flags(web_response_headers(&p->response));
             bool clean=transport>=0 && !(transport & NJW_LOADED_OPAQUE);
             web_image_loaded(s->doc, p->image, body ? p->response.body : NULL, body ? p->response.body_len : 0, clean);
         } else if (!s->disabled && p->kind == P_FETCH) {
@@ -8285,30 +8359,32 @@ static bool process_pending(struct web_js_state *s) {
             begin_task(s);
             JSValue value;
             bool success = !p->response.error[0];
-            int transport=fetch_transport_flags(web_response_headers(&p->response));
-            bool opaque=transport>=0&&(transport & NJW_LOADED_OPAQUE)!=0;
-            if(success&&((opaque&&!p->no_cors)||(p->no_cors&&transport<0))){
+            int transport=njw_transport_flags(web_response_headers(&p->response));
+            bool opaque=transport>=0&&(transport & NJW_LOADED_OPAQUE)!=0,manual=transport>=0&&(transport & NJW_LOADED_OPAQUE_REDIRECT)!=0;
+            if(success&&((opaque&&!p->no_cors)||(manual&&!p->redirect_manual)||(p->no_cors&&transport<0))){
                 pending_error(p,"Native Fetch response is missing or contradicts its filtering policy");success=false;
             }
             if (success) {
                 /* Transfer the already runtime-charged native snapshot. The
                    current QuickJS adopts external data only on success;
                    construction failure leaves pending_free as its owner. */
-                JSValue bytes = opaque?JS_NULL:JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body,
+                const bool hidden=opaque||manual;
+                JSValue bytes = hidden?JS_NULL:JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body,
                     p->response.body_len, fetch_body_free, NULL, false);
-                if (!opaque&&!JS_IsException(bytes)) p->response.body = NULL;
+                if (!hidden&&!JS_IsException(bytes)) p->response.body = NULL;
                 /* Response decodes bytes only when its consumer asks for text.
                    The old fourth argument was unused and eagerly expanded
                    every binary media fragment into a large JS string. */
                 bool redirected=transport>=0?(transport & NJW_LOADED_REDIRECTED)!=0:
                     web_response_url(&p->response)[0]&&strcmp(p->url,web_response_url(&p->response));
-                JSValue type=opaque?JS_NewString(s->ctx,"opaque"):transport<0?JS_UNDEFINED:
+                JSValue type=opaque?JS_NewString(s->ctx,"opaque"):manual?JS_NewString(s->ctx,"opaqueredirect"):transport<0?JS_UNDEFINED:
                     JS_NewString(s->ctx,(transport & NJW_LOADED_CORS)?"cors":"basic");
-                JSValue args[] = {JS_NewInt32(s->ctx,opaque?0:p->response.status),
+                /* An opaque-redirect filtered response: the redirect's URL, nothing else. */
+                JSValue args[] = {JS_NewInt32(s->ctx,hidden?0:p->response.status),
                     JS_NewString(s->ctx,opaque?"":web_response_url(&p->response)[0]?web_response_url(&p->response):p->url),
-                    JS_NewString(s->ctx,opaque?"":web_response_headers(&p->response)),JS_UNDEFINED,bytes,
-                    JS_NewBool(s->ctx,!opaque&&redirected),JS_UNDEFINED,type,
-                    opaque?JS_NewInt32(s->ctx,fetch_resource_bits(web_response_headers(&p->response))):JS_UNDEFINED};
+                    JS_NewString(s->ctx,hidden?"":web_response_headers(&p->response)),JS_UNDEFINED,bytes,
+                    JS_NewBool(s->ctx,!hidden&&redirected),JS_UNDEFINED,type,
+                    opaque?JS_NewInt32(s->ctx,fetch_resource_bits(transport)):JS_UNDEFINED};
                 bool valid_args = true;
                 for (int i = 0; i < 9; ++i) if (JS_IsException(args[i])) valid_args = false;
                 value = valid_args ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 9, args) : JS_EXCEPTION;

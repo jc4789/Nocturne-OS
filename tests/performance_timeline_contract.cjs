@@ -295,11 +295,35 @@ async function navigationChecks() {
     same('window types', r.PerformanceObserver.supportedEntryTypes.join(','), 'mark,measure,navigation,paint,resource,visibility-state');
     check('frozen', Object.isFrozen(r.PerformanceObserver.supportedEntryTypes));
     const w = realm({ window: false });
-    same('worker types', w.PerformanceObserver.supportedEntryTypes.join(','), 'mark,measure');
+    same('worker types', w.PerformanceObserver.supportedEntryTypes.join(','), 'mark,measure,resource');
     same('worker has no PerformanceTiming', typeof w.PerformanceTiming, 'undefined');
     same('worker timing', 'timing' in vm.runInContext('performance', w), false);
-    same('worker clearResourceTimings', vm.runInContext('performance.clearResourceTimings()', w), undefined);
     same('worker mark navigationId', vm.runInContext("performance.mark('w').navigationId", w), 0);
+    /* A Worker's own requests: the parent's records in monotonic times (host.now's clock, 50 when
+       this realm began), converted with the Worker's time origin; zero stays zero. */
+    const observed = [];
+    new w.PerformanceObserver(list => observed.push(...list.getEntries())).observe({ type: 'resource' });
+    vm.runInContext("Object.defineProperty(Object.prototype,'serverTiming',{configurable:true,get(){return 'evil;dur=1';}})", w);
+    w.bridge.monotonicResource(0, 1, 'https://a.test/w', record({ startTime: 60, fetchStart: 61, responseEnd: 90, redirectStart: 0,
+        requestStart: 70, secureConnectionStart: 0, serverTiming: undefined }));
+    vm.runInContext("delete Object.prototype.serverTiming", w);
+    const [own] = vm.runInContext("performance.getEntriesByType('resource')", w);
+    same('worker resource entry', own && own.name, 'https://a.test/w');
+    same('worker initiatorType', own.initiatorType, 'fetch');
+    same('worker startTime', own.startTime, 10); same('worker fetchStart', own.fetchStart, 11);
+    same('worker duration', own.duration, 30); same('worker requestStart', own.requestStart, 20);
+    same('worker zero stays zero', own.redirectStart + own.secureConnectionStart, 0);
+    same("worker record ignores Object.prototype", own.serverTiming.length, 0);
+    same('worker importScripts initiator', (w.bridge.monotonicResource(0, 4, 'https://a.test/i', record({ startTime: 55 })),
+        vm.runInContext("performance.getEntriesByName('https://a.test/i')[0].initiatorType", w)), 'other');
+    w.bridge.monotonicResource(0, 1, 'https://a.test/x', null);
+    same('worker without a record', vm.runInContext("performance.getEntriesByType('resource').length", w), 2);
+    await tick();
+    same('worker observer', observed.length, 2);
+    same('worker clearResourceTimings', vm.runInContext('performance.clearResourceTimings(),performance.getEntriesByType("resource").length', w), 0);
+    const windowRealm = realm();
+    windowRealm.bridge.monotonicResource(0, 1, 'https://a.test/w', record());
+    same('a window has no monotonic records', vm.runInContext("performance.getEntriesByType('resource').length", windowRealm), 0);
     const noNav = realm();
     same('no navigation record, no entry', vm.runInContext("performance.getEntriesByType('navigation').length", noNav), 0);
     same('constructed mark ids', vm.runInContext("JSON.stringify(new PerformanceMark('j',{startTime:1}))", noNav),

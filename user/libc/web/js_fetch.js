@@ -1,14 +1,17 @@
 /* Fetch API (https://fetch.spec.whatwg.org/#fetch-api, consulted 2026-10-28): Headers, Request,
    Response, the Body mixin and fetch(), one definition for a Window and a Worker realm.
    fetchInterfaces(realm) builds them over what differs between the two:
-     realm.signals    the realm's AbortSignal (js_abort.js in a Window, the Worker runtime's own):
+     realm.signals    the realm's AbortSignal (js_abort.js's abortInterfaces, in both realms):
                       is, aborted, reason, follow, any (a dependent signal) and controller.
      realm.transport  the native transport that carries a request: noCors(), streaming(),
                       fetch(query, notify) -> {id, promise}, resume(id), cancel(id), and
                       keepaliveRoom() (the bytes the realm's fetch group can still take into its
-                      inflight keepalive bodies; a Window's only, for Beacon), and fetchSync(query,
-                      timeout) -> a Response or null (a Worker's only: its event loop pauses for a
-                      synchronous XMLHttpRequest). A Window's is js.c's (host.fetch); a Worker's
+                      inflight keepalive bodies; a Window's only, for Beacon), fetchSync(query,
+                      timeout, initiator) -> a Response or null (a Worker's only: its event loop
+                      pauses for a synchronous XMLHttpRequest; initiator(id) as realm.initiator),
+                      and obtainBlob(url[, timeout]) (a Worker's only: FileAPI "obtain a blob
+                      object" from its parent document's store, {id, promise} -> [bytes, type],
+                      or with a timeout [bytes, type] or null). A Window's is js.c's (host.fetch); a Worker's
                       is its parent window's, through browserjsworker.c, js_worker.c and js.c
                       (NJW_LOAD, NJW_FRAME, NJW_RESUME).
      realm.baseURL(), origin(), clientReferrer(), referrerPolicy(), url()
@@ -78,7 +81,7 @@ function fetchInterfaces(realm) {
     const promiseConstructor=freeze({[Symbol.species]:NativePromise});
     const U8=Uint8Array, AB=ArrayBuffer, isView=ArrayBuffer.isView, taSet=Uint8Array.prototype.set;
     const getter=(proto,key)=>Object.getOwnPropertyDescriptor(proto,key).get;
-    const abLength=getter(AB.prototype,'byteLength'), ta=Object.getPrototypeOf(U8.prototype);
+    const abLength=getter(AB.prototype,'byteLength'), abSlice=AB.prototype.slice, ta=Object.getPrototypeOf(U8.prototype);
     const taBuffer=getter(ta,'buffer'), taOffset=getter(ta,'byteOffset'), taLength=getter(ta,'byteLength');
     const taTag=getter(ta,Symbol.toStringTag), dvBuffer=getter(DataView.prototype,'buffer');
     const dvOffset=getter(DataView.prototype,'byteOffset'), dvLength=getter(DataView.prototype,'byteLength');
@@ -462,8 +465,12 @@ function fetchInterfaces(realm) {
         return record({bytes:b.bytes===null?null:copyBytes(b.bytes),stream,used:false,abort:b.abort});}
     function requestObject(s,b){const object=create(Request.prototype);requestSlots.set(object,s);storeBody(object,b);return object;}
     function requestCopy(s,b){return requestObject(record({...s,headers:copyHeaders(s.headers,headerSlots.get(s.headers).guard),signal:signals.any([s.signal])}),b);}
+    /* blobEntry is the URL record's blob URL entry: the URL parser resolves a blob: URL against the
+       realm's store when the Request parses it (FileAPI "resolve a blob URL"), so a URL revoked
+       later still fetches the Blob, in the Request and its clones. */
     const newRequestRecord=url=>record({url,method:'GET',mode:'cors',credentials:'same-origin',cache:'default',redirect:'follow',
-        referrer:'about:client',referrerPolicy:'',integrity:'',keepalive:false,destination:'',priority:'auto',preflight:false});
+        referrer:'about:client',referrerPolicy:'',integrity:'',keepalive:false,destination:'',priority:'auto',preflight:false,
+        blobEntry:objectURLAPI&&beginsWith(url,'blob:')?objectURLAPI.resolve(url):null});
     class Request {
         constructor(input,init=undefined) {
             if(!arguments.length)throw new TypeError('Request requires input');
@@ -630,6 +637,75 @@ function fetchInterfaces(realm) {
             if(signals.aborted(s.signal))fail(signals.reason(s.signal));
         });
     }
+    /* Fetch's "parse a single range header value" with allowWhitespace: [start, end], each null
+       when absent, or null for failure. */
+    function singleRange(data) {
+        if(!beginsWith(data,'bytes'))return null;
+        let at=5;
+        const space=()=>{while(at<data.length&&tabSpace(code(data,at)))at++;};
+        const digits=()=>{const start=at;while(at<data.length&&code(data,at)>=48&&code(data,at)<=57)at++;return at===start?null:+slice(data,start,at);};
+        space();if(code(data,at)!==61)return null;at++;space();
+        const start=digits();space();
+        if(code(data,at)!==45)return null;at++;space();
+        const end=digits();
+        if(at<data.length||start===null&&end===null||start!==null&&end!==null&&start>end)return null;
+        const out=newList();out[0]=start;out[1]=end;return out;
+    }
+    /* FileAPI's "slice blob" of bytes from start to end (relative to the end when negative). */
+    function sliceBytes(bytes,start,end) {
+        const size=apply(abLength,bytes,[]);
+        const from=start<0?(size+start>0?size+start:0):(start<size?start:size),to=end<0?(size+end>0?size+end:0):(end<size?end:size);
+        return apply(abSlice,bytes,[from,to>from?to:from]);
+    }
+    /* Fetch's scheme fetch for "blob": only GET; the URL record's blob URL entry and FileAPI's
+       "obtain a blob object"; the whole Blob, or a Range's slice (status 206) with its
+       Content-Range. A Worker's URL its own store does not hold is obtained from its parent
+       document's store by the transport (transport.obtainBlob: js.c checks the Worker's storage
+       partition); a Window's is a network error. sync: fetchCore's, the Response (null when its
+       timeout passed first) instead of a promise. */
+    function blobFetch(s,integrity,sync) {
+        const range=headerValue(headerSlots.get(s.headers),'range');
+        const respond=(bytes,type)=>{
+            const fullLength=apply(abLength,bytes,[]),headers=makeHeaders(undefined,'immutable'),list=headerSlots.get(headers).list;
+            let status=200,body=bytes;
+            if(range===null){add(list,pair('content-length',NativeString(fullLength)));add(list,pair('content-type',type));}
+            else{
+                const value=singleRange(range);if(value===null)throw new TypeError('Invalid Range for a blob: URL');
+                let start=value[0],end=value[1];
+                if(start===null){start=fullLength-end;end=start+end-1;}
+                else{if(start>=fullLength)throw new TypeError('Range start is past the Blob');if(end===null||end>=fullLength)end=fullLength-1;}
+                body=sliceBytes(bytes,start,end+1);status=206;
+                add(list,pair('content-length',NativeString(apply(abLength,body,[]))));add(list,pair('content-type',type));
+                add(list,pair('content-range','bytes '+NativeString(start)+'-'+NativeString(end)+'/'+NativeString(fullLength)));
+            }
+            const response=responseObject({status,statusText:status===206?'Partial Content':'OK',url:urlWithoutFragment(s.url),headers,redirected:false,type:'basic'},
+                {bytes:body,used:false,abort:s.signal});
+            return verifyIntegrity(response,integrity,s.signal);
+        };
+        /* The Response from this realm's store, or undefined when the transport is to obtain the Blob. */
+        const local=()=>{
+            if(s.method!=='GET')throw new TypeError('A blob: URL is fetched with GET only');
+            if(!blobAPI)throw notSupported('Blob is not initialized');
+            const blob=s.blobEntry?objectURLAPI.obtain(s.blobEntry):null;
+            if(blob!==null)return respond(blobAPI.bytes(blob),blobAPI.type(blob));
+            if(s.blobEntry||!transport.obtainBlob)throw new TypeError('The blob: URL has no Blob in this realm\'s store');
+            return undefined;
+        };
+        if(sync){
+            const response=local();if(response!==undefined)return response;
+            const obtained=transport.obtainBlob(s.url,sync.timeout);
+            return obtained===null?null:respond(obtained[0],obtained[1]);
+        }
+        return new NativePromise((resolve,reject)=>{
+            const response=local();if(response!==undefined){resolve(response);return;}
+            const started=transport.obtainBlob(s.url),id=started.id;
+            let finished=false;
+            const unfollow=signals.follow(s.signal,reason=>{if(finished)return;finished=true;transport.cancel(id);reject(reason);});
+            define(started.promise,'constructor',{value:promiseConstructor});
+            apply(then,started.promise,[obtained=>{if(finished)return;finished=true;unfollow();try{resolve(respond(obtained[0],obtained[1]));}catch(e){reject(e);}},
+                error=>{if(finished)return;finished=true;unfollow();reject(error);}]);
+        });
+    }
     /* prepared: input is a Request this bridge made for the fetch (Cache Storage's addAll), fetched
        as it is, without the Request constructor's steps for init.
        sync: a synchronous XMLHttpRequest's {timeout} (ms, 0 for none). The realm's event loop
@@ -652,15 +728,14 @@ function fetchInterfaces(realm) {
             let referrer=noReferrer?'':s.referrer==='about:client'?realm.clientReferrer():s.referrer;
             if(referrer){const source=parseURL(referrer);apply(setUsername,source,['']);apply(setPassword,source,['']);apply(setHash,source,['']);referrer=href(source);}
             const referrerPolicy=s.referrerPolicy?position(referrerPolicies,s.referrerPolicy):realm.referrerPolicy();
-            if(objectURLAPI&&beginsWith(s.url,'blob:')){
-                const local=objectURLAPI.fetch(s.url,s.method,headerValue(headerSlots.get(s.headers),'range')),headers=makeHeaders(undefined,'immutable'),list=headerSlots.get(headers).list;
-                add(list,pair('content-type',local.type));add(list,pair('content-length',NativeString(local.size)));if(local.range)add(list,pair('content-range',local.range));
-                const response=responseObject({status:local.status,statusText:local.status===206?'Partial Content':'OK',url:urlWithoutFragment(s.url),headers,redirected:false,type:'basic'},{bytes:s.method==='HEAD'?null:local.bytes,used:false,abort:s.signal});
-                if(sync)return verifyIntegrity(response,integrity,s.signal);
-                return new NativePromise(resolve=>resolve(verifyIntegrity(response,integrity,s.signal)));
+            if(beginsWith(s.url,'blob:'))return blobFetch(s,integrity,sync);
+            /* Main fetch: a no-cors request to another origin is a network error unless its
+               redirect mode is "follow" (the transport checks every request the same way). */
+            if(s.mode==='no-cors'&&s.redirect!=='follow'){
+                const target=originOf(parseURL(s.url));
+                if(target==='null'||target!==realm.origin())throw new TypeError('A no-cors request to another origin requires redirect mode "follow"');
             }
             if(s.mode==='no-cors'&&!transport.noCors())throw notSupported('This native context has no no-cors transport');
-            if(s.redirect==='manual')throw notSupported('Opaque manual redirect responses are not supported');
             // HTTP-network fetch: a body without a source (an author's stream) cannot be sent
             // over an HTTP/1.x connection, and the native transport sends whole bodies only.
             if(sourceless(b))throw new TypeError('The native transport cannot send a streaming request body');
@@ -683,7 +758,7 @@ function fetchInterfaces(realm) {
                 if(!active){done=true;finishStream();transport.cancel(transportId);return false;}
                 if(event===1){
                     const state=slot(bodySlots,value,'Body'),meta=slot(responseSlots,value,'Response');
-                    hasBody=s.method!=='HEAD'&&meta.type!=='opaque'&&!nullStatus(meta.status);
+                    hasBody=s.method!=='HEAD'&&meta.type!=='opaque'&&meta.type!=='opaqueredirect'&&!nullStatus(meta.status);
                     state.bytes=null;state.abort=s.signal;
                     if(hasBody&&!observer){state.stream=active.stream;networkSlots.set(active.stream,active);apply(registerFinalizer,networkFinalizer,[active,transportId,active]);channelRef=new NativeWeakRef(active);channel=null;}
                     if(observer){observer('headers',value,resume);return false;}
@@ -709,6 +784,7 @@ function fetchInterfaces(realm) {
             }:undefined;
             const query=record({url:s.url,method:s.method,headers:raw,body:b.bytes,sameOrigin:s.mode==='same-origin',
                 credentials:position(credentialModes,s.credentials),forcePreflight:forcePreflight||s.preflight,redirectError:s.redirect==='error',
+                redirectManual:s.redirect==='manual',
                 cache:position(cacheModes,s.cache),keepalive:s.keepalive,noCors:s.mode==='no-cors',noReferrer,referrer,referrerPolicy,
                 destination:s.destination});
             /* The response the transport delivered: its request's signal, HEAD's null body, integrity. */
@@ -720,7 +796,8 @@ function fetchInterfaces(realm) {
             if(sync){
                 if(!transport.fetchSync)throw notSupported('This realm cannot pause for a synchronous fetch');
                 if(b.bytes!==null)b.used=true;
-                const response=transport.fetchSync(query,sync.timeout);
+                /* realm.initiator: the request's initiator type, as for an observed fetch below. */
+                const response=transport.fetchSync(query,sync.timeout,realm.initiator);
                 return response===null?null:settle(response);
             }
             started=transport.fetch(query,notify);
@@ -755,6 +832,10 @@ function fetchInterfaces(realm) {
     const statusLine=/^HTTP\/\S+\s+\d{3}(?:[ \t]+([^\r\n]*))?/;
     const transportMeta=/^HTTP\/Nocturne-Meta cors=([01]) redirected=([01])(?: opaque=([01]))?(?: resource=[0-7])?\r?$/m;
     const opaqueResponse=resource=>responseObject({status:0,statusText:'',url:'',headers:makeHeaders(undefined,'immutable'),redirected:false,type:'opaque',resource},{bytes:null,used:false,abort:null});
+    /* An opaque-redirect filtered response (redirect mode "manual"): status 0, no fields, a null
+       body, and the URL of the response that redirected. */
+    const opaqueRedirectResponse=url=>responseObject({status:0,statusText:'',url:urlWithoutFragment(usv(url)),headers:makeHeaders(undefined,'immutable'),
+        redirected:false,type:'opaqueredirect'},{bytes:null,used:false,abort:null});
     return {
         Headers,Request,Response,fetch,
         /* The engine's own fetch for an element: a track, a media fallback. Its init is the
@@ -871,6 +952,7 @@ function fetchInterfaces(realm) {
            header block is read without author-modifiable regex, string or URL methods. */
         response(status,url,raw,text,bytes,redirected,statusText,type,resource) {
             if(type==='opaque')return opaqueResponse(typeof resource==='number'?resource:2);
+            if(type==='opaqueredirect')return opaqueRedirectResponse(url);
             const headers=makeHeaders(undefined,'response'),hs=headerSlots.get(headers);raw=NativeString(raw);
             eachLine(raw,line=>{const colon=indexOf(line,':');if(colon>0&&!beginsWith(line,'HTTP/'))appendHeader(hs,normalizeName(slice(line,0,colon)),normalizeValue(slice(line,colon+1,line.length)));});
             hs.guard='immutable';
