@@ -6,7 +6,7 @@ const indexedDBBridge=(()=>{
     const {Date,Uint8Array,ArrayBuffer,Array,Number,String,Object,Set,Map,WeakMap,DOMException,TypeError,Reflect}=globalThis;
     const native=host.indexedDB,storageKey=host.indexedDBStorageKey,pack=host.pack,unpack=host.unpack;
     if(typeof native!=='function')return null;
-    const invoke=Reflect.apply,wmGet=WeakMap.prototype.get,wmSet=WeakMap.prototype.set,wmHas=WeakMap.prototype.has;
+    const invoke=Reflect.apply,wmGet=WeakMap.prototype.get,wmSet=WeakMap.prototype.set,wmHas=WeakMap.prototype.has,wmDelete=WeakMap.prototype.delete;
     const setAdd=Set.prototype.add,setClear=Set.prototype.clear,setValues=Set.prototype.values;
     const setNext=Object.getPrototypeOf(new Set().values()).next;
     const mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapValues=Map.prototype.values,mapClear=Map.prototype.clear;
@@ -329,15 +329,44 @@ const indexedDBBridge=(()=>{
     }
     function insertion(records,k){let a=0,b=records.length;while(a<b){const m=(a+b)>>>1;if(compare(records[m][0],k)<0)a=m+1;else b=m;}return a;}
     function indexKeys(index,v){let raw=path(v,index.keyPath),out=[];if(index.multiEntry&&Array.isArray(raw)){for(const candidate of raw)try{const k=key(candidate);if(!out.some(x=>!compare(x,k)))out.push(k);}catch(e){if(e.name!=='DataError')throw e;}}else try{out.push(key(raw));}catch(e){if(e.name!=='DataError')throw e;}return out;}
-    function rows(source,query){const s=records.get(source),result=[];if(s.kind==='IDBObjectStore'){const store=storeOf(s);let begin=0,end=store.records.length;if(query?.lower!==undefined){begin=insertion(store.records,query.lower);if(query.lowerOpen&&begin<end&&!compare(store.records[begin][0],query.lower))begin++;}if(query?.upper!==undefined){end=insertion(store.records,query.upper);if(!query.upperOpen&&end<store.records.length&&!compare(store.records[end][0],query.upper))end++;}for(let i=begin;i<end;i++){const r=store.records[i];result.push({key:r[0],primaryKey:r[0],record:r});}}
-        else {const index=indexOf(s);for(const r of s.of.records)for(const k of r[2]?.find(v=>v[0]===index.id)?.[1]||[])if(matches(k,query))result.push({key:k,primaryKey:r[0],record:r});result.sort((a,b)=>compare(a.key,b.key)||compare(a.primaryKey,b.primaryKey));}return result;}
+    /* The order a handle reads: a store's own records ([key, value, index keys], kept sorted by
+       key), or an index's [key, record] entries sorted by key and then primary key. An index's
+       order is built from its store's records when first read, then kept in step with each record
+       stored or deleted (reorder); other changes to the records drop the store's orders. Reading a
+       record, a count or one step of a cursor is then a search, not a pass over the store. */
+    const orderSlots=new WeakMap(),orders={get:v=>invoke(wmGet,orderSlots,[v]),set:(v,r)=>invoke(wmSet,orderSlots,[v,r]),drop:v=>invoke(wmDelete,orderSlots,[v])};
+    const entryKeys=(record,id)=>record[2]?.find(v=>v[0]===id)?.[1]||[];
+    function indexOrder(store,index){
+        let kept=orders.get(store);if(!kept){kept=Object.create(null);orders.set(store,kept);}
+        let list=kept[index.id];
+        if(!list){list=[];for(const r of store.records)for(const k of entryKeys(r,index.id))list.push([k,r]);list.sort((a,b)=>compare(a[0],b[0])||compare(a[1][0],b[1][0]));kept[index.id]=list;}
+        return list;
+    }
+    const primaryOf=(entry,ofStore)=>ofStore?entry[0]:entry[1][0];
+    /* The first position whose entry is at or after (k, p), or after it with "after"; without p,
+       keys alone are compared. */
+    function seek(list,ofStore,k,p,after){let a=0,b=list.length;while(a<b){const m=(a+b)>>>1,c=compare(list[m][0],k)||(p===undefined?0:compare(primaryOf(list[m],ofStore),p));if(c<0||after&&!c)a=m+1;else b=m;}return a;}
+    /* The positions [lo, hi) of the entries whose key is in the range. */
+    function span(list,ofStore,query){const lo=query?.lower===undefined?0:seek(list,ofStore,query.lower,undefined,query.lowerOpen),hi=query?.upper===undefined?list.length:seek(list,ofStore,query.upper,undefined,!query.upperOpen);return [lo,Math.max(lo,hi)];}
+    function order(source){const s=records.get(source);if(s.kind==='IDBObjectStore')return {list:storeOf(s).records,ofStore:true};const index=indexOf(s);return {list:indexOrder(s.of,index),ofStore:false};}
+    /* Keep a store's kept index orders in step with one record replaced: old (or none) by record
+       (or none), both with the same primary key. */
+    function reorder(st,old,record){
+        const kept=orders.get(st);if(!kept)return;
+        for(const id in kept){
+            const list=kept[id],n=+id;
+            if(old)for(const k of entryKeys(old,n)){const i=seek(list,false,k,old[0],false);if(i<list.length&&list[i][1]===old)list.splice(i,1);else{orders.drop(st);return;}}
+            if(record)for(const k of entryKeys(record,n))list.splice(seek(list,false,k,record[0],false),0,[k,record]);
+        }
+    }
+    function rows(source,query){const {list,ofStore}=order(source),[lo,hi]=span(list,ofStore,query),result=[];for(let i=lo;i<hi;i++){const e=list[i],record=ofStore?e:e[1];result.push({key:e[0],primaryKey:record[0],record});}return result;}
     function write(source,v,provided,hasKey,addOnly){const s=existing(get(source,'IDBObjectStore'));live(s.tx,true);const detached=clone(v),store=storeOf(s);let candidate=provided;
         if(store.keyPath!==null){if(hasKey)fail('DataError');candidate=path(detached,store.keyPath);}
         let initial;if(candidate===undefined){if(!store.autoIncrement)fail('DataError');}else initial=key(candidate);
         return storeRecord(s,source,detached,initial,addOnly);
     }
     /* "delete records from an object store": the operation of a store's delete and a cursor's. */
-    const deleteRecords=(s,query)=>()=>{const st=storeOf(s);st.records=st.records.filter(record=>!matches(record[0],query));};
+    const deleteRecords=(s,query)=>()=>{const st=storeOf(s),[lo,hi]=span(st.records,true,query);if(hi-lo>64)orders.drop(st);else for(let i=lo;i<hi;i++)reorder(st,st.records[i],null);st.records.splice(lo,hi-lo);};
     /* "store a record into an object store", placed as a request whose source is the store handle
        (put, add) or the cursor (update). */
     function storeRecord(s,source,detached,initial,addOnly){
@@ -347,17 +376,19 @@ const indexedDBBridge=(()=>{
            own later step, one deleted after it is still there. */
         const present=storeOf(s).indexes.slice();
         return enqueue(s.tx,source,async r=>{const st=storeOf(s);let k=initial;if(k===undefined){if(st.generator>9007199254740992)fail('ConstraintError');k=st.generator;if(st.keyPath!==null)inject(detached,st.keyPath,k);}const at=insertion(st.records,k),exists=at<st.records.length&&!compare(st.records[at][0],k);if(addOnly&&exists)fail('ConstraintError');
-            const indexes=[];for(const index of present){const keys=indexKeys(index,detached);indexes.push([index.id,keys]);if(index.unique)for(const old of st.records){if(!compare(old[0],k))continue;for(const oldKey of old[2]?.find(v=>v[0]===index.id)?.[1]||[])if(keys.some(ik=>!compare(ik,oldKey)))fail('ConstraintError');}}
-            const staged=await native('stage',r.nativeToken,pack(cloneData.serialize(detached,undefined,true)));status(staged[0]);if(r.finished)return;const record=[k,staged[1],indexes];if(exists)st.records[at]=record;else st.records.splice(at,0,record);if(st.autoIncrement&&typeof k==='number'&&k>=st.generator)st.generator=Math.floor(k)+1;return clone(k);});
+            /* A unique index refuses a key another record (another primary key) has in it. */
+            const indexes=[];for(const index of present){const keys=indexKeys(index,detached);indexes.push([index.id,keys]);if(index.unique){const list=indexOrder(st,index);for(const ik of keys)for(let i=seek(list,false,ik,undefined,false);i<list.length&&!compare(list[i][0],ik);i++)if(compare(list[i][1][0],k))fail('ConstraintError');}}
+            const staged=await native('stage',r.nativeToken,pack(cloneData.serialize(detached,undefined,true)));status(staged[0]);if(r.finished)return;const record=[k,staged[1],indexes];reorder(st,exists?st.records[at]:null,record);if(exists)st.records[at]=record;else st.records.splice(at,0,record);if(st.autoIncrement&&typeof k==='number'&&k>=st.generator)st.generator=Math.floor(k)+1;return clone(k);});
     }
     /* The query steps of a store or index handle: "has been deleted" (InvalidStateError) first, then
        "not active" (TransactionInactiveError), then the query's conversion. */
     function query(source,kind,q){const s=existing(records.get(source));live(s.tx);const r=range(q,kind==='count');
         return enqueue(s.tx,source,async()=>{
-            const list=rows(source,r);
-            if(kind==='count')return list.length;
-            if(kind==='get')return list.length?value(list[0].record,s.tx):undefined;
-            return list.length?clone(list[0].primaryKey):undefined;
+            const {list,ofStore}=order(source),[lo,hi]=span(list,ofStore,r);
+            if(kind==='count')return hi-lo;
+            if(lo===hi)return undefined;
+            const record=ofStore?list[lo]:list[lo][1];
+            return kind==='get'?value(record,s.tx):clone(record[0]);
         });
     }
     /* "Create a request to retrieve multiple items" for getAll (kind 'value'), getAllKeys ('key')
@@ -415,7 +446,7 @@ const indexedDBBridge=(()=>{
         getAllRecords(options){return many(this,'record',options);}
         count(q){return query(this,'count',q);}
         delete(q){if(!arguments.length)throw new TypeError('Query required');const s=existing(get(this,'IDBObjectStore'));live(s.tx,true);return enqueue(s.tx,this,deleteRecords(s,range(q)));}
-        clear(){const s=existing(get(this,'IDBObjectStore'));live(s.tx,true);return enqueue(s.tx,this,()=>{storeOf(s).records=[];});}
+        clear(){const s=existing(get(this,'IDBObjectStore'));live(s.tx,true);return enqueue(s.tx,this,()=>{const st=storeOf(s);orders.drop(st);st.records=[];});}
         index(name){const s=get(this,'IDBObjectStore');name=strings(name);existing(s);if(get(s.tx,'IDBTransaction').finished)fail('InvalidStateError');const index=storeOf(s).indexes.find(i=>i.name===name);if(!index)fail('NotFoundError');return indexHandle(this,index);}
         /* The arguments are converted first (the key path is not nullable, so null is "null"; the
            options' members in lexicographic order), then: not an upgrade, store deleted
@@ -427,23 +458,25 @@ const indexedDBBridge=(()=>{
             /* The build runs in order even when the index is deleted before it runs: requests
                placed between see its entries, and deleteIndex's later step removes them. */
             r.queue.push({request:null,operation:async()=>{
-                const seen=[];
+                const seen=[];orders.drop(st);
                 for(let i=0;i<st.records.length;i++){
                     if(i%32===0)await prefetch(st.records.slice(i,i+32),s.tx);
                     const record=st.records[i];
                     const keys=indexKeys(index,await value(record,s.tx));
                     if(r.finished)return;
-                    if(index.unique)for(const k of keys){if(seen.some(x=>!compare(x,k)))fail('ConstraintError');seen.push(k);}
+                    /* seen is sorted: a unique index's keys so far. */
+                    if(index.unique)for(const k of keys){let a=0,b=seen.length;while(a<b){const m=(a+b)>>>1;if(compare(seen[m],k)<0)a=m+1;else b=m;}if(a<seen.length&&!compare(seen[a],k))fail('ConstraintError');seen.splice(a,0,k);}
                     if(!record[2])record[2]=[];
                     record[2]=record[2].filter(entry=>entry[0]!==index.id);
                     record[2].push([index.id,keys]);
                 }
+                orders.drop(st);
             }});
             return indexHandle(this,index);}
         deleteIndex(name){const s=get(this,'IDBObjectStore');name=strings(name);const r=get(s.tx,'IDBTransaction');if(r.mode!=='versionchange')fail('InvalidStateError');existing(s);live(s.tx);const st=storeOf(s),i=st.indexes.findIndex(x=>x.name===name);if(i<0)fail('NotFoundError');const index=st.indexes[i];st.indexes.splice(i,1);
             /* The handle loses the index now; its records go when the requests placed before this
                call have run, in order, as createIndex builds one. A rename never touches them. */
-            r.queue.push({request:null,operation:async()=>{for(const record of st.records)if(record[2])record[2]=record[2].filter(v=>v[0]!==index.id);}});}
+            r.queue.push({request:null,operation:async()=>{orders.drop(st);for(const record of st.records)if(record[2])record[2]=record[2].filter(v=>v[0]!==index.id);}});}
         openCursor(q,d='next'){return cursor(this,q,d,true);}
         openKeyCursor(q,d='next'){return cursor(this,q,d,false);}
     }
@@ -470,24 +503,28 @@ const indexedDBBridge=(()=>{
     function indexHandle(store,index){const s=records.get(store);let handle=s.indexes.get(index.id);if(!handle){handle=new IDBIndex(token,store,index);s.indexes.set(index.id,handle);}return handle;}
     function cursor(source,q,d,withValue){d=direction(d);const s=existing(records.get(source));live(s.tx);const query=range(q,true),request=new IDBRequest(token,source,s.tx),object=new(withValue?IDBCursorWithValue:IDBCursor)(token,source,request,d,query);const r=get(object,'IDBCursor');get(s.tx,'IDBTransaction').queue.push({request,operation:()=>move(object,undefined,undefined,1)});return request;}
     async function move(object,to,primary,amount){
-        const r=get(object,'IDBCursor');let list=rows(r.source,r.query);
-        const unique=r.direction.endsWith('unique');
-        if(unique)list=list.filter((v,i)=>!i||compare(v.key,list[i-1].key));
-        if(r.direction.startsWith('prev'))list.reverse();
-        const forward=r.direction.startsWith('next');
-        if(r.position)list=list.filter(v=>{
-            const c=compare(v.key,r.position.key)||(unique?0:compare(v.primaryKey,r.position.primaryKey));
-            return forward?c>0:c<0;
-        });
-        if(to!==undefined)list=list.filter(v=>{
-            const c=compare(v.key,to)||(primary===undefined?0:compare(v.primaryKey,primary));
-            return forward?c>=0:c<=0;
-        });
-        r.position=list[amount-1]||null;
+        /* "Iterate a cursor", count times: the first entry in range past the position (past its
+           key alone when unique) and at or past the key (and primary key) asked for, or the last
+           such before them going back; prevunique takes the first entry of the key it lands on. */
+        const r=get(object,'IDBCursor'),{list,ofStore}=order(r.source),[lo,hi]=span(list,ofStore,r.query);
+        const unique=r.direction.endsWith('unique'),forward=r.direction.startsWith('next');
+        let at=-1;
+        for(let n=0;n<amount;n++){
+            const p=n?{key:list[at][0],primaryKey:primaryOf(list[at],ofStore)}:r.position;let i;
+            if(forward){i=lo;if(p)i=Math.max(i,seek(list,ofStore,p.key,unique?undefined:p.primaryKey,true));if(to!==undefined)i=Math.max(i,seek(list,ofStore,to,primary,false));at=i<hi?i:-1;}
+            else{i=hi;if(p)i=Math.min(i,seek(list,ofStore,p.key,unique?undefined:p.primaryKey,false));if(to!==undefined)i=Math.min(i,seek(list,ofStore,to,primary,true));i--;if(i>=lo&&unique)i=Math.max(lo,seek(list,ofStore,list[i][0],undefined,false));at=i>=lo?i:-1;}
+            if(at<0)break;
+        }
+        const recordAt=i=>ofStore?list[i]:list[i][1];
+        r.position=at<0?null:{key:list[at][0],primaryKey:recordAt(at)[0],record:recordAt(at)};
         if(r.position&&object instanceof IDBCursorWithValue){
             const tx=records.get(r.source).tx;
-            if(!get(tx,'IDBTransaction').valueCache?.has(r.position.record[1]))
-                await prefetch(list.slice(amount-1,amount+31).map(row=>row.record),tx);
+            if(!get(tx,'IDBTransaction').valueCache?.has(r.position.record[1])){
+                const ahead=[];
+                if(forward)for(let i=at;i<Math.min(hi,at+32);i++)ahead.push(recordAt(i));
+                else for(let i=at;i>=Math.max(lo,at-31);i--)ahead.push(recordAt(i));
+                await prefetch(ahead,tx);
+            }
             if(get(tx,'IDBTransaction').finished)return null;
             r.value=await value(r.position.record,tx);
         }else r.value=undefined;
