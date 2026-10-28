@@ -75,7 +75,7 @@ user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
 - 入口 `python -X utf8 scripts/build.py -j 8 [目標]`（UCRT64 の make）。目標：`all`（img・vhd・vhdx・iso）、`qemu-image`（img だけ）、`run`、`test`・`test-quick`・`test-full`、`kernel`、`user`、`clean`。
 - 出力 `build/kernel.elf`、`build/programs/`、`build/sdk/`、`build/c.list`、`build/nocturne.{img,vhd,vhdx,iso}`。C: の中身は `scripts/layout.py` → `build/c.list` → `build/host/store.exe fill`（`mkroots.py` は TLS の根の証明書で、C: とは無関係）。
 - 任意の移植は道具があるときだけ：Go `tools/go`、TypeScript `tools/TypeScript`、Rust `tools/rust`、OS の中の LLVM `tools/llvm`、NVIDIA の firmware `local/firmware/`。
-- 試験：`scripts/test.py [--quick] [--no-net] [群|群/名]`（`tests/runtests.c` の `tests[]`、114 群 225 件。例 `web/fonts`・`web/engine`・`web/javascript`）。QEMU を窓なしで起動し、`C:\Tests\autorun.sh` から tcc で組んで走らせる。結果 `build/test-serial.log`・`build/test-metadata.json`。`tests/check_*.py` はホストの検査で、まとめる runner は無い。
+- 試験：`scripts/test.py [--quick] [--no-net] [群|群/名]`（`tests/runtests.c` の `tests[]`、117 群 227 件。例 `web/fonts`・`web/engine`・`web/javascript`）。QEMU を窓なしで起動し、`C:\Tests\autorun.sh` から tcc で組んで走らせる。結果 `build/test-serial.log`・`build/test-metadata.json`。`tests/check_*.py` はホストの検査で、まとめる runner は無い。
 - WPT：`scripts/wpt.py --label <名>`（ホストの wptserve と QEMU 一台、ゲストの `tests/wptrunner.c` が枠ごとにブラウザーを開き、`tests/wpt/testharnessreport.js` が結果を返す。`--resume`、`--summary-only`）。結果 `build/wpt/<名>/results.jsonl`・`summary.txt`。QuickJS だけの test262 はホストの `tests/check_test262.py`。
 - 画面で確かめる：`scripts/platform_qa.py`（ラベル専用の写し、`build/nocturne-platform/<label>/`）、`scripts/qtest.py`、または手で起動した QEMU。
 
@@ -90,4 +90,4 @@ user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
 ## 古い記述（直すまで信じない）
 
 - README.md:51 の起動メニュー 3 項目と解像度 → `boot/limine.conf` は 2 項目で解像度を持たない。README.md:268 の tools 一覧 → llvm・rust・go・TypeScript もある。README.md:660 の `hv/`・`rdp/`・e1000・tulip・ATA の置き場所 → どれも `kernel/src/vm/`。README.md:668 の ports 一覧に llvm が無い。
-- `scripts/test.py:20` の群の一覧（13 群）→ `tests/runtests.c` は 114 群。
+- `scripts/test.py:20` の群の一覧（13 群）→ `tests/runtests.c` は 117 群。
