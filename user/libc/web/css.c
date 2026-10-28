@@ -322,6 +322,18 @@ struct sheet {
     arena_t *arena;
     uint64_t serial;
     struct css_index *index;
+    /* A CSSOM parse whose top-level text put rules into the lists above that
+       no top-level CSSOM rule's span holds (@document, an @font-face with a
+       prelude): only a parse of its whole text can change it. */
+    bool cssom_hidden;
+};
+/* What one top-level rule of a CSSOM parse put into its sheet's lists: the
+   first and last of each, adjacent there (NULL: none). */
+struct css_rule_span {
+    struct rule *rules, *rules_last;
+    struct font_face *fonts, *fonts_last;
+    struct opacity_keyframes *motions, *motions_last;
+    struct css_layer_event *layers, *layers_last;
 };
 
 struct pctx {
@@ -4213,10 +4225,42 @@ static void cssom_page_rules(struct pctx *pc,const char *s,const char *e) {
     }
 }
 
+/* The lists' ends before a top-level rule of a CSSOM parse, and what the
+   rule added after them: its span. */
+struct span_mark {
+    struct rule *rules; struct font_face *fonts; struct opacity_keyframes *motions;
+    struct css_layer_event *layers; struct css_rule_info *cssom;
+};
+static void span_mark(const sheet_t *sh, struct span_mark *m) {
+    *m = (struct span_mark){sh->last, sh->fonts_last, sh->motions_last, sh->layers_last, sh->cssom_last};
+}
+static void span_close(struct pctx *pc, struct span_mark *m) {
+    sheet_t *sh = pc->sh;
+    struct css_rule_info *rule = sh->cssom_last == m->cssom ? NULL : m->cssom ? m->cssom->next : sh->cssom_first;
+    bool added = sh->last != m->rules || sh->fonts_last != m->fonts || sh->motions_last != m->motions ||
+                 sh->layers_last != m->layers;
+    if (rule && rule == sh->cssom_last) {
+        struct css_rule_span *span = ar_alloc(pc->a, sizeof *span);
+        if (sh->last != m->rules) { span->rules = m->rules ? m->rules->next : sh->first; span->rules_last = sh->last; }
+        if (sh->fonts_last != m->fonts) { span->fonts = m->fonts ? m->fonts->next : sh->fonts; span->fonts_last = sh->fonts_last; }
+        if (sh->motions_last != m->motions) {
+            span->motions = m->motions ? m->motions->next : sh->motions; span->motions_last = sh->motions_last;
+        }
+        if (sh->layers_last != m->layers) {
+            span->layers = m->layers ? m->layers->next : sh->layers_first; span->layers_last = sh->layers_last;
+        }
+        rule->span = span;
+    } else if (rule || added) sh->cssom_hidden = true;
+    span_mark(sh, m);
+}
 static void parse_rules(struct pctx *pc, const char *s, const char *e, const struct mcond *media) {
     pc->rule_depth++;
     bool top = pc->rule_depth == 1;
+    struct span_mark mark;
+    bool spans = top && pc->cssom_tree;
+    if (spans) span_mark(pc->sh, &mark);
     while (s < e) {
+        if (spans) span_close(pc, &mark);
         s = skip_ws(s, e);
         if (s >= e) break;
         if (*s == '@') {
@@ -4418,6 +4462,7 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
         if (native && top) pc->import_allowed = pc->namespace_allowed = false;
         s = be < e ? be + 1 : e;
     }
+    if (spans) span_close(pc, &mark);
     pc->rule_depth--;
 }
 
@@ -4494,16 +4539,23 @@ void css_sheet_import_context(sheet_t *sheet,sheet_t *parent,const struct css_ru
     parent->import_last=sheet;
 }
 
+/* an AST's identity across rescans: never reused, unlike its address */
+static uint64_t sheet_serials;
+/* context: the sheet the text's rules are parsed for (css_parse_cssom_rules) */
 static sheet_t *parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports,
-                            bool cssom_tree, const uint32_t *markers, uint32_t nmarkers) {
-    static uint64_t serials;
-    struct pctx pc = {.a = a, .base = base_url, .imports = imports, .import_allowed = true,
-                      .namespace_allowed = true, .cssom_tree = cssom_tree,
+                            bool cssom_tree, const uint32_t *markers, uint32_t nmarkers, sheet_t *context) {
+    struct pctx pc = {.a = a, .base = base_url, .imports = imports, .import_allowed = !context,
+                      .namespace_allowed = !context, .cssom_tree = cssom_tree,
                       .cssom_markers = markers, .cssom_nmarkers = nmarkers};
     pc.sh = ar_alloc(a, sizeof(sheet_t));
     pc.sh->order = order;
     pc.sh->ast = pc.sh; pc.sh->arena = a;
-    pc.sh->serial = __atomic_add_fetch(&serials, 1, __ATOMIC_RELAXED);
+    pc.sh->serial = __atomic_add_fetch(&sheet_serials, 1, __ATOMIC_RELAXED);
+    if (context) {
+        /* its prefixes, read only: no @namespace parses here */
+        pc.sh->ast = context; pc.sh->order = context->order;
+        pc.sh->namespaces = context->namespaces; pc.sh->layer_count = context->layer_count;
+    }
     size_t cn;
     char *c = strip_comments(a, css, n, &cn);
     pc.sh->cssom_source = pc.cssom_text = c; pc.sh->cssom_length = cn;
@@ -4511,7 +4563,7 @@ static sheet_t *parse_sheet(arena_t *a, const char *css, size_t n, const char *b
     return pc.sh;
 }
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
-    return parse_sheet(a, css, n, base_url, order, imports, false, NULL, 0);
+    return parse_sheet(a, css, n, base_url, order, imports, false, NULL, 0, NULL);
 }
 
 struct sheet_parse_job {
@@ -4525,6 +4577,7 @@ struct sheet_parse_job {
     bool cssom_tree;
     const uint32_t *markers;
     uint32_t nmarkers;
+    sheet_t *context;
 };
 static void sheet_parse_worker(size_t index, void *context) {
     (void)index;
@@ -4534,15 +4587,15 @@ static void sheet_parse_worker(size_t index, void *context) {
     job->arena->trap = &trap;
     job->failed = setjmp(trap);
     if (!job->failed) job->result = parse_sheet(job->arena, job->text, job->length, job->base, job->order, job->imports, job->cssom_tree,
-                                                    job->markers, job->nmarkers);
+                                                    job->markers, job->nmarkers, job->context);
     job->arena->trap = outer;
 }
 static void sheet_parse_service(void *context) { web_native_checkpoint(context); }
 static sheet_t *parse_serviced(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url, double order,
-                               pvec *imports, bool cssom_tree, const uint32_t *markers, uint32_t nmarkers) {
+                               pvec *imports, bool cssom_tree, const uint32_t *markers, uint32_t nmarkers, sheet_t *context) {
     if (!d || !d->live || n < 16384 || parallel_active())
-        return parse_sheet(a,css,n,base_url,order,imports,cssom_tree,markers,nmarkers);
-    struct sheet_parse_job job = {a,css,base_url,n,order,imports,NULL,0,cssom_tree,markers,nmarkers};
+        return parse_sheet(a,css,n,base_url,order,imports,cssom_tree,markers,nmarkers,context);
+    struct sheet_parse_job job = {a,css,base_url,n,order,imports,NULL,0,cssom_tree,markers,nmarkers,context};
     parallel_call_stage(PARALLEL_CSS_PARSE,sheet_parse_worker,&job,sheet_parse_service,d);
     if (job.failed) {
         if (a->trap) longjmp(*a->trap,job.failed);
@@ -4551,12 +4604,17 @@ static sheet_t *parse_serviced(web_doc *d, arena_t *a, const char *css, size_t n
     return job.result;
 }
 sheet_t *css_parse_sheet_serviced(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
-    return parse_serviced(d, a, css, n, base_url, order, imports, false, NULL, 0);
+    return parse_serviced(d, a, css, n, base_url, order, imports, false, NULL, 0, NULL);
 }
 sheet_t *css_parse_cssom_sheet(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url,
                                const uint32_t *markers, uint32_t nmarkers) {
-    return parse_serviced(d, a, css, n, base_url, 0, NULL, true, markers, nmarkers);
+    return parse_serviced(d, a, css, n, base_url, 0, NULL, true, markers, nmarkers, NULL);
 }
+sheet_t *css_parse_cssom_rules(web_doc *d, sheet_t *sheet, const char *css, size_t n, const char *base_url,
+                               const uint32_t *markers, uint32_t nmarkers) {
+    return parse_serviced(d, sheet->arena, css, n, base_url, 0, NULL, true, markers, nmarkers, sheet);
+}
+bool css_cssom_spliceable(const sheet_t *sheet) { return sheet && !sheet->cssom_hidden; }
 
 /* ---------------------------------------------------------------- media queries */
 /* CSS and matchMedia share this explicit-stack parser and device model. Unknown
@@ -5012,6 +5070,8 @@ struct css_index {
     bool containers, siblings;
     const struct mcond **media; /* the distinct @media of its rules */
     uint32_t nmedia, media_cap;
+    const struct mcond *last_media; /* the last rule's, at media[last_media_id - 1] */
+    uint32_t last_media_id;
     struct css_index *relational; /* :has() subjects (ient.has) by their compounds' keys */
     struct css_index *child_list_subjects; /* parent state can affect its outer siblings */
     struct css_index *child_list_parents; /* own state changed by a child-list mutation */
@@ -5541,6 +5601,33 @@ static uint32_t index_media(arena_t *a, struct css_index *x, const struct mcond 
     x->media[x->nmedia++] = m;
     return x->nmedia;
 }
+/* a rule after every rule the index holds */
+static void index_add(web_doc *d, arena_t *a, struct css_index *index, const struct rule *r) {
+    for(const struct mcond *m=r->media;m;m=m->up)if(m->container)index->containers=true;
+    for(int k=0;k<r->ndecls;k++)if(container_units_used(r->decls[k].value))index->containers=true;
+    if (r->ndecls) {
+        /* The rules of one @media block share its condition and are adjacent. */
+        if (r->media != index->last_media) {
+            index->last_media = r->media; index->last_media_id = r->media ? index_media(a, index, r->media) : 0;
+        }
+        for (int k = 0; k < r->sel->n; k++) {
+            index->form_features |= selector_form_features(r->sel->v[k]->right);
+            if(selector_siblings(r->sel->v[k]->right)) {
+                index->siblings=true;
+                for(const struct compound *part=r->sel->v[k]->right;part;part=part->left)
+                    index_child_list_subjects(a,index,part);
+            }
+            for(const struct compound *part=r->sel->v[k]->right;part;part=part->left) {
+                index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_PARENT);
+                index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_SIBLING);
+            }
+            index_rule(a, index, r, r->sel->v[k], index->rules, index->last_media_id);
+            index_features(a, index, r->sel->v[k]);
+            if (d && d->profile_enabled) d->profile.style_index_entries++;
+        }
+    }
+    index->rules++;
+}
 /* NULL when cancelled: a partial index is never published to the AST. */
 static struct css_index *index_sheet(web_doc *d, sheet_t *s) {
     arena_t *a = s->arena;
@@ -5554,32 +5641,59 @@ static struct css_index *index_sheet(web_doc *d, sheet_t *s) {
     ht_init(a, &index->feature_ids, 32);
     ht_init(a, &index->feature_classes, 128);
     ht_init(a, &index->feature_attrs, 32);
-    /* The rules of one @media block share its condition and are adjacent. */
-    const struct mcond *last = NULL; uint32_t media = 0;
-    for (struct rule *r = s->first; r; r = r->next, index->rules++) {
+    for (struct rule *r = s->first; r; r = r->next) {
         if (!web_native_checkpoint(d)) return NULL;
-        for(const struct mcond *m=r->media;m;m=m->up)if(m->container)index->containers=true;
-        for(int k=0;k<r->ndecls;k++)if(container_units_used(r->decls[k].value))index->containers=true;
-        if (!r->ndecls) continue;
-        if (r->media != last) { last = r->media; media = last ? index_media(a, index, last) : 0; }
-        for (int k = 0; k < r->sel->n; k++) {
-            index->form_features |= selector_form_features(r->sel->v[k]->right);
-            if(selector_siblings(r->sel->v[k]->right)) {
-                index->siblings=true;
-                for(const struct compound *part=r->sel->v[k]->right;part;part=part->left)
-                    index_child_list_subjects(a,index,part);
-            }
-            for(const struct compound *part=r->sel->v[k]->right;part;part=part->left) {
-                index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_PARENT);
-                index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_SIBLING);
-            }
-            index_rule(a, index, r, r->sel->v[k], index->rules, media);
-            index_features(a, index, r->sel->v[k]);
-            if (d->profile_enabled) d->profile.style_index_entries++;
-        }
+        index_add(d, a, index, r);
     }
     return index;
 }
+/* One list of an AST with a top-level rule's part replaced: after the last
+   element an earlier top-level rule put there (pred), before what followed
+   the old part (succ). */
+#define SPLICE_LIST(T, head, tail, first, last, moved)                                                    \
+    do {                                                                                                  \
+        T *gone = old && old->span ? old->span->first : NULL, *gone_last = gone ? old->span->last : NULL; \
+        T *in = put ? put->first : NULL, *in_last = in ? put->last : NULL;                                \
+        if (!gone && !in) break;                                                                          \
+        T *pred = NULL;                                                                                   \
+        if (at == count && !old) pred = sheet->tail;                                                      \
+        else for (uint32_t k = at; k-- > 0;)                                                              \
+            if (top[k]->span && top[k]->span->last) { pred = top[k]->span->last; break; }                 \
+        T *succ = gone ? gone_last->next : pred ? pred->next : sheet->head;                               \
+        if (pred) pred->next = in ? in : succ; else sheet->head = in ? in : succ;                         \
+        if (in) in_last->next = succ;                                                                     \
+        if (!succ) sheet->tail = in ? in_last : pred;                                                     \
+        moved = moved || gone || succ;                                                                    \
+    } while (0)
+bool css_cssom_splice(web_doc *d, sheet_t *sheet, struct css_rule_info *const *top, uint32_t count, uint32_t at,
+                      struct css_rule_info *old, sheet_t *fresh) {
+    struct css_rule_info *rule = fresh ? fresh->cssom_first : NULL;
+    const struct css_rule_span *put = rule ? rule->span : NULL;
+    /* moved: style rules other than after all others, which the index orders */
+    bool moved = false, others = false;
+    SPLICE_LIST(struct rule, first, last, rules, rules_last, moved);
+    SPLICE_LIST(struct font_face, fonts, fonts_last, fonts, fonts_last, others);
+    SPLICE_LIST(struct opacity_keyframes, motions, motions_last, motions, motions_last, others);
+    SPLICE_LIST(struct css_layer_event, layers_first, layers_last, layers, layers_last, others);
+    (void)others;
+    struct css_rule_info *prev = at ? top[at - 1] : NULL, *next = old ? old->next : at < count ? top[at] : NULL;
+    if (rule) rule->next = next;
+    if (prev) prev->next = rule ? rule : next; else sheet->cssom_first = rule ? rule : next;
+    if (!next) sheet->cssom_last = rule ? rule : prev;
+    sheet->cssom_count = sheet->cssom_count - (old != NULL) + (rule != NULL);
+    if (fresh && fresh->layer_count > sheet->layer_count) sheet->layer_count = fresh->layer_count;
+    sheet->serial = __atomic_add_fetch(&sheet_serials, 1, __ATOMIC_RELAXED);
+    struct css_index *index = sheet->index;
+    if (!index) return false;
+    /* Rules after all others take the next places of its order; any other
+       change to the rules leaves an index to build again. */
+    if (moved) { sheet->index = NULL; return true; }
+    for (const struct rule *r = put ? put->rules : NULL; r; r = r == put->rules_last ? NULL : r->next)
+        index_add(d, sheet->arena, index, r);
+    index->fonts = sheet->fonts; index->motions = sheet->motions;
+    return false;
+}
+#undef SPLICE_LIST
 /* The rule index of a sheet's AST, shared by every instance of that AST and
    kept across rescans for as long as the AST lives. */
 static struct css_index *sheet_index(web_doc *d, const sheet_t *s) {

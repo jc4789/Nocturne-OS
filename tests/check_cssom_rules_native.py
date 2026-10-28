@@ -6,10 +6,17 @@ serialize-group-rules-with-decls.html、css/cssom/CSSKeyframesRule*.html、cssom
 MediaList・宣言の塊・CSSRule の同一性の問いと期待。JS の束縛（例外の型、IDL の形、
 [SameObject]）は guest の WPT の仕事で、ここでは照らさない。
 
+tests/cssom_splice_cases.c は、規則ごとの変更（変わった最上位の規則だけを解析し、AST の
+列と規則の木と cascade の索引に差し込む）のあとの AST と木と索引が、同じ頁の全文を一度に
+解析したものと同じであること、CSSRule の id が規則を指し続けること、置き換えた規則の
+記憶が溜まり続けないこと、insertRule を一つずつ 5000 回する時間が 1000 回の十倍に届か
+ないことを確かめる。
+
   python -X utf8 tests/check_cssom_rules_native.py [--old]
 
---old は規則の木の前の源（930c2d13）で同じ件を組み、変更前の数を出す。前の口で
-書けない件（子の規則、規則の種類ごとの属性、MediaList、宣言）は落ちる。
+--old は前の源で同じ件を組み、変更前の数を出す。規則の木の件は規則の木の前（930c2d13）で、
+前の口で書けない件（子の規則、規則の種類ごとの属性、MediaList、宣言）は落ちる。差し込みの
+件は規則ごとの変更の前（8cbe1194、変更のたびに頁の全文を解析し直した）で、時間の件が落ちる。
 """
 from pathlib import Path
 import os
@@ -20,54 +27,72 @@ import tarfile
 
 root = Path(__file__).resolve().parent.parent
 old = "--old" in sys.argv
-out = root / "build/check-cssom-rules" / ("old" if old else "new")
-out.mkdir(parents=True, exist_ok=True)
 cc = next(p / "tools/msys64/ucrt64/bin/clang.exe" for p in (root, *root.parents)
           if (p / "tools/msys64/ucrt64/bin/clang.exe").exists())
 env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH", ""))
-source = root
-if old:
+undefined = re.compile(r"undefined (?:symbol: |reference to `)([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def source_of(out, revision):
+    """the tree to build from: this one, or an old revision's web engine"""
+    if not old:
+        return root
     source = out / "src"
     if not (source / "user/libc/web/cssom.c").exists():
         archive = out / "old.tar"
-        subprocess.run(["git", "archive", "--format=tar", "-o", str(archive), "930c2d13", "user/libc/web",
+        subprocess.run(["git", "archive", "--format=tar", "-o", str(archive), revision, "user/libc/web",
                         "user/include", "common"], cwd=root, check=True)
         with tarfile.open(archive) as t:
             t.extractall(source, filter="data")
-abi = out / "host-abi"
-abi.mkdir(exist_ok=True)
-(abi / "setjmp.h").write_text('#include "' + (cc.parent.parent / "include/setjmp.h").as_posix() + '"\n', encoding="utf-8")
-web = source / "user/libc/web"
-cases = out / "cssom-rules-generated.c"
-cases.write_text(("#define OLD_SOURCE 1\n" if old else "") +
-                 (root / "tests/cssom_rules_native_cases.c").read_text(encoding="utf-8"), encoding="utf-8")
-stubs = out / "unreached.c"
-exe = out / "cssom-rules.exe"
-units = [str(cases), str(web / "css.c"), str(web / "dom.c"), str(web / "html.c"), str(web / "util.c"),
-         str(web / "cssprop.c"), str(web / "color.c"), str(web / "cssmath.c")]
-flags = ["-std=gnu11", "-O1", "-w", "-I" + str(abi), "-I" + str(source / "user/include"), "-I" + str(source / "common"),
-         "-I" + str(source / "user/libc"), "-I" + str(web), "-I" + str(root / "third_party/quickjs")]
-undefined = re.compile(r"undefined (?:symbol: |reference to `)([A-Za-z_][A-Za-z0-9_]*)")
-names = set()
-for attempt in range(6):
-    # every external the linked units reach but these cases never call: a call stops with its name
-    stubs.write_text("int puts(const char *);\nvoid exit(int);\n" + "".join(
-        f'void {n}(void) {{ puts("unreached: {n}"); exit(3); }}\n' for n in sorted(names)), encoding="utf-8")
-    r = subprocess.run([str(cc), *flags, *units, str(stubs), "-o", str(exe)], cwd=root, env=env,
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if r.returncode == 0:
-        break
-    found = set(undefined.findall(r.stdout + r.stderr)) - names
-    if not found:
-        print(r.stdout + r.stderr)
-        sys.exit("道具を組めない" + ("（前の口に無い関数がある）" if old else ""))
-    names |= found
-else:
-    sys.exit("道具を組めない")
-result = subprocess.run([str(exe)], cwd=root, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                        timeout=600)
-print(result.stdout, end="")
-if result.returncode not in (0, 1):
-    print(result.stderr, end="")
-    sys.exit(f"道具が止まった（{result.returncode}）")
-sys.exit(result.returncode)
+    return source
+
+
+def program(name, case_file, revision, owner):
+    """cases built with the units beside them (owner: the one the cases include), run"""
+    out = root / "build/check-cssom-rules" / (f"old-{name}" if old else name)
+    out.mkdir(parents=True, exist_ok=True)
+    source = source_of(out, revision)
+    abi = out / "host-abi"
+    abi.mkdir(exist_ok=True)
+    (abi / "setjmp.h").write_text('#include "' + (cc.parent.parent / "include/setjmp.h").as_posix() + '"\n',
+                                  encoding="utf-8")
+    web = source / "user/libc/web"
+    cases = out / f"{name}-generated.c"
+    cases.write_text(("#define OLD_SOURCE 1\n" if old else "") + (root / case_file).read_text(encoding="utf-8"),
+                     encoding="utf-8")
+    stubs = out / "unreached.c"
+    exe = out / f"{name}.exe"
+    units = [str(cases)] + [str(web / u) for u in ("css.c", "cssom.c", "dom.c", "html.c", "util.c", "cssprop.c",
+                                                   "color.c", "cssmath.c")
+                            if u != owner and (web / u).exists()]
+    flags = ["-std=gnu11", "-O1", "-w", "-I" + str(abi), "-I" + str(source / "user/include"),
+             "-I" + str(source / "common"), "-I" + str(source / "user/libc"), "-I" + str(web),
+             "-I" + str(root / "third_party/quickjs")]
+    names = set()
+    for attempt in range(6):
+        # every external the linked units reach but these cases never call: a call stops with its name
+        stubs.write_text("int puts(const char *);\nvoid exit(int);\n" + "".join(
+            f'void {n}(void) {{ puts("unreached: {n}"); exit(3); }}\n' for n in sorted(names)), encoding="utf-8")
+        r = subprocess.run([str(cc), *flags, *units, str(stubs), "-o", str(exe)], cwd=root, env=env,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode == 0:
+            break
+        found = set(undefined.findall(r.stdout + r.stderr)) - names
+        if not found:
+            print(r.stdout + r.stderr)
+            sys.exit("道具を組めない" + ("（前の口に無い関数がある）" if old else ""))
+        names |= found
+    else:
+        sys.exit("道具を組めない")
+    result = subprocess.run([str(exe)], cwd=root, env=env, capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=1200)
+    print(result.stdout, end="")
+    if result.returncode not in (0, 1):
+        print(result.stderr, end="")
+        sys.exit(f"道具が止まった（{result.returncode}）")
+    return result.returncode
+
+
+status = program("rules", "tests/cssom_rules_native_cases.c", "930c2d13", "cssom.c")
+status |= program("splice", "tests/cssom_splice_cases.c", "8cbe1194", "css.c")
+sys.exit(status)

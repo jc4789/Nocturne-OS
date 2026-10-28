@@ -17,14 +17,17 @@ bool cssom_owner_disabled(node_t *node);
 node_t *cssom_list_owner(web_doc *d, node_t *root, uint32_t index, bool select, uint32_t *count, int *error);
 /* One CSSOM parse of a text, in its own arena: the cascade AST, the rule tree,
    the comment-free text every rule points into, and an index of each rule's
-   children (top: the top-level rules). */
+   children (top: the top-level rules, malloc'd, room for cap). Once a change
+   has been spliced in rule by rule, each top-level rule's text is its own
+   (spliced): the parse's text is theirs in order, no longer source. */
 struct cssom_parse {
     arena_t arena;
     sheet_t *ast;
     const char *source;
     size_t length;
     struct css_rule_info **top;
-    uint32_t count;
+    uint32_t count, cap;
+    bool spliced;
 };
 /* Rules removed from a sheet while a CSSRule object stood for one of them: a
    parse of the removed rule inside its old ancestors' preludes (root_id the
@@ -44,7 +47,10 @@ struct cssom_sheet {
     struct cssom_parse p;
     struct cssom_tree *detached;
     struct cssom_slot *slots; /* id -> rule, over p and detached */
-    uint32_t slot_mask;
+    uint32_t slot_mask, slot_count;
+    /* the text bytes p's live top-level rules hold, and those of the rules
+       its arena still holds after their change (a whole parse frees them) */
+    size_t live, garbage;
     char *base;
     char *media;     /* the sheet's MediaList, serialized; NULL: empty */
     char *dom_media; /* the media attribute it was last set from */

@@ -992,15 +992,20 @@ struct css_rule_info {
     struct css_rule_info *next;                  /* next sibling */
     struct css_rule_info *parent, *first, *last; /* CSSOM parses only */
     struct css_rule_info **children;             /* cssom.c's index of first..last */
-    /* text: the rule's text_len bytes in its sheet's comment-free source,
-       not terminated. The other ranges are offsets into text: the trimmed
+    /* text: the rule's text_len bytes in the comment-free source of the parse
+       that made it (its sheet's, or its top-level rule's own when cssom.c
+       spliced that in), not terminated. The other ranges are offsets into text: the trimmed
        prelude (selector, key text, at-rule prelude), the block's contents
        between its braces, and the declarations the rule owns itself. */
     const char *text, *selector;
     const struct css_rule_import *import; /* @import only */
     void *native_rule;
+    /* A top-level rule of a CSSOM parse: what it put into the cascade AST's
+       lists, which css_cssom_splice takes out or puts in with the rule. */
+    struct css_rule_span *span;
     uint32_t text_len, type, id, child_count;
     uint32_t prelude_at, prelude_len, block_at, block_len, decls_at, decls_len;
+    uint32_t index;     /* cssom.c: its place among its parent's (or the sheet's) rules */
     bool block, closed; /* has a block; ended by its own '}' or ';', not by end of input */
     bool marker;        /* a nested declarations rule written as CSS_NESTED_DECLARATIONS_MARKER */
     bool exposed;       /* cssom.c: a CSSRule object stands for it */
@@ -1032,10 +1037,26 @@ sheet_t *css_parse_sheet_serviced(web_doc *d, arena_t *a, const char *css, size_
    nested-declarations markers at the sorted offsets markers holds. */
 sheet_t *css_parse_cssom_sheet(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url,
                                const uint32_t *markers, uint32_t nmarkers);
+/* A change to a CSSOM sheet's rules parses only the text of the top-level rule
+   it changes. css_parse_cssom_rules parses comment-free text as top-level rules
+   of sheet, in its context (its @namespace prefixes, its layer ids, never an
+   @import or @namespace), into sheet's arena: a sheet of its own the rules wait
+   in. css_cssom_splice then replaces top[at] (old; NULL: none) of the sheet's
+   top-level rules, the count of them before the change, by fresh's one rule
+   (NULL: none), its span in every list of the AST with them, and patches the
+   rule index of the AST when the rules come after all others (else drops it, to
+   be built again at the next cascade). false: the parse cannot be changed
+   rule by rule (rules in it stand in no top-level CSSOM rule's span). */
+sheet_t *css_parse_cssom_rules(web_doc *d, sheet_t *sheet, const char *css, size_t n, const char *base_url,
+                               const uint32_t *markers, uint32_t nmarkers);
+bool css_cssom_spliceable(const sheet_t *sheet);
+/* the index was dropped (its memory is the arena's garbage) */
+bool css_cssom_splice(web_doc *d, sheet_t *sheet, struct css_rule_info *const *top, uint32_t count, uint32_t at,
+                      struct css_rule_info *old, sheet_t *fresh);
 /* css as the parser reads it: comments out, NUL as U+FFFD (malloc; NULL: no memory).
    A parse of text that went through this has its rules at the same offsets. */
 char *css_preprocess(const char *css, size_t n, size_t *out_n);
-/* The comment-free source every css_rule_info text points into. */
+/* The comment-free source the parse's css_rule_info texts point into. */
 const char *css_sheet_source(const sheet_t *sheet, size_t *length);
 void css_sheet_scope(sheet_t *sheet, node_t *shadow_root);
 /* The arena the sheet was parsed into now lives at another address: the AST's
