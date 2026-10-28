@@ -8691,7 +8691,7 @@ static int64_t js_deadline(web_doc *d, int *why) {
         if(web_presentation_event_peek(d))DUE_NOW();
         if(s->languages_seen!=webprefs_languages_generation())DUE_NOW();
         if(web_idb_next(&s->indexed_db))DUE_NOW();
-        if(web_idb_waiting(&s->indexed_db)){
+        if(web_idb_needs_poll(&s->indexed_db)){
             uint64_t storage_due=now+8;
             EARLIER(storage_due, JD_INDEXED_DB);
         }
@@ -9141,13 +9141,13 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
        embedder; its own scripts are refused by sandbox_flags, not by
        retiring the realm. */
     const struct web_js_webidl_report *idl = web_js_webidl_last();
-    char limits[480];
+    char limits[560];
     snprintf(limits,sizeof limits,"JavaScript runtime: OS-allocated heap (no page quota), dynamically allocated timers; stack guard %u KiB, task budget %u ms; "
              "realm setup %llu ms (bindings: compiler wait %llu, read %llu, run %llu, of which Web IDL shapes %u ms: %u interfaces, %u members, "
-             "%u wrapped, %u readonly setters dropped, %u misplaced), heap +%zu KiB",
+             "%u wrapped, built-in shape %u native/%u prototype, %u readonly setters dropped, %u misplaced), heap +%zu KiB",
              JS_STACK_LIMIT/1024u,s->task_budget_ms,(unsigned long long)(uptime_ms()-initialized),
              (unsigned long long)bindings.wait_ms,(unsigned long long)bindings.read_ms,(unsigned long long)bindings.run_ms,
-             idl->milliseconds,idl->interfaces,idl->members,idl->wrapped,idl->setters_dropped,idl->misplaced,
+             idl->milliseconds,idl->interfaces,idl->members,idl->wrapped,idl->builtin_wrapped,idl->builtin_reprototyped,idl->setters_dropped,idl->misplaced,
              (s->runtime_owner->allocation.current>heap_before?s->runtime_owner->allocation.current-heap_before:0)/1024);
     log_text(s,WEB_CONSOLE_TRACE,limits);
     if (s->host.debug_js && (idl->misplaced || idl->setters_dropped)) {

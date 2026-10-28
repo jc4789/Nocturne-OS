@@ -12,9 +12,10 @@
    an enumerable method named for its identifier with the length of its shortest overload; an
    attribute is an enumerable accessor whose getter is "get <name>" of length 0 and whose
    setter, which only a writable, [Replaceable], [PutForwards] or [LegacyLenientSetter]
-   attribute has, is "set <name>" of length 1; a constant is a non-writable, non-configurable
-   property of both the interface object and its prototype; [Unscopable] members are listed in
-   the prototype's @@unscopables. The members of the realm's own [Global] interface are the
+   attribute has, is "set <name>" of length 1; each of those functions has the shape of a
+   built-in function (not a constructor, no "prototype", %Function.prototype% its prototype);
+   a constant is a non-writable, non-configurable property of both the interface object and
+   its prototype; [Unscopable] members are listed in the prototype's @@unscopables. The members of the realm's own [Global] interface are the
    global object's own properties.
 
    Behaviour stays where it is: a member the IDL names but the bindings lack stays missing, and
@@ -66,8 +67,10 @@ struct webidl_interface {
 
 enum role { ROLE_VALUE, ROLE_GET, ROLE_SET };
 /* A function this pass has named: one function object serving two members of different names
-   gets a function of its own for the second, which calls the first. */
-struct named { void *function; const struct webidl_member *member; enum role role; };
+   gets a function of its own for the second, which calls the first. shaped is the native
+   function that stands for it when it lacked the built-in shape (JS_UNDEFINED otherwise), so
+   every holder of the same member gets the same one. */
+struct named { void *function; const struct webidl_member *member; enum role role; JSValue shaped; };
 struct shaper {
     JSContext *ctx;
     JSValue global;
@@ -138,8 +141,18 @@ static const struct named *remember(struct shaper *s, void *function, const stru
         if (s->named[at].function == function) return &s->named[at];
         at = (at + 1) & (s->named_capacity - 1);
     }
-    s->named[at] = (struct named){function, m, role};
+    s->named[at] = (struct named){function, m, role, JS_UNDEFINED};
     s->named_count++;
+    return NULL;
+}
+
+static struct named *find_named(struct shaper *s, void *function) {
+    if (!s->named_capacity) return NULL;
+    size_t at = hash_pointer(function, s->named_capacity - 1);
+    while (s->named[at].function) {
+        if (s->named[at].function == function) return &s->named[at];
+        at = (at + 1) & (s->named_capacity - 1);
+    }
     return NULL;
 }
 
@@ -148,10 +161,32 @@ static JSValue delegate(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     return JS_Call(ctx, data[0], this_val, argc, argv);
 }
 
-/* function (owned) as the member's operation, getter or setter: named and of the IDL's length. */
+/* Web IDL makes an operation, and an attribute's getter and setter, with CreateBuiltinFunction:
+   not a constructor, no own "prototype", and %Function.prototype% as its [[Prototype]]. A
+   binding written as an ordinary function (constructible, with a prototype) is called through a
+   native function of that shape; an async or generator method keeps its body and gets the
+   [[Prototype]]. Whether f needs the native function, after giving it the [[Prototype]]. */
+static bool builtin_shape(struct shaper *s, JSValueConst f) {
+    JSContext *ctx = s->ctx;
+    int own = JS_GetOwnProperty(ctx, NULL, f, s->prototype);
+    if (own < 0) { forget_exception(ctx); own = 0; }
+    if (JS_IsConstructor(ctx, f) || own) return true;
+    JSValue proto = JS_GetPrototype(ctx, f);
+    if (JS_IsException(proto)) { forget_exception(ctx); return false; }
+    if (JS_VALUE_GET_PTR(proto) != JS_VALUE_GET_PTR(s->function_prototype)) {
+        if (JS_SetPrototype(ctx, f, s->function_prototype) < 0) forget_exception(ctx);
+        else s->report.builtin_reprototyped++;
+    }
+    JS_FreeValue(ctx, proto);
+    return false;
+}
+
+/* function (owned) as the member's operation, getter or setter: named, of the IDL's length, and
+   of the built-in shape. */
 static JSValue named_function(struct shaper *s, JSValue function, const struct webidl_member *m, enum role role, int length) {
     JSContext *ctx = s->ctx;
-    const struct named *earlier = remember(s, JS_VALUE_GET_PTR(function), m, role);
+    void *key = JS_VALUE_GET_PTR(function);
+    const struct named *earlier = remember(s, key, m, role);
     if (earlier && (earlier->role != role || strcmp(earlier->member->name, m->name)) &&
         !(m->flags & WEBIDL_SAME_AS_VALUES)) {
         JSValue own = JS_NewCFunctionData(ctx, delegate, length, 0, 1, &function);
@@ -160,7 +195,17 @@ static JSValue named_function(struct shaper *s, JSValue function, const struct w
         function = own;
         s->report.wrapped++;
     } else if (earlier) {
-        return function; /* named already */
+        if (JS_IsUndefined(earlier->shaped)) return function; /* named already */
+        JS_FreeValue(ctx, function);
+        return JS_DupValue(ctx, earlier->shaped);
+    } else if (builtin_shape(s, function)) {
+        JSValue own = JS_NewCFunctionData(ctx, delegate, length, 0, 1, &function);
+        JS_FreeValue(ctx, function);
+        if (JS_IsException(own)) return own;
+        function = own;
+        struct named *entry = find_named(s, key);
+        if (entry) entry->shaped = JS_DupValue(ctx, function);
+        s->report.builtin_wrapped++;
     }
     char text[96];
     snprintf(text, sizeof text, "%s%s", role == ROLE_GET ? "get " : role == ROLE_SET ? "set " : "", m->name);
@@ -437,6 +482,8 @@ static void shaper_close(struct shaper *s) {
     for (size_t k = 0; k < sizeof atoms / sizeof atoms[0]; k++) JS_FreeAtom(ctx, atoms[k]);
     JS_FreeValue(ctx, s->object_prototype); JS_FreeValue(ctx, s->function_prototype); JS_FreeValue(ctx, s->error_prototype);
     JS_FreeValue(ctx, s->global);
+    for (size_t k = 0; k < s->named_capacity; k++)
+        if (s->named[k].function) JS_FreeValue(ctx, s->named[k].shaped);
     free(s->named);
 }
 

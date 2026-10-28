@@ -1,5 +1,6 @@
 #pragma once
 #include <webidb.h>
+#include <nocturne.h>
 #include <stdbool.h>
 
 /* Browser-private, pointer-free native storage broker protocol. Only the
@@ -49,7 +50,11 @@ struct webidb_async_result {
     struct webidb_database *items;
     size_t item_count;
 };
-webidb_async *webidb_async_create(void);
+/* queue: the event queue whose wait this transport's results must end (the pumping thread's).
+ * While a sent command waits for its result, the channel is watched there (N_EVENT_RECEIVABLE,
+ * N_EVENT_CLOSED); the watch goes when the result is in, so an idle helper never wakes it.
+ * -1: none, and webidb_async_watched is false. */
+webidb_async *webidb_async_create(n_handle queue);
 /* Copies private input into owned queue storage; never opens the browser's data or waits
  * for helper/disk. Zero means allocation/representation/spawn failure. */
 uint32_t webidb_async_submit(webidb_async *,const struct webidb_async_request *);
@@ -59,6 +64,8 @@ bool webidb_async_take(webidb_async *,struct webidb_async_result *);
 bool webidb_async_pending(const webidb_async *);
 bool webidb_async_ready(const webidb_async *);
 bool webidb_async_failed(const webidb_async *);
+/* Whether the result of the command sent will end a wait on the queue given at create. */
+bool webidb_async_watched(const webidb_async *);
 void webidb_async_result_free(struct webidb_async_result *);
 /* Closes lanes and retires helper without a blocking wait. */
 void webidb_async_free(webidb_async *);

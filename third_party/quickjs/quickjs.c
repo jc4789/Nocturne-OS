@@ -42520,7 +42520,10 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
             return JS_NewStringLen(ctx, b->debug.source->text + b->debug.source_start,
                                    b->debug.source_len);
         }
-        func_kind = b->func_kind;
+        /* Nocturne: a function without its source is a platform binding (js.c compiles
+           only those with JS_STRIP_SOURCE), a built-in function object, whose string is
+           ECMA-262 NativeFunction syntax: no async or generator prefix. */
+        func_kind = JS_FUNC_NORMAL;
     }
     {
         JSValue name;

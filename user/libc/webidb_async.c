@@ -24,14 +24,16 @@ struct idb_packet {
 };
 struct webidb_async {
     struct webidb_async *next;
-    n_handle app, channel;
+    n_handle app, channel, queue;
+    uint64_t token; /* the channel's watch in queue, while a result is awaited */
     uint32_t serial;
-    bool failed, ready;
+    bool failed, ready, watched;
     struct idb_packet *first, *last;
     struct webidb_wire_result response;
     uint8_t *body;
 };
 static webidb_async *retired;
+#define WEBIDB_TOKEN (UINT64_C(0x49) << 56)
 
 static bool add_length(size_t *total,size_t add) {
     if(add>SIZE_MAX-*total)return false;
@@ -41,8 +43,15 @@ static void packet_free(struct idb_packet *p) {
     if(!p)return;
     free(p->body);free(p);
 }
+/* Only while a result is awaited: the channel is then empty or holds that result. */
+static void watch(webidb_async *db,bool on) {
+    if(on==db->watched||db->queue<0||db->channel<0)return;
+    if(on)db->watched=n_events_watch(db->queue,db->channel,N_EVENT_RECEIVABLE|N_EVENT_CLOSED,db->token)>=0;
+    else {n_events_unwatch(db->queue,db->token);db->watched=false;}
+}
 static void stop(webidb_async *db) {
     if(db->failed)return;
+    watch(db,false);
     db->failed=true;
     if(db->channel>=0)n_handle_close(db->channel);
     db->channel=-1;
@@ -77,10 +86,14 @@ static bool spawn_broker(webidb_async *db) {
     db->app=app;
     return true;
 }
-webidb_async *webidb_async_create(void) {
+webidb_async *webidb_async_create(n_handle queue) {
+    static uint64_t tokens;
     webidb_async_background();
     webidb_async *db=calloc(1,sizeof *db);
-    if(db)db->app=db->channel=-1;
+    if(db){
+        db->app=db->channel=-1;db->queue=queue;
+        db->token=WEBIDB_TOKEN|(++tokens&((UINT64_C(1)<<56)-1));
+    }
     return db;
 }
 uint32_t webidb_async_submit(webidb_async *db,const struct webidb_async_request *request) {
@@ -143,8 +156,10 @@ void webidb_async_pump(webidb_async *db) {
         if(n_channel_send(db->channel,p->body,sizeof p->command+p->length,-1)<0){stop(db);return;}
         p->sent=true;
     }
+    watch(db,true);
     n_result size=n_channel_receive(db->channel,NULL,0,N_CHANNEL_PEEK,NULL);
     if(size==-N_ERR_NOT_READY)return;
+    watch(db,false);
     struct webidb_wire_result *r=&db->response;
     uint8_t *bytes=size>=(n_result)sizeof *r?malloc((size_t)size):NULL;
     if(!bytes||n_channel_receive(db->channel,bytes,(size_t)size,0,NULL)!=size){free(bytes);stop(db);return;}
@@ -213,6 +228,7 @@ bool webidb_async_take(webidb_async *db,struct webidb_async_result *r) {
 bool webidb_async_pending(const webidb_async *db) {return db&&db->first;}
 bool webidb_async_ready(const webidb_async *db) {return db&&db->first&&(db->ready||db->failed);}
 bool webidb_async_failed(const webidb_async *db) {return db&&db->failed;}
+bool webidb_async_watched(const webidb_async *db) {return db&&db->watched;}
 void webidb_async_free(webidb_async *db) {
     if(!db)return;
     stop(db);

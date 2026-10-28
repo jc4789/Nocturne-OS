@@ -676,8 +676,9 @@ int main(int argc,char**argv){
         struct deferred *d=NULL;if(w.head){d=w.head;w.head=d->next;if(!w.head)w.tail=NULL;w.queued-=d->h.bytes;}
         else{
             w.until=UINT64_MAX;JSValue deadline=hook(&w,"deadline",0,NULL);int64_t due=-1;JS_ToInt64(w.ctx,&due,deadline);JS_FreeValue(w.ctx,deadline);uint64_t now=n_clock_uptime_ms();int64_t atomics_due=web_atomics_deadline(w.ctx,now);if(atomics_due>=0&&(due<0||atomics_due<due))due=atomics_due;int wait=JS_IsJobPending(w.rt)?0:due<0?-1:due<=(int64_t)now?0:due-(int64_t)now>INT_MAX?INT_MAX:(int)(due-(int64_t)now);
-            /* The storage broker is not in this queue: while it has requests, look again soon. */
-            if(web_idb_next(&w.indexed_db))wait=0;else if(web_idb_waiting(&w.indexed_db)&&(wait<0||wait>8))wait=8;
+            /* The storage broker's answer ends this wait (its channel is watched in the queue);
+               only a watch that could not be made has the loop look again soon. */
+            if(web_idb_next(&w.indexed_db))wait=0;else if(web_idb_needs_poll(&w.indexed_db)&&(wait<0||wait>8))wait=8;
             if(w.shared){d=shared_receive(&w,wait);if(w.closed&&!d)continue;}
             else{if(!dedicated_wait(&w,wait))break;if(w.output)output_flush(&w);if(w.output_failed)break;bool failed=false;d=receive(&w,&failed);if(failed)break;}
         }
