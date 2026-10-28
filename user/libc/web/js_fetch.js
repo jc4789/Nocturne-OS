@@ -331,6 +331,19 @@ const fetchBridge = (() => {
         abort(reason){abortSignal(slot(controllerSlots,this,'AbortController'),reason);}
     }
     abortHandlerTarget=(target,type)=>signalSlots.has(target)&&type==='abort';
+    // addEventListener's signal option: the listener's removal is one of the signal's abort
+    // algorithms, which run before its abort event (DOM "signal abort").
+    {
+        const setAdd=Set.prototype.add,setDelete=Set.prototype.delete;
+        abortSignals={
+            is:value=>apply(mapGet,signalSlots,[value])!==undefined,
+            aborted:signal=>apply(mapGet,signalSlots,[signal]).aborted,
+            follow(signal,steps){
+                const s=apply(mapGet,signalSlots,[signal]);apply(setAdd,s.algorithms,[steps]);
+                return ()=>apply(setDelete,s.algorithms,[steps]);
+            }
+        };
+    }
     installHandlers(AbortSignal.prototype,['abort']);
     function readInit(value) {
         const init=dictionary(value),out={};

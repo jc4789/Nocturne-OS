@@ -87,7 +87,18 @@
                 }catch(error){s.listenerException=true;report(error);}finally{s.passive=false;}
                 if(s.immediate)return;
             }
-            if(!capture){try{const fn=node['on'+type];if(typeof fn==='function'&&apply(fn,current,[event])===false&&s.cancelable)s.defaultPrevented=true;}catch(error){s.listenerException=true;report(error);}}
+            /* The handler, as HTML's event handler processing algorithm runs it: this is the
+               currentTarget; special error event handling (an ErrorEvent named error at this
+               global) passes the ErrorEvent's five values and cancels on true, otherwise false
+               cancels. It still runs after the listeners, not where it was first set. */
+            if(!capture){try{
+                const fn=node['on'+type];
+                if(typeof fn==='function'){
+                    const values=type==='error'&&current===globalThis?errorEventValues(event):null;
+                    const result=values!==null?apply(fn,current,[values.message,values.filename,values.lineno,values.colno,values.error]):apply(fn,current,[event]);
+                    if((values!==null?result===true:result===false)&&s.cancelable&&!s.passive)s.defaultPrevented=true;
+                }
+            }catch(error){s.listenerException=true;report(error);}}
         }
         try{
             for(let i=entries.length-1;i>0&&!s.stop;i--)visit(entries[i],true,entries[i].atTarget?2:1);

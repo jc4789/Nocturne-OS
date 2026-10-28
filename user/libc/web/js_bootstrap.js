@@ -28,10 +28,11 @@
     }
     const apply = Reflect.apply;
     const eventSlice = Array.prototype.slice, mouseAssign = Object.assign;
+    // Dispatch reads the listener lists through these, never through what a page can replace.
+    const mapGet=WeakMap.prototype.get,mapSet=WeakMap.prototype.set,mapDelete=WeakMap.prototype.delete,EventTypeError=TypeError;
     const listenerMap = new WeakMap(), inlineMap = new WeakMap();
     const inputWindow=globalThis;
     const handlerMap = new WeakMap();
-    const eventPaths = new WeakMap();
     let xhrHandlerTarget = () => false;
     let messageHandlerTarget = () => false;
     let svgHandlerTarget = () => false;
@@ -60,12 +61,42 @@
     const state = new WeakMap();
     /* @include js_collections.js */
     function list(a) { return collectionBridge.list(a); }
-    function options(o) { return typeof o === 'boolean' ? {capture:o} : (o || {}); }
     // HTML "report an exception" for what a callback threw (js.c report_exception): an ErrorEvent at
     // this global, then the console unless a listener canceled it. The native side reads only an own
     // stack data property, never a stack getter. errorReporting is the global's errors reporting
     // mode: an error listener's own exception goes to the console alone.
     function report(e) { host.reportException(e); }
+    // This Window's current event (DOM "Legacy extensions to the Window interface"): window.event.
+    let currentEvent;
+    /* The steps of DOM "inner invoke" (https://dom.spec.whatwg.org/#concept-event-listener-inner-invoke)
+       that belong to the realm of the listener's callback, run in that realm. This function is
+       the realm's port (js.c native_event_realm_init): a dispatch in any realm of the runtime
+       calls the port of the realm its listener's callback belongs to, which it learned when the
+       listener was added. Steps 2.9 and 2.10: save this Window's current event, and set it to
+       the event unless the invocation target is in a shadow tree (setCurrent). Step 2.13, Web
+       IDL "call a user object's operation" with "handleEvent": a function is called with the
+       event's currentTarget as this; any other object's handleEvent is got now, at every
+       dispatch, and called with the object as this. So the Get, the TypeError for a handleEvent
+       that is not callable and the call all happen in this realm. Step 2.13.1 reports what the
+       callback threw for this realm's global, while the current event is still set; step 2.15
+       restores it. The in passive listener flag (steps 2.11 and 2.14) is the dispatching
+       realm's, set around this call; step 2.12 (record timing info, Event Timing) is not
+       implemented. Returns whether the callback threw (step 2.13.2, the
+       legacyOutputDidListenersThrowFlag IndexedDB reads). */
+    function invokeListener(callback,thisArg,event,setCurrent) {
+        const saved=currentEvent;
+        if(setCurrent)currentEvent=event;
+        try {
+            if(typeof callback==='function')apply(callback,thisArg,[event]);
+            else {
+                const operation=callback.handleEvent;
+                if(typeof operation!=='function')throw new EventTypeError('The event listener has no callable handleEvent');
+                apply(operation,callback,[event]);
+            }
+            return false;
+        } catch(e) { report(e); return true; }
+        finally { currentEvent=saved; }
+    }
     let errorReporting=false;
     function reportException(error,message,filename,lineno,colno,muted) {
         if(errorReporting)return true;
@@ -77,7 +108,11 @@
             return dispatch(globalThis,event);
         } finally { errorReporting=false; }
     }
-    const eventStates=new WeakMap(),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set,eventDefine=Object.defineProperty;
+    /* Event state: one table for every realm of this runtime (js.c native_event_realm_init), so that
+       an Event made in one frame dispatches, and is read, in another (Web IDL brands an Event by its
+       interface, not its realm). */
+    const eventStates=host.eventRealmInit(invokeListener,new WeakMap()),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set,eventDefine=Object.defineProperty,
+        ownProperty=Object.prototype.hasOwnProperty;
     const eventFields=new Set(['type','target','srcElement','currentTarget','eventPhase','bubbles','cancelable','composed','defaultPrevented','isTrusted','timeStamp']);
     function eventState(event){const state=apply(eventGet,eventStates,[event]);if(!state)throw new TypeError('Illegal Event receiver');return state;}
     class Event {
@@ -86,7 +121,7 @@
             type=String(type);init=init==null?{}:Object(init);
             apply(eventSet,eventStates,[this,{type,bubbles:!!init.bubbles,cancelable:!!init.cancelable,composed:!!init.composed,
                 target:null,currentTarget:null,eventPhase:0,defaultPrevented:false,isTrusted:false,timeStamp:host.now(),
-                stop:false,immediate:false,passive:false,dispatching:false,initialized:true}]);
+                stop:false,immediate:false,passive:false,dispatching:false,initialized:true,listenerException:false,path:null}]);
             eventDefine(this,'isTrusted',{enumerable:true,get(){return eventState(this).isTrusted;}});
         }
         initEvent(type,bubbles=false,cancelable=false) {
@@ -99,7 +134,7 @@
         preventDefault() { const s=eventState(this);if(s.cancelable && !s.passive)s.defaultPrevented=true; }
         stopPropagation() { eventState(this).stop=true; }
         stopImmediatePropagation() { const s=eventState(this);s.stop=s.immediate=true; }
-        composedPath() { return apply(eventSlice,eventPaths.get(this)||[],[]); }
+        composedPath() { const path=eventState(this).path;return path?copyList(path):[]; }
         get cancelBubble() { return eventState(this).stop; }
         set cancelBubble(v) { if (v) this.stopPropagation(); }
         get returnValue() { return !eventState(this).defaultPrevented; }
@@ -124,7 +159,8 @@
         }
     }
     /* @include js_input_event.js */
-    const focusData=new WeakMap();
+    // A FocusEvent's relatedTarget lives in its Event state, where dispatch in any realm retargets it.
+    const focusEvents=new WeakSet();
     class FocusEvent extends UIEvent {
         constructor(type,init={}) {
             if(!arguments.length)throw new TypeError('FocusEvent requires type');
@@ -132,9 +168,10 @@
             const target=init.relatedTarget??null;
             if(target!==null && !(target instanceof EventTarget) && target!==globalThis)
                 throw new TypeError('Expected an EventTarget');
-            focusData.set(this,target);
+            eventDefine(eventState(this),'relatedTarget',{value:target,writable:true,enumerable:true,configurable:true});
+            focusEvents.add(this);
         }
-        get relatedTarget(){if(!focusData.has(this))throw new TypeError('Illegal FocusEvent receiver');return focusData.get(this);}
+        get relatedTarget(){if(!focusEvents.has(this))throw new TypeError('Illegal FocusEvent receiver');return eventState(this).relatedTarget;}
     }
     Object.defineProperty(FocusEvent.prototype,Symbol.toStringTag,{configurable:true,value:'FocusEvent'});
     Object.defineProperty(FocusEvent.prototype,'relatedTarget',Object.assign({},Object.getOwnPropertyDescriptor(FocusEvent.prototype,'relatedTarget'),{enumerable:true}));
@@ -172,26 +209,110 @@
         if(target===inputWindow)return host.inputListener(null,0);
         return rawDom.isNode(null,target)?host.inputListener(target,0):false;
     }
+    /* The event listener lists are read and changed with loops over own elements and the
+       captured WeakMap methods: a page that replaces Array.prototype methods, Array's species or
+       WeakMap.prototype must not change which listeners an event reaches. */
+    function copyList(a) {
+        const out=[];
+        for(let i=0;i<a.length;i++)out[i]=a[i];
+        return out;
+    }
+    function listenerList(target) { return apply(mapGet,listenerMap,[target]); }
+    function appendListener(target,entry) {
+        let a=listenerList(target);
+        if(!a)apply(mapSet,listenerMap,[target,a=[]]);
+        a[a.length]=entry;
+    }
+    // DOM "remove an event listener".
     function removeListener(target, entry) {
         if (entry.removed) return;
         entry.removed = true;
         nativeListenerChange(target,entry,-1);
-        const a = listenerMap.get(target), i = a ? a.indexOf(entry) : -1;
-        if (i >= 0) {
-            a.splice(i, 1);
-            if (!a.length) listenerMap.delete(target);
+        const a=listenerList(target);
+        if(a) {
+            let i=0;while(i<a.length && a[i]!==entry)i++;
+            if(i<a.length) {
+                for(;i+1<a.length;i++)a[i]=a[i+1];
+                a.length--;
+                if(!a.length)apply(mapDelete,listenerMap,[target]);
+            }
         }
-        if (entry.signal) entry.signal.removeEventListener('abort', entry.abort);
-        entry.signal = entry.abort = null;
+        if(entry.unfollow)entry.unfollow();
+        else if(entry.signal)entry.signal.removeEventListener('abort',entry.abort);
+        entry.signal=entry.abort=entry.unfollow=null;
+    }
+    /* AbortSignal, as js_fetch.js defines it: is(value), aborted(signal), and follow(signal, steps),
+       which adds abort steps (DOM "add an algorithm") and returns their removal. */
+    let abortSignals={is:()=>false,aborted:()=>false,follow:()=>null};
+    /* Another realm's AbortSignal: this realm cannot read its slots, so the listener follows its
+       abort event instead of its abort algorithms. */
+    function foreignSignal(value) {
+        if(value===null || typeof value!=='object')return false;
+        const port=host.eventRealm(value);
+        return port!==null && port!==invokeListener && typeof value.addEventListener==='function';
+    }
+    /* DOM "flatten more" (addEventListener, more) and "flatten" (removeEventListener): the
+       (AddEventListenerOptions or boolean) union. A non-object is the boolean capture; an object
+       is the dictionary, whose members are got once each in Web IDL order: capture, then once,
+       passive and signal. */
+    function flattenOptions(o,more) {
+        let capture=false,once=false,passive=null,signal=null;
+        if(o!==undefined && o!==null) {
+            if(typeof o!=='object' && typeof o!=='function')capture=!!o;
+            else {
+                capture=!!o.capture;
+                if(more) {
+                    once=!!o.once;
+                    const p=o.passive;if(p!==undefined)passive=!!p;
+                    const v=o.signal;
+                    if(v!==undefined) {
+                        if(!abortSignals.is(v) && !foreignSignal(v))throw new EventTypeError('The signal option must be an AbortSignal');
+                        signal=v;
+                    }
+                }
+            }
+        }
+        return {capture,once,passive,signal};
+    }
+    // Web IDL's EventListener? argument: null, undefined or an object, else a TypeError.
+    function listenerArgument(callback) {
+        if(callback===undefined || callback===null)return null;
+        if(typeof callback!=='object' && typeof callback!=='function')throw new EventTypeError('The event listener must be an object');
+        return callback;
+    }
+    /* DOM "add an event listener". The entry keeps the port of its callback's realm
+       (host.eventRealm), looked up here once: a callback's realm never changes, so a dispatch
+       pays nothing to find the realm whose current event and error reporting the listener
+       uses. */
+    function addListener(target,type,callback,o) {
+        handlerRecord(target,type); // parsed inline handlers precede later listeners
+        const signal=o.signal;
+        if(signal!==null && (abortSignals.is(signal)?abortSignals.aborted(signal):!!signal.aborted))return;
+        if(callback===null)return;
+        const a=listenerList(target);
+        if(a)for(let i=0;i<a.length;i++) {
+            const x=a[i];
+            if(x.type===type && x.callback===callback && x.capture===o.capture)return;
+        }
+        const x={type,callback,capture:o.capture,once:o.once,
+            passive:o.passive===null?defaultPassive(target,type):o.passive,removed:false,
+            signal:null,abort:null,unfollow:null,port:host.eventRealm(callback),handler:null};
+        nativeListenerChange(target,x,1);
+        appendListener(target,x);
+        if(signal!==null) {
+            x.signal=signal;x.abort=()=>removeListener(target,x);
+            if(abortSignals.is(signal))x.unfollow=abortSignals.follow(signal,x.abort);
+            else signal.addEventListener('abort',x.abort,{once:true});
+        }
     }
     function resetDocumentEvents(root) {
         // document.open removes listeners and handlers, not the old attributes.
         // Keep null handler records so retained old nodes cannot recompile them.
         const pending=[root,globalThis];
         while(pending.length) {
-            const target=pending.pop(),listeners=listenerMap.get(target);
+            const target=pending.pop(),listeners=listenerList(target);
             if(bodyWindowHandler(target,'load'))parsedBodyHandlers.add(target);
-            if(listeners)for(const entry of listeners.slice())removeListener(target,entry);
+            if(listeners){const copy=copyList(listeners);for(let i=0;i<copy.length;i++)removeListener(target,copy[i]);}
             const handlers=new Map();
             for(const type of globalHandlerTypes)if(handlerTarget(target,type))
                 handlers.set(type,{value:null,text:null,compiled:true,entry:null});
@@ -209,30 +330,17 @@
         pointerCaptureBridge.reset();
     }
     class EventTarget {
+        // The arguments are converted in order (type, callback, options) before any step runs.
         addEventListener(type, callback, init) {
-            if (callback == null) return;
-            if (typeof callback !== 'function' && typeof callback.handleEvent !== 'function') return;
-            type = String(type); const o = options(init);
-            handlerRecord(this,type); // parsed inline handlers precede later listeners
-            let a = listenerMap.get(this);
-            if (!a) listenerMap.set(this, a = []);
-            if (a.some(x => x.type === type && x.callback === callback && x.capture === !!o.capture)) return;
-            if (o.signal && o.signal.aborted) return;
-            const passive=o.passive;
-            const x = {type, callback, capture:!!o.capture, once:!!o.once,
-                passive:passive===undefined?defaultPassive(this,type):!!passive, removed:false, signal:null, abort:null};
-            nativeListenerChange(this,x,1);
-            a.push(x);
-            if (o.signal) {
-                x.signal = o.signal; x.abort = () => removeListener(this, x);
-                x.signal.addEventListener('abort', x.abort, {once:true});
-            }
+            type=`${type}`;callback=listenerArgument(callback);
+            addListener(this,type,callback,flattenOptions(init,true));
         }
         removeEventListener(type, callback, init) {
-            const a = listenerMap.get(this), capture = !!options(init).capture;
-            type = String(type);
-            if (a) for (const x of a) if (x.type === type && x.callback === callback && x.capture === capture) {
-                removeListener(this, x); break;
+            type=`${type}`;callback=listenerArgument(callback);
+            const capture=flattenOptions(init,false).capture,a=listenerList(this);
+            if(a)for(let i=0;i<a.length;i++) {
+                const x=a[i];
+                if(x.type===type && x.callback===callback && x.capture===capture){removeListener(this,x);break;}
             }
         }
         dispatchEvent(event) {
@@ -258,18 +366,46 @@
         bodyWindowBrands.set(target,body);return body;
     }
     function handlerOwner(target,type){return bodyWindowHandler(target,type)?rawDom.get(target,'eventHandlerWindow'):target;}
+    /* HTML "activate an event handler": one listener per handler, added once, whose callback
+       runs the event handler processing algorithm. Its passive is null, so add an event
+       listener gives it the default passive value. The HTML callback's realm is arbitrary;
+       here it is the realm of the handler's current value (handlerPort), so inner invoke's
+       check of the listener's global is also the processing algorithm's step 4, and window.event
+       and the report of what the handler threw belong to the handler's realm. */
     function activateHandler(target,type,r) {
         if(r.entry)return;
-        let a=listenerMap.get(target);if(!a)listenerMap.set(target,a=[]);
-        r.entry={type,capture:false,once:false,passive:false,removed:false,signal:null,abort:null,
-            callback(event){
-                const fn=handlerValue(target,type);if(typeof fn!=='function')return;
-                if(target===globalThis && type==='error' && event instanceof ErrorEvent){
-                    if(fn.call(target,event.message,event.filename,event.lineno,event.colno,event.error)===true)event.preventDefault();
-                }else if(fn.call(target,event)===false)event.preventDefault();
-            }};
+        r.entry={type,capture:false,once:false,passive:defaultPassive(target,type),removed:false,
+            signal:null,abort:null,unfollow:null,port:null,handler:r,
+            callback(event){processHandler(target,type,event);}};
         nativeListenerChange(target,r.entry,1);
-        a.push(r.entry);
+        appendListener(target,r.entry);
+    }
+    /* The port of a handler's value: set with the value when a script assigns an object, and
+       this realm's own for a handler compiled from its content attribute here (r.port undefined). */
+    function handlerPort(r) { return r.port===undefined?invokeListener:r.port; }
+    /* HTML "the event handler processing algorithm", steps 2, 3 and 5 to 7, for target's handler
+       named on+type; inner invoke did step 4 (handlerPort). The value is called with the event's
+       currentTarget as this. Special error event handling (an ErrorEvent named error at a
+       global) passes the ErrorEvent's five values, read from its private data, and cancels when
+       the handler returns true; otherwise returning false cancels. A Window's (and so a body's)
+       onbeforeunload is an OnBeforeUnloadEventHandler, whose result is converted to DOMString?
+       while this event is still the current event. Canceling is DOM "set the canceled flag":
+       it does nothing for a non-cancelable event or inside a passive listener. What the handler
+       throws propagates to invokeListener, which reports it. */
+    function processHandler(target,type,event) {
+        const fn=handlerValue(target,type);
+        if(typeof fn!=='function')return; // null, or an object that is not callable: nothing to invoke
+        const s=eventState(event),current=s.currentTarget;
+        const values=type==='error' && current===globalThis?errorEventValues(event):null;
+        let result=values!==null?apply(fn,current,[values.message,values.filename,values.lineno,values.colno,values.error]):
+            apply(fn,current,[event]);
+        if(type==='beforeunload' && current===globalThis) {
+            if(result!==undefined && result!==null)result=`${result}`;
+            return; // no BeforeUnloadEvent yet, and a DOMString? is never false
+        }
+        if(values!==null?result===true:result===false) {
+            if(s.cancelable && !s.passive)s.defaultPrevented=true;
+        }
     }
     function handlerRecord(target,type) {
         if(!handlerTarget(target,type))return null;
@@ -308,7 +444,10 @@
         if(owner!==target && owner!==globalThis)return host.windowHandler('set',target,type,value,text);
         target=owner;
         const r=handlerRecord(target,type);if(!r)throw new TypeError('Illegal event handler receiver');
-        r.value=typeof value==='function'?value:null;r.text=text;r.compiled=text===null;
+        // [LegacyTreatNonObjectAsNull]: any object is kept, callable or not; anything else is null.
+        const object=value!==null && (typeof value==='object' || typeof value==='function');
+        r.value=object?value:null;r.text=text;r.compiled=text===null;
+        r.port=object?host.eventRealm(value):undefined;
         if(r.value!==null || text!==null)activateHandler(target,type,r);
         else if(r.entry){removeListener(target,r.entry);r.entry=null;}
     }
@@ -326,7 +465,7 @@
             if(text===null)continue;
             let r=map.get(type);
             if(!r)map.set(type,r={value:null,text:null,compiled:true,entry:null});
-            r.value=null;r.text=text;r.compiled=false;
+            r.value=null;r.text=text;r.compiled=false;r.port=undefined;
             activateHandler(globalThis,type,r);
         }
     }
@@ -340,23 +479,60 @@
             get(){return handlerValue(this,type);},set(v){setHandler(this,type,v,null);}
         });
     }
-    function invoke(target, event, capture) {
-        const s=eventState(event);s.currentTarget=target;
-        handlerRecord(target,s.type);
-        const a = listenerMap.get(target);
-        if (a) for (const x of a.slice()) {
-            if (x.removed || x.capture !== capture || x.type !== s.type) continue;
-            if (x.once) removeListener(target, x);
-            s.passive=x.passive;
-            try {
-                if (typeof x.callback === 'function') x.callback.call(target,event);
-                else x.callback.handleEvent(event);
-            } catch (e) { s.listenerException=true;report(e); }
+    /* DOM "inner invoke" (https://dom.spec.whatwg.org/#concept-event-listener-inner-invoke), in
+       the realm that dispatches. Steps 2.1 to 2.8 are here; the realm part of steps 2.9 to 2.15
+       runs in the port of the listener's realm (invokeListener), with the in passive listener
+       flag set around it. The realm of a listener was found when it was added, so a listener
+       costs one host.eventActive (pointer reads for the target's and the listener's Documents,
+       asked anew for each listener because an earlier one can adopt the target or remove a
+       frame) and one call through its port. capture is the phase: true "capturing", false
+       "bubbling". inShadow is the path item's invocation-target-in-shadow-tree. Returns found. */
+    function innerInvoke(target,event,s,listeners,capture,inShadow) {
+        let found=false;
+        for(let i=0;i<listeners.length;i++) {
+            const x=listeners[i];
+            if(x.removed || x.type!==s.type)continue;
+            found=true;
+            if(x.capture!==capture)continue;
+            if(x.once)removeListener(target,x);
+            const port=x.handler?handlerPort(x.handler):x.port;
+            if(port===null || !host.eventActive(target,port===invokeListener?undefined:port))continue;
+            if(x.passive)s.passive=true;
+            const threw=port(x.callback,target,event,!inShadow);
             s.passive=false;
+            if(threw)s.listenerException=true;
             if(s.immediate)break;
         }
+        return found;
+    }
+    // DOM "invoke" step 10: the legacy types a trusted event also reaches when no listener has its type.
+    const legacyEventTypes={__proto__:null,animationend:'webkitAnimationEnd',animationiteration:'webkitAnimationIteration',
+        animationstart:'webkitAnimationStart',transitionend:'webkitTransitionEnd'};
+    /* DOM "invoke" (https://dom.spec.whatwg.org/#concept-event-listener-invoke) steps 7 to 10;
+       dispatch's visit did steps 1 to 6. The listeners are a clone of the list, so a listener
+       added during this invocation does not run in it, while a removed one is skipped by its
+       removed flag. */
+    function invoke(target, event, capture, inShadow) {
+        const s=eventState(event);s.currentTarget=target;
+        handlerRecord(target,s.type);
+        const a=listenerList(target);
+        if(a) { // a target without listeners finds none, under its type or a legacy one
+            const listeners=copyList(a);
+            const found=innerInvoke(target,event,s,listeners,capture,inShadow);
+            if(!found && s.isTrusted) {
+                const legacy=legacyEventTypes[s.type];
+                if(legacy!==undefined) {
+                    const original=s.type;s.type=legacy;
+                    try { innerInvoke(target,event,s,listeners,capture,inShadow); }
+                    finally { s.type=original; }
+                }
+            }
+        }
+        /* Not in DOM or HTML: an on<type> property or attribute for a type this realm has no
+           event handler for yet (its GlobalEventHandlers list is not complete) is still run as
+           one, at the end of the bubbling invocation, through the same steps as a handler. */
         if (!capture && !s.immediate && !handlerTarget(target,s.type)) {
-            let fn = target['on' + s.type];
+            let fn = target['on' + s.type],port;
             if (fn === undefined && target instanceof Node && target.nodeType === 1) {
                 const text = reflectedAttr(target,'on' + s.type);
                 if (text !== null && rawDom.get(target,'scripting')) {
@@ -367,12 +543,15 @@
                         try { x = {text, fn:host.inline(text)}; cache.set(s.type,x); }
                         catch (e) { s.listenerException=true;report(e); x = {text,fn:null}; cache.set(s.type,x); }
                     }
-                    fn = x.fn;
+                    fn = x.fn;port=invokeListener;
                 }
             }
             if (typeof fn === 'function') {
-                try { if (fn.call(target,event) === false) event.preventDefault(); }
-                catch (e) { s.listenerException=true;report(e); }
+                if(port===undefined)port=host.eventRealm(fn);
+                if(port!==null && host.eventActive(target,port===invokeListener?undefined:port)) {
+                    const handler=function(){const result=apply(fn,target,[event]);if(result===false && s.cancelable && !s.passive)s.defaultPrevented=true;};
+                    if(port(handler,target,event,!inShadow))s.listenerException=true;
+                }
             }
         }
     }
@@ -380,13 +559,19 @@
         const s=eventState(event);s.dispatching=true;s.target=target;
         try {
         const plan=snapshot && snapshot.entries?snapshot:shadowBridge.path(target,{type:s.type,composed:s.composed,relatedTarget:event.relatedTarget},snapshot),entries=plan.entries;
-        const hasRelated='relatedTarget' in event;
-        // Retarget the private FocusEvent slot, not its read-only IDL getter.
+        const hasRelated='relatedTarget' in event,relatedState=apply(ownProperty,s,['relatedTarget']);
+        // Retarget a FocusEvent's relatedTarget in its Event state, not through its read-only IDL getter.
         // Mouse events still use their existing internal writable field.
-        function related(value){if(focusData.has(event))focusData.set(event,value);else event.relatedTarget=value;}
+        function related(value){if(relatedState)s.relatedTarget=value;else event.relatedTarget=value;}
+        /* DOM "invoke" steps 1 to 6 for one path item: its shadow-adjusted target and
+           relatedTarget, the composed path it sees, and the phase. A path item is in a shadow
+           tree when its invocation target's root, snapshotted with the path, is a shadow root
+           (entry.scopes, js_shadow.js); a listener there does not set window.event. */
         function visit(entry,capture,phase){
             s.target=entry.target;if(hasRelated)related(entry.related);
-            eventPaths.set(event,entry.visible);s.eventPhase=phase;invoke(entry.node,event,capture);
+            s.path=entry.visible;s.eventPhase=phase;
+            const scopes=entry.scopes;
+            invoke(entry.node,event,capture,!!scopes && scopes.length>0);
         }
         for(let i=entries.length-1;i>0 && !s.stop;i--)visit(entries[i],true,entries[i].atTarget?2:1);
         if(entries.length && !s.stop){
@@ -398,10 +583,9 @@
         for(let i=1;i<entries.length && !s.stop;i++)
             if(s.bubbles || entries[i].atTarget)visit(entries[i],false,entries[i].atTarget?2:3);
         s.target=plan.finalTarget;if(hasRelated)related(plan.finalRelated);
-        eventPaths.delete(event);
         return !s.defaultPrevented;
         } finally {
-            eventPaths.delete(event);s.currentTarget=null;s.eventPhase=0;s.dispatching=s.passive=s.stop=s.immediate=false;
+            s.path=null;s.currentTarget=null;s.eventPhase=0;s.dispatching=s.passive=s.stop=s.immediate=false;
         }
     }
     class Node extends EventTarget {
@@ -1055,7 +1239,16 @@
         get outerWidth(){return host.windowSize(0);},set outerWidth(v){replace('outerWidth',v);},
         get outerHeight(){return host.windowSize(1);},set outerHeight(v){replace('outerHeight',v);},
         get screenX(){return 0;},set screenX(v){replace('screenX',v);},get screenLeft(){return 0;},set screenLeft(v){replace('screenLeft',v);},
-        get screenY(){return 0;},set screenY(v){replace('screenY',v);},get screenTop(){return 0;},set screenTop(v){replace('screenTop',v);}}));}
+        get screenY(){return 0;},set screenY(v){replace('screenY',v);},get screenTop(){return 0;},set screenTop(v){replace('screenTop',v);}}));
+     /* DOM "Legacy extensions to the Window interface": [Replaceable] readonly attribute
+        (Event or undefined) event, this Window's current event (invokeListener sets it). An
+        undefined this is this global; another receiver is not this Window. The setter is Web
+        IDL's [Replaceable] one: CreateDataPropertyOrThrow on the global. js_webidl.c gives the
+        accessors their IDL names and lengths. */
+     const windowReceiver=self=>{if(self!==undefined && self!==null && self!==globalThis)throw new EventTypeError('Illegal Window receiver');};
+     Object.defineProperties(globalThis,Object.getOwnPropertyDescriptors({
+        get event(){windowReceiver(this);return currentEvent;},
+        set event(v){windowReceiver(this);replace('event',v);}}));}
     Object.defineProperty(Document.prototype,'cookie',{get(){return this===document?host.cookie():'';},set(v){v=String(v);if(this===document)host.cookie(v);}});
     Object.defineProperties(globalThis,{
         scrollX:{get(){return host.scroll(0);}},pageXOffset:{get(){return host.scroll(0);}},
