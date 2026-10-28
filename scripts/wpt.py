@@ -13,8 +13,10 @@ which hands them to this script and returns the slot's next test. A slot whose t
 report in time, or whose browser ends, gets a new browser, and its test is recorded as
 EXTERNAL-TIMEOUT or CRASH.
 
-testharness.js and test262 tests only so far (--type): no reftests, and no testdriver backend (test_driver calls fail
-as unimplemented, as WPT's own testdriver.js does without a vendor's). For the https and h2 tests
+testharness.js and test262 tests only so far (--type): no reftests. The testdriver backend is
+tests/wpt/testdriver-vendor.js, served in place of WPT's empty one: the guest runner starts each browser with
+--wpt-automation, a test tool that lets test_driver.click, send_keys and action_sequence put their input into the
+browser's own input queue; every other test_driver call fails at once as unimplemented. For the https and h2 tests
 the test disk's system trusts WPT's certificate authority (tools/certs/cacert.pem, put in
 C:\\Nocturne\\Certificates); --no-https leaves them out.
 
@@ -386,6 +388,10 @@ def wptserve(wpt, out, multiplier, collector):
         routes = serve.get_route_builder(logger, [], config)
         routes.add_static([os.path.join(HARNESS, "testharnessreport.js")], {"timeout_multiplier": multiplier},
                           "text/javascript;charset=utf8", "/resources/testharnessreport.js",
+                          headers={"Cache-Control": "max-age=3600"})
+        # Empty format arguments: the file is sent as it is, with no %-formatting.
+        routes.add_static([os.path.join(HARNESS, "testdriver-vendor.js")], {},
+                          "text/javascript;charset=utf8", "/resources/testdriver-vendor.js",
                           headers={"Cache-Control": "max-age=3600"})
         routes.add_mount_point("/_nocturne/", os.path.join(HARNESS, "nocturne"))
         with stash.StashServer(("127.0.0.1", 0), authkey=str(uuid.uuid4())):
