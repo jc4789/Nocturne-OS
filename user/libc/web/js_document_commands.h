@@ -51,11 +51,17 @@ static JSValue document_command_dom(struct web_js_state *s,node_t *document,int 
         if(on<0)result=JS_EXCEPTION;
         else if(d&&d->root==document&&d->design_mode!=(on>0)){d->design_mode=on>0;css_mark_dirty(d,d->root);d->dirty=true;}
     }else if(!strcmp(mode,"color")){
-        /* The value as getComputedStyle() serializes the color, or null: not a
-           color, or currentcolor, which has no value of its own. */
-        uint32_t color=0;
-        if(!css_color(command,command_len,&color)||color==COLOR_CURRENT)result=JS_NULL;
-        else{char text[64];computed_color_text(text,sizeof text,color);result=JS_NewString(ctx,text);}
+        /* The value as getComputedStyle() serializes the color (color.c, the
+           exact used colour, not its 8 bits), or null: not a color, or one
+           that names currentcolor, which has no value of its own. */
+        uint32_t color=0;struct css_color used;
+        if(!css_color(command,command_len,&color)||color==COLOR_CURRENT||
+           !css_color_parse_used(command,command_len,NULL,NULL,&used))result=JS_NULL;
+        else{
+            sbuf text={0};css_color_serialize(&used,false,&text);
+            result=text.p?JS_NewStringLen(ctx,text.p,text.n):JS_ThrowOutOfMemory(ctx);
+            sb_free(&text);
+        }
     }else if(!strcmp(mode,"fontKeywords")){
         result=JS_NewArray(ctx);
         for(unsigned i=0;i<8&&!JS_IsException(result);i++)

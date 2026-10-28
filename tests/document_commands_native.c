@@ -31,8 +31,13 @@ static JSValue custom_element_hook(struct web_js_state *s,const char *name,int a
 /* The CSS answers js_document_commands.h gives the editing layer; this fixture's
    commands do not reach them but for the font keyword sizes. */
 #define COLOR_CURRENT 0x00FFFFFEu
+typedef struct sbuf {char *p;size_t n,cap;} sbuf;
+struct css_color {double c[3],alpha;};
+typedef struct style style_t;
 static bool css_color(const char *s,size_t n,uint32_t *out){(void)s;(void)n;(void)out;return false;}
-static void computed_color_text(char *out,size_t capacity,uint32_t color){snprintf(out,capacity,"rgb(%u, %u, %u)",(color>>16)&255,(color>>8)&255,color&255);}
+static bool css_color_parse_used(const char *s,size_t n,const style_t *(*element)(void *),void *context,struct css_color *out){(void)s;(void)n;(void)element;(void)context;(void)out;return false;}
+static bool css_color_serialize(const struct css_color *c,bool html,sbuf *out){(void)c;(void)html;(void)out;return false;}
+static void sb_free(sbuf *b){free(b->p);b->p=NULL;b->n=b->cap=0;}
 static float css_font_keyword_px(unsigned keyword){static const float px[]={9,10,13,16,18,24,32,48};return px[keyword<8?keyword:3];}
 static void css_mark_dirty(web_doc *d,node_t *n){(void)d;(void)n;}
 #include "user/libc/web/js_document_commands.h"
