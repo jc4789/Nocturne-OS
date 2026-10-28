@@ -22,9 +22,6 @@ int html_policy_embedder(const char *headers);
 /* Cross-Origin-Opener-Policy: same-origin, the opener policy that isolates
  * a top-level browsing context group. */
 bool html_policy_opener_isolated(const char *headers);
-/* Potentially trustworthy URL for secure-context gated policy: https, file,
- * and loopback http. */
-bool html_policy_trustworthy(const char *url);
 /* Document creation: COEP is the response's own, or the creator's for local
  * documents; isolation requires a trustworthy isolated top-level document
  * and, in frames, a same-origin isolated parent with its own COEP. */

@@ -12,7 +12,7 @@ code=prefix+css+'\n#define NANOSVG_IMPLEMENTATION\n#include "nanosvg.h"\n'+(root
 cc=root/'tools/msys64/ucrt64/bin/clang.exe';env=dict(os.environ,PATH=str(cc.parent)+os.pathsep+os.environ.get('PATH',''))
 abi=root/'build/goal-20261009/svg-paint27-new-once/host-abi'
 exe=out/'native.exe'
-r=subprocess.run([str(cc),'-std=gnu11','-O1','-ffunction-sections','-fdata-sections','-Wl,--gc-sections','-I'+str(abi),'-Iuser/include','-Icommon','-Iuser/libc/web','-Ithird_party/img',str(out/'native.c'),'user/libc/web/cssprop.c','user/libc/web/shape.c','user/libc/web/color.c','user/libc/web/util.c','user/libc/web/html.c',str(root/'build/goal-20261009/svg-paint27-new-once/url.c'),'-o',str(exe)],cwd=root,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace')
+r=subprocess.run([str(cc),'-std=gnu11','-O1','-ffunction-sections','-fdata-sections','-Wl,--gc-sections','-I'+str(abi),'-Iuser/include','-Icommon','-Iuser/libc/web','-Ithird_party/img',str(out/'native.c'),'user/libc/web/cssprop.c','user/libc/web/shape.c','user/libc/web/color.c','user/libc/web/cssmath.c','user/libc/web/util.c','user/libc/web/html.c',str(root/'build/goal-20261009/svg-paint27-new-once/url.c'),'-o',str(exe)],cwd=root,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace')
 (out/'compile-original.log').write_text(r.stdout+r.stderr,encoding='utf-8');print('compile',r.returncode,flush=True)
 if r.returncode: print((r.stdout+r.stderr)[-4000:]);raise SystemExit(r.returncode)
 (out/'runtime-started.json').write_text('{}',encoding='utf-8')

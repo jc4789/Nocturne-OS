@@ -564,7 +564,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
         !q->body_len || q->credentials!=WEBNET_CREDENTIALS_SAME_ORIGIN || !q->redirect_error ||
         q->user_navigation || q->force_preflight || q->same_origin || q->no_cors || q->no_referrer ||
         q->keepalive || q->image_upgrade || q->cache_mode!=WEBNET_CACHE_DEFAULT ||
-        (strncasecmp(q->url,"http://",7)&&strncasecmp(q->url,"https://",8))))return 0;
+        (!web_url_has_scheme(q->url,"http")&&!web_url_has_scheme(q->url,"https"))))return 0;
     /* Fetch Standard's inflight keepalive body bound, per fetch group. Queued
        and active requests both count; explicit aborted requests are done. */
     if (q->keepalive) {
@@ -615,14 +615,15 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     r->tx = tx;
     r->cookie_site = strdup(top_level_url);r->cookie_origin=strdup(origin);
     if (!r->cookie_site||!r->cookie_origin) { request_free(r); return 0; }
-    struct url_owned destination={0};
-    if(url_parse_owned(q->url,&destination)){
+    /* The connection a request goes over: the scheme, port and host of its URL's record. */
+    struct http_target destination;
+    enum web_url_result target=http_target_of(q->url,&destination);
+    if(target==WEB_URL_OOM){request_free(r);return 0;}
+    if(target==WEB_URL_TUPLE){
         size_t host_length=strlen(destination.host);
-        if(host_length>SIZE_MAX-32){url_owned_free(&destination);request_free(r);return 0;}
-        r->transport_origin=malloc(host_length+32);
+        r->transport_origin=host_length<=SIZE_MAX-32?malloc(host_length+32):NULL;
         if(r->transport_origin)snprintf(r->transport_origin,host_length+32,"%u:%u:%s",destination.tls,destination.port,destination.host);
-        if(r->transport_origin)for(char *c=r->transport_origin;*c;c++)if(*c>='A'&&*c<='Z')*c+=32;
-        url_owned_free(&destination);
+        http_target_free(&destination);
         if(!r->transport_origin){request_free(r);return 0;}
     }
     /* Origin bookkeeping is not admission policy. Native local navigation
@@ -791,8 +792,8 @@ uint64_t webnet_socket_open(webnet *n, const struct webnet_request *q, webnet_so
         q->keepalive || q->stream_response || q->image_upgrade || q->cache_mode != WEBNET_CACHE_DEFAULT ||
         q->destination != WEBNET_DEST_EMPTY || q->user_activation || q->browser_ui ||
         q->credentials < WEBNET_CREDENTIALS_OMIT || q->credentials > WEBNET_CREDENTIALS_INCLUDE) return 0;
-    bool secure = !strncasecmp(q->url, "wss://", 6);
-    if (!secure && strncasecmp(q->url, "ws://", 5)) return 0;
+    bool secure = web_url_has_scheme(q->url, "wss");
+    if (!secure && !web_url_has_scheme(q->url, "ws")) return 0;
     const char *headers = q->headers ? q->headers : "";
     if (*headers && (strncasecmp(headers, "Sec-WebSocket-Protocol: ", 24) || strstr(headers, "\r\n") != headers + strlen(headers) - 2)) return 0;
     if (service_start(n) < 0) return 0;
@@ -801,10 +802,10 @@ uint64_t webnet_socket_open(webnet *n, const struct webnet_request *q, webnet_so
     struct wsock *s = calloc(1, sizeof *s);
     if (!s) return 0;
     s->channel = -1;
-    size_t rest = strlen(q->url) - (secure ? 6 : 5);
-    s->cookie_url = malloc(rest + 9);
+    /* The cookies of the handshake are those of its URL with the scheme http for ws and https
+       for wss (the URL Standard's protocol setter, as webfetch's handshake sets it). */
+    web_url_change(q->url, WEB_URL_PROTOCOL, secure ? "https" : "http", &s->cookie_url);
     s->cookie_site = strdup(q->top_level_url ? q->top_level_url : q->origin ? q->origin : "");
-    if (s->cookie_url) snprintf(s->cookie_url, rest + 9, "%s://%s", secure ? "https" : "http", q->url + (secure ? 6 : 5));
     /* The opening handshake is a fetch (WebSockets "establish a WebSocket connection"). */
     char language[WEBNET_WIRE_ACCEPT_LANGUAGE_MAX + 1];
     request_language(language);
@@ -937,8 +938,8 @@ static bool cookie_events_inner(webnet *n, struct request *r, struct cookie_scra
             free(work->url);work->url=url;memcpy(url,p,e.url_len);url[e.url_len]=0;
             if (r->credentials == WEBNET_CREDENTIALS_OMIT) return false;
             if (r->credentials == WEBNET_CREDENTIALS_SAME_ORIGIN) {
-                char *origin=NULL;enum http_url_result parsed=http_origin_owned(url,&origin);
-                bool same=parsed==HTTP_URL_TUPLE&&work->site_origin&&!strcmp(origin,work->site_origin);
+                char *origin=NULL;enum web_url_result parsed=web_url_origin(url,&origin);
+                bool same=parsed==WEB_URL_TUPLE&&work->site_origin&&!strcmp(origin,work->site_origin);
                 free(origin);if(!same)return false;
             }
             if (pass) {
@@ -954,7 +955,7 @@ static bool cookie_events(webnet *n, struct request *r) {
     if (!r->head.cookie_len) return true;
     struct cookie_scratch *work = calloc(1,sizeof *work);
     if (!work) return false;
-    bool ok=r->credentials!=WEBNET_CREDENTIALS_SAME_ORIGIN||http_origin_owned(r->cookie_origin,&work->site_origin)==HTTP_URL_TUPLE;
+    bool ok=r->credentials!=WEBNET_CREDENTIALS_SAME_ORIGIN||web_url_origin(r->cookie_origin,&work->site_origin)==WEB_URL_TUPLE;
     if(ok)ok = cookie_events_inner(n, r, work);
     free(work->url);free(work->site_origin);
     free(work);
@@ -1173,8 +1174,8 @@ static bool unpack(struct request *r) {
     if (!webnet_wire_payload_size(h, &wire_len)) return false;
     /* A successful retained upgrade-class request from HTTPS cannot publish
        an insecure final response, even if a worker violates the hop policy. */
-    if (r->image_upgrade && !strncasecmp(r->cookie_origin, "https://", 8) && h->status &&
-        (h->url_len < 8 || strncasecmp((const char *)r->rx, "https://", 8))) return false;
+    if (r->image_upgrade && web_url_has_scheme(r->cookie_origin, "https") && h->status &&
+        (h->url_len < 6 || memcmp(r->rx, "https:", 6))) return false;
     unsigned char *out = malloc(wire_len + 4);
     if (!out) return false;
     size_t sizes[4] = {h->url_len, h->headers_len, h->body_len, h->error_len};

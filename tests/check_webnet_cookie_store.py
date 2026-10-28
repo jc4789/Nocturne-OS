@@ -10,6 +10,7 @@ from pathlib import Path
 import hashlib
 import os
 import subprocess
+import url_owner
 
 root = Path(__file__).resolve().parent.parent
 out = root / 'build/webnet-cookie-store-host'
@@ -27,18 +28,21 @@ cut = (part('#define WEBNET_COOKIE_TOKEN', '/* A WebSocket') +
        part('long webnet_cookie_sites(', 'long webnet_cookie_get(webnet *n,'))
 (out / 'store.inc').write_bytes(cut.encode('utf-8'))
 
-cc = root / 'tools/msys64/ucrt64/bin/clang.exe'
+cc = url_owner.clang(root)
 env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get('PATH', ''))
 log = out / 'result.log'
 exe = out / 'webnet_cookie_store.exe'
 sources = ['tests/webnet_cookie_store_host.c', 'user/libc/webcookie.c']
+# The jar reads each URL from its record: the URL parser's own objects (tests/url_owner.py).
+owner = url_owner.objects(root, cc)
 with log.open('w', encoding='utf-8') as stream:
-    for name in sources + ['user/libc/webnet.c', 'user/include/webcookie.h', 'tests/check_webnet_cookie_store.py']:
+    for name in sources + ['user/libc/webnet.c', 'user/include/webcookie.h', 'user/include/weburl.h',
+                           'user/libc/web/web_url.c', 'tests/check_webnet_cookie_store.py']:
         stream.write(name + ' SHA256 ' + hashlib.sha256((root / name).read_bytes()).hexdigest() + '\n')
     stream.flush()
     subprocess.run([str(cc), '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Wno-unused-parameter', '-Wno-sign-compare', '-Wno-unused-function',
                     '-fsanitize=undefined', '-fsanitize-trap=undefined', '-iquote', str(out),
-                    '-idirafter', 'user/include', '-idirafter', 'common'] + sources + ['-o', str(exe)],
+                    '-idirafter', 'user/include', '-idirafter', 'common'] + sources + owner + ['-o', str(exe)],
                    cwd=root, env=env, check=True, stdout=stream, stderr=subprocess.STDOUT)
     result = subprocess.run([str(exe), 'rootfs/Nocturne/Web/public_suffix_list.dat'], cwd=root, env=env, timeout=60,
                             stdout=stream, stderr=subprocess.STDOUT)

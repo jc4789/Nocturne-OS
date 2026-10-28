@@ -349,6 +349,13 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     uint64_t resolve_started=0,tls_started=0;
     if(timing){memset(timing,0,sizeof *timing);timing->phase=HTTP_PHASE_RESOLVE;resolve_started=uptime_ms();}
     if(cancelled&&cancelled(cancel_ctx)){errno=ECANCELED;snprintf(err,errlen,"request cancelled");return NULL;}
+    /* host is a URL's host serialized (http.c's http_target): an IPv6 address comes in brackets,
+       and the network stack (SYS_NET_*) has IPv4 only. */
+    if (host && host[0] == '[') {
+        if(timing)timing->resolve_ms=0;
+        errno=N_ERR_UNSUPPORTED;snprintf(err, errlen, "%s: the network has no IPv6", host);
+        return NULL;
+    }
     if (!net_wait_up(5000)) {
         if(timing)timing->resolve_ms=uptime_ms()-resolve_started;
         errno=N_ERR_NETWORK_DOWN;snprintf(err, errlen, "network is down");

@@ -324,6 +324,16 @@ struct pctx {
     /* the selector being parsed: a forgiving list kept an invalid item; it
        holds syntax this engine accepts but never matches */
     bool forgiven, unsupported;
+    /* CSSOM parses record the whole rule tree. cssom_parent is the rule
+       being filled; cssom_implicit marks a nested group rule's block, whose
+       declarations are nested declarations rather than a style rule's own. */
+    bool cssom_tree, cssom_implicit, imports_seen;
+    struct css_rule_info *cssom_parent;
+    struct cssom_run *cssom_run; /* the declaration run of cssom_parent's block */
+    /* cssom.c's nested-declarations markers: sorted offsets into cssom_text */
+    const char *cssom_text;
+    const uint32_t *cssom_markers;
+    uint32_t cssom_nmarkers;
 };
 
 /* ---------------------------------------------------------------- scanning */
@@ -1777,66 +1787,21 @@ void css_rule_selector_serialize(const struct css_rule_info *info, sbuf *out) {
     const struct rule *r = info ? info->native_rule : NULL;
     if (r && r->sel) ser_list(out, r->sel);
 }
-/* where a style rule's text has its block (the parser's own scan) */
-static const char *rule_block(const char *text, size_t length) {
-    const char *s = skip_ws(text, text + length);
-    return scan_to(s, text + length, "{;}");
-}
-/* CSSOM "serialize a CSS rule": a style rule's selectors as serialized, then its
-   block as written; an @namespace rule from its prefix and URI; any other rule
-   as written */
-void css_rule_text_serialize(const struct css_rule_info *info, sbuf *out) {
-    if (info->type == 1 && info->native_rule) {
-        const char *block = rule_block(info->text, info->text_len);
-        css_rule_selector_serialize(info, out);
-        sb_putc(out, ' ');
-        sb_put(out, block, (size_t)(info->text + info->text_len - block));
-        return;
-    }
-    if (info->type == 10) {
-        arena_t a = {0};
-        jmp_buf trap;
-        a.trap = &trap;
-        const char *prefix, *uri;
-        if (!setjmp(trap) && css_namespace_rule(&a, info->text, info->text_len, &prefix, &uri)) {
-            sb_puts(out, "@namespace ");
-            if (prefix) { ser_ident(out, prefix); sb_putc(out, ' '); }
-            sb_puts(out, "url(");
-            ser_string(out, uri ? uri : "");
-            sb_puts(out, ");");
-            ar_free(&a);
-            return;
-        }
-        ar_free(&a);
-    }
-    sb_put(out, info->text, info->text_len);
-}
-/* CSSOM selectorText's setter: the style rule's text with the selectors parsed
-   from [selector, +length) in the namespaces of sheet (NULL: a removed rule's,
-   none), serialized, and its block as it was; NULL when they do not parse.
-   *selector_out gets the serialized selectors alone. Both are malloc'd. */
-char *css_rule_with_selector(const sheet_t *sheet, const struct css_rule_info *info, const char *selector,
-                             size_t length, size_t *out_length, char **selector_out) {
-    *selector_out = NULL;
-    if (!info || info->type != 1) return NULL;
+/* selectorText's setter: the selectors of [selector, +length) parsed in the
+   namespaces of sheet (NULL: none) and serialized; false when they do not parse */
+bool css_selectors_serialize(const sheet_t *sheet, const char *selector, size_t length, sbuf *out) {
     arena_t a = {0};
     jmp_buf trap;
     a.trap = &trap;
-    if (setjmp(trap)) { ar_free(&a); return NULL; } /* the parse's scratch ran out */
+    if (setjmp(trap)) { ar_free(&a); return false; } /* the parse's scratch ran out */
     struct pctx pc = {.a = &a, .sh = (sheet_t *)sheet};
     struct sellist *l = selector_list_parse(&pc, selector, selector + length);
-    if (!l) { ar_free(&a); return NULL; }
-    sbuf names = {0}, b = {0};
-    ser_list(&names, l);
+    if (l) ser_list(out, l);
     ar_free(&a);
-    const char *block = rule_block(info->text, info->text_len);
-    sb_put(&b, names.p ? names.p : "", names.n);
-    sb_putc(&b, ' ');
-    sb_put(&b, block, (size_t)(info->text + info->text_len - block));
-    *out_length = b.n;
-    *selector_out = sb_cstr(&names);
-    return sb_cstr(&b);
+    return l != NULL;
 }
+void css_serialize_ident(sbuf *out, const char *name) { ser_ident(out, name); }
+void css_serialize_string(sbuf *out, const char *text) { ser_string(out, text); }
 
 /* ---------------------------------------------------------------- the ancestor filter
    A Bloom filter over the ids, classes and type names of an element's
@@ -2784,6 +2749,308 @@ bool css_valid_declaration(const char *property,size_t pn,const char *value,size
     return declaration_parse(property,pn,value,vn,false);
 }
 
+/* FNV-1a, for the rule index's tables and a declaration block's names */
+static uint32_t hash_str(const char *s) {
+    uint32_t h = 2166136261u;
+    for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
+    return h;
+}
+static char *strip_comments(arena_t *a, const char *css, size_t n, size_t *out_n);
+char *css_preprocess(const char *css, size_t n, size_t *out_n) {
+    arena_t a = {0};
+    jmp_buf trap;
+    a.trap = &trap;
+    if (setjmp(trap)) { ar_free(&a); return NULL; }
+    size_t length;
+    char *stripped = strip_comments(&a, css, n, &length), *copy = malloc(length + 1);
+    if (copy) { memcpy(copy, stripped, length + 1); *out_n = length; }
+    ar_free(&a);
+    return copy;
+}
+
+/* ---- CSSOM declaration blocks as text. An element's style attribute and a
+   rule's declarations (cssom.c) are read, set and serialized through these. */
+/* the first wanted at depth 0 in [p, end): quoted strings, comments, escapes and
+   ()[]{} do not split a declaration */
+static const char *decl_separator(const char *p, const char *end, int wanted) {
+    int quote = 0, depth = 0;
+    while (p < end) {
+        int c = (unsigned char)*p;
+        if (c == '\\' && p + 1 < end) { p += 2; continue; }
+        if (quote) { if (c == quote) quote = 0; }
+        else if (c == '\'' || c == '"') quote = c;
+        else if (c == '/' && p + 1 < end && p[1] == '*') { p += 2; while (p + 1 < end && !(p[0] == '*' && p[1] == '/')) p++; if (p + 1 < end) p += 2; continue; }
+        else if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']' || c == '}') { if (depth) depth--; }
+        else if (!depth && c == wanted) return p;
+        p++;
+    }
+    return end;
+}
+static bool decl_property_equal(const char *begin, const char *end, const char *property) {
+    while (begin < end && is_space((unsigned char)*begin)) begin++;
+    while (end > begin && is_space((unsigned char)end[-1])) end--;
+    size_t n = (size_t)(end - begin);
+    return strlen(property) == n && (!strncmp(property, "--", 2) ? !strncmp(begin, property, n) : !strncasecmp(begin, property, n));
+}
+static const char *decl_ws(const char *p, const char *end) {
+    for (;;) {
+        while (p < end && is_space((unsigned char)*p)) p++;
+        if (end - p < 2 || p[0] != '/' || p[1] != '*') return p;
+        p += 2;
+        while (end - p >= 2 && !(p[0] == '*' && p[1] == '/')) p++;
+        if (end - p < 2) return end;
+        p += 2;
+    }
+}
+/* Priority is not part of the CSSOM value. Do not split quoted strings,
+   functions or custom-property token streams at a nested exclamation mark. */
+static bool decl_priority(const char *begin, const char **end) {
+    const char *bang = decl_separator(begin, *end, '!');
+    if (bang == *end) return false;
+    const char *p = decl_ws(bang + 1, *end);
+    if (*end - p < 9 || strncasecmp(p, "important", 9) ||
+        decl_ws(p + 9, *end) != *end) return false;
+    *end = bang;
+    while (*end > begin && is_space((unsigned char)(*end)[-1])) (*end)--;
+    return true;
+}
+void css_decl_value(const char *property, const char *begin, size_t n, sbuf *out) {
+    const char *end = begin + n;
+    if(!strcasecmp(property,"border-radius")||!strcasecmp(property,"border-top-left-radius")||!strcasecmp(property,"border-top-right-radius")||
+       !strcasecmp(property,"border-bottom-right-radius")||!strcasecmp(property,"border-bottom-left-radius")) {
+        sbuf text={0};
+        if(css_radius_specified(property,begin,n,&text)){sb_put(out,text.p?text.p:"",text.n);sb_free(&text);return;}
+        sb_free(&text);
+    }
+    {
+        sbuf text={0}; /* colours and color-scheme; CSS-wide keywords and var() stay authored */
+        if(css_specified_longhand(property,begin,n,&text)){sb_put(out,text.p?text.p:"",text.n);sb_free(&text);return;}
+        sb_free(&text);
+    }
+    if (!strcasecmp(property,"box-shadow")) {
+        sbuf serialized={0};
+        if (css_shadow_specified(begin,n,&serialized)) {
+            sb_put(out,serialized.p?serialized.p:"",serialized.n);
+            sb_free(&serialized);return;
+        }
+        sb_free(&serialized); /* CSS-wide keywords / unresolved var() stay authored. */
+    }
+    /* Normalize supported numeric opacity, not arbitrary/custom values.
+       Preserve var()/calc() token streams unchanged. */
+    if (!strcasecmp(property, "opacity") && end - begin > 0 && end - begin < 64) {
+        const char *p = begin, *number_end = end;
+        bool percent = end[-1] == '%';
+        if (percent) number_end--;
+        if (p < number_end && (*p == '+' || *p == '-')) p++;
+        const char *digits = p;
+        while (p < number_end && *p >= '0' && *p <= '9') p++;
+        bool any = p > digits;
+        if (p < number_end && *p == '.') {
+            p++; digits = p;
+            while (p < number_end && *p >= '0' && *p <= '9') p++;
+            any = p > digits;
+        }
+        if (any && p < number_end && (*p == 'e' || *p == 'E')) {
+            p++; if (p < number_end && (*p == '+' || *p == '-')) p++;
+            digits = p;
+            while (p < number_end && *p >= '0' && *p <= '9') p++;
+            any = p > digits;
+        }
+        if (any && p == number_end) {
+            char number[64], result[64];
+            memcpy(number, begin, (size_t)(number_end - begin));
+            number[number_end - begin] = 0;
+            double value = strtod(number, NULL);
+            if (isfinite(value) && fabs(value) < 1e12) {
+                if (fabs(value) < .0000005) value = 0;
+                int len = snprintf(result, sizeof result, "%.6f", value);
+                if (len > 0 && (size_t)len < sizeof result) {
+                    while (len && result[len-1] == '0') len--;
+                    if (len && result[len-1] == '.') len--;
+                    if (percent) result[len++] = '%';
+                    sb_put(out, result, (size_t)len);
+                    return;
+                }
+            }
+        }
+    }
+    sb_put(out, begin, n);
+}
+bool css_decl_find(const char *css, size_t n, const char *property, const char **value, size_t *value_n, bool *important) {
+    const char *found = NULL, *found_end = NULL, *end = css + n;
+    bool found_important = false;
+    for (const char *p = css; p < end;) {
+        const char *e = decl_separator(p, end, ';'), *colon = decl_separator(p, e, ':');
+        if (colon < e && decl_property_equal(p, colon, property)) {
+            const char *v = colon + 1, *ve = e;
+            while (v < ve && is_space((unsigned char)*v)) v++;
+            while (ve > v && is_space((unsigned char)ve[-1])) ve--;
+            bool priority = decl_priority(v, &ve);
+            if (!found || priority || !found_important) {
+                found = v; found_end = ve; found_important = priority;
+            }
+        }
+        p = e < end ? e + 1 : end;
+    }
+    *value = found; *value_n = found ? (size_t)(found_end - found) : 0; *important = found_important;
+    return found != NULL;
+}
+/* the declarations of a serialized block, each trimmed and without its ';' */
+static bool decl_next(const char **at, const char *end, const char **begin, const char **finish, const char **colon) {
+    while (*at < end) {
+        const char *p = *at, *e = decl_separator(p, end, ';');
+        *at = e < end ? e + 1 : end;
+        while (p < e && is_space((unsigned char)*p)) p++;
+        while (e > p && is_space((unsigned char)e[-1])) e--;
+        if (p == e) continue;
+        *begin = p; *finish = e; *colon = decl_separator(p, e, ':');
+        return true;
+    }
+    return false;
+}
+int css_decl_set(const char *css, size_t n, const char *property, const char *value, const char *priority,
+                 css_decl_check *check, sbuf *out) {
+    if (strchr(property, ':') || strchr(property, ';') || strchr(property, '{') || strchr(property, '}')) return -1;
+    const char *value_end = value + strlen(value);
+    if (*value && ((priority && *priority && strcasecmp(priority, "important")) ||
+                   decl_separator(value, value_end, '!') != value_end ||
+                   decl_separator(value, value_end, ';') != value_end)) return 0;
+    char *name = strdup(property);
+    if (!name) return -2;
+    if (strncmp(name, "--", 2)) for (char *c = name; *c; c++) *c = (char)lower((unsigned char)*c);
+    /* CSSOM setProperty parses the value for the property before changing the
+       block: the value as CSS reads it (no comments), trimmed. Keep
+       syntactically valid but not-yet-rendered values separate from @supports
+       capability reporting; both use the real property grammar and var rules. */
+    sbuf serialized = {0};
+    if (*value) {
+        size_t vn;
+        char *clean = css_preprocess(value, (size_t)(value_end - value), &vn);
+        if (!clean) { free(name); return -2; }
+        const char *v = clean;
+        while (vn && is_space((unsigned char)*v)) v++, vn--;
+        while (vn && is_space((unsigned char)v[vn - 1])) vn--;
+        bool valid = vn && (check ? check(name, v, vn, &serialized) : css_valid_declaration(name, strlen(name), v, vn));
+        if (valid && !check) css_decl_value(name, v, vn, &serialized);
+        free(clean);
+        if (!valid) { sb_free(&serialized); free(name); return 0; }
+    }
+    /* css is a serialized block: the others keep their text and order, and the
+       property's declaration (if any) is replaced by one at the end */
+    bool first = true;
+    const char *at = css, *begin, *finish, *colon;
+    while (decl_next(&at, css + n, &begin, &finish, &colon)) {
+        if (colon < finish && decl_property_equal(begin, colon, name)) continue;
+        if (!first) sb_putc(out, ' ');
+        first = false;
+        sb_put(out, begin, (size_t)(finish - begin)); sb_putc(out, ';');
+    }
+    if (*value) {
+        if (!first) sb_putc(out, ' ');
+        sb_puts(out, name); sb_puts(out, ": ");
+        sb_put(out, serialized.p ? serialized.p : "", serialized.n);
+        if (priority && *priority) sb_puts(out, " !important");
+        sb_putc(out, ';');
+    }
+    sb_free(&serialized); free(name);
+    return 1;
+}
+void css_decl_names(const char *css, size_t n, sbuf *names) {
+    const char *at = css, *begin, *finish, *colon;
+    while (decl_next(&at, css + n, &begin, &finish, &colon)) {
+        while (colon > begin && is_space((unsigned char)colon[-1])) colon--;
+        sb_put(names, begin, (size_t)(colon - begin)); sb_putc(names, 0);
+    }
+}
+/* CSSOM "serialize a CSS declaration block" of the declarations the block
+   parses to: the valid ones, a later one replacing an earlier one of the same
+   property unless only the earlier is !important. names, when given, gets
+   their property names, each NUL-terminated. false: no memory. The live
+   declaration of each name is found through a table of their indexes, so a
+   long block is not walked again for every declaration. */
+bool css_decl_serialize(const char *css, size_t n, css_decl_check *check, sbuf *out, sbuf *names) {
+    struct entry { char *name; sbuf value; bool important, live; } *list = NULL;
+    size_t count = 0, capacity = 0, *slots = NULL, mask = 0; /* slots: index + 1 of a name's live entry */
+    bool failed = false;
+    const char *end = css + n;
+    for (const char *p = css; p < end;) {
+        const char *e = decl_separator(p, end, ';'), *colon = decl_separator(p, e, ':');
+        const char *ns = p, *ne = colon, *v = colon + 1, *ve = e;
+        p = e < end ? e + 1 : end;
+        if (colon >= e) continue;
+        while (ns < ne && is_space((unsigned char)*ns)) ns++;
+        while (ne > ns && is_space((unsigned char)ne[-1])) ne--;
+        while (v < ve && is_space((unsigned char)*v)) v++;
+        while (ve > v && is_space((unsigned char)ve[-1])) ve--;
+        bool important = decl_priority(v, &ve);
+        if (ns == ne || v == ve) continue;
+        char *name = strndup(ns, (size_t)(ne - ns));
+        if (!name) { failed = true; break; }
+        if (strncmp(name, "--", 2)) for (char *c = name; *c; c++) *c = (char)lower((unsigned char)*c);
+        sbuf value = {0};
+        bool valid = check ? check(name, v, (size_t)(ve - v), &value) : css_valid_declaration(name, strlen(name), v, (size_t)(ve - v));
+        if (valid && !check) css_decl_value(name, v, (size_t)(ve - v), &value);
+        if (!valid) { free(name); sb_free(&value); continue; }
+        if (count == capacity) {
+            size_t grown = capacity ? capacity * 2 : 16;
+            struct entry *more = grown <= SIZE_MAX / sizeof *more ? realloc(list, grown * sizeof *more) : NULL;
+            size_t *table = grown <= SIZE_MAX / (2 * sizeof *table) ? calloc(grown * 2, sizeof *table) : NULL;
+            if (more) list = more;
+            if (!more || !table) { free(table); free(name); sb_free(&value); failed = true; break; }
+            capacity = grown;
+            free(slots); slots = table; mask = grown * 2 - 1;
+            for (size_t i = 0; i < count; i++) if (list[i].live) {
+                size_t at = hash_str(list[i].name) & mask;
+                while (slots[at]) at = (at + 1) & mask;
+                slots[at] = i + 1;
+            }
+        }
+        size_t at = hash_str(name) & mask;
+        while (slots[at] && strcmp(list[slots[at] - 1].name, name)) at = (at + 1) & mask;
+        if (slots[at]) {
+            struct entry *earlier = &list[slots[at] - 1];
+            if (earlier->important && !important) { free(name); sb_free(&value); continue; }
+            earlier->live = false;
+        }
+        slots[at] = count + 1;
+        list[count++] = (struct entry){name, value, important, true};
+    }
+    free(slots);
+    bool first = true;
+    for (size_t i = 0; i < count; i++) {
+        if (list[i].live && !failed) {
+            if (!first) sb_putc(out, ' ');
+            first = false;
+            sb_puts(out, list[i].name); sb_puts(out, ": ");
+            sb_put(out, list[i].value.p ? list[i].value.p : "", list[i].value.n);
+            if (list[i].important) sb_puts(out, " !important");
+            sb_putc(out, ';');
+            if (names) sb_put(names, list[i].name, strlen(list[i].name) + 1);
+        }
+        free(list[i].name); sb_free(&list[i].value);
+    }
+    free(list);
+    return !failed;
+}
+/* whether [s, +n) can stand inside a block: its braces, parentheses and
+   brackets balance (as block_end and scan_to count them) and no string is open */
+bool css_decl_balanced(const char *s, size_t n) {
+    size_t braces = 0, parens = 0;
+    int quote = 0;
+    for (const char *p = s, *end = s + n; p < end; p++) {
+        char c = *p;
+        if (c == '\\') { if (p + 1 < end) p++; continue; }
+        if (quote) { if (c == quote) quote = 0; else if (c == '\n') return false; continue; }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == '{') braces++;
+        else if (c == '}') { if (!braces) return false; braces--; }
+        else if (c == '(' || c == '[') parens++;
+        else if (c == ')' || c == ']') { if (!parens) return false; parens--; }
+    }
+    return !quote && !braces && !parens;
+}
+
 struct supports_walk {
     struct supports_walk *parent;
     const char *s, *e, *p, *next;
@@ -2876,7 +3143,8 @@ done:;
     return result;
 }
 
-bool css_supports_condition(const char *condition, size_t n, bool implied_parens) {
+static bool supports_evaluate(const char *condition, size_t n, bool implied_parens, bool *valid) {
+    *valid = false;
     if (!condition || n > SIZE_MAX - 3) return false;
     arena_t *a = calloc(1, sizeof *a);
     if (!a) return false;
@@ -2888,19 +3156,25 @@ bool css_supports_condition(const char *condition, size_t n, bool implied_parens
     bool result = false;
     if (s) {
         struct supports_result r = supports_expr(a, s, s + len);
-        result = r.valid && r.value;
+        result = r.valid && r.value; *valid = r.valid;
         if (!result && implied_parens) {
             char *wrapped = ar_alloc(a, len + 3);
             wrapped[0] = '(';
             memcpy(wrapped + 1, s, len);
             wrapped[len + 1] = ')'; wrapped[len + 2] = 0;
             r = supports_expr(a, wrapped, wrapped + len + 2);
-            result = r.valid && r.value;
+            result = r.valid && r.value; *valid |= r.valid;
         }
     }
     ar_free(a);
     free(a);
     return result;
+}
+bool css_supports_condition(const char *condition, size_t n, bool implied_parens) {
+    bool valid; return supports_evaluate(condition, n, implied_parens, &valid);
+}
+bool css_supports_grammar(const char *condition, size_t n, bool implied_parens) {
+    bool valid; supports_evaluate(condition, n, implied_parens, &valid); return valid;
 }
 
 /* ---------------------------------------------------------------- parsing stylesheets */
@@ -3089,10 +3363,96 @@ static char *nest_selector(struct pctx *pc, const char *ps, const char *pe, cons
     return r;
 }
 
+/* ---- CSSOM rule tree. An ordinary parse records only the top-level
+   @import rules the resource scan reads; a CSSOM parse (cssom_tree) records
+   every rule the grammar keeps, in the same pass that builds the cascade AST,
+   so both always agree on what a sheet contains. */
+struct cssom_run { const char *start, *end; bool valid, implicit; };
+static struct css_rule_info *cssom_link(struct pctx *pc, uint32_t kind, const char *s, const char *e) {
+    struct css_rule_info *parent = pc->cssom_parent;
+    uint32_t *count = parent ? &parent->child_count : &pc->sh->cssom_count;
+    if (*count == UINT32_MAX || (size_t)(e - s) > UINT32_MAX) {
+        if (pc->a->trap) longjmp(*pc->a->trap, 1);
+        abort();
+    }
+    struct css_rule_info *info = ar_alloc(pc->a, sizeof *info);
+    /* The comment-free source lives as long as the sheet: no copy of the rule. */
+    info->type = kind; info->text = s; info->text_len = (uint32_t)(e - s); info->parent = parent;
+    info->closed = e > s && (e[-1] == '}' || e[-1] == ';');
+    if (parent) {
+        /* A style or page rule owns the declarations before its first child. */
+        if (!parent->child_count && (parent->type == CSS_RULE_STYLE || parent->type == CSS_RULE_PAGE) &&
+            s >= parent->text + parent->decls_at && s <= parent->text + parent->decls_at + parent->decls_len)
+            parent->decls_len = (uint32_t)(s - (parent->text + parent->decls_at));
+        if (parent->last) parent->last->next = info; else parent->first = info;
+        parent->last = info;
+    } else {
+        if (pc->sh->cssom_last) pc->sh->cssom_last->next = info; else pc->sh->cssom_first = info;
+        pc->sh->cssom_last = info;
+    }
+    (*count)++; return info;
+}
+static void cssom_flush_run(struct pctx *pc) {
+    struct cssom_run *run = pc->cssom_run;
+    if (!run || !run->start) return;
+    pc->cssom_run = NULL;
+    /* The leading run of a style rule is its own declarations. */
+    if ((run->implicit || (pc->cssom_parent && pc->cssom_parent->child_count)) && run->valid) {
+        struct css_rule_info *info = cssom_link(pc, CSS_RULE_NESTED_DECLARATIONS, run->start, run->end);
+        info->decls_len = info->text_len;
+    }
+    run->start = run->end = NULL; run->valid = false; pc->cssom_run = run;
+}
+static struct css_rule_info *cssom_record(struct pctx *pc, uint32_t kind, const char *s, const char *e) {
+    if (!pc->sh || (!pc->cssom_tree && (kind != CSS_RULE_IMPORT || pc->rule_depth != 1))) return NULL;
+    if (pc->cssom_tree) cssom_flush_run(pc);
+    return cssom_link(pc, kind, s, e);
+}
+static void cssom_ranges(struct css_rule_info *info, const char *ps, const char *pe, const char *bs, const char *be) {
+    if (!info) return;
+    if (ps && pe >= ps) { info->prelude_at = (uint32_t)(ps - info->text); info->prelude_len = (uint32_t)(pe - ps); }
+    if (bs) {
+        info->block = true;
+        info->block_at = (uint32_t)(bs - info->text); info->block_len = (uint32_t)(be - bs);
+        if (info->type == CSS_RULE_STYLE || info->type == CSS_RULE_PAGE || info->type == CSS_RULE_KEYFRAME ||
+            info->type == CSS_RULE_FONT_FACE || info->type == CSS_RULE_MARGIN || info->type == CSS_RULE_COUNTER_STYLE ||
+            info->type == CSS_RULE_PROPERTY || info->type == CSS_RULE_FONT_PALETTE_VALUES) {
+            info->decls_at = info->block_at; info->decls_len = info->block_len;
+        }
+    }
+}
+/* A false @supports or an unimplemented @starting-style keeps its rules in
+   the CSSOM tree, while this condition keeps them out of every cascade. */
+static const struct mcond *cssom_inert(struct pctx *pc, const struct mcond *up) {
+    struct mcond *mc = ar_alloc(pc->a, sizeof *mc);
+    mc->up = up; mc->q = "not all"; mc->axes = 1;
+    return mc;
+}
+static uint32_t cssom_group_kind(const char *name) {
+    return !name ? 0 : !strcmp(name,"media") ? CSS_RULE_MEDIA : !strcmp(name,"supports") ? CSS_RULE_SUPPORTS :
+        !strcmp(name,"container") ? CSS_RULE_CONTAINER : !strcmp(name,"layer") ? CSS_RULE_LAYER_BLOCK :
+        !strcmp(name,"scope") ? CSS_RULE_SCOPE : !strcmp(name,"starting-style") ? CSS_RULE_STARTING_STYLE : 0;
+}
+
+/* Only where cssom.c put one (its offsets, never the author's text) is
+   CSS_NESTED_DECLARATIONS_MARKER a nested declarations rule. */
+static bool cssom_marker(const struct pctx *pc, const char *s) {
+    if (!pc->cssom_nmarkers || !pc->cssom_text || s < pc->cssom_text) return false;
+    size_t at = (size_t)(s - pc->cssom_text);
+    uint32_t lo = 0, hi = pc->cssom_nmarkers;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (pc->cssom_markers[mid] < at) lo = mid + 1; else hi = mid;
+    }
+    return lo < pc->cssom_nmarkers && pc->cssom_markers[lo] == at &&
+        !strncmp(s, CSS_NESTED_DECLARATIONS_MARKER, sizeof CSS_NESTED_DECLARATIONS_MARKER - 1);
+}
+
 /* the declarations and nested rules of a block */
 static void parse_body(struct pctx *pc, const char *s, const char *e, const char *sel, const struct mcond *media,
                        struct decl **out, int *nout) {
     sbuf d = {0}; /* struct decl array */
+    struct cssom_run *run = pc->cssom_tree && sel ? pc->cssom_run : NULL;
     while (s < e) {
         while (s < e && (is_space((unsigned char)*s) || *s == ';')) s++;
         if (s >= e) break;
@@ -3100,32 +3460,59 @@ static void parse_body(struct pctx *pc, const char *s, const char *e, const char
             const char *p = scan_to(s, e, "{;}");
             if (p >= e || *p != '{') {
                 const char *ns=s+1;const char *name=read_ident(pc->a,&ns,p,true);
-                if(pc->sh && name&&!strcmp(name,"layer") && p<e&&*p==';')layer_statement(pc,skip_ws(ns,p),p,media);
+                const char *qs=skip_ws(ns,p),*qe=p;trim_r(qs,&qe);
+                if(pc->sh && name&&!strcmp(name,"layer") && (p<e&&*p==';') && layer_statement(pc,qs,qe,media) && run)
+                    cssom_ranges(cssom_record(pc,CSS_RULE_LAYER_STATEMENT,s,p+1),qs,qe,NULL,NULL);
                 s = p < e ? p + 1 : e;
                 continue;
             }
             const char *be = block_end(p + 1, e);
+            if (sel && cssom_marker(pc, s)) {
+                /* cssom.c's text for a CSSNestedDeclarations rule: its block is
+                   one run of the parent's declarations, which apply as & does */
+                struct css_rule_info *nd = run ? cssom_record(pc, CSS_RULE_NESTED_DECLARATIONS, s, be < e ? be + 1 : e) : NULL;
+                if (nd) {
+                    nd->marker = nd->block = true;
+                    nd->block_at = nd->decls_at = (uint32_t)(p + 1 - s);
+                    nd->block_len = nd->decls_len = (uint32_t)(be - (p + 1));
+                }
+                bool tree = pc->cssom_tree;
+                pc->cssom_tree = false;
+                static const char nested[] = "&";
+                parse_style_rule(pc, nested, nested + 1, p + 1, be, media, sel);
+                pc->cssom_tree = tree;
+                s = be < e ? be + 1 : e;
+                continue;
+            }
             if (sel) {
                 const char *ns = s + 1;
                 const char *name = read_ident(pc->a, &ns, p, true);
                 const char *qs = skip_ws(ns, p), *qe = p;
                 trim_r(qs, &qe);
-                if (name && (!strcmp(name, "media") || !strcmp(name, "supports") || !strcmp(name, "container") ||
-                             !strcmp(name, "layer") || !strcmp(name, "scope"))) {
+                uint32_t kind = cssom_group_kind(name);
+                if (kind && (kind != CSS_RULE_STARTING_STYLE || run)) {
                     const struct mcond *m = media;
-                    if (!strcmp(name,"media") || !strcmp(name,"container"))
-                        m=parse_condition(pc,qs,qe,media,!strcmp(name,"container"));
-                    if (strcmp(name, "supports") || css_supports_condition(qs, (size_t)(p - qs), false)) {
-                        struct css_layer_decl *previous=pc->layer;
-                        if(!strcmp(name,"layer")) {
-                            pc->layer=layer_name_parse(pc,qs,qe,true);
-                            if(!pc->layer){s=be<e?be+1:e;continue;}
-                            layer_event(pc,pc->layer,media,NULL);
-                        }
-                        static const char amp[] = "&";
-                        parse_style_rule(pc, amp, amp + 1, p + 1, be, m, sel);
-                        pc->layer=previous;
+                    if (kind == CSS_RULE_MEDIA || kind == CSS_RULE_CONTAINER)
+                        m=parse_condition(pc,qs,qe,media,kind == CSS_RULE_CONTAINER);
+                    bool applies = kind != CSS_RULE_STARTING_STYLE &&
+                        (kind != CSS_RULE_SUPPORTS || css_supports_condition(qs, (size_t)(p - qs), false));
+                    bool valid = kind != CSS_RULE_SUPPORTS || applies || css_supports_grammar(qs, (size_t)(p - qs), false);
+                    struct css_layer_decl *previous=pc->layer;
+                    if(kind == CSS_RULE_LAYER_BLOCK) {
+                        pc->layer=layer_name_parse(pc,qs,qe,true);
+                        if(!pc->layer){pc->layer=previous;s=be<e?be+1:e;continue;}
+                        layer_event(pc,pc->layer,media,NULL);
                     }
+                    struct css_rule_info *group = run && valid ? cssom_record(pc, kind, s, be < e ? be + 1 : e) : NULL;
+                    cssom_ranges(group, qs, qe, p + 1, be);
+                    if (applies || group) {
+                        struct css_rule_info *outer = pc->cssom_parent;
+                        if (group) { pc->cssom_parent = group; pc->cssom_implicit = true; }
+                        static const char amp[] = "&";
+                        parse_style_rule(pc, amp, amp + 1, p + 1, be, applies ? m : cssom_inert(pc, m), sel);
+                        pc->cssom_parent = outer; pc->cssom_implicit = false;
+                    }
+                    pc->layer=previous;
                 }
             }
             s = be < e ? be + 1 : e;
@@ -3139,9 +3526,15 @@ static void parse_body(struct pctx *pc, const char *s, const char *e, const char
             continue;
         }
         struct decl x;
-        if (parse_decl(pc, s, p, &x)) sb_put(&d, (const char *)&x, sizeof x);
+        bool valid = parse_decl(pc, s, p, &x) != NULL;
+        if (valid) sb_put(&d, (const char *)&x, sizeof x);
+        if (run && pc->cssom_run == run) {
+            if (!run->start) run->start = s;
+            run->end = p < e ? p + 1 : e; run->valid |= valid;
+        }
         s = p < e ? p + 1 : e;
     }
+    if (run && pc->cssom_run == run) cssom_flush_run(pc);
     *nout = (int)(d.n / sizeof(struct decl));
     *out = NULL;
     if (*nout) {
@@ -3181,6 +3574,9 @@ static void parse_style_rule(struct pctx *pc, const char *ps, const char *pe, co
     trim_r(ps, &pe);
     if (parent) sel_text = nest_selector(pc, ps, pe, parent);
     else sel_text = ar_strndup(pc->a, ps, (size_t)(pe - ps));
+    /* A nested group rule's block parses as a style block of the implied
+       parent rule; that rule is not a CSSOM rule of its own. */
+    bool implicit = pc->cssom_implicit; pc->cssom_implicit = false;
     struct sellist *sl = selector_list_parse(pc, sel_text, sel_text + strlen(sel_text));
     if (!sl) return;
     struct rule *r = ar_alloc(pc->a, sizeof *r);
@@ -3192,23 +3588,19 @@ static void parse_style_rule(struct pctx *pc, const char *ps, const char *pe, co
     if (pc->sh->last) pc->sh->last->next = r;
     else pc->sh->first = r;
     pc->sh->last = r;
-    parse_body(pc, bs, be, sel_text, media, &r->decls, &r->ndecls);
-}
-static struct css_rule_info *cssom_record(struct pctx *pc, uint32_t type, const char *s, const char *e) {
-    /* New grouping rules have no legacy CSSRule numeric constant (type 0).
-       They still need source metadata: replaceSync and CSSOM edits rebuild
-       the native AST from this list, not from its already-flattened rules. */
-    if (pc->rule_depth != 1) return NULL;
-    if (pc->sh->cssom_count == UINT32_MAX || (size_t)(e - s) > UINT32_MAX) {
-        if (pc->a->trap) longjmp(*pc->a->trap, 1);
-        abort();
+    struct css_rule_info *outer = pc->cssom_parent;
+    struct cssom_run *outer_run = pc->cssom_run, run = {.implicit = implicit};
+    if (pc->cssom_tree) {
+        if (!implicit) {
+            struct css_rule_info *info = cssom_record(pc, CSS_RULE_STYLE, ps, *be == '}' ? be + 1 : be);
+            info->native_rule = r; info->selector = sel_text;
+            cssom_ranges(info, ps, pe, bs, be);
+            pc->cssom_parent = info;
+        }
+        pc->cssom_run = &run;
     }
-    struct css_rule_info *info = ar_alloc(pc->a, sizeof *info);
-    /* The comment-free source lives as long as the sheet: no copy of the rule. */
-    info->type = type; info->text = s; info->text_len = (uint32_t)(e - s);
-    if (pc->sh->cssom_last) pc->sh->cssom_last->next = info;
-    else pc->sh->cssom_first = info;
-    pc->sh->cssom_last = info; pc->sh->cssom_count++; return info;
+    parse_body(pc, bs, be, sel_text, media, &r->decls, &r->ndecls);
+    pc->cssom_parent = outer; pc->cssom_run = outer_run;
 }
 
 static bool font_source_hints(struct pctx *pc,const char *s,const char *e) {
@@ -3622,6 +4014,28 @@ static void parse_font_face(struct pctx *pc,const char *s,const char *e,const st
     pc->sh->fonts_last=f;
 }
 
+/* A keyframe block's selector list: from, to and percentages, comma
+   separated. NULL offsets only validates the list. */
+static bool keyframe_offsets(struct pctx *pc,const char *s,const char *p,float *offsets,int cap,int *count) {
+    int no=0;const char *q=s;
+    if(skip_ws(s,p)==p)return false;
+    while(q<p) {
+        const char *comma=scan_to(q,p,",");const char *a=skip_ws(q,comma),*z=comma;trim_r(a,&z);
+        float off=-1;
+        if(z-a==4 && strn_ieq(a,"from",4))off=0;
+        else if(z-a==2 && strn_ieq(a,"to",2))off=1;
+        else if(z>a && z[-1]=='%') {
+            char *text=ar_strndup(pc->a,a,(size_t)(z-a-1)),*tail;double v=strtod(text,&tail);
+            if(tail!=text && !*tail && isfinite(v) && v>=0 && v<=100)off=(float)(v/100);
+        }
+        if(off<0 || (offsets && no==cap))return false;
+        if(offsets)offsets[no]=off;
+        no++;
+        q=comma<p?comma+1:p;
+        if(comma<p && q==p)return false;
+    }
+    *count=no;return true;
+}
 static void parse_opacity_keyframes(struct pctx *pc,const char *ns,const char *ne,
     const char *s,const char *e,const struct mcond *media) {
     const char *cursor=ns,*name=read_ident(pc->a,&cursor,ne,false);
@@ -3636,20 +4050,8 @@ static void parse_opacity_keyframes(struct pctx *pc,const char *ns,const char *n
         struct decl *decls=NULL;int count=0;parse_body(pc,p+1,end,NULL,NULL,&decls,&count);
         /* One frame block may target several percentages. Invalid selector
            lists discard that block; important declarations are ignored later. */
-        float offsets[64];int no=0;const char *q=s;bool valid=true;
-        while(q<p) {
-            const char *comma=scan_to(q,p,",");const char *a=skip_ws(q,comma),*z=comma;trim_r(a,&z);
-            float off=-1;
-            if(z-a==4 && strn_ieq(a,"from",4))off=0;
-            else if(z-a==2 && strn_ieq(a,"to",2))off=1;
-            else if(z>a && z[-1]=='%') {
-                char *text=ar_strndup(pc->a,a,(size_t)(z-a-1)),*tail;double v=strtod(text,&tail);
-                if(tail!=text && !*tail && isfinite(v) && v>=0 && v<=100)off=(float)(v/100);
-            }
-            if(off<0 || no==64){valid=false;break;}offsets[no++]=off;
-            q=comma<p?comma+1:p;
-            if(comma<p && q==p){valid=false;break;}
-        }
+        float offsets[64];int no=0;
+        bool valid=keyframe_offsets(pc,s,p,offsets,64,&no);
         if(valid)for(int i=0;i<no;i++) {
             /* Duplicate offsets are one keyframe cascade, including timing
                declarations in a later block which omits opacity. */
@@ -3670,8 +4072,122 @@ static void parse_opacity_keyframes(struct pctx *pc,const char *ns,const char *n
     pc->sh->motions_last=key;
 }
 
+/* ---- CSSOM-only grammar: the rules the cascade does not implement still
+   belong to the CSSOM tree when their own grammar accepts them. */
+static bool cssom_keyword(const char *name,const char *const *words) {
+    for(;*words;words++)if(!strcasecmp(name,*words))return true;
+    return false;
+}
+static const char *const css_wide[]={"initial","inherit","unset","revert","revert-layer","default",NULL};
+/* <custom-ident>, whole range: no leading digit, no reserved keyword */
+static bool cssom_custom_ident(struct pctx *pc,const char *s,const char *e,const char *const *reserved) {
+    if(s==e || (*s>='0'&&*s<='9') || (*s=='-'&&s+1<e&&s[1]>='0'&&s[1]<='9'))return false;
+    const char *cursor=s,*name=read_ident(pc->a,&cursor,e,false);
+    return name && cursor==e && !cssom_keyword(name,css_wide) && !(reserved&&cssom_keyword(name,reserved));
+}
+static bool cssom_dashed_ident(struct pctx *pc,const char *s,const char *e) {
+    const char *cursor=s,*name=e-s>2&&s[0]=='-'&&s[1]=='-'?read_ident(pc->a,&cursor,e,false):NULL;
+    return name && cursor==e;
+}
+/* one whole CSS string token */
+static bool cssom_string(const char *s,const char *e) {
+    if(e-s<2 || (*s!='"'&&*s!='\'') || e[-1]!=*s)return false;
+    for(const char *p=s+1;p<e-1;p++) {
+        if(*p=='\\'){if(p+1==e-1)return false;p++;continue;}
+        if(*p==*s||*p=='\n')return false;
+    }
+    return true;
+}
+static bool cssom_keyframes_name(struct pctx *pc,const char *s,const char *e) {
+    static const char *const none[]={"none",NULL};
+    return cssom_string(s,e) || cssom_custom_ident(pc,s,e,none);
+}
+static bool cssom_counter_style_name(struct pctx *pc,const char *s,const char *e) {
+    static const char *const fixed[]={"none","decimal","disc","square","circle","disclosure-open","disclosure-closed",NULL};
+    return cssom_custom_ident(pc,s,e,fixed);
+}
+/* [ <ident>? <pseudo-page>* ]# ; an empty list is the page rule for every page */
+static bool cssom_page_selectors(struct pctx *pc,const char *s,const char *e) {
+    static const char *const pseudo[]={"left","right","first","blank",NULL};
+    if(skip_ws(s,e)==e)return true;
+    while(s<e) {
+        const char *comma=scan_to(s,e,","),*a=skip_ws(s,comma),*z=comma;trim_r(a,&z);
+        if(a==z)return false;
+        if(*a!=':') {
+            const char *cursor=a,*name=read_ident(pc->a,&cursor,z,false);
+            if(!name || (*a>='0'&&*a<='9') || cssom_keyword(name,css_wide))return false;
+            a=cursor;
+        }
+        while(a<z) {
+            if(*a!=':')return false;
+            const char *cursor=a+1,*name=read_ident(pc->a,&cursor,z,true);
+            if(!name || !cssom_keyword(name,pseudo))return false;
+            a=cursor;
+        }
+        s=comma<e?comma+1:e;
+        if(comma<e && skip_ws(s,e)==e)return false;
+    }
+    return true;
+}
+static bool cssom_margin_name(const char *name) {
+    static const char *const boxes[]={"top-left-corner","top-left","top-center","top-right","top-right-corner",
+        "bottom-left-corner","bottom-left","bottom-center","bottom-right","bottom-right-corner",
+        "left-top","left-middle","left-bottom","right-top","right-middle","right-bottom",NULL};
+    return name && cssom_keyword(name,boxes);
+}
+/* the value of a descriptor in a declaration list, or NULL */
+static bool cssom_descriptor(const char *s,const char *e,const char *name,const char **vs,const char **ve) {
+    bool found=false;size_t n=strlen(name);
+    while(s<e) {
+        const char *end=scan_to(s,e,";"),*colon=scan_to(s,end,":"),*a=skip_ws(s,colon),*z=colon;trim_r(a,&z);
+        if(colon<end && (size_t)(z-a)==n && strn_ieq(a,name,n)) {
+            *vs=skip_ws(colon+1,end);*ve=end;trim_r(*vs,ve);found=*vs<*ve;
+        }
+        s=end<e?end+1:e;
+    }
+    return found;
+}
+/* css-properties-values-api: syntax and inherits are required, and so is
+   initial-value unless the syntax is the universal one. */
+static bool cssom_property_rule(struct pctx *pc,const char *qs,const char *qe,const char *s,const char *e) {
+    const char *vs,*ve;
+    if(!cssom_dashed_ident(pc,qs,qe) || !cssom_descriptor(s,e,"inherits",&vs,&ve) ||
+       !((ve-vs==4&&strn_ieq(vs,"true",4)) || (ve-vs==5&&strn_ieq(vs,"false",5))) ||
+       !cssom_descriptor(s,e,"syntax",&vs,&ve) || !cssom_string(vs,ve))return false;
+    const char *a=skip_ws(vs+1,ve-1),*z=ve-1;trim_r(a,&z);
+    if(z-a==1 && *a=='*')return true;
+    return cssom_descriptor(s,e,"initial-value",&vs,&ve);
+}
+static void cssom_keyframe_rules(struct pctx *pc,const char *s,const char *e) {
+    while((s=skip_ws(s,e))<e) {
+        const char *p=scan_to(s,e,"{;}");if(p==e)break;
+        if(*p!='{'){s=p+1;continue;}
+        const char *end=block_end(p+1,e);int count;
+        if(keyframe_offsets(pc,s,p,NULL,0,&count)) {
+            const char *ke=p;trim_r(s,&ke);
+            cssom_ranges(cssom_record(pc,CSS_RULE_KEYFRAME,s,end<e?end+1:e),s,ke,p+1,end);
+        }
+        s=end<e?end+1:e;
+    }
+}
+/* @page declarations with their margin rules */
+static void cssom_page_rules(struct pctx *pc,const char *s,const char *e) {
+    while((s=skip_ws(s,e))<e) {
+        const char *p=scan_to(s,e,"{;}");
+        if(p<e && *p=='{' && *s=='@') {
+            const char *end=block_end(p+1,e),*ns=s+1,*name=read_ident(pc->a,&ns,p,true);
+            if(cssom_margin_name(name) && skip_ws(ns,p)==p)
+                cssom_ranges(cssom_record(pc,CSS_RULE_MARGIN,s,end<e?end+1:e),NULL,NULL,p+1,end);
+            s=end<e?end+1:e;continue;
+        }
+        if(p<e && *p=='{'){const char *end=block_end(p+1,e);s=end<e?end+1:e;continue;}
+        s=p<e?p+1:e;
+    }
+}
+
 static void parse_rules(struct pctx *pc, const char *s, const char *e, const struct mcond *media) {
     pc->rule_depth++;
+    bool top = pc->rule_depth == 1;
     while (s < e) {
         s = skip_ws(s, e);
         if (s >= e) break;
@@ -3681,126 +4197,183 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
             const char *p = scan_to(ns, e, "{;");
             const char *qs = skip_ws(ns, p), *qe = p;
             trim_r(qs, &qe);
-            uint32_t type = !name ? 0 : !strcmp(name,"import") ? 3 : !strcmp(name,"media") ? 4 :
-                !strcmp(name,"font-face") ? 5 : !strcmp(name,"page") ? 6 :
-                (!strcmp(name,"keyframes") || !strcmp(name,"-webkit-keyframes")) ? 7 :
-                !strcmp(name,"namespace") ? 10 : !strcmp(name,"supports") ? 12 : 0;
-            bool known_group = name && (!strcmp(name,"container") || !strcmp(name,"layer") ||
-                !strcmp(name,"scope") || !strcmp(name,"document") || !strcmp(name,"-moz-document"));
-            if(name&&!strcmp(name,"import") && (pc->rule_depth!=1 || !pc->import_allowed)) {
-                s=p<e?p+1:e;continue;
-            }
             if (p >= e || *p == ';') {
-                bool layer=name&&!strcmp(name,"layer");
-                if(layer && !layer_statement(pc,qs,qe,media)) {
-                    s=p<e?p+1:e;continue;
-                }
-                if (type == 10) {
+                /* Statements: @import, @namespace and @layer. A block at-rule
+                   without its block is invalid. */
+                const char *end = p < e ? p + 1 : e;
+                if (name && !strcmp(name, "layer")) {
+                    if (layer_statement(pc, qs, qe, media)) {
+                        cssom_ranges(cssom_record(pc, CSS_RULE_LAYER_STATEMENT, s, end), qs, qe, NULL, NULL);
+                        /* No @import after a layer statement that follows an @import. */
+                        if (top && pc->imports_seen) pc->import_allowed = false;
+                    }
+                } else if (name && !strcmp(name, "namespace")) {
                     /* CSS Namespaces: before every rule but @charset, @import and @layer statements */
                     const char *prefix, *uri;
-                    if (pc->rule_depth != 1 || !pc->namespace_allowed || !namespace_prelude(pc->a, qs, qe, &prefix, &uri)) {
-                        s = p < e ? p + 1 : e;
-                        continue;
+                    if (top && pc->namespace_allowed && namespace_prelude(pc->a, qs, qe, &prefix, &uri)) {
+                        struct css_namespace *declared = ar_alloc(pc->a, sizeof *declared), **at = &pc->sh->namespaces;
+                        declared->prefix = prefix; declared->uri = uri; declared->next = NULL;
+                        while (*at) at = &(*at)->next;
+                        *at = declared;
+                        cssom_ranges(cssom_record(pc, CSS_RULE_NAMESPACE, s, end), qs, qe, NULL, NULL);
+                        pc->import_allowed = false;
                     }
-                    struct css_namespace *declared = ar_alloc(pc->a, sizeof *declared), **at = &pc->sh->namespaces;
-                    declared->prefix = prefix; declared->uri = uri; declared->next = NULL;
-                    while (*at) at = &(*at)->next;
-                    *at = declared;
-                }
-                struct css_rule_info *info = (p<e||layer||type==10) && (type || known_group) ? cssom_record(pc, type, s, p<e?p+1:e) : NULL;
-                if(info&&layer)info->layer_kind=1;
-                if(pc->rule_depth==1 && type==10)pc->import_allowed=false;
-                if (name && !strcmp(name, "import")) {
-                    /* @import url [media]: fetched later, ordered just before this sheet */
+                } else if (name && !strcmp(name, "import") && top && pc->import_allowed) {
+                    /* @import <url> [layer | layer(<name>)]? [supports(...)]? <media-query-list>? */
                     const char *ue = scan_to(qs, qe, " \t\n");
                     const char *t = qs;
                     size_t tl = (size_t)(ue - qs);
                     sbuf u = {0};
-                    if (tl > 4 && strn_ieq(t, "url(", 4)) {
+                    bool url = false;
+                    if (tl > 4 && strn_ieq(t, "url(", 4) && t[tl-1] == ')') {
                         const char *a = t + 4, *b = t + tl - 1;
                         a = skip_ws(a, b);
                         trim_r(a, &b);
                         if (b > a && (*a == '"' || *a == '\'')) a++, b--;
-                        css_unescape(&u, a, (size_t)(b - a));
-                    } else if (tl >= 2 && (t[0] == '"' || t[0] == '\'')) css_unescape(&u, t + 1, tl - 2);
-                    const char *rest = skip_ws(ue, qe);
-                    bool ok = u.n > 0;
-                    struct css_layer_decl *import_layer=NULL;
-                    if((size_t)(qe-rest)>=5 && strn_ieq(rest,"layer",5) &&
-                       (rest+5==qe || rest[5]=='(' || is_space((unsigned char)rest[5]))) {
-                        rest+=5;
-                        if(rest<qe&&*rest=='(') {
-                            const char *close=scan_to(rest+1,qe,")");
-                            const char *begin=skip_ws(rest+1,close),*end=close;trim_r(begin,&end);
-                            import_layer=close<qe?layer_name_parse(pc,begin,end,false):NULL;
-                            rest=close<qe?close+1:qe;ok&=import_layer!=NULL;
-                        } else import_layer=layer_name_parse(pc,rest,rest,true);
-                        rest=skip_ws(rest,qe);
+                        css_unescape(&u, a, (size_t)(b - a)); url = true;
+                    } else if (tl >= 2 && (t[0] == '"' || t[0] == '\'') && cssom_string(t, ue)) {
+                        css_unescape(&u, t + 1, tl - 2); url = true;
                     }
-                    if((size_t)(qe-rest)>=9 && strn_ieq(rest,"supports(",9)) {
-                        const char *close=scan_to(rest+9,qe,")");
-                        bool supported=false;
-                        if(close<qe) {
-                            supported=css_supports_condition(rest+9,(size_t)(close-rest-9),false);
-                            if(!supported){sbuf q={0};sb_putc(&q,'(');sb_put(&q,rest+9,(size_t)(close-rest-9));sb_putc(&q,')');
-                                supported=css_supports_condition(sb_cstr(&q),q.n,false);sb_free(&q);}
+                    if (url) {
+                        const char *rest = skip_ws(ue, qe), *layer_text = NULL, *supports_text = NULL;
+                        size_t layer_n = 0, supports_n = 0;
+                        bool ok = u.n > 0;
+                        struct css_layer_decl *import_layer=NULL;
+                        if((size_t)(qe-rest)>=5 && strn_ieq(rest,"layer",5) &&
+                           (rest+5==qe || rest[5]=='(' || is_space((unsigned char)rest[5]))) {
+                            const char *after=rest+5;
+                            if(after<qe&&*after=='(') {
+                                const char *close=scan_to(after+1,qe,")");
+                                const char *begin=skip_ws(after+1,close),*end_name=close;trim_r(begin,&end_name);
+                                /* An invalid layer() is not a layer: it begins the media query list. */
+                                import_layer=close<qe?layer_name_parse(pc,begin,end_name,false):NULL;
+                                if(import_layer){layer_text=begin;layer_n=(size_t)(end_name-begin);rest=skip_ws(close+1,qe);}
+                            } else {
+                                import_layer=layer_name_parse(pc,after,after,true);
+                                layer_text="";rest=skip_ws(after,qe);
+                            }
                         }
-                        ok&=supported;rest=close<qe?skip_ws(close+1,qe):qe;
+                        if((size_t)(qe-rest)>=9 && strn_ieq(rest,"supports(",9)) {
+                            const char *close=scan_to(rest+9,qe,")");
+                            bool supported=false,grammar=false;
+                            if(close<qe) {
+                                const char *in=rest+9;size_t n=(size_t)(close-in);
+                                supported=css_supports_condition(in,n,false);grammar=supported||css_supports_grammar(in,n,false);
+                                if(!supported){sbuf q={0};sb_putc(&q,'(');sb_put(&q,in,n);sb_putc(&q,')');
+                                    supported=css_supports_condition(sb_cstr(&q),q.n,false);
+                                    grammar=grammar||supported||css_supports_grammar(sb_cstr(&q),q.n,false);sb_free(&q);}
+                            }
+                            /* Like layer(), a supports() outside the grammar begins the media list. */
+                            if(grammar){
+                                const char *in=skip_ws(rest+9,close),*finish=close;trim_r(in,&finish);
+                                supports_text=in;supports_n=(size_t)(finish-in);
+                                ok&=supported;rest=skip_ws(close+1,qe);
+                            }
+                        }
+                        struct css_rule_info *info = cssom_record(pc, CSS_RULE_IMPORT, s, end);
+                        cssom_ranges(info, qs, qe, NULL, NULL);
+                        struct css_rule_import *record=info?ar_alloc(pc->a,sizeof *record):NULL;
+                        if(record){
+                            record->media=rest<qe?ar_strndup(pc->a,rest,(size_t)(qe-rest)):NULL;
+                            record->href=ar_strndup(pc->a,u.p?u.p:"",u.n);
+                            record->layer=layer_text?ar_strndup(pc->a,layer_text,layer_n):NULL;
+                            record->supports=supports_text?ar_strndup(pc->a,supports_text,supports_n):NULL;
+                            info->import=record;
+                        }
+                        const struct mcond *import_condition=rest<qe?parse_condition(pc,rest,qe,media,false):media;
+                        if(ok)layer_event(pc,import_layer,import_condition,info);
+                        pc->imports_seen = true;
+                        /* CSS's url(): UTF-8 against the style sheet's base URL. */
+                        char *abs = NULL;
+                        int resolved = ok ? web_resolve_url_owned(pc->base, sb_cstr(&u), &abs) : 0;
+                        sb_free(&u);
+                        if (resolved < 0) ar_alloc(pc->a, SIZE_MAX);
+                        if (resolved == 1) {
+                            if (record) { record->url = ar_strdup(pc->a, abs); pc->sh->import_urls++; }
+                            struct css_import *im = pc->imports ? malloc(sizeof *im) : NULL;
+                            if (im) {
+                                im->url = abs; abs = NULL;
+                                im->order = pc->sh->order - 0.1 + 0.001 * pc->nimports++;
+                                im->owner=info;
+                                pv_push(pc->imports, im);
+                            } else if (pc->imports) { free(abs); ar_alloc(pc->a, SIZE_MAX); }
+                        }
+                        free(abs);
                     }
-                    struct css_rule_import *record=info?ar_alloc(pc->a,sizeof *record):NULL;
-                    if(record){record->media=rest<qe?ar_strndup(pc->a,rest,(size_t)(qe-rest)):NULL;info->import=record;}
-                    const struct mcond *import_condition=rest<qe?parse_condition(pc,rest,qe,media,false):media;
-                    if(ok)layer_event(pc,import_layer,import_condition,info);
-                    /* CSS's url(): UTF-8 against the style sheet's base URL. */
-                    char *abs = NULL;
-                    int resolved = ok ? web_resolve_url_owned(pc->base, sb_cstr(&u), &abs) : 0;
                     sb_free(&u);
-                    if (resolved < 0) ar_alloc(pc->a, SIZE_MAX);
-                    if (resolved == 1) {
-                        if (record) { record->url = ar_strdup(pc->a, abs); pc->sh->import_urls++; }
-                        struct css_import *im = pc->imports ? malloc(sizeof *im) : NULL;
-                        if (im) {
-                            im->url = abs; abs = NULL;
-                            im->order = pc->sh->order - 0.1 + 0.001 * pc->nimports++;
-                            im->owner=info;
-                            pv_push(pc->imports, im);
-                        } else if (pc->imports) { free(abs); ar_alloc(pc->a, SIZE_MAX); }
-                    }
-                    free(abs);
                 }
-                s = p < e ? p + 1 : e;
+                s = end;
                 continue;
             }
-            const char *be = block_end(p + 1, e);
+            const char *be = block_end(p + 1, e), *end = be < e ? be + 1 : e;
+            const char *bs = p + 1;
             struct css_layer_decl *block_layer=NULL;
             if(name&&!strcmp(name,"layer")) {
                 block_layer=layer_name_parse(pc,qs,qe,true);
-                if(!block_layer){s=be<e?be+1:e;continue;}
+                if(!block_layer){s=end;continue;}
             }
-            if(type || known_group) {
-                struct css_rule_info *info=cssom_record(pc, type, s, be < e ? be + 1 : e);
-                if(info&&block_layer)info->layer_kind=2;
-                if(pc->rule_depth==1)pc->import_allowed=pc->namespace_allowed=false;
+            bool keyframes = name && (!strcmp(name,"keyframes") || !strcmp(name,"-webkit-keyframes"));
+            bool document = name && (!strcmp(name, "document") || !strcmp(name, "-moz-document"));
+            uint32_t kind = cssom_group_kind(name);
+            if (name && !kind) {
+                kind = !strcmp(name,"font-face") ? CSS_RULE_FONT_FACE : keyframes ? CSS_RULE_KEYFRAMES :
+                    !strcmp(name,"page") ? CSS_RULE_PAGE : !strcmp(name,"counter-style") ? CSS_RULE_COUNTER_STYLE :
+                    !strcmp(name,"property") ? CSS_RULE_PROPERTY : !strcmp(name,"font-feature-values") ? CSS_RULE_FONT_FEATURE_VALUES :
+                    !strcmp(name,"font-palette-values") ? CSS_RULE_FONT_PALETTE_VALUES : 0;
             }
+            bool supported = kind != CSS_RULE_SUPPORTS || css_supports_condition(qs, (size_t)(p - qs), false);
+            if (kind && pc->cssom_tree) {
+                /* Each at-rule's own prelude grammar decides whether it exists. */
+                bool valid =
+                    kind == CSS_RULE_SUPPORTS ? supported || css_supports_grammar(qs, (size_t)(p - qs), false) :
+                    kind == CSS_RULE_CONTAINER ? qs < qe :
+                    kind == CSS_RULE_FONT_FACE || kind == CSS_RULE_STARTING_STYLE ? qs == qe :
+                    kind == CSS_RULE_KEYFRAMES ? cssom_keyframes_name(pc, qs, qe) :
+                    kind == CSS_RULE_PAGE ? cssom_page_selectors(pc, qs, qe) :
+                    kind == CSS_RULE_COUNTER_STYLE ? cssom_counter_style_name(pc, qs, qe) :
+                    kind == CSS_RULE_PROPERTY ? cssom_property_rule(pc, qs, qe, bs, be) :
+                    kind == CSS_RULE_FONT_PALETTE_VALUES ? cssom_dashed_ident(pc, qs, qe) :
+                    kind == CSS_RULE_FONT_FEATURE_VALUES ? qs < qe : true;
+                if (!valid) kind = 0;
+            } else if (!pc->cssom_tree) kind = 0;
+            struct css_rule_info *info = kind ? cssom_record(pc, kind, s, end) : NULL;
+            cssom_ranges(info, qs, qe, bs, be);
+            if (top && (info || cssom_group_kind(name) || keyframes || document ||
+                        (name && (!strcmp(name,"font-face") || !strcmp(name,"page"))))) {
+                pc->import_allowed = false; pc->namespace_allowed = false;
+            }
+            struct css_rule_info *outer = pc->cssom_parent;
+            if (info) pc->cssom_parent = info;
             if (name) {
-                if (!strcmp(name, "font-face")) parse_font_face(pc,p+1,be,media);
-                else if (!strcmp(name,"keyframes") || !strcmp(name,"-webkit-keyframes"))
-                    parse_opacity_keyframes(pc,qs,qe,p+1,be,media);
+                if (!strcmp(name, "font-face")) parse_font_face(pc,bs,be,media);
+                else if (keyframes) {
+                    parse_opacity_keyframes(pc,qs,qe,bs,be,media);
+                    if (info) cssom_keyframe_rules(pc,bs,be);
+                }
                 else if (!strcmp(name,"media") || !strcmp(name,"container")) {
                     const struct mcond *mc=parse_condition(pc,qs,qe,media,!strcmp(name,"container"));
-                    parse_rules(pc,p+1,be,mc);
+                    parse_rules(pc,bs,be,mc);
                 } else if (!strcmp(name, "supports")) {
-                    if (css_supports_condition(qs, (size_t)(p - qs), false)) parse_rules(pc, p + 1, be, media);
+                    if (supported) parse_rules(pc, bs, be, media);
+                    else if (info) parse_rules(pc, bs, be, cssom_inert(pc, media));
                 } else if (!strcmp(name,"layer")) {
                     struct css_layer_decl *previous=pc->layer;pc->layer=block_layer;
-                    layer_event(pc,block_layer,media,NULL);parse_rules(pc,p+1,be,media);pc->layer=previous;
-                } else if (!strcmp(name, "scope") ||
-                           !strcmp(name, "document") || !strcmp(name, "-moz-document")) {
-                    parse_rules(pc, p + 1, be, media);
-                }
-                /* @page, @property, @starting-style ... remain unsupported */
+                    layer_event(pc,block_layer,media,NULL);parse_rules(pc,bs,be,media);pc->layer=previous;
+                } else if (!strcmp(name, "scope")) {
+                    parse_rules(pc, bs, be, media);
+                } else if (document) {
+                    /* Legacy: the cascade applies its rules; it is no CSSOM rule. */
+                    bool tree = pc->cssom_tree;
+                    pc->cssom_tree = false;
+                    parse_rules(pc, bs, be, media);
+                    pc->cssom_tree = tree;
+                } else if (info && kind == CSS_RULE_STARTING_STYLE) {
+                    parse_rules(pc, bs, be, cssom_inert(pc, media));
+                } else if (info && kind == CSS_RULE_PAGE) cssom_page_rules(pc, bs, be);
+                /* @page, @property, @counter-style ... have no cascade effect yet */
             }
-            s = be < e ? be + 1 : e;
+            pc->cssom_parent = outer;
+            s = end;
             continue;
         }
         const char *p = scan_to(s, e, "{;}");
@@ -3813,11 +4386,7 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
         struct rule *before = pc->sh->last;
         parse_style_rule(pc, s, p, p + 1, be, media, NULL);
         struct rule *native = before ? before->next : pc->sh->first;
-        if (native) {
-            if(pc->rule_depth==1)pc->import_allowed=pc->namespace_allowed=false;
-            struct css_rule_info *info = cssom_record(pc, 1, s, be < e ? be + 1 : e);
-            if (info) { info->native_rule = native; info->selector = native->selector_text; }
-        }
+        if (native && top) pc->import_allowed = pc->namespace_allowed = false;
         s = be < e ? be + 1 : e;
     }
     pc->rule_depth--;
@@ -3876,18 +4445,9 @@ struct css_rule_info *css_sheet_rules(sheet_t *sheet, uint32_t *length) {
     if (length) *length = sheet ? sheet->cssom_count : 0;
     return sheet ? sheet->cssom_first : NULL;
 }
-bool css_sheet_single_rule(sheet_t *sheet, const char *source, size_t length) {
-    (void)source; (void)length;
-    uint32_t count = 0; struct css_rule_info *info = css_sheet_rules(sheet, &count);
-    if (count != 1 || !info || ((!info->layer_kind) && (info->type != 1 || !info->native_rule))) return false;
-    /* Native parser recovery may accept a prefix/missing close. insertRule
-       requires one entire qualified rule, not forgiving stylesheet recovery. */
-    size_t n = sheet->cssom_length; const char *clean = sheet->cssom_source;
-    const char *s = skip_ws(clean, clean + n), *p = scan_to(s, clean + n, "{;}");
-    if(info->layer_kind==1)return p==clean+n || (*p==';'&&skip_ws(p+1,clean+n)==clean+n);
-    bool ok = p < clean + n && *p == '{';
-    if (ok) { const char *end = block_end(p + 1, clean + n); ok = end < clean + n && skip_ws(end + 1, clean + n) == clean + n; }
-    return ok;
+const char *css_sheet_source(const sheet_t *sheet, size_t *length) {
+    if (length) *length = sheet ? sheet->cssom_length : 0;
+    return sheet ? sheet->cssom_source : NULL;
 }
 
 /* Rules/selectors/declarations are immutable after parsing. Each adoption in
@@ -3905,18 +4465,24 @@ void css_sheet_import_context(sheet_t *sheet,sheet_t *parent,const struct css_ru
     parent->import_last=sheet;
 }
 
-sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
+static sheet_t *parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports,
+                            bool cssom_tree, const uint32_t *markers, uint32_t nmarkers) {
     static uint64_t serials;
-    struct pctx pc = {.a = a, .base = base_url, .imports = imports, .import_allowed = true, .namespace_allowed = true};
+    struct pctx pc = {.a = a, .base = base_url, .imports = imports, .import_allowed = true,
+                      .namespace_allowed = true, .cssom_tree = cssom_tree,
+                      .cssom_markers = markers, .cssom_nmarkers = nmarkers};
     pc.sh = ar_alloc(a, sizeof(sheet_t));
     pc.sh->order = order;
     pc.sh->ast = pc.sh; pc.sh->arena = a;
     pc.sh->serial = __atomic_add_fetch(&serials, 1, __ATOMIC_RELAXED);
     size_t cn;
     char *c = strip_comments(a, css, n, &cn);
-    pc.sh->cssom_source = c; pc.sh->cssom_length = cn;
+    pc.sh->cssom_source = pc.cssom_text = c; pc.sh->cssom_length = cn;
     parse_rules(&pc, c, c + cn, NULL);
     return pc.sh;
+}
+sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
+    return parse_sheet(a, css, n, base_url, order, imports, false, NULL, 0);
 }
 
 struct sheet_parse_job {
@@ -3927,6 +4493,9 @@ struct sheet_parse_job {
     pvec *imports;
     sheet_t *result;
     int failed;
+    bool cssom_tree;
+    const uint32_t *markers;
+    uint32_t nmarkers;
 };
 static void sheet_parse_worker(size_t index, void *context) {
     (void)index;
@@ -3935,20 +4504,29 @@ static void sheet_parse_worker(size_t index, void *context) {
     jmp_buf trap; jmp_buf *outer = job->arena->trap;
     job->arena->trap = &trap;
     job->failed = setjmp(trap);
-    if (!job->failed) job->result = css_parse_sheet(job->arena, job->text, job->length, job->base, job->order, job->imports);
+    if (!job->failed) job->result = parse_sheet(job->arena, job->text, job->length, job->base, job->order, job->imports, job->cssom_tree,
+                                                    job->markers, job->nmarkers);
     job->arena->trap = outer;
 }
 static void sheet_parse_service(void *context) { web_native_checkpoint(context); }
-sheet_t *css_parse_sheet_serviced(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
+static sheet_t *parse_serviced(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url, double order,
+                               pvec *imports, bool cssom_tree, const uint32_t *markers, uint32_t nmarkers) {
     if (!d || !d->live || n < 16384 || parallel_active())
-        return css_parse_sheet(a,css,n,base_url,order,imports);
-    struct sheet_parse_job job = {a,css,base_url,n,order,imports,NULL,0};
+        return parse_sheet(a,css,n,base_url,order,imports,cssom_tree,markers,nmarkers);
+    struct sheet_parse_job job = {a,css,base_url,n,order,imports,NULL,0,cssom_tree,markers,nmarkers};
     parallel_call_stage(PARALLEL_CSS_PARSE,sheet_parse_worker,&job,sheet_parse_service,d);
     if (job.failed) {
         if (a->trap) longjmp(*a->trap,job.failed);
         ar_alloc(a,SIZE_MAX); return NULL;
     }
     return job.result;
+}
+sheet_t *css_parse_sheet_serviced(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
+    return parse_serviced(d, a, css, n, base_url, order, imports, false, NULL, 0);
+}
+sheet_t *css_parse_cssom_sheet(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url,
+                               const uint32_t *markers, uint32_t nmarkers) {
+    return parse_serviced(d, a, css, n, base_url, 0, NULL, true, markers, nmarkers);
 }
 
 /* ---------------------------------------------------------------- media queries */
@@ -4205,7 +4783,7 @@ bool css_media_evaluate(const char *query,int vw,int vh,bool scripting,char *out
         if(!first)ok=ok&&mq_append(out,cap,&used,", ",2);first=false;
         if(!valid||r==MQ_UNKNOWN)ok=ok&&mq_append(out,cap,&used,"not all",7);
         else {
-            const char *p=skip_ws(s,end),*z=end;trim_r(p,&z);bool space=false;
+            const char *p=skip_ws(s,end),*z=end;trim_r(p,&z);bool space=false;size_t query=used;
             for(;p<z;p++){
                 if(is_space((unsigned char)*p)){space=true;continue;}
                 char c=*p,prev=out&&used?out[used-1]:0;
@@ -4214,6 +4792,8 @@ bool css_media_evaluate(const char *query,int vw,int vh,bool scripting,char *out
                 ok=ok&&mq_append(out,cap,&used,&c,1);space=false;
                 if(c==':'||c=='/'||c=='='||((c=='<'||c=='>')&&(p+1==z||p[1]!='=')))ok=ok&&mq_append(out,cap,&used," ",1);
             }
+            /* CSSOM "serialize a media query": the type "all" with features is implied */
+            if(out&&used-query>8&&!memcmp(out+query,"all and ",8)){memmove(out+query,out+query+8,used-query-8+1);used-=8;}
         }
         if(end==e)break;s=end+1;
     }
@@ -4518,12 +5098,6 @@ bool css_containers_update(web_doc *d) {
         n=n && n!=d->html?container_next(n):NULL;
     }
     return changed;
-}
-
-static uint32_t hash_str(const char *s) {
-    uint32_t h = 2166136261u;
-    for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
-    return h;
 }
 
 static void ht_init(arena_t *a, struct htab *t, uint32_t cap) {

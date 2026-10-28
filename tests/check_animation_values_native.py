@@ -153,11 +153,11 @@ int main(void){
     EXPECT(mix("transform","none","scale(3)",.5),"scale(2, 2)");
     EXPECT(mix("transform","rotate(0deg)","rotate(180deg)",.5),"rotate(1.570796rad)");
     EXPECT(mix("translate","none","10px 20px",.5),"5px 10px");
-    EXPECT(mix("scale","none","3",.5),"2 2");
+    EXPECT(mix("scale","none","3",.5),"2"); /* css-transforms scale-parsing-computed: the shortest form */
     EXPECT(mix("rotate","none","90deg",.5),"45deg");
     EXPECT(compose("transform","translate(10px)","scale(2)",false),"translate(10px, 0px) scale(2, 2)");
     EXPECT(compose("transform","scale(2)","scale(3)",true),"scale(4, 4)");
-    EXPECT(compose("scale","2","3",false),"6 6");
+    EXPECT(compose("scale","2","3",false),"6");
     /* shadow and filter lists */
     EXPECT(mix("box-shadow","none","10px 20px 30px 40px rgb(0, 0, 255)",.5),"rgba(0, 0, 255, 0.5) 5px 10px 15px 20px");
     EXPECT(mix("box-shadow","10px 10px red","10px 10px blue inset",.5),"DISCRETE-B");
@@ -317,9 +317,6 @@ int main(void){
 '''
 source = out / "values.c"
 source.write_text(css_host + production + main, encoding="utf-8")
-http = (root / "user/libc/http.c").read_text(encoding="utf-8")
-url = out / "url.c"
-url.write_text(http[:http.index("/* The pool is process-local.")] + http[http.index("bool url_parse(const char *s, struct url *u)"):http.index("enum http_url_result http_origin_owned_n(")], encoding="utf-8")
 cc = root / "tools/msys64/ucrt64/bin/clang.exe"
 if not cc.exists():
     cc = root.parents[2] / "tools/msys64/ucrt64/bin/clang.exe"  # a git worktree shares the main tree's tools
@@ -331,6 +328,6 @@ env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH",
 exe = out / "values.exe"
 command = [str(cc), "-std=gnu11", "-O1", "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include",
            "-Icommon", "-Iuser/libc", "-Iuser/libc/web", "-Ithird_party/quickjs", str(source), "user/libc/web/cssprop.c", "user/libc/web/shape.c",
-           "user/libc/web/color.c", "user/libc/web/util.c", "user/libc/web/html.c", str(url), "-o", str(exe)]
+           "user/libc/web/color.c", "user/libc/web/cssmath.c", "user/libc/web/util.c", "user/libc/web/html.c", "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 subprocess.run([str(exe)], cwd=root, env=env, check=True, timeout=60)

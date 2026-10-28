@@ -94,21 +94,25 @@ static void transform(char *s, size_t n, int tt) {
     }
 }
 
-/* white-space processing and text-transform */
-static const char *ws_process(arena_t *a, const char *s, size_t n, const style_t *st, size_t *out_n) {
+/* white-space processing and text-transform. With source, also the byte of s each output
+   byte came from (source has room for one entry per output byte and one for the end, which
+   is n): the one record of how a text box's text corresponds to its Text node's data. */
+static const char *ws_process(arena_t *a, const char *s, size_t n, const style_t *st, size_t *out_n,
+                              uint32_t *source) {
     char *o = ar_alloc(a, n * 8 + 1); /* tabs may expand */
     size_t k = 0;
     int ws = st->white_space;
+#define WS_EMIT(c, from) do { if (source) source[k] = (uint32_t)(from); o[k++] = (c); } while (0)
     if (ws == WS_PRE || ws == WS_PRE_WRAP || ws == WS_BREAK_SPACES) {
         int col = 0;
         for (size_t i = 0; i < n; i++) {
             char c = s[i];
             if (c == '\t') {
                 int sp = 8 - col % 8;
-                for (int j = 0; j < sp; j++) o[k++] = ' ';
+                for (int j = 0; j < sp; j++) WS_EMIT(' ', i);
                 col += sp;
             } else {
-                o[k++] = c;
+                WS_EMIT(c, i);
                 col = c == '\n' ? 0 : col + 1;
             }
         }
@@ -119,12 +123,12 @@ static const char *ws_process(arena_t *a, const char *s, size_t n, const style_t
             char c = s[i];
             if (c == '\n' && keep_nl) {
                 while (k > 0 && o[k - 1] == ' ') k--;
-                o[k++] = '\n';
+                WS_EMIT('\n', i);
                 space = true; /* drops the spaces after it */
                 continue;
             }
             if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
-                if (!space) o[k++] = ' ';
+                if (!space) WS_EMIT(' ', i);
                 space = true;
                 continue;
             }
@@ -133,14 +137,31 @@ static const char *ws_process(arena_t *a, const char *s, size_t n, const style_t
                 i++;
                 continue;
             }
-            o[k++] = c;
+            WS_EMIT(c, i);
             space = false;
         }
     }
+#undef WS_EMIT
     o[k] = 0;
+    if (source) source[k] = (uint32_t)n;
+    /* In place and byte for byte: the source map stays exact. */
     if (st->text_transform) transform(o, k, st->text_transform);
     *out_n = k;
     return o;
+}
+
+uint32_t *box_text_source_map(arena_t *a, const box_t *t) {
+    const node_t *n = t ? t->node : NULL;
+    if (!n || n->type != N_TEXT || t->kind != B_TEXT || n->box != t || !t->st || !t->text ||
+        n->textlen > UINT32_MAX - 1 || t->len > SIZE_MAX / sizeof(uint32_t) - 1) return NULL;
+    /* t->len is what this data made when the box was built; a different result means a
+       text change the next layout has not published yet. */
+    uint32_t *source = ar_alloc(a, (t->len + 1) * sizeof *source);
+    size_t length = 0;
+    const char *text = ws_process(a, n->text ? n->text : "", n->textlen, t->st, &length, NULL);
+    if (length != t->len || memcmp(text, t->text, length)) return NULL;
+    ws_process(a, n->text ? n->text : "", n->textlen, t->st, &length, source);
+    return source;
 }
 
 /* ---------------------------------------------------------------- list markers */
@@ -731,7 +752,7 @@ static void fixup(struct bctx *b, box_t *x);
 
 static void text_box(struct bctx *b, box_t *pb, node_t *n, const char *s, size_t len, style_t *st) {
     size_t k;
-    const char *t = ws_process(b->a, s, len, st, &k);
+    const char *t = ws_process(b->a, s, len, st, &k, NULL);
     if (!k) return;
     box_t *x = nbox(b, B_TEXT, n, st);
     x->text = t;
@@ -1729,7 +1750,7 @@ bool boxes_update_text(web_doc *d, node_t *n) {
     arena_t next = {.chunk_size=4096}; jmp_buf trap; next.trap = &trap;
     if (setjmp(trap)) { ar_free(&next); return false; }
     size_t length;
-    const char *text = ws_process(&next,n->text,n->textlen,b->st,&length);
+    const char *text = ws_process(&next,n->text,n->textlen,b->st,&length,NULL);
     next.trap = NULL; ar_free(&b->text_mem); b->text_mem = next;
     b->text=text; b->len=length;
     layout_invalidate(b); return true;

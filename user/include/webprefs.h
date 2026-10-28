@@ -71,7 +71,8 @@ struct webprefs_site_exception {
 };
 /* The rule for a host (ASCII, any case, a final dot ignored); DEFAULT for none. */
 enum webprefs_site_rule webprefs_site_rule(const char *host);
-/* The rule for the host of an http(s) or ws(s) URL; DEFAULT for any other URL. */
+/* The rule for the host of an http(s) or ws(s) URL (or origin), as the URL parser reads it;
+   DEFAULT for any other URL; BLOCK when there is no memory to read it. */
 enum webprefs_site_rule webprefs_site_rule_url(const char *url);
 /* Whether a document or worker of url may use storage and cookies: not when its host is blocked.
    (A URL without a host is the storage owners' own refusal, opaque origins.) */

@@ -96,21 +96,18 @@ static bool strong_tag(const char *p) {
         if ((unsigned char)p[i] < 33 || (unsigned char)p[i] > 126 || p[i] == '"') return false;
     return true;
 }
-/* Media resources are explicit HTTP(S), not bare-host, userinfo or fragment
- * aliases. Shared owned parsing supplies exact host/path and allocation status.
- * No media-only spelling length, hostname or path quota is imposed. */
-static enum http_url_result valid_url(const char *s,struct url_owned *parsed) {
-    memset(parsed,0,sizeof *parsed);
-    if(!s||(strncmp(s,"https://",8)&&strncmp(s,"http://",7)))return HTTP_URL_INVALID;
-    for(const unsigned char *p=(const unsigned char *)s;*p;p++)
-        if(*p<=32||*p>=127||*p=='#'||*p=='\\')return HTTP_URL_INVALID;
-    return url_parse_owned_result_n(s,strlen(s),parsed);
+/* Media resources are http or https URLs as the URL parser reads them (weburl.h): the
+ * request (http.c's target) carries neither their credentials nor their fragment (a media
+ * fragment such as #t=10 is the element's). No media-only spelling, length, hostname or
+ * path quota is imposed. *tls: https. */
+static enum web_url_result valid_url(const char *s,bool *tls) {
+    struct web_url url;int parsed=web_url_read(s,s?strlen(s):0,&url);
+    if(parsed!=1)return parsed<0?WEB_URL_OOM:WEB_URL_INVALID;
+    bool secure=web_url_scheme_is(&url,"https"),http=secure||web_url_scheme_is(&url,"http");
+    web_url_free(&url);if(tls)*tls=secure;
+    return http?WEB_URL_TUPLE:WEB_URL_INVALID;
 }
-static enum http_url_result valid_url_text(const char *s){
-    struct url_owned parsed;
-    enum http_url_result result=valid_url(s,&parsed);
-    url_owned_free(&parsed);return result;
-}
+static enum web_url_result valid_url_text(const char *s){return valid_url(s,NULL);}
 static char *url_join(const char *a,size_t an,const char *b,size_t bn,const char *c,size_t cn) {
     if(cn==SIZE_MAX||an>SIZE_MAX-bn||an+bn>SIZE_MAX-cn-1)return NULL;
     size_t length=an+bn+cn;char *owned=nmedia_ff_malloc(length+1);
@@ -121,27 +118,27 @@ static char *url_join(const char *a,size_t an,const char *b,size_t bn,const char
 /* Document origins use the same exact serializer as browser fetch/frames.
  * Opaque documents still fail closed: never manufacture an Origin:null grant.
  * The media resource's explicit HTTP grammar is independent of this. */
-static enum http_url_result browser_origin(const char *url,const char *document_url,
+static enum web_url_result browser_origin(const char *url,const char *document_url,
                                           char **site,bool *cross) {
     char *target=NULL;*site=NULL;
-    enum http_url_result result=http_origin_owned(document_url,site);
-    if(result==HTTP_URL_TUPLE)result=http_origin_owned(url,&target);
-    if(result==HTTP_URL_TUPLE&&!strncmp(*site,"https://",8)&&strncmp(target,"https://",8))
-        result=HTTP_URL_INVALID;
-    if(result==HTTP_URL_TUPLE)*cross=strcmp(*site,target)!=0;
+    enum web_url_result result=web_url_origin(document_url,site);
+    if(result==WEB_URL_TUPLE)result=web_url_origin(url,&target);
+    if(result==WEB_URL_TUPLE&&web_url_has_scheme(*site,"https")&&!web_url_has_scheme(target,"https"))
+        result=WEB_URL_INVALID;
+    if(result==WEB_URL_TUPLE)*cross=strcmp(*site,target)!=0;
     else {free(*site);*site=NULL;}
     free(target);return result;
 }
 bool nmedia_http_browser_url(const char *url,const char *document_url) {
-    if(valid_url_text(url)!=HTTP_URL_TUPLE)return false;
+    if(valid_url_text(url)!=WEB_URL_TUPLE)return false;
     char *site;bool cross;
-    enum http_url_result result=browser_origin(url,document_url,&site,&cross);
-    free(site);return result==HTTP_URL_TUPLE;
+    enum web_url_result result=browser_origin(url,document_url,&site,&cross);
+    free(site);return result==WEB_URL_TUPLE;
 }
 static bool reader_origin(nmedia_http *r,const char *document_url) {
-    enum http_url_result result=browser_origin(r->url,document_url,&r->origin,&r->cross);
-    if(result!=HTTP_URL_TUPLE){
-        snprintf(r->error,sizeof r->error,"%s",result==HTTP_URL_OOM?
+    enum web_url_result result=browser_origin(r->url,document_url,&r->origin,&r->cross);
+    if(result!=WEB_URL_TUPLE){
+        snprintf(r->error,sizeof r->error,"%s",result==WEB_URL_OOM?
             "media origin allocation failed":"invalid, opaque or mixed-content native media origin");
         return false;
     }
@@ -182,64 +179,19 @@ static int cors(struct transfer *t) {
         return rejected(t,"anonymous media CORS response denied");
     return 0;
 }
-/* RFC 3986 dot-segment removal, without browser whitespace repair or path
- * truncation. Only the path is normalized; the query remains byte-for-byte. */
-static void remove_dots(char *path) {
-    char *query=strchr(path,'?');
-    size_t length=query?(size_t)(query-path):strlen(path),query_length=query?strlen(query):0;
-    size_t used=0,at=0;
-    while(at<length){
-        size_t left=length-at;const char *in=path+at;
-        if(left>=3&&!memcmp(in,"../",3))at+=3;
-        else if(left>=2&&!memcmp(in,"./",2))at+=2;
-        else if(left>=3&&!memcmp(in,"/./",3))at+=2;
-        else if(left==2&&!memcmp(in,"/.",2)){at+=2;path[used++]='/';}
-        else if((left>=4&&!memcmp(in,"/../",4))||(left==3&&!memcmp(in,"/..",3))){
-            at+=3;while(used&&path[used-1]!='/')used--;if(used)used--;
-            if(at==length)path[used++]='/';
-        }else if((left==1&&in[0]=='.')||(left==2&&!memcmp(in,"..",2)))at=length;
-        else {
-            size_t end=at+1;while(end<length&&path[end]!='/')end++;
-            size_t take=end-at;memmove(path+used,path+at,take);used+=take;at=end;
-        }
-    }
-    /* Every path operation is deletion-only. Move the original query after
-     * the compacted path; it is never normalized or interpreted as segments. */
-    if(query_length)memmove(path+used,query,query_length);
-    path[used+query_length]=0;
-}
-enum http_url_result nmedia_http_resolve(const char *base,const char *location,char **out) {
-    *out=NULL;struct url_owned before={0},after={0};char *candidate=NULL;
-    enum http_url_result result=valid_url(base,&before);
-    if(result!=HTTP_URL_TUPLE)goto done;
-    if(!location||!location[0]){result=HTTP_URL_INVALID;goto done;}
-    size_t supplied=strlen(location);
-    if(!strncmp(location,"http://",7)||!strncmp(location,"https://",8))
-        candidate=url_join(NULL,0,NULL,0,location,supplied);
-    else if(!strncmp(location,"//",2)){
-        const char *scheme=before.tls?"https:":"http:";
-        candidate=url_join(scheme,strlen(scheme),NULL,0,location,supplied);
-    }else {
-        const char *colon=strchr(location,':');
-        if(colon&&colon<location+strcspn(location,"/?")){result=HTTP_URL_INVALID;goto done;}
-        const char *authority=strstr(base,"://")+3;
-        size_t origin=(size_t)(authority+strcspn(authority,"/?")-base);
-        size_t path_size=strcspn(before.path,"?");
-        if(location[0]=='/')path_size=0;
-        else if(location[0]!='?')while(path_size&&before.path[path_size-1]!='/')path_size--;
-        candidate=url_join(base,origin,before.path,path_size,location,supplied);
-    }
-    if(!candidate){result=HTTP_URL_OOM;goto done;}
-    result=valid_url(candidate,&after);
-    if(result!=HTTP_URL_TUPLE)goto done;
-    if(before.tls&&!after.tls){result=HTTP_URL_INVALID;goto done;}
-    remove_dots(after.path);
-    const char *authority=strstr(candidate,"://")+3;
-    size_t origin=(size_t)(authority+strcspn(authority,"/?")-candidate);
-    *out=url_join(candidate,origin,NULL,0,after.path,strlen(after.path));
-    if(!*out)result=HTTP_URL_OOM;
-done:
-    nmedia_ff_free(candidate);url_owned_free(&before);url_owned_free(&after);return result;
+/* location (a redirect's, a manifest's) against base by the URL parser (web_url.c): an http or
+ * https URL in *out (nmedia_ff_free it), never from https down to http. */
+enum web_url_result nmedia_http_resolve(const char *base,const char *location,char **out) {
+    *out=NULL;bool tls_before=false,tls_after=false;char *resolved=NULL;
+    enum web_url_result result=valid_url(base,&tls_before);
+    if(result!=WEB_URL_TUPLE)return result;
+    if(!location||!location[0])return WEB_URL_INVALID;
+    int parsed=web_resolve_url_owned(base,location,&resolved);
+    if(parsed!=1)return parsed<0?WEB_URL_OOM:WEB_URL_INVALID;
+    result=valid_url(resolved,&tls_after);
+    if(result==WEB_URL_TUPLE&&tls_before&&!tls_after)result=WEB_URL_INVALID;
+    if(result==WEB_URL_TUPLE&&!(*out=url_join(NULL,0,NULL,0,resolved,strlen(resolved))))result=WEB_URL_OOM;
+    free(resolved);return result;
 }
 static int header(void *opaque, const char *line, size_t size) {
     struct transfer *t = opaque;
@@ -360,10 +312,10 @@ static bool refill(nmedia_http *r, int64_t at) {
         int result = http_request(&request, &response);
         nmedia_ff_free(headers);
         if (redirect_status(response.status) && (result == 0 || t.discard) && !t.error[0]) {
-            char *next=NULL;enum http_url_result redirect=HTTP_URL_INVALID;
+            char *next=NULL;enum web_url_result redirect=WEB_URL_INVALID;
             if(!r->browser&&!r->initialized&&redirects<5)redirect=nmedia_http_resolve(r->url,t.location,&next);
             http_resp_free(&response);transfer_free(&t);
-            if(redirect!=HTTP_URL_TUPLE){snprintf(r->error,sizeof r->error,"%s",redirect==HTTP_URL_OOM?
+            if(redirect!=WEB_URL_TUPLE){snprintf(r->error,sizeof r->error,"%s",redirect==WEB_URL_OOM?
                 "media redirect allocation failed":"unsafe, changed or excessive media redirect");return false;}
             nmedia_ff_free(r->url);r->url=next;continue;
         }
@@ -409,9 +361,9 @@ static int download_body(void *opaque,const char *bytes,size_t size) {
 bool nmedia_http_get_bounded_cors(const char *url,const char *document_url,size_t maximum,
     uint8_t **bytes,size_t *length,char *error,size_t error_size) {
     if(bytes)*bytes=NULL;if(length)*length=0;
-    enum http_url_result valid=valid_url_text(url);
-    if(!bytes||!length||!maximum||maximum>NMEDIA_HTTP_COMPLETE_BYTES||valid!=HTTP_URL_TUPLE){
-        if(error&&error_size)snprintf(error,error_size,"%s",valid==HTTP_URL_OOM?
+    enum web_url_result valid=valid_url_text(url);
+    if(!bytes||!length||!maximum||maximum>NMEDIA_HTTP_COMPLETE_BYTES||valid!=WEB_URL_TUPLE){
+        if(error&&error_size)snprintf(error,error_size,"%s",valid==WEB_URL_OOM?
             "complete media URL allocation failed":"invalid or unbounded complete media URL");
         return false;
     }
@@ -434,10 +386,10 @@ bool nmedia_http_get_bounded_cors(const char *url,const char *document_url,size_
         int result=http_request(&request,&response);
         nmedia_ff_free(headers);
         if(redirect_status(response.status)&&(result==0||d.t.discard)&&!d.t.error[0]){
-            char *next=NULL;enum http_url_result redirect=HTTP_URL_INVALID;
+            char *next=NULL;enum web_url_result redirect=WEB_URL_INVALID;
             if(!r->browser&&redirects<5)redirect=nmedia_http_resolve(r->url,d.t.location,&next);
             http_resp_free(&response);transfer_free(&d.t);nmedia_ff_free(d.bytes);
-            if(redirect!=HTTP_URL_TUPLE){snprintf(r->error,sizeof r->error,"%s",redirect==HTTP_URL_OOM?
+            if(redirect!=WEB_URL_TUPLE){snprintf(r->error,sizeof r->error,"%s",redirect==WEB_URL_OOM?
                 "complete media redirect allocation failed":"unsafe or excessive complete media redirect");break;}
             nmedia_ff_free(r->url);r->url=next;continue;
         }
@@ -452,9 +404,9 @@ bool nmedia_http_get_bounded_cors(const char *url,const char *document_url,size_
 }
 
 static nmedia_http *open_reader(const char *url,const char *document_url,char *error,size_t error_size) {
-    enum http_url_result valid=valid_url_text(url);
-    if (valid!=HTTP_URL_TUPLE) {
-        if(error&&error_size)snprintf(error,error_size,"%s",valid==HTTP_URL_OOM?
+    enum web_url_result valid=valid_url_text(url);
+    if (valid!=WEB_URL_TUPLE) {
+        if(error&&error_size)snprintf(error,error_size,"%s",valid==WEB_URL_OOM?
             "media URL allocation failed":"invalid native media URL");
         return NULL;
     }

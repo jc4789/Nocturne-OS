@@ -43,21 +43,18 @@ static bool seconds(const char *p,int64_t *out){
         for(unsigned digits=0;*p>='0'&&*p<='9';digits++){if(digits>=6)return false;f=f*10+(*p++-'0');scale*=10;}}
     if(*p||n>1000000000u)return false;*out=(int64_t)(n*1000000+f*1000000/scale);return true;
 }
-static bool safe_uri(const char *p){
-    if(!p||!*p)return false;
-    for(const unsigned char *q=(const unsigned char *)p;*q;q++)
-        if(*q<=32||*q>=127||*q=='#'||*q=='\\')return false;
-    const char *a=strstr(p,"://");if(a&&strncmp(p,"http://",7)&&strncmp(p,"https://",8))return false;
-    if(a){a+=3;const char *end=a+strcspn(a,"/?");if(a==end||memchr(a,'@',(size_t)(end-a)))return false;}
-    return true;
-}
-enum http_url_result nmedia_adaptive_resolve_owned(const char *base,const char *uri,char **out){
-    *out=NULL;if(!safe_uri(base)||!safe_uri(uri))return HTTP_URL_INVALID;
+/* A manifest's URI, kept as written until it is used: the URL parser decides what it is when
+   it is resolved against its base (nmedia_adaptive_resolve_owned). */
+static bool uri_given(const char *p){return p&&*p;}
+/* A manifest's URI (HLS's, DASH's BaseURL) against its base: the URL parser's resolution
+   (media_http.c's nmedia_http_resolve), an http or https URL. */
+enum web_url_result nmedia_adaptive_resolve_owned(const char *base,const char *uri,char **out){
+    *out=NULL;if(!base||!*base||!uri||!*uri)return WEB_URL_INVALID;
     return nmedia_http_resolve(base,uri,out);
 }
 bool nmedia_adaptive_resolve(const char *base,const char *uri,char *out,size_t z){
-    char *owned=NULL;enum http_url_result result=nmedia_adaptive_resolve_owned(base,uri,&owned);
-    bool ok=result==HTTP_URL_TUPLE&&out&&strlen(owned)<z;
+    char *owned=NULL;enum web_url_result result=nmedia_adaptive_resolve_owned(base,uri,&owned);
+    bool ok=result==WEB_URL_TUPLE&&out&&strlen(owned)<z;
     if(ok)memcpy(out,owned,strlen(owned)+1);nmedia_ff_free(owned);return ok;
 }
 struct attribute {char key[64];const char *value;};
@@ -99,7 +96,7 @@ static int parse_hls(char *text,size_t bytes,const char *base,
                              struct nmedia_adaptive_manifest *m,char *e,size_t z){
     if(e&&z)*e=0;if(!text||bytes<8||bytes>NMEDIA_ADAPTIVE_MANIFEST_BYTES||memchr(text,0,bytes)||
         strncmp(text,"#EXTM3U",7)||(text[7]!='\n'&&text[7]!='\r'))return (reject(e,z,"invalid HLS manifest"),-1);
-    if(!safe_uri(base)||(m->tracks[0].base=manifest_copy(m,base,strlen(base)))==NULL)goto syntax;
+    if(!uri_given(base)||(m->tracks[0].base=manifest_copy(m,base,strlen(base)))==NULL)goto syntax;
     struct nmedia_adaptive_track *t=&m->tracks[0];
     bool master=false,ended=false,have_duration=false,target=false,have_map=false,pending_variant=false,variant_ok=false;
     int64_t duration=0,range_start=0,range_bytes=0,previous_end=0,best=INT64_MAX,bandwidth=0;
@@ -110,9 +107,9 @@ static int parse_hls(char *text,size_t bytes,const char *base,
         if(!n||!strcmp(line,"#EXTM3U")){line=next;continue;}
         if(line[0]!='#'){
             if(ended)goto syntax;
-            if(pending_variant){if(variant_ok&&bandwidth<best){if(!safe_uri(line)||(m->variant=manifest_copy(m,line,n))==NULL)goto syntax;best=bandwidth;}pending_variant=false;}
+            if(pending_variant){if(variant_ok&&bandwidth<best){if(!uri_given(line)||(m->variant=manifest_copy(m,line,n))==NULL)goto syntax;best=bandwidth;}pending_variant=false;}
             else{
-                if(master||!have_duration||t->count>=NMEDIA_ADAPTIVE_SEGMENTS||!safe_uri(line))goto syntax;
+                if(master||!have_duration||t->count>=NMEDIA_ADAPTIVE_SEGMENTS||!uri_given(line))goto syntax;
                 if(range_bytes&&range_start<0){if(strcmp(previous_uri,line))goto syntax;range_start=previous_end;}
                 struct nmedia_adaptive_segment *s=&t->segments[t->count++];if(!(s->uri=manifest_copy(m,line,n)))goto syntax;
                 s->start_us=m->duration_us;s->duration_us=duration;s->range_start=range_start;s->range_bytes=range_bytes;
@@ -150,7 +147,7 @@ static int parse_hls(char *text,size_t bytes,const char *base,
             if(na!=1||!v||strcmp(v,"NONE"))return (reject(e,z,"encrypted HLS is unsupported"),-1);
         }else if(!strncmp(line,"#EXT-X-MAP:",11)){
             if(master||t->count||have_map)goto syntax;struct attribute a[8];int na=attributes(m,line+11,a,8);
-            const char *v=attr(a,na,"URI");if(na<1||!v||!safe_uri(v))goto syntax;
+            const char *v=attr(a,na,"URI");if(na<1||!v||!uri_given(v))goto syntax;
             v=attr(a,na,"BYTERANGE");if(v){char b[128];if(!copy(b,sizeof b,v,strlen(v))||!strchr(b,'@')||
                 !range_value(b,&t->init_start,&t->init_bytes))goto syntax;}
             for(int i=0;i<na;i++)if(strcmp(a[i].key,"URI")&&strcmp(a[i].key,"BYTERANGE"))goto syntax;
@@ -329,14 +326,14 @@ static bool dash_segment(struct xml_reader *r,struct nmedia_adaptive_track *t,co
     start-=t->presentation_offset_us;if(start<0)return reject(r->error,r->capacity,"DASH negative segment start is unsupported");
     if(start>=presentation)return true;
     struct nmedia_adaptive_segment *s=&t->segments[t->count++];
-    if(!(s->uri=dash_expand(r->owner,d->media,id,bandwidth,number,time))||!safe_uri(s->uri))
+    if(!(s->uri=dash_expand(r->owner,d->media,id,bandwidth,number,time))||!uri_given(s->uri))
         return reject(r->error,r->capacity,"unsupported DASH URL template");
     s->start_us=start;s->duration_us=span;s->range_start=s->range_bytes=0;return true;
 }
 static bool dash_track_build(struct xml_reader *r,struct nmedia_adaptive_track *t,const struct dash_template *d,
                               const char *id,int64_t bandwidth,int64_t presentation){
     if(!d->media||!d->init||!d->media[0]||!d->init[0]||!scale_us(d->offset,d->scale,&t->presentation_offset_us)||
-       !(t->init=dash_expand(r->owner,d->init,id,bandwidth,d->number,0))||!safe_uri(t->init))
+       !(t->init=dash_expand(r->owner,d->init,id,bandwidth,d->number,0))||!uri_given(t->init))
         return reject(r->error,r->capacity,"missing or unsupported DASH initialization");
     t->mp4=true;int64_t number=d->number,time=0;
     if(!d->timeline){
@@ -374,11 +371,11 @@ static bool dash_base(struct xml_reader *r,const struct xml_element *x,const cha
     struct attribute a[1];if(xml_attributes(r,x,a,1)!=0)return reject(r->error,r->capacity,"DASH BaseURL extensions are unsupported");
     const char *p=ws(x->body,x->end),*end=x->end;while(end>p&&isspace((unsigned char)end[-1]))end--;
     char *uri=xml_text(r->owner,p,end),*resolved=NULL;
-    enum http_url_result result=uri?nmedia_adaptive_resolve_owned(base,uri,&resolved):HTTP_URL_INVALID;
-    if(result==HTTP_URL_OOM)r->owner->allocation_failed=true;
-    if(result==HTTP_URL_TUPLE)*out=manifest_copy(r->owner,resolved,strlen(resolved));
+    enum web_url_result result=uri?nmedia_adaptive_resolve_owned(base,uri,&resolved):WEB_URL_INVALID;
+    if(result==WEB_URL_OOM)r->owner->allocation_failed=true;
+    if(result==WEB_URL_TUPLE)*out=manifest_copy(r->owner,resolved,strlen(resolved));
     nmedia_ff_free(resolved);
-    return (result==HTTP_URL_TUPLE&&*out)||reject(r->error,r->capacity,"invalid DASH BaseURL");
+    return (result==WEB_URL_TUPLE&&*out)||reject(r->error,r->capacity,"invalid DASH BaseURL");
 }
 struct dash_representation {const char *id,*codec,*mime,*base;int64_t bandwidth,width,height;struct dash_template templ;};
 static bool dash_rep_read(struct xml_reader *r,const struct xml_element *x,const struct dash_representation *in,
@@ -441,7 +438,7 @@ static bool parse_dash(char *text,size_t bytes,const char *base,struct nmedia_ad
     const char *v=attr(a,n,"type");if(v&&strcmp(v,"static"))return reject(e,z,"dynamic DASH is unsupported");
     v=attr(a,n,"xmlns");if(v&&strcmp(v,"urn:mpeg:dash:schema:mpd:2011"))return reject(e,z,"unsupported DASH namespace");
     if(!iso_duration(attr(a,n,"mediaPresentationDuration"),&m->duration_us)||m->duration_us<=0)return reject(e,z,"missing finite DASH duration");
-    const char *root_base=manifest_copy(m,base,strlen(base));if(!root_base||!safe_uri(base))return false;
+    const char *root_base=manifest_copy(m,base,strlen(base));if(!root_base||!uri_given(base))return false;
     struct dash_template root_template={.scale=1,.number=1};struct xml_element period={0},c;bool b=false,t=false;
     p=mpd.body;
     while(p<mpd.end){if(!xml_next(&r,&p,mpd.end,&c))return false;if(!c.name[0])break;

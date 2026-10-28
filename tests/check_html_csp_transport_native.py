@@ -15,7 +15,7 @@ def between(text, begin, end):
 parts = [net[:net.index('static void load_cookie_psl')],
          between(net, 'uint64_t webnet_submit', 'static bool start('),
          worker[:worker.index('static bool read_all(')],
-         between(worker, 'static bool fail(', '/* Only publish a replacement'),
+         between(worker, 'static bool fail(', '/* raw read by the URL parser as an http or https URL'),
          between(worker, 'static bool no_cors(', '/* Headers have already been validated'),
          between(worker, 'static int body_cb(', 'static int discard_cb('),
          between(worker, 'static bool exposed_header(', 'static bool run_http(')]

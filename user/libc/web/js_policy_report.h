@@ -1,8 +1,15 @@
 /* Native CSP report transport. Never calls page JSON/toJSON or exposed Fetch. */
+static void policy_report_post(struct web_js_state *s,JSValueConst init,const char *url,const char *origin);
+/* A report goes to an http(s) URL without credentials (a report request carries none), as the
+   URL parser reads url. */
 static void policy_report_url(struct web_js_state *s,JSValueConst init,const char *url,const char *origin){
-    if(!url || (strncasecmp(url,"http://",7)&&strncasecmp(url,"https://",8)))return;
-    const char *authority=strstr(url,"://")+3,*end=authority+strcspn(authority,"/?#");
-    if(memchr(authority,'@',end-authority))return;
+    struct web_url target;int read=url?web_url_read(url,strlen(url),&target):0;
+    if(read<0){log_text(s,2,"CSP report URL could not be read: out of memory");return;}
+    if(read!=1)return;
+    if(web_url_http_scheme(&target)&&!web_url_includes_credentials(&target))policy_report_post(s,init,target.href,origin);
+    web_url_free(&target);
+}
+static void policy_report_post(struct web_js_state *s,JSValueConst init,const char *url,const char *origin){
     JSValue record=JS_NewObjectProto(s->ctx,JS_NULL),envelope=JS_NewObjectProto(s->ctx,JS_NULL);
     const char *fields[]={"documentURI","referrer","blockedURI","violatedDirective","effectiveDirective","originalPolicy","sourceFile","sample","disposition","statusCode","lineNumber","columnNumber"};
     const char *wire[]={"document-uri","referrer","blocked-uri","violated-directive","effective-directive","original-policy","source-file","script-sample","disposition","status-code","line-number","column-number"};
@@ -44,7 +51,7 @@ static void js_policy_worker_report(void *opaque,JSValueConst message){
         // Workers use the creator's effective URL, never the report endpoint.
         JSValue document=JS_GetPropertyStr(s->ctx,init,"documentURI");
         const char *document_uri=JS_IsString(document)?JS_ToCString(s->ctx,document):NULL;
-        const char *origin=document_uri&&(!strncasecmp(document_uri,"http://",7)||!strncasecmp(document_uri,"https://",8))?document_uri:web_effective_url(s->doc);
+        const char *origin=web_url_has_scheme(document_uri,"http")||web_url_has_scheme(document_uri,"https")?document_uri:web_effective_url(s->doc);
         JSValue count=JS_GetPropertyStr(s->ctx,endpoints,"length");uint32_t length=0;
         if(JS_ToUint32(s->ctx,&length,count)<0)exception(s);
         else for(uint32_t i=0;i<length;i++){

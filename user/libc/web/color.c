@@ -226,612 +226,35 @@ static bool tok_ident(const struct tok *t, const char *kw) {
 }
 static bool name_is(const char *s, size_t n, const char *kw) { return strn_ieq(s, kw, n); }
 
-/* ---------------------------------------------------------------- math functions (CSS Values 4, 10) */
+/* ---------------------------------------------------------------- numbers and math (cssmath.c owns them) */
+/* a channel's type */
 enum { MT_NUM, MT_PCT, MT_ANGLE, MT_LEN };
-enum { MN_LEAF, MN_KEY, MN_SUM, MN_PRODUCT, MN_NEGATE, MN_INVERT, MN_FN };
-enum { MF_MIN, MF_MAX, MF_CLAMP, MF_ROUND, MF_MOD, MF_REM, MF_SIN, MF_COS, MF_TAN, MF_ASIN, MF_ACOS, MF_ATAN,
-       MF_ATAN2, MF_POW, MF_SQRT, MF_HYPOT, MF_LOG, MF_EXP, MF_ABS, MF_SIGN, MF_COUNT };
-static const char *const math_names[MF_COUNT] = {"min", "max", "clamp", "round", "mod", "rem", "sin", "cos", "tan",
-    "asin", "acos", "atan", "atan2", "pow", "sqrt", "hypot", "log", "exp", "abs", "sign"};
-enum { RS_NEAREST, RS_UP, RS_DOWN, RS_TO_ZERO };
-static const char *const round_names[] = {"nearest", "up", "down", "to-zero"};
-struct cm {
-    uint8_t op, type, fn, n;
-    uint8_t key;     /* MN_KEY: the channel 0..3; MF_ROUND: the strategy */
-    bool hint;       /* a percentage made it though its type is not one (sign(), §10.9's percent hint):
-                        valid only where percentages are */
-    char unit[7];    /* MN_LEAF: "" number, "%" percentage, else a lowercase unit */
-    double v;
-    struct cm **k;
-};
-static const struct cx unit_probe = {.em = 16, .rem = 16, .vw = 100, .vh = 100};
-static const struct cx no_element = {.em = 16, .rem = 16, .vw = 800, .vh = 600};
-
-static double angle_unit(const char *u, size_t n) {
-    if (name_is(u, n, "deg")) return 1;
-    if (name_is(u, n, "grad")) return 0.9;
-    if (name_is(u, n, "rad")) return 180 / M_PI;
-    if (name_is(u, n, "turn")) return 360;
-    return 0;
-}
-static double absolute_length(const char *u) {
-    static const struct { const char *u; double px; } units[] = {
-        {"px", 1}, {"in", 96}, {"cm", 96 / 2.54}, {"mm", 96 / 25.4}, {"q", 96 / 101.6}, {"pt", 4.0 / 3}, {"pc", 16}};
-    for (size_t i = 0; i < sizeof units / sizeof *units; i++)
-        if (!strcmp(units[i].u, u)) return units[i].px;
-    return 0;
-}
-/* a leaf's type from its unit; false for an unknown unit */
-static bool unit_type(const char *u, size_t n, bool pct, uint8_t *type) {
-    if (pct) { *type = MT_PCT; return true; }
-    if (!n) { *type = MT_NUM; return true; }
-    if (angle_unit(u, n)) { *type = MT_ANGLE; return true; }
-    float px, p;
-    bool number;
-    if (n < 7 && css_unit_px(u, n, 1, &unit_probe, &px, &p, &number) && !number) { *type = MT_LEN; return true; }
-    return false;
-}
-/* a leaf in its canonical unit: degrees, pixels (context-free lengths only), or as is */
-static double leaf_value(const struct cm *m, const struct cx *cx, bool *resolved) {
-    if (m->type == MT_ANGLE) return m->v * angle_unit(m->unit, strlen(m->unit));
-    if (m->type != MT_LEN) return m->v;
-    double abs = absolute_length(m->unit);
-    if (abs) return m->v * abs;
-    if (!cx) {
-        /* no element (canvas, attributes): the initial font and viewport */
-        if (resolved) *resolved = false;
-        cx = &no_element;
-    }
-    float px, pct;
-    bool number;
-    if (!css_unit_px(m->unit, strlen(m->unit), (float)m->v, cx, &px, &pct, &number)) return 0;
-    return px;
-}
-
 struct pctx {
     arena_t *a;
     int depth;
-    unsigned nodes;
     const char *const *keys; /* relative colour channel keywords (4, the last is alpha), or NULL */
-    bool in_math;
     bool unclamped; /* the animation layer's computed-value text (cx.computed_text): rgb() keeps its range */
 };
 static void *p_alloc(struct pctx *P, size_t n) { return ar_alloc(P->a, n); }
-static struct cm *m_new(struct pctx *P, uint8_t op, unsigned n) {
-    if (++P->nodes > 4096) return NULL;
-    struct cm *m = p_alloc(P, sizeof *m);
-    m->op = op;
-    m->n = (uint8_t)n;
-    if (n) m->k = p_alloc(P, n * sizeof *m->k);
-    return m;
+/* a literal's type from its unit; false for an unknown unit */
+static bool unit_type(const char *u, size_t n, bool pct, uint8_t *type) {
+    if (pct) { *type = MT_PCT; return true; }
+    switch (css_unit_kind(css_unit_find(u, n))) {
+    case CSS_CALC_NUMBER: *type = MT_NUM; return true;
+    case CSS_CALC_ANGLE: *type = MT_ANGLE; return true;
+    case CSS_CALC_LENGTH: *type = MT_LEN; return true;
+    }
+    return false;
 }
-static struct cm *m_leaf(struct pctx *P, double v, const char *unit, uint8_t type) {
-    struct cm *m = m_new(P, MN_LEAF, 0);
-    if (!m) return NULL;
-    m->v = v;
-    m->type = type;
-    snprintf(m->unit, sizeof m->unit, "%s", unit);
-    return m;
+/* the math owner's types for a channel's (bit 1<<MT_*) */
+static unsigned calc_accept(unsigned types) {
+    static const unsigned kinds[] = {CSS_CALC_NUMBER, CSS_CALC_PERCENT, CSS_CALC_ANGLE, CSS_CALC_LENGTH};
+    unsigned accept = 0;
+    for (unsigned i = 0; i < 4; i++) if (types & 1u << i) accept |= kinds[i];
+    return accept;
 }
-static bool m_numeric(const struct cm *m) { return m->op == MN_LEAF; }
-/* a leaf whose value needs no element: not a font, viewport or container length */
-static bool m_free(const struct cm *m) {
-    return m->op == MN_LEAF && (m->type != MT_LEN || absolute_length(m->unit));
-}
-static bool m_same_unit(const struct cm *a, const struct cm *b) {
-    if (a->type != b->type) return false;
-    if (a->type == MT_LEN) return !strcmp(a->unit, b->unit) || (absolute_length(a->unit) && absolute_length(b->unit));
-    return true; /* numbers, percentages, and angles in degrees */
-}
-static void m_canon(struct cm *m) {
-    /* inside a math function, angles and absolute lengths are in their canonical unit */
-    if (m->op != MN_LEAF) return;
-    if (m->type == MT_ANGLE && strcmp(m->unit, "deg")) { m->v *= angle_unit(m->unit, strlen(m->unit)); strcpy(m->unit, "deg"); }
-    else if (m->type == MT_LEN && absolute_length(m->unit) && strcmp(m->unit, "px")) {
-        m->v *= absolute_length(m->unit);
-        strcpy(m->unit, "px");
-    }
-}
-
-static double m_eval(const struct cm *m, const double *ch, const struct cx *cx, bool *resolved);
-static double round_to(double a, double b, int strategy) {
-    if (!isfinite(a) || b == 0 || isnan(b)) return NAN;
-    if (isinf(b)) {
-        if (strategy == RS_UP) return a > 0 ? INFINITY : copysign(0, a);
-        if (strategy == RS_DOWN) return a < 0 ? -INFINITY : copysign(0, a);
-        return copysign(0, a);
-    }
-    double q = a / b, lo = floor(q) * b, hi = ceil(q) * b;
-    if (lo > hi) { double t = lo; lo = hi; hi = t; }
-    switch (strategy) {
-    case RS_UP: return hi;
-    case RS_DOWN: return lo;
-    case RS_TO_ZERO: return fabs(lo) < fabs(hi) ? lo : hi;
-    default: return a - lo < hi - a ? lo : hi;
-    }
-}
-static double m_fn(const struct cm *m, const double *x) {
-    double a = x[0], b = m->n > 1 ? x[1] : 0;
-    switch (m->fn) {
-    case MF_MIN: { double r = a; for (unsigned i = 1; i < m->n; i++) if (isnan(x[i]) || x[i] < r) r = x[i]; return r; }
-    case MF_MAX: { double r = a; for (unsigned i = 1; i < m->n; i++) if (isnan(x[i]) || x[i] > r) r = x[i]; return r; }
-    case MF_CLAMP: { double v = b < a ? a : b; return x[2] < v ? (x[2] > a ? x[2] : a) : v; }
-    case MF_ROUND: return round_to(a, m->n > 1 ? b : 1, m->key);
-    case MF_MOD: { if (b == 0 || isinf(a)) return NAN; if (isinf(b)) return (a < 0) == (b < 0) ? a : NAN;
-        double r = fmod(a, b); if (r != 0 && (r < 0) != (b < 0)) r += b; return r; }
-    case MF_REM: { if (b == 0 || isinf(a)) return NAN; if (isinf(b)) return a; return fmod(a, b); }
-    case MF_SIN: return sin(m->k[0]->type == MT_ANGLE ? a * M_PI / 180 : a);
-    case MF_COS: return cos(m->k[0]->type == MT_ANGLE ? a * M_PI / 180 : a);
-    case MF_TAN: return tan(m->k[0]->type == MT_ANGLE ? a * M_PI / 180 : a);
-    case MF_ASIN: return asin(a) * 180 / M_PI;
-    case MF_ACOS: return acos(a) * 180 / M_PI;
-    case MF_ATAN: return atan(a) * 180 / M_PI;
-    case MF_ATAN2: return atan2(a, b) * 180 / M_PI;
-    case MF_POW: return pow(a, b);
-    case MF_SQRT: return sqrt(a);
-    case MF_HYPOT: { double r = 0; for (unsigned i = 0; i < m->n; i++) r = hypot(r, x[i]); return r; }
-    case MF_LOG: return m->n > 1 ? log(a) / log(b) : log(a);
-    case MF_EXP: return exp(a);
-    case MF_ABS: return fabs(a);
-    case MF_SIGN: return a > 0 ? 1 : a < 0 ? -1 : a; /* keeps the sign of zero and NaN */
-    }
-    return NAN;
-}
-/* the value in its type's canonical unit; channel keywords read ch (none is 0 in math) */
-static double m_eval(const struct cm *m, const double *ch, const struct cx *cx, bool *resolved) {
-    switch (m->op) {
-    case MN_LEAF: return leaf_value(m, cx, resolved);
-    case MN_KEY: return ch ? ch[m->key] : 0;
-    case MN_NEGATE: return -m_eval(m->k[0], ch, cx, resolved);
-    case MN_INVERT: return 1 / m_eval(m->k[0], ch, cx, resolved);
-    case MN_SUM: { double r = 0; for (unsigned i = 0; i < m->n; i++) r += m_eval(m->k[i], ch, cx, resolved); return r; }
-    case MN_PRODUCT: { double r = 1; for (unsigned i = 0; i < m->n; i++) r *= m_eval(m->k[i], ch, cx, resolved); return r; }
-    default: {
-        double x[64];
-        for (unsigned i = 0; i < m->n && i < 64; i++) x[i] = m_eval(m->k[i], ch, cx, resolved);
-        return m_fn(m, x);
-    }
-    }
-}
-/* CSS Values 4, 10.10: simplify an operator node whose children are simplified */
-static struct cm *m_simplify(struct pctx *P, struct cm *m) {
-    if (!m) return NULL;
-    if (m->op == MN_NEGATE) {
-        struct cm *c = m->k[0];
-        if (m_numeric(c)) { c->v = -c->v; return c; }
-        if (c->op == MN_NEGATE) return c->k[0];
-        return m;
-    }
-    if (m->op == MN_INVERT) {
-        struct cm *c = m->k[0];
-        if (m_numeric(c) && c->type == MT_NUM) { c->v = 1 / c->v; return c; }
-        if (c->op == MN_INVERT) return c->k[0];
-        return m;
-    }
-    if (m->op == MN_SUM || m->op == MN_PRODUCT) {
-        /* flatten nested nodes of the same operator */
-        unsigned count = 0;
-        for (unsigned i = 0; i < m->n; i++) count += m->k[i]->op == m->op ? m->k[i]->n : 1;
-        struct cm **k = p_alloc(P, (count ? count : 1) * sizeof *k);
-        unsigned j = 0;
-        for (unsigned i = 0; i < m->n; i++)
-            if (m->k[i]->op == m->op) for (unsigned q = 0; q < m->k[i]->n; q++) k[j++] = m->k[i]->k[q];
-            else k[j++] = m->k[i];
-        if (count > 255) return NULL;
-        m->k = k;
-        m->n = (uint8_t)count;
-        if (m->op == MN_SUM) {
-            for (unsigned i = 0; i < m->n; i++) {
-                if (!m_free(m->k[i])) continue;
-                for (unsigned q = i + 1; q < m->n;) {
-                    if (m_free(m->k[q]) && m_same_unit(m->k[i], m->k[q])) {
-                        bool r = true;
-                        m->k[i]->v = leaf_value(m->k[i], NULL, &r) + leaf_value(m->k[q], NULL, &r);
-                        m->k[i]->hint |= m->k[q]->hint;
-                        if (m->k[i]->type == MT_LEN) strcpy(m->k[i]->unit, "px");
-                        if (m->k[i]->type == MT_ANGLE) strcpy(m->k[i]->unit, "deg");
-                        memmove(&m->k[q], &m->k[q + 1], (m->n - q - 1) * sizeof *m->k);
-                        m->n--;
-                    } else q++;
-                }
-            }
-            return m->n == 1 ? m->k[0] : m;
-        }
-        /* a product: multiply its numbers, then into one other numeric value */
-        double number = 1;
-        unsigned numbers = 0, w = 0;
-        for (unsigned i = 0; i < m->n; i++) {
-            struct cm *c = m->k[i];
-            if (c->op == MN_LEAF && c->type == MT_NUM) { number *= c->v; numbers++; }
-            else if (c->op == MN_INVERT && m_numeric(c->k[0]) && c->k[0]->type == MT_NUM) { number /= c->k[0]->v; numbers++; }
-            else m->k[w++] = c;
-        }
-        m->n = (uint8_t)w;
-        if (!w) return m_leaf(P, number, "", MT_NUM);
-        if (w == 1 && m_numeric(m->k[0])) { m->k[0]->v *= number; return m->k[0]; }
-        if (w == 1 && m->k[0]->op == MN_SUM) {
-            bool all = true;
-            for (unsigned i = 0; i < m->k[0]->n; i++) all &= m_numeric(m->k[0]->k[i]);
-            if (all) { for (unsigned i = 0; i < m->k[0]->n; i++) m->k[0]->k[i]->v *= number; return m->k[0]; }
-        }
-        if (numbers && number != 1) {
-            struct cm **k2 = p_alloc(P, (w + 1) * sizeof *k2);
-            k2[0] = m_leaf(P, number, "", MT_NUM);
-            if (!k2[0]) return NULL;
-            memcpy(k2 + 1, m->k, w * sizeof *k2);
-            m->k = k2;
-            m->n = (uint8_t)(w + 1);
-        } else if (w == 1) return m->k[0];
-        return m;
-    }
-    if (m->op == MN_FN) {
-        bool all = true;
-        for (unsigned i = 0; i < m->n; i++) all &= m_free(m->k[i]);
-        if (!all) return m;
-        double x[64];
-        bool r = true;
-        for (unsigned i = 0; i < m->n && i < 64; i++) x[i] = leaf_value(m->k[i], NULL, &r);
-        double v = m_fn(m, x);
-        const char *unit = m->type == MT_PCT ? "%" : m->type == MT_ANGLE ? "deg" : m->type == MT_LEN ? "px" : "";
-        return m_leaf(P, v, unit, m->type);
-    }
-    return m;
-}
-
-static struct cm *m_sum(struct pctx *P, const struct tok *t, int n);
-/* one value of a calculation: a numeric literal, a keyword, a nested block or math function */
-static struct cm *m_value(struct pctx *P, const struct tok *t);
-static struct cm *m_function(struct pctx *P, const struct tok *t, bool *calc);
-static struct cm **m_args(struct pctx *P, const char *s, size_t n, unsigned *count) {
-    struct tok buf[TOKS_MAX];
-    int k;
-    const struct tok *t = lx_all(P, s, n, buf, &k);
-    if (!t) return NULL;
-    unsigned c = 1;
-    for (int i = 0; i < k; i++) c += t[i].kind == TK_COMMA;
-    struct cm **out = p_alloc(P, c * sizeof *out);
-    c = 0;
-    int start = 0;
-    for (int i = 0; i <= k; i++) {
-        if (i < k && t[i].kind != TK_COMMA) continue;
-        if (i == start) return NULL;
-        if (!(out[c++] = m_sum(P, t + start, i - start))) return NULL;
-        start = i + 1;
-    }
-    *count = c;
-    return out;
-}
-static struct cm *m_function(struct pctx *P, const struct tok *t, bool *calc) {
-    if (++P->depth > 32) return NULL;
-    struct cm *result = NULL;
-    bool outer = P->in_math;
-    P->in_math = true;
-    *calc = false;
-    if (name_is(TK_NAME(t), TK_LEN(t), "calc")) {
-        struct tok buf[TOKS_MAX];
-        int n;
-        const struct tok *k = lx_all(P, t->in, t->in_n, buf, &n);
-        if (k && n) result = m_sum(P, k, n);
-        *calc = true;
-        goto done;
-    }
-    int fn = -1;
-    for (int i = 0; i < MF_COUNT; i++)
-        if (name_is(TK_NAME(t), TK_LEN(t), math_names[i])) fn = i;
-    if (fn < 0) goto done;
-    struct cm **args;
-    unsigned n = 0;
-    int strategy = RS_NEAREST;
-    const char *in = t->in;
-    size_t in_n = t->in_n;
-    if (fn == MF_ROUND) {
-        struct lex l = {in, in + in_n};
-        struct tok first, comma;
-        lx_next(&l, &first);
-        if (first.kind == TK_IDENT)
-            for (int i = 0; i < 4; i++)
-                if (tok_ident(&first, round_names[i])) {
-                    lx_next(&l, &comma);
-                    if (comma.kind != TK_COMMA) goto done;
-                    strategy = i;
-                    in = l.p;
-                    in_n = (size_t)(t->in + t->in_n - l.p);
-                }
-    }
-    if (!(args = m_args(P, in, in_n, &n))) goto done;
-    static const unsigned min_args[MF_COUNT] = {1, 1, 3, 1, 2, 2, 1, 1, 1, 1, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1};
-    static const unsigned max_args[MF_COUNT] = {~0u, ~0u, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 2, 2, 1, ~0u, 2, 1, 1, 1};
-    if (n < min_args[fn] || n > max_args[fn]) goto done;
-    struct cm *m = m_new(P, MN_FN, n);
-    if (!m) goto done;
-    m->fn = (uint8_t)fn;
-    m->key = (uint8_t)strategy;
-    memcpy(m->k, args, n * sizeof *args);
-    uint8_t t0 = args[0]->type;
-    switch (fn) {
-    case MF_MIN: case MF_MAX: case MF_CLAMP: case MF_HYPOT: case MF_MOD: case MF_REM: case MF_ATAN2:
-        for (unsigned i = 1; i < n; i++) if (args[i]->type != t0) goto done;
-        m->type = fn == MF_ATAN2 ? MT_ANGLE : t0;
-        break;
-    case MF_ROUND:
-        if (n == 1 && t0 != MT_NUM) goto done; /* the step defaults to the number 1 */
-        if (n == 2 && args[1]->type != t0) goto done;
-        m->type = t0;
-        break;
-    case MF_SIN: case MF_COS: case MF_TAN:
-        if (t0 != MT_NUM && t0 != MT_ANGLE) goto done;
-        m->type = MT_NUM;
-        break;
-    case MF_ASIN: case MF_ACOS: case MF_ATAN:
-        if (t0 != MT_NUM) goto done;
-        m->type = MT_ANGLE;
-        break;
-    case MF_POW: case MF_LOG:
-        for (unsigned i = 0; i < n; i++) if (args[i]->type != MT_NUM) goto done;
-        m->type = MT_NUM;
-        break;
-    case MF_SQRT: case MF_EXP:
-        if (t0 != MT_NUM) goto done;
-        m->type = MT_NUM;
-        break;
-    case MF_ABS: m->type = t0; break;
-    case MF_SIGN: m->type = MT_NUM; break;
-    }
-    bool hint = fn == MF_SIGN && t0 == MT_PCT;
-    for (unsigned i = 0; i < n; i++) hint |= args[i]->hint;
-    result = m_simplify(P, m);
-    if (result) result->hint |= hint;
-done:
-    P->in_math = outer;
-    P->depth--;
-    return result;
-}
-static struct cm *m_value(struct pctx *P, const struct tok *t) {
-    if (t->kind == TK_NUM) {
-        char unit[8] = {0};
-        uint8_t type;
-        if (t->name_n >= sizeof unit || !unit_type(t->name, t->name_n, t->pct, &type)) return NULL;
-        for (size_t i = 0; i < t->name_n; i++) unit[i] = (char)lower((unsigned char)t->name[i]);
-        struct cm *m = m_leaf(P, t->num, unit, type);
-        if (m && P->in_math) m_canon(m);
-        return m;
-    }
-    if (t->kind == TK_IDENT) {
-        if (P->keys)
-            for (int i = 0; i < 4; i++)
-                if (P->keys[i] && name_is(TK_NAME(t), TK_LEN(t), P->keys[i])) {
-                    struct cm *m = m_new(P, MN_KEY, 0);
-                    if (m) { m->key = (uint8_t)i; m->type = MT_NUM; }
-                    return m;
-                }
-        if (!P->in_math) return NULL;
-        static const struct { const char *name; double v; } constants[] = {
-            {"e", M_E}, {"pi", M_PI}, {"infinity", INFINITY}, {"-infinity", -INFINITY}, {"nan", NAN}};
-        for (size_t i = 0; i < sizeof constants / sizeof *constants; i++)
-            if (name_is(TK_NAME(t), TK_LEN(t), constants[i].name)) return m_leaf(P, constants[i].v, "", MT_NUM);
-        return NULL;
-    }
-    if (t->kind == TK_PAREN && P->in_math) {
-        if (++P->depth > 32) return NULL;
-        struct tok buf[TOKS_MAX];
-        int n;
-        const struct tok *k = lx_all(P, t->in, t->in_n, buf, &n);
-        struct cm *m = k && n ? m_sum(P, k, n) : NULL;
-        P->depth--;
-        return m;
-    }
-    if (t->kind == TK_FUNC) {
-        bool calc;
-        return m_function(P, t, &calc);
-    }
-    return NULL;
-}
-static struct cm *m_product(struct pctx *P, const struct tok *t, int n) {
-    if (n <= 0) return NULL;
-    struct cm *first = m_value(P, &t[0]);
-    if (!first) return NULL;
-    if (n == 1) return first;
-    struct cm *items[64];
-    unsigned k = 0;
-    items[k++] = first;
-    for (int i = 1; i < n; i += 2) {
-        if (i + 1 >= n || (t[i].kind != TK_DELIM && t[i].kind != TK_SLASH)) return NULL;
-        if (t[i].kind == TK_DELIM && t[i].delim != '*') return NULL;
-        struct cm *v = m_value(P, &t[i + 1]);
-        if (!v || k == 64) return NULL;
-        if (t[i].kind == TK_SLASH) {
-            struct cm *inv = m_new(P, MN_INVERT, 1);
-            if (!inv) return NULL;
-            inv->k[0] = v;
-            inv->type = v->type;
-            inv->hint = v->hint;
-            items[k++] = m_simplify(P, inv);
-        } else items[k++] = v;
-    }
-    /* typed multiplication: at most one non-number factor that is not divided by its own type */
-    uint8_t type = MT_NUM;
-    for (unsigned i = 0; i < k; i++) {
-        struct cm *c = items[i];
-        bool inverse = c->op == MN_INVERT;
-        uint8_t ct = c->type;
-        if (ct == MT_NUM) continue;
-        if (inverse) {
-            if (type != ct) return NULL;
-            type = MT_NUM;
-        } else {
-            if (type != MT_NUM) return NULL;
-            type = ct;
-        }
-    }
-    struct cm *m = m_new(P, MN_PRODUCT, k);
-    if (!m) return NULL;
-    memcpy(m->k, items, k * sizeof *items);
-    m->type = type;
-    bool hint = false;
-    for (unsigned i = 0; i < k; i++) hint |= items[i]->hint;
-    struct cm *r = m_simplify(P, m);
-    if (r) r->hint |= hint;
-    return r;
-}
-static struct cm *m_sum(struct pctx *P, const struct tok *t, int n) {
-    struct cm *items[64];
-    unsigned k = 0;
-    int start = 0;
-    char sign = '+';
-    for (int i = 0; i <= n; i++) {
-        bool op = i < n && t[i].kind == TK_DELIM && (t[i].delim == '+' || t[i].delim == '-');
-        if (i < n && !op) continue;
-        if (op) {
-            /* + and - need whitespace on both sides */
-            if (!i || i + 1 >= n || t[i - 1].e == t[i].s || t[i].e == t[i + 1].s) return NULL;
-        }
-        struct cm *v = m_product(P, t + start, i - start);
-        if (!v || k == 64) return NULL;
-        if (sign == '-') {
-            struct cm *neg = m_new(P, MN_NEGATE, 1);
-            if (!neg) return NULL;
-            neg->k[0] = v;
-            neg->type = v->type;
-            neg->hint = v->hint;
-            v = m_simplify(P, neg);
-        }
-        if (k && v->type != items[0]->type) return NULL;
-        items[k++] = v;
-        if (i < n) sign = t[i].delim;
-        start = i + 1;
-    }
-    if (k == 1) return items[0];
-    struct cm *m = m_new(P, MN_SUM, k);
-    if (!m) return NULL;
-    memcpy(m->k, items, k * sizeof *items);
-    m->type = items[0]->type;
-    bool hint = false;
-    for (unsigned i = 0; i < k; i++) hint |= items[i]->hint;
-    struct cm *r = m_simplify(P, m);
-    if (r) r->hint |= hint;
-    return r;
-}
-/* a copy of m with lengths of the element in pixels, simplified again */
-static struct cm *m_bind(struct pctx *P, const struct cm *m, const struct cx *cx) {
-    if (m->op == MN_LEAF) {
-        struct cm *c = m_leaf(P, m->v, m->unit, m->type);
-        if (c && c->type == MT_LEN && cx) {
-            bool r = true;
-            c->v = leaf_value(m, cx, &r);
-            strcpy(c->unit, "px");
-        }
-        return c;
-    }
-    struct cm *c = m_new(P, m->op, m->n);
-    if (!c) return NULL;
-    c->type = m->type;
-    c->fn = m->fn;
-    c->key = m->key;
-    for (unsigned i = 0; i < m->n; i++)
-        if (!(c->k[i] = m_bind(P, m->k[i], cx))) return NULL;
-    return c->op == MN_KEY ? c : m_simplify(P, c);
-}
-static bool m_context_free(const struct cm *m) {
-    if (m->op == MN_KEY) return false;
-    if (m->op == MN_LEAF) return m_free(m);
-    for (unsigned i = 0; i < m->n; i++) if (!m_context_free(m->k[i])) return false;
-    return true;
-}
-
-/* ---------------------------------------------------------------- numbers */
-/* a <number> as CSS serializes it: at most six significant figures, no exponent */
-static void num_put(sbuf *b, double v) {
-    char t[64];
-    if (isnan(v)) v = 0;
-    if (fabs(v) < 5e-7) v = 0;
-    snprintf(t, sizeof t, "%.6g", v);
-    if (strchr(t, 'e')) {
-        snprintf(t, sizeof t, fabs(v) >= 1 ? "%.0f" : "%.6f", v);
-        if (strchr(t, '.')) {
-            size_t n = strlen(t);
-            while (n && t[n - 1] == '0') t[--n] = 0;
-            if (n && t[n - 1] == '.') t[--n] = 0;
-        }
-    }
-    if (!strcmp(t, "-0")) strcpy(t, "0");
-    sb_puts(b, t);
-}
-static void m_put(sbuf *b, const struct cm *m, const char *const *keys, bool top);
-static void m_put_leaf(sbuf *b, const struct cm *m) {
-    if (!isfinite(m->v)) {
-        sb_puts(b, isnan(m->v) ? "NaN" : m->v > 0 ? "infinity" : "-infinity");
-        if (m->type != MT_NUM) sb_puts(b, m->type == MT_PCT ? " * 1%" : m->type == MT_ANGLE ? " * 1deg" : " * 1px");
-        return;
-    }
-    num_put(b, m->v);
-    sb_puts(b, m->unit);
-}
-/* sort a calculation's children: number, percentage, dimensions by unit, then the rest */
-static void m_sorted(const struct cm *m, const struct cm **out) {
-    unsigned k = 0;
-    for (unsigned i = 0; i < m->n; i++) if (m->k[i]->op == MN_LEAF && m->k[i]->type == MT_NUM) out[k++] = m->k[i];
-    for (unsigned i = 0; i < m->n; i++) if (m->k[i]->op == MN_LEAF && m->k[i]->type == MT_PCT) out[k++] = m->k[i];
-    unsigned dims = k;
-    for (unsigned i = 0; i < m->n; i++)
-        if (m->k[i]->op == MN_LEAF && m->k[i]->type != MT_NUM && m->k[i]->type != MT_PCT) out[k++] = m->k[i];
-    for (unsigned i = dims + 1; i < k; i++)
-        for (unsigned j = i; j > dims && strcmp(out[j - 1]->unit, out[j]->unit) > 0; j--) {
-            const struct cm *x = out[j]; out[j] = out[j - 1]; out[j - 1] = x;
-        }
-    for (unsigned i = 0; i < m->n; i++) if (m->k[i]->op != MN_LEAF) out[k++] = m->k[i];
-}
-static void m_put_child(sbuf *b, const struct cm *m, const char *const *keys, bool strip) {
-    sbuf t = {0};
-    m_put(&t, m, keys, false);
-    const char *s = t.p ? t.p : "";
-    size_t n = t.n;
-    if (strip && n >= 2 && s[0] == '(' && s[n - 1] == ')') { s++; n -= 2; }
-    sb_put(b, s, n);
-    sb_free(&t);
-}
-/* CSS Values 4, 10.13: serialize a calculation tree; top: the root of a channel's math function */
-static void m_put(sbuf *b, const struct cm *m, const char *const *keys, bool top) {
-    if (top && m->op != MN_FN) {
-        sb_puts(b, "calc(");
-        m_put_child(b, m, keys, true);
-        sb_putc(b, ')');
-        return;
-    }
-    switch (m->op) {
-    case MN_LEAF: m_put_leaf(b, m); return;
-    case MN_KEY: sb_puts(b, keys && keys[m->key] ? keys[m->key] : "none"); return;
-    case MN_NEGATE: sb_puts(b, "(-1 * "); m_put_child(b, m->k[0], keys, false); sb_putc(b, ')'); return;
-    case MN_INVERT: sb_puts(b, "(1 / "); m_put_child(b, m->k[0], keys, false); sb_putc(b, ')'); return;
-    case MN_SUM: case MN_PRODUCT: {
-        const struct cm *k[256];
-        m_sorted(m, k);
-        sb_putc(b, '(');
-        for (unsigned i = 0; i < m->n; i++) {
-            const struct cm *c = k[i];
-            if (!i) m_put_child(b, c, keys, false);
-            else if (m->op == MN_SUM && c->op == MN_NEGATE) { sb_puts(b, " - "); m_put_child(b, c->k[0], keys, false); }
-            else if (m->op == MN_SUM && c->op == MN_LEAF && (c->v < 0 || (c->v == 0 && signbit(c->v)))) {
-                struct cm neg = *c;
-                neg.v = -c->v;
-                sb_puts(b, " - ");
-                m_put_leaf(b, &neg);
-            } else if (m->op == MN_PRODUCT && c->op == MN_INVERT) { sb_puts(b, " / "); m_put_child(b, c->k[0], keys, false); }
-            else { sb_puts(b, m->op == MN_SUM ? " + " : " * "); m_put_child(b, c, keys, false); }
-        }
-        sb_putc(b, ')');
-        return;
-    }
-    default:
-        sb_puts(b, math_names[m->fn]);
-        sb_putc(b, '(');
-        if (m->fn == MF_ROUND && m->key != RS_NEAREST) { sb_puts(b, round_names[m->key]); sb_puts(b, ", "); }
-        for (unsigned i = 0; i < m->n; i++) {
-            if (i) sb_puts(b, ", ");
-            m_put_child(b, m->k[i], keys, true);
-        }
-        sb_putc(b, ')');
-    }
-}
+/* a <number> as CSS serializes it */
+static void num_put(sbuf *b, double v) { css_number_serialize(b, v); }
 
 /* ---------------------------------------------------------------- the value tree */
 enum { CV_ABS, CV_CURRENT, CV_SYSTEM, CV_FN, CV_MIX, CV_LIGHT_DARK, CV_CONTRAST, CV_LAYERS };
@@ -839,10 +262,10 @@ enum { F_RGB, F_HSL, F_HWB, F_LAB, F_LCH, F_OKLAB, F_OKLCH, F_COLOR, F_ALPHA };
 enum { CH_ABSENT, CH_NONE, CH_LEAF, CH_MATH };
 struct chan {
     uint8_t kind, type;
-    bool wrapped;   /* CH_MATH: a math function whose root is not one: serialized in calc() */
+    bool wrapped;   /* CH_MATH: written as a math function, not a bare channel keyword */
     char unit[7];   /* CH_LEAF: the authored unit */
     double v;       /* CH_LEAF: the authored value */
-    struct cm *m;   /* CH_MATH */
+    struct css_calc *m; /* CH_MATH: a math function (cssmath.c), or a keyword */
 };
 struct mix_item {
     const struct css_color_value *color;
@@ -1013,12 +436,10 @@ static unsigned chan_types(uint8_t fn, int i, bool legacy) {
 }
 static double chan_raw(const struct chan *c, const double *keys, const struct cx *cx) {
     if (c->kind == CH_LEAF) {
-        if (c->type == MT_ANGLE) return c->v * angle_unit(c->unit, strlen(c->unit));
+        if (c->type == MT_ANGLE) return css_unit_canonical(css_unit_find(c->unit, strlen(c->unit)), c->v, NULL);
         return c->v;
     }
-    bool r = true;
-    double v = m_eval(c->m, keys, cx, &r);
-    return v;
+    return css_calc_value(c->m, NAN, keys, cx);
 }
 static double hue_normal(double h) {
     if (!isfinite(h)) return 0;
@@ -1088,21 +509,32 @@ static bool parse_chan(struct pctx *P, const struct tok *t, unsigned types, bool
         for (size_t i = 0; i < t->name_n; i++) c->unit[i] = (char)lower((unsigned char)t->name[i]);
         return true;
     }
-    if (t->kind != TK_IDENT && t->kind != TK_FUNC) return false;
-    struct cm *m;
-    if (t->kind == TK_FUNC) {
-        bool calc;
-        if (!(m = m_function(P, t, &calc))) return false;
-        c->wrapped = m->op != MN_FN; /* serialized inside calc() */
-    } else if (!(m = m_value(P, t))) return false;
-    if (!(types & 1u << m->type) || (m->hint && !(types & 1u << MT_PCT))) return false;
+    if (t->kind == TK_IDENT) {
+        /* a channel keyword of relative colour syntax: a number */
+        for (unsigned i = 0; P->keys && i < 4; i++)
+            if (P->keys[i] && name_is(TK_NAME(t), TK_LEN(t), P->keys[i])) {
+                if (!(types & 1u << MT_NUM)) return false;
+                c->kind = CH_MATH;
+                c->type = MT_NUM;
+                c->m = css_calc_key(P->a, i);
+                return true;
+            }
+        return false;
+    }
+    if (t->kind != TK_FUNC) return false;
+    /* a math function, whose percentages are the channel's own type */
+    struct css_calc_parse M = {.a = P->a, .keys = P->keys, .nkeys = P->keys ? 4 : 0};
+    unsigned kind;
+    struct css_calc *m = css_calc_read(&M, calc_accept(types), t->s, (size_t)(t->e - t->s), &kind);
+    if (!m) return false;
+    c->wrapped = true;
     c->kind = CH_MATH;
-    c->type = m->type;
+    c->type = kind == CSS_CALC_PERCENT ? MT_PCT : kind == CSS_CALC_ANGLE ? MT_ANGLE : kind == CSS_CALC_LENGTH ? MT_LEN : MT_NUM;
     c->m = m;
     return true;
 }
 static bool chan_context_free(const struct chan *c) {
-    return c->kind != CH_MATH || m_context_free(c->m);
+    return c->kind != CH_MATH || css_calc_context_free(c->m);
 }
 /* evaluate a function's channels into an absolute colour: origin (converted into the
    function's space) gives the keywords; NULL: absolute syntax */
@@ -1136,8 +568,8 @@ static struct css_color fn_evaluate(const struct css_color_value *v, const struc
             }
             continue;
         }
-        if (c->kind == CH_NONE || (c->kind == CH_MATH && c->m->op == MN_KEY && !c->wrapped &&
-                                   (key_none & (c->m->key == 3 ? CSS_COLOR_NONE_ALPHA : 1u << c->m->key)))) {
+        int key = c->kind == CH_MATH && !c->wrapped ? css_calc_key_of(c->m) : -1;
+        if (c->kind == CH_NONE || (key >= 0 && (key_none & (key == 3 ? CSS_COLOR_NONE_ALPHA : 1u << key)))) {
             out.none |= bit;
             if (i == 3) out.alpha = 0;
             else out.c[i] = 0;
@@ -2030,7 +1462,7 @@ static struct css_color contrast_of(const struct css_color *c) {
 /* a computed value that still names currentcolor: lengths in pixels, the rest absolute */
 static bool chan_bind(struct pctx *P, const struct chan *c, const struct cx *cx, struct chan *out) {
     *out = *c;
-    if (c->kind == CH_MATH && !(out->m = m_bind(P, c->m, cx))) return false;
+    if (c->kind == CH_MATH && !(out->m = css_calc_bind(P->a, c->m, cx))) return false;
     return true;
 }
 static bool cv_compute(const struct css_color_value *v, const struct cenv *E, struct css_color *out,
@@ -2217,7 +1649,8 @@ static void chan_put(sbuf *b, const struct css_color_value *v, int i, const char
         return;
     case CH_MATH:
         /* a channel keyword, or a math function */
-        m_put(b, c->m, keys, c->wrapped || c->m->op == MN_FN);
+        if (!c->wrapped && css_calc_key_of(c->m) >= 0) sb_puts(b, keys && keys[css_calc_key_of(c->m)] ? keys[css_calc_key_of(c->m)] : "none");
+        else css_calc_serialize(b, c->m, keys);
         return;
     }
 }
@@ -2265,7 +1698,7 @@ static void mix_put(sbuf *b, const struct css_color_value *v) {
             sb_putc(b, '%');
         } else {
             sb_putc(b, ' ');
-            m_put(b, c->m, NULL, true);
+            css_calc_serialize(b, c->m, NULL);
         }
     }
     sb_putc(b, ')');

@@ -32,7 +32,7 @@ struct nmedia_adaptive_manifest {
  * Failure clears every allocation. Clear before replacing a successful plan. */
 void nmedia_adaptive_manifest_clear(struct nmedia_adaptive_manifest *);
 /* Successful exact URL belongs to nmedia_ff_free; failure leaves NULL. */
-enum http_url_result nmedia_adaptive_resolve_owned(const char *base, const char *uri, char **out);
+enum web_url_result nmedia_adaptive_resolve_owned(const char *base, const char *uri, char **out);
 /* Compatibility output-span wrapper, not an internal URL size ceiling. */
 bool nmedia_adaptive_resolve(const char *base, const char *uri, char *out, size_t capacity);
 int nmedia_adaptive_parse_hls(char *text, size_t bytes, const char *base,

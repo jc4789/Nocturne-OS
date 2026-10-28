@@ -2,6 +2,7 @@
    keywords), shorthand expansion, and the user agent stylesheet. */
 #include <stdio.h>
 #include <math.h>
+#include <float.h>
 #include <stddef.h>
 #include <ctype.h>
 #include "webi.h"
@@ -219,317 +220,8 @@ static bool parse_filter(const char *v, size_t n, struct cx *cx, const struct cs
     return true;
 }
 
-/* ---------------------------------------------------------------- lengths and calc() */
-struct cexpr {
-    char op; /* 'v' value, + - * /, 'm' min, 'M' max */
-    bool num;
-    float px, pct;
-    struct cexpr *a, *b;
-};
-static bool expression_equal(const struct cexpr *a,const struct cexpr *b){
-    struct expression_pair {const struct cexpr *a,*b;} local[32],*pending=local;
-    size_t count=0,capacity=32;bool equal=true;
-    for(;;){
-        if(a!=b){
-            if(!a||!b||a->op!=b->op||(a->op=='v'&&(a->num!=b->num||a->px!=b->px||a->pct!=b->pct))){equal=false;break;}
-            if(a->b!=b->b){
-                if(count==capacity){size_t n=capacity*2;
-                    if(n<capacity||n>SIZE_MAX/sizeof *pending){equal=false;break;}
-                    struct expression_pair *v=malloc(n*sizeof *v);if(!v){equal=false;break;}
-                    memcpy(v,pending,count*sizeof *v);if(pending!=local)free(pending);pending=v;capacity=n;
-                }
-                pending[count++]=(struct expression_pair){a->b,b->b};
-            }
-            a=a->a;b=b->a;continue;
-        }
-        if(!count)break;struct expression_pair p=pending[--count];a=p.a;b=p.b;
-    }
-    if(pending!=local)free(pending);return equal;
-}
-bool css_length_equal(const len_t *a,const len_t *b){
-    return a==b||(a&&b&&a->kind==b->kind&&a->px==b->px&&a->pct==b->pct&&expression_equal(a->expr,b->expr));
-}
-
-/* a dimension: number + unit; false if the unit is unknown */
-bool css_unit_px(const char *u, size_t un, float v, const struct cx *cx, float *px, float *pct, bool *num) {
-    *px = *pct = 0;
-    *num = false;
-    if (!un) {
-        *px = v;
-        *num = true;
-        return true;
-    }
-    if (cx->angles) { /* css-values-4 §7.1: the angle units, in degrees */
-        static const struct { const char *u; double f; } angles[] = {
-            {"deg", 1}, {"grad", 0.9}, {"rad", 57.29577951308232}, {"turn", 360}};
-        for (size_t i = 0; i < sizeof angles / sizeof *angles; i++)
-            if (strn_ieq(u, angles[i].u, un)) { *px = (float)(v * angles[i].f); return true; }
-        return false;
-    }
-    if (cx->time) { /* css-values-4 §7.3: the time units, in milliseconds */
-        if (un == 1 && (u[0] | 32) == 's') { *px = v * 1000; return true; }
-        if (un == 2 && (u[0] | 32) == 'm' && (u[1] | 32) == 's') { *px = v; return true; }
-        return false;
-    }
-    if (un == 1 && u[0] == '%') {
-        if (cx->absolute_lengths) return false;
-        *pct = v;
-        return true;
-    }
-    char b[8];
-    if (un >= sizeof b) return false;
-    for (size_t i = 0; i < un; i++) b[i] = (char)lower((unsigned char)u[i]);
-    b[un] = 0;
-    float em = cx->em;
-    static const struct {
-        const char *u;
-        int kind; /* 0 absolute, 1 em, 2 rem, 3..6 viewport, 7..10 container */
-        float f;
-    } units[] = {
-        {"px", 0, 1},     {"em", 1, 1},     {"rem", 2, 1},    {"ex", 1, 0.5f}, {"ch", 1, 0.6f},
-        {"lh", 1, 1.2f},  {"rlh", 2, 1.2f}, {"cap", 1, 0.7f}, {"ic", 1, 1},    {"vw", 3, 1},
-        {"vh", 4, 1},     {"svw", 3, 1},    {"svh", 4, 1},    {"lvw", 3, 1},   {"lvh", 4, 1},
-        {"dvw", 3, 1},    {"dvh", 4, 1},    {"cqw", 7, 1},    {"cqh", 8, 1},   {"vi", 3, 1},
-        {"vb", 4, 1},     {"vmin", 5, 1},   {"vmax", 6, 1},   {"cqmin", 9, 1}, {"cqmax", 10, 1},
-        {"cqi", 7, 1},    {"cqb", 8, 1},
-        {"pt", 0, 4.0f / 3}, {"pc", 0, 16}, {"in", 0, 96},    {"cm", 0, 96 / 2.54f}, {"mm", 0, 96 / 25.4f},
-        {"q", 0, 96 / 101.6f},
-    };
-    for (size_t i = 0; i < sizeof units / sizeof *units; i++) {
-        if (strcmp(units[i].u, b)) continue;
-        if ((cx->absolute_lengths || cx->absolute_units) && units[i].kind) return false;
-        float f = units[i].f;
-        switch (units[i].kind) {
-        case 0: *px = v * f; break;
-        case 1: *px = v * f * em; break;
-        case 2: *px = v * f * cx->rem; break;
-        case 3: *px = v * f * cx->vw / 100; break;
-        case 4: *px = v * f * cx->vh / 100; break;
-        case 5: *px = v * f * (cx->vw < cx->vh ? cx->vw : cx->vh) / 100; break;
-        case 6: *px = v * f * (cx->vw > cx->vh ? cx->vw : cx->vh) / 100; break;
-        case 7: *px = v * f * (cx->cq_width_set ? cx->cq_width : cx->vw) / 100; break;
-        case 8: *px = v * f * (cx->cq_height_set ? cx->cq_height : cx->vh) / 100; break;
-        case 9: {
-            float w=cx->cq_width_set?cx->cq_width:cx->vw,h=cx->cq_height_set?cx->cq_height:cx->vh;
-            *px=v*f*(w<h?w:h)/100;break;
-        }
-        case 10: {
-            float w=cx->cq_width_set?cx->cq_width:cx->vw,h=cx->cq_height_set?cx->cq_height:cx->vh;
-            *px=v*f*(w>h?w:h)/100;break;
-        }
-        }
-        return true;
-    }
-    return false;
-}
-
-static struct cexpr *calc_sum(const char **s, const char *e, struct cx *cx);
-
-static void cskip(const char **s, const char *e) {
-    while (*s < e && is_space((unsigned char)**s)) (*s)++;
-}
-
-static struct cexpr *cnode(struct cx *cx, char op, struct cexpr *a, struct cexpr *b) {
-    if (cx->supports_probe && ++cx->supports_nodes > 512) cx->invalid = true;
-    struct cexpr *x = ar_alloc(cx->a, sizeof *x);
-    x->op = op;
-    x->a = a;
-    x->b = b;
-    return x;
-}
-
-/* the arguments of min(), max() or clamp() up to the closing parenthesis */
-static struct cexpr *calc_args(const char **s, const char *e, struct cx *cx, char op, bool clamp) {
-    struct cexpr *result = NULL, *first = NULL, *second = NULL;
-    /* min/max accept an author-sized list. Keep only clamp's grammatical
-       arity, not an arbitrary fixed argument array or quota. Arena OOM is
-       handled by the same allocation trap as the expression nodes. */
-    unsigned clamp_count = 0;
-    for (;;) {
-        cskip(s, e);
-        struct cexpr *x = calc_sum(s, e, cx);
-        if (!x) return NULL;
-        if (clamp) {
-            if (clamp_count == 3) return NULL;
-            if (clamp_count == 0) first = x;
-            else if (clamp_count == 1) second = x;
-            else result = cnode(cx, 'M', first, cnode(cx, 'm', second, x));
-            clamp_count++;
-        } else result = result ? cnode(cx, op, result, x) : x;
-        cskip(s, e);
-        if (*s < e && **s == ',') {
-            (*s)++;
-            continue;
-        }
-        if (*s < e && **s == ')') {
-            (*s)++;
-            break;
-        }
-        return NULL;
-    }
-    if (clamp && clamp_count != 3) return NULL;
-    return result;
-}
-
-static struct cexpr *calc_value(const char **s, const char *e, struct cx *cx) {
-    cskip(s, e);
-    if (*s >= e) return NULL;
-    if (**s == '(') {
-        (*s)++;
-        struct cexpr *x = calc_sum(s, e, cx);
-        cskip(s, e);
-        if (!x || *s >= e || **s != ')') return NULL;
-        (*s)++;
-        return x;
-    }
-    const char *st = *s;
-    while (*s < e && (isalpha((unsigned char)**s) || **s == '-') && !(**s == '-' && *s + 1 < e && isdigit((unsigned char)(*s)[1])))
-        (*s)++;
-    if (*s > st && *s < e && **s == '(') {
-        size_t fl = (size_t)(*s - st);
-        (*s)++;
-        if (ident_is(st, fl, "calc") || ident_is(st, fl, "-webkit-calc")) {
-            struct cexpr *x = calc_sum(s, e, cx);
-            cskip(s, e);
-            if (!x || *s >= e || **s != ')') return NULL;
-            (*s)++;
-            return x;
-        }
-        if (ident_is(st, fl, "min")) return calc_args(s, e, cx, 'm', false);
-        if (ident_is(st, fl, "max")) return calc_args(s, e, cx, 'M', false);
-        if (ident_is(st, fl, "clamp")) return calc_args(s, e, cx, 0, true);
-        return NULL;
-    }
-    *s = st;
-    float v;
-    if (!parse_number(s, e, &v)) return NULL;
-    const char *u = *s;
-    while (*s < e && (isalpha((unsigned char)**s) || **s == '%')) (*s)++;
-    struct cexpr *x = cnode(cx, 'v', NULL, NULL);
-    if (!css_unit_px(u, (size_t)(*s - u), v, cx, &x->px, &x->pct, &x->num)) return NULL;
-    return x;
-}
-
-static struct cexpr *calc_product(const char **s, const char *e, struct cx *cx) {
-    struct cexpr *x = calc_value(s, e, cx);
-    for (;;) {
-        if (!x) return NULL;
-        const char *before_space = *s;
-        cskip(s, e);
-        if (*s < e && (**s == '*' || **s == '/')) {
-            char op = *(*s)++;
-            x = cnode(cx, op, x, calc_value(s, e, cx));
-            if (!x->b) return NULL;
-        } else { *s = before_space; return x; }
-    }
-}
-
-static struct cexpr *calc_sum(const char **s, const char *e, struct cx *cx) {
-    struct cexpr *x = calc_product(s, e, cx);
-    for (;;) {
-        if (!x) return NULL;
-        const char *before_space = *s;
-        cskip(s, e);
-        if (*s < e && (**s == '+' || **s == '-')) {
-            /* CSS calc-sum requires whitespace on both sides. Product does
-               not consume that whitespace when it returns its final value. */
-            if (*s == before_space || *s + 1 == e || !is_space((unsigned char)(*s)[1])) return NULL;
-            char op = *(*s)++;
-            x = cnode(cx, op, x, calc_product(s, e, cx));
-            if (!x->b) return NULL;
-        } else return x;
-    }
-}
-
-/* fold to px + pct% when possible */
-static bool cfold(const struct cexpr *x, bool *num, float *px, float *pct) {
-    if (x->op == 'v') {
-        *num = x->num;
-        *px = x->px;
-        *pct = x->pct;
-        return true;
-    }
-    bool an, bn;
-    float apx, apc, bpx, bpc;
-    if (!cfold(x->a, &an, &apx, &apc) || !cfold(x->b, &bn, &bpx, &bpc)) return false;
-    switch (x->op) {
-    case '+': case '-': {
-        float sg = x->op == '-' ? -1 : 1;
-        if (an != bn) return false;
-        *num = an;
-        *px = apx + sg * bpx;
-        *pct = apc + sg * bpc;
-        return true;
-    }
-    case '*':
-        if (an) {
-            *num = bn;
-            *px = apx * bpx;
-            *pct = apx * bpc;
-            return true;
-        }
-        if (bn) {
-            *num = false;
-            *px = apx * bpx;
-            *pct = apc * bpx;
-            return true;
-        }
-        return false;
-    case '/':
-        if (!bn || bpx == 0) return false;
-        *num = an;
-        *px = apx / bpx;
-        *pct = apc / bpx;
-        return true;
-    case 'm': case 'M':
-        if (an != bn || apc != 0 || bpc != 0) return false;
-        *num = an;
-        *pct = 0;
-        *px = x->op == 'm' ? (apx < bpx ? apx : bpx) : (apx > bpx ? apx : bpx);
-        return true;
-    }
-    return false;
-}
-
-static float ceval(const struct cexpr *x, float base) {
-    switch (x->op) {
-    case 'v': return x->px + x->pct * base / 100;
-    case '+': return ceval(x->a, base) + ceval(x->b, base);
-    case '-': return ceval(x->a, base) - ceval(x->b, base);
-    case '*': return ceval(x->a, base) * ceval(x->b, base);
-    case '/': {
-        float d = ceval(x->b, base);
-        return d ? ceval(x->a, base) / d : 0;
-    }
-    case 'm': {
-        float a = ceval(x->a, base), b = ceval(x->b, base);
-        return a < b ? a : b;
-    }
-    case 'M': {
-        float a = ceval(x->a, base), b = ceval(x->b, base);
-        return a > b ? a : b;
-    }
-    }
-    return 0;
-}
-
-/* lengths are kept within +-LEN_MAX px, so that sums of them stay finite and fit an int */
-#define LEN_MAX 1e7f
-static float len_clamp(float v) { return v != v ? 0 : v > LEN_MAX ? LEN_MAX : v < -LEN_MAX ? -LEN_MAX : v; }
-
-float len_resolve(const len_t *l, float base) {
-    switch (l->kind) {
-    case LK_LEN: return len_clamp(l->px + (l->pct ? l->pct * base / 100 : 0));
-    case LK_NUMBER: return len_clamp(l->px);
-    case LK_EXPR: return len_clamp(ceval(l->expr, base));
-    }
-    return 0;
-}
-
-/* CSSOM must preserve unresolved percentages and comparison expressions,
-   not turn opaque calculation nodes into a fabricated zero. Keep this next
-   to the native calculation representation; callers never mirror cexpr.
-   Unlike the general sb_put API, this author-readable path reports OOM. */
+/* ---------------------------------------------------------------- lengths and numbers (cssmath.c owns the math) */
+/* Unlike the general sb_put API, the author-readable paths report OOM. */
 static bool length_append(sbuf *out, const char *text, size_t length) {
     if (out->n == SIZE_MAX || length > SIZE_MAX - out->n - 1) return false;
     size_t need = out->n + length + 1;
@@ -589,105 +281,8 @@ bool css_filter_serialize(const struct css_filter *filter, sbuf *out, web_doc *d
     }
     return success;
 }
-static bool length_coefficients(sbuf *out, float px, float pct, bool number) {
-    if (!isfinite(px) || !isfinite(pct)) return false;
-    if (number) return pct == 0 && length_number(out, px, "");
-    if (pct == 0) return length_number(out, px, "px");
-    if (px == 0) return length_number(out, pct, "%");
-    /* css-values-4 §10.13 sorts a sum's terms: the percentage before the dimensions. */
-    return length_append(out, "calc(", 5) && length_number(out, pct, "%") &&
-        length_append(out, px < 0 ? " - " : " + ", 3) && length_number(out, fabsf(px), "px") &&
-        length_append(out, ")", 1);
-}
-struct length_frame { const struct cexpr *node; unsigned phase; };
-static bool length_expression(sbuf *out, const struct cexpr *expression, web_doc *d) {
-    struct length_frame local[32], *stack = local;
-    size_t capacity = sizeof local / sizeof local[0], count = 1;
-    local[0] = (struct length_frame){expression, 0};
-    bool success = false;
-    unsigned work = 0;
-    while (count) {
-        struct length_frame *frame = &stack[count - 1];
-        const struct cexpr *x = frame->node, *child = NULL;
-        if (!x) goto done;
-        if (frame->phase == 0 && d && !(++work & 63) && !web_native_checkpoint(d)) goto done;
-        if (x->op == 'v') {
-            if (!length_coefficients(out, x->px, x->pct, x->num)) goto done;
-            count--; continue;
-        }
-        bool comparison = x->op == 'm' || x->op == 'M';
-        if (!comparison && x->op != '+' && x->op != '-' && x->op != '*' && x->op != '/') goto done;
-        if (!x->a || !x->b) goto done;
-        if (frame->phase == 0) {
-            const char *open = comparison ? (x->op == 'm' ? "min(" : "max(") : count == 1 ? "calc(" : "(";
-            if (!length_append(out, open, strlen(open))) goto done;
-            frame->phase = 1; child = x->a;
-        } else if (frame->phase == 1) {
-            char op[3] = {' ', x->op, ' '};
-            if (!length_append(out, comparison ? ", " : op, comparison ? 2 : sizeof op)) goto done;
-            frame->phase = 2; child = x->b;
-        } else {
-            if (!length_append(out, ")", 1)) goto done;
-            count--; continue;
-        }
-        if (count == capacity) {
-            if (capacity > SIZE_MAX / 2 / sizeof *stack) goto done;
-            size_t next = capacity * 2;
-            struct length_frame *grown = stack == local ? malloc(next * sizeof *stack) : realloc(stack, next * sizeof *stack);
-            if (!grown) goto done;
-            if (stack == local) memcpy(grown, local, count * sizeof *stack);
-            stack = grown; capacity = next;
-        }
-        stack[count++] = (struct length_frame){child, 0};
-    }
-    success = true;
-done:
-    if (stack != local) free(stack);
-    return success;
-}
-bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d) {
-    if (!l || !out || out->n > out->cap || (!out->p && (out->n || out->cap))) return false;
-    size_t begin = out->n;
-    bool success = false;
-    switch (l->kind) {
-    case LK_AUTO: success = length_append(out, "auto", 4); break;
-    case LK_NONE: success = length_append(out, "none", 4); break;
-    case LK_NORMAL: success = length_append(out, "normal", 6); break;
-    case LK_NUMBER: success = length_coefficients(out, l->px, l->pct, true); break;
-    case LK_LEN: success = length_coefficients(out, l->px, l->pct, false); break;
-    case LK_EXPR: success = length_expression(out, l->expr, d); break;
-    }
-    if (!success) {
-        out->n = begin;
-        if (out->p && begin < out->cap) out->p[begin] = 0;
-    }
-    return success;
-}
-
-static bool calc_dimension(const struct cexpr *x,bool *number){
-    if(!x)return false;if(x->op=='v'){*number=x->num;return true;}
-    bool a,b;if(!calc_dimension(x->a,&a)||!calc_dimension(x->b,&b))return false;
-    if(x->op=='*'){if(!a&&!b)return false;*number=a&&b;return true;}
-    if(x->op=='/'){if(!b)return false;*number=a;return true;}
-    if(a!=b)return false;*number=a;return true;
-}
-/* Media feature lengths have no percentage basis or property range clamp.
-   Share the actual CSS arithmetic grammar/type checker instead of using a
-   permissive strtod prefix or rewriting calc() in the media-query parser. */
-bool css_query_length(const char *text, size_t length, float em, float rem, float vw, float vh, double *value) {
-    if (!text || !value || memchr(text, '%', length)) return false;
-    arena_t *arena = calloc(1, sizeof *arena); if (!arena) return false;
-    jmp_buf trap; arena->trap = &trap;
-    if (setjmp(trap)) { ar_free(arena); free(arena); return false; }
-    struct cx context = {.a = arena, .em = em, .rem = rem, .vw = vw, .vh = vh};
-    const char *cursor = text, *end = text + length;
-    struct cexpr *expression = calc_value(&cursor, end, &context); cskip(&cursor, end);
-    bool number; float px, percentage; bool success = expression && cursor == end &&
-        calc_dimension(expression, &number) && !number && cfold(expression, &number, &px, &percentage) &&
-        !number && percentage == 0 && isfinite(px);
-    if (success) *value = px;
-    ar_free(arena); free(arena); return success;
-}
+/* a math function's infinity is the largest value a float field keeps (CSS Values 4 §10.12) */
+static float calc_float(double v) { return v != v ? 0 : v > FLT_MAX ? FLT_MAX : v < -FLT_MAX ? -FLT_MAX : (float)v; }
 static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int flags) {
     trim(&s, &n);
     if (!n) return false;
@@ -728,32 +323,30 @@ static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int fl
             out->kind = LK_AUTO;
             return true;
         }
-        const char *p = s;
-        struct cexpr *x = calc_value(&p, s + n, cx);
-        cskip(&p, s + n);
-        if (!x || p != s + n || (cx->supports_probe && cx->invalid)) return false;
-        if(flags&LF_LENGTH){bool number;if(!calc_dimension(x,&number)||number)return false;}
-        bool num;
-        float px, pct;
-        if (cfold(x, &num, &px, &pct)) {
-            if ((flags & LF_NOPCT) && pct) return false;
-            if (!(flags & LF_NEG) && pct == 0 && px < 0) px = 0; /* calc() clamps to the range */
-            out->kind = LK_LEN;
-            out->px = px;
-            out->pct = pct;
-            return true;
-        }
-        out->kind = LK_EXPR;
-        out->expr = x;
-        return true;
+        /* a math function of type <length> (or <length-percentage>): computed, range-clamped */
+        struct css_calc_parse P = {.a = cx->a, .cx = cx};
+        struct css_calc *c = css_calc_read(&P, CSS_CALC_LENGTH | (flags & LF_NOPCT ? 0 : CSS_CALC_PERCENT), s, n, NULL);
+        return c && css_length_from_calc(c, flags & LF_NEG, out);
     }
     const char *p = s;
     float v;
     if (!parse_number(&p, s + n, &v)) return false;
-    bool num;
-    if (!css_unit_px(p, (size_t)(s + n - p), v, cx, &out->px, &out->pct, &num)) return false;
-    if((flags&LF_LENGTH)&&num&&v!=0)return false;
-    if ((flags & LF_NOPCT) && out->pct) return false;
+    int unit = css_unit_find(p, (size_t)(s + n - p));
+    switch (css_unit_kind(unit)) {
+    case CSS_CALC_NUMBER:
+        if ((flags & LF_LENGTH) && v != 0) return false;
+        out->px = v;
+        break;
+    case CSS_CALC_PERCENT:
+        if ((flags & LF_NOPCT) || cx->absolute_lengths) return false;
+        out->pct = v;
+        break;
+    case CSS_CALC_LENGTH:
+        if (cx->absolute_lengths && css_unit_relative(unit)) return false;
+        out->px = (float)css_unit_canonical(unit, v, cx);
+        break;
+    default: return false;
+    }
     if (!(flags & LF_NEG) && v < 0) return false;
     out->kind = LK_LEN;
     return true;
@@ -765,58 +358,14 @@ static bool parse_number_value(const char *v, size_t n, struct cx *cx, float *ou
     trim(&v, &n);
     const char *q = v;
     if (parse_number(&q, v + n, out)) return q == v + n;
-    if (!n || !isalpha((unsigned char)v[0])) return false;
-    struct cexpr *x = calc_value(&q, v + n, cx);
-    cskip(&q, v + n);
-    bool number;
-    float pct;
-    return x && q == v + n && !(cx->supports_probe && cx->invalid) && calc_dimension(x, &number) && number &&
-           cfold(x, &number, out, &pct) && number && isfinite(*out);
+    double x;
+    if (!css_calc_is_math(v, n) || !css_numeric_read(v, n, CSS_CALC_NUMBER, cx, cx->a, NAN, &x, NULL)) return false;
+    *out = calc_float(x);
+    return true;
 }
 /* The value grammar for the value owners outside this file (shape.c). */
 bool css_parse_length(const char *s, size_t n, struct cx *cx, len_t *out, int flags) { return parse_len(s, n, cx, out, flags); }
 bool css_number_token(const char **s, const char *end, float *out) { return parse_number(s, end, out); }
-/* 100% - x - y (y may be NULL), the far edge of an offset from the near one: inset()'s from rect()'s
-   and xywh()'s (css-shapes-1 §3.2), a position's from right or bottom (css-values-4 §9.1) */
-void css_length_complement(arena_t *a, const len_t *x, const len_t *y, len_t *out) {
-    if (x->kind == LK_LEN && (!y || y->kind == LK_LEN)) {
-        *out = (len_t){.kind = LK_LEN, .px = -x->px - (y ? y->px : 0), .pct = 100 - x->pct - (y ? y->pct : 0)};
-        return;
-    }
-    struct cexpr *e = ar_alloc(a, sizeof *e);
-    *e = (struct cexpr){.op = 'v', .pct = 100};
-    const len_t *terms[2] = {x, y};
-    for (int i = 0; i < 2 && terms[i]; i++) {
-        struct cexpr *term = terms[i]->expr;
-        if (terms[i]->kind != LK_EXPR) { term = ar_alloc(a, sizeof *term); *term = (struct cexpr){.op = 'v', .px = terms[i]->px, .pct = terms[i]->pct}; }
-        struct cexpr *difference = ar_alloc(a, sizeof *difference);
-        *difference = (struct cexpr){.op = '-', .a = e, .b = term};
-        e = difference;
-    }
-    *out = (len_t){.kind = LK_EXPR, .expr = e};
-}
-/* ka·x + kb·y of two <length-percentage>s as a computed length: px and percentage add while both
-   are sums of them, calc() trees combine as a tree */
-void css_length_mix(arena_t *a, const len_t *x, const len_t *y, double ka, double kb, len_t *out) {
-    if (x->kind == LK_LEN && y->kind == LK_LEN) {
-        *out = (len_t){.kind = LK_LEN, .px = (float)(x->px * ka + y->px * kb), .pct = (float)(x->pct * ka + y->pct * kb)};
-        return;
-    }
-    const len_t *terms[2] = {x, y};
-    double k[2] = {ka, kb};
-    struct cexpr *sum[2];
-    for (int i = 0; i < 2; i++) {
-        struct cexpr *term = terms[i]->expr;
-        if (terms[i]->kind != LK_EXPR) { term = ar_alloc(a, sizeof *term); *term = (struct cexpr){.op = 'v', .px = terms[i]->px, .pct = terms[i]->pct}; }
-        struct cexpr *factor = ar_alloc(a, sizeof *factor);
-        *factor = (struct cexpr){.op = 'v', .num = true, .px = (float)k[i]};
-        sum[i] = ar_alloc(a, sizeof *sum[i]);
-        *sum[i] = (struct cexpr){.op = '*', .a = term, .b = factor};
-    }
-    struct cexpr *e = ar_alloc(a, sizeof *e);
-    *e = (struct cexpr){.op = '+', .a = sum[0], .b = sum[1]};
-    *out = (len_t){.kind = LK_EXPR, .expr = e};
-}
 
 /* ---------------------------------------------------------------- colours (color.c owns them) */
 /* a <color> for a property that keeps only the 8-bit used value (COLOR_CURRENT for currentcolor) */
@@ -1189,16 +738,16 @@ static struct propdef props[] = {
     {"color", PT_COLOR, 0, true, O(color), NULL, 0, AN_TYPE},
     {"color-scheme", PT_COLOR_SCHEME, 0, true, O(color_scheme), NULL, 0, AN_DISCRETE},
     {"column-gap", PT_PX, LF_NOPCT, false, O(gap_col), kw_normal0, 0, AN_TYPE},
-    /* CSS Gap Decorations 1. flags: a list's enum css_rule_list_kind, a shorthand's GS_* */
+    /* CSS Gap Decorations 1. flags: a list's enum css_gap_rule_kind, a shorthand's GS_* */
     SH_GAP("column-rule", GS_RULE | GS_COLUMN),
     SH_GAP("row-rule", GS_RULE | GS_ROW),
     SH_GAP("rule", GS_RULE | GS_BOTH),
-    {"column-rule-color", PT_RULE_LIST, CSS_RULE_COLOR, false, OGAP(axis[0].list[CSS_RULE_COLOR]), NULL, 0, AN_TYPE},
-    {"column-rule-style", PT_RULE_LIST, CSS_RULE_STYLE, false, OGAP(axis[0].list[CSS_RULE_STYLE]), NULL, 0, AN_DISCRETE},
-    {"column-rule-width", PT_RULE_LIST, CSS_RULE_WIDTH, false, OGAP(axis[0].list[CSS_RULE_WIDTH]), NULL, 0, AN_TYPE},
-    {"row-rule-color", PT_RULE_LIST, CSS_RULE_COLOR, false, OGAP(axis[1].list[CSS_RULE_COLOR]), NULL, 0, AN_TYPE},
-    {"row-rule-style", PT_RULE_LIST, CSS_RULE_STYLE, false, OGAP(axis[1].list[CSS_RULE_STYLE]), NULL, 0, AN_DISCRETE},
-    {"row-rule-width", PT_RULE_LIST, CSS_RULE_WIDTH, false, OGAP(axis[1].list[CSS_RULE_WIDTH]), NULL, 0, AN_TYPE},
+    {"column-rule-color", PT_RULE_LIST, CSS_GAP_COLOR, false, OGAP(axis[0].list[CSS_GAP_COLOR]), NULL, 0, AN_TYPE},
+    {"column-rule-style", PT_RULE_LIST, CSS_GAP_STYLE, false, OGAP(axis[0].list[CSS_GAP_STYLE]), NULL, 0, AN_DISCRETE},
+    {"column-rule-width", PT_RULE_LIST, CSS_GAP_WIDTH, false, OGAP(axis[0].list[CSS_GAP_WIDTH]), NULL, 0, AN_TYPE},
+    {"row-rule-color", PT_RULE_LIST, CSS_GAP_COLOR, false, OGAP(axis[1].list[CSS_GAP_COLOR]), NULL, 0, AN_TYPE},
+    {"row-rule-style", PT_RULE_LIST, CSS_GAP_STYLE, false, OGAP(axis[1].list[CSS_GAP_STYLE]), NULL, 0, AN_DISCRETE},
+    {"row-rule-width", PT_RULE_LIST, CSS_GAP_WIDTH, false, OGAP(axis[1].list[CSS_GAP_WIDTH]), NULL, 0, AN_TYPE},
     SH_GAP("rule-color", GS_COLOR | GS_BOTH),
     SH_GAP("rule-style", GS_STYLE | GS_BOTH),
     SH_GAP("rule-width", GS_WIDTH | GS_BOTH),
@@ -1580,7 +1129,8 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
         snprintf(text, sizeof text, "%d", (int)*(const int32_t *)field); sb_puts(out, text); return 1;
     case PT_COLOR: return css_style_color_text(st, color_slot(p), out) ? 1 : -1;
     case PT_COLOR_SCHEME: sb_puts(out, st->color_scheme_text ? st->color_scheme_text : "normal"); return 1;
-    case PT_MOTION_LIST: case PT_SHAPE: case PT_OFFSET: return css_computed_value(st, p, out, d) ? 1 : -1;
+    case PT_MOTION_LIST: case PT_SHAPE: case PT_OFFSET: case PT_ROTATE: case PT_SCALE:
+        return css_computed_value(st, p, out, d) ? 1 : -1;
     case PT_RULE_LIST: case PT_RULE_INSET: return gap_computed(st, p, out, d);
     case PT_SHORT: /* the shorthands whose longhands' owner serializes them together */
         if (p->sh == SH_OFFSET) return css_offset_shorthand_serialize(css_style_offset(st), out, d) ? 1 : -1;
@@ -1603,7 +1153,15 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     if (p->group == G_GAP_RULE || (p->type == PT_SHORT && p->sh == SH_GAP_RULE)) return gap_specified(p, v, n, out);
     if (p->type == PT_SHAPE || p->group != G_STYLE || (p->type == PT_SHORT && p->sh == SH_OFFSET))
         return css_shape_specified(p->name, v, n, out);
-    if (p->type != PT_COLOR_SCHEME) return false;
+    if (p->type != PT_COLOR_SCHEME) {
+        /* math functions serialize simplified (CSS Values 4 §10.13); in a <length-percentage> context
+           percentages are lengths' (calc(10% / 1px) is a number there) */
+        unsigned accept = CSS_CALC_ANY;
+        if (p->type == PT_LEN || p->type == PT_PX || p->type == PT_FONT_SIZE || p->type == PT_VALIGN)
+            accept = CSS_CALC_LENGTH | (p->type == PT_PX || (p->type == PT_LEN && (p->flags & LF_NOPCT)) ? 0 : CSS_CALC_PERCENT);
+        else if (p->type == PT_LINE_HEIGHT) accept = CSS_CALC_NUMBER | CSS_CALC_LENGTH | CSS_CALC_PERCENT;
+        return css_calc_specified(v, n, accept, out);
+    }
     arena_t a = {.chunk_size = 1024};
     jmp_buf trap;
     a.trap = &trap;
@@ -1645,17 +1203,17 @@ static const struct css_rule_item rule_initial_item = {0, 0, 1};
 static const union css_rule_value rule_initial_values[3] = {
     {.color = {COLOR_CURRENT, NULL}}, {.style = BS_NONE}, {.width = 3}};
 #define RULE_INITIAL_AXIS {                                                                                          \
-    .list = {{&rule_initial_item, &rule_initial_values[CSS_RULE_COLOR], 1, 1},                                     \
-             {&rule_initial_item, &rule_initial_values[CSS_RULE_STYLE], 1, 1},                                     \
-             {&rule_initial_item, &rule_initial_values[CSS_RULE_WIDTH], 1, 1}},                                    \
+    .list = {{&rule_initial_item, &rule_initial_values[CSS_GAP_COLOR], 1, 1},                                     \
+             {&rule_initial_item, &rule_initial_values[CSS_GAP_STYLE], 1, 1},                                     \
+             {&rule_initial_item, &rule_initial_values[CSS_GAP_WIDTH], 1, 1}},                                    \
     .inset = {{{.kind = LK_LEN}, false}, {{.kind = LK_LEN}, false}, {{.kind = LK_LEN}, false}, {{.kind = LK_LEN}, false}}, \
     .rule_break = CSS_RULE_BREAK_NORMAL, .visibility = CSS_RULE_ITEMS_NORMAL}
 const struct css_gap_rules css_gap_rules_initial = {.axis = {RULE_INITIAL_AXIS, RULE_INITIAL_AXIS},
                                                     .overlap = CSS_RULE_ROW_OVER_COLUMN};
 
 static bool rule_value_equal(int kind, const union css_rule_value *a, const union css_rule_value *b) {
-    if (kind == CSS_RULE_COLOR) return a->color.argb == b->color.argb && css_color_value_equal(a->color.exact, b->color.exact);
-    return kind == CSS_RULE_STYLE ? a->style == b->style : a->width == b->width;
+    if (kind == CSS_GAP_COLOR) return a->color.argb == b->color.argb && css_color_value_equal(a->color.exact, b->color.exact);
+    return kind == CSS_GAP_STYLE ? a->style == b->style : a->width == b->width;
 }
 static bool rule_items_equal(const struct css_rule_list *a, const struct css_rule_list *b) {
     if (a->nitems != b->nitems || a->nvalues != b->nvalues) return false;
@@ -1674,7 +1232,7 @@ static bool rule_inset_equal(const struct css_rule_inset *a, const struct css_ru
 /* what the segments' geometry takes from one axis (layout.c): everything but colour and style */
 static bool rule_axis_layout_equal(const struct css_gap_axis *a, const struct css_gap_axis *b) {
     if (a->rule_break != b->rule_break || a->visibility != b->visibility ||
-        !rule_list_equal(CSS_RULE_WIDTH, &a->list[CSS_RULE_WIDTH], &b->list[CSS_RULE_WIDTH])) return false;
+        !rule_list_equal(CSS_GAP_WIDTH, &a->list[CSS_GAP_WIDTH], &b->list[CSS_GAP_WIDTH])) return false;
     for (int i = 0; i < 4; i++) if (!rule_inset_equal(&a->inset[i], &b->inset[i])) return false;
     return true;
 }
@@ -1685,8 +1243,8 @@ bool css_gap_rules_equal(const struct css_gap_rules *a, const struct css_gap_rul
     if (a->overlap != b->overlap) return false;
     for (int x = 0; x < 2; x++)
         if (!rule_axis_layout_equal(&a->axis[x], &b->axis[x]) ||
-            !rule_list_equal(CSS_RULE_COLOR, &a->axis[x].list[CSS_RULE_COLOR], &b->axis[x].list[CSS_RULE_COLOR]) ||
-            !rule_list_equal(CSS_RULE_STYLE, &a->axis[x].list[CSS_RULE_STYLE], &b->axis[x].list[CSS_RULE_STYLE])) return false;
+            !rule_list_equal(CSS_GAP_COLOR, &a->axis[x].list[CSS_GAP_COLOR], &b->axis[x].list[CSS_GAP_COLOR]) ||
+            !rule_list_equal(CSS_GAP_STYLE, &a->axis[x].list[CSS_GAP_STYLE], &b->axis[x].list[CSS_GAP_STYLE])) return false;
     return true;
 }
 /* a container records its segments only while its style holds the group (layout.c) */
@@ -1816,8 +1374,8 @@ static bool rule_width(const char *s, size_t n, struct cx *cx, float *out) {
 static bool rule_value(int kind, const char *s, size_t n, struct cx *cx, union css_rule_value *out) {
     trim(&s, &n);
     if (!n) return false;
-    if (kind == CSS_RULE_STYLE) return kw_find(kw_bstyle, s, n, &out->style);
-    if (kind == CSS_RULE_WIDTH) return rule_width(s, n, cx, &out->width);
+    if (kind == CSS_GAP_STYLE) return kw_find(kw_bstyle, s, n, &out->style);
+    if (kind == CSS_GAP_WIDTH) return rule_width(s, n, cx, &out->width);
     return css_color_value_compute(s, n, cx, NULL, &out->color.argb, &out->color.exact);
 }
 static void rule_spec_word(sbuf *spec, const char *s, size_t n) {
@@ -1832,10 +1390,10 @@ static bool gap_rule(const char *s, size_t n, struct cx *cx, union css_rule_valu
     int k = split(s, n, t, tl, 4, ' ');
     if (k < 1 || k > 3 || t[k - 1] + tl[k - 1] != s + n) return false;
     int at[3] = {-1, -1, -1};
-    v[CSS_RULE_COLOR] = rule_initial_values[CSS_RULE_COLOR];
-    v[CSS_RULE_STYLE] = rule_initial_values[CSS_RULE_STYLE];
-    v[CSS_RULE_WIDTH] = rule_initial_values[CSS_RULE_WIDTH];
-    static const int order[3] = {CSS_RULE_STYLE, CSS_RULE_COLOR, CSS_RULE_WIDTH};
+    v[CSS_GAP_COLOR] = rule_initial_values[CSS_GAP_COLOR];
+    v[CSS_GAP_STYLE] = rule_initial_values[CSS_GAP_STYLE];
+    v[CSS_GAP_WIDTH] = rule_initial_values[CSS_GAP_WIDTH];
+    static const int order[3] = {CSS_GAP_STYLE, CSS_GAP_COLOR, CSS_GAP_WIDTH};
     for (int i = 0; i < k; i++) {
         int found = -1;
         for (int j = 0; j < 3 && found < 0; j++)
@@ -1845,7 +1403,7 @@ static bool gap_rule(const char *s, size_t n, struct cx *cx, union css_rule_valu
     }
     if (!spec) return true;
     size_t begin = spec->n;
-    int w = at[CSS_RULE_WIDTH], st = at[CSS_RULE_STYLE], c = at[CSS_RULE_COLOR];
+    int w = at[CSS_GAP_WIDTH], st = at[CSS_GAP_STYLE], c = at[CSS_GAP_COLOR];
     if (w >= 0 && !ident_is(t[w], tl[w], "medium")) rule_spec_word(spec, t[w], tl[w]);
     if (st >= 0 && !ident_is(t[st], tl[st], "none")) {
         if (spec->n > begin) sb_putc(spec, ' ');
@@ -1992,9 +1550,9 @@ static bool gap_shorthand_parse(int what, const char *v, size_t n, struct cx *cx
                                 sbuf inset_spec[4]) {
     switch (what) {
     case GS_RULE: return rule_lists(RULE_GAP, v, n, cx, out->list, spec);
-    case GS_COLOR: return rule_lists(CSS_RULE_COLOR, v, n, cx, out->list, NULL);
-    case GS_STYLE: return rule_lists(CSS_RULE_STYLE, v, n, cx, out->list, NULL);
-    case GS_WIDTH: return rule_lists(CSS_RULE_WIDTH, v, n, cx, out->list, NULL);
+    case GS_COLOR: return rule_lists(CSS_GAP_COLOR, v, n, cx, out->list, NULL);
+    case GS_STYLE: return rule_lists(CSS_GAP_STYLE, v, n, cx, out->list, NULL);
+    case GS_WIDTH: return rule_lists(CSS_GAP_WIDTH, v, n, cx, out->list, NULL);
     case GS_BREAK: return kw_find(kw_rule_break, v, n, &out->rule_break);
     case GS_ITEMS: return kw_find(kw_rule_items, v, n, &out->visibility);
     }
@@ -2037,8 +1595,8 @@ static bool gap_shorthand_apply(const struct propdef *p, const char *v, size_t n
 
 /* ---- serialization */
 static void rule_value_text(const style_t *st, int kind, const union css_rule_value *v, bool resolved, sbuf *out) {
-    if (kind == CSS_RULE_STYLE) { sb_puts(out, kw_name(kw_bstyle, v->style)); return; }
-    if (kind == CSS_RULE_WIDTH) { anim_unit(out, v->width, "px"); return; }
+    if (kind == CSS_GAP_STYLE) { sb_puts(out, kw_name(kw_bstyle, v->style)); return; }
+    if (kind == CSS_GAP_WIDTH) { anim_unit(out, v->width, "px"); return; }
     struct css_color_computed c;
     css_color_held(v->color.argb, v->color.exact, st->color, &c);
     if (!resolved) { anim_color_text(out, &c); return; }
@@ -2070,7 +1628,7 @@ static bool rule_inset_text(const struct css_rule_inset *v, sbuf *out, web_doc *
 /* §4.8: column-rule and row-rule from their longhands when they are repeater aligned (false: they
    serialize as the empty string) */
 static bool rule_triple_text(const style_t *st, const struct css_gap_axis *x, sbuf *out) {
-    const struct css_rule_list *w = &x->list[CSS_RULE_WIDTH], *s = &x->list[CSS_RULE_STYLE], *c = &x->list[CSS_RULE_COLOR];
+    const struct css_rule_list *w = &x->list[CSS_GAP_WIDTH], *s = &x->list[CSS_GAP_STYLE], *c = &x->list[CSS_GAP_COLOR];
     if (w->nitems != s->nitems || w->nitems != c->nitems) return false;
     for (uint32_t i = 0; i < w->nitems; i++)
         if (w->items[i].repeat != s->items[i].repeat || w->items[i].repeat != c->items[i].repeat ||
@@ -2081,11 +1639,11 @@ static bool rule_triple_text(const style_t *st, const struct css_gap_axis *x, sb
         if (it->repeat) rule_repeat_open(it, out);
         for (uint32_t j = 0; j < it->count; j++) {
             if (j) sb_puts(out, ", ");
-            rule_value_text(st, CSS_RULE_WIDTH, &w->values[w->items[i].first + j], true, out);
+            rule_value_text(st, CSS_GAP_WIDTH, &w->values[w->items[i].first + j], true, out);
             sb_putc(out, ' ');
-            rule_value_text(st, CSS_RULE_STYLE, &s->values[s->items[i].first + j], true, out);
+            rule_value_text(st, CSS_GAP_STYLE, &s->values[s->items[i].first + j], true, out);
             sb_putc(out, ' ');
-            rule_value_text(st, CSS_RULE_COLOR, &c->values[c->items[i].first + j], true, out);
+            rule_value_text(st, CSS_GAP_COLOR, &c->values[c->items[i].first + j], true, out);
         }
         if (it->repeat) sb_putc(out, ')');
     }
@@ -2096,9 +1654,9 @@ static bool gap_axis_text(const style_t *st, int what, const struct css_gap_axis
     const struct css_rule_inset *in = x->inset;
     switch (what) {
     case GS_RULE: return rule_triple_text(st, x, out);
-    case GS_COLOR: rule_list_text(st, CSS_RULE_COLOR, &x->list[CSS_RULE_COLOR], true, out); return true;
-    case GS_STYLE: rule_list_text(st, CSS_RULE_STYLE, &x->list[CSS_RULE_STYLE], true, out); return true;
-    case GS_WIDTH: rule_list_text(st, CSS_RULE_WIDTH, &x->list[CSS_RULE_WIDTH], true, out); return true;
+    case GS_COLOR: rule_list_text(st, CSS_GAP_COLOR, &x->list[CSS_GAP_COLOR], true, out); return true;
+    case GS_STYLE: rule_list_text(st, CSS_GAP_STYLE, &x->list[CSS_GAP_STYLE], true, out); return true;
+    case GS_WIDTH: rule_list_text(st, CSS_GAP_WIDTH, &x->list[CSS_GAP_WIDTH], true, out); return true;
     case GS_BREAK: sb_puts(out, kw_name(kw_rule_break, x->rule_break)); return true;
     case GS_ITEMS: sb_puts(out, kw_name(kw_rule_items, x->visibility)); return true;
     case GS_INSET_START: case GS_INSET_END: {
@@ -2265,7 +1823,12 @@ static bool parse_font_weight(const char *s, size_t n, struct cx *cx, uint16_t *
     else if (ident_is(s, n, "bold")) *out = 700;
     else if (ident_is(s, n, "bolder")) *out = pw < 350 ? 400 : pw < 550 ? 700 : 900;
     else if (ident_is(s, n, "lighter")) *out = pw < 550 ? 100 : pw < 750 ? 400 : 700;
-    else {
+    else if (css_calc_is_math(s, n)) {
+        /* a calculation clamps to [1, 1000] (§10.12) */
+        double v;
+        if (!css_numeric_read(s, n, CSS_CALC_NUMBER, cx, cx->a, NAN, &v, NULL)) return false;
+        *out = (uint16_t)(v < 1 ? 1 : v > 1000 ? 1000 : v);
+    } else {
         const char *p = s;
         float v;
         if (!parse_number(&p, s + n, &v) || p != s + n || v < 1 || v > 1000) return false;
@@ -2538,7 +2101,7 @@ static bool parse_mask_image(const char *s, size_t n, struct cx *cx) {
     return false;
 }
 
-static bool transform_angle(const char *s, size_t n, float *out);
+static bool transform_angle(const char *s, size_t n, struct cx *cx, float *out);
 /* linear-gradient(), radial-gradient() and their repeating- forms; NULL if it is not one */
 static const struct gradient *parse_gradient(const char *s, size_t n, struct cx *cx) {
     size_t fl = 0;
@@ -2603,7 +2166,7 @@ static const struct gradient *parse_gradient(const char *s, size_t n, struct cx 
                     g.angle = g.to_y < 0 ? 0 : g.to_x > 0 ? 90 : g.to_y > 0 ? 180 : 270;
                     g.to_x = g.to_y = 0;
                 }
-            } else if (q == 1 && transform_angle(c[0], cl[0], &deg)) g.angle = deg * 180 / (float)M_PI;
+            } else if (q == 1 && transform_angle(c[0], cl[0], cx, &deg)) g.angle = deg * 180 / (float)M_PI;
             else return NULL;
             continue;
         }
@@ -2901,24 +2464,21 @@ static bool motion_name(const char *s, size_t n) {
 /* a <time> in milliseconds, or a math function of type <time> (CSS Values 4 §10); duration: it
    may not be negative, which a calculation clamps to 0 (§10.12) and a literal is invalid */
 static bool motion_time(const char *s,size_t n,struct cx *cx,bool duration,float *out) {
-    const char *p=s;float v;
-    if (n && isalpha((unsigned char)s[0])) {
-        bool outer=cx->time;
-        cx->time=true;
-        struct cexpr *x=calc_value(&p,s+n,cx);
-        cskip(&p,s+n);
-        cx->time=outer;
-        bool number;float ms,pct;
-        if (!x || p!=s+n || (cx->supports_probe && cx->invalid) || !calc_dimension(x,&number) || number ||
-            !cfold(x,&number,&ms,&pct) || number || pct || isnan(ms)) return false;
-        if (duration && ms<0) ms=0;
-        *out=ms;return true;
-    }
-    if (!parse_number(&p,s+n,&v) || !isfinite(v)) return false;
-    if (s+n-p==1 && (*p|32)=='s') v*=1000;
-    else if (s+n-p!=2 || (p[0]|32)!='m' || (p[1]|32)!='s') return false;
-    if (!isfinite(v) || (duration && v<0)) return false;
-    *out=v;return true;
+    double v;
+    bool math=css_calc_is_math(s,n);
+    if (!css_numeric_read(s,n,CSS_CALC_TIME,cx,cx->a,NAN,&v,NULL)) return false;
+    v*=1000;
+    if (math) { if (duration && v<0) v=0; } /* the range clamps a calculation (§10.12) */
+    else if (!isfinite(v) || (duration && v<0)) return false;
+    *out=calc_float(v);return true;
+}
+/* an <easing-function>'s <number> or <integer>: a literal or a math function (no element) */
+static bool easing_number(const char *s,size_t n,bool integer,float *out) {
+    double v;
+    bool math=css_calc_is_math(s,n);
+    if (!css_numeric_read(s,n,CSS_CALC_NUMBER,NULL,NULL,NAN,&v,NULL) || (!math && !isfinite(v))) return false;
+    if (integer) { if (math) v=floor(v+0.5); else if (v!=floor(v)) return false; }
+    *out=calc_float(v);return true;
 }
 /* <easing-function> (css-easing-1 §2): linear, the cubic-bezier() keywords and function,
    step-start/step-end and steps(<integer>[, <step-position>]). */
@@ -2937,8 +2497,9 @@ bool css_easing_parse(const char *s,size_t n,struct css_easing *out) {
     if(n>7 && strn_ieq(s,"steps(",6) && s[n-1]==')') {
         const char *t[3];size_t tl[3];int k=split(s+6,n-7,t,tl,3,',');
         if(k<1 || k>2)return false;
-        const char *p=t[0];float count;
-        if(!parse_number(&p,t[0]+tl[0],&count) || p!=t[0]+tl[0] || count!=floorf(count) || count<1 || count>1e9f)return false;
+        float count;
+        if(!easing_number(t[0],tl[0],true,&count) || count<1)return false;
+        if(count>1e9f)count=1e9f; /* steps beyond a float's integers are not told apart */
         uint8_t position=CM_STEP_END;
         if(k==2) {
             static const struct kw positions[]={{"end",CM_STEP_END},{"jump-end",CM_STEP_END},{"start",CM_STEP_START},
@@ -2949,13 +2510,9 @@ bool css_easing_parse(const char *s,size_t n,struct css_easing *out) {
         *out=(struct css_easing){.kind=CM_STEPS,.steps=(uint32_t)count,.position=position};return true;
     }
     if(n<15 || !strn_ieq(s,"cubic-bezier(",13) || s[n-1]!=')')return false;
-    const char *p=s+13,*e=s+n-1;float a[4];
-    for(int i=0;i<4;i++) {
-        while(p<e && is_space((unsigned char)*p))p++;
-        if(!parse_number(&p,e,&a[i]) || !isfinite(a[i]))return false;
-        while(p<e && is_space((unsigned char)*p))p++;
-        if(i<3){if(p==e || *p++!=',')return false;}else if(p!=e)return false;
-    }
+    const char *t[5];size_t tl[5];float a[4];
+    if(split(s+13,n-14,t,tl,5,',')!=4)return false;
+    for(int i=0;i<4;i++) if(!easing_number(t[i],tl[i],false,&a[i]))return false;
     if(a[0]<0 || a[0]>1 || a[2]<0 || a[2]>1)return false;
     v.x1=a[0];v.y1=a[1];v.x2=a[2];v.y2=a[3];
     *out=v;return true;
@@ -3078,6 +2635,13 @@ static bool motion_item_parse(int list, const struct kw *kws, const char *s, siz
     case ML_EASING: case ML_TEASING: return css_easing_parse(s, n, &out->e);
     case ML_ITERATIONS:
         if (ident_is(s, n, "infinite")) { out->f = INFINITY; return true; }
+        if (css_calc_is_math(s, n)) {
+            /* a calculation clamps to [0, infinity], which the count keeps (§10.12) */
+            double v;
+            if (!css_numeric_read(s, n, CSS_CALC_NUMBER, cx, cx->a, NAN, &v, NULL)) return false;
+            out->f = v < 0 ? 0 : v > FLT_MAX ? INFINITY : (float)v;
+            return true;
+        }
         return parse_number(&q, s + n, &out->f) && q == s + n && isfinite(out->f) && out->f >= 0;
     case ML_TPROPERTY: {
         if (ident_is(s, n, "all")) { out->s = "all"; return true; }
@@ -3100,11 +2664,11 @@ static size_t motion_items(const char *v, size_t n, const char **items, size_t *
     int depth = 0; char quote = 0;
     for (size_t i = 0; i <= n; i++) {
         char c = i < n ? v[i] : ',';
-        if (quote) { if (c == '\\') i++; else if (c == quote) quote = 0; continue; }
-        if (c == '"' || c == '\'') quote = c;
+        if (quote && i < n) { if (c == '\\') i++; else if (c == quote) quote = 0; continue; }
+        if (i < n && (c == '"' || c == '\'')) quote = c;
         else if (c == '(') depth++;
         else if (c == ')') depth--;
-        else if (c == ',' && depth <= 0) {
+        else if (c == ',' && (depth <= 0 || i == n)) { /* the end closes what is open (CSS Syntax) */
             if (count < max) { items[count] = v + start; lengths[count] = i - start; }
             count++; start = i + 1;
         }
@@ -3287,23 +2851,26 @@ static bool parse_translate_value(const char *v,size_t n,struct cx *cx,struct cs
     for(int i=0;i<count;i++)if(!parse_len(parts[i],lengths[i],cx,&t.xy[i],LF_NEG|LF_LENGTH))return false;
     t.active=true;*out=t;return true;
 }
-static bool transform_number(const char *s,size_t n,bool percentage,float *out){
-    trim(&s,&n);const char *p=s,*e=s+n;float v;
-    if(!parse_number(&p,e,&v)||!isfinite(v))return false;
-    if(p==e){*out=v;return true;}
-    if(percentage&&p+1==e&&*p=='%'){*out=v/100;return true;}
-    return false;
+/* a <number> (percentage: or a <percentage>, as a fraction) of a transform: a literal or a math function */
+static bool transform_number(const char *s,size_t n,struct cx *cx,bool percentage,float *out){
+    double v;unsigned kind;
+    bool math=css_calc_is_math(s,n);
+    if(!css_numeric_read(s,n,CSS_CALC_NUMBER|(percentage?CSS_CALC_PERCENT:0),cx,cx->a,NAN,&v,&kind))return false;
+    if(kind==CSS_CALC_PERCENT)v/=100;
+    if(!math&&(!isfinite(v)||fabs(v)>FLT_MAX))return false;
+    *out=calc_float(v);return true;
 }
-static bool transform_angle(const char *s,size_t n,float *out){
-    trim(&s,&n);const char *p=s,*e=s+n;float v;
-    if(!parse_number(&p,e,&v))return false;
-    size_t unit=(size_t)(e-p);double r;
-    if(!unit){if(v!=0)return false;r=0;} /* unitless zero only */
-    else if(ident_is(p,unit,"deg"))r=v*M_PI/180;
-    else if(ident_is(p,unit,"rad"))r=v;
-    else if(ident_is(p,unit,"grad"))r=v*M_PI/200;
-    else if(ident_is(p,unit,"turn"))r=v*2*M_PI;
-    else return false;
+/* an <angle> of a transform in radians: a literal (unitless zero too) or a math function of type <angle> */
+static bool transform_angle(const char *s,size_t n,struct cx *cx,float *out){
+    double v;unsigned kind;
+    bool math=css_calc_is_math(s,n);
+    if(!css_numeric_read(s,n,CSS_CALC_ANGLE|(math?0:CSS_CALC_NUMBER),cx,cx->a,NAN,&v,&kind))return false;
+    if(kind==CSS_CALC_NUMBER&&v!=0)return false; /* unitless zero only */
+    if(!isfinite(v)){
+        if(!math)return false;
+        v=0; /* an infinite or NaN calculation is no turn: it has no angle in range to clamp to */
+    }
+    double r=v*M_PI/180;
     *out=(float)r;return isfinite(*out);
 }
 static struct css_transform transform_identity(uint8_t kind){
@@ -3319,7 +2886,7 @@ static bool transform_function(const char *name,size_t nn,const char **a,const s
     if(IS("matrix")||IS("matrix3d")){
         bool three=IS("matrix3d");float v[16];
         if(count!=(three?16:6))return false;
-        for(int i=0;i<count;i++)if(!transform_number(a[i],al[i],false,&v[i]))return false;
+        for(int i=0;i<count;i++)if(!transform_number(a[i],al[i],cx,false,&v[i]))return false;
         *t=transform_identity(CT_MATRIX);
         if(three){for(int r=0;r<4;r++)for(int c=0;c<4;c++)t->m[r*4+c]=v[c*4+r];} /* column-major input */
         else{t->m[0]=v[0];t->m[4]=v[1];t->m[1]=v[2];t->m[5]=v[3];t->m[3]=v[4];t->m[7]=v[5];}
@@ -3342,7 +2909,7 @@ static bool transform_function(const char *name,size_t nn,const char **a,const s
         *t=transform_identity(CT_SCALE);
         bool both=IS("scale"),three=IS("scale3d");float v[3];
         if(three?count!=3:both?(count<1||count>2):count!=1)return false;
-        for(int i=0;i<count;i++)if(!transform_number(a[i],al[i],true,&v[i]))return false;
+        for(int i=0;i<count;i++)if(!transform_number(a[i],al[i],cx,true,&v[i]))return false;
         if(three){t->v[0]=v[0];t->v[1]=v[1];t->v[2]=v[2];}
         else if(both){t->v[0]=v[0];t->v[1]=count>1?v[1]:v[0];}
         else t->v[IS("scaleX")?0:IS("scaleY")?1:2]=v[0];
@@ -3352,10 +2919,10 @@ static bool transform_function(const char *name,size_t nn,const char **a,const s
         *t=transform_identity(CT_ROTATE);
         if(IS("rotate3d")){
             if(count!=4)return false;
-            for(int i=0;i<3;i++)if(!transform_number(a[i],al[i],false,&t->v[i]))return false;
-            return transform_angle(a[3],al[3],&t->v[3]);
+            for(int i=0;i<3;i++)if(!transform_number(a[i],al[i],cx,false,&t->v[i]))return false;
+            return transform_angle(a[3],al[3],cx,&t->v[3]);
         }
-        if(count!=1||!transform_angle(a[0],al[0],&t->v[3]))return false;
+        if(count!=1||!transform_angle(a[0],al[0],cx,&t->v[3]))return false;
         if(IS("rotateX")){t->v[0]=1;t->v[2]=0;}
         else if(IS("rotateY")){t->v[1]=1;t->v[2]=0;}
         return true;
@@ -3363,7 +2930,7 @@ static bool transform_function(const char *name,size_t nn,const char **a,const s
     if(IS("skew")||IS("skewX")||IS("skewY")){
         *t=transform_identity(CT_SKEW);
         if(IS("skew")?(count<1||count>2):count!=1)return false;
-        for(int i=0;i<count;i++)if(!transform_angle(a[i],al[i],&t->v[IS("skewY")?1:i]))return false;
+        for(int i=0;i<count;i++)if(!transform_angle(a[i],al[i],cx,&t->v[IS("skewY")?1:i]))return false;
         return true;
     }
     if(IS("perspective")){
@@ -3445,10 +3012,10 @@ static bool parse_rotate_value(const char *v,size_t n,struct cx *cx,const struct
     if(ident_is(v,n,"none")){*out=NULL;return true;}
     const char *t[5];size_t tl[5];int k=split_checked(v,n,t,tl,5,' ',cx);
     struct css_transform value=transform_identity(CT_ROTATE);
-    if(k==1){if(!transform_angle(t[0],tl[0],&value.v[3]))return false;}
+    if(k==1){if(!transform_angle(t[0],tl[0],cx,&value.v[3]))return false;}
     else if(k==2||k==4){
-        int angle=transform_angle(t[0],tl[0],&value.v[3])?0:k-1;
-        if(angle&&!transform_angle(t[angle],tl[angle],&value.v[3]))return false;
+        int angle=transform_angle(t[0],tl[0],cx,&value.v[3])?0:k-1;
+        if(angle&&!transform_angle(t[angle],tl[angle],cx,&value.v[3]))return false;
         int axis=angle?0:1;
         if(k==2){
             value.v[2]=0;
@@ -3456,7 +3023,7 @@ static bool parse_rotate_value(const char *v,size_t n,struct cx *cx,const struct
             else if(ident_is(t[axis],tl[axis],"y"))value.v[1]=1;
             else if(ident_is(t[axis],tl[axis],"z"))value.v[2]=1;
             else return false;
-        }else for(int i=0;i<3;i++)if(!transform_number(t[axis+i],tl[axis+i],false,&value.v[i]))return false;
+        }else for(int i=0;i<3;i++)if(!transform_number(t[axis+i],tl[axis+i],cx,false,&value.v[i]))return false;
     }else return false;
     struct css_transform *node=ar_alloc(cx->a,sizeof *node);*node=value;*out=node;return true;
 }
@@ -3466,7 +3033,7 @@ static bool parse_scale_value(const char *v,size_t n,struct cx *cx,const struct 
     const char *t[4];size_t tl[4];int k=split_checked(v,n,t,tl,4,' ',cx);
     if(k<1||k>3)return false;
     struct css_transform value=transform_identity(CT_SCALE);
-    for(int i=0;i<k;i++)if(!transform_number(t[i],tl[i],true,&value.v[i]))return false;
+    for(int i=0;i<k;i++)if(!transform_number(t[i],tl[i],cx,true,&value.v[i]))return false;
     if(k==1)value.v[1]=value.v[0];
     struct css_transform *node=ar_alloc(cx->a,sizeof *node);*node=value;*out=node;return true;
 }
@@ -3673,7 +3240,8 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
     }
     case PT_NUM: {
         float x;
-        if (!parse_number_value(v, n, cx, &x) || x < 0) return false;
+        if (!parse_number_value(v, n, cx, &x)) return false;
+        if (x < 0) { if (!css_calc_is_math(v, n)) return false; x = 0; } /* a calculation clamps to the range */
         *(float *)field = x;
         return true;
     }
@@ -3690,11 +3258,12 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
     case PT_CLIP: return parse_clip_rect(v, n, cx, &s->clip);
     case PT_BOX_SHADOW: return parse_box_shadows(v, n, cx, &s->box_shadow, NULL);
     case PT_OPACITY: {
-        const char *q = v;
-        float x;
-        if (parse_number(&q, v + n, &x) && q + 1 == v + n && *q == '%') x /= 100;
-        else if (!parse_number_value(v, n, cx, &x)) return false;
-        *(float *)field = x < 0 ? 0 : x > 1 ? 1 : x;
+        /* <opacity-value>: <number> | <percentage>, either of them a calculation */
+        double x;
+        unsigned kind;
+        if (!css_numeric_read(v, n, CSS_CALC_NUMBER | CSS_CALC_PERCENT, cx, cx->a, NAN, &x, &kind)) return false;
+        if (kind == CSS_CALC_PERCENT) x /= 100;
+        *(float *)field = x < 0 ? 0 : x > 1 ? 1 : (float)x;
         return true;
     }
     case PT_INT: case PT_ZINDEX: {
@@ -3706,8 +3275,13 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
         const char *q = v;
         float x;
         bool math = !parse_number(&q, v + n, &x) || q != v + n;
-        if (math && !parse_number_value(v, n, cx, &x)) return false;
-        if (math) x = roundf(x); /* a math function resolves to the nearest integer */
+        if (math) {
+            /* a calculation resolves to the nearest integer, a half toward +infinity, in range (§10.12) */
+            double d;
+            if (!css_calc_is_math(v, n) || !css_numeric_read(v, n, CSS_CALC_NUMBER, cx, cx->a, NAN, &d, NULL)) return false;
+            d = floor(d + 0.5);
+            x = d > 2147483520.0 ? 2147483520.0f : d < -2147483648.0 ? -2147483648.0f : (float)d;
+        }
         if (cx->supports_probe && (x != floorf(x) || x > 2147483520.0f || x < -2147483648.0f)) return false;
         *(int *)field = (int)x;
         if (p->type == PT_ZINDEX) s->z_auto = false;
@@ -3719,22 +3293,19 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
         if(!choose_family(v,n,&s->font_family,cx))return false;
         s->font_names=ar_strndup(cx->a,v,n);s->named_font=NULL;s->font_choices=NULL;return true;
     case PT_LINE_HEIGHT: {
-        len_t l;
         if (ident_is(v, n, "normal")) {
             s->line_height.kind = LK_NORMAL;
             return true;
         }
-        float x;
-        if (parse_number_value(v, n, cx, &x)) {
-            if (x < 0) return false;
-            s->line_height.kind = LK_NUMBER;
-            s->line_height.px = x;
-            s->line_height.pct = 0;
-            return true;
-        }
-        if (!parse_len(v, n, cx, &l, 0)) return false;
-        s->line_height.kind = LK_LEN;
-        s->line_height.px = len_resolve(&l, s->font_size);
+        /* <number> | <length-percentage>: percentages are of the font size, also in a calculation
+           (calc(10% / 1px) is a number) */
+        double x;
+        unsigned kind;
+        if (!css_numeric_read(v, n, CSS_CALC_NUMBER | CSS_CALC_LENGTH | CSS_CALC_PERCENT, cx, cx->a, s->font_size, &x, &kind))
+            return false;
+        if (x < 0) { if (!css_calc_is_math(v, n)) return false; x = 0; }
+        s->line_height.kind = kind == CSS_CALC_NUMBER ? LK_NUMBER : LK_LEN;
+        s->line_height.px = kind == CSS_CALC_NUMBER ? calc_float(x) : x > 1e7 ? 1e7f : (float)x;
         s->line_height.pct = 0;
         return true;
     }
@@ -4954,7 +4525,9 @@ static void tf_rotate_text(sbuf *b, const struct css_transform *t) {
 }
 static void tf_scale_text(sbuf *b, const struct css_transform *t) {
     if (!t) { sb_puts(b, "none"); return; }
-    anim_number(b, t->v[0]); sb_putc(b, ' '); anim_number(b, t->v[1]);
+    anim_number(b, t->v[0]);
+    /* the shortest form that reads back (CSS Transforms 2: scale's y is its x when omitted) */
+    if (t->v[1] != t->v[0] || t->v[2] != 1) { sb_putc(b, ' '); anim_number(b, t->v[1]); }
     if (t->v[2] != 1) { sb_putc(b, ' '); anim_number(b, t->v[2]); }
 }
 static bool tf_equal(const struct css_transform *a, const struct css_transform *b) {
@@ -5360,7 +4933,7 @@ static uint64_t rule_lcm(uint64_t a, uint64_t b) {
 }
 static bool rule_value_combine(int kind, const style_t *a, const union css_rule_value *x, const style_t *b,
                                const union css_rule_value *y, double ka, double kb, int mode, sbuf *out) {
-    if (kind == CSS_RULE_WIDTH) { anim_unit(out, anim_clamp(x->width * ka + y->width * kb, 0, INFINITY), "px"); return true; }
+    if (kind == CSS_GAP_WIDTH) { anim_unit(out, anim_clamp(x->width * ka + y->width * kb, 0, INFINITY), "px"); return true; }
     struct css_color_computed u, v;
     css_color_held(x->color.argb, x->color.exact, a->color, &u);
     css_color_held(y->color.argb, y->color.exact, b->color, &v);

@@ -9,8 +9,8 @@ css/css-shadow/part（::part()）の頁は、頁の木（custom element の temp
 tree に）を道具へ渡し、cascade 自身の集め方（cascade_collect・style 属性・cmp_dent）で
 勝つ色を照らす。読む前に DOM を変える subtest と form の部品のある頁は数えて落とす。
 
-照らすのは native の層だけ：insertRule は css_parse_sheet と css_sheet_single_rule、
-selectorText・cssText は規則の直列化、querySelector・matches は css_select_n・
+照らすのは native の層だけ：insertRule・selectorText・cssText は規則の木の持ち主（cssom.c の
+cssom_insert・cssom_set_attribute・cssom_serialize）、querySelector・matches は css_select_n・
 css_matches_n、getComputedStyle は「規則の選択子のどれかが要素に当たるか」で置き換える
 （cascade の索引と Bloom の篩は通さない。::part() の頁だけは索引を通る）。JS の束縛（例外の型・CSSOM の物）、iframe の
 読込み、:focus-visible の打鍵は guest の WPT の仕事。
@@ -57,7 +57,7 @@ generated.write_text('#include "css.c"\n' + ("#define OLD_SOURCE 1\n" if old els
 stubs = out / "unreached.c"
 exe = out / "css-selectors.exe"
 units = [str(generated), str(web / "dom.c"), str(web / "html.c"), str(web / "util.c"), str(web / "cssprop.c"),
-         str(web / "color.c")]
+         str(web / "color.c")] + ([] if old else [str(web / "cssom.c")]) + ([str(web / "cssmath.c")] if (web / "cssmath.c").exists() else [])
 flags =["-std=gnu11", "-O1", "-w", "-I" + str(abi), "-I" + str(source / "user/include"), "-I" + str(source / "common"),
          "-I" + str(source / "user/libc"), "-I" + str(web), "-I" + str(root / "third_party/quickjs")]
 undefined = re.compile(r"undefined (?:symbol: |reference to `)([A-Za-z_][A-Za-z0-9_]*)")

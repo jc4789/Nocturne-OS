@@ -51,10 +51,10 @@ static JSValue native_broadcast(JSContext *ctx, JSValueConst this_val, int argc,
         if (!b->name) { js_free(ctx, b); JS_FreeCString(ctx, name); return JS_EXCEPTION; }
         memcpy(b->name, name, length + 1); b->name_len = length; JS_FreeCString(ctx, name);
         const char *url = web_effective_url(s->doc);
-        enum http_url_result origin_status = make_origin(url, &b->origin);
-        if (origin_status == HTTP_URL_OOM || origin_status == HTTP_URL_INVALID) {
+        enum web_url_result origin_status = web_url_origin(url, &b->origin);
+        if (origin_status == WEB_URL_OOM || origin_status == WEB_URL_INVALID) {
             free(b->origin); js_free(ctx,b->name); js_free(ctx,b);
-            return origin_status == HTTP_URL_OOM ? JS_ThrowOutOfMemory(ctx) :
+            return origin_status == WEB_URL_OOM ? JS_ThrowOutOfMemory(ctx) :
                 JS_ThrowTypeError(ctx,"Channel origin is unavailable");
         }
         b->state = s; b->callback = JS_DupValue(ctx, argv[2]);

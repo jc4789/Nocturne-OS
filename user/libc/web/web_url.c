@@ -65,10 +65,23 @@ static lxb_status_t put(const lxb_char_t *data, size_t length, void *out) {
     return href_put(out, data, length) ? LXB_STATUS_OK : LXB_STATUS_ERROR_MEMORY_ALLOCATION;
 }
 
+_Static_assert((int)WEB_URL_HOST_NULL == (int)LXB_URL_HOST_TYPE__UNDEF &&
+               (int)WEB_URL_HOST_DOMAIN == (int)LXB_URL_HOST_TYPE_DOMAIN &&
+               (int)WEB_URL_HOST_OPAQUE == (int)LXB_URL_HOST_TYPE_OPAQUE &&
+               (int)WEB_URL_HOST_IPV4 == (int)LXB_URL_HOST_TYPE_IPV4 &&
+               (int)WEB_URL_HOST_IPV6 == (int)LXB_URL_HOST_TYPE_IPV6 &&
+               (int)WEB_URL_HOST_EMPTY == (int)LXB_URL_HOST_TYPE_EMPTY, "Lexbor's host types");
+
+void web_url_free(struct web_url *url) {
+    if (!url) return;
+    free(url->href);
+    memset(url, 0, sizeof *url);
+}
+
 /* The URL serializer, noting each component's span on the way; false when
-   out of memory. */
+   out of memory (out then empty). */
 static bool serialize(const lxb_url_t *url, struct web_url *out) {
-    sbuf *b = &out->href;
+    sbuf text = {0}, *b = &text;
     size_t *mark = out->mark;
     bool ok = lxb_url_serialize_scheme(url, put, b) == LXB_STATUS_OK && href_put(b, ":", 1);
     mark[WEB_URL_PROTOCOL_END] = b->n;
@@ -104,7 +117,16 @@ static bool serialize(const lxb_url_t *url, struct web_url *out) {
     mark[WEB_URL_FRAGMENT_START] = b->n;
     if (url->fragment.data)
         ok = ok && href_put(b, "#", 1) && href_put(b, url->fragment.data, url->fragment.length);
-    return ok;
+    if (!ok) {
+        free(text.p);
+        memset(out, 0, sizeof *out);
+        return false;
+    }
+    out->href = text.p;
+    out->length = text.n;
+    out->host = (enum web_url_host_type)url->host.type;
+    out->port = url->has_port ? url->port : -1;
+    return true;
 }
 
 /* A parse in the parser's scratch memory: NULL for failure, with *status.
@@ -152,15 +174,13 @@ static const lxb_url_t *base_of(struct web_url_parser *p, const char *base, size
     return url;
 }
 
-/* input against base_url (or none) into out: 1, 0 or -1, out's href freed
-   unless 1. */
+/* input against base_url (or none) into out: 1, 0 or -1, out empty unless 1. */
 static int parse_into(struct web_url_parser *p, const lxb_url_t *base_url, const char *input,
                       size_t length, web_encoding encoding, struct web_url *out) {
     lxb_status_t status;
     lxb_url_t *url = parse(p, base_url, input, length, encoding, &status);
     int result = url ? serialize(url, out) ? 1 : -1 : result_of(status);
     lexbor_mraw_clean(p->mraw);
-    if (result != 1) sb_free(&out->href);
     return result;
 }
 
@@ -218,7 +238,6 @@ int web_url_set(struct web_url_parser *p, const char *href, size_t href_length,
     int result = url && status != LXB_STATUS_ERROR_MEMORY_ALLOCATION ? 1 : url ? -1 : result_of(status);
     if (result == 1 && !serialize(url, out)) result = -1;
     lexbor_mraw_clean(p->mraw);
-    if (result != 1) sb_free(&out->href);
     return result;
 }
 
@@ -287,7 +306,7 @@ int web_url_resolve(const char *base, const char *input, web_encoding encoding, 
         struct web_url url = {0};
         result = status == LXB_STATUS_ERROR_MEMORY_ALLOCATION ? -1 :
             parse_into(p, base_url, input_copy ? input_copy : input, length, encoding, &url);
-        if (result == 1) *out = url.href.p;
+        if (result == 1) *out = url.href;
         give_back(p);
     }
     free(input_copy);
@@ -297,6 +316,181 @@ int web_url_resolve(const char *base, const char *input, web_encoding encoding, 
 
 int web_resolve_url_owned(const char *base, const char *rel, char **out) {
     return web_url_resolve(base, rel, WEB_ENCODING_UTF8, out);
+}
+
+int web_url_read(const char *input, size_t length, struct web_url *url) {
+    if (!url) return 0;
+    memset(url, 0, sizeof *url);
+    if (!input) return 0;
+    char *copy;
+    if (!scalar_values(input, length, &copy)) return -1;
+    struct web_url_parser *p = borrow();
+    int result = p ? parse_into(p, NULL, copy ? copy : input, length, WEB_ENCODING_UTF8, url) : -1;
+    if (p) give_back(p);
+    free(copy);
+    return result;
+}
+
+int web_url_change(const char *href, enum web_url_part part, const char *value, char **out) {
+    if (!out) return 0;
+    *out = NULL;
+    if (!href || !value) return 0;
+    struct web_url_parser *p = borrow();
+    if (!p) return -1;
+    struct web_url url = {0};
+    int result = web_url_set(p, href, strlen(href), part, value, strlen(value), WEB_ENCODING_UTF8, &url);
+    give_back(p);
+    if (result == 1) *out = url.href;
+    return result;
+}
+
+/* A tuple origin's serialization: scheme "://" and the host and port as the URL's own
+   serialization has them (the port is null when it is the scheme's default). */
+static enum web_url_result tuple_origin(const struct web_url *url, char **origin) {
+    size_t scheme = url->mark[WEB_URL_PROTOCOL_END], authority;
+    const char *at = web_url_authority(url, &authority);
+    char *text = malloc(scheme + 2 + authority + 1);
+    if (!text) return WEB_URL_OOM;
+    memcpy(text, url->href, scheme);
+    memcpy(text + scheme, "//", 2);
+    memcpy(text + scheme + 2, at, authority);
+    text[scheme + 2 + authority] = 0;
+    *origin = text;
+    return WEB_URL_TUPLE;
+}
+
+enum web_url_result web_url_origin_of(const struct web_url *url, char **origin) {
+    if (!origin) return WEB_URL_INVALID;
+    *origin = NULL;
+    if (!url || !url->href) return WEB_URL_INVALID;
+    if (web_url_scheme_is(url, "ftp") || web_url_scheme_is(url, "http") || web_url_scheme_is(url, "https") ||
+        web_url_scheme_is(url, "ws") || web_url_scheme_is(url, "wss"))
+        return tuple_origin(url, origin);
+    if (!web_url_scheme_is(url, "blob")) return WEB_URL_OPAQUE;
+    /* A blob URL entry's environment's origin is the blob store's; without one, the origin of
+       the URL its path parses as, when that is http, https or file (whose origin is opaque here). */
+    size_t length;
+    const char *path = web_url_span(url, WEB_URL_PATH_START, WEB_URL_QUERY_START, &length);
+    struct web_url inner;
+    int parsed = web_url_read(path, length, &inner);
+    if (parsed < 0) return WEB_URL_OOM;
+    enum web_url_result result = WEB_URL_OPAQUE;
+    if (parsed == 1 && web_url_http_scheme(&inner))
+        result = tuple_origin(&inner, origin);
+    web_url_free(&inner);
+    return result;
+}
+
+enum web_url_result web_url_origin(const char *text, char **origin) {
+    if (origin) *origin = NULL;
+    if (!origin || !text) return WEB_URL_INVALID;
+    struct web_url url;
+    int parsed = web_url_read(text, strlen(text), &url);
+    if (parsed != 1) return parsed < 0 ? WEB_URL_OOM : WEB_URL_INVALID;
+    enum web_url_result result = web_url_origin_of(&url, origin);
+    web_url_free(&url);
+    return result;
+}
+
+int web_url_same_origin(const char *a, const char *b) {
+    char *x = NULL, *y = NULL;
+    enum web_url_result xr = web_url_origin(a, &x), yr = web_url_origin(b, &y);
+    int same = xr == WEB_URL_OOM || yr == WEB_URL_OOM ? -1 :
+               xr == WEB_URL_TUPLE && yr == WEB_URL_TUPLE && !strcmp(x, y);
+    free(x);
+    free(y);
+    return same;
+}
+
+bool web_origin_http(const char *origin) {
+    if (!origin) return false;
+    size_t length = strlen(origin);
+    struct web_url url;
+    if (web_url_read(origin, length, &url) != 1) return false;
+    /* The origin's own text, and the URL it reads as is that origin's URL: scheme, host,
+       port and the path "/", nothing else. */
+    bool valid = web_url_http_scheme(&url) &&
+                 !web_url_includes_credentials(&url) && url.length == length + 1 &&
+                 url.mark[WEB_URL_PATH_START] == length && url.href[length] == '/' &&
+                 !memcmp(url.href, origin, length);
+    web_url_free(&url);
+    return valid;
+}
+
+bool web_url_host_serialized(const char *host, size_t length) {
+    if (!host || !length || memchr(host, 0, length) || length > SIZE_MAX - 9) return false;
+    char *text = malloc(length + 9);
+    if (!text) return false;
+    memcpy(text, "http://", 7);
+    memcpy(text + 7, host, length);
+    memcpy(text + 7 + length, "/", 2);
+    struct web_url url;
+    bool valid = false;
+    if (web_url_read(text, length + 8, &url) == 1) {
+        size_t n;
+        const char *parsed = web_url_host_text(&url, &n);
+        valid = url.port < 0 && n == length && !memcmp(parsed, host, length) && url.length == length + 8;
+        web_url_free(&url);
+    }
+    free(text);
+    return valid;
+}
+
+/* Secure Contexts' "Is origin potentially trustworthy?" for the tuple origin of url (ftp,
+   http, https, ws or wss): https and wss, then a loopback host. Every serialization of an
+   IPv4 address in 127.0.0.0/8 starts "127." and ::1's is "[::1]". */
+static bool tuple_trustworthy(const struct web_url *url) {
+    size_t n;
+    const char *host = web_url_host_text(url, &n);
+    return web_url_scheme_is(url, "https") || web_url_scheme_is(url, "wss") ||
+           (url->host == WEB_URL_HOST_IPV4 && n > 4 && !memcmp(host, "127.", 4)) ||
+           (url->host == WEB_URL_HOST_IPV6 && n == 5 && !memcmp(host, "[::1]", 5)) ||
+           (url->host == WEB_URL_HOST_DOMAIN && n == 9 && !memcmp(host, "localhost", 9));
+}
+
+/* HTML's "matches about:blank" (or about:srcdoc): the about scheme, no credentials, a null
+   host and the path name, whatever the query and fragment. */
+static bool about_is(const struct web_url *url, const char *name) {
+    size_t n;
+    const char *path = web_url_span(url, WEB_URL_PATH_START, WEB_URL_QUERY_START, &n);
+    return web_url_scheme_is(url, "about") && url->host == WEB_URL_HOST_NULL &&
+           n == strlen(name) && !memcmp(path, name, n);
+}
+
+bool web_url_potentially_trustworthy(const char *text) {
+    if (!text) return false;
+    struct web_url url;
+    if (web_url_read(text, strlen(text), &url) != 1) return false;
+    bool trustworthy = about_is(&url, "blank") || about_is(&url, "srcdoc") ||
+                       web_url_scheme_is(&url, "data") || web_url_scheme_is(&url, "file");
+    if (!trustworthy && web_url_default_port(&url) >= 0) trustworthy = tuple_trustworthy(&url);
+    else if (!trustworthy && web_url_scheme_is(&url, "blob")) {
+        /* A blob URL's origin is its path's when that is an http or https URL. */
+        size_t length;
+        const char *path = web_url_span(&url, WEB_URL_PATH_START, WEB_URL_QUERY_START, &length);
+        struct web_url inner;
+        if (web_url_read(path, length, &inner) == 1) {
+            trustworthy = web_url_http_scheme(&inner) &&
+                          tuple_trustworthy(&inner);
+            web_url_free(&inner);
+        }
+    }
+    web_url_free(&url);
+    return trustworthy;
+}
+
+int web_url_equal(const char *a, const char *b, bool exclude_fragments) {
+    struct web_url x, y;
+    int xr = web_url_read(a, a ? strlen(a) : 0, &x);
+    if (xr != 1) return xr;
+    int yr = web_url_read(b, b ? strlen(b) : 0, &y);
+    if (yr != 1) { web_url_free(&x); return yr; }
+    size_t xn = exclude_fragments ? x.mark[WEB_URL_FRAGMENT_START] : x.length,
+           yn = exclude_fragments ? y.mark[WEB_URL_FRAGMENT_START] : y.length;
+    int equal = xn == yn && !memcmp(x.href, y.href, xn);
+    web_url_free(&x);
+    web_url_free(&y);
+    return equal;
 }
 
 /* '+' as a space, then percent-decoding, in place. */

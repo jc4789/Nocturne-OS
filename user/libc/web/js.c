@@ -75,6 +75,7 @@
 #define JS_IDLE_PERIOD_CALLBACKS 8u
 
 #define JS_NODE_BUCKETS 4096
+#define JS_STYLE_MEMO 64
 struct js_node_ref {
     node_t *node;
     struct web_js_state *state;
@@ -121,6 +122,8 @@ struct js_pending {
     char *url,*origin,*integrity,*referrer;
     bool done, aborted, force_preflight, redirect_error, same_origin, keepalive, no_cors, no_referrer;
     bool streaming, headers_delivered, host_accepted;
+    /* P_WORKER streamed: a frame is in the child, its NJW_RESUME not yet taken (worker_resume). */
+    bool worker_paused;
     /* A streamed response's metadata, kept past the frame that clears response
        for Resource Timing and net_log: its status, whether it is an opaque
        response, its Content-Type and the minimized MIME type of it. */
@@ -224,6 +227,9 @@ struct web_js_state {
     struct js_node_ref *node_buckets[JS_NODE_BUCKETS];
     bool node_cache_syncing, node_cache_failed;
     struct web_js_state *node_cache_next, **node_cache_prev;
+    /* style attributes' declaration blocks: a text and its serialization, by
+       element (style_memo_block) */
+    struct js_style_memo { char *source, *block; size_t source_n, block_n; } style_memo[JS_STYLE_MEMO];
     struct js_script *scripts, *last_script, *blocker;
     uint64_t dynamic_scan_revision;
     bool dynamic_scan_valid;
@@ -270,6 +276,7 @@ struct web_js_state {
     struct js_image_pin *image_pins;
     uint64_t next_request, task_deadline, now, stream_generation;
     uint64_t fetch_group;
+    struct js_worker_group *worker_groups; /* each Worker's own fetch group */
     uint64_t window_named_revision;
     char *window_name;
     uint64_t task_started_ms, task_native_wait_ms, diagnostic_task_id;
@@ -1268,6 +1275,7 @@ static bool inserted_roots_capture(struct web_js_state *s,node_t *node,struct js
            !((candidate->tag==T_script && !candidate->script_started) ||
              (!candidate->foreign && candidate->tag==T_meta && !candidate->html_policy_processed) ||
              web_frame_element(candidate)))continue;
+        if(web_frame_element(candidate))candidate->frame_connection_pending=true;
         if(roots->count==roots->capacity){
             size_t maximum=SIZE_MAX/sizeof *roots->nodes;
             if(roots->capacity==maximum){JS_ThrowOutOfMemory(s->ctx);return false;}
@@ -1283,6 +1291,8 @@ static bool inserted_roots_capture(struct web_js_state *s,node_t *node,struct js
     return true;
 }
 static void inserted_roots_release(struct web_js_state *s,struct js_inserted_roots *roots) {
+    /* A failed or abandoned insertion runs no post-connection steps; its frames are reconciled later. */
+    for(size_t i=0;i<roots->count;i++)roots->nodes[i]->frame_connection_pending=false;
     if(roots->nodes&&roots->nodes!=roots->local)js_free(s->ctx,roots->nodes);
 }
 static bool equal_nodes(const node_t *a, const node_t *b) {
@@ -1405,7 +1415,7 @@ static bool html_image(const node_t *n) { return n && n->type == N_ELEM && !n->f
 static const char *fetch_client_referrer_source(web_doc *document) {
     if(!document||(document->sandbox_flags&SB_ORIGIN))return "";
     const char *effective=web_effective_url(document);
-    if(strncasecmp(effective,"http://",7)&&strncasecmp(effective,"https://",8))return "";
+    if(!web_url_has_scheme(effective,"http")&&!web_url_has_scheme(effective,"https"))return "";
     /* Window client origin must not be opaque. For srcdoc, Referrer Policy
        walks container documents; never return an opaque ancestor's URL. */
     while(document&&document->url&&!strcmp(document->url,"about:srcdoc")){
@@ -1573,9 +1583,9 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     if(!strcmp(p,"fetchClientReferrer"))return JS_NewString(ctx,fetch_client_referrer_source(d));
     if(!strcmp(p,"fetchOrigin")){
         if(d->sandbox_flags&SB_ORIGIN)return JS_NewString(ctx,"null");
-        char *origin=NULL;enum http_url_result status=http_origin_owned(web_effective_url(d),&origin);
-        if(status==HTTP_URL_OOM)return oom(ctx);
-        JSValue value=JS_NewString(ctx,status==HTTP_URL_TUPLE?origin:"null");free(origin);return value;
+        char *origin=NULL;enum web_url_result status=web_url_origin(web_effective_url(d),&origin);
+        if(status==WEB_URL_OOM)return oom(ctx);
+        JSValue value=JS_NewString(ctx,status==WEB_URL_TUPLE?origin:"null");free(origin);return value;
     }
     if (!strcmp(p, "contentType")) return JS_NewString(ctx, d->content_type ? d->content_type : "text/html");
     if (!strcmp(p, "htmlDocument")) return JS_NewBool(ctx, !d->xml); /* DOM "HTML document", node document of n */
@@ -1857,159 +1867,125 @@ static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValue
     return ok ? JS_UNDEFINED : oom(ctx);
 }
 
-/* CSS declaration boundaries must not split quoted strings or url()/calc(). */
-static const char *css_separator(const char *p, const char *end, int wanted) {
-    int quote = 0, depth = 0;
-    while (p < end) {
-        int c = (unsigned char)*p;
-        if (c == '\\' && p + 1 < end) { p += 2; continue; }
-        if (quote) { if (c == quote) quote = 0; }
-        else if (c == '\'' || c == '"') quote = c;
-        else if (c == '/' && p + 1 < end && p[1] == '*') { p += 2; while (p + 1 < end && !(p[0] == '*' && p[1] == '/')) p++; if (p + 1 < end) p += 2; continue; }
-        else if (c == '(' || c == '[' || c == '{') depth++;
-        else if (c == ')' || c == ']' || c == '}') { if (depth) depth--; }
-        else if (!depth && c == wanted) return p;
-        p++;
+/* A CSSOM declaration block, which an element's style attribute or a rule's
+   declarations (js_cssom.h) stand for as text. Its declarations are the ones
+   the text parses to (css.c's css_decl_serialize keeps the valid ones in their
+   block, check), so every read is of the block's serialization; a change
+   writes the whole block's serialization ("update style attribute", CSSOM
+   6.7). */
+/* the text as CSS reads it (no comments), serialized as a block */
+static bool style_serialize(const char *css, size_t n, css_decl_check *check, sbuf *out, sbuf *names) {
+    size_t clean_n;
+    char *clean = css_preprocess(css, n, &clean_n);
+    bool ok = clean && css_decl_serialize(clean, clean_n, check, out, names);
+    free(clean);
+    return ok;
+}
+/* get or set a property of a serialized block; a set writes the block's new
+   serialization into out, *write when it differs */
+static JSValue style_text_access(JSContext *ctx, const char *block, size_t n, const char *property, bool set,
+                                 JSValueConst value, JSValueConst priority, bool priority_only,
+                                 css_decl_check *check, sbuf *out, bool *write) {
+    *write = false;
+    if (!set) {
+        const char *v; size_t vn; bool important;
+        bool found = css_decl_find(block, n, property, &v, &vn, &important);
+        return priority_only ? JS_NewString(ctx, found && important ? "important" : "") :
+            JS_NewStringLen(ctx, found ? v : "", found ? vn : 0);
     }
-    return end;
-}
-static bool css_property_equal(const char *begin, const char *end, const char *property) {
-    while (begin < end && is_space((unsigned char)*begin)) begin++;
-    while (end > begin && is_space((unsigned char)end[-1])) end--;
-    size_t n = (size_t)(end - begin);
-    return strlen(property) == n && (!strncmp(property, "--", 2) ? !strncmp(begin, property, n) : !strncasecmp(begin, property, n));
-}
-static const char *css_style_ws(const char *p, const char *end) {
-    for (;;) {
-        while (p < end && is_space((unsigned char)*p)) p++;
-        if (end - p < 2 || p[0] != '/' || p[1] != '*') return p;
-        p += 2;
-        while (end - p >= 2 && !(p[0] == '*' && p[1] == '/')) p++;
-        if (end - p < 2) return end;
-        p += 2;
+    const char *v = JS_ToCString(ctx, value), *prio = JS_IsUndefined(priority) ? NULL : JS_ToCString(ctx, priority);
+    if (!v || (!JS_IsUndefined(priority) && !prio)) {
+        JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); return JS_EXCEPTION;
     }
+    int status = css_decl_set(block, n, property, v, prio, check, out);
+    JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio);
+    if (status == -2) return JS_ThrowOutOfMemory(ctx);
+    if (status < 0) return JS_ThrowTypeError(ctx, "Invalid CSS property name");
+    *write = status > 0 && (out->n != n || (n && memcmp(out->p, block, n)));
+    return JS_UNDEFINED;
 }
-/* Priority is not part of the CSSOM value. Do not split quoted strings,
-   functions or custom-property token streams at a nested exclamation mark. */
-static bool css_style_priority(const char *begin, const char **end) {
-    const char *bang = css_separator(begin, *end, '!');
-    if (bang == *end) return false;
-    const char *p = css_style_ws(bang + 1, *end);
-    if (*end - p < 9 || strncasecmp(p, "important", 9) ||
-        css_style_ws(p + 9, *end) != *end) return false;
-    *end = bang;
-    while (*end > begin && is_space((unsigned char)(*end)[-1])) (*end)--;
+/* a serialized block's cssText and its declarations' names: [cssText, name...] */
+static JSValue style_text_block(JSContext *ctx, const char *block, size_t n) {
+    sbuf names = {0};
+    css_decl_names(block, n, &names);
+    JSValue list = JS_NewArray(ctx);
+    uint32_t i = 0;
+    bool ok = !JS_IsException(list) && JS_SetPropertyUint32(ctx, list, i++, JS_NewStringLen(ctx, block, n)) >= 0;
+    for (size_t at = 0; ok && at < names.n; at += strlen(names.p + at) + 1)
+        ok = JS_SetPropertyUint32(ctx, list, i++, JS_NewString(ctx, names.p + at)) >= 0;
+    sb_free(&names);
+    if (!ok) { JS_FreeValue(ctx, list); return JS_EXCEPTION; }
+    return list;
+}
+/* An element's style attribute as a serialized block. The serialization is a
+   function of the text alone, so the last text each slot saw and its block
+   stand for any element whose attribute is that text: reading a style or
+   setting one property does not parse every declaration again. */
+static struct js_style_memo *style_memo_slot(struct web_js_state *s, const node_t *n) {
+    uint32_t h = (uint32_t)((uintptr_t)n >> 4) * 2654435761u;
+    return &s->style_memo[h >> 26 & (JS_STYLE_MEMO - 1)];
+}
+static void style_memo_store(struct web_js_state *s, const node_t *n, const char *source, size_t source_n,
+                             const char *block, size_t block_n) {
+    struct js_style_memo *m = style_memo_slot(s, n);
+    char *a = malloc(source_n + 1), *b = malloc(block_n + 1);
+    free(m->source); free(m->block);
+    *m = (struct js_style_memo){0};
+    if (!a || !b) { free(a); free(b); return; }
+    memcpy(a, source, source_n); a[source_n] = 0;
+    memcpy(b, block, block_n); b[block_n] = 0;
+    *m = (struct js_style_memo){a, b, source_n, block_n};
+}
+static bool style_memo_block(struct web_js_state *s, node_t *n, sbuf *block) {
+    const char *css = node_attr(n, "style"); if (!css) css = "";
+    size_t length = strlen(css);
+    struct js_style_memo *m = style_memo_slot(s, n);
+    if (m->source && m->source_n == length && !memcmp(m->source, css, length)) {
+        sb_put(block, m->block, m->block_n);
+        return true;
+    }
+    if (!style_serialize(css, length, NULL, block, NULL)) return false;
+    style_memo_store(s, n, css, length, block->p ? block->p : "", block->n);
     return true;
 }
-static JSValue css_style_value(JSContext *ctx, const char *property,
-                               const char *begin, const char *end) {
-    if(!strcasecmp(property,"border-radius")||!strcasecmp(property,"border-top-left-radius")||!strcasecmp(property,"border-top-right-radius")||
-       !strcasecmp(property,"border-bottom-right-radius")||!strcasecmp(property,"border-bottom-left-radius")) {
-        sbuf text={0};
-        if(css_radius_specified(property,begin,(size_t)(end-begin),&text)){JSValue value=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return value;}
-        sb_free(&text);
-    }
-    {
-        sbuf text={0}; /* colours and color-scheme; CSS-wide keywords and var() stay authored */
-        if(css_specified_longhand(property,begin,(size_t)(end-begin),&text)){JSValue value=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return value;}
-        sb_free(&text);
-    }
-    if (!strcasecmp(property,"box-shadow")) {
-        sbuf serialized={0};
-        if (css_shadow_specified(begin,(size_t)(end-begin),&serialized)) {
-            JSValue value=JS_NewStringLen(ctx,serialized.p?serialized.p:"",serialized.n);
-            sb_free(&serialized);return value;
-        }
-        sb_free(&serialized); /* CSS-wide keywords / unresolved var() stay authored. */
-    }
-    /* Normalize supported numeric opacity, not arbitrary/custom values.
-       Preserve var()/calc() token streams unchanged. */
-    if (!strcasecmp(property, "opacity") && end - begin > 0 && end - begin < 64) {
-        const char *p = begin, *number_end = end;
-        bool percent = end[-1] == '%';
-        if (percent) number_end--;
-        if (p < number_end && (*p == '+' || *p == '-')) p++;
-        const char *digits = p;
-        while (p < number_end && *p >= '0' && *p <= '9') p++;
-        bool any = p > digits;
-        if (p < number_end && *p == '.') {
-            p++; digits = p;
-            while (p < number_end && *p >= '0' && *p <= '9') p++;
-            any = p > digits;
-        }
-        if (any && p < number_end && (*p == 'e' || *p == 'E')) {
-            p++; if (p < number_end && (*p == '+' || *p == '-')) p++;
-            digits = p;
-            while (p < number_end && *p >= '0' && *p <= '9') p++;
-            any = p > digits;
-        }
-        if (any && p == number_end) {
-            char number[64], result[64];
-            memcpy(number, begin, (size_t)(number_end - begin));
-            number[number_end - begin] = 0;
-            double value = strtod(number, NULL);
-            if (isfinite(value) && fabs(value) < 1e12) {
-                if (fabs(value) < .0000005) value = 0;
-                int len = snprintf(result, sizeof result, "%.6f", value);
-                if (len > 0 && (size_t)len < sizeof result) {
-                    while (len && result[len-1] == '0') len--;
-                    if (len && result[len-1] == '.') len--;
-                    if (percent) result[len++] = '%';
-                    return JS_NewStringLen(ctx, result, (size_t)len);
-                }
-            }
-        }
-    }
-    return JS_NewStringLen(ctx, begin, (size_t)(end - begin));
+/* the attribute becomes a block's serialization; the block is what the
+   attribute now stands for (CSSOM's mutate flag: the attribute is not parsed
+   again) */
+static bool style_attribute_set(struct web_js_state *s, node_t *n, const sbuf *block) {
+    if (!doc_attr_set_ns(n->owner ? n->owner : s->doc, n, NULL, NULL, "style", sb_cstr((sbuf *)block))) return false;
+    style_memo_store(s, n, block->p ? block->p : "", block->n, block->p ? block->p : "", block->n);
+    return true;
 }
 static JSValue style_access(struct web_js_state *s, node_t *n, const char *property,
                             bool set, JSValueConst value, JSValueConst priority, bool priority_only) {
     JSContext *ctx = s->ctx;
-    const char *css = node_attr(n, "style"); if (!css) css = "";
-    sbuf b = {0}; const char *found = NULL, *found_end = NULL;
-    bool found_important = false;
-    const char *end = css + strlen(css);
-    for (const char *p = css; p < end;) {
-        const char *e = css_separator(p, end, ';'), *colon = css_separator(p, e, ':');
-        if (colon < e && css_property_equal(p, colon, property)) {
-            const char *v = colon + 1, *ve = e;
-            while (v < ve && is_space((unsigned char)*v)) v++;
-            while (ve > v && is_space((unsigned char)ve[-1])) ve--;
-            bool important = css_style_priority(v, &ve);
-            if (!found || important || !found_important) {
-                found = v; found_end = ve; found_important = important;
-            }
-        } else if (set) { sb_put(&b, p, (size_t)(e - p)); if (e < end) sb_putc(&b, ';'); }
-        p = e < end ? e + 1 : end;
-    }
-    if (!set) {
+    sbuf block = {0}, b = {0};
+    if (!style_memo_block(s, n, &block)) { sb_free(&block); return oom(ctx); }
+    bool write;
+    JSValue result = style_text_access(ctx, block.p ? block.p : "", block.n, property, set, value, priority, priority_only,
+                                       NULL, &b, &write);
+    if (write && !style_attribute_set(s, n, &b)) result = oom(ctx);
+    sb_free(&b); sb_free(&block);
+    return result;
+}
+/* an element's inline style as a block: [cssText, name...], or cssText's
+   setter (the attribute becomes the serialization of what text parses to) */
+static JSValue style_block_access(struct web_js_state *s, node_t *n, int argc, JSValueConst *argv) {
+    JSContext *ctx = s->ctx;
+    sbuf b = {0};
+    if (argc <= 2) {
+        JSValue result = style_memo_block(s, n, &b) ? style_text_block(ctx, b.p ? b.p : "", b.n) : oom(ctx);
         sb_free(&b);
-        if (priority_only) return JS_NewString(ctx, found_important ? "important" : "");
-        return found ? css_style_value(ctx, property, found, found_end) : JS_NewString(ctx, "");
+        return result;
     }
-    const char *v = JS_ToCString(ctx, value), *prio = JS_IsUndefined(priority) ? NULL : JS_ToCString(ctx, priority);
-    if (!v || (!JS_IsUndefined(priority) && !prio)) { JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b); return JS_EXCEPTION; }
-    if (strchr(property, ':') || strchr(property, ';') || strchr(property, '{') || strchr(property, '}')) { JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b); return JS_ThrowTypeError(ctx, "Invalid CSS property name"); }
-    const char *value_end = v + strlen(v);
-    if (*v && ((prio && *prio && strcasecmp(prio, "important")) ||
-               css_separator(v, value_end, '!') != value_end ||
-               css_separator(v, value_end, ';') != value_end)) {
-        JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b); return JS_UNDEFINED;
-    }
-    /* CSSOM setProperty parses before changing the declaration block. Keep
-       syntactically valid but not-yet-rendered values separate from @supports
-       capability reporting; both use the real property grammar and var rules. */
-    if (*v && !css_valid_declaration(property,strlen(property),v,(size_t)(value_end-v))) {
-        JS_FreeCString(ctx,v);JS_FreeCString(ctx,prio);sb_free(&b);return JS_UNDEFINED;
-    }
-    if (*v) {
-        if (b.n && b.p[b.n - 1] != ';') sb_putc(&b, ';');
-        sb_puts(&b, property); sb_putc(&b, ':'); sb_puts(&b, v);
-        if (prio && *prio) sb_puts(&b, " !important"); sb_putc(&b, ';');
-    }
-    bool ok = doc_attr_set_ns(n->owner ? n->owner : s->doc, n, NULL, NULL, "style", sb_cstr(&b));
-    JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b);
-    return ok ? JS_UNDEFINED : oom(ctx);
+    size_t length;
+    const char *text = JS_ToCStringLen(ctx, &length, argv[2]);
+    if (!text) return JS_EXCEPTION;
+    bool ok = style_serialize(text, length, NULL, &b, NULL);
+    JS_FreeCString(ctx, text);
+    JSValue result = !ok ? JS_ThrowOutOfMemory(ctx) : style_attribute_set(s, n, &b) ? JS_UNDEFINED : oom(ctx);
+    sb_free(&b);
+    return result;
 }
 static void flush_layout(struct web_js_state *s) {
     web_doc *d = s->doc;
@@ -2972,18 +2948,31 @@ void web_form_navigate(web_doc *d, node_t *submitter) {
     if (submitter && submitter->owner) d = submitter->owner;
     if (!d || !d->js || web_js_dialog_submit(d,submitter) != 0) return;
     struct web_js_state *s = d->js;
-    if(d->frame_parent){web_js_console(d,2,"Child form navigation requires a destination/origin-aware embedder and is not implemented");return;}
     struct web_form_request request;
     if (!web_submit_request(d,submitter,&request)) return;
     web_autocomplete_record(d,submitter,request.url);
+    /* "Plan to navigate": the form's target chooses the navigable among this page's frames
+       first (frame.c), then the host's top-level traversables. */
+    web_doc *top=d;while(top->frame_parent)top=top->frame_parent;
+    web_doc *destination=web_frame_choose(top,d,request.target);
+    struct web_navigation navigation={.url=request.url,.history=WEB_NAVIGATE_PUSH,.body=request.body,
+        .body_length=request.body_len,.content_type=request.content_type,.target=destination?NULL:request.target};
+    web_navigation_source(d,web_form_owner(d,submitter),&navigation);
     if (strncmp(request.url,"https://",8) && strncmp(request.url,"http://",7))
         web_js_console(d,2,"Form navigation requires an HTTP(S) destination");
-    else if (s->host.navigate) {
-        struct web_navigation navigation={.url=request.url,.history=WEB_NAVIGATE_PUSH,.body=request.body,
-            .body_length=request.body_len,.content_type=request.content_type,.target=request.target};
-        web_navigation_source(d,web_form_owner(d,submitter),&navigation);
-        s->host.navigate(s->host.opaque,&navigation);
+    else if (destination && !web_sandbox_navigation_allowed(d,destination,navigation.user_activation))
+        web_js_console(d,1,"Sandbox destination policy denied form navigation");
+    else if (!destination && !web_sandbox_auxiliary_allowed(d))
+        web_js_console(d,1,"Sandbox auxiliary policy denied form navigation");
+    else if (destination && destination!=top) {
+        /* The chosen frame fetches the form's request itself, its body with it. */
+        struct web_frame *frame=web_frame_find(destination->frame_parent,destination->frame_element);
+        if (!web_frame_set_navigation(frame,request.url,d) ||
+            (request.body && !web_frame_set_navigation_body(frame,request.body,request.body_len,request.content_type)))
+            web_js_console(d,2,"Child form navigation could not retain its request");
+        else top->dirty=true;
     }
+    else if (s->host.navigate) s->host.navigate(s->host.opaque,&navigation);
     else web_js_console(d,2,"The embedder cannot preserve this form encoding or destination");
     web_submit_request_free(&request);
 }
@@ -3034,14 +3023,16 @@ static bool dom_synchronous_hooks(struct web_js_state *s,int opcode,node_t *n,in
     if(n&&n->type==N_ATTR)n=n->attr_owner;
     return custom_candidate(n);
 }
-/* Snapshot actual CSS border fragments. Inline geometry comes from the same
-   deco spans used by paint/hit testing; querying one node never scans the DOM. */
+/* Snapshot actual CSS border fragments. Inline and text geometry comes from the line
+   layout's own fragments (layout_inline_rects, layout_text_rects), the ones paint and hit
+   testing use; querying one node never scans the DOM or another node's fragments. */
 struct client_rect_output {
     JSContext *ctx;
     JSValueConst list;
     uint32_t count;
     bool first_seen, extent_seen, area_seen;
     bool untransformed, all_fragments;
+    bool failed; /* a script exception is pending */
     double first[4], bounds[4]; /* left, top, right, bottom */
     const box_t *space; /* rects are in this box's untransformed space */
     int sx, sy;
@@ -3074,6 +3065,7 @@ static bool client_rect_append(struct client_rect_output *out,
         return true;
     }
     JSContext *ctx=out->ctx;
+    out->failed=true;
     if (out->count == UINT32_MAX) { JS_ThrowOutOfMemory(ctx); return false; }
     JSValue rect = JS_NewArray(ctx);
     if (JS_IsException(rect)) return false;
@@ -3082,7 +3074,14 @@ static bool client_rect_append(struct client_rect_output *out,
         JS_FreeValue(ctx,rect);return false;
     }
     if (JS_SetPropertyUint32(ctx,out->list,out->count++,rect)<0) return false;
+    out->failed=false;
     return true;
+}
+/* A line layout fragment, in document coordinates, in the space its transforms apply to. */
+static bool client_rect_fragment(void *opaque,const box_t *space,double x,double y,double w,double h) {
+    struct client_rect_output *out=opaque;
+    out->space=space;
+    return client_rect_append(out,x-out->sx,y-out->sy,w,h);
 }
 static bool client_rect_box(struct client_rect_output *out,
                             const box_t *b,int sx,int sy) {
@@ -3096,17 +3095,7 @@ static bool collect_client_rects(struct client_rect_output *out,node_t *n,int sx
     if(!b || !b->st || b->st->display==D_NONE)return true;
     out->sx=sx;out->sy=sy;
     if(b->kind==B_INLINE){
-        box_t *a=n->anchor_block;
-        out->space=a;
-        if(a){
-            double x=(out->untransformed?box_abs_x(a):box_visual_x(a))-sx;
-            double y=(out->untransformed?box_abs_y(a):box_visual_y(a))+a->content_dy-sy;
-            if(!out->untransformed && box_element_scrollable(a)){x-=a->node->scroll_x;y-=a->node->scroll_y;}
-            for(int i=0;i<a->ndecos;i++){
-                const struct deco *span=&a->decos[i];
-                if(span->node==n && !client_rect_append(out,x+span->x,y+span->y,span->w,span->h))return false;
-            }
-        }
+        if(!layout_inline_rects(n,!out->untransformed,client_rect_fragment,out))return false;
     }else{
         b=geometry_principal_box(n);
         out->space=b;
@@ -3130,14 +3119,91 @@ static JSValue element_client_rects(JSContext *ctx,node_t *n,int sx,int sy) {
     if(!collect_client_rects(&out,n,sx,sy)){JS_FreeValue(ctx,list);return JS_EXCEPTION;}
     return list;
 }
+/* CSSOM View getBoundingClientRect of a rectangle list: zeros for none, the first when
+   every one has zero width or height, else the union of those with a width or a height. */
+static void client_rect_bounds(const struct client_rect_output *out,double rect[4],bool *present) {
+    const double *r=out->area_seen?out->bounds:out->first;
+    if(present)*present=out->first_seen;
+    rect[0]=out->first_seen?r[0]:0;rect[1]=out->first_seen?r[1]:0;
+    rect[2]=out->first_seen?r[2]-r[0]:0;rect[3]=out->first_seen?r[3]-r[1]:0;
+}
 static bool client_bounding_rect(JSContext *ctx,node_t *n,int sx,int sy,double rect[4],bool *present) {
     struct client_rect_output out={.ctx=ctx,.list=JS_UNDEFINED};
     if(!collect_client_rects(&out,n,sx,sy))return false;
-    const double *r=out.area_seen?out.bounds:out.first;
-    *present=out.first_seen;
-    rect[0]=out.first_seen?r[0]:0;rect[1]=out.first_seen?r[1]:0;
-    rect[2]=out.first_seen?r[2]-r[0]:0;rect[3]=out.first_seen?r[3]-r[1]:0;
+    client_rect_bounds(&out,rect,present);
     return true;
+}
+/* The DOMRect fields of x, y, width, height for the bindings to copy. */
+static JSValue client_rect_object(JSContext *ctx,const double r[4]) {
+    double left=r[0],top=r[1],w=r[2],h=r[3];
+    JSValue result=JS_NewObject(ctx);
+    if(JS_IsException(result))return result;
+    JS_DefinePropertyValueStr(ctx, result, "x", JS_NewFloat64(ctx, left), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "y", JS_NewFloat64(ctx, top), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, result, "left", JS_NewFloat64(ctx, left), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "top", JS_NewFloat64(ctx, top), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, result, "right", JS_NewFloat64(ctx, left + w), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "bottom", JS_NewFloat64(ctx, top + h), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, result, "width", JS_NewFloat64(ctx, w), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "height", JS_NewFloat64(ctx, h), JS_PROP_C_W_E);
+    return result;
+}
+static int node_address_order(const void *a,const void *b) {
+    uintptr_t x=(uintptr_t)*(node_t *const *)a,y=(uintptr_t)*(node_t *const *)b;
+    return (x>y)-(x<y);
+}
+/* The node after n's subtree in tree order (not shadow-including). */
+static node_t *range_after_subtree(node_t *n) {
+    for(;n;n=n->parent)if(n->next)return n->next;
+    return NULL;
+}
+static bool range_character_data(const node_t *n) { return n->type==N_TEXT || n->type==N_COMMENT || n->type==N_PI; }
+/* The first node at or after boundary point (n, offset) in tree order. */
+static node_t *range_boundary_node(node_t *n,uint32_t offset) {
+    if(range_character_data(n))return n;
+    node_t *c=n->first;
+    for(;c && offset;offset--)c=c->next;
+    return c?c:range_after_subtree(n);
+}
+/* CSSOM View §9 Range.getClientRects, in tree order between the boundary points: the border
+   boxes of each element the range contains whose parent it does not contain (through
+   display:contents, which has no box of its own, to its children), and the selected part of
+   each Text node it contains or partially contains, identical boundary points included. A
+   visited element contains the end only when it is one of the end's inclusive ancestors. */
+static bool range_client_rects(struct client_rect_output *out,node_t *sc,uint32_t so,node_t *ec,uint32_t eo,int sx,int sy) {
+    node_t *first=range_boundary_node(sc,so);
+    node_t *stop=range_character_data(ec)?range_after_subtree(ec):range_boundary_node(ec,eo);
+    node_t *local[64],**ancestors=local;
+    size_t depth=0;
+    for(node_t *a=ec;a;a=a->parent)depth++;
+    if(depth>sizeof local/sizeof *local){
+        ancestors=depth<=SIZE_MAX/sizeof *ancestors?malloc(depth*sizeof *ancestors):NULL;
+        if(!ancestors){JS_ThrowOutOfMemory(out->ctx);return false;}
+    }
+    depth=0;
+    for(node_t *a=ec;a;a=a->parent)ancestors[depth++]=a;
+    qsort(ancestors,depth,sizeof *ancestors,node_address_order);
+    out->sx=sx;out->sy=sy;
+    bool ok=true;
+    node_t *cover=NULL; /* a contained element whose rectangles stand for its subtree's */
+    unsigned work=0;
+    for(node_t *n=first;n && n!=stop;){
+        if(!(++work&63) && !web_native_checkpoint(n->owner))break;
+        if(n->type==N_TEXT){
+            uint32_t a=n==sc?so:0,b=n==ec?eo:UINT32_MAX;
+            if(!layout_text_rects(n,a,b,!out->untransformed,client_rect_fragment,out)){ok=!out->failed;break;}
+        }else if(n->type==N_ELEM && !cover && !bsearch(&n,ancestors,depth,sizeof *ancestors,node_address_order)){
+            if(n->box){
+                if(!collect_client_rects(out,n,sx,sy)){ok=false;break;}
+                cover=n;
+            }else if(!n->style || n->style->display!=D_CONTENTS)cover=n;
+        }
+        node_t *next=n->first;
+        if(range_character_data(n))next=NULL;
+        for(node_t *m=n;!next && m;m=m->parent){
+            if(m==cover)cover=NULL;
+            if(m->next)next=m->next;
+        }
+        n=next;
+    }
+    if(ancestors!=local)free(ancestors);
+    return ok;
 }
 /* Before any native DOM work on d (the operations here and the DOM collections'
    revision check): a sandboxed actor borrows no other document's authority. */
@@ -3187,7 +3253,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
     }
     if(!n){switch(opcode){
-    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
+    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_rangeRects: case DOM_caretPosition: case DOM_caretRect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_styleBlock: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
         result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");goto dom_complete;
     default:break;
     }}
@@ -3843,13 +3909,69 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
            subpixels or include a layout-only inline wrapper. */
         double r[4]={0};bool present=false;
         if(visible && !client_bounding_rect(ctx,n,sx,sy,r,&present)){result=JS_EXCEPTION;break;}
-        double left=r[0],top=r[1],w=r[2],h=r[3];
-        result = JS_NewObject(ctx);
-        JS_DefinePropertyValueStr(ctx, result, "x", JS_NewFloat64(ctx, left), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "y", JS_NewFloat64(ctx, top), JS_PROP_C_W_E);
-        JS_DefinePropertyValueStr(ctx, result, "left", JS_NewFloat64(ctx, left), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "top", JS_NewFloat64(ctx, top), JS_PROP_C_W_E);
-        JS_DefinePropertyValueStr(ctx, result, "right", JS_NewFloat64(ctx, left + w), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "bottom", JS_NewFloat64(ctx, top + h), JS_PROP_C_W_E);
-        JS_DefinePropertyValueStr(ctx, result, "width", JS_NewFloat64(ctx, w), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "height", JS_NewFloat64(ctx, h), JS_PROP_C_W_E);
-
+        result=client_rect_object(ctx,r);
+    } break;
+    case DOM_rangeRects: {
+        /* Range getClientRects (fragments) or getBoundingClientRect: start container, offset,
+           end container, offset. Not in the document: no rectangles. */
+        node_t *end=argc>4?unwrap(ctx,argv[3]):NULL;
+        if(argc>4 && !end && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3])){result=JS_EXCEPTION;break;}
+        uint32_t start_offset=0,end_offset=0;
+        if(!n || !end){result=JS_ThrowTypeError(ctx,"Range boundary points required");break;}
+        if(JS_ToUint32(ctx,&start_offset,argv[2]) || JS_ToUint32(ctx,&end_offset,argv[4])){result=JS_EXCEPTION;break;}
+        bool fragments=argc>5 && JS_ToBool(ctx,argv[5])>0;
+        struct web_js_state *owner=geometry_owner(s,d);
+        bool visible=owner && end->owner==n->owner && connected(owner,n) && connected(owner,end);
+        int sx=0,sy=0;
+        if(visible){
+            flush_layout(owner);viewport_scroll_position(owner,&sx,&sy);
+            d->view_x=sx;d->view_y=sy;
+            visible=connected(owner,n) && connected(owner,end);
+        }
+        struct client_rect_output out={.ctx=ctx,.list=fragments?JS_NewArray(ctx):JS_UNDEFINED};
+        if(fragments && JS_IsException(out.list)){result=JS_EXCEPTION;break;}
+        if(visible && !range_client_rects(&out,n,start_offset,end,end_offset,sx,sy)){
+            if(fragments)JS_FreeValue(ctx,out.list);
+            result=JS_EXCEPTION;break;
+        }
+        if(fragments){result=out.list;break;}
+        double r[4];client_rect_bounds(&out,r,NULL);
+        result=client_rect_object(ctx,r);
+    } break;
+    case DOM_caretPosition: {
+        /* caretPositionFromPoint before shadow retargeting: [node, offset] or null. */
+        double x,y;
+        struct web_js_state *owner=NULL;
+        if(!n || n->type!=N_DOC){result=JS_ThrowTypeError(ctx,"Document receiver required");break;}
+        if(argc<4){result=JS_ThrowTypeError(ctx,"Two coordinates required");break;}
+        if(JS_ToFloat64(ctx,&x,argv[2]) || JS_ToFloat64(ctx,&y,argv[3])){result=JS_EXCEPTION;break;}
+        if(!isfinite(x) || !isfinite(y)){result=JS_ThrowTypeError(ctx,"The coordinates are not finite numbers");break;}
+        /* No viewport, or a point outside it (CSSOM View §5 steps 1 and 2). */
+        if(!(owner=geometry_owner(s,d)) || d->width<1 || d->height<1 || x<0 || y<0 || x>d->width || y>d->height){result=JS_NULL;break;}
+        flush_layout(owner);
+        viewport_scroll_position(owner,&d->view_x,&d->view_y);
+        node_t *at=NULL;uint32_t offset=0;
+        if(!doc_caret_at(d,x+d->view_x,y+d->view_y,&at,&offset) || !at || doc_node_root(at,true)!=d->root){result=JS_NULL;break;}
+        result=JS_NewArray(ctx);
+        if(JS_IsException(result))break;
+        JSValue object=wrap(s,at);
+        if(JS_IsException(object) || JS_SetPropertyUint32(ctx,result,0,object)<0 ||
+           JS_SetPropertyUint32(ctx,result,1,JS_NewUint32(ctx,offset))<0){JS_FreeValue(ctx,result);result=JS_EXCEPTION;}
+    } break;
+    case DOM_caretRect: {
+        /* CaretPosition.getClientRect for a rendered text entry widget in the document, or null. */
+        uint32_t offset=0;
+        if(!n || argc<3){result=JS_ThrowTypeError(ctx,"Caret node and offset required");break;}
+        if(JS_ToUint32(ctx,&offset,argv[2])){result=JS_EXCEPTION;break;}
+        struct web_js_state *owner=n->type==N_ELEM?geometry_owner(s,d):NULL;
+        if(!owner || !connected(owner,n)){result=JS_NULL;break;}
+        int sx=0,sy=0;
+        flush_layout(owner);viewport_scroll_position(owner,&sx,&sy);
+        d->view_x=sx;d->view_y=sy;
+        double r[4];
+        if(!connected(owner,n) || !doc_control_caret_rect(n,offset,r)){result=JS_NULL;break;}
+        r[0]-=sx;r[1]-=sy;
+        result=client_rect_object(ctx,r);
     } break;
     case DOM_submit: {
         if (!d->inert) navigate_form_request(s,n);
@@ -3906,6 +4028,10 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         bool valid; bool matches = css_matches_n(n, scope, p, plen, &valid); result = valid ? JS_NewBool(ctx, matches) : JS_NULL;
     } break;
     case DOM_style: case DOM_stylePriority: {result = style_access(s, n, p, argc > 3, argc > 3 ? argv[3] : JS_UNDEFINED, argc > 4 ? argv[4] : JS_UNDEFINED, opcode == DOM_stylePriority);
+    } break;
+    case DOM_styleBlock: {
+        if (n->type != N_ELEM) result = JS_ThrowTypeError(ctx, "Expected an Element");
+        else result = style_block_access(s, n, argc, argv);
     } break;
     case DOM_computed: {
         const char *pseudo=argc>3&&!JS_IsNull(argv[3])&&!JS_IsUndefined(argv[3])?JS_ToCString(ctx,argv[3]):NULL;
@@ -4040,28 +4166,27 @@ uint64_t web_js_input_stream(web_doc *d) {
     return d && d->js ? d->js->stream_generation : 0;
 }
 
-static enum http_url_result make_origin(const char *url, char **out) {
-    return http_origin_owned(url, out);
-}
-/* No prefix comparison or empty-string fallback on parse/allocation failure.
-   Both results are transient native owners, including the failed second parse. */
+/* HTML's same origin of two URLs' origins (web_url_same_origin, the URL record's owner). */
 static bool same_origin_urls(const char *a, const char *b, bool *allocation_failed) {
-    char *x = NULL, *y = NULL;
-    enum http_url_result xr = make_origin(a, &x), yr = make_origin(b, &y);
-    *allocation_failed = xr == HTTP_URL_OOM || yr == HTTP_URL_OOM;
-    bool same = xr == HTTP_URL_TUPLE && yr == HTTP_URL_TUPLE && !strcmp(x, y);
-    free(x); free(y); return same;
+    int same = web_url_same_origin(a, b);
+    *allocation_failed = same < 0;
+    return same == 1;
 }
 #include "js_html_safety_host.h"
 #include "js_pi_native.h"
 #include "js_collections_native.h"
+/* url is a serialization the URL parser gave (a resolved URL or a response's URL). An http(s)
+   URL is permitted when it is a URL without credentials: the engine's requests and navigations
+   never carry a username or password (Fetch's Request constructor turns them down, and nothing
+   here keeps an authentication entry that would send them). */
 static bool permitted_url(struct web_js_state *s, const char *url, bool fetch) {
-    if (!strncasecmp(url, "https://", 8) || !strncasecmp(url, "http://", 7)) {
-        struct url_owned parsed = {0};
-        bool ok = url_parse_owned(url, &parsed) && !strchr(parsed.host, '@');
-        url_owned_free(&parsed); return ok;
+    if (web_url_has_scheme(url, "https") || web_url_has_scheme(url, "http")) {
+        struct web_url record;
+        if (web_url_read(url, strlen(url), &record) != 1) return false;
+        bool ok = !web_url_includes_credentials(&record);
+        web_url_free(&record); return ok;
     }
-    if (fetch || strncasecmp(url, "file://", 7) || strncasecmp(s->doc->url, "file://", 7)) return false;
+    if (fetch || !web_url_has_scheme(url, "file") || !web_url_has_scheme(s->doc->url, "file")) return false;
     /* Resolution already removes dot segments. Encoded path separators and dot
        segments must not create a second, more privileged interpretation. */
     const char *u = url + 7, *base = s->doc->url + 7;
@@ -4074,8 +4199,8 @@ static bool permitted_url(struct web_js_state *s, const char *url, bool fetch) {
  * this does not grant a native fetch, navigation or local-file allowance. */
 static bool permitted_script_url(struct web_js_state *s,const char *url) {
     size_t length=strlen(url);
-    if (!strncasecmp(url,"data:",5)) return length<=JS_DATA_URL_LIMIT;
-    if (!strncasecmp(url,"blob:",5)) return length<=UINT32_MAX;
+    if (web_url_has_scheme(url,"data")) return length<=JS_DATA_URL_LIMIT;
+    if (web_url_has_scheme(url,"blob")) return length<=UINT32_MAX;
     return length<=UINT32_MAX && permitted_url(s,url,false);
 }
 static char *script_data_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]);
@@ -4248,9 +4373,9 @@ static JSValue native_url(JSContext *ctx, JSValueConst this_val, int argc, JSVal
 static const char *opfs_storage_url(JSContext *ctx) { struct web_js_state *s = state(ctx); return s && s->doc ? web_effective_url(s->doc) : NULL; }
 static JSValue native_origin(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     char *out = NULL;
-    enum http_url_result status = make_origin(web_effective_url(state(ctx)->doc), &out);
-    if (status == HTTP_URL_OOM) return JS_ThrowOutOfMemory(ctx);
-    JSValue result = JS_NewString(ctx, status == HTTP_URL_TUPLE ? out : "null");
+    enum web_url_result status = web_url_origin(web_effective_url(state(ctx)->doc), &out);
+    if (status == WEB_URL_OOM) return JS_ThrowOutOfMemory(ctx);
+    JSValue result = JS_NewString(ctx, status == WEB_URL_TUPLE ? out : "null");
     free(out); return result;
 }
 static JSValue native_class_id(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -4386,10 +4511,10 @@ static JSValue native_canvas(JSContext *ctx, JSValueConst this_val, int argc, JS
             for(unsigned i=0;i<sizeof known/sizeof *known;i++)if(!strcmp(type,known[i])) {
                 if(!(s->canvas_probe_seen&(1u<<i))) {
                     s->canvas_probe_seen|=1u<<i;
-                    char *origin=NULL;enum http_url_result parsed=http_origin_owned(web_effective_url(s->doc),&origin);
+                    char *origin=NULL;enum web_url_result parsed=web_url_origin(web_effective_url(s->doc),&origin);
                     char message[320];snprintf(message,sizeof message,
                         "Canvas context request: type=%s frame=%d connected=%d origin=%.160s",
-                        known[i],s->doc->frame_parent!=NULL,connected(s,node),parsed==HTTP_URL_TUPLE?origin:"null");
+                        known[i],s->doc->frame_parent!=NULL,connected(s,node),parsed==WEB_URL_TUPLE?origin:"null");
                     log_text(s,WEB_CONSOLE_TRACE,message);free(origin);
                 }
                 break;
@@ -5090,14 +5215,11 @@ static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc
         if(node_attr(anchor,"download") && (sandbox_authority(s)&SB_DOWNLOADS))return JS_UNDEFINED;
         struct web_hit action = {0};
         if (web_link_action(s->doc, anchor, &action) && permitted_url(s, action.href, false)) {
-            if(s->doc->frame_parent) {
-                const char *target=node_attr(anchor,"target");
-                struct web_frame *f=web_frame_find(s->doc->frame_parent,s->doc->frame_element);
-                if(target && *target && strcasecmp(target,"_self"))log_text(s,1,"Scripted child link activation cannot navigate another browsing context");
-                else if(!web_frame_set_navigation(f,action.href,s->doc))return oom(ctx);
-            }else if(!web_frame_navigate(s->doc,anchor,action.href,s->doc->sandbox_activation_until>uptime_ms()) && s->host.navigate){
-                /* A top-level document follows the hyperlink as a click the user made does
-                   (frame.c: its target chooses the navigable), with its own activation. */
+            web_doc *top=s->doc;while(top->frame_parent)top=top->frame_parent;
+            if(!web_frame_navigate(top,anchor,action.href,s->doc->sandbox_activation_until>uptime_ms()) && s->host.navigate){
+                /* The document follows the hyperlink as a click the user made does (frame.c:
+                   its target chooses the navigable), with its own activation; the top-level
+                   one is the host's. */
                 struct web_navigation navigation={.url=action.href,.history=WEB_NAVIGATE_PUSH};
                 web_navigation_source(s->doc,anchor,&navigation);
                 s->host.navigate(s->host.opaque,&navigation);
@@ -5449,9 +5571,9 @@ static int pending_destination(const struct js_pending *p) {
 static bool send_request(struct web_js_state *s, struct js_pending *p, int kind, const char *method,
                          const char *headers, const void *body, size_t len) {
     if(s->disabled){pending_error(p,"Browsing context is inactive");return false;}
-    if ((p->kind==P_SCRIPT || p->kind==P_MODULE || p->kind==P_FONT || p->kind==P_CSS) && (!strncasecmp(p->url,"data:",5) || !strncasecmp(p->url,"blob:",5))) {
+    if ((p->kind==P_SCRIPT || p->kind==P_MODULE || p->kind==P_FONT || p->kind==P_CSS) && (web_url_has_scheme(p->url,"data") || web_url_has_scheme(p->url,"blob"))) {
         char mime[128];
-        p->response.body=!strncasecmp(p->url,"data:",5)
+        p->response.body=web_url_has_scheme(p->url,"data")
             ? script_data_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime)
             : script_blob_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime,NULL);
         if (!p->response.body) {
@@ -5497,20 +5619,57 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
 }
 #include "js_policy_report.h"
 #include "frame_native.h"
+/* Fetch groups (webnet_request.fetch_group): one per environment settings object, a document's
+   (s->fetch_group) or a Worker's (js_worker_group), never reused while a keepalive request of an
+   older one can still be alive. */
+static uint64_t fetch_group_serial;
+static bool fetch_group_new(uint64_t *group) {
+    if (fetch_group_serial == UINT64_MAX) return false;
+    *group = ++fetch_group_serial; return true;
+}
+struct js_worker_group { struct js_worker_group *next; uint32_t worker; uint64_t group; };
+/* The fetch group of this realm's Worker worker, made when it first needs one; 0 when none can be. */
+static uint64_t worker_fetch_group(struct web_js_state *s, uint32_t worker) {
+    for (struct js_worker_group *g = s->worker_groups; g; g = g->next) if (g->worker == worker) return g->group;
+    struct js_worker_group *g = js_mallocz(s->ctx, sizeof *g);
+    if (!g) { JSValue error = JS_GetException(s->ctx); JS_FreeValue(s->ctx, error); return 0; }
+    if (!fetch_group_new(&g->group)) { js_free(s->ctx, g); return 0; }
+    g->worker = worker; g->next = s->worker_groups; s->worker_groups = g; return g->group;
+}
+static void worker_fetch_group_forget(struct web_js_state *s, uint32_t worker) {
+    for (struct js_worker_group **at = &s->worker_groups; *at; at = &(*at)->next)
+        if ((*at)->worker == worker) { struct js_worker_group *g = *at; *at = g->next; js_free(s->ctx, g); return; }
+}
 /* Children have no networking/file host. Parent transport owns cookies, CORS,
-   redirects and generation cancellation; completions only queue native bytes. */
-static bool worker_request(void *opaque, uint32_t worker, uint32_t request,
-                        const char *url, int kind,const char *method,const char *headers,
-                        const void *body,size_t body_len,const char *referrer,int referrer_policy) {
+   redirects and generation cancellation; completions only queue native bytes.
+   A fetch (kind 2) carries its Request's modes in the kind's NJW_LOAD_* flags; this realm checks
+   them as native_fetch does a Window's and hands them to the same transport. */
+static bool worker_request(void *opaque, uint32_t worker, uint32_t request, int kind,
+                           const struct web_worker_fetch *f) {
     struct web_js_state *s = opaque;
-    if (!s || s->disabled || kind < 0 ||
+    if (!s || s->disabled || kind < 0 || !f || !f->url ||
         (kind != 0 && !njw_load_kind_valid((uint32_t)kind))) return false;
     const uint32_t policy = (uint32_t)kind & NJW_LOAD_POLICY_FLAGS;
     kind = (int)((uint32_t)kind & ~NJW_LOAD_POLICY_FLAGS);
-    if(!url||!method||!webnet_method_valid(method)||body_len>WEBNET_BODY_LIMIT||
+    const char *url = f->url, *method = f->method ? f->method : "GET", *headers = f->headers, *referrer = f->referrer;
+    const void *body = f->body; size_t body_len = f->body_len; int referrer_policy = f->referrer_policy;
+    if(!webnet_method_valid(method)||body_len>WEBNET_BODY_LIMIT||
        (!body&&body_len)||strlen(method)>UINT32_MAX||(headers&&strlen(headers)>UINT32_MAX)||
        ((!strcmp(method,"GET")||!strcmp(method,"HEAD"))&&body)||
-       (kind!=2&&(strcmp(method,"GET")||body||body_len||referrer||referrer_policy))||referrer_policy<0||referrer_policy>WEBNET_REFERRER_UNSAFE)return false;
+       (kind!=2&&(strcmp(method,"GET")||body||body_len||referrer||referrer_policy||policy))||referrer_policy<0||referrer_policy>WEBNET_REFERRER_UNSAFE)return false;
+    /* The Request's destination, "" for fetch(). */
+    int destination = WEBNET_DEST_EMPTY;
+    if (kind == 2 && f->destination && f->destination[0]) {
+        destination = -1;
+        for (int i = 0; i < WEBNET_DEST_COUNT; i++) if (!strcmp(webnet_destination_name((enum webnet_destination)i), f->destination)) { destination = i; break; }
+        if (destination < 0) return false;
+    }
+    const int credentials = kind == 2 ? (int)((policy & NJW_LOAD_CREDENTIALS) >> NJW_LOAD_CREDENTIALS_SHIFT) : 1;
+    const int cache_mode = kind == 2 ? (int)((policy & NJW_LOAD_CACHE) >> NJW_LOAD_CACHE_SHIFT) : WEBNET_CACHE_DEFAULT;
+    const bool same_origin = kind == 0 || (policy & NJW_LOAD_SAME_ORIGIN), keepalive = (policy & NJW_LOAD_KEEPALIVE) != 0;
+    const bool streaming = (policy & NJW_LOAD_STREAM) != 0;
+    /* Only a host that can resume streams offered them (NJW_START_STREAMING). */
+    if (streaming && !s->host.resume_request) return false;
     struct js_pending *p = pending_new(s, P_WORKER, url);
     if (!p) {
         /* Loader rejection is reported over Worker IPC. Do not leave an OOM
@@ -5519,7 +5678,11 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request,
         return false;
     }
     p->worker = worker; p->worker_request = request; p->worker_kind = kind;
-    bool blob = !strncasecmp(url,"blob:",5);
+    p->credentials = credentials; p->cache_mode = cache_mode; p->same_origin = same_origin; p->destination = destination;
+    p->redirect_error = (policy & NJW_LOAD_REDIRECT_ERROR) != 0; p->force_preflight = (policy & NJW_LOAD_PREFLIGHT) != 0;
+    p->no_cors = (policy & NJW_LOAD_NO_CORS) != 0; p->no_referrer = (policy & NJW_LOAD_NO_REFERRER) != 0;
+    p->keepalive = keepalive; p->streaming = streaming; p->referrer_policy = referrer_policy;
+    bool blob = web_url_has_scheme(url,"blob");
     if (strlen(url) > UINT32_MAX || (!blob && !permitted_url(s,url,true)) || (blob && kind == 2)) {
         pending_error(p,"Worker resource URL is not permitted"); return true;
     }
@@ -5543,27 +5706,46 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request,
         pending_error(p, allocation_failed ? "Out of memory while checking Worker origin" :
             "Worker startup requires a same-origin script"); return true;
     }
+    /* Fetch's main fetch for a Request's mode "same-origin", the cache-only mode's own rule and
+       a keepalive request's fetch group, as native_fetch has them for a Window's Request. */
+    if (kind == 2 && same_origin && !same_origin_urls(web_effective_url(s->doc), url, &allocation_failed)) {
+        pending_error(p, allocation_failed ? "Out of memory while checking the Worker fetch origin" :
+            "Cross-origin fetch is forbidden by same-origin mode"); return true;
+    }
+    if (cache_mode == WEBNET_CACHE_ONLY_IF_CACHED && !same_origin) {
+        pending_error(p, "only-if-cached requires same-origin mode"); return true;
+    }
+    uint64_t group = 0;
+    if (keepalive && (!s->host.release_request || !(group = worker_fetch_group(s, worker)))) {
+        pending_error(p, "Native host cannot retain this Worker's keepalive request"); return true;
+    }
     struct web_request r = {.id=p->id, .kind=kind == 2 ? WEB_RESOURCE_FETCH : WEB_RESOURCE_SCRIPT,
         /* Worker settings inherit the creating realm's origin, including
            about:blank/srcdoc children. Never let the shared host substitute
            the top-level document as the initiator of startup/import/fetch. */
         .url=p->url, .origin=web_effective_url(s->doc), .method=method,
         .headers=headers,.body=body,.body_len=body_len,
-        .credentials=1, .same_origin=kind == 0,
-        .no_cors=(policy & NJW_LOAD_NO_CORS)!=0,
+        .credentials=credentials, .same_origin=same_origin,
+        .force_preflight=p->force_preflight, .redirect_error=p->redirect_error,
+        .no_cors=p->no_cors,
         .referrer=referrer,.referrer_policy=referrer_policy,
-        .no_referrer=(policy & NJW_LOAD_NO_REFERRER)!=0,
+        .no_referrer=p->no_referrer,
+        .cache_mode=cache_mode, .keepalive=keepalive, .fetch_group=group, .stream_response=streaming,
         .require_corp=s->doc->embedder_policy==HTML_COEP_REQUIRE_CORP,
-        .destination=kind==0?WEBNET_DEST_WORKER:kind==1?WEBNET_DEST_SCRIPT:WEBNET_DEST_EMPTY};
+        .destination=kind==0?WEBNET_DEST_WORKER:kind==1?WEBNET_DEST_SCRIPT:destination};
     /* The worker's script is fetched by its creating document, as its client. */
     if(kind==0){r.referrer=fetch_client_referrer_source(s->doc);r.referrer_policy=s->doc->referrer_policy;}
     if (!s->host.request || !s->host.request(s->host.opaque,&r))
         pending_error(p,"The browser rejected the Worker resource request");
+    else p->host_accepted = true;
     return true;
 }
 static bool worker_load(void *opaque,uint32_t worker,uint32_t request,const char *url,int kind){
-    return worker_request(opaque,worker,request,url,kind,"GET",NULL,NULL,0,NULL,0);
+    const struct web_worker_fetch fetch={.url=url,.method="GET"};
+    return worker_request(opaque,worker,request,kind,&fetch);
 }
+/* request 0: the Worker's owner went away, which a keepalive request outlives (release, not
+   cancel). Otherwise the child aborted one fetch. */
 static void worker_cancel(void *opaque,uint32_t worker,uint32_t request) {
     struct web_js_state *s=opaque;if(!s)return;
     for(struct js_pending *p=s->pending;p;p=p->next){
@@ -5572,8 +5754,23 @@ static void worker_cancel(void *opaque,uint32_t worker,uint32_t request) {
         /* The child's request identity never names a parent or sibling fetch.
            Retire before cancellation so a native completion cannot revive it. */
         p->aborted=true;pending_error(p,"The Worker resource was aborted");
-        if(s->host.cancel)s->host.cancel(s->host.opaque,p->id);
+        if(!request)release_pending_request(s,p);
+        else if(s->host.cancel)s->host.cancel(s->host.opaque,p->id);
     }
+    if(!request)worker_fetch_group_forget(s,worker);
+}
+/* The child took a streamed fetch's last frame (NJW_RESUME): one resume per frame, since the
+   transport drops a frame that finds the one before still unread. */
+static void worker_resume(void *opaque,uint32_t worker,uint32_t request) {
+    struct web_js_state *s=opaque;if(!s)return;
+    for(struct js_pending *p=s->pending;p;p=p->next)
+        if(p->kind==P_WORKER&&p->worker==worker&&p->worker_request==request&&p->worker_kind==2){
+            if(p->streaming&&p->worker_paused&&!p->done&&!p->aborted){
+                p->worker_paused=false;
+                if(s->host.resume_request)s->host.resume_request(s->host.opaque,p->id);
+            }
+            return;
+        }
 }
 static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
@@ -5589,7 +5786,7 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
             JS_FreeCString(ctx, url); return JS_ThrowTypeError(ctx, "Worker context retired during URL conversion");
         }
         bool allocation_failed = false;
-        bool blob = !strncasecmp(url,"blob:",5);
+        bool blob = web_url_has_scheme(url,"blob");
         bool allowed = strlen(url)<=UINT32_MAX && (blob || (permitted_url(s,url,true) &&
             same_origin_urls(web_effective_url(s->doc), url, &allocation_failed)));
         JS_FreeCString(ctx,url);
@@ -5601,7 +5798,7 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
         static uint32_t generation;
         if (!++generation) ++generation;
         s->workers = web_worker_new(ctx,generation,worker_load,s);
-        if(s->workers)web_worker_set_requester(s->workers,worker_request);
+        if(s->workers){web_worker_set_requester(s->workers,worker_request);web_worker_set_resumer(s->workers,s->host.resume_request?worker_resume:NULL);}
         if (!s->workers) return oom(ctx);
         web_worker_set_canceler(s->workers,s->host.cancel?worker_cancel:NULL);
         web_worker_set_reporter(s->workers,js_policy_worker_report,s);
@@ -5611,9 +5808,9 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
     }
     if(op==0 || op==5){
         char *origin=NULL;
-        enum http_url_result parsed=make_origin(web_effective_url(s->doc),&origin);
-        if(parsed==HTTP_URL_OOM)return oom(ctx);
-        if(op==5 && parsed!=HTTP_URL_TUPLE){free(origin);return history_security_error(ctx,"SharedWorker requires a non-opaque document origin");}
+        enum web_url_result parsed=web_url_origin(web_effective_url(s->doc),&origin);
+        if(parsed==WEB_URL_OOM)return oom(ctx);
+        if(op==5 && parsed!=WEB_URL_TUPLE){free(origin);return history_security_error(ctx,"SharedWorker requires a non-opaque document origin");}
         bool origin_ok=web_worker_set_origin(s->workers,origin?origin:"");free(origin);
         web_worker_set_isolated(s->workers,s->doc->cross_origin_isolated);
         if(!origin_ok)return oom(ctx);
@@ -5659,11 +5856,10 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
                 struct js_pending *p=*link;
                 if (p->kind != P_WORKER || p->worker != id) { link=&p->next; continue; }
                 *link=p->next;
-                if (s->host.cancel) s->host.cancel(s->host.opaque,p->id);
-                JS_FreeValue(ctx,p->resolve); JS_FreeValue(ctx,p->reject);
-                js_free(ctx,p->url); pending_response_release(ctx,p);
-                js_free(ctx,p); s->pending_count--;
+                /* The Worker's keepalive requests outlive it; others are cancelled. */
+                release_pending_request(s,p); pending_free(s,p);
             }
+            worker_fetch_group_forget(s,id);
         }
     }
     return result;
@@ -5981,7 +6177,6 @@ static bool run_automation(struct web_js_state *s) {
     return true;
 }
 static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    static uint64_t fetch_group_serial;
     struct web_js_state *s = state(ctx);
     if(sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Sandbox denied borrowed asynchronous authority");
     if (argc < 4) return JS_ThrowTypeError(ctx, "Invalid fetch request");
@@ -6062,8 +6257,7 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     if (keepalive && !s->fetch_group) {
         /* A pointer or per-runtime request number can be reused after top-level
            navigation while an older native request is still alive. */
-        if (fetch_group_serial == UINT64_MAX) { result = JS_ThrowRangeError(ctx, "Fetch group identity is not representable"); goto out; }
-        s->fetch_group = ++fetch_group_serial;
+        if (!fetch_group_new(&s->fetch_group)) { result = JS_ThrowRangeError(ctx, "Fetch group identity is not representable"); goto out; }
     }
     struct js_pending *p = pending_new(s, P_FETCH, url);
     if (!p) { result = oom(ctx); goto out; }
@@ -6175,7 +6369,7 @@ static char *normalize_module(JSContext *ctx, const char *base, const char *name
     }
     const char *resolve_base = base && *base ? base : s->doc->base;
     for (struct js_module *m = s->modules; m; m = m->next) if (!strcmp(m->url, resolve_base)) { resolve_base = m->base; break; }
-    if ((!strncasecmp(resolve_base,"data:",5) || !strncasecmp(resolve_base,"blob:",5)) &&
+    if ((web_url_has_scheme(resolve_base,"data") || web_url_has_scheme(resolve_base,"blob")) &&
         (name[0]=='/' || !strncmp(name,"./",2) || !strncmp(name,"../",3))) {
         JS_ThrowTypeError(ctx,"Relative module imports require a hierarchical base URL"); return NULL;
     }
@@ -6287,7 +6481,7 @@ static bool script_data_checkpoint(void *opaque) {
 /* Source loading shares Fetch's decoder; only the existing source-loader MIME
  * essence contract and its JavaScript-module check belong to this adapter. */
 static char *script_data_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]) {
-    if (!permitted_script_url(s,url) || strncasecmp(url,"data:",5)) {
+    if (!permitted_script_url(s,url) || !web_url_has_scheme(url,"data")) {
         JS_ThrowTypeError(s->ctx,"Data script URL exceeds the URL limit"); return NULL;
     }
     struct web_data_url data;int result=web_data_url_process(url,&data,script_data_checkpoint,s);
@@ -6419,7 +6613,7 @@ static void module_received(struct web_js_state *s,struct js_pending *p) {
     if(!m || !m->fetching || !p->done)return;
     bool ok=!p->response.error[0] && p->response.status>=200 && p->response.status<300 &&
         (!p->response.body_len||p->response.body) &&
-        (!strncasecmp(p->url,"file://",7)||javascript_mime(web_response_headers(&p->response))) &&
+        (web_url_has_scheme(p->url,"file")||javascript_mime(web_response_headers(&p->response))) &&
         (!web_response_url(&p->response)[0]||permitted_url(s,web_response_url(&p->response),false));
     if(ok)ok=module_integrity(s,p->integrity,p->response.body,p->response.body_len);
     if(ok) {
@@ -6482,7 +6676,7 @@ static void module_descendants(struct web_js_state *s,struct js_module *m) {
         char *url=specifier?normalize_module(s->ctx,m->url,specifier,s):NULL;
         JS_FreeCString(s->ctx,specifier);
         if(!url){JS_FreeValue(s->ctx,JS_GetException(s->ctx));continue;}
-        struct js_module *child=strncasecmp(url,"data:",5)&&strncasecmp(url,"blob:",5)&&permitted_script_url(s,url)?
+        struct js_module *child=!web_url_has_scheme(url,"data")&&!web_url_has_scheme(url,"blob")&&permitted_script_url(s,url)?
             request_module(s,url,m->credentials,NULL,m->base,m->referrer_policy):NULL;
         js_free(s->ctx,url);
         if(child){child->users++;children[n++]=child;}
@@ -6580,9 +6774,9 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
         module_received(s,pending);
     }
     if(m && m->fetch_failed){JS_ThrowReferenceError(ctx,"Module fetch failed: %s",url);return NULL;}
-    if (!m && (!strncasecmp(url,"data:",5) || !strncasecmp(url,"blob:",5))) {
+    if (!m && (web_url_has_scheme(url,"data") || web_url_has_scheme(url,"blob"))) {
         size_t length; char mime[128];
-        char *source=!strncasecmp(url,"data:",5)
+        char *source=web_url_has_scheme(url,"data")
             ? script_data_source(s,url,true,&length,mime)
             : script_blob_source(s,url,true,&length,mime,NULL);
         if (!source) return NULL;
@@ -6625,7 +6819,7 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
             web_response_free(r); js_free(ctx,diagnostic);
             JS_ThrowTypeError(ctx,"Module browsing context changed during native loading"); return NULL;
         }
-        bool local = !strncasecmp(url, "file://", 7);
+        bool local = web_url_has_scheme(url, "file");
         if (!ok || r->error[0] || r->status < 200 || r->status >= 300 || r->body_len > JS_SOURCE_LIMIT || (r->body_len && !r->body) ||
             strlen(web_response_headers(r)) > WEB_RESPONSE_HEADERS_MAX ||
             (!local && !javascript_mime(web_response_headers(r))) || (web_response_url(r)[0] && !permitted_url(s, web_response_url(r), false))) {
@@ -6692,7 +6886,7 @@ static int import_module(JSContext *ctx,const char *basename,const char *specifi
     if(!module_context_current(s,s->doc->root)){JS_ThrowTypeError(ctx,"Module browsing context is inactive");return -1;}
     char *url=normalize_module(ctx,basename,specifier,s);
     if(!url)return -1;
-    struct js_module *m=strncasecmp(url,"data:",5)&&strncasecmp(url,"blob:",5)&&permitted_script_url(s,url)?
+    struct js_module *m=!web_url_has_scheme(url,"data")&&!web_url_has_scheme(url,"blob")&&permitted_script_url(s,url)?
         request_module(s,url,1,NULL,NULL,0):NULL;
     js_free(ctx,url);
     struct js_import *p=m&&!module_graph_settled(s,m)?js_mallocz(ctx,sizeof *p):NULL;
@@ -7009,6 +7203,7 @@ void web_js_window_names_changed(web_doc *d) {
     if(d && d->js)d->js->window_named_revision++;
 }
 static void dynamic_prepare_node(struct web_js_state *s,node_t *n,uint64_t generation,bool synchronous) {
+    n->frame_connection_pending=false;
     if(s->stream_generation!=generation || s->disabled || !connected(s,n))return;
     if(n->type==N_ELEM && n->tag==T_script && !n->script_started){
         struct js_script *script=queue_script(s,n,true);
@@ -7099,7 +7294,7 @@ static void sync_parser_body_handlers(struct web_js_state *s) {
    goes on; ready_script runs it once that finishes. */
 static void compile_elsewhere(struct web_js_state *s, struct js_script *script) {
     char *origin = NULL;
-    if ((s->doc->sandbox_flags & SB_ORIGIN) || http_origin_owned(web_effective_url(s->doc), &origin) != HTTP_URL_TUPLE) origin = NULL;
+    if ((s->doc->sandbox_flags & SB_ORIGIN) || web_url_origin(web_effective_url(s->doc), &origin) != WEB_URL_TUPLE) origin = NULL;
     script->compile = js_compile_start(script->source, script->len, script->url, origin);
     free(origin);
 }
@@ -7480,7 +7675,7 @@ failed:
    or a network error has neither. */
 static void resource_timing(struct web_js_state *s, struct js_pending *p) {
     if (s->disabled || !JS_IsObject(s->hooks) || p->kind==P_POLICY_REPORT || !p->url ||
-        (strncasecmp(p->url,"https://",8) && strncasecmp(p->url,"http://",7))) return;
+        (!web_url_has_scheme(p->url,"https") && !web_url_has_scheme(p->url,"http"))) return;
     const struct http_fetch_timing *t=&p->response.timing;
     bool failed=p->response.error[0],exposed=p->kind!=P_FRAME || (t->valid && t->redirect_same_origin);
     bool opaque_body;int status=0;char type[sizeof p->timing_type]="";
@@ -7652,6 +7847,50 @@ static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
     }
     end_task(s);
 }
+/* One native frame of a Worker's streamed fetch, queued to its child (NJW_FRAME). No JS runs in
+   this realm. The next frame waits for the child's NJW_RESUME (worker_resume), except an opaque
+   response's chunks: they never enter the child, and the transport resumes at once. */
+static void worker_fetch_frame(struct web_js_state *s, struct js_pending *p) {
+    int event = p->response.event;
+    bool terminal = event == WEBNET_END || p->response.error[0] || p->aborted, queued = true, resume = false;
+    if (event == WEBNET_HEADERS && !terminal) {
+        int flags = fetch_transport_flags(web_response_headers(&p->response));
+        bool opaque = flags >= 0 && (flags & NJW_LOADED_OPAQUE);
+        if (flags < 0 || (opaque && !p->no_cors)) {
+            pending_error(p, "Native Fetch response contradicts its filtering policy"); terminal = true;
+        } else {
+            if (!opaque && p->response.status >= 400) diagnostic_resource(s, p, "unsuccessful HTTP response");
+            streamed_response_metadata(p, opaque);
+            if (s->host.net_log) net_log_response(s, p, "headers", 0);
+            const char *final = web_response_url(&p->response)[0] ? web_response_url(&p->response) : p->url;
+            queued = web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_HEADERS, p->response.status,
+                final, web_response_headers(&p->response), NULL, 0, NULL);
+            p->headers_delivered = queued;
+        }
+    } else if (event == WEBNET_CHUNK && !terminal) {
+        p->streamed_bytes += p->response.body_len;
+        if (p->streamed_opaque) resume = true;
+        else queued = web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_CHUNK, 0, NULL, NULL,
+            p->response.body, p->response.body_len, NULL);
+    } else if (event == WEBNET_UPLOAD && !terminal)
+        queued = web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_UPLOAD, 0, NULL, NULL, NULL,
+            (size_t)p->response.uploaded, NULL);
+    if (!queued) { p->aborted = true; terminal = true; } /* the child is gone */
+    if (terminal) {
+        if (p->response.error[0] && !p->aborted) diagnostic_resource(s, p, p->response.error);
+        if (queued) web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_END, 0, NULL, NULL, NULL, 0,
+            p->response.error[0] ? p->response.error : event == WEBNET_END ? "" : "Worker fetch failed");
+        if (!p->aborted) { begin_named_task(s, "resource timing", p->id); resource_timing(s, p); end_task(s); }
+        if (s->host.net_log) net_log_response(s, p, "done", p->streamed_bytes);
+        if ((event != WEBNET_END || p->response.error[0] || p->aborted) && s->host.cancel) s->host.cancel(s->host.opaque, p->id);
+        pending_free(s, p);
+        return;
+    }
+    pending_response_release(s->ctx, p); p->done = false;
+    p->next = s->pending; s->pending = p;
+    if (resume) { if (s->host.resume_request) s->host.resume_request(s->host.opaque, p->id); }
+    else p->worker_paused = true;
+}
 static bool process_pending(struct web_js_state *s) {
     struct js_pending **link = &s->pending;
     uint64_t now = uptime_ms();
@@ -7665,8 +7904,11 @@ static bool process_pending(struct web_js_state *s) {
         if (!p->done && now >= p->deadline) { if (s->host.cancel) s->host.cancel(s->host.opaque, p->id); pending_error(p, "Resource request exceeded its deadline"); }
         if (!p->done) { link = &p->next; continue; }
         if (ran_task && !s->disabled && (p->kind == P_FETCH ||
-            (p->kind == P_WORKER && !strncasecmp(p->url,"blob:",5)))) { link = &p->next; continue; }
+            (p->kind == P_WORKER && web_url_has_scheme(p->url,"blob")))) { link = &p->next; continue; }
         *link = p->next;
+        if (p->streaming && p->kind == P_WORKER && !s->disabled) {
+            worker_fetch_frame(s, p); link = &s->pending; continue;
+        }
         if (p->streaming && !s->disabled) {
             process_fetch_frame(s, p); ran_task = true; link = &s->pending; continue;
         }
@@ -7706,7 +7948,7 @@ static bool process_pending(struct web_js_state *s) {
                         if (final) { js_free(s->ctx, script->url); script->url = final; }
                         else { script->failed = true; exception(s); }
                     }
-                    if (!script->failed && (!strncasecmp(script->url, "http://", 7) || !strncasecmp(script->url, "https://", 8))) {
+                    if (!script->failed && (web_url_has_scheme(script->url, "http") || web_url_has_scheme(script->url, "https"))) {
                         bool oom = false;
                         script->muted = !same_origin_urls(script->url, s->doc->url, &oom);
                     }
@@ -7714,7 +7956,7 @@ static bool process_pending(struct web_js_state *s) {
                 }
             }
         } else if (p->kind == P_WORKER && !s->disabled) {
-            if (!strncasecmp(p->url,"blob:",5) && !p->response.body && !p->response.error[0]) {
+            if (web_url_has_scheme(p->url,"blob") && !p->response.body && !p->response.error[0]) {
                 char mime[128];
                 ran_task = true; begin_named_task(s,"Worker object-URL source",p->worker);
                 p->response.body = script_blob_source(s,p->url,true,&p->response.body_len,mime,NULL);
@@ -7725,7 +7967,7 @@ static bool process_pending(struct web_js_state *s) {
                 end_task(s);
             }
             const char *final = web_response_url(&p->response)[0] ? web_response_url(&p->response) : p->url;
-            if (!p->response.error[0] && strncasecmp(p->url,"blob:",5)) {
+            if (!p->response.error[0] && !web_url_has_scheme(p->url,"blob")) {
                 bool valid = permitted_url(s,final,true);
                 bool allocation_failed = false;
                 if (p->worker_kind == 0) valid = valid &&
@@ -9570,6 +9812,7 @@ void web_js_free(web_doc *d) {
         broadcast_free(s);
         while(s->frame_proxies){struct js_frame_proxy *p=s->frame_proxies;s->frame_proxies=p->next;JS_FreeValue(s->ctx,p->proxy);js_free(s->ctx,p);}
         web_worker_free(s->workers); s->workers = NULL;
+        while (s->worker_groups) { struct js_worker_group *g = s->worker_groups; s->worker_groups = g->next; js_free(s->ctx, g); }
         while (s->sockets) socket_drop(s, s->sockets);
         while (s->automations) { struct js_automation *p = s->automations; s->automations = p->next; automation_free(s, p); }
         release_document_tasks(s);
@@ -9593,6 +9836,7 @@ void web_js_free(web_doc *d) {
             JS_FreeValue(s->ctx,p->promise);JS_FreeValue(s->ctx,p->reason);js_free(s->ctx,p);}
         s->last_handled_rejection=NULL;
         node_cache_free(s);
+        for (int i = 0; i < JS_STYLE_MEMO; i++) { free(s->style_memo[i].source); free(s->style_memo[i].block); }
         js_free(s->ctx,s->window_name);s->window_name=NULL;
         JS_FreeValue(s->ctx, s->hooks); JS_FreeValue(s->ctx, s->dispatch); JS_FreeValue(s->ctx, s->response); JS_FreeValue(s->ctx, s->reject);
         JS_FreeValue(s->ctx, s->event_port); JS_FreeValue(s->ctx, s->event_states);
