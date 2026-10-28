@@ -1,5 +1,7 @@
 #pragma once
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 #define NJW_MAGIC 0x4e4a5731u
 /* Payloads/identifiers use uint32_t on the unchanged pipe ABI. Queues are
    linked lazy allocations, constrained only by size_t accounting and OOM. */
@@ -44,20 +46,23 @@ enum { NJW_LOADED_TIMING=7 };
 #define NJW_LOAD_NO_CORS 0x100u
 #define NJW_LOAD_NO_REFERRER 0x200u
 /* A fetch's (kind 2) request modes, as Fetch's request records them: mode "same-origin", redirect
- * mode "error", the use-CORS-preflight flag, keepalive, a streamed response (NJW_FRAME), the
- * credentials mode (omit, same-origin, include) and the cache mode (enum webnet_cache). */
+ * mode "error" or "manual" (never both), the use-CORS-preflight flag, keepalive, a streamed
+ * response (NJW_FRAME), the credentials mode (omit, same-origin, include) and the cache mode
+ * (enum webnet_cache). */
 #define NJW_LOAD_SAME_ORIGIN 0x400u
 #define NJW_LOAD_REDIRECT_ERROR 0x800u
 #define NJW_LOAD_PREFLIGHT 0x1000u
 #define NJW_LOAD_KEEPALIVE 0x2000u
 #define NJW_LOAD_STREAM 0x4000u
+#define NJW_LOAD_REDIRECT_MANUAL 0x8000u
 #define NJW_LOAD_CREDENTIALS_SHIFT 16u
 #define NJW_LOAD_CREDENTIALS (3u << NJW_LOAD_CREDENTIALS_SHIFT)
 #define NJW_LOAD_CACHE_SHIFT 18u
 #define NJW_LOAD_CACHE (7u << NJW_LOAD_CACHE_SHIFT)
-#define NJW_LOAD_POLICY_FLAGS (NJW_LOAD_NO_CORS | NJW_LOAD_NO_REFERRER | NJW_LOAD_SAME_ORIGIN | NJW_LOAD_REDIRECT_ERROR | NJW_LOAD_PREFLIGHT | NJW_LOAD_KEEPALIVE | NJW_LOAD_STREAM | NJW_LOAD_CREDENTIALS | NJW_LOAD_CACHE)
+#define NJW_LOAD_POLICY_FLAGS (NJW_LOAD_NO_CORS | NJW_LOAD_NO_REFERRER | NJW_LOAD_SAME_ORIGIN | NJW_LOAD_REDIRECT_ERROR | NJW_LOAD_PREFLIGHT | NJW_LOAD_KEEPALIVE | NJW_LOAD_STREAM | NJW_LOAD_REDIRECT_MANUAL | NJW_LOAD_CREDENTIALS | NJW_LOAD_CACHE)
 static inline int njw_load_kind_valid(uint32_t kind) {
     return kind == 1u || ((kind & ~NJW_LOAD_POLICY_FLAGS) == 2u &&
+        (kind & (NJW_LOAD_REDIRECT_ERROR | NJW_LOAD_REDIRECT_MANUAL)) != (NJW_LOAD_REDIRECT_ERROR | NJW_LOAD_REDIRECT_MANUAL) &&
         ((kind & NJW_LOAD_CREDENTIALS) >> NJW_LOAD_CREDENTIALS_SHIFT) <= 2u &&
         ((kind & NJW_LOAD_CACHE) >> NJW_LOAD_CACHE_SHIFT) <= 5u);
 }
@@ -68,9 +73,36 @@ static inline int njw_load_kind_valid(uint32_t kind) {
    shifted by NJW_LOADED_RESOURCE_SHIFT), for Cache Storage's cross-origin resource policy check. */
 #define NJW_LOADED_RESOURCE_SHIFT 3u
 #define NJW_LOADED_RESOURCE (7u << NJW_LOADED_RESOURCE_SHIFT)
-#define NJW_LOADED_FLAGS (NJW_LOADED_CORS | NJW_LOADED_REDIRECTED | NJW_LOADED_OPAQUE | NJW_LOADED_RESOURCE)
+/* An opaque-redirect filtered response (redirect mode "manual"): the redirect's URL only, its
+   status, fields and body withheld. */
+#define NJW_LOADED_OPAQUE_REDIRECT 64u
+#define NJW_LOADED_FLAGS (NJW_LOADED_CORS | NJW_LOADED_REDIRECTED | NJW_LOADED_OPAQUE | NJW_LOADED_RESOURCE | NJW_LOADED_OPAQUE_REDIRECT)
 static inline int njw_loaded_kind_valid(uint32_t kind) {
-    return kind <= (NJW_LOADED_CORS | NJW_LOADED_REDIRECTED) || (kind & ~NJW_LOADED_RESOURCE) == NJW_LOADED_OPAQUE;
+    return kind <= (NJW_LOADED_CORS | NJW_LOADED_REDIRECTED) || (kind & ~NJW_LOADED_RESOURCE) == NJW_LOADED_OPAQUE ||
+        kind == NJW_LOADED_OPAQUE_REDIRECT;
+}
+/* The NJW_LOADED flags of a response's header block, from webfetch's private metadata line
+ * (webfetch.c response_headers: "HTTP/Nocturne-Meta cors=C redirected=R[ opaque=1][ resource=B]
+ * [ opaqueredirect=1][ referrer=URL]"): cors and redirected, an opaque response with what the
+ * transport noted of it (resource=, 2 when it noted nothing: another origin), or an
+ * opaque-redirect; -1 when the block has no valid line. The one reader for a Window's fetch
+ * (js.c) and a Worker's (js_worker.c). Server fields contain a colon and cannot forge the line;
+ * its referrer URL has no space. */
+static inline int njw_transport_flags(const char *headers) {
+    const char *meta = headers ? strstr(headers, "\r\nHTTP/Nocturne-Meta cors=") : NULL;
+    unsigned cors = 0, redirected = 0, opaque = 0;
+    if (!meta || sscanf(meta + 2, "HTTP/Nocturne-Meta cors=%u redirected=%u opaque=%u", &cors, &redirected, &opaque) < 2 ||
+        cors > 1 || redirected > 1 || opaque > 1) return -1;
+    const char *line = meta + 2, *end = strstr(line, "\r\n");
+    if (!end) end = line + strlen(line);
+    if (opaque) {
+        const char *at = strstr(line, " resource="); unsigned bits = 2;
+        if (!at || at > end || sscanf(at + 10, "%u", &bits) != 1 || bits > 7) bits = 2;
+        return (int)(NJW_LOADED_OPAQUE | (bits << NJW_LOADED_RESOURCE_SHIFT));
+    }
+    const char *manual = strstr(line, " opaqueredirect=1");
+    if (manual && manual < end) return (int)NJW_LOADED_OPAQUE_REDIRECT;
+    return (int)((cors ? NJW_LOADED_CORS : 0) | (redirected ? NJW_LOADED_REDIRECTED : 0));
 }
 /* An NJW_FRAME's event (webnet's: headers, a chunk, the end, upload progress), shifted. */
 #define NJW_FRAME_SHIFT 8u

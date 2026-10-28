@@ -238,26 +238,18 @@ JSValue web_worker_native(web_workers *w,int argc,JSValueConst *argv){
 static void resource_retire(struct child *c,uint32_t request){
     if(request){struct resource**at=&c->resources;while(*at&&(*at)->id!=request)at=&(*at)->next;if(*at){struct resource*r=*at;*at=r->next;free(r);}}
 }
-/* The NJW_LOADED flags of a response's header block, from the transport's own line. An opaque
- * response's internals are blanked here: never place them in the author's Worker realm, even if
- * its built-in prototypes have been replaced. */
+/* The NJW_LOADED flags of a response's header block, from the transport's own line
+ * (njw_transport_flags). An opaque response's internals, and an opaque-redirect's but its URL,
+ * are blanked here: never place them in the author's Worker realm, even if its built-in
+ * prototypes have been replaced. */
 static uint32_t response_kind(int *status,const char **url,const char **headers,const void **bytes,size_t *n){
-    uint32_t kind=0;
-    /* This second status line is emitted by the trusted HTTP host. Server
-       fields contain a colon and cannot manufacture transport metadata. */
-    const char *meta=*headers?strstr(*headers,"\r\nHTTP/Nocturne-Meta cors="):NULL;
-    unsigned cors=0,redirected=0,opaque=0;
-    if(meta&&sscanf(meta+2,"HTTP/Nocturne-Meta cors=%u redirected=%u opaque=%u",&cors,&redirected,&opaque)>=2&&cors<=1&&redirected<=1&&opaque<=1){
-        if(cors)kind|=NJW_LOADED_CORS;
-        if(redirected)kind|=NJW_LOADED_REDIRECTED;
-        if(opaque){
-            const char *end=strstr(meta+2,"\r\n"),*at=strstr(meta+2," resource=");unsigned bits=2;
-            if(!at||!end||at>end||sscanf(at+10,"%u",&bits)!=1||bits>7)bits=2;
-            kind=NJW_LOADED_OPAQUE|(bits<<NJW_LOADED_RESOURCE_SHIFT);
-            *status=0;*url="";*headers="";*bytes=NULL;*n=0;
-        }
+    int flags=njw_transport_flags(*headers);
+    if(flags<0)return 0;
+    if(flags&(NJW_LOADED_OPAQUE|NJW_LOADED_OPAQUE_REDIRECT)){
+        *status=0;*headers="";*bytes=NULL;*n=0;
+        if(flags&NJW_LOADED_OPAQUE)*url="";
     }
-    return kind;
+    return (uint32_t)flags;
 }
 void web_worker_loaded(web_workers *w,uint32_t id,uint32_t request,int status,const char *url,const char *headers,const void *bytes,size_t n,const char *error,JSValueConst timing){
     if(!w)return;struct child *c=find(w,id);if(!c||c->stopped)return;

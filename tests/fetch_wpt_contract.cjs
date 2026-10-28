@@ -9,7 +9,13 @@
  * js_object_url.js as its bootstrap installs it (a Worker's only in the REVs whose Worker has
  * one). The native transports are recorders that never answer, so a test that needs the network
  * times out in every realm, except in a file marked network:'error', where every request is a
- * network error. A Worker's request for a blob: URL is answered as js.c's worker_blob answers
+ * network error, and in one marked network:'redirect', where every URL is one of wptserve's
+ * redirect handlers and the transport answers as webfetch's response_start answers its 3xx
+ * (tests/fetch_redirect_manual_hosttest.c runs that code): in redirect mode "manual", when the
+ * CORS check passes (the same origin, or fetch/api/resources/redirect.py, which allows the
+ * request's origin), the opaque-redirect filtered response, delivered as js.c gives it to a
+ * Window and as the parent's frames give it to a Worker; else a network error ("error", a CORS
+ * failure, and "follow", which has no network to follow to). A Worker's request for a blob: URL is answered as js.c's worker_blob answers
  * for a creating document whose store does not hold it: a network error. The realms have node's
  * URL (its createObjectURL hidden until a realm installs its own) and TextEncoder. This is not
  * the guest browser and not wptrunner: it shows the two realms give the same results and, with
@@ -55,6 +61,8 @@ const files = [
        needs the network: there it is a network error, so the tests after it run. */
     {file: 'fetch/api/basic/scheme-blob.sub.any.js', network: 'error'}, 'fetch/range/blob.any.js',
     'FileAPI/url/url-format.any.js', 'FileAPI/url/url-with-fetch.any.js',
+    /* HTTP fetch's redirect mode "manual" and main fetch's no-cors rule for it. */
+    {file: 'fetch/api/redirect/redirect-mode.any.js', network: 'redirect'},
     /* DOM "Aborting ongoing activities", in testharness.js's form: the garbage collection rule
        ("A non-aborted dependent AbortSignal object must not be garbage collected while its source
        signals is non-empty and it has registered event listeners for its abort event or its abort
@@ -153,7 +161,7 @@ const hideObjectURLs = () => { for (const name of ['createObjectURL', 'revokeObj
     Object.defineProperty(URL, name, {value: undefined, writable: true, configurable: true, enumerable: false}); };
 /* The realm's shared start: what both a Window's and a Worker's bootstrap have before Fetch:
    js_worker_runtime.js's ProgressEvent and js_blob.js (this tree's, the environment of every REV). */
-function context(rev) {
+function context(rev, network) {
     hideObjectURLs();
     const c = {console, URL, URLSearchParams, TextEncoder, TextDecoder, setTimeout, clearTimeout, crypto: globalThis.crypto,
         location: new URL(BASE_URL), queueMicrotask, Buffer, WeakRef, FinalizationRegistry, digest, __gc: global.gc};
@@ -161,7 +169,10 @@ function context(rev) {
     c.self = vm.runInContext('globalThis', c);
     vm.runInContext(read(web + 'js_dom_exception.js'), c);
     vm.runInContext(`const apply=Reflect.apply,DOMException=domExceptionBridge.DOMException;globalThis.DOMException=DOMException;
-        const reported=[],calls=[],sent=[],cancelled=[],resumed=[];
+        const reported=[],calls=[],sent=[],cancelled=[],resumed=[],network=${JSON.stringify(network || null)};
+        const networkError='Network error (the harness has no network)';
+        /* webfetch's CORS check of a redirect handler's response (network:'redirect'). */
+        const redirectAllowed=url=>{const u=new URL(url);return u.origin===location.origin||u.pathname.startsWith('/fetch/api/resources/');};
         function report(e){reported.push(e);}
         const host={now:()=>Date.now(),promiseThen:(p,f,r)=>Promise.prototype.then.call(p,f,r),dataURL:${dataURL},cryptoDigest:digest,
             safety:(name,fallback)=>fallback,
@@ -186,15 +197,19 @@ const includes = (rev, text) => text.replace('/* @include js_abort.js */', sourc
     .replace('/* @include js_fetch.js */', source(rev, web + 'js_fetch.js'));
 const realms = {
     /* js_bootstrap.js from its js_abort.js include to the Fetch globals. */
-    window(rev, networkError) {
-        const c = context(rev);
+    window(rev, network) {
+        const c = context(rev, network);
         vm.runInContext(`let abortSignals,abortListen=()=>{};const mapGet=WeakMap.prototype.get;
             const document={},performanceBridge={initiator(){}};
             const rawDom={get:(d,k)=>({baseURI:'${BASE_URL}',fetchOrigin:new URL('${BASE_URL}').origin,fetchClientReferrer:'${BASE_URL}',referrerPolicy:0})[k]};
             Object.assign(host,{url:()=>'${BASE_URL}',timer:(k,fn,ms,args)=>setTimeout(()=>fn(...args),ms),clear:id=>clearTimeout(id),
                 noCorsFetch:true,streamingFetch:true,resumeFetch(id){resumed.push(id);},cancel(id){cancelled.push(id);},
-                fetch(...args){calls.push(args);
-                    return {id:calls.length,promise:${networkError}?Promise.reject(new TypeError('Network error (the harness has no network)')):new Promise(()=>{})};}});
+                fetch(...args){calls.push(args);const id=calls.length;
+                    /* js.c's process_fetch_frame for an opaque-redirect: the headers frame's Response, then the end. */
+                    if(network==='redirect')return {id,promise:!(args[7]===2&&redirectAllowed(args[0]))?Promise.reject(new TypeError(networkError)):
+                        new Promise(resolve=>setTimeout(()=>{const r=fetchBridge.response(0,args[0],'',undefined,new ArrayBuffer(0),false,undefined,'opaqueredirect');
+                            if(args[12])args[12](1,r);resolve(r);if(args[12])args[12](3);},0))};
+                    return {id,promise:network==='error'?Promise.reject(new TypeError(networkError)):new Promise(()=>{})};}});
             /* REV's Worker events asked the Worker's own AbortSignal copy for the signal option. */
             var workerAbortBridge={brand:v=>abortSignals.is(v),state:v=>({aborted:abortSignals.aborted(v)}),subscribe:(s,f)=>abortSignals.follow(s,f)};`, c);
         const bootstrap = source(rev, web + 'js_bootstrap.js');
@@ -208,16 +223,20 @@ const realms = {
     },
     /* js_worker_runtime.js from its AbortSignal to the Fetch globals. The parent answers a blob:
        URL's request as worker_blob does for a document whose store does not hold it. */
-    worker(rev, networkError) {
-        const c = context(rev);
+    worker(rev, network) {
+        const c = context(rev, network);
         vm.runInContext(`let closed=false,address='${BASE_URL}',workerCanCancel=true,workerStreaming=true;
             const fetches=new Map();
             function timer(fn,ms,args){return setTimeout(()=>fn(...(args||[])),ms);}
             function clearTimer(id){clearTimeout(id);}
             Object.assign(host,{securityURL:()=>address,referrerPolicy:()=>0,resume(id){resumed.push(id);},cancel(id){cancelled.push(id);},
-                request(...args){sent.push(args);const id=sent.length,blob=String(args[0].url).startsWith('blob:');
-                    if(blob||${networkError})setTimeout(()=>workerFetchTransport.loaded(id,[0,'','',new ArrayBuffer(0),
-                        blob?"The blob: URL has no Blob in the creating document's store":'Network error (the harness has no network)'],0));
+                request(...args){sent.push(args);const id=sent.length,q=args[0],blob=String(q.url).startsWith('blob:');
+                    /* The parent's frames of an opaque-redirect (js_worker.c's response_kind leaves its URL only). */
+                    if(!blob&&network==='redirect'&&q.redirectManual&&redirectAllowed(q.url))setTimeout(()=>{
+                        if(args[1]){workerFetchTransport.frame(id,[0,q.url,''],256|64);workerFetchTransport.frame(id,[],768);}
+                        else workerFetchTransport.loaded(id,[0,q.url,'',new ArrayBuffer(0),''],64);});
+                    else if(blob||network)setTimeout(()=>workerFetchTransport.loaded(id,[0,'','',new ArrayBuffer(0),
+                        blob?"The blob: URL has no Blob in the creating document's store":networkError],0));
                     return id;}});`, c);
         const runtime = source(rev, web + 'js_worker_runtime.js');
         const start = runtime.includes('    /* @include js_abort.js */') ? '    /* @include js_abort.js */' : '    const workerAbortBridge=(()=>{';
@@ -244,7 +263,7 @@ const substitute = text => text.replace(/\{\{domains\[([^\]]*)\]\}\}/g, (m, sub)
 function runFile(kind, rev, entry) {
     const file = typeof entry === 'string' ? entry : entry.file;
     return new Promise(resolve => {
-        const c = realms[kind](rev, typeof entry === 'object' && entry.network === 'error');
+        const c = realms[kind](rev, typeof entry === 'object' ? entry.network : undefined);
         const results = new Map();
         let timer;
         c.__done = (tests, status) => {
@@ -261,7 +280,9 @@ function runFile(kind, rev, entry) {
         try {
             for (const line of text.split('\n')) {
                 const m = /^\/\/ META: script=(.*)$/.exec(line.trim());
-                if (m) vm.runInContext(read(m[1].startsWith('/') ? path.join(wpt, m[1]) : path.join(path.dirname(full), m[1])), c);
+                if (!m) continue;
+                const script = read(m[1].startsWith('/') ? path.join(wpt, m[1]) : path.join(path.dirname(full), m[1]));
+                vm.runInContext(m[1].includes('.sub.') ? substitute(script) : script, c, {filename: m[1]});
             }
             vm.runInContext(text, c, {filename: file});
         } catch (e) { results.set('(load) ' + file, 'ERROR ' + e.message); }

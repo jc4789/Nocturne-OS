@@ -554,6 +554,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
         ((q->referrer||q->referrer_policy) && (q->kind==WEBNET_REPORT||q->kind==WEBNET_WEBSOCKET)) ||
         ((q->no_cors || q->no_referrer) && q->kind != WEBNET_FETCH) ||
         (q->no_cors && (q->same_origin || q->force_preflight)) ||
+        (q->redirect_manual && (q->kind != WEBNET_FETCH || q->redirect_error)) ||
         (q->keepalive && (q->kind != WEBNET_FETCH || !q->fetch_group)) ||
         (q->image_upgrade && q->kind != WEBNET_RESOURCE) ||
         (q->stream_response && q->kind != WEBNET_FETCH) ||
@@ -591,6 +592,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     uint32_t flags = (q->user_navigation ? WEBNET_WIRE_USER_NAVIGATION : 0) |
                      (q->force_preflight ? WEBNET_WIRE_FORCE_PREFLIGHT : 0) |
                      (q->redirect_error ? WEBNET_WIRE_REDIRECT_ERROR : 0) |
+                     (q->redirect_manual ? WEBNET_WIRE_REDIRECT_MANUAL : 0) |
                      (q->same_origin ? WEBNET_WIRE_SAME_ORIGIN : 0) |
                      ((uint32_t)q->cache_mode << WEBNET_WIRE_CACHE_SHIFT);
     if (q->kind == WEBNET_CLASSIC || q->kind == WEBNET_MODULE) flags |= WEBNET_WIRE_LARGE_SCRIPT;

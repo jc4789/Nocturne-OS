@@ -210,11 +210,16 @@
         /* A fetch's end: its stream's (notify), then its promise's when no response was published. */
         function end(p,error){if(p.notify)p.notify(3,error);if(!p.published)p.reject(error===undefined?new NativeTypeError('Worker fetch failed'):error);}
         /* The response the parent delivered: NJW_LOADED's [status, url, headers, bytes] or a
-           headers frame's [status, url, headers], its NJW_LOADED_* flags. */
+           headers frame's [status, url, headers], its NJW_LOADED_* flags (4 opaque with its
+           resource bits, 64 an opaque-redirect: its URL only). */
         function response(r,flags,bytes){
             if(flags&4)return fetchBridge.response(0,'','',undefined,null,false,'','opaque',(flags>>3)&7);
+            if(flags&64)return fetchBridge.response(0,r[1],'',undefined,null,false,'','opaqueredirect');
             return fetchBridge.response(r[0],r[1],r[2],undefined,bytes,!!(flags&2),undefined,flags&1?'cors':'basic');
         }
+        /* A filtered response the request's modes do not allow: an opaque one for a request not in
+           mode "no-cors", an opaque-redirect for one whose redirect mode is not "manual". */
+        const contradicts=(p,flags)=>((flags&4)&&!p.noCors)||((flags&64)&&!p.manual);
         /* One frame taken: the parent sends the next on this resume, once per frame. */
         function next(id,p,more){if(more&&!p.done)apply(resume,host,[id]);else p.paused=!p.done;}
         /* Fetch's report timing, once the fetch has ended (as a Window's js.c reports it): the
@@ -226,7 +231,7 @@
                 if(closed)throw new NativeTypeError('Worker closed');
                 const stream=!!notify&&workerStreaming,id=apply(request,host,[q,stream]);
                 let resolve,reject;const promise=new NativePromise((a,b)=>{resolve=a;reject=b;});
-                apply(mapSet,fetches,[id,record({resolve,reject,notify:stream?notify:undefined,noCors:q.noCors,url:q.url,published:false,paused:false,done:false})]);
+                apply(mapSet,fetches,[id,record({resolve,reject,notify:stream?notify:undefined,noCors:q.noCors,manual:q.redirectManual,url:q.url,published:false,paused:false,done:false})]);
                 return record({id,promise});
             },
             /* FileAPI "obtain a blob object" for a blob: URL this Worker's store does not hold: the
@@ -254,20 +259,20 @@
                     return;
                 }
                 timing(p,wireField(r,LOADED_TIMING));
-                if(r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!p.noCors)||p.notify){end(p,new NativeTypeError(r[4]||'Worker fetch failed'));return;}
+                if(r[4]||(!(flags&(4|64))&&!r[0])||contradicts(p,flags)||p.notify){end(p,new NativeTypeError(r[4]||'Worker fetch failed'));return;}
                 try{p.published=true;p.resolve(response(r,flags,r[3]));}catch(error){p.reject(error);}
             },
             /* NJW_FRAME: one frame of a streamed fetch (the parent's process_fetch_frame order:
                the stream first, then the promise). */
             frame(id,value,kind){
                 const p=apply(mapGet,fetches,[id]);if(!p||closed||!p.notify)return;
-                const event=(kind>>8)&7,flags=kind&63;
+                const event=(kind>>8)&7,flags=kind&127;
                 if(event===3){
                     const error=wireField(value,0);take(id);p.done=true;end(p,error?new NativeTypeError(error):undefined);
                     timing(p,wireField(value,1));return;
                 }
                 if(event===1){
-                    if((flags&4)&&!p.noCors){take(id);p.done=true;end(p,new NativeTypeError('Native Fetch response contradicts its filtering policy'));return;}
+                    if(contradicts(p,flags)){take(id);p.done=true;end(p,new NativeTypeError('Native Fetch response contradicts its filtering policy'));return;}
                     const published=response(value,flags,new ArrayBuffer(0)),more=p.notify(1,published);
                     p.published=true;p.resolve(published);next(id,p,more);return;
                 }

@@ -139,8 +139,25 @@ async function test() {
     check('include, no referrer', last().credentials === 2 && last().cache === 2 && last().noReferrer === true && last().referrer === '');
     R("fetch('https://other.test/x',{mode:'no-cors',referrer:'/page#f'}).catch(()=>{})");
     check('no-cors query', last().noCors === true && last().referrer === 'https://cache.test/page');
-    check('manual redirect', await rejects(R("fetch('r',{redirect:'manual'})"), 'NotSupportedError'));
+    /* Redirect mode "manual": the parent's opaque-redirect (NJW_LOADED_OPAQUE_REDIRECT, 64) arrives
+       with its URL only; it contradicts any other redirect mode. */
+    p = R("fetch('r#f',{redirect:'manual'})");
+    check('manual redirect query', last().redirectManual === true && last().redirectError === false);
+    respond(sent.length, 0, 'https://cache.test/worker/r', '', null, 64);
+    const manual = await p;
+    check('opaque-redirect', manual.type === 'opaqueredirect' && manual.status === 0 && manual.statusText === '' &&
+        manual.url === 'https://cache.test/worker/r' && [...manual.headers].length === 0 && manual.body === null && manual.redirected === false);
+    p = R("fetch('r')");
+    check('follow query', last().redirectManual === false);
+    respond(sent.length, 0, 'https://cache.test/worker/r', '', null, 64);
+    check('opaque-redirect for a follow request', await rejects(p, 'TypeError'));
     let before = sent.length;
+    check('no-cors manual to another origin', await rejects(R("fetch('https://other.test/x',{mode:'no-cors',redirect:'manual'})"), 'TypeError') &&
+        await rejects(R("fetch('https://other.test/x',{mode:'no-cors',redirect:'error'})"), 'TypeError') && sent.length === before);
+    R("fetch('same',{mode:'no-cors',redirect:'manual'}).catch(()=>{})");
+    check('no-cors manual to the same origin', last().url === 'https://cache.test/worker/same' && last().noCors === true && last().redirectManual === true);
+    respond(sent.length, 0, '', '', null, 0, 'net::refused');
+    before = sent.length;
     check('stream upload', await rejects(R("fetch('u',{method:'POST',body:new ReadableStream(),duplex:'half'})"), 'TypeError') && sent.length === before);
     check('data: stays in the realm', (await (await R("fetch('data:,hello%20there')")).text()) === 'hello there' && sent.length === before);
     p = R("fetch('loaded-error')");

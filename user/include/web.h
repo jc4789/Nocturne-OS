@@ -69,6 +69,9 @@ struct web_request {
     int credentials; /* 0 omit, 1 same-origin, 2 include */
     bool force_preflight; /* XHR upload listeners require CORS preflight even with safe headers. */
     bool redirect_error, same_origin;
+    /* Fetch's redirect mode "manual" (a fetch only, never a navigation): the first redirect is
+       the response, an opaque-redirect filtered one. */
+    bool redirect_manual;
     bool no_cors, no_referrer; /* Private Fetch policy, never author headers. */
     const char *referrer; /* Private source URL; transport strips credentials/fragment. */
     int referrer_policy;

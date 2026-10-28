@@ -704,8 +704,13 @@ function fetchInterfaces(realm) {
             if(referrer){const source=parseURL(referrer);apply(setUsername,source,['']);apply(setPassword,source,['']);apply(setHash,source,['']);referrer=href(source);}
             const referrerPolicy=s.referrerPolicy?position(referrerPolicies,s.referrerPolicy):realm.referrerPolicy();
             if(beginsWith(s.url,'blob:'))return blobFetch(s,integrity);
+            /* Main fetch: a no-cors request to another origin is a network error unless its
+               redirect mode is "follow" (the transport checks every request the same way). */
+            if(s.mode==='no-cors'&&s.redirect!=='follow'){
+                const target=originOf(parseURL(s.url));
+                if(target==='null'||target!==realm.origin())throw new TypeError('A no-cors request to another origin requires redirect mode "follow"');
+            }
             if(s.mode==='no-cors'&&!transport.noCors())throw notSupported('This native context has no no-cors transport');
-            if(s.redirect==='manual')throw notSupported('Opaque manual redirect responses are not supported');
             // HTTP-network fetch: a body without a source (an author's stream) cannot be sent
             // over an HTTP/1.x connection, and the native transport sends whole bodies only.
             if(sourceless(b))throw new TypeError('The native transport cannot send a streaming request body');
@@ -728,7 +733,7 @@ function fetchInterfaces(realm) {
                 if(!active){done=true;finishStream();transport.cancel(transportId);return false;}
                 if(event===1){
                     const state=slot(bodySlots,value,'Body'),meta=slot(responseSlots,value,'Response');
-                    hasBody=s.method!=='HEAD'&&meta.type!=='opaque'&&!nullStatus(meta.status);
+                    hasBody=s.method!=='HEAD'&&meta.type!=='opaque'&&meta.type!=='opaqueredirect'&&!nullStatus(meta.status);
                     state.bytes=null;state.abort=s.signal;
                     if(hasBody&&!observer){state.stream=active.stream;networkSlots.set(active.stream,active);apply(registerFinalizer,networkFinalizer,[active,transportId,active]);channelRef=new NativeWeakRef(active);channel=null;}
                     if(observer){observer('headers',value,resume);return false;}
@@ -754,6 +759,7 @@ function fetchInterfaces(realm) {
             }:undefined;
             started=transport.fetch(record({url:s.url,method:s.method,headers:raw,body:b.bytes,sameOrigin:s.mode==='same-origin',
                 credentials:position(credentialModes,s.credentials),forcePreflight:forcePreflight||s.preflight,redirectError:s.redirect==='error',
+                redirectManual:s.redirect==='manual',
                 cache:position(cacheModes,s.cache),keepalive:s.keepalive,noCors:s.mode==='no-cors',noReferrer,referrer,referrerPolicy,
                 destination:s.destination}),notify);
             transportId=started.id;const transportPromise=started.promise;started=null;
@@ -791,6 +797,10 @@ function fetchInterfaces(realm) {
     const statusLine=/^HTTP\/\S+\s+\d{3}(?:[ \t]+([^\r\n]*))?/;
     const transportMeta=/^HTTP\/Nocturne-Meta cors=([01]) redirected=([01])(?: opaque=([01]))?(?: resource=[0-7])?\r?$/m;
     const opaqueResponse=resource=>responseObject({status:0,statusText:'',url:'',headers:makeHeaders(undefined,'immutable'),redirected:false,type:'opaque',resource},{bytes:null,used:false,abort:null});
+    /* An opaque-redirect filtered response (redirect mode "manual"): status 0, no fields, a null
+       body, and the URL of the response that redirected. */
+    const opaqueRedirectResponse=url=>responseObject({status:0,statusText:'',url:urlWithoutFragment(usv(url)),headers:makeHeaders(undefined,'immutable'),
+        redirected:false,type:'opaqueredirect'},{bytes:null,used:false,abort:null});
     return {
         Headers,Request,Response,fetch,
         /* The engine's own fetch for an element: a track, a media fallback. Its init is the
@@ -877,6 +887,7 @@ function fetchInterfaces(realm) {
            header block is read without author-modifiable regex, string or URL methods. */
         response(status,url,raw,text,bytes,redirected,statusText,type,resource) {
             if(type==='opaque')return opaqueResponse(typeof resource==='number'?resource:2);
+            if(type==='opaqueredirect')return opaqueRedirectResponse(url);
             const headers=makeHeaders(undefined,'response'),hs=headerSlots.get(headers);raw=NativeString(raw);
             eachLine(raw,line=>{const colon=indexOf(line,':');if(colon>0&&!beginsWith(line,'HTTP/'))appendHeader(hs,normalizeName(slice(line,0,colon)),normalizeValue(slice(line,colon+1,line.length)));});
             hs.guard='immutable';

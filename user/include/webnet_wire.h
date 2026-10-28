@@ -82,6 +82,16 @@
    to its block; a stream's end frame carries them as its whole block. Server
    field names are tokens and can never take this form. */
 #define WEBNET_WIRE_TIMING 134217728u
+/* Fetch's redirect mode "manual" (HTTP fetch): a redirect status ends the fetch as its response,
+   which the worker withholds but for its URL (no fields, no body, not stored in the HTTP cache)
+   and marks " opaqueredirect=1" on its metadata line, so the client makes an opaque-redirect
+   filtered response. Only a WEBNET_FETCH with the metadata line, never with
+   WEBNET_WIRE_REDIRECT_ERROR: a navigation's redirects are the navigation's own. */
+#define WEBNET_WIRE_REDIRECT_MANUAL 268435456u
+static inline bool webnet_wire_redirect_flag_valid(uint32_t kind, uint32_t flags) {
+    return !(flags & WEBNET_WIRE_REDIRECT_MANUAL) ||
+        (kind == WEBNET_FETCH && (flags & WEBNET_WIRE_STATUS_LINE) && !(flags & WEBNET_WIRE_REDIRECT_ERROR));
+}
 struct webnet_wire_language { uint32_t length, reserved; };
 _Static_assert(sizeof(struct webnet_wire_language)==8,"webfetch Accept-Language extension");
 /* Whether length bytes are a value the field may carry: a subset of the CORS-safelisted
@@ -113,7 +123,7 @@ _Static_assert(sizeof(struct webnet_wire_top_level)==8,"webfetch top document ex
 #define WEBNET_STREAM_UPLOAD  0x574e5304u
 #define WEBNET_STREAM_REQUEST_CREDIT 0x574e5305u
 #define WEBNET_STREAM_CHUNK_MAX 65536u
-#define WEBNET_WIRE_REQUEST_FLAGS (WEBNET_WIRE_USER_NAVIGATION | WEBNET_WIRE_FORCE_PREFLIGHT | WEBNET_WIRE_REDIRECT_ERROR | WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_CACHE_MASK | WEBNET_WIRE_LARGE_SCRIPT | WEBNET_WIRE_DYNAMIC_BODY | WEBNET_WIRE_DYNAMIC_HEADERS | WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS | WEBNET_WIRE_IMAGE_UPGRADE | WEBNET_WIRE_DYNAMIC_URL | WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER | WEBNET_WIRE_STREAM | WEBNET_WIRE_DEBUG_REQUEST | WEBNET_WIRE_BODY_PRESENT | WEBNET_WIRE_REFERRER | WEBNET_WIRE_SERVICE | WEBNET_WIRE_TOP_LEVEL | WEBNET_WIRE_REQUIRE_CORP | WEBNET_WIRE_FETCH_METADATA | WEBNET_WIRE_SENT_HEADERS | WEBNET_WIRE_ACCEPT_LANGUAGE | WEBNET_WIRE_TIMING)
+#define WEBNET_WIRE_REQUEST_FLAGS (WEBNET_WIRE_USER_NAVIGATION | WEBNET_WIRE_FORCE_PREFLIGHT | WEBNET_WIRE_REDIRECT_ERROR | WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_CACHE_MASK | WEBNET_WIRE_LARGE_SCRIPT | WEBNET_WIRE_DYNAMIC_BODY | WEBNET_WIRE_DYNAMIC_HEADERS | WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS | WEBNET_WIRE_IMAGE_UPGRADE | WEBNET_WIRE_DYNAMIC_URL | WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER | WEBNET_WIRE_STREAM | WEBNET_WIRE_DEBUG_REQUEST | WEBNET_WIRE_BODY_PRESENT | WEBNET_WIRE_REFERRER | WEBNET_WIRE_SERVICE | WEBNET_WIRE_TOP_LEVEL | WEBNET_WIRE_REQUIRE_CORP | WEBNET_WIRE_FETCH_METADATA | WEBNET_WIRE_SENT_HEADERS | WEBNET_WIRE_ACCEPT_LANGUAGE | WEBNET_WIRE_TIMING | WEBNET_WIRE_REDIRECT_MANUAL)
 static inline size_t webnet_wire_url_limit(uint32_t flags) {
     return flags & WEBNET_WIRE_DYNAMIC_URL ? (size_t)UINT32_MAX : WEBNET_URL_MAX - 1u;
 }

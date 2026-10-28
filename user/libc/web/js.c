@@ -119,7 +119,7 @@ struct js_pending {
     struct cached_css *css;
     JSValue resolve, reject, stream_callback;
     char *url,*origin,*integrity,*referrer;
-    bool done, aborted, force_preflight, redirect_error, same_origin, keepalive, no_cors, no_referrer;
+    bool done, aborted, force_preflight, redirect_error, redirect_manual, same_origin, keepalive, no_cors, no_referrer;
     bool streaming, headers_delivered, host_accepted;
     /* P_WORKER streamed: a frame is in the child, its NJW_RESUME not yet taken (worker_resume). */
     bool worker_paused;
@@ -5615,7 +5615,8 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
     struct web_request r = {.id=p->id, .kind=kind, .url=p->url, .method=method, .headers=headers, .body=body, .body_len=len,
         .origin=p->origin?p->origin:web_effective_url(s->doc),
         .credentials=(kind == WEB_RESOURCE_FETCH || kind == WEB_RESOURCE_REPORT || p->kind==P_MODULE) ? p->credentials : kind == WEB_RESOURCE_MODULE ? 1 : 2,
-        .force_preflight=p->force_preflight, .redirect_error=p->redirect_error, .same_origin=p->same_origin,
+        .force_preflight=p->force_preflight, .redirect_error=p->redirect_error, .redirect_manual=p->redirect_manual,
+        .same_origin=p->same_origin,
         .no_cors=p->no_cors, .no_referrer=p->no_referrer,
         /* Fetch's default referrer is "client" (the document) under the
            document's policy; a report is sent with no referrer. */
@@ -5705,6 +5706,7 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request, int 
     p->worker = worker; p->worker_request = request; p->worker_kind = kind;
     p->credentials = credentials; p->cache_mode = cache_mode; p->same_origin = same_origin; p->destination = destination;
     p->redirect_error = (policy & NJW_LOAD_REDIRECT_ERROR) != 0; p->force_preflight = (policy & NJW_LOAD_PREFLIGHT) != 0;
+    p->redirect_manual = (policy & NJW_LOAD_REDIRECT_MANUAL) != 0;
     p->no_cors = (policy & NJW_LOAD_NO_CORS) != 0; p->no_referrer = (policy & NJW_LOAD_NO_REFERRER) != 0;
     p->keepalive = keepalive; p->streaming = streaming; p->referrer_policy = referrer_policy;
     bool blob = !strncasecmp(url,"blob:",5);
@@ -5761,7 +5763,7 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request, int 
         .url=p->url, .origin=web_effective_url(s->doc), .method=method,
         .headers=headers,.body=body,.body_len=body_len,
         .credentials=credentials, .same_origin=same_origin,
-        .force_preflight=p->force_preflight, .redirect_error=p->redirect_error,
+        .force_preflight=p->force_preflight, .redirect_error=p->redirect_error, .redirect_manual=p->redirect_manual,
         .no_cors=p->no_cors,
         .referrer=referrer,.referrer_policy=referrer_policy,
         .no_referrer=p->no_referrer,
@@ -6253,7 +6255,7 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     }
     int32_t credentials = 1, redirect = 0, cache_mode = WEBNET_CACHE_DEFAULT,referrer_policy=WEBNET_REFERRER_DEFAULT;
     if ((argc > 5 && (JS_ToInt32(ctx, &credentials, argv[5]) || credentials < 0 || credentials > 2)) ||
-        (argc > 7 && (JS_ToInt32(ctx, &redirect, argv[7]) || redirect < 0 || redirect > 1)) ||
+        (argc > 7 && (JS_ToInt32(ctx, &redirect, argv[7]) || redirect < 0 || redirect > 2)) ||
         (argc > 8 && (JS_ToInt32(ctx, &cache_mode, argv[8]) || cache_mode < WEBNET_CACHE_DEFAULT || cache_mode > WEBNET_CACHE_ONLY_IF_CACHED)) ||
         (argc > 14 && (JS_ToInt32(ctx,&referrer_policy,argv[14]) || referrer_policy<WEBNET_REFERRER_DEFAULT || referrer_policy>WEBNET_REFERRER_UNSAFE))) {
         result = JS_ThrowTypeError(ctx, "Invalid fetch policy"); goto out;
@@ -6301,7 +6303,8 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     p->keepalive = keepalive;
     p->cache_mode = cache_mode;
     p->same_origin = same_origin;
-    p->redirect_error = redirect == 1;
+    /* Fetch's redirect mode: 0 "follow", 1 "error", 2 "manual" (an opaque-redirect filtered response). */
+    p->redirect_error = redirect == 1; p->redirect_manual = redirect == 2;
     p->force_preflight = argc > 6 && JS_ToBool(ctx, argv[6]) > 0;
     p->no_cors = argc > 10 && JS_ToBool(ctx, argv[10]) > 0;
     p->no_referrer = argc > 11 && JS_ToBool(ctx, argv[11]) > 0;
@@ -7686,7 +7689,6 @@ static void streamed_response_metadata(struct js_pending *p, bool opaque) {
     p->streamed_opaque=opaque;
     minimized_content_type(headers,p->timing_type,sizeof p->timing_type);
 }
-static int fetch_transport_flags(const char *headers);
 /* Resource Timing's "convert fetch timestamp": zero stays zero, any other
    time is relative to the time origin, an uptime_ms value (the realm's
    s->now; 0 keeps monotonic times, for a Worker's own time origin). */
@@ -7764,8 +7766,8 @@ static JSValue report_timing(struct web_js_state *s, struct js_pending *p, uint6
         opaque_body=p->streamed_opaque || !p->headers_delivered;
         if(!opaque_body && exposed){status=p->streamed_status;memcpy(type,p->timing_type,sizeof type);}
     }else{
-        int flags=fetch_transport_flags(web_response_headers(&p->response));
-        opaque_body=failed || (flags>=0 && (flags&NJW_LOADED_OPAQUE));
+        int flags=njw_transport_flags(web_response_headers(&p->response));
+        opaque_body=failed || (flags>=0 && (flags&(NJW_LOADED_OPAQUE|NJW_LOADED_OPAQUE_REDIRECT)));
         if(!opaque_body && exposed){status=p->response.status;minimized_content_type(web_response_headers(&p->response),type,sizeof type);}
     }
     return timing_value(s,origin,t,p->started,!t->timing_allow_passed,opaque_body,status,type);
@@ -7827,23 +7829,11 @@ static void net_log_response(struct web_js_state *s, struct js_pending *p, const
              !p->aborted&&p->response.error[0]?p->response.error:"",hex);
     log_text(s,WEB_CONSOLE_TRACE,message);
 }
-static int fetch_transport_flags(const char *headers) {
-    /* The HTTP host writes this non-field line; server header fields cannot
-       forge it. Keep security decisions out of mutable author JS built-ins. */
-    const char *meta=headers?strstr(headers,"\r\nHTTP/Nocturne-Meta cors="):NULL;
-    unsigned cors=0,redirected=0,opaque=0;
-    if(!meta||sscanf(meta+2,"HTTP/Nocturne-Meta cors=%u redirected=%u opaque=%u",&cors,&redirected,&opaque)<2||cors>1||redirected>1||opaque>1)return -1;
-    return (cors?NJW_LOADED_CORS:0)|(redirected?NJW_LOADED_REDIRECTED:0)|(opaque?NJW_LOADED_OPAQUE:0);
-}
-/* What the transport noted of the response an opaque one hides (webfetch.c's resource=): 2, a URL of
-   another origin and nothing else known, when it noted nothing. Cache Storage's match checks it
-   against the matching realm's embedder policy (js_cache_storage.js). */
-static int fetch_resource_bits(const char *headers) {
-    const char *meta=headers?strstr(headers,"\r\nHTTP/Nocturne-Meta cors="):NULL;
-    const char *end=meta?strstr(meta+2,"\r\n"):NULL,*at=meta?strstr(meta+2," resource="):NULL;
-    unsigned bits=2;
-    if(at&&end&&at<end&&sscanf(at+10,"%u",&bits)==1&&bits<=7)return (int)bits;
-    return 2;
+/* What the transport noted of the response an opaque one hides (webfetch.c's resource=, in the
+   flags njw_transport_flags read). Cache Storage's match checks it against the matching realm's
+   embedder policy (js_cache_storage.js). */
+static int fetch_resource_bits(int flags) {
+    return (int)(((unsigned)flags & NJW_LOADED_RESOURCE) >> NJW_LOADED_RESOURCE_SHIFT);
 }
 /* Consume exactly one native stream frame in its own task. Metadata/chunks
    are owned by this pending request; no JS callback runs inside network pump. */
@@ -7853,22 +7843,23 @@ static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
     bool terminal = event == WEBNET_END || p->response.error[0] || p->aborted;
     JSValue value = JS_UNDEFINED;
     if (event == WEBNET_HEADERS && !terminal) {
-        int flags = fetch_transport_flags(web_response_headers(&p->response));
-        bool opaque = flags >= 0 && (flags & NJW_LOADED_OPAQUE);
-        if (flags < 0 || (opaque && !p->no_cors)) {
+        int flags = njw_transport_flags(web_response_headers(&p->response));
+        bool opaque = flags >= 0 && (flags & NJW_LOADED_OPAQUE), manual = flags >= 0 && (flags & NJW_LOADED_OPAQUE_REDIRECT);
+        if (flags < 0 || (opaque && !p->no_cors) || (manual && !p->redirect_manual)) {
             pending_error(p, "Native Fetch response contradicts its filtering policy"); terminal = true;
         } else {
             /* Same report as a buffered request: a streamed body hides an
                error status from the console until its reader is drained. */
-            if (!opaque && p->response.status >= 400) diagnostic_resource(s, p, "unsuccessful HTTP response");
-            streamed_response_metadata(p, opaque);
+            if (!opaque && !manual && p->response.status >= 400) diagnostic_resource(s, p, "unsuccessful HTTP response");
+            streamed_response_metadata(p, opaque || manual);
             if (s->host.net_log) net_log_response(s, p, "headers", 0);
-            JSValue args[] = {JS_NewInt32(s->ctx, opaque ? 0 : p->response.status),
+            /* An opaque-redirect filtered response: the redirect's URL, nothing else. */
+            JSValue args[] = {JS_NewInt32(s->ctx, opaque || manual ? 0 : p->response.status),
                 JS_NewString(s->ctx, opaque ? "" : web_response_url(&p->response)),
-                JS_NewString(s->ctx, opaque ? "" : web_response_headers(&p->response)), JS_UNDEFINED,
-                JS_NewArrayBufferCopy(s->ctx, NULL, 0), JS_NewBool(s->ctx, !opaque && (flags & NJW_LOADED_REDIRECTED)),
-                JS_UNDEFINED, JS_NewString(s->ctx, opaque ? "opaque" : (flags & NJW_LOADED_CORS) ? "cors" : "basic"),
-                opaque ? JS_NewInt32(s->ctx, fetch_resource_bits(web_response_headers(&p->response))) : JS_UNDEFINED};
+                JS_NewString(s->ctx, opaque || manual ? "" : web_response_headers(&p->response)), JS_UNDEFINED,
+                JS_NewArrayBufferCopy(s->ctx, NULL, 0), JS_NewBool(s->ctx, !opaque && !manual && (flags & NJW_LOADED_REDIRECTED)),
+                JS_UNDEFINED, JS_NewString(s->ctx, opaque ? "opaque" : manual ? "opaqueredirect" : (flags & NJW_LOADED_CORS) ? "cors" : "basic"),
+                opaque ? JS_NewInt32(s->ctx, fetch_resource_bits(flags)) : JS_UNDEFINED};
             bool valid = true; for (unsigned i = 0; i < 9; i++) if (JS_IsException(args[i])) valid = false;
             value = valid ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 9, args) : JS_EXCEPTION;
             for (unsigned i = 0; i < 9; i++) JS_FreeValue(s->ctx, args[i]);
@@ -7952,13 +7943,13 @@ static void worker_fetch_frame(struct web_js_state *s, struct js_pending *p) {
     int event = p->response.event;
     bool terminal = event == WEBNET_END || p->response.error[0] || p->aborted, queued = true, resume = false;
     if (event == WEBNET_HEADERS && !terminal) {
-        int flags = fetch_transport_flags(web_response_headers(&p->response));
-        bool opaque = flags >= 0 && (flags & NJW_LOADED_OPAQUE);
-        if (flags < 0 || (opaque && !p->no_cors)) {
+        int flags = njw_transport_flags(web_response_headers(&p->response));
+        bool opaque = flags >= 0 && (flags & NJW_LOADED_OPAQUE), manual = flags >= 0 && (flags & NJW_LOADED_OPAQUE_REDIRECT);
+        if (flags < 0 || (opaque && !p->no_cors) || (manual && !p->redirect_manual)) {
             pending_error(p, "Native Fetch response contradicts its filtering policy"); terminal = true;
         } else {
-            if (!opaque && p->response.status >= 400) diagnostic_resource(s, p, "unsuccessful HTTP response");
-            streamed_response_metadata(p, opaque);
+            if (!opaque && !manual && p->response.status >= 400) diagnostic_resource(s, p, "unsuccessful HTTP response");
+            streamed_response_metadata(p, opaque || manual);
             if (s->host.net_log) net_log_response(s, p, "headers", 0);
             const char *final = web_response_url(&p->response)[0] ? web_response_url(&p->response) : p->url;
             queued = web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_HEADERS, p->response.status,
@@ -8101,7 +8092,7 @@ static bool process_pending(struct web_js_state *s) {
             bool body=!p->aborted && !p->response.error[0] && p->response.body_len;
             /* Fetch's response tainting decides whether a canvas may read it:
                a no-cors image that left the document's origin is opaque. */
-            int transport=fetch_transport_flags(web_response_headers(&p->response));
+            int transport=njw_transport_flags(web_response_headers(&p->response));
             bool clean=transport>=0 && !(transport & NJW_LOADED_OPAQUE);
             web_image_loaded(s->doc, p->image, body ? p->response.body : NULL, body ? p->response.body_len : 0, clean);
         } else if (!s->disabled && p->kind == P_FETCH) {
@@ -8109,30 +8100,32 @@ static bool process_pending(struct web_js_state *s) {
             begin_task(s);
             JSValue value;
             bool success = !p->response.error[0];
-            int transport=fetch_transport_flags(web_response_headers(&p->response));
-            bool opaque=transport>=0&&(transport & NJW_LOADED_OPAQUE)!=0;
-            if(success&&((opaque&&!p->no_cors)||(p->no_cors&&transport<0))){
+            int transport=njw_transport_flags(web_response_headers(&p->response));
+            bool opaque=transport>=0&&(transport & NJW_LOADED_OPAQUE)!=0,manual=transport>=0&&(transport & NJW_LOADED_OPAQUE_REDIRECT)!=0;
+            if(success&&((opaque&&!p->no_cors)||(manual&&!p->redirect_manual)||(p->no_cors&&transport<0))){
                 pending_error(p,"Native Fetch response is missing or contradicts its filtering policy");success=false;
             }
             if (success) {
                 /* Transfer the already runtime-charged native snapshot. The
                    current QuickJS adopts external data only on success;
                    construction failure leaves pending_free as its owner. */
-                JSValue bytes = opaque?JS_NULL:JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body,
+                const bool hidden=opaque||manual;
+                JSValue bytes = hidden?JS_NULL:JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body,
                     p->response.body_len, fetch_body_free, NULL, false);
-                if (!opaque&&!JS_IsException(bytes)) p->response.body = NULL;
+                if (!hidden&&!JS_IsException(bytes)) p->response.body = NULL;
                 /* Response decodes bytes only when its consumer asks for text.
                    The old fourth argument was unused and eagerly expanded
                    every binary media fragment into a large JS string. */
                 bool redirected=transport>=0?(transport & NJW_LOADED_REDIRECTED)!=0:
                     web_response_url(&p->response)[0]&&strcmp(p->url,web_response_url(&p->response));
-                JSValue type=opaque?JS_NewString(s->ctx,"opaque"):transport<0?JS_UNDEFINED:
+                JSValue type=opaque?JS_NewString(s->ctx,"opaque"):manual?JS_NewString(s->ctx,"opaqueredirect"):transport<0?JS_UNDEFINED:
                     JS_NewString(s->ctx,(transport & NJW_LOADED_CORS)?"cors":"basic");
-                JSValue args[] = {JS_NewInt32(s->ctx,opaque?0:p->response.status),
+                /* An opaque-redirect filtered response: the redirect's URL, nothing else. */
+                JSValue args[] = {JS_NewInt32(s->ctx,hidden?0:p->response.status),
                     JS_NewString(s->ctx,opaque?"":web_response_url(&p->response)[0]?web_response_url(&p->response):p->url),
-                    JS_NewString(s->ctx,opaque?"":web_response_headers(&p->response)),JS_UNDEFINED,bytes,
-                    JS_NewBool(s->ctx,!opaque&&redirected),JS_UNDEFINED,type,
-                    opaque?JS_NewInt32(s->ctx,fetch_resource_bits(web_response_headers(&p->response))):JS_UNDEFINED};
+                    JS_NewString(s->ctx,hidden?"":web_response_headers(&p->response)),JS_UNDEFINED,bytes,
+                    JS_NewBool(s->ctx,!hidden&&redirected),JS_UNDEFINED,type,
+                    opaque?JS_NewInt32(s->ctx,fetch_resource_bits(transport)):JS_UNDEFINED};
                 bool valid_args = true;
                 for (int i = 0; i < 9; ++i) if (JS_IsException(args[i])) valid_args = false;
                 value = valid_args ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 9, args) : JS_EXCEPTION;
