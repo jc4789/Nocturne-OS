@@ -435,6 +435,20 @@ static void worker_csp_report(void *opaque,const struct html_csp_violation *viol
     v->rule=violation->policy&&!violation->policy->from_meta?violation->policy:NULL;
     if(w->last_violation)w->last_violation->next=v;else w->violations=v;w->last_violation=v;
 }
+/* CSP3 §4.1.1 and §4.1.2 for a request the WorkerGlobalScope makes: the
+   worker's own CSP list decides (its creator's only fetched the worker's
+   script). url is the request's current URL, original its URL; redirects 1
+   for the URL a redirect reached, whose path is then not matched. */
+static bool worker_csp_allowed(struct worker *w,const char *url,const char *original,int destination,unsigned redirects){
+    if(!w->policy_initialized)return true;
+    struct html_csp_request r={.url=url,.original_url=original,.destination=destination,.redirect_count=redirects};
+    return html_policy_request_allowed(&w->policy_doc,&r,worker_csp_report,w);
+}
+/* Whether two URL serializations differ apart from their fragments. */
+static bool worker_url_moved(const char *a,const char *b){
+    size_t an=strcspn(a,"#"),bn=strcspn(b,"#");
+    return an!=bn || strncmp(a,b,an);
+}
 static JSValue worker_code_check(JSContext *ctx,JSValueConst value,int kind,int argc,JSValueConst *argv,void *opaque){
     struct worker *w=opaque;
     if(!html_policy_requires_script(&w->policy_doc) && (kind==JS_DYNAMIC_FUNCTION || !JS_IsObject(value)))
@@ -544,6 +558,19 @@ static JSValue native_request(JSContext *ctx,JSValueConst thisv,int argc,JSValue
         int on=JS_ToBool(ctx,value);JS_FreeValue(ctx,value);if(on<0)return JS_EXCEPTION;if(on)kind|=modes[i].flag;
     }
     if(argc>1){int on=JS_ToBool(ctx,argv[1]);if(on<0)return JS_EXCEPTION;if(on)kind|=NJW_LOAD_STREAM;}
+    /* Fetch's main fetch step 7 against the worker's CSP list: a blocked
+       request is a network error (the fetch rejects with a TypeError). */
+    {
+        JSValue address=JS_GetPropertyStr(ctx,argv[0],"url"),target=JS_GetPropertyStr(ctx,argv[0],"destination");
+        const char *url=JS_IsString(address)?JS_ToCString(ctx,address):NULL,*name=JS_IsString(target)?JS_ToCString(ctx,target):NULL;
+        JS_FreeValue(ctx,address);JS_FreeValue(ctx,target);
+        int destination=WEBNET_DEST_EMPTY;
+        for(int i=0;name&&i<WEBNET_DEST_COUNT;i++)if(!strcmp(webnet_destination_name((enum webnet_destination)i),name)){destination=i;break;}
+        bool allowed=!url||worker_csp_allowed(w,url,url,destination,0);
+        JS_FreeCString(ctx,url);JS_FreeCString(ctx,name);
+        if(JS_HasException(ctx))return JS_EXCEPTION;
+        if(!allowed)return JS_ThrowTypeError(ctx,"Blocked by Content Security Policy");
+    }
     static const struct {const char *name;int32_t max;unsigned shift;} numbers[]={{"credentials",2,NJW_LOAD_CREDENTIALS_SHIFT},{"cache",5,NJW_LOAD_CACHE_SHIFT}};
     for(unsigned i=0;i<2;i++){
         JSValue value=JS_GetPropertyStr(ctx,argv[0],numbers[i].name);if(JS_IsException(value))return value;
@@ -596,8 +623,8 @@ static JSValue native_cancel(JSContext *ctx,JSValueConst thisv,int argc,JSValueC
     return JS_UNDEFINED;
 }
 static JSValue native_referrer_policy(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){(void)self;(void)argc;(void)argv;return JS_NewInt32(ctx,state(ctx)->policy_doc.referrer_policy);}
-static JSValue native_import(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
-    (void)thisv;struct worker *w=state(ctx);if(!argc)return JS_ThrowTypeError(ctx,"URL required");if(w->request==UINT32_MAX)return JS_ThrowRangeError(ctx,"Worker request identifier space exhausted");uint32_t id=++w->request;if(!send_value(w,NJW_LOAD,id,1,argv[0]))return JS_ThrowTypeError(ctx,"Worker import IPC failed");
+static JSValue import_load(JSContext *ctx,JSValueConst url){
+    struct worker *w=state(ctx);if(w->request==UINT32_MAX)return JS_ThrowRangeError(ctx,"Worker request identifier space exhausted");uint32_t id=++w->request;if(!send_value(w,NJW_LOAD,id,1,url))return JS_ThrowTypeError(ctx,"Worker import IPC failed");
     uint64_t wait_start=n_clock_uptime_ms(),deadline=wait_start+WEBNET_TIMEOUT_MS;
     while(!w->closed){uint64_t now=n_clock_uptime_ms();if(now>=deadline){send_value(w,NJW_CANCEL,id,0,JS_NULL);return JS_ThrowTypeError(ctx,"Worker import deadline exceeded");}uint64_t left=deadline-now;int timeout=left>(uint64_t)INT_MAX?INT_MAX:(int)left;struct deferred*d=NULL;
         if(w->shared){
@@ -610,6 +637,34 @@ static JSValue native_import(JSContext *ctx,JSValueConst thisv,int argc,JSValueC
         if(d->h.op==NJW_LOADED&&d->h.request==id){if(w->until!=UINT64_MAX)w->until+=n_clock_uptime_ms()-wait_start;JSValue result=JS_ReadObject(ctx,d->data,d->h.bytes,JS_READ_OBJ_REFERENCE);deferred_free(d);return result;}
         if(d->h.bytes>SIZE_MAX-w->queued){deferred_free(d);return JS_ThrowRangeError(ctx,"Worker deferred message accounting overflow");}w->queued+=d->h.bytes;if(w->tail)w->tail->next=d;else w->head=d;w->tail=d;
     }return JS_ThrowTypeError(ctx,"Worker closed");
+}
+/* What importScripts reads for a network error: no status, the URL, the reason. */
+static JSValue import_blocked(JSContext *ctx,const char *url){
+    JSValue r=JS_NewArray(ctx);if(JS_IsException(r))return r;
+    if(JS_DefinePropertyValueUint32(ctx,r,0,JS_NewInt32(ctx,0),JS_PROP_C_W_E)<0||
+       JS_DefinePropertyValueUint32(ctx,r,1,JS_NewString(ctx,url),JS_PROP_C_W_E)<0||
+       JS_DefinePropertyValueUint32(ctx,r,4,JS_NewString(ctx,"Blocked by Content Security Policy"),JS_PROP_C_W_E)<0){
+        JS_FreeValue(ctx,r);return JS_EXCEPTION;
+    }
+    return r;
+}
+/* importScripts' fetch (destination "script"): the worker's CSP list before
+   the request and, for the URL a redirect reached, after it. A blocked fetch
+   is a network error, which importScripts throws as a NetworkError. */
+static JSValue native_import(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
+    (void)thisv;struct worker *w=state(ctx);if(!argc)return JS_ThrowTypeError(ctx,"URL required");
+    const char *url=JS_ToCString(ctx,argv[0]);if(!url)return JS_EXCEPTION;
+    JSValue result=worker_csp_allowed(w,url,url,WEBNET_DEST_SCRIPT,0)?import_load(ctx,argv[0]):import_blocked(ctx,url);
+    if(JS_IsObject(result)){
+        JSValue final=JS_GetPropertyUint32(ctx,result,1);
+        const char *reached=JS_IsString(final)?JS_ToCString(ctx,final):NULL;JS_FreeValue(ctx,final);
+        if(!reached&&JS_HasException(ctx)){JS_FreeValue(ctx,result);result=JS_EXCEPTION;}
+        else if(reached&&*reached&&worker_url_moved(url,reached)&&!worker_csp_allowed(w,reached,url,WEBNET_DEST_SCRIPT,1)){
+            JS_FreeValue(ctx,result);result=import_blocked(ctx,url);
+        }
+        JS_FreeCString(ctx,reached);
+    }
+    JS_FreeCString(ctx,url);return result;
 }
 static int interrupt(JSRuntime *rt,void *opaque){
     (void)rt;struct worker*w=opaque;if(w->closed)return 1;

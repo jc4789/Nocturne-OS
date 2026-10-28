@@ -55,6 +55,7 @@ struct pending {
     double order;
     char *media; /* the <link media> the sheet is wrapped in, or NULL */
     node_t *scope; /* stylesheet owner shadow root, NULL for document */
+    node_t *owner; /* the link element that asked, NULL for an @import */
 };
 
 /* Immutable inline ASTs survive resource snapshots. Each cascade instance
@@ -403,13 +404,42 @@ static char *doc_absolute_url(web_doc *d,const char *relative) {
 /* HTML's "set the frozen base URL": href against the fallback base URL with
    the document's character encoding; failure, a data: or a javascript: URL
    leaves the fallback. */
-static void doc_frozen_base(web_doc *d,const char *href) {
-    const char *fallback=web_effective_url(d);
+/* CSP: an element's check, once for each new text (webi.h's csp_checked). */
+static bool element_csp_checked(node_t *n,const char *text,size_t length,bool *allowed) {
+    uint64_t hash=sheet_hash(text,length);
+    if(n->csp_checked && n->csp_checked_hash==hash && n->csp_checked_length==length){*allowed=n->csp_checked==1;return true;}
+    n->csp_checked_hash=hash;n->csp_checked_length=length;n->csp_checked=0;return false;
+}
+static bool element_csp_answer(node_t *n,bool allowed){n->csp_checked=allowed?1:2;return allowed;}
+static bool document_has_csp(const web_doc *d){return d->html_policy && d->html_policy->first;}
+/* HTML "set the frozen base URL": a URL that cannot be parsed, or that CSP's
+   "Is base allowed for Document?" blocks, leaves the fallback base URL. */
+static void doc_frozen_base(web_doc *d,node_t *base) {
+    const char *fallback=web_effective_url(d),*href=node_attr(base,"href");
     char *url=NULL;
-    if(web_url_resolve(fallback,href,doc_url_encoding(d),&url)!=1 ||
+    if(web_url_resolve(fallback,href?href:"",doc_url_encoding(d),&url)!=1 ||
        !strncmp(url,"data:",5) || !strncmp(url,"javascript:",11)){free(url);url=NULL;}
+    if(url && document_has_csp(d)){
+        bool allowed;
+        if(!element_csp_checked(base,url,strlen(url),&allowed))
+            allowed=element_csp_answer(base,web_js_csp_base_allowed(d,base,url));
+        if(!allowed){free(url);url=NULL;}
+    }
     if(!doc_set_base(d,url?url:fallback))web_js_console(d,2,"Document base URL allocation failed");
     free(url);
+}
+bool doc_style_csp_allowed(web_doc *d,node_t *n,const char *text,size_t length) {
+    if(!d || !n || !document_has_csp(d))return true;
+    sbuf b={0};
+    if(!text){
+        text_of(n,&b); /* the child text content */
+        if(!sb_cstr(&b))return false; /* no memory to read it: blocked */
+        text=b.p;length=b.n;
+    }
+    bool allowed;
+    if(!element_csp_checked(n,text,length,&allowed))
+        allowed=element_csp_answer(n,web_js_csp_style_allowed(d,n,text,length));
+    sb_free(&b);return allowed;
 }
 static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int preferred,bool image_upgrade,int cors,int referrer_policy) {
     if (preferred >= 0 && preferred < d->images.n) {
@@ -647,7 +677,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             if (scope) break;
             const char *h = node_attr(c, "href");
             if (h && !d->base_seen) { /* only the first <base> counts */
-                doc_frozen_base(d,h);
+                doc_frozen_base(d,c);
                 d->base_seen = true;
             }
             break;
@@ -741,6 +771,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             pd->order = d->next_sheet_order++;
             pd->media = media && *media ? strdup(media) : NULL;
             pd->scope = scope;
+            pd->owner = c;
             if (!strncasecmp(abs, "data:", 5)) {
                 size_t dn;
                 char *css = data_url(d,abs,&dn,NULL);
@@ -777,7 +808,11 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
                 else if (error==CSSOM_OOM) web_js_console(d,2,"Native style sheet allocation failed");
             } else {
                 sbuf b = {0}; text_of(c,&b);
-                add_sheet(d,b.p ? b.p : "",b.n,d->base,d->next_sheet_order++,media,scope); sb_free(&b);
+                /* HTML "update a style block": CSP's inline check for the
+                   child text (cssom_style_sheet makes it for a CSSOM sheet). */
+                if (doc_style_csp_allowed(d,c,b.p ? b.p : "",b.n))
+                    add_sheet(d,b.p ? b.p : "",b.n,d->base,d->next_sheet_order++,media,scope);
+                sb_free(&b);
             }
             break;
         }
@@ -1108,7 +1143,7 @@ void doc_sync_tree(web_doc *d) {
     node_t *base = first_base(d, d->root, &profile->metadata_visits);
     if (d->native_cancelled) return; /* never publish a cancelled partial tree */
     d->html=html;d->head=head;d->body=body;
-    if (base) doc_frozen_base(d,node_attr(base,"href"));
+    if (base) doc_frozen_base(d,base);
     else if (!doc_set_base(d,web_effective_url(d))) web_js_console(d,2,"Document base URL allocation failed");
     d->metadata_revision=d->dom_revision;d->metadata_valid=true;
     if (d->profile_enabled) profile->metadata_ms += uptime_ms() - start;
@@ -1214,7 +1249,8 @@ static struct cached_css *css_resource(web_doc *d,const char *url) {
     }
     return c;
 }
-struct cached_css *doc_css_request_next(web_doc *d,size_t *cursor) {
+struct cached_css *doc_css_request_next(web_doc *d,size_t *cursor,node_t **element) {
+    if(element)*element=NULL;
     if(!d || !cursor || !d->live)return NULL;
     while(*cursor<(size_t)d->pending_css.n) {
         struct pending *pending=d->pending_css.v[(*cursor)++];
@@ -1224,7 +1260,7 @@ struct cached_css *doc_css_request_next(web_doc *d,size_t *cursor) {
             web_js_console(d,2,"Stylesheet request identity allocation failed in the OS allocator");
             return NULL;
         }
-        if(!c->done&&!c->loading_id)return c;
+        if(!c->done&&!c->loading_id){if(element)*element=pending->owner;return c;}
     }
     return NULL;
 }

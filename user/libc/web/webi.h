@@ -268,6 +268,11 @@ typedef struct node {
     uint64_t js_image_generation;
     bool style_disabled; /* stylesheet state, not the HTML disabled attribute */
     bool style_disabled_set; /* link IDL/CSSOM override of its initial disabled attribute */
+    /* CSP: what this element's last check judged (a style element's child
+       text, a base element's URL), as a hash and length, and the answer:
+       0 none yet, 1 allowed, 2 blocked. A check runs (and reports) once for
+       each new text, not on every resource scan. */
+    uint64_t csp_checked_hash; size_t csp_checked_length; uint8_t csp_checked;
     struct cssom_sheet *cssom_sheets, *cssom_current; /* native owner/source/AST, allocation-owned */
     uint32_t cssom_serial;
     struct cssom_sheet **adopted_sheets;
@@ -1940,7 +1945,17 @@ void doc_sync_tree(web_doc *d);
 node_t *doc_image_node_next(web_doc *d, node_t *previous);
 void doc_image_node_owned(node_t *n); /* at element creation, once its tag is known */
 void doc_image_sync(web_doc *d, node_t *n);
-struct cached_css *doc_css_request_next(web_doc *d, size_t *cursor);
+/* The next stylesheet to request, and the link element that asked for it
+   (NULL for an @import), whose nonce the request carries. */
+struct cached_css *doc_css_request_next(web_doc *d, size_t *cursor, node_t **element);
+/* HTML "update a style block": whether CSP allows a style element's child
+   text (text NULL: read it from the element). The check runs and reports
+   once for each new text. */
+bool doc_style_csp_allowed(web_doc *d, node_t *style, const char *text, size_t length);
+/* CSP checks for elements of d, reported through d's realm (without one,
+   still decided): a style element's inline text, and Is base allowed. */
+bool web_js_csp_style_allowed(web_doc *d, node_t *style, const char *text, size_t length);
+bool web_js_csp_base_allowed(web_doc *d, node_t *base, const char *url);
 void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const char *css, size_t n);
 bool doc_link_load_current(web_doc *d, node_t *n, uint64_t generation);
 bool web_js_stylesheet_event(web_doc *d, node_t *n, bool failed);

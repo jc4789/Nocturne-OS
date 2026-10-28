@@ -125,6 +125,7 @@ struct js_pending {
     char *url,*origin,*integrity,*referrer;
     char *nonce; /* CSP: the request's cryptographic nonce metadata */
     bool parser_inserted; /* CSP: the request's parser metadata */
+    node_t *element; /* CSP: P_CSS, the link element a violation targets */
     bool done, aborted, force_preflight, redirect_error, same_origin, keepalive, no_cors, no_referrer;
     bool streaming, headers_delivered, host_accepted;
     /* P_WORKER streamed: a frame is in the child, its NJW_RESUME not yet taken (worker_resume). */
@@ -8227,8 +8228,8 @@ static void request_styles(struct web_js_state *s) {
     if (!s->ctx) return;
     if (s->doc->resources_dirty) doc_rescan(s->doc);
     size_t cursor=0;uint64_t generation=s->stream_generation;
-    struct cached_css *css;
-    while((css=doc_css_request_next(s->doc,&cursor))) {
+    struct cached_css *css;node_t *owner;
+    while((css=doc_css_request_next(s->doc,&cursor,&owner))) {
         if((cursor&31)==0&&!web_native_checkpoint(s->doc))return;
         struct js_pending *p=pending_new(s,P_CSS,css->url);
         if(!p) {
@@ -8240,6 +8241,11 @@ static void request_styles(struct web_js_state *s) {
            before dispatch (even a synchronous host completion) so neither a
            duplicate link/import nor the next tick sends the same request. */
         p->css=css;css->loading_id=p->id;
+        /* HTML link: the request's cryptographic nonce metadata is the
+           element's nonce (no memory to copy it: the request has none). */
+        const char *nonce=owner?node_attr(owner,"nonce"):NULL;
+        p->element=owner;
+        if(nonce&&*nonce&&!(p->nonce=js_strdup(s->ctx,nonce)))JS_FreeValue(s->ctx,JS_GetException(s->ctx));
         send_request(s,p,WEB_RESOURCE_CSS,"GET",NULL,NULL,0);
         if(s->stream_generation!=generation)return;
     }
