@@ -32,6 +32,7 @@ const failures=[],check=(name,yes)=>{checks++;if(!yes)failures.push(name);};
 /* A scenario that throws or never settles counts as one failed check. */
 async function scenario(name,fn){let timer;try{await Promise.race([fn(),new Promise((_,bad)=>{timer=setTimeout(()=>bad(new Error('timed out')),3000);})]);}catch(e){checks++;failures.push(name+': '+(e?.message||e));}finally{clearTimeout(timer);}}
 const thrown=fn=>{try{fn();return 'none';}catch(e){return e?.name;}},same=(list,want)=>JSON.stringify(Array.from(list))===JSON.stringify(want);
+const attempt=fn=>{try{return fn();}catch(e){return 'threw '+e?.name;}};
 const listed=fn=>{try{return Array.from(fn());}catch(e){return 'threw '+e?.name;}},close=db=>{if(typeof db?.close==='function')db.close();};
 /* WPT IndexedDB/resources/support-promises.js: migrateNamedDatabase and createBooksStore. An
    aborted upgrade answers with the open request's error. */
@@ -183,6 +184,56 @@ async function schemaOwners(){
         check('createIndex and index() give the one index handle; objectStore is its store handle (idbindex-objectStore-SameObject)',seen.created&&store.index('index')===index&&index.objectStore===store);
         check('keyPath is the same object each time (idbobjectstore_keyPath, idbindex_keyPath)',Array.isArray(store.keyPath)&&store.keyPath===store.keyPath&&index.keyPath===index.keyPath);
         check('rename outside an upgrade throws InvalidStateError (idbindex-rename-errors, idbobjectstore-rename-errors)',thrown(()=>{index.name='x';})==='InvalidStateError'&&thrown(()=>{store.name='x';})==='InvalidStateError');
+        db.close();
+    });
+    /* WebIDL argument conversion and the valid key path definition (IndexedDB 2.5): the keyPath of
+       createIndex is (DOMString or sequence<DOMString>), so null is "null" and an iterable a
+       sequence; the empty list is not a valid key path. */
+    await scenario('key path conversion and validity',async()=>{
+        const seen={};
+        const db=await migrate('keypaths',1,db=>{
+            seen.storeEmpty=thrown(()=>db.createObjectStore('empty',{keyPath:run('[]')}));
+            const store=db.createObjectStore('s');
+            seen.indexEmpty=thrown(()=>store.createIndex('empty',run('[]')));
+            seen.nullPath=attempt(()=>store.createIndex('null',null).keyPath);
+            seen.setPath=attempt(()=>Array.from(store.createIndex('set',run('new Set(["a","b"])')).keyPath));
+            seen.stringObject=thrown(()=>store.createIndex('bad',run('({toString(){return "3m"}})')));
+            seen.storeNull=db.createObjectStore('plain',{keyPath:null}).keyPath;
+            seen.options=thrown(()=>store.createIndex('opt','x',5));
+            store.put(run('({null:"n"})'),1);
+        });
+        check('an empty list is not a valid key path (keypath_invalid: [])',seen.storeEmpty==='SyntaxError'&&seen.indexEmpty==='SyntaxError');
+        check('createIndex(name, null) is the key path "null" (WebIDL union conversion)',seen.nullPath==='null');
+        check('an iterable key path is a sequence of strings; another object its string',same(seen.setPath,['a','b'])&&seen.stringObject==='SyntaxError');
+        check('IDBObjectStoreParameters keyPath null is no key path',seen.storeNull===null);
+        check('an options argument that is not an object is a TypeError (WebIDL dictionary)',seen.options==='TypeError');
+        check('the "null" index finds by the property null',seen.nullPath==='null'&&(await request(db.transaction('s').objectStore('s').index('null').getKey('n')))===1);
+        close(db);
+    });
+    /* IDBTransaction.commit(): "If this's state is not active, throw InvalidStateError". */
+    await scenario('commit outside the active state',async()=>{
+        (await migrate('commits',1,db=>db.createObjectStore('s'))).close();
+        const db=await request(idb().open('commits'));
+        let tx=db.transaction('s','readwrite');tx.abort();const aborted=thrown(()=>tx.commit());
+        tx=db.transaction('s','readwrite');tx.commit();const twice=thrown(()=>tx.commit());await new Promise(ok=>tx.oncomplete=ok);
+        const finished=thrown(()=>tx.commit());
+        tx=db.transaction('s','readwrite');await new Promise(ok=>setTimeout(ok,0));const inactive=thrown(()=>tx.commit());await new Promise(ok=>tx.oncomplete=ok);
+        check('commit() on an aborted, committing, finished or inactive transaction throws InvalidStateError (idb-explicit-commit)',same([aborted,twice,finished,inactive],['InvalidStateError','InvalidStateError','InvalidStateError','InvalidStateError']));
+        db.close();
+    });
+    /* IDBCursor update() and delete() run "asynchronously execute a request" with the cursor. */
+    await scenario('cursor requests',async()=>{
+        (await migrate('cursor-source',1,db=>{const store=db.createObjectStore('store',{keyPath:'id'});store.createIndex('index','value');for(const [id,v] of [[1,'z'],[2,'y']])store.put(run(`({id:${id},value:"${v}"})`));})).close();
+        const db=await request(idb().open('cursor-source'));
+        const tx=db.transaction('store','readwrite'),seen=[],missing=[];let reads=0;
+        for(const source of [tx.objectStore('store'),tx.objectStore('store').index('index')])await new Promise(ok=>{const r=source.openCursor();r.onsuccess=()=>{const cursor=r.result;
+            const value=run('((counter,id)=>{const v={value:"w"};Object.defineProperty(v,"id",{enumerable:true,get(){counter();return id;}});return v;})')(()=>reads++,cursor.primaryKey);
+            missing.push(thrown(()=>cursor.update()));
+            const update=cursor.update(value),remove=cursor.delete();seen.push(update.source===cursor&&remove.source===cursor);remove.onsuccess=ok;};});
+        await new Promise(ok=>tx.oncomplete=ok);
+        check('the source of a cursor update() or delete() request is the cursor (idbcursor-request-source)',same(seen,[true,true]));
+        check('cursor update() reads the value once, into its clone (clone-before-keypath-eval)',reads===2);
+        check('cursor update() without its value argument is a TypeError (idbcursor_update_*: No argument)',same(missing,['TypeError','TypeError']));
         db.close();
     });
     await scenario('stored schema without ids',async()=>{
