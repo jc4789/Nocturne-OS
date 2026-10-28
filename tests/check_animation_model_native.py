@@ -332,6 +332,17 @@ int main(void){
                   k->v[1].offset==1 && k->v[1].composite==WA_COMPOSITE_AUTO);
         }
     }
+    /* the keyframe's step easing takes the effect's before flag (effect-value-step-easing-reversed-
+       direction.html, jump-start-animation-before-phase.html): the left limit in the before phase going
+       forwards and in the after phase going backwards, the right limit in the before phase reversed */
+    static const struct {const char *text;double want;} limits[]={
+        {"rise 100s steps(1, start) 50s backwards",0.1},{"rise 100s steps(1, start) -150s reverse forwards",0.1},
+        {"rise 100s steps(1, start) 50s reverse backwards",0.2}};
+    for(size_t i=0;i<sizeof limits/sizeof *limits;i++){
+        style_t limit=styled_on(&faint,"animation",limits[i].text);
+        s=site(&limit);web_motion_animations(&s);
+        CHECK(ra && sample(&limit,false)==1 && fabs(strtod(sampled("opacity"),NULL)-limits[i].want)<0.005);
+    }
     /* the computed value follows the element's style */
     style_t brighter=styled("opacity","0.15");
     style_t rise=styled_on(&brighter,"animation","rise 100s linear -50s");

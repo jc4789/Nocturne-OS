@@ -140,7 +140,9 @@ int web_animation_play_state(const struct web_animation *a);
 bool web_animation_relevant(const struct web_animation *a);
 double web_effect_end(const struct web_timing *t);
 double web_effect_active_duration(const struct web_timing *t);
-struct web_effect_progress { double local, active, progress, iteration; int phase; };
+/* before: the before flag of "calculating the transformed progress", which the step easing functions
+   take, for the effect's easing and its keyframes' */
+struct web_effect_progress { double local, active, progress, iteration; int phase; bool before; };
 void web_effect_compute(const struct web_effect *e, struct web_effect_progress *out);
 struct web_animation *web_animation_by_id(web_doc *d, uint32_t id);
 struct web_effect *web_effect_by_id(web_doc *d, uint32_t id);

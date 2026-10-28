@@ -74,7 +74,7 @@ static web_doc *new_document(void) {
     if (!doc) return NULL;
     doc->url = strdup(BASE);
     if (!doc->url) { check("URL 割り当て", false); web_free(doc); return NULL; }
-    snprintf(doc->base, sizeof doc->base, "%s", BASE);
+    if (!doc_set_base(doc, BASE)) { check("base 割り当て", false); web_free(doc); return NULL; }
     return doc;
 }
 static web_doc *parse_document(const char *html) {

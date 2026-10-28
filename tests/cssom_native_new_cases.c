@@ -6,7 +6,7 @@ static struct css_rule_info *rule(struct cssom_sheet*s,unsigned i){struct css_ru
 static void clear_document(web_doc*d){css_styling_free(&d->sty);ar_free(&d->cssmem);for(int i=0;i<d->pending_css.n;i++){struct pending*p=d->pending_css.v[i];free(p->url);free(p->media);free(p);}pv_free(&d->pending_css);}
 int main(void){
     node_t root={.type=N_DOC},style={.type=N_ELEM,.tag=T_style,.parent=&root},text={.type=N_TEXT,.parent=&style,.text=".first{color:red}",.textlen=17};
-    web_doc d={.live=true,.root=&root};style.owner=root.owner=text.owner=&d;style.first=style.last=&text;root.first=root.last=&style;strcpy(d.base,"https://cssom.test/index.html");
+    web_doc d={.live=true,.root=&root};style.owner=root.owner=text.owner=&d;style.first=style.last=&text;root.first=root.last=&style;doc_set_base(&d,"https://cssom.test/index.html");
     int error;struct cssom_sheet*s=cssom_style_sheet(&d,&style,&error);
     CHECK(s&&error==CSSOM_OK&&count(s)==1&&s->owner==&style&&s->document==&d);
     CHECK(cssom_style_sheet(&d,&style,&error)==s&&style.cssom_serial==1);
@@ -45,7 +45,7 @@ int main(void){
     CHECK(parser&&parser!=fresh&&!fresh->associated&&!strcmp(parser->source,text.text));
     cssom_style_lifecycle(&style);CHECK(!parser->associated&&!style.cssom_current);
     struct cssom_sheet*reinsert=cssom_style_sheet(&d,&style,&error);CHECK(reinsert&&reinsert!=parser&&count(reinsert)==1);
-    web_doc second={.live=true,.root=&root};strcpy(second.base,"https://second.test/");style.owner=&second;
+    web_doc second={.live=true,.root=&root};doc_set_base(&second,"https://second.test/");style.owner=&second;
     cssom_style_lifecycle(&style);struct cssom_sheet*adopted=cssom_style_sheet(&second,&style,&error);
     CHECK(adopted&&adopted->document==&second&&adopted->id!=reinsert->id);
     style.owner=&d;cssom_style_lifecycle(&style);text.text="@import 'child.css';@media screen{.inside{width:2px}}.after{width:3px}";text.textlen=strlen(text.text);d.dom_revision++;
