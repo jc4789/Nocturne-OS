@@ -106,6 +106,14 @@ n_result win_direct(window_t *win, bool wanted) {
 n_result win_frame(window_t *win) {
     return win && !win->closed ? __syscall(SYS_WIN_FRAME, win->handle, 0, 0, 0, 0) : -N_ERR_NO_HANDLE;
 }
+n_result win_pointer(window_t *win, const struct n_win_pointer *pointer) {
+    if (!win || win->closed) return -N_ERR_NO_HANDLE;
+    return __syscall(SYS_WIN_POINTER, win->handle, (uint64_t)(uintptr_t)pointer, sizeof *pointer, 0, 0);
+}
+n_result win_pointer_shape(window_t *win, uint32_t shape) {
+    struct n_win_pointer pointer = {.shape = shape};
+    return win_pointer(win, &pointer);
+}
 
 /* One system call takes every queued event that fits, waiting up to timeout. */
 static n_result fetch(window_t *win, int timeout) {

@@ -1760,7 +1760,7 @@ static void spec_put(sbuf *b, const struct css_color_value *v) {
 }
 
 /* ---------------------------------------------------------------- the cascade's entry points */
-static bool scheme_dark(const style_t *s) { return s && (s->color_scheme & CSS_SCHEME_DARK) && !(s->color_scheme & CSS_SCHEME_LIGHT); }
+bool css_style_dark(const style_t *s) { return s && (s->color_scheme & CSS_SCHEME_DARK) && !(s->color_scheme & CSS_SCHEME_LIGHT); }
 /* the computed colour of slot k: *exact the absolute value, or a tree that names currentcolor */
 static const struct css_color_value *slot_get(const style_t *s, int k) {
     if (k < CSS_SLOT_INHERITED) return s->color_inherited ? s->color_inherited[k] : NULL;
@@ -1860,7 +1860,7 @@ bool css_style_set_color(style_t *st, enum css_color_slot k, const struct css_co
     return true;
 }
 static struct cenv style_env(struct cx *cx) {
-    struct cenv E = {.cx = cx, .dark = scheme_dark(cx->s), .a = cx->a};
+    struct cenv E = {.cx = cx, .dark = css_style_dark(cx->s), .a = cx->a};
     return E;
 }
 bool css_color_value_compute(const char *s, size_t n, struct cx *cx, const struct css_color *current, uint32_t *argb,
@@ -1889,7 +1889,7 @@ bool css_color_apply(const char *s, size_t n, struct cx *cx, enum css_color_slot
     const struct css_color *current = NULL;
     if (k == CSS_SLOT_COLOR) {
         /* currentcolor in color is the inherited value; the root's is the initial CanvasText */
-        parent_color = cx->parent ? style_current(cx->parent) : system_color(SYS_CANVASTEXT, scheme_dark(st));
+        parent_color = cx->parent ? style_current(cx->parent) : system_color(SYS_CANVASTEXT, css_style_dark(st));
         current = &parent_color;
     }
     uint32_t argb;
@@ -1996,7 +1996,7 @@ static bool use_used(const struct css_color_value *v, void *context) {
     struct used_request *r = context;
     const style_t *st = r->element && needs_element(v) ? r->element(r->context) : NULL;
     struct css_color current = st ? style_current(st) : css_color_from_argb(0xFF000000u);
-    struct cenv E = {.current = &current, .dark = scheme_dark(st)};
+    struct cenv E = {.current = &current, .dark = css_style_dark(st)};
     const struct css_color_value *tree;
     return cv_compute(v, &E, r->out, &tree) && !tree;
 }

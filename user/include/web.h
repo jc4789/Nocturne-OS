@@ -497,6 +497,20 @@ struct web_hit {
     web_node *node;   /* the form control or link element */
 };
 bool web_hit_test(web_doc *d, int x, int y, struct web_hit *hit);
+/* CSS Basic User Interface 4 §5.1: the pointer the page shows at (x, y), the point web_hit_test takes
+   (a frame's document's inside it): the cursor of what is there, auto being the text beam over text
+   that can be selected and over editable fields and the arrow elsewhere. When an image of its list
+   has loaded and the native pointer can show it (at most N_POINTER_IMAGE_MAX each way at 1 dppx), the
+   first such image with its hot spot; shape is the keyword after the list. pending: an image before
+   the one given is still loading, so the answer may change once it has. false: nothing can be said
+   now (the document is busy), out unchanged. */
+struct web_cursor {
+    uint32_t shape;                  /* N_POINTER_* */
+    int width, height, hot_x, hot_y; /* the image, 0 when none */
+    uint32_t pixels[N_POINTER_IMAGE_MAX * N_POINTER_IMAGE_MAX]; /* rows of width, 0xAARRGGBB not premultiplied */
+    bool pending;
+};
+bool web_cursor_at(web_doc *d, int x, int y, struct web_cursor *out);
 int web_anchor_y(web_doc *d, const char *fragment); /* y of the element with that id/name, or -1 */
 
 /* form controls */

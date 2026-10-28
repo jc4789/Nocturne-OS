@@ -67,6 +67,7 @@ enum {
     SYS_WIN_RECEIVE, /* (window, struct gui_event *out, max, timeout_ms): count, 0 on timeout */
     SYS_WIN_DIRECT,  /* (window, wanted): ask to be shown by the display driver directly (EV_DIRECT) */
     SYS_WIN_FRAME,   /* (window): EV_FRAME at the display's next frame, presented or not (WIN_FRAME_EVENTS) */
+    SYS_WIN_POINTER, /* (window, const struct n_win_pointer *, size): the pointer over the client area */
     SYS_SHARED_RESERVE = 88, SYS_WAIT_ADDRESS64,
     SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
     SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
@@ -541,6 +542,59 @@ struct gui_event {
 #define WIN_STATE_FOCUSED 2
 #define WIN_STATE_FULLSCREEN 4
 #define WIN_STATE_DIRECT 8 /* the display driver shows the window's own images (EV_DIRECT) */
+
+/* The pointer over a window. The window manager owns the pointer: it draws it, keeps the
+   art and hot spot of every shape, and decides what is shown. A window only declares what
+   it wants over its own client area with SYS_WIN_POINTER; the declaration stays until the
+   next one (a new window wants N_POINTER_DEFAULT). It is shown while the pointer is over
+   the client area and nothing of the window manager's is there (a menu, a frame, the
+   resize band, a drag of a window), and during a drag that started in the client area. The
+   shapes are the CSS UI 4 cursor keywords, one for one, so a browser passes its keyword on:
+   the art is the window manager's own. */
+enum {
+    N_POINTER_DEFAULT = 0,   /* the arrow */
+    N_POINTER_NONE,          /* no pointer is drawn */
+    N_POINTER_CONTEXT_MENU,
+    N_POINTER_HELP,
+    N_POINTER_POINTER,       /* a hand: a link */
+    N_POINTER_PROGRESS,      /* the arrow, busy in the background */
+    N_POINTER_WAIT,
+    N_POINTER_CELL,
+    N_POINTER_CROSSHAIR,
+    N_POINTER_TEXT,
+    N_POINTER_VERTICAL_TEXT,
+    N_POINTER_ALIAS,
+    N_POINTER_COPY,
+    N_POINTER_MOVE,
+    N_POINTER_NO_DROP,
+    N_POINTER_NOT_ALLOWED,
+    N_POINTER_GRAB,
+    N_POINTER_GRABBING,
+    N_POINTER_E_RESIZE, N_POINTER_N_RESIZE, N_POINTER_NE_RESIZE, N_POINTER_NW_RESIZE,
+    N_POINTER_S_RESIZE, N_POINTER_SE_RESIZE, N_POINTER_SW_RESIZE, N_POINTER_W_RESIZE,
+    N_POINTER_EW_RESIZE, N_POINTER_NS_RESIZE, N_POINTER_NESW_RESIZE, N_POINTER_NWSE_RESIZE,
+    N_POINTER_COL_RESIZE,
+    N_POINTER_ROW_RESIZE,
+    N_POINTER_ALL_SCROLL,
+    N_POINTER_ZOOM_IN,
+    N_POINTER_ZOOM_OUT,
+    N_POINTER_SHAPES          /* how many there are */
+};
+/* An image instead of a shape (a page's cursor: url(...)): width and height 1 to
+   N_POINTER_IMAGE_MAX, pixels width*height of 0xAARRGGBB, not premultiplied, rows top first,
+   the hot spot (hot_x < width, hot_y < height) is the pixel at the pointer's position. The
+   window manager copies the image at the call. width, height and the hot spot all 0 mean no
+   image: shape is shown. With an image, shape must be a shape all the same.
+   The limit is the size every way of showing the pointer can show (N_SCREEN_POINTER_SIZE: the
+   display driver's own pointer, the remote desktop's): a larger image is the caller's to refuse. */
+#define N_POINTER_IMAGE_MAX N_SCREEN_POINTER_SIZE
+struct n_win_pointer {
+    uint32_t shape;              /* N_POINTER_* */
+    uint32_t width, height;      /* 0: no image */
+    uint32_t hot_x, hot_y;
+    uint32_t reserved;           /* 0 */
+    const uint32_t *pixels;
+};
 
 struct screen_info {
     uint32_t width, height;

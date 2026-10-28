@@ -62,9 +62,9 @@ static struct {
     unsigned ticks, layouts, draws;
     unsigned partial_draws, video_patches, console_draws;
     unsigned partial_empty, partial_whole; /* damage off the page, or not a known rectangle */
-    unsigned waits[6], engine_waits, woken; /* which source set each wait's timeout; waits an event ended */
+    unsigned waits[7], engine_waits, woken; /* which source set each wait's timeout; waits an event ended */
 } loop_profile;
-enum { WAIT_NONE, WAIT_NET, WAIT_STORAGE, WAIT_DOCUMENT, WAIT_NOW, WAIT_REFRESH };
+enum { WAIT_NONE, WAIT_NET, WAIT_STORAGE, WAIT_DOCUMENT, WAIT_NOW, WAIT_REFRESH, WAIT_POINTER };
 /* Browser pages need more time than small custom web_live hosts. The native
    command line can select a finite limit, never an unlimited watchdog. */
 static uint32_t js_task_budget_ms = WEB_JS_TASK_DEFAULT_MS;
@@ -1168,8 +1168,10 @@ static void initial_scroll(void) {
     }
 }
 
+static uint64_t page_layouts; /* layouts of any tab's page: the pointer looks again after one */
 static void relayout(void) {
     if (!tab->doc) return;
+    page_layouts++;
     uint64_t start = debug_js ? n_clock_uptime_ms() : 0;
     tab->doc_h = web_layout(tab->doc, page_w(), page_h());
     tab->doc_w = web_doc_width(tab->doc);
@@ -3189,6 +3191,11 @@ static void scrollbar_drag(int my) {
     scroll_to((int)((long)(my - drag_off) * max_scroll() / range));
 }
 
+/* whether a point of the surface is on the open select list's options */
+static bool select_list_at(int x, int y) {
+    int vis = MIN(tab->sel_n - tab->sel_top, (view.h - tab->sel_y) / SEL_H);
+    return x >= tab->sel_x && x < tab->sel_x + tab->sel_w && y >= tab->sel_y && y < tab->sel_y + vis * SEL_H;
+}
 static void mouse_down(const struct gui_event *e) {
     if (!(e->buttons & 1)) return;
     if(tab->pressed_node)return; /* an additional button is not a new primary press */
@@ -3196,8 +3203,7 @@ static void mouse_down(const struct gui_event *e) {
     int x = e->x, y = e->y;
     if (devtools_pointer_down(x, y)) return;
     if (tab->sel_node) {
-        int vis = MIN(tab->sel_n - tab->sel_top, (view.h - tab->sel_y) / SEL_H);
-        if (x >= tab->sel_x && x < tab->sel_x + tab->sel_w && y >= tab->sel_y && y < tab->sel_y + vis * SEL_H) choose_select(tab->sel_top + (y - tab->sel_y) / SEL_H);
+        if (select_list_at(x, y)) choose_select(tab->sel_top + (y - tab->sel_y) / SEL_H);
         else tab->sel_node = NULL;
         return;
     }
@@ -3258,6 +3264,91 @@ static void mouse_move(const struct gui_event *e) {
     if (strcmp(h, tab->hover)) {
         strlcpy(tab->hover, h, sizeof tab->hover);
         show_chrome();
+    }
+}
+
+/* ---- the pointer over the page's surface (css-ui-4 cursor). What the point wants (DevTools, the
+   scroll bar, the select list, else the page's cursor) is told to the window when it changes: at
+   once after input and after the first layout that follows it, otherwise at most every
+   POINTER_SETTLE_MS for a change under a still pointer (a layout, a scroll, another document or
+   tab, an image the cursor waits for). The window shows it only while the pointer is over the
+   surface; the widgets around it (the tab strip, the toolbar, the fields) choose their own. */
+#define POINTER_SETTLE_MS 100
+static struct {
+    struct web_cursor want;
+    uint32_t pixels[N_POINTER_IMAGE_MAX * N_POINTER_IMAGE_MAX]; /* the image the window has */
+    struct n_win_pointer sent;
+    bool asked;   /* the window has one */
+    bool input;   /* the pointer moved or pressed: look at once */
+    bool settle;  /* the look after input came before the page's next layout: look again at it */
+    bool again;   /* the last look could not finish (the page was busy, an image was loading, sending failed) */
+    /* what the last look saw */
+    const struct tab *tab;
+    uint64_t generation, layouts;
+    int scroll_x, scroll_y;
+    uint64_t next; /* the earliest look for a change that is not input */
+} pointer;
+
+static bool pointer_want(int x, int y, struct web_cursor *want) {
+    want->shape = N_POINTER_DEFAULT;
+    want->width = want->height = want->hot_x = want->hot_y = 0;
+    want->pending = false;
+    uint32_t shape;
+    if (devtools_pointer_shape(x, y, &shape)) { want->shape = shape; return true; }
+    if (drag_sb || (tab->sel_node && select_list_at(x, y))) return true;
+    /* the scroll bar, and the surface of a tab without a document */
+    if (!tab->doc || x < 0 || y < 0 || x >= page_w() || y >= page_h()) return true;
+    return web_cursor_at(tab->doc, document_x(x), y + tab->scroll_y, want);
+}
+static void pointer_send(const struct web_cursor *want) {
+    size_t pixels = (size_t)want->width * (size_t)want->height;
+    const struct n_win_pointer *sent = &pointer.sent;
+    if (pointer.asked && sent->shape == want->shape && sent->width == (uint32_t)want->width &&
+        sent->height == (uint32_t)want->height && sent->hot_x == (uint32_t)want->hot_x && sent->hot_y == (uint32_t)want->hot_y &&
+        !memcmp(pointer.pixels, want->pixels, pixels * sizeof *want->pixels))
+        return;
+    struct n_win_pointer p = {.shape = want->shape};
+    if (pixels) {
+        p.width = (uint32_t)want->width; p.height = (uint32_t)want->height;
+        p.hot_x = (uint32_t)want->hot_x; p.hot_y = (uint32_t)want->hot_y;
+        p.pixels = want->pixels;
+    }
+    if (ui_surface_pointer(ui, VIEW, &p) < 0) { pointer.again = true; return; }
+    memcpy(pointer.pixels, want->pixels, pixels * sizeof *want->pixels);
+    p.pixels = pointer.pixels;
+    pointer.sent = p;
+    pointer.asked = true;
+}
+/* In the main loop with the front tab served, between script tasks; *timeout shortens to the
+   next look a change waits for. */
+static void pointer_service(uint64_t now, int *timeout, int *source) {
+    if (!ui || quit || tab != front || tab->settings || tab->native_wait || web_script_running(tab->doc) || pointer_x < 0) return;
+    bool laid_out = pointer.layouts != page_layouts;
+    bool changed = pointer.input || pointer.again || laid_out || pointer.tab != tab || pointer.generation != tab->generation ||
+                   pointer.scroll_x != tab->scroll_x || pointer.scroll_y != tab->scroll_y;
+    if (!changed) return;
+    bool now_due = pointer.input || pointer.tab != tab || (pointer.settle && laid_out);
+    if (!now_due && now < pointer.next) {
+        int due = (int)MIN(pointer.next - now, (uint64_t)POINTER_SETTLE_MS);
+        if (*timeout < 0 || due < *timeout) { *timeout = due; *source = WAIT_POINTER; }
+        return;
+    }
+    pointer.settle = pointer.input;
+    pointer.input = false;
+    pointer.next = now + POINTER_SETTLE_MS;
+    pointer.tab = tab;
+    pointer.generation = tab->generation;
+    pointer.layouts = page_layouts;
+    pointer.scroll_x = tab->scroll_x;
+    pointer.scroll_y = tab->scroll_y;
+    pointer.again = !pointer_want(pointer_x, pointer_y, &pointer.want);
+    if (!pointer.again) {
+        pointer.again = pointer.want.pending;
+        pointer_send(&pointer.want);
+    }
+    if (pointer.again && (*timeout < 0 || *timeout > POINTER_SETTLE_MS)) {
+        *timeout = POINTER_SETTLE_MS;
+        *source = WAIT_POINTER;
     }
 }
 
@@ -3348,6 +3439,7 @@ static void command(const struct gui_event *e) {
 }
 
 static void handle(const struct gui_event *e) {
+    if (e->type == EV_MOUSE_MOVE || e->type == EV_MOUSE_DOWN || e->type == EV_MOUSE_UP || e->type == EV_WHEEL) pointer.input = true;
     bool console_only=tab->console_open && !dt_resizing &&
         ((e->type==EV_KEY && tab->focus==F_CONSOLE) ||
          (e->type==EV_WHEEL && e->y>=page_h() && e->y<view.h));
@@ -3579,7 +3671,7 @@ static void report_loop_profile(uint64_t now) {
     uint64_t console_ms=loop_profile.console_ms,console_update=loop_profile.console_update_ms;
     uint64_t partial_ms=loop_profile.partial_ms,partial_update=loop_profile.partial_update_ms,video_ms=loop_profile.video_present_ms;
     uint64_t partial_pixels=loop_profile.partial_pixels;
-    unsigned waits[6],engine_waits=loop_profile.engine_waits,woken=loop_profile.woken;memcpy(waits,loop_profile.waits,sizeof waits);
+    unsigned waits[7],engine_waits=loop_profile.engine_waits,woken=loop_profile.woken;memcpy(waits,loop_profile.waits,sizeof waits);
     memset(&loop_profile, 0, sizeof loop_profile);
     loop_profile.since = now;
     host_console(NULL, WEB_CONSOLE_TRACE, message);
@@ -3597,8 +3689,8 @@ static void report_loop_profile(uint64_t now) {
         if (web_memory_report(tab->doc, message, sizeof message) > 0) host_console(NULL, WEB_CONSOLE_TRACE, message);
     }
     snprintf(message, sizeof message,
-             "Browser wait profile: timeout from none %u, network %u, storage %u, document %u, now %u, refresh %u; shortened by the window engine %u; ended by an event %u",
-             waits[WAIT_NONE], waits[WAIT_NET], waits[WAIT_STORAGE], waits[WAIT_DOCUMENT], waits[WAIT_NOW], waits[WAIT_REFRESH],
+             "Browser wait profile: timeout from none %u, network %u, storage %u, document %u, now %u, refresh %u, pointer %u; shortened by the window engine %u; ended by an event %u",
+             waits[WAIT_NONE], waits[WAIT_NET], waits[WAIT_STORAGE], waits[WAIT_DOCUMENT], waits[WAIT_NOW], waits[WAIT_REFRESH], waits[WAIT_POINTER],
              engine_waits, woken);
     host_console(NULL, WEB_CONSOLE_TRACE, message);
     if (web_wait_report(message, sizeof message) > 0) host_console(NULL, WEB_CONSOLE_TRACE, message);
@@ -3894,6 +3986,7 @@ int main(int argc, char **argv) {
         }
         if (tab->doc && w && !frame_asked && web_rendering_wanted(tab->doc))
             frame_asked = ui_window_frame(ui, WINDOW) == 0;
+        pointer_service(now, &timeout, &source);
         if(console_startup_pending()&&tab->doc&&!tab->loading){int due=now>=console_due?0:(int)MIN(console_due-now,0x7fffffff);
             if(timeout<0||due<timeout){timeout=due;source=WAIT_NOW;}}
         bool refreshed = false;

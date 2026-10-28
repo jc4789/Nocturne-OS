@@ -1869,10 +1869,39 @@ static void bg_images(web_doc *d, style_t *st) {
     }
 }
 
+/* css-images-4 §2.3.1: the option of an image-set() a 1 dppx screen shows: of those whose type() it
+   decodes, the lowest resolution not under 1x, else the highest */
+static const struct css_cursor_choice *cursor_choice(const struct css_cursor_image *im) {
+    const struct css_cursor_choice *best = NULL;
+    float best_dppx = 0;
+    for (uint32_t i = 0; i < im->count; i++) {
+        const struct css_cursor_choice *c = &im->choices[i];
+        if (c->type && !image_type_supported(c->type)) continue;
+        float r = c->dppx > 0 ? c->dppx : 1;
+        if (!best || (r >= 1 ? best_dppx < 1 || r < best_dppx : best_dppx < 1 && r > best_dppx)) { best = c; best_dppx = r; }
+    }
+    return best;
+}
+int doc_cursor_image(web_doc *d, const struct css_cursor_image *image, float *dppx) {
+    const struct css_cursor_choice *c = cursor_choice(image);
+    if (!c) return -1;
+    *dppx = c->dppx > 0 ? c->dppx : 1;
+    return add_image(d, c->url, true);
+}
+/* the images an element's cursor names are fetched as its style is known (the ones it inherits are
+   its parent's) */
+static void cursor_images(web_doc *d, const style_t *st, const style_t *parent) {
+    const struct css_cursor *cursor = &css_style_ui(st)->cursor;
+    if (!cursor->count || (parent && css_style_ui(parent)->cursor.images == cursor->images)) return;
+    float dppx;
+    for (uint32_t i = 0; i < cursor->count; i++) (void)doc_cursor_image(d, &cursor->images[i], &dppx);
+}
+
 static void register_bg(web_doc *d, node_t *n) {
     for (node_t *c = n->first; c; c = c->next) {
         if (c->type != N_ELEM || !c->style) continue;
         bg_images(d, c->style);
+        cursor_images(d, c->style, n->type == N_ELEM ? n->style : NULL);
         if (c->style->before_generated) bg_images(d, c->style->before);
         if (c->style->after_generated) bg_images(d, c->style->after);
         register_bg(d, c);
@@ -2963,14 +2992,11 @@ static bool readonly(node_t *n) {
 
 #include "control_edit.h"
 
-/* The keys go to an editing host: the document is in design mode, or its focus
-   is in an element whose contenteditable state is true or plaintext-only, below
-   no false state (HTML, "editing host", "editable"). js_document_commands.js
-   holds the definitions; this is the native reader's copy of the same walk. */
-static bool editing_focus(web_doc *d) {
+/* js_document_commands.js holds the definitions; this is the native reader's copy of the same walk. */
+bool doc_node_editable(web_doc *d, node_t *n) {
     if (!d || !d->live || d->inert) return false;
     if (d->design_mode) return true;
-    for (node_t *n = d->focus; n && n->owner == d; n = n->parent) {
+    for (; n && n->owner == d; n = n->parent) {
         if (n->type != N_ELEM) continue;
         const char *editable = node_attr(n, "contenteditable");
         if (!editable) continue;
@@ -2979,6 +3005,8 @@ static bool editing_focus(web_doc *d) {
     }
     return false;
 }
+/* The keys go to an editing host: the document's focus is editable. */
+static bool editing_focus(web_doc *d) { return d && doc_node_editable(d, d->focus); }
 /* An editing key, as the editing layer's action: an Input Events inputType, or a
    caret move (extend with Shift). The editing layer fires beforeinput and input
    and takes the action through the command execCommand runs. */

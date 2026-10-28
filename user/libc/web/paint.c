@@ -1581,10 +1581,32 @@ static void paint_control_line(const struct control_text_line *line, void *opaqu
         (size_t)p->caret <= line->first + len &&
         ((size_t)p->caret < line->first + len || line->hard_break || line->next == p->length)) {
         float cx = p->x + control_text_width(p->style,text,(size_t)p->caret-line->first);
-        gfx_fill(c,(int)cx,(int)ly+2,1,(int)fmaxf(1,lh-4),p->base->color);
+        gfx_fill_blend(c,(int)cx,(int)ly+2,1,(int)fmaxf(1,lh-4),css_ui_caret_color(p->base));
     }
 }
 
+/* accent-color (css-ui-4 §6.2): the platform's accent when auto, else the color, drawn opaque over the
+   control's white; *foreground the mark on it (white while it keeps 3:1 contrast, else black) */
+static double accent_luminance(uint32_t rgb) {
+    double l = 0;
+    static const double weight[3] = {.2126, .7152, .0722};
+    for (int i = 0; i < 3; i++) {
+        double v = (double)(rgb >> (16 - 8 * i) & 255) / 255;
+        l += weight[i] * (v <= .04045 ? v / 12.92 : pow((v + .055) / 1.055, 2.4));
+    }
+    return l;
+}
+static uint32_t control_accent(const style_t *st, uint32_t *foreground) {
+    uint32_t accent = RGB(0, 117, 255), argb;
+    if (css_ui_accent_color(st, &argb)) {
+        uint32_t alpha = argb >> 24, mixed = 0;
+        for (int shift = 0; shift < 24; shift += 8)
+            mixed |= (((argb >> shift & 255) * alpha + 255 * (255 - alpha) + 127) / 255) << shift;
+        accent = 0xFF000000u | mixed;
+    }
+    if (foreground) *foreground = 1.05 / (accent_luminance(accent) + .05) >= 3 ? RGB(255, 255, 255) : RGB(0, 0, 0);
+    return accent;
+}
 static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     /* x, y: content box on the canvas */
     canvas_t *c = P->c;
@@ -1643,7 +1665,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
             float text_width, text_height;
             if (!control_text_lines(b,text_style,v,paint_control_line,&lines,&text_width,&text_height)) P->failed=true;
         }
-        if (focused && !selected && b->atomic == AT_INPUT) gfx_fill(c, (int)caret_x, (int)y + 1, 1, (int)h - 2, st->color);
+        if (focused && !selected && b->atomic == AT_INPUT) gfx_fill_blend(c, (int)caret_x, (int)y + 1, 1, (int)h - 2, css_ui_caret_color(st));
         c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
         break;
     }
@@ -1656,16 +1678,17 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     }
     case AT_CHECKBOX: {
         int X = (int)roundf(x), Y = (int)roundf(y), S = (int)roundf(w);
+        uint32_t mark, accent = control_accent(st, &mark);
         if (n->indeterminate) {
-            gfx_fill_round(c, X, Y, S, S, 2, RGB(0, 117, 255));
-            gfx_fill(c, X + S / 4, Y + S / 2 - 1, S / 2, 2, RGB(255, 255, 255));
+            gfx_fill_round(c, X, Y, S, S, 2, accent);
+            gfx_fill(c, X + S / 4, Y + S / 2 - 1, S / 2, 2, mark);
         } else if (n->checked) {
-            gfx_fill_round(c, X, Y, S, S, 2, RGB(0, 117, 255));
+            gfx_fill_round(c, X, Y, S, S, 2, accent);
             int s = S;
             /* a check mark */
             for (int k = -1; k <= 0; k++) {
-                gfx_line(c, X + s * 22 / 100, Y + s / 2 + k, X + s * 42 / 100, Y + s * 70 / 100 + k, RGB(255, 255, 255));
-                gfx_line(c, X + s * 42 / 100, Y + s * 70 / 100 + k, X + s * 78 / 100, Y + s * 30 / 100 + k, RGB(255, 255, 255));
+                gfx_line(c, X + s * 22 / 100, Y + s / 2 + k, X + s * 42 / 100, Y + s * 70 / 100 + k, mark);
+                gfx_line(c, X + s * 42 / 100, Y + s * 70 / 100 + k, X + s * 78 / 100, Y + s * 30 / 100 + k, mark);
             }
         } else {
             gfx_fill_round(c, X, Y, S, S, 2, RGB(118, 118, 118));
@@ -1676,9 +1699,10 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     case AT_RADIO: {
         int r = (int)(w / 2), cx_ = (int)roundf(x + w / 2), cy_ = (int)roundf(y + h / 2);
         if (n->checked) {
-            gfx_fill_circle(c, cx_, cy_, r, RGB(0, 117, 255));
+            uint32_t accent = control_accent(st, NULL);
+            gfx_fill_circle(c, cx_, cy_, r, accent);
             gfx_fill_circle(c, cx_, cy_, r - 1, RGB(255, 255, 255));
-            gfx_fill_circle(c, cx_, cy_, r - 3, RGB(0, 117, 255));
+            gfx_fill_circle(c, cx_, cy_, r - 3, accent);
         } else {
             gfx_fill_circle(c, cx_, cy_, r, RGB(118, 118, 118));
             gfx_fill_circle(c, cx_, cy_, r - 1, RGB(255, 255, 255));
@@ -1740,17 +1764,17 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
             double fraction = max > min ? (value - min) / (max - min) : 0;
             gfx_fill_round(c, X, Y + H / 4, W, H / 2, H / 4, RGB(220, 220, 220));
             if (n->tag == T_progress && web_gauge_value(n, "position") < 0) {
-                gfx_fill_round(c, X + W / 3, Y + H / 4, W / 3, H / 2, H / 4, RGB(0, 117, 255));
+                gfx_fill_round(c, X + W / 3, Y + H / 4, W / 3, H / 2, H / 4, control_accent(st, NULL));
             } else {
                 int quality = n->tag == T_meter ? web_meter_quality(n) : 0;
-                uint32_t color = n->tag == T_progress ? RGB(0, 117, 255) : quality == 0 ? RGB(16, 160, 64) : quality == 1 ? RGB(220, 160, 0) : RGB(210, 50, 45);
+                uint32_t color = n->tag == T_progress ? control_accent(st, NULL) : quality == 0 ? RGB(16, 160, 64) : quality == 1 ? RGB(220, 160, 0) : RGB(210, 50, 45);
                 gfx_fill_round(c, X, Y + H / 4, (int)(W * fraction), H / 2, H / 4, color);
             }
             break;
         }
         if (str_ieq(n->name, "input")) { /* range */
             gfx_fill_round(c, X, Y + H / 2 - 2, W, 4, 2, RGB(180, 180, 180));
-            gfx_fill_circle(c, X + W / 2, Y + H / 2, 7, RGB(0, 117, 255));
+            gfx_fill_circle(c, X + W / 2, Y + H / 2, 7, control_accent(st, NULL));
             break;
         }
         gfx_fill_blend(c, X, Y, W, H, RGB(232, 232, 236));
@@ -3634,6 +3658,93 @@ bool doc_caret_at(web_doc *d, double x, double y, node_t **node, uint32_t *offse
         return true;
     }
     return layout_position_at(box ? box : d->root_box, local_x, local_y, node, offset);
+}
+
+/* ---- the pointer (css-ui-4 §5.1) */
+/* auto: the text beam over text that can be selected (a button's label is the button's) or edited,
+   the arrow elsewhere */
+static uint32_t cursor_auto(web_doc *d, node_t *element, const struct pctx *P) {
+    box_t *box = element ? element->box : NULL;
+    if (element && text_control_box(box) && box->node == element)
+        return web_control_disabled(element) ? N_POINTER_DEFAULT : N_POINTER_TEXT;
+    if (element && doc_node_editable(d, element)) return N_POINTER_TEXT;
+    const box_t *block = P->hit_run_block;
+    /* a run of text (generated text too), not an atomic inline in the line */
+    const struct run *run = block && P->hit_run >= 0 && P->hit_run < block->nruns ? &block->runs[P->hit_run] : NULL;
+    if (!run || run->atomic || !run->node) return N_POINTER_DEFAULT;
+    for (node_t *n = element; n; n = doc_flat_parent(n))
+        if (n->type == N_ELEM && !n->foreign && n->tag == T_button) return N_POINTER_DEFAULT;
+    return N_POINTER_TEXT;
+}
+static int cursor_round(float v, int size) {
+    int i = (int)floorf(v + .5f);
+    return i < 0 ? 0 : i > size - 1 ? size - 1 : i; /* a hot spot outside the image is clamped to it */
+}
+/* the first image of the list that has loaded and the native pointer can show, at its natural size
+   (its pixels at its resolution); out->pending when one before it still loads */
+static bool cursor_image(web_doc *d, const struct css_cursor *cursor, struct web_cursor *out) {
+    for (uint32_t i = 0; i < cursor->count; i++) {
+        const struct css_cursor_image *im = &cursor->images[i];
+        float dppx = 1;
+        int index = doc_cursor_image(d, im, &dppx);
+        if (index < 0 || index >= d->images.n) continue;
+        const struct web_image *source = d->images.v[index];
+        if (!source->done) { out->pending = true; continue; }
+        const image_t *img = source->img;
+        if (!img || img->w < 1 || img->h < 1 || !(dppx > 0)) continue;
+        float fw = img->w / dppx, fh = img->h / dppx;
+        if (!(fw < N_POINTER_IMAGE_MAX + .5f) || !(fh < N_POINTER_IMAGE_MAX + .5f)) continue;
+        int w = MAX(1, (int)floorf(fw + .5f)), h = MAX(1, (int)floorf(fh + .5f));
+        bool resize = w != img->w || h != img->h;
+        /* an SVG is drawn again at the size, a raster image resampled */
+        image_t *scaled = !resize ? NULL : source->svg ? image_decode_svg(source->svg, source->svg_n, w, h) : image_scale(img, w, h);
+        if (resize && (!scaled || scaled->w != w || scaled->h != h)) { image_free(scaled); continue; }
+        memcpy(out->pixels, (scaled ? scaled : img)->px, (size_t)w * (size_t)h * sizeof *out->pixels);
+        image_free(scaled);
+        /* <x> <y>, else the image's own hot spot (a cursor file's), else its top left */
+        out->hot_x = cursor_round(im->hot ? im->x : img->hot ? img->hot_x / dppx : 0, w);
+        out->hot_y = cursor_round(im->hot ? im->y : img->hot ? img->hot_y / dppx : 0, h);
+        out->width = w;
+        out->height = h;
+        return true;
+    }
+    return false;
+}
+bool web_cursor_at(web_doc *d, int x, int y, struct web_cursor *out) {
+    while (d && out && !d->native_cancelled && !d->native_recovery_pending && !d->native_recovery_active && d->root_box) {
+        struct pctx P = {0};
+        struct web_hit hit = {0};
+        canvas_t dummy = {0};
+        dummy.cx0 = dummy.cy0 = -1000000000;
+        dummy.cx1 = dummy.cy1 = 1000000000;
+        P.d = d; P.c = &dummy; P.mode = M_HIT; P.hx = (float)x; P.hy = (float)y; P.hit = &hit;
+        if (!hit_index_lookup(&P)) walk(&P);
+        if (P.failed) return false;
+        node_t *target = P.target;
+        /* inside a frame: its document's pointer, as web_node_at enters it */
+        if (target && web_frame_element(target)) {
+            struct web_frame *frame = web_frame_find(d, target);
+            box_t *box = target->box;
+            if (frame && frame->document && !frame->detached && frame->document->root_box && box) {
+                int child_x = x - (int)box_visual_x(box) + frame->scroll_x, child_y = y - (int)box_visual_y(box) + frame->scroll_y;
+                if (child_x >= frame->scroll_x && child_y >= frame->scroll_y && child_x < frame->scroll_x + (int)box->w &&
+                    child_y < frame->scroll_y + (int)box->h) { d = frame->document; x = child_x; y = child_y; continue; }
+            }
+        }
+        out->shape = N_POINTER_DEFAULT;
+        out->width = out->height = out->hot_x = out->hot_y = 0;
+        out->pending = false;
+        if (target && web_dialog_inert(d, target)) return true;
+        node_t *element = target && target->type != N_ELEM ? doc_flat_parent(target) : target;
+        /* no box under the point: the canvas, the root element's */
+        const style_t *st = element && element->style ? element->style : d->root_box->st;
+        if (!st) return true;
+        const struct css_cursor *cursor = &css_style_ui(st)->cursor;
+        cursor_image(d, cursor, out);
+        out->shape = cursor->shape == CSS_CURSOR_AUTO ? cursor_auto(d, element, &P) : cursor->shape;
+        return true;
+    }
+    return false;
 }
 
 struct hit_found { const struct hit_primitive **items; size_t count, capacity; bool failed; };

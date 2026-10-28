@@ -68,14 +68,20 @@ void wm_remote_detach(void);
 bool wm_remote_viewing(void); /* a viewer has the desktop at its size; takes no lock */
 int wm_remote_damage(struct wm_rect *out, int max); /* takes the areas redrawn since the last call */
 bool wm_remote_copy(uint32_t *dst, int pitch, int x, int y, int w, int h);
-int wm_cursor_shape(void);
+/* The pointer the desktop shows now (a remote viewer draws it itself). Returns its serial, which
+   changes with the image and is never 0; when that is not seen, its image (a square of
+   N_SCREEN_POINTER_SIZE pixels of 0xAARRGGBB not premultiplied) goes into px and its hot spot into
+   *hot_x, *hot_y, under the WM lock. */
+uint32_t wm_pointer_image(uint32_t seen, uint32_t *px, int *hot_x, int *hot_y);
 
 /* desktop.c */
 void desktop_draw_wallpaper(canvas_t *c, uint8_t *deep); /* deep plane (display_abi.h) or NULL */
 void desktop_draw_icon(canvas_t *c, int x, int y, int icon);
-void desktop_draw_cursor(canvas_t *c, int x, int y, int shape);
+/* The art of a pointer shape (N_POINTER_*, abi.h; another number is N_POINTER_DEFAULT): a square
+   of N_SCREEN_POINTER_SIZE pixels of 0xAARRGGBB not premultiplied, and its hot spot. Drawn the
+   first time it is asked for and kept. Under the WM lock. */
+const uint32_t *desktop_pointer(int shape, int *hot_x, int *hot_y);
 enum { ICON_TERMINAL, ICON_FILES, ICON_PAINT, ICON_CLOCK, ICON_SNAKE, ICON_FRACTAL, ICON_CUBE,
        ICON_LIFE, ICON_MONITOR, ICON_EDITOR, ICON_ABOUT, ICON_CALC, ICON_POWER, ICON_REBOOT,
        ICON_TETRIS, ICON_MINES, ICON_NET, ICON_PIANO, ICON_SOUND, ICON_SETTINGS, ICON_SLEEP, ICON_HIBERNATE, ICON_GENERIC,
        ICON_COUNT };
-enum { CURSOR_ARROW, CURSOR_RESIZE, CURSOR_MOVE };

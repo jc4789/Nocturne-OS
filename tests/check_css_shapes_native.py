@@ -8,14 +8,15 @@ test_composition）を node で取り出し、shape.c・cssprop.c を host の c
 （tests/css_shapes_native_cases.c）に渡して、WPT の比べ方で照らす。補間と合成は
 interpolation-testcommon.js の normalizeValue（数は小数 2 桁、字句の間に空白）で、期待は
 その文字の計算値と比べる。--group gaps では WPT の css-gaps（parsing・animation）の頁を同じ道具で照らす
-（頁の #target の font-size と color を要素に与える）。
+（頁の #target の font-size と color を要素に与える）。--group ui では css-ui の cursor・caret-color・
+accent-color の頁（parsing・animation）を照らす（性質の表の G_UI の群）。
 
 guest の WPT の代わりではない。CSSOM の宣言の塊・cascade・var()・時間の模型（animation.c）・
 配置と描画は通らない。数えないもの：test_shorthand_value（CSSOM が shorthand の longhand の
 文字を持つかどうかは宣言の塊の仕事）、補間の端が neutral・CSS 全体の語（cascade の仕事）。
 補間は CSS animation の流儀（離散は 0.5 で入れ替わる）だけを試す。
 
-  python -X utf8 tests/check_css_shapes_native.py [--group shapes|gaps|anchor] [--verbose] [--file 名前の一部] [--out 出力の場所]
+  python -X utf8 tests/check_css_shapes_native.py [--group shapes|gaps|anchor|ui] [--verbose] [--file 名前の一部] [--out 出力の場所]
 """
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -46,8 +47,15 @@ elif group == "shapes":
              sorted((wpt / "css-masking/animations").glob("clip-path-*.html")) +
              [wpt / "css-masking/clip-path/animations/clip-path-interpolation-discrete.html"] +
              sorted((wpt / "motion/animation").glob("*.html")))
+elif group == "ui":
+    pages = ([wpt / "css-ui/parsing" / f"{name}-{kind}.html" for name in ("cursor", "caret-color")
+              for kind in ("valid", "invalid", "computed")] +
+             [wpt / "css-ui" / name for name in ("accent-color-parsing.html", "accent-color-computed.html")] +
+             [wpt / "css-ui/animation" / name for name in (
+                 "caret-color-interpolation.html", "caret-color-composition.html", "accent-color-interpolation.html",
+                 "cursor-no-interpolation.html")])
 else:
-    sys.exit(f"群は shapes・gaps・anchor のどれか：{group}")
+    sys.exit(f"群は shapes・gaps・anchor・ui のどれか：{group}")
 out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else root / f"build/check-css-{group}"
 out.mkdir(parents=True, exist_ok=True)
 # the repository's tools (a worktree has them in the main checkout above it)
@@ -206,6 +214,13 @@ for path in pages:
                 continue
             cases.append((path.name, kind, args[1], ("S", prop, args[1]), None if kind == "invalid" else args[2]))
         elif kind == "computed":
+            if args[1].strip().lower() in ("inherit", "unset") and group == "ui":
+                skip("親の値を取る CSS 全体の語（親の装いは頁のもの）")
+                continue
+            if group == "ui" and prop == "cursor" and "gradient(" in args[1]:
+                # cursor-invalid.html が無効とする <image> で、期待の文字も括弧が閉じていない
+                skip("頁の期待が不正（cursor-invalid.html と食い違う gradient）")
+                continue
             cases.append((path.name, kind, args[1], ("C", prop, font, args[1]), args[2]))
         elif kind == "interpolation":
             _, a, b, at, want = args

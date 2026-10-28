@@ -5,8 +5,10 @@
 #include <float.h>
 #include <stddef.h>
 #include <ctype.h>
+#include <limits.h>
 #include "webi.h"
 #include "inspect_private.h"
+#include "abi.h" /* the native pointer shapes cursor's keywords name */
 
 /* ---------------------------------------------------------------- small parsing helpers */
 static void trim(const char **s, size_t *n) {
@@ -536,7 +538,7 @@ enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_
        PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_BOX_SHADOW, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
        PT_MOTION_LIST, PT_TRANSFORM, PT_TRANSLATE,
        PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_SHAPE, PT_OFFSET, PT_CLIP, PT_COLOR_SCHEME, PT_RULE_LIST,
-       PT_RULE_INSET, PT_ANCHOR };
+       PT_RULE_INSET, PT_ANCHOR, PT_CURSOR, PT_UI_COLOR };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
@@ -558,8 +560,12 @@ struct propdef {
 /* Web Animations 1 §5.3 animation types that differ from a value type's default */
 enum { AN_TYPE, AN_NONE, AN_DISCRETE, AN_VISIBILITY, AN_DISPLAY };
 /* style_t itself, or a group of rarely set properties it holds by pointer (style_t's float_shape,
-   offset, gap_rules, anchor). A group holds only properties that are not inherited. */
-enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET, G_GAP_RULE, G_ANCHOR };
+   offset, gap_rules, anchor, ui). A group holds only properties that are not inherited, except G_UI,
+   which holds only inherited ones: an element's style starts with its parent's group, and with the
+   initial values the others (groups_copy). */
+enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET, G_GAP_RULE, G_ANCHOR, G_UI };
+/* which colour a PT_UI_COLOR property is (its flags) */
+enum { UI_CARET, UI_ACCENT };
 /* the gap decoration shorthands (css-gaps-1): propdef flags hold what one sets (GS_*) and on which
    axes (GS_COLUMN, GS_ROW) */
 enum { GS_RULE, GS_COLOR, GS_STYLE, GS_WIDTH, GS_BREAK, GS_ITEMS, GS_INSET_START, GS_INSET_END, GS_INSET_CAP,
@@ -663,6 +669,19 @@ static const struct kw kw_rule_overlap[] = {{"row-over-column", CSS_RULE_ROW_OVE
 static const struct kw kw_try_order[] = {{"normal", CSS_TRY_ORDER_NORMAL}, {"most-width", CSS_TRY_ORDER_MOST_WIDTH},
     {"most-height", CSS_TRY_ORDER_MOST_HEIGHT}, {"most-block-size", CSS_TRY_ORDER_MOST_BLOCK},
     {"most-inline-size", CSS_TRY_ORDER_MOST_INLINE}, {0}};
+/* css-ui-4 §5.1 <cursor-predefined>, as the native pointer shapes (abi.h) */
+static const struct kw kw_cursor[] = {{"auto", CSS_CURSOR_AUTO}, {"default", N_POINTER_DEFAULT}, {"none", N_POINTER_NONE},
+    {"context-menu", N_POINTER_CONTEXT_MENU}, {"help", N_POINTER_HELP}, {"pointer", N_POINTER_POINTER},
+    {"progress", N_POINTER_PROGRESS}, {"wait", N_POINTER_WAIT}, {"cell", N_POINTER_CELL},
+    {"crosshair", N_POINTER_CROSSHAIR}, {"text", N_POINTER_TEXT}, {"vertical-text", N_POINTER_VERTICAL_TEXT},
+    {"alias", N_POINTER_ALIAS}, {"copy", N_POINTER_COPY}, {"move", N_POINTER_MOVE}, {"no-drop", N_POINTER_NO_DROP},
+    {"not-allowed", N_POINTER_NOT_ALLOWED}, {"grab", N_POINTER_GRAB}, {"grabbing", N_POINTER_GRABBING},
+    {"e-resize", N_POINTER_E_RESIZE}, {"n-resize", N_POINTER_N_RESIZE}, {"ne-resize", N_POINTER_NE_RESIZE},
+    {"nw-resize", N_POINTER_NW_RESIZE}, {"s-resize", N_POINTER_S_RESIZE}, {"se-resize", N_POINTER_SE_RESIZE},
+    {"sw-resize", N_POINTER_SW_RESIZE}, {"w-resize", N_POINTER_W_RESIZE}, {"ew-resize", N_POINTER_EW_RESIZE},
+    {"ns-resize", N_POINTER_NS_RESIZE}, {"nesw-resize", N_POINTER_NESW_RESIZE}, {"nwse-resize", N_POINTER_NWSE_RESIZE},
+    {"col-resize", N_POINTER_COL_RESIZE}, {"row-resize", N_POINTER_ROW_RESIZE}, {"all-scroll", N_POINTER_ALL_SCROLL},
+    {"zoom-in", N_POINTER_ZOOM_IN}, {"zoom-out", N_POINTER_ZOOM_OUT}, {0}};
 static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}, {"super", VA_SUPER},
                                       {"top", VA_TOP}, {"middle", VA_MIDDLE}, {"bottom", VA_BOTTOM},
                                       {"text-top", VA_TEXT_TOP}, {"text-bottom", VA_TEXT_BOTTOM}, {0}};
@@ -739,6 +758,10 @@ static struct propdef props[] = {
     {"clear", PT_KW, 0, false, O(clear), kw_clear, 0, AN_TYPE},
     {"color", PT_COLOR, 0, true, O(color), NULL, 0, AN_TYPE},
     {"color-scheme", PT_COLOR_SCHEME, 0, true, O(color_scheme), NULL, 0, AN_DISCRETE},
+    /* CSS Basic User Interface 4 */
+    {"cursor", PT_CURSOR, 0, true, OG(G_UI, struct css_ui, cursor), kw_cursor, 0, AN_DISCRETE},
+    {"caret-color", PT_UI_COLOR, UI_CARET, true, OG(G_UI, struct css_ui, caret), NULL, 0, AN_TYPE},
+    {"accent-color", PT_UI_COLOR, UI_ACCENT, true, OG(G_UI, struct css_ui, accent), NULL, 0, AN_TYPE},
     {"column-gap", PT_PX, LF_NOPCT, false, O(gap_col), kw_normal0, 0, AN_TYPE},
     /* CSS Gap Decorations 1. flags: a list's enum css_gap_rule_kind, a shorthand's GS_* */
     SH_GAP("column-rule", GS_RULE | GS_COLUMN),
@@ -1000,7 +1023,7 @@ static void init_initial(void) {
     s->align_self = 255;
     s->justify_self = 255;
     s->z_auto = true;
-    /* the groups (float_shape, offset, gap_rules, anchor) stay NULL: their initial records */
+    /* the groups (float_shape, offset, gap_rules, anchor, ui) stay NULL: their initial records */
 }
 
 static void props_init(void) {
@@ -1079,16 +1102,17 @@ static const void *group_of(const style_t *s, uint8_t g) {
     case G_OFFSET: return css_style_offset(s);
     case G_GAP_RULE: return css_style_gap_rules(s);
     case G_ANCHOR: return css_style_anchor(s);
+    case G_UI: return css_style_ui(s);
     }
     return s;
 }
 static size_t group_size(uint8_t g) {
     return g == G_FLOAT_SHAPE ? sizeof(struct css_float_shape) : g == G_OFFSET ? sizeof(struct css_offset) :
-                                g == G_GAP_RULE ? sizeof(struct css_gap_rules) : sizeof(struct css_anchor);
+           g == G_GAP_RULE ? sizeof(struct css_gap_rules) : g == G_UI ? sizeof(struct css_ui) : sizeof(struct css_anchor);
 }
 static bool group_same(const style_t *a, const style_t *b, uint8_t g) {
     return g == G_FLOAT_SHAPE ? a->float_shape == b->float_shape : g == G_OFFSET ? a->offset == b->offset :
-           g == G_GAP_RULE ? a->gap_rules == b->gap_rules : a->anchor == b->anchor;
+           g == G_GAP_RULE ? a->gap_rules == b->gap_rules : g == G_UI ? a->ui == b->ui : a->anchor == b->anchor;
 }
 /* s's group g becomes a copy of value in a, for the caller to finish writing: the group s held may
    be another style's too (box.c's copies of a style, the animation layer's copy of its base) */
@@ -1099,10 +1123,12 @@ static void *group_write(style_t *s, uint8_t g, const void *value, arena_t *a) {
     if (g == G_FLOAT_SHAPE) s->float_shape = copy;
     else if (g == G_OFFSET) s->offset = copy;
     else if (g == G_GAP_RULE) s->gap_rules = copy;
+    else if (g == G_UI) s->ui = copy;
     else s->anchor = copy;
     return copy;
 }
-/* every group of src, as copying each of their (uninherited) properties would */
+/* every group of uninherited properties of src, as copying each of those properties would (G_UI's
+   are inherited: css_style_init's copy of the parent already holds them) */
 static void groups_copy(style_t *dst, const style_t *src) {
     dst->float_shape = src->float_shape;
     dst->offset = src->offset;
@@ -1119,6 +1145,11 @@ static int gap_computed(const style_t *st, const struct propdef *p, sbuf *out, w
 static bool gap_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
 static bool position_try_text(const struct css_anchor *a, sbuf *out);
 static bool anchor_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
+/* the user interface values (below) */
+static void ui_cursor_text(const struct css_cursor *c, sbuf *out);
+static bool ui_colors_text(const struct propdef *p, const style_t *st, const struct css_ui_color *field, bool resolved,
+                           sbuf *out);
+static bool ui_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d) {
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return 0;
@@ -1151,6 +1182,8 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
     case PT_MOTION_LIST: case PT_SHAPE: case PT_OFFSET: case PT_ROTATE: case PT_SCALE: case PT_ANCHOR:
         return css_computed_value(st, p, out, d) ? 1 : -1;
     case PT_RULE_LIST: case PT_RULE_INSET: return gap_computed(st, p, out, d);
+    case PT_CURSOR: ui_cursor_text((const struct css_cursor *)field, out); return 1;
+    case PT_UI_COLOR: return ui_colors_text(p, st, (const struct css_ui_color *)field, true, out) ? 1 : -1;
     case PT_SHORT: /* the shorthands whose longhands' owner serializes them together */
         if (p->sh == SH_OFFSET) return css_offset_shorthand_serialize(css_style_offset(st), out, d) ? 1 : -1;
         if (p->sh == SH_GAP_RULE) return gap_computed(st, p, out, d);
@@ -1169,6 +1202,7 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     /* a CSS-wide keyword serializes as itself */
     if (ident_is(v, n, "inherit") || ident_is(v, n, "initial") || ident_is(v, n, "unset") || ident_is(v, n, "revert") ||
         ident_is(v, n, "revert-layer")) return false;
+    if (p->group == G_UI) return ui_specified(p, v, n, out);
     if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
     if (p->group == G_GAP_RULE || (p->type == PT_SHORT && p->sh == SH_GAP_RULE)) return gap_specified(p, v, n, out);
     if (p->group == G_ANCHOR || (p->type == PT_SHORT && p->sh == SH_POSITION_TRY)) return anchor_specified(p, v, n, out);
@@ -1757,6 +1791,292 @@ static bool gap_specified(const struct propdef *p, const char *v, size_t n, sbuf
         }
     }
     for (int i = 0; i < 4; i++) sb_free(&spec[i]);
+    ar_free(&arena);
+    if (!ok) out->n = begin;
+    sb_cstr(out);
+    return ok;
+}
+
+/* ---------------------------------------------------------------- user interface (css-ui-4) */
+/* cursor (§5.1), caret-color (§6.2.1) and accent-color (§6.3): their values computed against the
+   element (light-dark() by its color-scheme, currentcolor kept), and their specified, computed and
+   resolved serializations. Which pointer shows is the hit test's (paint.c web_cursor_at); the window's
+   pointer is the browser's (browser.c). */
+static void anim_number(sbuf *b, double v);
+const struct css_ui css_ui_initial = {
+    .cursor = {.shape = CSS_CURSOR_AUTO},
+    .caret = {{COLOR_CURRENT, NULL, true}, {COLOR_CURRENT, NULL, true}},
+    .accent = {COLOR_CURRENT, NULL, true}};
+
+static bool ui_same(const char *a, const char *b) { return a == b || (a && b && !strcmp(a, b)); }
+/* CSSOM "serialize a string" */
+static void ui_string(sbuf *out, const char *s) {
+    sb_putc(out, '"');
+    for (const unsigned char *c = (const unsigned char *)s; *c; c++) {
+        if (*c == '"' || *c == '\\') { sb_putc(out, '\\'); sb_putc(out, (char)*c); }
+        else if (*c < 0x20 || *c == 0x7f) { char hex[8]; snprintf(hex, sizeof hex, "\\%x ", *c); sb_puts(out, hex); }
+        else sb_putc(out, (char)*c);
+    }
+    sb_putc(out, '"');
+}
+static void ui_url_text(sbuf *out, const char *url) { sb_puts(out, "url("); ui_string(out, url); sb_putc(out, ')'); }
+static bool ui_quoted(const char *s, size_t n) { return n >= 2 && (s[0] == '"' || s[0] == '\'') && s[n - 1] == s[0]; }
+/* a <url> (url(), or src() of a <string>), unescaped; string: a bare <string> too (an image-set()
+   option's) */
+static const char *ui_url(const char *s, size_t n, bool string, arena_t *a) {
+    if (ui_quoted(s, n)) return string ? css_parse_url(s, n, a) : NULL;
+    if (n > 5 && strn_ieq(s, "src(", 4) && s[n - 1] == ')') {
+        const char *q = s + 4;
+        size_t qn = n - 5;
+        trim(&q, &qn);
+        return ui_quoted(q, qn) ? css_parse_url(q, qn, a) : NULL;
+    }
+    return n > 4 && strn_ieq(s, "url(", 4) ? css_parse_url(s, n, a) : NULL;
+}
+/* the top-level comma-separated items of s (as many as there are) */
+static int ui_items(const char *s, size_t n, struct cx *cx, const char ***t, size_t **tl) {
+    size_t max = 1;
+    for (size_t i = 0; i < n; i++) max += s[i] == ',';
+    if (max > INT_MAX) return 0;
+    *t = ar_alloc(cx->a, max * sizeof **t);
+    *tl = ar_alloc(cx->a, max * sizeof **tl);
+    return split_checked(s, n, *t, *tl, (int)max, ',', cx);
+}
+/* a number (the hot spot's) as specified: math functions simplified (CSS Values 4 §10.13) */
+static void ui_number_specified(sbuf *spec, const char *s, size_t n, float v) {
+    if (!css_calc_is_math(s, n) || !css_calc_specified(s, n, CSS_CALC_NUMBER, spec)) length_number(spec, v, "");
+}
+/* an image-set() option of a <url-set>: [ <url> | <string> ] [ <resolution> || type(<string>) ]? */
+static bool ui_set_option(const char *s, size_t n, struct cx *cx, struct css_cursor_choice *out, sbuf *spec) {
+    const char *t[4];
+    size_t tl[4];
+    int k = split_checked(s, n, t, tl, 4, ' ', cx);
+    if (k < 1 || k > 3) return false;
+    *out = (struct css_cursor_choice){ui_url(t[0], tl[0], true, cx->a), NULL, 0};
+    if (!out->url) return false;
+    bool resolution = false;
+    sbuf res = {0};
+    for (int i = 1; i < k; i++) {
+        if (tl[i] > 6 && strn_ieq(t[i], "type(", 5) && t[i][tl[i] - 1] == ')') {
+            const char *q = t[i] + 5;
+            size_t qn = tl[i] - 6;
+            trim(&q, &qn);
+            if (out->type || !ui_quoted(q, qn)) { sb_free(&res); return false; }
+            out->type = css_parse_url(q, qn, cx->a);
+            continue;
+        }
+        double v;
+        unsigned kind;
+        bool math = css_calc_is_math(t[i], tl[i]);
+        if (resolution || !css_numeric_read(t[i], tl[i], CSS_CALC_RESOLUTION, cx, cx->a, NAN, &v, &kind) ||
+            kind != CSS_CALC_RESOLUTION || (!math && v < 0)) { sb_free(&res); return false; }
+        resolution = true;
+        out->dppx = v < 0 ? 0 : calc_float(v); /* a calculation clamps to the range */
+        if (!spec) continue;
+        const char *q = t[i];
+        float number;
+        if (math) { if (!css_calc_specified(t[i], tl[i], CSS_CALC_RESOLUTION, &res)) sb_put(&res, t[i], tl[i]); }
+        else if (parse_number(&q, t[i] + tl[i], &number)) {
+            length_number(&res, number, "");
+            for (; q < t[i] + tl[i]; q++) sb_putc(&res, (char)lower((unsigned char)*q));
+        }
+    }
+    if (spec) {
+        ui_url_text(spec, out->url);
+        if (res.n) { sb_putc(spec, ' '); sb_put(spec, res.p, res.n); }
+        if (out->type) { sb_puts(spec, " type("); ui_string(spec, out->type); sb_putc(spec, ')'); }
+    }
+    sb_free(&res);
+    return true;
+}
+/* [ <url> | <url-set> ] */
+static bool ui_cursor_source(const char *s, size_t n, struct cx *cx, struct css_cursor_image *out, sbuf *spec) {
+    size_t open = n > 18 && strn_ieq(s, "-webkit-image-set(", 18) ? 18 : n > 10 && strn_ieq(s, "image-set(", 10) ? 10 : 0;
+    if (open && s[n - 1] == ')') {
+        const char **t;
+        size_t *tl;
+        int k = ui_items(s + open, n - open - 1, cx, &t, &tl);
+        if (k < 1) return false;
+        struct css_cursor_choice *c = ar_alloc(cx->a, (size_t)k * sizeof *c);
+        if (spec) sb_put(spec, open == 18 ? "-webkit-image-set(" : "image-set(", open);
+        for (int i = 0; i < k; i++) {
+            if (spec && i) sb_puts(spec, ", ");
+            if (!tl[i] || !ui_set_option(t[i], tl[i], cx, &c[i], spec)) return false;
+        }
+        if (spec) sb_putc(spec, ')');
+        *out = (struct css_cursor_image){.choices = c, .count = (uint32_t)k, .set = true};
+        return true;
+    }
+    struct css_cursor_choice *c = ar_alloc(cx->a, sizeof *c);
+    *c = (struct css_cursor_choice){ui_url(s, n, false, cx->a), NULL, 0};
+    if (!c->url) return false;
+    if (spec) ui_url_text(spec, c->url);
+    *out = (struct css_cursor_image){.choices = c, .count = 1};
+    return true;
+}
+/* <cursor-image> = [ <url> | <url-set> ] <number>{2}?, either source light-dark() of two (css-color-5 §2) */
+static bool ui_cursor_image(const char *s, size_t n, struct cx *cx, struct css_cursor_image *out, sbuf *spec) {
+    const char *t[4];
+    size_t tl[4];
+    int k = split_checked(s, n, t, tl, 4, ' ', cx);
+    if (k != 1 && k != 3) return false;
+    if (tl[0] > 12 && strn_ieq(t[0], "light-dark(", 11) && t[0][tl[0] - 1] == ')') {
+        const char *side[3];
+        size_t sl[3];
+        if (split_checked(t[0] + 11, tl[0] - 12, side, sl, 3, ',', cx) != 2 || !sl[0] || !sl[1]) return false;
+        struct css_cursor_image light, dark;
+        if (spec) sb_puts(spec, "light-dark(");
+        if (!ui_cursor_source(side[0], sl[0], cx, &light, spec)) return false;
+        if (spec) sb_puts(spec, ", ");
+        if (!ui_cursor_source(side[1], sl[1], cx, &dark, spec)) return false;
+        if (spec) sb_putc(spec, ')');
+        *out = css_style_dark(cx->s) ? dark : light;
+    } else if (!ui_cursor_source(t[0], tl[0], cx, out, spec)) return false;
+    if (k == 3) {
+        float xy[2];
+        for (int i = 0; i < 2; i++) {
+            if (!parse_number_value(t[1 + i], tl[1 + i], cx, &xy[i])) return false;
+            if (spec) { sb_putc(spec, ' '); ui_number_specified(spec, t[1 + i], tl[1 + i], xy[i]); }
+        }
+        out->hot = true;
+        out->x = xy[0];
+        out->y = xy[1];
+    }
+    return true;
+}
+/* cursor = [ <cursor-image> , ]* <cursor-predefined> */
+static bool ui_cursor(const char *v, size_t n, struct cx *cx, struct css_cursor *out, sbuf *spec) {
+    const char **t;
+    size_t *tl;
+    int k = ui_items(v, n, cx, &t, &tl);
+    uint8_t shape;
+    if (k < 1 || !tl[k - 1] || !kw_find(kw_cursor, t[k - 1], tl[k - 1], &shape)) return false;
+    struct css_cursor_image *images = k > 1 ? ar_alloc(cx->a, (size_t)(k - 1) * sizeof *images) : NULL;
+    for (int i = 0; i < k - 1; i++) {
+        if (!(i & 63) && i && !cx->supports_probe && cx->node && !web_native_checkpoint(cx->node->owner)) return false;
+        if (!tl[i] || !ui_cursor_image(t[i], tl[i], cx, &images[i], spec)) return false;
+        if (spec) sb_puts(spec, ", ");
+    }
+    if (spec) sb_puts(spec, kw_name(kw_cursor, shape));
+    *out = (struct css_cursor){images, (uint32_t)(k - 1), shape};
+    return true;
+}
+/* auto | <color> */
+static bool ui_color_one(const char *s, size_t n, struct cx *cx, struct css_ui_color *out, sbuf *spec) {
+    if (ident_is(s, n, "auto")) {
+        *out = css_ui_initial.accent;
+        if (spec) sb_puts(spec, "auto");
+        return true;
+    }
+    *out = (struct css_ui_color){0};
+    return css_color_value_compute(s, n, cx, NULL, &out->argb, &out->exact) && (!spec || css_color_specified(s, n, spec));
+}
+/* caret-color = auto | <color> | [ auto | <color> ]{2}; accent-color = auto | <color> */
+static bool ui_color(const struct propdef *p, const char *v, size_t n, struct cx *cx, struct css_ui_color *out, sbuf *spec) {
+    const char *t[3];
+    size_t tl[3];
+    int k = split_checked(v, n, t, tl, 3, ' ', cx);
+    if (k < 1 || k > (p->flags == UI_CARET ? 2 : 1)) return false;
+    struct css_ui_color c[2] = {css_ui_initial.accent, css_ui_initial.accent};
+    for (int i = 0; i < k; i++) {
+        if (spec && i) sb_putc(spec, ' ');
+        if (!tl[i] || !ui_color_one(t[i], tl[i], cx, &c[i], spec)) return false;
+    }
+    out[0] = c[0];
+    if (p->flags == UI_CARET) out[1] = c[1];
+    return true;
+}
+/* a colour's computed value (auto, or as the animation layer reads it back: currentcolor kept), or
+   with resolved its resolved value (the used colour; auto: caret-color's currentcolor) */
+static bool ui_color_text(const style_t *st, const struct css_ui_color *c, bool resolved, bool auto_current, sbuf *out) {
+    if (c->automatic && !(resolved && auto_current)) { sb_puts(out, "auto"); return true; }
+    struct css_color_computed v;
+    css_color_held(c->automatic ? COLOR_CURRENT : c->argb, c->automatic ? NULL : c->exact, st->color, &v);
+    if (!resolved) return anim_color_text(out, &v);
+    struct css_color used = anim_color_used(st, &v);
+    return css_color_serialize(&used, false, out);
+}
+/* the value of a PT_UI_COLOR property (field: its first colour); a second auto colour is left out */
+static bool ui_colors_text(const struct propdef *p, const style_t *st, const struct css_ui_color *field, bool resolved,
+                           sbuf *out) {
+    if (!ui_color_text(st, &field[0], resolved, p->flags == UI_CARET, out)) return false;
+    if (p->flags != UI_CARET || field[1].automatic) return true;
+    sb_putc(out, ' ');
+    return ui_color_text(st, &field[1], resolved, true, out);
+}
+/* the computed value of cursor (its url()s as the cascade holds them: made absolute when declared) */
+static void ui_cursor_text(const struct css_cursor *c, sbuf *out) {
+    for (uint32_t i = 0; i < c->count; i++) {
+        const struct css_cursor_image *im = &c->images[i];
+        if (im->set) sb_puts(out, "image-set(");
+        for (uint32_t j = 0; j < im->count; j++) {
+            const struct css_cursor_choice *o = &im->choices[j];
+            if (j) sb_puts(out, ", ");
+            ui_url_text(out, o->url);
+            if (o->dppx > 0) { sb_putc(out, ' '); anim_unit(out, o->dppx, "x"); }
+            if (o->type) { sb_puts(out, " type("); ui_string(out, o->type); sb_putc(out, ')'); }
+        }
+        if (im->set) sb_putc(out, ')');
+        if (im->hot) { sb_putc(out, ' '); anim_number(out, im->x); sb_putc(out, ' '); anim_number(out, im->y); }
+        sb_puts(out, ", ");
+    }
+    sb_puts(out, kw_name(kw_cursor, c->shape));
+}
+static bool ui_color_equal(const struct css_ui_color *a, const struct css_ui_color *b) {
+    return a->automatic == b->automatic &&
+           (a->automatic || (a->argb == b->argb && css_color_value_equal(a->exact, b->exact)));
+}
+static bool ui_cursor_equal(const struct css_cursor *a, const struct css_cursor *b) {
+    if (a->shape != b->shape || a->count != b->count) return false;
+    for (uint32_t i = 0; i < a->count; i++) {
+        const struct css_cursor_image *x = &a->images[i], *y = &b->images[i];
+        if (x->count != y->count || x->set != y->set || x->hot != y->hot || (x->hot && (x->x != y->x || x->y != y->y)))
+            return false;
+        for (uint32_t j = 0; j < x->count; j++)
+            if (!ui_same(x->choices[j].url, y->choices[j].url) || !ui_same(x->choices[j].type, y->choices[j].type) ||
+                x->choices[j].dppx != y->choices[j].dppx) return false;
+    }
+    return true;
+}
+bool css_ui_equal(const struct css_ui *a, const struct css_ui *b) {
+    if (a == b) return true;
+    if (!a) a = &css_ui_initial;
+    if (!b) b = &css_ui_initial;
+    return ui_cursor_equal(&a->cursor, &b->cursor) && ui_color_equal(&a->caret[0], &b->caret[0]) &&
+           ui_color_equal(&a->caret[1], &b->caret[1]) && ui_color_equal(&a->accent, &b->accent);
+}
+/* the used 8-bit colour of one: currentcolor (auto too) is the element's colour */
+static uint32_t ui_color_used(const style_t *st, const struct css_ui_color *c) {
+    if (c->automatic || c->argb == COLOR_CURRENT)
+        return !c->automatic && c->exact ? css_color_value_argb(c->exact, st->color) : st->color;
+    return c->argb;
+}
+uint32_t css_ui_caret_color(const style_t *st) { return ui_color_used(st, &css_style_ui(st)->caret[0]); }
+bool css_ui_accent_color(const style_t *st, uint32_t *argb) {
+    const struct css_ui_color *c = &css_style_ui(st)->accent;
+    if (c->automatic) return false;
+    *argb = ui_color_used(st, c);
+    return true;
+}
+/* CSSOM: the specified serialization of a declared value; false leaves the authored text */
+static bool ui_specified(const struct propdef *p, const char *v, size_t n, sbuf *out) {
+    for (size_t i = 0; i + 4 <= n; i++) if (strn_ieq(v + i, "var(", 4)) return false;
+    arena_t arena = {.chunk_size = 4096};
+    jmp_buf trap;
+    arena.trap = &trap;
+    size_t begin = out->n;
+    volatile bool ok = false;
+    if (!setjmp(trap)) {
+        style_t scratch;
+        css_style_init(&scratch, NULL);
+        uint8_t set[1] = {0};
+        struct cx cx = {.s = &scratch, .em = 16, .rem = 16, .vw = 800, .vh = 600, .a = &arena, .set = set,
+                        .supports_probe = true};
+        struct css_cursor cursor;
+        struct css_ui_color colors[2];
+        ok = (p->type == PT_CURSOR ? ui_cursor(v, n, &cx, &cursor, out) : ui_color(p, v, n, &cx, colors, out)) &&
+             !cx.invalid;
+    }
     ar_free(&arena);
     if (!ok) out->n = begin;
     sb_cstr(out);
@@ -3873,7 +4193,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     if (p->group == G_STYLE) return apply_value(p, v, n, cx, (char *)s + p->off);
     /* a group's field: parsed into a copy of the group, which s takes when the value is valid */
     union { struct css_float_shape float_shape; struct css_offset offset; struct css_gap_rules gap_rules;
-            struct css_anchor anchor; } own;
+            struct css_anchor anchor; struct css_ui ui; } own;
     memcpy(&own, group_of(s, p->group), group_size(p->group));
     if (!apply_value(p, v, n, cx, (char *)&own + p->off)) return false;
     group_write(s, p->group, &own, cx->a);
@@ -4052,6 +4372,8 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
     }
     case PT_RULE_INSET: return rule_inset(v, n, cx, (struct css_rule_inset *)field, NULL);
     case PT_ANCHOR: return anchor_value_parse(p->flags, v, n, cx, field, NULL);
+    case PT_CURSOR: return ui_cursor(v, n, cx, (struct css_cursor *)field, NULL);
+    case PT_UI_COLOR: return ui_color(p, v, n, cx, (struct css_ui_color *)field, NULL);
     case PT_CLIP: return parse_clip_rect(v, n, cx, &s->clip);
     case PT_BOX_SHADOW: return parse_box_shadows(v, n, cx, &s->box_shadow, NULL);
     case PT_OPACITY: {
@@ -5013,6 +5335,7 @@ const char *css_ua_sheet(void) {
            "u, ins { text-decoration: underline; } s, strike, del { text-decoration: line-through; }\n"
            "mark { background-color: yellow; color: black; }\n"
            "a:link { color: #0645ad; text-decoration: underline; }\n"
+           ":any-link { cursor: pointer; }\n"
            "abbr[title] { text-decoration: underline; }\n"
            "q::before { content: open-quote; } q::after { content: close-quote; }\n"
            "img, video, canvas, iframe, embed, svg, input, select, textarea, button, meter, progress "
@@ -5590,6 +5913,8 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
     /* gap decorations: currentcolor stays itself, for the cascade to resolve against the element */
     case PT_RULE_LIST: rule_list_text(st, p->flags, (const struct css_rule_list *)field, false, out); break;
     case PT_RULE_INSET: ok = rule_inset_text((const struct css_rule_inset *)field, out, d); break;
+    case PT_CURSOR: ui_cursor_text((const struct css_cursor *)field, out); break;
+    case PT_UI_COLOR: ok = ui_colors_text(p, st, (const struct css_ui_color *)field, false, out); break;
 
     default: return false;
     }
@@ -5667,6 +5992,11 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
         return *(const void *const *)fa == *(const void *const *)fb;
     case PT_MOTION_LIST: return css_motion_equal(&a->motion, &b->motion);
     case PT_ANCHOR: return anchor_value_equal(p->flags, fa, fb);
+    case PT_CURSOR: return ui_cursor_equal((const struct css_cursor *)fa, (const struct css_cursor *)fb);
+    case PT_UI_COLOR: {
+        const struct css_ui_color *x = (const struct css_ui_color *)fa, *y = (const struct css_ui_color *)fb;
+        return ui_color_equal(&x[0], &y[0]) && (p->flags != UI_CARET || ui_color_equal(&x[1], &y[1]));
+    }
     }
     return !memcmp(fa, fb, p->size);
 }
@@ -5848,6 +6178,19 @@ static bool anim_combine(const struct css_anim_ctx *c, const struct propdef *p, 
         css_style_color(a, color_slot(p), &x);
         css_style_color(b, color_slot(p), &y);
         return anim_color(out, a, &x, b, &y, kb, mode);
+    }
+    case PT_UI_COLOR: { /* css-ui-4 §6.2.1, §6.3: by computed value type, auto with nothing (discrete) */
+        const struct css_ui_color *x = (const struct css_ui_color *)fa, *y = (const struct css_ui_color *)fb;
+        int pairs = p->flags == UI_CARET && !(x[1].automatic && y[1].automatic) ? 2 : 1;
+        for (int i = 0; i < pairs; i++) {
+            if (x[i].automatic || y[i].automatic) return false;
+            struct css_color_computed u, v;
+            css_color_held(x[i].argb, x[i].exact, a->color, &u);
+            css_color_held(y[i].argb, y[i].exact, b->color, &v);
+            if (i && !length_append(out, " ", 1)) return false;
+            if (!anim_color(out, a, &u, b, &v, kb, mode)) return false;
+        }
+        return true;
     }
     case PT_RADIUS: {
         const len_t *x = ((const struct css_corner_radius *)fa)->axis, *y = ((const struct css_corner_radius *)fb)->axis;
