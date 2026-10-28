@@ -1834,7 +1834,8 @@ const char *css_font_family_next(arena_t *a,const char **cursor,const char *end)
         }
         finish=s;while(finish>begin && is_space((unsigned char)finish[-1]))finish--;
     }
-    if(finish==begin)goto bad;
+    /* A <string> family name may be empty; a <custom-ident>+ one may not. */
+    if(!quoted && finish==begin)goto bad;
     sbuf b={0};css_unescape(&b,begin,(size_t)(finish-begin));
     if(!quoted) {
         size_t write=0;bool space=false;
@@ -1843,8 +1844,9 @@ const char *css_font_family_next(arena_t *a,const char **cursor,const char *end)
         b.n=write;
     }
     const char *name=ar_strndup(a,b.p?b.p:"",b.n);sb_free(&b);
+    /* <custom-ident> excludes the CSS-wide keywords and default (CSS Values 4). */
     if(!quoted && (!strcasecmp(name,"inherit") || !strcasecmp(name,"initial") || !strcasecmp(name,"unset") ||
-       !strcasecmp(name,"revert") || !strcasecmp(name,"revert-layer")))goto bad;
+       !strcasecmp(name,"revert") || !strcasecmp(name,"revert-layer") || !strcasecmp(name,"default")))goto bad;
     if(s<end){s++;const char *tail=s;while(tail<end && is_space((unsigned char)*tail))tail++;if(tail==end)goto bad;}
     *cursor=s;return name;
 bad:*cursor=NULL;return NULL;
@@ -3281,12 +3283,21 @@ static bool set_font(const char *v, size_t n, struct cx *cx) {
     float fs;
     if (!parse_font_size(sz, szl, cx, &fs)) return false;
     if (fam >= k) return false;
+    /* The shorthand takes <'font-family'>, the property's own grammar: a
+       CSS-wide keyword there is not a family list (CSS Fonts 4 font). */
+    const char *family = t[fam];
+    size_t family_n = (size_t)(v + n - t[fam]);
+    if (ident_is(family, family_n, "inherit") || ident_is(family, family_n, "initial") || ident_is(family, family_n, "unset") ||
+        ident_is(family, family_n, "revert") || ident_is(family, family_n, "revert-layer") || ident_is(family, family_n, "default")) {
+        if (cx->supports_probe) cx->invalid = true;
+        return false;
+    }
     set_long("font-size", sz, szl, cx);
     if (cx->font_pass) return true;
     set_long("font-style", style, stl, cx);
     set_long("font-weight", weight, wl, cx);
     set_long("line-height", lh, lhl, cx);
-    set_long("font-family", t[fam], (size_t)(v + n - t[fam]), cx);
+    set_long("font-family", family, family_n, cx);
     return true;
 }
 

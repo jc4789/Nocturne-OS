@@ -584,6 +584,53 @@ const char *css_ua_sheet(void);
 void css_cascade(web_doc *d, int vw, int vh);
 /* Retry failed font sources against the published style snapshot. */
 void css_refresh_font_selection(web_doc *d);
+/* CSS Font Loading (https://drafts.csswg.org/css-font-loading-3/): the
+   @font-face descriptors its FontFace attributes reflect, FontFace records,
+   the document's font source and its font matching. The page-facing objects
+   are js_font_loading.js; js_fonts.h binds these to it. */
+enum css_font_descriptor {
+    CSS_FONT_FAMILY, CSS_FONT_STYLE, CSS_FONT_WEIGHT, CSS_FONT_WIDTH, CSS_FONT_UNICODE_RANGE,
+    CSS_FONT_FEATURE_SETTINGS, CSS_FONT_VARIATION_SETTINGS, CSS_FONT_DISPLAY, CSS_FONT_ASCENT_OVERRIDE,
+    CSS_FONT_DESCENT_OVERRIDE, CSS_FONT_LINE_GAP_OVERRIDE, CSS_FONT_SIZE_ADJUST, CSS_FONT_DESCRIPTORS
+};
+enum css_font_status { CSS_FONT_UNLOADED, CSS_FONT_LOADING, CSS_FONT_LOADED, CSS_FONT_ERROR };
+struct font_face;
+struct css_font_face;
+/* A CSS-connected FontFace: one @font-face rule of a document style sheet, in
+   document order. occurrence counts earlier instances of the same parsed sheet. */
+struct css_font_rule { struct font_face *face; arena_t *arena; uint64_t id; uint32_t occurrence; };
+/* One face that "find the matching font faces" selected: a rule or a record. */
+struct css_font_match { uint64_t id; uint32_t occurrence; struct css_font_face *author; };
+/* Validate a descriptor (the family never fails: an invalid name is a string).
+   1: valid, *serialized its CSSOM text (malloc); 0: syntax error; -1: allocator. */
+int css_font_descriptor(enum css_font_descriptor which, const char *value, size_t n, char **serialized);
+/* The document's @font-face rules (malloc array). 1; 0 unavailable now
+   (cancelled native work), nothing returned; -1 allocator. */
+int css_font_rules(web_doc *d, struct css_font_rule **rules, size_t *count);
+const char *css_font_rule_descriptor(const struct font_face *face, enum css_font_descriptor which);
+int css_font_rule_set(web_doc *d, const struct css_font_rule *rule, enum css_font_descriptor which, const char *value, size_t n);
+/* Status of a rule's or record's sources; started (load()) demands the next
+   untried source, as does an earlier source having failed. */
+enum css_font_status css_font_rule_status(web_doc *d, struct font_face *face, bool started);
+struct css_font_face *css_font_face_new(void);
+void css_font_face_release(struct css_font_face *f);
+uint64_t css_font_face_id(const struct css_font_face *f);
+const char *css_font_face_descriptor(const struct css_font_face *f, enum css_font_descriptor which);
+int css_font_face_set(web_doc *d, struct css_font_face *f, enum css_font_descriptor which, const char *value, size_t n);
+/* <font-src-list> resolved against base; resources belong to d. 1, 0 syntax error, -1 allocator. */
+int css_font_face_source(web_doc *d, struct css_font_face *f, const char *base, const char *value, size_t n);
+/* Decode a BufferSource source. 1 decoded, 0 not a font, -1 allocator. */
+int css_font_face_data(web_doc *d, struct css_font_face *f, const void *bytes, size_t n);
+enum css_font_status css_font_face_status(web_doc *d, struct css_font_face *f, bool load);
+/* The document's font source: FontFaces added to document.fonts. */
+bool css_font_set_add(web_doc *d, struct css_font_face *f);
+void css_font_set_delete(web_doc *d, struct css_font_face *f);
+void css_font_set_clear(web_doc *d);
+void css_font_set_free(web_doc *d);
+/* Find the matching font faces (CSS Font Loading 3.1) for a font shorthand and
+   text, without system fonts (they are always loaded). 1, 0 syntax error, -1 allocator. */
+int css_font_match(web_doc *d, const char *font, size_t n, const char *text, size_t tn,
+                   struct css_font_match **matches, size_t *count);
 bool css_containers_update(web_doc *d); /* supervisor, after layout; changed query inputs */
 bool css_container_names_valid(const char *s, size_t n);
 void css_mark_dirty(web_doc *d, node_t *n);
@@ -1111,6 +1158,13 @@ struct web_doc {
     double next_sheet_order;
     pvec images;      /* struct web_image* */
     struct web_font_resource *fonts; /* stable URL identities across CSS rescans */
+    /* CSS Font Loading: decoded BufferSource faces (live until the document
+       goes, as styles may still borrow them), FontFace records in
+       document.fonts in insertion order, and a count of changes to the font
+       loads and font source that js_font_loading.js has not yet seen. */
+    struct web_font_resource *font_data;
+    pvec author_fonts; /* struct css_font_face* */
+    uint64_t font_generation;
     pvec svgs;        /* struct svg_cache* */
     box_t *root_box;
     pvec abs_boxes;   /* absolutely positioned boxes, painted last */
@@ -1167,12 +1221,18 @@ bool doc_templates_finish(web_doc *d, node_t *root);
 const char *doc_link_href(web_doc *d, node_t *a); /* node-owner-relative absolute URL; valid until the next call */
 void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *base);
 void doc_viewport_update(web_doc *d,int width,int height); /* size publication; no author callbacks */
+/* wanted: a cascade or text run selected it (reset by each cascade);
+   demanded: a FontFace load (CSS Font Loading) asked for it, until done. */
 struct web_font_resource {
     struct web_font_resource *next;
     char *url;
     font_t *face;
-    bool wanted, loading, done, failed;
+    bool wanted, demanded, loading, done, failed;
 };
+/* Requests that have not yet been sent: the document still waits on them. */
+bool doc_fonts_unrequested(web_doc *d);
+/* A stylesheet the document requested has not yet arrived. */
+bool doc_css_loading(web_doc *d);
 struct web_font_range { uint32_t first,last; };
 struct web_font_choice {
     struct web_font_choice *next;

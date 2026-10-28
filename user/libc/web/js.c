@@ -297,6 +297,11 @@ struct web_js_state {
     unsigned ignore_destructive_writes_counter;
     uint64_t storage_source, storage_poll_due, storage_listeners;
     uint64_t languages_seen; /* webprefs_languages_generation() navigator.languages answers for */
+    /* CSS Font Loading (js_fonts.h): the realm made a FontFace or document.fonts;
+       the doc->font_generation its objects reflect; document.fonts is stuck on
+       the environment, since the layout_revision then. */
+    bool fonts_active, fonts_stuck;
+    uint64_t fonts_seen, fonts_layout_mark;
     char *storage_origin;
     webidb_async *indexed_db;
     struct js_idb_pending *indexed_db_pending;
@@ -2989,6 +2994,7 @@ static void navigate_form_request(struct web_js_state *s, node_t *submitter) {
 }
 #include "js_document_commands.h"
 #include "js_cssom.h"
+#include "js_fonts.h"
 static JSValue native_dom_hooks(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     (void)this_val;struct web_js_state *s=state(ctx);int32_t kind=0;
     if(argc<2||JS_ToInt32(ctx,&kind,argv[0])<0)return JS_EXCEPTION;
@@ -7560,13 +7566,15 @@ static void request_styles(struct web_js_state *s) {
 static void request_fonts(struct web_js_state *s) {
     if(!s->ctx)return;
     for(struct web_font_resource *f=s->doc->fonts;f;f=f->next) {
-        if(!f->wanted || f->loading || f->done)continue;
+        if((!f->wanted && !f->demanded) || f->loading || f->done)continue;
         struct js_pending *p=pending_new(s,P_FONT,f->url);
         if(!p) {
             JSValue error=JS_GetException(s->ctx);JS_FreeValue(s->ctx,error);
             doc_font_loaded(s->doc,f,NULL,0);log_text(s,1,"Font request allocation failed");continue;
         }
         p->font=f;f->loading=true;p->credentials=1;
+        /* A rendering use starts its FontFace loading (CSS Font Loading 2.2). */
+        __atomic_add_fetch(&s->doc->font_generation,1,__ATOMIC_RELAXED);
         /* Font loads use the real anonymous CORS fetch path, not image no-CORS
            or the module synchronous loader. The host retains origin/redirect
            checks and cancellation for this document generation. */
@@ -8361,6 +8369,17 @@ void web_js_tick(web_doc *d, uint64_t now) {
         if(JS_IsException(fired))exception(s);
         JS_FreeValue(s->ctx,fired);end_task(s);ran=true;
     }
+    /* CSS Font Loading: a font load progressed, or the document stopped being
+       pending on the environment while document.fonts was stuck on it. One
+       task updates every FontFace and FontFaceSet of this realm. */
+    if(!ran&&fonts_task_due(s)){
+        s->fonts_seen=__atomic_load_n(&d->font_generation,__ATOMIC_RELAXED);
+        begin_named_task(s,"font loading",s->fonts_seen);
+        JSValue changed=custom_element_hook(s,"fontsChanged",0,NULL);
+        /* A failed update must not leave the task due forever. */
+        if(JS_IsException(changed)){exception(s);s->fonts_stuck=false;}
+        JS_FreeValue(s->ctx,changed);end_task(s);ran=true;
+    }
     if(!ran)ran=!s->disabled&&s->indexed_db_turn&&indexed_db_run_one(s);
     s->indexed_db_turn=!ran;
     if(!ran){ran=!s->disabled&&s->storage_event_turn&&storage_run_event(s,now);s->storage_event_turn=!ran;}
@@ -8524,8 +8543,8 @@ static int64_t js_deadline(web_doc *d, int *why) {
     /* Dirty registration and wanted, unqueued images are work, even after the
        final idle/console task. Do not spin while the bounded queue is full. */
     if (d->resources_dirty || d->images_dirty) DUE_NOW();
-    for(struct web_font_resource *f=d->fonts;f;f=f->next)
-        if(f->wanted && !f->done && !f->loading)DUE_NOW();
+    if(doc_fonts_unrequested(d))DUE_NOW();
+    if(fonts_task_due(s))DUE_NOW();
     for (int i = 0; i < web_image_count(d); i++) {
         if (!web_image_wanted(d, i)) continue;
         DUE_NOW();
@@ -8907,6 +8926,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("idle", 2, native_idle), JS_CFUNC_DEF("cancelIdle", 1, native_cancel_idle),
         JS_CFUNC_DEF("worker", 3, native_worker),
         JS_CFUNC_DEF("cssSupports", 2, native_css_supports),
+        JS_CFUNC_DEF("fonts", 4, native_fonts),
         JS_CFUNC_DEF("cssProperties", 1, native_css_properties),
         JS_CFUNC_DEF("storage", 5, native_storage),
         JS_CFUNC_DEF("indexedDB", 5, native_indexed_db),
