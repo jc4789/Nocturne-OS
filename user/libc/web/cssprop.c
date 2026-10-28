@@ -397,7 +397,17 @@ static struct cexpr *calc_value(const char **s, const char *e, struct cx *cx) {
     const char *u = *s;
     while (*s < e && (isalpha((unsigned char)**s) || **s == '%')) (*s)++;
     struct cexpr *x = cnode(cx, 'v', NULL, NULL);
-    if (!css_unit_px(u, (size_t)(*s - u), v, cx, &x->px, &x->pct, &x->num)) return NULL;
+    size_t un = (size_t)(*s - u);
+    if (cx->time) {
+        /* a <time> calculation: numbers and times, no lengths or percentages */
+        x->num = !un;
+        if (!un) x->px = v;
+        else if (un == 1 && (u[0] | 32) == 's') x->px = v * 1000;
+        else if (un == 2 && (u[0] | 32) == 'm' && (u[1] | 32) == 's') x->px = v;
+        else return NULL;
+        return x;
+    }
+    if (!css_unit_px(u, un, v, cx, &x->px, &x->pct, &x->num)) return NULL;
     return x;
 }
 
@@ -2422,12 +2432,26 @@ static bool motion_name(const char *s, size_t n) {
         s[i]!='_' && s[i]!='-') return false;
     return true;
 }
-static bool motion_time(const char *s,size_t n,float *out) {
+/* a <time> in milliseconds, or a math function of type <time> (CSS Values 4 §10); duration: it
+   may not be negative, which a calculation clamps to 0 (§10.12) and a literal is invalid */
+static bool motion_time(const char *s,size_t n,struct cx *cx,bool duration,float *out) {
     const char *p=s;float v;
+    if (n && isalpha((unsigned char)s[0])) {
+        bool outer=cx->time;
+        cx->time=true;
+        struct cexpr *x=calc_value(&p,s+n,cx);
+        cskip(&p,s+n);
+        cx->time=outer;
+        bool number;float ms,pct;
+        if (!x || p!=s+n || (cx->supports_probe && cx->invalid) || !calc_dimension(x,&number) || number ||
+            !cfold(x,&number,&ms,&pct) || number || pct || isnan(ms)) return false;
+        if (duration && ms<0) ms=0;
+        *out=ms;return true;
+    }
     if (!parse_number(&p,s+n,&v) || !isfinite(v)) return false;
     if (s+n-p==1 && (*p|32)=='s') v*=1000;
     else if (s+n-p!=2 || (p[0]|32)!='m' || (p[1]|32)!='s') return false;
-    if (!isfinite(v)) return false;
+    if (!isfinite(v) || (duration && v<0)) return false;
     *out=v;return true;
 }
 /* <easing-function> (css-easing-1 §2): linear, the cubic-bezier() keywords and function,
@@ -2579,9 +2603,9 @@ static bool motion_item_parse(int list, const struct kw *kws, const char *s, siz
         return true;
     case ML_DURATION:
         if (ident_is(s, n, "auto")) { out->f = NAN; return true; }
-        return motion_time(s, n, &out->f) && out->f >= 0;
-    case ML_TDURATION: return motion_time(s, n, &out->f) && out->f >= 0;
-    case ML_DELAY: case ML_TDELAY: return motion_time(s, n, &out->f);
+        return motion_time(s, n, cx, true, &out->f);
+    case ML_TDURATION: return motion_time(s, n, cx, true, &out->f);
+    case ML_DELAY: case ML_TDELAY: return motion_time(s, n, cx, false, &out->f);
     case ML_EASING: case ML_TEASING: return css_easing_parse(s, n, &out->e);
     case ML_ITERATIONS:
         if (ident_is(s, n, "infinite")) { out->f = INFINITY; return true; }
@@ -2655,7 +2679,7 @@ static bool animation_single(const char *s, size_t n, struct cx *cx, union css_m
     for (int i = 0; i < k; i++) {
         union css_motion_item item;
         if (motion_item_parse(ML_TDELAY, NULL, t[i], tl[i], cx, &item)) {
-            if (times == 0) { if (item.f < 0) return false; v[ML_DURATION] = item; }
+            if (times == 0) { if (!motion_time(t[i], tl[i], cx, true, &item.f)) return false; v[ML_DURATION] = item; }
             else if (times == 1) v[ML_DELAY] = item;
             else return false;
             times++; continue;
@@ -2682,7 +2706,7 @@ static bool transition_single(const char *s, size_t n, struct cx *cx, union css_
     for (int i = 0; i < k; i++) {
         union css_motion_item item;
         if (motion_item_parse(ML_TDELAY, NULL, t[i], tl[i], cx, &item)) {
-            if (times == 0) { if (item.f < 0) return false; v[ML_TDURATION] = item; }
+            if (times == 0) { if (!motion_time(t[i], tl[i], cx, true, &item.f)) return false; v[ML_TDURATION] = item; }
             else if (times == 1) v[ML_TDELAY] = item;
             else return false;
             times++; continue;

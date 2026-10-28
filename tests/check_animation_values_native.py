@@ -188,6 +188,22 @@ int main(void){
     EXPECT(computed("transition-property","all"),"all");
     EXPECT(computed("transition-behavior","allow-discrete, normal"),"allow-discrete, normal");
     EXPECT(computed("transition-duration","-1s"),"PARSE");
+    /* <time> math functions (css-values/calc-time-values.html; css-easing/step-jump-*.html's
+       animation-delay: calc(var(--at) * -1s)); a negative duration calculation clamps to 0 */
+    EXPECT(computed("transition-delay","calc(4s + 1s)"),"5s");
+    EXPECT(computed("transition-delay","calc(4s + 1ms)"),"4.001s");
+    EXPECT(computed("transition-delay","calc(4ms + 1ms)"),"0.005s");
+    EXPECT(computed("transition-delay","calc(4s - 1ms)"),"3.999s");
+    EXPECT(computed("transition-delay","calc(4 * 1s)"),"4s");
+    EXPECT(computed("transition-delay","calc(4ms / 2)"),"0.002s");
+    EXPECT(computed("transition-delay","calc(4000ms)"),"4s");
+    EXPECT(computed("animation-delay","calc(3.0 * -1s)"),"-3s");
+    EXPECT(computed("animation-duration","min(1s, 200ms), max(1s, 200ms)"),"0.2s, 1s");
+    EXPECT(computed("transition-duration","calc(-1s)"),"0s");
+    EXPECT(computed("transition-delay","calc(1px + 1s)"),"PARSE");
+    EXPECT(computed("transition-delay","calc(1s * 2s)"),"PARSE");
+    EXPECT(computed("transition-delay","calc(50%)"),"PARSE");
+    EXPECT(computed("transition-delay","calc(2)"),"PARSE");
     EXPECT(computed("transition-property","none, opacity"),"PARSE");
     /* a shorthand's longhands */
     uint8_t set[css_prop_count()];css_prop_longhands(css_prop_lookup("margin",6),set);
@@ -216,6 +232,10 @@ int main(void){
     EXPECT(wpt_round(shown("color",mix("color","black","orange",.3))),"rgb(77, 50, 0)");
     EXPECT(wpt_round(shown("color",mix("color","black","orange",.6))),"rgb(153, 99, 0)");
     EXPECT(wpt_round(shown("color",mix("color","black","orange",1.5))),"rgb(255, 248, 0)");
+    /* from neutral (the target's yellow) to green: 178.5 and 64.5 round up */
+    EXPECT(wpt_round(shown("color",mix("color","yellow","green",.3))),"rgb(179, 217, 0)");
+    EXPECT(wpt_round(shown("color",mix("color","yellow","green",.6))),"rgb(102, 179, 0)");
+    EXPECT(wpt_round(shown("color",mix("color","yellow","green",1.5))),"rgb(0, 65, 0)");
     EXPECT(wpt_round(shown("color",mix("color","rgb(0 0 0)","color(srgb 1 1 1)",-.3))),"oklab(0 0 0)");
     EXPECT(wpt_round(shown("color",mix("color","rgb(0 0 0)","color(srgb 1 1 1)",0))),"oklab(0 0 0)");
     EXPECT(wpt_round(shown("color",mix("color","rgb(0 0 0)","color(srgb 1 1 1)",.3))),"oklab(0.3 0 0)");

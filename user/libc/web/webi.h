@@ -833,6 +833,7 @@ struct cx {
     float cq_width, cq_height;
     bool cq_width_set, cq_height_set;
     bool absolute_lengths; /* relative lengths and percentages fail (Geometry's matrix strings) */
+    bool time;             /* calc() takes <time> (s, ms; in milliseconds where it takes lengths) */
     bool computed_text;    /* the value is computed-value text the animation layer wrote (css_anim_parse):
                               what a style sheet's parse clamps (rgb()'s components) keeps its value */
 };
