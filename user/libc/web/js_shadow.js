@@ -51,13 +51,18 @@ const shadowBridge = (() => {
             set(value){get(this,'elementBrand');reflectedAttr(this,'slot',string(value));}},
         attachShadow:{configurable:true,enumerable:true,writable:true,value:function(init){
             get(this,'elementBrand');if(!arguments.length)throw new TypeError('ShadowRootInit required');
-            const o=dictionary(init),clonable=!!o.clonable,registry=o.customElementRegistry,delegates=!!o.delegatesFocus;
+            const o=dictionary(init),clonable=!!o.clonable;
+            const registry=customElementsBridge.registryOption(o.customElementRegistry),delegates=!!o.delegatesFocus;
             const modeValue=o.mode;if(modeValue===undefined)throw new TypeError('Shadow root mode required');
             const mode=string(modeValue),serializable=!!o.serializable,assignmentValue=o.slotAssignment;
             const assignment=assignmentValue===undefined?'named':string(assignmentValue);
             if(!['open','closed'].includes(mode) || !['named','manual'].includes(assignment))throw new TypeError('Invalid shadow root mode or slot assignment');
+            // DOM attachShadow: the node document's registry unless the dictionary gives one;
+            // a global one must be that document's.
             const owner=get(this,'ownerDocument');
-            const selectedRegistry=customElementsBridge.registryOption(registry,customElementsBridge.registryFor(owner));
+            const selectedRegistry=registry===undefined?customElementsBridge.registryFor(owner):registry;
+            if(customElementsBridge.globalOther(selectedRegistry,owner))
+                throw new DOMException('A global CustomElementRegistry of another document','NotSupportedError');
             const existing=get(this,'shadowRoot');
             if(!get(this,'shadowHostValid') || !customElementsBridge.allowShadow(this) ||
                existing && (!get(existing,'shadowDeclarative') || get(existing,'shadowMode')!==mode))

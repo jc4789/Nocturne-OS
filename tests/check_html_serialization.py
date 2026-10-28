@@ -1,6 +1,7 @@
 """Compile the exact HTML/XML serializer with allocator/checkpoint fault probes.
 
-Only the native tree fixture, cancellation and node_attr consumers are shims.
+Only the native tree fixture, cancellation, node_attr and whether a document runs
+script (web_js_enabled) are shims; the custom element registry slots are dom.c's.
 This supplements native JS and real-site acceptance; it is not rendering evidence.
 """
 from pathlib import Path
@@ -28,16 +29,18 @@ prefix = r'''
 #include <stdbool.h>
 #include <string.h>
 typedef struct {char *p;size_t n,cap;} sbuf;
-typedef struct web_doc {bool live,inert;struct web_doc *dom_family;} web_doc;
+typedef struct web_doc {bool live,inert,scripting;struct web_doc *dom_family;
+    int32_t custom_registry_id;void *custom_registry_realm;struct node *root;} web_doc;
 typedef struct node node_t;
 struct attr {const char *name,*raw,*value,*namespace_uri,*prefix,*local;node_t *node;};
 struct node {web_doc *owner;int type,namespace_id,tag,nattrs;size_t textlen,public_id_len,system_id_len;
     const char *name,*raw_name,*custom_is,*public_id,*system_id;char *text;struct attr *attrs;
     const char *prefix,*local_name,*namespace_uri;bool cdata;
-    node_t *first,*next,*parent,*template_content,*shadow_root;
+    node_t *first,*next,*parent,*template_content,*shadow_root,*shadow_host;
     bool doctype_identifiers_sized,shadow_serializable,shadow_closed,shadow_delegates_focus,shadow_clonable,shadow_manual;
-    int custom_registry_id;
+    int32_t custom_registry_id;void *custom_registry_realm;
 };
+static bool web_js_enabled(web_doc *d){return d->scripting;}
 static int allocations,fail_allocation=-1,live_allocations,checkpoints,cancel_at=-1;
 static void *fault_malloc(size_t n){if(allocations++==fail_allocation)return NULL;void *p=malloc(n);if(p)live_allocations++;return p;}
 static void *fault_realloc(void *p,size_t n){if(allocations++==fail_allocation)return NULL;void *q=realloc(p,n);if(q&&!p)live_allocations++;return q;}
@@ -58,9 +61,10 @@ buffer += between(util, "char *sb_cstr(", "void pv_push(")
 compare = between(util, "bool str_ieq(", "bool strn_ieq(")
 name_validation = between(dom, "static bool xml_name_start(", "void doc_create_diagnostic(")
 namespaces = between(dom, "const char *doc_element_namespace(", "/* DOM \"create an element\"'s names")
+registries = between(dom, "static int32_t document_registry(", "/* DOM \"adopt\", the registry")
 cases = (root / "tests/html_serialization_host_cases.c").read_text(encoding="utf-8")
 generated = out / "serializer.c"
-generated.write_text(prefix+tags+types+statuses+buffer+compare+name_validation+namespaces+
+generated.write_text(prefix+tags+types+statuses+buffer+compare+name_validation+namespaces+registries+
                      source.replace('#include "html_serialize.h"', '')+cases, encoding="utf-8")
 cc = root / "tools/msys64/ucrt64/bin/clang.exe"
 env = dict(os.environ, PATH=str(cc.parent)+os.pathsep+os.environ.get("PATH", ""))

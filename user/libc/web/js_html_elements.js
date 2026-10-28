@@ -553,6 +553,11 @@ const htmlElementsBridge = (() => {
             rawDom.get(parent,'localName')==='fieldset'?rawDom.get(parent,'form:fieldset'):null;
     }});
     reflectBoolean(HTMLOptGroupElement,'disabled');reflectInterface(HTMLOptGroupElement,'label');reflectInterface(HTMLMapElement,'name');
+    // HTML template: the declarative shadow root's content attributes.
+    enumerated(HTMLTemplateElement,'template','shadowRootMode','shadowrootmode',['open','closed'],'');
+    enumerated(HTMLTemplateElement,'template','shadowRootSlotAssignment','shadowrootslotassignment',['named','manual'],'named');
+    for(const property of ['shadowRootDelegatesFocus','shadowRootSerializable','shadowRootClonable'])reflectBoolean(HTMLTemplateElement,property);
+    reflectInterface(HTMLTemplateElement,'shadowRootCustomElementRegistry');
     const mapAreas=new WeakMap();
     define(HTMLMapElement.prototype,'areas',{configurable:true,enumerable:true,get(){
         interfaceBrand(this,'HTMLMapElement');let areas=mapAreas.get(this);

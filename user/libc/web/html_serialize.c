@@ -74,13 +74,18 @@ static void serialize_children(const node_t *node, sbuf *out,const struct serial
     const node_t *parent = node->type == N_ELEM && node->namespace_id == NS_HTML && node->tag == T_template ?
         node->template_content : node;
     if(node->shadow_root && include_shadow(node->shadow_root,options)){
-        const node_t *r=node->shadow_root;
+        node_t *r=node->shadow_root;
         sb_puts(out,"<template shadowrootmode=\"");sb_puts(out,r->shadow_closed?"closed":"open");sb_putc(out,'"');
         if(r->shadow_delegates_focus)sb_puts(out," shadowrootdelegatesfocus=\"\"");
-        if(r->shadow_clonable)sb_puts(out," shadowrootclonable=\"\"");
         if(r->shadow_serializable)sb_puts(out," shadowrootserializable=\"\"");
         if(r->shadow_manual)sb_puts(out," shadowrootslotassignment=\"manual\"");
-        if(r->custom_registry_id==-1)sb_puts(out," shadowrootcustomelementregistry=\"\"");
+        if(r->shadow_clonable)sb_puts(out," shadowrootclonable=\"\"");
+        /* shouldAppendRegistryAttribute: unless the node document's and the shadow root's
+           registries are both null or both global. */
+        int32_t document_registry=doc_custom_registry(r->owner?r->owner->root:NULL,NULL);
+        int32_t shadow_registry=doc_custom_registry(r,NULL);
+        if(!(document_registry==-1&&shadow_registry==-1) && !(document_registry==0&&shadow_registry==0))
+            sb_puts(out," shadowrootcustomelementregistry=\"\"");
         sb_putc(out,'>');serialize_children(r,out,options);sb_puts(out,"</template>");
     }
     for (const node_t *child = parent ? parent->first : NULL; child; child = child->next)
