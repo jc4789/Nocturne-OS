@@ -13,7 +13,16 @@
 function objectURLInterfaces(realm) {
     const URLType=URL, apply=Reflect.apply, define=Object.defineProperty, setPrototype=Object.setPrototypeOf;
     const urls=new Map(), get=Map.prototype.get, put=Map.prototype.set, remove=Map.prototype.delete;
-    const randomUUID=crypto.randomUUID, cryptoObject=crypto, indexOf=String.prototype.indexOf, strSlice=String.prototype.slice;
+    const getRandomValues=crypto.getRandomValues, cryptoObject=crypto, indexOf=String.prototype.indexOf, strSlice=String.prototype.slice;
+    /* WebCrypto's "generate a random UUID" (version 4). Not crypto.randomUUID: that member is
+       [SecureContext], and a blob URL is made in every environment. */
+    function randomUUID(){
+        const bytes=apply(getRandomValues,cryptoObject,[new Uint8Array(16)]),hex='0123456789abcdef';
+        bytes[6]=(bytes[6]&15)|64;bytes[8]=(bytes[8]&63)|128;
+        let result='';
+        for(let i=0;i<16;i++){if(i===4||i===6||i===8||i===10)result+='-';result+=hex[bytes[i]>>4]+hex[bytes[i]&15];}
+        return result;
+    }
     const urlGetter=name=>Object.getOwnPropertyDescriptor(URLType.prototype,name).get, href=urlGetter('href'), protocol=urlGetter('protocol');
     let mediaBrand=()=>false;
     const string=v=>{if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol to string');return String(v);};
@@ -25,7 +34,7 @@ function objectURLInterfaces(realm) {
     function createObjectURL(value){
         const blob=blobBridge.brand(value),media=mediaBrand(value);
         if(!blob&&!media)throw new TypeError('Blob or MediaSource required');
-        let id;do id='blob:'+realm.origin()+'/'+apply(randomUUID,cryptoObject,[]);while(lookup(id));
+        let id;do id='blob:'+realm.origin()+'/'+randomUUID();while(lookup(id));
         apply(put,urls,[id,setPrototype({value,blob,policyHeaders:realm.policy()},null)]);return id;
     }
     /* revokeObjectURL: the parsed URL's entry, when it is a blob: URL, "removed from the blob URL

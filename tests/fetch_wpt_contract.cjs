@@ -191,9 +191,12 @@ const hideObjectURLs = () => { for (const name of ['createObjectURL', 'revokeObj
     Object.defineProperty(URL, name, {value: undefined, writable: true, configurable: true, enumerable: false}); };
 /* The realm's shared start: what both a Window's and a Worker's bootstrap have before Fetch:
    js_xhr.js's ProgressEvent and js_blob.js (this tree's, the environment of every REV). */
+/* The realm's Crypto has getRandomValues only: a blob URL is made in every environment, secure or
+   not, so js_object_url.js must not lean on the [SecureContext] members (randomUUID, subtle). */
+const insecureCrypto = {getRandomValues: array => globalThis.crypto.getRandomValues(array)};
 function context(rev, network) {
     hideObjectURLs();
-    const c = {console, URL, URLSearchParams, TextEncoder, TextDecoder, setTimeout, clearTimeout, crypto: globalThis.crypto,
+    const c = {console, URL, URLSearchParams, TextEncoder, TextDecoder, setTimeout, clearTimeout, crypto: insecureCrypto,
         location: new URL(BASE_URL), queueMicrotask, Buffer, WeakRef, FinalizationRegistry, digest, __gc: global.gc};
     vm.createContext(c);
     c.self = vm.runInContext('globalThis', c);

@@ -1547,15 +1547,18 @@ int main(int argc, char **argv) {
         }
     }
     if(argc>1 && !strcmp(argv[1],"wasm-policy")){
-        const char *policies[]={"Content-Security-Policy: script-src 'self'\r\n",
-            "Content-Security-Policy: default-src 'none';script-src 'wasm-unsafe-eval'\r\n",
+        /* The cases run as the page's inline script, under styled elements: each enforced policy
+           allows inline script and style ('unsafe-inline' never authorizes compiling WebAssembly),
+           so its only violations are the five compilations. */
+        const char *policies[]={"Content-Security-Policy: script-src 'self' 'unsafe-inline'\r\n",
+            "Content-Security-Policy: default-src 'none';script-src 'unsafe-inline' 'wasm-unsafe-eval';style-src 'unsafe-inline'\r\n",
             "Content-Security-Policy-Report-Only: default-src 'none'\r\n",NULL};
         const char *tails[]={";runWasmPolicyCases(false,5)",";runWasmPolicyCases(true,0)",";runWasmPolicyCases(true,5)",";runWasmPolicyCases(false,5)"};
         const char suffix[]=".then(n=>{console.log('WebAssembly policy checks '+n);mark('api-done');},e=>{check('wasm-policy-error',false);console.log('FAIL wasm-policy '+e+' '+e.stack);mark('api-done');});";
         for(size_t i=0;i<sizeof policies/sizeof *policies;i++){
             char tail[sizeof ";runWasmPolicyCases(false,5)"+sizeof suffix];snprintf(tail,sizeof tail,"%s%s",tails[i],suffix);
             case_response_headers=policies[i];
-            case_meta_policy=policies[i]?NULL:"<meta http-equiv=Content-Security-Policy content=\"script-src 'none'\">";
+            case_meta_policy=policies[i]?NULL:"<meta http-equiv=Content-Security-Policy content=\"script-src 'unsafe-inline'\">";
             external_case("js_wasm_cases.js",tail,BASE);case_response_headers=case_meta_policy=NULL;
         }
     }
