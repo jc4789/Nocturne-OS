@@ -591,6 +591,9 @@ struct JSContext {
     void *user_opaque;
     JSDynamicCodeCheck *dynamic_code_check;
     void *dynamic_code_opaque;
+#ifdef CONFIG_NOCTURNE
+    const JSGlobalIndexMethods *global_index; /* JS_SetGlobalIndexMethods */
+#endif
 };
 
 typedef union JSFloat64Union {
@@ -827,6 +830,11 @@ typedef struct JSTypedArray {
 
 typedef struct JSGlobalObject {
     JSValue uninitialized_vars; /* hidden object containing the list of uninitialized variables */
+#ifdef CONFIG_NOCTURNE
+    /* The realm whose global object this is, for its index methods. Not a
+       reference: JS_FreeContext clears it, the object may outlive the realm. */
+    JSContext *realm;
+#endif
 } JSGlobalObject;
 
 typedef struct JSAsyncFunctionState {
@@ -2402,6 +2410,11 @@ void JS_SetPlatformScriptPrefix(JSRuntime *rt, const char *prefix)
     snprintf(rt->platform_script_prefix, sizeof rt->platform_script_prefix, "%s", prefix ? prefix : "");
 }
 
+void JS_SetGlobalIndexMethods(JSContext *realm, const JSGlobalIndexMethods *methods)
+{
+    realm->global_index = methods;
+}
+
 int JS_EnqueueJobForCallback(JSContext *ctx, JSValueConst callback,
                              JSJobFunc *job_func, int argc, JSValueConst *argv)
 {
@@ -2948,6 +2961,11 @@ void JS_FreeContext(JSContext *ctx)
 
     js_free_modules(ctx, JS_FREE_MODULE_ALL);
 
+#ifdef CONFIG_NOCTURNE
+    /* the global object may outlive its realm: it has no index methods then */
+    if (JS_VALUE_GET_TAG(ctx->global_obj) == JS_TAG_OBJECT)
+        JS_VALUE_GET_OBJ(ctx->global_obj)->u.global_object.realm = NULL;
+#endif
     JS_FreeValue(ctx, ctx->global_obj);
     JS_FreeValue(ctx, ctx->global_var_obj);
 
@@ -5946,6 +5964,9 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
         break;
     case JS_CLASS_GLOBAL_OBJECT:
         p->u.global_object.uninitialized_vars = JS_UNDEFINED;
+#ifdef CONFIG_NOCTURNE
+        p->u.global_object.realm = NULL;
+#endif
         break;
     default:
     set_exotic:
@@ -8648,6 +8669,77 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     return 0;
 }
 
+#ifdef CONFIG_NOCTURNE
+/* HTML "The WindowProxy exotic object" (JS_SetGlobalIndexMethods): a realm
+   global object's array index keys are its document-tree child navigables.
+   Only these keys of the global object come here, after a test of the atom's
+   tag bit; every other key and object keeps the upstream paths. The global
+   object never has an own index property: [[DefineOwnProperty]] and [[Set]]
+   create none (js_global_index_reserved), so the index answers below need
+   not come before the ordinary own-property lookup that misses. */
+static inline JSContext *js_global_index_realm(JSObject *p)
+{
+    JSContext *realm = p->u.global_object.realm;
+    return realm && realm->global_index ? realm : NULL;
+}
+
+/* [[GetOwnProperty]] step 2 for a tagged integer P: the descriptor
+   {value, writable: false, enumerable: true, configurable: true} of the child
+   at that index, else no property (2.5.1, also without methods). */
+static int js_global_index_get_own(JSContext *ctx, JSPropertyDescriptor *desc,
+                                   JSObject *p, JSAtom prop)
+{
+    JSContext *realm = js_global_index_realm(p);
+    JSValue val;
+    int ret;
+
+    if (!realm)
+        return FALSE;
+    ret = realm->global_index->get(ctx, realm, __JS_AtomToUInt32(prop),
+                                   desc ? &val : NULL);
+    if (ret <= 0)
+        return ret;
+    if (desc) {
+        desc->flags = JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE;
+        desc->value = val;
+        desc->getter = JS_UNDEFINED;
+        desc->setter = JS_UNDEFINED;
+    }
+    return TRUE;
+}
+
+/* [[DefineOwnProperty]] step 2.1 and [[Set]] step 3.1: no array index
+   property name is created, the tagged ones nor 2^31 .. 2^32-2 (string atoms). */
+static BOOL js_global_index_reserved(JSContext *ctx, JSObject *p, JSAtom prop)
+{
+    uint32_t idx;
+    return js_global_index_realm(p) && JS_AtomIsArrayIndex(ctx, &idx, prop);
+}
+
+/* [[OwnPropertyKeys]] steps 2-3: the number of keys 0 .. n-1. */
+static int js_global_index_count(JSContext *ctx, JSObject *p, uint32_t *pcount)
+{
+    JSContext *realm = js_global_index_realm(p);
+
+    *pcount = 0;
+    if (!realm)
+        return 0;
+    if (realm->global_index->count(ctx, realm, pcount)) {
+        *pcount = 0;
+        return -1;
+    }
+    /* the keys stay tagged integers */
+    if (*pcount > (uint32_t)JS_ATOM_MAX_INT + 1)
+        *pcount = (uint32_t)JS_ATOM_MAX_INT + 1;
+    return 0;
+}
+
+static int js_global_index_define_refused(JSContext *ctx, int flags)
+{
+    return JS_ThrowTypeErrorOrFalse(ctx, flags, "cannot define an array index property of a WindowProxy");
+}
+#endif
+
 JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                JSAtom prop, JSValueConst this_obj,
                                BOOL throw_ref_error)
@@ -8793,6 +8885,24 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                 }
             }
         }
+#ifdef CONFIG_NOCTURNE
+        else if (unlikely(__JS_AtomIsTaggedInt(prop)) &&
+                 p->class_id == JS_CLASS_GLOBAL_OBJECT) {
+            /* WindowProxy [[Get]] step 3: OrdinaryGet over its
+               [[GetOwnProperty]]; no child, the prototypes answer */
+            JSPropertyDescriptor desc;
+            int ret;
+            JSValue obj1;
+
+            obj1 = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+            ret = js_global_index_get_own(ctx, &desc, p, prop);
+            JS_FreeValue(ctx, obj1);
+            if (ret < 0)
+                return JS_EXCEPTION;
+            if (ret)
+                return desc.value;
+        }
+#endif
         p = p->shape->proto;
         if (!p)
             break;
@@ -9051,13 +9161,29 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
     BOOL is_enumerable, num_sorted;
     uint32_t num_key;
     JSAtomKindEnum kind;
+#ifdef CONFIG_NOCTURNE
+    uint32_t global_index_count = 0;
+#endif
 
     /* clear pointer for consistency in case of failure */
     *ptab = NULL;
     *plen = 0;
 
+#ifdef CONFIG_NOCTURNE
+    /* WindowProxy [[OwnPropertyKeys]] steps 2-4: the keys 0 .. n-1, then the
+       ordinary ones. Asked before the shape is read, as the host may run script. */
+    if (unlikely(p->class_id == JS_CLASS_GLOBAL_OBJECT) &&
+        (flags & JS_GPN_STRING_MASK)) {
+        if (js_global_index_count(ctx, p, &global_index_count))
+            return -1;
+    }
+#endif
+
     /* compute the number of returned properties */
     num_keys_count = 0;
+#ifdef CONFIG_NOCTURNE
+    num_keys_count = global_index_count;
+#endif
     str_keys_count = 0;
     sym_keys_count = 0;
     exotic_keys_count = 0;
@@ -9227,6 +9353,13 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
             js_free(ctx, tab_exotic);
         }
     }
+#ifdef CONFIG_NOCTURNE
+    for(num_key = 0; num_key < global_index_count; num_key++) {
+        tab_atom[num_index].atom = __JS_AtomFromUInt32(num_key);
+        tab_atom[num_index].is_enumerable = TRUE;
+        num_index++;
+    }
+#endif
 
     assert(num_index == num_keys_count);
     assert(str_index == num_keys_count + str_keys_count);
@@ -9305,6 +9438,11 @@ retry:
         }
         return TRUE;
     }
+#ifdef CONFIG_NOCTURNE
+    /* WindowProxy [[GetOwnProperty]] step 2 */
+    if (unlikely(__JS_AtomIsTaggedInt(prop)) && p->class_id == JS_CLASS_GLOBAL_OBJECT)
+        return js_global_index_get_own(ctx, desc, p, prop);
+#endif
     if (p->is_exotic) {
         if (p->fast_array) {
             /* specific case for fast arrays */
@@ -9841,6 +9979,15 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
             }
         }
     }
+#ifdef CONFIG_NOCTURNE
+    else if (unlikely(__JS_AtomIsTaggedInt(atom)) && p->class_id == JS_CLASS_GLOBAL_OBJECT) {
+        /* WindowProxy [[Delete]] step 2.1: false while the index names a
+           child, asked again on every delete */
+        int ret = js_global_index_get_own(ctx, NULL, p, atom);
+        if (ret)
+            return ret < 0 ? -1 : FALSE;
+    }
+#endif
     /* not found */
     return TRUE;
 }
@@ -10272,6 +10419,15 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                 }
             }
         }
+#ifdef CONFIG_NOCTURNE
+        else if (unlikely(__JS_AtomIsTaggedInt(prop)) &&
+                 p1->class_id == JS_CLASS_GLOBAL_OBJECT && js_global_index_realm(p1)) {
+            /* WindowProxy [[Set]] step 3.1: false, whatever the receiver,
+               before any prototype is asked (2^31 .. 2^32-2 are refused by
+               JS_CreateProperty) */
+            goto read_only_prop;
+        }
+#endif
         p1 = p1->shape->proto;
     prototype_lookup:
         if (!p1)
@@ -10655,6 +10811,12 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
     var_ref = NULL;
     delete_obj = NULL;
     if (flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) {
+#ifdef CONFIG_NOCTURNE
+        /* WindowProxy [[DefineOwnProperty]] step 2.1 (accessor) */
+        if (unlikely(p->class_id == JS_CLASS_GLOBAL_OBJECT) &&
+            js_global_index_reserved(ctx, p, prop))
+            return js_global_index_define_refused(ctx, flags);
+#endif
         prop_flags = (flags & (JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE)) |
             JS_PROP_GETSET;
     } else {
@@ -10663,6 +10825,12 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
             JSObject *p1 = JS_VALUE_GET_OBJ(p->u.global_object.uninitialized_vars);
             JSShapeProperty *prs1;
             JSProperty *pr1;
+#ifdef CONFIG_NOCTURNE
+            /* WindowProxy [[DefineOwnProperty]] step 2.1 (data), also the
+               end of [[Set]] for 2^31 .. 2^32-2 */
+            if (js_global_index_reserved(ctx, p, prop))
+                return js_global_index_define_refused(ctx, flags);
+#endif
             prs1 = find_own_property(&pr1, p1, prop);
             if (prs1) {
                 delete_obj = p1;
@@ -57863,6 +58031,9 @@ static int JS_AddIntrinsicBasicObjects(JSContext *ctx)
         obj = JS_NewObjectProtoClassAlloc(ctx, JS_NULL, JS_CLASS_OBJECT, 4);
         p = JS_VALUE_GET_OBJ(ctx->global_obj);
         p->u.global_object.uninitialized_vars = obj;
+#ifdef CONFIG_NOCTURNE
+        p->u.global_object.realm = ctx;
+#endif
     }
     ctx->global_var_obj = JS_NewObjectProtoClassAlloc(ctx, JS_NULL,
                                                       JS_CLASS_OBJECT, 16);

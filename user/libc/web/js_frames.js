@@ -129,8 +129,14 @@
             return collectionBridge.html(()=>{refreshNames();return lookup(namedElements,key)||[];});
         }
         let namedObject;
+        // An array index is never an own property of the Window: the
+        // WindowProxy refuses to define one, and the global object's indexed
+        // properties are the WindowProxy's (its child navigables), which the
+        // visibility algorithm does not ask. Template and >>> do not call
+        // author code.
+        const arrayIndex=key=>{const n=+key;return (n>>>0)===n&&n!==4294967295&&`${n}`===key;};
         function visibleName(key){
-            if(typeof key!=='string'||namedGetOwn(globalThis,key))return false;
+            if(typeof key!=='string'||!arrayIndex(key)&&namedGetOwn(globalThis,key))return false;
             for(let p=namedGetPrototype(globalThis);p;p=namedGetPrototype(p))
                 if(p!==namedObject&&namedGetOwn(p,key))return false;
             return true;
@@ -165,7 +171,10 @@
             parent:{configurable:true,get(){const token=host.frame('parent',selfToken);return token===selfToken?globalThis:windowProxy(token);}},
             top:{configurable:true,get(){const token=host.frame('top',selfToken);return token===selfToken?globalThis:windowProxy(token);}},
             frameElement:{configurable:true,get(){return access('frameElement',selfToken);}},
-            frames:{configurable:true,get(){return windowProxy(selfToken);}},
+            // As defaultView: a top-level Window's WindowProxy is its global
+            // object, which answers frames[i] itself (quickjs.c's global index
+            // methods); a child's is the proxy its embedder holds.
+            frames:{configurable:true,get(){return host.frame('top',selfToken)===selfToken?globalThis:windowProxy(selfToken);}},
             length:{configurable:true,get(){return access('length',selfToken);}},
             name:{configurable:true,enumerable:true,
                 get(){if(this!==globalThis)throw new TypeError('Illegal Window receiver');return access('name',selfToken);},

@@ -8953,6 +8953,9 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     s->hooks = platform_run(s->ctx, &bindings_program, &bindings);
     if (JS_IsException(s->hooks)) { exception(s); s->hooks = JS_UNDEFINED; end_task(s); goto failed; }
     JS_SetDynamicCodeCheck(s->ctx,trusted_code_check,s);
+    /* The global object's "0".."n-1" are its child navigables' WindowProxies,
+       from frameBridge (the hooks), as window.frames[i] gives them. */
+    JS_SetGlobalIndexMethods(s->ctx,&frame_global_index);
     if (web_atomics_isolation(s->ctx, d->cross_origin_isolated) < 0) { exception(s); end_task(s); goto failed; }
     s->dispatch = JS_GetPropertyStr(s->ctx, s->hooks, "dispatch"); s->response = JS_GetPropertyStr(s->ctx, s->hooks, "response");
     s->reject = JS_GetPropertyStr(s->ctx, s->hooks, "reject");
