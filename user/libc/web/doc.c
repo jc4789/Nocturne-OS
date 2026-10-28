@@ -2337,6 +2337,17 @@ static double scroll_align_delta(double first, double last, double start, double
     return 0;
 }
 
+struct scroll_target_union { double left, top, right, bottom; bool found; };
+static bool scroll_target_span(void *opaque, const box_t *space, double x, double y, double w, double h) {
+    (void)space;
+    struct scroll_target_union *u = opaque;
+    if (!u->found) { u->left = x; u->top = y; u->right = x + w; u->bottom = y + h; u->found = true; return true; }
+    if (x < u->left) u->left = x;
+    if (y < u->top) u->top = y;
+    if (x + w > u->right) u->right = x + w;
+    if (y + h > u->bottom) u->bottom = y + h;
+    return true;
+}
 static bool scroll_target_rect(node_t *n, double r[4]) {
     box_t *b = n->box;
     if (!b || !b->st || b->st->display == D_NONE) return false;
@@ -2346,25 +2357,12 @@ static bool scroll_target_rect(node_t *n, double r[4]) {
         r[2] = b->w + b->p[1] + b->p[3] + b->b[1] + b->b[3];
         r[3] = b->h + b->p[0] + b->p[2] + b->b[0] + b->b[2];
     } else {
-        /* Native inline fragments are deco spans in their formatting block,
-           not a fabricated parentNode relationship or the unpositioned inline
-           box. Union this element's painted spans in its first native block. */
-        box_t *a = n->anchor_block;
-        if (!a) return false;
-        double x = box_visual_x(a), y = box_visual_y(a) + a->content_dy;
-        if (box_element_scrollable(a)) { x -= a->node->scroll_x; y -= a->node->scroll_y; }
-        bool found = false;
-        double right = 0, bottom = 0;
-        for (int i = 0; i < a->ndecos; i++) {
-            const struct deco *span = &a->decos[i];
-            if (span->node != n) continue;
-            double l = x + span->x, t = y + span->y, rr = l + span->w, bb = t + span->h;
-            if (!found) { r[0] = l; r[1] = t; right = rr; bottom = bb; found = true; }
-            else { if (l < r[0]) r[0] = l; if (t < r[1]) r[1] = t;
-                   if (rr > right) right = rr; if (bb > bottom) bottom = bb; }
-        }
-        if (!found) return false;
-        r[2] = right - r[0]; r[3] = bottom - r[1];
+        /* Native inline fragments are deco spans in their formatting block (layout owns
+           which), not a fabricated parentNode relationship or the unpositioned inline box. */
+        struct scroll_target_union u = {0};
+        layout_inline_rects(n, true, scroll_target_span, &u);
+        if (!u.found) return false;
+        r[0] = u.left; r[1] = u.top; r[2] = u.right - u.left; r[3] = u.bottom - u.top;
     }
     return isfinite(r[0]) && isfinite(r[1]) && isfinite(r[2]) && isfinite(r[3]);
 }
@@ -2666,18 +2664,37 @@ bool doc_control_selection_supported(const node_t *n) {
 }
 
 /* Control strings use UTF-8, with WTF-8 for isolated JS UTF-16 surrogates.
-   Count a scalar outside the BMP as two code units; never count bytes as units. */
-static uint32_t control_decode(const char *text, size_t *byte) {
+   Count a scalar outside the BMP as two code units; never count bytes as units.
+   CharacterData is the same encoding, counted: its data may hold U+0000. */
+static uint32_t utf16_decode(const char *text, size_t length, size_t *byte) {
     const unsigned char *p = (const unsigned char *)text + *byte;
+    size_t room = length - *byte;
     uint32_t cp = *p; size_t n = 1;
     if (cp >= 0xc2 && cp <= 0xf4) {
         size_t want = cp < 0xe0 ? 2 : cp < 0xf0 ? 3 : 4;
         uint32_t out = cp & (want == 2 ? 31 : want == 3 ? 15 : 7);
         size_t j = 1;
-        while (j < want && p[j] && (p[j] & 0xc0) == 0x80) { out = (out << 6) | (p[j] & 63); j++; }
+        while (j < want && j < room && (p[j] & 0xc0) == 0x80) { out = (out << 6) | (p[j] & 63); j++; }
         if (j == want && out <= 0x10ffff && out >= (want == 2 ? 0x80u : want == 3 ? 0x800u : 0x10000u)) { cp = out; n = want; }
     }
     *byte += n; return cp;
+}
+/* A NUL ends a control string: it is not a continuation byte either. */
+static uint32_t control_decode(const char *text, size_t *byte) { return utf16_decode(text, SIZE_MAX, byte); }
+uint32_t doc_text_utf16(const char *text, size_t length, size_t byte) {
+    uint32_t units = 0; size_t at = 0;
+    if (byte > length) byte = length;
+    while (text && at < byte) units += utf16_decode(text, length, &at) > 0xffff ? 2 : 1;
+    return units;
+}
+size_t doc_text_byte(const char *text, size_t length, uint32_t offset, bool round_up) {
+    size_t byte = 0; uint32_t at = 0;
+    while (text && byte < length && at < offset) {
+        size_t before = byte; uint32_t count = utf16_decode(text, length, &byte) > 0xffff ? 2 : 1;
+        if (offset - at < count) return round_up ? byte : before;
+        at += count;
+    }
+    return byte;
 }
 uint32_t doc_utf16_length(const char *text) {
     uint32_t length = 0; size_t byte = 0;

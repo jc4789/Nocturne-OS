@@ -3034,14 +3034,16 @@ static bool dom_synchronous_hooks(struct web_js_state *s,int opcode,node_t *n,in
     if(n&&n->type==N_ATTR)n=n->attr_owner;
     return custom_candidate(n);
 }
-/* Snapshot actual CSS border fragments. Inline geometry comes from the same
-   deco spans used by paint/hit testing; querying one node never scans the DOM. */
+/* Snapshot actual CSS border fragments. Inline and text geometry comes from the line
+   layout's own fragments (layout_inline_rects, layout_text_rects), the ones paint and hit
+   testing use; querying one node never scans the DOM or another node's fragments. */
 struct client_rect_output {
     JSContext *ctx;
     JSValueConst list;
     uint32_t count;
     bool first_seen, extent_seen, area_seen;
     bool untransformed, all_fragments;
+    bool failed; /* a script exception is pending */
     double first[4], bounds[4]; /* left, top, right, bottom */
     const box_t *space; /* rects are in this box's untransformed space */
     int sx, sy;
@@ -3074,6 +3076,7 @@ static bool client_rect_append(struct client_rect_output *out,
         return true;
     }
     JSContext *ctx=out->ctx;
+    out->failed=true;
     if (out->count == UINT32_MAX) { JS_ThrowOutOfMemory(ctx); return false; }
     JSValue rect = JS_NewArray(ctx);
     if (JS_IsException(rect)) return false;
@@ -3082,7 +3085,14 @@ static bool client_rect_append(struct client_rect_output *out,
         JS_FreeValue(ctx,rect);return false;
     }
     if (JS_SetPropertyUint32(ctx,out->list,out->count++,rect)<0) return false;
+    out->failed=false;
     return true;
+}
+/* A line layout fragment, in document coordinates, in the space its transforms apply to. */
+static bool client_rect_fragment(void *opaque,const box_t *space,double x,double y,double w,double h) {
+    struct client_rect_output *out=opaque;
+    out->space=space;
+    return client_rect_append(out,x-out->sx,y-out->sy,w,h);
 }
 static bool client_rect_box(struct client_rect_output *out,
                             const box_t *b,int sx,int sy) {
@@ -3096,17 +3106,7 @@ static bool collect_client_rects(struct client_rect_output *out,node_t *n,int sx
     if(!b || !b->st || b->st->display==D_NONE)return true;
     out->sx=sx;out->sy=sy;
     if(b->kind==B_INLINE){
-        box_t *a=n->anchor_block;
-        out->space=a;
-        if(a){
-            double x=(out->untransformed?box_abs_x(a):box_visual_x(a))-sx;
-            double y=(out->untransformed?box_abs_y(a):box_visual_y(a))+a->content_dy-sy;
-            if(!out->untransformed && box_element_scrollable(a)){x-=a->node->scroll_x;y-=a->node->scroll_y;}
-            for(int i=0;i<a->ndecos;i++){
-                const struct deco *span=&a->decos[i];
-                if(span->node==n && !client_rect_append(out,x+span->x,y+span->y,span->w,span->h))return false;
-            }
-        }
+        if(!layout_inline_rects(n,!out->untransformed,client_rect_fragment,out))return false;
     }else{
         b=geometry_principal_box(n);
         out->space=b;
@@ -3130,14 +3130,91 @@ static JSValue element_client_rects(JSContext *ctx,node_t *n,int sx,int sy) {
     if(!collect_client_rects(&out,n,sx,sy)){JS_FreeValue(ctx,list);return JS_EXCEPTION;}
     return list;
 }
+/* CSSOM View getBoundingClientRect of a rectangle list: zeros for none, the first when
+   every one has zero width or height, else the union of those with a width or a height. */
+static void client_rect_bounds(const struct client_rect_output *out,double rect[4],bool *present) {
+    const double *r=out->area_seen?out->bounds:out->first;
+    if(present)*present=out->first_seen;
+    rect[0]=out->first_seen?r[0]:0;rect[1]=out->first_seen?r[1]:0;
+    rect[2]=out->first_seen?r[2]-r[0]:0;rect[3]=out->first_seen?r[3]-r[1]:0;
+}
 static bool client_bounding_rect(JSContext *ctx,node_t *n,int sx,int sy,double rect[4],bool *present) {
     struct client_rect_output out={.ctx=ctx,.list=JS_UNDEFINED};
     if(!collect_client_rects(&out,n,sx,sy))return false;
-    const double *r=out.area_seen?out.bounds:out.first;
-    *present=out.first_seen;
-    rect[0]=out.first_seen?r[0]:0;rect[1]=out.first_seen?r[1]:0;
-    rect[2]=out.first_seen?r[2]-r[0]:0;rect[3]=out.first_seen?r[3]-r[1]:0;
+    client_rect_bounds(&out,rect,present);
     return true;
+}
+/* The DOMRect fields of x, y, width, height for the bindings to copy. */
+static JSValue client_rect_object(JSContext *ctx,const double r[4]) {
+    double left=r[0],top=r[1],w=r[2],h=r[3];
+    JSValue result=JS_NewObject(ctx);
+    if(JS_IsException(result))return result;
+    JS_DefinePropertyValueStr(ctx, result, "x", JS_NewFloat64(ctx, left), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "y", JS_NewFloat64(ctx, top), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, result, "left", JS_NewFloat64(ctx, left), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "top", JS_NewFloat64(ctx, top), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, result, "right", JS_NewFloat64(ctx, left + w), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "bottom", JS_NewFloat64(ctx, top + h), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, result, "width", JS_NewFloat64(ctx, w), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "height", JS_NewFloat64(ctx, h), JS_PROP_C_W_E);
+    return result;
+}
+static int node_address_order(const void *a,const void *b) {
+    uintptr_t x=(uintptr_t)*(node_t *const *)a,y=(uintptr_t)*(node_t *const *)b;
+    return (x>y)-(x<y);
+}
+/* The node after n's subtree in tree order (not shadow-including). */
+static node_t *range_after_subtree(node_t *n) {
+    for(;n;n=n->parent)if(n->next)return n->next;
+    return NULL;
+}
+static bool range_character_data(const node_t *n) { return n->type==N_TEXT || n->type==N_COMMENT || n->type==N_PI; }
+/* The first node at or after boundary point (n, offset) in tree order. */
+static node_t *range_boundary_node(node_t *n,uint32_t offset) {
+    if(range_character_data(n))return n;
+    node_t *c=n->first;
+    for(;c && offset;offset--)c=c->next;
+    return c?c:range_after_subtree(n);
+}
+/* CSSOM View §9 Range.getClientRects, in tree order between the boundary points: the border
+   boxes of each element the range contains whose parent it does not contain (through
+   display:contents, which has no box of its own, to its children), and the selected part of
+   each Text node it contains or partially contains, identical boundary points included. A
+   visited element contains the end only when it is one of the end's inclusive ancestors. */
+static bool range_client_rects(struct client_rect_output *out,node_t *sc,uint32_t so,node_t *ec,uint32_t eo,int sx,int sy) {
+    node_t *first=range_boundary_node(sc,so);
+    node_t *stop=range_character_data(ec)?range_after_subtree(ec):range_boundary_node(ec,eo);
+    node_t *local[64],**ancestors=local;
+    size_t depth=0;
+    for(node_t *a=ec;a;a=a->parent)depth++;
+    if(depth>sizeof local/sizeof *local){
+        ancestors=depth<=SIZE_MAX/sizeof *ancestors?malloc(depth*sizeof *ancestors):NULL;
+        if(!ancestors){JS_ThrowOutOfMemory(out->ctx);return false;}
+    }
+    depth=0;
+    for(node_t *a=ec;a;a=a->parent)ancestors[depth++]=a;
+    qsort(ancestors,depth,sizeof *ancestors,node_address_order);
+    out->sx=sx;out->sy=sy;
+    bool ok=true;
+    node_t *cover=NULL; /* a contained element whose rectangles stand for its subtree's */
+    unsigned work=0;
+    for(node_t *n=first;n && n!=stop;){
+        if(!(++work&63) && !web_native_checkpoint(n->owner))break;
+        if(n->type==N_TEXT){
+            uint32_t a=n==sc?so:0,b=n==ec?eo:UINT32_MAX;
+            if(!layout_text_rects(n,a,b,!out->untransformed,client_rect_fragment,out)){ok=!out->failed;break;}
+        }else if(n->type==N_ELEM && !cover && !bsearch(&n,ancestors,depth,sizeof *ancestors,node_address_order)){
+            if(n->box){
+                if(!collect_client_rects(out,n,sx,sy)){ok=false;break;}
+                cover=n;
+            }else if(!n->style || n->style->display!=D_CONTENTS)cover=n;
+        }
+        node_t *next=n->first;
+        if(range_character_data(n))next=NULL;
+        for(node_t *m=n;!next && m;m=m->parent){
+            if(m==cover)cover=NULL;
+            if(m->next)next=m->next;
+        }
+        n=next;
+    }
+    if(ancestors!=local)free(ancestors);
+    return ok;
 }
 /* Before any native DOM work on d (the operations here and the DOM collections'
    revision check): a sandboxed actor borrows no other document's authority. */
@@ -3187,7 +3264,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
     }
     if(!n){switch(opcode){
-    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
+    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_rangeRects: case DOM_caretPosition: case DOM_caretRect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
         result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");goto dom_complete;
     default:break;
     }}
@@ -3843,13 +3920,69 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
            subpixels or include a layout-only inline wrapper. */
         double r[4]={0};bool present=false;
         if(visible && !client_bounding_rect(ctx,n,sx,sy,r,&present)){result=JS_EXCEPTION;break;}
-        double left=r[0],top=r[1],w=r[2],h=r[3];
-        result = JS_NewObject(ctx);
-        JS_DefinePropertyValueStr(ctx, result, "x", JS_NewFloat64(ctx, left), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "y", JS_NewFloat64(ctx, top), JS_PROP_C_W_E);
-        JS_DefinePropertyValueStr(ctx, result, "left", JS_NewFloat64(ctx, left), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "top", JS_NewFloat64(ctx, top), JS_PROP_C_W_E);
-        JS_DefinePropertyValueStr(ctx, result, "right", JS_NewFloat64(ctx, left + w), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "bottom", JS_NewFloat64(ctx, top + h), JS_PROP_C_W_E);
-        JS_DefinePropertyValueStr(ctx, result, "width", JS_NewFloat64(ctx, w), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "height", JS_NewFloat64(ctx, h), JS_PROP_C_W_E);
-
+        result=client_rect_object(ctx,r);
+    } break;
+    case DOM_rangeRects: {
+        /* Range getClientRects (fragments) or getBoundingClientRect: start container, offset,
+           end container, offset. Not in the document: no rectangles. */
+        node_t *end=argc>4?unwrap(ctx,argv[3]):NULL;
+        if(argc>4 && !end && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3])){result=JS_EXCEPTION;break;}
+        uint32_t start_offset=0,end_offset=0;
+        if(!n || !end){result=JS_ThrowTypeError(ctx,"Range boundary points required");break;}
+        if(JS_ToUint32(ctx,&start_offset,argv[2]) || JS_ToUint32(ctx,&end_offset,argv[4])){result=JS_EXCEPTION;break;}
+        bool fragments=argc>5 && JS_ToBool(ctx,argv[5])>0;
+        struct web_js_state *owner=geometry_owner(s,d);
+        bool visible=owner && end->owner==n->owner && connected(owner,n) && connected(owner,end);
+        int sx=0,sy=0;
+        if(visible){
+            flush_layout(owner);viewport_scroll_position(owner,&sx,&sy);
+            d->view_x=sx;d->view_y=sy;
+            visible=connected(owner,n) && connected(owner,end);
+        }
+        struct client_rect_output out={.ctx=ctx,.list=fragments?JS_NewArray(ctx):JS_UNDEFINED};
+        if(fragments && JS_IsException(out.list)){result=JS_EXCEPTION;break;}
+        if(visible && !range_client_rects(&out,n,start_offset,end,end_offset,sx,sy)){
+            if(fragments)JS_FreeValue(ctx,out.list);
+            result=JS_EXCEPTION;break;
+        }
+        if(fragments){result=out.list;break;}
+        double r[4];client_rect_bounds(&out,r,NULL);
+        result=client_rect_object(ctx,r);
+    } break;
+    case DOM_caretPosition: {
+        /* caretPositionFromPoint before shadow retargeting: [node, offset] or null. */
+        double x,y;
+        struct web_js_state *owner=NULL;
+        if(!n || n->type!=N_DOC){result=JS_ThrowTypeError(ctx,"Document receiver required");break;}
+        if(argc<4){result=JS_ThrowTypeError(ctx,"Two coordinates required");break;}
+        if(JS_ToFloat64(ctx,&x,argv[2]) || JS_ToFloat64(ctx,&y,argv[3])){result=JS_EXCEPTION;break;}
+        if(!isfinite(x) || !isfinite(y)){result=JS_ThrowTypeError(ctx,"The coordinates are not finite numbers");break;}
+        /* No viewport, or a point outside it (CSSOM View §5 steps 1 and 2). */
+        if(!(owner=geometry_owner(s,d)) || d->width<1 || d->height<1 || x<0 || y<0 || x>d->width || y>d->height){result=JS_NULL;break;}
+        flush_layout(owner);
+        viewport_scroll_position(owner,&d->view_x,&d->view_y);
+        node_t *at=NULL;uint32_t offset=0;
+        if(!doc_caret_at(d,x+d->view_x,y+d->view_y,&at,&offset) || !at || doc_node_root(at,true)!=d->root){result=JS_NULL;break;}
+        result=JS_NewArray(ctx);
+        if(JS_IsException(result))break;
+        JSValue object=wrap(s,at);
+        if(JS_IsException(object) || JS_SetPropertyUint32(ctx,result,0,object)<0 ||
+           JS_SetPropertyUint32(ctx,result,1,JS_NewUint32(ctx,offset))<0){JS_FreeValue(ctx,result);result=JS_EXCEPTION;}
+    } break;
+    case DOM_caretRect: {
+        /* CaretPosition.getClientRect for a rendered text entry widget in the document, or null. */
+        uint32_t offset=0;
+        if(!n || argc<3){result=JS_ThrowTypeError(ctx,"Caret node and offset required");break;}
+        if(JS_ToUint32(ctx,&offset,argv[2])){result=JS_EXCEPTION;break;}
+        struct web_js_state *owner=n->type==N_ELEM?geometry_owner(s,d):NULL;
+        if(!owner || !connected(owner,n)){result=JS_NULL;break;}
+        int sx=0,sy=0;
+        flush_layout(owner);viewport_scroll_position(owner,&sx,&sy);
+        d->view_x=sx;d->view_y=sy;
+        double r[4];
+        if(!connected(owner,n) || !doc_control_caret_rect(n,offset,r)){result=JS_NULL;break;}
+        r[0]-=sx;r[1]-=sy;
+        result=client_rect_object(ctx,r);
     } break;
     case DOM_submit: {
         if (!d->inert) navigate_form_request(s,n);

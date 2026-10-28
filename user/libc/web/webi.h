@@ -1070,6 +1070,10 @@ typedef struct box {
     struct box *cb;         /* the block box these coordinates are relative to */
     struct box *inline_paint_owner, *inline_paint_source;
     int inline_run_first, inline_run_last, inline_deco_first, inline_deco_last;
+    /* Its line fragments from its formatting root's last line layout: a text box's runs, an
+       inline box's decos, as [frag_first, frag_end) of that root's arrays (frag_end 0: none).
+       Other boxes' fragments may lie between; each lookup still checks the owner. */
+    int frag_first, frag_end;
     bool inline_cb_valid;
     float inline_cb_left, inline_cb_top, inline_cb_right, inline_cb_bottom;
     uint64_t paint_bounds_generation;
@@ -1175,6 +1179,7 @@ struct run {
     box_t *paint_owner; /* filtered inline group; private layout-arena dependency */
     int paint_next;
     float descent; /* measured with the line; overflow does not query fonts again */
+    int highlight_first, highlight_end; /* find in page: the bytes of s the match covers */
 };
 
 struct deco {
@@ -1195,6 +1200,14 @@ node_t *doc_element_at(web_doc *d,int x,int y); /* hit retargeted to this Docume
    their element is the target. *elements is NULL when nothing is hit; the caller frees it.
    false only when memory ran out. */
 bool doc_elements_at(web_doc *d,int x,int y,node_t ***elements,size_t *count);
+/* CSSOM View caretPositionFromPoint before shadow retargeting: the text insertion point at
+   document point (x, y) through the same hit test as elementFromPoint. A text entry widget
+   (<input>, <textarea>) gives itself and the UTF-16 offset in its value; a hit with no text
+   under the point gives the nearest point in the hit box's subtree. false when nothing. */
+bool doc_caret_at(web_doc *d,double x,double y,node_t **node,uint32_t *offset);
+/* CaretPosition.getClientRect for a text entry widget: the caret at UTF-16 offset of its
+   value, in document coordinates through the transforms that apply. false when not one. */
+bool doc_control_caret_rect(node_t *control,uint32_t offset,double rect[4]);
 void doc_hover_update(web_doc *document,node_t *target); /* native-only CSS state; no JS dispatch */
 void doc_active_cancel(web_doc *document); /* retire/free only this context subtree */
 node_t *doc_active_target(web_doc *document); /* validates live native press and embedding generation */
@@ -1209,6 +1222,10 @@ bool boxes_rebuild_local(web_doc *d);
 void boxes_changes_clear(web_doc *d);
 bool box_pseudo_generated(node_t *node, const style_t *origin, const style_t *pseudo);
 bool boxes_update_text(web_doc *d, node_t *n);
+/* A Text node's text box: for each byte of its processed text (white space collapsed,
+   transformed), the byte of the node's data it came from, and the data's length at [t->len].
+   Allocated in a. NULL when t is not a Text node's box, or the data has changed since. */
+uint32_t *box_text_source_map(arena_t *a, const box_t *t);
 void boxes_discard(web_doc *d); /* unpublish node/top-layer borrowers, then bmem */
 /* Widths are float sums of advances, and the same content summed in another order (a line,
    an intrinsic width) may differ in the last bits: content within this much of a width fits it. */
@@ -1218,6 +1235,44 @@ void layout_cache_free(web_doc *d);
 void layout_clamp_trace_report(web_doc *d);
 void layout_invalidate(box_t *b);
 void layout_invalidate_fonts(box_t *b);
+/* ---- Text geometry (layout.c): where DOM text lies in the line layout, and back. The one
+   owner for Range and CaretPosition rectangles, caretPositionFromPoint, the native hit test,
+   find in page and inline elements' fragments (CSSOM View §5, §6, §9). Coordinates are
+   document coordinates: visual as painted and hit tested (element scrolling, sticky offsets,
+   marquee), or else unscrolled layout offsets (offsetLeft/offsetTop). */
+/* The origin of block b's runs and decos. */
+void layout_runs_origin(const box_t *b, bool visual, float *x, float *y);
+/* A text run's fragment box from its font: top (ascent above its baseline) and bottom
+   (descent below), in its block's coordinates. */
+void layout_run_extent(const struct run *r, float *top, float *bottom);
+/* The advance from the start of r's text to its byte boundary at (r->w at its end). */
+float layout_run_x(const struct run *r, size_t at);
+/* The advance of s[at, next), one grapheme cluster, x after the text's start. */
+typedef float (*layout_measure_fn)(const void *opaque, const char *s, size_t at, size_t next, float x);
+/* The grapheme cluster boundary of s[0,n) nearest the advance dx from its start; a boundary
+   at a cluster's middle is the earlier one. width >= 0: the whole text's placed width. */
+size_t layout_text_boundary(const char *s, size_t n, float width, float dx, layout_measure_fn measure, const void *opaque);
+/* The same for run r's text, measured as the line measured it. */
+size_t layout_run_boundary(const struct run *r, float dx);
+/* The formatting root whose runs and decos hold text or inline box b's fragments. */
+box_t *layout_inline_root(const box_t *b);
+/* A rectangle, and space: the box whose and whose ancestors' transforms apply to it. */
+typedef bool (*layout_rect_fn)(void *opaque, const box_t *space, double x, double y, double w, double h);
+/* Text node n's rendered text between UTF-16 offsets start and end (UINT32_MAX: its end),
+   one rectangle per line fragment in content order: the part selected, widened to whole
+   grapheme clusters, its height the font's ascent and descent; start == end, or a part that
+   is selected but not rendered, gives a zero-width rectangle at that position. Nothing for a
+   node without rendered text. false when visit returns false or a checkpoint fails. */
+bool layout_text_rects(node_t *n, uint32_t start, uint32_t end, bool visual, layout_rect_fn visit, void *opaque);
+/* Inline element n's own border-box fragments, not its ::before/::after boxes', in line order. */
+bool layout_inline_rects(node_t *n, bool visual, layout_rect_fn visit, void *opaque);
+/* The DOM position of the boundary nearest dx in run of block: a Text node and UTF-16
+   offset, or for generated content its element, before (::before, ::marker) or after
+   (::after) its children. false for an atomic run or a stale layout. */
+bool layout_run_position(const box_t *block, int run, float dx, node_t **node, uint32_t *offset);
+/* The text insertion point in b's subtree nearest visual document point (x, y): the nearest
+   line fragment's nearest boundary, before or after a replaced element. */
+bool layout_position_at(const box_t *b, float x, float y, node_t **node, uint32_t *offset);
 float box_abs_x(const box_t *b);
 float box_abs_y(const box_t *b);
 /* Paint/hit/DOMRect positions; box_abs remains unscrolled offset geometry. */
@@ -1297,6 +1352,9 @@ struct control_text_line {
 };
 typedef void (*control_text_line_fn)(const struct control_text_line *, void *);
 float control_text_width(const style_t *st, const char *s, size_t n);
+/* The grapheme boundary of one control line's text s[0,n) nearest the advance x from its
+   start, measured as control_text_width measures (tab stops included). */
+size_t control_text_boundary(const style_t *st, const char *s, size_t n, float x);
 bool control_text_lines(const box_t *b, const style_t *st, const char *text,
                         control_text_line_fn visit, void *opaque, float *width, float *height);
 const char *web_button_label(node_t *n);   /* the text on an <input> button */
@@ -1709,6 +1767,10 @@ bool doc_control_selection_supported(const node_t *node);
 uint32_t doc_utf16_length(const char *text);
 uint32_t doc_byte_to_utf16(const char *text, size_t byte);
 size_t doc_utf16_to_byte(const char *text, uint32_t offset, bool round_up);
+/* The same for CharacterData's counted data, which may hold U+0000: the UTF-16 offset of a
+   byte, and the byte of a UTF-16 offset (inside a surrogate pair: before it, or round_up after). */
+uint32_t doc_text_utf16(const char *text, size_t length, size_t byte);
+size_t doc_text_byte(const char *text, size_t length, uint32_t offset, bool round_up);
 void doc_control_caret(web_doc *d, node_t *node);
 void doc_control_selection(web_doc *d, node_t *node, uint32_t start, uint32_t end, uint8_t direction);
 bool doc_control_replace(web_doc *d, node_t *node, uint32_t start, uint32_t end, const char *text);
