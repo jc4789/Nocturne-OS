@@ -1,7 +1,9 @@
 /* Cookie policy follows RFC 6265bis section 5 (HTTPWG, September 2026).
    Limits: WEBCOOKIE_DOMAIN_MAX per domain field and WEBCOOKIE_TOTAL_MAX in all (webcookie.h), a
    400-day lifetime; no Lax-allowing-unsafe grace, no partitioned-cookie emulation.
-   URLs must already use ASCII/A-label hosts, as Nocturne's HTTP worker does.
+   A URL is read by the URL parser (weburl.h), which gives the canonicalized host name (a domain
+   in A-labels, an IPv4 address, an IPv6 address in brackets), the path and the scheme; the jar
+   reads no URL text itself. Same site is HTML's (the origins' sites), with this jar's PSL.
 
    The window process's jar tracks its changes for the saved store (webnet.c keeps the document):
    every set or removal of a cookie the store would hold, and every clear, goes into an ordered
@@ -10,6 +12,7 @@
    list on top, and keeps the jar's own session cookies, so neither process loses the other's
    writes. A cookie's saved flag says the store or the list holds it. */
 #include "webcookie.h"
+#include "weburl.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -53,10 +56,14 @@ struct webcookie_jar {
     size_t clear_count;
     uint64_t clear_top, clear_seen;
 };
-struct address { char host[DOMAIN_MAX + 1]; const char *path; size_t path_len; bool secure, ip; };
+/* What a cookie is set or sent for: the request URL's record (the URL parser's, weburl.h), its
+   host as a string of its own (the canonicalized host name: a domain in A-labels, or an IP
+   address), its path, whether its scheme is secure and whether its host is an IP address. */
+struct address { struct web_url url; char *host; const char *path; size_t path_len; bool secure, ip; };
 
 static unsigned char lower(unsigned char c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
 static bool digit(unsigned char c) { return c >= '0' && c <= '9'; }
+/* A rule of the Public Suffix List: ASCII LDH labels (the list is loaded already converted). */
 static bool ascii_host(char *out, const char *src, size_t n) {
     if (!n || n > DOMAIN_MAX) return false;
     size_t label = 0;
@@ -73,32 +80,23 @@ static bool ascii_host(char *out, const char *src, size_t n) {
     if (!label || src[n-1] == '-') return false;
     out[n] = 0; return true;
 }
-static bool address(const char *url, struct address *a) {
-    if (!url) return false;
-    const char *p;
-    if (!strncasecmp(url, "https://", 8)) { a->secure = true; p = url + 8; }
-    else if (!strncasecmp(url, "http://", 7)) { a->secure = false; p = url + 7; }
-    else return false;
-    size_t n = strlen(url);
-    if (n > UINT32_MAX || n == SIZE_MAX) return false;
-    /* As http.c's url_parse_owned: the URL Standard's serializer keeps '\' in a special URL's
-       query and fragment, and before them a raw one is not its serialization. */
-    size_t query = strcspn(url, "?#");
-    for (size_t i = 0; i < n; i++) if ((unsigned char)url[i] <= 32 || (unsigned char)url[i] >= 127 || (url[i] == '\\' && i < query)) return false;
-    const char *end = p + strcspn(p, "/?#"), *colon = memchr(p, ':', (size_t)(end - p));
-    const char *host_end = colon ? colon : end;
-    if (!ascii_host(a->host, p, (size_t)(host_end - p))) return false;
-    if (colon) {
-        unsigned port = 0; p = colon + 1;
-        if (p == end) return false;
-        while (p < end) { if (!digit((unsigned char)*p) || port > (65535u-(unsigned)(*p-'0'))/10u) return false; port = port * 10 + (unsigned)(*p++ - '0'); }
-        if (!port) return false;
-    }
-    a->ip = true;
-    for (p = a->host; *p; p++) if (!digit((unsigned char)*p) && *p != '.') a->ip = false;
-    size_t pathlen = *end == '/' ? strcspn(end, "?#") : 0;
-    a->path=pathlen?end:"/";a->path_len=pathlen?pathlen:1;return true;
+/* url read by the URL parser: 1 an http or https URL (address_free a); 0 not one; -1 no memory. */
+static int address(const char *url, struct address *a) {
+    memset(a, 0, sizeof *a);
+    int parsed = web_url_read(url, url ? strlen(url) : 0, &a->url);
+    if (parsed != 1) return parsed;
+    if (!web_url_http_scheme(&a->url)) { web_url_free(&a->url); return 0; }
+    a->secure = web_url_scheme_is(&a->url, "https");
+    size_t n;
+    const char *host = web_url_host_text(&a->url, &n);
+    if (!(a->host = malloc(n + 1))) { web_url_free(&a->url); return -1; }
+    memcpy(a->host, host, n); a->host[n] = 0;
+    a->ip = a->url.host == WEB_URL_HOST_IPV4 || a->url.host == WEB_URL_HOST_IPV6;
+    /* uri-path: a special URL's path always begins with '/'. */
+    a->path = web_url_span(&a->url, WEB_URL_PATH_START, WEB_URL_QUERY_START, &a->path_len);
+    return 1;
 }
+static void address_free(struct address *a) { free(a->host); web_url_free(&a->url); }
 static bool domain_match(const char *host, const char *domain) {
     size_t h = strlen(host), d = strlen(domain);
     return h == d ? !strcmp(host, domain) : h > d && host[h-d-1] == '.' && !strcmp(host+h-d, domain);
@@ -131,8 +129,10 @@ static unsigned suffix_labels(const webcookie_jar *j, const char *host) {
 const char *webcookie_site_of(const webcookie_jar *j, const char *host) {
     if (!host) return host;
     size_t n = strlen(host);
-    bool ip = true;
-    for (const char *p = host; *p; p++) if (!digit((unsigned char)*p) && *p != '.') ip = false;
+    /* A host the URL parser wrote: an IPv6 address is in brackets, and a host of digits and
+       dots alone is an IPv4 address (the parser takes any other such text for one, or fails). */
+    bool ip = *host == '[';
+    if (!ip) { ip = true; for (const char *p = host; *p; p++) if (!digit((unsigned char)*p) && *p != '.') ip = false; }
     if (!j || !j->rule_count || ip || !n || n > DOMAIN_MAX) return host;
     unsigned total = labels(host), suffix = suffix_labels(j, host);
     if (total <= suffix) return host;
@@ -140,12 +140,37 @@ const char *webcookie_site_of(const webcookie_jar *j, const char *host) {
     for (unsigned i = total; i > suffix + 1; i--) p = strchr(p, '.') + 1;
     return p;
 }
-static const char *site_host(const webcookie_jar *j, const struct address *a) {
-    return a->ip ? a->host : webcookie_site_of(j, a->host);
+/* HTML's "obtain a site" for the origin of url, serialized (the serialization of a site):
+   1 with *site malloc'd for a tuple origin, 0 for an opaque one or no URL, -1 no memory. */
+static int url_site(const webcookie_jar *j, const char *url, char **site) {
+    *site = NULL;
+    char *origin = NULL;
+    enum web_url_result kind = web_url_origin(url, &origin);
+    if (kind != WEB_URL_TUPLE) return kind == WEB_URL_OOM ? -1 : 0;
+    struct web_url u;
+    int parsed = web_url_read(origin, strlen(origin), &u);
+    free(origin);
+    if (parsed != 1) return parsed;
+    size_t n, scheme = u.mark[WEB_URL_PROTOCOL_END];
+    const char *at = web_url_host_text(&u, &n);
+    char *host = malloc(n + 1);
+    if (!host) { web_url_free(&u); return -1; }
+    memcpy(host, at, n); host[n] = 0;
+    const char *registrable = u.host == WEB_URL_HOST_DOMAIN ? webcookie_site_of(j, host) : host;
+    size_t r = strlen(registrable);
+    *site = malloc(scheme + 2 + r + 1);
+    if (*site) { memcpy(*site, u.href, scheme); memcpy(*site + scheme, "//", 2); memcpy(*site + scheme + 2, registrable, r + 1); }
+    free(host);
+    web_url_free(&u);
+    return *site ? 1 : -1;
 }
+/* HTML's same site for the origins of two URLs: both tuple origins whose sites are the same
+   (scheme and registrable domain, or the host itself when it has none). */
 bool webcookie_same_site(const webcookie_jar *j, const char *x, const char *y) {
-    struct address a, b;
-    return address(x, &a) && address(y, &b) && a.secure == b.secure && !strcmp(site_host(j, &a), site_host(j, &b));
+    char *a = NULL, *b = NULL;
+    bool same = url_site(j, x, &a) == 1 && url_site(j, y, &b) == 1 && !strcmp(a, b);
+    free(a); free(b);
+    return same;
 }
 static bool same_context(const webcookie_jar *j, const struct webcookie_context *c) {
     return !c->redirect_cross_site && (c->site_url ? webcookie_same_site(j, c->url, c->site_url) : c->http && c->top_level);
@@ -387,9 +412,33 @@ static void make_room(webcookie_jar *j, const struct cookie *c) {
         evict(j, victim);
     }
 }
+/* The Domain attribute's value (§5.6.3: without one leading '.', lowercase) for the storage
+   model to domain-match against the canonicalized request host: ASCII without controls, at
+   most DOMAIN_MAX bytes. Only a suffix of the host the URL parser gave can match it. */
+static bool domain_attribute(char *out, const char *v) {
+    size_t n = strlen(v);
+    if (!n || n > DOMAIN_MAX) return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)v[i];
+        if (c <= 32 || c >= 127) return false;
+        out[i] = (char)lower(c);
+    }
+    out[n] = 0;
+    return true;
+}
+static int set_for(webcookie_jar *j, const struct webcookie_context *ctx, const struct address *at, const char *input, size_t len, int64_t now);
 int webcookie_set(webcookie_jar *j, const struct webcookie_context *ctx, const char *input, size_t len, int64_t now) {
     if (!j || !ctx || !input || now < 0 || now > NEVER-COOKIE_DAYS || len > WEBCOOKIE_FIELD_MAX) return -1;
-    struct address a; if (!address(ctx->url,&a)) return 0;
+    struct address a; int parsed = address(ctx->url, &a);
+    if (parsed != 1) return parsed;
+    int result = set_for(j, ctx, &a, input, len, now);
+    address_free(&a);
+    return result;
+}
+static int set_for(webcookie_jar *j, const struct webcookie_context *ctx, const struct address *at, const char *input, size_t len, int64_t now) {
+    const struct address a = *at;
+    /* A host past what a cookie's domain field holds (the URL parser bounds no domain). */
+    if (strlen(a.host) > DOMAIN_MAX) return 0;
     if (policy(j, a.host) & WEBCOOKIE_BLOCK) return 0; /* the user's choice (§5.3, §7.2) */
     if (memchr(input,0,len) || !clean(input,len)) return 0;
     char *copy=malloc(len+1); if (!copy) return -1; memcpy(copy,input,len); copy[len]=0;
@@ -407,7 +456,7 @@ int webcookie_set(webcookie_jar *j, const struct webcookie_context *ctx, const c
         char *v=strchr(p,'='); if (v) *v++=0; else v=p+strlen(p);
         p=trim(p); v=trim(v);
         if (!strcasecmp(p,"Domain")) {
-            if (*v) { if (*v=='.') v++; domain_attr=true; if (!ascii_host(domain,v,strlen(v))) bad=true; }
+            if (*v) { if (*v=='.') v++; domain_attr=true; if (!domain_attribute(domain,v)) bad=true; }
         } else if (!strcasecmp(p,"Path")) {
             size_t n=strlen(v); if (n<=COOKIE_PATH_MAX) { if (*v=='/') memcpy(path,v,n+1); else strcpy(path,default_path); path_root=n==1&&*v=='/'; }
         } else if (!strcasecmp(p,"Secure")) secure=true;
@@ -460,14 +509,27 @@ int webcookie_set(webcookie_jar *j, const struct webcookie_context *ctx, const c
     else if (was_saved) note(j,CHANGE_DELETE,c);
     j->cookies[j->count++]=c; j->bytes+=record_bytes(c); return 1;
 }
+/* Whether the cookie-string of a holds c as to domain (host-only: the same host), path and
+   Secure; an HttpOnly cookie only for an HTTP API. SameSite is the caller's. */
+static bool sent_to(const struct cookie *c,const struct address *a,bool http) {
+    if ((c->flags&F_HOST) ? strcmp(a->host,c->domain)!=0 : !domain_match(a->host,c->domain)) return false;
+    return path_match_n(a->path,a->path_len,c->path) && (!(c->flags&F_SECURE)||a->secure) && (!(c->flags&F_HTTP)||http);
+}
 static int send_order(const void *a,const void *b) {
     const struct cookie *x=*(const struct cookie *const *)a,*y=*(const struct cookie *const *)b;
     if (x->pl!=y->pl) return x->pl>y->pl?-1:1;
     return x->created<y->created?-1:x->created>y->created?1:0;
 }
+static long get_for(webcookie_jar *j,const struct webcookie_context *ctx,const struct address *at,char *out,size_t cap,int64_t now);
 long webcookie_get(webcookie_jar *j,const struct webcookie_context *ctx,char *out,size_t cap,int64_t now) {
     if (out && cap) out[0]=0;
-    struct address a; if (!j || !ctx || (out&&!cap) || !address(ctx->url,&a)) return -1;
+    struct address a; if (!j || !ctx || (out&&!cap) || address(ctx->url,&a)!=1) return -1;
+    long result=get_for(j,ctx,&a,out,cap,now);
+    address_free(&a);
+    return result;
+}
+static long get_for(webcookie_jar *j,const struct webcookie_context *ctx,const struct address *at,char *out,size_t cap,int64_t now) {
+    const struct address a=*at;
     purge(j,now);
     if (policy(j,a.host) & WEBCOOKIE_BLOCK) return 0; /* §5.8.1: the field is omitted */
     struct cookie **list=j->count?malloc(j->count*sizeof *list):NULL;
@@ -478,8 +540,7 @@ long webcookie_get(webcookie_jar *j,const struct webcookie_context *ctx,char *ou
     bool safe=!strcmp(method,"GET")||!strcmp(method,"HEAD")||!strcmp(method,"OPTIONS")||!strcmp(method,"TRACE");
     for (size_t i=0;i<j->count;i++) {
         struct cookie *c=j->cookies[i];
-        if ((c->flags&F_HOST) ? strcmp(a.host,c->domain)!=0 : !domain_match(a.host,c->domain)) continue;
-        if (!path_match_n(a.path,a.path_len,c->path) || ((c->flags&F_SECURE)&&!a.secure) || ((c->flags&F_HTTP)&&!ctx->http)) continue;
+        if (!sent_to(c,&a,ctx->http)) continue;
         if (!same && c->same!=S_NONE && !(c->same==S_LAX && ctx->http && ctx->top_level && safe)) continue;
         list[count++]=c; len+=c->nl+c->vl+(c->nl?1:0)+(count>1?2:0);
     }
@@ -519,7 +580,7 @@ static int parse_record(const webcookie_jar *j,const unsigned char **at,const un
     if(nl+vl>4096||!dl||dl>DOMAIN_MAX||!pl||pl>COOKIE_PATH_MAX||flags>15||same>S_NONE||created>serial||access>serial||expires<0||memchr(p,0,size)||!clean((const char*)p,size))return 0;
     char fields[4096+DOMAIN_MAX+COOKIE_PATH_MAX+4],*f=fields;const char *parts[4];unsigned sizes[4]={nl,vl,dl,pl};
     for(int k=0;k<4;k++){parts[k]=f;memcpy(f,p,sizes[k]);f[sizes[k]]=0;p+=sizes[k];f+=sizes[k]+1;}
-    char domain[DOMAIN_MAX+1];if(!name_ok(parts[0])||strchr(parts[1],';')||!ascii_host(domain,parts[2],dl)||strcmp(domain,parts[2])||parts[3][0]!='/')return 0;
+    const char *domain=parts[2];if(!name_ok(parts[0])||strchr(parts[1],';')||!web_url_host_serialized(domain,dl)||parts[3][0]!='/')return 0;
     if(!(flags&F_HOST)&&(!j->rule_count||suffix_labels(j,domain)==labels(domain)))return 0;
     struct cookie *c=make_cookie(parts[0],parts[1],parts[2],parts[3]);if(!c)return -2;
     c->flags=flags;c->same=same;c->expires=expires;c->created=created;c->access=access;*out=c;return 1;
@@ -605,7 +666,8 @@ static void merged_clear(struct index *x,struct cookie **m,size_t mn,const char 
         free(m[i]);m[i]=NULL;
     }
 }
-static bool clear_site_ok(const char *site,size_t n){char host[DOMAIN_MAX+1];return !n||(ascii_host(host,site,n)&&!memcmp(host,site,n));}
+/* A clear's site: none (every cookie), or a host as the URL parser writes one. */
+static bool clear_site_ok(const char *site,size_t n){return !n||(n<=DOMAIN_MAX&&web_url_host_serialized(site,n));}
 int webcookie_load(webcookie_jar *j,const void *data,size_t len,int64_t now){
     if(!j||(len&&!data))return 0;
     const unsigned char *p=data,*end=p+len;
@@ -772,9 +834,68 @@ long webcookie_sites(webcookie_jar *j,struct webcookie_site **out,int64_t now){
 size_t webcookie_clear(webcookie_jar *j,const char *site){
     if(!j)return 0;
     char host[DOMAIN_MAX+1]="";
-    if(site&&*site&&!ascii_host(host,site,strlen(site)))return 0;
+    if(site&&*site){
+        size_t n=strlen(site);if(n>DOMAIN_MAX)return 0;
+        for(size_t i=0;i<=n;i++)host[i]=(char)lower((unsigned char)site[i]);
+        if(!clear_site_ok(host,n))return 0;
+    }
     size_t removed=0;
     for(size_t i=0;i<j->count;)if(!*host||domain_match(j->cookies[i]->domain,host)){remove_cookie(j,i);removed++;}else i++;
     note_clear(j,host);
+    return removed;
+}
+_Static_assert(S_LAX==WEBCOOKIE_SAME_SITE_LAX&&S_STRICT==WEBCOOKIE_SAME_SITE_STRICT&&S_NONE==WEBCOOKIE_SAME_SITE_NONE,"SameSite values");
+/* An associated cookie of a document at a (webcookie_associated): the cookie-string for an HTTP
+   API holds it, and its name is name unless that is NULL. */
+static bool associated(const struct cookie *c,const struct address *a,const char *name){
+    return sent_to(c,a,true)&&(!name||!strcmp(c->name,name));
+}
+long webcookie_associated(webcookie_jar *j,const char *url,const char *name,struct webcookie_record **out,int64_t now){
+    if(!out)return -1;
+    *out=NULL;if(!j)return -1;
+    struct address a;int parsed=address(url,&a);
+    if(parsed!=1)return parsed;
+    purge(j,now);
+    long result=0;size_t count=0,bytes=0;
+    struct cookie **list=NULL;
+    if(!(policy(j,a.host)&WEBCOOKIE_BLOCK)&&j->count){ /* the user's block: no Cookie field */
+        if(!(list=malloc(j->count*sizeof *list)))result=-1;
+        else for(size_t i=0;i<j->count;i++){
+            struct cookie *c=j->cookies[i];
+            if(associated(c,&a,name)){list[count++]=c;bytes+=c->nl+c->vl+c->dl+c->pl+4;}
+        }
+    }
+    if(count){
+        qsort(list,count,sizeof *list,send_order);
+        struct webcookie_record *r=malloc(count*sizeof *r+bytes);
+        if(!r)result=-1;
+        else{
+            char *text=(char *)(r+count);
+            for(size_t i=0;i<count;i++){
+                struct cookie *c=list[i];
+                const char *from[4]={c->name,c->value,c->domain,c->path};
+                size_t len[4]={c->nl,c->vl,c->dl,c->pl};
+                const char **to[4]={&r[i].name,&r[i].value,&r[i].domain,&r[i].path};
+                for(int k=0;k<4;k++){memcpy(text,from[k],len[k]+1);*to[k]=text;text+=len[k]+1;}
+                r[i].host_only=c->flags&F_HOST;r[i].secure=c->flags&F_SECURE;r[i].http_only=c->flags&F_HTTP;
+                r[i].persistent=c->flags&F_PERSIST;r[i].same_site=c->same;r[i].expires=r[i].persistent?c->expires:0;
+                c->access=stamp(j,now);
+            }
+            *out=r;result=(long)count;
+        }
+    }
+    free(list);address_free(&a);
+    return result;
+}
+long webcookie_delete_associated(webcookie_jar *j,const char *url,const char *name,int64_t now){
+    if(!j)return -1;
+    struct address a;int parsed=address(url,&a);
+    if(parsed!=1)return parsed;
+    purge(j,now);
+    long removed=0;
+    if(!(policy(j,a.host)&WEBCOOKIE_BLOCK)){
+        for(size_t i=0;i<j->count;)if(associated(j->cookies[i],&a,name)){evict(j,i);removed++;}else i++;
+    }
+    address_free(&a);
     return removed;
 }

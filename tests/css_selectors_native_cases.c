@@ -20,6 +20,9 @@
    最後の要素が問いの要素で、attrs（ns \x1f name \x1f value を \x1e で並べる）を setAttributeNS で付ける。
    tree と sheets の形は build_tree と answer_cascade の注釈。 */
 #include <stdio.h>
+#ifndef OLD_SOURCE
+#include "cssom.h"
+#endif
 
 /* ---- the host's ends of what building a document reaches (the rest stop the tool by name) */
 void doc_dom_budget(web_doc *d) { (void)d; }                /* no quota on a test document */
@@ -75,8 +78,10 @@ void boxes_note_foreign(web_doc *d, node_t *n) { (void)d; (void)n; }
 void boxes_note_regen(web_doc *d, node_t *n) { (void)d; (void)n; }
 void boxes_require_full(web_doc *d, const char *reason) { (void)d; (void)reason; }
 void layout_invalidate(box_t *b) { (void)b; }
+#ifdef OLD_SOURCE
 void cssom_style_lifecycle(node_t *subtree) { (void)subtree; }
 void cssom_style_text_changed(node_t *node) { (void)node; }
+#endif
 void doc_referrer_meta(web_doc *d, node_t *node) { (void)d; (void)node; }
 uint32_t doc_utf16_length(const char *text) {
     uint32_t n = 0;
@@ -227,8 +232,24 @@ static arena_t scratch;
 static sheet_t *parse(const char *text, size_t n) {
     ar_free(&scratch);
     memset(&scratch, 0, sizeof scratch);
+#ifdef OLD_SOURCE
     return css_parse_sheet(&scratch, text, n, "about:blank", 0, NULL);
+#else
+    /* the parse CSSOM reads: the same cascade AST, with its rule tree */
+    return css_parse_cssom_sheet(NULL, &scratch, text, n, "about:blank", NULL, 0);
+#endif
 }
+#ifndef OLD_SOURCE
+/* insertRule and selectorText go through the rule tree's owner (cssom.c), on a
+   constructed sheet of a document of its own */
+static struct cssom_sheet *constructed(void) {
+    static web_doc host;
+    static node_t host_root;
+    host.root = &host_root; host.base = "about:blank"; host_root.owner = &host;
+    int error;
+    return cssom_construct(&host, &error);
+}
+#endif
 static void selector_text(const struct css_rule_info *r, sbuf *b) {
 #ifdef OLD_SOURCE
     if (r->selector) sb_puts(b, r->selector);
@@ -240,7 +261,7 @@ static void css_text(const struct css_rule_info *r, sbuf *b) {
 #ifdef OLD_SOURCE
     sb_put(b, r->text, r->text_len);
 #else
-    css_rule_text_serialize(r, b);
+    cssom_serialize(NULL, r, b);
 #endif
 }
 static bool query(web_doc *d, node_t *scope, const char *s, size_t n, pvec *out) {
@@ -263,7 +284,13 @@ static void answer_sheet(FILE *f, const char *text, size_t n) {
     sheet_t *sh = parse(text, n);
     uint32_t count;
     struct css_rule_info *r = css_sheet_rules(sh, &count);
+#ifdef OLD_SOURCE
     fprintf(f, "%d\t%u", css_sheet_single_rule(sh, text, n), count);
+#else
+    /* insertRule's parse a CSS rule: the one rule the whole text is */
+    struct cssom_sheet *s = constructed();
+    fprintf(f, "%d\t%u", s && cssom_insert(s, 0, text, n, 0) == CSSOM_OK, count);
+#endif
     for (; r; r = r->next) {
         sbuf b = {0};
         fprintf(f, "\t%u\t", r->type);
@@ -288,23 +315,17 @@ static void answer_set(FILE *f, const char *rule, size_t n, const char *selector
     put_escaped(f, b.p ? b.p : "", b.n);
     sb_free(&b);
 #else
-    size_t length;
-    char *names = NULL, *text = css_rule_with_selector(sh, r, selector, sn, &length, &names);
-    if (!text) {
-        sbuf b = {0};
-        selector_text(r, &b);
-        put_escaped(f, b.p ? b.p : "", b.n);
-        sb_free(&b);
-        return;
-    }
-    /* the sheet is rebuilt from the rule's new text, as cssom_rule_selector does */
-    sheet_t *again = parse(text, length);
-    struct css_rule_info *x = css_sheet_rules(again, NULL);
+    /* CSSStyleRule.selectorText's setter on the rule, then its getter */
+    struct cssom_sheet *s = constructed();
+    uint32_t count;
+    struct css_rule_info *x = s && cssom_insert(s, 0, rule, n, 0) == CSSOM_OK ? cssom_child(s, 0, 0, &count) : NULL;
+    if (!x) { fputs("!", f); return; }
+    uint32_t id = x->id;
+    cssom_set_attribute(s, id, "selectorText", selector, sn);
     sbuf b = {0};
-    if (x) selector_text(x, &b);
+    cssom_attribute(s, cssom_rule(s, id, NULL), "selectorText", &b);
     put_escaped(f, b.p ? b.p : "", b.n);
     sb_free(&b);
-    free(text); free(names);
 #endif
 }
 static void answer_document(FILE *f, int mode, const char *chain, const char *attrs, const char *sheet_text,

@@ -55,15 +55,12 @@ if c.exists(): (out/f'native-before-compile-{attempt}.c').write_bytes(c.read_byt
 c.write_text(prefix+parts+read('tests/svg_paint27_cases.c'),encoding='utf-8')
 css=read('user/libc/web/css.c').replace('#include <nocturne.h>\n','').replace('#include "avmedia.h"\n','void web_avmedia_checkpoint(void);\n')
 css_source=out/'css.c'; css_source.write_text(css,encoding='utf-8')
-http=read('user/libc/http.c')
-urls=out/'url.c'
-urls.write_text(http[:http.index('enum http_url_result http_origin_owned_n(')],encoding='utf-8')
 cc=root/'tools/msys64/ucrt64/bin/clang.exe'
 abi=out/'host-abi'; abi.mkdir(exist_ok=True)
 (abi/'setjmp.h').write_text('#include "'+(cc.parent.parent/'include/setjmp.h').as_posix()+'"\n',encoding='utf-8')
 env=dict(os.environ,PATH=str(cc.parent)+os.pathsep+os.environ.get('PATH',''))
 exe=out/'native.exe'
-command=[str(cc),'-std=gnu11','-O1','-ffunction-sections','-fdata-sections','-Wl,--gc-sections','-I'+str(abi),'-Iuser/include','-Icommon','-Iuser/libc/web',str(c),str(css_source),'user/libc/web/cssprop.c','user/libc/web/shape.c','user/libc/web/color.c','user/libc/web/cssmath.c','user/libc/web/util.c','user/libc/web/html.c',str(urls),'-o',str(exe)]
+command=[str(cc),'-std=gnu11','-O1','-ffunction-sections','-fdata-sections','-Wl,--gc-sections','-I'+str(abi),'-Iuser/include','-Icommon','-Iuser/libc/web',str(c),str(css_source),'user/libc/web/cssprop.c','user/libc/web/shape.c','user/libc/web/color.c','user/libc/web/cssmath.c','user/libc/web/util.c','user/libc/web/html.c','-o',str(exe)]
 r=subprocess.run(command,cwd=root,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace')
 (out/f'compile-{attempt}.log').write_text(r.stdout+r.stderr,encoding='utf-8')
 print('compile',r.returncode,flush=True)

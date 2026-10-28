@@ -1395,11 +1395,14 @@ static void resource_completed(webnet *net, uint64_t id, uint64_t gen,
     else if (t->detached) webnet_resume(net, id);
 }
 
+static const char *request_refusal;
+static const char *host_request_refusal(void *opaque) { (void)opaque; return request_refusal; }
+static size_t host_keepalive_inflight(void *opaque, uint64_t group) { (void)opaque; return webnet_keepalive_inflight(network, group); }
 static bool host_request(void *opaque, const struct web_request *request) {
     SERVE(opaque);
-    if (!tab->doc || quit) return false;
+    if (!tab->doc || quit) { request_refusal = "the tab is closing"; return false; }
     struct transfer *t = calloc(1, sizeof *t);
-    if (!t) return false;
+    if (!t) { request_refusal = "out of memory"; return false; }
     t->owner = tab;
     t->resource_id = request->id;
     t->generation = tab->generation;
@@ -1422,7 +1425,7 @@ static bool host_request(void *opaque, const struct web_request *request) {
         , .report_sent = tab->console_open /* DevTools records it: show the fields it sent */
     };
     t->network_id = webnet_submit(network, &r, resource_completed, t);
-    if (!t->network_id) { free(t); return false; }
+    if (!t->network_id) { request_refusal = webnet_refusal(network); free(t); return false; }
     t->devtools = dt_net_begin(false, tab->generation, request->id, request->kind, request->method, request->url, request->headers);
     t->next = transfers;
     transfers = t;
@@ -1960,6 +1963,21 @@ static const char *host_automation(void *opaque, web_doc *document, uint64_t id,
     *link = run;
     return NULL;
 }
+/* WebDriver's Cookies for the same testdriver (web_host.automation_cookies): the window's own jar,
+   the one document.cookie and the requests use, for a document of the tab's own tree. Nothing of
+   a cookie goes to the console or the serial log. */
+static long host_automation_cookies(void *opaque, web_doc *document, const char *url, const char *name,
+                                    struct webcookie_record **out) {
+    SERVE(opaque);
+    if (out) *out = NULL;
+    if (!automation_enabled || !document || document != tab->doc) return -1;
+    return webnet_cookie_associated(network, url, name, out);
+}
+static long host_automation_delete_cookies(void *opaque, web_doc *document, const char *url, const char *name) {
+    SERVE(opaque);
+    if (!automation_enabled || !document || document != tab->doc) return -1;
+    return webnet_cookie_delete_associated(network, url, name);
+}
 static void automation_end(const char *error) {
     struct automation_run *run = automation_runs;
     automation_runs = run->next;
@@ -2284,7 +2302,7 @@ static bool host_sync_load(void *opaque, const char *url, int kind, struct web_r
 }
 
 static const struct web_host browser_host = {
-    .request = host_request, .cancel = host_cancel, .release_request = host_release_request, .resume_request = host_resume_request, .sync_load = host_sync_load,
+    .request = host_request, .request_refusal = host_request_refusal, .keepalive_inflight = host_keepalive_inflight, .cancel = host_cancel, .release_request = host_release_request, .resume_request = host_resume_request, .sync_load = host_sync_load,
     .socket_open = host_socket_open, .socket_send = host_socket_send, .socket_close = host_socket_close,
     .socket_buffered = host_socket_buffered, .socket_release = host_socket_release,
     .sync_request = host_sync_request,
@@ -2351,11 +2369,20 @@ static void finish_navigation(void) {
     bool native_page = !f->error[0] && settings_url(web_response_url(f));
     struct settings *page = !native_page ? NULL : tab->settings ? tab->settings : settings_new();
     if (native_page && !page) { web_response_free(f); free(f); tab->loading = false; set_status("Out of memory loading page"); return; }
+    /* A page the browser writes is UTF-8; HTML's sniffing would take an unlabeled one as
+       windows-1252. A response's own body carries its Content-Type's charset. */
     if (native_page) {}
-    else if (f->error[0]) html = error_page(navigation_url, f->error);
-    else if (has_prefix(web_response_url(f), "about:"))
+    else if (f->error[0]) { html = error_page(navigation_url, f->error); charset = "utf-8"; }
+    else if (has_prefix(web_response_url(f), "about:")) {
         html = !strcasecmp(web_response_url(f), HOME) ? home_html() : strdup("<!doctype html><title>blank</title>");
-    else {
+        charset = "utf-8";
+    } else {
+        const char *cs = strstr(ctype, "charset=");
+        if (cs) {
+            cs += 8; if (*cs == '"') cs++;
+            size_t n = MIN(strcspn(cs, "\"; "), sizeof charset_buf - 1);
+            memcpy(charset_buf, cs, n); charset_buf[n] = 0; charset = charset_buf;
+        }
         bool sniff_html = !ctype[0] && f->body_len && memchr(f->body, '<', MIN(f->body_len, 512));
         /* HTML "load a document": HTML and XML types are documents of their
            own kind (SVG too); the rest the browser displays its own way. */
@@ -2363,19 +2390,17 @@ static void finish_navigation(void) {
         if (kind != WEB_DOCUMENT_OTHER || sniff_html) {
             html = f->body; hlen = f->body_len; f->body = NULL;
             if (kind == WEB_DOCUMENT_XML) document_type = ctype;
-            const char *cs = strstr(ctype, "charset=");
-            if (cs) {
-                cs += 8; if (*cs == '"') cs++;
-                size_t n = MIN(strcspn(cs, "\"; "), sizeof charset_buf - 1);
-                memcpy(charset_buf, cs, n); charset_buf[n] = 0; charset = charset_buf;
-            }
-        } else if (has_prefix(ctype, "image/")) { html = image_page(web_response_url(f)); image = web_response_url(f); }
+        } else if (has_prefix(ctype, "image/")) { html = image_page(web_response_url(f)); image = web_response_url(f); charset = "utf-8"; }
+        /* The text page wraps the body's bytes: they are in the body's charset, else UTF-8. */
         else if (has_prefix(ctype, "text/") || !ctype[0] || strstr(ctype, "json") ||
-                 strstr(ctype, "javascript") || strstr(ctype, "xml")) html = text_page(web_response_url(f), f->body, f->body_len);
-        else {
+                 strstr(ctype, "javascript") || strstr(ctype, "xml")) {
+            html = text_page(web_response_url(f), f->body, f->body_len);
+            if (!charset) charset = "utf-8";
+        } else {
             char message[256];
             snprintf(message, sizeof message, "Cannot display %s (%lu bytes).", ctype, (unsigned long)f->body_len);
             html = error_page(web_response_url(f), message);
+            charset = "utf-8";
         }
     }
     if (!html && !native_page) { web_response_free(f); free(f); tab->loading = false; set_status("Out of memory loading page"); return; }
@@ -2395,6 +2420,8 @@ static void finish_navigation(void) {
     document_host.navigation_timing.headers = web_response_headers(f);
     document_host.js_task_budget_ms = js_task_budget_ms;
     document_host.automation = automation_enabled ? host_automation : NULL;
+    document_host.automation_cookies = automation_enabled ? host_automation_cookies : NULL;
+    document_host.automation_delete_cookies = automation_enabled ? host_automation_delete_cookies : NULL;
     nd = web_live_response(html, hlen, final_url, charset, web_response_headers(f), document_type, &document_host);
     free(html);
     if (!nd) { web_response_free(f); free(f); tab->loading = false; set_status("Out of memory creating document"); return; }

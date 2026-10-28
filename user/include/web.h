@@ -186,9 +186,15 @@ struct web_automation_step {
     uint32_t at, value;
     double x, y, dx, dy;
 };
+struct webcookie_record; /* webcookie.h: one cookie as WebDriver serializes it */
 struct web_host {
     void *opaque;
     bool (*request)(void *opaque, const struct web_request *request);
+    /* Why the last request() returned false (static text for the page's console), or NULL. */
+    const char *(*request_refusal)(void *opaque);
+    /* Fetch's inflight keepalive request bytes of a fetch group (web_request.fetch_group): what
+       the host still carries for it, including requests of retired documents. */
+    size_t (*keepalive_inflight)(void *opaque, uint64_t fetch_group);
     void (*cancel)(void *opaque, uint64_t id);
     /* Document retirement, unlike explicit AbortSignal: detach callback delivery
        and retain a keepalive transport. A host without this cannot accept it. */
@@ -283,6 +289,15 @@ struct web_host {
        one and duration has passed. Returns NULL when it took them, else why not (static). */
     const char *(*automation)(void *opaque, web_doc *document, uint64_t id,
                               const struct web_automation_step *steps, size_t count, uint32_t duration);
+    /* The same tool's WebDriver Cookies (§14), set with automation and only then: document is the
+       top-level document whose realm asks, url the address of a document of its tree.
+       automation_cookies gives that document's associated cookies, HttpOnly ones too
+       (webcookie_associated: name's alone unless NULL), as a malloc'd block in *out (the caller
+       frees it) and their count; automation_delete_cookies removes them (WebDriver's "delete
+       cookies") and gives how many. -1 when refused or out of memory. */
+    long (*automation_cookies)(void *opaque, web_doc *document, const char *url, const char *name,
+                               struct webcookie_record **out);
+    long (*automation_delete_cookies)(void *opaque, web_doc *document, const char *url, const char *name);
 };
 enum web_socket_event_type { WEB_SOCKET_OPENED, WEB_SOCKET_MESSAGE_TEXT, WEB_SOCKET_MESSAGE_BINARY,
     WEB_SOCKET_CLOSED, WEB_SOCKET_FAILED };
@@ -444,11 +459,7 @@ const char *web_url(web_doc *d);
 /* <meta http-equiv="refresh" content="N; url=...">: the absolute URL, or NULL */
 const char *web_refresh_url(web_doc *d, int *delay_s);
 
-/* The URL Standard's URL parser, UTF-8 for the query: rel against base (NULL, or a
-   base that is not a URL: none). 1: *out is the URL's serialization, malloc'd for
-   the caller to free; 0: rel is not a URL (*out NULL); -1: out of memory. No
-   length limit. */
-int web_resolve_url_owned(const char *base, const char *rel, char **out);
+/* web_resolve_url_owned, the URL parser for a URL against a base, is weburl.h's. */
 
 /* ---- resources ---- */
 const char *web_pending_stylesheet(web_doc *d);                   /* next stylesheet to fetch, or NULL */

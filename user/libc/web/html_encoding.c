@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include "html_encoding.h"
 #include "web_encoding.h"
+#include "frame.h"
+#include <weburl.h>
 #include <lexbor/html/encoding.h>
 
 /* A meta or prescan charset as the encoding it names: UTF-16BE/LE become UTF-8,
@@ -81,9 +83,18 @@ char *html_decode_bytes(web_doc *d, const char *src, size_t n, const char *label
         }
         lxb_html_encoding_destroy(&scan, false);
     }
-    /* Unlabeled: UTF-8 when the bytes are valid UTF-8 throughout (the standard
-       allows autodetection), else the windows-1252 default. */
-    if (!e) e = web_utf8_valid(bytes, n) == n ? WEB_ENCODING_UTF8 : LXB_ENCODING_WINDOWS_1252;
+    /* A document in a frame: its container document's encoding when that document is same origin
+       with it and not UTF-16 (a sandboxed document's origin is opaque). */
+    web_doc *container = d->frame_parent;
+    if (!e && container && !(d->sandbox_flags & SB_ORIGIN) && web_frame_same_origin(container, d)) {
+        web_encoding inherited = web_encoding_get(container->encoding, strlen(container->encoding));
+        if (inherited != LXB_ENCODING_UTF_16BE && inherited != LXB_ENCODING_UTF_16LE) e = inherited;
+    }
+    /* Autodetection is discouraged for resources from the network: only a file from the local
+       file system is taken as UTF-8 when its bytes are valid UTF-8 throughout. Else the
+       windows-1252 default. */
+    if (!e && d->url && web_url_has_scheme(d->url, "file") && web_utf8_valid(bytes, n) == n) e = WEB_ENCODING_UTF8;
+    if (!e) e = LXB_ENCODING_WINDOWS_1252;
     web_encoding used;
     char *text = web_decode(bytes, n, e, &used, length);
     if (text) snprintf(d->encoding, sizeof d->encoding, "%s", web_encoding_name(used));

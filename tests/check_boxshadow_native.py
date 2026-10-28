@@ -5,6 +5,7 @@ import subprocess
 import json
 import re
 import sys
+import url_owner
 root = Path(__file__).resolve().parent.parent
 out = root / "build/browser-compat-shadow-host"
 out.mkdir(exist_ok=True)
@@ -50,9 +51,6 @@ support = out / "css-support.c"
 # The host has no display: media queries see an 8-bit one.
 css_host = "void *thread_local_get(unsigned slot);\nint display_bits_per_channel(void){return 8;}\n#define MIN(a,b) ((a)<(b)?(a):(b))\n#define MAX(a,b) ((a)>(b)?(a):(b))\n"
 support.write_text(css_host+production,encoding="utf-8")
-# URL parsing alone, without the connection pool before it.
-def url_source(http):
-    return http[:http.index("/* The pool is process-local.")] + http[http.index("bool url_parse(const char *s, struct url *u)"):http.index("enum http_url_result http_origin_owned_n(")]
 gfx = (root / "common/gfx.c").read_text(encoding="utf-8")
 gfx_source = out / "gfx.c"
 gfx_source.write_text(gfx[:gfx.index("void gfx_line(")] + gfx[gfx.index("void gfx_blit("):gfx.index("void gfx_triangle(")], encoding="utf-8")
@@ -63,12 +61,11 @@ abi.mkdir(exist_ok=True)
 (abi / "time.h").write_text('#include "' + (cc.parent.parent / "include/time.h").as_posix() + '"\n', encoding="utf-8")
 env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH", ""))
 exe = out / "native.exe"
-http = (root / "user/libc/http.c").read_text(encoding="utf-8")
-url = out / "url.c"
-url.write_text(url_source(http),encoding="utf-8")
 command = [str(cc), "-std=gnu11", "-O2", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
            "-Wno-incompatible-library-redeclaration", "-I"+str(abi), "-Iuser/include", "-Icommon", "-Iuser/libc", "-Iuser/libc/web",
-           "-Ithird_party/quickjs", str(source), str(gfx_source),str(support),"user/libc/web/cssprop.c", "user/libc/web/shape.c","user/libc/web/color.c", "user/libc/web/cssmath.c","user/libc/web/util.c","user/libc/web/html.c",str(url), "-o", str(exe)]
+           "-Ithird_party/quickjs", str(source), str(gfx_source),str(support),"user/libc/web/cssprop.c", "user/libc/web/shape.c","user/libc/web/color.c", "user/libc/web/cssmath.c","user/libc/web/util.c","user/libc/web/html.c",
+           # CSS resolves url() through the URL record's owner (tests/url_owner.py).
+           *url_owner.objects(root, cc, util=False), "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 if "--parser" not in sys.argv and "--radius-parser" not in sys.argv:
     subprocess.run([str(exe)] + [x for x in ("--mask-performance","--image-association") if x in sys.argv], cwd=root, env=env, check=True, timeout=60)
@@ -110,10 +107,7 @@ printf("boxshadow-parser: %d checks, %d failures\\n",checks,failed);return faile
 '''
     source = out / "parser.c"
     source.write_text(production + main, encoding="utf-8")
-    http = (root / "user/libc/http.c").read_text(encoding="utf-8")
-    url = out / "url.c"
-    url.write_text(url_source(http),encoding="utf-8")
     exe = out / "parser.exe"
-    command = command[:command.index(str(out / "native.c"))] + [str(source),"user/libc/web/cssprop.c", "user/libc/web/shape.c","user/libc/web/color.c", "user/libc/web/cssmath.c","user/libc/web/util.c","user/libc/web/html.c",str(url),"-o",str(exe)]
+    command = command[:command.index(str(out / "native.c"))] + [str(source),"user/libc/web/cssprop.c", "user/libc/web/shape.c","user/libc/web/color.c", "user/libc/web/cssmath.c","user/libc/web/util.c","user/libc/web/html.c",*url_owner.objects(root,cc,util=False),"-o",str(exe)]
     subprocess.run(command,cwd=root,env=env,check=True)
     subprocess.run([str(exe)],cwd=root,env=env,check=True,timeout=60)

@@ -4,6 +4,7 @@
  * retain crash fallback, and payload GC keeps both committed generations. */
 #include <webidb.h>
 #include <webstorage.h>
+#include <weburl.h>
 #include <nocturne.h>
 #include <stdlib.h>
 #include <string.h>
@@ -141,7 +142,7 @@ int webidb_begin(webidb *db,const char *origin,const char *name,size_t name_leng
     *bytes=NULL;
     *length=0;
     *token=0;
-    if(!db||!origin||!name||(strncmp(origin,"http://",7)&&strncmp(origin,"https://",8)))
+    if(!db||!name||!web_origin_http(origin))
         return WEB_IDB_SECURITY;
     char root[WEBIDB_BASE_MAX];
     if(!idb_root(root)||!directory(root))return WEB_IDB_IO;
@@ -374,7 +375,7 @@ static int catalog_scan(const char *directory_path,const char *origin,struct web
 }
 int webidb_databases(webidb *db,const char *origin,struct webidb_database **items,size_t *count){
     *items=NULL;*count=0;
-    if(!db||!origin||(strncmp(origin,"http://",7)&&strncmp(origin,"https://",8)))return WEB_IDB_SECURITY;
+    if(!db||!web_origin_http(origin))return WEB_IDB_SECURITY;
     char root[WEBIDB_BASE_MAX];
     return idb_root(root)?catalog_scan(root,origin,items,count,true):WEB_IDB_IO;
 }

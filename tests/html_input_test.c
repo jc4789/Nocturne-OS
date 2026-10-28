@@ -99,7 +99,9 @@ int main(void){
     check("windows euro",d && text(id(d->root,"x"),"\xe2\x82\xac"));web_free(d);
     const char deceptive[]="<!-- charset=shift_jis --><div title='charset=shift_jis'><p id=x>\xe3\x81\x82";
     d=web_parse(deceptive,sizeof deceptive-1,"https://parser.test/",NULL);
-    check("prescan ignores comment and non-meta attribute",d && text(id(d->root,"x"),"\xe3\x81\x82"));web_free(d);
+    /* No meta was found and UTF-8 is not sniffed for a network resource: the windows-1252 default. */
+    check("prescan ignores comment and non-meta attribute",d && !strcmp(d->encoding,"windows-1252") &&
+          text(id(d->root,"x"),"\xc3\xa3\xc2\x81\xe2\x80\x9a"));web_free(d);
     const char gb[]="<meta charset=gb18030><p id=x>\xc4\xe3\xba\xc3";
     d=web_parse(gb,sizeof gb-1,"https://parser.test/",NULL);
     check("gb18030 decoder",d && text(id(d->root,"x"),"\xe4\xbd\xa0\xe5\xa5\xbd"));web_free(d);

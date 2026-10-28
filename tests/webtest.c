@@ -684,7 +684,9 @@ static void test_text(void) {
     title_is("title-whitespace", "<title>\n  two   words \n</title>", NULL, "two words");
     title_is("charset-header", "<title>caf\xe9 \x93q\x94</title>", "windows-1252", "caf\xc3\xa9 \xe2\x80\x9cq\xe2\x80\x9d");
     title_is("charset-meta", "<meta charset=iso-8859-1><title>\xe9</title>", NULL, "\xc3\xa9");
-    title_is("charset-utf8", "<title>\xe6\x9c\x88</title>", NULL, "\xe6\x9c\x88");
+    title_is("charset-utf8", "<meta charset=utf-8><title>\xe6\x9c\x88</title>", NULL, "\xe6\x9c\x88");
+    /* HTML encoding sniffing does not detect UTF-8 in a network resource (WPT encoding/sniffing). */
+    title_is("charset-unlabeled-utf8-bytes", "<title>\xe6\x9c\x88</title>", NULL, "\xc3\xa6\xc5\x93\xcb\x86");
 
     url_is("url-dotdot", "http://a/b/c?d", "../x#y", "http://a/x#y");
     url_is("url-scheme-relative", "https://a/b", "//c/d", "https://c/d");

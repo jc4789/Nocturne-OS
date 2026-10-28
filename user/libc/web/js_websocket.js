@@ -109,6 +109,9 @@
             nativeApply(weakSet, states, [this, s]);
             const target = this;
             s.id = host.socketOpen(s.url, list.length ? list.join(', ') : null, (type, code, data, protocol) => receive(target, s, type, code, data, protocol));
+            // 0: Content Security Policy blocked the establishment fetch, which
+            // fails the connection in a later task (error, then close 1006).
+            if (!s.id) nativeApply(nativeSetTimeout, globalThis, [() => receive(target, s, 4, 0, 'Refused by Content Security Policy', ''), 0]);
         }
         get url() { return state(this).url; }
         get readyState() { return state(this).ready; }

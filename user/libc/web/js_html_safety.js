@@ -422,10 +422,11 @@ const htmlSafetyBridge=(()=>{
     for(const method of ['setTimeout','setInterval']){
         const original=globalThis[method];
         globalThis[method]=function(callback,delay,...args){
-            if(typeof callback!=='function')callback=make(2,check(callback,2,method));
-            // Pass a function to the established timer to avoid converting the
-            // approved TrustedScript into an untrusted string a second time.
-            if(typeof callback!=='function')callback=new DynamicFunction(callback);
+            // HTML timer initialization: the string handler's Trusted Types
+            // step, then CSP's string compilation check for a "timer"; a
+            // blocked handler starts no timer and returns 0. The established
+            // timer receives the compiled function, never the string again.
+            if(typeof callback!=='function'){callback=timerCode(callback,method);if(callback===null)return 0;}
             return apply(original,this,[callback,delay,...args]);
         };
     }
@@ -437,7 +438,6 @@ const htmlSafetyBridge=(()=>{
     const windowLocation=Object.getOwnPropertyDescriptor(globalThis,'location');
     if(windowLocation&&windowLocation.configurable)define(globalThis,'location',{...windowLocation,set(value){return apply(windowLocation.set,this,[navigationInput(value)]);}});
     }
-    const DynamicFunction=Function;
     function writeInput(values,sink,node){
         if(!nativeRequired(node)){let strings=true;for(let i=0;i<values.length;i++)if(typeof values[i]!=='string'){strings=false;break;}if(strings)return values.join('');}
         let html='',trusted=true;
@@ -445,7 +445,10 @@ const htmlSafetyBridge=(()=>{
         return trusted?html:check(html,1,sink,node);
     }
     function navigationInput(value,node=null){const text=ttString(value);if(!javascriptURL(text))return text;const offset=text.indexOf(':');return text.slice(0,offset+1)+check(text.slice(offset+1),2,'Location javascript',node);}
-    function timerCode(value,sink){return make(2,check(value,2,sink));}
+    // HTML timer initialization for a string handler: its Trusted Types step,
+    // then CSP's string compilation check for a "timer". The compiled
+    // function, or null when CSP blocks it (the timer then returns 0).
+    function timerCode(value,sink){return nativeSafety('cspTimer',null,check(value,2,sink));}
     function dynamicCode(value,kind,args=[]){
         if(kind===2)return trustedKind(value)===2?payload(value,2):value;
         if(kind===0){if(trustedKind(value)===2)return payload(value,2);if(typeof value!=='string')return value;return check(value,2,'eval',null);}

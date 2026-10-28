@@ -255,6 +255,9 @@ typedef struct node {
     struct node *owned_next; /* document-owned allocation list, including detached nodes */
     struct node *owned_image_next; /* the same allocation's <img>/<input> elements (doc_image_node_next) */
     bool control_ready, script_started;
+    /* An inserted frame element waiting for its HTML post-connection steps: until they run (after
+       every node of the insertion is in place, in tree order with scripts) it has no child navigable. */
+    bool frame_connection_pending;
     bool script_parse_eligible; /* fragment script closed before EOF; explicit runScripts only */
     const char *script_text_snapshot; /* admitted source, allocation_doc arena; never a DOM property */
     size_t script_text_snapshot_len;
@@ -265,6 +268,16 @@ typedef struct node {
     uint64_t js_image_generation;
     bool style_disabled; /* stylesheet state, not the HTML disabled attribute */
     bool style_disabled_set; /* link IDL/CSSOM override of its initial disabled attribute */
+    /* CSP: what this element's last check judged (a style element's child
+       text, a base element's URL), as a hash and length, and the answer:
+       0 none yet, 1 allowed, 2 blocked. A check runs (and reports) once for
+       each new text, not on every resource scan. */
+    uint64_t csp_checked_hash; size_t csp_checked_length; uint8_t csp_checked;
+    /* CSP for the style attribute (HTML: its value applies only when the
+       inline check allows it): 0 not checked (applies), 1 allowed, 2 blocked
+       (neither the cascade nor CSSOM reads it), 3 CSSOM is writing it (its
+       updating flag: the attribute change steps neither parse nor check it). */
+    uint8_t csp_style_attribute;
     struct cssom_sheet *cssom_sheets, *cssom_current; /* native owner/source/AST, allocation-owned */
     uint32_t cssom_serial;
     struct cssom_sheet **adopted_sheets;
@@ -297,8 +310,10 @@ bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d); /* fallible co
    the property allows negative values, else a negative one clamps to 0), else LK_EXPR */
 bool css_length_from_calc(const struct css_calc *c, bool negative, len_t *out);
 /* What a value's grammar accepts (cssprop.c): auto, none, normal, negative values, percentages, and
-   LF_LENGTH: unitless numbers other than 0 are not lengths */
-enum { LF_AUTO = 1, LF_NONE = 2, LF_NEG = 4, LF_NORMAL = 8, LF_NOPCT = 16, LF_LENGTH = 32 };
+   LF_LENGTH: unitless numbers other than 0 are not lengths; LF_ANCHOR, LF_ANCHOR_SIZE: anchor() (the
+   inset properties) and anchor-size() (the properties @position-try accepts), css-anchor-position-1 */
+enum { LF_AUTO = 1, LF_NONE = 2, LF_NEG = 4, LF_NORMAL = 8, LF_NOPCT = 16, LF_LENGTH = 32, LF_ANCHOR = 64,
+       LF_ANCHOR_SIZE = 128 };
 struct cx;
 bool css_parse_length(const char *s, size_t n, struct cx *cx, len_t *out, int flags);
 bool css_number_token(const char **s, const char *end, float *out); /* a CSS <number-token> at *s */
@@ -330,6 +345,9 @@ struct css_calc_parse {
     const char *const *keys; /* identifiers that stand for numbers (a relative colour's channels) */
     unsigned nkeys;
     unsigned nodes, depth;   /* the parse's budget, from 0 */
+    /* LF_ANCHOR, LF_ANCHOR_SIZE: anchor() and anchor-size() are <length>s here (css-anchor-position-1
+       §3.2, §5.1; a computed value only, cx set). cssprop.c reads their arguments; each is a leaf */
+    uint8_t anchors;
 };
 bool css_calc_is_math(const char *s, size_t n); /* s starts with a math function */
 /* s..s+n, one math function: its simplified tree, typed against accept (*kind: the CSS_CALC_* type it
@@ -347,6 +365,20 @@ bool css_calc_equal(const struct css_calc *a, const struct css_calc *b);
    keys' values, cx the element's relative lengths. NaN and infinities as IEEE-754 gives them. */
 double css_calc_value(const struct css_calc *c, double basis, const double *keys, const struct cx *cx);
 struct css_calc *css_calc_bind(arena_t *a, const struct css_calc *c, const struct cx *cx); /* relative lengths resolved */
+/* anchor() and anchor-size() leaves (css-anchor-position-1): whether c holds one; a copy of c in a with
+   each replaced by what map gives (NULL: the copy fails), simplified again; the leaves map may give */
+struct css_anchor_function;
+typedef struct css_calc *(*css_calc_anchor_map)(void *context, arena_t *a, const struct css_anchor_function *f);
+bool css_calc_anchored(const struct css_calc *c);
+struct css_calc *css_calc_map_anchors(arena_t *a, const struct css_calc *c, css_calc_anchor_map map, void *context);
+struct css_calc *css_calc_anchor(arena_t *a, const struct css_anchor_function *f); /* a <length> */
+struct css_calc *css_calc_length(arena_t *a, const len_t *l); /* a computed <length-percentage> as a tree */
+/* cssprop.c: an anchor function's arguments from *s, after its '(' up to and past its ')'; NULL: invalid.
+   Its text and equality */
+const struct css_anchor_function *css_anchor_function_read(struct css_calc_parse *P, const char **s, const char *e,
+                                                           bool size);
+bool css_anchor_function_text(sbuf *out, const struct css_anchor_function *f);
+bool css_anchor_function_equal(const struct css_anchor_function *a, const struct css_anchor_function *b);
 bool css_calc_serialize(sbuf *b, const struct css_calc *c, const char *const *keys); /* §10.13; false: out of memory */
 /* a literal or a math function of a type accept allows, in its canonical unit (a percentage that
    resolves against a dimension: of basis, NaN if none); a top-level NaN is 0 (§10.9), infinities are the
@@ -458,12 +490,99 @@ struct css_offset {
     len_t position[2], anchor[2];
     struct css_offset_rotate rotate;
 };
+/* CSS Anchor Positioning 1 (css-anchor-position-1): anchor-name (§2.1), anchor-scope (§2.2),
+   position-anchor (§2.4), position-area (§3.1), position-try-fallbacks (§6.1), position-try-order
+   (§6.2) and position-visibility (§6.6). A style holds them as one group (style_t's anchor). Names
+   are <dashed-ident>s with their escapes resolved. */
+struct css_anchor_names {
+    const char *const *name;
+    uint32_t count;      /* 0: none */
+    bool all;            /* anchor-scope: all */
+};
+enum { CSS_ANCHOR_NORMAL, CSS_ANCHOR_NONE, CSS_ANCHOR_AUTO, CSS_ANCHOR_NAMED, CSS_ANCHOR_MATCH_PARENT };
+struct css_position_anchor { const char *name; uint8_t kind; }; /* kind CSS_ANCHOR_*; name: CSS_ANCHOR_NAMED */
+/* <position-area> (§3.1.2): a keyword of each axis, the block axis's (or the horizontal axis's)
+   first; the computed value holds the long logical keywords. css_area_keyword describes one. */
+enum { CSS_AREA_X = 1, CSS_AREA_Y, CSS_AREA_BLOCK, CSS_AREA_INLINE, CSS_AREA_SELF_BLOCK, CSS_AREA_SELF_INLINE,
+       CSS_AREA_LOGICAL, CSS_AREA_SELF_LOGICAL }; /* families; 0: center and span-all, either axis */
+enum { CSS_AREA_START, CSS_AREA_END, CSS_AREA_CENTER, CSS_AREA_SPAN_START, CSS_AREA_SPAN_END, CSS_AREA_SPAN_ALL };
+struct css_area_keyword {
+    const char *name;
+    uint8_t family, track; /* CSS_AREA_X..., CSS_AREA_START... */
+    uint8_t writing;       /* x and y keywords: 0 physical, 1 the containing block's writing mode, 2 the box's */
+};
+const struct css_area_keyword *css_area_keyword(uint8_t keyword); /* NULL: 0 or not one */
+/* position-try-fallbacks' try tactics (§6.1), in the order they apply */
+enum { CSS_TRY_FLIP_BLOCK = 1, CSS_TRY_FLIP_INLINE, CSS_TRY_FLIP_START, CSS_TRY_FLIP_X, CSS_TRY_FLIP_Y };
+struct css_position_try {
+    const char *rule;  /* a @position-try rule's name; NULL: the base styles */
+    uint8_t tactic[5], tactics;
+    uint8_t area[2];   /* a <position-area> option instead; area[0] 0: none */
+    /* not a computed value: the cascade with the option's declarations in the position fallback
+       origin (§6.4, css.c), for an absolutely positioned box's rule and area options. NULL: the
+       base styles, or (rule set) no @position-try rule has the name, and the option is skipped. */
+    const struct style *style;
+};
+struct css_position_tries { const struct css_position_try *option; uint32_t count; }; /* count 0: none */
+enum { CSS_TRY_ORDER_NORMAL, CSS_TRY_ORDER_MOST_WIDTH, CSS_TRY_ORDER_MOST_HEIGHT, CSS_TRY_ORDER_MOST_BLOCK,
+       CSS_TRY_ORDER_MOST_INLINE };
+enum { CSS_VISIBLE_ANCHOR_VALID = 1, CSS_VISIBLE_ANCHOR_VISIBLE = 2, CSS_VISIBLE_NO_OVERFLOW = 4 }; /* 0: always */
+struct css_anchor {
+    struct css_anchor_names name, scope;
+    struct css_position_anchor position_anchor;
+    uint8_t area[2];   /* area[0] 0: none */
+    struct css_position_tries tries;
+    uint8_t try_order, visibility;
+};
+/* anchor() and anchor-size() (§3.2, §5.1) in a length: a leaf of its calc() tree. side is a
+   CSS_SIDE_* (anchor()) or CSS_SIZE_* (anchor-size()); a percentage side is CSS_SIDE_PERCENT. */
+enum { CSS_SIDE_INSIDE, CSS_SIDE_OUTSIDE, CSS_SIDE_TOP, CSS_SIDE_LEFT, CSS_SIDE_RIGHT, CSS_SIDE_BOTTOM,
+       CSS_SIDE_START, CSS_SIDE_END, CSS_SIDE_SELF_START, CSS_SIDE_SELF_END, CSS_SIDE_CENTER, CSS_SIDE_PERCENT };
+enum { CSS_SIZE_IMPLIED, CSS_SIZE_WIDTH, CSS_SIZE_HEIGHT, CSS_SIZE_BLOCK, CSS_SIZE_INLINE, CSS_SIZE_SELF_BLOCK,
+       CSS_SIZE_SELF_INLINE };
+struct css_anchor_function {
+    bool size;          /* anchor-size() */
+    uint8_t side;
+    bool percent_function; /* a math function gave the percentage: it serializes as calc() */
+    float percent;
+    const char *name;   /* NULL: the default anchor */
+    bool fallback_given;
+    len_t fallback;
+};
+/* A positioned box's anchor functions resolved (layout.c): for each function, the length it is, or
+   false when it is not resolvable (its fallback, if any, is used instead). axis: the property's (0
+   horizontal, 1 vertical); inset: which inset property (0-3, top right bottom left), -1 otherwise. */
+typedef bool (*css_anchor_resolver)(void *context, const struct css_anchor_function *f, unsigned axis, int inset,
+                                    float *out);
+/* the length l with every anchor function it holds replaced by what resolve gives, or its fallback;
+   false: one has neither, and the declaration is invalid at computed-value time. resolve NULL: no
+   function is resolvable (a box that is not absolutely positioned). */
+bool css_length_resolve_anchors(arena_t *a, const len_t *l, css_anchor_resolver resolve, void *context,
+                                unsigned axis, int inset, len_t *out);
+bool css_length_anchored(const len_t *l); /* l holds an anchor function */
+void css_length_own(arena_t *a, len_t *l); /* l's calculation, if any, copied into a */
+/* the anchor functions of a style that is not absolutely positioned: each computes to its fallback,
+   or the property to its initial value (cssprop.c) */
+void css_style_anchor_fallbacks(struct style *s, arena_t *a);
+/* The accepted @position-try properties (§6.4): the inset, margin, sizing and self-alignment
+   properties, position-anchor and position-area. css_style_position_option copies them from a
+   position option's style into used (anchor: storage for used's anchor group); css_style_try_tactic
+   executes a try tactic on them (§6.5.2), in horizontal-tb ltr; css_style_position_hash digests them
+   with position and the position-try longhands, to tell a fallback-sensitive change (§6.5.1). */
+struct propdef;
+bool css_prop_position_try_accepted(const struct propdef *p);
+void css_style_position_option(struct style *used, const struct style *option, struct css_anchor *anchor);
+void css_style_try_tactic(struct style *s, uint8_t tactic, struct css_anchor *anchor, arena_t *a);
+uint64_t css_style_position_hash(const struct style *s);
+bool css_position_area_text(const uint8_t area[2], sbuf *out); /* a computed <position-area> */
 /* the groups' initial values (a style's NULL group), and whether two groups hold the same computed
    values (NULL: the initial ones) */
 extern const struct css_float_shape css_float_shape_initial;
 extern const struct css_offset css_offset_initial;
+extern const struct css_anchor css_anchor_initial;
 bool css_float_shape_equal(const struct css_float_shape *a, const struct css_float_shape *b);
 bool css_offset_equal(const struct css_offset *a, const struct css_offset *b);
+bool css_anchor_equal(const struct css_anchor *a, const struct css_anchor *b);
 enum css_offset_property { CSS_OFFSET_POSITION, CSS_OFFSET_ANCHOR, CSS_OFFSET_ROTATE };
 bool css_offset_parse(enum css_offset_property which, const char *v, size_t n, struct cx *cx, void *out, sbuf *specified);
 bool css_offset_serialize(enum css_offset_property which, const void *value, sbuf *out, web_doc *d);
@@ -475,6 +594,55 @@ bool css_offset_shorthand_serialize(const struct css_offset *o, sbuf *out, web_d
 /* CSSOM specified value of a declared shape, Motion Path, shape-margin or shape-image-threshold
    value (name: the property); false leaves the authored text */
 bool css_shape_specified(const char *name, const char *v, size_t n, sbuf *out);
+/* CSS Gap Decorations 1 (css-gaps-1 §3, §4): the lines a container paints in its gaps. A style
+   holds them as one group (style_t's gap_rules); axis 0 is the column gaps' (column-rule-*), 1
+   the row gaps' (row-rule-*). */
+enum css_gap_rule_kind { CSS_GAP_COLOR, CSS_GAP_STYLE, CSS_GAP_WIDTH };
+/* one value of a <line-color-list>, <line-style-list> or <line-width-list> (§4.1-4.3) */
+union css_rule_value {
+    struct { uint32_t argb; const struct css_color_value *exact; } color; /* as a shadow's colour */
+    uint8_t style; /* BS_* */
+    float width;   /* px, snapped as a border width */
+};
+/* an item of a list (§4.5): the values [first, first + count) once (repeat 0), repeat times (an
+   integer repeater), or as many times as the gaps between the other items need (CSS_RULE_AUTO) */
+#define CSS_RULE_AUTO UINT32_MAX
+struct css_rule_item { uint32_t repeat, first, count; };
+struct css_rule_list {
+    const struct css_rule_item *items;
+    const union css_rule_value *values;
+    uint32_t nitems, nvalues;
+};
+/* <inset-value> (§3.3): a <length-percentage> of the crossing gap width, or overlap-join */
+struct css_rule_inset { len_t length; bool join; };
+enum { CSS_RULE_CAP_START, CSS_RULE_CAP_END, CSS_RULE_JUNCTION_START, CSS_RULE_JUNCTION_END };
+enum { CSS_RULE_BREAK_NONE, CSS_RULE_BREAK_NORMAL, CSS_RULE_BREAK_INTERSECTION };
+enum { CSS_RULE_ITEMS_ALL, CSS_RULE_ITEMS_AROUND, CSS_RULE_ITEMS_BETWEEN, CSS_RULE_ITEMS_NORMAL };
+enum { CSS_RULE_ROW_OVER_COLUMN, CSS_RULE_COLUMN_OVER_ROW };
+struct css_gap_axis {
+    struct css_rule_list list[3];     /* by enum css_gap_rule_kind */
+    struct css_rule_inset inset[4];   /* cap-start, cap-end, junction-start, junction-end */
+    uint8_t rule_break, visibility;   /* CSS_RULE_BREAK_*, CSS_RULE_ITEMS_* */
+};
+struct css_gap_rules {
+    struct css_gap_axis axis[2];
+    uint8_t overlap; /* rule-overlap */
+};
+extern const struct css_gap_rules css_gap_rules_initial;
+/* the same computed values (NULL: the initial ones); layout: those the segments' geometry takes
+   (widths, insets, breaks, visibility), whether the style holds the group at all included */
+bool css_gap_rules_equal(const struct css_gap_rules *a, const struct css_gap_rules *b);
+bool css_gap_rules_layout_equal(const struct css_gap_rules *a, const struct css_gap_rules *b);
+/* §4.6: the value list l gives gap index of count gaps */
+union css_rule_value css_rule_value_at(const struct css_rule_list *l, uint32_t index, uint32_t count);
+/* the gap decoration segments a container's layout found (layout.c), in its content box: each
+   runs along its axis from s to e, centred across it on centre; gap is its place in §4.6's order */
+struct gap_segment { float s, e, centre; uint32_t gap; uint8_t axis; };
+struct gap_decorations {
+    const struct gap_segment *seg;
+    uint32_t n;
+    uint32_t gaps[2]; /* the gaps of each axis, the count the value lists assign to */
+};
 /* A computed shape's geometry against its reference box r (x y w h, any one space). */
 void css_shape_ellipse(const struct css_shape *s, const float r[4], double centre[2], double radii[2]); /* circle(), ellipse() */
 /* inset(): the inner rectangle (x y w h) and its corner radii TL TR BR BL, scaled to fit (css-backgrounds-3 §5.5) */
@@ -520,7 +688,12 @@ enum { OV_VISIBLE, OV_HIDDEN, OV_SCROLL, OV_AUTO, OV_CLIP };
 enum { FD_ROW, FD_ROW_REVERSE, FD_COLUMN, FD_COLUMN_REVERSE };
 enum { FW_NOWRAP, FW_WRAP, FW_WRAP_REVERSE };
 enum { JC_START, JC_END, JC_CENTER, JC_BETWEEN, JC_AROUND, JC_EVENLY };
-enum { AI_STRETCH, AI_START, AI_END, AI_CENTER, AI_BASELINE };
+/* AI_NORMAL: normal (and justify-items' legacy), which flex, grid and block layout treat as stretch
+   and an anchor-positioned box's position-area replaces (css-anchor-position-1 §4.1); AI_ANCHOR_CENTER:
+   justify-self and align-self anchor-center (§4.2), which is center for a box that is not anchor
+   positioned. ai_used: the value those other layouts use. */
+enum { AI_STRETCH, AI_START, AI_END, AI_CENTER, AI_BASELINE, AI_ANCHOR_CENTER, AI_NORMAL };
+static inline int ai_used(int v) { return v == AI_ANCHOR_CENTER ? AI_CENTER : v == AI_NORMAL ? AI_STRETCH : v; }
 enum { AC_NORMAL, AC_STRETCH, AC_FLEX_START, AC_FLEX_END, AC_CENTER,
        AC_BETWEEN, AC_AROUND, AC_EVENLY, AC_START, AC_END };
 enum { BR_REPEAT, BR_REPEAT_X, BR_REPEAT_Y, BR_NO_REPEAT };
@@ -707,6 +880,8 @@ typedef struct style {
        style holds it: cssprop.c writes a longhand into a copy and points the style at the copy. */
     const struct css_float_shape *float_shape; /* shape-outside, shape-margin, shape-image-threshold */
     const struct css_offset *offset;           /* Motion Path */
+    const struct css_gap_rules *gap_rules;     /* gap decorations */
+    const struct css_anchor *anchor;           /* Anchor Positioning */
     struct css_clip_rect clip;
     const struct css_transform *transform;
     struct css_translate translate;
@@ -748,6 +923,12 @@ static inline const struct css_float_shape *css_style_float_shape(const style_t 
 static inline const struct css_offset *css_style_offset(const style_t *s) {
     return s->offset ? s->offset : &css_offset_initial;
 }
+static inline const struct css_gap_rules *css_style_gap_rules(const style_t *s) {
+    return s->gap_rules ? s->gap_rules : &css_gap_rules_initial;
+}
+static inline const struct css_anchor *css_style_anchor(const style_t *s) {
+    return s->anchor ? s->anchor : &css_anchor_initial;
+}
 
 /* ---------------------------------------------------------------- stylesheets */
 typedef struct sheet sheet_t;
@@ -762,19 +943,49 @@ struct cached_css {
     sheet_t *ast;
 };
 typedef struct css_ctx css_ctx;
-/* An @import rule's resolved URL (NULL: not fetched) and media query text. */
-struct css_rule_import { const char *url, *media; };
-/* Parser-owned CSSOM metadata points at the SAME native cascade AST. One
-   per top-level rule, so a sheet of fifty thousand rules keeps it small. */
+/* An @import rule's resolved URL (NULL: not fetched) and media query text;
+   href is the URL as written, layer NULL without layer ("" anonymous),
+   supports the text inside supports() or NULL. */
+struct css_rule_import { const char *url, *media, *href, *layer, *supports; };
+/* The CSSOM rule interfaces. Values below 16 are the legacy CSSRule.type
+   numbers; the others have none (CSSRule.type reads 0). */
+enum css_rule_kind {
+    CSS_RULE_STYLE = 1, CSS_RULE_IMPORT = 3, CSS_RULE_MEDIA = 4, CSS_RULE_FONT_FACE = 5,
+    CSS_RULE_PAGE = 6, CSS_RULE_KEYFRAMES = 7, CSS_RULE_KEYFRAME = 8, CSS_RULE_MARGIN = 9,
+    CSS_RULE_NAMESPACE = 10, CSS_RULE_COUNTER_STYLE = 11, CSS_RULE_SUPPORTS = 12,
+    CSS_RULE_FONT_FEATURE_VALUES = 14,
+    CSS_RULE_LAYER_BLOCK = 16, CSS_RULE_LAYER_STATEMENT, CSS_RULE_CONTAINER, CSS_RULE_SCOPE,
+    CSS_RULE_STARTING_STYLE, CSS_RULE_PROPERTY, CSS_RULE_NESTED_DECLARATIONS,
+    CSS_RULE_FONT_PALETTE_VALUES
+};
+/* Parser-owned CSSOM metadata points at the SAME native cascade AST. An
+   ordinary parse records only top-level @import rules (the resource scan
+   needs them), so a sheet of fifty thousand rules keeps it small. A CSSOM
+   parse records the whole rule tree: every rule the CSS grammar keeps, with
+   its parent and children, whether or not the cascade implements it. */
 struct css_rule_info {
-    struct css_rule_info *next;
-    /* text: the rule's text_len bytes in its sheet's source, not terminated */
+    struct css_rule_info *next;                  /* next sibling */
+    struct css_rule_info *parent, *first, *last; /* CSSOM parses only */
+    struct css_rule_info **children;             /* cssom.c's index of first..last */
+    /* text: the rule's text_len bytes in its sheet's comment-free source,
+       not terminated. The other ranges are offsets into text: the trimmed
+       prelude (selector, key text, at-rule prelude), the block's contents
+       between its braces, and the declarations the rule owns itself. */
     const char *text, *selector;
     const struct css_rule_import *import; /* @import only */
     void *native_rule;
-    uint32_t text_len, type, id;
-    uint8_t layer_kind; /* 1 statement, 2 block; not a CSSRule.type surrogate */
+    uint32_t text_len, type, id, child_count;
+    uint32_t prelude_at, prelude_len, block_at, block_len, decls_at, decls_len;
+    bool block, closed; /* has a block; ended by its own '}' or ';', not by end of input */
+    bool marker;        /* a nested declarations rule written as CSS_NESTED_DECLARATIONS_MARKER */
+    bool exposed;       /* cssom.c: a CSSRule object stands for it */
 };
+/* cssom.c writes a CSSNestedDeclarations rule that its text cannot otherwise
+   keep apart (beside another, or with no declarations) as this at-rule with the
+   declarations as its block. The parser takes it as that rule only at the
+   offsets cssom.c passes; anywhere else, like any author text, it is an unknown
+   at-rule. */
+#define CSS_NESTED_DECLARATIONS_MARKER "@-nocturne-nested-declarations"
 
 /* the document's styling state */
 struct styling {
@@ -792,6 +1003,15 @@ struct css_import {
 };
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports);
 sheet_t *css_parse_sheet_serviced(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports);
+/* The same parse, also recording the whole CSSOM rule tree (cssom.c), with the
+   nested-declarations markers at the sorted offsets markers holds. */
+sheet_t *css_parse_cssom_sheet(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url,
+                               const uint32_t *markers, uint32_t nmarkers);
+/* css as the parser reads it: comments out, NUL as U+FFFD (malloc; NULL: no memory).
+   A parse of text that went through this has its rules at the same offsets. */
+char *css_preprocess(const char *css, size_t n, size_t *out_n);
+/* The comment-free source every css_rule_info text points into. */
+const char *css_sheet_source(const sheet_t *sheet, size_t *length);
 void css_sheet_scope(sheet_t *sheet, node_t *shadow_root);
 /* The arena the sheet was parsed into now lives at another address: the AST's
    rule index is built later in its owning arena, which it names by address. */
@@ -801,7 +1021,6 @@ void css_sheet_import_context(sheet_t *sheet,sheet_t *parent,const struct css_ru
 void css_sheet_media(sheet_t *sheet, const char *media);
 struct css_rule_info *css_sheet_rules(sheet_t *sheet, uint32_t *length);
 uint32_t css_sheet_import_urls(const sheet_t *sheet); /* how many of its rules are @import with a URL */
-bool css_sheet_single_rule(sheet_t *sheet, const char *source, size_t length);
 const char *css_ua_sheet(void);
 /* compute every element's style for the viewport */
 void css_cascade(web_doc *d, int vw, int vh);
@@ -1005,6 +1224,8 @@ struct cx {
     bool absolute_lengths; /* relative lengths and percentages fail (Geometry's matrix strings) */
     bool computed_text;    /* the value is computed-value text the animation layer wrote (css_anim_parse):
                               what a style sheet's parse clamps (rgb()'s components) keeps its value */
+    uint8_t anchor_functions; /* LF_ANCHOR, LF_ANCHOR_SIZE: the anchor functions the length being parsed may hold */
+    uint8_t anchor_depth;     /* the anchor functions' fallbacks the length being parsed is in */
 };
 /* apply a declaration (var() already substituted) unless its properties are all set; false if invalid */
 bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx);
@@ -1014,6 +1235,8 @@ const char *css_value_canonical(arena_t *a, const char *value, size_t n, size_t 
 bool css_supports_declaration(const char *property, size_t pn, const char *value, size_t vn);
 bool css_valid_declaration(const char *property, size_t pn, const char *value, size_t vn);
 bool css_supports_condition(const char *condition, size_t n, bool implied_parens);
+/* whether the condition matches the @supports grammar, true or false */
+bool css_supports_grammar(const char *condition, size_t n, bool implied_parens);
 /* start a style: inherited properties from the parent, the others initial */
 void css_style_init(style_t *s, const style_t *parent);
 /* s takes from's inherited values (what css_style_init copies from a parent)
@@ -1115,6 +1338,7 @@ typedef struct box {
     float static_x, static_y;
     struct box *static_cb;
     uint32_t gen;           /* layout pass that listed it */
+    uint32_t abs_placed;    /* layout pass that placed it, which an anchor-positioned box may do early */
     struct box *cb;         /* the block box these coordinates are relative to */
     struct box *inline_paint_owner, *inline_paint_source;
     int inline_run_first, inline_run_last, inline_deco_first, inline_deco_last;
@@ -1151,6 +1375,9 @@ typedef struct box {
     int ndecos;
     struct line_fragment *lines;
     int nlines;
+    /* a grid or flex container's gap decoration segments (layout_mem), NULL when its style holds
+       no gap_rules group */
+    const struct gap_decorations *gap_decorations;
     bool clamp_hidden, clamp_truncated;
     bool ellipsis_hidden; /* paint-only elision of an atomic inline, never hit/layout */
     uint64_t ellipsis_hidden_revision;
@@ -1179,7 +1406,19 @@ typedef struct box {
     uint8_t marker_shape;
     /* inline <svg>: its entry in the document's cache */
     struct svg_cache *svg;
+    /* an anchor-positioned box's resolved position (layout.c, css-anchor-position-1): the styles it
+       is laid out with, the chosen position option, the scroll it compensates for. Box lifetime. */
+    struct box_anchor *anchored;
 } box_t;
+/* layout.c: an anchor-positioned box's used styles (its own st with its anchor functions resolved and
+   its chosen position option applied, into style and its anchor group into anchor; false: it is not
+   anchor positioned), its used inset in px (side 0-3; false: auto, or not anchor positioned),
+   whether position-visibility hides it, and its default scroll shift on an axis (§3.3) */
+bool box_anchor_style(const box_t *b, struct style *style, struct css_anchor *anchor);
+bool box_anchor_inset(const box_t *b, unsigned side, float *out);
+bool box_anchor_hidden(const box_t *b);
+float box_anchor_shift(const box_t *b, unsigned axis);
+void box_anchor_free(box_t *b);
 
 static inline bool box_line_clamp(const box_t *b) {
     return b && !b->anon && b->st && b->st->legacy_box &&
@@ -1600,6 +1839,8 @@ struct web_doc {
     pvec svgs;        /* struct svg_cache* */
     box_t *root_box;
     pvec abs_boxes;   /* absolutely positioned boxes, painted last */
+    struct box_anchor *anchored_boxes; /* layout.c: the anchor-positioned boxes (box_t's anchored), linked */
+    uint32_t anchor_epoch; /* box.c: counts unpublished element boxes, which those boxes' records name */
     pvec box_changes; /* parent/subtree pairs, or node/NULL to regenerate a node, until box publication */
     bool box_changes_full;
     const char *box_full_reason; /* debug_js only: why the next publication rebuilds every box */
@@ -1841,7 +2082,20 @@ void doc_sync_tree(web_doc *d);
 node_t *doc_image_node_next(web_doc *d, node_t *previous);
 void doc_image_node_owned(node_t *n); /* at element creation, once its tag is known */
 void doc_image_sync(web_doc *d, node_t *n);
-struct cached_css *doc_css_request_next(web_doc *d, size_t *cursor);
+/* The next stylesheet to request, and the link element that asked for it
+   (NULL for an @import), whose nonce the request carries. */
+struct cached_css *doc_css_request_next(web_doc *d, size_t *cursor, node_t **element);
+/* HTML "update a style block": whether CSP allows a style element's child
+   text (text NULL: read it from the element). The check runs and reports
+   once for each new text. */
+bool doc_style_csp_allowed(web_doc *d, node_t *style, const char *text, size_t length);
+/* CSP checks for elements of d, reported through d's realm (without one,
+   still decided): a style element's inline text, and Is base allowed. */
+bool web_js_csp_style_allowed(web_doc *d, node_t *element, bool attribute, const char *text, size_t length);
+bool web_js_csp_base_allowed(web_doc *d, node_t *base, const char *url);
+/* HTML's style attribute was set to value (NULL: removed) by a parser or the
+   attribute change steps: CSP's inline check decides whether it applies. */
+void doc_style_attribute_changed(web_doc *d, node_t *n, const char *value);
 void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const char *css, size_t n);
 bool doc_link_load_current(web_doc *d, node_t *n, uint64_t generation);
 bool web_js_stylesheet_event(web_doc *d, node_t *n, bool failed);
@@ -1855,13 +2109,31 @@ bool css_matches_n(node_t *node, node_t *scope, const char *selector, size_t len
 /* CSSOM: a style rule's selectorText; an @namespace rule's prefix (NULL: none) and URI */
 void css_rule_selector_serialize(const struct css_rule_info *info, sbuf *out);
 bool css_namespace_rule(arena_t *a, const char *text, size_t length, const char **prefix, const char **uri);
-/* CSSOM "serialize a CSS rule" (a style rule's selectors and an @namespace rule from
-   their parse; other rules as written) */
-void css_rule_text_serialize(const struct css_rule_info *info, sbuf *out);
-/* selectorText's setter: the rule's new text, or NULL when the selectors do not
-   parse in sheet's namespaces; *selector gets them serialized (both malloc'd) */
-char *css_rule_with_selector(const sheet_t *sheet, const struct css_rule_info *info, const char *selector,
-                             size_t length, size_t *out_length, char **selector_out);
+/* selectorText's setter: the selectors parsed in sheet's namespaces (NULL: none),
+   serialized into out; false when they do not parse */
+bool css_selectors_serialize(const sheet_t *sheet, const char *selector, size_t length, sbuf *out);
+/* CSSOM "serialize an identifier" and "serialize a string" */
+void css_serialize_ident(sbuf *out, const char *name);
+void css_serialize_string(sbuf *out, const char *text);
+/* CSSOM declaration blocks as text (an element's style attribute, a rule's
+   declarations). serialize: the block's serialization, with the property names
+   NUL-terminated into names when given; find: a property's last effective value
+   and priority; value: a specified value as CSSOM serializes it; set: on a
+   serialized block, setProperty's (removeProperty's, for an empty value)
+   serialized result into out (1), the value or priority does not parse (0, out
+   unchanged), the name is not a property name (-1), or no memory (-2); names:
+   a serialized block's property names, each NUL-terminated; balanced: the text
+   can stand inside a block. */
+/* a declaration's validity in its block (name lowercased unless custom), and
+   when serialized is given, its value's serialization; NULL: a property's */
+typedef bool css_decl_check(const char *name, const char *value, size_t n, sbuf *serialized);
+bool css_decl_find(const char *css, size_t n, const char *property, const char **value, size_t *value_n, bool *important);
+void css_decl_value(const char *property, const char *value, size_t n, sbuf *out);
+int css_decl_set(const char *css, size_t n, const char *property, const char *value, const char *priority,
+                 css_decl_check *check, sbuf *out);
+bool css_decl_serialize(const char *css, size_t n, css_decl_check *check, sbuf *out, sbuf *names);
+void css_decl_names(const char *css, size_t n, sbuf *names);
+bool css_decl_balanced(const char *text, size_t n);
 void web_js_start(web_doc *d, const struct web_host *host);
 bool web_js_parser_candidate(web_doc *d, const char *name, const char *is);
 node_t *web_js_parser_element(web_doc *d, node_t *node, const char *is, bool finish);

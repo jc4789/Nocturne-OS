@@ -27,6 +27,11 @@ struct layout_context {
     bool pure;
     unsigned clamp_depth; /* copied by value into independent layout helpers */
     arena_t scratch; /* helper-owned allocation trap, never the caller stack */
+    /* css-anchor-position-1: the anchor elements' boxes, in reverse tree order, listed (in the
+       document's lmem) the first time an anchor-positioned box looks a name up in this layout */
+    struct anchor_entry *anchors;
+    bool anchors_listed;
+    unsigned anchor_depth; /* anchor-positioned boxes placed early for another's anchor, nested */
 };
 static struct layout_context default_layout;
 static struct layout_context *layout_current(void) {
@@ -50,6 +55,45 @@ static void layout_media_checkpoint(void) {
 }
 
 #define INF 1e30f
+
+/* ---------------------------------------------------------------- anchor positioning: the record */
+/* What an anchor-positioned box (css-anchor-position-1) keeps between layouts, box lifetime: the
+   used values of its accepted @position-try properties (its anchor functions resolved, its chosen
+   position option applied) for CSSOM, its default anchor and the scroll it compensates for (§3.3)
+   for paint, and its last successful position option (§6.5.1.1). */
+struct anchor_scroll { const box_t *anchor; float offset[2]; }; /* a remembered scroll offset */
+struct box_anchor {
+    struct box_anchor *next, **link; /* web_doc's anchored_boxes */
+    box_t *box;
+    uint32_t placed;    /* the layout generation that placed it */
+    uint64_t revision;  /* the document's layout_revision then */
+    uint32_t epoch;     /* and its anchor_epoch: the boxes named below are not freed while it is the same */
+    bool valid;         /* the used values below are its last layout's */
+    len_t inset[4], margin[4], width, height, min_width, max_width, min_height, max_height; /* owned by mem */
+    uint8_t align_self, justify_self;
+    struct css_position_anchor position_anchor; /* name owned by mem */
+    uint8_t area[2];
+    float inset_px[4];
+    bool inset_auto[4];
+    bool shrink_height; /* while it is laid out: self-alignment does not stretch its auto height */
+    bool fixed;         /* a fixed box in the viewport */
+    style_t *base;      /* its st while it is laid out with used */
+    web_doc *doc;
+    const box_t *default_anchor, *cb;
+    bool compensate[2]; /* it compensates for scroll on the axis (§3.3) */
+    struct anchor_scroll *scrolls; /* the remembered scroll offsets of the anchors it refers to */
+    uint32_t nscrolls, scroll_cap;
+    struct anchor_scroll *pending; /* those of a hypothetical anchor recalculation point (§6.5) */
+    uint32_t npending, pending_cap;
+    int option;         /* the last successful position option: -1 the fallback base styles */
+    uint64_t hash;      /* css_style_position_hash of the base styles it was chosen under */
+    bool laid;          /* placed before: not a newly generated box's anchor recalculation point */
+    bool hidden;        /* position-visibility: anchor-valid or no-overflow hides it */
+    uint8_t visibility; /* its used position-visibility */
+    arena_t mem;
+    style_t used;       /* its used style while it is laid out (its st then) */
+    struct css_anchor used_anchor;
+};
 
 /* ---------------------------------------------------------------- fonts */
 wfont style_font(const style_t *st) {
@@ -365,6 +409,7 @@ static float clamp_h(const box_t *b, float h, float cbh) {
 static float resolved_content_height(const box_t *b,float cbh) {
     float h=spec_h(b,&b->st->height,cbh);
     if(h>=0 || !len_auto(&b->st->height) || !b->abspos || cbh<0 ||
+       (b->anchored && b->anchored->shrink_height) ||
        (b->kind==B_ATOMIC && b->atomic!=AT_INLINE_BLOCK) ||
        len_auto(&b->st->inset[0]) || len_auto(&b->st->inset[2]) ||
        (b->node && b->node->box==b && web_dialog_is_modal(D,b->node)))return h;
@@ -698,6 +743,9 @@ static double visual_unstuck(const box_t *b, unsigned axis) {
             if(box_viewport_fixed(a))break;
         }
     for (const box_t *c = b; c; c = c->cb) {
+        /* css-anchor-position-1 §3.3: an anchor-positioned box moves with its default anchor's
+           scroll, as if by a transform before its others */
+        if (c->anchored) v += box_anchor_shift(c, axis);
         if (c != b) {
             double scroll = c->node ? axis ? c->node->scroll_y : c->node->scroll_x : 0;
             if (scroll != 0 && box_element_scrollable(c)) v -= scroll;
@@ -2895,6 +2943,195 @@ static bool layout_children_parallel(box_t **boxes,int n,float cbh) {
     return true;
 }
 
+/* ---------------------------------------------------------------- gap decorations (css-gaps-1 §3) */
+/* Grid and flex layout describe their gaps here, and one algorithm turns them into the segments
+   paint.c draws (box_t's gap_decorations): §3.1.2's segments, §3.4's visibility, §3.3's insets. A
+   gap runs along its axis (0: a column gap, 1: a row gap) from its start bound to its end bound,
+   between lo and hi across it, in the container's content box (coordinates grow rightwards and
+   downwards). Its cells lie between its bounds: bound k ends cell k - 1 at end_at and starts cell k
+   at start_at, so a gap of n cells has n + 1 bounds, the first and the last at its edges. */
+struct gd_bound {
+    float end_at, start_at;
+    float width;            /* the crossing gap width (§3.3): the junction's size, 0 at a container edge */
+    uint32_t cross, ncross; /* the gaps abutting or crossing it here: gd.cross[cross, cross + ncross) */
+    bool flanked;           /* items on opposing sides span every crossing gap here (§3.1.2) */
+};
+enum { GD_CROSSED = 1, GD_BEFORE = 2, GD_AFTER = 4 }; /* a cell: an item crosses the gap; the areas beside hold items */
+struct gd_gap {
+    float lo, hi;
+    size_t cell, bound, ncell; /* gd.cell[cell, cell + ncell), gd.bound[bound, bound + ncell + 1) */
+    size_t run, nrun;          /* its runs of painted cells: gd.run[run, run + nrun) */
+    uint32_t order;            /* its place among its axis' gaps, the index §4.6 assigns values by */
+    uint8_t axis;
+};
+struct gd_run { size_t k0, k1; }; /* cells k0 to k1: a segment before its insets */
+struct gd {
+    struct gd_gap *gap;
+    uint8_t *cell;
+    struct gd_bound *bound;
+    uint32_t *cross;
+    struct gd_run *run;
+    size_t ngap, ncell, nbound, ncross, nrun;
+    size_t capgap, capcell, capbound, capcross, caprun;
+    uint32_t count[2];                /* the gaps of each axis */
+    uint8_t rule_break[2], visibility[2]; /* the used values, which depend on the container's type */
+};
+static void gd_free(struct gd *g) {
+    free(g->gap); free(g->cell); free(g->bound); free(g->cross); free(g->run);
+}
+static bool gd_room(void **p, size_t *cap, size_t need, size_t size) {
+    if (need <= *cap) return true;
+    size_t c = *cap ? *cap : 16;
+    while (c < need) {
+        if (c > SIZE_MAX / 2 / size) return false;
+        c *= 2;
+    }
+    void *q = realloc(*p, c * size);
+    if (!q) return false;
+    *p = q;
+    *cap = c;
+    return true;
+}
+#define GD_ROOM(g, field, cap, need) gd_room((void **)&(g)->field, &(g)->cap, (need), sizeof *(g)->field)
+/* a gap of ncell (>= 1) cells, whose zeroed cells and bounds the caller fills before adding the next
+   gap; NULL out of memory */
+static struct gd_gap *gd_gap_add(struct gd *g, uint8_t axis, float lo, float hi, size_t ncell) {
+    if (ncell >= SIZE_MAX / 2 || !GD_ROOM(g, gap, capgap, g->ngap + 1) || !GD_ROOM(g, cell, capcell, g->ncell + ncell) ||
+        !GD_ROOM(g, bound, capbound, g->nbound + ncell + 1)) return NULL;
+    struct gd_gap *x = &g->gap[g->ngap++];
+    *x = (struct gd_gap){.lo = lo, .hi = hi, .cell = g->ncell, .bound = g->nbound, .ncell = ncell,
+                         .order = g->count[axis]++, .axis = axis};
+    memset(g->cell + g->ncell, 0, ncell);
+    memset(g->bound + g->nbound, 0, (ncell + 1) * sizeof *g->bound);
+    g->ncell += ncell;
+    g->nbound += ncell + 1;
+    return x;
+}
+/* gap y crosses or abuts bound b of the gap being filled (each bound's gaps added together) */
+static bool gd_cross(struct gd *g, struct gd_bound *b, size_t y) {
+    if (!GD_ROOM(g, cross, capcross, g->ncross + 1)) return false;
+    if (!b->ncross) b->cross = (uint32_t)g->ncross;
+    g->cross[g->ncross++] = (uint32_t)y;
+    b->ncross++;
+    return true;
+}
+static bool gd_shown(uint8_t cell, uint8_t visibility) {
+    if (visibility == CSS_RULE_ITEMS_AROUND) return cell & (GD_BEFORE | GD_AFTER);
+    if (visibility == CSS_RULE_ITEMS_BETWEEN) return (cell & (GD_BEFORE | GD_AFTER)) == (GD_BEFORE | GD_AFTER);
+    return true;
+}
+/* §3.1.2 "determine gap decoration segments" for every gap, as runs of cells. none: one segment
+   from one end of the gap to the other; normal: each stretch no item crosses; intersection: also
+   broken at each junction not flanked by spanning items. A cell §3.4 does not paint ends a run. */
+static bool gd_runs(struct gd *g) {
+    for (size_t i = 0; i < g->ngap; i++) {
+        struct gd_gap *x = &g->gap[i];
+        const uint8_t *cell = g->cell + x->cell;
+        const struct gd_bound *bound = g->bound + x->bound;
+        uint8_t brk = g->rule_break[x->axis], vis = g->visibility[x->axis];
+        x->run = g->nrun;
+        x->nrun = 0;
+        for (size_t k = 0; k < x->ncell; k++) {
+            if (!(k & 1023) && !layout_checkpoint()) return false;
+            if (!gd_shown(cell[k], vis) || (brk != CSS_RULE_BREAK_NONE && (cell[k] & GD_CROSSED))) continue;
+            size_t k1 = k;
+            while (k1 + 1 < x->ncell && gd_shown(cell[k1 + 1], vis) &&
+                   (brk == CSS_RULE_BREAK_NONE ||
+                    (!(cell[k1 + 1] & GD_CROSSED) && (brk != CSS_RULE_BREAK_INTERSECTION || bound[k1 + 1].flanked))))
+                k1++;
+            if (!GD_ROOM(g, run, caprun, g->nrun + 1)) return false;
+            g->run[g->nrun++] = (struct gd_run){k, k1};
+            x->nrun++;
+            k = k1;
+        }
+    }
+    return true;
+}
+/* whether a segment of gap y, before its insets, reaches into [lo, hi] along y */
+static bool gd_present(const struct gd *g, size_t y, float lo, float hi) {
+    const struct gd_gap *x = &g->gap[y];
+    const struct gd_bound *bound = g->bound + x->bound;
+    size_t a = 0, b = x->nrun;
+    while (a < b) { /* the first whose end reaches lo */
+        size_t m = a + (b - a) / 2;
+        if (bound[g->run[x->run + m].k1 + 1].end_at < lo) a = m + 1;
+        else b = m;
+    }
+    return a < x->nrun && bound[g->run[x->run + a].k0].start_at <= hi;
+}
+/* §3.3: how far the endpoint a run makes at bound k of gap x moves into the run (start: the run's
+   start). It is a junction segment endpoint when another segment is present at the junction: the
+   gap's own next one (neighbour) or a crossing gap's. overlap-join reaches into the junction by
+   half its size and half the crossing gap's rule width. */
+static float gd_inset(const struct gd *g, const struct css_gap_rules *rules, const struct gd_gap *x, size_t k, bool start,
+                      bool neighbour) {
+    const struct gd_bound *b = &g->bound[x->bound + k];
+    bool junction = neighbour;
+    for (uint32_t i = 0; i < b->ncross && !junction; i++) junction = gd_present(g, g->cross[b->cross + i], x->lo, x->hi);
+    const struct css_rule_inset *in =
+        &rules->axis[x->axis].inset[junction ? start ? CSS_RULE_JUNCTION_START : CSS_RULE_JUNCTION_END :
+                                    start ? CSS_RULE_CAP_START : CSS_RULE_CAP_END];
+    if (!in->join) return len_resolve(&in->length, b->width);
+    if (!junction) return 0;
+    const struct css_rule_list *widths = &rules->axis[!x->axis].list[CSS_GAP_WIDTH];
+    float rule = 0;
+    for (uint32_t i = 0; i < b->ncross; i++) {
+        const struct gd_gap *y = &g->gap[g->cross[b->cross + i]];
+        rule = fmaxf_(rule, css_rule_value_at(widths, y->order, g->count[y->axis]).width);
+    }
+    return -(b->width / 2 + rule / 2);
+}
+/* the segments of the gaps g holds, into b's layout memory; g is freed */
+static void gd_finish(box_t *b, struct gd *g) {
+    const struct css_gap_rules *rules = css_style_gap_rules(b->st);
+    struct gap_segment *seg = NULL;
+    size_t n = 0;
+    bool ok = gd_runs(g) && (!g->nrun || (seg = malloc(g->nrun * sizeof *seg)));
+    for (size_t i = 0; ok && i < g->ngap; i++) {
+        const struct gd_gap *x = &g->gap[i];
+        const struct gd_bound *bound = g->bound + x->bound;
+        size_t first = n;
+        for (size_t t = 0; t < x->nrun; t++) {
+            const struct gd_run *r = &g->run[x->run + t];
+            bool before = t > 0 && g->run[x->run + t - 1].k1 + 1 == r->k0;
+            bool after = t + 1 < x->nrun && g->run[x->run + t + 1].k0 == r->k1 + 1;
+            /* positive start insets move towards the end, positive end insets towards the start */
+            float s = bound[r->k0].start_at + gd_inset(g, rules, x, r->k0, true, before);
+            float e = bound[r->k1 + 1].end_at - gd_inset(g, rules, x, r->k1 + 1, false, after);
+            if (!(e > s)) continue;
+            if (n > first && s <= seg[n - 1].e) { /* overlapping segments of one gap paint as one */
+                if (s < seg[n - 1].s) seg[n - 1].s = s;
+                if (e > seg[n - 1].e) seg[n - 1].e = e;
+                continue;
+            }
+            seg[n++] = (struct gap_segment){s, e, (x->lo + x->hi) / 2, x->order, x->axis};
+        }
+    }
+    uint32_t count[2] = {g->count[0], g->count[1]};
+    gd_free(g);
+    if (!ok) {
+        free(seg);
+        if (!__atomic_load_n(&D->native_cancelled, __ATOMIC_ACQUIRE)) ar_alloc(layout_scratch(), SIZE_MAX);
+        return;
+    }
+    /* the layout memory's trap would leave seg behind */
+    jmp_buf trap, *previous = b->layout_mem.trap;
+    b->layout_mem.trap = &trap;
+    if (setjmp(trap)) {
+        b->layout_mem.trap = previous;
+        free(seg);
+        ar_alloc(layout_scratch(), SIZE_MAX);
+        return;
+    }
+    struct gap_decorations *out = ar_alloc(&b->layout_mem, sizeof *out);
+    struct gap_segment *kept = n ? ar_alloc(&b->layout_mem, n * sizeof *kept) : NULL;
+    b->layout_mem.trap = previous;
+    if (n) memcpy(kept, seg, n * sizeof *kept);
+    free(seg);
+    *out = (struct gap_decorations){kept, (uint32_t)n, {count[0], count[1]}};
+    b->gap_decorations = out;
+}
+
 /* ---------------------------------------------------------------- flexbox */
 struct fitem {
     box_t *b;
@@ -2906,6 +3143,7 @@ struct fitem {
 struct fline {
     int first, end;
     float cross, ascent, descent;
+    float origin; /* where its cross extent starts (flex_cross_lines) */
 };
 
 /* CSS Flexbox 9.7: clamped items leave the flexible pool, and their unused
@@ -3010,6 +3248,7 @@ static void flex_cross_lines(box_t *b, struct fitem *it, struct fline *lines,
     for (int l = 0; l < count; l++) {
         struct fline *line = &lines[l];
         float origin = flip ? available - cursor - line->cross : cursor;
+        line->origin = origin;
         for (int i = line->first; i < line->end; i++) {
             if (!layout_checkpoint()) break;
             layout_media_checkpoint();
@@ -3054,6 +3293,125 @@ static void flex_cross_lines(box_t *b, struct fitem *it, struct fline *lines,
     }
     if (!column) b->h = available;
     b->baseline = b->last_baseline = first_bl;
+}
+
+/* css-gaps-1 §2 in a flex container: a gap between adjacent items of a line runs across the line,
+   a gap between adjacent lines from one edge of the container to the other. Values are assigned
+   in placement order, the items' gaps on through the lines (§4.6); normal breaks behave as none,
+   and the visibility properties do not apply. */
+struct gd_span { float lo, hi; uint32_t gap; };
+static int gd_span_order(const void *a, const void *b) {
+    float x = ((const struct gd_span *)a)->lo, y = ((const struct gd_span *)b)->lo;
+    return x < y ? -1 : x > y;
+}
+/* an item's margin box along the main axis */
+static void flex_main_range(const box_t *c, bool column, float *lo, float *hi) {
+    *lo = column ? c->y - c->p[0] - c->b[0] - c->m[0] : c->x - c->p[3] - c->b[3] - c->m[3];
+    *hi = *lo + (column ? c->h + vext(c) + c->m[0] + c->m[2] : c->w + hext(c) + c->m[1] + c->m[3]);
+}
+static size_t flex_line_gaps(const struct fline *line) {
+    return line->end - line->first > 1 ? (size_t)(line->end - line->first - 1) : 0;
+}
+static void flex_gap_decorations(box_t *b, const struct fitem *it, const struct fline *lines, int count, bool column,
+                                 bool reverse) {
+    const struct css_gap_rules *rules = b->st->gap_rules;
+    if (!rules || count <= 0) return;
+    struct gd g = {0};
+    for (int a = 0; a < 2; a++) {
+        g.rule_break[a] = rules->axis[a].rule_break == CSS_RULE_BREAK_NORMAL ? CSS_RULE_BREAK_NONE : rules->axis[a].rule_break;
+        g.visibility[a] = CSS_RULE_ITEMS_ALL;
+    }
+    bool flip = b->st->flex_wrap == FW_WRAP_REVERSE;
+    uint8_t item_axis = column ? 1 : 0;
+    float main_size = column ? b->h : b->w;
+    size_t items_gaps = 0;
+    for (int l = 0; l < count; l++) items_gaps += flex_line_gaps(&lines[l]);
+    /* the gutters between lines, across: line l + 1 follows line l, before it when wrap-reverse */
+    float (*gutter)[2] = count > 1 ? malloc((size_t)(count - 1) * sizeof *gutter) : NULL;
+    /* the items' gaps along the main axis (spans, by gap) and two lines' of them sorted (pair) */
+    struct gd_span *spans = items_gaps ? malloc(items_gaps * sizeof *spans) : NULL;
+    struct gd_span *pair = items_gaps ? malloc(items_gaps * sizeof *pair) : NULL;
+    bool ok = (count < 2 || gutter) && (!items_gaps || (spans && pair));
+    for (int l = 0; ok && l + 1 < count; l++) {
+        float e0 = lines[l].origin, e1 = e0 + lines[l].cross, f0 = lines[l + 1].origin, f1 = f0 + lines[l + 1].cross;
+        float lo = flip ? f1 : e1, hi = flip ? e0 : f0;
+        if (hi < lo) lo = hi = (lo + hi) / 2;
+        gutter[l][0] = lo;
+        gutter[l][1] = hi;
+    }
+    /* the gaps between items, line by line in placement order (gap ids 0 .. items_gaps - 1) */
+    for (int l = 0; ok && l < count; l++) {
+        const struct fline *line = &lines[l];
+        /* the gaps between lines on the line's near (top or left) and far side */
+        int near = flip ? (l + 1 < count ? l : -1) : l - 1, far = flip ? l - 1 : (l + 1 < count ? l : -1);
+        for (int i = line->first; ok && i + 1 < line->end; i++) {
+            if (!(i & 1023) && !layout_checkpoint()) { ok = false; break; }
+            float a0, a1, b0, b1;
+            flex_main_range(it[i].b, column, &a0, &a1);
+            flex_main_range(it[i + 1].b, column, &b0, &b1);
+            float lo = reverse ? b1 : a1, hi = reverse ? a0 : b0;
+            if (hi < lo) lo = hi = (lo + hi) / 2;
+            struct gd_gap *x = gd_gap_add(&g, item_axis, lo, hi, 1);
+            if (!x) { ok = false; break; }
+            g.cell[x->cell] = GD_BEFORE | GD_AFTER;
+            struct gd_bound *bound = g.bound + x->bound;
+            bound[0].start_at = line->origin;
+            bound[1].end_at = line->origin + line->cross;
+            /* where a gap between lines abuts it, its bound is a junction as wide as that gap */
+            if (near >= 0) {
+                bound[0].width = gutter[near][1] - gutter[near][0];
+                ok = gd_cross(&g, &bound[0], items_gaps + (size_t)near);
+            }
+            if (ok && far >= 0) {
+                bound[1].width = gutter[far][1] - gutter[far][0];
+                ok = gd_cross(&g, &bound[1], items_gaps + (size_t)far);
+            }
+            spans[g.ngap - 1] = (struct gd_span){lo, hi, (uint32_t)(g.ngap - 1)};
+        }
+    }
+    /* the gaps between lines (ids from items_gaps): the items' gaps of the lines on either side abut
+       it, those that overlap or touch making one junction */
+    size_t first = 0;
+    for (int l = 0; ok && l + 1 < count; l++) {
+        size_t here = flex_line_gaps(&lines[l]), ns = here + flex_line_gaps(&lines[l + 1]);
+        if (ns) {
+            memcpy(pair, spans + first, ns * sizeof *pair);
+            qsort(pair, ns, sizeof *pair, gd_span_order);
+        }
+        first += here;
+        size_t junctions = 0;
+        for (size_t i = 0; i < ns; junctions++) {
+            float hi = pair[i].hi;
+            for (i++; i < ns && pair[i].lo <= hi; i++) hi = fmaxf_(hi, pair[i].hi);
+        }
+        struct gd_gap *x = gd_gap_add(&g, (uint8_t)!item_axis, gutter[l][0], gutter[l][1], junctions + 1);
+        if (!x) { ok = false; break; }
+        memset(g.cell + x->cell, GD_BEFORE | GD_AFTER, junctions + 1);
+        struct gd_bound *bound = g.bound + x->bound;
+        bound[0].start_at = 0;
+        bound[junctions + 1].end_at = main_size;
+        for (size_t i = 0, j = 1; ok && i < ns; j++) {
+            struct gd_bound *at = &bound[j];
+            float hi = pair[i].hi;
+            at->end_at = pair[i].lo;
+            ok = gd_cross(&g, at, pair[i].gap);
+            for (i++; ok && i < ns && pair[i].lo <= hi; i++) {
+                hi = fmaxf_(hi, pair[i].hi);
+                ok = gd_cross(&g, at, pair[i].gap);
+            }
+            at->start_at = hi;
+            at->width = hi - at->end_at;
+        }
+    }
+    free(gutter);
+    free(spans);
+    free(pair);
+    if (!ok) {
+        gd_free(&g);
+        if (!__atomic_load_n(&D->native_cancelled, __ATOMIC_ACQUIRE)) ar_alloc(layout_scratch(), SIZE_MAX);
+        return;
+    }
+    gd_finish(b, &g);
 }
 
 static void layout_flex(box_t *b, float defh) {
@@ -3102,7 +3460,7 @@ static void layout_flex(box_t *b, float defh) {
         for (int i = 0; i < n; i++) {
             box_t *c = it[i].b;
             resolve_edges(c, cw);
-            int al = c->st->align_self != 255 ? c->st->align_self : st->align_items;
+            int al = ai_used(c->st->align_self != 255 ? c->st->align_self : st->align_items);
             float w = spec_w(c, &c->st->width, cw);
             if (c->kind == B_ATOMIC && c->atomic != AT_INLINE_BLOCK) {
                 size_atomic(c, cw, -1);
@@ -3177,6 +3535,7 @@ static void layout_flex(box_t *b, float defh) {
         }
         b->h = defh >= 0 ? defh : content_height;
         flex_cross_lines(b, it, lines, line_count, true, single, defh, gap_cross);
+        flex_gap_decorations(b, it, lines, line_count, true, reverse);
         free(lines); free(it);
         return;
     }
@@ -3216,7 +3575,7 @@ static void layout_flex(box_t *b, float defh) {
         if (it[i].mx < it[i].mn) it[i].mx = it[i].mn;
         it[i].base = base;
         it[i].hypo = fminf_(fmaxf_(base, it[i].mn), it[i].mx);
-        it[i].align = c->st->align_self != 255 ? c->st->align_self : st->align_items;
+        it[i].align = ai_used(c->st->align_self != 255 ? c->st->align_self : st->align_items);
     }
     /* lines */
     int i0 = 0;
@@ -3286,6 +3645,7 @@ static void layout_flex(box_t *b, float defh) {
         i0 = i1;
     }
     flex_cross_lines(b, it, lines, line_count, false, single, defh, gap_cross);
+    flex_gap_decorations(b, it, lines, line_count, false, reverse);
     free(lines); free(it);
 }
 
@@ -3810,6 +4170,98 @@ static void grid_intrinsic(box_t *b, float *mn, float *mx) {
     gr_free(&g);
 }
 
+/* css-gaps-1 §2 in a grid: the gutters between adjacent tracks that are not collapsed (§4.6 counts
+   a run of collapsed gutters as one gap), each running along all the tracks of the other axis with
+   a junction at every gutter crossing it. Which areas hold items comes from the placed items. */
+static void grid_gap_decorations(box_t *b, const struct grid *gr) {
+    const struct css_gap_rules *rules = b->st->gap_rules;
+    if (!rules) return;
+    struct gd g = {0};
+    for (int a = 0; a < 2; a++) {
+        g.rule_break[a] = rules->axis[a].rule_break;
+        g.visibility[a] = rules->axis[a].visibility == CSS_RULE_ITEMS_NORMAL ? CSS_RULE_ITEMS_ALL : rules->axis[a].visibility;
+    }
+    /* the tracks that are not collapsed (rows, then columns), and each track's index among them */
+    size_t nr = (size_t)(gr->nr > 0 ? gr->nr : 0), nc = (size_t)(gr->nc > 0 ? gr->nc : 0);
+    int *track = malloc((nr + nc) * 2 * sizeof *track + 1);
+    if (!track) { ar_alloc(layout_scratch(), SIZE_MAX); return; }
+    int *rows = track, *cols = track + nr, *row_at = track + nr + nc, *col_at = row_at + nr;
+    size_t vr = 0, vc = 0;
+    for (size_t i = 0; i < nr; i++) { row_at[i] = gr->row[i].collapsed ? -1 : (int)vr; if (!gr->row[i].collapsed) rows[vr++] = (int)i; }
+    for (size_t i = 0; i < nc; i++) { col_at[i] = gr->col[i].collapsed ? -1 : (int)vc; if (!gr->col[i].collapsed) cols[vc++] = (int)i; }
+    if (!vr || !vc || (vr < 2 && vc < 2)) { free(track); return; }
+    /* the item (index + 1) each area holds; an area two items share is the first one's */
+    uint32_t *area = vr > SIZE_MAX / sizeof *area / vc ? NULL : calloc(vr * vc, sizeof *area);
+    bool ok = area != NULL;
+    for (int i = 0; ok && i < gr->n; i++) {
+        if (!(i & 255) && !layout_checkpoint()) { ok = false; break; }
+        const struct gitem *t = &gr->it[i];
+        for (int r = t->r0; r < t->r1 && r < (int)nr; r++) {
+            if (r < 0 || row_at[r] < 0) continue;
+            for (int c = t->c0; c < t->c1 && c < (int)nc; c++)
+                if (c >= 0 && col_at[c] >= 0 && !area[(size_t)row_at[r] * vc + (size_t)col_at[c]])
+                    area[(size_t)row_at[r] * vc + (size_t)col_at[c]] = (uint32_t)i + 1;
+        }
+    }
+#define AREA(r, c) area[(size_t)(r) * vc + (size_t)(c)]
+    size_t column_gaps = vc - 1;
+    /* column gaps (ids 0 .. vc - 2), along the rows; the row gaps (ids from vc - 1) cross them */
+    for (size_t k = 0; ok && k + 1 < vc; k++) {
+        const struct gtr *left = &gr->col[cols[k]], *right = &gr->col[cols[k + 1]];
+        struct gd_gap *x = gd_gap_add(&g, 0, left->pos + left->size, right->pos, vr);
+        if (!x) { ok = false; break; }
+        uint8_t *cell = g.cell + x->cell;
+        struct gd_bound *bound = g.bound + x->bound;
+        for (size_t j = 0; j < vr; j++) {
+            uint32_t l = AREA(j, k), r = AREA(j, k + 1);
+            cell[j] = (l && l == r ? GD_CROSSED : 0) | (l ? GD_BEFORE : 0) | (r ? GD_AFTER : 0);
+        }
+        bound[0].start_at = gr->row[rows[0]].pos;
+        bound[vr].end_at = gr->row[rows[vr - 1]].pos + gr->row[rows[vr - 1]].size;
+        for (size_t j = 1; ok && j < vr; j++) {
+            const struct gtr *above = &gr->row[rows[j - 1]];
+            bound[j].end_at = above->pos + above->size;
+            bound[j].start_at = gr->row[rows[j]].pos;
+            bound[j].width = fmaxf_(0, bound[j].start_at - bound[j].end_at);
+            uint32_t l0 = AREA(j - 1, k), l1 = AREA(j, k), r0 = AREA(j - 1, k + 1), r1 = AREA(j, k + 1);
+            bound[j].flanked = l0 && l0 == l1 && r0 && r0 == r1;
+            ok = gd_cross(&g, &bound[j], column_gaps + j - 1);
+        }
+    }
+    /* row gaps, along the columns; the column gaps cross them */
+    for (size_t j = 0; ok && j + 1 < vr; j++) {
+        const struct gtr *above = &gr->row[rows[j]], *below = &gr->row[rows[j + 1]];
+        struct gd_gap *x = gd_gap_add(&g, 1, above->pos + above->size, below->pos, vc);
+        if (!x) { ok = false; break; }
+        uint8_t *cell = g.cell + x->cell;
+        struct gd_bound *bound = g.bound + x->bound;
+        for (size_t k = 0; k < vc; k++) {
+            uint32_t a = AREA(j, k), c = AREA(j + 1, k);
+            cell[k] = (a && a == c ? GD_CROSSED : 0) | (a ? GD_BEFORE : 0) | (c ? GD_AFTER : 0);
+        }
+        bound[0].start_at = gr->col[cols[0]].pos;
+        bound[vc].end_at = gr->col[cols[vc - 1]].pos + gr->col[cols[vc - 1]].size;
+        for (size_t k = 1; ok && k < vc; k++) {
+            const struct gtr *left = &gr->col[cols[k - 1]];
+            bound[k].end_at = left->pos + left->size;
+            bound[k].start_at = gr->col[cols[k]].pos;
+            bound[k].width = fmaxf_(0, bound[k].start_at - bound[k].end_at);
+            uint32_t a0 = AREA(j, k - 1), a1 = AREA(j, k), c0 = AREA(j + 1, k - 1), c1 = AREA(j + 1, k);
+            bound[k].flanked = a0 && a0 == a1 && c0 && c0 == c1;
+            ok = gd_cross(&g, &bound[k], k - 1);
+        }
+    }
+#undef AREA
+    free(area);
+    free(track);
+    if (!ok) {
+        gd_free(&g);
+        if (!__atomic_load_n(&D->native_cancelled, __ATOMIC_ACQUIRE)) ar_alloc(layout_scratch(), SIZE_MAX);
+        return;
+    }
+    gd_finish(b, &g);
+}
+
 static void layout_grid(box_t *b, float defh) {
     const style_t *st = b->st;
     float cw = b->w;
@@ -3852,7 +4304,7 @@ static void layout_grid(box_t *b, float defh) {
         float aw = g.col[t->c1 - 1].pos + g.col[t->c1 - 1].size - g.col[t->c0].pos;
         resolve_edges(c, aw);
         float ext = hext(c) + c->m[1] + c->m[3];
-        int js = c->st->justify_self != 255 ? c->st->justify_self : st->justify_items;
+        int js = ai_used(c->st->justify_self != 255 ? c->st->justify_self : st->justify_items);
         if (c->kind == B_ATOMIC && c->atomic != AT_INLINE_BLOCK) size_atomic(c, aw, -1);
         else {
             if (c->kind == B_TABLE) table_width(c, aw);
@@ -3891,8 +4343,8 @@ static void layout_grid(box_t *b, float defh) {
             layout_inner(c, NULL, 0, 0, ah);
             t->h = c->h + vext(c) + c->m[0] + c->m[2];
         }
-        int js = c->st->justify_self != 255 ? c->st->justify_self : st->justify_items;
-        int as = c->st->align_self != 255 ? c->st->align_self : st->align_items;
+        int js = ai_used(c->st->justify_self != 255 ? c->st->justify_self : st->justify_items);
+        int as = ai_used(c->st->align_self != 255 ? c->st->align_self : st->align_items);
         float ow = c->w + hext(c) + c->m[1] + c->m[3], xoff = 0;
         if (len_auto(&c->st->margin[3]) && len_auto(&c->st->margin[1])) xoff = (aw - ow) / 2;
         else if (len_auto(&c->st->margin[3])) xoff = aw - ow;
@@ -3917,6 +4369,7 @@ static void layout_grid(box_t *b, float defh) {
     }
     b->h = defh >= 0 ? defh : rows_h;
     b->baseline = b->last_baseline = first_bl;
+    grid_gap_decorations(b, &g);
     gr_free(&g);
 }
 
@@ -4370,6 +4823,7 @@ static void layout_inner_body(box_t *b, struct bfc *f, float ox, float oy, float
     }
     ar_free(&b->layout_mem);
     b->decos=NULL;b->ndecos=0; /* including early-return frameset layout */
+    b->gap_decorations = NULL;
     b->layout_mem.chunk_size = 4096;
     b->layout_mem.trap = layout_scratch()->trap;
     b->clamp_trace = NULL;
@@ -4733,31 +5187,81 @@ static void abs_flex_static_position(const box_t *a, float *x, float *y) {
         main = main_space >= 0 ? main_space / 2 : reverse ? main_space : 0; break;
     }
     if (reverse) main = main_space - main;
-    int align = a->st->align_self == 255 ? s->align_items : a->st->align_self;
+    int align = ai_used(a->st->align_self == 255 ? s->align_items : a->st->align_self);
     float cross = align == AI_END ? cross_space : align == AI_CENTER ? cross_space / 2 : 0;
     if (s->flex_wrap == FW_WRAP_REVERSE) cross = cross_space - cross;
     *x += column ? cross : main;
     *y += column ? main : cross;
 }
 
-static void layout_abs(box_t *a) {
-    if (a->clamp_hidden) return;
-    box_t *cb = abs_containing_block(a);
+/* An absolutely positioned box's containing block and self-alignment when anchor positioning
+   decides them (anchor_attempt). Without a frame its containing block is cb's padding box and only
+   auto margins align it. */
+struct abs_frame {
+    float rect[4];     /* the containing block: left, top, width, height in cb's content coordinates */
+    /* the overflow limit rect's start and end on each axis before the inset-modified containing block
+       joins it (CSS Box Alignment 3 §4.4.1.2): the original containing block, extended */
+    float limit_lo[2], limit_hi[2];
+    int align[2];      /* self-alignment on each axis (0 justify-self, 1 align-self): AI_*; -1 normal */
+    bool unsafe[2];
+    float center[2];   /* anchor-center: the default anchor box's center on the axis */
+    /* out: the inset-modified containing block (auto insets as 0) and the margin box, and whether
+       the former was negative in an axis and became empty */
+    float imcb[4], margin_box[4];
+    bool collapsed;
+};
+static bool abs_align_shrinks(int align) {
+    return align == AI_START || align == AI_END || align == AI_CENTER || align == AI_ANCHOR_CENTER || align == AI_BASELINE;
+}
+/* CSS Box Alignment 3 §6.1 for an absolutely positioned box in its inset-modified containing block
+   (CSS Position 3 §3.5.2: a negative one has its end inset reduced to make it empty), with §4.4.1.2's
+   default overflow alignment. pos: the margin box's start as the insets put it; the aligned start. */
+static float abs_align_axis(struct abs_frame *f, unsigned axis, float start, float end, bool start_auto, bool end_auto,
+                            bool margin_auto, float size, float pos) {
+    float s0 = f->rect[axis] + (start_auto ? 0 : start);
+    float len = f->rect[2 + axis] - (start_auto ? 0 : start) - (end_auto ? 0 : end);
+    if (len < 0) { len = 0; f->collapsed = true; }
+    f->imcb[axis] = s0; f->imcb[2 + axis] = len;
+    int align = f->align[axis];
+    if (!start_auto && !end_auto && !margin_auto && align >= 0 && align != AI_STRETCH) {
+        float free = len - size;
+        pos = align == AI_END ? s0 + free : align == AI_CENTER ? s0 + free / 2 :
+              align == AI_ANCHOR_CENTER ? f->center[axis] - size / 2 : s0;
+        if (!f->unsafe[axis]) {
+            /* it fits: as aligned, as far as it stays within the inset-modified containing block;
+               else within the overflow limit rect, covering that block as far as it can; else at
+               the limit rect's start */
+            float lo = fminf_(f->limit_lo[axis], s0), hi = fmaxf_(f->limit_hi[axis], s0 + len);
+            if (size <= len) pos = fminf_(fmaxf_(pos, s0), s0 + len - size);
+            else if (size <= hi - lo) pos = fminf_(fmaxf_(fminf_(fmaxf_(pos, s0 + len - size), s0), lo), hi - size);
+            else pos = lo;
+        }
+    }
+    f->margin_box[axis] = pos; f->margin_box[2 + axis] = size;
+    return pos;
+}
+
+static void abs_place(box_t *a, box_t *cb, struct abs_frame *f) {
     bool icb = cb == D->root_box;
-    float rect[4]; box_abs_cb_rect(cb, D, rect);
-    float pl = -rect[0], pt = -rect[1], cbw = rect[2], cbh = rect[3];
+    float rect[4];
+    if (f) memcpy(rect, f->rect, sizeof rect);
+    else box_abs_cb_rect(cb, D, rect);
+    float left = rect[0], top = rect[1], cbw = rect[2], cbh = rect[3];
     resolve_edges(a, cbw);
     const len_t *in = a->st->inset;
     bool la = len_auto(&in[3]), ra = len_auto(&in[1]), ta = len_auto(&in[0]), ba = len_auto(&in[2]);
     float l = la ? 0 : len_resolve(&in[3], cbw), r = ra ? 0 : len_resolve(&in[1], cbw);
     float t = ta ? 0 : len_resolve(&in[0], cbh), bo = ba ? 0 : len_resolve(&in[2], cbh);
     float ext = hext(a);
+    /* self-alignment other than stretch sizes an auto size to fit its contents */
+    bool shrink_w = f && abs_align_shrinks(f->align[0]), shrink_h = f && abs_align_shrinks(f->align[1]);
     a->cb = cb;
+    if (a->anchored) a->anchored->shrink_height = shrink_h;
     if (a->kind == B_ATOMIC && a->atomic != AT_INLINE_BLOCK) size_atomic(a, cbw, cbh);
     else {
         float w = spec_w(a, &a->st->width, cbw);
         if (w < 0) {
-            if (!la && !ra && !(a->node && a->node->box==a && web_dialog_is_modal(D,a->node))) w = cbw - l - r - ext - a->m[1] - a->m[3];
+            if (!la && !ra && !shrink_w && !(a->node && a->node->box==a && web_dialog_is_modal(D,a->node))) w = cbw - l - r - ext - a->m[1] - a->m[3];
             else w = stf_width(a, cbw - l - r);
         }
         if (a->kind == B_TABLE) {
@@ -4769,6 +5273,7 @@ static void layout_abs(box_t *a) {
         layout_inner(a, NULL, 0, 0, cbh);
         if (sh >= 0 && a->kind != B_TABLE) a->h = clamp_h(a, sh, cbh);
     }
+    if (a->anchored) a->anchored->shrink_height = false;
     /* Publish used auto margins, not just an adjusted paint position. With
        both insets definite the abspos constraint determines either auto
        margin; the horizontal negative-remainder rule follows our LTR layout
@@ -4796,16 +5301,741 @@ static void layout_abs(box_t *a) {
     }
     float mw = a->w + ext + a->m[1] + a->m[3];
     float x;
-    if (!la) x = -pl + l + a->m[3];
-    else if (!ra) x = -pl + cbw - r - mw + a->m[3];
+    if (!la) x = left + l + a->m[3];
+    else if (!ra) x = left + cbw - r - mw + a->m[3];
     else x = sx + a->m[3];
     float mh = a->h + vext(a) + a->m[0] + a->m[2];
     float y;
-    if (!ta) y = -pt + t + a->m[0];
-    else if (!ba) y = -pt + cbh - bo - mh + a->m[0];
+    if (!ta) y = top + t + a->m[0];
+    else if (!ba) y = top + cbh - bo - mh + a->m[0];
     else y = sy + a->m[0];
+    if (f) {
+        bool mx = len_auto(&a->st->margin[3]) || len_auto(&a->st->margin[1]);
+        bool my = len_auto(&a->st->margin[0]) || len_auto(&a->st->margin[2]);
+        x = abs_align_axis(f, 0, l, r, la, ra, mx, mw, x - a->m[3]) + a->m[3];
+        y = abs_align_axis(f, 1, t, bo, ta, ba, my, mh, y - a->m[0]) + a->m[0];
+    }
     a->x = x + a->b[3] + a->p[3];
     a->y = y + a->b[0] + a->p[0];
+}
+
+/* ---------------------------------------------------------------- anchor positioning */
+/* css-anchor-position-1. An absolutely positioned box is anchor positioned when it may have a
+   default anchor or refers to anchors. Here its anchor functions resolve against the anchor boxes
+   laid out before it (§2.3), its position-area grid and anchor-center decide its containing block
+   and alignment (§3.1, §4), and its position options are tried in turn (§6.5): all in the absolute
+   positioning stage, once per layout. An anchor that is itself absolutely positioned is placed
+   first; the document is never laid out again for an anchor. */
+static bool anchor_style_used(const style_t *st) {
+    const struct css_anchor *an = st->anchor;
+    if (an && (an->position_anchor.kind != CSS_ANCHOR_NORMAL || an->area[0] || an->tries.count)) return true;
+    if (st->align_self == AI_ANCHOR_CENTER || st->justify_self == AI_ANCHOR_CENTER) return true;
+    const len_t *l[] = {&st->inset[0], &st->inset[1], &st->inset[2], &st->inset[3], &st->margin[0], &st->margin[1],
+                        &st->margin[2], &st->margin[3], &st->width, &st->height, &st->min_width, &st->max_width,
+                        &st->min_height, &st->max_height};
+    for (size_t i = 0; i < sizeof l / sizeof *l; i++) if (l[i]->kind == LK_EXPR && css_length_anchored(l[i])) return true;
+    return false;
+}
+static struct box_anchor *anchor_attach(box_t *a) {
+    if (a->anchored) return a->anchored;
+    struct box_anchor *ba = calloc(1, sizeof *ba);
+    if (!ba) return NULL;
+    ba->box = a; ba->option = -1;
+    ba->next = D->anchored_boxes;
+    if (ba->next) ba->next->link = &ba->next;
+    ba->link = &D->anchored_boxes;
+    D->anchored_boxes = ba;
+    a->anchored = ba;
+    return ba;
+}
+void box_anchor_free(box_t *b) {
+    struct box_anchor *ba = b ? b->anchored : NULL;
+    if (!ba) return;
+    *ba->link = ba->next;
+    if (ba->next) ba->next->link = ba->link;
+    ar_free(&ba->mem);
+    free(ba->scrolls); free(ba->pending);
+    free(ba);
+    b->anchored = NULL;
+}
+
+/* An anchor element's principal box (§2.1): an element's, or a ::before or ::after's first box. */
+static bool anchor_principal(const box_t *b) {
+    const style_t *st = b->st;
+    if (!st || !st->anchor || !st->anchor->name.count || b->anon || !b->node || b->node->type != N_ELEM ||
+        b->kind == B_TEXT || b->kind == B_BR || b->clamp_hidden) return false;
+    if (b->node->box == b) return true;
+    const style_t *own = b->node->style;
+    return own && (st == own->before || st == own->after) && (!b->parent || b->parent->st != st);
+}
+struct anchor_entry { struct anchor_entry *next; box_t *box; };
+static void anchors_list(void) {
+    struct layout_context *lc = layout_current();
+    lc->anchors_listed = true;
+    for (box_t *b = D->root_box; b; ) {
+        if (anchor_principal(b)) {
+            struct anchor_entry *e = ar_alloc(&D->lmem, sizeof *e);
+            e->box = b; e->next = lc->anchors; lc->anchors = e;
+        }
+        if (b->first) { b = b->first; continue; }
+        while (b && !b->next) b = b->parent;
+        if (b) b = b->next;
+    }
+}
+static bool anchor_names_has(const struct css_anchor_names *n, const char *name) {
+    for (uint32_t i = 0; i < n->count; i++) if (!strcmp(n->name[i], name)) return true;
+    return false;
+}
+static bool box_within(const box_t *b, const box_t *ancestor) {
+    for (; b; b = b->parent) if (b == ancestor) return true;
+    return false;
+}
+/* §2.2: the nearest element at or above b whose anchor-scope scopes name */
+static const box_t *anchor_scope_of(const box_t *b, const char *name) {
+    for (; b; b = b->parent) {
+        if (b->anon || !b->node || b->node->type != N_ELEM || !b->st || !b->st->anchor) continue;
+        const struct css_anchor_names *s = &b->st->anchor->scope;
+        if (s->all || anchor_names_has(s, name)) return b;
+    }
+    return NULL;
+}
+/* an anchor's name is visible only in its scope's subtree, and a scope's descendants see that
+   name only on anchors within it */
+static bool anchor_in_scope(const box_t *anchor, const box_t *p, const char *name) {
+    const box_t *s = anchor_scope_of(anchor, name);
+    if (s && (p == s || !box_within(p, s))) return false;
+    s = p->parent ? anchor_scope_of(p->parent, name) : NULL;
+    return !s || box_within(anchor, s);
+}
+/* the top layer a box is in: 0 none, else above every lower one */
+static int anchor_top_layer(const box_t *b) {
+    int count = web_dialog_count(D);
+    if (!count) return 0;
+    for (; b; b = b->parent)
+        if (b->node && b->node->box == b && web_dialog_layer_box(D, (box_t *)b)) {
+            for (int i = 0; i < count; i++) if (web_dialog_at(D, i) == b->node) return i + 1;
+            return count + 1;
+        }
+    return 0;
+}
+/* x before y in the box tree's (the flat tree's) order */
+static bool box_precedes(const box_t *x, const box_t *y) {
+    if (x == y) return false;
+    int dx = 0, dy = 0;
+    for (const box_t *b = x; b; b = b->parent) dx++;
+    for (const box_t *b = y; b; b = b->parent) dy++;
+    const box_t *a = x, *b = y;
+    while (dx > dy) { a = a->parent; dx--; }
+    while (dy > dx) { b = b->parent; dy--; }
+    if (a == b) return a == x; /* an ancestor precedes its descendants */
+    while (a->parent != b->parent) { a = a->parent; b = b->parent; }
+    for (const box_t *s = a->next; s; s = s->next) if (s == b) return true;
+    return false;
+}
+/* the containing block an anchor's acceptability walks: an absolutely positioned box's, else the
+   block box it is laid out in */
+static box_t *anchor_containing_block(box_t *b) {
+    if (b->abspos) return abs_containing_block(b);
+    if (b->kind != B_INLINE && b->kind != B_TEXT && b->cb) return b->cb;
+    box_t *p = b->parent;
+    while (p && p->kind == B_INLINE) p = p->parent;
+    return p;
+}
+/* §2.3 an acceptable anchor element: laid out strictly before p. An anchor in p's containing block
+   is, unless it is absolutely positioned after p (in the same top layer); elsewhere the box that
+   generates its containing block must be. */
+static bool anchor_acceptable(box_t *anchor, box_t *p, box_t *pcb) {
+    if (anchor == p) return false;
+    for (box_t *x = anchor; x; ) {
+        box_t *cb = anchor_containing_block(x);
+        if (cb == pcb) {
+            int own = anchor_top_layer(x), theirs = anchor_top_layer(p);
+            if (own != theirs) return own < theirs;
+            return !x->abspos || box_precedes(x, p);
+        }
+        if (!cb || x == D->root_box) return false;
+        x = cb;
+    }
+    return false;
+}
+/* §2.3 the target anchor element of a name: the nearest acceptable ancestor, else the last
+   acceptable anchor element in tree order */
+static box_t *anchor_target(box_t *p, box_t *pcb, const char *name) {
+    for (box_t *x = p->parent; x; x = x->parent)
+        if (anchor_principal(x) && anchor_names_has(&x->st->anchor->name, name) && anchor_in_scope(x, p, name) &&
+            anchor_acceptable(x, p, pcb)) return x;
+    struct layout_context *lc = layout_current();
+    if (!lc->anchors_listed) anchors_list();
+    for (struct anchor_entry *e = lc->anchors; e; e = e->next) {
+        box_t *x = e->box;
+        if (anchor_names_has(&x->st->anchor->name, name) && anchor_in_scope(x, p, name) && anchor_acceptable(x, p, pcb))
+            return x;
+    }
+    return NULL;
+}
+static bool anchor_pseudo(const box_t *b, const style_t *base) {
+    const style_t *own = b->node ? b->node->style : NULL;
+    return own && base != own && (base == own->before || base == own->after);
+}
+/* §2.4 the default anchor element's principal box */
+static box_t *anchor_default(box_t *p, const style_t *base, const style_t *used, box_t *pcb) {
+    const struct css_anchor *an = css_style_anchor(used);
+    uint8_t kind = an->position_anchor.kind;
+    if (kind == CSS_ANCHOR_NORMAL) kind = an->area[0] ? CSS_ANCHOR_AUTO : CSS_ANCHOR_NONE;
+    if (kind == CSS_ANCHOR_NAMED) return an->position_anchor.name ? anchor_target(p, pcb, an->position_anchor.name) : NULL;
+    if (kind == CSS_ANCHOR_AUTO) {
+        /* §2.4.1 a pseudo-element's implicit anchor element is its originating element */
+        box_t *origin = anchor_pseudo(p, base) ? p->node->box : NULL;
+        return origin && anchor_acceptable(origin, p, pcb) ? origin : NULL;
+    }
+    if (kind == CSS_ANCHOR_MATCH_PARENT) {
+        box_t *parent = anchor_pseudo(p, base) ? p->node->box : NULL;
+        for (box_t *x = p->parent; x && !parent; x = x->parent)
+            if (!x->anon && x->node && x->node->box == x) parent = x;
+        box_t *inherited = parent && parent->anchored && parent->anchored->valid ? (box_t *)parent->anchored->default_anchor : NULL;
+        return inherited && anchor_acceptable(inherited, p, pcb) ? inherited : NULL;
+    }
+    return NULL;
+}
+/* An absolutely positioned box on an anchor's containing-block chain up to p's containing block, not
+   yet placed in this layout, is placed now, the outermost first: the anchor's position depends on it. */
+static void layout_abs(box_t *a);
+static void anchor_ensure_placed(box_t *anchor, box_t *pcb) {
+    box_t *chain[32];
+    int n = 0;
+    for (box_t *c = anchor; c && c != pcb && n < 32; c = anchor_containing_block(c)) {
+        if (c->abspos) chain[n++] = c;
+        if (c == D->root_box) break;
+    }
+    for (int i = n - 1; i >= 0; i--)
+        if (chain[i]->gen == GEN && chain[i]->abs_placed != GEN) layout_abs(chain[i]);
+}
+/* relative_offsets' offset for this layout, which runs before it */
+static float anchor_relative(const box_t *b, unsigned axis) {
+    if (!b->parent || !b->st || b->st->position != POS_RELATIVE || b->kind == B_INLINE || b->kind == B_TEXT ||
+        b->wrapped_inner) return 0;
+    const len_t *in = b->st->inset;
+    float cw = b->cb ? b->cb->w : VW, ch = b->cb ? b->cb->h : VH;
+    if (!axis) return !len_auto(&in[3]) ? len_resolve(&in[3], cw) : !len_auto(&in[1]) ? -len_resolve(&in[1], cw) : 0;
+    if (!len_auto(&in[0])) return len_has_pct(&in[0]) && !b->cb ? 0 : len_resolve(&in[0], ch);
+    return !len_auto(&in[2]) ? -len_resolve(&in[2], ch) : 0;
+}
+/* box_abs_x/y with this layout's relative offsets */
+static double anchor_abs(const box_t *b, unsigned axis) {
+    double v = 0;
+    if (!axis) { for (const box_t *c = b; c; c = c->cb) v += c->x + anchor_relative(c, 0); return v; }
+    v = b->y + anchor_relative(b, 1);
+    for (const box_t *c = b->cb; c; c = c->cb) v += c->y + anchor_relative(c, 1) + c->content_dy;
+    return v;
+}
+/* where the scroll containers that move an anchor start: its box, which its own scroll does not move,
+   or an inline's block, whose scroll does (self) */
+static const box_t *anchor_scroll_origin(const box_t *anchor, bool *self) {
+    *self = anchor->kind == B_INLINE;
+    if (!*self) return anchor;
+    const box_t *block = anchor->parent;
+    while (block && block->kind == B_INLINE) block = block->parent;
+    return block;
+}
+/* §2 the anchor box: its principal box's border box, or a fragmented inline's fragments' bounding
+   rectangle, in pcb's content coordinates as laid out (no scroll container scrolled) */
+static bool anchor_border_rect(const box_t *anchor, const box_t *pcb, double r[4]) {
+    const box_t *g = anchor;
+    if (g->kind == B_ATOMIC && g->first && g->first->node == g->node &&
+        (g->first->kind == B_FLEX || g->first->kind == B_GRID || g->first->kind == B_TABLE)) g = g->first;
+    double x, y, w, h;
+    if (g->kind == B_INLINE) {
+        const box_t *block = g->parent;
+        while (block && block->kind == B_INLINE) block = block->parent;
+        if (!block) return false;
+        bool any = false;
+        double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        for (int i = 0; i < block->ndecos; i++) {
+            const struct deco *span = &block->decos[i];
+            if (span->node != g->node || span->st != g->st) continue;
+            if (!any) { x0 = span->x; y0 = span->y; x1 = span->x + span->w; y1 = span->y + span->h; any = true; }
+            else {
+                x0 = fmin(x0, span->x); y0 = fmin(y0, span->y);
+                x1 = fmax(x1, span->x + span->w); y1 = fmax(y1, span->y + span->h);
+            }
+        }
+        if (!any) return false;
+        x = anchor_abs(block, 0) + x0; y = anchor_abs(block, 1) + block->content_dy + y0;
+        w = x1 - x0; h = y1 - y0;
+    } else {
+        x = anchor_abs(g, 0) - g->p[3] - g->b[3]; y = anchor_abs(g, 1) - g->p[0] - g->b[0];
+        w = g->w + hext(g); h = g->h + vext(g);
+    }
+    r[0] = x - anchor_abs(pcb, 0); r[1] = y - (anchor_abs(pcb, 1) + pcb->content_dy); r[2] = w; r[3] = h;
+    return isfinite(r[0]) && isfinite(r[1]) && isfinite(r[2]) && isfinite(r[3]);
+}
+/* §3.3 the scroll that moves an anchor relative to p's containing block now: the scroll offsets of
+   the scroll containers from it up to (not including) that containing block, less the sticky
+   shifts; a fixed p's anchor in the document also moves with the viewport's scroll. */
+static void anchor_scroll_now(web_doc *d, const box_t *from, bool self, const box_t *pcb, bool fixed, float out[2]) {
+    double sx = 0, sy = 0;
+    bool in_fixed = false;
+    for (const box_t *c = from; c && c != pcb; c = c->cb) {
+        if ((c != from || self) && box_element_scrollable(c)) { sx += c->node->scroll_x; sy += c->node->scroll_y; }
+        if (box_sticky(c)) { float shift[2]; sticky_offset(c, shift); sx -= shift[0]; sy -= shift[1]; }
+        if (box_viewport_fixed(c)) { in_fixed = true; break; }
+    }
+    if (fixed && !in_fixed) { sx += d->view_x; sy += d->view_y; }
+    else if (!fixed && in_fixed) { sx -= d->view_x; sy -= d->view_y; }
+    out[0] = (float)sx; out[1] = (float)sy;
+}
+/* the nearest scroll container on a box's containing-block chain (NULL: the viewport) */
+static const box_t *anchor_scroller(const box_t *b) {
+    for (const box_t *c = b ? b->cb : NULL; c; c = c->cb) if (box_element_scrollable(c)) return c;
+    return NULL;
+}
+/* §3.3 how far an anchor has scrolled on an axis since its remembered scroll offset in list */
+static float anchor_scroll_shift(web_doc *d, const struct anchor_scroll *list, uint32_t n, const box_t *anchor,
+                                 const box_t *pcb, bool fixed, unsigned axis) {
+    const struct anchor_scroll *remembered = NULL;
+    for (uint32_t i = 0; i < n && !remembered; i++) if (list[i].anchor == anchor) remembered = &list[i];
+    bool self;
+    const box_t *from = remembered ? anchor_scroll_origin(anchor, &self) : NULL;
+    if (!from) return 0;
+    float now[2];
+    anchor_scroll_now(d, from, self, pcb, fixed, now);
+    float shift = remembered->offset[axis] - now[axis];
+    return isfinite(shift) ? shift : 0;
+}
+static bool scrolls_push(struct anchor_scroll **v, uint32_t *n, uint32_t *cap, const box_t *anchor, const float offset[2]) {
+    if (*n == *cap) {
+        uint32_t next = *cap ? *cap * 2 : 4;
+        struct anchor_scroll *grown = realloc(*v, next * sizeof *grown);
+        if (!grown) return false;
+        *v = grown; *cap = next;
+    }
+    (*v)[*n] = (struct anchor_scroll){anchor, {offset[0], offset[1]}};
+    (*n)++;
+    return true;
+}
+/* One try of an anchor-positioned box: what resolving its anchor functions sees. */
+struct anchor_attempt {
+    box_t *p, *pcb;
+    struct box_anchor *ba;
+    const style_t *base;
+    bool hypothetical; /* §6.5.2: a hypothetical anchor recalculation point (an option not in effect) */
+    bool fixed;        /* a fixed box in the viewport */
+    box_t *default_anchor;
+    const box_t *default_scroller;
+    float cb[4];       /* the containing block the insets are offsets from */
+    bool referenced_default, missing_default; /* position-visibility: anchor-valid */
+    bool compensate[2];
+};
+/* an anchor's box in pcb's coordinates with its remembered scroll offset applied (§3.3): as
+   remembered at the box's last anchor recalculation point, or now for a hypothetical one */
+static bool anchor_rect_for(struct anchor_attempt *t, box_t *anchor, double r[4]) {
+    anchor_ensure_placed(anchor, t->pcb);
+    bool self;
+    const box_t *from = anchor_scroll_origin(anchor, &self);
+    if (!from || !anchor_border_rect(anchor, t->pcb, r)) return false;
+    struct box_anchor *ba = t->ba;
+    const struct anchor_scroll *found = NULL;
+    struct anchor_scroll *list = t->hypothetical ? ba->pending : ba->scrolls;
+    uint32_t count = t->hypothetical ? ba->npending : ba->nscrolls;
+    for (uint32_t i = 0; i < count && !found; i++) if (list[i].anchor == anchor) found = &list[i];
+    float offset[2];
+    if (found) { offset[0] = found->offset[0]; offset[1] = found->offset[1]; }
+    else {
+        anchor_scroll_now(D, from, self, t->pcb, t->fixed, offset);
+        if (t->hypothetical) scrolls_push(&ba->pending, &ba->npending, &ba->pending_cap, anchor, offset);
+        else scrolls_push(&ba->scrolls, &ba->nscrolls, &ba->scroll_cap, anchor, offset);
+    }
+    r[0] -= offset[0]; r[1] -= offset[1];
+    return true;
+}
+/* §3.2.1, §5.1.1: an anchor function's length, false when it is not resolvable */
+static bool anchor_resolve(void *context, const struct css_anchor_function *f, unsigned axis, int inset, float *out) {
+    struct anchor_attempt *t = context;
+    box_t *target = f->name ? anchor_target(t->p, t->pcb, f->name) : t->default_anchor;
+    if (!f->name) { t->referenced_default = true; if (!target) t->missing_default = true; }
+    if (!target) return false;
+    double r[4];
+    if (!anchor_rect_for(t, target, r)) return false;
+    if (f->size) {
+        uint8_t k = f->side;
+        /* horizontal-tb: inline is the width, block the height; omitted, the property's axis */
+        unsigned dim = k == CSS_SIZE_IMPLIED ? axis :
+            k == CSS_SIZE_WIDTH || k == CSS_SIZE_INLINE || k == CSS_SIZE_SELF_INLINE ? 0 : 1;
+        *out = (float)r[2 + dim];
+        return isfinite(*out);
+    }
+    if (inset < 0) return false;
+    unsigned ax = inset == 1 || inset == 3 ? 0 : 1;
+    bool start_inset = inset == 0 || inset == 3;
+    float at;
+    switch (f->side) {
+    case CSS_SIDE_TOP: if (ax != 1) return false; at = 0; break;
+    case CSS_SIDE_BOTTOM: if (ax != 1) return false; at = 1; break;
+    case CSS_SIDE_LEFT: if (ax != 0) return false; at = 0; break;
+    case CSS_SIDE_RIGHT: if (ax != 0) return false; at = 1; break;
+    case CSS_SIDE_INSIDE: at = start_inset ? 0 : 1; break;
+    case CSS_SIDE_OUTSIDE: at = start_inset ? 1 : 0; break;
+    case CSS_SIDE_START: case CSS_SIDE_SELF_START: at = 0; break;
+    case CSS_SIDE_END: case CSS_SIDE_SELF_END: at = 1; break;
+    case CSS_SIDE_CENTER: at = 0.5f; break;
+    default: at = f->percent / 100; break;
+    }
+    /* the length that puts the inset-modified containing block's edge on the anchor's */
+    double edge = r[ax] + at * r[2 + ax];
+    double v = start_inset ? edge - t->cb[ax] : t->cb[ax] + t->cb[2 + ax] - edge;
+    if (t->default_anchor && (target == t->default_anchor || anchor_scroller(target) == t->default_scroller))
+        t->compensate[ax] = true;
+    *out = (float)v;
+    return isfinite(*out);
+}
+/* the used style of a position option (-1: the fallback base styles) before its anchors resolve:
+   the base styles with the option's accepted properties, then its try tactics (§6.5.2) */
+static void anchor_used_style(struct box_anchor *ba, const style_t *base, int option) {
+    ba->used = *base;
+    ba->used_anchor = *css_style_anchor(base);
+    ba->used.anchor = &ba->used_anchor;
+    if (option < 0) return;
+    const struct css_position_try *o = &css_style_anchor(base)->tries.option[option];
+    if (o->style) css_style_position_option(&ba->used, o->style, &ba->used_anchor);
+    else if (o->area[0]) memcpy(ba->used_anchor.area, o->area, 2);
+    for (int i = 0; i < o->tactics; i++) css_style_try_tactic(&ba->used, o->tactic[i], &ba->used_anchor, &ba->mem);
+}
+/* the track a computed <position-area> selects on a physical axis (0 horizontal) */
+static int anchor_area_track(const uint8_t area[2], unsigned axis) {
+    for (int i = 0; i < 2; i++) {
+        const struct css_area_keyword *k = css_area_keyword(area[i]), *other = css_area_keyword(area[!i]);
+        if (!k) continue;
+        unsigned at;
+        if (k->family == CSS_AREA_X || k->family == CSS_AREA_INLINE || k->family == CSS_AREA_SELF_INLINE) at = 0;
+        else if (k->family) at = 1;
+        else if (other && other->family)
+            at = other->family == CSS_AREA_X || other->family == CSS_AREA_INLINE || other->family == CSS_AREA_SELF_INLINE;
+        else at = i == 0; /* both ambiguous: the block axis's first */
+        if (at == axis) return k->track;
+    }
+    return CSS_AREA_SPAN_ALL;
+}
+/* An option's used style, default anchor, containing block and self-alignment, its anchor functions
+   resolved: §2.4, §3.1 (the position-area grid), §3.2, §4 */
+static void anchor_prepare(struct anchor_attempt *t, int option, struct abs_frame *f) {
+    struct box_anchor *ba = t->ba;
+    anchor_used_style(ba, t->base, option);
+    style_t *u = &ba->used;
+    t->referenced_default = t->missing_default = false;
+    t->compensate[0] = t->compensate[1] = false;
+    t->default_anchor = anchor_default(t->p, t->base, u, t->pcb);
+    t->default_scroller = anchor_scroller(t->default_anchor);
+    float rect[4];
+    box_abs_cb_rect(t->pcb, D, rect);
+    /* §2.4: with a default anchor, a scroll container's whole scrollable area */
+    if (t->default_anchor && t->pcb != D->root_box && box_element_scrollable(t->pcb)) {
+        rect[2] = fmaxf_(rect[2], t->pcb->scroll_w); rect[3] = fmaxf_(rect[3], t->pcb->scroll_h); /* the last layout's */
+    }
+    /* CSS Box Alignment 3 §4.4.1.2 the overflow limit rect: the original containing block; a fixed
+       box's extends over the document's scrollable area, and one in a scroll container's to its end */
+    bool scroller = t->pcb != D->root_box && box_element_scrollable(t->pcb);
+    for (unsigned axis = 0; axis < 2; axis++) {
+        f->limit_lo[axis] = rect[axis]; f->limit_hi[axis] = rect[axis] + rect[2 + axis];
+        if (t->fixed) {
+            float view = (float)(axis ? D->view_y : D->view_x), extent = (float)(axis ? D->doc_h : D->doc_w);
+            f->limit_lo[axis] = fminf_(f->limit_lo[axis], -view);
+            f->limit_hi[axis] = fmaxf_(f->limit_hi[axis], extent - view);
+        } else if (scroller) f->limit_hi[axis] = INF;
+    }
+    f->align[0] = f->align[1] = -1;
+    f->unsafe[0] = f->unsafe[1] = false;
+    f->collapsed = false;
+    double ar[4] = {0};
+    bool anchored = t->default_anchor && anchor_rect_for(t, t->default_anchor, ar);
+    f->center[0] = (float)(ar[0] + ar[2] / 2); f->center[1] = (float)(ar[1] + ar[3] / 2);
+    const uint8_t *area = ba->used_anchor.area;
+    bool area_used = area[0] && anchored;
+    if (area[0]) { t->referenced_default = true; t->missing_default |= !anchored; }
+    /* §3.1.1 the position-area grid's lines: the containing block's edges (or the anchor's, if
+       beyond them) and the anchor's; the selected tracks are the containing block */
+    if (area_used)
+        for (unsigned axis = 0; axis < 2; axis++) {
+            double l1 = ar[axis], l2 = ar[axis] + ar[2 + axis];
+            double l0 = fmin(rect[axis], l1), l3 = fmax(rect[axis] + rect[2 + axis], l2);
+            double from = l0, to = l3;
+            switch (anchor_area_track(area, axis)) {
+            case CSS_AREA_START: from = l0; to = l1; break;
+            case CSS_AREA_END: from = l2; to = l3; break;
+            case CSS_AREA_CENTER: from = l1; to = l2; break;
+            case CSS_AREA_SPAN_START: from = l0; to = l2; break;
+            case CSS_AREA_SPAN_END: from = l1; to = l3; break;
+            }
+            rect[axis] = (float)from; rect[2 + axis] = (float)fmax(0, to - from);
+        }
+    memcpy(f->rect, rect, sizeof rect);
+    memcpy(t->cb, rect, sizeof rect);
+    /* anchor functions: invalid at computed-value time without a fallback, the initial value */
+    static const unsigned inset_axis[4] = {1, 0, 1, 0};
+    for (int i = 0; i < 4; i++) {
+        len_t out;
+        if (!css_length_resolve_anchors(&ba->mem, &u->inset[i], anchor_resolve, t, inset_axis[i], i, &out))
+            out = (len_t){.kind = LK_AUTO};
+        u->inset[i] = out;
+        if (!css_length_resolve_anchors(&ba->mem, &u->margin[i], anchor_resolve, t, inset_axis[i], -1, &out))
+            out = (len_t){.kind = LK_LEN};
+        u->margin[i] = out;
+    }
+    struct { len_t *l; unsigned axis; uint8_t initial; } sizes[] = {
+        {&u->width, 0, LK_AUTO}, {&u->height, 1, LK_AUTO}, {&u->min_width, 0, LK_AUTO}, {&u->min_height, 1, LK_AUTO},
+        {&u->max_width, 0, LK_NONE}, {&u->max_height, 1, LK_NONE}};
+    for (size_t i = 0; i < sizeof sizes / sizeof *sizes; i++) {
+        len_t out;
+        if (!css_length_resolve_anchors(&ba->mem, sizes[i].l, anchor_resolve, t, sizes[i].axis, -1, &out))
+            out = (len_t){.kind = sizes[i].initial};
+        *sizes[i].l = out;
+    }
+    /* §4.1 area-specific default alignment, §4.2 anchor-center; with either, auto insets and
+       margins on the axis are 0 */
+    for (unsigned axis = 0; axis < 2; axis++) {
+        int self = axis ? u->align_self : u->justify_self;
+        bool normal = self == AI_NORMAL || self == 255; /* auto: normal for an absolutely positioned box */
+        int start = axis ? 0 : 3, end = axis ? 2 : 1;
+        if (area_used && normal) {
+            bool start_auto = len_auto(&u->inset[start]), end_auto = len_auto(&u->inset[end]);
+            if (start_auto != end_auto) { self = start_auto ? AI_END : AI_START; f->unsafe[axis] = true; }
+            else switch (anchor_area_track(area, axis)) {
+                case CSS_AREA_CENTER: self = AI_CENTER; break;
+                case CSS_AREA_SPAN_ALL: self = AI_ANCHOR_CENTER; break;
+                case CSS_AREA_START: case CSS_AREA_SPAN_START: self = AI_END; break;
+                default: self = AI_START; break;
+            }
+            normal = false;
+        }
+        if (self == AI_ANCHOR_CENTER) {
+            t->referenced_default = true;
+            if (!anchored) { t->missing_default = true; self = AI_CENTER; }
+        }
+        f->align[axis] = normal ? -1 : self;
+        if (area_used || self == AI_ANCHOR_CENTER) {
+            int sides[2] = {start, end};
+            for (int k = 0; k < 2; k++) {
+                if (len_auto(&u->inset[sides[k]])) u->inset[sides[k]] = (len_t){.kind = LK_LEN};
+                if (len_auto(&u->margin[sides[k]])) u->margin[sides[k]] = (len_t){.kind = LK_LEN};
+            }
+        }
+        if (anchored && (area_used || self == AI_ANCHOR_CENTER)) t->compensate[axis] = true;
+    }
+}
+/* lay the box out with an option's used style; whether it overflows its inset-modified containing
+   block (§6.5: its margin box is not within it, or it was negative) */
+static bool anchor_attempt(struct anchor_attempt *t, int option, struct abs_frame *f) {
+    anchor_prepare(t, option, f);
+    box_t *a = t->p;
+    style_t *base = a->st;
+    a->st = &t->ba->used;
+    abs_place(a, t->pcb, f);
+    a->st = base;
+    /* §6.5: as it is shown, after its default scroll shift (none at a recalculation point) */
+    if (!t->hypothetical && t->default_anchor)
+        for (unsigned axis = 0; axis < 2; axis++)
+            if (t->compensate[axis])
+                f->margin_box[axis] += anchor_scroll_shift(D, t->ba->scrolls, t->ba->nscrolls, t->default_anchor, t->pcb,
+                                                           t->fixed, axis);
+    const float slack = 0.01f;
+    bool over = f->collapsed;
+    for (unsigned axis = 0; axis < 2; axis++)
+        if (f->margin_box[axis] < f->imcb[axis] - slack ||
+            f->margin_box[axis] + f->margin_box[2 + axis] > f->imcb[axis] + f->imcb[2 + axis] + slack) over = true;
+    return over;
+}
+/* the used values CSSOM and paint read until the next layout */
+static void anchor_record(struct box_anchor *ba, const struct anchor_attempt *t, const struct abs_frame *f, bool over) {
+    const style_t *u = &ba->used;
+    for (int i = 0; i < 4; i++) {
+        ba->inset[i] = u->inset[i]; css_length_own(&ba->mem, &ba->inset[i]);
+        ba->margin[i] = u->margin[i]; css_length_own(&ba->mem, &ba->margin[i]);
+        ba->inset_auto[i] = len_auto(&u->inset[i]);
+        ba->inset_px[i] = ba->inset_auto[i] ? 0 : len_resolve(&u->inset[i], i == 1 || i == 3 ? f->rect[2] : f->rect[3]);
+    }
+    len_t *own[] = {&ba->width, &ba->height, &ba->min_width, &ba->max_width, &ba->min_height, &ba->max_height};
+    const len_t *from[] = {&u->width, &u->height, &u->min_width, &u->max_width, &u->min_height, &u->max_height};
+    for (size_t i = 0; i < sizeof own / sizeof *own; i++) { *own[i] = *from[i]; css_length_own(&ba->mem, own[i]); }
+    ba->align_self = u->align_self; ba->justify_self = u->justify_self;
+    ba->position_anchor = ba->used_anchor.position_anchor;
+    if (ba->position_anchor.name) ba->position_anchor.name = ar_strdup(&ba->mem, ba->position_anchor.name);
+    memcpy(ba->area, ba->used_anchor.area, 2);
+    ba->default_anchor = t->default_anchor;
+    ba->fixed = t->fixed;
+    ba->compensate[0] = t->default_anchor && t->compensate[0];
+    ba->compensate[1] = t->default_anchor && t->compensate[1];
+    ba->visibility = ba->used_anchor.visibility;
+    ba->hidden = ((ba->visibility & CSS_VISIBLE_ANCHOR_VALID) && t->referenced_default && t->missing_default) ||
+                 ((ba->visibility & CSS_VISIBLE_NO_OVERFLOW) && over);
+    ba->doc = D;
+    ba->revision = D->layout_revision;
+    ba->epoch = D->anchor_epoch;
+    ba->placed = GEN;
+    ba->valid = ba->laid = true;
+}
+static void anchor_layout(box_t *a) {
+    box_t *pcb = abs_containing_block(a);
+    struct box_anchor *ba = anchor_attach(a);
+    struct layout_context *lc = layout_current();
+    if (!ba || lc->anchor_depth > 32) {
+        if (ba) ba->valid = false;
+        abs_place(a, pcb, NULL);
+        return;
+    }
+    lc->anchor_depth++;
+    const style_t *base = a->st;
+    ba->base = (style_t *)base;
+    ba->valid = false;
+    ar_free(&ba->mem);
+    ba->mem.chunk_size = 1024;
+    ba->mem.trap = D->lmem.trap;
+    /* §6.5.1: a fallback-sensitive change forgets the last successful option; a newly generated
+       box, or another containing block, is an anchor recalculation point (§3.3) */
+    uint64_t hash = css_style_position_hash(base);
+    if (!ba->laid || ba->hash != hash || ba->cb != pcb) { ba->option = -1; ba->nscrolls = 0; }
+    ba->hash = hash; ba->cb = pcb;
+    /* §6.1 the position options list: the fallback base styles, then each option there is */
+    const struct css_anchor *an = css_style_anchor(base);
+    uint32_t count = an->tries.count;
+    int *options = ar_alloc(&ba->mem, (count + 1) * sizeof *options);
+    int n = 0;
+    options[n++] = -1;
+    for (uint32_t i = 0; i < count; i++) {
+        const struct css_position_try *o = &an->tries.option[i];
+        if (o->rule && !o->style) continue; /* no @position-try rule has the name */
+        options[n++] = (int)i;
+    }
+    bool listed = false;
+    for (int i = 0; i < n; i++) listed |= options[i] == ba->option;
+    if (!listed) ba->option = -1;
+    struct anchor_attempt t = {.p = a, .pcb = pcb, .ba = ba, .base = base,
+        .fixed = base->position == POS_FIXED && pcb == D->root_box};
+    struct abs_frame f;
+    /* §6.2 sorted, stably, by the inset-modified containing block each option gives (auto insets 0) */
+    if (an->try_order != CSS_TRY_ORDER_NORMAL && n > 1) {
+        unsigned axis = an->try_order == CSS_TRY_ORDER_MOST_WIDTH || an->try_order == CSS_TRY_ORDER_MOST_INLINE ? 0 : 1;
+        float *size = ar_alloc(&ba->mem, (size_t)n * sizeof *size);
+        t.hypothetical = true;
+        for (int i = 0; i < n; i++) {
+            ba->npending = 0;
+            anchor_prepare(&t, options[i], &f);
+            const len_t *in = ba->used.inset;
+            float extent = f.rect[2 + axis];
+            float s = axis ? (len_auto(&in[0]) ? 0 : len_resolve(&in[0], extent)) + (len_auto(&in[2]) ? 0 : len_resolve(&in[2], extent))
+                           : (len_auto(&in[3]) ? 0 : len_resolve(&in[3], extent)) + (len_auto(&in[1]) ? 0 : len_resolve(&in[1], extent));
+            size[i] = fmaxf_(0, extent - s);
+        }
+        for (int i = 1; i < n; i++) {
+            int o = options[i];
+            float s = size[i];
+            int j = i;
+            for (; j > 0 && size[j - 1] < s; j--) { options[j] = options[j - 1]; size[j] = size[j - 1]; }
+            options[j] = o; size[j] = s;
+        }
+    }
+    /* §6.5 the styles in effect first; only when they overflow are the others tried, in order */
+    int current = ba->option;
+    t.hypothetical = false;
+    bool over = anchor_attempt(&t, current, &f);
+    if (over && n > 1) {
+        bool found = false;
+        for (int i = 0; i < n && !found; i++) {
+            if (options[i] == current) continue;
+            struct abs_frame g;
+            t.hypothetical = true;
+            ba->npending = 0;
+            if (!anchor_attempt(&t, options[i], &g)) { found = true; current = options[i]; f = g; over = false; }
+        }
+        if (found) {
+            /* the hypothetical recalculation point is the box's now */
+            struct anchor_scroll *v = ba->scrolls; uint32_t vc = ba->scroll_cap;
+            ba->scrolls = ba->pending; ba->nscrolls = ba->npending; ba->scroll_cap = ba->pending_cap;
+            ba->pending = v; ba->pending_cap = vc; ba->npending = 0;
+        } else {
+            t.hypothetical = false;
+            over = anchor_attempt(&t, current, &f);
+        }
+    }
+    /* §6.5.1.1 the last successful position option */
+    ba->option = current;
+    anchor_record(ba, &t, &f, over);
+    ba->mem.trap = NULL;
+    lc->anchor_depth--;
+}
+static void layout_abs(box_t *a) {
+    if (a->abs_placed == GEN) return; /* placed early, as an anchor's ancestor or an anchor */
+    /* a layout that unwound while the box was laid out with a position option's used style */
+    if (a->anchored && a->st == &a->anchored->used) a->st = a->anchored->base;
+    if (a->clamp_hidden) { if (a->anchored) a->anchored->valid = false; return; }
+    a->abs_placed = GEN;
+    if (anchor_style_used(a->st)) { anchor_layout(a); return; }
+    if (a->anchored) box_anchor_free(a);
+    abs_place(a, abs_containing_block(a), NULL);
+}
+
+/* §3.3 an anchor-positioned box's default scroll shift on an axis: how far its default anchor has
+   scrolled since its remembered scroll offset, when it compensates for scroll there */
+/* the record is the last layout's, and the boxes it names are still published */
+static bool anchor_record_current(const struct box_anchor *ba) {
+    return ba && ba->valid && ba->doc && ba->revision + 1 == ba->doc->layout_revision && ba->epoch == ba->doc->anchor_epoch;
+}
+float box_anchor_shift(const box_t *b, unsigned axis) {
+    const struct box_anchor *ba = b ? b->anchored : NULL;
+    if (!anchor_record_current(ba) || axis > 1 || !ba->compensate[axis] || !ba->default_anchor) return 0;
+    return anchor_scroll_shift(ba->doc, ba->scrolls, ba->nscrolls, ba->default_anchor, ba->cb, ba->fixed, axis);
+}
+/* §6.6 whether position-visibility hides an anchor-positioned box (depth: through the anchors it
+   relies on, themselves anchor positioned) */
+static bool anchor_invisible(const box_t *anchor, const box_t *pcb, unsigned depth);
+static bool anchor_hidden_at(const box_t *b, unsigned depth) {
+    const struct box_anchor *ba = b ? b->anchored : NULL;
+    if (!anchor_record_current(ba)) return false;
+    if (ba->hidden) return true;
+    if (!(ba->visibility & CSS_VISIBLE_ANCHOR_VISIBLE) || !ba->default_anchor) return false;
+    return anchor_invisible(ba->default_anchor, ba->cb, depth + 1);
+}
+/* anchor-visible: the default anchor is invisible (visibility, or hidden itself by position-visibility),
+   or its box is clipped away by one between it and the positioned box's containing block */
+static bool anchor_invisible(const box_t *anchor, const box_t *pcb, unsigned depth) {
+    if (depth > 8) return false;
+    if (anchor->st && anchor->st->visibility) return true;
+    if (anchor_hidden_at(anchor, depth)) return true;
+    const box_t *g = anchor;
+    if (g->kind == B_INLINE) return false;
+    double x0 = box_visual_x(g) - g->p[3] - g->b[3], y0 = box_visual_y(g) - g->p[0] - g->b[0];
+    double x1 = x0 + g->w + hext(g), y1 = y0 + g->h + vext(g);
+    bool area = x1 > x0 && y1 > y0;
+    for (const box_t *c = g->cb; c && c != pcb; c = c->cb) {
+        if (!c->st || c->kind == B_INLINE || (c->st->overflow == OV_VISIBLE && !c->st->clip_path) ||
+            (c->node && c->node->owner && doc_viewport_overflow_box(c->node->owner, c))) continue;
+        double cx0 = box_visual_x(c) - c->p[3], cy0 = box_visual_y(c) - c->p[0];
+        double cx1 = cx0 + c->w + c->p[1] + c->p[3], cy1 = cy0 + c->h + c->p[0] + c->p[2];
+        double ix0 = fmax(x0, cx0), iy0 = fmax(y0, cy0), ix1 = fmin(x1, cx1), iy1 = fmin(y1, cy1);
+        if (area ? !(ix1 > ix0 && iy1 > iy0) : !(ix1 >= ix0 && iy1 >= iy0)) return true;
+    }
+    return false;
+}
+bool box_anchor_hidden(const box_t *b) { return anchor_hidden_at(b, 0); }
+bool box_anchor_inset(const box_t *b, unsigned side, float *out) {
+    const struct box_anchor *ba = b ? b->anchored : NULL;
+    if (!ba || !ba->valid || side > 3 || ba->inset_auto[side]) return false;
+    *out = ba->inset_px[side];
+    return true;
+}
+bool box_anchor_style(const box_t *b, style_t *style, struct css_anchor *anchor) {
+    const struct box_anchor *ba = b ? b->anchored : NULL;
+    if (!ba || !ba->valid || !b->st || b->st == &ba->used) return false;
+    *style = *b->st;
+    *anchor = *css_style_anchor(b->st);
+    memcpy(style->inset, ba->inset, sizeof ba->inset);
+    memcpy(style->margin, ba->margin, sizeof ba->margin);
+    style->width = ba->width; style->height = ba->height;
+    style->min_width = ba->min_width; style->max_width = ba->max_width;
+    style->min_height = ba->min_height; style->max_height = ba->max_height;
+    style->align_self = ba->align_self; style->justify_self = ba->justify_self;
+    anchor->position_anchor = ba->position_anchor;
+    memcpy(anchor->area, ba->area, 2);
+    style->anchor = anchor;
+    return true;
 }
 
 /* ---------------------------------------------------------------- entry */

@@ -197,11 +197,24 @@ long webnet_cookie_sites(webnet *, struct webcookie_site **out);
    at once; other windows remove theirs when they read the store. The count removed, or the
    store's failure (negative n_result; the clear is saved at a later try). */
 long webnet_cookie_clear(webnet *, const char *site);
+/* For the test automation alone (WebDriver's Cookies, web_host.automation_cookies): the
+   associated cookies of a document at url, HttpOnly ones too (webcookie_associated, name's alone
+   unless NULL), with what other windows saved: a malloc'd block (free it) in *out and the count,
+   or -1. delete_associated removes them (WebDriver's "delete cookies") and saves at once: the
+   count removed, or -1. */
+struct webcookie_record;
+long webnet_cookie_associated(webnet *, const char *url, const char *name, struct webcookie_record **out);
+long webnet_cookie_delete_associated(webnet *, const char *url, const char *name);
 /* The site (registrable domain, by the Public Suffix List the jar uses) of a host, in out: the
    key the settings page groups a site's cookies and storage by. false when it does not fit. */
 bool webnet_site(const webnet *, const char *host, char *out, size_t cap);
 /* Copies all request data; 0 means invalid request, queue full, or allocation failure. */
 uint64_t webnet_submit(webnet *, const struct webnet_request *, webnet_callback, void *opaque);
+/* Why the last webnet_submit returned 0: static text for the page's console. */
+const char *webnet_refusal(const webnet *);
+/* Fetch's keepalive bound: a fetch group's inflight keepalive request bodies stay within it. */
+#define WEBNET_KEEPALIVE_BYTES ((size_t)65536)
+size_t webnet_keepalive_inflight(const webnet *, uint64_t fetch_group);
 /* Dispatches completions only here. Response pointers remain valid until callback returns.
    Callbacks may submit/cancel requests, but must not free net or recursively pump it. */
 void webnet_pump(webnet *, uint64_t now_ms);

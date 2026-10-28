@@ -61,8 +61,8 @@ static int deny_external(AVFormatContext *f,AVIOContext **io,const char *url,int
 }
 static bool fetch(struct adaptive *a,const char *base,const char *uri,int64_t start,int64_t count,
                    size_t maximum,uint8_t **bytes,size_t *length){
-    char *url=NULL;enum http_url_result resolved=nmedia_adaptive_resolve_owned(base,uri,&url);
-    if(resolved!=HTTP_URL_TUPLE)return bad(a,resolved==HTTP_URL_OOM?
+    char *url=NULL;enum web_url_result resolved=nmedia_adaptive_resolve_owned(base,uri,&url);
+    if(resolved!=WEB_URL_TUPLE)return bad(a,resolved==WEB_URL_OOM?
         "adaptive segment URL allocation failed":"invalid or mixed-content adaptive segment URL");
     if(!count){bool ok=nmedia_http_get_bounded_cors(url,a->document,maximum,bytes,length,a->error,sizeof a->error);
         nmedia_ff_free(url);return ok;}
@@ -256,8 +256,8 @@ nmedia *nmedia_adaptive_open_cors(const char *url,const char *document,char *err
     size_t document_bytes=strlen(document);if(document_bytes==SIZE_MAX){bad(a,"adaptive document size overflow");goto done;}
     a->document=nmedia_ff_malloc(document_bytes+1);if(!a->document){bad(a,"adaptive document allocation failed");goto done;}
     memcpy(a->document,document,document_bytes+1);
-    enum http_url_result resolved=nmedia_adaptive_resolve_owned(url,url,&manifest_url);
-    if(resolved!=HTTP_URL_TUPLE){bad(a,resolved==HTTP_URL_OOM?"adaptive manifest URL allocation failed":"invalid adaptive manifest URL");goto done;}
+    enum web_url_result resolved=nmedia_adaptive_resolve_owned(url,url,&manifest_url);
+    if(resolved!=WEB_URL_TUPLE){bad(a,resolved==WEB_URL_OOM?"adaptive manifest URL allocation failed":"invalid adaptive manifest URL");goto done;}
     for(unsigned depth=0;depth<4;depth++){
         if(!nmedia_http_get_bounded_cors(manifest_url,document,NMEDIA_ADAPTIVE_MANIFEST_BYTES,&text,&bytes,a->error,sizeof a->error))goto done;
         /* Parser requires its own trailing NUL; embedded NUL remains invalid. */
@@ -271,7 +271,7 @@ nmedia *nmedia_adaptive_open_cors(const char *url,const char *document,char *err
         if(result<0)goto done;if(result==1)break;
         if(depth==3){bad(a,"HLS master recursion limit");goto done;}
         char *next=NULL;resolved=nmedia_adaptive_resolve_owned(manifest_url,a->manifest.variant,&next);
-        if(resolved!=HTTP_URL_TUPLE){bad(a,resolved==HTTP_URL_OOM?"HLS variant URL allocation failed":"invalid or mixed-content HLS variant URL");goto done;}
+        if(resolved!=WEB_URL_TUPLE){bad(a,resolved==WEB_URL_OOM?"HLS variant URL allocation failed":"invalid or mixed-content HLS variant URL");goto done;}
         nmedia_ff_free(manifest_url);manifest_url=next;
     }
     a->metadata=avformat_alloc_context();if(!a->metadata){bad(a,"adaptive metadata quota");goto done;}

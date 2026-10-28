@@ -4,9 +4,16 @@
      realm.signals    the realm's AbortSignal (js_abort.js's abortInterfaces, in both realms):
                       is, aborted, reason, follow, any (a dependent signal) and controller.
      realm.transport  the native transport that carries a request: noCors(), streaming(),
-                      fetch(query, notify) -> {id, promise}, resume(id), cancel(id). A Window's is
-                      js.c's (host.fetch); a Worker's is its parent window's, through
-                      browserjsworker.c, js_worker.c and js.c (NJW_LOAD, NJW_FRAME, NJW_RESUME).
+                      fetch(query, notify) -> {id, promise}, resume(id), cancel(id), and
+                      keepaliveRoom() (the bytes the realm's fetch group can still take into its
+                      inflight keepalive bodies; a Window's only, for Beacon), fetchSync(query,
+                      timeout, initiator) -> a Response or null (a Worker's only: its event loop
+                      pauses for a synchronous XMLHttpRequest; initiator(id) as realm.initiator),
+                      and obtainBlob(url[, timeout]) (a Worker's only: FileAPI "obtain a blob
+                      object" from its parent document's store, {id, promise} -> [bytes, type],
+                      or with a timeout [bytes, type] or null). A Window's is js.c's (host.fetch); a Worker's
+                      is its parent window's, through browserjsworker.c, js_worker.c and js.c
+                      (NJW_LOAD, NJW_FRAME, NJW_RESUME).
      realm.baseURL(), origin(), clientReferrer(), referrerPolicy(), url()
                       the realm's settings object: API base URL, origin, the "client" referrer
                       source and its referrer policy (enum webnet_referrer_policy).
@@ -595,6 +602,13 @@ function fetchInterfaces(realm) {
     for(const name of ['type','url','redirected','status','statusText','headers'])define(Response.prototype,name,{configurable:true,enumerable:true,get(){return slot(responseSlots,this,'Response')[name];}});
     installBody(Request.prototype);installBody(Response.prototype);
     const urlWithoutFragment=url=>{const hash=indexOf(url,'#');return hash<0?url:slice(url,0,hash);};
+    /* Fetch "scheme fetch" for data: (the realm's own data: URL processor): a basic 200 response. */
+    function dataResponse(s) {
+        const local=realm.dataURL(s.url),bytes=s.method==='HEAD'?null:local[0];
+        const headers=makeHeaders(undefined,'immutable');add(headerSlots.get(headers).list,pair('content-type',local[1]));
+        return responseObject({status:200,statusText:'OK',url:urlWithoutFragment(s.url),
+            headers,redirected:false,type:'basic'},{bytes,used:false,abort:s.signal});
+    }
     function dataFetch(s,body,integrity,observer) {
         if(body.bytes!==null)body.used=true;
         return new NativePromise((resolve,reject)=>{
@@ -611,10 +625,7 @@ function fetchInterfaces(realm) {
             unfollow=signals.follow(s.signal,fail);
             try {
                 schedule(()=>{
-                    const local=realm.dataURL(s.url),bytes=s.method==='HEAD'?null:local[0];
-                    const headers=makeHeaders(undefined,'immutable');add(headerSlots.get(headers).list,pair('content-type',local[1]));
-                    const response=responseObject({status:200,statusText:'OK',url:urlWithoutFragment(s.url),
-                        headers,redirected:false,type:'basic'},{bytes,used:false,abort:s.signal});
+                    const response=dataResponse(s),bytes=bodySlots.get(response).bytes;
                     verifyIntegrity(response,integrity,s.signal);
                     if(!observer){done=true;unfollow();resolve(response);return;}
                     const end=()=>{if(done)return;done=true;unfollow();observer('end',undefined,()=>{});};
@@ -650,60 +661,74 @@ function fetchInterfaces(realm) {
        "obtain a blob object"; the whole Blob, or a Range's slice (status 206) with its
        Content-Range. A Worker's URL its own store does not hold is obtained from its parent
        document's store by the transport (transport.obtainBlob: js.c checks the Worker's storage
-       partition); a Window's is a network error. */
-    function blobFetch(s,integrity) {
-        return new NativePromise((resolve,reject)=>{
+       partition); a Window's is a network error. sync: fetchCore's, the Response (null when its
+       timeout passed first) instead of a promise. */
+    function blobFetch(s,integrity,sync) {
+        const range=headerValue(headerSlots.get(s.headers),'range');
+        const respond=(bytes,type)=>{
+            const fullLength=apply(abLength,bytes,[]),headers=makeHeaders(undefined,'immutable'),list=headerSlots.get(headers).list;
+            let status=200,body=bytes;
+            if(range===null){add(list,pair('content-length',NativeString(fullLength)));add(list,pair('content-type',type));}
+            else{
+                const value=singleRange(range);if(value===null)throw new TypeError('Invalid Range for a blob: URL');
+                let start=value[0],end=value[1];
+                if(start===null){start=fullLength-end;end=start+end-1;}
+                else{if(start>=fullLength)throw new TypeError('Range start is past the Blob');if(end===null||end>=fullLength)end=fullLength-1;}
+                body=sliceBytes(bytes,start,end+1);status=206;
+                add(list,pair('content-length',NativeString(apply(abLength,body,[]))));add(list,pair('content-type',type));
+                add(list,pair('content-range','bytes '+NativeString(start)+'-'+NativeString(end)+'/'+NativeString(fullLength)));
+            }
+            const response=responseObject({status,statusText:status===206?'Partial Content':'OK',url:urlWithoutFragment(s.url),headers,redirected:false,type:'basic'},
+                {bytes:body,used:false,abort:s.signal});
+            return verifyIntegrity(response,integrity,s.signal);
+        };
+        /* The Response from this realm's store, or undefined when the transport is to obtain the Blob. */
+        const local=()=>{
             if(s.method!=='GET')throw new TypeError('A blob: URL is fetched with GET only');
             if(!blobAPI)throw notSupported('Blob is not initialized');
-            const range=headerValue(headerSlots.get(s.headers),'range');
-            const respond=(bytes,type)=>{
-                const fullLength=apply(abLength,bytes,[]),headers=makeHeaders(undefined,'immutable'),list=headerSlots.get(headers).list;
-                let status=200,body=bytes;
-                if(range===null){add(list,pair('content-length',NativeString(fullLength)));add(list,pair('content-type',type));}
-                else{
-                    const value=singleRange(range);if(value===null)throw new TypeError('Invalid Range for a blob: URL');
-                    let start=value[0],end=value[1];
-                    if(start===null){start=fullLength-end;end=start+end-1;}
-                    else{if(start>=fullLength)throw new TypeError('Range start is past the Blob');if(end===null||end>=fullLength)end=fullLength-1;}
-                    body=sliceBytes(bytes,start,end+1);status=206;
-                    add(list,pair('content-length',NativeString(apply(abLength,body,[]))));add(list,pair('content-type',type));
-                    add(list,pair('content-range','bytes '+NativeString(start)+'-'+NativeString(end)+'/'+NativeString(fullLength)));
-                }
-                const response=responseObject({status,statusText:status===206?'Partial Content':'OK',url:urlWithoutFragment(s.url),headers,redirected:false,type:'basic'},
-                    {bytes:body,used:false,abort:s.signal});
-                resolve(verifyIntegrity(response,integrity,s.signal));
-            };
             const blob=s.blobEntry?objectURLAPI.obtain(s.blobEntry):null;
-            if(blob!==null){respond(blobAPI.bytes(blob),blobAPI.type(blob));return;}
+            if(blob!==null)return respond(blobAPI.bytes(blob),blobAPI.type(blob));
             if(s.blobEntry||!transport.obtainBlob)throw new TypeError('The blob: URL has no Blob in this realm\'s store');
+            return undefined;
+        };
+        if(sync){
+            const response=local();if(response!==undefined)return response;
+            const obtained=transport.obtainBlob(s.url,sync.timeout);
+            return obtained===null?null:respond(obtained[0],obtained[1]);
+        }
+        return new NativePromise((resolve,reject)=>{
+            const response=local();if(response!==undefined){resolve(response);return;}
             const started=transport.obtainBlob(s.url),id=started.id;
             let finished=false;
             const unfollow=signals.follow(s.signal,reason=>{if(finished)return;finished=true;transport.cancel(id);reject(reason);});
             define(started.promise,'constructor',{value:promiseConstructor});
-            apply(then,started.promise,[obtained=>{if(finished)return;finished=true;unfollow();try{respond(obtained[0],obtained[1]);}catch(e){reject(e);}},
+            apply(then,started.promise,[obtained=>{if(finished)return;finished=true;unfollow();try{resolve(respond(obtained[0],obtained[1]));}catch(e){reject(e);}},
                 error=>{if(finished)return;finished=true;unfollow();reject(error);}]);
         });
     }
     /* prepared: input is a Request this bridge made for the fetch (Cache Storage's addAll), fetched
-       as it is, without the Request constructor's steps for init. */
-    function fetchCore(input,init,observer,forcePreflight=false,destination='',prepared=false) {
+       as it is, without the Request constructor's steps for init.
+       sync: a synchronous XMLHttpRequest's {timeout} (ms, 0 for none). The realm's event loop
+       pauses in transport.fetchSync until the response is whole; the result is the Response, null
+       when timeout passed first, and a network error throws. */
+    function fetchCore(input,init,observer,forcePreflight=false,destination='',prepared=false,sync=null) {
         let r,s,b,integrity;
         try {
             r=prepared?input:new Request(input,init);s=requestSlots.get(r);b=bodySlots.get(r);
             if(destination)s.destination=destination;
-            if(signals.aborted(s.signal))return reject(signals.reason(s.signal));
+            if(signals.aborted(s.signal))throw signals.reason(s.signal);
             integrity=s.integrity?integrityMetadata(s.integrity):null;
             // Fetch main fetch selects data before same-origin/no-cors/CORS
             // checks. Local data has a basic response and no HTTP transport,
             // redirect, cache miss, preflight, cookie, or request-header wire.
-            if(beginsWith(s.url,'data:'))return dataFetch(s,b,integrity,observer);
+            if(beginsWith(s.url,'data:'))return sync?verifyIntegrity(dataResponse(s),integrity,s.signal):dataFetch(s,b,integrity,observer);
             // Referrer policy/source are private native metadata, never part
             // of author headers or CORS preflight header classification.
             const noReferrer=s.referrer===''||s.referrerPolicy==='no-referrer';
             let referrer=noReferrer?'':s.referrer==='about:client'?realm.clientReferrer():s.referrer;
             if(referrer){const source=parseURL(referrer);apply(setUsername,source,['']);apply(setPassword,source,['']);apply(setHash,source,['']);referrer=href(source);}
             const referrerPolicy=s.referrerPolicy?position(referrerPolicies,s.referrerPolicy):realm.referrerPolicy();
-            if(beginsWith(s.url,'blob:'))return blobFetch(s,integrity);
+            if(beginsWith(s.url,'blob:'))return blobFetch(s,integrity,sync);
             /* Main fetch: a no-cors request to another origin is a network error unless its
                redirect mode is "follow" (the transport checks every request the same way). */
             if(s.mode==='no-cors'&&s.redirect!=='follow'){
@@ -721,7 +746,7 @@ function fetchInterfaces(realm) {
             /* Integrity responses must be fully verified before either their
                headers/Response or body stream is exposed. Requests without
                metadata retain the existing native streaming flow control. */
-            if(transport.streaming()&&streams&&!integrity){
+            if(!sync&&transport.streaming()&&streams&&!integrity){
                 channel=streams.network(()=>new NativePromise(resolve=>{waiting=resolve;resume();}),reason=>{
                     if(done)return;done=true;finishStream();transport.cancel(transportId);
                     if(waiting){const resolve=waiting;waiting=null;resolve();}
@@ -757,11 +782,25 @@ function fetchInterfaces(realm) {
                 }
                 return false;
             }:undefined;
-            started=transport.fetch(record({url:s.url,method:s.method,headers:raw,body:b.bytes,sameOrigin:s.mode==='same-origin',
+            const query=record({url:s.url,method:s.method,headers:raw,body:b.bytes,sameOrigin:s.mode==='same-origin',
                 credentials:position(credentialModes,s.credentials),forcePreflight:forcePreflight||s.preflight,redirectError:s.redirect==='error',
                 redirectManual:s.redirect==='manual',
                 cache:position(cacheModes,s.cache),keepalive:s.keepalive,noCors:s.mode==='no-cors',noReferrer,referrer,referrerPolicy,
-                destination:s.destination}),notify);
+                destination:s.destination});
+            /* The response the transport delivered: its request's signal, HEAD's null body, integrity. */
+            const settle=response=>{
+                const state=slot(bodySlots,response,'Body');state.abort=s.signal;
+                if(s.method==='HEAD')state.bytes=null;
+                return verifyIntegrity(response,integrity,s.signal);
+            };
+            if(sync){
+                if(!transport.fetchSync)throw notSupported('This realm cannot pause for a synchronous fetch');
+                if(b.bytes!==null)b.used=true;
+                /* realm.initiator: the request's initiator type, as for an observed fetch below. */
+                const response=transport.fetchSync(query,sync.timeout,realm.initiator);
+                return response===null?null:settle(response);
+            }
+            started=transport.fetch(query,notify);
             transportId=started.id;const transportPromise=started.promise;started=null;
             if(observer&&realm.initiator)realm.initiator(transportId);
             if(b.bytes!==null)b.used=true;
@@ -775,16 +814,12 @@ function fetchInterfaces(realm) {
                     define(transportPromise,'constructor',{value:promiseConstructor});
                     apply(then,transportPromise,[response=>{
                         if(finished)return;finished=true;pendingReject=null;if(!notify)cleanup();
-                        try {
-                            const state=slot(bodySlots,response,'Body');state.abort=s.signal;
-                            if(s.method==='HEAD')state.bytes=null;
-                            resolve(verifyIntegrity(response,integrity,s.signal));
-                        }catch(e){reject(e);}
+                        try{resolve(settle(response));}catch(e){reject(e);}
                     },error=>{if(finished)return;finished=true;done=true;cleanup();reject(error);}]);
                 }catch(e){finished=true;done=true;cleanup();const active=liveChannel();if(active)active.error(e);transport.cancel(transportId);pendingReject=null;reject(e);}
                 if(signals.aborted(s.signal))abort(signals.reason(s.signal));
             });
-        }catch(e){return reject(e);}
+        }catch(e){if(sync)throw e;return reject(e);}
     }
     function fetch(input,init=undefined){if(!arguments.length)return reject(new TypeError('fetch requires input'));return fetchCore(input,init);}
     for(const [C,name]of [[Headers,'Headers'],[Request,'Request'],[Response,'Response']]) {
@@ -806,6 +841,23 @@ function fetchInterfaces(realm) {
         /* The engine's own fetch for an element: a track, a media fallback. Its init is the
            engine's, copied without a prototype. */
         fetchFor(destination,input,init){return fetchCore(input,init===undefined?undefined:record({...init}),undefined,false,destination);},
+        /* Beacon's sendBeacon steps (https://w3c.github.io/beacon/#sec-processing-model, consulted
+           2026-10-28): url parsed against the realm's API base URL, an HTTP(S) scheme, the data's
+           body extracted with keepalive, false when the fetch group's inflight keepalive bytes
+           cannot take it, then a credentialed keepalive POST whose mode is no-cors unless the
+           extracted Content-Type is not a CORS-safelisted request-header. */
+        beacon(url,data){
+            const target=parseURL(usv(url),realm.baseURL()),scheme=apply(urlProtocol,target,[]);
+            if(scheme!=='http:'&&scheme!=='https:')throw new TypeError('sendBeacon requires an HTTP(S) URL');
+            let body=null,type=null;
+            if(data!==null&&data!==undefined){const extracted=extractBody(bodyInit(data),true);body=extracted.bytes;type=extracted.type;}
+            if(body!==null&&apply(abLength,body,[])>transport.keepaliveRoom())return false;
+            const headers=type===null?undefined:record({'content-type':type});
+            const mode=type!==null&&!noCorsSafe('content-type',type)?'cors':'no-cors';
+            const started=fetchCore(href(target),record({method:'POST',body:body===null?undefined:body,headers,keepalive:true,credentials:'include',mode}));
+            apply(then,started,[undefined,()=>{}]);
+            return true;
+        },
         moduleIntegrity(bytes,metadata){return integrityBytes(bytes,integrityMetadata(metadata));},
         initialize(){
             NativeURL=globalThis.URL;paramsString=globalThis.URLSearchParams.prototype.toString;Encoder=globalThis.TextEncoder;encode=Encoder.prototype.encode;Decoder=globalThis.TextDecoder;decode=Decoder.prototype.decode;
@@ -818,7 +870,9 @@ function fetchInterfaces(realm) {
         initializeFormData(api){formDataAPI=api;},
         initializeStreams(api){streams=api;},
         initializeObjectURLs(api){objectURLAPI=api;},
-        xhrBody(value){const binary=isBuffer(value)||!!(blobAPI&&blobAPI.brand(value))||!!(formDataAPI&&formDataAPI.brand(value)),body=extractBody(bodyInit(value));if(body.stream)throw notSupported('XHR stream uploads are unsupported');return {...body,binary};},
+        /* XHR send()'s body is nullable (Document or XMLHttpRequestBodyInit)?: null is no body,
+           never the string "null". */
+        xhrBody(value){const binary=isBuffer(value)||!!(blobAPI&&blobAPI.brand(value))||!!(formDataAPI&&formDataAPI.brand(value)),body=extractBody(value===null?null:bodyInit(value));if(body.stream)throw notSupported('XHR stream uploads are unsupported');return {...body,binary};},
         xhrResponse(response) {
             // Only the private XHR completion path calls this. Do not invoke
             // page-mutable Response getters or publish a backing-buffer API.
@@ -827,11 +881,22 @@ function fetchInterfaces(realm) {
             const bytes=b.bytes===null?new AB(0):b.bytes;b.bytes=null;b.used=true;
             return {status:s.status,statusText:s.statusText,url:s.url,headers:s.headers,bytes};
         },
-        /* XHR's own request: init and its header record are the engine's, read without a prototype. */
+        /* XHR's own request (js_xhr.js): init and its header record are the engine's, read without a
+           prototype. observed: whether the observer gets the response's headers, chunks and end
+           (a data: URL's local fetch, a streaming transport's frames); otherwise the promise
+           brings the whole response (a blob: URL, a transport that buffers). */
         xhrFetch(url,init,observer,forcePreflight){
             const c=signals.controller(),q=record({...init,signal:c.signal});
             if(q.headers!==null&&typeof q.headers==='object')q.headers=record({...q.headers});
-            return {promise:fetchCore(url,q,observer,forcePreflight),cancel(){c.abort();}};
+            const observed=beginsWith(url,'data:')||(!(objectURLAPI&&beginsWith(url,'blob:'))&&transport.streaming()&&!!streams);
+            return {promise:fetchCore(url,q,observer,forcePreflight),cancel(){c.abort();},observed};
+        },
+        /* A synchronous XHR's request (fetchCore's sync): the Response, null when timeout ms passed
+           first. Only a realm whose transport has fetchSync can pause for it. */
+        xhrFetchSync(url,init,forcePreflight,timeout){
+            const q=record({...init,signal:signals.controller().signal});
+            if(q.headers!==null&&typeof q.headers==='object')q.headers=record({...q.headers});
+            return fetchCore(url,q,undefined,forcePreflight,'',false,record({timeout}));
         },
         xhrMetadata(response){const s=slot(responseSlots,response,'Response');return {status:s.status,statusText:s.statusText,url:s.url,headers:s.headers};},
         /* Cache Storage's view of this realm's Fetch objects (js_cache_storage.js): a record of a

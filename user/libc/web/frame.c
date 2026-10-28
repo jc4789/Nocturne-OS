@@ -36,36 +36,15 @@ struct web_frame *web_frame_walk_next(web_doc *root,struct web_frame *f,bool des
 }
 int web_frame_ancestor_url(web_doc *parent,const char *text) {
     if(!parent || !text)return false;
-    /* srcdoc takes a different HTML processing branch. An initial blank
-     * context is created independently and never reaches this URL check. */
-    if(!strncasecmp(text,"about:",6)) {
-        size_t n=strcspn(text,"#");
-        for(web_doc *p=parent;p;p=p->frame_parent) {
-            size_t m=strcspn(p->url?p->url:"","#");
-            if(m==n && !strncmp(text,p->url?p->url:"",n))return true;
-        }
-        return false;
+    /* HTML: the URL equals an ancestor document's URL, fragments excluded (the URL
+     * Standard's equality). srcdoc takes a different HTML processing branch. An initial
+     * blank context is created independently and never reaches this URL check. An actual
+     * allocation failure never bypasses recursive-resource checks. */
+    for(web_doc *p=parent;p;p=p->frame_parent) {
+        int equal=web_url_equal(text,p->url?p->url:"",true);
+        if(equal)return equal;
     }
-    char *a=NULL,*origin=NULL;
-    enum http_url_result status=http_canonical_owned_n(text,strlen(text),&a,&origin);
-    free(origin);
-    /* An actual allocation failure never bypasses recursive-resource checks. */
-    if(status==HTTP_URL_OOM)return -1;
-    bool matches=false;
-    if(status==HTTP_URL_TUPLE)for(web_doc *p=parent;p;p=p->frame_parent) {
-        char *b=NULL;origin=NULL;
-        enum http_url_result own_status=http_canonical_owned_n(p->url,p->url?strlen(p->url):0,&b,&origin);
-        free(origin);
-        if(own_status==HTTP_URL_OOM){free(a);free(b);return -1;}
-        if(own_status==HTTP_URL_TUPLE && strcspn(a,"#")==strcspn(b,"#") &&
-           !strncmp(a,b,strcspn(a,"#")))matches=true;
-        free(b);if(matches)break;
-    }
-    if(!matches)for(web_doc *p=parent;p;p=p->frame_parent) {
-        const char *own=p->url?p->url:"";size_t n=strcspn(text,"#");
-        if(strcspn(own,"#")==n && !strncmp(text,own,n)){matches=true;break;}
-    }
-    free(a);return matches;
+    return false;
 }
 struct web_frame *web_frame_find(web_doc *d,node_t *n) {
     for(struct web_frame *f=d?d->frames:NULL;f;f=f->next)if(f->element==n)return f;
@@ -184,22 +163,22 @@ bool web_sandbox_document_allowed(struct web_frame *f,const char *url,bool inher
     /* No script of a script-disabled Document runs, so it cannot lift its own
        sandbox: same-origin and inherited (about:srcdoc) documents are safe. */
     if(flags&SB_SCRIPTS)return url && (!strcmp(url,"about:srcdoc") || !strcmp(url,"about:blank") ||
-        (inherited && !strncasecmp(url,"blob:",5)) || !strncasecmp(url,"https://",8) || !strncasecmp(url,"http://",7));
+        (inherited && web_url_has_scheme(url,"blob")) || web_url_has_scheme(url,"https") || web_url_has_scheme(url,"http"));
     /* A scripted sandbox may share its origin only with ancestors restricted
        at least as much: reaching one then grants no authority it lacks. An
        inherited blank/srcdoc/blob document takes its creator's origin. */
     const char *source=url;
     if(inherited) {
-        if(!url || (strcmp(url,"about:blank") && strcmp(url,"about:srcdoc") && strncasecmp(url,"blob:",5)))return false;
+        if(!url || (strcmp(url,"about:blank") && strcmp(url,"about:srcdoc") && !web_url_has_scheme(url,"blob")))return false;
         source=web_effective_url(f->navigation_owner?f->navigation_owner:f->element->owner);
     }
-    if(!source || (strncasecmp(source,"https://",8) && strncasecmp(source,"http://",7)))return false;
-    char *origin=NULL;if(http_origin_owned(source,&origin)!=HTTP_URL_TUPLE){free(origin);return false;}
+    if(!web_url_has_scheme(source,"https") && !web_url_has_scheme(source,"http"))return false;
+    char *origin=NULL;if(web_url_origin(source,&origin)!=WEB_URL_TUPLE){free(origin);return false;}
     bool allowed=true;
     for(web_doc *p=f->element->owner;p;p=p->frame_parent) {
         char *ancestor=NULL;
-        enum http_url_result parsed=http_origin_owned(web_effective_url(p),&ancestor);
-        if(parsed!=HTTP_URL_TUPLE || (!strcmp(origin,ancestor) && (p->sandbox_flags&flags)!=flags))allowed=false;
+        enum web_url_result parsed=web_url_origin(web_effective_url(p),&ancestor);
+        if(parsed!=WEB_URL_TUPLE || (!strcmp(origin,ancestor) && (p->sandbox_flags&flags)!=flags))allowed=false;
         free(ancestor);if(!allowed)break;
     }
     free(origin);return allowed;
@@ -244,11 +223,7 @@ bool web_frame_same_origin(web_doc *a,web_doc *b) {
     if(a==b)return true;
     if(!a || !b)return false;
     if((a->origin_owner?a->origin_owner:a)==(b->origin_owner?b->origin_owner:b))return true;
-    char *x=NULL,*y=NULL;
-    enum http_url_result xr=http_origin_owned(web_effective_url(a),&x),
-        yr=http_origin_owned(web_effective_url(b),&y);
-    bool same=xr==HTTP_URL_TUPLE && yr==HTTP_URL_TUPLE && !strcmp(x,y);
-    free(x);free(y);return same;
+    return web_url_same_origin(web_effective_url(a),web_effective_url(b))==1;
 }
 /* Whether the frame element's box shows its document's pixels at all. */
 static bool frame_box_shown(const box_t *b) {

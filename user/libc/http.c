@@ -90,7 +90,7 @@ static int pool_open_cancelled(void *opaque) {
     if(shared)w->superseded=true;
     return shared;
 }
-static struct pooled_connection *pool_acquire(const struct http_req *rq,const struct url_owned *u,
+static struct pooled_connection *pool_acquire(const struct http_req *rq,const struct http_target *u,
     int timeout,const char *partition,bool prior,const struct http_stream_hooks *hooks,
     struct http_transport_timing *timing,struct http_transport_result *result,char *error,size_t error_cap) {
     char *key=pool_key(rq,partition);if(!key){errno=ENOMEM;snprintf(error,error_cap,"out of memory preparing connection key");return NULL;}
@@ -171,151 +171,30 @@ void http_pool_clear(void) {
     ns_sessions_clear();
 }
 
-bool url_parse(const char *s, struct url *u) {
-    if (!s || !u || strlen(s) >= HTTP_URL_MAX) return false;
-    memset(u, 0, sizeof *u);
-    if (!strncmp(s, "https://", 8)) {
-        u->tls = true;
-        u->port = 443;
-        s += 8;
-    } else {
-        u->port = 80;
-        if (!strncmp(s, "http://", 7)) s += 7;
-    }
-    size_t hl = strcspn(s, ":/?");
-    if (hl == 0 || hl >= sizeof u->host) return false;
-    memcpy(u->host, s, hl);
-    s += hl;
-    if (*s == ':') {
-        long p = strtol(s + 1, (char **)&s, 10);
-        if (p <= 0 || p > 65535) return false;
-        u->port = (uint16_t)p;
-    }
-    /* "host:80abc" must not yield the relative request target "abc". */
-    if (*s && *s != '/' && *s != '?') return false;
-    int n = *s == '?' ? snprintf(u->path, sizeof u->path, "/%s", s)
-                      : snprintf(u->path, sizeof u->path, "%s", *s ? s : "/");
-    /* A prefix would request a different resource, not the original URL. */
-    return n >= 0 && (size_t)n < sizeof u->path;
+enum web_url_result http_target_of(const char *text, struct http_target *t) {
+    if (!t) return WEB_URL_INVALID;
+    memset(t, 0, sizeof *t);
+    struct web_url url;
+    int parsed = web_url_read(text, text ? strlen(text) : 0, &url);
+    if (parsed != 1) return parsed < 0 ? WEB_URL_OOM : WEB_URL_INVALID;
+    bool tls = web_url_scheme_is(&url, "https");
+    if (!tls && !web_url_scheme_is(&url, "http")) { web_url_free(&url); return WEB_URL_OPAQUE; }
+    size_t host_length, authority_length, path_length;
+    const char *host = web_url_host_text(&url, &host_length), *authority = web_url_authority(&url, &authority_length),
+               *path = web_url_target(&url, &path_length);
+    t->host = malloc(host_length + 1); t->authority = malloc(authority_length + 1); t->path = malloc(path_length + 1);
+    if (!t->host || !t->authority || !t->path) { web_url_free(&url); http_target_free(t); return WEB_URL_OOM; }
+    memcpy(t->host, host, host_length); t->host[host_length] = 0;
+    memcpy(t->authority, authority, authority_length); t->authority[authority_length] = 0;
+    memcpy(t->path, path, path_length); t->path[path_length] = 0;
+    t->tls = tls; t->port = (uint16_t)web_url_port_or_default(&url);
+    web_url_free(&url);
+    return WEB_URL_TUPLE;
 }
 
-void url_owned_free(struct url_owned *u) {
-    if (!u) return;
-    free(u->host); free(u->path); memset(u, 0, sizeof *u);
-}
-
-static enum http_url_result url_parse_owned_status(const char *s, size_t length, struct url_owned *u) {
-    if (!u) return HTTP_URL_INVALID;
-    memset(u, 0, sizeof *u);
-    if (!s || !length || length > UINT32_MAX || length == SIZE_MAX || memchr(s, 0, length)) return HTTP_URL_INVALID;
-    const char *end = s + length, *authority = s;
-    bool tls = length >= 8 && !strncasecmp(s, "https://", 8);
-    if (tls) authority += 8;
-    else if (length >= 7 && !strncasecmp(s, "http://", 7)) authority += 7;
-    else {
-        /* Keep the legacy bare-host entry, but never interpret another
-           explicit scheme as a host/port or permit request-line controls. */
-        for (const char *p = s; (size_t)(end - p) > 2; p++)
-            if (p[0] == ':' && p[1] == '/' && p[2] == '/') return HTTP_URL_INVALID;
-    }
-    /* The URL Standard's serializer keeps '\' in a special URL's query and fragment (no
-       percent-encode set of theirs has it); before them it is a separator the URL parser has
-       already turned into '/', so a raw one there would be a second reading of the URL. */
-    const char *query = s;
-    while (query < end && *query != '?' && *query != '#') query++;
-    for (const unsigned char *p = (const unsigned char *)s; p < (const unsigned char *)end; p++)
-        if (*p <= 32 || *p == 127 || (*p == '\\' && p < (const unsigned char *)query)) return HTTP_URL_INVALID;
-    const char *tail = authority;
-    while (tail < end && *tail != '/' && *tail != '?' && *tail != '#') tail++;
-    const char *colon = NULL;
-    for (const char *p = authority; p < tail; p++) {
-        unsigned char c = (unsigned char)*p;
-        if (c == ':') { if (colon) return HTTP_URL_INVALID; colon = p; }
-        else if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                   (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_')) return HTTP_URL_INVALID;
-    }
-    size_t host_length = (size_t)((colon ? colon : tail) - authority);
-    if (!host_length || host_length == SIZE_MAX) return HTTP_URL_INVALID;
-    unsigned port = tls ? 443 : 80;
-    if (colon) {
-        if (colon + 1 == tail) return HTTP_URL_INVALID;
-        port = 0;
-        for (const char *p = colon + 1; p < tail; p++) {
-            if (*p < '0' || *p > '9' || port > (65535u - (unsigned)(*p - '0')) / 10u) return HTTP_URL_INVALID;
-            port = port * 10u + (unsigned)(*p - '0');
-        }
-        if (!port) return HTTP_URL_INVALID;
-    }
-    const char *path_end = tail;
-    while (path_end < end && *path_end != '#') path_end++;
-    size_t supplied = (size_t)(path_end - tail);
-    bool prepend = !supplied || *tail == '?';
-    if (supplied > SIZE_MAX - (size_t)prepend - 1) return HTTP_URL_INVALID;
-    size_t path_length = supplied + (size_t)prepend;
-    char *host = malloc(host_length + 1), *path = malloc(path_length + 1);
-    if (!host || !path) { free(host); free(path); return HTTP_URL_OOM; }
-    for (size_t i = 0; i < host_length; i++) {
-        unsigned char c = (unsigned char)authority[i];
-        host[i] = c >= 'A' && c <= 'Z' ? (char)(c + ('a' - 'A')) : (char)c;
-    }
-    host[host_length] = 0;
-    size_t at = 0; if (prepend) path[at++] = '/';
-    memcpy(path + at, tail, supplied); path[path_length] = 0;
-    u->tls = tls; u->port = (uint16_t)port; u->host = host; u->path = path;
-    return HTTP_URL_TUPLE;
-}
-
-enum http_url_result url_parse_owned_result_n(const char *s, size_t length, struct url_owned *u) {
-    return url_parse_owned_status(s, length, u);
-}
-
-bool url_parse_owned_n(const char *s, size_t length, struct url_owned *u) {
-    return url_parse_owned_result_n(s, length, u) == HTTP_URL_TUPLE;
-}
-
-bool url_parse_owned(const char *s, struct url_owned *u) {
-    return url_parse_owned_n(s, s ? strlen(s) : 0, u);
-}
-
-enum http_url_result http_canonical_owned_n(const char *raw, size_t length, char **canonical, char **origin) {
-    if (canonical) *canonical = NULL;
-    if (!origin) return HTTP_URL_INVALID;
-    *origin = NULL;
-    if (!raw || !length || length > UINT32_MAX || length == SIZE_MAX || memchr(raw, 0, length)) return HTTP_URL_INVALID;
-    bool secure = length >= 8 && !strncasecmp(raw, "https://", 8);
-    bool plain = length >= 7 && !strncasecmp(raw, "http://", 7);
-    if (!secure && !plain) {
-        if ((length >= 6 && !strncasecmp(raw, "https:", 6)) ||
-            (length >= 5 && !strncasecmp(raw, "http:", 5))) return HTTP_URL_INVALID;
-        /* Non-HTTP URL parsing/inherited blob origin belongs to its caller.
-           No tuple, equality permission or empty serialization is invented. */
-        return HTTP_URL_OPAQUE;
-    }
-    struct url_owned parsed;
-    enum http_url_result result = url_parse_owned_status(raw, length, &parsed);
-    if (result != HTTP_URL_TUPLE) return result;
-    char port[8] = "";
-    if (parsed.port != (parsed.tls ? 443 : 80)) snprintf(port, sizeof port, ":%u", parsed.port);
-    const char *scheme = parsed.tls ? "https://" : "http://";
-    size_t sl = strlen(scheme), hl = strlen(parsed.host), pl = strlen(port);
-    if (hl > SIZE_MAX - sl - pl - 1) { url_owned_free(&parsed); return HTTP_URL_INVALID; }
-    size_t ol = sl + hl + pl, path_length = strlen(parsed.path);
-    if (canonical && (path_length > SIZE_MAX - ol - 1 ||
-                      ol > UINT32_MAX || path_length > UINT32_MAX - ol)) { url_owned_free(&parsed); return HTTP_URL_INVALID; }
-    char *o = malloc(ol + 1), *c = canonical ? malloc(ol + path_length + 1) : NULL;
-    if (!o || (canonical && !c)) { free(o); free(c); url_owned_free(&parsed); return HTTP_URL_OOM; }
-    memcpy(o, scheme, sl); memcpy(o + sl, parsed.host, hl); memcpy(o + sl + hl, port, pl + 1);
-    if (c) { memcpy(c, o, ol); memcpy(c + ol, parsed.path, path_length + 1); }
-    url_owned_free(&parsed); *origin = o; if (canonical) *canonical = c;
-    return HTTP_URL_TUPLE;
-}
-
-enum http_url_result http_origin_owned_n(const char *raw, size_t length, char **origin) {
-    return http_canonical_owned_n(raw, length, NULL, origin);
-}
-
-enum http_url_result http_origin_owned(const char *raw, char **origin) {
-    return http_origin_owned_n(raw, raw ? strlen(raw) : 0, origin);
+void http_target_free(struct http_target *t) {
+    if (!t) return;
+    free(t->host); free(t->authority); free(t->path); memset(t, 0, sizeof *t);
 }
 
 /* buffered reader on top of a stream */
@@ -535,7 +414,7 @@ static bool decode_whole(struct sink *k, const struct http_req *buffered, size_t
 }
 
 struct http_scratch {
-    struct url_owned url;
+    struct http_target url;
     char *head;
     size_t head_length;
     struct pooled_connection *connection;
@@ -563,9 +442,8 @@ static const char *request_head(const struct http_req *rq, struct http_scratch *
     for (const unsigned char *p = (const unsigned char *)method; *p; p++)
         if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
               strchr("!#$%&'*+-.^_`|~", *p))) return "invalid HTTP method";
-    struct url_owned *u = &work->url;
-    char port[8] = "", content_length[64] = "";
-    if (u->port != (u->tls ? 443 : 80)) snprintf(port, sizeof port, ":%u", u->port);
+    const struct http_target *u = &work->url;
+    char content_length[64] = "";
     if (rq->body_len && !rq->body) return "missing HTTP request body storage";
     if(rq->headers)for(const char *p=rq->headers;*p;) {
         const char *end=strstr(p,"\r\n"),*colon=strchr(p,':');
@@ -589,7 +467,7 @@ static const char *request_head(const struct http_req *rq, struct http_scratch *
        other absent bodies must not become an allocated empty-body request. */
     if (rq->body || !strcmp(method, "POST") || !strcmp(method, "PUT"))
         snprintf(content_length, sizeof content_length, "Content-Length: %zu\r\n", rq->body_len);
-    const char *parts[] = {method, " ", u->path, " HTTP/1.1\r\nHost: ", u->host, port,
+    const char *parts[] = {method, " ", u->path, " HTTP/1.1\r\nHost: ", u->authority,
         "\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\n", content_length,
         rq->headers ? rq->headers : "", "\r\n"};
     size_t length = 0;
@@ -612,10 +490,12 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
                          const struct http_stream_hooks *hooks,struct http_transport_timing *timing,
                          uint64_t *phase_started,const char *partition,bool prior) {
     memset(rs, 0, sizeof *rs);
-    struct url_owned *u = &work->url;
-    if (!url_parse_owned(rq->url, u)) {
-        errno=EINVAL;
-        snprintf(rs->error, sizeof rs->error, "invalid URL or URL allocation failure");
+    struct http_target *u = &work->url;
+    enum web_url_result target = http_target_of(rq->url, u);
+    if (target != WEB_URL_TUPLE) {
+        errno = target == WEB_URL_OOM ? ENOMEM : EINVAL;
+        snprintf(rs->error, sizeof rs->error, "%s", target == WEB_URL_OOM ? "out of memory reading the URL" :
+                 target == WEB_URL_OPAQUE ? "not an http or https URL" : "invalid URL");
         return -1;
     }
     if(prior&&u->tls){errno=EINVAL;snprintf(rs->error,sizeof rs->error,"prior-knowledge entry requires an http URL");return -1;}
@@ -928,7 +808,7 @@ static int request_with_limit(const struct http_req *rq, struct http_resp *rs, s
     if(code<0&&result->reused&&!result->response_bytes_received&&idempotent&&
         (cause==ECONNRESET||cause==EPIPE||cause==ENOTCONN||cause==EIO||
          (cause==EAGAIN&&result->request_unprocessed))) {
-        free(work->head);url_owned_free(&work->url);http_resp_free(rs);
+        free(work->head);http_target_free(&work->url);http_resp_free(rs);
         memset(work,0,sizeof *work);memset(result,0,sizeof *result);work->result=result;errno=0;
         code=request_inner(rq,rs,work,body_limit,hooks,timing,&phase_started,partition,prior);cause=errno;
         if(work->h2)http2_release(work->h2);pool_release(work->connection,work->reusable);
@@ -953,7 +833,7 @@ static int request_with_limit(const struct http_req *rq, struct http_resp *rs, s
         else result->error=HTTP_ERR_IO;
     }
     free(work->head);
-    url_owned_free(&work->url);
+    http_target_free(&work->url);
     free(work);
     errno=cause;return code;
 }

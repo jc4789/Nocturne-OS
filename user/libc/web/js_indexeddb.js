@@ -38,7 +38,26 @@ const indexedDBBridge=(()=>{
     function compare(a,b){const x=rank(a),y=rank(b);if(x!==y)return x<y?-1:1;if(x===1){a=Date.prototype.getTime.call(a);b=Date.prototype.getTime.call(b);}if(x===3){a=new Uint8Array(a);b=new Uint8Array(b);}if(x>=3){for(let i=0;i<Math.min(a.length,b.length);i++){const c=x===4?compare(a[i],b[i]):a[i]<b[i]?-1:a[i]>b[i]?1:0;if(c)return c;}return a.length<b.length?-1:a.length>b.length?1:0;}return a<b?-1:a>b?1:0;}
     function path(value,path){if(Array.isArray(path))return path.map(p=>pathValue(value,p));return pathValue(value,path);}
     function pathValue(value,path){if(path==='')return value;for(const p of path.split('.')){if(value==null||!Object.hasOwn(Object(value),p))return undefined;value=value[p];}return value;}
-    function keyPath(value){if(value===null)return null;const p=Array.isArray(value)?value.map(strings):strings(value);const valid=x=>x===''||/^[\p{ID_Start}_$][\p{ID_Continue}$\u200c\u200d]*(?:\.[\p{ID_Start}_$][\p{ID_Continue}$\u200c\u200d]*)*$/u.test(x);if(Array.isArray(p)?p.some(x=>!valid(x)):!valid(p))fail('SyntaxError');return p;}
+    /* WebIDL: a JavaScript value to (DOMString or sequence<DOMString>). An object with an iterator
+       is a sequence, each item a DOMString; anything else (null too) is a DOMString. */
+    function keyPathValue(v){
+        if(v!==null&&(typeof v==='object'||typeof v==='function')){
+            const method=v[Symbol.iterator];
+            if(method!==undefined&&method!==null){
+                if(typeof method!=='function')throw new TypeError('The key path iterator is not callable');
+                const iterator=invoke(method,v,[]);if(iterator===null||typeof iterator!=='object'&&typeof iterator!=='function')throw new TypeError('The key path iterator is not an object');
+                const next=iterator.next,items=[];
+                for(;;){const step=invoke(next,iterator,[]);if(step===null||typeof step!=='object'&&typeof step!=='function')throw new TypeError('The key path iterator result is not an object');if(step.done)return items;items[items.length]=strings(step.value);}
+            }
+        }
+        return strings(v);
+    }
+    /* A "valid key path" (2.5): the empty string, identifiers joined by periods, or a non-empty
+       list of such strings. */
+    const identifiers=/^[\p{ID_Start}_$][\p{ID_Continue}$\u200c\u200d]*(?:\.[\p{ID_Start}_$][\p{ID_Continue}$\u200c\u200d]*)*$/u;
+    const validPath=x=>x===''||identifiers.test(x),validKeyPath=p=>Array.isArray(p)?p.length>0&&p.every(validPath):validPath(p);
+    /* WebIDL: a dictionary argument is undefined, null (its defaults) or an object. */
+    function dictionary(v){if(v==null)return null;if(typeof v!=='object'&&typeof v!=='function')throw new TypeError('The options argument is not an object');return v;}
     function inject(value,path,valueKey){if(!value||typeof value!=='object'||!path||Array.isArray(path))fail('DataError');const parts=path.split('.');for(let i=0;i<parts.length-1;i++){const p=parts[i];if(!Object.hasOwn(value,p))Object.defineProperty(value,p,{value:{},writable:true,enumerable:true,configurable:true});value=value[p];if(!value||typeof value!=='object')fail('DataError');}Object.defineProperty(value,parts[parts.length-1],{value:valueKey,writable:true,enumerable:true,configurable:true});}
     function clone(value){return cloneData.deserialize(cloneData.serialize(value,undefined,true),null,true);}
     async function prefetch(list,tx){
@@ -304,7 +323,9 @@ const indexedDBBridge=(()=>{
             /* One handle per object store in a transaction, whatever it is renamed to. */
             let handle=r.stores.get(store.id);if(!handle){handle=new IDBObjectStore(token,this,store);r.stores.set(store.id,handle);}return handle;}
         abort(){const r=get(this,'IDBTransaction');if(r.finished||r.committing)fail('InvalidStateError');abort(this);}
-        commit(){const r=live(this);r.committing=true;r.active=false;}
+        /* "If this's state is not active, then throw an InvalidStateError": finished, committing
+           and inactive alike. */
+        commit(){const r=get(this,'IDBTransaction');if(r.finished||r.committing||!r.active)fail('InvalidStateError');r.committing=true;r.active=false;}
     }
     function insertion(records,k){let a=0,b=records.length;while(a<b){const m=(a+b)>>>1;if(compare(records[m][0],k)<0)a=m+1;else b=m;}return a;}
     function indexKeys(index,v){let raw=path(v,index.keyPath),out=[];if(index.multiEntry&&Array.isArray(raw)){for(const candidate of raw)try{const k=key(candidate);if(!out.some(x=>!compare(x,k)))out.push(k);}catch(e){if(e.name!=='DataError')throw e;}}else try{out.push(key(raw));}catch(e){if(e.name!=='DataError')throw e;}return out;}
@@ -313,11 +334,18 @@ const indexedDBBridge=(()=>{
     function write(source,v,provided,hasKey,addOnly){const s=existing(get(source,'IDBObjectStore'));live(s.tx,true);const detached=clone(v),store=storeOf(s);let candidate=provided;
         if(store.keyPath!==null){if(hasKey)fail('DataError');candidate=path(detached,store.keyPath);}
         let initial;if(candidate===undefined){if(!store.autoIncrement)fail('DataError');}else initial=key(candidate);
+        return storeRecord(s,source,detached,initial,addOnly);
+    }
+    /* "delete records from an object store": the operation of a store's delete and a cursor's. */
+    const deleteRecords=(s,query)=>()=>{const st=storeOf(s);st.records=st.records.filter(record=>!matches(record[0],query));};
+    /* "store a record into an object store", placed as a request whose source is the store handle
+       (put, add) or the cursor (update). */
+    function storeRecord(s,source,detached,initial,addOnly){
         /* Requests run in the order they were placed. Only a version change transaction changes an
            index set, and it is the only transaction then, so the indexes this request finds when it
            runs are the ones the store's handle has now: an index created after it is built by its
            own later step, one deleted after it is still there. */
-        const present=store.indexes.slice();
+        const present=storeOf(s).indexes.slice();
         return enqueue(s.tx,source,async r=>{const st=storeOf(s);let k=initial;if(k===undefined){if(st.generator>9007199254740992)fail('ConstraintError');k=st.generator;if(st.keyPath!==null)inject(detached,st.keyPath,k);}const at=insertion(st.records,k),exists=at<st.records.length&&!compare(st.records[at][0],k);if(addOnly&&exists)fail('ConstraintError');
             const indexes=[];for(const index of present){const keys=indexKeys(index,detached);indexes.push([index.id,keys]);if(index.unique)for(const old of st.records){if(!compare(old[0],k))continue;for(const oldKey of old[2]?.find(v=>v[0]===index.id)?.[1]||[])if(keys.some(ik=>!compare(ik,oldKey)))fail('ConstraintError');}}
             const staged=await native('stage',r.nativeToken,pack(cloneData.serialize(detached,undefined,true)));status(staged[0]);if(r.finished)return;const record=[k,staged[1],indexes];if(exists)st.records[at]=record;else st.records.splice(at,0,record);if(st.autoIncrement&&typeof k==='number'&&k>=st.generator)st.generator=Math.floor(k)+1;return clone(k);});
@@ -386,10 +414,15 @@ const indexedDBBridge=(()=>{
         getAllKeys(q,c){return many(this,'key',q,c);}
         getAllRecords(options){return many(this,'record',options);}
         count(q){return query(this,'count',q);}
-        delete(q){if(!arguments.length)throw new TypeError('Query required');const s=existing(get(this,'IDBObjectStore'));live(s.tx,true);const r=range(q);return enqueue(s.tx,this,()=>{const st=storeOf(s);st.records=st.records.filter(record=>!matches(record[0],r));});}
+        delete(q){if(!arguments.length)throw new TypeError('Query required');const s=existing(get(this,'IDBObjectStore'));live(s.tx,true);return enqueue(s.tx,this,deleteRecords(s,range(q)));}
         clear(){const s=existing(get(this,'IDBObjectStore'));live(s.tx,true);return enqueue(s.tx,this,()=>{storeOf(s).records=[];});}
         index(name){const s=get(this,'IDBObjectStore');name=strings(name);existing(s);if(get(s.tx,'IDBTransaction').finished)fail('InvalidStateError');const index=storeOf(s).indexes.find(i=>i.name===name);if(!index)fail('NotFoundError');return indexHandle(this,index);}
-        createIndex(name,p,options={}){const s=get(this,'IDBObjectStore');name=strings(name);const r=get(s.tx,'IDBTransaction');if(r.mode!=='versionchange')fail('InvalidStateError');existing(s);live(s.tx);const st=storeOf(s);if(st.indexes.some(i=>i.name===name))fail('ConstraintError');p=keyPath(p);if(p===null)throw new TypeError('Key path required');if(Array.isArray(p)&&options.multiEntry)fail('InvalidAccessError');const index={id:r.data.nextId++,name,keyPath:p,unique:!!options.unique,multiEntry:!!options.multiEntry};
+        /* The arguments are converted first (the key path is not nullable, so null is "null"; the
+           options' members in lexicographic order), then: not an upgrade, store deleted
+           (InvalidStateError), not active, the name taken (ConstraintError), an invalid key path
+           (SyntaxError), a sequence key path with multiEntry (InvalidAccessError). */
+        createIndex(name,p,options){const s=get(this,'IDBObjectStore');if(arguments.length<2)throw new TypeError('Name and key path required');name=strings(name);p=keyPathValue(p);options=dictionary(options);const multiEntry=!!options?.multiEntry,unique=!!options?.unique;
+            const r=get(s.tx,'IDBTransaction');if(r.mode!=='versionchange')fail('InvalidStateError');existing(s);live(s.tx);const st=storeOf(s);if(st.indexes.some(i=>i.name===name))fail('ConstraintError');if(!validKeyPath(p))fail('SyntaxError');if(Array.isArray(p)&&multiEntry)fail('InvalidAccessError');const index={id:r.data.nextId++,name,keyPath:p,unique,multiEntry};
             st.indexes.push(index);
             /* The build runs in order even when the index is deleted before it runs: requests
                placed between see its entries, and deleteIndex's later step removes them. */
@@ -470,8 +503,13 @@ const indexedDBBridge=(()=>{
         continue(k){iterate(this,k,undefined,1,false);}
         advance(n){if(!arguments.length)throw new TypeError('Count required');n=enforceCount(n);if(n===0)throw new TypeError('Invalid advance count');iterate(this,undefined,undefined,n,false);}
         continuePrimaryKey(k,p){iterate(this,k,p,1,true);}
-        update(v){const r=get(this,'IDBCursor'),s=records.get(r.source);live(s.tx,true);existing(s);if(r.pending||!r.position||!(this instanceof IDBCursorWithValue))fail('InvalidStateError');const store=effectiveStore(r),st=storeOf(records.get(store));if(st.keyPath!==null){const candidate=key(path(v,st.keyPath));if(compare(candidate,r.position.primaryKey))fail('DataError');return store.put(v);}return store.put(v,r.position.primaryKey);}
-        delete(){const r=get(this,'IDBCursor'),s=records.get(r.source);live(s.tx,true);existing(s);if(r.pending||!r.position||!(this instanceof IDBCursorWithValue))fail('InvalidStateError');return effectiveStore(r).delete(r.position.primaryKey);}
+        /* Not active, read-only, source or effective store deleted, no got value, key only; then
+           the clone, and with in-line keys the key the clone yields must be the effective key
+           (DataError). The request's source is the cursor. The value is a required argument. */
+        update(v){const r=get(this,'IDBCursor'),s=records.get(r.source);if(!arguments.length)throw new TypeError('Value required');live(s.tx,true);existing(s);if(r.pending||!r.position||!(this instanceof IDBCursorWithValue))fail('InvalidStateError');const detached=clone(v),store=records.get(effectiveStore(r)),st=storeOf(store);
+            if(st.keyPath!==null&&compare(key(path(detached,st.keyPath)),r.position.primaryKey))fail('DataError');
+            return storeRecord(store,this,detached,r.position.primaryKey,false);}
+        delete(){const r=get(this,'IDBCursor'),s=records.get(r.source);live(s.tx,true);existing(s);if(r.pending||!r.position||!(this instanceof IDBCursorWithValue))fail('InvalidStateError');return enqueue(s.tx,this,deleteRecords(records.get(effectiveStore(r)),range(r.position.primaryKey)));}
     }
     /* The cursor's effective object store, as its handle: its source index's, or its source. */
     const effectiveStore=r=>{const s=records.get(r.source);return s.kind==='IDBIndex'?s.handle:r.source;};
@@ -495,9 +533,12 @@ const indexedDBBridge=(()=>{
         get objectStoreNames(){return names(get(this,'IDBDatabase').schema.stores.map(s=>s.name));}
         close(){get(this,'IDBDatabase').closed=true;closing(this);}
         transaction(scope,mode='readonly',options={}){const r=get(this,'IDBDatabase');if(r.closed||r.upgrade)fail('InvalidStateError');scope=typeof scope==='string'?[scope]:Array.from(scope,strings);scope=[...new Set(scope)];if(!scope.length)fail('InvalidAccessError');for(const name of scope)if(!r.schema.stores.some(s=>s.name===name))fail('NotFoundError');mode=strings(mode);if(mode!=='readonly'&&mode!=='readwrite')throw new TypeError('Invalid transaction mode');if(options.durability!==undefined&&!['default','strict','relaxed'].includes(options.durability))throw new TypeError('Invalid durability');return new IDBTransaction(token,this,scope,mode,options);}
-        /* No upgrade (InvalidStateError), not active, an invalid key path (SyntaxError), the name
-           taken (ConstraintError), then a key generator on an empty or sequence key path. */
-        createObjectStore(name,options={}){const r=get(this,'IDBDatabase');name=strings(name);if(!r.upgrade)fail('InvalidStateError');const tx=live(r.upgrade,true);const p=keyPath(options.keyPath==null?null:options.keyPath);if(tx.data.stores.some(s=>s.name===name))fail('ConstraintError');if(options.autoIncrement&&(p===''||Array.isArray(p)))fail('InvalidAccessError');tx.data.stores.push({id:tx.data.nextId++,name,keyPath:p,autoIncrement:!!options.autoIncrement,generator:1,records:[],indexes:[]});return r.upgrade.objectStore(name);}
+        /* The arguments are converted first (the options' members in lexicographic order; a null or
+           missing key path is null), then: no upgrade (InvalidStateError), not active, an invalid
+           key path (SyntaxError), the name taken (ConstraintError), then a key generator on an
+           empty or sequence key path. */
+        createObjectStore(name,options){const r=get(this,'IDBDatabase');if(!arguments.length)throw new TypeError('Name required');name=strings(name);options=dictionary(options);const autoIncrement=!!options?.autoIncrement,given=options?.keyPath,p=given==null?null:keyPathValue(given);
+            if(!r.upgrade)fail('InvalidStateError');const tx=live(r.upgrade,true);if(p!==null&&!validKeyPath(p))fail('SyntaxError');if(tx.data.stores.some(s=>s.name===name))fail('ConstraintError');if(autoIncrement&&(p===''||Array.isArray(p)))fail('InvalidAccessError');tx.data.stores.push({id:tx.data.nextId++,name,keyPath:p,autoIncrement,generator:1,records:[],indexes:[]});return r.upgrade.objectStore(name);}
         /* The store leaves the connection's object store set; its handle's index set empties with
            it (deleted), and requests placed before still run against it. */
         deleteObjectStore(name){const r=get(this,'IDBDatabase');name=strings(name);if(!r.upgrade)fail('InvalidStateError');const tx=live(r.upgrade,true);const i=tx.data.stores.findIndex(s=>s.name===name);if(i<0)fail('NotFoundError');tx.data.stores.splice(i,1);}

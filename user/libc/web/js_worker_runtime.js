@@ -9,7 +9,7 @@
     const DOMException=domExceptionBridge.DOMException,QuotaExceededError=domExceptionBridge.QuotaExceededError;
     /* @include js_atob.js */
     const eventStates=new WeakMap(),listeners=new WeakMap(),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set;
-    const eventDefine=Object.defineProperty,eventCreate=Object.create,eventMapGet=Map.prototype.get,eventMapSet=Map.prototype.set,eventSlice=Array.prototype.slice;
+    const eventDefine=Object.defineProperty,eventCreate=Object.create,eventMapGet=Map.prototype.get,eventMapSet=Map.prototype.set,eventMapForEach=Map.prototype.forEach,eventSlice=Array.prototype.slice;
     const EventMap=Map,EventString=String,eventIndexOf=Array.prototype.indexOf,eventSplice=Array.prototype.splice;
     const eventString=value=>{if(typeof value==='symbol')throw new TypeError('Symbol is not a DOMString');return EventString(value);};
     function eventState(event){const s=apply(eventGet,eventStates,[event]);if(!s)throw new TypeError('Illegal Event receiver');return s;}
@@ -111,24 +111,30 @@
     }
     function dispatchNativeWorkerEvent(object,event,snapshot){eventState(event).isTrusted=true;return dispatchWorkerEvent(object,event,snapshot);}
     Object.assign(globalThis,{DOMException,QuotaExceededError,Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,EventTarget});
-    const progressSlots=new WeakMap();
-    class ProgressEvent extends Event{
-        constructor(type,init={}){init=init==null?{}:Object(init);super(type,init);const number=v=>{const n=Number(v)||0;return Number.isFinite(n)?Number(BigInt(Math.trunc(n))&18446744073709551615n):0;};apply(eventSet,progressSlots,[this,{lengthComputable:!!init.lengthComputable,loaded:number(init.loaded),total:number(init.total)}]);}
-        get lengthComputable(){const s=apply(eventGet,progressSlots,[this]);if(!s)throw new TypeError('Illegal ProgressEvent receiver');return s.lengthComputable;}
-        get loaded(){const s=apply(eventGet,progressSlots,[this]);if(!s)throw new TypeError('Illegal ProgressEvent receiver');return s.loaded;}
-        get total(){const s=apply(eventGet,progressSlots,[this]);if(!s)throw new TypeError('Illegal ProgressEvent receiver');return s.total;}
-    }
+    /* XMLHttpRequest and ProgressEvent are the Window's (js_xhr.js); ProgressEvent is made here,
+       before FileReader (js_blob.js) takes it, the rest once this realm's Fetch exists. */
+    /* @include js_xhr.js */
+    const ProgressEvent=progressEventInterface(Event);
     Object.defineProperty(globalThis,'ProgressEvent',{value:ProgressEvent,writable:true,configurable:true});
-    let blobHandlerTarget=()=>false,indexedDBHandlerTarget=()=>false,abortHandlerTarget=()=>false;
+    let blobHandlerTarget=()=>false,indexedDBHandlerTarget=()=>false,abortHandlerTarget=()=>false,xhrHandlerTarget=()=>false;
     const fileHandlers=new WeakMap();
     const dispatch=dispatchNativeWorkerEvent;
-    const handlerTarget=(value,type)=>blobHandlerTarget(value,type)||indexedDBHandlerTarget(value,type)||abortHandlerTarget(value,type);
+    const handlerTarget=(value,type)=>blobHandlerTarget(value,type)||indexedDBHandlerTarget(value,type)||abortHandlerTarget(value,type)||xhrHandlerTarget(value,type);
     function installHandlers(prototype,types){for(const type of types)eventDefine(prototype,'on'+type,{enumerable:true,configurable:true,
         get(){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');return apply(eventGet,fileHandlers,[this])?.[type]||null;},
         set(value){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');let map=apply(eventGet,fileHandlers,[this]);if(!map){map=eventCreate(null);apply(eventSet,fileHandlers,[this,map]);}
             const had=typeof map[type]==='function';map[type]=typeof value==='function'?value:null;
             /* An abort handler is an abort listener for AbortSignal's garbage collection rule. */
             if(type==='abort'&&had!==(map[type]!==null))abortBridge.listen(this,had?-1:1);}});}
+    /* Whether one or more event listeners are registered on target, an event handler among them
+       (XMLHttpRequest's upload listener flag). */
+    function workerListened(target){
+        const handlers=apply(eventGet,fileHandlers,[target]);
+        if(handlers)for(const type in handlers)if(handlers[type])return true;
+        const m=apply(eventGet,listeners,[target]);let found=false;
+        if(m)apply(eventMapForEach,m,[list=>{for(let i=0;i<list.length;i++)if(!list[i].removed)found=true;}]);
+        return found;
+    }
     /* @include js_navigator.js */
     const {navigator,Interface:WorkerNavigator,languagesChanged}=navigatorBridge.create(true);
     /* @include js_encoding.js */
@@ -180,7 +186,7 @@
         for(;;){const left=index*2+1;if(left>=timerHeap.length)break;const right=left+1,child=right<timerHeap.length&&timerBefore(timerHeap[right],timerHeap[left])?right:left;if(!timerBefore(timerHeap[child],timerHeap[index]))break;timerSwap(index,child);index=child;}
     }
     function clearTimer(id){const t=timers.get(Number(id));if(!t)return;timers.delete(t.id);const index=t.index,last=timerHeap.pop();if(index<timerHeap.length){timerHeap[index]=last;last.index=index;timerFix(index);}}
-    function timer(fn,ms,args,repeat){if(closed)return 0;if(typeof fn!=='function')fn=new Function(htmlSafetyBridge.timerCode(fn,repeat?'setInterval':'setTimeout'));let id;for(let i=0;i<=timers.size;i++){nextTimer=nextTimer===4294967295?1:nextTimer+1;if(!timers.has(nextTimer)){id=nextTimer;break;}}if(id===undefined)throw new RangeError('Worker timer identifier space exhausted');if(timerOrder===9007199254740991){timerOrder=0;for(const t of timers.values())t.order=++timerOrder;for(let i=Math.floor(timerHeap.length/2)-1;i>=0;i--)timerFix(i);}const delay=Math.max(1,Math.min(2147483647,Number(ms)||0)),t={id,order:++timerOrder,fn,args,repeat,delay,due:host.now()+delay,index:timerHeap.length};timers.set(id,t);timerHeap.push(t);timerFix(t.index);return id;}
+    function timer(fn,ms,args,repeat){if(closed)return 0;if(typeof fn!=='function'){fn=htmlSafetyBridge.timerCode(fn,repeat?'setInterval':'setTimeout');if(fn===null)return 0;}let id;for(let i=0;i<=timers.size;i++){nextTimer=nextTimer===4294967295?1:nextTimer+1;if(!timers.has(nextTimer)){id=nextTimer;break;}}if(id===undefined)throw new RangeError('Worker timer identifier space exhausted');if(timerOrder===9007199254740991){timerOrder=0;for(const t of timers.values())t.order=++timerOrder;for(let i=Math.floor(timerHeap.length/2)-1;i>=0;i--)timerFix(i);}const delay=Math.max(1,Math.min(2147483647,Number(ms)||0)),t={id,order:++timerOrder,fn,args,repeat,delay,due:host.now()+delay,index:timerHeap.length};timers.set(id,t);timerHeap.push(t);timerFix(t.index);return id;}
     function importScripts(...urls){for(const u of urls){const url=new URL(htmlSafetyBridge.check(u,3,'WorkerGlobalScope importScripts'),address).href;const r=host.import(url);performanceBridge.monotonicResource(0,IMPORT_REQUEST,url,wireField(r,LOADED_TIMING));if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker script load failed','NetworkError');evalSource(new TextDecoder().decode(r[3]),r[1]||url);}}
     /* @include js_abort.js */
     /* This Worker's events for AbortSignal: a trusted abort event through this realm's dispatch,
@@ -204,9 +210,15 @@
     const workerFetchTransport=(()=>{
         const apply=Reflect.apply,mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapDelete=Map.prototype.delete,mapForEach=Map.prototype.forEach,mapClear=Map.prototype.clear,
             setPrototype=Object.setPrototypeOf,NativePromise=Promise,NativeTypeError=TypeError,request=host.request,resume=host.resume,cancel=host.cancel,
-            strIndex=String.prototype.indexOf,strSlice=String.prototype.slice;
+            strIndex=String.prototype.indexOf,strSlice=String.prototype.slice,requestWait=host.requestWait;
         const record=object=>setPrototype(object,null);
         const take=id=>{const p=apply(mapGet,fetches,[id]);apply(mapDelete,fetches,[id]);return p;};
+        /* A filtered response the request's modes do not allow: an opaque one for a request not in
+           mode "no-cors", an opaque-redirect for one whose redirect mode is not "manual". */
+        const contradicts=(flags,noCors,manual)=>((flags&4)&&!noCors)||((flags&64)&&!manual);
+        /* An NJW_LOADED that is a network error: the parent's reason, no status (a filtered
+           response has none), or a filtered response the request's modes contradict. */
+        const failed=(r,flags,noCors,manual)=>r[4]||(!(flags&(4|64))&&!r[0])||contradicts(flags,noCors,manual);
         /* A fetch's end: its stream's (notify), then its promise's when no response was published. */
         function end(p,error){if(p.notify)p.notify(3,error);if(!p.published)p.reject(error===undefined?new NativeTypeError('Worker fetch failed'):error);}
         /* The response the parent delivered: NJW_LOADED's [status, url, headers, bytes] or a
@@ -217,32 +229,39 @@
             if(flags&64)return fetchBridge.response(0,r[1],'',undefined,null,false,'','opaqueredirect');
             return fetchBridge.response(r[0],r[1],r[2],undefined,bytes,!!(flags&2),undefined,flags&1?'cors':'basic');
         }
-        /* A filtered response the request's modes do not allow: an opaque one for a request not in
-           mode "no-cors", an opaque-redirect for one whose redirect mode is not "manual". */
-        const contradicts=(p,flags)=>((flags&4)&&!p.noCors)||((flags&64)&&!p.manual);
         /* One frame taken: the parent sends the next on this resume, once per frame. */
         function next(id,p,more){if(more&&!p.done)apply(resume,host,[id]);else p.paused=!p.done;}
         /* Fetch's report timing, once the fetch has ended (as a Window's js.c reports it): the
-           entry in this Worker's performance timeline. */
-        function timing(p,record){try{performanceBridge.monotonicResource(0,FETCH_REQUEST,p.url,record);}catch(error){report(error);}}
+           entry in this Worker's performance timeline, by its request id (realm.initiator's). */
+        function timing(p,record){try{performanceBridge.monotonicResource(p.id,FETCH_REQUEST,p.url,record);}catch(error){report(error);}}
+        /* The parent's answer to obtainBlob: the Blob's bytes and its type (the Content-Type field
+           worker_blob writes). */
+        function blobAnswer(r){
+            const headers=typeof r[2]==='string'?r[2]:'',field=apply(strIndex,headers,['Content-Type: ']),end=field<0?-1:apply(strIndex,headers,['\r\n',field]);
+            if(r[4]||r[0]!==200||end<0)throw new NativeTypeError(r[4]||'The blob: URL has no Blob in this Worker\'s partition');
+            return [r[3],apply(strSlice,headers,[field+14,end])];
+        }
         return {
             noCors:()=>true,streaming:()=>workerStreaming,
             fetch(q,notify){
                 if(closed)throw new NativeTypeError('Worker closed');
                 const stream=!!notify&&workerStreaming,id=apply(request,host,[q,stream]);
                 let resolve,reject;const promise=new NativePromise((a,b)=>{resolve=a;reject=b;});
-                apply(mapSet,fetches,[id,record({resolve,reject,notify:stream?notify:undefined,noCors:q.noCors,manual:q.redirectManual,url:q.url,published:false,paused:false,done:false})]);
+                apply(mapSet,fetches,[id,record({id,resolve,reject,notify:stream?notify:undefined,noCors:q.noCors,manual:q.redirectManual,url:q.url,published:false,paused:false,done:false})]);
                 return record({id,promise});
             },
             /* FileAPI "obtain a blob object" for a blob: URL this Worker's store does not hold: the
                parent's js.c resolves it in its document's store when this Worker is in that
                document's storage partition (worker_blob). The NJW_LOADED body and its Content-Type
                field are the Blob's bytes and type; Fetch (js_fetch.js) runs the rest of scheme
-               fetch here, as a Window does. */
-            obtainBlob(url){
+               fetch here, as a Window does. With a timeout (a synchronous XMLHttpRequest's), the
+               event loop pauses for the answer as fetchSync's does: [bytes, type], null when the
+               timeout passed first. */
+            obtainBlob(url,timeout){
                 if(closed)throw new NativeTypeError('Worker closed');
                 const id=apply(request,host,[record({url,method:'GET',headers:'',body:null,sameOrigin:false,credentials:0,forcePreflight:false,
                     redirectError:false,cache:0,keepalive:false,noCors:false,noReferrer:true,referrer:'',referrerPolicy:0,destination:''}),false]);
+                if(timeout!==undefined){const answer=apply(requestWait,host,[id,timeout]);return answer===null?null:blobAnswer(answer[0]);}
                 let resolve,reject;const promise=new NativePromise((a,b)=>{resolve=a;reject=b;});
                 apply(mapSet,fetches,[id,record({resolve,reject,notify:undefined,noCors:false,url,blob:true,published:false,paused:false,done:false})]);
                 return record({id,promise});
@@ -252,14 +271,9 @@
             /* NJW_LOADED: a buffered response, or the error that ends any fetch. */
             loaded(id,r,flags){
                 const p=take(id);if(!p||closed)return;p.done=true;
-                if(p.blob){
-                    const headers=typeof r[2]==='string'?r[2]:'',field=apply(strIndex,headers,['Content-Type: ']),end=field<0?-1:apply(strIndex,headers,['\r\n',field]);
-                    if(r[4]||r[0]!==200||end<0)p.reject(new NativeTypeError(r[4]||'The blob: URL has no Blob in this Worker\'s partition'));
-                    else p.resolve([r[3],apply(strSlice,headers,[field+14,end])]);
-                    return;
-                }
+                if(p.blob){let blob;try{blob=blobAnswer(r);}catch(error){p.reject(error);return;}p.resolve(blob);return;}
                 timing(p,wireField(r,LOADED_TIMING));
-                if(r[4]||(!(flags&(4|64))&&!r[0])||contradicts(p,flags)||p.notify){end(p,new NativeTypeError(r[4]||'Worker fetch failed'));return;}
+                if(failed(r,flags,p.noCors,p.manual)||p.notify){end(p,new NativeTypeError(r[4]||'Worker fetch failed'));return;}
                 try{p.published=true;p.resolve(response(r,flags,r[3]));}catch(error){p.reject(error);}
             },
             /* NJW_FRAME: one frame of a streamed fetch (the parent's process_fetch_frame order:
@@ -272,7 +286,7 @@
                     timing(p,wireField(value,1));return;
                 }
                 if(event===1){
-                    if(contradicts(p,flags)){take(id);p.done=true;end(p,new NativeTypeError('Native Fetch response contradicts its filtering policy'));return;}
+                    if(contradicts(flags,p.noCors,p.manual)){take(id);p.done=true;end(p,new NativeTypeError('Native Fetch response contradicts its filtering policy'));return;}
                     const published=response(value,flags,new ArrayBuffer(0)),more=p.notify(1,published);
                     p.published=true;p.resolve(published);next(id,p,more);return;
                 }
@@ -282,6 +296,21 @@
             close(){
                 const list=[];apply(mapForEach,fetches,[p=>{list[list.length]=p;}]);apply(mapClear,fetches,[]);
                 for(let i=0;i<list.length;i++){list[i].done=true;try{end(list[i],new DOMException('Worker closed','AbortError'));}catch(error){report(error);}}
+            },
+            /* A synchronous XMLHttpRequest's fetch, unstreamed: browserjsworker.c's requestWait
+               pauses this worker's event loop (other records wait in its task queue) until the
+               parent's NJW_LOADED, or until timeout ms (0: none) pass, when it tells the parent to
+               cancel and gives null. */
+            fetchSync(q,timeout,initiator){
+                if(closed)throw new NativeTypeError('Worker closed');
+                const id=apply(request,host,[q,false]);
+                if(initiator)initiator(id);
+                const answer=apply(requestWait,host,[id,timeout]);
+                if(answer===null)return null;
+                const r=answer[0],flags=answer[1];
+                timing(record({id,url:q.url}),wireField(r,LOADED_TIMING));
+                if(failed(r,flags,q.noCors,q.redirectManual))throw new NativeTypeError(r[4]||'Worker fetch failed');
+                return response(r,flags,r[3]);
             }
         };
     })();
@@ -294,10 +323,18 @@
         return fetchInterfaces({signals:abortBridge.signals,transport:workerFetchTransport,
             baseURL:()=>address,origin,clientReferrer:()=>address,referrerPolicy:()=>apply(referrerPolicy,host,[]),
             url:()=>apply(securityURL,host,[])||address,dataURL:url=>apply(dataURL,host,[url]),
-            task:fn=>timer(fn,0,[],false),clearTask:clearTimer,digest:(algorithm,bytes)=>apply(digest,host,[algorithm,bytes])});
+            task:fn=>timer(fn,0,[],false),clearTask:clearTimer,digest:(algorithm,bytes)=>apply(digest,host,[algorithm,bytes]),
+            initiator:id=>performanceBridge.initiator(id,'xmlhttprequest')});
     })();
     fetchBridge.initialize();fetchBridge.initializeStreams(streamBridge);fetchBridge.initializeBlobs(blobBridge);
     const {Headers,Request,Response,fetch}=fetchBridge;
+    /* This Worker's XMLHttpRequest: its Fetch, open()'s URL against its API base URL in UTF-8, no
+       documents; its event loop pauses for a synchronous request (workerFetchTransport.fetchSync). */
+    const xhr=xhrInterfaces({fetch:fetchBridge,parseURL:url=>urlBridge.encodingParse(url,address,'UTF-8'),listened:workerListened,
+        log:text=>host.send(7,0,{message:text,filename:address}),document:null,synchronous:true});
+    xhrHandlerTarget=xhr.handlerTarget;
+    for(const name of ['XMLHttpRequest','XMLHttpRequestUpload','XMLHttpRequestEventTarget'])
+        Object.defineProperty(globalThis,name,{value:xhr[name],writable:true,configurable:true});
     /* @include js_performance.js */
     /* @include js_console.js */
     Object.assign(globalThis,{self:globalThis,navigator,WorkerNavigator,postMessage,close,importScripts,Headers,Request,Response,AbortSignal,AbortController,fetch,

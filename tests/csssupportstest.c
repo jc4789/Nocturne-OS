@@ -80,7 +80,7 @@ static const struct cond_case conditions[] = {
     {"selector(:has(div,))",false}, {"selector(:has(:unknown))",false},
     {"selector(:hover)",true}, {"selector(:scope)",true}, {"selector(:defined)",false},
     {"selector(div::unknown)",false}, {"selector(:is(div,:unknown))",false},
-    {"selector(:is(div,))",false}, {"selector(:nth-child(2n of .item))",false},
+    {"selector(:is(div,))",false}, {"selector(:nth-child(2n of .item))",true},
     {"selector(div >)",false}, {"selector(a|div)",false}, {"selector(**)",false},
     {"selector(123)",false}, {"selector(.123)",false},
 };

@@ -8,6 +8,7 @@
 #include <webprefs.h>
 #include <webstorage.h>
 #include <webcookie.h>
+#include <weburl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
@@ -871,15 +872,18 @@ static bool authority_host(const char *p, char out[WEBPREFS_HOST_MAX + 1]) {
     return host_key(p, n, out);
 }
 
-/* The host of an http(s) or ws(s) URL in out. */
-static bool url_host(const char *url, char out[WEBPREFS_HOST_MAX + 1]) {
-    static const char *const schemes[] = {"http://", "https://", "ws://", "wss://"};
-    for (size_t i = 0; url && i < sizeof schemes / sizeof *schemes; i++) {
-        size_t k = strlen(schemes[i]), m = 0;
-        while (m < k && lower(url[m]) == schemes[i][m]) m++;
-        if (m == k) return authority_host(url + k, out);
-    }
-    return false;
+/* The host of an http(s) or ws(s) URL (or of an origin's serialization) in out, as its URL record
+   has it (weburl.h): 1; 0 for any other URL or text that is not one; -1 out of memory. */
+static int url_host(const char *url, char out[WEBPREFS_HOST_MAX + 1]) {
+    struct web_url record;
+    int read = url ? web_url_read(url, strlen(url), &record) : 0;
+    if (read != 1) return read;
+    size_t n;
+    const char *host = web_url_host_text(&record, &n);
+    bool ok = (web_url_http_scheme(&record) || web_url_scheme_is(&record, "ws") || web_url_scheme_is(&record, "wss")) &&
+              host_key(host, n, out);
+    web_url_free(&record);
+    return ok;
 }
 
 n_result webprefs_site_host(const char *input, char out[WEBPREFS_HOST_MAX + 1]) {
@@ -924,7 +928,9 @@ enum webprefs_site_rule webprefs_site_rule(const char *host) {
 enum webprefs_site_rule webprefs_site_rule_url(const char *url) {
     char key[WEBPREFS_HOST_MAX + 1];
     bool kept;
-    return url_host(url, key) ? site_of_key(key, &kept) : WEBPREFS_SITE_DEFAULT;
+    int host = url_host(url, key);
+    /* Out of memory: the host cannot be told, so storage is refused rather than allowed. */
+    return host < 0 ? WEBPREFS_SITE_BLOCK : host ? site_of_key(key, &kept) : WEBPREFS_SITE_DEFAULT;
 }
 
 bool webprefs_storage_allowed(const char *url) { return webprefs_site_rule_url(url) != WEBPREFS_SITE_BLOCK; }

@@ -5,6 +5,9 @@
      L  get an encoding of data; data out is the name (status 0 on failure)
      D  decoder of label over data in chunks; flags 1 fatal, 2 drop BOM, 4 sniff;
         out is UTF-8, status as web_decoder_run
+     T  one decoder of label (flags as D) over a run of TextDecoder decode() calls,
+        each u8 last (not stream), u32 length, bytes; out per call: status (i8),
+        u32 length, UTF-8
      B  decode (BOM sniff, label as fallback); out is name, NUL, UTF-8
      S  data is u32 scalar values; for each a fresh encoder, encode or fail,
         then end-of-queue; out per value: byte count (u8), bytes, error (u32)
@@ -74,6 +77,22 @@ int main(int argc, char **argv) {
                 uint32_t n = length - i < chunk ? length - i : chunk;
                 status = web_decoder_run(decoder, data + i, n, i + n >= length, &result);
                 if (status != 1 || i + n >= length) break;
+            }
+            break;
+        case 'T':
+            web_decoder_init(decoder, encoding, flags & 1);
+            decoder->drop_bom = flags & 2;
+            for (uint32_t i = 0; i + 5 <= length;) {
+                bool last = data[i];
+                uint32_t n = u32(data + i + 1);
+                struct web_bytes call = {0};
+                int8_t called = (int8_t)web_decoder_run(decoder, data + i + 5, n, last, &call);
+                uint8_t head[5] = {(uint8_t)called, (uint8_t)call.length, (uint8_t)(call.length >> 8),
+                                   (uint8_t)(call.length >> 16), (uint8_t)(call.length >> 24)};
+                web_bytes_put(&result, head, 5);
+                if (call.length) web_bytes_put(&result, call.data, call.length);
+                free(call.data);
+                i += 5 + n;
             }
             break;
         case 'B': {

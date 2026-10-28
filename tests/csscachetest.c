@@ -514,7 +514,7 @@ int main(int argc,char **argv){
     int error=0;struct cssom_sheet *editable=cssom_style_sheet(d,one,&error);
     check(editable&&error==CSSOM_OK,"link CSSOM promotion has independent editable AST");
     const char *edit=".value{width:99px}";
-    check(editable&&cssom_insert(editable,edit,strlen(edit),2)==CSSOM_OK,"CSSOM mutation");
+    check(editable&&cssom_insert(editable,0,edit,strlen(edit),2)==CSSOM_OK,"CSSOM mutation");
     web_layout(d,1000,600);
     check(value->box&&near(value->box->w,99)&&shadow_value->box&&near(shadow_value->box->w,40),
         "edited CSSOM AST wins for its owner without altering cached shared source");

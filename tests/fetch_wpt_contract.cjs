@@ -26,8 +26,9 @@
 'use strict';
 const fs = require('node:fs'), vm = require('node:vm'), path = require('node:path'), cp = require('node:child_process');
 const crypto = require('node:crypto'), assert = require('node:assert/strict');
-/* The garbage collection checks call V8's collector. */
-if (typeof global.gc !== 'function') {
+/* The garbage collection checks call V8's collector (when this file runs; a file that requires
+   it for its realms gets no collector). */
+if (typeof global.gc !== 'function' && require.main === module) {
     const run = cp.spawnSync(process.execPath, ['--expose-gc', __filename, ...process.argv.slice(2)], {stdio: 'inherit'});
     process.exit(run.status === null ? 1 : run.status);
 }
@@ -160,7 +161,7 @@ function events(rev) {
 const hideObjectURLs = () => { for (const name of ['createObjectURL', 'revokeObjectURL'])
     Object.defineProperty(URL, name, {value: undefined, writable: true, configurable: true, enumerable: false}); };
 /* The realm's shared start: what both a Window's and a Worker's bootstrap have before Fetch:
-   js_worker_runtime.js's ProgressEvent and js_blob.js (this tree's, the environment of every REV). */
+   js_xhr.js's ProgressEvent and js_blob.js (this tree's, the environment of every REV). */
 function context(rev, network) {
     hideObjectURLs();
     const c = {console, URL, URLSearchParams, TextEncoder, TextDecoder, setTimeout, clearTimeout, crypto: globalThis.crypto,
@@ -182,9 +183,9 @@ function context(rev, network) {
                 const out=new Uint8Array(n);let at=0;for(const b of parts){out.set(b,at);at+=b.length;}return out.buffer;}};`, c);
     vm.runInContext(events(rev), c, {filename: (rev ? rev + ':' : '') + 'js_worker_runtime.js (events)'});
     vm.runInContext(streamsSource(), c);
-    const runtime = read(web + 'js_worker_runtime.js');
-    vm.runInContext(slice(runtime, '    const progressSlots=new WeakMap();', "{value:ProgressEvent,writable:true,configurable:true});") +
-        '\n' + read(web + 'js_blob.js'), c, {filename: 'js_blob.js'});
+    vm.runInContext(read(web + 'js_xhr.js') + '\nconst ProgressEvent=progressEventInterface(Event);\n' +
+        "Object.defineProperty(globalThis,'ProgressEvent',{value:ProgressEvent,writable:true,configurable:true});", c, {filename: 'js_xhr.js'});
+    vm.runInContext(read(web + 'js_blob.js'), c, {filename: 'js_blob.js'});
     return c;
 }
 /* The realm's blob URL store, as its bootstrap installs it after FormData. */
@@ -321,6 +322,9 @@ async function main() {
     /* AbortSignal.timeout's long timers would keep node waiting. */
     process.exit(failed ? 1 : 0);
 }
-/* A file's top-level body reads (request-disturbed's) reject with nobody waiting: not a result. */
-process.on('unhandledRejection', () => {});
-main().catch(e => { console.error(e); process.exit(1); });
+module.exports = {realms};
+if (require.main === module) {
+    /* A file's top-level body reads (request-disturbed's) reject with nobody waiting: not a result. */
+    process.on('unhandledRejection', () => {});
+    main().catch(e => { console.error(e); process.exit(1); });
+}

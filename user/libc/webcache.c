@@ -4,6 +4,7 @@
  * as the disk has them. */
 #include <webcache.h>
 #include <webstorage.h>
+#include <weburl.h>
 #include <nocturne.h>
 #include <bearssl_hash.h>
 #include <stdio.h>
@@ -794,7 +795,7 @@ int webcache_run(webcache *c, const struct webcache_call *call, struct webcache_
     if (!c || !call) return WEB_CACHE_TYPE;
     bool origin = call->operation != WEB_CACHE_WRITE && call->operation != WEB_CACHE_DISCARD &&
         call->operation != WEB_CACHE_READ && call->operation != WEB_CACHE_CLOSE;
-    if (origin && (!call->origin || (strncmp(call->origin, "https://", 8) && strncmp(call->origin, "http://", 7))))
+    if (origin && !web_origin_http(call->origin))
         return WEB_CACHE_SECURITY;
     switch (call->operation) {
     case WEB_CACHE_OPEN: return open_cache(call, out);

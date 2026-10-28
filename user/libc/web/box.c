@@ -346,7 +346,7 @@ static void svg_computed_style(sbuf *b, node_t *n, bool root) {
     const style_t *st = n->style;
     if (!st) return;
     sb_puts(b, " style=\"");
-    const char *original = node_attr(n, "style");
+    const char *original = n->csp_style_attribute == 2 ? NULL : node_attr(n, "style");
     /* Preserve codec-supported properties not yet represented by native CSS
        (e.g. stroke dashes), then override only our computed painting subset. */
     if (original) xml_escape(b, original, strlen(original), true);
@@ -1142,6 +1142,9 @@ static void unpublish_boxes(box_t *b) {
     }
     ar_free(&b->layout_mem);
     ar_free(&b->text_mem);
+    /* an anchor-positioned box's record goes with it; the others may name this box until the next layout */
+    box_anchor_free(b);
+    if(b->node && b->node->owner)b->node->owner->anchor_epoch++;
     if(b->node && b->node->box==b){b->node->box=NULL;b->node->anchor_block=NULL;}
     for(box_t *child=b->first,*next;child;child=next){next=child->next;unpublish_boxes(child);}
     arena_t *branch=b->branch_mem;

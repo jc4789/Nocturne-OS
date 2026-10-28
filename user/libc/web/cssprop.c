@@ -323,8 +323,9 @@ static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int fl
             out->kind = LK_AUTO;
             return true;
         }
-        /* a math function of type <length> (or <length-percentage>): computed, range-clamped */
-        struct css_calc_parse P = {.a = cx->a, .cx = cx};
+        /* a math function of type <length> (or <length-percentage>): computed, range-clamped. anchor()
+           and anchor-size() are <length>s where the property takes them (css-anchor-position-1 §3.2, §5.1) */
+        struct css_calc_parse P = {.a = cx->a, .cx = cx, .anchors = (uint8_t)(flags & (LF_ANCHOR | LF_ANCHOR_SIZE))};
         struct css_calc *c = css_calc_read(&P, CSS_CALC_LENGTH | (flags & LF_NOPCT ? 0 : CSS_CALC_PERCENT), s, n, NULL);
         return c && css_length_from_calc(c, flags & LF_NEG, out);
     }
@@ -534,14 +535,15 @@ enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
        PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_BOX_SHADOW, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
        PT_MOTION_LIST, PT_TRANSFORM, PT_TRANSLATE,
-       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_SHAPE, PT_OFFSET, PT_CLIP, PT_COLOR_SCHEME };
+       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_SHAPE, PT_OFFSET, PT_CLIP, PT_COLOR_SCHEME, PT_RULE_LIST,
+       PT_RULE_INSET, PT_ANCHOR };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
        SH_MARGIN_INLINE, SH_MARGIN_BLOCK, SH_PADDING_INLINE, SH_PADDING_BLOCK, SH_INSET_INLINE, SH_INSET_BLOCK,
        SH_LIST_STYLE, SH_FONT, SH_BACKGROUND, SH_FLEX, SH_FLEX_FLOW, SH_GAP, SH_OVERFLOW, SH_TEXT_DECORATION, SH_ALL,
        SH_PLACE_ITEMS, SH_PLACE_SELF, SH_PLACE_CONTENT, SH_GRID_AREA, SH_GRID_ROW, SH_GRID_COLUMN,
-       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_TRANSITION, SH_OUTLINE, SH_OFFSET };
+       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_TRANSITION, SH_OUTLINE, SH_OFFSET, SH_GAP_RULE, SH_POSITION_TRY };
 
 struct propdef {
     const char *name;
@@ -556,8 +558,18 @@ struct propdef {
 /* Web Animations 1 §5.3 animation types that differ from a value type's default */
 enum { AN_TYPE, AN_NONE, AN_DISCRETE, AN_VISIBILITY, AN_DISPLAY };
 /* style_t itself, or a group of rarely set properties it holds by pointer (style_t's float_shape,
-   offset). A group holds only properties that are not inherited. */
-enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET };
+   offset, gap_rules, anchor). A group holds only properties that are not inherited. */
+enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET, G_GAP_RULE, G_ANCHOR };
+/* the gap decoration shorthands (css-gaps-1): propdef flags hold what one sets (GS_*) and on which
+   axes (GS_COLUMN, GS_ROW) */
+enum { GS_RULE, GS_COLOR, GS_STYLE, GS_WIDTH, GS_BREAK, GS_ITEMS, GS_INSET_START, GS_INSET_END, GS_INSET_CAP,
+       GS_INSET_JUNCTION, GS_INSET };
+#define GS_COLUMN 0x10
+#define GS_ROW 0x20
+#define GS_BOTH (GS_COLUMN | GS_ROW)
+/* which Anchor Positioning value a PT_ANCHOR property holds (its flags) */
+enum { CSS_ANCHOR_NAME, CSS_ANCHOR_SCOPE, CSS_POSITION_ANCHOR, CSS_POSITION_AREA, CSS_POSITION_TRY_FALLBACKS,
+       CSS_POSITION_VISIBILITY };
 
 static const struct kw kw_position[] = {{"static", POS_STATIC}, {"relative", POS_RELATIVE}, {"absolute", POS_ABSOLUTE},
                                         {"fixed", POS_FIXED}, {"sticky", POS_STICKY}, {"-webkit-sticky", POS_STICKY}, {0}};
@@ -619,18 +631,13 @@ static const struct kw kw_justify[] = {{"normal", JC_START}, {"flex-start", JC_S
                                        {"end", JC_END}, {"right", JC_END}, {"center", JC_CENTER},
                                        {"space-between", JC_BETWEEN}, {"space-around", JC_AROUND},
                                        {"space-evenly", JC_EVENLY}, {"safe center", JC_CENTER}, {0}};
-static const struct kw kw_align[] = {{"normal", AI_STRETCH}, {"stretch", AI_STRETCH}, {"flex-start", AI_START},
-                                     {"start", AI_START}, {"self-start", AI_START}, {"flex-end", AI_END},
-                                     {"end", AI_END}, {"self-end", AI_END}, {"center", AI_CENTER},
-                                     {"safe center", AI_CENTER}, {"baseline", AI_BASELINE},
-                                     {"first baseline", AI_BASELINE}, {"last baseline", AI_BASELINE},
-                                     {"auto", 255}, {0}};
-static const struct kw kw_jalign[] = {{"normal", AI_STRETCH}, {"stretch", AI_STRETCH}, {"legacy", AI_STRETCH},
-                                      {"start", AI_START}, {"self-start", AI_START}, {"flex-start", AI_START},
-                                      {"left", AI_START}, {"end", AI_END}, {"self-end", AI_END},
-                                      {"flex-end", AI_END}, {"right", AI_END}, {"center", AI_CENTER},
-                                      {"safe center", AI_CENTER}, {"legacy center", AI_CENTER},
-                                      {"baseline", AI_START}, {"auto", 255}, {0}};
+/* align-items and justify-items; the -self properties also take anchor-center (css-anchor-position-1 §4.2) */
+#define KW_ALIGN {"normal", AI_NORMAL}, {"stretch", AI_STRETCH}, {"flex-start", AI_START},                  {"start", AI_START}, {"self-start", AI_START}, {"flex-end", AI_END},                  {"end", AI_END}, {"self-end", AI_END}, {"center", AI_CENTER},                  {"safe center", AI_CENTER}, {"baseline", AI_BASELINE},                  {"first baseline", AI_BASELINE}, {"last baseline", AI_BASELINE}, {"auto", 255}
+#define KW_JALIGN {"normal", AI_NORMAL}, {"stretch", AI_STRETCH}, {"legacy", AI_NORMAL},                   {"start", AI_START}, {"self-start", AI_START}, {"flex-start", AI_START},                   {"left", AI_START}, {"end", AI_END}, {"self-end", AI_END},                   {"flex-end", AI_END}, {"right", AI_END}, {"center", AI_CENTER},                   {"safe center", AI_CENTER}, {"legacy center", AI_CENTER},                   {"baseline", AI_START}, {"auto", 255}
+static const struct kw kw_align[] = {KW_ALIGN, {0}};
+static const struct kw kw_align_self[] = {KW_ALIGN, {"anchor-center", AI_ANCHOR_CENTER}, {0}};
+static const struct kw kw_jalign[] = {KW_JALIGN, {0}};
+static const struct kw kw_jalign_self[] = {KW_JALIGN, {"anchor-center", AI_ANCHOR_CENTER}, {0}};
 static const struct kw kw_gflow[] = {{"row", 0}, {"column", 1}, {"dense", 0}, {"row dense", 0},
                                      {"column dense", 1}, {"dense row", 0}, {"dense column", 1}, {0}};
 static const struct kw kw_capside[] = {{"top", 0}, {"bottom", 1}, {"block-start", 0}, {"block-end", 1}, {0}};
@@ -647,6 +654,15 @@ static const struct kw kw_ostyle[] = {{"none", BS_NONE}, {"solid", BS_SOLID}, {"
                                       {"dotted", BS_DOTTED}, {"double", BS_DOUBLE}, {"groove", BS_GROOVE},
                                       {"ridge", BS_RIDGE}, {"inset", BS_INSET}, {"outset", BS_OUTSET}, {0}};
 static const struct kw kw_normal0[] = {{"normal", 0}, {0}};
+static const struct kw kw_rule_break[] = {{"none", CSS_RULE_BREAK_NONE}, {"normal", CSS_RULE_BREAK_NORMAL},
+                                          {"intersection", CSS_RULE_BREAK_INTERSECTION}, {0}};
+static const struct kw kw_rule_items[] = {{"all", CSS_RULE_ITEMS_ALL}, {"around", CSS_RULE_ITEMS_AROUND},
+                                          {"between", CSS_RULE_ITEMS_BETWEEN}, {"normal", CSS_RULE_ITEMS_NORMAL}, {0}};
+static const struct kw kw_rule_overlap[] = {{"row-over-column", CSS_RULE_ROW_OVER_COLUMN},
+                                            {"column-over-row", CSS_RULE_COLUMN_OVER_ROW}, {0}};
+static const struct kw kw_try_order[] = {{"normal", CSS_TRY_ORDER_NORMAL}, {"most-width", CSS_TRY_ORDER_MOST_WIDTH},
+    {"most-height", CSS_TRY_ORDER_MOST_HEIGHT}, {"most-block-size", CSS_TRY_ORDER_MOST_BLOCK},
+    {"most-inline-size", CSS_TRY_ORDER_MOST_INLINE}, {0}};
 static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}, {"super", VA_SUPER},
                                       {"top", VA_TOP}, {"middle", VA_MIDDLE}, {"bottom", VA_BOTTOM},
                                       {"text-top", VA_TEXT_TOP}, {"text-bottom", VA_TEXT_BOTTOM}, {0}};
@@ -654,6 +670,8 @@ static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}
 #define O(f) G_STYLE, (uint16_t)offsetof(style_t, f), (uint16_t)sizeof(((style_t *)0)->f)
 #define OG(g, T, f) g, (uint16_t)offsetof(T, f), (uint16_t)sizeof(((T *)0)->f) /* a field of group g, a T */
 #define SH(name, id) {name, PT_SHORT, 0, false, G_STYLE, 0, 0, NULL, id, AN_NONE}
+#define SH_GAP(name, flags) {name, PT_SHORT, flags, false, G_STYLE, 0, 0, NULL, SH_GAP_RULE, AN_NONE}
+#define OGAP(f) OG(G_GAP_RULE, struct css_gap_rules, f)
 
 /* sorted by name at first use */
 static struct propdef props[] = {
@@ -678,7 +696,7 @@ static struct propdef props[] = {
     {"transition-behavior",PT_MOTION_LIST,ML_TBEHAVIOR,false,O(motion.list[ML_TBEHAVIOR]),kw_transition_behavior,0,AN_NONE},
     {"align-content", PT_KW, 0, false, O(align_content), kw_acontent, 0, AN_TYPE},
     {"align-items", PT_KW, 0, false, O(align_items), kw_align, 0, AN_TYPE},
-    {"align-self", PT_KW, 0, false, O(align_self), kw_align, 0, AN_TYPE},
+    {"align-self", PT_KW, 0, false, O(align_self), kw_align_self, 0, AN_TYPE},
     SH("background", SH_BACKGROUND),
     {"background-color", PT_COLOR, 0, false, O(bg_color), NULL, 0, AN_TYPE},
     {"background-image", PT_BG_IMAGE, 0, false, O(bg_image), NULL, 0, AN_TYPE},
@@ -715,13 +733,57 @@ static struct propdef props[] = {
     {"border-top-style", PT_KW, 0, false, O(border_style[0]), kw_bstyle, 0, AN_TYPE},
     {"border-top-width", PT_PX, LF_NOPCT, false, O(border_width[0]), kw_bwidth, 0, AN_TYPE},
     SH("border-width", SH_BORDER_WIDTH),
-    {"bottom", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[2]), NULL, 0, AN_TYPE},
+    {"bottom", PT_LEN, LF_AUTO | LF_NEG | LF_ANCHOR | LF_ANCHOR_SIZE, false, O(inset[2]), NULL, 0, AN_TYPE},
     {"box-sizing", PT_KW, 0, false, O(box_sizing), kw_boxsizing, 0, AN_TYPE},
     {"caption-side", PT_KW, 0, true, O(caption_bottom), kw_capside, 0, AN_TYPE},
     {"clear", PT_KW, 0, false, O(clear), kw_clear, 0, AN_TYPE},
     {"color", PT_COLOR, 0, true, O(color), NULL, 0, AN_TYPE},
     {"color-scheme", PT_COLOR_SCHEME, 0, true, O(color_scheme), NULL, 0, AN_DISCRETE},
     {"column-gap", PT_PX, LF_NOPCT, false, O(gap_col), kw_normal0, 0, AN_TYPE},
+    /* CSS Gap Decorations 1. flags: a list's enum css_gap_rule_kind, a shorthand's GS_* */
+    SH_GAP("column-rule", GS_RULE | GS_COLUMN),
+    SH_GAP("row-rule", GS_RULE | GS_ROW),
+    SH_GAP("rule", GS_RULE | GS_BOTH),
+    {"column-rule-color", PT_RULE_LIST, CSS_GAP_COLOR, false, OGAP(axis[0].list[CSS_GAP_COLOR]), NULL, 0, AN_TYPE},
+    {"column-rule-style", PT_RULE_LIST, CSS_GAP_STYLE, false, OGAP(axis[0].list[CSS_GAP_STYLE]), NULL, 0, AN_DISCRETE},
+    {"column-rule-width", PT_RULE_LIST, CSS_GAP_WIDTH, false, OGAP(axis[0].list[CSS_GAP_WIDTH]), NULL, 0, AN_TYPE},
+    {"row-rule-color", PT_RULE_LIST, CSS_GAP_COLOR, false, OGAP(axis[1].list[CSS_GAP_COLOR]), NULL, 0, AN_TYPE},
+    {"row-rule-style", PT_RULE_LIST, CSS_GAP_STYLE, false, OGAP(axis[1].list[CSS_GAP_STYLE]), NULL, 0, AN_DISCRETE},
+    {"row-rule-width", PT_RULE_LIST, CSS_GAP_WIDTH, false, OGAP(axis[1].list[CSS_GAP_WIDTH]), NULL, 0, AN_TYPE},
+    SH_GAP("rule-color", GS_COLOR | GS_BOTH),
+    SH_GAP("rule-style", GS_STYLE | GS_BOTH),
+    SH_GAP("rule-width", GS_WIDTH | GS_BOTH),
+    {"column-rule-break", PT_KW, 0, false, OGAP(axis[0].rule_break), kw_rule_break, 0, AN_TYPE},
+    {"row-rule-break", PT_KW, 0, false, OGAP(axis[1].rule_break), kw_rule_break, 0, AN_TYPE},
+    SH_GAP("rule-break", GS_BREAK | GS_BOTH),
+    {"column-rule-visibility-items", PT_KW, 0, false, OGAP(axis[0].visibility), kw_rule_items, 0, AN_TYPE},
+    {"row-rule-visibility-items", PT_KW, 0, false, OGAP(axis[1].visibility), kw_rule_items, 0, AN_TYPE},
+    SH_GAP("rule-visibility-items", GS_ITEMS | GS_BOTH),
+    {"rule-overlap", PT_KW, 0, false, OGAP(overlap), kw_rule_overlap, 0, AN_TYPE},
+    {"column-rule-inset-cap-start", PT_RULE_INSET, 0, false, OGAP(axis[0].inset[CSS_RULE_CAP_START]), NULL, 0, AN_TYPE},
+    {"column-rule-inset-cap-end", PT_RULE_INSET, 0, false, OGAP(axis[0].inset[CSS_RULE_CAP_END]), NULL, 0, AN_TYPE},
+    {"column-rule-inset-junction-start", PT_RULE_INSET, 0, false, OGAP(axis[0].inset[CSS_RULE_JUNCTION_START]), NULL, 0,
+     AN_TYPE},
+    {"column-rule-inset-junction-end", PT_RULE_INSET, 0, false, OGAP(axis[0].inset[CSS_RULE_JUNCTION_END]), NULL, 0, AN_TYPE},
+    {"row-rule-inset-cap-start", PT_RULE_INSET, 0, false, OGAP(axis[1].inset[CSS_RULE_CAP_START]), NULL, 0, AN_TYPE},
+    {"row-rule-inset-cap-end", PT_RULE_INSET, 0, false, OGAP(axis[1].inset[CSS_RULE_CAP_END]), NULL, 0, AN_TYPE},
+    {"row-rule-inset-junction-start", PT_RULE_INSET, 0, false, OGAP(axis[1].inset[CSS_RULE_JUNCTION_START]), NULL, 0, AN_TYPE},
+    {"row-rule-inset-junction-end", PT_RULE_INSET, 0, false, OGAP(axis[1].inset[CSS_RULE_JUNCTION_END]), NULL, 0, AN_TYPE},
+    SH_GAP("column-rule-inset-start", GS_INSET_START | GS_COLUMN),
+    SH_GAP("column-rule-inset-end", GS_INSET_END | GS_COLUMN),
+    SH_GAP("row-rule-inset-start", GS_INSET_START | GS_ROW),
+    SH_GAP("row-rule-inset-end", GS_INSET_END | GS_ROW),
+    SH_GAP("rule-inset-start", GS_INSET_START | GS_BOTH),
+    SH_GAP("rule-inset-end", GS_INSET_END | GS_BOTH),
+    SH_GAP("column-rule-inset-cap", GS_INSET_CAP | GS_COLUMN),
+    SH_GAP("column-rule-inset-junction", GS_INSET_JUNCTION | GS_COLUMN),
+    SH_GAP("row-rule-inset-cap", GS_INSET_CAP | GS_ROW),
+    SH_GAP("row-rule-inset-junction", GS_INSET_JUNCTION | GS_ROW),
+    SH_GAP("rule-inset-cap", GS_INSET_CAP | GS_BOTH),
+    SH_GAP("rule-inset-junction", GS_INSET_JUNCTION | GS_BOTH),
+    SH_GAP("column-rule-inset", GS_INSET | GS_COLUMN),
+    SH_GAP("row-rule-inset", GS_INSET | GS_ROW),
+    SH_GAP("rule-inset", GS_INSET | GS_BOTH),
     {"content", PT_CONTENT, 0, false, O(content), NULL, 0, AN_TYPE},
     {"content-visibility", PT_KW, 0, false, O(content_visibility), kw_content_visibility, 0, AN_DISPLAY},
     SH("container", SH_CONTAINER),
@@ -751,6 +813,17 @@ static struct propdef props[] = {
     {"offset-position", PT_OFFSET, CSS_OFFSET_POSITION, false, OG(G_OFFSET, struct css_offset, position), NULL, 0, AN_TYPE},
     {"offset-anchor", PT_OFFSET, CSS_OFFSET_ANCHOR, false, OG(G_OFFSET, struct css_offset, anchor), NULL, 0, AN_TYPE},
     {"offset-rotate", PT_OFFSET, CSS_OFFSET_ROTATE, false, OG(G_OFFSET, struct css_offset, rotate), NULL, 0, AN_TYPE},
+    {"anchor-name", PT_ANCHOR, CSS_ANCHOR_NAME, false, OG(G_ANCHOR, struct css_anchor, name), NULL, 0, AN_DISCRETE},
+    {"anchor-scope", PT_ANCHOR, CSS_ANCHOR_SCOPE, false, OG(G_ANCHOR, struct css_anchor, scope), NULL, 0, AN_DISCRETE},
+    {"position-anchor", PT_ANCHOR, CSS_POSITION_ANCHOR, false, OG(G_ANCHOR, struct css_anchor, position_anchor), NULL, 0,
+     AN_DISCRETE},
+    {"position-area", PT_ANCHOR, CSS_POSITION_AREA, false, OG(G_ANCHOR, struct css_anchor, area), NULL, 0, AN_DISCRETE},
+    SH("position-try", SH_POSITION_TRY),
+    {"position-try-fallbacks", PT_ANCHOR, CSS_POSITION_TRY_FALLBACKS, false, OG(G_ANCHOR, struct css_anchor, tries), NULL,
+     0, AN_DISCRETE},
+    {"position-try-order", PT_KW, 0, false, OG(G_ANCHOR, struct css_anchor, try_order), kw_try_order, 0, AN_DISCRETE},
+    {"position-visibility", PT_ANCHOR, CSS_POSITION_VISIBILITY, false, OG(G_ANCHOR, struct css_anchor, visibility), NULL,
+     0, AN_DISCRETE},
     {"fill-rule", PT_KW, 0, true, O(svg_fill_rule), kw_svg_fill_rule, 0, AN_TYPE},
     SH("font", SH_FONT),
     SH("all", SH_ALL),
@@ -774,14 +847,14 @@ static struct propdef props[] = {
     {"grid-template-areas", PT_GAREAS, 0, false, O(grid_areas), NULL, 0, AN_TYPE},
     {"grid-template-columns", PT_GTEMPLATE, 0, false, O(grid_cols), NULL, 0, AN_TYPE},
     {"grid-template-rows", PT_GTEMPLATE, 0, false, O(grid_rows), NULL, 0, AN_TYPE},
-    {"height", PT_LEN, LF_AUTO, false, O(height), NULL, 0, AN_TYPE},
+    {"height", PT_LEN, LF_AUTO | LF_ANCHOR_SIZE, false, O(height), NULL, 0, AN_TYPE},
     SH("inset", SH_INSET),
     SH("inset-block", SH_INSET_BLOCK),
     SH("inset-inline", SH_INSET_INLINE),
     {"justify-content", PT_KW, 0, false, O(justify_content), kw_justify, 0, AN_TYPE},
     {"justify-items", PT_KW, 0, false, O(justify_items), kw_jalign, 0, AN_TYPE},
-    {"justify-self", PT_KW, 0, false, O(justify_self), kw_jalign, 0, AN_TYPE},
-    {"left", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[3]), NULL, 0, AN_TYPE},
+    {"justify-self", PT_KW, 0, false, O(justify_self), kw_jalign_self, 0, AN_TYPE},
+    {"left", PT_LEN, LF_AUTO | LF_NEG | LF_ANCHOR | LF_ANCHOR_SIZE, false, O(inset[3]), NULL, 0, AN_TYPE},
     {"letter-spacing", PT_PX, LF_NEG | LF_NOPCT, true, O(letter_spacing), kw_normal0, 0, AN_TYPE},
     {"line-height", PT_LINE_HEIGHT, 0, true, O(line_height), NULL, 0, AN_TYPE},
     SH("list-style", SH_LIST_STYLE),
@@ -789,21 +862,21 @@ static struct propdef props[] = {
     {"list-style-type", PT_LIST_TYPE, 0, true, O(list_style), NULL, 0, AN_TYPE},
     SH("margin", SH_MARGIN),
     SH("margin-block", SH_MARGIN_BLOCK),
-    {"margin-bottom", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[2]), NULL, 0, AN_TYPE},
+    {"margin-bottom", PT_LEN, LF_AUTO | LF_NEG | LF_ANCHOR_SIZE, false, O(margin[2]), NULL, 0, AN_TYPE},
     SH("margin-inline", SH_MARGIN_INLINE),
-    {"margin-left", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[3]), NULL, 0, AN_TYPE},
-    {"margin-right", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[1]), NULL, 0, AN_TYPE},
-    {"margin-top", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[0]), NULL, 0, AN_TYPE},
+    {"margin-left", PT_LEN, LF_AUTO | LF_NEG | LF_ANCHOR_SIZE, false, O(margin[3]), NULL, 0, AN_TYPE},
+    {"margin-right", PT_LEN, LF_AUTO | LF_NEG | LF_ANCHOR_SIZE, false, O(margin[1]), NULL, 0, AN_TYPE},
+    {"margin-top", PT_LEN, LF_AUTO | LF_NEG | LF_ANCHOR_SIZE, false, O(margin[0]), NULL, 0, AN_TYPE},
     {"mask-image", PT_MASK_IMAGE, 0, false, O(mask_image), NULL, 0, AN_TYPE},
     {"mask-position", PT_BG_POS, 0, false, O(mask_pos), NULL, 0, AN_TYPE},
     {"object-fit", PT_KW, 0, false, O(object_fit), kw_object_fit, 0, AN_TYPE},
     {"object-position", PT_BG_POS, 0, true, O(object_pos), NULL, 0, AN_TYPE},
     {"mask-repeat", PT_KW, 0, false, O(mask_repeat), kw_bg_repeat, 0, AN_TYPE},
     {"mask-size", PT_MASK_SIZE, 0, false, O(mask_size), NULL, 0, AN_TYPE},
-    {"max-height", PT_LEN, LF_NONE, false, O(max_height), NULL, 0, AN_TYPE},
-    {"max-width", PT_LEN, LF_NONE, false, O(max_width), NULL, 0, AN_TYPE},
-    {"min-height", PT_LEN, LF_AUTO, false, O(min_height), NULL, 0, AN_TYPE},
-    {"min-width", PT_LEN, LF_AUTO, false, O(min_width), NULL, 0, AN_TYPE},
+    {"max-height", PT_LEN, LF_NONE | LF_ANCHOR_SIZE, false, O(max_height), NULL, 0, AN_TYPE},
+    {"max-width", PT_LEN, LF_NONE | LF_ANCHOR_SIZE, false, O(max_width), NULL, 0, AN_TYPE},
+    {"min-height", PT_LEN, LF_AUTO | LF_ANCHOR_SIZE, false, O(min_height), NULL, 0, AN_TYPE},
+    {"min-width", PT_LEN, LF_AUTO | LF_ANCHOR_SIZE, false, O(min_width), NULL, 0, AN_TYPE},
     {"opacity", PT_OPACITY, 0, false, O(opacity), NULL, 0, AN_TYPE},
     {"order", PT_INT, 0, false, O(order), NULL, 0, AN_TYPE},
     SH("outline", SH_OUTLINE),
@@ -826,7 +899,7 @@ static struct propdef props[] = {
     SH("place-self", SH_PLACE_SELF),
     {"pointer-events", PT_KW, 0, true, O(pointer_events), kw_pointer_events, 0, AN_TYPE},
     {"position", PT_KW, 0, false, O(position), kw_position, 0, AN_TYPE},
-    {"right", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[1]), NULL, 0, AN_TYPE},
+    {"right", PT_LEN, LF_AUTO | LF_NEG | LF_ANCHOR | LF_ANCHOR_SIZE, false, O(inset[1]), NULL, 0, AN_TYPE},
     {"row-gap", PT_PX, LF_NOPCT, false, O(gap_row), kw_normal0, 0, AN_TYPE},
     {"stroke", PT_SVG_PAINT, 0, true, O(svg_stroke), NULL, 0, AN_TYPE},
     {"stroke-opacity", PT_OPACITY, 0, true, O(svg_stroke_opacity), NULL, 0, AN_TYPE},
@@ -843,7 +916,7 @@ static struct propdef props[] = {
     {"text-indent", PT_LEN, LF_NEG, true, O(text_indent), NULL, 0, AN_TYPE},
     {"text-transform", PT_KW, 0, true, O(text_transform), kw_ttrans, 0, AN_TYPE},
     {"text-wrap-mode", PT_KW, 0, true, O(white_space), kw_textwrap, 0, AN_TYPE},
-    {"top", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[0]), NULL, 0, AN_TYPE},
+    {"top", PT_LEN, LF_AUTO | LF_NEG | LF_ANCHOR | LF_ANCHOR_SIZE, false, O(inset[0]), NULL, 0, AN_TYPE},
     {"transform", PT_TRANSFORM, 0, false, O(transform), NULL, 0, AN_TYPE},
     {"transform-origin", PT_TRANSFORM_ORIGIN, 0, false, O(transform_origin), NULL, 0, AN_TYPE},
     {"transform-box", PT_KW, 0, false, O(transform_box), kw_transform_box, 0, AN_TYPE},
@@ -853,7 +926,7 @@ static struct propdef props[] = {
     {"vertical-align", PT_VALIGN, 0, false, O(vertical_align), kw_valign, 0, AN_TYPE},
     {"visibility", PT_KW, 0, true, O(visibility), kw_visibility, 0, AN_VISIBILITY},
     {"white-space", PT_KW, 0, true, O(white_space), kw_ws, 0, AN_TYPE},
-    {"width", PT_LEN, LF_AUTO, false, O(width), NULL, 0, AN_TYPE},
+    {"width", PT_LEN, LF_AUTO | LF_ANCHOR_SIZE, false, O(width), NULL, 0, AN_TYPE},
     {"word-spacing", PT_PX, LF_NEG | LF_NOPCT, true, O(word_spacing), kw_normal0, 0, AN_TYPE},
     {"z-index", PT_ZINDEX, 0, false, O(z_index), NULL, 0, AN_TYPE},
 };
@@ -923,10 +996,11 @@ static void init_initial(void) {
     s->object_pos[0].pct=s->object_pos[1].pct=50;
     s->transform_origin[0].kind=s->transform_origin[1].kind=LK_LEN;
     s->transform_origin[0].pct=s->transform_origin[1].pct=50;
+    s->align_items = s->justify_items = AI_NORMAL;
     s->align_self = 255;
     s->justify_self = 255;
     s->z_auto = true;
-    /* the groups (float_shape, offset) stay NULL: their initial records */
+    /* the groups (float_shape, offset, gap_rules, anchor) stay NULL: their initial records */
 }
 
 static void props_init(void) {
@@ -1003,12 +1077,18 @@ static const void *group_of(const style_t *s, uint8_t g) {
     switch (g) {
     case G_FLOAT_SHAPE: return css_style_float_shape(s);
     case G_OFFSET: return css_style_offset(s);
+    case G_GAP_RULE: return css_style_gap_rules(s);
+    case G_ANCHOR: return css_style_anchor(s);
     }
     return s;
 }
-static size_t group_size(uint8_t g) { return g == G_FLOAT_SHAPE ? sizeof(struct css_float_shape) : sizeof(struct css_offset); }
+static size_t group_size(uint8_t g) {
+    return g == G_FLOAT_SHAPE ? sizeof(struct css_float_shape) : g == G_OFFSET ? sizeof(struct css_offset) :
+                                g == G_GAP_RULE ? sizeof(struct css_gap_rules) : sizeof(struct css_anchor);
+}
 static bool group_same(const style_t *a, const style_t *b, uint8_t g) {
-    return g == G_FLOAT_SHAPE ? a->float_shape == b->float_shape : a->offset == b->offset;
+    return g == G_FLOAT_SHAPE ? a->float_shape == b->float_shape : g == G_OFFSET ? a->offset == b->offset :
+           g == G_GAP_RULE ? a->gap_rules == b->gap_rules : a->anchor == b->anchor;
 }
 /* s's group g becomes a copy of value in a, for the caller to finish writing: the group s held may
    be another style's too (box.c's copies of a style, the animation layer's copy of its base) */
@@ -1017,18 +1097,28 @@ static void *group_write(style_t *s, uint8_t g, const void *value, arena_t *a) {
     void *copy = ar_alloc(a, size);
     memcpy(copy, value, size);
     if (g == G_FLOAT_SHAPE) s->float_shape = copy;
-    else s->offset = copy;
+    else if (g == G_OFFSET) s->offset = copy;
+    else if (g == G_GAP_RULE) s->gap_rules = copy;
+    else s->anchor = copy;
     return copy;
 }
 /* every group of src, as copying each of their (uninherited) properties would */
 static void groups_copy(style_t *dst, const style_t *src) {
     dst->float_shape = src->float_shape;
     dst->offset = src->offset;
+    dst->gap_rules = src->gap_rules;
+    dst->anchor = src->anchor;
 }
 /* the property's field in s */
 static const void *field_of(const style_t *s, const struct propdef *p) {
     return (const char *)group_of(s, p->group) + p->off;
 }
+/* the gap decorations' values (below): the computed value getComputedStyle reads, longhand or
+   shorthand (1; -1 out of memory), and a declared value's specified serialization */
+static int gap_computed(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d);
+static bool gap_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
+static bool position_try_text(const struct css_anchor *a, sbuf *out);
+static bool anchor_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d) {
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return 0;
@@ -1058,10 +1148,13 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
         snprintf(text, sizeof text, "%d", (int)*(const int32_t *)field); sb_puts(out, text); return 1;
     case PT_COLOR: return css_style_color_text(st, color_slot(p), out) ? 1 : -1;
     case PT_COLOR_SCHEME: sb_puts(out, st->color_scheme_text ? st->color_scheme_text : "normal"); return 1;
-    case PT_MOTION_LIST: case PT_SHAPE: case PT_OFFSET: case PT_ROTATE: case PT_SCALE:
+    case PT_MOTION_LIST: case PT_SHAPE: case PT_OFFSET: case PT_ROTATE: case PT_SCALE: case PT_ANCHOR:
         return css_computed_value(st, p, out, d) ? 1 : -1;
+    case PT_RULE_LIST: case PT_RULE_INSET: return gap_computed(st, p, out, d);
     case PT_SHORT: /* the shorthands whose longhands' owner serializes them together */
         if (p->sh == SH_OFFSET) return css_offset_shorthand_serialize(css_style_offset(st), out, d) ? 1 : -1;
+        if (p->sh == SH_GAP_RULE) return gap_computed(st, p, out, d);
+        if (p->sh == SH_POSITION_TRY) return position_try_text(css_style_anchor(st), out) ? 1 : -1;
         return 0;
     }
     return 0;
@@ -1077,6 +1170,14 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     if (ident_is(v, n, "inherit") || ident_is(v, n, "initial") || ident_is(v, n, "unset") || ident_is(v, n, "revert") ||
         ident_is(v, n, "revert-layer")) return false;
     if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
+    if (p->group == G_GAP_RULE || (p->type == PT_SHORT && p->sh == SH_GAP_RULE)) return gap_specified(p, v, n, out);
+    if (p->group == G_ANCHOR || (p->type == PT_SHORT && p->sh == SH_POSITION_TRY)) return anchor_specified(p, v, n, out);
+    /* a length (or a shorthand of lengths) with an anchor function in it; the rest as other lengths */
+    if (((p->type == PT_LEN && (p->flags & (LF_ANCHOR | LF_ANCHOR_SIZE))) ||
+         (p->type == PT_SHORT && (p->sh == SH_INSET || p->sh == SH_INSET_BLOCK || p->sh == SH_INSET_INLINE ||
+                                  p->sh == SH_MARGIN || p->sh == SH_MARGIN_BLOCK || p->sh == SH_MARGIN_INLINE))) &&
+        anchor_specified(p, v, n, out))
+        return true;
     if (p->type == PT_SHAPE || p->group != G_STYLE || (p->type == PT_SHORT && p->sh == SH_OFFSET))
         return css_shape_specified(p->name, v, n, out);
     if (p->type != PT_COLOR_SCHEME) {
@@ -1113,6 +1214,1321 @@ static bool kw_find(const struct kw *k, const char *s, size_t n, uint8_t *out) {
             return true;
         }
     return false;
+}
+static const char *kw_name(const struct kw *k, uint8_t v) {
+    for (; k->name; k++) if (k->v == v) return k->name;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------- gap decorations (css-gaps-1) */
+static void anim_unit(sbuf *b, double v, const char *unit);
+static struct css_color anim_color_used(const style_t *st, const struct css_color_computed *v);
+static bool anim_color_text(sbuf *b, const struct css_color_computed *v);
+
+/* §4.1-4.3 and §3: currentcolor, none, medium; insets 0; normal; row-over-column */
+static const struct css_rule_item rule_initial_item = {0, 0, 1};
+static const union css_rule_value rule_initial_values[3] = {
+    {.color = {COLOR_CURRENT, NULL}}, {.style = BS_NONE}, {.width = 3}};
+#define RULE_INITIAL_AXIS {                                                                                          \
+    .list = {{&rule_initial_item, &rule_initial_values[CSS_GAP_COLOR], 1, 1},                                     \
+             {&rule_initial_item, &rule_initial_values[CSS_GAP_STYLE], 1, 1},                                     \
+             {&rule_initial_item, &rule_initial_values[CSS_GAP_WIDTH], 1, 1}},                                    \
+    .inset = {{{.kind = LK_LEN}, false}, {{.kind = LK_LEN}, false}, {{.kind = LK_LEN}, false}, {{.kind = LK_LEN}, false}}, \
+    .rule_break = CSS_RULE_BREAK_NORMAL, .visibility = CSS_RULE_ITEMS_NORMAL}
+const struct css_gap_rules css_gap_rules_initial = {.axis = {RULE_INITIAL_AXIS, RULE_INITIAL_AXIS},
+                                                    .overlap = CSS_RULE_ROW_OVER_COLUMN};
+
+static bool rule_value_equal(int kind, const union css_rule_value *a, const union css_rule_value *b) {
+    if (kind == CSS_GAP_COLOR) return a->color.argb == b->color.argb && css_color_value_equal(a->color.exact, b->color.exact);
+    return kind == CSS_GAP_STYLE ? a->style == b->style : a->width == b->width;
+}
+static bool rule_items_equal(const struct css_rule_list *a, const struct css_rule_list *b) {
+    if (a->nitems != b->nitems || a->nvalues != b->nvalues) return false;
+    for (uint32_t i = 0; i < a->nitems; i++)
+        if (a->items[i].repeat != b->items[i].repeat || a->items[i].count != b->items[i].count) return false;
+    return true;
+}
+static bool rule_list_equal(int kind, const struct css_rule_list *a, const struct css_rule_list *b) {
+    if (!rule_items_equal(a, b)) return false;
+    for (uint32_t i = 0; i < a->nvalues; i++) if (!rule_value_equal(kind, &a->values[i], &b->values[i])) return false;
+    return true;
+}
+static bool rule_inset_equal(const struct css_rule_inset *a, const struct css_rule_inset *b) {
+    return a->join == b->join && (a->join || css_length_equal(&a->length, &b->length));
+}
+/* what the segments' geometry takes from one axis (layout.c): everything but colour and style */
+static bool rule_axis_layout_equal(const struct css_gap_axis *a, const struct css_gap_axis *b) {
+    if (a->rule_break != b->rule_break || a->visibility != b->visibility ||
+        !rule_list_equal(CSS_GAP_WIDTH, &a->list[CSS_GAP_WIDTH], &b->list[CSS_GAP_WIDTH])) return false;
+    for (int i = 0; i < 4; i++) if (!rule_inset_equal(&a->inset[i], &b->inset[i])) return false;
+    return true;
+}
+bool css_gap_rules_equal(const struct css_gap_rules *a, const struct css_gap_rules *b) {
+    if (a == b) return true;
+    if (!a) a = &css_gap_rules_initial;
+    if (!b) b = &css_gap_rules_initial;
+    if (a->overlap != b->overlap) return false;
+    for (int x = 0; x < 2; x++)
+        if (!rule_axis_layout_equal(&a->axis[x], &b->axis[x]) ||
+            !rule_list_equal(CSS_GAP_COLOR, &a->axis[x].list[CSS_GAP_COLOR], &b->axis[x].list[CSS_GAP_COLOR]) ||
+            !rule_list_equal(CSS_GAP_STYLE, &a->axis[x].list[CSS_GAP_STYLE], &b->axis[x].list[CSS_GAP_STYLE])) return false;
+    return true;
+}
+/* a container records its segments only while its style holds the group (layout.c) */
+bool css_gap_rules_layout_equal(const struct css_gap_rules *a, const struct css_gap_rules *b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    return rule_axis_layout_equal(&a->axis[0], &b->axis[0]) && rule_axis_layout_equal(&a->axis[1], &b->axis[1]);
+}
+
+/* how many values item it stands for once written out (an auto repeater's own values once) */
+static uint64_t rule_item_span(const struct css_rule_item *it) {
+    return it->repeat == 0 ? 1 : it->repeat == CSS_RULE_AUTO ? it->count : (uint64_t)it->repeat * it->count;
+}
+/* value k of items [from, to) with their integer repeaters written out */
+static union css_rule_value rule_expanded_at(const struct css_rule_list *l, uint32_t from, uint32_t to, uint64_t k) {
+    for (uint32_t i = from; i < to; i++) {
+        const struct css_rule_item *it = &l->items[i];
+        uint64_t span = rule_item_span(it);
+        if (k < span) return l->values[it->first + (uint32_t)(k % it->count)];
+        k -= span;
+    }
+    return l->values[l->nvalues - 1];
+}
+/* §4.6 "assign gap decoration values to a list of gaps" for gap index of count */
+union css_rule_value css_rule_value_at(const struct css_rule_list *l, uint32_t index, uint32_t count) {
+    uint32_t a = l->nitems;
+    for (uint32_t i = 0; i < l->nitems; i++) if (l->items[i].repeat == CSS_RULE_AUTO) { a = i; break; }
+    uint64_t leading = 0, trailing = 0;
+    for (uint32_t i = 0; i < a; i++) leading += rule_item_span(&l->items[i]);
+    if (a == l->nitems) return rule_expanded_at(l, 0, a, leading ? index % leading : 0);
+    for (uint32_t i = a + 1; i < l->nitems; i++) trailing += rule_item_span(&l->items[i]);
+    if (index < leading) return rule_expanded_at(l, 0, a, index);
+    /* the trailing gaps are the last trailing count, without the leading ones */
+    uint64_t first_trailing = count > trailing ? count - trailing : 0;
+    if (first_trailing < leading) first_trailing = leading;
+    if (index >= first_trailing) return rule_expanded_at(l, a + 1, l->nitems, index - first_trailing);
+    const struct css_rule_item *it = &l->items[a];
+    return l->values[it->first + (uint32_t)((index - leading) % it->count)];
+}
+
+/* the parts of a comma-separated list, each trimmed; -1 for an empty part or an unbalanced bracket */
+static int rule_parts(const char *v, size_t n, struct cx *cx, const char ***tok, size_t **len) {
+    size_t count = 1;
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = v[i];
+        if (quote) { if (c == '\\') i++; else if (c == quote) quote = 0; }
+        else if (c == '"' || c == '\'') quote = c;
+        else if (c == '(') depth++;
+        else if (c == ')') { if (!depth) return -1; depth--; }
+        else if (c == ',' && !depth) count++;
+    }
+    if (depth || quote || count > INT32_MAX) return -1;
+    const char **t = ar_alloc(cx->a, count * sizeof *t);
+    size_t *l = ar_alloc(cx->a, count * sizeof *l), k = 0, start = 0;
+    for (size_t i = 0; i <= n; i++) {
+        char c = i < n ? v[i] : ',';
+        if (i < n && quote) { if (c == '\\') i++; else if (c == quote) quote = 0; continue; }
+        if (i < n && (c == '"' || c == '\'')) { quote = c; continue; }
+        if (c == '(') depth++;
+        else if (c == ')') depth--;
+        else if (c == ',' && !depth) {
+            const char *s = v + start;
+            size_t m = (i < n ? i : n) - start;
+            trim(&s, &m);
+            if (!m) return -1;
+            t[k] = s; l[k++] = m;
+            start = i + 1;
+        }
+    }
+    *tok = t; *len = l;
+    return (int)k;
+}
+/* repeat( <count> , <values> ): the two arguments' text, when s is that whole function */
+static bool rule_repeat(const char *s, size_t n, const char **count, size_t *count_n, const char **values, size_t *values_n) {
+    if (n < 8 || !strn_ieq(s, "repeat(", 7)) return false;
+    const char *p = s + 7, *end = s + n, *comma = NULL;
+    int depth = 0;
+    for (; p < end; p++) {
+        if (*p == '(') depth++;
+        else if (*p == ')') { if (!depth) break; depth--; }
+        else if (*p == ',' && !depth && !comma) comma = p;
+    }
+    if (p != end - 1) return false; /* its closing bracket ends the part */
+    if (!comma) comma = p;
+    *count = s + 7; *count_n = (size_t)(comma - (s + 7));
+    *values = comma < p ? comma + 1 : p; *values_n = (size_t)(p - *values);
+    return true;
+}
+/* <integer [1,∞]> (a math function rounds to one) or auto */
+static bool rule_repeat_count(const char *s, size_t n, struct cx *cx, uint32_t *out) {
+    trim(&s, &n);
+    if (!n) return false;
+    if (ident_is(s, n, "auto")) { *out = CSS_RULE_AUTO; return true; }
+    size_t i = s[0] == '+' ? 1 : 0;
+    if (i < n && isdigit((unsigned char)s[i])) {
+        uint64_t v = 0;
+        for (; i < n; i++) {
+            if (!isdigit((unsigned char)s[i])) return false;
+            if (v < INT32_MAX) v = v * 10 + (uint64_t)(s[i] - '0');
+        }
+        if (v < 1) return false;
+        *out = v > INT32_MAX ? INT32_MAX : (uint32_t)v; /* integers beyond the range clamp */
+        return true;
+    }
+    float x;
+    if (!isalpha((unsigned char)s[0]) || !parse_number_value(s, n, cx, &x)) return false;
+    x = roundf(x);
+    if (!(x >= 1)) return false;
+    *out = x > (float)INT32_MAX ? INT32_MAX : (uint32_t)x;
+    return true;
+}
+/* §4.3: a <line-width> as a border width snaps (css-values-4 "snap as a border width") */
+static float rule_snap(float w) { return w > 0 && w < 1 ? 1 : floorf(w); }
+static bool rule_width(const char *s, size_t n, struct cx *cx, float *out) {
+    uint8_t k;
+    if (kw_find(kw_bwidth, s, n, &k)) { *out = k; return true; }
+    len_t l;
+    if (!parse_len(s, n, cx, &l, LF_NOPCT | LF_LENGTH) || (l.kind != LK_LEN && l.kind != LK_EXPR)) return false;
+    float px = len_resolve(&l, 0);
+    if (!isfinite(px) || px != len_resolve(&l, 100)) return false; /* a <length>: no percentage inside */
+    *out = rule_snap(px < 0 ? 0 : px); /* a math function clamps to the range */
+    return true;
+}
+/* one value of a list of kind */
+static bool rule_value(int kind, const char *s, size_t n, struct cx *cx, union css_rule_value *out) {
+    trim(&s, &n);
+    if (!n) return false;
+    if (kind == CSS_GAP_STYLE) return kw_find(kw_bstyle, s, n, &out->style);
+    if (kind == CSS_GAP_WIDTH) return rule_width(s, n, cx, &out->width);
+    return css_color_value_compute(s, n, cx, NULL, &out->color.argb, &out->color.exact);
+}
+static void rule_spec_word(sbuf *spec, const char *s, size_t n) {
+    if (!isalpha((unsigned char)s[0])) { shadow_specified_length(spec, s, n); return; }
+    for (size_t i = 0; i < n; i++) sb_putc(spec, (char)lower((unsigned char)s[i]));
+}
+/* §4.4 <gap-rule> = <line-width> || <line-style> || <color>, by list kind; the specified value
+   leaves out what is initial and orders the rest as the grammar does */
+static bool gap_rule(const char *s, size_t n, struct cx *cx, union css_rule_value v[3], sbuf *spec) {
+    const char *t[4];
+    size_t tl[4];
+    int k = split(s, n, t, tl, 4, ' ');
+    if (k < 1 || k > 3 || t[k - 1] + tl[k - 1] != s + n) return false;
+    int at[3] = {-1, -1, -1};
+    v[CSS_GAP_COLOR] = rule_initial_values[CSS_GAP_COLOR];
+    v[CSS_GAP_STYLE] = rule_initial_values[CSS_GAP_STYLE];
+    v[CSS_GAP_WIDTH] = rule_initial_values[CSS_GAP_WIDTH];
+    static const int order[3] = {CSS_GAP_STYLE, CSS_GAP_COLOR, CSS_GAP_WIDTH};
+    for (int i = 0; i < k; i++) {
+        int found = -1;
+        for (int j = 0; j < 3 && found < 0; j++)
+            if (at[order[j]] < 0 && rule_value(order[j], t[i], tl[i], cx, &v[order[j]])) found = order[j];
+        if (found < 0) return false;
+        at[found] = i;
+    }
+    if (!spec) return true;
+    size_t begin = spec->n;
+    int w = at[CSS_GAP_WIDTH], st = at[CSS_GAP_STYLE], c = at[CSS_GAP_COLOR];
+    if (w >= 0 && !ident_is(t[w], tl[w], "medium")) rule_spec_word(spec, t[w], tl[w]);
+    if (st >= 0 && !ident_is(t[st], tl[st], "none")) {
+        if (spec->n > begin) sb_putc(spec, ' ');
+        rule_spec_word(spec, t[st], tl[st]);
+    }
+    if (c >= 0) {
+        sbuf color = {0};
+        if (css_color_specified(t[c], tl[c], &color) && !ident_is(color.p, color.n, "currentcolor")) {
+            if (spec->n > begin) sb_putc(spec, ' ');
+            sb_put(spec, color.p, color.n);
+        }
+        sb_free(&color);
+    }
+    if (spec->n == begin) sb_puts(spec, "medium");
+    return true;
+}
+/* §4.1-4.5: a list of kind's values (kind RULE_GAP: the shorthand's <gap-rule-list>, into the three
+   lists at once, with its specified value in spec) with at most one auto repeater */
+enum { RULE_GAP = 3 };
+static bool rule_lists(int kind, const char *v, size_t n, struct cx *cx, struct css_rule_list out[3], sbuf *spec) {
+    const char **part;
+    size_t *part_n;
+    int parts = rule_parts(v, n, cx, &part, &part_n);
+    if (parts < 1) return false;
+    struct css_rule_item *items = ar_alloc(cx->a, (size_t)parts * sizeof *items);
+    const char ***text = ar_alloc(cx->a, (size_t)parts * sizeof *text);
+    size_t **text_n = ar_alloc(cx->a, (size_t)parts * sizeof *text_n);
+    uint64_t total = 0;
+    bool repeat_auto = false;
+    for (int i = 0; i < parts; i++) {
+        const char *count, *values;
+        size_t count_n, values_n;
+        if (rule_repeat(part[i], part_n[i], &count, &count_n, &values, &values_n)) {
+            uint32_t times;
+            if (!rule_repeat_count(count, count_n, cx, &times)) return false;
+            if (times == CSS_RULE_AUTO) { if (repeat_auto) return false; repeat_auto = true; }
+            int inner = rule_parts(values, values_n, cx, &text[i], &text_n[i]);
+            if (inner < 1) return false;
+            items[i] = (struct css_rule_item){times, (uint32_t)total, (uint32_t)inner};
+            total += (uint64_t)inner;
+        } else {
+            text[i] = &part[i]; text_n[i] = &part_n[i];
+            items[i] = (struct css_rule_item){0, (uint32_t)total, 1};
+            total++;
+        }
+        if (total > UINT32_MAX) return false;
+    }
+    int first = kind == RULE_GAP ? 0 : kind, last = kind == RULE_GAP ? 2 : kind;
+    union css_rule_value *values[3] = {NULL, NULL, NULL};
+    for (int l = first; l <= last; l++) values[l] = ar_alloc(cx->a, (size_t)total * sizeof *values[l]);
+    for (int i = 0; i < parts; i++) {
+        const struct css_rule_item *it = &items[i];
+        if (spec) {
+            if (i) sb_puts(spec, ", ");
+            if (it->repeat == CSS_RULE_AUTO) sb_puts(spec, "repeat(auto, ");
+            else if (it->repeat) { char number[16]; snprintf(number, sizeof number, "repeat(%u, ", it->repeat); sb_puts(spec, number); }
+        }
+        for (uint32_t j = 0; j < it->count; j++) {
+            if (spec && j) sb_puts(spec, ", ");
+            if (kind == RULE_GAP) {
+                union css_rule_value triple[3];
+                if (!gap_rule(text[i][j], text_n[i][j], cx, triple, spec)) return false;
+                for (int l = 0; l < 3; l++) values[l][it->first + j] = triple[l];
+            } else if (!rule_value(kind, text[i][j], text_n[i][j], cx, &values[kind][it->first + j])) return false;
+        }
+        if (spec && it->repeat) sb_putc(spec, ')');
+    }
+    for (int l = first; l <= last; l++) out[l] = (struct css_rule_list){items, values[l], (uint32_t)parts, (uint32_t)total};
+    return true;
+}
+/* <inset-value> (§3.3) */
+static bool rule_inset(const char *s, size_t n, struct cx *cx, struct css_rule_inset *out, sbuf *spec) {
+    trim(&s, &n);
+    if (ident_is(s, n, "overlap-join")) {
+        *out = (struct css_rule_inset){{.kind = LK_LEN}, true};
+        if (spec) sb_puts(spec, "overlap-join");
+        return true;
+    }
+    len_t l;
+    if (!parse_len(s, n, cx, &l, LF_NEG | LF_LENGTH) || (l.kind != LK_LEN && l.kind != LK_EXPR)) return false;
+    *out = (struct css_rule_inset){l, false};
+    if (spec) shadow_specified_length(spec, s, n);
+    return true;
+}
+/* the longhand names each GS_* sets on one axis, after its column- or row- */
+static const char *const gap_longhand_names[GS_INSET + 1][4] = {
+    [GS_RULE] = {"-rule-width", "-rule-style", "-rule-color"},
+    [GS_COLOR] = {"-rule-color"}, [GS_STYLE] = {"-rule-style"}, [GS_WIDTH] = {"-rule-width"},
+    [GS_BREAK] = {"-rule-break"}, [GS_ITEMS] = {"-rule-visibility-items"},
+    [GS_INSET_START] = {"-rule-inset-cap-start", "-rule-inset-junction-start"},
+    [GS_INSET_END] = {"-rule-inset-cap-end", "-rule-inset-junction-end"},
+    [GS_INSET_CAP] = {"-rule-inset-cap-start", "-rule-inset-cap-end"},
+    [GS_INSET_JUNCTION] = {"-rule-inset-junction-start", "-rule-inset-junction-end"},
+    [GS_INSET] = {"-rule-inset-cap-start", "-rule-inset-cap-end", "-rule-inset-junction-start", "-rule-inset-junction-end"},
+};
+static const struct propdef *find_prop(const char *name, size_t n);
+static const struct propdef *gap_longhand(int what, int axis, int i) {
+    const char *suffix = gap_longhand_names[what][i];
+    if (!suffix) return NULL;
+    char name[64];
+    snprintf(name, sizeof name, "%s%s", axis ? "row" : "column", suffix);
+    return find_prop(name, strlen(name));
+}
+/* the inset shorthands' values (§3.3.1-3.3.3) into inset in the longhands' order, each value's
+   specified text in spec (when given) */
+static bool rule_insets(int what, const char *v, size_t n, struct cx *cx, struct css_rule_inset inset[4], sbuf spec[4]) {
+    const char *half[3], *t[3];
+    size_t half_n[3], tn[3];
+    trim(&v, &n);
+    int halves = what == GS_INSET ? split(v, n, half, half_n, 3, '/') : 1;
+    if (what != GS_INSET) { half[0] = v; half_n[0] = n; }
+    if (halves < 1 || halves > 2 || half[halves - 1] + half_n[halves - 1] != v + n) return false;
+    int slot[2][2] = {{CSS_RULE_CAP_START, CSS_RULE_CAP_END}, {CSS_RULE_JUNCTION_START, CSS_RULE_JUNCTION_END}};
+    if (what == GS_INSET_JUNCTION) slot[0][0] = CSS_RULE_JUNCTION_START, slot[0][1] = CSS_RULE_JUNCTION_END;
+    int most = what == GS_INSET_START || what == GS_INSET_END ? 1 : 2;
+    for (int h = 0; h < halves; h++) {
+        if (!half_n[h]) return false;
+        int k = split(half[h], half_n[h], t, tn, 3, ' ');
+        if (k < 1 || k > most || t[k - 1] + tn[k - 1] != half[h] + half_n[h]) return false;
+        if (what == GS_INSET_START || what == GS_INSET_END) {
+            int a = what == GS_INSET_START ? CSS_RULE_CAP_START : CSS_RULE_CAP_END;
+            int b = what == GS_INSET_START ? CSS_RULE_JUNCTION_START : CSS_RULE_JUNCTION_END;
+            if (!rule_inset(t[0], tn[0], cx, &inset[a], spec ? &spec[a] : NULL)) return false;
+            inset[b] = inset[a];
+            if (spec) sb_put(&spec[b], spec[a].p, spec[a].n);
+            return true;
+        }
+        int a = slot[h][0], b = slot[h][1];
+        if (!rule_inset(t[0], tn[0], cx, &inset[a], spec ? &spec[a] : NULL) ||
+            !rule_inset(t[k - 1], tn[k - 1], cx, &inset[b], spec ? &spec[b] : NULL)) return false;
+    }
+    if (halves == 1 && what == GS_INSET) { /* the junction values are the cap ones */
+        inset[CSS_RULE_JUNCTION_START] = inset[CSS_RULE_CAP_START];
+        inset[CSS_RULE_JUNCTION_END] = inset[CSS_RULE_CAP_END];
+        if (spec) {
+            sb_put(&spec[CSS_RULE_JUNCTION_START], spec[CSS_RULE_CAP_START].p, spec[CSS_RULE_CAP_START].n);
+            sb_put(&spec[CSS_RULE_JUNCTION_END], spec[CSS_RULE_CAP_END].p, spec[CSS_RULE_CAP_END].n);
+        }
+    }
+    return true;
+}
+/* a gap decoration shorthand's value (what: GS_*) into one axis' values */
+static bool gap_shorthand_parse(int what, const char *v, size_t n, struct cx *cx, struct css_gap_axis *out, sbuf *spec,
+                                sbuf inset_spec[4]) {
+    switch (what) {
+    case GS_RULE: return rule_lists(RULE_GAP, v, n, cx, out->list, spec);
+    case GS_COLOR: return rule_lists(CSS_GAP_COLOR, v, n, cx, out->list, NULL);
+    case GS_STYLE: return rule_lists(CSS_GAP_STYLE, v, n, cx, out->list, NULL);
+    case GS_WIDTH: return rule_lists(CSS_GAP_WIDTH, v, n, cx, out->list, NULL);
+    case GS_BREAK: return kw_find(kw_rule_break, v, n, &out->rule_break);
+    case GS_ITEMS: return kw_find(kw_rule_items, v, n, &out->visibility);
+    }
+    return rule_insets(what, v, n, cx, out->inset, inset_spec);
+}
+/* a shorthand: the longhands no more important declaration set, written into one copy of the group */
+static bool set_long(const char *name, const char *v, size_t n, struct cx *cx);
+static bool gap_shorthand_apply(const struct propdef *p, const char *v, size_t n, bool global, struct cx *cx) {
+    int what = p->flags & 15;
+    if (global) {
+        for (int axis = 0; axis < 2; axis++)
+            if (p->flags & (axis ? GS_ROW : GS_COLUMN))
+                for (int i = 0; i < 4; i++) {
+                    const struct propdef *q = gap_longhand(what, axis, i);
+                    if (q) set_long(q->name, v, n, cx);
+                }
+        return true;
+    }
+    struct css_gap_axis parsed = css_gap_rules_initial.axis[0];
+    if (!gap_shorthand_parse(what, v, n, cx, &parsed, NULL, NULL)) return false;
+    if (cx->font_pass) return true;
+    struct css_gap_rules own = *css_style_gap_rules(cx->s);
+    bool written = false;
+    for (int axis = 0; axis < 2; axis++) {
+        if (!(p->flags & (axis ? GS_ROW : GS_COLUMN))) continue;
+        size_t base = offsetof(struct css_gap_rules, axis) + (size_t)axis * sizeof(struct css_gap_axis);
+        for (int i = 0; i < 4; i++) {
+            const struct propdef *q = gap_longhand(what, axis, i);
+            if (!q) continue;
+            int at = css_prop_index(q);
+            if (cx->set[at]) continue;
+            memcpy((char *)&own + q->off, (const char *)&parsed + (q->off - base), q->size);
+            cx->set[at] = 1;
+            written = true;
+        }
+    }
+    if (written) group_write(cx->s, G_GAP_RULE, &own, cx->a);
+    return true;
+}
+
+/* ---- serialization */
+static void rule_value_text(const style_t *st, int kind, const union css_rule_value *v, bool resolved, sbuf *out) {
+    if (kind == CSS_GAP_STYLE) { sb_puts(out, kw_name(kw_bstyle, v->style)); return; }
+    if (kind == CSS_GAP_WIDTH) { anim_unit(out, v->width, "px"); return; }
+    struct css_color_computed c;
+    css_color_held(v->color.argb, v->color.exact, st->color, &c);
+    if (!resolved) { anim_color_text(out, &c); return; }
+    struct css_color used = anim_color_used(st, &c);
+    css_color_serialize(&used, false, out);
+}
+static void rule_repeat_open(const struct css_rule_item *it, sbuf *out) {
+    if (it->repeat == CSS_RULE_AUTO) sb_puts(out, "repeat(auto, ");
+    else { char number[24]; snprintf(number, sizeof number, "repeat(%u, ", it->repeat); sb_puts(out, number); }
+}
+/* a list's computed value; resolved: currentcolor as the used colour (getComputedStyle), else as
+   the animation layer reads it back */
+static void rule_list_text(const style_t *st, int kind, const struct css_rule_list *l, bool resolved, sbuf *out) {
+    for (uint32_t i = 0; i < l->nitems; i++) {
+        const struct css_rule_item *it = &l->items[i];
+        if (i) sb_puts(out, ", ");
+        if (it->repeat) rule_repeat_open(it, out);
+        for (uint32_t j = 0; j < it->count; j++) {
+            if (j) sb_puts(out, ", ");
+            rule_value_text(st, kind, &l->values[it->first + j], resolved, out);
+        }
+        if (it->repeat) sb_putc(out, ')');
+    }
+}
+static bool rule_inset_text(const struct css_rule_inset *v, sbuf *out, web_doc *d) {
+    if (v->join) { sb_puts(out, "overlap-join"); return true; }
+    return css_length_serialize(&v->length, out, d);
+}
+/* §4.8: column-rule and row-rule from their longhands when they are repeater aligned (false: they
+   serialize as the empty string) */
+static bool rule_triple_text(const style_t *st, const struct css_gap_axis *x, sbuf *out) {
+    const struct css_rule_list *w = &x->list[CSS_GAP_WIDTH], *s = &x->list[CSS_GAP_STYLE], *c = &x->list[CSS_GAP_COLOR];
+    if (w->nitems != s->nitems || w->nitems != c->nitems) return false;
+    for (uint32_t i = 0; i < w->nitems; i++)
+        if (w->items[i].repeat != s->items[i].repeat || w->items[i].repeat != c->items[i].repeat ||
+            w->items[i].count != s->items[i].count || w->items[i].count != c->items[i].count) return false;
+    for (uint32_t i = 0; i < w->nitems; i++) {
+        const struct css_rule_item *it = &w->items[i];
+        if (i) sb_puts(out, ", ");
+        if (it->repeat) rule_repeat_open(it, out);
+        for (uint32_t j = 0; j < it->count; j++) {
+            if (j) sb_puts(out, ", ");
+            rule_value_text(st, CSS_GAP_WIDTH, &w->values[w->items[i].first + j], true, out);
+            sb_putc(out, ' ');
+            rule_value_text(st, CSS_GAP_STYLE, &s->values[s->items[i].first + j], true, out);
+            sb_putc(out, ' ');
+            rule_value_text(st, CSS_GAP_COLOR, &c->values[c->items[i].first + j], true, out);
+        }
+        if (it->repeat) sb_putc(out, ')');
+    }
+    return true;
+}
+/* a shorthand's value on one axis: false when its longhands have no common value */
+static bool gap_axis_text(const style_t *st, int what, const struct css_gap_axis *x, sbuf *out, web_doc *d) {
+    const struct css_rule_inset *in = x->inset;
+    switch (what) {
+    case GS_RULE: return rule_triple_text(st, x, out);
+    case GS_COLOR: rule_list_text(st, CSS_GAP_COLOR, &x->list[CSS_GAP_COLOR], true, out); return true;
+    case GS_STYLE: rule_list_text(st, CSS_GAP_STYLE, &x->list[CSS_GAP_STYLE], true, out); return true;
+    case GS_WIDTH: rule_list_text(st, CSS_GAP_WIDTH, &x->list[CSS_GAP_WIDTH], true, out); return true;
+    case GS_BREAK: sb_puts(out, kw_name(kw_rule_break, x->rule_break)); return true;
+    case GS_ITEMS: sb_puts(out, kw_name(kw_rule_items, x->visibility)); return true;
+    case GS_INSET_START: case GS_INSET_END: {
+        int a = what == GS_INSET_START ? CSS_RULE_CAP_START : CSS_RULE_CAP_END;
+        int b = what == GS_INSET_START ? CSS_RULE_JUNCTION_START : CSS_RULE_JUNCTION_END;
+        return rule_inset_equal(&in[a], &in[b]) && rule_inset_text(&in[a], out, d);
+    }
+    case GS_INSET_CAP: case GS_INSET_JUNCTION: {
+        int a = what == GS_INSET_CAP ? CSS_RULE_CAP_START : CSS_RULE_JUNCTION_START;
+        if (!rule_inset_text(&in[a], out, d)) return false;
+        if (rule_inset_equal(&in[a], &in[a + 1])) return true;
+        sb_putc(out, ' ');
+        return rule_inset_text(&in[a + 1], out, d);
+    }
+    }
+    /* <'column-rule-inset-cap'> [ / <'column-rule-inset-junction'> ]?: one value when the four agree */
+    bool same = true;
+    for (int i = 1; i < 4; i++) same &= rule_inset_equal(&in[0], &in[i]);
+    if (same) return rule_inset_text(&in[0], out, d);
+    return rule_inset_text(&in[0], out, d) && (sb_putc(out, ' '), rule_inset_text(&in[1], out, d)) &&
+           (sb_puts(out, " / "), rule_inset_text(&in[2], out, d)) && (sb_putc(out, ' '), rule_inset_text(&in[3], out, d));
+}
+static int gap_computed(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d) {
+    const struct css_gap_rules *g = css_style_gap_rules(st);
+    size_t begin = out->n;
+    if (p->type == PT_RULE_LIST) { rule_list_text(st, p->flags, (const struct css_rule_list *)field_of(st, p), true, out); return 1; }
+    if (p->type == PT_RULE_INSET) return rule_inset_text((const struct css_rule_inset *)field_of(st, p), out, d) ? 1 : -1;
+    int what = p->flags & 15;
+    bool column = p->flags & GS_COLUMN, row = p->flags & GS_ROW, ok = true;
+    if (column) ok = gap_axis_text(st, what, &g->axis[0], out, d);
+    if (ok && row) {
+        if (!column) ok = gap_axis_text(st, what, &g->axis[1], out, d);
+        else { /* the bidirectional shorthands: both axes' values, when they agree */
+            sbuf other = {0};
+            ok = gap_axis_text(st, what, &g->axis[1], &other, d) && other.n == out->n - begin &&
+                 !memcmp(other.p, out->p + begin, other.n);
+            sb_free(&other);
+        }
+    }
+    if (!ok) { out->n = begin; sb_cstr(out); }
+    return 1;
+}
+/* CSSOM: a declared value's specified serialization; false leaves the authored text */
+static bool gap_specified(const struct propdef *p, const char *v, size_t n, sbuf *out) {
+    int what = p->type == PT_SHORT ? p->flags & 15 : -1;
+    if (p->type != PT_RULE_INSET && what != GS_RULE && what < GS_INSET_START) return false;
+    if (memchr(v, '\\', n)) return false;
+    for (size_t i = 0; i + 4 <= n; i++) if (strn_ieq(v + i, "var(", 4)) return false;
+    arena_t arena = {.chunk_size = 4096};
+    jmp_buf trap;
+    arena.trap = &trap;
+    size_t begin = out->n;
+    volatile bool ok = false;
+    sbuf spec[4] = {{0}};
+    if (!setjmp(trap)) {
+        struct cx cx = {.em = 16, .rem = 16, .vw = 800, .vh = 600, .a = &arena};
+        struct css_gap_axis parsed = css_gap_rules_initial.axis[0];
+        if (p->type == PT_RULE_INSET) ok = rule_inset(v, n, &cx, &parsed.inset[0], out);
+        else if (what == GS_RULE) ok = rule_lists(RULE_GAP, v, n, &cx, parsed.list, out);
+        else if ((ok = gap_shorthand_parse(what, v, n, &cx, &parsed, NULL, spec))) {
+            /* the shortest form of the specified values, as the computed ones' */
+            int a = what == GS_INSET_JUNCTION ? CSS_RULE_JUNCTION_START : what == GS_INSET_END ? CSS_RULE_CAP_END : 0;
+            int count = what == GS_INSET ? 4 : what == GS_INSET_START || what == GS_INSET_END ? 1 : 2;
+            bool same = true;
+            for (int i = 1; i < count; i++)
+                same &= spec[a + i].n == spec[a].n && !memcmp(spec[a + i].p, spec[a].p, spec[a].n);
+            for (int i = 0; i < (same ? 1 : count); i++) {
+                if (i) sb_puts(out, i == 2 ? " / " : " ");
+                sb_put(out, spec[a + i].p, spec[a + i].n);
+            }
+        }
+    }
+    for (int i = 0; i < 4; i++) sb_free(&spec[i]);
+    ar_free(&arena);
+    if (!ok) out->n = begin;
+    sb_cstr(out);
+    return ok;
+}
+
+/* ---------------------------------------------------------------- anchor positioning */
+/* css-anchor-position-1: the values of the anchor group's properties, and anchor() and
+   anchor-size() in lengths. Layout (layout.c) finds the anchors and resolves the functions. */
+const struct css_anchor css_anchor_initial = {.visibility = CSS_VISIBLE_ANCHOR_VISIBLE};
+
+static bool dashed_ident(const char *s, size_t n) {
+    if (n < 3 || s[0] != '-' || s[1] != '-') return false;
+    for (size_t i = 2; i < n; i++)
+        if ((unsigned char)s[i] < 128 && !isalnum((unsigned char)s[i]) && s[i] != '-' && s[i] != '_') return false;
+    return true;
+}
+static bool anchor_text(sbuf *out, const char *s) { return length_append(out, s, strlen(s)); }
+static bool same_name(const char *a, const char *b) { return a == b || (a && b && !strcmp(a, b)); }
+
+/* <position-area> keywords (§3.1.2); a keyword is its index here */
+static const struct css_area_keyword area_keywords[] = {
+    {NULL, 0, 0, 0},
+    {"center", 0, CSS_AREA_CENTER, 0}, {"span-all", 0, CSS_AREA_SPAN_ALL, 0},
+#define AREA_AXIS(family, writing, start, end, span_start, span_end) \
+    {start, family, CSS_AREA_START, writing}, {end, family, CSS_AREA_END, writing}, \
+    {span_start, family, CSS_AREA_SPAN_START, writing}, {span_end, family, CSS_AREA_SPAN_END, writing}
+    AREA_AXIS(CSS_AREA_X, 0, "left", "right", "span-left", "span-right"),
+    AREA_AXIS(CSS_AREA_X, 1, "x-start", "x-end", "span-x-start", "span-x-end"),
+    AREA_AXIS(CSS_AREA_X, 2, "self-x-start", "self-x-end", "span-self-x-start", "span-self-x-end"),
+    AREA_AXIS(CSS_AREA_Y, 0, "top", "bottom", "span-top", "span-bottom"),
+    AREA_AXIS(CSS_AREA_Y, 1, "y-start", "y-end", "span-y-start", "span-y-end"),
+    AREA_AXIS(CSS_AREA_Y, 2, "self-y-start", "self-y-end", "span-self-y-start", "span-self-y-end"),
+    AREA_AXIS(CSS_AREA_BLOCK, 1, "block-start", "block-end", "span-block-start", "span-block-end"),
+    AREA_AXIS(CSS_AREA_INLINE, 1, "inline-start", "inline-end", "span-inline-start", "span-inline-end"),
+    AREA_AXIS(CSS_AREA_SELF_BLOCK, 2, "self-block-start", "self-block-end", "span-self-block-start",
+              "span-self-block-end"),
+    AREA_AXIS(CSS_AREA_SELF_INLINE, 2, "self-inline-start", "self-inline-end", "span-self-inline-start",
+              "span-self-inline-end"),
+    AREA_AXIS(CSS_AREA_LOGICAL, 1, "start", "end", "span-start", "span-end"),
+    AREA_AXIS(CSS_AREA_SELF_LOGICAL, 2, "self-start", "self-end", "span-self-start", "span-self-end"),
+#undef AREA_AXIS
+};
+#define AREA_KEYWORDS (sizeof area_keywords / sizeof *area_keywords)
+const struct css_area_keyword *css_area_keyword(uint8_t keyword) {
+    return keyword && keyword < AREA_KEYWORDS ? &area_keywords[keyword] : NULL;
+}
+static uint8_t area_lookup(const char *s, size_t n) {
+    for (uint8_t i = 1; i < AREA_KEYWORDS; i++) if (ident_is(s, n, area_keywords[i].name)) return i;
+    return 0;
+}
+static uint8_t area_find(uint8_t family, uint8_t track) {
+    if (track == CSS_AREA_CENTER) return 1;
+    if (track == CSS_AREA_SPAN_ALL) return 2;
+    for (uint8_t i = 3; i < AREA_KEYWORDS; i++)
+        if (area_keywords[i].family == family && area_keywords[i].track == track) return i;
+    return 0;
+}
+static uint8_t area_family(uint8_t k) { return k < AREA_KEYWORDS ? area_keywords[k].family : 0; }
+static bool area_ambiguous(uint8_t family) {
+    return !family || family == CSS_AREA_LOGICAL || family == CSS_AREA_SELF_LOGICAL;
+}
+/* a <position-area>: written, its keywords in their axes' order; computed, with the ambiguous
+   logical keywords made the long ones of their axes (§3.1.3). false: not one. */
+static bool parse_position_area(const char *v, size_t n, uint8_t written[2], uint8_t computed[2]) {
+    const char *t[3]; size_t tl[3];
+    int k = split(v, n, t, tl, 3, ' ');
+    if (k < 1 || k > 2) return false;
+    uint8_t a = area_lookup(t[0], tl[0]), b = k == 2 ? area_lookup(t[1], tl[1]) : 0;
+    if (!a || (k == 2 && !b)) return false;
+    uint8_t fa = area_family(a), fb = area_family(b);
+    if (k == 1) {
+        /* §3.1.2: an unambiguous keyword alone spans the other axis; an ambiguous one is repeated */
+        if (area_ambiguous(fa)) b = a;
+        else if (fa == CSS_AREA_X || fa == CSS_AREA_BLOCK || fa == CSS_AREA_SELF_BLOCK) b = 2;
+        else { b = a; a = 2; }
+    } else if (fa && fb) {
+        bool pair = (fa == CSS_AREA_X && fb == CSS_AREA_Y) || (fa == CSS_AREA_BLOCK && fb == CSS_AREA_INLINE) ||
+            (fa == CSS_AREA_SELF_BLOCK && fb == CSS_AREA_SELF_INLINE);
+        bool flipped = (fb == CSS_AREA_X && fa == CSS_AREA_Y) || (fb == CSS_AREA_BLOCK && fa == CSS_AREA_INLINE) ||
+            (fb == CSS_AREA_SELF_BLOCK && fa == CSS_AREA_SELF_INLINE);
+        if (flipped) { uint8_t x = a; a = b; b = x; }
+        else if (!pair && !(fa == fb && (fa == CSS_AREA_LOGICAL || fa == CSS_AREA_SELF_LOGICAL))) return false;
+    } else if (fa || fb) {
+        /* center or span-all refers to the other keyword's opposite axis */
+        uint8_t f = fa ? fa : fb, keyword = fa ? a : b, other = fa ? b : a;
+        if (f == CSS_AREA_X || f == CSS_AREA_BLOCK || f == CSS_AREA_SELF_BLOCK) { a = keyword; b = other; }
+        else if (f == CSS_AREA_Y || f == CSS_AREA_INLINE || f == CSS_AREA_SELF_INLINE) { a = other; b = keyword; }
+    }
+    written[0] = a; written[1] = b;
+    for (int i = 0; i < 2; i++) {
+        uint8_t f = area_family(written[i]), keyword = written[i];
+        if (f == CSS_AREA_LOGICAL) keyword = area_find(i ? CSS_AREA_INLINE : CSS_AREA_BLOCK, area_keywords[keyword].track);
+        else if (f == CSS_AREA_SELF_LOGICAL)
+            keyword = area_find(i ? CSS_AREA_SELF_INLINE : CSS_AREA_SELF_BLOCK, area_keywords[keyword].track);
+        computed[i] = keyword;
+    }
+    return true;
+}
+/* a written <position-area> (CSSOM's specified value): span-all beside an unambiguous keyword and a
+   repeated keyword are left out */
+static bool area_written_text(sbuf *out, const uint8_t a[2]) {
+    uint8_t fa = area_family(a[0]), fb = area_family(a[1]);
+    if (a[0] == 2 && !area_ambiguous(fb)) return anchor_text(out, area_keywords[a[1]].name);
+    if (a[1] == 2 && !area_ambiguous(fa)) return anchor_text(out, area_keywords[a[0]].name);
+    if (a[0] == a[1]) return anchor_text(out, area_keywords[a[0]].name);
+    return anchor_text(out, area_keywords[a[0]].name) && anchor_text(out, " ") && anchor_text(out, area_keywords[a[1]].name);
+}
+/* a computed one (§3.1.3): logical keywords in their short forms, unless span-all leaves one alone */
+static bool area_computed_text(sbuf *out, const uint8_t a[2]) {
+    if (!a[0]) return anchor_text(out, "none");
+    uint8_t fa = area_family(a[0]), fb = area_family(a[1]);
+    if (!fa && !fb) {
+        if (a[0] == a[1]) return anchor_text(out, area_keywords[a[0]].name);
+    } else if (a[0] == 2) return anchor_text(out, area_keywords[a[1]].name);
+    else if (a[1] == 2) return anchor_text(out, area_keywords[a[0]].name);
+    uint8_t shown[2] = {a[0], a[1]};
+    for (int i = 0; i < 2; i++) {
+        uint8_t f = area_family(a[i]);
+        if (f == CSS_AREA_BLOCK || f == CSS_AREA_INLINE) shown[i] = area_find(CSS_AREA_LOGICAL, area_keywords[a[i]].track);
+        else if (f == CSS_AREA_SELF_BLOCK || f == CSS_AREA_SELF_INLINE)
+            shown[i] = area_find(CSS_AREA_SELF_LOGICAL, area_keywords[a[i]].track);
+    }
+    if (shown[0] == shown[1]) return anchor_text(out, area_keywords[shown[0]].name);
+    return anchor_text(out, area_keywords[shown[0]].name) && anchor_text(out, " ") &&
+        anchor_text(out, area_keywords[shown[1]].name);
+}
+
+/* none | <dashed-ident># (anchor-name; anchor-scope also all) */
+static bool parse_anchor_names(const char *v, size_t n, struct cx *cx, bool scope, struct css_anchor_names *out) {
+    *out = (struct css_anchor_names){0};
+    if (ident_is(v, n, "none")) return true;
+    if (scope && ident_is(v, n, "all")) { out->all = true; return true; }
+    uint32_t count = 1;
+    for (size_t i = 0; i < n; i++) if (v[i] == ',') count++;
+    const char **names = ar_alloc(cx->a, count * sizeof *names);
+    uint32_t got = 0;
+    for (const char *p = v, *e = v + n; got < count; got++) {
+        const char *comma = memchr(p, ',', (size_t)(e - p)), *end = comma ? comma : e;
+        const char *name = p; size_t length = (size_t)(end - p);
+        trim(&name, &length);
+        if (!dashed_ident(name, length)) return false;
+        names[got] = ar_strndup(cx->a, name, length);
+        if (!comma) { got++; break; }
+        p = comma + 1;
+    }
+    if (got != count) return false;
+    out->name = names; out->count = count;
+    return true;
+}
+static bool anchor_names_text(sbuf *out, const struct css_anchor_names *names, bool scope) {
+    if (scope && names->all) return anchor_text(out, "all");
+    if (!names->count) return anchor_text(out, "none");
+    for (uint32_t i = 0; i < names->count; i++)
+        if ((i && !anchor_text(out, ", ")) || !anchor_text(out, names->name[i])) return false;
+    return true;
+}
+static bool anchor_names_equal(const struct css_anchor_names *a, const struct css_anchor_names *b) {
+    if (a->count != b->count || a->all != b->all) return false;
+    for (uint32_t i = 0; i < a->count; i++) if (strcmp(a->name[i], b->name[i])) return false;
+    return true;
+}
+
+/* position-try-fallbacks (§6.1): none | [ [<dashed-ident> || <try-tactic>] | <position-area> ]# */
+static const struct kw kw_try_tactic[] = {{"flip-block", CSS_TRY_FLIP_BLOCK}, {"flip-inline", CSS_TRY_FLIP_INLINE},
+    {"flip-start", CSS_TRY_FLIP_START}, {"flip-x", CSS_TRY_FLIP_X}, {"flip-y", CSS_TRY_FLIP_Y}, {0}};
+static bool parse_try_option(const char *v, size_t n, struct cx *cx, struct css_position_try *out) {
+    *out = (struct css_position_try){0};
+    uint8_t written[2];
+    if (parse_position_area(v, n, written, out->area)) return true;
+    const char *t[7]; size_t tl[7];
+    int k = split(v, n, t, tl, 7, ' ');
+    if (k < 1 || k > 6) return false;
+    for (int i = 0; i < k; i++) {
+        uint8_t tactic;
+        if (dashed_ident(t[i], tl[i])) {
+            /* the name before or after the tactics, once */
+            if (out->rule || (i && i != k - 1)) return false;
+            out->rule = ar_strndup(cx->a, t[i], tl[i]);
+            continue;
+        }
+        if (!kw_find(kw_try_tactic, t[i], tl[i], &tactic)) return false;
+        for (int j = 0; j < out->tactics; j++) if (out->tactic[j] == tactic) return false;
+        if (out->tactics == 5) return false;
+        out->tactic[out->tactics++] = tactic;
+    }
+    return true;
+}
+static bool parse_try_fallbacks(const char *v, size_t n, struct cx *cx, struct css_position_tries *out) {
+    *out = (struct css_position_tries){0};
+    if (ident_is(v, n, "none")) return true;
+    uint32_t count = 1;
+    for (size_t i = 0; i < n; i++) if (v[i] == ',') count++;
+    struct css_position_try *options = ar_alloc(cx->a, count * sizeof *options);
+    const char *p = v, *e = v + n;
+    for (uint32_t i = 0; i < count; i++) {
+        const char *comma = memchr(p, ',', (size_t)(e - p)), *end = comma ? comma : e;
+        const char *item = p; size_t length = (size_t)(end - p);
+        trim(&item, &length);
+        if (!length || !parse_try_option(item, length, cx, &options[i])) return false;
+        p = comma ? comma + 1 : e;
+    }
+    out->option = options; out->count = count;
+    return true;
+}
+static bool try_option_text(sbuf *out, const struct css_position_try *o) {
+    if (o->area[0]) return area_computed_text(out, o->area);
+    bool space = false;
+    if (o->rule) { if (!anchor_text(out, o->rule)) return false; space = true; }
+    for (int i = 0; i < o->tactics; i++) {
+        if ((space && !anchor_text(out, " ")) || !anchor_text(out, kw_name(kw_try_tactic, o->tactic[i]))) return false;
+        space = true;
+    }
+    return true;
+}
+static bool try_fallbacks_text(sbuf *out, const struct css_position_tries *t) {
+    if (!t->count) return anchor_text(out, "none");
+    for (uint32_t i = 0; i < t->count; i++)
+        if ((i && !anchor_text(out, ", ")) || !try_option_text(out, &t->option[i])) return false;
+    return true;
+}
+static bool try_option_equal(const struct css_position_try *a, const struct css_position_try *b) {
+    return same_name(a->rule, b->rule) && a->tactics == b->tactics &&
+        !memcmp(a->tactic, b->tactic, a->tactics) && a->area[0] == b->area[0] && a->area[1] == b->area[1];
+}
+
+/* position-visibility (§6.6): always | [ anchor-valid || anchor-visible || no-overflow ] */
+static const struct kw kw_visibility_bits[] = {{"anchor-valid", CSS_VISIBLE_ANCHOR_VALID},
+    {"anchor-visible", CSS_VISIBLE_ANCHOR_VISIBLE}, {"no-overflow", CSS_VISIBLE_NO_OVERFLOW}, {0}};
+static bool parse_position_visibility(const char *v, size_t n, uint8_t *out) {
+    if (ident_is(v, n, "always")) { *out = 0; return true; }
+    const char *t[4]; size_t tl[4];
+    int k = split(v, n, t, tl, 4, ' ');
+    if (k < 1 || k > 3) return false;
+    uint8_t bits = 0;
+    for (int i = 0; i < k; i++) {
+        uint8_t bit;
+        if (!kw_find(kw_visibility_bits, t[i], tl[i], &bit) || (bits & bit)) return false;
+        bits |= bit;
+    }
+    *out = bits;
+    return true;
+}
+static bool position_visibility_text(sbuf *out, uint8_t bits) {
+    if (!bits) return anchor_text(out, "always");
+    bool first = true;
+    for (const struct kw *k = kw_visibility_bits; k->name; k++)
+        if (bits & k->v) {
+            if ((!first && !anchor_text(out, " ")) || !anchor_text(out, k->name)) return false;
+            first = false;
+        }
+    return true;
+}
+
+/* a PT_ANCHOR value into field (the group's copy); specified: also its CSSOM serialization */
+static bool anchor_value_parse(uint8_t which, const char *v, size_t n, struct cx *cx, void *field, sbuf *specified) {
+    trim(&v, &n);
+    if (!n) return false;
+    switch (which) {
+    case CSS_ANCHOR_NAME: case CSS_ANCHOR_SCOPE: {
+        struct css_anchor_names names;
+        if (!parse_anchor_names(v, n, cx, which == CSS_ANCHOR_SCOPE, &names)) return false;
+        *(struct css_anchor_names *)field = names;
+        return !specified || anchor_names_text(specified, &names, which == CSS_ANCHOR_SCOPE);
+    }
+    case CSS_POSITION_ANCHOR: {
+        static const struct kw kinds[] = {{"normal", CSS_ANCHOR_NORMAL}, {"none", CSS_ANCHOR_NONE},
+            {"auto", CSS_ANCHOR_AUTO}, {"match-parent", CSS_ANCHOR_MATCH_PARENT}, {0}};
+        struct css_position_anchor anchor = {0};
+        if (!kw_find(kinds, v, n, &anchor.kind)) {
+            if (!dashed_ident(v, n)) return false;
+            anchor.kind = CSS_ANCHOR_NAMED;
+            anchor.name = ar_strndup(cx->a, v, n);
+        }
+        *(struct css_position_anchor *)field = anchor;
+        return !specified || anchor_text(specified, anchor.name ? anchor.name : kw_name(kinds, anchor.kind));
+    }
+    case CSS_POSITION_AREA: {
+        uint8_t written[2] = {0}, computed[2] = {0};
+        if (!ident_is(v, n, "none") && !parse_position_area(v, n, written, computed)) return false;
+        memcpy(field, computed, 2);
+        return !specified || (written[0] ? area_written_text(specified, written) : anchor_text(specified, "none"));
+    }
+    case CSS_POSITION_TRY_FALLBACKS: {
+        struct css_position_tries tries;
+        if (!parse_try_fallbacks(v, n, cx, &tries)) return false;
+        *(struct css_position_tries *)field = tries;
+        if (!specified) return true;
+        if (!tries.count) return anchor_text(specified, "none");
+        /* a <position-area> option serializes as written */
+        const char *p = v, *e = v + n;
+        for (uint32_t i = 0; i < tries.count; i++) {
+            const char *comma = memchr(p, ',', (size_t)(e - p)), *end = comma ? comma : e;
+            const char *item = p; size_t length = (size_t)(end - p);
+            trim(&item, &length);
+            uint8_t written[2], computed[2];
+            if (i && !anchor_text(specified, ", ")) return false;
+            if (tries.option[i].area[0]) {
+                if (!parse_position_area(item, length, written, computed) || !area_written_text(specified, written)) return false;
+            } else if (!try_option_text(specified, &tries.option[i])) return false;
+            p = comma ? comma + 1 : e;
+        }
+        return true;
+    }
+    case CSS_POSITION_VISIBILITY: {
+        uint8_t bits;
+        if (!parse_position_visibility(v, n, &bits)) return false;
+        *(uint8_t *)field = bits;
+        return !specified || position_visibility_text(specified, bits);
+    }
+    }
+    return false;
+}
+static bool anchor_value_text(uint8_t which, const void *field, sbuf *out) {
+    switch (which) {
+    case CSS_ANCHOR_NAME: case CSS_ANCHOR_SCOPE:
+        return anchor_names_text(out, field, which == CSS_ANCHOR_SCOPE);
+    case CSS_POSITION_ANCHOR: {
+        const struct css_position_anchor *a = field;
+        static const char *const kinds[] = {"normal", "none", "auto", NULL, "match-parent"};
+        return anchor_text(out, a->kind == CSS_ANCHOR_NAMED ? a->name : kinds[a->kind < 5 ? a->kind : 0]);
+    }
+    case CSS_POSITION_AREA: return area_computed_text(out, field);
+    case CSS_POSITION_TRY_FALLBACKS: return try_fallbacks_text(out, field);
+    case CSS_POSITION_VISIBILITY: return position_visibility_text(out, *(const uint8_t *)field);
+    }
+    return false;
+}
+static bool anchor_value_equal(uint8_t which, const void *a, const void *b) {
+    switch (which) {
+    case CSS_ANCHOR_NAME: case CSS_ANCHOR_SCOPE: return anchor_names_equal(a, b);
+    case CSS_POSITION_ANCHOR: {
+        const struct css_position_anchor *x = a, *y = b;
+        return x->kind == y->kind && same_name(x->name, y->name);
+    }
+    case CSS_POSITION_AREA: return !memcmp(a, b, 2);
+    case CSS_POSITION_TRY_FALLBACKS: {
+        const struct css_position_tries *x = a, *y = b;
+        if (x->count != y->count) return false;
+        for (uint32_t i = 0; i < x->count; i++) if (!try_option_equal(&x->option[i], &y->option[i])) return false;
+        return true;
+    }
+    case CSS_POSITION_VISIBILITY: return *(const uint8_t *)a == *(const uint8_t *)b;
+    }
+    return false;
+}
+bool css_anchor_equal(const struct css_anchor *a, const struct css_anchor *b) {
+    if (!a) a = &css_anchor_initial;
+    if (!b) b = &css_anchor_initial;
+    return a == b || (anchor_names_equal(&a->name, &b->name) && anchor_names_equal(&a->scope, &b->scope) &&
+        anchor_value_equal(CSS_POSITION_ANCHOR, &a->position_anchor, &b->position_anchor) &&
+        !memcmp(a->area, b->area, 2) && anchor_value_equal(CSS_POSITION_TRY_FALLBACKS, &a->tries, &b->tries) &&
+        a->try_order == b->try_order && a->visibility == b->visibility);
+}
+
+/* the position-try shorthand (§6.3): <'position-try-order'>? <'position-try-fallbacks'> */
+static bool parse_position_try(const char *v, size_t n, struct cx *cx, uint8_t *order, struct css_position_tries *tries,
+                               sbuf *specified) {
+    trim(&v, &n);
+    *order = CSS_TRY_ORDER_NORMAL;
+    size_t first = 0;
+    while (first < n && !is_space((unsigned char)v[first]) && v[first] != ',') first++;
+    const char *rest = v; size_t rest_n = n;
+    if (first < n && is_space((unsigned char)v[first]) && kw_find(kw_try_order, v, first, order)) {
+        rest = v + first; rest_n = n - first; trim(&rest, &rest_n);
+    }
+    if (!rest_n) return false;
+    if (!specified) return parse_try_fallbacks(rest, rest_n, cx, tries);
+    if (*order != CSS_TRY_ORDER_NORMAL &&
+        (!anchor_text(specified, kw_name(kw_try_order, *order)) || !anchor_text(specified, " "))) return false;
+    return anchor_value_parse(CSS_POSITION_TRY_FALLBACKS, rest, rest_n, cx, tries, specified);
+}
+
+/* anchor() and anchor-size() (§3.2, §5.1) */
+static const struct kw kw_anchor_side[] = {{"inside", CSS_SIDE_INSIDE}, {"outside", CSS_SIDE_OUTSIDE},
+    {"top", CSS_SIDE_TOP}, {"left", CSS_SIDE_LEFT}, {"right", CSS_SIDE_RIGHT}, {"bottom", CSS_SIDE_BOTTOM},
+    {"start", CSS_SIDE_START}, {"end", CSS_SIDE_END}, {"self-start", CSS_SIDE_SELF_START},
+    {"self-end", CSS_SIDE_SELF_END}, {"center", CSS_SIDE_CENTER}, {0}};
+static const struct kw kw_anchor_size[] = {{"width", CSS_SIZE_WIDTH}, {"height", CSS_SIZE_HEIGHT},
+    {"block", CSS_SIZE_BLOCK}, {"inline", CSS_SIZE_INLINE}, {"self-block", CSS_SIZE_SELF_BLOCK},
+    {"self-inline", CSS_SIZE_SELF_INLINE}, {0}};
+/* an <anchor-side>'s <percentage>: a percentage token, or a math function of type <percentage> */
+static bool anchor_percentage(const char *v, size_t n, const struct cx *cx, arena_t *a, float *out, bool *function) {
+    const char *q = v;
+    float x;
+    if (parse_number(&q, v + n, &x) && q + 1 == v + n && *q == '%') { *out = x; *function = false; return true; }
+    double value;
+    /* against a basis of 100: its value is the percentage's number */
+    if (!css_calc_is_math(v, n) || !css_numeric_read(v, n, CSS_CALC_PERCENT, cx, a, 100, &value, NULL) || !isfinite(value))
+        return false;
+    *out = (float)value;
+    *function = true;
+    return true;
+}
+const struct css_anchor_function *css_anchor_function_read(struct css_calc_parse *P, const char **s, const char *e,
+                                                           bool size) {
+    if (!P || !P->cx || P->cx->anchor_depth > 32) return NULL;
+    /* the fallback is a length of the same element, which may hold the same anchor functions */
+    struct cx cx = *P->cx;
+    cx.a = P->a;
+    cx.anchor_functions = P->anchors;
+    cx.anchor_depth++;
+    const char *begin = *s, *p = begin, *comma = NULL;
+    int depth = 0;
+    char quote = 0;
+    for (; p < e; p++) {
+        if (quote) { if (*p == '\\' && p + 1 < e) p++; else if (*p == quote) quote = 0; continue; }
+        if (*p == '"' || *p == '\'') quote = *p;
+        else if (*p == '(') depth++;
+        else if (*p == ')') { if (!depth) break; depth--; }
+        else if (*p == ',' && !depth && !comma) comma = p;
+    }
+    if (p >= e) return NULL;
+    *s = p + 1;
+    struct css_anchor_function *f = ar_alloc(cx.a, sizeof *f);
+    f->size = size;
+    const char *head = begin, *fallback = comma ? comma + 1 : NULL;
+    size_t head_n = (size_t)((comma ? comma : p) - begin), fallback_n = comma ? (size_t)(p - comma - 1) : 0;
+    trim(&head, &head_n);
+    const char *t[3]; size_t tl[3];
+    int k = head_n ? split(head, head_n, t, tl, 3, ' ') : 0;
+    if (k > 2 || (comma && !k)) return NULL;
+    uint8_t kw;
+    /* anchor-size(<length-percentage>): only the fallback */
+    if (size && !comma && k == 1 && !dashed_ident(t[0], tl[0]) && !kw_find(kw_anchor_size, t[0], tl[0], &kw)) {
+        fallback = head; fallback_n = head_n; k = 0;
+    }
+    bool side = false;
+    for (int i = 0; i < k; i++) {
+        if (dashed_ident(t[i], tl[i]) && !f->name) { f->name = ar_strndup(cx.a, t[i], tl[i]); continue; }
+        if (side) return NULL;
+        if (size) {
+            if (!kw_find(kw_anchor_size, t[i], tl[i], &kw)) return NULL;
+            f->side = kw;
+        } else if (kw_find(kw_anchor_side, t[i], tl[i], &kw)) f->side = kw;
+        else if (anchor_percentage(t[i], tl[i], &cx, cx.a, &f->percent, &f->percent_function)) f->side = CSS_SIDE_PERCENT;
+        else return NULL;
+        side = true;
+    }
+    if (!size && !side) return NULL;
+    if (fallback) {
+        trim(&fallback, &fallback_n);
+        if (!fallback_n || !parse_len(fallback, fallback_n, &cx, &f->fallback, LF_NEG | LF_LENGTH | P->anchors))
+            return NULL;
+        f->fallback_given = true;
+    }
+    return f;
+}
+bool css_anchor_function_text(sbuf *out, const struct css_anchor_function *f) {
+    if (!f || !anchor_text(out, f->size ? "anchor-size(" : "anchor(")) return false;
+    bool any = false;
+    if (f->name) { if (!anchor_text(out, f->name)) return false; any = true; }
+    if (!f->size || f->side != CSS_SIZE_IMPLIED) {
+        if (any && !anchor_text(out, " ")) return false;
+        if (f->size) { if (!anchor_text(out, kw_name(kw_anchor_size, f->side))) return false; }
+        else if (f->side != CSS_SIDE_PERCENT) { if (!anchor_text(out, kw_name(kw_anchor_side, f->side))) return false; }
+        else if ((f->percent_function && !anchor_text(out, "calc(")) || !length_number(out, f->percent, "%") ||
+                 (f->percent_function && !anchor_text(out, ")"))) return false;
+        any = true;
+    }
+    if (f->fallback_given && ((any && !anchor_text(out, ", ")) || !css_length_serialize(&f->fallback, out, NULL))) return false;
+    return anchor_text(out, ")");
+}
+bool css_anchor_function_equal(const struct css_anchor_function *a, const struct css_anchor_function *b) {
+    if (a == b) return true;
+    if (!a || !b || a->size != b->size || a->side != b->side || a->percent != b->percent ||
+        a->percent_function != b->percent_function || !same_name(a->name, b->name) ||
+        a->fallback_given != b->fallback_given) return false;
+    return !a->fallback_given || css_length_equal(&a->fallback, &b->fallback);
+}
+bool css_length_anchored(const len_t *l) { return l && l->kind == LK_EXPR && css_calc_anchored(l->expr); }
+/* css_length_resolve_anchors: each anchor function as resolve gives it, else its fallback (whose own
+   anchor functions resolve the same way) */
+struct anchor_resolution { css_anchor_resolver resolve; void *context; unsigned axis; int inset; unsigned depth; };
+static struct css_calc *anchor_resolved(void *context, arena_t *a, const struct css_anchor_function *f) {
+    struct anchor_resolution *r = context;
+    float px;
+    if (r->resolve && r->resolve(r->context, f, r->axis, r->inset, &px)) {
+        len_t value = {.kind = LK_LEN, .px = px};
+        return css_calc_length(a, &value);
+    }
+    if (!f->fallback_given || r->depth > 32) return NULL;
+    if (f->fallback.kind != LK_EXPR) return css_calc_length(a, &f->fallback);
+    r->depth++;
+    struct css_calc *c = css_calc_map_anchors(a, f->fallback.expr, anchor_resolved, r);
+    r->depth--;
+    return c;
+}
+bool css_length_resolve_anchors(arena_t *a, const len_t *l, css_anchor_resolver resolve, void *context,
+                                unsigned axis, int inset, len_t *out) {
+    if (!css_length_anchored(l)) { *out = *l; return true; }
+    struct anchor_resolution r = {resolve, context, axis, inset, 0};
+    struct css_calc *c = css_calc_map_anchors(a, l->expr, anchor_resolved, &r);
+    return c && css_length_from_calc(c, true, out);
+}
+void css_style_anchor_fallbacks(style_t *s, arena_t *a) {
+    if (s->position == POS_ABSOLUTE || s->position == POS_FIXED) return;
+    props_init();
+    for (int i = 0; i < NPROPS; i++) {
+        const struct propdef *p = &props[i];
+        if (p->type != PT_LEN || p->group != G_STYLE || !(p->flags & (LF_ANCHOR | LF_ANCHOR_SIZE))) continue;
+        len_t *field = (len_t *)((char *)s + p->off);
+        if (field->kind != LK_EXPR || !css_length_anchored(field)) continue;
+        len_t used;
+        /* invalid at computed-value time: the property's initial value (it is not inherited) */
+        if (!css_length_resolve_anchors(a, field, NULL, NULL, 0, -1, &used)) used = *(const len_t *)((const char *)&initial + p->off);
+        *field = used;
+    }
+}
+
+/* css_length_own: an anchor function copied with its name and fallback */
+static struct css_calc *anchor_copied(void *context, arena_t *a, const struct css_anchor_function *f) {
+    (void)context;
+    struct css_anchor_function *g = ar_alloc(a, sizeof *g);
+    *g = *f;
+    if (g->name) g->name = ar_strdup(a, g->name);
+    if (g->fallback_given) css_length_own(a, &g->fallback);
+    return css_calc_anchor(a, g);
+}
+void css_length_own(arena_t *a, len_t *l) {
+    if (l->kind != LK_EXPR || !l->expr) return;
+    struct css_calc *c = css_calc_map_anchors(a, l->expr, anchor_copied, NULL);
+    if (c) l->expr = c;
+}
+
+/* the accepted @position-try properties (§6.4) */
+bool css_prop_position_try_accepted(const struct propdef *p) {
+    static const char *const names[] = {"top", "right", "bottom", "left", "inset", "inset-block", "inset-inline",
+        "margin", "margin-top", "margin-right", "margin-bottom", "margin-left", "margin-block", "margin-inline",
+        "width", "height", "min-width", "min-height", "max-width", "max-height", "align-self", "justify-self",
+        "place-self", "position-anchor", "position-area"};
+    if (!p) return false;
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(p->name, names[i])) return true;
+    return false;
+}
+bool css_position_area_text(const uint8_t area[2], sbuf *out) { return area_computed_text(out, area); }
+void css_style_position_option(style_t *used, const style_t *option, struct css_anchor *anchor) {
+    props_init();
+    *anchor = *css_style_anchor(used);
+    const struct css_anchor *from = css_style_anchor(option);
+    for (int i = 0; i < NPROPS; i++) {
+        const struct propdef *p = &props[i];
+        if (p->type == PT_SHORT || !css_prop_position_try_accepted(p)) continue;
+        if (p->group == G_STYLE) memcpy((char *)used + p->off, (const char *)option + p->off, p->size);
+        else if (p->group == G_ANCHOR) memcpy((char *)anchor + p->off, (const char *)from + p->off, p->size);
+    }
+    used->anchor = anchor;
+}
+/* §6.5.2 a try tactic on anchor functions: across one axis (flipped: the property is in that axis) the
+   sides and percentages mirror; flip-start swaps the axes, so physical sides and sizes trade places */
+static const struct css_anchor_function *function_tactic(arena_t *a, const struct css_anchor_function *f,
+                                                         uint8_t tactic, bool flipped);
+struct anchor_tactic { uint8_t tactic; bool flipped; };
+static struct css_calc *anchor_flipped(void *context, arena_t *a, const struct css_anchor_function *f) {
+    const struct anchor_tactic *t = context;
+    return css_calc_anchor(a, function_tactic(a, f, t->tactic, t->flipped));
+}
+static void length_tactic(arena_t *a, len_t *l, uint8_t tactic, bool flipped) {
+    if (!css_length_anchored(l)) return;
+    struct anchor_tactic t = {tactic, flipped};
+    struct css_calc *c = css_calc_map_anchors(a, l->expr, anchor_flipped, &t);
+    if (c) l->expr = c;
+}
+static const struct css_anchor_function *function_tactic(arena_t *a, const struct css_anchor_function *f,
+                                                         uint8_t tactic, bool flipped) {
+    static const uint8_t start_sides[][2] = {{CSS_SIDE_TOP, CSS_SIDE_LEFT}, {CSS_SIDE_BOTTOM, CSS_SIDE_RIGHT}};
+    static const uint8_t axis_sides[][2] = {{CSS_SIDE_TOP, CSS_SIDE_BOTTOM}, {CSS_SIDE_LEFT, CSS_SIDE_RIGHT},
+        {CSS_SIDE_START, CSS_SIDE_END}, {CSS_SIDE_SELF_START, CSS_SIDE_SELF_END}};
+    static const uint8_t sizes[][2] = {{CSS_SIZE_WIDTH, CSS_SIZE_HEIGHT}, {CSS_SIZE_BLOCK, CSS_SIZE_INLINE},
+        {CSS_SIZE_SELF_BLOCK, CSS_SIZE_SELF_INLINE}};
+    struct css_anchor_function g = *f;
+    const uint8_t (*pairs)[2] = NULL;
+    size_t count = 0;
+    if (f->size) { if (tactic == CSS_TRY_FLIP_START) { pairs = sizes; count = 3; } }
+    else if (tactic == CSS_TRY_FLIP_START) { pairs = start_sides; count = 2; }
+    else if (flipped) {
+        pairs = axis_sides; count = 4;
+        if (f->side == CSS_SIDE_PERCENT) g.percent = 100 - f->percent;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (f->side == pairs[i][0]) g.side = pairs[i][1];
+        else if (f->side == pairs[i][1]) g.side = pairs[i][0];
+    }
+    if (f->fallback_given) length_tactic(a, &g.fallback, tactic, flipped);
+    if (g.side == f->side && g.percent == f->percent &&
+        (!f->fallback_given || g.fallback.expr == f->fallback.expr)) return f;
+    struct css_anchor_function *r = ar_alloc(a, sizeof *r);
+    *r = g;
+    return r;
+}
+/* a computed <position-area>'s keyword's physical axis (1: vertical): the first of an ambiguous pair is
+   the block axis's */
+static unsigned area_axis(const uint8_t area[2], int i) {
+    uint8_t f = area_family(area[i]), other = area_family(area[!i]);
+    if (f == CSS_AREA_X || f == CSS_AREA_INLINE || f == CSS_AREA_SELF_INLINE) return 0;
+    if (f == CSS_AREA_Y || f == CSS_AREA_BLOCK || f == CSS_AREA_SELF_BLOCK) return 1;
+    if (other) return !area_axis(area, !i);
+    return i == 0;
+}
+static void area_tactic(uint8_t area[2], uint8_t tactic) {
+    if (!area[0]) return;
+    if (tactic == CSS_TRY_FLIP_START) {
+        static const uint8_t swap[][2] = {{CSS_AREA_X, CSS_AREA_Y}, {CSS_AREA_BLOCK, CSS_AREA_INLINE},
+                                          {CSS_AREA_SELF_BLOCK, CSS_AREA_SELF_INLINE}};
+        uint8_t next[2];
+        for (int i = 0; i < 2; i++) {
+            uint8_t k = area[i], f = area_family(k), g = f;
+            for (int j = 0; j < 3; j++) { if (f == swap[j][0]) g = swap[j][1]; else if (f == swap[j][1]) g = swap[j][0]; }
+            next[!i] = g == f ? k : area_find(g, area_keywords[k].track);
+        }
+        area[0] = next[0]; area[1] = next[1];
+        return;
+    }
+    unsigned axis = tactic == CSS_TRY_FLIP_X || tactic == CSS_TRY_FLIP_INLINE ? 0 : 1;
+    uint8_t original[2] = {area[0], area[1]};
+    for (int i = 0; i < 2; i++) {
+        if (area_axis(original, i) != axis || !area_family(original[i])) continue;
+        uint8_t track = area_keywords[original[i]].track;
+        uint8_t mirrored = track == CSS_AREA_START ? CSS_AREA_END : track == CSS_AREA_END ? CSS_AREA_START :
+            track == CSS_AREA_SPAN_START ? CSS_AREA_SPAN_END : track == CSS_AREA_SPAN_END ? CSS_AREA_SPAN_START : track;
+        area[i] = area_find(area_family(original[i]), mirrored);
+    }
+}
+static void swap_len(len_t *x, len_t *y) { len_t t = *x; *x = *y; *y = t; }
+/* §6.5.2 execute a try tactic on s's accepted @position-try properties, in horizontal-tb ltr (the
+   logical tactics are the physical ones): flip-x mirrors across a vertical line, flip-y across a
+   horizontal one, flip-start across the start-start to end-end diagonal */
+void css_style_try_tactic(style_t *s, uint8_t tactic, struct css_anchor *anchor, arena_t *a) {
+    if (anchor != s->anchor) { *anchor = *css_style_anchor(s); s->anchor = anchor; }
+    if (tactic == CSS_TRY_FLIP_START) {
+        swap_len(&s->inset[0], &s->inset[3]); swap_len(&s->inset[2], &s->inset[1]);
+        swap_len(&s->margin[0], &s->margin[3]); swap_len(&s->margin[2], &s->margin[1]);
+        swap_len(&s->width, &s->height); swap_len(&s->min_width, &s->min_height); swap_len(&s->max_width, &s->max_height);
+        uint8_t align = s->align_self; s->align_self = s->justify_self; s->justify_self = align;
+        len_t *all[] = {&s->inset[0], &s->inset[1], &s->inset[2], &s->inset[3], &s->margin[0], &s->margin[1],
+                        &s->margin[2], &s->margin[3], &s->width, &s->height, &s->min_width, &s->min_height,
+                        &s->max_width, &s->max_height};
+        for (size_t i = 0; i < sizeof all / sizeof *all; i++) length_tactic(a, all[i], tactic, false);
+    } else {
+        bool x = tactic == CSS_TRY_FLIP_X || tactic == CSS_TRY_FLIP_INLINE;
+        int from = x ? 3 : 0, to = x ? 1 : 2; /* left and right, or top and bottom */
+        swap_len(&s->inset[from], &s->inset[to]); swap_len(&s->margin[from], &s->margin[to]);
+        for (int i = 0; i < 4; i++) length_tactic(a, &s->inset[i], tactic, i == from || i == to);
+        uint8_t *self = x ? &s->justify_self : &s->align_self;
+        if (*self == AI_START) *self = AI_END;
+        else if (*self == AI_END) *self = AI_START;
+    }
+    area_tactic(anchor->area, tactic);
+}
+/* FNV-1a over the computed values a fallback-sensitive change (§6.5.1) can change */
+static uint64_t position_hash_style(uint64_t h, const style_t *s, bool options, sbuf *t) {
+    h = (h ^ s->position) * 1099511628211ull;
+    for (int i = 0; i < NPROPS; i++) {
+        const struct propdef *p = &props[i];
+        bool tries = p->group == G_ANCHOR && (p->off == offsetof(struct css_anchor, tries) ||
+                                              p->off == offsetof(struct css_anchor, try_order));
+        if (p->type == PT_SHORT || (!css_prop_position_try_accepted(p) && !(options && tries))) continue;
+        t->n = 0;
+        if (!css_computed_value(s, p, t, NULL)) continue;
+        for (size_t j = 0; j < t->n; j++) h = (h ^ (unsigned char)t->p[j]) * 1099511628211ull;
+        h = (h ^ 0xff) * 1099511628211ull;
+    }
+    if (options) {
+        const struct css_position_tries *tries = &css_style_anchor(s)->tries;
+        for (uint32_t i = 0; i < tries->count; i++)
+            h = tries->option[i].style ? position_hash_style(h, tries->option[i].style, false, t) :
+                (h ^ (tries->option[i].rule ? 1 : 2)) * 1099511628211ull;
+    }
+    return h;
+}
+uint64_t css_style_position_hash(const style_t *s) {
+    props_init();
+    sbuf t = {0};
+    uint64_t h = position_hash_style(1469598103934665603ull, s, true, &t);
+    sb_free(&t);
+    return h;
+}
+/* whether the text has a dimension in a unit of the element's font, the viewport or a container
+   (outside names and strings) */
+static bool relative_unit_mentioned(const char *v, size_t n) {
+    const char *p = v, *e = v + n;
+    while (p < e) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\'') {
+            for (p++; p < e && *p != (char)c; p++) if (*p == '\\' && p + 1 < e) p++;
+            if (p < e) p++;
+            continue;
+        }
+        unsigned char before = p > v ? (unsigned char)p[-1] : ' ';
+        if (before < 128 && !isalnum(before) && before != '-' && before != '_') {
+            const char *q = p, *u;
+            double x;
+            size_t un;
+            if (css_numeric_token(&q, e, &x, &u, &un) && q > p) {
+                if (un && css_unit_relative(css_unit_find(u, un))) return true;
+                p = q;
+                continue;
+            }
+        }
+        p++;
+    }
+    return false;
+}
+/* CSSOM's specified value of one length of an anchored value. Parsing computes relative lengths, so
+   an anchored length with one, like a length without an anchor function, has its math functions
+   serialized as other lengths' (css_calc_specified) and the rest as written */
+static bool anchor_length_specified(const struct propdef *p, const char *v, size_t n, sbuf *out) {
+    arena_t a = {.chunk_size = 1024};
+    jmp_buf trap;
+    a.trap = &trap;
+    bool ok = false;
+    if (!setjmp(trap)) {
+        style_t scratch = {0};
+        struct cx cx = {.s = &scratch, .a = &a, .supports_probe = true, .em = 16, .rem = 16};
+        len_t l;
+        size_t begin = out->n;
+        trim(&v, &n);
+        unsigned accept = CSS_CALC_LENGTH | (p->flags & LF_NOPCT ? 0 : CSS_CALC_PERCENT);
+        ok = parse_len(v, n, &cx, &l, p->flags) && !cx.invalid &&
+            (css_length_anchored(&l) && !relative_unit_mentioned(v, n) ? css_length_serialize(&l, out, NULL)
+                                                                       : css_calc_specified(v, n, accept, out) ||
+                                                                             length_append(out, v, n));
+        if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    }
+    ar_free(&a);
+    return ok;
+}
+static bool anchor_mentioned(const char *v, size_t n) {
+    for (size_t i = 0; i + 7 <= n; i++) if (strn_ieq(v + i, "anchor(", 7) || strn_ieq(v + i, "anchor-", 7)) return true;
+    return false;
+}
+static bool position_try_text(const struct css_anchor *a, sbuf *out) {
+    if (a->try_order != CSS_TRY_ORDER_NORMAL &&
+        (!anchor_text(out, kw_name(kw_try_order, a->try_order)) || !anchor_text(out, " "))) return false;
+    return try_fallbacks_text(out, &a->tries);
+}
+/* CSSOM's specified value of the anchor group's properties, the position-try shorthand, and the
+   lengths and shorthands of lengths that hold an anchor function; false keeps the authored text */
+static bool anchor_specified(const struct propdef *p, const char *v, size_t n, sbuf *out) {
+    if (p->type == PT_KW) return false;
+    if ((p->type == PT_LEN || p->type == PT_SHORT) && p->sh != SH_POSITION_TRY && !anchor_mentioned(v, n)) return false;
+    arena_t a = {.chunk_size = 1024};
+    jmp_buf trap;
+    a.trap = &trap;
+    bool ok = false;
+    size_t begin = out->n;
+    if (!setjmp(trap)) {
+        style_t scratch = {0};
+        struct cx cx = {.s = &scratch, .a = &a, .supports_probe = true};
+        if (p->type == PT_ANCHOR) {
+            union { struct css_anchor_names names; struct css_position_anchor anchor; struct css_position_tries tries;
+                    uint8_t bytes[2]; } field;
+            ok = anchor_value_parse(p->flags, v, n, &cx, &field, out) && !cx.invalid;
+        } else if (p->type == PT_SHORT && p->sh == SH_POSITION_TRY) {
+            uint8_t order;
+            struct css_position_tries tries;
+            ok = parse_position_try(v, n, &cx, &order, &tries, out) && !cx.invalid;
+        } else if (p->type == PT_LEN) ok = anchor_length_specified(p, v, n, out);
+        else {
+            /* a shorthand of lengths: each of its values */
+            bool margin = p->sh == SH_MARGIN || p->sh == SH_MARGIN_BLOCK || p->sh == SH_MARGIN_INLINE;
+            const struct propdef *longhand = find_prop(margin ? "margin-top" : "top", margin ? 10 : 3);
+            const char *t[5]; size_t tl[5];
+            int max = p->sh == SH_MARGIN || p->sh == SH_INSET ? 4 : 2;
+            int k = split(v, n, t, tl, max + 1, ' ');
+            ok = longhand && k >= 1 && k <= max;
+            for (int i = 0; ok && i < k; i++) ok = (!i || anchor_text(out, " ")) && anchor_length_specified(longhand, t[i], tl[i], out);
+        }
+    }
+    if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    ar_free(&a);
+    return ok;
 }
 
 static bool parse_display(const char *s, size_t n, uint8_t *out, struct cx *cx) {
@@ -2456,7 +3872,8 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     }
     if (p->group == G_STYLE) return apply_value(p, v, n, cx, (char *)s + p->off);
     /* a group's field: parsed into a copy of the group, which s takes when the value is valid */
-    union { struct css_float_shape float_shape; struct css_offset offset; } own;
+    union { struct css_float_shape float_shape; struct css_offset offset; struct css_gap_rules gap_rules;
+            struct css_anchor anchor; } own;
     memcpy(&own, group_of(s, p->group), group_size(p->group));
     if (!apply_value(p, v, n, cx, (char *)&own + p->off)) return false;
     group_write(s, p->group, &own, cx->a);
@@ -2627,6 +4044,14 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
     case PT_FILTER: return parse_filter(v, n, cx, &s->filter);
     case PT_SHAPE: return css_shape_parse(p->flags, v, n, cx, (const struct css_shape **)field, NULL);
     case PT_OFFSET: return css_offset_parse(p->flags, v, n, cx, field, NULL);
+    case PT_RULE_LIST: {
+        struct css_rule_list lists[3];
+        if (!rule_lists(p->flags, v, n, cx, lists, NULL)) return false;
+        *(struct css_rule_list *)field = lists[p->flags];
+        return true;
+    }
+    case PT_RULE_INSET: return rule_inset(v, n, cx, (struct css_rule_inset *)field, NULL);
+    case PT_ANCHOR: return anchor_value_parse(p->flags, v, n, cx, field, NULL);
     case PT_CLIP: return parse_clip_rect(v, n, cx, &s->clip);
     case PT_BOX_SHADOW: return parse_box_shadows(v, n, cx, &s->box_shadow, NULL);
     case PT_OPACITY: {
@@ -3109,6 +4534,23 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
             return true;
         }
         return set_border(v, n, cx, sides, ns);
+    }
+    case SH_GAP_RULE: return gap_shorthand_apply(p, v, n, global, cx);
+    case SH_POSITION_TRY: {
+        if (global) { set_long("position-try-order", v, n, cx); set_long("position-try-fallbacks", v, n, cx); return true; }
+        uint8_t order;
+        struct css_position_tries tries;
+        if (!parse_position_try(v, n, cx, &order, &tries, NULL)) return false;
+        if (cx->font_pass) return true;
+        /* the longhands no more important declaration set, written into one copy of the group */
+        struct css_anchor own = *css_style_anchor(cx->s);
+        int at_order = css_prop_index(find_prop("position-try-order", 18));
+        int at_tries = css_prop_index(find_prop("position-try-fallbacks", 22));
+        bool written = false;
+        if (!cx->set[at_order]) { own.try_order = order; cx->set[at_order] = 1; written = true; }
+        if (!cx->set[at_tries]) { own.tries = tries; cx->set[at_tries] = 1; written = true; }
+        if (written) group_write(cx->s, G_ANCHOR, &own, cx->a);
+        return true;
     }
     case SH_OFFSET: {
         static const char *const names[] = {"offset-position", "offset-path", "offset-distance", "offset-rotate", "offset-anchor"};
@@ -4107,6 +5549,7 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
     case PT_SCALE: tf_scale_text(out, st->scale); break;
     case PT_SHAPE: ok = css_shape_serialize(p->flags, *(const struct css_shape *const *)field, out, d); break;
     case PT_OFFSET: ok = css_offset_serialize(p->flags, field, out, d); break;
+    case PT_ANCHOR: ok = anchor_value_text(p->flags, field, out); break;
     case PT_CLIP: ok = css_clip_rect_serialize(&st->clip, out); break;
     case PT_MOTION_LIST: {
         int list = p->flags;
@@ -4144,6 +5587,9 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
         }
         break;
     }
+    /* gap decorations: currentcolor stays itself, for the cascade to resolve against the element */
+    case PT_RULE_LIST: rule_list_text(st, p->flags, (const struct css_rule_list *)field, false, out); break;
+    case PT_RULE_INSET: ok = rule_inset_text((const struct css_rule_inset *)field, out, d); break;
 
     default: return false;
     }
@@ -4211,6 +5657,8 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
         return x->kind == y->kind && x->n == y->n && same_text(x->name, y->name);
     }
     case PT_SHAPE: return css_shape_equal(*(const struct css_shape *const *)fa, *(const struct css_shape *const *)fb);
+    case PT_RULE_LIST: return rule_list_equal(p->flags, (const struct css_rule_list *)fa, (const struct css_rule_list *)fb);
+    case PT_RULE_INSET: return rule_inset_equal((const struct css_rule_inset *)fa, (const struct css_rule_inset *)fb);
     case PT_OFFSET:
         if (p->flags == CSS_OFFSET_ROTATE) return !memcmp(fa, fb, sizeof(struct css_offset_rotate));
         return css_length_equal(&((const len_t *)fa)[0], &((const len_t *)fb)[0]) &&
@@ -4218,6 +5666,7 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
     case PT_GTEMPLATE: case PT_GAREAS:
         return *(const void *const *)fa == *(const void *const *)fb;
     case PT_MOTION_LIST: return css_motion_equal(&a->motion, &b->motion);
+    case PT_ANCHOR: return anchor_value_equal(p->flags, fa, fb);
     }
     return !memcmp(fa, fb, p->size);
 }
@@ -4252,6 +5701,111 @@ bool css_anim_discrete_second(const struct propdef *p, const style_t *a, const s
         if (hides_a != hides_b) return hides_a;
     }
     return t >= .5;
+}
+
+/* -------- gap decoration lists (css-gaps-1 §4.7) */
+/* a walk through items [from, to) of a list with their integer repeaters written out, round and
+   round (an auto repeater's values once a round) */
+struct rule_walk {
+    const struct css_rule_list *l;
+    uint32_t from, to, item, j;
+    uint64_t round;
+};
+static void rule_walk_start(struct rule_walk *w, const struct css_rule_list *l, uint32_t from, uint32_t to) {
+    *w = (struct rule_walk){l, from, to, from, 0, 0};
+}
+static const union css_rule_value *rule_walk_next(struct rule_walk *w) {
+    const struct css_rule_item *it = &w->l->items[w->item];
+    const union css_rule_value *v = &w->l->values[it->first + w->j];
+    if (++w->j < it->count) return v;
+    w->j = 0;
+    uint64_t rounds = it->repeat && it->repeat != CSS_RULE_AUTO ? it->repeat : 1;
+    if (++w->round < rounds) return v;
+    w->round = 0;
+    if (++w->item == w->to) w->item = w->from;
+    return v;
+}
+static uint64_t rule_span(const struct css_rule_list *l, uint32_t from, uint32_t to) {
+    uint64_t n = 0;
+    for (uint32_t i = from; i < to; i++) {
+        uint64_t span = rule_item_span(&l->items[i]);
+        if (n > UINT64_MAX - span) return UINT64_MAX;
+        n += span;
+    }
+    return n;
+}
+static uint32_t rule_auto_item(const struct css_rule_list *l) {
+    for (uint32_t i = 0; i < l->nitems; i++) if (l->items[i].repeat == CSS_RULE_AUTO) return i;
+    return l->nitems;
+}
+/* the repeatable list's length (Web Animations 1 §5.3): the lowest common multiple; 0 past 64 bits */
+static uint64_t rule_lcm(uint64_t a, uint64_t b) {
+    if (!a || !b) return 0;
+    uint64_t x = a, y = b;
+    while (y) { uint64_t r = x % y; x = y; y = r; }
+    a /= x;
+    return a > UINT64_MAX / b ? 0 : a * b;
+}
+static bool rule_value_combine(int kind, const style_t *a, const union css_rule_value *x, const style_t *b,
+                               const union css_rule_value *y, double ka, double kb, int mode, sbuf *out) {
+    if (kind == CSS_GAP_WIDTH) { anim_unit(out, anim_clamp(x->width * ka + y->width * kb, 0, INFINITY), "px"); return true; }
+    struct css_color_computed u, v;
+    css_color_held(x->color.argb, x->color.exact, a->color, &u);
+    css_color_held(y->color.argb, y->color.exact, b->color, &v);
+    return anim_color(out, a, &u, b, &v, kb, mode);
+}
+/* n values of the two walks against each other, each after a comma unless *first; the text grows
+   only while memory allows, and stops when the document is cancelled */
+static bool rule_walks_combine(const struct css_anim_ctx *c, int kind, const style_t *a, struct rule_walk *wx,
+                               const style_t *b, struct rule_walk *wy, uint64_t n, double ka, double kb, int mode,
+                               bool *first, sbuf *out) {
+    sbuf one = {0};
+    bool ok = true;
+    for (uint64_t k = 0; k < n && ok; k++) {
+        if (!(k & 1023) && c->d && __atomic_load_n(&c->d->native_cancelled, __ATOMIC_ACQUIRE)) { ok = false; break; }
+        one.n = 0;
+        ok = rule_value_combine(kind, a, rule_walk_next(wx), b, rule_walk_next(wy), ka, kb, mode, &one) &&
+             (*first || length_append(out, ", ", 2)) && length_append(out, one.p, one.n);
+        *first = false;
+    }
+    sb_free(&one);
+    return ok;
+}
+/* §4.7: integer repeaters written out, then the repeatable list's items against each other; with
+   an auto repeater in both, the leading and trailing values pairwise (their lengths must match)
+   and the auto repeaters' values as a repeatable list. Otherwise false: discrete. */
+static bool rule_lists_combine(const struct css_anim_ctx *c, int kind, const style_t *a, const struct css_rule_list *x,
+                               const style_t *b, const struct css_rule_list *y, double ka, double kb, int mode, sbuf *out) {
+    uint32_t ax = rule_auto_item(x), ay = rule_auto_item(y);
+    bool repeat_auto = ax < x->nitems;
+    if (repeat_auto != (ay < y->nitems)) return false;
+    struct rule_walk wx, wy;
+    bool first = true;
+    if (!repeat_auto) {
+        uint64_t n = rule_lcm(rule_span(x, 0, x->nitems), rule_span(y, 0, y->nitems));
+        if (!n) return false;
+        rule_walk_start(&wx, x, 0, x->nitems);
+        rule_walk_start(&wy, y, 0, y->nitems);
+        return rule_walks_combine(c, kind, a, &wx, b, &wy, n, ka, kb, mode, &first, out);
+    }
+    uint64_t leading = rule_span(x, 0, ax), trailing = rule_span(x, ax + 1, x->nitems);
+    if (leading != rule_span(y, 0, ay) || trailing != rule_span(y, ay + 1, y->nitems)) return false;
+    if (leading) {
+        rule_walk_start(&wx, x, 0, ax);
+        rule_walk_start(&wy, y, 0, ay);
+        if (!rule_walks_combine(c, kind, a, &wx, b, &wy, leading, ka, kb, mode, &first, out)) return false;
+    }
+    uint64_t n = rule_lcm(x->items[ax].count, y->items[ay].count);
+    bool inner = true;
+    if (!n || !length_append(out, first ? "repeat(auto, " : ", repeat(auto, ", first ? 13 : 15)) return false;
+    rule_walk_start(&wx, x, ax, ax + 1);
+    rule_walk_start(&wy, y, ay, ay + 1);
+    if (!rule_walks_combine(c, kind, a, &wx, b, &wy, n, ka, kb, mode, &inner, out) || !length_append(out, ")", 1)) return false;
+    first = false;
+    if (!trailing) return true;
+    rule_walk_start(&wx, x, ax + 1, x->nitems);
+    rule_walk_start(&wy, y, ay + 1, y->nitems);
+    return rule_walks_combine(c, kind, a, &wx, b, &wy, trailing, ka, kb, mode, &first, out);
 }
 
 /* ka·a + kb·b for each value type (mode MIX), or b added / accumulated onto a */
@@ -4350,6 +5904,18 @@ static bool anim_combine(const struct css_anim_ctx *c, const struct propdef *p, 
         return css_shape_combine(p->flags, *(const struct css_shape *const *)fa, *(const struct css_shape *const *)fb,
                                  kb, mode != MIX, out, d);
     case PT_OFFSET: return css_offset_combine(p->flags, fa, fb, kb, mode != MIX, out, d);
+    case PT_RULE_LIST:
+        return rule_lists_combine(c, p->flags, a, (const struct css_rule_list *)fa, b, (const struct css_rule_list *)fb, ka,
+                                  kb, mode, out);
+    case PT_RULE_INSET: { /* <length-percentage> | overlap-join: the keyword only with itself */
+        const struct css_rule_inset *x = (const struct css_rule_inset *)fa, *y = (const struct css_rule_inset *)fb;
+        if (x->join || y->join) {
+            if (mode != MIX || !x->join || !y->join) return false;
+            sb_puts(out, "overlap-join");
+            return true;
+        }
+        return anim_len(out, &x->length, &y->length, ka, kb, LF_NEG, d);
+    }
     case PT_CLIP:
         if (!a->clip.rect || !b->clip.rect || a->clip.auto_edges != b->clip.auto_edges) return false;
         sb_puts(out, "rect(");

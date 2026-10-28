@@ -22,24 +22,35 @@ static bool active(web_doc *d){
 web_doc *web_presentation_root(web_doc *d){return active(d)?top_document(d):NULL;}
 static bool valid(web_doc *d,node_t *n){return active(d)&&n&&n->owner==d&&n->type==N_ELEM&&doc_node_connected(n);}
 static bool origin_is(const char *a,const char *b){return a&&b&&!strcmp(a,b);}
-static char *document_origin(const web_doc *d){char *out=NULL;if(d&&(d->sandbox_flags&SB_ORIGIN)==0&&http_origin_owned(web_effective_url((web_doc *)d),&out)==HTTP_URL_TUPLE)return out;free(out);return NULL;}
+static char *document_origin(const web_doc *d){char *out=NULL;if(d&&(d->sandbox_flags&SB_ORIGIN)==0&&web_url_origin(web_effective_url((web_doc *)d),&out)==WEB_URL_TUPLE)return out;free(out);return NULL;}
 static bool origin_match(const char *text,size_t size,const char *origin,bool pattern){
     if(!origin)return false;
-    if(pattern&&size==6&&!memcmp(text,"https:",6))return !strncmp(origin,"https:",6);
-    if(pattern&&size==5&&!memcmp(text,"http:",5))return !strncmp(origin,"http:",5)||!strncmp(origin,"https:",6);
+    if(pattern&&size==6&&!memcmp(text,"https:",6))return web_url_has_scheme(origin,"https");
+    if(pattern&&size==5&&!memcmp(text,"http:",5))return web_url_has_scheme(origin,"http")||web_url_has_scheme(origin,"https");
     char *value=malloc(size+1);if(!value)return false;memcpy(value,text,size);value[size]=0;
-    if(!pattern){char *parsed=NULL;bool matched=http_origin_owned(value,&parsed)==HTTP_URL_TUPLE&&origin_is(parsed,origin);free(parsed);free(value);return matched;}
+    if(!pattern){char *parsed=NULL;bool matched=web_url_origin(value,&parsed)==WEB_URL_TUPLE&&origin_is(parsed,origin);free(parsed);free(value);return matched;}
     char *wild=strstr(value,"://*.");bool domain_wild=wild!=NULL,port_wild=false,matched=false;
     if(wild){size_t prefix=(size_t)(wild-value)+3;memmove(value+prefix,value+prefix+2,strlen(value+prefix+2)+1);}
     char *scheme=strstr(value,"://");if(scheme){char *authority=scheme+3,*end=authority;while(*end&&*end!='/'&&*end!='?'&&*end!='#')end++;
         if(end-authority>=2&&end[-2]==':'&&end[-1]=='*'){port_wild=true;memmove(end-2,end,strlen(end)+1);}}
-    struct url_owned source={0},target={0};
-    if(url_parse_owned_result_n(value,strlen(value),&source)==HTTP_URL_TUPLE&&url_parse_owned_result_n(origin,strlen(origin),&target)==HTTP_URL_TUPLE&&source.path&&!strcmp(source.path,"/")){
-        bool host=!strcmp(source.host,target.host);
-        if(domain_wild){size_t a=strlen(source.host),b=strlen(target.host);host=b>a+1&&target.host[b-a-1]=='.'&&!strcmp(target.host+b-a,source.host);}
-        matched=host&&(!source.tls||target.tls)&&(port_wild||source.port==target.port||(!source.tls&&source.port==80&&target.tls&&target.port==443));
+    /* The pattern, its wildcards taken out, and the origin are URLs: their schemes, hosts and
+       ports come from their records. */
+    struct web_url source,target;
+    if(web_url_read(value,strlen(value),&source)==1){
+        if(web_url_read(origin,strlen(origin),&target)==1){
+            bool source_tls=web_url_scheme_is(&source,"https"),target_tls=web_url_scheme_is(&target,"https");
+            bool http=web_url_http_scheme(&source)&&web_url_http_scheme(&target);
+            size_t path_length,a,b;const char *path=web_url_target(&source,&path_length);
+            const char *source_host=web_url_host_text(&source,&a),*target_host=web_url_host_text(&target,&b);
+            int source_port=web_url_port_or_default(&source),target_port=web_url_port_or_default(&target);
+            bool host=a==b&&!memcmp(source_host,target_host,a);
+            if(domain_wild)host=b>a+1&&target_host[b-a-1]=='.'&&!memcmp(target_host+b-a,source_host,a);
+            matched=http&&path_length==1&&*path=='/'&&host&&(!source_tls||target_tls)&&
+                (port_wild||source_port==target_port||(!source_tls&&source_port==80&&target_tls&&target_port==443));
+            web_url_free(&target);
+        }
+        web_url_free(&source);
     }
-    url_owned_free(&source);url_owned_free(&target);
     free(value);return matched;
 }
 static bool policy_token(const char *text,size_t size,const char *origin,const char *self,const char *src,bool header){
@@ -122,7 +133,7 @@ static char *declared_origin(web_doc *parent,node_t *container,const char *self)
     /* The iframe's src as its navigation parses it (encoding-parse a URL). */
     char *url=NULL,*origin=NULL;if(doc_encoding_parse_url(parent,src,&url)==1){
         if(!strcmp(url,"about:blank")||!strncmp(url,"about:blank#",12))origin=self?strdup(self):NULL;
-        else http_origin_owned(url,&origin);}
+        else web_url_origin(url,&origin);}
     free(url);return origin;
 }
 bool web_presentation_policy_init(web_doc *d,const char *headers,const web_doc *inherit){
