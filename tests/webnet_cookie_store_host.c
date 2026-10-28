@@ -163,6 +163,14 @@ int main(int argc, char **argv) {
     CHECK(sends(a, "https://www.a.test/", "q=2") && sends(a, "https://www.a.test/", "r=3"));
     CHECK(cookie_sync(b, false) == 0 && sends(b, "https://www.a.test/", "r=3") && sends(b, "https://www.a.test/", "p=1"));
     CHECK(settled());
+    /* The URL Standard keeps '\' in a special URL's query and fragment; before them it is not
+       the parser's serialization. */
+    CHECK(sends(a, "https://www.a.test/log?x\\y|z#f\\g", "r=3"));
+    {
+        struct webcookie_context c = {"https://www.a.test/p\\q", "https://www.a.test/p\\q", "GET", true, true, false};
+        char out[64];
+        CHECK(webcookie_get(a->cookies, &c, out, sizeof out, time(NULL)) < 0);
+    }
 
     /* What the Settings window lists, and a site's key. */
     struct webcookie_site *sites = NULL;

@@ -81,7 +81,10 @@ static bool address(const char *url, struct address *a) {
     else return false;
     size_t n = strlen(url);
     if (n > UINT32_MAX || n == SIZE_MAX) return false;
-    for (size_t i = 0; i < n; i++) if ((unsigned char)url[i] <= 32 || (unsigned char)url[i] >= 127 || url[i] == '\\') return false;
+    /* As http.c's url_parse_owned: the URL Standard's serializer keeps '\' in a special URL's
+       query and fragment, and before them a raw one is not its serialization. */
+    size_t query = strcspn(url, "?#");
+    for (size_t i = 0; i < n; i++) if ((unsigned char)url[i] <= 32 || (unsigned char)url[i] >= 127 || (url[i] == '\\' && i < query)) return false;
     const char *end = p + strcspn(p, "/?#"), *colon = memchr(p, ':', (size_t)(end - p));
     const char *host_end = colon ? colon : end;
     if (!ascii_host(a->host, p, (size_t)(host_end - p))) return false;
