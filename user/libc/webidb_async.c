@@ -41,7 +41,7 @@ static bool cache_origin_operation(unsigned operation) {
         operation!=WEB_CACHE_DISCARD&&operation!=WEB_CACHE_READ&&operation!=WEB_CACHE_CLOSE;
 }
 static bool known_operation(unsigned operation) {
-    return (operation>=WEB_IDB_BEGIN&&operation<=WEB_IDB_FIRED)||(operation>=WEB_CACHE_OPEN&&operation<=WEB_CACHE_LAST);
+    return (operation>=WEB_IDB_BEGIN&&operation<=WEB_IDB_LAST)||(operation>=WEB_CACHE_OPEN&&operation<=WEB_CACHE_LAST);
 }
 static bool add_length(size_t *total,size_t add) {
     if(add>SIZE_MAX-*total)return false;

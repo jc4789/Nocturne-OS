@@ -188,8 +188,32 @@ const offscreenCanvasBridge = (() => {
         commit(value){const s=state(value),writes=detachWrites(s);for(let i=0;i<writes.length;i++)writes[i].object[writes[i].key]=writes[i].value;}
     });
     globalThis.OffscreenCanvas=OffscreenCanvas;
+    /* ImageData ([Exposed=(Window,Worker), Serializable]): the one interface of both realms; the
+       Window's 2D context (js_canvas.js) reads and makes them through imageRecord and ImageData.
+       Its serialization carries the width, height, color space and a copy of the pixels; the
+       receiving realm's deserialization makes its own ImageData around them. */
+    const images=new WeakMap(), Bytes=Uint8ClampedArray, abs=Math.abs, floor=Math.floor, number=Number, ARRAY_LENGTH=0xffffffff;
+    const imageGet=WeakMap.prototype.get, imageHas=WeakMap.prototype.has;
+    class ImageData {
+        constructor(a,b,c){let data,w,h;if(a instanceof Bytes){data=a;w=number(b)>>>0;h=c===undefined?data.length/4/w:number(c)>>>0;if(!w||!finite(h)||h!==floor(h)||h<1||data.length!==w*h*4)throw new DomErr('Invalid ImageData dimensions','IndexSizeError');}
+            else{w=abs(trunc(number(a)));h=abs(trunc(number(b)));if(!finite(w)||!finite(h)||!w||!h||w>ARRAY_LENGTH||h>ARRAY_LENGTH)throw new DomErr('Invalid ImageData dimensions','IndexSizeError');if(!safe(w*h*4))throw new RangeError('ImageData byte size representation');data=new Bytes(w*h*4);}
+            images.set(this,{data,w,h});}
+        get width(){const s=apply(imageGet,images,[this]);if(!s)throw new TypeError('Illegal ImageData receiver');return s.w;}
+        get height(){const s=apply(imageGet,images,[this]);if(!s)throw new TypeError('Illegal ImageData receiver');return s.h;}
+        get data(){const s=apply(imageGet,images,[this]);if(!s)throw new TypeError('Illegal ImageData receiver');return s.data;}
+        get colorSpace(){if(!apply(imageHas,images,[this]))throw new TypeError('Illegal ImageData receiver');return 'srgb';}
+    }
+    define(ImageData.prototype,Symbol.toStringTag,{value:'ImageData',configurable:true});
+    const imageRecord=value=>value!==null&&(typeof value==='object'||typeof value==='function')?apply(imageGet,images,[value]):undefined;
+    if(typeof cloneData!=='undefined')cloneData.registerSerializable('ImageData',value=>!!imageRecord(value),
+        value=>{const s=imageRecord(value);return [s.w,s.h,'srgb',new Bytes(s.data)];},
+        data=>new ImageData(data[3],data[0],data[1]));
+    globalThis.ImageData=ImageData;
     return {
         OffscreenCanvas,
+        ImageData,
+        /* An ImageData's private state {data, w, h}, or undefined for any other value. */
+        imageRecord,
         attachRaster(api){raster=api;},
         webglVersion,
         /* Realm services for native WebGL: TexImageSource resolution and the

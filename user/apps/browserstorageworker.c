@@ -60,7 +60,7 @@ int main(void) {
         size_t total=0;
         memcpy(&command,message,sizeof command);
         if(command.magic!=WEB_IDB_WIRE_MAGIC||!command.sequence||
-           ((command.operation<WEB_IDB_BEGIN||command.operation>WEB_IDB_FIRED)&&
+           ((command.operation<WEB_IDB_BEGIN||command.operation>WEB_IDB_LAST)&&
             (command.operation<WEB_CACHE_OPEN||command.operation>WEB_CACHE_LAST))||
            command.reference_count>SIZE_MAX/64||
            !add(&total,command.origin_length)||!add(&total,command.name_length)||
@@ -105,7 +105,8 @@ int main(void) {
             char reference[65];memcpy(reference,payload,64);reference[64]=0;
             result.status=webidb_value(engine,command.token,reference,&output,&output_length);break;
         }
-        case WEB_IDB_COMMIT: {
+        case WEB_IDB_COMMIT:
+        case WEB_IDB_SAVE: {
             size_t count=(size_t)command.reference_count;
             if(count>SIZE_MAX/65||count>SIZE_MAX/sizeof(char*)){result.status=WEB_IDB_MEMORY;break;}
             char **references=count?malloc(count*sizeof *references):NULL;
@@ -117,7 +118,7 @@ int main(void) {
                 memcpy(references[i],source+i*64,64);
                 references[i][64]=0;
             }
-            result.status=webidb_commit(engine,command.token,payload,(size_t)command.payload_length,(const char *const*)references,count,command.version);
+            result.status=(command.operation==WEB_IDB_SAVE?webidb_save:webidb_commit)(engine,command.token,payload,(size_t)command.payload_length,(const char *const*)references,count,command.version);
             free(strings);free(references);break;
         }
         case WEB_IDB_ABORT:
