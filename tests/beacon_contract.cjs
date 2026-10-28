@@ -31,6 +31,10 @@ check('no payload: true, a credentialed keepalive no-cors POST without Content-T
     assert.equal(a[10], true, 'no-cors');
     assert.equal(header(a[2], 'content-type'), null);
 });
+check('the initiator type of the request is "beacon" (Resource Timing)', () => {
+    assert.equal(run(`fetchBridge.beacon('/beacon/resources/beacon.py?cmd=store&id=2')`), true);
+    assert.deepEqual(run('JSON.stringify(initiators[initiators.length-1])'), JSON.stringify([count(), 'beacon']));
+});
 check('null payload: as no payload', () => {
     const before = count();
     assert.equal(run(`fetchBridge.beacon('/b', null)`), true);

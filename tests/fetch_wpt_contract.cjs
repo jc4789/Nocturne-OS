@@ -230,7 +230,8 @@ const realms = {
     window(rev, network) {
         const c = context(rev, network);
         vm.runInContext(`let abortSignals,abortListen=()=>{};const mapGet=WeakMap.prototype.get;
-            const document={},performanceBridge={initiator(){}};
+            /* The Resource Timing initiator types the realm registers, by request id. */
+            const document={},initiators=[],performanceBridge={initiator(id,type){initiators.push([id,type]);}};
             const rawDom={get:(d,k)=>({baseURI:'${BASE_URL}',fetchOrigin:new URL('${BASE_URL}').origin,fetchClientReferrer:'${BASE_URL}',referrerPolicy:0})[k]};
             Object.assign(host,{url:()=>'${BASE_URL}',timer:(k,fn,ms,args)=>setTimeout(()=>fn(...args),ms),clear:id=>clearTimeout(id),
                 noCorsFetch:true,streamingFetch:true,resumeFetch(id){resumed.push(id);},cancel(id){cancelled.push(id);},

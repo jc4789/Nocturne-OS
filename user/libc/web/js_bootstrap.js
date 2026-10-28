@@ -1370,7 +1370,7 @@
         baseURL:()=>rawDom.get(document,'baseURI'),origin:()=>rawDom.get(document,'fetchOrigin'),
         clientReferrer:()=>rawDom.get(document,'fetchClientReferrer'),referrerPolicy:()=>rawDom.get(document,'referrerPolicy'),
         url:()=>host.url(),dataURL:url=>host.dataURL(url),task:fn=>host.timer(0,fn,0,[]),clearTask:id=>host.clear(id),
-        digest:(algorithm,bytes)=>host.cryptoDigest(algorithm,bytes),initiator:id=>performanceBridge.initiator(id,'xmlhttprequest')});
+        digest:(algorithm,bytes)=>host.cryptoDigest(algorithm,bytes),initiator:(id,type)=>performanceBridge.initiator(id,type)});
     const {Headers,Request,Response,fetch}=fetchBridge;
     const location={assign(url){host.navigate(String(url),0);},replace(url){host.navigate(String(url),2);},reload(){host.navigate(host.url(),1);},toString(){return this.href;}};
     Object.defineProperties(location,{href:{get(){return host.url();},set(v){host.navigate(htmlSafetyBridge.navigationInput(v));}}});

@@ -326,7 +326,7 @@
             baseURL:()=>address,origin,clientReferrer:()=>address,referrerPolicy:()=>apply(referrerPolicy,host,[]),
             url:()=>apply(securityURL,host,[])||address,dataURL:url=>apply(dataURL,host,[url]),
             task:fn=>timer(fn,0,[],false),clearTask:clearTimer,digest:(algorithm,bytes)=>apply(digest,host,[algorithm,bytes]),
-            initiator:id=>performanceBridge.initiator(id,'xmlhttprequest')});
+            initiator:(id,type)=>performanceBridge.initiator(id,type)});
     })();
     fetchBridge.initialize();fetchBridge.initializeStreams(streamBridge);fetchBridge.initializeBlobs(blobBridge);
     const {Headers,Request,Response,fetch}=fetchBridge;
