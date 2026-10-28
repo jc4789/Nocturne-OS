@@ -1254,7 +1254,21 @@
     /* @include js_pointer_events.js */
     /* @include js_tokens.js */
     const DOMTokenList=tokenListBridge.DOMTokenList;
+    /* @include js_abort.js */
     /* @include js_fetch.js */
+    /* This Window's settings and transport for Fetch: js.c's native fetch (CORS, cookies, Mixed
+       Content, CSP and the HTTP cache are its), the document's base URL, origin, referrer source
+       and policy container. */
+    const fetchBridge=fetchInterfaces({signals:abortBridge.signals,
+        transport:{noCors:()=>!!host.noCorsFetch,streaming:()=>!!host.streamingFetch,
+            fetch:(q,notify)=>host.fetch(q.url,q.method,q.headers,q.body,q.sameOrigin,q.credentials,q.forcePreflight,q.redirectError?1:0,q.cache,
+                q.keepalive,q.noCors,q.noReferrer,notify,q.referrer,q.referrerPolicy,q.destination),
+            resume:id=>host.resumeFetch(id),cancel:id=>host.cancel(id)},
+        baseURL:()=>rawDom.get(document,'baseURI'),origin:()=>rawDom.get(document,'fetchOrigin'),
+        clientReferrer:()=>rawDom.get(document,'fetchClientReferrer'),referrerPolicy:()=>rawDom.get(document,'referrerPolicy'),
+        url:()=>host.url(),dataURL:url=>host.dataURL(url),task:fn=>host.timer(0,fn,0,[]),clearTask:id=>host.clear(id),
+        digest:(algorithm,bytes)=>host.cryptoDigest(algorithm,bytes),initiator:id=>performanceBridge.initiator(id,'xmlhttprequest')});
+    const {Headers,Request,Response,fetch}=fetchBridge;
     const location={assign(url){host.navigate(String(url),0);},replace(url){host.navigate(String(url),2);},reload(){host.navigate(host.url(),1);},toString(){return this.href;}};
     Object.defineProperties(location,{href:{get(){return host.url();},set(v){host.navigate(htmlSafetyBridge.navigationInput(v));}}});
     document.location=location;

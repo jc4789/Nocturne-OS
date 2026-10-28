@@ -19,7 +19,7 @@ struct child {struct child *next,*shared_next;web_workers *owner;char *name,*cre
 #define WORKER_PROGRAM N_FOLDER_SYSTEM "\\browserjsworker"
 struct shared_ref {struct shared_ref *next;struct child *child;};
 struct event {struct event *next;uint32_t id;struct njw_header h;uint8_t *data;struct web_inbox inbox;bool from_child;};
-struct web_workers {struct web_workers *next;JSContext *ctx;JSValue callback;uint32_t generation;web_worker_loader load;web_worker_requester request;web_worker_canceler cancel;void *opaque;char *creator_policy,*origin;int creator_referrer_policy;bool isolated;web_worker_reporter reporter;void *report_opaque;struct child *children;struct shared_ref *shared;struct event *events,*last;size_t queued;uint32_t next_lease;struct broker_lease *leases;};
+struct web_workers {struct web_workers *next;JSContext *ctx;JSValue callback;uint32_t generation;web_worker_loader load;web_worker_requester request;web_worker_resumer resume;web_worker_canceler cancel;void *opaque;char *creator_policy,*origin;int creator_referrer_policy;bool isolated;web_worker_reporter reporter;void *report_opaque;struct child *children;struct shared_ref *shared;struct event *events,*last;size_t queued;uint32_t next_lease;struct broker_lease *leases;};
 static struct child *shared_children;
 static web_workers *managers;
 static uint32_t next_worker_id;
@@ -190,6 +190,7 @@ void web_worker_set_isolated(web_workers*w,bool isolated){if(w)w->isolated=isola
 void web_worker_set_reporter(web_workers *w,web_worker_reporter reporter,void *opaque){if(w){w->reporter=reporter;w->report_opaque=opaque;}}
 void web_worker_set_canceler(web_workers *w,web_worker_canceler cancel){if(w)w->cancel=cancel;}
 void web_worker_set_requester(web_workers *w,web_worker_requester request){if(w)w->request=request;}
+void web_worker_set_resumer(web_workers *w,web_worker_resumer resume){if(w)w->resume=resume;}
 void web_worker_set_callback(web_workers *w,JSValueConst fn){if(!w)return;JS_FreeValue(w->ctx,w->callback);w->callback=JS_DupValue(w->ctx,fn);}
 JSValue web_worker_native(web_workers *w,int argc,JSValueConst *argv){
     if(!w)return JS_UNDEFINED;JSContext *ctx=w->ctx;uint32_t op=0,id=0;if(argc<2||JS_ToUint32(ctx,&op,argv[0])<0||JS_ToUint32(ctx,&id,argv[1])<0)return JS_EXCEPTION;
@@ -227,28 +228,35 @@ JSValue web_worker_native(web_workers *w,int argc,JSValueConst *argv){
     if(op==1){if(argc<3)return JS_ThrowTypeError(ctx,"Worker message required");if(!serialized(w,c,NJW_MESSAGE,0,0,argv[2],false))return JS_ThrowRangeError(ctx,"Worker message allocation, representation or transport failed");return JS_UNDEFINED;}
     return JS_ThrowTypeError(ctx,"Invalid Worker operation");
 }
-void web_worker_loaded(web_workers *w,uint32_t id,uint32_t request,int status,const char *url,const char *headers,const void *bytes,size_t n,const char *error){
-    if(!w)return;struct child *c=find(w,id);if(!c||c->stopped)return;
+static void resource_retire(struct child *c,uint32_t request){
     if(request){struct resource**at=&c->resources;while(*at&&(*at)->id!=request)at=&(*at)->next;if(*at){struct resource*r=*at;*at=r->next;free(r);}}
+}
+/* The NJW_LOADED flags of a response's header block, from the transport's own line. An opaque
+ * response's internals are blanked here: never place them in the author's Worker realm, even if
+ * its built-in prototypes have been replaced. */
+static uint32_t response_kind(int *status,const char **url,const char **headers,const void **bytes,size_t *n){
     uint32_t kind=0;
-    if(request&&status>0&&(!error||!error[0])&&headers){
-        /* This second status line is emitted by the trusted HTTP host. Server
-           fields contain a colon and cannot manufacture transport metadata. */
-        const char *meta=strstr(headers,"\r\nHTTP/Nocturne-Meta cors=");
-        unsigned cors=0,redirected=0,opaque=0;
-        if(meta&&sscanf(meta+2,"HTTP/Nocturne-Meta cors=%u redirected=%u opaque=%u",&cors,&redirected,&opaque)>=2&&cors<=1&&redirected<=1&&opaque<=1){
-            if(cors)kind|=NJW_LOADED_CORS;
-            if(redirected)kind|=NJW_LOADED_REDIRECTED;
-            if(opaque){
-                const char *end=strstr(meta+2,"\r\n"),*at=strstr(meta+2," resource=");unsigned bits=2;
-                if(!at||!end||at>end||sscanf(at+10,"%u",&bits)!=1||bits>7)bits=2;
-                kind=NJW_LOADED_OPAQUE|(bits<<NJW_LOADED_RESOURCE_SHIFT);
-                /* Never place opaque internals in the author's Worker realm,
-                   even if its built-in prototypes have been replaced. */
-                status=0;url="";headers="";bytes=NULL;n=0;
-            }
+    /* This second status line is emitted by the trusted HTTP host. Server
+       fields contain a colon and cannot manufacture transport metadata. */
+    const char *meta=*headers?strstr(*headers,"\r\nHTTP/Nocturne-Meta cors="):NULL;
+    unsigned cors=0,redirected=0,opaque=0;
+    if(meta&&sscanf(meta+2,"HTTP/Nocturne-Meta cors=%u redirected=%u opaque=%u",&cors,&redirected,&opaque)>=2&&cors<=1&&redirected<=1&&opaque<=1){
+        if(cors)kind|=NJW_LOADED_CORS;
+        if(redirected)kind|=NJW_LOADED_REDIRECTED;
+        if(opaque){
+            const char *end=strstr(meta+2,"\r\n"),*at=strstr(meta+2," resource=");unsigned bits=2;
+            if(!at||!end||at>end||sscanf(at+10,"%u",&bits)!=1||bits>7)bits=2;
+            kind=NJW_LOADED_OPAQUE|(bits<<NJW_LOADED_RESOURCE_SHIFT);
+            *status=0;*url="";*headers="";*bytes=NULL;*n=0;
         }
     }
+    return kind;
+}
+void web_worker_loaded(web_workers *w,uint32_t id,uint32_t request,int status,const char *url,const char *headers,const void *bytes,size_t n,const char *error){
+    if(!w)return;struct child *c=find(w,id);if(!c||c->stopped)return;
+    resource_retire(c,request);
+    uint32_t kind=0;
+    if(request&&status>0&&(!error||!error[0])&&headers)kind=response_kind(&status,&url,&headers,&bytes,&n);
     if(n>NJW_MAX_BYTES){fail(w,c,"Worker resource length is not representable on the wire");return;}
     JSContext *ctx=w->ctx;JSValue a=JS_NewArray(ctx);
     bool filled=!JS_IsException(a) && resource_field(ctx,a,0,JS_NewInt32(ctx,status)) &&
@@ -260,8 +268,26 @@ void web_worker_loaded(web_workers *w,uint32_t id,uint32_t request,int status,co
         resource_field(ctx,a,NJW_START_INHERIT_POLICY,JS_NewBool(ctx,c->inherit_policy)) && resource_field(ctx,a,NJW_START_SHARED,JS_NewBool(ctx,c->shared)) &&
         resource_field(ctx,a,NJW_START_CREATOR_ORIGIN,JS_NewString(ctx,c->origin?c->origin:"")) &&
         resource_field(ctx,a,NJW_START_CREATOR_REFERRER_POLICY,JS_NewInt32(ctx,c->creator_referrer_policy)) &&
-        resource_field(ctx,a,NJW_START_CROSS_ORIGIN_ISOLATED,JS_NewBool(ctx,c->isolated));
+        resource_field(ctx,a,NJW_START_CROSS_ORIGIN_ISOLATED,JS_NewBool(ctx,c->isolated)) &&
+        resource_field(ctx,a,NJW_START_STREAMING,JS_NewBool(ctx,w->resume!=NULL));
     bool ok=filled && serialized(w,c,first?NJW_START:NJW_LOADED,request,kind,a,first);JS_FreeValue(ctx,a);if(!ok){fail(w,c,"Worker resource allocation, representation or transport failed");return;}if(first)c->started=true;
+}
+bool web_worker_frame(web_workers *w,uint32_t id,uint32_t request,int event,int status,const char *url,const char *headers,const void *bytes,size_t n,const char *error){
+    if(!w||!request||event<1||event>4)return false;struct child *c=find(w,id);if(!c||c->stopped)return false;
+    JSContext *ctx=w->ctx;JSValue value;uint32_t kind=(uint32_t)event<<NJW_FRAME_SHIFT;
+    if(event==1){
+        kind|=response_kind(&status,&url,&headers,&bytes,&n);
+        value=JS_NewArray(ctx);
+        if(!JS_IsException(value)&&!(resource_field(ctx,value,0,JS_NewInt32(ctx,status))&&resource_field(ctx,value,1,JS_NewString(ctx,url?url:""))&&
+            resource_field(ctx,value,2,JS_NewString(ctx,headers?headers:"")))){JS_FreeValue(ctx,value);value=JS_EXCEPTION;}
+    } else if(event==2){
+        if(n>NJW_MAX_BYTES){fail(w,c,"Worker resource length is not representable on the wire");return false;}
+        value=JS_NewArrayBufferCopy(ctx,bytes,n);
+    } else if(event==4)value=JS_NewFloat64(ctx,(double)n);
+    else {value=JS_NewString(ctx,error?error:"");resource_retire(c,request);}
+    bool ok=!JS_IsException(value)&&serialized(w,c,NJW_FRAME,request,kind,value,false);JS_FreeValue(ctx,value);
+    if(!ok){if(JS_HasException(ctx))JS_FreeValue(ctx,JS_GetException(ctx));fail(w,c,"Worker resource allocation, representation or transport failed");}
+    return ok;
 }
 void web_worker_pump(web_workers *w,uint64_t now){
     (void)now;web_worker_background();if(!w)return;
@@ -291,8 +317,8 @@ void web_worker_pump(web_workers *w,uint64_t now){
             if(!data){fail(w,c,"Invalid Worker response, receive size overflow or allocation failure");break;}
             if(n_channel_receive(c->channel,data,(size_t)size,0,NULL)!=size){free(data);child_exited(w,c);break;}
             memcpy(&h,data,sizeof h);bool port=h.op==NJW_PORT_MESSAGE||h.op==NJW_PORT_CLOSE||h.op==NJW_PORT_DRAINED;
-            bool valid_kind=port?h.kind<=1:h.op==NJW_MESSAGE?(h.kind==0||h.kind==NJW_WITH_PORTS):h.op==NJW_LOAD?(njw_load_kind_valid(h.kind)||(c->shared&&!h.request&&!h.kind)):h.op==NJW_CANCEL?h.kind==0&&h.request!=0:h.kind<=2;
-            if(h.magic!=NJW_MAGIC||h.generation!=c->generation||h.bytes!=bytes||(h.op!=NJW_MESSAGE&&h.op!=NJW_ERROR&&h.op!=NJW_LOAD&&h.op!=NJW_CANCEL&&h.op!=NJW_CLOSE&&h.op!=NJW_CONSOLE&&h.op!=NJW_CSP_REPORT&&!port)||!valid_kind){free(data);fail(w,c,"Invalid Worker response");break;}
+            bool valid_kind=port?h.kind<=1:h.op==NJW_MESSAGE?(h.kind==0||h.kind==NJW_WITH_PORTS):h.op==NJW_LOAD?(njw_load_kind_valid(h.kind)||(c->shared&&!h.request&&!h.kind)):(h.op==NJW_CANCEL||h.op==NJW_RESUME)?h.kind==0&&h.request!=0:h.kind<=2;
+            if(h.magic!=NJW_MAGIC||h.generation!=c->generation||h.bytes!=bytes||(h.op!=NJW_MESSAGE&&h.op!=NJW_ERROR&&h.op!=NJW_LOAD&&h.op!=NJW_CANCEL&&h.op!=NJW_RESUME&&h.op!=NJW_CLOSE&&h.op!=NJW_CONSOLE&&h.op!=NJW_CSP_REPORT&&!port)||!valid_kind){free(data);fail(w,c,"Invalid Worker response");break;}
             memmove(data,data+sizeof h,bytes);budget-=(size_t)size<budget?(size_t)size:budget;
             struct event *e=calloc(1,sizeof *e);if(!e){free(data);fail(w,c,"Worker event allocation failed");break;}
             e->id=c->id;e->h=h;e->data=data;e->inbox=c->inbox;c->inbox=(struct web_inbox){0};e->from_child=true;w->queued+=sizeof h+bytes;route_event(w,c,e);
@@ -354,20 +380,24 @@ bool web_worker_run_one(web_workers *w){
             bool initial=c->shared&&!e->h.request&&!e->h.kind,ok=false;
             if(JS_IsString(v)){const char *url=JS_ToCString(ctx,v);ok=(r||initial)&&url&&w->load&&w->load(w->opaque,c->id,e->h.request,url,e->h.kind);JS_FreeCString(ctx,url);}
             else if(r&&((e->h.kind&~NJW_LOAD_POLICY_FLAGS)==2)&&JS_IsArray(ctx,v)){
-                JSValue fields[6];for(unsigned i=0;i<6;i++)fields[i]=JS_GetPropertyUint32(ctx,v,i);
-                JSValue count_value=JS_GetPropertyStr(ctx,v,"length");uint32_t count=0;bool valid=JS_ToUint32(ctx,&count,count_value)>=0&&(count==4||count==6);JS_FreeValue(ctx,count_value);
-                size_t lengths[3]={0};const char *strings[3]={0};
-                for(unsigned i=0;i<3&&valid;i++){valid=JS_IsString(fields[i]);if(valid){strings[i]=JS_ToCStringLen(ctx,&lengths[i],fields[i]);valid=strings[i]&&!memchr(strings[i],0,lengths[i]);}}
+                /* [url, method, headers, body, referrer, referrer policy, destination]: browserjsworker.c's native_request. */
+                JSValue fields[7];for(unsigned i=0;i<7;i++)fields[i]=JS_GetPropertyUint32(ctx,v,i);
+                JSValue count_value=JS_GetPropertyStr(ctx,v,"length");uint32_t count=0;bool valid=JS_ToUint32(ctx,&count,count_value)>=0&&count==7;JS_FreeValue(ctx,count_value);
+                static const unsigned text[]={0,1,2,4,6};size_t lengths[5]={0};const char *strings[5]={0};
+                for(unsigned i=0;i<5&&valid;i++){valid=JS_IsString(fields[text[i]]);if(valid){strings[i]=JS_ToCStringLen(ctx,&lengths[i],fields[text[i]]);valid=strings[i]&&!memchr(strings[i],0,lengths[i]);}}
                 uint8_t empty_body=0;size_t bytes=0;uint8_t *body=NULL;if(valid&&!JS_IsNull(fields[3])){body=JS_GetArrayBuffer(ctx,&bytes,fields[3]);valid=body||!JS_HasException(ctx);if(valid&&!body)body=&empty_body;}
-                const char *referrer=NULL;size_t referrer_len=0;int32_t referrer_policy=0;
-                if(valid&&count==6){valid=JS_IsString(fields[4])&&JS_IsNumber(fields[5]);if(valid){referrer=JS_ToCStringLen(ctx,&referrer_len,fields[4]);valid=referrer&&!memchr(referrer,0,referrer_len)&&JS_ToInt32(ctx,&referrer_policy,fields[5])>=0&&referrer_policy>=0&&referrer_policy<=8;}}
-                if(valid)ok=w->request&&w->request(w->opaque,c->id,e->h.request,strings[0],e->h.kind,strings[1],strings[2],body,bytes,referrer,referrer_policy);
-                JS_FreeCString(ctx,referrer);for(unsigned i=0;i<3;i++)JS_FreeCString(ctx,strings[i]);for(unsigned i=0;i<6;i++)JS_FreeValue(ctx,fields[i]);
+                int32_t referrer_policy=0;
+                if(valid)valid=JS_IsNumber(fields[5])&&JS_ToInt32(ctx,&referrer_policy,fields[5])>=0&&referrer_policy>=0&&referrer_policy<=8;
+                struct web_worker_fetch fetch={.url=strings[0],.method=strings[1],.headers=strings[2],.referrer=strings[3],.destination=strings[4],
+                    .body=body,.body_len=bytes,.referrer_policy=referrer_policy};
+                if(valid)ok=w->request&&w->request(w->opaque,c->id,e->h.request,(int)e->h.kind,&fetch);
+                for(unsigned i=0;i<5;i++)JS_FreeCString(ctx,strings[i]);for(unsigned i=0;i<7;i++)JS_FreeValue(ctx,fields[i]);
             }
             if(!ok){if(JS_HasException(ctx)){JSValue error=JS_GetException(ctx);JS_FreeValue(ctx,error);}web_worker_loaded(w,c->id,e->h.request,0,"","",NULL,0,"Worker resource request rejected or allocation failed");}
         }
         else if(e->h.op==NJW_CSP_REPORT){if(report_private(ctx,v)){if(w->reporter)w->reporter(w->report_opaque,v);}else fail(w,c,"Invalid private Worker CSP report");}
         else if(e->h.op==NJW_CANCEL){if(!JS_IsNull(v)||!w->cancel)fail(w,c,"Worker host cannot cancel this resource");else w->cancel(w->opaque,c->id,e->h.request);}
+        else if(e->h.op==NJW_RESUME){if(!JS_IsNull(v)||!w->resume)fail(w,c,"Worker host cannot stream this resource");else w->resume(w->opaque,c->id,e->h.request);}
         else {if(e->h.op!=NJW_CONSOLE||!c||console_prefix(ctx,v,c)){JSValue args[]={JS_NewUint32(ctx,e->id),JS_NewUint32(ctx,e->h.op),v,JS_NewUint32(ctx,e->h.request),JS_NewUint32(ctx,e->h.kind)};web_atomics_import_begin(&e->inbox);JSValue r=JS_Call(ctx,w->callback,JS_UNDEFINED,5,args);web_atomics_import_end();JS_FreeValue(ctx,r);JS_FreeValue(ctx,args[0]);JS_FreeValue(ctx,args[1]);JS_FreeValue(ctx,args[3]);JS_FreeValue(ctx,args[4]);if(e->h.op==NJW_CLOSE&&c)stop(w,c);}}
         JS_FreeValue(ctx,v);
     }}done:web_inbox_close(&e->inbox);free(e->data);free(e);return true;
