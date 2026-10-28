@@ -2337,22 +2337,35 @@ static JSValue computed_inset(struct web_js_state *s, JSContext *ctx, node_t *n,
     const len_t *size = horizontal ? &st->width : &st->height;
     unsigned before = horizontal ? 3 : 0, after = horizontal ? 1 : 2;
     bool constrained = side == after && !len_auto(&in[before]) && !len_auto(&in[after]) &&
-        (st->position == POS_RELATIVE || (!len_auto(size) &&
-         !len_auto(&st->margin[before]) && !len_auto(&st->margin[after])));
+        st->position != POS_RELATIVE && st->position != POS_STICKY && !len_auto(size) &&
+        !len_auto(&st->margin[before]) && !len_auto(&st->margin[after]);
     if (!b || st->display == D_NONE || st->display == D_CONTENTS || st->position == POS_STATIC ||
-        st->position == POS_STICKY || constrained) return computed_length(ctx, &in[side], n->owner);
+        constrained) return computed_length(ctx, &in[side], n->owner);
     float value;
     /* an anchor-positioned box's used inset, against the containing block its position-area made */
     if (box_anchor_inset(b, side, &value)) {
         char text[64]; snprintf(text, sizeof text, "%gpx", (double)(value == 0 ? 0 : value));
         return JS_NewString(ctx, text);
     }
-    if (st->position == POS_RELATIVE) {
-        box_t *relative_cb = b->cb ? b->cb : n->anchor_block;
-        float base = relative_cb ? (horizontal ? relative_cb->w : relative_cb->h) : horizontal ? s->doc->width : s->doc->height;
-        value = !len_auto(&in[before]) ? len_resolve(&in[before], base) :
-            !len_auto(&in[after]) ? -len_resolve(&in[after], base) : 0;
-        if (side == after) value = -value;
+    if (st->position == POS_RELATIVE || st->position == POS_STICKY) {
+        /* CSSOM's resolved value of a relative or sticky inset: a set side is its own value
+           with percentages absolutized (an ignored side too, CSSOM's "absolutize the computed
+           value when over-constrained"), against the containing block's content box, or for
+           a sticky box below a scroll container, that container's content box (css-position-3:
+           sticky insets are relative to the scrollport; the viewport's is the containing
+           block's, as WPT getComputedStyle-insets-sticky*.html expect). An auto side: sticky
+           keeps auto; relative is the opposite side's offset reversed, or 0. */
+        const box_t *base_box = b->cb ? b->cb : n->anchor_block;
+        if (st->position == POS_STICKY)
+            for (const box_t *c = b->cb; c; c = c->cb) {
+                if (box_element_scrollable(c)) { base_box = c; break; }
+                if (box_viewport_fixed(c)) break;
+            }
+        float base = base_box ? (horizontal ? base_box->w : base_box->h) : horizontal ? s->doc->width : s->doc->height;
+        unsigned opposite = side == before ? after : before;
+        if (!len_auto(&in[side])) value = len_resolve(&in[side], base);
+        else if (st->position == POS_STICKY) return JS_NewString(ctx, "auto");
+        else value = len_auto(&in[opposite]) ? 0 : -len_resolve(&in[opposite], base);
     } else {
         box_t *cb = b->cb;
         if (!cb) return computed_length(ctx, &in[side], n->owner);
