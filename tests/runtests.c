@@ -174,7 +174,7 @@ static const struct test tests[] = {
     {"placeholder", "computed-body-without-generated-box", "tcc -IC:\\Tests -o .\\csscachetest C:\\Tests\\csscachetest.c && .\\csscachetest --pseudo-bodies", 0,
      {"csscache-pseudo-bodies: 17 checks, 0 failures"}, "FAIL", 120, false, true},
     {"xmlserializer", "native-namespace-serialization-and-existing-documents", "tcc -IC:\\Tests -o .\\jstest C:\\Tests\\jstest.c && .\\jstest xml-serialization && .\\jstest documents", 0,
-     {"XMLSerializer checks 53", "jstest: 9 checks, 0 failed", "Document checks 153"}, "FAIL", 120, false, true},
+     {"XMLSerializer checks 53", "jstest: 9 checks, 0 failed", "Document checks 155"}, "FAIL", 120, false, true},
     {"paintboundaries", "new-marker-sort-cancellation", "tcc -IC:\\Tests -o .\\paintperformancetest C:\\Tests\\paintperformancetest.c && .\\paintperformancetest --boundaries", 0,
      {"paintperformance boundaries: ", ", 0 failed"}, "FAIL", 120, false, true},
     {"scrollinput", "native-scrollport-chain-and-extent", "tcc -IC:\\Tests -o .\\paintperformancetest C:\\Tests\\paintperformancetest.c && .\\paintperformancetest --scroll-input", 0,

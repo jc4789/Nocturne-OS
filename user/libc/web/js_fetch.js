@@ -1,36 +1,70 @@
-/* Fetch API over the native, CORS-checked browser transport.
-   https://fetch.spec.whatwg.org/#fetch-api (consulted 2026-10-06).
-   Body bytes are real snapshots, not String(BufferSource). Response and Blob
-   bodies expose real Streams with native headers/chunk/end flow control.
-   Stream uploads and manual opaque redirects fail explicitly. Native no-cors
-   fetches perform actual HTTP and expose an empty opaque response after a
-   cross-origin hop; the native worker checks safelists and resource policy.
-   Buffered keepalive requests use a native, document-independent transport;
-   Fetch's 64 KiB inflight body accounting belongs to that native fetch group.
-   Request cache modes use the native partitioned HTTP response cache;
-   only-if-cached asks that cache for a stored response without network I/O.
-   HTTP-generated cache headers belong
-   after CORS preflight, not in the author's Request.headers.
-   https://fetch.spec.whatwg.org/#http-network-or-cache-fetch (2026-10-07).
-   Included after DOMException; initialize after js_encoding.js/js_url.js. */
-const fetchBridge = (() => {
+/* Fetch API (https://fetch.spec.whatwg.org/#fetch-api, consulted 2026-10-28): Headers, Request,
+   Response, the Body mixin and fetch(), one definition for a Window and a Worker realm.
+   fetchInterfaces(realm) builds them over what differs between the two:
+     realm.signals    the realm's AbortSignal (js_abort.js in a Window, the Worker runtime's own):
+                      is, aborted, reason, follow, any (a dependent signal) and controller.
+     realm.transport  the native transport that carries a request: noCors(), streaming(),
+                      fetch(query, notify) -> {id, promise}, resume(id), cancel(id), and
+                      keepaliveRoom() (the bytes the realm's fetch group can still take into its
+                      inflight keepalive bodies; a Window's only, for Beacon). A Window's is
+                      js.c's (host.fetch); a Worker's is its parent window's, through
+                      browserjsworker.c, js_worker.c and js.c (NJW_LOAD, NJW_FRAME, NJW_RESUME).
+     realm.baseURL(), origin(), clientReferrer(), referrerPolicy(), url()
+                      the realm's settings object: API base URL, origin, the "client" referrer
+                      source and its referrer policy (enum webnet_referrer_policy).
+     realm.dataURL(url) -> [bytes, type], task(fn) -> id, clearTask(id), digest(algorithm, bytes),
+     realm.initiator(id) (optional: XHR's Resource Timing initiator).
+   CORS and its preflight, cookies and the credentials mode, Mixed Content, the redirect modes,
+   the HTTP cache modes, opaque filtering and the Cross-Origin-Resource-Policy check are the
+   native transport's (webnet.c, webfetch.c): this layer sends a request's modes with it and
+   never relaxes them. Opaque responses enter a realm already redacted.
+   Body bytes are real snapshots, not String(BufferSource). Response and Blob bodies expose real
+   Streams with native headers/chunk/end flow control. A Request keeps a ReadableStream body;
+   the native transport sends whole bodies only, so fetching one is Fetch's network error for an
+   HTTP/1.x connection. Manual redirects fail explicitly (NotSupportedError). Native no-cors
+   fetches perform actual HTTP and expose an empty opaque response after a cross-origin hop.
+   Buffered keepalive requests use a native, document-independent transport; Fetch's 64 KiB
+   inflight body accounting belongs to that native fetch group. Request cache modes use the
+   native partitioned HTTP response cache; only-if-cached asks that cache for a stored response
+   without network I/O. HTTP-generated cache headers belong after CORS preflight, not in the
+   author's Request.headers (https://fetch.spec.whatwg.org/#http-network-or-cache-fetch).
+   Page-modifiable built-ins (Array, String, RegExp and URL prototypes, Object.prototype) are
+   not consulted on private records: methods are captured here and records have no prototype.
+   Included after DOMException; initialize() after js_encoding.js and js_url.js. */
+function fetchInterfaces(realm) {
+    const signals=realm.signals, transport=realm.transport;
     const headerSlots=new WeakMap(), requestSlots=new WeakMap(), responseSlots=new WeakMap();
-    const bodySlots=new WeakMap(), signalSlots=new WeakMap(), controllerSlots=new WeakMap(),networkSlots=new WeakMap();
+    const bodySlots=new WeakMap(), networkSlots=new WeakMap();
     const NativePromise=Promise, then=Promise.prototype.then, apply=Reflect.apply;
-    const dataURL=host.dataURL, nativeTimer=host.timer, nativeClear=host.clear;
     const NativeWeakRef=WeakRef, deref=WeakRef.prototype.deref;
     const registerFinalizer=FinalizationRegistry.prototype.register,unregisterFinalizer=FinalizationRegistry.prototype.unregister;
-    const dependentFinalizer=new FinalizationRegistry(cleanups=>{for(const [s,fn]of cleanups)s.algorithms.delete(fn);});
-    const networkFinalizer=new FinalizationRegistry(id=>host.cancel(id));
-    const define=Object.defineProperty, create=Object.create, keys=Object.keys, setPrototype=Object.setPrototypeOf;
+    const networkFinalizer=new FinalizationRegistry(id=>transport.cancel(id));
+    const define=Object.defineProperty, create=Object.create, setPrototype=Object.setPrototypeOf;
+    const ownKeys=Reflect.ownKeys, getOwnProperty=Reflect.getOwnPropertyDescriptor, freeze=Object.freeze;
     const weakGet=WeakMap.prototype.get, weakSet=WeakMap.prototype.set, weakHas=WeakMap.prototype.has;
+    const NativeString=String, NativeTypeError=TypeError, iteratorKey=Symbol.iterator;
     // These maps contain the exclusive native transport buffer. Page changes
     // to WeakMap.prototype must not expose private records through callbacks.
-    for(const map of [headerSlots,requestSlots,responseSlots,bodySlots,signalSlots,controllerSlots,networkSlots]) {
+    for(const map of [headerSlots,requestSlots,responseSlots,bodySlots,networkSlots]) {
         define(map,'get',{value:key=>apply(weakGet,map,[key])});
         define(map,'set',{value:(key,value)=>apply(weakSet,map,[key,value])});
         define(map,'has',{value:key=>apply(weakHas,map,[key])});
     }
+    /* Private records and lists: no prototype, so a missing field or index never reaches a
+       getter or setter the page put on Object.prototype or Array.prototype. */
+    const record=object=>setPrototype(object,null);
+    const newList=()=>setPrototype([],null);
+    const add=(list,value)=>{list[list.length]=value;};
+    const pair=(name,value)=>{const p=newList();p[0]=name;p[1]=value;return p;};
+    const charCode=String.prototype.charCodeAt, strSlice=String.prototype.slice, strIndex=String.prototype.indexOf;
+    const toLower=String.prototype.toLowerCase, toUpper=String.prototype.toUpperCase, wellFormed=String.prototype.toWellFormed;
+    const startsWith=String.prototype.startsWith, regexExec=RegExp.prototype.exec;
+    const matches=(pattern,text)=>apply(regexExec,pattern,[text])!==null;
+    const code=(text,i)=>apply(charCode,text,[i]);
+    const slice=(text,a,b)=>apply(strSlice,text,[a,b]);
+    const indexOf=(text,search,from=0)=>apply(strIndex,text,[search,from]);
+    const lower=text=>apply(toLower,text,[]);
+    const beginsWith=(text,prefix)=>apply(startsWith,text,[prefix]);
     function storeBody(object,body) {
         // Missing stream/releaseBytes fields must not invoke an author accessor
         // on Object.prototype with the private Body as its receiver.
@@ -39,39 +73,43 @@ const fetchBridge = (() => {
         if(!('releaseBytes' in body))body.releaseBytes=false;
         bodySlots.set(object,body);
     }
-    const promiseConstructor=Object.freeze({[Symbol.species]:NativePromise});
+    const promiseConstructor=freeze({[Symbol.species]:NativePromise});
     const U8=Uint8Array, AB=ArrayBuffer, isView=ArrayBuffer.isView, taSet=Uint8Array.prototype.set;
     const getter=(proto,key)=>Object.getOwnPropertyDescriptor(proto,key).get;
     const abLength=getter(AB.prototype,'byteLength'), ta=Object.getPrototypeOf(U8.prototype);
     const taBuffer=getter(ta,'buffer'), taOffset=getter(ta,'byteOffset'), taLength=getter(ta,'byteLength');
     const taTag=getter(ta,Symbol.toStringTag), dvBuffer=getter(DataView.prototype,'buffer');
     const dvOffset=getter(DataView.prototype,'byteOffset'), dvLength=getter(DataView.prototype,'byteLength');
-    const stringify=JSON.stringify, parse=JSON.parse, wellFormed=String.prototype.toWellFormed;
-    const token=/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
-    const forbidden=/^(accept-charset|accept-encoding|access-control-request-headers|access-control-request-method|connection|content-length|cookie2?|date|dnt|expect|host|keep-alive|origin|referer|set-cookie|te|trailer|transfer-encoding|upgrade|via)$|^(proxy-|sec-)/i;
-    const nullStatuses=new Set([101,103,204,205,304]);
+    const stringify=JSON.stringify, parse=JSON.parse;
+    const token=/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/, notByte=/[^\x00-\xff]/;
+    const forbidden=/^(accept-charset|accept-encoding|access-control-request-headers|access-control-request-method|connection|content-length|cookie2?|date|dnt|expect|host|keep-alive|origin|referer|set-cookie|te|trailer|transfer-encoding|upgrade|via)$|^(proxy-|sec-)/;
+    const corsUnsafe=/[\x00-\x08\x0a-\x1f"():<>?@\[\\\]{}\x7f]/, languageValue=/^[0-9A-Za-z *,\-.;=]*$/, reasonPhrase=/[^\t\x20-\x7e\x80-\xff]/;
+    const nullStatuses=[101,103,204,205,304], nullStatus=status=>{for(let i=0;i<nullStatuses.length;i++)if(nullStatuses[i]===status)return true;return false;};
     const cacheModes=['default','no-store','reload','no-cache','force-cache','only-if-cached'];
-    const sriCode=String.prototype.charCodeAt, sriIndex=String.prototype.indexOf, sriSlice=String.prototype.slice;
-    const sriDigest=host.cryptoDigest, sriAlphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const referrerPolicies=['','no-referrer','no-referrer-when-downgrade','same-origin','origin','strict-origin','origin-when-cross-origin','strict-origin-when-cross-origin','unsafe-url'];
+    const requestModes=['navigate','same-origin','no-cors','cors'], credentialModes=['omit','same-origin','include'];
+    const redirectModes=['follow','error','manual'], duplexModes=['half'], priorities=['high','low','auto'];
+    const position=(list,value)=>{for(let i=0;i<list.length;i++)if(list[i]===value)return i;return -1;};
+    const sriAlphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
     /* W3C SRI 3.3.2--3.3.4 and Fetch main-fetch integrity handling.
        A malformed supported stronger hash must not downgrade to a matching
        weaker one. Unknown algorithms/options are ignored as specified. */
     function integrityMetadata(text) {
-        let strength=0,algorithm='',values=setPrototype([],null);
+        let strength=0,algorithm='',values=newList();
         const space=c=>c===9||c===10||c===12||c===13||c===32;
         for(let i=0;i<text.length;) {
-            if(space(apply(sriCode,text,[i]))){i++;continue;}
-            const start=i;while(i<text.length&&!space(apply(sriCode,text,[i])))i++;
-            const item=apply(sriSlice,text,[start,i]),option=apply(sriIndex,item,['?']);
-            const expression=option<0?item:apply(sriSlice,item,[0,option]);
-            const dash=apply(sriIndex,expression,['-']),name=dash<0?expression:apply(sriSlice,expression,[0,dash]);
+            if(space(code(text,i))){i++;continue;}
+            const start=i;while(i<text.length&&!space(code(text,i)))i++;
+            const item=slice(text,start,i),option=indexOf(item,'?');
+            const expression=option<0?item:slice(item,0,option);
+            const dash=indexOf(expression,'-'),name=dash<0?expression:slice(expression,0,dash);
             const rank=name==='sha256'?1:name==='sha384'?2:name==='sha512'?3:0;
             if(!rank||rank<strength)continue;
-            if(rank>strength){strength=rank;algorithm=rank===1?'SHA-256':rank===2?'SHA-384':'SHA-512';values=setPrototype([],null);}
-            const next=dash<0?-1:apply(sriIndex,expression,['-',dash+1]);
-            values[values.length]=dash<0?'':apply(sriSlice,expression,[dash+1,next<0?expression.length:next]);
+            if(rank>strength){strength=rank;algorithm=rank===1?'SHA-256':rank===2?'SHA-384':'SHA-512';values=newList();}
+            const next=dash<0?-1:indexOf(expression,'-',dash+1);
+            add(values,dash<0?'':slice(expression,dash+1,next<0?expression.length:next));
         }
-        return {strength,algorithm,values};
+        return record({strength,algorithm,values});
     }
     function verifyIntegrity(response,metadata,signal) {
         if(!metadata)return response;
@@ -80,13 +118,13 @@ const fetchBridge = (() => {
            into integrity-eligible bytes or reveal its internal body. */
         if(meta.type==='opaque'||meta.type==='opaqueredirect'||meta.type==='error')
             throw new TypeError('Response is not eligible for integrity verification');
-        const sig=signalSlots.get(signal);if(sig.aborted)throw sig.reason;
+        if(signals.aborted(signal))throw signals.reason(signal);
         if(!metadata.strength)return response;
         if(body.stream)throw new TypeError('Integrity response was published before buffering completed');
         const bytes=body.bytes===null?new AB(0):body.bytes;
-        const matches=integrityBytes(bytes,metadata);
-        if(sig.aborted)throw sig.reason;
-        if(matches)return response;
+        const matched=integrityBytes(bytes,metadata);
+        if(signals.aborted(signal))throw signals.reason(signal);
+        if(matched)return response;
         /* The response has never escaped to author code. Release its exclusive
            bytes on failure; an integrity error is a Fetch network TypeError. */
         body.bytes=null;body.used=true;
@@ -94,7 +132,7 @@ const fetchBridge = (() => {
     }
     function integrityBytes(bytes,metadata) {
         if(!metadata.strength)return true;
-        const digest=apply(sriDigest,host,[metadata.algorithm,bytes]),size=apply(abLength,digest,[]);
+        const digest=realm.digest(metadata.algorithm,bytes),size=apply(abLength,digest,[]);
         if(size!==(metadata.strength===1?32:metadata.strength===2?48:64))throw new TypeError('Invalid integrity digest');
         const hash=new U8(digest);let encoded='';
         for(let i=0;i<size;i+=3) {
@@ -105,99 +143,201 @@ const fetchBridge = (() => {
         for(let i=0;i<metadata.values.length;i++)if(encoded===metadata.values[i])return true;
         return false;
     }
-    let NativeURL, Params, paramsString, Encoder, encode, Decoder, decode;
+    let NativeURL, paramsString, Encoder, encode, Decoder, decode;
+    let urlHref, urlOrigin, urlProtocol, urlPathname, urlUsername, urlPassword, setUsername, setPassword, setHash;
     let blobAPI,formDataAPI,objectURLAPI,streams;
-    const str=v=>{if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol to string');return String(v);};
+    const str=v=>{if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol to string');return NativeString(v);};
     const usv=v=>apply(wellFormed,str(v),[]);
-    const byteString=v=>{const t=str(v);if(/[^\x00-\xff]/.test(t))throw new TypeError('Expected ByteString');return t;};
-    const dictionary=v=>{if(v==null)return {};if(typeof v!=='object'&&typeof v!=='function')throw new TypeError('Expected dictionary');return v;};
+    const byteString=v=>{const t=str(v);if(matches(notByte,t))throw new TypeError('Expected ByteString');return t;};
     const slot=(map,v,label)=>{const s=map.get(v);if(!s)throw new TypeError('Illegal '+label+' receiver');return s;};
     const notSupported=message=>new DOMException(message,'NotSupportedError');
     const reject=e=>new NativePromise((_,r)=>r(e));
-    const normalizeName=v=>{v=byteString(v).toLowerCase();if(!token.test(v))throw new TypeError('Invalid header name');return v;};
-    const normalizeValue=v=>{v=byteString(v).replace(/^[\t\r\n ]+|[\t\r\n ]+$/g,'');if(/[\0\r\n]/.test(v))throw new TypeError('Invalid header value');return v;};
-    function forbiddenRequest(name,value) {
-        return forbidden.test(name) || (['x-http-method','x-http-method-override','x-method-override'].includes(name)&&
-            value.split(',').some(v=>/^(CONNECT|TRACE|TRACK)$/i.test(v.trim())));
+    const httpSpace=c=>c===9||c===10||c===13||c===32, tabSpace=c=>c===9||c===32;
+    function trim(text,space) {
+        let start=0,end=text.length;
+        while(start<end&&space(code(text,start)))start++;
+        while(end>start&&space(code(text,end-1)))end--;
+        return start||end<text.length?slice(text,start,end):text;
     }
+    const normalizeName=v=>{v=lower(byteString(v));if(!matches(token,v))throw new TypeError('Invalid header name');return v;};
+    function normalizeValue(v) {
+        v=trim(byteString(v),httpSpace);
+        for(let i=0;i<v.length;i++){const c=code(v,i);if(c===0||c===10||c===13)throw new TypeError('Invalid header value');}
+        return v;
+    }
+    /* The URL parser's record, read through the URL prototype's own accessors as this file
+       captured them. */
+    function parseURL(input,base) {
+        try{return new NativeURL(input,base);}catch(_){throw new TypeError('Invalid URL');}
+    }
+    const href=url=>apply(urlHref,url,[]), originOf=url=>apply(urlOrigin,url,[]);
+    function forbiddenRequest(name,value) {
+        if(matches(forbidden,name))return true;
+        if(name!=='x-http-method'&&name!=='x-http-method-override'&&name!=='x-method-override')return false;
+        // "get, decode, and split" the value: each comma-separated part, HTTP tab or space stripped.
+        for(let start=0;;) {
+            const comma=indexOf(value,',',start),part=trim(slice(value,start,comma<0?value.length:comma),tabSpace);
+            const method=apply(toUpper,part,[]);
+            if(method==='CONNECT'||method==='TRACE'||method==='TRACK')return true;
+            if(comma<0)return false;
+            start=comma+1;
+        }
+    }
+    /* A no-CORS-safelisted request-header: its name is one of four and (name, value) is a
+       CORS-safelisted request-header. */
     function noCorsSafe(name,value) {
         if(value.length>128)return false;
-        const unsafe=/[\x00-\x08\x0a-\x1f"():<>?@\[\\\]{}\x7f]/;
-        if(name==='accept')return !unsafe.test(value);
-        if(name==='accept-language'||name==='content-language')return /^[0-9A-Za-z *,\-.;=]*$/.test(value);
+        if(name==='accept')return !matches(corsUnsafe,value);
+        if(name==='accept-language'||name==='content-language')return matches(languageValue,value);
         if(name==='content-type') {
-            if(unsafe.test(value))return false;
-            const essence=value.split(';')[0].trim().toLowerCase();
-            return ['application/x-www-form-urlencoded','multipart/form-data','text/plain'].includes(essence);
+            if(matches(corsUnsafe,value))return false;
+            const semicolon=indexOf(value,';'),essence=lower(trim(semicolon<0?value:slice(value,0,semicolon),httpSpace));
+            return essence==='application/x-www-form-urlencoded'||essence==='multipart/form-data'||essence==='text/plain';
         }
         return false;
     }
     function canChange(s,name,value) {
         if(s.guard==='immutable')throw new TypeError('Headers are immutable');
         if(s.guard==='request'||s.guard==='request-no-cors')if(forbiddenRequest(name,value))return false;
-        if(s.guard==='response'&&/^set-cookie2?$/.test(name))return false;
+        if(s.guard==='response'&&(name==='set-cookie'||name==='set-cookie2'))return false;
         return true;
     }
-    const headerValue=(s,name)=>{const a=s.list.filter(e=>e[0]===name);return a.length?a.map(e=>e[1]).join(', '):null;};
+    function headerValue(s,name) {
+        let value=null;const list=s.list;
+        for(let i=0;i<list.length;i++)if(list[i][0]===name)value=value===null?list[i][1]:value+', '+list[i][1];
+        return value;
+    }
+    function hasHeader(s,name){const list=s.list;for(let i=0;i<list.length;i++)if(list[i][0]===name)return true;return false;}
+    function withoutName(list,name){const out=newList();for(let i=0;i<list.length;i++)if(list[i][0]!==name)add(out,list[i]);return out;}
     function appendHeader(s,name,value) {
         if(!canChange(s,name,value))return;
-        const previous=headerValue(s,name);
-        if(s.guard==='request-no-cors'&&!noCorsSafe(name,previous===null?value:previous+', '+value))return;
-        s.list.push([name,value]);
-        if(s.guard==='request-no-cors')s.list=s.list.filter(e=>e[0]!=='range');
+        if(s.guard==='request-no-cors') {
+            const previous=headerValue(s,name);
+            if(!noCorsSafe(name,previous===null?value:previous+', '+value))return;
+        }
+        add(s.list,pair(name,value));
+        if(s.guard==='request-no-cors')s.list=withoutName(s.list,'range');
     }
-    function fillHeaders(s,init) {
-        if(init==null)return;
-        if(headerSlots.has(init)) {for(const [n,v]of headerSlots.get(init).list)appendHeader(s,n,v);return;}
-        if(typeof init!=='object'&&typeof init!=='function')throw new TypeError('Expected HeadersInit');
-        const iterator=init[Symbol.iterator];
-        if(iterator!==undefined) {
-            if(typeof iterator!=='function')throw new TypeError('HeadersInit is not iterable');
-            for(const pair of init) {
-                if(pair===null||(typeof pair!=='object'&&typeof pair!=='function'))throw new TypeError('Expected header pair');
-                const fields=Array.from(pair);if(fields.length!==2)throw new TypeError('Header pair must contain two items');
-                appendHeader(s,normalizeName(fields[0]),normalizeValue(fields[1]));
-            }
-        } else for(const n of keys(init))appendHeader(s,normalizeName(n),normalizeValue(init[n]));
+    /* Web IDL "create a sequence from an iterable", each value converted as it arrives. */
+    function sequence(object,method,convert) {
+        const iterator=apply(method,object,[]);
+        if(iterator===null||(typeof iterator!=='object'&&typeof iterator!=='function'))throw new TypeError('Iterator is not an object');
+        const next=iterator.next,out=newList();
+        for(;;) {
+            const result=apply(next,iterator,[]);
+            if(result===null||(typeof result!=='object'&&typeof result!=='function'))throw new TypeError('Iterator result is not an object');
+            if(result.done)return out;
+            add(out,convert(result.value));
+        }
     }
+    function headerPair(value) {
+        if(value===null||(typeof value!=='object'&&typeof value!=='function'))throw new TypeError('Expected header pair');
+        const method=value[iteratorKey];
+        if(typeof method!=='function')throw new TypeError('Header pair is not iterable');
+        return sequence(value,method,byteString);
+    }
+    /* Web IDL: HeadersInit, (sequence<sequence<ByteString>> or record<ByteString, ByteString>),
+       converted to a list of pairs. A sequence's items are checked by fill, a record's are
+       pairs already. */
+    function headersInit(value) {
+        if(value===null||(typeof value!=='object'&&typeof value!=='function'))throw new TypeError('Expected HeadersInit');
+        const method=value[iteratorKey];
+        if(method!==undefined&&method!==null) {
+            if(typeof method!=='function')throw new TypeError('HeadersInit is not iterable');
+            return sequence(value,method,headerPair);
+        }
+        const keys=ownKeys(value),out=newList();
+        for(let i=0;i<keys.length;i++) {
+            const key=keys[i],desc=getOwnProperty(value,key);
+            if(desc===undefined||!desc.enumerable)continue;
+            const name=byteString(key);
+            add(out,pair(name,byteString(value[key])));
+        }
+        return out;
+    }
+    /* Fetch "fill" a Headers from a converted HeadersInit. */
+    function fillHeaders(s,list) {
+        for(let i=0;i<list.length;i++) {
+            const item=list[i];
+            if(item.length!==2)throw new TypeError('Header pair must contain two items');
+            appendHeader(s,normalizeName(item[0]),normalizeValue(item[1]));
+        }
+    }
+    function copyList(list){const out=newList();for(let i=0;i<list.length;i++)add(out,pair(list[i][0],list[i][1]));return out;}
+    /* A Headers object of this realm: init is a converted HeadersInit or undefined. */
     function makeHeaders(init,guard='none') {
-        const h=create(Headers.prototype),s={guard:guard==='immutable'?'none':guard,list:[]};
-        headerSlots.set(h,s);fillHeaders(s,init);s.guard=guard;return h;
+        const h=create(Headers.prototype),s=record({guard:guard==='immutable'?'none':guard,list:newList()});
+        headerSlots.set(h,s);if(init!==undefined)fillHeaders(s,init);s.guard=guard;return h;
+    }
+    /* A Headers object whose header list is a copy of source's, with guard. */
+    function copyHeaders(source,guard) {
+        const h=create(Headers.prototype);
+        headerSlots.set(h,record({guard,list:copyList(headerSlots.get(source).list)}));return h;
     }
     function sortedHeaders(s) {
-        const names=[...new Set(s.list.map(e=>e[0]))].sort(),out=[];
-        for(const n of names) {
-            if(n==='set-cookie'){for(const e of s.list)if(e[0]===n)out.push([n,e[1]]);}
-            else out.push([n,headerValue(s,n)]);
+        const names=newList(),list=s.list,out=[];
+        for(let i=0;i<list.length;i++) {
+            const name=list[i][0];let at=names.length;
+            if(position(names,name)>=0)continue;
+            while(at>0&&names[at-1]>name){names[at]=names[at-1];at--;}
+            names[at]=name;
+        }
+        for(let n=0;n<names.length;n++) {
+            const name=names[n];
+            if(name==='set-cookie'){for(let i=0;i<list.length;i++)if(list[i][0]===name)define(out,out.length,{value:[name,list[i][1]],writable:true,enumerable:true,configurable:true});}
+            else define(out,out.length,{value:[name,headerValue(s,name)],writable:true,enumerable:true,configurable:true});
         }
         return out;
     }
     class Headers {
-        constructor(init){headerSlots.set(this,{guard:'none',list:[]});fillHeaders(headerSlots.get(this),init);}
-        append(name,value){const s=slot(headerSlots,this,'Headers');if(arguments.length<2)throw new TypeError('append requires two arguments');appendHeader(s,normalizeName(name),normalizeValue(value));}
+        constructor(init=undefined){
+            const converted=init===undefined?undefined:headersInit(init);
+            const s=record({guard:'none',list:newList()});headerSlots.set(this,s);if(converted!==undefined)fillHeaders(s,converted);
+        }
+        append(name,value){const s=slot(headerSlots,this,'Headers');if(arguments.length<2)throw new TypeError('append requires two arguments');name=byteString(name);value=byteString(value);appendHeader(s,normalizeName(name),normalizeValue(value));}
         set(name,value) {
             const s=slot(headerSlots,this,'Headers');if(arguments.length<2)throw new TypeError('set requires two arguments');
+            name=byteString(name);value=byteString(value);
             name=normalizeName(name);value=normalizeValue(value);if(!canChange(s,name,value))return;
             if(s.guard==='request-no-cors'&&!noCorsSafe(name,value))return;
-            const i=s.list.findIndex(e=>e[0]===name);s.list=s.list.filter(e=>e[0]!==name);
-            s.list.splice(i<0?s.list.length:i,0,[name,value]);
-            if(s.guard==='request-no-cors')s.list=s.list.filter(e=>e[0]!=='range');
+            const list=s.list,out=newList();let placed=false;
+            for(let i=0;i<list.length;i++){if(list[i][0]!==name){add(out,list[i]);continue;}if(!placed){add(out,pair(name,value));placed=true;}}
+            if(!placed)add(out,pair(name,value));
+            s.list=out;
+            if(s.guard==='request-no-cors')s.list=withoutName(s.list,'range');
         }
         delete(name) {
             const s=slot(headerSlots,this,'Headers');if(!arguments.length)throw new TypeError('delete requires name');name=normalizeName(name);
             if(!canChange(s,name,''))return;
-            if(s.guard==='request-no-cors'&&!['accept','accept-language','content-language','content-type','range'].includes(name))return;
-            s.list=s.list.filter(e=>e[0]!==name&&(s.guard!=='request-no-cors'||e[0]!=='range'));
+            if(s.guard==='request-no-cors'&&name!=='accept'&&name!=='accept-language'&&name!=='content-language'&&name!=='content-type'&&name!=='range')return;
+            if(!hasHeader(s,name))return;
+            s.list=withoutName(s.list,name);
+            if(s.guard==='request-no-cors')s.list=withoutName(s.list,'range');
         }
         get(name){const s=slot(headerSlots,this,'Headers');if(!arguments.length)throw new TypeError('get requires name');return headerValue(s,normalizeName(name));}
-        has(name){const s=slot(headerSlots,this,'Headers');if(!arguments.length)throw new TypeError('has requires name');name=normalizeName(name);return s.list.some(e=>e[0]===name);}
-        getSetCookie(){return slot(headerSlots,this,'Headers').list.filter(e=>e[0]==='set-cookie').map(e=>e[1]);}
-        entries(){const s=slot(headerSlots,this,'Headers');return (function*(){for(let i=0;;i++){const list=sortedHeaders(s);if(i>=list.length)return;yield list[i];}})();}
-        keys(){const s=slot(headerSlots,this,'Headers');return (function*(){for(let i=0;;i++){const list=sortedHeaders(s);if(i>=list.length)return;yield list[i][0];}})();}
-        values(){const s=slot(headerSlots,this,'Headers');return (function*(){for(let i=0;;i++){const list=sortedHeaders(s);if(i>=list.length)return;yield list[i][1];}})();}
+        has(name){const s=slot(headerSlots,this,'Headers');if(!arguments.length)throw new TypeError('has requires name');return hasHeader(s,normalizeName(name));}
+        getSetCookie(){const list=slot(headerSlots,this,'Headers').list,out=[];for(let i=0;i<list.length;i++)if(list[i][0]==='set-cookie')define(out,out.length,{value:list[i][1],writable:true,enumerable:true,configurable:true});return out;}
+        entries(){return headersIterator(slot(headerSlots,this,'Headers'),2);}
+        keys(){return headersIterator(slot(headerSlots,this,'Headers'),0);}
+        values(){return headersIterator(slot(headerSlots,this,'Headers'),1);}
         forEach(fn,thisArg){const s=slot(headerSlots,this,'Headers');if(typeof fn!=='function')throw new TypeError('Expected callback');for(let i=0;;i++){const list=sortedHeaders(s);if(i>=list.length)return;apply(fn,thisArg,[list[i][1],list[i][0],this]);}}
-        [Symbol.iterator](){return apply(Headers.prototype.entries,this,[]);}
     }
+    /* Web IDL's default iterator objects of a pair iterator: Headers's value pairs are sort and
+       combine of its header list, taken again at each next(). kind: 0 key, 1 value, 2 both. */
+    const iteratorSlots=new WeakMap();
+    define(iteratorSlots,'get',{value:key=>apply(weakGet,iteratorSlots,[key])});
+    define(iteratorSlots,'set',{value:(key,value)=>apply(weakSet,iteratorSlots,[key,value])});
+    const HeadersIteratorPrototype=create(Object.getPrototypeOf(Object.getPrototypeOf([][iteratorKey]())));
+    define(HeadersIteratorPrototype,'next',{writable:true,enumerable:true,configurable:true,value:function next(){
+        const it=slot(iteratorSlots,this,'Headers Iterator'),list=sortedHeaders(it.headers);
+        if(it.index>=list.length)return {value:undefined,done:true};
+        const entry=list[it.index++];
+        return {value:it.kind===0?entry[0]:it.kind===1?entry[1]:entry,done:false};
+    }});
+    define(HeadersIteratorPrototype,Symbol.toStringTag,{value:'Headers Iterator',configurable:true});
+    function headersIterator(headers,kind){const it=create(HeadersIteratorPrototype);iteratorSlots.set(it,record({headers,kind,index:0}));return it;}
+    // @@iterator is the same function object as entries (Web IDL "iterable declarations").
+    define(Headers.prototype,iteratorKey,{value:Headers.prototype.entries,writable:true,configurable:true});
     // Copy using integer byte access, never ArrayBuffer/TypedArray @@species or
     // page-defined .buffer/.byteOffset accessors. Detached buffers must fail.
     function copyBytes(input) {
@@ -212,23 +352,38 @@ const fetchBridge = (() => {
         return apply(taBuffer,result,[]);
     }
     function isBuffer(input){if(isView(input))return true;try{apply(abLength,input,[]);return true;}catch(_){return false;}}
-    function extractBody(value) {
-        if(value==null)return {bytes:null,type:null};
-        if(isBuffer(value))return {bytes:copyBytes(value),type:null};
-        if(blobAPI&&blobAPI.brand(value))return {bytes:blobAPI.bytes(value),type:blobAPI.type(value)||null};
-        if(formDataAPI&&formDataAPI.brand(value))return formDataAPI.multipart(value);
-        if(streams&&streams.brand(value)) {
-            if(streams.locked(value)||streams.disturbed(value))throw new TypeError('Body stream is locked or disturbed');
-            return {bytes:null,type:null,stream:value};
+    function isParams(input){if(input===null||typeof input!=='object')return false;try{apply(paramsString,input,[]);return true;}catch(_){return false;}}
+    /* Web IDL: BodyInit, (ReadableStream or Blob or BufferSource or FormData or URLSearchParams
+       or USVString). Platform objects stay what they are; anything else becomes a string. */
+    function bodyInit(value) {
+        if(value!==null&&(typeof value==='object'||typeof value==='function')) {
+            if(isBuffer(value)||(blobAPI&&blobAPI.brand(value))||(formDataAPI&&formDataAPI.brand(value))||
+               (streams&&streams.brand(value))||isParams(value))return value;
         }
-        if(Params&&value instanceof Params)return {bytes:apply(taBuffer,apply(encode,new Encoder(),[apply(paramsString,value,[])]),[]),type:'application/x-www-form-urlencoded;charset=UTF-8'};
-        return {bytes:apply(taBuffer,apply(encode,new Encoder(),[usv(value)]),[]),type:'text/plain;charset=UTF-8'};
+        return usv(value);
     }
+    /* Fetch "extract a body" of a converted BodyInit. */
+    function extractBody(value,keepalive=false) {
+        if(value==null)return record({bytes:null,type:null});
+        if(typeof value==='string')return record({bytes:apply(taBuffer,apply(encode,new Encoder(),[value]),[]),type:'text/plain;charset=UTF-8'});
+        if(isBuffer(value))return record({bytes:copyBytes(value),type:null});
+        if(blobAPI&&blobAPI.brand(value))return record({bytes:blobAPI.bytes(value),type:blobAPI.type(value)||null});
+        if(formDataAPI&&formDataAPI.brand(value)){const multipart=formDataAPI.multipart(value);return record({bytes:multipart.bytes,type:multipart.type});}
+        if(streams&&streams.brand(value)) {
+            if(keepalive)throw new TypeError('A keepalive request cannot have a stream body');
+            if(streams.locked(value)||streams.disturbed(value))throw new TypeError('Body stream is locked or disturbed');
+            return record({bytes:null,type:null,stream:value});
+        }
+        if(isParams(value))return record({bytes:apply(taBuffer,apply(encode,new Encoder(),[apply(paramsString,value,[])]),[]),type:'application/x-www-form-urlencoded;charset=UTF-8'});
+        return record({bytes:apply(taBuffer,apply(encode,new Encoder(),[usv(value)]),[]),type:'text/plain;charset=UTF-8'});
+    }
+    /* A body whose source is null: an author's ReadableStream, not bytes this realm holds. */
+    const sourceless=b=>b!==null&&b.bytes===null&&!!b.stream;
     function bodyStream(b) {
         if(b.stream)return b.stream;
         if(b.bytes===null)return null;
         b.stream=streams.fromBytes(b.bytes,()=>{
-            if(b.abort){const signal=slot(signalSlots,b.abort,'AbortSignal');if(signal.aborted)throw signal.reason;}
+            if(b.abort&&signals.aborted(b.abort))throw signals.reason(b.abort);
         });
         /* A Response has no upload consumer. Once its stream owns the bytes,
          * the Body slot must not retain another backing-buffer root. */
@@ -240,7 +395,7 @@ const fetchBridge = (() => {
         let b;try{b=slot(bodySlots,object,'Body');}catch(e){return reject(e);}
         if(kind==='blob'&&!blobAPI)return reject(notSupported('Blob is not initialized'));
         if(unusable(b))return reject(new TypeError('Body already consumed or locked'));
-        if((b.bytes!==null||b.stream)&&b.abort&&slot(signalSlots,b.abort,'AbortSignal').aborted)return reject(slot(signalSlots,b.abort,'AbortSignal').reason);
+        if((b.bytes!==null||b.stream)&&b.abort&&signals.aborted(b.abort))return reject(signals.reason(b.abort));
         const stream=streams?bodyStream(b):null;
         if(b.bytes!==null||stream)b.used=true;
         return new NativePromise((resolve,reject)=>{
@@ -272,140 +427,114 @@ const fetchBridge = (() => {
         define(proto,'body',{configurable:true,enumerable:true,get(){return bodyStream(slot(bodySlots,this,'Body'));}});
         for(const name of ['text','json','arrayBuffer','bytes','blob','formData'])define(proto,name,{configurable:true,enumerable:true,writable:true,value:function(){return consume(this,name);}});
     }
-    const signalToken={};
-    function newSignal(){return new AbortSignal(signalToken);}
-    function abortSignal(signal,reason) {
-        const s=slot(signalSlots,signal,'AbortSignal');if(s.aborted)return;
-        s.aborted=true;s.reason=reason===undefined?new DOMException('The operation was aborted','AbortError'):reason;
-        s.sources=null;
-        const algorithms=[...s.algorithms];s.algorithms.clear();
-        for(const fn of algorithms){try{fn(s.reason);}catch(e){report(e);}}
-        const e=new Event('abort');eventState(e).isTrusted=true;dispatch(signal,e);
-    }
-    function dependentSignal(sources) {
-        const signal=newSignal(),out=signalSlots.get(signal),cleanups=[],reference=new NativeWeakRef(signal);
-        // A live dependent signal keeps its intermediate source signals alive.
-        // Otherwise any([...]) temporaries could disappear before fetch aborts.
-        out.sources=sources.slice();
-        const cleanup=()=>{for(const [s,fn]of cleanups)s.algorithms.delete(fn);cleanups.length=0;};
-        out.algorithms.add(cleanup);
-        for(const source of sources) {
-            const s=slot(signalSlots,source,'AbortSignal');
-            if(s.aborted){abortSignal(signal,s.reason);break;}
-            const fn=reason=>{const target=apply(deref,reference,[]);if(target)abortSignal(target,reason);else cleanup();};
-            s.algorithms.add(fn);cleanups.push([s,fn]);
-        }
-        if(cleanups.length)dependentFinalizer.register(signal,cleanups);
-        return signal;
-    }
-    class AbortSignal extends EventTarget {
-        constructor(t){super();if(t!==signalToken)throw new TypeError('Illegal constructor');signalSlots.set(this,{aborted:false,reason:undefined,algorithms:new Set()});}
-        get aborted(){return slot(signalSlots,this,'AbortSignal').aborted;}
-        get reason(){return slot(signalSlots,this,'AbortSignal').reason;}
-        throwIfAborted(){const s=slot(signalSlots,this,'AbortSignal');if(s.aborted)throw s.reason;}
-        static abort(reason){const signal=newSignal();abortSignal(signal,reason);return signal;}
-        static timeout(ms) {
-            if(!arguments.length)throw new TypeError('timeout requires milliseconds');
-            ms=+ms;if(!Number.isFinite(ms))throw new TypeError('Invalid timeout');
-            ms=Math.trunc(ms);if(ms<0||ms>=18446744073709551616)throw new TypeError('Invalid timeout');
-            // AbortSignal takes unsigned long long, not setTimeout's signed
-            // long. Keep its complete duration and split only the native wait.
-            const signal=newSignal(),started=host.now();
-            const elapsed=()=>{
-                const remaining=ms-(host.now()-started);
-                if(remaining>0)host.timer(0,elapsed,Math.min(remaining,2147483647),[]);
-                else abortSignal(signal,new DOMException('Timed out','TimeoutError'));
-            };
-            host.timer(0,elapsed,Math.min(ms,2147483647),[]);return signal;
-        }
-        static any(signals) {
-            if(!arguments.length)throw new TypeError('any requires signals');
-            if(signals===null||(typeof signals!=='object'&&typeof signals!=='function'))throw new TypeError('Expected signal sequence');
-            if(typeof signals[Symbol.iterator]!=='function')throw new TypeError('Expected iterable signal sequence');
-            const sources=Array.from(signals);for(const source of sources)slot(signalSlots,source,'AbortSignal');return dependentSignal(sources);
-        }
-    }
-    class AbortController {
-        constructor(){controllerSlots.set(this,newSignal());}
-        get signal(){return slot(controllerSlots,this,'AbortController');}
-        abort(reason){abortSignal(slot(controllerSlots,this,'AbortController'),reason);}
-    }
-    abortHandlerTarget=(target,type)=>signalSlots.has(target)&&type==='abort';
-    // addEventListener's signal option: the listener's removal is one of the signal's abort
-    // algorithms, which run before its abort event (DOM "signal abort").
-    {
-        const setAdd=Set.prototype.add,setDelete=Set.prototype.delete;
-        abortSignals={
-            is:value=>apply(mapGet,signalSlots,[value])!==undefined,
-            aborted:signal=>apply(mapGet,signalSlots,[signal]).aborted,
-            follow(signal,steps){
-                const s=apply(mapGet,signalSlots,[signal]);apply(setAdd,s.algorithms,[steps]);
-                return ()=>apply(setDelete,s.algorithms,[steps]);
-            }
-        };
-    }
-    installHandlers(AbortSignal.prototype,['abort']);
-    function readInit(value) {
-        const init=dictionary(value),out={};
-        // WebIDL dictionary members are read once, in lexicographic order.
-        for(const key of ['body','cache','credentials','duplex','headers','integrity','keepalive','method','mode','redirect','referrer','referrerPolicy','signal']) {
-            const v=init[key];if(v!==undefined)out[key]=v;
-        }
+    function dictionary(v){if(v===undefined||v===null)return null;if(typeof v!=='object'&&typeof v!=='function')throw new TypeError('Expected dictionary');return v;}
+    function enumValue(v,allowed,label){v=str(v);if(position(allowed,v)<0)throw new TypeError('Invalid '+label);return v;}
+    /* Web IDL: a RequestInit, its members read once each, in lexicographic order, each
+       converted as it is read. empty: whether no member exists. */
+    function requestInit(value) {
+        const init=dictionary(value),out=record({empty:true});
+        if(init===null)return out;
+        let v;
+        const has=(key,converted)=>{out[key]=converted;out.empty=false;};
+        if((v=init.body)!==undefined)has('body',v===null?null:bodyInit(v));
+        if((v=init.cache)!==undefined)has('cache',enumValue(v,cacheModes,'cache mode'));
+        if((v=init.credentials)!==undefined)has('credentials',enumValue(v,credentialModes,'credentials mode'));
+        if((v=init.duplex)!==undefined)has('duplex',enumValue(v,duplexModes,'duplex mode'));
+        if((v=init.headers)!==undefined)has('headers',headersInit(v));
+        if((v=init.integrity)!==undefined)has('integrity',str(v));
+        if((v=init.keepalive)!==undefined)has('keepalive',!!v);
+        if((v=init.method)!==undefined)has('method',byteString(v));
+        if((v=init.mode)!==undefined)has('mode',enumValue(v,requestModes,'request mode'));
+        if((v=init.priority)!==undefined)has('priority',enumValue(v,priorities,'request priority'));
+        if((v=init.redirect)!==undefined)has('redirect',enumValue(v,redirectModes,'redirect mode'));
+        if((v=init.referrer)!==undefined)has('referrer',usv(v));
+        if((v=init.referrerPolicy)!==undefined)has('referrerPolicy',enumValue(v,referrerPolicies,'referrer policy'));
+        if((v=init.signal)!==undefined){if(v!==null&&!signals.is(v))throw new TypeError('Expected AbortSignal');has('signal',v);}
+        if((v=init.window)!==undefined)has('window',v);
         return out;
     }
-    function enumValue(v,allowed,label){v=str(v);if(!allowed.includes(v))throw new TypeError('Invalid '+label);return v;}
-    const referrerPolicies=['','no-referrer','no-referrer-when-downgrade','same-origin','origin','strict-origin','origin-when-cross-origin','strict-origin-when-cross-origin','unsafe-url'];
-    function makeURL(value){return new NativeURL(usv(value),rawDom.get(document,'baseURI'));}
-    function methodValue(value){const method=byteString(value),upper=method.toUpperCase();if(!token.test(method)||['CONNECT','TRACE','TRACK'].includes(upper))throw new TypeError('Invalid or forbidden HTTP method');return ['DELETE','GET','HEAD','OPTIONS','POST','PUT'].includes(upper)?upper:method;}
+    function makeURL(value){return parseURL(usv(value),realm.baseURL());}
+    function methodValue(method){const upper=apply(toUpper,method,[]);if(!matches(token,method)||upper==='CONNECT'||upper==='TRACE'||upper==='TRACK')throw new TypeError('Invalid or forbidden HTTP method');return upper==='DELETE'||upper==='GET'||upper==='HEAD'||upper==='OPTIONS'||upper==='POST'||upper==='PUT'?upper:method;}
     function cloneBody(b){if(unusable(b))throw new TypeError('Body already consumed or locked');let stream;
         if(b.stream){const branches=streams.tee(b.stream);b.stream=branches[0];stream=branches[1];}
-        return {bytes:b.bytes===null?null:copyBytes(b.bytes),stream,used:false,abort:b.abort};}
-    function requestCopy(s,b) {
-        const object=create(Request.prototype),copy={...s,headers:makeHeaders(s.headers,headerSlots.get(s.headers).guard),signal:dependentSignal([s.signal])};
-        requestSlots.set(object,copy);storeBody(object,b);return object;
-    }
+        return record({bytes:b.bytes===null?null:copyBytes(b.bytes),stream,used:false,abort:b.abort});}
+    function requestObject(s,b){const object=create(Request.prototype);requestSlots.set(object,s);storeBody(object,b);return object;}
+    function requestCopy(s,b){return requestObject(record({...s,headers:copyHeaders(s.headers,headerSlots.get(s.headers).guard),signal:signals.any([s.signal])}),b);}
+    const newRequestRecord=url=>record({url,method:'GET',mode:'cors',credentials:'same-origin',cache:'default',redirect:'follow',
+        referrer:'about:client',referrerPolicy:'',integrity:'',keepalive:false,destination:'',priority:'auto',preflight:false});
     class Request {
-        constructor(input,init={}) {
+        constructor(input,init=undefined) {
             if(!arguments.length)throw new TypeError('Request requires input');
-            const old=requestSlots.get(input),i=readInit(init);
-            let s=old?{...old}:{url:'',method:'GET',mode:'cors',credentials:'same-origin',cache:'default',redirect:'follow',
-                referrer:'about:client',referrerPolicy:'',integrity:'',keepalive:false,destination:''};
-            if(!old){const url=makeURL(input);if(url.username||url.password)throw new TypeError('Request URL cannot contain credentials');s.url=url.href;}
-            if(keys(i).length){s.referrer='about:client';s.referrerPolicy='';}
-            if(i.method!==undefined)s.method=methodValue(i.method);
-            if(i.mode!==undefined)s.mode=enumValue(i.mode,['cors','same-origin','no-cors','navigate'],'request mode');
-            if(s.mode==='navigate')throw new TypeError('Cannot construct navigate request');
-            if(i.credentials!==undefined)s.credentials=enumValue(i.credentials,['omit','same-origin','include'],'credentials mode');
-            if(i.cache!==undefined)s.cache=enumValue(i.cache,cacheModes,'cache mode');
-            if(s.cache==='only-if-cached'&&s.mode!=='same-origin')throw new TypeError('only-if-cached requires same-origin mode');
-            if(i.redirect!==undefined)s.redirect=enumValue(i.redirect,['follow','error','manual'],'redirect mode');
-            if(i.duplex!==undefined)enumValue(i.duplex,['half'],'duplex mode');
-            if(i.integrity!==undefined)s.integrity=str(i.integrity);
-            if(i.keepalive!==undefined)s.keepalive=!!i.keepalive;
-            if(i.referrerPolicy!==undefined)s.referrerPolicy=enumValue(i.referrerPolicy,referrerPolicies,'referrer policy');
+            // Web IDL: RequestInfo (Request or USVString), then the RequestInit dictionary.
+            const old=requestSlots.get(input),source=old?null:usv(input),i=requestInit(init);
+            let s,fallbackMode=null,signal=null;
+            if(!old) {
+                const url=makeURL(source);
+                if(apply(urlUsername,url,[])||apply(urlPassword,url,[]))throw new TypeError('Request URL cannot contain credentials');
+                s=newRequestRecord(href(url));fallbackMode='cors';
+            } else {s=record({...old});signal=old.signal;}
+            if(i.window!==undefined&&i.window!==null)throw new TypeError('RequestInit window must be null');
+            if(!i.empty){if(s.mode==='navigate')s.mode='same-origin';s.referrer='about:client';s.referrerPolicy='';}
             if(i.referrer!==undefined) {
-                const referrer=usv(i.referrer);
-                if(referrer==='')s.referrer='';
-                else {const u=makeURL(referrer);s.referrer=u.protocol==='about:'&&u.pathname==='client'||u.origin!==rawDom.get(document,'fetchOrigin')?'about:client':u.href;}
+                if(i.referrer==='')s.referrer='';
+                else {
+                    const u=makeURL(i.referrer);
+                    s.referrer=apply(urlProtocol,u,[])==='about:'&&apply(urlPathname,u,[])==='client'||originOf(u)!==realm.origin()?'about:client':href(u);
+                }
             }
-            if(s.mode==='no-cors'&&!['GET','HEAD','POST'].includes(s.method))throw new TypeError('no-cors requires a safelisted method');
-            const signal=i.signal!==undefined?i.signal:old?old.signal:null;
-            if(signal!==null)slot(signalSlots,signal,'AbortSignal');
-            s.headers=makeHeaders(i.headers!==undefined?i.headers:old?old.headers:undefined,s.mode==='no-cors'?'request-no-cors':'request');
-            const previous=old?bodySlots.get(input):null,override=i.body!==undefined&&i.body!==null;
-            const previousBody=previous&&(previous.bytes!==null||previous.stream);
-            if((override||previousBody)&&['GET','HEAD'].includes(s.method))throw new TypeError('GET and HEAD cannot have a body');
-            let body;
+            if(i.referrerPolicy!==undefined)s.referrerPolicy=i.referrerPolicy;
+            const mode=i.mode!==undefined?i.mode:fallbackMode;
+            if(mode==='navigate')throw new TypeError('Cannot construct navigate request');
+            if(mode!==null)s.mode=mode;
+            if(i.credentials!==undefined)s.credentials=i.credentials;
+            if(i.cache!==undefined)s.cache=i.cache;
+            if(s.cache==='only-if-cached'&&s.mode!=='same-origin')throw new TypeError('only-if-cached requires same-origin mode');
+            if(i.redirect!==undefined)s.redirect=i.redirect;
+            if(i.integrity!==undefined)s.integrity=i.integrity;
+            if(i.keepalive!==undefined)s.keepalive=i.keepalive;
+            if(i.method!==undefined)s.method=methodValue(i.method);
+            if(i.signal!==undefined)signal=i.signal;
+            if(i.priority!==undefined)s.priority=i.priority;
+            s.signal=signals.any(signal===null?[]:[signal]);
+            // this's headers: request's header list, guard "request", then the mode's guard.
+            const headers=create(Headers.prototype),hs=record({guard:'request',list:old?copyList(headerSlots.get(old.headers).list):newList()});
+            headerSlots.set(headers,hs);s.headers=headers;
+            if(s.mode==='no-cors') {
+                if(s.method!=='GET'&&s.method!=='HEAD'&&s.method!=='POST')throw new TypeError('no-cors requires a safelisted method');
+                hs.guard='request-no-cors';
+            }
+            if(!i.empty) {
+                const previous=hs.list;hs.list=newList();
+                if(i.headers!==undefined)fillHeaders(hs,i.headers);
+                else for(let n=0;n<previous.length;n++)appendHeader(hs,previous[n][0],previous[n][1]);
+            }
+            const inputBody=old?bodySlots.get(input):null,hasInputBody=!!inputBody&&(inputBody.bytes!==null||!!inputBody.stream);
+            const override=i.body!==undefined&&i.body!==null;
+            if((override||hasInputBody)&&(s.method==='GET'||s.method==='HEAD'))throw new TypeError('GET and HEAD cannot have a body');
+            let initBody=null;
             if(override) {
-                const extracted=extractBody(i.body);if(extracted.stream)throw notSupported('ReadableStream uploads require incremental native transport');
-                body={bytes:extracted.bytes,used:false,abort:null};
-                if(extracted.type!==null&&headerValue(headerSlots.get(s.headers),'content-type')===null)appendHeader(headerSlots.get(s.headers),'content-type',extracted.type);
-            } else if(previousBody)body=cloneBody(previous);
-            else body={bytes:null,used:false,abort:null};
-            s.signal=dependentSignal(signal===null?[]:[signal]);
-            // Transferring a Request body consumes the input, unlike clone().
-            if(!override&&previousBody)previous.used=true;
-            requestSlots.set(this,s);storeBody(this,body);
+                const extracted=extractBody(i.body,s.keepalive);
+                initBody=record({bytes:extracted.bytes,stream:extracted.stream||null,used:false,abort:null});
+                if(extracted.type!==null&&!hasHeader(hs,'content-type'))appendHeader(hs,'content-type',extracted.type);
+            }
+            const inputOrInitBody=initBody!==null?initBody:hasInputBody?inputBody:null;
+            s.preflight=false;
+            if(sourceless(inputOrInitBody)) {
+                if(initBody!==null&&i.duplex===undefined)throw new TypeError('A request with a stream body requires duplex "half"');
+                if(s.mode!=='same-origin'&&s.mode!=='cors')throw new TypeError('A request with a stream body requires cors or same-origin mode');
+                s.preflight=true;
+            }
+            let finalBody=inputOrInitBody;
+            if(initBody===null&&hasInputBody) {
+                if(unusable(inputBody))throw new TypeError('Body already consumed or locked');
+                /* Streams "creating a proxy" for inputBody: a new stream that pulls from the input's,
+                   which is locked and disturbed from now on; the input's source (its bytes) stays
+                   the new body's. Transferring a Request body consumes the input, unlike clone(). */
+                finalBody=record({bytes:inputBody.bytes===null?null:copyBytes(inputBody.bytes),
+                    stream:inputBody.stream?streams.proxy(inputBody.stream):null,used:false,abort:inputBody.abort});
+                inputBody.used=true;
+            }
+            requestSlots.set(this,s);storeBody(this,finalBody||{bytes:null,used:false,abort:null});
         }
         clone(){const s=slot(requestSlots,this,'Request');return requestCopy(s,cloneBody(slot(bodySlots,this,'Body')));}
         get destination(){return slot(requestSlots,this,'Request').destination;}
@@ -415,71 +544,84 @@ const fetchBridge = (() => {
     }
     for(const name of ['url','method','headers','credentials','mode','redirect','signal','cache','referrer','referrerPolicy','integrity','keepalive'])
         define(Request.prototype,name,{configurable:true,enumerable:true,get(){return slot(requestSlots,this,'Request')[name];}});
-    function responseObject(s,body) {const object=create(Response.prototype);storeBody(object,body);body.releaseBytes=true;responseSlots.set(object,s);return object;}
+    function responseObject(s,body) {const object=create(Response.prototype);storeBody(object,body);body.releaseBytes=true;responseSlots.set(object,record(s));return object;}
+    /* Web IDL: a ResponseInit, members headers, status and statusText in that order. */
     function responseInit(value) {
-        const init=dictionary(value),headers=init.headers,status=init.status,statusText=init.statusText;
-        let n=status===undefined?200:+status;n=Number.isFinite(n)?((Math.trunc(n)%65536)+65536)%65536:0;
-        if(n<200||n>599)throw new RangeError('Response status must be between 200 and 599');
-        const text=statusText===undefined?'':byteString(statusText);if(/[^\t\x20-\x7e\x80-\xff]/.test(text))throw new TypeError('Invalid statusText');
-        return {status:n,statusText:text,headers:makeHeaders(headers,'response'),url:'',redirected:false,type:'default'};
+        const init=dictionary(value),out=record({headers:undefined,status:200,statusText:''});
+        if(init===null)return out;
+        let v;
+        if((v=init.headers)!==undefined)out.headers=headersInit(v);
+        if((v=init.status)!==undefined){let n=+v;n=Number.isFinite(n)?((Math.trunc(n)%65536)+65536)%65536:0;out.status=n;}
+        if((v=init.statusText)!==undefined)out.statusText=byteString(v);
+        return out;
+    }
+    /* Fetch "initialize a response": the status, status text, headers and body of a new one. */
+    function initializeResponse(i,body) {
+        if(i.status<200||i.status>599)throw new RangeError('Response status must be between 200 and 599');
+        if(matches(reasonPhrase,i.statusText))throw new TypeError('Invalid statusText');
+        const s=record({status:i.status,statusText:i.statusText,headers:makeHeaders(i.headers,'response'),url:'',redirected:false,type:'default'});
+        if(body!==null) {
+            if(nullStatus(s.status))throw new TypeError('This status cannot have a body');
+            if(body.type!==null&&!hasHeader(headerSlots.get(s.headers),'content-type'))appendHeader(headerSlots.get(s.headers),'content-type',body.type);
+        }
+        return s;
     }
     class Response {
-        constructor(body=null,init={}) {
-            const s=responseInit(init),b=extractBody(body);if((b.bytes!==null||b.stream)&&nullStatuses.has(s.status))throw new TypeError('This status cannot have a body');
-            if(b.type!==null&&headerValue(headerSlots.get(s.headers),'content-type')===null)appendHeader(headerSlots.get(s.headers),'content-type',b.type);
-            responseSlots.set(this,s);storeBody(this,{bytes:b.bytes,stream:b.stream,used:false,abort:null,releaseBytes:true});
+        constructor(body=null,init=undefined) {
+            const converted=body===null||body===undefined?null:bodyInit(body),i=responseInit(init);
+            const b=converted===null?null:extractBody(converted),s=initializeResponse(i,b);
+            responseSlots.set(this,s);storeBody(this,{bytes:b?b.bytes:null,stream:b&&b.stream||null,used:false,abort:null,releaseBytes:true});
         }
         get ok(){const n=slot(responseSlots,this,'Response').status;return n>=200&&n<300;}
-        clone(){const s=slot(responseSlots,this,'Response'),b=cloneBody(slot(bodySlots,this,'Body'));return responseObject({...s,headers:makeHeaders(s.headers,headerSlots.get(s.headers).guard)},b);}
+        clone(){const s=slot(responseSlots,this,'Response'),b=cloneBody(slot(bodySlots,this,'Body'));return responseObject({...s,headers:copyHeaders(s.headers,headerSlots.get(s.headers).guard)},b);}
         static error(){return responseObject({status:0,statusText:'',headers:makeHeaders(undefined,'immutable'),url:'',redirected:false,type:'error'},{bytes:null,used:false,abort:null});}
         static redirect(url,status=302) {
-            if(!arguments.length)throw new TypeError('redirect requires URL');const parsed=makeURL(url);
+            if(!arguments.length)throw new TypeError('redirect requires URL');url=usv(url);
             status=+status;status=Number.isFinite(status)?((Math.trunc(status)%65536)+65536)%65536:0;
-            if(![301,302,303,307,308].includes(status))throw new RangeError('Invalid redirect status');
-            const headers=makeHeaders({'location':parsed.href});headerSlots.get(headers).guard='immutable';
+            const parsed=makeURL(url);
+            if(status!==301&&status!==302&&status!==303&&status!==307&&status!==308)throw new RangeError('Invalid redirect status');
+            const headers=makeHeaders(undefined,'immutable');add(headerSlots.get(headers).list,pair('location',href(parsed)));
             return responseObject({status,statusText:'',headers,url:'',redirected:false,type:'default'},{bytes:null,used:false,abort:null});
         }
-        static json(data,init={}) {
+        static json(data,init=undefined) {
             if(!arguments.length)throw new TypeError('json requires data');
-            const text=stringify(data);if(text===undefined)throw new TypeError('Value cannot be serialized as JSON');
-            const s=responseInit(init);if(nullStatuses.has(s.status))throw new TypeError('This status cannot have a body');
-            if(headerValue(headerSlots.get(s.headers),'content-type')===null)appendHeader(headerSlots.get(s.headers),'content-type','application/json');
-            return responseObject(s,{bytes:extractBody(text).bytes,used:false,abort:null});
+            const i=responseInit(init),text=stringify(data);if(text===undefined)throw new TypeError('Value cannot be serialized as JSON');
+            const b=record({bytes:apply(taBuffer,apply(encode,new Encoder(),[text]),[]),type:'application/json'});
+            return responseObject(initializeResponse(i,b),{bytes:b.bytes,used:false,abort:null});
         }
     }
     for(const name of ['type','url','redirected','status','statusText','headers'])define(Response.prototype,name,{configurable:true,enumerable:true,get(){return slot(responseSlots,this,'Response')[name];}});
     installBody(Request.prototype);installBody(Response.prototype);
+    const urlWithoutFragment=url=>{const hash=indexOf(url,'#');return hash<0?url:slice(url,0,hash);};
     function dataFetch(s,body,integrity,observer) {
         if(body.bytes!==null)body.used=true;
         return new NativePromise((resolve,reject)=>{
-            const sig=signalSlots.get(s.signal);let done=false,task=0;
-            const cleanup=()=>sig.algorithms.delete(abort);
+            let done=false,task=0,unfollow=()=>{};
             const fail=reason=>{
-                if(done)return;done=true;cleanup();
-                if(task){apply(nativeClear,host,[task]);task=0;}
+                if(done)return;done=true;unfollow();
+                if(task){realm.clearTask(task);task=0;}
                 reject(reason);if(observer)observer('end',reason,()=>{});
             };
-            const abort=reason=>fail(reason);
-            const schedule=fn=>{task=apply(nativeTimer,host,[0,()=>{task=0;if(done)return;try{fn();}catch(e){fail(e);}},0,[]]);};
+            const schedule=fn=>{task=realm.task(()=>{task=0;if(done)return;try{fn();}catch(e){fail(e);}});};
             // The transport's observer owns flow control. Resume at most once,
             // and on a new task, just as native headers/chunks/end are queued.
             const resume=fn=>{let used=false;return ()=>{if(used||done)return;used=true;try{schedule(fn);}catch(e){fail(e);}};};
-            sig.algorithms.add(abort);
+            unfollow=signals.follow(s.signal,fail);
             try {
                 schedule(()=>{
-                    const local=apply(dataURL,host,[s.url]),bytes=s.method==='HEAD'?null:local[0];
-                    const response=responseObject({status:200,statusText:'OK',url:s.url.split('#')[0],
-                        headers:makeHeaders({'content-type':local[1]},'immutable'),redirected:false,type:'basic'},
-                        {bytes,used:false,abort:s.signal});
+                    const local=realm.dataURL(s.url),bytes=s.method==='HEAD'?null:local[0];
+                    const headers=makeHeaders(undefined,'immutable');add(headerSlots.get(headers).list,pair('content-type',local[1]));
+                    const response=responseObject({status:200,statusText:'OK',url:urlWithoutFragment(s.url),
+                        headers,redirected:false,type:'basic'},{bytes,used:false,abort:s.signal});
                     verifyIntegrity(response,integrity,s.signal);
-                    if(!observer){done=true;cleanup();resolve(response);return;}
-                    const end=()=>{if(done)return;done=true;cleanup();observer('end',undefined,()=>{});};
+                    if(!observer){done=true;unfollow();resolve(response);return;}
+                    const end=()=>{if(done)return;done=true;unfollow();observer('end',undefined,()=>{});};
                     const chunk=()=>{if(bytes!==null&&apply(abLength,bytes,[])!==0)observer('chunk',bytes,resume(end));else end();};
                     const publish=()=>{observer('headers',response,resume(chunk));resolve(response);};
                     if(body.bytes!==null)observer('upload',apply(abLength,body.bytes,[]),resume(publish));else publish();
                 });
             }catch(e){fail(e);}
-            if(sig.aborted)abort(sig.reason);
+            if(signals.aborted(s.signal))fail(signals.reason(s.signal));
         });
     }
     /* prepared: input is a Request this bridge made for the fetch (Cache Storage's addAll), fetched
@@ -489,48 +631,49 @@ const fetchBridge = (() => {
         try {
             r=prepared?input:new Request(input,init);s=requestSlots.get(r);b=bodySlots.get(r);
             if(destination)s.destination=destination;
-            const signal=signalSlots.get(s.signal);if(signal.aborted)return reject(signal.reason);
+            if(signals.aborted(s.signal))return reject(signals.reason(s.signal));
             integrity=s.integrity?integrityMetadata(s.integrity):null;
             // Fetch main fetch selects data before same-origin/no-cors/CORS
             // checks. Local data has a basic response and no HTTP transport,
             // redirect, cache miss, preflight, cookie, or request-header wire.
-            if(s.url.startsWith('data:'))return dataFetch(s,b,integrity,observer);
+            if(beginsWith(s.url,'data:'))return dataFetch(s,b,integrity,observer);
             // Referrer policy/source are private native metadata, never part
             // of author headers or CORS preflight header classification.
             const noReferrer=s.referrer===''||s.referrerPolicy==='no-referrer';
-            let referrer=noReferrer?'':s.referrer==='about:client'?rawDom.get(document,'fetchClientReferrer'):s.referrer;
-            if(referrer){const source=new NativeURL(referrer);source.username='';source.password='';source.hash='';referrer=source.href;}
-            const referrerPolicy=s.referrerPolicy?referrerPolicies.indexOf(s.referrerPolicy):rawDom.get(document,'referrerPolicy');
-            // This host has no stored HTTP responses. A cache-only miss is a
-            // Fetch network error (TypeError), not a synthetic HTTP 504, and
-            // cannot reach host.fetch even for a cross-origin target URL.
-            if(objectURLAPI&&s.url.startsWith('blob:')){
-                const local=objectURLAPI.fetch(s.url,s.method,headerValue(headerSlots.get(s.headers),'range')),fields={'content-type':local.type,'content-length':String(local.size)};if(local.range)fields['content-range']=local.range;const headers=makeHeaders(fields,'immutable');
-                const response=responseObject({status:local.status,statusText:local.status===206?'Partial Content':'OK',url:s.url.split('#')[0],headers,redirected:false,type:'basic'},{bytes:s.method==='HEAD'?null:local.bytes,used:false,abort:s.signal});
+            let referrer=noReferrer?'':s.referrer==='about:client'?realm.clientReferrer():s.referrer;
+            if(referrer){const source=parseURL(referrer);apply(setUsername,source,['']);apply(setPassword,source,['']);apply(setHash,source,['']);referrer=href(source);}
+            const referrerPolicy=s.referrerPolicy?position(referrerPolicies,s.referrerPolicy):realm.referrerPolicy();
+            if(objectURLAPI&&beginsWith(s.url,'blob:')){
+                const local=objectURLAPI.fetch(s.url,s.method,headerValue(headerSlots.get(s.headers),'range')),headers=makeHeaders(undefined,'immutable'),list=headerSlots.get(headers).list;
+                add(list,pair('content-type',local.type));add(list,pair('content-length',NativeString(local.size)));if(local.range)add(list,pair('content-range',local.range));
+                const response=responseObject({status:local.status,statusText:local.status===206?'Partial Content':'OK',url:urlWithoutFragment(s.url),headers,redirected:false,type:'basic'},{bytes:s.method==='HEAD'?null:local.bytes,used:false,abort:s.signal});
                 return new NativePromise(resolve=>resolve(verifyIntegrity(response,integrity,s.signal)));
             }
-            if(s.mode==='no-cors'&&!host.noCorsFetch)throw notSupported('This native context has no no-cors transport');
+            if(s.mode==='no-cors'&&!transport.noCors())throw notSupported('This native context has no no-cors transport');
             if(s.redirect==='manual')throw notSupported('Opaque manual redirect responses are not supported');
-            let raw='';for(const [name,value]of sortedHeaders(headerSlots.get(s.headers)))raw+=name+': '+value+'\r\n';
-            let pair,channel,channelRef,waiting,transportId=0,done=false,hasBody=false,finishStream=()=>{};
+            // HTTP-network fetch: a body without a source (an author's stream) cannot be sent
+            // over an HTTP/1.x connection, and the native transport sends whole bodies only.
+            if(sourceless(b))throw new TypeError('The native transport cannot send a streaming request body');
+            let raw='';{const list=sortedHeaders(headerSlots.get(s.headers));for(let n=0;n<list.length;n++)raw+=list[n][0]+': '+list[n][1]+'\r\n';}
+            let started,channel,channelRef,waiting,transportId=0,done=false,hasBody=false,finishStream=()=>{};
             const liveChannel=()=>channel||(channelRef&&apply(deref,channelRef,[]));
-            const resume=()=>{if(!done&&transportId)host.resumeFetch(transportId);};
+            const resume=()=>{if(!done&&transportId)transport.resume(transportId);};
             /* Integrity responses must be fully verified before either their
                headers/Response or body stream is exposed. Requests without
                metadata retain the existing native streaming flow control. */
-            if(host.streamingFetch&&streams&&!integrity){
+            if(transport.streaming()&&streams&&!integrity){
                 channel=streams.network(()=>new NativePromise(resolve=>{waiting=resolve;resume();}),reason=>{
-                    if(done)return;done=true;finishStream();host.cancel(transportId);
+                    if(done)return;done=true;finishStream();transport.cancel(transportId);
                     if(waiting){const resolve=waiting;waiting=null;resolve();}
                 });
             }
             const notify=channel?(event,value)=>{
                 if(done)return true;
                 const active=liveChannel();
-                if(!active){done=true;finishStream();host.cancel(transportId);return false;}
+                if(!active){done=true;finishStream();transport.cancel(transportId);return false;}
                 if(event===1){
                     const state=slot(bodySlots,value,'Body'),meta=slot(responseSlots,value,'Response');
-                    hasBody=s.method!=='HEAD'&&meta.type!=='opaque'&&!nullStatuses.has(meta.status);
+                    hasBody=s.method!=='HEAD'&&meta.type!=='opaque'&&!nullStatus(meta.status);
                     state.bytes=null;state.abort=s.signal;
                     if(hasBody&&!observer){state.stream=active.stream;networkSlots.set(active.stream,active);apply(registerFinalizer,networkFinalizer,[active,transportId,active]);channelRef=new NativeWeakRef(active);channel=null;}
                     if(observer){observer('headers',value,resume);return false;}
@@ -554,16 +697,19 @@ const fetchBridge = (() => {
                 }
                 return false;
             }:undefined;
-            pair=host.fetch(s.url,s.method,raw,b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),forcePreflight,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache),s.keepalive,s.mode==='no-cors',noReferrer,notify,referrer,referrerPolicy,s.destination);
-            transportId=pair.id;const transportPromise=pair.promise;pair=null;
-            if(observer)performanceBridge.initiator(transportId,'xmlhttprequest');
+            started=transport.fetch(record({url:s.url,method:s.method,headers:raw,body:b.bytes,sameOrigin:s.mode==='same-origin',
+                credentials:position(credentialModes,s.credentials),forcePreflight:forcePreflight||s.preflight,redirectError:s.redirect==='error',
+                cache:position(cacheModes,s.cache),keepalive:s.keepalive,noCors:s.mode==='no-cors',noReferrer,referrer,referrerPolicy,
+                destination:s.destination}),notify);
+            transportId=started.id;const transportPromise=started.promise;started=null;
+            if(observer&&realm.initiator)realm.initiator(transportId);
             if(b.bytes!==null)b.used=true;
             return new NativePromise((resolve,reject)=>{
-                let finished=false,pendingReject=reject;
-                const sig=signalSlots.get(s.signal),cleanup=()=>sig.algorithms.delete(abort);
-                const abort=reason=>{if(done)return;done=true;finished=true;cleanup();const active=liveChannel();if(active){active.error(reason);apply(unregisterFinalizer,networkFinalizer,[active]);}channel=null;channelRef=null;if(waiting){const resolve=waiting;waiting=null;resolve();}try{host.cancel(transportId);}finally{if(pendingReject)pendingReject(reason);pendingReject=null;if(observer)observer('end',reason,()=>{});}};
+                let finished=false,pendingReject=reject,unfollow=()=>{};
+                const cleanup=()=>{const stop=unfollow;unfollow=()=>{};stop();};
+                const abort=reason=>{if(done)return;done=true;finished=true;cleanup();const active=liveChannel();if(active){active.error(reason);apply(unregisterFinalizer,networkFinalizer,[active]);}channel=null;channelRef=null;if(waiting){const resolve=waiting;waiting=null;resolve();}try{transport.cancel(transportId);}finally{if(pendingReject)pendingReject(reason);pendingReject=null;if(observer)observer('end',reason,()=>{});}};
                 finishStream=cleanup;
-                sig.algorithms.add(abort);
+                unfollow=signals.follow(s.signal,abort);
                 try {
                     define(transportPromise,'constructor',{value:promiseConstructor});
                     apply(then,transportPromise,[response=>{
@@ -574,27 +720,57 @@ const fetchBridge = (() => {
                             resolve(verifyIntegrity(response,integrity,s.signal));
                         }catch(e){reject(e);}
                     },error=>{if(finished)return;finished=true;done=true;cleanup();reject(error);}]);
-                }catch(e){finished=true;done=true;cleanup();const active=liveChannel();if(active)active.error(e);host.cancel(transportId);pendingReject=null;reject(e);}
-                if(sig.aborted)abort(sig.reason);
+                }catch(e){finished=true;done=true;cleanup();const active=liveChannel();if(active)active.error(e);transport.cancel(transportId);pendingReject=null;reject(e);}
+                if(signals.aborted(s.signal))abort(signals.reason(s.signal));
             });
         }catch(e){return reject(e);}
     }
-    function fetch(input,init){if(!arguments.length)return reject(new TypeError('fetch requires input'));return fetchCore(input,init);}
-    for(const [C,name]of [[Headers,'Headers'],[Request,'Request'],[Response,'Response'],[AbortSignal,'AbortSignal'],[AbortController,'AbortController']]) {
+    function fetch(input,init=undefined){if(!arguments.length)return reject(new TypeError('fetch requires input'));return fetchCore(input,init);}
+    for(const [C,name]of [[Headers,'Headers'],[Request,'Request'],[Response,'Response']]) {
         define(C.prototype,Symbol.toStringTag,{value:name,configurable:true});
         for(const key of Object.getOwnPropertyNames(C.prototype)){if(key==='constructor')continue;const d=Object.getOwnPropertyDescriptor(C.prototype,key);d.enumerable=true;define(C.prototype,key,d);}
     }
+    /* A native header block (CRLF lines: a status line, Name: value fields, the transport's
+       HTTP/Nocturne- lines), read line by line. */
+    function eachLine(raw,fn){for(let start=0;start<raw.length;){const end=indexOf(raw,'\n',start),stop=end<0?raw.length:end;fn(slice(raw,start,stop>start&&code(raw,stop-1)===13?stop-1:stop));start=stop+1;}}
+    const statusLine=/^HTTP\/\S+\s+\d{3}(?:[ \t]+([^\r\n]*))?/;
+    const transportMeta=/^HTTP\/Nocturne-Meta cors=([01]) redirected=([01])(?: opaque=([01]))?(?: resource=[0-7])?\r?$/m;
+    const opaqueResponse=resource=>responseObject({status:0,statusText:'',url:'',headers:makeHeaders(undefined,'immutable'),redirected:false,type:'opaque',resource},{bytes:null,used:false,abort:null});
     return {
-        Headers,Request,Response,AbortSignal,AbortController,fetch,
-        /* The engine's own fetch for an element: a track, a media fallback. */
-        fetchFor(destination,input,init){return fetchCore(input,init,undefined,false,destination);},
+        Headers,Request,Response,fetch,
+        /* The engine's own fetch for an element: a track, a media fallback. Its init is the
+           engine's, copied without a prototype. */
+        fetchFor(destination,input,init){return fetchCore(input,init===undefined?undefined:record({...init}),undefined,false,destination);},
+        /* Beacon's sendBeacon steps (https://w3c.github.io/beacon/#sec-processing-model, consulted
+           2026-10-28): url parsed against the realm's API base URL, an HTTP(S) scheme, the data's
+           body extracted with keepalive, false when the fetch group's inflight keepalive bytes
+           cannot take it, then a credentialed keepalive POST whose mode is no-cors unless the
+           extracted Content-Type is not a CORS-safelisted request-header. */
+        beacon(url,data){
+            const target=parseURL(usv(url),realm.baseURL()),scheme=apply(urlProtocol,target,[]);
+            if(scheme!=='http:'&&scheme!=='https:')throw new TypeError('sendBeacon requires an HTTP(S) URL');
+            let body=null,type=null;
+            if(data!==null&&data!==undefined){const extracted=extractBody(bodyInit(data),true);body=extracted.bytes;type=extracted.type;}
+            if(body!==null&&apply(abLength,body,[])>transport.keepaliveRoom())return false;
+            const headers=type===null?undefined:record({'content-type':type});
+            const mode=type!==null&&!noCorsSafe('content-type',type)?'cors':'no-cors';
+            const started=fetchCore(href(target),record({method:'POST',body:body===null?undefined:body,headers,keepalive:true,credentials:'include',mode}));
+            apply(then,started,[undefined,()=>{}]);
+            return true;
+        },
         moduleIntegrity(bytes,metadata){return integrityBytes(bytes,integrityMetadata(metadata));},
-        initialize(){NativeURL=globalThis.URL;Params=globalThis.URLSearchParams;paramsString=Params.prototype.toString;Encoder=globalThis.TextEncoder;encode=Encoder.prototype.encode;Decoder=globalThis.TextDecoder;decode=Decoder.prototype.decode;},
+        initialize(){
+            NativeURL=globalThis.URL;paramsString=globalThis.URLSearchParams.prototype.toString;Encoder=globalThis.TextEncoder;encode=Encoder.prototype.encode;Decoder=globalThis.TextDecoder;decode=Decoder.prototype.decode;
+            const url=NativeURL.prototype,accessor=key=>Object.getOwnPropertyDescriptor(url,key);
+            urlHref=accessor('href').get;urlOrigin=accessor('origin').get;urlProtocol=accessor('protocol').get;urlPathname=accessor('pathname').get;
+            urlUsername=accessor('username').get;urlPassword=accessor('password').get;
+            setUsername=accessor('username').set;setPassword=accessor('password').set;setHash=accessor('hash').set;
+        },
         initializeBlobs(api){blobAPI=api;},
         initializeFormData(api){formDataAPI=api;},
         initializeStreams(api){streams=api;},
         initializeObjectURLs(api){objectURLAPI=api;},
-        xhrBody(value){const binary=isBuffer(value)||!!(blobAPI&&blobAPI.brand(value))||!!(formDataAPI&&formDataAPI.brand(value)),body=extractBody(value);if(body.stream)throw notSupported('XHR stream uploads are unsupported');return {...body,binary};},
+        xhrBody(value){const binary=isBuffer(value)||!!(blobAPI&&blobAPI.brand(value))||!!(formDataAPI&&formDataAPI.brand(value)),body=extractBody(bodyInit(value));if(body.stream)throw notSupported('XHR stream uploads are unsupported');return {...body,binary};},
         xhrResponse(response) {
             // Only the private XHR completion path calls this. Do not invoke
             // page-mutable Response getters or publish a backing-buffer API.
@@ -603,32 +779,38 @@ const fetchBridge = (() => {
             const bytes=b.bytes===null?new AB(0):b.bytes;b.bytes=null;b.used=true;
             return {status:s.status,statusText:s.statusText,url:s.url,headers:s.headers,bytes};
         },
-        xhrFetch(url,init,observer,forcePreflight){const signal=newSignal();return {promise:fetchCore(url,{...init,signal},observer,forcePreflight),cancel(){abortSignal(signal);}};},
+        /* XHR's own request: init and its header record are the engine's, read without a prototype. */
+        xhrFetch(url,init,observer,forcePreflight){
+            const c=signals.controller(),q=record({...init,signal:c.signal});
+            if(q.headers!==null&&typeof q.headers==='object')q.headers=record({...q.headers});
+            return {promise:fetchCore(url,q,observer,forcePreflight),cancel(){c.abort();}};
+        },
         xhrMetadata(response){const s=slot(responseSlots,response,'Response');return {status:s.status,statusText:s.statusText,url:s.url,headers:s.headers};},
         /* Cache Storage's view of this realm's Fetch objects (js_cache_storage.js): a record of a
            Request's or a Response's own request or response (never its page-mutable getters), the
            objects a match makes of stored ones (immutable headers, a new signal), and the fetch of
            add and addAll. A header list is [name, value, ...]; extra is what the broker keeps for
-           this realm to read back. */
+           this realm to read back. Every realm writes and reads the same records. */
         cache:{
             isRequest:v=>requestSlots.has(v),isResponse:v=>responseSlots.has(v),
             newRequest:input=>new Request(input),
             request(r){
                 const s=slot(requestSlots,r,'Request'),list=headerSlots.get(s.headers).list,headers=[];
-                for(let i=0;i<list.length;i++){headers[headers.length]=list[i][0];headers[headers.length]=list[i][1];}
+                for(let i=0;i<list.length;i++){define(headers,headers.length,{value:list[i][0],writable:true,enumerable:true,configurable:true});define(headers,headers.length,{value:list[i][1],writable:true,enumerable:true,configurable:true});}
                 return {url:s.url,method:s.method,headers,extra:stringify({__proto__:null,m:s.mode,c:s.credentials,k:s.cache,r:s.redirect,
                     f:s.referrer,p:s.referrerPolicy,i:s.integrity,a:s.keepalive,d:s.destination})};
             },
             makeRequest(url,method,headers,x){
-                const object=create(Request.prototype),h=makeHeaders(undefined,'immutable'),list=headerSlots.get(h).list;
-                for(let i=0;i+1<headers.length;i+=2)list[list.length]=[headers[i],headers[i+1]];
-                requestSlots.set(object,{url,method,mode:x.m,credentials:x.c,cache:x.k,redirect:x.r,referrer:x.f,referrerPolicy:x.p,
-                    integrity:x.i,keepalive:x.a,destination:x.d,headers:h,signal:newSignal()});
-                storeBody(object,{bytes:null,used:false,abort:null});return object;
+                const h=makeHeaders(undefined,'immutable'),list=headerSlots.get(h).list;
+                for(let i=0;i+1<headers.length;i+=2)add(list,pair(headers[i],headers[i+1]));
+                const s=newRequestRecord(url);
+                s.method=method;s.mode=x.m;s.credentials=x.c;s.cache=x.k;s.redirect=x.r;s.referrer=x.f;s.referrerPolicy=x.p;
+                s.integrity=x.i;s.keepalive=x.a;s.destination=x.d;s.headers=h;s.signal=signals.controller().signal;
+                return requestObject(s,{bytes:null,used:false,abort:null});
             },
             response(r){
                 const s=slot(responseSlots,r,'Response'),b=slot(bodySlots,r,'Body'),list=headerSlots.get(s.headers).list,headers=[];
-                for(let i=0;i<list.length;i++){headers[headers.length]=list[i][0];headers[headers.length]=list[i][1];}
+                for(let i=0;i<list.length;i++){define(headers,headers.length,{value:list[i][0],writable:true,enumerable:true,configurable:true});define(headers,headers.length,{value:list[i][1],writable:true,enumerable:true,configurable:true});}
                 return {type:s.type,status:s.status,headers,unusable:unusable(b),
                     extra:stringify({__proto__:null,t:s.type,s:s.status,x:s.statusText,u:s.url,r:s.redirected,c:s.resource})};
             },
@@ -636,41 +818,41 @@ const fetchBridge = (() => {
             takeBody(r){return bodyStream(slot(bodySlots,r,'Body'));},
             makeResponse(x,headers,stream){
                 const h=makeHeaders(undefined,'immutable'),list=headerSlots.get(h).list;
-                for(let i=0;i+1<headers.length;i+=2)list[list.length]=[headers[i],headers[i+1]];
+                for(let i=0;i+1<headers.length;i+=2)add(list,pair(headers[i],headers[i+1]));
                 const meta={status:x.s,statusText:x.x,headers:h,url:x.u,redirected:x.r,type:x.t};
                 if(x.t==='opaque')meta.resource=x.c;
                 return responseObject(meta,{bytes:null,stream,used:false,abort:null});
             },
             /* A fetch of r as it is, which signal can abort too. */
             fetch(r,signal){
-                const s=slot(requestSlots,r,'Request'),object=create(Request.prototype);
-                requestSlots.set(object,{...s,headers:makeHeaders(s.headers,headerSlots.get(s.headers).guard),signal:dependentSignal([s.signal,signal])});
-                storeBody(object,cloneBody(slot(bodySlots,r,'Body')));
-                return fetchCore(object,undefined,undefined,false,'',true);
+                try{
+                    const s=slot(requestSlots,r,'Request');
+                    const object=requestObject(record({...s,headers:copyHeaders(s.headers,headerSlots.get(s.headers).guard),signal:signals.any([s.signal,signal])}),cloneBody(slot(bodySlots,r,'Body')));
+                    return fetchCore(object,undefined,undefined,false,'',true);
+                }catch(e){return reject(e);}
             },
-            controller(){const signal=newSignal();return {signal,abort(reason){abortSignal(signal,reason);}};}
+            controller(){return signals.controller();}
         },
+        /* A response the native transport delivered to this realm. Native completions redact
+           opaque internals before entering it; resource is the bits Cache Storage's resource
+           policy check needs of the hidden response (js.c's fetch_resource_bits), private. The
+           header block is read without author-modifiable regex, string or URL methods. */
         response(status,url,raw,text,bytes,redirected,statusText,type,resource) {
-            // Native completions redact the opaque internals before entering
-            // this realm. Do not inspect author-modifiable regex/URL methods.
-            // resource: the bits Cache Storage's resource policy check needs
-            // of the hidden response (js.c's fetch_resource_bits), private.
-            if(type==='opaque')return responseObject({status:0,statusText:'',url:'',headers:makeHeaders(undefined,'immutable'),redirected:false,type:'opaque',resource:typeof resource==='number'?resource:2},{bytes:null,used:false,abort:null});
-            const headers=makeHeaders(undefined,'response');
-            for(const line of raw.split(/\r?\n/)){const i=line.indexOf(':');if(i>0&&!line.startsWith('HTTP/'))appendHeader(headerSlots.get(headers),normalizeName(line.slice(0,i)),normalizeValue(line.slice(i+1)));}
-            headerSlots.get(headers).guard='immutable';
-            if(statusText===undefined){const m=/^HTTP\/\S+\s+\d{3}(?:[ \t]+([^\r\n]*))?/.exec(raw);statusText=m?(m[1]||''):'';}
+            if(type==='opaque')return opaqueResponse(typeof resource==='number'?resource:2);
+            const headers=makeHeaders(undefined,'response'),hs=headerSlots.get(headers);raw=NativeString(raw);
+            eachLine(raw,line=>{const colon=indexOf(line,':');if(colon>0&&!beginsWith(line,'HTTP/'))appendHeader(hs,normalizeName(slice(line,0,colon)),normalizeValue(slice(line,colon+1,line.length)));});
+            hs.guard='immutable';
+            if(statusText===undefined){const m=apply(regexExec,statusLine,[raw]);statusText=m?(m[1]||''):'';}
             // Negotiated native metadata is not an HTTP field: webfetch only
             // copies server fields containing ':', so a server cannot forge it.
-            const transport=type===undefined?/^HTTP\/Nocturne-Meta cors=([01]) redirected=([01])(?: opaque=([01]))?(?: resource=[0-7])?\r?$/m.exec(raw):null;
-            if(transport&&transport[3]==='1')return responseObject({status:0,statusText:'',url:'',headers:makeHeaders(undefined,'immutable'),redirected:false,type:'opaque',resource:2},{bytes:null,used:false,abort:null});
-            if(transport){type=transport[1]==='1'?'cors':'basic';redirected=transport[2]==='1';}
-            if(type===undefined)type=new NativeURL(url).origin===new NativeURL(host.url()).origin?'basic':'cors';
-            return responseObject({status,statusText,url:usv(url).split('#')[0],headers,redirected:!!redirected,type},
+            const meta=type===undefined?apply(regexExec,transportMeta,[raw]):null;
+            if(meta&&meta[3]==='1')return opaqueResponse(2);
+            if(meta){type=meta[1]==='1'?'cors':'basic';redirected=meta[2]==='1';}
+            if(type===undefined)type=originOf(parseURL(url))===originOf(parseURL(realm.url()))?'basic':'cors';
+            return responseObject({status,statusText,url:urlWithoutFragment(usv(url)),headers,redirected:!!redirected,type},
                 // The native hook transfers an exclusive runtime-charged
                 // snapshot. Author constructors and clone still copy/tee.
-                {bytes:nullStatuses.has(status)?null:bytes,used:false,abort:null});
+                {bytes:nullStatus(status)?null:bytes,used:false,abort:null});
         }
     };
-})();
-const {Headers,Request,Response,AbortSignal,AbortController,fetch}=fetchBridge;
+}

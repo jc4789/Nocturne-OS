@@ -725,7 +725,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
                 if (cached->body && link_sheet_applies(c)) {
                     if(c->cssom_current) {
                         int error;struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                        if(sheet)complete=add_sheet_ast(d,sheet->source,sheet->length,sheet->base,d->next_sheet_order++,media,scope,sheet->ast);
+                        if(sheet)complete=add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,d->next_sheet_order++,sheet->media,scope,sheet->p.ast);
                         else if(error==CSSOM_OOM)web_js_console(d,2,"Native link style sheet allocation failed");
                     }else complete=add_sheet(d,cached->body,cached->n,cached->base,d->next_sheet_order++,media,scope);
                 }
@@ -748,7 +748,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
                 if (css && link_sheet_applies(c)) {
                     if(c->cssom_current) {
                         int error;struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                        if(sheet)complete=add_sheet_ast(d,sheet->source,sheet->length,sheet->base,pd->order,pd->media,scope,sheet->ast);
+                        if(sheet)complete=add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,pd->order,sheet->media,scope,sheet->p.ast);
                         else if(error==CSSOM_OOM)web_js_console(d,2,"Native link style sheet allocation failed");
                     }else complete=add_sheet(d,css,dn,d->base,pd->order,pd->media,scope);
                 }
@@ -763,14 +763,17 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
         case T_style: {
             const char *type = node_attr(c, "type");
             const char *media = node_attr(c, "media");
+            /* A sheet CSSOM stands for applies by its MediaList, which starts
+               as the media attribute and scripts may change. */
+            bool cssom = d->live && c->cssom_current;
             if (c->style_disabled || (type && *type && !str_ieq(type, "text/css")) ||
-                !media_wanted(media) || node_ancestor(c, T_template)) break;
+                (!cssom && !media_wanted(media)) || node_ancestor(c, T_template)) break;
             /* Keep the existing per-snapshot native AST reuse for untouched
                sheets. A real CSSOM handle lazily promotes only its owner to
                persistent parser storage, not every repeated component style. */
-            if (d->live && c->cssom_current) {
+            if (cssom) {
                 int error; struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                if (sheet) add_sheet_ast(d,sheet->source,sheet->length,sheet->base,d->next_sheet_order++,media,scope,sheet->ast);
+                if (sheet) add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,d->next_sheet_order++,sheet->media,scope,sheet->p.ast);
                 else if (error==CSSOM_OOM) web_js_console(d,2,"Native style sheet allocation failed");
             } else {
                 sbuf b = {0}; text_of(c,&b);
@@ -802,8 +805,8 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
     if (n == d->root || n->shadow_host) {
         for (uint32_t i = 0; i < n->adopted_count; i++) {
             struct cssom_sheet *s = n->adopted_sheets[i];
-            if (!s->disabled) add_sheet_ast(d, s->source, s->length, s->base,
-                d->next_sheet_order++, s->media, scope, s->ast);
+            if (!s->disabled) add_sheet_ast(d, s->p.source, s->p.length, s->base,
+                d->next_sheet_order++, s->media, scope, s->p.ast);
         }
     }
 }
@@ -1478,8 +1481,15 @@ bool web_paint_dirty(web_doc *d) {
     return dirty;
 }
 bool web_script_running(web_doc *d) { return d && d->live && web_js_running(d); }
+static void focus_keyboard_input(web_doc *d, const struct web_event *e);
 bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
     if(!d||!d->live)return true;
+    if(e&&e->type&&!e->synthetic) {
+        /* the latest user input, for :focus-visible */
+        web_doc *input=target&&target->owner?target->owner:d;
+        if(!strcmp(e->type,"keydown"))focus_keyboard_input(input,e);
+        else if(!strcmp(e->type,"mousedown")||!strcmp(e->type,"pointerdown"))input->focus_modality=WEB_MODALITY_POINTER;
+    }
     /* WHATWG image-button activation: capture the selected point in the
        displayed image before click listeners can replace layout or reparent
        it. Only an uncanceled explicit coordinate selection updates it;
@@ -1582,8 +1592,12 @@ bool doc_css_loading(web_doc *d) {
     return false;
 }
 
-void web_free(web_doc *d) {
-    if (!d) return;
+/* A document family (a document and its dom_docs) shares nodes: a node is allocation-owned by one
+   member and may be DOM-owned by another after adoption. web_free releases the whole family in
+   three steps, so that no step reads a member that an earlier step freed: each member's own state
+   (scripts, styles, boxes, animations, parsers), then every member's allocation-owned nodes, then
+   every member's storage. */
+static void doc_release(web_doc *d) {
     while (d->scroll_input_first) {
         node_t *n = d->scroll_input_first;
         d->scroll_input_first = n->scroll_input_next;
@@ -1620,11 +1634,8 @@ void web_free(web_doc *d) {
     web_form_validation_free(d);
     /* Parser subscriptions can borrow allocation-owned nodes in helper docs. */
     doc_parser_stop(d);
-    while (d->dom_docs) {
-        web_doc *child = d->dom_docs;
-        d->dom_docs = child->dom_next; child->dom_next = NULL;
-        web_free(child);
-    }
+}
+static void doc_nodes_retire(web_doc *d) {
     if (d->owned_nodes) {
         for (node_t *n = d->owned_nodes; n; n = n->owned_next) {
             /* Allocation ownership differs from DOM ownership after adoption.
@@ -1643,6 +1654,8 @@ void web_free(web_doc *d) {
             free(n->input_edit);
         }
     } else if (d->root) free_values(d->root);
+}
+static void doc_storage_free(web_doc *d) {
     css_style_doc_free(d);
     free_pending(d);
     pv_free(&d->pending_css);
@@ -1686,6 +1699,29 @@ void web_free(web_doc *d) {
     free(d->referrer);
     free(d->content_type);
     free(d);
+}
+static void family_release(web_doc *member) {
+    for (; member; member = member->dom_next) { doc_release(member); family_release(member->dom_docs); }
+}
+static void family_retire(web_doc *member) {
+    for (; member; member = member->dom_next) { family_retire(member->dom_docs); doc_nodes_retire(member); }
+}
+static void family_free(web_doc *d) {
+    while (d->dom_docs) {
+        web_doc *child = d->dom_docs;
+        d->dom_docs = child->dom_next; child->dom_next = NULL;
+        family_free(child);
+        doc_storage_free(child);
+    }
+}
+void web_free(web_doc *d) {
+    if (!d) return;
+    doc_release(d);
+    family_release(d->dom_docs);
+    family_retire(d->dom_docs);
+    doc_nodes_retire(d);
+    family_free(d);
+    doc_storage_free(d);
 }
 
 const char *web_title(web_doc *d) { return d->title ? d->title : ""; }
@@ -2304,6 +2340,17 @@ static double scroll_align_delta(double first, double last, double start, double
     return 0;
 }
 
+struct scroll_target_union { double left, top, right, bottom; bool found; };
+static bool scroll_target_span(void *opaque, const box_t *space, double x, double y, double w, double h) {
+    (void)space;
+    struct scroll_target_union *u = opaque;
+    if (!u->found) { u->left = x; u->top = y; u->right = x + w; u->bottom = y + h; u->found = true; return true; }
+    if (x < u->left) u->left = x;
+    if (y < u->top) u->top = y;
+    if (x + w > u->right) u->right = x + w;
+    if (y + h > u->bottom) u->bottom = y + h;
+    return true;
+}
 static bool scroll_target_rect(node_t *n, double r[4]) {
     box_t *b = n->box;
     if (!b || !b->st || b->st->display == D_NONE) return false;
@@ -2313,25 +2360,12 @@ static bool scroll_target_rect(node_t *n, double r[4]) {
         r[2] = b->w + b->p[1] + b->p[3] + b->b[1] + b->b[3];
         r[3] = b->h + b->p[0] + b->p[2] + b->b[0] + b->b[2];
     } else {
-        /* Native inline fragments are deco spans in their formatting block,
-           not a fabricated parentNode relationship or the unpositioned inline
-           box. Union this element's painted spans in its first native block. */
-        box_t *a = n->anchor_block;
-        if (!a) return false;
-        double x = box_visual_x(a), y = box_visual_y(a) + a->content_dy;
-        if (box_element_scrollable(a)) { x -= a->node->scroll_x; y -= a->node->scroll_y; }
-        bool found = false;
-        double right = 0, bottom = 0;
-        for (int i = 0; i < a->ndecos; i++) {
-            const struct deco *span = &a->decos[i];
-            if (span->node != n) continue;
-            double l = x + span->x, t = y + span->y, rr = l + span->w, bb = t + span->h;
-            if (!found) { r[0] = l; r[1] = t; right = rr; bottom = bb; found = true; }
-            else { if (l < r[0]) r[0] = l; if (t < r[1]) r[1] = t;
-                   if (rr > right) right = rr; if (bb > bottom) bottom = bb; }
-        }
-        if (!found) return false;
-        r[2] = right - r[0]; r[3] = bottom - r[1];
+        /* Native inline fragments are deco spans in their formatting block (layout owns
+           which), not a fabricated parentNode relationship or the unpositioned inline box. */
+        struct scroll_target_union u = {0};
+        layout_inline_rects(n, true, scroll_target_span, &u);
+        if (!u.found) return false;
+        r[0] = u.left; r[1] = u.top; r[2] = u.right - u.left; r[3] = u.bottom - u.top;
     }
     return isfinite(r[0]) && isfinite(r[1]) && isfinite(r[2]) && isfinite(r[3]);
 }
@@ -2633,18 +2667,37 @@ bool doc_control_selection_supported(const node_t *n) {
 }
 
 /* Control strings use UTF-8, with WTF-8 for isolated JS UTF-16 surrogates.
-   Count a scalar outside the BMP as two code units; never count bytes as units. */
-static uint32_t control_decode(const char *text, size_t *byte) {
+   Count a scalar outside the BMP as two code units; never count bytes as units.
+   CharacterData is the same encoding, counted: its data may hold U+0000. */
+static uint32_t utf16_decode(const char *text, size_t length, size_t *byte) {
     const unsigned char *p = (const unsigned char *)text + *byte;
+    size_t room = length - *byte;
     uint32_t cp = *p; size_t n = 1;
     if (cp >= 0xc2 && cp <= 0xf4) {
         size_t want = cp < 0xe0 ? 2 : cp < 0xf0 ? 3 : 4;
         uint32_t out = cp & (want == 2 ? 31 : want == 3 ? 15 : 7);
         size_t j = 1;
-        while (j < want && p[j] && (p[j] & 0xc0) == 0x80) { out = (out << 6) | (p[j] & 63); j++; }
+        while (j < want && j < room && (p[j] & 0xc0) == 0x80) { out = (out << 6) | (p[j] & 63); j++; }
         if (j == want && out <= 0x10ffff && out >= (want == 2 ? 0x80u : want == 3 ? 0x800u : 0x10000u)) { cp = out; n = want; }
     }
     *byte += n; return cp;
+}
+/* A NUL ends a control string: it is not a continuation byte either. */
+static uint32_t control_decode(const char *text, size_t *byte) { return utf16_decode(text, SIZE_MAX, byte); }
+uint32_t doc_text_utf16(const char *text, size_t length, size_t byte) {
+    uint32_t units = 0; size_t at = 0;
+    if (byte > length) byte = length;
+    while (text && at < byte) units += utf16_decode(text, length, &at) > 0xffff ? 2 : 1;
+    return units;
+}
+size_t doc_text_byte(const char *text, size_t length, uint32_t offset, bool round_up) {
+    size_t byte = 0; uint32_t at = 0;
+    while (text && byte < length && at < offset) {
+        size_t before = byte; uint32_t count = utf16_decode(text, length, &byte) > 0xffff ? 2 : 1;
+        if (offset - at < count) return round_up ? byte : before;
+        at += count;
+    }
+    return byte;
 }
 uint32_t doc_utf16_length(const char *text) {
     uint32_t length = 0; size_t byte = 0;
@@ -2786,6 +2839,23 @@ static node_t *focus_delegate(web_doc *d, node_t *parent) {
     return target ? target : focus_descendants(d, parent, false);
 }
 
+/* Selectors 4 :focus-visible heuristics: an element that takes keyboard input
+   (a text-entry control or an editing host) always shows focus; another one
+   does unless a pointer press was the latest user input. A focus() call's
+   focusVisible decides it instead. */
+static bool focus_shows_indicator(web_doc *d, node_t *n) {
+    if (d->focus_visible_request) return d->focus_visible_request == 2;
+    if (n->type == N_ELEM && !n->foreign) {
+        if (n->tag == T_textarea) return true;
+        if (n->tag == T_input) {
+            enum web_input_kind type = web_input_type(n);
+            if (type <= WEB_INPUT_PASSWORD || (type >= WEB_INPUT_DATE && type <= WEB_INPUT_NUMBER)) return true;
+        }
+        const char *editable = node_attr(n, "contenteditable");
+        if (editable && !str_ieq(editable, "false")) return true;
+    }
+    return d->focus_modality != WEB_MODALITY_POINTER;
+}
 void web_focus(web_doc *d, web_node *n) {
     if (!d) return;
     if(n && n->owner && n->owner!=d && n->owner->frame_parent){
@@ -2815,11 +2885,23 @@ void web_focus(web_doc *d, web_node *n) {
         n->selection_direction = 0; n->selection_set = true;
     }
     node_t *old = d->focus;
+    bool was_visible = d->focus_visible;
     d->focus = n;
     d->caret = 0;
+    d->focus_visible = n && focus_shows_indicator(d, n);
     if (n) doc_control_caret(d, n);
     css_mark_state_moved(d, CSS_STATE_FOCUS, old, n);
+    if (n && old == n && was_visible != d->focus_visible) css_mark_dirty(d, n);
     d->dirty = true;
+}
+/* Selectors 4 :focus-visible after a key press: the focused element shows its
+   indicator from then on, though the key moved no focus. */
+static void focus_keyboard_input(web_doc *d, const struct web_event *e) {
+    static const char *const modifiers[] = {"Alt", "AltGraph", "CapsLock", "Control", "Fn", "Meta", "NumLock", "Shift"};
+    if (e->ctrl || e->alt) return; /* a shortcut, not keyboard navigation or typing */
+    for (size_t i = 0; e->key && i < sizeof modifiers / sizeof *modifiers; i++) if (!strcmp(e->key, modifiers[i])) return;
+    d->focus_modality = WEB_MODALITY_KEYBOARD;
+    if (d->focus && !d->focus_visible) { d->focus_visible = true; css_mark_dirty(d, d->focus); }
 }
 
 web_node *web_focused(web_doc *d) {

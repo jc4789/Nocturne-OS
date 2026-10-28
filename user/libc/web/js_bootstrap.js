@@ -3,7 +3,7 @@
     'use strict';
     delete globalThis.__nocturne_host;
     const domOperations=host.domOperations || Object.fromEntries(
-        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'move', 'moveStatus', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
+        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'caretPosition', 'caretRect', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'move', 'moveStatus', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rangeRects', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleBlock', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
     const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
     // Reading never runs custom element reactions: getters go to the native operation directly.
     const domGet=domOperations.get;
@@ -18,7 +18,7 @@
     function dom(op, ...args) {
         const mutation = op === 'shadowAttach' || op === 'slotAssign' || op === 'insert' || op === 'replace' || op === 'replaceAll' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'import' || op === 'set' || op === 'attrSetNode' || op === 'attrRemoveNode' ||
             (op === 'attrNS' && args.length > 3) ||
-            ((op === 'attr' || op === 'style') && args.length > 2);
+            ((op === 'attr' || op === 'style') && args.length > 2) || (op === 'styleBlock' && args.length > 1);
         return mutation && customElementsReady && customElementsBridge.active() ? customElementsBridge.reactions(() => domOperations[op](...args)) : domOperations[op](...args);
     }
     // IDL reflection always addresses the null namespace; getAttribute remains
@@ -752,6 +752,9 @@
         set className(v) { reflectedAttr(this,'class',String(v)); }
         get classList() { return tokenListBridge.for(this,'class'); }
         set classList(value) { tokenListBridge.for(this,'class').value=value; }
+        /* CSS Shadow Parts: the element's part names, for ::part() */
+        get part() { return tokenListBridge.for(this,'part'); }
+        set part(value) { tokenListBridge.for(this,'part').value=value; }
         getAttribute(name) { return dom('attr',this,String(name)); }
         setAttribute(name,value) { dom('attr',this,String(name),String(value)); }
         removeAttribute(name) { dom('attr',this,String(name),null); }
@@ -779,12 +782,22 @@
                 dom('remove',this);
             });
         }
-        querySelector(selector) { return dom('query',this,String(selector),true); }
-        querySelectorAll(selector) { return list(dom('query',this,String(selector),false)); }
-        matches(selector) { if(!arguments.length)throw new TypeError("Failed to execute 'matches': 1 argument required");return dom('matches',this,String(selector)); }
+        querySelector(selector) { return selectorQuery(this,selector,true); }
+        querySelectorAll(selector) { return list(selectorQuery(this,selector,false)); }
+        matches(selector) { if(!arguments.length)throw new TypeError("Failed to execute 'matches': 1 argument required");return selectorMatches(this,String(selector),this); }
         /* DOM: a legacy alias of matches (an operation of its own name, the same steps). */
-        webkitMatchesSelector(selector) { if(!arguments.length)throw new TypeError("Failed to execute 'webkitMatchesSelector': 1 argument required");return dom('matches',this,String(selector)); }
-        closest(selector) { for(let n=this;n&&n.nodeType===1;n=n.parentElement) if(n.matches(selector))return n; return null; }
+        webkitMatchesSelector(selector) { if(!arguments.length)throw new TypeError("Failed to execute 'webkitMatchesSelector': 1 argument required");return selectorMatches(this,String(selector),this); }
+        closest(selector) {
+            // DOM: parse once, then the inclusive ancestor elements, with this as :scope
+            if(!arguments.length)throw new TypeError("Failed to execute 'closest': 1 argument required");
+            selector=String(selector);
+            for(let n=this;n;){
+                if(selectorMatches(n,selector,this))return n;
+                const parent=domGet(n,'parentNode');
+                n=parent&&domGet(parent,'nodeType')===1?parent:null;
+            }
+            return null;
+        }
         getElementsByTagName(name) { name=String(name);return collectionBridge.domHTML(this,()=>rawDom.tagQuery(this,name)); }
         getElementsByTagNameNS(namespace,localName) {
             if(arguments.length<2)throw new TypeError('Namespace and local name are required');
@@ -804,6 +817,30 @@
         set style(value) { inlineStyle(this).cssText=value; }
         get dataset() { const n=this;return new Proxy({}, {get(_,k){return reflectedAttr(n,'data-'+String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase()));},set(_,k,v){reflectedAttr(n,'data-'+String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase()),v);return true;}}); }
     }
+    // DOM "scope-match a selectors string" and "match a selector": an invalid
+    // selector is a "SyntaxError" DOMException.
+    function invalidSelector(selector) { return domExceptionBridge.create('SyntaxError', "'"+selector+"' is not a valid selector"); }
+    function selectorQuery(node, selector, first) {
+        selector=String(selector);
+        const result=dom('query',node,selector,first);
+        if(result===false)throw invalidSelector(selector);
+        return result;
+    }
+    function selectorMatches(node, selector, scope) {
+        const result=dom('matches',node,selector,scope);
+        if(result===null)throw invalidSelector(selector);
+        return result;
+    }
+    // HTML FocusOptions (WebIDL dictionary, members in lexicographic order):
+    // focusVisible, or undefined when absent; preventScroll is read and kept
+    // for the conversion's observable getters.
+    function focusOptionsVisible(options) {
+        if (options === undefined || options === null) return undefined;
+        if (typeof options !== 'object' && typeof options !== 'function') throw new TypeError('FocusOptions must be an object');
+        const visible = options.focusVisible;
+        void options.preventScroll;
+        return visible === undefined ? undefined : !!visible;
+    }
     class HTMLElement extends Element {
         constructor() { return customElementsBridge.construct(new.target); }
         get offsetParent() { return dom('geometry',this,'offsetParent'); }
@@ -821,7 +858,7 @@
         set selected(v) { dom('set',this,'selected',!!v); }
         get disabled() { return reflectedAttr(this,'disabled')!==null; }
         set disabled(v) { reflectedAttr(this,'disabled',v?'':null); }
-        focus() { dom('focus',this); }
+        focus(options = undefined) { dom('focus',this,focusOptionsVisible(options)); }
         blur() { dom('blur',this); }
         click() { host.click(this); }
     }
@@ -1180,7 +1217,11 @@
         eventState(e).initialized=false;return e;
     };
     function cssName(k){return k==='cssFloat'?'float':String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase());}
-    const styleToken={},styleRecords=new WeakMap(),cssPropertyMetadata=host.cssProperties();
+    /* A CSSStyleDeclaration is an element's inline style (node), its computed
+       style (computed), or a rule's declarations (js_stylesheets.js: backend,
+       whose block, read, write and setText reach cssom.c). Every one is the
+       native declaration block: its names and cssText are its serialization. */
+    const styleToken={},ruleStyleToken={},styleRecords=new WeakMap(),cssPropertyMetadata=host.cssProperties();
     /* CSSOM lists computed longhands in code-unit order with prefixed names
        last; the native table is already in code-unit order. Built on first
        enumeration, not in every realm's bootstrap. */
@@ -1193,20 +1234,22 @@
     }
     function styleRecord(value){const record=styleRecords.get(value);if(!record)throw new TypeError('Invalid CSSStyleDeclaration receiver');return record;}
     function styleProperty(name){name=String(name);return name.startsWith('--')?name:name.toLowerCase();}
+    function styleBlock(record){return record.backend?record.backend.block():dom('styleBlock',record.node);}
     function styleNames(value){
         const record=styleRecord(value);
-        if(!record.computed)return (reflectedAttr(record.node,'style')||'').split(';').filter(x=>x.includes(':')).map(x=>x.split(':')[0].trim());
+        if(!record.computed)return styleBlock(record).slice(1);
         const custom=host.cssProperties(record.node,record.pseudo);if(custom===null)return [];
         const names=[],seen=new Set();for(const [name,valid] of custom){if(seen.has(name))continue;seen.add(name);if(valid)names.push(name);}
         return longhandNames().concat(names);
     }
-    function styleRead(value,name){const record=styleRecord(value);return record.computed?
-        dom('computed',record.node,styleProperty(name),record.pseudo):dom('style',record.node,styleProperty(name));}
+    function styleRead(value,name){const record=styleRecord(value);
+        if(record.backend)return record.backend.read(styleProperty(name),false);
+        return record.computed?dom('computed',record.node,styleProperty(name),record.pseudo):dom('style',record.node,styleProperty(name));}
     function styleWrite(value,name,text,priority=''){
         /* CSSOM: value and priority are [LegacyNullToEmptyString]. */
         name=styleProperty(name);text=text==null?'':String(text);priority=priority===null?'':String(priority);
         const record=styleRecord(value);if(record.computed)throw new DOMException('Computed style is read-only','NoModificationAllowedError');
-        dom('style',record.node,name,text,priority);
+        if(record.backend)record.backend.write(name,text,priority);else dom('style',record.node,name,text,priority);
     }
     function styleIndex(key){return typeof key==='string'&&/^(0|[1-9][0-9]*)$/.test(key)?Number(key):-1;}
     function inlineStyle(node){
@@ -1215,9 +1258,14 @@
     }
     class CSSStyleDeclaration {
         constructor(node,computed,token,pseudo=null){
-            if(token!==styleToken)throw new TypeError('Illegal constructor');
-            if(!rawDom.isNode(null,node)||rawDom.get(node,'nodeType')!==1)throw new TypeError('Expected an Element');
-            const record={node,computed:!!computed,pseudo:computed&&pseudo!=null?String(pseudo):''};styleRecords.set(this,record);
+            let record;
+            if(token===ruleStyleToken)record={node:null,backend:node,computed:false,pseudo:''};
+            else {
+                if(token!==styleToken)throw new TypeError('Illegal constructor');
+                if(!rawDom.isNode(null,node)||rawDom.get(node,'nodeType')!==1)throw new TypeError('Expected an Element');
+                record={node,computed:!!computed,pseudo:computed&&pseudo!=null?String(pseudo):''};
+            }
+            styleRecords.set(this,record);
             const proxy=new Proxy(this,{
                 get(t,k,r){const i=styleIndex(k);return i>=0?styleNames(t)[i]:Reflect.get(t,k,r);},
                 set(t,k,v,r){if(styleIndex(k)>=0)return false;return Reflect.set(t,k,v,r);},
@@ -1226,11 +1274,13 @@
                 getOwnPropertyDescriptor(t,k){const i=styleIndex(k);if(i>=0){const name=styleNames(t)[i];return name===undefined?undefined:{value:name,writable:false,enumerable:true,configurable:true};}return Reflect.getOwnPropertyDescriptor(t,k);}
             });styleRecords.set(proxy,record);return proxy;
         }
-        get cssText(){const r=styleRecord(this);return r.computed?'':reflectedAttr(r.node,'style')||'';}
-        set cssText(v){v=v==null?'':String(v);const r=styleRecord(this);if(r.computed)throw new DOMException('Computed style is read-only','NoModificationAllowedError');reflectedAttr(r.node,'style',v);}
-        get parentRule(){styleRecord(this);return null;}
+        get cssText(){const r=styleRecord(this);return r.computed?'':styleBlock(r)[0];}
+        set cssText(v){v=v==null?'':String(v);const r=styleRecord(this);if(r.computed)throw new DOMException('Computed style is read-only','NoModificationAllowedError');
+            if(r.backend)r.backend.setText(v);else dom('styleBlock',r.node,v);}
+        get parentRule(){const r=styleRecord(this);return r.backend?r.backend.rule:null;}
         getPropertyValue(name){return styleRead(this,name);}
-        getPropertyPriority(name){name=styleProperty(name);const r=styleRecord(this);return r.computed?'':dom('stylePriority',r.node,name);}
+        getPropertyPriority(name){name=styleProperty(name);const r=styleRecord(this);
+            return r.backend?r.backend.read(name,true):r.computed?'':dom('stylePriority',r.node,name);}
         setProperty(name,value,priority=''){styleWrite(this,name,value,priority);}
         removeProperty(name){name=styleProperty(name);const old=styleRead(this,name);styleWrite(this,name,'');return old;}
         get length(){return styleNames(this).length;}
@@ -1238,6 +1288,24 @@
         *[Symbol.iterator](){for(let i=0;i<styleNames(this).length;i++)yield styleNames(this)[i];}
     }
     class CSSStyleProperties extends CSSStyleDeclaration {}
+    /* @font-face's and @page's descriptor blocks (CSS Fonts 5, CSSOM) */
+    class CSSFontFaceDescriptors extends CSSStyleDeclaration {}
+    class CSSPageDescriptors extends CSSStyleDeclaration {}
+    for(const [C,names] of [[CSSFontFaceDescriptors,['src','font-family','font-style','font-weight','font-stretch','font-width','font-size',
+        'size-adjust','unicode-range','font-feature-settings','font-variation-settings','font-named-instance','font-display',
+        'font-language-override','ascent-override','descent-override','line-gap-override','superscript-position-override',
+        'subscript-position-override','superscript-size-override','subscript-size-override']],
+        [CSSPageDescriptors,['margin','margin-top','margin-right','margin-bottom','margin-left','size','page-orientation','marks','bleed']]])
+        for(const name of names){
+            const camel=name.replace(/-([a-z])/g,(_,c)=>c.toUpperCase());
+            for(const key of new Set([name,camel]))Object.defineProperty(C.prototype,key,{configurable:true,enumerable:true,
+                get(){return styleRead(this,name);},set(value){styleWrite(this,name,value);}});
+        }
+    /* a rule's declarations: kind 'page', 'font-face' or the properties */
+    function cssRuleStyle(kind,backend){
+        const C=kind==='page'?CSSPageDescriptors:kind==='font-face'?CSSFontFaceDescriptors:CSSStyleProperties;
+        return new C(backend,false,ruleStyleToken);
+    }
     /* Expose only the native engine's real properties, not a permissive `has`
        trap. Each named accessor reads/writes the same declaration as methods. */
     for(const [name] of cssPropertyMetadata){
@@ -1247,6 +1315,8 @@
     }
     Object.defineProperty(CSSStyleDeclaration.prototype,Symbol.toStringTag,{value:'CSSStyleDeclaration',configurable:true});
     Object.defineProperty(CSSStyleProperties.prototype,Symbol.toStringTag,{value:'CSSStyleProperties',configurable:true});
+    Object.defineProperty(CSSFontFaceDescriptors.prototype,Symbol.toStringTag,{value:'CSSFontFaceDescriptors',configurable:true});
+    Object.defineProperty(CSSPageDescriptors.prototype,Symbol.toStringTag,{value:'CSSPageDescriptors',configurable:true});
     const CSS={escape(s){return Array.from(String(s)).map((c,i)=>/[a-zA-Z_\-]/.test(c)||(/[0-9]/.test(c)&&i>0)?c:'\\'+c.codePointAt(0).toString(16)+' ').join('');}};
     /* @include js_dom_exception.js */
     const DOMException=domExceptionBridge.DOMException,QuotaExceededError=domExceptionBridge.QuotaExceededError;
@@ -1254,7 +1324,21 @@
     /* @include js_pointer_events.js */
     /* @include js_tokens.js */
     const DOMTokenList=tokenListBridge.DOMTokenList;
+    /* @include js_abort.js */
     /* @include js_fetch.js */
+    /* This Window's settings and transport for Fetch: js.c's native fetch (CORS, cookies, Mixed
+       Content, CSP and the HTTP cache are its), the document's base URL, origin, referrer source
+       and policy container. */
+    const fetchBridge=fetchInterfaces({signals:abortBridge.signals,
+        transport:{noCors:()=>!!host.noCorsFetch,streaming:()=>!!host.streamingFetch,
+            fetch:(q,notify)=>host.fetch(q.url,q.method,q.headers,q.body,q.sameOrigin,q.credentials,q.forcePreflight,q.redirectError?1:0,q.cache,
+                q.keepalive,q.noCors,q.noReferrer,notify,q.referrer,q.referrerPolicy,q.destination),
+            resume:id=>host.resumeFetch(id),cancel:id=>host.cancel(id),keepaliveRoom:()=>host.keepaliveRoom()},
+        baseURL:()=>rawDom.get(document,'baseURI'),origin:()=>rawDom.get(document,'fetchOrigin'),
+        clientReferrer:()=>rawDom.get(document,'fetchClientReferrer'),referrerPolicy:()=>rawDom.get(document,'referrerPolicy'),
+        url:()=>host.url(),dataURL:url=>host.dataURL(url),task:fn=>host.timer(0,fn,0,[]),clearTask:id=>host.clear(id),
+        digest:(algorithm,bytes)=>host.cryptoDigest(algorithm,bytes),initiator:id=>performanceBridge.initiator(id,'xmlhttprequest')});
+    const {Headers,Request,Response,fetch}=fetchBridge;
     const location={assign(url){host.navigate(String(url),0);},replace(url){host.navigate(String(url),2);},reload(){host.navigate(host.url(),1);},toString(){return this.href;}};
     Object.defineProperties(location,{href:{get(){return host.url();},set(v){host.navigate(htmlSafetyBridge.navigationInput(v));}}});
     document.location=location;
@@ -1275,7 +1359,7 @@
         Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,CDATASection,Comment,ProcessingInstruction,DocumentFragment,
         Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,UIEvent,InputEvent,FocusEvent,MouseEvent,WheelEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,QuotaExceededError,AbortController,AbortSignal,
         fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,reportError,
-        CSSStyleDeclaration,CSSStyleProperties,
+        CSSStyleDeclaration,CSSStyleProperties,CSSFontFaceDescriptors,CSSPageDescriptors,
         performance:{now:()=>host.now()},getComputedStyle:(n,pseudo=null)=>new CSSStyleProperties(n,true,styleToken,pseudo)});
     Object.defineProperty(globalThis,'location',{configurable:true,get(){return location;},set(v){host.navigate(String(v));}});
     globalThis.window=globalThis;globalThis.self=globalThis;globalThis.top=globalThis;globalThis.parent=globalThis;

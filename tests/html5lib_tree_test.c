@@ -96,7 +96,7 @@ static bool dump_children(sbuf *out,const node_t *parent,unsigned depth,size_t *
 static web_doc *new_family(void) {
     web_doc *d=calloc(1,sizeof *d);if(!d)return NULL;
     d->url=strdup("http://html5lib.test/corpus");if(!d->url){free(d);return NULL;}
-    snprintf(d->base,sizeof d->base,"%s",d->url);
+    if(!doc_set_base(d,d->url)){web_free(d);return NULL;}
     const char *initial="<!doctype html><html><head></head><body></body>";
     d->root=html_parse(d,initial,strlen(initial),"utf-8");
     if(!d->root){web_free(d);return NULL;}return d;

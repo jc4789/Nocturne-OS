@@ -46,12 +46,7 @@ static void *tracked_calloc(size_t n,size_t s) {
 cases = (root / "tests/cascade_winner23_cases.c").read_text(encoding="utf-8")
 c = out / "cascade-winner23-generated.c"
 c.write_text(prefix + parser + "\n#undef calloc\n" + cases, encoding="utf-8")
-# cssprop retains its URL-valued property path. Link the current real owned
-# canonicalizer (no HTTP transport is used by these winner-only cases).
-http = (root / "user/libc/http.c").read_text(encoding="utf-8")
-urls = out / "cascade-winner23-url-generated.c"
-urls.write_text(http[:http.index("enum http_url_result http_origin_owned_n(")], encoding="utf-8")
-cc = root / "tools/msys64/ucrt64/bin/clang.exe"
+cc =root / "tools/msys64/ucrt64/bin/clang.exe"
 abi = out / "cascade-winner23-host-abi"
 abi.mkdir(exist_ok=True)
 (abi / "setjmp.h").write_text('#include "' + (cc.parent.parent / "include/setjmp.h").as_posix() + '"\n', encoding="utf-8")
@@ -59,6 +54,6 @@ env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH",
 exe = out / "cascade-winner23-native.exe"
 command = [str(cc), "-std=gnu11", "-O1", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
            "-I" + str(abi), "-Iuser/include", "-Icommon", "-Iuser/libc/web", str(c),
-           "user/libc/web/cssprop.c", "user/libc/web/shape.c","user/libc/web/color.c", "user/libc/web/util.c", "user/libc/web/html.c", str(urls), "-o", str(exe)]
+           "user/libc/web/cssprop.c", "user/libc/web/shape.c","user/libc/web/color.c", "user/libc/web/cssmath.c", "user/libc/web/util.c", "user/libc/web/html.c", "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 subprocess.run([str(exe)], cwd=root, env=env, check=True, timeout=60)

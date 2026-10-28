@@ -321,13 +321,12 @@ static void placeholder_cases(void) {
     static const char *const selectors[]={"input::placeholder", "textarea::placeholder", ".hint:focus::placeholder"};
     arena_t a={0};struct pctx pc={.a=&a};
     for(unsigned i=0;i<sizeof selectors/sizeof *selectors;i++) {
-        struct sellist *list=parse_sellist(&pc,selectors[i],selectors[i]+strlen(selectors[i]),false);
+        struct sellist *list=selector_list_parse(&pc,selectors[i],selectors[i]+strlen(selectors[i]));
         check(list&&list->n==1&&list->v[0]->pseudo==PE_PLACEHOLDER,"placeholder selector retains real pseudo kind");
     }
-    pc.supports_probe=true;
     const char *valid="input::placeholder",*invalid="input::placeholder(foo)";
-    check(parse_sellist(&pc,valid,valid+strlen(valid),false)!=NULL,"supports selector accepts implemented placeholder");
-    check(parse_sellist(&pc,invalid,invalid+strlen(invalid),false)==NULL,"placeholder function syntax rejected");
+    check(selector_supported(&a,valid,valid+strlen(valid)),"supports selector accepts implemented placeholder");
+    check(!selector_supported(&a,invalid,invalid+strlen(invalid)),"placeholder function syntax rejected");
     style_t parent,child,pseudo;css_style_init(&parent,NULL);css_style_init(&pseudo,&parent);
     parent.placeholder=&pseudo;parent.color=RGB(10,20,30);pseudo.color=0;pseudo.opacity=1;
     css_style_init(&child,&parent);

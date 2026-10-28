@@ -27,10 +27,6 @@ void *thread_local_get(unsigned slot) { (void)slot; return NULL; }
 unsigned parallel_worker_index(void) { return 0; }
 bool css_valid_declaration(const char *p, size_t pn, const char *v, size_t vn) { (void)p; (void)pn; (void)v; (void)vn; return false; }
 bool css_container_names_valid(const char *s, size_t n) { (void)s; (void)n; return false; }
-enum http_url_result http_canonical_owned_n(const char *r, size_t n, char **c, char **o) {
-    (void)r; (void)n; (void)c; (void)o;
-    return HTTP_URL_INVALID;
-}
 void css_transform_list_matrix_3d(const struct css_transform *t, double m[16]) { (void)t; (void)m; abort(); }
 void css_transform_list_matrix(const struct css_transform *t, float w, float h, double m[16]) { (void)t; (void)w; (void)h; (void)m; abort(); }
 /* no top layer, no fullscreen, no viewport-propagated overflow, no filters or transforms */

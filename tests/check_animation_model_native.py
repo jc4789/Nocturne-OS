@@ -332,6 +332,17 @@ int main(void){
                   k->v[1].offset==1 && k->v[1].composite==WA_COMPOSITE_AUTO);
         }
     }
+    /* the keyframe's step easing takes the effect's before flag (effect-value-step-easing-reversed-
+       direction.html, jump-start-animation-before-phase.html): the left limit in the before phase going
+       forwards and in the after phase going backwards, the right limit in the before phase reversed */
+    static const struct {const char *text;double want;} limits[]={
+        {"rise 100s steps(1, start) 50s backwards",0.1},{"rise 100s steps(1, start) -150s reverse forwards",0.1},
+        {"rise 100s steps(1, start) 50s reverse backwards",0.2}};
+    for(size_t i=0;i<sizeof limits/sizeof *limits;i++){
+        style_t limit=styled_on(&faint,"animation",limits[i].text);
+        s=site(&limit);web_motion_animations(&s);
+        CHECK(ra && sample(&limit,false)==1 && fabs(strtod(sampled("opacity"),NULL)-limits[i].want)<0.005);
+    }
     /* the computed value follows the element's style */
     style_t brighter=styled("opacity","0.15");
     style_t rise=styled_on(&brighter,"animation","rise 100s linear -50s");
@@ -351,9 +362,6 @@ int main(void){
 '''
 source = out / "model.c"
 source.write_text(host + production + model + main, encoding="utf-8")
-http = (root / "user/libc/http.c").read_text(encoding="utf-8")
-url = out / "url.c"
-url.write_text(http[:http.index("/* The pool is process-local.")] + http[http.index("bool url_parse(const char *s, struct url *u)"):http.index("enum http_url_result http_origin_owned_n(")], encoding="utf-8")
 cc = root / "tools/msys64/ucrt64/bin/clang.exe"
 if not cc.exists():
     cc = root.parents[2] / "tools/msys64/ucrt64/bin/clang.exe"  # a git worktree shares the main tree's tools
@@ -365,6 +373,6 @@ env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH",
 exe = out / "model.exe"
 command = [str(cc), "-std=gnu11", "-O1", "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include",
            "-Icommon", "-Iuser/libc", "-Iuser/libc/web", "-Ithird_party/quickjs", str(source), "user/libc/web/cssprop.c", "user/libc/web/shape.c",
-           "user/libc/web/color.c", "user/libc/web/util.c", "user/libc/web/html.c", str(url), "-o", str(exe)]
+           "user/libc/web/color.c", "user/libc/web/cssmath.c", "user/libc/web/util.c", "user/libc/web/html.c", "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 subprocess.run([str(exe)], cwd=root, env=env, check=True, timeout=60)

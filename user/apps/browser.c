@@ -1395,11 +1395,14 @@ static void resource_completed(webnet *net, uint64_t id, uint64_t gen,
     else if (t->detached) webnet_resume(net, id);
 }
 
+static const char *request_refusal;
+static const char *host_request_refusal(void *opaque) { (void)opaque; return request_refusal; }
+static size_t host_keepalive_inflight(void *opaque, uint64_t group) { (void)opaque; return webnet_keepalive_inflight(network, group); }
 static bool host_request(void *opaque, const struct web_request *request) {
     SERVE(opaque);
-    if (!tab->doc || quit) return false;
+    if (!tab->doc || quit) { request_refusal = "the tab is closing"; return false; }
     struct transfer *t = calloc(1, sizeof *t);
-    if (!t) return false;
+    if (!t) { request_refusal = "out of memory"; return false; }
     t->owner = tab;
     t->resource_id = request->id;
     t->generation = tab->generation;
@@ -1422,7 +1425,7 @@ static bool host_request(void *opaque, const struct web_request *request) {
         , .report_sent = tab->console_open /* DevTools records it: show the fields it sent */
     };
     t->network_id = webnet_submit(network, &r, resource_completed, t);
-    if (!t->network_id) { free(t); return false; }
+    if (!t->network_id) { request_refusal = webnet_refusal(network); free(t); return false; }
     t->devtools = dt_net_begin(false, tab->generation, request->id, request->kind, request->method, request->url, request->headers);
     t->next = transfers;
     transfers = t;
@@ -2284,7 +2287,7 @@ static bool host_sync_load(void *opaque, const char *url, int kind, struct web_r
 }
 
 static const struct web_host browser_host = {
-    .request = host_request, .cancel = host_cancel, .release_request = host_release_request, .resume_request = host_resume_request, .sync_load = host_sync_load,
+    .request = host_request, .request_refusal = host_request_refusal, .keepalive_inflight = host_keepalive_inflight, .cancel = host_cancel, .release_request = host_release_request, .resume_request = host_resume_request, .sync_load = host_sync_load,
     .socket_open = host_socket_open, .socket_send = host_socket_send, .socket_close = host_socket_close,
     .socket_buffered = host_socket_buffered, .socket_release = host_socket_release,
     .sync_request = host_sync_request,

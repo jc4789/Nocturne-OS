@@ -18,6 +18,9 @@ static box_t *viewport,*top_layer;
 bool doc_viewport_overflow_box(const web_doc *d,const box_t *b){(void)d;return b==viewport;}
 bool web_dialog_layer_box(web_doc *d,box_t *b){(void)d;return b==top_layer;}
 static float fmaxf_(float a,float b){return a>b?a:b;}
+bool box_filter_containing_block(const box_t *b){(void)b;return false;}
+bool box_viewport_fixed(const box_t *b){return b->st && b->st->position==POS_FIXED;}
+float box_translation_axis(const box_t *b,unsigned axis,unsigned sources){(void)b;(void)axis;(void)sources;return 0;}
 '''
 c=out/'scroll-area20-generated.c'
 c.write_text(prefix+fn('static float scroll_extent(')+publish+(root/'tests/scroll_area20_cases.c').read_text(encoding='utf-8'),encoding='utf-8')

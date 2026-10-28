@@ -155,9 +155,9 @@ static void cssom_scope(void) {
     ;
     check("replacement does not affect foreign scope",opacity(b,.75));
     const char *ordinary=".ordinary{opacity:.4}";
-    (void)(cssom_insert(s,ordinary,strlen(ordinary),0)==CSSOM_OK);layout(d);
+    (void)(cssom_insert(s,0,ordinary,strlen(ordinary),0)==CSSOM_OK);layout(d);
     check("insert rebuilt keyframes still sample",opacity(a,.45));
-    (void)(cssom_delete(s,1)==CSSOM_OK);layout(d);web_animations_tick(d,uptime_ms());
+    (void)(cssom_delete(s,0,1)==CSSOM_OK);layout(d);web_animations_tick(d,uptime_ms());
     check("deleted keyframe stops effect and identity",opacity(a,.1) && a->owned==NULL);
     const char *media="@media print{@keyframes same{to{opacity:.9}}}@media screen{@keyframes same{to{opacity:.35}}}"
         ".sample{opacity:.1;animation:same 0s forwards}";

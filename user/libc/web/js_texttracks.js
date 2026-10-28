@@ -12,7 +12,7 @@ const textTrackBridge = (() => {
     const token={}, HTML='http://www.w3.org/1999/xhtml', KINDS=['subtitles','captions','descriptions','chapters','metadata'];
     const schedule=fn=>host.timer(0,fn,0,[]), encoder=new TextEncoder(), encode=TextEncoder.prototype.encode;
     const decoder=new TextDecoder('utf-8',{fatal:true}), decode=TextDecoder.prototype.decode;
-    const Abort=fetchBridge.AbortController, bodyBytes=fetchBridge.Response.prototype.arrayBuffer;
+    const Abort=abortBridge.AbortController, bodyBytes=fetchBridge.Response.prototype.arrayBuffer;
     const refs=new Set();
     let pollTimer=0, sequence=0;
     const lookup=(map,value,name)=>{const s=apply(mapGet,map,[value]);if(!s)throw new TypeError('Illegal '+name+' receiver');return s;};

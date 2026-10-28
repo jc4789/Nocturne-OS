@@ -36,36 +36,15 @@ struct web_frame *web_frame_walk_next(web_doc *root,struct web_frame *f,bool des
 }
 int web_frame_ancestor_url(web_doc *parent,const char *text) {
     if(!parent || !text)return false;
-    /* srcdoc takes a different HTML processing branch. An initial blank
-     * context is created independently and never reaches this URL check. */
-    if(!strncasecmp(text,"about:",6)) {
-        size_t n=strcspn(text,"#");
-        for(web_doc *p=parent;p;p=p->frame_parent) {
-            size_t m=strcspn(p->url?p->url:"","#");
-            if(m==n && !strncmp(text,p->url?p->url:"",n))return true;
-        }
-        return false;
+    /* HTML: the URL equals an ancestor document's URL, fragments excluded (the URL
+     * Standard's equality). srcdoc takes a different HTML processing branch. An initial
+     * blank context is created independently and never reaches this URL check. An actual
+     * allocation failure never bypasses recursive-resource checks. */
+    for(web_doc *p=parent;p;p=p->frame_parent) {
+        int equal=web_url_equal(text,p->url?p->url:"",true);
+        if(equal)return equal;
     }
-    char *a=NULL,*origin=NULL;
-    enum http_url_result status=http_canonical_owned_n(text,strlen(text),&a,&origin);
-    free(origin);
-    /* An actual allocation failure never bypasses recursive-resource checks. */
-    if(status==HTTP_URL_OOM)return -1;
-    bool matches=false;
-    if(status==HTTP_URL_TUPLE)for(web_doc *p=parent;p;p=p->frame_parent) {
-        char *b=NULL;origin=NULL;
-        enum http_url_result own_status=http_canonical_owned_n(p->url,p->url?strlen(p->url):0,&b,&origin);
-        free(origin);
-        if(own_status==HTTP_URL_OOM){free(a);free(b);return -1;}
-        if(own_status==HTTP_URL_TUPLE && strcspn(a,"#")==strcspn(b,"#") &&
-           !strncmp(a,b,strcspn(a,"#")))matches=true;
-        free(b);if(matches)break;
-    }
-    if(!matches)for(web_doc *p=parent;p;p=p->frame_parent) {
-        const char *own=p->url?p->url:"";size_t n=strcspn(text,"#");
-        if(strcspn(own,"#")==n && !strncmp(text,own,n)){matches=true;break;}
-    }
-    free(a);return matches;
+    return false;
 }
 struct web_frame *web_frame_find(web_doc *d,node_t *n) {
     for(struct web_frame *f=d?d->frames:NULL;f;f=f->next)if(f->element==n)return f;
@@ -113,7 +92,21 @@ bool web_frame_set_navigation(struct web_frame *f,const char *url,web_doc *origi
     if(!f || !url || !origin)return false;
     char *copy=strdup(url),*initiator=strdup(web_effective_url(origin));
     if(!copy || !initiator){free(copy);free(initiator);return false;}
-    free(f->navigation);free(f->navigation_origin);f->navigation=copy;f->navigation_origin=initiator;f->navigation_owner=origin;f->initial_failed=false;return true;
+    free(f->navigation);free(f->navigation_origin);f->navigation=copy;f->navigation_origin=initiator;f->navigation_owner=origin;f->initial_failed=false;
+    web_frame_set_navigation_body(f,NULL,0,NULL);return true;
+}
+bool web_frame_set_navigation_body(struct web_frame *f,const void *body,size_t length,const char *content_type) {
+    if(!f)return false;
+    free(f->navigation_body);free(f->navigation_type);f->navigation_body=f->navigation_type=NULL;f->navigation_body_length=0;
+    if(!body)return true;
+    char *copy=malloc(length?length:1),*type=strdup(content_type?content_type:"");
+    if(!copy || !type){
+        /* Without its body the navigation would be another request: none is kept. */
+        free(copy);free(type);free(f->navigation);free(f->navigation_origin);
+        f->navigation=f->navigation_origin=NULL;f->navigation_owner=NULL;return false;
+    }
+    if(length)memcpy(copy,body,length);
+    f->navigation_body=copy;f->navigation_type=type;f->navigation_body_length=length;return true;
 }
 bool web_frame_initial_blocked(const struct web_frame *f,const char *src,const char *srcdoc) {
     return f && f->initial_failed && !f->detached && f->source && !strcmp(f->source,src?src:"") &&
@@ -170,22 +163,22 @@ bool web_sandbox_document_allowed(struct web_frame *f,const char *url,bool inher
     /* No script of a script-disabled Document runs, so it cannot lift its own
        sandbox: same-origin and inherited (about:srcdoc) documents are safe. */
     if(flags&SB_SCRIPTS)return url && (!strcmp(url,"about:srcdoc") || !strcmp(url,"about:blank") ||
-        (inherited && !strncasecmp(url,"blob:",5)) || !strncasecmp(url,"https://",8) || !strncasecmp(url,"http://",7));
+        (inherited && web_url_has_scheme(url,"blob")) || web_url_has_scheme(url,"https") || web_url_has_scheme(url,"http"));
     /* A scripted sandbox may share its origin only with ancestors restricted
        at least as much: reaching one then grants no authority it lacks. An
        inherited blank/srcdoc/blob document takes its creator's origin. */
     const char *source=url;
     if(inherited) {
-        if(!url || (strcmp(url,"about:blank") && strcmp(url,"about:srcdoc") && strncasecmp(url,"blob:",5)))return false;
+        if(!url || (strcmp(url,"about:blank") && strcmp(url,"about:srcdoc") && !web_url_has_scheme(url,"blob")))return false;
         source=web_effective_url(f->navigation_owner?f->navigation_owner:f->element->owner);
     }
-    if(!source || (strncasecmp(source,"https://",8) && strncasecmp(source,"http://",7)))return false;
-    char *origin=NULL;if(http_origin_owned(source,&origin)!=HTTP_URL_TUPLE){free(origin);return false;}
+    if(!web_url_has_scheme(source,"https") && !web_url_has_scheme(source,"http"))return false;
+    char *origin=NULL;if(web_url_origin(source,&origin)!=WEB_URL_TUPLE){free(origin);return false;}
     bool allowed=true;
     for(web_doc *p=f->element->owner;p;p=p->frame_parent) {
         char *ancestor=NULL;
-        enum http_url_result parsed=http_origin_owned(web_effective_url(p),&ancestor);
-        if(parsed!=HTTP_URL_TUPLE || (!strcmp(origin,ancestor) && (p->sandbox_flags&flags)!=flags))allowed=false;
+        enum web_url_result parsed=web_url_origin(web_effective_url(p),&ancestor);
+        if(parsed!=WEB_URL_TUPLE || (!strcmp(origin,ancestor) && (p->sandbox_flags&flags)!=flags))allowed=false;
         free(ancestor);if(!allowed)break;
     }
     free(origin);return allowed;
@@ -230,11 +223,7 @@ bool web_frame_same_origin(web_doc *a,web_doc *b) {
     if(a==b)return true;
     if(!a || !b)return false;
     if((a->origin_owner?a->origin_owner:a)==(b->origin_owner?b->origin_owner:b))return true;
-    char *x=NULL,*y=NULL;
-    enum http_url_result xr=http_origin_owned(web_effective_url(a),&x),
-        yr=http_origin_owned(web_effective_url(b),&y);
-    bool same=xr==HTTP_URL_TUPLE && yr==HTTP_URL_TUPLE && !strcmp(x,y);
-    free(x);free(y);return same;
+    return web_url_same_origin(web_effective_url(a),web_effective_url(b))==1;
 }
 /* Whether the frame element's box shows its document's pixels at all. */
 static bool frame_box_shown(const box_t *b) {
@@ -329,7 +318,7 @@ void web_frames_free(web_doc *d) {
             struct web_frame *f=current->frames;current->frames=f->next;
             if(f->document){f->document->frame_free_next=pending;pending=f->document;}
             while(f->retired){web_doc *old=f->retired;f->retired=old->frame_retired_next;old->frame_free_next=pending;pending=old;}
-            free(f->paint.px);free(f->source);free(f->srcdoc);free(f->navigation);free(f->navigation_origin);free(f->sandbox);free(f->target_name);free(f->name_attribute);free(f);
+            free(f->paint.px);free(f->source);free(f->srcdoc);free(f->navigation);free(f->navigation_origin);free(f->navigation_body);free(f->navigation_type);free(f->sandbox);free(f->target_name);free(f->name_attribute);free(f);
         }
         if(current!=d){current->frame_free_next=finished;finished=current;}
     }
@@ -452,6 +441,13 @@ static web_doc *named_frame(web_doc *d,const char *name) {
     }
     return NULL;
 }
+web_doc *web_frame_choose(web_doc *top,web_doc *source,const char *target) {
+    if(!target || !*target || !strcasecmp(target,"_self"))return source;
+    if(!strcasecmp(target,"_top"))return top;
+    if(!strcasecmp(target,"_parent"))return source->frame_parent?source->frame_parent:source;
+    if(!strcasecmp(target,"_blank"))return NULL;
+    return named_frame(top,target);
+}
 static bool frame_link_space(unsigned char c) {
     return c==' ' || c=='\t' || c=='\n' || c=='\r' || c=='\f';
 }
@@ -490,26 +486,22 @@ bool web_frame_navigate(web_doc *top,web_node *anchor,const char *url,bool activ
     web_doc *root=source;while(root->frame_parent)root=root->frame_parent;
     if(root!=top){web_js_console(source,1,"Link source belongs to another browsing context");return true;}
     if(source->sandbox_flags && node_attr(anchor,"download") && (source->sandbox_flags&SB_DOWNLOADS)){web_js_console(source,1,"Sandbox denied link download");return true;}
-    const char *target=frame_link_target(source,anchor);web_doc *destination=source;
-    if(target && *target && strcasecmp(target,"_self")){
-        if(!strcasecmp(target,"_top"))destination=top;
-        else if(!strcasecmp(target,"_parent"))destination=source->frame_parent?source->frame_parent:source;
-        else if(!strcasecmp(target,"_blank")){
-            if(!frame_auxiliary_allowed(source))return true;
-            const char *rel=node_attr(anchor,"rel");
-            if(frame_link_token(rel,"opener") && !frame_link_token(rel,"noopener") && !frame_link_token(rel,"noreferrer")){
-                web_js_console(source,1,"Auxiliary link opener relationships are not implemented");return true;
-            }
-            if(!web_js_auxiliary_link(source,anchor,url,"_blank",activated))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
-            return true;
+    const char *target=frame_link_target(source,anchor);web_doc *destination=web_frame_choose(top,source,target);
+    if(!destination && !strcasecmp(target,"_blank")){
+        if(!frame_auxiliary_allowed(source))return true;
+        const char *rel=node_attr(anchor,"rel");
+        if(frame_link_token(rel,"opener") && !frame_link_token(rel,"noopener") && !frame_link_token(rel,"noreferrer")){
+            web_js_console(source,1,"Auxiliary link opener relationships are not implemented");return true;
         }
-        else if(!(destination=named_frame(top,target))) {
-            /* No frame of this page has the name: another top-level traversable may (the
-               host's tab of that name), or a new one takes it as a popup would. */
-            if(!frame_auxiliary_allowed(source))return true;
-            if(!web_js_auxiliary_link(source,anchor,url,target,activated))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
-            return true;
-        }
+        if(!web_js_auxiliary_link(source,anchor,url,"_blank",activated))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
+        return true;
+    }
+    if(!destination) {
+        /* No frame of this page has the name: another top-level traversable may (the
+           host's tab of that name), or a new one takes it as a popup would. */
+        if(!frame_auxiliary_allowed(source))return true;
+        if(!web_js_auxiliary_link(source,anchor,url,target,activated))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
+        return true;
     }
     if(!web_sandbox_navigation_allowed(source,destination,activated)){web_js_console(source,1,"Sandbox destination policy denied link navigation");return true;}
     if(destination==top)return false;

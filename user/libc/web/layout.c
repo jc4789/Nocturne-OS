@@ -1257,6 +1257,14 @@ float control_text_width(const style_t *st, const char *s, size_t n) {
     }
     return width + text_width_uncached(st, &font, s + first, n - first);
 }
+static float control_measure(const void *opaque, const char *s, size_t at, size_t next, float x) {
+    const style_t *st = opaque;
+    wfont font = style_font(st);
+    return next == at + 1 && s[at] == '\t' ? control_tab_width(st, &font, x) : text_width_uncached(st, &font, s + at, next - at);
+}
+size_t control_text_boundary(const style_t *st, const char *s, size_t n, float x) {
+    return layout_text_boundary(s, n, -1, x, control_measure, st);
+}
 bool control_text_lines(const box_t *b, const style_t *st, const char *text,
                         control_text_line_fn visit, void *opaque, float *width, float *height) {
     if (!b || !st || !text || !width || !height) return false;
@@ -1363,7 +1371,10 @@ static void build_items(box_t *parent, struct ibuild *s) {
     for (box_t *c = parent->first; c; c = c->next) {
         if (!layout_checkpoint()) break;
         layout_media_checkpoint();
-        if (s->collect_paint) c->inline_paint_owner = s->paint_owner;
+        if (s->collect_paint) {
+            c->inline_paint_owner = s->paint_owner;
+            c->frag_first = c->frag_end = 0; /* this line layout records them afresh */
+        }
         if (c->abspos) {
             ipush(s->v, IT_ABS)->box = c;
             continue;
@@ -1511,6 +1522,9 @@ static void add_deco(struct iline *L, box_t *ib, float x0, float x1, float basel
     }
     ib->inline_cb_right = d.x + d.w - ib->b[1];
     ib->inline_cb_bottom = d.y + d.h - ib->b[2];
+    int index = (int)(L->decos.n / sizeof d);
+    if (!ib->frag_end) ib->frag_first = index;
+    ib->frag_end = index + 1;
     sb_put(&L->decos, (const char *)&d, sizeof d);
 }
 
@@ -1669,8 +1683,13 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
                 while (n > 0 && it->s[n - 1] == ' ') n--;
             }
             struct run r = {x, baseline - it->shift, w, it->s, n, it->st, it->link, NULL, false,
-                            it->box ? it->box->node : NULL, it->box ? it->box->inline_paint_owner : NULL, -1, it->descent};
-            if (n > 0) sb_put(&L->runs, (const char *)&r, sizeof r);
+                            it->box ? it->box->node : NULL, it->box ? it->box->inline_paint_owner : NULL, -1, it->descent, 0, 0};
+            if (n > 0) {
+                int index = (int)(L->runs.n / sizeof r);
+                if (it->box && !it->box->frag_end) it->box->frag_first = index;
+                if (it->box) it->box->frag_end = index + 1;
+                sb_put(&L->runs, (const char *)&r, sizeof r);
+            }
             x += w;
             if (it->space_end && i != last_text) x += extra_space;
             break;
@@ -1687,7 +1706,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
             c->cb = b;
             c->x = x + c->m[3] + c->b[3] + c->p[3];
             c->y = top + c->m[0] + c->b[0] + c->p[0];
-            struct run r = {x, top, it->w, NULL, 0, it->st, it->link, c, false, c->node, c->inline_paint_owner, -1, 0};
+            struct run r = {x, top, it->w, NULL, 0, it->st, it->link, c, false, c->node, c->inline_paint_owner, -1, 0, 0, 0};
             sb_put(&L->runs, (const char *)&r, sizeof r);
             x += it->w;
             break;
@@ -1711,7 +1730,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
         if (layout_current()->clamp_depth || b->st->text_overflow == TO_ELLIPSIS) {
             struct line_fragment line = {first_run, (int)(L->runs.n / sizeof(struct run)),
                 first_deco, (int)(L->decos.n / sizeof(struct deco)),
-                L->y, L->y + lh, baseline, L->left, L->right};
+                L->y, L->y + lh, baseline, L->left, L->right, false, 0, 0, 0, 0, 0};
             sb_put(&L->lines, (const char *)&line, sizeof line);
         }
     }
@@ -1940,6 +1959,258 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
     b->baseline = L.first_bl;
     b->last_baseline = L.last_bl;
     b->h = L.y; /* the caller applies height and min/max */
+}
+
+/* ---------------------------------------------------------------- text geometry */
+/* A line layout keeps, for each run, its position and the bytes of its text box's processed
+   text it shows; for each text and inline box, the range of its block's runs or decos that
+   holds its fragments (frag_first, frag_end). box_text_source_map (box.c) gives the bytes of
+   the Text node's data those bytes came from. Together they map a DOM position to a line
+   position and back, for every caller, without walking other nodes' fragments. Readers run
+   between layouts (script, paint, native input), never inside one. */
+void layout_runs_origin(const box_t *b, bool visual, float *x, float *y) {
+    if (!visual) { *x = box_abs_x(b); *y = box_abs_y(b) + b->content_dy; return; }
+    *x = box_visual_x(b); *y = box_visual_y(b) + b->content_dy;
+    if (web_marquee_box(b)) { *x += b->node->marquee_x; *y += b->node->marquee_y; }
+    if (box_element_scrollable(b)) { *x -= (float)b->node->scroll_x; *y -= (float)b->node->scroll_y; }
+}
+void layout_run_extent(const struct run *r, float *top, float *bottom) {
+    wfont f = style_font(r->st);
+    float ascent, descent;
+    wf_metrics(&f, &ascent, &descent);
+    *top = r->y - ascent; *bottom = r->y + descent;
+}
+float layout_run_x(const struct run *r, size_t at) {
+    if (!r->s || r->n <= 0 || !at) return 0;
+    if (at >= (size_t)r->n) return r->w; /* the width the line placed */
+    return style_text_width(r->st, r->s, at);
+}
+size_t layout_text_boundary(const char *s, size_t n, float width, float dx, layout_measure_fn measure, const void *opaque) {
+    if (!s || !n || !(dx > 0)) return 0;
+    size_t at = 0;
+    float x = 0;
+    while (at < n) {
+        size_t next = wf_grapheme_next(s, n, at);
+        if (next <= at || next > n) next = n;
+        float w = next == n && width >= 0 ? width - x : measure(opaque, s, at, next, x);
+        if (dx <= x + w / 2) return at; /* a boundary at the middle is the earlier one */
+        x += w; at = next;
+    }
+    return n;
+}
+static float run_measure(const void *opaque, const char *s, size_t at, size_t next, float x) {
+    (void)x;
+    return style_text_width(opaque, s + at, next - at);
+}
+size_t layout_run_boundary(const struct run *r, float dx) {
+    if (!r->s || r->n <= 0) return 0;
+    return layout_text_boundary(r->s, (size_t)r->n, r->w, dx, run_measure, r->st);
+}
+box_t *layout_inline_root(const box_t *b) {
+    const box_t *p = b ? b->parent : NULL;
+    while (p && p->kind == B_INLINE) p = p->parent;
+    return p && p->inline_ctx ? (box_t *)p : NULL;
+}
+/* r is one of text box t's runs: its node and a part of t's current text. */
+static bool text_run_of(const struct run *r, const box_t *t) {
+    return !r->atomic && r->s && r->node == t->node && r->n > 0 &&
+           r->s >= t->text && (size_t)(r->s - t->text) + (size_t)r->n <= t->len;
+}
+/* The first processed byte whose source byte is at or after byte (map is nondecreasing). */
+static size_t source_lower_bound(const uint32_t *map, size_t length, size_t byte) {
+    size_t low = 0, high = length;
+    while (low < high) { size_t mid = low + (high - low) / 2; if (map[mid] < byte) low = mid + 1; else high = mid; }
+    return low;
+}
+static bool text_checkpoint(const box_t *t, unsigned *work) {
+    return (++*work & 63) || !t->node || !t->node->owner || web_native_checkpoint(t->node->owner);
+}
+bool layout_text_rects(node_t *n, uint32_t start, uint32_t end, bool visual, layout_rect_fn visit, void *opaque) {
+    box_t *t = n && n->type == N_TEXT ? n->box : NULL;
+    if (!t || t->kind != B_TEXT || t->node != n || !t->frag_end) return true;
+    box_t *b = layout_inline_root(t);
+    if (!b || !b->runs) return true;
+    int first = t->frag_first, last = t->frag_end < b->nruns ? t->frag_end : b->nruns;
+    if (first < 0 || first >= last) return true;
+    if (end != UINT32_MAX && start > end) start = end;
+    size_t ps = 0, pe = t->len;
+    unsigned work = 0;
+    if (start || end != UINT32_MAX) {
+        arena_t scratch = {.chunk_size = 4096};
+        jmp_buf trap; scratch.trap = &trap;
+        if (setjmp(trap)) { ar_free(&scratch); return false; }
+        uint32_t *map = box_text_source_map(&scratch, t);
+        if (!map) { ar_free(&scratch); return true; }
+        /* Inside a surrogate pair the whole pair counts (CSSOM View §9). */
+        size_t from = doc_text_byte(n->text, n->textlen, start, false);
+        size_t to = end == UINT32_MAX ? n->textlen : doc_text_byte(n->text, n->textlen, end, true);
+        ps = source_lower_bound(map, t->len, from); pe = source_lower_bound(map, t->len, to);
+        ar_free(&scratch);
+        if (pe < ps) pe = ps;
+        /* So does a whole grapheme cluster, the typographic character unit here. */
+        size_t down = ps, up = pe;
+        for (size_t at = 0; at < t->len && at < pe;) {
+            if (!text_checkpoint(t, &work)) return false;
+            size_t next = wf_grapheme_next(t->text, t->len, at);
+            if (next <= at || next > t->len) next = t->len;
+            if (at < ps && ps < next) down = at;
+            if (at < pe && pe < next) up = next;
+            at = next;
+        }
+        bool collapsed = ps == pe;
+        ps = down; pe = collapsed ? down : up;
+    }
+    float ox, oy;
+    layout_runs_origin(b, visual, &ox, &oy);
+    bool drawn = false;
+    int inside = -1, ending = -1, after = -1, before = -1;
+    for (int i = first; i < last; i++) {
+        if (!text_checkpoint(t, &work)) return false;
+        const struct run *r = &b->runs[i];
+        if (!text_run_of(r, t)) continue;
+        size_t rs = (size_t)(r->s - t->text), re = rs + (size_t)r->n;
+        if (ps < pe) {
+            size_t a = ps > rs ? ps : rs, z = pe < re ? pe : re;
+            if (a < z) {
+                float x0 = layout_run_x(r, a - rs), x1 = layout_run_x(r, z - rs), top, bottom;
+                layout_run_extent(r, &top, &bottom);
+                drawn = true;
+                if (!visit(opaque, b, (double)ox + r->x + x0, (double)oy + top, (double)x1 - x0, (double)bottom - top)) return false;
+                continue;
+            }
+        }
+        if (inside < 0 && rs <= ps && ps < re) inside = i;
+        if (re == ps) ending = i;
+        if (after < 0 && rs > ps) after = i;
+        if (re < ps) before = i;
+    }
+    if (drawn) return true;
+    /* A collapsed point, or a selection none of whose characters are rendered: a zero-width
+       fragment where it lies, at a fragment's start before the end of the one ahead. */
+    int at = inside >= 0 ? inside : ending >= 0 ? ending : after >= 0 ? after : before;
+    if (at < 0) return true;
+    const struct run *r = &b->runs[at];
+    size_t rs = (size_t)(r->s - t->text);
+    float x = at == after ? 0 : at == before ? r->w : layout_run_x(r, ps - rs), top, bottom;
+    layout_run_extent(r, &top, &bottom);
+    return visit(opaque, b, (double)ox + r->x + x, (double)oy + top, 0, (double)bottom - top);
+}
+bool layout_inline_rects(node_t *n, bool visual, layout_rect_fn visit, void *opaque) {
+    box_t *ib = n ? n->box : NULL;
+    if (!ib || ib->kind != B_INLINE || ib->node != n || !ib->frag_end) return true;
+    box_t *a = layout_inline_root(ib);
+    if (!a || !a->decos) return true;
+    int last = ib->frag_end < a->ndecos ? ib->frag_end : a->ndecos;
+    float ox, oy;
+    layout_runs_origin(a, visual, &ox, &oy);
+    const style_t *own = n->style;
+    for (int i = ib->frag_first; i >= 0 && i < last; i++) {
+        const struct deco *span = &a->decos[i];
+        /* The element's ::before/::after inline boxes have decos with its node too. */
+        if (span->node != n || (own && (span->st == own->before || span->st == own->after))) continue;
+        if (!visit(opaque, a, (double)ox + span->x, (double)oy + span->y, span->w, span->h)) return false;
+    }
+    return true;
+}
+static uint32_t child_count(const node_t *n) {
+    uint32_t count = 0;
+    for (const node_t *c = n->first; c; c = c->next) count++;
+    return count;
+}
+bool layout_run_position(const box_t *block, int run, float dx, node_t **node, uint32_t *offset) {
+    if (!block || run < 0 || run >= block->nruns) return false;
+    const struct run *r = &block->runs[run];
+    node_t *n = r->node;
+    if (r->atomic || !n) return false;
+    if (n->type == N_ELEM) {
+        /* Generated content is not in the DOM: the point is at its edge of the element. */
+        const style_t *own = n->style;
+        *node = n; *offset = own && r->st == own->after ? child_count(n) : 0;
+        return true;
+    }
+    box_t *t = n->type == N_TEXT ? n->box : NULL;
+    if (!t || t->kind != B_TEXT || !text_run_of(r, t)) return false;
+    size_t at = (size_t)(r->s - t->text) + layout_run_boundary(r, dx);
+    arena_t scratch = {.chunk_size = 4096};
+    jmp_buf trap; scratch.trap = &trap;
+    if (setjmp(trap)) { ar_free(&scratch); return false; }
+    uint32_t *map = box_text_source_map(&scratch, t);
+    bool ok = map != NULL;
+    if (ok) { *node = n; *offset = doc_text_utf16(n->text, n->textlen, map[at]); }
+    ar_free(&scratch);
+    return ok;
+}
+static float axis_distance(float v, float low, float high) { return v < low ? low - v : v > high ? v - high : 0; }
+/* The DOM position before (or, right of its middle, after) replaced element box a. */
+static bool replaced_position(const box_t *a, float x, node_t **node, uint32_t *offset) {
+    node_t *n = a->node;
+    if (!n) return false;
+    node_t *p = n->parent;
+    if (!p) { *node = n; *offset = 0; return true; }
+    uint32_t index = 0;
+    for (const node_t *c = p->first; c && c != n; c = c->next) index++;
+    float left = box_visual_x(a) - a->p[3] - a->b[3];
+    *node = p; *offset = index + (x > left + (a->w + hext(a)) / 2);
+    return true;
+}
+bool layout_position_at(const box_t *b, float x, float y, node_t **node, uint32_t *offset) {
+    unsigned work = 0;
+    web_doc *d = NULL;
+    for (const box_t *p = b; p && !d; p = p->parent) if (p->node) d = p->node->owner;
+#define POSITION_CHECKPOINT() do { if (!(++work & 63) && d && !web_native_checkpoint(d)) return false; } while (0)
+    while (b) {
+        POSITION_CHECKPOINT();
+        if (b->kind == B_TEXT || b->kind == B_INLINE || b->kind == B_BR) {
+            box_t *root = layout_inline_root(b);
+            if (!root) break;
+            b = root; continue;
+        }
+        if (b->kind == B_ATOMIC && b->atomic != AT_INLINE_BLOCK) return replaced_position(b, x, node, offset);
+        if (b->inline_ctx && b->nruns) {
+            float ox, oy;
+            layout_runs_origin(b, true, &ox, &oy);
+            int best = -1; float best_dy = INFINITY, best_dx = INFINITY;
+            for (int i = 0; i < b->nruns; i++) {
+                POSITION_CHECKPOINT();
+                const struct run *r = &b->runs[i];
+                float left, top, right, bottom;
+                if (r->atomic) {
+                    const box_t *a = r->atomic;
+                    if (a->clamp_hidden) continue;
+                    left = box_visual_x(a) - a->p[3] - a->b[3]; top = box_visual_y(a) - a->p[0] - a->b[0];
+                    right = left + a->w + hext(a); bottom = top + a->h + vext(a);
+                } else {
+                    if (!r->node || !r->s) continue;
+                    layout_run_extent(r, &top, &bottom);
+                    left = ox + r->x; right = left + r->w; top += oy; bottom += oy;
+                }
+                float dy = axis_distance(y, top, bottom), dx = axis_distance(x, left, right);
+                if (dy < best_dy || (dy == best_dy && dx < best_dx)) { best = i; best_dy = dy; best_dx = dx; }
+            }
+            if (best >= 0) {
+                const struct run *r = &b->runs[best];
+                if (r->atomic) { b = r->atomic; continue; }
+                return layout_run_position(b, best, x - (ox + r->x), node, offset);
+            }
+        }
+        const box_t *pick = NULL; float best_dy = INFINITY, best_dx = INFINITY;
+        for (const box_t *c = b->first; c; c = c->next) {
+            POSITION_CHECKPOINT();
+            /* Text, inline and line-break boxes lie only in an inline formatting context,
+               whose runs hold their fragments. */
+            if (c->clamp_hidden || !c->st || c->st->display == D_NONE || c->kind == B_TEXT ||
+                c->kind == B_BR || c->kind == B_INLINE) continue;
+            float left = box_visual_x(c) - c->p[3] - c->b[3], top = box_visual_y(c) - c->p[0] - c->b[0];
+            float dy = axis_distance(y, top, top + c->h + vext(c)), dx = axis_distance(x, left, left + c->w + hext(c));
+            if (dy < best_dy || (dy == best_dy && dx < best_dx)) { pick = c; best_dy = dy; best_dx = dx; }
+        }
+        if (pick) { b = pick; continue; }
+        break;
+    }
+#undef POSITION_CHECKPOINT
+    /* No fragment below: the start of the nearest node's contents. */
+    for (; b; b = b->parent) if (b->node) { *node = b->node; *offset = 0; return true; }
+    return false;
 }
 
 /* ---------------------------------------------------------------- floats */
@@ -4077,7 +4348,7 @@ static void clamp_apply(box_t *root) {
     struct run *runs = ar_alloc(&b->layout_mem, ((size_t)end + 1) * sizeof *runs);
     if (end) memcpy(runs, b->runs, (size_t)end * sizeof *runs);
     runs[end] = (struct run){x, line->baseline, ellipsis_width, clamp_ellipsis,
-        sizeof clamp_ellipsis - 1, b->st, NULL, NULL, false, NULL, NULL, -1, 0};
+        sizeof clamp_ellipsis - 1, b->st, NULL, NULL, false, NULL, NULL, -1, 0, 0, 0};
     float ellipsis_ascent;
     wf_metrics(&font, &ellipsis_ascent, &runs[end].descent);
     b->layout_mem.trap = previous_trap;
@@ -5393,8 +5664,17 @@ static void scroll_area_publish(box_t *b) {
        x(b)-x(cb) = b.x+b.rel_dx; y(b)-y(cb) additionally has cb.content_dy.
        Do not walk that same ancestor chain four times for every box. Local
        coordinates also avoid losing small offsets beside a huge ancestor. */
-    float right = b->x + b->rel_dx - b->p[3] + bw + b->b[1] + b->m[1] + cb->p[3] + cb->p[1];
-    float bottom = b->y + b->rel_dy + cb->content_dy - b->p[0] + bh + b->b[2] + b->m[2] + cb->p[0] + cb->p[2];
+    /* "Scrollable overflow area" (CSS Overflow 3): b's border box with the overflow it carries,
+       and b's margin box followed by cb's end-side padding. A negative margin shrinks only the
+       second; a border box of zero area adds nothing of its own. */
+    float box_right = b->x + b->rel_dx - b->p[3] + bw + b->b[1] + cb->p[3];
+    float box_bottom = b->y + b->rel_dy + cb->content_dy - b->p[0] + bh + b->b[2] + cb->p[0];
+    float right = box_right + b->m[1] + cb->p[1];
+    float bottom = box_bottom + b->m[2] + cb->p[2];
+    if (bw + b->b[1] + b->b[3] > 0 && bh + b->b[0] + b->b[2] > 0) {
+        right = fmaxf_(right, box_right);
+        bottom = fmaxf_(bottom, box_bottom);
+    }
     /* CSS transforms extend, never shrink, the union of original and visual
        overflow. Descendant overflow has already propagated into b; add only
        b's own translation here, not its ancestors a second time. */

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
+#include "weburl.h"
 
 /* ---- streams: plain TCP or TLS 1.2 (BearSSL, verified against the built-in Mozilla roots) ---- */
 typedef struct net_stream net_stream;
@@ -74,48 +75,26 @@ uint64_t ns_bytes_sent(net_stream *); /* accepted TCP bytes, including TLS recor
 void ns_sessions_clear(void);
 
 /* ---- URLs ---- */
-#define HTTP_URL_MAX 16384u /* legacy fixed struct/url_parse bound, including NUL */
-#define HTTP_URL_PATH_MAX HTTP_URL_MAX
-struct url {
-    bool tls;
-    char host[128];
-    uint16_t port;
-    char path[HTTP_URL_PATH_MAX]; /* includes the query string; "/" if empty */
-};
-bool url_parse(const char *s, struct url *u);
+/* The inline URL of struct web_response (web.h) and the network wire's older bound, NUL
+   included. A request's own URL has no fixed bound. */
+#define HTTP_URL_MAX 16384u
 
-/* Exact-length storage for the real transport. The legacy struct/url_parse
-   remain ABI-compatible for callers not yet migrated. A successful parse owns
-   both strings; release with url_owned_free. Pass a fresh output, not a live
-   owned result. The span entry rejects embedded NUL rather than accepting a
-   different prefix. IPv6 transport is not implemented and fails closed. */
-struct url_owned {
-    bool tls;
-    char *host;
-    uint16_t port;
-    char *path;
+/* What a request to an http or https URL is made with, read from the URL Standard's record
+   of it (weburl.h), never from a second reading of its text. The URL's credentials are never
+   part of a request: Fetch sends them only from an authentication entry, after a 401, which
+   this layer does not make. */
+struct http_target {
+    bool tls;          /* https */
+    uint16_t port;     /* the URL's port, or the scheme's default */
+    char *host;        /* the host, serialized: an IPv6 address in brackets */
+    char *authority;   /* the host and the URL's port, if any: the Host field and :authority */
+    char *path;        /* path and query (origin-form); never empty, never the fragment */
 };
-bool url_parse_owned_n(const char *s, size_t length, struct url_owned *u);
-bool url_parse_owned(const char *s, struct url_owned *u);
-void url_owned_free(struct url_owned *u);
-
-enum http_url_result {
-    HTTP_URL_OOM = -2, HTTP_URL_INVALID = -1, HTTP_URL_OPAQUE = 0, HTTP_URL_TUPLE = 1
-};
-/* Same grammar/ownership as url_parse_owned_n, but distinguish malformed spans
-   from actual allocation failure. The owned entries accept uint32_t byte spans
-   (plus a representable terminator), without the legacy fixed-buffer quota.
-   Fresh u is zero on failure; on TUPLE release it with url_owned_free. */
-enum http_url_result url_parse_owned_result_n(const char *s, size_t length, struct url_owned *u);
-/* Fresh output slots are NULL on every non-TUPLE result. On TUPLE each output
-   owns an exact-length malloc string. canonical may be NULL to request origin
-   only; origin is required. Unsupported non-HTTP documents are OPAQUE, never
-   comparable empty origins. HTTP parse/allocation failures are distinct.
-   Fragment is excluded, host ASCII case/default port canonicalize; userinfo,
-   embedded NUL and unsupported IPv6 fail closed. Caller frees both strings. */
-enum http_url_result http_canonical_owned_n(const char *raw, size_t length, char **canonical, char **origin);
-enum http_url_result http_origin_owned_n(const char *raw, size_t length, char **origin);
-enum http_url_result http_origin_owned(const char *raw, char **origin);
+/* url (a URL's serialization, or any absolute URL the URL parser reads) as a request's
+   target. WEB_URL_TUPLE: t's strings are malloc'd (http_target_free them); WEB_URL_OPAQUE: a
+   URL of another scheme; WEB_URL_INVALID: not a URL; WEB_URL_OOM. t is zero unless TUPLE. */
+enum web_url_result http_target_of(const char *url, struct http_target *t);
+void http_target_free(struct http_target *t);
 
 /* ---- HTTP ---- */
 /* body callback: return a negative value to abort the transfer */

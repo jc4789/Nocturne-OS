@@ -18,11 +18,20 @@ void web_worker_abort(web_worker_publication *);
  * same-origin/CORS/cookie/security policy; child has no direct network API.
  * Completion may queue bytes only, never execute author JS. */
 typedef bool (*web_worker_loader)(void *,uint32_t,uint32_t,const char *,int);
-/* Binary Fetch request snapshots are borrowed only for this call. The browser
- * transport copies them before returning and retains the native initiator. */
-typedef bool (*web_worker_requester)(void *,uint32_t,uint32_t,const char *,int,
-                                    const char *,const char *,const void *,size_t,const char *,int);
+/* A Worker's fetch (NJW_LOAD kind 2) as the child sent it: its modes are the kind's
+ * NJW_LOAD_* flags. referrer is the child's referrer source (NULL: its client), destination a
+ * webnet destination's name. Binary Fetch request snapshots are borrowed only for this call. The
+ * browser transport copies them before returning and retains the native initiator. */
+struct web_worker_fetch {
+    const char *url,*method,*headers,*referrer,*destination;
+    const void *body;size_t body_len;
+    int referrer_policy;
+};
+typedef bool (*web_worker_requester)(void *,uint32_t,uint32_t,int,const struct web_worker_fetch *);
 void web_worker_set_requester(web_workers *,web_worker_requester);
+/* The child took the last frame of a streamed fetch (NJW_RESUME): send the next. */
+typedef void (*web_worker_resumer)(void *,uint32_t,uint32_t);
+void web_worker_set_resumer(web_workers *,web_worker_resumer);
 /* Request zero retires all outstanding resources of this real child owner. */
 typedef void (*web_worker_canceler)(void *,uint32_t,uint32_t);
 web_workers *web_worker_new(JSContext *,uint32_t,web_worker_loader,void *);
@@ -39,6 +48,11 @@ void web_worker_set_canceler(web_workers *,web_worker_canceler);
 JSValue web_worker_native(web_workers *,int,JSValueConst *);
 void web_worker_set_callback(web_workers *,JSValueConst);
 void web_worker_loaded(web_workers *,uint32_t,uint32_t,int,const char *,const char *,const void *,size_t,const char *);
+/* One frame of a streamed fetch (event: WEBNET_HEADERS, WEBNET_CHUNK, WEBNET_END or
+ * WEBNET_UPLOAD; bytes: a chunk's, or the uploaded count for WEBNET_UPLOAD). An opaque response's
+ * headers enter the child blank. False when the child is gone or the frame was not queued; the
+ * caller then cancels the request. */
+bool web_worker_frame(web_workers *,uint32_t,uint32_t,int,int,const char *,const char *,const void *,size_t,const char *);
 void web_worker_pump(web_workers *,uint64_t);
 bool web_worker_runnable(const web_workers *);
 /* Invoke under the caller's ordinary main-JS task budget/microtask checkpoint. */

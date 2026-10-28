@@ -58,7 +58,7 @@ globalThis.runEditingCases = function () {
     setup('a[b]c');
     document.execCommand('styleWithCSS', false, 'true');
     document.execCommand('bold');
-    eq(html(), 'a<span style="font-weight: bold">b</span>c', 'bold with CSS');
+    eq(html(), 'a<span style="font-weight: bold;">b</span>c', 'bold with CSS');
     document.execCommand('styleWithCSS', false, 'false');
     setup('a[b]c');
     document.execCommand('foreColor', false, '#FF0000');

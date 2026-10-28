@@ -261,7 +261,7 @@ static void effect_compute_fill(const struct web_effect *e, int fill, struct web
     const struct web_timing *t = &e->timing;
     const struct web_animation *a = e->animation;
     o->local = a ? web_animation_current(a) : NAN;
-    o->active = o->progress = o->iteration = NAN; o->phase = WA_PHASE_IDLE;
+    o->active = o->progress = o->iteration = NAN; o->phase = WA_PHASE_IDLE; o->before = false;
     if (!resolved(o->local)) return;
     double ad = web_effect_active_duration(t), end = web_effect_end(t), id = iteration_duration(t);
     double before_active = fmax(fmin(t->delay, end), 0), active_after = fmax(fmin(t->delay + ad, end), 0);
@@ -289,8 +289,8 @@ static void effect_compute_fill(const struct web_effect *e, int fill, struct web
         forwards = isinf(d) || fmod(d, 2) == 0;
     }
     double directed = forwards ? simple : 1 - simple;
-    bool before = (o->phase == WA_PHASE_BEFORE && forwards) || (o->phase == WA_PHASE_AFTER && !forwards);
-    o->progress = css_easing_apply(&t->easing, directed, before);
+    o->before = (o->phase == WA_PHASE_BEFORE && forwards) || (o->phase == WA_PHASE_AFTER && !forwards);
+    o->progress = css_easing_apply(&t->easing, directed, o->before);
 }
 void web_effect_compute(const struct web_effect *e, struct web_effect_progress *o) { effect_compute_fill(e, e->timing.fill, o); }
 bool web_animation_relevant(const struct web_animation *a) {
@@ -702,7 +702,8 @@ static bool effect_value(struct sampler *s, const struct web_effect *e, const st
     if (!values[1]) return css_computed_value(values[0], p, out, s->ctx->d);
     double span = ends[1]->offset - ends[0]->offset;
     double distance = span == 0 ? 0 : (progress - ends[0]->offset) / span;
-    double t = ends[0]->frame ? css_easing_apply(&ends[0]->frame->easing, distance, false) : distance;
+    /* "the effect value of a keyframe effect": the start keyframe's easing, with the before flag */
+    double t = ends[0]->frame ? css_easing_apply(&ends[0]->frame->easing, distance, pr->before) : distance;
     size_t begin = out->n;
     if (css_anim_interpolate(s->ctx, p, values[0], values[1], t, out)) return true;
     out->n = begin;

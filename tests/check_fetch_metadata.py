@@ -19,6 +19,7 @@ from pathlib import Path
 import hashlib
 import os
 import subprocess
+import url_owner
 
 root=Path(__file__).resolve().parent.parent
 out=root/'build/fetch-metadata-host';out.mkdir(parents=True,exist_ok=True)
@@ -44,9 +45,13 @@ prefix=r'''
 #define strncasecmp _strnicmp
 #define strcasecmp _stricmp
 static int allocations,fail_allocation=-1,live_allocations;
-static void *fault_malloc(size_t n){if(allocations++==fail_allocation)return NULL;void *p=malloc(n);if(p)live_allocations++;return p;}
-static void *fault_realloc(void *p,size_t n){if(allocations++==fail_allocation)return NULL;void *q=realloc(p,n);if(q&&!p)live_allocations++;return q;}
-static void fault_free(void *p){if(p)live_allocations--;free(p);}
+/* 製品の割り当てだけを数える。URL の解析器（tests/url_owner.py の物）が渡した文字列は、受け取った側が放す。 */
+static void *fault_live[4096];
+static void fault_track(void *p){for(int i=0;i<4096;i++)if(!fault_live[i]){fault_live[i]=p;live_allocations++;return;}abort();}
+static bool fault_untrack(void *p){for(int i=0;i<4096;i++)if(fault_live[i]==p){fault_live[i]=NULL;live_allocations--;return true;}return false;}
+static void *fault_malloc(size_t n){if(allocations++==fail_allocation)return NULL;void *p=malloc(n);if(p)fault_track(p);return p;}
+static void *fault_realloc(void *p,size_t n){if(allocations++==fail_allocation)return NULL;bool own=p&&fault_untrack(p);void *q=realloc(p,n);if(q)fault_track(q);else if(own)fault_track(p);return q;}
+static void fault_free(void *p){if(p)fault_untrack(p);free(p);}
 static char *fault_strdup(const char *s){size_t n=strlen(s);char *p=fault_malloc(n+1);if(p)memcpy(p,s,n+1);return p;}
 #define malloc fault_malloc
 #define realloc fault_realloc
@@ -156,13 +161,14 @@ long webcookie_get(webcookie_jar *jar,const struct webcookie_context *c,char *ou
     (void)jar;(void)c;(void)now;cookie_reads++;if(out&&cap)out[0]=0;return 0;
 }
 '''
-# URL の正規化は製品の実装（http.c と webfetch.c の http_url）で、試験用の解析器ではない。
-product=between(http,'void url_owned_free(','struct rd {')
+# URL の正規化は製品の実装（URL の記録の持ち主 web_url.c、http.c の http_target_of、webfetch.c の
+# http_url）で、試験用の解析器ではない。
+product=between(http,'enum web_url_result http_target_of(','struct rd {')
 product+=between(fetch,'static bool top_level_navigation(','static bool cache_context_allowed(')
 product+=between(fetch,'static bool fail(','static bool header_reserve(')
 product+=between(fetch,'static bool header_reserve(','static int remaining(')
-product+=between(fetch,'static enum http_url_result http_url(','static bool url_failure(')
-product+=between(fetch,'static bool potentially_trustworthy(','/* WHATWG host parsing')
+product+=between(fetch,'static enum web_url_result http_url(','static bool url_failure(')
+product+=between(fetch,'static bool append_referrer(','/* Mixed Content\'s "upgrade a mixed content request')
 product+=between(fetch,'static bool no_cors(','static bool forbidden_header(')
 product+=between(fetch,'static bool field_name_is(','/* Iterate every field occurrence')
 product+=between(fetch,'static const char *cookie_site_url(','static bool cache_partition(')
@@ -182,13 +188,14 @@ product+='static unsigned socket_records;\nstatic bool ws_record(struct websocke
 product+=between(fetch,'static bool ws_handshake(','static bool run_websocket(')
 generated=out/'fetch_metadata.c'
 generated.write_text(prefix+product+(root/'tests/fetch_metadata_host_cases.c').read_text(encoding='utf-8'),encoding='utf-8')
-cc=root/'tools/msys64/ucrt64/bin/clang.exe'
+cc=url_owner.clang(root)
 env=dict(os.environ,PATH=str(cc.parent)+os.pathsep+os.environ.get('PATH',''))
 log=out/'result.log';exe=out/'fetch_metadata.exe'
+owner=url_owner.objects(root,cc)
 with log.open('w',encoding='utf-8') as stream:
-    for name in ['user/apps/webfetch.c','user/libc/webnet.c','user/libc/http.c','user/include/webnet.h','user/include/webnet_wire.h','user/include/webprefs.h','tests/fetch_metadata_host_cases.c']:
+    for name in ['user/apps/webfetch.c','user/libc/webnet.c','user/libc/http.c','user/include/http.h','user/include/weburl.h','user/libc/web/web_url.c','user/include/webnet.h','user/include/webnet_wire.h','user/include/webprefs.h','tests/fetch_metadata_host_cases.c']:
         stream.write(name+' SHA256 '+hashlib.sha256((root/name).read_bytes()).hexdigest()+'\n')
     stream.flush()
-    subprocess.run([str(cc),'-std=gnu11','-O1','-Wall','-Wextra','-idirafter','user/include','-idirafter','common','-idirafter','third_party/bearssl/inc',str(generated),'-o',str(exe)],cwd=root,env=env,check=True,stdout=stream,stderr=subprocess.STDOUT)
+    subprocess.run([str(cc),'-std=gnu11','-O1','-Wall','-Wextra','-idirafter','user/include','-idirafter','common','-idirafter','third_party/bearssl/inc',str(generated),*owner,'-o',str(exe)],cwd=root,env=env,check=True,stdout=stream,stderr=subprocess.STDOUT)
     result=subprocess.run([str(exe)],cwd=root,env=env,timeout=20,stdout=stream,stderr=subprocess.STDOUT)
 print(log.read_text(encoding='utf-8'));raise SystemExit(result.returncode)
