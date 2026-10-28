@@ -167,7 +167,7 @@ Bilibili /en/ は、ログインしていないと再生 60 秒で動画を止�
 | 割り当てられた難しさ | startpage.com の検索 | 6 | 6（sp3、F12 で頁の `anubis_challenge` の rules を読んだ） | 4 |
 | 確認の頁から結果まで | 同上 | 176 秒（1 回） | 19.7 秒（sp2）、34.0 秒（sp3）。どれも 1 回ずつで、難しさ 6 の手間は平均 1678 万回のまわりで大きく散らばる。速くなったとは言えない | 295 ms（elapsedTime。体感 1 秒） |
 | 計算の速さ | 同上 | 35 万回/秒（同じ台本、Worker 2 本、20 秒） | 34.6 万回/秒（sp3 の pass-challenge の nonce 11,830,813 ÷ elapsedTime 34,144 ms） | Floorp 23 万回/秒（nonce 67,729 ÷ 295 ms）、Chromium（ホスト）42 万回/秒 |
-| Turnstile が通るか | Cloudflare の確認 | 未測定 | 未測定 | — |
+| Turnstile が通るか | Cloudflare の確認（demo.turnstile.workers.dev の枠） | 未測定 | 通った（m1028/cf1：開いて 25 秒以内に枠が「成功しました!」、console に例外なし）。Sign in の送信（サーバーの検証）はしていない。ユーザーが言う「前は通ったが今は通らない」確認の頁は未特定 | — |
 
 要求の頭（Accept・Accept-Language・Sec-Fetch-*・Upgrade-Insecure-Requests）を足しても難しさは 6 のままで、「頭の欠けが割り当ての差」という説明は覆った。差は割り当てだけに残る（平均の手間 256 倍）。
 
