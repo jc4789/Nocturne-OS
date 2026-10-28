@@ -1358,6 +1358,14 @@
         transport:{noCors:()=>!!host.noCorsFetch,streaming:()=>!!host.streamingFetch,
             fetch:(q,notify)=>host.fetch(q.url,q.method,q.headers,q.body,q.sameOrigin,q.credentials,q.forcePreflight,q.redirectError?1:q.redirectManual?2:0,q.cache,
                 q.keepalive,q.noCors,q.noReferrer,notify,q.referrer,q.referrerPolicy,q.destination),
+            /* A synchronous XMLHttpRequest's: host.fetchWait pauses this event loop until the
+               request is done (js.c native_fetch_wait). */
+            fetchSync:host.syncFetch?(q,timeout,initiator)=>{
+                const id=host.fetch(q.url,q.method,q.headers,q.body,q.sameOrigin,q.credentials,q.forcePreflight,q.redirectError?1:q.redirectManual?2:0,q.cache,
+                    q.keepalive,q.noCors,q.noReferrer,undefined,q.referrer,q.referrerPolicy,q.destination,true).id;
+                if(initiator)initiator(id);
+                return host.fetchWait(id);
+            }:undefined,
             resume:id=>host.resumeFetch(id),cancel:id=>host.cancel(id),keepaliveRoom:()=>host.keepaliveRoom()},
         baseURL:()=>rawDom.get(document,'baseURI'),origin:()=>rawDom.get(document,'fetchOrigin'),
         clientReferrer:()=>rawDom.get(document,'fetchClientReferrer'),referrerPolicy:()=>rawDom.get(document,'referrerPolicy'),
@@ -1449,7 +1457,7 @@
     const xhr=xhrInterfaces({fetch:fetchBridge,
         parseURL:url=>urlBridge.encodingParse(url,rawDom.get(document,'baseURI'),rawDom.get(document,'characterSet')),
         listened(target){const list=listenerList(target);if(list)for(let i=0;i<list.length;i++)if(!list[i].removed)return true;return false;},
-        log:text=>host.log(1,text),synchronous:false,
+        log:text=>host.log(1,text),synchronous:!!host.syncFetch,
         document:{is:value=>value instanceof Document,
             body(value){const html=rawDom.get(value,'htmlDocument');
                 return [html?'text/html;charset=UTF-8':'application/xml;charset=UTF-8',(html?rawDom.get(value,'innerHTML'):rawDom.get(value,'xmlSerialization'))??''];},

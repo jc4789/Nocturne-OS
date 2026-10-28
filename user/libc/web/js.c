@@ -130,6 +130,9 @@ struct js_pending {
     node_t *element; /* CSP: P_CSS, the link element a violation targets */
     bool done, aborted, force_preflight, redirect_error, redirect_manual, same_origin, keepalive, no_cors, no_referrer;
     bool streaming, headers_delivered, host_accepted;
+    /* P_FETCH: a Window's synchronous XMLHttpRequest's, which native_fetch_wait takes when it
+       completes; process_pending never settles it. */
+    bool synchronous;
     /* P_WORKER streamed: a frame is in the child, its NJW_RESUME not yet taken (worker_resume). */
     bool worker_paused;
     /* A streamed response's metadata, kept past the frame that clears response
@@ -6550,6 +6553,18 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     p->no_referrer = argc > 11 && JS_ToBool(ctx, argv[11]) > 0;
     p->referrer_policy=referrer_policy;
     if(referrer){p->referrer=js_strndup(ctx,referrer,referrer_length);if(!p->referrer){pending_error(p,"Out of memory preparing referrer policy");result=oom(ctx);goto out;}}
+    /* argv[16]: a Window's synchronous XMLHttpRequest's request, taken by fetchWait: no
+       promise and no stream. */
+    p->synchronous = argc > 16 && JS_ToBool(ctx, argv[16]) > 0;
+    if (p->synchronous && !s->host.wait_request) { pending_error(p, "This host cannot pause for a synchronous request"); result = JS_ThrowTypeError(ctx, "This realm cannot pause for a synchronous fetch"); goto out; }
+    if (p->synchronous) {
+        result = JS_NewObject(ctx);
+        if (JS_IsException(result) || JS_DefinePropertyValueStr(ctx, result, "id", JS_NewInt64(ctx, (int64_t)p->id), JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, result); result = JS_EXCEPTION; pending_error(p, "Out of memory preparing fetch result"); goto out;
+        }
+        send_request(s, p, WEB_RESOURCE_FETCH, method, headers, body, n);
+        goto out;
+    }
     p->streaming = argc > 12 && JS_IsFunction(ctx, argv[12]) && s->host.resume_request;
     if (p->streaming) p->stream_callback = JS_DupValue(ctx, argv[12]);
     JSValue funcs[2]; JSValue promise = JS_NewPromiseCapability(ctx, funcs);
@@ -8267,6 +8282,46 @@ static void worker_fetch_frame(struct web_js_state *s, struct js_pending *p) {
     if (resume) { if (s->host.resume_request) s->host.resume_request(s->host.opaque, p->id); }
     else p->worker_paused = true;
 }
+/* A finished P_FETCH request's settlement: the Response this realm's Fetch makes of its response
+   (*settled true), or the error its fetch rejects with. */
+static JSValue fetch_settlement(struct web_js_state *s, struct js_pending *p, bool *settled) {
+    JSValue value;
+    bool success = !p->response.error[0];
+    int transport=njw_transport_flags(web_response_headers(&p->response));
+    bool opaque=transport>=0&&(transport & NJW_LOADED_OPAQUE)!=0,manual=transport>=0&&(transport & NJW_LOADED_OPAQUE_REDIRECT)!=0;
+    if(success&&((opaque&&!p->no_cors)||(manual&&!p->redirect_manual)||(p->no_cors&&transport<0))){
+        pending_error(p,"Native Fetch response is missing or contradicts its filtering policy");success=false;
+    }
+    if (success) {
+        /* Transfer the already runtime-charged native snapshot. The
+           current QuickJS adopts external data only on success;
+           construction failure leaves pending_free as its owner. */
+        const bool hidden=opaque||manual;
+        JSValue bytes = hidden?JS_NULL:JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body,
+            p->response.body_len, fetch_body_free, NULL, false);
+        if (!hidden&&!JS_IsException(bytes)) p->response.body = NULL;
+        /* Response decodes bytes only when its consumer asks for text.
+           The old fourth argument was unused and eagerly expanded
+           every binary media fragment into a large JS string. */
+        bool redirected=transport>=0?(transport & NJW_LOADED_REDIRECTED)!=0:
+            web_response_url(&p->response)[0]&&strcmp(p->url,web_response_url(&p->response));
+        JSValue type=opaque?JS_NewString(s->ctx,"opaque"):manual?JS_NewString(s->ctx,"opaqueredirect"):transport<0?JS_UNDEFINED:
+            JS_NewString(s->ctx,(transport & NJW_LOADED_CORS)?"cors":"basic");
+        /* An opaque-redirect filtered response: the redirect's URL, nothing else. */
+        JSValue args[] = {JS_NewInt32(s->ctx,hidden?0:p->response.status),
+            JS_NewString(s->ctx,opaque?"":web_response_url(&p->response)[0]?web_response_url(&p->response):p->url),
+            JS_NewString(s->ctx,hidden?"":web_response_headers(&p->response)),JS_UNDEFINED,bytes,
+            JS_NewBool(s->ctx,!hidden&&redirected),JS_UNDEFINED,type,
+            opaque?JS_NewInt32(s->ctx,fetch_resource_bits(transport)):JS_UNDEFINED};
+        bool valid_args = true;
+        for (int i = 0; i < 9; ++i) if (JS_IsException(args[i])) valid_args = false;
+        value = valid_args ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 9, args) : JS_EXCEPTION;
+        for (int i = 0; i < 9; ++i) JS_FreeValue(s->ctx, args[i]);
+        if (JS_IsException(value)) { exception(s); success = false; value = JS_NewString(s->ctx, "Could not construct fetch response"); }
+    } else { JSValue args[] = {JS_NewString(s->ctx, p->response.error), JS_NewBool(s->ctx, p->aborted)}; value = JS_Call(s->ctx, s->reject, JS_UNDEFINED, 2, args); JS_FreeValue(s->ctx, args[0]); JS_FreeValue(s->ctx, args[1]); }
+    *settled = success;
+    return value;
+}
 static bool process_pending(struct web_js_state *s) {
     struct js_pending **link = &s->pending;
     uint64_t now = uptime_ms();
@@ -8276,6 +8331,12 @@ static bool process_pending(struct web_js_state *s) {
         if(document_resource_kind(p->kind) && p->stream_generation!=s->stream_generation){
             imports_waiting|=p->kind==P_MODULE; /* its module failed with the old stream */
             *link=p->next;pending_free(s,p);continue;
+        }
+        /* fetchWait takes a synchronous request in the task that made it; one still here was
+           left by that task (its initiator threw). */
+        if (p->synchronous) {
+            if (!p->done && s->host.cancel) s->host.cancel(s->host.opaque, p->id);
+            *link = p->next; pending_free(s, p); continue;
         }
         if (!p->done && now >= p->deadline) { if (s->host.cancel) s->host.cancel(s->host.opaque, p->id); pending_error(p, "Resource request exceeded its deadline"); }
         if (!p->done) { link = &p->next; continue; }
@@ -8382,40 +8443,8 @@ static bool process_pending(struct web_js_state *s) {
         } else if (!s->disabled && p->kind == P_FETCH) {
             ran_task = true;
             begin_task(s);
-            JSValue value;
-            bool success = !p->response.error[0];
-            int transport=njw_transport_flags(web_response_headers(&p->response));
-            bool opaque=transport>=0&&(transport & NJW_LOADED_OPAQUE)!=0,manual=transport>=0&&(transport & NJW_LOADED_OPAQUE_REDIRECT)!=0;
-            if(success&&((opaque&&!p->no_cors)||(manual&&!p->redirect_manual)||(p->no_cors&&transport<0))){
-                pending_error(p,"Native Fetch response is missing or contradicts its filtering policy");success=false;
-            }
-            if (success) {
-                /* Transfer the already runtime-charged native snapshot. The
-                   current QuickJS adopts external data only on success;
-                   construction failure leaves pending_free as its owner. */
-                const bool hidden=opaque||manual;
-                JSValue bytes = hidden?JS_NULL:JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body,
-                    p->response.body_len, fetch_body_free, NULL, false);
-                if (!hidden&&!JS_IsException(bytes)) p->response.body = NULL;
-                /* Response decodes bytes only when its consumer asks for text.
-                   The old fourth argument was unused and eagerly expanded
-                   every binary media fragment into a large JS string. */
-                bool redirected=transport>=0?(transport & NJW_LOADED_REDIRECTED)!=0:
-                    web_response_url(&p->response)[0]&&strcmp(p->url,web_response_url(&p->response));
-                JSValue type=opaque?JS_NewString(s->ctx,"opaque"):manual?JS_NewString(s->ctx,"opaqueredirect"):transport<0?JS_UNDEFINED:
-                    JS_NewString(s->ctx,(transport & NJW_LOADED_CORS)?"cors":"basic");
-                /* An opaque-redirect filtered response: the redirect's URL, nothing else. */
-                JSValue args[] = {JS_NewInt32(s->ctx,hidden?0:p->response.status),
-                    JS_NewString(s->ctx,opaque?"":web_response_url(&p->response)[0]?web_response_url(&p->response):p->url),
-                    JS_NewString(s->ctx,hidden?"":web_response_headers(&p->response)),JS_UNDEFINED,bytes,
-                    JS_NewBool(s->ctx,!hidden&&redirected),JS_UNDEFINED,type,
-                    opaque?JS_NewInt32(s->ctx,fetch_resource_bits(transport)):JS_UNDEFINED};
-                bool valid_args = true;
-                for (int i = 0; i < 9; ++i) if (JS_IsException(args[i])) valid_args = false;
-                value = valid_args ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 9, args) : JS_EXCEPTION;
-                for (int i = 0; i < 9; ++i) JS_FreeValue(s->ctx, args[i]);
-                if (JS_IsException(value)) { exception(s); success = false; value = JS_NewString(s->ctx, "Could not construct fetch response"); }
-            } else { JSValue args[] = {JS_NewString(s->ctx, p->response.error), JS_NewBool(s->ctx, p->aborted)}; value = JS_Call(s->ctx, s->reject, JS_UNDEFINED, 2, args); JS_FreeValue(s->ctx, args[0]); JS_FreeValue(s->ctx, args[1]); }
+            bool success;
+            JSValue value = fetch_settlement(s, p, &success);
             JSValue r = JS_Call(s->ctx, success ? p->resolve : p->reject, JS_UNDEFINED, 1, &value);
             JS_FreeValue(s->ctx, value); if (JS_IsException(r)) exception(s); else JS_FreeValue(s->ctx, r);
             end_task(s);
@@ -8424,6 +8453,46 @@ static bool process_pending(struct web_js_state *s) {
     }
     if(imports_waiting&&module_imports_advance(s))ran_task=true;
     return ran_task;
+}
+
+/* host.fetchWait(id): a Window's synchronous XMLHttpRequest (XHR send() with the synchronous
+   flag). This realm's event loop pauses, no task or microtask running, while the host serves only
+   the network and the window (host.wait_request) until the request host.fetch(..., true) started
+   is done. The Response is returned and the error it ends with thrown; a pause that the user, the
+   window or a navigation ended is a network error. */
+static JSValue native_fetch_wait(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    int64_t id; if (!argc || JS_ToInt64(ctx, &id, argv[0])) return JS_EXCEPTION;
+    struct web_js_state *s = state(ctx);
+    struct js_pending *p = s->pending;
+    while (p && !(p->id == (uint64_t)id && p->kind == P_FETCH && p->synchronous)) p = p->next;
+    if (!p) return JS_ThrowTypeError(ctx, "No synchronous request has this id");
+    if (!p->done) {
+        uint64_t before = uptime_ms();
+        bool completed = s->host.wait_request && s->host.wait_request(s->host.opaque, p->id, &p->done);
+        /* The network wait is not JavaScript execution, as a synchronously loaded module's. */
+        uint64_t waited = uptime_ms() - before;
+        for (struct web_js_state *active = s; active; active = active->runtime_previous)
+            if (active->running) { active->task_deadline += waited; active->task_native_wait_ms += waited; }
+        if (s->compiling) s->compile_wait_ms += waited;
+        if (!completed || !p->done) {
+            if (!p->done && s->host.cancel) s->host.cancel(s->host.opaque, p->id);
+            p->aborted = true; pending_error(p, "The synchronous request was interrupted");
+        }
+    }
+    /* The host delivered other requests while it waited; take this one out of the list as it is now. */
+    for (struct js_pending **link = &s->pending; *link; link = &(*link)->next)
+        if (*link == p) { *link = p->next; break; }
+    bool ok = !p->response.error[0] && p->response.status >= 200 && p->response.status < 300;
+    if (!ok && (p->response.error[0] || p->response.status >= 400))
+        diagnostic_resource(s,p,p->aborted?"aborted":p->response.error[0]?p->response.error:"unsuccessful HTTP response");
+    if (!p->aborted && !s->disabled) resource_timing(s, p);
+    if (s->host.net_log) net_log_response(s,p,"done",p->response.body_len);
+    if (s->disabled) { pending_free(s, p); return JS_ThrowTypeError(ctx, "Scripting was disabled during the synchronous request"); }
+    bool success;
+    JSValue value = fetch_settlement(s, p, &success);
+    pending_free(s, p);
+    return success ? value : JS_Throw(ctx, value);
 }
 
 static bool pending_kind(struct web_js_state *s, int kind) {
@@ -10089,6 +10158,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("socketBuffered", 1, native_socket_buffered), JS_CFUNC_DEF("socketRelease", 1, native_socket_release),
 JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_cancel),
         JS_CFUNC_DEF("resumeFetch", 1, native_resume_fetch), JS_CFUNC_DEF("keepaliveRoom", 0, native_keepalive_room),
+        JS_CFUNC_DEF("fetchWait", 1, native_fetch_wait),
         JS_CFUNC_DEF("promiseThen", 3, native_promise_then),
         JS_CFUNC_DEF("promiseIsHandled", 1, native_promise_is_handled)
     };
@@ -10100,6 +10170,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     JS_SetPropertyStr(s->ctx,api,"domOperations",operations);
     JS_SetPropertyStr(s->ctx,api,"noCorsFetch",JS_TRUE);
     JS_SetPropertyStr(s->ctx,api,"streamingFetch",JS_NewBool(s->ctx,s->host.resume_request != NULL));
+    JS_SetPropertyStr(s->ctx,api,"syncFetch",JS_NewBool(s->ctx,s->host.wait_request != NULL)); /* fetchWait */
     JS_SetPropertyStr(s->ctx,api,"automation",JS_NewBool(s->ctx,s->host.automation != NULL)); /* navigator.webdriver */
     /* Watch before the realm first reads the languages, so no change falls between
        (web_wait_queue watches the preferences once for the process). */

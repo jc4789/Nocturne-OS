@@ -205,8 +205,9 @@ struct web_host {
        callback; origin/credentials are native initiating-realm values. Same
        native-only wait/response ownership contract as sync_load applies. */
     bool (*sync_request)(void *opaque, const struct web_request *request, struct web_response *response);
-    /* Join an already submitted module request without another HTTP fetch.
-       completed is borrowed from a pinned native pending record. This callback
+    /* Join an already submitted request without another HTTP fetch: a module
+       request, or a Window's synchronous XMLHttpRequest's fetch (js.c
+       native_fetch_wait). completed is borrowed from a pinned native pending record. This callback
        may pump native network/UI only: no author JS, document replacement or
        pending-record destruction. Return false on navigation/cancellation. */
     bool (*wait_request)(void *opaque, uint64_t id, const bool *completed);

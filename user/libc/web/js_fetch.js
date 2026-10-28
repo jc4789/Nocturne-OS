@@ -7,8 +7,9 @@
                       fetch(query, notify) -> {id, promise}, resume(id), cancel(id), and
                       keepaliveRoom() (the bytes the realm's fetch group can still take into its
                       inflight keepalive bodies; a Window's only, for Beacon), fetchSync(query,
-                      timeout, initiator) -> a Response or null (a Worker's only: its event loop
-                      pauses for a synchronous XMLHttpRequest; initiator(id) as realm.initiator),
+                      timeout, initiator) -> a Response or null (its event loop pauses for a
+                      synchronous XMLHttpRequest: a Worker's, and a Window's when its host can
+                      serve the network alone; initiator(id) as realm.initiator),
                       and obtainBlob(url[, timeout]) (a Worker's only: FileAPI "obtain a blob
                       object" from its parent document's store, {id, promise} -> [bytes, type],
                       or with a timeout [bytes, type] or null). A Window's is js.c's (host.fetch); a Worker's
