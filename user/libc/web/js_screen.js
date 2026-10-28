@@ -35,10 +35,10 @@ const viewportBridge=(()=>{
     const viewportTypes=['resize','scroll','scrollend'];
     installHandlers(VisualViewport.prototype,viewportTypes);
     const visualViewport=Object.create(VisualViewport.prototype);viewports.add(visualViewport);
-    // [SameObject, Replaceable]; null while the document is not fully active.
+    // [SameObject, Replaceable] (js_webidl.c gives the setter); null while the document is not
+    // fully active.
     Object.defineProperty(globalThis,'visualViewport',{configurable:true,enumerable:true,
-        get(){return dom('fullyActive',null)?visualViewport:null;},
-        set(v){Object.defineProperty(globalThis,'visualViewport',{configurable:true,enumerable:true,writable:true,value:v});}});
+        get(){return dom('fullyActive',null)?visualViewport:null;}});
     globalThis.VisualViewport=VisualViewport;
     const fire=target=>{const event=new Event('resize');eventState(event).isTrusted=true;dispatch(target,event);};
     return {

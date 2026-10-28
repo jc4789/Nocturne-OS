@@ -1407,23 +1407,18 @@
     installHandlers(globalThis,windowHandlerTypes);
     Object.defineProperties(globalThis,{innerWidth:{get(){return dom('viewport',null,0);}},innerHeight:{get(){return dom('viewport',null,1);}}});
     // CSSOM View: the window manager does not expose the window position to
-    // applications, so it is reported as the screen origin. [Replaceable]:
-    // assignment shadows the attribute with an ordinary data property.
-    {const replace=(name,value)=>Object.defineProperty(globalThis,name,{configurable:true,enumerable:true,writable:true,value});
-     Object.defineProperties(globalThis,Object.getOwnPropertyDescriptors({
-        get outerWidth(){return host.windowSize(0);},set outerWidth(v){replace('outerWidth',v);},
-        get outerHeight(){return host.windowSize(1);},set outerHeight(v){replace('outerHeight',v);},
-        get screenX(){return 0;},set screenX(v){replace('screenX',v);},get screenLeft(){return 0;},set screenLeft(v){replace('screenLeft',v);},
-        get screenY(){return 0;},set screenY(v){replace('screenY',v);},get screenTop(){return 0;},set screenTop(v){replace('screenTop',v);}}));
-     /* DOM "Legacy extensions to the Window interface": [Replaceable] readonly attribute
+    // applications, so it is reported as the screen origin. These are [Replaceable]:
+    // js_webidl.c gives every such attribute the Web IDL setter that shadows it with an
+    // ordinary data property, so the bindings define the getters only.
+    Object.defineProperties(globalThis,Object.getOwnPropertyDescriptors({
+        get outerWidth(){return host.windowSize(0);},get outerHeight(){return host.windowSize(1);},
+        get screenX(){return 0;},get screenLeft(){return 0;},get screenY(){return 0;},get screenTop(){return 0;}}));
+    {/* DOM "Legacy extensions to the Window interface": [Replaceable] readonly attribute
         (Event or undefined) event, this Window's current event (invokeListener sets it). An
-        undefined this is this global; another receiver is not this Window. The setter is Web
-        IDL's [Replaceable] one: CreateDataPropertyOrThrow on the global. js_webidl.c gives the
-        accessors their IDL names and lengths. */
+        undefined this is this global; another receiver is not this Window. */
      const windowReceiver=self=>{if(self!==undefined && self!==null && self!==globalThis)throw new EventTypeError('Illegal Window receiver');};
      Object.defineProperties(globalThis,Object.getOwnPropertyDescriptors({
-        get event(){windowReceiver(this);return currentEvent;},
-        set event(v){windowReceiver(this);replace('event',v);}}));}
+        get event(){windowReceiver(this);return currentEvent;}}));}
     Object.defineProperty(Document.prototype,'cookie',{get(){return this===document?host.cookie():'';},set(v){v=String(v);if(this===document)host.cookie(v);}});
     Object.defineProperties(globalThis,{
         scrollX:{get(){return host.scroll(0);}},pageXOffset:{get(){return host.scroll(0);}},

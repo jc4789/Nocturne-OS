@@ -215,6 +215,25 @@ static JSValue named_function(struct shaper *s, JSValue function, const struct w
     return function;
 }
 
+/* The setter of a [Replaceable] attribute (Web IDL "attribute setter"), the same for every one:
+   this, or the realm's global object for undefined and null, must implement the interface, and
+   every [Replaceable] attribute is a member of a [Global] interface (or a mixin it includes),
+   so that is the global itself; the value then shadows the attribute as an own data property
+   of it (CreateDataPropertyOrThrow). The bindings define the getters only. data: the
+   identifier, the global. */
+static JSValue replaceable_setter(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *data) {
+    (void)magic;
+    JSValueConst target = JS_IsUndefined(this_val) || JS_IsNull(this_val) ? data[1] : this_val;
+    if (!JS_IsObject(target) || JS_VALUE_GET_PTR(target) != JS_VALUE_GET_PTR(data[1]))
+        return JS_ThrowTypeError(ctx, "Illegal invocation");
+    JSAtom id = JS_ValueToAtom(ctx, data[0]);
+    if (id == JS_ATOM_NULL) return JS_EXCEPTION;
+    int defined = JS_DefinePropertyValue(ctx, target, id, JS_DupValue(ctx, argc > 0 ? argv[0] : JS_UNDEFINED),
+                                         JS_PROP_C_W_E | JS_PROP_THROW);
+    JS_FreeAtom(ctx, id);
+    return defined < 0 ? JS_EXCEPTION : JS_UNDEFINED;
+}
+
 static JSValue constant_value(JSContext *ctx, const struct webidl_member *m) {
     if (m->flags & WEBIDL_BOOLEAN) return JS_NewBool(ctx, m->value != 0);
     if (m->value == floor(m->value) && fabs(m->value) <= 2147483647.0) return JS_NewInt32(ctx, (int32_t)m->value);
@@ -270,7 +289,13 @@ static void shape_member(struct shaper *s, const struct webidl_interface *i, JSV
                             (m->flags & (WEBIDL_REPLACEABLE | WEBIDL_PUT_FORWARDS | WEBIDL_LENIENT_SETTER));
             JSValue get = JS_IsUndefined(d.getter) ? JS_UNDEFINED : named_function(s, JS_DupValue(ctx, d.getter), m, ROLE_GET, 0);
             JSValue set = JS_UNDEFINED;
-            if (!JS_IsUndefined(d.setter)) {
+            if (JS_IsUndefined(d.setter) && (m->flags & WEBIDL_REPLACEABLE) &&
+                JS_VALUE_GET_PTR(holder) == JS_VALUE_GET_PTR(s->global)) {
+                JSValue data[2] = {JS_NewString(ctx, m->name), s->global};
+                set = JS_NewCFunctionData(ctx, replaceable_setter, 1, 0, 2, data);
+                JS_FreeValue(ctx, data[0]);
+                if (!JS_IsException(set)) set = named_function(s, set, m, ROLE_SET, 1);
+            } else if (!JS_IsUndefined(d.setter)) {
                 if (settable) set = named_function(s, JS_DupValue(ctx, d.setter), m, ROLE_SET, 1);
                 else {
                     s->report.setters_dropped++;
