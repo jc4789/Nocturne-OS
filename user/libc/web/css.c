@@ -2980,6 +2980,16 @@ int css_decl_set(const char *css, size_t n, const char *property, const char *va
     sb_free(&serialized); free(name);
     return 1;
 }
+void css_decl_drop_important(const char *css, size_t n, sbuf *out) {
+    const char *end = css + n;
+    for (const char *p = css; p < end;) {
+        const char *e = decl_separator(p, end, ';'), *colon = decl_separator(p, e, ':');
+        const char *v = colon < e ? colon + 1 : e, *ve = e;
+        while (ve > v && is_space((unsigned char)ve[-1])) ve--;
+        if (colon >= e || !decl_priority(v, &ve)) { sb_put(out, p, (size_t)(e - p)); if (e < end) sb_putc(out, ';'); }
+        p = e < end ? e + 1 : end;
+    }
+}
 void css_decl_names(const char *css, size_t n, sbuf *names) {
     const char *at = css, *begin, *finish, *colon;
     while (decl_next(&at, css + n, &begin, &finish, &colon)) {

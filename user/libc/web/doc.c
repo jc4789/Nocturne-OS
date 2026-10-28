@@ -157,6 +157,7 @@ struct sheet_walk {
     struct sheet_walk *parent;
     const char *url, *base; /* cached request/final URL, not an inline sheet's base */
     sheet_t *sheet;
+    struct cssom_sheet *cssom; /* the CSSOM sheet whose AST it is, if any */
     pvec imports;
     int next;
     sbuf wrapped;
@@ -288,7 +289,7 @@ static bool sheet_parse(web_doc *d, struct sheet_walk *f, const char *css, size_
 /* Return whether this root has no outstanding critical import fetches. The
    ordinary parser/OOM diagnostics remain separate from resource load state;
    unrelated root sheets must not become this owner's completion barrier. */
-static bool add_sheet_ast(web_doc *d, const char *css, size_t n, const char *base, double order, const char *media, node_t *scope, sheet_t *native_ast) {
+static bool add_sheet_ast(web_doc *d, const char *css, size_t n, const char *base, double order, const char *media, node_t *scope, struct cssom_sheet *cssom) {
     struct sheet_walk *volatile active = calloc(1, sizeof(struct sheet_walk));
     if (!active) {
         web_js_console(d, 2, "Stylesheet import traversal allocation failed");
@@ -315,8 +316,9 @@ static bool add_sheet_ast(web_doc *d, const char *css, size_t n, const char *bas
         d->need_style = true;
         return !pending_import;
     }
-    if (native_ast) {
-        if(!sheet_instance_imports(d,active,native_ast,order,media,scope))failed=true;
+    if (cssom) {
+        active->cssom=cssom;
+        if(!sheet_instance_imports(d,active,cssom->p.ast,order,media,scope))failed=true;
     } else if (!sheet_parse(d, active, css, n, base, order, media, scope)) failed = true;
     while (!failed && active) {
         struct sheet_walk *f = active;
@@ -338,6 +340,21 @@ static bool add_sheet_ast(web_doc *d, const char *css, size_t n, const char *bas
         bool cycle = sheet_ancestor_url(f, im->url) ||
                      (cached && sheet_ancestor_url(f, cached->base));
         if (cycle) { f->next++; free(im->url); free(im); continue; }
+        /* An @import rule CSSOM gave a sheet of its own (CSSImportRule.styleSheet)
+           cascades that sheet's AST, which its changes reach; a disabled one none. */
+        struct cssom_sheet *own = f->cssom && im->owner ? cssom_import_child(f->cssom, im->owner->id) : NULL;
+        if (own) {
+            const struct css_rule_info *import_owner=im->owner;
+            f->next++; free(im->url); free(im);
+            if (own->disabled) continue;
+            struct sheet_walk *child = calloc(1, sizeof *child);
+            if (!child) { failed = true; break; }
+            child->parent = f; child->url = own->href; child->base = own->base; child->cssom = own;
+            active = child;
+            if (!sheet_instance_imports(d, child, own->p.ast, order, media, scope)) failed = true;
+            if (!failed) css_sheet_import_context(child->sheet, f->sheet, import_owner);
+            continue;
+        }
         if (cached && cached->done) {
             if (cached->body) {
                 struct sheet_walk *child = calloc(1, sizeof *child);
@@ -632,14 +649,9 @@ bool web_render_blocked(web_doc *d) {
     return false;
 }
 /* Borrow only a completed native resource, never a fabricated empty sheet.
-   URL/data scratch is caller-owned; cache text/base survives the document. */
-int doc_cssom_link_source(web_doc *d,node_t *n,struct cssom_link_source *source) {
-    memset(source,0,sizeof *source);
-    if(!d||!n||n->owner!=d||!d->live||d->inert||!link_stylesheet(n)||
-        doc_node_root(n,true)!=d->root||node_ancestor(n,T_template))return CSSOM_INACTIVE;
-    const char *href=node_attr(n,"href");if(!href||!*href)return CSSOM_INACTIVE;
-    int resolved=doc_encoding_parse_url(d,href,&source->url);
-    if(resolved!=1)return resolved<0?CSSOM_OOM:CSSOM_INACTIVE;
+   URL/data scratch is caller-owned; cache text/base survives the document.
+   source->url is the sheet's absolute URL, which the source then owns. */
+static int cssom_url_source(web_doc *d,struct cssom_link_source *source) {
     if(!strncasecmp(source->url,"data:",5)) {
         int result;source->owned_text=data_url(d,source->url,&source->length,&result);
         if(!source->owned_text){free(source->url);memset(source,0,sizeof *source);return result==-1?CSSOM_OOM:CSSOM_INACTIVE;}
@@ -648,6 +660,21 @@ int doc_cssom_link_source(web_doc *d,node_t *n,struct cssom_link_source *source)
     struct cached_css *cached=cached_css(d,source->url);
     if(!cached||!cached->done||!cached->body){free(source->url);memset(source,0,sizeof *source);return CSSOM_INACTIVE;}
     source->text=cached->body;source->length=cached->n;source->base=cached->base;return CSSOM_OK;
+}
+int doc_cssom_link_source(web_doc *d,node_t *n,struct cssom_link_source *source) {
+    memset(source,0,sizeof *source);
+    if(!d||!n||n->owner!=d||!d->live||d->inert||!link_stylesheet(n)||
+        doc_node_root(n,true)!=d->root||node_ancestor(n,T_template))return CSSOM_INACTIVE;
+    const char *href=node_attr(n,"href");if(!href||!*href)return CSSOM_INACTIVE;
+    int resolved=doc_encoding_parse_url(d,href,&source->url);
+    if(resolved!=1)return resolved<0?CSSOM_OOM:CSSOM_INACTIVE;
+    return cssom_url_source(d,source);
+}
+int doc_cssom_import_source(web_doc *d,const char *url,struct cssom_link_source *source) {
+    memset(source,0,sizeof *source);
+    if(!d||!url||!d->live||d->inert)return CSSOM_INACTIVE;
+    if(!(source->url=strdup(url)))return CSSOM_OOM;
+    return cssom_url_source(d,source);
 }
 bool doc_link_load_current(web_doc *d, node_t *n, uint64_t generation) {
     if (!d || !d->live || d->inert || !n || n->owner != d ||
@@ -755,7 +782,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
                 if (cached->body && link_sheet_applies(c)) {
                     if(c->cssom_current) {
                         int error;struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                        if(sheet)complete=add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,d->next_sheet_order++,sheet->media,scope,sheet->p.ast);
+                        if(sheet)complete=add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,d->next_sheet_order++,sheet->media,scope,sheet);
                         else if(error==CSSOM_OOM)web_js_console(d,2,"Native link style sheet allocation failed");
                     }else complete=add_sheet(d,cached->body,cached->n,cached->base,d->next_sheet_order++,media,scope);
                 }
@@ -779,7 +806,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
                 if (css && link_sheet_applies(c)) {
                     if(c->cssom_current) {
                         int error;struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                        if(sheet)complete=add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,pd->order,sheet->media,scope,sheet->p.ast);
+                        if(sheet)complete=add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,pd->order,sheet->media,scope,sheet);
                         else if(error==CSSOM_OOM)web_js_console(d,2,"Native link style sheet allocation failed");
                     }else complete=add_sheet(d,css,dn,d->base,pd->order,pd->media,scope);
                 }
@@ -804,7 +831,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
                persistent parser storage, not every repeated component style. */
             if (cssom) {
                 int error; struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                if (sheet) add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,d->next_sheet_order++,sheet->media,scope,sheet->p.ast);
+                if (sheet) add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,d->next_sheet_order++,sheet->media,scope,sheet);
                 else if (error==CSSOM_OOM) web_js_console(d,2,"Native style sheet allocation failed");
             } else {
                 sbuf b = {0}; text_of(c,&b);
@@ -841,7 +868,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
         for (uint32_t i = 0; i < n->adopted_count; i++) {
             struct cssom_sheet *s = n->adopted_sheets[i];
             if (!s->disabled) add_sheet_ast(d, s->p.source, s->p.length, s->base,
-                d->next_sheet_order++, s->media, scope, s->p.ast);
+                d->next_sheet_order++, s->media, scope, s);
         }
     }
 }

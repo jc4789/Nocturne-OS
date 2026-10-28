@@ -13,6 +13,9 @@ struct cssom_link_source {
     char *url, *owned_text;
 };
 int doc_cssom_link_source(web_doc *d, node_t *node, struct cssom_link_source *source);
+/* the same for an @import rule's absolute URL: a data: URL's text, or a
+   completed fetch's from the document's cache (CSSOM_INACTIVE: none yet) */
+int doc_cssom_import_source(web_doc *d, const char *url, struct cssom_link_source *source);
 bool cssom_owner_disabled(node_t *node);
 node_t *cssom_list_owner(web_doc *d, node_t *root, uint32_t index, bool select, uint32_t *count, int *error);
 /* One CSSOM parse of a text, in its own arena: the cascade AST, the rule tree,
@@ -57,12 +60,26 @@ struct cssom_sheet {
     char *dom_source, *dom_href, *href;
     size_t dom_length;
     uint64_t observed_dom_revision;
+    /* An @import rule's sheet (CSSOM: the rule's associated CSS style sheet),
+       in the list of the owner its parent sheet is in: parent's rule owner_rule
+       made it. It reaches the cascade while that rule stands in parent. */
+    struct cssom_sheet *parent;
+    uint32_t owner_rule;
     uint32_t id, next_rule_id;
     bool associated, disabled, origin_clean, constructed;
 };
 struct cssom_sheet *cssom_style_sheet(web_doc *d, node_t *owner, int *error);
 struct cssom_sheet *cssom_style_find(node_t *owner, uint32_t id);
 struct cssom_sheet *cssom_construct(web_doc *d, int *error);
+/* new CSSStyleSheet(options): base_url (NULL: none) parsed against the
+   document's base URL is the sheet's base; CSSOM_NOT_ALLOWED when it is not a URL */
+struct cssom_sheet *cssom_construct_based(web_doc *d, const char *base_url, int *error);
+/* CSSImportRule.styleSheet: the sheet of sheet's @import rule, made from the
+   rule's loaded resource the first time; NULL while it has none (no URL, its
+   supports() false, not loaded, failed) */
+struct cssom_sheet *cssom_import_sheet(struct cssom_sheet *sheet, const struct css_rule_info *rule, int *error);
+/* the sheet sheet's @import rule rule_id already has, or NULL (the cascade's) */
+struct cssom_sheet *cssom_import_child(const struct cssom_sheet *sheet, uint32_t rule_id);
 int cssom_replace_sync(struct cssom_sheet *sheet, const char *text, size_t length);
 int cssom_adopt(node_t *root, struct cssom_sheet **sheets, uint32_t count);
 void cssom_changed(struct cssom_sheet *sheet);
@@ -88,6 +105,9 @@ bool cssom_attribute(struct cssom_sheet *sheet, const struct css_rule_info *rule
 int cssom_set_attribute(struct cssom_sheet *sheet, uint32_t id, const char *name, const char *value, size_t length);
 /* a rule's declarations as written, their validity in its block, and setting them */
 void cssom_declarations(const struct css_rule_info *rule, const char **text, size_t *length);
+/* the rule's declaration block serialized: the declarations its block keeps
+   (a keyframe's without !important ones, CSS Animations 1); false: no memory */
+bool cssom_block(const struct css_rule_info *rule, sbuf *out);
 css_decl_check *cssom_declaration_check(const struct css_rule_info *rule);
 int cssom_set_declarations(struct cssom_sheet *sheet, uint32_t id, const char *text, size_t length);
 /* MediaList of the sheet (id 0), an @media rule or an @import rule:

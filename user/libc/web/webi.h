@@ -2221,6 +2221,10 @@ int css_inline_set(web_doc *d, node_t *e, const char *block, size_t n, const cha
                    const char *priority, sbuf *attribute);
 bool css_inline_replace(web_doc *d, node_t *e, const char *text, size_t n, sbuf *attribute);
 bool css_decl_balanced(const char *text, size_t n);
+/* a declaration list's text (comment-free) without its !important
+   declarations, the others as written: a keyframe's block, where CSS
+   Animations 1 makes them invalid */
+void css_decl_drop_important(const char *css, size_t n, sbuf *out);
 void web_js_start(web_doc *d, const struct web_host *host);
 bool web_js_parser_candidate(web_doc *d, const char *name, const char *is);
 node_t *web_js_parser_element(web_doc *d, node_t *node, const char *is, bool finish);

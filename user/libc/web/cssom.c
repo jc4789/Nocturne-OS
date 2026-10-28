@@ -706,6 +706,9 @@ static void invalidate(web_doc *d) {
     d->layout_valid = false;
 }
 void cssom_changed(struct cssom_sheet *s) {
+    /* an @import rule's sheet is in the cascade through the rule's sheet */
+    for (bool attached; s->parent; s = s->parent)
+        if (!cssom_rule(s->parent, s->owner_rule, &attached) || !attached) return;
     if (s->constructed) invalidate(s->document);
     else if (s->associated && s->owner->cssom_current == s && s->owner->owner == s->document)
         invalidate(s->document);
@@ -745,13 +748,23 @@ static void sheet_free(struct cssom_sheet *s) {
     parse_free(&s->p); free(s->slots); free(s->base); free(s->media); free(s->dom_media);
     free(s->dom_source); free(s->dom_href); free(s->href); free(s);
 }
-struct cssom_sheet *cssom_construct(web_doc *d, int *error) {
+struct cssom_sheet *cssom_construct(web_doc *d, int *error) { return cssom_construct_based(d, NULL, error); }
+/* CSSOM "create a constructed CSSStyleSheet": its stylesheet base URL is
+   options' baseURL, a URL against the document's base URL. (Its href stays
+   null, as the engines and tests/browserfreezetest.c have it, not the
+   document's base URL the draft names its location.) */
+struct cssom_sheet *cssom_construct_based(web_doc *d, const char *base_url, int *error) {
     *error = CSSOM_OK;
     node_t *owner = d->root;
     if (owner->cssom_serial == UINT32_MAX) { *error = CSSOM_OOM; return NULL; }
+    char *base = NULL;
+    if (base_url) {
+        int resolved = web_resolve_url_owned(d->base ? d->base : "", base_url, &base);
+        if (resolved != 1) { *error = resolved < 0 ? CSSOM_OOM : CSSOM_NOT_ALLOWED; return NULL; }
+    }
     struct cssom_sheet *s = calloc(1, sizeof *s);
-    if (!s) { *error = CSSOM_OOM; return NULL; }
-    s->document = d; s->base = strdup(d->base ? d->base : "");
+    if (!s) { free(base); *error = CSSOM_OOM; return NULL; }
+    s->document = d; s->base = base ? base : strdup(d->base ? d->base : "");
     *error = s->base ? sheet_parse(s, "", 0) : CSSOM_OOM;
     if (*error) { sheet_free(s); return NULL; }
     s->owner = owner; s->id = ++owner->cssom_serial;
@@ -831,6 +844,41 @@ static int link_origin_clean(web_doc *d,const struct cssom_link_source *source,b
     *clean=!error&&a==WEB_URL_TUPLE&&b==WEB_URL_TUPLE&&c==WEB_URL_TUPLE&&
         !strcmp(origin,request)&&!strcmp(origin,final);
     free(origin);free(request);free(final);return error;
+}
+struct cssom_sheet *cssom_import_child(const struct cssom_sheet *s, uint32_t rule_id) {
+    for (struct cssom_sheet *c = s->owner ? s->owner->cssom_sheets : NULL; c; c = c->next)
+        if (c->parent == s && c->owner_rule == rule_id) return c;
+    return NULL;
+}
+/* An @import rule's sheet is its resource's text in a sheet of its own (CSS
+   Cascade 5 "fetch an @import": its parent the rule's sheet, its location the
+   rule's URL), kept in the list of the owner of the rule's sheet so that it
+   lives as long as that sheet and the ids of both find it. */
+struct cssom_sheet *cssom_import_sheet(struct cssom_sheet *s, const struct css_rule_info *r, int *error) {
+    *error = CSSOM_OK;
+    if (!r || r->type != CSS_RULE_IMPORT || !r->import || !r->import->url) return NULL;
+    struct cssom_sheet *c = cssom_import_child(s, r->id);
+    node_t *owner = s->owner;
+    if (c || !owner) return c;
+    if (owner->cssom_serial == UINT32_MAX) { *error = CSSOM_OOM; return NULL; }
+    struct cssom_link_source source;
+    int status = doc_cssom_import_source(s->document, r->import->url, &source);
+    if (status) { if (status == CSSOM_OOM) *error = status; return NULL; }
+    c = calloc(1, sizeof *c);
+    if (!c) *error = CSSOM_OOM;
+    else {
+        c->document = s->document;
+        c->base = strdup(source.base ? source.base : "");
+        c->href = strdup(source.url);
+        *error = c->base && c->href ? link_origin_clean(s->document, &source, &c->origin_clean) : CSSOM_OOM;
+        if (!*error) *error = sheet_parse(c, source.text, source.length);
+    }
+    free(source.url); free(source.owned_text);
+    if (*error) { if (c) sheet_free(c); return NULL; }
+    c->owner = owner; c->id = ++owner->cssom_serial;
+    c->parent = s; c->owner_rule = r->id;
+    c->next = owner->cssom_sheets; owner->cssom_sheets = c;
+    return c;
 }
 static bool available(web_doc *d,node_t *n,int *error) {
     if(!active(d,n))return false;
@@ -1085,26 +1133,53 @@ static bool nested(const struct css_rule_info *r) {
     }
     return false;
 }
-/* CSSStyleRule.selectorText: the parsed selectors serialized; a nested rule's
-   relative selectors absolutized with the nesting selector (CSS Nesting 3) */
-static void selector_text(const struct css_rule_info *r, sbuf *out) {
-    if (!nested(r)) {
-        size_t at = out->n;
-        css_rule_selector_serialize(r, out);
-        if (out->n == at) prelude(r, out);
-        return;
+/* The nesting selector as the selector serializer takes it: in a forgiving
+   :is(), which keeps an argument it cannot parse as written. Every & of the
+   text goes in so, so every one that comes out was one. */
+#define NESTING_STAND_IN ":is(&)"
+/* s with each & outside strings and escapes replaced by with (with_n bytes) */
+static void put_nesting(sbuf *out, const char *s, size_t n, const char *with, size_t with_n, size_t from_n) {
+    char quote = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == '\\' && i + 1 < n) { sb_put(out, s + i, 2); i++; continue; }
+        if (quote) { if (c == quote) quote = 0; sb_putc(out, c); continue; }
+        if (c == '"' || c == '\'') quote = c;
+        if (!quote && n - i >= from_n && !memcmp(s + i, from_n == 1 ? "&" : NESTING_STAND_IN, from_n)) {
+            sb_put(out, with, with_n);
+            i += from_n - 1;
+        } else sb_putc(out, c);
     }
+}
+/* A nested rule's selectors (CSS Nesting 1): each relative selector made
+   absolute, "& " before one with no nesting selector or that starts with a
+   combinator, and the whole list serialized as a group of selectors in the
+   sheet's namespaces. false: it does not parse so. */
+static bool nested_selector_text(const sheet_t *ast, const struct css_rule_info *r, sbuf *out) {
     const char *t = prelude_text(r);
     size_t n = r->prelude_len;
+    sbuf in = {0}, serialized = {0};
     for (size_t at = 0;;) {
         size_t end = piece_end(t, at, n), a = at, z = end;
         trim(t, &a, &z);
-        if (at) sb_puts(out, ", ");
-        if (!has_char(t + a, z - a, "&")) sb_puts(out, "& ");
-        put_collapsed(out, t + a, z - a);
+        if (at) sb_puts(&in, ", ");
+        if (a < z && (!has_char(t + a, z - a, "&") || strchr("+>~", t[a]))) sb_puts(&in, NESTING_STAND_IN " ");
+        put_nesting(&in, t + a, z - a, NESTING_STAND_IN, strlen(NESTING_STAND_IN), 1);
         if (end >= n) break;
         at = end + 1;
     }
+    bool ok = css_selectors_serialize(ast, in.p ? in.p : "", in.n, &serialized);
+    if (ok) put_nesting(out, serialized.p ? serialized.p : "", serialized.n, "&", 1, strlen(NESTING_STAND_IN));
+    sb_free(&in); sb_free(&serialized);
+    return ok;
+}
+/* CSSStyleRule.selectorText: the parsed selectors serialized; a nested rule's
+   relative selectors absolutized with the nesting selector (CSS Nesting 3) */
+static void selector_text(const sheet_t *ast, const struct css_rule_info *r, sbuf *out) {
+    size_t at = out->n;
+    if (!nested(r)) css_rule_selector_serialize(r, out);
+    else if (nested_selector_text(ast, r, out)) return;
+    if (out->n == at) prelude(r, out);
 }
 /* a media query list as CSSOM serializes it */
 static bool media_of(const char *text, size_t n, sbuf *out) {
@@ -1261,11 +1336,18 @@ css_decl_check *cssom_declaration_check(const struct css_rule_info *r) {
     default: return NULL;
     }
 }
-static void declarations(const struct css_rule_info *r, sbuf *out) {
+bool cssom_block(const struct css_rule_info *r, sbuf *out) {
     const char *text; size_t n;
     cssom_declarations(r, &text, &n);
-    css_decl_serialize(text, n, cssom_declaration_check(r), out, NULL);
+    if (!r || r->type != CSS_RULE_KEYFRAME) return css_decl_serialize(text, n, cssom_declaration_check(r), out, NULL);
+    /* CSS Animations 1: a keyframe's !important declarations are invalid */
+    sbuf kept = {0};
+    css_decl_drop_important(text, n, &kept);
+    bool ok = css_decl_serialize(kept.p ? kept.p : "", kept.n, NULL, out, NULL);
+    sb_free(&kept);
+    return ok;
 }
+static void declarations(const struct css_rule_info *r, sbuf *out) { cssom_block(r, out); }
 /* a descriptor's value in a rule's declaration block; false: none */
 static bool descriptor(const struct css_rule_info *r, const char *name, sbuf *out) {
     sbuf block = {0};
@@ -1399,15 +1481,15 @@ static void features_text(const struct features *f, sbuf *out) {
 }
 
 /* ---------------------------------------------------------------- serialize a CSS rule */
-static void serialize(const struct css_rule_info *r, sbuf *out);
+static void serialize(const sheet_t *ast, const struct css_rule_info *r, sbuf *out);
 /* a group rule's block (CSS Conditional 3): each child on a line of its own */
-static void group(const struct css_rule_info *r, sbuf *out) {
+static void group(const sheet_t *ast, const struct css_rule_info *r, sbuf *out) {
     sb_puts(out, " {");
     for (uint32_t i = 0; i < r->child_count; i++) {
         size_t at = out->n;
         sb_puts(out, "\n  ");
         size_t child = out->n;
-        serialize(r->children[i], out);
+        serialize(ast, r->children[i], out);
         if (out->n == child) out->n = at;
     }
     sb_puts(out, "\n}");
@@ -1421,11 +1503,11 @@ static void declaration_block(const struct css_rule_info *r, sbuf *out) {
     if (out->n == at + 1) out->n = at;
     sb_puts(out, " }");
 }
-static void serialize(const struct css_rule_info *r, sbuf *out) {
+static void serialize(const sheet_t *ast, const struct css_rule_info *r, sbuf *out) {
     switch (r->type) {
     case CSS_RULE_STYLE: {
         /* CSSOM 6.4.3, CSSStyleRule */
-        selector_text(r, out);
+        selector_text(ast, r, out);
         sbuf decls = {0};
         declarations(r, &decls);
         if (!r->child_count) {
@@ -1439,7 +1521,7 @@ static void serialize(const struct css_rule_info *r, sbuf *out) {
                 size_t at = out->n;
                 sb_puts(out, "\n  ");
                 size_t child = out->n;
-                serialize(r->children[i], out);
+                serialize(ast, r->children[i], out);
                 if (out->n == child) out->n = at;
             }
             sb_puts(out, "\n}");
@@ -1469,21 +1551,21 @@ static void serialize(const struct css_rule_info *r, sbuf *out) {
     case CSS_RULE_MEDIA:
         sb_puts(out, "@media ");
         media_of(prelude_text(r), r->prelude_len, out);
-        group(r, out);
+        group(ast, r, out);
         break;
-    case CSS_RULE_SUPPORTS: sb_puts(out, "@supports "); prelude(r, out); group(r, out); break;
-    case CSS_RULE_CONTAINER: sb_puts(out, "@container "); prelude(r, out); group(r, out); break;
+    case CSS_RULE_SUPPORTS: sb_puts(out, "@supports "); prelude(r, out); group(ast, r, out); break;
+    case CSS_RULE_CONTAINER: sb_puts(out, "@container "); prelude(r, out); group(ast, r, out); break;
     case CSS_RULE_LAYER_BLOCK:
         sb_puts(out, "@layer");
         if (r->prelude_len) { sb_putc(out, ' '); prelude(r, out); }
-        group(r, out);
+        group(ast, r, out);
         break;
     case CSS_RULE_SCOPE:
         sb_puts(out, "@scope");
         if (r->prelude_len) { sb_putc(out, ' '); prelude(r, out); }
-        group(r, out);
+        group(ast, r, out);
         break;
-    case CSS_RULE_STARTING_STYLE: sb_puts(out, "@starting-style"); group(r, out); break;
+    case CSS_RULE_STARTING_STYLE: sb_puts(out, "@starting-style"); group(ast, r, out); break;
     case CSS_RULE_LAYER_STATEMENT: {
         sb_puts(out, "@layer ");
         const char *t = prelude_text(r);
@@ -1507,7 +1589,7 @@ static void serialize(const struct css_rule_info *r, sbuf *out) {
         sb_putc(out, ' ');
         declarations(r, out);
         if (out->n == at + 1) out->n = at;
-        for (uint32_t i = 0; i < r->child_count; i++) { sb_putc(out, ' '); serialize(r->children[i], out); }
+        for (uint32_t i = 0; i < r->child_count; i++) { sb_putc(out, ' '); serialize(ast, r->children[i], out); }
         sb_puts(out, " }");
         break;
     }
@@ -1518,7 +1600,7 @@ static void serialize(const struct css_rule_info *r, sbuf *out) {
         sb_puts(out, "@keyframes ");
         put_keyframes_name(out, sb_cstr(&name));
         sb_free(&name);
-        group(r, out);
+        group(ast, r, out);
         break;
     }
     case CSS_RULE_KEYFRAME:
@@ -1555,9 +1637,16 @@ static void serialize(const struct css_rule_info *r, sbuf *out) {
     default: break;
     }
 }
+/* the AST of the parse a rule of s stands in (its namespaces); a rule of no
+   sheet (NULL) is read with none */
+static const sheet_t *ast_of(struct cssom_sheet *s, const struct css_rule_info *r) {
+    struct cssom_tree *tree = NULL;
+    if (!s) return NULL;
+    find(s, r->id, &tree);
+    return parse_of(s, tree)->ast;
+}
 void cssom_serialize(struct cssom_sheet *s, const struct css_rule_info *r, sbuf *out) {
-    (void)s;
-    if (r) serialize(r, out);
+    if (r) serialize(ast_of(s, r), r, out);
 }
 
 /* ---------------------------------------------------------------- attributes */
@@ -1615,7 +1704,7 @@ bool cssom_attribute(struct cssom_sheet *s, const struct css_rule_info *r, const
     if (!r) return false;
     uint32_t type = r->type;
     if (!strcmp(name, "selectorText")) {
-        if (type == CSS_RULE_STYLE) selector_text(r, out);
+        if (type == CSS_RULE_STYLE) selector_text(ast_of(s, r), r, out);
         else if (type == CSS_RULE_PAGE) prelude(r, out);
         else return false;
         return true;
@@ -1639,6 +1728,21 @@ bool cssom_attribute(struct cssom_sheet *s, const struct css_rule_info *r, const
     }
     if (!strcmp(name, "basePalette") && type == CSS_RULE_FONT_PALETTE_VALUES) { descriptor(r, "base-palette", out); return true; }
     if (!strcmp(name, "overrideColors") && type == CSS_RULE_FONT_PALETTE_VALUES) { descriptor(r, "override-colors", out); return true; }
+    if (!strcmp(name, "matches")) {
+        /* CSS Conditional 3: the rule's condition now, a media query list against
+           the document as matchMedia() evaluates it, @supports as the cascade */
+        bool matches;
+        if (type == CSS_RULE_MEDIA) {
+            sbuf query = {0};
+            sb_put(&query, prelude_text(r), r->prelude_len);
+            web_doc *d = s->document;
+            matches = css_media_evaluate(sb_cstr(&query), d->width, d->height, web_js_enabled(d), NULL, 0);
+            sb_free(&query);
+        } else if (type == CSS_RULE_SUPPORTS) matches = css_supports_condition(prelude_text(r), r->prelude_len, false);
+        else return false;
+        sb_puts(out, matches ? "true" : "false");
+        return true;
+    }
     if (!strcmp(name, "conditionText")) {
         if (type == CSS_RULE_MEDIA) media_of(prelude_text(r), r->prelude_len, out);
         else if (type == CSS_RULE_SUPPORTS || type == CSS_RULE_CONTAINER) prelude(r, out);

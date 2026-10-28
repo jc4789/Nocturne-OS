@@ -12,11 +12,22 @@ tests/cssom_splice_cases.c は、規則ごとの変更（変わった最上位�
 記憶が溜まり続けないこと、insertRule を一つずつ 5000 回する時間が 1000 回の十倍に届か
 ないことを確かめる。
 
-  python -X utf8 tests/check_cssom_rules_native.py [--old]
+tests/cssom_bindings_cases.c は、製品の js_stylesheets.js を製品の QuickJS と橋（js_cssom.h）と
+規則の木の上で走らせ、tests/cssom_bindings_cases.js の件（CSSImportRule.styleSheet、
+CSSMediaRule・CSSSupportsRule の matches、keyframe の !important、入れ子の selectorText、
+CSSStyleSheetInit、nameList の同一性）を照らす。js.c の宣言の塊の関数は js.c から切り出す。
+
+tests/cssom_import_cascade_cases.c は、doc.c の資源の走査（scan）が、@import の規則に CSSOM が
+与えたシートの解析（CSSOM が読むものと同じ一つ）を cascade に入れ、その変更と disabled が
+cascade に届くことを確かめる。
+
+  python -X utf8 tests/check_cssom_rules_native.py [--old] [rules|splice|bindings|cascade ...]
 
 --old は前の源で同じ件を組み、変更前の数を出す。規則の木の件は規則の木の前（930c2d13）で、
 前の口で書けない件（子の規則、規則の種類ごとの属性、MediaList、宣言）は落ちる。差し込みの
 件は規則ごとの変更の前（8cbe1194、変更のたびに頁の全文を解析し直した）で、時間の件が落ちる。
+束縛と cascade の件は 4983e50e（CSSImportRule.styleSheet の前）で、束縛の件は落ち、cascade の
+件は前の口で書けない（@import の規則にシートが無い）ので落ちる。
 """
 from pathlib import Path
 import os
@@ -47,11 +58,43 @@ def source_of(out, revision):
     return source
 
 
-def program(name, case_file, revision, owner):
+def quickjs(out):
+    """the product's QuickJS, built once for the host"""
+    objects = []
+    for unit in ("quickjs", "dtoa", "libregexp", "libunicode", "cutils"):
+        obj = out / f"{unit}.o"
+        source = root / "third_party/quickjs" / f"{unit}.c"
+        if not obj.exists() or obj.stat().st_mtime < source.stat().st_mtime:
+            subprocess.run([str(cc), "-std=gnu11", "-O1", "-w", "-fwrapv", "-funsigned-char", "-D_GNU_SOURCE",
+                            '-DCONFIG_VERSION="Nocturne-test"', "-I" + str(root / "third_party/quickjs"), "-c",
+                            str(source), "-o", str(obj)], cwd=root, env=env, check=True)
+        objects.append(str(obj))
+    return objects
+
+
+def bindings(out, source):
+    """js.c's declaration block functions the bridge calls, copied out of js.c, and QuickJS"""
+    js = (source / "user/libc/web/js.c").read_text(encoding="utf-8")
+    parts = []
+    for signature in ("static bool style_serialize(", "static JSValue style_text_access(", "static JSValue style_text_block("):
+        at = js.index(signature)
+        parts.append(js[at:js.index("\n}\n", at) + 3])
+    (out / "bindings-extract.h").write_text("\n".join(parts), encoding="utf-8", newline="\n")
+    return quickjs(out), ["-I" + str(out)], [str(source / "user/libc/web/js_stylesheets.js")]
+
+
+def document_headers(out, source):
+    """doc.c's headers beyond the web engine's: the libraries the product builds libc with"""
+    return [], ["-I" + str(root / p) for p in ("third_party/bearssl/inc", "third_party/img", "third_party/lexbor/source",
+                                               "ports/lexbor/include", "third_party/freetype/include")], []
+
+
+def program(name, case_file, revision, owner, extra=None):
     """cases built with the units beside them (owner: the one the cases include), run"""
     out = root / "build/check-cssom-rules" / (f"old-{name}" if old else name)
     out.mkdir(parents=True, exist_ok=True)
     source = source_of(out, revision)
+    more_units, more_flags, args = extra(out, source) if extra else ([], [], [])
     abi = out / "host-abi"
     abi.mkdir(exist_ok=True)
     (abi / "setjmp.h").write_text('#include "' + (cc.parent.parent / "include/setjmp.h").as_posix() + '"\n',
@@ -67,13 +110,13 @@ def program(name, case_file, revision, owner):
                             if u != owner and (web / u).exists()]
     flags = ["-std=gnu11", "-O1", "-w", "-I" + str(abi), "-I" + str(source / "user/include"),
              "-I" + str(source / "common"), "-I" + str(source / "user/libc"), "-I" + str(web),
-             "-I" + str(root / "third_party/quickjs")]
+             "-I" + str(root / "third_party/quickjs")] + more_flags
     names = set()
     for attempt in range(6):
         # every external the linked units reach but these cases never call: a call stops with its name
         stubs.write_text("int puts(const char *);\nvoid exit(int);\n" + "".join(
             f'void {n}(void) {{ puts("unreached: {n}"); exit(3); }}\n' for n in sorted(names)), encoding="utf-8")
-        r = subprocess.run([str(cc), *flags, *units, str(stubs), "-o", str(exe)], cwd=root, env=env,
+        r = subprocess.run([str(cc), *flags, *units, *more_units, str(stubs), "-lm", "-o", str(exe)], cwd=root, env=env,
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode == 0:
             break
@@ -84,7 +127,7 @@ def program(name, case_file, revision, owner):
         names |= found
     else:
         sys.exit("道具を組めない")
-    result = subprocess.run([str(exe)], cwd=root, env=env, capture_output=True, text=True, encoding="utf-8",
+    result = subprocess.run([str(exe), *args], cwd=root, env=env, capture_output=True, text=True, encoding="utf-8",
                             errors="replace", timeout=1200)
     print(result.stdout, end="")
     if result.returncode not in (0, 1):
@@ -93,6 +136,12 @@ def program(name, case_file, revision, owner):
     return result.returncode
 
 
-status = program("rules", "tests/cssom_rules_native_cases.c", "930c2d13", "cssom.c")
-status |= program("splice", "tests/cssom_splice_cases.c", "8cbe1194", "css.c")
+programs = {"rules": ("tests/cssom_rules_native_cases.c", "930c2d13", "cssom.c", None),
+            "splice": ("tests/cssom_splice_cases.c", "8cbe1194", "css.c", None),
+            "bindings": ("tests/cssom_bindings_cases.c", "4983e50e", "cssom.c", bindings),
+            "cascade": ("tests/cssom_import_cascade_cases.c", "4983e50e", "doc.c", document_headers)}
+chosen = [a for a in sys.argv[1:] if a in programs] or list(programs)
+status = 0
+for name in chosen:
+    status |= program(name, *programs[name])
 sys.exit(status)
