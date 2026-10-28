@@ -3,7 +3,7 @@
     'use strict';
     delete globalThis.__nocturne_host;
     const domOperations=host.domOperations || Object.fromEntries(
-        ['adopt', 'animationComputed', 'animationStyle', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
+        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
     const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
     // Reading never runs custom element reactions: getters go to the native operation directly.
     const domGet=domOperations.get;
@@ -46,7 +46,10 @@
     let presentationHandlerTarget = () => false;
     let textTrackHandlerTarget = () => false;
     let audioHandlerTarget = () => false;
-    const globalHandlerTypes = new Set(('abort beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout formdata input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
+    let viewportHandlerTarget = () => false;
+    let fontHandlerTarget = () => false;
+    let animationHandlerTarget = () => false;
+    const globalHandlerTypes = new Set(('abort animationcancel animationend animationiteration animationstart beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout formdata input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle transitioncancel transitionend transitionrun transitionstart wheel').split(' '));
     const windowHandlerTypes = new Set(('afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pageswap pagehide pagereveal pageshow popstate rejectionhandled storage unhandledrejection unload').split(' '));
     const bodyWindowTypes=new Set([...windowHandlerTypes,'blur','error','focus','load','resize','scroll']);
     // HTML: event handler IDL attributes of Document objects only, with no content attribute
@@ -97,14 +100,8 @@
     /* @include js_error_event.js */
     /* @include js_promise_rejection.js */
     const rejectionBridge=promiseRejectionBridge(event=>dispatch(globalThis,event),host.promiseIsHandled,fn=>setTimeout(fn,0));
-    class CustomEvent extends Event {
-        constructor(t, o = {}) { super(t,o); this.detail = o.detail === undefined ? null : o.detail; }
-        initCustomEvent(type,bubbles=false,cancelable=false,detail=null) {
-            if(!arguments.length)throw new TypeError('initCustomEvent requires type');
-            if(eventState(this).dispatching)return;
-            this.initEvent(type,bubbles,cancelable);this.detail=detail;
-        }
-    }
+    /* @include js_custom_event.js */
+    const CustomEvent=customEventInterface(Event,eventState);
     class UIEvent extends Event {
         constructor(t,o={}){super(t,o);this.view=o.view??null;this.detail=(+(o.detail??0))>>0;}
         initUIEvent(type,bubbles=false,cancelable=false,view=null,detail=0){
@@ -234,7 +231,7 @@
     }
     function handlerTarget(target,type) {
         return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document || svgHandlerTarget(target))) ||
-            (windowHandlerTypes.has(type) && target===globalThis) || (documentHandlerTypes.has(type) && target instanceof Document) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type) || socketHandlerTarget(target,type) || audioHandlerTarget(target,type);
+            (windowHandlerTypes.has(type) && target===globalThis) || (documentHandlerTypes.has(type) && target instanceof Document) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type) || socketHandlerTarget(target,type) || audioHandlerTarget(target,type) || viewportHandlerTarget(target,type) || fontHandlerTarget(target,type) || animationHandlerTarget(target,type);
     }
     function bodyWindowHandler(target,type){
         if(!bodyWindowTypes.has(type) || target===globalThis)return false;
@@ -497,6 +494,7 @@
         get tagName() { return this.nodeType === 1 ? this.nodeName : undefined; }
         get localName() { return domGet(this,'localName'); }
         get namespaceURI() { return domGet(this,'namespaceURI'); }
+        get prefix() { return domGet(this,'prefix'); }
         get id() { return reflectedAttr(this,'id') || ''; }
         set id(v) { reflectedAttr(this,'id',String(v)); }
         get className() { return reflectedAttr(this,'class') || ''; }
@@ -534,7 +532,12 @@
         querySelectorAll(selector) { return list(dom('query',this,String(selector),false)); }
         matches(selector) { return dom('matches',this,String(selector)); }
         closest(selector) { for(let n=this;n&&n.nodeType===1;n=n.parentElement) if(n.matches(selector))return n; return null; }
-        getElementsByTagName(name) { const query=String(name)==='*'?'*':CSS.escape(String(name));return collectionBridge.domHTML(this,()=>dom('query',this,query,false)); }
+        getElementsByTagName(name) { name=String(name);return collectionBridge.domHTML(this,()=>rawDom.tagQuery(this,name)); }
+        getElementsByTagNameNS(namespace,localName) {
+            if(arguments.length<2)throw new TypeError('Namespace and local name are required');
+            namespace=namespace==null?null:String(namespace);localName=String(localName);
+            return collectionBridge.domHTML(this,()=>rawDom.tagQuery(this,namespace===''?null:namespace,localName,true));
+        }
         getElementsByClassName(names) { const query=String(names).trim().split(/\s+/).filter(Boolean).map(x=>'.'+CSS.escape(x)).join('');return collectionBridge.domHTML(this,()=>query?dom('query',this,query,false):[]); }
         getBoundingClientRect() { rawDom.get(this,'elementBrand');return observerBridge.clientBoundingRect(dom('rect',this)); }
         getClientRects() { return observerBridge.clientRects(dom('rect',this,true)); }
@@ -764,8 +767,16 @@
     Object.assign(Node.prototype, {ELEMENT_NODE:1,TEXT_NODE:3,CDATA_SECTION_NODE:4,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
     for(const [name,value] of [['DISCONNECTED',1],['PRECEDING',2],['FOLLOWING',4],['CONTAINS',8],['CONTAINED_BY',16],['IMPLEMENTATION_SPECIFIC',32]])
         for(const target of [Node,Node.prototype])Object.defineProperty(target,'DOCUMENT_POSITION_'+name,{value,enumerable:true});
-    class Document extends Node {}
-    class HTMLDocument extends Document {}
+    // DOM "new Document()": an XML document of this realm whose content type
+    // is application/xml; it implements Document, not XMLDocument.
+    class Document extends Node {
+        constructor(){
+            const made=rawDom.documentCreate(null,'application/xml',false),proto=new.target.prototype;
+            if(proto!==Document.prototype)Object.setPrototypeOf(made,proto);
+            return made;
+        }
+    }
+    class HTMLDocument extends Document { constructor(){throw new TypeError('Illegal HTMLDocument constructor');} }
     function characterDataBrand(node){
         const type=rawDom.get(node,'nodeType');if(type!==3 && type!==4 && type!==7 && type!==8)throw new TypeError('Illegal CharacterData receiver');
     }
@@ -818,9 +829,9 @@
             return parts.join('');
         }
     }
-    // CDATASection is an exposed Text-derived interface even in an HTML realm.
-    // HTML documents cannot create CDATA nodes; do not alias it to Text or
-    // advertise an XML parser that the native document model does not have.
+    // CDATASection is an exposed Text-derived interface even in an HTML realm:
+    // a native text node of an XML document's CDATA section (createCDATASection,
+    // the XML parser), never an alias of Text.
     class CDATASection extends Text {
         constructor(){throw new TypeError('Illegal CDATASection constructor');}
     }
@@ -874,7 +885,7 @@
     // ParentNode is shared, but attributes and matching belong only to elements.
     const parentMembers = ['children','firstElementChild','lastElementChild','childElementCount',
         'append','prepend','replaceChildren','querySelector','querySelectorAll'];
-    copyElementMembers(Document.prototype, parentMembers.concat(['getElementsByTagName','getElementsByClassName']));
+    copyElementMembers(Document.prototype, parentMembers.concat(['getElementsByTagName','getElementsByTagNameNS','getElementsByClassName']));
     copyElementMembers(DocumentFragment.prototype, parentMembers);
     copyElementMembers(CharacterData.prototype, ['nextElementSibling','previousElementSibling','remove','before','after','replaceWith']);
     copyElementMembers(DocumentType.prototype, ['replaceWith']);
@@ -896,23 +907,6 @@
     });
     document.getElementById=id=>dom('id',document,String(id));
     document.getElementsByName=name=>{const query='[name="'+CSS.escape(String(name))+'"]';return collectionBridge.domLive(document,()=>dom('query',document,query,false));};
-    document.createElement=(name,options)=>customElementsBridge.create(name,options);
-    document.createElementNS=function(ns,name,options=undefined){
-        if(arguments.length<2)throw new TypeError('Namespace and qualified name are required');
-        ns=ns===null || ns===undefined?null:elementURL.string(ns);if(ns==='')ns=null;
-        name=elementURL.string(name);
-        if(ns===null){
-            const colon=name.indexOf(':'),prefix=colon<0?null:name.slice(0,colon),local=colon<0?name:name.slice(colon+1);
-            if(prefix!==null && (!prefix || /[\0\t\n\f\r />]/.test(prefix)) ||
-               !/^(?:[A-Za-z][^\0\t\n\f\r />]*|[:_\u0080-\u{10FFFF}][A-Za-z0-9_.:\-\u0080-\u{10FFFF}]*)$/u.test(local))
-                throw new DOMException('Invalid element name','InvalidCharacterError');
-            if(prefix!==null || name==='xmlns')throw new DOMException('A prefix requires a namespace','NamespaceError');
-            return dom('create',null,1,name,'',null);
-        }
-        if(ns==='http://www.w3.org/1999/xhtml')return customElementsBridge.create(name,options,true);
-        if(ns!=='http://www.w3.org/2000/svg')throw new DOMException('Unsupported namespace','NotSupportedError');
-        return dom('create',null,1,name,'',true);
-    };
     document.createTextNode=text=>dom('create',null,3,'#text',String(text));
     document.createComment=text=>dom('create',null,8,'#comment',String(text));
     document.createDocumentFragment=()=>dom('create',null,11,'#document-fragment','');
@@ -1136,6 +1130,8 @@
     /* @include js_history.js */
     /* @include js_custom_elements.js */
     /* @include js_media.js */
+    /* @include js_geometry.js */
+    const geometryBridge=geometryInterfaces({parse:host.transformMatrix,list:collectionBridge.typed});
     /* @include js_observers.js */
     /* @include js_mutations.js */
     /* @include js_selection.js */
@@ -1146,11 +1142,11 @@
     /* @include js_document_selection.js */
     /* @include js_traversal.js */
     /* @include js_xpath.js */
-    /* @include js_geometry.js */
     /* @include js_svg.js */
     /* @include js_attributes.js */
     /* @include js_shadow.js */
     /* @include js_stylesheets.js */
+    /* @include js_font_loading.js */
     /* @include js_animations.js */
     /* @include js_web_legacy.js */
     /* @include js_form_controls.js */
@@ -1209,59 +1205,10 @@
     }
     ownMembersToPrototype(document,Document.prototype,['location']);
     ownMembersToPrototype(navigator,Navigator.prototype,[]);
-    /* WebIDL gives each operation a function named by its identifier, each
-       attribute getter/setter "get <id>"/"set <id>", and each interface object
-       its interface name. Bootstrap members are written as object-literal
-       methods and shared closures, so give them their WebIDL names before any
-       author script observes them. A spec alias (Set.prototype.keys, String's
-       trimLeft) keeps the name of the member it aliases; one function serving
-       two attributes gets a delegating function for the second. */
-    (()=>{
-        const named=new Map(),skip=new Set(['prototype','length','name','caller','arguments','constructor']);
-        function rename(fn,name){
-            const previous=named.get(fn);
-            if(previous!==undefined)return previous===name;
-            named.set(fn,name);
-            if(fn.name===name)return true;
-            try{Object.defineProperty(fn,'name',{value:name,configurable:true});return true;}catch(e){return false;}
-        }
-        function delegate(f,kind,key){
-            const holder=kind==='get'?{get [key](){return apply(f,this,[]);}}:kind==='set'?{set [key](v){apply(f,this,[v]);}}:{[key](...a){return apply(f,this,a);}};
-            const d=Object.getOwnPropertyDescriptor(holder,key),w=kind==='value'?d.value:d[kind];
-            Object.defineProperty(w,'length',{value:f.length,configurable:true});
-            named.set(w,kind==='value'?key:kind+' '+key);
-            return w;
-        }
-        function members(object){
-            for(const key of Object.getOwnPropertyNames(object)){
-                if(skip.has(key))continue;
-                const d=Object.getOwnPropertyDescriptor(object,key);
-                let replaced=false;
-                if(typeof d.value==='function'){
-                    const f=d.value,alias=f.name&&f.name!==key&&Object.getOwnPropertyDescriptor(object,f.name);
-                    if(alias&&alias.value===f){named.set(f,f.name);continue;}
-                    if(!rename(f,key)&&d.configurable){d.value=delegate(f,'value',key);replaced=true;}
-                }
-                for(const kind of ['get','set']){
-                    const f=d[kind];if(typeof f!=='function')continue;
-                    if(!rename(f,kind+' '+key)&&d.configurable){d[kind]=delegate(f,kind,key);replaced=true;}
-                }
-                if(replaced)Object.defineProperty(object,key,d);
-            }
-        }
-        for(const key of Object.getOwnPropertyNames(globalThis)){
-            const d=Object.getOwnPropertyDescriptor(globalThis,key);
-            /* Namespaces (console, CSS, ...) are plain objects of operations;
-               a WebIDL namespace sits on an empty object over Object.prototype. */
-            const namespaceProto=d.value&&typeof d.value==='object'&&Object.getPrototypeOf(d.value);
-            if(namespaceProto&&(namespaceProto===Object.prototype||Object.getPrototypeOf(namespaceProto)===Object.prototype&&!Reflect.ownKeys(namespaceProto).length)){members(d.value);continue;}
-            if(typeof d.value!=='function')continue;
-            const c=d.value;
-            if(c.name!==key&&globalThis[c.name]!==c)rename(c,key);else named.set(c,c.name);
-            members(c);
-            if(c.prototype&&typeof c.prototype==='object'&&key[0]>='A'&&key[0]<='Z')members(c.prototype);
-        }
-    })();
+    /* The ECMAScript shape Web IDL gives every interface, namespace and member these
+       bindings define (js_webidl.c, from the specifications' IDL), before any author
+       script observes them. */
+    host.webidl('Window');
     frameBridge.finalizeMethods();
     customElementsReady = true;
     /* Private native-input state, never reachable from page JS. C supplies the
@@ -1320,12 +1267,16 @@
     }
     return {
         presentationSync:presentationBridge.sync,
+        animationUpdate:animationBridge.update,
+        animationEvents:animationBridge.events,
         resourceTiming:performanceBridge.resource,
         workerNotify:workerBridge.deliver,
         storageOrigin:storageBridge.origin,
         storageEvent:storageBridge.deliver,
         languageChange(){if(!languagesChanged())return;const event=new Event('languagechange');eventState(event).isTrusted=true;dispatch(globalThis,event);},
         // HTML "update the visibility state" steps 3 and 7 (js.c web_js_visibility_changed).
+        // CSSOM View's resize steps (js.c run_resize_steps).
+        resizeSteps(){viewportBridge.resize();},
         visibilityChange(visibility,time){
             performanceBridge.visibility(visibility,time);
             const event=new Event('visibilitychange',{bubbles:true});eventState(event).isTrusted=true;dispatch(document,event);
@@ -1403,6 +1354,8 @@
         historyOperation:historyBridge.operation,
         historySecurityError:historyBridge.securityError,
         mediaChanged(){mediaBridge.changed();},
+        // CSS Font Loading's font loading task (js.c web_js_tick).
+        fontsChanged(){fontLoadingBridge.changed();},
         avmediaActivate(node){return avmediaBridge.activate(node);},
         inertClick(target){return dispatch(target,new MouseEvent('click',{bubbles:true,cancelable:true,composed:true}));},
         nodeProtos:[Node.prototype,HTMLDocument.prototype,Element.prototype,HTMLElement.prototype,
@@ -1415,7 +1368,8 @@
             HTMLModElement.prototype,HTMLUListElement.prototype,HTMLDListElement.prototype,HTMLDirectoryElement.prototype,
             HTMLLegendElement.prototype,HTMLOptGroupElement.prototype,HTMLMapElement.prototype,HTMLEmbedElement.prototype,
             HTMLParamElement.prototype,HTMLFontElement.prototype,HTMLFrameSetElement.prototype,HTMLMarqueeElement.prototype,
-            ...htmlTablesBridge.nodeProtos,svgBridge.groupProto],
+            ...htmlTablesBridge.nodeProtos,svgBridge.groupProto,
+            documentBridge.xmlDocumentPrototype,Document.prototype,CDATASection.prototype],
         dispatch:nativeDispatch,
         // js_webaudio.js, run apart when the page first touches a Web Audio interface.
         webaudioBridge:{host,Event,EventTarget,DOMException,eventState,dispatch,handlerValue,setHandler,Promise,

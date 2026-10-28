@@ -15,11 +15,11 @@ int main(void){
     support("transform","translateX(-100%)",true);
     support("transform","translate(10px, 20%) translateY(calc(10px + 5%))",true);
     support("transform","translate3d(-100%, 0, 0px)",true);
-    support("transform","translate3d(0, 0, 1px)",false);
+    support("transform","translate3d(0, 0, 1px)",true);
     support("transform","translate3d(0, 0, 0%)",false);
     support("transform","translateX(3)",false);
     support("transform","translateX(calc(3))",false);
-    support("transform","translateX(2px) rotate(2deg)",false);
+    support("transform","translateX(2px) rotate(2deg)",true);
     support("transform","translateX(1px, 2px)",false);
     support("translate","calc(10% + 2px) -20px",true);
     support("translate","1px 2px 3px",false);
@@ -53,7 +53,7 @@ int main(void){
     struct web_hit hit={0};check(web_hit_test(d,36,21,&hit)&&hit.kind==WEB_HIT_LINK&&hit.node==link,"real hit matches translated link");
     style(d,panel,"width:100px;height:40px;padding:10px;border:5px solid black;transform:translateX(calc(50% + 10px)) translateY(7px);translate:2px 3px");
     web_node_rect(d,panel,&x,&y,&w,&h);check(x==77&&y==10,"calc and transform list resolve against own border box");
-    style(d,panel,"width:100px;height:40px;padding:10px;border:5px solid black;transform:translateX(25px);transform:rotate(20deg);translate:none");
+    style(d,panel,"width:100px;height:40px;padding:10px;border:5px solid black;transform:translateX(25px);transform:translateX(1px, 2px);translate:none");
     web_node_rect(d,panel,&x,&y,&w,&h);check(x==25,"unsupported whole declaration preserves prior cascade value");
     style(d,shift,"width:20px;height:10px;transform:translateX(-140px)");
     check(near(scroller->box->scroll_w,100),"negative transform never shrinks original overflow");

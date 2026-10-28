@@ -14,7 +14,9 @@ long ns_read(net_stream *s,void *data,size_t n){abort();}
 const char *ns_error(net_stream *s){abort();}
 void ns_close(net_stream *s){abort();}
 #include "http_mock_lifecycle.h"
-void *http_br_create(void){abort();}int http_br_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){abort();}void http_br_free(void *s){(void)s;}
+#include "deflate.h"
+void *brotli_decoder_begin(void){abort();}int brotli_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){abort();}void brotli_decoder_end(void *s){(void)s;}
+struct inflate_stream *inflate_begin(enum deflate_wrap w,unsigned o,inflate_put p,void *c){abort();}enum inflate_result inflate_feed(struct inflate_stream *s,const void *in,size_t n,bool last,size_t *used){abort();}void inflate_end(struct inflate_stream *s){(void)s;}
 static unsigned checks,failed;
 static void check(bool ok,const char *name){checks++;if(!ok){failed++;printf("FAIL %s\n",name);}}
 static bool wasm_allowed(const web_doc *d,size_t *violations,size_t *reports){

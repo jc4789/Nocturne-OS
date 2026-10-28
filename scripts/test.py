@@ -280,6 +280,29 @@ def start_web_servers():
         raise
 
 
+# The wpt* groups read chosen WPT originals, unchanged, from the WPT checkout at this fixed address
+# (tests/runtests.c: http://10.0.2.2:8766/); tests/wptperformancetest.c checks each file's hash.
+WPT_CHECKOUT = r"D:\Programes\cloned repos\wpt"
+WPT_PORT = 8766
+
+
+def start_wpt_server():
+    """The WPT checkout, read-only, on 127.0.0.1:8766 for the wpt* groups"""
+    import http.server
+    if not os.path.isdir(os.path.join(WPT_CHECKOUT, "resources")):
+        sys.exit("test: the wpt groups need the WPT checkout at " + WPT_CHECKOUT)
+    class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", WPT_PORT), partial(QuietHandler, directory=WPT_CHECKOUT))
+    except OSError as e:
+        sys.exit("test: 127.0.0.1:%d for the WPT checkout is taken (%s)" % (WPT_PORT, e))
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
 def start_h2_server():
     """Explicit transport regression fixture; never substitute for ALPN/TLS tests."""
     fixture = os.path.join(ROOT, "tests", "fixtures", "js", "h2_server.py")
@@ -316,6 +339,7 @@ def test_files(a, tcp_port, web_ports, scratch):
     srcs.append(os.path.join(source_root, "user", "libc", "web", "js_canvas.h"))
     srcs.append(os.path.join(source_root, "third_party", "quickjs", "quickjs.h"))
     srcs.append(os.path.join(source_root, "user", "apps", "browser_events.h"))
+    srcs.append(os.path.join(source_root, "user", "apps", "browser_automation.h"))
     srcs += [os.path.join(source_root, "user", "libc", "web", name) for name in
              ("form_value.h", "form_file.h", "form_face.h", "form_validation.h", "elements.h", "frame.h", "html_lexbor.h", "html_policy.h", "html_pi.h", "sandbox.h")]
     srcs += sorted(glob.glob(os.path.join(source_root, "tests", "*.h")))
@@ -705,6 +729,8 @@ def main():
             silent_tls = start_silent_tls_server()
             servers.append(silent_tls)
             a.tls_silent_port = silent_tls.server_address[1]
+        if not a.groups or any(group.startswith("wpt") for group in a.groups):
+            servers.append(start_wpt_server())
         if not a.groups or any(group == "nettransport" or group.startswith("nettransport/") for group in a.groups):
             dns = start_dns_servers()
             servers.extend(dns)

@@ -12,6 +12,28 @@ bool html_meta_label(const char *label,size_t length,char *canonical,size_t capa
     size_t n=strlen((const char *)enc->name);if(n>=capacity)return false;
     memcpy(canonical,enc->name,n+1);return true;
 }
+/* Encoding Standard "get an encoding": the canonical name of label (UTF-16 and
+   x-user-defined stay themselves, unlike a meta label), false for failure. */
+bool html_encoding_label(const char *label,size_t length,char *canonical,size_t capacity){
+    if(!label||!canonical||!capacity)return false;
+    const lxb_encoding_data_t *enc=lxb_encoding_data_by_pre_name((const lxb_char_t *)label,length);
+    if(!enc)return false;
+    size_t n=strlen((const char *)enc->name);if(n>=capacity)return false;
+    memcpy(canonical,enc->name,n+1);return true;
+}
+/* HTML "prescan a byte stream to determine its encoding" over the first 1024
+   bytes, with its UTF-16 and x-user-defined rules; false when it fails. */
+bool html_prescan_label(const char *src,size_t n,char *canonical,size_t capacity){
+    if((!src&&n)||!canonical||!capacity)return false;
+    lxb_html_encoding_t scan={0};
+    if(lxb_html_encoding_init(&scan)!=LXB_STATUS_OK)return false;
+    const lxb_char_t *bytes=(const lxb_char_t *)(src?src:"");
+    size_t name_length=0;
+    const lxb_char_t *name=lxb_html_encoding_prescan(&scan,bytes,bytes+(n<1024?n:1024),&name_length);
+    bool ok=name && html_meta_label((const char *)name,name_length,canonical,capacity);
+    lxb_html_encoding_destroy(&scan,false);
+    return ok;
+}
 void html_transport_label(const char *type,char *label,size_t capacity) {
     if(!capacity)return;label[0]=0;if(!type)return;
     const lxb_char_t *end=NULL;

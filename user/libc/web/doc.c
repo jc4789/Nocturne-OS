@@ -808,8 +808,8 @@ void doc_dom_budget(web_doc *d) {
 web_doc *doc_inert(web_doc *family, const char *html, size_t n, const char *url) {
     return doc_inert_ex(family, html, n, url, false);
 }
-web_doc *doc_inert_ex(web_doc *family, const char *html, size_t n, const char *url, bool allow_shadow) {
-    if (!family || n == SIZE_MAX || (n && !html)) return NULL;
+web_doc *doc_inert_new(web_doc *family, const char *url) {
+    if (!family) return NULL;
     int referrer_policy=family->referrer_policy;
     family = family->dom_family ? family->dom_family : family;
     web_doc *d = calloc(1, sizeof *d);
@@ -822,17 +822,46 @@ web_doc *doc_inert_ex(web_doc *family, const char *html, size_t n, const char *u
     family->dom_family = family;
     d->dom_next = family->dom_docs; family->dom_docs = d;
     doc_dom_budget(d);
-    web_doc *previous = d->dom_next;
-    d->root = html_parse_string(d, html ? html : "", n, allow_shadow);
-    if (!d->root) {
-        /* No wrappers have escaped: discard every nested template document too. */
-        while (family->dom_docs != previous) {
-            web_doc *bad = family->dom_docs;
-            family->dom_docs = bad->dom_next; bad->dom_next = NULL;
-            web_free(bad);
-        }
-        return NULL;
+    return d;
+}
+void doc_inert_discard(web_doc *d) {
+    web_doc *family = d->dom_family, *previous = d->dom_next;
+    /* No wrappers have escaped: discard every nested template document too. */
+    while (family->dom_docs != previous) {
+        web_doc *bad = family->dom_docs;
+        family->dom_docs = bad->dom_next; bad->dom_next = NULL;
+        web_free(bad);
     }
+}
+web_doc *doc_inert_ex(web_doc *family, const char *html, size_t n, const char *url, bool allow_shadow) {
+    if (!family || n == SIZE_MAX || (n && !html)) return NULL;
+    web_doc *d = doc_inert_new(family, url);
+    if (!d) return NULL;
+    d->root = html_parse_string(d, html ? html : "", n, allow_shadow);
+    if (!d->root) { doc_inert_discard(d); return NULL; }
+    d->resources_dirty = true;
+    return d;
+}
+/* XMLHttpRequest "set a document response", HTML: the received bytes in the
+   final encoding label, else the prescan's, else UTF-8, parsed with scripting
+   and declarative shadow roots disabled. */
+web_doc *doc_inert_bytes(web_doc *family, const char *bytes, size_t n, const char *label,
+                         const char *url, const char *content_type) {
+    if (!family || (n && !bytes)) return NULL;
+    char encoding[64];
+    if (!label || !html_encoding_label(label, strlen(label), encoding, sizeof encoding))
+        label = html_prescan_label(bytes, n, encoding, sizeof encoding) ? encoding : "UTF-8";
+    else label = encoding;
+    web_doc *d = doc_inert_new(family, url);
+    if (!d) return NULL;
+    d->content_type = strdup(content_type && *content_type ? content_type : "text/html");
+    struct html_parser *p = d->content_type ? html_begin(d, bytes ? bytes : "", n, label, false) : NULL;
+    if (!p) { doc_inert_discard(d); return NULL; }
+    html_declarative_shadow_set(p, false);
+    node_t *ignored; int result;
+    do result = html_resume(p, &ignored); while (result == HTML_PARSE_YIELD);
+    html_finish(p);
+    if (result < 0 || !d->root) { doc_inert_discard(d); return NULL; }
     d->resources_dirty = true;
     return d;
 }
@@ -974,7 +1003,9 @@ void doc_sync_tree(web_doc *d) {
         profile->metadata_visits++;
         if (n->type == N_ELEM) { html = n; break; }
     }
-    for (node_t *n = html ? html->first : NULL; n; n = n->next) {
+    /* HTML "the html element" is the document element only when it is an HTML
+       html element; head and body are its children (an XML document's root may be anything). */
+    for (node_t *n = html && !html->foreign && html->tag == T_html ? html->first : NULL; n; n = n->next) {
         profile->metadata_visits++;
         if (!head && !n->foreign && n->tag == T_head) head = n;
         if (!body && !n->foreign && (n->tag == T_body || n->tag == T_frameset)) body = n;
@@ -995,21 +1026,10 @@ void doc_sync_tree(web_doc *d) {
 void doc_rescan(web_doc *d) {
     if (d && d->native_cancelled) return;
     if (d && d->inert && d->resources_dirty) {
-        d->resources_dirty = false; d->html = d->head = d->body = NULL;
-        snprintf(d->base, sizeof d->base, "%s", d->url);
-        for (node_t *n = d->root ? d->root->first : NULL; n; n = n->next)
-            if (n->type == N_ELEM) { d->html = n; break; }
-        for (node_t *n = d->html ? d->html->first : NULL; n; n = n->next) {
-            if (!d->head && n->tag == T_head) d->head = n;
-            if (!d->body && (n->tag == T_body || n->tag == T_frameset)) d->body = n;
-        }
-        for (node_t *n = d->head ? d->head->first : NULL; n; n = n->next)
-            if (n->tag == T_base && node_attr(n, "href")) {
-                char *url=doc_absolute_url(d->url,node_attr(n,"href"));
-                if(url)snprintf(d->base,sizeof d->base,"%s",url);
-                free(url);
-                break;
-            }
+        /* The same html/head/body and frozen base URL steps as a live
+           document's metadata (an XML document's root may be any element). */
+        d->resources_dirty = false; d->metadata_valid = false;
+        doc_sync_tree(d);
         return; /* no authored CSS, image/meta fetch or live resource scan */
     }
     if (!d || !d->live || (!d->resources_dirty && !d->images_dirty)) return;
@@ -1281,7 +1301,7 @@ void web_tick(web_doc *d, uint64_t now) {
     if(d->native_cancelled)return;
     TICK_STEP(d, TICK_MEDIA, web_avmedia_tick(d, now));
     if(d->native_cancelled)return;
-    TICK_STEP(d, TICK_MOTION, css_motion_tick(d,now));
+    TICK_STEP(d, TICK_MOTION, web_animations_tick(d,now));
     if(d->native_cancelled)return;
     TICK_STEP(d, TICK_MARQUEE, web_marquee_tick(d,now));
     if(d->native_cancelled)return;
@@ -1322,7 +1342,7 @@ int64_t web_deadline(web_doc *d) {
     const int64_t sources[DUE_SOURCES] = {-1, background,
         !d->initial_render_done && now < d->initial_render_deadline ? (int64_t)d->initial_render_deadline : -1,
         d->visibility_updates ? (int64_t)now : -1,
-        web_js_deadline(d), web_avmedia_deadline(d, now), css_motion_deadline(d), web_marquee_deadline(d),
+        web_js_deadline(d), web_avmedia_deadline(d, now), web_animations_deadline(d), web_marquee_deadline(d),
         web_frames_deadline(d)};
     int64_t deadline = -1; int from = DUE_NONE;
     for (int i = DUE_BACKGROUND; i < DUE_SOURCES; i++)
@@ -1419,7 +1439,7 @@ static void free_values(node_t *n) {
     css_node_style_free(n);
     cssom_style_free(n);
     web_paint_debug_node_free(n);
-    css_animation_free(n);
+    web_animations_node_free(n);
     web_canvas_free(n);
     web_input_files_release(n);
     web_face_release(n);
@@ -1444,8 +1464,9 @@ struct web_font_resource *doc_font_resource(web_doc *d,const char *url) {
 void doc_font_loaded(web_doc *d,struct web_font_resource *f,const void *bytes,size_t length) {
     if(!d || !f || f->done)return;
     f->face=bytes && length?font_open_memory(bytes,length):NULL;
-    f->loading=false;f->done=true;f->failed=!f->face;
+    f->loading=f->demanded=false;f->done=true;f->failed=!f->face;
     d->dirty=true;
+    __atomic_add_fetch(&d->font_generation,1,__ATOMIC_RELAXED); /* FontFace statuses */
     /* A decoded face changes native glyph metrics and fallback coverage.
        Mark committed formatting stale before selecting it at the next layout
        boundary; otherwise a geometry getter can reuse the old font's cache.
@@ -1455,6 +1476,21 @@ void doc_font_loaded(web_doc *d,struct web_font_resource *f,const void *bytes,si
         layout_invalidate_fonts(d->root_box);
     }
     d->font_selection_dirty=true;
+}
+bool doc_fonts_unrequested(web_doc *d) {
+    for(struct web_font_resource *f=d?d->fonts:NULL;f;f=f->next)
+        if((f->wanted || f->demanded) && !f->loading && !f->done)return true;
+    return false;
+}
+/* CSS Font Loading's "pending stylesheet requests": every requested sheet,
+   whatever its media or scope, until it arrives or fails. */
+bool doc_css_loading(web_doc *d) {
+    if(!d || !d->live || d->inert)return false;
+    for(int i=0;i<d->pending_css.n;i++){
+        const struct cached_css *c=cached_css(d,((const struct pending *)d->pending_css.v[i])->url);
+        if(!c || !c->done)return true;
+    }
+    return false;
 }
 
 void web_free(web_doc *d) {
@@ -1479,11 +1515,18 @@ void web_free(web_doc *d) {
     web_frames_free(d);
     web_js_free(d);
     html_policy_free(d);
-    css_motion_doc_free(d);
+    web_animations_doc_free(d);
     pv_free(&d->marquees);
+    /* FontFace records outlive neither their document font sources nor the
+       resources they name: release them before either goes. */
+    css_font_set_free(d);
     while(d->fonts) {
         struct web_font_resource *f=d->fonts;d->fonts=f->next;
         font_close(f->face);free(f->url);free(f);
+    }
+    while(d->font_data) {
+        struct web_font_resource *f=d->font_data;d->font_data=f->next;
+        font_close(f->face);free(f);
     }
     web_form_validation_free(d);
     /* Parser subscriptions can borrow allocation-owned nodes in helper docs. */
@@ -1504,7 +1547,7 @@ void web_free(web_doc *d) {
             css_node_style_free(n);
             cssom_style_free(n);
             web_paint_debug_node_free(n);
-            css_animation_free(n);
+            web_animations_node_free(n);
             web_canvas_free(n);
             web_input_files_release(n);
             web_face_release(n);
@@ -1552,6 +1595,7 @@ void web_free(web_doc *d) {
     free(d->find_text);
     free((void *)d->inherited_url);
     free(d->referrer);
+    free(d->content_type);
     free(d);
 }
 

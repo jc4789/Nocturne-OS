@@ -432,8 +432,9 @@ void box_scroll_clamp(box_t *b) {
 }
 
 bool css_translation_active(const style_t *s){return s&&(s->transform||s->translate.active||s->rotate||s->scale);}
-/* Row-major 4x4 of one function; translation percentages use w/h. */
-static void transform_function_matrix(const struct css_transform *t,float w,float h,double m[16]){
+/* Row-major 4x4 of one function; translation percentages use w/h. depth: perspective too,
+   which orthographic flattening otherwise discards. */
+static void transform_function_matrix(const struct css_transform *t,float w,float h,bool depth,double m[16]){
     for(int i=0;i<16;i++)m[i]=i%5?0:1;
     switch(t->kind){
     case CT_TRANSLATE:m[3]=len_resolve(&t->xy[0],w);m[7]=len_resolve(&t->xy[1],h);m[11]=t->v[0];break;
@@ -450,7 +451,11 @@ static void transform_function_matrix(const struct css_transform *t,float w,floa
         m[8]=z*x*k-y*s; m[9]=z*y*k+x*s; m[10]=c+z*z*k;
         break;
     }
-    default:break; /* perspective only changes w, which orthographic flattening discards */
+    case CT_PERSPECTIVE:
+        /* CSS Transforms 2: perspective(none) is the identity; lengths under 1px act as 1px. */
+        if(depth&&t->v[1]!=1)m[14]=-1.0/(t->v[0]<1?1:t->v[0]);
+        break;
+    default:break;
     }
 }
 static void matrix4_multiply(double out[16],const double a[16],const double b[16]){
@@ -461,7 +466,11 @@ static void matrix4_multiply(double out[16],const double a[16],const double b[16
 }
 void css_transform_list_matrix(const struct css_transform *t,float w,float h,double m[16]){
     for(int i=0;i<16;i++)m[i]=i%5?0:1;
-    for(;t;t=t->next){double f[16];transform_function_matrix(t,w,h,f);matrix4_multiply(m,m,f);}
+    for(;t;t=t->next){double f[16];transform_function_matrix(t,w,h,false,f);matrix4_multiply(m,m,f);}
+}
+void css_transform_list_matrix_3d(const struct css_transform *t,double m[16]){
+    for(int i=0;i<16;i++)m[i]=i%5?0:1;
+    for(;t;t=t->next){double f[16];transform_function_matrix(t,0,0,true,f);matrix4_multiply(m,m,f);}
 }
 /* A function whose x/y linear part is the identity only translates. */
 static bool transform_function_translates(const struct css_transform *t){
@@ -510,10 +519,10 @@ bool css_style_transform_matrix(const style_t *st,double x,double y,float w,floa
     m[3]=ox;m[7]=oy;
     if(st->translate.active){
         struct css_transform t={.kind=CT_TRANSLATE};t.xy[0]=st->translate.xy[0];t.xy[1]=st->translate.xy[1];
-        transform_function_matrix(&t,w,h,f);matrix4_multiply(m,m,f);
+        transform_function_matrix(&t,w,h,false,f);matrix4_multiply(m,m,f);
     }
-    if(st->rotate){transform_function_matrix(st->rotate,w,h,f);matrix4_multiply(m,m,f);}
-    if(st->scale){transform_function_matrix(st->scale,w,h,f);matrix4_multiply(m,m,f);}
+    if(st->rotate){transform_function_matrix(st->rotate,w,h,false,f);matrix4_multiply(m,m,f);}
+    if(st->scale){transform_function_matrix(st->scale,w,h,false,f);matrix4_multiply(m,m,f);}
     css_transform_list_matrix(st->transform,w,h,f);matrix4_multiply(m,m,f);
     for(int i=0;i<16;i++)f[i]=i%5?0:1;
     f[3]=-ox;f[7]=-oy;matrix4_multiply(m,m,f);

@@ -1,7 +1,9 @@
 /* DEFLATE compression (RFC 1951): LZ77 over a 32 KiB window, with lazy matching at the
    higher levels (a match waits one byte in case the next one starts a longer match),
    then for each block the cheapest of stored bytes, the fixed codes and codes built
-   from the block's own frequencies. Wrappers: zlib (RFC 1950) and gzip (RFC 1952). */
+   from the block's own frequencies. Wrappers: zlib (RFC 1950) and gzip (RFC 1952).
+   Decompression (inflate_*) is a state machine over a bit reservoir, so input may
+   stop at any bit and output may stop at any byte. */
 #include <stdlib.h>
 #include <string.h>
 #include "deflate.h"
@@ -70,6 +72,15 @@ struct deflate_stream {
     uint64_t total_in;
     bool started, finished, failed;
 };
+
+/* RFC 1952 8's CRC-32, by byte */
+static void crc_table_fill(uint32_t table[256]) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t v = i;
+        for (int k = 0; k < 8; k++) v = v & 1 ? 0xEDB88320u ^ (v >> 1) : v >> 1;
+        table[i] = v;
+    }
+}
 
 size_t deflate_bound(size_t n) {
     /* A block ends after BLOCK_SYMBOLS symbols (each a byte or more), before the window
@@ -494,11 +505,7 @@ struct deflate_stream *deflate_begin(int level, enum deflate_wrap wrap) {
     s->adler_a = 1;
     s->adler_b = 0;
     s->crc = 0;
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t v = i;
-        for (int k = 0; k < 8; k++) v = v & 1 ? 0xEDB88320u ^ (v >> 1) : v >> 1;
-        s->crc_table[i] = v;
-    }
+    crc_table_fill(s->crc_table);
     s->total_in = 0;
     s->started = s->finished = s->failed = false;
     return s;
@@ -553,3 +560,395 @@ int deflate_feed(struct deflate_stream *s, const void *in, size_t n, bool last, 
 }
 
 void deflate_end(struct deflate_stream *s) { free(s); }
+
+/* ---------------------------------------------------------------- decompression */
+
+enum {
+    I_HEADER, I_EXTRA_LEN, I_EXTRA, I_NAME, I_COMMENT, I_HCRC, I_ZLIB_HEADER,
+    I_BLOCK, I_STORED_LEN, I_STORED, I_DYNAMIC, I_CODE_LENGTHS, I_LENGTHS, I_REPEAT,
+    I_SYMBOL, I_LENGTH_EXTRA, I_DISTANCE, I_DISTANCE_EXTRA, I_COPY,
+    I_TRAILER_CRC, I_TRAILER_SIZE, I_ADLER, I_END,
+};
+
+/* a canonical code by length: how many codes of each length, then the symbols in order */
+struct huffman { uint16_t count[MAX_BITS + 1], symbol[288]; };
+
+struct inflate_stream {
+    enum deflate_wrap wrap;  /* DEFLATE_ZLIB becomes DEFLATE_RAW when INFLATE_ZLIB_OR_RAW finds no header */
+    unsigned options;
+    inflate_put put;
+    void *context;
+    unsigned phase, header_pos, flags, extra, index;
+    unsigned hlit, hdist, hclen, repeat, repeat_bits, repeat_value, length, distance;
+    bool final, invalid;
+    uint64_t bits;           /* the reservoir: input bits not yet taken, the next one lowest */
+    unsigned nbits;
+    const uint8_t *input;
+    size_t remaining;
+    uint32_t crc, header_crc, size, members, adler_a, adler_b, crc_table[256];
+    uint8_t lengths[320], code_lengths[CODELEN_CODES];
+    struct huffman lit, dist, code;
+    size_t window_at, window_used, output_used;
+    uint8_t window[WSIZE], output[16384];
+};
+
+static bool inflate_need(struct inflate_stream *s, unsigned n) {
+    while (s->nbits < n) {
+        if (!s->remaining) return false;
+        s->bits |= (uint64_t)*s->input++ << s->nbits;
+        s->remaining--;
+        s->nbits += 8;
+    }
+    return true;
+}
+
+static unsigned inflate_take(struct inflate_stream *s, unsigned n) {
+    unsigned value = (unsigned)(s->bits & (((uint64_t)1 << n) - 1));
+    s->bits >>= n;
+    s->nbits -= n;
+    return value;
+}
+
+static uint32_t crc_byte(const struct inflate_stream *s, uint32_t crc, unsigned byte) {
+    return (crc >> 8) ^ s->crc_table[(crc ^ byte) & 0xFF];
+}
+
+/* complete: every code must be used (the fixed codes, the code length code); a literal
+   or distance code may leave codes unused only when it has one code of one bit */
+static bool huffman_build(struct huffman *h, const uint8_t *lengths, unsigned n, bool complete) {
+    memset(h, 0, sizeof *h);
+    unsigned offsets[MAX_BITS + 1] = {0}, used = 0, max = 0;
+    int left = 1;
+    for (unsigned i = 0; i < n; i++) {
+        if (lengths[i] > MAX_BITS) return false;
+        h->count[lengths[i]]++;
+        if (lengths[i]) {
+            used++;
+            if (lengths[i] > max) max = lengths[i];
+        }
+    }
+    for (unsigned i = 1; i <= MAX_BITS; i++) {
+        left = left * 2 - h->count[i];
+        if (left < 0) return false;  /* more codes than the lengths allow */
+    }
+    if (left && (complete || max > 1)) return false;
+    for (unsigned i = 1; i < MAX_BITS; i++) offsets[i + 1] = offsets[i] + h->count[i];
+    for (unsigned i = 0; i < n; i++)
+        if (lengths[i]) h->symbol[offsets[lengths[i]]++] = (uint16_t)i;
+    return used || !complete;
+}
+
+/* 1 decoded a symbol, 0 needs another byte, -1 the bits are no code */
+static int huffman_decode(struct inflate_stream *s, const struct huffman *h, unsigned *value) {
+    unsigned code = 0, first = 0, index = 0;
+    for (unsigned len = 1; len <= MAX_BITS; len++) {
+        if (!inflate_need(s, len)) return 0;
+        code = (code << 1) | ((unsigned)(s->bits >> (len - 1)) & 1);
+        unsigned count = h->count[len];
+        if (code >= first && code - first < count) {
+            *value = h->symbol[index + code - first];
+            inflate_take(s, len);
+            return 1;
+        }
+        index += count;
+        first = (first + count) << 1;
+    }
+    return -1;
+}
+
+static bool inflate_flush(struct inflate_stream *s) {
+    size_t n = s->output_used;
+    s->output_used = 0;
+    return !n || s->put(s->context, s->output, n);
+}
+
+/* false: put said stop (it has taken this byte) */
+static bool inflate_emit(struct inflate_stream *s, unsigned byte) {
+    s->window[s->window_at++ & WMASK] = (uint8_t)byte;
+    if (s->window_used < WSIZE) s->window_used++;
+    s->output[s->output_used++] = (uint8_t)byte;
+    s->crc = crc_byte(s, s->crc, byte);
+    s->size++;
+    if (s->wrap == DEFLATE_ZLIB) {
+        s->adler_a = (s->adler_a + byte) % 65521u;
+        s->adler_b = (s->adler_b + s->adler_a) % 65521u;
+    }
+    return s->output_used < sizeof s->output || inflate_flush(s);
+}
+
+static void inflate_start_data(struct inflate_stream *s) {
+    s->phase = I_BLOCK;
+    s->crc = 0xFFFFFFFFu;
+    s->size = 0;
+    s->window_at = s->window_used = 0;
+    s->adler_a = 1;
+    s->adler_b = 0;
+}
+
+/* the gzip header's optional fields, in their order, then the data */
+static void inflate_after_extra(struct inflate_stream *s) {
+    if (s->flags & 8) { s->flags &= ~8u; s->phase = I_NAME; }
+    else if (s->flags & 16) { s->flags &= ~16u; s->phase = I_COMMENT; }
+    else if (s->flags & 2) { s->flags &= ~2u; s->phase = I_HCRC; }
+    else inflate_start_data(s);
+}
+
+/* what follows the final DEFLATE block */
+static unsigned inflate_after_data(const struct inflate_stream *s) {
+    return s->wrap == DEFLATE_GZIP ? I_TRAILER_CRC : s->wrap == DEFLATE_ZLIB ? I_ADLER : I_END;
+}
+
+struct inflate_stream *inflate_begin(enum deflate_wrap wrap, unsigned options, inflate_put put, void *context) {
+    struct inflate_stream *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+    crc_table_fill(s->crc_table);
+    s->wrap = wrap;
+    s->options = options;
+    s->put = put;
+    s->context = context;
+    s->header_crc = 0xFFFFFFFFu;
+    if (wrap == DEFLATE_GZIP) s->phase = I_HEADER;
+    else if (wrap == DEFLATE_ZLIB) s->phase = I_ZLIB_HEADER;
+    else inflate_start_data(s);
+    return s;
+}
+
+enum inflate_result inflate_feed(struct inflate_stream *s, const void *in, size_t n, bool last, size_t *used) {
+    *used = 0;
+    if (!s || s->invalid || (n && !in)) return INFLATE_INVALID;
+    s->input = in;
+    s->remaining = n;
+    for (;;) {
+        unsigned v = 0;
+        int decoded;
+        switch (s->phase) {
+        case I_HEADER:
+            if (!inflate_need(s, 8)) goto wait;
+            v = inflate_take(s, 8);
+            s->header_crc = crc_byte(s, s->header_crc, v);
+            /* ID1 ID2, CM 8 (deflate), FLG without the reserved bits; MTIME, XFL and OS are not read */
+            if ((s->header_pos == 0 && v != 31) || (s->header_pos == 1 && v != 139) || (s->header_pos == 2 && v != 8) ||
+                (s->header_pos == 3 && (v & 224)))
+                goto invalid;
+            if (s->header_pos == 3) s->flags = v;
+            if (++s->header_pos == 10) {
+                if (s->flags & 4) { s->flags &= ~4u; s->phase = I_EXTRA_LEN; }
+                else inflate_after_extra(s);
+            }
+            break;
+        case I_EXTRA_LEN:
+            if (!inflate_need(s, 16)) goto wait;
+            v = inflate_take(s, 16);
+            s->header_crc = crc_byte(s, crc_byte(s, s->header_crc, v & 255), v >> 8);
+            s->extra = v;
+            s->phase = I_EXTRA;
+            break;
+        case I_EXTRA:
+            if (!s->extra) { inflate_after_extra(s); break; }
+            if (!inflate_need(s, 8)) goto wait;
+            s->header_crc = crc_byte(s, s->header_crc, inflate_take(s, 8));
+            s->extra--;
+            break;
+        case I_NAME:
+        case I_COMMENT:  /* zero-terminated; the contents are not read */
+            if (!inflate_need(s, 8)) goto wait;
+            v = inflate_take(s, 8);
+            s->header_crc = crc_byte(s, s->header_crc, v);
+            if (!v) inflate_after_extra(s);
+            break;
+        case I_HCRC:  /* the low 16 bits of the CRC-32 of the header before it */
+            if (!inflate_need(s, 16)) goto wait;
+            if (inflate_take(s, 16) != ((~s->header_crc) & 0xFFFF)) goto invalid;
+            inflate_after_extra(s);
+            break;
+        case I_ZLIB_HEADER:
+            /* CMF and FLG: CM 8, CINFO (the window) at most 7, FCHECK, no FDICT */
+            if (!inflate_need(s, 16)) goto wait;
+            v = (unsigned)(s->bits & 0xFFFF);
+            if ((v & 15) == 8 && (v & 255) >> 4 <= 7 && !(((v & 255) * 256 + (v >> 8)) % 31) && !(v & 0x2000))
+                inflate_take(s, 16);
+            else if (s->options & INFLATE_ZLIB_OR_RAW)
+                s->wrap = DEFLATE_RAW;  /* these bits start the DEFLATE data */
+            else
+                goto invalid;
+            inflate_start_data(s);
+            break;
+        case I_BLOCK:
+            if (!inflate_need(s, 3)) goto wait;
+            v = inflate_take(s, 3);
+            s->final = (v & 1) != 0;
+            v >>= 1;
+            if (v == 0) {
+                inflate_take(s, s->nbits % 8);
+                s->phase = I_STORED_LEN;
+            } else if (v == 1) {
+                for (unsigned i = 0; i < 288; i++) s->lengths[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8;
+                if (!huffman_build(&s->lit, s->lengths, 288, true)) goto invalid;
+                memset(s->lengths, 5, 32);
+                huffman_build(&s->dist, s->lengths, 32, true);
+                s->phase = I_SYMBOL;
+            } else if (v == 2) {
+                s->phase = I_DYNAMIC;
+            } else {
+                goto invalid;
+            }
+            break;
+        case I_STORED_LEN:
+            if (!inflate_need(s, 32)) goto wait;
+            v = inflate_take(s, 32);
+            if ((v & 0xFFFF) != ((~v >> 16) & 0xFFFF)) goto invalid;  /* LEN and NLEN */
+            s->length = v & 0xFFFF;
+            s->phase = I_STORED;
+            break;
+        case I_STORED:
+            if (!s->length) { s->phase = s->final ? inflate_after_data(s) : I_BLOCK; break; }
+            if (!inflate_need(s, 8)) goto wait;
+            v = inflate_take(s, 8);
+            s->length--;
+            if (!inflate_emit(s, v)) goto stopped;
+            break;
+        case I_DYNAMIC:
+            if (!inflate_need(s, 14)) goto wait;
+            v = inflate_take(s, 14);
+            s->hlit = (v & 31) + 257;
+            s->hdist = ((v >> 5) & 31) + 1;
+            s->hclen = (v >> 10) + 4;
+            if (s->hlit > LITLEN_CODES) goto invalid;
+            memset(s->code_lengths, 0, sizeof s->code_lengths);
+            s->index = 0;
+            s->phase = I_CODE_LENGTHS;
+            break;
+        case I_CODE_LENGTHS:
+            if (s->index == s->hclen) {
+                if (!huffman_build(&s->code, s->code_lengths, CODELEN_CODES, true)) goto invalid;
+                s->index = 0;
+                s->phase = I_LENGTHS;
+                break;
+            }
+            if (!inflate_need(s, 3)) goto wait;
+            s->code_lengths[codelen_order[s->index++]] = (uint8_t)inflate_take(s, 3);
+            break;
+        case I_LENGTHS:
+            if (s->index == s->hlit + s->hdist) {
+                /* the block must be able to end */
+                if (!s->lengths[256] || !huffman_build(&s->lit, s->lengths, s->hlit, false) ||
+                    !huffman_build(&s->dist, s->lengths + s->hlit, s->hdist, false))
+                    goto invalid;
+                s->phase = I_SYMBOL;
+                break;
+            }
+            decoded = huffman_decode(s, &s->code, &v);
+            if (!decoded) goto wait;
+            if (decoded < 0) goto invalid;
+            if (v < 16) {
+                s->lengths[s->index++] = (uint8_t)v;
+            } else {
+                if (v == 16 && !s->index) goto invalid;  /* nothing to repeat */
+                s->repeat = v == 18 ? 11 : 3;
+                s->repeat_bits = v == 16 ? 2 : v == 17 ? 3 : 7;
+                s->repeat_value = v == 16 ? s->lengths[s->index - 1] : 0;
+                s->phase = I_REPEAT;
+            }
+            break;
+        case I_REPEAT:
+            if (!inflate_need(s, s->repeat_bits)) goto wait;
+            v = s->repeat + inflate_take(s, s->repeat_bits);
+            if (v > s->hlit + s->hdist - s->index) goto invalid;
+            memset(s->lengths + s->index, (int)s->repeat_value, v);
+            s->index += v;
+            s->phase = I_LENGTHS;
+            break;
+        case I_SYMBOL:
+            decoded = huffman_decode(s, &s->lit, &v);
+            if (!decoded) goto wait;
+            if (decoded < 0) goto invalid;
+            if (v < 256) {
+                if (!inflate_emit(s, v)) goto stopped;
+            } else if (v == 256) {
+                s->phase = s->final ? inflate_after_data(s) : I_BLOCK;
+                if (s->final) inflate_take(s, s->nbits % 8);  /* the last byte's unused bits */
+            } else {
+                if (v > 285) goto invalid;
+                v -= 257;
+                s->length = length_base[v];
+                s->extra = length_extra[v];
+                s->phase = I_LENGTH_EXTRA;
+            }
+            break;
+        case I_LENGTH_EXTRA:
+            if (!inflate_need(s, s->extra)) goto wait;
+            s->length += inflate_take(s, s->extra);
+            s->phase = I_DISTANCE;
+            break;
+        case I_DISTANCE:
+            decoded = huffman_decode(s, &s->dist, &v);
+            if (!decoded) goto wait;
+            if (decoded < 0 || v >= DIST_CODES) goto invalid;
+            s->distance = dist_base[v];
+            s->extra = dist_extra[v];
+            s->phase = I_DISTANCE_EXTRA;
+            break;
+        case I_DISTANCE_EXTRA:
+            if (!inflate_need(s, s->extra)) goto wait;
+            s->distance += inflate_take(s, s->extra);
+            if (s->distance > s->window_used) goto invalid;  /* before the data's first byte */
+            s->phase = I_COPY;
+            break;
+        case I_COPY:
+            while (s->length) {
+                s->length--;
+                if (!inflate_emit(s, s->window[(s->window_at - s->distance) & WMASK])) goto stopped;
+            }
+            s->phase = I_SYMBOL;
+            break;
+        case I_TRAILER_CRC:
+            if (!inflate_need(s, 32)) goto wait;
+            if (inflate_take(s, 32) != ~s->crc) goto invalid;
+            s->phase = I_TRAILER_SIZE;
+            break;
+        case I_TRAILER_SIZE:  /* ISIZE: the data's length mod 2^32 */
+            if (!inflate_need(s, 32)) goto wait;
+            if (inflate_take(s, 32) != s->size) goto invalid;
+            s->members++;
+            if (s->options & INFLATE_MEMBERS) {
+                s->phase = I_HEADER;
+                s->header_pos = 0;
+                s->header_crc = 0xFFFFFFFFu;
+            } else {
+                s->phase = I_END;
+            }
+            break;
+        case I_ADLER:
+            if (!inflate_need(s, 32)) goto wait;
+            v = inflate_take(s, 32);  /* most significant byte first */
+            if (((v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24)) != (s->adler_b << 16 | s->adler_a))
+                goto invalid;
+            s->phase = I_END;
+            break;
+        case I_END:
+            /* Every take leaves less than a byte in the reservoir and the end is
+               byte-aligned, so what is left of in follows the stream. */
+            if (!inflate_flush(s)) goto stopped;
+            *used = n - s->remaining;
+            return INFLATE_END;
+        default:
+            goto invalid;
+        }
+    }
+wait:
+    if (!inflate_flush(s)) goto stopped;
+    *used = n;
+    if (!last) return INFLATE_MORE;
+    if (s->wrap == DEFLATE_GZIP && (s->options & INFLATE_MEMBERS) && s->members && s->phase == I_HEADER &&
+        !s->header_pos && !s->nbits)
+        return INFLATE_END;
+invalid:
+    s->invalid = true;
+    s->output_used = 0;
+    return INFLATE_INVALID;
+stopped:
+    *used = n - s->remaining;
+    return INFLATE_STOPPED;
+}
+
+void inflate_end(struct inflate_stream *s) { free(s); }

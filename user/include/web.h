@@ -160,6 +160,18 @@ struct web_video_patch {
    measurement (profiles, network and media traces). A host shows traces apart
    from the page's console, so that they never bury the page's messages. */
 enum { WEB_CONSOLE_LOG, WEB_CONSOLE_WARN, WEB_CONSOLE_ERROR, WEB_CONSOLE_TRACE };
+/* One input step of a test automation run (web_host.automation): at is ms after the run
+   starts; x, y a point in the top-level viewport (CSS px). DOWN and UP press and release
+   WebDriver button value (0 left, 1 middle, 2 right, 3 back, 4 forward) at x, y; KEY_DOWN and
+   KEY_UP the key whose WebDriver code point is value (a character, or U+E000..U+F8FF for the
+   named keys); WHEEL scrolls dx, dy CSS px at x, y. */
+enum web_automation_kind { WEB_AUTOMATION_MOVE, WEB_AUTOMATION_DOWN, WEB_AUTOMATION_UP,
+    WEB_AUTOMATION_KEY_DOWN, WEB_AUTOMATION_KEY_UP, WEB_AUTOMATION_WHEEL };
+struct web_automation_step {
+    enum web_automation_kind kind;
+    uint32_t at, value;
+    double x, y, dx, dy;
+};
 struct web_host {
     void *opaque;
     bool (*request)(void *opaque, const struct web_request *request);
@@ -249,6 +261,14 @@ struct web_host {
     bool (*socket_close)(void *opaque, uint64_t id, unsigned code, const char *reason, size_t length);
     size_t (*socket_buffered)(void *opaque, uint64_t id);
     void (*socket_release)(void *opaque, uint64_t id);
+    /* A test tool, not a product feature: WPT's testdriver drives the host's own input with
+       it. A host sets it only when its user started it for automation; then, and only then,
+       a top-level document's realm has the function that calls it (see web_automation_step).
+       The host takes the steps (copied before return) for document, puts them into its real
+       input at their times and calls web_automation_done with id once it has handled the last
+       one and duration has passed. Returns NULL when it took them, else why not (static). */
+    const char *(*automation)(void *opaque, web_doc *document, uint64_t id,
+                              const struct web_automation_step *steps, size_t count, uint32_t duration);
 };
 enum web_socket_event_type { WEB_SOCKET_OPENED, WEB_SOCKET_MESSAGE_TEXT, WEB_SOCKET_MESSAGE_BINARY,
     WEB_SOCKET_CLOSED, WEB_SOCKET_FAILED };
@@ -262,6 +282,9 @@ struct web_socket_event {
 /* Host to document: deliver one event of a socket opened by this document or
    one of its frames. Data is copied before return. */
 void web_socket_event(web_doc *d, uint64_t id, const struct web_socket_event *event);
+/* Host to document: the automation run id of d ended, NULL when every step was handled, else
+   why it failed (copied). Its promise settles in a task of d's (web_tick). Runs no script. */
+void web_automation_done(web_doc *d, uint64_t id, const char *error);
 bool web_set_url(web_doc *d, const char *url);
 /* Call between JS tasks, after the host history position and document URL change. */
 void web_history_event(web_doc *d, const char *old_url, bool popstate);

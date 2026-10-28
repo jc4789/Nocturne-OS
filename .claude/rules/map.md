@@ -21,7 +21,7 @@
 | `user/include/` | 公開の見出し（`nocturne.h`、`web.h`、`webnet.h`、`ui.h` …）。SDK にも入る | L |
 | `user/apps/` | システムのプログラム（`browser*.c`（タブは `browser.c` の `struct tab`、設定の頁 `about:settings` は `browser_settings.h`）・`webfetch.c`・`uihost.c`・`init.c`・`sh.c`・`agent.c`、`*.cpp`、`*.ts`→`System\*.js`） | A |
 | `ports/<名>/` | 移植の差分・設定：ffmpeg、freetype、go、lexbor、llvm、mesa（`nocturne_gl.c`）、nvidia（RM をアプリ `nvrm` にする OS 層）、rust、tcc、typescript、virgl（ホストの QEMU の DLL だけ）、wabt | P |
-| `third_party/<名>/` | 取り込んだ上流：quickjs、lexbor、bearssl・ca、ffmpeg、freetype・brotli・img、mesa、nvidia-open（615.78.08）、tinycc、wabt、uacpi、unicode・formatjs、unifont、web_streams | P |
+| `third_party/<名>/` | 取り込んだ上流：webref（仕様の IDL）、quickjs、lexbor、bearssl・ca、ffmpeg、freetype・brotli・img、mesa、nvidia-open（615.78.08）、tinycc、wabt、uacpi、unicode・formatjs、unifont、web_streams | P |
 | `host/` | `store/store.c`（C: を作る・詰める・検査する）、`limine/` | H |
 | `boot/limine.conf` | 起動の項目は 2 つ（desktop と `nogui`）。解像度は持たない | H |
 | `rootfs/` | C: へそのまま入る（`Nocturne\`、`Users\User\` の見本） | — |
@@ -29,7 +29,7 @@
 | `tests/`、`docs/` | 試験、仕様・台帳・日付入りの報告 | — |
 | `build/`、`tools/`、`hyperv/`、`local/`、`.codegraph/`（無視） | 出力、同梱の道具、Hyper-V のディスク、GSP の firmware、codegraph の索引 | — |
 
-生成物（手で直さず生成元を直す）：`web/js_bootstrap.inc` ← `js_*.js`＋`js_embed.py`、`js_worker_runtime.inc` ← `js_worker_embed.py`、`js_intl.js`・`js_segmenter.js`・`js_collator.js` ← `scripts/build_*.py`、`unicode_grapheme_data.h`・`wctype_data.h` ← `scripts/unicode_*.py`、`common/unifont.bin` ← `scripts/unifont2bin.py`。
+生成物（手で直さず生成元を直す）：`web/js_bootstrap.inc` ← `js_*.js`＋`js_embed.py`、`js_worker_runtime.inc` ← `js_worker_embed.py`（どちらも `user/libc/web/` にある）、`web/webidl_data.inc` ← `third_party/webref/idl`＋`scripts/build_webidl.py`、`js_intl.js`・`js_segmenter.js`・`js_collator.js` ← `scripts/build_*.py`、`unicode_grapheme_data.h`・`wctype_data.h` ← `scripts/unicode_*.py`、`common/unifont.bin` ← `scripts/unifont2bin.py`。
 
 ## 境界
 
@@ -57,15 +57,15 @@ user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
 | 文書・公開 API | `web/doc.c`（`web.h` の実装） | `web_live`・`web_parse`、`web_tick`（媒体→`web_js_tick`→`web_frames_tick`）、`web_layout`（`css_cascade`→`boxes_build`→`layout_doc`） |
 | 解析 | `web/html_lexbor.c`・`html_lexbor_bridge.c`（Lexbor は木構築の状態だけ）、`html.c`（tag ID） | `html_begin`、`html_resume`、`html_fragment` |
 | DOM | `web/dom.c`（`node_t` は文書の持ち物）、`html_serialize.c`、`elements.c` | — |
-| CSS | `css.c`（解析・selector・cascade）、`cssprop.c`（性質と UA の表）、`cssom.c` | `css_cascade` |
+| CSS | `css.c`（解析・selector・cascade）、`cssprop.c`（性質と UA の表）、`color.c`（色の値の型 `struct css_color`：解析・計算値・直列化・色域の写像・補間。描画は装いの 8 ビットの欄、正確な値は `color_inherited`・`color_own`）、`cssom.c` | `css_cascade`、`css_color_interpolate` |
 | 箱・配置 | `box.c`／`layout.c`（block・inline・table・flex・grid・abs） | `boxes_build`・`boxes_rebuild_local`／`layout_doc` |
 | 描画 | `paint.c`（描画・当たり・ページ内検索） | `web_paint`、`web_hit_test` |
-| JS | `js.c`（QuickJS の host）＋`js_*.c`・`js_*.js`（`js_bootstrap.inc` に埋込み） | `web_js_start`、`web_js_tick`、`web_console_eval` |
+| JS | `js.c`（QuickJS の host）＋`js_*.c`・`js_*.js`（`js_bootstrap.inc` に埋込み）。Web IDL の形（interface object・prototype・member の名と length・列挙・定数）は束縛が組み上がった後に `js_webidl.c` が `webidl_data.inc` の表から一度に与える。窓と Worker の両方の realm に入る定義：`js_geometry.js`（DOMPoint・DOMRect・DOMQuad・DOMMatrix）、`js_custom_event.js`、`js_clone.js`（`registerSerializable`）、`js_compression.c`（Compression Streams、`deflate.c`・`brotli_codec.h`） | `web_js_start`、`web_js_tick`、`web_console_eval` |
 | 枠 | `frame.c`、`frame_native.h` | `web_frames_tick`、`web_rendering_now` |
 | 媒体 | `avmedia.c` → `user/libc/media*.c` → 子 `browsermediaworker`・`browsermseworker`。`js_canvas.c`、`js_webgl.c` → `ports/mesa/nocturne_gl.c` | `web_avmedia_tick` |
 | Web Audio | `webaudio.c`、`webaudio_dsp.c`、`js_webaudio.c`・`.js`。出口は `n_audio_submit` | — |
 | Worker・WASM | `js_worker.c` → 子 `browserjsworker`／`js_wasm.cpp`（wabt） | — |
-| 保存 | `webstorage.c`、`webidb*.c` → 子 `browserstorageworker`、`webcookie.c`（永続の Cookie は webnet.c の `cookie_sync` が `AppData\Browser\cookies` へ。窓どうしは見張りで読み直す）、`js_opfs.c`、まとめは `websitedata.c` | — |
+| 保存 | `webstorage.c`、IndexedDB は `js_indexeddb.js`＋`js_indexeddb.c`（窓と Worker の両方の realm。Worker は `browserjsworker.c` の主ループ）→ `webidb_async.c` → 子 `browserstorageworker` → `webidb.c`（接続の表で窓と Worker の versionchange・blocked・close が出会う）、`webcookie.c`（永続の Cookie は webnet.c の `cookie_sync` が `AppData\Browser\cookies` へ。窓どうしは見張りで読み直す）、`js_opfs.c`、まとめは `websitedata.c` | — |
 | F12・ログ | `user/apps/browser_devtools.h`＋`web/inspect.c`。console の行は `web_js_console`（js.c）→ `host_console`→`console_add`（browser.c）。`--log-console`／`--debug-js` で serial へ `[browser <level> @秒.ms] …` | — |
 
 ## ビルド・媒体・試験（手順は `nocturne-project` スキル）
@@ -74,6 +74,7 @@ user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
 - 出力 `build/kernel.elf`、`build/programs/`、`build/sdk/`、`build/c.list`、`build/nocturne.{img,vhd,vhdx,iso}`。C: の中身は `scripts/layout.py` → `build/c.list` → `build/host/store.exe fill`（`mkroots.py` は TLS の根の証明書で、C: とは無関係）。
 - 任意の移植は道具があるときだけ：Go `tools/go`、TypeScript `tools/TypeScript`、Rust `tools/rust`、OS の中の LLVM `tools/llvm`、NVIDIA の firmware `local/firmware/`。
 - 試験：`scripts/test.py [--quick] [--no-net] [群|群/名]`（`tests/runtests.c` の `tests[]`、114 群 225 件。例 `web/fonts`・`web/engine`・`web/javascript`）。QEMU を窓なしで起動し、`C:\Tests\autorun.sh` から tcc で組んで走らせる。結果 `build/test-serial.log`・`build/test-metadata.json`。`tests/check_*.py` はホストの検査で、まとめる runner は無い。
+- WPT：`scripts/wpt.py --label <名>`（ホストの wptserve と QEMU 一台、ゲストの `tests/wptrunner.c` が枠ごとにブラウザーを開き、`tests/wpt/testharnessreport.js` が結果を返す。`--resume`、`--summary-only`）。結果 `build/wpt/<名>/results.jsonl`・`summary.txt`。QuickJS だけの test262 はホストの `tests/check_test262.py`。
 - 画面で確かめる：`scripts/platform_qa.py`（ラベル専用の写し、`build/nocturne-platform/<label>/`）、`scripts/qtest.py`、または手で起動した QEMU。
 
 ## 記録と道具
@@ -87,4 +88,4 @@ user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
 ## 古い記述（直すまで信じない）
 
 - README.md:51 の起動メニュー 3 項目と解像度 → `boot/limine.conf` は 2 項目で解像度を持たない。README.md:268 の tools 一覧 → llvm・rust・go・TypeScript もある。README.md:660 の `hv/`・`rdp/`・e1000・tulip・ATA の置き場所 → どれも `kernel/src/vm/`。README.md:668 の ports 一覧に llvm が無い。
-- `scripts/test.py:20` の群の一覧（13 群）→ `tests/runtests.c` は 114 群。`user/libc/web/webi.h:3`「html.c は tokenizer と tree builder」→ `html.c` は tag ID だけで、木の構築は `html_lexbor.c`。
+- `scripts/test.py:20` の群の一覧（13 群）→ `tests/runtests.c` は 114 群。

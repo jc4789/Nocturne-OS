@@ -103,19 +103,22 @@ FT_C := $(addprefix third_party/freetype/src/,base/ftbase.c base/ftinit.c base/f
         truetype/truetype.c cff/cff.c psaux/psaux.c psnames/psnames.c \
         pshinter/pshinter.c sfnt/sfnt.c smooth/smooth.c gzip/ftgzip.c)
 BROTLI_C := $(wildcard third_party/brotli/c/common/*.c third_party/brotli/c/dec/*.c)
-FT_OBJ := $(patsubst %.c,$(BUILD)/font/%.o,$(FT_C) $(BROTLI_C))
+# The encoder is for the Compression Standard's "brotli" (web/js_compression.c).
+BROTLI_ENC_C := $(wildcard third_party/brotli/c/enc/*.c)
+FT_OBJ := $(patsubst %.c,$(BUILD)/font/%.o,$(FT_C) $(BROTLI_C) $(BROTLI_ENC_C))
 FTFLAGS := $(filter-out -W%,$(UCFLAGS)) -w -Iports/freetype -Ithird_party/brotli/c/include \
            -DFT2_BUILD_LIBRARY -DFT_CONFIG_OPTIONS_H='"nocturne-ftoption.h"' \
            -DFT_CONFIG_MODULES_H='"nocturne-ftmodule.h"' -DBROTLI_BUILD_PORTABLE
 $(BUILD)/u/user/libc/third_party_ttf.o: UCFLAGS += $(filter -Iports/freetype -DFT%,$(FTFLAGS))
-# HTTP's br content coding shares the same brotli decoder objects.
+# HTTP's br content coding and the Compression Standard share the same brotli objects.
 $(BUILD)/u/user/libc/third_party_brotli.o: UCFLAGS += -Ithird_party/brotli/c/include
 .PHONY: font-decoders
 font-decoders: $(FT_OBJ) $(BUILD)/u/user/libc/font.o $(BUILD)/u/user/libc/third_party_ttf.o
 FONT_VENDOR_INPUTS := $(wildcard third_party/freetype/src/*/*.c third_party/freetype/src/*/*.h \
     third_party/freetype/src/*/*/*.c third_party/freetype/src/*/*/*.h \
     third_party/freetype/include/freetype/*.h third_party/freetype/include/freetype/*/*.h \
-    third_party/brotli/c/common/*.h third_party/brotli/c/dec/*.h third_party/brotli/c/include/brotli/*.h)
+    third_party/brotli/c/common/*.h third_party/brotli/c/dec/*.h third_party/brotli/c/enc/*.h \
+    third_party/brotli/c/include/brotli/*.h)
 $(BUILD)/font/%.o: %.c ports/freetype/nocturne-ftoption.h ports/freetype/nocturne-ftmodule.h $(FONT_VENDOR_INPUTS)
 	@mkdir -p $(dir $@)
 	@echo "  FONT $<"
@@ -190,6 +193,18 @@ $(BUILD)/qjs/%.o: %.c
 	@echo "  QJS  $<"
 	@$(CC) $(QJSFLAGS) -c $< -o $@
 
+# Expat: XML tokens, the internal DTD subset and entity replacement only
+# (third_party/expat/README.nocturne.md). Namespaces, the DOM and the
+# parsererror document belong to user/libc/web/xml.c.
+EXPAT_C := $(addprefix third_party/expat/lib/,xmlparse.c xmlrole.c xmltok.c)
+EXPAT_OBJ := $(patsubst %.c,$(BUILD)/expat/%.o,$(EXPAT_C))
+EXPATFLAGS := $(filter-out -W%,$(UCFLAGS)) -w -fno-addrsig -Iports/expat
+$(BUILD)/expat/%.o: %.c ports/expat/expat_config.h
+	@mkdir -p $(dir $@)
+	@echo "  XML  $<"
+	@$(CC) $(EXPATFLAGS) -c $< -o $@
+$(BUILD)/u/user/libc/web/xml.o: UCFLAGS += -Ithird_party/expat/lib -Iports/expat
+
 # stb_truetype, stb_image, jebp and nanosvg are compiled as they are, without warnings
 $(BUILD)/u/user/libc/third_party_%.o: UCFLAGS += -w
 
@@ -229,6 +244,10 @@ $(BUILD)/u/%.o: %.c
 user/libc/web/js_bootstrap.inc: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json
 	@$(PY) user/libc/web/js_embed.py
 $(BUILD)/u/user/libc/web/js.o: user/libc/web/js_bootstrap.inc
+# The Web IDL table the binding layer shapes interfaces by, from the specifications' IDL.
+user/libc/web/webidl_data.inc: scripts/build_webidl.py third_party/webref/upstream.json $(wildcard third_party/webref/idl/*.idl)
+	@$(PY) scripts/build_webidl.py
+$(BUILD)/u/user/libc/web/js_webidl.o: user/libc/web/webidl_data.inc
 # 原UCD／generator変更時に表を正規再生成。guest内linkは保全された表を使う。
 user/libc/web/unicode_grapheme_data.h: scripts/unicode_grapheme.py scripts/ucd.py third_party/unicode/18.0.0/GraphemeBreakProperty.txt third_party/unicode/18.0.0/DerivedCoreProperties.txt third_party/unicode/18.0.0/emoji-data.txt
 	@$(PY) scripts/unicode_grapheme.py
@@ -239,7 +258,7 @@ $(BUILD)/u/user/libc/wctype.o: user/libc/wctype_data.h
 third_party/lexbor/source/lexbor/unicode/idna_validity_res.h: scripts/unicode_idna.py scripts/ucd.py third_party/unicode/18.0.0/UnicodeData.txt
 	@$(PY) scripts/unicode_idna.py
 $(BUILD)/lexbor/third_party/lexbor/source/lexbor/unicode/idna.o: third_party/lexbor/source/lexbor/unicode/idna_validity_res.h
-user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_console.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_atob.js user/libc/web/js_error_event.js user/libc/web/js_promise_rejection.js user/libc/web/js_performance.js user/libc/web/js_clone.js user/libc/web/js_offscreen_canvas.js user/libc/web/js_opfs.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js user/libc/web/js_wasm.js user/libc/web/js_wasm.h third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
+user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_console.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_atob.js user/libc/web/js_error_event.js user/libc/web/js_promise_rejection.js user/libc/web/js_custom_event.js user/libc/web/js_geometry.js user/libc/web/js_performance.js user/libc/web/js_clone.js user/libc/web/js_offscreen_canvas.js user/libc/web/js_opfs.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js user/libc/web/js_wasm.js user/libc/web/js_indexeddb.js user/libc/web/js_wasm.h third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
 	@$(PY) user/libc/web/js_worker_embed.py
 $(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc user/libc/web/js_worker_transfer.h user/libc/web/js_worker_port_lifetime.h
 $(BUILD)/u/user/libc/web/js_worker.o: user/libc/web/js_worker.h user/include/js_worker_wire.h user/libc/web/js_worker_port_lifetime.h
@@ -282,7 +301,7 @@ CXX_RUNTIME_LINK := $(if $(LLVMPIPE),$(LLVM_RUNTIMES)/Lib/libc++.a $(LLVM_RUNTIM
     $(BUILD)/u/user/libc/cxxabi.cpp.o $(CXX_RUNTIME_OBJ))
 # Zink and NVK (with its Rust archive and libnvrm) are lazy members like the rest: only a program
 # that draws with OpenGL pulls them in.
-LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(FT_OBJ) $(WASM_LINK) \
+LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(EXPAT_OBJ) $(FF_OBJ) $(FT_OBJ) $(WASM_LINK) \
     $(CXX_RUNTIME_LINK) $(MESA_OBJ) $(ZINK_OBJ) $(NVK_OBJ) $(NVRM_CLIENT_OBJ)
 # Programs are linked from the libc's members and, with llvmpipe, LLVM's libraries. The SDK's
 # libc.a is made from the same list: a program linked inside Nocturne reaches llvmpipe through
@@ -428,7 +447,7 @@ $(LICENSES)/%: third_party/%
 	@mkdir -p $(dir $@)
 	@cp $< $@
 LICENSE_FILES := $(LICENSES)/libcxx/LICENSE.TXT $(addprefix $(LICENSES)/,uacpi/LICENSE wabt/LICENSE wabt/UPSTREAM.json \
-    lexbor/LICENSE lexbor/NOTICE lexbor/UPSTREAM.json ffmpeg/LICENSE.md ffmpeg/COPYING.LGPLv2.1 ffmpeg/manifest.json \
+    lexbor/LICENSE lexbor/NOTICE lexbor/UPSTREAM.json expat/COPYING expat/README.nocturne.md ffmpeg/LICENSE.md ffmpeg/COPYING.LGPLv2.1 ffmpeg/manifest.json \
     ffmpeg/README.nocturne.md unifont/OFL-1.1.txt unifont/NOTICE.txt unifont/manifest.json)
 $(PROGRAMS)/nvrm: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(NVKMS_LINK_OBJ) $(UVM_LINK_OBJ) $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)

@@ -593,11 +593,75 @@ void doc_create_diagnostic(web_doc *d,unsigned stage,int type,size_t name_bytes,
     web_js_console(report,2,message);
 }
 
-node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t len) {
+int doc_namespace_id(const char *ns) {
+    if (!ns || !*ns) return NS_NONE;
+    if (!strcmp(ns, WEB_NS_HTML)) return NS_HTML;
+    if (!strcmp(ns, WEB_NS_SVG)) return NS_SVG;
+    if (!strcmp(ns, WEB_NS_MATHML)) return NS_MATHML;
+    return NS_OTHER;
+}
+const char *doc_element_namespace(const node_t *n) {
+    if (!n || n->type != N_ELEM) return NULL;
+    switch (n->namespace_id) {
+    case NS_HTML: return WEB_NS_HTML;
+    case NS_SVG: return WEB_NS_SVG;
+    case NS_MATHML: return WEB_NS_MATHML;
+    case NS_OTHER: return n->namespace_uri;
+    default: return NULL;
+    }
+}
+/* DOM "create an element"'s names, under the caller's arena trap. The tag ID
+   follows the local name; an HTML local name is case-sensitive, so one with
+   ASCII uppercase is an unknown element, not the lowercase element. */
+static void element_names(web_doc *d, node_t *n, int namespace_id, const char *ns,
+                          const char *prefix, size_t prefix_len, const char *local, size_t local_len) {
+    size_t at = prefix_len ? prefix_len + 1 : 0;
+    char *qualified = ar_alloc(&d->mem, at + local_len + 1);
+    if (prefix_len) { memcpy(qualified, prefix, prefix_len); qualified[prefix_len] = ':'; }
+    memcpy(qualified + at, local, local_len); qualified[at + local_len] = 0;
+    n->raw_name = qualified; n->local_name = qualified + at;
+    n->prefix = prefix_len ? ar_strndup(&d->mem, prefix, prefix_len) : NULL;
+    n->namespace_id = (uint8_t)namespace_id;
+    n->namespace_uri = namespace_id == NS_OTHER ? ar_strdup(&d->mem, ns) : NULL;
+    n->foreign = namespace_id != NS_HTML;
+    bool upper = false;
+    for (size_t i = 0; i < local_len; i++) if (local[i] >= 'A' && local[i] <= 'Z') { upper = true; break; }
+    n->tag = namespace_id == NS_HTML && upper ? T_UNKNOWN : (uint16_t)tag_lookup(local, local_len);
+    if (n->tag) n->name = tag_names[n->tag];
+    else {
+        char *lower_name = ar_strndup(&d->mem, local, local_len);
+        for (size_t i = 0; i < local_len; i++) lower_name[i] = (char)lower((unsigned char)lower_name[i]);
+        n->name = lower_name;
+    }
+}
+/* DOM "create an element": a synchronous custom element constructor's result
+   takes the requested namespace prefix after the constructor's checks. */
+bool doc_element_prefix_set(node_t *n, const char *prefix) {
+    if (!n || n->type != N_ELEM || !n->allocation_doc) return false;
+    web_doc *d = n->allocation_doc;
+    const char *local = n->local_name ? n->local_name : n->raw_name ? n->raw_name : n->name;
+    size_t local_len = strlen(local), prefix_len = prefix ? strlen(prefix) : 0;
+    if (prefix_len > SIZE_MAX - 2 - local_len) return false;
+    jmp_buf trap;
+    jmp_buf *old = d->mem.trap;
+    d->mem.trap = &trap;
+    if (setjmp(trap)) { d->mem.trap = old; return false; }
+    size_t at = prefix_len ? prefix_len + 1 : 0;
+    char *qualified = ar_alloc(&d->mem, at + local_len + 1);
+    if (prefix_len) { memcpy(qualified, prefix, prefix_len); qualified[prefix_len] = ':'; }
+    memcpy(qualified + at, local, local_len); qualified[at + local_len] = 0;
+    char *kept_prefix = prefix_len ? ar_strndup(&d->mem, prefix, prefix_len) : NULL;
+    d->mem.trap = old;
+    n->raw_name = qualified; n->local_name = qualified + at; n->prefix = kept_prefix;
+    return true;
+}
+
+static node_t *node_create(web_doc *d, int type, const char *name, const char *text, size_t len,
+                           int namespace_id, const char *ns, const char *prefix) {
     if (!d) return NULL;
-    size_t name_bytes=name?strlen(name):0;
+    size_t name_bytes=name?strlen(name):0, prefix_bytes=prefix?strlen(prefix):0;
     if(type<N_DOC || type>N_ATTR || len==SIZE_MAX || (len && !text) ||
-       (type==N_ELEM && (!name || !*name)) ||
+       (type==N_ELEM && (!name || !*name || prefix_bytes>SIZE_MAX-2-name_bytes)) ||
        (type==N_PI && (!name || !doc_pi_target_valid(name,name_bytes)))) {
         doc_create_diagnostic(d,DOC_CREATE_INVALID,type,name_bytes,len);return NULL;
     }
@@ -619,15 +683,7 @@ node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text
     n->owned_next = d->owned_nodes;
     d->owned_nodes = n;
     if (type == N_ELEM) {
-        size_t l = strlen(name);
-        n->tag = (uint16_t)tag_lookup(name, l); /* lookup normalizes known short names itself */
-        if (n->tag) n->name = tag_names[n->tag];
-        else {
-            char *lower_name = ar_strndup(&d->mem, name, l);
-            for (size_t i = 0; i < l; i++) lower_name[i] = (char)lower((unsigned char)lower_name[i]);
-            n->name = lower_name;
-        }
-        n->raw_name = ar_strdup(&d->mem, name);
+        element_names(d, n, namespace_id, ns, prefix, prefix_bytes, name, name_bytes);
         doc_image_node_owned(n);
     } else if (type == N_DOCTYPE) {
         n->name = ar_strdup(&d->mem, name ? name : "html");
@@ -638,6 +694,99 @@ node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text
     }
     d->mem.trap = old;
     return n;
+}
+/* An element is an HTML-namespace element without a prefix. */
+node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t len) {
+    return node_create(d, type, name, text, len, NS_HTML, WEB_NS_HTML, NULL);
+}
+/* DOM "create an element" given a local name, namespace (NULL: none) and
+   prefix (NULL: none) that the caller validated and extracted. */
+node_t *doc_element_create(web_doc *d, const char *ns, const char *prefix, const char *local) {
+    if (prefix && !*prefix) prefix = NULL;
+    return node_create(d, N_ELEM, local, NULL, 0, doc_namespace_id(ns), ns, prefix);
+}
+
+/* The element where DOM's namespace lookups begin for a node of any interface:
+   a document's document element, an Attr's element, another node's parent
+   element; doctypes and fragments (shadow roots too) have none. */
+static const node_t *namespace_scope(const node_t *n) {
+    if (!n) return NULL;
+    switch (n->type) {
+    case N_ELEM: return n;
+    case N_DOC:
+        for (const node_t *c = n->first; c; c = c->next) if (c->type == N_ELEM) return c;
+        return NULL;
+    case N_DOCTYPE: case N_FRAGMENT: return NULL;
+    case N_ATTR: return n->attr_owner;
+    default: return n->parent && n->parent->type == N_ELEM ? n->parent : NULL;
+    }
+}
+static const node_t *parent_element(const node_t *n) {
+    return n->parent && n->parent->type == N_ELEM ? n->parent : NULL;
+}
+static bool same_string(const char *a, const char *b) { return a == b || (a && b && !strcmp(a, b)); }
+const char *doc_locate_namespace(const node_t *n, const char *prefix) {
+    if (prefix && !*prefix) prefix = NULL;
+    for (const node_t *e = namespace_scope(n); e; e = parent_element(e)) {
+        if (prefix && !strcmp(prefix, "xml")) return WEB_NS_XML;
+        if (prefix && !strcmp(prefix, "xmlns")) return WEB_NS_XMLNS;
+        const char *ns = doc_element_namespace(e);
+        if (ns && same_string(e->prefix, prefix)) return ns;
+        for (int i = 0; i < e->nattrs; i++) {
+            const struct attr *a = &e->attrs[i];
+            const char *local = a->local ? a->local : a->raw;
+            if (!same_string(a->namespace_uri, WEB_NS_XMLNS)) continue;
+            if (prefix ? a->prefix && !strcmp(a->prefix, "xmlns") && !strcmp(local, prefix) :
+                         !a->prefix && !strcmp(local, "xmlns"))
+                return a->value && *a->value ? a->value : NULL;
+        }
+    }
+    return NULL;
+}
+/* DOM "list of elements with qualified name" (namespaced false) and "with
+   namespace and local name" (namespaced: ns NULL is the null namespace, "*"
+   in either is any): root's descendants in tree order, without shadow trees
+   or template contents. */
+void doc_elements_named(node_t *root, bool namespaced, const char *ns, const char *name, pvec *out) {
+    if (!root || !name) return;
+    bool any_name = !strcmp(name, "*"), any_ns = namespaced && ns && !strcmp(ns, "*");
+    /* An HTML document's HTML elements match the ASCII-lowercased name. */
+    char *folded = NULL;
+    if (!namespaced && !any_name && root->owner && !root->owner->xml) {
+        size_t length = strlen(name);
+        folded = malloc(length + 1);
+        if (!folded) return;
+        for (size_t i = 0; i <= length; i++) folded[i] = (char)lower((unsigned char)name[i]);
+    }
+    for (node_t *c = root->first; c;) {
+        if (c->type == N_ELEM) {
+            bool match;
+            if (namespaced) match = (any_ns || same_string(doc_element_namespace(c), ns)) &&
+                                    (any_name || !strcmp(c->local_name ? c->local_name : c->name, name));
+            else match = any_name || !strcmp(c->raw_name ? c->raw_name : c->name,
+                                             folded && c->namespace_id == NS_HTML ? folded : name);
+            if (match) pv_push(out, c);
+        }
+        if (c->first) c = c->first;
+        else {
+            while (c != root && !c->next) c = c->parent;
+            if (c == root) break;
+            c = c->next;
+        }
+    }
+    free(folded);
+}
+const char *doc_locate_prefix(const node_t *n, const char *ns) {
+    if (!ns || !*ns) return NULL;
+    for (const node_t *e = namespace_scope(n); e; e = parent_element(e)) {
+        if (e->prefix && same_string(doc_element_namespace(e), ns)) return e->prefix;
+        for (int i = 0; i < e->nattrs; i++) {
+            const struct attr *a = &e->attrs[i];
+            if (a->prefix && !strcmp(a->prefix, "xmlns") && same_string(a->value, ns))
+                return a->local ? a->local : a->raw;
+        }
+    }
+    return NULL;
 }
 
 node_t *doc_doctype_create(web_doc *d, const char *name, size_t name_len,
@@ -695,6 +844,16 @@ static void attribute_cache(web_doc *d, node_t *n) {
     }
 }
 
+/* A parser's attribute list for an element it just created, under the
+   caller's arena trap: the list becomes the element's, with its id and classes. */
+void doc_attrs_initial(web_doc *d, node_t *n, struct attr *attrs, int count) {
+    node_t temp = *n;
+    temp.attrs = attrs; temp.nattrs = count;
+    attribute_cache(d, &temp);
+    doc_attrs_publish(n, attrs, count);
+    n->id = temp.id; n->classes = temp.classes; n->nclasses = temp.nclasses;
+}
+
 /* The element array remains the renderer/parser's canonical data. An Attr
    wrapper points into that array; old arena slots survive detachment. */
 void doc_attrs_publish(node_t *n, struct attr *attrs, int count) {
@@ -725,7 +884,8 @@ int doc_attr_index(node_t *n, const char *ns, const char *name, bool namespaced)
                 !strcmp(name, a->local ? a->local : a->raw)) return i;
         } else {
             const char *p = name, *q = a->raw;
-            while (*p && *q && (n->foreign ? *p : lower((unsigned char)*p)) == (unsigned char)*q) { p++; q++; }
+            bool fold = doc_html_names(n);
+            while (*p && *q && (fold ? lower((unsigned char)*p) : *p) == (unsigned char)*q) { p++; q++; }
             if (!*p && !*q) return i;
         }
     }
@@ -942,7 +1102,7 @@ bool doc_node_attr(web_doc *d, node_t *n, const char *name, const char *value) {
     char *normalized = malloc(length + 1);
     if (!normalized) return false;
     memcpy(normalized, name, length + 1);
-    if (n && !n->foreign) for (char *p = normalized; *p; p++) *p = (char)lower((unsigned char)*p);
+    if (doc_html_names(n)) for (char *p = normalized; *p; p++) *p = (char)lower((unsigned char)*p);
     bool result = attribute_change(d, n, found, a ? a->raw : normalized, value,
         a ? a->namespace_uri : NULL, a ? a->prefix : NULL, a ? a->local : normalized, NULL);
     free(normalized); return result;
@@ -1254,7 +1414,7 @@ static void adopt_subtree(web_doc *d, node_t *root) {
     doc_parser_form_set(n,NULL);n->owner = owner;
     html_bridge_native_changed(n, HTML_BRIDGE_FIELDS | HTML_BRIDGE_LINKS);
     for (int i = 0; i < n->nattrs; i++) if (n->attrs[i].node) n->attrs[i].node->owner = owner;
-    n->style = n->animation_base_style = NULL; n->box = n->anchor_block = NULL;
+    n->style = n->animation_base_style = n->animation_after_style = NULL; n->box = n->anchor_block = NULL;
     n->image = -1; n->image_request = -1; n->image_initialized = false;
     n->image_generation++;
     /* Adoption is an image-data mutation even without a later insertion or
@@ -1309,6 +1469,9 @@ node_t *doc_template_content(web_doc *d, node_t *n) {
         if (!owner) return NULL;
         while (owner->root->first) doc_node_remove(owner, owner->root->first);
         owner->template_owner = true; d->template_doc = owner;
+        /* HTML "appropriate template contents owner document": an HTML
+           document's is an HTML document, an XML document's an XML document. */
+        if (d->xml) { owner->xml = true; owner->content_type = strdup("application/xml"); }
     }
     n->template_content = doc_node_create(owner, N_FRAGMENT, NULL, "", 0);
     if (n->template_content) n->template_content->template_host = n;
@@ -1522,10 +1685,11 @@ static node_t *clone_one(web_doc *d, node_t *n, int32_t fallback, void *fallback
         struct attr *a = n->attribute;
         return doc_attr_create(d, a->namespace_uri, a->prefix, a->local ? a->local : a->raw, a->value);
     }
-    node_t *c = doc_node_create(d, n->type, n->raw_name ? n->raw_name : n->name, n->text, n->textlen);
+    node_t *c = n->type == N_ELEM ?
+        doc_element_create(d, doc_element_namespace(n), n->prefix, n->local_name ? n->local_name : n->raw_name) :
+        doc_node_create(d, n->type, n->raw_name ? n->raw_name : n->name, n->text, n->textlen);
     if (!c) return NULL;
-    c->foreign = n->foreign;
-    c->namespace_id = n->namespace_id;
+    c->cdata = n->cdata;
     clone_registry(d,c,n,fallback,fallback_realm);
     if (n->custom_is) {
         jmp_buf trap; jmp_buf *old = d->mem.trap; d->mem.trap = &trap;

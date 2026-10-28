@@ -108,7 +108,7 @@ const attributeBridge = (() => {
     Element.prototype.setAttributeNS=function(ns,name,value){element(this);required(arguments.length,3);ns=namespace(ns);name=string(name);value=valueString(value);const x=extract(ns,name);dom('attrNS',this,x.ns,x.local,value,x.prefix);};
     Element.prototype.removeAttributeNS=function(ns,local){element(this);required(arguments.length,2);dom('attrNS',this,namespace(ns),string(local),null);};
     Document.prototype.createAttribute=function(name){documentBridge.brand(this);required(arguments.length,1);name=string(name);localValid(name);
-        return rawDom.attrCreate(this,null,null,lower(name));};
+        return rawDom.attrCreate(this,null,null,rawDom.get(this,'htmlDocument')?lower(name):name);};
     Document.prototype.createAttributeNS=function(ns,name){documentBridge.brand(this);required(arguments.length,2);const x=extract(ns,name);return rawDom.attrCreate(this,x.ns,x.prefix,x.local);};
     for(const [C,name] of [[Attr,'Attr'],[NamedNodeMap,'NamedNodeMap']])Object.defineProperty(C.prototype,Symbol.toStringTag,{value:name,configurable:true});
     Object.defineProperty(Node.prototype,'ATTRIBUTE_NODE',{value:2,enumerable:true});

@@ -1,7 +1,7 @@
 /* Feed the product content-coding decoders across every byte/bit boundary on the host:
      http_coding_hosttest "<Content-Encoding value>" [chunk] < coded > decoded
    A list this decoder leaves alone (Fetch: the codings are not supported) is copied as it is.
-   Built with user/libc/third_party_brotli.c and third_party/brotli/c/{common,dec}. */
+   Built with user/libc/deflate.c, user/libc/third_party_brotli.c and third_party/brotli/c. */
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>

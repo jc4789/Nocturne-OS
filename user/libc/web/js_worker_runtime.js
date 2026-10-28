@@ -39,6 +39,8 @@
     }
     /* @include js_error_event.js */
     /* @include js_promise_rejection.js */
+    /* @include js_custom_event.js */
+    const CustomEvent=customEventInterface(Event,eventState);
     function workerListeners(value){const m=apply(eventGet,listeners,[value]);if(!m)throw new TypeError('Illegal EventTarget receiver');return m;}
     function removeWorkerListener(list,entry){if(entry.removed)return;entry.removed=true;const index=apply(eventIndexOf,list,[entry]);if(index>=0)apply(eventSplice,list,[index,1]);if(entry.unlisten){entry.unlisten();entry.unlisten=null;}}
     class EventTarget{
@@ -62,30 +64,41 @@
         }
         dispatchEvent(event){workerListeners(this);const s=eventState(event);if(!s.initialized||s.dispatching)throw new DOMException('Uninitialized or dispatching event','InvalidStateError');s.isTrusted=false;return dispatchWorkerEvent(this,event);}
     }
-    function dispatchWorkerEvent(object,event){
-        const m=workerListeners(object),s=eventState(event);if(!s.initialized||s.dispatching)throw new DOMException('Uninitialized or dispatching event','InvalidStateError');
-        const receiver=object===target?globalThis:object,type=s.type,reached=!s.stop;s.dispatching=true;s.target=receiver;s.path=[receiver];
-        try{
-            const invoke=capture=>{
-                if(s.stop)return;s.currentTarget=receiver;s.eventPhase=2;
-                const list=apply(eventMapGet,m,[type])||[],snapshot=apply(eventSlice,list,[]);
-                for(const entry of snapshot){
-                    if(entry.removed||entry.capture!==capture)continue;if(entry.once)removeWorkerListener(list,entry);s.passive=entry.passive;
-                    try{if(typeof entry.fn==='function')apply(entry.fn,receiver,[event]);else{const fn=entry.fn.handleEvent;if(typeof fn==='function')apply(fn,entry.fn,[event]);}}catch(error){report(error);}finally{s.passive=false;}
-                    if(s.immediate)break;
-                }
-            };
-            if(reached)invoke(true);if(reached&&!s.immediate){
-                /* stopPropagation at this target still permits its remaining
-                 * listeners; stopImmediatePropagation suppresses them. */
-                const stopped=s.stop;s.stop=false;invoke(false);s.stop=s.stop||stopped;
-                if(!s.immediate){try{const fn=object['on'+type];if(typeof fn==='function'&&apply(fn,receiver,[event])===false&&s.cancelable)s.defaultPrevented=true;}catch(error){report(error);}}
+    /* DOM "dispatch" (https://dom.spec.whatwg.org/#concept-event-dispatch). The path is a
+       snapshot's entries in js_bootstrap.js's form, entries[0] the target itself, then the
+       parents a platform object names (IndexedDB: request, transaction, database); without a
+       snapshot the path is the target alone. Capture runs from the outermost parent inward, then
+       the target's capture and other listeners as two invocations, then bubbling; each
+       invocation first checks stopPropagation. A listener that throws is reported and sets the
+       event's listenerException (IndexedDB aborts the request's transaction for it). */
+    function dispatchWorkerEvent(object,event,snapshot){
+        workerListeners(object);const s=eventState(event);if(!s.initialized||s.dispatching)throw new DOMException('Uninitialized or dispatching event','InvalidStateError');
+        const scope=node=>node===target?globalThis:node,receiver=scope(object),type=s.type;
+        const planned=!!(snapshot&&snapshot.entries),entries=planned?snapshot.entries:[{node:object,target:receiver,visible:[receiver],atTarget:true}];
+        s.dispatching=true;s.target=receiver;
+        function visit(entry,capture,phase){
+            const node=entry.node,current=scope(node),list=apply(eventMapGet,workerListeners(node),[type])||[],listed=apply(eventSlice,list,[]);
+            s.target=scope(entry.target);s.path=entry.visible;s.eventPhase=phase;s.currentTarget=current;
+            for(const item of listed){
+                if(item.removed||item.capture!==capture)continue;if(item.once)removeWorkerListener(list,item);s.passive=item.passive;
+                try{
+                    if(typeof item.fn==='function')apply(item.fn,current,[event]);
+                    else{const fn=item.fn.handleEvent;if(typeof fn!=='function')throw new TypeError('EventListener handleEvent is not callable');apply(fn,item.fn,[event]);}
+                }catch(error){s.listenerException=true;report(error);}finally{s.passive=false;}
+                if(s.immediate)return;
             }
+            if(!capture){try{const fn=node['on'+type];if(typeof fn==='function'&&apply(fn,current,[event])===false&&s.cancelable)s.defaultPrevented=true;}catch(error){s.listenerException=true;report(error);}}
+        }
+        try{
+            for(let i=entries.length-1;i>0&&!s.stop;i--)visit(entries[i],true,entries[i].atTarget?2:1);
+            if(entries.length&&!s.stop){visit(entries[0],true,2);if(!s.stop)visit(entries[0],false,2);}
+            for(let i=1;i<entries.length&&!s.stop;i++)if(s.bubbles||entries[i].atTarget)visit(entries[i],false,entries[i].atTarget?2:3);
+            s.target=planned?scope(snapshot.finalTarget):receiver;
             return !s.defaultPrevented;
         }finally{s.currentTarget=null;s.eventPhase=0;s.path=[];s.dispatching=s.passive=s.stop=s.immediate=false;}
     }
-    function dispatchNativeWorkerEvent(object,event){eventState(event).isTrusted=true;return dispatchWorkerEvent(object,event);}
-    Object.assign(globalThis,{DOMException,Event,ErrorEvent,PromiseRejectionEvent,EventTarget});
+    function dispatchNativeWorkerEvent(object,event,snapshot){eventState(event).isTrusted=true;return dispatchWorkerEvent(object,event,snapshot);}
+    Object.assign(globalThis,{DOMException,Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,EventTarget});
     const progressSlots=new WeakMap();
     class ProgressEvent extends Event{
         constructor(type,init={}){init=init==null?{}:Object(init);super(type,init);const number=v=>{const n=Number(v)||0;return Number.isFinite(n)?Number(BigInt(Math.trunc(n))&18446744073709551615n):0;};apply(eventSet,progressSlots,[this,{lengthComputable:!!init.lengthComputable,loaded:number(init.loaded),total:number(init.total)}]);}
@@ -94,12 +107,13 @@
         get total(){const s=apply(eventGet,progressSlots,[this]);if(!s)throw new TypeError('Illegal ProgressEvent receiver');return s.total;}
     }
     Object.defineProperty(globalThis,'ProgressEvent',{value:ProgressEvent,writable:true,configurable:true});
-    let blobHandlerTarget=()=>false;
+    let blobHandlerTarget=()=>false,indexedDBHandlerTarget=()=>false;
     const fileHandlers=new WeakMap();
     const dispatch=dispatchNativeWorkerEvent;
+    const handlerTarget=(value,type)=>blobHandlerTarget(value,type)||indexedDBHandlerTarget(value,type);
     function installHandlers(prototype,types){for(const type of types)eventDefine(prototype,'on'+type,{enumerable:true,configurable:true,
-        get(){if(!blobHandlerTarget(this,type))throw new TypeError('Illegal event handler receiver');return apply(eventGet,fileHandlers,[this])?.[type]||null;},
-        set(value){if(!blobHandlerTarget(this,type))throw new TypeError('Illegal event handler receiver');let map=apply(eventGet,fileHandlers,[this]);if(!map){map=eventCreate(null);apply(eventSet,fileHandlers,[this,map]);}map[type]=typeof value==='function'?value:null;}});}
+        get(){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');return apply(eventGet,fileHandlers,[this])?.[type]||null;},
+        set(value){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');let map=apply(eventGet,fileHandlers,[this]);if(!map){map=eventCreate(null);apply(eventSet,fileHandlers,[this,map]);}map[type]=typeof value==='function'?value:null;}});}
     /* @include js_navigator.js */
     const {navigator,Interface:WorkerNavigator,languagesChanged}=navigatorBridge.create(true);
     /* @include js_encoding.js */
@@ -107,7 +121,10 @@
     /* @include js_streams.js */
     host.timer=(_,fn,ms,args)=>timer(fn,ms,args,false);host.clear=clearTimer;
     /* @include js_blob.js */
+    Object.defineProperty(globalThis,'FileReaderSync',{value:blobBridge.FileReaderSync,writable:true,configurable:true});
     /* @include js_clone.js */
+    /* @include js_geometry.js */
+    geometryInterfaces({});
     /* @include js_offscreen_canvas.js */
     /* @include js_worker_messaging.js */
     /* @include js_sanitizer_constants.js */
@@ -346,6 +363,10 @@
     // No DOM image sources here; context loss events are timer tasks.
     offscreenCanvasBridge.bindWebGL(undefined,fn=>timer(fn,0,[],false));
     /* @include js_wasm.js */
+    /* IndexedDB is the Window's (js_indexeddb.js over js_indexeddb.c): the same storage owner and
+       storage key, its connections meeting the Window's in the profile's connection table. Its
+       tasks are this worker's timers and browserjsworker.c's completion tasks. */
+    /* @include js_indexeddb.js */
     // The global object is a WorkerGlobalScope: its interface objects are not
     // constructible, and the chain runs through EventTarget.prototype. The
     // concrete scope (dedicated or shared) is fixed when the host starts it.
@@ -381,10 +402,12 @@
         safetyDynamicCode:htmlSafetyBridge.dynamicCode,
         safetyViolation(init){if(!closed)dispatchNativeWorkerEvent(target,htmlSafetyBridge.violationEvent(init));},
         languageChange(){if(languagesChanged()&&!closed)dispatchNativeWorkerEvent(target,new Event('languagechange'));},
-        start(r){address=r[1];workerName=String(r[5]||"");workerCanCancel=r[6]===true;shared=r[9]===true;installScope(shared);if(shared)delete globalThis.postMessage;if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker source failed','NetworkError');const locationURL=new URL(address);Object.defineProperty(globalThis,'location',{value:Object.freeze({href:address,origin:locationURL.origin,protocol:locationURL.protocol,host:locationURL.host,hostname:locationURL.hostname,port:locationURL.port,pathname:locationURL.pathname,search:locationURL.search,hash:locationURL.hash,toString(){return address;}}),configurable:true});if(!formDataBridge)formDataBridge=initializeWorkerFormData();evalSource(new TextDecoder().decode(r[3]),address);},
+        start(r){address=r[1];workerName=String(r[5]||"");workerCanCancel=r[6]===true;shared=r[9]===true;installScope(shared);if(shared)delete globalThis.postMessage;host.webidl(shared?'SharedWorkerGlobalScope':'DedicatedWorkerGlobalScope');if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker source failed','NetworkError');const locationURL=new URL(address);Object.defineProperty(globalThis,'location',{value:Object.freeze({href:address,origin:locationURL.origin,protocol:locationURL.protocol,host:locationURL.host,hostname:locationURL.hostname,port:locationURL.port,pathname:locationURL.pathname,search:locationURL.search,hash:locationURL.hash,toString(){return address;}}),configurable:true});if(!formDataBridge)formDataBridge=initializeWorkerFormData();evalSource(new TextDecoder().decode(r[3]),address);},
         receive(packet,op=2,id=0,kind=0){try{if(op===8||op===9||op===10){workerMessagingBridge.receivePort(id,kind,packet,op!==8);return;}const payload=kind===3?workerMessagingBridge.importExternal(packet):{data:cloneData.deserialize(packet),ports:[]};if(!closed){if(op===13){if(!shared||payload.ports.length!==1)throw new TypeError('Invalid shared worker connection');dispatchNativeWorkerEvent(target,new MessageEvent('connect',{data:'',source:payload.ports[0],ports:payload.ports}));}else dispatchNativeWorkerEvent(target,new MessageEvent('message',{data:payload.data,ports:payload.ports}));}}catch(e){if(!closed)dispatchNativeWorkerEvent(target,new MessageEvent('messageerror'));}},
         loaded(id,r,flags=0){const p=workerFetchBridge.take(id);if(!p||closed)return;p.cleanup();if(r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!p.noCors)){p.reject(new TypeError(r[4]||'Worker fetch failed'));return;}try{p.resolve(workerFetchBridge.networkResponse(r,flags,p.signal,p.method));}catch(error){p.reject(error);}},
         tick(now){if(closed)return false;const ports=workerMessagingBridge.ready();if(ports&&!lastPortTask){lastPortTask=true;return workerMessagingBridge.runOne();}const t=timerHeap[0];if(t&&t.due<=now){lastPortTask=false;if(t.repeat){t.due=now+t.delay;timerFix(0);}else clearTimer(t.id);try{t.fn(...t.args);}catch(e){report(e);}return true;}lastPortTask=ports;return ports?workerMessagingBridge.runOne():false;},
-        deadline(){if(workerMessagingBridge.ready())return host.now();return timerHeap.length?timerHeap[0].due:-1;},report
+        deadline(){if(workerMessagingBridge.ready())return host.now();return timerHeap.length?timerHeap[0].due:-1;},report,
+        storageOrigin:urlBridge.storageOrigin,
+        indexedDBTaskEnd:indexedDBBridge.taskEnd
     };
 })(__workerHost);

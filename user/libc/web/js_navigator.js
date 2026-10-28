@@ -6,9 +6,21 @@
  * languagesChanged() there and fires the event when it returns true. */
 const navigatorBridge=(()=>{
     const invoke=Reflect.apply,has=WeakSet.prototype.has,add=WeakSet.prototype.add;
-    const define=Object.defineProperty,freeze=Object.freeze,cookieEnabled=host.cookieEnabled,nativeLanguages=host.languages;
+    const define=Object.defineProperty,getOwnDescriptor=Object.getOwnPropertyDescriptor,freeze=Object.freeze;
+    const cookieEnabled=host.cookieEnabled,nativeLanguages=host.languages;
+    const automation=host.automation===true;
     const split=String.prototype.split,join=Array.prototype.join;
     function userLanguages(){return freeze(invoke(split,invoke(nativeLanguages,host,[]),[',']));}
+    // HTML appVersion in the Gecko navigator compatibility mode: empty unless the
+    // User-Agent starts with "Mozilla/5.0 (", else "5.0 (Windows)" or the trail up to
+    // its first ";" closed with ")".
+    function geckoAppVersion(userAgent){
+        if(!userAgent.startsWith('Mozilla/5.0 ('))return '';
+        const trail=userAgent.slice('Mozilla/'.length);
+        if(trail.startsWith('5.0 (Windows'))return '5.0 (Windows)';
+        const semicolon=trail.indexOf(';');
+        return (semicolon<0?trail:trail.slice(0,semicolon))+')';
+    }
     function create(worker){
         const token={},brands=new WeakSet();
         function construct(receiver,value){
@@ -21,34 +33,40 @@ const navigatorBridge=(()=>{
         function requireReceiver(receiver){
             if(!invoke(has,brands,[receiver]))throw new TypeError('Illegal navigator receiver');
         }
-        const values={userAgent:host.userAgent,platform:host.platform,
-            appCodeName:'Mozilla',appName:'Netscape',appVersion:host.userAgent,
-            vendor:'',vendorSub:'',product:'Gecko',productSub:'20030107',
+        // Web IDL: an attribute's getter is a function named "get <name>" of length 0.
+        function attribute(name,read){
+            const get=getOwnDescriptor({get [name](){requireReceiver(this);return read();}},name).get;
+            define(Interface.prototype,name,{configurable:true,enumerable:true,get});
+        }
+        // HTML NavigatorID. The navigator compatibility mode is Gecko: the User-Agent names
+        // neither Chrome nor WebKit and Nocturne claims no vendor, so productSub is
+        // "20100101", vendor "", and Window has taintEnabled() and oscpu. productSub,
+        // vendor, vendorSub, taintEnabled and oscpu are [Exposed=Window].
+        const userAgent=host.userAgent,platform=host.platform;
+        const values={userAgent,platform,appCodeName:'Mozilla',appName:'Netscape',
+            appVersion:geckoAppVersion(userAgent),product:'Gecko',
             onLine:true,hardwareConcurrency:host.hardwareConcurrency};
-        for(const [name,value] of Object.entries(values))
-            define(Interface.prototype,name,{configurable:true,enumerable:true,get(){requireReceiver(this);return value;}});
+        if(!worker){values.productSub='20100101';values.vendor='';values.vendorSub='';values.oscpu=platform;}
+        for(const [name,value] of Object.entries(values))attribute(name,()=>value);
+        if(!worker)define(Interface.prototype,'taintEnabled',{configurable:true,enumerable:true,writable:true,
+            value:{taintEnabled(){requireReceiver(this);return false;}}.taintEnabled});
         let languages=userLanguages();
-        define(Interface.prototype,'language',{configurable:true,enumerable:true,get(){requireReceiver(this);return languages[0];}});
-        define(Interface.prototype,'languages',{configurable:true,enumerable:true,get(){requireReceiver(this);return languages;}});
+        attribute('language',()=>languages[0]);
+        attribute('languages',()=>languages);
         function languagesChanged(){
             const next=userLanguages();
             if(invoke(join,next,[','])===invoke(join,languages,[',']))return false;
             languages=next;return true;
         }
-        if(!worker)define(Interface.prototype,'cookieEnabled',{configurable:true,enumerable:true,get(){
-            requireReceiver(this);return typeof cookieEnabled==='function'&&!!invoke(cookieEnabled,host,[]);
-        }});
-        // WebDriver NavigatorAutomationInformation: Window-only; Nocturne has
-        // no remote-control (WebDriver) session, so the flag is never set.
-        if(!worker)define(Interface.prototype,'webdriver',{configurable:true,enumerable:true,get(){
-            requireReceiver(this);return false;
-        }});
+        if(!worker)attribute('cookieEnabled',()=>typeof cookieEnabled==='function'&&!!invoke(cookieEnabled,host,[]));
+        // WebDriver NavigatorAutomationInformation: Window-only. True only while
+        // the browser's input is driven for automation (the WPT runner starts it
+        // with --wpt-automation; see native_automation in js.c), never otherwise.
+        if(!worker)attribute('webdriver',()=>automation);
         // Pointer Events: Window-only. The input layer turns a touch screen or
         // pen into the one system pointer (kernel usbhid.c), so pages never see
         // simultaneous touch contacts.
-        if(!worker)define(Interface.prototype,'maxTouchPoints',{configurable:true,enumerable:true,get(){
-            requireReceiver(this);return 0;
-        }});
+        if(!worker)attribute('maxTouchPoints',()=>0);
         // Beacon: a POST that outlives the document, carried by the native
         // keepalive fetch transport. Only a CORS-safelisted body type may go
         // without CORS; anything else needs the server's consent.
@@ -118,7 +136,7 @@ const navigatorBridge=(()=>{
                 }
             }
             const capabilities=Object.create(MediaCapabilities.prototype);
-            define(Interface.prototype,'mediaCapabilities',{configurable:true,enumerable:true,get(){requireReceiver(this);return capabilities;}});
+            attribute('mediaCapabilities',()=>capabilities);
             define(globalThis,'MediaCapabilities',{value:MediaCapabilities,writable:true,configurable:true});
         }
         define(Interface.prototype,Symbol.toStringTag,{value:worker?'WorkerNavigator':'Navigator',configurable:true});

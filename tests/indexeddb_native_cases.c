@@ -130,9 +130,12 @@ int main(void){fixture_serial=(unsigned)_getpid();char dir[100];snprintf(dir,siz
     check("catalog-opaque-origin-rejected",webidb_databases(a,"null",&catalog_items,&catalog_count)==WEB_IDB_SECURITY);
     written_bytes=read_bytes=0;check("reopen-reads-metadata-only",webidb_begin(b,"https://idb.test","db",2,&tb,&meta,&n)==0&&n==3&&!memcmp(meta,"one",3)&&read_bytes<1024);free(meta);
     check("lazy-value-round-trip",webidb_value(b,tb,ref,&bytes,&bn)==0&&bn==1024*1024&&bytes[1024*1024-1]==0x72);free(bytes);
-    uint32_t client=0;check("native-connection-register",webidb_connect(b,tb,1,&client)==0&&client);size_t clients_count=0;check("native-versionchange-enqueue",webidb_connections(b,tb,2,&clients_count)==0&&clients_count==1);int pending=0;uint64_t desired=0;check("native-versionchange-delivery",webidb_poll(b,client,&pending,&desired)==0&&pending&&desired==2);check("native-versionchange-once",webidb_poll(b,client,&pending,&desired)==0&&!pending);
-    check("native-versionchange-retry-once",webidb_connections(b,tb,2,&clients_count)==0&&webidb_poll(b,client,&pending,&desired)==0&&!pending);
-    check("native-close-unblocks",webidb_disconnect(b,client)==0&&webidb_connections(b,tb,2,&clients_count)==0&&clients_count==0);
+    uint32_t client=0;check("native-connection-register",webidb_connect(b,tb,1,&client)==0&&client);size_t clients_count=0,unfired=0;check("native-versionchange-enqueue",webidb_connections(b,tb,2,&clients_count,&unfired)==0&&clients_count==1&&unfired==1);int pending=0;uint64_t desired=0;check("native-versionchange-delivery",webidb_poll(b,client,&pending,&desired)==0&&pending&&desired==2);check("native-versionchange-once",webidb_poll(b,client,&pending,&desired)==0&&!pending);
+    check("native-versionchange-unfired-until-fired",webidb_connections(b,tb,2,&clients_count,&unfired)==0&&clients_count==1&&unfired==1);
+    check("native-versionchange-fired",webidb_fired(b,client)==0&&webidb_connections(b,tb,2,&clients_count,&unfired)==0&&clients_count==1&&unfired==0);
+    check("native-versionchange-retry-once",webidb_connections(b,tb,2,&clients_count,&unfired)==0&&webidb_poll(b,client,&pending,&desired)==0&&!pending);
+    check("native-versionchange-new-version-marks-again",webidb_connections(b,tb,3,&clients_count,&unfired)==0&&unfired==1&&webidb_poll(b,client,&pending,&desired)==0&&pending&&desired==3&&webidb_fired(b,client)==0);
+    check("native-close-unblocks",webidb_disconnect(b,client)==0&&webidb_connections(b,tb,2,&clients_count,&unfired)==0&&clients_count==0&&unfired==0);
     size_t before=written_bytes;check("unchanged-value-no-rewrite",webidb_stage(b,tb,large,1024*1024,unused)==0&&written_bytes==before&&!strcmp(ref,unused));
     fail_write=12;check("partial-manifest-fails",webidb_commit(b,tb,(const uint8_t *)"two",3,refs,1,2)==WEB_IDB_IO);fail_write=-1;webidb_abort(b,tb);
     check("catalog-partial-write-retains-old-version",webidb_databases(a,"https://idb.test",&catalog_items,&catalog_count)==0&&catalog_count==1&&catalog_items[0].version==1);webidb_databases_free(catalog_items,catalog_count);

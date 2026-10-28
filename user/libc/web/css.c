@@ -9,6 +9,7 @@
 #include <display.h>
 #include <parallel.h>
 #include "webi.h"
+#include "animation.h"
 #include "web_dialog.h"
 #include "web_presentation.h"
 #include "form_validation.h"
@@ -185,7 +186,9 @@ struct mcond {
     bool container;
 };
 
-struct font_source {const char *url;struct font_source *next;};
+/* resource: a FontFace's own source, resolved when its source was set (the
+   document owns it); NULL for an @font-face rule, found by url on demand. */
+struct font_source {const char *url;struct font_source *next;struct web_font_resource *resource;};
 struct font_face {
     const char *family;
     struct font_source *sources;
@@ -196,6 +199,24 @@ struct font_face {
     const struct mcond *media;
     struct font_face *next;
     const struct css_layer_decl *layer;
+    /* CSS Font Loading: the FontFace identity (never reused), the CSSOM
+       serialization of each descriptor (enum css_font_descriptor) its
+       attributes reflect, and the FontFace record when no rule owns it. */
+    uint64_t id;
+    const char *desc[CSS_FONT_DESCRIPTORS];
+    struct css_font_face *author;
+};
+/* A FontFace the page constructed (CSS Font Loading 2.1). Its JS wrapper holds
+   one reference and every document font source (document.fonts) holding it
+   another; selection reads it only through those documents' author_fonts. */
+struct css_font_face {
+    struct font_face face;
+    unsigned refs;
+    bool started; /* load() or a rendering use: as if load() had been called */
+    char *names[CSS_FONT_DESCRIPTORS]; /* face.desc's malloc storage */
+    char *family;                      /* the literal family name it matches */
+    struct web_font_range *ranges;     /* face.ranges, sorted and merged */
+    struct web_font_resource *data;    /* decoded BufferSource, document-owned */
 };
 
 /* Immutable syntax identities. Resolved layer ordering belongs to each
@@ -1968,53 +1989,316 @@ static struct font_source *font_sources(struct pctx *pc,const char *s,const char
     }
     return first;
 }
+/* ---------------------------------------------------------------- @font-face descriptors
+   CSS Fonts 4 descriptor grammar (https://drafts.csswg.org/css-fonts-4/#font-face-rule),
+   parsed once for both a face's matching fields and the CSSOM serialization
+   that the CSS Font Loading FontFace attributes reflect. A rule and a FontFace
+   setter use the same parser, so `font-feature-settings: "smcp" off` and
+   face.featureSettings = "'smcp' off" both read back `"smcp" 0`. */
+struct font_desc {
+    unsigned weight_lo,weight_hi;
+    bool italic;
+    struct web_font_range *ranges; /* malloc: sorted and merged; NULL with 0: U+0-10FFFF */
+    size_t range_count;
+};
 static int font_range_compare(const void *a,const void *b) {
     const struct web_font_range *x=a,*y=b;
     return x->first<y->first?-1:x->first>y->first?1:x->last<y->last?-1:x->last>y->last;
 }
-static bool parse_font_ranges(arena_t *a,const char *s,const char *end,
-                              const struct web_font_range **out,size_t *count) {
+/* <urange>#, each range as written (malloc). 1, 0 syntax error, -1 allocator. */
+static int font_ranges_parse(const char *s,const char *end,struct web_font_range **out,size_t *count) {
     struct web_font_range *ranges=NULL;size_t n=0,capacity=0;
+    *out=NULL;*count=0;
     for(;;){
         s=skip_ws(s,end);
-        if(end-s<3 || (*s!='u'&&*s!='U') || s[1]!='+')return false;
+        if(end-s<3 || (*s!='u'&&*s!='U') || s[1]!='+')goto invalid;
         s+=2;uint32_t lo=0,hi=0;unsigned digits=0,wildcards=0;
         while(s<end && (isxdigit((unsigned char)*s)||*s=='?')){
-            if(++digits>6)return false;
+            if(++digits>6)goto invalid;
             if(*s=='?'){wildcards++;lo<<=4;hi=(hi<<4)|15;}
-            else {if(wildcards)return false;unsigned v=*s>='0'&&*s<='9'?*s-'0':tolower((unsigned char)*s)-'a'+10;lo=(lo<<4)|v;hi=(hi<<4)|v;}
+            else {if(wildcards)goto invalid;unsigned v=*s>='0'&&*s<='9'?*s-'0':tolower((unsigned char)*s)-'a'+10;lo=(lo<<4)|v;hi=(hi<<4)|v;}
             s++;
         }
-        if(!digits)return false;
+        if(!digits)goto invalid;
         if(s<end&&*s=='-'){
-            if(wildcards)return false;s++;hi=0;unsigned d=0;
+            if(wildcards)goto invalid;s++;hi=0;unsigned d=0;
             while(s<end&&isxdigit((unsigned char)*s)){
-                if(++d>6)return false;unsigned v=*s>='0'&&*s<='9'?*s-'0':tolower((unsigned char)*s)-'a'+10;hi=(hi<<4)|v;s++;
+                if(++d>6)goto invalid;unsigned v=*s>='0'&&*s<='9'?*s-'0':tolower((unsigned char)*s)-'a'+10;hi=(hi<<4)|v;s++;
             }
-            if(!d)return false;
+            if(!d)goto invalid;
         }
-        if(lo>hi||lo>0x10ffff)return false;hi=MIN(hi,0x10ffffu);
+        if(lo>hi||lo>0x10ffff)goto invalid;hi=MIN(hi,0x10ffffu);
         if(n==capacity){
             size_t cap=capacity?capacity*2:8;
-            if(cap<capacity||cap>SIZE_MAX/sizeof *ranges){ar_alloc(a,SIZE_MAX);return false;}
-            struct web_font_range *next=ar_alloc(a,cap*sizeof *next);
-            if(n)memcpy(next,ranges,n*sizeof *next);ranges=next;capacity=cap;
+            void *next=cap>capacity&&cap<=SIZE_MAX/sizeof *ranges?realloc(ranges,cap*sizeof *ranges):NULL;
+            if(!next){free(ranges);return -1;}
+            ranges=next;capacity=cap;
         }
         ranges[n++]=(struct web_font_range){lo,hi};s=skip_ws(s,end);
         if(s==end)break;
-        if(*s++!=',')return false;
+        if(*s++!=',')goto invalid;
     }
-    qsort(ranges,n,sizeof *ranges,font_range_compare);
-    size_t merged=0;
+    *out=ranges;*count=n;return 1;
+invalid:
+    free(ranges);return 0;
+}
+/* Matching wants sorted, merged ranges; one covering every code point is no
+   restriction at all, and is selected as an ordinary face. */
+static void font_ranges_merge(struct web_font_range **ranges,size_t *count) {
+    struct web_font_range *r=*ranges;size_t n=*count,merged=0;
+    qsort(r,n,sizeof *r,font_range_compare);
     for(size_t i=0;i<n;i++){
-        if(merged&&ranges[i].first<=ranges[merged-1].last+1)ranges[merged-1].last=MAX(ranges[merged-1].last,ranges[i].last);
-        else ranges[merged++]=ranges[i];
+        if(merged&&r[i].first<=r[merged-1].last+1)r[merged-1].last=MAX(r[merged-1].last,r[i].last);
+        else r[merged++]=r[i];
     }
-    *out=ranges;*count=merged;return true;
+    if(merged==1&&r[0].first==0&&r[0].last>=0x10ffff){free(r);*ranges=NULL;merged=0;}
+    *count=merged;
+}
+/* A keyword (lowercased, at most 31 bytes, without escapes), or false. */
+static bool fd_keyword(const char **ps,const char *e,char word[32]) {
+    const char *s=*ps;size_t n=0;
+    if(s>=e || isdigit((unsigned char)*s) || !ident_char((unsigned char)*s))return false;
+    if(*s=='-' && s+1<e && (isdigit((unsigned char)s[1]) || s[1]=='.'))return false;
+    while(s<e && ident_char((unsigned char)*s)){if(n==31)return false;word[n++]=(char)lower((unsigned char)*s++);}
+    if(s<e && (*s=='(' || *s=='\\'))return false;
+    word[n]=0;*ps=s;return true;
+}
+/* A number, percentage or dimension token: its value, whether it is an
+   <integer>, and its unit ("", "%" or a lowercase identifier). */
+static bool fd_number(const char **ps,const char *e,double *value,bool *integer,char unit[8]) {
+    const char *s=*ps,*start=s;bool digits=false,point=false,exponent=false;
+    if(s<e && (*s=='+' || *s=='-'))s++;
+    while(s<e && isdigit((unsigned char)*s)){s++;digits=true;}
+    if(s+1<e && *s=='.' && isdigit((unsigned char)s[1])){point=digits=true;s++;while(s<e && isdigit((unsigned char)*s))s++;}
+    if(!digits)return false;
+    if(s<e && (*s=='e' || *s=='E')){
+        const char *t=s+1;if(t<e && (*t=='+' || *t=='-'))t++;
+        if(t<e && isdigit((unsigned char)*t)){exponent=true;s=t;while(s<e && isdigit((unsigned char)*s))s++;}
+    }
+    char text[64];size_t n=(size_t)(s-start);if(n>=sizeof text)return false;
+    memcpy(text,start,n);text[n]=0;*value=strtod(text,NULL);
+    if(!isfinite(*value))return false;
+    *integer=!point && !exponent;unit[0]=0;
+    if(s<e && *s=='%'){unit[0]='%';unit[1]=0;s++;}
+    else if(s<e && ident_char((unsigned char)*s)){
+        size_t k=0;
+        while(s<e && ident_char((unsigned char)*s)){if(k==7)return false;unit[k++]=(char)lower((unsigned char)*s++);}
+        unit[k]=0;
+    }
+    if(s<e && (*s=='(' || *s=='\\'))return false;
+    *ps=s;return true;
+}
+static void fd_put_number(sbuf *b,double v) {char t[32];snprintf(t,sizeof t,"%.6g",v==0?0.0:v);sb_puts(b,t);}
+static bool fd_string(const char **ps,const char *e,sbuf *out) {
+    const char *s=*ps;
+    if(s>=e || (*s!='"' && *s!='\''))return false;
+    char quote=*s++;const char *begin=s;
+    while(s<e && *s!=quote){if(*s=='\n')return false;if(*s=='\\' && s+1<e)s++;s++;}
+    if(s>=e)return false;
+    css_unescape(out,begin,(size_t)(s-begin));*ps=s+1;return true;
+}
+/* CSSOM "serialize a string". */
+static void fd_put_string(sbuf *b,const char *s,size_t n) {
+    sb_putc(b,'"');
+    for(size_t i=0;i<n;i++){
+        unsigned char c=(unsigned char)s[i];
+        if(!c){sb_puts(b,"\xEF\xBF\xBD");continue;}
+        if(c<0x20 || c==0x7f){char t[8];snprintf(t,sizeof t,"\\%x ",c);sb_puts(b,t);continue;}
+        if(c=='"' || c=='\\')sb_putc(b,'\\');
+        sb_putc(b,(char)c);
+    }
+    sb_putc(b,'"');
+}
+/* A family name serializes as identifiers when it is a sequence of them, one
+   space apart, that is no generic family or CSS-wide keyword; otherwise as a
+   string ("sans-serif", "a  b", "content:Segoe UI" are quoted). */
+static bool fd_family_identifiers(const char *s,size_t n) {
+    static const char *const reserved[]={"inherit","initial","unset","revert","revert-layer","default",
+        "serif","sans-serif","cursive","fantasy","monospace","system-ui","emoji","math","fangsong",
+        "ui-serif","ui-sans-serif","ui-monospace","ui-rounded",NULL};
+    if(!n || memchr(s,0,n))return false;
+    if(!memchr(s,' ',n))for(int i=0;reserved[i];i++)if(strlen(reserved[i])==n && strn_ieq(s,reserved[i],n))return false;
+    for(const char *w=s,*e=s+n;;){
+        const char *end=memchr(w,' ',(size_t)(e-w));if(!end)end=e;
+        if(end==w)return false; /* leading, trailing or doubled space */
+        unsigned char c=(unsigned char)*w;
+        if(isdigit(c) || !ident_char(c) || (c=='-' && (end-w==1 || isdigit((unsigned char)w[1]))))return false;
+        for(const char *p=w;p<end;p++)if(!ident_char((unsigned char)*p))return false;
+        if(end==e)return true;
+        w=end+1;
+    }
+}
+static void fd_put_family(sbuf *b,const char *name,size_t n) {
+    if(fd_family_identifiers(name,n))sb_put(b,name,n);else fd_put_string(b,name,n);
+}
+static bool fd_tag(const sbuf *tag) {
+    if(tag->n!=4)return false;
+    for(size_t i=0;i<4;i++)if((unsigned char)tag->p[i]<0x20 || (unsigned char)tag->p[i]>0x7e)return false;
+    return true;
+}
+/* `normal`, or a list of <opentype-tag> with an integer, on/off (features) or
+   a number (variations) after each. */
+static int fd_tag_list(const char *s,const char *e,sbuf *out,bool features) {
+    char word[32];double x;bool integer;char unit[8];
+    const char *t=s;
+    if(fd_keyword(&t,e,word)){
+        if(strcmp(word,"normal") || skip_ws(t,e)!=e)return 0;
+        sb_puts(out,"normal");return 1;
+    }
+    for(bool first=true;;first=false){
+        sbuf tag={0};t=skip_ws(s,e);
+        if(!fd_string(&t,e,&tag) || !fd_tag(&tag)){sb_free(&tag);return 0;}
+        if(!first)sb_puts(out,", ");
+        fd_put_string(out,tag.p,tag.n);sb_free(&tag);
+        const char *u=skip_ws(t,e);double value=1;
+        if(features){
+            if(u<e && *u!=','){
+                if(fd_keyword(&u,e,word)){
+                    if(!strcmp(word,"on"))value=1;else if(!strcmp(word,"off"))value=0;else return 0;
+                }else if(!fd_number(&u,e,&x,&integer,unit) || unit[0] || !integer || x<0)return 0;
+                else value=x;
+                t=u;
+            }
+            if(value!=1){sb_putc(out,' ');fd_put_number(out,value);}
+        }else{
+            if(!fd_number(&u,e,&x,&integer,unit) || unit[0])return 0;
+            sb_putc(out,' ');fd_put_number(out,x);t=u;
+        }
+        t=skip_ws(t,e);
+        if(t==e)return 1;
+        if(*t!=',')return 0;
+        s=t+1;
+    }
+}
+/* One or two of normal, the keywords in names, or a non-negative percentage
+   (font-width, the metrics overrides); auto alone where allowed. */
+static int fd_percentages(const char *s,const char *e,sbuf *out,const char *const *names,int most,bool automatic) {
+    char word[32];double x;bool integer;char unit[8];int count=0;
+    for(;;){
+        const char *t=skip_ws(s,e);
+        if(t==e)break;
+        if(count==most || (count && t==s))return 0;
+        if(count)sb_putc(out,' ');
+        if(fd_keyword(&t,e,word)){
+            if(automatic && !count && !strcmp(word,"auto") && skip_ws(t,e)==e){sb_puts(out,word);return 1;}
+            bool known=false;
+            for(int i=0;names&&names[i];i++)if(!strcmp(word,names[i]))known=true;
+            if(!known)return 0;
+            sb_puts(out,word);
+        }else{
+            if(!fd_number(&t,e,&x,&integer,unit) || strcmp(unit,"%") || x<0)return 0;
+            fd_put_number(out,x);sb_putc(out,'%');
+        }
+        count++;s=t;
+    }
+    return count>0;
+}
+/* 1: valid, the serialization appended to out and matching fields in m (if
+   any); 0: syntax error (out is then garbage); -1: allocator. Not the family:
+   a rule parses <family-name>, a FontFace takes its literal name. */
+static int font_desc_parse(enum css_font_descriptor which,const char *v,size_t length,sbuf *out,struct font_desc *m) {
+    static const char *const normal[]={"normal",NULL};
+    static const char *const widths[]={"normal","ultra-condensed","extra-condensed","condensed","semi-condensed",
+        "semi-expanded","expanded","extra-expanded","ultra-expanded",NULL};
+    const char *s=skip_ws(v,v+length),*e=v+length;trim_r(s,&e);
+    char word[32];double x;bool integer;char unit[8];
+    if(s==e)return 0;
+    switch(which){
+    case CSS_FONT_STYLE: {
+        if(!fd_keyword(&s,e,word))return 0;
+        bool oblique=!strcmp(word,"oblique");
+        if(!oblique && strcmp(word,"auto") && strcmp(word,"normal") && strcmp(word,"italic"))return 0;
+        sb_puts(out,word);
+        if(m)m->italic=oblique || !strcmp(word,"italic");
+        for(int angles=0;oblique && skip_ws(s,e)<e;angles++){
+            const char *t=skip_ws(s,e);
+            if(angles==2 || t==s || !fd_number(&t,e,&x,&integer,unit))return 0;
+            double degrees=!strcmp(unit,"deg")?x:!strcmp(unit,"grad")?x*0.9:!strcmp(unit,"rad")?x*57.29577951308232:
+                           !strcmp(unit,"turn")?x*360:NAN;
+            if(!(degrees>=-90 && degrees<=90))return 0;
+            sb_putc(out,' ');fd_put_number(out,x);sb_puts(out,unit);s=t;
+        }
+        return skip_ws(s,e)==e;
+    }
+    case CSS_FONT_WEIGHT: {
+        unsigned weights[2]={400,400};int count=0;
+        for(;;){
+            const char *t=skip_ws(s,e);
+            if(t==e)break;
+            if(count==2 || (count && t==s))return 0;
+            if(count)sb_putc(out,' ');
+            if(fd_keyword(&t,e,word)){
+                if(!count && !strcmp(word,"auto") && skip_ws(t,e)==e){sb_puts(out,word);if(m)m->weight_lo=m->weight_hi=400;return 1;}
+                if(!strcmp(word,"normal"))weights[count]=400;else if(!strcmp(word,"bold"))weights[count]=700;else return 0;
+                sb_puts(out,word);
+            }else{
+                if(!fd_number(&t,e,&x,&integer,unit) || unit[0] || !(x>=1 && x<=1000))return 0;
+                weights[count]=(unsigned)(x+0.5);fd_put_number(out,x);
+            }
+            count++;s=t;
+        }
+        if(!count)return 0;
+        /* A reversed range is swapped where it is used (CSS Fonts 4 4.5). */
+        if(m){m->weight_lo=MIN(weights[0],weights[count-1]);m->weight_hi=MAX(weights[0],weights[count-1]);}
+        return 1;
+    }
+    case CSS_FONT_WIDTH: return fd_percentages(s,e,out,widths,2,true);
+    case CSS_FONT_UNICODE_RANGE: {
+        struct web_font_range *ranges;size_t count;
+        int status=font_ranges_parse(s,e,&ranges,&count);
+        if(status<=0)return status;
+        for(size_t i=0;i<count;i++){
+            char t[40];
+            if(ranges[i].first==ranges[i].last)snprintf(t,sizeof t,"%sU+%X",i?", ":"",(unsigned)ranges[i].first);
+            else snprintf(t,sizeof t,"%sU+%X-%X",i?", ":"",(unsigned)ranges[i].first,(unsigned)ranges[i].last);
+            sb_puts(out,t);
+        }
+        if(m){font_ranges_merge(&ranges,&count);m->ranges=ranges;m->range_count=count;}else free(ranges);
+        return 1;
+    }
+    case CSS_FONT_FEATURE_SETTINGS: return fd_tag_list(s,e,out,true);
+    case CSS_FONT_VARIATION_SETTINGS: return fd_tag_list(s,e,out,false);
+    case CSS_FONT_DISPLAY: {
+        static const char *const displays[]={"auto","block","swap","fallback","optional",NULL};
+        if(!fd_keyword(&s,e,word) || skip_ws(s,e)!=e)return 0;
+        for(int i=0;displays[i];i++)if(!strcmp(word,displays[i])){sb_puts(out,word);return 1;}
+        return 0;
+    }
+    case CSS_FONT_ASCENT_OVERRIDE: case CSS_FONT_DESCENT_OVERRIDE: case CSS_FONT_LINE_GAP_OVERRIDE:
+        return fd_percentages(s,e,out,normal,2,false);
+    case CSS_FONT_SIZE_ADJUST: return fd_percentages(s,e,out,NULL,1,false);
+    default: return 0;
+    }
+}
+/* Initial values: the FontFaceDescriptors defaults, as a rule without the
+   descriptor also reads (CSS Font Loading 2.1). */
+static const char *const font_desc_initial[CSS_FONT_DESCRIPTORS]={
+    [CSS_FONT_FAMILY]="",[CSS_FONT_STYLE]="normal",[CSS_FONT_WEIGHT]="normal",[CSS_FONT_WIDTH]="normal",
+    [CSS_FONT_UNICODE_RANGE]="U+0-10FFFF",[CSS_FONT_FEATURE_SETTINGS]="normal",[CSS_FONT_VARIATION_SETTINGS]="normal",
+    [CSS_FONT_DISPLAY]="auto",[CSS_FONT_ASCENT_OVERRIDE]="normal",[CSS_FONT_DESCENT_OVERRIDE]="normal",
+    [CSS_FONT_LINE_GAP_OVERRIDE]="normal",[CSS_FONT_SIZE_ADJUST]="100%"
+};
+static uint64_t font_face_serials;
+int css_font_descriptor(enum css_font_descriptor which,const char *value,size_t n,char **serialized) {
+    *serialized=NULL;
+    if((unsigned)which>=CSS_FONT_DESCRIPTORS)return 0;
+    sbuf out={0};int status=1;
+    if(which==CSS_FONT_FAMILY)fd_put_family(&out,value,n);
+    else status=font_desc_parse(which,value,n,&out,NULL);
+    if(status>0)*serialized=sb_cstr(&out);else sb_free(&out);
+    return status;
 }
 static void parse_font_face(struct pctx *pc,const char *s,const char *e,const struct mcond *media) {
+    static const struct {const char *name;enum css_font_descriptor which;} names[]={
+        {"font-style",CSS_FONT_STYLE},{"font-weight",CSS_FONT_WEIGHT},{"font-stretch",CSS_FONT_WIDTH},
+        {"font-width",CSS_FONT_WIDTH},{"unicode-range",CSS_FONT_UNICODE_RANGE},
+        {"font-feature-settings",CSS_FONT_FEATURE_SETTINGS},{"font-variation-settings",CSS_FONT_VARIATION_SETTINGS},
+        {"font-display",CSS_FONT_DISPLAY},{"ascent-override",CSS_FONT_ASCENT_OVERRIDE},
+        {"descent-override",CSS_FONT_DESCENT_OVERRIDE},{"line-gap-override",CSS_FONT_LINE_GAP_OVERRIDE},
+        {"size-adjust",CSS_FONT_SIZE_ADJUST}};
     struct font_face *f=ar_alloc(pc->a,sizeof *f);memset(f,0,sizeof *f);
     f->weight_lo=f->weight_hi=400;f->media=media;f->layer=pc->layer;
+    for(int i=0;i<CSS_FONT_DESCRIPTORS;i++)f->desc[i]=font_desc_initial[i];
     while(s<e) {
         const char *end=scan_to(s,e,";"),*colon=scan_to(s,end,":"),*name_end=colon;
         const char *name=skip_ws(s,name_end);trim_r(name,&name_end);
@@ -2023,33 +2307,38 @@ static void parse_font_face(struct pctx *pc,const char *s,const char *e,const st
             size_t n=(size_t)(name_end-name);
             if(n==11 && strn_ieq(name,"font-family",n)) {
                 const char *cursor=value,*family=css_font_family_next(pc->a,&cursor,ve);
-                if(family && cursor==ve)f->family=family;
+                if(family && cursor==ve){
+                    f->family=family;
+                    sbuf b={0};fd_put_family(&b,family,strlen(family));
+                    f->desc[CSS_FONT_FAMILY]=ar_strndup(pc->a,b.p?b.p:"",b.n);sb_free(&b);
+                }
             } else if(n==3 && strn_ieq(name,"src",n)) {
                 struct font_source *sources=font_sources(pc,value,ve);
                 /* A list without any supported component is a parse error,
                    not a valid empty override of an earlier src descriptor. */
                 if(sources)f->sources=sources;
-            }
-            else if(n==13 && strn_ieq(name,"unicode-range",n)){
-                const struct web_font_range *ranges;size_t count;
-                if(parse_font_ranges(pc->a,value,ve,&ranges,&count)){f->ranges=ranges;f->range_count=count;}
-            }
-            else if(n==10 && strn_ieq(name,"font-style",n))f->italic=(ve-value>=6 && strn_ieq(value,"italic",6)) || (ve-value>=7 && strn_ieq(value,"oblique",7));
-            else if(n==11 && strn_ieq(name,"font-weight",n)) {
-                if(ve-value==6 && strn_ieq(value,"normal",6))f->weight_lo=f->weight_hi=400;
-                else if(ve-value==4 && strn_ieq(value,"bold",4))f->weight_lo=f->weight_hi=700;
-                else {
-                    char *text=ar_strndup(pc->a,value,(size_t)(ve-value)),*tail;
-                    unsigned long lo=strtoul(text,&tail,10),hi=lo;
-                    if(tail!=text){while(is_space((unsigned char)*tail))tail++;if(*tail)hi=strtoul(tail,&tail,10);
-                        while(is_space((unsigned char)*tail))tail++;
-                        if(!*tail && lo>=1 && lo<=1000 && hi>=lo && hi<=1000){f->weight_lo=(unsigned)lo;f->weight_hi=(unsigned)hi;}}
+            } else for(size_t i=0;i<sizeof names/sizeof *names;i++) {
+                if(strlen(names[i].name)!=n || !strn_ieq(name,names[i].name,n))continue;
+                /* An invalid declaration leaves the previous valid one. */
+                sbuf b={0};struct font_desc m={.weight_lo=f->weight_lo,.weight_hi=f->weight_hi,.italic=f->italic};
+                int status=font_desc_parse(names[i].which,value,(size_t)(ve-value),&b,&m);
+                if(status<0){sb_free(&b);free(m.ranges);ar_alloc(pc->a,SIZE_MAX);}
+                if(status>0){
+                    f->desc[names[i].which]=ar_strndup(pc->a,b.p?b.p:"",b.n);
+                    f->weight_lo=m.weight_lo;f->weight_hi=m.weight_hi;f->italic=m.italic;
+                    if(names[i].which==CSS_FONT_UNICODE_RANGE){
+                        struct web_font_range *ranges=m.range_count?ar_alloc(pc->a,m.range_count*sizeof *ranges):NULL;
+                        if(m.range_count)memcpy(ranges,m.ranges,m.range_count*sizeof *ranges);
+                        f->ranges=ranges;f->range_count=m.range_count;
+                    }
                 }
+                free(m.ranges);sb_free(&b);break;
             }
         }
         s=end<e?end+1:e;
     }
     if(!f->family || !f->sources)return;
+    f->id=__atomic_add_fetch(&font_face_serials,1,__ATOMIC_RELAXED);
     if(pc->sh->fonts_last)pc->sh->fonts_last->next=f;else pc->sh->fonts=f;
     pc->sh->fonts_last=f;
 }
@@ -2675,6 +2964,21 @@ static void font_bindings_clear(void) {
     free(font_bindings);font_bindings=NULL;font_binding_count=font_binding_capacity=0;
 }
 static struct font_face *scoped_font_face(web_doc *d, node_t *scope, const char *family, unsigned weight, bool italic, int vw, int vh);
+/* The resource of a source: a FontFace's own, or the document's for a rule
+   URL (workers only find the identities build_ctx published). */
+static struct web_font_resource *font_source_resource(web_doc *d,const struct font_source *src) {
+    if(src->resource)return src->resource;
+    if(!css_worker())return doc_font_resource(d,src->url);
+    struct web_font_resource *r=d->fonts;
+    while(r && strcmp(r->url,src->url))r=r->next;
+    return r;
+}
+/* Rendering selected a FontFace: the user agent loads it as if load() had
+   been called (CSS Font Loading 2.2), which its document's realm observes. */
+static void font_face_used(web_doc *d,const struct font_face *f) {
+    if(f->author && !__atomic_exchange_n(&f->author->started,true,__ATOMIC_RELAXED))
+        __atomic_add_fetch(&d->font_generation,1,__ATOMIC_RELAXED);
+}
 static font_t *select_web_font_uncached(web_doc *d,node_t *node,style_t *style,int vw,int vh,arena_t *a) {
     if(!style->font_names)return NULL;
     const char *cursor=style->font_names,*end=cursor+strlen(cursor);
@@ -2691,10 +2995,9 @@ static font_t *select_web_font_uncached(web_doc *d,node_t *node,style_t *style,i
         /* Restricted faces are selected per character below, never as the
            metrics/raster face for every character in the entire family. */
         if(best->range_count)continue;
+        font_face_used(d,best);
         for(struct font_source *src=best->sources;src;src=src->next) {
-            struct web_font_resource *r=NULL;
-            if(css_worker()) { for(r=d->fonts;r && strcmp(r->url,src->url);r=r->next) {} }
-            else r=doc_font_resource(d,src->url);
+            struct web_font_resource *r=font_source_resource(d,src);
             if(!r){ar_alloc(a,SIZE_MAX);return NULL;}
             if(r->failed)continue;
             __atomic_store_n(&r->wanted,true,__ATOMIC_RELAXED);return r->face;
@@ -3473,6 +3776,18 @@ static struct cascade_layer *binding_layer(const struct css_binding *binding,con
     struct cascade_layer *layer=map?(syntax?map->layers[syntax->id]:map->outer):NULL;
     return layer&&layer->depth?layer:NULL;
 }
+/* Font matching distance of a face for a computed weight and slope. */
+static unsigned font_face_score(const struct font_face *f,unsigned weight,bool italic) {
+    unsigned distance=weight<f->weight_lo?f->weight_lo-weight:weight>f->weight_hi?weight-f->weight_hi:0;
+    return distance+(italic!=f->italic?10000u:0u);
+}
+/* A FontFace of document.fonts takes part in matching once its family and
+   descriptors parsed; it follows the document's rules, as its font source
+   orders them (CSS Font Loading 3), and wins equal matches as the later face. */
+static struct css_font_face *author_font_face(web_doc *d,int i) {
+    struct css_font_face *a=d->author_fonts.v[i];
+    return a->face.family?a:NULL;
+}
 static struct font_face *scoped_font_face(web_doc *d,node_t *root,const char *family,unsigned weight,bool italic,int vw,int vh) {
     struct css_scope *scope=root?root->style_scope:NULL;
     struct font_face *best=NULL;unsigned score=UINT_MAX;
@@ -3481,48 +3796,61 @@ static struct font_face *scoped_font_face(web_doc *d,node_t *root,const char *fa
     for(struct css_binding *binding=scope?scope->first:NULL;binding;binding=binding->next)
         for(struct font_face *f=binding->index->fonts;f;f=f->next) {
             if(strcasecmp(family,f->family)||!font_conditions_ok(f->media,vw,vh,scripting))continue;
-            unsigned distance=weight<f->weight_lo?f->weight_lo-weight:weight>f->weight_hi?weight-f->weight_hi:0;
-            unsigned candidate=distance+(italic!=f->italic?10000u:0u);
+            unsigned candidate=font_face_score(f,weight,italic);
             struct cascade_layer *layer=binding_layer(binding,f->layer);
             if(candidate<score || (candidate==score && (!best || layer_compare(layer,best_layer)>=0))) {
                 best=f;score=candidate;best_layer=layer;
             }
         }
+    for(int i=0;i<d->author_fonts.n;i++){
+        struct css_font_face *a=author_font_face(d,i);
+        if(!a || strcasecmp(family,a->face.family))continue;
+        unsigned candidate=font_face_score(&a->face,weight,italic);
+        if(candidate<=score){best=&a->face;score=candidate;best_layer=NULL;}
+    }
     return best;
+}
+struct ranked_font_choice {struct web_font_choice choice;struct cascade_layer *layer;};
+/* Add f's first usable source to a family's composite, by layer priority. */
+static bool font_choice_add(web_doc *d,struct font_face *f,struct cascade_layer *layer,
+                            struct web_font_choice **family_first,bool *restricted,arena_t *a) {
+    for(struct font_source *src=f->sources;src;src=src->next){
+        struct web_font_resource *r=font_source_resource(d,src);
+        if(!r){ar_alloc(a,SIZE_MAX);return false;}if(r->failed)continue;
+        struct ranked_font_choice *ranked=ar_alloc(a,sizeof *ranked);
+        struct web_font_choice *choice=&ranked->choice;ranked->layer=layer;
+        *choice=(struct web_font_choice){.resource=r,.face=r->face,.range_count=f->range_count};
+        if(f->range_count){struct web_font_range *ranges=ar_alloc(a,f->range_count*sizeof *ranges);memcpy(ranges,f->ranges,f->range_count*sizeof *ranges);choice->ranges=ranges;*restricted=true;}
+        struct web_font_choice **position=family_first;
+        while(*position && layer_compare(ranked->layer,((struct ranked_font_choice *)*position)->layer)<0)position=&(*position)->next;
+        choice->next=*position;*position=choice;break;
+    }
+    return true;
 }
 static const struct web_font_choice *select_font_choices(web_doc *d,node_t *node,style_t *style,int vw,int vh,arena_t *a) {
     if(!style->font_names)return NULL;
     node_t *root=doc_node_root(node,false);struct css_scope *scope=root?root->style_scope:NULL;
     const char *cursor=style->font_names,*end=cursor+strlen(cursor);
-    struct web_font_choice *first=NULL,**tail=&first;bool restricted=false;
+    struct web_font_choice *first=NULL,**tail=&first;bool restricted=false,italic=style->font_style!=0;
     while(cursor<end){
         const char *token=skip_ws(cursor,end);bool quoted=token<end&&(*token=='"'||*token=='\'');
         const char *family=css_font_family_next(a,&cursor,end);if(!family||!cursor)break;
         if(!quoted&&(!strcasecmp(family,"serif")||!strcasecmp(family,"sans-serif")||!strcasecmp(family,"monospace")||
            !strcasecmp(family,"system-ui")||!strcasecmp(family,"cursive")||!strcasecmp(family,"fantasy")))break;
-        struct font_face *best=scoped_font_face(d,root,family,style->font_weight,style->font_style!=0,vw,vh);
+        struct font_face *best=scoped_font_face(d,root,family,style->font_weight,italic,vw,vh);
         if(!best)continue;
-        unsigned distance=style->font_weight<best->weight_lo?best->weight_lo-style->font_weight:style->font_weight>best->weight_hi?style->font_weight-best->weight_hi:0;
-        unsigned score=distance+((style->font_style!=0)!=best->italic?10000u:0u);
+        unsigned score=font_face_score(best,style->font_weight,italic);
         struct web_font_choice *family_first=NULL;
         for(struct css_binding *b=scope?scope->first:NULL;b;b=b->next)for(struct font_face *f=b->index->fonts;f;f=f->next){
             if(strcasecmp(family,f->family)||!font_conditions_ok(f->media,vw,vh,d->sty.index_scripting))continue;
-            unsigned delta=style->font_weight<f->weight_lo?f->weight_lo-style->font_weight:style->font_weight>f->weight_hi?style->font_weight-f->weight_hi:0;
-            if(delta+((style->font_style!=0)!=f->italic?10000u:0u)!=score)continue;
-            for(struct font_source *src=f->sources;src;src=src->next){
-                struct web_font_resource *r;
-                if(css_worker()){for(r=d->fonts;r&&strcmp(r->url,src->url);r=r->next){}}
-                else r=doc_font_resource(d,src->url);
-                if(!r){ar_alloc(a,SIZE_MAX);return NULL;}if(r->failed)continue;
-                struct ranked_font_choice {struct web_font_choice choice;struct cascade_layer *layer;};
-                struct ranked_font_choice *ranked=ar_alloc(a,sizeof *ranked);
-                struct web_font_choice *choice=&ranked->choice;ranked->layer=binding_layer(b,f->layer);
-                *choice=(struct web_font_choice){.resource=r,.face=r->face,.range_count=f->range_count};
-                if(f->range_count){struct web_font_range *ranges=ar_alloc(a,f->range_count*sizeof *ranges);memcpy(ranges,f->ranges,f->range_count*sizeof *ranges);choice->ranges=ranges;restricted=true;}
-                struct web_font_choice **position=&family_first;
-                while(*position && layer_compare(ranked->layer,((struct ranked_font_choice *)*position)->layer)<0)position=&(*position)->next;
-                choice->next=*position;*position=choice;break;
-            }
+            if(font_face_score(f,style->font_weight,italic)!=score)continue;
+            if(!font_choice_add(d,f,binding_layer(b,f->layer),&family_first,&restricted,a))return NULL;
+        }
+        for(int i=0;i<d->author_fonts.n;i++){
+            struct css_font_face *author=author_font_face(d,i);
+            if(!author || strcasecmp(family,author->face.family) || font_face_score(&author->face,style->font_weight,italic)!=score)continue;
+            /* A text run that needs a code point in its range requests it. */
+            if(!font_choice_add(d,&author->face,NULL,&family_first,&restricted,a))return NULL;
         }
         if(family_first){*tail=family_first;while(*tail)tail=&(*tail)->next;}
     }
@@ -3581,6 +3909,383 @@ void css_refresh_font_selection(web_doc *d) {
         ar_free(scratch);
     }
     ar_free(scratch);free(scratch);
+}
+
+/* ---------------------------------------------------------------- CSS Font Loading
+   The native half of https://drafts.csswg.org/css-font-loading-3/: the
+   document's CSS-connected faces (its @font-face rules), FontFace records,
+   their load status and "find the matching font faces". js_fonts.h binds it. */
+static void font_viewport(web_doc *d,int *vw,int *vh) {
+    *vw=d->styled_w>0?d->styled_w:d->width>0?d->width:800;
+    *vh=d->styled_h>0?d->styled_h:d->height>0?d->height:600;
+}
+/* The document's font source begins with a FontFace per @font-face rule of
+   its style sheets (not a shadow root's), in document order: the cascade's
+   sheet order, imports before their importer's rules. 0: unavailable now
+   (cancelled native work); the caller keeps what it knew. */
+int css_font_rules(web_doc *d,struct css_font_rule **rules,size_t *count) {
+    *rules=NULL;*count=0;
+    if(!d)return 1;
+    if(d->native_cancelled || !sheets_sort(d))return 0;
+    int vw,vh;font_viewport(d,&vw,&vh);bool scripting=web_js_enabled(d);
+    const pvec *sh=&d->sty.sheets;
+    struct css_font_rule *v=NULL;size_t n=0,capacity=0;
+    for(int i=0;i<sh->n;i++){
+        const sheet_t *s=sh->v[i];
+        if(s->ua || s->scope || !s->fonts || !sheet_media_ok(s,vw,vh,scripting))continue;
+        uint32_t occurrence=0;
+        for(int j=0;j<i;j++){
+            const sheet_t *p=sh->v[j];
+            if(p->ast==s->ast && !p->ua && !p->scope && sheet_media_ok(p,vw,vh,scripting))occurrence++;
+        }
+        for(struct font_face *f=s->fonts;f;f=f->next){
+            if(!font_conditions_ok(f->media,vw,vh,scripting))continue;
+            if(n==capacity){
+                size_t cap=capacity?capacity*2:16;
+                void *grown=cap<=SIZE_MAX/sizeof *v?realloc(v,cap*sizeof *v):NULL;
+                if(!grown){free(v);return -1;}
+                v=grown;capacity=cap;
+            }
+            /* The shared AST's arena owns the rule (cssom.c may move it). */
+            v[n++]=(struct css_font_rule){f,s->ast?s->ast->arena:s->arena,f->id,occurrence};
+        }
+    }
+    *rules=v;*count=n;return 1;
+}
+const char *css_font_rule_descriptor(const struct font_face *face,enum css_font_descriptor which) {
+    return face && (unsigned)which<CSS_FONT_DESCRIPTORS?face->desc[which]:NULL;
+}
+/* Load status of a face's src list, as CSS Fonts' "load a font" walks it: a
+   failed source moves on to the next. started (a load() or a rendering use)
+   demands the first untried source; a rule whose earlier source failed has
+   been started by whoever used that resource. */
+static enum css_font_status font_sources_status(web_doc *d,struct font_source *src,bool started) {
+    bool tried=started;
+    for(;src;src=src->next){
+        struct web_font_resource *r=font_source_resource(d,src);
+        if(!r)return tried?CSS_FONT_LOADING:CSS_FONT_UNLOADED;
+        if(r->failed){tried=true;continue;}
+        if(r->done)return CSS_FONT_LOADED;
+        if(r->loading)return CSS_FONT_LOADING;
+        if(!tried && !r->demanded)return CSS_FONT_UNLOADED;
+        r->demanded=true; /* request_fonts sends it at the end of this tick */
+        return CSS_FONT_LOADING;
+    }
+    return tried?CSS_FONT_ERROR:CSS_FONT_UNLOADED;
+}
+enum css_font_status css_font_rule_status(web_doc *d,struct font_face *face,bool started) {
+    return face?font_sources_status(d,face->sources,started):CSS_FONT_ERROR;
+}
+/* Changing a font source or a face in it re-matches every element's fonts;
+   committed shaping and min-content measurements used the old selection. */
+static void font_source_changed(web_doc *d) {
+    if(!d || !d->live)return;
+    css_mark_dirty(d,NULL);d->dirty=true;
+    d->layout_valid=false;layout_invalidate_fonts(d->root_box);
+}
+/* A CSS-connected FontFace's attribute writes its rule's descriptor too (CSS
+   Font Loading 2.3). The rule's sheet arena keeps the new text. */
+int css_font_rule_set(web_doc *d,const struct css_font_rule *rule,enum css_font_descriptor which,const char *value,size_t n) {
+    if(!rule || !rule->face || !rule->arena || (unsigned)which>=CSS_FONT_DESCRIPTORS)return 0;
+    struct font_face *f=rule->face;
+    sbuf b={0};struct font_desc m={.weight_lo=f->weight_lo,.weight_hi=f->weight_hi,.italic=f->italic};
+    int status=1;
+    if(which==CSS_FONT_FAMILY)fd_put_family(&b,value,n);
+    else status=font_desc_parse(which,value,n,&b,&m);
+    if(status<=0){sb_free(&b);free(m.ranges);return status;}
+    arena_t *a=rule->arena;jmp_buf trap,*previous=a->trap;a->trap=&trap;
+    if(setjmp(trap)){a->trap=previous;sb_free(&b);free(m.ranges);return -1;}
+    const char *text=ar_strndup(a,b.p?b.p:"",b.n);
+    const char *family=which==CSS_FONT_FAMILY?ar_strndup(a,value,n):NULL;
+    struct web_font_range *ranges=which==CSS_FONT_UNICODE_RANGE&&m.range_count?ar_alloc(a,m.range_count*sizeof *ranges):NULL;
+    a->trap=previous;
+    if(ranges)memcpy(ranges,m.ranges,m.range_count*sizeof *ranges);
+    f->desc[which]=text;
+    if(family)f->family=family;
+    if(which==CSS_FONT_UNICODE_RANGE){f->ranges=ranges;f->range_count=m.range_count;}
+    f->weight_lo=m.weight_lo;f->weight_hi=m.weight_hi;f->italic=m.italic;
+    sb_free(&b);free(m.ranges);
+    font_source_changed(d);
+    return 1;
+}
+struct css_font_face *css_font_face_new(void) {
+    struct css_font_face *f=calloc(1,sizeof *f);
+    if(!f)return NULL;
+    f->refs=1;f->face.author=f;f->face.weight_lo=f->face.weight_hi=400;
+    f->face.id=__atomic_add_fetch(&font_face_serials,1,__ATOMIC_RELAXED);
+    for(int i=0;i<CSS_FONT_DESCRIPTORS;i++)f->face.desc[i]=font_desc_initial[i];
+    return f;
+}
+static void font_face_sources_free(struct css_font_face *f) {
+    while(f->face.sources){
+        struct font_source *src=f->face.sources;f->face.sources=src->next;
+        free((char *)src->url);free(src);
+    }
+}
+/* Never touches the resources: the record may outlive their document. */
+void css_font_face_release(struct css_font_face *f) {
+    if(!f || --f->refs)return;
+    for(int i=0;i<CSS_FONT_DESCRIPTORS;i++)free(f->names[i]);
+    free(f->family);free(f->ranges);font_face_sources_free(f);free(f);
+}
+uint64_t css_font_face_id(const struct css_font_face *f) { return f?f->face.id:0; }
+const char *css_font_face_descriptor(const struct css_font_face *f,enum css_font_descriptor which) {
+    return f && (unsigned)which<CSS_FONT_DESCRIPTORS?f->face.desc[which]:NULL;
+}
+/* Whether some document font source holds f (its wrapper holds one reference). */
+static bool font_face_in_set(const struct css_font_face *f) { return f->refs>1; }
+int css_font_face_set(web_doc *d,struct css_font_face *f,enum css_font_descriptor which,const char *value,size_t n) {
+    if(!f || (unsigned)which>=CSS_FONT_DESCRIPTORS)return 0;
+    sbuf b={0};struct font_desc m={.weight_lo=f->face.weight_lo,.weight_hi=f->face.weight_hi,.italic=f->face.italic};
+    int status=1;
+    if(which==CSS_FONT_FAMILY)fd_put_family(&b,value,n);
+    else status=font_desc_parse(which,value,n,&b,&m);
+    if(status<=0){sb_free(&b);free(m.ranges);return status;}
+    if(which==CSS_FONT_FAMILY){
+        /* The FontFace family is the literal name it matches (an invalid
+           <family-name> is that name as a string), not a parsed list. */
+        char *name=malloc(n+1);
+        if(!name){sb_free(&b);return -1;}
+        memcpy(name,value,n);name[n]=0;
+        free(f->family);f->family=name;f->face.family=name;
+    }
+    free(f->names[which]);f->names[which]=sb_cstr(&b);f->face.desc[which]=f->names[which];
+    f->face.weight_lo=m.weight_lo;f->face.weight_hi=m.weight_hi;f->face.italic=m.italic;
+    if(which==CSS_FONT_UNICODE_RANGE){free(f->ranges);f->ranges=m.ranges;f->face.ranges=m.ranges;f->face.range_count=m.range_count;}
+    else free(m.ranges);
+    if(font_face_in_set(f))font_source_changed(d);
+    return 1;
+}
+/* format() and tech() hints after a url(), syntactically. */
+static bool font_src_hints_syntax(const char *s,const char *e) {
+    while((s=skip_ws(s,e))<e){
+        const char *name=s;
+        while(s<e && ident_char((unsigned char)*s))s++;
+        size_t n=(size_t)(s-name);
+        if(!n || s>=e || *s!='(' || !((n==6 && strn_ieq(name,"format",6)) || (n==4 && strn_ieq(name,"tech",4))))return false;
+        const char *close=scan_to(s+1,e,")");
+        if(close>=e)return false;
+        s=close+1;
+    }
+    return true;
+}
+/* A FontFace string source parses as the src descriptor (CSS Fonts 4
+   forgiving <font-src-list>): invalid components drop, and only a list with
+   none valid is a syntax error. local() is valid but no native face answers
+   it, so that component always fails to load. */
+int css_font_face_source(web_doc *d,struct css_font_face *f,const char *base,const char *value,size_t n) {
+    if(!d || !f)return 0;
+    arena_t *scratch=calloc(1,sizeof *scratch);
+    if(!scratch)return -1;
+    struct font_source *first=NULL,**tail=&first;
+    jmp_buf trap;scratch->trap=&trap;scratch->chunk_size=1024;
+    if(setjmp(trap)){
+        ar_free(scratch);free(scratch);
+        return -1;
+    }
+    struct pctx pc={.a=scratch,.base=base};
+    bool valid=false;
+    struct font_source *found=NULL,**found_tail=&found;
+    for(const char *s=value,*e=value+n;s<e;){
+        const char *end=scan_to(s,e,","),*c=skip_ws(s,end),*z=end;trim_r(c,&z);
+        if(z-c>=4 && strn_ieq(c,"url(",4)){
+            const char *close=scan_to(c+4,z,")");
+            if(close<z && font_src_hints_syntax(close+1,z)){
+                valid=true;
+                struct font_source *sources=font_sources(&pc,c,z);
+                *found_tail=sources;while(*found_tail)found_tail=&(*found_tail)->next;
+            }
+        }else if(z-c>=6 && strn_ieq(c,"local(",6)){
+            const char *close=scan_to(c+6,z,")");
+            if(close==z-1 && skip_ws(c+6,close)<close)valid=true;
+        }
+        s=end<e?end+1:e;
+    }
+    scratch->trap=NULL;
+    /* Copy out of the scratch arena; each URL is a document resource. */
+    int status=valid?1:0;
+    for(struct font_source *src=valid?found:NULL;src;src=src->next){
+        struct font_source *copy=calloc(1,sizeof *copy);
+        char *url=copy?strdup(src->url):NULL;
+        struct web_font_resource *r=url?doc_font_resource(d,url):NULL;
+        if(!r){free(url);free(copy);status=-1;break;}
+        copy->url=url;copy->resource=r;*tail=copy;tail=&copy->next;
+    }
+    ar_free(scratch);free(scratch);
+    if(status<=0){
+        while(first){struct font_source *src=first;first=src->next;free((char *)src->url);free(src);}
+        return status;
+    }
+    font_face_sources_free(f);f->face.sources=first;
+    return 1;
+}
+int css_font_face_data(web_doc *d,struct css_font_face *f,const void *bytes,size_t n) {
+    if(!d || !f)return 0;
+    font_t *face=bytes && n?font_open_memory(bytes,n):NULL;
+    if(!face)return 0;
+    struct web_font_resource *r=calloc(1,sizeof *r);
+    struct font_source *src=r?calloc(1,sizeof *src):NULL;
+    if(!src){free(r);font_close(face);return -1;}
+    /* Styles may borrow the face after the record goes: the document keeps it. */
+    r->face=face;r->done=true;r->next=d->font_data;d->font_data=r;
+    src->resource=r;font_face_sources_free(f);f->face.sources=src;f->data=r;
+    if(font_face_in_set(f))font_source_changed(d);
+    return 1;
+}
+enum css_font_status css_font_face_status(web_doc *d,struct css_font_face *f,bool load) {
+    if(!f)return CSS_FONT_ERROR;
+    if(load)__atomic_store_n(&f->started,true,__ATOMIC_RELAXED);
+    if(f->data)return f->data->face?CSS_FONT_LOADED:CSS_FONT_ERROR;
+    /* Until load() or a rendering use, a FontFace stays unloaded even when
+       another face already fetched the same URL. */
+    if(!__atomic_load_n(&f->started,__ATOMIC_RELAXED))return CSS_FONT_UNLOADED;
+    return font_sources_status(d,f->face.sources,true);
+}
+bool css_font_set_add(web_doc *d,struct css_font_face *f) {
+    if(!d || !f)return false;
+    for(int i=0;i<d->author_fonts.n;i++)if(d->author_fonts.v[i]==f)return true;
+    pv_push(&d->author_fonts,f);f->refs++;
+    font_source_changed(d);
+    return true;
+}
+void css_font_set_delete(web_doc *d,struct css_font_face *f) {
+    for(int i=0;d && i<d->author_fonts.n;i++)if(d->author_fonts.v[i]==f){
+        memmove(d->author_fonts.v+i,d->author_fonts.v+i+1,sizeof(void *)*(size_t)(d->author_fonts.n-i-1));
+        d->author_fonts.n--;css_font_face_release(f);font_source_changed(d);return;
+    }
+}
+void css_font_set_clear(web_doc *d) {
+    if(!d || !d->author_fonts.n)return;
+    for(int i=0;i<d->author_fonts.n;i++)css_font_face_release(d->author_fonts.v[i]);
+    d->author_fonts.n=0;font_source_changed(d);
+}
+void css_font_set_free(web_doc *d) {
+    for(int i=0;i<d->author_fonts.n;i++)css_font_face_release(d->author_fonts.v[i]);
+    pv_free(&d->author_fonts);
+}
+/* CSS Font Loading 3.1: a CSS-wide keyword, or a var()/env()/attr() that
+   nothing can substitute here, is a syntax error before the font shorthand
+   grammar runs. Strings may still contain those words. */
+static bool font_query_plain(const char *s,size_t n) {
+    static const char *const wide[]={"inherit","initial","unset","revert","revert-layer","default",NULL};
+    const char *e=s+n;s=skip_ws(s,e);trim_r(s,&e);
+    for(int i=0;wide[i];i++)if((size_t)(e-s)==strlen(wide[i]) && strn_ieq(s,wide[i],(size_t)(e-s)))return false;
+    for(const char *p=s;p<e;p++){
+        if(*p=='"' || *p=='\''){char q=*p++;while(p<e && *p!=q){if(*p=='\\')p++;p++;}continue;}
+        if(*p=='\\'){p++;continue;}
+        if(p>s && ident_char((unsigned char)p[-1]))continue;
+        static const char *const functions[]={"var(","env(","attr(",NULL};
+        for(int i=0;functions[i];i++){
+            size_t k=strlen(functions[i]);
+            if((size_t)(e-p)>=k && !strncasecmp(p,functions[i],k))return false;
+        }
+    }
+    return true;
+}
+static bool font_text_points(const char *text,size_t n,uint32_t **points,size_t *count) {
+    *points=NULL;*count=0;
+    uint32_t *v=n?malloc(n*sizeof *v):NULL;
+    if(n && !v)return false;
+    size_t k=0;
+    for(size_t i=0;i<n;){
+        unsigned char c=(unsigned char)text[i];uint32_t cp;size_t len;
+        if(c<0x80){cp=c;len=1;}
+        else if((c&0xe0)==0xc0 && i+1<n){cp=((c&0x1fu)<<6)|(text[i+1]&0x3fu);len=2;}
+        else if((c&0xf0)==0xe0 && i+2<n){cp=((c&0x0fu)<<12)|((text[i+1]&0x3fu)<<6)|(text[i+2]&0x3fu);len=3;}
+        else if((c&0xf8)==0xf0 && i+3<n){cp=((c&0x07u)<<18)|((text[i+1]&0x3fu)<<12)|((text[i+2]&0x3fu)<<6)|(text[i+3]&0x3fu);len=4;}
+        else {cp=0xfffd;len=1;}
+        v[k++]=cp;i+=len;
+    }
+    *points=v;*count=k;return true;
+}
+/* Whether a face's unicode-range covers any code point of the text. */
+static bool font_face_covers(const struct font_face *f,const uint32_t *points,size_t count) {
+    if(!count)return false;
+    if(!f->range_count)return true;
+    for(size_t i=0;i<count;i++){
+        size_t lo=0,hi=f->range_count;
+        while(lo<hi){size_t mid=lo+(hi-lo)/2;if(points[i]>f->ranges[mid].last)lo=mid+1;else hi=mid;}
+        if(lo<f->range_count && points[i]>=f->ranges[lo].first)return true;
+    }
+    return false;
+}
+struct font_match_work {
+    struct css_font_rule *rules;size_t rule_count;
+    struct css_font_match *matches;size_t count,capacity;
+    uint32_t *points;size_t point_count;
+};
+static bool font_match_push(struct font_match_work *w,struct css_font_match match) {
+    for(size_t i=0;i<w->count;i++)
+        if(w->matches[i].id==match.id && w->matches[i].occurrence==match.occurrence && w->matches[i].author==match.author)return true;
+    if(w->count==w->capacity){
+        size_t cap=w->capacity?w->capacity*2:8;
+        void *grown=cap<=SIZE_MAX/sizeof *w->matches?realloc(w->matches,cap*sizeof *w->matches):NULL;
+        if(!grown)return false;
+        w->matches=grown;w->capacity=cap;
+    }
+    w->matches[w->count++]=match;return true;
+}
+/* For each family of the font list, the faces font matching selects (all of
+   a composite face's unicode-range parts), then only those covering a code
+   point of the text. System fonts are never listed: they are loaded. */
+int css_font_match(web_doc *d,const char *font,size_t n,const char *text,size_t tn,
+                   struct css_font_match **matches,size_t *count) {
+    *matches=NULL;*count=0;
+    if(!d || !font_query_plain(font,n))return 0;
+    const struct propdef *p=css_prop_lookup("font",4);
+    if(!p || !css_value_supported(p,font,n))return 0;
+    struct font_match_work *w=calloc(1,sizeof *w);
+    arena_t *arena=calloc(1,sizeof *arena);
+    if(!w || !arena || css_font_rules(d,&w->rules,&w->rule_count)<0 || !font_text_points(text,tn,&w->points,&w->point_count)){
+        if(w){free(w->rules);free(w);}
+        free(arena);return -1;
+    }
+    int status=-1;
+    jmp_buf trap;arena->trap=&trap;arena->chunk_size=4096;
+    if(!setjmp(trap)){
+        style_t parent,st;css_style_init(&parent,NULL);css_style_init(&st,&parent);
+        int vw,vh;font_viewport(d,&vw,&vh);
+        uint8_t *set=ar_alloc(arena,(size_t)css_prop_count());
+        struct cx cx={.s=&st,.parent=&parent,.em=parent.font_size,.rem=16,.vw=(float)vw,.vh=(float)vh,.a=arena,.set=set};
+        status=0;
+        if(css_apply(p,font,n,&cx) && !cx.invalid && st.font_names) {
+            status=1;
+            bool italic=st.font_style!=0;
+            const char *cursor=st.font_names,*end=cursor+strlen(cursor);
+            while(status>0 && cursor<end){
+                const char *token=skip_ws(cursor,end);bool quoted=token<end && (*token=='"' || *token=='\'');
+                const char *family=css_font_family_next(arena,&cursor,end);
+                if(!family || !cursor)break;
+                if(!quoted && (!strcasecmp(family,"serif") || !strcasecmp(family,"sans-serif") || !strcasecmp(family,"monospace") ||
+                   !strcasecmp(family,"system-ui") || !strcasecmp(family,"cursive") || !strcasecmp(family,"fantasy")))continue;
+                unsigned best=UINT_MAX;
+                for(size_t i=0;i<w->rule_count;i++)
+                    if(!strcasecmp(family,w->rules[i].face->family))best=MIN(best,font_face_score(w->rules[i].face,st.font_weight,italic));
+                for(int i=0;i<d->author_fonts.n;i++){
+                    struct css_font_face *a=author_font_face(d,i);
+                    if(a && !strcasecmp(family,a->face.family))best=MIN(best,font_face_score(&a->face,st.font_weight,italic));
+                }
+                if(best==UINT_MAX)continue;
+                for(size_t i=0;i<w->rule_count && status>0;i++){
+                    struct font_face *f=w->rules[i].face;
+                    if(strcasecmp(family,f->family) || font_face_score(f,st.font_weight,italic)!=best ||
+                       !font_face_covers(f,w->points,w->point_count))continue;
+                    if(!font_match_push(w,(struct css_font_match){w->rules[i].id,w->rules[i].occurrence,NULL}))status=-1;
+                }
+                for(int i=0;i<d->author_fonts.n && status>0;i++){
+                    struct css_font_face *a=author_font_face(d,i);
+                    if(!a || strcasecmp(family,a->face.family) || font_face_score(&a->face,st.font_weight,italic)!=best ||
+                       !font_face_covers(&a->face,w->points,w->point_count))continue;
+                    if(!font_match_push(w,(struct css_font_match){a->face.id,0,a}))status=-1;
+                }
+            }
+        }
+    }
+    arena->trap=NULL;ar_free(arena);free(arena);
+    free(w->rules);free(w->points);
+    if(status>0){*matches=w->matches;*count=w->count;}else free(w->matches);
+    free(w);
+    return status;
 }
 
 static void css_ctx_free(struct css_ctx *x) {
@@ -3773,100 +4478,13 @@ static bool hint_reaches_descendants(const node_t *e, const char *name) {
 }
 
 /* ---------------------------------------------------------------- the cascade */
-struct css_animation {
-    struct css_animation *next;
-    uint32_t id;
-    uint8_t pseudo;
-    char *text;
-    struct css_declarations *declarations;
-};
-/* Playback owns only a name/time/identity, never an AST or computed-style
-   pointer. The supervisor ticks after joins; workers publish disjoint nodes
-   onto the document list with CAS and read one supervisor clock snapshot. */
-struct css_motion_state {
-    struct css_motion_state *next;
-    web_doc *document;
-    node_t *node;
-    char *name;
-    uint64_t last;
-    double elapsed;
-    bool paused, running;
-    bool requested; /* marked for a sample; the cascade takes it, not the clock */
-};
-static void css_motion_reset(node_t *n) {
-    if(n && n->css_motion){n->css_motion->node=NULL;n->css_motion->running=false;n->css_motion=NULL;}
-}
-void css_motion_doc_free(web_doc *d) {
-    while(d->css_motions) {
-        struct css_motion_state *s=d->css_motions;d->css_motions=s->next;
-        if(s->node && s->node->css_motion==s)s->node->css_motion=NULL;
-        free(s->name);free(s);
-    }
-}
-void css_motion_tick(web_doc *d,uint64_t now) {
-    if(!d || __atomic_load_n(&d->native_cancelled,__ATOMIC_ACQUIRE))return;
-    struct css_motion_state **slot=&d->css_motions;
-    while(*slot) {
-        struct css_motion_state *s=*slot;
-        if(!s->node){*slot=s->next;free(s->name);free(s);continue;}
-        slot=&s->next;
-        /* HTML "update the rendering" leaves a hidden document out of "update animations and
-           send events", so nothing samples its animations. Their timeline does not stop
-           (Web Animations: the document timeline's current time follows the "now" timestamp
-           and changes only when animations are updated): the first sample after the document
-           is visible again adds the whole hidden interval to elapsed (motion_sample), so the
-           animation stands where its start time puts it, not where it was hidden. */
-        if(!d->visible)continue;
-        if(!s->node || !s->running || s->requested || now<s->last || now-s->last<16)continue;
-        if(doc_node_root(s->node,true)!=d->root){css_motion_reset(s->node);continue;}
-        /* A sample changes the element's own values, never what any selector
-           matches: no sibling, ancestor or :has() subject restyles with it.
-           Nor the layout: what it repaints is bounded when its style publishes. */
-        mark_style_own(d,s->node);d->restyle_dirty=true;s->requested=true;
-    }
-}
-int64_t css_motion_deadline(web_doc *d) {
-    if(!d || !d->visible || __atomic_load_n(&d->native_cancelled,__ATOMIC_ACQUIRE))return -1; /* css_motion_tick */
-    uint64_t deadline=UINT64_MAX;
-    for(struct css_motion_state *s=d->css_motions;s;s=s->next)if(s->node && s->running && !s->requested) {
-        uint64_t due=s->last>UINT64_MAX-16?UINT64_MAX:s->last+16;
-        if(due<deadline)deadline=due;
-    }
-    return deadline>(uint64_t)INT64_MAX?-1:(int64_t)deadline;
-}
-int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text) {
-    struct css_animation **slot = &n->animations;
-    while (*slot && ((*slot)->id != id || (*slot)->pseudo != pseudo)) {
-        slot = &(*slot)->next;
-    }
-    struct css_animation *old = *slot;
-    if (!text || !*text) {
-        if (!old) return 0;
-        *slot = old->next; declarations_free(&old->declarations); free(old->text); free(old); return 1;
-    }
-    if (old && !strcmp(old->text, text)) return 0;
-    char *copy = strdup(text);
-    if (!copy) return -1;
-    if (old) { free(old->text); old->text = copy; return 1; }
-    struct css_animation *a = malloc(sizeof *a);
-    if (!a) { free(copy); return -1; }
-    *a = (struct css_animation){.id=id, .pseudo=pseudo, .text=copy};
-    *slot = a; return 1;
-}
-void css_animation_free(node_t *n) {
-    css_motion_reset(n);
-    while (n->animations) {
-        struct css_animation *a = n->animations;
-        n->animations = a->next;
-        declarations_free(&a->declarations); free(a->text); free(a);
-    }
-}
 struct dent {
     const struct decl *d;
     uint64_t key;
     uint8_t pseudo;
     int scope_depth;
-    bool animation;
+    bool animation;  /* the animation or transition origin (CSS Cascade 5 §6.1) */
+    bool transition; /* the transition origin, above every other */
     bool inline_style;
     struct cascade_layer *layer;
 };
@@ -3892,7 +4510,7 @@ static void add_dent(const struct decl *d, uint64_t key, uint8_t pseudo, int dep
     dents[ndents].key = d->important ? (key ^ (1ull << 62)) | (1ull << 63) : key;
     dents[ndents].pseudo = pseudo;
     dents[ndents].scope_depth = depth;
-    dents[ndents].animation = false;
+    dents[ndents].animation = dents[ndents].transition = false;
     dents[ndents].inline_style=false;dents[ndents].layer=NULL;
     ndents++;
 }
@@ -4023,6 +4641,7 @@ static void collect_scope(node_t *root, const struct element_keys *k) {
 
 static int cmp_dent(const void *a, const void *b) {
     const struct dent *da = a, *db = b;
+    if (da->transition != db->transition) return da->transition ? -1 : 1;
     /* Animation origin beats normal styles, never !important. It must not
        acquire author inline specificity or the shadow encapsulation order. */
     if (da->animation != db->animation) {
@@ -4228,6 +4847,13 @@ static struct var_walk *var_dependency(struct var_walk *f, const struct var_walk
     f->s = e; return NULL;
 }
 
+static bool value_references(const char *s);
+static bool subst(const char *s, size_t n, const struct custom_prop *vars, sbuf *out);
+bool css_substitute(const style_t *st, const char *v, sbuf *out) {
+    size_t n = strlen(v);
+    if (!value_references(v)) { sb_put(out, v, n); return true; }
+    return subst(v, n, st ? st->vars : NULL, out);
+}
 static bool value_references(const char *s) {
     if (!s) return false;
     size_t n = strlen(s);
@@ -4382,7 +5008,7 @@ static void apply_decl(struct cascade *c, struct cx *cx, const struct dent *entr
     if(was_rollback)for(int i=0;i<count;i++)if(hidden[i])cx->set[i]=0;
 }
 
-static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uint8_t pseudo, bool underlying) {
+static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uint8_t pseudo) {
     web_doc *d = c->d;
     style_t *s = style_slot_alloc(d, e, c->a);
     css_style_init(s, parent);
@@ -4403,7 +5029,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     struct custom_rollback {const char *name;struct css_rollback state;struct custom_rollback *next;} *custom_rollbacks=NULL;
     size_t own = 0;
     for (int i = 0; i < ndents; i++)
-        if (dents[i].pseudo == pseudo && !dents[i].d->p && !(underlying && dents[i].animation)) own++;
+        if (dents[i].pseudo == pseudo && !dents[i].d->p) own++;
     struct var_segment *segment = NULL;
     if (own >= VAR_SEGMENT_INDEX_MIN) {
         size_t capacity = var_slot_capacity(own);
@@ -4412,7 +5038,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     }
     for (int i = 0; i < ndents; i++) {
         const struct decl *x = dents[i].d;
-        if (dents[i].pseudo != pseudo || x->p || (underlying && dents[i].animation)) continue;
+        if (dents[i].pseudo != pseudo || x->p) continue;
         bool dup = false;
         if (segment) dup = var_slot_get(segment->slots, segment->capacity, x->name, strlen(x->name)) != NULL;
         else for (struct custom_prop *m = mine; m; m = m->next)
@@ -4456,11 +5082,11 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
         if(block_container){cx.cq_height=block_container->container_height;cx.cq_height_set=true;}
     }
     for (int i = 0; i < ndents; i++)
-        if ((!underlying || !dents[i].animation) && dents[i].pseudo == pseudo && dents[i].d->p && css_prop_is_font(dents[i].d->p)) apply_decl(c, &cx, &dents[i],rollback,&has_rollback);
+        if (dents[i].pseudo == pseudo && dents[i].d->p && css_prop_is_early(dents[i].d->p)) apply_decl(c, &cx, &dents[i],rollback,&has_rollback);
     cx.font_pass = false;
     cx.em = s->font_size;
     for (int i = 0; i < ndents; i++)
-        if ((!underlying || !dents[i].animation) && dents[i].pseudo == pseudo && dents[i].d->p) apply_decl(c, &cx, &dents[i],rollback,&has_rollback);
+        if (dents[i].pseudo == pseudo && dents[i].d->p) apply_decl(c, &cx, &dents[i],rollback,&has_rollback);
     if (!pseudo) web_dialog_style(d,e,s);
     if(pseudo==PE_BACKDROP) {
         if(s->position!=POS_FIXED && s->position!=POS_ABSOLUTE)s->position=POS_ABSOLUTE;
@@ -4484,18 +5110,6 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     return s;
 }
 
-static double motion_eased(const struct css_easing *e,double x) {
-    if(e->kind==CM_STEP_START)return 1;
-    if(e->kind==CM_STEP_END)return x>=1?1:0;
-    if(e->kind==CM_LINEAR || x<=0 || x>=1)return x;
-    double lo=0,hi=1,t=x;
-    for(unsigned i=0;i<30;i++) {
-        double u=1-t,z=3*u*u*t*e->x1+3*u*t*t*e->x2+t*t*t;
-        if(fabs(z-x)<1e-9)break;
-        if(z<x)lo=t;else hi=t;t=(lo+hi)/2;
-    }
-    double u=1-t;return 3*u*u*t*e->y1+3*u*t*t*e->y2+t*t*t;
-}
 static const struct opacity_keyframes *motion_keyframes(struct cascade *c,node_t *n,const char *name) {
     node_t *root=doc_node_root(n,false);
     /* Bindings are already ordered (including imports) and filtered by owner
@@ -4519,289 +5133,116 @@ static const struct opacity_keyframes *motion_keyframes(struct cascade *c,node_t
     }
     return NULL;
 }
-static struct css_motion_state *motion_state(struct cascade *c,node_t *n,const char *name) {
-    struct css_motion_state *state=n->css_motion;
-    if(state && (state->document!=c->d || strcmp(state->name,name)))css_motion_reset(n),state=NULL;
-    if(!state) {
-        state=calloc(1,sizeof *state);char *copy=strdup(name);
-        if(!state || !copy){free(state);free(copy);ar_alloc(c->a,SIZE_MAX);return NULL;}
-        state->node=n;state->document=c->d;state->name=copy;state->last=c->d->css_motion_now;
-        struct css_motion_state *head;
-        do { head=__atomic_load_n(&c->d->css_motions,__ATOMIC_RELAXED);state->next=head; }
-        while(!__atomic_compare_exchange_n(&c->d->css_motions,&head,state,false,__ATOMIC_RELEASE,__ATOMIC_RELAXED));
-        n->css_motion=state;
-    }
-    return state;
-}
-/* One keyframe's animatable values. Only properties the native motion
-   sampler interpolates are applied; the rest keep their cascaded value. */
-struct motion_frame {
-    float opacity;
-    const struct css_transform *transform;
-    struct css_easing easing;
-    bool has_opacity, has_transform;
-};
-static bool motion_frame_value(struct cascade *c,node_t *n,const style_t *base,const style_t *parent,
-    const struct opacity_frame *frame,struct motion_frame *out) {
-    uint8_t bits[css_prop_count()];memset(bits,0,sizeof bits);
-    style_t temp=*base;
-    struct cx cx={.s=&temp,.parent=parent,.node=n,.em=base->font_size,.rem=c->rem,
-        .vw=(float)c->vw,.vh=(float)c->vh,.a=c->a,.set=bits};
-    struct css_rollback rollback[css_prop_count()];bool has_rollback=false;
-    struct dent entry={.animation=true};
-    const struct propdef *opacity_prop=css_prop_lookup("opacity",7),*transform_prop=css_prop_lookup("transform",9),
-        *timing_prop=css_prop_lookup("animation-timing-function",25);
-    out->has_opacity=out->has_transform=false;
-    /* Same-offset blocks cascade in source order; the last valid declaration
-       in each block wins. Invalid later values do not erase valid earlier ones. */
-    for(int i=frame->count-1;i>=0;i--) {
-        const struct decl *x=&frame->decls[i];if(x->important || !x->p)continue;
-        entry.d=x;
-        if(x->p==opacity_prop || x->p==transform_prop){
-            int at=css_prop_index(x->p);bool before=bits[at];apply_decl(c,&cx,&entry,rollback,&has_rollback);
-            if(!before && bits[at]){if(x->p==opacity_prop)out->has_opacity=true;else out->has_transform=true;}
-        }
-        else if(x->p==timing_prop)apply_decl(c,&cx,&entry,rollback,&has_rollback);
-    }
-    out->opacity=temp.opacity;out->transform=temp.transform;out->easing=temp.motion.easing;
-    return out->has_opacity || out->has_transform;
-}
-/* ------------------------------------------------ transform interpolation */
-static void motion_number(sbuf *b,double v){
-    /* Fixed notation: the CSS number grammar is not printf's %g. */
-    if(!isfinite(v) || fabs(v)<5e-7)v=0;
-    if(v>1e15)v=1e15;else if(v< -1e15)v=-1e15;
-    char text[48];int len=snprintf(text,sizeof text,"%.6f",v);
-    while(len>1 && text[len-1]=='0')text[--len]=0;
-    if(len>1 && text[len-1]=='.')text[--len]=0;
-    if(!strcmp(text,"-0"))strcpy(text,"0");
-    sb_puts(b,text);
-}
-static bool motion_length(struct cascade *c,sbuf *b,const len_t *x,const len_t *y,double p){
-    static const len_t zero={.kind=LK_LEN};
-    if(x->kind!=LK_LEN && x->kind!=LK_EXPR)x=&zero;
-    if(y->kind!=LK_LEN && y->kind!=LK_EXPR)y=&zero;
-    if(x->kind==LK_LEN && y->kind==LK_LEN){
-        double px=x->px+(y->px-x->px)*p,pct=x->pct+(y->pct-x->pct)*p;
-        if(fabs(pct)<1e-9){motion_number(b,px);sb_puts(b,"px");return true;}
-        sb_puts(b,"calc(");motion_number(b,px);sb_puts(b,"px + ");motion_number(b,pct);sb_puts(b,"%)");return true;
-    }
-    /* Calculated lengths keep percentages unresolved: blend the expressions. */
-    sbuf ta={0},tb={0};
-    bool ok=css_length_serialize(x,&ta,c->d) && css_length_serialize(y,&tb,c->d);
-    if(ok){
-        sb_puts(b,"calc(");sb_puts(b,sb_cstr(&ta));sb_puts(b," * ");motion_number(b,1-p);
-        sb_puts(b," + ");sb_puts(b,sb_cstr(&tb));sb_puts(b," * ");motion_number(b,p);sb_putc(b,')');
-    }
-    sb_free(&ta);sb_free(&tb);return ok;
-}
-static bool motion_axis(const struct css_transform *t,double axis[3]){
-    double x=t->v[0],y=t->v[1],z=t->v[2],length=sqrt(x*x+y*y+z*z);
-    if(!(length>0) || !isfinite(length))return false;
-    axis[0]=x/length;axis[1]=y/length;axis[2]=z/length;return true;
-}
-/* The neutral function of t's kind used to pad the shorter list. */
-static struct css_transform motion_identity(const struct css_transform *t){
-    struct css_transform r={.xy={{.kind=LK_LEN},{.kind=LK_LEN}},.kind=t->kind};
-    if(t->kind==CT_SCALE)r.v[0]=r.v[1]=r.v[2]=1;
-    if(t->kind==CT_ROTATE){r.v[0]=t->v[0];r.v[1]=t->v[1];r.v[2]=t->v[2];}
-    for(int i=0;i<4;i++)r.m[i*5]=1;
-    return r;
-}
-/* CSS Transforms: lists interpolate function by function when every pair
-   shares a primitive (rotations need a common axis). */
-static bool motion_lists_match(const struct css_transform *a,const struct css_transform *b){
-    for(;a||b;a=a?a->next:NULL,b=b?b->next:NULL){
-        const struct css_transform *t=a?a:b;
-        if(t->kind==CT_MATRIX || t->kind==CT_PERSPECTIVE)return false;
-        if(!a || !b)continue;
-        if(a->kind!=b->kind)return false;
-        if(a->kind==CT_ROTATE && a->v[3]!=0 && b->v[3]!=0){
-            double p[3],q[3];
-            if(!motion_axis(a,p) || !motion_axis(b,q))return false;
-            if(fabs(p[0]-q[0])>1e-6 || fabs(p[1]-q[1])>1e-6 || fabs(p[2]-q[2])>1e-6)return false;
-        }
-    }
-    return true;
-}
-/* Writes a(1-p)+b·p function by function; with a==b and p==0 it is an exact
-   serialization of any list, matrices and perspective included. */
-static bool motion_write_pairs(struct cascade *c,sbuf *b,const struct css_transform *x,const struct css_transform *y,double p){
-    bool first=true;
-    for(;x||y;x=x?x->next:NULL,y=y?y->next:NULL){
-        struct css_transform ix,iy;
-        const struct css_transform *s=x,*e=y;
-        if(!s){ix=motion_identity(e);s=&ix;}
-        if(!e){iy=motion_identity(s);e=&iy;}
-        if(!first)sb_putc(b,' ');
-        first=false;
-        double v[4];for(int i=0;i<4;i++)v[i]=s->v[i]+(e->v[i]-s->v[i])*p;
-        switch(s->kind){
-        case CT_TRANSLATE:
-            sb_puts(b,v[0]?"translate3d(":"translate(");
-            if(!motion_length(c,b,&s->xy[0],&e->xy[0],p))return false;
-            sb_puts(b,", ");
-            if(!motion_length(c,b,&s->xy[1],&e->xy[1],p))return false;
-            if(v[0]){sb_puts(b,", ");motion_number(b,v[0]);sb_puts(b,"px");}
-            sb_putc(b,')');break;
-        case CT_SCALE:
-            sb_puts(b,v[2]!=1?"scale3d(":"scale(");motion_number(b,v[0]);sb_puts(b,", ");motion_number(b,v[1]);
-            if(v[2]!=1){sb_puts(b,", ");motion_number(b,v[2]);}
-            sb_putc(b,')');break;
-        case CT_ROTATE:{
-            double axis[3]={0,0,1};
-            if(!motion_axis(s->v[3]!=0 || e->v[3]==0?s:e,axis)){axis[0]=axis[1]=0;axis[2]=1;}
-            double angle=s->v[3]+(e->v[3]-s->v[3])*p;
-            if(axis[0]==0 && axis[1]==0 && axis[2]>0){sb_puts(b,"rotate(");motion_number(b,angle);sb_puts(b,"rad)");}
-            else{
-                sb_puts(b,"rotate3d(");
-                for(int i=0;i<3;i++){motion_number(b,axis[i]);sb_puts(b,", ");}
-                motion_number(b,angle);sb_puts(b,"rad)");
+/* The animation and transition origins. animation.c owns the records, the time model and the
+   sampling; the cascade gives it each site's styles and @keyframes and takes the sampled
+   longhands back as declarations of those origins. */
+struct motion_cascade { struct cascade *c; node_t *node; uint8_t pseudo; bool transition; };
+/* CSS Animations 2 §4.3 the keyframes of a CSSAnimation: the rule's blocks by offset (blocks at
+   one offset are one keyframe, already joined by the parser), a block's animation-timing-function
+   its easing (else the element's) and its animation-composition its composite. */
+static const struct web_keyframe *motion_frames(void *arg, const char *name, const struct css_easing *easing, uint32_t *count) {
+    struct motion_cascade *m = arg;
+    struct cascade *c = m->c;
+    const struct opacity_keyframes *key = motion_keyframes(c, m->node, name);
+    if (!key) return NULL;
+    uint32_t n = 0;
+    for (const struct opacity_frame *f = key->first; f; f = f->next) n++;
+    struct web_keyframe *frames = ar_alloc(c->a, (n ? n : 1) * sizeof *frames);
+    const struct propdef *timing = css_prop_lookup("animation-timing-function", 25),
+                         *composition = css_prop_lookup("animation-composition", 21);
+    uint32_t i = 0;
+    for (const struct opacity_frame *f = key->first; f; f = f->next, i++) {
+        struct web_keyframe *k = &frames[i];
+        *k = (struct web_keyframe){.offset = f->offset, .easing = *easing, .composite = WA_COMPOSITE_AUTO};
+        k->values = ar_alloc(c->a, (size_t)(f->count ? f->count : 1) * sizeof *k->values);
+        for (int j = 0; j < f->count; j++) {
+            const struct decl *x = &f->decls[j];
+            if (!x->p || x->important) continue; /* CSS Animations 1 §3: !important in a keyframe is ignored */
+            const char *v = x->value, *end = v + strlen(v);
+            v = skip_ws(v, end); trim_r(v, &end);
+            if (x->p == timing) {
+                struct css_easing e;
+                if (css_easing_parse(v, (size_t)(end - v), &e)) k->easing = e;
+                continue;
             }
-            break;
-        }
-        case CT_SKEW:
-            sb_puts(b,"skew(");motion_number(b,v[0]);sb_puts(b,"rad, ");motion_number(b,v[1]);sb_puts(b,"rad)");break;
-        case CT_PERSPECTIVE:
-            if(!(v[0]>0)){sb_puts(b,"perspective(none)");break;}
-            sb_puts(b,"perspective(");motion_number(b,v[0]);sb_puts(b,"px)");break;
-        case CT_MATRIX:
-            sb_puts(b,"matrix3d(");
-            for(int col=0;col<4;col++)for(int row=0;row<4;row++){
-                double value=s->m[row*4+col]+(e->m[row*4+col]-s->m[row*4+col])*p;
-                motion_number(b,value);if(col<3 || row<3)sb_puts(b,", ");
+            if (x->p == composition) {
+                size_t len = (size_t)(end - v);
+                if (len == 7 && strn_ieq(v, "replace", 7)) k->composite = CM_COMPOSITE_REPLACE;
+                else if (len == 3 && strn_ieq(v, "add", 3)) k->composite = CM_COMPOSITE_ADD;
+                else if (len == 10 && strn_ieq(v, "accumulate", 10)) k->composite = CM_COMPOSITE_ACCUMULATE;
+                continue;
             }
-            sb_putc(b,')');break;
-        default:return false;
+            if (css_prop_is_motion(x->p)) continue; /* animation-* and transition-* do not animate */
+            k->values[k->count++] = (struct web_keyframe_value){.p = x->p, .text = (char *)x->value};
         }
     }
-    if(first)sb_puts(b,"none");
-    return true;
+    /* by offset, blocks at one offset in source order (insertion sort: stable, and short) */
+    for (uint32_t a = 1; a < n; a++) {
+        struct web_keyframe f = frames[a];
+        uint32_t b = a;
+        for (; b > 0 && frames[b - 1].offset > f.offset; b--) frames[b] = frames[b - 1];
+        frames[b] = f;
+    }
+    *count = n;
+    return frames;
 }
-struct motion_2d { double tx,ty,sx,sy,angle,m11,m12,m21,m22; };
-/* CSS Transforms 1 §"Interpolation of matrices", 2D decomposition. */
-static bool motion_decompose(const struct css_transform *t,const box_t *box,struct motion_2d *out){
-    float w=0,h=0;
-    if(box){w=box->w+box->p[1]+box->p[3]+box->b[1]+box->b[3];h=box->h+box->p[0]+box->p[2]+box->b[0]+box->b[2];}
-    else for(const struct css_transform *x=t;x;x=x->next)
-        if(x->kind==CT_TRANSLATE && (len_has_pct(&x->xy[0]) || len_has_pct(&x->xy[1])))return false;
-    double m[16];css_transform_list_matrix(t,w,h,m);
-    double r0x=m[0],r0y=m[4],r1x=m[1],r1y=m[5];
-    out->tx=m[3];out->ty=m[7];
-    out->sx=sqrt(r0x*r0x+r0y*r0y);out->sy=sqrt(r1x*r1x+r1y*r1y);
-    if(r0x*r1y-r0y*r1x<0){if(r0x<r1y)out->sx=-out->sx;else out->sy=-out->sy;}
-    if(out->sx){r0x/=out->sx;r0y/=out->sx;}
-    if(out->sy){r1x/=out->sy;r1y/=out->sy;}
-    out->angle=atan2(r0y,r0x);
-    if(out->angle){
-        double sn=-r0y,cs=r0x,a=r0x,b=r0y,cc=r1x,d=r1y;
-        r0x=cs*a+sn*cc;r0y=cs*b+sn*d;r1x=-sn*a+cs*cc;r1y=-sn*b+cs*d;
-    }
-    out->m11=r0x;out->m12=r0y;out->m21=r1x;out->m22=r1y;
-    const double *f=&out->tx;for(int i=0;i<9;i++)if(!isfinite(f[i]))return false;
-    return true;
+static void motion_emit(void *arg, const struct propdef *p, const char *value) {
+    struct motion_cascade *m = arg;
+    struct cascade *c = m->c;
+    struct decl *x = ar_alloc(c->a, sizeof *x);
+    *x = (struct decl){.p = p, .value = ar_strdup(c->a, value)};
+    add_dent(x, 0, m->pseudo, 0);
+    dents[ndents - 1].animation = true;
+    dents[ndents - 1].transition = m->transition;
 }
-static bool motion_matrix_blend(sbuf *b,const struct css_transform *x,const struct css_transform *y,const box_t *box,double p){
-    struct motion_2d A,B;
-    if(!motion_decompose(x,box,&A) || !motion_decompose(y,box,&B))return false;
-    if((A.sx<0 && B.sy<0) || (A.sy<0 && B.sx<0)){A.sx=-A.sx;A.sy=-A.sy;A.angle+=A.angle<0?M_PI:-M_PI;}
-    if(!A.angle)A.angle=2*M_PI;
-    if(!B.angle)B.angle=2*M_PI;
-    if(fabs(A.angle-B.angle)>M_PI){if(A.angle>B.angle)A.angle-=2*M_PI;else B.angle-=2*M_PI;}
-    struct motion_2d R;double *r=&R.tx;const double *a=&A.tx,*q=&B.tx;
-    for(int i=0;i<9;i++)r[i]=a[i]+(q[i]-a[i])*p;
-    /* rows = diag(sx,sy) · rotate · remainder */
-    double cs=cos(R.angle),sn=sin(R.angle);
-    double n11=cs*R.m11+sn*R.m21,n12=cs*R.m12+sn*R.m22,n21=-sn*R.m11+cs*R.m21,n22=-sn*R.m12+cs*R.m22;
-    double values[6]={n11*R.sx,n12*R.sx,n21*R.sy,n22*R.sy,R.tx,R.ty};
-    sb_puts(b,"matrix(");
-    for(int i=0;i<6;i++){motion_number(b,values[i]);if(i<5)sb_puts(b,", ");}
-    sb_putc(b,')');return true;
+/* The style of one site with its effects. base: the style with none of them; CSS Animations
+   update from it and the animation origin is sampled into it (the after-change style, which
+   inherits from the parent's after-change style); CSS Transitions update from the before-change
+   style to that one, and the transition origin is sampled into the final style. A site with no
+   records, no animation-name and no transition duration costs one compute, as before. */
+static style_t *motion_compute(struct cascade *c, node_t *e, const style_t *parent, const style_t *parent_after,
+                               uint8_t pseudo, const style_t *before, style_t **base_out, style_t **after_out) {
+    style_t *base = compute(c, e, parent, pseudo);
+    *base_out = *after_out = NULL;
+    if (!c->d->animations) return base;
+    bool shown = base->display != D_NONE && (pseudo == PE_NONE || box_pseudo_generated(e, parent, base));
+    int want = web_motion_wanted(e, pseudo, shown ? base : NULL);
+    if (!want) return base;
+    if (!shown) web_motion_cancel(e, pseudo);
+    struct motion_cascade m = {c, e, pseudo, false};
+    struct web_motion_site site = {
+        .ctx = {.base = base, .parent = parent, .node = e, .box = e->box, .rem = c->rem, .vw = (float)c->vw,
+                .vh = (float)c->vh, .a = c->a, .d = c->d},
+        .pseudo = pseudo, .keyframes = motion_frames, .emit = motion_emit, .arg = &m};
+    if (shown && (want & 1)) web_motion_animations(&site);
+    uint8_t animated[css_prop_count()];
+    memset(animated, 0, sizeof animated);
+    size_t first = web_motion_sample(&site, false, animated), second = 0;
+    if (first) qsort(dents, (size_t)ndents, sizeof *dents, cmp_dent);
+    style_t *after = base;
+    bool after_inherits = true; /* after inherits from parent, not from parent_after */
+    if (shown && (want & 2)) {
+        const style_t *pa = parent_after ? parent_after : parent;
+        if (first || pa != parent) { after = compute(c, e, pa, pseudo); after_inherits = pa == parent; }
+        web_motion_transitions(&site, before, after, animated);
+        m.transition = true;
+        second = web_motion_sample(&site, true, animated);
+        if (second) qsort(dents, (size_t)ndents, sizeof *dents, cmp_dent);
+    }
+    style_t *final;
+    if (!first && !second) final = base;
+    else if (!second && after != base && after_inherits) final = after;
+    else final = compute(c, e, parent, pseudo);
+    final->animated = first || second;
+    /* the base style only where effects apply: elsewhere the style is the base */
+    if (final != base) *base_out = base;
+    if (after != final && after != base) *after_out = after;
+    return final;
 }
-static char *motion_transform_text(struct cascade *c,node_t *n,const struct css_transform *x,const struct css_transform *y,double p){
-    sbuf b={0};bool ok;
-    if(motion_lists_match(x,y))ok=motion_write_pairs(c,&b,x,y,p);
-    else{
-        ok=motion_matrix_blend(&b,x,y,n->box,p);
-        if(!ok){ /* not interpolable without a used size: discrete at 50% */
-            const struct css_transform *t=p<.5?x:y;sb_free(&b);b=(sbuf){0};
-            ok=motion_write_pairs(c,&b,t,t,0);
-        }
-    }
-    char *text=ok?ar_strdup(c->a,sb_cstr(&b)):NULL;sb_free(&b);return text;
-}
-struct motion_result { bool has_opacity; float opacity; char *transform; };
-static bool motion_sample(struct cascade *c,node_t *n,const style_t *base,const style_t *parent,struct motion_result *out) {
-    const struct css_motion *spec=&base->motion;
-    if(!spec->name || base->display==D_NONE || doc_node_root(n,true)!=c->d->root) {
-        css_motion_reset(n);return false;
-    }
-    const struct opacity_keyframes *key=motion_keyframes(c,n,spec->name);
-    if(!key){css_motion_reset(n);return false;} /* unresolved names do not start */
-    struct css_motion_state *state=motion_state(c,n,spec->name);if(!state)return false;
-    uint64_t now=c->d->css_motion_now;
-    if(!state->paused && now>=state->last)state->elapsed+=(double)(now-state->last);
-    state->last=now;state->paused=spec->paused;state->requested=false;
-    double local=state->elapsed-spec->delay;
-    double ad=spec->duration==0 || spec->iterations==0?0:(double)spec->duration*spec->iterations;
-    state->running=!spec->paused && state->elapsed<(double)spec->delay+ad;
-    double overall;
-    if(local<0) {
-        if(spec->fill!=CM_FILL_BACKWARDS && spec->fill!=CM_FILL_BOTH)return false;
-        overall=0;
-    } else if(local>=ad) {
-        if(spec->fill!=CM_FILL_FORWARDS && spec->fill!=CM_FILL_BOTH)return false;
-        overall=spec->iterations; if(!isfinite(overall))overall=1;
-    } else overall=spec->duration>0?local/spec->duration:0;
-    double iteration=floor(overall),progress=overall-iteration;
-    if(local>=ad && overall>0 && progress==0){progress=1;iteration-=1;}
-    bool reverse=spec->direction==CM_REVERSE ||
-        (spec->direction==CM_ALTERNATE && fmod(iteration,2)!=0) ||
-        (spec->direction==CM_ALTERNATE_REVERSE && fmod(iteration,2)==0);
-    if(reverse)progress=1-progress;
-    /* Each property picks its own surrounding keyframes; omitted endpoints
-       are the underlying (cascaded) value. */
-    float oleft=0,oright=1,olv=base->opacity,orv=base->opacity,tleft=0,tright=1;
-    const struct css_transform *tlv=base->transform,*trv=base->transform;
-    struct css_easing oease=spec->easing,tease=spec->easing;bool any_opacity=false,any_transform=false;
-    for(const struct opacity_frame *f=key->first;f;f=f->next) {
-        if(__atomic_load_n(&c->d->native_cancelled,__ATOMIC_ACQUIRE) ||
-            (css_can_service() && !web_native_checkpoint(c->d)))return false;
-        struct motion_frame frame;
-        if(!motion_frame_value(c,n,base,parent,f,&frame))continue;
-        if(frame.has_opacity){
-            any_opacity=true;
-            if(f->offset<=progress && f->offset>=oleft){oleft=f->offset;olv=frame.opacity;oease=frame.easing;}
-            if(f->offset>progress && f->offset<=oright){oright=f->offset;orv=frame.opacity;}
-        }
-        if(frame.has_transform){
-            any_transform=true;
-            if(f->offset<=progress && f->offset>=tleft){tleft=f->offset;tlv=frame.transform;tease=frame.easing;}
-            if(f->offset>progress && f->offset<=tright){tright=f->offset;trv=frame.transform;}
-        }
-    }
-    if(!any_opacity && !any_transform){state->running=false;return false;}
-    /* Backwards fill during the delay is the directed first endpoint, not
-       an easing sample: step-start must not jump before the active phase. */
-    out->has_opacity=any_opacity;out->transform=NULL;
-    if(any_opacity){
-        double fraction=oright>oleft?(progress-oleft)/(oright-oleft):0;
-        double p=local<0?fraction:motion_eased(&oease,fraction);
-        double value=olv+(orv-olv)*p;
-        out->opacity=(float)(value<0?0:value>1?1:value);
-    }
-    if(any_transform){
-        double fraction=tright>tleft?(progress-tleft)/(tright-tleft):0;
-        double p=local<0?fraction:motion_eased(&tease,fraction);
-        out->transform=motion_transform_text(c,n,tlv,trv,p);
-    }
-    return out->has_opacity || out->transform;
-}
-
 /* What a display: none element hides is its flat subtree: also the light children its slots
    take from a host above it, which are not its descendants. */
 static void clear_styles(node_t *n) {
-    n->animation_base_style = NULL;
+    n->animation_base_style = n->animation_after_style = NULL;
     if (n->shadow_root) clear_styles(n->shadow_root);
     for (node_t *c = n->first; c; c = c->next) {
         c->style = NULL;
@@ -4813,29 +5254,30 @@ static void clear_styles(node_t *n) {
             clear_styles(c);
         }
 }
-static void motion_hide_subtree(node_t *n) {
-    css_motion_reset(n);
-    if(n->shadow_root)motion_hide_subtree(n->shadow_root);
-    for(node_t *ch=n->first;ch;ch=ch->next)motion_hide_subtree(ch);
-    if(flat_slot(n))for(node_t *ch=n->slot_assigned_first;ch;ch=ch->assigned_next)motion_hide_subtree(ch);
+/* CSS Animations 2 §3, CSS Transitions 2 §3: display: none cancels what the subtree's style made */
+static void motion_cancel_subtree(node_t *n) {
+    if(n->owned)web_motion_cancel(n,-1);
+    if(n->shadow_root)motion_cancel_subtree(n->shadow_root);
+    for(node_t *ch=n->first;ch;ch=ch->next)motion_cancel_subtree(ch);
+    if(flat_slot(n))for(node_t *ch=n->slot_assigned_first;ch;ch=ch->assigned_next)motion_cancel_subtree(ch);
 }
 
 void css_node_style_free(node_t *n) {
     if (!n) return;
-    css_motion_reset(n);
     ar_free(&n->style_mem); ar_free(&n->style_previous_mem); ar_free(&n->style_inherit_mem);
     style_slots_free(&n->style_slots); style_slots_free(&n->style_previous_slots);
     declarations_free(&n->style_declarations);
-    n->style = n->animation_base_style = n->style_previous = NULL;
+    n->style = n->animation_base_style = n->animation_after_style = n->style_previous = NULL;
 }
 
 void css_node_style_unpublish(node_t *n) {
     if (!n) return;
-    css_motion_reset(n);
+    /* out of the document: its CSS animations and transitions are canceled */
+    if (n->owned) web_motion_cancel(n, -1);
     /* Detached inherited styles can borrow an ancestor's variable/font data.
        Keep their arenas alive until published box borrows have been retired,
        but never let a detached tree expose those ancestor-dependent styles. */
-    n->style = n->animation_base_style = NULL;
+    n->style = n->animation_base_style = n->animation_after_style = NULL;
     n->container_valid = false;
     n->query_inline_container=n->query_size_container=NULL;
     if (n->shadow_root) css_node_style_unpublish(n->shadow_root);
@@ -4977,6 +5419,11 @@ static void mark_style_self(web_doc *d, node_t *n) {
 static void mark_style_own(web_doc *d, node_t *n) {
     d->need_style = true;
     mark_style_self(d, n);
+}
+void css_mark_style_own(web_doc *d, node_t *n) {
+    if (!d || !n || n->type != N_ELEM || n->owner != d) return;
+    mark_style_own(d, n);
+    d->restyle_dirty = true;
 }
 /* The boundary when it is not known what a change reaches: n's subtree, or
    its parent's when some sheet has a sibling combinator. */
@@ -5470,7 +5917,7 @@ static bool same_translation(const style_t *a,const style_t *b){
        testing read the used translation live from the box style, so the
        samples only repaint; scrollable overflow follows at the next layout
        instead of relaying out a whole document sixty times a second. */
-    if(a->motion.name && b->motion.name)return true;
+    if(a->animated && b->animated)return true;
     bool general=css_transform_general(a);
     if(general!=css_transform_general(b))return false;
     if(general)return true;
@@ -5500,7 +5947,6 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     if(!same_translation(a,b))return false;
     if ((a->display == D_INLINE || b->display == D_INLINE) && (a->opacity < 1) != (b->opacity < 1)) return false;
     if(!equal_string(a->font_names,b->font_names) || !equal_string(a->content,b->content) ||
-        !equal_string(a->motion.name,b->motion.name) ||
         !equal_string(a->container_names,b->container_names) ||
         !equal_string(a->list_style_string,b->list_style_string) ||
         !equal_tracks(a->grid_cols,b->grid_cols) || !equal_tracks(a->grid_rows,b->grid_rows) ||
@@ -5530,7 +5976,8 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.rotate=y.rotate=x.scale=y.scale=NULL;
     memset(x.transform_origin,0,sizeof x.transform_origin);memset(y.transform_origin,0,sizeof y.transform_origin);
     x.transform_box=y.transform_box=0;
-    memset(&x.motion,0,sizeof x.motion);memset(&y.motion,0,sizeof y.motion); /* opacity timing is paint state */
+    memset(&x.motion,0,sizeof x.motion);memset(&y.motion,0,sizeof y.motion); /* timing lists are not layout */
+    x.animated=y.animated=false;
     x.font_names=y.font_names=NULL;x.font_choices=y.font_choices=NULL; x.content=y.content=NULL; x.list_style_string=y.list_style_string=NULL;
     x.container_names=y.container_names=NULL;
     x.grid_cols=y.grid_cols=x.grid_rows=y.grid_rows=x.grid_auto_cols=y.grid_auto_cols=x.grid_auto_rows=y.grid_auto_rows=NULL;
@@ -5545,6 +5992,8 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.bg_image=y.bg_image=x.mask_image=y.mask_image=NULL;
     x.bg_img=y.bg_img=x.mask_img=y.mask_img=0;
     x.color=y.color=x.bg_color=y.bg_color=0;
+    x.color_inherited=y.color_inherited=x.color_own=y.color_own=NULL;
+    x.color_scheme=y.color_scheme=0;x.color_scheme_text=y.color_scheme_text=NULL;
     memset(x.border_color,0,sizeof x.border_color);memset(y.border_color,0,sizeof y.border_color);
     x.outline_color=y.outline_color=0;x.outline_width=y.outline_width=x.outline_offset=y.outline_offset=0;
     x.outline_style=y.outline_style=0; /* outlines paint outside layout */
@@ -5570,7 +6019,7 @@ static bool transforms_equal(const struct css_transform *x, const struct css_tra
 static bool shadows_equal(const struct css_box_shadow *x, const struct css_box_shadow *y) {
     for (; x && y; x = x->next, y = y->next)
         if (x->x != y->x || x->y != y->y || x->blur != y->blur || x->spread != y->spread || x->color != y->color ||
-            x->inset != y->inset) return false;
+            x->inset != y->inset || !css_color_value_equal(x->color_value, y->color_value)) return false;
     return !x && !y;
 }
 static bool filters_equal(const struct css_filter *x, const struct css_filter *y) {
@@ -5600,7 +6049,8 @@ static bool gradients_equal(const struct gradient *x, const struct gradient *y) 
         x->to_x != y->to_x || x->to_y != y->to_y || x->rsize != y->rsize || x->angle != y->angle || x->n != y->n ||
         !css_length_equal(&x->at[0], &y->at[0]) || !css_length_equal(&x->at[1], &y->at[1])) return false;
     for (int i = 0; i < x->n; i++)
-        if (x->col[i] != y->col[i] || !css_length_equal(&x->pos[i], &y->pos[i])) return false;
+        if (x->col[i] != y->col[i] || !css_color_value_equal(x->col_value[i], y->col_value[i]) ||
+            !css_length_equal(&x->pos[i], &y->pos[i])) return false;
     return true;
 }
 static bool vars_equal(const struct custom_prop *x, const struct custom_prop *y) {
@@ -5624,7 +6074,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     if (!equal_string(a->container_names, b->container_names) || !equal_string(a->font_names, b->font_names) ||
         !equal_string(a->content, b->content) || !equal_string(a->list_style_string, b->list_style_string) ||
         !equal_string(a->bg_image, b->bg_image) || !equal_string(a->mask_image, b->mask_image) ||
-        !equal_string(a->motion.name, b->motion.name) || !equal_string(a->svg_fill.ref, b->svg_fill.ref) ||
+        !css_motion_equal(&a->motion, &b->motion) || !equal_string(a->svg_fill.ref, b->svg_fill.ref) ||
         !equal_string(a->svg_stroke.ref, b->svg_stroke.ref) || !shadows_equal(a->box_shadow, b->box_shadow) ||
         !filters_equal(a->filter, b->filter) || !clip_paths_equal(a->clip_path, b->clip_path) ||
         !transforms_equal(a->transform, b->transform) ||
@@ -5634,7 +6084,8 @@ static bool style_equal(const style_t *a, const style_t *b) {
         !equal_tracks(a->grid_auto_cols, b->grid_auto_cols) || !equal_tracks(a->grid_auto_rows, b->grid_auto_rows) ||
         !equal_areas(a->grid_areas, b->grid_areas) || !style_equal(a->before, b->before) ||
         !style_equal(a->after, b->after) || !style_equal(a->backdrop, b->backdrop) ||
-        !style_equal(a->placeholder, b->placeholder)) return false;
+        !style_equal(a->placeholder, b->placeholder) || !css_color_slots_equal(a, b) ||
+        !equal_string(a->color_scheme_text, b->color_scheme_text)) return false;
     for (int i = 0; i < 4; i++) if (!equal_string(a->grid_place[i].name, b->grid_place[i].name)) return false;
     style_t x = *a, y = *b;
     len_t *xl[] = {&x.object_pos[0], &x.object_pos[1], &x.line_height, &x.svg_stroke_width, &x.width, &x.height,
@@ -5662,10 +6113,12 @@ static bool style_equal(const style_t *a, const style_t *b) {
     x.font_choices = y.font_choices = NULL;
     x.container_names = y.container_names = x.font_names = y.font_names = x.content = y.content = NULL;
     x.list_style_string = y.list_style_string = x.bg_image = y.bg_image = x.mask_image = y.mask_image = NULL;
-    x.motion.name = y.motion.name = x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;
+    memset(&x.motion, 0, sizeof x.motion); memset(&y.motion, 0, sizeof y.motion);
+    x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;
     x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = NULL; x.clip_path = y.clip_path = NULL;
     x.transform = y.transform = x.rotate = y.rotate = x.scale = y.scale = NULL;
     x.gradient = y.gradient = NULL; x.vars = y.vars = NULL;
+    x.color_inherited = y.color_inherited = x.color_own = y.color_own = NULL; x.color_scheme_text = y.color_scheme_text = NULL;
     x.grid_cols = y.grid_cols = x.grid_rows = y.grid_rows = NULL;
     x.grid_auto_cols = y.grid_auto_cols = x.grid_auto_rows = y.grid_auto_rows = NULL;
     x.grid_areas = y.grid_areas = NULL;
@@ -5686,7 +6139,7 @@ void css_box_change_report(web_doc *d) {
         e->name?e->name:"?",id?id:"",cls?cls:"",css_style_layout_equal(a,b),a->display,b->display,a->position,b->position,
         a->overflow,b->overflow,a->before_generated,b->before_generated,a->after_generated,b->after_generated,
         css_translation_active(a),css_translation_active(b),css_transform_general(a),css_transform_general(b),
-        (double)a->opacity,(double)b->opacity,b->motion.name?b->motion.name:"none");
+        (double)a->opacity,(double)b->opacity,b->animated?"sampled":"none");
     web_js_console(d,1,line);
 }
 /* Descendants of an outermost <svg> generate no boxes: the root's atomic box
@@ -5911,41 +6364,6 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
             dents[ndents-1].inline_style=true;
         }
     }
-    /* CSS animations precede higher-priority script-created WAAPI effects.
-       Their omitted endpoints use the underlying cascade, never last frame's
-       computed opacity. The same normal declarations still outrank at the
-       important origin in cmp_dent(). */
-    bool motion_decl=e->css_motion!=NULL;
-    for(int i=0;!motion_decl && i<ndents;i++)if(css_prop_is_motion(dents[i].d->p))motion_decl=true;
-    style_t *motion_base=NULL;struct motion_result motion;
-    if(motion_decl) {
-        qsort(dents,(size_t)ndents,sizeof *dents,cmp_dent);
-        motion_base=compute(c,e,parent,PE_NONE,true);
-    }
-    if(motion_base && motion_sample(c,e,motion_base,parent,&motion)) {
-        if(motion.has_opacity){
-            char text[48];snprintf(text,sizeof text,"%.9g",(double)motion.opacity);
-            struct decl *sample=ar_alloc(c->a,sizeof *sample);
-            *sample=(struct decl){.p=css_prop_lookup("opacity",7),.value=ar_strdup(c->a,text)};
-            add_dent(sample,0,PE_NONE,0);dents[ndents-1].animation=true;
-        }
-        if(motion.transform){
-            struct decl *sample=ar_alloc(c->a,sizeof *sample);
-            *sample=(struct decl){.p=css_prop_lookup("transform",9),.value=motion.transform};
-            add_dent(sample,0,PE_NONE,0);dents[ndents-1].animation=true;
-        }
-    }
-    for (struct css_animation *a = e->animations; a; a = a->next) {
-        struct css_declarations *block = declarations_get(&a->declarations, a->text, d->base, c->a);
-        struct decl *ds = block->values; int nd = block->count;
-        for(int i=0;i<nd;i++)if(container_units_used(ds[i].value))
-            __atomic_store_n(&((struct css_ctx *)d->sty.ctx)->containers,true,__ATOMIC_RELEASE);
-        for (int i = 0; i < nd; i++) {
-            if (!ds[i].p || ds[i].important) continue;
-            add_dent(&ds[i], a->id, a->pseudo, 0);
-            dents[ndents - 1].animation = true;
-        }
-    }
     qsort(dents, (size_t)ndents, sizeof *dents, cmp_dent);
     bool has_before = false, has_after = false, has_placeholder = false;
     for (int i = 0; i < ndents; i++) {
@@ -5953,31 +6371,40 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
         if (dents[i].pseudo == PE_AFTER) has_after = true;
         if (dents[i].pseudo == PE_PLACEHOLDER) has_placeholder = true;
     }
-    style_t *s = compute(c, e, parent, PE_NONE, false);
+    /* CSS Transitions 1 §3: the after-change style inherits from the parent's */
+    node_t *flat_parent = doc_flat_parent(e);
+    const style_t *parent_after = flat_parent && flat_parent->style == parent ? flat_parent->animation_after_style : NULL;
+    style_t *base = NULL, *after = NULL;
+    style_t *s = motion_compute(c, e, parent, parent_after, PE_NONE, e->style_previous, &base, &after);
     e->style = s;
+    e->animation_base_style = base;
+    e->animation_after_style = after;
     /* Only controls with matching authored declarations get a pseudo body.
        Its slot retires with the originating node's other computed styles. */
     if (has_placeholder && !e->foreign && (e->tag == T_textarea ||
         (e->tag == T_input && web_input_type(e) <= WEB_INPUT_PASSWORD)))
-        s->placeholder = compute(c, e, s, PE_PLACEHOLDER, false);
-    e->animation_base_style = NULL;
-    if (e->animations || (motion_base && motion_base->motion.name)) {
-        style_t *base = motion_base?motion_base:compute(c,e,parent,PE_NONE,true);
-        if (has_before) base->before = compute(c, e, s, PE_BEFORE, true);
-        if (has_after) base->after = compute(c, e, s, PE_AFTER, true);
-        base->before_generated=box_pseudo_generated(e,base,base->before);
-        base->after_generated=box_pseudo_generated(e,base,base->after);
-        e->animation_base_style = base;
-    }
-    if (web_dialog_is_modal(d,e)) s->backdrop = compute(c,e,NULL,PE_BACKDROP,false);
+        s->placeholder = compute(c, e, s, PE_PLACEHOLDER);
+    if (web_dialog_is_modal(d,e)) s->backdrop = compute(c,e,NULL,PE_BACKDROP);
     if (e == d->html) c->rem = s->font_size;
     /* CSSOM exposes resolved pseudo styles even when content:none, display:none
        or the originating replaced element prevents a generated box. Keep the
        body in the existing style lifetime, not in a second queried-style cache. */
-    if (has_before) s->before = compute(c, e, s, PE_BEFORE, false);
-    if (has_after) s->after = compute(c, e, s, PE_AFTER, false);
+    const style_t *previous = e->style_previous;
+    style_t *pseudo_base = NULL, *pseudo_after = NULL;
+    if (has_before) {
+        s->before = motion_compute(c, e, s, after, PE_BEFORE, previous ? previous->before : NULL, &pseudo_base, &pseudo_after);
+        if (base) base->before = pseudo_base ? pseudo_base : s->before;
+    }
+    if (has_after) {
+        s->after = motion_compute(c, e, s, after, PE_AFTER, previous ? previous->after : NULL, &pseudo_base, &pseudo_after);
+        if (base) base->after = pseudo_base ? pseudo_base : s->after;
+    }
     s->before_generated=box_pseudo_generated(e,s,s->before);
     s->after_generated=box_pseudo_generated(e,s,s->after);
+    if (base) {
+        base->before_generated=box_pseudo_generated(e,base,base->before);
+        base->after_generated=box_pseudo_generated(e,base,base->after);
+    }
     if (self_only && !e->animation_base_style && style_equal(e->style_previous, s)) {
         keep_previous_style(e);
         children_redo = false;
@@ -6007,7 +6434,7 @@ descend:
     e->style_dirty = e->style_children_dirty = e->style_self_dirty = false;
     s = e->style;
     if (s->display == D_NONE) {
-        motion_hide_subtree(e);
+        motion_cancel_subtree(e);
         clear_styles(e);
         return;
     }
@@ -6176,7 +6603,6 @@ void css_cascade(web_doc *d, int vw, int vh) {
         if (!d->style_pool) { ar_alloc(&d->smem, SIZE_MAX); return; }
         d->style_pool->owned = true;
     }
-    d->css_motion_now=uptime_ms(); /* exactly one supervisor snapshot per cascade */
     /* Direct native callers may recascade without the document publication
        helper. Do not overwrite a prior retirement generation while boxes
        still borrow it. The ordinary web_layout path releases after each join. */
@@ -6186,7 +6612,7 @@ void css_cascade(web_doc *d, int vw, int vh) {
     }
     /* Keys borrow computed-style names. Never carry a previous document or
        style-arena generation into this cascade; release on normal exit too. */
-    font_bindings_clear();font_faces_available=false;
+    font_bindings_clear();font_faces_available=d->author_fonts.n>0;
     for(int i=0;i<d->sty.sheets.n;i++)if(((sheet_t *)d->sty.sheets.v[i])->fonts){font_faces_available=true;break;}
     for(struct web_font_resource *f=d->fonts;f;f=f->next)f->wanted=false;
     bool scripting = web_js_enabled(d);
@@ -6237,30 +6663,15 @@ void css_cascade(web_doc *d, int vw, int vh) {
     struct cascade c = {.d=d, .rem=d->html && d->html->style ? d->html->style->font_size : 16,
         .vw=vw, .vh=vh, .a=&d->smem, .full=full, .why=REDO_CASCADE, .trap=d->smem.trap,
         .ancestor_counts=&ancestors, .ancestors_published=SIZE_MAX};
+    /* the timeline's time holds still through the cascade; workers push new records, joined after */
+    web_animations_cascading(d, true);
     if (d->html) cascade_frontier_run(&c, d->html);
+    web_animations_cascading(d, false);
     font_bindings_clear();
     sb_free(&c.vbuf);
     d->styled_w = vw;
     d->styled_h = vh;
     d->style_full_dirty = d->style_pending_dirty = false;
-    /* --debug-js: a motion marked for a sample that this cascade did not reach (every 5 s). */
-    static uint64_t unreached_told;
-    if (d->profile_enabled && (!unreached_told || uptime_ms() - unreached_told >= 5000))
-        for (struct css_motion_state *s = d->css_motions; s; s = s->next) {
-            if (!s->node || !s->requested) continue;
-            node_t *a = s->node, *p = dirty_flat_parent(a);
-            while (p && p->style_children_dirty) { a = p; p = dirty_flat_parent(p); }
-            pvec kids = {0}; bool listed = false;
-            if (p) { doc_flat_children(p, &kids); for (int i = 0; i < kids.n; i++) if (kids.v[i] == a) listed = true; pv_free(&kids); }
-            char line[320]; const char *pc = p ? node_attr(p, "class") : NULL, *ac = node_attr(a, "class");
-            snprintf(line, sizeof line, "Unreached CSS motion %s on %s: stops below %s.%.30s (style %d, display %d, shadow %d, slot %d) at %s.%.30s (parent %d, assigned %d, listed %d, dirty %d/%d)",
-                s->name, s->node->name ? s->node->name : "?", p && p->name ? p->name : "-", pc ? pc : "",
-                p && p->style ? 1 : 0, p && p->style ? p->style->display : -1, p && p->shadow_root ? 1 : 0,
-                p && p->type == N_ELEM && !p->foreign && p->tag == T_slot, a->name ? a->name : "?", ac ? ac : "",
-                a->parent == p, a->assigned_slot != NULL, listed, a->style_children_dirty, a->style_self_dirty);
-            web_js_console(d, 1, line); unreached_told = uptime_ms();
-            break;
-        }
     if (d->profile_enabled) {
         style_profile.cascades++; style_profile.full += full;
         if (full) style_profile.full_by[full_by]++;

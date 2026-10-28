@@ -17,18 +17,25 @@ struct webidb_database {char *name;size_t name_length;uint64_t version;};
 int webidb_databases(webidb *db,const char *origin,struct webidb_database **items,size_t *count);
 void webidb_databases_free(struct webidb_database *items,size_t count);
 int webidb_abort(webidb *db,uint32_t token);
-/* Connections share notifications between native browser tasks. A caller
- * retries BUSY asynchronously; desired_version=0 means database deletion. */
-int webidb_connections(webidb *db,uint32_t token,uint64_t desired_version,size_t *count);
+/* Connections share notifications between native browser tasks, of every process and realm
+ * (Window or Worker) of the origin. A caller retries BUSY asynchronously; desired_version=0
+ * means database deletion. connections marks a versionchange to desired_version on each open
+ * connection (once per desired version) and counts them: count those still open, unfired those
+ * whose versionchange has not been fired yet. poll delivers a connection's marked versionchange
+ * once (*pending 1, *desired_version), or that webidb_clear removed its database (*pending 2:
+ * close it forcibly); fired acknowledges that its versionchange has been fired (or skipped: its
+ * close is pending), so IndexedDB's open fires blocked only after every one was fired. */
+int webidb_connections(webidb *db,uint32_t token,uint64_t desired_version,size_t *count,size_t *unfired);
 int webidb_connect(webidb *db,uint32_t token,uint64_t version,uint32_t *connection);
 int webidb_poll(webidb *db,uint32_t connection,int *pending,uint64_t *desired_version);
+int webidb_fired(webidb *db,uint32_t connection);
 int webidb_disconnect(webidb *db,uint32_t connection);
 int webidb_forget_connection(webidb *db,uint32_t connection);
 /* The Settings window's site data, from any browser process. usage: each database in the
  * profile, whatever its origin, to each: the origin its catalog names ("" when neither slot can
  * be read) and the bytes of all its files. clear: removes every database whose origin match
  * accepts (match NULL: all) whole, as the Storage Standard clears a bucket. One in a transaction
- * now is left (its lease is held): WEB_IDB_BUSY once the rest is removed; a connection another
- * window holds open is not closed and finds the database empty at its next transaction. */
+ * now is left (its lease is held): WEB_IDB_BUSY once the rest is removed; the connections open to
+ * a removed one, in any process, are closed forcibly at their next poll (webidb_poll). */
 int webidb_usage(void (*each)(void *opaque,const char *origin,uint64_t bytes),void *opaque);
 int webidb_clear(bool (*match)(void *opaque,const char *origin),void *opaque);

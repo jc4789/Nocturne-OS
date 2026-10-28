@@ -51,7 +51,8 @@ void ns_close(net_stream*s){(void)s;closes++;}
 void ns_set_timeout(net_stream*s,int t){(void)s;(void)t;}
 #define HTTP_MOCK_HAS_TIMEOUT
 #include "http_mock_lifecycle.h"
-void *http_br_create(void){return NULL;}int http_br_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){(void)s;(void)in;(void)n;(void)out;(void)room;return -1;}void http_br_free(void *s){(void)s;}
+void *brotli_decoder_begin(void){return NULL;}int brotli_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){(void)s;(void)in;(void)n;(void)out;(void)room;return -1;}void brotli_decoder_end(void *s){(void)s;}
+struct inflate_stream *inflate_begin(enum deflate_wrap w,unsigned o,inflate_put p,void *c){(void)w;(void)o;(void)p;(void)c;return NULL;}enum inflate_result inflate_feed(struct inflate_stream *s,const void *in,size_t n,bool last,size_t *used){(void)s;(void)in;(void)n;(void)last;*used=0;return INFLATE_INVALID;}void inflate_end(struct inflate_stream *s){(void)s;}
 #define CHECK(label,condition) do{checks++;if(!(condition)){failed++;printf("FAIL %s\n",label);}}while(0)
 static void reset(void){sent_length=opens=closes=0;sent[0]=opened_host[0]=0;open_failure=send_failure=false;fail_malloc=0;}
 static void hostname(char *out,size_t length){size_t at=0;while(at<length){size_t n=length-at;if(n>63)n=63;memset(out+at,'a',n);at+=n;if(at<length)out[at++]='.';}out[length]=0;}

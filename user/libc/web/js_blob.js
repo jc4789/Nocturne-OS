@@ -113,6 +113,18 @@ const blobBridge = (() => {
     }
     const readerState=v=>{const s=apply(get,readers,[v]);if(!s)throw new TypeError('Illegal FileReader receiver');return s;};
     function fire(reader,type,total=0){const event=new ProgressEventType(type,{lengthComputable:true,loaded:type==='loadstart'?0:total,total});eventState(event).isTrusted=true;dispatch(reader,event);}
+    /* File API "package data": the read result for kind from a blob's bytes and type. */
+    function packageData(bytes,kind,type,charset){
+        const n=apply(length,bytes,[]);
+        if(kind==='arrayBuffer')return apply(buffer,bytes,[]);
+        if(kind==='text'){
+            const parameter=/;\s*charset\s*=\s*(?:"([^"]*)"|([^;\s]*))/i.exec(type);
+            let decoder;try{decoder=new Decoder(charset??(parameter?(parameter[1]??parameter[2]):'utf-8'));}catch(_){decoder=new Decoder('utf-8');}
+            return apply(decode,decoder,[bytes]);
+        }
+        if(kind==='dataURL')return 'data:'+(type||'application/octet-stream')+';base64,'+base64(bytes);
+        let result='';for(let i=0;i<n;i++)result+=fromCode(bytes[i]);return result;
+    }
     function start(reader,blob,kind,encoding){
         const s=readerState(reader),b=state(blob);
         if(s.ready===1)throw new DOMException('Reader is already loading','InvalidStateError');
@@ -123,16 +135,7 @@ const blobBridge = (() => {
             const n=apply(length,b.bytes,[]);fire(reader,'loadstart',n);
             if(s.epoch!==epoch||s.ready!==1)return;
             try{
-                const bytes=copy(b.bytes);let result;
-                if(kind==='arrayBuffer')result=apply(buffer,bytes,[]);
-                else if(kind==='text'){
-                    const parameter=/;\s*charset\s*=\s*(?:"([^"]*)"|([^;\s]*))/i.exec(b.type);
-                    let decoder;try{decoder=new Decoder(charset??(parameter?(parameter[1]??parameter[2]):'utf-8'));}catch(_){decoder=new Decoder('utf-8');}
-                    result=apply(decode,decoder,[bytes]);
-                }else {
-                    if(kind==='dataURL')result='data:'+(b.type||'application/octet-stream')+';base64,'+base64(bytes);
-                    else {result='';for(let i=0;i<n;i++)result+=fromCode(bytes[i]);}
-                }
+                const result=packageData(copy(b.bytes),kind,b.type,charset);
                 fire(reader,'progress',n);if(s.epoch!==epoch||s.ready!==1)return;
                 s.result=result;s.ready=2;
                 fire(reader,'load',n);
@@ -152,6 +155,23 @@ const blobBridge = (() => {
         abort(){const s=readerState(this);s.result=null;if(s.ready!==1)return;
             if(s.timer)host.clear(s.timer);s.timer=0;s.ready=2;const epoch=++s.epoch;fire(this,'abort');if(s.epoch===epoch&&s.ready!==1)fire(this,'loadend');}
     }
+    /* [Exposed=(DedicatedWorker,SharedWorker)]: the worker runtime installs it. A Blob's bytes
+       are already in this realm, so reading them is the whole synchronous read. */
+    const syncReaders=new WeakSet(),syncHas=WeakSet.prototype.has,syncAdd=WeakSet.prototype.add;
+    function syncRead(reader,blob,kind,encoding,count){
+        if(!apply(syncHas,syncReaders,[reader]))throw new TypeError('Illegal FileReaderSync receiver');
+        if(count<1)throw new TypeError('Blob required');
+        const b=state(blob),charset=encoding===undefined?undefined:string(encoding);
+        return packageData(copy(b.bytes),kind,b.type,charset);
+    }
+    class FileReaderSync {
+        constructor(){apply(syncAdd,syncReaders,[this]);}
+        readAsArrayBuffer(blob){return syncRead(this,blob,'arrayBuffer',undefined,arguments.length);}
+        readAsBinaryString(blob){return syncRead(this,blob,'binary',undefined,arguments.length);}
+        readAsText(blob,encoding){return syncRead(this,blob,'text',encoding,arguments.length);}
+        readAsDataURL(blob){return syncRead(this,blob,'dataURL',undefined,arguments.length);}
+    }
+    define(FileReaderSync.prototype,Symbol.toStringTag,{value:'FileReaderSync',configurable:true});
     for(const [key,value] of [['EMPTY',0],['LOADING',1],['DONE',2]])for(const target of [FileReader,FileReader.prototype])define(target,key,{value,enumerable:true});
     const readerEvents=new Set(['loadstart','progress','load','error','abort','loadend']);
     blobHandlerTarget=(value,type)=>apply(get,readers,[value])!==undefined&&readerEvents.has(type);
@@ -161,7 +181,7 @@ const blobBridge = (() => {
         for(const key of Object.getOwnPropertyNames(C.prototype))if(key!=='constructor'){const d=Object.getOwnPropertyDescriptor(C.prototype,key);d.enumerable=true;define(C.prototype,key,d);}
     }
     Object.assign(globalThis,{Blob,File,FileReader});
-    return {brand:value=>apply(get,slots,[value])!==undefined,readerBrand:value=>apply(get,readers,[value])!==undefined,
+    return {FileReaderSync,brand:value=>apply(get,slots,[value])!==undefined,readerBrand:value=>apply(get,readers,[value])!==undefined,
         bytes:value=>apply(buffer,copy(state(value).bytes),[]),type:value=>state(value).type,
         fromBytes:(bytes,type)=>make(copy(view(bytes)),mime(type)),
         nativeFile(data){const bits=create(null),options=create(null);options.type=data[1];options.lastModified=data[3];bits[Symbol.iterator]=()=>{let done=false;const iterator=create(null);iterator.next=()=>done?{done:true}:(done=true,{done:false,value:data[0]});return iterator;};const file=new File(bits,data[2],options);apply(get,files,[file]).relativePath=data[4]||'';return file;},

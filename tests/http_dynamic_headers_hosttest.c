@@ -20,7 +20,9 @@ uint64_t uptime_ms(void){return 0;}
 long ns_read(net_stream*s,void*p,size_t n){size_t left=s->n-s->at;if(n>left)n=left;if(n>s->split)n=s->split;memcpy(p,s->p+s->at,n);s->at+=n;return (long)n;}
 const char *ns_error(net_stream*s){(void)s;return "";}
 void ns_close(net_stream*s){(void)s;}
-void *http_br_create(void){return NULL;}int http_br_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){(void)s;(void)in;(void)n;(void)out;(void)room;return -1;}void http_br_free(void *s){(void)s;}
+#include "deflate.h"
+void *brotli_decoder_begin(void){return NULL;}int brotli_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){(void)s;(void)in;(void)n;(void)out;(void)room;return -1;}void brotli_decoder_end(void *s){(void)s;}
+struct inflate_stream *inflate_begin(enum deflate_wrap w,unsigned o,inflate_put p,void *c){(void)w;(void)o;(void)p;(void)c;return NULL;}enum inflate_result inflate_feed(struct inflate_stream *s,const void *in,size_t n,bool last,size_t *used){(void)s;(void)in;(void)n;(void)last;*used=0;return INFLATE_INVALID;}void inflate_end(struct inflate_stream *s){(void)s;}
 #define malloc test_malloc
 #define calloc test_calloc
 #define realloc test_realloc
