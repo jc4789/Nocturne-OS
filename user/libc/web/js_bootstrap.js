@@ -1430,6 +1430,21 @@
     for(const C of [HTMLBodyElement,HTMLFrameSetElement])installHandlers(C.prototype,windowHandlerTypes);
     /* @include js_html_tables.js */
     /* @include js_xhr.js */
+    /* This Window's XMLHttpRequest: its Fetch, the document's base URL and encoding for open()'s
+       URL, its documents for Document bodies and responses. Its event loop cannot pause, so a
+       synchronous request is NotSupportedError. */
+    const ProgressEvent=progressEventInterface(Event);
+    const xhr=xhrInterfaces({fetch:fetchBridge,
+        parseURL:url=>urlBridge.encodingParse(url,rawDom.get(document,'baseURI'),rawDom.get(document,'characterSet')),
+        listened(target){const list=listenerList(target);if(list)for(let i=0;i<list.length;i++)if(!list[i].removed)return true;return false;},
+        log:text=>host.log(1,text),synchronous:false,
+        document:{is:value=>value instanceof Document,
+            body(value){const html=rawDom.get(value,'htmlDocument');
+                return [html?'text/html;charset=UTF-8':'application/xml;charset=UTF-8',(html?rawDom.get(value,'innerHTML'):rawDom.get(value,'xmlSerialization'))??''];},
+            response:(bytes,essence,html,encoding,url)=>html?rawDom.parseDocument(null,bytes,encoding,url,essence):rawDom.parseXML(null,bytes,essence,false,encoding,url)}});
+    xhrHandlerTarget=xhr.handlerTarget;
+    Object.assign(globalThis,{XMLHttpRequest:xhr.XMLHttpRequest,XMLHttpRequestUpload:xhr.XMLHttpRequestUpload,
+        XMLHttpRequestEventTarget:xhr.XMLHttpRequestEventTarget,ProgressEvent});
     /* @include js_blob.js */
     /* @include js_wasm.js */
     fetchBridge.initializeBlobs(blobBridge);

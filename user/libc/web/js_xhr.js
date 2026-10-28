@@ -1,9 +1,55 @@
-/* Asynchronous XHR over Nocturne's CORS-checked streaming transport.
-   No page-replaceable fetch/Promise methods are used to schedule host work.
-   Synchronous requests are not implemented; unsupported operations must not
-   pretend to succeed. Document responses use the native HTML and XML parsers. */
-{
-    const states = new WeakMap(), uploadStates = new WeakMap(), progressStates = new WeakMap();
+/* XMLHttpRequest Standard (https://xhr.spec.whatwg.org/, consulted 2026-10-28): ProgressEvent,
+   XMLHttpRequestEventTarget, XMLHttpRequestUpload and XMLHttpRequest, one definition for a Window
+   and a Worker realm (XMLHttpRequest is [Exposed=(Window,DedicatedWorker,SharedWorker)],
+   ProgressEvent [Exposed=(Window,Worker)]).
+   progressEventInterface(Event) makes ProgressEvent; a realm makes it before js_blob.js's
+   FileReader takes it. xhrInterfaces(realm) builds the rest over what differs between the realms:
+     realm.fetch         the realm's Fetch (fetchInterfaces's bridge). Every request is its xhrFetch
+                         or, synchronous, its xhrFetchSync: CORS, credentials, Mixed Content and CSP
+                         are its native transport's. xhrBody, xhrResponse and xhrMetadata read
+                         bodies and responses without page-mutable getters.
+     realm.parseURL(url) encoding-parse url relative to the relevant settings object: a Window's
+                         document base URL and the document's encoding, a Worker's API base URL and
+                         UTF-8. A URL, or null for failure.
+     realm.listened(t)   whether one or more event listeners (event handlers among them) are
+                         registered on t: send()'s upload listener flag.
+     realm.log(text)     a console line: the transport's reason for a failed request.
+     realm.document      a Window's documents, null in a Worker: is(value), body(document) ->
+                         [Content-Type, serialization], and response(bytes, essence, html,
+                         encoding, url) -> a Document or null ("set a document response"). In a
+                         Worker no body is a Document, responseType "document" is ignored and there
+                         is no responseXML ([Exposed=Window]).
+     realm.synchronous   whether the realm's event loop can pause for a synchronous request: a
+                         Worker's can (browserjsworker.c waits for the parent's answer); a Window's
+                         cannot, so open() with async false is a NotSupportedError there.
+   The bootstraps have the rest by the same names, as js_blob.js uses them: Event, EventTarget,
+   DOMException, Headers, ProgressEvent, eventState, dispatch, installHandlers, report, blobBridge
+   and host.now, timer, clear, textDecoder and textDecode. xhrInterfaces returns the interfaces and
+   handlerTarget, the realm's xhrHandlerTarget. An asynchronous request's processResponse, body
+   chunks and end of body are tasks; no page-replaceable fetch or Promise method schedules them.
+   Document responses use the native HTML and XML parsers. */
+function progressEventInterface(Event) {
+    const slots=new WeakMap(),apply=Reflect.apply,get=WeakMap.prototype.get,set=WeakMap.prototype.set;
+    const trunc=Math.trunc,finite=Number.isFinite;
+    /* Web IDL unsigned long long: the integer part of ToNumber, modulo 2^64; NaN, 0 and the
+       infinities are +0. */
+    const count=v=>{v=+v;if(!finite(v)||v===0)return 0;v=trunc(v)%18446744073709551616;return v<0?v+18446744073709551616:v;};
+    const state=e=>{const p=apply(get,slots,[e]);if(!p)throw new TypeError('Illegal ProgressEvent receiver');return p;};
+    class ProgressEvent extends Event {
+        constructor(type,init={}) {
+            if(!arguments.length)throw new TypeError('ProgressEvent requires a type');
+            init=init??{};super(type,init);
+            apply(set,slots,[this,{lengthComputable:!!init.lengthComputable,loaded:count(init.loaded??0),total:count(init.total??0)}]);
+        }
+        get lengthComputable(){return state(this).lengthComputable;}
+        get loaded(){return state(this).loaded;}
+        get total(){return state(this).total;}
+    }
+    return ProgressEvent;
+}
+function xhrInterfaces(realm) {
+    const fetch=realm.fetch,documents=realm.document||null,windowRealm=documents!==null;
+    const states = new WeakMap(), uploadStates = new WeakMap();
     const textDecoder = host.textDecoder, textDecode = host.textDecode;
     const nativeThen = Promise.prototype.then, nativeApply = Reflect.apply;
     const defineProperty=Object.defineProperty, promiseConstructor=Object.freeze({[Symbol.species]:Promise});
@@ -15,13 +61,16 @@
     const typedSet=U8.prototype.set;
     const split=String.prototype.split;
     const weakGet=WeakMap.prototype.get, weakSet=WeakMap.prototype.set, weakHas=WeakMap.prototype.has;
-    for(const map of [states,uploadStates,progressStates]) {
+    for(const map of [states,uploadStates]) {
         defineProperty(map,'get',{value:key=>nativeApply(weakGet,map,[key])});
         defineProperty(map,'set',{value:(key,value)=>nativeApply(weakSet,map,[key,value])});
         defineProperty(map,'has',{value:key=>nativeApply(weakHas,map,[key])});
     }
-    const parseJSON = JSON.parse, wellFormed=String.prototype.toWellFormed;
+    const parseJSON = JSON.parse;
     const headerEntries = Headers.prototype.entries, headerGet = Headers.prototype.get;
+    // A job for the emergency path, through this file's own resolved promise.
+    const resolved=Promise.resolve();defineProperty(resolved,'constructor',{value:promiseConstructor});
+    const microtask=fn=>nativeApply(nativeThen,resolved,[fn]);
     const eventTypes = new Set(['loadstart','progress','abort','error','load','timeout','loadend']);
     const string = v => { if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol to string');return String(v); };
     const bytestring = v => { const t=string(v);if(/[^\x00-\xff]/.test(t))throw new TypeError('Expected ByteString');return t; };
@@ -118,6 +167,21 @@
         }
         return mimeType;
     }
+    /* Fetch "extract a length" of a header list's Content-Length: its one decimal value, or 0 when
+       it has none, differing values or one that is not digits (send()'s "not an integer"). */
+    function extractLength(headers) {
+        const header=nativeApply(headerGet,headers,['content-length']);
+        if(header===null)return 0;
+        const values=nativeApply(split,header,[',']);let candidate=null;
+        for(let i=0;i<values.length;i++){
+            let value=values[i],a=0,b=value.length;
+            while(a<b&&(value[a]===' '||value[a]==='\t'))a++;
+            while(b>a&&(value[b-1]===' '||value[b-1]==='\t'))b--;
+            value=value.slice(a,b);
+            if(candidate===null)candidate=value;else if(value!==candidate)return 0;
+        }
+        return candidate!==null&&/^\d+$/.test(candidate)?NativeNumber(candidate):0;
+    }
     // XHR "get a response MIME type" and "get a final MIME type".
     const responseMime=s=>extractMime(s.responseHeaders)??{essence:'text/xml',parameters:new Map()};
     const finalMime=s=>s.override??responseMime(s);
@@ -129,34 +193,23 @@
         if(s.override && s.override.parameters.has('charset'))label=s.override.parameters.get('charset');
         return label;
     }
-    // Whether the received bytes must be kept for a document response.
+    // Whether the received bytes must be kept for a document response (a Window's only).
     function keepsBytes(s) {
+        if(!documents)return false;
         if(s.type==='document')return true;
         return s.type==='' && xmlMime(finalMime(s));
     }
     // XHR "set a document response".
     function documentResponse(s) {
         const bytes=s.bytes;s.bytes=null;
-        if(!bytes)return null;
+        if(!bytes || !documents)return null;
         const mime=finalMime(s),html=mime.essence==='text/html';
         if(!html && !xmlMime(mime))return null;
         if(s.type==='' && html)return null;
-        if(html)return rawDom.parseDocument(null,bytes,finalEncoding(s),s.finalURL,mime.essence);
-        // The XML parser with XML scripting support disabled; failure is null.
-        return rawDom.parseXML(null,bytes,mime.essence,false,finalEncoding(s),s.finalURL);
+        // The XML parser runs with XML scripting support disabled; failure is null.
+        return documents.response(bytes,mime.essence,html,finalEncoding(s),s.finalURL);
     }
 
-    class ProgressEvent extends Event {
-        constructor(type,init={}) {
-            if(!arguments.length)throw new TypeError('ProgressEvent requires a type');
-            init=init??{};super(type,init);
-            const count=v=>{v=+v;if(!Number.isFinite(v))return 0;v=Math.trunc(v)%18446744073709551616;return v<0?v+18446744073709551616:v;};
-            progressStates.set(this,{lengthComputable:!!init.lengthComputable,loaded:count(init.loaded??0),total:count(init.total??0)});
-        }
-        get lengthComputable(){const p=progressStates.get(this);if(!p)throw new TypeError('Illegal ProgressEvent receiver');return p.lengthComputable;}
-        get loaded(){const p=progressStates.get(this);if(!p)throw new TypeError('Illegal ProgressEvent receiver');return p.loaded;}
-        get total(){const p=progressStates.get(this);if(!p)throw new TypeError('Illegal ProgressEvent receiver');return p.total;}
-    }
     class XMLHttpRequestEventTarget extends EventTarget {
         constructor(){super();if(new.target===XMLHttpRequestEventTarget)throw new TypeError('Illegal constructor');}
     }
@@ -170,7 +223,7 @@
     }
     function stopTimer(s){if(s.timer)host.clear(s.timer);s.timer=0;}
     function clearResponse(s){s.status=0;s.statusText='';s.responseURL='';s.responseHeaders=null;s.text='';s.bytes=null;s.object=null;s.objectSet=false;s.chunks=[];s.loaded=0;s.total=0;s.decoder=null;s.progressAt=0;s.uploadProgressAt=0;s.finalURL='';s.keep=false;}
-    function cancel(s){if(s.transport){s.transport.cancel();s.transport=null;}if(s.id)host.cancel(s.id);s.id=0;stopTimer(s);}
+    function cancel(s){if(s.transport){const transport=s.transport;s.transport=null;transport.cancel();}stopTimer(s);}
     function error(x,s,epoch,type) {
         if(!current(s,epoch))return;
         cancel(s);s.sent=false;clearResponse(s);s.ready=4;
@@ -180,12 +233,15 @@
     }
     // Pages see only a bare network error; the console names the transport
     // reason, as other browsers report failed requests there.
-    function networkFailure(x,s,epoch,reason) {
-        if(!current(s,epoch))return;
+    function logFailure(s,reason) {
         let text;try{text=reason instanceof Error?reason.name+': '+reason.message:string(reason);}catch(_){text='unknown reason';}
         // Like resource diagnostics, never copy query/fragment tokens.
         const cut=s.url.search(/[?#]/),shown=cut<0?s.url:s.url.slice(0,cut)+' [URL suffix omitted]';
-        try{host.log(1,'XMLHttpRequest '+s.method+' '+shown+' failed: '+text);}catch(_){}
+        try{realm.log('XMLHttpRequest '+s.method+' '+shown+' failed: '+text);}catch(_){}
+    }
+    function networkFailure(x,s,epoch,reason) {
+        if(!current(s,epoch))return;
+        logFailure(s,reason);
         error(x,s,epoch,'error');
     }
     function armTimer(x,s,epoch) {
@@ -194,7 +250,7 @@
     }
     function emergencyError(x,s,epoch) {
         cancel(s);
-        try{host.microtask(()=>error(x,s,epoch,'error'));}
+        try{microtask(()=>error(x,s,epoch,'error'));}
         catch(_){
             // A simultaneous job-allocation failure cannot deliver events.
             // Still release the request and leave a terminal, reusable object.
@@ -218,19 +274,20 @@
         return s.type==='json'?textDecoder('UTF-8',false,false):textDecoder(label,false,true,true);
     }
     const decodeBytes=(decoder,bytes,stream)=>textDecode(decoder,bytes,0,bytes?nativeApply(bufferLength,bytes,[]):0,stream);
+    const charset=mime=>{const m=/;\s*charset\s*=\s*(?:"([^"]*)"|([^;\s]*))/i.exec(mime);return m?(m[1]??m[2]):null;};
+    const textLabel=s=>charset(s.mime)??charset(s.responseHeaders?nativeApply(headerGet,s.responseHeaders,['content-type'])||'':'')??'UTF-8';
     function textResponse(s) {
-        const charset=mime=>{const m=/;\s*charset\s*=\s*(?:"([^"]*)"|([^;\s]*))/i.exec(mime);return m?(m[1]??m[2]):null;};
-        const encoding=charset(s.mime)??charset(s.responseHeaders?nativeApply(headerGet,s.responseHeaders,['content-type'])||'':'')??'UTF-8';
-        return decodeBytes(responseDecoder(s,encoding),s.bytes,false);
+        return decodeBytes(responseDecoder(s,textLabel(s)),s.bytes,false);
     }
+    /* A response the realm's Fetch brought whole (no observer frames): the end of body at once. */
     function completed(x,s,epoch,response) {
         if(!current(s,epoch))return;
-        s.id=0;
+        s.transport=null;
         if(!s.uploadDone) {
             s.uploadDone=true;
-            if(s.uploadListener)for(const type of ['progress','load','loadend']){fire(s.upload,type,s.uploadSize,s.uploadSize,true);if(!current(s,epoch))return;}
+            if(s.uploadListener)for(const type of ['progress','load','loadend']){fire(s.upload,type,s.uploadSize,s.uploadSize,s.uploadSize>0);if(!current(s,epoch))return;}
         }
-        const result=fetchBridge.xhrResponse(response);
+        const result=fetch.xhrResponse(response);
         s.status=result.status;s.statusText=result.statusText;s.responseURL=nativeApply(split,result.url,['#'])[0];s.responseHeaders=result.headers;
         s.finalURL=result.url;
         s.ready=2;fire(x,'readystatechange');if(!current(s,epoch))return;
@@ -249,29 +306,22 @@
             if((s.type===''&&!keepsBytes(s))||s.type==='text'||s.type==='json')s.bytes=null;
             fire(x,'readystatechange');if(!current(s,epoch))return;
         }
-        const header=nativeApply(headerGet,s.responseHeaders,['content-length']);
-        const total=header!==null && /^\d+$/.test(header)?NativeNumber(header):0;
-        if(!current(s,epoch))return;
-        const computable=header!==null && total===loaded;
-        fire(x,'progress',loaded,computable?total:0,computable);if(!current(s,epoch))return;
+        const total=extractLength(s.responseHeaders);
+        fire(x,'progress',loaded,total,total>0);if(!current(s,epoch))return;
         stopTimer(s);s.sent=false;s.ready=4;
         fire(x,'readystatechange');if(s.epoch!==epoch)return;
-        fire(x,'load',loaded,computable?total:0,computable);if(s.epoch!==epoch)return;
-        fire(x,'loadend',loaded,computable?total:0,computable);
+        fire(x,'load',loaded,total,total>0);if(s.epoch!==epoch)return;
+        fire(x,'loadend',loaded,total,total>0);
     }
     function receivedHeaders(x,s,epoch,response) {
-        const result=fetchBridge.xhrMetadata(response);
+        const result=fetch.xhrMetadata(response);
         s.status=result.status;s.statusText=result.statusText;s.responseURL=nativeApply(split,result.url,['#'])[0];s.responseHeaders=result.headers;
         s.finalURL=result.url;s.keep=keepsBytes(s);
-        const header=nativeApply(headerGet,s.responseHeaders,['content-length']);
-        if(header!==null){const values=header.split(',').map(value=>value.trim());if(values.length&&/^\d+$/.test(values[0])&&values.every(value=>value===values[0]))s.total=NativeNumber(values[0]);}
+        s.total=extractLength(s.responseHeaders);
         s.ready=2;fire(x,'readystatechange');
     }
     function prepareDecoder(s) {
-        if(!s.decoder&&s.type!=='arraybuffer'&&s.type!=='blob'&&s.type!=='document'){
-            const charset=mime=>{const m=/;\s*charset\s*=\s*(?:"([^"]*)"|([^;\s]*))/i.exec(mime);return m?(m[1]??m[2]):null;};
-            s.decoder=responseDecoder(s,charset(s.mime)??charset(nativeApply(headerGet,s.responseHeaders,['content-type'])||'')??'UTF-8');
-        }
+        if(!s.decoder&&s.type!=='arraybuffer'&&s.type!=='blob'&&s.type!=='document')s.decoder=responseDecoder(s,textLabel(s));
     }
     function receivedChunk(x,s,epoch,bytes) {
         prepareDecoder(s);
@@ -310,13 +360,36 @@
             if(done){fire(s.upload,'load',count,s.uploadSize,s.uploadSize>0);if(s.epoch!==epoch)return;fire(s.upload,'loadend',count,s.uploadSize,s.uploadSize>0);}
         }
     }
+    /* send()'s synchronous steps: no loadstart, progress or upload events. The realm's Fetch pauses
+       its event loop until the response's body is whole or timeout milliseconds pass; then "handle
+       response end-of-body". A network error or the timeout runs the request error steps, which
+       throw for a synchronous request. */
+    function synchronous(x,s,epoch,init) {
+        let response=null,failure=null;
+        try{response=fetch.xhrFetchSync(s.url,init,s.uploadListener,s.timeout);}catch(e){failure=e;}
+        if(response===null){
+            if(failure!==null)logFailure(s,failure);
+            s.sent=false;clearResponse(s);s.ready=4;s.uploadDone=true;
+            if(failure===null)fail('TimeoutError','The synchronous request timed out');
+            fail('NetworkError','A network error occurred');
+        }
+        const result=fetch.xhrResponse(response);
+        s.status=result.status;s.statusText=result.statusText;s.responseURL=nativeApply(split,result.url,['#'])[0];s.responseHeaders=result.headers;
+        s.finalURL=result.url;s.bytes=result.bytes;
+        const loaded=nativeApply(bufferLength,s.bytes,[]),total=extractLength(s.responseHeaders);
+        if(s.type===''||s.type==='text'||s.type==='json'){s.text=textResponse(s);if(!keepsBytes(s))s.bytes=null;}
+        s.uploadDone=true;s.sent=false;s.ready=4;
+        fire(x,'readystatechange');if(s.epoch!==epoch)return;
+        fire(x,'load',loaded,total,total>0);if(s.epoch!==epoch)return;
+        fire(x,'loadend',loaded,total,total>0);
+    }
     class XMLHttpRequest extends XMLHttpRequestEventTarget {
         constructor() {
             super();const upload=new XMLHttpRequestUpload(uploadToken);
             // The private state later owns the transport ArrayBuffer; inherited
             // setters must not get this record while clearResponse initializes it.
-            const s=assign(create(null),{ready:0,sent:false,epoch:0,id:0,timer:0,started:0,timeout:0,credentials:false,type:'',mime:'',override:null,
-                method:'',url:'',headers:new Map(),upload,uploadDone:true,uploadSize:0,uploadListener:false});
+            const s=assign(create(null),{ready:0,sent:false,sync:false,epoch:0,timer:0,started:0,timeout:0,credentials:false,type:'',mime:'',override:null,
+                method:'',url:'',headers:new Map(),transport:null,upload,uploadDone:true,uploadSize:0,uploadListener:false});
             clearResponse(s);states.set(this,s);uploadStates.set(upload,s);
         }
         open(method,url,async,username=null,password=null) {
@@ -328,13 +401,14 @@
             const upper=method.toUpperCase();
             if(['CONNECT','TRACE','TRACK'].includes(upper))fail('SecurityError','Forbidden HTTP method');
             if(['DELETE','GET','HEAD','OPTIONS','POST','PUT'].includes(upper))method=upper;
-            // encoding-parse relative to the document: its encoding for the query.
-            const parsed=urlBridge.encodingParse(url,rawDom.get(document,'baseURI'),rawDom.get(document,'characterSet'));
+            // encoding-parse relative to the relevant settings object.
+            const parsed=realm.parseURL(url);
             if(parsed===null)fail('SyntaxError','Invalid request URL');
-            if(!async)fail('NotSupportedError','Synchronous XMLHttpRequest is not supported');
+            if(!async && windowRealm && (s.timeout!==0 || s.type!==''))fail('InvalidAccessError','A synchronous request of a Window has no timeout or response type');
+            if(!async && !realm.synchronous)fail('NotSupportedError','This realm cannot pause for a synchronous XMLHttpRequest');
             if(username!==null || password!==null || parsed.username || parsed.password)fail('NotSupportedError','URL credentials are not supported');
-            cancel(s);s.epoch++;s.sent=false;s.method=method;s.url=parsed.href;s.headers=new Map();clearResponse(s);
-            s.uploadDone=true;s.uploadSize=0;
+            cancel(s);s.epoch++;s.sent=false;s.sync=!async;s.method=method;s.url=parsed.href;s.headers=new Map();clearResponse(s);
+            s.uploadDone=true;s.uploadSize=0;s.uploadListener=false;
             const change=s.ready!==1;s.ready=1;if(change)fire(this,'readystatechange');
         }
         setRequestHeader(name,value) {
@@ -349,30 +423,27 @@
         send(body=null) {
             const s=state(this);if(s.ready!==1 || s.sent)fail('InvalidStateError','The request is not open');
             if(s.method==='GET' || s.method==='HEAD')body=null;
-            // A Document body is its fragment serialization, UTF-8 encoded.
+            // A Document body (a Window's) is its serialization, UTF-8 encoded.
             let documentType=null;
-            if(body!==null && body instanceof Document){
-                const html=rawDom.get(body,'htmlDocument');
-                documentType=html?'text/html;charset=UTF-8':'application/xml;charset=UTF-8';
-                body=(html?rawDom.get(body,'innerHTML'):rawDom.get(body,'xmlSerialization'))??'';
-            }
-            const extracted=fetchBridge.xhrBody(body),contentType=documentType??extracted.type;
+            if(body!==null && documents && documents.is(body)){const serialized=documents.body(body);documentType=serialized[0];body=serialized[1];}
+            const extracted=fetch.xhrBody(body),contentType=documentType??extracted.type;
             body=extracted.bytes;
             // Body conversion may have called open()/send()/abort() itself.
             if(s.ready!==1 || s.sent)fail('InvalidStateError','Request state changed during body conversion');
             if(s.method==='GET' || s.method==='HEAD')body=null;
             if(body!==null && contentType!==null && !s.headers.has('content-type'))s.headers.set('content-type',contentType);
             else if(body!==null && !extracted.binary && s.headers.has('content-type'))s.headers.set('content-type',utf8ContentType(s.headers.get('content-type')));
-            let raw='';for(const [key,value]of s.headers)raw+=key+': '+value+'\r\n';
-            const uploadSize=body===null?0:body.byteLength;
+            const uploadSize=body===null?0:nativeApply(bufferLength,body,[]);
+            s.uploadListener=!!realm.listened(s.upload);
+            const init=assign(create(null),{method:s.method,headers:Object.fromEntries(s.headers),body,credentials:s.credentials?'include':'same-origin'});
             const epoch=++s.epoch;s.sent=true;s.started=host.now();s.uploadDone=body===null;s.uploadSize=uploadSize;
-            s.uploadListener=!!(listenerMap.get(s.upload)||[]).some(entry=>!entry.removed);
+            if(s.sync)return synchronous(this,s,epoch,init);
             fire(this,'loadstart');if(!current(s,epoch))return;
-            if(!s.uploadDone && s.uploadListener){fire(s.upload,'loadstart');if(!current(s,epoch))return;}
+            if(!s.uploadDone && s.uploadListener){fire(s.upload,'loadstart',0,s.uploadSize,s.uploadSize>0);if(!current(s,epoch))return;}
             try{armTimer(this,s,epoch);}catch(e){cancel(s);s.sent=false;s.epoch++;throw e;}
-            let pair;
-            if(host.streamingFetch&&!s.url.startsWith('blob:')){
-                s.transport=fetchBridge.xhrFetch(s.url,{method:s.method,headers:Object.fromEntries(s.headers),body,credentials:s.credentials?'include':'same-origin'},(event,value,resume)=>{
+            let started;
+            try{
+                started=fetch.xhrFetch(s.url,init,(event,value,resume)=>{
                     queue(this,s,epoch,()=>{
                         try{
                             if(event==='headers')receivedHeaders(this,s,epoch,value);
@@ -383,21 +454,17 @@
                         finally{if(current(s,epoch))resume();}
                     });
                 },s.uploadListener);
-                defineProperty(s.transport.promise,'constructor',{value:promiseConstructor});
-                nativeApply(nativeThen,s.transport.promise,[()=>{},reason=>queue(this,s,epoch,()=>networkFailure(this,s,epoch,reason))]);
-                return;
-            }
-            try{pair=s.url.startsWith('blob:')||s.url.startsWith('data:')?{id:0,promise:fetchBridge.fetch(s.url,{method:s.method,headers:Object.fromEntries(s.headers),body})}:host.fetch(s.url,s.method,raw,body,false,s.credentials?2:1,s.uploadListener);}
-            catch(e){queue(this,s,epoch,()=>networkFailure(this,s,epoch,e));return;}
-            s.id=pair.id;if(s.id)performanceBridge.initiator(s.id,'xmlhttprequest');
+            }catch(e){queue(this,s,epoch,()=>networkFailure(this,s,epoch,e));return;}
+            s.transport=started;
             // Native promises settle at the host checkpoint. XHR notifications
             // are tasks; never run them recursively in send() or a page promise.
             // Even intrinsic then reads constructor@@species. This promise is
             // host-private, so shield it from a mutated Promise.prototype.
             try{
-                defineProperty(pair.promise,'constructor',{value:promiseConstructor});
-                nativeApply(nativeThen,pair.promise,[response=>{
-                    queue(this,s,epoch,()=>{try{completed(this,s,epoch,response);}catch(e){error(this,s,epoch,'error');report(e);}});
+                defineProperty(started.promise,'constructor',{value:promiseConstructor});
+                nativeApply(nativeThen,started.promise,[response=>{
+                    // A request whose frames reach the observer ends there.
+                    if(!started.observed)queue(this,s,epoch,()=>{try{completed(this,s,epoch,response);}catch(e){error(this,s,epoch,'error');report(e);}});
                 },reason=>queue(this,s,epoch,()=>networkFailure(this,s,epoch,reason))]);
             }catch(e){cancel(s);s.sent=false;s.epoch++;throw e;}
         }
@@ -414,14 +481,22 @@
         get responseURL(){return state(this).responseURL;}
         get upload(){return state(this).upload;}
         get timeout(){return state(this).timeout;}
-        set timeout(v){const s=state(this);s.timeout=uint(v);if(s.sent){const epoch=s.epoch;try{armTimer(this,s,epoch);}catch(e){emergencyError(this,s,epoch);throw e;}}}
+        set timeout(v){
+            const s=state(this);v=uint(v);
+            if(windowRealm && s.sync)fail('InvalidAccessError','A synchronous request of a Window has no timeout');
+            s.timeout=v;
+            if(s.sent && !s.sync){const epoch=s.epoch;try{armTimer(this,s,epoch);}catch(e){emergencyError(this,s,epoch);throw e;}}
+        }
         get withCredentials(){return state(this).credentials;}
         set withCredentials(v){const s=state(this);if(s.ready>1 || s.sent)fail('InvalidStateError','Request already sent');s.credentials=!!v;}
         get responseType(){return state(this).type;}
         set responseType(v){
             const s=state(this);v=string(v);
             if(!['','text','json','arraybuffer','blob','document'].includes(v))return;
+            // A document response is a Window's.
+            if(!windowRealm && v==='document')return;
             if(s.ready===3 || s.ready===4)fail('InvalidStateError','Response already loading');
+            if(windowRealm && s.sync)fail('InvalidAccessError','A synchronous request of a Window has no response type');
             s.type=v;
         }
         get responseText(){const s=state(this);if(s.type!=='' && s.type!=='text')fail('InvalidStateError','Response is not text');return s.ready<3?'':s.text;}
@@ -453,10 +528,12 @@
             headers.sort((a,b)=>a[0]<b[0]?-1:a[0]>b[0]?1:0);return headers.map(([k,v])=>k+': '+v+'\r\n').join('');
         }
     }
-    xhrHandlerTarget=(target,type)=>(states.has(target)&&(eventTypes.has(type)||type==='readystatechange')) || (uploadStates.has(target)&&eventTypes.has(type));
+    // responseXML is [Exposed=Window].
+    if(!documents)delete XMLHttpRequest.prototype.responseXML;
     installHandlers(XMLHttpRequestEventTarget.prototype,eventTypes);
     installHandlers(XMLHttpRequest.prototype,['readystatechange']);
     for(const [key,value]of Object.entries({UNSENT:0,OPENED:1,HEADERS_RECEIVED:2,LOADING:3,DONE:4}))
         for(const obj of [XMLHttpRequest,XMLHttpRequest.prototype])Object.defineProperty(obj,key,{value,enumerable:true});
-    Object.assign(globalThis,{XMLHttpRequest,XMLHttpRequestUpload,XMLHttpRequestEventTarget,ProgressEvent});
+    return {XMLHttpRequest,XMLHttpRequestUpload,XMLHttpRequestEventTarget,
+        handlerTarget:(target,type)=>(states.has(target)&&(eventTypes.has(type)||type==='readystatechange')) || (uploadStates.has(target)&&eventTypes.has(type))};
 }
