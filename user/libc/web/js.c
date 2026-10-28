@@ -4766,9 +4766,12 @@ static JSValue native_scroll(JSContext *ctx, JSValueConst this_val, int argc, JS
     return JS_NewInt32(ctx, axis ? y : x);
 }
 /* Native URL ownership follows actual length; the native wire uses uint32_t.
-   Resolver OOM must remain OOM rather than being rewritten as a policy denial. */
-static char *js_resolve_owned(JSContext *ctx,const char *base,const char *relative) {
-    char *owned=NULL; int status=web_resolve_url_owned(base,relative,&owned);
+   Resolver OOM must remain OOM rather than being rewritten as a policy denial.
+   encoding_parse: HTML's encoding-parse a URL relative to d (a navigation's
+   URL); otherwise the URL parser against d's base URL with UTF-8 (Fetch's). */
+static char *js_resolve_owned(JSContext *ctx,web_doc *d,const char *relative,bool encoding_parse) {
+    char *owned=NULL;
+    int status=encoding_parse?doc_encoding_parse_url(d,relative,&owned):web_resolve_url_owned(d->base,relative,&owned);
     if(status!=1){if(status<0)JS_ThrowOutOfMemory(ctx);else JS_ThrowTypeError(ctx,"Invalid URL");return NULL;}
     char *resolved=js_strdup(ctx,owned);free(owned);return resolved;
 }
@@ -4776,7 +4779,7 @@ static JSValue native_resolve(JSContext *ctx, JSValueConst this_val, int argc, J
     if (!argc) return JS_UNDEFINED;
     const char *rel = JS_ToCString(ctx, argv[0]); if (!rel) return JS_EXCEPTION;
     struct web_js_state *s = state(ctx); if (s->doc->resources_dirty) doc_sync_tree(s->doc);
-    char *url = js_resolve_owned(ctx, s->doc->base, rel);
+    char *url = js_resolve_owned(ctx, s->doc, rel, true);
     JS_FreeCString(ctx, rel);
     if (!url) return JS_EXCEPTION;
     JSValue result = JS_NewString(ctx, url);
@@ -4859,7 +4862,7 @@ static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, 
     const char *p = JS_ToCString(ctx, argv[0]); if (!p) return JS_EXCEPTION;
     if(!task_context_active(s) || !task_context_active(actor)){JS_FreeCString(ctx,p);return history_security_error(ctx,"Navigation context retired during conversion");}
     if (s->doc->resources_dirty) doc_sync_tree(s->doc);
-    char *url = js_resolve_owned(ctx, s->doc->base, p);
+    char *url = js_resolve_owned(ctx, s->doc, p, true);
     if (!url) { JS_FreeCString(ctx, p); return JS_EXCEPTION; }
     bool ok = permitted_url(s, url, false);
     JS_FreeCString(ctx, p);
@@ -5831,7 +5834,7 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     if(referrer_length>UINT32_MAX||(referrer&&memchr(referrer,0,referrer_length))){result=JS_ThrowTypeError(ctx,"Invalid private referrer URL");goto out;}
     if (!task_context_active(s) || s->doc->root != generation) { result = JS_ThrowTypeError(ctx, "Fetch browsing context retired during conversion"); goto out; }
     if (s->doc->resources_dirty) doc_sync_tree(s->doc);
-    url = js_resolve_owned(ctx, s->doc->base, rel); if (!url) goto out;
+    url = js_resolve_owned(ctx, s->doc, rel, false); if (!url) goto out;
     if (!permitted_url(s, url, true)) { result = JS_ThrowTypeError(ctx, "fetch supports HTTP(S) resources only"); goto out; }
     if (method_length > UINT32_MAX || memchr(method, 0, method_length) || !webnet_method_valid(method) || ((!strcmp(method, "GET") || !strcmp(method, "HEAD")) && body)) { result = JS_ThrowTypeError(ctx, "Invalid HTTP method or body"); goto out; }
     if (n > JS_BODY_LIMIT || header_length > UINT32_MAX) { result = JS_ThrowRangeError(ctx, "Request length is not representable on the native wire"); goto out; }
@@ -5965,6 +5968,19 @@ static JSValue module_bridge_call(struct web_js_state *s, const char *hook, cons
     JSValue args[] = {JS_NewStringLen(ctx, input, len), JS_NewString(ctx, base)};
     JSValue result = JS_IsException(args[0]) || JS_IsException(args[1]) ? JS_EXCEPTION : JS_Call(ctx, fn, s->hooks, 2, args);
     JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); JS_FreeValue(ctx, fn);
+    return result;
+}
+/* HTML's encoding-parse a URL given a script's src (or a module preload's href),
+   relative to the document, as a URL a script may come from: NULL with a
+   pending exception otherwise. */
+static char *script_src_url(struct web_js_state *s, const char *src) {
+    char *owned = NULL, *result = NULL;
+    int status = doc_encoding_parse_url(s->doc, src, &owned);
+    if (status < 0) JS_ThrowOutOfMemory(s->ctx);
+    else if (!status) JS_ThrowTypeError(s->ctx, "Invalid script URL: %s", src);
+    else if (!permitted_script_url(s, owned)) JS_ThrowTypeError(s->ctx, "Script URL is not permitted: %s", src);
+    else result = js_strdup(s->ctx, owned);
+    free(owned);
     return result;
 }
 static char *module_url(struct web_js_state *s, const char *hook, const char *name, const char *base) {
@@ -6591,13 +6607,11 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
     script->deferred = !fragment && !dynamic && !script->asynchronous && (module || (src && *src && node_attr(n, "defer")));
     if (src && *src) {
         if (module) {
-            begin_task(s); script->url = module_url(s, "moduleURL", src, s->doc->base);
+            begin_task(s); script->url = script_src_url(s, src);
             if (!script->url) { script->ready = script->failed = true; exception(s); }
             end_task(s);
         } else {
-            /* The generic native resolver rewrites backslashes even for opaque
-             * URLs and may truncate. Use the script-private WHATWG URL binding. */
-            begin_task(s); script->url=module_url(s,"moduleURL",src,s->doc->base);
+            begin_task(s); script->url=script_src_url(s,src);
             if (!script->url) { script->ready=script->failed=true; exception(s); }
             end_task(s);
         }
@@ -6706,7 +6720,7 @@ static void queue_modulepreload(struct web_js_state *s,node_t *node) {
     if(recognized_as&&!str_ieq(as,"script")){
         script_event(s,node,true);link->notified=true;return;
     }
-    char *url=module_url(s,"moduleURL",href,s->doc->base);
+    char *url=script_src_url(s,href);
     if(!url){if(JS_HasException(s->ctx))exception(s);link->notified=true;return;}
     const char *cors=node_attr(node,"crossorigin");
     link->module=request_module(s,url,cors&&str_ieq(cors,"use-credentials")?2:1,node_attr(node,"integrity"),

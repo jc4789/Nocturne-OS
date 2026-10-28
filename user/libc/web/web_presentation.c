@@ -119,7 +119,8 @@ static bool container_feature(node_t *container,int kind,const char *origin,cons
 static char *declared_origin(web_doc *parent,node_t *container,const char *self){
     if(node_attr(container,"srcdoc"))return self?strdup(self):NULL;
     const char *src=node_attr(container,"src");if(!src||!*src)return self?strdup(self):NULL;
-    char *url=NULL,*origin=NULL;if(web_resolve_url_owned(parent->base,src,&url)==1){
+    /* The iframe's src as its navigation parses it (encoding-parse a URL). */
+    char *url=NULL,*origin=NULL;if(doc_encoding_parse_url(parent,src,&url)==1){
         if(!strcmp(url,"about:blank")||!strncmp(url,"about:blank#",12))origin=self?strdup(self):NULL;
         else http_origin_owned(url,&origin);}
     free(url);return origin;
