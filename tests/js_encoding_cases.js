@@ -80,9 +80,12 @@ globalThis.runEncodingCases = function runEncodingCases() {
     const stream = new TextDecoder();
     assert(stream.decode(bom.subarray(0,1),{stream:true}) === '' && stream.decode(bom.subarray(1)) === 'a', 'BOM split');
     if (typeof ArrayBuffer.prototype.transfer === 'function') {
+        // Web IDL's copy of the bytes of a detached buffer source is empty
+        // (WPT encoding/textdecoder-arguments and encodeInto).
         const b = new ArrayBuffer(2), v = new Uint8Array(b); b.transfer();
-        throws(() => decoder.decode(v), 'TypeError', 'detached decode');
-        throws(() => encoder.encodeInto('a',v), 'TypeError', 'detached encodeInto');
+        assert(decoder.decode(v) === '', 'detached decode');
+        const into = encoder.encodeInto('a',v);
+        assert(into.read === 0 && into.written === 0, 'detached encodeInto');
     }
     // SharedArrayBuffer is intentionally excluded: Nocturne does not expose it.
     // Large conversion regression: a bounded implementation must not create a
