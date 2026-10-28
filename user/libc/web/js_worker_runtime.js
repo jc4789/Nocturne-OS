@@ -101,7 +101,7 @@
         get(){if(!blobHandlerTarget(this,type))throw new TypeError('Illegal event handler receiver');return apply(eventGet,fileHandlers,[this])?.[type]||null;},
         set(value){if(!blobHandlerTarget(this,type))throw new TypeError('Illegal event handler receiver');let map=apply(eventGet,fileHandlers,[this]);if(!map){map=eventCreate(null);apply(eventSet,fileHandlers,[this,map]);}map[type]=typeof value==='function'?value:null;}});}
     /* @include js_navigator.js */
-    const {navigator,Interface:WorkerNavigator}=navigatorBridge.create(true);
+    const {navigator,Interface:WorkerNavigator,languagesChanged}=navigatorBridge.create(true);
     /* @include js_encoding.js */
     /* @include js_url.js */
     /* @include js_streams.js */
@@ -365,7 +365,7 @@
         Object.defineProperty(globalThis,scope.name,{value:scope,writable:true,configurable:true});
         Object.setPrototypeOf(globalThis,scope.prototype);
     }
-    Object.defineProperties(globalThis,{name:{get:()=>workerName},onconnect:{get:()=>target.onconnect,set:fn=>target.onconnect=fn},onmessage:{get:()=>target.onmessage,set:fn=>target.onmessage=fn},onmessageerror:{get:()=>target.onmessageerror,set:fn=>target.onmessageerror=fn},onerror:{get:()=>target.onerror,set:fn=>target.onerror=fn},onunhandledrejection:{get:()=>target.onunhandledrejection,set:fn=>target.onunhandledrejection=fn},onrejectionhandled:{get:()=>target.onrejectionhandled,set:fn=>target.onrejectionhandled=fn},onsecuritypolicyviolation:{get:()=>target.onsecuritypolicyviolation,set:fn=>target.onsecuritypolicyviolation=fn}});
+    Object.defineProperties(globalThis,{name:{get:()=>workerName},onconnect:{get:()=>target.onconnect,set:fn=>target.onconnect=fn},onmessage:{get:()=>target.onmessage,set:fn=>target.onmessage=fn},onmessageerror:{get:()=>target.onmessageerror,set:fn=>target.onmessageerror=fn},onerror:{get:()=>target.onerror,set:fn=>target.onerror=fn},onlanguagechange:{get:()=>target.onlanguagechange,set:fn=>target.onlanguagechange=fn},onunhandledrejection:{get:()=>target.onunhandledrejection,set:fn=>target.onunhandledrejection=fn},onrejectionhandled:{get:()=>target.onrejectionhandled,set:fn=>target.onrejectionhandled=fn},onsecuritypolicyviolation:{get:()=>target.onsecuritypolicyviolation,set:fn=>target.onsecuritypolicyviolation=fn}});
     let rejectionBridge=null;
     const rejections=()=>rejectionBridge??=promiseRejectionBridge(event=>dispatchNativeWorkerEvent(target,event),host.promiseIsHandled,fn=>timer(fn,0,[],false));
     /* The console report is the default action of unhandledrejection. */
@@ -380,6 +380,7 @@
         safetyCheck:htmlSafetyBridge.check,
         safetyDynamicCode:htmlSafetyBridge.dynamicCode,
         safetyViolation(init){if(!closed)dispatchNativeWorkerEvent(target,htmlSafetyBridge.violationEvent(init));},
+        languageChange(){if(languagesChanged()&&!closed)dispatchNativeWorkerEvent(target,new Event('languagechange'));},
         start(r){address=r[1];workerName=String(r[5]||"");workerCanCancel=r[6]===true;shared=r[9]===true;installScope(shared);if(shared)delete globalThis.postMessage;if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker source failed','NetworkError');const locationURL=new URL(address);Object.defineProperty(globalThis,'location',{value:Object.freeze({href:address,origin:locationURL.origin,protocol:locationURL.protocol,host:locationURL.host,hostname:locationURL.hostname,port:locationURL.port,pathname:locationURL.pathname,search:locationURL.search,hash:locationURL.hash,toString(){return address;}}),configurable:true});if(!formDataBridge)formDataBridge=initializeWorkerFormData();evalSource(new TextDecoder().decode(r[3]),address);},
         receive(packet,op=2,id=0,kind=0){try{if(op===8||op===9||op===10){workerMessagingBridge.receivePort(id,kind,packet,op!==8);return;}const payload=kind===3?workerMessagingBridge.importExternal(packet):{data:cloneData.deserialize(packet),ports:[]};if(!closed){if(op===13){if(!shared||payload.ports.length!==1)throw new TypeError('Invalid shared worker connection');dispatchNativeWorkerEvent(target,new MessageEvent('connect',{data:'',source:payload.ports[0],ports:payload.ports}));}else dispatchNativeWorkerEvent(target,new MessageEvent('message',{data:payload.data,ports:payload.ports}));}}catch(e){if(!closed)dispatchNativeWorkerEvent(target,new MessageEvent('messageerror'));}},
         loaded(id,r,flags=0){const p=workerFetchBridge.take(id);if(!p||closed)return;p.cleanup();if(r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!p.noCors)){p.reject(new TypeError(r[4]||'Worker fetch failed'));return;}try{p.resolve(workerFetchBridge.networkResponse(r,flags,p.signal,p.method));}catch(error){p.reject(error);}},

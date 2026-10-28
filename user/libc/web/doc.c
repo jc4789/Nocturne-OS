@@ -7,6 +7,7 @@
 #include "nocturne.h"
 #include "webi.h"
 #include "js_atomics.h"
+#include "js_navigator_native.h"
 #include "web_presentation.h"
 #include <webidb_async.h>
 #include <webnet.h>
@@ -381,15 +382,15 @@ static char *doc_absolute_url(const char *base,const char *relative) {
     if(web_resolve_url_owned(base,relative,&url)==1)return url;
     free(url);return NULL;
 }
-static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int preferred,bool image_upgrade,int cors) {
+static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int preferred,bool image_upgrade,int cors,int referrer_policy) {
     if (preferred >= 0 && preferred < d->images.n) {
         struct web_image *im=d->images.v[preferred];
-        if(im->image_upgrade==image_upgrade && im->cors==cors && !strcmp(im->url,abs))return preferred;
+        if(im->image_upgrade==image_upgrade && im->cors==cors && im->referrer_policy==referrer_policy && !strcmp(im->url,abs))return preferred;
     }
     int failed_match = -1;
     for (int i = 0; i < d->images.n; i++) {
         struct web_image *im = d->images.v[i];
-        if (im->image_upgrade!=image_upgrade || im->cors!=cors || strcmp(im->url, abs)) continue;
+        if (im->image_upgrade!=image_upgrade || im->cors!=cors || im->referrer_policy!=referrer_policy || strcmp(im->url, abs)) continue;
         if (!im->done || !im->failed) return i;
         if (failed_match < 0) failed_match = i;
     }
@@ -400,6 +401,7 @@ static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int prefer
     im->url = strdup(abs);
     im->image_upgrade = image_upgrade;
     im->cors = (uint8_t)cors;
+    im->referrer_policy = (uint8_t)referrer_policy;
     if (!im->url) { free(im); return -1; }
     if (d->images.n == d->images.cap) {
         int cap = d->images.cap ? d->images.cap > INT_MAX/2 ? INT_MAX : d->images.cap * 2 : 16;
@@ -418,13 +420,21 @@ static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int prefer
     }
     return idx;
 }
-static int add_image_request(web_doc *d, const char *rel, bool retry_failed, int preferred,bool image_upgrade,int cors) {
+static int add_image_request(web_doc *d, const char *rel, bool retry_failed, int preferred,bool image_upgrade,int cors,int referrer_policy) {
     if(!rel || !*rel)return -1;
     while(is_space((unsigned char)*rel))rel++;
     char *abs=doc_absolute_url(d->base,rel);if(!abs)return -1;
-    int result=add_image_url(d,abs,retry_failed,preferred,image_upgrade,cors);free(abs);return result;
+    int result=add_image_url(d,abs,retry_failed,preferred,image_upgrade,cors,referrer_policy);free(abs);return result;
 }
-static int add_image(web_doc *d, const char *rel) { return add_image_request(d, rel, false, -1,true,WEB_IMAGE_NO_CORS); }
+static int add_image(web_doc *d, const char *rel) { return add_image_request(d, rel, false, -1,true,WEB_IMAGE_NO_CORS,WEBNET_REFERRER_DEFAULT); }
+int doc_element_referrer_policy(const node_t *n) {
+    const char *value=n&&n->type==N_ELEM?node_attr((node_t *)n,"referrerpolicy"):NULL;
+    char token[40];size_t length=value?strlen(value):0;
+    if(!value||length>=sizeof token)return WEBNET_REFERRER_DEFAULT;
+    /* An enumerated attribute: ASCII case-insensitive. */
+    for(size_t i=0;i<length;i++)token[i]=(char)lower((unsigned char)value[i]);
+    return webnet_referrer_policy_token(token,length);
+}
 /* The crossorigin attribute's state: missing is no CORS, an invalid value anonymous. */
 static int image_cors(node_t *n) {
     const char *v = node_attr(n, "crossorigin");
@@ -480,7 +490,7 @@ void doc_image_sync(web_doc *d, node_t *n) {
     bool image_upgrade=!ss && cors==WEB_IMAGE_NO_CORS &&
         !(n->parent && !n->parent->foreign && n->parent->tag==T_picture);
     int requested = add_image_request(d, src, n->image_invalidated,
-        n->image_initialized && !n->image_invalidated ? n->image_request : -1,image_upgrade,cors);
+        n->image_initialized && !n->image_invalidated ? n->image_request : -1,image_upgrade,cors,doc_element_referrer_policy(n));
     free(pick);
     if (!n->image_initialized || n->image_invalidated || requested != n->image_request || has_source != n->image_has_source) {
         n->image_initialized = true; n->image_invalidated = false;
@@ -885,6 +895,16 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
     html_policy_isolation(d,headers,inherited_origin);
     if(!web_presentation_policy_init(d,headers,inherited_origin)){web_free(d);return NULL;}
     d->referrer_policy=webnet_referrer_policy_header(headers,inherited_origin?inherited_origin->referrer_policy:WEBNET_REFERRER_DEFAULT);
+    /* The transport's metadata line (never a server field: it has no
+       field-name) carries the referrer the navigation request sent. */
+    const char *meta=headers?strstr(headers,"\r\nHTTP/Nocturne-Meta cors="):NULL;
+    const char *line_end=meta?strstr(meta+2,"\r\n"):NULL;
+    const char *sent=meta&&line_end?strstr(meta+2," referrer="):NULL;
+    if(sent&&sent<line_end){
+        sent+=10;
+        d->referrer=strndup(sent,(size_t)(line_end-sent));
+        if(!d->referrer){web_free(d);return NULL;}
+    }
     char transport_label[64]={0};
     if(headers){
         struct http_resp response_headers={.headers_full=(char *)headers};char type[512]={0};
@@ -1239,8 +1259,15 @@ void web_tick(web_doc *d, uint64_t now) {
     if(d->native_cancelled)return;
     TICK_STEP(d, TICK_FRAMES, web_frames_tick(d,now));
 }
-n_handle web_wait_queue(void) { return web_atomics_queue(); }
-void web_wait_events(const struct n_event *events, size_t count) { web_atomics_events(events, count); }
+n_handle web_wait_queue(void) {
+    n_handle queue = web_atomics_queue();
+    web_js_languages_watch(queue);
+    return queue;
+}
+void web_wait_events(const struct n_event *events, size_t count) {
+    web_atomics_events(events, count);
+    web_js_languages_events(events, count);
+}
 int web_wait_report(char *out, size_t size) { return web_atomics_report(out, size, uptime_ms()); }
 int64_t web_deadline(web_doc *d) {
     uint64_t now = uptime_ms();
@@ -1477,6 +1504,7 @@ void web_free(web_doc *d) {
     free(d->resolved_link);
     free(d->find_text);
     free((void *)d->inherited_url);
+    free(d->referrer);
     free(d);
 }
 

@@ -36,9 +36,9 @@ int main(void){
     check(prepare_referrer(&j)&&append_referrer(&j,"http://localhost:8080/")&&j.outgoing.length>0,"loopback potentially trustworthy target");clear(&j);
     j=job("https://referrer.test/path","http://127.evil.test/",5);
     check(prepare_referrer(&j)&&append_referrer(&j,"http://127.evil.test/")&&j.outgoing.length==0,"DNS name with 127 prefix still suppresses downgrade referrer");clear(&j);
-    check(referrer_trustworthy("http://127.0.0.1/")&&referrer_trustworthy("http://127.255.255.255:80/"),"all valid IPv4 127/8 literals are trustworthy");
-    check(!referrer_trustworthy("http://127.256.0.1/")&&!referrer_trustworthy("http://127.1.2.3.evil/")&&!referrer_trustworthy("http://127.1/")&&!referrer_trustworthy("http://a.localhost/"),"unsupported native spellings and unguaranteed DNS names not upgraded");
-    check(referrer_trustworthy("http://[::1]:8080/")&&!referrer_trustworthy("http://[::2]/"),"canonical IPv6 loopback trust distinct from transport support");
+    check(potentially_trustworthy("http://127.0.0.1/")&&potentially_trustworthy("http://127.255.255.255:80/"),"all valid IPv4 127/8 literals are trustworthy");
+    check(!potentially_trustworthy("http://127.256.0.1/")&&!potentially_trustworthy("http://127.1.2.3.evil/")&&!potentially_trustworthy("http://127.1/")&&!potentially_trustworthy("http://a.localhost/"),"unsupported native spellings and unguaranteed DNS names not upgraded");
+    check(potentially_trustworthy("http://[::1]:8080/")&&!potentially_trustworthy("http://[::2]/"),"canonical IPv6 loopback trust distinct from transport support");
     struct url_owned ipv6;check(url_parse_owned_result_n("http://[::1]/",13,&ipv6)==HTTP_URL_INVALID,"existing IPv6 transport rejection remains explicit");
     j=job("https://referrer.test/path","https://target.test/",7);
     check(prepare_referrer(&j)&&append_referrer(&j,"https://target.test/")&&!strcmp(j.referrer,origin),"cross-origin hop reduces stored referrer");

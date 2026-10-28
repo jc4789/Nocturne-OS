@@ -60,6 +60,22 @@ static inline bool webnet_report_fields_valid(const char *method,const char *hea
 static inline size_t webnet_response_limit(enum webnet_kind kind) {
     return kind == WEBNET_CLASSIC || kind == WEBNET_MODULE ? WEBNET_SCRIPT_BODY_LIMIT : WEBNET_BODY_LIMIT;
 }
+/* Fetch's request destination, in the standard's order; EMPTY is the empty
+   string (fetch(), XHR, EventSource, beacons). Trusted requester metadata,
+   never an author header: it selects the default Accept value and is sent as
+   Sec-Fetch-Dest (Fetch Metadata). */
+enum webnet_destination { WEBNET_DEST_EMPTY, WEBNET_DEST_AUDIO, WEBNET_DEST_AUDIOWORKLET, WEBNET_DEST_DOCUMENT,
+    WEBNET_DEST_EMBED, WEBNET_DEST_FONT, WEBNET_DEST_FRAME, WEBNET_DEST_IFRAME, WEBNET_DEST_IMAGE,
+    WEBNET_DEST_JSON, WEBNET_DEST_MANIFEST, WEBNET_DEST_OBJECT, WEBNET_DEST_PAINTWORKLET, WEBNET_DEST_REPORT,
+    WEBNET_DEST_SCRIPT, WEBNET_DEST_SERVICEWORKER, WEBNET_DEST_SHAREDWORKER, WEBNET_DEST_STYLE,
+    WEBNET_DEST_TEXT, WEBNET_DEST_TRACK, WEBNET_DEST_VIDEO, WEBNET_DEST_WEBIDENTITY, WEBNET_DEST_WORKER, WEBNET_DEST_XSLT,
+    WEBNET_DEST_COUNT };
+static inline const char *webnet_destination_name(enum webnet_destination d) {
+    static const char *const names[WEBNET_DEST_COUNT] = {"", "audio", "audioworklet", "document", "embed", "font",
+        "frame", "iframe", "image", "json", "manifest", "object", "paintworklet", "report", "script",
+        "serviceworker", "sharedworker", "style", "text", "track", "video", "webidentity", "worker", "xslt"};
+    return (unsigned)d < WEBNET_DEST_COUNT ? names[d] : "";
+}
 enum webnet_credentials { WEBNET_CREDENTIALS_OMIT, WEBNET_CREDENTIALS_SAME_ORIGIN, WEBNET_CREDENTIALS_INCLUDE };
 enum webnet_cache { WEBNET_CACHE_DEFAULT, WEBNET_CACHE_NO_STORE, WEBNET_CACHE_RELOAD,
                     WEBNET_CACHE_NO_CACHE, WEBNET_CACHE_FORCE_CACHE, WEBNET_CACHE_ONLY_IF_CACHED };
@@ -122,6 +138,15 @@ struct webnet_request {
     /* Initiator policy container COEP require-corp: a cross-origin no-cors
        response without Cross-Origin-Resource-Policy is same-origin only. */
     bool require_corp;
+    enum webnet_destination destination;
+    /* Navigation requests only. user_activation: HTML's request user-activation
+       (a click or key press, or the browser's own UI), sent as Sec-Fetch-User.
+       browser_ui: the user asked the browser itself (address bar, bookmark,
+       home, history list), so there is no initiating site: Sec-Fetch-Site none. */
+    bool user_activation, browser_ui;
+    /* The browser's developer tools record this request: its response says
+       which request fields the final hop actually sent (sent_headers). */
+    bool report_sent;
 };
 enum webnet_event { WEBNET_COMPLETE, WEBNET_HEADERS, WEBNET_CHUNK, WEBNET_END, WEBNET_UPLOAD };
 struct webnet_response {
@@ -133,6 +158,9 @@ struct webnet_response {
     const char *error; /* empty for a received HTTP response, including HTTP errors */
     enum webnet_event event;
     size_t uploaded;
+    /* With report_sent: the request fields the final hop sent, as sent
+       ("Name: value" CRLF lines, Host first); otherwise empty. */
+    const char *sent_headers;
 };
 typedef void (*webnet_callback)(webnet *, uint64_t id, uint64_t generation,
                                const struct webnet_response *, void *opaque);

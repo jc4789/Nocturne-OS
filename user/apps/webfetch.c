@@ -30,6 +30,9 @@ struct job {
     char *non_simple;
     char *response_headers;
     size_t response_headers_len;
+    /* WEBNET_WIRE_SENT_HEADERS: the request fields the latest hop sent, as
+       http.c writes them (Host, User-Agent, Content-Length, then outgoing). */
+    struct header_buffer sent;
     char *body;
     size_t body_len, body_cap;
     int status;
@@ -38,6 +41,11 @@ struct job {
     size_t cookie_len, cookie_cap;
     bool hop_cookies, redirect_cross_site;
     bool cors_tainted, origin_tainted, redirected, opaque_tainted;
+    /* Fetch request metadata (WEBNET_WIRE_FETCH_METADATA): the destination,
+       WEBNET_FETCH_* flags, and the Sec-Fetch-Site relation of every URL in
+       the request's URL list so far (0 same-origin, 1 same-site, 2 cross-site). */
+    struct webnet_wire_fetch fetch;
+    unsigned fetch_site;
     /* An element's no-cors subresource (an image, a stylesheet) that left the
        request origin: its response tainting is opaque. The browser still uses
        the bytes, unlike fetch()'s opaque response, but they are not
@@ -293,7 +301,7 @@ static bool prepare_referrer(struct job *j) {
     if(strlen(next)>4096){free(next);next=strdup(origin_url);if(!next){free(origin_url);return fail(j,"Out of memory reducing referrer");}}
     free(j->referrer);j->referrer=next;j->referrer_origin=origin_url;return true;
 }
-static bool referrer_trustworthy(const char *url) {
+static bool potentially_trustworthy(const char *url) {
     if(!strncmp(url,"https://",8))return true;
     if(strncmp(url,"http://",7))return false;
     const char *host=url+7;
@@ -316,7 +324,7 @@ static bool append_referrer(struct job *j,const char *current) {
     if(!j->referrer||!*j->referrer)return true;
     bool same=j->referrer_origin&&strlen(j->referrer_origin)==strlen(j->target_origin)+1&&
         !memcmp(j->referrer_origin,j->target_origin,strlen(j->target_origin));
-    bool downgrade=referrer_trustworthy(j->referrer)&&!referrer_trustworthy(current);
+    bool downgrade=potentially_trustworthy(j->referrer)&&!potentially_trustworthy(current);
     int policy=j->referrer_policy?j->referrer_policy:WEBNET_REFERRER_STRICT_ORIGIN_CROSS;
     const char *value=j->referrer;
     if(j->wire.user_navigation&WEBNET_WIRE_NO_REFERRER)policy=WEBNET_REFERRER_NONE;
@@ -892,6 +900,74 @@ static bool validate_headers(struct job *j) {
 out:
     free(name); free(seen.p); free(names.p); return ok;
 }
+/* Fetch: a navigation request's destination is document, embed, frame, iframe or object. */
+static bool navigation_request(const struct job *j) {
+    switch (j->fetch.destination) {
+    case WEBNET_DEST_DOCUMENT: case WEBNET_DEST_EMBED: case WEBNET_DEST_FRAME:
+    case WEBNET_DEST_IFRAME: case WEBNET_DEST_OBJECT: return true;
+    default: return false;
+    }
+}
+/* Fetch's fetch step: the Accept value for a request without one, by destination. */
+static const char *accept_value(const struct job *j) {
+    switch (j->fetch.destination) {
+    case WEBNET_DEST_DOCUMENT: case WEBNET_DEST_FRAME: case WEBNET_DEST_IFRAME:
+        return "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+    case WEBNET_DEST_IMAGE: return "image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5";
+    case WEBNET_DEST_JSON: return "application/json,*/*;q=0.5";
+    case WEBNET_DEST_STYLE: return "text/css,*/*;q=0.1";
+    case WEBNET_DEST_TEXT: return "text/plain,*/*;q=0.5";
+    default: return "*/*";
+    }
+}
+/* The user's preferred languages, most wanted first, as an Accept-Language
+   value: "ja,en-US;q=0.9,en;q=0.8". The list is the same one navigator.languages
+   reports (n_user_languages). */
+static bool append_accept_language(struct job *j) {
+    char languages[N_USER_LANGUAGES_MAX];
+    n_result n = n_user_languages(languages, sizeof languages);
+    if (n <= 0) return true;
+    if (!header_text(j, &j->outgoing, "Accept-Language: ")) return false;
+    unsigned rank = 0;
+    for (const char *p = languages; *p;) {
+        size_t length = strcspn(p, ",");
+        if (length) {
+            char q[16] = "";
+            /* Weights fall by a tenth and stay at 0.1 past the tenth language. */
+            if (rank) snprintf(q, sizeof q, ";q=0.%u", rank < 9 ? 10 - rank : 1);
+            if ((rank && !header_text(j, &j->outgoing, ",")) || !header_append(j, &j->outgoing, p, length) ||
+                !header_text(j, &j->outgoing, q)) return false;
+            rank++;
+        }
+        p += length; if (*p) p++;
+    }
+    return header_text(j, &j->outgoing, "\r\n");
+}
+/* Sec-Fetch-Site: how the request's origin relates to every URL of the
+   request's URL list so far (Fetch Metadata 2.3). Called once per URL, the
+   first and each redirect target, before that hop's request is sent. */
+static void note_fetch_site(struct job *j, const char *url, const char *url_origin) {
+    if (j->fetch.flags & WEBNET_FETCH_BROWSER_UI) return;
+    unsigned relation = j->origin && url_origin && !strcmp(j->origin, url_origin) ? 0u :
+        j->origin && webcookie_same_site(j->cookies, j->origin, url) ? 1u : 2u;
+    if (relation > j->fetch_site) j->fetch_site = relation;
+}
+/* Fetch Metadata's headers, for a request to a potentially trustworthy URL. */
+static bool append_fetch_metadata(struct job *j, const char *current) {
+    if (!potentially_trustworthy(current)) return true;
+    const char *destination = webnet_destination_name((enum webnet_destination)j->fetch.destination);
+    const char *mode = navigation_request(j) || j->wire.kind == WEBNET_NAVIGATION ? "navigate" :
+        j->wire.kind == WEBNET_WEBSOCKET ? "websocket" :
+        (j->wire.user_navigation & WEBNET_WIRE_SAME_ORIGIN) ? "same-origin" : cors_kind(j) ? "cors" : "no-cors";
+    static const char *const sites[] = {"same-origin", "same-site", "cross-site"};
+    const char *site = (j->fetch.flags & WEBNET_FETCH_BROWSER_UI) ? "none" : sites[j->fetch_site];
+    return header_text(j, &j->outgoing, "Sec-Fetch-Dest: ") && header_text(j, &j->outgoing, *destination ? destination : "empty") &&
+        header_text(j, &j->outgoing, "\r\nSec-Fetch-Mode: ") && header_text(j, &j->outgoing, mode) &&
+        header_text(j, &j->outgoing, "\r\nSec-Fetch-Site: ") && header_text(j, &j->outgoing, site) &&
+        header_text(j, &j->outgoing, "\r\n") &&
+        (!navigation_request(j) || !(j->fetch.flags & WEBNET_FETCH_USER_ACTIVATION) ||
+         header_text(j, &j->outgoing, "Sec-Fetch-User: ?1\r\n"));
+}
 /* Browser-generated fields remain separate from author classification. Cache
    lookup and conditional validation below own their network/storage effects;
    these fields never contaminate the CORS preflight author-header list. */
@@ -912,18 +988,32 @@ static bool cache_headers(struct job *j) {
 static bool prepare_outgoing(struct job *j, const char *current, const char *method, bool cross) {
     j->outgoing.length = 0;
     if (!header_text(j, &j->outgoing, j->headers)) return false;
+    /* Fetch's fetch step adds Accept and Accept-Language the author did not
+       set, and Upgrade Insecure Requests marks every navigation request (no
+       host here is a preloadable HSTS host). WebSocket handshakes have their
+       own fields. */
+    if (j->wire.kind != WEBNET_WEBSOCKET) {
+        if (!field_exists(j->headers, "Accept") && !(header_text(j, &j->outgoing, "Accept: ") &&
+            header_text(j, &j->outgoing, accept_value(j)) && header_text(j, &j->outgoing, "\r\n"))) return false;
+        if (!field_exists(j->headers, "Accept-Language") && !append_accept_language(j)) return false;
+        if (navigation_request(j) && !header_text(j, &j->outgoing, "Upgrade-Insecure-Requests: 1\r\n")) return false;
+    }
+    /* Fetch "append a request Origin header": always for a CORS request, and
+       for any other request (no-cors, a navigation, a form POST) whose
+       method is neither GET nor HEAD, nulled by its referrer policy. */
     const char *serialized_origin=request_origin(j);
-    if(no_cors(j)){
+    if(!cors_kind(j)&&j->wire.kind!=WEBNET_REPORT){
         int policy=j->referrer_policy?j->referrer_policy:WEBNET_REFERRER_STRICT_ORIGIN_CROSS;
-        bool downgrade=j->origin&&referrer_trustworthy(j->origin)&&!referrer_trustworthy(current);
+        bool downgrade=j->origin&&potentially_trustworthy(j->origin)&&!potentially_trustworthy(current);
         if((j->wire.user_navigation&WEBNET_WIRE_NO_REFERRER)||policy==WEBNET_REFERRER_NONE ||
            (policy==WEBNET_REFERRER_SAME_ORIGIN&&cross) ||
            ((policy==WEBNET_REFERRER_DOWNGRADE||policy==WEBNET_REFERRER_STRICT_ORIGIN||policy==WEBNET_REFERRER_STRICT_ORIGIN_CROSS)&&downgrade))serialized_origin="null";
     }
-    if ((cors_kind(j) || j->wire.kind==WEBNET_REPORT || (no_cors(j) && strcmp(method,"GET") && strcmp(method,"HEAD"))) && !(header_text(j, &j->outgoing, "Origin: ") &&
+    if ((cors_kind(j) || j->wire.kind==WEBNET_REPORT || (strcmp(method,"GET") && strcmp(method,"HEAD"))) && !(header_text(j, &j->outgoing, "Origin: ") &&
         header_text(j, &j->outgoing,serialized_origin) && header_text(j, &j->outgoing, "\r\n"))) return false;
     if (!cache_headers(j)) return false;
     if(!append_referrer(j,current))return false;
+    if (!append_fetch_metadata(j, current)) return false;
     /* Fetch's network layer owns content-coding negotiation, after author
        headers have been classified for CORS. Advertise only our real decoder;
        byte ranges must keep their representation offsets (Fetch step 19). */
@@ -967,6 +1057,35 @@ static void remove_body_headers(char *headers) {
     remove_request_header(headers, "Content-Language");
     remove_request_header(headers, "Content-Location");
     remove_request_header(headers, "Content-Type");
+}
+/* The fields this hop sends, for the browser's developer tools: the ones
+   http.c's request_head adds ahead of the prepared fields, then those. The
+   host is the URL's, without any userinfo, and its port only when not the
+   scheme's default. Only when the request asked (WEBNET_WIRE_SENT_HEADERS). */
+static bool record_sent(struct job *j, const struct http_req *q) {
+    if (!(j->wire.user_navigation & WEBNET_WIRE_SENT_HEADERS)) return true;
+    j->sent.length = 0;
+    if (j->sent.p) j->sent.p[0] = 0;
+    const char *authority = strstr(q->url, "://");
+    if (!authority) return fail(j, "Invalid request URL for developer tools");
+    bool tls = !strncasecmp(q->url, "https:", 6);
+    authority += 3;
+    const char *end = authority + strcspn(authority, "/?#");
+    const char *at = memchr(authority, '@', (size_t)(end - authority));
+    if (at) authority = at + 1;
+    size_t host_len = (size_t)(end - authority);
+    const char *port = NULL;
+    for (const char *p = end; p > authority; p--) if (p[-1] == ':') { port = p - 1; break; } else if (p[-1] == ']') break;
+    if (port && ((tls && !strncmp(port, ":443", (size_t)(end - port)) && end - port == 4) ||
+                 (!tls && !strncmp(port, ":80", (size_t)(end - port)) && end - port == 3))) host_len = (size_t)(port - authority);
+    char length[64] = "";
+    if (q->body || !strcmp(q->method, "POST") || !strcmp(q->method, "PUT"))
+        snprintf(length, sizeof length, "Content-Length: %zu\r\n", q->body_len);
+    if (!header_append(j, &j->sent, "Host: ", 6) || !header_append(j, &j->sent, authority, host_len) ||
+        !header_append(j, &j->sent, "\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\n", sizeof("\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\n") - 1) ||
+        !header_append(j, &j->sent, length, strlen(length)) ||
+        !header_append(j, &j->sent, q->headers ? q->headers : "", q->headers ? strlen(q->headers) : 0)) return false;
+    return true;
 }
 /* One first-hop observation, only after trusted debug negotiation. Never
    retain/log names, values, bodies, URLs, or hashes of credential material. */
@@ -1205,9 +1324,16 @@ static bool response_headers(struct job *j, const struct http_resp *r, bool cros
     if (j->wire.user_navigation & WEBNET_WIRE_STATUS_LINE) {
         const char *reason = http_response_status_text(r);
         size_t reason_len = strlen(reason);
+        /* A navigation's document learns the referrer its last hop actually
+           sent (HTML: the document's referrer), already a canonical URL. */
+        const char *referrer = j->wire.kind == WEBNET_NAVIGATION && j->referrer ? j->referrer : "";
+        size_t referrer_len = strlen(referrer);
         char start[32], end[320];
         int a = snprintf(start, sizeof start, "HTTP/1.1 %d ", r->status);
-        int b = snprintf(end, sizeof end, "\r\nHTTP/Nocturne-Meta cors=%d redirected=%d%s\r\n", j->cors_tainted, j->redirected,j->opaque_tainted||j->resource_opaque?" opaque=1":"");
+        int m = snprintf(end, sizeof end, "\r\nHTTP/Nocturne-Meta cors=%d redirected=%d%s%s", j->cors_tainted, j->redirected,
+                         j->opaque_tainted||j->resource_opaque?" opaque=1":"", referrer_len?" referrer=":"");
+        int b = m >= 0 && (size_t)m < sizeof end ? snprintf(end + m, sizeof end - (size_t)m, "\r\n") : -1;
+        if (b >= 0) b += m;
         if (b >= 0 && (size_t)b < sizeof end && j->debug_request_measured) {
             int c = snprintf(end + b, sizeof end - (size_t)b,
                 "HTTP/Nocturne-Request bytes=%lu ctl=%lu nonascii=%lu cookie=%u content_length=%u\r\n",
@@ -1216,15 +1342,34 @@ static bool response_headers(struct job *j, const struct http_resp *r, bool cros
             if (c < 0 || (size_t)c >= sizeof end - (size_t)b) return fail(j, "Request diagnostic metadata length overflow");
             b += c;
         }
-        if (a < 0 || b < 0 || (size_t)a >= sizeof start || (size_t)b >= sizeof end ||
-            reason_len > SIZE_MAX - (size_t)a - (size_t)b - 1) return fail(j, "Response metadata length overflow");
-        prefix_len = (size_t)a + reason_len + (size_t)b;
+        if (a < 0 || b < 0 || (size_t)a >= sizeof start || (size_t)b >= sizeof end || referrer_len > 4096 || strpbrk(referrer, "\r\n ") ||
+            reason_len > SIZE_MAX - (size_t)a - (size_t)b - referrer_len - 1) return fail(j, "Response metadata length overflow");
+        /* The sent fields: "HTTP/Nocturne-Sent " ahead of each line. Field
+           values never hold CR or LF (validated before the request went). */
+        size_t sent_lines = 0;
+        const char *sent = (j->wire.user_navigation & WEBNET_WIRE_SENT_HEADERS) && j->sent.p ? j->sent.p : "";
+        for (const char *p = sent; *p; p = strstr(p, "\r\n") + 2) sent_lines++;
+        size_t sent_len = strlen(sent);
+        if (sent_lines > (SIZE_MAX - sent_len) / 32) return fail(j, "Response metadata length overflow");
+        sent_len += sent_lines * (sizeof "HTTP/Nocturne-Sent " - 1);
+        if (sent_len > SIZE_MAX - (size_t)a - (size_t)b - referrer_len - reason_len - 1) return fail(j, "Response metadata length overflow");
+        prefix_len = (size_t)a + reason_len + (size_t)b + referrer_len + sent_len;
         if (prefix_len > webnet_wire_header_limit(j->wire.user_navigation)) return fail(j, "Response metadata exceeds negotiated representation");
         prefix = malloc(prefix_len + 1);
         if (!prefix) return fail(j, "Out of memory storing response metadata");
-        memcpy(prefix, start, (size_t)a);
-        memcpy(prefix + a, reason, reason_len);
-        memcpy(prefix + a + reason_len, end, (size_t)b + 1);
+        char *at = prefix;
+        memcpy(at, start, (size_t)a); at += a;
+        memcpy(at, reason, reason_len); at += reason_len;
+        memcpy(at, end, (size_t)m); at += m;
+        memcpy(at, referrer, referrer_len); at += referrer_len;
+        memcpy(at, end + m, (size_t)(b - m)); at += b - m;
+        for (const char *p = sent; *p;) {
+            const char *line_end = strstr(p, "\r\n") + 2;
+            memcpy(at, "HTTP/Nocturne-Sent ", sizeof "HTTP/Nocturne-Sent " - 1); at += sizeof "HTTP/Nocturne-Sent " - 1;
+            memcpy(at, p, (size_t)(line_end - p)); at += line_end - p;
+            p = line_end;
+        }
+        *at = 0;
     }
     size_t limit = webnet_wire_header_limit(j->wire.user_navigation);
     size_t required = prefix_len;
@@ -1390,6 +1535,7 @@ static bool run_http(struct job *j) {
         if (cors_kind(j) && cross) j->cors_tainted = true;
         if(no_cors(j) && cross)j->opaque_tainted=true;
         if(j->wire.kind==WEBNET_RESOURCE && cross)j->resource_opaque=true;
+        note_fetch_site(j, current, j->target_origin);
         const char *method = drop_body ? "GET" : j->method;
         /* Redirects can remove authorization/body fields; rederive the preflight names. */
         if (!validate_headers(j)) return false;
@@ -1405,6 +1551,7 @@ static bool run_http(struct job *j) {
                              drop_body ? 0 : j->wire.body_len,
                              left, body_cb, j, cookie_header};
         observe_request(j, &q);
+        if (!record_sent(j, &q)) return false;
         struct http_resp r={0};
         size_t cookie_start=j->cookie_len; j->cookie_start = cookie_start; j->stream_final = false; j->hop_method = method;
         size_t body_limit = webnet_wire_response_limit(j->wire.kind, j->wire.user_navigation);
@@ -1746,6 +1893,11 @@ static bool ws_handshake(struct websocket *ws, const char *http_url, const struc
     }
     char *origin = NULL;
     if (http_origin_owned(j->document, &origin) != HTTP_URL_TUPLE) { free(origin); origin = NULL; }
+    /* The handshake is a Fetch with mode websocket: Sec-Fetch-Site relates the
+       creating document's origin to the socket's URL. */
+    if (origin && !j->origin) { j->origin = strdup(origin); if (!j->origin) { free(origin); free(key); return fail(j, "Out of memory preparing WebSocket origin"); } }
+    if (!j->target_origin && http_origin_owned(http_url, &j->target_origin) != HTTP_URL_TUPLE) { free(j->target_origin); j->target_origin = NULL; }
+    note_fetch_site(j, http_url, j->target_origin);
     struct header_buffer *b = &j->outgoing; b->length = 0;
     char port[16] = "";
     if (u->port != (u->tls ? 443 : 80)) snprintf(port, sizeof port, ":%u", u->port);
@@ -1754,7 +1906,8 @@ static bool ws_handshake(struct websocket *ws, const char *http_url, const struc
         header_text(j, b, "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ") && header_text(j, b, key) &&
         header_text(j, b, "\r\nSec-WebSocket-Version: 13\r\nOrigin: ") && header_text(j, b, origin ? origin : "null") &&
         header_text(j, b, "\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n") &&
-        header_text(j, b, j->headers);
+        header_text(j, b, j->headers) && header_text(j, b, "Accept: */*\r\n") && append_accept_language(j) &&
+        append_fetch_metadata(j, http_url);
     free(origin); free(key);
     if (ok && j->wire.credentials != WEBNET_CREDENTIALS_OMIT) {
         struct webcookie_context c = {http_url, cookie_site_url(j), "GET", false, true, false};
@@ -1908,7 +2061,8 @@ static int run_one(n_handle input,n_handle output) {
         ((w->user_navigation & WEBNET_WIRE_DEBUG_REQUEST) &&
          ((w->kind != WEBNET_RESOURCE && w->kind != WEBNET_CLASSIC && w->kind != WEBNET_MODULE &&
            w->kind != WEBNET_NAVIGATION) || !(w->user_navigation & WEBNET_WIRE_STATUS_LINE))) ||
-        ((w->user_navigation & (WEBNET_WIRE_STREAM|WEBNET_WIRE_REFERRER)) && w->kind != WEBNET_FETCH) ||
+        ((w->user_navigation & WEBNET_WIRE_STREAM) && w->kind != WEBNET_FETCH) ||
+        ((w->user_navigation & WEBNET_WIRE_REFERRER) && (w->kind == WEBNET_REPORT || w->kind == WEBNET_WEBSOCKET)) ||
         ((input==output)!=((w->user_navigation&WEBNET_WIRE_SERVICE)!=0))) { job_free_io(j); free(j); return 1; }
     bool socket = w->kind == WEBNET_WEBSOCKET, socket_ran = false;
     struct webnet_wire_referrer ref={0};
@@ -1925,6 +2079,16 @@ static int run_one(n_handle input,n_handle output) {
             job_free_io(j);free(j);return 1;
         }
         extended_size+=(uint64_t)top.length+sizeof top;
+    }
+    if(w->user_navigation&WEBNET_WIRE_FETCH_METADATA){
+        struct webnet_wire_fetch *f=&j->fetch;
+        if(!job_read_all(j,f,sizeof *f)||f->destination>=WEBNET_DEST_COUNT||
+           (f->flags&~(WEBNET_FETCH_USER_ACTIVATION|WEBNET_FETCH_BROWSER_UI))||
+           (f->flags&&w->kind!=WEBNET_NAVIGATION)||((f->flags&WEBNET_FETCH_BROWSER_UI)&&!(w->user_navigation&WEBNET_WIRE_USER_NAVIGATION))||
+           (socket&&f->destination!=WEBNET_DEST_EMPTY)){
+            job_free_io(j);free(j);return 1;
+        }
+        extended_size+=sizeof *f;
     }
     if(extended_size>SIZE_MAX-8){job_free_io(j);free(j);return 1;}
     j->url = read_string(j,w->url_len, false); j->document = read_string(j,w->origin_len, false);
@@ -2021,7 +2185,7 @@ static int run_one(n_handle input,n_handle output) {
     free(j->backlog);
     free(j->origin); free(j->target_origin);free(j->final_url);free(j->referrer);free(j->referrer_origin);
     free(j->top_level_url);free(j->top_origin);
-    free(j->url); free(j->document); free(j->method); free(j->headers); free(j->request_body); free(j->body); free(j->response_headers); free(j->cookie_events); free(j->non_simple); free(j->outgoing.p);
+    free(j->url); free(j->document); free(j->method); free(j->headers); free(j->request_body); free(j->body); free(j->response_headers); free(j->cookie_events); free(j->non_simple); free(j->outgoing.p); free(j->sent.p);
     free(j->partition);free(j->cache_body.p);cache_free(j->cached);webcookie_free(j->cookies); job_free_io(j); free(j);
     return ok ? 0 : 1;
 }

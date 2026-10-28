@@ -78,7 +78,31 @@ struct web_request {
     int cache_mode; /* Fetch: 0 default, 1 no-store, 2 reload, 3 no-cache, 4 force-cache, 5 only-if-cached. */
     bool stream_response;
     bool require_corp; /* initiator COEP require-corp */
+    int destination; /* Fetch request destination, enum webnet_destination (0 is "") */
 };
+/* One navigation of the top-level document (HTML "navigate"), with its source
+   snapshot: the document that asked for it and whether that document's window
+   had transient activation. Strings are borrowed until the callback returns. */
+enum { WEB_NAVIGATE_PUSH, WEB_NAVIGATE_RELOAD, WEB_NAVIGATE_REPLACE };
+struct web_navigation {
+    const char *url;
+    int history;             /* WEB_NAVIGATE_* */
+    const void *body;        /* the POST body, or NULL for GET */
+    size_t body_length;
+    const char *content_type; /* with a body */
+    const char *target;      /* NULL, "" or "_self"/"_top"/"_parent" for this window; "_blank" for a new one */
+    const char *initiator;   /* the source document's URL: the request's origin */
+    const char *referrer;    /* referrer source URL; NULL or "" sends no Referer (noreferrer) */
+    int referrer_policy;     /* enum webnet_referrer_policy */
+    bool user_activation;    /* the source window had transient activation */
+};
+/* HTML's source snapshot for a navigation the document itself asks for (a
+   hyperlink, a form, location, a meta refresh): the initiator and referrer
+   of its fetch client, the referrer policy, and its window's transient
+   activation. A hyperlink or form element (or NULL) contributes its
+   referrerpolicy attribute and rel=noreferrer. Fills only those fields; the
+   strings stay valid while the document lives. */
+void web_navigation_source(web_doc *, web_node *element, struct web_navigation *);
 enum { WEB_HISTORY_INFO, WEB_HISTORY_PUSH, WEB_HISTORY_REPLACE, WEB_HISTORY_GO, WEB_HISTORY_SCROLL };
 struct web_history {
     uint64_t entry;
@@ -154,11 +178,9 @@ struct web_host {
        may pump native network/UI only: no author JS, document replacement or
        pending-record destruction. Return false on navigation/cancellation. */
     bool (*wait_request)(void *opaque, uint64_t id, const bool *completed);
-    void (*navigate)(void *opaque, const char *url, const char *post);
-    /* Native form bytes are not a NUL-terminated urlencoded substitute.
-       The host must copy transient data before returning to the JS task. */
-    void (*navigate_form)(void *opaque, const char *url, const void *body,
-                          size_t length, const char *content_type, const char *target);
+    /* Form bytes are not NUL-terminated. The host copies what it keeps
+       before returning to the JS task. */
+    void (*navigate)(void *opaque, const struct web_navigation *navigation);
     /* level is a WEB_CONSOLE_* value. */
     void (*console)(void *opaque, int level, const char *message);
     void (*scroll)(void *opaque, int *x, int *y);
@@ -181,7 +203,6 @@ struct web_host {
     void (*cookie_set)(void *opaque, const char *url, const char *value);
     /* Actual runtime cookie-jar capability; NULL means unavailable/unknown. */
     bool (*cookie_enabled)(void *opaque);
-    void (*navigate_mode)(void *opaque, const char *url, int mode); /* 0 assign, 1 reload, 2 replace */
     /* origin is derived from the native document URL by the private URL parser,
        never a page-selected directory. Output text transfers malloc ownership. */
     int (*storage)(void *opaque, const char *origin, const struct web_storage_request *request,
@@ -265,8 +286,9 @@ int64_t web_deadline(web_doc *d);
 bool web_rendering_wanted(web_doc *d);
 void web_rendering_now(web_doc *d, double period_ms);
 /* The event queue the browser's main loop waits on. Atomics.waitAsync waiters
- * report into it; the loop adds its window and transports with its own tokens
- * and hands every report it receives to web_wait_events. */
+ * and the watch on the user's languages (languagechange) report into it; the
+ * loop adds its window and transports with its own tokens and hands every
+ * report it receives to web_wait_events. */
 n_handle web_wait_queue(void);
 void web_wait_events(const struct n_event *events, size_t count);
 /* Debug summary of the realm waits behind web_wait_queue; 0 when none. */
@@ -441,6 +463,9 @@ int web_js_dialog_submit(web_doc *d, web_node *submitter);
 /* Native form activation: validates the actual active owner/family and its immutable sandbox. */
 bool web_sandbox_form_submission_allowed(web_doc *top, web_node *submitter);
 bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request *request);
+/* HTML "submit" after its submit event: a dialog method closes the dialog,
+   any other method navigates with the form's source snapshot. */
+void web_form_navigate(web_doc *d, web_node *submitter);
 void web_submit_request_free(struct web_form_request *request);
 bool web_submit(web_doc *d, web_node *submitter, char **url, char **body);
 bool web_input_is_file(web_node *input);

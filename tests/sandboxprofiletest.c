@@ -24,7 +24,7 @@ static void receive(void *unused,int level,const char *text){
     else if(!strncmp(text,"Frame sandbox policy:",21)){
         policy_logs++;if(strstr(text,"private-path")||strstr(text,"private-query")||strstr(text,"private-token"))policy_private=false;
         puts(text);
-    }else if(level>=2){errors++;printf("ERROR %s\n",text);}
+    }else if(level==2){errors++;printf("ERROR %s\n",text);}
 }
 static bool request(void *unused,const struct web_request *r){
     for(unsigned i=0;i<32;i++)if(!queued[i].used){queued[i].id=r->id;queued[i].kind=r->kind;
@@ -32,9 +32,8 @@ static bool request(void *unused,const struct web_request *r){
     return false;
 }
 static void cancel(void *unused,uint64_t id){for(unsigned i=0;i<32;i++)if(queued[i].id==id)queued[i].used=false;}
-static void navigate(void *unused,const char *url,const char *post){navigations++;}
-static void navigate_form(void *unused,const char *url,const void *body,size_t length,const char *type,const char *target){
-    if(target&&!strcmp(target,"_blank"))auxiliary++;else navigations++;
+static void navigate(void *unused,const struct web_navigation *n){
+    if(n->target&&!strcmp(n->target,"_blank"))auxiliary++;else navigations++;
 }
 static node_t *find_id(web_doc *d,const char *id){
     for(node_t *n=d->root;n;){if(n->type==N_ELEM && node_attr(n,"id") && !strcmp(node_attr(n,"id"),id))return n;
@@ -108,7 +107,7 @@ int main(void){
     check("missing-same-origin-blocked",!sandbox_supported(sandbox_parse("allow-scripts",known,sizeof known)));
     check("unactivated-top-grant-outside-subset",!sandbox_supported(sandbox_parse("allow-same-origin allow-scripts allow-top-navigation",known,sizeof known)));
     char overlong[4100];memset(overlong,' ',4097);strcpy(overlong+4097,"x");check("overlong-policy-fail-closed",!sandbox_supported(sandbox_parse(overlong,known,sizeof known)));
-    struct web_host host={.request=request,.cancel=cancel,.console=receive,.navigate=navigate,.navigate_form=navigate_form,.debug_js=true,.js_task_budget_ms=5000};
+    struct web_host host={.request=request,.cancel=cancel,.console=receive,.navigate=navigate,.debug_js=true,.js_task_budget_ms=5000};
     top=web_live(page,sizeof page-1,"https://root.test/","utf-8",&host);check("native-live-root",top!=NULL);if(!top)return 1;
     web_layout(top,640,480);pump();
     struct web_frame *safe=frame("safe"),*grant=frame("grants");

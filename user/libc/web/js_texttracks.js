@@ -5,7 +5,7 @@
 const textTrackBridge = (() => {
     'use strict';
     const native=host.avmedia, brandMedia=avmediaBridge.brand, mediaState=avmediaBridge.state;
-    const generation=avmediaBridge.generation, privateFetch=avmediaBridge.privateFetch;
+    const generation=avmediaBridge.generation, trackFetch=avmediaBridge.trackFetch;
     const apply=Reflect.apply, define=Object.defineProperty;
     const mapGet=WeakMap.prototype.get, mapSet=WeakMap.prototype.set;
     const mediaSlots=new WeakMap(), trackSlots=new WeakMap(), cueSlots=new WeakMap(), listSlots=new WeakMap(), elementSlots=new WeakMap(),regionSlots=new WeakMap();
@@ -170,7 +170,7 @@ const textTrackBridge = (() => {
         const current=()=>s.owner===o&&s.epoch===epoch&&s.signature===signature&&generation(o.node)===gen&&s.element.parentNode===o.node;
         (async()=>{try{
             const cross=o.node.crossOrigin;
-            const response=await privateFetch(url,{signal:controller.signal,mode:cross===null?'same-origin':'cors',
+            const response=await trackFetch(url,{signal:controller.signal,mode:cross===null?'same-origin':'cors',
                 credentials:cross==='use-credentials'?'include':'same-origin',redirect:'error'});
             if(!current())return;if(!response.ok)throw new Error('Text track HTTP status '+response.status);
             const bytes=await apply(bodyBytes,response,[]);if(!current())return;

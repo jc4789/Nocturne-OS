@@ -172,6 +172,15 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
     }
     struct js_pending *p=pending_new(s,P_FRAME,url);free(url);
     if(p && f->navigation_origin){p->origin=js_strdup(s->ctx,f->navigation_origin);if(!p->origin)pending_error(p,"Frame initiator could not be retained");}
+    if(p){
+        /* The source snapshot: the document that navigated the frame, else
+           the container's own under the iframe's referrerpolicy. An opaque
+           source sends no referrer, never the container's URL. */
+        struct web_navigation source={0};
+        web_navigation_source(f->navigation_owner?f->navigation_owner:s->doc,f->navigation_owner?NULL:f->element,&source);
+        p->referrer=js_strdup(s->ctx,source.referrer?source.referrer:"");p->referrer_policy=source.referrer_policy;
+        if(!p->referrer)pending_error(p,"Frame referrer could not be retained");
+    }
     free(f->navigation_origin);f->navigation_origin=NULL;f->navigation_owner=NULL;
     if(!p){log_text(s,2,"Frame request queue or memory limit reached");return;}
     p->frame=f;f->request=p->id;f->notified=false;
@@ -616,8 +625,11 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
                 if(!f || f->document!=target || f->detached)result=history_security_error(ctx,"Child navigation target has no active frame metadata");
                 else if(!web_frame_set_navigation(f,url,caller->doc))result=oom(ctx);
             }
-            else if(target->js->host.navigate_mode)target->js->host.navigate_mode(target->js->host.opaque,url,mode==2?2:0);
-            else if(target->js->host.navigate)target->js->host.navigate(target->js->host.opaque,url,NULL);
+            else if(target->js->host.navigate){
+                struct web_navigation navigation={.url=url,.history=mode==2?WEB_NAVIGATE_REPLACE:WEB_NAVIGATE_PUSH};
+                web_navigation_source(caller->doc,NULL,&navigation);
+                target->js->host.navigate(target->js->host.opaque,&navigation);
+            }
             else result=JS_ThrowTypeError(ctx,"Top-level navigation requires a native window host");
             js_free(ctx,url);
         }

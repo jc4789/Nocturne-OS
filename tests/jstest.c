@@ -257,12 +257,12 @@ static bool sync_load(void *opaque, const char *url, int kind, struct web_respon
     if (strstr(url, "/long-headers.mjs")) long_headers(r, "text/javascript");
     return r->body != NULL;
 }
-static void navigate(void *opaque, const char *url, const char *post) {
+static void navigate(void *opaque, const struct web_navigation *n) {
     struct fixture *f = opaque;
     if (!f->doc || !web_script_running(f->doc)) f->outside_running++;
     f->navigations++;
-    snprintf(f->navigation, sizeof f->navigation, "%s", url);
-    snprintf(f->post, sizeof f->post, "%s", post ? post : "");
+    snprintf(f->navigation, sizeof f->navigation, "%s", n->url);
+    snprintf(f->post, sizeof f->post, "%.*s", n->body ? (int)n->body_length : 0, n->body ? (const char *)n->body : "");
     /* Like the browser, defer document replacement until the JS task returns. */
 }
 static void scroll_position(void *opaque, int *x, int *y) {

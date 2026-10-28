@@ -955,10 +955,14 @@ struct web_image {
     uint64_t loading_id; /* The owning transport request, not a global resource-count gate. */
     bool image_upgrade; /* Part of request identity: imageset must not share an upgraded image. */
     uint8_t cors;       /* Part of request identity: WEB_IMAGE_NO_CORS or a CORS credentials mode. */
+    uint8_t referrer_policy; /* Part of request identity: the element's referrerpolicy, 0 the document's. */
     bool origin_clean;  /* The response is CORS-same-origin: a canvas or WebGL may read its pixels. */
 };
 /* An image request's CORS settings (the crossorigin attribute's state). */
 enum { WEB_IMAGE_NO_CORS, WEB_IMAGE_ANONYMOUS, WEB_IMAGE_USE_CREDENTIALS };
+/* An element's referrerpolicy attribute (enum webnet_referrer_policy); 0 when
+   absent or invalid, which leaves the document's policy. */
+int doc_element_referrer_policy(const node_t *n);
 
 /* Monotonic diagnostic counters, sampled at task boundaries. No timing limit
    or DOM semantics depend on these values. Times can overlap (inclusive). */
@@ -990,6 +994,7 @@ struct web_doc {
     struct web_frame *frames;
     const char *inherited_url; /* about:blank/srcdoc base and origin, never an author property */
     int referrer_policy; /* Policy container, not Document.referrer's navigation value. */
+    char *referrer; /* Document.referrer: the Referer its navigation sent; NULL for none */
     int embedder_policy; /* Policy container COEP: enum html_embedder_policy. */
     bool cross_origin_isolated; /* Agent cluster isolation; fixed at document creation. */
     web_doc *origin_owner; /* inherited opaque origins retain native identity */
@@ -1306,7 +1311,7 @@ void web_js_console(web_doc *d, int level, const char *message);
 /* The engine's own measurement (WEB_CONSOLE_TRACE): kept out of the page's console. */
 void web_js_trace(web_doc *d, const char *message);
 /* Native trusted link activation only; not exposed as a script popup API. */
-bool web_js_auxiliary_link(web_doc *d,const char *url);
+bool web_js_auxiliary_link(web_doc *d,node_t *anchor,const char *url);
 bool web_js_video_present(web_doc *d,const struct web_video_patch *patch);
 /* The display showed a frame of d: its rendering opportunity is now, the next about period_ms
    later (web_rendering_now). */

@@ -378,6 +378,7 @@ static void dt_select(web_node *n) {
 struct dt_request {
     uint64_t serial, generation, resource, start, end;
     char *method, *url, *request_headers, *response_headers, *error, *mime;
+    char *sent_headers; /* the fields the final hop sent (webnet's report_sent) */
     size_t size;
     int kind, status;
     bool navigation, done, streamed;
@@ -388,7 +389,7 @@ static int dt_net_n, dt_net_capacity, dt_net_top, dt_net_selected = -1;
 static uint64_t dt_net_serial, dt_nav_serial;
 
 static void dt_request_free(struct dt_request *r) {
-    free(r->method); free(r->url); free(r->request_headers); free(r->response_headers); free(r->error); free(r->mime);
+    free(r->method); free(r->url); free(r->request_headers); free(r->response_headers); free(r->error); free(r->mime); free(r->sent_headers);
 }
 static void dt_net_clear(void) {
     for (int i = 0; i < dt_net_n; i++) dt_request_free(&dt_net[i]);
@@ -460,6 +461,9 @@ static void dt_net_update(uint64_t serial, const struct webnet_response *result)
         if (result->headers && (!r->response_headers || strcmp(r->response_headers, result->headers))) {
             free(r->response_headers); r->response_headers = strdup(result->headers);
             free(r->mime); r->mime = dt_header_value(result->headers, "content-type");
+        }
+        if (result->sent_headers && *result->sent_headers && (!r->sent_headers || strcmp(r->sent_headers, result->sent_headers))) {
+            free(r->sent_headers); r->sent_headers = strdup(result->sent_headers);
         }
     }
     if (result->event == WEBNET_CHUNK) { r->size += result->body_len; r->streamed = true; }
@@ -557,7 +561,9 @@ static void dt_net_detail_build(void) {
     dt_format_size(text, sizeof text, r->size); dt_detail_add("Size", text, width);
     if (r->done) { dt_format_time(text, sizeof text, r->end - r->start); dt_detail_add("Time", text, width); }
     dt_detail_headers("Response Headers", r->response_headers, width);
-    dt_detail_headers(r->navigation ? "Request Headers" : "Request Headers (set by the page)", r->request_headers, width);
+    /* What went out, as other browsers show it; before the response says, what the page set. */
+    if (r->sent_headers) dt_detail_headers("Request Headers", r->sent_headers, width);
+    else dt_detail_headers(r->navigation ? "Request Headers" : "Request Headers (set by the page)", r->request_headers, width);
 }
 static void dt_net_select(int index) {
     dt_net_selected = index >= 0 && index < dt_net_n ? index : -1;

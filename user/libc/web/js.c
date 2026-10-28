@@ -96,6 +96,7 @@ enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE, P_WORKER, P_FRAME, P_FONT, P_POLICY_RE
 struct js_pending {
     uint64_t id, deadline, stream_generation;
     int kind, credentials, cache_mode, referrer_policy;
+    int destination; /* P_FETCH: its Request's destination (enum webnet_destination) */
     int image;
     uint32_t worker, worker_request;
     int worker_kind;
@@ -126,7 +127,7 @@ struct js_module {
        descendants of a module script); each holds a user. graph_settled: no
        module it reaches is still fetching. */
     struct js_module **children; uint32_t child_count;
-    int credentials; bool descendants, graph_settled; uint64_t visit;
+    int credentials, referrer_policy; bool descendants, graph_settled; uint64_t visit;
     struct js_module *next;
 };
 /* An import() waiting for its module graph to be fetched. */
@@ -294,6 +295,7 @@ struct web_js_state {
     unsigned dynamic_markup_counter;
     unsigned ignore_destructive_writes_counter;
     uint64_t storage_source, storage_poll_due, storage_listeners;
+    uint64_t languages_seen; /* web_js_languages_generation() navigator.languages answers for */
     char *storage_origin;
     webidb_async *indexed_db;
     struct js_idb_pending *indexed_db_pending;
@@ -511,13 +513,14 @@ void web_js_console(web_doc *d, int level, const char *message) {
     if (d && d->js) log_text(d->js, level, message);
 }
 void web_js_trace(web_doc *d, const char *message) { web_js_console(d, WEB_CONSOLE_TRACE, message); }
-bool web_js_auxiliary_link(web_doc *d,const char *url) {
+bool web_js_auxiliary_link(web_doc *d,node_t *anchor,const char *url) {
     /* The native click path has applied sandbox and opener policy. This GET
-       uses the host's real new-window spawn, with no opener or initiator URL.
-       As with existing navigation, Nocturne sends no referrer. */
-    if(!d || !d->live || d->inert || !d->js || !d->js->host.navigate_form || !url || !web_sandbox_auxiliary_allowed(d))return false;
+       uses the host's real new-window spawn, with no opener. */
+    if(!d || !d->live || d->inert || !d->js || !d->js->host.navigate || !url || !web_sandbox_auxiliary_allowed(d))return false;
     if(strncmp(url,"https://",8) && strncmp(url,"http://",7))return false;
-    d->js->host.navigate_form(d->js->host.opaque,url,NULL,0,NULL,"_blank");
+    struct web_navigation navigation={.url=url,.history=WEB_NAVIGATE_PUSH,.target="_blank"};
+    web_navigation_source(d,anchor,&navigation);
+    d->js->host.navigate(d->js->host.opaque,&navigation);
     return true; /* Accepted by host, not a promise that native spawn succeeded. */
 }
 bool web_js_video_present(web_doc *d, const struct web_video_patch *patch) {
@@ -1288,6 +1291,28 @@ static const char *fetch_client_referrer_source(web_doc *document) {
     }
     return document&&!(document->sandbox_flags&SB_ORIGIN)&&document->url?document->url:"";
 }
+static bool link_type(const char *value,const char *token) {
+    size_t length=strlen(token);
+    for(const char *p=value?value:"";*p;){
+        while(is_space((unsigned char)*p))p++;
+        const char *start=p;while(*p&&!is_space((unsigned char)*p))p++;
+        if((size_t)(p-start)==length&&!strncasecmp(start,token,length))return true;
+    }
+    return false;
+}
+void web_navigation_source(web_doc *d,web_node *element,struct web_navigation *out) {
+    /* An opaque (sandboxed) origin is the empty initiator, never its URL. */
+    out->initiator=d&&!(d->sandbox_flags&SB_ORIGIN)?web_effective_url(d):"";
+    out->referrer=fetch_client_referrer_source(d);
+    out->referrer_policy=d?d->referrer_policy:WEBNET_REFERRER_DEFAULT;
+    out->user_activation=d&&d->sandbox_activation_until>uptime_ms();
+    if(!element)return;
+    /* Follow the hyperlink / form submission: the element's referrerpolicy
+       replaces the document's, and the noreferrer link type means no-referrer. */
+    int policy=element->tag!=T_form?doc_element_referrer_policy(element):WEBNET_REFERRER_DEFAULT;
+    if(policy)out->referrer_policy=policy;
+    if(link_type(node_attr(element,"rel"),"noreferrer"))out->referrer_policy=WEBNET_REFERRER_NONE;
+}
 static JSValue get_image(struct web_js_state *s, node_t *n, const char *p) {
     JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
     if (!html_image(n)) return JS_ThrowTypeError(ctx, "HTMLImageElement receiver required");
@@ -1419,9 +1444,8 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
         return content ? wrap(s, content) : oom(ctx);
     }
     if (!strcmp(p, "URL") || !strcmp(p, "documentURI")) return JS_NewString(ctx, d->url);
-    /* Nocturne currently sends no navigation referrer. Expose the standard
-       empty DOMString, not undefined (and never invent a previous URL). */
-    if (!strcmp(p, "referrer")) return JS_NewString(ctx, "");
+    /* The Referer the document's navigation sent; empty when it sent none. */
+    if (!strcmp(p, "referrer")) return JS_NewString(ctx, d->referrer ? d->referrer : "");
     if(!strcmp(p,"referrerPolicy"))return JS_NewInt32(ctx,d->referrer_policy);
     if(!strcmp(p,"fetchClientReferrer"))return JS_NewString(ctx,fetch_client_referrer_source(d));
     if(!strcmp(p,"fetchOrigin")){
@@ -2934,21 +2958,28 @@ int web_js_dialog_submit(web_doc *d, web_node *submitter) {
     if (outer) end_task(s);
     return status;
 }
+void web_form_navigate(web_doc *d, node_t *submitter) {
+    if (submitter && submitter->owner) d = submitter->owner;
+    if (!d || !d->js || web_js_dialog_submit(d,submitter) != 0) return;
+    struct web_js_state *s = d->js;
+    if(d->frame_parent){web_js_console(d,2,"Child form navigation requires a destination/origin-aware embedder and is not implemented");return;}
+    struct web_form_request request;
+    if (!web_submit_request(d,submitter,&request)) return;
+    web_autocomplete_record(d,submitter,request.url);
+    if (strncmp(request.url,"https://",8) && strncmp(request.url,"http://",7))
+        web_js_console(d,2,"Form navigation requires an HTTP(S) destination");
+    else if (s->host.navigate) {
+        struct web_navigation navigation={.url=request.url,.history=WEB_NAVIGATE_PUSH,.body=request.body,
+            .body_length=request.body_len,.content_type=request.content_type,.target=request.target};
+        web_navigation_source(d,web_form_owner(d,submitter),&navigation);
+        s->host.navigate(s->host.opaque,&navigation);
+    }
+    else web_js_console(d,2,"The embedder cannot preserve this form encoding or destination");
+    web_submit_request_free(&request);
+}
 static void navigate_form_request(struct web_js_state *s, node_t *submitter) {
     if(sandbox_authority(s)&SB_FORMS){log_text(s,1,"Sandbox denied form submission");return;}
-    if (web_js_dialog_submit(s->doc,submitter) != 0) return;
-    if(s->doc->frame_parent){web_js_console(s->doc,2,"Child form navigation requires a destination/origin-aware embedder and is not implemented");return;}
-    struct web_form_request request;
-    if (!web_submit_request(s->doc,submitter,&request)) return;
-    web_autocomplete_record(s->doc,submitter,request.url);
-    if (s->host.navigate_form) s->host.navigate_form(s->host.opaque,request.url,request.body,
-        request.body_len,request.content_type,request.target);
-    else if (s->host.navigate && (!request.body ||
-        (request.content_type && !strcmp(request.content_type,"application/x-www-form-urlencoded"))) &&
-        (!strcasecmp(request.target,"_self") || !strcasecmp(request.target,"_top") || !strcasecmp(request.target,"_parent")))
-        s->host.navigate(s->host.opaque,request.url,request.body);
-    else web_js_console(s->doc,2,"The embedder cannot preserve this form encoding or destination");
-    web_submit_request_free(&request);
+    web_form_navigate(s->doc,submitter);
 }
 #include "js_document_commands.h"
 #include "js_cssom.h"
@@ -4958,13 +4989,16 @@ static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, 
     int32_t mode = 0;
     if (argc > 1 && JS_ToInt32(ctx, &mode, argv[1])) { js_free(ctx, url); return JS_EXCEPTION; }
     if(!task_context_active(s) || !task_context_active(actor) || !web_sandbox_navigation_allowed(actor->doc,s->doc,actor->doc->sandbox_activation_until>uptime_ms())){js_free(ctx,url);return history_security_error(ctx,"Navigation authority changed during conversion");}
+    /* The source snapshot precedes the sandbox's consumption of activation. */
+    struct web_navigation navigation={.url=url,
+        .history=mode==2?WEB_NAVIGATE_REPLACE:mode==1?WEB_NAVIGATE_RELOAD:WEB_NAVIGATE_PUSH};
+    web_navigation_source(actor->doc,NULL,&navigation);
     if(actor->doc!=s->doc)actor->doc->sandbox_activation_until=0;
     if (s->doc->frame_parent) {
         struct web_frame *f=web_frame_find(s->doc->frame_parent,s->doc->frame_element);
         if (!web_frame_set_navigation(f,url,actor->doc)) { js_free(ctx,url); return oom(ctx); }
     }
-    else if (s->host.navigate_mode) s->host.navigate_mode(s->host.opaque, url, mode);
-    else if (s->host.navigate) s->host.navigate(s->host.opaque, url, NULL);
+    else if (s->host.navigate) s->host.navigate(s->host.opaque,&navigation);
     js_free(ctx, url); return JS_UNDEFINED;
 }
 /* Capture the native activation path before author listeners can reparent
@@ -5012,7 +5046,11 @@ static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc
                 struct web_frame *f=web_frame_find(s->doc->frame_parent,s->doc->frame_element);
                 if(target && *target && strcasecmp(target,"_self"))log_text(s,1,"Scripted child link activation cannot navigate another browsing context");
                 else if(!web_frame_set_navigation(f,action.href,s->doc))return oom(ctx);
-            }else if(s->host.navigate)s->host.navigate(s->host.opaque, action.href, NULL);
+            }else if(s->host.navigate){
+                struct web_navigation navigation={.url=action.href,.history=WEB_NAVIGATE_PUSH};
+                web_navigation_source(s->doc,anchor,&navigation);
+                s->host.navigate(s->host.opaque,&navigation);
+            }
         }
     } else if (n->tag == T_input) {
         const char *type = node_attr(n, "type");
@@ -5321,6 +5359,18 @@ static void net_log_bytes(struct web_js_state *s, struct js_pending *p, const ch
         log_text(s, WEB_CONSOLE_TRACE, message);
     }
 }
+/* Fetch's request destination for what a pending request loads. */
+static int pending_destination(const struct js_pending *p) {
+    switch(p->kind){
+    case P_SCRIPT: case P_MODULE: return WEBNET_DEST_SCRIPT;
+    case P_CSS: return WEBNET_DEST_STYLE;
+    case P_IMAGE: return WEBNET_DEST_IMAGE;
+    case P_FONT: return WEBNET_DEST_FONT;
+    case P_FRAME: return p->frame&&p->frame->element&&p->frame->element->tag==T_frame?WEBNET_DEST_FRAME:WEBNET_DEST_IFRAME;
+    case P_POLICY_REPORT: return WEBNET_DEST_REPORT;
+    default: return p->destination;
+    }
+}
 static bool send_request(struct web_js_state *s, struct js_pending *p, int kind, const char *method,
                          const char *headers, const void *body, size_t len) {
     if(s->disabled){pending_error(p,"Browsing context is inactive");return false;}
@@ -5345,9 +5395,13 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
         .credentials=(kind == WEB_RESOURCE_FETCH || kind == WEB_RESOURCE_REPORT || p->kind==P_MODULE) ? p->credentials : kind == WEB_RESOURCE_MODULE ? 1 : 2,
         .force_preflight=p->force_preflight, .redirect_error=p->redirect_error, .same_origin=p->same_origin,
         .no_cors=p->no_cors, .no_referrer=p->no_referrer,
-        .referrer=p->referrer,.referrer_policy=p->referrer_policy,
+        /* Fetch's default referrer is "client" (the document) under the
+           document's policy; a report is sent with no referrer. */
+        .referrer=p->referrer||p->kind==P_POLICY_REPORT?p->referrer:fetch_client_referrer_source(s->doc),
+        .referrer_policy=p->referrer_policy||p->kind==P_POLICY_REPORT?p->referrer_policy:s->doc->referrer_policy,
         .cache_mode=p->cache_mode, .keepalive=p->keepalive, .fetch_group=p->keepalive?s->fetch_group:0,
-        .stream_response=p->streaming, .require_corp=s->doc->embedder_policy==HTML_COEP_REQUIRE_CORP};
+        .stream_response=p->streaming, .require_corp=s->doc->embedder_policy==HTML_COEP_REQUIRE_CORP,
+        .destination=pending_destination(p)};
     if(kind==WEB_RESOURCE_IMAGE && p->kind==P_IMAGE && p->image>=0 && p->image<s->doc->images.n)
         r.image_upgrade=((struct web_image *)s->doc->images.v[p->image])->image_upgrade;
     bool ok = s->host.request && s->host.request(s->host.opaque, &r);
@@ -5424,7 +5478,10 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request,
         .no_cors=(policy & NJW_LOAD_NO_CORS)!=0,
         .referrer=referrer,.referrer_policy=referrer_policy,
         .no_referrer=(policy & NJW_LOAD_NO_REFERRER)!=0,
-        .require_corp=s->doc->embedder_policy==HTML_COEP_REQUIRE_CORP};
+        .require_corp=s->doc->embedder_policy==HTML_COEP_REQUIRE_CORP,
+        .destination=kind==0?WEBNET_DEST_WORKER:kind==1?WEBNET_DEST_SCRIPT:WEBNET_DEST_EMPTY};
+    /* The worker's script is fetched by its creating document, as its client. */
+    if(kind==0){r.referrer=fetch_client_referrer_source(s->doc);r.referrer_policy=s->doc->referrer_policy;}
     if (!s->host.request || !s->host.request(s->host.opaque,&r))
         pending_error(p,"The browser rejected the Worker resource request");
     return true;
@@ -5750,6 +5807,17 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
         (argc > 14 && (JS_ToInt32(ctx,&referrer_policy,argv[14]) || referrer_policy<WEBNET_REFERRER_DEFAULT || referrer_policy>WEBNET_REFERRER_UNSAFE))) {
         result = JS_ThrowTypeError(ctx, "Invalid fetch policy"); goto out;
     }
+    /* The Request's destination: "" for fetch() and XHR, others for the
+       engine's own element fetches (a track, a media fallback). */
+    int destination=WEBNET_DEST_EMPTY;
+    if(argc>15&&!JS_IsUndefined(argv[15])){
+        const char *name=JS_ToCString(ctx,argv[15]);
+        if(!name)goto out;
+        destination=-1;
+        for(int i=0;i<WEBNET_DEST_COUNT;i++)if(!strcmp(webnet_destination_name((enum webnet_destination)i),name)){destination=i;break;}
+        JS_FreeCString(ctx,name);
+        if(destination<0){result=JS_ThrowTypeError(ctx,"Invalid request destination");goto out;}
+    }
     if (!task_context_active(s) || s->doc->root != generation) { result = JS_ThrowTypeError(ctx, "Fetch browsing context retired during conversion"); goto out; }
     /* Policy coercion can run author code and detach the caller's buffer.
        Acquire its backing pointer again only after the last such conversion. */
@@ -5779,6 +5847,7 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     struct js_pending *p = pending_new(s, P_FETCH, url);
     if (!p) { result = oom(ctx); goto out; }
     p->credentials = credentials;
+    p->destination = destination;
     p->keepalive = keepalive;
     p->cache_mode = cache_mode;
     p->same_origin = same_origin;
@@ -6094,15 +6163,21 @@ static void module_received(struct web_js_state *s,struct js_pending *p) {
     m->fetching=false;m->fetch_failed=!ok;
     if(!ok && !p->response.error[0])diagnostic_resource(s,p,"module response rejected (MIME, URL or integrity)");
 }
-static struct js_module *request_module(struct web_js_state *s,const char *url,int credentials,const char *integrity) {
+/* referrer: the importing module's base URL, NULL for the document ("client");
+   referrer_policy: the script fetch options', 0 for the document's. */
+static struct js_module *request_module(struct web_js_state *s,const char *url,int credentials,const char *integrity,
+                                        const char *referrer,int referrer_policy) {
     struct js_module *m=find_module(s,url);if(m)return m;
     m=cache_module(s,url,"",0,url);if(!m)return NULL;
     struct js_pending *p=pending_new(s,P_MODULE,url);
     if(!p){m->fetch_failed=true;return m;}
     p->module=m;m->users++;p->credentials=m->credentials=credentials;
+    p->referrer_policy=m->referrer_policy=referrer_policy;
     p->integrity=integrity&&*integrity?js_strdup(s->ctx,integrity):NULL;
+    p->referrer=referrer?js_strdup(s->ctx,referrer):NULL;
     m->request=p->id;m->fetching=true;
     if(integrity&&*integrity&&!p->integrity)pending_error(p,"Module integrity metadata allocation failed");
+    else if(referrer&&!p->referrer)pending_error(p,"Module referrer allocation failed");
     else send_request(s,p,WEB_RESOURCE_MODULE,"GET",NULL,NULL,0);
     return m;
 }
@@ -6132,7 +6207,7 @@ static void module_descendants(struct web_js_state *s,struct js_module *m) {
         JS_FreeCString(s->ctx,specifier);
         if(!url){JS_FreeValue(s->ctx,JS_GetException(s->ctx));continue;}
         struct js_module *child=strncasecmp(url,"data:",5)&&strncasecmp(url,"blob:",5)&&permitted_script_url(s,url)?
-            request_module(s,url,m->credentials,NULL):NULL;
+            request_module(s,url,m->credentials,NULL,m->base,m->referrer_policy):NULL;
         js_free(s->ctx,url);
         if(child){child->users++;children[n++]=child;}
         else if(JS_HasException(s->ctx))JS_FreeValue(s->ctx,JS_GetException(s->ctx)); /* no memory: linking loads it */
@@ -6256,7 +6331,8 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
         struct web_response *r = &diagnostic->response; uint64_t before = uptime_ms();
         diagnostic->kind = P_SCRIPT; diagnostic->url = (char *)url; diagnostic->deadline = before + WEBNET_TIMEOUT_MS;
         struct web_request request={.kind=WEB_RESOURCE_MODULE, .url=url, .method="GET",
-            .origin=web_effective_url(s->doc), .credentials=1};
+            .origin=web_effective_url(s->doc), .credentials=1, .destination=WEBNET_DEST_SCRIPT,
+            .referrer=fetch_client_referrer_source(s->doc), .referrer_policy=s->doc->referrer_policy};
         bool ok = s->host.sync_request
             ? s->host.sync_request(s->host.opaque, &request, r)
             : s->host.sync_load && s->host.sync_load(s->host.opaque, url, WEB_RESOURCE_MODULE, r);
@@ -6341,7 +6417,7 @@ static int import_module(JSContext *ctx,const char *basename,const char *specifi
     char *url=normalize_module(ctx,basename,specifier,s);
     if(!url)return -1;
     struct js_module *m=strncasecmp(url,"data:",5)&&strncasecmp(url,"blob:",5)&&permitted_script_url(s,url)?
-        request_module(s,url,1,NULL):NULL;
+        request_module(s,url,1,NULL,NULL,0):NULL;
     js_free(ctx,url);
     struct js_import *p=m&&!module_graph_settled(s,m)?js_mallocz(ctx,sizeof *p):NULL;
     if(p){
@@ -6494,13 +6570,15 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
             }
             if(module){
                 const char *cors=node_attr(n,"crossorigin");
-                struct js_module *m=request_module(s,script->url,cors&&str_ieq(cors,"use-credentials")?2:1,node_attr(n,"integrity"));
+                struct js_module *m=request_module(s,script->url,cors&&str_ieq(cors,"use-credentials")?2:1,node_attr(n,"integrity"),
+                                                   NULL,doc_element_referrer_policy(n));
                 if(!m)script->ready=script->failed=true;
                 else {script->request=m->request;script->graph=m;m->users++;module_script_source(s,script,m);}
             }else{
                 struct js_pending *p = pending_new(s, P_SCRIPT, script->url);
                 if (!p) script->ready = script->failed = true;
-                else { p->script = script; script->request = p->id; send_request(s, p, WEB_RESOURCE_SCRIPT, "GET", NULL, NULL, 0); }
+                else { p->script = script; script->request = p->id; p->referrer_policy = doc_element_referrer_policy(n);
+                    send_request(s, p, WEB_RESOURCE_SCRIPT, "GET", NULL, NULL, 0); }
             }
         }
     } else {
@@ -6587,7 +6665,8 @@ static void queue_modulepreload(struct web_js_state *s,node_t *node) {
     char *url=module_url(s,"moduleURL",href,s->doc->base);
     if(!url){if(JS_HasException(s->ctx))exception(s);link->notified=true;return;}
     const char *cors=node_attr(node,"crossorigin");
-    link->module=request_module(s,url,cors&&str_ieq(cors,"use-credentials")?2:1,node_attr(node,"integrity"));
+    link->module=request_module(s,url,cors&&str_ieq(cors,"use-credentials")?2:1,node_attr(node,"integrity"),
+                                NULL,doc_element_referrer_policy(node));
     if(link->module)link->module->users++;
     js_free(s->ctx,url);
     if(!link->module){script_event(s,node,true);link->notified=true;}
@@ -7483,6 +7562,7 @@ static void request_images(struct web_js_state *s) {
         if (!p) { JSValue e = JS_GetException(s->ctx); JS_FreeValue(s->ctx, e); web_image_loaded(s->doc, i, NULL, 0, false); s->doc->dirty = true; continue; }
         p->image = i;
         struct web_image *image = s->doc->images.v[i];
+        p->referrer_policy = image->referrer_policy;
         image->loading_id=p->id;
         if (image->cors == WEB_IMAGE_NO_CORS) send_request(s, p, WEB_RESOURCE_IMAGE, "GET", NULL, NULL, 0);
         else {
@@ -8215,6 +8295,15 @@ void web_js_tick(web_doc *d, uint64_t now) {
         if(JS_IsException(notified))exception(s);
         JS_FreeValue(s->ctx,notified);end_task(s);ran=true;
     }
+    /* HTML: a new set of the user's languages is a task on the DOM manipulation task source
+       that switches navigator.languages and fires languagechange at the window. */
+    if(!ran&&!s->disabled&&s->languages_seen!=web_js_languages_generation()){
+        s->languages_seen=web_js_languages_generation();
+        begin_named_task(s,"languagechange",s->languages_seen);
+        JSValue fired=custom_element_hook(s,"languageChange",0,NULL);
+        if(JS_IsException(fired))exception(s);
+        JS_FreeValue(s->ctx,fired);end_task(s);ran=true;
+    }
     if(!ran)ran=!s->disabled&&s->indexed_db_turn&&indexed_db_run_one(s);
     s->indexed_db_turn=!ran;
     if(!ran){ran=!s->disabled&&s->storage_event_turn&&storage_run_event(s,now);s->storage_event_turn=!ran;}
@@ -8398,6 +8487,7 @@ static int64_t js_deadline(web_doc *d, int *why) {
         if (s->storage_origin && storage_listening(s) && (s->storage_subscribed[0]||s->storage_subscribed[1])) EARLIER(s->storage_poll_due, JD_STORAGE);
         if(s->indexed_db_failed&&s->indexed_db_pending)DUE_NOW();
         if(web_presentation_event_peek(d))DUE_NOW();
+        if(s->languages_seen!=web_js_languages_generation())DUE_NOW();
         if(s->indexed_db&&webidb_async_pending(s->indexed_db)){
             webidb_async_pump(s->indexed_db);
             if(webidb_async_ready(s->indexed_db))DUE_NOW();
@@ -8747,6 +8837,9 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     JS_SetPropertyStr(s->ctx,api,"domOperations",operations);
     JS_SetPropertyStr(s->ctx,api,"noCorsFetch",JS_TRUE);
     JS_SetPropertyStr(s->ctx,api,"streamingFetch",JS_NewBool(s->ctx,s->host.resume_request != NULL));
+    /* Watch before the realm first reads the languages, so no change falls between. */
+    web_js_languages_watch(web_wait_queue());
+    s->languages_seen=web_js_languages_generation();
     web_js_navigator_init(s->ctx,api);
     web_js_crypto_init(s->ctx, api);
     web_js_encoding_init(s->ctx, api);

@@ -14,7 +14,11 @@ out = root / 'build/parallel-navigator-contract-20261010'
 out.mkdir(parents=True, exist_ok=True)
 shim = out / 'include'
 shim.mkdir(exist_ok=True)
-(shim / 'nocturne.h').write_text('#pragma once\n#undef SYS_OPEN\n#include "common/abi.h"\nint cpu_info(struct n_cpuinfo *);\n', encoding='utf-8', newline='\n')
+# web.h takes libc's own nocturne.h; the engine's <nocturne.h> comes here and
+# gets the same one. The system calls the engine and this probe use are
+# defined in the probe below.
+(shim / 'nocturne.h').write_text('#pragma once\n#undef SYS_OPEN\n#include "user/include/nocturne.h"\n#include <ctype.h>\n',
+                                 encoding='utf-8', newline='\n')
 js = (root / 'user/libc/web/js.c').read_text(encoding='utf-8')
 cookie = js[js.index('static JSValue native_cookie_enabled('):js.index('static JSValue native_cookie_impl(')]
 worker_native = (root / 'user/apps/browserjsworker.c').read_text(encoding='utf-8')
@@ -30,12 +34,21 @@ source = r'''
 #include <stdint.h>
 #include <stdbool.h>
 #include "user/libc/web/js_navigator_native.h"
+#include "user/libc/web/html_policy.h"
+#include "user/libc/web/js_html_safety_native.h"
 #include "user/libc/web/js_worker_runtime.inc"
 #include "user/include/http.h"
 #include "user/include/web.h"
 static struct n_cpuinfo native_info;
-static int cpu_result,cpu_calls,checks,failed,capability_calls;
-int cpu_info(struct n_cpuinfo *out){*out=native_info;cpu_calls++;return cpu_result;}
+static int cpu_result,cpu_calls,checks,failed,capability_calls,language_calls;
+n_result cpu_info(struct n_cpuinfo *out){*out=native_info;cpu_calls++;return cpu_result;}
+/* The engine's Atomics.wait and its clock; the probe never waits. */
+uint64_t n_clock_uptime_ms(void){return 0;}
+n_result wait_on_address(volatile uint32_t *address,uint32_t expected,unsigned ms){return -N_ERR_TIMEOUT;}
+n_result wake_address(volatile uint32_t *address,unsigned count){return 0;}
+/* The system's list of the user's languages, as n_user_languages gives it. */
+static const char *user_languages="ja,en-US";
+n_result n_user_languages(char *out,size_t cap){size_t n=strlen(user_languages);language_calls++;if(n+1>cap)return -N_ERR_TOO_LARGE;memcpy(out,user_languages,n+1);return (n_result)n;}
 struct web_js_state {struct web_host host;};
 static struct web_js_state *state(JSContext *ctx){return JS_GetContextOpaque(ctx);}
 static bool enabled;
@@ -49,7 +62,8 @@ static JSValue js_check(JSContext *ctx,JSValueConst receiver,int argc,JSValueCon
 }
 static bool evaluate(JSContext *ctx,const char *source){
     JSValue value=JS_Eval(ctx,source,strlen(source),"navigator-contract.js",JS_EVAL_TYPE_GLOBAL);bool ok=!JS_IsException(value);
-    if(!ok){JSValue error=JS_GetException(ctx);const char *text=JS_ToCString(ctx,error);printf("EXCEPTION %s\n",text?text:"unknown");JS_FreeCString(ctx,text);JS_FreeValue(ctx,error);}
+    if(!ok){JSValue error=JS_GetException(ctx),stack=JS_GetPropertyStr(ctx,error,"stack");const char *text=JS_ToCString(ctx,error),*where=JS_IsString(stack)?JS_ToCString(ctx,stack):NULL;
+        printf("EXCEPTION %s\n%s",text?text:"unknown",where?where:"");JS_FreeCString(ctx,text);JS_FreeCString(ctx,where);JS_FreeValue(ctx,stack);JS_FreeValue(ctx,error);}
     JS_FreeValue(ctx,value);return ok;
 }
 static void realm(bool worker,int provider,bool enabled_value){
@@ -61,15 +75,30 @@ static void realm(bool worker,int provider,bool enabled_value){
     if(provider==4){state_value.host.cookie_enabled=capability;state_value.host.cookie_set=NULL;}
     JSValue global=JS_GetGlobalObject(ctx),host=JS_NewObject(ctx);web_js_navigator_init(ctx,host);
     JS_SetPropertyStr(ctx,host,"classID",JS_NewCFunction(ctx,native_class,"classID",1));
+    /* The Worker realm keeps Trusted Types in the production native class. */
+    if(worker){check("trusted-class",trusted_native_init(ctx)==0);JS_SetPropertyStr(ctx,host,"trusted",JS_NewCFunction(ctx,native_trusted,"trusted",4));}
     JS_SetPropertyStr(ctx,host,"cookieEnabled",JS_NewCFunction(ctx,native_cookie_enabled,"cookieEnabled",0));
     if(worker)JS_SetPropertyStr(ctx,global,"__workerHost",JS_DupValue(ctx,host));
     JS_SetPropertyStr(ctx,global,"host",host);JS_SetPropertyStr(ctx,global,"check",JS_NewCFunction(ctx,js_check,"check",2));JS_FreeValue(ctx,global);
-    int queries=cpu_calls,cookie_queries=capability_calls;char ending[1024];
-    snprintf(ending,sizeof ending,"%srunNavigatorChecks(%s,navigator,{userAgent:'%s',cpus:%u,cookies:%s},%s,check);for(let i=0;i<100;i++)navigator.hardwareConcurrency;",
-        worker?"":"const {navigator,Interface}=navigatorBridge.create(false);",worker?"WorkerNavigator":"Interface",
+    int queries=cpu_calls,cookie_queries=capability_calls,language_queries=language_calls;char ending[1024];
+    snprintf(ending,sizeof ending,"%srunNavigatorChecks(%s,navigator,{userAgent:'%s',cpus:%u,cookies:%s,languages:['ja','en-US']},%s,check);for(let i=0;i<100;i++)navigator.hardwareConcurrency+navigator.languages.length;",
+        worker?"":"const {navigator,Interface,languagesChanged}=navigatorBridge.create(false);",worker?"WorkerNavigator":"Interface",
         NOCTURNE_USER_AGENT,native_info.scheduler_cpus,provider==2&&enabled_value?"true":"false",worker?"true":"false");
-    check("realm-evaluation",evaluate(ctx,worker?js_worker_runtime:navigator_source)&&evaluate(ctx,navigator_cases)&&evaluate(ctx,ending));
+    check(worker?"worker-realm-evaluation":"realm-evaluation",evaluate(ctx,worker?js_worker_runtime:navigator_source)&&evaluate(ctx,navigator_cases)&&evaluate(ctx,ending));
     check("count-getters-no-syscall",cpu_calls==queries);
+    /* The realm reads the user's languages once when it starts, not at every getter. */
+    check("languages-read-once",language_calls==language_queries+1);
+    if(!worker){
+        /* HTML: the same frozen array until the global's languagechange task switches it. */
+        user_languages="fr-CA,ja";
+        check("languages-change-evaluation",evaluate(ctx,
+            "const before=navigator.languages;"
+            "check('languages-kept-until-task',navigator.languages===before&&navigator.language==='ja');"
+            "check('languages-changed',languagesChanged()===true);"
+            "check('languages-new',navigator.languages!==before&&Object.isFrozen(navigator.languages)&&navigator.languages.join()==='fr-CA,ja'&&navigator.language==='fr-CA');"
+            "check('languages-same-again',languagesChanged()===false&&navigator.languages===navigator.languages);"));
+        user_languages="ja,en-US";
+    }
     if(worker)check("worker-does-not-query-cookies",capability_calls==cookie_queries);
     if(!worker&&provider==2){enabled=!enabled_value;check("live-capability-evaluation",evaluate(ctx,enabled?"check('live-cookie-enabled',navigator.cookieEnabled===true)":"check('live-cookie-disabled',navigator.cookieEnabled===false)"));}
     JS_FreeContext(ctx);JS_FreeRuntime(rt);
@@ -105,7 +134,7 @@ engine = [root / ('third_party/quickjs/'+name+'.c') for name in ('quickjs','dtoa
 exe = out / 'navigator-contract.exe'
 log = out / 'navigator-contract.log'
 with log.open('w', encoding='utf-8') as stream:
-    command = [str(cc), '-std=gnu11', '-O1', '-fwrapv', '-funsigned-char', '-DCONFIG_NOCTURNE',
+    command = [str(cc), '-std=gnu11', '-O1', '-fwrapv', '-funsigned-char', '-DCONFIG_NOCTURNE', '-DNOGDI',
                '-DCONFIG_VERSION="Nocturne-test"', '-I'+str(shim), '-I.', '-Ithird_party/quickjs',
                '-Ibuild/nocturne-audit/url-host-include', '-Icommon', '-idirafter', 'user/include',
                str(c), *map(str,engine), '-lm', '-o', str(exe)]

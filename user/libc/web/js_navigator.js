@@ -1,8 +1,14 @@
 /* Window and Worker share the actual native HTTP identity and scheduler count.
- * Cookies remain a live Window-only host capability, not a write/read probe. */
+ * Cookies remain a live Window-only host capability, not a write/read probe.
+ * The languages are the user's, as the system keeps them (the same list goes
+ * out as Accept-Language). HTML: navigator.languages is the same frozen array
+ * until the global's languagechange task begins; the realm's host calls
+ * languagesChanged() there and fires the event when it returns true. */
 const navigatorBridge=(()=>{
     const invoke=Reflect.apply,has=WeakSet.prototype.has,add=WeakSet.prototype.add;
-    const define=Object.defineProperty,freeze=Object.freeze,cookieEnabled=host.cookieEnabled;
+    const define=Object.defineProperty,freeze=Object.freeze,cookieEnabled=host.cookieEnabled,nativeLanguages=host.languages;
+    const split=String.prototype.split,join=Array.prototype.join;
+    function userLanguages(){return freeze(invoke(split,invoke(nativeLanguages,host,[]),[',']));}
     function create(worker){
         const token={},brands=new WeakSet();
         function construct(receiver,value){
@@ -15,12 +21,20 @@ const navigatorBridge=(()=>{
         function requireReceiver(receiver){
             if(!invoke(has,brands,[receiver]))throw new TypeError('Illegal navigator receiver');
         }
-        const values={userAgent:host.userAgent,platform:host.platform,language:'en-US',
+        const values={userAgent:host.userAgent,platform:host.platform,
             appCodeName:'Mozilla',appName:'Netscape',appVersion:host.userAgent,
             vendor:'',vendorSub:'',product:'Gecko',productSub:'20030107',
-            languages:freeze(['en-US']),onLine:true,hardwareConcurrency:host.hardwareConcurrency};
+            onLine:true,hardwareConcurrency:host.hardwareConcurrency};
         for(const [name,value] of Object.entries(values))
             define(Interface.prototype,name,{configurable:true,enumerable:true,get(){requireReceiver(this);return value;}});
+        let languages=userLanguages();
+        define(Interface.prototype,'language',{configurable:true,enumerable:true,get(){requireReceiver(this);return languages[0];}});
+        define(Interface.prototype,'languages',{configurable:true,enumerable:true,get(){requireReceiver(this);return languages;}});
+        function languagesChanged(){
+            const next=userLanguages();
+            if(invoke(join,next,[','])===invoke(join,languages,[',']))return false;
+            languages=next;return true;
+        }
         if(!worker)define(Interface.prototype,'cookieEnabled',{configurable:true,enumerable:true,get(){
             requireReceiver(this);return typeof cookieEnabled==='function'&&!!invoke(cookieEnabled,host,[]);
         }});
@@ -108,7 +122,7 @@ const navigatorBridge=(()=>{
             define(globalThis,'MediaCapabilities',{value:MediaCapabilities,writable:true,configurable:true});
         }
         define(Interface.prototype,Symbol.toStringTag,{value:worker?'WorkerNavigator':'Navigator',configurable:true});
-        return {navigator:new Interface(token),Interface};
+        return {navigator:new Interface(token),Interface,languagesChanged};
     }
     return {create};
 })();

@@ -498,7 +498,7 @@ bool web_frame_navigate(web_doc *top,web_node *anchor,const char *url) {
             if(frame_link_token(rel,"opener") && !frame_link_token(rel,"noopener") && !frame_link_token(rel,"noreferrer")){
                 web_js_console(source,1,"Auxiliary link opener relationships are not implemented");return true;
             }
-            if(!web_js_auxiliary_link(source,url))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
+            if(!web_js_auxiliary_link(source,anchor,url))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
             return true;
         }
         else {destination=named_frame(top,target);if(!destination){web_js_console(source,1,"Named link target has no browsing context");return true;}}

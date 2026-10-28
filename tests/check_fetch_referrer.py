@@ -49,7 +49,7 @@ dispatcher=(root/'user/libc/web/js.c').read_text(encoding='utf-8')
 product+=between(sandbox,'enum web_sandbox_flag {','#define SB_ALL')
 product+='typedef struct web_doc {const char *url,*inherited_url;unsigned sandbox_flags;struct web_doc *frame_parent;} web_doc;\n'
 product+=between(frame,'const char *web_effective_url(', 'bool web_frame_element(')
-product+=between(dispatcher,'static const char *fetch_client_referrer_source(', 'static JSValue get_image(')
+product+=between(dispatcher,'static const char *fetch_client_referrer_source(', 'static bool link_type(')
 generated=out/'referrer.c'
 generated.write_text(prefix+product+(root/'tests/referrer_policy_host_cases.c').read_text(encoding='utf-8'),encoding='utf-8')
 cc=root/'tools/msys64/ucrt64/bin/clang.exe'
@@ -59,6 +59,6 @@ with log.open('w',encoding='utf-8') as stream:
     for name in ['user/apps/webfetch.c','user/libc/http.c','user/include/webnet.h','user/include/webnet_wire.h','user/libc/web/js.c','user/libc/web/frame.c','user/libc/web/sandbox.h','tests/referrer_policy_host_cases.c']:
         stream.write(name+' SHA256 '+hashlib.sha256((root/name).read_bytes()).hexdigest()+'\n')
     stream.flush()
-    subprocess.run([str(cc),'-std=gnu11','-O1','-Wall','-Wextra','-idirafter','user/include',str(generated),'-o',str(exe)],cwd=root,env=env,check=True,stdout=stream,stderr=subprocess.STDOUT)
+    subprocess.run([str(cc),'-std=gnu11','-O1','-Wall','-Wextra','-idirafter','user/include','-idirafter','common',str(generated),'-o',str(exe)],cwd=root,env=env,check=True,stdout=stream,stderr=subprocess.STDOUT)
     result=subprocess.run([str(exe)],cwd=root,env=env,timeout=20,stdout=stream,stderr=subprocess.STDOUT)
 print(log.read_text(encoding='utf-8'));raise SystemExit(result.returncode)

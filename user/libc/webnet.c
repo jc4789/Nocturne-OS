@@ -41,6 +41,8 @@ struct request {
     size_t head_pos;
     bool cancelled, finishing, in_callback;
     bool streaming, paused, headers_seen, debug_request, debug_reported, frame_ready, credit_closed;
+    bool report_sent;
+    char *sent; /* report_sent: the fields the final hop sent, taken out of the headers */
     char *cookie_site, *cookie_origin;
     char *transport_origin;
     uint64_t queued_at,started_at;
@@ -147,7 +149,7 @@ n_result webnet_wire_write(n_handle h, const void *data, size_t n) {
         if (done == n) return (n_result)n;
     }
 }
-static void request_free(struct request *r) { if(!r)return;free(r->tx); free(r->rx); free(r->merge);free(r->cookie_site);free(r->cookie_origin);free(r->transport_origin); webnet_wire_in_free(&r->wire_in); free(r); }
+static void request_free(struct request *r) { if(!r)return;free(r->tx); free(r->rx); free(r->merge);free(r->sent);free(r->cookie_site);free(r->cookie_origin);free(r->transport_origin); webnet_wire_in_free(&r->wire_in); free(r); }
 static unsigned worker_budget(void){
     struct n_cpuinfo cpu={0};struct n_sysinfo memory={0};
     unsigned online=cpu_info(&cpu)>=0&&cpu.online_cpus?cpu.online_cpus:1;
@@ -286,7 +288,7 @@ static unsigned char *wire_request(webnet *n,const struct webnet_request *q,uint
     if (cookie_len < 0 || (uint64_t)cookie_len > UINT32_MAX) return NULL;
     uint64_t total = sizeof(struct webnet_wire_request) + (uint64_t)ul + ol + ml + hl + q->body_len + (uint64_t)cookie_len+
         (referrer_extension?sizeof(struct webnet_wire_referrer)+(uint64_t)rl:0)+
-        (top_extension?sizeof(struct webnet_wire_top_level)+(uint64_t)tl:0);
+        (top_extension?sizeof(struct webnet_wire_top_level)+(uint64_t)tl:0)+sizeof(struct webnet_wire_fetch);
     if (total > SIZE_MAX) return NULL;
     unsigned char *tx = malloc((size_t)total);
     if (!tx) return NULL;
@@ -296,6 +298,7 @@ static unsigned char *wire_request(webnet *n,const struct webnet_request *q,uint
         WEBNET_WIRE_DYNAMIC_HEADERS | WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS | WEBNET_WIRE_DYNAMIC_URL;
     if (referrer_extension)h.user_navigation|=WEBNET_WIRE_REFERRER;
     if (top_extension)h.user_navigation|=WEBNET_WIRE_TOP_LEVEL;
+    h.user_navigation|=WEBNET_WIRE_FETCH_METADATA;
     if (q->body) h.user_navigation |= WEBNET_WIRE_BODY_PRESENT;
     h.credentials = q->credentials; h.cookie_len = (uint32_t)cookie_len;
     h.id = id; h.generation = q->generation; h.deadline = deadline;
@@ -304,6 +307,9 @@ static unsigned char *wire_request(webnet *n,const struct webnet_request *q,uint
     unsigned char *p = tx + sizeof h;
     if(referrer_extension){struct webnet_wire_referrer ref={(uint32_t)rl,(uint32_t)q->referrer_policy};memcpy(p,&ref,sizeof ref);p+=sizeof ref;}
     if(top_extension){struct webnet_wire_top_level top={(uint32_t)tl,0};memcpy(p,&top,sizeof top);p+=sizeof top;}
+    struct webnet_wire_fetch fetch={(uint32_t)q->destination,
+        (q->user_activation?WEBNET_FETCH_USER_ACTIVATION:0u)|(q->browser_ui?WEBNET_FETCH_BROWSER_UI:0u)};
+    memcpy(p,&fetch,sizeof fetch);p+=sizeof fetch;
     memcpy(p, q->url, ul); p += ul; memcpy(p, origin, ol); p += ol;
     if(referrer_extension){memcpy(p,referrer,rl);p+=rl;}
     if(top_extension){memcpy(p,top_level_url,tl);p+=tl;}
@@ -321,12 +327,16 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
         q->cache_mode < WEBNET_CACHE_DEFAULT || q->cache_mode > WEBNET_CACHE_ONLY_IF_CACHED ||
         (q->kind != WEBNET_FETCH && q->cache_mode != WEBNET_CACHE_DEFAULT) ||
         q->referrer_policy<WEBNET_REFERRER_DEFAULT || q->referrer_policy>WEBNET_REFERRER_UNSAFE ||
-        ((q->referrer||q->referrer_policy) && q->kind!=WEBNET_FETCH) ||
+        /* Every fetch carries its referrer but reports and WebSocket handshakes (no-referrer). */
+        ((q->referrer||q->referrer_policy) && (q->kind==WEBNET_REPORT||q->kind==WEBNET_WEBSOCKET)) ||
         ((q->no_cors || q->no_referrer) && q->kind != WEBNET_FETCH) ||
         (q->no_cors && (q->same_origin || q->force_preflight)) ||
         (q->keepalive && (q->kind != WEBNET_FETCH || !q->fetch_group)) ||
         (q->image_upgrade && q->kind != WEBNET_RESOURCE) ||
-        (q->stream_response && q->kind != WEBNET_FETCH)) return 0;
+        (q->stream_response && q->kind != WEBNET_FETCH) ||
+        (unsigned)q->destination >= WEBNET_DEST_COUNT ||
+        ((q->user_activation || q->browser_ui) && q->kind != WEBNET_NAVIGATION) ||
+        (q->browser_ui && !q->user_navigation)) return 0;
     if(q->kind==WEBNET_REPORT && (!webnet_report_fields_valid(q->method,q->headers) || !q->origin ||
         !q->body_len || q->credentials!=WEBNET_CREDENTIALS_SAME_ORIGIN || !q->redirect_error ||
         q->user_navigation || q->force_preflight || q->same_origin || q->no_cors || q->no_referrer ||
@@ -367,6 +377,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     if (q->stream_response) flags |= WEBNET_WIRE_STREAM;
     if (q->require_corp) flags |= WEBNET_WIRE_REQUIRE_CORP;
     if (debug_request) flags |= WEBNET_WIRE_DEBUG_REQUEST;
+    if (q->report_sent) flags |= WEBNET_WIRE_SENT_HEADERS;
     uint64_t id = ++n->serial;
     if (!id) id = ++n->serial;
     uint64_t deadline = uptime_ms() + WEBNET_TIMEOUT_MS;
@@ -400,6 +411,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     r->image_upgrade = q->image_upgrade;
     r->streaming = q->stream_response;
     r->debug_request = debug_request;
+    r->report_sent = q->report_sent;
     r->keepalive_bytes = q->keepalive ? q->body_len : 0;
     r->response_limit = webnet_response_limit(q->kind);
     r->deadline = deadline;
@@ -552,6 +564,7 @@ uint64_t webnet_socket_open(webnet *n, const struct webnet_request *q, webnet_so
     if (!n || !q || !q->url || !cb || q->kind != WEBNET_WEBSOCKET || q->body || q->body_len ||
         (q->method && strcmp(q->method, "GET")) || q->referrer || q->referrer_policy || q->no_cors || q->no_referrer ||
         q->keepalive || q->stream_response || q->image_upgrade || q->cache_mode != WEBNET_CACHE_DEFAULT ||
+        q->destination != WEBNET_DEST_EMPTY || q->user_activation || q->browser_ui ||
         q->credentials < WEBNET_CREDENTIALS_OMIT || q->credentials > WEBNET_CREDENTIALS_INCLUDE) return 0;
     bool secure = !strncasecmp(q->url, "wss://", 6);
     if (!secure && strncasecmp(q->url, "ws://", 5)) return 0;
@@ -748,6 +761,7 @@ static void complete(webnet *n, struct slot *s) {
             response.headers = p; p += (size_t)r->head.headers_len + 1;
             response.body = p; response.body_len = r->head.body_len; p += (size_t)r->head.body_len + 1;
             response.error = p;
+            response.sent_headers = r->sent ? r->sent : "";
         }
         r->callback(n, r->id, r->generation, &response, r->opaque);
     }
@@ -786,6 +800,37 @@ static bool consume_request_diagnostic(struct request *r, char *headers) {
     fprintf(stderr, "[web-net:request] id=%lu generation=%lu status=%u header_bytes=%lu ctl=%lu nonascii=%lu cookie=%lu content_length=%lu\n",
         (unsigned long)r->id, (unsigned long)r->generation, r->head.status, (unsigned long)bytes,
         (unsigned long)ctl, (unsigned long)non_ascii, (unsigned long)cookie, (unsigned long)content_length);
+    return true;
+}
+/* The request fields the final hop sent, one private line each right after
+   the metadata line, move out of the headers into r->sent for the browser's
+   developer tools. They are never there unless this request asked. */
+static bool consume_sent_fields(struct request *r, char *headers) {
+    static const char mark[] = "\r\nHTTP/Nocturne-Sent ";
+    char *line = strstr(headers, mark);
+    if (!line) return true;
+    if (!r->report_sent) return false;
+    size_t total = 0;
+    for (char *p = line; p && !strncmp(p, mark, sizeof mark - 1); p = strstr(p + 2, "\r\n")) {
+        const char *field = p + sizeof mark - 1, *end = strstr(field, "\r\n");
+        if (!end) return false;
+        size_t n = (size_t)(end - field);
+        if (n > SIZE_MAX - total - 3) return false;
+        total += n + 2;
+    }
+    char *sent = malloc(total + 1), *at = sent;
+    if (!sent) return false;
+    char *p = line;
+    while (!strncmp(p, mark, sizeof mark - 1)) {
+        const char *field = p + sizeof mark - 1, *end = strstr(field, "\r\n");
+        size_t n = (size_t)(end - field);
+        memcpy(at, field, n); at += n; memcpy(at, "\r\n", 2); at += 2;
+        p = (char *)end;
+    }
+    *at = 0;
+    memmove(line, p, strlen(p) + 1);
+    if (strstr(headers, mark)) { free(sent); return false; }
+    free(r->sent); r->sent = sent;
     return true;
 }
 static bool consume_transport_diagnostic(struct request *r,char *headers) {
@@ -838,6 +883,7 @@ static bool unpack(struct request *r) {
     }
     memcpy(out+dst,r->rx+src,h->cookie_len);
     if (!consume_request_diagnostic(r, (char *)out + (size_t)h->url_len + 1)) { free(out); return false; }
+    if (!consume_sent_fields(r, (char *)out + (size_t)h->url_len + 1)) { free(out); return false; }
     if (!consume_transport_diagnostic(r, (char *)out + (size_t)h->url_len + 1)) { free(out); return false; }
     free(r->rx); r->rx = out;
     return true;
@@ -873,6 +919,7 @@ static bool dispatch_stream_frame(webnet *n, struct request *r) {
     response.headers = p; p += (size_t)r->head.headers_len + 1;
     response.body = p; response.body_len = r->head.body_len; p += (size_t)r->head.body_len + 1;
     response.error = p;
+    response.sent_headers = r->sent ? r->sent : "";
     response.event = r->head.magic == WEBNET_STREAM_HEADERS ? WEBNET_HEADERS :
         r->head.magic == WEBNET_STREAM_CHUNK ? WEBNET_CHUNK : WEBNET_UPLOAD;
     response.uploaded = r->head.magic == WEBNET_STREAM_UPLOAD ? r->head.status : 0;

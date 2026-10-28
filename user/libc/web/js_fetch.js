@@ -356,7 +356,7 @@ const fetchBridge = (() => {
             if(!arguments.length)throw new TypeError('Request requires input');
             const old=requestSlots.get(input),i=readInit(init);
             let s=old?{...old}:{url:'',method:'GET',mode:'cors',credentials:'same-origin',cache:'default',redirect:'follow',
-                referrer:'about:client',referrerPolicy:'',integrity:'',keepalive:false};
+                referrer:'about:client',referrerPolicy:'',integrity:'',keepalive:false,destination:''};
             if(!old){const url=makeURL(input);if(url.username||url.password)throw new TypeError('Request URL cannot contain credentials');s.url=url.href;}
             if(keys(i).length){s.referrer='about:client';s.referrerPolicy='';}
             if(i.method!==undefined)s.method=methodValue(i.method);
@@ -395,7 +395,7 @@ const fetchBridge = (() => {
             requestSlots.set(this,s);storeBody(this,body);
         }
         clone(){const s=slot(requestSlots,this,'Request');return requestCopy(s,cloneBody(slot(bodySlots,this,'Body')));}
-        get destination(){slot(requestSlots,this,'Request');return '';}
+        get destination(){return slot(requestSlots,this,'Request').destination;}
         get duplex(){slot(requestSlots,this,'Request');return 'half';}
         get isReloadNavigation(){slot(requestSlots,this,'Request');return false;}
         get isHistoryNavigation(){slot(requestSlots,this,'Request');return false;}
@@ -469,10 +469,11 @@ const fetchBridge = (() => {
             if(sig.aborted)abort(sig.reason);
         });
     }
-    function fetchCore(input,init,observer,forcePreflight=false) {
+    function fetchCore(input,init,observer,forcePreflight=false,destination='') {
         let r,s,b,integrity;
         try {
             r=new Request(input,init);s=requestSlots.get(r);b=bodySlots.get(r);
+            if(destination)s.destination=destination;
             const signal=signalSlots.get(s.signal);if(signal.aborted)return reject(signal.reason);
             integrity=s.integrity?integrityMetadata(s.integrity):null;
             // Fetch main fetch selects data before same-origin/no-cors/CORS
@@ -538,7 +539,7 @@ const fetchBridge = (() => {
                 }
                 return false;
             }:undefined;
-            pair=host.fetch(s.url,s.method,raw,b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),forcePreflight,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache),s.keepalive,s.mode==='no-cors',noReferrer,notify,referrer,referrerPolicy);
+            pair=host.fetch(s.url,s.method,raw,b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),forcePreflight,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache),s.keepalive,s.mode==='no-cors',noReferrer,notify,referrer,referrerPolicy,s.destination);
             transportId=pair.id;const transportPromise=pair.promise;pair=null;
             if(observer)performanceBridge.initiator(transportId,'xmlhttprequest');
             if(b.bytes!==null)b.used=true;
@@ -570,6 +571,8 @@ const fetchBridge = (() => {
     }
     return {
         Headers,Request,Response,AbortSignal,AbortController,fetch,
+        /* The engine's own fetch for an element: a track, a media fallback. */
+        fetchFor(destination,input,init){return fetchCore(input,init,undefined,false,destination);},
         moduleIntegrity(bytes,metadata){return integrityBytes(bytes,integrityMetadata(metadata));},
         initialize(){NativeURL=globalThis.URL;Params=globalThis.URLSearchParams;paramsString=Params.prototype.toString;Encoder=globalThis.TextEncoder;encode=Encoder.prototype.encode;Decoder=globalThis.TextDecoder;decode=Decoder.prototype.decode;},
         initializeBlobs(api){blobAPI=api;},

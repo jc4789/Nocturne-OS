@@ -1013,7 +1013,7 @@
     function cancelAnimationFrame(id){host.clear(Number(id));}
     function queueMicrotask(fn){return host.microtask(fn);}
     /* @include js_navigator.js */
-    const {navigator,Interface:Navigator}=navigatorBridge.create(false);
+    const {navigator,Interface:Navigator,languagesChanged}=navigatorBridge.create(false);
     Object.assign(globalThis,{document,console,navigator,Navigator,Node,Element,HTMLElement,HTMLUnknownElement,HTMLIFrameElement,HTMLFrameElement,HTMLImageElement,Image,
         HTMLInputElement,HTMLButtonElement,HTMLSelectElement,HTMLTextAreaElement,HTMLFieldSetElement,HTMLObjectElement,HTMLOutputElement,HTMLOptionElement,
         HTMLScriptElement,HTMLFormElement,HTMLAnchorElement,HTMLAreaElement,
@@ -1317,6 +1317,7 @@
         workerNotify:workerBridge.deliver,
         storageOrigin:storageBridge.origin,
         storageEvent:storageBridge.deliver,
+        languageChange(){if(!languagesChanged())return;const event=new Event('languagechange');eventState(event).isTrusted=true;dispatch(globalThis,event);},
         indexedDBTaskEnd:indexedDBBridge.taskEnd,
         promiseRejection:rejectionBridge.unhandled,
         promiseRejectionHandled:rejectionBridge.handled,

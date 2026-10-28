@@ -168,7 +168,7 @@ const avmediaBridge = (() => {
                         await new Promise(resolve=>setTimeout(resolve,10));
                     }
                 } else {
-                    const response=await fetch(url,{signal:controller.signal,credentials:node.crossOrigin==='use-credentials'?'include':'same-origin'});
+                    const response=await fetchBridge.fetchFor(node.localName==='audio'?'audio':'video',url,{signal:controller.signal,credentials:node.crossOrigin==='use-credentials'?'include':'same-origin'});
                     if(!current(node,s,generation,url))throw abortError();
                     if(!response.ok)throw new Error('Media HTTP status '+response.status);
                     const bytes=await response.arrayBuffer();
@@ -324,5 +324,5 @@ const avmediaBridge = (() => {
     Audio.prototype=HTMLAudioElement.prototype;
     Object.assign(globalThis,{HTMLMediaElement,HTMLAudioElement,HTMLVideoElement,MediaError,Audio});
     for(const cls of [HTMLMediaElement,HTMLAudioElement,HTMLVideoElement,MediaError])Object.defineProperty(cls.prototype,Symbol.toStringTag,{value:cls.name,configurable:true});
-    return {HTMLMediaElement,HTMLAudioElement,HTMLVideoElement,brand,state:snapshot,generation(node){return get(node).generation;},privateFetch:fetch,changed(node){if(!node)return;get(node);active.add(node);monitor();},activate(node){if(!node||!node.controls)return false;if(node.paused)node.play().catch(report);else node.pause();return true;}};
+    return {HTMLMediaElement,HTMLAudioElement,HTMLVideoElement,brand,state:snapshot,generation(node){return get(node).generation;},trackFetch:(input,init)=>fetchBridge.fetchFor('track',input,init),changed(node){if(!node)return;get(node);active.add(node);monitor();},activate(node){if(!node||!node.controls)return false;if(node.paused)node.play().catch(report);else node.pause();return true;}};
 })();

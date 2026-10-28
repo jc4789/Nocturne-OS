@@ -80,10 +80,27 @@ static uint64_t generation = 1, next_generation = 1, navigation_generation, navi
 static int navigation_mode;
 static struct web_navigation_timing navigation_timing;
 static bool native_wait, pending_navigation;
-static char *pending_post;
-static size_t pending_post_len;
-static char *pending_content_type;
-static int pending_mode;
+/* HTML document state: how the navigation that fetched a document asked for
+   it. Its history entry keeps it, so reload and traversal fetch the same way.
+   initiator: the source document's URL ("" for an opaque origin), NULL when
+   the browser itself asked (address bar, home, its buttons). referrer: the
+   referrer source, NULL for no-referrer. */
+struct document_state { char *initiator, *referrer; int referrer_policy; };
+/* One navigation of this window, as the browser or a page asks for it. */
+struct navigation_request {
+    const char *url;
+    const void *body; size_t body_length; const char *content_type; /* a POST */
+    int mode; /* NAV_* */
+    const char *initiator, *referrer; int referrer_policy; /* as in document_state */
+    bool user_activation, browser_ui;
+};
+/* The same request, owned, while a script or a native wait delays it; its URL
+   is pending_text. */
+static struct pending_request {
+    void *body; size_t body_length; char *content_type, *initiator, *referrer;
+    int mode, referrer_policy; bool user_activation, browser_ui;
+} pending;
+static struct document_state navigation_state; /* the navigation in flight */
 static bool navigation_ready, sync_stopped;
 
 struct transfer {
@@ -145,6 +162,7 @@ static struct browser_history_entry {
     void *state;
     size_t state_len;
     bool manual;
+    struct document_state source;
 } *hist;
 static int nhist, hist_capacity, hpos = -1;
 static uint64_t history_serial;
@@ -1030,8 +1048,18 @@ static void prepare_native_snapshot(bool force) {
     }
 }
 
+static void document_state_free(struct document_state *s) {
+    free(s->initiator); free(s->referrer);
+    *s = (struct document_state){0};
+}
+static bool document_state_set(struct document_state *to, const char *initiator, const char *referrer, int policy) {
+    struct document_state s = {initiator ? strdup(initiator) : NULL, referrer && *referrer ? strdup(referrer) : NULL, policy};
+    if ((initiator && !s.initiator) || (referrer && *referrer && !s.referrer)) { document_state_free(&s); return false; }
+    document_state_free(to); *to = s;
+    return true;
+}
 static void hist_discard(int index) {
-    free(hist[index].url); free(hist[index].state);
+    free(hist[index].url); free(hist[index].state); document_state_free(&hist[index].source);
     memset(&hist[index], 0, sizeof hist[index]);
 }
 static bool hist_reserve(size_t count) {
@@ -1044,12 +1072,17 @@ static bool hist_reserve(size_t count) {
     hist = grown; hist_capacity = (int)capacity;
     return true;
 }
+/* A new entry of the current document shares its document state. */
 static bool hist_append(char *copy) {
     if (!hist_reserve((size_t)(hpos + 1) + 1)) return false;
+    struct document_state source = {0};
+    if (hpos >= 0 && !document_state_set(&source, hist[hpos].source.initiator, hist[hpos].source.referrer,
+                                         hist[hpos].source.referrer_policy)) return false;
     for (int i = hpos + 1; i < nhist; i++) hist_discard(i);
     nhist = hpos + 1;
     memset(&hist[nhist], 0, sizeof hist[nhist]);
     hist[nhist].url = copy;
+    hist[nhist].source = source;
     hist[nhist].document = generation;
     hist[nhist].entry = ++history_serial;
     hpos = nhist++;
@@ -1192,6 +1225,8 @@ static bool host_request(void *opaque, const struct web_request *request) {
         .fetch_group = request->fetch_group
         , .stream_response = request->stream_response, .top_level_url=web_url(doc)
         , .require_corp = request->require_corp
+        , .destination = (enum webnet_destination)request->destination
+        , .report_sent = console_open /* DevTools records it: show the fields it sent */
     };
     t->network_id = webnet_submit(network, &r, resource_completed, t);
     if (!t->network_id) { free(t); return false; }
@@ -1293,61 +1328,73 @@ static void cancel_document_requests(void) {
     }
 }
 
-static void queue_navigation_body(const char *url, const void *post, size_t length, const char *content_type, int mode) {
-    if (!url || !*url) return;
-    if (length > WEBNET_BODY_LIMIT ||
-        (post && (!content_type || strlen(content_type) > UINT32_MAX - 16u || strpbrk(content_type,"\r\n")))) {
+static void pending_free(struct pending_request *p) {
+    free(p->body); free(p->content_type); free(p->initiator); free(p->referrer);
+    *p = (struct pending_request){0};
+}
+static void queue_navigation(const struct navigation_request *r) {
+    if (!r->url || !*r->url) return;
+    if (r->body_length > WEBNET_BODY_LIMIT ||
+        (r->body && (!r->content_type || strlen(r->content_type) > UINT32_MAX - 16u || strpbrk(r->content_type,"\r\n")))) {
         console_add("error", "Form navigation exceeds the native request bounds"); return;
     }
-    char *copy = post ? malloc(length + 1) : NULL;
-    char *url_copy = strdup(url), *type_copy = post ? strdup(content_type) : NULL;
-    if (!url_copy || (post && (!copy || !type_copy))) { free(url_copy); free(copy); free(type_copy); console_add("error", "Navigation allocation failed"); return; }
-    if (copy) { if(length)memcpy(copy,post,length);copy[length]=0; }
-    free(pending_text.p); pending_text = (struct url_text){url_copy, strlen(url_copy) + 1};
-    free(pending_post);
-    pending_post = copy;
-    pending_post_len = post ? length : 0;
-    free(pending_content_type); pending_content_type = type_copy;
-    pending_mode = mode;
+    struct pending_request p = {.body_length = r->body ? r->body_length : 0, .mode = r->mode,
+        .referrer_policy = r->referrer_policy, .user_activation = r->user_activation, .browser_ui = r->browser_ui};
+    char *url = strdup(r->url);
+    p.body = r->body ? malloc(r->body_length + 1) : NULL;
+    p.content_type = r->body ? strdup(r->content_type) : NULL;
+    p.initiator = r->initiator ? strdup(r->initiator) : NULL;
+    p.referrer = r->referrer ? strdup(r->referrer) : NULL;
+    if (!url || (r->body && (!p.body || !p.content_type)) || (r->initiator && !p.initiator) || (r->referrer && !p.referrer)) {
+        free(url); pending_free(&p); console_add("error", "Navigation allocation failed"); return;
+    }
+    if (p.body) { if (r->body_length) memcpy(p.body, r->body, r->body_length); ((char *)p.body)[r->body_length] = 0; }
+    free(pending_text.p); pending_text = (struct url_text){url, strlen(url) + 1};
+    pending_free(&pending); pending = p;
     pending_navigation = true;
 }
-static void queue_navigation(const char *url, const char *post, int mode) {
-    queue_navigation_body(url,post,post?strlen(post):0,"application/x-www-form-urlencoded",mode);
+/* The browser's own navigation (address bar, home, its buttons, the window's
+   first page): no source document, so no referrer unless reload and
+   traversal reuse their entry's, and the user's own activation. */
+static struct navigation_request browser_navigation(const char *url, int mode) {
+    struct navigation_request r = {.url = url, .mode = mode, .user_activation = true, .browser_ui = true};
+    if ((mode == NAV_RELOAD || mode == NAV_HISTORY) && hpos >= 0) {
+        r.referrer = hist[hpos].source.referrer; r.referrer_policy = hist[hpos].source.referrer_policy;
+    }
+    return r;
 }
 
-static void host_navigate(void *opaque, const char *url, const char *post) {
+static void host_navigate(void *opaque, const struct web_navigation *n) {
     (void)opaque;
+    if (!n || !n->url) return;
     if (doc && !has_prefix(web_url(doc), "file://") && !has_prefix(web_url(doc), "about:") &&
-        has_prefix(url, "file://")) {
+        has_prefix(n->url, "file://")) {
         console_add("error", "A remote document cannot navigate to a local file.");
         return;
     }
-    queue_navigation(url, post, NAV_PUSH);
-}
-static void host_navigate_mode(void *opaque, const char *url, int mode) {
-    host_navigate(opaque, url, NULL);
-    if (pending_navigation) pending_mode = mode == 2 ? NAV_REPLACE : mode == 1 ? NAV_RELOAD : NAV_PUSH;
-}
-static void host_navigate_form(void *opaque, const char *url, const void *body, size_t length, const char *content_type, const char *target) {
-    (void)opaque;
-    if (!url || (!has_prefix(url,"https://") && !has_prefix(url,"http://"))) {
-        console_add("error","Form navigation requires an HTTP(S) destination"); return;
-    }
+    const char *target = n->target;
     if (!target || !*target || !strcasecmp(target,"_self") || !strcasecmp(target,"_top") || !strcasecmp(target,"_parent")) {
-        queue_navigation_body(url,body,length,content_type,NAV_PUSH); return;
+        struct navigation_request r = {.url = n->url, .body = n->body, .body_length = n->body_length,
+            .content_type = n->content_type,
+            .mode = n->history == WEB_NAVIGATE_REPLACE ? NAV_REPLACE : n->history == WEB_NAVIGATE_RELOAD ? NAV_RELOAD : NAV_PUSH,
+            .initiator = n->initiator ? n->initiator : "", .referrer = n->referrer,
+            .referrer_policy = n->referrer_policy, .user_activation = n->user_activation};
+        /* Reload fetches with its entry's request referrer and policy. */
+        if (r.mode == NAV_RELOAD && hpos >= 0) { r.referrer = hist[hpos].source.referrer; r.referrer_policy = hist[hpos].source.referrer_policy; }
+        queue_navigation(&r); return;
     }
-    if (!strcasecmp(target,"_blank") && !body) {
+    if (!strcasecmp(target,"_blank") && !n->body) {
         /* The new window shares this one's input, output and log, if it has them. */
-        const char *args[]={"browser",url};int32_t handles[]={0,1,2};
+        const char *args[]={"browser",n->url};int32_t handles[]={0,1,2};
         struct n_launch launch={.arguments=args,.argument_count=2,.handles=handles,.handle_count=3};
         char self[1024];
         n_handle app=find_program("browser",self,sizeof self)?n_app_launch(self,&launch):-N_ERR_NOT_FOUND;
         if (app==-N_ERR_NO_HANDLE) { launch.handle_count=0; app=n_app_launch(self,&launch); }
-        if (app<0) console_add("error","Unable to open the form destination window");
+        if (app<0) console_add("error","Unable to open the new window");
         else n_handle_close(app);
         return;
     }
-    console_add("error","Named form destinations and POST into a new window are not yet supported");
+    console_add("error","Named destinations and POST into a new window are not yet supported");
 }
 
 static void host_console(void *opaque, int level, const char *message) {
@@ -1795,7 +1842,9 @@ static bool host_sync_request(void *opaque, const struct web_request *request, s
         .kind = s->kind, .generation = s->generation, .url = request->url,
         .origin = request->origin, .method = "GET", .credentials = request->credentials,
         .redirect_error = request->redirect_error, .same_origin = request->same_origin,
-        .cache_mode = request->cache_mode, .top_level_url=web_url(doc)
+        .cache_mode = request->cache_mode, .top_level_url=web_url(doc),
+        .referrer = request->referrer, .referrer_policy = request->referrer_policy,
+        .destination = (enum webnet_destination)request->destination
     };
     uint64_t id = webnet_submit(network, &r, synchronous_completed, s);
     if (!id) { free(s); strcpy(response->error, "module request could not be started"); return false; }
@@ -1844,7 +1893,6 @@ static const struct web_host browser_host = {
     .sync_request = host_sync_request,
     .wait_request = host_wait_request,
     .navigate = host_navigate, .console = host_console, .scroll = host_scroll,
-    .navigate_form = host_navigate_form,
     .scroll_to = host_scroll_to, .history = host_history,
     .window_state=host_window_state,.window_size=host_window_size,
     .navigation_pending=host_navigation_pending,
@@ -1853,7 +1901,6 @@ static const struct web_host browser_host = {
     .presentation=host_presentation,
     .cookie_get = host_cookie_get, .cookie_set = host_cookie_set,
     .cookie_enabled = host_cookie_enabled
-    , .navigate_mode = host_navigate_mode
     , .storage = host_storage, .storage_events = true
     , .media_range = true
     , .display_frames = true
@@ -1962,6 +2009,13 @@ static void finish_navigation(void) {
             for (int i = 0; i < nhist; i++) if (hist[i].document == previous) hist[i].document = generation;
         }
     }
+    /* A new entry keeps how its document was asked for; reload and traversal
+       keep the entry's own. */
+    if (hpos >= 0 && hist[hpos].document == generation &&
+        (navigation_mode == NAV_PUSH || navigation_mode == NAV_REPLACE)) {
+        document_state_free(&hist[hpos].source);
+        hist[hpos].source = navigation_state; navigation_state = (struct document_state){0};
+    }
     int keep = navigation_mode == NAV_PUSH || hpos < 0 || hist[hpos].manual ? 0 : hist[hpos].y;
     int keep_x = navigation_mode == NAV_PUSH || hpos < 0 || hist[hpos].manual ? 0 : hist[hpos].x;
     scroll_x = scroll_y = 0; scroll_event_pending = false;
@@ -1989,7 +2043,8 @@ static void finish_navigation(void) {
     redraw();
 }
 
-static void navigate_inner(const char *url, const void *post, size_t length, const char *headers, int mode) {
+static void navigate_inner(const struct navigation_request *r, const char *headers) {
+    const char *url = r->url; const void *post = r->body; size_t length = r->body_length; int mode = r->mode;
     if (storage && webstorage_pending(storage)) {
         struct web_storage_result result;
         if (webstorage_flush(storage, true, &result) != WEB_STORAGE_OK)
@@ -2021,6 +2076,9 @@ static void navigate_inner(const char *url, const void *post, size_t length, con
         redraw(); return;
     }
     if (!url_text_set(&navigation_text, url)) { console_add("error", "Navigation URL allocation failed"); return; }
+    if (!document_state_set(&navigation_state, r->initiator, r->referrer, r->referrer_policy)) {
+        console_add("error", "Navigation allocation failed"); return;
+    }
     stop_navigation();
     navigation_generation = ++next_generation;
     navigation_timing.valid = true;
@@ -2054,14 +2112,19 @@ static void navigate_inner(const char *url, const void *post, size_t length, con
         free(local->url); free(local);
         navigation_ready = true; return;
     }
+    /* The request's origin and its top-level navigation initiator are the
+       source document's. The browser UI has none (no client): Sec-Fetch-Site
+       none, and SameSite=Strict cookies remain eligible. */
     struct webnet_request rq = {
         .kind = WEBNET_NAVIGATION, .generation = navigation_generation, .url = url,
-        .origin = cur_url, .method = post ? "POST" : "GET",
+        .origin = r->initiator, .method = post ? "POST" : "GET",
         .headers = post ? headers : NULL,
         .body = post, .body_len = post ? length : 0, .user_navigation = true,
-        /* No document is a browser-initiated navigation (no client), not an
-           opaque one: SameSite=Strict cookies remain eligible. */
-        .credentials = WEBNET_CREDENTIALS_INCLUDE, .top_level_url=doc?web_url(doc):NULL
+        .credentials = WEBNET_CREDENTIALS_INCLUDE, .top_level_url = r->initiator,
+        .referrer = r->referrer && *r->referrer ? r->referrer : NULL, .referrer_policy = r->referrer_policy,
+        .destination = WEBNET_DEST_DOCUMENT,
+        .user_activation = r->user_activation || r->browser_ui, .browser_ui = r->browser_ui,
+        .report_sent = console_open
     };
     navigation_timing.fetch_start_ms = n_clock_uptime_ms();
     navigation_timing.fetch_valid = true;
@@ -2084,30 +2147,49 @@ static char *navigation_post_headers(const char *content_type) {
     memcpy(headers,"Content-Type: ",14);memcpy(headers+14,content_type,n);
     memcpy(headers+14+n,"\r\n",3);return headers;
 }
-static void navigate_body(const char *url_in, const void *post, size_t length, const char *content_type, int mode) {
-    if (!url_in) return;
-    if (native_wait || (doc && web_script_running(doc))) { queue_navigation_body(url_in,post,length,content_type,mode); return; }
-    char *url = strdup(url_in); /* input can alias current URL or history */
-    if (!url) { console_add("error", "Navigation allocation failed"); return; }
-    char *headers=post?navigation_post_headers(content_type):NULL;
-    if(post&&!headers){free(url);console_add("error","Form request header is invalid or could not be allocated");return;}
-    navigate_inner(url, post, length, headers, mode);
-    free(headers); free(url);
+static void navigate_request(const struct navigation_request *in) {
+    if (!in->url) return;
+    if (native_wait || (doc && web_script_running(doc))) { queue_navigation(in); return; }
+    /* The URL and the source can alias the current URL or a history entry. */
+    struct navigation_request r = *in;
+    char *url = strdup(in->url), *initiator = in->initiator ? strdup(in->initiator) : NULL;
+    char *referrer = in->referrer ? strdup(in->referrer) : NULL;
+    char *headers = in->body ? navigation_post_headers(in->content_type) : NULL;
+    if (!url || (in->initiator && !initiator) || (in->referrer && !referrer)) console_add("error", "Navigation allocation failed");
+    else if (in->body && !headers) console_add("error","Form request header is invalid or could not be allocated");
+    else { r.url = url; r.initiator = initiator; r.referrer = referrer; navigate_inner(&r, headers); }
+    free(headers); free(url); free(initiator); free(referrer);
 }
-static void navigate(const char *url_in, const char *post, int mode) {
-    navigate_body(url_in,post,post?strlen(post):0,"application/x-www-form-urlencoded",mode);
+/* The browser's own navigation: its chrome, keys and first page. */
+static void navigate(const char *url, int mode) {
+    struct navigation_request r = browser_navigation(url, mode);
+    navigate_request(&r);
+}
+/* A navigation the page itself asks for (history.go, a refresh), or a link
+   the user follows in it: the page is the source. Reload and traversal
+   fetch with their entry's request referrer. */
+static struct navigation_request page_navigation(const char *url, int mode, web_node *element) {
+    struct web_navigation source = {0};
+    web_navigation_source(doc, element, &source);
+    struct navigation_request r = {.url = url, .mode = mode, .initiator = source.initiator ? source.initiator : "",
+        .referrer = source.referrer, .referrer_policy = source.referrer_policy, .user_activation = source.user_activation};
+    if ((mode == NAV_RELOAD || mode == NAV_HISTORY) && hpos >= 0) {
+        r.referrer = hist[hpos].source.referrer; r.referrer_policy = hist[hpos].source.referrer_policy;
+    }
+    return r;
 }
 
 static void apply_pending_navigation(void) {
     if (!pending_navigation || native_wait || quit || (doc && web_script_running(doc))) return;
     char *url = pending_text.p;
     pending_text = (struct url_text){0};
-    char *post = pending_post; int mode = pending_mode; size_t length=pending_post_len;
-    char *content_type=pending_content_type; pending_content_type=NULL;
-    pending_post = NULL; pending_navigation = false;
-    navigate_body(url, post, length, content_type, mode);
-    free(url);
-    free(post); free(content_type);
+    struct pending_request p = pending;
+    pending = (struct pending_request){0}; pending_navigation = false;
+    struct navigation_request r = {.url = url, .body = p.body, .body_length = p.body_length,
+        .content_type = p.content_type, .mode = p.mode, .initiator = p.initiator, .referrer = p.referrer,
+        .referrer_policy = p.referrer_policy, .user_activation = p.user_activation, .browser_ui = p.browser_ui};
+    navigate_request(&r);
+    free(url); pending_free(&p);
 }
 
 
@@ -2138,15 +2220,16 @@ static void go_addr(const char *text) {
     if (!*text) return;
     char *url = address_destination(text);
     if (!url) { console_add("error", "Navigation allocation failed"); return; }
-    navigate(url, NULL, NAV_PUSH); free(url);
+    navigate(url, NAV_PUSH); free(url);
 }
 
-static void go_history(int d) {
+static void go_history(int d, bool browser_ui) {
     int64_t p = (int64_t)hpos + d;
     if (p < 0 || p >= nhist) return;
     history_scroll_save();
     hpos = (int)p;
-    navigate(hist[hpos].url, NULL, NAV_HISTORY);
+    if (browser_ui) navigate(hist[hpos].url, NAV_HISTORY);
+    else { struct navigation_request r = page_navigation(hist[hpos].url, NAV_HISTORY, NULL); navigate_request(&r); }
 }
 static void apply_pending_history(void) {
     if (!history_queue_count || loading || native_wait || quit || (doc && web_script_running(doc))) return;
@@ -2154,8 +2237,8 @@ static void apply_pending_history(void) {
     history_queue=task->next; if (!history_queue) history_queue_tail=NULL; history_queue_count--;
     int delta = task->delta; uint64_t document_generation = task->generation; free(task);
     if (document_generation != generation) return;
-    if (!delta) navigate(cur_url, NULL, NAV_RELOAD);
-    else go_history(delta);
+    if (!delta) { struct navigation_request r = page_navigation(cur_url, NAV_RELOAD, NULL); navigate_request(&r); }
+    else go_history(delta, false);
 }
 
 static void submit(web_node *n) {
@@ -2168,12 +2251,8 @@ static void submit(web_node *n) {
     bool allowed = form && web_dispatch(doc, form, &event);
     flush_dom_layout();
     if (!allowed) return;
-    if (web_js_dialog_submit(doc,n) != 0) {flush_dom_layout();return;}
-    struct web_form_request request;
-    if (!web_submit_request(doc,n,&request)) return;
-    web_autocomplete_record(doc,n,request.url);
-    host_navigate_form(NULL,request.url,request.body,request.body_len,request.content_type,request.target);
-    web_submit_request_free(&request);
+    web_form_navigate(doc, n);
+    flush_dom_layout();
 }
 
 /* ---------------------------------------------------------------- input */
@@ -2468,11 +2547,11 @@ static void key(const struct gui_event *e) {
         return;
     }
     if (k == NKEY_F5 || (ctrl && k == 'r')) {
-        if (cur_url[0]) navigate(cur_url, NULL, NAV_RELOAD);
+        if (cur_url[0]) navigate(cur_url, NAV_RELOAD);
         return;
     }
-    if (alt && k == NKEY_LEFT) return go_history(-1);
-    if (alt && k == NKEY_RIGHT) return go_history(1);
+    if (alt && k == NKEY_LEFT) return go_history(-1, true);
+    if (alt && k == NKEY_RIGHT) return go_history(1, true);
     if(console_open&&focus==F_CONSOLE)return console_key(e);
     if (sel_node) {
         int room = MAX((view.h - sel_y) / SEL_H, 1);
@@ -2511,7 +2590,7 @@ static void key(const struct gui_event *e) {
         if (r) return;
         if (e->key >= 32 && e->key < 127) return; /* typed into a control that ignored it */
     }
-    if (k == NKEY_BACKSPACE && !ctrl) return go_history(-1);
+    if (k == NKEY_BACKSPACE && !ctrl) return go_history(-1, true);
     if (k == NKEY_ESC && find_open) {
         find_close();
         return;
@@ -2553,7 +2632,10 @@ static void page_click(web_node *target, int x, int y, bool keyboard) {
                 set_status("A remote page cannot open a local file");
                 return;
             }
-            if (!web_frame_navigate(doc, anchor, hit.href)) queue_navigation(hit.href, NULL, NAV_PUSH);
+            if (!web_frame_navigate(doc, anchor, hit.href)) {
+                struct navigation_request r = page_navigation(hit.href, NAV_PUSH, anchor);
+                queue_navigation(&r);
+            }
         }
         return;
     case WEB_HIT_TEXT_INPUT:
@@ -2665,13 +2747,13 @@ static void mouse_move(const struct gui_event *e) {
 /* What the widgets around the page asked for, in its turn with the rest of the input. */
 static void command(const struct gui_event *e) {
     switch (e->key) {
-    case CMD_BACK: go_history(-1); break;
-    case CMD_FORWARD: go_history(1); break;
+    case CMD_BACK: go_history(-1, true); break;
+    case CMD_FORWARD: go_history(1, true); break;
     case CMD_RELOAD:
         if (loading && !native_wait) stop_navigation();
-        else if (cur_url[0]) navigate(cur_url, NULL, NAV_RELOAD);
+        else if (cur_url[0]) navigate(cur_url, NAV_RELOAD);
         break;
-    case CMD_HOME: navigate(HOME, NULL, NAV_PUSH); break;
+    case CMD_HOME: navigate(HOME, NAV_PUSH); break;
     case CMD_HISTORY: sel_node = NULL; web_autocomplete_settings(); need_paint = true; break;
     case CMD_GO: focus = F_PAGE; sel_node = NULL; go_addr(addr); break;
     case CMD_FIND: find_next(find_y >= 0 ? find_y : scroll_y); break;
@@ -2798,11 +2880,12 @@ static void handle_native_wait(const struct gui_event *e) {
         }
         if ((e->mods & NMOD_CTRL) && k == 'l') { addr_focus(); show_chrome(); return; }
         if (e->key == NKEY_F5 || ((e->mods & NMOD_CTRL) && k == 'r')) {
-            queue_navigation(cur_url, NULL, NAV_RELOAD); return;
+            struct navigation_request r = browser_navigation(cur_url, NAV_RELOAD);
+            queue_navigation(&r); return;
         }
         if (e->mods & NMOD_ALT) {
-            if (e->key == NKEY_LEFT) { go_history(-1); return; }
-            if (e->key == NKEY_RIGHT) { go_history(1); return; }
+            if (e->key == NKEY_LEFT) { go_history(-1, true); return; }
+            if (e->key == NKEY_RIGHT) { go_history(1, true); return; }
         }
     }
     /* The toolbar's commands act now; what needs the document (find, the console) waits. */
@@ -3023,7 +3106,7 @@ int main(int argc, char **argv) {
     take_engine_events();
     redraw();
     if (argc > 1) go_addr(argv[1]); /* a URL, a path (as Files opens one) or words to search */
-    else navigate(HOME, NULL, NAV_PUSH);
+    else navigate(HOME, NAV_PUSH);
     while (!quit) {
         uint64_t now = n_clock_uptime_ms();
         webnet_pump(network, now);
@@ -3092,7 +3175,8 @@ int main(int argc, char **argv) {
             uint64_t now = n_clock_uptime_ms();
             if (now >= refresh_at) {
                 refresh_at = 0;
-                navigate(refresh_url, NULL, NAV_PUSH);
+                struct navigation_request r = page_navigation(refresh_url, NAV_PUSH, NULL);
+                navigate_request(&r);
                 continue;
             }
             int due = (int)MIN(refresh_at - now, 0x7fffffff);
@@ -3114,7 +3198,7 @@ int main(int argc, char **argv) {
     webnet_free(network);
     webstorage_free(storage);
     parallel_shutdown();
-    free(pending_post); free(pending_content_type);
+    pending_free(&pending); document_state_free(&navigation_state);
     free(current_text.p); free(navigation_text.p); free(pending_text.p); free(address_text.p); free(refresh_text.p);
     free(focus_value); free(find_text.p);
     for (int i = 0; i < nhist; i++) hist_discard(i);

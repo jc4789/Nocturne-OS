@@ -103,6 +103,13 @@
 | K37 | Notification・navigator.permissions・navigator.mediaDevices・navigator.maxTouchPoints が無く、plugins・mimeTypes が 0（Chromium は 5・2、Firefox も持つ） | F12 で Chromium と同じ式（fix-yt2、組込みのブラウザー） | maxTouchPoints を足した（Pointer Events、窓だけ、0。触れる画面はカーネルが一本のポインターにする）。plugins 0・pdfViewerEnabled false は PDF の表示器が無いので仕様どおり。Notification・Permissions・mediaDevices は OS に通知・撮影の口が無く、足すなら OS の設計から（未着手） |
 | K40 | NavigatorID の値が一つの互換の型にそろわない：product "Gecko"・productSub "20030107"（Chrome・WebKit の型）・vendor ""（Gecko の型）、appVersion が UA そのもので "5.0 (" で始まらない（HTML の NavigatorID の要件） | js_navigator.js を読んだ | 未着手（見つけただけ） |
 | K41 | MSE が受ける byte stream は mp4・webm だけ（audio/mpeg・audio/aac は無い）。requestVideoFrameCallback と ManagedMediaSource が無い。shaka-player の README の機能一覧と照らした（changeType・live seekable range・Worker の MSE・VTTCue・EME はある） | js_mse.js・media_mse.c を読んだ | 未着手（見つけただけ） |
+| K42 | 要求に Fetch・Fetch Metadata・HTML が決める頭が無い：destination ごとの Accept の既定、Accept-Language、移動の Upgrade-Insecure-Requests、Sec-Fetch-Dest・Mode・Site・User。Accept-Encoding は gzip だけ。Anubis の確認で割り当てられる難しさが我々 6、Floorp 4（平均の手間は 256 倍。再現は startpage.com） | webfetch.c の prepare_outgoing を読んだ。難しさは頁の challenge の値（6 節の測定） | 修理（未コミット）：webfetch.c が要求の destination・mode・利用者の起動・ブラウザーの UI から付ける（accept_value・append_accept_language・append_fetch_metadata）。Sec-Fetch-* は信用できる URL だけ。Accept-Language は利用者の言語の設定（n_user_languages）から。ホストの試験 `tests/check_fetch_metadata.py`：webfetch.c の関数を切り出して組み、1464 件・失敗 0（割り当ての失敗の注入 162 点、書き換え 12 通りを全部捕まえる）。実際の HTTP・QEMU と、browser.c・js.c が destination と旗を正しく渡すかは試験の外。難しさが変わるかは未測定 |
+| K43 | 移動の口が三つ（navigate・navigate_form・navigate_mode）に分かれ、元の文書の写し（起点・referrer・referrer policy・利用者の起動）を持たない。履歴の項目が文書の状態を持たず、再読み込み・戻る・進むで元の referrer を失う。アドレス欄・戻るなどブラウザーの UI からの移動と頁からの移動を区別しない（Sec-Fetch-Site none、SameSite の判定）。a・area の referrerpolicy と rel=noreferrer、form の rel=noreferrer が移動に届かない | browser.c・js.c・frame_native.h を読んだ（HTML の navigate、source snapshot params、session history entry の document state） | 修理（未コミット）：口を `host.navigate(struct web_navigation)` 一つにし、`web_navigation_source` が元の文書と要素から写しを作る。履歴の項目が文書の状態（起点・referrer・policy）を持ち、再読み込みと履歴の移動はそれを使う。POST の移動に Origin。document.referrer は最後の跳びで実際に送った referrer（webfetch の応答の Meta の行）。form の送信は `web_form_navigate` に一本化 |
+| K44 | script・style・image・font・frame・module・Worker の要求が destination を持たず、referrer を渡さない（Fetch の既定「client」＝文書と、文書の referrer policy にならない）。img の referrerpolicy が画像の要求の識別に入らない | js.c の send_request・request_module・worker_request、doc.c の画像の要求を読んだ。どの頁で Referer が欠けたかは未測定 | 修理（未コミット）：全要求に destination（fetch() は Request.destination、音・動画は audio・video、字幕は track）。referrer の無い要求は文書の referrer と policy、報告は no-referrer。module の子は親の URL と policy。img・script の referrerpolicy を要素から |
+| K45 | 見つけた referrer の残り：新しい窓（_blank）の移動がブラウザーの UI の扱いになり、Referer と Sec-Fetch-Site が元の文書を表さない。枠を的にしたリンクの referrerpolicy が落ちる。link の stylesheet の referrerpolicy が使われない（CSS の記憶が URL だけで引く）。字体の referrer が stylesheet の URL でない。importScripts に referrer が無い。classic script・link stylesheet の crossorigin。mask-image の cors | K43・K44 の作業でコードを読んだ | 未着手（見つけただけ） |
+| K46 | 見つけた移動・取得の残り：POST の頁の再読み込みで本文を送り直さない。iframe の移動の Sec-Fetch-User。媒体の取得（media_http.c）が Fetch の層を通らない。track の redirect の mode。meta refresh が HTML の shared declarative refresh steps と違う：履歴を push にする（仕様は replace）、同じ URL への更新をしない（`strcmp(url, cur_url)`。自動で読み直す頁が読み直さない）、10 秒を超える遅れを捨てる、時刻の解析が atoi で仕様の手順でない、Refresh の応答の頭を読まない、script が後から入れた meta を見ない、sandbox の automatic features を見ない、時刻を「完全に読み込んだ時」と「meta を入れた時」から数えない | 同上。meta refresh は doc.c の T_meta と browser.c の refresh_at を読み、仕様（semantics.html の shared declarative refresh steps）と照らした | 未着手（見つけただけ） |
+| K48 | F12 の Network が、実際に送った要求の頭（webfetch.c が付ける Accept・Accept-Language・Sec-Fetch-*・Origin・Referer・Cookie）を見せない。見せるのは頁が付けた頭だけ（browser_devtools.h の「Request Headers (set by the page)」）。他のブラウザーの開発者の道具は送った頭を見せる。QEMU で K42 を確かめる口も無い | browser_devtools.h・webfetch.c を読んだ | 修理（未コミット）：F12 が開いている間の要求は `report_sent` を立て、webfetch が最後の段で送った欄（Host・User-Agent・Content-Length と準備した欄）を応答の前置きに `HTTP/Nocturne-Sent ` の行で載せ、webnet が取り出して `webnet_response.sent_headers` で窓へ渡す（頁の fetch・XHR の頭には出ない）。F12 の詳細は送った欄を「Request Headers」に出す。QEMU で未確認 |
+| K47 | Worker の残り：型の無い Blob の classic worker を拒む（HTML の classic worker の取得は blob の MIME を検査しない）。Worker に languagechange が届かない。Worker の進捗 1 通ごとに BSP への往復が Worker で 3 回（`sendable` が毎回 `n_events_watch`・`n_events_unwatch`、それから `n_channel_send`）、頁で 5 回（受け取り・credit の送り返し）。`web_js_tick` は 1 拍に Worker の通を 1 つだけ処理する | QEMU 4 CPU（startpage の確認の台本を F12 で走らせた回）。往復の数は browserjsworker.c・js_worker.c・channel.c・events.c を読んだサブエージェントの報告（行は未検証） | languagechange は修理（未コミット：browserjsworker.c の主ループと js_worker_runtime.js の onlanguagechange）。前に書いた「1 本 4 万回/秒、2 本のときの 1 本分 17.5 万回/秒」は撤回：難しさ 6・20 秒の回と難しさ 9・12 秒の回という条件の違う二つの比べで、しかも数は thread 0 が送り頁が処理し終えた nonce（頁に溜まった分を数えない）。1 本の回は頁の主ループも同じ割合で遅かった（setTimeout(12000) が 39 ms 遅れ、処理した通 39 通/秒、3 本の回は 136 通/秒）。一番の見込みはその 12 秒間の BSP の往復の遅さで、`prof` の回（同じ台本で 1 本と 3 本を [1,3,1,2,1] の順に）で未確認。Blob の MIME は未着手 |
 
 ## 5. 受入表（browser-hikaku の組）
 
@@ -150,6 +157,15 @@ Floorp の性能記録（10/26 04:16、74.5 秒の範囲）は頁を開いた後
 
 Bilibili /en/ は、ログインしていないと再生 60 秒で動画を止めてログインの窓を出す（Chromium でも同じ。我々の log の `author-pause`）。前の「190 秒の止まり」はこれだった。以後の Bilibili は CN の頁（BV1cgYQ6PE8c）で確かめる。
 
+確認の頁（challenge。2026-10-27 夜。我々は QEMU WHPX・4 CPU・4 GiB・2560×1440、F12 を開いたまま、`--log-console`。Floorp は実機、ユーザーの記録 `START PAGE Floorp 2026-10-27 21.23 profile.json.gz`）：
+
+| 測るもの | 再現 | HEAD 750fecbd | K42〜K44 の後 | Floorp |
+|---|---|---|---|---|
+| 割り当てられた難しさ | startpage.com の検索 | 6 | 未測定 | 4 |
+| 確認の頁から結果まで | 同上 | 176 秒 | 未測定 | 295 ms（elapsedTime。体感 1 秒） |
+| 計算の速さ（同じ台本、難しさ 6、Worker 2 本、20 秒） | 同上の台本 | 35 万回/秒 | — | Chromium（ホスト）42 万回/秒 |
+| Turnstile が通るか | Cloudflare の確認 | 未測定 | 未測定 | — |
+
 
 ## 7. 決定
 
@@ -157,3 +173,6 @@ Bilibili /en/ は、ログインしていないと再生 60 秒で動画を止�
 |---|---|---|
 | D1 | 基準 b2f5b721 を別の作業木で全体ビルドし、組を基準と現在で撮り比べる | 退行かどうかは、変更前と並べないと判定できない |
 | D2 | AP の読み取り区間で、事象待ちだけは自分の task を park に登録してよい（約束を smp.h に書いた） | 待ち行列の解放が登録より前に来ないことを、読み取り区間の同期で保つため |
+| D3 | 移動は一つの口 `host.navigate(struct web_navigation)` で受け、元の文書の写しは JS の層（`web_navigation_source`）が作り、文書の状態は窓の履歴の項目が持つ | HTML の navigate は source snapshot params と session history entry の document state で決まる。口を分けると写しの欄がどこかで落ちる（K43） |
+| D5 | アドレス欄・履歴のボタン・再読み込みのボタンなどブラウザーの UI からの移動は、要求の user-activation を真にする（Sec-Fetch-User: ?1、Sec-Fetch-Site: none） | HTML の create navigation params by fetching は user-activation を元の文書の一時的な起動からだけ立てるが、Fetch Metadata の「Navigation from the address bar」の節は UI からの移動を利用者が直接起こしたものとして扱うよう書く。ホストの試験 `tests/check_fetch_metadata.py`（1464 件）はこの決定を前提に組んだ |
+| D4 | 名乗り（UA）を変える、BotGuard や確認の台本が集める値を他のブラウザーへ寄せる変更は、ユーザーの判断まで行わない。その診断のビルドや比べも、自動の審査が bot の検査の回避として止めた | 仕様の欠けを満たすこと（K42〜K44）と、身元を偽ることを分ける |

@@ -6,12 +6,13 @@ function runNavigatorChecks(Interface,nav,expected,worker,check){
     ck('instance',nav instanceof Interface);
     ck('tag',Object.prototype.toString.call(nav)===(worker?'[object WorkerNavigator]':'[object Navigator]'));
     let error;try{new Interface();}catch(e){error=e;}ck('illegal-constructor',error instanceof TypeError);
-    const values={userAgent:expected.userAgent,platform:'Nocturne',language:'en-US',onLine:true,hardwareConcurrency:expected.cpus};
+    /* The user's languages as the system keeps them (expected.languages, most wanted first). */
+    const values={userAgent:expected.userAgent,platform:'Nocturne',language:expected.languages[0],languages:expected.languages,onLine:true,hardwareConcurrency:expected.cpus};
     if(!worker)values.cookieEnabled=expected.cookies;
     for(const [name,value]of Object.entries(values)){
         const descriptor=Object.getOwnPropertyDescriptor(Interface.prototype,name);
         ck(name+'-descriptor',descriptor?.enumerable===true&&descriptor.configurable===true&&typeof descriptor.get==='function'&&descriptor.set===undefined);
-        ck(name+'-value',nav[name]===value);
+        ck(name+'-value',Array.isArray(value)?Array.isArray(nav[name])&&nav[name].join()===value.join():nav[name]===value);
         if(!descriptor?.get)continue;
         for(const [label,receiver]of [['object',{}],['null',null],['prototype',Interface.prototype],['inherited',Object.create(nav)],['proxy',new Proxy(nav,{})]]){
             let caught;try{Reflect.apply(descriptor.get,receiver,[]);}catch(e){caught=e;}
@@ -20,7 +21,8 @@ function runNavigatorChecks(Interface,nav,expected,worker,check){
         const before=nav[name];try{nav[name]='not-native';}catch(_){}ck(name+'-readonly',nav[name]===before);
     }
     ck('native-count-integer',Number.isInteger(nav.hardwareConcurrency)&&nav.hardwareConcurrency>=1);
-    ck('languages',Array.isArray(nav.languages)&&Object.isFrozen(nav.languages)&&nav.languages.length===1&&nav.languages[0]===nav.language);
+    /* HTML: a frozen array, the same object until the languages change. */
+    ck('languages',Array.isArray(nav.languages)&&Object.isFrozen(nav.languages)&&nav.languages===nav.languages&&nav.languages[0]===nav.language);
     if(worker)ck('no-cookie-capability',!('cookieEnabled'in nav)&&!Object.prototype.hasOwnProperty.call(Interface.prototype,'cookieEnabled'));
     const original=WeakSet.prototype.has;
     try{

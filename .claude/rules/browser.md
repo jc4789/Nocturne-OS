@@ -33,6 +33,7 @@ paths:
 
 ## 触るときの約束
 
+- W3C・WHATWG の標準（WPT が試すもの）を満たす。欠けは仕様の手順のとおり全部、持ち主の層まで通して入れ、安全の規則を削らない（AGENTS.md「Web の標準を満たす」）。仕様の原文は `fetch.spec.whatwg.org` などを読み、WPT は `D:\Programes\cloned repos\wpt`。
 - 壊れているのは我々のブラウザー。サイト名は「再現は◯◯」とだけ添え、ホスト名・URL・特定の DOM での分岐を書かない。
 - 実サイトだけで確かめる。自作の HTML・ローカルの試験ページ・example.com は使わない。
 - 箱・run・deco の装い（st）は節の装いの arena を借りる。外す・入れ直す・release の前後は覚え書きを読む。
