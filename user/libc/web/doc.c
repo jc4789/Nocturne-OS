@@ -2242,6 +2242,12 @@ bool doc_element_scroll(web_doc *d, node_t *n, double x, double y) {
     return element_scroll_commit(d, n, n->box, x, y);
 }
 
+double doc_element_scroll_max(web_doc *d, node_t *n, int axis) {
+    if (!doc_element_scroll_metrics(d, n, NULL, NULL) || !box_element_scrollable(n->box) ||
+        n == d->html) return 0;
+    return element_scroll_limit(n->box, axis ? 1 : 0);
+}
+
 static void element_scroll_input_unqueue(node_t *n) {
     web_doc *old = n->scroll_input_owner;
     if (old) {
@@ -2509,8 +2515,9 @@ static bool scroll_target_rect(node_t *n, double r[4]) {
 }
 
 int doc_element_scroll_into_view(web_doc *d, node_t *n, int block, int inline_, bool nearest_only,
-                                double *x, double *y, pvec *changed) {
-    if (!d || !n || !x || !y || !changed || changed->v || changed->n || changed->cap ||
+                                double *x, double *y, struct doc_scroll_target **targets, int *count_out) {
+    if (count_out) *count_out = 0;
+    if (!d || !n || !x || !y || !targets || *targets || !count_out ||
         block < DOC_SCROLL_START || block > DOC_SCROLL_NEAREST ||
         inline_ < DOC_SCROLL_START || inline_ > DOC_SCROLL_NEAREST || n->type != N_ELEM ||
         n->owner != d || !d->live || d->inert || !doc_node_connected(n) ||
@@ -2535,28 +2542,43 @@ int doc_element_scroll_into_view(web_doc *d, node_t *n, int block, int inline_, 
         }
     }
     if (!scroll_target_rect(n, target)) return 0;
+    struct doc_scroll_target *out = NULL;
+    double *from = NULL;
     if (count) {
-        if ((size_t)count > SIZE_MAX / sizeof *changed->v) return -3;
-        changed->v = malloc((size_t)count * sizeof *changed->v);
-        if (!changed->v) return -1;
-        changed->cap = count;
+        if ((size_t)count > SIZE_MAX / sizeof *out / 2) return -3;
+        out = malloc((size_t)count * sizeof *out);
+        from = malloc((size_t)count * 2 * sizeof *from);
+        if (!out || !from) { free(out); free(from); return -1; }
     }
+    int used = 0;
+    bool viewport = !fixed;
     for (box_t *a = first; a; a = a->cb) {
         if (!box_element_scrollable(a)) continue;
-        if (!scroll_target_rect(n, target)) return 1;
+        if (!scroll_target_rect(n, target)) { viewport = false; break; }
         double left = box_visual_x(a) - a->p[3], top = box_visual_y(a) - a->p[0];
         double dx = scroll_align_delta(target[0], target[0] + target[2], left, a->w + a->p[1] + a->p[3], inline_);
         double dy = scroll_align_delta(target[1], target[1] + target[3], top, a->h + a->p[0] + a->p[2], block);
-        if (doc_element_scroll(d, a->node, a->node->scroll_x + dx, a->node->scroll_y + dy))
-            changed->v[changed->n++] = a->node;
-        if (nearest_only) return 1;
+        node_t *e = a->node;
+        double old_x = e->scroll_x, old_y = e->scroll_y;
+        /* Each outer box is aligned as if this one already had its position. */
+        if (doc_element_scroll(d, e, e->scroll_x + dx, e->scroll_y + dy)) {
+            out[used] = (struct doc_scroll_target){e, e->scroll_x, e->scroll_y};
+            from[2 * used] = old_x; from[2 * used + 1] = old_y; used++;
+        }
+        if (nearest_only) { viewport = false; break; }
     }
-    if (!fixed && scroll_target_rect(n, target)) {
+    if (viewport && scroll_target_rect(n, target)) {
         /* This document's real viewport only. There is no traversal through a
            fabricated frame parent or access to a different-origin document. */
         *x += scroll_align_delta(target[0], target[0] + target[2], *x, d->width, inline_);
         *y += scroll_align_delta(target[1], target[1] + target[3], *y, d->height, block);
     }
+    /* Put every box back: performing the scrolls (and their events) is the caller's. */
+    for (int i = used; i-- > 0;) { out[i].node->scroll_x = from[2 * i]; out[i].node->scroll_y = from[2 * i + 1]; }
+    if (used) { d->visual_revision++; doc_paint_full(d); }
+    free(from);
+    if (!used) { free(out); out = NULL; }
+    *targets = out; *count_out = used;
     return 1;
 }
 

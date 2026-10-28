@@ -2210,13 +2210,19 @@ static struct web_js_state *geometry_owner(struct web_js_state *s,web_doc *d) {
        !web_frame_same_origin(s->doc,d))return NULL;
     return owner;
 }
+/* The viewport's largest scroll position on axis (0 horizontal, 1 vertical): its scrolling
+   area less the viewport. */
+static double viewport_scroll_limit(web_doc *d,int axis) {
+    double limit=axis?(double)d->doc_h-d->height:
+        MAX(d->doc_w,d->root_box?d->root_box->scroll_w:0)-(double)d->width;
+    return isfinite(limit)&&limit>0?MIN(limit,(double)INT_MAX):0;
+}
 static bool viewport_scroll_to(struct web_js_state *s,double x,double y) {
     web_doc *d=s->doc;
     if(!isfinite(x))x=0;
     if(!isfinite(y))y=0;
-    double content_w=MAX(d->doc_w,d->root_box?d->root_box->scroll_w:0);
-    int a=(int)MIN(MAX(x,0),MIN((double)INT_MAX,MAX(0,content_w-d->width)));
-    int b=(int)MIN(MAX(y,0),MIN((double)INT_MAX,(double)MAX(0,d->doc_h-d->height)));
+    int a=(int)MIN(MAX(x,0),viewport_scroll_limit(d,0));
+    int b=(int)MIN(MAX(y,0),viewport_scroll_limit(d,1));
     struct web_frame *f=d->frame_element?web_frame_find(d->frame_parent,d->frame_element):NULL;
     int old_x,old_y;viewport_scroll_position(s,&old_x,&old_y);
     if(f){if(f->scroll_x!=a || f->scroll_y!=b){
@@ -2234,6 +2240,28 @@ static box_t *geometry_principal_box(node_t *n) {
     if (b && b->kind == B_ATOMIC && b->first && b->first->node == n &&
         (b->first->kind == B_FLEX || b->first->kind == B_GRID || b->first->kind == B_TABLE)) return b->first;
     return b;
+}
+/* CSSOM View "scrollingElement": the root element, or in quirks mode the body element
+   when it is not potentially scrollable. */
+static node_t *scrolling_element(web_doc *d) {
+    if (!d->quirks) return d->html;
+    return d->body && element_viewport(d, d->body) ? d->body : NULL;
+}
+/* CSSOM View HTMLElement "scrollParent": the nearest scroll container along the flat tree's
+   containing blocks (the box tree's cb chain), else the scrollingElement at the initial
+   containing block. */
+static node_t *scroll_parent(web_doc *d, node_t *n) {
+    box_t *b = n->box;
+    if (!b || n == d->html || n == d->body || box_viewport_fixed(b)) return NULL;
+    for (box_t *a = b->cb; ; a = a->cb) {
+        if (!a || a == d->root_box) {
+            node_t *e = scrolling_element(d);
+            return e && !geometry_closed_shadow_hidden(e, n) ? e : NULL;
+        }
+        if (box_element_scrollable(a) && !geometry_closed_shadow_hidden(a->node, n)) return a->node;
+        /* a fixed box whose containing block is the viewport: nothing it scrolls with */
+        if (box_viewport_fixed(a)) return NULL;
+    }
 }
 static JSValue geometry(struct web_js_state *s, node_t *n, const char *property) {
     JSContext *ctx = s->ctx;
@@ -2259,6 +2287,29 @@ static JSValue geometry(struct web_js_state *s, node_t *n, const char *property)
         else if(b)doc_element_scroll_metrics(d,n,&w,&h);
         double v=ceil(!strcmp(property,"scrollWidth")?w:h);
         return JS_NewInt32(ctx,(int32_t)MIN(MAX(v,0),INT_MAX));
+    }
+    if(!strcmp(property,"scrollBox")) {
+        /* CSSOM View element scrolling: 2 when the element's scrolls are the viewport's (the
+           root element; the quirks-mode body that is not potentially scrollable), 1 when it has
+           its own scrolling box with overflow, 0 when they do nothing (no box, no overflow, the
+           quirks-mode root element). */
+        if(!visible || (d->quirks && n==d->html))return JS_NewInt32(ctx,0);
+        if(element_viewport(d,n))return JS_NewInt32(ctx,2);
+        return JS_NewInt32(ctx,doc_element_scroll_max(d,n,0)>0 || doc_element_scroll_max(d,n,1)>0?1:0);
+    }
+    if(!strcmp(property,"scrollMaxLeft") || !strcmp(property,"scrollMaxTop"))
+        return JS_NewFloat64(ctx,b?doc_element_scroll_max(d,n,!strcmp(property,"scrollMaxTop")):0);
+    if(!strcmp(property,"scrollParent"))return wrap(s,b?scroll_parent(d,n):NULL);
+    /* CSSOM View currentCSSZoom: the product of the element's and its flat-tree ancestors'
+       zoom, 1 when it is not rendered. This engine has no zoom property (cssprop.c's table),
+       so every effective zoom is 1. */
+    if(!strcmp(property,"currentCSSZoom"))return JS_NewFloat64(ctx,1);
+    if(!strcmp(property,"imageX") || !strcmp(property,"imageY")) {
+        /* HTMLImageElement x/y: the first box's border edge from the initial containing block,
+           ignoring transforms; zero without a box. */
+        double first[4],bounds[4],v=0;
+        if(b && element_offset_metrics(n,first,bounds))v=first[!strcmp(property,"imageY")];
+        return JS_NewInt32(ctx,(int32_t)MIN(MAX(round(v),INT32_MIN),INT32_MAX));
     }
     node_t *parent = b ? offset_parent(owner,n) : NULL;
     if (!strcmp(property, "offsetParent")) return wrap(s, parent);
@@ -3363,6 +3414,7 @@ static bool dom_authority_denied(struct web_js_state *s, web_doc *d) {
     return !s->starting && ((sandbox_authority(s)&SB_SCRIPTS) ||
        (sandbox_actor(s)->doc->sandbox_flags && sandbox_actor(s)->doc!=d));
 }
+#include "js_geometry_native.h"
 static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int opcode) {
     struct web_js_state *s = state(ctx); web_doc *d = s->doc;
     if (argc < 2) return JS_ThrowTypeError(ctx, "DOM operation requires a receiver");
@@ -3406,7 +3458,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
     }
     if(!n){switch(opcode){
-    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_rangeRects: case DOM_caretPosition: case DOM_caretRect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_styleBlock: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
+    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_boxQuads: case DOM_convertPoints: case DOM_checkVisibility: case DOM_rangeRects: case DOM_caretPosition: case DOM_caretRect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_styleBlock: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
         result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");goto dom_complete;
     default:break;
     }}
@@ -3889,25 +3941,32 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                 (nearest=JS_ToBool(ctx,argv[4]))<0)result=JS_EXCEPTION;
         else if(block<0 || block>3 || inline_<0 || inline_>3)result=JS_ThrowTypeError(ctx,"Invalid scroll alignment");
         else {
+            /* The plan of "scroll a target into view": [viewport x, viewport y, then each
+               scrolling box innermost first as element, x, y]. The caller performs the scrolls;
+               an empty array: nothing is rendered. */
             result=JS_NewArray(ctx);
             web_doc *owner=n->owner;struct web_js_state *target=owner?owner->js:NULL;
             if(!JS_IsException(result) && target && !target->disabled && owner->live && connected(target,n)) {
                 flush_layout(target);
                 int x,y;viewport_scroll_position(target,&x,&y);double vx=x,vy=y;
-                pvec changed={0};
-                int status=doc_element_scroll_into_view(owner,n,block,inline_,nearest,&vx,&vy,&changed);
+                struct doc_scroll_target *plan=NULL;int count=0;
+                int status=doc_element_scroll_into_view(owner,n,block,inline_,nearest,&vx,&vy,&plan,&count);
                 if(status<0){JS_FreeValue(ctx,result);result=status==-1?oom(ctx):
                     JS_ThrowRangeError(ctx,status==-2?"Invalid scroll ancestor cycle":"Scroll result exceeds its native index representation");}
                 else if(status>0){
-                    viewport_scroll_to(target,vx,vy);
-                    for(int i=0;i<changed.n;i++){
-                        JSValue node=wrap(s,changed.v[i]);
-                        if(JS_IsException(node) || JS_SetPropertyUint32(ctx,result,(uint32_t)i,node)<0){
-                            JS_FreeValue(ctx,result);result=JS_EXCEPTION;break;
+                    uint32_t at=0;
+                    if(JS_SetPropertyUint32(ctx,result,at++,JS_NewFloat64(ctx,vx))<0 ||
+                       JS_SetPropertyUint32(ctx,result,at++,JS_NewFloat64(ctx,vy))<0){JS_FreeValue(ctx,result);result=JS_EXCEPTION;}
+                    for(int i=0;i<count && !JS_IsException(result);i++){
+                        JSValue node=wrap(s,plan[i].node);
+                        if(JS_IsException(node) || JS_SetPropertyUint32(ctx,result,at++,node)<0 ||
+                           JS_SetPropertyUint32(ctx,result,at++,JS_NewFloat64(ctx,plan[i].x))<0 ||
+                           JS_SetPropertyUint32(ctx,result,at++,JS_NewFloat64(ctx,plan[i].y))<0){
+                            JS_FreeValue(ctx,result);result=JS_EXCEPTION;
                         }
                     }
                 }
-                pv_free(&changed);
+                free(plan);
             }
         }
 
@@ -4066,6 +4125,14 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             } else result=n->custom_is?JS_NewString(ctx,n->custom_is):JS_NULL;
         } else result=JS_ThrowTypeError(ctx,"Unknown custom metadata key");
         JS_FreeCString(ctx,key);
+    } break;
+    case DOM_boxQuads: result=geometry_box_quads_value(s,n,argc,argv); break;
+    case DOM_convertPoints: result=geometry_convert_value(s,n,argc,argv); break;
+    case DOM_checkVisibility: {
+        int32_t flags=0;
+        if(!n || n->type!=N_ELEM)result=JS_ThrowTypeError(ctx,"Element receiver required");
+        else if(argc>2 && JS_ToInt32(ctx,&flags,argv[2])<0)result=JS_EXCEPTION;
+        else result=JS_NewBool(ctx,geometry_check_visibility(s,n,flags));
     } break;
     case DOM_rect: {
         bool fragments=argc>2 && JS_ToBool(ctx,argv[2])>0;
@@ -5149,8 +5216,14 @@ static JSValue native_scroll(JSContext *ctx, JSValueConst this_val, int argc, JS
         viewport_scroll_to(s,a,b);
         return JS_UNDEFINED;
     }
-    viewport_scroll_position(s,&x,&y);
     int32_t axis = 0; if (argc && JS_ToInt32(ctx, &axis, argv[0])) return JS_EXCEPTION;
+    if (axis == 2 || axis == 3) {
+        /* the viewport's largest scroll positions, for a scroll that clamps before it moves */
+        if (s->disabled || !s->doc->live) return JS_NewInt32(ctx, 0);
+        flush_layout(s);
+        return JS_NewInt32(ctx, (int32_t)viewport_scroll_limit(s->doc, axis - 2));
+    }
+    viewport_scroll_position(s,&x,&y);
     return JS_NewInt32(ctx, axis ? y : x);
 }
 /* Native URL ownership follows actual length; the native wire uses uint32_t.

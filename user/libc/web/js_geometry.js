@@ -350,5 +350,8 @@ function geometryInterfaces(options){
         matrix:values=>matrixObject(DOMMatrix,values,false),matrix2D:values=>matrixObject(DOMMatrix,values,true),
         matrix2DInit:v=>names2D.map(k=>matrix2DDictionary(v)[index(k)]),
         rectInit,rectList,liveRect,
-        rect:(values,isMutable)=>rect(values.slice(0,4).map(number),isMutable)};
+        rect:(values,isMutable)=>rect(values.slice(0,4).map(number),isMutable),
+        /* GeometryUtils: a DOMQuad of four [x,y,z,w] points; the DOMQuadInit and DOMPointInit
+           conversions; a DOMRectReadOnly's [x,y,width,height] (TypeError for anything else) */
+        quad:points=>quad(points),quadInit,pointInit,rectValues:value=>record(value,'DOMRect').v.slice()};
 }

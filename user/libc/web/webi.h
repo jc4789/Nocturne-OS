@@ -1131,7 +1131,8 @@ typedef struct style {
     uint8_t display, position, float_, clear, white_space, text_align, vertical_align, list_style,
         list_style_inside, font_style, text_transform, text_decoration, overflow, box_sizing, visibility, pointer_events,
         border_collapse, flex_direction, flex_wrap, justify_content, align_items, align_self, align_content, table_layout,
-        content_visibility,text_overflow;
+        content_visibility,text_overflow,
+        scroll_behavior; /* CSS Overflow 3: 0 auto, 1 smooth (CSSOM View "perform a scroll") */
     uint8_t border_style[4];
     uint8_t container_type;
     uint8_t box_orient;
@@ -2136,8 +2137,11 @@ void css_transform_list_matrix_3d(const struct css_transform *t,double m[16]);
 /* Geometry's "parse a string into an abstract matrix": column-major m, *two_d false when a
    3D transform function is in the list. False when the string is no valid list. */
 bool css_transform_string_matrix(const char *s,size_t n,double m[16],bool *two_d);
+/* The complete transform of b's space: b's and its ancestors' used transforms (b's applied
+   first) composed into one affine matrix of document coordinates, layout x'=m[0]x+m[2]y+m[4]. */
+void box_transform_chain(const box_t *b,double m[6]);
 /* Maps a document rectangle (x,y,w,h) through b's and its ancestors' used
-   transforms and returns its bounding box. */
+   transforms and returns the bounding box of the resulting quad. */
 void box_transform_rect(const box_t *b,double rect[4]);
 bool box_viewport_fixed(const box_t *b); /* actual layout CB, not merely position:fixed */
 void box_abs_cb_rect(const box_t *cb, const web_doc *d, float rect[4]); /* x/y/w/h of padding CB in its content coordinates */
@@ -2529,12 +2533,20 @@ bool doc_element_scroll_metrics(web_doc *d, node_t *n, float *width, float *heig
 /* True only when the regular element's native position actually changed.
    Root/quirks-body viewport forwarding belongs to the Window host bridge. */
 bool doc_element_scroll(web_doc *d, node_t *n, double x, double y);
+/* CSSOM View "scroll an element": the largest scroll position of n's own scrolling box
+   on axis (0 horizontal, 1 vertical); 0 when n has none. */
+double doc_element_scroll_max(web_doc *d, node_t *n, int axis);
 enum doc_scroll_alignment { DOC_SCROLL_START, DOC_SCROLL_END, DOC_SCROLL_CENTER, DOC_SCROLL_NEAREST };
-/* Horizontal-LTR only. Current viewport positions enter through x/y; desired
-   positions leave through them. changed must start empty and is heap-owned.
-   1 rendered, 0 inactive/no box, -1 allocation, -2 bounded-chain refusal. */
+/* One scrolling box's position in "scroll a target into view". */
+struct doc_scroll_target { node_t *node; double x, y; };
+/* CSSOM View "scroll a target into view", horizontal-LTR only: the position each scrolling
+   box must take, innermost first, each as if the boxes inside it already had theirs. Nothing
+   is left scrolled: the caller performs each scroll (instant or smooth). The current viewport
+   position enters through x/y and the viewport's leaves through them. *targets (heap-owned,
+   *count entries) must start NULL. 1 rendered, 0 inactive/no box, -1 allocation,
+   -2 containing-block cycle, -3 too many boxes for the index. */
 int doc_element_scroll_into_view(web_doc *d, node_t *n, int block, int inline_, bool nearest_only,
-                                double *x, double *y, pvec *changed);
+                                double *x, double *y, struct doc_scroll_target **targets, int *count);
 enum doc_create_failure { DOC_CREATE_INVALID, DOC_CREATE_QUOTA, DOC_CREATE_ALLOCATOR,
     DOC_CREATE_OVERFLOW, DOC_CREATE_TEMPLATE, DOC_CREATE_WRAPPER };
 void doc_create_diagnostic(web_doc *d, unsigned stage, int type, size_t name_bytes, size_t data_bytes);
