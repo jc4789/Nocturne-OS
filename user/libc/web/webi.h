@@ -708,19 +708,49 @@ struct cached_css {
     sheet_t *ast;
 };
 typedef struct css_ctx css_ctx;
-/* An @import rule's resolved URL (NULL: not fetched) and media query text. */
-struct css_rule_import { const char *url, *media; };
-/* Parser-owned CSSOM metadata points at the SAME native cascade AST. One
-   per top-level rule, so a sheet of fifty thousand rules keeps it small. */
+/* An @import rule's resolved URL (NULL: not fetched) and media query text;
+   href is the URL as written, layer NULL without layer ("" anonymous),
+   supports the text inside supports() or NULL. */
+struct css_rule_import { const char *url, *media, *href, *layer, *supports; };
+/* The CSSOM rule interfaces. Values below 16 are the legacy CSSRule.type
+   numbers; the others have none (CSSRule.type reads 0). */
+enum css_rule_kind {
+    CSS_RULE_STYLE = 1, CSS_RULE_IMPORT = 3, CSS_RULE_MEDIA = 4, CSS_RULE_FONT_FACE = 5,
+    CSS_RULE_PAGE = 6, CSS_RULE_KEYFRAMES = 7, CSS_RULE_KEYFRAME = 8, CSS_RULE_MARGIN = 9,
+    CSS_RULE_NAMESPACE = 10, CSS_RULE_COUNTER_STYLE = 11, CSS_RULE_SUPPORTS = 12,
+    CSS_RULE_FONT_FEATURE_VALUES = 14,
+    CSS_RULE_LAYER_BLOCK = 16, CSS_RULE_LAYER_STATEMENT, CSS_RULE_CONTAINER, CSS_RULE_SCOPE,
+    CSS_RULE_STARTING_STYLE, CSS_RULE_PROPERTY, CSS_RULE_NESTED_DECLARATIONS,
+    CSS_RULE_FONT_PALETTE_VALUES
+};
+/* Parser-owned CSSOM metadata points at the SAME native cascade AST. An
+   ordinary parse records only top-level @import rules (the resource scan
+   needs them), so a sheet of fifty thousand rules keeps it small. A CSSOM
+   parse records the whole rule tree: every rule the CSS grammar keeps, with
+   its parent and children, whether or not the cascade implements it. */
 struct css_rule_info {
-    struct css_rule_info *next;
-    /* text: the rule's text_len bytes in its sheet's source, not terminated */
+    struct css_rule_info *next;                  /* next sibling */
+    struct css_rule_info *parent, *first, *last; /* CSSOM parses only */
+    struct css_rule_info **children;             /* cssom.c's index of first..last */
+    /* text: the rule's text_len bytes in its sheet's comment-free source,
+       not terminated. The other ranges are offsets into text: the trimmed
+       prelude (selector, key text, at-rule prelude), the block's contents
+       between its braces, and the declarations the rule owns itself. */
     const char *text, *selector;
     const struct css_rule_import *import; /* @import only */
     void *native_rule;
-    uint32_t text_len, type, id;
-    uint8_t layer_kind; /* 1 statement, 2 block; not a CSSRule.type surrogate */
+    uint32_t text_len, type, id, child_count;
+    uint32_t prelude_at, prelude_len, block_at, block_len, decls_at, decls_len;
+    bool block, closed; /* has a block; ended by its own '}' or ';', not by end of input */
+    bool marker;        /* a nested declarations rule written as CSS_NESTED_DECLARATIONS_MARKER */
+    bool exposed;       /* cssom.c: a CSSRule object stands for it */
 };
+/* cssom.c writes a CSSNestedDeclarations rule that its text cannot otherwise
+   keep apart (beside another, or with no declarations) as this at-rule with the
+   declarations as its block. The parser takes it as that rule only at the
+   offsets cssom.c passes; anywhere else, like any author text, it is an unknown
+   at-rule. */
+#define CSS_NESTED_DECLARATIONS_MARKER "@-nocturne-nested-declarations"
 
 /* the document's styling state */
 struct styling {
@@ -738,6 +768,15 @@ struct css_import {
 };
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports);
 sheet_t *css_parse_sheet_serviced(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports);
+/* The same parse, also recording the whole CSSOM rule tree (cssom.c), with the
+   nested-declarations markers at the sorted offsets markers holds. */
+sheet_t *css_parse_cssom_sheet(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url,
+                               const uint32_t *markers, uint32_t nmarkers);
+/* css as the parser reads it: comments out, NUL as U+FFFD (malloc; NULL: no memory).
+   A parse of text that went through this has its rules at the same offsets. */
+char *css_preprocess(const char *css, size_t n, size_t *out_n);
+/* The comment-free source every css_rule_info text points into. */
+const char *css_sheet_source(const sheet_t *sheet, size_t *length);
 void css_sheet_scope(sheet_t *sheet, node_t *shadow_root);
 /* The arena the sheet was parsed into now lives at another address: the AST's
    rule index is built later in its owning arena, which it names by address. */
@@ -747,7 +786,6 @@ void css_sheet_import_context(sheet_t *sheet,sheet_t *parent,const struct css_ru
 void css_sheet_media(sheet_t *sheet, const char *media);
 struct css_rule_info *css_sheet_rules(sheet_t *sheet, uint32_t *length);
 uint32_t css_sheet_import_urls(const sheet_t *sheet); /* how many of its rules are @import with a URL */
-bool css_sheet_single_rule(sheet_t *sheet, const char *source, size_t length);
 const char *css_ua_sheet(void);
 /* compute every element's style for the viewport */
 void css_cascade(web_doc *d, int vw, int vh);
@@ -964,6 +1002,8 @@ const char *css_value_canonical(arena_t *a, const char *value, size_t n, size_t 
 bool css_supports_declaration(const char *property, size_t pn, const char *value, size_t vn);
 bool css_valid_declaration(const char *property, size_t pn, const char *value, size_t vn);
 bool css_supports_condition(const char *condition, size_t n, bool implied_parens);
+/* whether the condition matches the @supports grammar, true or false */
+bool css_supports_grammar(const char *condition, size_t n, bool implied_parens);
 /* start a style: inherited properties from the parent, the others initial */
 void css_style_init(style_t *s, const style_t *parent);
 /* s takes from's inherited values (what css_style_init copies from a parent)
@@ -1745,13 +1785,31 @@ bool css_matches_n(node_t *node, node_t *scope, const char *selector, size_t len
 /* CSSOM: a style rule's selectorText; an @namespace rule's prefix (NULL: none) and URI */
 void css_rule_selector_serialize(const struct css_rule_info *info, sbuf *out);
 bool css_namespace_rule(arena_t *a, const char *text, size_t length, const char **prefix, const char **uri);
-/* CSSOM "serialize a CSS rule" (a style rule's selectors and an @namespace rule from
-   their parse; other rules as written) */
-void css_rule_text_serialize(const struct css_rule_info *info, sbuf *out);
-/* selectorText's setter: the rule's new text, or NULL when the selectors do not
-   parse in sheet's namespaces; *selector gets them serialized (both malloc'd) */
-char *css_rule_with_selector(const sheet_t *sheet, const struct css_rule_info *info, const char *selector,
-                             size_t length, size_t *out_length, char **selector_out);
+/* selectorText's setter: the selectors parsed in sheet's namespaces (NULL: none),
+   serialized into out; false when they do not parse */
+bool css_selectors_serialize(const sheet_t *sheet, const char *selector, size_t length, sbuf *out);
+/* CSSOM "serialize an identifier" and "serialize a string" */
+void css_serialize_ident(sbuf *out, const char *name);
+void css_serialize_string(sbuf *out, const char *text);
+/* CSSOM declaration blocks as text (an element's style attribute, a rule's
+   declarations). serialize: the block's serialization, with the property names
+   NUL-terminated into names when given; find: a property's last effective value
+   and priority; value: a specified value as CSSOM serializes it; set: on a
+   serialized block, setProperty's (removeProperty's, for an empty value)
+   serialized result into out (1), the value or priority does not parse (0, out
+   unchanged), the name is not a property name (-1), or no memory (-2); names:
+   a serialized block's property names, each NUL-terminated; balanced: the text
+   can stand inside a block. */
+/* a declaration's validity in its block (name lowercased unless custom), and
+   when serialized is given, its value's serialization; NULL: a property's */
+typedef bool css_decl_check(const char *name, const char *value, size_t n, sbuf *serialized);
+bool css_decl_find(const char *css, size_t n, const char *property, const char **value, size_t *value_n, bool *important);
+void css_decl_value(const char *property, const char *value, size_t n, sbuf *out);
+int css_decl_set(const char *css, size_t n, const char *property, const char *value, const char *priority,
+                 css_decl_check *check, sbuf *out);
+bool css_decl_serialize(const char *css, size_t n, css_decl_check *check, sbuf *out, sbuf *names);
+void css_decl_names(const char *css, size_t n, sbuf *names);
+bool css_decl_balanced(const char *text, size_t n);
 void web_js_start(web_doc *d, const struct web_host *host);
 bool web_js_parser_candidate(web_doc *d, const char *name, const char *is);
 node_t *web_js_parser_element(web_doc *d, node_t *node, const char *is, bool finish);

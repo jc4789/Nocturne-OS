@@ -137,17 +137,17 @@ static int layer_dynamic(void) {
     int error=0;struct cssom_sheet *sheet=cssom_style_sheet(d,id(d,"sheet"),&error);
     if(!sheet||error){web_free(d);return 1;}
     const char *statement="@layer b,a";
-    check(cssom_insert(sheet,statement,strlen(statement),0)==CSSOM_OK,"layer statement without final semicolon inserts through real CSSOM AST");
+    check(cssom_insert(sheet,0,statement,strlen(statement),0)==CSSOM_OK,"layer statement without final semicolon inserts through real CSSOM AST");
     web_layout(d,800,600);node_t *target=id(d,"target");
     check(target&&target->style->color==0xffff0000u,"inserted first statement changes layer encounter priority");
-    check(cssom_delete(sheet,0)==CSSOM_OK,"layer statement deletion reparses existing AST");
+    check(cssom_delete(sheet,0,0)==CSSOM_OK,"layer statement deletion reparses existing AST");
     web_layout(d,800,600);check(target&&target->style->color==0xff008000u,"deleting prelude restores original source encounter priority");
     const char *block="@layer a{#target{color:blue}}";
-    check(cssom_insert(sheet,block,strlen(block),2)==CSSOM_OK,"layer block inserts through existing native CSSOM");
-    check(cssom_insert(sheet,"@layer 123{}",12,0)==CSSOM_SYNTAX,"invalid layer ident is rejected without publication");
+    check(cssom_insert(sheet,0,block,strlen(block),2)==CSSOM_OK,"layer block inserts through existing native CSSOM");
+    check(cssom_insert(sheet,0,"@layer 123{}",12,0)==CSSOM_SYNTAX,"invalid layer ident is rejected without publication");
     sheet=cssom_style_sheet(d,id(d,"imports"),&error);if(!sheet||error){web_free(d);return 1;}
-    check(cssom_insert(sheet,"@layer more",11,0)==CSSOM_OK,"empty layer statement may precede imports");
-    check(cssom_insert(sheet,block,strlen(block),0)==CSSOM_HIERARCHY,"layer block cannot be inserted before imports");
+    check(cssom_insert(sheet,0,"@layer more",11,0)==CSSOM_OK,"empty layer statement may precede imports");
+    check(cssom_insert(sheet,0,block,strlen(block),0)==CSSOM_HIERARCHY,"layer block cannot be inserted before imports");
     node_t *one=doc_shadow_attach(d,id(d,"host1"),false,false,false,false,false),
         *two=doc_shadow_attach(d,id(d,"host2"),false,false,false,false,false);
     if(!one||!two){web_free(d);return 1;}node_t *p1=element(d,one,"p",NULL),*p2=element(d,two,"p",NULL);
