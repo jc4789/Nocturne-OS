@@ -99,21 +99,6 @@ static void put_num(sbuf *o, double v) {
     }
     sb_puts(o, t);
 }
-/* six significant digits, as a specified calc() keeps its folded value */
-static void put_num6(sbuf *o, double v) {
-    if (!isfinite(v) || fabs(v) < 5e-7) v = 0;
-    char t[80];
-    int len = snprintf(t, sizeof t, "%.6g", v);
-    if (strchr(t, 'e')) {
-        len = snprintf(t, sizeof t, fabs(v) >= 1 ? "%.0f" : "%.9f", v);
-        if (strchr(t, '.')) {
-            while (len > 1 && t[len - 1] == '0') t[--len] = 0;
-            if (t[len - 1] == '.') t[--len] = 0;
-        }
-    }
-    if (!strcmp(t, "-0")) strcpy(t, "0");
-    sb_puts(o, t);
-}
 /* A zero percentage that stays one (0%, a keyword's, a difference that cancels) is pct -0. */
 static bool has_pct(const len_t *l) { return l->kind == LK_EXPR || (l->kind == LK_LEN && (l->pct != 0 || signbit(l->pct))); }
 static len_t percent(float p) { len_t l = {.kind = LK_LEN, .pct = p == 0 ? -0.0f : p}; return l; }
@@ -166,10 +151,11 @@ static void put_authored(sbuf *o, const char *t, size_t n) {
     }
 }
 /* The specified value of a <length-percentage> (angle: an <angle>) word: a number keeps its unit,
-   unitless zero is 0px, a math function is its folded sum when it needs nothing but percentages
-   (calc(100% / 4) is calc(25%)) and otherwise as written. */
+   unitless zero is 0px, a math function is serialized simplified (CSS Values 4 §10.13: calc(100% / 4)
+   is calc(25%)), and what is not one as written. */
 static void spec_len(sbuf *o, const char *t, size_t n, struct cx *cx, bool angle) {
     if (!o) return;
+    (void)cx;
     trim(&t, &n);
     const char *p = t;
     float v;
@@ -179,25 +165,7 @@ static void spec_len(sbuf *o, const char *t, size_t n, struct cx *cx, bool angle
         for (; p < t + n; p++) sb_putc(o, (char)tolower((unsigned char)*p));
         return;
     }
-    struct cx probe = *cx;
-    probe.absolute_units = !angle;
-    probe.angles = angle;
-    probe.supports_probe = false;
-    probe.invalid = false;
-    len_t l;
-    if (css_parse_length(t, n, &probe, &l, LF_NEG | LF_LENGTH | (angle ? LF_NOPCT : 0)) && l.kind == LK_LEN &&
-        isfinite(l.px) && isfinite(l.pct)) {
-        bool pct = l.pct != 0 || (!angle && l.px == 0 && memchr(t, '%', n));
-        sb_puts(o, "calc(");
-        if (pct) { put_num6(o, l.pct); sb_putc(o, '%'); }
-        if (l.px != 0 || !pct) {
-            if (pct) sb_puts(o, l.px < 0 ? " - " : " + ");
-            put_num6(o, pct ? fabsf(l.px) : l.px);
-            sb_puts(o, angle ? "deg" : "px");
-        }
-        sb_putc(o, ')');
-        return;
-    }
+    if (css_calc_specified(t, n, angle ? CSS_CALC_ANGLE : CSS_CALC_LENGTH | CSS_CALC_PERCENT, o)) return;
     put_authored(o, t, n);
 }
 static void spec_word(sbuf *o, const char *t, size_t n) {
@@ -206,15 +174,9 @@ static void spec_word(sbuf *o, const char *t, size_t n) {
 static void spec_puts(sbuf *o, const char *s) { if (o) sb_puts(o, s); }
 /* An <angle> word, in degrees; a unitless number is not one here (offset-rotate, ray(), rotate). */
 static bool get_angle(const char *t, size_t n, struct cx *cx, float *deg) {
-    trim(&t, &n);
-    if (!n || (!isalpha((unsigned char)t[n - 1]) && t[n - 1] != ')')) return false;
-    struct cx a = *cx;
-    a.angles = true;
-    a.absolute_units = false;
-    len_t l;
-    if (!css_parse_length(t, n, &a, &l, LF_NEG | LF_LENGTH | LF_NOPCT) || l.kind != LK_LEN || l.pct != 0 || !isfinite(l.px))
-        return false;
-    *deg = l.px;
+    double v;
+    if (!css_numeric_read(t, n, CSS_CALC_ANGLE, cx, cx->a, NAN, &v, NULL) || !isfinite(v)) return false;
+    *deg = (float)v;
     return true;
 }
 static void put_angle(sbuf *o, double deg) { put_num(o, deg); sb_puts(o, "deg"); }
