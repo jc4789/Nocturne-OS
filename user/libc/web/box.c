@@ -815,7 +815,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
     *is = *st;
     is->filter = NULL; is->opacity = 1; /* the element's outer group composites once, and clips once */
     is->clip_path = NULL; memset(&is->clip, 0, sizeof is->clip);
-    is->transform=is->rotate=is->scale=NULL;memset(&is->translate,0,sizeof is->translate);
+    is->transform=is->rotate=is->scale=NULL;memset(&is->translate,0,sizeof is->translate);is->offset.path=NULL;
     is->display = inner_kind == B_TABLE ? D_TABLE : inner_kind == B_GRID ? D_GRID : D_FLEX;
     for (int i = 0; i < 4; i++) {
         is->margin[i].kind = LK_LEN;
@@ -1664,7 +1664,7 @@ static bool restyle_derived(box_t *b, style_t *old) {
     } else {
         next.display=b->kind == B_TABLE ? D_TABLE : b->kind == B_GRID ? D_GRID : D_FLEX;
         next.filter=NULL; next.opacity=1; next.clip_path=NULL; memset(&next.clip,0,sizeof next.clip);
-        next.transform=next.rotate=next.scale=NULL;memset(&next.translate,0,sizeof next.translate);
+        next.transform=next.rotate=next.scale=NULL;memset(&next.translate,0,sizeof next.translate);next.offset.path=NULL;
         for (int i=0;i<4;i++) {
             next.margin[i].kind=LK_LEN; next.margin[i].px=next.margin[i].pct=0;
         }

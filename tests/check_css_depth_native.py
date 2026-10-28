@@ -81,7 +81,7 @@ host_abi.mkdir(exist_ok=True)
 (host_abi / "setjmp.h").write_text('#include "' + (cc.parent.parent / "include/setjmp.h").as_posix() + '"\n', encoding="utf-8")
 command = [str(cc), "-std=gnu11", "-O1", "-ffunction-sections", "-fdata-sections",
            "-Wl,--gc-sections", "-I" + str(host_abi), "-Iuser/include", "-Icommon", "-Iuser/libc/web",
-           str(c), str(parser_file), "user/libc/web/cssprop.c","user/libc/web/color.c", "user/libc/web/util.c",
+           str(c), str(parser_file), "user/libc/web/cssprop.c", "user/libc/web/shape.c","user/libc/web/color.c", "user/libc/web/util.c",
            "user/libc/web/html.c", "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 if os.environ.get("NOCTURNE_COMPILE_ONLY") != "1":

@@ -6,7 +6,6 @@
 #include <ctype.h>
 #include "webi.h"
 #include "inspect_private.h"
-#include "svg_geometry.h"
 
 /* ---------------------------------------------------------------- small parsing helpers */
 static void trim(const char **s, size_t *n) {
@@ -251,8 +250,6 @@ bool css_length_equal(const len_t *a,const len_t *b){
     return a==b||(a&&b&&a->kind==b->kind&&a->px==b->px&&a->pct==b->pct&&expression_equal(a->expr,b->expr));
 }
 
-enum { LF_AUTO = 1, LF_NONE = 2, LF_NEG = 4, LF_NORMAL = 8, LF_NOPCT = 16, LF_LENGTH = 32 };
-
 /* a dimension: number + unit; false if the unit is unknown */
 bool css_unit_px(const char *u, size_t un, float v, const struct cx *cx, float *px, float *pct, bool *num) {
     *px = *pct = 0;
@@ -261,6 +258,18 @@ bool css_unit_px(const char *u, size_t un, float v, const struct cx *cx, float *
         *px = v;
         *num = true;
         return true;
+    }
+    if (cx->angles) { /* css-values-4 §7.1: the angle units, in degrees */
+        static const struct { const char *u; double f; } angles[] = {
+            {"deg", 1}, {"grad", 0.9}, {"rad", 57.29577951308232}, {"turn", 360}};
+        for (size_t i = 0; i < sizeof angles / sizeof *angles; i++)
+            if (strn_ieq(u, angles[i].u, un)) { *px = (float)(v * angles[i].f); return true; }
+        return false;
+    }
+    if (cx->time) { /* css-values-4 §7.3: the time units, in milliseconds */
+        if (un == 1 && (u[0] | 32) == 's') { *px = v * 1000; return true; }
+        if (un == 2 && (u[0] | 32) == 'm' && (u[1] | 32) == 's') { *px = v; return true; }
+        return false;
     }
     if (un == 1 && u[0] == '%') {
         if (cx->absolute_lengths) return false;
@@ -288,7 +297,7 @@ bool css_unit_px(const char *u, size_t un, float v, const struct cx *cx, float *
     };
     for (size_t i = 0; i < sizeof units / sizeof *units; i++) {
         if (strcmp(units[i].u, b)) continue;
-        if (cx->absolute_lengths && units[i].kind) return false;
+        if ((cx->absolute_lengths || cx->absolute_units) && units[i].kind) return false;
         float f = units[i].f;
         switch (units[i].kind) {
         case 0: *px = v * f; break;
@@ -397,17 +406,7 @@ static struct cexpr *calc_value(const char **s, const char *e, struct cx *cx) {
     const char *u = *s;
     while (*s < e && (isalpha((unsigned char)**s) || **s == '%')) (*s)++;
     struct cexpr *x = cnode(cx, 'v', NULL, NULL);
-    size_t un = (size_t)(*s - u);
-    if (cx->time) {
-        /* a <time> calculation: numbers and times, no lengths or percentages */
-        x->num = !un;
-        if (!un) x->px = v;
-        else if (un == 1 && (u[0] | 32) == 's') x->px = v * 1000;
-        else if (un == 2 && (u[0] | 32) == 'm' && (u[1] | 32) == 's') x->px = v;
-        else return NULL;
-        return x;
-    }
-    if (!css_unit_px(u, un, v, cx, &x->px, &x->pct, &x->num)) return NULL;
+    if (!css_unit_px(u, (size_t)(*s - u), v, cx, &x->px, &x->pct, &x->num)) return NULL;
     return x;
 }
 
@@ -774,6 +773,50 @@ static bool parse_number_value(const char *v, size_t n, struct cx *cx, float *ou
     return x && q == v + n && !(cx->supports_probe && cx->invalid) && calc_dimension(x, &number) && number &&
            cfold(x, &number, out, &pct) && number && isfinite(*out);
 }
+/* The value grammar for the value owners outside this file (shape.c). */
+bool css_parse_length(const char *s, size_t n, struct cx *cx, len_t *out, int flags) { return parse_len(s, n, cx, out, flags); }
+bool css_number_token(const char **s, const char *end, float *out) { return parse_number(s, end, out); }
+/* 100% - x - y (y may be NULL), the far edge of an offset from the near one: inset()'s from rect()'s
+   and xywh()'s (css-shapes-1 §3.2), a position's from right or bottom (css-values-4 §9.1) */
+void css_length_complement(arena_t *a, const len_t *x, const len_t *y, len_t *out) {
+    if (x->kind == LK_LEN && (!y || y->kind == LK_LEN)) {
+        *out = (len_t){.kind = LK_LEN, .px = -x->px - (y ? y->px : 0), .pct = 100 - x->pct - (y ? y->pct : 0)};
+        return;
+    }
+    struct cexpr *e = ar_alloc(a, sizeof *e);
+    *e = (struct cexpr){.op = 'v', .pct = 100};
+    const len_t *terms[2] = {x, y};
+    for (int i = 0; i < 2 && terms[i]; i++) {
+        struct cexpr *term = terms[i]->expr;
+        if (terms[i]->kind != LK_EXPR) { term = ar_alloc(a, sizeof *term); *term = (struct cexpr){.op = 'v', .px = terms[i]->px, .pct = terms[i]->pct}; }
+        struct cexpr *difference = ar_alloc(a, sizeof *difference);
+        *difference = (struct cexpr){.op = '-', .a = e, .b = term};
+        e = difference;
+    }
+    *out = (len_t){.kind = LK_EXPR, .expr = e};
+}
+/* ka·x + kb·y of two <length-percentage>s as a computed length: px and percentage add while both
+   are sums of them, calc() trees combine as a tree */
+void css_length_mix(arena_t *a, const len_t *x, const len_t *y, double ka, double kb, len_t *out) {
+    if (x->kind == LK_LEN && y->kind == LK_LEN) {
+        *out = (len_t){.kind = LK_LEN, .px = (float)(x->px * ka + y->px * kb), .pct = (float)(x->pct * ka + y->pct * kb)};
+        return;
+    }
+    const len_t *terms[2] = {x, y};
+    double k[2] = {ka, kb};
+    struct cexpr *sum[2];
+    for (int i = 0; i < 2; i++) {
+        struct cexpr *term = terms[i]->expr;
+        if (terms[i]->kind != LK_EXPR) { term = ar_alloc(a, sizeof *term); *term = (struct cexpr){.op = 'v', .px = terms[i]->px, .pct = terms[i]->pct}; }
+        struct cexpr *factor = ar_alloc(a, sizeof *factor);
+        *factor = (struct cexpr){.op = 'v', .num = true, .px = (float)k[i]};
+        sum[i] = ar_alloc(a, sizeof *sum[i]);
+        *sum[i] = (struct cexpr){.op = '*', .a = term, .b = factor};
+    }
+    struct cexpr *e = ar_alloc(a, sizeof *e);
+    *e = (struct cexpr){.op = '+', .a = sum[0], .b = sum[1]};
+    *out = (len_t){.kind = LK_EXPR, .expr = e};
+}
 
 /* ---------------------------------------------------------------- colours (color.c owns them) */
 /* a <color> for a property that keeps only the 8-bit used value (COLOR_CURRENT for currentcolor) */
@@ -892,75 +935,6 @@ bool css_radius_serialize(const style_t *style,int corner,sbuf *out,web_doc *doc
     } else ok=radius_lengths_serialize(lengths,out,doc);
     if(!ok){out->n=original;if(out->p&&original<out->cap)out->p[original]=0;}return ok;
 }
-/* A CSS string's contents (CSSOM §6.6.2 "serialize a string"), without the quotes */
-static bool string_escaped(sbuf *out,const char *s) {
-    for(;*s;s++) {
-        unsigned char c=(unsigned char)*s;char escape[16];
-        if(c<0x20||c==0x7f){int n=snprintf(escape,sizeof escape,"\\%x ",c);if(!length_append(out,escape,(size_t)n))return false;}
-        else if(c=='"'||c=='\\'){escape[0]='\\';escape[1]=(char)c;if(!length_append(out,escape,2))return false;}
-        else if(!length_append(out,(const char *)s,1))return false;
-    }
-    return true;
-}
-static bool clip_side_zero_percent(const struct css_clip_path *c,int side) {
-    const len_t *l=&c->inset[side];
-    return l->kind==LK_LEN&&l->px==0&&l->pct==0&&(c->inset_percent>>side&1);
-}
-static bool clip_sides_equal(const struct css_clip_path *c,int a,int b) {
-    return css_length_equal(&c->inset[a],&c->inset[b])&&clip_side_zero_percent(c,a)==clip_side_zero_percent(c,b);
-}
-static const char *const clip_boxes[]={"border-box","padding-box","content-box","margin-box","fill-box","stroke-box","view-box"};
-bool css_clip_path_serialize(const struct css_clip_path *c,sbuf *out,web_doc *d) {
-    size_t original=out->n;bool ok=true;
-    if(!c)ok=length_append(out,"none",4);
-    else switch(c->shape) {
-    case CLIP_SHAPE_URL: ok=length_append(out,"url(\"",5)&&string_escaped(out,c->text)&&length_append(out,"\")",2);break;
-    case CLIP_SHAPE_BOX: ok=length_append(out,clip_boxes[c->box],strlen(clip_boxes[c->box]));break;
-    case CLIP_SHAPE_INSET: {
-        int count=4;
-        if(clip_sides_equal(c,1,3)){count=3;if(clip_sides_equal(c,0,2)){count=2;if(clip_sides_equal(c,0,1))count=1;}}
-        ok=length_append(out,"inset(",6);
-        for(int i=0;i<count&&ok;i++)ok=(!i||length_append(out," ",1))&&(clip_side_zero_percent(c,i)?length_append(out,"0%",2):css_length_serialize(&c->inset[i],out,d));
-        len_t lengths[2][4];bool round=false;
-        for(int i=0;i<4;i++)for(int axis=0;axis<2;axis++){const len_t *r=&c->corner[i].axis[axis];lengths[axis][i]=*r;round|=r->kind!=LK_LEN||r->px!=0||r->pct!=0;}
-        if(ok&&round)ok=length_append(out," round ",7)&&radius_lengths_serialize(lengths,out,d);
-        ok=ok&&length_append(out,")",1);
-        break;
-    }
-    case CLIP_SHAPE_CIRCLE: case CLIP_SHAPE_ELLIPSE: {
-        int radii=c->shape==CLIP_SHAPE_CIRCLE?1:2;bool closest=true;
-        ok=radii==1?length_append(out,"circle(",7):length_append(out,"ellipse(",8);
-        for(int i=0;i<radii;i++)closest&=c->extent[i]==CLIP_EXTENT_CLOSEST;
-        for(int i=0;i<radii&&ok&&!closest;i++)
-            ok=(!i||length_append(out," ",1))&&(c->extent[i]==CLIP_EXTENT_CLOSEST?length_append(out,"closest-side",12):
-               c->extent[i]==CLIP_EXTENT_FARTHEST?length_append(out,"farthest-side",13):css_length_serialize(&c->radius[i],out,d));
-        ok=ok&&(closest||length_append(out," ",1))&&length_append(out,"at ",3)&&css_length_serialize(&c->at[0],out,d)&&
-           length_append(out," ",1)&&css_length_serialize(&c->at[1],out,d)&&length_append(out,")",1);
-        break;
-    }
-    case CLIP_SHAPE_POLYGON:
-        ok=length_append(out,"polygon(",8)&&(!c->evenodd||length_append(out,"evenodd",7));
-        if(ok&&c->round>0)ok=(!c->evenodd||length_append(out," ",1))&&length_append(out,"round ",6)&&length_number(out,c->round,"px");
-        if(ok&&(c->evenodd||c->round>0))ok=length_append(out,", ",2);
-        for(size_t i=0;i<c->points&&ok;i++) {
-            if(!(i&63)&&d&&!web_native_checkpoint(d)){ok=false;break;}
-            ok=(!i||length_append(out,", ",2))&&css_length_serialize(&c->point[i][0],out,d)&&length_append(out," ",1)&&
-               css_length_serialize(&c->point[i][1],out,d);
-        }
-        ok=ok&&length_append(out,")",1);
-        break;
-    case CLIP_SHAPE_PATH:
-        ok=length_append(out,"path(",5)&&(!c->evenodd||length_append(out,"evenodd, ",9))&&length_append(out,"\"",1)&&
-           string_escaped(out,c->text)&&length_append(out,"\")",2);
-        break;
-    default: ok=false;
-    }
-    /* A shape's default box is border-box (css-masking-1 §5.1): the shortest form leaves it out. */
-    if(ok&&c&&c->shape!=CLIP_SHAPE_BOX&&c->shape!=CLIP_SHAPE_URL&&c->box!=CLIP_BOX_BORDER)
-        ok=length_append(out," ",1)&&length_append(out,clip_boxes[c->box],strlen(clip_boxes[c->box]));
-    if(!ok){out->n=original;if(out->p&&original<out->cap)out->p[original]=0;}
-    return ok;
-}
 bool css_clip_rect_serialize(const struct css_clip_rect *clip,sbuf *out) {
     size_t original=out->n;bool ok=true;
     if(!clip->rect)ok=length_append(out,"auto",4);
@@ -1011,18 +985,18 @@ enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
        PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_BOX_SHADOW, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
        PT_MOTION_LIST, PT_TRANSFORM, PT_TRANSLATE,
-       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_CLIP_PATH, PT_CLIP, PT_COLOR_SCHEME };
+       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_SHAPE, PT_OFFSET, PT_CLIP, PT_COLOR_SCHEME };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
        SH_MARGIN_INLINE, SH_MARGIN_BLOCK, SH_PADDING_INLINE, SH_PADDING_BLOCK, SH_INSET_INLINE, SH_INSET_BLOCK,
        SH_LIST_STYLE, SH_FONT, SH_BACKGROUND, SH_FLEX, SH_FLEX_FLOW, SH_GAP, SH_OVERFLOW, SH_TEXT_DECORATION, SH_ALL,
        SH_PLACE_ITEMS, SH_PLACE_SELF, SH_PLACE_CONTENT, SH_GRID_AREA, SH_GRID_ROW, SH_GRID_COLUMN,
-       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_TRANSITION, SH_OUTLINE };
+       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_TRANSITION, SH_OUTLINE, SH_OFFSET };
 
 struct propdef {
     const char *name;
-    uint8_t type, flags; /* flags: LF_* for lengths */
+    uint8_t type, flags; /* flags: LF_* for lengths; which shape or offset value (shape.c) */
     bool inherited;
     uint16_t off, size;
     const struct kw *kws;
@@ -1212,7 +1186,16 @@ static struct propdef props[] = {
     {"fill-opacity", PT_OPACITY, 0, true, O(svg_fill_opacity), NULL, 0, AN_TYPE},
     {"filter", PT_FILTER, 0, false, O(filter), NULL, 0, AN_TYPE},
     {"clip", PT_CLIP, 0, false, O(clip), NULL, 0, AN_TYPE},
-    {"clip-path", PT_CLIP_PATH, 0, false, O(clip_path), NULL, 0, AN_TYPE},
+    {"clip-path", PT_SHAPE, CSS_SHAPE_CLIP_PATH, false, O(clip_path), NULL, 0, AN_TYPE},
+    {"shape-outside", PT_SHAPE, CSS_SHAPE_OUTSIDE, false, O(shape_outside), NULL, 0, AN_TYPE},
+    {"shape-margin", PT_LEN, LF_LENGTH, false, O(shape_margin), NULL, 0, AN_TYPE},
+    {"shape-image-threshold", PT_OPACITY, 0, false, O(shape_image_threshold), NULL, 0, AN_TYPE},
+    SH("offset", SH_OFFSET),
+    {"offset-path", PT_SHAPE, CSS_SHAPE_OFFSET_PATH, false, O(offset.path), NULL, 0, AN_TYPE},
+    {"offset-distance", PT_LEN, LF_NEG | LF_LENGTH, false, O(offset.distance), NULL, 0, AN_TYPE},
+    {"offset-position", PT_OFFSET, CSS_OFFSET_POSITION, false, O(offset.position), NULL, 0, AN_TYPE},
+    {"offset-anchor", PT_OFFSET, CSS_OFFSET_ANCHOR, false, O(offset.anchor), NULL, 0, AN_TYPE},
+    {"offset-rotate", PT_OFFSET, CSS_OFFSET_ROTATE, false, O(offset.rotate), NULL, 0, AN_TYPE},
     {"fill-rule", PT_KW, 0, true, O(svg_fill_rule), kw_svg_fill_rule, 0, AN_TYPE},
     SH("font", SH_FONT),
     SH("all", SH_ALL),
@@ -1388,6 +1371,11 @@ static void init_initial(void) {
     s->align_self = 255;
     s->justify_self = 255;
     s->z_auto = true;
+    s->shape_margin.kind = LK_LEN;
+    s->offset.distance.kind = LK_LEN;
+    s->offset.position[0].kind = s->offset.position[1].kind = LK_NORMAL;
+    s->offset.anchor[0].kind = s->offset.anchor[1].kind = LK_AUTO;
+    s->offset.rotate.auto_rotate = true;
 }
 
 static void props_init(void) {
@@ -1487,7 +1475,10 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
         snprintf(text, sizeof text, "%d", (int)*(const int32_t *)field); sb_puts(out, text); return 1;
     case PT_COLOR: return css_style_color_text(st, color_slot(p), out) ? 1 : -1;
     case PT_COLOR_SCHEME: sb_puts(out, st->color_scheme_text ? st->color_scheme_text : "normal"); return 1;
-    case PT_MOTION_LIST: return css_computed_value(st, p, out, d) ? 1 : -1;
+    case PT_MOTION_LIST: case PT_SHAPE: case PT_OFFSET: return css_computed_value(st, p, out, d) ? 1 : -1;
+    case PT_SHORT: /* the shorthands whose longhands' owner serializes them together */
+        if (p->sh == SH_OFFSET) return css_offset_shorthand_serialize(&st->offset, out, d) ? 1 : -1;
+        return 0;
     }
     return 0;
 }
@@ -1502,6 +1493,9 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     if (ident_is(v, n, "inherit") || ident_is(v, n, "initial") || ident_is(v, n, "unset") || ident_is(v, n, "revert") ||
         ident_is(v, n, "revert-layer")) return false;
     if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
+    if (p->type == PT_SHAPE || p->type == PT_OFFSET || (p->type == PT_SHORT && p->sh == SH_OFFSET) ||
+        p->off == offsetof(style_t, offset.distance) || p->off == offsetof(style_t, shape_margin) ||
+        p->off == offsetof(style_t, shape_image_threshold)) return css_shape_specified(p->name, v, n, out);
     if (p->type != PT_COLOR_SCHEME) return false;
     arena_t a = {.chunk_size = 1024};
     jmp_buf trap;
@@ -1726,7 +1720,7 @@ static bool parse_list_type(const char *s, size_t n, struct cx *cx, uint8_t *out
 }
 
 /* url(...) contents, unescaped */
-static const char *parse_url(const char *s, size_t n, arena_t *a) {
+const char *css_parse_url(const char *s, size_t n, arena_t *a) {
     if (n < 5 || !strn_ieq(s, "url(", 4) || s[n - 1] != ')') {
         if (n >= 2 && (s[0] == '"' || s[0] == '\'') && s[n - 1] == s[0]) { /* @import "x" */
             sbuf b = {0};
@@ -1825,7 +1819,7 @@ static bool parse_bg_size(const char *s, size_t n, struct cx *cx, len_t *size, u
     return true;
 }
 
-/* ---------------------------------------------------------------- clip-path and clip */
+/* ---------------------------------------------------------------- border-radius lists and clip (shape.c owns clip-path) */
 /* A <border-radius> value: one to four horizontal radii and, after a /, one to four vertical ones,
    expanded to each axis's four corners (TL TR BR BL). */
 static bool parse_radius_list(const char *v, size_t n, struct cx *cx, len_t lengths[2][4]) {
@@ -1843,196 +1837,11 @@ static bool parse_radius_list(const char *v, size_t n, struct cx *cx, len_t leng
     if(count==1)memcpy(lengths[1],lengths[0],sizeof lengths[0]);
     return true;
 }
-static const struct kw kw_clip_box[]={{"border-box",CLIP_BOX_BORDER},{"padding-box",CLIP_BOX_PADDING},
-    {"content-box",CLIP_BOX_CONTENT},{"margin-box",CLIP_BOX_MARGIN},{"fill-box",CLIP_BOX_FILL},
-    {"stroke-box",CLIP_BOX_STROKE},{"view-box",CLIP_BOX_VIEW},{0}};
 /* name(arguments): the arguments, NULL for any other token */
 static const char *function_args(const char *v,size_t n,const char *name,size_t *size) {
     size_t k=strlen(name);
     if(n<k+2||!strn_ieq(v,name,k)||v[k]!='('||v[n-1]!=')')return NULL;
     *size=n-k-2;return v+k+1;
-}
-/* The end of the comma-separated item at s: the next top-level comma, or end. */
-static const char *item_end(const char *s,const char *end) {
-    int depth=0;char quote=0;
-    for(;s<end;s++) {
-        char c=*s;
-        if(quote){if(c=='\\'&&s+1<end)s++;else if(c==quote)quote=0;}
-        else if(c=='"'||c=='\'')quote=c;
-        else if(c=='(')depth++;
-        else if(c==')')depth--;
-        else if(c==','&&depth<=0)break;
-    }
-    return s;
-}
-static bool ends_percent(const char *t,size_t n){return n&&t[n-1]=='%';}
-/* 100% - a - b: inset()'s far edge for rect()'s and xywh()'s (css-shapes-1 §3.2). */
-static void clip_far_edge(struct cx *cx,const len_t *a,const len_t *b,len_t *out) {
-    if(a->kind==LK_LEN&&(!b||b->kind==LK_LEN)) {
-        *out=(len_t){.kind=LK_LEN,.px=-a->px-(b?b->px:0),.pct=100-a->pct-(b?b->pct:0)};return;
-    }
-    struct cexpr *x=ar_alloc(cx->a,sizeof *x);*x=(struct cexpr){.op='v',.pct=100};
-    const len_t *terms[2]={a,b};
-    for(int i=0;i<2&&terms[i];i++) {
-        struct cexpr *term=terms[i]->expr;
-        if(terms[i]->kind!=LK_EXPR){term=ar_alloc(cx->a,sizeof *term);*term=(struct cexpr){.op='v',.px=terms[i]->px,.pct=terms[i]->pct};}
-        struct cexpr *difference=ar_alloc(cx->a,sizeof *difference);*difference=(struct cexpr){.op='-',.a=x,.b=term};x=difference;
-    }
-    *out=(len_t){.kind=LK_EXPR,.expr=x};
-}
-/* [round <'border-radius'>]? closing a rectangle function: the corners (zero without it), and in
-   *before how much of the arguments precedes it */
-static bool parse_clip_round(const char *v,size_t n,struct cx *cx,struct css_clip_path *c,size_t *before) {
-    const char *t[16];size_t tl[16];int k=split_checked(v,n,t,tl,16,' ',cx);
-    *before=n;
-    for(int i=0;i<4;i++)for(int axis=0;axis<2;axis++)c->corner[i].axis[axis]=(len_t){.kind=LK_LEN};
-    for(int i=0;i<k;i++)if(ident_is(t[i],tl[i],"round")) {
-        *before=(size_t)(t[i]-v);
-        const char *radii=t[i]+tl[i];len_t lengths[2][4];
-        if(!parse_radius_list(radii,(size_t)(v+n-radii),cx,lengths))return false;
-        for(int corner=0;corner<4;corner++)for(int axis=0;axis<2;axis++)c->corner[corner].axis[axis]=lengths[axis][corner];
-        break;
-    }
-    return true;
-}
-static bool parse_clip_sides(const char *v,size_t n,struct cx *cx,struct css_clip_path *c) {
-    const char *t[5];size_t tl[5];int k=split_checked(v,n,t,tl,5,' ',cx);
-    if(k<1||k>4)return false;
-    static const int pick[5][4]={{0},{0,0,0,0},{0,1,0,1},{0,1,2,1},{0,1,2,3}};
-    len_t values[4];unsigned percent=0;
-    for(int i=0;i<k;i++) {
-        if(!parse_len(t[i],tl[i],cx,&values[i],LF_NEG|LF_LENGTH))return false;
-        if(ends_percent(t[i],tl[i]))percent|=1u<<i;
-    }
-    for(int i=0;i<4;i++){c->inset[i]=values[pick[k][i]];if(percent>>pick[k][i]&1)c->inset_percent|=(uint8_t)(1u<<i);}
-    return true;
-}
-/* xywh(x y w h): inset(y, 100% - x - w, 100% - y - h, x) */
-static bool parse_clip_xywh(const char *v,size_t n,struct cx *cx,struct css_clip_path *c) {
-    const char *t[5];size_t tl[5];
-    if(split_checked(v,n,t,tl,5,' ',cx)!=4)return false;
-    len_t x[4];
-    for(int i=0;i<4;i++)if(!parse_len(t[i],tl[i],cx,&x[i],(i<2?LF_NEG:0)|LF_LENGTH))return false;
-    c->inset[0]=x[1];c->inset[3]=x[0];
-    clip_far_edge(cx,&x[0],&x[2],&c->inset[1]);clip_far_edge(cx,&x[1],&x[3],&c->inset[2]);
-    c->inset_percent=(uint8_t)(1u<<1|1u<<2|(ends_percent(t[1],tl[1])?1u:0)|(ends_percent(t[0],tl[0])?1u<<3:0));
-    return true;
-}
-/* rect(top right bottom left), auto edges the reference box's: inset(top, 100% - right, 100% - bottom, left) */
-static bool parse_clip_rect_shape(const char *v,size_t n,struct cx *cx,struct css_clip_path *c) {
-    const char *t[5];size_t tl[5];
-    if(split_checked(v,n,t,tl,5,' ',cx)!=4)return false;
-    len_t edge[4];unsigned percent=1u<<1|1u<<2;
-    for(int i=0;i<4;i++) {
-        if(ident_is(t[i],tl[i],"auto")){edge[i]=(len_t){.kind=LK_LEN,.pct=i==1||i==2?100:0};percent|=1u<<i;}
-        else if(!parse_len(t[i],tl[i],cx,&edge[i],LF_NEG|LF_LENGTH))return false;
-        else if(ends_percent(t[i],tl[i]))percent|=1u<<i;
-    }
-    c->inset[0]=edge[0];c->inset[3]=edge[3];
-    clip_far_edge(cx,&edge[1],NULL,&c->inset[1]);clip_far_edge(cx,&edge[2],NULL,&c->inset[2]);
-    c->inset_percent=(uint8_t)percent;
-    return true;
-}
-/* circle( <radial-size>? [at <position>]? ), ellipse( [<radial-size>{2}]? [at <position>]? ) */
-static bool parse_clip_radial(const char *v,size_t n,struct cx *cx,struct css_clip_path *c,int radii) {
-    const char *t[8];size_t tl[8];int k=split_checked(v,n,t,tl,8,' ',cx);
-    if(k==8)return false;
-    int at=k;for(int i=0;i<k;i++)if(ident_is(t[i],tl[i],"at")){at=i;break;}
-    if(at&&at!=radii)return false;
-    c->extent[0]=c->extent[1]=CLIP_EXTENT_CLOSEST;
-    for(int i=0;i<at;i++) {
-        if(ident_is(t[i],tl[i],"closest-side"))c->extent[i]=CLIP_EXTENT_CLOSEST;
-        else if(ident_is(t[i],tl[i],"farthest-side"))c->extent[i]=CLIP_EXTENT_FARTHEST;
-        else if(parse_len(t[i],tl[i],cx,&c->radius[i],LF_LENGTH))c->extent[i]=CLIP_EXTENT_LENGTH;
-        else return false;
-    }
-    c->at[0]=c->at[1]=(len_t){.kind=LK_LEN,.pct=50};
-    if(at==k)return true;
-    if(at+1==k)return false;
-    const char *position=t[at+1];size_t size=(size_t)(v+n-position);trim(&position,&size);
-    return !memchr(position,',',size)&&parse_bg_pos(position,size,cx,c->at);
-}
-/* polygon( [<fill-rule> || round <length>]?, [<length-percentage> <length-percentage>]# ) */
-static bool parse_clip_polygon(const char *v,size_t n,struct cx *cx,struct css_clip_path **out) {
-    const char *end=v+n,*first=item_end(v,end);
-    size_t items=1;for(const char *q=first;q<end;q=item_end(q+1,end))items++;
-    const char *t[5];size_t tl[5];int k=split_checked(v,(size_t)(first-v),t,tl,5,' ',cx);
-    bool evenodd=false;float round=0;
-    if(k>0&&(ident_is(t[0],tl[0],"nonzero")||ident_is(t[0],tl[0],"evenodd")||ident_is(t[0],tl[0],"round"))) {
-        int i=0;
-        if(!ident_is(t[0],tl[0],"round")){evenodd=ident_is(t[0],tl[0],"evenodd");i=1;}
-        if(i<k) {
-            len_t r;
-            if(!ident_is(t[i],tl[i],"round")||i+1>=k||!parse_len(t[i+1],tl[i+1],cx,&r,LF_LENGTH|LF_NOPCT)||r.kind!=LK_LEN)return false;
-            round=r.px;i+=2;
-        }
-        if(i!=k||first==end)return false;
-        v=first+1;items--;
-    }
-    if(items>(SIZE_MAX-sizeof(struct css_clip_path))/sizeof(len_t[2]))return false;
-    struct css_clip_path *c=ar_alloc(cx->a,sizeof *c+items*sizeof c->point[0]);
-    memset(c,0,sizeof *c);
-    c->shape=CLIP_SHAPE_POLYGON;c->evenodd=evenodd;c->round=round;c->points=items;
-    for(size_t i=0;i<items;i++) {
-        const char *e=item_end(v,end),*xy[3];size_t xyn[3];
-        if(split_checked(v,(size_t)(e-v),xy,xyn,3,' ',cx)!=2||!parse_len(xy[0],xyn[0],cx,&c->point[i][0],LF_NEG|LF_LENGTH)||
-           !parse_len(xy[1],xyn[1],cx,&c->point[i][1],LF_NEG|LF_LENGTH))return false;
-        if(!(i&63)&&!cx->supports_probe&&cx->node&&!web_native_checkpoint(cx->node->owner))return false;
-        v=e+1;
-    }
-    *out=c;return true;
-}
-/* path( [<fill-rule>,]? <string> ), the string SVG path data */
-static bool parse_clip_path_data(const char *v,size_t n,struct cx *cx,struct css_clip_path **out) {
-    const char *end=v+n,*e=item_end(v,end);bool evenodd=false;
-    if(e!=end) {
-        const char *rule=v;size_t size=(size_t)(e-v);trim(&rule,&size);
-        if(ident_is(rule,size,"evenodd"))evenodd=true;
-        else if(!ident_is(rule,size,"nonzero"))return false;
-        v=e+1;
-        if(item_end(v,end)!=end)return false;
-    }
-    size_t size=(size_t)(end-v);trim(&v,&size);
-    if(size<2||(v[0]!='"'&&v[0]!='\'')||v[size-1]!=v[0])return false;
-    sbuf data={0};css_unescape(&data,v+1,size-2);
-    bool valid=data.p&&svg_path_data_valid(data.p);
-    const char *text=valid?ar_strndup(cx->a,data.p,data.n):NULL;
-    sb_free(&data);
-    if(!valid)return false;
-    struct css_clip_path *c=ar_alloc(cx->a,sizeof *c);memset(c,0,sizeof *c);
-    c->shape=CLIP_SHAPE_PATH;c->evenodd=evenodd;c->text=text;*out=c;return true;
-}
-static bool parse_clip_shape(const char *v,size_t n,struct cx *cx,struct css_clip_path **out) {
-    size_t size,before;const char *args;
-    if((args=function_args(v,n,"polygon",&size)))return parse_clip_polygon(args,size,cx,out);
-    if((args=function_args(v,n,"path",&size)))return parse_clip_path_data(args,size,cx,out);
-    struct css_clip_path *c=ar_alloc(cx->a,sizeof *c);memset(c,0,sizeof *c);*out=c;
-    if((args=function_args(v,n,"circle",&size))){c->shape=CLIP_SHAPE_CIRCLE;return parse_clip_radial(args,size,cx,c,1);}
-    if((args=function_args(v,n,"ellipse",&size))){c->shape=CLIP_SHAPE_ELLIPSE;return parse_clip_radial(args,size,cx,c,2);}
-    c->shape=CLIP_SHAPE_INSET;
-    if((args=function_args(v,n,"inset",&size)))return parse_clip_round(args,size,cx,c,&before)&&parse_clip_sides(args,before,cx,c);
-    if((args=function_args(v,n,"xywh",&size)))return parse_clip_round(args,size,cx,c,&before)&&parse_clip_xywh(args,before,cx,c);
-    if((args=function_args(v,n,"rect",&size)))return parse_clip_round(args,size,cx,c,&before)&&parse_clip_rect_shape(args,before,cx,c);
-    return false;
-}
-/* clip-path: none | <url> | [<basic-shape> || <geometry-box>] */
-static bool parse_clip_path(const char *v,size_t n,struct cx *cx,const struct css_clip_path **out) {
-    trim(&v,&n);
-    if(ident_is(v,n,"none")){*out=NULL;return true;}
-    const char *t[3];size_t tl[3];int k=split_checked(v,n,t,tl,3,' ',cx);
-    if(k<1||k>2)return false;
-    if(k==1&&n>=5&&strn_ieq(v,"url(",4)&&v[n-1]==')') {
-        const char *ref=parse_url(v,n,cx->a);if(!ref)return false;
-        struct css_clip_path *c=ar_alloc(cx->a,sizeof *c);memset(c,0,sizeof *c);
-        c->shape=CLIP_SHAPE_URL;c->text=ref;*out=c;return true;
-    }
-    struct css_clip_path *shape=NULL;uint8_t box=CLIP_BOX_BORDER;bool box_given=false;
-    for(int i=0;i<k;i++) {
-        if(kw_find(kw_clip_box,t[i],tl[i],&box)){if(box_given)return false;box_given=true;continue;}
-        if(shape||!parse_clip_shape(t[i],tl[i],cx,&shape))return false;
-    }
-    if(!shape){shape=ar_alloc(cx->a,sizeof *shape);memset(shape,0,sizeof *shape);shape->shape=CLIP_SHAPE_BOX;}
-    shape->box=box;*out=shape;return true;
 }
 /* clip: auto | rect(<top>, <right>, <bottom>, <left>), each a length or auto; CSS 2.1's spaces still parse */
 static bool parse_clip_rect(const char *v,size_t n,struct cx *cx,struct css_clip_rect *out) {
@@ -2065,7 +1874,7 @@ static bool parse_mask_image(const char *s, size_t n, struct cx *cx) {
     int k = split_checked(s, n, t, tl, 8, ',', cx);
     if (cx->supports_probe && (k != 1 || !strn_ieq(s, "url(", 4))) return false;
     for (int i = 0; i < k; i++) {
-        const char *u = parse_url(t[i], tl[i], cx->a);
+        const char *u = css_parse_url(t[i], tl[i], cx->a);
         if (u) {
             cx->s->mask_image = u;
             cx->s->mask_img = 0;
@@ -2188,7 +1997,7 @@ static bool parse_bg_image(const char *s, size_t n, struct cx *cx) {
     int k = split_checked(s, n, t, tl, 8, ',', cx);
     if (cx->supports_probe && k != 1) return false; /* no layered painting */
     for (int i = 0; i < k; i++) {
-        const char *u = parse_url(t[i], tl[i], cx->a);
+        const char *u = css_parse_url(t[i], tl[i], cx->a);
         if (u) {
             st->bg_image = u;
             st->bg_img = 0;st->has_grad=false;st->gradient=NULL;
@@ -3170,7 +2979,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         else {
             /* The rasterizer can resolve local SVG gradients, not external
                paint servers or context paints. Do not claim those in supports(). */
-            const char *ref = n >= 5 && strn_ieq(v, "url(", 4) && v[n-1] == ')' ? parse_url(v, n, cx->a) : NULL;
+            const char *ref = n >= 5 && strn_ieq(v, "url(", 4) && v[n-1] == ')' ? css_parse_url(v, n, cx->a) : NULL;
             if (!ref) return false;
             if (ref[0] != '#') {
                 const char *fragment = strchr(ref, '#');
@@ -3197,7 +3006,8 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         return true;
     }
     case PT_FILTER: return parse_filter(v, n, cx, &s->filter);
-    case PT_CLIP_PATH: return parse_clip_path(v, n, cx, &s->clip_path);
+    case PT_SHAPE: return css_shape_parse(p->flags, v, n, cx, (const struct css_shape **)field, NULL);
+    case PT_OFFSET: return css_offset_parse(p->flags, v, n, cx, field, NULL);
     case PT_CLIP: return parse_clip_rect(v, n, cx, &s->clip);
     case PT_BOX_SHADOW: return parse_box_shadows(v, n, cx, &s->box_shadow, NULL);
     case PT_OPACITY: {
@@ -3677,6 +3487,19 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
             return true;
         }
         return set_border(v, n, cx, sides, ns);
+    }
+    case SH_OFFSET: {
+        static const char *const names[] = {"offset-position", "offset-path", "offset-distance", "offset-rotate", "offset-anchor"};
+        if (global) { for (unsigned i = 0; i < 5; i++) set_long(names[i], v, n, cx); return true; }
+        style_t temp = *cx->s;
+        if (!css_offset_shorthand(v, n, cx, &temp.offset, NULL)) return false;
+        if (cx->font_pass) return true;
+        for (unsigned i = 0; i < 5; i++) {
+            const struct propdef *q = find_prop(names[i], strlen(names[i]));
+            int at = css_prop_index(q);
+            if (!cx->set[at]) { copy_prop(q, cx->s, &temp); cx->set[at] = 1; }
+        }
+        return true;
     }
     case SH_OUTLINE: {
         if (global) {
@@ -4175,7 +3998,7 @@ int css_prop_animation(const struct propdef *p) {
     case PT_DISPLAY: return CSS_ANIM_DISPLAY;
     case PT_KW: case PT_OVERFLOW: case PT_FONT_FAMILY: case PT_CONTENT: case PT_LIST_TYPE: case PT_BG_IMAGE:
     case PT_TEXT_DECO: case PT_GTEMPLATE: case PT_GAREAS: case PT_GLINE: case PT_MASK_IMAGE: case PT_LINE_CLAMP:
-    case PT_CLIP_PATH: return CSS_ANIM_DISCRETE;
+        return CSS_ANIM_DISCRETE;
     }
     return CSS_ANIM_VALUE;
 }
@@ -4647,10 +4470,8 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
         break;
     case PT_ROTATE: tf_rotate_text(out, st->rotate); break;
     case PT_SCALE: tf_scale_text(out, st->scale); break;
-    case PT_CLIP_PATH:
-        if (!st->clip_path) sb_puts(out, "none");
-        else ok = css_clip_path_serialize(st->clip_path, out, d);
-        break;
+    case PT_SHAPE: ok = css_shape_serialize(p->flags, *(const struct css_shape *const *)field, out, d); break;
+    case PT_OFFSET: ok = css_offset_serialize(p->flags, field, out, d); break;
     case PT_CLIP: ok = css_clip_rect_serialize(&st->clip, out); break;
     case PT_MOTION_LIST: {
         int list = p->flags;
@@ -4754,14 +4575,11 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
         const struct gline *x = (const struct gline *)fa, *y = (const struct gline *)fb;
         return x->kind == y->kind && x->n == y->n && same_text(x->name, y->name);
     }
-    case PT_CLIP_PATH: {
-        if (!a->clip_path || !b->clip_path) return a->clip_path == b->clip_path;
-        sbuf x = {0}, y = {0};
-        bool same = css_clip_path_serialize(a->clip_path, &x, NULL) && css_clip_path_serialize(b->clip_path, &y, NULL) &&
-            x.n == y.n && !memcmp(x.p, y.p, x.n);
-        sb_free(&x); sb_free(&y);
-        return same;
-    }
+    case PT_SHAPE: return css_shape_equal(*(const struct css_shape *const *)fa, *(const struct css_shape *const *)fb);
+    case PT_OFFSET:
+        if (p->flags == CSS_OFFSET_ROTATE) return !memcmp(fa, fb, sizeof(struct css_offset_rotate));
+        return css_length_equal(&((const len_t *)fa)[0], &((const len_t *)fb)[0]) &&
+            css_length_equal(&((const len_t *)fa)[1], &((const len_t *)fb)[1]);
     case PT_GTEMPLATE: case PT_GAREAS:
         return *(const void *const *)fa == *(const void *const *)fb;
     case PT_MOTION_LIST: return css_motion_equal(&a->motion, &b->motion);
@@ -4893,6 +4711,10 @@ static bool anim_combine(const struct css_anim_ctx *c, const struct propdef *p, 
     }
     case PT_BOX_SHADOW: return anim_shadows(out, a, b, ka, kb, mode);
     case PT_FILTER: return anim_filters(out, a->filter, b->filter, ka, kb, mode);
+    case PT_SHAPE: /* css-shapes-1 §3.4, motion-1 §2.1; accumulation is addition */
+        return css_shape_combine(p->flags, *(const struct css_shape *const *)fa, *(const struct css_shape *const *)fb,
+                                 kb, mode != MIX, out, d);
+    case PT_OFFSET: return css_offset_combine(p->flags, fa, fb, kb, mode != MIX, out, d);
     case PT_CLIP:
         if (!a->clip.rect || !b->clip.rect || a->clip.auto_edges != b->clip.auto_edges) return false;
         sb_puts(out, "rect(");

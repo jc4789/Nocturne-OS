@@ -364,7 +364,7 @@ abi.mkdir(exist_ok=True)
 env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH", ""))
 exe = out / "model.exe"
 command = [str(cc), "-std=gnu11", "-O1", "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include",
-           "-Icommon", "-Iuser/libc", "-Iuser/libc/web", "-Ithird_party/quickjs", str(source), "user/libc/web/cssprop.c",
+           "-Icommon", "-Iuser/libc", "-Iuser/libc/web", "-Ithird_party/quickjs", str(source), "user/libc/web/cssprop.c", "user/libc/web/shape.c",
            "user/libc/web/color.c", "user/libc/web/util.c", "user/libc/web/html.c", str(url), "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 subprocess.run([str(exe)], cwd=root, env=env, check=True, timeout=60)
