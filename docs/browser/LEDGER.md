@@ -178,6 +178,8 @@ Floorp の性能記録（10/26 04:16、74.5 秒の範囲）は頁を開いた後
 写真の回 2026-10-27（dad77052 の媒体、QEMU 4 CPU・4 GiB、`build/qa/hikaku/wa/sweep3`、並べた画像は `wa/cmp3`。前の回は `20261026-sweep1`、10-26 21 時台の媒体）：8 サイトとも上・下・戻りで落ちない。sweep1 に無かった違いは見つからない。前からの違いは K8（Anthropic の大きな題）・K29（Bilibili のログインの窓）・K31（百度百科の logo）・K32（弾幕）。Yahoo の右欄の広告の枠が空なのは参照の Floorp が広告を止めているため、数えない。musewonder.win は始めの画面（題・星・Start・説明。上下の黒い帯は Chrome でも同じ）と遊びの画面（順位・進みの帯・残りの帯・中の場面）が参照と合う。音は未確認。
 
 写真の回 2026-10-28 1028h（main 04a466d3 の前の媒体：Encoding・XPath・animation・color・report an exception、QEMU WHPX 4 GiB・2560×1440、F12 は 30 秒で開く、`--log-console` だけ、`build/qa/hikaku/1028h/new`、並べた画像は `1028h/pairs`、前の回は `1028g/new`）：6 サイト（YouTube は別の回）とも配置・字・部品が 1028g と一致。Bilibili のログインの窓の QR は今回は描かれてから撮れた（1028g の違いは撮った時刻の差）。百度百科で console の error `[monitor][resource_timeout]` が一行増えた（頁の監視の時間切れ、原因は未確認）。下へのスクロールと戻りはこの回では撮っていない。
+写真の回 2026-10-28 1028i（9ae7e2b2、同じ条件、`build/qa/hikaku/1028i/new`、並べた画像 `1028i/pairs`）：6 サイトとも配置・字・部品が 1028h と一致。退行一つ：Bilibili の `data.bilibili.com/log/web` の XHR・fetch が「fetch supports HTTP(S) resources only」で拒まれた（K80 の後、query の `\`。76f16425・29e8b2e9 で直した、K94）。百度百科の頁の監視の resource_timeout の行は 1028f 3・g 0・h 1・i 8・j 0 で、版の差ではない。
+写真の回 2026-10-28 1028j（d15b616f の媒体：+ shapes・offset の群、XML の文書、moveBefore、NodeIterator、DOMMatrix の逆、CacheStorage、inner invoke・window.event、http.c の `\`。同じ条件、`build/qa/hikaku/1028j/new`、`1028j/pairs`）：6 サイトとも 1028i と一致（Reddit の右の欄の中身は入れ替わり）。Bilibili の XHR は先の段の「Cannot measure request cookies」で落ちた（webcookie.c、29e8b2e9 で直した。画面は 1028k で）。新しい行：GitHub の `api.github.com/_private/browser/stats` への要求が送る前に「The browser rejected the resource request」（webnet_submit が 0、keepalive の 64 KiB の枠か入口の条件か未確認。前の版ではこの要求が 75 秒の間に出ていない）。
 
 ## 6. 測定
 
