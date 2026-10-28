@@ -1724,7 +1724,6 @@
             return ce||mutation||range||traversal?{ce,mutation,range,traversal,op:args[0]}:null;
         },
         customElementAfter(token,result){rangeBridge.after(token.range);traversalBridge.after(token.traversal);if(!mutationBridge.native)mutationBridge.after(token.mutation);customElementsBridge.after(token.ce,result);},
-        customElementCloneDocuments:customElementsBridge.cloneDocuments,
         mutationFlush(){mutationBridge.flush();},
         customElementScan(){customElementsBridge.upgradeTree(document);customElementsBridge.formRefresh();},
         customElementParserCandidate:customElementsBridge.parserCandidate,

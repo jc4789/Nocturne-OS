@@ -26,19 +26,22 @@
                 throw new DOMException('Namespace and prefix disagree','NamespaceError');
             return {namespace,prefix,localName};
         }
-        // DOM "internal createElementNS steps": an HTML-namespace element may be custom.
+        // DOM "internal createElementNS steps"; options is the converted ElementCreationOptions.
         function createNS(receiver,namespace,qualifiedName,options){
             const x=extract(namespace,qualifiedName);
-            if(x.namespace===HTML_NS)return customElementsBridge.create(x.localName,options,true,receiver,x.prefix);
-            return dom('create',receiver,1,x.localName,'',x.namespace,x.prefix);
+            const {registry,is}=customElementsBridge.flatten(options,receiver);
+            return customElementsBridge.create(receiver,x.localName,x.namespace,x.prefix,is,true,registry);
         }
         const xmlTypes=['text/xml','application/xml','application/xhtml+xml','image/svg+xml'];
-        function transfer(receiver,node,deep,adopt){
+        // adoptNode, and importNode's clone with its fallbackRegistry (undefined: this's registry).
+        function transfer(receiver,node,deep,adopt,registry=undefined){
             brand(receiver);
             const kind=apply(nodeTypeGetter,node,[]);
             if(kind===9)throw new DOMException('A Document cannot be transferred','NotSupportedError');
             if(rawDom.get(node,'shadowHost'))throw new DOMException('A shadow root cannot be transferred directly',adopt?'HierarchyRequestError':'NotSupportedError');
-            return dom(adopt?'adopt':'import',receiver,node,!!deep);
+            if(adopt)return dom('adopt',receiver,node,false);
+            if(registry===undefined)registry=customElementsBridge.registryFor(receiver);
+            return dom('import',receiver,node,!!deep,...customElementsBridge.identity(registry));
         }
         class DOMParser {
             constructor(){parserBrands.add(this);}
@@ -173,16 +176,20 @@
         // for an HTML document or an application/xhtml+xml one, else null.
         Document.prototype.createElement=function(name){
             brand(this);if(!arguments.length)throw new TypeError('Missing name');
-            const options=arguments[1];
-            name=string(name);validLocalName(name);
+            name=string(name);
+            const options=customElementsBridge.creationOptions(arguments[1]);
+            validLocalName(name);
             const html=rawDom.get(this,'htmlDocument');
-            if(html || rawDom.get(this,'contentType')==='application/xhtml+xml')return customElementsBridge.create(name,options,!html,this);
-            return dom('create',this,1,name,'',null,null);
+            if(html)name=name.replace(/[A-Z]/g,c=>c.toLowerCase());
+            const {registry,is}=customElementsBridge.flatten(options,this);
+            const namespace=html || rawDom.get(this,'contentType')==='application/xhtml+xml'?HTML_NS:null;
+            return customElementsBridge.create(this,name,namespace,null,is,true,registry);
         };
         Document.prototype.createElementNS=function(namespace,name){
             brand(this);
             if(arguments.length<2)throw new TypeError('Missing namespace or name');
-            return createNS(this,namespace==null?null:string(namespace),string(name),arguments[2]);
+            namespace=namespace==null?null:string(namespace);name=string(name);
+            return createNS(this,namespace,name,customElementsBridge.creationOptions(arguments[2]));
         };
         for(const [method,kind,label] of [['createTextNode',3,'#text'],['createComment',8,'#comment']])Document.prototype[method]=function(value){brand(this);if(!arguments.length)throw new TypeError('Missing data');return dom('create',this,kind,label,string(value));};
         Document.prototype.createDocumentFragment=function(){brand(this);return dom('create',this,11,'#document-fragment','');};
@@ -209,7 +216,23 @@
             namespace=namespace==null?null:string(namespace);
             return rawDom.namespaceLookup(this,null,false)===(namespace===''?null:namespace);
         };
-        Document.prototype.importNode=function(node,deep=false){if(!arguments.length)throw new TypeError('Missing node');return transfer(this,node,deep,false);};
+        /* DOM importNode(node, (boolean or ImportNodeOptions) options = false): a dictionary
+           (null too) gives subtree = !selfOnly and the fallbackRegistry customElementRegistry. */
+        Document.prototype.importNode=function(node,options=false){
+            brand(this);if(!arguments.length)throw new TypeError('Missing node');
+            apply(nodeTypeGetter,node,[]);
+            let subtree,registry;
+            if(options===null || typeof options==='object' || typeof options==='function'){
+                registry=customElementsBridge.registryOption(options==null?undefined:options.customElementRegistry,false);
+                const selfOnly=options==null?undefined:options.selfOnly;
+                subtree=!(selfOnly!==undefined && !!selfOnly);
+            }else subtree=!!options;
+            const kind=apply(nodeTypeGetter,node,[]);
+            if(kind===9 || rawDom.get(node,'shadowHost'))throw new DOMException('A Document or a shadow root cannot be imported','NotSupportedError');
+            if(registry!==undefined && customElementsBridge.globalOther(registry,this))
+                throw new DOMException('A global CustomElementRegistry of another document','NotSupportedError');
+            return transfer(this,node,subtree,false,registry);
+        };
         Document.prototype.adoptNode=function(node){if(!arguments.length)throw new TypeError('Missing node');return transfer(this,node,false,true);};
         const createEvent=document.createEvent;
         Document.prototype.hasFocus=function(){brand(this);return this===document && !!(host.windowState()&2);};

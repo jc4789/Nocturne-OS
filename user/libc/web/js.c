@@ -233,6 +233,11 @@ struct web_js_state {
     /* The bindings' invokeListener (native_event_realm), and, in the runtime owner only, the
        Event state table every realm of the runtime shares (native_event_realm_init). */
     JSValue event_port, event_states;
+    /* HTML custom elements (js_custom_elements.js): in the runtime owner only, the similar-origin
+       window agent's state every realm shares (registries, element states, the active custom
+       element constructor map, the reactions stack); in each realm, its Window's global
+       CustomElementRegistry, the one a global registry identity of its Document names. */
+    JSValue ce_agent, ce_registry;
     struct js_node_ref *nodes;
     struct js_node_ref *node_buckets[JS_NODE_BUCKETS];
     bool node_cache_syncing, node_cache_failed;
@@ -315,6 +320,10 @@ struct web_js_state {
     struct js_profile *js_profile; /* the runtime owner's, for --debug-js */
     struct js_storage_profile storage_profile;
     bool ce_hooks_active, range_hooks_active, face_hooks_active;
+    bool ce_scoped_active; /* a scoped CustomElementRegistry exists in the agent */
+    /* Runtime owner: a scoped registry has (form-associated) definitions, which reach every
+       realm's documents, so every realm, a new one too, takes the reaction path. */
+    bool ce_agent_hooks, face_agent_hooks;
     struct js_mutation_registration *mutation_registrations;
     struct js_mutation_record *mutation_first,*mutation_last;
     bool mutation_job_pending;
@@ -3019,19 +3028,39 @@ static void navigate_form_request(struct web_js_state *s, node_t *submitter) {
 #include "js_document_commands.h"
 #include "js_cssom.h"
 #include "js_fonts.h"
+/* host.domHooks(kind, active, document): 1 this realm's live Ranges and NodeIterators. 0 custom
+   element definitions and 2 form-associated ones: of a global registry, in the realm whose
+   Window's Document is document (its elements are that Document's); of a scoped registry (no
+   document), in every realm of the runtime, since a scoped registry's elements may be in any of
+   its documents. 3: a scoped registry exists, in every realm (connecting its elements records
+   their documents). */
 static JSValue native_dom_hooks(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     (void)this_val;struct web_js_state *s=state(ctx);int32_t kind=0;
     if(argc<2||JS_ToInt32(ctx,&kind,argv[0])<0)return JS_EXCEPTION;
     bool active=JS_ToBool(ctx,argv[1])>0;
-    if(kind==0)s->ce_hooks_active=active;else if(kind==1)s->range_hooks_active=active;
-    else if(kind==2)s->face_hooks_active=active;
+    if(kind==1){s->range_hooks_active=active;return JS_UNDEFINED;}
+    struct web_js_state *owner=s->runtime_owner?s->runtime_owner:s;
+    node_t *document=argc>2&&kind!=3?node_opaque(argv[2]):NULL;
+    if(!document){
+        if(kind==0)owner->ce_agent_hooks=active;
+        else if(kind==2)owner->face_agent_hooks=active;
+    }
+    for(struct web_js_state *realm=owner->runtime_realms;realm;realm=realm->runtime_next){
+        if(document&&(!realm->doc||realm->doc->root!=document))continue;
+        if(kind==0)realm->ce_hooks_active=active;
+        else if(kind==2)realm->face_hooks_active=active;
+        else if(kind==3)realm->ce_scoped_active=active;
+    }
     return JS_UNDEFINED;
 }
+/* Whether node's shadow-including inclusive descendants hold a custom element candidate, or
+   with scoped_only an element or shadow root whose registry is scoped (DOM "insert" appends its
+   node document to that registry's scoped document set). */
 static bool dom_custom_subtree(node_t *node, bool scoped_only) {
     if(!node)return false;
     node_t *current=node;
     for(;;){
-        if(custom_candidate(current) && (!scoped_only || current->custom_registry_id>0))return true;
+        if(scoped_only?(current->type==N_ELEM||current->shadow_host)&&current->custom_registry_id>0:custom_candidate(current))return true;
         if(current->shadow_root&&dom_custom_subtree(current->shadow_root,scoped_only))return true;
         if(current->first){current=current->first;continue;}
         while(current!=node&&!current->next)current=current->parent;
@@ -3049,8 +3078,14 @@ static bool dom_synchronous_hooks(struct web_js_state *s,int opcode,node_t *n,in
         bool markup=key&&!strcmp(key,"innerHTML");JS_FreeCString(s->ctx,key);
         if(s->range_hooks_active&&content)return true;
         if(s->ce_hooks_active&&(markup||(content&&dom_custom_subtree(n,false))))return true;
+        /* Fragment parsing gives the new children the target's registry. */
+        if(s->ce_scoped_active&&markup&&n&&doc_custom_registry(n,NULL)>0)return true;
     }
-    if(!s->ce_hooks_active)return false;
+    if(!s->ce_hooks_active){
+        /* Connecting an element or shadow root of a scoped registry records its document. */
+        bool connecting=opcode==DOM_insert||opcode==DOM_move||opcode==DOM_replace||opcode==DOM_replaceAll;
+        return s->ce_scoped_active&&connecting&&dom_custom_subtree(incoming,true);
+    }
     if(opcode==DOM_adopt&&incoming&&incoming->type==N_ATTR)return custom_candidate(incoming->attr_owner);
     if(structure||opcode==DOM_clone||opcode==DOM_import){
         return dom_custom_subtree(opcode==DOM_remove||opcode==DOM_clone?n:incoming,false)||
@@ -3259,7 +3294,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     bool mutation = opcode == DOM_shadowAttach || opcode == DOM_slotAssign || opcode == DOM_insert || opcode == DOM_move || opcode == DOM_replace || opcode == DOM_replaceAll || opcode == DOM_remove || opcode == DOM_adopt || opcode == DOM_clone || opcode == DOM_import || opcode == DOM_set ||
                     opcode == DOM_attrSetNode || opcode == DOM_attrRemoveNode ||
                     ((opcode == DOM_attr || opcode == DOM_style) && argc > 3) || (opcode == DOM_attrNS && argc > 4);
-    bool synchronous_hooks=mutation&&(s->ce_hooks_active||s->range_hooks_active)&&dom_synchronous_hooks(s,opcode,n,argc,argv);
+    bool synchronous_hooks=mutation&&(s->ce_hooks_active||s->ce_scoped_active||s->range_hooks_active)&&dom_synchronous_hooks(s,opcode,n,argc,argv);
     JSValue operation=synchronous_hooks ? JS_NewString(ctx,dom_opcode_names[opcode]) : JS_UNDEFINED;
     if(JS_IsException(operation))return operation;
     /* Only the synchronous CE/Range slow path needs an operation string. */
@@ -3865,8 +3900,16 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         node_t *child = argc > 2 ? unwrap(ctx, argv[2]) : NULL;
         if (n->type != N_DOC || !child || child->type == N_DOC) result = JS_ThrowTypeError(ctx, "Invalid document node transfer");
         else if (opcode == DOM_adopt) result = doc_node_adopt(d, child) ? wrap(s, child) : oom(ctx);
-        else { node_t *copy = doc_node_clone_registry(d, child, argc > 3 && JS_ToBool(ctx, argv[3]) > 0,
-            d->custom_registry_id,d->custom_registry_realm); result = copy ? wrap(s, copy) : oom(ctx); }
+        else {
+            /* DOM importNode: clone with fallbackRegistry, the registry importNode chose (an
+               identity and, for a global one, its Window's Document), else this's. */
+            int32_t registry = -2; void *realm = NULL;
+            if (argc > 4 && JS_ToInt32(ctx, &registry, argv[4]) < 0) { result = JS_EXCEPTION; break; }
+            if (registry < -2) { result = JS_ThrowTypeError(ctx, "Invalid registry identity"); break; }
+            if (registry == 0) { node_t *where = argc > 5 ? unwrap(ctx, argv[5]) : NULL; realm = where && where->type == N_DOC ? where : d->root; }
+            node_t *copy = doc_node_clone_registry(d, child, argc > 3 && JS_ToBool(ctx, argv[3]) > 0, registry, realm);
+            result = copy ? wrap(s, copy) : oom(ctx);
+        }
 
     } break;
     case DOM_clone: {
@@ -3876,6 +3919,8 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             if (!made) result = oom(ctx);
             else {
                 while (made->root->first) doc_node_remove(made, made->root->first);
+                /* DOM "clone a single node": a scoped registry of the Document is the copy's. */
+                if (doc_custom_registry(n, NULL) > 0) made->custom_registry_id = d->custom_registry_id;
                 bool ok = true; made->quirks = d->quirks; made->document_mode=d->document_mode;
                 snprintf(made->encoding,sizeof made->encoding,"%s",d->encoding);
                 for (node_t *c = deep ? n->first : NULL; c && ok; c = c->next) {
@@ -3897,19 +3942,31 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         const char *key=JS_ToCString(ctx,argv[2]);
         if (!key) { result=JS_EXCEPTION; break; }
         if (!strcmp(key,"registry")) {
+            /* The registry identity: -1 null, a positive number the agent's scoped registry,
+               0 this realm's global registry. Writing 0 names the global registry of the
+               Window whose Document is argv[4]; reading a global registry of another realm of
+               this runtime gives that CustomElementRegistry object itself. */
             if (argc>3) {
                 int32_t id;
+                node_t *where=argc>4?unwrap(ctx,argv[4]):NULL;
                 if (JS_ToInt32(ctx,&id,argv[3])<0) result=JS_EXCEPTION;
-                else if (id < -2) result=JS_ThrowTypeError(ctx,"Invalid registry identity");
+                else if (id < -1) result=JS_ThrowTypeError(ctx,"Invalid registry identity");
+                else if (n->type!=N_DOC && n->type!=N_ELEM && !n->shadow_host) result=JS_ThrowTypeError(ctx,"Only a Document, an Element or a ShadowRoot has a registry");
                 else {
-                    n->custom_registry_id=id; n->custom_registry_realm=s->doc->root;
-                    if (n->type==N_DOC) { d->custom_registry_id=id;d->custom_registry_realm=s->doc->root; }
+                    void *realm=id!=0?NULL:where&&where->type==N_DOC?where:s->doc->root;
+                    if (n->type==N_DOC) { d->custom_registry_id=id;d->custom_registry_realm=realm; }
+                    else { n->custom_registry_id=id; n->custom_registry_realm=realm; }
                 }
             } else {
-                int32_t id=n->type==N_DOC?d->custom_registry_id:n->custom_registry_id;
-                void *realm=n->type==N_DOC?d->custom_registry_realm:n->custom_registry_realm;
-                /* Never reinterpret a scoped integer in a different registry table. */
-                result=JS_NewInt32(ctx,realm && realm!=s->doc->root && id>0?-1:id);
+                void *realm;
+                int32_t id=doc_custom_registry(n,&realm);
+                result=JS_NewInt32(ctx,id);
+                if (id==0 && realm!=s->doc->root) {
+                    result=JS_NULL;
+                    struct web_js_state *owner=s->runtime_owner?s->runtime_owner:s;
+                    for(struct web_js_state *r=owner->runtime_realms;r;r=r->runtime_next)
+                        if(r->doc && r->doc->root==realm && JS_IsObject(r->ce_registry)){result=JS_DupValue(ctx,r->ce_registry);break;}
+                }
             }
         } else if (!strcmp(key,"authorConstructor")) {
             if(n->type!=N_DOC)result=JS_ThrowTypeError(ctx,"Author constructor requires its Document");
@@ -4082,12 +4139,6 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     }
 dom_complete:;
 mutation_after(s,&observed,!JS_IsException(result));
-    if(!JS_IsException(result) && !s->starting && !s->ce_hooks_active &&
-       (opcode==DOM_clone || opcode==DOM_import) && dom_custom_subtree(node_opaque(result),true)){
-        JSValue notified=custom_element_hook(s,"customElementCloneDocuments",1,&result);
-        if(JS_IsException(notified)){JS_FreeValue(ctx,result);result=notified;}
-        else JS_FreeValue(ctx,notified);
-    }
     if (!JS_IsException(result) && attribute_target && attribute_name) {
         JSValue notified = attribute_native_changed(s, attribute_target, attribute_name, old_attribute_present);
         if (JS_IsException(notified)) { JS_FreeValue(ctx, result); result = notified; } else JS_FreeValue(ctx, notified);
@@ -5131,6 +5182,30 @@ static JSValue native_event_realm_init(JSContext *ctx, JSValueConst this_val, in
     JS_FreeValue(ctx, s->event_port); s->event_port = JS_DupValue(ctx, argv[0]);
     if (!JS_IsObject(owner->event_states)) owner->event_states = JS_DupValue(ctx, argv[1]);
     return JS_DupValue(ctx, owner->event_states);
+}
+/* host.customElementAgent(init, registry): HTML gives custom elements one state per similar-origin
+   window agent, and every realm of this runtime is one such agent's: the registries and their
+   definitions, each element's custom element state, the active custom element constructor map
+   and the custom element reactions stack with its backup element queue. The first realm to ask
+   makes that state with init; every realm gets the same object. A realm passes its Window's
+   global CustomElementRegistry once it exists, so that another realm reading a global registry
+   identity of this realm's Document gets that object (DOM_customData "registry"). */
+static JSValue native_custom_element_agent(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    struct web_js_state *s = state(ctx);
+    if (!s) return JS_ThrowTypeError(ctx, "Custom elements need a realm");
+    struct web_js_state *owner = s->runtime_owner ? s->runtime_owner : s;
+    if (argc > 1 && JS_IsObject(argv[1])) {
+        JS_FreeValue(ctx, s->ce_registry); s->ce_registry = JS_DupValue(ctx, argv[1]);
+    }
+    if (!JS_IsObject(owner->ce_agent)) {
+        if (argc < 1 || !JS_IsFunction(ctx, argv[0])) return JS_ThrowTypeError(ctx, "The custom element agent needs its initializer");
+        JSValue made = JS_Call(ctx, argv[0], JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(made)) return made;
+        if (!JS_IsObject(made)) { JS_FreeValue(ctx, made); return JS_ThrowTypeError(ctx, "The custom element agent is an object"); }
+        owner->ce_agent = made;
+    }
+    return JS_DupValue(ctx, owner->ce_agent);
 }
 /* host.eventRealm(callback): the port of the realm the callback belongs to (Web IDL's
    "associated realm": a function's realm, and for a { handleEvent } object the realm that made
@@ -9827,6 +9902,12 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     s->observer_turn = true;
     s->hooks = s->dispatch = s->response = s->reject = s->webaudio = JS_UNDEFINED;
     s->event_port = s->event_states = JS_UNDEFINED;
+    s->ce_agent = s->ce_registry = JS_UNDEFINED;
+    /* Scoped registries and their definitions belong to the agent: a new realm's mutations take
+       the reaction path whenever theirs reach it. */
+    s->ce_hooks_active = s->runtime_owner->ce_agent_hooks;
+    s->face_hooks_active = s->runtime_owner->face_agent_hooks;
+    s->ce_scoped_active = s->runtime_owner->ce_scoped_active;
     for (int i = 0; i < NP_COUNT; i++) s->node_protos[i] = JS_UNDEFINED;
     /* Grow on demand through the real OS allocator. An invented page quota
        must not turn available memory into a JavaScript compatibility failure. */
@@ -9857,7 +9938,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("dom", 2, native_dom), JS_CFUNC_DEF("log", 1, native_log),
         JS_CFUNC_DEF("reportException", 1, native_report_exception),
         JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),JS_CFUNC_DEF("safetyRequired",1,native_safety_required),
-        JS_CFUNC_DEF("domHooks",2,native_dom_hooks),
+        JS_CFUNC_DEF("domHooks",3,native_dom_hooks),
         JS_CFUNC_DEF("inputListener",2,native_input_listener),JS_CFUNC_DEF("storageListener",1,native_storage_listener),
         JS_CFUNC_DEF("locale",0,native_locale),JS_CFUNC_DEF("editing",0,native_editing),
         JS_CFUNC_DEF("sandboxFlags",1,native_sandbox_flags),
@@ -9889,7 +9970,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("pi",2,native_pi),
         JS_CFUNC_DEF("inline", 1, native_inline),
         JS_CFUNC_DEF("windowHandler", 5, native_window_handler),
-        JS_CFUNC_DEF("eventRealmInit", 2, native_event_realm_init), JS_CFUNC_DEF("eventRealm", 1, native_event_realm),
+        JS_CFUNC_DEF("eventRealmInit", 2, native_event_realm_init), JS_CFUNC_DEF("customElementAgent", 2, native_custom_element_agent), JS_CFUNC_DEF("eventRealm", 1, native_event_realm),
         JS_CFUNC_DEF("eventActive", 2, native_event_active),
         JS_CFUNC_DEF("click", 1, native_click), JS_CFUNC_DEF("timer", 4, native_timer), JS_CFUNC_DEF("clear", 1, native_clear),
         JS_CFUNC_DEF("microtask", 1, native_microtask),
@@ -10062,6 +10143,7 @@ void web_js_free(web_doc *d) {
         js_free(s->ctx,s->window_name);s->window_name=NULL;
         JS_FreeValue(s->ctx, s->hooks); JS_FreeValue(s->ctx, s->dispatch); JS_FreeValue(s->ctx, s->response); JS_FreeValue(s->ctx, s->reject);
         JS_FreeValue(s->ctx, s->event_port); JS_FreeValue(s->ctx, s->event_states);
+        JS_FreeValue(s->ctx, s->ce_agent); JS_FreeValue(s->ctx, s->ce_registry);
         for (int i = 0; i < NP_COUNT; i++) JS_FreeValue(s->ctx, s->node_protos[i]);
         web_atomics_release(s->ctx);
         web_opfs_release(s->ctx);

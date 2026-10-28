@@ -1415,25 +1415,43 @@ bool doc_node_replace_all(web_doc *d,node_t *p,node_t *c) {
     return !c||doc_node_move(d,p,c,NULL);
 }
 
-static int32_t clone_document_registry(web_doc *d) {
-    return d->custom_registry_id!=-2?d->custom_registry_id:web_js_enabled(d)?0:-1;
+/* DOM's custom element registry of a Document, an element or a shadow root, as the native
+   slots record it: -1 null, 0 a global registry, a positive number a scoped registry (the
+   identity the script realms of the runtime share). For a global registry *realm is the
+   Document node of the Window whose registry it is. A Document whose slot was never assigned
+   has its Window's registry when it is a Window's Document (one that runs script), else null;
+   an element or shadow root whose slot was never assigned has its node document's, and keeps
+   it from then on. A global identity recorded without its realm is the node document's. */
+static int32_t document_registry(web_doc *d, void **realm) {
+    int32_t id = d->custom_registry_id != -2 ? d->custom_registry_id : web_js_enabled(d) ? 0 : -1;
+    if (realm) *realm = id != 0 ? NULL : d->custom_registry_realm ? d->custom_registry_realm : d->root;
+    return id;
 }
+int32_t doc_custom_registry(node_t *n, void **realm) {
+    if (realm) *realm = NULL;
+    if (!n || !n->owner || (n->type != N_DOC && n->type != N_ELEM && !n->shadow_host)) return -1;
+    if (n->type == N_DOC) return document_registry(n->owner, realm);
+    if (n->custom_registry_id == -2)
+        n->custom_registry_id = document_registry(n->owner, &n->custom_registry_realm);
+    if (n->custom_registry_id == 0 && !n->custom_registry_realm) n->custom_registry_realm = n->owner->root;
+    if (realm && n->custom_registry_id == 0) *realm = n->custom_registry_realm;
+    return n->custom_registry_id;
+}
+/* DOM "adopt", the registry of an element or shadow root that moves to document. */
 static void adopt_registry(web_doc *document,node_t *node) {
     if(node->type!=N_ELEM && !node->shadow_host)return;
-    int32_t registry=node->custom_registry_id;
-    if(registry==-2)registry=clone_document_registry(node->owner);
+    int32_t registry=doc_custom_registry(node,NULL);
     if(registry>0)return; /* A scoped registry keeps its identity. */
     if(node->shadow_host && registry==-1 && node->shadow_keep_registry_null)return;
-    int32_t destination=clone_document_registry(document);
+    void *realm;
+    int32_t destination=document_registry(document,&realm);
     if(!node->shadow_host && registry==-1 && node->parent &&
-       !(node->parent->type==N_FRAGMENT && !node->parent->shadow_host)){
-        node_t *parent=node->parent;
-        destination=parent->custom_registry_id==-2?clone_document_registry(parent->owner):parent->custom_registry_id;
-    }
+       !(node->parent->type==N_FRAGMENT && !node->parent->shadow_host))
+        destination=doc_custom_registry(node->parent,&realm);
     /* Adoption chooses only the effective global registry of the document or
        parent; it must not accidentally opt a null element into a scoped one. */
     node->custom_registry_id=destination==0?0:-1;
-    node->custom_registry_realm=destination==0?document->custom_registry_realm:NULL;
+    node->custom_registry_realm=destination==0?realm:NULL;
 }
 static void adopt_subtree(web_doc *d, node_t *root) {
   for (node_t *n = root; n; n = tree_next(n, root, true, true, true)) {
@@ -1708,23 +1726,21 @@ static bool clone_attributes(web_doc *d, node_t *copy, const node_t *source) {
     return true;
 }
 
-static void clone_registry(web_doc *d,node_t *copy,const node_t *source,int32_t fallback,void *fallback_realm) {
-    int32_t registry=source->custom_registry_id;
-    void *realm=source->custom_registry_realm;
-    if(registry==-2 && source->owner){
-        registry=clone_document_registry(source->owner);
-        realm=source->owner->custom_registry_realm;
-    }
-    if(registry==-1 || registry==-2){registry=fallback;realm=fallback_realm;}
+/* DOM "clone a single node" (and the shadow root of "clone a node"): the source's registry,
+   else fallback; a global one becomes document's effective global registry. */
+static void clone_registry(web_doc *d,node_t *copy,node_t *source,int32_t fallback,void *fallback_realm) {
+    void *realm;
+    int32_t registry=doc_custom_registry(source,&realm);
+    if(registry==-1){registry=fallback;realm=fallback_realm;}
     if(registry==0){
         /* A global registry is never borrowed from another Document. Scoped
            registries retain their identity; the destination's effective
            global registry is null when its registry is scoped or null. */
-        registry=clone_document_registry(d)==0?0:-1;
-        realm=registry==0?d->custom_registry_realm:NULL;
+        registry=document_registry(d,&realm)==0?0:-1;
+        if(registry!=0)realm=NULL;
     }
     copy->custom_registry_id=registry;
-    copy->custom_registry_realm=realm;
+    copy->custom_registry_realm=registry==0?realm:NULL;
 }
 static node_t *clone_one(web_doc *d, node_t *n, int32_t fallback, void *fallback_realm) {
     if (!d || !n || n->type == N_DOC || n->shadow_host) return NULL;
@@ -1786,7 +1802,7 @@ struct clone_walk {
 };
 node_t *doc_node_clone_registry(web_doc *d, node_t *n, bool deep, int32_t fallback_registry, void *fallback_realm) {
     if(!d)return NULL;
-    if(fallback_registry==-2){fallback_registry=clone_document_registry(d);fallback_realm=d->custom_registry_realm;}
+    if(fallback_registry==-2)fallback_registry=document_registry(d,&fallback_realm);
     node_t *root = clone_one(d, n, fallback_registry, fallback_realm);
     if (!root || n->type == N_ATTR) return root;
     size_t capacity = 16, used = 1;

@@ -2070,6 +2070,9 @@ node_t *doc_select_option(node_t *select, int index);
 bool doc_option_selected(node_t *option);
 node_t *doc_node_clone(web_doc *d, node_t *node, bool deep);
 node_t *doc_node_clone_registry(web_doc *d, node_t *node, bool deep, int32_t fallback_registry, void *fallback_realm);
+/* The custom element registry of a Document, element or shadow root (-1 null, 0 global with
+   *realm its Window's Document node, positive scoped); -1 for any other node. */
+int32_t doc_custom_registry(node_t *node, void **realm);
 void doc_mutated(web_doc *d, node_t *node);
 void doc_fragment_parsed(web_doc *d, node_t *forest);
 void doc_rescan(web_doc *d);

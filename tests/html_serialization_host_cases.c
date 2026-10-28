@@ -9,6 +9,12 @@ static void expected(node_t *n,bool strict,const char *value,const char *label){
     if(result==XML_SERIALIZED&&b.p&&strcmp(b.p,value))printf("  actual: %s\n  expected: %s\n",b.p,value);
     sb_free(&b);check(live_allocations==0,"temporary serializer storage freed");
 }
+static void shadowed(node_t *host,const char *value,const char *label){
+    sbuf b={0};html_serialize_get(host,&b,true,NULL,0);const char *actual=sb_cstr(&b);
+    check(!strcmp(actual,value),label);
+    if(strcmp(actual,value))printf("  actual: %s\n  expected: %s\n",actual,value);
+    sb_free(&b);
+}
 static void invalid(node_t *n,const char *label){
     sbuf b={0};sb_puts(&b,"kept");enum xml_serialization_result result=xml_serialize_node(n,&b,true);
     check(result==XML_SERIALIZE_INVALID&&b.n==4&&!strcmp(b.p,"kept"),label);sb_free(&b);
@@ -82,6 +88,30 @@ int main(void){
     expected(&template,true,"<template xmlns=\"http://www.w3.org/1999/xhtml\"><br /></template>","template content uses native inert tree");
     div.attrs=NULL;div.nattrs=0;div.shadow_root=&content;
     expected(&div,true,"<div xmlns=\"http://www.w3.org/1999/xhtml\"></div>","shadow tree not leaked");div.shadow_root=NULL;
+    /* HTML "serializing HTML fragments": a serializable shadow root's declarative attributes in
+       the standard's order, then shouldAppendRegistryAttribute from the node document's and the
+       shadow root's custom element registries (dom.c's slots: -1 null, 0 global, >0 scoped). */
+    document.root=&doc;
+    node_t host=element(NS_HTML,"div",T_div),shadow={.owner=&document,.type=N_FRAGMENT,.shadow_host=&host,.custom_registry_id=-2};
+    host.shadow_root=&shadow;shadow.shadow_serializable=shadow.shadow_delegates_focus=shadow.shadow_manual=shadow.shadow_clonable=true;
+    const char *all="<template shadowrootmode=\"open\" shadowrootdelegatesfocus=\"\" shadowrootserializable=\"\" shadowrootslotassignment=\"manual\" shadowrootclonable=\"\"";
+    char with_registry[256];snprintf(with_registry,sizeof with_registry,"%s shadowrootcustomelementregistry=\"\"></template>",all);
+    char without_registry[256];snprintf(without_registry,sizeof without_registry,"%s></template>",all);
+    shadowed(&host,without_registry,"declarative attribute order; both registries global");
+    check(shadow.custom_registry_id==0&&shadow.custom_registry_realm==&doc,"unassigned shadow root registry is its node document's");
+    sbuf inner={0};html_serialize_children(&host,&inner);check(!strcmp(sb_cstr(&inner),""),"innerHTML keeps the shadow root out");sb_free(&inner);
+    shadow.custom_registry_id=-1;shadowed(&host,with_registry,"null shadow registry in a document with a global registry");
+    shadow.custom_registry_id=7;shadowed(&host,with_registry,"scoped shadow registry");
+    document.custom_registry_id=-1;shadow.custom_registry_id=-1;
+    shadow.shadow_delegates_focus=shadow.shadow_manual=shadow.shadow_clonable=false;shadow.shadow_closed=true;
+    shadowed(&host,"<template shadowrootmode=\"closed\" shadowrootserializable=\"\"></template>","closed mode; both registries null");
+    shadow.custom_registry_id=0;
+    shadowed(&host,"<template shadowrootmode=\"closed\" shadowrootserializable=\"\" shadowrootcustomelementregistry=\"\"></template>","global shadow registry in a document whose registry is null");
+    document.custom_registry_id=-2;shadow.custom_registry_id=-1;document.scripting=false;
+    shadowed(&host,"<template shadowrootmode=\"closed\" shadowrootserializable=\"\"></template>","unassigned registry of a document without script is null");
+    document.scripting=true;
+    shadowed(&host,"<template shadowrootmode=\"closed\" shadowrootserializable=\"\" shadowrootcustomelementregistry=\"\"></template>","unassigned registry of a Window's document is global");
+    document.custom_registry_id=0;document.scripting=false;
     node_t doctype={.owner=&document,.type=N_DOCTYPE,.name="html",.public_id="pub",.system_id="sys"};
     expected(&doctype,true,"<!DOCTYPE html PUBLIC \"pub\" \"sys\">","doctype public and system");
     doctype.public_id="";doctype.system_id="\"quoted\"";
