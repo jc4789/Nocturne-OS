@@ -2300,7 +2300,7 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     else if (!strcmp(property, "animation-play-state")) snprintf(out,sizeof out,"%s",st->motion.paused?"paused":"running");
     else if (!strcmp(property, "animation-fill-mode")) {static const char *const names[]={"none","forwards","backwards","both"};snprintf(out,sizeof out,"%s",names[st->motion.fill<4?st->motion.fill:0]);}
     else if (!strcmp(property, "animation-direction")) {static const char *const names[]={"normal","reverse","alternate","alternate-reverse"};snprintf(out,sizeof out,"%s",names[st->motion.direction<4?st->motion.direction:0]);}
-    else if (!strcmp(property, "animation-timing-function")) {const struct css_easing *e=&st->motion.easing;if(e->kind==CM_LINEAR)snprintf(out,sizeof out,"linear");else if(e->kind==CM_STEP_START)snprintf(out,sizeof out,"step-start");else if(e->kind==CM_STEP_END)snprintf(out,sizeof out,"step-end");else snprintf(out,sizeof out,"cubic-bezier(%g, %g, %g, %g)",(double)e->x1,(double)e->y1,(double)e->x2,(double)e->y2);}
+    else if (!strcmp(property, "animation-timing-function")) {sbuf b={0};css_easing_serialize(&st->motion.easing,&b);snprintf(out,sizeof out,"%s",b.n?sb_cstr(&b):"ease");sb_free(&b);}
     else if (!strcmp(property, "fill-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_fill_opacity);
     else if (!strcmp(property, "stroke-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_stroke_opacity);
     else if (!strcmp(property, "stop-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_stop_opacity);

@@ -421,8 +421,12 @@ struct svg_paint {
 
 enum { CM_NORMAL, CM_REVERSE, CM_ALTERNATE, CM_ALTERNATE_REVERSE };
 enum { CM_FILL_NONE, CM_FILL_FORWARDS, CM_FILL_BACKWARDS, CM_FILL_BOTH };
-enum { CM_BEZIER, CM_LINEAR, CM_STEP_START, CM_STEP_END };
-struct css_easing { float x1, y1, x2, y2; uint8_t kind; };
+/* An <easing-function> (css-easing-1): cubic-bezier() (keyword: which named curve, for
+   serialization), linear, or steps(steps, position). step-start/step-end are steps(1, …). */
+enum { CM_BEZIER, CM_LINEAR, CM_STEPS };
+enum { CM_STEP_END, CM_STEP_START, CM_STEP_JUMP_START, CM_STEP_JUMP_BOTH, CM_STEP_JUMP_NONE };
+enum { CM_CURVE, CM_EASE, CM_EASE_IN, CM_EASE_OUT, CM_EASE_IN_OUT };
+struct css_easing { float x1, y1, x2, y2; uint32_t steps; uint8_t kind, position, keyword; };
 struct css_motion {
     const char *name; /* NULL = none; one animation, never an accepted comma-list */
     float duration, delay, iterations; /* milliseconds; infinity allowed only for iterations */
@@ -613,6 +617,9 @@ void css_box_change_report(web_doc *d); /* debug_js only */
 int64_t css_motion_deadline(web_doc *d); /* absolute uptime_ms(), as web_deadline */
 void css_motion_doc_free(web_doc *d);
 bool css_easing_parse(const char *s, size_t n, struct css_easing *out);
+/* css-easing-1 §2: the output progress for input x; before: the before flag of step easing */
+double css_easing_apply(const struct css_easing *e, double x, bool before);
+bool css_easing_serialize(const struct css_easing *e, sbuf *out);
 /* Shared @media / matchMedia evaluator; optional serialization cap >= 9*n+16. */
 bool css_media_evaluate(const char *query, int vw, int vh, bool scripting, char *out, size_t cap);
 void css_styling_free(struct styling *st);
@@ -635,6 +642,43 @@ bool css_prop_is_motion(const struct propdef *p);
    integer): 1 with the text in out; 2 for a colour, resolved into *color; -1 out of memory;
    0 for any other property, whose value has its own serializer or none. */
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, uint32_t *color, web_doc *d);
+/* Animation values (cssprop.c). The property table owns each longhand's animation type
+   (Web Animations 1 §5.3): not animatable, discrete, by computed value, visibility (visible
+   wins inside the interval), or display (the value that is not none/hidden wins inside it;
+   discrete otherwise). */
+enum { CSS_ANIM_NONE, CSS_ANIM_DISCRETE, CSS_ANIM_VALUE, CSS_ANIM_VISIBILITY, CSS_ANIM_DISPLAY };
+int css_prop_animation(const struct propdef *p);
+/* the longhands a property sets (itself, or a shorthand's), as css_prop_index bits in set */
+void css_prop_longhands(const struct propdef *p, uint8_t *set);
+/* p's computed value in st as text css_apply reads back to the same value; false: no serializer */
+bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d);
+/* do a and b hold the same computed value of longhand p */
+bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b);
+/* An element's animation context: its style without effects (the underlying values and
+   what em/currentcolor resolve against) and its last box (matrix decomposition). */
+struct box;
+struct css_anim_ctx {
+    const style_t *base, *parent;
+    node_t *node;
+    const struct box *box;
+    float rem, vw, vh;
+    arena_t *a;
+    web_doc *d;
+};
+/* value text (var() already substituted) parsed into a copy of the base; set: the longhands
+   it set (css_prop_count bytes, may be NULL) */
+bool css_anim_parse(const struct css_anim_ctx *c, const struct propdef *p, const char *v, size_t n,
+                    style_t *out, uint8_t *set);
+/* CSS Values 4 §3: longhand p's value a·(1-t) + b·t as computed-value text (t may lie outside
+   [0, 1]); false: the pair does not interpolate and the caller falls back to discrete */
+bool css_anim_interpolate(const struct css_anim_ctx *c, const struct propdef *p, const style_t *a,
+                          const style_t *b, double t, sbuf *out);
+/* discrete interpolation (Web Animations 1 §5.3, with the visibility and display rules):
+   true when b (rather than a) is the value at t */
+bool css_anim_discrete_second(const struct propdef *p, const style_t *a, const style_t *b, double t);
+/* value added (or accumulated) onto underlying; false: the type is not additive (value replaces) */
+bool css_anim_compose(const struct css_anim_ctx *c, const struct propdef *p, const style_t *underlying,
+                      const style_t *value, bool accumulate, sbuf *out);
 /* the values a declaration is resolved against */
 struct cx {
     style_t *s;

@@ -4484,18 +4484,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     return s;
 }
 
-static double motion_eased(const struct css_easing *e,double x) {
-    if(e->kind==CM_STEP_START)return 1;
-    if(e->kind==CM_STEP_END)return x>=1?1:0;
-    if(e->kind==CM_LINEAR || x<=0 || x>=1)return x;
-    double lo=0,hi=1,t=x;
-    for(unsigned i=0;i<30;i++) {
-        double u=1-t,z=3*u*u*t*e->x1+3*u*t*t*e->x2+t*t*t;
-        if(fabs(z-x)<1e-9)break;
-        if(z<x)lo=t;else hi=t;t=(lo+hi)/2;
-    }
-    double u=1-t;return 3*u*u*t*e->y1+3*u*t*t*e->y2+t*t*t;
-}
+static double motion_eased(const struct css_easing *e,double x) { return css_easing_apply(e,x,false); }
 static const struct opacity_keyframes *motion_keyframes(struct cascade *c,node_t *n,const char *name) {
     node_t *root=doc_node_root(n,false);
     /* Bindings are already ordered (including imports) and filtered by owner
@@ -4566,168 +4555,14 @@ static bool motion_frame_value(struct cascade *c,node_t *n,const style_t *base,c
     out->opacity=temp.opacity;out->transform=temp.transform;out->easing=temp.motion.easing;
     return out->has_opacity || out->has_transform;
 }
-/* ------------------------------------------------ transform interpolation */
-static void motion_number(sbuf *b,double v){
-    /* Fixed notation: the CSS number grammar is not printf's %g. */
-    if(!isfinite(v) || fabs(v)<5e-7)v=0;
-    if(v>1e15)v=1e15;else if(v< -1e15)v=-1e15;
-    char text[48];int len=snprintf(text,sizeof text,"%.6f",v);
-    while(len>1 && text[len-1]=='0')text[--len]=0;
-    if(len>1 && text[len-1]=='.')text[--len]=0;
-    if(!strcmp(text,"-0"))strcpy(text,"0");
-    sb_puts(b,text);
-}
-static bool motion_length(struct cascade *c,sbuf *b,const len_t *x,const len_t *y,double p){
-    static const len_t zero={.kind=LK_LEN};
-    if(x->kind!=LK_LEN && x->kind!=LK_EXPR)x=&zero;
-    if(y->kind!=LK_LEN && y->kind!=LK_EXPR)y=&zero;
-    if(x->kind==LK_LEN && y->kind==LK_LEN){
-        double px=x->px+(y->px-x->px)*p,pct=x->pct+(y->pct-x->pct)*p;
-        if(fabs(pct)<1e-9){motion_number(b,px);sb_puts(b,"px");return true;}
-        sb_puts(b,"calc(");motion_number(b,px);sb_puts(b,"px + ");motion_number(b,pct);sb_puts(b,"%)");return true;
-    }
-    /* Calculated lengths keep percentages unresolved: blend the expressions. */
-    sbuf ta={0},tb={0};
-    bool ok=css_length_serialize(x,&ta,c->d) && css_length_serialize(y,&tb,c->d);
-    if(ok){
-        sb_puts(b,"calc(");sb_puts(b,sb_cstr(&ta));sb_puts(b," * ");motion_number(b,1-p);
-        sb_puts(b," + ");sb_puts(b,sb_cstr(&tb));sb_puts(b," * ");motion_number(b,p);sb_putc(b,')');
-    }
-    sb_free(&ta);sb_free(&tb);return ok;
-}
-static bool motion_axis(const struct css_transform *t,double axis[3]){
-    double x=t->v[0],y=t->v[1],z=t->v[2],length=sqrt(x*x+y*y+z*z);
-    if(!(length>0) || !isfinite(length))return false;
-    axis[0]=x/length;axis[1]=y/length;axis[2]=z/length;return true;
-}
-/* The neutral function of t's kind used to pad the shorter list. */
-static struct css_transform motion_identity(const struct css_transform *t){
-    struct css_transform r={.xy={{.kind=LK_LEN},{.kind=LK_LEN}},.kind=t->kind};
-    if(t->kind==CT_SCALE)r.v[0]=r.v[1]=r.v[2]=1;
-    if(t->kind==CT_ROTATE){r.v[0]=t->v[0];r.v[1]=t->v[1];r.v[2]=t->v[2];}
-    for(int i=0;i<4;i++)r.m[i*5]=1;
-    return r;
-}
-/* CSS Transforms: lists interpolate function by function when every pair
-   shares a primitive (rotations need a common axis). */
-static bool motion_lists_match(const struct css_transform *a,const struct css_transform *b){
-    for(;a||b;a=a?a->next:NULL,b=b?b->next:NULL){
-        const struct css_transform *t=a?a:b;
-        if(t->kind==CT_MATRIX || t->kind==CT_PERSPECTIVE)return false;
-        if(!a || !b)continue;
-        if(a->kind!=b->kind)return false;
-        if(a->kind==CT_ROTATE && a->v[3]!=0 && b->v[3]!=0){
-            double p[3],q[3];
-            if(!motion_axis(a,p) || !motion_axis(b,q))return false;
-            if(fabs(p[0]-q[0])>1e-6 || fabs(p[1]-q[1])>1e-6 || fabs(p[2]-q[2])>1e-6)return false;
-        }
-    }
-    return true;
-}
-/* Writes a(1-p)+b·p function by function; with a==b and p==0 it is an exact
-   serialization of any list, matrices and perspective included. */
-static bool motion_write_pairs(struct cascade *c,sbuf *b,const struct css_transform *x,const struct css_transform *y,double p){
-    bool first=true;
-    for(;x||y;x=x?x->next:NULL,y=y?y->next:NULL){
-        struct css_transform ix,iy;
-        const struct css_transform *s=x,*e=y;
-        if(!s){ix=motion_identity(e);s=&ix;}
-        if(!e){iy=motion_identity(s);e=&iy;}
-        if(!first)sb_putc(b,' ');
-        first=false;
-        double v[4];for(int i=0;i<4;i++)v[i]=s->v[i]+(e->v[i]-s->v[i])*p;
-        switch(s->kind){
-        case CT_TRANSLATE:
-            sb_puts(b,v[0]?"translate3d(":"translate(");
-            if(!motion_length(c,b,&s->xy[0],&e->xy[0],p))return false;
-            sb_puts(b,", ");
-            if(!motion_length(c,b,&s->xy[1],&e->xy[1],p))return false;
-            if(v[0]){sb_puts(b,", ");motion_number(b,v[0]);sb_puts(b,"px");}
-            sb_putc(b,')');break;
-        case CT_SCALE:
-            sb_puts(b,v[2]!=1?"scale3d(":"scale(");motion_number(b,v[0]);sb_puts(b,", ");motion_number(b,v[1]);
-            if(v[2]!=1){sb_puts(b,", ");motion_number(b,v[2]);}
-            sb_putc(b,')');break;
-        case CT_ROTATE:{
-            double axis[3]={0,0,1};
-            if(!motion_axis(s->v[3]!=0 || e->v[3]==0?s:e,axis)){axis[0]=axis[1]=0;axis[2]=1;}
-            double angle=s->v[3]+(e->v[3]-s->v[3])*p;
-            if(axis[0]==0 && axis[1]==0 && axis[2]>0){sb_puts(b,"rotate(");motion_number(b,angle);sb_puts(b,"rad)");}
-            else{
-                sb_puts(b,"rotate3d(");
-                for(int i=0;i<3;i++){motion_number(b,axis[i]);sb_puts(b,", ");}
-                motion_number(b,angle);sb_puts(b,"rad)");
-            }
-            break;
-        }
-        case CT_SKEW:
-            sb_puts(b,"skew(");motion_number(b,v[0]);sb_puts(b,"rad, ");motion_number(b,v[1]);sb_puts(b,"rad)");break;
-        case CT_PERSPECTIVE:
-            if(!(v[0]>0)){sb_puts(b,"perspective(none)");break;}
-            sb_puts(b,"perspective(");motion_number(b,v[0]);sb_puts(b,"px)");break;
-        case CT_MATRIX:
-            sb_puts(b,"matrix3d(");
-            for(int col=0;col<4;col++)for(int row=0;row<4;row++){
-                double value=s->m[row*4+col]+(e->m[row*4+col]-s->m[row*4+col])*p;
-                motion_number(b,value);if(col<3 || row<3)sb_puts(b,", ");
-            }
-            sb_putc(b,')');break;
-        default:return false;
-        }
-    }
-    if(first)sb_puts(b,"none");
-    return true;
-}
-struct motion_2d { double tx,ty,sx,sy,angle,m11,m12,m21,m22; };
-/* CSS Transforms 1 §"Interpolation of matrices", 2D decomposition. */
-static bool motion_decompose(const struct css_transform *t,const box_t *box,struct motion_2d *out){
-    float w=0,h=0;
-    if(box){w=box->w+box->p[1]+box->p[3]+box->b[1]+box->b[3];h=box->h+box->p[0]+box->p[2]+box->b[0]+box->b[2];}
-    else for(const struct css_transform *x=t;x;x=x->next)
-        if(x->kind==CT_TRANSLATE && (len_has_pct(&x->xy[0]) || len_has_pct(&x->xy[1])))return false;
-    double m[16];css_transform_list_matrix(t,w,h,m);
-    double r0x=m[0],r0y=m[4],r1x=m[1],r1y=m[5];
-    out->tx=m[3];out->ty=m[7];
-    out->sx=sqrt(r0x*r0x+r0y*r0y);out->sy=sqrt(r1x*r1x+r1y*r1y);
-    if(r0x*r1y-r0y*r1x<0){if(r0x<r1y)out->sx=-out->sx;else out->sy=-out->sy;}
-    if(out->sx){r0x/=out->sx;r0y/=out->sx;}
-    if(out->sy){r1x/=out->sy;r1y/=out->sy;}
-    out->angle=atan2(r0y,r0x);
-    if(out->angle){
-        double sn=-r0y,cs=r0x,a=r0x,b=r0y,cc=r1x,d=r1y;
-        r0x=cs*a+sn*cc;r0y=cs*b+sn*d;r1x=-sn*a+cs*cc;r1y=-sn*b+cs*d;
-    }
-    out->m11=r0x;out->m12=r0y;out->m21=r1x;out->m22=r1y;
-    const double *f=&out->tx;for(int i=0;i<9;i++)if(!isfinite(f[i]))return false;
-    return true;
-}
-static bool motion_matrix_blend(sbuf *b,const struct css_transform *x,const struct css_transform *y,const box_t *box,double p){
-    struct motion_2d A,B;
-    if(!motion_decompose(x,box,&A) || !motion_decompose(y,box,&B))return false;
-    if((A.sx<0 && B.sy<0) || (A.sy<0 && B.sx<0)){A.sx=-A.sx;A.sy=-A.sy;A.angle+=A.angle<0?M_PI:-M_PI;}
-    if(!A.angle)A.angle=2*M_PI;
-    if(!B.angle)B.angle=2*M_PI;
-    if(fabs(A.angle-B.angle)>M_PI){if(A.angle>B.angle)A.angle-=2*M_PI;else B.angle-=2*M_PI;}
-    struct motion_2d R;double *r=&R.tx;const double *a=&A.tx,*q=&B.tx;
-    for(int i=0;i<9;i++)r[i]=a[i]+(q[i]-a[i])*p;
-    /* rows = diag(sx,sy) · rotate · remainder */
-    double cs=cos(R.angle),sn=sin(R.angle);
-    double n11=cs*R.m11+sn*R.m21,n12=cs*R.m12+sn*R.m22,n21=-sn*R.m11+cs*R.m21,n22=-sn*R.m12+cs*R.m22;
-    double values[6]={n11*R.sx,n12*R.sx,n21*R.sy,n22*R.sy,R.tx,R.ty};
-    sb_puts(b,"matrix(");
-    for(int i=0;i<6;i++){motion_number(b,values[i]);if(i<5)sb_puts(b,", ");}
-    sb_putc(b,')');return true;
-}
-static char *motion_transform_text(struct cascade *c,node_t *n,const struct css_transform *x,const struct css_transform *y,double p){
-    sbuf b={0};bool ok;
-    if(motion_lists_match(x,y))ok=motion_write_pairs(c,&b,x,y,p);
-    else{
-        ok=motion_matrix_blend(&b,x,y,n->box,p);
-        if(!ok){ /* not interpolable without a used size: discrete at 50% */
-            const struct css_transform *t=p<.5?x:y;sb_free(&b);b=(sbuf){0};
-            ok=motion_write_pairs(c,&b,t,t,0);
-        }
-    }
+/* transform text at p through the shared animation-value layer (cssprop.c) */
+static char *motion_transform_text(struct cascade *c,node_t *n,const style_t *base,const style_t *parent,
+    const struct css_transform *x,const struct css_transform *y,double p){
+    style_t from=*base,to=*base;from.transform=x;to.transform=y;
+    struct css_anim_ctx ac={.base=base,.parent=parent,.node=n,.box=n->box,.rem=c->rem,.vw=(float)c->vw,.vh=(float)c->vh,.a=c->a,.d=c->d};
+    const struct propdef *tp=css_prop_lookup("transform",9);sbuf b={0};
+    bool ok=css_anim_interpolate(&ac,tp,&from,&to,p,&b);
+    if(!ok){b.n=0;ok=css_computed_value(p<.5?&from:&to,tp,&b,c->d);} /* not interpolable without a used size: discrete */
     char *text=ok?ar_strdup(c->a,sb_cstr(&b)):NULL;sb_free(&b);return text;
 }
 struct motion_result { bool has_opacity; float opacity; char *transform; };
@@ -4793,7 +4628,7 @@ static bool motion_sample(struct cascade *c,node_t *n,const style_t *base,const 
     if(any_transform){
         double fraction=tright>tleft?(progress-tleft)/(tright-tleft):0;
         double p=local<0?fraction:motion_eased(&tease,fraction);
-        out->transform=motion_transform_text(c,n,tlv,trv,p);
+        out->transform=motion_transform_text(c,n,base,parent,tlv,trv,p);
     }
     return out->has_opacity || out->transform;
 }
