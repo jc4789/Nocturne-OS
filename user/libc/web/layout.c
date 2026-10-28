@@ -649,17 +649,27 @@ static bool style_transform_matrix(const style_t *st,double x,double y,float w,f
     for(int i=0;i<6;i++)if(!isfinite(out[i]))return false;
     return true;
 }
-void box_transform_rect(const box_t *b,double rect[4]){
+void box_transform_chain(const box_t *b,double m[6]){
+    m[0]=m[3]=1;m[1]=m[2]=m[4]=m[5]=0;
     for(;b;b=b->parent){
-        double m[6];if(!box_transform_matrix(b,m))continue;
-        double x0=rect[0],y0=rect[1],x1=rect[0]+rect[2],y1=rect[1]+rect[3];
-        double xs[4]={x0,x1,x0,x1},ys[4]={y0,y0,y1,y1},l=INFINITY,t=INFINITY,r=-INFINITY,bt=-INFINITY;
-        for(int i=0;i<4;i++){
-            double x=m[0]*xs[i]+m[2]*ys[i]+m[4],y=m[1]*xs[i]+m[3]*ys[i]+m[5];
-            l=fmin(l,x);t=fmin(t,y);r=fmax(r,x);bt=fmax(bt,y);
-        }
-        rect[0]=l;rect[1]=t;rect[2]=r-l;rect[3]=bt-t;
+        double t[6];if(!box_transform_matrix(b,t))continue;
+        /* the ancestor's transform applies after everything inside it */
+        double r[6]={t[0]*m[0]+t[2]*m[1],t[1]*m[0]+t[3]*m[1],t[0]*m[2]+t[2]*m[3],t[1]*m[2]+t[3]*m[3],
+                     t[0]*m[4]+t[2]*m[5]+t[4],t[1]*m[4]+t[3]*m[5]+t[5]};
+        memcpy(m,r,sizeof r);
     }
+}
+void box_transform_rect(const box_t *b,double rect[4]){
+    double m[6];box_transform_chain(b,m);
+    if(m[0]==1&&m[1]==0&&m[2]==0&&m[3]==1&&m[4]==0&&m[5]==0)return;
+    /* The quad's own bounds: bounding each nested transform separately would grow it. */
+    double x0=rect[0],y0=rect[1],x1=rect[0]+rect[2],y1=rect[1]+rect[3];
+    double xs[4]={x0,x1,x0,x1},ys[4]={y0,y0,y1,y1},l=INFINITY,t=INFINITY,r=-INFINITY,bt=-INFINITY;
+    for(int i=0;i<4;i++){
+        double x=m[0]*xs[i]+m[2]*ys[i]+m[4],y=m[1]*xs[i]+m[3]*ys[i]+m[5];
+        l=fmin(l,x);t=fmin(t,y);r=fmax(r,x);bt=fmax(bt,y);
+    }
+    rect[0]=l;rect[1]=t;rect[2]=r-l;rect[3]=bt-t;
 }
 bool box_filter_containing_block(const box_t *b) {
     const box_t *effect = b;

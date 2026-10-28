@@ -653,6 +653,7 @@ static const struct kw kw_transform_box[] = {{"view-box", TB_VIEW_BOX}, {"fill-b
                                            {"content-box", TB_CONTENT_BOX}, {"border-box", TB_BORDER_BOX}, {0}};
 static const struct kw kw_visibility[] = {{"visible", 0}, {"hidden", 1}, {"collapse", 1}, {0}};
 static const struct kw kw_content_visibility[] = {{"visible", CV_VISIBLE}, {"auto", CV_AUTO}, {"hidden", CV_HIDDEN}, {0}};
+static const struct kw kw_scroll_behavior[] = {{"auto", 0}, {"smooth", 1}, {0}};
 static const struct kw kw_container_type[] = {{"normal", CT_NORMAL}, {"inline-size", CT_INLINE_SIZE}, {"size", CT_SIZE}, {0}};
 static const struct kw kw_bcollapse[] = {{"separate", 0}, {"collapse", 1}, {0}};
 static const struct kw kw_fdir[] = {{"row", FD_ROW}, {"row-reverse", FD_ROW_REVERSE}, {"column", FD_COLUMN},
@@ -880,6 +881,7 @@ static struct propdef props[] = {
     {"counter-reset", PT_COUNTER, CSS_COUNTER_RESET, false, OCOUNTER(CSS_COUNTER_RESET), NULL, 0, AN_DISCRETE},
     {"counter-set", PT_COUNTER, CSS_COUNTER_SET, false, OCOUNTER(CSS_COUNTER_SET), NULL, 0, AN_DISCRETE},
     {"content-visibility", PT_KW, 0, false, O(content_visibility), kw_content_visibility, 0, AN_DISPLAY},
+    {"scroll-behavior", PT_KW, 0, false, O(scroll_behavior), kw_scroll_behavior, 0, AN_DISCRETE},
     SH("container", SH_CONTAINER),
     {"container-name", PT_CONTAINER_NAMES, 0, false, O(container_names), NULL, 0, AN_TYPE},
     {"container-type", PT_KW, 0, false, O(container_type), kw_container_type, 0, AN_NONE},
