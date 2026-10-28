@@ -296,6 +296,83 @@ function fetchInterfaces(realm) {
         }
         return out;
     }
+    const fromCharCode=String.fromCharCode, NativeMap=Map, mapGet=Map.prototype.get, mapSet=Map.prototype.set, mapHas=Map.prototype.has;
+    const quotedTokens=/^[\t\x20-\x7e\x80-\xff]*$/;
+    /* ASCII lowercase: only A to Z change. */
+    function asciiLower(text) {
+        let out='',from=0;
+        for(let i=0;i<text.length;i++){const c=code(text,i);if(c>=65&&c<=90){out+=slice(text,from,i)+fromCharCode(c+32);from=i+1;}}
+        return from?out+slice(text,from,text.length):text;
+    }
+    /* Fetch "collect an HTTP quoted string" from input at position at (a U+0022): [the string, the
+       position after it]; extract: the value alone, otherwise the input from the quote on. */
+    function quotedString(input,at,extract) {
+        const start=at;let value='';at++;
+        for(;;) {
+            let stop=at;while(stop<input.length&&code(input,stop)!==34&&code(input,stop)!==92)stop++;
+            value+=slice(input,at,stop);at=stop;
+            if(at>=input.length)break;
+            const quote=code(input,at++);
+            if(quote===92){if(at>=input.length){value+='\\';break;}value+=slice(input,at,at+1);at++;}
+            else break;
+        }
+        const out=newList();out[0]=extract?value:slice(input,start,at);out[1]=at;return out;
+    }
+    /* MIME Sniffing "parse a MIME type" (https://mimesniff.spec.whatwg.org/#parse-a-mime-type): a
+       record {essence, parameters (a Map, lowercase names)}, or null for failure. */
+    function parseMIME(input) {
+        input=trim(input,httpSpace);
+        const slash=indexOf(input,'/');if(slash<0)return null;
+        const type=slice(input,0,slash);if(!matches(token,type))return null;
+        let at=indexOf(input,';',slash+1);if(at<0)at=input.length;
+        let subtypeEnd=at;while(subtypeEnd>slash+1&&httpSpace(code(input,subtypeEnd-1)))subtypeEnd--;
+        const subtype=slice(input,slash+1,subtypeEnd);
+        if(!matches(token,subtype))return null;
+        const parameters=new NativeMap();
+        while(at<input.length) {
+            at++;
+            while(at<input.length&&httpSpace(code(input,at)))at++;
+            let nameEnd=at;while(nameEnd<input.length&&code(input,nameEnd)!==59&&code(input,nameEnd)!==61)nameEnd++;
+            const name=asciiLower(slice(input,at,nameEnd));at=nameEnd;
+            if(at<input.length){if(code(input,at)===59)continue;at++;}
+            if(at>=input.length)break;
+            let value;
+            if(code(input,at)===34){const quoted=quotedString(input,at,true);value=quoted[0];at=quoted[1];while(at<input.length&&code(input,at)!==59)at++;}
+            else {
+                let valueEnd=indexOf(input,';',at);if(valueEnd<0)valueEnd=input.length;
+                value=slice(input,at,valueEnd);at=valueEnd;
+                let end=value.length;while(end>0&&httpSpace(code(value,end-1)))end--;
+                if(end<value.length)value=slice(value,0,end);
+                if(!value)continue;
+            }
+            if(name&&matches(token,name)&&matches(quotedTokens,value)&&!apply(mapHas,parameters,[name]))apply(mapSet,parameters,[name,value]);
+        }
+        return record({essence:asciiLower(type)+'/'+asciiLower(subtype),parameters});
+    }
+    /* Fetch "extract a MIME type" (https://fetch.spec.whatwg.org/#concept-header-extract-mime-type)
+       of a header list, over "get, decode, and split" Content-Type: the MIME type, or null. */
+    function extractMIME(s) {
+        const raw=headerValue(s,'content-type');
+        if(raw===null)return null;
+        const values=newList();let at=0,temporary='';
+        for(;;) {
+            let stop=at;while(stop<raw.length&&code(raw,stop)!==34&&code(raw,stop)!==44)stop++;
+            temporary+=slice(raw,at,stop);at=stop;
+            if(at<raw.length&&code(raw,at)===34){const quoted=quotedString(raw,at,false);temporary+=quoted[0];at=quoted[1];if(at<raw.length)continue;}
+            add(values,trim(temporary,tabSpace));temporary='';
+            if(at>=raw.length)break;
+            at++;
+        }
+        let charset=null,essence=null,mimeType=null;
+        for(let i=0;i<values.length;i++) {
+            const parsed=parseMIME(values[i]);
+            if(parsed===null||parsed.essence==='*/*')continue;
+            mimeType=parsed;
+            if(mimeType.essence!==essence){charset=apply(mapHas,mimeType.parameters,['charset'])?apply(mapGet,mimeType.parameters,['charset']):null;essence=mimeType.essence;}
+            else if(!apply(mapHas,mimeType.parameters,['charset'])&&charset!==null)apply(mapSet,mimeType.parameters,['charset',charset]);
+        }
+        return mimeType;
+    }
     class Headers {
         constructor(init=undefined){
             const converted=init===undefined?undefined:headersInit(init);
@@ -902,6 +979,65 @@ function fetchInterfaces(realm) {
             return fetchCore(url,q,undefined,forcePreflight,'',false,record({timeout}),'xmlhttprequest');
         },
         xhrMetadata(response){const s=slot(responseSlots,response,'Response');return {status:s.status,statusText:s.statusText,url:s.url,headers:s.headers};},
+        /* Fetch "extract a MIME type" of a Headers object of this realm (null: none), and MIME
+           Sniffing "parse a MIME type" (XHR's response and override MIME types). */
+        mimeType(headers){return headers===null||headers===undefined?null:extractMIME(slot(headerSlots,headers,'Headers'));},
+        parseMIME(text){return parseMIME(str(text));},
+        /* HTML's EventSource connection (https://html.spec.whatwg.org/multipage/server-sent-events.html#dom-eventsource,
+           consulted 2026-10-28; js_event_source.js): "create a potential-CORS request" for the URL
+           (a serialized URL record) with the empty destination and the CORS attribute state Use
+           Credentials (credentials true: credentials mode "include") or Anonymous ("same-origin"),
+           so mode "cors" and the use-URL-credentials flag set (a URL with credentials is not the
+           Request constructor's TypeError); this realm's settings object as its client (referrer
+           "about:client"); `Accept: text/event-stream`; cache mode "no-store"; initiator type
+           "other"; and, when lastEventId is not empty, the `Last-Event-ID` the source sets to
+           reestablish the connection (lastEventId's UTF-8 bytes). It is a CORS-unsafe request-header
+           name, so a cross-origin reconnection is preflighted like any request's.
+           process(kind, value, resume) gets, in order: Fetch's processResponse ("response":
+           {status, url, essence}, url the response's URL after redirects, essence its extracted MIME
+           type's, '' for none), the body's chunks ("chunk": an ArrayBuffer), then either the end of
+           the body ("end": undefined, or the network error that ended the body) or, instead of a
+           response, a network error ("error": the error, an AbortError DOMException when the
+           fetch was aborted). After "response" and each "chunk" the next comes on resume(). A
+           transport that buffers, and a blob: URL, bring the whole body as one chunk. cancel()
+           aborts the fetch; process gets nothing more. */
+        eventSource(url,credentials,lastEventId,process){
+            const c=signals.controller(),s=newRequestRecord(url);
+            s.credentials=credentials?'include':'same-origin';s.cache='no-store';
+            const headers=makeHeaders(undefined,'request'),list=headerSlots.get(headers).list;
+            add(list,pair('accept','text/event-stream'));
+            if(lastEventId!==''){
+                const bytes=apply(encode,new Encoder(),[lastEventId]),length=apply(taLength,bytes,[]);let value='';
+                for(let i=0;i<length;i++)value+=fromCharCode(bytes[i]);
+                add(list,pair('last-event-id',value));
+            }
+            s.headers=headers;s.signal=c.signal;
+            let finished=false,responded=false;
+            const end=(kind,value)=>{if(finished)return;finished=true;process(kind,value,()=>{});};
+            /* processResponse: the response's status, URL and MIME type. */
+            const respond=(response,resume)=>{
+                const m=slot(responseSlots,response,'Response'),mime=extractMIME(headerSlots.get(m.headers));
+                responded=true;process('response',record({status:m.status,url:m.url,essence:mime===null?'':mime.essence}),resume);
+            };
+            const observer=(event,value,resume)=>{
+                if(finished)return;
+                if(event==='headers')respond(value,resume);
+                else if(event==='chunk')process('chunk',value,resume);
+                else if(event==='end')end(responded?'end':'error',value);
+            };
+            const started=fetchCore(requestObject(s,{bytes:null,used:false,abort:null}),undefined,observer,false,'',true,null,'other');
+            define(started,'constructor',{value:promiseConstructor});
+            apply(then,started,[response=>{
+                /* A response the observer did not see: a buffered one, its body whole. */
+                if(finished||responded)return;
+                respond(response,()=>{});
+                if(finished)return;
+                const b=slot(bodySlots,response,'Body'),bytes=b.bytes;b.bytes=null;b.used=true;
+                if(bytes!==null&&apply(abLength,bytes,[])!==0)process('chunk',bytes,()=>{});
+                end('end',undefined);
+            },error=>end(responded?'end':'error',error)]);
+            return record({cancel(){if(finished)return;finished=true;c.abort();}});
+        },
         /* Cache Storage's view of this realm's Fetch objects (js_cache_storage.js): a record of a
            Request's or a Response's own request or response (never its page-mutable getters), the
            objects a match makes of stored ones (immutable headers, a new signal), and the fetch of
