@@ -24,6 +24,7 @@ struct web_html_policy {
     struct web_html_policy_rule *first, *last;
     char *self_url;
     struct web_url_parser *urls; /* this list's own URL parser, made on first use */
+    int status; /* §2.4.1: the status of the response the list came with; 0 for none */
 };
 bool html_policy_requires_script(const web_doc *document);
 /* Source-list decision only. Callers must report every denied rule and block

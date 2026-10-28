@@ -710,6 +710,7 @@ JSValue __js_printf_like(2, 3) JS_ThrowTypeError(JSContext *ctx, const char *fmt
 JSValue __js_printf_like(2, 3) JS_ThrowReferenceError(JSContext *ctx, const char *fmt, ...);
 JSValue __js_printf_like(2, 3) JS_ThrowRangeError(JSContext *ctx, const char *fmt, ...);
 JSValue __js_printf_like(2, 3) JS_ThrowInternalError(JSContext *ctx, const char *fmt, ...);
+JSValue __js_printf_like(2, 3) JS_ThrowEvalError(JSContext *ctx, const char *fmt, ...);
 JSValue JS_ThrowOutOfMemory(JSContext *ctx);
 
 void __JS_FreeValue(JSContext *ctx, JSValue v);
@@ -1126,6 +1127,8 @@ JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels);
 const void *JS_GetRunningFunction(JSRuntime *rt);
 int JS_DescribeFunction(JSContext *ctx, const void *function, char *name, int name_size,
                         char *filename, int filename_size, int *column);
+/* Nocturne: the running author script's name, line and column (0: none). */
+int JS_GetScriptLocation(JSContext *ctx, char *filename, int filename_size, int *column);
 /* only exported for os.Worker() */
 JSValue JS_LoadModule(JSContext *ctx, const char *basename,
                       const char *filename);

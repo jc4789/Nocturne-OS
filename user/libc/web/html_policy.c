@@ -306,6 +306,13 @@ bool html_policy_init(web_doc *d,const char *headers,const web_doc *inherit){
             if((enforce||report) && !list(d,colon+1,end,report,false))return false;}
         p=end;while(*p=='\r'||*p=='\n')p++;
     }
+    /* The transport puts the response's status line first ("HTTP/1.1 200 ");
+       a document with no response of its own (about:blank, srcdoc) has 0. */
+    if(d->html_policy && headers && !strncmp(headers,"HTTP/",5)){
+        const char *s=headers+5;while(*s && *s!=' ' && *s!='\r' && *s!='\n')s++;
+        if(*s==' ' && isdigit((unsigned char)s[1]) && isdigit((unsigned char)s[2]) && isdigit((unsigned char)s[3]))
+            d->html_policy->status=(s[1]-'0')*100+(s[2]-'0')*10+(s[3]-'0');
+    }
     return self_origin(d,headers?d->url:NULL);
 }
 /* The bare token of a structured-field item, without its parameters. Field

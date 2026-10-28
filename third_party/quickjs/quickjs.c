@@ -8198,6 +8198,19 @@ JSValue __attribute__((format(printf, 2, 3))) JS_ThrowRangeError(JSContext *ctx,
     return val;
 }
 
+/* Nocturne: HostEnsureCanCompileStrings refuses with an EvalError (CSP3
+   §4.4.1), from the host's dynamic code check. */
+JSValue __attribute__((format(printf, 2, 3))) JS_ThrowEvalError(JSContext *ctx, const char *fmt, ...)
+{
+    JSValue val;
+    va_list ap;
+
+    va_start(ap, fmt);
+    val = JS_ThrowError(ctx, JS_EVAL_ERROR, fmt, ap);
+    va_end(ap);
+    return val;
+}
+
 JSValue __attribute__((format(printf, 2, 3))) JS_ThrowInternalError(JSContext *ctx, const char *fmt, ...)
 {
     JSValue val;
@@ -31759,6 +31772,48 @@ static void atom_text(JSContext *ctx, char *buf, int buf_size, JSAtom atom)
     text = atom == JS_ATOM_NULL ? "" : JS_AtomGetStr(ctx, buf, buf_size, atom);
     if (text != buf)
         snprintf(buf, buf_size, "%s", text);
+}
+
+/* Nocturne: where the running author script is, for a report that names its
+   source (CSP's "create a violation object for global"): the innermost frame
+   of a bytecode function that is neither platform script nor code compiled
+   from a string. Its script's name goes into the buffer; returns its line,
+   with the column in *column, or 0 (and an empty name) when none runs. Runs no
+   JavaScript and leaves any pending exception alone. */
+int JS_GetScriptLocation(JSContext *ctx, char *filename, int filename_size, int *column)
+{
+    JSStackFrame *sf;
+    if (filename_size > 0)
+        filename[0] = '\0';
+    if (column)
+        *column = 0;
+    for (sf = ctx->rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
+        JSObject *p;
+        JSFunctionBytecode *b;
+        int line_num, col_num = 0;
+        if (sf->js_mode & JS_MODE_BACKTRACE_BARRIER)
+            break;
+        if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+            continue;
+        p = JS_VALUE_GET_OBJ(sf->cur_func);
+        if (!js_class_has_bytecode(p->class_id))
+            continue;
+#ifdef CONFIG_NOCTURNE
+        if (platform_frame(ctx, sf))
+            continue;
+#endif
+        b = p->u.func.function_bytecode;
+        if (!b->has_debug || b->is_direct_or_indirect_eval || !sf->cur_pc)
+            continue;
+        line_num = find_line_num(ctx, b, sf->cur_pc - b->byte_code_buf - 1, &col_num);
+        if (!line_num)
+            continue;
+        atom_text(ctx, filename, filename_size, b->debug.filename);
+        if (column)
+            *column = col_num;
+        return line_num;
+    }
+    return 0;
 }
 
 int JS_DescribeFunction(JSContext *ctx, const void *function, char *name, int name_size,
