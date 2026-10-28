@@ -7299,6 +7299,9 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.float_shape=y.float_shape=NULL;
     /* same_translation() saw whether there is an offset transform; where it puts the box is paint's */
     x.offset=y.offset=NULL;
+    /* a gap decoration's segments are layout's (layout.c records them); colour and style paint only */
+    if(!css_gap_rules_layout_equal(x.gap_rules,y.gap_rules))return false;
+    x.gap_rules=y.gap_rules=NULL;
     /* same_translation() decided every geometric effect of the transform
        properties; their values and arena addresses are paint state. */
     x.transform=y.transform=NULL;memset(&x.translate,0,sizeof x.translate);memset(&y.translate,0,sizeof y.translate);
@@ -7393,7 +7396,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
         !equal_string(a->svg_stroke.ref, b->svg_stroke.ref) || !shadows_equal(a->box_shadow, b->box_shadow) ||
         !filters_equal(a->filter, b->filter) || !css_shape_equal(a->clip_path, b->clip_path) ||
         !css_float_shape_equal(a->float_shape, b->float_shape) || !css_offset_equal(a->offset, b->offset) ||
-        !transforms_equal(a->transform, b->transform) ||
+        !css_gap_rules_equal(a->gap_rules, b->gap_rules) || !transforms_equal(a->transform, b->transform) ||
         !transforms_equal(a->rotate, b->rotate) || !transforms_equal(a->scale, b->scale) ||
         !gradients_equal(a->gradient, b->gradient) || !vars_equal(a->vars, b->vars) ||
         !equal_tracks(a->grid_cols, b->grid_cols) || !equal_tracks(a->grid_rows, b->grid_rows) ||
@@ -7432,7 +7435,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     memset(&x.motion, 0, sizeof x.motion); memset(&y.motion, 0, sizeof y.motion);
     x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;
     x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = NULL; x.clip_path = y.clip_path = NULL;
-    x.float_shape = y.float_shape = NULL; x.offset = y.offset = NULL; /* the groups compared above */
+    x.float_shape = y.float_shape = NULL; x.offset = y.offset = NULL; x.gap_rules = y.gap_rules = NULL; /* the groups compared above */
     x.transform = y.transform = x.rotate = y.rotate = x.scale = y.scale = NULL;
     x.gradient = y.gradient = NULL; x.vars = y.vars = NULL;
     x.color_inherited = y.color_inherited = x.color_own = y.color_own = NULL; x.color_scheme_text = y.color_scheme_text = NULL;

@@ -1,4 +1,5 @@
-"""図形の値の持ち主（shape.c）を、性質の表（cssprop.c）と動きの値の層（css_anim_*）を通して host で確かめる。
+"""図形の値の持ち主（shape.c）と gap の飾りの値を、性質の表（cssprop.c）と動きの値の層（css_anim_*）を通して
+host で確かめる。
 
 WPT の css-shapes（shape-functions・parsing・animation）、css-masking の clip-path（parsing・
 animations）、motion（parsing・animation）の頁から、試験の呼出し（test_valid_value・
@@ -6,14 +7,15 @@ test_invalid_value・test_computed_value・test_interpolation・test_no_interpol
 test_composition）を node で取り出し、shape.c・cssprop.c を host の clang で組んだ道具
 （tests/css_shapes_native_cases.c）に渡して、WPT の比べ方で照らす。補間と合成は
 interpolation-testcommon.js の normalizeValue（数は小数 2 桁、字句の間に空白）で、期待は
-その文字の計算値と比べる。
+その文字の計算値と比べる。--group gaps では WPT の css-gaps（parsing・animation）の頁を同じ道具で照らす
+（頁の #target の font-size と color を要素に与える）。
 
 guest の WPT の代わりではない。CSSOM の宣言の塊・cascade・var()・時間の模型（animation.c）・
 配置と描画は通らない。数えないもの：test_shorthand_value（CSSOM が shorthand の longhand の
 文字を持つかどうかは宣言の塊の仕事）、補間の端が neutral・CSS 全体の語（cascade の仕事）。
 補間は CSS animation の流儀（離散は 0.5 で入れ替わる）だけを試す。
 
-  python -X utf8 tests/check_css_shapes_native.py [--verbose] [--file 名前の一部] [--out 出力の場所]
+  python -X utf8 tests/check_css_shapes_native.py [--group shapes|gaps] [--verbose] [--file 名前の一部] [--out 出力の場所]
 """
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -25,15 +27,21 @@ import sys
 
 root = Path(__file__).resolve().parent.parent
 wpt = Path(os.environ.get("NOCTURNE_WPT", "D:/Programes/cloned repos/wpt")) / "css"
-pages = (sorted(p for p in (wpt / "css-shapes/shape-functions").glob("*.html") if re.search(r"-(valid|invalid|computed|parsing)\.html$", p.name)) +
-         sorted((wpt / "css-shapes/parsing").glob("*.html")) +
-         sorted((wpt / "css-masking/parsing").glob("clip-path-*.html")) +
-         sorted((wpt / "motion/parsing").glob("*.html")) +
-         sorted((wpt / "css-shapes/animation").glob("*.html")) +
-         sorted((wpt / "css-masking/animations").glob("clip-path-*.html")) +
-         [wpt / "css-masking/clip-path/animations/clip-path-interpolation-discrete.html"] +
-         sorted((wpt / "motion/animation").glob("*.html")))
-out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else root / "build/check-css-shapes"
+group = sys.argv[sys.argv.index("--group") + 1] if "--group" in sys.argv else "shapes"
+if group == "gaps":
+    pages = sorted((wpt / "css-gaps/parsing").glob("*.html")) + sorted((wpt / "css-gaps/animation").glob("*.html"))
+elif group == "shapes":
+    pages = (sorted(p for p in (wpt / "css-shapes/shape-functions").glob("*.html") if re.search(r"-(valid|invalid|computed|parsing)\.html$", p.name)) +
+             sorted((wpt / "css-shapes/parsing").glob("*.html")) +
+             sorted((wpt / "css-masking/parsing").glob("clip-path-*.html")) +
+             sorted((wpt / "motion/parsing").glob("*.html")) +
+             sorted((wpt / "css-shapes/animation").glob("*.html")) +
+             sorted((wpt / "css-masking/animations").glob("clip-path-*.html")) +
+             [wpt / "css-masking/clip-path/animations/clip-path-interpolation-discrete.html"] +
+             sorted((wpt / "motion/animation").glob("*.html")))
+else:
+    sys.exit(f"群は shapes か gaps：{group}")
+out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else root / f"build/check-css-{group}"
 out.mkdir(parents=True, exist_ok=True)
 # the repository's tools (a worktree has them in the main checkout above it)
 cc = next(p / "tools/msys64/ucrt64/bin/clang.exe" for p in (root, *root.parents)
@@ -66,6 +74,8 @@ if not node:
 collector = r"""
 const fs = require('fs');
 const calls = [];
+// a crash test's own script (an async function using what node lacks) records nothing
+process.on('unhandledRejection', () => {});
 globalThis.test_valid_value = function (p, v, s) {
   calls.push({kind: 'valid', args: [p, v, arguments.length < 3 ? v : s]});
 };
@@ -95,7 +105,9 @@ globalThis.test = () => calls.push({kind: 'other', args: []});
 globalThis.test_shorthand_value = () => calls.push({kind: 'shorthand', args: []});
 globalThis.promise_test = globalThis.async_test = globalThis.test;
 globalThis.setup = globalThis.add_completion_callback = () => {};
-const element = new Proxy(function () {}, {get: () => element, apply: () => element, set: () => true});
+// what the page reads from the document (a computed value it builds an expectation from) is a marker
+const element = new Proxy(function () {}, {get: (t, k) => k === Symbol.toPrimitive ? () => '\u0000page' : element,
+                                           apply: () => element, set: () => true});
 globalThis.document = new Proxy({}, {get: () => () => element});
 globalThis.window = globalThis;
 globalThis.getComputedStyle = () => element;
@@ -141,9 +153,12 @@ class Tool:
         return (out / "answers.txt").read_text(encoding="utf-8").split("\n")[:len(requests)]
 
 def page_font(page):
-    """the font-size the page gives its target (computed values of em)"""
+    """the font-size the page gives its target (computed values of em), and its color after a ';'
+    (computed values of currentcolor) when it gives one"""
     m = re.search(r"font-size:\s*(\d+(?:\.\d+)?)px", page)
-    return m.group(1) if m else "16"
+    font = m.group(1) if m else "16"
+    c = re.search(r"#target\s*\{[^}]*?(?<![-\w])color:\s*([^;}]+)", page)
+    return font + ";" + c.group(1).strip() if c else font
 
 tool = Tool()
 only = sys.argv[sys.argv.index("--file") + 1] if "--file" in sys.argv else None
@@ -174,6 +189,9 @@ for path in pages:
             continue
         if kind not in ("valid", "invalid", "computed", "interpolation", "composition"):
             continue
+        if any(isinstance(a, str) and "\u0000page" in a for a in args):
+            skip("頁が文書から読む値")
+            continue
         prop = args[0]
         if kind in ("valid", "invalid"):
             if "var(" in args[1] or args[1].strip().lower() in wide:
@@ -195,6 +213,37 @@ for path in pages:
                 continue
             cases.append((path.name, kind, f"[{under}] {from_op} {a} → {to_op} {b} @{at}",
                           ("A", prop, font, under, from_op, a, to_op, b, repr(float(at))), want))
+# The accumulation pages of css-gaps write their element.animate() calls in test() bodies, which the
+# collector does not read: their inputs and expectations, as written there (underlying value, the two
+# keyframes, composite, currentTime / duration).
+if group == "gaps" and (not only or "accumulation" in only):
+    animate = {
+        "rule-width-accumulation-auto-repeaters.html": [
+            ("column-rule-width", "repeat(auto, 10px, 20px)", "accumulate", "repeat(auto, 30px)", "repeat(auto, 50px)", "repeat(auto, 50px, 60px)"),
+            ("column-rule-width", "repeat(auto, 10px)", "accumulate", "repeat(auto, 20px, 30px)", "repeat(auto, 40px, 50px)", "repeat(auto, 40px, 50px)"),
+            ("column-rule-width", "repeat(auto, 10px, 20px)", "accumulate", "repeat(auto, 1px, 2px, 3px)", "repeat(auto, 1px, 2px, 3px)",
+             "repeat(auto, 11px, 22px, 13px, 21px, 12px, 23px)"),
+            ("column-rule-width", "repeat(auto, 10px, 20px)", "add", "repeat(auto, 30px)", "repeat(auto, 50px)", "repeat(auto, 50px, 60px)"),
+            ("row-rule-width", "repeat(auto, 10px, 20px)", "accumulate", "repeat(auto, 30px)", "repeat(auto, 50px)", "repeat(auto, 50px, 60px)"),
+        ],
+        "rule-color-accumulation-auto-repeaters.html": [
+            ("column-rule-color", "repeat(auto, rgb(100, 0, 0), rgb(0, 100, 0))", "accumulate", "repeat(auto, rgb(50, 50, 50))",
+             "repeat(auto, rgb(50, 50, 50))", "repeat(auto, rgb(150, 50, 50), rgb(50, 150, 50))"),
+            ("column-rule-color", "repeat(auto, rgb(50, 50, 50))", "accumulate", "repeat(auto, rgb(100, 0, 0), rgb(0, 100, 0))",
+             "repeat(auto, rgb(100, 0, 0), rgb(0, 100, 0))", "repeat(auto, rgb(150, 50, 50), rgb(50, 150, 50))"),
+            ("column-rule-color", "repeat(auto, rgb(100, 0, 0), rgb(0, 100, 0))", "add", "repeat(auto, rgb(50, 50, 50))",
+             "repeat(auto, rgb(50, 50, 50))", "repeat(auto, rgb(150, 50, 50), rgb(50, 150, 50))"),
+            ("row-rule-color", "repeat(auto, rgb(100, 0, 0), rgb(0, 100, 0))", "accumulate", "repeat(auto, rgb(50, 50, 50))",
+             "repeat(auto, rgb(50, 50, 50))", "repeat(auto, rgb(150, 50, 50), rgb(50, 150, 50))"),
+        ],
+    }
+    for name, rows in animate.items():
+        page = (wpt / "css-gaps/animation" / name).read_text(encoding="utf-8")
+        for prop, under, op, a, b, want in rows:
+            if want not in page:
+                sys.exit(f"{name} の期待が頁と違う：{want}")
+            cases.append((name, "composition", f"[{under}] {op} {a} → {b} @0.5",
+                          ("A", prop, "16", under, op, a, op, b, "0.5"), want))
 # an animated value's expectation is the computed value of what it names
 expect_index = {}
 expected_requests = []

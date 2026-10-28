@@ -421,6 +421,55 @@ bool css_offset_shorthand_serialize(const struct css_offset *o, sbuf *out, web_d
 /* CSSOM specified value of a declared shape, Motion Path, shape-margin or shape-image-threshold
    value (name: the property); false leaves the authored text */
 bool css_shape_specified(const char *name, const char *v, size_t n, sbuf *out);
+/* CSS Gap Decorations 1 (css-gaps-1 §3, §4): the lines a container paints in its gaps. A style
+   holds them as one group (style_t's gap_rules); axis 0 is the column gaps' (column-rule-*), 1
+   the row gaps' (row-rule-*). */
+enum css_rule_list_kind { CSS_RULE_COLOR, CSS_RULE_STYLE, CSS_RULE_WIDTH };
+/* one value of a <line-color-list>, <line-style-list> or <line-width-list> (§4.1-4.3) */
+union css_rule_value {
+    struct { uint32_t argb; const struct css_color_value *exact; } color; /* as a shadow's colour */
+    uint8_t style; /* BS_* */
+    float width;   /* px, snapped as a border width */
+};
+/* an item of a list (§4.5): the values [first, first + count) once (repeat 0), repeat times (an
+   integer repeater), or as many times as the gaps between the other items need (CSS_RULE_AUTO) */
+#define CSS_RULE_AUTO UINT32_MAX
+struct css_rule_item { uint32_t repeat, first, count; };
+struct css_rule_list {
+    const struct css_rule_item *items;
+    const union css_rule_value *values;
+    uint32_t nitems, nvalues;
+};
+/* <inset-value> (§3.3): a <length-percentage> of the crossing gap width, or overlap-join */
+struct css_rule_inset { len_t length; bool join; };
+enum { CSS_RULE_CAP_START, CSS_RULE_CAP_END, CSS_RULE_JUNCTION_START, CSS_RULE_JUNCTION_END };
+enum { CSS_RULE_BREAK_NONE, CSS_RULE_BREAK_NORMAL, CSS_RULE_BREAK_INTERSECTION };
+enum { CSS_RULE_ITEMS_ALL, CSS_RULE_ITEMS_AROUND, CSS_RULE_ITEMS_BETWEEN, CSS_RULE_ITEMS_NORMAL };
+enum { CSS_RULE_ROW_OVER_COLUMN, CSS_RULE_COLUMN_OVER_ROW };
+struct css_gap_axis {
+    struct css_rule_list list[3];     /* by enum css_rule_list_kind */
+    struct css_rule_inset inset[4];   /* cap-start, cap-end, junction-start, junction-end */
+    uint8_t rule_break, visibility;   /* CSS_RULE_BREAK_*, CSS_RULE_ITEMS_* */
+};
+struct css_gap_rules {
+    struct css_gap_axis axis[2];
+    uint8_t overlap; /* rule-overlap */
+};
+extern const struct css_gap_rules css_gap_rules_initial;
+/* the same computed values (NULL: the initial ones); layout: those the segments' geometry takes
+   (widths, insets, breaks, visibility), whether the style holds the group at all included */
+bool css_gap_rules_equal(const struct css_gap_rules *a, const struct css_gap_rules *b);
+bool css_gap_rules_layout_equal(const struct css_gap_rules *a, const struct css_gap_rules *b);
+/* §4.6: the value list l gives gap index of count gaps */
+union css_rule_value css_rule_value_at(const struct css_rule_list *l, uint32_t index, uint32_t count);
+/* the gap decoration segments a container's layout found (layout.c), in its content box: each
+   runs along its axis from s to e, centred across it on centre; gap is its place in §4.6's order */
+struct gap_segment { float s, e, centre; uint32_t gap; uint8_t axis; };
+struct gap_decorations {
+    const struct gap_segment *seg;
+    uint32_t n;
+    uint32_t gaps[2]; /* the gaps of each axis, the count the value lists assign to */
+};
 /* A computed shape's geometry against its reference box r (x y w h, any one space). */
 void css_shape_ellipse(const struct css_shape *s, const float r[4], double centre[2], double radii[2]); /* circle(), ellipse() */
 /* inset(): the inner rectangle (x y w h) and its corner radii TL TR BR BL, scaled to fit (css-backgrounds-3 §5.5) */
@@ -653,6 +702,7 @@ typedef struct style {
        style holds it: cssprop.c writes a longhand into a copy and points the style at the copy. */
     const struct css_float_shape *float_shape; /* shape-outside, shape-margin, shape-image-threshold */
     const struct css_offset *offset;           /* Motion Path */
+    const struct css_gap_rules *gap_rules;     /* gap decorations */
     struct css_clip_rect clip;
     const struct css_transform *transform;
     struct css_translate translate;
@@ -693,6 +743,9 @@ static inline const struct css_float_shape *css_style_float_shape(const style_t 
 }
 static inline const struct css_offset *css_style_offset(const style_t *s) {
     return s->offset ? s->offset : &css_offset_initial;
+}
+static inline const struct css_gap_rules *css_style_gap_rules(const style_t *s) {
+    return s->gap_rules ? s->gap_rules : &css_gap_rules_initial;
 }
 
 /* ---------------------------------------------------------------- stylesheets */
@@ -1099,6 +1152,9 @@ typedef struct box {
     int ndecos;
     struct line_fragment *lines;
     int nlines;
+    /* a grid or flex container's gap decoration segments (layout_mem), NULL when its style holds
+       no gap_rules group */
+    const struct gap_decorations *gap_decorations;
     bool clamp_hidden, clamp_truncated;
     bool ellipsis_hidden; /* paint-only elision of an atomic inline, never hit/layout */
     uint64_t ellipsis_hidden_revision;
