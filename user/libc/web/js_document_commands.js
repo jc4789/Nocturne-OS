@@ -152,13 +152,20 @@ const documentCommandBridge=(()=>{
         define(Document.prototype,name,{configurable:true,writable:true,value:{[name](commandId){
             return query(this,mode,args(this,arguments.length,commandId));
         }}[name]});
+    /* A command run from a listener of the events of a command that is running
+       (its input event, or a mutation event) does nothing and returns false:
+       the editing layer's steps and its history assume one command at a time
+       (w3c/editing#200; WPT editing/other/recursive-exec-command-calls). */
+    let executing=false;
     define(Document.prototype,'execCommand',{configurable:true,writable:true,value:{execCommand(commandId,showUI=false,value=''){
         const cmd=args(this,arguments.length,commandId);showUI=!!showUI;value=string(value);
-        if(clipboard[cmd])return false;
+        if(clipboard[cmd]||executing)return false;
         const control=textControl(this);
-        if(control&&textCommands[cmd]!==undefined)return textControlEdit(this,cmd,value);
-        if(this!==realmDocument||(control&&(!miscellaneous[cmd]||cmd==='undo'||cmd==='redo')))return false;
-        return editing().exec(cmd,showUI,value);
+        if(!(control&&textCommands[cmd]!==undefined)&&
+           (this!==realmDocument||(control&&(!miscellaneous[cmd]||cmd==='undo'||cmd==='redo'))))return false;
+        executing=true;
+        try{return control&&textCommands[cmd]!==undefined?textControlEdit(this,cmd,value):editing().exec(cmd,showUI,value);}
+        finally{executing=false;}
     }}.execCommand});
 
     /* HTML: designMode.  On: reset the active range's boundary points to the
