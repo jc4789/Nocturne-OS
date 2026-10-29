@@ -58,6 +58,7 @@ CODE = {".c", ".h", ".inc", ".cc", ".cpp", ".cxx", ".hh", ".hpp",
 SURE = 0.8  # これより確からしさの低いつながり（名前だけで推したもの）は出さない
 QUIET = datetime.timedelta(hours=2)  # ユーザーのいない時間がこれを越えるごとに、節目の報告を促す
 MANY_EDITS = 40  # 模型を書かずにこれだけ編集したら、模型を今に合わせるよう促す
+MANY_MEASURES = 12  # 編集なしに測る命令がこれだけ続いたら、読んで直す側へ戻るよう促す。測る回は欠陥を直さない
 JA = re.compile(r"[぀-ヿ一-鿿]")
 
 
@@ -456,13 +457,15 @@ def reground(ws, state, source):
     events = ws.events()
     last_user = last_time(events, "user")
     last_measure = last_time(events, "measure")
+    last_edit = last_time(events, "edit")
     starts = [datetime.datetime.fromisoformat(state["start"])] if state.get("start") else []
     start = min(starts + [event["t"] for event in events[:1]], default=None)
     flow, swaps = versions(events)
     head = (f"区切り（{ {'compact': '圧縮', 'fork': '分岐'}.get(source, '再開') }。"
             f"この会話の圧縮 {state.get('compactions', 0)} 回、ユーザーの最後の発言から {since(last_user)}、"
             f"最後に測って（ログ・撮影）から {since(last_measure) if last_measure else '一度も無い'}、"
-            f"その間の編集 {count_after(events, 'edit', last_measure)} 件、説明の入れ替わり {swaps} 回）。\n"
+            f"その間の編集 {count_after(events, 'edit', last_measure)} 件、"
+            f"最後の編集から測る命令 {count_after(events, 'measure', last_edit)} 件、説明の入れ替わり {swaps} 回）。\n"
             "要約は直前の作業を一番詳しく残す。下はフックが事象から書いた記録で、起きたことはこちらにある。"
             "次の一手へ進む前に、ユーザーの原文と自分の流れ（版・編集）を並べ、同じ方向を向いているかを見る。"
             "向いていなければ、なぜそうなったかが今の説明の一番になる。")
@@ -516,6 +519,19 @@ def milestone(ws, events, state):
     return "\n".join(out) or None
 
 
+def only_measuring(ws):
+    """直さずに測るばかりのとき、一度ずつ促す。測る回は欠陥を直さない。"""
+    events = ws.events()
+    measures = count_after(events, "measure", last_time(events, "edit"))
+    if measures < MANY_MEASURES or measures % MANY_MEASURES:
+        return None
+    ws.record("nudge", why="measure")
+    return (f"最後の編集から測る命令が {measures} 件、編集は無い。変える前の記録はもう取れているはず。"
+            "測る・比べる・確かめ直す回は欠陥を直さない。症状の層が分かっているなら、ログや撮影を重ねず、"
+            "コード（rg・codegraph で場所を絞り、原文を読む）と仕様の原文を読んで直す。直すまで測らない"
+            "（AGENTS.md「確かめ方」）。")
+
+
 def on_start(ws, data):
     source = data.get("source") or "startup"
     state = ws.state()
@@ -565,6 +581,7 @@ def on_tool(ws, data):
         command = args.get("command") or ""
         if any(mark in command for mark in MEASURE):
             ws.record("measure", text=one_line(command, 120))
+            return only_measuring(ws)
         return None
     path = args.get("file_path") or args.get("notebook_path")
     if not path:
