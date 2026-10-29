@@ -506,11 +506,14 @@ static int add_image_request(web_doc *d, const char *rel, bool css, bool retry_f
     int result=add_image_url(d,abs,retry_failed,preferred,image_upgrade,cors,referrer_policy);free(abs);return result;
 }
 static int add_image(web_doc *d, const char *rel, bool css) { return add_image_request(d, rel, css, false, -1,true,WEB_IMAGE_NO_CORS,WEBNET_REFERRER_DEFAULT); }
-int doc_css_image(web_doc *d, const struct css_image *image) {
+/* a CSS <image>'s url() in the document's images: cors WEB_IMAGE_NO_CORS (background-image,
+   list-style-image), or a CORS request's credentials mode (mask images, css-masking-1 §7.1: cors
+   mode, same-origin credentials; a response that fails the check is not drawn) */
+int doc_css_image(web_doc *d, const struct css_image *image, int cors) {
     if (!d || !image || image->kind != CSS_IMAGE_URL) return -1;
     struct css_image *cached = (struct css_image *)image; /* the value's cache of its document image */
     if (!cached->img) {
-        int i = add_image(d, image->url, true);
+        int i = add_image_request(d, image->url, true, false, -1, cors == WEB_IMAGE_NO_CORS, cors, WEBNET_REFERRER_DEFAULT);
         cached->img = i >= 0 ? i + 1 : -1;
     }
     return cached->img > 0 ? cached->img - 1 : -1;
@@ -1931,17 +1934,23 @@ static void bg_images(web_doc *d, style_t *st) {
         int i = add_image(d, st->bg_image, true);
         st->bg_img = i >= 0 ? i + 1 : 0;
     }
-    if (st && st->mask_image && !st->mask_img) {
-        int i = add_image(d, st->mask_image, true);
-        st->mask_img = i >= 0 ? i + 1 : 0;
+    /* the mask layers' images (css-masking-1 §7.1): CORS requests; a url() naming an element of the
+       document itself is no fetch */
+    const struct css_mask *mask = st ? css_style_mask(st) : NULL;
+    for (uint32_t layer = 0; mask && layer < mask->image.n; layer++) {
+        const struct css_image *image = mask->image.v[layer];
+        if (image && image->kind == CSS_IMAGE_URL && !image->img && !doc_url_local(d, image->url))
+            doc_css_image(d, image, WEB_IMAGE_ANONYMOUS);
     }
-    /* border-image-source and mask-border-source: the same images, fetched and decoded once */
+    /* border-image-source and mask-border-source (CORS, as mask images: css-masking-1 §8.1): the same
+       images, fetched and decoded once */
     if (st && st->border_image && st->border_image->source.url && !st->border_image_img) {
         int i = add_image(d, st->border_image->source.url, true);
         st->border_image_img = i >= 0 ? i + 1 : 0;
     }
     if (st && st->mask_border && st->mask_border->source.url && !st->mask_border_img) {
-        int i = add_image(d, st->mask_border->source.url, true);
+        int i = add_image_request(d, st->mask_border->source.url, true, false, -1, false, WEB_IMAGE_ANONYMOUS,
+                                  WEBNET_REFERRER_DEFAULT);
         st->mask_border_img = i >= 0 ? i + 1 : 0;
     }
 }

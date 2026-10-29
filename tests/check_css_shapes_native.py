@@ -10,7 +10,8 @@ interpolation-testcommon.js の normalizeValue（数は小数 2 桁、字句の�
 その文字の計算値と比べる。--group gaps では WPT の css-gaps（parsing・animation）の頁を同じ道具で照らす
 （頁の #target の font-size と color を要素に与える）。--group backgrounds では css-backgrounds の背景の層と
 border-image の頁（parsing・animations）、compositing の background-blend-mode、css-masking の mask-border の
-動きの頁を照らす。--group ui では css-ui の cursor・caret-color・accent-color の頁（parsing・animation）を
+動きの頁を照らす。--group masking では css-masking の mask の層の性質・mask の一括・mask-type・clip・clip-rule の
+parsing と動きの頁を照らす。--group ui では css-ui の cursor・caret-color・accent-color の頁（parsing・animation）を
 照らす（性質の表の G_UI の群）。
 --group fonts では css-fonts の parsing・animations の頁と、根にある数式・離散の動きの頁を照らす。
 
@@ -30,7 +31,7 @@ css-multicol の column-rule の頁（parsing・animation）も同じ性質な�
 --rev <版> は、その版の user/libc/web・user/include・common（git archive）を今の道具で組む
 （前の版と同じ道具で比べる）。
 
-  python -X utf8 tests/check_css_shapes_native.py [--group shapes|gaps|anchor|lists|backgrounds|ui|text|decor|fonts] [--verbose] [--file 名前の一部] [--out 出力の場所] [--rev 版]
+  python -X utf8 tests/check_css_shapes_native.py [--group shapes|gaps|anchor|lists|backgrounds|masking|ui|text|decor|fonts] [--verbose] [--file 名前の一部] [--out 出力の場所] [--rev 版]
 """
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -105,6 +106,13 @@ elif group == "backgrounds":
              sorted((wpt / "compositing/parsing").glob("background-blend-mode-*.html")) +
              sorted(p for p in (background / "animations").glob("*.html") if re.match(r"(background-position|border-image)", p.name)) +
              sorted((wpt / "css-masking/animations").glob("mask-border-*.html")))
+elif group == "masking":
+    # CSS Masking 1 の mask の層の性質（mask-image・-mode・-repeat・-position・-clip・-origin・-size・
+    # -composite と mask の一括）、mask-type、clip、clip-rule。clip-path は shapes、mask-border は backgrounds の群
+    masking = wpt / "css-masking"
+    pages = (sorted(p for p in (masking / "parsing").glob("*.html") if re.match(r"(mask-|clip-(computed|valid|invalid|rule))", p.name)) +
+             sorted(p for p in (masking / "animations").glob("*.html") if re.match(r"(mask-(image|no|position)|clip-(interpolation|composition))", p.name)) +
+             [masking / "clip-rule/clip-rule-no-interpolation.html"])
 elif group == "ui":
     pages = ([wpt / "css-ui/parsing" / f"{name}-{kind}.html" for name in ("cursor", "caret-color")
               for kind in ("valid", "invalid", "computed")] +
@@ -121,7 +129,7 @@ elif group == "fonts":
              sorted(p for p in fonts.glob("*.html") if re.search(r"(-interpolation-math-functions|-sign-function|"
                                                                  r"-calc|discrete-no-interpolation)\.html$", p.name)))
 else:
-    sys.exit(f"群は shapes・gaps・anchor・lists・backgrounds・ui・text・decor・fonts のどれか：{group}")
+    sys.exit(f"群は shapes・gaps・anchor・lists・backgrounds・masking・ui・text・decor・fonts のどれか：{group}")
 out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else root / f"build/check-css-{group}"
 out.mkdir(parents=True, exist_ok=True)
 # the repository's tools (a worktree has them in the main checkout above it)

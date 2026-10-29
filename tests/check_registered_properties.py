@@ -68,10 +68,15 @@ objects.mkdir(exist_ok=True)
 shared = root / "build/check-registered-properties/obj-shared"
 shared.mkdir(exist_ok=True)
 
+# the engine's headers: a unit that includes them is compiled again when one is newer (a style_t or
+# web_doc of another shape in a stale object reads the wrong fields)
+engine_headers = max(h.stat().st_mtime for d in (web, source / "user/include", source / "common") for h in d.glob("*.h"))
+
 def compile_once(src, flags, name, where=objects):
-    """an object for src, compiled again only when the source is newer"""
+    """an object for src, compiled again only when the source (or, for the engine, a header) is newer"""
     obj = where / (name + ".o")
-    if not obj.exists() or obj.stat().st_mtime < Path(src).stat().st_mtime:
+    newest = max(Path(src).stat().st_mtime, engine_headers if flags is engine_flags else 0)
+    if not obj.exists() or obj.stat().st_mtime < newest:
         subprocess.run([str(cc), *flags, "-c", str(src), "-o", str(obj)], cwd=root, env=env, check=True)
     return str(obj)
 

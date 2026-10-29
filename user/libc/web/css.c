@@ -9599,8 +9599,8 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.vars=y.vars=NULL; x.gradient=y.gradient=NULL; x.box_shadow=y.box_shadow=NULL;
     memset(x.corner_radius,0,sizeof x.corner_radius);memset(y.corner_radius,0,sizeof y.corner_radius);
     x.border_radius=y.border_radius=0; /* decoration clipping does not change layout */
-    x.bg_image=y.bg_image=x.mask_image=y.mask_image=NULL;
-    x.bg_img=y.bg_img=x.mask_img=y.mask_img=0;
+    x.bg_image=y.bg_image=NULL;x.mask=y.mask=NULL; /* mask layers paint over the laid-out boxes */
+    x.bg_img=y.bg_img=0;
     x.color=y.color=x.bg_color=y.bg_color=0;
     x.color_inherited=y.color_inherited=x.color_own=y.color_own=NULL;x.color_current=y.color_current=0;
     x.color_scheme=y.color_scheme=0;x.color_scheme_text=y.color_scheme_text=NULL;
@@ -9612,10 +9612,9 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.svg_stop_color=y.svg_stop_color=0;
     x.opacity=y.opacity=x.svg_fill_opacity=y.svg_fill_opacity=x.svg_stroke_opacity=y.svg_stroke_opacity=x.svg_stop_opacity=y.svg_stop_opacity=0;
     memset(x.grad,0,sizeof x.grad);memset(y.grad,0,sizeof y.grad);x.has_grad=y.has_grad=false;
-    x.bg_repeat=y.bg_repeat=x.bg_size_kind=y.bg_size_kind=x.mask_repeat=y.mask_repeat=x.mask_size_kind=y.mask_size_kind=0;
+    x.bg_repeat=y.bg_repeat=x.bg_size_kind=y.bg_size_kind=0;
     memset(x.bg_size,0,sizeof x.bg_size);memset(y.bg_size,0,sizeof y.bg_size);
-    memset(x.mask_pos,0,sizeof x.mask_pos);memset(y.mask_pos,0,sizeof y.mask_pos);
-    memset(x.mask_size,0,sizeof x.mask_size);memset(y.mask_size,0,sizeof y.mask_size);
+    x.svg_clip_rule=y.svg_clip_rule=0;
     return !memcmp(&x,&y,sizeof x);
 }
 
@@ -9673,7 +9672,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
         !css_content_equal(a->content, b->content) || !css_list_equal(a->list, b->list) ||
         !css_counters_equal(a->counters, b->counters) || !css_font_equal(a->font, b->font) ||
         !style_equal(a->marker, b->marker) ||
-        !equal_string(a->bg_image, b->bg_image) || !equal_string(a->mask_image, b->mask_image) ||
+        !equal_string(a->bg_image, b->bg_image) || !css_mask_equal(css_style_mask(a), css_style_mask(b)) ||
         !css_motion_equal(&a->motion, &b->motion) || !equal_string(a->svg_fill.ref, b->svg_fill.ref) ||
         !equal_string(a->svg_stroke.ref, b->svg_stroke.ref) || !shadows_equal(a->box_shadow, b->box_shadow) ||
         !filters_equal(a->filter, b->filter) || !filters_equal(a->backdrop_filter, b->backdrop_filter) ||
@@ -9699,13 +9698,11 @@ static bool style_equal(const style_t *a, const style_t *b) {
     len_t *xl[] = {&x.object_pos[0], &x.object_pos[1], &x.line_height, &x.svg_stroke_width, &x.width, &x.height,
                    &x.min_width, &x.max_width, &x.min_height, &x.max_height, &x.text_indent, &x.flex_basis,
                    &x.translate.xy[0], &x.translate.xy[1], &x.transform_origin[0], &x.transform_origin[1],
-                   &x.bg_size[0], &x.bg_size[1], &x.mask_pos[0], &x.mask_pos[1],
-                   &x.mask_size[0], &x.mask_size[1]};
+                   &x.bg_size[0], &x.bg_size[1]};
     len_t *yl[] = {&y.object_pos[0], &y.object_pos[1], &y.line_height, &y.svg_stroke_width, &y.width, &y.height,
                    &y.min_width, &y.max_width, &y.min_height, &y.max_height, &y.text_indent, &y.flex_basis,
                    &y.translate.xy[0], &y.translate.xy[1], &y.transform_origin[0], &y.transform_origin[1],
-                   &y.bg_size[0], &y.bg_size[1], &y.mask_pos[0], &y.mask_pos[1],
-                   &y.mask_size[0], &y.mask_size[1]};
+                   &y.bg_size[0], &y.bg_size[1]};
     for (size_t i = 0; i < sizeof xl / sizeof *xl; i++) {
         if (!css_length_equal(xl[i], yl[i])) return false;
         xl[i]->expr = yl[i]->expr = NULL;
@@ -9722,7 +9719,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     x.container_names = y.container_names = x.font_names = y.font_names = NULL; x.content = y.content = NULL;
     x.list = y.list = NULL; x.counters = y.counters = NULL; x.marker = y.marker = NULL; /* compared above */
     x.font = y.font = NULL;
-    x.bg_image = y.bg_image = x.mask_image = y.mask_image = NULL;
+    x.bg_image = y.bg_image = NULL; x.mask = y.mask = NULL;
     memset(&x.motion, 0, sizeof x.motion); memset(&y.motion, 0, sizeof y.motion);
     x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;
     x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = x.backdrop_filter = y.backdrop_filter = NULL;
@@ -9738,7 +9735,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     x.grid_areas = y.grid_areas = NULL;
     for (int i = 0; i < 4; i++) x.grid_place[i].name = y.grid_place[i].name = NULL;
     x.before = y.before = x.after = y.after = x.backdrop = y.backdrop = x.placeholder = y.placeholder = NULL;
-    x.bg_img = y.bg_img = x.mask_img = y.mask_img = 0; /* found from bg_image and mask_image after the cascade */
+    x.bg_img = y.bg_img = 0; /* found from bg_image after the cascade */
     x.border_image_img = y.border_image_img = x.mask_border_img = y.mask_border_img = 0; /* and from the sources */
     return !memcmp(&x, &y, sizeof x);
 }
@@ -9957,7 +9954,7 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
         static const char *const svg_properties[] = {
             "fill", "fill-opacity", "fill-rule", "stroke", "stroke-opacity", "stroke-width",
             "stroke-linecap", "stroke-linejoin", "stop-color", "stop-opacity", "color", "opacity",
-            "display", "visibility"
+            "display", "visibility", "clip-rule", "mask-type"
         };
         /* SVG presentation attributes participate at author specificity zero.
            Only null-namespace, exact-case attributes are presentation attributes. */
