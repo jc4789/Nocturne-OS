@@ -26,6 +26,11 @@ enum { WINDOW = 1, VIEW = 1 };
 static struct ui_session *ui;
 static window_t *w;   /* behind the engine's window: its state, fullscreen and handle */
 static canvas_t view; /* the surface */
+/* A paint into view reaches host_script_checkpoint, which takes the engine's events, and ui_surface
+   frees the surface it replaces: a new one asked for meanwhile is taken once no paint holds view. */
+static int view_painting;
+static bool view_asked;
+static int view_asked_w, view_asked_h;
 static bool browser_fullscreen;
 static web_doc *fullscreen_doc,*pip_doc;
 /* Direct scanout (win_direct, web_direct_open): the display shows a fullscreen WebGL canvas's frames
@@ -581,8 +586,11 @@ static void show_chrome(void) {
 static void draw_page(void) {
     canvas_t *c = &view;
     int pw = page_w(), ph = page_h();
-    if (tab->doc) web_paint(tab->doc, c, 0, 0, pw, ph, tab->scroll_x, tab->scroll_y);
-    else gfx_fill(c, 0, 0, pw, ph, RGB(255, 255, 255));
+    if (tab->doc) {
+        view_painting++;
+        web_paint(tab->doc, c, 0, 0, pw, ph, tab->scroll_x, tab->scroll_y);
+        view_painting--;
+    } else gfx_fill(c, 0, 0, pw, ph, RGB(255, 255, 255));
     devtools_draw_overlay(c);
     /* scrollbar */
     int x = view.w - SCRW;
@@ -1734,12 +1742,22 @@ static bool console_set(const char *text, size_t n) {
     memcpy(tab->console_input, text, n); tab->console_input[n] = 0;
     return true;
 }
+static void surface_take(int width, int height) {
+    if (view_painting) { view_asked = true; view_asked_w = width; view_asked_h = height; return; }
+    view_asked = false;
+    canvas_t *surface = ui_surface(ui, VIEW, width, height, 0);
+    if (!surface) { console_add("error", "Page surface allocation failed"); return; }
+    view = *surface;
+    tab->need_paint = true;
+    inbox_put((struct gui_event){.type = EV_RESIZE, .x = view.w, .y = view.h});
+}
 static void take_engine_events(void) {
     static char *text;
     static size_t text_capacity;
     size_t n;
     const void *p;
     bool echo = false;
+    if (view_asked) surface_take(view_asked_w, view_asked_h);
     while ((p = ui_session_peek(ui, &n))) {
         struct ui_event e;
         bool ok = ui_event_read(p, n, &e) && e.window == WINDOW;
@@ -1841,14 +1859,9 @@ static void take_engine_events(void) {
             if (e.flags & UI_GONE) w = NULL;
             inbox_put((struct gui_event){.type = EV_CLOSE});
             break;
-        case UI_EVENT_CANVAS: {
-            canvas_t *surface = ui_surface(ui, VIEW, (int)e.a, (int)e.b, 0);
-            if (!surface) { console_add("error", "Page surface allocation failed"); break; }
-            view = *surface;
-            tab->need_paint = true;
-            inbox_put((struct gui_event){.type = EV_RESIZE, .x = view.w, .y = view.h});
+        case UI_EVENT_CANVAS:
+            surface_take((int)e.a, (int)e.b);
             break;
-        }
         case UI_EVENT_POINTER: {
             pointer_x = (int)floor(e.a); pointer_y = (int)floor(e.b);
             uint32_t type = e.flags & UI_DOWN ? EV_MOUSE_DOWN : e.flags & UI_UP ? EV_MOUSE_UP : EV_MOUSE_MOVE;
