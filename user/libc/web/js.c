@@ -2653,7 +2653,7 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
             }
         }
     }
-    if (is_px) snprintf(out, sizeof out, "%gpx", (double)px);
+    if (is_px) snprintf(out, sizeof out, "%gpx", (double)(px == 0 ? 0 : px)); /* -0 serializes as 0 */
     if (!is_px && !out[0]) {
         /* Every other longhand the property table stores whole. */
         sbuf text={0};

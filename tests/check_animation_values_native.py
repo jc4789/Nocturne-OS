@@ -217,7 +217,9 @@ int main(void){
     EXPECT(computed("animation-duration","1s, 200ms"),"1s, 0.2s");
     EXPECT(computed("animation-duration","auto"),"auto");
     EXPECT(computed("animation-iteration-count","infinite, 2.5"),"infinite, 2.5");
-    EXPECT(computed("animation-name","none, foo, \"bar baz\""),"none, foo, \"bar baz\"");
+    /* a <string> name serializes as an identifier (WPT animation-name-computed.html: "multi word string") */
+    EXPECT(computed("animation-name","none, foo, \"bar baz\""),"none, foo, bar\\ baz");
+    EXPECT(computed("animation-name","\"none\", x\\yz"),"\"none\", xyz");
     EXPECT(computed("animation-name","\"\""),"PARSE"); /* parsing/animation-name-invalid.html */
     EXPECT(computed("animation-delay","-1s"),"-1s");
     EXPECT(computed("animation-direction","alternate-reverse, normal"),"alternate-reverse, normal");

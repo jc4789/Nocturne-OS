@@ -5443,14 +5443,19 @@ static size_t ident_token(const char *s, size_t n) {
 }
 /* a <custom-ident> (CSS Values 4 §6.6.1) that is the whole of s, decoded, which is not a CSS-wide
    keyword, default or excluded (ASCII case-insensitively); NULL when it is not one */
+/* the CSS-wide keywords and default, which no <custom-ident> is (CSS Values 4 §6.6.1) */
+static bool ident_reserved(const char *name, size_t n) {
+    static const char *const reserved[] = {"initial", "inherit", "unset", "revert", "revert-layer", "revert-rule",
+                                           "default"};
+    for (size_t i = 0; i < sizeof reserved / sizeof *reserved; i++) if (ident_is(name, n, reserved[i])) return true;
+    return false;
+}
 static const char *custom_ident(const char *s, size_t n, arena_t *a, const char *excluded) {
     if (!n || ident_token(s, n) != n) return NULL;
     sbuf b = {0};
     css_unescape(&b, s, n);
     const char *name = b.p ? b.p : "";
-    static const char *const reserved[] = {"initial", "inherit", "unset", "revert", "revert-layer", "default"};
-    bool bad = excluded && ident_is(name, b.n, excluded);
-    for (size_t i = 0; i < sizeof reserved / sizeof *reserved; i++) bad = bad || ident_is(name, b.n, reserved[i]);
+    bool bad = (excluded && ident_is(name, b.n, excluded)) || ident_reserved(name, b.n);
     const char *r = bad ? NULL : ar_strndup(a, name, b.n);
     sb_free(&b);
     return r;
@@ -6284,9 +6289,8 @@ static bool motion_item_parse(int list, const struct kw *kws, const char *s, siz
             sb_free(&b);
             return named;
         }
-        if (!motion_name(s, n)) return false;
-        out->s = ar_strndup(cx->a, s, n);
-        return true;
+        /* a <custom-ident>, its escapes decoded (x\yz names xyz) */
+        return (out->s = custom_ident(s, n, cx->a, NULL)) != NULL;
     case ML_DURATION:
         if (ident_is(s, n, "auto")) { out->f = NAN; return true; }
         return motion_time(s, n, cx, true, &out->f);
@@ -9837,13 +9841,15 @@ bool css_prop_logical_group(const char *name, char *group, size_t size, bool *lo
     return false;
 }
 
-/* Fixed notation within the CSS number grammar, to the precision of the stored floats
-   (seven significant digits) so a value read back serializes as it was written. */
+/* Fixed notation within the CSS number grammar, to the precision of the stored floats (seven
+   significant digits, so a value read back serializes as it was written) and with no more than the
+   six decimals of CSSOM's <number> ("serialize a CSS component value") */
 static void anim_number(sbuf *b, double v) {
     if (!isfinite(v) || fabs(v) < 5e-10) v = 0;
     if (v > 1e15) v = 1e15; else if (v < -1e15) v = -1e15;
     char text[64]; snprintf(text, sizeof text, "%.7g", v);
-    if (strchr(text, 'e')) {
+    const char *dot = strchr(text, '.');
+    if (strchr(text, 'e') || (dot && strlen(dot + 1) > 6)) {
         int len = snprintf(text, sizeof text, "%.6f", v);
         while (len > 1 && text[len - 1] == '0') text[--len] = 0;
         if (len > 1 && text[len - 1] == '.') text[--len] = 0;
@@ -10387,13 +10393,12 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
             switch (list) {
             case ML_NAME: case ML_TPROPERTY:
                 if (!item.s) sb_puts(out, "none");
-                else if (list == ML_TPROPERTY || (motion_name(item.s, strlen(item.s)) && !ident_is(item.s, strlen(item.s), "none")))
-                    sb_puts(out, item.s);
-                else {
-                    sb_putc(out, '"');
-                    for (const char *c = item.s; *c; c++) { if (*c == '"' || *c == '\\') sb_putc(out, '\\'); sb_putc(out, *c); }
-                    sb_putc(out, '"');
-                }
+                else if (list == ML_TPROPERTY) sb_puts(out, item.s);
+                /* a <keyframes-name> serializes as an identifier, a <string> only for the names no
+                   <custom-ident> spells (none, the CSS-wide keywords, default) */
+                else if (ident_is(item.s, strlen(item.s), "none") || ident_reserved(item.s, strlen(item.s)))
+                    css_serialize_string(out, item.s);
+                else css_serialize_ident(out, item.s);
                 break;
             case ML_DURATION: case ML_DELAY: case ML_TDURATION: case ML_TDELAY:
                 if (isnan(item.f)) sb_puts(out, "auto");
