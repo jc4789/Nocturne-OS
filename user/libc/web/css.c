@@ -9630,7 +9630,7 @@ static bool style_layout_equal(const style_t *a,const style_t *b,size_t *differs
     /* Custom properties have already been resolved into real properties (the
        chain and where its own entries end live in each restyle's arena). Paint
        data/colors are replaced in boxes/runs, but cannot change geometry. */
-    x.vars=y.vars=x.vars_inherited=y.vars_inherited=NULL; x.gradient=y.gradient=NULL; x.box_shadow=y.box_shadow=NULL;
+    x.vars=y.vars=NULL; x.vars_inherited=y.vars_inherited=NULL; x.gradient=y.gradient=NULL; x.box_shadow=y.box_shadow=NULL;
     memset(x.corner_radius,0,sizeof x.corner_radius);memset(y.corner_radius,0,sizeof y.corner_radius);
     x.border_radius=y.border_radius=0; /* decoration clipping does not change layout */
     x.bg_image=y.bg_image=NULL;x.mask=y.mask=NULL; /* mask layers paint over the laid-out boxes */
@@ -9692,11 +9692,23 @@ static bool vars_equal(const struct custom_prop *x, const struct custom_prop *y)
         if (!x || !y || !equal_string(x->name, y->name) || !equal_string(x->value, y->value)) return false;
     return true;
 }
+/* Where the element's own entries end in equal chains (a registered property that does not
+   inherit reads only those). Each restyle makes its chain in its own arena: compare positions. */
+static bool vars_own_equal(const style_t *a, const style_t *b) {
+    for (const struct custom_prop *x = a->vars, *y = b->vars;; x = x->next, y = y->next) {
+        bool x_end = x == a->vars_inherited, y_end = y == b->vars_inherited;
+        if (x_end || y_end) return x_end && y_end;
+        if (!x || !y) return false;
+    }
+}
 /* Every computed value of a and b is the same, so b may be dropped for a,
    which its element's descendants may borrow from. Pointed-to values are
    compared by content; a pointer this does not know compares by address,
    which can only report a difference. */
-static bool style_equal(const style_t *a, const style_t *b) {
+static bool style_equal_at(const style_t *a, const style_t *b, size_t *differs);
+static bool style_equal(const style_t *a, const style_t *b) { return style_equal_at(a, b, NULL); }
+/* differs: the first byte of the final field comparison that differs (debug_js reports) */
+static bool style_equal_at(const style_t *a, const style_t *b, size_t *differs) {
     if (a == b) return true;
     if (!a || !b) return false;
     const struct web_font_choice *fa = a->font_choices, *fb = b->font_choices;
@@ -9720,7 +9732,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
         !css_ui_equal(a->ui, b->ui) ||
         !transforms_equal(a->transform, b->transform) ||
         !transforms_equal(a->rotate, b->rotate) || !transforms_equal(a->scale, b->scale) ||
-        !gradients_equal(a->gradient, b->gradient) || !vars_equal(a->vars, b->vars) ||
+        !gradients_equal(a->gradient, b->gradient) || !vars_equal(a->vars, b->vars) || !vars_own_equal(a, b) ||
         !equal_tracks(a->grid_cols, b->grid_cols) || !equal_tracks(a->grid_rows, b->grid_rows) ||
         !equal_tracks(a->grid_auto_cols, b->grid_auto_cols) || !equal_tracks(a->grid_auto_rows, b->grid_auto_rows) ||
         !equal_areas(a->grid_areas, b->grid_areas) || !style_equal(a->before, b->before) ||
@@ -9765,7 +9777,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     x.background = y.background = NULL; x.border_image = y.border_image = x.mask_border = y.mask_border = NULL;
     x.text = y.text = NULL; x.decoration = y.decoration = NULL; x.decorations = y.decorations = NULL; x.effects = y.effects = NULL;
     x.transform = y.transform = x.rotate = y.rotate = x.scale = y.scale = NULL;
-    x.gradient = y.gradient = NULL; x.vars = y.vars = NULL;
+    x.gradient = y.gradient = NULL; x.vars = y.vars = NULL; x.vars_inherited = y.vars_inherited = NULL;
     x.color_inherited = y.color_inherited = x.color_own = y.color_own = NULL; x.color_scheme_text = y.color_scheme_text = NULL;
     x.grid_cols = y.grid_cols = x.grid_rows = y.grid_rows = NULL;
     x.grid_auto_cols = y.grid_auto_cols = x.grid_auto_rows = y.grid_auto_rows = NULL;
@@ -9774,6 +9786,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     x.before = y.before = x.after = y.after = x.backdrop = y.backdrop = x.placeholder = y.placeholder = NULL;
     x.bg_img = y.bg_img = 0; /* found from bg_image after the cascade */
     x.border_image_img = y.border_image_img = x.mask_border_img = y.mask_border_img = 0; /* and from the sources */
+    if (differs) for (size_t i = 0; i < sizeof x; i++) if (((const unsigned char *)&x)[i] != ((const unsigned char *)&y)[i]) { *differs = i; break; }
     return !memcmp(&x, &y, sizeof x);
 }
 static bool style_box_compatible(node_t *e, const style_t *old, const style_t *next);
@@ -9875,13 +9888,25 @@ static void keep_previous_style(node_t *e) {
    retired style's own, its memory becomes e's inherit arena; otherwise they
    are already there or an ancestor's. Not inlined: the templates stay off the
    recursive walk's frames. */
+static struct { bool taken; char text[160]; } adopt_refused; /* debug_js: one per web_style_report() */
+static void adopt_refused_note(node_t *e, const char *why, long byte) {
+    if (__atomic_exchange_n(&adopt_refused.taken, true, __ATOMIC_ACQ_REL)) return;
+    const char *id = node_attr(e, "id"), *cls = node_attr(e, "class");
+    snprintf(adopt_refused.text, sizeof adopt_refused.text, "<%s id=%.30s class=%.60s> %s %ld",
+             e->name ? e->name : "?", id ? id : "", cls ? cls : "", why, byte);
+}
 static __attribute__((noinline)) bool adopt_inherited(node_t *e) {
     const style_t *was = e->style_previous;
     style_t *s = e->style;
-    if (s->display != was->display) return false;
+    bool profile = e->owner && e->owner->profile_enabled;
+    if (s->display != was->display) { if (profile) adopt_refused_note(e, "display", -1); return false; }
     style_t from_was, from_new;
     css_style_init(&from_was, was); css_style_init(&from_new, s);
-    if (!style_equal(&from_was, &from_new)) return false;
+    size_t differs = SIZE_MAX;
+    if (!style_equal_at(&from_was, &from_new, profile ? &differs : NULL)) {
+        if (profile) adopt_refused_note(e, "inherited values differ at byte", differs == SIZE_MAX ? -1L : (long)differs);
+        return false;
+    }
     css_style_adopt_inherited(s, was);
     if (!e->style_inherit_mem.head) {
         e->style_inherit_mem = e->style_previous_mem; e->style_inherit_mem.trap = NULL;
@@ -10037,6 +10062,7 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     node_t *flat_parent = doc_flat_parent(e);
     const style_t *parent_after = flat_parent && flat_parent->style == parent ? flat_parent->animation_after_style : NULL;
     style_t *base = NULL, *after = NULL;
+    bool had_after = e->animation_after_style != NULL;
     style_t *s = motion_compute(c, e, parent, parent_after, PE_NONE, e->style_previous, &base, &after);
     position_try_styles(c, e, parent, PE_NONE, s);
     e->style = s;
@@ -10088,7 +10114,11 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
             if(boxed){e->box_regen=true;__atomic_store_n(&d->style_existing_boxes_changed,true,__ATOMIC_RELAXED);}
             if(d->profile_enabled && boxed)__atomic_store_n(&d->box_change_node,e,__ATOMIC_RELAXED);
         }
-        if (self_only && !e->animation_base_style && adopt_inherited(e)) {
+        /* The children read e's inherited values from its style, and from its after-change
+           style where it has one (CSS Transitions 1 §3). Without one, now or before, e's
+           animation effects leave them alone when those values are equal: only keeping
+           the previous style swaps the arena its base and after-change styles live in. */
+        if (self_only && (!e->animation_base_style || (!had_after && !after)) && adopt_inherited(e)) {
             children_redo = false; adopted = true;
             if (d->profile_enabled) __atomic_fetch_add(&d->profile.style_adopted, 1, __ATOMIC_RELAXED);
         } else {
@@ -10227,6 +10257,10 @@ int web_style_report(char *out, size_t size) {
         (unsigned long)style_profile.bucket[0], (unsigned long)style_profile.bucket[1],
         (unsigned long)style_profile.bucket[2], (unsigned long)style_profile.bucket[3],
         (unsigned long)style_profile.filtered, (unsigned long)style_profile.lookups);
+    if (__atomic_load_n(&adopt_refused.taken, __ATOMIC_ACQUIRE) && n >= 0 && (size_t)n < size) {
+        n += snprintf(out + n, size - (size_t)n, "; adoption refused %s", adopt_refused.text);
+        __atomic_store_n(&adopt_refused.taken, false, __ATOMIC_RELEASE);
+    }
     const char *separator = "; wide ";
     for (int i = 0; i < STYLE_MARK_NAMES && n >= 0 && (size_t)n < size; i++)
         if (style_marks.names[i].count) {

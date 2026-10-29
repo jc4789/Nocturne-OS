@@ -9364,6 +9364,10 @@ void css_style_init(style_t *s, const style_t *parent) {
 void css_style_adopt_inherited(style_t *s, const style_t *from) {
     style_t own = *s;
     css_style_init(s, from);
+    /* from's chain equals s's (adopt_inherited compared them): s's own entries end at the same place in it */
+    const struct custom_prop *mine = own.vars, *adopted = from->vars;
+    while (mine != own.vars_inherited && mine && adopted) { mine = mine->next; adopted = adopted->next; }
+    s->vars_inherited = adopted;
     for (int i = 0; i < NPROPS; i++)
         if (props[i].type != PT_SHORT && !props[i].inherited && props[i].group == G_STYLE)
             copy_prop(&props[i], s, &own, NULL);
