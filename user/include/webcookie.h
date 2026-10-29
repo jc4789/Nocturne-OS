@@ -13,9 +13,14 @@
    per domain the non-Secure least recently used first, in all the least recently used. */
 #define WEBCOOKIE_DOMAIN_MAX 180u
 #define WEBCOOKIE_TOTAL_MAX 3000u
+/* A partitioned cookie's partition-key (CHIPS, draft-cutler-httpbis-partitioned-cookies §2.3):
+   the site of the top-level document it was set under, serialized ("https://" and a registrable
+   domain at its longest). */
+#define WEBCOOKIE_PARTITION_MAX (8u + 253u)
 /* One record of a snapshot or of the saved store at its largest: 40 bytes of fields, the name
-   and value (4096 together, §5.7 step 4), the domain (253) and the path (1024). */
-#define WEBCOOKIE_RECORD_MAX (40u + 4096u + 253u + 1024u)
+   and value (4096 together, §5.7 step 4), the domain (253), the path (1024) and the
+   partition-key. */
+#define WEBCOOKIE_RECORD_MAX (40u + 4096u + 253u + 1024u + WEBCOOKIE_PARTITION_MAX)
 /* The largest snapshot a full jar makes: the transport to a worker never refuses a jar. */
 #define WEBCOOKIE_SNAPSHOT_MAX (24u + WEBCOOKIE_TOTAL_MAX * WEBCOOKIE_RECORD_MAX)
 #define WEBCOOKIE_PSL_MAX (2u * 1024u * 1024u)
@@ -29,7 +34,9 @@ typedef struct webcookie_jar webcookie_jar;
 struct webcookie_context {
     const char *url;
     /* Trusted top-level site-for-cookies, never a page-supplied Origin header.
-       NULL is no client (address-bar navigation); "" is an opaque client. */
+       NULL is no client (address-bar navigation); "" is an opaque client. It also gives the
+       cookie-partition-key (CHIPS §2.2): the site of the top-level document, which for a
+       top-level navigation (http and top_level) and for no client is url's own. */
     const char *site_url;
     const char *method;
     bool top_level;

@@ -12,6 +12,7 @@
 #include "elements.h"
 #include "js_canvas.h"
 #include "cssom.h"
+#include "html_policy.h"
 /* Internal lifetime query: implemented beside the wrapper cache. */
 bool web_js_nodes_same_forest(web_doc *document, node_t *node, node_t *parent);
 
@@ -394,12 +395,161 @@ static void textarea_changed(node_t *n) {
         if (n->type == N_ELEM && !n->foreign && n->tag == T_textarea && !n->value_dirty) n->control_ready = false;
 }
 
+/* HTML "Document named properties". A Document's supported property names are the name
+   attributes of its exposed embed, form, iframe, img and exposed object elements, the ids of
+   its exposed object elements and of its img elements that also have a name, in tree order
+   (an element's id before its name), each once. js.c's node_exotic answers the Document's
+   [[GetOwnProperty]] and the other legacy platform object steps with them. */
+struct doc_named {
+    bool valid;
+    uint64_t revision;
+    uint32_t count, capacity, mask; /* mask + 1 slots, at most half of them used */
+    char **names;                   /* copies, in order */
+    uint32_t *table;                /* open addressing over names: a slot holds a position + 1 */
+};
+static bool named_html(const node_t *n, int tag) {
+    return n->type == N_ELEM && n->namespace_id == NS_HTML && n->tag == tag;
+}
+/* HTML "exposed": an embed, or an object, with no exposed object ancestor; an object also only
+   while it is not showing its fallback content or has no object or embed descendants. No
+   object resource renderer is installed, so every object shows its fallback content (box.c
+   atomic_kind): an object with an embed or object descendant is never exposed, so neither is
+   an embed's or object's object ancestor, and the ancestor test always passes. */
+static bool named_exposed(const node_t *n) {
+    if (n->tag != T_object) return true;
+    for (node_t *c = tree_next((node_t *)n, (node_t *)n, false, false, true); c;
+         c = tree_next(c, (node_t *)n, false, false, true))
+        if (named_html(c, T_object) || named_html(c, T_embed)) return false;
+    return true;
+}
+/* The id, then the name, that n gives its Document's supported property names (NULL: none). */
+static void named_keys(const node_t *n, const char **id, const char **name) {
+    *id = *name = NULL;
+    if (n->type != N_ELEM || n->namespace_id != NS_HTML) return;
+    bool object = n->tag == T_object;
+    if (object ? !named_exposed(n) : n->tag != T_embed && n->tag != T_form && n->tag != T_iframe && n->tag != T_img)
+        return;
+    const char *value = node_attr(n, "name");
+    if (value && *value) *name = value;
+    if (n->id && *n->id && (object || (n->tag == T_img && *name))) *id = n->id;
+}
+/* Which name tables a subtree entering or leaving the document tree can change. The Window's
+   (js_frames.js, HTML "named access on the Window object") holds the ids of its elements, the
+   target names of its child navigables and the names of its embed, form, img and object
+   elements; the Document's those of the elements named_keys reads, and an object's exposure
+   follows its embed and object descendants. */
+enum { NAMES_WINDOW = 1, NAMES_DOCUMENT = 2 };
+static unsigned named_subtree(node_t *root) {
+    unsigned found = 0;
+    for (node_t *n = root; n && found != (NAMES_WINDOW | NAMES_DOCUMENT); n = tree_next(n, root, false, false, true)) {
+        if (n->type != N_ELEM) continue;
+        if ((n->id && *n->id) || web_frame_element(n)) found |= NAMES_WINDOW;
+        if (named_html(n, T_embed) || named_html(n, T_object)) found |= NAMES_DOCUMENT;
+        if (named_html(n, T_embed) || named_html(n, T_form) || named_html(n, T_img) || named_html(n, T_object)) {
+            const char *name = node_attr(n, "name");
+            if (name && *name) found |= NAMES_WINDOW;
+        }
+        const char *id, *name;
+        named_keys(n, &id, &name);
+        if (id || name) found |= NAMES_DOCUMENT;
+    }
+    return found;
+}
+static uint32_t named_hash(const char *s, size_t length) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < length; i++) { h ^= (unsigned char)s[i]; h *= 16777619u; }
+    return h;
+}
+static int64_t named_find(const struct doc_named *t, const char *s, size_t length) {
+    if (!t->table) return -1;
+    for (uint32_t slot = named_hash(s, length) & t->mask;; slot = (slot + 1) & t->mask) {
+        uint32_t entry = t->table[slot];
+        if (!entry) return -1;
+        const char *name = t->names[entry - 1];
+        if (!strncmp(name, s, length) && !name[length]) return entry - 1;
+    }
+}
+static void named_clear(struct doc_named *t) {
+    for (uint32_t i = 0; i < t->count; i++) free(t->names[i]);
+    free(t->names); free(t->table);
+    *t = (struct doc_named){0};
+}
+static bool named_add(struct doc_named *t, const char *name) {
+    if (t->count == t->capacity) {
+        uint32_t capacity = t->capacity ? t->capacity * 2 : 16;
+        char **names = capacity > t->capacity ? realloc(t->names, (size_t)capacity * sizeof *names) : NULL;
+        if (!names) return false;
+        t->names = names; t->capacity = capacity;
+    }
+    if (!t->table || (t->count + 1) * 2 > t->mask + 1) {
+        uint32_t slots = t->table ? (t->mask + 1) * 2 : 32;
+        uint32_t *table = slots > t->mask + 1 ? calloc(slots, sizeof *table) : NULL;
+        if (!table) return false;
+        for (uint32_t i = 0; i < t->count; i++) {
+            uint32_t slot = named_hash(t->names[i], strlen(t->names[i])) & (slots - 1);
+            while (table[slot]) slot = (slot + 1) & (slots - 1);
+            table[slot] = i + 1;
+        }
+        free(t->table); t->table = table; t->mask = slots - 1;
+    }
+    char *copy = strdup(name);
+    if (!copy) return false;
+    uint32_t slot = named_hash(copy, strlen(copy)) & t->mask;
+    while (t->table[slot]) slot = (slot + 1) & t->mask;
+    t->names[t->count] = copy; t->table[slot] = ++t->count;
+    return true;
+}
+/* The names as of named_revision, read again after it moved; NULL when out of memory. */
+static struct doc_named *named_current(web_doc *d) {
+    struct doc_named *t = d->named;
+    if (t && t->valid && t->revision == d->named_revision) return t;
+    if (!t && !(t = d->named = calloc(1, sizeof *t))) return NULL;
+    named_clear(t);
+    for (node_t *n = d->root; n; n = tree_next(n, d->root, false, false, true)) {
+        const char *keys[2];
+        named_keys(n, &keys[0], &keys[1]);
+        for (int i = 0; i < 2; i++)
+            if (keys[i] && named_find(t, keys[i], strlen(keys[i])) < 0 && !named_add(t, keys[i])) {
+                named_clear(t); return NULL;
+            }
+    }
+    t->valid = true; t->revision = d->named_revision;
+    return t;
+}
+int doc_named_supported(web_doc *d, const char *name, size_t length) {
+    struct doc_named *t = named_current(d);
+    if (!t) return -1;
+    return t->count && named_find(t, name, length) >= 0;
+}
+const char *const *doc_named_names(web_doc *d, uint32_t *count) {
+    static const char *const none[1];
+    struct doc_named *t = named_current(d);
+    *count = t ? t->count : 0;
+    return !t ? NULL : t->count ? (const char *const *)t->names : none;
+}
+node_t *doc_named_next(web_doc *d, node_t *n, const char *name, size_t length) {
+    for (n = n ? tree_next(n, d->root, false, false, true) : d->root; n; n = tree_next(n, d->root, false, false, true)) {
+        const char *keys[2];
+        named_keys(n, &keys[0], &keys[1]);
+        for (int i = 0; i < 2; i++)
+            if (keys[i] && !strncmp(keys[i], name, length) && !keys[i][length]) return n;
+    }
+    return NULL;
+}
+void doc_named_free(web_doc *d) {
+    if (!d->named) return;
+    named_clear(d->named); free(d->named); d->named = NULL;
+}
+
 static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recascade, bool boxes,node_t *child_list,bool inserted,
                              const struct css_attribute_change *attribute) {
     if (!d) return;
     d->dom_revision++;
     /* Window の名前表はdocument-tree構造だけを追う。style/rAFやshadow内部は無効化しない。 */
-    if(!n || (child_list && doc_node_root(n,false)==d->root))web_js_window_names_changed(d);
+    /* Only a subtree that can hold a name moves the name tables (named_subtree). */
+    unsigned names=!n?NAMES_WINDOW|NAMES_DOCUMENT:child_list && doc_node_root(n,false)==d->root?named_subtree(child_list):0;
+    if(names&NAMES_WINDOW)web_js_window_names_changed(d);
+    if(names&NAMES_DOCUMENT)d->named_revision++;
     if (d->js_nodes_dirty) { d->js_nodes_dirty = false; web_js_nodes_changed(d); }
     if (n) {
         n->resource_revision++;
@@ -854,6 +1004,55 @@ void doc_style_attribute_changed(web_doc *d, node_t *n, const char *value) {
     n->csp_style_attribute = !d->html_policy || web_js_csp_style_allowed(d, n, true, value, strlen(value)) ? 1 : 2;
 }
 
+/* HTML "nonce attributes": [[CryptographicNonce]] (webi.h's crypto_nonce) of the elements that
+   include HTMLOrSVGOrMathMLElement. */
+static bool nonce_element(const node_t *n) {
+    return n && n->type == N_ELEM &&
+           (n->namespace_id == NS_HTML || n->namespace_id == NS_SVG || n->namespace_id == NS_MATHML);
+}
+bool doc_element_nonce_set(web_doc *d, node_t *n, const char *value, size_t length) {
+    if (!nonce_element(n) || (length && !value) || length == SIZE_MAX) return false;
+    const char *copy = NULL;
+    if (length) {
+        web_doc *allocation = n->allocation_doc ? n->allocation_doc : d;
+        if (!allocation) return false;
+        jmp_buf trap; jmp_buf *old = allocation->mem.trap;
+        allocation->mem.trap = &trap; doc_dom_budget(allocation);
+        if (setjmp(trap)) { allocation->mem.trap = old; return false; }
+        copy = ar_strndup(&allocation->mem, value, length);
+        allocation->mem.trap = old;
+    }
+    n->crypto_nonce = copy; n->crypto_nonce_length = length;
+    return true;
+}
+const char *doc_element_nonce(const node_t *n, size_t *length) {
+    bool set = nonce_element(n) && n->crypto_nonce;
+    if (length) *length = set ? n->crypto_nonce_length : 0;
+    return set ? n->crypto_nonce : "";
+}
+const char *doc_element_csp_nonce(const node_t *n) {
+    if (!nonce_element(n) || !n->crypto_nonce || memchr(n->crypto_nonce, 0, n->crypto_nonce_length)) return NULL;
+    return n->crypto_nonce;
+}
+/* The attribute change steps: localName nonce, namespace null. */
+bool doc_element_nonce_attribute_changed(web_doc *d, node_t *n, const char *value) {
+    return !nonce_element(n) || doc_element_nonce_set(d, n, value, value ? strlen(value) : 0);
+}
+/* "Whenever an element including HTMLOrSVGOrMathMLElement becomes browsing-context connected":
+   every such element of the subtree, shadow trees included, when the document has a browsing
+   context and its CSP list a header-delivered policy. */
+void doc_element_nonce_connected(web_doc *d, node_t *root) {
+    if (!d || d->inert || !root || !d->html_policy || !html_policy_header_delivered(d) ||
+        doc_node_root(root, true) != d->root) return;
+    for (node_t *n = root; n; n = tree_next(n, root, true, false, true)) {
+        if (!nonce_element(n)) continue;
+        int i = doc_attr_index(n, NULL, "nonce", true);
+        if (i < 0 || !*n->attrs[i].value) continue;
+        const char *nonce = n->crypto_nonce; size_t length = n->crypto_nonce_length;
+        if (doc_attr_set_ns(d, n, NULL, NULL, "nonce", "")) { n->crypto_nonce = nonce; n->crypto_nonce_length = length; }
+    }
+}
+
 /* A parser's attribute list for an element it just created, under the
    caller's arena trap: the list becomes the element's, with its id and classes. */
 void doc_attrs_initial(web_doc *d, node_t *n, struct attr *attrs, int count) {
@@ -864,6 +1063,8 @@ void doc_attrs_initial(web_doc *d, node_t *n, struct attr *attrs, int count) {
     n->id = temp.id; n->classes = temp.classes; n->nclasses = temp.nclasses;
     const char *style = d->html_policy ? node_attr(n, "style") : NULL;
     if (style) doc_style_attribute_changed(d, n, style);
+    int nonce = doc_attr_index(n, NULL, "nonce", true);
+    if (nonce >= 0 && !doc_element_nonce_attribute_changed(d, n, n->attrs[nonce].value)) longjmp(*d->mem.trap, 1);
 }
 
 /* The element array remains the renderer/parser's canonical data. An Attr
@@ -945,6 +1146,7 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
     if (!ns && !n->foreign && n->tag == T_select && !strcmp(name, low) &&
         (!strcmp(low, "multiple") || !strcmp(low, "size"))) doc_control_init(d, n);
     if (found < 0 && !value) return true;
+    bool nonce_change = !ns && !strcmp(local ? local : name, "nonce");
     bool html_image = !n->foreign && n->tag == T_img;
     bool image_candidate = !ns && !n->foreign && !strcmp(name, low) &&
         ((html_image && (!strcmp(low, "src") || !strcmp(low, "srcset") || !strcmp(low, "sizes") ||
@@ -961,7 +1163,7 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
             web_canvas_attr_changed(n, local);
             d->dirty = true;
         }
-        return true;
+        return !nonce_change || doc_element_nonce_attribute_changed(d, n, value);
     }
     if (n->nattrs < 0 || (found < 0 && n->nattrs == INT_MAX)) return false;
     const char *old_value = found >= 0 ? n->attrs[found].value : NULL;
@@ -999,6 +1201,7 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
     n->classes = temp.classes;
     n->nclasses = temp.nclasses;
     d->mem.trap = old;
+    if (nonce_change && !doc_element_nonce_attribute_changed(d, n, value)) { doc_mutated(d, n); return false; }
     if (!ns && !strcmp(low, "style")) doc_style_attribute_changed(d, n, value);
     bool ordinary = !ns && !n->foreign && !strcmp(name, low);
     if(!ns&&!n->foreign&&n->tag==T_meta&&(!strcmp(low,"name")||!strcmp(low,"content")))doc_referrer_meta(d,n);
@@ -1006,8 +1209,12 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
        !node_ancestor(n,T_template))d->metadata_valid=false;
     if (ordinary && !strcmp(low,"form")) doc_parser_form_set(n,NULL);
     if (ordinary && n->tag==T_style && !strcmp(low,"type")) cssom_style_lifecycle(n);
+    /* HTML link rel=stylesheet: the times to fetch and process the linked
+       resource again. A media change is not one: the sheet keeps its load
+       and its MediaList follows the attribute (cssom.c owner_media) when the
+       rescan this resource attribute asks for matches the media anew. */
     if (ordinary && n->tag == T_link && (!strcmp(low,"href") || !strcmp(low,"rel") ||
-        !strcmp(low,"media") || !strcmp(low,"type") || !strcmp(low,"disabled"))) {
+        !strcmp(low,"type") || !strcmp(low,"disabled"))) {
         n->stylesheet_generation++; n->stylesheet_url = NULL; n->stylesheet_notified = false;
         if(!strcmp(low,"disabled")){n->style_disabled_set=false;n->style_disabled=false;}
         if(!strcmp(low,"href")||!strcmp(low,"rel")||!strcmp(low,"type"))cssom_style_lifecycle(n);
@@ -1058,8 +1265,11 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
        reads after classList updates needlessly rebuild all sheet snapshots. */
     struct css_attribute_change change = {low, old_value, value};
     changed(d, n, resources, ordinary ? &change : NULL);
-    if(!ns && (!strcmp(low,"id") || !strcmp(low,"name")) && doc_node_root(n,false)==d->root)
+    if(!ns && (!strcmp(low,"id") || !strcmp(low,"name")) && doc_node_root(n,false)==d->root) {
         web_js_window_names_changed(d);
+        if(named_html(n,T_embed) || named_html(n,T_form) || named_html(n,T_iframe) || named_html(n,T_img) || named_html(n,T_object))
+            d->named_revision++;
+    }
     if(ordinary&&n->tag==T_link&&(!strcmp(low,"rel")||!strcmp(low,"href")))web_js_link_changed(d);
     /* These native HTML semantics are consumed while building boxes rather
        than encoded in computed CSS. Equal styles therefore do not imply the
@@ -1366,6 +1576,7 @@ static bool insert_node(web_doc *d, node_t *p, node_t *c, node_t *before, bool p
     if (old_parent && old_parent != p) structure_changed_lifetime(d, old_parent, c, !same_lifetime_forest, false);
     /* A reorder within p also changed the former position: not an insertion. */
     structure_changed_lifetime(d, p, c, !same_lifetime_forest, old_parent != p);
+    if (!preserve) doc_element_nonce_connected(d, c);
     doc_details_inserted(c);
     node_t *new_select = node_ancestor(p, T_select);
     web_select_inserted(d, c, old_parent);
@@ -1772,6 +1983,8 @@ static node_t *clone_one(web_doc *d, node_t *n, int32_t fallback, void *fallback
         d->mem.trap = old;
     }
     if (!clone_attributes(d, c, n)) return NULL;
+    /* HTML's cloning steps for HTMLOrSVGOrMathMLElement: the copy's [[CryptographicNonce]] is the node's. */
+    if (nonce_element(c) && !doc_element_nonce_set(d, c, n->crypto_nonce, n->crypto_nonce_length)) return NULL;
     c->checked = n->checked;
     c->indeterminate = n->indeterminate;
     c->selected = n->selected;

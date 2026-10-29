@@ -228,3 +228,13 @@ callback の realm を引く口が要る。二つを quickjs.h に出した。
 枠の TypeError にならない）。bindings は listener を足すとき・handler に値を置くときに一度だけ
 引くので、事象の配りの一回ごとの費用にはならない。確かめ方は
 `node tests/js_event_state_hosttest.js`（一つの realm の配り）と、枠を持つ WPT の `dom/events`。
+
+## 例外を置かずに失敗した操作
+
+QuickJS の約束では、`JS_EXCEPTION` を返す native の関数・exotic の手順・host の hook は先に例外を
+置く。置かずに返すと、インタープリターは空の欄（`JS_UNINITIALIZED`）を `catch` の値として台本へ
+渡してしまう（2026-10-29、Cloudflare の challenge の台本が API を探る中で `catch` が tag 4 の値を
+受けた）。`js_call_c_function` と `js_c_function_data_call` は、その関数の `name` を書いた
+InternalError を代わりに置き、インタープリターの `exception:` は名の分からない道（exotic の手順など）
+にも InternalError を置く。どちらも約束を破った束縛の誤りを示す印で、直すのはその束縛の側。
+約束を守る関数の結果は変えない。

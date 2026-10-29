@@ -101,18 +101,21 @@ globalThis.runCryptoCases = async function runCryptoCases() {
     await rejects(() => crypto.subtle.digest('SHA-256', new DataView(new SharedArrayBuffer(8))), 'TypeError', 'digest shared view');
   }
   if (typeof ArrayBuffer.prototype.transfer === 'function') {
+    // Web IDL's conversions do not reject a detached buffer; "get a copy of the bytes held by the
+    // buffer source" gives the empty byte sequence, and a detached view's byte length is 0.
     const buffer = new ArrayBuffer(8), view = new Uint8Array(buffer); buffer.transfer();
-    throws(() => crypto.getRandomValues(view), 'TypeError', 'detached random');
-    await rejects(() => crypto.subtle.digest('SHA-256', buffer), 'TypeError', 'detached digest');
-    await rejects(() => crypto.subtle.digest('SHA-256', view), 'TypeError', 'detached digest view');
+    assert(crypto.getRandomValues(view) === view, 'detached random');
+    const emptySHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+    assert(hex(await crypto.subtle.digest('SHA-256', buffer)) === emptySHA256, 'detached digest');
+    assert(hex(await crypto.subtle.digest('SHA-256', view)) === emptySHA256, 'detached digest view');
   }
   if (Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable')) {
     const buffer = new ArrayBuffer(8, { maxByteLength: 16 });
     throws(() => crypto.getRandomValues(new Uint8Array(buffer)), 'TypeError', 'resizable random');
     await rejects(() => crypto.subtle.digest('SHA-256', buffer), 'TypeError', 'resizable digest');
   }
-  // AES now has native implementations; the other algorithms still reject.
+  // Every operation is implemented; too few arguments reject with Web IDL's TypeError.
   for (const name of ['sign','verify','deriveKey','deriveBits','wrapKey','unwrapKey'])
-    await rejects(() => crypto.subtle[name](), 'NotSupportedError', name + ' explicit unsupported');
+    await rejects(() => crypto.subtle[name](), 'TypeError', name + ' arguments required');
   return checks;
 };

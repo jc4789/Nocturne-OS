@@ -65,6 +65,13 @@ int64_t web_atomics_deadline(JSContext *ctx, uint64_t now);
 int web_atomics_run(JSContext *ctx, uint64_t now);
 /* Withdraw every waiter of ctx before the realm is freed. */
 void web_atomics_release(JSContext *ctx);
+/* Native work that another thread finishes (Web Crypto's RSA key generation): ctx waits on
+ * *word as a waitAsync waiter without a timeout, so the Window and Worker event loops wake
+ * for it, and callback("ok") runs in their Atomics.waitAsync task once the thread stored a
+ * value other than expected and woke the word (wake_address). The word must stay mapped
+ * while it is watched: web_atomics_release withdraws the watch before the realm goes.
+ * 0 watching, 1 the word already differs (nothing enrolled), -1 an exception. */
+int web_atomics_watch_word(JSContext *ctx, volatile uint32_t *word, uint32_t expected, JSValueConst callback);
 /* Debug summary of pending waitAsync waiters; 0 when none. */
 int web_atomics_report(char *out, size_t size, uint64_t now);
 /* WebAssembly shared memory storage: a region of one header page, whose first

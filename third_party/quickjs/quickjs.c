@@ -1213,6 +1213,9 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b);
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                   JSValueConst this_obj,
                                   int argc, JSValueConst *argv, int flags);
+#ifdef CONFIG_NOCTURNE
+static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop);
+#endif
 static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
                                       JSValueConst this_obj,
                                       int argc, JSValueConst *argv, int flags);
@@ -6306,7 +6309,21 @@ static JSValue js_c_function_data_call(JSContext *ctx, JSValueConst func_obj,
         arg_buf = argv;
     }
 
+#ifdef CONFIG_NOCTURNE
+    {
+        /* the same contract as js_call_c_function's */
+        JSValue ret_val = s->func(ctx, this_val, argc, arg_buf, s->magic, s->data);
+        if (unlikely(JS_IsException(ret_val)) && JS_IsUninitialized(ctx->rt->current_exception)) {
+            const char *name = get_prop_string(ctx, func_obj, JS_ATOM_name);
+            JS_ThrowInternalError(ctx, "%s returned an exception without throwing one",
+                                  name && *name ? name : "a native function");
+            JS_FreeCString(ctx, name);
+        }
+        return ret_val;
+    }
+#else
     return s->func(ctx, this_val, argc, arg_buf, s->magic, s->data);
+#endif
 }
 
 JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
@@ -18577,6 +18594,17 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
         abort();
     }
 
+#ifdef CONFIG_NOCTURNE
+    /* A native function that reports an exception has thrown one. One that did not would hand
+       the catching script the empty exception slot (JS_UNINITIALIZED): an InternalError that
+       names the function takes its place (README.nocturne.md). */
+    if (unlikely(JS_IsException(ret_val)) && JS_IsUninitialized(rt->current_exception)) {
+        const char *name = get_prop_string(ctx, func_obj, JS_ATOM_name);
+        JS_ThrowInternalError(ctx, "%s returned an exception without throwing one",
+                              name && *name ? name : "a native function");
+        JS_FreeCString(ctx, name);
+    }
+#endif
     rt->current_stack_frame = sf->prev_frame;
     return ret_val;
 }
@@ -21557,6 +21585,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
  exception:
+#ifdef CONFIG_NOCTURNE
+    /* An operation that failed without throwing (an exotic method or host hook breaking the
+       contract) left the slot empty: the script catches an InternalError, never JS_UNINITIALIZED. */
+    if (unlikely(JS_IsUninitialized(rt->current_exception)))
+        JS_ThrowInternalError(ctx, "an operation failed without an exception");
+#endif
     if (is_backtrace_needed(ctx, rt->current_exception)) {
         /* add the backtrace information now (it is not done
            before if the exception happens in a bytecode

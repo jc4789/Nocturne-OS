@@ -155,6 +155,12 @@
     const {MessageEvent,MessagePort,MessageChannel}=workerMessagingBridge;
     Object.assign(globalThis,{MessageEvent,MessagePort,MessageChannel});
     const target=new EventTarget(),timers=new Map(),timerHeap=[],fetches=new Map();let nextTimer=0,timerOrder=0,closed=false,address='',workerName='',workerCanCancel=false,workerStreaming=false,reporting=false,lastPortTask=false,shared=false;
+    /* The crypto task source of this event loop (js_crypto.js queues its "queue a global
+       task" steps on host.postTask), taking turns with the other tasks in tick. */
+    const cryptoTasks=[];let cryptoTaskHead=0,lastCryptoTask=false;
+    host.postTask=task=>{if(!closed)cryptoTasks.push(task);};
+    const cryptoTaskReady=()=>cryptoTaskHead<cryptoTasks.length;
+    function runCryptoTask(){lastCryptoTask=true;const task=cryptoTasks[cryptoTaskHead];cryptoTasks[cryptoTaskHead++]=undefined;if(cryptoTaskHead===cryptoTasks.length){cryptoTasks.length=0;cryptoTaskHead=0;}try{task();}catch(e){report(e);}return true;}
     let formDataBridge;
     function initializeWorkerFormData(){
         // START's native policy URL is now established. No author script runs
@@ -405,8 +411,8 @@
         receive(packet,op=2,id=0,kind=0){try{if(op===8||op===9||op===10){workerMessagingBridge.receivePort(id,kind,packet,op!==8);return;}const payload=kind===3?workerMessagingBridge.importExternal(packet):{data:cloneData.deserialize(packet),ports:[]};if(!closed){if(op===13){if(!shared||payload.ports.length!==1)throw new TypeError('Invalid shared worker connection');dispatchNativeWorkerEvent(target,new MessageEvent('connect',{data:'',source:payload.ports[0],ports:payload.ports}));}else dispatchNativeWorkerEvent(target,new MessageEvent('message',{data:payload.data,ports:payload.ports}));}}catch(e){if(!closed)dispatchNativeWorkerEvent(target,new MessageEvent('messageerror'));}},
         loaded(id,r,flags=0){workerFetchTransport.loaded(id,r,flags);},
         frame(id,value,kind){workerFetchTransport.frame(id,value,kind);},
-        tick(now){if(closed)return false;const ports=workerMessagingBridge.ready();if(ports&&!lastPortTask){lastPortTask=true;return workerMessagingBridge.runOne();}const t=timerHeap[0];if(t&&t.due<=now){lastPortTask=false;if(t.repeat){t.due=now+t.delay;timerFix(0);}else clearTimer(t.id);try{t.fn(...t.args);}catch(e){report(e);}return true;}lastPortTask=ports;return ports?workerMessagingBridge.runOne():false;},
-        deadline(){if(workerMessagingBridge.ready())return host.now();return timerHeap.length?timerHeap[0].due:-1;},report,
+        tick(now){if(closed)return false;if(cryptoTaskReady()&&!lastCryptoTask)return runCryptoTask();lastCryptoTask=false;const ports=workerMessagingBridge.ready();if(ports&&!lastPortTask){lastPortTask=true;return workerMessagingBridge.runOne();}const t=timerHeap[0];if(t&&t.due<=now){lastPortTask=false;if(t.repeat){t.due=now+t.delay;timerFix(0);}else clearTimer(t.id);try{t.fn(...t.args);}catch(e){report(e);}return true;}lastPortTask=ports;return ports?workerMessagingBridge.runOne():cryptoTaskReady()?runCryptoTask():false;},
+        deadline(){if(workerMessagingBridge.ready()||cryptoTaskReady())return host.now();return timerHeap.length?timerHeap[0].due:-1;},report,
         storageOrigin:urlBridge.storageOrigin,
         indexedDBTaskEnd:indexedDBBridge.taskEnd
     };

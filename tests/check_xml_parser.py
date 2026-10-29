@@ -200,6 +200,8 @@ static node_t *doc_doctype_create(web_doc *d, const char *name, size_t nl, const
     return n;
 }
 static void doc_attrs_initial(web_doc *d, node_t *n, struct attr *attrs, int count) { (void)d; n->attrs = attrs; n->nattrs = count; }
+/* stylesheet blocking belongs to doc.c, which this check does not build */
+static void doc_parser_element_created(node_t *n) { (void)n; }
 static web_doc *shim_doc(void) {
     web_doc *d = host_malloc(sizeof *d);
     if (!d) return NULL;

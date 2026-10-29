@@ -65,6 +65,9 @@ const svgBridge = (() => {
             if(!value){value=create(animatedProto);call(set,animated,[value,{node:this,attribute:'class'}]);call(set,classes,[this,value]);}
             return value;
         }
+        /* HTMLOrSVGOrMathMLElement's nonce: [[CryptographicNonce]], not the content attribute */
+        get nonce(){brand(this);return rawDom.get(this,'nonce');}
+        set nonce(value){brand(this);rawDom.set(this,'nonce',`${value}`);}
         get ownerSVGElement(){return rawDom.get(this,'svgOwner');}
         get viewportElement(){return rawDom.get(this,'svgViewport');}
         focus(options=undefined){brand(this);dom('focus',this,focusOptionsVisible(options));}

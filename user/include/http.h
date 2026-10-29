@@ -8,7 +8,7 @@
 #include <threads.h>
 #include "weburl.h"
 
-/* ---- streams: plain TCP or TLS 1.2 (BearSSL, verified against the built-in Mozilla roots) ---- */
+/* ---- streams: plain TCP or TLS 1.3 and 1.2 (tls.c on BearSSL's primitives, verified against the built-in Mozilla roots) ---- */
 typedef struct net_stream net_stream;
 /* Opt-in native diagnostics; no request/hook/response layout changes. Times
    include native scheduling, not just server latency. Never expose as fields. */

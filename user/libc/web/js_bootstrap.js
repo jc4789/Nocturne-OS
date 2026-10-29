@@ -3,7 +3,7 @@
     'use strict';
     delete globalThis.__nocturne_host;
     const domOperations=host.domOperations || Object.fromEntries(
-        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'boxQuads', 'caretPosition', 'caretRect', 'checkVisibility', 'clone', 'computed', 'convertPoints', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'move', 'moveStatus', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rangeRects', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleBlock', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
+        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'boxQuads', 'caretPosition', 'caretRect', 'checkVisibility', 'clone', 'computed', 'convertPoints', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'documentNamed', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'move', 'moveStatus', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rangeRects', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleBlock', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
     const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
     // Reading never runs custom element reactions: getters go to the native operation directly.
     const domGet=domOperations.get;
@@ -1591,6 +1591,9 @@
         function intlSet(value){build();Reflect.defineProperty(globalThis,'Intl',{value,writable:true,enumerable:false,configurable:true});}
         Object.defineProperty(globalThis,'Intl',{get:intlGet,set:intlSet,enumerable:false,configurable:true});
     }
+    /* Structured cloning comes before the interfaces that register [Serializable] steps with it
+       (CryptoKey below; it reads only DOMException and Blob, which are above). */
+    /* @include js_clone.js */
     /* @include js_crypto.js */
     /* @include js_formdata.js */
     fetchBridge.initializeFormData(formDataBridge);
@@ -1601,7 +1604,6 @@
        Worker made from its entries inherits. */
     const objectURLBridge=objectURLInterfaces({origin:()=>rawDom.get(document,'fetchOrigin'),policy:()=>host.safety('policyHeaders',null)});
     fetchBridge.initializeObjectURLs(objectURLBridge);
-    /* @include js_clone.js */
     cloneData.registerUncloneable(formDataBridge.brand,'FormData');
     cloneData.registerUncloneable(formDataBridge.eventBrand,'FormDataEvent');
     /* @include js_worker.js */
@@ -1805,6 +1807,7 @@
         reportException,
         promiseRejectionHandled:rejectionBridge.handled,
         formNamedProperty:formNameBridge.property,
+        documentNamedProperty:documentBridge.namedProperty,
         formNamedKeys:formNameBridge.keys,
         registerImportMap:importMapsBridge.register,
         resolveModule:importMapsBridge.resolve,

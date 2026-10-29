@@ -1536,6 +1536,12 @@ static JSValue image_decode_promise(struct web_js_state *s, node_t *n) {
 #include "js_inner_text.h"
 static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
+    if(!strcmp(p,"nonce")) { /* HTML: the element's [[CryptographicNonce]] */
+        if(n->type!=N_ELEM || (n->namespace_id!=NS_HTML && n->namespace_id!=NS_SVG && n->namespace_id!=NS_MATHML))
+            return JS_ThrowTypeError(ctx,"HTMLOrSVGOrMathMLElement receiver required");
+        size_t length; const char *nonce=doc_element_nonce(n,&length);
+        return JS_NewStringLen(ctx,nonce,length);
+    }
     if(!strcmp(p,"htmlInterface")) {
         const char *name=html_interface_name(n);
         return name?JS_NewString(ctx,name):JS_NULL;
@@ -1819,6 +1825,15 @@ static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValue
         if(n->type!=N_ELEM || n->foreign || n->tag!=T_marquee)return JS_ThrowTypeError(ctx,"HTMLMarqueeElement receiver required");
         int running=JS_ToBool(ctx,value);if(running<0)return JS_EXCEPTION;
         web_marquee_set(n,running);return JS_UNDEFINED;
+    }
+    if (!strcmp(p, "nonce")) { /* HTML: sets [[CryptographicNonce]], never the content attribute */
+        if (n->type != N_ELEM || (n->namespace_id != NS_HTML && n->namespace_id != NS_SVG && n->namespace_id != NS_MATHML))
+            return JS_ThrowTypeError(ctx, "HTMLOrSVGOrMathMLElement receiver required");
+        size_t length = 0; const char *text = JS_ToCStringLen(ctx, &length, value);
+        if (!text) return JS_EXCEPTION;
+        bool ok = doc_element_nonce_set(d, n, text, length);
+        JS_FreeCString(ctx, text);
+        return ok ? JS_UNDEFINED : oom(ctx);
     }
     if (!strcmp(p, "elementPrefix")) {
         /* The custom element constructor's result of DOM "create an element". */
@@ -2794,7 +2809,6 @@ static int form_get_own_property_names(JSContext *ctx, JSPropertyEnum **table, u
     }
     JS_FreeValue(ctx,keys);*table=out;*length=n;return 0;
 }
-static JSClassExoticMethods node_exotic={.get_own_property=form_get_own_property,.get_own_property_names=form_get_own_property_names};
 
 void web_js_face_reset(web_doc *d, node_t *form) {
     web_doc *live=d->dom_family?d->dom_family:d;
@@ -3502,12 +3516,12 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
     }
     if(!n){switch(opcode){
-    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_boxQuads: case DOM_convertPoints: case DOM_checkVisibility: case DOM_rangeRects: case DOM_caretPosition: case DOM_caretRect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_styleBlock: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
+    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_boxQuads: case DOM_convertPoints: case DOM_checkVisibility: case DOM_rangeRects: case DOM_caretPosition: case DOM_caretRect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_styleBlock: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath: case DOM_documentNamed:
         result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");goto dom_complete;
     default:break;
     }}
     switch(opcode){
-    case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry:
+    case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_documentNamed:
         if(argc<3 || !(p=JS_ToCStringLen(ctx,&plen,argv[2]))){result=JS_EXCEPTION;goto dom_complete;}
         break;
     default:break;
@@ -4297,6 +4311,15 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
 
     } break;
+    case DOM_documentNamed: {
+        /* HTML "Document named properties": the named elements with the name p, in tree order. */
+        if(n->type!=N_DOC || !n->owner || n->owner->root!=n){result=JS_ThrowTypeError(ctx,"Document receiver required");break;}
+        result=JS_NewArray(ctx);uint32_t index=0;
+        for(node_t *e=doc_named_next(n->owner,NULL,p,plen);e && !JS_IsException(result);e=doc_named_next(n->owner,e,p,plen)){
+            JSValue element=wrap(s,e);
+            if(JS_IsException(element) || JS_DefinePropertyValueUint32(ctx,result,index++,element,JS_PROP_C_W_E)<0){JS_FreeValue(ctx,result);result=JS_EXCEPTION;}
+        }
+    } break;
     case DOM_id: {result = wrap(s, find_id(n, p));
     } break;
     case DOM_query: {
@@ -4455,6 +4478,127 @@ static bool same_origin_urls(const char *a, const char *b, bool *allocation_fail
 #include "js_html_safety_host.h"
 #include "js_pi_native.h"
 #include "js_collections_native.h"
+/* HTML "Document named properties" ([LegacyOverrideBuiltIns] getter object (DOMString name)):
+   a Document is a legacy platform object (Web IDL). dom.c has its supported property names
+   (doc_named_*), the bindings' documentNamedProperty hook a name's value. QuickJS looks at the
+   ordinary own properties first, so a supported name that reaches here is visible: enumerable
+   and configurable, not writable (there is no named setter). */
+static web_doc *document_exotic_receiver(JSContext *ctx, JSValueConst object) {
+    node_t *node=node_opaque(object); struct web_js_state *s=state(ctx);
+    if(!node || node->type!=N_DOC || !node->owner || node->owner->root!=node || !s || !JS_IsObject(s->hooks))return NULL;
+    return node->owner;
+}
+/* 1 when atom is a supported property name of d, 0 when not, -1 with an exception. */
+static int document_named_supported(JSContext *ctx, web_doc *d, JSAtom atom) {
+    uint32_t index,count;
+    if(JS_AtomKeyKind(ctx,atom,&index)==JS_ATOM_KEY_SYMBOL)return 0;
+    if(!doc_named_names(d,&count)){JS_ThrowOutOfMemory(ctx);return -1;}
+    if(!count)return 0;
+    size_t length;const char *name=JS_AtomToCStringLen(ctx,&length,atom);
+    if(!name)return -1;
+    int supported=doc_named_supported(d,name,length);
+    JS_FreeCString(ctx,name);
+    if(supported<0)JS_ThrowOutOfMemory(ctx);
+    return supported;
+}
+static int document_get_own_property(JSContext *ctx, JSPropertyDescriptor *descriptor, JSValueConst object, web_doc *d, JSAtom atom) {
+    int supported=document_named_supported(ctx,d,atom);
+    if(supported<=0 || !descriptor)return supported;
+    JSValue key=JS_AtomToString(ctx,atom);
+    if(JS_IsException(key))return -1;
+    JSValueConst args[]={object,key};
+    JSValue value=custom_element_hook(state(ctx),"documentNamedProperty",2,args);
+    JS_FreeValue(ctx,key);
+    if(JS_IsException(value))return -1;
+    if(JS_IsUndefined(value) || JS_IsNull(value))return 0;
+    descriptor->flags=JS_PROP_ENUMERABLE|JS_PROP_CONFIGURABLE;
+    descriptor->value=value;descriptor->getter=descriptor->setter=JS_UNDEFINED;
+    return 1;
+}
+static int document_get_own_property_names(JSContext *ctx, JSPropertyEnum **table, uint32_t *length, web_doc *d) {
+    uint32_t count;const char *const *names=doc_named_names(d,&count);
+    if(!names){JS_ThrowOutOfMemory(ctx);return -1;}
+    JSPropertyEnum *out=count?js_mallocz(ctx,(size_t)count*sizeof *out):NULL;
+    if(count && !out)return -1;
+    for(uint32_t i=0;i<count;i++){
+        /* JS_NewAtom reads bytes as Latin-1; a name is UTF-8. */
+        JSValue name=JS_NewString(ctx,names[i]);
+        out[i].atom=JS_IsException(name)?JS_ATOM_NULL:JS_ValueToAtom(ctx,name);JS_FreeValue(ctx,name);
+        if(out[i].atom==JS_ATOM_NULL){for(uint32_t j=0;j<i;j++)JS_FreeAtom(ctx,out[j].atom);js_free(ctx,out);return -1;}
+    }
+    *table=out;*length=count;return 0;
+}
+
+/* The DOM node class's exotic steps: the legacy platform object steps of a Document and an
+   HTMLFormElement (both [LegacyOverrideBuiltIns], without setters or deleters), ordinary for
+   any other node. QuickJS calls them only for a key that is no ordinary own property. */
+static int node_get_own_property(JSContext *ctx, JSPropertyDescriptor *descriptor, JSValueConst object, JSAtom atom) {
+    web_doc *d=document_exotic_receiver(ctx,object);
+    return d?document_get_own_property(ctx,descriptor,object,d,atom):form_get_own_property(ctx,descriptor,object,atom);
+}
+static int node_get_own_property_names(JSContext *ctx, JSPropertyEnum **table, uint32_t *length, JSValueConst object) {
+    web_doc *d=document_exotic_receiver(ctx,object);
+    if(d){*table=NULL;*length=0;return document_get_own_property_names(ctx,table,length,d);}
+    return form_get_own_property_names(ctx,table,length,object);
+}
+/* 1 when the key is a supported index or a visible supported property name of a Document or
+   form, 0 when it is neither, -1 with an exception. */
+static int node_legacy_property(JSContext *ctx, JSValueConst object, JSAtom atom) {
+    web_doc *d=document_exotic_receiver(ctx,object);
+    if(d)return document_named_supported(ctx,d,atom);
+    return form_exotic_receiver(ctx,object)?form_get_own_property(ctx,NULL,object,atom):0;
+}
+/* [[DefineOwnProperty]]: a form's array index not at all (no indexed setter), a supported
+   property name not at all (no named setter), anything else ordinarily. */
+static int node_define_own_property(JSContext *ctx, JSValueConst object, JSAtom atom, JSValueConst value,
+                                    JSValueConst getter, JSValueConst setter, int flags) {
+    uint32_t index;
+    if(form_exotic_receiver(ctx,object) && JS_AtomKeyKind(ctx,atom,&index)==JS_ATOM_KEY_INDEX)
+        return JS_ThrowTypeErrorOrFalseStr(ctx,flags,"cannot define an indexed property of a form");
+    /* Web IDL leaves out an unforgeable property name: a Document's "location". */
+    if(document_exotic_receiver(ctx,object)) {
+        const char *name=JS_AtomToCString(ctx,atom);
+        if(!name)return -1;
+        bool unforgeable=!strcmp(name,"location");
+        JS_FreeCString(ctx,name);
+        if(unforgeable)return JS_DefineProperty(ctx,object,atom,value,getter,setter,flags|JS_PROP_NO_EXOTIC);
+    }
+    int legacy=node_legacy_property(ctx,object,atom);
+    if(legacy<0)return -1;
+    if(legacy)return JS_ThrowTypeErrorOrFalseStr(ctx,flags,"cannot define a named property of this object");
+    return JS_DefineProperty(ctx,object,atom,value,getter,setter,flags|JS_PROP_NO_EXOTIC);
+}
+/* [[Set]]: a form's supported index is read-only; the named properties are ignored
+   (LegacyPlatformObjectGetOwnProperty with ignoreNamedProps true), so OrdinarySetWithOwnDescriptor
+   goes on to the prototype, whose setter (document.title beside a form named "title") or the
+   receiver's [[DefineOwnProperty]] decides. */
+static int node_set_property(JSContext *ctx, JSValueConst object, JSAtom atom, JSValueConst value,
+                             JSValueConst receiver, int flags) {
+    uint32_t index;
+    if(form_exotic_receiver(ctx,object) && JS_AtomKeyKind(ctx,atom,&index)==JS_ATOM_KEY_INDEX) {
+        int supported=form_get_own_property(ctx,NULL,object,atom);
+        if(supported<0)return -1;
+        if(supported)return JS_ThrowTypeErrorOrFalseStr(ctx,flags,"indexed property of a form is read-only");
+    }
+    JSValue prototype=JS_GetPrototype(ctx,object);
+    if(JS_IsException(prototype))return -1;
+    if(!JS_IsObject(prototype))return collection_set_receiver(ctx,atom,value,receiver,flags);
+    int set=JS_SetPropertyInternal(ctx,prototype,atom,JS_DupValue(ctx,value),receiver,flags);
+    JS_FreeValue(ctx,prototype);
+    return set;
+}
+/* [[Delete]]: a supported index or a visible named property cannot be deleted (no deleters). */
+static int node_delete_property(JSContext *ctx, JSValueConst object, JSAtom atom) {
+    int legacy=node_legacy_property(ctx,object,atom);
+    return legacy<0?-1:!legacy;
+}
+static JSClassExoticMethods node_exotic={
+    .get_own_property=node_get_own_property,
+    .get_own_property_names=node_get_own_property_names,
+    .define_own_property=node_define_own_property,
+    .set_property=node_set_property,
+    .delete_property=node_delete_property,
+};
 /* url is a serialization the URL parser gave (a resolved URL or a response's URL). An http(s)
    URL is permitted when it is a URL without credentials: the engine's requests and navigations
    never carry a username or password (Fetch's Request constructor turns them down, and nothing
@@ -5493,7 +5637,9 @@ static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, 
 static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
     struct web_js_state *s = state(ctx); node_t *n = argc ? unwrap(ctx, argv[0]) : NULL;
-    if (!n) return JS_EXCEPTION;
+    /* Web IDL: an HTMLElement operation on any other receiver (unwrap throws nothing for
+       null and undefined) */
+    if (!n || n->type != N_ELEM || n->namespace_id != NS_HTML) return JS_ThrowTypeError(ctx, "Illegal HTMLElement receiver");
     if((sandbox_authority(s)&SB_SCRIPTS) || (sandbox_borrowed(s) && n->owner!=sandbox_actor(s)->doc))
         return history_security_error(ctx,"Sandbox denied borrowed activation authority");
     if (web_control_disabled(n) || n->click_in_progress) return JS_UNDEFINED;
@@ -7347,7 +7493,7 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
        loaded synchronously): CSP's pre-request check runs here, with the
        running classic script's nonce or the default fetch options. */
     struct html_csp_request csp_probe={.url=url,.original_url=url,.destination=WEBNET_DEST_SCRIPT,
-        .nonce=s->current_script?node_attr(s->current_script,"nonce"):NULL};
+        .nonce=s->current_script?doc_element_csp_nonce(s->current_script):NULL};
     if(!m && !csp_fetch_allowed(s,&csp_probe,NULL)){JS_ThrowTypeError(ctx,"Module blocked by Content Security Policy");return NULL;}
     if (!m && (web_url_has_scheme(url,"data") || web_url_has_scheme(url,"blob"))) {
         size_t length; char mime[128];
@@ -7474,7 +7620,7 @@ static int import_module(JSContext *ctx,const char *basename,const char *specifi
        script, the nonce of the script element running now; otherwise the
        default classic script fetch options (no nonce, not parser-inserted). */
     struct js_module *referencing=basename?find_module(s,basename):NULL;
-    const char *nonce=referencing?referencing->nonce:s->current_script?node_attr(s->current_script,"nonce"):NULL;
+    const char *nonce=referencing?referencing->nonce:s->current_script?doc_element_csp_nonce(s->current_script):NULL;
     struct js_module *m=!web_url_has_scheme(url,"data")&&!web_url_has_scheme(url,"blob")&&permitted_script_url(s,url)?
         request_module(s,url,1,NULL,NULL,0,nonce,referencing&&referencing->parser_inserted):NULL;
     js_free(ctx,url);
@@ -7638,7 +7784,7 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
             if(module){
                 const char *cors=node_attr(n,"crossorigin");
                 struct js_module *m=request_module(s,script->url,cors&&str_ieq(cors,"use-credentials")?2:1,node_attr(n,"integrity"),
-                                                   NULL,doc_element_referrer_policy(n),node_attr(n,"nonce"),!dynamic);
+                                                   NULL,doc_element_referrer_policy(n),doc_element_csp_nonce(n),!dynamic);
                 if(!m)script->ready=script->failed=true;
                 else {script->request=m->request;script->graph=m;m->users++;module_script_source(s,script,m);}
             }else{
@@ -7646,7 +7792,7 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
                 if (!p) script->ready = script->failed = true;
                 else { p->script = script; script->request = p->id; p->referrer_policy = doc_element_referrer_policy(n);
                     /* The script fetch options' nonce and parser metadata. */
-                    const char *nonce = node_attr(n, "nonce"); p->parser_inserted = !dynamic;
+                    const char *nonce = doc_element_csp_nonce(n); p->parser_inserted = !dynamic;
                     if (nonce && *nonce && !(p->nonce = js_strdup(s->ctx, nonce))) pending_error(p, "Script nonce allocation failed");
                     else send_request(s, p, WEB_RESOURCE_SCRIPT, "GET", NULL, NULL, 0); }
             }
@@ -7690,7 +7836,7 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
         struct js_module *m = cache_module(s, script->url, script->source, script->len, script->base);
         if (!m) { script->failed = true; if (JS_HasException(s->ctx)) exception(s); }
         else {
-            const char *cors = node_attr(n, "crossorigin"), *nonce = node_attr(n, "nonce");
+            const char *cors = node_attr(n, "crossorigin"), *nonce = doc_element_csp_nonce(n);
             m->credentials = cors && str_ieq(cors, "use-credentials") ? 2 : 1;
             /* Its descendants are fetched with its options (nonce, parser metadata). */
             m->parser_inserted = !dynamic;
@@ -7744,7 +7890,7 @@ static void queue_modulepreload(struct web_js_state *s,node_t *node) {
     if(!url){if(JS_HasException(s->ctx))exception(s);link->notified=true;return;}
     const char *cors=node_attr(node,"crossorigin");
     link->module=request_module(s,url,cors&&str_ieq(cors,"use-credentials")?2:1,node_attr(node,"integrity"),
-                                NULL,doc_element_referrer_policy(node),node_attr(node,"nonce"),false);
+                                NULL,doc_element_referrer_policy(node),doc_element_csp_nonce(node),false);
     if(link->module)link->module->users++;
     js_free(s->ctx,url);
     if(!link->module){script_event(s,node,true);link->notified=true;}
@@ -8873,7 +9019,7 @@ static void request_styles(struct web_js_state *s) {
         p->css=css;css->loading_id=p->id;
         /* HTML link: the request's cryptographic nonce metadata is the
            element's nonce (no memory to copy it: the request has none). */
-        const char *nonce=owner?node_attr(owner,"nonce"):NULL;
+        const char *nonce=owner?doc_element_csp_nonce(owner):NULL;
         p->element=owner;
         if(nonce&&*nonce&&!(p->nonce=js_strdup(s->ctx,nonce)))JS_FreeValue(s->ctx,JS_GetException(s->ctx));
         send_request(s,p,WEB_RESOURCE_CSS,"GET",NULL,NULL,0);
@@ -8924,9 +9070,11 @@ static void request_images(struct web_js_state *s) {
         }
     }
 }
+/* Every stylesheet fetch delays the load event; only a script-blocking style
+   sheet (doc_style_blocks_scripts) holds back parser and deferred scripts. */
 static bool styles_busy(struct web_js_state *s) { return pending_kind(s, P_CSS) || web_pending_stylesheet(s->doc); }
 static bool parser_script_ready(struct web_js_state *s, struct js_script *script) {
-    return script->stream_generation==s->stream_generation && script->ready && !styles_busy(s);
+    return script->stream_generation==s->stream_generation && script->ready && !doc_style_blocks_scripts(s->doc);
 }
 static bool images_wanted(web_doc *d) {
     for (int i = 0; i < web_image_count(d); i++) if (web_image_wanted(d, i)) return true;

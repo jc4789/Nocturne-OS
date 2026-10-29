@@ -227,6 +227,10 @@ typedef struct node {
     struct web_doc *stylesheet_owner;
     uint64_t stylesheet_generation;
     bool stylesheet_notified;
+    /* Its document's parser created it as a style element, or as a link that
+       contributed to styling with its style sheet enabled (HTML "contributes a
+       script-blocking style sheet"; doc_parser_element_created). */
+    bool parser_sheet;
     /* form controls */
     char *value; /* current value of input/textarea (malloc'd) */
     size_t value_capacity;
@@ -285,6 +289,11 @@ typedef struct node {
        (neither the cascade nor CSSOM reads it), 3 CSSOM is writing it (its
        updating flag: the attribute change steps neither parse nor check it). */
     uint8_t csp_style_attribute;
+    /* HTML "nonce attributes": [[CryptographicNonce]] of an element that includes
+       HTMLOrSVGOrMathMLElement, in allocation_doc's arena (NULL is the empty string). The
+       nonce content attribute's change steps set it; the nonce IDL attribute reads and
+       writes only it. Read it with doc_element_nonce, never from the attribute. */
+    const char *crypto_nonce; size_t crypto_nonce_length;
     struct cssom_sheet *cssom_sheets, *cssom_current; /* native owner/source/AST, allocation-owned */
     uint32_t cssom_serial;
     struct cssom_sheet **adopted_sheets;
@@ -2525,6 +2534,11 @@ struct web_doc {
     uint8_t dom_create_reported; /* one numeric failure diagnostic per stage */
     bool frame_allocation_reported;
     uint64_t dom_revision;
+    /* HTML "Document named properties" (dom.c doc_named_*): moves when an element that can
+       give a supported property name enters or leaves the document tree or its id or name
+       changes; named keeps the names read at one revision. */
+    uint64_t named_revision;
+    struct doc_named *named;
     uint64_t metadata_revision;
     bool metadata_valid;
     uint64_t layout_revision;
@@ -2848,6 +2862,15 @@ bool doc_node_replace_all(web_doc *d,node_t *parent,node_t *child);
 void doc_node_remove(web_doc *d, node_t *node);
 bool doc_node_text(web_doc *d, node_t *node, const char *text, size_t n);
 void doc_parser_form_set(node_t *node,node_t *form);
+void doc_parser_element_created(node_t *node); /* once, with the attributes its parser gave it */
+bool doc_style_blocks_scripts(web_doc *d); /* HTML "has a style sheet that is blocking scripts" */
+/* HTML "Document named properties" of d: whether name is a supported property name (-1 out of
+   memory); the supported property names in order (NULL out of memory); the
+   next named element with that name after n in tree order (n NULL: the first). */
+int doc_named_supported(web_doc *d, const char *name, size_t length);
+const char *const *doc_named_names(web_doc *d, uint32_t *count);
+node_t *doc_named_next(web_doc *d, node_t *n, const char *name, size_t length);
+void doc_named_free(web_doc *d);
 bool web_js_script_parser_capture(web_doc *d,node_t *node);
 bool web_js_encoding_restart(web_doc *d);
 bool doc_node_html(web_doc *d, node_t *node, const char *html, size_t n);
@@ -2899,6 +2922,19 @@ bool web_js_csp_base_allowed(web_doc *d, node_t *base, const char *url);
 /* HTML's style attribute was set to value (NULL: removed) by a parser or the
    attribute change steps: CSP's inline check decides whether it applies. */
 void doc_style_attribute_changed(web_doc *d, node_t *n, const char *value);
+/* HTML "nonce attributes". set: [[CryptographicNonce]] := value (length 0 the empty string);
+   false out of memory or for an element without the slot. nonce: the slot as script sees
+   it ("" when empty). csp_nonce: the slot as CSP's nonce metadata, NULL when it is empty
+   or holds U+0000 (no nonce-source matches such a value). attribute_changed: the change
+   steps of the null-namespace nonce attribute, value NULL when removed. connected: the
+   steps run when element (an inserted subtree's root) becomes browsing-context connected:
+   with a header-delivered CSP, a non-empty nonce attribute becomes the empty string and
+   the slot keeps the nonce. */
+bool doc_element_nonce_set(web_doc *d, node_t *element, const char *value, size_t length);
+const char *doc_element_nonce(const node_t *element, size_t *length);
+const char *doc_element_csp_nonce(const node_t *element);
+bool doc_element_nonce_attribute_changed(web_doc *d, node_t *element, const char *value);
+void doc_element_nonce_connected(web_doc *d, node_t *element);
 void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const char *css, size_t n);
 bool doc_link_load_current(web_doc *d, node_t *n, uint64_t generation);
 bool web_js_stylesheet_event(web_doc *d, node_t *n, bool failed);

@@ -488,6 +488,10 @@ static int wait_async(JSContext *ctx, void *opaque, void *address, uint32_t expe
     return 0;
 }
 
+int web_atomics_watch_word(JSContext *ctx, volatile uint32_t *word, uint32_t expected, JSValueConst callback) {
+    return wait_async(ctx, NULL, (void *)word, expected, INFINITY, callback);
+}
+
 void web_atomics_runtime_init(JSRuntime *rt) {
     static const JSSharedArrayBufferFunctions functions = {
         .sab_alloc = sab_alloc, .sab_free = sab_free, .sab_dup = sab_dup,

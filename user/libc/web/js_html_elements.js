@@ -107,6 +107,11 @@ const htmlElementsBridge = (() => {
         define(HTMLElement.prototype,property,{configurable:true,enumerable:true,
             get(){htmlBrand(this);return reflectedAttr(this,attribute)||'';},
             set(value){htmlBrand(this);reflectedAttr(this,attribute,string(value));}});
+    /* HTMLOrSVGOrMathMLElement's nonce: the element's [[CryptographicNonce]] (HTML "nonce
+       attributes"), which the setter changes without the content attribute; no [CEReactions]. */
+    define(HTMLElement.prototype,'nonce',{configurable:true,enumerable:true,
+        get(){htmlBrand(this);return rawDom.get(this,'nonce');},
+        set(value){htmlBrand(this);rawDom.set(this,'nonce',string(value));}});
     // Limited to only known values (ltr, rtl, auto), ASCII case-insensitively.
     define(HTMLElement.prototype,'dir',{configurable:true,enumerable:true,get(){
         htmlBrand(this);const value=lower(reflectedAttr(this,'dir')||'');

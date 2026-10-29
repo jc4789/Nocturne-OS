@@ -184,5 +184,5 @@
                 get(){if(this!==globalThis)throw new TypeError('Illegal Window receiver');return access('name',selfToken);},
                 set(value){if(this!==globalThis)throw new TypeError('Illegal Window receiver');access('name',selfToken,String(value));}}
         });
-        return {windowProxy,methodOriginal:key=>originalMethods[key],finalizeMethods,scriptCreatedAuxiliary};
+        return {windowProxy,contentWindow:element=>windowProxy(access('window',element)),methodOriginal:key=>originalMethods[key],finalizeMethods,scriptCreatedAuxiliary};
     })();

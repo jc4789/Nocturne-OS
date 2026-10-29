@@ -153,7 +153,7 @@ static JSValue native_safety(JSContext *ctx,JSValueConst this_value,int argc,JSV
         if(!type||!text)result=JS_EXCEPTION;
         else if(!node || node->type!=N_ELEM || !realm || realm->disabled)result=JS_ThrowTypeError(ctx,"Inline check requires an element of an active document");
         else{
-            struct html_csp_element element={.nonce=node_attr(node,"nonce"),.nonceable=html_policy_nonceable(node)};
+            struct html_csp_element element={.nonce=doc_element_csp_nonce(node),.nonceable=html_policy_nonceable(node)};
             struct csp_site site={realm,node};
             result=JS_NewBool(ctx,html_policy_inline_allowed(realm->doc,!strcmp(type,"style attribute")?HTML_CSP_STYLE_ATTRIBUTE:HTML_CSP_SCRIPT_ATTRIBUTE,
                                                             &element,text,length,csp_report,&site));

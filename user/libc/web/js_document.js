@@ -249,6 +249,19 @@
             if(!rawDom.get(this,'htmlDocument'))throw new DOMException('An XML document cannot be written to','InvalidStateError');
             throw new DOMException('Writing to an inactive document is not implemented','NotSupportedError');
         };
+        // HTML "Document named properties": the value of a supported property name (js.c's
+        // node_exotic asks only for one). A lone iframe gives its content navigable's WindowProxy,
+        // a lone element itself, several a live HTMLCollection of them rooted at the Document.
+        function namedProperty(owner,name){
+            const elements=rawDom.documentNamed(owner,name);
+            if(elements.length===1){
+                const element=elements[0];
+                if(rawDom.get(element,'localName')==='iframe'){const window=frameBridge.contentWindow(element);if(window!==null)return window;}
+                return element;
+            }
+            if(!elements.length)return undefined;
+            return collectionBridge.domHTML(owner,()=>rawDom.documentNamed(owner,name));
+        }
         Object.assign(globalThis,{DOMParser,XMLSerializer,DOMImplementation,XMLDocument});
-        return {brand,xmlDocumentPrototype:XMLDocument.prototype};
+        return {brand,namedProperty,xmlDocumentPrototype:XMLDocument.prototype};
     })();

@@ -123,6 +123,63 @@ static void store(void) {
     CHECK(webcookie_load(a,bad,sizeof bad,now)==0);CHECK(sends(a,"https://example.com/","k"));
     free(file4);webcookie_free(a);webcookie_free(b);
 }
+/* Partitioned cookies (CHIPS, draft-cutler-httpbis-partitioned-cookies-01 §2): the partition-key is
+   the top-level document's site, the same name, domain and path under two keys are two cookies,
+   and each is sent only under its own key. */
+static bool sends_under(webcookie_jar *j,const char *url,const char *top,bool http,const char *name) {
+    struct webcookie_context c={url,top,"GET",false,http,false};static char out[WEBCOOKIE_OUTPUT_MAX+1];
+    return webcookie_get(j,&c,out,sizeof out,now)>=0&&has(out,name);
+}
+static int set_under(webcookie_jar *j,const char *url,const char *top,bool http,bool top_level,const char *value) {
+    struct webcookie_context c={url,top,"GET",top_level,http,false};return webcookie_set(j,&c,value,strlen(value),now);
+}
+static void partitioned(void) {
+    webcookie_jar *j=jar();webcookie_track(j);
+    /* An embedded site's cookie under two top-level sites, and its unpartitioned one. */
+    CHECK(set_under(j,"https://embed.org/w","https://a.example.com/",true,false,"p=a; Secure; SameSite=None; Partitioned; Path=/; Max-Age=1000")==1);
+    CHECK(set_under(j,"https://embed.org/w","https://www.other.org/",true,false,"p=b; Secure; SameSite=None; Partitioned; Path=/; Max-Age=1000")==1);
+    CHECK(set_under(j,"https://embed.org/w","https://a.example.com/",true,false,"p=plain; Secure; SameSite=None; Path=/")==1);
+    struct webcookie_context c={"https://embed.org/x","https://b.example.com/","GET",false,true,false};char out[512];
+    /* b.example.com is the same site as a.example.com: the key is the site, not the host. */
+    CHECK(webcookie_get(j,&c,out,sizeof out,now)>=0&&!strcmp(out,"p=a; p=plain"));
+    c.site_url="https://other.org/";CHECK(webcookie_get(j,&c,out,sizeof out,now)>=0&&!strcmp(out,"p=b; p=plain"));
+    c.site_url="https://third.net/";CHECK(webcookie_get(j,&c,out,sizeof out,now)>=0&&!strcmp(out,"p=plain"));
+    /* An http top-level site is another site than the https one. */
+    c.site_url="http://a.example.com/";CHECK(webcookie_get(j,&c,out,sizeof out,now)>=0&&!strcmp(out,"p=plain"));
+    /* Not Secure: ignored. An opaque top-level origin has no key to set it under. */
+    CHECK(set_under(j,"https://embed.org/","https://a.example.com/",true,false,"q=1; SameSite=None; Partitioned")==0);
+    CHECK(set_under(j,"https://embed.org/","",true,false,"q=1; Secure; SameSite=None; Partitioned")==0);
+    /* A top-level navigation's response sets it under the navigated URL's own site. */
+    CHECK(set_under(j,"https://www.example.com/","https://elsewhere.org/",true,true,"nav=1; Secure; Partitioned")==1);
+    CHECK(sends_under(j,"https://www.example.com/","https://example.com/",true,"nav"));
+    CHECK(!sends_under(j,"https://www.example.com/","https://elsewhere.org/",true,"nav"));
+    /* document.cookie (a non-HTTP API) under its top-level document's site. */
+    CHECK(set_under(j,"https://embed.org/","https://a.example.com/",false,false,"dom=1; Secure; SameSite=None; Partitioned")==1);
+    CHECK(sends_under(j,"https://embed.org/","https://a.example.com/",false,"dom"));
+    CHECK(!sends_under(j,"https://embed.org/","https://other.org/",false,"dom"));
+    /* Deleting under one key leaves the other key's cookie. */
+    CHECK(set_under(j,"https://embed.org/w","https://other.org/",true,false,"p=; Secure; SameSite=None; Partitioned; Path=/; Max-Age=0")==1);
+    c.site_url="https://other.org/";CHECK(webcookie_get(j,&c,out,sizeof out,now)>=0&&!strcmp(out,"p=plain"));
+    c.site_url="https://a.example.com/";CHECK(webcookie_get(j,&c,out,sizeof out,now)>=0&&!strcmp(out,"p=a; p=plain; dom=1"));
+    /* The saved store and a snapshot keep the key. */
+    long n0;unsigned char *file=save(j,NULL,0,&n0);
+    webcookie_jar *k=jar();CHECK(webcookie_load(k,file,(size_t)n0,now)==1);
+    c.site_url="https://a.example.com/";CHECK(webcookie_get(k,&c,out,sizeof out,now)>=0&&!strcmp(out,"p=a"));
+    c.site_url="https://other.org/";CHECK(webcookie_get(k,&c,out,sizeof out,now)>=0&&!strcmp(out,""));
+    webcookie_free(k);free(file);
+    long n=webcookie_export(j,NULL,0,now);void *snapshot=n>0?malloc((size_t)n):NULL;CHECK(snapshot!=NULL);
+    if(snapshot){
+        CHECK(webcookie_export(j,snapshot,(size_t)n,now)==n);
+        k=jar();CHECK(webcookie_import(k,snapshot,(size_t)n,now));
+        c.site_url="https://a.example.com/";CHECK(webcookie_get(k,&c,out,sizeof out,now)>=0&&!strcmp(out,"p=a; p=plain; dom=1"));
+        c.site_url="https://third.net/";CHECK(webcookie_get(k,&c,out,sizeof out,now)>=0&&!strcmp(out,"p=plain"));
+        webcookie_free(k);free(snapshot);
+    }
+    /* Clearing the top-level site's data removes the cookies partitioned under it. */
+    CHECK(webcookie_clear(j,"example.com")>=1);
+    c.site_url="https://a.example.com/";CHECK(webcookie_get(j,&c,out,sizeof out,now)>=0&&!strcmp(out,"p=plain"));
+    webcookie_free(j);
+}
 /* WebDriver's associated cookies and its "delete cookies" (the WPT testdriver's Cookies). */
 static void webdriver(void) {
     webcookie_jar *j=jar();webcookie_track(j);
@@ -232,7 +289,9 @@ int main(int argc,char **argv) {
     CHECK(set(j,"https://example.com/","__Http-x=1; Secure",true)==0);
     CHECK(set(j,"https://example.com/","__Host-Http-x=1; Secure; HttpOnly; Path=/",false)==0);
     CHECK(set(j,"https://example.com/","__Host-Http-x=1; Secure; HttpOnly; Path=/",true)==1);
-    CHECK(set(j,"https://example.com/","partitioned=1; Secure; Partitioned",true)==0);
+    /* CHIPS §2.3: a Partitioned cookie must be Secure; a Secure one is set under the top-level site. */
+    CHECK(set(j,"https://example.com/","partitioned=1; Partitioned",true)==0);
+    CHECK(set(j,"https://example.com/","partitioned=1; Secure; Partitioned",true)==1);
     CHECK(set(j,"file:///C:/Users/User/index.html","x=1",false)==0);
     /* The URL's host is evil.com; its userinfo never names the cookie's domain. */
     CHECK(set(j,"https://example.com@evil.com/","userinfo=1",true)==1);
@@ -354,6 +413,7 @@ int main(int argc,char **argv) {
     limits();
     rules();
     store();
+    partitioned();
     webdriver();
     /* The deployed complete PSL, not merely the small policy-unit table. */
     FILE *f=fopen(argc>1?argv[1]:"C:\\Nocturne\\Web\\public_suffix_list.dat","r");

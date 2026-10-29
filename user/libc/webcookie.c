@@ -1,6 +1,10 @@
 /* Cookie policy follows RFC 6265bis section 5 (HTTPWG, September 2026).
    Limits: WEBCOOKIE_DOMAIN_MAX per domain field and WEBCOOKIE_TOTAL_MAX in all (webcookie.h), a
-   400-day lifetime; no Lax-allowing-unsafe grace, no partitioned-cookie emulation.
+   400-day lifetime; no Lax-allowing-unsafe grace. Partitioned cookies follow CHIPS
+   (draft-cutler-httpbis-partitioned-cookies-01 §2): a Secure cookie with the Partitioned
+   attribute keeps the site of the top-level document it was set under as its partition-key, is
+   a different cookie from one of the same name, domain and path under another key, and is sent
+   only where the top-level document's site is that key.
    A URL is read by the URL parser (weburl.h), which gives the canonicalized host name (a domain
    in A-labels, an IPv4 address, an IPv6 address in brackets), the path and the scheme; the jar
    reads no URL text itself. Same site is HTML's (the origins' sites), with this jar's PSL.
@@ -24,13 +28,15 @@
 #define SNAP_HEADER 24u
 #define STORE_HEADER 48u
 #define NEVER INT64_MAX
-_Static_assert(RECORD_SIZE + 4096u + DOMAIN_MAX + COOKIE_PATH_MAX == WEBCOOKIE_RECORD_MAX, "record bound");
+#define PARTITION_MAX WEBCOOKIE_PARTITION_MAX
+_Static_assert(RECORD_SIZE + 4096u + DOMAIN_MAX + COOKIE_PATH_MAX + PARTITION_MAX == WEBCOOKIE_RECORD_MAX, "record bound");
 _Static_assert(WEBCOOKIE_TOTAL_MAX <= 0xffffu, "snapshot count is 16 bits");
 enum { S_LAX, S_STRICT, S_NONE };
 enum { F_HOST = 1, F_SECURE = 2, F_HTTP = 4, F_PERSIST = 8 };
 struct cookie {
-    char *name, *value, *domain, *path;
-    uint16_t nl, vl, dl, pl;
+    /* partition: the partition-key (CHIPS §2.3), "" for an unpartitioned cookie. */
+    char *name, *value, *domain, *path, *partition;
+    uint16_t nl, vl, dl, pl, kl;
     unsigned flags, same;
     bool saved, doomed;
     int64_t expires;
@@ -175,6 +181,22 @@ bool webcookie_same_site(const webcookie_jar *j, const char *x, const char *y) {
 static bool same_context(const webcookie_jar *j, const struct webcookie_context *c) {
     return !c->redirect_cross_site && (c->site_url ? webcookie_same_site(j, c->url, c->site_url) : c->http && c->top_level);
 }
+/* The cookie-partition-key of a context (CHIPS §2.2): the site of the top-level document. A
+   top-level navigation makes url the top-level document's, as does a request without a client;
+   otherwise it is the site of site_url, the top-level document of the requesting one (for a
+   non-HTTP API too). 1 with *key malloc'd, 0 for an opaque top-level origin (no key: a
+   partitioned cookie can be neither set nor sent there), -1 no memory. */
+static int partition_key(const webcookie_jar *j, const struct webcookie_context *c, char **key) {
+    *key = NULL;
+    const char *top = (c->http && c->top_level) || !c->site_url ? c->url : c->site_url;
+    if (!*top) return 0;
+    return url_site(j, top, key);
+}
+/* Whether a cookie's partition-key lets it be sent under key (CHIPS §2.5): an unpartitioned
+   cookie always, a partitioned one only under the same site. */
+static bool partition_sent(const struct cookie *c, const char *key) {
+    return !c->kl || (key && !strcmp(c->partition, key));
+}
 static unsigned policy(const webcookie_jar *j, const char *host) {
     return j->rule ? j->rule(j->rule_opaque, host) : WEBCOOKIE_ALLOW;
 }
@@ -232,7 +254,7 @@ bool webcookie_psl_load(webcookie_jar *j, const char *text, size_t len) {
     free(j->rules); free(j->psl_text); j->rules = rules; j->psl_text = copy; j->rule_count = count;
     return true;
 }
-static size_t record_bytes(const struct cookie *c) { return RECORD_SIZE + c->nl + c->vl + c->dl + c->pl; }
+static size_t record_bytes(const struct cookie *c) { return RECORD_SIZE + c->nl + c->vl + c->dl + c->pl + c->kl; }
 static void remove_cookie(webcookie_jar *j, size_t i) {
     j->bytes -= record_bytes(j->cookies[i]); free(j->cookies[i]);
     memmove(j->cookies+i, j->cookies+i+1, (j->count-i-1) * sizeof *j->cookies); j->count--;
@@ -293,33 +315,36 @@ static bool max_age(const char *p, int64_t now, int64_t *expiry) {
     else *expiry = now + (n > COOKIE_DAYS ? COOKIE_DAYS : n);
     return true;
 }
-static struct cookie *make_cookie(const char *name, const char *value, const char *domain, const char *path) {
-    size_t sizes[4] = {strlen(name), strlen(value), strlen(domain), strlen(path)}, total = 4;
-    for (int i=0;i<4;i++) total += sizes[i];
+static struct cookie *make_cookie(const char *name, const char *value, const char *domain, const char *path,
+                                  const char *partition) {
+    size_t sizes[5] = {strlen(name), strlen(value), strlen(domain), strlen(path), strlen(partition)}, total = 5;
+    for (int i=0;i<5;i++) total += sizes[i];
     struct cookie *c = calloc(1, sizeof *c + total); if (!c) return NULL;
-    char *dst=c->data; char **fields[4] = {&c->name,&c->value,&c->domain,&c->path};
-    const char *src[4] = {name,value,domain,path};
-    for (int i=0;i<4;i++) { *fields[i]=dst; memcpy(dst,src[i],sizes[i]+1); dst+=sizes[i]+1; }
-    c->nl=sizes[0]; c->vl=sizes[1]; c->dl=sizes[2]; c->pl=sizes[3]; return c;
+    char *dst=c->data; char **fields[5] = {&c->name,&c->value,&c->domain,&c->path,&c->partition};
+    const char *src[5] = {name,value,domain,path,partition};
+    for (int i=0;i<5;i++) { *fields[i]=dst; memcpy(dst,src[i],sizes[i]+1); dst+=sizes[i]+1; }
+    c->nl=sizes[0]; c->vl=sizes[1]; c->dl=sizes[2]; c->pl=sizes[3]; c->kl=sizes[4]; return c;
 }
 static struct cookie *copy_cookie(const struct cookie *from) {
-    struct cookie *c = make_cookie(from->name, from->value, from->domain, from->path);
+    struct cookie *c = make_cookie(from->name, from->value, from->domain, from->path, from->partition);
     if (!c) return NULL;
     c->flags = from->flags; c->same = from->same; c->expires = from->expires;
     c->created = from->created; c->access = from->access;
     return c;
 }
 
-/* The identity of a cookie (RFC 6265bis §5.7 step 23): name, domain, path, host-only. */
+/* The identity of a cookie (RFC 6265bis §5.7 step 23): name, domain, path, host-only, and the
+   partition-key (CHIPS §2.4). */
 static bool same_key(const struct cookie *a, const struct cookie *b) {
-    return a->nl == b->nl && a->dl == b->dl && a->pl == b->pl && !((a->flags ^ b->flags) & F_HOST) &&
-           !memcmp(a->name, b->name, a->nl) && !memcmp(a->domain, b->domain, a->dl) && !memcmp(a->path, b->path, a->pl);
+    return a->nl == b->nl && a->dl == b->dl && a->pl == b->pl && a->kl == b->kl && !((a->flags ^ b->flags) & F_HOST) &&
+           !memcmp(a->name, b->name, a->nl) && !memcmp(a->domain, b->domain, a->dl) && !memcmp(a->path, b->path, a->pl) &&
+           !memcmp(a->partition, b->partition, a->kl);
 }
 static uint64_t key_hash(const struct cookie *c) {
     uint64_t h = UINT64_C(1469598103934665603) ^ (c->flags & F_HOST);
-    const char *parts[3] = {c->name, c->domain, c->path};
-    size_t sizes[3] = {c->nl, c->dl, c->pl};
-    for (int k = 0; k < 3; k++) {
+    const char *parts[4] = {c->name, c->domain, c->path, c->partition};
+    size_t sizes[4] = {c->nl, c->dl, c->pl, c->kl};
+    for (int k = 0; k < 4; k++) {
         for (size_t i = 0; i < sizes[k]; i++) { h ^= (unsigned char)parts[k][i]; h *= UINT64_C(1099511628211); }
         h ^= 0x100; h *= UINT64_C(1099511628211);
     }
@@ -375,11 +400,18 @@ static void note(webcookie_jar *j, unsigned kind, const struct cookie *c) {
     if (!ch) { free(copy); return; }
     ch->kind = kind; ch->cookie = copy;
 }
+/* Whether clearing site's cookies (webcookie_clear: "" is every site) removes c: a cookie of the
+   site or of a subdomain of it, and a partitioned cookie set under such a top-level site. */
+static bool clear_covers(const struct cookie *c, const char *site) {
+    if (!*site || domain_match(c->domain, site)) return true;
+    const char *host = c->kl ? strstr(c->partition, "://") : NULL;
+    return host && domain_match(host + 3, site);
+}
 static void note_clear(webcookie_jar *j, const char *site) {
     if (!j->tracking) return;
     for (size_t i = 0; i < j->change_count;) {
         const struct change *ch = &j->changes[i];
-        bool covered = !*site || (ch->kind == CHANGE_CLEAR ? *ch->site && domain_match(ch->site, site) : domain_match(ch->cookie->domain, site));
+        bool covered = !*site || (ch->kind == CHANGE_CLEAR ? *ch->site && domain_match(ch->site, site) : clear_covers(ch->cookie, site));
         if (covered) change_drop(j, i); else i++;
     }
     struct change *ch = change_add(j);
@@ -478,7 +510,18 @@ static int set_for(webcookie_jar *j, const struct webcookie_context *ctx, const 
     if (http_only && !ctx->http) bad=true;
     if (same==S_NONE && !secure) bad=true;
     if (same!=S_NONE && !same_context(j,ctx) && !(ctx->http && ctx->top_level)) bad=true;
-    if (partitioned) bad=true; /* No partition key exists in this browser yet. */
+    /* CHIPS §2.3: a Partitioned cookie that is not Secure is ignored; one is set under the
+       context's cookie-partition-key, and an opaque top-level origin has none to set it under. */
+    char *partition=NULL;
+    if (partitioned && !bad) {
+        if (!secure) bad=true;
+        else {
+            int k=partition_key(j,ctx,&partition);
+            if (k<0) { free(copy); return -1; }
+            if (!k || strlen(partition)>PARTITION_MAX) bad=true;
+        }
+    }
+    const char *key=partition?partition:"";
     const char *prefix=*name ? name : value;
     if ((!strncasecmp(prefix,"__Secure-",9) || !strncasecmp(prefix,"__Host-",7)) && !secure) bad=true;
     if (!strncasecmp(prefix,"__Host-",7) && (domain_attr || !path_root)) bad=true;
@@ -490,15 +533,15 @@ static int set_for(webcookie_jar *j, const struct webcookie_context *ctx, const 
         struct cookie *c=j->cookies[i];
         if (strcmp(c->name,name)) continue;
         if (!a.secure && (c->flags&F_SECURE) && (domain_match(c->domain,domain) || domain_match(domain,c->domain)) && path_match(path,c->path)) bad=true;
-        if (!strcmp(c->domain,domain) && !strcmp(c->path,path) && !!(c->flags&F_HOST)==host_only) {
+        if (!strcmp(c->domain,domain) && !strcmp(c->path,path) && !!(c->flags&F_HOST)==host_only && !strcmp(c->partition,key)) {
             old=i; if (!ctx->http && (c->flags&F_HTTP)) bad=true;
         }
     }
-    if (bad) { free(copy); return 0; }
+    if (bad) { free(copy); free(partition); return 0; }
     if (age) { expires=age_time; persistent=true; }
     if (persistent && expires>now+COOKIE_DAYS) expires=now+COOKIE_DAYS;
-    if (expires<=now) { if (old<j->count) evict(j,old); free(copy); return 1; }
-    struct cookie *c=make_cookie(name,value,domain,path); free(copy); if (!c) return -1;
+    if (expires<=now) { if (old<j->count) evict(j,old); free(copy); free(partition); return 1; }
+    struct cookie *c=make_cookie(name,value,domain,path,key); free(copy); free(partition); if (!c) return -1;
     c->flags=(host_only?F_HOST:0)|(secure?F_SECURE:0)|(http_only?F_HTTP:0)|(persistent?F_PERSIST:0); c->same=same; c->expires=expires;
     c->created=old<j->count ? j->cookies[old]->created : stamp(j,now); c->access=stamp(j,now);
     bool was_saved = old<j->count && j->cookies[old]->saved;
@@ -538,12 +581,15 @@ static long get_for(webcookie_jar *j,const struct webcookie_context *ctx,const s
     bool same=same_context(j,ctx);
     const char *method=ctx->method?ctx->method:"GET";
     bool safe=!strcmp(method,"GET")||!strcmp(method,"HEAD")||!strcmp(method,"OPTIONS")||!strcmp(method,"TRACE");
+    char *key=NULL;
+    if (partition_key(j,ctx,&key)<0) { free(list); return -1; }
     for (size_t i=0;i<j->count;i++) {
         struct cookie *c=j->cookies[i];
-        if (!sent_to(c,&a,ctx->http)) continue;
+        if (!sent_to(c,&a,ctx->http) || !partition_sent(c,key)) continue;
         if (!same && c->same!=S_NONE && !(c->same==S_LAX && ctx->http && ctx->top_level && safe)) continue;
         list[count++]=c; len+=c->nl+c->vl+(c->nl?1:0)+(count>1?2:0);
     }
+    free(key);
     if (len>WEBCOOKIE_OUTPUT_MAX || (out && len>=cap)) { free(list); return -1; }
     if (!out) { free(list); return (long)len; }
     qsort(list,count,sizeof *list,send_order); size_t pos=0;
@@ -562,27 +608,39 @@ static void put32(unsigned char *p,uint32_t n){for(int i=0;i<4;i++)p[i]=(unsigne
 static uint32_t get32(const unsigned char *p){uint32_t n=0;for(int i=0;i<4;i++)n|=(uint32_t)p[i]<<(i*8);return n;}
 static void put64(unsigned char *p,uint64_t n){for(int i=0;i<8;i++)p[i]=(unsigned char)(n>>(i*8));}
 static uint64_t get64(const unsigned char *p){uint64_t n=0;for(int i=0;i<8;i++)n|=(uint64_t)p[i]<<(i*8);return n;}
+/* A record: the lengths of the name, value, domain and path (2 each), the flags, SameSite, the
+   partition-key's length (2, 0 for an unpartitioned cookie), 4 zero bytes, the expiry, creation and
+   access times (8 each); then the name, value, domain, path and partition-key. */
 static unsigned char *put_record(unsigned char *p,const struct cookie *c){
     memset(p,0,RECORD_SIZE);put16(p,c->nl);put16(p+2,c->vl);put16(p+4,c->dl);put16(p+6,c->pl);
-    p[8]=(unsigned char)c->flags;p[9]=(unsigned char)c->same;put64(p+16,(uint64_t)c->expires);put64(p+24,c->created);put64(p+32,c->access);p+=RECORD_SIZE;
-    memcpy(p,c->name,c->nl);p+=c->nl;memcpy(p,c->value,c->vl);p+=c->vl;memcpy(p,c->domain,c->dl);p+=c->dl;memcpy(p,c->path,c->pl);return p+c->pl;
+    p[8]=(unsigned char)c->flags;p[9]=(unsigned char)c->same;put16(p+10,c->kl);put64(p+16,(uint64_t)c->expires);put64(p+24,c->created);put64(p+32,c->access);p+=RECORD_SIZE;
+    memcpy(p,c->name,c->nl);p+=c->nl;memcpy(p,c->value,c->vl);p+=c->vl;memcpy(p,c->domain,c->dl);p+=c->dl;memcpy(p,c->path,c->pl);p+=c->pl;
+    memcpy(p,c->partition,c->kl);return p+c->kl;
+}
+/* A partition-key as a record holds it: a site serialized, a scheme and a host the URL parser
+   writes. */
+static bool partition_ok(const char *k,size_t n){
+    size_t s=n>=8&&!memcmp(k,"https://",8)?8:n>=7&&!memcmp(k,"http://",7)?7:0;
+    return s&&n>s&&web_url_host_serialized(k+s,n-s);
 }
 /* One record at *at: 1 with a new cookie in *out; 0 a record the policy refuses (skipped); -1 the
    bytes end inside it; -2 no memory. */
 static int parse_record(const webcookie_jar *j,const unsigned char **at,const unsigned char *end,uint64_t serial,struct cookie **out){
     const unsigned char *p=*at;*out=NULL;
     if((size_t)(end-p)<RECORD_SIZE)return -1;
-    unsigned nl=get16(p),vl=get16(p+2),dl=get16(p+4),pl=get16(p+6),flags=p[8],same=p[9];
+    unsigned nl=get16(p),vl=get16(p+2),dl=get16(p+4),pl=get16(p+6),flags=p[8],same=p[9],kl=get16(p+10);
     int64_t expires=(int64_t)get64(p+16);uint64_t created=get64(p+24),access=get64(p+32);p+=RECORD_SIZE;
-    size_t size=(size_t)nl+vl+dl+pl;
+    size_t size=(size_t)nl+vl+dl+pl+kl;
     if(size>(size_t)(end-p))return -1;
     *at=p+size;
-    if(nl+vl>4096||!dl||dl>DOMAIN_MAX||!pl||pl>COOKIE_PATH_MAX||flags>15||same>S_NONE||created>serial||access>serial||expires<0||memchr(p,0,size)||!clean((const char*)p,size))return 0;
-    char fields[4096+DOMAIN_MAX+COOKIE_PATH_MAX+4],*f=fields;const char *parts[4];unsigned sizes[4]={nl,vl,dl,pl};
-    for(int k=0;k<4;k++){parts[k]=f;memcpy(f,p,sizes[k]);f[sizes[k]]=0;p+=sizes[k];f+=sizes[k]+1;}
+    if(nl+vl>4096||!dl||dl>DOMAIN_MAX||!pl||pl>COOKIE_PATH_MAX||kl>PARTITION_MAX||(kl&&!(flags&F_SECURE))||flags>15||same>S_NONE||
+       created>serial||access>serial||expires<0||memchr(p,0,size)||!clean((const char*)p,size))return 0;
+    char fields[4096+DOMAIN_MAX+COOKIE_PATH_MAX+PARTITION_MAX+5],*f=fields;const char *parts[5];unsigned sizes[5]={nl,vl,dl,pl,kl};
+    for(int k=0;k<5;k++){parts[k]=f;memcpy(f,p,sizes[k]);f[sizes[k]]=0;p+=sizes[k];f+=sizes[k]+1;}
     const char *domain=parts[2];if(!name_ok(parts[0])||strchr(parts[1],';')||!web_url_host_serialized(domain,dl)||parts[3][0]!='/')return 0;
+    if(kl&&!partition_ok(parts[4],kl))return 0;
     if(!(flags&F_HOST)&&(!j->rule_count||suffix_labels(j,domain)==labels(domain)))return 0;
-    struct cookie *c=make_cookie(parts[0],parts[1],parts[2],parts[3]);if(!c)return -2;
+    struct cookie *c=make_cookie(parts[0],parts[1],parts[2],parts[3],parts[4]);if(!c)return -2;
     c->flags=flags;c->same=same;c->expires=expires;c->created=created;c->access=access;*out=c;return 1;
 }
 long webcookie_export(webcookie_jar *j,void *output,size_t cap,int64_t now){
@@ -660,7 +718,7 @@ static bool merged_add(struct index *x,struct cookie ***m,size_t *mn,size_t *mca
     (*m)[(*mn)++]=c;*slot=*mn;return true;
 }
 static void merged_clear(struct index *x,struct cookie **m,size_t mn,const char *site){
-    for(size_t i=0;i<mn;i++)if(m[i]&&(!*site||domain_match(m[i]->domain,site))){
+    for(size_t i=0;i<mn;i++)if(m[i]&&clear_covers(m[i],site)){
         bool found;size_t *slot=index_slot(x,m,m[i],&found);
         if(found)*slot=TOMB;
         free(m[i]);m[i]=NULL;
@@ -731,7 +789,7 @@ int webcookie_load(webcookie_jar *j,const void *data,size_t len,int64_t now){
         }
         if(found||mine->expires<=now)continue;
         bool cleared=false;
-        for(size_t k=0;k<nclears&&!cleared;k++)cleared=clears[k].serial>j->clear_seen&&(!*clears[k].site||domain_match(mine->domain,clears[k].site));
+        for(size_t k=0;k<nclears&&!cleared;k++)cleared=clears[k].serial>j->clear_seen&&clear_covers(mine,clears[k].site);
         if(cleared)continue;
         m[mn++]=mine;*slot=mn;moved[i]=true;
     }
@@ -840,15 +898,16 @@ size_t webcookie_clear(webcookie_jar *j,const char *site){
         if(!clear_site_ok(host,n))return 0;
     }
     size_t removed=0;
-    for(size_t i=0;i<j->count;)if(!*host||domain_match(j->cookies[i]->domain,host)){remove_cookie(j,i);removed++;}else i++;
+    for(size_t i=0;i<j->count;)if(clear_covers(j->cookies[i],host)){remove_cookie(j,i);removed++;}else i++;
     note_clear(j,host);
     return removed;
 }
 _Static_assert(S_LAX==WEBCOOKIE_SAME_SITE_LAX&&S_STRICT==WEBCOOKIE_SAME_SITE_STRICT&&S_NONE==WEBCOOKIE_SAME_SITE_NONE,"SameSite values");
 /* An associated cookie of a document at a (webcookie_associated): the cookie-string for an HTTP
-   API holds it, and its name is name unless that is NULL. */
-static bool associated(const struct cookie *c,const struct address *a,const char *name){
-    return sent_to(c,a,true)&&(!name||!strcmp(c->name,name));
+   API holds it, and its name is name unless that is NULL. The document is taken for the
+   top-level one: a partitioned cookie is associated under its own site's key alone. */
+static bool associated(const struct cookie *c,const struct address *a,const char *name,const char *key){
+    return sent_to(c,a,true)&&partition_sent(c,key)&&(!name||!strcmp(c->name,name));
 }
 long webcookie_associated(webcookie_jar *j,const char *url,const char *name,struct webcookie_record **out,int64_t now){
     if(!out)return -1;
@@ -857,14 +916,16 @@ long webcookie_associated(webcookie_jar *j,const char *url,const char *name,stru
     if(parsed!=1)return parsed;
     purge(j,now);
     long result=0;size_t count=0,bytes=0;
-    struct cookie **list=NULL;
-    if(!(policy(j,a.host)&WEBCOOKIE_BLOCK)&&j->count){ /* the user's block: no Cookie field */
+    struct cookie **list=NULL;char *key=NULL;
+    if(url_site(j,url,&key)<0)result=-1;
+    else if(!(policy(j,a.host)&WEBCOOKIE_BLOCK)&&j->count){ /* the user's block: no Cookie field */
         if(!(list=malloc(j->count*sizeof *list)))result=-1;
         else for(size_t i=0;i<j->count;i++){
             struct cookie *c=j->cookies[i];
-            if(associated(c,&a,name)){list[count++]=c;bytes+=c->nl+c->vl+c->dl+c->pl+4;}
+            if(associated(c,&a,name,key)){list[count++]=c;bytes+=c->nl+c->vl+c->dl+c->pl+4;}
         }
     }
+    free(key);
     if(count){
         qsort(list,count,sizeof *list,send_order);
         struct webcookie_record *r=malloc(count*sizeof *r+bytes);
@@ -892,10 +953,11 @@ long webcookie_delete_associated(webcookie_jar *j,const char *url,const char *na
     struct address a;int parsed=address(url,&a);
     if(parsed!=1)return parsed;
     purge(j,now);
-    long removed=0;
-    if(!(policy(j,a.host)&WEBCOOKIE_BLOCK)){
-        for(size_t i=0;i<j->count;)if(associated(j->cookies[i],&a,name)){evict(j,i);removed++;}else i++;
+    long removed=0;char *key=NULL;
+    if(url_site(j,url,&key)<0)removed=-1;
+    else if(!(policy(j,a.host)&WEBCOOKIE_BLOCK)){
+        for(size_t i=0;i<j->count;)if(associated(j->cookies[i],&a,name,key)){evict(j,i);removed++;}else i++;
     }
-    address_free(&a);
+    free(key);address_free(&a);
     return removed;
 }

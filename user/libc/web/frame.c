@@ -71,6 +71,8 @@ void web_frame_retire(struct web_frame *f) {
        failure, not an arbitrary navigation counter, limits retained arenas. */
     old->frame_retired_next=f->retired;f->retired=old;web_js_retire(old);old->live=false;
     f->document=NULL;f->notified=false;
+    /* A child navigable's target name is a Window name only while it has a document. */
+    web_js_window_names_changed(f->owner);
 }
 void web_frames_detach_tree(web_doc *d,node_t *root) {
     if(!d || !root)return;
@@ -148,6 +150,7 @@ bool web_frame_commit_response(struct web_frame *f,const char *html,size_t n,con
     f->commit_failure=NULL;
     made->frame_container=f;
     web_frame_retire(f);f->document=made;f->failed=false;f->initial_failed=false;f->detached=false;f->notified=false;f->paint_failed=false;
+    web_js_window_names_changed(parent);
     web_frames_commit_viewports(parent);
     parent->dirty=true;return true;
 }

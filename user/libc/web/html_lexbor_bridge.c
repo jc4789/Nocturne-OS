@@ -4,6 +4,7 @@
 #include "html_lexbor.h"
 #include "elements.h"
 #include "html_pi.h"
+#include "html_policy.h"
 #include <limits.h>
 #include <lexbor/dom/interfaces/character_data.h>
 #include <lexbor/dom/interfaces/document_type.h>
@@ -25,6 +26,7 @@ struct binding {
     web_doc *target_owner;
     node_t *prepared;
     bool owner_template;
+    bool created; /* the document's own parser made its native node; its first commit tells doc.c */
 };
 struct html_bridge {
     struct binding **items, **table;
@@ -264,7 +266,9 @@ static struct binding *import_node(struct html_parser *p, lxb_dom_node_t *lex, w
     struct binding *b = by_lex(lex);
     if (b) return b;
     node_t *n = new_native(p, lex, owner);
-    return n ? bind_node(p, lex, n) : NULL;
+    b = n ? bind_node(p, lex, n) : NULL;
+    if (b) b->created = !p->fragment && n->owner == p->d;
+    return b;
 }
 
 /* Lexbor's HTML namespace/attribute helpers case-fold arbitrary namespace URIs
@@ -418,12 +422,20 @@ static void commit_fields(struct binding *b) {
     if (n->type == N_ELEM) {
         bool was_open = node_attr(n, "open") != NULL;
         const char *style = node_attr(n, "style");
+        int nonce_at = doc_attr_index(n, NULL, "nonce", true);
+        const char *nonce = nonce_at >= 0 ? n->attrs[nonce_at].value : NULL;
         doc_attrs_publish(n, prepared->attrs, prepared->nattrs);
         n->id = prepared->id; n->classes = prepared->classes; n->nclasses = prepared->nclasses;
         doc_details_parser_attribute_changed(n, was_open);
         /* A style attribute the parser set or changed meets CSP's check. */
         const char *now = node_attr(n, "style");
         if (now ? !style || strcmp(style, now) : style != NULL) doc_style_attribute_changed(n->owner, n, now);
+        /* A nonce attribute the parser set or changed: its change steps. */
+        nonce_at = doc_attr_index(n, NULL, "nonce", true);
+        const char *nonce_now = nonce_at >= 0 ? n->attrs[nonce_at].value : NULL;
+        /* out of memory, the slot stays as it was: a nonce that matches nothing */
+        if (nonce_now ? !nonce || strcmp(nonce, nonce_now) : nonce != NULL)
+            (void)doc_element_nonce_attribute_changed(n->owner, n, nonce_now);
     } else {
         n->text = prepared->text; n->textlen = prepared->textlen;
         if (n->type == N_PI) { n->pi_attributes_ready = false; n->pi_attributes = NULL; n->pi_attribute_count = 0; }
@@ -827,6 +839,10 @@ bool html_bridge_import(struct html_parser *p) {
     struct bridge_adoption *adoptions = NULL;
     size_t adoption_count = 0, pending = 0;
     bool details_changed = false;
+    /* Elements with a nonce attribute, for HTML's steps when one becomes browsing-context connected
+       (doc_element_nonce_connected): they set an attribute, so they run once the import is over. */
+    node_t **nonces = NULL; size_t nonce_count = 0, nonce_room = 0;
+    bool nonce_hiding = p->d && !p->d->inert && html_policy_header_delivered(p->d);
     /* SOE/AFE are small parser-state lists, not a scan of the binding forest.
        A removed open element or formatting reconstruction still has identity. */
     if (p->lex && p->lex->tree) {
@@ -949,6 +965,15 @@ bool html_bridge_import(struct html_parser *p) {
     }
     for (struct binding *v = b->lex_first; v; v = v->lex_next) {
         commit_fields(v);
+        if (nonce_hiding && v->native->type == N_ELEM && doc_attr_index(v->native, NULL, "nonce", true) >= 0) {
+            if (nonce_count == nonce_room) {
+                size_t room = nonce_room ? nonce_room * 2 : 8;
+                node_t **grown = room <= SIZE_MAX / sizeof *grown ? realloc(nonces, room * sizeof *grown) : NULL;
+                if (grown) { nonces = grown; nonce_room = room; }
+            }
+            if (nonce_count < nonce_room) nonces[nonce_count++] = v->native;
+        }
+        if (v->created) { v->created = false; doc_parser_element_created(v->native); }
         if (v->native->type == N_ELEM && v->lex->ns == LXB_NS_HTML)
             doc_parser_form_set(v->native, bound_native(lxb_html_interface_element(v->lex)->parser_form_owner));
     }
@@ -980,6 +1005,8 @@ bool html_bridge_import(struct html_parser *p) {
     }
     b->importing = false;
     clear_import(b);
+    for (size_t i = 0; i < nonce_count; i++) doc_element_nonce_connected(nonces[i]->owner, nonces[i]);
+    free(nonces);
     if (details_changed || (b->has_details && adoption_count)) doc_details_parser_finish(p->native_root);
     for(size_t i=0;i<changed.length;i++)
         if(forest_only && changed.items[i]==p->native_root->owner)doc_fragment_parsed(changed.items[i],p->native_root);
@@ -989,7 +1016,7 @@ bool html_bridge_import(struct html_parser *p) {
     free(adoptions);free(changed.items);
     return true;
 fail_changes:
-    b->importing = false;clear_import(b);free(adoptions);free(changed.items);return false;
+    b->importing = false;clear_import(b);free(adoptions);free(changed.items);free(nonces);return false;
 }
 
 static lxb_dom_node_t *new_lex(struct html_parser *p, node_t *n) {

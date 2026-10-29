@@ -16,6 +16,11 @@ bool html_policy_requires_script(const web_doc *d) {
         if(r->require_script)return true;
     return false;
 }
+bool html_policy_header_delivered(const web_doc *d) {
+    for(const struct web_html_policy_rule *r=d && d->html_policy?d->html_policy->first:NULL;r;r=r->next)
+        if(!r->from_meta)return true;
+    return false;
+}
 bool html_policy_wasm_allowed(const struct web_html_policy_rule *r) {
     return !r || !r->has_wasm_policy || r->wasm_allowed;
 }

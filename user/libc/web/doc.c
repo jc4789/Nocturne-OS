@@ -56,6 +56,9 @@ struct pending {
     char *media; /* the <link media> the sheet is wrapped in, or NULL */
     node_t *scope; /* stylesheet owner shadow root, NULL for document */
     node_t *owner; /* the link element that asked, NULL for an @import */
+    /* its root sheet's element contributes a script-blocking style sheet
+       (doc_style_blocks_scripts) */
+    bool blocks_scripts;
 };
 
 /* Immutable inline ASTs survive resource snapshots. Each cascade instance
@@ -115,10 +118,10 @@ static struct cached_css *cached_css(web_doc *d, const char *url) {
     return NULL;
 }
 
-static bool css_queued(web_doc *d, const char *url) {
+static struct pending *css_queued(web_doc *d, const char *url) {
     for (int i = 0; i < d->pending_css.n; i++)
-        if (!strcmp(((struct pending *)d->pending_css.v[i])->url, url)) return true;
-    return false;
+        if (!strcmp(((struct pending *)d->pending_css.v[i])->url, url)) return d->pending_css.v[i];
+    return NULL;
 }
 
 /* ---------------------------------------------------------------- data: URLs */
@@ -288,8 +291,10 @@ static bool sheet_parse(web_doc *d, struct sheet_walk *f, const char *css, size_
 
 /* Return whether this root has no outstanding critical import fetches. The
    ordinary parser/OOM diagnostics remain separate from resource load state;
-   unrelated root sheets must not become this owner's completion barrier. */
-static bool add_sheet_ast(web_doc *d, const char *css, size_t n, const char *base, double order, const char *media, node_t *scope, struct cssom_sheet *cssom) {
+   unrelated root sheets must not become this owner's completion barrier.
+   blocks: the root sheet's element contributes a script-blocking style sheet,
+   which its imports still loading keep blocking. */
+static bool add_sheet_ast(web_doc *d, const char *css, size_t n, const char *base, double order, const char *media, node_t *scope, struct cssom_sheet *cssom, bool blocks) {
     struct sheet_walk *volatile active = calloc(1, sizeof(struct sheet_walk));
     if (!active) {
         web_js_console(d, 2, "Stylesheet import traversal allocation failed");
@@ -368,14 +373,16 @@ static bool add_sheet_ast(web_doc *d, const char *css, size_t n, const char *bas
             } else { f->next++; free(im->url); free(im); }
             continue;
         }
-        if (d->live && css_queued(d, im->url)) {
+        struct pending *queued = d->live ? css_queued(d, im->url) : NULL;
+        if (queued) {
+            queued->blocks_scripts |= blocks;
             pending_import=true;
             f->next++; free(im->url); free(im);
             continue;
         }
         struct pending *p = calloc(1, sizeof *p);
         if (!p) { failed = true; break; }
-        p->url = im->url; p->order = im->order; p->scope = scope;
+        p->url = im->url; p->order = im->order; p->scope = scope; p->blocks_scripts = blocks;
         p->media = media && *media ? strdup(media) : NULL;
         if ((media && *media && !p->media) || !sheet_push(&d->pending_css, p)) {
             free(p->media); free(p); failed = true; break;
@@ -389,12 +396,12 @@ static bool add_sheet_ast(web_doc *d, const char *css, size_t n, const char *bas
     if (failed) web_js_console(d, 2, "Stylesheet import traversal allocation or index representation failed");
     return !pending_import;
 }
-static bool add_sheet(web_doc *d,const char *css,size_t n,const char *base,double order,const char *media,node_t *scope) {
-    return add_sheet_ast(d,css,n,base,order,media,scope,NULL);
+static bool add_sheet(web_doc *d,const char *css,size_t n,const char *base,double order,const char *media,node_t *scope,bool blocks) {
+    return add_sheet_ast(d,css,n,base,order,media,scope,NULL,blocks);
 }
 
 void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *base) {
-    add_sheet(d, css, n, base, d->next_sheet_order++, NULL, NULL);
+    add_sheet(d, css, n, base, d->next_sheet_order++, NULL, NULL, false);
 }
 
 /* The document's character encoding, the URL parser's for a query (failure,
@@ -631,8 +638,9 @@ static bool link_stylesheet(node_t *n) {
     }
     return sheet;
 }
-static bool link_sheet_applies(node_t *n) {
-    if (cssom_owner_disabled(n) || !media_wanted(node_attr(n,"media"))) return false;
+/* its style sheet is enabled: not disabled, not an alternative style sheet */
+static bool link_sheet_enabled(node_t *n) {
+    if (cssom_owner_disabled(n)) return false;
     const char *rel=node_attr(n,"rel");
     while (rel && *rel) {
         while(is_space((unsigned char)*rel))rel++;
@@ -641,6 +649,14 @@ static bool link_sheet_applies(node_t *n) {
         rel=end;
     }
     return true;
+}
+static bool link_sheet_applies(node_t *n) {
+    return link_sheet_enabled(n) && media_wanted(node_attr(n,"media"));
+}
+/* the media attribute of a pending sheet's root element matches the environment */
+static bool pending_media_matches(web_doc *d, const struct pending *p) {
+    return !p->media || !*p->media || css_media_evaluate(p->media,
+        MAX(1,d->width),MAX(1,d->height),!(d->sandbox_flags&SB_SCRIPTS),NULL,0);
 }
 /* HTML's initial render-blocking mechanism. A short paint fallback cannot
    abort a fetch, suppress an error, or limit the size/lifetime of the page.
@@ -653,12 +669,37 @@ bool web_render_blocked(web_doc *d) {
     for (int i=0; i<d->pending_css.n; i++) {
         const struct pending *p=d->pending_css.v[i];
         if (p->scope || p->order >= d->render_head_order) continue;
-        if (p->media && *p->media && !css_media_evaluate(p->media,
-            MAX(1,d->width),MAX(1,d->height),!(d->sandbox_flags&SB_SCRIPTS),NULL,0)) continue;
+        if (!pending_media_matches(d,p)) continue;
         const struct cached_css *c=cached_css(d,p->url);
         if (!c || !c->done) return true;
     }
     return false;
+}
+/* HTML "contributes a script-blocking style sheet" asks what the element was
+   when the parser created it: a style element, or a link that contributed to
+   the styling processing model with its style sheet enabled (no disabled
+   attribute, not an alternative style sheet). */
+void doc_parser_element_created(node_t *n) {
+    if (!n || n->type != N_ELEM || n->foreign) return;
+    n->parser_sheet = n->tag == T_style || (link_stylesheet(n) && link_sheet_enabled(n));
+}
+/* A document's script-blocking style sheet set is its parser-created sheets
+   (doc_parser_element_created) still in its tree, outside shadow trees, whose
+   media matches the environment, while the sheet or one of its imports is
+   loading. A rescan rebuilds pending_css; until then a loaded entry keeps
+   blocking, so the imports it brings are queued before a script runs. */
+static bool script_blocking_set_empty(web_doc *d) {
+    for (int i=0; i<d->pending_css.n; i++) {
+        const struct pending *p=d->pending_css.v[i];
+        if (p->blocks_scripts && pending_media_matches(d,p)) return false;
+    }
+    return true;
+}
+bool doc_style_blocks_scripts(web_doc *d) {
+    if (!d) return false;
+    if (!script_blocking_set_empty(d)) return true;
+    /* and its container document's set (HTML "has a style sheet that is blocking scripts" 3-4) */
+    return d->frame_parent && !script_blocking_set_empty(d->frame_parent);
 }
 /* Borrow only a completed native resource, never a fabricated empty sheet.
    URL/data scratch is caller-owned; cache text/base survives the document.
@@ -782,6 +823,9 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
                Preserve its screen-only pending-resource API, while live
                documents may fetch inactive sheets for CSSOM/load events. */
             if (!d->live && !link_sheet_applies(c)) break;
+            /* HTML "contributes a script-blocking style sheet"; its media is
+               matched when scripts ask (doc_style_blocks_scripts) */
+            bool blocks = c->parser_sheet && c->allocation_doc == d && !scope;
             char *abs=doc_absolute_url(d,href);if(!abs)break;
             if (d->live && (c->stylesheet_owner != d || !c->stylesheet_url || strcmp(c->stylesheet_url,abs))) {
                 c->stylesheet_url = ar_strdup(&d->mem,abs);
@@ -794,16 +838,17 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
                 if (cached->body && link_sheet_applies(c)) {
                     if(c->cssom_current) {
                         int error;struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                        if(sheet)complete=add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,d->next_sheet_order++,sheet->media,scope,sheet);
+                        if(sheet)complete=add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,d->next_sheet_order++,sheet->media,scope,sheet,blocks);
                         else if(error==CSSOM_OOM)web_js_console(d,2,"Native link style sheet allocation failed");
-                    }else complete=add_sheet(d,cached->body,cached->n,cached->base,d->next_sheet_order++,media,scope);
+                    }else complete=add_sheet(d,cached->body,cached->n,cached->base,d->next_sheet_order++,media,scope,blocks);
                 }
                 if(complete)link_stylesheet_complete(d,c,!cached->body);
                 free(abs);
                 break;
             }
             if(cssom_owner_disabled(c)){free(abs);break;}
-            if (d->live && css_queued(d, abs)) {free(abs);break;}
+            struct pending *queued = d->live ? css_queued(d, abs) : NULL;
+            if (queued) {queued->blocks_scripts |= blocks;free(abs);break;}
             struct pending *pd = calloc(1, sizeof *pd);
             if(!pd){free(abs);break;}
             pd->url = abs;
@@ -811,6 +856,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             pd->media = media && *media ? strdup(media) : NULL;
             pd->scope = scope;
             pd->owner = c;
+            pd->blocks_scripts = blocks;
             if (!strncasecmp(abs, "data:", 5)) {
                 size_t dn;
                 char *css = data_url(d,abs,&dn,NULL);
@@ -818,9 +864,9 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
                 if (css && link_sheet_applies(c)) {
                     if(c->cssom_current) {
                         int error;struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                        if(sheet)complete=add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,pd->order,sheet->media,scope,sheet);
+                        if(sheet)complete=add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,pd->order,sheet->media,scope,sheet,blocks);
                         else if(error==CSSOM_OOM)web_js_console(d,2,"Native link style sheet allocation failed");
-                    }else complete=add_sheet(d,css,dn,d->base,pd->order,pd->media,scope);
+                    }else complete=add_sheet(d,css,dn,d->base,pd->order,pd->media,scope,blocks);
                 }
                 if(complete)link_stylesheet_complete(d,c,!css);
                 free(css);
@@ -838,19 +884,21 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             bool cssom = d->live && c->cssom_current;
             if (c->style_disabled || (type && *type && !str_ieq(type, "text/css")) ||
                 (!cssom && !media_wanted(media)) || node_ancestor(c, T_template)) break;
+            /* its imports still loading block scripts as a link's sheet does */
+            bool blocks = c->parser_sheet && c->allocation_doc == d && !scope;
             /* Keep the existing per-snapshot native AST reuse for untouched
                sheets. A real CSSOM handle lazily promotes only its owner to
                persistent parser storage, not every repeated component style. */
             if (cssom) {
                 int error; struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                if (sheet) add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,d->next_sheet_order++,sheet->media,scope,sheet);
+                if (sheet) add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,d->next_sheet_order++,sheet->media,scope,sheet,blocks);
                 else if (error==CSSOM_OOM) web_js_console(d,2,"Native style sheet allocation failed");
             } else {
                 sbuf b = {0}; text_of(c,&b);
                 /* HTML "update a style block": CSP's inline check for the
                    child text (cssom_style_sheet makes it for a CSSOM sheet). */
                 if (doc_style_csp_allowed(d,c,b.p ? b.p : "",b.n))
-                    add_sheet(d,b.p ? b.p : "",b.n,d->base,d->next_sheet_order++,media,scope);
+                    add_sheet(d,b.p ? b.p : "",b.n,d->base,d->next_sheet_order++,media,scope,blocks);
                 sb_free(&b);
             }
             break;
@@ -880,7 +928,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
         for (uint32_t i = 0; i < n->adopted_count; i++) {
             struct cssom_sheet *s = n->adopted_sheets[i];
             if (!s->disabled) add_sheet_ast(d, s->p.source, s->p.length, s->base,
-                d->next_sheet_order++, s->media, scope, s);
+                d->next_sheet_order++, s->media, scope, s, false);
         }
     }
 }
@@ -1721,6 +1769,7 @@ static void doc_release(web_doc *d) {
     d->frame_docs = web_frames_detach(d);
     for (web_doc *c = d->frame_docs; c; c = c->frame_free_next) { doc_release(c); family_release(c->dom_docs); }
     web_js_free(d);
+    doc_named_free(d);
     html_policy_free(d);
     web_animations_doc_free(d);
     pv_free(&d->marquees);
@@ -1880,7 +1929,7 @@ void web_stylesheet_loaded(web_doc *d, const char *css, size_t n) {
     if (css) {
         /* skip a UTF-8 byte order mark */
         if (n >= 3 && !memcmp(css, "\xEF\xBB\xBF", 3)) css += 3, n -= 3;
-        add_sheet(d, css, n, p->url, p->order, p->media, p->scope);
+        add_sheet(d, css, n, p->url, p->order, p->media, p->scope, false);
     }
     free(p->url);
     free(p->media);

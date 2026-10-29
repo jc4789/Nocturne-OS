@@ -130,7 +130,7 @@ static bool csp_request_allowed(struct web_js_state *s,struct js_pending *p,cons
    blocked by Content Security Policy?" for an inline script's source text. */
 static bool csp_script_allowed(struct web_js_state *s,node_t *n,bool parser_inserted,const char *text,size_t length){
     if(!s->doc->html_policy || !s->doc->html_policy->first)return true;
-    struct html_csp_element element={.nonce=node_attr(n,"nonce"),.nonceable=html_policy_nonceable(n),.parser_inserted=parser_inserted};
+    struct html_csp_element element={.nonce=doc_element_csp_nonce(n),.nonceable=html_policy_nonceable(n),.parser_inserted=parser_inserted};
     struct csp_site site={s,n};
     return html_policy_inline_allowed(s->doc,HTML_CSP_SCRIPT,&element,text,length,csp_report,&site);
 }
@@ -139,7 +139,7 @@ static bool csp_script_allowed(struct web_js_state *s,node_t *n,bool parser_inse
    document without a realm (scripting off) is checked, unreported. */
 bool web_js_csp_style_allowed(web_doc *d,node_t *n,bool attribute,const char *text,size_t length){
     if(!d || !d->html_policy || !d->html_policy->first)return true;
-    struct html_csp_element element={.nonce=node_attr(n,"nonce"),.nonceable=html_policy_nonceable(n)};
+    struct html_csp_element element={.nonce=doc_element_csp_nonce(n),.nonceable=html_policy_nonceable(n)};
     struct csp_site site={d->js,n};
     return html_policy_inline_allowed(d,attribute?HTML_CSP_STYLE_ATTRIBUTE:HTML_CSP_STYLE,&element,text?text:"",length,csp_report,&site);
 }

@@ -379,6 +379,7 @@ static void XMLCALL start_element(void *data, const XML_Char *name, const XML_Ch
             element->custom_is = ar_strdup(&owner->mem, attrs[i].value); break;
         }
     owner->mem.trap = old;
+    if (owner == x->d) doc_parser_element_created(element);
     element->custom_registry_id = owner->custom_registry_id;
     element->custom_registry_realm = owner->custom_registry_realm;
     /* HTML: a script the parser creates with XML scripting support enabled

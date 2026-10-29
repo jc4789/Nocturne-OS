@@ -13,11 +13,17 @@ static int64_t aes_test_random(void *bytes,size_t size){if(size>65536)return -1;
 #define n_random aes_test_random
 #include "../user/libc/web/js_crypto.c"
 #undef n_random
+/* js_crypto.c's parallel work (RSA key generation) without a thread here: Start makes the key
+   at once, so no word is ever watched. */
+int thrd_create(thrd_t *thr,thrd_start_t func,void *arg){(void)thr;(void)func;(void)arg;return thrd_error;}
+int thrd_detach(thrd_t thr){(void)thr;return thrd_error;}
+n_result wake_address(volatile uint32_t *address,unsigned count){(void)address;(void)count;return 0;}
+int web_atomics_watch_word(JSContext *ctx,volatile uint32_t *word,uint32_t expected,JSValueConst callback){(void)ctx;(void)word;(void)expected;(void)callback;return 1;}
 static void exception(JSContext *ctx){JSValue e=JS_GetException(ctx),stack=JS_GetPropertyStr(ctx,e,"stack");const char *s=JS_ToCString(ctx,e),*t=JS_ToCString(ctx,stack);fprintf(stderr,"%s\n%s\n",s?s:"exception",t?t:"");JS_FreeCString(ctx,s);JS_FreeCString(ctx,t);JS_FreeValue(ctx,stack);JS_FreeValue(ctx,e);}
 static JSValue evaluate(JSContext *ctx,const char *source,const char *name){JSValue v=JS_Eval(ctx,source,strlen(source),name,JS_EVAL_TYPE_GLOBAL);if(JS_IsException(v)){exception(ctx);exit(2);}return v;}
 static void load(JSContext *ctx,const char *path){FILE *f=fopen(path,"rb");if(!f){perror(path);exit(2);}fseek(f,0,SEEK_END);long size=ftell(f);rewind(f);char *source=malloc((size_t)size+1);if(!source||fread(source,1,(size_t)size,f)!=(size_t)size)exit(2);fclose(f);source[size]=0;JS_FreeValue(ctx,evaluate(ctx,source,path));free(source);}
 static JSValue url(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){(void)self;(void)argc;(void)argv;return JS_NewString(ctx,"https://example.com/");}
-static int await_result(JSContext *ctx,JSValue p){JSContext *job;int n;while((n=JS_ExecutePendingJob(JS_GetRuntime(ctx),&job))>0){}if(n<0){exception(job);exit(2);}JSValue result=JS_PromiseResult(ctx,p);if(JS_PromiseState(ctx,p)!=JS_PROMISE_FULFILLED){JS_Throw(ctx,result);exception(ctx);exit(2);}int count=0;if(JS_ToInt32(ctx,&count,result)<0)exit(2);JS_FreeValue(ctx,result);JS_FreeValue(ctx,p);return count;}
+static int await_result(JSContext *ctx,JSValue p){JSContext *job;int n;for(;;){while((n=JS_ExecutePendingJob(JS_GetRuntime(ctx),&job))>0){}if(n<0){exception(job);exit(2);}JSValue ran=evaluate(ctx,"__runPosted()","posted tasks");bool more=JS_ToBool(ctx,ran)>0;JS_FreeValue(ctx,ran);if(!more)break;}JSValue result=JS_PromiseResult(ctx,p);if(JS_PromiseState(ctx,p)!=JS_PROMISE_FULFILLED){JS_Throw(ctx,result);exception(ctx);exit(2);}int count=0;if(JS_ToInt32(ctx,&count,result)<0)exit(2);JS_FreeValue(ctx,result);JS_FreeValue(ctx,p);return count;}
 #ifndef WORKER_BODY_NATIVE
 int main(int argc,char **argv){
     JSRuntime *rt=JS_NewRuntime();JSContext *ctx=JS_NewContext(rt);
@@ -25,7 +31,7 @@ int main(int argc,char **argv){
     JS_SetPropertyStr(ctx,host,"url",JS_NewCFunction(ctx,url,"url",0));
     JS_SetPropertyStr(ctx,global,"host",host);JS_FreeValue(ctx,global);
     load(ctx,"user/libc/web/js_dom_exception.js");
-    JS_FreeValue(ctx,evaluate(ctx,"globalThis.DOMException=domExceptionBridge.DOMException;host.decodeUTF8=(b,o,n)=>{let s='';for(const v of new Uint8Array(b,o,n))s+='%'+v.toString(16).padStart(2,'0');return decodeURIComponent(s);};","setup"));
+    JS_FreeValue(ctx,evaluate(ctx,"globalThis.DOMException=domExceptionBridge.DOMException;host.decodeUTF8=(b,o,n)=>{let s='';for(const v of new Uint8Array(b,o,n))s+='%'+v.toString(16).padStart(2,'0');return decodeURIComponent(s);};{const posted=[];host.postTask=f=>{posted.push(f);return posted.length;};globalThis.__runPosted=()=>{if(!posted.length)return false;posted.shift()();return true;};}","setup"));
     load(ctx,"user/libc/web/js_encoding.js");load(ctx,"user/libc/web/js_url.js");load(ctx,"user/libc/web/js_crypto.js");
     bool incremental=argc>1&&!strcmp(argv[1],"--incremental");
     load(ctx,"tests/js_aes_cases.js");printf("Production AES checks: %d\n",await_result(ctx,evaluate(ctx,incremental?"runGCMCases()":"runAESCases()","AES cases")));
