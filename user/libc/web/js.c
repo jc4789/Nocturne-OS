@@ -4466,7 +4466,7 @@ static bool permitted_script_url(struct web_js_state *s,const char *url) {
     return length<=UINT32_MAX && permitted_url(s,url,false);
 }
 static char *script_data_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]);
-static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],bool *untyped);
+static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],bool *untyped,char label[64]);
 static void worker_blob(struct web_js_state *s,struct js_pending *p);
 /* Console text is author data, not a diagnostic excerpt. Grow on demand and
  * report real allocation failure instead of truncating or aborting the task. */
@@ -5853,7 +5853,7 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
         char mime[128];
         p->response.body=web_url_has_scheme(p->url,"data")
             ? script_data_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime)
-            : script_blob_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime,NULL);
+            : script_blob_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime,NULL,NULL);
         if (!p->response.body) {
             if (JS_HasException(s->ctx)) exception(s);
             pending_error(p,"Unavailable local resource URL or invalid MIME type"); return false;
@@ -5995,7 +5995,7 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request, int 
            Other child requests are resolved at a later bounded task boundary. */
         if (kind == 0 && s->running) {
             char mime[128];
-            p->response.body=script_blob_source(s,url,true,&p->response.body_len,mime,NULL);
+            p->response.body=script_blob_source(s,url,true,&p->response.body_len,mime,NULL,NULL);
             if (!p->response.body) {
                 if (JS_HasException(s->ctx)) { JSValue error=JS_GetException(s->ctx); JS_FreeValue(s->ctx,error); }
                 pending_error(p,"Worker object URL is unavailable or has an invalid JavaScript MIME type");
@@ -6805,7 +6805,7 @@ static char *normalize_module(JSContext *ctx, const char *base, const char *name
 }
 /* The complete MIME Sniffing Standard JavaScript essence set. In particular,
    application/x-javascript is still valid for modules; it is not plain text. */
-static bool javascript_essence(const char *value, size_t len) {
+bool web_javascript_mime_essence(const char *value, size_t len) {
     static const char *const types[] = {
         "application/ecmascript", "application/javascript",
         "application/x-ecmascript", "application/x-javascript",
@@ -6817,6 +6817,14 @@ static bool javascript_essence(const char *value, size_t len) {
     for (size_t i = 0; i < sizeof types / sizeof *types; i++)
         if (strn_ieq(value, types[i], len)) return true;
     return false;
+}
+/* MIME Sniffing "JSON MIME type": a subtype ending in "+json", or the essence
+   application/json or text/json (ASCII case-insensitive). */
+bool web_json_mime_essence(const char *value, size_t len) {
+    const char *slash = memchr(value, '/', len);
+    size_t subtype_length = slash ? len - (size_t)(slash + 1 - value) : 0;
+    return (subtype_length >= 5 && strn_ieq(slash + 1 + subtype_length - 5, "+json", 5)) ||
+           strn_ieq(value, "application/json", len) || strn_ieq(value, "text/json", len);
 }
 static bool mime_space(unsigned char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
 static bool mime_token(unsigned char c) {
@@ -6866,7 +6874,7 @@ static bool content_type_essence(const char *raw, const char **essence, size_t *
 }
 static bool javascript_mime(const char *raw) {
     const char *essence; size_t length;
-    return content_type_essence(raw, &essence, &length) && javascript_essence(essence, length);
+    return content_type_essence(raw, &essence, &length) && web_javascript_mime_essence(essence, length);
 }
 /* MIME Sniffing "minimize a supported MIME type", into out (cap bytes, at
    least 32): what a Resource or Navigation Timing entry's contentType shows
@@ -6881,11 +6889,10 @@ static void minimized_content_type(const char *headers, char *out, size_t cap) {
     if (!content_type_essence(headers, &essence, &length)) return;
     const char *slash = memchr(essence, '/', length), *subtype = slash + 1;
     size_t subtype_length = length - (size_t)(subtype - essence);
-    bool plus_json = subtype_length >= 5 && strn_ieq(subtype + subtype_length - 5, "+json", 5);
     bool plus_xml = subtype_length >= 4 && strn_ieq(subtype + subtype_length - 4, "+xml", 4);
     const char *result = NULL;
-    if (javascript_essence(essence, length)) result = "text/javascript";
-    else if (plus_json || strn_ieq(essence, "application/json", length) || strn_ieq(essence, "text/json", length)) result = "application/json";
+    if (web_javascript_mime_essence(essence, length)) result = "text/javascript";
+    else if (web_json_mime_essence(essence, length)) result = "application/json";
     else if (strn_ieq(essence, "image/svg+xml", length)) result = "image/svg+xml";
     else if (plus_xml || strn_ieq(essence, "text/xml", length) || strn_ieq(essence, "application/xml", length)) result = "application/xml";
     if (result) { snprintf(out, cap, "%s", result); return; }
@@ -6914,7 +6921,7 @@ static char *script_data_source(struct web_js_state *s,const char *url,bool modu
     }
     struct web_data_url data;int result=web_data_url_process(url,&data,script_data_checkpoint,s);
     if(result!=1){if(result==-1)JS_ThrowOutOfMemory(s->ctx);else if(result==-2)JS_ThrowInternalError(s->ctx,"Data source conversion interrupted");else JS_ThrowTypeError(s->ctx,"Malformed data source URL");return NULL;}
-    size_t mn=strcspn(data.mime,";");bool javascript=javascript_essence(data.mime,mn);
+    size_t mn=strcspn(data.mime,";");bool javascript=web_javascript_mime_essence(data.mime,mn);
     if(module&&!javascript){web_data_url_free(&data);JS_ThrowTypeError(s->ctx,"Data module requires a JavaScript MIME type");return NULL;}
     if(mn<128){memcpy(mime,data.mime,mn);mime[mn]=0;}else strcpy(mime,"text/plain");
     if(data.length>JS_BODY_LIMIT){web_data_url_free(&data);JS_ThrowRangeError(s->ctx,"Data source length is not representable");return NULL;}
@@ -6951,9 +6958,10 @@ out:
     JS_FreeValue(ctx,buffer); JS_FreeValue(ctx,value); return source;
 }
 /* A blob: script's source: the Blob's bytes, with its type's MIME essence in mime (text/plain when
- * the type is not a valid MIME type; a module requires a JavaScript one). MIME and byte limits
- * remain native. */
-static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],bool *untyped) {
+ * the type is not a valid MIME type; a module requires a JavaScript one), and when label is not
+ * NULL the encoding label of a valid type's charset parameter ("" for none): a blob: URL's
+ * response has the Blob's type as its Content-Type. MIME and byte limits remain native. */
+static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],bool *untyped,char label[64]) {
     JSContext *ctx=s->ctx; char *type=NULL; size_t n=0,tn=0;
     char *source=blob_url_bytes(s,url,&n,&type,&tn);
     if (!source) return NULL;
@@ -6963,12 +6971,13 @@ static char *script_blob_source(struct web_js_state *s,const char *url,bool modu
     while (end>first && mime_space((unsigned char)end[-1])) end--;
     size_t mn=(size_t)(end-first);
     bool valid=valid_mime_essence(first,end) && mn<128;
-    if (module && (!valid || !javascript_essence(first,mn))) {
+    if (module && (!valid || !web_javascript_mime_essence(first,mn))) {
         JS_ThrowTypeError(ctx,"Blob module requires a JavaScript MIME type");
         js_free(ctx,source); js_free(ctx,type); return NULL;
     }
     if (valid) { memcpy(mime,first,mn); mime[mn]=0; } else strcpy(mime,"text/plain");
     if (untyped) *untyped=!mn;
+    if (label) { label[0]=0; if (valid) html_transport_label(type,label,64); }
     js_free(ctx,type); *length=n; return source;
 }
 /* Fetch's scheme fetch "blob" for a Worker's request (js_worker_runtime.js obtainBlob) whose URL
@@ -7259,7 +7268,7 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
         size_t length; char mime[128];
         char *source=web_url_has_scheme(url,"data")
             ? script_data_source(s,url,true,&length,mime)
-            : script_blob_source(s,url,true,&length,mime,NULL);
+            : script_blob_source(s,url,true,&length,mime,NULL,NULL);
         if (!source) return NULL;
         m=cache_module(s,url,source,length,url); js_free(ctx,source);
         if (!m) return NULL;
@@ -7423,7 +7432,7 @@ static bool script_type(node_t *n, bool *module) {
     if (!type || !*type) return true;
     while (is_space((unsigned char)*type)) type++;
     size_t len = strlen(type); while (len && is_space((unsigned char)type[len - 1])) len--;
-    return javascript_essence(type, len);
+    return web_javascript_mime_essence(type, len);
 }
 static JSValue script_compliant_source(void *opaque,node_t *node,JSValueConst input){
     struct web_js_state *s=opaque,*owner=node->owner && node->owner->js?node->owner->js:s;
@@ -8533,7 +8542,7 @@ static bool process_pending(struct web_js_state *s) {
                 ran_task = true; begin_named_task(s,"Worker object-URL source",p->worker);
                 if (p->worker_kind == 2) worker_blob(s,p);
                 else {
-                    p->response.body = script_blob_source(s,p->url,true,&p->response.body_len,mime,NULL);
+                    p->response.body = script_blob_source(s,p->url,true,&p->response.body_len,mime,NULL,NULL);
                     if (!p->response.body) {
                         if (JS_HasException(s->ctx)) exception(s);
                         pending_error(p,"Worker object URL is unavailable or has an invalid JavaScript MIME type");

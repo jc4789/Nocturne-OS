@@ -45,7 +45,7 @@ sources = "\n".join([
     cut("user/libc/web/webi.h", "static inline int lower(int c)", "\n") + "\n",
     function("user/libc/web/util.c", "bool strn_ieq(const char *a, const char *b, size_t n) {"),
     function("user/libc/web/image_source.c", "bool web_image_type_supported(const char *type, size_t n) {"),
-    cut("user/libc/web/js.c", "static bool javascript_essence(const char *value, size_t len) {",
+    cut("user/libc/web/js.c", "bool web_javascript_mime_essence(const char *value, size_t len) {",
         "static bool script_data_checkpoint(void *opaque) {"),
 ])
 (out / "sources.inc").write_text(sources, "utf-8", newline="\n")

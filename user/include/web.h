@@ -338,12 +338,15 @@ web_doc *web_live(const char *html, size_t len, const char *url, const char *cha
 /* HTML "load a document": the document a response of a Content-Type value
    (NULL or empty: none) makes. An HTML MIME type an HTML document, an XML
    MIME type (text/xml, application/xml, a subtype ending in "+xml") an XML
-   document; any other the host displays its own way. */
-enum web_document_kind { WEB_DOCUMENT_OTHER, WEB_DOCUMENT_HTML, WEB_DOCUMENT_XML };
+   document, a JavaScript MIME type, a JSON MIME type, text/css, text/plain,
+   text/vtt and the other text types a text document; any other the host
+   displays its own way. */
+enum web_document_kind { WEB_DOCUMENT_OTHER, WEB_DOCUMENT_HTML, WEB_DOCUMENT_XML, WEB_DOCUMENT_TEXT };
 enum web_document_kind web_document_kind(const char *type);
 /* A browsing context's document from a response: html is its body, headers
    its header block, type the Content-Type of html (NULL: text/html, as for
-   markup the host writes itself). An XML type loads an XML document. */
+   markup the host writes itself). An XML type loads an XML document, a text
+   type a text document (its bytes are text, never markup or script). */
 web_doc *web_live_response(const char *html,size_t len,const char *url,const char *charset,
                          const char *headers,const char *type,const struct web_host *host);
 void web_tick(web_doc *d, uint64_t now_ms);

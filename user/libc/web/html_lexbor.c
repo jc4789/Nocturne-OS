@@ -7,6 +7,7 @@
 #include "html_encoding.h"
 #include "html_policy.h"
 #include <lexbor/html/tree/insertion_mode.h>
+#include <lexbor/html/tokenizer/state.h>
 #include <lexbor/html/encoding.h>
 #include <lexbor/html/interfaces/form_element.h>
 #include <lexbor/html/interfaces/script_element.h>
@@ -181,6 +182,43 @@ struct html_parser *html_begin_mode(web_doc *d, const char *src, size_t n, const
 }
 struct html_parser *html_begin(web_doc *d, const char *src, size_t n, const char *charset, bool scripting) {
     return html_begin_mode(d,src,n,charset,scripting?HTML_SCRIPTING_NORMAL:HTML_SCRIPTING_DISABLED);
+}
+/* HTML "load a text document": "act as if the tokenizer had emitted a start tag token with the
+   tag name "pre" followed by a single U+000A LINE FEED (LF) character, and switch the HTML
+   parser's tokenizer to the PLAINTEXT state". Here the tokenizer reads that tag itself before
+   any byte of the document, and the LF is the first character the PLAINTEXT state reads: the
+   tree builder gets the same tokens (the pre's rule ignores that LF, so a leading LF of the text
+   stays), and no byte of the text can start a tag, a character reference or a script. The
+   document has no markup, so its encoding is never declared again (no raw bytes are kept). */
+struct html_parser *html_begin_text(web_doc *d, const char *src, size_t n, const char *charset, bool json, bool scripting) {
+    if (!d || !d->text_document) return NULL;
+    size_t length = 0;
+    char *text = html_decode_text(d, src, n, charset, json, &length);
+    if (!text) return NULL;
+    char *input = length < SIZE_MAX - 2 ? realloc(text, length + 2) : NULL;
+    if (!input) { free(text); return NULL; }
+    memmove(input + 1, input, length);
+    input[0] = '\n'; input[++length] = 0;
+    struct html_parser *p = parser_create(d, scripting ? HTML_SCRIPTING_NORMAL : HTML_SCRIPTING_DISABLED);
+    if (!p) { free(input); return NULL; }
+    if (!add_input(p, input, length, false)) { html_finish(p); return NULL; }
+    p->document = lxb_html_parse_chunk_begin(p->lex);
+    if (!p->document) { html_finish(p); return NULL; }
+    /* This parser's "parser cannot change the mode flag" is set. Lexbor reads iframe_srcdoc
+       only in the initial insertion mode, as "an iframe srcdoc document, or the parser cannot
+       change the mode flag": the flag is this parser's, not the document's (a parser that
+       document.open() makes has none). */
+    p->document->iframe_srcdoc = d;
+    p->root = lxb_dom_interface_node(p->document);
+    install_callback(p);
+    if (!html_bridge_init(p) || !html_bridge_import(p)) { html_finish(p); return NULL; }
+    static const char pre[] = "<pre>";
+    if (lxb_html_parse_chunk_process(p->lex, (const lxb_char_t *)pre, sizeof pre - 1) != LXB_STATUS_OK) {
+        html_finish(p); return NULL;
+    }
+    lxb_html_tokenizer_state_set(p->lex->tkz, lxb_html_tokenizer_state_plaintext_before);
+    d->root = p->native_root;
+    return p;
 }
 
 struct html_parser *html_open(web_doc *d) {

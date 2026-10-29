@@ -1125,17 +1125,6 @@ static char *error_page(const char *url, const char *msg) {
     return s.b;
 }
 
-static char *text_page(const char *url, const char *text, size_t n) {
-    struct sb s = {0};
-    const char *name = strrchr(url, '/');
-    sb_str(&s, "<!doctype html><title>");
-    sb_esc(&s, name && name[1] ? name + 1 : url, strlen(name && name[1] ? name + 1 : url));
-    sb_str(&s, "</title><pre style=\"white-space:pre-wrap;margin:8px\">");
-    sb_esc(&s, text, n);
-    sb_str(&s, "</pre>");
-    return s.b;
-}
-
 static char *image_page(const char *url) {
     struct sb s = {0};
     const char *name = strrchr(url, '/');
@@ -2374,8 +2363,8 @@ static void finish_navigation(void) {
     http_header(&headers, "Content-Type", ctype, sizeof ctype);
     char *html = NULL;
     size_t hlen = 0;
-    /* The Content-Type of html when it is the response's own body; NULL for
-       a page the browser writes (text/html). */
+    /* The computed type of html when it is the response's own body (an XML or a text
+       document); NULL for HTML, as for a page the browser writes. */
     const char *document_type = NULL;
     /* The settings are a page of the browser's own, with no document. */
     bool native_page = !f->error[0] && settings_url(web_response_url(f));
@@ -2396,19 +2385,16 @@ static void finish_navigation(void) {
             memcpy(charset_buf, cs, n); charset_buf[n] = 0; charset = charset_buf;
         }
         bool sniff_html = !ctype[0] && f->body_len && memchr(f->body, '<', MIN(f->body_len, 512));
-        /* HTML "load a document": HTML and XML types are documents of their
-           own kind (SVG too); the rest the browser displays its own way. */
-        enum web_document_kind kind = web_document_kind(ctype);
-        if (kind != WEB_DOCUMENT_OTHER || sniff_html) {
+        /* HTML "load a document": HTML, XML (SVG too) and text types are documents of their
+           own kind, which the engine makes from the body; the rest the browser displays its
+           own way. An unlabeled body is HTML when it looks like markup, else plain text. */
+        const char *computed = ctype[0] ? ctype : sniff_html ? "text/html" : "text/plain";
+        enum web_document_kind kind = web_document_kind(computed);
+        if (kind != WEB_DOCUMENT_OTHER) {
             html = f->body; hlen = f->body_len; f->body = NULL;
-            if (kind == WEB_DOCUMENT_XML) document_type = ctype;
+            if (kind != WEB_DOCUMENT_HTML) document_type = computed;
         } else if (has_prefix(ctype, "image/")) { html = image_page(web_response_url(f)); image = web_response_url(f); charset = "utf-8"; }
-        /* The text page wraps the body's bytes: they are in the body's charset, else UTF-8. */
-        else if (has_prefix(ctype, "text/") || !ctype[0] || strstr(ctype, "json") ||
-                 strstr(ctype, "javascript") || strstr(ctype, "xml")) {
-            html = text_page(web_response_url(f), f->body, f->body_len);
-            if (!charset) charset = "utf-8";
-        } else {
+        else {
             char message[256];
             snprintf(message, sizeof message, "Cannot display %s (%lu bytes).", ctype, (unsigned long)f->body_len);
             html = error_page(web_response_url(f), message);
