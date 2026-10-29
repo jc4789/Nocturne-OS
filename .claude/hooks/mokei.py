@@ -9,8 +9,8 @@
 - コードのつながり：codegraph の索引（.codegraph/）。編集した関数を呼ぶ所を、編集の直後に一度だけ出す。
 
 ここは見せるだけで、作業を止めない。止めるのは二つ：ユーザーへの返事に日本語が無いとき（Stop）と、
-ユーザーが禁じた命令（PreToolUse。窓なしの QEMU、媒体の写し、build の下の記録、写しで動く試験の道具、
-目標の無いビルド。2026-10-29）。
+ユーザーが禁じた命令（PreToolUse。窓なしの QEMU、三台目の QEMU、三つ目の媒体、build の下の記録、
+窓なしのままの試験の道具、目標の無いビルド。2026-10-29）。
 使い方は .claude/skills/mokei/SKILL.md にある。失敗は .claude/mokei/errors.log に残し、会話には出さない。
 """
 import datetime
@@ -32,26 +32,32 @@ MACHINE = ("<task-notification", "<side-sessions-event", "<ci-monitor-event", "<
            "This session is being continued from a previous conversation", "[Artifact comment")
 EDITS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 SHELLS = {"Bash", "PowerShell"}
-# シェルの命令にこれがあれば、物差しを測った（ログを読んだ・撮った・QEMU を起こした）と数える。
-# 試験の道具（test.py・platform_qa・wpt）と記録のフォルダー（hikaku）は数えない：10-28〜29 の会話では
-# 「測った」の大半がそれらで、本物（一つの媒体を窓付きで見る）から離れた。
+# シェルの命令にこれがあれば、物差しを測った（ログを読んだ・撮った・QEMU を起こした・対象を絞った WPT を回した）と数える。
+# platform_qa と記録のフォルダー（hikaku）は数えない：10-28〜29 の会話では「測った」の大半がそれらで、
+# 本物（媒体を窓付きで見る）から離れた。
 MEASURE = ("serial.log", "screendump", "qemu-system", "hv-serial", "hv-boot", "System.log",
-           "browser log", "browser trace")
+           "browser log", "browser trace", "wpt.py", "scripts/test.py", "scripts\\test.py")
 # 実行の前に止める命令（2026-10-29 ユーザーの指示）。読むだけの命令（grep・ls など）は build の道の規則から除く。
 READ_ONLY = ("grep", "rg ", "git ", "ls", "cat ", "find ", "head ", "tail ", "sed -n", "wc ", "stat ", "dir ",
              "Get-ChildItem", "Get-Content", "Select-String", "Test-Path", "Get-Item")
 FORBIDDEN = (
     (re.compile(r"qemu-system[^\n;&|]*(-display\s+(none|egl-headless)|-nographic)"),
-     "QEMU を窓なしで起動する命令。QEMU は窓付きで一台（nocturne-project スキル）。ユーザーはその窓を見ている。", False),
-    (re.compile(r"python[^\n]*scripts[/\\](test|platform_qa|wpt|qtest)\.py"),
-     "媒体を写して窓なしの QEMU を起こす試験の道具。使わない。要るなら道具を一つの媒体・窓付きに直してから。", False),
-    (re.compile(r"build[/\\](qa|nocturne-platform|wpt|test\.img|run\.img)\b"),
-     "build の下の記録のフォルダー・写しの媒体。build には今のビルドの出力だけ。画像とログは会話の作業場（scratchpad）へ。", True),
-    (re.compile(r"(\bcp\b|\bcopy\b|Copy-Item|robocopy|qemu-img\s+convert)[^\n]*nocturne\.img"),
-     "媒体の写し。媒体は build/nocturne.img の一つだけ。", False),
+     "QEMU を窓なしで起動する命令。QEMU は窓付きで二台まで（nocturne-project スキル）。ユーザーはその窓を見ている。", False),
+    (re.compile(r"python[^\n]*scripts[/\\](platform_qa|qtest)\.py"),
+     "媒体を何枚も写して窓なしの QEMU を起こす道具。使わない。試験は wpt.py（対象を絞る）と test.py を窓付きに直して使う。", False),
+    (re.compile(r"build[/\\](qa|nocturne-platform)\b"),
+     "build の下の記録のフォルダー。build には今のビルドの出力と試験の道具の出力（build/wpt）だけ。画像とログは会話の作業場（scratchpad）へ。", True),
     (re.compile(r"python[^\n]*scripts[/\\]build\.py(?:\s+(?:-j|--jobs)\s*\d+)?\s*(?:2>&1\s*)?(?:$|[|;&])", re.M),
      "目標の無いビルド（既定は all で vhd・vhdx・iso まで作る）。確かめは qemu-image、Hyper-V へ渡すときだけ all と書く。", False),
 )
+# 数で止めるもの（2026-10-29 夕、ユーザー）：QEMU は同時に二台まで（何台も起こして RAM が尽き、ページングに落ちて
+# 速さの値が歪んだ）、build の下の媒体（.img）は本線と写し一つの二つまで。試験の道具は、窓なしの印が残る間は止める。
+MAX_QEMU = 2
+MAX_IMAGES = 2
+TOOL_RUN = re.compile(r"python[^\n]*scripts[/\\](test|wpt)\.py")
+TOOL_IMAGE = {"test.py": "test.img", "wpt.py": "wpt.img"}  # 道具が自分で作る写し
+HEADLESS = re.compile(r'-display"[^\n]*"(none|egl-headless)"|CREATE_NO_WINDOW')
+COPY_IMAGE = re.compile(r"(\bcp\b|\bcopy\b|Copy-Item|robocopy|qemu-img\s+convert)[^\n]*nocturne\.img")
 NOTES = Path(".claude") / "oboegaki.md"
 CODE = {".c", ".h", ".inc", ".cc", ".cpp", ".cxx", ".hh", ".hpp",
         ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx", ".rs", ".go"}
@@ -558,6 +564,41 @@ def reads_only(command):
     return head.startswith(READ_ONLY)
 
 
+def deny(ws, command, why):
+    ws.record("blocked", text=one_line(command, 120))
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": "止めた：" + why
+                                   + "（2026-10-29 ユーザーの指示。.claude/skills/nocturne-project/SKILL.md）"}}
+
+
+def running_qemu():
+    """動いている qemu-system の数。試験では MOKEI_QEMU_RUNNING で与える。"""
+    override = os.environ.get("MOKEI_QEMU_RUNNING")
+    if override is not None:
+        return int(override)
+    try:
+        done = subprocess.run(["tasklist", "/FI", "IMAGENAME eq qemu-system-x86_64.exe", "/NH", "/FO", "CSV"],
+                              capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    return sum(1 for line in done.stdout.decode("utf-8", "replace").splitlines() if line.startswith('"qemu-system'))
+
+
+def images(root):
+    """build の下の媒体（.img）。本線の nocturne.img と、直下か一段下の写し。"""
+    build = root / "build"
+    return sorted(set(build.glob("*.img")) | set(build.glob("*/*.img")))
+
+
+def headless_tool(root, name):
+    """試験の道具のスクリプトに、QEMU を窓なしで起こす印が残っているか。"""
+    try:
+        text = (root / "scripts" / name).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return bool(HEADLESS.search(text))
+
+
 def on_pre_tool(ws, data):
     """禁じられた命令を実行の前に止め、理由を返す。"""
     if data.get("tool_name") not in SHELLS:
@@ -567,10 +608,28 @@ def on_pre_tool(ws, data):
         if skip_reads and reads_only(command):
             continue
         if pattern.search(command):
-            ws.record("blocked", text=one_line(command, 120))
-            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                           "permissionDecisionReason": "止めた：" + why
-                                           + "（2026-10-29 ユーザーの指示。.claude/skills/nocturne-project/SKILL.md）"}}
+            return deny(ws, command, why)
+    tool = TOOL_RUN.search(command)
+    if tool:
+        name = tool.group(1) + ".py"
+        if headless_tool(ws.root, name):
+            return deny(ws, command, f"scripts/{name} は今の作りだと QEMU を窓なしで起こす（-display none か CREATE_NO_WINDOW が"
+                                     "残っている）。先に窓付きに直してから、対象を絞って走らせる。")
+        if running_qemu() >= MAX_QEMU:
+            return deny(ws, command, f"QEMU が既に {MAX_QEMU} 台動いていて、道具がもう一台起こす。先に一台を quit する。")
+        others = [path.name for path in images(ws.root) if path.name != TOOL_IMAGE[name]]
+        if len(others) >= MAX_IMAGES:
+            return deny(ws, command, f"媒体は {MAX_IMAGES} つまで。build に既に " + "、".join(others)
+                                     + " があり、道具の写しが三つ目になる。要らない写しを片づけてから。")
+        return None
+    if "qemu-system" in command and not reads_only(command) and running_qemu() >= MAX_QEMU:
+        return deny(ws, command, f"QEMU は同時に {MAX_QEMU} 台まで。何台も起こすと RAM が尽きてページングに落ち、"
+                                 "速さの値が歪む。先に一台を quit する。")
+    if COPY_IMAGE.search(command):
+        found = [path.name for path in images(ws.root)]
+        if len(found) >= MAX_IMAGES:
+            return deny(ws, command, f"媒体は {MAX_IMAGES} つまで。build に既に " + "、".join(found)
+                                     + " がある。写しは一つまでで、要らない写しを片づけるか上書きで使い回す。")
     return None
 
 
