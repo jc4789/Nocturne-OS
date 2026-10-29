@@ -7072,6 +7072,10 @@ struct dent {
                           (css-anchor-position-1 §6.4) */
     bool inline_style;
     struct cascade_layer *layer;
+    /* the tree of its style sheet (CSS Shadow 1 §4.2), which the tree-scoped names and references it
+       gives keep (struct cx's tree): NULL the document's, else a shadow root. A shared sheet's
+       declarations are one, so it is the binding's, not the declaration's. */
+    const node_t *tree;
 };
 
 
@@ -7081,7 +7085,7 @@ static int scope_depth(node_t *root) {
     return depth;
 }
 
-static void add_dent(const struct decl *d, uint64_t key, uint8_t pseudo, int depth) {
+static void add_dent(const struct decl *d, uint64_t key, uint8_t pseudo, int depth, const node_t *tree) {
     if (ndents == capdents) {
         if(capdents>INT_MAX/2)ar_alloc(css_scratch_get()->arena,SIZE_MAX);
         int capacity = capdents ? capdents * 2 : 256;
@@ -7097,14 +7101,16 @@ static void add_dent(const struct decl *d, uint64_t key, uint8_t pseudo, int dep
     dents[ndents].scope_depth = depth;
     dents[ndents].animation = dents[ndents].transition = dents[ndents].position_try = false;
     dents[ndents].inline_style=false;dents[ndents].layer=NULL;
+    dents[ndents].tree = tree;
     ndents++;
 }
 
-static void add_rule_decls(const struct rule *r, uint32_t spec, uint32_t order, bool author, uint8_t pseudo, int depth,struct cascade_layer *layer) {
+static void add_rule_decls(const struct rule *r, uint32_t spec, uint32_t order, bool author, uint8_t pseudo, int depth,
+                           struct cascade_layer *layer, const node_t *tree) {
     for (int i = 0; i < r->ndecls; i++) {
         uint64_t key = (author ? 1ull << 62 : 0) | (uint64_t)(spec & 0x3FFFFFFF) << 32 |
                        (uint64_t)(order & 0xFFFFFF) << 8 | (uint64_t)(i < 255 ? i : 255);
-        add_dent(&r->decls[i], key, pseudo, depth);
+        add_dent(&r->decls[i], key, pseudo, depth, tree);
         dents[ndents-1].layer=layer;
     }
 }
@@ -7185,8 +7191,11 @@ static void collect(const struct ient *l, const struct element_keys *k, node_t *
         scratch->form_snapshot = previous;
         if (matches) {
             struct cascade_layer *layer=binding_layer(binding,l->r->layer);
+            /* a scoped sheet's tree is its shadow root; the user agent's applies in every tree as the
+               element's own */
             add_rule_decls(l->r, l->sel->spec, l->order + binding->order, !binding->ua,
-                           l->pseudo == PE_SLOTTED ? PE_NONE : l->pseudo, depth,layer);
+                           l->pseudo == PE_SLOTTED ? PE_NONE : l->pseudo, depth,layer,
+                           binding->ua ? css_tree_scope(e) : scope);
         }
     }
 }
@@ -8557,18 +8566,22 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     for (int i = 0; i < ndents; i++)
         if (dents[i].pseudo == pseudo && dents[i].d->p && css_prop_is_early(dents[i].d->p)) {
             cx.tree_mismatch = !dents[i].animation && !dents[i].position_try && dents[i].scope_depth < tree_depth;
+            cx.tree = dents[i].tree;
             apply_decl(c, &cx, &dents[i],rollback,&has_rollback);
         }
     cx.font_pass = false;
     cx.tree_mismatch = false;
+    cx.tree = NULL;
     cx.em = s->font_size;
     if (mine && registry) resolve_vars(d, c->a, &cx, mine, inherited, true, root_element);
     for (int i = 0; i < ndents; i++)
         if (dents[i].pseudo == pseudo && dents[i].d->p) {
             cx.tree_mismatch = !dents[i].animation && !dents[i].position_try && dents[i].scope_depth < tree_depth;
+            cx.tree = dents[i].tree;
             apply_decl(c, &cx, &dents[i],rollback,&has_rollback);
         }
     cx.tree_mismatch = false;
+    cx.tree = NULL;
     if (!pseudo) web_dialog_style(d,e,s);
     if(pseudo==PE_BACKDROP) {
         if(s->position!=POS_FIXED && s->position!=POS_ABSOLUTE)s->position=POS_ABSOLUTE;
@@ -8694,7 +8707,7 @@ static void motion_emit(void *arg, const struct propdef *p, const char *value) {
     struct cascade *c = m->c;
     struct decl *x = ar_alloc(c->a, sizeof *x);
     *x = (struct decl){.p = p, .value = ar_strdup(c->a, value)};
-    add_dent(x, 0, m->pseudo, 0);
+    add_dent(x, 0, m->pseudo, 0, css_tree_scope(m->node));
     dents[ndents - 1].animation = true;
     dents[ndents - 1].transition = m->transition;
 }
@@ -8705,7 +8718,7 @@ static void motion_emit_custom(void *arg, const char *name, const char *value) {
     struct cascade *c = m->c;
     struct decl *x = ar_alloc(c->a, sizeof *x);
     *x = (struct decl){.name = ar_strdup(c->a, name), .value = ar_strdup(c->a, value ? value : "initial")};
-    add_dent(x, 0, m->pseudo, 0);
+    add_dent(x, 0, m->pseudo, 0, css_tree_scope(m->node));
     dents[ndents - 1].animation = true;
     dents[ndents - 1].transition = m->transition;
 }
@@ -8753,9 +8766,14 @@ static style_t *motion_compute(struct cascade *c, node_t *e, const style_t *pare
     if (after != final && after != base) *after_out = after;
     return final;
 }
-/* css-anchor-position-1 §6.4: the @position-try rule of a name, searched as @keyframes are */
-static const struct position_try_rule *position_try_lookup(struct cascade *c, node_t *n, const char *name) {
-    for (node_t *root = doc_node_root(n, false); root; root = root->shadow_host ? doc_node_root(root->shadow_host, false) : NULL) {
+/* css-anchor-position-1 §6.4: the @position-try rule of a name, a tree-scoped reference (CSS Shadow 1
+   §4.2): searched in the tree of the position-try-fallbacks declaration (tree, struct cx's), then
+   outward through its hosts' trees, as @keyframes are; *found_tree: the tree that has it */
+static const struct position_try_rule *position_try_lookup(struct cascade *c, node_t *n, const char *name,
+                                                           const node_t *tree, const node_t **found_tree) {
+    for (node_t *root = tree ? (node_t *)tree : doc_node_root(n, true); root;
+         root = root->shadow_host ? doc_node_root(root->shadow_host, false) : NULL) {
+        *found_tree = root->shadow_host ? root : NULL;
         const struct position_try_rule *found = NULL;
         struct cascade_layer *found_layer = NULL;
         struct css_scope *scope = root->style_scope;
@@ -8786,9 +8804,13 @@ static void position_try_styles(struct cascade *c, node_t *e, const style_t *par
         struct css_position_try *o = &options[i];
         o->style = NULL;
         if (o->rule) {
-            const struct position_try_rule *rule = position_try_lookup(c, e, o->rule);
+            const node_t *rule_tree = NULL;
+            const struct position_try_rule *rule = position_try_lookup(c, e, o->rule, tries->tree, &rule_tree);
             if (!rule) continue;
-            for (int j = 0; j < rule->count; j++) { add_dent(&rule->decls[j], (uint64_t)j, pseudo, 0); dents[ndents - 1].position_try = true; }
+            for (int j = 0; j < rule->count; j++) {
+                add_dent(&rule->decls[j], (uint64_t)j, pseudo, 0, rule_tree);
+                dents[ndents - 1].position_try = true;
+            }
         } else if (o->area[0] && area) {
             sbuf text = {0};
             bool written = css_position_area_text(o->area, &text);
@@ -8796,7 +8818,7 @@ static void position_try_styles(struct cascade *c, node_t *e, const style_t *par
             if (x) *x = (struct decl){.p = area, .value = ar_strndup(c->a, text.p ? text.p : "", text.n)};
             sb_free(&text);
             if (!x) continue;
-            add_dent(x, 0, pseudo, 0); dents[ndents - 1].position_try = true;
+            add_dent(x, 0, pseudo, 0, css_tree_scope(e)); dents[ndents - 1].position_try = true;
         } else continue;
         qsort(dents, (size_t)ndents, sizeof *dents, cmp_dent);
         o->style = compute(c, e, parent, pseudo);
@@ -9979,7 +10001,9 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
             }
     }
     int depth = scope_depth(doc_node_root(e, false));
-    for (int i = 0; i < h.n; i++) add_dent(&h.d[i], 1ull << 62, PE_NONE, depth);
+    /* presentational hints and the style attribute are of the element's own tree */
+    const node_t *own_tree = css_tree_scope(e);
+    for (int i = 0; i < h.n; i++) add_dent(&h.d[i], 1ull << 62, PE_NONE, depth, own_tree);
     /* the declarations the style attribute stands for: none when CSP blocked it, the exact
        ones when a CSSOM change wrote it (css_inline_text) */
     const char *sa = css_inline_text(e);
@@ -9989,7 +10013,8 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
         for(int i=0;i<nd;i++)if(container_units_used(ds[i].value))
             __atomic_store_n(&((struct css_ctx *)d->sty.ctx)->containers,true,__ATOMIC_RELEASE);
         for (int i = 0; i < nd; i++) {
-            add_dent(&ds[i], 1ull << 62 | (uint64_t)0x3FFFFFFF << 32 | (uint64_t)(i < 255 ? i : 255), PE_NONE, depth);
+            add_dent(&ds[i], 1ull << 62 | (uint64_t)0x3FFFFFFF << 32 | (uint64_t)(i < 255 ? i : 255), PE_NONE, depth,
+                     own_tree);
             dents[ndents-1].inline_style=true;
         }
     }

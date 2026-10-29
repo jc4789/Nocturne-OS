@@ -3253,6 +3253,7 @@ static bool area_computed_text(sbuf *out, const uint8_t a[2]) {
 static bool parse_anchor_names(const char *v, size_t n, struct cx *cx, bool scope, struct css_anchor_names *out) {
     *out = (struct css_anchor_names){0};
     if (ident_is(v, n, "none")) return true;
+    out->tree = cx->tree;
     if (scope && ident_is(v, n, "all")) { out->all = true; return true; }
     uint32_t count = 1;
     for (size_t i = 0; i < n; i++) if (v[i] == ',') count++;
@@ -3278,8 +3279,9 @@ static bool anchor_names_text(sbuf *out, const struct css_anchor_names *names, b
         if ((i && !anchor_text(out, ", ")) || !anchor_text(out, names->name[i])) return false;
     return true;
 }
+/* computed values compare a tree-scoped name's tree too (CSS Shadow 1 §4.2) */
 static bool anchor_names_equal(const struct css_anchor_names *a, const struct css_anchor_names *b) {
-    if (a->count != b->count || a->all != b->all) return false;
+    if (a->count != b->count || a->all != b->all || ((a->count || a->all) && a->tree != b->tree)) return false;
     for (uint32_t i = 0; i < a->count; i++) if (strcmp(a->name[i], b->name[i])) return false;
     return true;
 }
@@ -3323,7 +3325,7 @@ static bool parse_try_fallbacks(const char *v, size_t n, struct cx *cx, struct c
         if (!length || !parse_try_option(item, length, cx, &options[i])) return false;
         p = comma ? comma + 1 : e;
     }
-    out->option = options; out->count = count;
+    out->option = options; out->count = count; out->tree = cx->tree;
     return true;
 }
 static bool try_option_text(sbuf *out, const struct css_position_try *o) {
@@ -3394,6 +3396,7 @@ static bool anchor_value_parse(uint8_t which, const char *v, size_t n, struct cx
             if (!dashed_ident(v, n)) return false;
             anchor.kind = CSS_ANCHOR_NAMED;
             anchor.name = ar_strndup(cx->a, v, n);
+            anchor.tree = cx->tree;
         }
         *(struct css_position_anchor *)field = anchor;
         return !specified || anchor_text(specified, anchor.name ? anchor.name : kw_name(kinds, anchor.kind));
@@ -3454,12 +3457,12 @@ static bool anchor_value_equal(uint8_t which, const void *a, const void *b) {
     case CSS_ANCHOR_NAME: case CSS_ANCHOR_SCOPE: return anchor_names_equal(a, b);
     case CSS_POSITION_ANCHOR: {
         const struct css_position_anchor *x = a, *y = b;
-        return x->kind == y->kind && same_name(x->name, y->name);
+        return x->kind == y->kind && same_name(x->name, y->name) && (!x->name || x->tree == y->tree);
     }
     case CSS_POSITION_AREA: return !memcmp(a, b, 2);
     case CSS_POSITION_TRY_FALLBACKS: {
         const struct css_position_tries *x = a, *y = b;
-        if (x->count != y->count) return false;
+        if (x->count != y->count || (x->count && x->tree != y->tree)) return false;
         for (uint32_t i = 0; i < x->count; i++) if (!try_option_equal(&x->option[i], &y->option[i])) return false;
         return true;
     }
@@ -3550,7 +3553,7 @@ const struct css_anchor_function *css_anchor_function_read(struct css_calc_parse
     }
     bool side = false;
     for (int i = 0; i < k; i++) {
-        if (dashed_ident(t[i], tl[i]) && !f->name) { f->name = ar_strndup(cx.a, t[i], tl[i]); continue; }
+        if (dashed_ident(t[i], tl[i]) && !f->name) { f->name = ar_strndup(cx.a, t[i], tl[i]); f->tree = cx.tree; continue; }
         if (side) return NULL;
         if (size) {
             if (!kw_find(kw_anchor_size, t[i], tl[i], &kw)) return NULL;
@@ -3587,7 +3590,7 @@ bool css_anchor_function_text(sbuf *out, const struct css_anchor_function *f) {
 bool css_anchor_function_equal(const struct css_anchor_function *a, const struct css_anchor_function *b) {
     if (a == b) return true;
     if (!a || !b || a->size != b->size || a->side != b->side || a->percent != b->percent ||
-        a->percent_function != b->percent_function || !same_name(a->name, b->name) ||
+        a->percent_function != b->percent_function || !same_name(a->name, b->name) || (a->name && a->tree != b->tree) ||
         a->fallback_given != b->fallback_given) return false;
     return !a->fallback_given || css_length_equal(&a->fallback, &b->fallback);
 }
@@ -10813,8 +10816,10 @@ bool css_anim_parse(const struct css_anim_ctx *c, const struct propdef *p, const
     if (!set) set = local;
     memset(set, 0, NPROPS);
     const style_t *parent = c->parent;
+    /* the animation origin's declarations are the element's own: its tree's (CSS Shadow 1 §4.2) */
     struct cx cx = {.s = out, .parent = parent, .node = c->node, .em = parent ? parent->font_size : 16, .rem = c->rem,
-                    .vw = c->vw, .vh = c->vh, .a = c->a, .set = set, .font_pass = true, .computed_text = computed};
+                    .vw = c->vw, .vh = c->vh, .a = c->a, .set = set, .font_pass = true, .computed_text = computed,
+                    .tree = css_tree_scope(c->node)};
     /* font-size first, against the parent's, as the cascade does; then the rest against it */
     if (css_prop_is_early(p) && !css_apply(p, v, n, &cx)) return false;
     cx.font_pass = false;

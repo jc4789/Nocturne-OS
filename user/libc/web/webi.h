@@ -590,14 +590,22 @@ struct css_offset {
 /* CSS Anchor Positioning 1 (css-anchor-position-1): anchor-name (§2.1), anchor-scope (§2.2),
    position-anchor (§2.4), position-area (§3.1), position-try-fallbacks (§6.1), position-try-order
    (§6.2) and position-visibility (§6.6). A style holds them as one group (style_t's anchor). Names
-   are <dashed-ident>s with their escapes resolved. */
+   are <dashed-ident>s with their escapes resolved.
+   The names are tree-scoped (CSS Shadow 1 §4.2, the shadow-names section): each value keeps the tree
+   of the style sheet whose declaration gave it (struct cx's tree; NULL the document's, else a shadow
+   root), also when it is inherited, and its serialization drops it. anchor-name's names are loosely
+   matched (a reference from their tree or a tree inside it finds them), anchor-scope's strictly (only
+   anchor names of their own tree, all too); position-anchor, anchor() and anchor-size() and
+   position-try-fallbacks' rule names are references, which look from their tree outward. */
 struct css_anchor_names {
     const char *const *name;
     uint32_t count;      /* 0: none */
     bool all;            /* anchor-scope: all */
+    const node_t *tree;  /* with count or all: the tree the names are from */
 };
 enum { CSS_ANCHOR_NORMAL, CSS_ANCHOR_NONE, CSS_ANCHOR_AUTO, CSS_ANCHOR_NAMED, CSS_ANCHOR_MATCH_PARENT };
-struct css_position_anchor { const char *name; uint8_t kind; }; /* kind CSS_ANCHOR_*; name: CSS_ANCHOR_NAMED */
+/* kind CSS_ANCHOR_*; name and its tree: CSS_ANCHOR_NAMED */
+struct css_position_anchor { const char *name; uint8_t kind; const node_t *tree; };
 /* <position-area> (§3.1.2): a keyword of each axis, the block axis's (or the horizontal axis's)
    first; the computed value holds the long logical keywords. css_area_keyword describes one. */
 enum { CSS_AREA_X = 1, CSS_AREA_Y, CSS_AREA_BLOCK, CSS_AREA_INLINE, CSS_AREA_SELF_BLOCK, CSS_AREA_SELF_INLINE,
@@ -620,7 +628,8 @@ struct css_position_try {
        base styles, or (rule set) no @position-try rule has the name, and the option is skipped. */
     const struct style *style;
 };
-struct css_position_tries { const struct css_position_try *option; uint32_t count; }; /* count 0: none */
+/* count 0: none; tree: the tree its rule names are looked up from (with count) */
+struct css_position_tries { const struct css_position_try *option; uint32_t count; const node_t *tree; };
 enum { CSS_TRY_ORDER_NORMAL, CSS_TRY_ORDER_MOST_WIDTH, CSS_TRY_ORDER_MOST_HEIGHT, CSS_TRY_ORDER_MOST_BLOCK,
        CSS_TRY_ORDER_MOST_INLINE };
 enum { CSS_VISIBLE_ANCHOR_VALID = 1, CSS_VISIBLE_ANCHOR_VISIBLE = 2, CSS_VISIBLE_NO_OVERFLOW = 4 }; /* 0: always */
@@ -643,6 +652,7 @@ struct css_anchor_function {
     bool percent_function; /* a math function gave the percentage: it serializes as calc() */
     float percent;
     const char *name;   /* NULL: the default anchor */
+    const node_t *tree; /* with name: the tree the reference is from */
     bool fallback_given;
     len_t fallback;
 };
@@ -1898,7 +1908,16 @@ struct cx {
     void *record_opaque;
     bool tree_mismatch;       /* the declaration is from an outer tree than node's (css-values-5 §10: a
                                  tree-counting function's reference fails to match) */
+    const node_t *tree;       /* the tree of the declaration's style sheet, which its tree-scoped names
+                                 and references keep (CSS Shadow 1 §4.2): NULL the document's, else a
+                                 shadow root (css_tree_scope) */
 };
+/* the tree scope of a node's tree, as struct cx's tree names it: NULL the document's (or no
+   shadow root's), else the shadow root */
+static inline const node_t *css_tree_scope(const node_t *n) {
+    while (n && n->parent) n = n->parent;
+    return n && n->shadow_host ? n : NULL;
+}
 /* apply a declaration (var() already substituted) unless its properties are all set; false if invalid */
 bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx);
 bool css_value_supported(const struct propdef *p, const char *value, size_t n);
