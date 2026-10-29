@@ -87,8 +87,11 @@ static box_t *boxes[256];
 static int nboxes;
 static box_t *root;
 
-/* an element's computed style with the declarations "property: value; ..." (longhands) */
-static style_t *style_of(const char *decls) {
+/* an element's computed style with the declarations "property: value; ..." (longhands). With a node,
+   the declarations are of a style sheet of its tree (CSS Shadow 1 §4.2): cssprop.c takes their tree
+   from the context node (css_tree_scope), where the guest's cascade takes it from the style sheet's
+   binding (css.c's collect) */
+static style_t *style_for(const char *decls, node_t *node) {
     style_t *s = ar_alloc(&values, sizeof *s);
     css_style_init(s, &parent_style);
     css_style_finish(s, &parent_style, false);
@@ -102,7 +105,8 @@ static style_t *style_of(const char *decls) {
         while (*name == ' ') name++;
         for (char *e = name + strlen(name); e > name && e[-1] == ' '; ) *--e = 0;
         const struct propdef *p = css_prop_lookup(name, strlen(name));
-        struct css_anim_ctx c = {.base = s, .parent = &parent_style, .rem = 16, .vw = 800, .vh = 600, .a = &values};
+        struct css_anim_ctx c = {.base = s, .parent = &parent_style, .node = node, .rem = 16, .vw = 800, .vh = 600,
+                                 .a = &values};
         style_t next;
         if (!p || !css_anim_parse(&c, p, value, strlen(value), false, &next, NULL)) {
             char what[256];
@@ -114,9 +118,14 @@ static style_t *style_of(const char *decls) {
     }
     return s;
 }
+static style_t *style_of(const char *decls) { return style_for(decls, NULL); }
+/* shadow roots: the trees other than the document's (NULL) */
+static node_t *shadows[16];
+static int nshadows;
 static void scene(float width, float height) {
     for (int i = 0; i < nboxes; i++) { box_anchor_free(boxes[i]); free(boxes[i]->node); free(boxes[i]); }
-    nboxes = ncontents = 0;
+    for (int i = 0; i < nshadows; i++) free(shadows[i]);
+    nboxes = ncontents = nshadows = 0;
     ar_free(&doc.lmem);
     memset(&doc, 0, sizeof doc);
     doc.width = (int)width; doc.height = (int)height;
@@ -129,10 +138,14 @@ static void scene(float width, float height) {
     root->node->type = N_ELEM; root->node->owner = &doc; root->node->box = root; root->node->style = root->st;
     doc.root_box = root;
 }
-static box_t *element(box_t *parent, const char *decls) {
+/* an element whose declarations are of tree's style sheets (a shadow root; NULL the document's).
+   Its node stands in that tree (css_tree_scope walks a node's parents to its root); the box tree is
+   the flat tree. */
+static box_t *element_in(box_t *parent, const char *decls, node_t *tree) {
     box_t *b = calloc(1, sizeof *b);
     node_t *n = calloc(1, sizeof *n);
-    b->st = style_of(decls);
+    n->parent = tree;
+    b->st = style_for(decls, tree ? n : NULL);
     n->type = N_ELEM; n->owner = &doc; n->box = b; n->style = b->st;
     b->node = n; b->kind = B_BLOCK; b->parent = parent;
     if (parent->last) parent->last->next = b; else parent->first = b;
@@ -143,7 +156,18 @@ static box_t *element(box_t *parent, const char *decls) {
     boxes[nboxes++] = b;
     return b;
 }
-static void restyle(box_t *b, const char *decls) { b->st = b->node->style = style_of(decls); }
+static box_t *element(box_t *parent, const char *decls) { return element_in(parent, decls, NULL); }
+/* the shadow root attached to host's element */
+static node_t *shadow(box_t *host) {
+    node_t *r = calloc(1, sizeof *r);
+    r->type = N_FRAGMENT; r->owner = &doc; r->shadow_host = host->node;
+    host->node->shadow_root = r;
+    shadows[nshadows++] = r;
+    return r;
+}
+static void restyle(box_t *b, const char *decls) {
+    b->st = b->node->style = style_for(decls, b->node->parent ? b->node : NULL);
+}
 static void content(box_t *b, float min_w, float max_w, float h) {
     contents[ncontents++] = (struct content){b, min_w, max_w, h};
 }
@@ -426,6 +450,117 @@ int main(void) {
         layout(abs, 2);
         near(used_inset(pa, 0), 20, "scope --a: --a top");
         near(used_inset(pb, 0), 40, "scope --a: --b top");
+    }
+
+    /* tree-scoped names (§2.1, §2.2; CSS Shadow 1 §4.2). anchor-name is loosely matched: a reference
+       from a shadow tree finds a name of its own tree or of a tree around it, never one of a sibling
+       or an inner tree. anchor-scope (its names, and all) is strictly matched: it scopes only the
+       anchor names of its own tree. */
+    group = "tree-scoped";
+    {
+        /* anchor-name-in-shadow-002.html: two hosts, each shadow tree with an anchor --a and a fixed
+           box at anchor(--a left) and anchor(--a bottom). (The page's two shadow trees share one style
+           sheet; that the tree is the binding's and not the shared declaration's is css.c's.) */
+        scene(800, 600);
+        box_t *host1 = element(root, "width: 100px; height: 100px");
+        at(host1, 0, 0, 100, 100);
+        node_t *s1 = shadow(host1);
+        at(element_in(host1, "anchor-name: --a; width: 100px; height: 100px", s1), 0, 0, 100, 100);
+        box_t *t1 = element_in(host1, "position: fixed; left: anchor(--a left); top: anchor(--a bottom); width: 100px; "
+                               "height: 100px", s1);
+        box_t *host2 = element(root, "width: 100px; height: 100px");
+        at(host2, 200, 100, 100, 100);
+        node_t *s2 = shadow(host2);
+        at(element_in(host2, "anchor-name: --a; width: 100px; height: 100px", s2), 0, 0, 100, 100);
+        box_t *t2 = element_in(host2, "position: fixed; left: anchor(--a left); top: anchor(--a bottom); width: 100px; "
+                               "height: 100px", s2);
+        box_t *fixed[] = {t1, t2};
+        layout(fixed, 2);
+        offsets(t1, 0, 100, 100, 100, "anchor-name-in-shadow-002 target1");
+        offsets(t2, 200, 200, 100, 100, "anchor-name-in-shadow-002 target2");
+
+        /* anchor-name-shadow-lower-tree.html: the document's box does not find a name of the host's
+           shadow tree (both insets take their fallbacks) */
+        scene(800, 600);
+        box_t *host = element(root, "width: 200px; height: 100px");
+        at(host, 50, 50, 200, 100);
+        node_t *s = shadow(host);
+        at(element_in(host, "anchor-name: --lower-anchor; width: 100px; height: 50px", s), 0, 0, 100, 50);
+        box_t *target = element(root, "position: absolute; left: anchor(--lower-anchor end, 37px); "
+                                "top: anchor(--lower-anchor start, 37px); width: 50px; height: 50px");
+        layout(&target, 1);
+        offsets(target, 37, 37, 50, 50, "anchor-name-shadow-lower-tree");
+
+        /* anchor-name-shadow-higher-tree.html: a shadow tree's box finds its host's name of the
+           document (the page's logical insets, in horizontal-tb ltr) */
+        scene(800, 600);
+        host = element(root, "anchor-name: --higher-anchor; width: 200px; height: 100px");
+        at(host, 50, 50, 200, 100);
+        s = shadow(host);
+        target = element_in(host, "position: absolute; top: anchor(--higher-anchor start, 37px); "
+                            "left: anchor(--higher-anchor end, 37px); width: 50px; height: 50px", s);
+        layout(&target, 1);
+        offsets(target, 250, 50, 50, 50, "anchor-name-shadow-higher-tree");
+
+        /* two trees down: a reference from a shadow tree inside a shadow tree finds the document's
+           --a, not a later --a of a sibling host's shadow tree */
+        scene(800, 600);
+        box_t *cb = element(root, "position: relative; width: 400px; height: 400px");
+        at(cb, 0, 0, 400, 400);
+        at(element(cb, "anchor-name: --a; width: 20px; height: 20px"), 0, 0, 20, 20);
+        host1 = element(cb, "width: 400px; height: 100px");
+        at(host1, 0, 20, 400, 100);
+        s1 = shadow(host1);
+        host2 = element_in(host1, "width: 400px; height: 100px", s1);
+        at(host2, 0, 0, 400, 100);
+        s2 = shadow(host2);
+        target = element_in(host2, "position: absolute; position-anchor: --a; top: anchor(bottom); left: anchor(right); "
+                            "width: 5px; height: 5px", s2);
+        box_t *host3 = element(cb, "width: 400px; height: 100px");
+        at(host3, 0, 120, 400, 100);
+        node_t *s3 = shadow(host3);
+        at(element_in(host3, "anchor-name: --a; width: 30px; height: 30px", s3), 0, 0, 30, 30);
+        layout(&target, 1);
+        offsets(target, 20, 20, 5, 5, "a shadow tree in a shadow tree");
+
+        /* anchor-scope-shadow-all.html and anchor-scope-shadow-names.html (test_part): the shadow tree's
+           anchor --a and a ::part() element, the box's parent, scoped by the document's rule; then the
+           same scope from the shadow tree's own style sheet, which does scope --a */
+        static const char *const scopes[] = {"anchor-scope: all", "anchor-scope: --a"};
+        for (int i = 0; i < 4; i++) {
+            bool own = i >= 2;
+            scene(800, 600);
+            host = element(root, "width: 400px; height: 200px");
+            at(host, 0, 0, 400, 200);
+            s = shadow(host);
+            cb = element_in(host, "position: relative; width: 200px; height: 200px", s);
+            at(cb, 0, 0, 200, 200);
+            at(element_in(cb, "anchor-name: --a; height: 10px", s), 0, 0, 200, 10);
+            box_t *part = element_in(cb, scopes[i & 1], own ? s : NULL);
+            at(part, 0, 10, 200, 0);
+            target = element_in(part, "position: absolute; top: anchor(bottom, 1px); position-anchor: --a; "
+                                "width: 5px; height: 5px", s);
+            layout(&target, 1);
+            char name[96];
+            snprintf(name, sizeof name, "%s from %s", scopes[i & 1], own ? "the shadow tree" : "::part()");
+            offsets(target, 0, own ? 1 : 10, 5, 5, name);
+        }
+
+        /* anchor-scope-shadow-names.html (test_slot): a slotted element of the document is not scoped
+           by its host's shadow tree's anchor-scope (the slot generates no box) */
+        scene(800, 600);
+        cb = element(root, "position: relative; width: 50px; height: 50px");
+        at(cb, 0, 0, 50, 50);
+        at(element(cb, "anchor-name: --a; height: 10px"), 0, 0, 50, 10);
+        host = element(cb, "width: 50px");
+        at(host, 0, 10, 50, 0);
+        s = shadow(host);
+        box_t *scope = element_in(host, "anchor-scope: --a", s);
+        at(scope, 0, 0, 50, 0);
+        target = element(scope, "position: absolute; top: anchor(bottom, 1px); position-anchor: --a; width: 5px; "
+                         "height: 5px");
+        layout(&target, 1);
+        offsets(target, 0, 10, 5, 5, "slotted under a shadow tree's anchor-scope");
     }
 
     /* acceptable anchor elements (§2.3): an absolutely positioned anchor after the box in tree

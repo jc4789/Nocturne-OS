@@ -5754,25 +5754,43 @@ static bool anchor_names_has(const struct css_anchor_names *n, const char *name)
     for (uint32_t i = 0; i < n->count; i++) if (!strcmp(n->name[i], name)) return true;
     return false;
 }
+/* CSS Shadow 1 §4.2 tree-scoped names. A tree is a style sheet's (struct cx's tree): NULL the
+   document's, else a shadow root, inside its host's tree. A loosely matched name (anchor-name) is
+   found by a reference (position-anchor, anchor(), anchor-size()) from its own tree or from a tree
+   inside it: the reference's tree, or one around it, is the name's. */
+static const node_t *tree_outer(const node_t *tree) {
+    return tree && tree->shadow_host ? css_tree_scope(tree->shadow_host) : NULL;
+}
+static bool tree_reference_reaches(const node_t *reference, const node_t *name) {
+    for (unsigned depth = 0; depth < 4096; depth++, reference = tree_outer(reference)) {
+        if (reference == name) return true;
+        if (!reference) return false;
+    }
+    return false;
+}
 static bool box_within(const box_t *b, const box_t *ancestor) {
     for (; b; b = b->parent) if (b == ancestor) return true;
     return false;
 }
-/* §2.2: the nearest element at or above b whose anchor-scope scopes name */
-static const box_t *anchor_scope_of(const box_t *b, const char *name) {
+/* §2.2: the nearest element at or above b whose anchor-scope scopes name of tree. anchor-scope's
+   names are strictly matched tree-scoped names, and all too affects only the anchor names of its own
+   tree: a scope from another tree (::part(), :host, a shadow tree's above a slotted element) leaves
+   the name alone. */
+static const box_t *anchor_scope_of(const box_t *b, const char *name, const node_t *tree) {
     for (; b; b = b->parent) {
         if (b->anon || !b->node || b->node->type != N_ELEM || !b->st || !b->st->anchor) continue;
         const struct css_anchor_names *s = &b->st->anchor->scope;
-        if (s->all || anchor_names_has(s, name)) return b;
+        if ((s->all || anchor_names_has(s, name)) && s->tree == tree) return b;
     }
     return NULL;
 }
 /* an anchor's name is visible only in its scope's subtree, and a scope's descendants see that
    name only on anchors within it */
 static bool anchor_in_scope(const box_t *anchor, const box_t *p, const char *name) {
-    const box_t *s = anchor_scope_of(anchor, name);
+    const node_t *tree = anchor->st->anchor->name.tree;
+    const box_t *s = anchor_scope_of(anchor, name, tree);
     if (s && (p == s || !box_within(p, s))) return false;
-    s = p->parent ? anchor_scope_of(p->parent, name) : NULL;
+    s = p->parent ? anchor_scope_of(p->parent, name, tree) : NULL;
     return !s || box_within(anchor, s);
 }
 /* the top layer a box is in: 0 none, else above every lower one */
@@ -5826,17 +5844,22 @@ static bool anchor_acceptable(box_t *anchor, box_t *p, box_t *pcb) {
     }
     return false;
 }
-/* §2.3 the target anchor element of a name: the nearest acceptable ancestor, else the last
-   acceptable anchor element in tree order */
-static box_t *anchor_target(box_t *p, box_t *pcb, const char *name) {
+/* x's anchor name loosely matches the reference name from tree */
+static bool anchor_named(const box_t *x, const char *name, const node_t *tree) {
+    const struct css_anchor_names *n = &x->st->anchor->name;
+    return anchor_names_has(n, name) && tree_reference_reaches(tree, n->tree);
+}
+/* §2.3 the target anchor element of a name (a reference from tree): the nearest acceptable
+   ancestor, else the last acceptable anchor element in tree order */
+static box_t *anchor_target(box_t *p, box_t *pcb, const char *name, const node_t *tree) {
     for (box_t *x = p->parent; x; x = x->parent)
-        if (anchor_principal(x) && anchor_names_has(&x->st->anchor->name, name) && anchor_in_scope(x, p, name) &&
+        if (anchor_principal(x) && anchor_named(x, name, tree) && anchor_in_scope(x, p, name) &&
             anchor_acceptable(x, p, pcb)) return x;
     struct layout_context *lc = layout_current();
     if (!lc->anchors_listed) anchors_list();
     for (struct anchor_entry *e = lc->anchors; e; e = e->next) {
         box_t *x = e->box;
-        if (anchor_names_has(&x->st->anchor->name, name) && anchor_in_scope(x, p, name) && anchor_acceptable(x, p, pcb))
+        if (anchor_named(x, name, tree) && anchor_in_scope(x, p, name) && anchor_acceptable(x, p, pcb))
             return x;
     }
     return NULL;
@@ -5850,7 +5873,8 @@ static box_t *anchor_default(box_t *p, const style_t *base, const style_t *used,
     const struct css_anchor *an = css_style_anchor(used);
     uint8_t kind = an->position_anchor.kind;
     if (kind == CSS_ANCHOR_NORMAL) kind = an->area[0] ? CSS_ANCHOR_AUTO : CSS_ANCHOR_NONE;
-    if (kind == CSS_ANCHOR_NAMED) return an->position_anchor.name ? anchor_target(p, pcb, an->position_anchor.name) : NULL;
+    if (kind == CSS_ANCHOR_NAMED)
+        return an->position_anchor.name ? anchor_target(p, pcb, an->position_anchor.name, an->position_anchor.tree) : NULL;
     if (kind == CSS_ANCHOR_AUTO) {
         /* §2.4.1 a pseudo-element's implicit anchor element is its originating element */
         box_t *origin = anchor_pseudo(p, base) ? p->node->box : NULL;
@@ -6019,7 +6043,7 @@ static bool anchor_rect_for(struct anchor_attempt *t, box_t *anchor, double r[4]
 /* §3.2.1, §5.1.1: an anchor function's length, false when it is not resolvable */
 static bool anchor_resolve(void *context, const struct css_anchor_function *f, unsigned axis, int inset, float *out) {
     struct anchor_attempt *t = context;
-    box_t *target = f->name ? anchor_target(t->p, t->pcb, f->name) : t->default_anchor;
+    box_t *target = f->name ? anchor_target(t->p, t->pcb, f->name, f->tree) : t->default_anchor;
     if (!f->name) { t->referenced_default = true; if (!target) t->missing_default = true; }
     if (!target) return false;
     double r[4];
