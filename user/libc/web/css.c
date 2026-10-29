@@ -9545,7 +9545,8 @@ static bool same_translation(const style_t *a,const style_t *b){
     }
     return !x&&!y;
 }
-bool css_style_layout_equal(const style_t *a,const style_t *b) {
+/* differs: the first byte of the final field comparison that differs (debug_js reports) */
+static bool style_layout_equal(const style_t *a,const style_t *b,size_t *differs) {
     if(a==b)return true;
     if(!a || !b)return false;
     const struct web_font_choice *fa=a->font_choices,*fb=b->font_choices;
@@ -9626,9 +9627,10 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.grid_areas=y.grid_areas=NULL;
     for(int i=0;i<4;i++)x.grid_place[i].name=y.grid_place[i].name=NULL;
     x.before=y.before=x.after=y.after=x.backdrop=y.backdrop=x.placeholder=y.placeholder=NULL;
-    /* Custom properties have already been resolved into real properties. Paint
+    /* Custom properties have already been resolved into real properties (the
+       chain and where its own entries end live in each restyle's arena). Paint
        data/colors are replaced in boxes/runs, but cannot change geometry. */
-    x.vars=y.vars=NULL; x.gradient=y.gradient=NULL; x.box_shadow=y.box_shadow=NULL;
+    x.vars=y.vars=x.vars_inherited=y.vars_inherited=NULL; x.gradient=y.gradient=NULL; x.box_shadow=y.box_shadow=NULL;
     memset(x.corner_radius,0,sizeof x.corner_radius);memset(y.corner_radius,0,sizeof y.corner_radius);
     x.border_radius=y.border_radius=0; /* decoration clipping does not change layout */
     x.bg_image=y.bg_image=NULL;x.mask=y.mask=NULL; /* mask layers paint over the laid-out boxes */
@@ -9647,8 +9649,10 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.bg_repeat=y.bg_repeat=x.bg_size_kind=y.bg_size_kind=0;
     memset(x.bg_size,0,sizeof x.bg_size);memset(y.bg_size,0,sizeof y.bg_size);
     x.svg_clip_rule=y.svg_clip_rule=0;
+    if(differs)for(size_t i=0;i<sizeof x;i++)if(((const unsigned char *)&x)[i]!=((const unsigned char *)&y)[i]){*differs=i;break;}
     return !memcmp(&x,&y,sizeof x);
 }
+bool css_style_layout_equal(const style_t *a,const style_t *b) { return style_layout_equal(a,b,NULL); }
 
 static bool transforms_equal(const struct css_transform *x, const struct css_transform *y) {
     for (; x && y; x = x->next, y = y->next)
@@ -9780,12 +9784,15 @@ void css_box_change_report(web_doc *d) {
     const style_t *a=e->style_previous,*b=e->style;
     const char *id=node_attr(e,"id"),*cls=node_attr(e,"class");
     char line[400];
-    snprintf(line,sizeof line,"Box rebuild from <%s id=%.40s class=%.80s>: layout-equal %d, display %d>%d, position %d>%d, overflow %d>%d, before %d>%d, after %d>%d, transform %d>%d general %d>%d, opacity %.3g>%.3g, animation %s",
-        e->name?e->name:"?",id?id:"",cls?cls:"",css_style_layout_equal(a,b),a->display,b->display,a->position,b->position,
+    size_t differs=SIZE_MAX;
+    bool equal=style_layout_equal(a,b,&differs);
+    snprintf(line,sizeof line,"Box rebuild from <%s id=%.40s class=%.80s>: layout-equal %d (first differing byte %ld of %lu), display %d>%d, position %d>%d, overflow %d>%d, before %d>%d, after %d>%d, transform %d>%d general %d>%d, opacity %.3g>%.3g, animation %s",
+        e->name?e->name:"?",id?id:"",cls?cls:"",equal,differs==SIZE_MAX?-1L:(long)differs,(unsigned long)sizeof *a,
+        a->display,b->display,a->position,b->position,
         a->overflow,b->overflow,a->before_generated,b->before_generated,a->after_generated,b->after_generated,
         css_translation_active(a),css_translation_active(b),css_transform_general(a),css_transform_general(b),
         (double)a->opacity,(double)b->opacity,b->animated?"sampled":"none");
-    web_js_console(d,1,line);
+    web_js_trace(d,line);
 }
 /* Descendants of an outermost <svg> generate no boxes: the root's atomic box
    owns a snapshot serialized from their computed paint. A restyle there only

@@ -1181,6 +1181,8 @@ void boxes_note_regen(web_doc *d,node_t *n){
 static struct {
     uint64_t locals, splices, regions, escalations, whole;
     struct { const char *reason; uint64_t count; } reasons[BOX_WHOLE_REASONS];
+    char region[120]; /* the element of the last region replaced */
+    bool change_reported; /* one restyle that changed boxes is named per report */
 } box_profile;
 static void box_profile_whole(const char *reason) {
     box_profile.whole++;
@@ -1198,6 +1200,7 @@ int web_box_report(char *out,size_t size) {
     int n=snprintf(out,size,"Native box profile: local publications %lu (splices %lu, regions %lu, escalations %lu), whole builds %lu",
         (unsigned long)box_profile.locals,(unsigned long)box_profile.splices,(unsigned long)box_profile.regions,
         (unsigned long)box_profile.escalations,(unsigned long)box_profile.whole);
+    if(box_profile.region[0] && n>=0 && (size_t)n<size)n+=snprintf(out+n,size-(size_t)n,", last region %s",box_profile.region);
     const char *separator=" by ";
     for(int i=0;i<BOX_WHOLE_REASONS && n>=0 && (size_t)n<size;i++)
         if(box_profile.reasons[i].count){
@@ -1349,6 +1352,10 @@ static enum local_step local_region(struct local *L,node_t *r,node_t **next){
     local_dirty(box);
     unpublish_boxes(old);
     L->changed++;L->regions++;
+    if(d->profile_enabled){
+        const char *id=node_attr(r,"id"),*cls=node_attr(r,"class");
+        snprintf(box_profile.region,sizeof box_profile.region,"<%s id=%.30s class=%.60s>",r->name?r->name:"?",id?id:"",cls?cls:"");
+    }
     return STEP_DONE;
 }
 
@@ -1517,6 +1524,7 @@ bool boxes_rebuild_local(web_doc *d){
     L->epoch=d->box_epoch;
     struct local_units u={0};
     bool ok=true;
+    if(d->profile_enabled && !box_profile.change_reported){box_profile.change_reported=true;css_box_change_report(d);}
     for(int i=0;ok && i+1<d->box_changes.n;i+=2)ok=local_request(L,&u,d->box_changes.v[i],d->box_changes.v[i+1]);
     for(node_t *e=d->style_retired_first;ok && e;e=e->style_retired_next)if(e->box_regen)ok=local_request(L,&u,e,NULL);
     if(ok){
