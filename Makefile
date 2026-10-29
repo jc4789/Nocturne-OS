@@ -392,20 +392,17 @@ $(LICENSES)/go/LICENSE:
 	@cp "$$("$(GO)" env GOROOT)/LICENSE" $@
 # TYPESCRIPT: Microsoft's TypeScript repository (a path below this folder, the
 # clone left at its commit) -> tsc, TypeScript's compiler written in Go (tsc/).
-# ports/typescript/nocturne.patch is applied to copies of the files it touches
-# under $(BUILD)/typescript and given to Go as an overlay; the clone is not changed.
+# The files Nocturne changes are kept whole in ports/typescript, at their paths in the clone,
+# and given to Go as an overlay; the clone is not changed and no source is copied into $(BUILD).
 ifneq ($(TYPESCRIPT),)
 TS_SRC := $(TYPESCRIPT)/tsc/go.mod $(TYPESCRIPT)/tsc/go.sum $(shell find $(TYPESCRIPT)/tsc/cmd/tsc \
           $(TYPESCRIPT)/tsc/internal -type f ! -name '*_test.go' ! -path '*/testdata/*')
-TS_PATCHED := $(shell sed -n 's|^+++ b/||p' ports/typescript/nocturne.patch)
+TS_PORT := $(patsubst ports/typescript/%,%,$(shell find ports/typescript/tsc -type f -name '*.go'))
 TS_OVERLAY := $(BUILD)/typescript/overlay.json
-$(TS_OVERLAY): ports/typescript/nocturne.patch $(wildcard $(addprefix $(TYPESCRIPT)/,$(TS_PATCHED)))
-	@rm -rf $(BUILD)/typescript/src
-	@for f in $(TS_PATCHED); do mkdir -p $(BUILD)/typescript/src/$$(dirname $$f); \
-	  if [ -f $(TYPESCRIPT)/$$f ]; then cp $(TYPESCRIPT)/$$f $(BUILD)/typescript/src/$$f; fi; done
-	@patch -s -p1 -d $(BUILD)/typescript/src < $<
-	@{ printf '{"Replace":{'; sep=; for f in $(TS_PATCHED); do \
-	  printf '%s"%s":"%s"' "$$sep" "$$(cygpath -m "$(CURDIR)/$(TYPESCRIPT)/$$f")" "$$(cygpath -m "$(CURDIR)/$(BUILD)/typescript/src/$$f")"; \
+$(TS_OVERLAY): $(addprefix ports/typescript/,$(TS_PORT))
+	@mkdir -p $(dir $@)
+	@{ printf '{"Replace":{'; sep=; for f in $(TS_PORT); do \
+	  printf '%s"%s":"%s"' "$$sep" "$$(cygpath -m "$(CURDIR)/$(TYPESCRIPT)/$$f")" "$$(cygpath -m "$(CURDIR)/ports/typescript/$$f")"; \
 	  sep=,; done; printf '}}\n'; } > $@
 GO_FILES += $(PROGRAMS)/tsc $(LICENSES)/typescript/LICENSE.txt
 $(PROGRAMS)/tsc: $(TS_SRC) $(TS_OVERLAY) ports/go/nocturne.patch

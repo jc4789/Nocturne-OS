@@ -136,7 +136,8 @@ $(MESA_GEN_STAMP): $(MESA_GEN_INPUTS)
 	@echo "  GEN  mesa"
 	@$(PY) ports/mesa/generate.py
 	@touch $@
-$(filter $(MESA_GEN)/%,$(MESA_GEN_SRC)): $(MESA_GEN_STAMP)
+# every generated source of MESA_SRC, llvmpipe's (LLVMPIPE_SRC) too: a clean build has none of them
+$(filter $(MESA_GEN)/%,$(MESA_SRC)): $(MESA_GEN_STAMP)
 	@:
 
 $(BUILD)/mesa/o/%.c.o: %.c $(MESA_FLAGS_RECORD) | $(MESA_GEN_STAMP)

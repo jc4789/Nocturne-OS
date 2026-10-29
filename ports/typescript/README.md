@@ -12,7 +12,9 @@ tsc にリンクされるモジュール（`golang.org/x/text` 等、`go version
 
 リポジトリーの複製を `tools/TypeScript` に置けば、`GO` があるビルドで自動で使います
 （別の場所なら `TYPESCRIPT=<このフォルダーの下のパス>`）。複製はそのコミットのまま使い、書き換えません。
-`nocturne.patch` は、触るファイルの写しへ `build/typescript/src` で当て、Go の `-overlay` で渡します。
+Nocturne が変えるファイルは、複製の中と同じ道で `ports/typescript/tsc/` にそのまま置き、
+Go の `-overlay` で複製のファイルの代わりに渡します（`build/typescript/overlay.json` は対応の表だけで、
+build にソースは写しません）。
 
 ```
 python scripts/build.py
@@ -31,7 +33,8 @@ Nocturne は UNIX ではないので、アプリを止めるのは `AppStop` で
 （Nocturne では `os.Interrupt` だけ）。それ以外は Go の移植（`os`、`net`、`os/exec` 等）の上で
 そのまま動きます。
 
-上流を新しくして差分が当たらなくなったら、`nocturne.patch` を新しいソースへ作り直します。
+上流を新しくしたら、`ports/typescript/tsc/cmd/tsc/` の `main.go`・`api.go`・`lsp.go` を新しいソースから
+取り直し、上の置き換えをもう一度入れます（`stopsignals.go`・`stopsignals_nocturne.go` は Nocturne のファイル）。
 
 ## 確認したこと（2026-10-26、QEMU、WHPX、4 CPU、4096 MiB、1920×1080）
 
