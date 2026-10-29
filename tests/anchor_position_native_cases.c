@@ -55,10 +55,16 @@ static void layout_inner(box_t *b, struct bfc *f, float ox, float oy, float cbh)
     float sh = resolved_content_height(b, cbh);
     b->h = clamp_h(b, sh >= 0 ? sh : c ? c->h : 0, cbh);
 }
-static float stf_width(box_t *b, float avail) {
+static void intrinsic(box_t *b, float *mn, float *mx) {
     const struct content *c = content_of(b);
+    *mn = c ? c->min_w : 0;
+    *mx = c ? c->max_w : 0;
+}
+static float stf_width(box_t *b, float avail) {
+    float mn, mx;
+    intrinsic(b, &mn, &mx);
     float a = avail - b->m[1] - b->m[3] - hext(b);
-    return fminf_(fmaxf_(c ? c->min_w : 0, a), c ? c->max_w : 0);
+    return fminf_(fmaxf_(mn, a), mx);
 }
 static void size_atomic(box_t *c, float cbw, float cbh) { (void)c; (void)cbw; (void)cbh; abort(); }
 static void table_width(box_t *t, float cw) { (void)t; (void)cw; abort(); }

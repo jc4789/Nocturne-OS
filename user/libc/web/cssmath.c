@@ -111,8 +111,11 @@ double css_unit_canonical(int unit, double v, const struct cx *cx) {
 }
 
 /* ---------------------------------------------------------------- the tree */
-/* N_ANCHOR: anchor() or anchor-size() (css-anchor-position-1), a <length> that layout resolves */
-enum { N_VALUE, N_KEY, N_SUM, N_PRODUCT, N_NEGATE, N_INVERT, N_FN, N_ANCHOR };
+/* N_ANCHOR: anchor() or anchor-size() (css-anchor-position-1), a <length> that layout resolves.
+   N_SIZE: calc-size()'s size keyword, a <length> that is the basis's size at used-value time.
+   N_CALC_SIZE: calc-size() (css-sizing-4 §7): key is the basis (CSS_SIZING_*), k[0] its tree (a <calc-sum>,
+   a nested calc-size(), fit-content()'s argument; NULL for a keyword and any), k[1] the calculation */
+enum { N_VALUE, N_KEY, N_SUM, N_PRODUCT, N_NEGATE, N_INVERT, N_FN, N_ANCHOR, N_SIZE, N_CALC_SIZE };
 enum { F_MIN, F_MAX, F_CLAMP, F_ROUND, F_MOD, F_REM, F_SIN, F_COS, F_TAN, F_ASIN, F_ACOS, F_ATAN, F_ATAN2, F_POW,
        F_SQRT, F_HYPOT, F_LOG, F_EXP, F_ABS, F_SIGN, F_COUNT };
 static const char *const fn_names[F_COUNT] = {"min", "max", "clamp", "round", "mod", "rem", "sin", "cos", "tan",
@@ -141,6 +144,7 @@ struct mp {
     int8_t pct; /* the base a percentage has here: T_PERCENT for its own type, -1: percentages fail */
     bool own;   /* T_PERCENT: the context says a percentage is a fraction, not of a basis it did not name */
     struct css_calc *made; /* P->raw: the last operator node the grammar made (a calc() without one wraps) */
+    bool size;  /* a calc-size() calculation whose basis is not any: the size keyword is a <length> */
 };
 static struct css_calc *node(struct mp *m, uint8_t op, unsigned n) {
     if (++m->P->nodes > CALC_NODES || n > 0xffff) return NULL;
@@ -531,13 +535,20 @@ static double fn_eval(uint8_t fn, uint8_t strategy, const double *x, const bool 
     }
     return NAN;
 }
-struct ev { double basis; const double *keys; const struct cx *cx; };
+/* size: the size keyword's value (calc-size()'s basis at used-value time) */
+struct ev { double basis; const double *keys; const struct cx *cx; double size; };
 static double ev(const struct css_calc *c, const struct ev *E) {
     switch (c->op) {
     case N_VALUE:
         if (c->unit == U_PERCENT) return own_percent(c) || isnan(E->basis) ? c->v : c->v * E->basis / 100;
         return css_unit_canonical(c->unit, c->v, E->cx);
     case N_KEY: return E->keys ? E->keys[c->key] : 0;
+    case N_SIZE: return E->size;
+    case N_CALC_SIZE: { /* §7.1: the basis's used value is the calculation's size */
+        struct ev inner = *E;
+        if (c->key == CSS_SIZING_LENGTH || c->key == CSS_SIZING_CALC_SIZE) inner.size = ev(c->k[0], E);
+        return ev(c->k[1], &inner);
+    }
     case N_NEGATE: return -ev(c->k[0], E);
     case N_INVERT: return 1 / ev(c->k[0], E);
     case N_SUM: {
@@ -572,8 +583,14 @@ static double ev(const struct css_calc *c, const struct ev *E) {
     return fn_eval(c->fn, c->key, x, present, c->n, c->k[0] && c->k[0]->type.e[T_ANGLE] == 1);
 }
 double css_calc_value(const struct css_calc *c, double basis, const double *keys, const struct cx *cx) {
-    struct ev E = {basis, keys, cx};
+    struct ev E = {basis, keys, cx, 0};
     return c ? ev(c, &E) : 0;
+}
+double css_calc_size_value(const struct css_calc *c, double size, double basis) {
+    struct ev E = {basis, NULL, NULL, size};
+    if (!c) return 0;
+    double v = ev(c, &E);
+    return isnan(v) ? 0 : v; /* §10.9: a top-level NaN is 0 */
 }
 
 /* ---------------------------------------------------------------- the grammar (§10.1) */
@@ -828,6 +845,11 @@ static struct css_calc *m_value(struct mp *m) {
         m->p++;
         return m_function(m, name, name_n);
     }
+    if (m->size && word_is(name, name_n, "size")) { /* calc-size()'s <calc-keyword>, a <length> (§7) */
+        struct css_calc *c = node(m, N_SIZE, 0);
+        if (c) c->type.e[T_LENGTH] = 1;
+        return c;
+    }
     for (unsigned i = 0; i < m->P->nkeys; i++)
         if (m->P->keys && m->P->keys[i] && word_is(name, name_n, m->P->keys[i])) {
             struct css_calc *c = node(m, N_KEY, 0);
@@ -911,6 +933,108 @@ static int8_t pct_base(unsigned accept) {
         if (accept & base_kind[i]) { dims++; base = i; }
     return dims == 1 ? base : T_PERCENT;
 }
+
+/* ---------------------------------------------------------------- calc-size() (css-sizing-4 §7) */
+static const struct { const char *name; uint8_t size; } sizing_names[] = {
+    {"auto", CSS_SIZING_AUTO}, {"min-content", CSS_SIZING_MIN_CONTENT}, {"max-content", CSS_SIZING_MAX_CONTENT},
+    {"fit-content", CSS_SIZING_FIT_CONTENT}, {"stretch", CSS_SIZING_STRETCH}, {"content", CSS_SIZING_CONTENT},
+    {"any", CSS_SIZING_ANY},
+    /* legacy name aliases of stretch and fit-content, as the keywords they stand for */
+    {"-webkit-fill-available", CSS_SIZING_STRETCH}, {"-moz-available", CSS_SIZING_STRETCH},
+    {"-webkit-fit-content", CSS_SIZING_FIT_CONTENT}, {"-moz-fit-content", CSS_SIZING_FIT_CONTENT}};
+int css_sizing_keyword(const char *s, size_t n) {
+    for (size_t i = 0; i < sizeof sizing_names / sizeof *sizing_names; i++)
+        if (sizing_names[i].size != CSS_SIZING_ANY && word_is(s, n, sizing_names[i].name)) return sizing_names[i].size;
+    return 0;
+}
+const char *css_sizing_name(int size) {
+    for (size_t i = 0; i < sizeof sizing_names / sizeof *sizing_names; i++)
+        if (sizing_names[i].size == size) return sizing_names[i].name;
+    return NULL;
+}
+static struct css_calc_type length_type(void) {
+    struct css_calc_type t = {{0}, -1};
+    t.e[T_LENGTH] = 1;
+    return t;
+}
+/* a <calc-sum> whose type matches <length-percentage> (§7: either argument) */
+static bool length_percentage(const struct css_calc *c) {
+    return c && (t_match(&c->type, CSS_CALC_LENGTH | CSS_CALC_PERCENT, T_LENGTH) & (CSS_CALC_LENGTH | CSS_CALC_PERCENT));
+}
+/* calc-size( after its '(' up to and past its ')': keywords are the <size-keyword>s the context allows */
+static struct css_calc *m_calc_size(struct mp *m, unsigned keywords) {
+    if (++m->P->depth > CALC_DEPTH) return NULL;
+    struct css_calc *result = NULL, *basis = NULL, *calc;
+    bool size = m->size;
+    int kind = 0;
+    m->size = false; /* the basis is not in terms of size */
+    sp(m);
+    if (m->p < m->e && ident_start(m->p, m->e)) {
+        const char *name = m->p, *q = m->p;
+        while (q < m->e && name_char((unsigned char)*q)) q++;
+        size_t k = (size_t)(q - name);
+        if (q < m->e && *q == '(') {
+            if (word_is(name, k, "calc-size")) {
+                m->p = q + 1;
+                if (!(basis = m_calc_size(m, keywords))) goto done;
+                kind = CSS_SIZING_CALC_SIZE;
+            } else if (word_is(name, k, "fit-content")) { /* a related sizing function */
+                if (!(keywords & 1u << CSS_SIZING_FIT_CONTENT_FN)) goto done;
+                m->p = q + 1;
+                basis = m_sum(m);
+                sp(m);
+                if (!length_percentage(basis) || (m->p < m->e && *m->p != ')')) goto done;
+                if (m->p < m->e) m->p++;
+                kind = CSS_SIZING_FIT_CONTENT_FN;
+            } /* otherwise a math function: the <calc-sum> below */
+        } else {
+            m->p = q;
+            kind = word_is(name, k, "any") ? CSS_SIZING_ANY : css_sizing_keyword(name, k);
+            if (!kind || (kind != CSS_SIZING_ANY && !(keywords & 1u << kind))) goto done;
+        }
+    }
+    if (!kind) {
+        if (!length_percentage(basis = m_sum(m))) goto done;
+        kind = CSS_SIZING_LENGTH;
+    }
+    sp(m);
+    if (m->p >= m->e || *m->p != ',') goto done;
+    m->p++;
+    m->size = kind != CSS_SIZING_ANY; /* any's calculation cannot use size */
+    calc = m_sum(m);
+    sp(m);
+    if (!length_percentage(calc) || (m->p < m->e && *m->p != ')')) goto done;
+    if (m->p < m->e) m->p++;
+    if (!(result = node(m, N_CALC_SIZE, 2))) goto done;
+    result->key = (uint8_t)kind;
+    result->k[0] = basis;
+    result->k[1] = calc;
+    result->type = length_type();
+done:
+    m->size = size;
+    m->P->depth--;
+    return result;
+}
+bool css_calc_is_size(const char *s, size_t n) {
+    while (n && is_space((unsigned char)*s)) { s++; n--; }
+    return n > 10 && word_is(s, 9, "calc-size") && s[9] == '(';
+}
+struct css_calc *css_calc_size_read(struct css_calc_parse *P, unsigned keywords, const char *s, size_t n) {
+    struct mp m = {P, s, s + n, T_LENGTH, false, NULL, false};
+    sp(&m);
+    if (!css_calc_is_size(m.p, (size_t)(m.e - m.p))) return NULL;
+    m.p += 10;
+    struct css_calc *c = m_calc_size(&m, keywords);
+    sp(&m);
+    return c && m.p == m.e ? c : NULL;
+}
+int css_calc_size_basis(const struct css_calc *c, const struct css_calc **tree) {
+    *tree = NULL;
+    while (c && c->op == N_CALC_SIZE && c->key == CSS_SIZING_CALC_SIZE) c = c->k[0];
+    if (!c || c->op != N_CALC_SIZE) return 0;
+    *tree = c->k[0];
+    return c->key;
+}
 bool css_calc_is_math(const char *s, size_t n) {
     const char *p = s, *e = s + n;
     while (p < e && is_space((unsigned char)*p)) p++;
@@ -947,7 +1071,9 @@ struct css_calc *css_calc_key(arena_t *a, unsigned index) {
     return c;
 }
 int css_calc_key_of(const struct css_calc *c) { return c && c->op == N_KEY ? c->key : -1; }
-bool css_calc_function_root(const struct css_calc *c) { return c && (c->op == N_FN || c->op == N_ANCHOR); }
+bool css_calc_function_root(const struct css_calc *c) {
+    return c && (c->op == N_FN || c->op == N_ANCHOR || c->op == N_CALC_SIZE);
+}
 /* anchor() and anchor-size() have no Typed OM object: OTHER */
 int css_calc_shape(const struct css_calc *c, double *v, int *unit, unsigned *n, struct css_calc *const **children) {
     *n = c ? c->n : 0;
@@ -1009,7 +1135,7 @@ static struct css_calc *rebuild(struct mp *m, const struct css_calc *c) {
         if (units[c->unit].rel == R_ABS) return (struct css_calc *)c;
         return mk_leaf(m, css_unit_canonical(c->unit, c->v, m->P->cx), U_PX, c->type);
     }
-    if (c->op == N_KEY || c->op == N_ANCHOR) return (struct css_calc *)c;
+    if (c->op == N_KEY || c->op == N_ANCHOR || c->op == N_SIZE) return (struct css_calc *)c;
     struct css_calc **k = ar_alloc(m->P->a, c->n * sizeof *k);
     for (unsigned i = 0; i < c->n; i++)
         if (c->k[i] && !(k[i] = rebuild(m, c->k[i]))) return NULL;
@@ -1124,6 +1250,23 @@ static void sorted(const struct css_calc *c, const struct css_calc **out) {
     for (unsigned i = 0; i < c->n; i++) if (!is_leaf(c->k[i])) out[k++] = c->k[i];
 }
 static void put_tree(struct out *o, const struct css_calc *c, const char *const *keys, bool bare);
+/* calc-size( basis , calculation ): each argument a calculation's serialization without calc() */
+static void put_calc_size(struct out *o, const struct css_calc *c, const char *const *keys) {
+    puts_(o, "calc-size(");
+    switch (c->key) {
+    case CSS_SIZING_LENGTH: put_tree(o, c->k[0], keys, true); break;
+    case CSS_SIZING_CALC_SIZE: put_calc_size(o, c->k[0], keys); break;
+    case CSS_SIZING_FIT_CONTENT_FN: puts_(o, "fit-content("); put_tree(o, c->k[0], keys, true); put(o, ")", 1); break;
+    default: {
+        const char *name = css_sizing_name(c->key);
+        if (!name) { o->ok = false; return; }
+        puts_(o, name);
+    }
+    }
+    put(o, ", ", 2);
+    put_tree(o, c->k[1], keys, true);
+    put(o, ")", 1);
+}
 static void put_fn(struct out *o, const struct css_calc *c, const char *const *keys) {
     puts_(o, fn_names[c->fn]);
     put(o, "(", 1);
@@ -1144,6 +1287,8 @@ static void put_tree(struct out *o, const struct css_calc *c, const char *const 
     case N_KEY: puts_(o, keys && keys[c->key] ? keys[c->key] : "none"); return;
     case N_FN: put_fn(o, c, keys); return;
     case N_ANCHOR: if (o->ok && !css_anchor_function_text(o->b, c->anchor)) o->ok = false; return;
+    case N_SIZE: puts_(o, "size"); return;
+    case N_CALC_SIZE: put_calc_size(o, c, keys); return;
     case N_NEGATE: case N_INVERT:
         if (!bare) put(o, "(", 1);
         puts_(o, c->op == N_NEGATE ? "-1 * " : "1 / ");
@@ -1175,7 +1320,7 @@ static bool calc_serialize(sbuf *b, const struct css_calc *c, const char *const 
     size_t begin = b->n;
     struct out o = {b, true, d, 0};
     if (c->op == N_FN) put_fn(&o, c, keys);
-    else if (c->op == N_ANCHOR) put_tree(&o, c, keys, true); /* a function of its own, not in calc() */
+    else if (c->op == N_ANCHOR || c->op == N_CALC_SIZE) put_tree(&o, c, keys, true); /* a function of its own, not in calc() */
     else {
         put(&o, "calc(", 5);
         put_tree(&o, c, keys, true);
@@ -1318,7 +1463,12 @@ float len_resolve(const len_t *l, float base) {
     return 0;
 }
 bool css_length_equal(const len_t *a, const len_t *b) {
-    return a == b || (a && b && a->kind == b->kind && a->px == b->px && a->pct == b->pct && css_calc_equal(a->expr, b->expr));
+    return a == b || (a && b && a->kind == b->kind && a->size == b->size && a->px == b->px && a->pct == b->pct &&
+                      css_calc_equal(a->expr, b->expr));
+}
+len_t css_size_argument(const len_t *l) {
+    if (l->expr) return (len_t){.kind = LK_EXPR, .expr = l->expr};
+    return (len_t){.kind = LK_LEN, .px = l->px, .pct = l->pct};
 }
 bool css_length_from_calc(const struct css_calc *c, bool negative, len_t *out) {
     double px, pct;
@@ -1410,6 +1560,138 @@ void css_length_mix(arena_t *a, const len_t *x, const len_t *y, double ka, doubl
     struct css_calc *terms[2] = {scaled(&m, length_tree(&m, x), ka), scaled(&m, length_tree(&m, y), kb)};
     length_combine(a, terms, 2, out);
 }
+
+/* -------- interpolating calc-size() (css-sizing-4 §7.2) */
+/* a tree's size with its shared subtrees counted at each use: at most limit + 1 */
+static unsigned weight(const struct css_calc *c, unsigned limit) {
+    if (!c) return 0;
+    unsigned w = 1;
+    for (unsigned i = 0; i < c->n && w <= limit; i++) w += weight(c->k[i], limit - w);
+    return w;
+}
+/* "substitute into a calc-size calculation": each size in c replaced by insertion (a subtree, so in
+   parentheses), simplified again (§10.10.1) */
+static struct css_calc *substitute(struct mp *m, const struct css_calc *c, struct css_calc *insertion) {
+    if (c->op == N_SIZE) return insertion;
+    if (!c->n) return (struct css_calc *)c;
+    if (++m->P->depth > CALC_DEPTH * 4) return NULL;
+    struct css_calc **k = ar_alloc(m->P->a, c->n * sizeof *k);
+    for (unsigned i = 0; i < c->n; i++)
+        if (c->k[i] && !(k[i] = substitute(m, c->k[i], insertion))) return NULL;
+    m->P->depth--;
+    struct css_calc *r = with_children(m, c, k, c->n);
+    return r ? simplify(m, r) : NULL;
+}
+/* "de-percentify a calc-size calculation": each percentage N% is (size * N/100) */
+static struct css_calc *depercentify(struct mp *m, const struct css_calc *c) {
+    if (is_leaf(c) && c->unit == U_PERCENT) {
+        struct css_calc_type none = {{0}, -1};
+        struct css_calc *f = mk_leaf(m, c->v / 100, U_NUMBER, none), *s = node(m, N_SIZE, 0), *p = node(m, N_PRODUCT, 2);
+        if (!f || !s || !p) return NULL;
+        s->type = p->type = length_type();
+        p->k[0] = s;
+        p->k[1] = f;
+        return simplify(m, p);
+    }
+    if (!c->n) return (struct css_calc *)c;
+    if (++m->P->depth > CALC_DEPTH * 4) return NULL;
+    struct css_calc **k = ar_alloc(m->P->a, c->n * sizeof *k);
+    for (unsigned i = 0; i < c->n; i++)
+        if (c->k[i] && !(k[i] = depercentify(m, c->k[i]))) return NULL;
+    m->P->depth--;
+    struct css_calc *r = with_children(m, c, k, c->n);
+    return r ? simplify(m, r) : NULL;
+}
+/* a calc-size() "prepared for interpolation": its basis a keyword, fit-content(basis), any, or (LENGTH)
+   the basis 100%; the calculation simplified */
+struct prepared { int kind; struct css_calc *basis, *calc; };
+static bool prepare(struct mp *m, const struct css_calc *c, struct prepared *out) {
+    struct css_calc *calc = c->k[1];
+    switch (c->key) {
+    case CSS_SIZING_CALC_SIZE: {
+        struct prepared inner;
+        if (!prepare(m, c->k[0], &inner)) return false;
+        *out = inner;
+        calc = substitute(m, calc, inner.calc);
+        break;
+    }
+    case CSS_SIZING_LENGTH:
+        if (css_calc_percent_free(c->k[0])) {
+            out->kind = CSS_SIZING_ANY;
+            out->basis = NULL;
+            calc = substitute(m, calc, c->k[0]);
+        } else {
+            struct css_calc_type t = length_type();
+            t.hint = T_LENGTH;
+            struct css_calc *flat = depercentify(m, c->k[0]);
+            out->kind = CSS_SIZING_LENGTH;
+            out->basis = mk_leaf(m, 100, U_PERCENT, t);
+            calc = flat && out->basis ? substitute(m, calc, flat) : NULL;
+        }
+        break;
+    default:
+        out->kind = c->key;
+        out->basis = c->k[0];
+        break;
+    }
+    /* a substitution past what one value may hold fails (the limit of var(), CSS Variables 1 §3.3) */
+    if (!calc || weight(calc, CALC_NODES) > CALC_NODES) return false;
+    out->calc = calc;
+    return true;
+}
+/* the non-calc-size() value l as calc-size(any, l) or calc-size(l, size) */
+static struct css_calc *as_calc_size(struct mp *m, const len_t *l) {
+    if (l->kind == LK_SIZE && l->size == CSS_SIZING_CALC_SIZE) return l->expr;
+    struct css_calc *c = node(m, N_CALC_SIZE, 2);
+    if (!c) return NULL;
+    c->type = length_type();
+    if (l->kind == LK_LEN || l->kind == LK_EXPR) {
+        c->key = CSS_SIZING_ANY;
+        c->k[1] = length_tree(m, l);
+    } else if (l->kind == LK_AUTO || l->kind == LK_SIZE) {
+        c->key = l->kind == LK_AUTO ? CSS_SIZING_AUTO : l->size;
+        if (c->key == CSS_SIZING_FIT_CONTENT_FN) {
+            len_t argument = css_size_argument(l);
+            if (!(c->k[0] = length_tree(m, &argument))) return NULL;
+        }
+        if ((c->k[1] = node(m, N_SIZE, 0))) c->k[1]->type = length_type();
+    } else return NULL;
+    return c->k[1] ? c : NULL;
+}
+static bool sizing_keyword(const len_t *l) {
+    return l->kind == LK_AUTO || l->kind == LK_NONE || (l->kind == LK_SIZE && l->size != CSS_SIZING_CALC_SIZE);
+}
+static bool calc_size(const len_t *l) { return l->kind == LK_SIZE && l->size == CSS_SIZING_CALC_SIZE; }
+bool css_size_mix(arena_t *a, const len_t *x, const len_t *y, double ka, double kb, bool allow_keywords, sbuf *out) {
+    bool kx = sizing_keyword(x), ky = sizing_keyword(y);
+    /* keywords do not interpolate with each other (§7.3); the same one is itself */
+    if (kx && ky) return css_length_equal(x, y) && css_length_serialize(x, out, NULL);
+    /* a keyword combines with a calc-size(), and with a <length-percentage> only under allow-keywords */
+    if ((kx && !calc_size(y) && !allow_keywords) || (ky && !calc_size(x) && !allow_keywords)) return false;
+    if (!kx && !ky && !calc_size(x) && !calc_size(y)) return false;
+    struct css_calc_parse P = {.a = a};
+    struct mp m = {&P, NULL, NULL, T_LENGTH, false, NULL, false};
+    struct css_calc *tx = as_calc_size(&m, x), *ty = as_calc_size(&m, y);
+    struct prepared px, py, r;
+    if (!tx || !ty || !prepare(&m, tx, &px) || !prepare(&m, ty, &py)) return false;
+    if (px.kind == py.kind && (px.kind != CSS_SIZING_FIT_CONTENT_FN || css_calc_equal(px.basis, py.basis))) r = px;
+    else if (px.kind == CSS_SIZING_ANY) r = py;
+    else if (py.kind == CSS_SIZING_ANY) r = px;
+    else return false;
+    /* the calculations interpolated; added (ka = kb = 1: composite add and accumulate) as they are */
+    bool add = ka == 1 && kb == 1;
+    struct css_calc *sum = node(&m, N_SUM, 2), *c = node(&m, N_CALC_SIZE, 2);
+    if (!sum || !c || !(sum->k[0] = add ? px.calc : scaled(&m, px.calc, ka)) ||
+        !(sum->k[1] = add ? py.calc : scaled(&m, py.calc, kb)))
+        return false;
+    sum->type = px.calc->type;
+    if (!(c->k[1] = simplify(&m, sum))) return false;
+    c->key = (uint8_t)r.kind;
+    c->k[0] = r.basis;
+    c->type = length_type();
+    if (weight(c, CALC_NODES) > CALC_NODES) return false;
+    return calc_serialize(out, c, NULL, NULL);
+}
 /* a computed <length-percentage>'s serialization (CSSOM: percentages and math kept, never a zero made up) */
 bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d) {
     if (!l || !out || out->n > out->cap || (!out->p && (out->n || out->cap))) return false;
@@ -1432,6 +1714,20 @@ bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d) {
         break;
     }
     case LK_EXPR: if (!l->expr || !calc_serialize(out, l->expr, NULL, d)) o.ok = false; break;
+    case LK_SIZE: {
+        if (l->size == CSS_SIZING_CALC_SIZE) { if (!l->expr || !calc_serialize(out, l->expr, NULL, d)) o.ok = false; break; }
+        if (l->size == CSS_SIZING_FIT_CONTENT_FN) {
+            len_t argument = css_size_argument(l);
+            puts_(&o, "fit-content(");
+            if (o.ok && !css_length_serialize(&argument, out, d)) o.ok = false;
+            puts_(&o, ")");
+            break;
+        }
+        const char *name = l->size != CSS_SIZING_ANY ? css_sizing_name(l->size) : NULL;
+        if (name) puts_(&o, name);
+        else o.ok = false;
+        break;
+    }
     default: o.ok = false;
     }
     if (!o.ok) {

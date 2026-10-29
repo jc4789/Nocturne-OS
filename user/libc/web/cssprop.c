@@ -308,22 +308,7 @@ static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int fl
                 out->kind = LK_NORMAL;
                 return true;
             }
-            if (ident_is(s, n, "min-content") || ident_is(s, n, "max-content") || ident_is(s, n, "fit-content") ||
-                ident_is(s, n, "-webkit-fill-available") || ident_is(s, n, "-moz-available") ||
-                ident_is(s, n, "stretch") || ident_is(s, n, "-webkit-fit-content") || ident_is(s, n, "-moz-fit-content")) {
-                if (cx->supports_probe) return false; /* intrinsic sizing is currently an auto/none fallback */
-                if (flags & LF_AUTO) out->kind = LK_AUTO;
-                else if (flags & LF_NONE) out->kind = LK_NONE;
-                else return false;
-                return true;
-            }
             return false;
-        }
-        if (ident_is(s, k, "fit-content")) {
-            if (cx->supports_probe) return false;
-            if (!(flags & LF_AUTO)) return false;
-            out->kind = LK_AUTO;
-            return true;
         }
         /* a math function of type <length> (or <length-percentage>): computed, range-clamped. anchor()
            and anchor-size() are <length>s where the property takes them (css-anchor-position-1 §3.2, §5.1) */
@@ -626,6 +611,101 @@ static const struct kw kw_overflow[] = {{"visible", OV_VISIBLE}, {"hidden", OV_H
                                         {"auto", OV_AUTO}, {"clip", OV_CLIP}, {"overlay", OV_AUTO},
                                         {"-moz-hidden-unscrollable", OV_HIDDEN}, {0}};
 static const struct kw kw_boxsizing[] = {{"content-box", 0}, {"border-box", 1}, {0}};
+/* the sizing properties' keywords (css-sizing-3 §3.2, css-sizing-4 §3.2) and flex-basis's (css-flexbox-1 §7.2),
+   by their len_t size (cssmath.c names them and their legacy aliases). A PT_LEN row with one of these is a
+   sizing property: parse_size reads it, with fit-content() and calc-size() (css-sizing-4 §7) */
+static const struct kw kw_size[] = {{"auto", CSS_SIZING_AUTO}, {"min-content", CSS_SIZING_MIN_CONTENT},
+    {"max-content", CSS_SIZING_MAX_CONTENT}, {"fit-content", CSS_SIZING_FIT_CONTENT}, {"stretch", CSS_SIZING_STRETCH}, {0}};
+static const struct kw kw_size_max[] = {{"min-content", CSS_SIZING_MIN_CONTENT}, {"max-content", CSS_SIZING_MAX_CONTENT},
+    {"fit-content", CSS_SIZING_FIT_CONTENT}, {"stretch", CSS_SIZING_STRETCH}, {0}};
+static const struct kw kw_size_flex[] = {{"auto", CSS_SIZING_AUTO}, {"content", CSS_SIZING_CONTENT},
+    {"min-content", CSS_SIZING_MIN_CONTENT}, {"max-content", CSS_SIZING_MAX_CONTENT}, {"fit-content", CSS_SIZING_FIT_CONTENT},
+    {"stretch", CSS_SIZING_STRETCH}, {0}};
+static const struct kw kw_interpolate_size[] = {{"numeric-only", 0}, {"allow-keywords", 1}, {0}};
+/* the CSS_SIZING_* a sizing property takes (its row's keywords, and fit-content()): bits */
+static unsigned size_keywords(const struct kw *k) {
+    unsigned bits = 1u << CSS_SIZING_FIT_CONTENT_FN;
+    for (; k && k->name; k++) bits |= 1u << k->v;
+    return bits;
+}
+/* fit-content( <length-percentage [0,inf]> ): its argument's text */
+static bool fit_content_argument(const char *s, size_t n, const char **arg, size_t *arg_n) {
+    if (n < 14 || !ident_is(s, 12, "fit-content(") || s[n - 1] != ')') return false;
+    unsigned depth = 0;
+    for (size_t i = 12; i < n - 1; i++) {
+        if (s[i] == '(') depth++;
+        else if (s[i] == ')' && !depth--) return false; /* the function closes before the end */
+    }
+    if (depth) return false;
+    *arg = s + 12;
+    *arg_n = n - 13;
+    trim(arg, arg_n);
+    return *arg_n > 0;
+}
+/* a sizing property's value (css-sizing-3 §3.2, css-sizing-4 §3.2, §7): a keyword it takes, fit-content()
+   or calc-size() as an LK_SIZE that layout resolves, auto, none and <length-percentage> as parse_len's */
+static bool parse_size(const char *s, size_t n, struct cx *cx, len_t *out, const struct propdef *p) {
+    trim(&s, &n);
+    memset(out, 0, sizeof *out);
+    unsigned keywords = size_keywords(p->kws);
+    const char *arg;
+    size_t arg_n;
+    int size = css_sizing_keyword(s, n);
+    if (size) {
+        if (!(keywords & 1u << size)) return false;
+        if (size == CSS_SIZING_AUTO) out->kind = LK_AUTO;
+        else { out->kind = LK_SIZE; out->size = (uint8_t)size; }
+        return true;
+    }
+    if (fit_content_argument(s, n, &arg, &arg_n)) {
+        len_t l;
+        if (!parse_len(arg, arg_n, cx, &l, 0) || (l.kind != LK_LEN && l.kind != LK_EXPR)) return false;
+        *out = (len_t){.kind = LK_SIZE, .size = CSS_SIZING_FIT_CONTENT_FN, .px = l.px, .pct = l.pct,
+                       .expr = l.kind == LK_EXPR ? l.expr : NULL};
+        return true;
+    }
+    if (css_calc_is_size(s, n)) {
+        /* computed as other math functions are: relative lengths resolved, nothing else (§7.1) */
+        struct css_calc_parse P = {.a = cx->a, .cx = cx};
+        struct css_calc *c = css_calc_size_read(&P, keywords, s, n);
+        if (!c) return false;
+        *out = (len_t){.kind = LK_SIZE, .size = CSS_SIZING_CALC_SIZE, .expr = c};
+        return true;
+    }
+    return parse_len(s, n, cx, out, p->flags);
+}
+/* a sizing value's specified value (CSSOM): a keyword by its name, fit-content()'s argument and calc-size()'s
+   arguments simplified with their relative lengths kept (css-sizing-4 §7.2.1); false: another kind of value */
+static bool size_specified(const struct propdef *p, const char *v, size_t n, sbuf *out) {
+    int size = css_sizing_keyword(v, n);
+    const char *arg;
+    size_t arg_n;
+    if (size) {
+        if (!(size_keywords(p->kws) & 1u << size)) return false;
+        sb_puts(out, css_sizing_name(size));
+        return true;
+    }
+    if (fit_content_argument(v, n, &arg, &arg_n)) {
+        sb_puts(out, "fit-content(");
+        if (!css_calc_specified(arg, arg_n, CSS_CALC_LENGTH | CSS_CALC_PERCENT, out)) length_append(out, arg, arg_n);
+        sb_putc(out, ')');
+        return true;
+    }
+    if (!css_calc_is_size(v, n)) return false;
+    arena_t a = {.chunk_size = 1024};
+    jmp_buf trap;
+    a.trap = &trap;
+    bool ok = false;
+    size_t begin = out->n;
+    if (!setjmp(trap)) {
+        struct css_calc_parse P = {.a = &a};
+        struct css_calc *c = css_calc_size_read(&P, size_keywords(p->kws), v, n);
+        ok = c && css_calc_serialize(out, c, NULL);
+    }
+    ar_free(&a);
+    if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    return ok;
+}
 static const struct kw kw_object_fit[] = {{"fill", OF_FILL}, {"contain", OF_CONTAIN}, {"cover", OF_COVER},
                                          {"none", OF_NONE}, {"scale-down", OF_SCALE_DOWN}, {0}};
 static const struct kw kw_bg_attachment[] = {{"scroll", CSS_BG_SCROLL}, {"fixed", CSS_BG_FIXED}, {"local", CSS_BG_LOCAL}, {0}};
@@ -885,7 +965,7 @@ static struct propdef props[] = {
     {"container-type", PT_KW, 0, false, O(container_type), kw_container_type, 0, AN_NONE},
     {"display", PT_DISPLAY, 0, false, O(display), NULL, 0, AN_TYPE},
     SH("flex", SH_FLEX),
-    {"flex-basis", PT_LEN, LF_AUTO | LF_LENGTH, false, O(flex_basis), NULL, 0, AN_TYPE},
+    {"flex-basis", PT_LEN, LF_AUTO | LF_LENGTH, false, O(flex_basis), kw_size_flex, 0, AN_TYPE},
     {"flex-direction", PT_KW, 0, false, O(flex_direction), kw_fdir, 0, AN_TYPE},
     SH("flex-flow", SH_FLEX_FLOW),
     {"flex-grow", PT_NUM, 0, false, O(flex_grow), NULL, 0, AN_TYPE},
@@ -941,10 +1021,11 @@ static struct propdef props[] = {
     {"grid-template-areas", PT_GAREAS, 0, false, O(grid_areas), NULL, 0, AN_TYPE},
     {"grid-template-columns", PT_GTEMPLATE, 0, false, O(grid_cols), NULL, 0, AN_TYPE},
     {"grid-template-rows", PT_GTEMPLATE, 0, false, O(grid_rows), NULL, 0, AN_TYPE},
-    {"height", PT_LEN, LF_AUTO | LF_ANCHOR_SIZE, false, O(height), NULL, 0, AN_TYPE},
+    {"height", PT_LEN, LF_AUTO | LF_ANCHOR_SIZE, false, O(height), kw_size, 0, AN_TYPE},
     SH("inset", SH_INSET),
     SH("inset-block", SH_INSET_BLOCK),
     SH("inset-inline", SH_INSET_INLINE),
+    {"interpolate-size", PT_KW, 0, true, O(interpolate_size), kw_interpolate_size, 0, AN_NONE},
     {"justify-content", PT_KW, 0, false, O(justify_content), kw_justify, 0, AN_TYPE},
     {"justify-items", PT_KW, 0, false, O(justify_items), kw_jalign, 0, AN_TYPE},
     {"justify-self", PT_KW, 0, false, O(justify_self), kw_jalign_self, 0, AN_TYPE},
@@ -969,10 +1050,10 @@ static struct propdef props[] = {
     {"object-position", PT_BG_POS, 0, true, O(object_pos), NULL, 0, AN_TYPE},
     {"mask-repeat", PT_KW, 0, false, O(mask_repeat), kw_bg_repeat, 0, AN_TYPE},
     {"mask-size", PT_MASK_SIZE, 0, false, O(mask_size), NULL, 0, AN_TYPE},
-    {"max-height", PT_LEN, LF_NONE | LF_ANCHOR_SIZE, false, O(max_height), NULL, 0, AN_TYPE},
-    {"max-width", PT_LEN, LF_NONE | LF_ANCHOR_SIZE, false, O(max_width), NULL, 0, AN_TYPE},
-    {"min-height", PT_LEN, LF_AUTO | LF_ANCHOR_SIZE, false, O(min_height), NULL, 0, AN_TYPE},
-    {"min-width", PT_LEN, LF_AUTO | LF_ANCHOR_SIZE, false, O(min_width), NULL, 0, AN_TYPE},
+    {"max-height", PT_LEN, LF_NONE | LF_ANCHOR_SIZE, false, O(max_height), kw_size_max, 0, AN_TYPE},
+    {"max-width", PT_LEN, LF_NONE | LF_ANCHOR_SIZE, false, O(max_width), kw_size_max, 0, AN_TYPE},
+    {"min-height", PT_LEN, LF_AUTO | LF_ANCHOR_SIZE, false, O(min_height), kw_size, 0, AN_TYPE},
+    {"min-width", PT_LEN, LF_AUTO | LF_ANCHOR_SIZE, false, O(min_width), kw_size, 0, AN_TYPE},
     {"opacity", PT_OPACITY, 0, false, O(opacity), NULL, 0, AN_TYPE},
     {"order", PT_INT, 0, false, O(order), NULL, 0, AN_TYPE},
     SH("outline", SH_OUTLINE),
@@ -1037,7 +1118,7 @@ static struct propdef props[] = {
     {"vertical-align", PT_VALIGN, 0, false, O(vertical_align), kw_valign, 0, AN_TYPE},
     {"visibility", PT_KW, 0, true, O(visibility), kw_visibility, 0, AN_VISIBILITY},
     {"white-space", PT_KW, 0, true, O(white_space), kw_ws, 0, AN_TYPE},
-    {"width", PT_LEN, LF_AUTO | LF_ANCHOR_SIZE, false, O(width), NULL, 0, AN_TYPE},
+    {"width", PT_LEN, LF_AUTO | LF_ANCHOR_SIZE, false, O(width), kw_size, 0, AN_TYPE},
     {"word-spacing", PT_PX, LF_NEG | LF_NOPCT, true, O(word_spacing), kw_normal0, 0, AN_TYPE},
     {"z-index", PT_ZINDEX, 0, false, O(z_index), NULL, 0, AN_TYPE},
 };
@@ -1374,6 +1455,7 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
     if (p->group == G_GAP_RULE || (p->type == PT_SHORT && p->sh == SH_GAP_RULE)) return gap_specified(p, v, n, out);
     if (p->group == G_ANCHOR || (p->type == PT_SHORT && p->sh == SH_POSITION_TRY)) return anchor_specified(p, v, n, out);
+    if (p->type == PT_LEN && p->kws && size_specified(p, v, n, out)) return true;
     if (p->type == PT_CONTENT || p->type == PT_LIST_TYPE || p->type == PT_LIST_IMAGE || p->type == PT_QUOTES ||
         p->type == PT_COUNTER || (p->type == PT_SHORT && p->sh == SH_LIST_STYLE))
         return list_specified(p, v, n, out);
@@ -5905,7 +5987,7 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
     }
     case PT_LEN: {
         len_t l;
-        if (!parse_len(v, n, cx, &l, p->flags)) return false;
+        if (!(p->kws ? parse_size(v, n, cx, &l, p) : parse_len(v, n, cx, &l, p->flags))) return false;
         *(len_t *)field = l;
         return true;
     }
@@ -6873,7 +6955,7 @@ static bool set_flex(const char *v, size_t n, struct cx *cx) {
     /* Validate before publishing any longhand: an invalid basis must not
        overwrite the grow/shrink of an earlier valid declaration. */
     len_t parsed;
-    if (!parse_len(b, bl, cx, &parsed, LF_AUTO | LF_LENGTH)) return false;
+    if (!parse_size(b, bl, cx, &parsed, css_prop_lookup("flex-basis", 10))) return false;
     return set_long("flex-grow", g, gl, cx) && set_long("flex-shrink", sh, shl, cx) &&
            set_long("flex-basis", b, bl, cx);
 }
@@ -8831,8 +8913,14 @@ static bool anim_combine(const struct css_anim_ctx *c, const struct propdef *p, 
     const char *fa = field_of(a, p), *fb = field_of(b, p);
     web_doc *d = c->d;
     switch (p->type) {
-    case PT_LEN: case PT_SVG_WIDTH:
-        return anim_len(out, (const len_t *)fa, (const len_t *)fb, ka, kb, p->type == PT_SVG_WIDTH ? 0 : p->flags, d);
+    case PT_LEN: case PT_SVG_WIDTH: {
+        const len_t *x = (const len_t *)fa, *y = (const len_t *)fb;
+        /* a sizing property's keywords and calc-size() (css-sizing-4 §7.2, §7.3): interpolate-size is the
+           element's own, of the style the animation starts from (the after-change style of a transition) */
+        if (p->type == PT_LEN && p->kws && (x->kind == LK_SIZE || y->kind == LK_SIZE || x->kind == LK_AUTO || y->kind == LK_AUTO))
+            return css_size_mix(c->a, x, y, ka, kb, c->base && c->base->interpolate_size, out);
+        return anim_len(out, x, y, ka, kb, p->type == PT_SVG_WIDTH ? 0 : p->flags, d);
+    }
     case PT_PX: {
         double v = *(const float *)fa * ka + *(const float *)fb * kb;
         anim_unit(out, p->flags & LF_NEG ? v : anim_clamp(v, 0, INFINITY), "px");
