@@ -8567,6 +8567,11 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.border_image_img=y.border_image_img=x.mask_border_img=y.mask_border_img=0;
     x.bg_layers=y.bg_layers=x.bg_layer=y.bg_layer=0;
     x.ui=y.ui=NULL; /* the pointer and the caret's and accents' colours are not layout */
+    x.appearance=y.appearance=x.user_select=y.user_select=x.touch_action=y.touch_action=0; /* paint and input */
+    /* containment and the containing blocks perspective, transform-style and will-change make are
+       layout's; blending, isolation, backface-visibility and the perspective's values paint only */
+    if(!css_effects_layout_equal(x.effects,y.effects))return false;
+    x.effects=y.effects=NULL;
     /* line breaking reads the text group's breaking and hyphenation values; text-shadow and the
        decorations (their lines, colour, style, thickness, offset) paint only */
     if(!css_text_layout_equal(x.text,y.text))return false;
@@ -8683,7 +8688,8 @@ static bool style_equal(const style_t *a, const style_t *b) {
         !style_equal(a->after, b->after) || !style_equal(a->backdrop, b->backdrop) ||
         !style_equal(a->placeholder, b->placeholder) || !css_color_slots_equal(a, b) ||
         !equal_string(a->color_scheme_text, b->color_scheme_text) || !css_text_equal(a->text, b->text) ||
-        !css_decoration_equal(a->decoration, b->decoration) || !css_decorating_equal(a->decorations, b->decorations))
+        !css_decoration_equal(a->decoration, b->decoration) || !css_decorating_equal(a->decorations, b->decorations) ||
+        !css_effects_equal(a->effects, b->effects))
         return false;
     for (int i = 0; i < 4; i++) if (!equal_string(a->grid_place[i].name, b->grid_place[i].name)) return false;
     style_t x = *a, y = *b;
@@ -8719,7 +8725,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     x.clip_path = y.clip_path = NULL;
     x.float_shape = y.float_shape = NULL; x.offset = y.offset = NULL; x.gap_rules = y.gap_rules = NULL; x.anchor = y.anchor = NULL; x.ui = y.ui = NULL; /* the groups compared above */
     x.background = y.background = NULL; x.border_image = y.border_image = x.mask_border = y.mask_border = NULL;
-    x.text = y.text = NULL; x.decoration = y.decoration = NULL; x.decorations = y.decorations = NULL;
+    x.text = y.text = NULL; x.decoration = y.decoration = NULL; x.decorations = y.decorations = NULL; x.effects = y.effects = NULL;
     x.transform = y.transform = x.rotate = y.rotate = x.scale = y.scale = NULL;
     x.gradient = y.gradient = NULL; x.vars = y.vars = NULL;
     x.color_inherited = y.color_inherited = x.color_own = y.color_own = NULL; x.color_scheme_text = y.color_scheme_text = NULL;
@@ -8774,7 +8780,9 @@ static bool style_box_compatible(node_t *e, const style_t *old, const style_t *n
         old->overflow != next->overflow || old->content_visibility != next->content_visibility ||
         old->white_space != next->white_space || old->text_transform != next->text_transform ||
         old->list_style != next->list_style || old->list_style_inside != next->list_style_inside ||
-        !css_counters_equal(old->counters, next->counters)) return false;
+        !css_counters_equal(old->counters, next->counters) ||
+        /* style containment scopes the counters and quotes below (counter.c counts again) */
+        ((css_style_effects(old)->contain ^ css_style_effects(next)->contain) & CSS_CONTAIN_STYLE)) return false;
     return old->display == D_BLOCK || old->display == D_FLOW_ROOT || old->display == D_INLINE || old->display == D_NONE ||
         old->display==D_FLEX||old->display==D_INLINE_FLEX||old->display==D_GRID||old->display==D_INLINE_GRID;
 }

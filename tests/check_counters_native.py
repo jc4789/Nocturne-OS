@@ -6,7 +6,8 @@
 で走らせる。試すのは WPT の css/css-lists の reftest（li-value-reversed-*、li-list-item-counter-*、
 counter-list-item、counter-reset-reversed-*、counters-scope-*、counters-00*、counter-set-001、
 counter-reset-increment-overflow-underflow、implicit-and-explicit-list-item-counters、
-marker-quotes、display: contents の二つ）が参照の頁で示す番号と文字。counters-001〜004 は WPT の頁と参照から読む。
+marker-quotes、display: contents の二つ）と css/css-contain の contain-style-counters-001〜005（style 包含）が
+参照の頁で示す番号と文字。counters-001〜004 は WPT の頁と参照から読む。
 
 guest の WPT の代わりではない。cascade（css.c の selector、UA の style sheet、ol・li の
 presentational hint。hint は css.c が写す宣言で書く：li value=V → counter-set: list-item V、
@@ -295,6 +296,27 @@ def counters_page(name):
 
 for name in ("counters-001", "counters-002", "counters-003", "counters-004"):
     counters_page(name)
+
+# CSS Containment 2 §3.3, WPT css-contain/contain-style-counters-001〜005 and their references: in a
+# style-contained subtree, counter-increment and counter-set of a counter from outside it make a new
+# one (as a counter-reset of the element would); display: contents has no box and contains nothing
+span_after = "content: counter(counter-of-span)"
+case("contain-style-counters-001",
+     E("counter-reset: counter-of-span 9"),
+     E("contain: style", E("counter-increment: counter-of-span 5", after=(span_after, "5"))))
+case("contain-style-counters-002",
+     E("counter-reset: counter-of-span 9"),
+     E("contain: style; display: contents", E("counter-increment: counter-of-span 5", after=(span_after, "14"))))
+case("contain-style-counters-003",
+     E("counter-reset: counter-of-span 17; contain: style",
+       *[E("counter-increment: counter-of-span 4") for _ in range(5)], E("", after=(span_after, "20"))))
+case("contain-style-counters-004",
+     E("counter-reset: counter-of-span 13; contain: style",
+       E("", *[E("counter-increment: counter-of-span 5") for _ in range(4)]), E("", after=(span_after, "13"))))
+inc = lambda text: E("counter-increment: c", before=("content: counters(c, '')", text))
+case("contain-style-counters-005",
+     E("", inc("1"), E("contain: style", inc("11"), E("counter-reset: c"), inc("11")), inc("2"),
+       E("contain: style", inc("21"), inc("22")), inc("3")))
 
 
 # ---------------------------------------------------------------- C

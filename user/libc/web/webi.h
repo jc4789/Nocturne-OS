@@ -705,7 +705,7 @@ uint32_t css_text_shadow_color(const struct style *st, const struct css_box_shad
 /* tab-size's tab stop interval in px for st's preserved tabs, given space: the advance of a space
    (letter-spacing and word-spacing included) of their nearest block container (css-text-4 §4.4) */
 float css_tab_interval(const struct style *st, float space);
-enum css_offset_property { CSS_OFFSET_POSITION, CSS_OFFSET_ANCHOR, CSS_OFFSET_ROTATE };
+enum css_offset_property { CSS_OFFSET_POSITION, CSS_OFFSET_ANCHOR, CSS_OFFSET_ROTATE, CSS_PERSPECTIVE_ORIGIN };
 bool css_offset_parse(enum css_offset_property which, const char *v, size_t n, struct cx *cx, void *out, sbuf *specified);
 bool css_offset_serialize(enum css_offset_property which, const void *value, sbuf *out, web_doc *d);
 bool css_offset_combine(enum css_offset_property which, const void *a, const void *b, double t, bool add,
@@ -713,7 +713,7 @@ bool css_offset_combine(enum css_offset_property which, const void *a, const voi
 /* the offset shorthand (motion-1 §2.6): the longhands it sets, false when v is not one */
 bool css_offset_shorthand(const char *v, size_t n, struct cx *cx, struct css_offset *out, sbuf *specified);
 bool css_offset_shorthand_serialize(const struct css_offset *o, sbuf *out, web_doc *d); /* its computed value */
-/* CSSOM specified value of a declared shape, Motion Path, shape-margin or shape-image-threshold
+/* CSSOM specified value of a declared shape, Motion Path, perspective-origin, shape-margin or shape-image-threshold
    value (name: the property); false leaves the authored text */
 bool css_shape_specified(const char *name, const char *v, size_t n, sbuf *out);
 /* CSS Gap Decorations 1 (css-gaps-1 §3, §4): the lines a container paints in its gaps. A style
@@ -856,6 +856,55 @@ struct css_ui {
 };
 extern const struct css_ui css_ui_initial;
 bool css_ui_equal(const struct css_ui *a, const struct css_ui *b); /* NULL: the initial values */
+/* appearance (css-ui-4 §7.2): none, auto, base, base-select, and the <compat-auto> and
+   <compat-special> keywords, each its own computed value; every one but none behaves as auto here
+   (the controls' native appearance; there is no base appearance) */
+enum { CSS_APPEARANCE_NONE, CSS_APPEARANCE_AUTO, CSS_APPEARANCE_BASE, CSS_APPEARANCE_BASE_SELECT,
+       CSS_APPEARANCE_SEARCHFIELD, CSS_APPEARANCE_TEXTAREA, CSS_APPEARANCE_CHECKBOX, CSS_APPEARANCE_RADIO,
+       CSS_APPEARANCE_MENULIST, CSS_APPEARANCE_LISTBOX, CSS_APPEARANCE_METER, CSS_APPEARANCE_PROGRESS_BAR,
+       CSS_APPEARANCE_BUTTON, CSS_APPEARANCE_TEXTFIELD, CSS_APPEARANCE_MENULIST_BUTTON };
+/* user-select (css-ui-4 §6.1): its computed value; the used one is paint.c's user_select_used (the pointer's) */
+enum { CSS_USER_SELECT_AUTO, CSS_USER_SELECT_TEXT, CSS_USER_SELECT_NONE, CSS_USER_SELECT_CONTAIN,
+       CSS_USER_SELECT_ALL };
+/* touch-action (Pointer Events 3 §9.1): 0 auto; none; or the pan bits, manipulation */
+#define CSS_TOUCH_NONE 0x01
+#define CSS_TOUCH_PAN_X 0x02
+#define CSS_TOUCH_PAN_LEFT 0x04
+#define CSS_TOUCH_PAN_RIGHT 0x08
+#define CSS_TOUCH_PAN_Y 0x10
+#define CSS_TOUCH_PAN_UP 0x20
+#define CSS_TOUCH_PAN_DOWN 0x40
+#define CSS_TOUCH_MANIPULATION 0x80
+/* Compositing 1 §3 (mix-blend-mode, isolation), CSS Transforms 2 §8-§10 (perspective,
+   perspective-origin, transform-style, backface-visibility), CSS Will Change 1 §2.1 (will-change)
+   and CSS Containment 2 §2 (contain): not inherited; a style holds them as one group (style_t's
+   effects), NULL being the initial values. */
+enum { CSS_CONTAIN_SIZE = 1, CSS_CONTAIN_INLINE_SIZE = 2, CSS_CONTAIN_LAYOUT = 4, CSS_CONTAIN_STYLE = 8,
+       CSS_CONTAIN_PAINT = 16 };
+/* what the properties will-change names would make of the element with a value that is not their
+   initial one (§2.1): a stacking context (CSS_WILL_STACK; _TRANSFORM: one that a transform's, not for
+   an inline box; _Z: z-index's, for a positioned box or a flex or grid item), a containing block for
+   fixed descendants (and absolute ones: CSS_WILL_FIXED_CB, _TRANSFORM as above), for absolute ones
+   (position) */
+enum { CSS_WILL_STACK = 1, CSS_WILL_STACK_TRANSFORM = 2, CSS_WILL_STACK_Z = 4, CSS_WILL_FIXED_CB = 8,
+       CSS_WILL_FIXED_CB_TRANSFORM = 16, CSS_WILL_ABS_CB = 32 };
+enum { CSS_TRANSFORM_FLAT, CSS_TRANSFORM_PRESERVE_3D };
+enum { CSS_ISOLATION_AUTO, CSS_ISOLATION_ISOLATE };
+enum { CSS_BACKFACE_VISIBLE, CSS_BACKFACE_HIDDEN };
+struct css_effects {
+    len_t perspective;            /* LK_NONE: none; a length, never negative */
+    len_t perspective_origin[2];  /* x, y: a length-percentage of the reference box */
+    /* will-change: its computed value as it serializes (NULL: auto), and the CSS_WILL_* of the
+       properties it names */
+    struct css_will_change { const char *text; uint8_t effects; } will_change;
+    uint8_t isolation, blend;     /* CSS_ISOLATION_*, mix-blend-mode's CSS_BLEND_* */
+    uint8_t transform_style, backface; /* CSS_TRANSFORM_*, CSS_BACKFACE_* */
+    uint8_t contain;              /* CSS_CONTAIN_* */
+};
+extern const struct css_effects css_effects_initial;
+bool css_effects_equal(const struct css_effects *a, const struct css_effects *b); /* NULL: the initial values */
+/* the values of a and b that layout reads: containment, and what makes a containing block */
+bool css_effects_layout_equal(const struct css_effects *a, const struct css_effects *b);
 /* A computed shape's geometry against its reference box r (x y w h, any one space). */
 void css_shape_ellipse(const struct css_shape *s, const float r[4], double centre[2], double radii[2]); /* circle(), ellipse() */
 /* inset(): the inner rectangle (x y w h) and its corner radii TL TR BR BL, scaled to fit (css-backgrounds-3 §5.5) */
@@ -1134,6 +1183,7 @@ typedef struct style {
     font_t *named_font;     /* document-owned downloaded face, never AST-owned */
     const struct web_font_choice *font_choices; /* computed-arena composite family */
     uint8_t object_fit;
+    uint8_t appearance, user_select, touch_action; /* CSS_APPEARANCE_*, CSS_USER_SELECT_*, CSS_TOUCH_*: not inherited */
     len_t object_pos[2]; /* position within (content box - fitted image) */
     float font_size;
     len_t line_height;
@@ -1186,6 +1236,7 @@ typedef struct style {
     const struct css_border_image *border_image, *mask_border;
     const struct css_ui *ui; /* cursor, caret-color, accent-color: inherited, the group a parent's style shares */
     const struct css_decoration *decoration;   /* text-decoration-color, -style and -thickness */
+    const struct css_effects *effects;         /* compositing, 3D, will-change, containment */
     /* an inherited group: the text properties of struct css_text */
     const struct css_text *text;
     /* not computed values: the decorating boxes whose lines draw over this style's text, and the
@@ -1272,6 +1323,9 @@ uint32_t css_ui_caret_color(const style_t *st);
 bool css_ui_accent_color(const style_t *st, uint32_t *argb);
 static inline const struct css_decoration *css_style_decoration(const style_t *s) {
     return s->decoration ? s->decoration : &css_decoration_initial;
+}
+static inline const struct css_effects *css_style_effects(const style_t *s) {
+    return s->effects ? s->effects : &css_effects_initial;
 }
 static inline const struct css_text *css_style_text(const style_t *s) {
     return s->text ? s->text : &css_text_initial;
@@ -2033,7 +2087,9 @@ float box_visual_y(const box_t *b);
    coordinates until box_visual_memo_end restores the previous generation. */
 uint32_t box_visual_memo_begin(void);
 void box_visual_memo_end(uint32_t previous);
-bool box_filter_containing_block(const box_t *b); /* filters/transforms establish descendant containing blocks */
+bool box_filter_containing_block(const box_t *b); /* transforms, 3D, filters, containment and will-change establish descendant containing blocks */
+/* the containment b has in use: CSS_CONTAIN_* of contain, content-visibility and container-type, for the boxes they apply to */
+unsigned box_containment(const box_t *b);
 bool css_translation_active(const style_t *s);
 enum { CSS_TRANSLATE_INDIVIDUAL=1,CSS_TRANSLATE_TRANSFORM=2 };
 /* Pure translations stay in visual coordinates. Any other used transform is
@@ -2044,6 +2100,7 @@ bool css_transform_general(const style_t *s);
 bool box_transformed(const box_t *b);
 /* Affine x'=m[0]x+m[2]y+m[4], y'=m[1]x+m[3]y+m[5] in document coordinates. */
 bool box_transform_matrix(const box_t *b,double m[6]);
+bool box_backface_hidden(const box_t *b); /* backface-visibility: hidden and its back toward the viewer */
 /* The used affine matrix of s's transform properties for a reference box of
    w x h whose top-left corner is at (x,y); false if none or not finite. */
 bool css_style_transform_matrix(const style_t *s,double x,double y,float w,float h,double m[6]);

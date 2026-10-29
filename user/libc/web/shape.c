@@ -1135,9 +1135,10 @@ static bool rotate_value(const char **w, const size_t *wn, int k, struct cx *cx,
     if (angle >= 0) { if (keyword >= 0) spec_puts(spec, " "); spec_len(spec, w[angle], wn[angle], cx, true); }
     return true;
 }
-/* offset-position: normal | auto | <position>; offset-anchor: auto | <position> */
+/* offset-position: normal | auto | <position>; offset-anchor: auto | <position>; perspective-origin:
+   <position> (css-transforms-2 §8) */
 static bool point_value(enum css_offset_property which, const char **w, const size_t *wn, int k, struct cx *cx, len_t at[2], sbuf *spec) {
-    if (k == 1 && kw(w[0], wn[0], "auto")) { at[0] = at[1] = (len_t){.kind = LK_AUTO}; spec_puts(spec, "auto"); return true; }
+    if (k == 1 && which != CSS_PERSPECTIVE_ORIGIN && kw(w[0], wn[0], "auto")) { at[0] = at[1] = (len_t){.kind = LK_AUTO}; spec_puts(spec, "auto"); return true; }
     if (k == 1 && which == CSS_OFFSET_POSITION && kw(w[0], wn[0], "normal")) {
         at[0] = at[1] = (len_t){.kind = LK_NORMAL};
         spec_puts(spec, "normal");
@@ -1316,6 +1317,7 @@ bool css_shape_specified(const char *name, const char *v, size_t n, sbuf *out) {
         else if (!strcmp(name, "offset-position")) ok = css_offset_parse(CSS_OFFSET_POSITION, v, n, &cx, offset.position, out);
         else if (!strcmp(name, "offset-anchor")) ok = css_offset_parse(CSS_OFFSET_ANCHOR, v, n, &cx, offset.anchor, out);
         else if (!strcmp(name, "offset-rotate")) ok = css_offset_parse(CSS_OFFSET_ROTATE, v, n, &cx, &offset.rotate, out);
+        else if (!strcmp(name, "perspective-origin")) ok = css_offset_parse(CSS_PERSPECTIVE_ORIGIN, v, n, &cx, offset.position, out);
         else if (!strcmp(name, "offset")) ok = css_offset_shorthand(v, n, &cx, &offset, out);
         else if (!strcmp(name, "offset-distance") || !strcmp(name, "shape-margin")) {
             bool neg = name[0] == 'o';

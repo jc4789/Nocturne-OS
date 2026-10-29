@@ -56,6 +56,7 @@ struct web_hit_index {
     bool valid;
 };
 
+struct blend_results;
 struct pctx {
     web_doc *d;
     canvas_t *c;
@@ -82,6 +83,12 @@ struct pctx {
     const struct gfx_mask_clip *viewport_mask;
     const box_t *untransformed; /* this box's own used transform is being applied by the caller */
     const box_t *unfiltered; /* this box's own filter, clip and opacity are being applied by the caller */
+    const box_t *unblended; /* this box's own mix-blend-mode is being applied by the caller (paint_blended) */
+    /* paint_blended's backdrop walk: it stops where this box would paint, the group's content under
+       it drawn, and sets *halted (shared by the walk's copies) */
+    const box_t *halt;
+    bool *halted;
+    struct blend_results *blends; /* the paint's blended results, kept until their group's paint ends */
     bool private_surface; /* a surface of a transform or filter, not the canvas the page is shown on */
     struct hit_stack *stack; /* doc_elements_at: every target the exact walk reaches, bottom first */
     /* Paint Timing, of a paint walk: it drew something other than the default
@@ -132,10 +139,26 @@ static bool mask_border_set(const style_t *st) {
     const struct css_border_image *m = css_style_mask_border(st);
     return m->source.url || m->source.gradient;
 }
+/* Compositing 1 §3.1-3.2: mix-blend-mode other than normal and isolation: isolate; CSS Transforms 2
+   §8: perspective other than none, and transform-style: preserve-3d, on a transformable box; CSS
+   Containment 2 §3.2, §3.4: layout and paint containment; CSS Will Change 1 §2.1: a property
+   will-change names that would make one */
+static bool effects_stacking_context(const box_t *b) {
+    const struct css_effects *e = css_style_effects(b->st);
+    uint8_t will = e->will_change.effects;
+    if (e->blend != CSS_BLEND_NORMAL || e->isolation == CSS_ISOLATION_ISOLATE || (will & CSS_WILL_STACK)) return true;
+    if (b->kind == B_INLINE) return false;
+    if (e->perspective.kind != LK_NONE || e->transform_style == CSS_TRANSFORM_PRESERVE_3D || (will & CSS_WILL_STACK_TRANSFORM))
+        return true;
+    if ((will & CSS_WILL_STACK_Z) && (b->st->position != POS_STATIC ||
+                                       (b->parent && !b->abspos && (b->parent->kind == B_FLEX || b->parent->kind == B_GRID))))
+        return true;
+    return (box_containment(b) & (CSS_CONTAIN_LAYOUT | CSS_CONTAIN_PAINT)) != 0;
+}
 static bool stacking_context(const box_t *b) {
     if (!b->st || b->kind == B_TEXT || b->kind == B_BR) return false;
     if (b->st->filter || b->st->backdrop_filter || b->st->opacity < 1 || mask_border_set(b->st) ||
-        (b->kind!=B_INLINE&&css_translation_active(b->st))) return true;
+        (b->kind!=B_INLINE&&css_translation_active(b->st)) || effects_stacking_context(b)) return true;
     if (b->kind == B_INLINE) return false;
     /* Opacity groups are atomic even in normal flow. Fixed/sticky boxes also
        establish a context with auto z-index; their descendants cannot escape
@@ -2610,6 +2633,8 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
         break;
     }
     case AT_CHECKBOX: {
+        /* css-ui-4 §7.2: appearance: none renders the widget as an ordinary element, its box alone */
+        if (st->appearance == CSS_APPEARANCE_NONE) break;
         int X = (int)roundf(x), Y = (int)roundf(y), S = (int)roundf(w);
         uint32_t mark, accent = control_accent(st, &mark);
         if (n->indeterminate) {
@@ -2630,6 +2655,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
         break;
     }
     case AT_RADIO: {
+        if (st->appearance == CSS_APPEARANCE_NONE) break;
         int r = (int)(w / 2), cx_ = (int)roundf(x + w / 2), cy_ = (int)roundf(y + h / 2);
         if (n->checked) {
             uint32_t accent = control_accent(st, NULL);
@@ -2669,12 +2695,16 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
         const char *txt = s.p ? sb_cstr(&s) : "";
         while (*txt == ' ' || *txt == '\n') txt++;
         paint_drew(P, contentful_text(txt, strlen(txt)));
+        /* appearance: none: the label alone, without the drop-down arrow (css-ui-4 §7.2) */
+        bool arrow = st->appearance != CSS_APPEARANCE_NONE;
         int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
-        gfx_clip(c, (int)x, (int)y, (int)w - 12, (int)ceilf(h) + 1);
+        gfx_clip(c, (int)x, (int)y, (int)w - (arrow ? 12 : 0), (int)ceilf(h) + 1);
         text_in(P, st, x, y, h, txt, st->color);
         c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
-        int ax = (int)(x + w - 9), ay = (int)(y + h / 2 - 2);
-        gfx_triangle(c, ax, ay, ax + 8, ay, ax + 4, ay + 5, st->color);
+        if (arrow) {
+            int ax = (int)(x + w - 9), ay = (int)(y + h / 2 - 2);
+            gfx_triangle(c, ax, ay, ax + 8, ay, ax + 4, ay + 5, st->color);
+        }
         sb_free(&s);
         break;
     }
@@ -3298,10 +3328,15 @@ static void marker_ink(const web_doc *d,const box_t *b,float rect[4]) {
     rect[0]=fminf(x-w,bx-fs*2)-slack;rect[1]=fminf(base-asc,by)-slack;
     rect[2]=x+slack;rect[3]=fmaxf(base+desc,by+b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2])+slack;
 }
-/* b clips what its own paint recursion draws to its padding box: an overflow, marquee or
-   line-clamp box. The viewport takes the root's and body's propagated overflow instead. */
+/* overflow other than visible, a line-clamp's truncation, or paint containment (CSS Containment 2
+   §3.4: the contents clipped to the overflow clip edge, the padding box here) */
+static bool clips_overflow(const box_t *b) {
+    return b->clamp_truncated || b->st->overflow != OV_VISIBLE || (box_containment(b) & CSS_CONTAIN_PAINT);
+}
+/* b clips what its own paint recursion draws to its padding box: an overflow, marquee, line-clamp
+   or paint-contained box. The viewport takes the root's and body's propagated overflow instead. */
 static bool overflow_clips(const web_doc *d,const box_t *b) {
-    return (web_marquee_box(b)||b->clamp_truncated||b->st->overflow!=OV_VISIBLE)&&
+    return (web_marquee_box(b)||clips_overflow(b))&&
            b->kind!=B_INLINE&&b->parent&&!doc_viewport_overflow_box(d,b);
 }
 
@@ -4086,6 +4121,178 @@ static void paint_backdrop(struct pctx *P, const box_t *b, const double *m, floa
     free(px);
 }
 
+/* ---------------------------------------------------------------- blending */
+/* Compositing 1 §3.2, §5.2, §9.1: a box whose mix-blend-mode is not normal is an isolated group that
+   blends with its backdrop, what its own group (the nearest ancestor stacking context, an isolated
+   group; the root's when there is none) painted under it. The result, Cs' = (1 − αb)·Cs + αb·B(Cb, Cs)
+   with the source's alpha (blend_pixel), drawn source-over, composes the group onto what is under it,
+   so it does not depend on that: it is kept, as premultiplied pixels over a rectangle of the document
+   space it was painted in (document = canvas − origin), until its group's paint ends. A later blended
+   box of the group, whose backdrop walk paints this one again, then takes it, and the walks stay one
+   per blended box. */
+struct blend_result {
+    const box_t *box, *group;
+    double x, y; /* the rectangle's document-space corner */
+    int w, h;
+    uint32_t *px;
+    bool painted, contentful; /* Paint Timing: what the box's own paint drew */
+};
+struct blend_results { struct blend_result *v; size_t n, cap; };
+static void blend_results_release(struct blend_results *R, const box_t *group) {
+    size_t keep = 0;
+    for (size_t i = 0; i < R->n; i++) {
+        if (R->v[i].group == group) free(R->v[i].px);
+        else R->v[keep++] = R->v[i];
+    }
+    R->n = keep;
+}
+static void blend_results_free(struct blend_results *R) {
+    for (size_t i = 0; i < R->n; i++) free(R->v[i].px);
+    free(R->v);
+    memset(R, 0, sizeof *R);
+}
+/* b's kept result holding the document rectangle at (x, y) of w × h pixels on its pixel grid */
+static const struct blend_result *blend_result_find(const struct blend_results *R, const box_t *b, double x, double y, int w, int h) {
+    for (size_t i = 0; R && i < R->n; i++) {
+        const struct blend_result *e = &R->v[i];
+        double dx = x - e->x, dy = y - e->y, ix = round(dx), iy = round(dy);
+        if (e->box != b || fabs(dx - ix) > 1e-3 || fabs(dy - iy) > 1e-3) continue;
+        if (ix >= 0 && iy >= 0 && ix + w <= e->w && iy + h <= e->h) return e;
+    }
+    return NULL;
+}
+/* keeps r, replacing b's earlier result; false (r not taken) when there is no room */
+static bool blend_result_keep(struct blend_results *R, const struct blend_result *r) {
+    if (!R) return false;
+    for (size_t i = 0; i < R->n; i++)
+        if (R->v[i].box == r->box) { free(R->v[i].px); R->v[i] = *r; return true; }
+    if (R->n == R->cap) {
+        size_t cap = R->cap ? R->cap * 2 : 8;
+        void *v = cap > SIZE_MAX / sizeof *R->v ? NULL : realloc(R->v, cap * sizeof *R->v);
+        if (!v) return false;
+        R->v = v; R->cap = cap;
+    }
+    R->v[R->n++] = *r;
+    return true;
+}
+/* b's group: the nearest ancestor stacking context (a top-layer box is one); NULL: the root's */
+static const box_t *blend_group(const struct pctx *P, const box_t *b) {
+    if (b == P->top_root) return NULL; /* the top layer paints over the root's group */
+    for (const box_t *a = b->parent; a && a != P->d->root_box; a = a->parent)
+        if (a == P->top_root || stacking_context(a)) return a;
+    return NULL;
+}
+/* Each source pixel blended with the backdrop's, both premultiplied: the result, premultiplied, in
+   place of the source. Each 32-row band is its own. */
+struct blend_job { uint32_t *source; const uint32_t *backdrop; int sw, sh, mode; };
+static void blend_band(size_t tile, void *context) {
+    const struct blend_job *j = context;
+    size_t first = tile * 32 * (size_t)j->sw, end = MIN((tile + 1) * 32, (size_t)j->sh) * (size_t)j->sw;
+    for (size_t i = first; i < end; i++) {
+        uint32_t s = j->source[i], k = j->backdrop[i], as = s >> 24, ab = k >> 24;
+        if (!as || !ab) continue; /* no source, or Cs' = Cs over nothing */
+        uint32_t straight = as << 24, cb = 0;
+        for (int shift = 0; shift < 24; shift += 8) {
+            straight |= MIN(255u, (((s >> shift) & 255) * 255 + as / 2) / as) << shift;
+            cb |= MIN(255u, (((k >> shift) & 255) * 255 + ab / 2) / ab) << shift;
+        }
+        uint32_t o = blend_pixel(j->mode, straight, cb, (float)ab * (1.f / 255.f)), r = as << 24;
+        for (int shift = 0; shift < 24; shift += 8) r |= ((((o >> shift) & 255) * as + 127) / 255) << shift;
+        j->source[i] = r;
+    }
+    parallel_record_work(PARALLEL_RASTER, end - first);
+}
+/* A surface past this many pixels is not allocated: the box paints in place, unblended. */
+#define BLEND_SURFACE_MAX (8.0 * 1024 * 1024)
+/* Paints sw × sh pixels of the walk Q's box `root` (the canvas's (l, t) at their top left) over black
+   and over white, into black and white, and recovers premultiplied colour into black. */
+static void blend_surface(struct pctx *P, struct pctx *Q, box_t *root, bool layer_root, double l, double t,
+                          uint32_t *black, uint32_t *white, int sw, int sh) {
+    for (int pass = 0; pass < 2 && !P->failed; pass++) {
+        canvas_t surface;
+        gfx_init(&surface, pass ? white : black, sw, sh, sw);
+        gfx_fill(&surface, 0, 0, sw, sh, pass ? RGB(255, 255, 255) : RGB(0, 0, 0));
+        struct pctx S = *Q;
+        S.c = &surface; S.ox = (float)(P->ox - l); S.oy = (float)(P->oy - t);
+        S.vx0 = 0; S.vy0 = 0; S.vx1 = sw; S.vy1 = sh; S.viewport_mask = NULL;
+        S.private_surface = true;
+        if (S.halted) *S.halted = false;
+        paint_box(&S, root, layer_root);
+        if (S.failed && !(S.halted && *S.halted)) P->failed = true;
+        Q->painted |= S.painted; Q->contentful |= S.contentful;
+    }
+    if (P->failed) return;
+    struct transformed_job coverage = {.black = black, .white = white, .sw = sw, .sh = sh};
+    transformed_run(P->d, transformed_coverage, sh, (size_t)sw * (size_t)sh, &coverage);
+}
+static void paint_blended(struct pctx *P, box_t *b, bool layer_root) {
+    canvas_t *c = P->c;
+    /* what b paints, in document space; a private bounds generation, as a transform's */
+    struct pctx Q = *P;
+    Q.mode = M_BOUNDS; Q.bounds_valid = false; Q.unblended = b;
+    Q.bounds_generation = __atomic_add_fetch(&P->d->paint_bounds_generation, 1, __ATOMIC_RELAXED);
+    paint_box(&Q, b, layer_root);
+    if (Q.failed) { P->failed = true; return; }
+    if (!Q.bounds_valid) return;
+    double l = fmax(floor((double)Q.bounds[0] + P->ox), c->cx0), t = fmax(floor((double)Q.bounds[1] + P->oy), c->cy0);
+    double r = fmin(ceil((double)Q.bounds[2] + P->ox), c->cx1), bt = fmin(ceil((double)Q.bounds[3] + P->oy), c->cy1);
+    if (!(r > l && bt > t)) return;
+    int dx = (int)l, dy = (int)t, dw = (int)(r - l), dh = (int)(bt - t);
+    const struct blend_result *kept = blend_result_find(P->blends, b, l - P->ox, t - P->oy, dw, dh);
+    struct blend_result made = {0};
+    uint32_t *white = NULL, *under = NULL;
+    if (!kept) {
+        if (!((double)dw * dh <= BLEND_SURFACE_MAX)) {
+            struct pctx S = *P; S.unblended = b; paint_box(&S, b, layer_root);
+            if (S.failed) P->failed = true;
+            P->painted |= S.painted; P->contentful |= S.contentful;
+            return;
+        }
+        size_t count = (size_t)dw * (size_t)dh;
+        made = (struct blend_result){.box = b, .group = blend_group(P, b), .x = l - P->ox, .y = t - P->oy, .w = dw, .h = dh};
+        made.px = malloc(count * sizeof *made.px); white = malloc(count * sizeof *white); under = malloc(count * sizeof *under);
+        if (!made.px || !white || !under) { P->failed = true; goto done; }
+        if (P->d->profile_enabled) { paint_profile.groups++; paint_profile.group_pixels += count; }
+        /* the source: b as an isolated group, without its blending */
+        struct pctx S = *P;
+        S.unblended = b; S.halt = NULL; S.halted = NULL; S.painted = S.contentful = false;
+        blend_surface(P, &S, b, layer_root, l, t, made.px, white, dw, dh);
+        made.painted = S.painted; made.contentful = S.contentful;
+        if (P->failed || !web_native_checkpoint(P->d)) { P->failed = true; goto done; }
+        if (!made.group && !P->private_surface) {
+            /* the root's group is the page's canvas, opaque: what it holds under b is the backdrop */
+            for (int row = 0; row < dh; row++) {
+                const uint32_t *from = c->px + (size_t)(dy + row) * c->pitch + dx;
+                uint32_t *to = under + (size_t)row * dw;
+                for (int i = 0; i < dw; i++) to[i] = from[i] | 0xFF000000u;
+            }
+        } else {
+            /* the backdrop: the group, as isolated as it paints (without its own effects), stopped
+               where b paints */
+            box_t *group = made.group ? (box_t *)made.group : P->d->root_box;
+            bool halted = false;
+            struct pctx G = *P;
+            G.unfiltered = G.untransformed = G.unblended = group;
+            G.halt = b; G.halted = &halted;
+            blend_surface(P, &G, group, true, l, t, under, white, dw, dh);
+            if (P->failed || !web_native_checkpoint(P->d)) { P->failed = true; goto done; }
+        }
+        struct blend_job job = {made.px, under, dw, dh, css_style_effects(b->st)->blend};
+        transformed_run(P->d, blend_band, dh, count, &job);
+        if (!web_native_checkpoint(P->d)) { P->failed = true; goto done; }
+        kept = &made;
+    }
+    /* the result reads what is under it: a video there repaints with it */
+    web_avmedia_snapshot_reject_region(c, dx, dy, dw, dh);
+    int sx = dx - (int)round(l - P->ox - kept->x), sy = dy - (int)round(t - P->oy - kept->y);
+    struct filtered_job j = {kept->px, c, kept->w, sx, sy, dx, dy, dw, dh, 255};
+    transformed_run(NULL, filtered_composite, dh, (size_t)dw * (size_t)dh, &j);
+    P->painted |= kept->painted; P->contentful |= kept->contentful;
+    if (kept == &made && blend_result_keep(P->blends, &made)) made.px = NULL;
+done:
+    free(made.px); free(white); free(under);
+}
+
 static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (P->failed) return;
     if (P->mode==M_PAINT && b->ellipsis_hidden && b->ellipsis_hidden_revision==P->d->layout_revision) return;
@@ -4095,11 +4302,22 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (web_dialog_layer_box(P->d,b) && b != P->top_root) return;
     if (P->mode == M_HIT && b->node && web_dialog_inert(P->d,b->node)) return;
     if (P->mode != M_BOUNDS && paint_box_layer(b) && !layer_root) return; /* painted with the layers */
+    /* a backdrop walk ends where its blended box paints (a measure inside it takes the box's ink) */
+    if (P->halt == b && P->mode == M_PAINT) { if (P->halted) *P->halted = true; P->failed = true; return; }
     const style_t *st = b->st;
     /* paint_filtered applies a filtered box's opacity after its filter */
     float group_opacity = P->unfiltered == b ? 1 : st->opacity * (st->filter ? st->filter->opacity : 1);
     /* Transparent auto boxes still participate in hit testing. */
     if (P->mode != M_HIT && group_opacity <= 0) return;
+    /* CSS Transforms 2 §10: a box whose back faces the viewer is not rendered, nor hit */
+    if (css_style_effects(st)->backface == CSS_BACKFACE_HIDDEN && box_backface_hidden(b)) return;
+    /* mix-blend-mode blends b's group, after its transform, filter, clip and opacity; the root
+       element has no backdrop to blend with */
+    if (P->mode == M_PAINT && !P->text_mask && P->unblended != b && css_style_effects(st)->blend != CSS_BLEND_NORMAL &&
+        !(b->node && b->node == P->d->html)) {
+        paint_blended(P, b, layer_root);
+        return;
+    }
     if (P->untransformed != b && box_transformed(b)) { paint_transformed(P, b, layer_root); return; }
     /* A filter maps what b paints, before its clip and opacity (and inside its transform); it
        never moves where b is hit. */
@@ -4275,6 +4493,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     int layer = 0;
     for (; layer < layers.n && layer_z(layers.v[layer]) < 0; layer++)
         paint_stacked_layer(P, layers.v[layer]);
+    if (P->failed) contents = false; /* nothing paints over where a walk stopped (a backdrop walk's end) */
     if (contents && b->inline_ctx) {
         inline_children(P, b, true);
         paint_runs(P, b, NULL);
@@ -4295,8 +4514,8 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     c->mask_clip=previous_mask;
 done:
     release_layers(&layers,layers_borrowed);
-    if (P->mode == M_PAINT && visible && !P->text_mask && st->outline_width > 0 && b->kind != B_INLINE && b->kind != B_TEXT &&
-        b->kind != B_BR && b->kind != B_ROW && b->kind != B_ROW_GROUP)
+    if (P->mode == M_PAINT && visible && !P->text_mask && !P->failed && st->outline_width > 0 && b->kind != B_INLINE &&
+        b->kind != B_TEXT && b->kind != B_BR && b->kind != B_ROW && b->kind != B_ROW_GROUP)
         paint_outline(c, st, P->ox + bx, P->oy + by, bw, bh);
     if (clipped) clip_pop(c, clip_saved, clip_prior);
     if (saved) {
@@ -4311,7 +4530,9 @@ done:
             } else for (int i = 0; i < gw; i++) row[i] = gfx_mix(old[i], row[i], a);
         }
         free(mask);
-        if (P->failed)
+        /* a backdrop walk that ended inside the group keeps what the group drew, unmixed: the
+           group's own opacity and mask are its caller's */
+        if (P->failed && !(P->halted && *P->halted))
             for (int j = 0; j < gh; j++) memcpy(c->px + (size_t)(gy + j) * c->pitch + gx,
                 saved + (size_t)j * gw, sizeof *saved * (size_t)gw);
         free(saved);
@@ -4331,6 +4552,8 @@ done:
         if (b->paint_bounds_valid) bounds_rect(P, b->paint_bounds[0], b->paint_bounds[1],
             b->paint_bounds[2] - b->paint_bounds[0], b->paint_bounds[3] - b->paint_bounds[1]);
     }
+    /* a group's paint ended: no walk reads its blended boxes' results again but by painting it anew */
+    if (P->mode == M_PAINT && P->blends && P->blends->n && !P->failed) blend_results_release(P->blends, b);
 }
 
 static void stacked_ancestor_clips(struct pctx *P,box_t *layer,box_t *ancestor,bool reached,bool fixed_escape,bool skip) {
@@ -4339,7 +4562,7 @@ static void stacked_ancestor_clips(struct pctx *P,box_t *layer,box_t *ancestor,b
     if(ancestor->clamp_hidden||(ancestor->st&&ancestor->st->display==D_NONE)||
        (ancestor->anchored&&P->mode!=M_BOUNDS&&box_anchor_hidden(ancestor)))skip=true;
     if(ancestor==layer->cb)reached=true;
-    if(ancestor->st&&(web_marquee_box(ancestor)||((ancestor->clamp_truncated||ancestor->st->overflow!=OV_VISIBLE)&&reached&&!fixed_escape))&&
+    if(ancestor->st&&(web_marquee_box(ancestor)||(clips_overflow(ancestor)&&reached&&!fixed_escape))&&
         !doc_viewport_overflow_box(P->d,ancestor)&&ancestor->kind!=B_INLINE) {
         float x=box_visual_x(ancestor)-ancestor->p[3],y=box_visual_y(ancestor)-ancestor->p[0];
         gfx_clip(canvas,(int)(P->ox+x),(int)(P->oy+y),(int)(ancestor->w+ancestor->p[1]+ancestor->p[3]),(int)(ancestor->h+ancestor->p[0]+ancestor->p[2]));
@@ -4528,7 +4751,10 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
     }
     P.canvas_bg_from = (uint32_t)from;
     if (from) paint_drew(&P, false); /* a non-default canvas background */
+    struct blend_results blends = {0};
+    P.blends = &blends;
     walk(&P);
+    blend_results_free(&blends);
     /* Paint Timing "mark paint timing": this rendering update's end, once each. */
     if (!P.failed && (P.painted || P.contentful)) {
         uint64_t painted_at = uptime_ms();
@@ -4558,6 +4784,7 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
                 gfx_fill(&probe,0,0,probe.w,probe.h,RGB(255,255,255));
                 if (!Q.canvas_group) gfx_fill_blend(&probe,x-px,y-py,w,h,bg);
                 walk(&Q);
+                blend_results_free(&blends); /* each phase paints its own video frames */
             }
             if(!font_probe_end())web_avmedia_snapshot_reject();
         }
@@ -4795,7 +5022,7 @@ static bool hit_corner_contains(const struct hit_primitive *item,float x,float y
     bool reached=!box->abspos,fixed=box_viewport_fixed(box);
     for(box_t *a=box->parent;a&&a->parent;a=a->parent) {
         if(a==box->cb)reached=true;
-        if(a->st&&(web_marquee_box(a)||((a->clamp_truncated||a->st->overflow!=OV_VISIBLE)&&reached&&!fixed))&&a->kind!=B_INLINE&&
+        if(a->st&&(web_marquee_box(a)||(clips_overflow(a)&&reached&&!fixed))&&a->kind!=B_INLINE&&
             !doc_viewport_overflow_box(doc,a)&&a->radius_clip[1]) {
             const struct radius_cache *radius=a->radius_clip[1];float px=box_visual_x(a)-a->p[3],py=box_visual_y(a)-a->p[0];
             if(corners_coverage(x,y,px,py,radius->w,radius->h,&radius->radii)<.5f)return false;
@@ -4970,8 +5197,26 @@ bool doc_caret_at(web_doc *d, double x, double y, node_t **node, uint32_t *offse
 }
 
 /* ---- the pointer (css-ui-4 §5.1) */
-/* auto: the text beam over text that can be selected (a button's label is the button's) or edited,
-   the arrow elsewhere */
+/* css-ui-4 §6.1: user-select's used value for element's content (pseudo: its ::before or ::after's):
+   contain on an editable element whatever its computed value; for auto, none on ::before and
+   ::after, and otherwise the parent's used value when it is all or none, else text */
+static int user_select_used(web_doc *d, node_t *element, uint8_t pseudo) {
+    if (pseudo == PE_BEFORE || pseudo == PE_AFTER) {
+        const style_t *own = element && element->style ? pseudo == PE_BEFORE ? element->style->before : element->style->after : NULL;
+        return !own || own->user_select == CSS_USER_SELECT_AUTO ? CSS_USER_SELECT_NONE : own->user_select;
+    }
+    for (node_t *n = element; n; n = doc_flat_parent(n)) {
+        if (n->type != N_ELEM) continue;
+        if (doc_node_editable(d, n)) return n == element ? CSS_USER_SELECT_CONTAIN : CSS_USER_SELECT_TEXT;
+        int v = n->style ? n->style->user_select : CSS_USER_SELECT_AUTO;
+        if (v == CSS_USER_SELECT_AUTO) continue; /* the parent's */
+        if (n == element) return v;
+        return v == CSS_USER_SELECT_ALL || v == CSS_USER_SELECT_NONE ? v : CSS_USER_SELECT_TEXT;
+    }
+    return CSS_USER_SELECT_TEXT;
+}
+/* auto: the text beam over text that can be selected (user-select's used value is not none; a
+   button's label is the button's) or edited, the arrow elsewhere */
 static uint32_t cursor_auto(web_doc *d, node_t *element, const struct pctx *P) {
     box_t *box = element ? element->box : NULL;
     if (element && text_control_box(box) && box->node == element)
@@ -4983,7 +5228,7 @@ static uint32_t cursor_auto(web_doc *d, node_t *element, const struct pctx *P) {
     if (!run || run->atomic || !run->node) return N_POINTER_DEFAULT;
     for (node_t *n = element; n; n = doc_flat_parent(n))
         if (n->type == N_ELEM && !n->foreign && n->tag == T_button) return N_POINTER_DEFAULT;
-    return N_POINTER_TEXT;
+    return user_select_used(d, element, P->target_pseudo) == CSS_USER_SELECT_NONE ? N_POINTER_DEFAULT : N_POINTER_TEXT;
 }
 static int cursor_round(float v, int size) {
     int i = (int)floorf(v + .5f);

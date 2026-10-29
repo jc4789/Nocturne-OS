@@ -754,7 +754,7 @@ enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_
        PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_SHAPE, PT_OFFSET, PT_CLIP, PT_COLOR_SCHEME, PT_RULE_LIST,
        PT_RULE_INSET, PT_ANCHOR, PT_COUNTER, PT_QUOTES, PT_LIST_IMAGE,
        PT_BG_LIST, PT_BG_OFFSET, PT_BI_SOURCE, PT_BI_SLICE, PT_BI_SIDES, PT_BI_REPEAT,
-       PT_CURSOR, PT_UI_COLOR, PT_TEXT };
+       PT_CURSOR, PT_UI_COLOR, PT_TEXT, PT_WILL_CHANGE, PT_CONTAIN, PT_TOUCH_ACTION };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
@@ -778,11 +778,11 @@ struct propdef {
 enum { AN_TYPE, AN_NONE, AN_DISCRETE, AN_VISIBILITY, AN_DISPLAY };
 /* style_t itself, or a group of rarely set properties it holds by pointer (style_t's float_shape,
    offset, gap_rules, anchor, counters, list, background, border_image, mask_border, ui, decoration,
-   text). A group holds only properties that are not inherited, but for G_LIST, G_UI and G_TEXT, which
-   hold only inherited ones: an element's style starts with its parent's group by the pointer
-   (css_style_init's copy of the parent), and with the initial values the others (groups_copy). */
+   text, effects). A group holds only properties that are not inherited, but for G_LIST, G_UI and
+   G_TEXT, which hold only inherited ones: an element's style starts with its parent's group by the
+   pointer (css_style_init's copy of the parent), and with the initial values the others (groups_copy). */
 enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET, G_GAP_RULE, G_ANCHOR, G_COUNTER, G_LIST, G_BACKGROUND, G_BORDER_IMAGE,
-       G_MASK_BORDER, G_UI, G_DECORATION, G_TEXT };
+       G_MASK_BORDER, G_UI, G_DECORATION, G_TEXT, G_EFFECTS };
 /* which sides list a PT_BI_SIDES property holds (its flags) */
 enum { BI_WIDTH, BI_OUTSET };
 /* which colour a PT_UI_COLOR property is (its flags) */
@@ -860,6 +860,21 @@ static const struct kw kw_bg_repeat[] = {{"repeat", BR_REPEAT}, {"repeat-x", BR_
                                          {0}};
 /* HTML hit testing supports auto/none; SVG painted/geometry keywords remain unsupported. */
 static const struct kw kw_pointer_events[] = {{"auto", 0}, {"none", 1}, {0}};
+/* Compositing 1 §3.2; CSS Transforms 2: transform-style, backface-visibility (§10) */
+static const struct kw kw_isolation[] = {{"auto", CSS_ISOLATION_AUTO}, {"isolate", CSS_ISOLATION_ISOLATE}, {0}};
+static const struct kw kw_transform_style[] = {{"flat", CSS_TRANSFORM_FLAT}, {"preserve-3d", CSS_TRANSFORM_PRESERVE_3D}, {0}};
+static const struct kw kw_backface[] = {{"visible", CSS_BACKFACE_VISIBLE}, {"hidden", CSS_BACKFACE_HIDDEN}, {0}};
+/* css-ui-4 §7.2: none | auto | <compat-auto> | <compat-special>. base and base-select (the base
+   appearance, which no control here has) are not taken: CSS.supports() would claim them. */
+static const struct kw kw_appearance[] = {{"none", CSS_APPEARANCE_NONE}, {"auto", CSS_APPEARANCE_AUTO},
+    {"searchfield", CSS_APPEARANCE_SEARCHFIELD}, {"textarea", CSS_APPEARANCE_TEXTAREA},
+    {"checkbox", CSS_APPEARANCE_CHECKBOX}, {"radio", CSS_APPEARANCE_RADIO}, {"menulist", CSS_APPEARANCE_MENULIST},
+    {"listbox", CSS_APPEARANCE_LISTBOX}, {"meter", CSS_APPEARANCE_METER}, {"progress-bar", CSS_APPEARANCE_PROGRESS_BAR},
+    {"button", CSS_APPEARANCE_BUTTON}, {"textfield", CSS_APPEARANCE_TEXTFIELD},
+    {"menulist-button", CSS_APPEARANCE_MENULIST_BUTTON}, {0}};
+/* css-ui-4 §6.1 */
+static const struct kw kw_user_select[] = {{"auto", CSS_USER_SELECT_AUTO}, {"text", CSS_USER_SELECT_TEXT},
+    {"none", CSS_USER_SELECT_NONE}, {"contain", CSS_USER_SELECT_CONTAIN}, {"all", CSS_USER_SELECT_ALL}, {0}};
 static const struct kw kw_transform_box[] = {{"view-box", TB_VIEW_BOX}, {"fill-box", TB_FILL_BOX}, {"stroke-box", TB_STROKE_BOX},
                                            {"content-box", TB_CONTENT_BOX}, {"border-box", TB_BORDER_BOX}, {0}};
 static const struct kw kw_visibility[] = {{"visible", 0}, {"hidden", 1}, {"collapse", 1}, {0}};
@@ -951,6 +966,7 @@ static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}
 #define OMB(f) OG(G_MASK_BORDER, struct css_border_image, f)
 #define OTEXT(f) OG(G_TEXT, struct css_text, f)
 #define ODECO(f) OG(G_DECORATION, struct css_decoration, f)
+#define OEFF(f) OG(G_EFFECTS, struct css_effects, f)
 
 /* sorted by name at first use */
 static struct propdef props[] = {
@@ -1043,6 +1059,19 @@ static struct propdef props[] = {
     {"cursor", PT_CURSOR, 0, true, OG(G_UI, struct css_ui, cursor), kw_cursor, 0, AN_DISCRETE},
     {"caret-color", PT_UI_COLOR, UI_CARET, true, OG(G_UI, struct css_ui, caret), NULL, 0, AN_TYPE},
     {"accent-color", PT_UI_COLOR, UI_ACCENT, true, OG(G_UI, struct css_ui, accent), NULL, 0, AN_TYPE},
+    {"appearance", PT_KW, 0, false, O(appearance), kw_appearance, 0, AN_DISCRETE},
+    {"user-select", PT_KW, 0, false, O(user_select), kw_user_select, 0, AN_DISCRETE},
+    /* Pointer Events 3 §9.1 */
+    {"touch-action", PT_TOUCH_ACTION, 0, false, O(touch_action), NULL, 0, AN_NONE},
+    /* Compositing 1, CSS Transforms 2, CSS Will Change 1, CSS Containment 2: the effects group */
+    {"isolation", PT_KW, 0, false, OEFF(isolation), kw_isolation, 0, AN_DISCRETE},
+    {"mix-blend-mode", PT_KW, 0, false, OEFF(blend), kw_blend, 0, AN_DISCRETE},
+    {"perspective", PT_LEN, LF_NONE | LF_NOPCT | LF_LENGTH, false, OEFF(perspective), NULL, 0, AN_TYPE},
+    {"perspective-origin", PT_OFFSET, CSS_PERSPECTIVE_ORIGIN, false, OEFF(perspective_origin), NULL, 0, AN_TYPE},
+    {"transform-style", PT_KW, 0, false, OEFF(transform_style), kw_transform_style, 0, AN_DISCRETE},
+    {"backface-visibility", PT_KW, 0, false, OEFF(backface), kw_backface, 0, AN_DISCRETE},
+    {"will-change", PT_WILL_CHANGE, 0, false, OEFF(will_change), NULL, 0, AN_NONE},
+    {"contain", PT_CONTAIN, 0, false, OEFF(contain), NULL, 0, AN_NONE},
     {"column-gap", PT_PX, LF_NOPCT, false, O(gap_col), kw_normal0, 0, AN_TYPE},
     /* CSS Gap Decorations 1. flags: a list's enum css_gap_rule_kind, a shorthand's GS_* */
     SH_GAP("column-rule", GS_RULE | GS_COLUMN),
@@ -1267,7 +1296,7 @@ static const struct {
     const char *alias, *name;
     bool legacy;
 } aliases[] = {
-    {"-webkit-transform", "transform"},
+    {"-webkit-transform", "transform"}, {"-webkit-appearance", "appearance", true},
     {"block-size", "height"}, {"border-block-end", "border-bottom"}, {"border-block-start", "border-top"},
     {"border-block-end-color", "border-bottom-color"}, {"border-block-start-color", "border-top-color"},
     {"border-block-end-width", "border-bottom-width"}, {"border-block-start-width", "border-top-width"},
@@ -1425,6 +1454,7 @@ static const void *group_of(const style_t *s, uint8_t g) {
     case G_UI: return css_style_ui(s);
     case G_DECORATION: return css_style_decoration(s);
     case G_TEXT: return css_style_text(s);
+    case G_EFFECTS: return css_style_effects(s);
     }
     return s;
 }
@@ -1440,6 +1470,7 @@ static size_t group_size(uint8_t g) {
     case G_UI: return sizeof(struct css_ui);
     case G_DECORATION: return sizeof(struct css_decoration);
     case G_TEXT: return sizeof(struct css_text);
+    case G_EFFECTS: return sizeof(struct css_effects);
     }
     return sizeof(struct css_list);
 }
@@ -1456,6 +1487,7 @@ static bool group_same(const style_t *a, const style_t *b, uint8_t g) {
     case G_UI: return a->ui == b->ui;
     case G_DECORATION: return a->decoration == b->decoration;
     case G_TEXT: return a->text == b->text;
+    case G_EFFECTS: return a->effects == b->effects;
     }
     return a->list == b->list;
 }
@@ -1477,6 +1509,7 @@ static void *group_write(style_t *s, uint8_t g, const void *value, arena_t *a) {
     case G_UI: s->ui = copy; break;
     case G_DECORATION: s->decoration = copy; break;
     case G_TEXT: s->text = copy; break;
+    case G_EFFECTS: s->effects = copy; break;
     default: s->list = copy;
     }
     return copy;
@@ -1493,6 +1526,7 @@ static void groups_copy(style_t *dst, const style_t *src) {
     dst->border_image = src->border_image; dst->border_image_img = src->border_image_img;
     dst->mask_border = src->mask_border; dst->mask_border_img = src->mask_border_img;
     dst->decoration = src->decoration;
+    dst->effects = src->effects;
 }
 /* the property's field in s */
 static const void *field_of(const style_t *s, const struct propdef *p) {
@@ -1520,6 +1554,11 @@ static bool text_value_text(const style_t *st, const struct propdef *p, bool res
 static void decoration_line_text(sbuf *out, uint8_t lines);
 static bool decoration_shorthand_text(const style_t *st, sbuf *out, web_doc *d);
 static bool text_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
+/* the effects group's and touch-action's values (below) */
+static bool effects_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
+static void contain_text(sbuf *out, uint8_t bits, bool computed);
+static void touch_action_text(sbuf *out, uint8_t bits);
+static bool motion_name(const char *s, size_t n);
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d) {
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return 0;
@@ -1560,6 +1599,9 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
     case PT_UI_COLOR: return ui_colors_text(p, st, (const struct css_ui_color *)field, true, out) ? 1 : -1;
     case PT_TEXT: return text_value_text(st, p, true, out, d) ? 1 : -1;
     case PT_TEXT_DECO: decoration_line_text(out, st->text_decoration); return 1;
+    case PT_WILL_CHANGE: sb_puts(out, css_style_effects(st)->will_change.text ? css_style_effects(st)->will_change.text : "auto"); return 1;
+    case PT_CONTAIN: contain_text(out, css_style_effects(st)->contain, true); return 1;
+    case PT_TOUCH_ACTION: touch_action_text(out, st->touch_action); return 1;
     case PT_SHORT: /* the shorthands whose longhands' owner serializes them together */
         if (p->sh == SH_LIST_STYLE) { list_style_text(st, out); return 1; }
         if (p->sh == SH_TEXT_DECORATION) return decoration_shorthand_text(st, out, d) ? 1 : -1;
@@ -1611,6 +1653,7 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     if (p->type == PT_TEXT || p->type == PT_TEXT_DECO || (p->type == PT_SHORT && p->sh == SH_TEXT_DECORATION))
         return text_specified(p, v, n, out);
     if (p->group == G_TEXT || p->group == G_DECORATION) return false; /* their keywords, as written */
+    if (p->group == G_EFFECTS || p->type == PT_TOUCH_ACTION) return p->type != PT_KW && effects_specified(p, v, n, out);
     if (p->type == PT_SHAPE || p->group != G_STYLE || (p->type == PT_SHORT && p->sh == SH_OFFSET))
         return css_shape_specified(p->name, v, n, out);
     if (p->type != PT_COLOR_SCHEME) {
@@ -1701,6 +1744,7 @@ bool css_prop_reify(const char *name, size_t n, struct css_reify *out) {
     case PT_KW: case PT_DISPLAY: case PT_COLOR: case PT_FONT_FAMILY: case PT_LIST_TYPE: case PT_BG_IMAGE: case PT_OVERFLOW:
     case PT_MASK_IMAGE: case PT_SVG_PAINT: case PT_CONTAINER_NAMES: case PT_TRANSFORM: case PT_GAREAS: case PT_FILTER:
     case PT_BOX_SHADOW: case PT_CLIP: case PT_COLOR_SCHEME: case PT_GLINE:
+    case PT_WILL_CHANGE: case PT_CONTAIN: case PT_TOUCH_ACTION:
         break;
     default: typed = false;
     }
@@ -2546,6 +2590,182 @@ static bool ui_specified(const struct propdef *p, const char *v, size_t n, sbuf 
         struct css_ui_color colors[2];
         ok = (p->type == PT_CURSOR ? ui_cursor(v, n, &cx, &cursor, out) : ui_color(p, v, n, &cx, colors, out)) &&
              !cx.invalid;
+    }
+    ar_free(&arena);
+    if (!ok) out->n = begin;
+    sb_cstr(out);
+    return ok;
+}
+
+/* ---------------------------------------------------------------- compositing, 3D, will-change, containment */
+/* The effects group (Compositing 1 §3, CSS Transforms 2 §8-10 and transform-style, CSS Will Change 1 §2.1, CSS
+   Containment 2 §2) and touch-action (Pointer Events 3 §9.1): the values the table does not parse
+   as keywords or lengths, and their serializations. What they make of a box (stacking contexts,
+   containing blocks, containment, blending) is layout's and paint's (layout.c box_containment and
+   box_filter_containing_block, paint.c stacking_context). */
+const struct css_effects css_effects_initial = {
+    .perspective = {.kind = LK_NONE},
+    .perspective_origin = {{.kind = LK_LEN, .pct = 50}, {.kind = LK_LEN, .pct = 50}}};
+bool css_effects_equal(const struct css_effects *a, const struct css_effects *b) {
+    if (a == b) return true;
+    if (!a) a = &css_effects_initial;
+    if (!b) b = &css_effects_initial;
+    return css_length_equal(&a->perspective, &b->perspective) &&
+           css_length_equal(&a->perspective_origin[0], &b->perspective_origin[0]) &&
+           css_length_equal(&a->perspective_origin[1], &b->perspective_origin[1]) && ui_same(a->will_change.text, b->will_change.text) &&
+           a->will_change.effects == b->will_change.effects && a->isolation == b->isolation && a->blend == b->blend &&
+           a->transform_style == b->transform_style && a->backface == b->backface && a->contain == b->contain;
+}
+bool css_effects_layout_equal(const struct css_effects *a, const struct css_effects *b) {
+    if (a == b) return true;
+    if (!a) a = &css_effects_initial;
+    if (!b) b = &css_effects_initial;
+    return a->contain == b->contain && a->will_change.effects == b->will_change.effects &&
+           a->transform_style == b->transform_style && (a->perspective.kind == LK_NONE) == (b->perspective.kind == LK_NONE);
+}
+/* §2.1 of CSS Will Change 1: a property will-change names makes the element what any value of it
+   other than the initial one would (the names a property's own name, its legacy or prefixed name
+   too, as the property table finds it) */
+#define WILL_TRANSFORM (CSS_WILL_STACK_TRANSFORM | CSS_WILL_FIXED_CB_TRANSFORM)
+static const struct { const char *name; uint8_t effects; } will_features[] = {
+    {"backdrop-filter", CSS_WILL_STACK | CSS_WILL_FIXED_CB}, {"clip-path", CSS_WILL_STACK}, {"contain", WILL_TRANSFORM},
+    {"filter", CSS_WILL_STACK | CSS_WILL_FIXED_CB}, {"isolation", CSS_WILL_STACK}, {"mask", CSS_WILL_STACK},
+    {"mask-border", CSS_WILL_STACK}, {"mask-border-source", CSS_WILL_STACK}, {"mask-image", CSS_WILL_STACK},
+    {"mix-blend-mode", CSS_WILL_STACK}, {"offset", WILL_TRANSFORM}, {"offset-path", WILL_TRANSFORM},
+    {"opacity", CSS_WILL_STACK}, {"perspective", WILL_TRANSFORM}, {"position", CSS_WILL_STACK | CSS_WILL_ABS_CB},
+    {"rotate", WILL_TRANSFORM}, {"scale", WILL_TRANSFORM}, {"transform", WILL_TRANSFORM},
+    {"transform-style", WILL_TRANSFORM}, {"translate", WILL_TRANSFORM}, {"view-transition-name", CSS_WILL_STACK},
+    {"z-index", CSS_WILL_STACK_Z}};
+static uint8_t will_feature(const char *s, size_t n) {
+    const struct propdef *p = css_prop_lookup(s, n);
+    char low[64];
+    const char *name = p ? p->name : low;
+    if (!p) {
+        if (n >= sizeof low) return 0;
+        for (size_t i = 0; i < n; i++) low[i] = (char)lower((unsigned char)s[i]);
+        low[n] = 0;
+    }
+    for (size_t i = 0; i < sizeof will_features / sizeof *will_features; i++)
+        if (!strcmp(will_features[i].name, name)) return will_features[i].effects;
+    return 0;
+}
+/* will-change: auto | <animateable-feature>#; <animateable-feature> = scroll-position | contents |
+   <custom-ident>, which is none of will-change, none, all, auto, scroll-position, contents and the
+   CSS-wide keywords. The computed value is as specified: the keywords lowercase, the identifiers as
+   written, joined by ", ". */
+static bool will_change_parse(const char *v, size_t n, struct cx *cx, struct css_will_change *w) {
+    if (ident_is(v, n, "auto")) { *w = (struct css_will_change){0}; return true; }
+    const char **t;
+    size_t *tl;
+    int k = ui_items(v, n, cx, &t, &tl);
+    if (k < 1) return false;
+    char *out = ar_alloc(cx->a, n + 2 * (size_t)k + 1), *o = out;
+    uint8_t bits = 0;
+    for (int i = 0; i < k; i++) {
+        const char *s = t[i];
+        size_t sn = tl[i];
+        trim(&s, &sn);
+        if (!sn) return false;
+        bool keyword = ident_is(s, sn, "scroll-position") || ident_is(s, sn, "contents");
+        if (!keyword && (!motion_name(s, sn) || ident_is(s, sn, "revert-rule") || ident_is(s, sn, "will-change") ||
+                         ident_is(s, sn, "none") || ident_is(s, sn, "all") || ident_is(s, sn, "auto"))) return false;
+        if (i) { *o++ = ','; *o++ = ' '; }
+        for (size_t j = 0; j < sn; j++) *o++ = keyword ? (char)lower((unsigned char)s[j]) : s[j];
+        if (!keyword) bits |= will_feature(s, sn);
+    }
+    *o = 0;
+    *w = (struct css_will_change){out, bits};
+    return true;
+}
+/* contain: none | strict | content | [ [ size | inline-size ] || layout || style || paint ] */
+static const struct kw kw_contain[] = {{"size", CSS_CONTAIN_SIZE}, {"inline-size", CSS_CONTAIN_INLINE_SIZE},
+    {"layout", CSS_CONTAIN_LAYOUT}, {"style", CSS_CONTAIN_STYLE}, {"paint", CSS_CONTAIN_PAINT}, {0}};
+#define CONTAIN_STRICT (CSS_CONTAIN_SIZE | CSS_CONTAIN_LAYOUT | CSS_CONTAIN_STYLE | CSS_CONTAIN_PAINT)
+#define CONTAIN_CONTENT (CSS_CONTAIN_LAYOUT | CSS_CONTAIN_STYLE | CSS_CONTAIN_PAINT)
+/* the keywords in the grammar's order; computed: strict and content for the sets they are (the
+   specified value keeps what was written: a keyword, or the list) */
+static void contain_text(sbuf *out, uint8_t bits, bool computed) {
+    if (!bits) { sb_puts(out, "none"); return; }
+    if (computed && (bits == CONTAIN_STRICT || bits == CONTAIN_CONTENT)) { sb_puts(out, bits == CONTAIN_STRICT ? "strict" : "content"); return; }
+    bool first = true;
+    for (const struct kw *k = kw_contain; k->name; k++)
+        if (bits & k->v) { if (!first) sb_putc(out, ' '); sb_puts(out, k->name); first = false; }
+}
+static bool contain_parse(const char *v, size_t n, struct cx *cx, uint8_t *out, sbuf *spec) {
+    const char *t[5];
+    size_t tl[5];
+    int k = split_checked(v, n, t, tl, 5, ' ', cx);
+    if (k < 1 || k > 4) return false;
+    if (k == 1 && (ident_is(t[0], tl[0], "none") || ident_is(t[0], tl[0], "strict") || ident_is(t[0], tl[0], "content"))) {
+        *out = ident_is(t[0], tl[0], "none") ? 0 : ident_is(t[0], tl[0], "strict") ? CONTAIN_STRICT : CONTAIN_CONTENT;
+        if (spec) sb_puts(spec, ident_is(t[0], tl[0], "none") ? "none" : ident_is(t[0], tl[0], "strict") ? "strict" : "content");
+        return true;
+    }
+    uint8_t bits = 0;
+    for (int i = 0; i < k; i++) {
+        uint8_t b;
+        if (!kw_find(kw_contain, t[i], tl[i], &b) || (bits & b)) return false;
+        bits |= b;
+    }
+    if ((bits & CSS_CONTAIN_SIZE) && (bits & CSS_CONTAIN_INLINE_SIZE)) return false;
+    *out = bits;
+    if (spec) contain_text(spec, bits, false);
+    return true;
+}
+/* touch-action: auto | none | [ [ pan-x | pan-left | pan-right ] || [ pan-y | pan-up | pan-down ] ] |
+   manipulation; canonical order per grammar (the horizontal keyword first) */
+#define TOUCH_HORIZONTAL (CSS_TOUCH_PAN_X | CSS_TOUCH_PAN_LEFT | CSS_TOUCH_PAN_RIGHT)
+#define TOUCH_VERTICAL (CSS_TOUCH_PAN_Y | CSS_TOUCH_PAN_UP | CSS_TOUCH_PAN_DOWN)
+static const struct kw kw_touch_action[] = {{"auto", 0}, {"none", CSS_TOUCH_NONE}, {"manipulation", CSS_TOUCH_MANIPULATION},
+    {"pan-x", CSS_TOUCH_PAN_X}, {"pan-left", CSS_TOUCH_PAN_LEFT}, {"pan-right", CSS_TOUCH_PAN_RIGHT},
+    {"pan-y", CSS_TOUCH_PAN_Y}, {"pan-up", CSS_TOUCH_PAN_UP}, {"pan-down", CSS_TOUCH_PAN_DOWN}, {0}};
+static void touch_action_text(sbuf *out, uint8_t bits) {
+    const char *h = kw_name(kw_touch_action, bits & TOUCH_HORIZONTAL), *y = kw_name(kw_touch_action, bits & TOUCH_VERTICAL);
+    if (!(bits & (TOUCH_HORIZONTAL | TOUCH_VERTICAL))) { sb_puts(out, kw_name(kw_touch_action, bits)); return; }
+    if (bits & TOUCH_HORIZONTAL) sb_puts(out, h);
+    if ((bits & TOUCH_HORIZONTAL) && (bits & TOUCH_VERTICAL)) sb_putc(out, ' ');
+    if (bits & TOUCH_VERTICAL) sb_puts(out, y);
+}
+static bool touch_action_parse(const char *v, size_t n, struct cx *cx, uint8_t *out) {
+    const char *t[3];
+    size_t tl[3];
+    int k = split_checked(v, n, t, tl, 3, ' ', cx);
+    if (k < 1 || k > 2) return false;
+    uint8_t bits = 0;
+    for (int i = 0; i < k; i++) {
+        uint8_t b;
+        if (!kw_find(kw_touch_action, t[i], tl[i], &b)) return false;
+        bool pan = b & (TOUCH_HORIZONTAL | TOUCH_VERTICAL);
+        /* a keyword of its own alone; at most one pan keyword of each axis */
+        if ((k > 1 && !pan) || (b & TOUCH_HORIZONTAL && bits & TOUCH_HORIZONTAL) || (b & TOUCH_VERTICAL && bits & TOUCH_VERTICAL))
+            return false;
+        bits |= b;
+    }
+    *out = bits;
+    return true;
+}
+/* CSSOM: the specified serialization of will-change, contain, touch-action, perspective and
+   perspective-origin; false leaves the authored text */
+static bool effects_specified(const struct propdef *p, const char *v, size_t n, sbuf *out) {
+    if (p->type == PT_LEN) return css_calc_specified(v, n, CSS_CALC_LENGTH, out);
+    if (p->type == PT_OFFSET) return css_shape_specified(p->name, v, n, out);
+    for (size_t i = 0; i + 4 <= n; i++) if (strn_ieq(v + i, "var(", 4)) return false;
+    arena_t arena = {.chunk_size = 1024};
+    jmp_buf trap;
+    arena.trap = &trap;
+    size_t begin = out->n;
+    volatile bool ok = false;
+    if (!setjmp(trap)) {
+        style_t scratch = {0};
+        uint8_t set[1] = {0};
+        struct cx cx = {.s = &scratch, .em = 16, .rem = 16, .vw = 800, .vh = 600, .a = &arena, .set = set,
+                        .supports_probe = true};
+        struct css_will_change w;
+        uint8_t bits;
+        if (p->type == PT_WILL_CHANGE) {
+            if ((ok = will_change_parse(v, n, &cx, &w) && !cx.invalid)) sb_puts(out, w.text ? w.text : "auto");
+        } else if (p->type == PT_CONTAIN) ok = contain_parse(v, n, &cx, &bits, out) && !cx.invalid;
+        else if ((ok = touch_action_parse(v, n, &cx, &bits) && !cx.invalid)) touch_action_text(out, bits);
     }
     ar_free(&arena);
     if (!ok) out->n = begin;
@@ -6071,7 +6291,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     union { struct css_float_shape float_shape; struct css_offset offset; struct css_gap_rules gap_rules;
             struct css_anchor anchor; struct css_counters counters; struct css_list list;
             struct css_background background; struct css_border_image border_image; struct css_ui ui;
-            struct css_decoration decoration; struct css_text text; } own;
+            struct css_decoration decoration; struct css_text text; struct css_effects effects; } own;
     memcpy(&own, group_of(s, p->group), group_size(p->group));
     if (!apply_value(p, v, n, cx, (char *)&own + p->off)) return false;
     group_write(s, p->group, &own, cx->a);
@@ -6339,6 +6559,9 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
     case PT_GAREAS: return parse_gareas(v, n, cx, &s->grid_areas);
     case PT_GLINE: return parse_gline(v, n, cx, (struct gline *)field);
     case PT_TEXT_DECO: return decoration_line_parse(v, n, &s->text_decoration);
+    case PT_WILL_CHANGE: return will_change_parse(v, n, cx, (struct css_will_change *)field);
+    case PT_CONTAIN: return contain_parse(v, n, cx, (uint8_t *)field, NULL);
+    case PT_TOUCH_ACTION: return touch_action_parse(v, n, cx, (uint8_t *)field);
     }
     return false;
 }
@@ -7737,6 +7960,9 @@ const char *css_ua_sheet(void) {
            "background-color: transparent; }\n"
            "input[type=image] { border: none; padding: 0; }\n"
            "select { padding-right: 18px; }\n"
+           /* HTML §15.5.1, §15.5.11, §15.5.13: the widgets' native appearance */
+           "input, select, button, textarea, meter, progress { appearance: auto; }\n"
+           "input[type=hidden i], input[type=file i], input[type=image i] { appearance: none; }\n"
            "option, optgroup { display: none; }\n"
            "summary { display: block; }\n"
            "details > summary:first-of-type { display: list-item; counter-increment: list-item 0; list-style: disclosure-closed inside; }\n"
@@ -8817,6 +9043,13 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
     case PT_BI_REPEAT: bi_repeat_text((const uint8_t *)field, out); break;
     case PT_CURSOR: ui_cursor_text((const struct css_cursor *)field, out); break;
     case PT_UI_COLOR: ok = ui_colors_text(p, st, (const struct css_ui_color *)field, false, out); break;
+    case PT_WILL_CHANGE: {
+        const struct css_will_change *w = (const struct css_will_change *)field;
+        sb_puts(out, w->text ? w->text : "auto");
+        break;
+    }
+    case PT_CONTAIN: contain_text(out, *(const uint8_t *)field, true); break;
+    case PT_TOUCH_ACTION: touch_action_text(out, *(const uint8_t *)field); break;
 
     default: return false;
     }
@@ -8926,6 +9159,10 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
         return ui_color_equal(&x[0], &y[0]) && (p->flags != UI_CARET || ui_color_equal(&x[1], &y[1]));
     }
     case PT_TEXT: return text_value_equal(p, a, fa, b, fb);
+    case PT_WILL_CHANGE: {
+        const struct css_will_change *x = (const struct css_will_change *)fa, *y = (const struct css_will_change *)fb;
+        return same_text(x->text, y->text);
+    }
     }
     return !memcmp(fa, fb, p->size);
 }
