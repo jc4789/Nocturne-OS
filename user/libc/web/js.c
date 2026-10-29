@@ -6018,7 +6018,8 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request, int 
            Other child requests are resolved at a later bounded task boundary. */
         if (kind == 0 && s->running) {
             char mime[128];
-            p->response.body=script_blob_source(s,url,true,&p->response.body_len,mime,NULL,NULL);
+            /* fetch a classic worker script: a blob: response's type is not checked. */
+            p->response.body=script_blob_source(s,url,false,&p->response.body_len,mime,NULL,NULL);
             if (!p->response.body) {
                 if (JS_HasException(s->ctx)) { JSValue error=JS_GetException(s->ctx); JS_FreeValue(s->ctx,error); }
                 pending_error(p,"Worker object URL is unavailable or has an invalid JavaScript MIME type");
@@ -8679,7 +8680,9 @@ static bool process_pending(struct web_js_state *s) {
                 ran_task = true; begin_named_task(s,"Worker object-URL source",p->worker);
                 if (p->worker_kind == 2) worker_blob(s,p);
                 else {
-                    p->response.body = script_blob_source(s,p->url,true,&p->response.body_len,mime,NULL,NULL);
+                    /* A classic worker's own script answers to no MIME type unless it came over
+                       HTTP(S) (fetch a classic worker script); an imported one needs a JavaScript one. */
+                    p->response.body = script_blob_source(s,p->url,p->worker_kind == 1,&p->response.body_len,mime,NULL,NULL);
                     if (!p->response.body) {
                         if (JS_HasException(s->ctx)) exception(s);
                         pending_error(p,"Worker object URL is unavailable or has an invalid JavaScript MIME type");
