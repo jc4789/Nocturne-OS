@@ -3,12 +3,14 @@
 作業場は、書く人で分ける。
 - 模型：本人が書く（.claude/mokei/<作業場>.md）。今、頭に置く判断。
 - 会話の記録：このフックが事象から書く（<作業場>.jsonl）。ユーザーの原文、模型のすべての版、
-  編集したファイル、計測（serial.log・撮影・試験を動かしたこと）、圧縮、自分の報告。
+  編集したファイル、計測（serial.log を読んだ・撮った・QEMU を起こしたこと）、止めた命令、圧縮、自分の報告。
   圧縮や再開の後に、要約とは別に、起きたことを見せる。
 - コードの覚え書き：.claude/oboegaki.md。ファイルに結び付き、そのファイルに触れた時にここが出す。
 - コードのつながり：codegraph の索引（.codegraph/）。編集した関数を呼ぶ所を、編集の直後に一度だけ出す。
 
-ここは見せるだけで、作業を止めない。止めるのは一つだけ：ユーザーへの返事に日本語が無いとき。
+ここは見せるだけで、作業を止めない。止めるのは二つ：ユーザーへの返事に日本語が無いとき（Stop）と、
+ユーザーが禁じた命令（PreToolUse。窓なしの QEMU、媒体の写し、build の下の記録、写しで動く試験の道具、
+目標の無いビルド。2026-10-29）。
 使い方は .claude/skills/mokei/SKILL.md にある。失敗は .claude/mokei/errors.log に残し、会話には出さない。
 """
 import datetime
@@ -30,9 +32,26 @@ MACHINE = ("<task-notification", "<side-sessions-event", "<ci-monitor-event", "<
            "This session is being continued from a previous conversation", "[Artifact comment")
 EDITS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 SHELLS = {"Bash", "PowerShell"}
-# シェルの命令にこれがあれば、物差しを測った（ログを読んだ・撮った・試験を回した）と数える
-MEASURE = ("serial.log", "serial-", "screendump", "platform_qa", "scripts/test.py", "qtest.py",
-           "hikaku", "qemu-system", "hv-serial", "hv-boot", "System.log", "browser log", "browser trace")
+# シェルの命令にこれがあれば、物差しを測った（ログを読んだ・撮った・QEMU を起こした）と数える。
+# 試験の道具（test.py・platform_qa・wpt）と記録のフォルダー（hikaku）は数えない：10-28〜29 の会話では
+# 「測った」の大半がそれらで、本物（一つの媒体を窓付きで見る）から離れた。
+MEASURE = ("serial.log", "screendump", "qemu-system", "hv-serial", "hv-boot", "System.log",
+           "browser log", "browser trace")
+# 実行の前に止める命令（2026-10-29 ユーザーの指示）。読むだけの命令（grep・ls など）は build の道の規則から除く。
+READ_ONLY = ("grep", "rg ", "git ", "ls", "cat ", "find ", "head ", "tail ", "sed -n", "wc ", "stat ", "dir ",
+             "Get-ChildItem", "Get-Content", "Select-String", "Test-Path", "Get-Item")
+FORBIDDEN = (
+    (re.compile(r"qemu-system[^\n;&|]*(-display\s+(none|egl-headless)|-nographic)"),
+     "QEMU を窓なしで起動する命令。QEMU は窓付きで一台（nocturne-project スキル）。ユーザーはその窓を見ている。", False),
+    (re.compile(r"python[^\n]*scripts[/\\](test|platform_qa|wpt|qtest)\.py"),
+     "媒体を写して窓なしの QEMU を起こす試験の道具。使わない。要るなら道具を一つの媒体・窓付きに直してから。", False),
+    (re.compile(r"build[/\\](qa|nocturne-platform|wpt|test\.img|run\.img)\b"),
+     "build の下の記録のフォルダー・写しの媒体。build には今のビルドの出力だけ。画像とログは会話の作業場（scratchpad）へ。", True),
+    (re.compile(r"(\bcp\b|\bcopy\b|Copy-Item|robocopy|qemu-img\s+convert)[^\n]*nocturne\.img"),
+     "媒体の写し。媒体は build/nocturne.img の一つだけ。", False),
+    (re.compile(r"python[^\n]*scripts[/\\]build\.py(?:\s+(?:-j|--jobs)\s*\d+)?\s*(?:2>&1\s*)?(?:$|[|;&])", re.M),
+     "目標の無いビルド（既定は all で vhd・vhdx・iso まで作る）。確かめは qemu-image、Hyper-V へ渡すときだけ all と書く。", False),
+)
 NOTES = Path(".claude") / "oboegaki.md"
 CODE = {".c", ".h", ".inc", ".cc", ".cpp", ".cxx", ".hh", ".hpp",
         ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx", ".rs", ".go"}
@@ -442,7 +461,7 @@ def reground(ws, state, source):
     flow, swaps = versions(events)
     head = (f"区切り（{ {'compact': '圧縮', 'fork': '分岐'}.get(source, '再開') }。"
             f"この会話の圧縮 {state.get('compactions', 0)} 回、ユーザーの最後の発言から {since(last_user)}、"
-            f"最後に測って（ログ・撮影・試験）から {since(last_measure) if last_measure else '一度も無い'}、"
+            f"最後に測って（ログ・撮影）から {since(last_measure) if last_measure else '一度も無い'}、"
             f"その間の編集 {count_after(events, 'edit', last_measure)} 件、説明の入れ替わり {swaps} 回）。\n"
             "要約は直前の作業を一番詳しく残す。下はフックが事象から書いた記録で、起きたことはこちらにある。"
             "次の一手へ進む前に、ユーザーの原文と自分の流れ（版・編集）を並べ、同じ方向を向いているかを見る。"
@@ -517,6 +536,28 @@ def on_prompt(ws, data):
     return None
 
 
+def reads_only(command):
+    """cd … && を外した先頭の語が、読むだけの命令か。"""
+    head = re.sub(r"^\s*(cd\s+(\"[^\"]*\"|'[^']*'|\S+)\s*(&&|;)\s*)+", "", command).lstrip()
+    return head.startswith(READ_ONLY)
+
+
+def on_pre_tool(ws, data):
+    """禁じられた命令を実行の前に止め、理由を返す。"""
+    if data.get("tool_name") not in SHELLS:
+        return None
+    command = (data.get("tool_input") or {}).get("command") or ""
+    for pattern, why, skip_reads in FORBIDDEN:
+        if skip_reads and reads_only(command):
+            continue
+        if pattern.search(command):
+            ws.record("blocked", text=one_line(command, 120))
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                           "permissionDecisionReason": "止めた：" + why
+                                           + "（2026-10-29 ユーザーの指示。.claude/skills/nocturne-project/SKILL.md）"}}
+    return None
+
+
 def on_tool(ws, data):
     tool = data.get("tool_name")
     args = data.get("tool_input") or {}
@@ -588,7 +629,7 @@ def on_stop(ws, data):
 def main():
     data = json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}")
     event = data.get("hook_event_name")
-    handler = {"SessionStart": on_start, "UserPromptSubmit": on_prompt,
+    handler = {"SessionStart": on_start, "UserPromptSubmit": on_prompt, "PreToolUse": on_pre_tool,
                "PostToolUse": on_tool, "Stop": on_stop}.get(event)
     if not handler:
         return

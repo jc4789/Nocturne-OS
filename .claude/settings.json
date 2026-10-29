@@ -24,6 +24,19 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "python -I \"${CLAUDE_PROJECT_DIR}/.claude/hooks/mokei.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell",

@@ -74,12 +74,12 @@ user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
 
 ## ビルド・媒体・試験（手順は `nocturne-project` スキル）
 
-- 入口 `python -X utf8 scripts/build.py -j 8 [目標]`（UCRT64 の make）。目標：`all`（img・vhd・vhdx・iso）、`qemu-image`（img だけ）、`run`、`test`・`test-quick`・`test-full`、`kernel`、`user`、`clean`。
+- 入口 `python -X utf8 scripts/build.py -j 8 <目標>`（UCRT64 の make。目標はいつも書く）。確かめは `qemu-image`（img だけ。`build/nocturne.img` を増分で上書き）。`all`（img・vhd・vhdx・iso）は Hyper-V へ渡すとき。`kernel`、`user`、`clean`。`run`（`build/run.img` という別の媒体を作る）と `test`・`test-quick`・`test-full`（`build/test.img` へ写して窓なし）は使わない（2026-10-29 ユーザー：媒体は一つ、窓なしは禁止）。
 - 出力 `build/kernel.elf`、`build/programs/`、`build/sdk/`、`build/c.list`、`build/nocturne.{img,vhd,vhdx,iso}`。C: の中身は `scripts/layout.py` → `build/c.list` → `build/host/store.exe fill`（`mkroots.py` は TLS の根の証明書で、C: とは無関係）。
 - 任意の移植は道具があるときだけ：Go `tools/go`、TypeScript `tools/TypeScript`、Rust `tools/rust`、OS の中の LLVM `tools/llvm`、NVIDIA の firmware `local/firmware/`。
-- 試験：`scripts/test.py [--quick] [--no-net] [群|群/名]`（`tests/runtests.c` の `tests[]`、117 群 227 件。例 `web/fonts`・`web/engine`・`web/javascript`）。QEMU を窓なしで起動し、`C:\Tests\autorun.sh` から tcc で組んで走らせる。結果 `build/test-serial.log`・`build/test-metadata.json`。`tests/check_*.py` はホストの検査で、まとめる runner は無い。URL を読む層を組む検査は、URL の持ち主（`web_url.c` と Lexbor）を `tests/url_owner.py` の `objects()` で結ぶ。
-- WPT：`scripts/wpt.py --label <名>`（ホストの wptserve と QEMU 一台、ゲストの `tests/wptrunner.c` が枠ごとにブラウザーを開き、`tests/wpt/testharnessreport.js` が結果を返す。`--resume`、`--summary-only`）。結果 `build/wpt/<名>/results.jsonl`・`summary.txt`。QuickJS だけの test262 はホストの `tests/check_test262.py`。
-- 画面で確かめる：`scripts/platform_qa.py`（ラベル専用の写し、`build/nocturne-platform/<label>/`）、`scripts/qtest.py`、または手で起動した QEMU。
+- 試験：ゲストの試験は `tests/runtests.c` の `tests[]`（117 群 227 件。例 `web/fonts`・`web/engine`・`web/javascript`）。それを回す `scripts/test.py` は媒体を `build/test.img` へ写して QEMU を窓なしで起こす作りなので使わない（2026-10-29 ユーザー）。使うなら道具を一つの媒体・窓付きに直してから。`tests/check_*.py` はホストの検査で、まとめる runner は無い。URL を読む層を組む検査は、URL の持ち主（`web_url.c` と Lexbor）を `tests/url_owner.py` の `objects()` で結ぶ。
+- WPT：`scripts/wpt.py`（ホストの wptserve と QEMU、ゲストの `tests/wptrunner.c` が枠ごとにブラウザーを開き、`tests/wpt/testharnessreport.js` が結果を返す。結果は `build/wpt/<名>/`）も窓なしの QEMU で、同じ理由で使わない。QuickJS だけの test262 はホストの `tests/check_test262.py`。
+- 画面で確かめる：手で起動した窓付きの QEMU 一台（`nocturne-project` スキル）。`scripts/platform_qa.py`（`build/nocturne-platform/<label>/` の写し）と `scripts/qtest.py` は写し・窓なしで、使わない。
 
 ## 記録と道具
 

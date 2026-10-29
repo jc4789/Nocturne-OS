@@ -6,12 +6,12 @@
 
 | 口 | 場所 | 出る条件 |
 |---|---|---|
-| ホストの serial.log | 手で起動した QEMU の `-serial file:<path>`。`scripts/platform_qa.py` → `build/nocturne-platform/<label>/serial.log`。`scripts/test.py` → `build/test-serial.log`。`scripts/qtest.py` → `build/serial.log` | カーネルの行は常に。ブラウザーの行は `--log-console` か `--debug-js` のときだけ |
+| ホストの serial.log | 手で起動した QEMU の `-serial file:<作業場>/serial.log`（この会話の scratchpad。build の下に置かない） | カーネルの行は常に。ブラウザーの行は `--log-console` か `--debug-js` のときだけ |
 | ゲストの F12 の Console の札 | ブラウザーの窓（F12 で開閉） | 頁の `console.*`、例外、ブラウザー自身の warn・error。旗は要らない |
 | ゲストの F12 の Trace の札 | 同じ窓の Console の右の右（Ctrl+] で回る） | ブラウザー自身の計測（`WEB_CONSOLE_TRACE`）：profile 群、`Net #`、媒体の timing、捕まった例外。旗は要らない（出る行の多くは旗が決める） |
 | ゲストの system log | `C:\Users\<名前>\AppData\Nocturne\System.log`（前回の起動の分は `System-previous.log`。`kernel/src/sys/stream.c`） | serial と同じ内容。ゲストの Files から読める |
 
-ブラウザーの旗は GUI からは付けられない。付け方は三つ：ゲストの Terminal で `browser --debug-js <URL>`、`C:\Tests\autorun.sh`（test.py・platform_qa の写しの C: にだけ置く）、`scripts/platform_qa.py --label <名> --command "<ゲストのコマンド>"`。
+ブラウザーの旗は GUI からは付けられない。ゲストの Terminal で `browser --debug-js <URL>` を打つ（HMP の `sendkey` で）。
 
 | 旗 | 効き |
 |---|---|
@@ -20,7 +20,7 @@
 | `--net-body <URL の一部>` | `--net-log` に加え、その文字列を含む URL の要求の本文の全部と応答の頭 2 KiB を 16 進で（`Net #N request body a-b:`・`response body a-b:`、512 バイトずつ） |
 | `--debug-js` | `debug_js = net_log = log_console = true`。2 秒ごとの profile 群、`JavaScript profile`、heap の census、媒体の transition・sink・supply 行が加わる。**製品の速さを歪める**（heap の census は heap 全体を歩く） |
 | `--js-console` | F12 を開いた状態で始める |
-| `--console-file <path>` | 3 秒後にそのファイルを console へ流し込む（platform_qa の `--guest-file` は `C:\Tests\<名>`） |
+| `--console-file <path>` | 3 秒後にそのファイルを console へ流し込む |
 | `--maximized`、`--js-budget-ms <n>`、`--console-file-each-document` | 窓を最大化、JS の一仕事の上限、文書ごとに console-file を流し直す |
 
 `--debug-paint`・`--prof` は無い。知らない旗は終了値 2 で止まる。
@@ -73,7 +73,7 @@ fps を直接出す行は無い。一組（wall ≈ 2000 ms）の `draw` の回�
 
 - 起動：`memory: N MiB usable, M MiB free`、`video: WxH, bpp …`、`video: monitor <名>, at R Hz`（EDID が決めた拍。`the firmware passed no EDID` なら EDID 無し）、`store: C: "<label>" on sata0, N MiB, M MiB free`。`store:` の他の行（`read only from now on`、`damaged`）は C: の異常。
 - メモリー切れ：`[memory] pid P … no pages for …`（10 秒に 1 回まで）。
-- 標本（起動の cmdline に `prof` か `prof_ms=<n>`。`platform_qa.py --cmdline prof`。窓は既定 10 秒）：
+- 標本（起動の cmdline に `prof` か `prof_ms=<n>` を付ける。Limine のメニューで項目を編集する。できなければ `boot/limine.conf` の cmdline を一時的に変えて `qemu-image` で組み、済んだら戻す。窓は既定 10 秒）：
   - `prof: ---- N ms window ----` で一組が始まる。
   - `prof: cpuN user U kernel K idle I[, MHz awake %]`：CPU ごとの配分。
   - `prof: task pid P <名>[ (thread)] total N`：仕事ごとの標本。
@@ -85,6 +85,6 @@ fps を直接出す行は無い。一組（wall ≈ 2000 ms）の `draw` の回�
 
 - 行を拾う：`grep -a "Native media timing" "<serial.log>" | tail -n 20`（`-a` は二進の混入に備える）。時刻の範囲で切るなら `@秒` を見る。
 - 製品の速さは `--log-console` だけ（または旗なしで F12 を読む）の回で測る。`--debug-js` は原因を探す回に使い、その回の数字を製品の速さとして書かない。
-- 変更前の媒体で同じ行を先に取る。前後は同じサイト・同じ操作・同じ秒数の範囲で並べる。
+- 変える前に、今の媒体（`build/nocturne.img` の一つ）で同じ行を取って書き残す。前後は同じサイト・同じ操作・同じ秒数の範囲で並べる。写しや旧版の媒体で「前」を作らない。
 - F12 を開いたまま撮る（ユーザーの硬い規則、2026-10-27）。撮影の画像の console の行も読む。
 - ホスト側にこれらの行を解析する道具は無い。要るときは一度きりの Python を作業場（scratchpad）に置き、リポジトリへ入れない。
