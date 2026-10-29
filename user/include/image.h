@@ -1,6 +1,6 @@
-/* Image decoding (libc/image.c): ICO (PNG/DIB), PNG, JPEG, GIF (first frame) and BMP through stb_image, WebP
-   through jebp and SVG through nanosvg. Pixels are 0xAARRGGBB with straight (not premultiplied)
-   alpha. */
+/* Image decoding (libc/image.c): ICO and CUR (PNG/DIB), PNG, JPEG, GIF (first frame) and BMP through
+   stb_image, WebP through jebp and SVG through nanosvg. Pixels are 0xAARRGGBB with straight (not
+   premultiplied) alpha. */
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -10,12 +10,17 @@
 typedef struct image {
     int w, h;
     uint32_t *px;
+    bool hot;               /* a cursor (CUR) says its hot spot: */
+    uint16_t hot_x, hot_y;  /* the pixel of it at the pointer's position */
 } image_t;
 
 #define IMAGE_MAX_PIXELS (8 << 20) /* larger images are refused */
 
 /* sniffs the format from the data; NULL if it is not an image we can decode */
 image_t *image_decode(const void *data, size_t n);
+/* whether image_decode (or image_decode_svg) reads images of a MIME type (its essence, ASCII
+   case-insensitive): what CSS image-set()'s type() asks */
+bool image_type_supported(const char *type);
 /* Decode on a native helper; service may handle chrome/cancellation only.
  * The source remains borrowed until the synchronous join returns. */
 image_t *image_decode_serviced(const void *data, size_t n, void (*service)(void *), void *context);

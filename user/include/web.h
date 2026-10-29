@@ -87,9 +87,13 @@ struct web_request {
    snapshot: the document that asked for it and whether that document's window
    had transient activation. Strings are borrowed until the callback returns. */
 enum { WEB_NAVIGATE_PUSH, WEB_NAVIGATE_RELOAD, WEB_NAVIGATE_REPLACE };
+/* Where the user asked a hyperlink to open (Ctrl or Shift on their own click): HTML leaves the
+   user's preference for a new top-level traversable to the user agent. */
+enum { WEB_DISPOSITION_CURRENT, WEB_DISPOSITION_TAB, WEB_DISPOSITION_WINDOW };
 struct web_navigation {
     const char *url;
     int history;             /* WEB_NAVIGATE_* */
+    int disposition;         /* WEB_DISPOSITION_*; only a hyperlink the user clicked sets it */
     const void *body;        /* the POST body, or NULL for GET */
     size_t body_length;
     const char *content_type; /* with a body */
@@ -501,6 +505,20 @@ struct web_hit {
     web_node *node;   /* the form control or link element */
 };
 bool web_hit_test(web_doc *d, int x, int y, struct web_hit *hit);
+/* CSS Basic User Interface 4 §5.1: the pointer the page shows at (x, y), the point web_hit_test takes
+   (a frame's document's inside it): the cursor of what is there, auto being the text beam over text
+   that can be selected and over editable fields and the arrow elsewhere. When an image of its list
+   has loaded and the native pointer can show it (at most N_POINTER_IMAGE_MAX each way at 1 dppx), the
+   first such image with its hot spot; shape is the keyword after the list. pending: an image before
+   the one given is still loading, so the answer may change once it has. false: nothing can be said
+   now (the document is busy), out unchanged. */
+struct web_cursor {
+    uint32_t shape;                  /* N_POINTER_* */
+    int width, height, hot_x, hot_y; /* the image, 0 when none */
+    uint32_t pixels[N_POINTER_IMAGE_MAX * N_POINTER_IMAGE_MAX]; /* rows of width, 0xAARRGGBB not premultiplied */
+    bool pending;
+};
+bool web_cursor_at(web_doc *d, int x, int y, struct web_cursor *out);
 int web_anchor_y(web_doc *d, const char *fragment); /* y of the element with that id/name, or -1 */
 
 /* form controls */
@@ -530,10 +548,7 @@ bool web_editing_target(web_doc *top);
 int web_editing_edit(web_doc *top, const char *input_type, const char *data, size_t length);
 /* Caller owns the UTF-8 text of the focused document's selection; NULL when empty. */
 char *web_selection_text(web_doc *top, size_t *length);
-struct web_control_activation { web_node *control, *previous; bool checked, indeterminate, radio; };
-void web_control_activation_begin(web_doc *d, web_node *control, struct web_control_activation *activation);
-bool web_control_activation_end(web_doc *d, struct web_control_activation *activation, bool allowed);
-void web_toggle(web_doc *d, web_node *n); /* checkbox or radio click */
+void web_toggle(web_doc *d, web_node *n); /* a details element's open state, or a checkbox or radio's checkedness */
 web_node *web_disclosure_focus(web_node *details); /* first summary, or the native default legend host */
 bool web_reset(web_doc *d, web_node *control); /* reset button default action, with cancellable event */
 /* the request a form submission makes: *url is malloc'd; *body is malloc'd for POST, NULL for GET.
@@ -549,6 +564,13 @@ bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request
 /* HTML "submit" after its submit event: a dialog method closes the dialog,
    any other method navigates with the form's source snapshot. */
 void web_form_navigate(web_doc *d, web_node *submitter);
+/* HTML "submit" (not from the submit() method) of submitter's form owner, or of submitter when it
+   is a form: the cannot-navigate, entry-list and sandbox checks, the firing-submission-events
+   guard, interactive validation, the submit event (whose submitter is submitter when it is a
+   submit button, else null, as in implicit submission), then web_form_navigate. False when a step
+   stopped it. The submit buttons' activation behavior, requestSubmit() and the browser's implicit
+   submission share it. */
+bool web_form_submit(web_doc *d, web_node *submitter);
 void web_submit_request_free(struct web_form_request *request);
 bool web_submit(web_doc *d, web_node *submitter, char **url, char **body);
 bool web_input_is_file(web_node *input);
@@ -569,7 +591,6 @@ void web_autocomplete_record(web_doc *d, web_node *submitter, const char *destin
 /* Turns the search history off (webprefs.h), then removes every stored search; false when either
    failed. Whether it is on is the browser's preference, changed in its Settings window. */
 bool web_autocomplete_clear(void);
-web_node *web_label_activation(web_node *target);
 /* document rectangle of an element (its first box), for placing popups */
 bool web_node_rect(web_doc *d, web_node *n, int *x, int *y, int *w, int *h);
 

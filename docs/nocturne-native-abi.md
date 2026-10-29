@@ -602,7 +602,8 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     モードを出したドライバーが、出すべきモード（`mode`、`mode_serial`。上）と、直接表示を受け持つ
     なら許可された窓（`struct n_screen_state` の `app`。無ければ 0）と、その間ドライバーが
     描くポインター（位置・表示の有無・32×32 の ARGB 画像とその要点、画像が変わると
-    `pointer_serial` が進む）を読む。`serial` が `seen` と同じ間は `timeout_ms` まで待つ
+    `pointer_serial` が進む。画像は窓の管理が選んだもの：その形の絵か、窓が `SYS_WIN_POINTER`
+    で渡した画像。§10）を読む。`serial` が `seen` と同じ間は `timeout_ms` まで待つ
     （0 は待たない。`N_ERR_TIMEOUT` でも今の状態を書く）。画面がこの claim の面でなく、
     モードも出していなければ `N_ERR_DENIED`。claim の終わりと起動時の
     画面への返却で直接表示は終わり、許可も取り消す。
@@ -811,6 +812,25 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   （143）は `id` の無い最初の形（`N_ENTRY_FIRST_BYTES`、280バイト）を書き続ける。
 - `SYS_WATCH_TAKE`（207、見張り）：§1 の見張りの数の取り出し。`SYS_ENTRY_WATCH`（208、パス、
   `N_WATCH_NAME` か `N_WATCH_FOLDER`）：§3 の C: の見張り。`N_KIND_WATCH`（13）を返す。
+- `SYS_WIN_POINTER`（80、窓、`const struct n_win_pointer *`、`sizeof *`。libc の
+  `win_pointer`・`win_pointer_shape`）：窓が自分の client 領域の上に望むポインターを窓の管理へ
+  伝える。ポインターの持ち主は窓の管理で、形の絵と要点（hot spot）を持ち、描き、何を見せるかを
+  決める。窓は望みを言うだけで、次の呼出しまで続く（新しい窓は `N_POINTER_DEFAULT`）。見せるのは
+  ポインターが client 領域の上にあり、窓の管理のもの（メニュー、枠、大きさを変える帯、窓のドラッグ）が
+  そこに無い間と、client 領域で始めたドラッグの間。形 `shape` は CSS UI 4 の `cursor` の語と
+  一対一の `N_POINTER_*`（`N_POINTER_DEFAULT` 矢印、`N_POINTER_NONE` 描かない、`CONTEXT_MENU`、
+  `HELP`、`POINTER` 手、`PROGRESS`、`WAIT`、`CELL`、`CROSSHAIR`、`TEXT`、`VERTICAL_TEXT`、`ALIAS`、
+  `COPY`、`MOVE`、`NO_DROP`、`NOT_ALLOWED`、`GRAB`、`GRABBING`、`E`・`N`・`NE`・`NW`・`S`・`SE`・`SW`・
+  `W`・`EW`・`NS`・`NESW`・`NWSE` の `_RESIZE`、`COL_RESIZE`、`ROW_RESIZE`、`ALL_SCROLL`、`ZOOM_IN`、
+  `ZOOM_OUT`。数は `N_POINTER_SHAPES`）。絵は窓の管理のもの。画像（頁の `cursor: url(…)`）は
+  `width`・`height` を 1〜`N_POINTER_IMAGE_MAX`（＝`N_SCREEN_POINTER_SIZE`、32）、`pixels` に
+  `width × height` の 0xAARRGGBB（乗算済みでない、上の行から）、要点 `hot_x < width`・
+  `hot_y < height`。窓の管理は呼出しの時に写し取る。`width`・`height`・要点がどれも 0 なら
+  画像なしで `shape` を見せる。画像があっても `shape` は正しい形でなければならない。上限は、ポインターを見せるどの道
+  （合成、直接表示のドライバーのポインター、遠隔デスクトップのポインター）でも見せられる大きさで、
+  それより大きい画像を断るのは呼ぶ側（頁なら次の候補へ）。大きさの引数が違う・形が範囲外・
+  `reserved` が 0 でない・画像の大きさや要点が範囲外は `N_ERR_INVALID`、読めない番地は
+  `N_ERR_BAD_ADDRESS`、ほかの app の窓は `N_ERR_DENIED`。
 
 ## 11. インターフェースエンジン（`ui.h`）
 
@@ -841,6 +861,7 @@ GUIの部品（ボタン、入力欄、一覧、スライダー等）は、libc 
 | `'Q'` | なし | 配色と寸法を問い合わせる |
 | `'S'` | u32 サーフェス、u32 幅、u32 高さ、［u32 flags］ | サーフェスを作る／大きさを変える |
 | `'P'` | u32 サーフェス、［u32 x、y、幅、高さ］ | その画素（矩形を付ければその部分だけ）が変わった |
+| `'U'` | u32 サーフェス、u32 形、［u32 幅、u32 高さ、u32 要点 x、u32 要点 y、幅×高さ個の u32 画素］ | `pointer` 付きで置いたこのサーフェスの上のポインター |
 | `'D'` | u32 サーフェス | 捨てる |
 
 窓の flags は `UI_WINDOW_FLAGS` の範囲だけ：`WIN_RESIZABLE`、`WIN_CENTER`、
@@ -849,6 +870,14 @@ GUIの部品（ボタン、入力欄、一覧、スライダー等）は、libc 
 `UI_SURFACE_DEEP`（1）だけで、画素の後ろに1画素1バイトの深い面（`win_deep` と同じ並び）を
 持つ。10bpc の画面で `WIN_DEEP_COLOR` の窓に置くと、深い面も画面へ写る。範囲外のビットは
 不正なメッセージ。
+
+窓のポインターはエンジンが持つ（`win_pointer`、§10 の `SYS_WIN_POINTER`）。入力欄の上（そこで
+選択をドラッグしている間も）は文字の縦棒（`N_POINTER_TEXT`）、`pointer` 付きのサーフェスの上と、
+そこで押して離すまでは、アプリが `'U'`（C は `ui_surface_pointer`）で言ったもの、ほか（ボタン、
+一覧、メニューの出ている間など）は矢印。変わった時だけデスクトップへ頼む。`'U'` の形は
+`N_POINTER_*`、画像は 1〜`N_POINTER_IMAGE_MAX` 四方の 0xAARRGGBB（乗算済みでない）で、要点は
+画像の中、形は画像を見せられない所の代わり。範囲外は不正なメッセージ。サーフェスを作り直しても
+（`'S'` の大きさの変更）続き、次の `'U'` まで続く。作ったばかりのサーフェスは矢印。
 
 `'P'` に矩形を付けると、エンジンは木を描き直さず、その部分だけを窓へ写して画面へ出す
 （動画、カーソル、動く駒など）。サーフェスが配置された大きさと違う、スクロールバーと

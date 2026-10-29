@@ -332,6 +332,10 @@ struct surface {
     size_t bytes;
     bool deep;   /* a deep plane (one byte a pixel, see display.h) follows the pixels */
     canvas_t c;
+    /* 'U': the pointer the app wants over it while it takes the pointer (its pixels are the
+       surface's own copy, or NULL), and how many times it was said */
+    struct n_win_pointer pointer;
+    uint32_t pointer_serial;
 };
 
 struct uiwin {
@@ -351,6 +355,10 @@ struct uiwin {
     struct str *lines;       /* scratch for wrapped text */
     uint32_t nlines, caplines;
     uint64_t hot, pressed, dragging, focus, over; /* over: the pointer canvas or surface under the pointer */
+    /* The pointer last asked of the window (win_pointer): a shape, or the image of the surface
+       pointer_surface as of its pointer_serial; pointer_asked is false before the first. */
+    uint32_t pointer_shape, pointer_surface, pointer_serial;
+    bool pointer_asked;
     uint8_t *deep;           /* the window's deep plane while it is painted, or NULL */
     float px, py;
     uint64_t now, redraw_at, caret_at;
@@ -1883,9 +1891,43 @@ static struct node *find(struct uiwin *w, uint64_t id) {
     return NULL;
 }
 
+/* The pointer the window wants of the desktop (win_pointer), from what is under it or held: the
+   text beam over a field (and while a selection is dragged out in it), over a surface that takes
+   the pointer what the app said for it ('U'), else the arrow (the menus, buttons, the rest). The
+   desktop is asked only when that changes. */
+static void sync_pointer(struct uiwin *w) {
+    if (!w->win) return;
+    struct node *n = NULL;
+    if (!w->nmenus) {
+        struct node *held = w->held ? find(w, w->pressed) : NULL;
+        n = held && (held->pointer || held->kind == K_FIELD) ? held : hit_test(w, w->px, w->py).n;
+    }
+    struct n_win_pointer want = {.shape = N_POINTER_DEFAULT};
+    uint32_t surface = 0, serial = 0;
+    if (n && n->kind == K_FIELD && !n->disabled) {
+        want.shape = N_POINTER_TEXT;
+    } else if (n && n->kind == K_SURFACE && n->pointer) {
+        struct surface *sf = surface_of(w->s, n->surface);
+        if (sf && sf->pointer_serial) {
+            want = sf->pointer;
+            surface = sf->id;
+            serial = sf->pointer_serial;
+        }
+    }
+    if (w->pointer_asked && want.shape == w->pointer_shape && surface == w->pointer_surface &&
+        serial == w->pointer_serial)
+        return;
+    w->pointer_asked = true;
+    w->pointer_shape = want.shape;
+    w->pointer_surface = surface;
+    w->pointer_serial = serial;
+    win_pointer(w->win, &want);
+}
+
 static void sync_hot(struct uiwin *w) {
     uint64_t id = w->dragging ? w->dragging : hit_test(w, w->px, w->py).id;
     if (id != w->hot) { w->hot = id; w->dirty = true; }
+    sync_pointer(w);
 }
 
 static void slide(struct uiwin *w, struct node *n, float x, bool done) {
@@ -2893,6 +2935,7 @@ static void win_free(struct ui_session *s, struct uiwin *w) {
 }
 
 static void surface_free(struct surface *sf) {
+    free((void *)sf->pointer.pixels);
     if (sf->c.px) n_memory_release(sf->c.px, sf->bytes);
     if (sf->shared >= 0) n_handle_close(sf->shared);
     free(sf);
@@ -2999,6 +3042,9 @@ static void set_surface(struct ui_session *s, uint32_t id, uint32_t width, uint3
             fresh->deep = deep;
             gfx_init(&fresh->c, px, (int)width, (int)height, (int)width);
             if (sf) {
+                fresh->pointer = sf->pointer; /* the pointer said for it stays */
+                fresh->pointer_serial = sf->pointer_serial;
+                sf->pointer.pixels = NULL;
                 for (uint32_t i = 0; i < s->nsurfaces; i++)
                     if (s->surfaces[i] == sf) s->surfaces[i] = fresh;
                 surface_free(sf);
@@ -3151,6 +3197,34 @@ n_result ui_session_send(struct ui_session *s, const void *msg, size_t n) {
                     w->dirty = true;
                 }
             }
+        return 0;
+    }
+    case 'U': {
+        uint32_t id = rd_u32(&r), shape = rd_u32(&r), width = 0, height = 0, hot_x = 0, hot_y = 0;
+        bool image = !r.bad && r.p != r.end;
+        if (image) {
+            width = rd_u32(&r);
+            height = rd_u32(&r);
+            hot_x = rd_u32(&r);
+            hot_y = rd_u32(&r);
+        }
+        if (r.bad || shape >= N_POINTER_SHAPES ||
+            (image && (!width || !height || width > N_POINTER_IMAGE_MAX || height > N_POINTER_IMAGE_MAX ||
+                       hot_x >= width || hot_y >= height || (size_t)(r.end - r.p) != (size_t)width * height * 4)))
+            return -N_ERR_INVALID;
+        struct surface *sf = surface_of(s, id);
+        if (!sf) return 0; /* dropped meanwhile */
+        uint32_t *px = NULL;
+        if (width) {
+            px = malloc((size_t)width * height * 4);
+            if (!px) return -N_ERR_NO_MEMORY;
+            memcpy(px, r.p, (size_t)width * height * 4);
+        }
+        free((void *)sf->pointer.pixels);
+        sf->pointer = (struct n_win_pointer){.shape = shape, .width = width, .height = height,
+                                             .hot_x = hot_x, .hot_y = hot_y, .pixels = px};
+        if (!++sf->pointer_serial) sf->pointer_serial = 1;
+        for (uint32_t i = 0; i < s->nwins; i++) sync_pointer(s->wins[i]);
         return 0;
     }
     case 'D': {
@@ -3426,6 +3500,24 @@ void ui_surface_changed(struct ui_session *s, uint32_t surface) {
     wr_u32(&w, surface);
     if (!w.bad) ui_session_send(s, w.p, w.n);
     free(w.p);
+}
+
+n_result ui_surface_pointer(struct ui_session *s, uint32_t surface, const struct n_win_pointer *pointer) {
+    struct ui_bytes w = {0};
+    wr_u8(&w, 'U');
+    wr_u32(&w, surface);
+    wr_u32(&w, pointer->shape);
+    if (pointer->width) {
+        wr_u32(&w, pointer->width);
+        wr_u32(&w, pointer->height);
+        wr_u32(&w, pointer->hot_x);
+        wr_u32(&w, pointer->hot_y);
+        if (pointer->width <= N_POINTER_IMAGE_MAX && pointer->height <= N_POINTER_IMAGE_MAX && pointer->pixels)
+            wr_put(&w, pointer->pixels, (size_t)pointer->width * pointer->height * 4);
+    }
+    n_result result = w.bad ? -N_ERR_NO_MEMORY : ui_session_send(s, w.p, w.n);
+    free(w.p);
+    return result;
 }
 
 void ui_surface_changed_rect(struct ui_session *s, uint32_t surface, int x, int y, int width, int height) {

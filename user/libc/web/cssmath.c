@@ -111,8 +111,9 @@ double css_unit_canonical(int unit, double v, const struct cx *cx) {
 }
 
 /* ---------------------------------------------------------------- the tree */
-/* N_ANCHOR: anchor() or anchor-size() (css-anchor-position-1), a <length> that layout resolves */
-enum { N_VALUE, N_KEY, N_SUM, N_PRODUCT, N_NEGATE, N_INVERT, N_FN, N_ANCHOR };
+/* N_ANCHOR: anchor() or anchor-size() (css-anchor-position-1), a <length> that layout resolves;
+   N_TREE: sibling-index() (fn 0) or sibling-count() (fn 1), an <integer> the element resolves */
+enum { N_VALUE, N_KEY, N_SUM, N_PRODUCT, N_NEGATE, N_INVERT, N_FN, N_ANCHOR, N_TREE };
 enum { F_MIN, F_MAX, F_CLAMP, F_ROUND, F_MOD, F_REM, F_SIN, F_COS, F_TAN, F_ASIN, F_ACOS, F_ATAN, F_ATAN2, F_POW,
        F_SQRT, F_HYPOT, F_LOG, F_EXP, F_ABS, F_SIGN, F_COUNT };
 static const char *const fn_names[F_COUNT] = {"min", "max", "clamp", "round", "mod", "rem", "sin", "cos", "tan",
@@ -348,6 +349,16 @@ static struct css_calc *simplify_product(struct mp *m, struct css_calc *c) {
         return mk_leaf(m, k[0]->v * number, k[0]->unit, k[0]->type);
     }
     if (w == 1 && !numbers) return k[0];
+    /* a number times one numeric value beside terms that are not: the value scaled (the engines and WPT
+       serialize calc(sibling-index() * 2rad * pi) as calc(360deg * sibling-index())) */
+    if (numbers) {
+        unsigned leaves = 0, at = 0;
+        for (unsigned i = 0; i < w; i++) if (is_leaf(k[i])) { leaves++; at = i; }
+        if (leaves == 1) {
+            if (!(k[at] = mk_leaf(m, k[at]->v * number, k[at]->unit, k[at]->type))) return NULL;
+            numbers = 0;
+        }
+    }
     if (numbers) {
         struct css_calc **t = ar_alloc(m->P->a, (w + 1) * sizeof *t);
         if (!(t[0] = numbers == 1 ? first_number : mk_leaf(m, number, U_NUMBER, none))) return NULL;
@@ -531,6 +542,19 @@ static double fn_eval(uint8_t fn, uint8_t strategy, const double *x, const bool 
     }
     return NAN;
 }
+/* css-values-5 §10 the tree-counting functions: the element's index among its inclusive element
+   siblings (1-based, as :nth-child() counts), or their number. A pseudo-element's are its originating
+   element's (cx->node). A declaration from an outer tree than the element's (::part()) is a
+   tree-scoped reference that fails to match: 1, as WPT reads it (tree-scoped-sibling-function.html). */
+static double tree_count(const struct cx *cx, bool count) {
+    node_t *e = cx->node;
+    if (cx->tree_mismatch) return 1;
+    if (e->parent) __atomic_store_n(&e->parent->style_counts_children, true, __ATOMIC_RELAXED);
+    if (!count) return e->elem_index > 0 ? e->elem_index : 1;
+    const node_t *last = e->parent ? e->parent->last : e;
+    while (last && last->type != N_ELEM) last = last->prev;
+    return last && last->elem_index > 0 ? last->elem_index : 1;
+}
 struct ev { double basis; const double *keys; const struct cx *cx; };
 static double ev(const struct css_calc *c, const struct ev *E) {
     switch (c->op) {
@@ -552,6 +576,7 @@ static double ev(const struct css_calc *c, const struct ev *E) {
     }
     case N_ANCHOR: /* not resolved against an anchor (css_length_resolve_anchors): its fallback */
         return c->anchor->fallback_given ? len_resolve(&c->anchor->fallback, isnan(E->basis) ? 0 : (float)E->basis) : 0;
+    case N_TREE: return E->cx && E->cx->node ? tree_count(E->cx, c->fn) : 0;
     }
     if (c->fn == F_MIN || c->fn == F_MAX || c->fn == F_HYPOT) {
         double r = ev(c->k[0], E);
@@ -696,6 +721,16 @@ static bool m_args(struct mp *m, struct list *args, bool none) {
         return false;
     }
 }
+/* a tree-counting function: its <integer> when the element is known (a computed value), else the
+   function itself (a specified value keeps it) */
+static struct css_calc *tree_leaf(struct mp *m, bool count) {
+    const struct cx *cx = m->P->cx;
+    struct css_calc_type t = {{0}, -1};
+    if (cx && cx->node && !cx->supports_probe) return mk_leaf(m, tree_count(cx, count), U_NUMBER, t);
+    struct css_calc *c = node(m, N_TREE, 0);
+    if (c) c->fn = count;
+    return c;
+}
 /* an anchor function's leaf: a <length> */
 static struct css_calc *anchor_leaf(struct mp *m, const struct css_anchor_function *f) {
     struct css_calc *c = f ? node(m, N_ANCHOR, 0) : NULL;
@@ -722,6 +757,15 @@ static struct css_calc *m_function(struct mp *m, const char *name, size_t name_n
     if (size || word_is(name, name_n, "anchor")) {
         if (m->P->anchors & (size ? LF_ANCHOR_SIZE : LF_ANCHOR) && m->P->cx)
             result = anchor_leaf(m, css_anchor_function_read(m->P, &m->p, m->e, size));
+        goto done;
+    }
+    bool count = word_is(name, name_n, "sibling-count");
+    if (count || word_is(name, name_n, "sibling-index")) {
+        sp(m); /* no arguments */
+        if (m->p < m->e && *m->p != ')') goto done;
+        if (m->p < m->e) m->p++;
+        if (m->P->raw) { m->P->unrepresentable = true; goto done; } /* no CSSMathValue (CSS Typed OM §4) */
+        result = tree_leaf(m, count);
         goto done;
     }
     int fn = -1;
@@ -919,6 +963,7 @@ bool css_calc_is_math(const char *s, size_t n) {
     if (p == name || p >= e || *p != '(') return false;
     size_t k = (size_t)(p - name);
     if (word_is(name, k, "calc") || word_is(name, k, "-webkit-calc")) return true;
+    if (word_is(name, k, "sibling-index") || word_is(name, k, "sibling-count")) return true;
     for (int i = 0; i < F_COUNT; i++) if (word_is(name, k, fn_names[i])) return true;
     return false;
 }
@@ -947,7 +992,7 @@ struct css_calc *css_calc_key(arena_t *a, unsigned index) {
     return c;
 }
 int css_calc_key_of(const struct css_calc *c) { return c && c->op == N_KEY ? c->key : -1; }
-bool css_calc_function_root(const struct css_calc *c) { return c && (c->op == N_FN || c->op == N_ANCHOR); }
+bool css_calc_function_root(const struct css_calc *c) { return c && (c->op == N_FN || c->op == N_ANCHOR || c->op == N_TREE); }
 /* anchor() and anchor-size() have no Typed OM object: OTHER */
 int css_calc_shape(const struct css_calc *c, double *v, int *unit, unsigned *n, struct css_calc *const **children) {
     *n = c ? c->n : 0;
@@ -989,7 +1034,7 @@ bool css_calc_linear(const struct css_calc *c, double *px, double *pct) {
 }
 bool css_calc_context_free(const struct css_calc *c) {
     if (!c) return true;
-    if (c->op == N_KEY) return false;
+    if (c->op == N_KEY || c->op == N_TREE) return false;
     if (c->op == N_VALUE) return units[c->unit].rel == R_ABS;
     for (unsigned i = 0; i < c->n; i++) if (!css_calc_context_free(c->k[i])) return false;
     return true;
@@ -1010,6 +1055,7 @@ static struct css_calc *rebuild(struct mp *m, const struct css_calc *c) {
         return mk_leaf(m, css_unit_canonical(c->unit, c->v, m->P->cx), U_PX, c->type);
     }
     if (c->op == N_KEY || c->op == N_ANCHOR) return (struct css_calc *)c;
+    if (c->op == N_TREE) return m->P->cx && m->P->cx->node ? tree_leaf(m, c->fn) : (struct css_calc *)c;
     struct css_calc **k = ar_alloc(m->P->a, c->n * sizeof *k);
     for (unsigned i = 0; i < c->n; i++)
         if (c->k[i] && !(k[i] = rebuild(m, c->k[i]))) return NULL;
@@ -1144,6 +1190,7 @@ static void put_tree(struct out *o, const struct css_calc *c, const char *const 
     case N_KEY: puts_(o, keys && keys[c->key] ? keys[c->key] : "none"); return;
     case N_FN: put_fn(o, c, keys); return;
     case N_ANCHOR: if (o->ok && !css_anchor_function_text(o->b, c->anchor)) o->ok = false; return;
+    case N_TREE: puts_(o, c->fn ? "sibling-count()" : "sibling-index()"); return;
     case N_NEGATE: case N_INVERT:
         if (!bare) put(o, "(", 1);
         puts_(o, c->op == N_NEGATE ? "-1 * " : "1 / ");
@@ -1175,7 +1222,7 @@ static bool calc_serialize(sbuf *b, const struct css_calc *c, const char *const 
     size_t begin = b->n;
     struct out o = {b, true, d, 0};
     if (c->op == N_FN) put_fn(&o, c, keys);
-    else if (c->op == N_ANCHOR) put_tree(&o, c, keys, true); /* a function of its own, not in calc() */
+    else if (c->op == N_ANCHOR || c->op == N_TREE) put_tree(&o, c, keys, true); /* a function of its own, not in calc() */
     else {
         put(&o, "calc(", 5);
         put_tree(&o, c, keys, true);
@@ -1264,6 +1311,23 @@ bool css_calc_specified(const char *s, size_t n, unsigned accept, sbuf *out) {
         if (c == '"' || c == '\'') {
             for (p++; p < e && *p != c; p++) if (*p == '\\' && p + 1 < e) p++;
             if (p < e) p++;
+            continue;
+        }
+        if (c == '#') { for (p++; p < e && name_char((unsigned char)*p); p++) {} continue; } /* a hash, not a number */
+        /* a number, percentage or dimension outside a math function serializes as CSSOM's "serialize a
+           CSS component value" does (.5em is 0.5em, -0 is 0, +5.0E1PX is 50px); an unknown unit's as written */
+        if (number_start(p, e) && !(p > s && (name_char((unsigned char)p[-1]) || p[-1] == '.'))) {
+            const char *token = p, *unit;
+            size_t unit_n;
+            double v;
+            if (!css_numeric_token(&p, e, &v, &unit, &unit_n)) { p++; continue; }
+            int u = css_unit_find(unit, unit_n);
+            if (u < 0 || !isfinite(v)) continue;
+            put(&o, copied, (size_t)(token - copied));
+            put_number(&o, v);
+            puts_(&o, units[u].name);
+            any = true;
+            copied = p;
             continue;
         }
         if (!ident_start(p, e) || (p > s && name_char((unsigned char)p[-1]))) { p++; continue; }

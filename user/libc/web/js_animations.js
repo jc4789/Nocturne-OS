@@ -102,13 +102,13 @@ const animationBridge=(()=>{
     /* an animatable property's CSS name for an IDL attribute name ("IDL attribute name to animation property name"), else null */
     function animationProperty(key){
         if(typeof key!=='string'||key==='composite'||key==='easing'||key==='offset'||key==='float')return null;
-        const css=key==='cssFloat'?'float':key==='cssOffset'?'offset':/^[A-Za-z]+$/.test(key)?key.replace(/[A-Z]/g,c=>'-'+c.toLowerCase()):null;
+        const css=key.startsWith('--')?key:key==='cssFloat'?'float':key==='cssOffset'?'offset':/^[A-Za-z]+$/.test(key)?key.replace(/[A-Z]/g,c=>'-'+c.toLowerCase()):null;
         if(css===null)return null;
         let name=apply(mGet,propertyNames,[css]);
         if(name===undefined){name=native(OP.PROPERTY,css);apply(mSet,propertyNames,[css,name]);}
         return name;
     }
-    function idlName(css){return css==='float'?'cssFloat':css==='offset'?'cssOffset':css.replace(/-([a-z])/g,(m,c)=>c.toUpperCase());}
+    function idlName(css){return css.startsWith('--')?css:css==='float'?'cssFloat':css==='offset'?'cssOffset':css.replace(/-([a-z])/g,(m,c)=>c.toUpperCase());}
     function keyframeLike(input,lists){
         if(input!==undefined&&input!==null&&!isObject(input))throw new TypeError('A keyframe must be an object');
         const o=input==null?{}:input,frame={composite:3,easing:'linear',offset:null,props:[]};

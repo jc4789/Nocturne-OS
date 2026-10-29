@@ -74,9 +74,12 @@ static JSValue wao_keyframes_set(JSContext *ctx, struct web_effect *e, JSValueCo
             JSValue name = JS_GetPropertyUint32(ctx, f, 3 + 2 * j), value = JS_GetPropertyUint32(ctx, f, 4 + 2 * j);
             const char *n = JS_ToCString(ctx, name), *v = JS_ToCString(ctx, value);
             const struct propdef *p = n ? css_prop_lookup(n, strlen(n)) : NULL;
-            /* Web Animations 1 "processing a keyframes argument": a value that does not parse is dropped */
+            /* Web Animations 1 "processing a keyframes argument": a value that does not parse is dropped;
+               a custom property's (css-properties-values-api-1 §2.5) by the custom property grammar */
             if (p && v && k->values && css_value_valid(p, v, strlen(v)))
                 k->values[k->count++] = (struct web_keyframe_value){.p = p, .text = strdup(v)};
+            else if (!p && n && v && k->values && n[0] == '-' && n[1] == '-' && css_valid_declaration(n, strlen(n), v, strlen(v)))
+                k->values[k->count++] = (struct web_keyframe_value){.name = strdup(n), .text = strdup(v)};
             if (n) JS_FreeCString(ctx, n);
             if (v) JS_FreeCString(ctx, v);
             JS_FreeValue(ctx, name); JS_FreeValue(ctx, value);
@@ -90,7 +93,7 @@ static JSValue wao_keyframes_set(JSContext *ctx, struct web_effect *e, JSValueCo
         else { web_effect_set_keyframes(e, k); wao_override(e, WA_OVERRIDE_KEYFRAMES); }
     }
     for (uint32_t i = 0; i < built && i < count; i++) {
-        for (uint32_t j = 0; j < list[i].count; j++) free(list[i].values[j].text);
+        for (uint32_t j = 0; j < list[i].count; j++) { free(list[i].values[j].text); free(list[i].values[j].name); }
         free(list[i].values);
     }
     free(list);
@@ -108,7 +111,8 @@ static JSValue wao_keyframes_get(JSContext *ctx, const struct web_effect *e) {
         JS_SetPropertyUint32(ctx, frame, at++, wao_easing_text(ctx, &f->easing));
         JS_SetPropertyUint32(ctx, frame, at++, JS_NewInt32(ctx, f->composite));
         for (uint32_t j = 0; j < f->count; j++) {
-            JS_SetPropertyUint32(ctx, frame, at++, JS_NewString(ctx, css_prop_name(css_prop_index(f->values[j].p), NULL)));
+            JS_SetPropertyUint32(ctx, frame, at++, JS_NewString(ctx, f->values[j].p ? css_prop_name(css_prop_index(f->values[j].p), NULL)
+                                                                                      : f->values[j].name));
             JS_SetPropertyUint32(ctx, frame, at++, JS_NewString(ctx, f->values[j].text));
         }
         JS_SetPropertyUint32(ctx, out, i, frame);
@@ -137,6 +141,12 @@ static JSValue native_animation(JSContext *ctx, JSValueConst this_val, int argc,
         const char *name = JS_ToCString(ctx, ARG(1));
         if (!name) return JS_EXCEPTION;
         const struct propdef *p = css_prop_lookup(name, strlen(name));
+        /* a custom property is its own name ("IDL attribute name to animation property name") */
+        if (!p && name[0] == '-' && name[1] == '-' && css_valid_declaration(name, strlen(name), "0", 1)) {
+            JSValue custom = JS_NewString(ctx, name);
+            JS_FreeCString(ctx, name);
+            return custom;
+        }
         JS_FreeCString(ctx, name);
         if (!p || css_prop_is_motion(p)) return JS_NULL;
         int n = css_prop_count();

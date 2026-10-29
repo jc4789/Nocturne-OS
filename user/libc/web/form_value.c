@@ -688,19 +688,20 @@ node_t *web_label_control(node_t *label) {
     node_t *control = *id ? control_first_id(doc_node_root(label, false), id) : NULL;
     return web_control_labelable(control) ? control : NULL;
 }
-node_t *web_label_activation(node_t *target) {
-    if (!target) return NULL;
-    for (node_t *n = target; n; n = n->parent) {
-        if (html_tag(n, T_label)) {
-            node_t *control = web_label_control(n);
-            return control == target ? NULL : control;
-        }
+node_t *web_label_activation(node_t *label, node_t *target) {
+    if (!html_tag(label, T_label)) return NULL;
+    if (!target) target = label;
+    for (node_t *n = target; n && n != label; n = n->shadow_host ? n->shadow_host : n->parent) {
         if (n->type != N_ELEM || n->foreign) continue;
-        if (web_control_labelable(n) || n->tag == T_summary || n->tag == T_iframe || n->tag == T_embed ||
-            (n->tag == T_a && node_attr(n, "href")) ||
-            ((n->tag == T_audio || n->tag == T_video) && node_attr(n, "controls"))) return NULL;
+        /* Interactive content (and what platforms treat alike: the other labelable
+           elements and summary) keeps its own click. */
+        if (web_control_labelable(n) || n->tag == T_label || n->tag == T_summary || n->tag == T_details ||
+            n->tag == T_iframe || n->tag == T_embed || (n->tag == T_a && node_attr(n, "href")) ||
+            ((n->tag == T_audio || n->tag == T_video) && node_attr(n, "controls")) ||
+            ((n->tag == T_img || n->tag == T_object) && node_attr(n, "usemap"))) return NULL;
     }
-    return NULL;
+    node_t *control = web_label_control(label);
+    return control == target ? NULL : control;
 }
 node_t *web_input_datalist(node_t *input) {
     if (!html_tag(input, T_input)) return NULL;
@@ -1253,39 +1254,38 @@ bool web_radio_same_group(web_doc *d, node_t *a, node_t *b) {
 }
 /* Checkedness is visible during click dispatch; canceled activation restores
    the captured native state rather than trying to undo a second toggle. */
-void web_control_activation_begin(web_doc *d, web_node *n, struct web_control_activation *activation) {
-    memset(activation, 0, sizeof *activation);
-    if (!d || !html_tag(n, T_input) || web_control_disabled(n)) return;
+void web_input_pre_activation(web_doc *d, node_t *n, struct web_input_activation *record) {
+    memset(record, 0, sizeof *record);
+    if (n && n->owner) d = n->owner;
+    if (!d || !html_tag(n, T_input)) return;
     enum web_input_kind kind = web_input_type(n);
     if (kind != WEB_INPUT_CHECKBOX && kind != WEB_INPUT_RADIO) return;
     doc_control_init(d, n);
-    activation->control = n; activation->checked = n->checked; activation->indeterminate = n->indeterminate;
-    activation->radio = kind == WEB_INPUT_RADIO;
-    if (activation->radio) {
+    record->used = true; record->checked = n->checked; record->indeterminate = n->indeterminate;
+    if (kind == WEB_INPUT_RADIO) {
         node_t *root = doc_node_root(n, false);
         for (node_t *p = root; p; ) {
             if (p == n || web_radio_same_group(d, n, p)) {
-                doc_control_init(d, p); if (p->checked) activation->previous = p;
+                doc_control_init(d, p); if (p->checked) record->previous = p;
             }
             if (p->first) p = p->first;
             else { while (p != root && !p->next) p = p->parent; if (p == root) break; p = p->next; }
         }
-    } else n->indeterminate = false;
-    doc_control_checked(d, n, activation->radio ? true : !activation->checked);
-}
-bool web_control_activation_end(web_doc *d, struct web_control_activation *activation, bool allowed) {
-    node_t *n = activation->control;
-    if (!n || !d || n->owner != d) return false;
-    enum web_input_kind kind = web_input_type(n);
-    if (!allowed) {
-        if (kind == WEB_INPUT_CHECKBOX) {
-            n->indeterminate = activation->indeterminate; doc_control_checked(d, n, activation->checked);
-        } else if (kind == WEB_INPUT_RADIO) {
-            node_t *previous = activation->previous;
-            if (previous && (previous == n || web_radio_same_group(d, n, previous))) doc_control_checked(d, previous, true);
-            else doc_control_checked(d, n, false);
-        }
-        return false;
+        doc_control_checked(d, n, true);
+    } else {
+        n->indeterminate = false;
+        doc_control_checked(d, n, !record->checked);
     }
-    return doc_node_connected(n) && !web_control_disabled(n) && (kind == WEB_INPUT_CHECKBOX || kind == WEB_INPUT_RADIO);
+}
+void web_input_canceled_activation(web_doc *d, node_t *n, const struct web_input_activation *record) {
+    if (n && n->owner) d = n->owner;
+    if (!d || !record || !record->used || !html_tag(n, T_input)) return;
+    enum web_input_kind kind = web_input_type(n);
+    if (kind == WEB_INPUT_CHECKBOX) {
+        n->indeterminate = record->indeterminate; doc_control_checked(d, n, record->checked);
+    } else if (kind == WEB_INPUT_RADIO) {
+        node_t *previous = record->previous;
+        if (previous && (previous == n || web_radio_same_group(d, n, previous))) doc_control_checked(d, previous, true);
+        else doc_control_checked(d, n, false);
+    }
 }

@@ -24,6 +24,7 @@ static box_t *nbox(struct bctx *b, int kind, node_t *n, style_t *st) {
     x->node = n;
     x->st = st;
     x->paint_alpha = kind != B_TEXT && kind != B_BR && st && (st->opacity * (st->filter ? st->filter->opacity : 1) < 1 ||
+        (st->filter && st->filter->effects) || st->backdrop_filter ||
         (kind != B_INLINE && (css_transform_general(st) || css_style_mask_border(st)->source.url ||
                               css_style_mask_border(st)->source.gradient || css_mask_layers_set(css_style_mask(st)))));
     x->baseline = -1;
@@ -98,26 +99,18 @@ static void transform(char *s, size_t n, int tt) {
 
 /* white-space processing and text-transform. With source, also the byte of s each output
    byte came from (source has room for one entry per output byte and one for the end, which
-   is n): the one record of how a text box's text corresponds to its Text node's data. */
+   is n): the one record of how a text box's text corresponds to its Text node's data.
+   Preserved tabs stay tabs: their advance reaches the next tab stop of the line they land on,
+   which layout knows (css-text-4 §4.1.3, tab-size). Soft hyphens stay too: invisible, they are
+   where line breaking may hyphenate (§6.3.1). The output is never longer than s. */
 static const char *ws_process(arena_t *a, const char *s, size_t n, const style_t *st, size_t *out_n,
                               uint32_t *source) {
-    char *o = ar_alloc(a, n * 8 + 1); /* tabs may expand */
+    char *o = ar_alloc(a, n + 1);
     size_t k = 0;
     int ws = st->white_space;
 #define WS_EMIT(c, from) do { if (source) source[k] = (uint32_t)(from); o[k++] = (c); } while (0)
     if (ws == WS_PRE || ws == WS_PRE_WRAP || ws == WS_BREAK_SPACES) {
-        int col = 0;
-        for (size_t i = 0; i < n; i++) {
-            char c = s[i];
-            if (c == '\t') {
-                int sp = 8 - col % 8;
-                for (int j = 0; j < sp; j++) WS_EMIT(' ', i);
-                col += sp;
-            } else {
-                WS_EMIT(c, i);
-                col = c == '\n' ? 0 : col + 1;
-            }
-        }
+        for (size_t i = 0; i < n; i++) WS_EMIT(s[i], i);
     } else {
         bool keep_nl = ws == WS_PRE_LINE;
         bool space = false;
@@ -132,11 +125,6 @@ static const char *ws_process(arena_t *a, const char *s, size_t n, const style_t
             if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
                 if (!space) WS_EMIT(' ', i);
                 space = true;
-                continue;
-            }
-            /* soft hyphens are invisible */
-            if ((unsigned char)c == 0xC2 && i + 1 < n && (unsigned char)s[i + 1] == 0xAD) {
-                i++;
                 continue;
             }
             WS_EMIT(c, i);
@@ -624,6 +612,7 @@ node_t *doc_svg_reference(node_t *n, const char *ref) {
     node_t *scope = doc_node_root(n, false);
     return scope ? find_id(scope, fragment + 1) : NULL;
 }
+
 bool doc_svg_clip_markup(node_t *n, const char *ref, const float box[4], sbuf *out) {
     node_t *clip = doc_svg_reference(n, ref);
     if (!clip || !clip->foreign || strcmp(clip->name, "clippath")) return false;
@@ -805,7 +794,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
     ws->height.kind = LK_AUTO;
     style_t *is = ar_alloc(b->a, sizeof *is);
     *is = *st;
-    is->filter = NULL; is->opacity = 1; /* the element's outer group composites once, and clips once */
+    is->filter = is->backdrop_filter = NULL; is->opacity = 1; /* the element's outer group composites once, and clips once */
     is->clip_path = NULL; memset(&is->clip, 0, sizeof is->clip);
     is->transform=is->rotate=is->scale=NULL;memset(&is->translate,0,sizeof is->translate);is->offset=NULL;
     is->mask_border = NULL; is->mask_border_img = 0; is->mask = NULL; /* masked with the outer group */
@@ -1614,7 +1603,7 @@ static bool restyle_derived(box_t *b, style_t *old) {
         next.width.kind=next.height.kind=LK_AUTO;
     } else {
         next.display=b->kind == B_TABLE ? D_TABLE : b->kind == B_GRID ? D_GRID : D_FLEX;
-        next.filter=NULL; next.opacity=1; next.clip_path=NULL; memset(&next.clip,0,sizeof next.clip);
+        next.filter=next.backdrop_filter=NULL; next.opacity=1; next.clip_path=NULL; memset(&next.clip,0,sizeof next.clip);
         next.transform=next.rotate=next.scale=NULL;memset(&next.translate,0,sizeof next.translate);next.offset=NULL;
         next.mask_border=NULL; next.mask_border_img=0; next.mask=NULL;
         for (int i=0;i<4;i++) {
@@ -1666,7 +1655,8 @@ static void restyle_boxes(box_t *b,bool inherited_borrow) {
         deco->st=replacement_style(deco->node?deco->node:fallback,deco->st);
     }
     b->paint_alpha = b->kind != B_TEXT && b->kind != B_BR && b->st &&
-        (b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1) < 1 || box_transformed(b) ||
+        (b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1) < 1 || (b->st->filter && b->st->filter->effects) ||
+         b->st->backdrop_filter || box_transformed(b) ||
          (b->kind != B_INLINE && (css_style_mask_border(b->st)->source.url || css_style_mask_border(b->st)->source.gradient ||
                                   css_mask_layers_set(css_style_mask(b->st)))));
     for (box_t *c = b->first; c; c = c->next) { restyle_boxes(c,inherited_borrow||own_borrow); b->paint_alpha |= c->paint_alpha; }

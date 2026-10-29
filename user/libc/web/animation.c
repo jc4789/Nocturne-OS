@@ -30,10 +30,13 @@ static void script_dirty(const struct web_animation *a) {
 static void keyframes_free(struct web_keyframes *k) {
     if (!k) return;
     for (uint32_t i = 0; i < k->count; i++) {
-        for (uint32_t j = 0; j < k->v[i].count; j++) { free(k->v[i].values[j].text); free(k->v[i].values[j].longhands); }
+        for (uint32_t j = 0; j < k->v[i].count; j++) {
+            free(k->v[i].values[j].text); free(k->v[i].values[j].longhands); free(k->v[i].values[j].name);
+        }
         free(k->v[i].values);
     }
-    free(k->v); free(k->properties); free(k);
+    for (uint32_t i = 0; i < k->ncustoms; i++) free(k->customs[i]);
+    free(k->customs); free(k->v); free(k->properties); free(k);
 }
 /* Keyframes another worker may be sampling retire to the join, never freed in place. */
 static void keyframes_retire(struct web_animations *x, struct web_keyframes *k) {
@@ -62,6 +65,21 @@ struct web_keyframes *web_keyframes_build(const struct web_keyframe *frames, uin
         }
         for (uint32_t j = 0; j < frames[i].count; j++) {
             const struct web_keyframe_value *v = &frames[i].values[j];
+            if (!v->p && v->name && v->text) {
+                /* a custom property: animatable, by its computed value */
+                struct web_keyframe_value *out = &f->values[f->count];
+                *out = (struct web_keyframe_value){.name = strdup(v->name), .text = strdup(v->text)};
+                if (!out->name || !out->text) { free(out->name); free(out->text); keyframes_free(k); return NULL; }
+                f->count++;
+                uint32_t c = 0;
+                while (c < k->ncustoms && strcmp(k->customs[c], v->name)) c++;
+                if (c < k->ncustoms) continue;
+                char **list = realloc(k->customs, (k->ncustoms + 1) * sizeof *list);
+                if (list) k->customs = list;
+                if (!list || !(k->customs[k->ncustoms] = strdup(v->name))) { keyframes_free(k); return NULL; }
+                k->ncustoms++;
+                continue;
+            }
             if (!v->p || !v->text) continue;
             css_prop_longhands(v->p, set);
             uint16_t n = 0;
@@ -101,6 +119,12 @@ static bool keyframes_same(const struct web_keyframes *k, const struct web_keyfr
             a->composite != b->composite || !css_easing_same(&a->easing, &b->easing)) return false;
         uint32_t j = 0;
         for (uint32_t n = 0; n < b->count; n++) {
+            if (!b->values[n].p && b->values[n].name && b->values[n].text) {
+                if (j >= a->count || !a->values[j].name || strcmp(a->values[j].name, b->values[n].name) ||
+                    strcmp(a->values[j].text, b->values[n].text)) return false;
+                j++;
+                continue;
+            }
             if (!b->values[n].p || !b->values[n].text) continue;
             if (j >= a->count) return false;
             if (a->values[j].p != b->values[n].p || strcmp(a->values[j].text, b->values[n].text)) {
@@ -620,7 +644,7 @@ struct sampler {
 /* a keyframe value's style, var() substituted against the base style */
 static style_t *value_style(struct sampler *s, const struct web_keyframe_value *v) {
     s->subst.n = 0;
-    if (!css_substitute(s->ctx->base, v->text, &s->subst)) return NULL;
+    if (!css_substitute(s->ctx->d, s->ctx->base, s->ctx->node, v->text, &s->subst)) return NULL;
     style_t *st = ar_alloc(s->ctx->a, sizeof *st);
     return css_anim_parse(s->ctx, v->p, sb_cstr(&s->subst), s->subst.n, false, st, NULL) ? st : NULL;
 }
@@ -710,6 +734,109 @@ static bool effect_value(struct sampler *s, const struct web_effect *e, const st
     return css_computed_value(css_anim_discrete_second(p, values[0], values[1], t) ? values[1] : values[0], p, out, s->ctx->d);
 }
 
+/* ---------------------------------------------------------------- custom properties (css-properties-values-api-1 §2.5) */
+static bool keyframes_custom(const struct web_keyframes *k, const char *name) {
+    for (uint32_t i = 0; k && i < k->ncustoms; i++) if (!strcmp(k->customs[i], name)) return true;
+    return false;
+}
+/* the last value in keyframe f that sets custom property name */
+static const struct web_keyframe_value *frame_custom(const struct web_keyframe *f, const char *name) {
+    for (uint32_t j = f->count; j-- > 0;) if (!f->values[j].p && f->values[j].name && !strcmp(f->values[j].name, name)) return &f->values[j];
+    return NULL;
+}
+/* value composited onto under (Web Animations 1 §5.4.4): a typed value adds or accumulates as its type
+   does; a value that does not (discrete, guaranteed-invalid) replaces */
+static const char *custom_composited(struct sampler *s, const struct css_syntax *syn, const char *under, const char *value, int op) {
+    if (op == CM_COMPOSITE_REPLACE || !syn || !under || !value) return value;
+    s->text.n = 0;
+    return css_custom_compose(s->ctx, syn, under, value, op == CM_COMPOSITE_ACCUMULATE, &s->text) ? ar_strdup(s->ctx->a, sb_cstr(&s->text)) : value;
+}
+struct custom_end { double offset; const struct web_keyframe *frame; const char *value; }; /* value NULL: guaranteed-invalid */
+/* effect_value for custom property name over the underlying computed value under: its property-specific
+   keyframes, neutral ones at 0 and 1, the interval's two values interpolated by the registered type (syn),
+   else discretely. false: the effect does not set it now */
+static bool effect_custom(struct sampler *s, const struct web_effect *e, const struct web_effect_progress *pr, const char *name,
+                          const struct css_syntax *syn, const char *under, const char **result) {
+    const struct web_keyframes *k = e->frames;
+    if (!k || !resolved(pr->progress) || !keyframes_custom(k, name)) return false;
+    struct custom_end list[k->count + 2];
+    uint32_t n = 0, zero = 0, one = 0;
+    sbuf text = {0};
+    for (uint32_t i = 0; i < k->count; i++) {
+        const struct web_keyframe_value *v = frame_custom(&k->v[i], name);
+        if (!v) continue;
+        text.n = 0;
+        int got = css_custom_animation_value(s->ctx, name, v->text, &text);
+        if (got < 0) continue; /* an invalid value is no keyframe for the property */
+        list[n++] = (struct custom_end){k->v[i].computed, &k->v[i], got ? ar_strdup(s->ctx->a, sb_cstr(&text)) : NULL};
+    }
+    sb_free(&text);
+    if (!n) return false;
+    for (uint32_t i = 0; i < n; i++) { if (list[i].offset == 0) zero++; if (list[i].offset == 1) one++; }
+    if (!zero) { memmove(list + 1, list, n * sizeof *list); list[0] = (struct custom_end){0, NULL, under}; n++; zero = 1; }
+    if (!one) { list[n++] = (struct custom_end){1, NULL, under}; one = 1; }
+    double progress = pr->progress;
+    struct custom_end *a = NULL, *b = NULL;
+    if (progress < 0 && zero > 1) a = &list[0];
+    else if (progress >= 1 && one > 1) a = &list[n - 1];
+    else {
+        for (uint32_t i = 0; i < n; i++) if (list[i].offset <= progress && list[i].offset < 1) a = &list[i];
+        if (!a) for (uint32_t i = 0; i < n; i++) if (list[i].offset == 0) a = &list[i];
+        if (!a) a = &list[0];
+        b = a + 1 < list + n ? a + 1 : NULL;
+    }
+    struct custom_end *ends[2] = {a, b};
+    const char *values[2] = {NULL, NULL};
+    for (int i = 0; i < 2; i++) {
+        if (!ends[i]) continue;
+        const char *v = ends[i]->value;
+        /* iteration composite accumulate: the final keyframe's value, current iteration times */
+        if (ends[i]->frame && syn && v && e->iteration_composite == CM_COMPOSITE_ACCUMULATE && resolved(pr->iteration) &&
+            pr->iteration > 0 && isfinite(pr->iteration) && list[n - 1].value) {
+            s->text.n = 0;
+            if (css_custom_compose(s->ctx, syn, list[n - 1].value, v, true, &s->text)) {
+                const char *once = ar_strdup(s->ctx->a, sb_cstr(&s->text));
+                s->text.n = 0;
+                if (css_custom_interpolate(s->ctx, syn, v, once, pr->iteration, &s->text)) v = ar_strdup(s->ctx->a, sb_cstr(&s->text));
+            }
+        }
+        if (ends[i]->frame) {
+            int op = ends[i]->frame->composite == WA_COMPOSITE_AUTO ? e->composite : ends[i]->frame->composite;
+            v = custom_composited(s, syn, under, v, op);
+        }
+        values[i] = v;
+    }
+    if (!b) { *result = values[0]; return true; }
+    double span = ends[1]->offset - ends[0]->offset;
+    double distance = span == 0 ? 0 : (progress - ends[0]->offset) / span;
+    double t = ends[0]->frame ? css_easing_apply(&ends[0]->frame->easing, distance, pr->before) : distance;
+    s->text.n = 0;
+    if (syn && values[0] && values[1] && css_custom_interpolate(s->ctx, syn, values[0], values[1], t, &s->text))
+        *result = ar_strdup(s->ctx->a, sb_cstr(&s->text));
+    else *result = t >= .5 ? values[1] : values[0]; /* discrete (Web Animations 1 §5.3) */
+    return true;
+}
+/* the custom properties of the effects, each once, in ctx.a */
+static uint32_t stack_customs(const struct css_anim_ctx *ctx, const struct web_effect *const *effects, size_t m, const char ***out) {
+    uint32_t total = 0;
+    for (size_t i = 0; i < m; i++) total += effects[i]->frames->ncustoms;
+    const char **names = total ? ar_alloc(ctx->a, total * sizeof *names) : NULL;
+    uint32_t n = 0;
+    for (size_t i = 0; i < m; i++)
+        for (uint32_t c = 0; c < effects[i]->frames->ncustoms; c++) {
+            const char *name = effects[i]->frames->customs[c];
+            uint32_t j = 0;
+            while (j < n && strcmp(names[j], name)) j++;
+            if (j == n) names[n++] = name;
+        }
+    *out = names;
+    return n;
+}
+static bool custom_animated(const struct web_motion_site *site, const char *name) {
+    for (uint32_t i = 0; i < site->nanimated_customs; i++) if (!strcmp(site->animated_customs[i], name)) return true;
+    return false;
+}
+
 /* ---------------------------------------------------------------- the cascade's side */
 static bool motion_declared(const style_t *st, int *want) {
     for (uint32_t i = 0, n = css_motion_count(st, ML_NAME); i < n; i++)
@@ -773,6 +900,22 @@ static void implicit_frame(const struct css_anim_ctx *ctx, struct web_keyframe *
     }
     uint32_t missing = 0;
     for (int p = 0; p < nprops; p++) missing += animated[p] && !present[p];
+    /* the custom properties some keyframe sets and none at this offset: their computed values */
+    uint32_t written = 0, ncustoms = 0;
+    for (uint32_t i = 0; i < *n; i++) written += frames[i].count;
+    const char **customs = written ? ar_alloc(ctx->a, written * sizeof *customs) : NULL;
+    for (uint32_t i = 0; i < *n; i++)
+        for (uint32_t j = 0; j < frames[i].count; j++) {
+            const char *name = frames[i].values[j].p ? NULL : frames[i].values[j].name;
+            if (!name) continue;
+            bool there = false;
+            for (uint32_t q = 0; q < *n && !there; q++)
+                if (frames[q].offset == offset) for (uint32_t r = 0; r < frames[q].count && !there; r++)
+                    there = !frames[q].values[r].p && frames[q].values[r].name && !strcmp(frames[q].values[r].name, name);
+            for (uint32_t q = 0; q < ncustoms && !there; q++) there = !strcmp(customs[q], name);
+            if (!there && css_custom_value(ctx->d, ctx->base, name)) customs[ncustoms++] = name;
+        }
+    missing += ncustoms;
     if (!missing) return;
     if (!k) {
         /* a new initial keyframe is prepended, a new final keyframe appended */
@@ -792,6 +935,9 @@ static void implicit_frame(const struct css_anim_ctx *ctx, struct web_keyframe *
         if (!css_computed_value(ctx->base, d, &text, ctx->d)) continue; /* it keeps the neutral keyframe */
         k->values[k->count++] = (struct web_keyframe_value){.p = d, .text = ar_strdup(ctx->a, sb_cstr(&text))};
     }
+    for (uint32_t q = 0; q < ncustoms; q++)
+        k->values[k->count++] = (struct web_keyframe_value){.name = (char *)customs[q],
+                                                             .text = ar_strdup(ctx->a, css_custom_value(ctx->d, ctx->base, customs[q]))};
     sb_free(&text);
 }
 /* the declared keyframes completed, in ctx.a; declared itself when nothing is added */
@@ -809,6 +955,8 @@ static const struct web_keyframe *animation_frames(const struct css_anim_ctx *ct
         }
     bool any = false;
     for (int p = 0; p < nprops && !any; p++) any = animated[p];
+    for (uint32_t i = 0; i < *n && !any; i++)
+        for (uint32_t j = 0; j < declared[i].count && !any; j++) any = !declared[i].values[j].p && declared[i].values[j].name;
     if (!any || !ctx->base) return declared;
     struct web_keyframe *frames = ar_alloc(ctx->a, (*n + 2) * sizeof *frames);
     if (*n) memcpy(frames, declared, *n * sizeof *frames);
@@ -891,6 +1039,7 @@ size_t web_motion_sample(struct web_motion_site *site, bool transitions, uint8_t
     size_t count = 0;
     for (struct web_effect *e = n->effects; e; e = e->target_next)
         if (e->pseudo == site->pseudo && e->animation && e->frames) count++;
+    if (!transitions) site->nanimated_customs = 0;
     if (!count) return 0;
     struct stack_entry stack[count];
     size_t m = 0;
@@ -927,6 +1076,30 @@ size_t web_motion_sample(struct web_motion_site *site, bool transitions, uint8_t
         if (!transitions) animated[li] = 1;
         emitted++;
     }
+    /* the custom properties the same way, by computed value over the base style's */
+    const struct web_effect *effects[m];
+    for (size_t i = 0; i < m; i++) effects[i] = stack[i].a->effect;
+    const char **names;
+    uint32_t ncustoms = site->emit_custom ? stack_customs(&site->ctx, effects, m, &names) : 0;
+    const char **set = !transitions && ncustoms ? ar_alloc(site->ctx.a, ncustoms * sizeof *set) : NULL;
+    for (uint32_t c = 0; c < ncustoms; c++) {
+        const char *name = names[c];
+        if (transitions && custom_animated(site, name)) continue;
+        const struct css_syntax *syn = css_custom_syntax(site->ctx.d, name);
+        const char *under = css_custom_value(site->ctx.d, site->ctx.base, name);
+        bool any = false;
+        for (size_t i = 0; i < m; i++) {
+            const char *v;
+            if (!effect_custom(&s, stack[i].a->effect, &stack[i].p, name, syn, under, &v)) continue;
+            any = true;
+            under = v;
+        }
+        if (!any) continue;
+        site->emit_custom(site->arg, name, under);
+        if (set) set[site->nanimated_customs++] = name;
+        emitted++;
+    }
+    if (set) site->animated_customs = set;
     sb_free(&value); sb_free(&s.text); sb_free(&s.subst);
     return emitted;
 }
@@ -941,25 +1114,38 @@ static bool transitionable(const struct css_anim_ctx *ctx, const struct propdef 
     sb_free(&t);
     return ok;
 }
+/* a and b as this layer writes them (its numbers have the stored floats' seven significant
+   digits) are one value: a transition between them would change nothing. A descendant that
+   inherits a transition's start value, written so, differs from its style before only below
+   that (10pt is 13.333333px, read back 13.33333px). */
+static bool same_written(const struct css_anim_ctx *ctx, const struct propdef *p, const style_t *a, const style_t *b) {
+    sbuf x = {0}, y = {0};
+    bool same = css_anim_interpolate(ctx, p, a, b, 0, &x) && css_anim_interpolate(ctx, p, a, b, 1, &y) &&
+                !strcmp(sb_cstr(&x), sb_cstr(&y));
+    sb_free(&x); sb_free(&y);
+    return same;
+}
 static char *computed_text(const style_t *st, const struct propdef *p, web_doc *d) {
     sbuf b = {0};
     char *text = css_computed_value(st, p, &b, d) ? strdup(sb_cstr(&b)) : NULL;
     sb_free(&b);
     return text;
 }
-static struct web_animation *start_transition(struct web_motion_site *site, const struct propdef *p, const char *from,
-                                              const char *to, const char *reversing, double shortening,
+/* a transition of longhand p, or of custom property custom (p NULL) */
+static struct web_animation *start_transition(struct web_motion_site *site, const struct propdef *p, const char *custom,
+                                              const char *from, const char *to, const char *reversing, double shortening,
                                               double duration, double delay, const struct css_easing *easing) {
     web_doc *d = site->ctx.d;
     struct web_animation *a = web_animation_new(d, WA_CSS_TRANSITION);
     struct web_effect *e = a ? web_effect_new(d) : NULL;
     if (!a || !e) return NULL;
-    struct web_keyframe_value v[2] = {{.p = p, .text = (char *)from}, {.p = p, .text = (char *)to}};
+    struct web_keyframe_value v[2] = {{.p = p, .name = (char *)custom, .text = (char *)from},
+                                      {.p = p, .name = (char *)custom, .text = (char *)to}};
     struct web_keyframe frames[2] = {
         {.offset = 0, .easing = {.kind = CM_LINEAR}, .composite = WA_COMPOSITE_AUTO, .count = 1, .values = &v[0]},
         {.offset = 1, .easing = {.kind = CM_LINEAR}, .composite = WA_COMPOSITE_AUTO, .count = 1, .values = &v[1]}};
     e->frames = web_keyframes_build(frames, 2);
-    a->name = strdup(css_prop_name(css_prop_index(p), NULL));
+    a->name = strdup(p ? css_prop_name(css_prop_index(p), NULL) : custom);
     a->to = strdup(to); a->reversing_from = strdup(reversing);
     a->property = p; a->shortening = shortening;
     a->generation = __atomic_add_fetch(&d->animations->transition_generation, 1, __ATOMIC_RELAXED);
@@ -978,9 +1164,124 @@ static char *transition_value(struct web_motion_site *site, struct web_animation
     struct web_effect_progress p;
     web_effect_compute(a->effect, &p);
     sbuf b = {0};
-    char *text = effect_value(&s, a->effect, &p, css_prop_index(a->property), site->ctx.base, &b) ? strdup(sb_cstr(&b)) : NULL;
+    char *text = NULL;
+    if (!a->property) {
+        const char *v = NULL;
+        web_doc *d = site->ctx.d;
+        if (effect_custom(&s, a->effect, &p, a->name, css_custom_syntax(d, a->name), css_custom_value(d, site->ctx.base, a->name), &v) && v)
+            text = strdup(v);
+    } else if (effect_value(&s, a->effect, &p, css_prop_index(a->property), site->ctx.base, &b)) text = strdup(sb_cstr(&b));
     sb_free(&b); sb_free(&s.text); sb_free(&s.subst);
     return text ? text : strdup(a->to);
+}
+/* css-properties-values-api-1 §2.5 with CSS Transitions 2 §3: a custom property's computed values
+   transition as its registered type interpolates them; the others, discrete, only with allow-discrete */
+static bool custom_transitionable(const struct css_anim_ctx *ctx, const struct css_syntax *syn, const char *a, const char *b,
+                                  bool allow_discrete) {
+    if (!a || !b) return false;
+    if (allow_discrete) return true;
+    sbuf t = {0};
+    bool ok = syn && css_custom_interpolate(ctx, syn, a, b, .5, &t);
+    sb_free(&t);
+    return ok;
+}
+/* CSS Transitions 1 §3 steps 1-4 for custom property name, i its transition-property item (-1: none);
+   another call for the same name finds what this one did and changes nothing */
+static void custom_transition(struct web_motion_site *site, const struct css_anim_ctx *after_ctx, const char *name,
+                              const style_t *before, const style_t *after, int32_t i) {
+    node_t *n = site->ctx.node;
+    web_doc *d = site->ctx.d;
+    struct web_animation *running = NULL, *completed = NULL;
+    for (struct web_animation *a = n->owned; a; a = a->owner_next) {
+        if (a->kind != WA_CSS_TRANSITION || a->owner_pseudo != site->pseudo || a->disowned || a->property || !a->name ||
+            strcmp(a->name, name)) continue;
+        int state = web_animation_play_state(a);
+        if (state == WA_FINISHED) completed = a;
+        else if (state != WA_IDLE) running = a;
+    }
+    const char *from = before ? css_custom_value(d, before, name) : NULL, *to = css_custom_value(d, after, name);
+    bool changed = before && !custom_animated(site, name) && (!from != !to || (from && strcmp(from, to)));
+    if (!running && !completed && (!changed || i < 0)) return;
+    if (!to) { /* nothing to transition to */
+        if (running) css_disown(running);
+        if (completed) css_disown(completed);
+        return;
+    }
+    double duration = i >= 0 ? fmax(css_motion_item(after, ML_TDURATION, (uint32_t)i).f, 0) : 0;
+    double delay = i >= 0 ? css_motion_item(after, ML_TDELAY, (uint32_t)i).f : 0;
+    bool allow_discrete = i >= 0 && css_motion_item(after, ML_TBEHAVIOR, (uint32_t)i).k;
+    struct css_easing easing = i >= 0 ? css_motion_item(after, ML_TEASING, (uint32_t)i).e : (struct css_easing){.kind = CM_LINEAR};
+    double combined = duration + delay;
+    const struct css_syntax *syn = css_custom_syntax(d, name);
+    if (!running && changed && i >= 0 && combined > 0 && custom_transitionable(after_ctx, syn, from, to, allow_discrete) &&
+        (!completed || strcmp(completed->to, to))) {
+        if (completed) { css_disown(completed); completed = NULL; }
+        start_transition(site, NULL, name, from, to, from, 1, duration, delay, &easing);
+    } else if (completed && strcmp(completed->to, to)) { css_disown(completed); completed = NULL; }
+    if (i < 0) {
+        if (running) css_disown(running);
+        if (completed) css_disown(completed);
+        return;
+    }
+    if (!running || !strcmp(running->to, to)) return;
+    char *current = transition_value(site, running);
+    if (!current || !strcmp(current, to) || !custom_transitionable(after_ctx, syn, current, to, allow_discrete) || combined <= 0)
+        css_disown(running);
+    else if (!strcmp(running->reversing_from, to)) {
+        struct web_effect_progress pr; web_effect_compute(running->effect, &pr);
+        double progress = resolved(pr.progress) ? pr.progress : 0;
+        double factor = fabs(progress * running->shortening + (1 - running->shortening));
+        factor = factor < 0 ? 0 : factor > 1 ? 1 : factor;
+        char *old_end = strdup(running->to);
+        css_disown(running);
+        if (old_end) start_transition(site, NULL, name, current, to, old_end, factor, factor * duration, delay < 0 ? factor * delay : delay, &easing);
+        free(old_end);
+    } else {
+        css_disown(running);
+        start_transition(site, NULL, name, current, to, current, 1, duration, delay, &easing);
+    }
+    free(current);
+}
+struct custom_transitions { struct web_motion_site *site; const struct css_anim_ctx *after_ctx; const style_t *before, *after; bool removed; };
+static int32_t custom_item(const style_t *after, const char *name) {
+    int32_t match = -1;
+    for (uint32_t i = 0, n = css_motion_count(after, ML_TPROPERTY); i < n; i++) {
+        const char *item = css_motion_item(after, ML_TPROPERTY, i).s;
+        if (item && (!strcmp(item, "all") || !strcmp(item, name))) match = (int32_t)i;
+    }
+    return match;
+}
+static bool custom_transition_each(void *arg, const char *name, const char *value) {
+    (void)value;
+    struct custom_transitions *t = arg;
+    /* the before-change style's walk: only the names the after-change style no longer has */
+    if (t->removed && css_custom_value(t->site->ctx.d, t->after, name)) return true;
+    custom_transition(t->site, t->after_ctx, name, t->before, t->after, custom_item(t->after, name));
+    return true;
+}
+/* the custom properties transition-property names (all: every one either style has) and those with a
+   transition already */
+static void custom_transitions(struct web_motion_site *site, const style_t *before, const style_t *after,
+                               const struct css_anim_ctx *after_ctx) {
+    node_t *n = site->ctx.node;
+    web_doc *d = site->ctx.d;
+    struct custom_transitions t = {site, after_ctx, before, after, false};
+    bool all = false;
+    for (uint32_t i = 0, count = css_motion_count(after, ML_TPROPERTY); before && i < count; i++) {
+        const char *item = css_motion_item(after, ML_TPROPERTY, i).s;
+        if (!item) continue;
+        if (!strcmp(item, "all")) all = true;
+        else if (item[0] == '-' && item[1] == '-') custom_transition(site, after_ctx, item, before, after, custom_item(after, item));
+    }
+    if (all) {
+        css_custom_values(d, after, custom_transition_each, &t);
+        t.removed = true;
+        css_custom_values(d, before, custom_transition_each, &t);
+    }
+    for (struct web_animation *a = n->owned; a; a = a->owner_next) {
+        if (a->kind != WA_CSS_TRANSITION || a->owner_pseudo != site->pseudo || a->disowned || a->property || !a->name) continue;
+        custom_transition(site, after_ctx, a->name, before, after, custom_item(after, a->name));
+    }
 }
 /* animated: the longhands the animation origin sets. Their before-change value is the animation's
    value updated to the current time, which is their after-change value: no transition starts. */
@@ -1031,11 +1332,12 @@ void web_motion_transitions(struct web_motion_site *site, const style_t *before,
         char *to = computed_text(after, p, d);
         if (!to) continue;
         if (!running && changed && i >= 0 && combined > 0 &&
-            transitionable(&after_ctx, p, before, after, allow_discrete) && (!completed || strcmp(completed->to, to))) {
+            transitionable(&after_ctx, p, before, after, allow_discrete) && !same_written(&after_ctx, p, before, after) &&
+            (!completed || strcmp(completed->to, to))) {
             /* §3 step 1 */
             if (completed) { css_disown(completed); completed = NULL; }
             char *from = computed_text(before, p, d);
-            if (from) start_transition(site, p, from, to, from, 1, duration, delay, &easing);
+            if (from) start_transition(site, p, NULL, from, to, from, 1, duration, delay, &easing);
             free(from);
         } else if (completed && strcmp(completed->to, to)) { css_disown(completed); completed = NULL; } /* step 2 */
         if (i < 0) { /* step 3 */
@@ -1056,17 +1358,18 @@ void web_motion_transitions(struct web_motion_site *site, const style_t *before,
                 factor = factor < 0 ? 0 : factor > 1 ? 1 : factor;
                 char *old_end = strdup(running->to);
                 css_disown(running);
-                if (old_end) start_transition(site, p, current, to, old_end, factor, factor * duration,
+                if (old_end) start_transition(site, p, NULL, current, to, old_end, factor, factor * duration,
                                               delay < 0 ? factor * delay : delay, &easing);
                 free(old_end);
             } else {
                 css_disown(running);
-                start_transition(site, p, current, to, current, 1, duration, delay, &easing);
+                start_transition(site, p, NULL, current, to, current, 1, duration, delay, &easing);
             }
             free(current);
         }
         free(to);
     }
+    custom_transitions(site, before, after, &after_ctx);
 }
 
 /* ---------------------------------------------------------------- events (CSS Animations 2 §4.2, CSS Transitions 2 §5) */
@@ -1170,6 +1473,14 @@ static void remove_replaced(struct web_animations *x) {
             for (const struct web_effect *o = e->target->effects; o && !covered; o = o->target_next)
                 covered = o != e && o->pseudo == e->pseudo && o->animation && replaceable(o->animation) &&
                     composite_order(o->animation, a) > 0 && o->frames->properties[p];
+            all = covered;
+        }
+        for (uint32_t c = 0; c < e->frames->ncustoms && all; c++) {
+            any = true;
+            bool covered = false;
+            for (const struct web_effect *o = e->target->effects; o && !covered; o = o->target_next)
+                covered = o != e && o->pseudo == e->pseudo && o->animation && replaceable(o->animation) &&
+                    composite_order(o->animation, a) > 0 && keyframes_custom(o->frames, e->frames->customs[c]);
             all = covered;
         }
         if (!any || !all) continue;
@@ -1361,6 +1672,13 @@ bool web_animation_commit(struct web_animation *a, sbuf *out, int *count) {
         if (!effect_value(&s, e, &p, li, base, &value)) continue;
         sb_puts(out, css_prop_name(li, NULL)); sb_putc(out, 0);
         sb_puts(out, sb_cstr(&value)); sb_putc(out, 0);
+        (*count)++;
+    }
+    for (uint32_t c = 0; c < e->frames->ncustoms; c++) {
+        const char *name = e->frames->customs[c], *v = NULL;
+        if (!effect_custom(&s, e, &p, name, css_custom_syntax(t->owner, name), css_custom_value(t->owner, base, name), &v) || !v) continue;
+        sb_puts(out, name); sb_putc(out, 0);
+        sb_puts(out, v); sb_putc(out, 0);
         (*count)++;
     }
     sb_free(&value); sb_free(&s.text); sb_free(&s.subst); ar_free(&arena);

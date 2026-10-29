@@ -9,6 +9,7 @@
 #include <math.h>
 #include <limits.h>
 #include <float.h>
+#include <wctype.h>
 #include <nocturne.h>
 #include <parallel.h>
 #include "webi.h"
@@ -648,17 +649,27 @@ static bool style_transform_matrix(const style_t *st,double x,double y,float w,f
     for(int i=0;i<6;i++)if(!isfinite(out[i]))return false;
     return true;
 }
-void box_transform_rect(const box_t *b,double rect[4]){
+void box_transform_chain(const box_t *b,double m[6]){
+    m[0]=m[3]=1;m[1]=m[2]=m[4]=m[5]=0;
     for(;b;b=b->parent){
-        double m[6];if(!box_transform_matrix(b,m))continue;
-        double x0=rect[0],y0=rect[1],x1=rect[0]+rect[2],y1=rect[1]+rect[3];
-        double xs[4]={x0,x1,x0,x1},ys[4]={y0,y0,y1,y1},l=INFINITY,t=INFINITY,r=-INFINITY,bt=-INFINITY;
-        for(int i=0;i<4;i++){
-            double x=m[0]*xs[i]+m[2]*ys[i]+m[4],y=m[1]*xs[i]+m[3]*ys[i]+m[5];
-            l=fmin(l,x);t=fmin(t,y);r=fmax(r,x);bt=fmax(bt,y);
-        }
-        rect[0]=l;rect[1]=t;rect[2]=r-l;rect[3]=bt-t;
+        double t[6];if(!box_transform_matrix(b,t))continue;
+        /* the ancestor's transform applies after everything inside it */
+        double r[6]={t[0]*m[0]+t[2]*m[1],t[1]*m[0]+t[3]*m[1],t[0]*m[2]+t[2]*m[3],t[1]*m[2]+t[3]*m[3],
+                     t[0]*m[4]+t[2]*m[5]+t[4],t[1]*m[4]+t[3]*m[5]+t[5]};
+        memcpy(m,r,sizeof r);
     }
+}
+void box_transform_rect(const box_t *b,double rect[4]){
+    double m[6];box_transform_chain(b,m);
+    if(m[0]==1&&m[1]==0&&m[2]==0&&m[3]==1&&m[4]==0&&m[5]==0)return;
+    /* The quad's own bounds: bounding each nested transform separately would grow it. */
+    double x0=rect[0],y0=rect[1],x1=rect[0]+rect[2],y1=rect[1]+rect[3];
+    double xs[4]={x0,x1,x0,x1},ys[4]={y0,y0,y1,y1},l=INFINITY,t=INFINITY,r=-INFINITY,bt=-INFINITY;
+    for(int i=0;i<4;i++){
+        double x=m[0]*xs[i]+m[2]*ys[i]+m[4],y=m[1]*xs[i]+m[3]*ys[i]+m[5];
+        l=fmin(l,x);t=fmin(t,y);r=fmax(r,x);bt=fmax(bt,y);
+    }
+    rect[0]=l;rect[1]=t;rect[2]=r-l;rect[3]=bt-t;
 }
 bool box_filter_containing_block(const box_t *b) {
     const box_t *effect = b;
@@ -666,7 +677,7 @@ bool box_filter_containing_block(const box_t *b) {
        inner box owns its real padding/border containing-block geometry. */
     if (b && b->wrapped_inner && b->parent) effect = b->parent;
     return effect && effect->st && b->kind != B_TEXT && b->kind != B_BR &&
-        ((effect->kind!=B_INLINE&&css_translation_active(effect->st))||(effect->st->filter&&
+        ((effect->kind!=B_INLINE&&css_translation_active(effect->st))||((effect->st->filter||effect->st->backdrop_filter)&&
          !(b->node&&b->node->owner&&b->node==b->node->owner->html)));
 }
 bool box_viewport_fixed(const box_t *b) {
@@ -1148,6 +1159,8 @@ struct item {
     uint8_t kind;
     bool brk;       /* a line may break after it */
     bool space_end; /* ends in a collapsible space (hangs at the end of a line) */
+    bool tab;       /* IT_TEXT: one preserved tab, w its advance where the line placing it put it */
+    bool hyphen;    /* its break (brk) is at a soft hyphen: a line ending there shows hw more */
     box_t *box;
     const char *s;
     int n;
@@ -1156,6 +1169,7 @@ struct item {
     node_t *link;
     float shift; /* baseline shift upwards */
     float descent; /* native font metric collected during line sizing */
+    float hw;      /* hyphen: layout_hyphen_string's advance in the soft hyphen's style */
     bool float_sized; /* IT_FLOAT already sized by a line-fit test */
 };
 
@@ -1182,23 +1196,50 @@ struct ibuild {
     float shift;
     box_t *paint_owner;
     bool collect_paint;
+    /* The word in progress across inline boxes (inline element boundaries and out-of-flow boxes
+       do not end a word, css-text-4 §6.3.1): 1 + the index of its last text item (0: none), and
+       its last two grapheme clusters' first code points, for the break before the next box's text. */
+    int word_item;
+    uint32_t word_prev, word_left;
+    bool hyphen_limits; /* some soft hyphen's hyphenate-limit-chars has a number: hyphen_limits() */
 };
 
-static float va_shift(const style_t *st) {
-    switch (st->vertical_align) {
-    case VA_SUB: return -st->font_size * 0.25f;
-    case VA_SUPER: return st->font_size * 0.4f;
-    case VA_LEN: return st->vertical_align_px;
-    }
-    return 0;
-}
 
-/* Common East Asian soft-wrap opportunities. These supplement whitespace
-   breaks, not break-all: Latin words stay intact, and Japanese opening/
-   closing punctuation, small kana and combining marks stay with their base.
-   This is not the full Unicode line-breaking algorithm (Thai dictionary and
-   grapheme/emoji tailoring remain separate work). Both layout and intrinsic
-   measurement use these same items, including text inside inline elements. */
+/* ---- soft wrap opportunities within a word: css-text-4 §6 (word-break, line-break, hyphens), over the
+   Unicode line breaking classes (UAX #14) its rules tell apart. Spaces, preserved tabs and segment breaks
+   separate words (text_items); within one, a break may come only between two grapheme clusters (a
+   typographic character unit is never split), decided by their first code points and, for a hyphen, the
+   one before it. This is not the whole of UAX #14: the classes are the ranges below, Southeast Asian
+   scripts have no dictionary (§6.1.1.3's fallback breaks between their letters instead), and there is no
+   automatic hyphenation: no language has a hyphenation resource, so hyphens: auto hyphenates only where
+   soft hyphens say, as the UA "must only automatically hyphenate text for which ... it has an appropriate
+   hyphenation resource" (§6.3.1). Layout, intrinsic sizes and the text controls read the same rules. */
+struct wrap_rules {
+    uint8_t word_break, line_break; /* CSS_WORD_BREAK_*, CSS_LINE_BREAK_* as they act */
+    bool hyphens;                   /* a soft hyphen is a hyphenation opportunity */
+};
+static struct wrap_rules wrap_rules_of(const style_t *st) {
+    const struct css_text *t = css_style_text(st);
+    struct wrap_rules w = {t->word_break, t->line_break, t->hyphens != CSS_HYPHENS_NONE};
+    /* break-word is normal's (and overflow-wrap: anywhere, wrap_emergency); auto-phrase is normal's
+       without phrase analysis (§6.1); auto is the UA's choice, here normal's (§6.2) */
+    if (w.word_break == CSS_WORD_BREAK_BREAK_WORD || w.word_break == CSS_WORD_BREAK_AUTO_PHRASE)
+        w.word_break = CSS_WORD_BREAK_NORMAL;
+    if (w.line_break == CSS_LINE_BREAK_AUTO) w.line_break = CSS_LINE_BREAK_NORMAL;
+    /* break-all, anywhere: "Hyphenation is not applied" */
+    if (w.word_break == CSS_WORD_BREAK_BREAK_ALL || w.line_break == CSS_LINE_BREAK_ANYWHERE) w.hyphens = false;
+    return w;
+}
+/* overflow-wrap: break-word and anywhere (and word-break: break-word, line-break: anywhere) let an
+   otherwise unbreakable sequence break between any two grapheme clusters when it does not fit its line,
+   with no hyphen (§6.4); with min_content, those whose opportunities count for min-content sizes
+   (anywhere, and word-break: break-word, which is overflow-wrap: anywhere) */
+static bool wrap_emergency(const style_t *st, bool min_content) {
+    const struct css_text *t = css_style_text(st);
+    if (t->line_break == CSS_LINE_BREAK_ANYWHERE || t->word_break == CSS_WORD_BREAK_BREAK_WORD ||
+        t->overflow_wrap == CSS_OVERFLOW_WRAP_ANYWHERE) return true;
+    return !min_content && t->overflow_wrap == CSS_OVERFLOW_WRAP_BREAK_WORD;
+}
 static bool east_asian_letter(uint32_t c) {
     return (c>=0x3041 && c<=0x3096) || (c>=0x30a1 && c<=0x30fa) ||
            (c>=0x31f0 && c<=0x31ff) || (c>=0x3400 && c<=0x9fff) ||
@@ -1215,9 +1256,51 @@ static bool no_break_after(uint32_t c) {
     }
     return c==0x00a0 || c==0x202f || c==0x2060 || c==0xfeff || c==0x200d;
 }
+/* UAX #14 CJ: Japanese small kana and the prolonged sound mark */
+static bool small_kana(uint32_t c) {
+    switch (c) {
+    case 0x3041: case 0x3043: case 0x3045: case 0x3047: case 0x3049: case 0x3063: case 0x3083: case 0x3085:
+    case 0x3087: case 0x308e: case 0x3095: case 0x3096: case 0x30a1: case 0x30a3: case 0x30a5: case 0x30a7:
+    case 0x30a9: case 0x30c3: case 0x30e3: case 0x30e5: case 0x30e7: case 0x30ee: case 0x30f5: case 0x30f6:
+    case 0x30fc:
+        return true;
+    }
+    return (c >= 0x31f0 && c <= 0x31ff) || (c >= 0xff67 && c <= 0xff70);
+}
+/* UAX #14 IN: inseparable characters */
+static bool inseparable(uint32_t c) { return (c >= 0x2024 && c <= 0x2026) || c == 0x22ef || c == 0xfe19; }
+/* UAX #14 SA: the Southeast Asian scripts written without spaces between words */
+static bool southeast_asian(uint32_t c) {
+    return (c >= 0x0e01 && c <= 0x0e3a) || (c >= 0x0e40 && c <= 0x0e4e) || (c >= 0x0e81 && c <= 0x0ecf) ||
+           (c >= 0x0edc && c <= 0x0edf) || (c >= 0x1000 && c <= 0x103f) || (c >= 0x1050 && c <= 0x108f) ||
+           (c >= 0x109a && c <= 0x109f) || (c >= 0x1780 && c <= 0x17d3) || c == 0x17d7 || c == 0x17dc ||
+           c == 0x17dd || (c >= 0x1950 && c <= 0x1974) || (c >= 0x1980 && c <= 0x19c9) || c == 0x19da ||
+           c == 0x19de || c == 0x19df || (c >= 0x1a20 && c <= 0x1a7c) || (c >= 0x1aa0 && c <= 0x1aad) ||
+           (c >= 0xa9e0 && c <= 0xa9ef) || (c >= 0xa9fa && c <= 0xa9fe) || (c >= 0xaa60 && c <= 0xaac2) ||
+           (c >= 0xaadb && c <= 0xaadf) || (c >= 0x11700 && c <= 0x1173f);
+}
+/* a letter or digit (AL, NU and like them), what break-all and keep-all speak of */
+static bool wrap_letter(uint32_t c) { return iswalnum((wint_t)c) != 0; }
+/* UAX #14 PO and PR with East Asian Width A, F or W: no break after an ideograph before the one,
+   nor after the other before an ideograph, but in loose (§6.2) */
+static bool wide_postfix(uint32_t c) {
+    return c == 0x00b0 || c == 0x2030 || c == 0x2031 || c == 0x2032 || c == 0x2033 || c == 0x2103 || c == 0x2109 ||
+           c == 0xff05 || c == 0xffe0;
+}
+static bool wide_prefix(uint32_t c) {
+    return c == 0x00b1 || c == 0x20ac || c == 0x2116 || c == 0x2212 || c == 0xff04 || c == 0xffe1 || c == 0xffe5 ||
+           c == 0xffe6;
+}
+/* UAX #14 BA (but the soft hyphen and the tab): a break after them */
+static bool break_after(uint32_t c) {
+    return c == 0x2010 || c == 0x2012 || c == 0x2013 || c == 0x058a || c == 0x0f0b || c == 0x1680 ||
+           (c >= 0x2000 && c <= 0x2006) || (c >= 0x2008 && c <= 0x200a) || c == 0x205f || c == 0x3000;
+}
 static bool no_break_before(uint32_t c) {
+    if (small_kana(c) || inseparable(c) || break_after(c)) return true;
     switch(c) {
-    case ')': case ']': case '}': case ',': case '.': case ':': case ';': case '!': case '?':
+    case ')': case ']': case '}': case ',': case '.': case ':': case ';': case '!': case '?': case '-': case 0x00ad:
+    case 0x30fb: case 0xff65: case 0x203c: case 0x2047: case 0x2048: case 0x2049:
     case 0x2019: case 0x201d: case 0x3001: case 0x3002: case 0x3005:
     case 0x3009: case 0x300b: case 0x300d: case 0x300f: case 0x3011:
     case 0x3015: case 0x3017: case 0x3019: case 0x301b: case 0x303b:
@@ -1238,14 +1321,82 @@ static bool no_break_before(uint32_t c) {
            (c>=0xe0100 && c<=0xe01ef) || c==0x3099 || c==0x309a ||
            c==0x00a0 || c==0x202f || c==0x2060 || c==0xfeff || c==0x200d;
 }
-static bool east_asian_break(uint32_t left,uint32_t right) {
-    return (east_asian_letter(left) || east_asian_letter(right)) &&
-           !no_break_after(left) && !no_break_before(right);
+/* the breaks loose allows that normal forbids before c (§6.2): before small kana and the prolonged
+   sound mark, iteration marks, between inseparables, and after an ideograph (after_id) before the
+   hyphens U+2010 and U+2013 and the centered punctuation of Chinese and Japanese text */
+static bool loose_break_before(uint32_t left, uint32_t c, bool after_id) {
+    if (small_kana(c) || c == 0x3005 || c == 0x303b || c == 0x309d || c == 0x309e || c == 0x30fd || c == 0x30fe)
+        return true;
+    if (inseparable(c)) return inseparable(left);
+    switch (c) {
+    case 0x2010: case 0x2013: case 0x30fb: case 0xff1a: case 0xff1b: case 0xff65: case 0x203c: case 0x2047:
+    case 0x2048: case 0x2049: case 0xff01: case 0xff1f:
+        return after_id;
+    }
+    return false;
+}
+enum { WRAP_NONE, WRAP_SOFT, WRAP_HYPHEN };
+/* Whether a word may break between grapheme clusters starting with left and right (prev: the one
+   before left, 0 at the word's start): WRAP_SOFT, WRAP_HYPHEN where it is a hyphenation opportunity
+   (after a soft hyphen, hyphens not none), or WRAP_NONE. */
+static int wrap_between(const struct wrap_rules *w, uint32_t prev, uint32_t left, uint32_t right) {
+    bool all = w->word_break == CSS_WORD_BREAK_BREAK_ALL;
+    if (w->line_break == CSS_LINE_BREAK_ANYWHERE) return WRAP_SOFT; /* around every typographic character unit */
+    if (left < 0x80 && right < 0x80 && !all && wrap_letter(left) && wrap_letter(right)) return WRAP_NONE;
+    if (right == 0x200b || right == 0x00ad) return WRAP_NONE; /* LB7 × ZW, LB21 × BA */
+    if (left == 0x200b) return WRAP_SOFT;                     /* LB8 ZW ÷ */
+    if (left == 0x00ad) {
+        if (w->hyphens) return WRAP_HYPHEN;
+        left = prev; prev = 0; /* hyphens: none: the soft hyphen is no opportunity, nor in the way */
+    }
+    bool loose = w->line_break == CSS_LINE_BREAK_LOOSE;
+    /* break-all: letters, digits and Southeast Asian letters are instead treated as ID */
+    bool left_id = east_asian_letter(left) || (all && (wrap_letter(left) || southeast_asian(left)));
+    bool right_id = east_asian_letter(right) || (all && (wrap_letter(right) || southeast_asian(right)));
+    if (no_break_after(left)) return WRAP_NONE;
+    if (no_break_before(right) && !(loose && loose_break_before(left, right, left_id))) return WRAP_NONE;
+    if (!loose && ((left_id && wide_postfix(right)) || (wide_prefix(left) && right_id))) return WRAP_NONE;
+    if (southeast_asian(left) && southeast_asian(right)) /* §6.1.1.3; manual: the author marks them */
+        return w->word_break == CSS_WORD_BREAK_MANUAL ? WRAP_NONE : WRAP_SOFT;
+    if (w->word_break == CSS_WORD_BREAK_KEEP_ALL && (east_asian_letter(left) || wrap_letter(left)) &&
+        (east_asian_letter(right) || wrap_letter(right))) return WRAP_NONE; /* between letter units */
+    if (left == 0x2014 || right == 0x2014) return left == right ? WRAP_NONE : WRAP_SOFT; /* B2, LB17 */
+    /* after HH (U+2010) and HY (U+002D) a line may break (LB21 forbids it only before them), but not
+       after a word-initial one before a letter (LB20a), nor after a hyphen-minus before a digit, the sign
+       or a part of a number (LB25 HY × NU) */
+    if (left == 0x2010 || left == '-') {
+        if (!prev && wrap_letter(right)) return WRAP_NONE;
+        return left == '-' && iswdigit((wint_t)right) ? WRAP_NONE : WRAP_SOFT;
+    }
+    if (break_after(left)) return WRAP_SOFT;
+    /* strict forbids what normal allows before the CJK hyphen-like 〜 and ゠ */
+    if (w->line_break == CSS_LINE_BREAK_STRICT && (right == 0x301c || right == 0x30a0)) return WRAP_NONE;
+    return left_id || right_id ? WRAP_SOFT : WRAP_NONE;
 }
 
+/* The advance of a preserved tab of st x after the start content edge of its nearest block container,
+   whose style is block (css-text-4 §4.1.3): to the next tab stop, a multiple of tab-size from that
+   edge, at least 0.5ch on; tab-size 0: no advance. */
+static float tab_advance(const style_t *st, const style_t *block, float x) {
+    wfont bf = style_font(block);
+    float interval = css_tab_interval(st, text_width_uncached(block, &bf, " ", 1));
+    if (!(interval > 0) || !isfinite(x)) return 0;
+    wfont f = style_font(st);
+    float half_ch = wf_width(&f, "0", 1) / 2, stop = ceilf((x + half_ch) / interval) * interval;
+    if (stop <= x) stop += interval;
+    float advance = stop - x;
+    return isfinite(advance) && advance > 0 ? advance : 0;
+}
 static float control_tab_width(const style_t *st, const wfont *font, float x) {
-    float stop = 8 * text_width_uncached(st, font, " ", 1);
-    return stop > 0 ? stop - fmodf(fmaxf_(0, x), stop) : 0;
+    (void)font;
+    return tab_advance(st, st, x);
+}
+const char *layout_hyphen_string(const style_t *st) {
+    const char *string = css_style_text(st)->hyphenate_character;
+    if (string) return string;
+    wfont f = style_font(st);
+    font_t *face = wf_face(&f, 0x2010);
+    return face && font_has_primary(face, 0x2010) ? "\xe2\x80\x90" : "-";
 }
 float control_text_width(const style_t *st, const char *s, size_t n) {
     wfont font = style_font(st);
@@ -1269,13 +1420,14 @@ bool control_text_lines(const box_t *b, const style_t *st, const char *text,
                         control_text_line_fn visit, void *opaque, float *width, float *height) {
     if (!b || !st || !text || !width || !height) return false;
     bool soft = st->white_space != WS_PRE && st->white_space != WS_NOWRAP;
+    struct wrap_rules rules = wrap_rules_of(st);
     wfont font = style_font(st);
     float limit = fmaxf_(0, b->w), lh = style_line_height(st), top = 0, widest = 0;
     size_t length = strlen(text), first = 0, work = 0;
     for (;;) {
         size_t at = first, end = first, next = first, opportunity = first;
         float used = 0, opportunity_width = 0;
-        uint32_t previous = 0;
+        uint32_t previous = 0, before = 0;
         bool hard = false;
         while (at < length) {
             if (!(work++ & 63) && b->node) {
@@ -1287,7 +1439,8 @@ bool control_text_lines(const box_t *b, const style_t *st, const char *text,
             size_t after = wf_grapheme_next(text, length, at);
             uint32_t cp; wf_grapheme_decode(text + at, after - at, &cp);
             if (cp == '\n' || cp == '\r') { end = at; next = after; hard = true; break; }
-            if (soft && at > first && east_asian_break(previous, cp)) {
+            if (soft && at > first && previous != ' ' && previous != '\t' && cp != ' ' && cp != '\t' &&
+                wrap_between(&rules, before, previous, cp)) {
                 opportunity = at; opportunity_width = used;
             }
             float advance = cp == '\t' ? control_tab_width(st, &font, used) :
@@ -1300,8 +1453,9 @@ bool control_text_lines(const box_t *b, const style_t *st, const char *text,
                 if (opportunity > first) used = opportunity_width;
                 break;
             }
-            used += advance; at = after; end = next = at; previous = cp;
-            if (soft && (cp == ' ' || cp == '\t' || cp == '-')) {
+            used += advance; at = after; end = next = at;
+            before = cp == ' ' || cp == '\t' ? 0 : previous; previous = cp;
+            if (soft && (cp == ' ' || cp == '\t')) {
                 opportunity = at; opportunity_width = used;
             }
         }
@@ -1315,55 +1469,169 @@ bool control_text_lines(const box_t *b, const style_t *st, const char *text,
     *width = widest; *height = top; return true;
 }
 
+/* An item's line may end at its soft hyphen, the advance of the hyphen shown then (css-text-4 §6.3). */
+static void item_hyphen(struct ibuild *s, struct item *it, const style_t *st) {
+    wfont f = style_font(st);
+    const char *hyphen = layout_hyphen_string(st);
+    it->hyphen = true;
+    it->hw = text_width(st, &f, hyphen, strlen(hyphen));
+    const int32_t *limit = css_style_text(st)->hyphenate_limit_chars;
+    if (limit[0] != CSS_TEXT_AUTO || limit[1] != CSS_TEXT_AUTO || limit[2] != CSS_TEXT_AUTO) s->hyphen_limits = true;
+}
+/* The word in progress ends: what follows starts a new one. */
+static void word_end(struct ibuild *s) { s->word_item = 0; s->word_prev = s->word_left = 0; }
+
 static void text_items(box_t *t, struct ibuild *s) {
     style_t *st = t->st;
     wfont f = style_font(st);
     int ws = st->white_space;
     bool collapse = ws == WS_NORMAL || ws == WS_NOWRAP || ws == WS_PRE_LINE;
     bool wrap = ws != WS_NOWRAP && ws != WS_PRE;
-    const char *p = t->text, *e = p + t->len;
-    while (p < e) {
-        if (*p == '\n') {
+    struct wrap_rules rules = wrap_rules_of(st);
+    const char *text = t->text;
+    size_t at = 0, length = t->len;
+    while (at < length) {
+        char c = text[at];
+        if (c == '\n') {
             struct item *it = ipush(s->v, IT_BR);
             it->st = st;
             it->box = t;
             s->last_space = true;
-            p++;
+            word_end(s);
+            at++;
             continue;
         }
-        if (collapse && *p == ' ' && s->last_space) {
-            p++;
+        if (collapse && c == ' ' && s->last_space) {
+            at++;
             continue;
         }
-        const char *we = p;
-        bool soft=false;
-        while (we < e && *we != ' ' && *we != '\n') {
-            uint32_t left,right;
-            int bytes=gfx_utf8_decode(we,&left);
-            if(bytes<1)bytes=1;
-            if(bytes>e-we)bytes=(int)(e-we);
-            const char *next=we+bytes;
-            if(wrap && next<e && *next!=' ' && *next!='\n') {
-                gfx_utf8_decode(next,&right);
-                if(east_asian_break(left,right)){we=next;soft=true;break;}
+        if (c == '\t') {
+            /* a preserved tab (white-space processing made the others spaces): a word of its own,
+               with a soft wrap opportunity after it where lines wrap; its advance is its line's */
+            struct item *it = ipush(s->v, IT_TEXT);
+            it->box = t;
+            it->st = st;
+            it->s = text + at;
+            it->n = 1;
+            it->tab = true;
+            it->brk = wrap;
+            it->link = s->link;
+            it->shift = s->shift;
+            s->last_space = false;
+            word_end(s);
+            at++;
+            continue;
+        }
+        /* The word continuing from an earlier inline box may break before this box's text: the
+           break goes after the inline boxes the word's last item is the last content of. The
+           white-space of the two characters' nearest common ancestor decides (css-text-3 §5). */
+        if (s->word_item && s->word_left && c != ' ') {
+            uint32_t right;
+            wf_grapheme_decode(text + at, length - at, &right);
+            struct item *last = &s->v->v[s->word_item - 1];
+            const box_t *common = NULL;
+            for (const box_t *x = last->box; x && !common; x = x->parent)
+                for (const box_t *y = t; y; y = y->parent) if (x == y) { common = x; break; }
+            int common_ws = common ? common->st->white_space : st->white_space;
+            /* a soft hyphen ending the earlier box is an opportunity by its own hyphens */
+            struct wrap_rules across = rules;
+            if (s->word_left == 0x00ad) across.hyphens = wrap_rules_of(last->st).hyphens;
+            int kind = common_ws != WS_NOWRAP && common_ws != WS_PRE ?
+                       wrap_between(&across, s->word_prev, s->word_left, right) : WRAP_NONE;
+            if (kind) {
+                /* out-of-flow boxes in between go to the next line with it */
+                int k = s->v->n - 1;
+                while (k > s->word_item - 1 &&
+                       (s->v->v[k].kind == IT_OPEN || s->v->v[k].kind == IT_ABS || s->v->v[k].kind == IT_FLOAT)) k--;
+                struct item *end = &s->v->v[k];
+                end->brk = true;
+                if (kind == WRAP_HYPHEN) item_hyphen(s, end, last->st);
             }
-            we=next;
         }
-        const char *se = we;
-        while (se < e && *se == ' ') se++;
+        size_t start = at, end = at;
+        int kind = WRAP_NONE;
+        uint32_t prev = s->word_item ? s->word_prev : 0, left = s->word_item ? s->word_left : 0;
+        while (end < length && text[end] != ' ' && text[end] != '\n' && text[end] != '\t') {
+            size_t next = wf_grapheme_next(text, length, end);
+            uint32_t cp;
+            wf_grapheme_decode(text + end, next - end, &cp);
+            if (wrap && end > start && (kind = wrap_between(&rules, prev, left, cp))) break;
+            prev = left; left = cp; end = next;
+        }
+        size_t spaces = end;
+        if (!kind) while (spaces < length && text[spaces] == ' ') spaces++;
         struct item *it = ipush(s->v, IT_TEXT);
         it->box = t;
         it->st = st;
-        it->s = p;
-        it->n = (int)(se - p);
-        it->sw = se > we ? text_width(st, &f, we, (size_t)(se - we)) : 0;
-        it->w = text_width(st, &f, p, (size_t)(we - p)) + it->sw;
-        it->space_end = se > we;
-        it->brk = wrap && (se > we || soft);
+        it->s = text + start;
+        it->n = (int)(spaces - start);
+        it->sw = spaces > end ? text_width(st, &f, text + end, spaces - end) : 0;
+        it->w = text_width(st, &f, text + start, end - start) + it->sw;
+        it->space_end = spaces > end;
+        it->brk = wrap && (spaces > end || kind);
+        if (kind == WRAP_HYPHEN) item_hyphen(s, it, st);
         it->link = s->link;
         it->shift = s->shift;
-        s->last_space = se > we;
-        p = se;
+        s->last_space = spaces > end;
+        if (spaces > end || (end < length && text[end] != ' ')) {
+            if (spaces > end || text[end] == '\n' || text[end] == '\t') word_end(s);
+            else { s->word_item = s->v->n; s->word_prev = prev; s->word_left = left; }
+        } else {
+            /* the box's text ends inside a word, which the next box's text may continue */
+            s->word_item = s->v->n; s->word_prev = prev; s->word_left = left;
+        }
+        at = spaces;
+    }
+}
+
+/* hyphenate-limit-chars (css-text-4 §6.3.4): a word with fewer letters than its first value, or fewer
+   before or after the hyphen than its second or third, is not hyphenated there. Combining marks and
+   punctuation do not count; a grapheme cluster counts once. auto is the UA's choice: for a word the
+   author hyphenated with soft hyphens, no minimum. A word spans inline boxes (§6.3.1), so this reads
+   the items of the whole formatting context, after they are built. */
+static size_t word_letters(const char *s, size_t n) {
+    size_t letters = 0;
+    for (size_t at = 0; at < n;) {
+        size_t next = wf_grapheme_next(s, n, at);
+        uint32_t cp;
+        wf_grapheme_decode(s + at, next - at, &cp);
+        if (cp != ' ' && cp != 0x00ad && cp != 0x200b && !iswpunct((wint_t)cp)) letters++;
+        at = next;
+    }
+    return letters;
+}
+static size_t item_letters(const struct item *it) {
+    return it->kind == IT_TEXT && !it->tab && it->s ? word_letters(it->s, (size_t)it->n) : 0;
+}
+static bool word_item(const struct item *it) {
+    return it->kind == IT_TEXT || it->kind == IT_OPEN || it->kind == IT_CLOSE || it->kind == IT_FLOAT || it->kind == IT_ABS;
+}
+static void hyphen_limits(struct ivec *v) {
+    for (int i = 0; i < v->n; i++) {
+        struct item *it = &v->v[i];
+        if (!it->hyphen) continue;
+        int text = i; /* the item whose soft hyphen it is */
+        while (text > 0 && v->v[text].kind == IT_CLOSE) text--;
+        const int32_t *limit = css_style_text(v->v[text].st)->hyphenate_limit_chars;
+        if (limit[0] == CSS_TEXT_AUTO && limit[1] == CSS_TEXT_AUTO && limit[2] == CSS_TEXT_AUTO) continue;
+        size_t before = 0, after = 0;
+        for (int k = text; k >= 0 && word_item(&v->v[k]); k--) {
+            if (k < text && v->v[k].space_end) break;
+            if (v->v[k].tab) break;
+            before += item_letters(&v->v[k]);
+        }
+        for (int k = text + 1; k < v->n && word_item(&v->v[k]); k++) {
+            if (v->v[k].tab) break;
+            after += item_letters(&v->v[k]);
+            if (v->v[k].space_end) break;
+        }
+        if ((limit[0] != CSS_TEXT_AUTO && before + after < (size_t)limit[0]) ||
+            (limit[1] != CSS_TEXT_AUTO && before < (size_t)limit[1]) ||
+            (limit[2] != CSS_TEXT_AUTO && after < (size_t)limit[2])) {
+            it->hyphen = false; it->hw = 0;
+            /* not a hyphenation opportunity, nor any other: the word stays whole there */
+            if (!it->space_end) it->brk = false;
+        }
     }
 }
 
@@ -1387,6 +1655,7 @@ static void build_items(box_t *parent, struct ibuild *s) {
         case B_TEXT: text_items(c, s); break;
         case B_BR: {
             bool soft = c->node && c->node->tag == T_wbr;
+            word_end(s);
             struct item *it = ipush(s->v, soft ? IT_WBR : IT_BR);
             it->box = c;
             it->st = c->st;
@@ -1405,7 +1674,7 @@ static void build_items(box_t *parent, struct ibuild *s) {
             node_t *save_link = s->link;
             float save_shift = s->shift;
             if (c->node && c->node->tag == T_a && node_attr(c->node, "href")) s->link = c->node;
-            s->shift += va_shift(c->st);
+            s->shift += css_style_baseline_shift(c->st);
             if (c->st->position == POS_RELATIVE) {
                 if (!len_auto(&c->st->inset[0])) s->shift -= len_resolve(&c->st->inset[0], 0);
                 else if (!len_auto(&c->st->inset[2])) s->shift += len_resolve(&c->st->inset[2], 0);
@@ -1427,11 +1696,12 @@ static void build_items(box_t *parent, struct ibuild *s) {
             break;
         }
         default: {
+            word_end(s);
             struct item *it = ipush(s->v, IT_ATOMIC);
             it->box = c;
             it->st = c->st;
             it->link = s->link;
-            it->shift = s->shift + va_shift(c->st);
+            it->shift = s->shift + css_style_baseline_shift(c->st);
             /* CSS Text 3 §5.1: a soft wrap opportunity before and after an atomic inline,
                allowed by the white-space of the nearest common ancestor of the atomic and its
                neighbour. Its own white-space only governs its contents. */
@@ -1479,6 +1749,7 @@ struct iline {
     float strut_lh;
     int *pending_floats;
     int npending;
+    int hyphenated; /* successive lines just finished that ended at a soft hyphen */
 };
 
 static void place_float(box_t *c, box_t *parent, struct bfc *f, float ox, float oy, float y_rel, float cbh);
@@ -1586,7 +1857,16 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
         }
         if (v[i].kind == IT_ATOMIC) break;
     }
-    float W = 0;
+    /* a soft wrap break at a soft hyphen shows the hyphen after it (css-text-4 §6.3): the run of the
+       text item it ends, before any inline boxes ending there */
+    int hyphen_at = -1;
+    float hyphen_w = 0;
+    if (!forced && le > ls && v[le - 1].hyphen) {
+        int k = le - 1;
+        while (k > ls && v[k].kind == IT_CLOSE) k--;
+        if (v[k].kind == IT_TEXT) { hyphen_at = k; hyphen_w = v[le - 1].hw; }
+    }
+    float W = hyphen_w;
     int spaces = 0;
     bool content = false;
     for (int i = ls; i < le; i++) {
@@ -1682,7 +1962,8 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
                 w -= it->sw;
                 while (n > 0 && it->s[n - 1] == ' ') n--;
             }
-            struct run r = {x, baseline - it->shift, w, it->s, n, it->st, it->link, NULL, false,
+            if (i == hyphen_at) w += hyphen_w;
+            struct run r = {x, baseline - it->shift, w, it->s, n, it->st, it->link, NULL, false, i == hyphen_at,
                             it->box ? it->box->node : NULL, it->box ? it->box->inline_paint_owner : NULL, -1, it->descent, 0, 0};
             if (n > 0) {
                 int index = (int)(L->runs.n / sizeof r);
@@ -1706,7 +1987,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
             c->cb = b;
             c->x = x + c->m[3] + c->b[3] + c->p[3];
             c->y = top + c->m[0] + c->b[0] + c->p[0];
-            struct run r = {x, top, it->w, NULL, 0, it->st, it->link, c, false, c->node, c->inline_paint_owner, -1, 0, 0, 0};
+            struct run r = {x, top, it->w, NULL, 0, it->st, it->link, c, false, false, c->node, c->inline_paint_owner, -1, 0, 0, 0};
             sb_put(&L->runs, (const char *)&r, sizeof r);
             x += it->w;
             break;
@@ -1727,6 +2008,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
         if (L->first_bl < 0) L->first_bl = baseline;
         L->last_bl = baseline;
         L->first_line = false;
+        L->hyphenated = hyphen_at >= 0 ? L->hyphenated + 1 : 0;
         if (layout_current()->clamp_depth || b->st->text_overflow == TO_ELLIPSIS) {
             struct line_fragment line = {first_run, (int)(L->runs.n / sizeof(struct run)),
                 first_deco, (int)(L->decos.n / sizeof(struct deco)),
@@ -1745,7 +2027,8 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
     line_space(L);
 }
 
-/* split a too-long word over lines at character boundaries */
+/* overflow-wrap's emergency break (wrap_emergency): a too-long word over lines between grapheme
+   clusters, with no hyphen */
 static int split_word(struct iline *L, int i, float avail) {
     struct ivec *iv = L->items;
     struct item it = iv->v[i];
@@ -1753,12 +2036,11 @@ static int split_word(struct iline *L, int i, float avail) {
     int k = 0;
     float w = 0;
     while (k < it.n) {
-        int cl = 1;
-        while (k + cl < it.n && ((unsigned char)it.s[k + cl] & 0xC0) == 0x80) cl++;
-        float cw = text_width(it.st, &f, it.s + k, (size_t)cl);
+        int next = (int)wf_grapheme_next(it.s, (size_t)it.n, (size_t)k);
+        float cw = text_width(it.st, &f, it.s + k, (size_t)(next - k));
         if (w + cw > avail && k > 0) break;
         w += cw;
-        k += cl;
+        k = next;
     }
     if (k >= it.n) return 0;
     /* the item becomes two: the part that fits, and the rest */
@@ -1776,10 +2058,24 @@ static int split_word(struct iline *L, int i, float avail) {
     a->sw = 0;
     a->space_end = false;
     a->brk = true;
+    a->hyphen = false;
+    a->hw = 0;
     b->s = it.s + k;
     b->n = it.n - k;
     b->w = it.w - w;
     return 1;
+}
+
+/* The width of the chunk of items from..to starting the current line: its tabs reach this line's stops. */
+static float chunk_tab_width(struct iline *L, int from, int to) {
+    float w = 0;
+    for (int k = from; k <= to; k++) {
+        struct item *it = &L->items->v[k];
+        if (it->kind == IT_FLOAT || it->kind == IT_ABS) continue;
+        if (it->tab) it->w = tab_advance(it->st, L->blk->st, L->left + w);
+        w += it->w;
+    }
+    return w;
 }
 
 static node_t *inline_link_ancestor(const box_t *b) {
@@ -1797,6 +2093,7 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
     struct ibuild bs = {&iv, true, NULL, 0, NULL, true};
     bs.link=inline_link_ancestor(b);
     build_items(b, &bs);
+    if (bs.hyphen_limits) hyphen_limits(&iv);
     /* widths of inline box edges and atomic inlines */
     for (int i = 0; i < iv.n; i++) {
         struct item *it = &iv.v[i];
@@ -1840,10 +2137,20 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
     line_space(&L);
     int ls = 0, cs = 0;
     float line_w = 0, chunk_w = 0;
+    bool chunk_tabs = false;
+    /* the chunk holds a soft hyphen opportunity (hyphenate-limit-lines decides it by the line it ends),
+       or a float */
+    bool chunk_hyphens = false, chunk_floats = false;
+    /* hyphenate-limit-lines (css-text-4 §6.3.5), of the block container */
+    int32_t hyphen_lines = css_style_text(b->st)->hyphenate_limit_lines;
+    /* the last item in the flow: out-of-flow boxes after it end no chunk */
+    int last = iv.n - 1;
+    while (last >= 0 && (iv.v[last].kind == IT_ABS || iv.v[last].kind == IT_FLOAT)) last--;
     for (int i = 0; i < iv.n; i++) {
         struct item *it = &iv.v[i];
         if (it->kind == IT_FLOAT) {
             box_t *c = it->box;
+            chunk_floats = true;
             if (line_w == 0 && chunk_w == 0) {
                 place_float(c, b, f, ox, oy, L.y, cbh);
                 line_space(&L);
@@ -1859,45 +2166,67 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
             continue;
         }
         if (it->kind == IT_ABS) continue;
+        if (it->tab) {
+            /* tab stops are measured from the block container's start content edge */
+            it->w = tab_advance(it->st, b->st, L.left + line_w + chunk_w);
+            chunk_tabs = true;
+        }
         chunk_w += it->w;
-        bool end = it->kind == IT_BR || it->brk || i == iv.n - 1;
+        /* a soft hyphen's opportunity, unless hyphenate-limit-lines lines ended at one just before */
+        bool usable = it->brk && !(it->hyphen && hyphen_lines != CSS_TEXT_AUTO && L.hyphenated >= hyphen_lines);
+        if (it->brk && it->hyphen && hyphen_lines != CSS_TEXT_AUTO) chunk_hyphens = true;
+        bool end = it->kind == IT_BR || usable || i == last;
         if (!end) continue;
-        /* commit the chunk cs..i */
-        float trim = it->space_end ? it->sw : 0;
+        /* commit the chunk cs..i; ending a line at a soft hyphen adds the hyphen */
+        float trim = it->space_end ? it->sw : 0, hyphen = usable && it->hyphen && i < last ? it->hw : 0;
         float avail = L.right - L.left;
-        if (line_w > 0 && line_w + chunk_w - trim > avail + LAYOUT_FIT_SLOP) {
+        if (line_w > 0 && line_w + chunk_w - trim + hyphen > avail + LAYOUT_FIT_SLOP) {
             finish_line(&L, ls, cs, false);
             ls = cs;
             line_w = 0;
             avail = L.right - L.left;
+            if (chunk_hyphens && !chunk_floats) {
+                /* its soft hyphens were weighed against the line just finished: weigh them again
+                   against the line they are now on (a line starting with the chunk ends no line
+                   before it, so this happens once a line) */
+                i = cs - 1;
+                chunk_w = 0;
+                chunk_tabs = chunk_hyphens = false;
+                continue;
+            }
+            if (chunk_tabs) chunk_w = chunk_tab_width(&L, cs, i);
         }
-        if (line_w == 0 && chunk_w - trim > avail + LAYOUT_FIT_SLOP) {
+        if (line_w == 0 && chunk_w - trim + hyphen > avail + LAYOUT_FIT_SLOP) {
             /* move below floats if they are what makes it too narrow */
             float y = L.y;
-            while (L.right - L.left < chunk_w - trim && L.f) {
+            while (L.right - L.left < chunk_w - trim + hyphen && L.f) {
                 float nb = bfc_next(L.f, L.oy + y);
                 if (nb < 0) break;
                 y = nb - L.oy;
                 L.y = y;
                 line_space(&L);
+                if (chunk_tabs) chunk_w = chunk_tab_width(&L, cs, i);
             }
             avail = L.right - L.left;
             int st_ws = iv.v[cs].kind == IT_TEXT ? iv.v[cs].st->white_space : WS_PRE;
-            if (chunk_w - trim > avail + LAYOUT_FIT_SLOP && cs == i && it->kind == IT_TEXT && st_ws != WS_NOWRAP && st_ws != WS_PRE &&
-                avail > 0) {
+            if (chunk_w - trim > avail + LAYOUT_FIT_SLOP && cs == i && it->kind == IT_TEXT && !it->tab &&
+                st_ws != WS_NOWRAP && st_ws != WS_PRE && avail > 0 && wrap_emergency(it->st, false)) {
                 if (split_word(&L, i, avail)) {
+                    last++; /* the rest is a new item after i */
                     it = &iv.v[i];
                     chunk_w = it->w;
                     line_w = chunk_w;
                     finish_line(&L, ls, i + 1, false);
                     ls = cs = i + 1;
                     line_w = chunk_w = 0;
+                    chunk_tabs = chunk_hyphens = chunk_floats = false;
                     continue; /* the rest is item i+1 */
                 }
             }
         }
         line_w += chunk_w;
         chunk_w = 0;
+        chunk_tabs = chunk_hyphens = chunk_floats = false;
         cs = i + 1;
         if (it->kind == IT_BR) {
             finish_line(&L, ls, i + 1, true);
@@ -4374,27 +4703,65 @@ static void layout_grid(box_t *b, float defh) {
 }
 
 /* ---------------------------------------------------------------- intrinsic sizes */
+/* The advances of the first, the widest and the last grapheme cluster of a text item's word. */
+static void item_clusters(const struct item *it, float *first, float *widest, float *last) {
+    wfont f = style_font(it->st);
+    size_t n = (size_t)it->n;
+    while (n > 0 && it->s[n - 1] == ' ') n--;
+    *first = *widest = *last = 0;
+    for (size_t at = 0; at < n;) {
+        size_t next = wf_grapheme_next(it->s, n, at);
+        float w = text_width(it->st, &f, it->s + at, next - at);
+        if (!at) *first = w;
+        *widest = fmaxf_(*widest, w);
+        *last = w;
+        at = next;
+    }
+}
+
 static void inline_intrinsic(box_t *b, float *mn, float *mx) {
     struct ivec iv = {0};
     struct ibuild bs = {&iv, true, NULL, 0, NULL, false};
     build_items(b, &bs);
+    if (bs.hyphen_limits) hyphen_limits(&iv);
     float line = 0, chunk = 0;
     *mn = *mx = 0;
+    int flow_end = iv.n - 1; /* the last item in the flow */
+    while (flow_end >= 0 && (iv.v[flow_end].kind == IT_ABS || iv.v[flow_end].kind == IT_FLOAT)) flow_end--;
     for (int i = 0; i < iv.n; i++) {
         struct item *it = &iv.v[i];
         switch (it->kind) {
-        case IT_TEXT:
-            chunk += it->w;
-            line += it->w;
-            if (it->brk || i == iv.n - 1) {
-                *mn = fmaxf_(*mn, chunk - (it->space_end ? it->sw : 0));
+        case IT_TEXT: {
+            int ws = it->st->white_space;
+            if (it->tab) {
+                /* at its place in the unbroken line, and in the min-content line it is in */
+                line += tab_advance(it->st, b->st, line);
+                chunk += tab_advance(it->st, b->st, chunk);
+            } else if (ws != WS_NOWRAP && ws != WS_PRE && wrap_emergency(it->st, true)) {
+                /* its every grapheme cluster boundary is a soft wrap opportunity for min-content */
+                float first, widest, last;
+                item_clusters(it, &first, &widest, &last);
+                *mn = fmaxf_(*mn, fmaxf_(chunk + first, widest)); /* the part before stays with the first */
+                chunk = last + it->sw;
+                line += it->w;
+            } else {
+                chunk += it->w;
+                line += it->w;
+            }
+            if (it->brk || i == flow_end) {
+                *mn = fmaxf_(*mn, chunk - (it->space_end ? it->sw : 0) + (it->hyphen && it->brk && i < flow_end ? it->hw : 0));
                 chunk = 0;
             }
             break;
+        }
         case IT_OPEN: case IT_CLOSE: {
             float w = inline_edge(it->box, it->kind == IT_OPEN, 0);
             chunk += w;
             line += w;
+            if (it->brk) {
+                *mn = fmaxf_(*mn, chunk + (it->hyphen ? it->hw : 0));
+                chunk = 0;
+            }
             break;
         }
         case IT_ATOMIC: {
@@ -4741,6 +5108,7 @@ static void clamp_apply(box_t *root) {
         if (r->x + r->w > edge) {
             if (r->atomic) break;
             r->n = clamp_prefix(r, edge - r->x, &r->w);
+            r->hyphen = false; /* cut before its end, where the hyphen was */
             if (r->n) { x = r->x + r->w; end = i + 1; }
             break;
         }
@@ -4753,7 +5121,7 @@ static void clamp_apply(box_t *root) {
     struct run *runs = ar_alloc(&b->layout_mem, ((size_t)end + 1) * sizeof *runs);
     if (end) memcpy(runs, b->runs, (size_t)end * sizeof *runs);
     runs[end] = (struct run){x, line->baseline, ellipsis_width, clamp_ellipsis,
-        sizeof clamp_ellipsis - 1, b->st, NULL, NULL, false, NULL, NULL, -1, 0, 0, 0};
+        sizeof clamp_ellipsis - 1, b->st, NULL, NULL, false, false, NULL, NULL, -1, 0, 0, 0};
     float ellipsis_ascent;
     wf_metrics(&font, &ellipsis_ascent, &runs[end].descent);
     b->layout_mem.trap = previous_trap;

@@ -193,6 +193,12 @@ bool web_doc_fully_active(web_doc *d) {
     }
     return true;
 }
+void web_user_activation_consume(web_doc *d) {
+    if(!d)return;
+    web_doc *top=d;while(top->frame_parent)top=top->frame_parent;
+    top->sandbox_activation_until=0;
+    for(struct web_frame *f=top->frames;f;f=web_frame_walk_next(top,f,true))if(f->document)f->document->sandbox_activation_until=0;
+}
 bool web_sandbox_forms_allowed(web_doc *d) {
     return d && !(d->sandbox_flags&SB_FORMS) && (!d->sandbox_flags || web_doc_fully_active(d));
 }

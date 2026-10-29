@@ -1062,6 +1062,7 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
     /* HTML "activate history entry" (and "initialize the navigable" for a new navigable's
        first document) sets the initial visibility state to the traversable's system visibility
        state: the host's for a top-level document, the one its top document holds for a frame. */
+    if(host)d->host=*host;
     if(host && host->window_state){d->window_state=host->window_state;d->window_opaque=host->opaque;}
     if(parent){web_doc *top=parent;while(top->frame_parent)top=top->frame_parent;d->visible=top->system_visible;}
     else d->visible=d->system_visible=!d->window_state || (d->window_state(d->window_opaque)&WEB_WINDOW_VISIBLE);
@@ -1565,12 +1566,13 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
         if(!strcmp(e->type,"keydown"))focus_keyboard_input(input,e);
         else if(!strcmp(e->type,"mousedown")||!strcmp(e->type,"pointerdown"))input->focus_modality=WEB_MODALITY_POINTER;
     }
-    /* WHATWG image-button activation: capture the selected point in the
-       displayed image before click listeners can replace layout or reparent
-       it. Only an uncanceled explicit coordinate selection updates it;
-       keyboard/script activation retains the initially-zero selected point.
-       Padding/border clicks may yield negative CSS coordinates, not 0-clamped
-       bitmap pixels. No extra layout flush or mutable author getter is used. */
+    /* HTML image button: "if the user activated the control while explicitly selecting a
+       coordinate", the point in the displayed image, captured before click listeners can
+       replace layout or reparent it. The click's activation behavior (js_activation_native.h)
+       makes it the selected coordinate, only when the click is not canceled; keyboard and
+       script activation keep the initially-zero one. Padding/border clicks may yield negative
+       CSS coordinates, not 0-clamped bitmap pixels. No extra layout flush or mutable author
+       getter is used. */
     web_doc *owner=target?target->owner:NULL;bool image_point=false;int selected_x=0,selected_y=0;
     if(e&&e->type&&!strcmp(e->type,"click")&&!e->synthetic&&!e->keyboard_activation&&
        target&&target->type==N_ELEM&&!target->foreign&&target->tag==T_input&&
@@ -1592,17 +1594,19 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
     bool trace_wheel=d->profile_enabled && e && e->type && !strcmp(e->type,"wheel");
     unsigned target_tag=trace_wheel&&target?target->tag:0;
     uint64_t window_blocking=trace_wheel?(target&&target->owner?target->owner:d)->wheel_window_blocking:0;
+    node_t *saved_image=NULL;int saved_x=0,saved_y=0;
+    if(image_point){
+        saved_image=owner->image_activation;saved_x=owner->image_activation_x;saved_y=owner->image_activation_y;
+        owner->image_activation=target;owner->image_activation_x=selected_x;owner->image_activation_y=selected_y;
+    }
     bool allowed=web_js_dispatch(d,target,e);
+    if(image_point){owner->image_activation=saved_image;owner->image_activation_x=saved_x;owner->image_activation_y=saved_y;}
     if(trace_wheel) {
         char message[256];snprintf(message,sizeof message,
             "Native wheel default: allowed %d, cancelable %d, delta %.0f, tag %u, window-blocking %llu, coherent %d/ready %d, viewport %d/%d, view %d, style %d/boxes %d",
             allowed,e->cancelable,(double)e->delta_y,target_tag,(unsigned long long)window_blocking,
             scroll_input_coherent(d),web_native_input_ready(d,false),d->doc_h,d->height,d->view_y,d->need_style,d->need_boxes);
         web_js_console(d,1,message);
-    }
-    if(allowed&&image_point&&target->owner==owner&&owner->live&&
-       web_input_type(target)==WEB_INPUT_IMAGE&&web_form_owner(owner,target)){
-        target->image_submit_x=selected_x;target->image_submit_y=selected_y;
     }
     return allowed;
 }
@@ -1689,6 +1693,7 @@ static void doc_release(web_doc *d) {
     layout_cache_free(d);
     css_styles_release(d);
     css_styling_free(&d->sty);
+    css_registrations_free(&d->sty);
     web_dialog_free(d);
     web_avmedia_free(d);
     /* The frames' documents are released here, before this realm, and keep their nodes and
@@ -1950,10 +1955,39 @@ static void bg_images(web_doc *d, style_t *st) {
     }
 }
 
+/* css-images-4 §2.3.1: the option of an image-set() a 1 dppx screen shows: of those whose type() it
+   decodes, the lowest resolution not under 1x, else the highest */
+static const struct css_cursor_choice *cursor_choice(const struct css_cursor_image *im) {
+    const struct css_cursor_choice *best = NULL;
+    float best_dppx = 0;
+    for (uint32_t i = 0; i < im->count; i++) {
+        const struct css_cursor_choice *c = &im->choices[i];
+        if (c->type && !image_type_supported(c->type)) continue;
+        float r = c->dppx > 0 ? c->dppx : 1;
+        if (!best || (r >= 1 ? best_dppx < 1 || r < best_dppx : best_dppx < 1 && r > best_dppx)) { best = c; best_dppx = r; }
+    }
+    return best;
+}
+int doc_cursor_image(web_doc *d, const struct css_cursor_image *image, float *dppx) {
+    const struct css_cursor_choice *c = cursor_choice(image);
+    if (!c) return -1;
+    *dppx = c->dppx > 0 ? c->dppx : 1;
+    return add_image(d, c->url, true);
+}
+/* the images an element's cursor names are fetched as its style is known (the ones it inherits are
+   its parent's) */
+static void cursor_images(web_doc *d, const style_t *st, const style_t *parent) {
+    const struct css_cursor *cursor = &css_style_ui(st)->cursor;
+    if (!cursor->count || (parent && css_style_ui(parent)->cursor.images == cursor->images)) return;
+    float dppx;
+    for (uint32_t i = 0; i < cursor->count; i++) (void)doc_cursor_image(d, &cursor->images[i], &dppx);
+}
+
 static void register_bg(web_doc *d, node_t *n) {
     for (node_t *c = n->first; c; c = c->next) {
         if (c->type != N_ELEM || !c->style) continue;
         bg_images(d, c->style);
+        cursor_images(d, c->style, n->type == N_ELEM ? n->style : NULL);
         if (c->style->before_generated) bg_images(d, c->style->before);
         if (c->style->after_generated) bg_images(d, c->style->after);
         register_bg(d, c);
@@ -2219,6 +2253,12 @@ bool doc_element_scroll(web_doc *d, node_t *n, double x, double y) {
     if (!doc_element_scroll_metrics(d, n, NULL, NULL) || !box_element_scrollable(n->box) ||
         n == d->html) return false;
     return element_scroll_commit(d, n, n->box, x, y);
+}
+
+double doc_element_scroll_max(web_doc *d, node_t *n, int axis) {
+    if (!doc_element_scroll_metrics(d, n, NULL, NULL) || !box_element_scrollable(n->box) ||
+        n == d->html) return 0;
+    return element_scroll_limit(n->box, axis ? 1 : 0);
 }
 
 static void element_scroll_input_unqueue(node_t *n) {
@@ -2488,8 +2528,9 @@ static bool scroll_target_rect(node_t *n, double r[4]) {
 }
 
 int doc_element_scroll_into_view(web_doc *d, node_t *n, int block, int inline_, bool nearest_only,
-                                double *x, double *y, pvec *changed) {
-    if (!d || !n || !x || !y || !changed || changed->v || changed->n || changed->cap ||
+                                double *x, double *y, struct doc_scroll_target **targets, int *count_out) {
+    if (count_out) *count_out = 0;
+    if (!d || !n || !x || !y || !targets || *targets || !count_out ||
         block < DOC_SCROLL_START || block > DOC_SCROLL_NEAREST ||
         inline_ < DOC_SCROLL_START || inline_ > DOC_SCROLL_NEAREST || n->type != N_ELEM ||
         n->owner != d || !d->live || d->inert || !doc_node_connected(n) ||
@@ -2514,28 +2555,43 @@ int doc_element_scroll_into_view(web_doc *d, node_t *n, int block, int inline_, 
         }
     }
     if (!scroll_target_rect(n, target)) return 0;
+    struct doc_scroll_target *out = NULL;
+    double *from = NULL;
     if (count) {
-        if ((size_t)count > SIZE_MAX / sizeof *changed->v) return -3;
-        changed->v = malloc((size_t)count * sizeof *changed->v);
-        if (!changed->v) return -1;
-        changed->cap = count;
+        if ((size_t)count > SIZE_MAX / sizeof *out / 2) return -3;
+        out = malloc((size_t)count * sizeof *out);
+        from = malloc((size_t)count * 2 * sizeof *from);
+        if (!out || !from) { free(out); free(from); return -1; }
     }
+    int used = 0;
+    bool viewport = !fixed;
     for (box_t *a = first; a; a = a->cb) {
         if (!box_element_scrollable(a)) continue;
-        if (!scroll_target_rect(n, target)) return 1;
+        if (!scroll_target_rect(n, target)) { viewport = false; break; }
         double left = box_visual_x(a) - a->p[3], top = box_visual_y(a) - a->p[0];
         double dx = scroll_align_delta(target[0], target[0] + target[2], left, a->w + a->p[1] + a->p[3], inline_);
         double dy = scroll_align_delta(target[1], target[1] + target[3], top, a->h + a->p[0] + a->p[2], block);
-        if (doc_element_scroll(d, a->node, a->node->scroll_x + dx, a->node->scroll_y + dy))
-            changed->v[changed->n++] = a->node;
-        if (nearest_only) return 1;
+        node_t *e = a->node;
+        double old_x = e->scroll_x, old_y = e->scroll_y;
+        /* Each outer box is aligned as if this one already had its position. */
+        if (doc_element_scroll(d, e, e->scroll_x + dx, e->scroll_y + dy)) {
+            out[used] = (struct doc_scroll_target){e, e->scroll_x, e->scroll_y};
+            from[2 * used] = old_x; from[2 * used + 1] = old_y; used++;
+        }
+        if (nearest_only) { viewport = false; break; }
     }
-    if (!fixed && scroll_target_rect(n, target)) {
+    if (viewport && scroll_target_rect(n, target)) {
         /* This document's real viewport only. There is no traversal through a
            fabricated frame parent or access to a different-origin document. */
         *x += scroll_align_delta(target[0], target[0] + target[2], *x, d->width, inline_);
         *y += scroll_align_delta(target[1], target[1] + target[3], *y, d->height, block);
     }
+    /* Put every box back: performing the scrolls (and their events) is the caller's. */
+    for (int i = used; i-- > 0;) { out[i].node->scroll_x = from[2 * i]; out[i].node->scroll_y = from[2 * i + 1]; }
+    if (used) { d->visual_revision++; doc_paint_full(d); }
+    free(from);
+    if (!used) { free(out); out = NULL; }
+    *targets = out; *count_out = used;
     return 1;
 }
 
@@ -3044,14 +3100,11 @@ static bool readonly(node_t *n) {
 
 #include "control_edit.h"
 
-/* The keys go to an editing host: the document is in design mode, or its focus
-   is in an element whose contenteditable state is true or plaintext-only, below
-   no false state (HTML, "editing host", "editable"). js_document_commands.js
-   holds the definitions; this is the native reader's copy of the same walk. */
-static bool editing_focus(web_doc *d) {
+/* js_document_commands.js holds the definitions; this is the native reader's copy of the same walk. */
+bool doc_node_editable(web_doc *d, node_t *n) {
     if (!d || !d->live || d->inert) return false;
     if (d->design_mode) return true;
-    for (node_t *n = d->focus; n && n->owner == d; n = n->parent) {
+    for (; n && n->owner == d; n = n->parent) {
         if (n->type != N_ELEM) continue;
         const char *editable = node_attr(n, "contenteditable");
         if (!editable) continue;
@@ -3060,6 +3113,8 @@ static bool editing_focus(web_doc *d) {
     }
     return false;
 }
+/* The keys go to an editing host: the document's focus is editable. */
+static bool editing_focus(web_doc *d) { return d && doc_node_editable(d, d->focus); }
 /* An editing key, as the editing layer's action: an Input Events inputType, or a
    caret move (extend with Shift). The editing layer fires beforeinput and input
    and takes the action through the command execCommand runs. */

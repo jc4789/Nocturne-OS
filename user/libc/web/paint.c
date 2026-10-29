@@ -81,6 +81,8 @@ struct pctx {
     float hit_shape_x,hit_shape_y;
     const struct gfx_mask_clip *viewport_mask;
     const box_t *untransformed; /* this box's own used transform is being applied by the caller */
+    const box_t *unfiltered; /* this box's own filter, clip and opacity are being applied by the caller */
+    bool private_surface; /* a surface of a transform or filter, not the canvas the page is shown on */
     struct hit_stack *stack; /* doc_elements_at: every target the exact walk reaches, bottom first */
     /* Paint Timing, of a paint walk: it drew something other than the default
        background (first paint), and something contentful (first contentful
@@ -133,7 +135,8 @@ static bool mask_border_set(const style_t *st) {
 static bool stacking_context(const box_t *b) {
     if (!b->st || b->kind == B_TEXT || b->kind == B_BR) return false;
     /* a mask (§7.1 a mask-image layer other than none, §8.1) makes one */
-    if (b->st->filter || b->st->opacity < 1 || mask_border_set(b->st) || css_mask_layers_set(css_style_mask(b->st)) ||
+    if (b->st->filter || b->st->backdrop_filter || b->st->opacity < 1 || mask_border_set(b->st) ||
+        css_mask_layers_set(css_style_mask(b->st)) ||
         (b->kind!=B_INLINE&&css_translation_active(b->st))) return true;
     if (b->kind == B_INLINE) return false;
     /* Opacity groups are atomic even in normal flow. Fixed/sticky boxes also
@@ -723,6 +726,36 @@ static void shadow_blur_columns(size_t tile, void *opaque) {
     parallel_record_work(PARALLEL_RASTER, (uint64_t)job->height * (x1-x0));
 }
 static void shadow_service(void *opaque) { web_native_checkpoint(opaque); }
+/* A shadow's blur (css-backgrounds-3 §7.2, css-text-decor-4 §4): the separable Gaussian whose standard
+   deviation is half the blur radius, over a reach of 1.5 radii, of the width×height coverage alpha, in
+   place. Its work runs before any canvas write; false: cancelled or out of memory. */
+static bool shadow_gaussian(web_doc *doc, uint8_t *alpha, int width, int height, float blur) {
+    int extent = (int)ceil((double)blur * 1.5); size_t kernel_count = (size_t)extent*2+1;
+    size_t pitch = (size_t)width, pixels = (size_t)width * (size_t)height;
+    if (kernel_count > SIZE_MAX / sizeof(float)) return false;
+    float *kernel = malloc(kernel_count*sizeof *kernel); uint8_t *temporary = malloc(pixels);
+    uint8_t *column_same = malloc(pitch);
+    if (!kernel || !temporary || !column_same) { free(kernel); free(temporary); free(column_same); return false; }
+    double sigma = blur / 2.0, inverse = -.5 / (sigma*sigma), sum = 0;
+    for (int i = -extent; i <= extent; i++) { kernel[i+extent] = (float)exp((double)i*i*inverse); sum += kernel[i+extent]; }
+    float normalize = (float)(1/sum); for (size_t i = 0; i < kernel_count; i++) kernel[i] *= normalize;
+    struct shadow_blur_job job = {alpha,temporary,kernel,column_same,width,height,extent};
+    parallel_for_stage(PARALLEL_RASTER, ((size_t)height+31)/32, shadow_blur_rows, &job, shadow_service, doc);
+    bool success = !__atomic_load_n(&doc->native_cancelled,__ATOMIC_ACQUIRE);
+    if (success) {
+        /* Columns clear of the corners are equal after the horizontal pass;
+           the vertical pass blurs one of each run and copies it. */
+        memset(column_same, 1, pitch); column_same[0] = 0;
+        for (int py = 0; py < height; py++) {
+            const uint8_t *row = temporary + (size_t)py*pitch;
+            for (size_t px = 1; px < pitch; px++) if (row[px] != row[px-1]) column_same[px] = 0;
+        }
+        job.source = temporary; job.target = alpha;
+        parallel_for_stage(PARALLEL_RASTER, (pitch+31)/32, shadow_blur_columns, &job, shadow_service, doc);
+        success = !__atomic_load_n(&doc->native_cancelled,__ATOMIC_ACQUIRE);
+    }
+    free(kernel); free(temporary); free(column_same); return success;
+}
 static bool shadow_mask_build(web_doc *doc, struct shadow_cache *cache, struct shadow_mask *mask) {
     const struct css_box_shadow *shadow = &mask->value;
     if (!(shadow->color >> 24)) return true;
@@ -776,30 +809,7 @@ static bool shadow_mask_build(web_doc *doc, struct shadow_cache *cache, struct s
         }
     }
     if (shadow->blur <= 0) return true;
-    int extent = (int)halo; size_t kernel_count = (size_t)extent*2+1;
-    if (kernel_count > SIZE_MAX / sizeof(float)) return false;
-    float *kernel = malloc(kernel_count*sizeof *kernel); uint8_t *temporary = malloc(pixels);
-    uint8_t *column_same = malloc(pitch);
-    if (!kernel || !temporary || !column_same) { free(kernel); free(temporary); free(column_same); return false; }
-    double sigma = shadow->blur / 2.0, inverse = -.5 / (sigma*sigma), sum = 0;
-    for (int i = -extent; i <= extent; i++) { kernel[i+extent] = (float)exp((double)i*i*inverse); sum += kernel[i+extent]; }
-    float normalize = (float)(1/sum); for (size_t i = 0; i < kernel_count; i++) kernel[i] *= normalize;
-    struct shadow_blur_job job = {mask->alpha,temporary,kernel,column_same,mask->width,mask->height,extent};
-    parallel_for_stage(PARALLEL_RASTER, ((size_t)mask->height+31)/32, shadow_blur_rows, &job, shadow_service, doc);
-    bool success = !__atomic_load_n(&doc->native_cancelled,__ATOMIC_ACQUIRE);
-    if (success) {
-        /* Columns clear of the corners are equal after the horizontal pass;
-           the vertical pass blurs one of each run and copies it. */
-        memset(column_same, 1, pitch); column_same[0] = 0;
-        for (int py = 0; py < mask->height; py++) {
-            const uint8_t *row = temporary + (size_t)py*pitch;
-            for (size_t px = 1; px < pitch; px++) if (row[px] != row[px-1]) column_same[px] = 0;
-        }
-        job.source = temporary; job.target = mask->alpha;
-        parallel_for_stage(PARALLEL_RASTER, (pitch+31)/32, shadow_blur_columns, &job, shadow_service, doc);
-        success = !__atomic_load_n(&doc->native_cancelled,__ATOMIC_ACQUIRE);
-    }
-    free(kernel); free(temporary); free(column_same); return success;
+    return shadow_gaussian(doc, mask->alpha, mask->width, mask->height, shadow->blur);
 }
 static bool shadow_cache_prepare_radii(web_doc *doc, struct shadow_cache **slot, const style_t *style,
                                  float x, float y, float w, float h, const float *borders,struct border_radii radii) {
@@ -1216,7 +1226,11 @@ static void paint_corner_border(struct pctx *P,float x,float y,float w,float h,c
 static void paint_box(struct pctx *P, box_t *b, bool layer_root);
 static void inline_children(struct pctx *P, box_t *b, bool floats);
 static void paint_runs(struct pctx *P, box_t *b, box_t *scope);
-static void paint_run_text(struct pctx *P, const struct run *r, float bx, float by);
+/* What paint draws of a text run: with RUN_SHADOWS its text shadows, with RUN_TEXT the rest, bottom
+   first (css-text-decor-4 §5.1): find-in-page's highlight, underlines and overlines, the glyphs, the
+   line-throughs. A block's runs paint their shadows first, so no shadow covers a neighbour's text. */
+enum { RUN_SHADOWS = 1, RUN_TEXT = 2 };
+static void paint_run_text(struct pctx *P, const struct run *r, float bx, float by, int layers);
 static bool ink_outside(struct pctx *P, box_t *b, bool context);
 
 /* What a background is the background of: a box (its own contents are what a text clip reads), or
@@ -1403,7 +1417,7 @@ static void text_mask_runs(struct pctx *Q, box_t *b, const struct deco *deco) {
         if (r->x + r->w <= deco->x || r->x >= deco->x + deco->w || bottom <= deco->y || top >= deco->y + deco->h) continue;
         node_t *n = r->node;
         while (n && n != deco->node) n = doc_flat_parent(n);
-        if (n) paint_run_text(Q, r, bx, by);
+        if (n) paint_run_text(Q, r, bx, by, RUN_TEXT);
     }
 }
 /* css-backgrounds-4 §2.1 text: the coverage of the text the target paints, over the canvas clip as
@@ -2173,9 +2187,8 @@ static void paint_bg_border(struct pctx *P, const style_t *st, float x, float y,
 }
 
 /* ---------------------------------------------------------------- text */
-static void draw_text(struct pctx *P, const style_t *st, float x, float baseline, const char *s, int n, uint32_t color) {
+static void draw_text_on(canvas_t *c, const style_t *st, float x, float baseline, const char *s, int n, uint32_t color) {
     wfont f = style_font(st);
-    canvas_t *c = P->c;
     int bl = (int)roundf(baseline);
     if (st->letter_spacing == 0 && st->word_spacing == 0) {
         wf_draw(c, &f, x, bl, s, (size_t)n, color);
@@ -2189,15 +2202,205 @@ static void draw_text(struct pctx *P, const style_t *st, float x, float baseline
         i += cl;
     }
 }
+static void draw_text(struct pctx *P, const style_t *st, float x, float baseline, const char *s, int n, uint32_t color) {
+    draw_text_on(P->c, st, x, baseline, s, n, color);
+}
 
-static void paint_run_text(struct pctx *P, const struct run *r, float bx, float by) {
+/* A run's glyphs at (x, its baseline): its text, and the hyphen a line broken at its soft hyphen shows
+   at its end (css-text-4 §6.3.2); a preserved tab is an advance with no glyph. */
+static void run_glyphs(canvas_t *c, const struct run *r, float x, float base, uint32_t color) {
+    if (r->n == 1 && r->s[0] == '\t') return;
+    draw_text_on(c, r->st, x, base, r->s, r->n, color);
+    if (!r->hyphen) return;
+    const char *hyphen = layout_hyphen_string(r->st);
+    size_t n = strlen(hyphen);
+    draw_text_on(c, r->st, x + r->w - style_text_width(r->st, hyphen, n), base, hyphen, (int)n, color);
+}
+
+/* css-text-decor-4 §2: the lines of the boxes decorating a run's text. The decorating box's used
+   values decide them all: its colour, style and thickness, its font's metrics, its underline position
+   and offset, and its baseline, below the run's by how much vertical-align raised the run above it.
+   auto thickness (and from-font: the font layer gives no underline metrics, so it "behaves as auto")
+   is a fourteenth of the font size, rounded to a device pixel and at least one (§2.4). */
+static float decoration_thickness(const struct css_decorating *e) {
+    return fmaxf(1, roundf(isnan(e->thickness) ? e->font_size / 14 : e->thickness));
+}
+static void wavy_line(canvas_t *c, float x, float w, float mid, float t, float amplitude, float period, uint32_t color) {
+    int x0 = (int)floorf(x), x1 = (int)ceilf(x + w);
+    x0 = MAX(x0, c->cx0); x1 = MIN(x1, c->cx1);
+    float k = 6.2831853f / period;
+    for (int px = x0; px < x1; px++) {
+        /* the stroke covers the curve over the column, half its thickness either side */
+        float ya = mid + amplitude * sinf(k * px), yb = mid + amplitude * sinf(k * (px + 1));
+        float lo = fminf(ya, yb) - t / 2, hi = fmaxf(ya, yb) + t / 2;
+        for (int py = (int)floorf(lo); py < (int)ceilf(hi); py++) {
+            float cover = fminf(hi, py + 1.f) - fmaxf(lo, (float)py);
+            uint32_t col = with_alpha(color, fminf(1, cover));
+            if (col >> 24) gfx_blend_pixel(c, px, py, col);
+        }
+    }
+}
+/* One decoration line from x over w: top its edge at the text (outward: +1 down for an underline, -1 up
+   for an overline, 0 a line-through, which centres on it), t thick, in a text-decoration-style. */
+static void decoration_line(canvas_t *c, float x, float w, float top, float t, uint8_t style, uint32_t color, int outward) {
+    int ix = (int)x, iw = (int)ceilf(w), it = (int)t;
+    switch (style) {
+    case CSS_DECORATION_DOUBLE: {
+        /* two lines a thickness apart: the second outward of the first */
+        float second = outward ? top + outward * 2 * t : top + t;
+        if (!outward) top -= t;
+        gfx_fill_blend(c, ix, (int)roundf(top), iw, it, color);
+        gfx_fill_blend(c, ix, (int)roundf(second), iw, it, color);
+        return;
+    }
+    case CSS_DECORATION_DOTTED: case CSS_DECORATION_DASHED: {
+        float on = style == CSS_DECORATION_DOTTED ? t : 3 * t, period = style == CSS_DECORATION_DOTTED ? 2 * t : 5 * t;
+        int y = (int)roundf(top);
+        for (float at = 0; at < w; at += period) {
+            float length = fminf(on, w - at);
+            if (style == CSS_DECORATION_DOTTED && t >= 3) fill_rrect_serial(c, x + at, (float)y, length, t, t / 2, color, color);
+            else gfx_fill_blend(c, (int)(x + at), y, (int)ceilf(length), it, color);
+        }
+        return;
+    }
+    case CSS_DECORATION_WAVY: {
+        float amplitude = fmaxf(1.5f, 1.5f * t), period = fmaxf(6, 6 * t);
+        float mid = outward > 0 ? top + amplitude + t / 2 : outward < 0 ? top - amplitude + t / 2 : top + t / 2;
+        wavy_line(c, x, w, mid, t, amplitude, period, color);
+        return;
+    }
+    }
+    gfx_fill_blend(c, ix, (int)roundf(top), iw, it, color);
+}
+/* The lines of kinds which (TD_*) of r's decorating boxes at (x, r's baseline): the outermost box's
+   first, so a descendant's lines go over an ancestor's; in each box's colour, or color when not 0
+   (a shadow's, or a mask's white). */
+static void run_lines(canvas_t *c, const struct run *r, float x, float base, uint8_t which, uint32_t color) {
+    const struct css_decorating *list = r->st->decorations, *few[16], **order = few;
+    size_t count = 0;
+    for (const struct css_decorating *e = list; e; e = e->next) count++;
+    if (!count) return;
+    if (count > sizeof few / sizeof *few && !(order = malloc(count * sizeof *order))) return;
+    size_t k = count;
+    for (const struct css_decorating *e = list; e; e = e->next) order[--k] = e;
+    for (k = 0; k < count; k++) {
+        const struct css_decorating *e = order[k];
+        uint8_t lines = e->lines & which;
+        uint32_t col = color ? color : e->color;
+        if (!lines || !(col >> 24)) continue;
+        wfont font = {.px = e->font_size, .ttf = e->font};
+        float ascent, descent, t = decoration_thickness(e);
+        wf_metrics(&font, &ascent, &descent);
+        float y = base + r->st->baseline_shift - e->shift; /* the decorating box's baseline */
+        if (lines & TD_UNDERLINE) {
+            /* §2.8.1: under's zero position is the text-under edge, auto's the alphabetic baseline */
+            bool under = e->underline_position & CSS_UNDERLINE_UNDER;
+            float offset = isnan(e->underline_offset) ? (under ? 0 : descent * 0.45f) : e->underline_offset;
+            decoration_line(c, x, r->w, (under ? y + descent : y) + offset, t, e->style, col, 1);
+        }
+        if (lines & TD_OVERLINE) decoration_line(c, x, r->w, y - ascent, t, e->style, col, -1);
+        if (lines & TD_LINE_THROUGH) decoration_line(c, x, r->w, y - ascent * 0.32f + 0.5f - t / 2, t, e->style, col, 0);
+    }
+    if (order != few) free(order);
+}
+/* The ink of run r around its start and baseline, with ascent and descent its font's and slack how
+   much more up and down to allow: its glyphs' overhang (up to a font size past its advance), its
+   decorating boxes' lines (wherever their offset, style and thickness put them), and its text
+   shadows, each a copy of both shifted by its offset and grown by its blur's reach. */
+static void run_ink_extent(const struct run *r, float ascent, float descent, float slack, float out[4]) {
+    const style_t *st = r->st;
+    float fs = st->font_size;
+    out[0] = -fs; out[1] = -ascent - slack; out[2] = r->w + fs; out[3] = descent + slack;
+    for (const struct css_decorating *e = st->decorations; e; e = e->next) {
+        float t = decoration_thickness(e), y = st->baseline_shift - e->shift;
+        float reach = (isnan(e->underline_offset) ? 0 : fabsf(e->underline_offset)) + 5 * t + 4;
+        out[1] = fminf(out[1], y - e->font_size * 1.25f - reach);
+        out[3] = fmaxf(out[3], y + e->font_size * 0.5f + reach);
+    }
+    float text[4] = {out[0], out[1], out[2], out[3]};
+    for (const struct css_box_shadow *shadow = css_style_text(st)->shadow; shadow; shadow = shadow->next) {
+        float halo = shadow->blur > 0 ? ceilf(shadow->blur * 1.5f) + 1 : 0;
+        out[0] = fminf(out[0], text[0] + shadow->x - halo); out[1] = fminf(out[1], text[1] + shadow->y - halo);
+        out[2] = fmaxf(out[2], text[2] + shadow->x + halo); out[3] = fmaxf(out[3], text[3] + shadow->y + halo);
+    }
+}
+/* A run's text and decorations at (x, base) in one colour onto c: what a text shadow shadows. */
+static void run_silhouette(canvas_t *c, const struct run *r, float x, float base, uint32_t color) {
+    run_lines(c, r, x, base, TD_UNDERLINE | TD_OVERLINE, color);
+    run_glyphs(c, r, x, base, color);
+    run_lines(c, r, x, base, TD_LINE_THROUGH, color);
+}
+/* One text shadow of run r drawn through a coverage mask: the run's silhouette in white on black,
+   cut to what the canvas clip shows within the blur's reach, its coverage blurred, then composited
+   in the shadow's colour. The text and its decorations so composite together (css-text-decor-4 §4),
+   and nothing reaches the canvas before the blur is done; false: cancelled or out of memory. */
+static bool text_shadow_mask(struct pctx *P, const struct run *r, float x, float base, const float ink[4],
+                             const struct css_box_shadow *shadow, uint32_t color) {
+    canvas_t *c = P->c;
+    double halo = shadow->blur > 0 ? ceil((double)shadow->blur * 1.5) + 1 : 1;
+    double left = floor(x + shadow->x + ink[0] - halo), top = floor(base + shadow->y + ink[1] - halo);
+    double right = ceil(x + shadow->x + ink[2] + halo), bottom = ceil(base + shadow->y + ink[3] + halo);
+    left = fmax(left, c->cx0 - halo); top = fmax(top, c->cy0 - halo);
+    right = fmin(right, c->cx1 + halo); bottom = fmin(bottom, c->cy1 + halo);
+    if (!(right > left) || !(bottom > top)) return true;
+    if (!isfinite(left) || !isfinite(top) || right - left > INT_MAX || bottom - top > INT_MAX) return false;
+    int mask_x = (int)left, mask_y = (int)top, width = (int)(right - left), height = (int)(bottom - top);
+    if ((size_t)width > SIZE_MAX / sizeof(uint32_t) / (size_t)height) return false;
+    size_t pixels = (size_t)width * (size_t)height;
+    uint32_t *silhouette = calloc(pixels, sizeof *silhouette);
+    uint8_t *alpha = malloc(pixels);
+    if (!silhouette || !alpha) { free(silhouette); free(alpha); return false; }
+    canvas_t mask = {silhouette, width, height, width, 0, 0, width, height, NULL};
+    run_silhouette(&mask, r, x + shadow->x - mask_x, base + shadow->y - mask_y, 0xFFFFFFFFu);
+    for (size_t i = 0; i < pixels; i++) {
+        uint32_t v = silhouette[i];
+        alpha[i] = (uint8_t)MAX(v >> 16 & 255, MAX(v >> 8 & 255, v & 255));
+    }
+    free(silhouette);
+    if (shadow->blur > 0 && !shadow_gaussian(P->d, alpha, width, height, shadow->blur)) { free(alpha); return false; }
+    int x0 = MAX(c->cx0, mask_x), y0 = MAX(c->cy0, mask_y);
+    int x1 = MIN(c->cx1, mask_x + width), y1 = MIN(c->cy1, mask_y + height);
+    for (int py = y0; py < y1; py++) {
+        const uint8_t *row = alpha + (size_t)(py - mask_y) * (size_t)width - mask_x;
+        for (int px = x0; px < x1; px++) {
+            if (!row[px]) continue;
+            uint32_t col = with_alpha(color, row[px] * (1.0f / 255));
+            if (col >> 24) gfx_blend_pixel(c, px, py, col);
+        }
+    }
+    free(alpha);
+    return true;
+}
+/* css-text-decor-4 §4: each text shadow of r, painted under the text and its decorations, the first
+   shadow on top. An opaque shadow without blur draws the silhouette directly; others go through a mask. */
+static void paint_text_shadows(struct pctx *P, const struct run *r, float x, float base, const float ink[4]) {
+    const struct css_box_shadow *list = css_style_text(r->st)->shadow, *few[8], **order = few;
+    size_t count = 0;
+    for (const struct css_box_shadow *shadow = list; shadow; shadow = shadow->next) count++;
+    if (count > sizeof few / sizeof *few && !(order = malloc(count * sizeof *order))) { P->failed = true; return; }
+    size_t k = count;
+    for (const struct css_box_shadow *shadow = list; shadow; shadow = shadow->next) order[--k] = shadow;
+    for (k = 0; k < count && !P->failed; k++) {
+        const struct css_box_shadow *shadow = order[k];
+        uint32_t color = css_text_shadow_color(r->st, shadow);
+        if (!(color >> 24)) continue;
+        if (shadow->blur <= 0 && (color >> 24) == 255) run_silhouette(P->c, r, x + shadow->x, base + shadow->y, color);
+        else if (!text_shadow_mask(P, r, x, base, ink, shadow, color)) P->failed = true;
+    }
+    if (order != few) free(order);
+}
+
+static void paint_run_text(struct pctx *P, const struct run *r, float bx, float by, int layers) {
     const style_t *st = r->st;
     if (st->visibility) return;
     float x = P->ox + bx + r->x, base = P->oy + by + r->y;
     wfont f = style_font(st);
-    float asc, desc;
+    float asc, desc, ink[4];
     wf_metrics(&f, &asc, &desc);
-    if (base - asc > P->c->cy1 || base + desc < P->c->cy0) return;
+    run_ink_extent(r, asc, desc, 0, ink);
+    if (base + ink[1] > P->c->cy1 || base + ink[3] < P->c->cy0) return;
+    if (layers & RUN_SHADOWS && !P->text_mask && css_style_text(st)->shadow) paint_text_shadows(P, r, x, base, ink);
+    if (!(layers & RUN_TEXT) || P->failed) return;
     if (r->highlight && r->highlight_first < r->highlight_end && !P->text_mask) {
         /* Only the matched bytes of the run, measured as the line placed them. */
         float x0 = layout_run_x(r, (size_t)r->highlight_first), x1 = layout_run_x(r, (size_t)r->highlight_end);
@@ -2205,19 +2408,11 @@ static void paint_run_text(struct pctx *P, const struct run *r, float bx, float 
     }
     /* Text is contentful even in a transparent colour (Paint Timing). */
     if (r->n > 0) paint_drew(P, contentful_text(r->s, (size_t)r->n));
-    uint32_t col = P->text_mask ? 0xFFFFFFFFu : st->color; /* a text clip's coverage, whatever its colour */
-    draw_text(P, st, x, base, r->s, r->n, col);
-    if (st->text_decoration) {
-        float th = st->font_size / 14;
-        if (th < 1) th = 1;
-        int t = (int)roundf(th);
-        int w = (int)ceilf(r->w);
-        /* trailing spaces are not decorated at the end of a line, but between words they are */
-        if (st->text_decoration & TD_UNDERLINE) gfx_fill_blend(P->c, (int)x, (int)roundf(base + desc * 0.45f), w, t, col);
-        if (st->text_decoration & TD_OVERLINE) gfx_fill_blend(P->c, (int)x, (int)roundf(base - asc), w, t, col);
-        if (st->text_decoration & TD_LINE_THROUGH)
-            gfx_fill_blend(P->c, (int)x, (int)roundf(base - asc * 0.32f), w, t, col);
-    }
+    /* a text clip's coverage (bg_text): the glyphs and the lines in white, whatever their colours */
+    uint32_t mask = P->text_mask ? 0xFFFFFFFFu : 0;
+    run_lines(P->c, r, x, base, TD_UNDERLINE | TD_OVERLINE, mask);
+    run_glyphs(P->c, r, x, base, mask ? mask : st->color);
+    run_lines(P->c, r, x, base, TD_LINE_THROUGH, mask);
 }
 
 /* ---------------------------------------------------------------- replaced elements and controls */
@@ -2424,10 +2619,32 @@ static void paint_control_line(const struct control_text_line *line, void *opaqu
         (size_t)p->caret <= line->first + len &&
         ((size_t)p->caret < line->first + len || line->hard_break || line->next == p->length)) {
         float cx = p->x + control_text_width(p->style,text,(size_t)p->caret-line->first);
-        gfx_fill(c,(int)cx,(int)ly+2,1,(int)fmaxf(1,lh-4),p->base->color);
+        gfx_fill_blend(c,(int)cx,(int)ly+2,1,(int)fmaxf(1,lh-4),css_ui_caret_color(p->base));
     }
 }
 
+/* accent-color (css-ui-4 §6.2): the platform's accent when auto, else the color, drawn opaque over the
+   control's white; *foreground the mark on it (white while it keeps 3:1 contrast, else black) */
+static double accent_luminance(uint32_t rgb) {
+    double l = 0;
+    static const double weight[3] = {.2126, .7152, .0722};
+    for (int i = 0; i < 3; i++) {
+        double v = (double)(rgb >> (16 - 8 * i) & 255) / 255;
+        l += weight[i] * (v <= .04045 ? v / 12.92 : pow((v + .055) / 1.055, 2.4));
+    }
+    return l;
+}
+static uint32_t control_accent(const style_t *st, uint32_t *foreground) {
+    uint32_t accent = RGB(0, 117, 255), argb;
+    if (css_ui_accent_color(st, &argb)) {
+        uint32_t alpha = argb >> 24, mixed = 0;
+        for (int shift = 0; shift < 24; shift += 8)
+            mixed |= (((argb >> shift & 255) * alpha + 255 * (255 - alpha) + 127) / 255) << shift;
+        accent = 0xFF000000u | mixed;
+    }
+    if (foreground) *foreground = 1.05 / (accent_luminance(accent) + .05) >= 3 ? RGB(255, 255, 255) : RGB(0, 0, 0);
+    return accent;
+}
 static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     /* x, y: content box on the canvas */
     canvas_t *c = P->c;
@@ -2486,7 +2703,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
             float text_width, text_height;
             if (!control_text_lines(b,text_style,v,paint_control_line,&lines,&text_width,&text_height)) P->failed=true;
         }
-        if (focused && !selected && b->atomic == AT_INPUT) gfx_fill(c, (int)caret_x, (int)y + 1, 1, (int)h - 2, st->color);
+        if (focused && !selected && b->atomic == AT_INPUT) gfx_fill_blend(c, (int)caret_x, (int)y + 1, 1, (int)h - 2, css_ui_caret_color(st));
         c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
         break;
     }
@@ -2499,16 +2716,17 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     }
     case AT_CHECKBOX: {
         int X = (int)roundf(x), Y = (int)roundf(y), S = (int)roundf(w);
+        uint32_t mark, accent = control_accent(st, &mark);
         if (n->indeterminate) {
-            gfx_fill_round(c, X, Y, S, S, 2, RGB(0, 117, 255));
-            gfx_fill(c, X + S / 4, Y + S / 2 - 1, S / 2, 2, RGB(255, 255, 255));
+            gfx_fill_round(c, X, Y, S, S, 2, accent);
+            gfx_fill(c, X + S / 4, Y + S / 2 - 1, S / 2, 2, mark);
         } else if (n->checked) {
-            gfx_fill_round(c, X, Y, S, S, 2, RGB(0, 117, 255));
+            gfx_fill_round(c, X, Y, S, S, 2, accent);
             int s = S;
             /* a check mark */
             for (int k = -1; k <= 0; k++) {
-                gfx_line(c, X + s * 22 / 100, Y + s / 2 + k, X + s * 42 / 100, Y + s * 70 / 100 + k, RGB(255, 255, 255));
-                gfx_line(c, X + s * 42 / 100, Y + s * 70 / 100 + k, X + s * 78 / 100, Y + s * 30 / 100 + k, RGB(255, 255, 255));
+                gfx_line(c, X + s * 22 / 100, Y + s / 2 + k, X + s * 42 / 100, Y + s * 70 / 100 + k, mark);
+                gfx_line(c, X + s * 42 / 100, Y + s * 70 / 100 + k, X + s * 78 / 100, Y + s * 30 / 100 + k, mark);
             }
         } else {
             gfx_fill_round(c, X, Y, S, S, 2, RGB(118, 118, 118));
@@ -2519,9 +2737,10 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     case AT_RADIO: {
         int r = (int)(w / 2), cx_ = (int)roundf(x + w / 2), cy_ = (int)roundf(y + h / 2);
         if (n->checked) {
-            gfx_fill_circle(c, cx_, cy_, r, RGB(0, 117, 255));
+            uint32_t accent = control_accent(st, NULL);
+            gfx_fill_circle(c, cx_, cy_, r, accent);
             gfx_fill_circle(c, cx_, cy_, r - 1, RGB(255, 255, 255));
-            gfx_fill_circle(c, cx_, cy_, r - 3, RGB(0, 117, 255));
+            gfx_fill_circle(c, cx_, cy_, r - 3, accent);
         } else {
             gfx_fill_circle(c, cx_, cy_, r, RGB(118, 118, 118));
             gfx_fill_circle(c, cx_, cy_, r - 1, RGB(255, 255, 255));
@@ -2583,17 +2802,17 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
             double fraction = max > min ? (value - min) / (max - min) : 0;
             gfx_fill_round(c, X, Y + H / 4, W, H / 2, H / 4, RGB(220, 220, 220));
             if (n->tag == T_progress && web_gauge_value(n, "position") < 0) {
-                gfx_fill_round(c, X + W / 3, Y + H / 4, W / 3, H / 2, H / 4, RGB(0, 117, 255));
+                gfx_fill_round(c, X + W / 3, Y + H / 4, W / 3, H / 2, H / 4, control_accent(st, NULL));
             } else {
                 int quality = n->tag == T_meter ? web_meter_quality(n) : 0;
-                uint32_t color = n->tag == T_progress ? RGB(0, 117, 255) : quality == 0 ? RGB(16, 160, 64) : quality == 1 ? RGB(220, 160, 0) : RGB(210, 50, 45);
+                uint32_t color = n->tag == T_progress ? control_accent(st, NULL) : quality == 0 ? RGB(16, 160, 64) : quality == 1 ? RGB(220, 160, 0) : RGB(210, 50, 45);
                 gfx_fill_round(c, X, Y + H / 4, (int)(W * fraction), H / 2, H / 4, color);
             }
             break;
         }
         if (str_ieq(n->name, "input")) { /* range */
             gfx_fill_round(c, X, Y + H / 2 - 2, W, 4, 2, RGB(180, 180, 180));
-            gfx_fill_circle(c, X + W / 2, Y + H / 2, 7, RGB(0, 117, 255));
+            gfx_fill_circle(c, X + W / 2, Y + H / 2, 7, control_accent(st, NULL));
             break;
         }
         gfx_fill_blend(c, X, Y, W, H, RGB(232, 232, 236));
@@ -3167,9 +3386,10 @@ static void bounds_decoration(struct pctx *P,const style_t *style,float x,float 
 struct run_metrics { const style_t *st; float asc, desc; };
 static void run_ink(const struct run *r,float bx,float by,struct run_metrics *m,bool tall,float rect[4]) {
     if(m->st!=r->st){wfont f=style_font(r->st);wf_metrics(&f,&m->asc,&m->desc);m->st=r->st;}
-    float fs=r->st->font_size,slack=tall?fmaxf(1,fs*.5f):1;
-    rect[0]=bx+r->x-fs;rect[1]=by+r->y-m->asc-slack;
-    rect[2]=bx+r->x+r->w+fs;rect[3]=by+r->y+m->desc+slack;
+    float fs=r->st->font_size,slack=tall?fmaxf(1,fs*.5f):1,extent[4];
+    run_ink_extent(r,m->asc,m->desc,slack,extent);
+    rect[0]=bx+r->x+extent[0];rect[1]=by+r->y+extent[1];
+    rect[2]=bx+r->x+extent[2];rect[3]=by+r->y+extent[3];
 }
 /* An outside list marker's ink (paint_marker): left of the content box on its baseline. */
 static void marker_ink(const web_doc *d,const box_t *b,float rect[4]) {
@@ -3378,6 +3598,21 @@ static struct line_fragment *overflow_line(box_t *b,int run) {
     while(low<high){int mid=low+(high-low)/2;if(b->lines[mid].end_run<=run)low=mid+1;else high=mid;}
     return low<b->nlines && b->lines[low].first_run<=run && b->lines[low].ellipsis_active?&b->lines[low]:NULL;
 }
+/* Run i of b as paint shows it: past a line's ellipsis nothing, at the ellipsis the part before it,
+   clipped at the ellipsis's edge. */
+static void paint_run_shown(struct pctx *P, box_t *b, int i, float bx, float by, int layers) {
+    const struct run *r = &b->runs[i];
+    struct line_fragment *line=overflow_line(b,i);
+    if(line && i>line->ellipsis_run)return;
+    if(line && i==line->ellipsis_run && line->ellipsis_bytes<r->n) {
+        struct run visible=*r;visible.n=line->ellipsis_bytes;visible.w=line->ellipsis_run_width;visible.hyphen=false;
+        canvas_t saved=*P->c;
+        int right=(int)floorf(P->ox+bx+line->ellipsis_x);
+        if(right<P->c->cx1)P->c->cx1=MAX(right,P->c->cx0);
+        if(visible.n)paint_run_text(P,&visible,bx,by,layers);
+        *P->c=saved;
+    } else paint_run_text(P,r,bx,by,layers);
+}
 static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
     float bx, by;
     layout_runs_origin(b, true, &bx, &by); /* the origin every text geometry reader uses */
@@ -3410,6 +3645,14 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
         if (!d->last) T.pad[1] = 0;
         paint_bg_border(P, st, x, y, d->w, d->h, bw, false, !d->first, !d->last,d->shadow_cache,d->radius_clip,&T);
     }
+    /* text shadows under all the runs' text (css-text-decor-4 §4) */
+    if (P->mode == M_PAINT)
+        for (int i = scope ? scope->inline_run_first : 0; i >= 0 && i < b->nruns && !P->failed;
+             i = scope ? b->runs[i].paint_next : i + 1) {
+            const struct run *r = &b->runs[i];
+            if ((scope && r->paint_owner != scope) || (!scope && r->paint_owner) || r->atomic) continue;
+            if (css_style_text(r->st)->shadow) paint_run_shown(P, b, i, bx, by, RUN_SHADOWS);
+        }
     for (int i = scope ? scope->inline_run_first : 0; i >= 0 && i < b->nruns;
          i = scope ? b->runs[i].paint_next : i + 1) {
         struct run *r = &b->runs[i];
@@ -3451,24 +3694,13 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
             if (r->st->visibility) continue;
             float ink[4]; run_ink(r, bx, by, &metrics, false, ink);
             bounds_rect(P, ink[0], ink[1], ink[2] - ink[0], ink[3] - ink[1]);
-        } else {
-            struct line_fragment *line=overflow_line(b,i);
-            if(line && i>line->ellipsis_run)continue;
-            if(line && i==line->ellipsis_run && line->ellipsis_bytes<r->n) {
-                struct run visible=*r;visible.n=line->ellipsis_bytes;visible.w=line->ellipsis_run_width;
-                canvas_t saved=*P->c;
-                int right=(int)floorf(P->ox+bx+line->ellipsis_x);
-                if(right<P->c->cx1)P->c->cx1=MAX(right,P->c->cx0);
-                if(visible.n)paint_run_text(P,&visible,bx,by);
-                *P->c=saved;
-            } else paint_run_text(P,r,bx,by);
-        }
+        } else paint_run_shown(P, b, i, bx, by, RUN_TEXT);
     }
     if(P->mode==M_PAINT&&!scope)for(int k=0;k<b->nlines;k++) {
         struct line_fragment *line=&b->lines[k];if(!line->ellipsis_active)continue;
         struct run marker={.x=line->ellipsis_x,.y=line->baseline,.w=line->ellipsis_width,
             .s=overflow_ellipsis,.n=sizeof overflow_ellipsis-1,.st=b->st};
-        paint_run_text(P,&marker,bx,by);
+        paint_run_text(P,&marker,bx,by,RUN_SHADOWS|RUN_TEXT);
     }
     /* inline box outlines, over the text like block outlines */
     if (P->mode == M_PAINT && !P->text_mask)
@@ -3484,6 +3716,7 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
 
 /* ---------------------------------------------------------------- 2D transforms */
 static void paint_box(struct pctx *P, box_t *b, bool layer_root);
+static void paint_backdrop(struct pctx *P, const box_t *b, const double *m, float opacity);
 static void affine_rect(const double m[6], double x0, double y0, double x1, double y1, double out[4]) {
     double xs[4] = {x0, x1, x0, x1}, ys[4] = {y0, y0, y1, y1};
     out[0] = out[1] = INFINITY; out[2] = out[3] = -INFINITY;
@@ -3593,7 +3826,7 @@ static void transformed_resample(size_t tile, void *context) {
    checkpoint may draw browser chrome into the window canvas, so only a step
    writing private buffers is serviced; one writing the canvas joins as a
    raster primitive does. */
-static void transformed_run(web_doc *d, parallel_fn fn, int rows, size_t pixels, struct transformed_job *j) {
+static void transformed_run(web_doc *d, parallel_fn fn, int rows, size_t pixels, void *j) {
     size_t tiles = ((size_t)rows + 31) / 32;
     if (rows < 64 || pixels < 65536) { for (size_t t = 0; t < tiles; t++) fn(t, j); return; }
     parallel_for_stage(PARALLEL_RASTER, tiles, fn, j, d ? shadow_service : NULL, d);
@@ -3643,10 +3876,15 @@ static void paint_transformed_surface(struct pctx *P, box_t *b, bool layer_root,
         struct pctx Q = *P;
         Q.c = &surface; Q.ox = (float)-sx0; Q.oy = (float)-sy0;
         Q.vx0 = 0; Q.vy0 = 0; Q.vx1 = sw; Q.vy1 = sh; Q.viewport_mask = NULL;
-        Q.untransformed = b;
+        Q.untransformed = b; Q.private_surface = true;
         paint_box(&Q, b, layer_root);
         if (Q.failed) P->failed = true;
+        P->painted |= Q.painted; P->contentful |= Q.contentful;
     }
+    if (P->failed) { free(black); free(white); return; }
+    /* Filter Effects 2 §2.1: the backdrop through the transformed border box, under b */
+    if (b->st->backdrop_filter && !b->st->visibility && !P->private_surface)
+        paint_backdrop(P, b, m, b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1));
     if (P->failed) { free(black); free(white); return; }
     /* Both steps write disjoint 32-row bands: coverage per surface row, then
        the destination rows the inverse matrix samples it into. Every band of
@@ -3712,6 +3950,247 @@ static void paint_transformed(struct pctx *P, box_t *b, bool layer_root) {
     c->cx0 = cx0; c->cy0 = cy0; c->cx1 = cx1; c->cy1 = cy1;
 }
 
+/* ---------------------------------------------------------------- filter effects */
+/* The filter list b's paint applies: none when it is only opacity (the group's, filter_opacity) or
+   has no effect, or when a url() names no <filter> element in b's tree (Filter Effects 1 §5: the
+   whole list is then ignored and nothing is filtered). A <filter>'s primitives are not drawn: its
+   reference maps nothing. Decided once for a list and a DOM revision. */
+static const struct css_filter *filter_used(web_doc *d, box_t *b) {
+    const struct css_filter *f = b->st ? b->st->filter : NULL;
+    if (!f || !f->effects || b->kind == B_TEXT || b->kind == B_BR) return NULL;
+    if (b->filter_ref_list != f || b->filter_ref_dom != d->dom_revision) {
+        bool ignored = false;
+        for (size_t i = 0; i < f->count && !ignored; i++) {
+            if (f->steps[i].kind != CSS_FILTER_URL) continue;
+            node_t *e = b->node ? doc_svg_reference(b->node, f->steps[i].url) : NULL;
+            ignored = !e || e->type != N_ELEM || !e->foreign || strcmp(e->name, "filter");
+        }
+        b->filter_ref_list = f; b->filter_ref_dom = d->dom_revision; b->filter_ref_ignored = ignored;
+    }
+    return b->filter_ref_ignored ? NULL : f;
+}
+/* The filtered surface, premultiplied, over the opaque destination through the canvas's mask
+   clip, with the element's opacity: Filter Effects 1 §6 applies the filter, then the clip, then
+   opacity. Each 32-row band of the destination is its own. */
+struct filtered_job {
+    const uint32_t *surface;
+    canvas_t *canvas;
+    int sw, sx, sy, dx, dy, dw, dh;
+    uint32_t alpha; /* opacity, of 255 */
+};
+static void filtered_composite(size_t tile, void *context) {
+    const struct filtered_job *j = context;
+    const canvas_t *c = j->canvas;
+    int last = MIN((int)(tile + 1) * 32, j->dh);
+    for (int row_index = (int)tile * 32; row_index < last; row_index++) {
+        int py = j->dy + row_index, x0 = j->dx, x1 = j->dx + j->dw, opaque0 = x0, opaque1 = x1;
+        if (c->mask_clip) {
+            struct gfx_clip_span span;
+            if (!gfx_clip_row(c, py, x0, x1, &span)) continue;
+            x0 = span.x0; x1 = span.x1; opaque0 = span.opaque0; opaque1 = span.opaque1;
+        }
+        const uint32_t *s = j->surface + (size_t)(py - j->sy) * (size_t)j->sw;
+        uint32_t *row = c->px + (size_t)py * c->pitch;
+        for (int px = x0; px < x1; px++) {
+            uint32_t v = s[px - j->sx];
+            if (!(v >> 24)) continue; /* the filters keep each colour within its alpha */
+            uint32_t mask = px >= opaque0 && px < opaque1 ? 255 : gfx_clip_alpha(c, px, py);
+            if (!mask) continue;
+            /* one rounding: s·w + d·(1 − a·w), w the opacity times the mask */
+            float w = (float)(j->alpha * mask) * (1.f / 65025.f), keep = 1.f - (float)(v >> 24) * (1.f / 255.f) * w;
+            uint32_t d = row[px], out = 0xFF000000u;
+            for (int shift = 0; shift < 24; shift += 8) {
+                uint32_t value = (uint32_t)((float)((v >> shift) & 255) * w + (float)((d >> shift) & 255) * keep + .5f);
+                out |= (value > 255 ? 255 : value) << shift;
+            }
+            row[px] = out;
+        }
+    }
+    parallel_record_work(PARALLEL_RASTER, (uint64_t)j->dw * (uint64_t)MAX(0, last - (int)tile * 32));
+}
+/* A surface past this many pixels reads less of its reach (a blur of hundreds of pixels across the
+   viewport): the pixels past it read as the transparent black beyond any edge. */
+#define FILTER_SURFACE_MAX (16.0 * 1024 * 1024)
+/* Filter Effects 1 §6: b and its descendants paint into a surface of their own, without b's
+   filter, clip and opacity; the filter list maps the surface, and the result is clipped and
+   composited with b's opacity. Like a transform's surface, it is painted over black and over
+   white, and the two recover premultiplied colour. The surface holds the filtered ink that
+   reaches the destination and every pixel the filter reads for it (web_filter_extent), no more:
+   a damage repaint filters only its rectangle and that reach. */
+static void paint_filtered(struct pctx *P, box_t *b, bool layer_root, const struct css_filter *f) {
+    canvas_t *c = P->c;
+    const int clip_saved[4] = {c->cx0, c->cy0, c->cx1, c->cy1};
+    const struct gfx_mask_clip *clip_prior = c->mask_clip; struct gfx_mask_clip clip_cut;
+    uint32_t *black = NULL, *white = NULL;
+    struct clip_used u;
+    if (clip_used(b, &u) && !clip_push(P, b, &u, &clip_cut)) goto done;
+    /* what b paints unfiltered, in document space; a private bounds generation, as a transform's */
+    struct pctx Q = *P;
+    Q.mode = M_BOUNDS; Q.bounds_valid = false; Q.unfiltered = b;
+    Q.bounds_generation = __atomic_add_fetch(&P->d->paint_bounds_generation, 1, __ATOMIC_RELAXED);
+    paint_box(&Q, b, layer_root);
+    if (Q.failed) { P->failed = true; goto done; }
+    if (!Q.bounds_valid) goto done;
+    float outset[4], reach[4];
+    web_filter_extent(f, outset, reach);
+    double ink[4] = {floor((double)Q.bounds[0] - outset[0] + P->ox), floor((double)Q.bounds[1] - outset[1] + P->oy),
+                     ceil((double)Q.bounds[2] + outset[2] + P->ox), ceil((double)Q.bounds[3] + outset[3] + P->oy)};
+    double l = fmax(ink[0], c->cx0), t = fmax(ink[1], c->cy0), r = fmin(ink[2], c->cx1), bt = fmin(ink[3], c->cy1);
+    if (!(r > l && bt > t)) goto done;
+    double grow[4];
+    for (int k = 0; k < 4; k++) grow[k] = ceil(reach[k]);
+    double dw = r - l, dh = bt - t;
+    if (!((dw + grow[0] + grow[2]) * (dh + grow[1] + grow[3]) <= FILTER_SURFACE_MAX)) {
+        /* the largest equal reach on every side that keeps the surface within the cap */
+        double sum = dw + dh, most = (-sum + sqrt(fmax(0, sum * sum - 4 * (dw * dh - FILTER_SURFACE_MAX)))) / 4;
+        for (int k = 0; k < 4; k++) grow[k] = fmin(grow[k], floor(fmax(0, most)));
+    }
+    double sx0 = fmax(ink[0], l - grow[0]), sy0 = fmax(ink[1], t - grow[1]);
+    double sx1 = fmin(ink[2], r + grow[2]), sy1 = fmin(ink[3], bt + grow[3]);
+    if (!((sx1 - sx0) * (sy1 - sy0) <= 2 * FILTER_SURFACE_MAX)) { P->failed = true; goto done; } /* never an unfiltered substitute */
+    int sw = (int)(sx1 - sx0), sh = (int)(sy1 - sy0);
+    size_t count = (size_t)sw * (size_t)sh;
+    black = malloc(count * sizeof *black); white = malloc(count * sizeof *white);
+    if (!black || !white) { P->failed = true; goto done; }
+    if (P->d->profile_enabled) { paint_profile.groups++; paint_profile.group_pixels += count; }
+    for (int pass = 0; pass < 2 && !P->failed; pass++) {
+        canvas_t surface;
+        gfx_init(&surface, pass ? white : black, sw, sh, sw);
+        gfx_fill(&surface, 0, 0, sw, sh, pass ? RGB(255, 255, 255) : RGB(0, 0, 0));
+        struct pctx S = *P;
+        S.c = &surface; S.ox = (float)(P->ox - sx0); S.oy = (float)(P->oy - sy0);
+        S.vx0 = 0; S.vy0 = 0; S.vx1 = sw; S.vy1 = sh; S.viewport_mask = NULL;
+        S.unfiltered = b; S.private_surface = true;
+        paint_box(&S, b, layer_root);
+        if (S.failed) P->failed = true;
+        P->painted |= S.painted; P->contentful |= S.contentful;
+    }
+    if (P->failed) goto done;
+    struct transformed_job coverage = {.black = black, .white = white, .sw = sw, .sh = sh};
+    transformed_run(P->d, transformed_coverage, sh, count, &coverage);
+    free(white); white = NULL;
+    if (!web_native_checkpoint(P->d) || !web_filter_apply(P->d, b->st, f, black, sw, sh, false)) { P->failed = true; goto done; }
+    /* The result is a fixed surface over what is under it, as an opacity group mixes it; a video
+       inside it painted into the private surface, which the snapshot refuses. */
+    web_avmedia_snapshot_blend_region(c, (int)l, (int)t, (int)dw, (int)dh);
+    float opacity = b->st->opacity;
+    struct filtered_job j = {black, c, sw, (int)sx0, (int)sy0, (int)l, (int)t, (int)dw, (int)dh,
+                             (uint32_t)(fminf(1, fmaxf(0, opacity)) * 255 + .5f)};
+    transformed_run(NULL, filtered_composite, (int)dh, (size_t)dw * (size_t)dh, &j);
+done:
+    free(black); free(white);
+    clip_pop(c, clip_saved, clip_prior);
+}
+/* The border boxes whose backdrop the canvas gave, for web_take_paint_damage. */
+static void backdrop_note(web_doc *d, const box_t *b, const double area[4]) {
+    if (d->backdrop_overflow) return;
+    float rect[4] = {(float)area[0] - 1, (float)area[1] - 1, (float)area[2] + 1, (float)area[3] + 1};
+    for (unsigned i = 0; i < d->backdrop_count; i++)
+        if (d->backdrop_regions[i].box == b) { memcpy(d->backdrop_regions[i].rect, rect, sizeof rect); return; }
+    const unsigned room = sizeof d->backdrop_regions / sizeof *d->backdrop_regions;
+    if (d->backdrop_count == room) { d->backdrop_overflow = true; return; }
+    d->backdrop_regions[d->backdrop_count].box = b;
+    memcpy(d->backdrop_regions[d->backdrop_count++].rect, rect, sizeof rect);
+}
+struct backdrop_job {
+    const uint32_t *filtered;
+    canvas_t *canvas;
+    int x, y, w, h;
+    float ox, oy, bx, by, bw, bh, inner[4];
+    struct border_radii radii;
+    bool mapped;
+    double inv[6];
+    uint32_t alpha;
+};
+/* The filtered backdrop over itself (source-over: §2.1's T' composited into b's parent) through
+   b's border box, its corners and the canvas's mask clip. */
+static void backdrop_composite(size_t tile, void *context) {
+    const struct backdrop_job *j = context;
+    const canvas_t *c = j->canvas;
+    int last = MIN((int)(tile + 1) * 32, j->h);
+    for (int row_index = (int)tile * 32; row_index < last; row_index++) {
+        int py = j->y + row_index, x0 = j->x, x1 = j->x + j->w, opaque0 = x0, opaque1 = x1;
+        if (c->mask_clip) {
+            struct gfx_clip_span span;
+            if (!gfx_clip_row(c, py, x0, x1, &span)) continue;
+            x0 = span.x0; x1 = span.x1; opaque0 = span.opaque0; opaque1 = span.opaque1;
+        }
+        const uint32_t *s = j->filtered + (size_t)row_index * (size_t)j->w;
+        uint32_t *row = c->px + (size_t)py * c->pitch;
+        double Y = py + 0.5 - j->oy;
+        for (int px = x0; px < x1; px++) {
+            double X = px + 0.5 - j->ox, u = X, v = Y;
+            if (j->mapped) { u = j->inv[0] * X + j->inv[2] * Y + j->inv[4]; v = j->inv[1] * X + j->inv[3] * Y + j->inv[5]; }
+            float cover = !j->mapped && u >= j->inner[0] && u < j->inner[2] && v >= j->inner[1] && v < j->inner[3] ? 1 :
+                corners_coverage((float)u, (float)v, j->bx, j->by, j->bw, j->bh, &j->radii);
+            float w = cover * (float)j->alpha * (1.f / 255.f);
+            if (w > 0 && !(px >= opaque0 && px < opaque1)) w *= (float)gfx_clip_alpha(c, px, py) * (1.f / 255.f);
+            if (!(w > 0)) continue;
+            /* one rounding: (f + d·(1 − fa))·w + d·(1 − w) = f·w + d·(1 − fa·w) */
+            uint32_t f = s[px - j->x], d = row[px], out = 0xFF000000u;
+            float keep = 1.f - (float)(f >> 24) * (1.f / 255.f) * w;
+            for (int shift = 0; shift < 24; shift += 8) {
+                uint32_t value = (uint32_t)((float)((f >> shift) & 255) * w + (float)((d >> shift) & 255) * keep + .5f);
+                out |= (value > 255 ? 255 : value) << shift;
+            }
+            row[px] = out;
+        }
+    }
+    parallel_record_work(PARALLEL_RASTER, (uint64_t)j->w * (uint64_t)MAX(0, last - (int)tile * 32));
+}
+/* Filter Effects 2 §2.1 and §3: before b paints, what the canvas holds under b's border box (the
+   Backdrop Root Image: what the page painted before b) is filtered with mirrored edges at the
+   clipped border box, and drawn back through that box, its corners and b's clip; b then paints
+   over it, and b's opacity mixes the result as the rest of b's (the group it paints in). Only the
+   page's own canvas holds a backdrop: in a transform's or filter's private surface, nothing of
+   what is under the surface is there (an approximation of §3's Backdrop Root, LEDGER K113). m:
+   b's own transform, when b paints from such a surface; the box is mapped through it, and
+   opacity is b's. */
+static void paint_backdrop(struct pctx *P, const box_t *b, const double *m, float opacity) {
+    canvas_t *c = P->c;
+    if (P->private_surface || !(opacity > 0) || (b->node && b->node == P->d->html)) return;
+    /* an inline-table, -flex or -grid's border box and corners are its inner box's */
+    const box_t *shape = b->kind == B_ATOMIC && b->atomic == AT_INLINE_BLOCK && b->first && b->first->wrapped_inner ? b->first : b;
+    float x = box_visual_x(shape) - shape->p[3] - shape->b[3], y = box_visual_y(shape) - shape->p[0] - shape->b[0];
+    float w = shape->w + shape->p[1] + shape->p[3] + shape->b[1] + shape->b[3];
+    float h = shape->h + shape->p[0] + shape->p[2] + shape->b[0] + shape->b[2];
+    if (!(w > 0 && h > 0) || !shape->st) return;
+    struct backdrop_job j = {.canvas = c, .ox = P->ox, .oy = P->oy, .bx = x, .by = y, .bw = w, .bh = h,
+                             .radii = used_radii(shape->st, w, h), .mapped = m != NULL,
+                             .alpha = (uint32_t)(fminf(1, opacity) * 255 + .5f)};
+    double area[4] = {x, y, (double)x + w, (double)y + h};
+    if (m) {
+        if (!affine_invert(m, j.inv)) return;
+        affine_rect(m, x, y, (double)x + w, (double)y + h, area);
+    }
+    for (int k = 0; k < 4; k++) if (!isfinite(area[k])) return;
+    backdrop_note(P->d, b, area);
+    float reach[4];
+    radii_reach(&j.radii, reach);
+    j.inner[0] = x + reach[0]; j.inner[1] = y + reach[1]; j.inner[2] = x + w - reach[2]; j.inner[3] = y + h - reach[3];
+    double l = fmax(floor(area[0] + P->ox), c->cx0), t = fmax(floor(area[1] + P->oy), c->cy0);
+    double r = fmin(ceil(area[2] + P->ox), c->cx1), bt = fmin(ceil(area[3] + P->oy), c->cy1);
+    if (!(r > l && bt > t)) return;
+    j.x = (int)l; j.y = (int)t; j.w = (int)(r - l); j.h = (int)(bt - t);
+    size_t count = (size_t)j.w * (size_t)j.h;
+    uint32_t *px = malloc(count * sizeof *px);
+    if (!px) { P->failed = true; return; }
+    for (int row = 0; row < j.h; row++) {
+        const uint32_t *from = c->px + (size_t)(j.y + row) * c->pitch + j.x;
+        uint32_t *to = px + (size_t)row * j.w;
+        for (int i = 0; i < j.w; i++) to[i] = from[i] | 0xFF000000u;
+    }
+    /* the result reads its neighbours: a video under it repaints with it */
+    web_avmedia_snapshot_reject_region(c, j.x, j.y, j.w, j.h);
+    if (P->d->profile_enabled) { paint_profile.groups++; paint_profile.group_pixels += count; }
+    if (!web_filter_apply(P->d, b->st, b->st->backdrop_filter, px, j.w, j.h, true) || !web_native_checkpoint(P->d)) {
+        P->failed = true; free(px); return;
+    }
+    j.filtered = px;
+    transformed_run(NULL, backdrop_composite, j.h, count, &j);
+    free(px);
+}
+
 static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (P->failed) return;
     if (P->mode==M_PAINT && b->ellipsis_hidden && b->ellipsis_hidden_revision==P->d->layout_revision) return;
@@ -3722,13 +4201,18 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (P->mode == M_HIT && b->node && web_dialog_inert(P->d,b->node)) return;
     if (P->mode != M_BOUNDS && paint_box_layer(b) && !layer_root) return; /* painted with the layers */
     const style_t *st = b->st;
-    float group_opacity = st->opacity * (st->filter ? st->filter->opacity : 1);
+    /* paint_filtered applies a filtered box's opacity after its filter */
+    float group_opacity = P->unfiltered == b ? 1 : st->opacity * (st->filter ? st->filter->opacity : 1);
     /* Transparent auto boxes still participate in hit testing. */
     if (P->mode != M_HIT && group_opacity <= 0) return;
     /* a mask layer's image still loading: the box shows once it has come (or failed) */
     if (P->mode == M_PAINT && !P->text_mask && b->kind != B_TEXT && b->kind != B_INLINE && b->kind != B_BR &&
         mask_layers_state(P->d, b) == MASK_PENDING) return;
     if (P->untransformed != b && box_transformed(b)) { paint_transformed(P, b, layer_root); return; }
+    /* A filter maps what b paints, before its clip and opacity (and inside its transform); it
+       never moves where b is hit. */
+    const struct css_filter *filter = P->mode != M_HIT && P->unfiltered != b ? filter_used(P->d, b) : NULL;
+    if (filter && P->mode == M_PAINT) { paint_filtered(P, b, layer_root, filter); return; }
     float parent_bounds[4]; bool parent_valid = P->bounds_valid;
     if (P->mode == M_BOUNDS) {
         if (!(++P->bounds_work & 63) && !web_native_checkpoint(P->d)) { P->failed = true; return; }
@@ -3760,7 +4244,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     /* clip-path and clip: b and everything it paints, and where they are hit */
     const int clip_saved[4] = {c->cx0, c->cy0, c->cx1, c->cy1};
     const struct gfx_mask_clip *clip_prior = c->mask_clip; struct gfx_mask_clip clip_cut;
-    bool clipped = P->mode != M_BOUNDS && box_clips(b);
+    bool clipped = P->mode != M_BOUNDS && P->unfiltered != b && box_clips(b);
     if (clipped) {
         struct clip_used u; bool shown = true;
         if (clip_used(b, &u)) {
@@ -3773,6 +4257,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         bounds_rect(P, P->vx0 - P->ox, P->vy0 - P->oy, P->vx1 - P->vx0, P->vy1 - P->vy0);
     if (P->mode == M_BOUNDS && !st->visibility && b->kind != B_INLINE && b->kind != B_TEXT && b->kind != B_BR) {
         bounds_decoration(P,st,bx,by,bw,bh);
+        if (st->backdrop_filter) bounds_rect(P, bx, by, bw, bh); /* it repaints its backdrop there */
         if (b->gap_decorations) {
             float gx = x, gy = y, ink[4] = {INFINITY, INFINITY, -INFINITY, -INFINITY};
             gap_scroll(b, &gx, &gy);
@@ -3832,9 +4317,10 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             if (right > P->vx1) right = P->vx1; if (bottom > P->vy1) bottom = P->vy1;
             if (right > left && bottom > top) {
                 gx = (int)left; gy = (int)top; gw = (int)(right - left); gh = (int)(bottom - top);
-                /* Group opacity mixes each pixel with what was under it, and
-                   nothing else; other filter functions mix neighbours. */
-                if(st->filter||masked||mask_layers)web_avmedia_snapshot_reject_region(c,gx,gy,gw,gh);
+                /* Group opacity mixes each pixel with what was under it, and nothing else
+                   (filters that mix neighbours paint in paint_filtered; a backdrop below
+                   reads them and rejects its own region). A mask is not one factor. */
+                if(masked||mask_layers)web_avmedia_snapshot_reject_region(c,gx,gy,gw,gh);
                 else web_avmedia_snapshot_blend_region(c,gx,gy,gw,gh);
                 if(P->d->profile_enabled){paint_profile.groups++;paint_profile.group_pixels+=(uint64_t)gw*(uint64_t)gh;}
                 if ((size_t)gw > SIZE_MAX / sizeof *saved / (size_t)gh ||
@@ -3850,6 +4336,9 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (P->mode == M_PAINT && canvas_group)
         gfx_fill_blend(c, P->vx0, P->vy0, P->vx1 - P->vx0, P->vy1 - P->vy0, P->canvas_bg);
     bool visible = !st->visibility;
+    if (P->mode == M_PAINT && visible && st->backdrop_filter && b->kind != B_INLINE && b->kind != B_TEXT &&
+        b->kind != B_BR && b->kind != B_ROW && b->kind != B_ROW_GROUP && P->untransformed != b)
+        paint_backdrop(P, b, NULL, 1);
     if (b->kind != B_INLINE && b->kind != B_TEXT && b->kind != B_BR && b->kind != B_ROW && b->kind != B_ROW_GROUP) {
         if (P->mode == M_PAINT && visible) {
             bool skip_bg = (P->canvas_bg_from == 1 && b->node == P->d->html && b->node) ||
@@ -3944,7 +4433,13 @@ done:
         free(saved);
     }
     if (P->mode == M_BOUNDS) {
-        if (P->bounds_valid && box_clips(b)) clip_bounds(b, P->bounds, &P->bounds_valid);
+        /* the filter's spread, then the clip (a filtered box's own clip is its caller's) */
+        if (P->bounds_valid && filter) {
+            float outset[4], reach[4];
+            web_filter_extent(filter, outset, reach);
+            P->bounds[0] -= outset[0]; P->bounds[1] -= outset[1]; P->bounds[2] += outset[2]; P->bounds[3] += outset[3];
+        }
+        if (P->bounds_valid && P->unfiltered != b && box_clips(b)) clip_bounds(b, P->bounds, &P->bounds_valid);
         b->paint_bounds_generation = P->bounds_generation;
         b->paint_bounds_valid = P->bounds_valid;
         if (P->bounds_valid) memcpy(b->paint_bounds, P->bounds, sizeof b->paint_bounds);
@@ -4094,6 +4589,13 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
     paint_debug_begin(d);
     d->view_x=doc_x; d->view_y=doc_y; /* frame crops use this paint's real scroll */
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+    /* A whole paint lists the backdrops again; a damage repaint keeps the list of the layout it
+       was made at (one with none recorded takes the new layout). Scrolling repaints whole, and a
+       restyle's damage holds what moved, old and new, so paint_backdrop moves its entry. */
+    bool whole = c->cx0 <= x && c->cy0 <= y && c->cx1 >= x + w && c->cy1 >= y + h;
+    if (whole) { d->backdrop_count = 0; d->backdrop_overflow = false; }
+    if (whole || (!d->backdrop_count && !d->backdrop_overflow)) d->backdrop_layout = d->layout_revision;
+    else if (d->backdrop_layout != d->layout_revision) d->backdrop_overflow = true;
     gfx_clip(c, x, y, w, h);
     bool snapshot_root=!d->frame_parent;
     if(snapshot_root){
@@ -4190,6 +4692,23 @@ void web_hit_index_free(web_doc *d) {
     if(!d||!d->hit_index)return;
     free(d->hit_index->items);free(d->hit_index->branches);free(d->hit_index->regions);free(d->hit_index);d->hit_index=NULL;
 }
+/* Maps a document rectangle (x, y, w, h) of b's subtree to what the page shows of it: grown by the
+   spread of each filter that maps it (b's own when own) and mapped through each transform, from b
+   up. A filter whose url() is ignored still counts: the rectangle only grows. */
+static void effect_rect(const box_t *b, bool own, double r[4]) {
+    for (const box_t *a = own ? b : b->parent; a; a = a->parent) {
+        const struct css_filter *f = a->st && a->kind != B_TEXT && a->kind != B_BR ? a->st->filter : NULL;
+        if (f && f->effects) {
+            float outset[4], reach[4];
+            web_filter_extent(f, outset, reach);
+            r[0] -= outset[0]; r[1] -= outset[1]; r[2] += (double)outset[0] + outset[2]; r[3] += (double)outset[1] + outset[3];
+        }
+        double m[6], out[4];
+        if (!box_transform_matrix(a, m)) continue;
+        affine_rect(m, r[0], r[1], r[0] + r[2], r[1] + r[3], out);
+        r[0] = out[0]; r[1] = out[1]; r[2] = out[2] - out[0]; r[3] = out[3] - out[1];
+    }
+}
 /* Unites a document rectangle (left, top, right, bottom) with the next paint's damage. */
 static void damage_add(web_doc *d,const float rect[4]){
     if(!d->paint_damage_valid){memcpy(d->paint_damage,rect,sizeof d->paint_damage);d->paint_damage_valid=true;return;}
@@ -4209,9 +4728,9 @@ void doc_paint_damage(web_doc *d,node_t *node){
     float bottom=y+box->h+box->p[0]+box->p[2]+box->b[0]+box->b[2]+4;
     float ink[4]={x,y,right,bottom};
     if(box->st)shadow_ink_bounds(box->st,x+2,y+2,right-x-4,bottom-y-4,ink);
-    /* The box's own transform and those above it move what it paints. */
+    /* The box's own filter and transform and those above it spread and move what it paints. */
     double r[4]={ink[0],ink[1],(double)ink[2]-ink[0],(double)ink[3]-ink[1]};
-    box_transform_rect(box,r);
+    effect_rect(box,true,r);
     for(int i=0;i<4;i++)if(!isfinite(r[i])){d->paint_damage_full=true;return;}
     ink[0]=(float)r[0];ink[1]=(float)r[1];ink[2]=(float)(r[0]+r[2]);ink[3]=(float)(r[1]+r[3]);
     damage_add(d,ink);
@@ -4254,9 +4773,9 @@ static bool restyle_box_ink(web_doc *d,box_t *b,float rect[4]){
     box_visual_memo_end(memo);
     if(P.failed)return false;
     if(!P.bounds_valid){rect[0]=rect[1]=INFINITY;rect[2]=rect[3]=-INFINITY;return true;}
-    /* the subtree's own transform is in its bounds; its antialiased edges reach a pixel out */
+    /* the subtree's own filter and transform are in its bounds; its antialiased edges reach a pixel out */
     double r[4]={P.bounds[0]-2,P.bounds[1]-2,P.bounds[2]-P.bounds[0]+4,P.bounds[3]-P.bounds[1]+4};
-    box_transform_rect(b->parent,r);
+    effect_rect(b,false,r);
     for(int i=0;i<4;i++)if(!isfinite(r[i]))return false;
     rect[0]=(float)r[0];rect[1]=(float)r[1];rect[2]=(float)(r[0]+r[2]);rect[3]=(float)(r[1]+r[3]);
     return true;
@@ -4307,6 +4826,18 @@ void doc_restyle_damage_commit(web_doc *d){
 bool web_take_paint_damage(web_doc *d,int *x,int *y,int *w,int *h){
     if(!d)return false;
     bool valid=d->paint_damage_valid&&!d->paint_damage_full&&d->layout_valid&&!d->need_style&&!d->need_boxes;
+    /* A backdrop is what is painted under its whole border box, read where it is drawn: damage
+       that reaches one repaints all of it, and that may reach another. */
+    if(valid&&(d->backdrop_overflow||d->backdrop_count)){
+        if(d->backdrop_overflow||d->backdrop_layout!=d->layout_revision){valid=false;d->paint_damage_full=true;}
+        else for(bool grown=true;grown;){
+            grown=false;
+            for(unsigned i=0;i<d->backdrop_count;i++){
+                const float *r=d->backdrop_regions[i].rect,*g=d->paint_damage;
+                if(r[0]<g[2]&&r[2]>g[0]&&r[1]<g[3]&&r[3]>g[1]&&(r[0]<g[0]||r[1]<g[1]||r[2]>g[2]||r[3]>g[3])){damage_add(d,r);grown=true;}
+            }
+        }
+    }
     if(d->profile_enabled){
         if(valid)damage_profile.taken_partial++;
         else if(d->paint_damage_full)damage_profile.taken_full++;
@@ -4554,6 +5085,93 @@ bool doc_caret_at(web_doc *d, double x, double y, node_t **node, uint32_t *offse
     return layout_position_at(box ? box : d->root_box, local_x, local_y, node, offset);
 }
 
+/* ---- the pointer (css-ui-4 §5.1) */
+/* auto: the text beam over text that can be selected (a button's label is the button's) or edited,
+   the arrow elsewhere */
+static uint32_t cursor_auto(web_doc *d, node_t *element, const struct pctx *P) {
+    box_t *box = element ? element->box : NULL;
+    if (element && text_control_box(box) && box->node == element)
+        return web_control_disabled(element) ? N_POINTER_DEFAULT : N_POINTER_TEXT;
+    if (element && doc_node_editable(d, element)) return N_POINTER_TEXT;
+    const box_t *block = P->hit_run_block;
+    /* a run of text (generated text too), not an atomic inline in the line */
+    const struct run *run = block && P->hit_run >= 0 && P->hit_run < block->nruns ? &block->runs[P->hit_run] : NULL;
+    if (!run || run->atomic || !run->node) return N_POINTER_DEFAULT;
+    for (node_t *n = element; n; n = doc_flat_parent(n))
+        if (n->type == N_ELEM && !n->foreign && n->tag == T_button) return N_POINTER_DEFAULT;
+    return N_POINTER_TEXT;
+}
+static int cursor_round(float v, int size) {
+    int i = (int)floorf(v + .5f);
+    return i < 0 ? 0 : i > size - 1 ? size - 1 : i; /* a hot spot outside the image is clamped to it */
+}
+/* the first image of the list that has loaded and the native pointer can show, at its natural size
+   (its pixels at its resolution); out->pending when one before it still loads */
+static bool cursor_image(web_doc *d, const struct css_cursor *cursor, struct web_cursor *out) {
+    for (uint32_t i = 0; i < cursor->count; i++) {
+        const struct css_cursor_image *im = &cursor->images[i];
+        float dppx = 1;
+        int index = doc_cursor_image(d, im, &dppx);
+        if (index < 0 || index >= d->images.n) continue;
+        const struct web_image *source = d->images.v[index];
+        if (!source->done) { out->pending = true; continue; }
+        const image_t *img = source->img;
+        if (!img || img->w < 1 || img->h < 1 || !(dppx > 0)) continue;
+        float fw = img->w / dppx, fh = img->h / dppx;
+        if (!(fw < N_POINTER_IMAGE_MAX + .5f) || !(fh < N_POINTER_IMAGE_MAX + .5f)) continue;
+        int w = MAX(1, (int)floorf(fw + .5f)), h = MAX(1, (int)floorf(fh + .5f));
+        bool resize = w != img->w || h != img->h;
+        /* an SVG is drawn again at the size, a raster image resampled */
+        image_t *scaled = !resize ? NULL : source->svg ? image_decode_svg(source->svg, source->svg_n, w, h) : image_scale(img, w, h);
+        if (resize && (!scaled || scaled->w != w || scaled->h != h)) { image_free(scaled); continue; }
+        memcpy(out->pixels, (scaled ? scaled : img)->px, (size_t)w * (size_t)h * sizeof *out->pixels);
+        image_free(scaled);
+        /* <x> <y>, else the image's own hot spot (a cursor file's), else its top left */
+        out->hot_x = cursor_round(im->hot ? im->x : img->hot ? img->hot_x / dppx : 0, w);
+        out->hot_y = cursor_round(im->hot ? im->y : img->hot ? img->hot_y / dppx : 0, h);
+        out->width = w;
+        out->height = h;
+        return true;
+    }
+    return false;
+}
+bool web_cursor_at(web_doc *d, int x, int y, struct web_cursor *out) {
+    while (d && out && !d->native_cancelled && !d->native_recovery_pending && !d->native_recovery_active && d->root_box) {
+        struct pctx P = {0};
+        struct web_hit hit = {0};
+        canvas_t dummy = {0};
+        dummy.cx0 = dummy.cy0 = -1000000000;
+        dummy.cx1 = dummy.cy1 = 1000000000;
+        P.d = d; P.c = &dummy; P.mode = M_HIT; P.hx = (float)x; P.hy = (float)y; P.hit = &hit;
+        if (!hit_index_lookup(&P)) walk(&P);
+        if (P.failed) return false;
+        node_t *target = P.target;
+        /* inside a frame: its document's pointer, as web_node_at enters it */
+        if (target && web_frame_element(target)) {
+            struct web_frame *frame = web_frame_find(d, target);
+            box_t *box = target->box;
+            if (frame && frame->document && !frame->detached && frame->document->root_box && box) {
+                int child_x = x - (int)box_visual_x(box) + frame->scroll_x, child_y = y - (int)box_visual_y(box) + frame->scroll_y;
+                if (child_x >= frame->scroll_x && child_y >= frame->scroll_y && child_x < frame->scroll_x + (int)box->w &&
+                    child_y < frame->scroll_y + (int)box->h) { d = frame->document; x = child_x; y = child_y; continue; }
+            }
+        }
+        out->shape = N_POINTER_DEFAULT;
+        out->width = out->height = out->hot_x = out->hot_y = 0;
+        out->pending = false;
+        if (target && web_dialog_inert(d, target)) return true;
+        node_t *element = target && target->type != N_ELEM ? doc_flat_parent(target) : target;
+        /* no box under the point: the canvas, the root element's */
+        const style_t *st = element && element->style ? element->style : d->root_box->st;
+        if (!st) return true;
+        const struct css_cursor *cursor = &css_style_ui(st)->cursor;
+        cursor_image(d, cursor, out);
+        out->shape = cursor->shape == CSS_CURSOR_AUTO ? cursor_auto(d, element, &P) : cursor->shape;
+        return true;
+    }
+    return false;
+}
+
 struct hit_found { const struct hit_primitive **items; size_t count, capacity; bool failed; };
 static void hit_collect(const struct web_hit_index *index,size_t id,float x,float y,struct hit_found *found){
     const struct hit_branch *branch=&index->branches[id];
@@ -4713,15 +5331,19 @@ struct fmatch {
     float best_y, first_y;
     box_t *best_b, *first_b;
     int best_r, first_r;
-    size_t best_off, first_off;
+    size_t best_off, first_off, best_len, first_len;
     bool failed;
 };
 
-static bool ieq_at(const char *s, size_t n, const char *q, size_t qn) {
-    if (qn > n) return false;
-    for (size_t i = 0; i < qn; i++)
-        if (lower((unsigned char)s[i]) != lower((unsigned char)q[i])) return false;
-    return true;
+/* How many bytes of s, from its start, match q ignoring ASCII case (0: none). Soft hyphens of s within
+   the match are skipped: invisible, and hyphenation must not affect searching (css-text-4 §6.3). */
+static size_t find_match(const char *s, size_t n, const char *q, size_t qn) {
+    size_t i = 0;
+    for (size_t j = 0; j < qn; j++, i++) {
+        while (j && i + 1 < n && (unsigned char)s[i] == 0xC2 && (unsigned char)s[i + 1] == 0xAD) i += 2;
+        if (i >= n || lower((unsigned char)s[i]) != lower((unsigned char)q[j])) return 0;
+    }
+    return i;
 }
 
 /* Flat-tree iteration keeps slots/shadow contents in native render order and
@@ -4874,14 +5496,16 @@ static void find_in(struct fmatch *F, box_t *b) {
         int *owner;
         if (!find_block_text(b, &t, &owner)) { F->failed = true; return; }
         for (size_t k = 0; F->qn<=t.n && k<=t.n-F->qn; k++) {
-            if (!ieq_at(t.p + k, t.n - k, F->q, F->qn)) continue;
+            size_t length = find_match(t.p + k, t.n - k, F->q, F->qn);
+            if (!length) continue;
             size_t j = k;
             while (j < t.n && owner[j] < 0) j++;
             if (j >= t.n) break;
             int ri = owner[j];
             float y = cy(b) + b->runs[ri].y;
-            if (!F->first_b) F->first_b = b, F->first_r = ri, F->first_y = y, F->first_off = k;
-            if (y >= (float)F->from_y && !F->best_b) F->best_b = b, F->best_r = ri, F->best_y = y, F->best_off = k;
+            if (!F->first_b) F->first_b = b, F->first_r = ri, F->first_y = y, F->first_off = k, F->first_len = length;
+            if (y >= (float)F->from_y && !F->best_b)
+                F->best_b = b, F->best_r = ri, F->best_y = y, F->best_off = k, F->best_len = length;
         }
         free(owner);
         sb_free(&t);
@@ -4966,9 +5590,9 @@ int web_find(web_doc *d, const char *text, int from_y) {
     }
     box_t *b = F.best_b ? F.best_b : F.first_b;
     if (!b) return -1;
-    size_t off = F.best_b ? F.best_off : F.first_off;
+    size_t off = F.best_b ? F.best_off : F.first_off, length = F.best_b ? F.best_len : F.first_len;
     float y = F.best_b ? F.best_y : F.first_y;
-    if (!highlight(b, off, F.qn)) return -2;
+    if (!highlight(b, off, length)) return -2;
     const struct run *r = &b->runs[F.best_b ? F.best_r : F.first_r];
     float top, bottom;
     layout_run_extent(r, &top, &bottom);

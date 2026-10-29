@@ -465,6 +465,13 @@ n_result win_direct(window_t *win, bool wanted);
    nothing: an animation waits for the display before it decides what to draw. One EV_FRAME answers the
    request and the presents before it; a window that is not shown gets it when it is shown again. */
 n_result win_frame(window_t *win);
+/* The pointer the window wants over its client area (SYS_WIN_POINTER): one of the desktop's shapes
+   (N_POINTER_*), or an image of at most N_POINTER_IMAGE_MAX square with its hot spot (copied at the
+   call) and the shape for where an image is not shown. The desktop draws it, and its own shapes
+   over its menus, frames and resize band. It stays until the next call; a new window has
+   N_POINTER_DEFAULT. */
+n_result win_pointer(window_t *win, const struct n_win_pointer *pointer);
+n_result win_pointer_shape(window_t *win, uint32_t shape);
 /* wait up to timeout_ms (-1 = forever) for an event; returns 1 if *e was filled, 0 on timeout,
    negative once the window is gone. EV_RESIZE is handled (buffer reallocated) before being returned. */
 n_result win_event(window_t *win, struct gui_event *e, int timeout_ms);

@@ -187,6 +187,9 @@ typedef struct node {
     struct node *style_retired_next;
     bool style_dirty, style_children_dirty;
     bool style_self_dirty; /* only this element's own match changed */
+    /* a child's style read sibling-index() or sibling-count() (css-values-5 §10): a change of the
+       child list restyles the children; css workers set it, so it is written atomically */
+    bool style_counts_children;
     uint8_t style_mark_source; /* --debug-js: what set style_dirty */
     uint8_t style_form_state; /* supervisor-published form pseudo snapshot; cascade reads only */
     uint32_t style_subtree_work; /* elements the next cascade restyles here, counted before it splits */
@@ -239,6 +242,7 @@ typedef struct node {
     bool checked, selected_set;
     bool click_in_progress;
     bool constructing_form_entries; /* entry-list construction and formdata event reentry guard */
+    bool firing_submission_events; /* a form's HTML "firing submission events" (web_form_submit) */
     int image_submit_x,image_submit_y; /* selected image CSS point, initially 0,0; non-pointer activation preserves it */
     bool indeterminate; /* native checkbox display state, independent of checkedness */
     struct web_form_files *files;
@@ -410,10 +414,10 @@ bool css_calc_serialize(sbuf *b, const struct css_calc *c, const char *const *ke
    caller's to clamp. a: the parse's memory (NULL: scratch); *kind: the type it is */
 bool css_numeric_read(const char *s, size_t n, unsigned accept, const struct cx *cx, arena_t *a, double basis, double *out,
                       unsigned *kind);
-/* text whose math functions are each serialized as a specified value (§10.13), the rest as written;
-   false: none, or a value with var() */
+/* text whose math functions are each serialized as a specified value (§10.13) and whose numbers,
+   percentages and dimensions outside them as CSSOM's component values (0.5em, not .5em), the rest as
+   written; false: neither in it, or a value with var() */
 bool css_calc_specified(const char *s, size_t n, unsigned accept, sbuf *out);
-struct css_filter_step { float value; bool percentage; };
 struct css_corner_radius { len_t axis[2]; }; /* x resolves against width, y against height */
 struct style;
 bool css_radius_serialize(const struct style *,int,sbuf *,web_doc *);
@@ -433,12 +437,47 @@ struct radius_cache;
 void web_radius_cache_free(struct radius_cache **);
 struct clip_cache;
 void web_clip_cache_free(struct clip_cache **);
+/* A <filter-value-list> (Filter Effects 1 §5, filter and backdrop-filter): its computed value, the
+   functions in order with their omitted arguments filled in (§6.2). value is the amount as a number
+   (a percentage over 100; grayscale, invert, opacity and sepia clamped to 1), blur's and
+   drop-shadow's standard deviation in px, hue-rotate's angle in degrees; x and y are drop-shadow's
+   offset in px. Its colour is held as a shadow's (COLOR_CURRENT: currentcolor, resolved against the
+   element's colour where it is used). A url() keeps the URL as written. */
+enum { CSS_FILTER_URL, CSS_FILTER_BLUR, CSS_FILTER_BRIGHTNESS, CSS_FILTER_CONTRAST, CSS_FILTER_DROP_SHADOW,
+       CSS_FILTER_GRAYSCALE, CSS_FILTER_HUE_ROTATE, CSS_FILTER_INVERT, CSS_FILTER_OPACITY, CSS_FILTER_SATURATE,
+       CSS_FILTER_SEPIA };
+struct css_filter_step {
+    uint8_t kind;
+    float value, x, y;
+    uint32_t color;
+    const struct css_color_value *color_value; /* the exact computed colour when 8 bits cannot hold it */
+    const char *url;
+};
 struct css_filter {
     size_t count;
-    float opacity; /* product of used, range-clamped steps; not the computed list */
+    /* the used amount the opacity() functions multiply to when no other step changes a pixel or
+       reads a reference (paint.c composites such a list as group opacity), else 1 */
+    float opacity;
+    bool effects; /* a step other than opacity() that changes pixels, or a url() */
     struct css_filter_step steps[];
 };
-bool css_filter_serialize(const struct css_filter *filter, sbuf *out, web_doc *d);
+/* its computed value (§6.3); st: the element, whose colour currentcolor is (NULL: currentcolor kept) */
+bool css_filter_serialize(const struct style *st, const struct css_filter *filter, sbuf *out, web_doc *d);
+/* CSSOM: the specified value's serialization (§6.3); false: not none or a <filter-value-list> */
+bool css_filter_specified(const char *s, size_t n, sbuf *out);
+/* filter.c: the functions' pixels (Filter Effects 1 §13) on premultiplied ARGB. A drop-shadow()'s
+   used colour, its currentcolor st's colour */
+uint32_t web_filter_shadow_color(const struct style *st, const struct css_filter_step *s);
+/* how far f's output reaches past its input on each side (left, top, right, bottom) in px, and how
+   far an output pixel reads the input past itself (reach); url() steps add nothing */
+void web_filter_extent(const struct css_filter *f, float outset[4], float reach[4]);
+/* f's functions in order over the w×h surface px (pitch w); url() steps are the caller's. mirror:
+   backdrop-filter's edge mode (Filter Effects 2 §2.1), else transparent past the edges. d (may be
+   NULL): checkpoints and cancellation. False: cancelled or out of memory */
+bool web_filter_apply(web_doc *d, const struct style *st, const struct css_filter *f, uint32_t *px, int w, int h,
+                      bool mirror);
+/* color-interpolation-filters (§10): the initial linearRGB is 0 */
+enum { CIF_LINEARRGB, CIF_AUTO, CIF_SRGB };
 /* The shape values (shape.c): <basic-shape> (css-shapes-1 §3: inset(), circle(), ellipse(),
    polygon(), path(), shape(), with rect() and xywh() computing to inset()), a reference box
    alone, ray() (motion-1 §2.1.1) and <url>. clip-path, shape-outside and offset-path hold the
@@ -608,6 +647,68 @@ extern const struct css_anchor css_anchor_initial;
 bool css_float_shape_equal(const struct css_float_shape *a, const struct css_float_shape *b);
 bool css_offset_equal(const struct css_offset *a, const struct css_offset *b);
 bool css_anchor_equal(const struct css_anchor *a, const struct css_anchor *b);
+/* CSS Text 3/4 and CSS Text Decoration 4's inherited text properties that few elements set: a style's
+   text group (style_t's text; NULL: every one initial). Unlike the other groups it is inherited, and
+   as a whole: an element that sets none of them shares its parent's record (css_style_init copies the
+   parent), so inheriting it costs a pointer; one that sets one writes a copy. */
+enum { CSS_WORD_BREAK_NORMAL, CSS_WORD_BREAK_BREAK_ALL, CSS_WORD_BREAK_KEEP_ALL, CSS_WORD_BREAK_MANUAL,
+       CSS_WORD_BREAK_AUTO_PHRASE, CSS_WORD_BREAK_BREAK_WORD };
+enum { CSS_LINE_BREAK_AUTO, CSS_LINE_BREAK_LOOSE, CSS_LINE_BREAK_NORMAL, CSS_LINE_BREAK_STRICT,
+       CSS_LINE_BREAK_ANYWHERE };
+enum { CSS_OVERFLOW_WRAP_NORMAL, CSS_OVERFLOW_WRAP_BREAK_WORD, CSS_OVERFLOW_WRAP_ANYWHERE };
+enum { CSS_HYPHENS_MANUAL, CSS_HYPHENS_NONE, CSS_HYPHENS_AUTO };
+/* text-underline-position: auto is none of them; at most one of FROM_FONT and UNDER, of LEFT and RIGHT */
+enum { CSS_UNDERLINE_FROM_FONT = 1, CSS_UNDERLINE_UNDER = 2, CSS_UNDERLINE_LEFT = 4, CSS_UNDERLINE_RIGHT = 8 };
+#define CSS_TEXT_AUTO INT32_MIN /* hyphenate-limit-chars' auto, hyphenate-limit-lines' no-limit */
+struct css_text {
+    /* text-shadow, the first on top: no spread and never inset (css-text-decor-3 §4); a colour that is
+       currentcolor stays COLOR_CURRENT, which each style resolves against its own color */
+    const struct css_box_shadow *shadow;
+    const char *hyphenate_character; /* UTF-8; NULL: auto */
+    int32_t hyphenate_limit_chars[3]; /* the word, before and after the hyphenation point; CSS_TEXT_AUTO: auto */
+    int32_t hyphenate_limit_lines;    /* CSS_TEXT_AUTO: no-limit */
+    struct css_tab_size { float value; bool length; } tab_size; /* spaces' advances, or (length) px */
+    len_t underline_offset;           /* text-underline-offset; LK_AUTO: auto */
+    uint8_t word_break, line_break, overflow_wrap, hyphens; /* CSS_WORD_BREAK_* ... CSS_HYPHENS_* */
+    uint8_t underline_position;       /* CSS_UNDERLINE_* */
+};
+extern const struct css_text css_text_initial;
+bool css_text_equal(const struct css_text *a, const struct css_text *b);
+/* the values of a and b that line breaking and white-space processing read */
+bool css_text_layout_equal(const struct css_text *a, const struct css_text *b);
+/* text-decoration-color, -style and -thickness: a style's decoration group (style_t's decoration;
+   NULL: currentcolor, solid, auto). Not inherited; text-decoration-line is style_t's text_decoration. */
+enum { CSS_DECORATION_SOLID, CSS_DECORATION_DOUBLE, CSS_DECORATION_DOTTED, CSS_DECORATION_DASHED,
+       CSS_DECORATION_WAVY };
+struct css_decoration {
+    /* argb COLOR_CURRENT: currentcolor; exact: the computed colour when 8 bits cannot hold it */
+    struct css_decoration_color { uint32_t argb; const struct css_color_value *exact; } color;
+    len_t thickness;                          /* LK_AUTO: auto; LK_NONE: from-font; a percentage of 1em */
+    uint8_t style;                            /* CSS_DECORATION_* */
+};
+extern const struct css_decoration css_decoration_initial;
+bool css_decoration_equal(const struct css_decoration *a, const struct css_decoration *b);
+/* A decorating box's lines (css-text-decor-4 §2: an element's own text-decoration-line, drawn over its
+   in-flow inline content and propagated to its in-flow descendants, but not into out-of-flow ones nor
+   the contents of atomic inlines). A style holds the list of every decorating box whose lines draw
+   over its text, its own first; each entry holds the decorating box's used values, so it outlives
+   that box's style (descendants borrow the list as they borrow inherited values). */
+struct css_decorating {
+    const struct css_decorating *next;
+    font_t *font;          /* the decorating box's first available font, NULL the bitmap font */
+    float font_size;
+    float thickness;       /* px; NAN: auto (from-font: the font gives no metric here, so auto too) */
+    float underline_offset; /* px; NAN: auto */
+    float shift;           /* the decorating box's baseline shift (vertical-align) within its line */
+    uint32_t color;        /* the used text-decoration-color */
+    uint8_t lines, style, underline_position;
+};
+bool css_decorating_equal(const struct css_decorating *a, const struct css_decorating *b);
+/* the used text-shadow colour of a shadow of st's text group */
+uint32_t css_text_shadow_color(const struct style *st, const struct css_box_shadow *shadow);
+/* tab-size's tab stop interval in px for st's preserved tabs, given space: the advance of a space
+   (letter-spacing and word-spacing included) of their nearest block container (css-text-4 §4.4) */
+float css_tab_interval(const struct style *st, float space);
 enum css_offset_property { CSS_OFFSET_POSITION, CSS_OFFSET_ANCHOR, CSS_OFFSET_ROTATE };
 bool css_offset_parse(enum css_offset_property which, const char *v, size_t n, struct cx *cx, void *out, sbuf *specified);
 bool css_offset_serialize(enum css_offset_property which, const void *value, sbuf *out, web_doc *d);
@@ -761,6 +862,37 @@ struct gap_decorations {
     uint32_t n;
     uint32_t gaps[2]; /* the gaps of each axis, the count the value lists assign to */
 };
+/* CSS Basic User Interface 4 (css-ui-4 §5, §6.2, §6.3): the pointer over the element and the
+   colours of its caret and of its controls' accents. All inherited; a style holds them as one group
+   (style_t's ui), NULL being the initial ones. light-dark() is resolved to one side by the element's
+   used color-scheme when the value is computed. */
+/* a <cursor-image>'s image (§5.1): url() (one choice, resolution 0), or a <url-set> (image-set() of
+   url()s or strings: each choice's resolution in dppx, 0 when it gives none, and its type() or NULL) */
+struct css_cursor_choice { const char *url, *type; float dppx; };
+struct css_cursor_image {
+    const struct css_cursor_choice *choices;
+    uint32_t count;
+    bool set;    /* written as image-set() */
+    bool hot;    /* <x> <y> given: the hot spot, in the image's pixels from its top left */
+    float x, y;
+};
+#define CSS_CURSOR_AUTO 0xFFu /* the shape auto: the user agent's choice by what is under the pointer */
+/* cursor: the images to try in order, then the shape (a native N_POINTER_* of abi.h, or auto) */
+struct css_cursor {
+    const struct css_cursor_image *images;
+    uint32_t count;
+    uint8_t shape;
+};
+/* auto | <color>: a computed colour held as a shadow's is (argb COLOR_CURRENT for currentcolor, exact
+   when 8 bits cannot hold it) */
+struct css_ui_color { uint32_t argb; const struct css_color_value *exact; bool automatic; };
+struct css_ui {
+    struct css_cursor cursor;
+    struct css_ui_color caret[2]; /* caret-color: the caret's, and the text's under a block caret */
+    struct css_ui_color accent;   /* accent-color */
+};
+extern const struct css_ui css_ui_initial;
+bool css_ui_equal(const struct css_ui *a, const struct css_ui *b); /* NULL: the initial values */
 /* A computed shape's geometry against its reference box r (x y w h, any one space). */
 void css_shape_ellipse(const struct css_shape *s, const float r[4], double centre[2], double radii[2]); /* circle(), ellipse() */
 /* inset(): the inner rectangle (x y w h) and its corner radii TL TR BR BL, scaled to fit (css-backgrounds-3 §5.5) */
@@ -858,10 +990,9 @@ struct css_list {
 extern const struct css_list css_list_initial;
 /* content (CSS Generated Content 3 §1.1): the items of its content list, then those of its
    alternative text. A style's content NULL is normal; css_content_none is none. attr() is
-   substituted at computed-value time, as a string item. */
+   substituted before the value is parsed (css.c's subst), like var(). */
 enum { CSS_CONTENT_STRING, CSS_CONTENT_COUNTER, CSS_CONTENT_COUNTERS, CSS_CONTENT_OPEN_QUOTE,
-       CSS_CONTENT_CLOSE_QUOTE, CSS_CONTENT_NO_OPEN_QUOTE, CSS_CONTENT_NO_CLOSE_QUOTE, CSS_CONTENT_IMAGE,
-       CSS_CONTENT_ATTR /* attr() as written, in a value no element computes (a declaration's CSSOM text) */ };
+       CSS_CONTENT_CLOSE_QUOTE, CSS_CONTENT_NO_OPEN_QUOTE, CSS_CONTENT_NO_CLOSE_QUOTE, CSS_CONTENT_IMAGE };
 struct css_content_item {
     uint8_t kind;
     const char *text;      /* STRING: the string; COUNTER(S): the counter's name */
@@ -884,7 +1015,9 @@ void css_content_strings(const struct css_content *c, sbuf *out);
 void css_counter_text(const struct css_counter_style *style, int32_t value, bool marker, sbuf *out);
 enum { BS_NONE, BS_HIDDEN, BS_SOLID, BS_DASHED, BS_DOTTED, BS_DOUBLE, BS_GROOVE, BS_RIDGE, BS_INSET, BS_OUTSET };
 enum { TT_NONE, TT_UPPER, TT_LOWER, TT_CAPITALIZE };
-enum { TD_UNDERLINE = 1, TD_OVERLINE = 2, TD_LINE_THROUGH = 4 };
+/* text-decoration-line (css-text-decor-4 §2.1): the lines, or one of the two error lines alone */
+enum { TD_UNDERLINE = 1, TD_OVERLINE = 2, TD_LINE_THROUGH = 4, TD_BLINK = 8, TD_SPELLING_ERROR = 16,
+       TD_GRAMMAR_ERROR = 32 };
 enum { OV_VISIBLE, OV_HIDDEN, OV_SCROLL, OV_AUTO, OV_CLIP };
 enum { FD_ROW, FD_ROW_REVERSE, FD_COLUMN, FD_COLUMN_REVERSE };
 enum { FW_NOWRAP, FW_WRAP, FW_WRAP_REVERSE };
@@ -961,7 +1094,16 @@ struct custom_prop {
     /* Only on the first of one element's own declarations: a name index of
        that element's declarations and the inherited chain after them. */
     const struct var_segment *segment;
+    /* the cascade's, while it computes the element (css.c): the declared value and the URL of the
+       sheet that declared it (a registered <url> resolves against it), and CUSTOM_* */
+    const char *raw, *base;
+    uint8_t state;
 };
+/* custom_prop.state: a registered value waits for the element's font size or colour scheme (the
+   early properties) or its colour; it took part in a cycle (through them, or a substitution that
+   guarded it again: css-values-5 §8.6); attr() substituted into it (§8.7.3 attr()-tainted); its
+   computed value is not known yet this round (a substitution that reaches it computes it then) */
+enum { CUSTOM_PENDING = 1, CUSTOM_COLOR = 2, CUSTOM_CYCLE = 4, CUSTOM_TAINTED = 8, CUSTOM_LAZY = 16 };
 
 /* linear-gradient() and radial-gradient(): colour stops along a line, or out from a centre */
 #define GRAD_MAX 8
@@ -1023,7 +1165,8 @@ typedef struct style {
     uint8_t display, position, float_, clear, white_space, text_align, vertical_align, list_style,
         list_style_inside, font_style, text_transform, text_decoration, overflow, box_sizing, visibility, pointer_events,
         border_collapse, flex_direction, flex_wrap, justify_content, align_items, align_self, align_content, table_layout,
-        content_visibility,text_overflow;
+        content_visibility,text_overflow,
+        scroll_behavior; /* CSS Overflow 3: 0 auto, 1 smooth (CSSOM View "perform a scroll") */
     uint8_t border_style[4];
     uint8_t container_type;
     uint8_t box_orient;
@@ -1075,8 +1218,10 @@ typedef struct style {
     float border_spacing;
     float opacity;
     const struct css_filter *filter; /* NULL: none; identity effects still establish a context */
+    const struct css_filter *backdrop_filter; /* Filter Effects 2 §2; NULL: none */
+    uint8_t color_interpolation_filters; /* CIF_*; inherited, initial linearRGB */
     const struct css_shape *clip_path; /* NULL: none; a computed-arena value */
-    /* Groups of rarely set properties that are not inherited, held by pointer so that every
+    /* Groups of rarely set properties, all but text not inherited, held by pointer so that every
        element's style does not carry them (css_style_float_shape, css_style_offset read them).
        NULL: all their values initial. A group is a computed-arena record that no one writes once a
        style holds it: cssprop.c writes a longhand into a copy and points the style at the copy. */
@@ -1086,6 +1231,14 @@ typedef struct style {
     const struct css_anchor *anchor;           /* Anchor Positioning */
     const struct css_background *background;   /* the layered background lists */
     const struct css_border_image *border_image, *mask_border;
+    const struct css_ui *ui; /* cursor, caret-color, accent-color: inherited, the group a parent's style shares */
+    const struct css_decoration *decoration;   /* text-decoration-color, -style and -thickness */
+    /* an inherited group: the text properties of struct css_text */
+    const struct css_text *text;
+    /* not computed values: the decorating boxes whose lines draw over this style's text, and the
+       baseline shift of its box within its line (css_style_decorations) */
+    const struct css_decorating *decorations;
+    float baseline_shift;
     struct css_clip_rect clip;
     const struct css_transform *transform;
     struct css_translate translate;
@@ -1119,6 +1272,9 @@ typedef struct style {
     bool before_generated, after_generated; /* computed pseudo bodies need not generate boxes */
     bool explicit_inherit; /* some property that is not inherited took its parent's value */
     struct custom_prop *vars;
+    /* where vars reaches the inherited chain: the entries before it are the element's own (a registered
+       property that does not inherit takes only those, else its initial value) */
+    const struct custom_prop *vars_inherited;
     struct style *before, *after, *backdrop, *placeholder;
     struct style *marker; /* a list item's ::marker with declarations of its own; NULL: css_style_marker() */
 } style_t;
@@ -1157,6 +1313,28 @@ static inline const struct css_border_image *css_style_mask_border(const style_t
 }
 static inline const struct css_mask *css_style_mask(const style_t *s) {
     return s->mask ? s->mask : &css_mask_initial;
+}
+static inline const struct css_ui *css_style_ui(const style_t *s) {
+    return s->ui ? s->ui : &css_ui_initial;
+}
+/* the used colour of caret-color's caret (auto: currentcolor), and of accent-color (false: auto) */
+uint32_t css_ui_caret_color(const style_t *st);
+bool css_ui_accent_color(const style_t *st, uint32_t *argb);
+static inline const struct css_decoration *css_style_decoration(const style_t *s) {
+    return s->decoration ? s->decoration : &css_decoration_initial;
+}
+static inline const struct css_text *css_style_text(const style_t *s) {
+    return s->text ? s->text : &css_text_initial;
+}
+/* how far vertical-align raises an inline box's baseline above its parent's (sub, super, a length;
+   the line-relative values align the box in layout.c instead) */
+static inline float css_style_baseline_shift(const style_t *st) {
+    switch (st->vertical_align) {
+    case VA_SUB: return -st->font_size * 0.25f;
+    case VA_SUPER: return st->font_size * 0.4f;
+    case VA_LEN: return st->vertical_align_px;
+    }
+    return 0;
 }
 
 /* ---------------------------------------------------------------- stylesheets */
@@ -1222,11 +1400,14 @@ struct css_rule_info {
 #define CSS_NESTED_DECLARATIONS_MARKER "@-nocturne-nested-declarations"
 
 /* the document's styling state */
+struct css_script_registration;
 struct styling {
     pvec sheets;   /* sheet_t*, in cascade order */
     css_ctx *ctx;  /* the sheets' rule indexes bound for the current viewport */
     int index_w, index_h;
     bool index_dirty, index_scripting, index_quirks;
+    /* css-properties-values-api-1 [[registeredPropertySet]]: CSS.registerProperty()'s, newest first */
+    struct css_script_registration *registered;
 };
 
 /* imports: receives struct css_import* for each @import, to be fetched and added with their order */
@@ -1347,11 +1528,55 @@ void css_styles_release(web_doc *d);
 bool css_restyled(const node_t *n);
 bool css_style_layout_equal(const style_t *a, const style_t *b);
 const struct custom_prop *css_custom_property(const style_t *s, const char *name); /* computed --name, or NULL */
+/* ---- registered custom properties (css-properties-values-api-1). cssprop.c reads a registration's
+   syntax string (§5) and computes a value against it (§2.4); css.c owns the document's registrations:
+   CSS.registerProperty()'s, else the last valid @property of the active sheets (§2.1) */
+enum { CSS_SYNTAX_IDENT, CSS_SYNTAX_ANGLE, CSS_SYNTAX_COLOR, CSS_SYNTAX_CUSTOM_IDENT, CSS_SYNTAX_IMAGE,
+       CSS_SYNTAX_INTEGER, CSS_SYNTAX_LENGTH, CSS_SYNTAX_LENGTH_PERCENTAGE, CSS_SYNTAX_NUMBER,
+       CSS_SYNTAX_PERCENTAGE, CSS_SYNTAX_RESOLUTION, CSS_SYNTAX_STRING, CSS_SYNTAX_TIME,
+       CSS_SYNTAX_TRANSFORM_FUNCTION, CSS_SYNTAX_TRANSFORM_LIST, CSS_SYNTAX_URL, CSS_SYNTAX_TYPES };
+struct css_syntax_component { uint8_t type; char multiplier; const char *ident; /* IDENT: unescaped */ };
+struct css_syntax { unsigned count; struct css_syntax_component component[]; }; /* count 0: universal */
+/* §5.4.2 consume a syntax definition: one block from a (NULL: malloc, free()), NULL on failure */
+struct css_syntax *css_syntax_parse(const char *s, size_t n, arena_t *a);
+bool css_syntax_text(const struct css_syntax *syn, sbuf *out);
+/* a component's data type name as the syntax writes it ("<length>"), or an ident component's ident */
+const char *css_syntax_type_name(const struct css_syntax_component *c);
+/* what a value's computed value depends on, read from its units, keywords and functions */
+enum { CSS_SYNTAX_DEP_FONT = 1, CSS_SYNTAX_DEP_ROOT_FONT = 2, CSS_SYNTAX_DEP_LINE_HEIGHT = 4, CSS_SYNTAX_DEP_COLOR = 8,
+       CSS_SYNTAX_DEP_SCHEME = 16, CSS_SYNTAX_DEP_CONTAINER = 32, CSS_SYNTAX_DEP_TREE = 64, CSS_SYNTAX_DEP_VIEWPORT = 128,
+       CSS_SYNTAX_DEP_REFERENCE = 256 };
+unsigned css_syntax_dependencies(const char *s, size_t n);
+/* v (var() already substituted) against syn: the index of the component it matched (§5.3: the first
+   that does), -1 none. out (NULL: only match) gets its computed value's text; cx is the element (em
+   its font size); current is what currentcolor is (NULL keeps it, *deps gets CSS_SYNTAX_DEP_COLOR);
+   base resolves a <url> */
+int css_syntax_compute(const struct css_syntax *syn, const char *v, size_t n, struct cx *cx, const char *base,
+                       const struct css_color *current, sbuf *out, unsigned *deps);
+struct css_registration {
+    const char *name;
+    const struct css_syntax *syntax;
+    bool inherits;
+    const char *initial; /* the computed initial value; NULL: the guaranteed-invalid value */
+};
+/* the registration of a custom property name (NULL: none); its records live until the next cascade */
+const struct css_registration *css_registration(web_doc *d, const char *name, size_t n);
+/* §4.1 registerProperty(): CSS_REGISTER_SYNTAX is a SyntaxError, DUPLICATE an InvalidModificationError */
+enum { CSS_REGISTER_OK, CSS_REGISTER_SYNTAX, CSS_REGISTER_DUPLICATE, CSS_REGISTER_MEMORY };
+int css_register_property(web_doc *d, const char *name, const char *syntax, bool inherits, const char *initial);
+/* st's computed value of a custom property, its registration's rules applied (NULL: guaranteed-invalid) */
+const char *css_custom_value(web_doc *d, const style_t *st, const char *name);
+/* each custom property st has a computed value for, once (each returns false to stop: false) */
+bool css_custom_values(web_doc *d, const style_t *st, bool (*each)(void *arg, const char *name, const char *value),
+                       void *arg);
+/* the syntax component a registered property's computed value matches (CSS Typed OM reifies it by that
+   component's type, css-properties-values-api-1 §6.2); NULL: unregistered or universal, or no match */
+const struct css_syntax_component *css_custom_component(web_doc *d, const char *name, const char *value);
 void css_box_change_report(web_doc *d); /* debug_js only */
 /* An animation sample changes the element's own values only: restyle it, not what selectors match. */
 void css_mark_style_own(web_doc *d, node_t *n);
 /* v with var() and env() substituted against st's custom properties; false: invalid at computed-value time */
-bool css_substitute(const style_t *st, const char *v, sbuf *out);
+bool css_substitute(web_doc *d, const style_t *st, node_t *node, const char *v, sbuf *out); /* node: what attr() reads */
 bool css_easing_parse(const char *s, size_t n, struct css_easing *out);
 /* css-easing-1 §2: the output progress for input x; before: the before flag of step easing */
 double css_easing_apply(const struct css_easing *e, double x, bool before);
@@ -1365,6 +1590,7 @@ bool css_motion_equal(const struct css_motion *a, const struct css_motion *b);
 /* Shared @media / matchMedia evaluator; optional serialization cap >= 9*n+16. */
 bool css_media_evaluate(const char *query, int vw, int vh, bool scripting, char *out, size_t cap);
 void css_styling_free(struct styling *st);
+void css_registrations_free(struct styling *st); /* at the document's end only */
 /* Around a rescan's rebuild of st->sheets: true when it rebuilt the list the
    rule bindings came from, which then stay, with the styles computed from them. */
 void css_sheets_rescan(struct styling *st);
@@ -1380,6 +1606,7 @@ struct propdef;
 const struct propdef *css_prop_lookup(const char *name, size_t n); /* NULL: not supported */
 int css_prop_count(void);
 const char *css_prop_name(int index,bool *longhand); /* actual native table, lexicographical order */
+const char *css_prop_legacy_alias(int index); /* the index-th legacy name alias (NULL past the last) */
 int css_prop_index(const struct propdef *p);
 /* computed before the other declarations, which depend on them: font-size, color-scheme, or a
    shorthand that sets one */
@@ -1455,6 +1682,19 @@ bool css_anim_discrete_second(const struct propdef *p, const style_t *a, const s
 /* value added (or accumulated) onto underlying; false: the type is not additive (value replaces) */
 bool css_anim_compose(const struct css_anim_ctx *c, const struct propdef *p, const style_t *underlying,
                       const style_t *value, bool accumulate, sbuf *out);
+/* css-properties-values-api-1 §2.5, a custom property: by computed value, as the type its values parsed
+   as against syn (cssprop.c); false: discrete (unregistered, the universal syntax, a type that does not
+   interpolate, or lists of different lengths) */
+bool css_custom_interpolate(const struct css_anim_ctx *c, const struct css_syntax *syn, const char *a, const char *b, double t,
+                            sbuf *out);
+bool css_custom_compose(const struct css_anim_ctx *c, const struct css_syntax *syn, const char *underlying, const char *value,
+                        bool accumulate, sbuf *out);
+/* the cascade's (css.c): a registered custom property's typed syntax, NULL when its values animate
+   discretely; a keyframe value of custom property name at a site, its var() and attr() substituted against
+   the base style, a CSS-wide keyword defaulted and a registered one computed: 1 the computed value into
+   out, 0 the guaranteed-invalid value, -1 no value (invalid: no keyframe) */
+const struct css_syntax *css_custom_syntax(web_doc *d, const char *name);
+int css_custom_animation_value(const struct css_anim_ctx *c, const char *name, const char *text, sbuf *out);
 const struct propdef *css_prop_at(int index);
 /* animation.c, the one time model (animation.h), as the cascade sees it. A site is one element or
    one of its pseudo-elements in one cascade. */
@@ -1466,7 +1706,13 @@ struct web_motion_site {
        keyframes' default); NULL: there is no such rule */
     const struct web_keyframe *(*keyframes)(void *arg, const char *name, const struct css_easing *easing, uint32_t *count);
     void (*emit)(void *arg, const struct propdef *p, const char *value); /* one longhand's sampled value */
+    /* one custom property's sampled computed value; NULL: the guaranteed-invalid value */
+    void (*emit_custom)(void *arg, const char *name, const char *value);
     void *arg;
+    /* the custom properties the animation origin set (web_motion_sample fills them, in ctx.a): the
+       transition origin leaves them alone, as it does the animated longhands */
+    const char **animated_customs;
+    uint32_t nanimated_customs;
 };
 /* 1: animations may apply or update (animation-name, owned CSS animations, script effects);
    2: transitions may (transition durations, owned transitions). base NULL: the records only. */
@@ -1503,6 +1749,8 @@ struct cx {
     uint8_t anchor_depth;     /* the anchor functions' fallbacks the length being parsed is in */
     css_longhand_record *record; /* when set: each longhand a shorthand gives a value, by name, with its text */
     void *record_opaque;
+    bool tree_mismatch;       /* the declaration is from an outer tree than node's (css-values-5 §10: a
+                                 tree-counting function's reference fails to match) */
 };
 /* apply a declaration (var() already substituted) unless its properties are all set; false if invalid */
 bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx);
@@ -1581,6 +1829,8 @@ bool css_color_value_text(const struct css_color_value *v, uint32_t argb, sbuf *
 bool css_color_value_specified(const struct css_color_value *v, sbuf *out);
 bool css_color_value_equal(const struct css_color_value *a, const struct css_color_value *b);
 bool css_color_slots_equal(const style_t *a, const style_t *b);
+/* the element's used color-scheme is dark (light-dark() takes its second value) */
+bool css_style_dark(const style_t *s);
 /* unescape a CSS string or identifier body (backslash escapes) */
 void css_unescape(sbuf *out, const char *s, size_t n);
 /* One decoded family at a time; no fixed family-count/identifier truncation.
@@ -1657,6 +1907,11 @@ typedef struct box {
     struct shadow_cache *shadow_cache; /* geometry-only Gaussian masks; box lifetime */
     struct radius_cache *radius_clip[3]; /* border, padding, replaced-content clip masks */
     struct clip_cache *clip_cache; /* clip-path's shape coverage; box lifetime */
+    /* paint.c filter_used: whether a url() of its filter list names no <filter> (Filter Effects 1
+       §5: the whole list is then ignored), decided for that list at that dom_revision */
+    const struct css_filter *filter_ref_list;
+    uint64_t filter_ref_dom;
+    bool filter_ref_ignored;
     bool style_sync_dirty; /* retirement join: this subtree has changed style borrows */
     bool style_sync_subtree; /* and every box below may borrow one: a display:contents element generated them */
     /* inline formatting results (block containers with inline content) */
@@ -1751,7 +2006,7 @@ struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color);
 bool doc_svg_clip_markup(node_t *n, const char *ref, const float box[4], sbuf *out);
 /* A url() that names an element of d itself (CSS Values 4 §4.5.1: a fragment-only URL, or d's own
    URL with a fragment): no resource to fetch. doc_svg_reference: the element it names in n's tree
-   (its document or shadow root), NULL when it names none or is not such a reference. */
+   (its document or shadow root), NULL for another document or no such element. */
 bool doc_url_local(const web_doc *d, const char *ref);
 node_t *doc_svg_reference(node_t *n, const char *ref);
 bool box_block_level(const box_t *b);
@@ -1764,6 +2019,7 @@ struct run {
     node_t *link;  /* the <a href> it belongs to */
     box_t *atomic; /* or an atomic inline box at (x, y = its top) */
     bool highlight;
+    bool hyphen;   /* the line breaks at the soft hyphen ending s: w includes layout_hyphen_string's advance */
     node_t *node; /* original text/atomic node, for generic DOM event targeting */
     box_t *paint_owner; /* filtered inline group; private layout-arena dependency */
     int paint_next;
@@ -1798,6 +2054,12 @@ bool doc_caret_at(web_doc *d,double x,double y,node_t **node,uint32_t *offset);
    value, in document coordinates through the transforms that apply. false when not one. */
 bool doc_control_caret_rect(node_t *control,uint32_t offset,double rect[4]);
 void doc_hover_update(web_doc *document,node_t *target); /* native-only CSS state; no JS dispatch */
+/* n is editable: d is in design mode, or n is in an element whose contenteditable state is true or
+   plaintext-only below no false state (HTML "editing host", "editable") */
+bool doc_node_editable(web_doc *d, node_t *n);
+/* css-ui-4 §5.1: d's image (its index) for a cursor image, the image-set() option shown (css-images-4
+   §2.3.1) requested as CSS images are, and that option's resolution (dppx); -1 when it has none */
+int doc_cursor_image(web_doc *d, const struct css_cursor_image *image, float *dppx);
 void doc_active_cancel(web_doc *document); /* retire/free only this context subtree */
 node_t *doc_active_target(web_doc *document); /* validates live native press and embedding generation */
 
@@ -1855,6 +2117,9 @@ void layout_runs_origin(const box_t *b, bool visual, float *x, float *y);
 void layout_run_extent(const struct run *r, float *top, float *bottom);
 /* The advance from the start of r's text to its byte boundary at (r->w at its end). */
 float layout_run_x(const struct run *r, size_t at);
+/* What a line broken at a soft hyphen of st's text shows (css-text-4 §6.3.2): hyphenate-character's
+   string, or for auto U+2010 where st's font has it and else U+002D. Layout measures and paint draws it. */
+const char *layout_hyphen_string(const style_t *st);
 /* The advance of s[at, next), one grapheme cluster, x after the text's start. */
 typedef float (*layout_measure_fn)(const void *opaque, const char *s, size_t at, size_t next, float x);
 /* The grapheme cluster boundary of s[0,n) nearest the advance dx from its start; a boundary
@@ -1910,8 +2175,11 @@ void css_transform_list_matrix_3d(const struct css_transform *t,double m[16]);
 /* Geometry's "parse a string into an abstract matrix": column-major m, *two_d false when a
    3D transform function is in the list. False when the string is no valid list. */
 bool css_transform_string_matrix(const char *s,size_t n,double m[16],bool *two_d);
+/* The complete transform of b's space: b's and its ancestors' used transforms (b's applied
+   first) composed into one affine matrix of document coordinates, layout x'=m[0]x+m[2]y+m[4]. */
+void box_transform_chain(const box_t *b,double m[6]);
 /* Maps a document rectangle (x,y,w,h) through b's and its ancestors' used
-   transforms and returns its bounding box. */
+   transforms and returns the bounding box of the resulting quad. */
 void box_transform_rect(const box_t *b,double rect[4]);
 bool box_viewport_fixed(const box_t *b); /* actual layout CB, not merely position:fixed */
 void box_abs_cb_rect(const box_t *cb, const web_doc *d, float rect[4]); /* x/y/w/h of padding CB in its content coordinates */
@@ -2013,6 +2281,14 @@ struct web_doc {
     web_doc *frame_parent;
     uint32_t sandbox_flags; /* immutable active document restrictions */
     uint64_t sandbox_activation_until; /* only native trusted input writes this */
+    /* The callbacks web_live was given: a document without a realm (a sandbox without
+       allow-scripts) still follows its hyperlinks through them. */
+    struct web_host host;
+    /* During the dispatch of a trusted pointer click at an image button (doc.c web_dispatch):
+       the point the user selected, which that click's activation behavior makes the button's
+       selected coordinate (js_activation_native.h). */
+    node_t *image_activation;
+    int image_activation_x, image_activation_y;
     /* HTML's design mode enabled. js_document_commands.js owns it and writes it
        here for the native readers: :read-write and the editing keys. */
     bool design_mode;
@@ -2092,6 +2368,13 @@ struct web_doc {
     struct restyle_damage { box_t *box; float rect[4]; } restyle_damage[32];
     uint8_t restyle_damage_n;
     bool restyle_damage_lost;
+    /* paint.c: the border boxes whose backdrop-filter read the canvas, in document space, since the
+       last whole paint at this layout revision. Damage that reaches one repaints all of it (its
+       backdrop is what is painted under it there); more than these repaints whole. */
+    struct backdrop_region { const box_t *box; float rect[4]; } backdrop_regions[32];
+    uint8_t backdrop_count;
+    bool backdrop_overflow;
+    uint64_t backdrop_layout;
     struct html_parser *parser;
     struct xml_parser *xml_parser; /* an XML document's, while it loads (xml.h) */
     struct web_js_state *js;
@@ -2296,12 +2579,20 @@ bool doc_element_scroll_metrics(web_doc *d, node_t *n, float *width, float *heig
 /* True only when the regular element's native position actually changed.
    Root/quirks-body viewport forwarding belongs to the Window host bridge. */
 bool doc_element_scroll(web_doc *d, node_t *n, double x, double y);
+/* CSSOM View "scroll an element": the largest scroll position of n's own scrolling box
+   on axis (0 horizontal, 1 vertical); 0 when n has none. */
+double doc_element_scroll_max(web_doc *d, node_t *n, int axis);
 enum doc_scroll_alignment { DOC_SCROLL_START, DOC_SCROLL_END, DOC_SCROLL_CENTER, DOC_SCROLL_NEAREST };
-/* Horizontal-LTR only. Current viewport positions enter through x/y; desired
-   positions leave through them. changed must start empty and is heap-owned.
-   1 rendered, 0 inactive/no box, -1 allocation, -2 bounded-chain refusal. */
+/* One scrolling box's position in "scroll a target into view". */
+struct doc_scroll_target { node_t *node; double x, y; };
+/* CSSOM View "scroll a target into view", horizontal-LTR only: the position each scrolling
+   box must take, innermost first, each as if the boxes inside it already had theirs. Nothing
+   is left scrolled: the caller performs each scroll (instant or smooth). The current viewport
+   position enters through x/y and the viewport's leaves through them. *targets (heap-owned,
+   *count entries) must start NULL. 1 rendered, 0 inactive/no box, -1 allocation,
+   -2 containing-block cycle, -3 too many boxes for the index. */
 int doc_element_scroll_into_view(web_doc *d, node_t *n, int block, int inline_, bool nearest_only,
-                                double *x, double *y, pvec *changed);
+                                double *x, double *y, struct doc_scroll_target **targets, int *count);
 enum doc_create_failure { DOC_CREATE_INVALID, DOC_CREATE_QUOTA, DOC_CREATE_ALLOCATOR,
     DOC_CREATE_OVERFLOW, DOC_CREATE_TEMPLATE, DOC_CREATE_WRAPPER };
 void doc_create_diagnostic(web_doc *d, unsigned stage, int type, size_t name_bytes, size_t data_bytes);

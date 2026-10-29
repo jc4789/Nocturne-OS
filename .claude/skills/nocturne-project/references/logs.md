@@ -39,7 +39,7 @@
 |---|---|
 | `Browser loop profile: wall W ms, ticks N/T ms/max M, host layout N/T ms, draw N/T ms, update U ms, net N ms, wait W ms, parallel jobs J (inclusive)` | 全面の描画の回数と時間。`wait` が小さく `draw`・`ticks` が大きければ主スレッドが飽和 |
 | `Browser damage profile: partial draw N/T ms over K kpx, partial present P ms, off the page N, drawn whole N, video patch N/T ms (…)` | 部分描画の回数と画素。損傷が無い 2 秒は出ない |
-| `Browser wait profile: timeout from none/network/storage/document/now/refresh …; shortened by the window engine N; ended by an event N` | 何で待ちが切れたか |
+| `Browser wait profile: timeout from none/network/storage/document/now/refresh/pointer …; shortened by the window engine N; ended by an event N` | 何で待ちが切れたか（pointer は指の形の見直しの締切、browser.c の `pointer_service`） |
 | `Browser memory: process KiB, malloc heap KiB, in use KiB` と `Document memory (KiB, N documents): DOM and sheets, computed styles, boxes, layout, authored sheets, fetched CSS, images, canvases, JavaScript` | 伸び続ければ漏れ |
 | `JavaScript heap census (KiB) of <URL>: malloc …, objects …, strings …, functions …` | `Document memory` の次の行。一番大きい JS の heap が 1/8 変わったか 30 秒たったときだけ。heap 全体を歩く |
 | `Native paint profile: paints N/T ms, order … walk W ms, video probe V ms, opacity groups …` | 描画の内訳（walk＝箱の木を歩く時間） |

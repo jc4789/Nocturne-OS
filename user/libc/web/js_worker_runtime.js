@@ -116,10 +116,10 @@
     /* @include js_xhr.js */
     const ProgressEvent=progressEventInterface(Event);
     Object.defineProperty(globalThis,'ProgressEvent',{value:ProgressEvent,writable:true,configurable:true});
-    let blobHandlerTarget=()=>false,indexedDBHandlerTarget=()=>false,abortHandlerTarget=()=>false,xhrHandlerTarget=()=>false;
+    let blobHandlerTarget=()=>false,indexedDBHandlerTarget=()=>false,abortHandlerTarget=()=>false,xhrHandlerTarget=()=>false,eventSourceHandlerTarget=()=>false;
     const fileHandlers=new WeakMap();
     const dispatch=dispatchNativeWorkerEvent;
-    const handlerTarget=(value,type)=>blobHandlerTarget(value,type)||indexedDBHandlerTarget(value,type)||abortHandlerTarget(value,type)||xhrHandlerTarget(value,type);
+    const handlerTarget=(value,type)=>blobHandlerTarget(value,type)||indexedDBHandlerTarget(value,type)||abortHandlerTarget(value,type)||xhrHandlerTarget(value,type)||eventSourceHandlerTarget(value,type);
     function installHandlers(prototype,types){for(const type of types)eventDefine(prototype,'on'+type,{enumerable:true,configurable:true,
         get(){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');return apply(eventGet,fileHandlers,[this])?.[type]||null;},
         set(value){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');let map=apply(eventGet,fileHandlers,[this]);if(!map){map=eventCreate(null);apply(eventSet,fileHandlers,[this,map]);}
@@ -231,8 +231,11 @@
             if(flags&64)return fetchBridge.response(0,r[1],'',undefined,null,false,'','opaqueredirect');
             return fetchBridge.response(r[0],r[1],r[2],undefined,bytes,!!(flags&2),undefined,flags&1?'cors':'basic');
         }
-        /* One frame taken: the parent sends the next on this resume, once per frame. */
-        function next(id,p,more){if(more&&!p.done)apply(resume,host,[id]);else p.paused=!p.done;}
+        /* One frame taken: the parent sends the next on this resume, once per frame. The fetch
+           is paused while its consumer handles the frame (frame below), so a resume the
+           consumer makes then counts, as js.c's resumeFetch counts it for a Window (a Fetch
+           observer may resume from its callback); more resumes it at once. */
+        function next(id,p,more){if(more&&p.paused&&!p.done){p.paused=false;apply(resume,host,[id]);}}
         /* Fetch's report timing, once the fetch has ended (as a Window's js.c reports it): the
            entry in this Worker's performance timeline, by its request id (realm.initiator's). */
         function timing(p,record){try{performanceBridge.monotonicResource(p.id,FETCH_REQUEST,p.url,record);}catch(error){report(error);}}
@@ -289,10 +292,11 @@
                 }
                 if(event===1){
                     if(contradicts(flags,p.noCors,p.manual)){take(id);p.done=true;end(p,new NativeTypeError('Native Fetch response contradicts its filtering policy'));return;}
-                    const published=response(value,flags,new ArrayBuffer(0)),more=p.notify(1,published);
+                    const published=response(value,flags,new ArrayBuffer(0));p.paused=true;
+                    const more=p.notify(1,published);
                     p.published=true;p.resolve(published);next(id,p,more);return;
                 }
-                next(id,p,p.notify(event,value));
+                p.paused=true;next(id,p,p.notify(event,value));
             },
             /* Closing this Worker ends every fetch the parent has not. */
             close(){
@@ -337,6 +341,15 @@
     xhrHandlerTarget=xhr.handlerTarget;
     for(const name of ['XMLHttpRequest','XMLHttpRequestUpload','XMLHttpRequestEventTarget'])
         Object.defineProperty(globalThis,name,{value:xhr[name],writable:true,configurable:true});
+    /* @include js_event_source.js */
+    /* This Worker's EventSource: its Fetch (the parent window's transport), the constructor's URL
+       against its API base URL in UTF-8, its MessageEvent, trusted events through this realm's
+       dispatch and its timers (none run once it is closed). */
+    const eventSourceBridge=eventSourceInterfaces({fetch:fetchBridge,parseURL:url=>urlBridge.encodingParse(url,address,'UTF-8'),
+        MessageEvent,fire:dispatchNativeWorkerEvent,handlers:installHandlers,report,now:()=>host.now(),
+        timer:(fn,ms)=>timer(fn,ms,[],false),clear:clearTimer});
+    eventSourceHandlerTarget=eventSourceBridge.handlerTarget;
+    Object.defineProperty(globalThis,'EventSource',{value:eventSourceBridge.EventSource,writable:true,configurable:true});
     /* @include js_performance.js */
     /* @include js_console.js */
     Object.assign(globalThis,{self:globalThis,navigator,WorkerNavigator,postMessage,close,importScripts,Headers,Request,Response,AbortSignal,AbortController,fetch,

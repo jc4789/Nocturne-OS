@@ -1,6 +1,8 @@
 /* Native Nocturne window picker. No author-supplied local path or UNIX layer.
-   Called only from the browser's trusted input dispatch, not DOM .click().
-   It is a window of the UI engine (ui.h), modal while the browser waits for it. */
+   Called only from a file input's activation behavior (js_activation_native.h), after HTML's
+   "show the picker, if applicable" found and consumed the window's transient activation, so a
+   page's click() opens it only during the user's own activation. It is a window of the UI
+   engine (ui.h), modal while the browser waits for it. */
 #include <stdio.h>
 #include "nocturne.h"
 #include "ui.h"

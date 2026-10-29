@@ -52,14 +52,15 @@ static void source_map_cases(arena_t *a) {
     static const uint32_t collapsed[] = {0, 2, 3, 5, 6, 7, 8, 9};
     CHECK(map && !memcmp(map, collapsed, sizeof collapsed));
 
-    scene_text(&s, a, "ab\xC2\xAD" "cd", WS_NORMAL); /* a soft hyphen is not shown */
+    scene_text(&s, a, "ab\xC2\xAD" "cd", WS_NORMAL); /* a soft hyphen stays: invisible, where hyphens may break */
     map = box_text_source_map(a, &s.text);
-    static const uint32_t shy[] = {0, 1, 4, 5, 6};
-    CHECK(s.text.len == 4 && map && !memcmp(map, shy, sizeof shy));
+    static const uint32_t shy[] = {0, 1, 2, 3, 4, 5, 6};
+    CHECK(s.text.len == 6 && !memcmp(s.text.text, "ab\xC2\xAD" "cd", 6) && map && !memcmp(map, shy, sizeof shy));
 
-    scene_text(&s, a, "a\tb", WS_PRE); /* a tab expands to its stop: every space is the tab's */
+    scene_text(&s, a, "a\tb", WS_PRE); /* a preserved tab stays a tab: layout gives it the advance to its stop */
     map = box_text_source_map(a, &s.text);
-    CHECK(s.text.len == 9 && map && map[0] == 0 && map[1] == 1 && map[7] == 1 && map[8] == 2 && map[9] == 3);
+    static const uint32_t tab[] = {0, 1, 2, 3};
+    CHECK(s.text.len == 3 && !memcmp(s.text.text, "a\tb", 3) && map && !memcmp(map, tab, sizeof tab));
 
     scene_text(&s, a, "a  \n  b", WS_PRE_LINE); /* spaces around a kept line break go */
     map = box_text_source_map(a, &s.text);

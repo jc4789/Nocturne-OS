@@ -62,9 +62,9 @@ static struct {
     unsigned ticks, layouts, draws;
     unsigned partial_draws, video_patches, console_draws;
     unsigned partial_empty, partial_whole; /* damage off the page, or not a known rectangle */
-    unsigned waits[6], engine_waits, woken; /* which source set each wait's timeout; waits an event ended */
+    unsigned waits[7], engine_waits, woken; /* which source set each wait's timeout; waits an event ended */
 } loop_profile;
-enum { WAIT_NONE, WAIT_NET, WAIT_STORAGE, WAIT_DOCUMENT, WAIT_NOW, WAIT_REFRESH };
+enum { WAIT_NONE, WAIT_NET, WAIT_STORAGE, WAIT_DOCUMENT, WAIT_NOW, WAIT_REFRESH, WAIT_POINTER };
 /* Browser pages need more time than small custom web_live hosts. The native
    command line can select a finite limit, never an unlimited watchdog. */
 static uint32_t js_task_budget_ms = WEB_JS_TASK_DEFAULT_MS;
@@ -241,6 +241,7 @@ static void tab_leave(struct tab **served) { tab = *served; }
 struct navigation_request;
 static struct tab *tab_new(struct tab *after);
 static struct tab *tab_open(const struct navigation_request *r, struct tab *after, bool foreground);
+static void new_window(const char *url);
 static void tab_select(struct tab *t);
 static void tab_close(struct tab *t);
 static void tab_move(struct tab *t, int to);
@@ -1168,8 +1169,10 @@ static void initial_scroll(void) {
     }
 }
 
+static uint64_t page_layouts; /* layouts of any tab's page: the pointer looks again after one */
 static void relayout(void) {
     if (!tab->doc) return;
+    page_layouts++;
     uint64_t start = debug_js ? n_clock_uptime_ms() : 0;
     tab->doc_h = web_layout(tab->doc, page_w(), page_h());
     tab->doc_w = web_doc_width(tab->doc);
@@ -1574,6 +1577,15 @@ static void host_navigate(void *opaque, const struct web_navigation *n) {
     if (tab->doc && !has_prefix(web_url(tab->doc), "file://") && !has_prefix(web_url(tab->doc), "about:") &&
         has_prefix(n->url, "file://")) {
         console_add("error", "A remote document cannot navigate to a local file.");
+        set_status("A remote page cannot open a local file");
+        return;
+    }
+    if (n->disposition != WEB_DISPOSITION_CURRENT) {
+        /* The user's own Ctrl or Shift on a hyperlink: a tab behind this one, or a window. */
+        struct navigation_request r = {.url = n->url, .mode = NAV_PUSH, .initiator = n->initiator ? n->initiator : "",
+            .referrer = n->referrer, .referrer_policy = n->referrer_policy, .user_activation = true};
+        if (n->disposition == WEB_DISPOSITION_TAB) tab_open(&r, tab, false);
+        else new_window(n->url);
         return;
     }
     const char *target = n->target;
@@ -2691,17 +2703,12 @@ static void apply_pending_history(void) {
     else go_history(delta, false);
 }
 
+/* Implicit submission from a field when the form has no submit button: HTML "submit" from the
+   form element itself. */
 static void submit(web_node *n) {
     if (!web_sandbox_form_submission_allowed(tab->doc, n)) return;
     web_node *form = web_form_owner(tab->doc, n);
-    if(!form || !web_form_submission_validate(tab->doc,n)) {flush_dom_layout();return;}
-    struct web_event event = {.type = "submit", .bubbles = true, .cancelable = true};
-    struct web_hit action={0};
-    if(web_node_action(tab->doc,n,&action) && action.kind==WEB_HIT_SUBMIT)event.submitter=n;
-    bool allowed = form && web_dispatch(tab->doc, form, &event);
-    flush_dom_layout();
-    if (!allowed) return;
-    web_form_navigate(tab->doc, n);
+    if (form) web_form_submit(tab->doc, form);
     flush_dom_layout();
 }
 
@@ -3112,71 +3119,36 @@ static void page_click(web_node *target, int x, int y, bool keyboard, uint32_t m
     tab->focus = F_PAGE;
     if (!tab->doc) return;
     if(web_control_disabled(target))return;
-    /* Author click listeners may reparent the target. Capture its first
-       native link activation now, without changing the event target. */
-    web_node *anchor = web_link_activation_anchor(tab->doc,target);
+    /* The click's DOM dispatch runs its activation behavior, the one script's click() and
+       dispatchEvent() reach too (js_activation_native.h): links, form controls, labels,
+       summaries and media controls. */
+    web_node *focused = web_focused(tab->doc);
     struct gui_event native = {.x = x, .y = y, .buttons = 0, .mods = mods};
-    struct web_control_activation activation;
-    web_control_activation_begin(tab->doc, target, &activation);
     bool allowed = dispatch_native_mode("click", target, &native, true, keyboard);
-    bool input_events = web_control_activation_end(tab->doc, &activation, allowed);
-    if (!allowed) { flush_dom_layout(); return; }
-    if (!anchor && web_media_activate(tab->doc,target)) { flush_dom_layout(); return; }
-    web_node *label_control = anchor ? NULL : web_label_activation(target);
-    if (label_control) { page_focus(label_control); page_click(label_control, x, y, keyboard, mods); return; }
-    struct web_hit hit = {0};
-    if (anchor) {
-        /* Read this same anchor's latest href after dispatch. Removal of
-           href or reparenting must not select another ancestor anchor. */
-        if (!web_link_action(tab->doc,anchor,&hit)) return;
-    } else if (!web_node_action(tab->doc,target,&hit) || hit.kind==WEB_HIT_LINK) return;
-    if (!keyboard && hit.kind==WEB_HIT_DETAILS) {
-        struct web_hit pointer={0};
-        if (!web_hit_test(tab->doc,document_x(x),y+tab->scroll_y,&pointer) || pointer.kind!=WEB_HIT_DETAILS || pointer.node!=hit.node) return;
+    web_node *now = web_focused(tab->doc);
+    if (now != focused || (now && web_input_is_file(now))) {
+        /* A label's control took the focus, or a file input's picker chose files: a later blur
+           compares against the value it has now. */
+        if (now != focused && focused) {
+            const char *value = web_control_value(focused);
+            if (tab->focus_value && value && strcmp(tab->focus_value, value)) dispatch_native("change", focused, NULL, false);
+        }
+        free(tab->focus_value);
+        const char *value = now ? web_control_value(now) : NULL;
+        tab->focus_value = value ? strdup(value) : NULL;
     }
-    switch (hit.kind) {
-    case WEB_HIT_LINK:
-        if (hit.href) {
-            if (has_prefix(hit.href, "file://") && !has_prefix(web_url(tab->doc), "file://") &&
-                !has_prefix(web_url(tab->doc), "about:")) {
-                set_status("A remote page cannot open a local file");
-                return;
-            }
-            /* Ctrl: a new tab behind this one; Shift: a new window. */
-            if (mods & (NMOD_CTRL | NMOD_SHIFT)) {
-                struct navigation_request r = page_navigation(hit.href, NAV_PUSH, anchor);
-                if (mods & NMOD_CTRL) tab_open(&r, tab, false);
-                else new_window(hit.href);
-                return;
-            }
-            if (!web_frame_navigate(tab->doc, anchor, hit.href, true)) {
-                struct navigation_request r = page_navigation(hit.href, NAV_PUSH, anchor);
-                queue_navigation(&r);
-            }
+    if (!allowed) return;
+    /* What the platform's widgets do beyond HTML's activation behavior: a select's list, and
+       the default summary of a details element without one. */
+    struct web_hit hit = {0};
+    if (!web_node_action(tab->doc,target,&hit)) return;
+    if (hit.kind == WEB_HIT_SELECT) open_select(hit.node);
+    else if (hit.kind == WEB_HIT_DETAILS && hit.node == target) {
+        if (!keyboard) {
+            struct web_hit pointer={0};
+            if (!web_hit_test(tab->doc,document_x(x),y+tab->scroll_y,&pointer) || pointer.kind!=WEB_HIT_DETAILS || pointer.node!=hit.node) return;
         }
-        return;
-    case WEB_HIT_TEXT_INPUT:
-    case WEB_HIT_TEXTAREA: break; /* focusing belongs to the preceding mousedown */
-    case WEB_HIT_FILE:
-        if (web_input_choose_files(tab->doc, hit.node)) {
-            dispatch_native("input", hit.node, &native, false);
-            dispatch_native("change", hit.node, &native, false);
-            if (web_focused(tab->doc) == hit.node) { free(tab->focus_value); tab->focus_value = strdup(web_control_value(hit.node)); }
-            flush_dom_layout();
-        }
-        break;
-    case WEB_HIT_CHECKBOX:
-    case WEB_HIT_RADIO:
-        if (input_events) { dispatch_native("input", hit.node, &native, false); dispatch_native("change", hit.node, &native, false); }
-        break;
-    case WEB_HIT_SUBMIT: submit(hit.node); return;
-    case WEB_HIT_BUTTON: web_reset(tab->doc,hit.node); flush_dom_layout(); break;
-    case WEB_HIT_DETAILS:
-        web_toggle(tab->doc,hit.node); flush_dom_layout(); break;
-    case WEB_HIT_SELECT:
-        open_select(hit.node);
-        break;
-    default: break;
+        web_toggle(tab->doc,hit.node); flush_dom_layout();
     }
 }
 
@@ -3189,6 +3161,11 @@ static void scrollbar_drag(int my) {
     scroll_to((int)((long)(my - drag_off) * max_scroll() / range));
 }
 
+/* whether a point of the surface is on the open select list's options */
+static bool select_list_at(int x, int y) {
+    int vis = MIN(tab->sel_n - tab->sel_top, (view.h - tab->sel_y) / SEL_H);
+    return x >= tab->sel_x && x < tab->sel_x + tab->sel_w && y >= tab->sel_y && y < tab->sel_y + vis * SEL_H;
+}
 static void mouse_down(const struct gui_event *e) {
     if (!(e->buttons & 1)) return;
     if(tab->pressed_node)return; /* an additional button is not a new primary press */
@@ -3196,8 +3173,7 @@ static void mouse_down(const struct gui_event *e) {
     int x = e->x, y = e->y;
     if (devtools_pointer_down(x, y)) return;
     if (tab->sel_node) {
-        int vis = MIN(tab->sel_n - tab->sel_top, (view.h - tab->sel_y) / SEL_H);
-        if (x >= tab->sel_x && x < tab->sel_x + tab->sel_w && y >= tab->sel_y && y < tab->sel_y + vis * SEL_H) choose_select(tab->sel_top + (y - tab->sel_y) / SEL_H);
+        if (select_list_at(x, y)) choose_select(tab->sel_top + (y - tab->sel_y) / SEL_H);
         else tab->sel_node = NULL;
         return;
     }
@@ -3258,6 +3234,91 @@ static void mouse_move(const struct gui_event *e) {
     if (strcmp(h, tab->hover)) {
         strlcpy(tab->hover, h, sizeof tab->hover);
         show_chrome();
+    }
+}
+
+/* ---- the pointer over the page's surface (css-ui-4 cursor). What the point wants (DevTools, the
+   scroll bar, the select list, else the page's cursor) is told to the window when it changes: at
+   once after input and after the first layout that follows it, otherwise at most every
+   POINTER_SETTLE_MS for a change under a still pointer (a layout, a scroll, another document or
+   tab, an image the cursor waits for). The window shows it only while the pointer is over the
+   surface; the widgets around it (the tab strip, the toolbar, the fields) choose their own. */
+#define POINTER_SETTLE_MS 100
+static struct {
+    struct web_cursor want;
+    uint32_t pixels[N_POINTER_IMAGE_MAX * N_POINTER_IMAGE_MAX]; /* the image the window has */
+    struct n_win_pointer sent;
+    bool asked;   /* the window has one */
+    bool input;   /* the pointer moved or pressed: look at once */
+    bool settle;  /* the look after input came before the page's next layout: look again at it */
+    bool again;   /* the last look could not finish (the page was busy, an image was loading, sending failed) */
+    /* what the last look saw */
+    const struct tab *tab;
+    uint64_t generation, layouts;
+    int scroll_x, scroll_y;
+    uint64_t next; /* the earliest look for a change that is not input */
+} pointer;
+
+static bool pointer_want(int x, int y, struct web_cursor *want) {
+    want->shape = N_POINTER_DEFAULT;
+    want->width = want->height = want->hot_x = want->hot_y = 0;
+    want->pending = false;
+    uint32_t shape;
+    if (devtools_pointer_shape(x, y, &shape)) { want->shape = shape; return true; }
+    if (drag_sb || (tab->sel_node && select_list_at(x, y))) return true;
+    /* the scroll bar, and the surface of a tab without a document */
+    if (!tab->doc || x < 0 || y < 0 || x >= page_w() || y >= page_h()) return true;
+    return web_cursor_at(tab->doc, document_x(x), y + tab->scroll_y, want);
+}
+static void pointer_send(const struct web_cursor *want) {
+    size_t pixels = (size_t)want->width * (size_t)want->height;
+    const struct n_win_pointer *sent = &pointer.sent;
+    if (pointer.asked && sent->shape == want->shape && sent->width == (uint32_t)want->width &&
+        sent->height == (uint32_t)want->height && sent->hot_x == (uint32_t)want->hot_x && sent->hot_y == (uint32_t)want->hot_y &&
+        !memcmp(pointer.pixels, want->pixels, pixels * sizeof *want->pixels))
+        return;
+    struct n_win_pointer p = {.shape = want->shape};
+    if (pixels) {
+        p.width = (uint32_t)want->width; p.height = (uint32_t)want->height;
+        p.hot_x = (uint32_t)want->hot_x; p.hot_y = (uint32_t)want->hot_y;
+        p.pixels = want->pixels;
+    }
+    if (ui_surface_pointer(ui, VIEW, &p) < 0) { pointer.again = true; return; }
+    memcpy(pointer.pixels, want->pixels, pixels * sizeof *want->pixels);
+    p.pixels = pointer.pixels;
+    pointer.sent = p;
+    pointer.asked = true;
+}
+/* In the main loop with the front tab served, between script tasks; *timeout shortens to the
+   next look a change waits for. */
+static void pointer_service(uint64_t now, int *timeout, int *source) {
+    if (!ui || quit || tab != front || tab->settings || tab->native_wait || web_script_running(tab->doc) || pointer_x < 0) return;
+    bool laid_out = pointer.layouts != page_layouts;
+    bool changed = pointer.input || pointer.again || laid_out || pointer.tab != tab || pointer.generation != tab->generation ||
+                   pointer.scroll_x != tab->scroll_x || pointer.scroll_y != tab->scroll_y;
+    if (!changed) return;
+    bool now_due = pointer.input || pointer.tab != tab || (pointer.settle && laid_out);
+    if (!now_due && now < pointer.next) {
+        int due = (int)MIN(pointer.next - now, (uint64_t)POINTER_SETTLE_MS);
+        if (*timeout < 0 || due < *timeout) { *timeout = due; *source = WAIT_POINTER; }
+        return;
+    }
+    pointer.settle = pointer.input;
+    pointer.input = false;
+    pointer.next = now + POINTER_SETTLE_MS;
+    pointer.tab = tab;
+    pointer.generation = tab->generation;
+    pointer.layouts = page_layouts;
+    pointer.scroll_x = tab->scroll_x;
+    pointer.scroll_y = tab->scroll_y;
+    pointer.again = !pointer_want(pointer_x, pointer_y, &pointer.want);
+    if (!pointer.again) {
+        pointer.again = pointer.want.pending;
+        pointer_send(&pointer.want);
+    }
+    if (pointer.again && (*timeout < 0 || *timeout > POINTER_SETTLE_MS)) {
+        *timeout = POINTER_SETTLE_MS;
+        *source = WAIT_POINTER;
     }
 }
 
@@ -3348,6 +3409,7 @@ static void command(const struct gui_event *e) {
 }
 
 static void handle(const struct gui_event *e) {
+    if (e->type == EV_MOUSE_MOVE || e->type == EV_MOUSE_DOWN || e->type == EV_MOUSE_UP || e->type == EV_WHEEL) pointer.input = true;
     bool console_only=tab->console_open && !dt_resizing &&
         ((e->type==EV_KEY && tab->focus==F_CONSOLE) ||
          (e->type==EV_WHEEL && e->y>=page_h() && e->y<view.h));
@@ -3579,7 +3641,7 @@ static void report_loop_profile(uint64_t now) {
     uint64_t console_ms=loop_profile.console_ms,console_update=loop_profile.console_update_ms;
     uint64_t partial_ms=loop_profile.partial_ms,partial_update=loop_profile.partial_update_ms,video_ms=loop_profile.video_present_ms;
     uint64_t partial_pixels=loop_profile.partial_pixels;
-    unsigned waits[6],engine_waits=loop_profile.engine_waits,woken=loop_profile.woken;memcpy(waits,loop_profile.waits,sizeof waits);
+    unsigned waits[7],engine_waits=loop_profile.engine_waits,woken=loop_profile.woken;memcpy(waits,loop_profile.waits,sizeof waits);
     memset(&loop_profile, 0, sizeof loop_profile);
     loop_profile.since = now;
     host_console(NULL, WEB_CONSOLE_TRACE, message);
@@ -3597,8 +3659,8 @@ static void report_loop_profile(uint64_t now) {
         if (web_memory_report(tab->doc, message, sizeof message) > 0) host_console(NULL, WEB_CONSOLE_TRACE, message);
     }
     snprintf(message, sizeof message,
-             "Browser wait profile: timeout from none %u, network %u, storage %u, document %u, now %u, refresh %u; shortened by the window engine %u; ended by an event %u",
-             waits[WAIT_NONE], waits[WAIT_NET], waits[WAIT_STORAGE], waits[WAIT_DOCUMENT], waits[WAIT_NOW], waits[WAIT_REFRESH],
+             "Browser wait profile: timeout from none %u, network %u, storage %u, document %u, now %u, refresh %u, pointer %u; shortened by the window engine %u; ended by an event %u",
+             waits[WAIT_NONE], waits[WAIT_NET], waits[WAIT_STORAGE], waits[WAIT_DOCUMENT], waits[WAIT_NOW], waits[WAIT_REFRESH], waits[WAIT_POINTER],
              engine_waits, woken);
     host_console(NULL, WEB_CONSOLE_TRACE, message);
     if (web_wait_report(message, sizeof message) > 0) host_console(NULL, WEB_CONSOLE_TRACE, message);
@@ -3894,6 +3956,7 @@ int main(int argc, char **argv) {
         }
         if (tab->doc && w && !frame_asked && web_rendering_wanted(tab->doc))
             frame_asked = ui_window_frame(ui, WINDOW) == 0;
+        pointer_service(now, &timeout, &source);
         if(console_startup_pending()&&tab->doc&&!tab->loading){int due=now>=console_due?0:(int)MIN(console_due-now,0x7fffffff);
             if(timeout<0||due<timeout){timeout=due;source=WAIT_NOW;}}
         bool refreshed = false;

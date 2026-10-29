@@ -34,12 +34,14 @@ const mediaBridge = (() => {
         set onchange(value) { get(this).handler = typeof value === 'function' ? value : null; retain(this); }
         addEventListener(type, callback, options) { get(this); add.call(this,type,callback,options); retain(this); }
         removeEventListener(type, callback, options) { get(this); remove.call(this,type,callback,options); retain(this); }
-        addListener(callback) { get(this);add.call(this,'change',callback);retain(this); }
-        removeListener(callback) { get(this);remove.call(this,'change',callback);retain(this); }
+        // EventListener? callback is a required argument, after the receiver check (Web IDL).
+        addListener(callback) { get(this);if(!arguments.length)throw new TypeError('addListener requires 1 argument');add.call(this,'change',callback);retain(this); }
+        removeListener(callback) { get(this);if(!arguments.length)throw new TypeError('removeListener requires 1 argument');remove.call(this,'change',callback);retain(this); }
     }
     Object.defineProperty(MediaQueryList.prototype,Symbol.toStringTag,{value:'MediaQueryList',configurable:true});
     Object.defineProperty(MediaQueryListEvent.prototype,Symbol.toStringTag,{value:'MediaQueryListEvent',configurable:true});
     function matchMedia(query) {
+        windowReceiver(this);
         if (!arguments.length) throw new TypeError('Media query is required');
         if (typeof query === 'symbol') throw new TypeError('Cannot convert a Symbol to a string');
         return new MediaQueryList(token, String(query));
