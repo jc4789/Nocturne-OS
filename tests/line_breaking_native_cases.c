@@ -86,6 +86,11 @@ void font_metrics(font_t *f, float px, float *ascent, float *descent, float *lin
     if (descent) *descent = px * 0.2f;
     if (line_gap) *line_gap = 0;
 }
+/* the test face has no OS/2 table: CSS's fallbacks (font.h), the cap height its ascent */
+float font_aspect(font_t *f, int metric) {
+    (void)f;
+    return metric == FONT_ASPECT_CAP_HEIGHT ? 0.8f : metric == FONT_ASPECT_EX_HEIGHT || metric == FONT_ASPECT_CH_WIDTH ? 0.5f : 1;
+}
 bool font_has_primary(font_t *f, uint32_t cp) { (void)f; (void)cp; return true; }
 /* no measurement cache: text_width measures every time */
 uint64_t font_metrics_generation(void) { return 0; }

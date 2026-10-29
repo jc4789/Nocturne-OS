@@ -5753,16 +5753,17 @@ static JSValue native_css_properties(JSContext *ctx,JSValueConst this_val,int ar
         }
         if(JS_SetPropertyUint32(ctx,result,(uint32_t)i,entry)<0){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
     }
-    /* the legacy name aliases: CSSOM attributes of their own, never computed longhands */
-    uint32_t index=(uint32_t)css_prop_count();
-    for(int i=0;css_prop_legacy_alias(i);i++) {
+    /* the legacy name aliases (font-stretch): their attributes reach the property under its own name, and
+       they are no computed longhands of their own (CSSOM §6.7.1) */
+    const char *alias;
+    for(int i=0;(alias=css_prop_legacy_alias_at(i,NULL));i++) {
         JSValue entry=JS_NewArray(ctx);
         if(JS_IsException(entry)){JS_FreeValue(ctx,result);return entry;}
-        if(JS_SetPropertyUint32(ctx,entry,0,JS_NewString(ctx,css_prop_legacy_alias(i)))<0||
-           JS_SetPropertyUint32(ctx,entry,1,JS_FALSE)<0) {
+        if(JS_SetPropertyUint32(ctx,entry,0,JS_NewString(ctx,alias))<0||
+           JS_SetPropertyUint32(ctx,entry,1,JS_NewBool(ctx,false))<0) {
             JS_FreeValue(ctx,entry);JS_FreeValue(ctx,result);return JS_EXCEPTION;
         }
-        if(JS_SetPropertyUint32(ctx,result,index++,entry)<0){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
+        if(JS_SetPropertyUint32(ctx,result,(uint32_t)(css_prop_count()+i),entry)<0){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
     }
     return result;
 }

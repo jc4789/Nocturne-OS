@@ -222,6 +222,7 @@ struct font_face {
     const struct web_font_range *ranges;
     size_t range_count;
     unsigned weight_lo,weight_hi;
+    float width_lo,width_hi; /* font-width's range, percentages (CSS Fonts 4 §4.6) */
     bool italic;
     const struct mcond *media;
     struct font_face *next;
@@ -3084,6 +3085,18 @@ static bool decl_shorthand(struct decl_list *l, const struct propdef *p, const c
 /* the declarations css parses to, their values as given. check: a descriptor
    block's own (its names are not shorthands), NULL for properties. A block's
    text (trusted) has only valid declarations. */
+/* a declaration's name as the block keeps it: a property's in lower case, under the property's own name
+   when it is a legacy name alias (CSS Cascade 5 §3.3); a custom property's as written. check: the block
+   holds descriptors (@font-face, @page), whose names are their own. */
+static char *decl_name(const char *property, size_t n, css_decl_check *check) {
+    if (n < 2 || strncmp(property, "--", 2)) {
+        const char *canonical = check ? NULL : css_prop_legacy_alias(property, n);
+        if (canonical) return strdup(canonical);
+    }
+    char *name = strndup(property, n);
+    if (name && strncmp(name, "--", 2)) for (char *c = name; *c; c++) *c = (char)lower((unsigned char)*c);
+    return name;
+}
 static void decl_list_parse(struct decl_list *l, const char *css, size_t n, css_decl_check *check, bool trusted) {
     const char *end = css + n;
     for (const char *p = css; p < end && !l->failed;) {
@@ -3097,10 +3110,9 @@ static void decl_list_parse(struct decl_list *l, const char *css, size_t n, css_
         while (ve > v && is_space((unsigned char)ve[-1])) ve--;
         bool important = decl_priority(v, &ve);
         if (ns == ne || v == ve) continue;
-        char *name = strndup(ns, (size_t)(ne - ns));
+        char *name = decl_name(ns, (size_t)(ne - ns), check);
         if (!name) { l->failed = true; break; }
         bool custom = !strncmp(name, "--", 2);
-        if (!custom) for (char *c = name; *c; c++) *c = (char)lower((unsigned char)*c);
         size_t vn = (size_t)(ve - v);
         const struct propdef *shorthand = check || custom ? NULL : decl_shorthand_of(name);
         if (shorthand) {
@@ -3248,11 +3260,6 @@ static bool decl_list_serialize(const struct decl_list *l, css_decl_check *check
     free(serialized); free(done); free(tried); free(values); free(lengths); free(used);
     return !failed;
 }
-static char *decl_name(const char *property) {
-    char *name = strdup(property);
-    if (name && strncmp(name, "--", 2)) for (char *c = name; *c; c++) *c = (char)lower((unsigned char)*c);
-    return name;
-}
 bool css_decl_block(const char *css, size_t n, css_decl_check *check, sbuf *block) {
     struct decl_list l = {0};
     decl_list_parse(&l, css, n, check, false);
@@ -3282,7 +3289,7 @@ bool css_decl_block_serialize(const char *block, size_t n, css_decl_check *check
    the text of the group they all stand in; a longhand in a group reads as "" */
 bool css_decl_get(const char *block, size_t n, const char *property, css_decl_check *check, sbuf *value, bool *important) {
     *important = false;
-    char *name = decl_name(property);
+    char *name = decl_name(property, strlen(property), check);
     if (!name) return false;
     struct decl_list l = {0};
     decl_list_parse(&l, block, n, check, true);
@@ -3343,7 +3350,7 @@ int css_decl_set(const char *css, size_t n, const char *property, const char *va
     if (*value && ((priority && *priority && strcasecmp(priority, "important")) ||
                    decl_separator(value, value_end, '!') != value_end ||
                    decl_separator(value, value_end, ';') != value_end)) return 0;
-    char *name = decl_name(property);
+    char *name = decl_name(property, strlen(property), check);
     if (!name) return -2;
     const struct propdef *shorthand = check ? NULL : decl_shorthand_of(name);
     bool important = priority && *priority;
@@ -4033,6 +4040,7 @@ static struct font_source *font_sources(struct pctx *pc,const char *s,const char
    face.featureSettings = "'smcp' off" both read back `"smcp" 0`. */
 struct font_desc {
     unsigned weight_lo,weight_hi;
+    float width_lo,width_hi;
     bool italic;
     struct web_font_range *ranges; /* malloc: sorted and merged; NULL with 0: U+0-10FFFF */
     size_t range_count;
@@ -4208,8 +4216,12 @@ static int fd_tag_list(const char *s,const char *e,sbuf *out,bool features) {
 }
 /* One or two of normal, the keywords in names, or a non-negative percentage
    (font-width, the metrics overrides); auto alone where allowed. */
-static int fd_percentages(const char *s,const char *e,sbuf *out,const char *const *names,int most,bool automatic) {
+/* got (if any): each value's percentage, a keyword's from percents (names' order); *count: how many,
+   0 for auto */
+static int fd_percentages(const char *s,const char *e,sbuf *out,const char *const *names,const float *percents,int most,
+                          bool automatic,float *got,int *got_count) {
     char word[32];double x;bool integer;char unit[8];int count=0;
+    if(got_count)*got_count=0;
     for(;;){
         const char *t=skip_ws(s,e);
         if(t==e)break;
@@ -4217,16 +4229,19 @@ static int fd_percentages(const char *s,const char *e,sbuf *out,const char *cons
         if(count)sb_putc(out,' ');
         if(fd_keyword(&t,e,word)){
             if(automatic && !count && !strcmp(word,"auto") && skip_ws(t,e)==e){sb_puts(out,word);return 1;}
-            bool known=false;
-            for(int i=0;names&&names[i];i++)if(!strcmp(word,names[i]))known=true;
-            if(!known)return 0;
+            int known=-1;
+            for(int i=0;names&&names[i];i++)if(!strcmp(word,names[i]))known=i;
+            if(known<0)return 0;
             sb_puts(out,word);
+            if(got)got[count]=percents?percents[known]:NAN;
         }else{
             if(!fd_number(&t,e,&x,&integer,unit) || strcmp(unit,"%") || x<0)return 0;
             fd_put_number(out,x);sb_putc(out,'%');
+            if(got)got[count]=(float)x;
         }
         count++;s=t;
     }
+    if(got_count)*got_count=count;
     return count>0;
 }
 /* 1: valid, the serialization appended to out and matching fields in m (if
@@ -4236,6 +4251,7 @@ static int font_desc_parse(enum css_font_descriptor which,const char *v,size_t l
     static const char *const normal[]={"normal",NULL};
     static const char *const widths[]={"normal","ultra-condensed","extra-condensed","condensed","semi-condensed",
         "semi-expanded","expanded","extra-expanded","ultra-expanded",NULL};
+    static const float width_percents[]={100,50,62.5f,75,87.5f,112.5f,125,150,200};
     const char *s=skip_ws(v,v+length),*e=v+length;trim_r(s,&e);
     char word[32];double x;bool integer;char unit[8];
     if(s==e)return 0;
@@ -4278,7 +4294,16 @@ static int font_desc_parse(enum css_font_descriptor which,const char *v,size_t l
         if(m){m->weight_lo=MIN(weights[0],weights[count-1]);m->weight_hi=MAX(weights[0],weights[count-1]);}
         return 1;
     }
-    case CSS_FONT_WIDTH: return fd_percentages(s,e,out,widths,2,true);
+    case CSS_FONT_WIDTH: {
+        /* auto is normal's 100% in a rule (§4.6); a reversed range is swapped where it is used */
+        float range[2];int count;
+        if(!fd_percentages(s,e,out,widths,width_percents,2,true,range,&count))return 0;
+        if(m){
+            m->width_lo=count?MIN(range[0],range[count-1]):100;
+            m->width_hi=count?MAX(range[0],range[count-1]):100;
+        }
+        return 1;
+    }
     case CSS_FONT_UNICODE_RANGE: {
         struct web_font_range *ranges;size_t count;
         int status=font_ranges_parse(s,e,&ranges,&count);
@@ -4301,8 +4326,8 @@ static int font_desc_parse(enum css_font_descriptor which,const char *v,size_t l
         return 0;
     }
     case CSS_FONT_ASCENT_OVERRIDE: case CSS_FONT_DESCENT_OVERRIDE: case CSS_FONT_LINE_GAP_OVERRIDE:
-        return fd_percentages(s,e,out,normal,2,false);
-    case CSS_FONT_SIZE_ADJUST: return fd_percentages(s,e,out,NULL,1,false);
+        return fd_percentages(s,e,out,normal,NULL,2,false,NULL,NULL);
+    case CSS_FONT_SIZE_ADJUST: return fd_percentages(s,e,out,NULL,NULL,1,false,NULL,NULL);
     default: return 0;
     }
 }
@@ -4333,7 +4358,7 @@ static void parse_font_face(struct pctx *pc,const char *s,const char *e,const st
         {"descent-override",CSS_FONT_DESCENT_OVERRIDE},{"line-gap-override",CSS_FONT_LINE_GAP_OVERRIDE},
         {"size-adjust",CSS_FONT_SIZE_ADJUST}};
     struct font_face *f=ar_alloc(pc->a,sizeof *f);memset(f,0,sizeof *f);
-    f->weight_lo=f->weight_hi=400;f->media=media;f->layer=pc->layer;
+    f->weight_lo=f->weight_hi=400;f->width_lo=f->width_hi=100;f->media=media;f->layer=pc->layer;
     for(int i=0;i<CSS_FONT_DESCRIPTORS;i++)f->desc[i]=font_desc_initial[i];
     while(s<e) {
         const char *end=scan_to(s,e,";"),*colon=scan_to(s,end,":"),*name_end=colon;
@@ -4356,12 +4381,14 @@ static void parse_font_face(struct pctx *pc,const char *s,const char *e,const st
             } else for(size_t i=0;i<sizeof names/sizeof *names;i++) {
                 if(strlen(names[i].name)!=n || !strn_ieq(name,names[i].name,n))continue;
                 /* An invalid declaration leaves the previous valid one. */
-                sbuf b={0};struct font_desc m={.weight_lo=f->weight_lo,.weight_hi=f->weight_hi,.italic=f->italic};
+                sbuf b={0};struct font_desc m={.weight_lo=f->weight_lo,.weight_hi=f->weight_hi,.width_lo=f->width_lo,
+                                               .width_hi=f->width_hi,.italic=f->italic};
                 int status=font_desc_parse(names[i].which,value,(size_t)(ve-value),&b,&m);
                 if(status<0){sb_free(&b);free(m.ranges);ar_alloc(pc->a,SIZE_MAX);}
                 if(status>0){
                     f->desc[names[i].which]=ar_strndup(pc->a,b.p?b.p:"",b.n);
-                    f->weight_lo=m.weight_lo;f->weight_hi=m.weight_hi;f->italic=m.italic;
+                    f->weight_lo=m.weight_lo;f->weight_hi=m.weight_hi;f->width_lo=m.width_lo;f->width_hi=m.width_hi;
+                    f->italic=m.italic;
                     if(names[i].which==CSS_FONT_UNICODE_RANGE){
                         struct web_font_range *ranges=m.range_count?ar_alloc(pc->a,m.range_count*sizeof *ranges):NULL;
                         if(m.range_count)memcpy(ranges,m.ranges,m.range_count*sizeof *ranges);
@@ -5339,7 +5366,7 @@ static bool container_chain_ok(const struct mcond *mc,node_t *e,bool inclusive) 
 }
 
 struct font_binding {
-    const char *names;node_t *scope;unsigned weight;bool italic;font_t *face;
+    const char *names;node_t *scope;unsigned weight;bool italic;float width;font_t *face;
     const struct web_font_choice *choices;
 };
 static struct font_binding *font_bindings;
@@ -5348,7 +5375,12 @@ static bool font_faces_available;
 static void font_bindings_clear(void) {
     free(font_bindings);font_bindings=NULL;font_binding_count=font_binding_capacity=0;
 }
-static struct font_face *scoped_font_face(web_doc *d, node_t *scope, const char *family, unsigned weight, bool italic, int vw, int vh);
+/* what a style asks of a face (CSS Fonts 4 §5.2): its width, then its slope, then its weight */
+struct font_request {unsigned weight;bool italic;float width;};
+static struct font_request font_request_of(const style_t *style) {
+    return (struct font_request){style->font_weight,style->font_style!=CSS_FONT_STYLE_NORMAL,css_style_font(style)->width};
+}
+static struct font_face *scoped_font_face(web_doc *d, node_t *scope, const char *family, struct font_request want, int vw, int vh);
 /* The resource of a source: a FontFace's own, or the document's for a rule
    URL (workers only find the identities build_ctx published). */
 static struct web_font_resource *font_source_resource(web_doc *d,const struct font_source *src) {
@@ -5375,7 +5407,7 @@ static font_t *select_web_font_uncached(web_doc *d,node_t *node,style_t *style,i
            order. A quoted name with that spelling is still a named family. */
         if(!quoted && (!strcasecmp(family,"serif") || !strcasecmp(family,"sans-serif") || !strcasecmp(family,"monospace") ||
             !strcasecmp(family,"system-ui") || !strcasecmp(family,"cursive") || !strcasecmp(family,"fantasy")))return NULL;
-        struct font_face *best=scoped_font_face(d,scope,family,style->font_weight,style->font_style!=0,vw,vh);
+        struct font_face *best=scoped_font_face(d,scope,family,font_request_of(style),vw,vh);
         if(!best)continue;
         /* Restricted faces are selected per character below, never as the
            metrics/raster face for every character in the entire family. */
@@ -5404,10 +5436,11 @@ static font_t *select_web_font(web_doc *d,node_t *node,style_t *style,int vw,int
     style->font_choices=NULL;
     if(!font_faces_available || !style->font_names)return NULL;
     if(css_worker()){style->font_choices=select_font_choices(d,node,style,vw,vh,a);return select_web_font_uncached(d,node,style,vw,vh,a);}
-    node_t *scope=doc_node_root(node,false);unsigned weight=style->font_weight;bool italic=style->font_style!=0;
+    node_t *scope=doc_node_root(node,false);struct font_request want=font_request_of(style);
+    unsigned weight=want.weight;bool italic=want.italic;float width=want.width;
     for(size_t i=0;i<font_binding_count;i++) {
         const struct font_binding *b=&font_bindings[i];
-        if(b->scope==scope && b->weight==weight && b->italic==italic &&
+        if(b->scope==scope && b->weight==weight && b->italic==italic && b->width==width &&
            (b->names==style->font_names || !strcmp(b->names,style->font_names))){
             /* Computed styles own separate per-node arenas. A later partial
                restyle must not retire another node's composite-font list. */
@@ -5426,7 +5459,7 @@ static font_t *select_web_font(web_doc *d,node_t *node,style_t *style,int vw,int
     }
     /* Optional acceleration only: allocator failure never rejects a font. */
     if(font_binding_count<font_binding_capacity)
-        font_bindings[font_binding_count++]=(struct font_binding){style->font_names,scope,weight,italic,face,style->font_choices};
+        font_bindings[font_binding_count++]=(struct font_binding){style->font_names,scope,weight,italic,width,face,style->font_choices};
     return face;
 }
 
@@ -6228,10 +6261,18 @@ static struct cascade_layer *binding_layer(const struct css_binding *binding,con
     struct cascade_layer *layer=map?(syntax?map->layers[syntax->id]:map->outer):NULL;
     return layer&&layer->depth?layer:NULL;
 }
-/* Font matching distance of a face for a computed weight and slope. */
-static unsigned font_face_score(const struct font_face *f,unsigned weight,bool italic) {
-    unsigned distance=weight<f->weight_lo?f->weight_lo-weight:weight>f->weight_hi?weight-f->weight_hi:0;
-    return distance+(italic!=f->italic?10000u:0u);
+/* Font matching distance of a face for a computed width, slope and weight (CSS Fonts 4 §5.2 step 4, in
+   that order). A width the face lacks prefers narrower ones when it is at most 100%, wider ones above. */
+static unsigned font_face_score(const struct font_face *f,struct font_request want) {
+    unsigned distance=want.weight<f->weight_lo?f->weight_lo-want.weight:want.weight>f->weight_hi?want.weight-f->weight_hi:0;
+    float lo=MIN(f->width_lo,f->width_hi),hi=MAX(f->width_lo,f->width_hi);
+    unsigned width=0;
+    if(want.width<lo || want.width>hi){
+        bool wider=want.width<lo,preferred=want.width<=100?!wider:wider;
+        float gap=wider?lo-want.width:want.width-hi;
+        width=(unsigned)MIN(gap*10,9999.0f)+1+(preferred?0:10000u);
+    }
+    return width*20000u+distance+(want.italic!=f->italic?10000u:0u);
 }
 /* A FontFace of document.fonts takes part in matching once its family and
    descriptors parsed; it follows the document's rules, as its font source
@@ -6240,7 +6281,7 @@ static struct css_font_face *author_font_face(web_doc *d,int i) {
     struct css_font_face *a=d->author_fonts.v[i];
     return a->face.family?a:NULL;
 }
-static struct font_face *scoped_font_face(web_doc *d,node_t *root,const char *family,unsigned weight,bool italic,int vw,int vh) {
+static struct font_face *scoped_font_face(web_doc *d,node_t *root,const char *family,struct font_request want,int vw,int vh) {
     struct css_scope *scope=root?root->style_scope:NULL;
     struct font_face *best=NULL;unsigned score=UINT_MAX;
     struct cascade_layer *best_layer=NULL;
@@ -6248,7 +6289,7 @@ static struct font_face *scoped_font_face(web_doc *d,node_t *root,const char *fa
     for(struct css_binding *binding=scope?scope->first:NULL;binding;binding=binding->next)
         for(struct font_face *f=binding->index->fonts;f;f=f->next) {
             if(strcasecmp(family,f->family)||!font_conditions_ok(f->media,vw,vh,scripting))continue;
-            unsigned candidate=font_face_score(f,weight,italic);
+            unsigned candidate=font_face_score(f,want);
             struct cascade_layer *layer=binding_layer(binding,f->layer);
             if(candidate<score || (candidate==score && (!best || layer_compare(layer,best_layer)>=0))) {
                 best=f;score=candidate;best_layer=layer;
@@ -6257,7 +6298,7 @@ static struct font_face *scoped_font_face(web_doc *d,node_t *root,const char *fa
     for(int i=0;i<d->author_fonts.n;i++){
         struct css_font_face *a=author_font_face(d,i);
         if(!a || strcasecmp(family,a->face.family))continue;
-        unsigned candidate=font_face_score(&a->face,weight,italic);
+        unsigned candidate=font_face_score(&a->face,want);
         if(candidate<=score){best=&a->face;score=candidate;best_layer=NULL;}
     }
     return best;
@@ -6283,24 +6324,24 @@ static const struct web_font_choice *select_font_choices(web_doc *d,node_t *node
     if(!style->font_names)return NULL;
     node_t *root=doc_node_root(node,false);struct css_scope *scope=root?root->style_scope:NULL;
     const char *cursor=style->font_names,*end=cursor+strlen(cursor);
-    struct web_font_choice *first=NULL,**tail=&first;bool restricted=false,italic=style->font_style!=0;
+    struct web_font_choice *first=NULL,**tail=&first;bool restricted=false;struct font_request want=font_request_of(style);
     while(cursor<end){
         const char *token=skip_ws(cursor,end);bool quoted=token<end&&(*token=='"'||*token=='\'');
         const char *family=css_font_family_next(a,&cursor,end);if(!family||!cursor)break;
         if(!quoted&&(!strcasecmp(family,"serif")||!strcasecmp(family,"sans-serif")||!strcasecmp(family,"monospace")||
            !strcasecmp(family,"system-ui")||!strcasecmp(family,"cursive")||!strcasecmp(family,"fantasy")))break;
-        struct font_face *best=scoped_font_face(d,root,family,style->font_weight,italic,vw,vh);
+        struct font_face *best=scoped_font_face(d,root,family,want,vw,vh);
         if(!best)continue;
-        unsigned score=font_face_score(best,style->font_weight,italic);
+        unsigned score=font_face_score(best,want);
         struct web_font_choice *family_first=NULL;
         for(struct css_binding *b=scope?scope->first:NULL;b;b=b->next)for(struct font_face *f=b->index->fonts;f;f=f->next){
             if(strcasecmp(family,f->family)||!font_conditions_ok(f->media,vw,vh,d->sty.index_scripting))continue;
-            if(font_face_score(f,style->font_weight,italic)!=score)continue;
+            if(font_face_score(f,want)!=score)continue;
             if(!font_choice_add(d,f,binding_layer(b,f->layer),&family_first,&restricted,a))return NULL;
         }
         for(int i=0;i<d->author_fonts.n;i++){
             struct css_font_face *author=author_font_face(d,i);
-            if(!author || strcasecmp(family,author->face.family) || font_face_score(&author->face,style->font_weight,italic)!=score)continue;
+            if(!author || strcasecmp(family,author->face.family) || font_face_score(&author->face,want)!=score)continue;
             /* A text run that needs a code point in its range requests it. */
             if(!font_choice_add(d,&author->face,NULL,&family_first,&restricted,a))return NULL;
         }
@@ -6440,7 +6481,8 @@ static void font_source_changed(web_doc *d) {
 int css_font_rule_set(web_doc *d,const struct css_font_rule *rule,enum css_font_descriptor which,const char *value,size_t n) {
     if(!rule || !rule->face || !rule->arena || (unsigned)which>=CSS_FONT_DESCRIPTORS)return 0;
     struct font_face *f=rule->face;
-    sbuf b={0};struct font_desc m={.weight_lo=f->weight_lo,.weight_hi=f->weight_hi,.italic=f->italic};
+    sbuf b={0};struct font_desc m={.weight_lo=f->weight_lo,.weight_hi=f->weight_hi,.width_lo=f->width_lo,
+                                   .width_hi=f->width_hi,.italic=f->italic};
     int status=1;
     if(which==CSS_FONT_FAMILY)fd_put_family(&b,value,n);
     else status=font_desc_parse(which,value,n,&b,&m);
@@ -6455,7 +6497,7 @@ int css_font_rule_set(web_doc *d,const struct css_font_rule *rule,enum css_font_
     f->desc[which]=text;
     if(family)f->family=family;
     if(which==CSS_FONT_UNICODE_RANGE){f->ranges=ranges;f->range_count=m.range_count;}
-    f->weight_lo=m.weight_lo;f->weight_hi=m.weight_hi;f->italic=m.italic;
+    f->weight_lo=m.weight_lo;f->weight_hi=m.weight_hi;f->width_lo=m.width_lo;f->width_hi=m.width_hi;f->italic=m.italic;
     sb_free(&b);free(m.ranges);
     font_source_changed(d);
     return 1;
@@ -6463,7 +6505,7 @@ int css_font_rule_set(web_doc *d,const struct css_font_rule *rule,enum css_font_
 struct css_font_face *css_font_face_new(void) {
     struct css_font_face *f=calloc(1,sizeof *f);
     if(!f)return NULL;
-    f->refs=1;f->face.author=f;f->face.weight_lo=f->face.weight_hi=400;
+    f->refs=1;f->face.author=f;f->face.weight_lo=f->face.weight_hi=400;f->face.width_lo=f->face.width_hi=100;
     f->face.id=__atomic_add_fetch(&font_face_serials,1,__ATOMIC_RELAXED);
     for(int i=0;i<CSS_FONT_DESCRIPTORS;i++)f->face.desc[i]=font_desc_initial[i];
     return f;
@@ -6488,7 +6530,8 @@ const char *css_font_face_descriptor(const struct css_font_face *f,enum css_font
 static bool font_face_in_set(const struct css_font_face *f) { return f->refs>1; }
 int css_font_face_set(web_doc *d,struct css_font_face *f,enum css_font_descriptor which,const char *value,size_t n) {
     if(!f || (unsigned)which>=CSS_FONT_DESCRIPTORS)return 0;
-    sbuf b={0};struct font_desc m={.weight_lo=f->face.weight_lo,.weight_hi=f->face.weight_hi,.italic=f->face.italic};
+    sbuf b={0};struct font_desc m={.weight_lo=f->face.weight_lo,.weight_hi=f->face.weight_hi,.width_lo=f->face.width_lo,
+                                   .width_hi=f->face.width_hi,.italic=f->face.italic};
     int status=1;
     if(which==CSS_FONT_FAMILY)fd_put_family(&b,value,n);
     else status=font_desc_parse(which,value,n,&b,&m);
@@ -6502,7 +6545,8 @@ int css_font_face_set(web_doc *d,struct css_font_face *f,enum css_font_descripto
         free(f->family);f->family=name;f->face.family=name;
     }
     free(f->names[which]);f->names[which]=sb_cstr(&b);f->face.desc[which]=f->names[which];
-    f->face.weight_lo=m.weight_lo;f->face.weight_hi=m.weight_hi;f->face.italic=m.italic;
+    f->face.weight_lo=m.weight_lo;f->face.weight_hi=m.weight_hi;f->face.width_lo=m.width_lo;f->face.width_hi=m.width_hi;
+    f->face.italic=m.italic;
     if(which==CSS_FONT_UNICODE_RANGE){free(f->ranges);f->ranges=m.ranges;f->face.ranges=m.ranges;f->face.range_count=m.range_count;}
     else free(m.ranges);
     if(font_face_in_set(f))font_source_changed(d);
@@ -6702,7 +6746,7 @@ int css_font_match(web_doc *d,const char *font,size_t n,const char *text,size_t 
         status=0;
         if(css_apply(p,font,n,&cx) && !cx.invalid && st.font_names) {
             status=1;
-            bool italic=st.font_style!=0;
+            struct font_request want=font_request_of(&st);
             const char *cursor=st.font_names,*end=cursor+strlen(cursor);
             while(status>0 && cursor<end){
                 const char *token=skip_ws(cursor,end);bool quoted=token<end && (*token=='"' || *token=='\'');
@@ -6712,21 +6756,21 @@ int css_font_match(web_doc *d,const char *font,size_t n,const char *text,size_t 
                    !strcasecmp(family,"system-ui") || !strcasecmp(family,"cursive") || !strcasecmp(family,"fantasy")))continue;
                 unsigned best=UINT_MAX;
                 for(size_t i=0;i<w->rule_count;i++)
-                    if(!strcasecmp(family,w->rules[i].face->family))best=MIN(best,font_face_score(w->rules[i].face,st.font_weight,italic));
+                    if(!strcasecmp(family,w->rules[i].face->family))best=MIN(best,font_face_score(w->rules[i].face,want));
                 for(int i=0;i<d->author_fonts.n;i++){
                     struct css_font_face *a=author_font_face(d,i);
-                    if(a && !strcasecmp(family,a->face.family))best=MIN(best,font_face_score(&a->face,st.font_weight,italic));
+                    if(a && !strcasecmp(family,a->face.family))best=MIN(best,font_face_score(&a->face,want));
                 }
                 if(best==UINT_MAX)continue;
                 for(size_t i=0;i<w->rule_count && status>0;i++){
                     struct font_face *f=w->rules[i].face;
-                    if(strcasecmp(family,f->family) || font_face_score(f,st.font_weight,italic)!=best ||
+                    if(strcasecmp(family,f->family) || font_face_score(f,want)!=best ||
                        !font_face_covers(f,w->points,w->point_count))continue;
                     if(!font_match_push(w,(struct css_font_match){w->rules[i].id,w->rules[i].occurrence,NULL}))status=-1;
                 }
                 for(int i=0;i<d->author_fonts.n && status>0;i++){
                     struct css_font_face *a=author_font_face(d,i);
-                    if(!a || strcasecmp(family,a->face.family) || font_face_score(&a->face,st.font_weight,italic)!=best ||
+                    if(!a || strcasecmp(family,a->face.family) || font_face_score(&a->face,want)!=best ||
                        !font_face_covers(&a->face,w->points,w->point_count))continue;
                     if(!font_match_push(w,(struct css_font_match){a->face.id,0,a}))status=-1;
                 }
@@ -8534,6 +8578,16 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     if ((pseudo != PE_BEFORE && pseudo != PE_AFTER) || box_pseudo_generated(e,parent,s))
         s->named_font=select_web_font(d,e,s,c->vw,c->vh,c->a);
     else { s->named_font=NULL; s->font_choices=NULL; }
+    /* CSS Fonts 5 §2.6: font-size-adjust's from-font computes to the aspect value of the first
+       available font (layout.c's style_font, the face text is measured in); children inherit the number */
+    const struct css_font *font = css_style_font(s);
+    if (font->size_adjust.kind == CSS_SIZE_ADJUST_FROM_FONT) {
+        struct css_font *own = ar_alloc(c->a, sizeof *own);
+        *own = *font;
+        own->size_adjust.kind = CSS_SIZE_ADJUST_NUMBER;
+        own->size_adjust.value = font_aspect(style_font(s).ttf, own->size_adjust.metric);
+        s->font = own;
+    }
     if (parent && parent->display == D_CONTENTS) {
         /* Inheritance uses the slot, while flex/grid blockification uses the
            nearest box-generating flat ancestor. A contents slot is not an
@@ -9483,7 +9537,7 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     if(!equal_string(a->font_names,b->font_names) || !css_content_equal(a->content,b->content) ||
         !equal_string(a->container_names,b->container_names) ||
         !css_list_equal(a->list,b->list) || !css_counters_equal(a->counters,b->counters) ||
-        !css_style_layout_equal(a->marker,b->marker) ||
+        !css_font_equal(a->font,b->font) || !css_style_layout_equal(a->marker,b->marker) ||
         !equal_tracks(a->grid_cols,b->grid_cols) || !equal_tracks(a->grid_rows,b->grid_rows) ||
         !equal_tracks(a->grid_auto_cols,b->grid_auto_cols) || !equal_tracks(a->grid_auto_rows,b->grid_auto_rows) ||
         !equal_areas(a->grid_areas,b->grid_areas))return false;
@@ -9534,7 +9588,7 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     memset(&x.motion,0,sizeof x.motion);memset(&y.motion,0,sizeof y.motion); /* timing lists are not layout */
     x.animated=y.animated=false;
     x.font_names=y.font_names=NULL;x.font_choices=y.font_choices=NULL; x.content=y.content=NULL;
-    x.list=y.list=NULL;x.counters=y.counters=NULL;x.marker=y.marker=NULL;
+    x.list=y.list=NULL;x.counters=y.counters=NULL;x.marker=y.marker=NULL;x.font=y.font=NULL;
     x.container_names=y.container_names=NULL;
     x.grid_cols=y.grid_cols=x.grid_rows=y.grid_rows=x.grid_auto_cols=y.grid_auto_cols=x.grid_auto_rows=y.grid_auto_rows=NULL;
     x.grid_areas=y.grid_areas=NULL;
@@ -9617,7 +9671,8 @@ static bool style_equal(const style_t *a, const style_t *b) {
     if (fa || fb) return false;
     if (!equal_string(a->container_names, b->container_names) || !equal_string(a->font_names, b->font_names) ||
         !css_content_equal(a->content, b->content) || !css_list_equal(a->list, b->list) ||
-        !css_counters_equal(a->counters, b->counters) || !style_equal(a->marker, b->marker) ||
+        !css_counters_equal(a->counters, b->counters) || !css_font_equal(a->font, b->font) ||
+        !style_equal(a->marker, b->marker) ||
         !equal_string(a->bg_image, b->bg_image) || !equal_string(a->mask_image, b->mask_image) ||
         !css_motion_equal(&a->motion, &b->motion) || !equal_string(a->svg_fill.ref, b->svg_fill.ref) ||
         !equal_string(a->svg_stroke.ref, b->svg_stroke.ref) || !shadows_equal(a->box_shadow, b->box_shadow) ||
@@ -9666,6 +9721,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     x.font_choices = y.font_choices = NULL;
     x.container_names = y.container_names = x.font_names = y.font_names = NULL; x.content = y.content = NULL;
     x.list = y.list = NULL; x.counters = y.counters = NULL; x.marker = y.marker = NULL; /* compared above */
+    x.font = y.font = NULL;
     x.bg_image = y.bg_image = x.mask_image = y.mask_image = NULL;
     memset(&x.motion, 0, sizeof x.motion); memset(&y.motion, 0, sizeof y.motion);
     x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;

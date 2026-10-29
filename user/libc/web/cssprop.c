@@ -754,7 +754,8 @@ enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_
        PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_SHAPE, PT_OFFSET, PT_CLIP, PT_COLOR_SCHEME, PT_RULE_LIST,
        PT_RULE_INSET, PT_ANCHOR, PT_COUNTER, PT_QUOTES, PT_LIST_IMAGE,
        PT_BG_LIST, PT_BG_OFFSET, PT_BI_SOURCE, PT_BI_SLICE, PT_BI_SIDES, PT_BI_REPEAT,
-       PT_CURSOR, PT_UI_COLOR, PT_TEXT };
+       PT_CURSOR, PT_UI_COLOR, PT_TEXT, PT_FONT_STYLE, PT_FONT_WIDTH, PT_FONT_VARIANT, PT_FONT_ALTERNATES,
+       PT_FONT_TAGS, PT_SIZE_ADJUST, PT_PALETTE, PT_LANGUAGE };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
@@ -762,7 +763,7 @@ enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORD
        SH_LIST_STYLE, SH_FONT, SH_BACKGROUND, SH_FLEX, SH_FLEX_FLOW, SH_GAP, SH_OVERFLOW, SH_TEXT_DECORATION, SH_ALL,
        SH_PLACE_ITEMS, SH_PLACE_SELF, SH_PLACE_CONTENT, SH_GRID_AREA, SH_GRID_ROW, SH_GRID_COLUMN,
        SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_TRANSITION, SH_OUTLINE, SH_OFFSET, SH_GAP_RULE, SH_POSITION_TRY,
-       SH_BACKGROUND_POSITION, SH_BORDER_IMAGE, SH_MASK_BORDER };
+       SH_BACKGROUND_POSITION, SH_BORDER_IMAGE, SH_MASK_BORDER, SH_FONT_VARIANT, SH_FONT_SYNTHESIS };
 
 struct propdef {
     const char *name;
@@ -778,11 +779,14 @@ struct propdef {
 enum { AN_TYPE, AN_NONE, AN_DISCRETE, AN_VISIBILITY, AN_DISPLAY };
 /* style_t itself, or a group of rarely set properties it holds by pointer (style_t's float_shape,
    offset, gap_rules, anchor, counters, list, background, border_image, mask_border, ui, decoration,
-   text). A group holds only properties that are not inherited, but for G_LIST, G_UI and G_TEXT, which
-   hold only inherited ones: an element's style starts with its parent's group by the pointer
-   (css_style_init's copy of the parent), and with the initial values the others (groups_copy). */
+   text, font). A group holds only properties that are not inherited, but for G_LIST, G_UI, G_TEXT and
+   G_FONT, which hold only inherited ones: an element's style starts with its parent's group by the
+   pointer (css_style_init's copy of the parent), and with the initial values the others (groups_copy). */
 enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET, G_GAP_RULE, G_ANCHOR, G_COUNTER, G_LIST, G_BACKGROUND, G_BORDER_IMAGE,
-       G_MASK_BORDER, G_UI, G_DECORATION, G_TEXT };
+       G_MASK_BORDER, G_UI, G_DECORATION, G_TEXT, G_FONT };
+/* which font-variant longhand a PT_FONT_VARIANT property is, and which list a PT_FONT_TAGS one (their flags) */
+enum { FV_LIGATURES, FV_NUMERIC, FV_EAST_ASIAN };
+enum { FT_FEATURES, FT_VARIATIONS };
 /* which sides list a PT_BI_SIDES property holds (its flags) */
 enum { BI_WIDTH, BI_OUTSET };
 /* which colour a PT_UI_COLOR property is (its flags) */
@@ -830,7 +834,24 @@ static const struct kw kw_talign[] = {{"left", TA_LEFT}, {"right", TA_RIGHT}, {"
                                       {"-webkit-left", TA_LEFT}, {"-webkit-right", TA_RIGHT}, {"-moz-left", TA_LEFT},
                                       {"-moz-right", TA_RIGHT}, {"match-parent", TA_LEFT}, {"justify-all", TA_JUSTIFY}, {0}};
 static const struct kw kw_lspos[] = {{"outside", 0}, {"inside", 1}, {0}};
-static const struct kw kw_fstyle[] = {{"normal", 0}, {"italic", 1}, {"oblique", 1}, {0}};
+static const struct kw kw_fstyle[] = {{"normal", CSS_FONT_STYLE_NORMAL}, {"italic", CSS_FONT_STYLE_ITALIC},
+    {"oblique", CSS_FONT_STYLE_OBLIQUE}, {"left", CSS_FONT_STYLE_LEFT}, {"right", CSS_FONT_STYLE_RIGHT}, {0}};
+/* CSS Fonts 4 §6.6 font-variant-caps, §6.5 -position, §6.10 -emoji (Fonts 4), §6.3 font-kerning, §7.3
+   font-optical-sizing, §3.1-3.4 font-synthesis-* */
+static const struct kw kw_font_caps[] = {{"normal", CSS_FONT_CAPS_NORMAL}, {"small-caps", CSS_FONT_CAPS_SMALL},
+    {"all-small-caps", CSS_FONT_CAPS_ALL_SMALL}, {"petite-caps", CSS_FONT_CAPS_PETITE},
+    {"all-petite-caps", CSS_FONT_CAPS_ALL_PETITE}, {"unicase", CSS_FONT_CAPS_UNICASE},
+    {"titling-caps", CSS_FONT_CAPS_TITLING}, {0}};
+static const struct kw kw_font_position[] = {{"normal", CSS_FONT_POSITION_NORMAL}, {"sub", CSS_FONT_POSITION_SUB},
+    {"super", CSS_FONT_POSITION_SUPER}, {0}};
+static const struct kw kw_font_emoji[] = {{"normal", CSS_FONT_EMOJI_NORMAL}, {"text", CSS_FONT_EMOJI_TEXT},
+    {"emoji", CSS_FONT_EMOJI_EMOJI}, {"unicode", CSS_FONT_EMOJI_UNICODE}, {0}};
+static const struct kw kw_font_kerning[] = {{"auto", CSS_FONT_KERNING_AUTO}, {"normal", CSS_FONT_KERNING_NORMAL},
+    {"none", CSS_FONT_KERNING_NONE}, {0}};
+static const struct kw kw_font_optical[] = {{"auto", CSS_FONT_OPTICAL_AUTO}, {"none", CSS_FONT_OPTICAL_NONE}, {0}};
+static const struct kw kw_synthesis[] = {{"auto", CSS_SYNTHESIS_AUTO}, {"none", CSS_SYNTHESIS_NONE}, {0}};
+static const struct kw kw_synthesis_style[] = {{"auto", CSS_SYNTHESIS_AUTO}, {"none", CSS_SYNTHESIS_NONE},
+    {"oblique-only", CSS_SYNTHESIS_OBLIQUE_ONLY}, {0}};
 static const struct kw kw_ttrans[] = {{"none", TT_NONE}, {"uppercase", TT_UPPER}, {"lowercase", TT_LOWER},
                                       {"capitalize", TT_CAPITALIZE}, {"full-width", TT_NONE}, {0}};
 static const struct kw kw_overflow[] = {{"visible", OV_VISIBLE}, {"hidden", OV_HIDDEN}, {"scroll", OV_SCROLL},
@@ -952,6 +973,7 @@ static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}
 #define OMB(f) OG(G_MASK_BORDER, struct css_border_image, f)
 #define OTEXT(f) OG(G_TEXT, struct css_text, f)
 #define ODECO(f) OG(G_DECORATION, struct css_decoration, f)
+#define OFONT(f) OG(G_FONT, struct css_font, f)
 
 /* sorted by name at first use */
 static struct propdef props[] = {
@@ -1140,8 +1162,30 @@ static struct propdef props[] = {
     SH("all", SH_ALL),
     {"font-family", PT_FONT_FAMILY, 0, true, O(font_family), NULL, 0, AN_TYPE},
     {"font-size", PT_FONT_SIZE, 0, true, O(font_size), NULL, 0, AN_TYPE},
-    {"font-style", PT_KW, 0, true, O(font_style), kw_fstyle, 0, AN_TYPE},
+    {"font-style", PT_FONT_STYLE, 0, true, O(font_style), kw_fstyle, 0, AN_TYPE},
     {"font-weight", PT_FONT_WEIGHT, 0, true, O(font_weight), NULL, 0, AN_TYPE},
+    /* CSS Fonts 4 (font-size-adjust, palette-mix(): Fonts 5): the inherited font group */
+    {"font-feature-settings", PT_FONT_TAGS, FT_FEATURES, true, OFONT(features), NULL, 0, AN_DISCRETE},
+    {"font-kerning", PT_KW, 0, true, OFONT(kerning), kw_font_kerning, 0, AN_TYPE},
+    {"font-language-override", PT_LANGUAGE, 0, true, OFONT(language), NULL, 0, AN_DISCRETE},
+    {"font-optical-sizing", PT_KW, 0, true, OFONT(optical_sizing), kw_font_optical, 0, AN_TYPE},
+    {"font-palette", PT_PALETTE, 0, true, OFONT(palette), NULL, 0, AN_TYPE},
+    {"font-size-adjust", PT_SIZE_ADJUST, 0, true, OFONT(size_adjust), NULL, 0, AN_TYPE},
+    SH("font-synthesis", SH_FONT_SYNTHESIS),
+    {"font-synthesis-position", PT_KW, 0, true, OFONT(synthesis[CSS_SYNTHESIS_POSITION]), kw_synthesis, 0, AN_TYPE},
+    {"font-synthesis-small-caps", PT_KW, 0, true, OFONT(synthesis[CSS_SYNTHESIS_SMALL_CAPS]), kw_synthesis, 0, AN_TYPE},
+    {"font-synthesis-style", PT_KW, 0, true, OFONT(synthesis[CSS_SYNTHESIS_STYLE]), kw_synthesis_style, 0, AN_TYPE},
+    {"font-synthesis-weight", PT_KW, 0, true, OFONT(synthesis[CSS_SYNTHESIS_WEIGHT]), kw_synthesis, 0, AN_TYPE},
+    SH("font-variant", SH_FONT_VARIANT),
+    {"font-variant-alternates", PT_FONT_ALTERNATES, 0, true, OFONT(alternates), NULL, 0, AN_DISCRETE},
+    {"font-variant-caps", PT_KW, 0, true, OFONT(caps), kw_font_caps, 0, AN_TYPE},
+    {"font-variant-east-asian", PT_FONT_VARIANT, FV_EAST_ASIAN, true, OFONT(east_asian), NULL, 0, AN_DISCRETE},
+    {"font-variant-emoji", PT_KW, 0, true, OFONT(emoji), kw_font_emoji, 0, AN_TYPE},
+    {"font-variant-ligatures", PT_FONT_VARIANT, FV_LIGATURES, true, OFONT(ligatures), NULL, 0, AN_DISCRETE},
+    {"font-variant-numeric", PT_FONT_VARIANT, FV_NUMERIC, true, OFONT(numeric), NULL, 0, AN_DISCRETE},
+    {"font-variant-position", PT_KW, 0, true, OFONT(position), kw_font_position, 0, AN_TYPE},
+    {"font-variation-settings", PT_FONT_TAGS, FT_VARIATIONS, true, OFONT(variations), NULL, 0, AN_TYPE},
+    {"font-width", PT_FONT_WIDTH, 0, true, OFONT(width), NULL, 0, AN_TYPE},
     SH("gap", SH_GAP),
     SH("grid", SH_GRID),
     SH("grid-area", SH_GRID_AREA),
@@ -1260,16 +1304,16 @@ static struct propdef props[] = {
 };
 #define NPROPS (int)(sizeof props / sizeof *props)
 
-/* other names for the same properties: the legacy name aliases the specifications define (legacy: CSS
-   Cascade's legacy name alias, a supported property with its own CSSOM attribute, never listed among a
-   computed style's longhands: word-wrap of CSS Text's overflow-wrap, the grid gaps of CSS Box Alignment's
-   legacy gap properties), and the
-   logical properties, which map to left-to-right, horizontal text */
+/* other names for the same properties (logical properties map to left-to-right, horizontal text); a
+   legacy name alias (CSS Cascade 5 §3.3, "legacy name alias": font-stretch of CSS Fonts' font-width,
+   word-wrap of CSS Text's overflow-wrap, the grid gaps of CSS Box Alignment's legacy gap properties) is
+   the property itself under another name: a declaration of it is one of the property, which CSSOM
+   writes under the property's name, and the alias is never listed among a computed style's longhands */
 static const struct {
     const char *alias, *name;
     bool legacy;
 } aliases[] = {
-    {"-webkit-transform", "transform"},
+    {"-webkit-transform", "transform"}, {"font-stretch", "font-width", true},
     {"block-size", "height"}, {"border-block-end", "border-bottom"}, {"border-block-start", "border-top"},
     {"border-block-end-color", "border-bottom-color"}, {"border-block-start-color", "border-top-color"},
     {"border-block-end-width", "border-bottom-width"}, {"border-block-start-width", "border-top-width"},
@@ -1377,12 +1421,18 @@ const struct propdef *css_prop_lookup(const char *name, size_t n) {
     return NULL;
 }
 
-int css_prop_count(void) { return NPROPS; }
-const char *css_prop_legacy_alias(int index) {
+/* the property a legacy name alias names (NULL: name is none), and the aliases one by one */
+const char *css_prop_legacy_alias(const char *name, size_t n) {
     for (size_t i = 0; i < sizeof aliases / sizeof *aliases; i++)
-        if (aliases[i].legacy && !index--) return aliases[i].alias;
+        if (aliases[i].legacy && ident_is(name, n, aliases[i].alias)) return aliases[i].name;
     return NULL;
 }
+const char *css_prop_legacy_alias_at(int index, const char **name) {
+    for (size_t i = 0; i < sizeof aliases / sizeof *aliases; i++)
+        if (aliases[i].legacy && !index--) { if (name) *name = aliases[i].name; return aliases[i].alias; }
+    return NULL;
+}
+int css_prop_count(void) { return NPROPS; }
 const char *css_prop_name(int index,bool *longhand) {
     if(index<0||index>=NPROPS)return NULL;
     props_init();
@@ -1427,6 +1477,7 @@ static const void *group_of(const style_t *s, uint8_t g) {
     case G_UI: return css_style_ui(s);
     case G_DECORATION: return css_style_decoration(s);
     case G_TEXT: return css_style_text(s);
+    case G_FONT: return css_style_font(s);
     }
     return s;
 }
@@ -1442,6 +1493,7 @@ static size_t group_size(uint8_t g) {
     case G_UI: return sizeof(struct css_ui);
     case G_DECORATION: return sizeof(struct css_decoration);
     case G_TEXT: return sizeof(struct css_text);
+    case G_FONT: return sizeof(struct css_font);
     }
     return sizeof(struct css_list);
 }
@@ -1458,6 +1510,7 @@ static bool group_same(const style_t *a, const style_t *b, uint8_t g) {
     case G_UI: return a->ui == b->ui;
     case G_DECORATION: return a->decoration == b->decoration;
     case G_TEXT: return a->text == b->text;
+    case G_FONT: return a->font == b->font;
     }
     return a->list == b->list;
 }
@@ -1479,12 +1532,13 @@ static void *group_write(style_t *s, uint8_t g, const void *value, arena_t *a) {
     case G_UI: s->ui = copy; break;
     case G_DECORATION: s->decoration = copy; break;
     case G_TEXT: s->text = copy; break;
+    case G_FONT: s->font = copy; break;
     default: s->list = copy;
     }
     return copy;
 }
 /* every group of uninherited properties of src, as copying each of those properties would (G_LIST's,
-   G_UI's and G_TEXT's are inherited: css_style_init's copy of the parent already holds them) */
+   G_UI's, G_TEXT's and G_FONT's are inherited: css_style_init's copy of the parent already holds them) */
 static void groups_copy(style_t *dst, const style_t *src) {
     dst->float_shape = src->float_shape;
     dst->offset = src->offset;
@@ -1522,6 +1576,12 @@ static bool text_value_text(const style_t *st, const struct propdef *p, bool res
 static void decoration_line_text(sbuf *out, uint8_t lines);
 static bool decoration_shorthand_text(const style_t *st, sbuf *out, web_doc *d);
 static bool text_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
+/* the font values (below): a computed value, font-family's, and a declared value's specified serialization */
+static bool font_value_text(const style_t *st, const struct propdef *p, sbuf *out);
+static void font_family_text(const style_t *st, sbuf *out);
+static bool font_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
+static bool font_shorthand_text(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d);
+static void anim_unit(sbuf *b, double v, const char *unit);
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d) {
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return 0;
@@ -1552,6 +1612,12 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
     case PT_COLOR: return css_style_color_text(st, color_slot(p), out) ? 1 : -1;
     case PT_COLOR_SCHEME: sb_puts(out, st->color_scheme_text ? st->color_scheme_text : "normal"); return 1;
     case PT_FILTER: return css_filter_serialize(st, *(const struct css_filter *const *)field, out, d) ? 1 : -1;
+    case PT_FONT_SIZE: anim_unit(out, st->font_size, "px"); return 1;
+    case PT_FONT_WEIGHT: snprintf(text, sizeof text, "%u", (unsigned)st->font_weight); sb_puts(out, text); return 1;
+    case PT_FONT_FAMILY: font_family_text(st, out); return 1;
+    case PT_FONT_STYLE: case PT_FONT_WIDTH: case PT_FONT_VARIANT: case PT_FONT_ALTERNATES: case PT_FONT_TAGS:
+    case PT_SIZE_ADJUST: case PT_PALETTE: case PT_LANGUAGE:
+        return font_value_text(st, p, out) ? 1 : -1;
     case PT_MOTION_LIST: case PT_SHAPE: case PT_OFFSET: case PT_ROTATE: case PT_SCALE: case PT_ANCHOR:
     case PT_CONTENT: case PT_LIST_TYPE: case PT_LIST_IMAGE: case PT_QUOTES: case PT_COUNTER:
     case PT_BG_LIST: case PT_BG_OFFSET: case PT_BI_SLICE: case PT_BI_SIDES: case PT_BI_REPEAT:
@@ -1568,7 +1634,8 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
         if (p->sh == SH_OFFSET) return css_offset_shorthand_serialize(css_style_offset(st), out, d) ? 1 : -1;
         if (p->sh == SH_GAP_RULE) return gap_computed(st, p, out, d);
         if (p->sh == SH_POSITION_TRY) return position_try_text(css_style_anchor(st), out) ? 1 : -1;
-        if (p->sh == SH_BACKGROUND_POSITION || p->sh == SH_BORDER_IMAGE || p->sh == SH_MASK_BORDER) {
+        if (p->sh == SH_BACKGROUND_POSITION || p->sh == SH_BORDER_IMAGE || p->sh == SH_MASK_BORDER || p->sh == SH_FONT ||
+            p->sh == SH_FONT_VARIANT || p->sh == SH_FONT_SYNTHESIS) {
             size_t begin = out->n;
             if (group_shorthand_text(st, p, out, d)) return 1;
             out->n = begin;
@@ -1591,6 +1658,9 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     if (p->group == G_UI) return ui_specified(p, v, n, out);
     if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
     if (p->type == PT_FILTER) return css_filter_specified(v, n, out);
+    if (p->group == G_FONT || p->type == PT_FONT_STYLE || p->type == PT_FONT_FAMILY ||
+        (p->type == PT_SHORT && (p->sh == SH_FONT || p->sh == SH_FONT_VARIANT || p->sh == SH_FONT_SYNTHESIS)))
+        return font_specified(p, v, n, out);
     /* a keyword serializes in ASCII lowercase (CSSOM "serialize a CSS component value"); the tables
        write theirs so */
     if (p->type == PT_KW && p->kws)
@@ -1688,6 +1758,7 @@ bool css_prop_reify(const char *name, size_t n, struct css_reify *out) {
     case PT_LINE_HEIGHT: case PT_SVG_WIDTH: accept = CSS_CALC_NUMBER | CSS_CALC_LENGTH | CSS_CALC_PERCENT; break;
     case PT_INT: case PT_ZINDEX: case PT_LINE_CLAMP: out->integer = true; /* fall through */
     case PT_NUM: case PT_FONT_WEIGHT: accept = CSS_CALC_NUMBER; break;
+    case PT_FONT_WIDTH: accept = CSS_CALC_PERCENT; break;
     case PT_OPACITY: case PT_SCALE: accept = CSS_CALC_NUMBER | CSS_CALC_PERCENT; break;
     case PT_ROTATE: accept = CSS_CALC_ANGLE; break;
     /* offset-rotate: [auto | reverse] || <angle>; shape-outside: a box, an <image> (a basic shape is
@@ -1702,7 +1773,7 @@ bool css_prop_reify(const char *name, size_t n, struct css_reify *out) {
        integer goes with a name or span, a CSSStyleValue (WPT grid-start-end.html) */
     case PT_KW: case PT_DISPLAY: case PT_COLOR: case PT_FONT_FAMILY: case PT_LIST_TYPE: case PT_BG_IMAGE: case PT_OVERFLOW:
     case PT_MASK_IMAGE: case PT_SVG_PAINT: case PT_CONTAINER_NAMES: case PT_TRANSFORM: case PT_GAREAS: case PT_FILTER:
-    case PT_BOX_SHADOW: case PT_CLIP: case PT_COLOR_SCHEME: case PT_GLINE:
+    case PT_BOX_SHADOW: case PT_CLIP: case PT_COLOR_SCHEME: case PT_GLINE: case PT_FONT_STYLE:
         break;
     default: typed = false;
     }
@@ -3559,7 +3630,8 @@ static bool parse_font_size(const char *s, size_t n, struct cx *cx, float *out) 
     len_t l;
     if (!parse_len(s, n, cx, &l, 0)) return false;
     float v = len_resolve(&l, pfs);
-    if (v < 0) return false;
+    /* <length-percentage [0,∞]>: a negative literal is invalid, a calculation clamps (CSS Values 4 §10.12) */
+    if (v < 0) { if (!css_calc_is_math(s, n)) return false; v = 0; }
     *out = v;
     return true;
 }
@@ -3584,6 +3656,23 @@ static bool parse_font_weight(const char *s, size_t n, struct cx *cx, uint16_t *
     return true;
 }
 
+/* The generic family keywords (CSS Fonts 4 §2.1.2), and the identifiers a <family-name> of identifiers
+   may not have in it (§2.1.1: "any identifier which could be misinterpreted as a pre-defined keyword in
+   the font-family value definition, or the CSS-wide keywords"); generic: the generic families too, which
+   a name of one identifier is instead */
+static const char *const generic_families[] = {"serif", "sans-serif", "cursive", "fantasy", "monospace", "system-ui",
+    "emoji", "math", "fangsong", "ui-serif", "ui-sans-serif", "ui-monospace", "ui-rounded", NULL};
+static bool generic_family(const char *name) {
+    for (int i = 0; generic_families[i]; i++) if (!strcasecmp(name, generic_families[i])) return true;
+    return false;
+}
+static bool family_word_reserved(const char *w, size_t n, bool generic) {
+    static const char *const wide[] = {"inherit", "initial", "unset", "revert", "revert-layer", "revert-rule", "default",
+                                       NULL};
+    for (int i = 0; wide[i]; i++) if (ident_is(w, n, wide[i])) return true;
+    for (int i = 0; generic && generic_families[i]; i++) if (ident_is(w, n, generic_families[i])) return true;
+    return false;
+}
 const char *css_font_family_next(arena_t *a,const char **cursor,const char *end) {
     const char *s=*cursor;while(s<end && is_space((unsigned char)*s))s++;
     const char *begin=s,*finish=s;bool quoted=s<end && (*s=='"' || *s=='\'');
@@ -3616,9 +3705,16 @@ const char *css_font_family_next(arena_t *a,const char **cursor,const char *end)
         b.n=write;
     }
     const char *name=ar_strndup(a,b.p?b.p:"",b.n);sb_free(&b);
-    /* <custom-ident> excludes the CSS-wide keywords and default (CSS Values 4). */
-    if(!quoted && (!strcasecmp(name,"inherit") || !strcasecmp(name,"initial") || !strcasecmp(name,"unset") ||
-       !strcasecmp(name,"revert") || !strcasecmp(name,"revert-layer") || !strcasecmp(name,"default")))goto bad;
+    /* <custom-ident> excludes the CSS-wide keywords and default (CSS Values 4); a name of several
+       identifiers also the generic families (§2.1.1), which one identifier alone is */
+    if(!quoted) {
+        bool several=strchr(name,' ')!=NULL;
+        for(const char *w=name;*w;) {
+            const char *e=strchr(w,' ');size_t n=e?(size_t)(e-w):strlen(w);
+            if(family_word_reserved(w,n,several))goto bad;
+            w+=n;if(*w)w++;
+        }
+    }
     if(s<end){s++;const char *tail=s;while(tail<end && is_space((unsigned char)*tail))tail++;if(tail==end)goto bad;}
     *cursor=s;return name;
 bad:*cursor=NULL;return NULL;
@@ -4599,6 +4695,7 @@ static bool border_image_text(const struct css_border_image *b, bool mask, sbuf 
 }
 /* the shorthands whose longhands are one group's: their computed value */
 static bool group_shorthand_text(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d) {
+    if (p->sh == SH_FONT || p->sh == SH_FONT_VARIANT || p->sh == SH_FONT_SYNTHESIS) return font_shorthand_text(st, p, out, d);
     if (p->sh == SH_BORDER_IMAGE) return border_image_text(css_style_border_image(st), false, out, d);
     if (p->sh == SH_MASK_BORDER) return border_image_text(css_style_mask_border(st), true, out, d);
     if (p->sh != SH_BACKGROUND_POSITION) return false;
@@ -5933,6 +6030,793 @@ static bool parse_gline(const char *s, size_t n, struct cx *cx, struct gline *g)
 }
 
 /* src's value of p into dst; a: where dst's copy of a group goes */
+/* ---------------------------------------------------------------- fonts (CSS Fonts 4; font-size-adjust's metrics: Fonts 5)
+   font-style's oblique angle, font-width, the font-variant longhands, font-feature-settings,
+   font-variation-settings, font-kerning, font-optical-sizing, font-synthesis-*, font-size-adjust,
+   font-palette and font-language-override live in the inherited group style_t holds by pointer
+   (struct css_font). Each parser writes the computed value; the ones whose specified value keeps
+   what the computed one loses (a keyword, a math function, the order of a list) also write the
+   declared value's specified serialization when given spec (CSSOM). */
+static void anim_number(sbuf *b, double v);
+static double anim_clamp(double v, double lo, double hi);
+const struct css_font css_font_initial = {.width = 100};
+
+/* a font-variant longhand's keywords: a keyword's bit is its index, in the order they serialize; one
+   excludes the others of its group (§6.4 ligatures, §6.7 numeric, §6.10 east-asian) */
+struct variant_kw { const char *name; uint8_t group; };
+static const struct variant_kw variant_ligatures[] = {{"common-ligatures", 0}, {"no-common-ligatures", 0},
+    {"discretionary-ligatures", 1}, {"no-discretionary-ligatures", 1}, {"historical-ligatures", 2},
+    {"no-historical-ligatures", 2}, {"contextual", 3}, {"no-contextual", 3}, {0}};
+static const struct variant_kw variant_numeric[] = {{"lining-nums", 0}, {"oldstyle-nums", 0}, {"proportional-nums", 1},
+    {"tabular-nums", 1}, {"diagonal-fractions", 2}, {"stacked-fractions", 2}, {"ordinal", 3}, {"slashed-zero", 4}, {0}};
+static const struct variant_kw variant_east_asian[] = {{"jis78", 0}, {"jis83", 0}, {"jis90", 0}, {"jis04", 0},
+    {"simplified", 0}, {"traditional", 0}, {"full-width", 1}, {"proportional-width", 1}, {"ruby", 2}, {0}};
+static const struct variant_kw *const variant_tables[3] = {variant_ligatures, variant_numeric, variant_east_asian};
+static int variant_find(const struct variant_kw *t, const char *s, size_t n) {
+    for (int i = 0; t[i].name; i++) if (ident_is(s, n, t[i].name)) return i;
+    return -1;
+}
+/* normal, ligatures' none, or keywords of distinct groups */
+static bool parse_font_variant(int which, const char *v, size_t n, uint16_t *out) {
+    if (ident_is(v, n, "normal")) { *out = 0; return true; }
+    if (which == FV_LIGATURES && ident_is(v, n, "none")) { *out = CSS_FONT_LIGATURES_NONE; return true; }
+    const struct variant_kw *t = variant_tables[which];
+    const char *p = v, *e = v + n, *token;
+    size_t tn;
+    uint16_t bits = 0;
+    unsigned groups = 0;
+    while (value_token(&p, e, &token, &tn)) {
+        int k = variant_find(t, token, tn);
+        if (k < 0 || (groups >> t[k].group & 1)) return false;
+        groups |= 1u << t[k].group;
+        bits |= (uint16_t)(1u << k);
+    }
+    if (!bits) return false;
+    *out = bits;
+    return true;
+}
+static void variant_text(int which, uint16_t bits, sbuf *out) {
+    if (!bits) { sb_puts(out, "normal"); return; }
+    if (bits == CSS_FONT_LIGATURES_NONE) { sb_puts(out, "none"); return; }
+    const struct variant_kw *t = variant_tables[which];
+    bool any = false;
+    for (int i = 0; t[i].name; i++)
+        if (bits >> i & 1) { if (any) sb_putc(out, ' '); sb_puts(out, t[i].name); any = true; }
+}
+
+/* font-variant-alternates (§6.8): normal | [ stylistic(<feature-value-name>) || historical-forms ||
+   styleset(<feature-value-name>#) || character-variant(<feature-value-name>#) || swash(<feature-value-name>) ||
+   ornaments(<feature-value-name>) || annotation(<feature-value-name>) ] */
+static const char *const alternate_functions[CSS_ALT_FUNCTIONS] = {"stylistic", "styleset", "character-variant", "swash",
+                                                                   "ornaments", "annotation"};
+static bool parse_font_alternates(const char *v, size_t n, struct cx *cx, const struct css_font_alternates **out) {
+    if (ident_is(v, n, "normal")) { *out = NULL; return true; }
+    struct css_font_alternates alt = {{NULL}, false};
+    const char *p = v, *e = v + n, *token;
+    size_t tn;
+    bool any = false;
+    while (value_token(&p, e, &token, &tn)) {
+        any = true;
+        if (ident_is(token, tn, "historical-forms")) {
+            if (alt.historical) return false;
+            alt.historical = true;
+            continue;
+        }
+        size_t open = 0;
+        while (open < tn && token[open] != '(') open++;
+        if (open == tn || token[tn - 1] != ')') return false;
+        int f = -1;
+        for (int i = 0; i < CSS_ALT_FUNCTIONS; i++) if (ident_is(token, open, alternate_functions[i])) f = i;
+        if (f < 0 || alt.arg[f]) return false;
+        const char **args;
+        size_t *argn;
+        int count = list_split(token + open + 1, tn - open - 2, cx, &args, &argn);
+        bool list = f == CSS_ALT_STYLESET || f == CSS_ALT_CHARACTER_VARIANT;
+        if (count < 1 || (!list && count != 1)) return false;
+        /* the names joined by ", " are no longer than the token */
+        char *text = ar_alloc(cx->a, tn + 2 * (size_t)count + 1), *w = text;
+        for (int i = 0; i < count; i++) {
+            if (!motion_name(args[i], argn[i])) return false; /* a <custom-ident> */
+            if (i) { *w++ = ','; *w++ = ' '; }
+            memcpy(w, args[i], argn[i]);
+            w += argn[i];
+        }
+        *w = 0;
+        alt.arg[f] = text;
+    }
+    if (!any) return false;
+    struct css_font_alternates *own = ar_alloc(cx->a, sizeof *own);
+    *own = alt;
+    *out = own;
+    return true;
+}
+static void alternates_text(const struct css_font_alternates *a, sbuf *out) {
+    if (!a) { sb_puts(out, "normal"); return; }
+    /* stylistic, historical-forms (-1), then the others in their order */
+    static const int order[] = {CSS_ALT_STYLISTIC, -1, CSS_ALT_STYLESET, CSS_ALT_CHARACTER_VARIANT, CSS_ALT_SWASH,
+                                CSS_ALT_ORNAMENTS, CSS_ALT_ANNOTATION};
+    bool any = false;
+    for (size_t i = 0; i < sizeof order / sizeof *order; i++) {
+        int f = order[i];
+        if (f < 0 ? !a->historical : !a->arg[f]) continue;
+        if (any) sb_putc(out, ' ');
+        any = true;
+        if (f < 0) { sb_puts(out, "historical-forms"); continue; }
+        sb_puts(out, alternate_functions[f]);
+        sb_putc(out, '(');
+        sb_puts(out, a->arg[f]);
+        sb_putc(out, ')');
+    }
+}
+static bool alternates_equal(const struct css_font_alternates *a, const struct css_font_alternates *b) {
+    if (a == b) return true;
+    if (!a || !b || a->historical != b->historical) return false;
+    for (int i = 0; i < CSS_ALT_FUNCTIONS; i++) if (!same_name(a->arg[i], b->arg[i])) return false;
+    return true;
+}
+
+/* an <opentype-tag> (§6.12): a <string> of four characters U+20-7E */
+static bool font_tag(const char *s, size_t n, char tag[4]) {
+    if (!string_token(s, n)) return false;
+    sbuf b = {0};
+    css_unescape(&b, s + 1, n - 2);
+    bool ok = b.n == 4;
+    for (size_t i = 0; ok && i < 4; i++) ok = (unsigned char)b.p[i] >= 0x20 && (unsigned char)b.p[i] <= 0x7E;
+    if (ok) memcpy(tag, b.p, 4);
+    sb_free(&b);
+    return ok;
+}
+static void tag_text(const char tag[4], sbuf *out) {
+    char t[5];
+    memcpy(t, tag, 4);
+    t[4] = 0;
+    css_serialize_string(out, t);
+}
+/* a literal <integer> token: digits after an optional + */
+static bool integer_literal(const char *s, size_t n) {
+    size_t i = n && s[0] == '+' ? 1 : 0;
+    if (i == n) return false;
+    for (; i < n; i++) if (s[i] < '0' || s[i] > '9') return false;
+    return true;
+}
+struct tag_order { struct css_font_tag tag; uint32_t at; };
+static int tag_order_compare(const void *x, const void *y) {
+    const struct tag_order *a = x, *b = y;
+    int c = memcmp(a->tag.tag, b->tag.tag, 4);
+    return c ? c : a->at < b->at ? -1 : a->at > b->at;
+}
+/* font-feature-settings (§6.12): normal | <feature-tag-value>#, a tag with an <integer [0,∞]>, on (1) or
+   off (0), 1 when not given; font-variation-settings (§7.2): normal | [ <opentype-tag> <number> ]#. The
+   computed list is sorted by tag, each tag once with its last value. */
+static bool parse_font_tags(bool variation, const char *v, size_t n, struct cx *cx, const struct css_font_tags **out,
+                            sbuf *spec) {
+    if (ident_is(v, n, "normal")) {
+        *out = NULL;
+        if (spec) sb_puts(spec, "normal");
+        return true;
+    }
+    const char **items;
+    size_t *lengths;
+    int count = list_split(v, n, cx, &items, &lengths);
+    if (count < 1) return false;
+    struct tag_order *order = ar_alloc(cx->a, (size_t)count * sizeof *order);
+    for (int i = 0; i < count; i++) {
+        const char *p = items[i], *e = p + lengths[i], *token[3];
+        size_t tn[3];
+        int k = 0;
+        while (k < 3 && value_token(&p, e, &token[k], &tn[k])) k++;
+        if (k < 1 || k > 2 || (variation && k != 2) || !font_tag(token[0], tn[0], order[i].tag.tag)) return false;
+        double value = 1;
+        bool math = false;
+        if (k == 2) {
+            if (!variation && ident_is(token[1], tn[1], "on")) value = 1;
+            else if (!variation && ident_is(token[1], tn[1], "off")) value = 0;
+            else {
+                math = css_calc_is_math(token[1], tn[1]);
+                if ((!variation && !math && !integer_literal(token[1], tn[1])) ||
+                    !css_numeric_read(token[1], tn[1], CSS_CALC_NUMBER, cx, cx->a, NAN, &value, NULL)) return false;
+                /* an <integer> calculation rounds to the nearest integer, a half toward +infinity, and clamps
+                   to the range (CSS Values 4 §10.9, §10.12) */
+                if (!variation && math) value = value < 0 ? 0 : floor(value + 0.5);
+            }
+        }
+        order[i].tag.value = isnan(value) ? 0 : value > DBL_MAX ? DBL_MAX : value < -DBL_MAX ? -DBL_MAX : value;
+        order[i].at = (uint32_t)i;
+        if (spec) {
+            if (i) sb_puts(spec, ", ");
+            tag_text(order[i].tag.tag, spec);
+            if (math) {
+                sb_putc(spec, ' ');
+                if (!css_calc_specified(token[1], tn[1], CSS_CALC_NUMBER, spec)) sb_put(spec, token[1], tn[1]);
+            } else if (variation || value != 1) { sb_putc(spec, ' '); anim_number(spec, value); }
+        }
+    }
+    qsort(order, (size_t)count, sizeof *order, tag_order_compare);
+    struct css_font_tags *list = ar_alloc(cx->a, sizeof *list + (size_t)count * sizeof *list->item);
+    list->n = 0;
+    for (int i = 0; i < count; i++) {
+        if (i + 1 < count && !memcmp(order[i].tag.tag, order[i + 1].tag.tag, 4)) continue; /* a later one wins */
+        list->item[list->n++] = order[i].tag;
+    }
+    *out = list;
+    return true;
+}
+static void tags_text(bool variation, const struct css_font_tags *l, sbuf *out) {
+    if (!l) { sb_puts(out, "normal"); return; }
+    for (uint32_t i = 0; i < l->n; i++) {
+        if (i) sb_puts(out, ", ");
+        tag_text(l->item[i].tag, out);
+        if (variation || l->item[i].value != 1) { sb_putc(out, ' '); anim_number(out, l->item[i].value); }
+    }
+}
+static bool tags_equal(const struct css_font_tags *a, const struct css_font_tags *b) {
+    if (a == b) return true;
+    if (!a || !b || a->n != b->n) return false;
+    for (uint32_t i = 0; i < a->n; i++)
+        if (memcmp(a->item[i].tag, b->item[i].tag, 4) || a->item[i].value != b->item[i].value) return false;
+    return true;
+}
+
+/* font-language-override (§6.13): normal | <string> of one to four characters U+20-7E, kept as written;
+   it serializes without its trailing spaces */
+static bool parse_font_language(const char *v, size_t n, char out[5]) {
+    if (ident_is(v, n, "normal")) { memset(out, 0, 5); return true; }
+    if (!string_token(v, n)) return false;
+    sbuf b = {0};
+    css_unescape(&b, v + 1, n - 2);
+    bool ok = b.n >= 1 && b.n <= 4;
+    for (size_t i = 0; ok && i < b.n; i++) ok = (unsigned char)b.p[i] >= 0x20 && (unsigned char)b.p[i] <= 0x7E;
+    if (ok) { memset(out, 0, 5); memcpy(out, b.p, b.n); }
+    sb_free(&b);
+    return ok;
+}
+static void language_text(const char *language, sbuf *out) {
+    if (!language[0]) { sb_puts(out, "normal"); return; }
+    char t[5];
+    size_t k = strnlen(language, 4);
+    memcpy(t, language, k);
+    while (k && t[k - 1] == ' ') k--;
+    t[k] = 0;
+    css_serialize_string(out, t);
+}
+
+/* font-size-adjust (Fonts 5 §2.6): none | [ ex-height | cap-height | ch-width | ic-width | ic-height ]?
+   [ from-font | <number [0,∞]> ], ex-height not written */
+static const char *const aspect_names[FONT_ASPECTS] = {"ex-height", "cap-height", "ch-width", "ic-width", "ic-height"};
+static bool parse_size_adjust(const char *v, size_t n, struct cx *cx, struct css_font_size_adjust *out, sbuf *spec) {
+    struct css_font_size_adjust r = {0, CSS_SIZE_ADJUST_NONE, FONT_ASPECT_EX_HEIGHT};
+    const char *t[3];
+    size_t tl[3];
+    int k = split_checked(v, n, t, tl, 3, ' ', cx);
+    if (k == 1 && ident_is(t[0], tl[0], "none")) {
+        *out = r;
+        if (spec) sb_puts(spec, "none");
+        return true;
+    }
+    if (k < 1 || k > 2) return false;
+    int i = 0;
+    if (k == 2) {
+        int metric = -1;
+        for (int m = 0; m < FONT_ASPECTS; m++) if (ident_is(t[0], tl[0], aspect_names[m])) metric = m;
+        if (metric < 0) return false;
+        r.metric = (uint8_t)metric;
+        i = 1;
+    }
+    bool math = false;
+    double x = 0;
+    if (ident_is(t[i], tl[i], "from-font")) r.kind = CSS_SIZE_ADJUST_FROM_FONT;
+    else {
+        math = css_calc_is_math(t[i], tl[i]);
+        if (!css_numeric_read(t[i], tl[i], CSS_CALC_NUMBER, cx, cx->a, NAN, &x, NULL)) return false;
+        if (x < 0) { if (!math) return false; x = 0; } /* a calculation clamps to the range */
+        r.kind = CSS_SIZE_ADJUST_NUMBER;
+        r.value = calc_float(x);
+    }
+    if (spec) {
+        if (r.metric != FONT_ASPECT_EX_HEIGHT) { sb_puts(spec, aspect_names[r.metric]); sb_putc(spec, ' '); }
+        if (r.kind == CSS_SIZE_ADJUST_FROM_FONT) sb_puts(spec, "from-font");
+        else if (!math) anim_number(spec, x);
+        else if (!css_calc_specified(t[i], tl[i], CSS_CALC_NUMBER, spec)) sb_put(spec, t[i], tl[i]);
+    }
+    *out = r;
+    return true;
+}
+static void size_adjust_text(const struct css_font_size_adjust *s, sbuf *out) {
+    if (s->kind == CSS_SIZE_ADJUST_NONE) { sb_puts(out, "none"); return; }
+    if (s->metric != FONT_ASPECT_EX_HEIGHT) { sb_puts(out, aspect_names[s->metric]); sb_putc(out, ' '); }
+    if (s->kind == CSS_SIZE_ADJUST_FROM_FONT) sb_puts(out, "from-font");
+    else anim_number(out, s->value);
+}
+static bool size_adjust_equal(const struct css_font_size_adjust *a, const struct css_font_size_adjust *b) {
+    return a->kind == b->kind && (a->kind == CSS_SIZE_ADJUST_NONE || a->metric == b->metric) &&
+           (a->kind != CSS_SIZE_ADJUST_NUMBER || a->value == b->value);
+}
+
+/* font-width (§2.3): normal | <percentage [0,∞]> | the keywords, each a percentage */
+static const struct { const char *name; float percent; } width_keywords[] = {{"normal", 100}, {"ultra-condensed", 50},
+    {"extra-condensed", 62.5f}, {"condensed", 75}, {"semi-condensed", 87.5f}, {"semi-expanded", 112.5f},
+    {"expanded", 125}, {"extra-expanded", 150}, {"ultra-expanded", 200}};
+static int width_keyword(const char *s, size_t n) {
+    for (size_t i = 0; i < sizeof width_keywords / sizeof *width_keywords; i++)
+        if (ident_is(s, n, width_keywords[i].name)) return (int)i;
+    return -1;
+}
+static bool parse_font_width(const char *v, size_t n, struct cx *cx, float *out, sbuf *spec) {
+    int k = width_keyword(v, n);
+    if (k >= 0) {
+        *out = width_keywords[k].percent;
+        if (spec) sb_puts(spec, width_keywords[k].name);
+        return true;
+    }
+    double x;
+    bool math = css_calc_is_math(v, n);
+    if (!css_numeric_read(v, n, CSS_CALC_PERCENT, cx, cx->a, NAN, &x, NULL)) return false;
+    if (spec) { if (!math) anim_unit(spec, x, "%"); else if (!css_calc_specified(v, n, CSS_CALC_PERCENT, spec)) sb_put(spec, v, n); }
+    if (x < 0) { if (!math) return false; x = 0; }
+    *out = calc_float(x);
+    return true;
+}
+
+/* font-style (§2.4): normal | italic | left | right | oblique <angle [-90deg,90deg]>?; oblique without
+   an angle is 14deg, and oblique 0deg is normal. The computed value keeps whether the angle was written. */
+static bool parse_font_style(const char *v, size_t n, struct cx *cx, uint8_t *style, float *angle, bool *given, sbuf *spec) {
+    const char *t[3];
+    size_t tl[3];
+    int k = split_checked(v, n, t, tl, 3, ' ', cx);
+    uint8_t s;
+    if (k < 1 || k > 2 || !kw_find(kw_fstyle, t[0], tl[0], &s) || (k == 2 && s != CSS_FONT_STYLE_OBLIQUE)) return false;
+    *angle = s == CSS_FONT_STYLE_OBLIQUE ? 14 : 0;
+    *given = false;
+    if (k == 2) {
+        double x;
+        bool math = css_calc_is_math(t[1], tl[1]);
+        if (!css_numeric_read(t[1], tl[1], CSS_CALC_ANGLE, cx, cx->a, NAN, &x, NULL)) return false;
+        if (x < -90 || x > 90) { if (!math) return false; x = anim_clamp(x, -90, 90); }
+        if (spec) {
+            if (!math && x == 0) sb_puts(spec, "normal");
+            else {
+                sb_puts(spec, "oblique ");
+                if (math) { if (!css_calc_specified(t[1], tl[1], CSS_CALC_ANGLE, spec)) sb_put(spec, t[1], tl[1]); }
+                else {
+                    /* the literal in its own unit */
+                    const char *q = t[1];
+                    float number;
+                    if (!parse_number(&q, t[1] + tl[1], &number)) return false;
+                    anim_number(spec, number);
+                    for (; q < t[1] + tl[1]; q++) sb_putc(spec, (char)lower((unsigned char)*q));
+                }
+            }
+        }
+        if (x == 0) s = CSS_FONT_STYLE_NORMAL;
+        else { *angle = calc_float(x); *given = true; }
+    } else if (spec) sb_puts(spec, kw_name(kw_fstyle, s));
+    *style = s;
+    return true;
+}
+static void font_style_text(const style_t *st, sbuf *out) {
+    const struct css_font *f = css_style_font(st);
+    sb_puts(out, kw_name(kw_fstyle, st->font_style));
+    if (st->font_style == CSS_FONT_STYLE_OBLIQUE && f->oblique_angle) { sb_putc(out, ' '); anim_unit(out, f->oblique, "deg"); }
+}
+/* the oblique angle a style interpolates (normal is oblique 0deg); false for italic, left and right */
+static bool font_style_angle(const style_t *st, double *angle) {
+    if (st->font_style == CSS_FONT_STYLE_NORMAL) { *angle = 0; return true; }
+    if (st->font_style != CSS_FONT_STYLE_OBLIQUE) return false;
+    *angle = css_style_font(st)->oblique;
+    return true;
+}
+
+/* font-palette (§9.1, palette-mix(): Fonts 5): normal | light | dark | <palette-identifier> |
+   palette-mix( <color-interpolation-method>? , [ <font-palette> && <percentage [0,100]>? ]# ), a
+   <palette-identifier> being a <dashed-ident> */
+static const char *const palette_names[3] = {"normal", "light", "dark"};
+static struct css_palette *palette_new(struct cx *cx, uint8_t kind, uint32_t count) {
+    struct css_palette *p = ar_alloc(cx->a, sizeof *p + (size_t)count * sizeof *p->item);
+    memset(p, 0, sizeof *p);
+    p->kind = kind;
+    p->space = CSS_SPACE_OKLAB;
+    p->hue = CSS_HUE_SHORTER;
+    p->count = count;
+    return p;
+}
+/* a <dashed-ident>, "--" alone too (anchor positioning's dashed_ident wants a name after it) */
+static bool palette_identifier(const char *s, size_t n) {
+    if (n < 2 || s[0] != '-' || s[1] != '-') return false;
+    for (size_t i = 2; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\\' && i + 1 < n && s[i + 1] != '\n') { i++; continue; }
+        if (!isalnum(c) && c != '-' && c != '_' && c < 0x80) return false;
+    }
+    return true;
+}
+/* a palette-mix() item's percentage: a literal in [0,100], or a math function (clamped there) */
+static bool palette_percent(const char *s, size_t n, struct cx *cx, struct css_palette_item *item) {
+    double x;
+    bool math = css_calc_is_math(s, n);
+    if ((!math && (!n || s[n - 1] != '%')) || !css_numeric_read(s, n, CSS_CALC_PERCENT, cx, cx->a, NAN, &x, NULL)) return false;
+    if (!math && (x < 0 || x > 100)) return false;
+    item->pct = (float)anim_clamp(x, 0, 100);
+    item->math = NULL;
+    if (math) {
+        sbuf b = {0};
+        bool ok = css_calc_specified(s, n, CSS_CALC_PERCENT, &b);
+        item->math = ok ? ar_strndup(cx->a, b.p ? b.p : "", b.n) : ar_strndup(cx->a, s, n);
+        sb_free(&b);
+    }
+    return true;
+}
+static const struct css_palette *parse_palette(const char *v, size_t n, struct cx *cx, unsigned depth) {
+    trim(&v, &n);
+    for (int k = 0; k < 3; k++) if (ident_is(v, n, palette_names[k])) return palette_new(cx, (uint8_t)k, 0);
+    if (palette_identifier(v, n)) {
+        struct css_palette *p = palette_new(cx, CSS_PALETTE_NAMED, 0);
+        sbuf b = {0};
+        css_unescape(&b, v, n);
+        p->name = ar_strndup(cx->a, b.p ? b.p : "", b.n);
+        sb_free(&b);
+        return p;
+    }
+    if (n < 13 || !strn_ieq(v, "palette-mix(", 12) || v[n - 1] != ')' || depth >= 32) return NULL;
+    const char **items;
+    size_t *lengths;
+    int count = list_split(v + 12, n - 13, cx, &items, &lengths);
+    if (count < 1) return NULL;
+    uint8_t space = CSS_SPACE_OKLAB, hue = CSS_HUE_SHORTER;
+    int first = 0;
+    if (lengths[0] > 3 && strn_ieq(items[0], "in", 2) && is_space((unsigned char)items[0][2])) {
+        if (!css_color_method_read(items[0], lengths[0], &space, &hue)) return NULL;
+        first = 1;
+    }
+    if (count - first < 1) return NULL;
+    struct css_palette *mix = palette_new(cx, CSS_PALETTE_MIX, (uint32_t)(count - first));
+    mix->space = space;
+    mix->hue = hue;
+    for (int i = first; i < count; i++) {
+        struct css_palette_item *item = &mix->item[i - first];
+        const char *p = items[i], *e = p + lengths[i], *token[3];
+        size_t tn[3];
+        int k = 0;
+        while (k < 3 && value_token(&p, e, &token[k], &tn[k])) k++;
+        if (k < 1 || k > 2) return NULL;
+        item->pct = NAN;
+        item->math = NULL;
+        int palette = 0;
+        if (k == 2) {
+            if (palette_percent(token[0], tn[0], cx, item)) palette = 1;
+            else if (!palette_percent(token[1], tn[1], cx, item)) return NULL;
+        }
+        if (!(item->palette = parse_palette(token[palette], tn[palette], cx, depth + 1))) return NULL;
+    }
+    return mix;
+}
+/* specified: a math function's percentage stays one (the specified serialization) */
+static void palette_text(const struct css_palette *p, bool specified, sbuf *out) {
+    if (!p) { sb_puts(out, "normal"); return; }
+    if (p->kind < CSS_PALETTE_NAMED) { sb_puts(out, palette_names[p->kind]); return; }
+    if (p->kind == CSS_PALETTE_NAMED) { css_serialize_ident(out, p->name ? p->name : ""); return; }
+    sb_puts(out, "palette-mix(");
+    if (css_color_method_text(out, p->space, p->hue)) sb_puts(out, ", ");
+    double small_given[8], small_put[8];
+    bool small_math[8];
+    double *given = small_given, *put = small_put;
+    bool *math = small_math;
+    if (p->count > 8) {
+        given = malloc(p->count * sizeof *given);
+        put = malloc(p->count * sizeof *put);
+        math = malloc(p->count * sizeof *math);
+    }
+    bool percentages = given && put && math;
+    if (percentages) {
+        for (uint32_t i = 0; i < p->count; i++) {
+            math[i] = specified && p->item[i].math;
+            given[i] = p->item[i].pct;
+        }
+        css_mix_percentages(p->count, given, math, put);
+    }
+    for (uint32_t i = 0; i < p->count; i++) {
+        if (i) sb_puts(out, ", ");
+        palette_text(p->item[i].palette, specified, out);
+        if (percentages && math[i]) { sb_putc(out, ' '); sb_puts(out, p->item[i].math); }
+        else if (percentages ? !isnan(put[i]) : !isnan(p->item[i].pct)) {
+            sb_putc(out, ' ');
+            anim_unit(out, percentages ? put[i] : p->item[i].pct, "%");
+        }
+    }
+    sb_putc(out, ')');
+    if (given != small_given) { free(given); free(put); free(math); }
+}
+static bool palette_equal(const struct css_palette *a, const struct css_palette *b) {
+    if (a == b) return true;
+    uint8_t ka = a ? a->kind : CSS_PALETTE_NORMAL, kb = b ? b->kind : CSS_PALETTE_NORMAL;
+    if (ka != kb) return false;
+    if (ka < CSS_PALETTE_NAMED) return true;
+    if (ka == CSS_PALETTE_NAMED) return same_name(a->name, b->name);
+    if (a->space != b->space || a->hue != b->hue || a->count != b->count) return false;
+    for (uint32_t i = 0; i < a->count; i++) {
+        float x = a->item[i].pct, y = b->item[i].pct;
+        if ((isnan(x) != isnan(y)) || (!isnan(x) && x != y) || !palette_equal(a->item[i].palette, b->item[i].palette))
+            return false;
+    }
+    return true;
+}
+
+bool css_font_equal(const struct css_font *a, const struct css_font *b) {
+    if (!a) a = &css_font_initial;
+    if (!b) b = &css_font_initial;
+    if (a == b) return true;
+    return a->width == b->width && a->oblique == b->oblique && a->oblique_angle == b->oblique_angle && a->caps == b->caps &&
+           a->position == b->position && a->emoji == b->emoji && a->kerning == b->kerning &&
+           a->optical_sizing == b->optical_sizing && !memcmp(a->synthesis, b->synthesis, sizeof a->synthesis) &&
+           a->ligatures == b->ligatures && a->numeric == b->numeric && a->east_asian == b->east_asian &&
+           size_adjust_equal(&a->size_adjust, &b->size_adjust) && alternates_equal(a->alternates, b->alternates) &&
+           tags_equal(a->features, b->features) && tags_equal(a->variations, b->variations) &&
+           palette_equal(a->palette, b->palette) && !memcmp(a->language, b->language, sizeof a->language);
+}
+
+/* font-family's list (§2.1) as CSSOM serializes it: a generic family as its keyword, a name as the
+   identifiers it reads as when it can, else as a string. false: not a family list. */
+/* a family name that reads back as the same name written as identifiers */
+static bool family_identifiers(const char *name) {
+    if (!*name) return false;
+    for (const char *w = name; *w;) {
+        const char *e = w;
+        while (*e && *e != ' ') e++;
+        if (e == w || family_word_reserved(w, (size_t)(e - w), true)) return false; /* a space at the start, at the end or twice */
+        unsigned char c = (unsigned char)w[0];
+        bool start = isalpha(c) || c == '_' || c >= 0x80 ||
+                     (c == '-' && e - w > 1 && (isalpha((unsigned char)w[1]) || w[1] == '_' || w[1] == '-' ||
+                                                 (unsigned char)w[1] >= 0x80));
+        if (!start) return false;
+        for (const char *q = w; q < e; q++) {
+            unsigned char d = (unsigned char)*q;
+            if (!isalnum(d) && d != '-' && d != '_' && d < 0x80) return false;
+        }
+        w = *e ? e + 1 : e;
+        if (*e && !*w) return false;
+    }
+    return true;
+}
+static bool family_list_text(const char *v, size_t n, sbuf *out) {
+    arena_t a = {.chunk_size = 256};
+    jmp_buf trap;
+    a.trap = &trap;
+    size_t begin = out->n;
+    bool ok = true;
+    if (setjmp(trap)) ok = false;
+    else {
+        const char *cursor = v, *end = v + n;
+        bool first = true;
+        while (ok && cursor < end) {
+            const char *token = cursor;
+            while (token < end && is_space((unsigned char)*token)) token++;
+            bool quoted = token < end && (*token == '"' || *token == '\'');
+            const char *name = css_font_family_next(&a, &cursor, end);
+            if (!name || !cursor) { ok = false; break; }
+            if (!first) sb_puts(out, ", ");
+            first = false;
+            if (!quoted && generic_family(name)) {
+                for (const char *c = name; *c; c++) sb_putc(out, (char)lower((unsigned char)*c));
+            } else if (!quoted || family_identifiers(name)) {
+                /* the identifiers of a name, separated by single spaces */
+                char *copy = ar_strndup(&a, name, strlen(name));
+                for (char *w = copy; *w;) {
+                    char *e = strchr(w, ' ');
+                    if (e) *e = 0;
+                    if (w != copy) sb_putc(out, ' ');
+                    css_serialize_ident(out, w);
+                    if (!e) break;
+                    w = e + 1;
+                }
+            } else css_serialize_string(out, name);
+        }
+        if (first) ok = false;
+    }
+    ar_free(&a);
+    if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    return ok;
+}
+static void font_family_text(const style_t *st, sbuf *out) {
+    if (st->font_names && family_list_text(st->font_names, strlen(st->font_names), out)) return;
+    sb_puts(out, st->font_family == FONT_FAMILY_MONO ? "monospace" : st->font_family == FONT_FAMILY_SANS ? "sans-serif" : "serif");
+}
+
+/* the computed value of a font group property, font-style or font-width */
+static bool font_value_text(const style_t *st, const struct propdef *p, sbuf *out) {
+    const struct css_font *f = css_style_font(st);
+    switch (p->type) {
+    case PT_FONT_STYLE: font_style_text(st, out); return true;
+    case PT_FONT_WIDTH: anim_unit(out, f->width, "%"); return true;
+    case PT_FONT_VARIANT: variant_text(p->flags, *(const uint16_t *)field_of(st, p), out); return true;
+    case PT_FONT_ALTERNATES: alternates_text(f->alternates, out); return true;
+    case PT_FONT_TAGS: tags_text(p->flags == FT_VARIATIONS, p->flags == FT_VARIATIONS ? f->variations : f->features, out); return true;
+    case PT_SIZE_ADJUST: size_adjust_text(&f->size_adjust, out); return true;
+    case PT_PALETTE: palette_text(f->palette, false, out); return true;
+    case PT_LANGUAGE: language_text(f->language, out); return true;
+    }
+    return false;
+}
+
+/* the font shorthands' longhands (their CSSOM order) */
+static const char *const font_variant_names[7] = {"font-variant-ligatures", "font-variant-caps", "font-variant-alternates",
+    "font-variant-numeric", "font-variant-east-asian", "font-variant-position", "font-variant-emoji"};
+static const char *const font_synthesis_names[CSS_SYNTHESIS_KINDS] = {"font-synthesis-weight", "font-synthesis-style",
+    "font-synthesis-small-caps", "font-synthesis-position"};
+/* what font resets without giving a value of its own (§2.8), and their initial values */
+enum { FONT_OWN = 7, FONT_RESETS = 12 };
+static const char *const font_reset_names[FONT_RESETS] = {"font-feature-settings", "font-kerning", "font-language-override",
+    "font-optical-sizing", "font-size-adjust", "font-variant-alternates", "font-variant-east-asian", "font-variant-emoji",
+    "font-variant-ligatures", "font-variant-numeric", "font-variant-position", "font-variation-settings"};
+static const char *const font_reset_initial[FONT_RESETS] = {"normal", "auto", "normal", "auto", "none", "normal", "normal",
+    "normal", "normal", "normal", "normal", "normal"};
+static bool set_long(const char *name, const char *v, size_t n, struct cx *cx);
+static void font_resets(const char *v, size_t n, struct cx *cx) {
+    for (int i = 0; i < FONT_RESETS; i++)
+        set_long(font_reset_names[i], v ? v : font_reset_initial[i], v ? n : strlen(font_reset_initial[i]), cx);
+}
+/* font-variant (§6.11): normal | none | [ <common-lig-values> || ... || <east-asian-width-values> || ruby ||
+   [ sub | super ] || [ text | emoji | unicode ] ]: none sets ligatures to none, the others normal */
+static bool set_font_variant(const char *v, size_t n, bool global, struct cx *cx) {
+    if (global || ident_is(v, n, "normal") || ident_is(v, n, "none")) {
+        for (int i = 0; i < 7; i++)
+            set_long(font_variant_names[i], global || !i ? v : "normal", global || !i ? n : 6, cx);
+        return true;
+    }
+    /* each longhand's tokens, in the order given */
+    char *text[7] = {NULL};
+    size_t length[7] = {0};
+    const char *p = v, *e = v + n, *token;
+    size_t tn;
+    uint8_t k;
+    while (value_token(&p, e, &token, &tn)) {
+        int which;
+        if (variant_find(variant_ligatures, token, tn) >= 0) which = 0;
+        else if (kw_find(kw_font_caps, token, tn, &k) && k) which = 1;
+        else if (ident_is(token, tn, "historical-forms") || memchr(token, '(', tn)) which = 2;
+        else if (variant_find(variant_numeric, token, tn) >= 0) which = 3;
+        else if (variant_find(variant_east_asian, token, tn) >= 0) which = 4;
+        else if (kw_find(kw_font_position, token, tn, &k) && k) which = 5;
+        else if (kw_find(kw_font_emoji, token, tn, &k) && k) which = 6;
+        else return false;
+        if (!text[which]) text[which] = ar_alloc(cx->a, n + 1);
+        else if (which == 1 || which >= 5) return false; /* one keyword */
+        else text[which][length[which]++] = ' ';
+        memcpy(text[which] + length[which], token, tn);
+        length[which] += tn;
+    }
+    /* every part valid before any longhand takes one */
+    uint16_t bits;
+    const struct css_font_alternates *alternates;
+    if ((text[0] && !parse_font_variant(FV_LIGATURES, text[0], length[0], &bits)) ||
+        (text[2] && !parse_font_alternates(text[2], length[2], cx, &alternates)) ||
+        (text[3] && !parse_font_variant(FV_NUMERIC, text[3], length[3], &bits)) ||
+        (text[4] && !parse_font_variant(FV_EAST_ASIAN, text[4], length[4], &bits)))
+        return false;
+    for (int i = 0; i < 7; i++) set_long(font_variant_names[i], text[i] ? text[i] : "normal", text[i] ? length[i] : 6, cx);
+    return true;
+}
+/* font-synthesis (§3.5): none | [ weight || style || small-caps || position ], oblique-only for style's
+   (Fonts 4 font-synthesis-style); each named one is auto, the others none */
+static bool set_font_synthesis(const char *v, size_t n, bool global, struct cx *cx) {
+    const char *value[CSS_SYNTHESIS_KINDS] = {"none", "none", "none", "none"};
+    if (global) for (int i = 0; i < CSS_SYNTHESIS_KINDS; i++) value[i] = NULL;
+    else if (!ident_is(v, n, "none")) {
+        static const char *const words[CSS_SYNTHESIS_KINDS] = {"weight", "style", "small-caps", "position"};
+        const char *p = v, *e = v + n, *token;
+        size_t tn;
+        while (value_token(&p, e, &token, &tn)) {
+            int which = -1;
+            for (int i = 0; i < CSS_SYNTHESIS_KINDS; i++) if (ident_is(token, tn, words[i])) which = i;
+            bool oblique = ident_is(token, tn, "oblique-only");
+            if (oblique) which = CSS_SYNTHESIS_STYLE;
+            if (which < 0 || strcmp(value[which], "none")) return false;
+            value[which] = oblique ? "oblique-only" : "auto";
+        }
+    }
+    for (int i = 0; i < CSS_SYNTHESIS_KINDS; i++)
+        set_long(font_synthesis_names[i], value[i] ? value[i] : v, value[i] ? strlen(value[i]) : n, cx);
+    return true;
+}
+/* the computed value of font, font-variant or font-synthesis: their longhands' computed values as the
+   shorthand serializes them; font's weight and width as the keywords it writes (§2.8) */
+static bool font_shorthand_text(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d) {
+    const char *const *names;
+    int count = css_shorthand_longhands(p, &names);
+    if (count < 1 || count > FONT_OWN + FONT_RESETS) return false;
+    sbuf text[FONT_OWN + FONT_RESETS];
+    memset(text, 0, sizeof text);
+    const char *values[FONT_OWN + FONT_RESETS];
+    size_t lengths[FONT_OWN + FONT_RESETS];
+    bool ok = true;
+    for (int i = 0; ok && i < count; i++) {
+        const struct propdef *q = css_prop_lookup(names[i], strlen(names[i]));
+        ok = q && css_computed_value(st, q, &text[i], d);
+        if (ok && p->sh == SH_FONT && q->type == PT_FONT_WEIGHT && st->font_weight == 400) { text[i].n = 0; sb_puts(&text[i], "normal"); }
+        /* line-height's resolved value is its used one (CSSOM §9) */
+        if (ok && p->sh == SH_FONT && q->type == PT_LINE_HEIGHT && st->line_height.kind == LK_NUMBER) {
+            text[i].n = 0;
+            anim_unit(&text[i], anim_clamp(st->line_height.px * st->font_size, 0, INFINITY), "px");
+        }
+        if (ok && p->sh == SH_FONT && q->type == PT_FONT_WIDTH) {
+            float width = css_style_font(st)->width;
+            text[i].n = 0;
+            ok = false;
+            for (size_t k = 0; !ok && k < sizeof width_keywords / sizeof *width_keywords; k++)
+                if (width_keywords[k].percent == width) { sb_puts(&text[i], width_keywords[k].name); ok = true; }
+        }
+        values[i] = text[i].p ? text[i].p : "";
+        lengths[i] = text[i].n;
+    }
+    ok = ok && css_shorthand_serialize(p, values, lengths, out);
+    for (int i = 0; i < count; i++) sb_free(&text[i]);
+    return ok;
+}
+static bool font_width_keyword(const char *v, size_t n) { return width_keyword(v, n) >= 0; }
+
+/* CSSOM: a declared font value's specified serialization (the group's longhands, font-style, font-width,
+   font-family, and font, font-variant and font-synthesis from their longhands'); false leaves the text */
+static void record_value(void *opaque, const char *name, const char *value, size_t n);
+static bool font_specified(const struct propdef *p, const char *v, size_t n, sbuf *out) {
+    props_init();
+    size_t begin = out->n;
+    bool ok = false;
+    if (p->type == PT_SHORT) {
+        sbuf given = {0};
+        if (css_shorthand_expand(p, v, n, record_value, &given) == 1) {
+            const char *values[FONT_OWN + FONT_RESETS];
+            size_t lengths[FONT_OWN + FONT_RESETS];
+            sbuf text[FONT_OWN + FONT_RESETS];
+            memset(text, 0, sizeof text);
+            int count = 0;
+            for (size_t at = 0; at < given.n && count < FONT_OWN + FONT_RESETS; count++) {
+                const char *name = given.p + at; at += strlen(name) + 1;
+                const char *value = given.p + at; at += strlen(value) + 1;
+                if (!css_specified_longhand(name, value, strlen(value), &text[count])) {
+                    const char *s = value;
+                    size_t l = strlen(value);
+                    trim(&s, &l);
+                    sb_put(&text[count], s, l);
+                }
+                values[count] = text[count].p ? text[count].p : "";
+                lengths[count] = text[count].n;
+            }
+            ok = css_shorthand_serialize(p, values, lengths, out);
+            for (int i = 0; i < count; i++) sb_free(&text[i]);
+        }
+        sb_free(&given);
+    } else if (p->type == PT_FONT_FAMILY) ok = family_list_text(v, n, out);
+    else {
+        arena_t a = {.chunk_size = 1024};
+        jmp_buf trap;
+        a.trap = &trap;
+        if (!setjmp(trap)) {
+            style_t scratch = initial;
+            uint8_t set[NPROPS];
+            memset(set, 0, sizeof set);
+            struct cx cx = {.s = &scratch, .a = &a, .set = set, .em = 16, .rem = 16, .vw = 800, .vh = 600, .supports_probe = true};
+            union { uint16_t bits; float width; struct css_font_size_adjust adjust; const struct css_font_tags *tags; } x;
+            uint8_t style;
+            float angle;
+            bool given;
+            switch (p->type) {
+            case PT_FONT_STYLE: ok = parse_font_style(v, n, &cx, &style, &angle, &given, out); break;
+            case PT_FONT_WIDTH: ok = parse_font_width(v, n, &cx, &x.width, out); break;
+            case PT_FONT_TAGS: ok = parse_font_tags(p->flags == FT_VARIATIONS, v, n, &cx, &x.tags, out); break;
+            case PT_SIZE_ADJUST: ok = parse_size_adjust(v, n, &cx, &x.adjust, out); break;
+            default:
+                /* the others' specified value is their computed one */
+                ok = apply_long(p, v, n, &cx) && !cx.invalid;
+                if (ok && p->type == PT_KW) sb_puts(out, kw_name(p->kws, *(const uint8_t *)field_of(&scratch, p)));
+                else if (ok && p->type == PT_PALETTE) palette_text(css_style_font(&scratch)->palette, true, out);
+                else if (ok) ok = font_value_text(&scratch, p, out);
+            }
+            ok = ok && !cx.invalid;
+        }
+        ar_free(&a);
+    }
+    if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    return ok;
+}
+
 static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src, arena_t *a) {
     if (p->group != G_STYLE) {
         if (group_same(dst, src, p->group)) return;
@@ -5968,6 +6852,15 @@ static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src,
     case PT_BG_SIZE: dst->bg_size_kind = src->bg_size_kind; break;
     case PT_MASK_SIZE: dst->mask_size_kind = src->mask_size_kind; break;
     case PT_COLOR_SCHEME: dst->color_scheme_text = src->color_scheme_text; break;
+    case PT_FONT_STYLE: { /* the oblique angle is the font group's */
+        const struct css_font *x = css_style_font(dst), *y = css_style_font(src);
+        if (x->oblique != y->oblique || x->oblique_angle != y->oblique_angle) {
+            struct css_font *own = group_write(dst, G_FONT, x, a);
+            own->oblique = y->oblique;
+            own->oblique_angle = y->oblique_angle;
+        }
+        break;
+    }
     }
 }
 
@@ -6205,16 +7098,26 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         if (from == par && !p->inherited && ident_is(v, n, "inherit")) s->explicit_inherit = true;
         return true;
     }
-    if (p->group == G_STYLE) return apply_value(p, v, n, cx, (char *)s + p->off);
-    /* a group's field: parsed into a copy of the group, which s takes when the value is valid */
-    union { struct css_float_shape float_shape; struct css_offset offset; struct css_gap_rules gap_rules;
-            struct css_anchor anchor; struct css_counters counters; struct css_list list;
-            struct css_background background; struct css_border_image border_image; struct css_ui ui;
-            struct css_decoration decoration; struct css_text text; } own;
-    memcpy(&own, group_of(s, p->group), group_size(p->group));
-    if (!apply_value(p, v, n, cx, (char *)&own + p->off)) return false;
-    group_write(s, p->group, &own, cx->a);
-    return true;
+    /* CSS Values 4 §6.1.1: in a font-affecting property the font-relative lengths resolve against the
+       parent's computed font metrics (the initial font's at the root), as font-size's do in the font pass */
+    float em = cx->em;
+    bool font_affecting = p->group == G_FONT || p->type == PT_FONT_WEIGHT || p->type == PT_FONT_STYLE ||
+                          p->type == PT_FONT_FAMILY;
+    if (font_affecting) cx->em = par->font_size;
+    bool ok;
+    if (p->group == G_STYLE) ok = apply_value(p, v, n, cx, (char *)s + p->off);
+    else {
+        /* a group's field: parsed into a copy of the group, which s takes when the value is valid */
+        union { struct css_float_shape float_shape; struct css_offset offset; struct css_gap_rules gap_rules;
+                struct css_anchor anchor; struct css_counters counters; struct css_list list;
+                struct css_background background; struct css_border_image border_image; struct css_ui ui;
+                struct css_decoration decoration; struct css_text text; struct css_font font; } own;
+        memcpy(&own, group_of(s, p->group), group_size(p->group));
+        ok = apply_value(p, v, n, cx, (char *)&own + p->off);
+        if (ok) group_write(s, p->group, &own, cx->a);
+    }
+    cx->em = em;
+    return ok;
 }
 /* a value (not a CSS-wide keyword) of p into field, s's own or its group's copy */
 static bool apply_value(const struct propdef *p, const char *v, size_t n, struct cx *cx, char *field) {
@@ -6426,6 +7329,32 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
     }
     case PT_FONT_SIZE: return parse_font_size(v, n, cx, &s->font_size);
     case PT_FONT_WEIGHT: return parse_font_weight(v, n, cx, &s->font_weight);
+    case PT_FONT_STYLE: {
+        uint8_t style;
+        float angle;
+        bool given;
+        if (!parse_font_style(v, n, cx, &style, &angle, &given, NULL)) return false;
+        *(uint8_t *)field = style;
+        const struct css_font *f = css_style_font(s);
+        if (f->oblique != angle || f->oblique_angle != given) {
+            struct css_font *own = group_write(s, G_FONT, f, cx->a);
+            own->oblique = angle;
+            own->oblique_angle = given;
+        }
+        return true;
+    }
+    case PT_FONT_WIDTH: return parse_font_width(v, n, cx, (float *)field, NULL);
+    case PT_FONT_VARIANT: return parse_font_variant(p->flags, v, n, (uint16_t *)field);
+    case PT_FONT_ALTERNATES: return parse_font_alternates(v, n, cx, (const struct css_font_alternates **)field);
+    case PT_FONT_TAGS: return parse_font_tags(p->flags == FT_VARIATIONS, v, n, cx, (const struct css_font_tags **)field, NULL);
+    case PT_SIZE_ADJUST: return parse_size_adjust(v, n, cx, (struct css_font_size_adjust *)field, NULL);
+    case PT_PALETTE: {
+        const struct css_palette *palette = parse_palette(v, n, cx, 0);
+        if (!palette) return false;
+        *(const struct css_palette **)field = palette->kind == CSS_PALETTE_NORMAL ? NULL : palette;
+        return true;
+    }
+    case PT_LANGUAGE: return parse_font_language(v, n, (char *)field);
     case PT_FONT_FAMILY:
         if(!choose_family(v,n,&s->font_family,cx))return false;
         s->font_names=ar_strndup(cx->a,v,n);s->named_font=NULL;s->font_choices=NULL;return true;
@@ -7119,36 +8048,61 @@ static bool set_border(const char *v, size_t n, struct cx *cx, const char *const
     return true;
 }
 
+/* font (CSS Fonts 4 §2.8): [ [ <'font-style'> || <font-variant-css2> || <'font-weight'> || <font-width-css3> ]?
+   <'font-size'> [ / <'line-height'> ]? <'font-family'># ] | <system-family-name>. Its longhands, in their
+   CSSOM order: the seven it takes a value for, then the twelve it resets to their initial values. */
 static bool set_font(const char *v, size_t n, struct cx *cx) {
     const char *t[16];
     size_t tl[16];
     int k = split_checked(v, n, t, tl, 16, ' ', cx);
+    /* a system font (§2.8.1): its values are the bundled UI face's (sans-serif, 13px) */
     static const char *const sys[] = {"caption", "icon", "menu", "message-box", "small-caption", "status-bar",
                                       "-webkit-small-control", "-apple-system-body", NULL};
     if (k == 1)
         for (int i = 0; sys[i]; i++)
             if (ident_is(t[0], tl[0], sys[i])) {
                 set_long("font-style", "normal", 6, cx);
+                set_long("font-variant-caps", "normal", 6, cx);
                 set_long("font-weight", "normal", 6, cx);
+                set_long("font-width", "normal", 6, cx);
                 set_long("font-size", "13px", 4, cx);
                 set_long("line-height", "normal", 6, cx);
                 set_long("font-family", "sans-serif", 10, cx);
+                font_resets(NULL, 0, cx);
                 return true;
             }
-    const char *style = "normal", *weight = "normal";
-    size_t stl = 6, wl = 6;
-    int i = 0;
-    for (; i < k; i++) {
+    /* style, small-caps, weight and width in any order, each once; normal stands for any not given, and
+       there are at most four of them together */
+    const char *style = "normal", *caps = "normal", *weight = "normal", *width = "normal";
+    size_t stl = 6, cl = 6, wl = 6, wdl = 6;
+    bool have_style = false, have_caps = false, have_weight = false, have_width = false;
+    int i = 0, items = 0;
+    for (; i < k && items < 4; i++, items++) {
         uint8_t d;
         uint16_t w;
-        if (kw_find(kw_fstyle, t[i], tl[i], &d) && !ident_is(t[i], tl[i], "normal")) style = t[i], stl = tl[i];
-        else if (ident_is(t[i], tl[i], "normal") || ident_is(t[i], tl[i], "small-caps")) {
-        } else if (!isdigit((unsigned char)t[i][0]) && parse_font_weight(t[i], tl[i], cx, &w)) weight = t[i], wl = tl[i];
-        else if (isdigit((unsigned char)t[i][0]) && parse_font_weight(t[i], tl[i], cx, &w) && i + 1 < k)
-            weight = t[i], wl = tl[i];
-        else if (ident_is(t[i], tl[i], "condensed") || ident_is(t[i], tl[i], "expanded") ||
-                 ident_is(t[i], tl[i], "semi-condensed") || ident_is(t[i], tl[i], "semi-expanded")) {
-        } else break;
+        if (ident_is(t[i], tl[i], "normal")) continue;
+        if (!have_style && kw_find(kw_fstyle, t[i], tl[i], &d)) {
+            have_style = true;
+            style = t[i];
+            stl = tl[i];
+            /* oblique's angle */
+            double angle;
+            if (d == CSS_FONT_STYLE_OBLIQUE && i + 1 < k &&
+                css_numeric_read(t[i + 1], tl[i + 1], CSS_CALC_ANGLE, cx, cx->a, NAN, &angle, NULL)) {
+                i++;
+                stl = (size_t)(t[i] + tl[i] - style);
+            }
+            continue;
+        }
+        if (!have_caps && ident_is(t[i], tl[i], "small-caps")) { have_caps = true; caps = t[i]; cl = tl[i]; continue; }
+        if (!have_weight && i + 1 < k && parse_font_weight(t[i], tl[i], cx, &w)) {
+            have_weight = true;
+            weight = t[i];
+            wl = tl[i];
+            continue;
+        }
+        if (!have_width && width_keyword(t[i], tl[i]) > 0) { have_width = true; width = t[i]; wdl = tl[i]; continue; }
+        break;
     }
     if (i >= k) return false;
     /* size[/line-height] */
@@ -7174,20 +8128,21 @@ static bool set_font(const char *v, size_t n, struct cx *cx) {
        CSS-wide keyword there is not a family list (CSS Fonts 4 font). */
     const char *family = t[fam];
     size_t family_n = (size_t)(v + n - t[fam]);
+    uint8_t generic;
     if (ident_is(family, family_n, "inherit") || ident_is(family, family_n, "initial") || ident_is(family, family_n, "unset") ||
-        ident_is(family, family_n, "revert") || ident_is(family, family_n, "revert-layer") || ident_is(family, family_n, "default")) {
+        ident_is(family, family_n, "revert") || ident_is(family, family_n, "revert-layer") || ident_is(family, family_n, "default") ||
+        !choose_family(family, family_n, &generic, cx)) {
         if (cx->supports_probe) cx->invalid = true;
         return false;
     }
-    /* the longhands in their order: style, weight, size, line height, family */
-    if (!cx->font_pass) {
-        set_long("font-style", style, stl, cx);
-        set_long("font-weight", weight, wl, cx);
-    }
+    set_long("font-style", style, stl, cx);
+    set_long("font-variant-caps", caps, cl, cx);
+    set_long("font-weight", weight, wl, cx);
+    set_long("font-width", width, wdl, cx);
     set_long("font-size", sz, szl, cx);
-    if (cx->font_pass) return true;
     set_long("line-height", lh, lhl, cx);
     set_long("font-family", family, family_n, cx);
+    font_resets(NULL, 0, cx);
     return true;
 }
 
@@ -7447,18 +8402,16 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     }
     case SH_FONT:
         if (global) {
-            if (!cx->font_pass) {
-                set_long("font-style", v, n, cx);
-                set_long("font-weight", v, n, cx);
-            }
-            set_long("font-size", v, n, cx);
-            if (!cx->font_pass) {
-                set_long("line-height", v, n, cx);
-                set_long("font-family", v, n, cx);
-            }
+            /* set_long leaves all but font-size to the second pass */
+            static const char *const own[FONT_OWN] = {"font-style", "font-variant-caps", "font-weight", "font-width",
+                                                      "font-size", "line-height", "font-family"};
+            for (int i = 0; i < FONT_OWN; i++) set_long(own[i], v, n, cx);
+            font_resets(v, n, cx);
             return true;
         }
         return set_font(v, n, cx);
+    case SH_FONT_VARIANT: return set_font_variant(v, n, global, cx);
+    case SH_FONT_SYNTHESIS: return set_font_synthesis(v, n, global, cx);
     case SH_BACKGROUND:
         if (global) {
             static const char *const longhands[] = {"background-color", "background-image", "background-repeat",
@@ -8206,13 +9159,51 @@ bool css_shorthand_serialize(const struct propdef *p, const char *const *v, cons
     case SH_ALL: case SH_ANIMATION: case SH_TRANSITION: case SH_OFFSET:
         return false; /* only a CSS-wide keyword: their longhands' values are not the shorthand's text */
     case SH_FONT: {
-        /* style, weight, size, line height, family: [style] [weight] size[ / line-height] family */
-        if (count != 5) return false;
-        for (int i = 0; i < 2; i++) if (!text_word(v[i], l[i], "normal")) { sb_put(out, v[i], l[i]); sb_putc(out, ' '); }
-        sb_put(out, v[2], l[2]);
-        if (!text_word(v[3], l[3], "normal")) { sb_puts(out, " / "); sb_put(out, v[3], l[3]); }
-        sb_putc(out, ' ');
+        /* style, variant-caps, weight, width, size, line height, family, then the longhands font only
+           resets: [style] [small-caps] [weight] [width] size[ / line-height] family, while the reset ones
+           are initial, the caps normal or small-caps and the width a keyword (§2.8) */
+        if (count != FONT_OWN + FONT_RESETS) return false;
+        for (int i = 0; i < FONT_RESETS; i++)
+            if (!text_word(v[FONT_OWN + i], l[FONT_OWN + i], font_reset_initial[i])) return false;
+        if ((!text_word(v[1], l[1], "normal") && !text_word(v[1], l[1], "small-caps")) || !font_width_keyword(v[3], l[3]))
+            return false;
+        for (int i = 0; i < 4; i++) if (!text_word(v[i], l[i], "normal")) { sb_put(out, v[i], l[i]); sb_putc(out, ' '); }
         sb_put(out, v[4], l[4]);
+        if (!text_word(v[5], l[5], "normal")) { sb_puts(out, " / "); sb_put(out, v[5], l[5]); }
+        sb_putc(out, ' ');
+        sb_put(out, v[6], l[6]);
+        return true;
+    }
+    case SH_FONT_VARIANT: {
+        /* ligatures, caps, alternates, numeric, east-asian, position, emoji: normal, none (the ligatures'
+           alone), or the values that are not normal */
+        if (count != 7) return false;
+        bool none = text_word(v[0], l[0], "none");
+        size_t at = out->n;
+        for (int i = none ? 1 : 0; i < 7; i++) {
+            if (text_word(v[i], l[i], "normal")) continue;
+            if (none) return false;
+            if (out->n > at) sb_putc(out, ' ');
+            sb_put(out, v[i], l[i]);
+        }
+        if (out->n == at) sb_puts(out, none ? "none" : "normal");
+        return true;
+    }
+    case SH_FONT_SYNTHESIS: {
+        /* weight, style, small-caps, position: the ones that are auto (oblique-only for the style), or none */
+        static const char *const words[CSS_SYNTHESIS_KINDS] = {"weight", "style", "small-caps", "position"};
+        if (count != CSS_SYNTHESIS_KINDS) return false;
+        size_t at = out->n;
+        for (int i = 0; i < CSS_SYNTHESIS_KINDS; i++) {
+            bool oblique = i == CSS_SYNTHESIS_STYLE && text_word(v[i], l[i], "oblique-only");
+            if (!oblique && !text_word(v[i], l[i], "auto")) {
+                if (!text_word(v[i], l[i], "none")) return false;
+                continue;
+            }
+            if (out->n > at) sb_putc(out, ' ');
+            sb_puts(out, oblique ? "oblique-only" : words[i]);
+        }
+        if (out->n == at) sb_puts(out, "none");
         return true;
     }
     case SH_BACKGROUND: {
@@ -8848,7 +9839,11 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
         ok = anim_color_text(out, &c);
         break;
     }
-    case PT_FONT_FAMILY: if (!st->font_names) return false; sb_puts(out, st->font_names); break;
+    case PT_FONT_FAMILY: font_family_text(st, out); break;
+    case PT_FONT_STYLE: case PT_FONT_WIDTH: case PT_FONT_VARIANT: case PT_FONT_ALTERNATES: case PT_FONT_TAGS:
+    case PT_SIZE_ADJUST: case PT_PALETTE: case PT_LANGUAGE:
+        ok = font_value_text(st, p, out);
+        break;
     case PT_CONTAINER_NAMES: sb_puts(out, st->container_names ? st->container_names : "none"); break;
     case PT_LINE_CLAMP:
         if (!st->line_clamp) sb_puts(out, "none");
@@ -9026,6 +10021,14 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
     case PT_ZINDEX: return a->z_auto == b->z_auto && (a->z_auto || a->z_index == b->z_index);
     case PT_DISPLAY: return a->display == b->display && a->legacy_box == b->legacy_box;
     case PT_FONT_FAMILY: return a->font_family == b->font_family && same_text(a->font_names, b->font_names);
+    case PT_FONT_STYLE: {
+        const struct css_font *x = css_style_font(a), *y = css_style_font(b);
+        return a->font_style == b->font_style && x->oblique == y->oblique && x->oblique_angle == y->oblique_angle;
+    }
+    case PT_SIZE_ADJUST: return size_adjust_equal(&css_style_font(a)->size_adjust, &css_style_font(b)->size_adjust);
+    case PT_FONT_ALTERNATES: return alternates_equal(css_style_font(a)->alternates, css_style_font(b)->alternates);
+    case PT_FONT_TAGS: return tags_equal(*(const struct css_font_tags *const *)fa, *(const struct css_font_tags *const *)fb);
+    case PT_PALETTE: return palette_equal(css_style_font(a)->palette, css_style_font(b)->palette);
     case PT_CONTAINER_NAMES: return same_text(a->container_names, b->container_names);
     case PT_CONTENT: return css_content_equal(a->content, b->content);
     case PT_LIST_TYPE: {
@@ -9272,6 +10275,58 @@ static bool anim_combine(const struct css_anim_ctx *c, const struct propdef *p, 
     case PT_NUM: anim_number(out, anim_clamp(*(const float *)fa * ka + *(const float *)fb * kb, 0, INFINITY)); return true;
     case PT_OPACITY: anim_number(out, anim_clamp(*(const float *)fa * ka + *(const float *)fb * kb, 0, 1)); return true;
     case PT_FONT_WEIGHT: anim_number(out, anim_clamp(a->font_weight * ka + b->font_weight * kb, 1, 1000)); return true;
+    case PT_FONT_STYLE: {
+        /* CSS Fonts 4 §2.4: oblique angles (normal is oblique 0deg); italic, left and right are discrete */
+        double x, y;
+        if (!font_style_angle(a, &x) || !font_style_angle(b, &y)) return false;
+        double angle = anim_clamp(x * ka + y * kb, -90, 90);
+        if (angle == 0) sb_puts(out, "normal");
+        else { sb_puts(out, "oblique "); anim_unit(out, angle, "deg"); }
+        return true;
+    }
+    case PT_FONT_WIDTH:
+        anim_unit(out, anim_clamp(css_style_font(a)->width * ka + css_style_font(b)->width * kb, 0, INFINITY), "%");
+        return true;
+    case PT_SIZE_ADJUST: {
+        /* Fonts 5 §2.6: numbers of one metric; none and from-font are discrete */
+        const struct css_font_size_adjust *x = &css_style_font(a)->size_adjust, *y = &css_style_font(b)->size_adjust;
+        if (x->kind != CSS_SIZE_ADJUST_NUMBER || y->kind != CSS_SIZE_ADJUST_NUMBER || x->metric != y->metric) return false;
+        struct css_font_size_adjust r = *x;
+        r.value = calc_float(anim_clamp(x->value * ka + y->value * kb, 0, INFINITY));
+        size_adjust_text(&r, out);
+        return true;
+    }
+    case PT_FONT_TAGS: {
+        /* §7.2 font-variation-settings: the values of lists with the same tags, in order; else discrete */
+        const struct css_font_tags *x = *(const struct css_font_tags *const *)fa, *y = *(const struct css_font_tags *const *)fb;
+        if (p->flags != FT_VARIATIONS || !x || !y || x->n != y->n) return false;
+        for (uint32_t i = 0; i < x->n; i++) if (memcmp(x->item[i].tag, y->item[i].tag, 4)) return false;
+        for (uint32_t i = 0; i < x->n; i++) {
+            if (i) sb_puts(out, ", ");
+            tag_text(x->item[i].tag, out);
+            sb_putc(out, ' ');
+            anim_number(out, x->item[i].value * ka + y->item[i].value * kb);
+        }
+        return true;
+    }
+    case PT_PALETTE: {
+        /* Fonts 5 §9.1: palette-mix(in oklab, a, b t%) between two palettes; one at its end, itself;
+           addition and accumulation replace */
+        if (mode != MIX) return false;
+        if (kb <= 0 || palette_equal(css_style_font(a)->palette, css_style_font(b)->palette)) {
+            palette_text(css_style_font(a)->palette, false, out);
+            return true;
+        }
+        if (ka <= 0) { palette_text(css_style_font(b)->palette, false, out); return true; }
+        sb_puts(out, "palette-mix(in oklab, ");
+        palette_text(css_style_font(a)->palette, false, out);
+        sb_puts(out, ", ");
+        palette_text(css_style_font(b)->palette, false, out);
+        sb_putc(out, ' ');
+        anim_unit(out, kb * 100, "%");
+        sb_putc(out, ')');
+        return true;
+    }
     case PT_INT: case PT_ZINDEX: {
         if (p->type == PT_ZINDEX && (a->z_auto || b->z_auto)) return false;
         /* <integer>: as a real number, then to the nearest integer, halves towards +infinity */

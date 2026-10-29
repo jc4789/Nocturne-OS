@@ -15,6 +15,7 @@
 #define font_metrics font_metrics_unlocked
 #define font_has font_has_unlocked
 #define font_has_primary font_has_primary_unlocked
+#define font_aspect font_aspect_unlocked
 #define font_advance font_advance_unlocked
 #define font_width font_width_unlocked
 #define font_metrics_generation font_metrics_generation_unlocked
@@ -54,6 +55,8 @@ struct font {
     bool gsub_tried;
     unsigned char *gsub;         /* emoji sequence ligatures (GSUB type 4) */
     size_t gsub_len;
+    float aspect[FONT_ASPECTS];  /* font_aspect's values per em, once found (aspect_known's bits) */
+    uint8_t aspect_known;
 };
 
 static uint64_t next_font_id = 1;
@@ -649,6 +652,72 @@ static bool emoji_sequence(font_t *e, uint32_t cp, const char *s, const char *en
 
 bool font_has(font_t *f, uint32_t cp) { int g; if (default_ignorable(cp)) return true; glyph_face(f, cp, &g); return g != 0; }
 bool font_has_primary(font_t *f,uint32_t cp) { return f && glyph_of(f,cp)!=0; }
+
+/* OS/2's sxHeight and sCapHeight (table version 2 and later), font units */
+static bool os2_heights(font_t *f, int *x_height, int *cap_height) {
+    if (f->outline) {
+        const TT_OS2 *os2 = FT_Get_Sfnt_Table(f->outline, FT_SFNT_OS2);
+        if (!os2 || os2->version == 0xFFFF || os2->version < 2) return false;
+        *x_height = os2->sxHeight;
+        *cap_height = os2->sCapHeight;
+        return true;
+    }
+    /* a face font_adopt opened: its records were bounded against its bytes (font_sfnt_valid for a
+       downloaded face; the bundled files are ours); offsets count from the file's start */
+    const unsigned char *directory = f->data + f->info.fontstart;
+    uint32_t at, n;
+    if (!sf_record(directory, sf_u16(directory + 4), "OS/2", &at, &n) || n < 90) return false;
+    const unsigned char *os2 = f->data + at;
+    if (sf_u16(os2) < 2) return false;
+    *x_height = sf_i16(os2 + 86);
+    *cap_height = sf_i16(os2 + 88);
+    return true;
+}
+/* the top of cp's outline above the baseline in the face itself, font units */
+static bool glyph_top(font_t *f, uint32_t cp, int *top) {
+    int g = glyph_of(f, cp);
+    if (!g) return false;
+    if (f->outline) {
+        if (FT_Load_Glyph(f->outline, (FT_UInt)g, FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP)) return false;
+        *top = (int)f->outline->glyph->metrics.horiBearingY;
+        return true;
+    }
+    int x0, y0, x1, y1;
+    if (!stbtt_GetGlyphBox(&f->info, g, &x0, &y0, &x1, &y1)) return false;
+    *top = y1;
+    return true;
+}
+float font_aspect(font_t *f, int metric) {
+    if (!f || metric < 0 || metric >= FONT_ASPECTS) return 0;
+    if (f->aspect_known >> metric & 1) return f->aspect[metric];
+    if (font_probe_depth) { font_probe_failed = true; return 0; }
+    float v = 0;
+    int x_height = 0, cap_height = 0, top;
+    switch (metric) {
+    case FONT_ASPECT_EX_HEIGHT: case FONT_ASPECT_CAP_HEIGHT: {
+        bool ex = metric == FONT_ASPECT_EX_HEIGHT;
+        bool os2 = os2_heights(f, &x_height, &cap_height) && (ex ? x_height : cap_height) > 0;
+        if (os2) v = (ex ? x_height : cap_height) * f->unit_scale;
+        else if (glyph_top(f, ex ? 'x' : 'H', &top) && top > 0) v = top * f->unit_scale;
+        else if (ex) v = 0.5f;
+        else font_metrics(f, 1, &v, NULL, NULL);
+        break;
+    }
+    case FONT_ASPECT_CH_WIDTH: case FONT_ASPECT_IC_WIDTH: {
+        /* the advance in the face that draws the character, its fallback ones included */
+        uint32_t cp = metric == FONT_ASPECT_CH_WIDTH ? '0' : 0x6C34;
+        int g;
+        font_t *face = present_face(f, cp, 0, &g);
+        v = g ? glyph_adv(face, g) * face->unit_scale : metric == FONT_ASPECT_CH_WIDTH ? 0.5f : 1;
+        break;
+    }
+    default: v = 1; /* no vertical metrics are read: the ideograph's vertical advance is the em */
+    }
+    if (!(v > 0) || !isfinite(v)) v = metric == FONT_ASPECT_CH_WIDTH || metric == FONT_ASPECT_EX_HEIGHT ? 0.5f : 1;
+    f->aspect[metric] = v;
+    f->aspect_known |= (uint8_t)(1u << metric);
+    return v;
+}
 
 /* the advance of a missing glyph: an empty box */
 static float tofu_adv(float px) { return px * 0.6f; }
@@ -1350,6 +1419,7 @@ int font_cell_draw(canvas_t *c, int x, int y, uint32_t cp, uint32_t fg, uint32_t
 #undef font_metrics
 #undef font_has
 #undef font_has_primary
+#undef font_aspect
 #undef font_advance
 #undef font_width
 #undef font_metrics_generation
@@ -1378,6 +1448,7 @@ font_t * font_family(int family, int style) { font_acquire(); font_t * result = 
 void font_metrics(font_t *f, float px, float *ascent, float *descent, float *gap) { font_acquire(); font_metrics_unlocked(f, px, ascent, descent, gap); font_release(); }
 bool font_has(font_t *f, uint32_t cp) { font_acquire(); bool result = font_has_unlocked(f, cp); font_release(); return result; }
 bool font_has_primary(font_t *f,uint32_t cp) { font_acquire();bool result=font_has_primary_unlocked(f,cp);font_release();return result; }
+float font_aspect(font_t *f, int metric) { font_acquire(); float result = font_aspect_unlocked(f, metric); font_release(); return result; }
 float font_advance(font_t *f, float px, uint32_t cp) { font_acquire(); float result = font_advance_unlocked(f, px, cp); font_release(); return result; }
 float font_width(font_t *f, float px, const char *s, size_t n) { font_acquire(); float result = font_width_unlocked(f, px, s, n); font_release(); return result; }
 uint64_t font_metrics_generation(void) { font_acquire(); uint64_t result = font_metrics_generation_unlocked(); font_release(); return result; }

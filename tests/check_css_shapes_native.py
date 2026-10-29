@@ -12,6 +12,7 @@ interpolation-testcommon.js の normalizeValue（数は小数 2 桁、字句の�
 border-image の頁（parsing・animations）、compositing の background-blend-mode、css-masking の mask-border の
 動きの頁を照らす。--group ui では css-ui の cursor・caret-color・accent-color の頁（parsing・animation）を
 照らす（性質の表の G_UI の群）。
+--group fonts では css-fonts の parsing・animations の頁と、根にある数式・離散の動きの頁を照らす。
 
 guest の WPT の代わりではない。CSSOM の宣言の塊・cascade・var()・時間の模型（animation.c）・
 配置と描画は通らない。数えないもの：test_shorthand_value（CSSOM が shorthand の longhand の
@@ -29,7 +30,7 @@ css-multicol の column-rule の頁（parsing・animation）も同じ性質な�
 --rev <版> は、その版の user/libc/web・user/include・common（git archive）を今の道具で組む
 （前の版と同じ道具で比べる）。
 
-  python -X utf8 tests/check_css_shapes_native.py [--group shapes|gaps|anchor|lists|backgrounds|ui|text|decor] [--verbose] [--file 名前の一部] [--out 出力の場所] [--rev 版]
+  python -X utf8 tests/check_css_shapes_native.py [--group shapes|gaps|anchor|lists|backgrounds|ui|text|decor|fonts] [--verbose] [--file 名前の一部] [--out 出力の場所] [--rev 版]
 """
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -111,8 +112,16 @@ elif group == "ui":
              [wpt / "css-ui/animation" / name for name in (
                  "caret-color-interpolation.html", "caret-color-composition.html", "accent-color-interpolation.html",
                  "cursor-no-interpolation.html")])
+elif group == "fonts":
+    # CSS Fonts 4 の性質（font-variant の longhand と一括、feature・variation、kerning、synthesis、
+    # optical-sizing、size-adjust、palette、language-override、width と別名 font-stretch、font の一括）：
+    # 構文・計算値の頁と動きの頁、根にある数式と離散の頁
+    fonts = wpt / "css-fonts"
+    pages = (sorted((fonts / "parsing").glob("*.html")) + sorted((fonts / "animations").glob("*.html")) +
+             sorted(p for p in fonts.glob("*.html") if re.search(r"(-interpolation-math-functions|-sign-function|"
+                                                                 r"-calc|discrete-no-interpolation)\.html$", p.name)))
 else:
-    sys.exit(f"群は shapes・gaps・anchor・lists・backgrounds・ui・text・decor のどれか：{group}")
+    sys.exit(f"群は shapes・gaps・anchor・lists・backgrounds・ui・text・decor・fonts のどれか：{group}")
 out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else root / f"build/check-css-{group}"
 out.mkdir(parents=True, exist_ok=True)
 # the repository's tools (a worktree has them in the main checkout above it)

@@ -1128,6 +1128,58 @@ struct css_transform {
     uint8_t kind;
 };
 struct css_translate {len_t xy[2];bool active;};
+/* CSS Fonts 4 (with font-size-adjust's metrics of Fonts 5): font-style's keyword (style_t's font_style;
+   any but normal selects the italic or oblique faces) and the inherited font values held by pointer
+   (style_t's font): a style takes its parent's by the pointer, NULL is all initial. */
+enum { CSS_FONT_STYLE_NORMAL, CSS_FONT_STYLE_ITALIC, CSS_FONT_STYLE_OBLIQUE, CSS_FONT_STYLE_LEFT, CSS_FONT_STYLE_RIGHT };
+enum { CSS_FONT_KERNING_AUTO, CSS_FONT_KERNING_NORMAL, CSS_FONT_KERNING_NONE };
+enum { CSS_FONT_OPTICAL_AUTO, CSS_FONT_OPTICAL_NONE };
+enum { CSS_FONT_CAPS_NORMAL, CSS_FONT_CAPS_SMALL, CSS_FONT_CAPS_ALL_SMALL, CSS_FONT_CAPS_PETITE, CSS_FONT_CAPS_ALL_PETITE,
+       CSS_FONT_CAPS_UNICASE, CSS_FONT_CAPS_TITLING };
+enum { CSS_FONT_POSITION_NORMAL, CSS_FONT_POSITION_SUB, CSS_FONT_POSITION_SUPER };
+enum { CSS_FONT_EMOJI_NORMAL, CSS_FONT_EMOJI_TEXT, CSS_FONT_EMOJI_EMOJI, CSS_FONT_EMOJI_UNICODE };
+/* font-synthesis-weight, -style, -small-caps, -position: auto, none, and (style only) oblique-only */
+enum { CSS_SYNTHESIS_WEIGHT, CSS_SYNTHESIS_STYLE, CSS_SYNTHESIS_SMALL_CAPS, CSS_SYNTHESIS_POSITION, CSS_SYNTHESIS_KINDS };
+enum { CSS_SYNTHESIS_AUTO, CSS_SYNTHESIS_NONE, CSS_SYNTHESIS_OBLIQUE_ONLY };
+/* font-variant-ligatures' none, beside the bits of its keywords (cssprop.c's tables give each
+   keyword of a variant its bit, in the order they serialize; 0 is normal) */
+#define CSS_FONT_LIGATURES_NONE 0x8000u
+/* font-size-adjust: none, a number, or from-font (a number once the element's first available font
+   gives it: css.c), of a metric (font.h's FONT_ASPECT_*) */
+enum { CSS_SIZE_ADJUST_NONE, CSS_SIZE_ADJUST_NUMBER, CSS_SIZE_ADJUST_FROM_FONT };
+struct css_font_size_adjust { float value; uint8_t kind, metric; };
+/* font-feature-settings' and font-variation-settings' computed lists: sorted by tag, each tag once */
+struct css_font_tag { char tag[4]; double value; }; /* a <number>'s whole range (an axis value may be large) */
+struct css_font_tags { uint32_t n; struct css_font_tag item[]; };
+/* font-variant-alternates: each function's argument list as it serializes (NULL: not given) */
+enum { CSS_ALT_STYLISTIC, CSS_ALT_STYLESET, CSS_ALT_CHARACTER_VARIANT, CSS_ALT_SWASH, CSS_ALT_ORNAMENTS, CSS_ALT_ANNOTATION,
+       CSS_ALT_FUNCTIONS };
+struct css_font_alternates { const char *arg[CSS_ALT_FUNCTIONS]; bool historical; };
+/* font-palette: normal, light, dark, a <dashed-ident> (name), or palette-mix() of palettes, each with
+   its percentage (NAN: not given) in a colour interpolation method (color.c's CSS_SPACE_*, CSS_HUE_*) */
+enum { CSS_PALETTE_NORMAL, CSS_PALETTE_LIGHT, CSS_PALETTE_DARK, CSS_PALETTE_NAMED, CSS_PALETTE_MIX };
+struct css_palette;
+struct css_palette_item {
+    const struct css_palette *palette;
+    float pct;
+    const char *math; /* a math function's percentage as its specified value serializes; NULL: a literal */
+};
+struct css_palette { uint8_t kind, space, hue; const char *name; uint32_t count; struct css_palette_item item[]; };
+struct css_font {
+    float width;         /* font-width: a percentage */
+    float oblique;       /* font-style oblique's angle, degrees */
+    bool oblique_angle;  /* written with its angle (the computed value keeps whether it was) */
+    uint8_t caps, position, emoji, kerning, optical_sizing;
+    uint8_t synthesis[CSS_SYNTHESIS_KINDS];
+    uint16_t ligatures, numeric, east_asian;
+    struct css_font_size_adjust size_adjust;
+    const struct css_font_alternates *alternates; /* NULL: normal */
+    const struct css_font_tags *features, *variations; /* NULL: normal */
+    const struct css_palette *palette;            /* NULL: normal */
+    char language[5]; /* font-language-override's string without its trailing spaces; "": normal */
+};
+extern const struct css_font css_font_initial;
+bool css_font_equal(const struct css_font *a, const struct css_font *b);
 typedef struct style {
     uint8_t display, position, float_, clear, white_space, text_align, vertical_align, list_style,
         list_style_inside, font_style, text_transform, text_decoration, overflow, box_sizing, visibility, pointer_events,
@@ -1215,6 +1267,7 @@ typedef struct style {
     int z_index, order;
     const struct css_content *content; /* NULL: normal (none, for ::before and ::after) */
     const struct css_list *list;       /* list-style-type's name, list-style-image, quotes; NULL: initial */
+    const struct css_font *font;       /* the inherited CSS Fonts 4 values; NULL: initial */
     const struct css_counters *counters; /* counter-*: a group that is not inherited; NULL: none */
     const char *bg_image; /* url() of background-image (absolute, or relative to the document) */
     int bg_img;           /* its index in the document's images + 1, or 0 (set after the cascade) */
@@ -1265,6 +1318,9 @@ static inline const struct css_list *css_style_list(const style_t *s) {
 }
 static inline const struct css_counters *css_style_counters(const style_t *s) {
     return s->counters ? s->counters : &css_counters_initial;
+}
+static inline const struct css_font *css_style_font(const style_t *s) {
+    return s->font ? s->font : &css_font_initial;
 }
 /* A list item's ::marker style when the cascade gave it none of its own (CSS Lists 3 §3.1): inherited
    from the item, with the UA style sheet's ::marker rule (white-space: pre, text-transform: none). */
@@ -1572,7 +1628,10 @@ struct propdef;
 const struct propdef *css_prop_lookup(const char *name, size_t n); /* NULL: not supported */
 int css_prop_count(void);
 const char *css_prop_name(int index,bool *longhand); /* actual native table, lexicographical order */
-const char *css_prop_legacy_alias(int index); /* the index-th legacy name alias (NULL past the last) */
+/* CSS Cascade 5 legacy name aliases (font-stretch for font-width): the property name n names, NULL for
+   any other name; and the aliases by index (NULL past the last), with their properties in *name */
+const char *css_prop_legacy_alias(const char *name, size_t n);
+const char *css_prop_legacy_alias_at(int index, const char **name);
 int css_prop_index(const struct propdef *p);
 /* computed before the other declarations, which depend on them: font-size, color-scheme, or a
    shorthand that sets one */
@@ -1759,6 +1818,17 @@ bool css_color_parse_used(const char *s, size_t n, const style_t *(*element)(voi
                           struct css_color *out);
 /* CSSOM: the specified value's serialization; false (out unchanged) when s is not a <color> */
 bool css_color_specified(const char *s, size_t n, sbuf *out);
+/* CSS Color 4 §12 <color-interpolation-method>, "in <space> [<hue-method> hue]?", the hue method only
+   for a polar space (xyz is xyz-d65); and its text as color-mix() serializes it (CSS Color 5 §2.4):
+   nothing for oklab, no hue method when it is shorter (false: nothing written). palette-mix() takes
+   both (CSS Fonts 5). */
+bool css_color_method_read(const char *s, size_t n, uint8_t *space, uint8_t *hue);
+bool css_color_method_text(sbuf *out, uint8_t space, uint8_t hue);
+/* the percentages color-mix() (CSS Color 5 §2.4) and palette-mix() serialize, from their items' given
+   percentages (NAN: omitted) and which are math functions (written as they are): put[i] is the one item
+   i writes, NAN when it writes none. An omitted one is the rest of 100% shared between the omitted,
+   unless one is a math function; none is written when each is the even share. */
+void css_mix_percentages(unsigned count, const double *given, const bool *math, double *put);
 /* CSS Typed OM §5.7: a <color> as written (color.c). KEYWORD: name (currentcolor, a system colour);
    a function's channels as authored (a math one's serialization in math at math_at), a hex or named
    colour RGB with its bytes and its alpha as a unitless fraction; OTHER: relative colours and mixes.
