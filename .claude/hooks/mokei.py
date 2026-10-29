@@ -10,7 +10,7 @@
 
 ここは見せるだけで、作業を止めない。止めるのは二つ：ユーザーへの返事に日本語が無いとき（Stop）と、
 ユーザーが禁じた命令（PreToolUse。窓なしの QEMU、三台目の QEMU、三つ目の媒体、build の下の記録、
-窓なしのままの試験の道具、目標の無いビルド。2026-10-29）。
+窓なしのままの試験の道具、目標の無いビルド、作業木（worktree）の作成。2026-10-29）。
 使い方は .claude/skills/mokei/SKILL.md にある。失敗は .claude/mokei/errors.log に残し、会話には出さない。
 """
 import datetime
@@ -32,6 +32,7 @@ MACHINE = ("<task-notification", "<side-sessions-event", "<ci-monitor-event", "<
            "This session is being continued from a previous conversation", "[Artifact comment")
 EDITS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 SHELLS = {"Bash", "PowerShell"}
+AGENTS = {"Agent", "Task"}  # サブエージェントを出す道具（古い名は Task）。isolation が worktree なら止める
 # シェルの命令にこれがあれば、物差しを測った（ログを読んだ・撮った・QEMU を起こした・対象を絞った WPT を回した）と数える。
 # platform_qa と記録のフォルダー（hikaku）は数えない：10-28〜29 の会話では「測った」の大半がそれらで、
 # 本物（媒体を窓付きで見る）から離れた。
@@ -40,7 +41,11 @@ MEASURE = ("serial.log", "screendump", "qemu-system", "hv-serial", "hv-boot", "S
 # 実行の前に止める命令（2026-10-29 ユーザーの指示）。読むだけの命令（grep・ls など）は build の道の規則から除く。
 READ_ONLY = ("grep", "rg ", "git ", "ls", "cat ", "find ", "head ", "tail ", "sed -n", "wc ", "stat ", "dir ",
              "Get-ChildItem", "Get-Content", "Select-String", "Test-Path", "Get-Item")
+# 作業木は一つ（2026-10-29 ユーザー：58 の作業木が 83 万ファイル・39.6 GB になり、Windows を遅くした）。
+WORKTREE = ("作業木（worktree）を作る。作業木はこの一つで、サブエージェントは isolation なしで、触るファイルを分けて働く。"
+            "2026-10-29、58 の作業木が 83 万ファイル・39.6 GB になり、Windows を遅くした（AGENTS.md「進め方」）。")
 FORBIDDEN = (
+    (re.compile(r"\bgit\b[^\n;&|]*\bworktree\s+add\b"), WORKTREE, False),
     (re.compile(r"qemu-system[^\n;&|]*(-display\s+(none|egl-headless)|-nographic)"),
      "QEMU を窓なしで起動する命令。QEMU は窓付きで二台まで（nocturne-project スキル）。ユーザーはその窓を見ている。", False),
     (re.compile(r"python[^\n]*scripts[/\\](platform_qa|qtest)\.py"),
@@ -568,7 +573,7 @@ def deny(ws, command, why):
     ws.record("blocked", text=one_line(command, 120))
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                    "permissionDecisionReason": "止めた：" + why
-                                   + "（2026-10-29 ユーザーの指示。.claude/skills/nocturne-project/SKILL.md）"}}
+                                   + "（2026-10-29 ユーザーの指示。止める命令の一覧は .claude/skills/mokei/SKILL.md）"}}
 
 
 def running_qemu():
@@ -600,10 +605,16 @@ def headless_tool(root, name):
 
 
 def on_pre_tool(ws, data):
-    """禁じられた命令を実行の前に止め、理由を返す。"""
-    if data.get("tool_name") not in SHELLS:
+    """禁じられた命令と道具の呼び出しを実行の前に止め、理由を返す。"""
+    tool = data.get("tool_name")
+    args = data.get("tool_input") or {}
+    if tool in AGENTS and args.get("isolation") == "worktree":
+        return deny(ws, f"{tool} isolation=worktree", WORKTREE)
+    if tool == "EnterWorktree":
+        return deny(ws, tool, WORKTREE)
+    if tool not in SHELLS:
         return None
-    command = (data.get("tool_input") or {}).get("command") or ""
+    command = args.get("command") or ""
     for pattern, why, skip_reads in FORBIDDEN:
         if skip_reads and reads_only(command):
             continue
