@@ -24,7 +24,7 @@ static box_t *nbox(struct bctx *b, int kind, node_t *n, style_t *st) {
     x->node = n;
     x->st = st;
     x->paint_alpha = kind != B_TEXT && kind != B_BR && st && (st->opacity * (st->filter ? st->filter->opacity : 1) < 1 ||
-        (st->filter && st->filter->effects) || st->backdrop_filter ||
+        (st->filter && st->filter->effects) || st->backdrop_filter || css_style_effects(st)->blend != CSS_BLEND_NORMAL ||
         (kind != B_INLINE && (css_transform_general(st) || css_style_mask_border(st)->source.url ||
                               css_style_mask_border(st)->source.gradient || css_mask_layers_set(css_style_mask(st)))));
     x->baseline = -1;
@@ -1656,7 +1656,7 @@ static void restyle_boxes(box_t *b,bool inherited_borrow) {
     }
     b->paint_alpha = b->kind != B_TEXT && b->kind != B_BR && b->st &&
         (b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1) < 1 || (b->st->filter && b->st->filter->effects) ||
-         b->st->backdrop_filter || box_transformed(b) ||
+         b->st->backdrop_filter || css_style_effects(b->st)->blend != CSS_BLEND_NORMAL || box_transformed(b) ||
          (b->kind != B_INLINE && (css_style_mask_border(b->st)->source.url || css_style_mask_border(b->st)->source.gradient ||
                                   css_mask_layers_set(css_style_mask(b->st)))));
     for (box_t *c = b->first; c; c = c->next) { restyle_boxes(c,inherited_borrow||own_borrow); b->paint_alpha |= c->paint_alpha; }

@@ -14,6 +14,10 @@ border-image の頁（parsing・animations）、compositing の background-blend
 parsing と動きの頁を照らす。--group ui では css-ui の cursor・caret-color・accent-color の頁（parsing・animation）を
 照らす（性質の表の G_UI の群）。
 --group fonts では css-fonts の parsing・animations の頁と、根にある数式・離散の動きの頁を照らす。
+--group effects では合成・3D・包含・操作の性質（性質の表の G_EFFECTS の群と appearance・user-select・
+touch-action）の頁を照らす：compositing の isolation・mix-blend-mode、css-transforms の backface-visibility・
+perspective・perspective-origin（解析と補間。perspective-origin の計算値の頁は箱の寸法で百分率を解くので数えない）、
+css-will-change、css-contain の contain、css-ui の user-select と appearance の動き、pointerevents の touch-action。
 
 guest の WPT の代わりではない。CSSOM の宣言の塊・cascade・var()・時間の模型（animation.c）・
 配置と描画は通らない。数えないもの：test_shorthand_value（CSSOM が shorthand の longhand の
@@ -31,7 +35,7 @@ css-multicol の column-rule の頁（parsing・animation）も同じ性質な�
 --rev <版> は、その版の user/libc/web・user/include・common（git archive）を今の道具で組む
 （前の版と同じ道具で比べる）。
 
-  python -X utf8 tests/check_css_shapes_native.py [--group shapes|gaps|anchor|lists|backgrounds|masking|ui|text|decor|fonts] [--verbose] [--file 名前の一部] [--out 出力の場所] [--rev 版]
+  python -X utf8 tests/check_css_shapes_native.py [--group shapes|gaps|anchor|lists|backgrounds|masking|ui|text|decor|fonts|effects] [--verbose] [--file 名前の一部] [--out 出力の場所] [--rev 版]
 """
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -128,8 +132,22 @@ elif group == "fonts":
     pages = (sorted((fonts / "parsing").glob("*.html")) + sorted((fonts / "animations").glob("*.html")) +
              sorted(p for p in fonts.glob("*.html") if re.search(r"(-interpolation-math-functions|-sign-function|"
                                                                  r"-calc|discrete-no-interpolation)\.html$", p.name)))
+elif group == "effects":
+    transforms = wpt / "css-transforms"
+    pages = (sorted(p for p in (wpt / "compositing/parsing").glob("*.html") if p.name.startswith(("isolation-", "mix-blend-mode-"))) +
+             [transforms / "parsing" / name for name in (
+                 "backface-visibility-valid.html", "backface-visibility-invalid.html", "backface-visibility-computed.html",
+                 "perspective-invalid.html", "perspective-origin-valid.html", "perspective-origin-invalid.html")] +
+             [transforms / "animation" / name for name in (
+                 "perspective-interpolation.html", "perspective-composition.html", "perspective-origin-interpolation.html",
+                 "perspective-origin-composition.html", "backface-visibility-no-interpolation.html")] +
+             sorted((wpt / "css-will-change/parsing").glob("*.html")) +
+             [wpt / "css-contain/parsing" / f"contain-{kind}.html" for kind in ("valid", "invalid", "computed")] +
+             sorted((wpt / "css-ui/parsing").glob("user-select-*.html")) +
+             [wpt / "css-ui/animation/appearance-no-interpolation.html"] +
+             sorted((wpt.parent / "pointerevents/parsing").glob("touch-action-*.html")))
 else:
-    sys.exit(f"群は shapes・gaps・anchor・lists・backgrounds・masking・ui・text・decor・fonts のどれか：{group}")
+    sys.exit(f"群は shapes・gaps・anchor・lists・backgrounds・masking・ui・text・decor・fonts・effects のどれか：{group}")
 out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else root / f"build/check-css-{group}"
 out.mkdir(parents=True, exist_ok=True)
 # the repository's tools (a worktree has them in the main checkout above it)

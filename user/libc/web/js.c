@@ -2534,6 +2534,21 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     box_t *principal = pseudo==PE_NONE?geometry_principal_box(n):NULL;
     if(!strcmp(property,"transform")||!strcmp(property,"translate"))
         return computed_translation(ctx,d,st,principal,!strcmp(property,"translate"));
+    /* CSS Transforms 2 §9: perspective-origin is a resolved value special case like height: for a
+       box, its used value, the percentages of the reference box (transform-box) as lengths */
+    if (!strcmp(property, "perspective-origin") && principal && principal->st) {
+        const len_t *o = css_style_effects(st)->perspective_origin;
+        bool content = st->transform_box == TB_FILL_BOX || st->transform_box == TB_CONTENT_BOX;
+        float w = principal->w + (content ? 0 : principal->p[1] + principal->p[3] + principal->b[1] + principal->b[3]);
+        float h = principal->h + (content ? 0 : principal->p[0] + principal->p[2] + principal->b[0] + principal->b[2]);
+        len_t x = {.kind = LK_LEN, .px = len_resolve(&o[0], w)}, y = {.kind = LK_LEN, .px = len_resolve(&o[1], h)};
+        sbuf text = {0};
+        bool ok = css_length_serialize(&x, &text, d);
+        if (ok) { sb_putc(&text, ' '); ok = css_length_serialize(&y, &text, d); }
+        if (!ok) { sb_free(&text); return JS_ThrowInternalError(ctx, "CSS perspective-origin serialization failed"); }
+        JSValue result = JS_NewStringLen(ctx, text.p ? text.p : "", text.n);
+        sb_free(&text); return result;
+    }
     if (!strcmp(property, "fill") || !strcmp(property, "stroke")) {
         const struct svg_paint *paint = !strcmp(property, "fill") ? &st->svg_fill : &st->svg_stroke;
         if (paint->kind == SVG_PAINT_NONE) return JS_NewString(ctx, "none");

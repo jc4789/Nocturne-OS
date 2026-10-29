@@ -457,18 +457,43 @@ static bool is_flex_item(const box_t *b) {
     return b->parent && (b->parent->kind == B_FLEX || b->parent->kind == B_GRID) && !b->abspos;
 }
 
-static bool size_container(const box_t *b) {
-    return !b->anon && b->st->container_type!=CT_NORMAL &&
-        b->st->display!=D_INLINE && b->st->display!=D_INLINE_TABLE &&
-        (b->kind==B_BLOCK || b->kind==B_FLEX || b->kind==B_GRID || b->kind==B_ATOMIC);
+/* CSS Containment 2 §3.1: the size containment b has, CSS_CONTAIN_SIZE (both axes) or
+   CSS_CONTAIN_INLINE_SIZE: contain's, content-visibility: hidden's (§4) and container-type's
+   (css-conditional-5 §2.1, not for an inline-level element), for the boxes it applies to (not a
+   non-atomic inline box, a table or an internal table box) */
+static unsigned size_containment(const box_t *b) {
+    if (b->anon || !b->st || !(b->kind==B_BLOCK || b->kind==B_FLEX || b->kind==B_GRID || b->kind==B_ATOMIC)) return 0;
+    const style_t *st = b->st;
+    unsigned c = css_style_effects(st)->contain & (CSS_CONTAIN_SIZE | CSS_CONTAIN_INLINE_SIZE);
+    if (st->content_visibility == CV_HIDDEN) c |= CSS_CONTAIN_SIZE;
+    if (st->display != D_INLINE && st->display != D_INLINE_TABLE)
+        c |= st->container_type == CT_SIZE ? CSS_CONTAIN_SIZE : st->container_type == CT_INLINE_SIZE ? CSS_CONTAIN_INLINE_SIZE : 0;
+    return c & CSS_CONTAIN_SIZE ? CSS_CONTAIN_SIZE : c;
+}
+static bool size_container(const box_t *b) { return size_containment(b) != 0; }
+/* the containment b has in use (CSS_CONTAIN_*): contain's; content-visibility auto's and hidden's
+   layout, style and paint containment (§4); container-type's layout and style containment; the
+   size containment above. Layout and paint containment do not apply to a non-atomic inline box nor
+   an internal table box other than a cell (§3.2, §3.4); style containment applies to every element. */
+unsigned box_containment(const box_t *b) {
+    if (!b || b->anon || !b->st || b->kind == B_TEXT || b->kind == B_BR) return 0;
+    const style_t *st = b->st;
+    unsigned c = css_style_effects(st)->contain & (CSS_CONTAIN_LAYOUT | CSS_CONTAIN_STYLE | CSS_CONTAIN_PAINT);
+    if (st->content_visibility != CV_VISIBLE) c |= CSS_CONTAIN_LAYOUT | CSS_CONTAIN_STYLE | CSS_CONTAIN_PAINT;
+    if (st->container_type != CT_NORMAL) c |= CSS_CONTAIN_LAYOUT | CSS_CONTAIN_STYLE;
+    if (b->kind == B_INLINE || (b->kind == B_BLOCK && st->display == D_INLINE) || b->kind == B_ROW || b->kind == B_ROW_GROUP)
+        c &= CSS_CONTAIN_STYLE; /* a block proxy of a split inline is the inline's */
+    return c | size_containment(b);
 }
 
+/* layout and paint containment make an independent formatting context (CSS Containment 2 §3.2, §3.4;
+   container-type's is its layout containment); size containment alone does not */
 static bool is_bfc_root(const box_t *b) {
     return !b->parent || b->floated || b->abspos || b->kind == B_ATOMIC || b->kind == B_CELL ||
            b->kind == B_CAPTION || b->kind == B_TABLE || b->kind == B_FLEX || b->kind == B_GRID ||
            (b->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(D,b)) ||
            b->st->display == D_FLOW_ROOT || (!b->anon && b->st->legacy_box) ||
-           size_container(b) || is_flex_item(b) || b->is_bfc;
+           is_flex_item(b) || b->is_bfc || (box_containment(b) & (CSS_CONTAIN_LAYOUT | CSS_CONTAIN_PAINT));
 }
 
 float box_abs_x(const box_t *b) {
@@ -633,24 +658,73 @@ static bool box_offset_used(const box_t *b,double x,double y,float w,float h,dou
     return isfinite(u->ax)&&isfinite(u->ay)&&isfinite(u->angle);
 }
 static bool style_transform_matrix(const style_t *st,double x,double y,float w,float h,const box_t *b,double out[6]);
-bool box_transform_matrix(const box_t *b,double out[6]){
-    if(!box_transformed(b))return false;
+static bool style_transform_matrix4(const style_t *st,double x,double y,float w,float h,const box_t *b,bool depth,double m[16]);
+/* b's reference box for its transform and perspective (transform-box), in document coordinates */
+static void transform_reference_box(const box_t *b,double *x,double *y,float *w,float *h){
     const style_t *st=b->st;
     bool content=st->transform_box==TB_FILL_BOX||st->transform_box==TB_CONTENT_BOX;
-    float w=content?b->w:b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3],h=content?b->h:b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2];
-    double x=box_visual_x(b)-(content?0:b->p[3]+b->b[3]),y=box_visual_y(b)-(content?0:b->p[0]+b->b[0]);
-    return style_transform_matrix(st,x,y,w,h,b,out);
+    *w=content?b->w:b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3];*h=content?b->h:b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2];
+    *x=box_visual_x(b)-(content?0:b->p[3]+b->b[3]);*y=box_visual_y(b)-(content?0:b->p[0]+b->b[0]);
+}
+bool box_transform_matrix(const box_t *b,double out[6]){
+    if(!box_transformed(b))return false;
+    double x,y;float w,h;
+    transform_reference_box(b,&x,&y,&w,&h);
+    return style_transform_matrix(b->st,x,y,w,h,b,out);
+}
+/* CSS Transforms 2 §10: backface-visibility: hidden hides b when the third diagonal component of its
+   accumulated 3D transformation matrix (§4.1.4) is negative. That matrix: b's transform, then its
+   parent's perspective matrix (§8: around the perspective origin, under 1px as 1px), and so up through
+   the ancestors that extend b's 3D rendering context (transform-style: preserve-3d), stopping at the
+   one that establishes it. Every matrix is in document coordinates, which holds the offsets between
+   them. The rendering itself stays flat (no 3D rendering context is drawn): the test is all of it. */
+bool box_backface_hidden(const box_t *b){
+    if(!b||!b->st||b->kind==B_TEXT||b->kind==B_BR||b->kind==B_INLINE||
+       css_style_effects(b->st)->backface!=CSS_BACKFACE_HIDDEN)return false;
+    double acc[16],f[16];
+    for(int i=0;i<16;i++)acc[i]=i%5?0:1;
+    for(const box_t *e=b;e;){
+        double x,y;float w,h;
+        if(box_transformed(e)){
+            transform_reference_box(e,&x,&y,&w,&h);
+            if(style_transform_matrix4(e->st,x,y,w,h,e,true,f))matrix4_multiply(acc,f,acc);
+        }
+        const box_t *p=e->parent;
+        if(!p||!p->st||p->kind==B_INLINE||p->kind==B_TEXT||p->kind==B_BR)break;
+        const struct css_effects *pe=css_style_effects(p->st);
+        if(pe->perspective.kind!=LK_NONE){
+            transform_reference_box(p,&x,&y,&w,&h);
+            double px=x+len_resolve(&pe->perspective_origin[0],w),py=y+len_resolve(&pe->perspective_origin[1],h);
+            double d=len_resolve(&pe->perspective,0);
+            double m[16];
+            for(int i=0;i<16;i++)m[i]=i%5?0:1;
+            m[3]=px;m[7]=py;
+            for(int i=0;i<16;i++)f[i]=i%5?0:1;
+            f[14]=-1.0/(d<1?1:d);matrix4_multiply(m,m,f);
+            for(int i=0;i<16;i++)f[i]=i%5?0:1;
+            f[3]=-px;f[7]=-py;matrix4_multiply(m,m,f);
+            matrix4_multiply(acc,m,acc);
+        }
+        /* p is part of b's 3D rendering context; one whose parent is flat establishes it */
+        if(pe->transform_style!=CSS_TRANSFORM_PRESERVE_3D)break;
+        const box_t *g=p->parent;
+        if(!g||!g->st||g->kind==B_INLINE||css_style_effects(g->st)->transform_style!=CSS_TRANSFORM_PRESERVE_3D)break;
+        e=p;
+    }
+    return isfinite(acc[10])&&acc[10]<0;
 }
 /* SVG graphics take the transform properties only; the offset transform is the CSS boxes' */
 bool css_style_transform_matrix(const style_t *st,double x,double y,float w,float h,double out[6]){
     return st&&transform_properties(st)&&style_transform_matrix(st,x,y,w,h,NULL,out);
 }
-static bool style_transform_matrix(const style_t *st,double x,double y,float w,float h,const box_t *b,double out[6]){
+/* The 4x4 (row-major) of st's transform around its origin, in document coordinates; depth: with the
+   perspective() functions, which the 2D matrix's orthographic flattening discards. */
+static bool style_transform_matrix4(const style_t *st,double x,double y,float w,float h,const box_t *b,bool depth,double m[16]){
     if(!css_translation_active(st))return false;
     double ox=x+len_resolve(&st->transform_origin[0],w),oy=y+len_resolve(&st->transform_origin[1],h);
     /* CSS Transforms 2: translate, rotate, scale, the offset transform (motion-1 §2.7), then transform,
        around the origin. */
-    double m[16],f[16];
+    double f[16];
     for(int i=0;i<16;i++)m[i]=i%5?0:1;
     m[3]=ox;m[7]=oy;
     if(st->translate.active){
@@ -670,9 +744,14 @@ static bool style_transform_matrix(const style_t *st,double x,double y,float w,f
         for(int i=0;i<16;i++)f[i]=i%5?0:1;
         f[3]=ox-off.ax;f[7]=oy-off.ay;matrix4_multiply(m,m,f);
     }
-    css_transform_list_matrix(st->transform,w,h,f);matrix4_multiply(m,m,f);
+    for(const struct css_transform *t=st->transform;t;t=t->next){transform_function_matrix(t,w,h,depth,f);matrix4_multiply(m,m,f);}
     for(int i=0;i<16;i++)f[i]=i%5?0:1;
     f[3]=-ox;f[7]=-oy;matrix4_multiply(m,m,f);
+    return true;
+}
+static bool style_transform_matrix(const style_t *st,double x,double y,float w,float h,const box_t *b,double out[6]){
+    double m[16];
+    if(!style_transform_matrix4(st,x,y,w,h,b,false,m))return false;
     out[0]=m[0];out[1]=m[4];out[2]=m[1];out[3]=m[5];out[4]=m[3];out[5]=m[7];
     for(int i=0;i<6;i++)if(!isfinite(out[i]))return false;
     return true;
@@ -699,14 +778,27 @@ void box_transform_rect(const box_t *b,double rect[4]){
     }
     rect[0]=l;rect[1]=t;rect[2]=r-l;rect[3]=bt-t;
 }
+/* whether b is a containing block for its fixed (and absolute) descendants by an effect: a transform
+   (CSS Transforms 1 §2) and, on a transformable box, perspective other than none and transform-style
+   preserve-3d (CSS Transforms 2: perspective §8, transform-style); filter and backdrop-filter but on the root element (Filter
+   Effects 1 §5, 2 §2); layout and paint containment (CSS Containment 2 §3.2, §3.4); will-change
+   naming a property that would make one (CSS Will Change 1 §2.1) */
 bool box_filter_containing_block(const box_t *b) {
     const box_t *effect = b;
     /* wrapped() paints an element's effect on the outer box once, but the
        inner box owns its real padding/border containing-block geometry. */
     if (b && b->wrapped_inner && b->parent) effect = b->parent;
-    return effect && effect->st && b->kind != B_TEXT && b->kind != B_BR &&
-        ((effect->kind!=B_INLINE&&css_translation_active(effect->st))||((effect->st->filter||effect->st->backdrop_filter)&&
-         !(b->node&&b->node->owner&&b->node==b->node->owner->html)));
+    if (!effect || !effect->st || b->kind == B_TEXT || b->kind == B_BR) return false;
+    const style_t *st = effect->st;
+    const struct css_effects *e = css_style_effects(st);
+    if (effect->kind != B_INLINE &&
+        (css_translation_active(st) || e->perspective.kind != LK_NONE || e->transform_style == CSS_TRANSFORM_PRESERVE_3D ||
+         (e->will_change.effects & CSS_WILL_FIXED_CB_TRANSFORM)))
+        return true;
+    if ((st->filter || st->backdrop_filter || (e->will_change.effects & CSS_WILL_FIXED_CB)) &&
+        !(b->node && b->node->owner && b->node == b->node->owner->html))
+        return true;
+    return (box_containment(effect) & (CSS_CONTAIN_LAYOUT | CSS_CONTAIN_PAINT)) != 0;
 }
 bool box_viewport_fixed(const box_t *b) {
     return b && b->st && b->st->position == POS_FIXED &&
@@ -1206,7 +1298,7 @@ static void size_replaced(box_t *c, float cbw, float cbh) {
     replaced_natural(c, &iw, &ih, &ratio);
     if(size_container(c)) {
         iw=0;ratio=0;
-        if(c->st->container_type==CT_SIZE)ih=0;
+        if(size_containment(c)==CSS_CONTAIN_SIZE)ih=0;
     }
     float w = spec_w(c, &c->st->width, cbw), h = spec_h(c, &c->st->height, cbh);
     bool derive_w = w < 0, derive_h = h < 0;
@@ -1313,7 +1405,7 @@ static void size_control(box_t *c, float cbw, float cbh) {
         break;
     }
     }
-    if(size_container(c)){w=0;if(st->container_type==CT_SIZE)h=0;}
+    if(size_container(c)){w=0;if(size_containment(c)==CSS_CONTAIN_SIZE)h=0;}
     float sw = spec_w(c, &st->width, cbw), sh = spec_h(c, &st->height, cbh);
     if (sw >= 0) w = sw;
     else if (st->width.kind == LK_SIZE) { float k = replaced_size(c, &st->width, w, cbw, true); if (k >= 0) w = k; }
@@ -5422,7 +5514,7 @@ static void layout_inner_body(box_t *b, struct bfc *f, float ox, float oy, float
        apply to the original non-replaced inline (CSS 2.2 9.2.1.1, 10.5). */
     bool split_inline = b->kind == B_BLOCK && b->st->display == D_INLINE;
     float sh = split_inline ? -1 : usedh >= 0 ? usedh : resolved_content_height(b, cbh);
-    if(!split_inline && sh<0 && size_container(b) && b->st->container_type==CT_SIZE)sh=0;
+    if(!split_inline && sh<0 && size_containment(b)==CSS_CONTAIN_SIZE)sh=0;
     if (b->clamp_trace) b->clamp_trace->sh = sh;
     /* The anonymous initial containing block supplies the viewport height,
        even though its own auto height follows document content. Otherwise
@@ -5740,7 +5832,8 @@ static box_t *abs_containing_block(box_t *a) {
     if (web_dialog_layer_box(D,a)) return D->root_box;
     for (box_t *p = a->parent; p; p = p->parent)
         if (box_filter_containing_block(p) ||
-            (a->st->position != POS_FIXED && p->st && p->st->position != POS_STATIC && p->kind != B_INLINE && p->kind != B_TEXT)) return p;
+            (a->st->position != POS_FIXED && p->st && p->kind != B_INLINE && p->kind != B_TEXT &&
+             (p->st->position != POS_STATIC || (css_style_effects(p->st)->will_change.effects & CSS_WILL_ABS_CB)))) return p;
     return D->root_box;
 }
 
@@ -6642,7 +6735,8 @@ static void scroll_area_publish(box_t *b) {
        an outer CSS child box. Its private scroll area must not enlarge an
        ancestor even if the author changes the outer overflow property. */
     bool clipped = b->clamp_truncated || b->atomic == AT_TEXTAREA ||
-        (b->st && b->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(D, b));
+        (b->st && b->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(D, b)) ||
+        (box_containment(b) & CSS_CONTAIN_PAINT); /* clipped to its overflow clip edge (CSS Containment 2 §3.4) */
     float bw = clipped ? b->w + b->p[1] + b->p[3] : b->scroll_w;
     float bh = clipped ? b->h + b->p[0] + b->p[2] : b->scroll_h;
     /* cb is b's actual coordinate parent. The shared cb chain cancels:
@@ -6711,7 +6805,7 @@ static void scroll_areas(box_t *b) {
     /* Document bottom and overflow consume the same final geometry. Compute
        both on this postorder walk rather than a second max_bottom tree walk. */
     b->layout_bottom = b->h + b->p[2] + b->b[2];
-    bool clipped = b->clamp_truncated || (b->st && b->st->overflow != OV_VISIBLE &&
+    bool clipped = b->clamp_truncated || (b->st && (b->st->overflow != OV_VISIBLE || (box_containment(b) & CSS_CONTAIN_PAINT)) &&
         b->kind != B_TEXT && !doc_viewport_overflow_box(D, b));
     for (box_t *c = b->first; c; c = c->next) {
         scroll_areas(c);

@@ -262,7 +262,8 @@ void css_counter_text(const struct css_counter_style *style, int32_t value, bool
    parent has is nested: its scope is the creating element (its descendants, not its following
    siblings), or for a pseudo-element the pseudo-element alone (scope NULL, depth UINT32_MAX).
    Any other's scope is the creator's flat parent (a pseudo-element's is its originating element):
-   the creator, the siblings after it and their descendants. */
+   the creator, the siblings after it and their descendants. level: how many style-contained
+   elements enclosed its creator (struct contained). */
 struct instance {
     const char *name;
     node_t *scope;
@@ -271,7 +272,12 @@ struct instance {
     int32_t value;
     bool reversed, nested;
     int32_t pending;
+    uint32_t level;
 };
+/* CSS Containment 2 §3.3: an element with style containment whose subtree (below it) holds the
+   participant, its depth in the flat tree, and the quote depth when its subtree began (which the
+   subtree's quotes do not change for what follows it) */
+struct contained { node_t *node; uint32_t depth, quote_depth; };
 /* §4.4.2's num and lastNonZeroIncrementNegated for one such counter, whether an element of its
    scope set it (which ends the sum), and what the participant being applied did to it */
 struct reversed_start { int64_t num; int32_t last; bool done; int64_t increment; bool set; int32_t set_value; bool touched; };
@@ -289,6 +295,8 @@ struct counting {
     node_t *creator;
     const void *origin;
     uint32_t quote_depth;
+    struct contained *frames; /* the style-contained elements around the participant, innermost last */
+    uint32_t nframes, capframes;
     bool failed;
     sbuf text;
 };
@@ -359,7 +367,7 @@ static struct instance *instantiate(struct counting *c, const char *name, bool r
     uint32_t depth = !nested ? c->len - 1 : c->creator ? c->len : UINT32_MAX;
     if (!grow((void **)&c->v, &c->cap, c->n + 1, sizeof *c->v)) { c->failed = true; return NULL; }
     struct instance *x = &c->v[c->n++];
-    *x = (struct instance){name, scope, depth, c->origin, valued ? value : 0, reversed, nested, -1};
+    *x = (struct instance){name, scope, depth, c->origin, valued ? value : 0, reversed, nested, -1, c->nframes};
     if (reversed && !valued) {
         uint32_t k = c->rev_next++;
         if (c->measure) {
@@ -380,15 +388,30 @@ static struct instance *counter_of(struct counting *c, const char *name) {
     struct instance *x = innermost(c, name);
     return x ? x : instantiate(c, name, false, true, 0);
 }
+/* CSS Containment 2 §3.3: in a style-contained element's subtree (below the element: its own counter
+   properties are outside), counter-increment and counter-set are scoped to the subtree and create a
+   new counter. The counter they change is one the subtree made; for one made outside it, a new counter
+   of 0 as the participant's counter-reset would make it, not nested (the participant, its following
+   siblings and their descendants): the outer counter stays as it was for the rest of the document,
+   the subtree's other elements among them (WPT css-contain/contain-style-counters-003, -004). */
+static struct instance *counter_to_change(struct counting *c, const char *name) {
+    struct instance *x = innermost(c, name);
+    if (!x || !c->nframes || x->level >= c->nframes) return x ? x : instantiate(c, name, false, true, 0);
+    if (!c->len) return NULL; /* a node without a parent creates no counter */
+    if (!grow((void **)&c->v, &c->cap, c->n + 1, sizeof *c->v)) { c->failed = true; return NULL; }
+    x = &c->v[c->n++];
+    *x = (struct instance){name, c->at[0], c->len - 1, c->origin, 0, false, false, -1, c->nframes};
+    return x;
+}
 static void increment(struct counting *c, const char *name, int32_t by) {
-    struct instance *x = counter_of(c, name);
+    struct instance *x = counter_to_change(c, name);
     if (!x) return;
     int64_t next = (int64_t)x->value + by;
     if (next <= INT32_MAX && next >= INT32_MIN) x->value = (int32_t)next; /* one that would overflow is not made */
     if (x->pending >= 0) { struct reversed_start *r = &c->rev[x->pending]; r->increment -= by; r->touched = true; }
 }
 static void set(struct counting *c, const char *name, int32_t to) {
-    struct instance *x = counter_of(c, name);
+    struct instance *x = counter_to_change(c, name);
     if (!x) return;
     x->value = to;
     if (x->pending >= 0) { struct reversed_start *r = &c->rev[x->pending]; r->set = true; r->set_value = to; r->touched = true; }
@@ -490,10 +513,34 @@ static void marker_text(struct counting *c, const style_t *item, const style_t *
 /* One counting box, in tree order: its element (and then the list item's ::marker, the first of
    its children, CSS Lists 3 §3.1) or its ::before or ::after (whose parent is the element). Of the
    ::marker's own values only content counts: the counter properties do not apply to it (§3.1.1). */
+/* the style-contained elements whose subtrees the walk has left (c->chain: the next participant's
+   ancestors): the quote depth is what it was before each */
+static void leave_contained(struct counting *c) {
+    while (c->nframes) {
+        const struct contained *f = &c->frames[c->nframes - 1];
+        if (f->depth < c->nchain && c->chain[c->nchain - 1 - f->depth] == f->node) return;
+        c->quote_depth = f->quote_depth;
+        c->nframes--;
+    }
+}
+/* b is the principal box of an element with style containment (contain, or content-visibility
+   auto or hidden, CSS Containment 2 §4) */
+static bool style_contained(const box_t *b) {
+    const node_t *n = b->node;
+    return n && n->type == N_ELEM && n->box == b && b->st &&
+           ((css_style_effects(b->st)->contain & CSS_CONTAIN_STYLE) || b->st->content_visibility != CV_VISIBLE);
+}
+static void enter_contained(struct counting *c, box_t *b) {
+    if (!ancestors(c, b->node)) return;
+    leave_contained(c);
+    if (!grow((void **)&c->frames, &c->capframes, c->nframes + 1, sizeof *c->frames)) { c->failed = true; return; }
+    c->frames[c->nframes++] = (struct contained){b->node, c->nchain - 1, c->quote_depth};
+}
 static void record(struct counting *c, box_t *b) {
     node_t *n = b->node;
     unsigned kind = b->counter_kind & BOX_COUNTER_KIND;
     if (!n || !ancestors(c, n)) return;
+    leave_contained(c);
     if (kind == BOX_COUNTER_ELEMENT) {
         participant(c, 1, NULL);
         if (!c->len) return; /* a node without a parent creates no counter */
@@ -523,6 +570,7 @@ static void record(struct counting *c, box_t *b) {
 static void walk(struct counting *c, box_t *root) {
     for (box_t *b = root; b && !c->failed;) {
         if (b->counter_kind & BOX_COUNTER_KIND) record(c, b);
+        if (style_contained(b)) enter_contained(c, b); /* its subtree, after the element itself */
         box_t *x = b->first;
         while (x && !x->counter_tree) x = x->next;
         if (x) { b = x; continue; }
@@ -542,12 +590,13 @@ void web_counters_update(web_doc *d) {
     walk(&c, d->root_box);
     if (c.nrev && !c.failed) { /* the reversed counters' initial values are known: count again, and write */
         c.measure = false;
-        c.n = c.rev_next = c.quote_depth = 0;
+        c.n = c.rev_next = c.quote_depth = c.nframes = 0;
         walk(&c, d->root_box);
     }
     if (c.failed) d->counters_dirty = true; /* out of memory: the next publication tries again */
     free(c.v);
     free(c.rev);
     free(c.chain);
+    free(c.frames);
     sb_free(&c.text);
 }
