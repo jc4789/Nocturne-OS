@@ -354,18 +354,7 @@ static JSValue native_safety(JSContext *ctx,JSValueConst self,int argc,JSValueCo
     if(timer){
         /* HTML timer initialization: a string handler CSP blocks (§4.4.1,
            "timer") starts no timer (null); otherwise its compiled function. */
-        size_t length=0;const char *text=argc>2?JS_ToCStringLen(ctx,&length,argv[2]):NULL;
-        if(!text)return JS_EXCEPTION;
-        JSValue result=JS_NULL;
-        if(html_policy_eval_allowed(&w->policy_doc,text,length,worker_csp_report,w)){
-            size_t n=length+16;char *source=length<SIZE_MAX-16?malloc(n):NULL;
-            if(!source)result=JS_ThrowOutOfMemory(ctx);
-            else{
-                memcpy(source,"(function(){\n",13);memcpy(source+13,text,length);memcpy(source+13+length,"\n})",3);
-                result=JS_Eval(ctx,source,13+length+3,w->script_url?w->script_url:"",JS_EVAL_TYPE_GLOBAL);free(source);
-            }
-        }
-        JS_FreeCString(ctx,text);return result;
+        return argc>2?csp_timer_code(ctx,&w->policy_doc,argv[2],w->script_url,worker_csp_report,w):JS_ThrowTypeError(ctx,"Timer handler required");
     }
     if(!violation||argc<7)return JS_ThrowTypeError(ctx,"Invalid Worker safety operation");
     uint32_t index;if(JS_ToUint32(ctx,&index,argv[6])<0)return JS_EXCEPTION;

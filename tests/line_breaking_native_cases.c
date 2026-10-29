@@ -24,6 +24,8 @@ static void near(double got, double want, const char *what) {
 
 /* reached only from properties these cases do not set */
 bool web_native_checkpoint(web_doc *d) { (void)d; return true; }
+/* web_url.c's, reached only from a registered <url> custom property (cssprop.c's syn_url_text) */
+int web_resolve_url_owned(const char *base, const char *rel, char **out) { (void)base; (void)rel; (void)out; abort(); }
 void web_avmedia_checkpoint(void) {}
 bool web_avmedia_snapshot_is_probe(void) { return false; }
 void *thread_local_get(unsigned slot) { (void)slot; return NULL; }
@@ -83,6 +85,11 @@ void font_metrics(font_t *f, float px, float *ascent, float *descent, float *lin
     if (ascent) *ascent = px * 0.8f;
     if (descent) *descent = px * 0.2f;
     if (line_gap) *line_gap = 0;
+}
+/* the test face has no OS/2 table: CSS's fallbacks (font.h), the cap height its ascent */
+float font_aspect(font_t *f, int metric) {
+    (void)f;
+    return metric == FONT_ASPECT_CAP_HEIGHT ? 0.8f : metric == FONT_ASPECT_EX_HEIGHT || metric == FONT_ASPECT_CH_WIDTH ? 0.5f : 1;
 }
 bool font_has_primary(font_t *f, uint32_t cp) { (void)f; (void)cp; return true; }
 /* no measurement cache: text_width measures every time */

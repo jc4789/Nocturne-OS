@@ -164,10 +164,14 @@
         delete globalThis[Symbol.toStringTag];
         Object.defineProperty(document,'defaultView',{configurable:true,get(){return host.frame('top',selfToken)===selfToken?globalThis:windowProxy(selfToken);}});
         Object.defineProperty(Document.prototype,'defaultView',{configurable:true,get(){if(rawDom.get(this,'nodeType')!==9)throw new TypeError('Document receiver required');return this===document?document.defaultView:null;}});
+        /* HTML: an auxiliary browsing context is a top-level one with an opener browsing
+           context. Native new windows are independent (never fake opener proxies), there is
+           no window.open, and child browsing contexts have no opener relationship: this
+           browsing context never has an opener, so it is never auxiliary. */
+        const openerContext=null;
+        const scriptCreatedAuxiliary=()=>openerContext!==null && host.frame('top',selfToken)===selfToken;
         Object.defineProperties(globalThis,{
-            // Native new windows are independent, never fake opener proxies.
-            // Child browsing contexts likewise have no opener relationship.
-            opener:{configurable:true,enumerable:true,get(){return null;},set(value){if(value!==null)Object.defineProperty(this,'opener',{value,writable:true,enumerable:true,configurable:true});}},
+            opener:{configurable:true,enumerable:true,get(){return openerContext;},set(value){if(value!==null)Object.defineProperty(this,'opener',{value,writable:true,enumerable:true,configurable:true});}},
             parent:{configurable:true,get(){const token=host.frame('parent',selfToken);return token===selfToken?globalThis:windowProxy(token);}},
             top:{configurable:true,get(){const token=host.frame('top',selfToken);return token===selfToken?globalThis:windowProxy(token);}},
             frameElement:{configurable:true,get(){return access('frameElement',selfToken);}},
@@ -180,5 +184,5 @@
                 get(){if(this!==globalThis)throw new TypeError('Illegal Window receiver');return access('name',selfToken);},
                 set(value){if(this!==globalThis)throw new TypeError('Illegal Window receiver');access('name',selfToken,String(value));}}
         });
-        return {windowProxy,methodOriginal:key=>originalMethods[key],finalizeMethods};
+        return {windowProxy,methodOriginal:key=>originalMethods[key],finalizeMethods,scriptCreatedAuxiliary};
     })();

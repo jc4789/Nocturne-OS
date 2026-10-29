@@ -20,7 +20,17 @@ async function runXHRCases() {
     throws(()=>x.open('TRACE','api/json'),'SecurityError','forbidden method');
     throws(()=>x.open('\u1000','api/json'),'TypeError','bytestring');
     throws(()=>x.open('GET','http://['),'SyntaxError','URL syntax');
-    throws(()=>x.open('GET','api/json',false),'NotSupportedError','sync explicitly unsupported');
+    {   /* XHR open() step 10 and the timeout and responseType setters: a Window's synchronous
+           request is allowed without a timeout or a response type (InvalidAccessError), and
+           send() returns with the response (K112) */
+        const timed=new XMLHttpRequest();timed.timeout=5;
+        throws(()=>timed.open('GET','api/json',false),'InvalidAccessError','sync with a timeout');
+        const sync=new XMLHttpRequest();sync.open('GET','api/json',false);
+        throws(()=>{sync.responseType='text';},'InvalidAccessError','sync response type');
+        throws(()=>{sync.timeout=1;},'InvalidAccessError','sync timeout');
+        sync.send();
+        assert(sync.readyState===4 && sync.status===200 && sync.responseText==='{"ok":true,"value":42}','sync GET text');
+    }
     throws(()=>x.open('GET','api/json',true,'user','password'),'NotSupportedError','credentials explicitly unsupported');
     throws(()=>x.send(),'InvalidStateError','send before open');
     throws(()=>x.setRequestHeader('x','y'),'InvalidStateError','header before open');

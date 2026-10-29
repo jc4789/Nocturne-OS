@@ -3,8 +3,9 @@
 const viewportBridge=(()=>{
     const screens=new WeakSet();
     const value=(screen,index)=>{if(!screens.has(screen))throw new TypeError('Illegal Screen receiver');return host.screen()[index];};
-    class Screen extends EventTarget {
-        constructor(){super();throw new TypeError('Illegal constructor');}
+    // CSSOM View's Screen is no EventTarget: its prototype's prototype is Object.prototype.
+    class Screen {
+        constructor(){throw new TypeError('Illegal constructor');}
         get width(){return value(this,0);}get height(){return value(this,1);}
         get availWidth(){return value(this,2);}get availHeight(){return value(this,3);}
         get availLeft(){value(this,0);return 0;}get availTop(){value(this,0);return 0;}
@@ -13,8 +14,9 @@ const viewportBridge=(()=>{
         get colorDepth(){return value(this,4);}get pixelDepth(){return value(this,4);}
     }
     const screen=Object.create(Screen.prototype);screens.add(screen);
-    Object.defineProperty(globalThis,'screen',{configurable:true,enumerable:true,get(){return screen;}});
-    Object.defineProperty(globalThis,'devicePixelRatio',{configurable:true,enumerable:true,get(){return 1;}});
+    // Window attributes: another receiver than this Window throws (windowReceiver).
+    Object.defineProperty(globalThis,'screen',{configurable:true,enumerable:true,get(){windowReceiver(this);return screen;}});
+    Object.defineProperty(globalThis,'devicePixelRatio',{configurable:true,enumerable:true,get(){windowReceiver(this);return 1;}});
     globalThis.Screen=Screen;
     /* The visual viewport has no scale factor of its own (no pinch zoom) and no classic
        scrollbars here, so it is the layout viewport at the layout viewport's scroll position:
@@ -38,7 +40,7 @@ const viewportBridge=(()=>{
     // [SameObject, Replaceable] (js_webidl.c gives the setter); null while the document is not
     // fully active.
     Object.defineProperty(globalThis,'visualViewport',{configurable:true,enumerable:true,
-        get(){return dom('fullyActive',null)?visualViewport:null;}});
+        get(){windowReceiver(this);return dom('fullyActive',null)?visualViewport:null;}});
     globalThis.VisualViewport=VisualViewport;
     const fire=target=>{const event=new Event('resize');eventState(event).isTrusted=true;dispatch(target,event);};
     return {

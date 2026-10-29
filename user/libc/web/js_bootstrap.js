@@ -3,7 +3,7 @@
     'use strict';
     delete globalThis.__nocturne_host;
     const domOperations=host.domOperations || Object.fromEntries(
-        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'caretPosition', 'caretRect', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'move', 'moveStatus', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rangeRects', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleBlock', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
+        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'boxQuads', 'caretPosition', 'caretRect', 'checkVisibility', 'clone', 'computed', 'convertPoints', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'move', 'moveStatus', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rangeRects', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleBlock', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
     const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
     // Reading never runs custom element reactions: getters go to the native operation directly.
     const domGet=domOperations.get;
@@ -120,9 +120,12 @@
         constructor(type, init = {}) {
             if(!arguments.length)throw new TypeError('Event requires type');
             type=String(type);init=init==null?{}:Object(init);
+            /* mouse: a MouseEvent object, in any realm (DOM dispatch's isActivationEvent). user: a
+               trusted click's own modifier keys, which no page property can change. */
             apply(eventSet,eventStates,[this,{type,bubbles:!!init.bubbles,cancelable:!!init.cancelable,composed:!!init.composed,
                 target:null,currentTarget:null,eventPhase:0,defaultPrevented:false,isTrusted:false,timeStamp:host.now(),
-                stop:false,immediate:false,passive:false,dispatching:false,initialized:true,listenerException:false,path:null}]);
+                stop:false,immediate:false,passive:false,dispatching:false,initialized:true,listenerException:false,path:null,
+                mouse:false,user:null}]);
             eventDefine(this,'isTrusted',{enumerable:true,get(){return eventState(this).isTrusted;}});
         }
         initEvent(type,bubbles=false,cancelable=false) {
@@ -176,10 +179,50 @@
     }
     Object.defineProperty(FocusEvent.prototype,Symbol.toStringTag,{configurable:true,value:'FocusEvent'});
     Object.defineProperty(FocusEvent.prototype,'relatedTarget',Object.assign({},Object.getOwnPropertyDescriptor(FocusEvent.prototype,'relatedTarget'),{enumerable:true}));
+    /* CSSOM View §10 "Extensions to the MouseEvent interface": pageX/pageY, x/y and
+       offsetX/offsetY are attributes of MouseEvent.prototype. A native event records where it
+       occurred relative to the initial containing block (mouseNativePosition); any other is
+       at its clientX/clientY plus this Window's scroll position. offsetX/offsetY are measured
+       while the event is dispatched, from its target's padding edge through GeometryUtils'
+       coordinate conversion (js_geometry_native.h), and kept after it. */
+    const mouseRecords=new WeakMap();
+    function mouseRecord(event){
+        const record=apply(eventGet,mouseRecords,[event]);
+        if(!record)throw new TypeError('Illegal MouseEvent receiver');
+        return record;
+    }
+    function mouseNativePosition(event,x,y){
+        const record=apply(eventGet,mouseRecords,[event]);
+        if(record && typeof x==='number' && typeof y==='number')record.page=[x,y];
+    }
+    function mousePage(event,axis){
+        const record=mouseRecord(event);
+        if(record.page)return record.page[axis];
+        return host.scroll(axis)+(axis?event.clientY:event.clientX);
+    }
+    function mouseOffset(event,axis){
+        const record=mouseRecord(event),state=eventState(event);
+        if(record.offset)return record.offset[axis];
+        const target=state.dispatching?state.target:null;
+        if(target && rawDom.isNode(null,target)){
+            const type=rawDom.get(target,'nodeType');
+            const owner=type===9?target:rawDom.get(target,'ownerDocument');
+            const point=dom('convertPoints',target,owner,1,2,[event.clientX,event.clientY],true);
+            if(typeof point!=='number'){record.offset=[point[0],point[1]];return point[axis];}
+        }
+        return mousePage(event,axis);
+    }
     class MouseEvent extends UIEvent {
-        constructor(t, o = {}) { super(t,o);const defaults={clientX:0, clientY:0, pageX:0, pageY:0,
+        constructor(t, o = {}) { super(t,o);eventState(this).mouse=true;const defaults={clientX:0, clientY:0,
             screenX:0,screenY:0,button:0, buttons:0, relatedTarget:null, ctrlKey:false, shiftKey:false, altKey:false, metaKey:false};
-            o=o==null?{}:Object(o);for(const key of Object.keys(defaults))this[key]=o[key]===undefined?defaults[key]:o[key]; }
+            o=o==null?{}:Object(o);for(const key of Object.keys(defaults))this[key]=o[key]===undefined?defaults[key]:o[key];
+            apply(eventSet,mouseRecords,[this,{page:null,offset:null}]); }
+        get pageX(){return mousePage(this,0);}
+        get pageY(){return mousePage(this,1);}
+        get x(){mouseRecord(this);return this.clientX;}
+        get y(){mouseRecord(this);return this.clientY;}
+        get offsetX(){return mouseOffset(this,0);}
+        get offsetY(){return mouseOffset(this,1);}
         initMouseEvent(type,bubbles=false,cancelable=false,view=null,detail=0,screenX=0,screenY=0,clientX=0,clientY=0,ctrlKey=false,altKey=false,shiftKey=false,metaKey=false,button=0,relatedTarget=null){
             if(!arguments.length)throw new TypeError('initMouseEvent requires type');
             if(eventState(this).dispatching)return;
@@ -187,7 +230,7 @@
             UIEvent.prototype.initUIEvent.call(this,type,bubbles,cancelable,view,detail);
             mouseAssign(this,{screenX:(+screenX)>>0,screenY:(+screenY)>>0,clientX:(+clientX)>>0,clientY:(+clientY)>>0,
                 ctrlKey:!!ctrlKey,altKey:!!altKey,shiftKey:!!shiftKey,metaKey:!!metaKey,button:((+button)<<16)>>16,relatedTarget});
-            this.pageX=this.clientX+host.scroll(0);this.pageY=this.clientY+host.scroll(1);
+            const record=mouseRecord(this);record.page=null;record.offset=null;
         }
         getModifierState(key){return ({Control:this.ctrlKey,Alt:this.altKey,Shift:this.shiftKey,Meta:this.metaKey})[String(key)]||false;}
     }
@@ -571,10 +614,24 @@
             }
         }
     }
+    /* DOM "dispatch". A click MouseEvent's activation target is chosen as its path is (steps 6.4,
+       6.5, 6.9.5.1, 6.9.7.2): the first path item with activation behavior, being the target, a
+       parent it reaches as its own target (a shadow host), or, when it bubbles, any parent. Its
+       legacy-pre-activation behavior runs before the listeners (6.12); after them, with the
+       event's path cleared, its activation behavior when the event was not canceled, else its
+       legacy-canceled-activation behavior (12). The behaviors are js_activation_native.h's. */
     function dispatch(target, event, snapshot) {
         const s=eventState(event);s.dispatching=true;s.target=target;
+        let activationTarget=null,activationRecord;
         try {
         const plan=snapshot && snapshot.entries?snapshot:shadowBridge.path(target,{type:s.type,composed:s.composed,relatedTarget:event.relatedTarget},snapshot),entries=plan.entries;
+        if(s.mouse && s.type==='click'){
+            for(let i=0;i<entries.length && activationTarget===null;i++){
+                const entry=entries[i];
+                if((i===0 || entry.atTarget || s.bubbles) && entry.node!==globalThis && host.activation(0,entry.node))activationTarget=entry.node;
+            }
+            if(activationTarget!==null)activationRecord=host.activation(1,activationTarget);
+        }
         const hasRelated='relatedTarget' in event,relatedState=apply(ownProperty,s,['relatedTarget']);
         // Retarget a FocusEvent's relatedTarget in its Event state, not through its read-only IDL getter.
         // Mouse events still use their existing internal writable field.
@@ -599,10 +656,16 @@
         for(let i=1;i<entries.length && !s.stop;i++)
             if(s.bubbles || entries[i].atTarget)visit(entries[i],false,entries[i].atTarget?2:3);
         s.target=plan.finalTarget;if(hasRelated)related(plan.finalRelated);
-        return !s.defaultPrevented;
         } finally {
             s.path=null;s.currentTarget=null;s.eventPhase=0;s.dispatching=s.passive=s.stop=s.immediate=false;
         }
+        if(activationTarget!==null){
+            if(!s.defaultPrevented){
+                const user=s.user;
+                host.activation(2,activationTarget,event,target,s.isTrusted,!!(user && user.ctrl),!!(user && user.shift));
+            }else if(activationRecord!==undefined)host.activation(3,activationTarget,activationRecord);
+        }
+        return !s.defaultPrevented;
     }
     class Node extends EventTarget {
         constructor() { super(); throw new TypeError('Use document.createElement/createTextNode'); }
@@ -827,6 +890,24 @@
         get clientHeight() { return dom('geometry',this,'clientHeight'); }
         get clientLeft() { return dom('geometry',this,'clientLeft'); }
         get clientTop() { return dom('geometry',this,'clientTop'); }
+        /* CSSOM View checkVisibility(): CheckVisibilityOptions' members in Web IDL order
+           (checkOpacity, checkVisibilityCSS, contentVisibilityAuto, opacityProperty,
+           visibilityProperty); the steps are native (js_geometry_native.h). */
+        checkVisibility(options=undefined) {
+            rawDom.get(this,'elementBrand');
+            if(options!=null && typeof options!=='object' && typeof options!=='function')
+                throw new TypeError('CheckVisibilityOptions must be a dictionary');
+            let flags=0;
+            if(options!=null){
+                const checkOpacity=!!options.checkOpacity,checkVisibilityCSS=!!options.checkVisibilityCSS,
+                    contentVisibilityAuto=!!options.contentVisibilityAuto,opacityProperty=!!options.opacityProperty,
+                    visibilityProperty=!!options.visibilityProperty;
+                flags=(checkOpacity||opacityProperty?1:0)|(checkVisibilityCSS||visibilityProperty?2:0)|(contentVisibilityAuto?4:0);
+            }
+            return dom('checkVisibility',this,flags);
+        }
+        /* CSSOM View: the effective zoom, or 1 when not rendered (native). */
+        get currentCSSZoom() { return dom('geometry',this,'currentCSSZoom'); }
         get style() { return inlineStyle(this); }
         // CSSOM [PutForwards=cssText]: assignment updates the native inline
         // declaration without replacing its SameObject style wrapper.
@@ -860,6 +941,7 @@
     class HTMLElement extends Element {
         constructor() { return customElementsBridge.construct(new.target); }
         get offsetParent() { return dom('geometry',this,'offsetParent'); }
+        get scrollParent() { return dom('geometry',this,'scrollParent'); }
         get offsetLeft() { return dom('geometry',this,'offsetLeft'); }
         get offsetTop() { return dom('geometry',this,'offsetTop'); }
         get offsetWidth() { return dom('geometry',this,'offsetWidth'); }
@@ -894,6 +976,11 @@
         constructor(){return customElementsBridge.construct(new.target,HTMLTemplateElement);}
         get content(){return domGet(this,'templateContent');}
     }
+    function imageBrand(node){
+        rawDom.get(node,'elementBrand');
+        if(rawDom.get(node,'localName')!=='img' || rawDom.get(node,'namespaceURI')!=='http://www.w3.org/1999/xhtml')
+            throw new TypeError('HTMLImageElement receiver required');
+    }
     class HTMLImageElement extends HTMLElement {
         constructor(){return customElementsBridge.construct(new.target,HTMLImageElement);}
         get width() { return domGet(this,'imageWidth'); }
@@ -902,6 +989,10 @@
         set height(v) { dom('set',this,'imageHeight',v); }
         get naturalWidth() { return domGet(this,'imageNaturalWidth'); }
         get naturalHeight() { return domGet(this,'imageNaturalHeight'); }
+        /* CSSOM View §8: the first box's border edge from the initial containing block,
+           ignoring transforms, or 0 without a box (native). */
+        get x() { imageBrand(this);return dom('geometry',this,'imageX'); }
+        get y() { imageBrand(this);return dom('geometry',this,'imageY'); }
         get complete() { return domGet(this,'imageComplete'); }
         get currentSrc() { return domGet(this,'imageCurrentSrc'); }
         get src() {
@@ -1048,19 +1139,7 @@
             try { if(dispatch(this,new Event('reset',{bubbles:true,cancelable:true})))dom('reset',this); }
             finally { formResetting.delete(this); }
         }
-        requestSubmit(submitter){
-            htmlElementBrand(this,'form');
-            if(submitter!=null){
-                const tag=rawDom.get(submitter,'localName'),type=(reflectedAttr(submitter,'type')||'').toLowerCase();
-                if(rawDom.get(submitter,'namespaceURI')!=='http://www.w3.org/1999/xhtml' ||
-                   !(tag==='input' && (type==='submit'||type==='image') || tag==='button' && type!=='reset' && type!=='button'))
-                    throw new TypeError('submitter must be a submit button');
-                if(rawDom.get(submitter,'form:'+tag)!==this)throw new DOMException('submitter belongs to another form','NotFoundError');
-            }
-            const e=new Event('submit',{bubbles:true,cancelable:true});
-            e.submitter=submitter||null;
-            if(dispatch(this,e))dom('submit',submitter||this);
-        }
+        // requestSubmit() is js_form_validation.js's.
     }
     /* @include js_form_named.js */
     class HTMLAnchorElement extends HTMLElement {
@@ -1406,33 +1485,43 @@
     installHandlers(Document.prototype,documentHandlerTypes);
     installHandlers(globalThis,globalHandlerTypes);
     installHandlers(globalThis,windowHandlerTypes);
-    Object.defineProperties(globalThis,{innerWidth:{get(){return dom('viewport',null,0);}},innerHeight:{get(){return dom('viewport',null,1);}}});
+    /* Window is a [Global] interface: its attribute getters and operations throw on another
+       receiver (an operation returning a Promise rejects); an undefined or null this is this
+       global. */
+    const windowReceiver=self=>{if(self!==undefined && self!==null && self!==globalThis)throw new EventTypeError('Illegal Window receiver');};
     // CSSOM View: the window manager does not expose the window position to
     // applications, so it is reported as the screen origin. These are [Replaceable]:
     // js_webidl.c gives every such attribute the Web IDL setter that shadows it with an
-    // ordinary data property, so the bindings define the getters only.
+    // ordinary data property, and the shape (enumerable, configurable) of each member, so the
+    // bindings define the getters only.
     Object.defineProperties(globalThis,Object.getOwnPropertyDescriptors({
-        get outerWidth(){return host.windowSize(0);},get outerHeight(){return host.windowSize(1);},
-        get screenX(){return 0;},get screenLeft(){return 0;},get screenY(){return 0;},get screenTop(){return 0;}}));
-    {/* DOM "Legacy extensions to the Window interface": [Replaceable] readonly attribute
-        (Event or undefined) event, this Window's current event (invokeListener sets it). An
-        undefined this is this global; another receiver is not this Window. */
-     const windowReceiver=self=>{if(self!==undefined && self!==null && self!==globalThis)throw new EventTypeError('Illegal Window receiver');};
-     Object.defineProperties(globalThis,Object.getOwnPropertyDescriptors({
-        get event(){windowReceiver(this);return currentEvent;}}));}
+        get innerWidth(){windowReceiver(this);return dom('viewport',null,0);},
+        get innerHeight(){windowReceiver(this);return dom('viewport',null,1);},
+        get scrollX(){windowReceiver(this);return host.scroll(0);},get pageXOffset(){windowReceiver(this);return host.scroll(0);},
+        get scrollY(){windowReceiver(this);return host.scroll(1);},get pageYOffset(){windowReceiver(this);return host.scroll(1);},
+        get outerWidth(){windowReceiver(this);return host.windowSize(0);},get outerHeight(){windowReceiver(this);return host.windowSize(1);},
+        get screenX(){windowReceiver(this);return 0;},get screenLeft(){windowReceiver(this);return 0;},
+        get screenY(){windowReceiver(this);return 0;},get screenTop(){windowReceiver(this);return 0;},
+        /* DOM "Legacy extensions to the Window interface": [Replaceable] readonly attribute
+           (Event or undefined) event, this Window's current event (invokeListener sets it). */
+        get event(){windowReceiver(this);return currentEvent;}}));
+    /* CSSOM View moveTo()/moveBy()/resizeTo()/resizeBy(): after the Web IDL conversions (two
+       longs: ToNumber, then ToInt32), step 3 returns unless this Window's browsing context is
+       an auxiliary one that a script created (js_frames.js owns that fact). Steps 4-5 would
+       move or resize that window through the window manager, which has no operation for an
+       application to move or resize its window, so such a call takes step 1's "optionally,
+       return". */
+    {const webidlLong=value=>(+value)|0;
+     const windowGeometry=name=>({[name](x,y){
+        windowReceiver(this);
+        if(arguments.length<2)throw new EventTypeError(`${name} requires 2 arguments`);
+        webidlLong(x);webidlLong(y);
+        if(!frameBridge.scriptCreatedAuxiliary())return; // step 3
+        // steps 4-5: see above (step 1)
+     }})[name];
+     for(const name of ['moveTo','moveBy','resizeTo','resizeBy'])
+        Object.defineProperty(globalThis,name,{configurable:true,enumerable:true,writable:true,value:windowGeometry(name)});}
     Object.defineProperty(Document.prototype,'cookie',{get(){return this===document?host.cookie():'';},set(v){v=String(v);if(this===document)host.cookie(v);}});
-    Object.defineProperties(globalThis,{
-        scrollX:{get(){return host.scroll(0);}},pageXOffset:{get(){return host.scroll(0);}},
-        scrollY:{get(){return host.scroll(1);}},pageYOffset:{get(){return host.scroll(1);}}
-    });
-    globalThis.scrollTo=globalThis.scroll=(x,y)=>{
-        if(x && typeof x==='object') host.scroll(x.left===undefined?host.scroll(0):Number(x.left),x.top===undefined?host.scroll(1):Number(x.top));
-        else host.scroll(Number(x)||0,Number(y)||0);
-    };
-    globalThis.scrollBy=(x,y)=>{
-        if(x && typeof x==='object') host.scroll(host.scroll(0)+(Number(x.left)||0),host.scroll(1)+(Number(x.top)||0));
-        else host.scroll(host.scroll(0)+(Number(x)||0),host.scroll(1)+(Number(y)||0));
-    };
     let historyEvent;
     /* @include js_encoding.js */
     /* @include js_url.js */
@@ -1443,6 +1532,8 @@
     /* @include js_importmaps.js */
     /* @include js_hyperlink.js */
     /* @include js_html_elements.js */
+    /* @include js_scroll.js */
+    scrollBridge.install(windowReceiver);
     for(const C of [HTMLBodyElement,HTMLFrameSetElement])installHandlers(C.prototype,windowHandlerTypes);
     /* @include js_html_tables.js */
     /* @include js_xhr.js */
@@ -1541,6 +1632,7 @@
     /* @include js_media.js */
     /* @include js_geometry.js */
     const geometryBridge=geometryInterfaces({parse:host.transformMatrix,list:collectionBridge.typed});
+    /* @include js_geometry_utils.js */
     /* @include js_observers.js */
     /* @include js_mutations.js */
     /* @include js_selection.js */
@@ -1659,10 +1751,10 @@
             const own=ancestry===previous?previousSnapshot:currentSnapshot,other=ancestry===previous?currentSnapshot:previousSnapshot;
             const part={nodes:apply(eventSlice,ancestry,[index]),info:own.info};
             const pointer=new PointerEvent(type.replace('mouse','pointer'),mousePointerInit(mouseAssign({},values,{button:-1})));
-            eventState(pointer).isTrusted=true;
+            eventState(pointer).isTrusted=true;mouseNativePosition(pointer,values.pageX,values.pageY);
             tasks[tasks.length]={event:pointer,target:part.nodes[0],plan:shadowBridge.path(part.nodes[0],pointer,part,other)};
             if(type!=='mousemove'||!suppressCompatibilityMouse){
-                const e=new MouseEvent(type,values);eventState(e).isTrusted=true;
+                const e=new MouseEvent(type,values);eventState(e).isTrusted=true;mouseNativePosition(e,values.pageX,values.pageY);
                 tasks[tasks.length]={event:e,target:part.nodes[0],plan:shadowBridge.path(part.nodes[0],e,part,other)};
             }
         }
@@ -1783,7 +1875,7 @@
         slotChanges(){mutationBridge.signalSlots();},
         dialogRequestClose(node){htmlElementsBridge.requestClose(node);},
         revealHidden:htmlElementsBridge.revealHidden,
-        queueNativeElementScroll:htmlElementsBridge.queueElementScroll,
+        queueNativeElementScroll:scrollBridge.queueElementScroll,
         dialogSubmit(node,result){return htmlElementsBridge.submit(node,result);},
         detailsToggle(target,oldOpen,newOpen){semanticElementsBridge.toggle(target,oldOpen,newOpen);},
         historyEvent(oldURL,popstate){historyEvent(oldURL,popstate);},
@@ -1793,7 +1885,7 @@
         // CSS Font Loading's font loading task (js.c web_js_tick).
         fontsChanged(){fontLoadingBridge.changed();},
         avmediaActivate(node){return avmediaBridge.activate(node);},
-        inertClick(target){return dispatch(target,new MouseEvent('click',{bubbles:true,cancelable:true,composed:true}));},
+        activationForward,
         nodeProtos:[Node.prototype,HTMLDocument.prototype,Element.prototype,HTMLElement.prototype,
             Text.prototype,Comment.prototype,DocumentFragment.prototype,HTMLIFrameElement.prototype,HTMLImageElement.prototype,
             HTMLInputElement.prototype,HTMLButtonElement.prototype,HTMLSelectElement.prototype,HTMLTextAreaElement.prototype,

@@ -9,7 +9,7 @@ const indexedDBBridge=(()=>{
     const invoke=Reflect.apply,wmGet=WeakMap.prototype.get,wmSet=WeakMap.prototype.set,wmHas=WeakMap.prototype.has,wmDelete=WeakMap.prototype.delete;
     const setAdd=Set.prototype.add,setClear=Set.prototype.clear,setValues=Set.prototype.values;
     const setNext=Object.getPrototypeOf(new Set().values()).next;
-    const mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapValues=Map.prototype.values,mapClear=Map.prototype.clear;
+    const mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapValues=Map.prototype.values,mapClear=Map.prototype.clear,mapDelete=Map.prototype.delete;
     const slots=new WeakMap(),connectionSlots=new Map();
     const activeTasks=new Set();
     const records={get:v=>invoke(wmGet,slots,[v]),set:(v,r)=>invoke(wmSet,slots,[v,r]),has:v=>invoke(wmHas,slots,[v])};
@@ -59,7 +59,11 @@ const indexedDBBridge=(()=>{
     /* WebIDL: a dictionary argument is undefined, null (its defaults) or an object. */
     function dictionary(v){if(v==null)return null;if(typeof v!=='object'&&typeof v!=='function')throw new TypeError('The options argument is not an object');return v;}
     function inject(value,path,valueKey){if(!value||typeof value!=='object'||!path||Array.isArray(path))fail('DataError');const parts=path.split('.');for(let i=0;i<parts.length-1;i++){const p=parts[i];if(!Object.hasOwn(value,p))Object.defineProperty(value,p,{value:{},writable:true,enumerable:true,configurable:true});value=value[p];if(!value||typeof value!=='object')fail('DataError');}Object.defineProperty(value,parts[parts.length-1],{value:valueKey,writable:true,enumerable:true,configurable:true});}
+    /* "Check that a key could be injected into a value" (the key generator's key at keyPath). */
+    function injectable(value,path){const parts=path.split('.');for(let i=0;i<parts.length-1;i++){if(!value||typeof value!=='object')return false;if(!Object.hasOwn(value,parts[i]))return true;value=value[parts[i]];}return !!value&&typeof value==='object';}
     function clone(value){return cloneData.deserialize(cloneData.serialize(value,undefined,true),null,true);}
+    /* "Clone a value during a transaction": the transaction is inactive while author getters run. */
+    function cloneDuring(tx,value){const r=get(tx,'IDBTransaction');r.active=false;try{return clone(value);}finally{r.active=true;}}
     async function prefetch(list,tx){
         const r=get(tx,'IDBTransaction');
         if(!r.valueCache)r.valueCache=new Map();
@@ -125,10 +129,15 @@ const indexedDBBridge=(()=>{
     function versionEvent(target,type,oldVersion,newVersion){const e=new IDBVersionChangeEvent(type,{oldVersion,newVersion});eventState(e).isTrusted=true;dispatch(target,e);return e;}
     function live(tx,writing=false){const r=get(tx,'IDBTransaction');if(r.finished||r.committing||!r.active)fail('TransactionInactiveError');if(writing&&r.mode==='readonly')fail('ReadOnlyError');return r;}
     function activate(tx){get(tx,'IDBTransaction').active=true;invoke(setAdd,activeTasks,[tx]);}
+    /* The versionchange events this task fired, acknowledged when it ends (watch): by taskEnd,
+       which both realms' hosts run before their next task, or else by the next task itself. */
+    const firedAtTaskEnd=[];
+    function firedFlush(){while(firedAtTaskEnd.length)firedAtTaskEnd.shift()();}
     function taskEnd(){
         const iterator=invoke(setValues,activeTasks,[]);
         for(;;){const item=invoke(setNext,iterator,[]);if(item.done)break;get(item.value,'IDBTransaction').active=false;}
         invoke(setClear,activeTasks,[]);
+        firedFlush();
     }
     /* The schema names an object store or an index by a fixed id, never by its name, which an
        upgrade can give to another one (a rename, or a delete and a rename onto the name). Records
@@ -192,12 +201,15 @@ const indexedDBBridge=(()=>{
                     if(r.connection===connection&&a[0]===0&&a[2]===true)forceClose(db);
                     else if(r.connection===connection&&a[0]===0&&a[1]!==null){
                         /* A connection whose close is pending gets no versionchange. Either way
-                           the opener learns it has been fired, after this task (a close its
-                           handler began goes to the broker first), and only then may fire
-                           blocked at its request. */
+                           the opener learns it has been fired at the end of this task, after its
+                           microtasks and before any later task of this realm (taskEnd): a close
+                           the handler or its microtasks began goes to the broker first, and the
+                           connection is gone; one a later task makes leaves the opener the
+                           evidence that it was open (webidb_disconnect). Only then may the opener
+                           fire blocked at its request. */
                         if(!r.closed)versionEvent(db,'versionchange',r.version,a[1]===0?null:a[1]);
                         const fired=async()=>{if(retired||r.connection!==connection)return;try{if(await native('fired',connection)===1)later(fired,5);}catch(_){}};
-                        later(fired,0);
+                        firedAtTaskEnd.push(fired);later(firedFlush,0);
                     }
                 }
             }catch(_){/* Broker failure is also delivered to its pending requests. */}
@@ -216,12 +228,97 @@ const indexedDBBridge=(()=>{
     function discard(nativeToken){
         if(nativeToken)try{Promise.resolve(native('abort',nativeToken)).catch(()=>{});}catch(_){}
     }
+    /* "Transaction scheduling" (2.7.2), for the realm's transactions on one database, of every
+       connection to it here, kept in creation order: a read-only transaction starts once no
+       unfinished read/write transaction created before it has an overlapping scope; a read/write
+       one once no unfinished transaction created before it has an overlapping scope and, as the
+       specification lets an implementation add, no other read/write one is running. The running
+       ones share the database's native lease: begun for the first, kept across a read/write
+       commit while others are here (save), given back when none is left (abort, or the commit of
+       the last one). Read-only transactions read the snapshot committed when they started, one
+       object for all of them (none changes it); a read/write transaction changes its own copy,
+       which only it can write. An upgrade transaction is not scheduled here: it runs alone, on
+       its open request's lease. */
+    const schedules=new Map();
+    function scheduleOf(name){
+        let s=invoke(mapGet,schedules,[name]);
+        if(!s){s={name,token:0,bytes:null,shared:null,list:[],writer:null,beginning:false,releasing:false};invoke(mapSet,schedules,[name,s]);}
+        return s;
+    }
+    const overlapping=(a,b)=>a.scope.some(name=>b.scope.includes(name));
+    function startable(s,r){
+        if(r.mode==='readwrite'&&s.writer)return false;
+        for(const other of s.list){if(other===r)return true;if(overlapping(other,r)&&(r.mode==='readwrite'||other.mode==='readwrite'))return false;}
+        return false;
+    }
+    function launch(s){
+        while(!retired&&!s.releasing){
+            const r=s.list.find(x=>x.ready&&!x.started&&startable(s,x));
+            if(!r)return;
+            if(!s.token){if(!s.beginning)lease(s);return;}
+            start(s,r);
+        }
+    }
+    async function lease(s){
+        s.beginning=true;let a;
+        try{a=await native('begin',s.name);}catch(e){s.beginning=false;fault(s,e);return;}
+        s.beginning=false;
+        if(retired||!s.list.length){if(a[0]===0)discard(a[1]);release(s);return;}
+        if(a[0]===1){later(()=>launch(s),5);return;}
+        if(a[0]!==0){try{status(a[0]);}catch(e){fault(s,e);}return;}
+        s.token=a[1];s.bytes=a[2];s.shared=null;
+        launch(s);
+    }
+    /* The lease cannot be had: the transactions waiting for it abort with the error. */
+    function fault(s,error){for(const r of s.list.slice())if(r.ready&&!r.started)abort(r.handle,error);release(s);}
+    const snapshot=bytes=>adopt(bytes===null?{version:0,stores:[]}:unpack(bytes));
+    function start(s,r){
+        r.started=true;r.nativeToken=s.token;
+        try{
+            if(r.mode==='readwrite'){s.writer=r;r.data=snapshot(s.bytes);}
+            else r.data=s.shared||(s.shared=snapshot(s.bytes));
+            if(r.data.version!==r.dbRecord.version)fail('VersionError','Database schema changed');
+            for(const n of r.scope)if(!r.data.stores.some(x=>x.name===n))fail('NotFoundError');
+        }catch(e){abort(r.handle,e);return;}
+        step(r.handle);
+    }
+    /* A scheduled transaction has finished: the next ones start, or the lease goes back. */
+    function leave(r){
+        const s=r.schedule;if(!s)return;
+        r.schedule=null;
+        const i=s.list.indexOf(r);if(i>=0)s.list.splice(i,1);
+        if(s.writer===r)s.writer=null;
+        if(!s.list.length)release(s);else launch(s);
+    }
+    function release(s){
+        if(s.list.length||s.beginning||s.releasing)return;
+        if(s.token){const t=s.token;s.token=0;discard(t);}
+        s.bytes=s.shared=null;
+        if(invoke(mapGet,schedules,[s.name])===s)invoke(mapDelete,schedules,[s.name]);
+    }
+    /* "Connection queue" (2.8.2): the realm's open and delete requests of one name, each run to
+       completion (its request processed) before the next one begins. */
+    const openQueues=new Map();
+    function queued(name,run){
+        let q=invoke(mapGet,openQueues,[name]);if(!q){q=[];invoke(mapSet,openQueues,[name,q]);}
+        const entry={run,done:false};q.push(entry);if(q.length===1)later(run,0);return entry;
+    }
+    function processed(name,entry){
+        if(!entry||entry.done)return;
+        entry.done=true;const q=invoke(mapGet,openQueues,[name]);if(!q)return;
+        const i=q.indexOf(entry);if(i<0)return;
+        q.splice(i,1);
+        if(!q.length)invoke(mapDelete,openQueues,[name]);else if(i===0)later(q[0].run,0);
+    }
     function abort(tx,error){
         const r=get(tx,'IDBTransaction');
         if(r.finished)return;
         r.finished=true;r.active=false;r.error=error||new DOMException('Transaction aborted','AbortError');
         r.valueCache?.clear();
-        discard(r.nativeToken);r.nativeToken=0;
+        /* A scheduled transaction's changes are its own copy's; the lease stays for the others
+           (leave, after its abort event is queued). */
+        const scheduled=!!r.schedule;if(!scheduled)discard(r.nativeToken);
+        r.nativeToken=0;
         r.dbRecord.transactions.delete(tx);
         /* "Abort an upgrade transaction": the connection's version and object store set, and with
            them the view of the upgrade's handles, go back to the database's before the upgrade. The
@@ -238,8 +335,9 @@ const indexedDBBridge=(()=>{
                error does not reach the transaction or the connection), and "open a database
                connection" then answers it with a new AbortError, in a task of its own. */
             if(r.openRequest){const request=get(r.openRequest,'IDBRequest');request.transaction=null;request.result=undefined;request.done=false;
-                later(()=>finish(r.openRequest,undefined,new DOMException('The upgrade transaction was aborted','AbortError')),0);}
+                later(()=>{processed(r.openName,r.openEntry);finish(r.openRequest,undefined,new DOMException('The upgrade transaction was aborted','AbortError'));},0);}
         },0);
+        if(scheduled)leave(r);
     }
     async function complete(tx){
         const r=get(tx,'IDBTransaction');if(r.finished)return;
@@ -251,35 +349,37 @@ const indexedDBBridge=(()=>{
                 status(a[0]);r.dbRecord.connection=a[1];watch();
             }
             if(r.finished)return;
-            if(r.mode==='readonly')status(await native('abort',r.nativeToken));
-            else status(await native('commit',r.nativeToken,pack(r.data),r.data.stores.flatMap(s=>s.records.map(v=>v[1])),r.data.version));
+            const s=r.schedule,refs=()=>r.data.stores.flatMap(x=>x.records.map(v=>v[1]));
+            if(r.mode==='versionchange')status(await native('commit',r.nativeToken,pack(r.data),refs(),r.data.version));
+            else if(r.mode==='readwrite'){
+                /* Others are here: the lease is kept (save) and they read what this wrote. */
+                const bytes=pack(r.data);
+                if(s.list.length>1){status(await native('save',r.nativeToken,bytes,refs(),r.data.version));if(r.finished)return;s.bytes=bytes;s.shared=null;}
+                else{s.releasing=true;let code;try{code=await native('commit',r.nativeToken,bytes,refs(),r.data.version);}finally{s.releasing=false;}
+                    /* A commit that succeeded gave the lease back; a failed one keeps it for the abort. */
+                    if(code===0){s.token=0;s.bytes=s.shared=null;}
+                    status(code);if(r.finished){release(s);return;}}
+            }
+            /* A read-only transaction has nothing to write. */
             if(r.finished)return;
             r.nativeToken=0;r.finished=true;r.dbRecord.version=r.data.version;r.dbRecord.schema=r.data;
             r.valueCache?.clear();
             r.dbRecord.transactions.delete(tx);
+            /* "Open a database connection": a connection closed meanwhile (close() in upgradeneeded)
+               answers the open request with an AbortError, the upgrade committed. */
+            later(()=>{if(r.openRequest)r.dbRecord.upgrade=null;fire(tx,'complete');if(r.openRequest){get(r.openRequest,'IDBRequest').transaction=null;processed(r.openName,r.openEntry);
+                if(r.dbRecord.closed)finish(r.openRequest,undefined,new DOMException('The connection was closed','AbortError'));else finish(r.openRequest,r.db);}},0);
+            /* After its complete event is queued: the ones this let start queue theirs after it. */
+            leave(r);
             closing(r.db);
-            later(()=>{if(r.openRequest)r.dbRecord.upgrade=null;fire(tx,'complete');if(r.openRequest){get(r.openRequest,'IDBRequest').transaction=null;finish(r.openRequest,r.db);}},0);
         }catch(e){abort(tx,e);}
     }
     async function step(tx){
         const r=get(tx,'IDBTransaction');if(r.finished||r.stepping)return;
+        /* A scheduled transaction waits for its turn (launch starts it). */
+        if(r.schedule&&!r.started)return;
         r.stepping=true;r.active=false;
         try{
-            if(!r.nativeToken){
-                const a=await native('begin',r.dbRecord.name);
-                if(r.finished){if(a[0]===0)discard(a[1]);return;}
-                if(a[0]===1){later(()=>step(tx),5);return;}
-                status(a[0]);r.nativeToken=a[1];r.data=adopt(a[2]===null?{version:0,stores:[]}:unpack(a[2]));
-                if(r.mode==='versionchange'){
-                    r.data.version=r.upgradeVersion;activate(tx);
-                    const request=get(r.openRequest,'IDBRequest');request.done=true;request.result=r.db;request.transaction=tx;
-                    versionEvent(r.openRequest,'upgradeneeded',r.oldVersion,r.upgradeVersion);
-                }else{
-                    if(r.data.version!==r.dbRecord.version)fail('VersionError','Database schema changed');
-                    for(const n of r.scope)if(!r.data.stores.some(s=>s.name===n))fail('NotFoundError');
-                }
-            }
-            if(r.finished)return;
             const q=r.queue.shift();
             if(!q){complete(tx);return;}
             r.executing=q;
@@ -304,13 +404,17 @@ const indexedDBBridge=(()=>{
         constructor(t,db,scope,mode,options={}){
             if(t!==token)throw new TypeError('Illegal IDBTransaction constructor');
             super();const dbRecord=get(db,'IDBDatabase');
-            records.set(this,{
-                kind:'IDBTransaction',db,dbRecord,scope:scope.slice(),mode,
+            const record={
+                kind:'IDBTransaction',handle:this,db,dbRecord,scope:scope.slice(),mode,
                 durability:options.durability||'default',active:true,finished:false,
-                committing:false,error:null,queue:[],data:null,nativeToken:0,stores:new Map()
-            });
+                committing:false,error:null,queue:[],data:null,nativeToken:0,stores:new Map(),
+                schedule:null,ready:false,started:false
+            };
+            records.set(this,record);
             activate(this);dbRecord.transactions.add(this);
-            later(()=>{const r=get(this,'IDBTransaction');r.active=false;step(this);},0);
+            if(mode!=='versionchange'){record.schedule=scheduleOf(dbRecord.name);record.schedule.list.push(record);}
+            /* After its creating task it may start (scheduled) or run its requests (an upgrade). */
+            later(()=>{record.active=false;if(record.schedule){record.ready=true;launch(record.schedule);}else step(this);},0);
         }
         get db(){return get(this,'IDBTransaction').db;}
         get mode(){return get(this,'IDBTransaction').mode;}
@@ -360,9 +464,9 @@ const indexedDBBridge=(()=>{
         }
     }
     function rows(source,query){const {list,ofStore}=order(source),[lo,hi]=span(list,ofStore,query),result=[];for(let i=lo;i<hi;i++){const e=list[i],record=ofStore?e:e[1];result.push({key:e[0],primaryKey:record[0],record});}return result;}
-    function write(source,v,provided,hasKey,addOnly){const s=existing(get(source,'IDBObjectStore'));live(s.tx,true);const detached=clone(v),store=storeOf(s);let candidate=provided;
+    function write(source,v,provided,hasKey,addOnly){const s=existing(get(source,'IDBObjectStore'));live(s.tx,true);const detached=cloneDuring(s.tx,v),store=storeOf(s);let candidate=provided;
         if(store.keyPath!==null){if(hasKey)fail('DataError');candidate=path(detached,store.keyPath);}
-        let initial;if(candidate===undefined){if(!store.autoIncrement)fail('DataError');}else initial=key(candidate);
+        let initial;if(candidate===undefined){if(!store.autoIncrement)fail('DataError');if(store.keyPath!==null&&!injectable(detached,store.keyPath))fail('DataError');}else initial=key(candidate);
         return storeRecord(s,source,detached,initial,addOnly);
     }
     /* "delete records from an object store": the operation of a store's delete and a cursor's. */
@@ -378,7 +482,7 @@ const indexedDBBridge=(()=>{
         return enqueue(s.tx,source,async r=>{const st=storeOf(s);let k=initial;if(k===undefined){if(st.generator>9007199254740992)fail('ConstraintError');k=st.generator;if(st.keyPath!==null)inject(detached,st.keyPath,k);}const at=insertion(st.records,k),exists=at<st.records.length&&!compare(st.records[at][0],k);if(addOnly&&exists)fail('ConstraintError');
             /* A unique index refuses a key another record (another primary key) has in it. */
             const indexes=[];for(const index of present){const keys=indexKeys(index,detached);indexes.push([index.id,keys]);if(index.unique){const list=indexOrder(st,index);for(const ik of keys)for(let i=seek(list,false,ik,undefined,false);i<list.length&&!compare(list[i][0],ik);i++)if(compare(list[i][1][0],k))fail('ConstraintError');}}
-            const staged=await native('stage',r.nativeToken,pack(cloneData.serialize(detached,undefined,true)));status(staged[0]);if(r.finished)return;const record=[k,staged[1],indexes];reorder(st,exists?st.records[at]:null,record);if(exists)st.records[at]=record;else st.records.splice(at,0,record);if(st.autoIncrement&&typeof k==='number'&&k>=st.generator)st.generator=Math.floor(k)+1;return clone(k);});
+            const staged=await native('stage',r.nativeToken,pack(cloneData.serialize(detached,undefined,true)));status(staged[0]);if(r.finished)return;const record=[k,staged[1],indexes];reorder(st,exists?st.records[at]:null,record);if(exists)st.records[at]=record;else st.records.splice(at,0,record);if(st.autoIncrement&&typeof k==='number'&&k>=st.generator)st.generator=Math.floor(k)>=9007199254740992?Infinity:Math.floor(k)+1;return clone(k);});
     }
     /* The query steps of a store or index handle: "has been deleted" (InvalidStateError) first, then
        "not active" (TransactionInactiveError), then the query's conversion. */
@@ -535,15 +639,16 @@ const indexedDBBridge=(()=>{
         get source(){return get(this,'IDBCursor').source;}
         get direction(){return get(this,'IDBCursor').direction;}
         get request(){return get(this,'IDBCursor').request;}
-        get key(){const r=get(this,'IDBCursor');return r.position?clone(r.position.key):undefined;}
-        get primaryKey(){const r=get(this,'IDBCursor');return r.position?clone(r.position.primaryKey):undefined;}
+        /* The same object every time until the cursor's position changes (its key's value). */
+        get key(){const p=get(this,'IDBCursor').position;if(!p)return undefined;if(p.keyValue===undefined)p.keyValue=clone(p.key);return p.keyValue;}
+        get primaryKey(){const p=get(this,'IDBCursor').position;if(!p)return undefined;if(p.primaryKeyValue===undefined)p.primaryKeyValue=clone(p.primaryKey);return p.primaryKeyValue;}
         continue(k){iterate(this,k,undefined,1,false);}
         advance(n){if(!arguments.length)throw new TypeError('Count required');n=enforceCount(n);if(n===0)throw new TypeError('Invalid advance count');iterate(this,undefined,undefined,n,false);}
         continuePrimaryKey(k,p){iterate(this,k,p,1,true);}
         /* Not active, read-only, source or effective store deleted, no got value, key only; then
            the clone, and with in-line keys the key the clone yields must be the effective key
            (DataError). The request's source is the cursor. The value is a required argument. */
-        update(v){const r=get(this,'IDBCursor'),s=records.get(r.source);if(!arguments.length)throw new TypeError('Value required');live(s.tx,true);existing(s);if(r.pending||!r.position||!(this instanceof IDBCursorWithValue))fail('InvalidStateError');const detached=clone(v),store=records.get(effectiveStore(r)),st=storeOf(store);
+        update(v){const r=get(this,'IDBCursor'),s=records.get(r.source);if(!arguments.length)throw new TypeError('Value required');live(s.tx,true);existing(s);if(r.pending||!r.position||!(this instanceof IDBCursorWithValue))fail('InvalidStateError');const detached=cloneDuring(s.tx,v),store=records.get(effectiveStore(r)),st=storeOf(store);
             if(st.keyPath!==null&&compare(key(path(detached,st.keyPath)),r.position.primaryKey))fail('DataError');
             return storeRecord(store,this,detached,r.position.primaryKey,false);}
         delete(){const r=get(this,'IDBCursor'),s=records.get(r.source);live(s.tx,true);existing(s);if(r.pending||!r.position||!(this instanceof IDBCursorWithValue))fail('InvalidStateError');return enqueue(s.tx,this,deleteRecords(records.get(effectiveStore(r)),range(r.position.primaryKey)));}
@@ -580,25 +685,29 @@ const indexedDBBridge=(()=>{
            it (deleted), and requests placed before still run against it. */
         deleteObjectStore(name){const r=get(this,'IDBDatabase');name=strings(name);if(!r.upgrade)fail('InvalidStateError');const tx=live(r.upgrade,true);const i=tx.data.stores.findIndex(s=>s.name===name);if(i<0)fail('NotFoundError');tx.data.stores.splice(i,1);}
     }
-    function open(name,version,deleting=false){name=strings(name);if(version!==undefined){version=Number(version);if(!Number.isSafeInteger(version)||version<=0)throw new TypeError('Invalid database version');}
+    /* version is [EnforceRange] unsigned long long (finite, truncated, 0 to 2^53-1), and not 0. */
+    function open(name,version,deleting=false){name=strings(name);if(version!==undefined){version=Number(version);if(!Number.isFinite(version))throw new TypeError('Invalid database version');version=Math.trunc(version);if(version<0||version>Number.MAX_SAFE_INTEGER)throw new TypeError('Invalid database version');if(version===0)throw new TypeError('The database version is 0');}
         /* "obtain a storage key": failure throws now, before a request exists. */
         if(typeof storageKey==='function'&&!storageKey())throw new DOMException('Storage is not available to this origin','SecurityError');
-        const request=new IDBOpenDBRequest(token);let blocked=false;
+        const request=new IDBOpenDBRequest(token);let blocked=false,entry=null;
+        /* The request is processed: the next one in its connection queue may run. */
+        const done=()=>processed(name,entry);
         async function attempt(){let a;try{a=await native('begin',name);if(retired){if(a[0]===0)discard(a[1]);return;}if(a[0]===1){later(attempt,5);return;}status(a[0]);const data=adopt(a[2]===null?{version:0,stores:[]}:unpack(a[2])),wanted=deleting?0:version===undefined?data.version||1:version;
-                if(!deleting&&wanted<data.version){await native('abort',a[1]);finish(request,undefined,new DOMException('Requested version is older','VersionError'));return;}
+                if(!deleting&&wanted<data.version){await native('abort',a[1]);done();finish(request,undefined,new DOMException('Requested version is older','VersionError'));return;}
                 const list=connections.get(name)||[];
                 /* versionchange goes to every other open connection (each realm's poll fires it);
                    blocked waits until all of them were fired, then fires once if any is still
                    open; the open goes on when none is. active: [status, open, not yet fired]. */
                 if(deleting||wanted>data.version){const active=await native('connections',a[1],deleting?0:wanted);if(active[0]===1){await native('abort',a[1]);later(attempt,5);return;}status(active[0]);if(active[1]){await native('abort',a[1]);if(!blocked&&!active[2]){blocked=true;versionEvent(request,'blocked',data.version,deleting?null:wanted);}later(attempt,50);return;}}
-                if(deleting){status(await native('commit',a[1],pack({version:0,stores:[]}),[],0));const rr=get(request,'IDBRequest');rr.done=true;rr.result=undefined;rr.error=null;versionEvent(request,'success',data.version,null);return;}
+                if(deleting){status(await native('commit',a[1],pack({version:0,stores:[]}),[],0));const rr=get(request,'IDBRequest');rr.done=true;rr.result=undefined;rr.error=null;done();versionEvent(request,'success',data.version,null);return;}
                 let connection=0;if(wanted===data.version){const c=await native('connect',a[1],wanted);if(c[0]===1){await native('abort',a[1]);later(attempt,5);return;}status(c[0]);connection=c[1];}const db=new IDBDatabase(token,name,data);get(db,'IDBDatabase').connection=connection;list.push(db);connections.set(name,list);watch();
                 /* "Upgrade a database": the connection's object store set is the upgrade's snapshot,
-                   whose version is the new one; before keeps what an abort gives back. */
-                if(wanted>data.version){const tx=new IDBTransaction(token,db,[],'versionchange'),r=get(tx,'IDBTransaction'),d=get(db,'IDBDatabase');r.nativeToken=a[1];r.before=outline(data);r.data=data;r.oldVersion=data.version;r.upgradeVersion=wanted;r.openRequest=request;d.upgrade=tx;d.version=wanted;r.data.version=wanted;activate(tx);const rr=get(request,'IDBRequest');rr.result=db;rr.done=true;rr.transaction=tx;const e=versionEvent(request,'upgradeneeded',r.oldVersion,wanted);if(eventState(e).listenerException)abort(tx,new DOMException('Upgrade listener threw','AbortError'));}
-                else {status(await native('abort',a[1]));finish(request,db);}
-            }catch(e){if(a?.[1])discard(a[1]);finish(request,undefined,e);}}
-        later(attempt,0);return request;
+                   whose version is the new one; before keeps what an abort gives back. The open
+                   request is processed when the upgrade transaction has finished. */
+                if(wanted>data.version){const tx=new IDBTransaction(token,db,[],'versionchange'),r=get(tx,'IDBTransaction'),d=get(db,'IDBDatabase');r.nativeToken=a[1];r.before=outline(data);r.data=data;r.oldVersion=data.version;r.upgradeVersion=wanted;r.openRequest=request;r.openName=name;r.openEntry=entry;d.upgrade=tx;d.version=wanted;r.data.version=wanted;activate(tx);const rr=get(request,'IDBRequest');rr.result=db;rr.done=true;rr.transaction=tx;const e=versionEvent(request,'upgradeneeded',r.oldVersion,wanted);if(eventState(e).listenerException)abort(tx,new DOMException('Upgrade listener threw','AbortError'));}
+                else {status(await native('abort',a[1]));done();finish(request,db);}
+            }catch(e){if(a?.[1])discard(a[1]);done();finish(request,undefined,e);}}
+        entry=queued(name,attempt);return request;
     }
     class IDBFactory {constructor(t){if(t!==token)throw new TypeError('Illegal IDBFactory constructor');}open(name,version){if(!arguments.length)throw new TypeError('Database name required');return open(name,version);}deleteDatabase(name){if(!arguments.length)throw new TypeError('Database name required');return open(name,undefined,true);}cmp(a,b){if(arguments.length<2)throw new TypeError('Two keys required');return compare(key(a),key(b));}databases(){return new Promise((resolve,reject)=>{async function attempt(){try{const a=await native('databases');if(a[0]===1){later(attempt,5);return;}status(a[0]);resolve(a[1]);}catch(e){reject(e);}}later(attempt,0);});}}
     indexedDBHandlerTarget=(v,type)=>{const r=records.get(v);return !!r&&(r.kind==='IDBRequest'&&(['success','error'].includes(type)||v instanceof IDBOpenDBRequest&&['blocked','upgradeneeded'].includes(type))||r.kind==='IDBDatabase'&&['abort','error','versionchange','close'].includes(type)||r.kind==='IDBTransaction'&&['abort','complete','error'].includes(type));};

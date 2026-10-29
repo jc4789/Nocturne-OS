@@ -2210,13 +2210,19 @@ static struct web_js_state *geometry_owner(struct web_js_state *s,web_doc *d) {
        !web_frame_same_origin(s->doc,d))return NULL;
     return owner;
 }
+/* The viewport's largest scroll position on axis (0 horizontal, 1 vertical): its scrolling
+   area less the viewport. */
+static double viewport_scroll_limit(web_doc *d,int axis) {
+    double limit=axis?(double)d->doc_h-d->height:
+        MAX(d->doc_w,d->root_box?d->root_box->scroll_w:0)-(double)d->width;
+    return isfinite(limit)&&limit>0?MIN(limit,(double)INT_MAX):0;
+}
 static bool viewport_scroll_to(struct web_js_state *s,double x,double y) {
     web_doc *d=s->doc;
     if(!isfinite(x))x=0;
     if(!isfinite(y))y=0;
-    double content_w=MAX(d->doc_w,d->root_box?d->root_box->scroll_w:0);
-    int a=(int)MIN(MAX(x,0),MIN((double)INT_MAX,MAX(0,content_w-d->width)));
-    int b=(int)MIN(MAX(y,0),MIN((double)INT_MAX,(double)MAX(0,d->doc_h-d->height)));
+    int a=(int)MIN(MAX(x,0),viewport_scroll_limit(d,0));
+    int b=(int)MIN(MAX(y,0),viewport_scroll_limit(d,1));
     struct web_frame *f=d->frame_element?web_frame_find(d->frame_parent,d->frame_element):NULL;
     int old_x,old_y;viewport_scroll_position(s,&old_x,&old_y);
     if(f){if(f->scroll_x!=a || f->scroll_y!=b){
@@ -2234,6 +2240,28 @@ static box_t *geometry_principal_box(node_t *n) {
     if (b && b->kind == B_ATOMIC && b->first && b->first->node == n &&
         (b->first->kind == B_FLEX || b->first->kind == B_GRID || b->first->kind == B_TABLE)) return b->first;
     return b;
+}
+/* CSSOM View "scrollingElement": the root element, or in quirks mode the body element
+   when it is not potentially scrollable. */
+static node_t *scrolling_element(web_doc *d) {
+    if (!d->quirks) return d->html;
+    return d->body && element_viewport(d, d->body) ? d->body : NULL;
+}
+/* CSSOM View HTMLElement "scrollParent": the nearest scroll container along the flat tree's
+   containing blocks (the box tree's cb chain), else the scrollingElement at the initial
+   containing block. */
+static node_t *scroll_parent(web_doc *d, node_t *n) {
+    box_t *b = n->box;
+    if (!b || n == d->html || n == d->body || box_viewport_fixed(b)) return NULL;
+    for (box_t *a = b->cb; ; a = a->cb) {
+        if (!a || a == d->root_box) {
+            node_t *e = scrolling_element(d);
+            return e && !geometry_closed_shadow_hidden(e, n) ? e : NULL;
+        }
+        if (box_element_scrollable(a) && !geometry_closed_shadow_hidden(a->node, n)) return a->node;
+        /* a fixed box whose containing block is the viewport: nothing it scrolls with */
+        if (box_viewport_fixed(a)) return NULL;
+    }
 }
 static JSValue geometry(struct web_js_state *s, node_t *n, const char *property) {
     JSContext *ctx = s->ctx;
@@ -2259,6 +2287,29 @@ static JSValue geometry(struct web_js_state *s, node_t *n, const char *property)
         else if(b)doc_element_scroll_metrics(d,n,&w,&h);
         double v=ceil(!strcmp(property,"scrollWidth")?w:h);
         return JS_NewInt32(ctx,(int32_t)MIN(MAX(v,0),INT_MAX));
+    }
+    if(!strcmp(property,"scrollBox")) {
+        /* CSSOM View element scrolling: 2 when the element's scrolls are the viewport's (the
+           root element; the quirks-mode body that is not potentially scrollable), 1 when it has
+           its own scrolling box with overflow, 0 when they do nothing (no box, no overflow, the
+           quirks-mode root element). */
+        if(!visible || (d->quirks && n==d->html))return JS_NewInt32(ctx,0);
+        if(element_viewport(d,n))return JS_NewInt32(ctx,2);
+        return JS_NewInt32(ctx,doc_element_scroll_max(d,n,0)>0 || doc_element_scroll_max(d,n,1)>0?1:0);
+    }
+    if(!strcmp(property,"scrollMaxLeft") || !strcmp(property,"scrollMaxTop"))
+        return JS_NewFloat64(ctx,b?doc_element_scroll_max(d,n,!strcmp(property,"scrollMaxTop")):0);
+    if(!strcmp(property,"scrollParent"))return wrap(s,b?scroll_parent(d,n):NULL);
+    /* CSSOM View currentCSSZoom: the product of the element's and its flat-tree ancestors'
+       zoom, 1 when it is not rendered. This engine has no zoom property (cssprop.c's table),
+       so every effective zoom is 1. */
+    if(!strcmp(property,"currentCSSZoom"))return JS_NewFloat64(ctx,1);
+    if(!strcmp(property,"imageX") || !strcmp(property,"imageY")) {
+        /* HTMLImageElement x/y: the first box's border edge from the initial containing block,
+           ignoring transforms; zero without a box. */
+        double first[4],bounds[4],v=0;
+        if(b && element_offset_metrics(n,first,bounds))v=first[!strcmp(property,"imageY")];
+        return JS_NewInt32(ctx,(int32_t)MIN(MAX(round(v),INT32_MIN),INT32_MAX));
     }
     node_t *parent = b ? offset_parent(owner,n) : NULL;
     if (!strcmp(property, "offsetParent")) return wrap(s, parent);
@@ -2434,8 +2485,20 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     style_t anchored; struct css_anchor anchored_group;
     if (pseudo == PE_NONE && n->box && box_anchor_style(n->box, &anchored, &anchored_group)) st = &anchored;
     if(property[0]=='-'&&property[1]=='-') {
-        const struct custom_prop *p=css_custom_property(st,property);
-        return JS_NewString(ctx,p&&p->value?p->value:"");
+        /* css-properties-values-api-1 §2.4: a registered property's computed value, its initial
+           value when it has none, its own value only when it does not inherit */
+        const char *value=css_custom_value(d,st,property);
+        /* Typed OM (§6.2) reifies a typed one by the syntax component its computed value is:
+           [value, the component's type name or ident, its multiplier] */
+        const struct css_syntax_component *c=cascade&&value?css_custom_component(d,property,value):NULL;
+        if(!c)return JS_NewString(ctx,value?value:"");
+        char multiplier[2]={c->multiplier,0};
+        JSValue typed=JS_NewArray(ctx);
+        if(JS_IsException(typed))return typed;
+        if(JS_SetPropertyUint32(ctx,typed,0,JS_NewString(ctx,value))<0||
+           JS_SetPropertyUint32(ctx,typed,1,JS_NewString(ctx,css_syntax_type_name(c)))<0||
+           JS_SetPropertyUint32(ctx,typed,2,JS_NewString(ctx,multiplier))<0){JS_FreeValue(ctx,typed);return JS_EXCEPTION;}
+        return typed;
     }
     if (cascade) {
         /* the longhands the property table stores whole serialize their computed value */
@@ -3109,6 +3172,32 @@ static void navigate_form_request(struct web_js_state *s, node_t *submitter) {
     if(sandbox_authority(s)&SB_FORMS){log_text(s,1,"Sandbox denied form submission");return;}
     web_form_navigate(s->doc,submitter);
 }
+bool web_form_submit(web_doc *d, node_t *submitter) {
+    if (submitter && submitter->owner) d = submitter->owner;
+    if (!d || !submitter || submitter->type != N_ELEM || submitter->foreign) return false;
+    node_t *form = submitter->tag == T_form ? submitter : web_form_owner(d, submitter);
+    if (!form || form->type != N_ELEM || form->foreign || form->tag != T_form) return false;
+    /* 1. "If form cannot navigate, then return": not connected, or not fully active. */
+    if (!doc_node_connected(form) || !web_doc_fully_active(d)) return false;
+    /* 2. Constructing its entry list. 4. The sandboxed forms browsing context flag. */
+    if (form->constructing_form_entries) return false;
+    if (!web_sandbox_forms_allowed(d)) { web_js_console(d, 1, "Sandbox denied form submission"); return false; }
+    /* 5. Not from submit(): the firing-submission-events guard, interactive validation (the
+       no-validate state is the form's or the submitter's), and the submit event. */
+    if (form->firing_submission_events) return false;
+    form->firing_submission_events = true;
+    bool go = web_form_submission_validate(d, submitter);
+    if (go) {
+        struct web_event e = {.type = "submit", .bubbles = true, .cancelable = true,
+            .submitter = submitter != form && web_control_submit_button(submitter) ? submitter : NULL};
+        go = web_js_dispatch(d, form, &e);
+    }
+    form->firing_submission_events = false;
+    /* 5.9 Listeners may have removed the form or replaced the document. */
+    if (!go || form->owner != d || !doc_node_connected(form) || !web_doc_fully_active(d)) return false;
+    web_form_navigate(d, submitter);
+    return true;
+}
 #include "js_document_commands.h"
 #include "js_cssom.h"
 #include "js_fonts.h"
@@ -3366,6 +3455,7 @@ static bool dom_authority_denied(struct web_js_state *s, web_doc *d) {
     return !s->starting && ((sandbox_authority(s)&SB_SCRIPTS) ||
        (sandbox_actor(s)->doc->sandbox_flags && sandbox_actor(s)->doc!=d));
 }
+#include "js_geometry_native.h"
 static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int opcode) {
     struct web_js_state *s = state(ctx); web_doc *d = s->doc;
     if (argc < 2) return JS_ThrowTypeError(ctx, "DOM operation requires a receiver");
@@ -3409,7 +3499,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
     }
     if(!n){switch(opcode){
-    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_rangeRects: case DOM_caretPosition: case DOM_caretRect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_styleBlock: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
+    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_boxQuads: case DOM_convertPoints: case DOM_checkVisibility: case DOM_rangeRects: case DOM_caretPosition: case DOM_caretRect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_styleBlock: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
         result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");goto dom_complete;
     default:break;
     }}
@@ -3892,25 +3982,32 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                 (nearest=JS_ToBool(ctx,argv[4]))<0)result=JS_EXCEPTION;
         else if(block<0 || block>3 || inline_<0 || inline_>3)result=JS_ThrowTypeError(ctx,"Invalid scroll alignment");
         else {
+            /* The plan of "scroll a target into view": [viewport x, viewport y, then each
+               scrolling box innermost first as element, x, y]. The caller performs the scrolls;
+               an empty array: nothing is rendered. */
             result=JS_NewArray(ctx);
             web_doc *owner=n->owner;struct web_js_state *target=owner?owner->js:NULL;
             if(!JS_IsException(result) && target && !target->disabled && owner->live && connected(target,n)) {
                 flush_layout(target);
                 int x,y;viewport_scroll_position(target,&x,&y);double vx=x,vy=y;
-                pvec changed={0};
-                int status=doc_element_scroll_into_view(owner,n,block,inline_,nearest,&vx,&vy,&changed);
+                struct doc_scroll_target *plan=NULL;int count=0;
+                int status=doc_element_scroll_into_view(owner,n,block,inline_,nearest,&vx,&vy,&plan,&count);
                 if(status<0){JS_FreeValue(ctx,result);result=status==-1?oom(ctx):
                     JS_ThrowRangeError(ctx,status==-2?"Invalid scroll ancestor cycle":"Scroll result exceeds its native index representation");}
                 else if(status>0){
-                    viewport_scroll_to(target,vx,vy);
-                    for(int i=0;i<changed.n;i++){
-                        JSValue node=wrap(s,changed.v[i]);
-                        if(JS_IsException(node) || JS_SetPropertyUint32(ctx,result,(uint32_t)i,node)<0){
-                            JS_FreeValue(ctx,result);result=JS_EXCEPTION;break;
+                    uint32_t at=0;
+                    if(JS_SetPropertyUint32(ctx,result,at++,JS_NewFloat64(ctx,vx))<0 ||
+                       JS_SetPropertyUint32(ctx,result,at++,JS_NewFloat64(ctx,vy))<0){JS_FreeValue(ctx,result);result=JS_EXCEPTION;}
+                    for(int i=0;i<count && !JS_IsException(result);i++){
+                        JSValue node=wrap(s,plan[i].node);
+                        if(JS_IsException(node) || JS_SetPropertyUint32(ctx,result,at++,node)<0 ||
+                           JS_SetPropertyUint32(ctx,result,at++,JS_NewFloat64(ctx,plan[i].x))<0 ||
+                           JS_SetPropertyUint32(ctx,result,at++,JS_NewFloat64(ctx,plan[i].y))<0){
+                            JS_FreeValue(ctx,result);result=JS_EXCEPTION;
                         }
                     }
                 }
-                pv_free(&changed);
+                free(plan);
             }
         }
 
@@ -4069,6 +4166,14 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             } else result=n->custom_is?JS_NewString(ctx,n->custom_is):JS_NULL;
         } else result=JS_ThrowTypeError(ctx,"Unknown custom metadata key");
         JS_FreeCString(ctx,key);
+    } break;
+    case DOM_boxQuads: result=geometry_box_quads_value(s,n,argc,argv); break;
+    case DOM_convertPoints: result=geometry_convert_value(s,n,argc,argv); break;
+    case DOM_checkVisibility: {
+        int32_t flags=0;
+        if(!n || n->type!=N_ELEM)result=JS_ThrowTypeError(ctx,"Element receiver required");
+        else if(argc>2 && JS_ToInt32(ctx,&flags,argv[2])<0)result=JS_EXCEPTION;
+        else result=JS_NewBool(ctx,geometry_check_visibility(s,n,flags));
     } break;
     case DOM_rect: {
         bool fragments=argc>2 && JS_ToBool(ctx,argv[2])>0;
@@ -5152,8 +5257,14 @@ static JSValue native_scroll(JSContext *ctx, JSValueConst this_val, int argc, JS
         viewport_scroll_to(s,a,b);
         return JS_UNDEFINED;
     }
-    viewport_scroll_position(s,&x,&y);
     int32_t axis = 0; if (argc && JS_ToInt32(ctx, &axis, argv[0])) return JS_EXCEPTION;
+    if (axis == 2 || axis == 3) {
+        /* the viewport's largest scroll positions, for a scroll that clamps before it moves */
+        if (s->disabled || !s->doc->live) return JS_NewInt32(ctx, 0);
+        flush_layout(s);
+        return JS_NewInt32(ctx, (int32_t)viewport_scroll_limit(s->doc, axis - 2));
+    }
+    viewport_scroll_position(s,&x,&y);
     return JS_NewInt32(ctx, axis ? y : x);
 }
 /* Native URL ownership follows actual length; the native wire uses uint32_t.
@@ -5372,82 +5483,21 @@ static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, 
     else if (s->host.navigate) s->host.navigate(s->host.opaque,&navigation);
     js_free(ctx, url); return JS_UNDEFINED;
 }
-/* Capture the native activation path before author listeners can reparent
-   the clicked descendant. The event target itself remains the clicked node. */
-static node_t *native_click_anchor(web_doc *d, node_t *target) {
-    return web_link_activation_anchor(d, target);
-}
-static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+/* HTML click(): a disabled form control or a click already in progress does nothing; otherwise
+   "fire a synthetic pointer event named click" with the not trusted flag, whose dispatch runs
+   the activation (js_activation_native.h). */
+static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
     struct web_js_state *s = state(ctx); node_t *n = argc ? unwrap(ctx, argv[0]) : NULL;
     if (!n) return JS_EXCEPTION;
     if((sandbox_authority(s)&SB_SCRIPTS) || (sandbox_borrowed(s) && n->owner!=sandbox_actor(s)->doc))
         return history_security_error(ctx,"Sandbox denied borrowed activation authority");
-    if (n->owner && n->owner->inert) {
-        JSValue args[] = {argv[0], JS_NewString(ctx, "click")};
-        JSValue value = custom_element_hook(s, "inertClick", 2, args);
-        JS_FreeValue(ctx, args[1]); return value;
-    }
-    if (web_control_disabled(n)) return JS_UNDEFINED;
-    node_t *anchor = native_click_anchor(s->doc, n);
-    struct web_event e = {.type="click", .bubbles=true, .cancelable=true, .synthetic=true};
-    struct web_control_activation activation;
-    web_control_activation_begin(s->doc, n, &activation);
-    bool allowed = web_js_dispatch(s->doc, n, &e);
-    bool input_events = web_control_activation_end(s->doc, &activation, allowed);
-    if (!allowed) return JS_UNDEFINED;
-    e.synthetic = false; /* default-action input/change/submit events are UA generated */
-    if (s->doc->resources_dirty) doc_rescan(s->doc);
-    node_t *label_control = anchor ? NULL : web_label_activation(n);
-    if (label_control && !web_control_disabled(label_control)) {
-        web_js_focus_control(s->doc, label_control);
-        JSValue argument = wrap(s, label_control);
-        JSValue result = JS_IsException(argument) ? argument : native_click(ctx, this_val, 1, &argument);
-        JS_FreeValue(ctx, argument); return result;
-    }
-    node_t *disclosure=anchor ? NULL : doc_details_activation(n);
-    if (disclosure) doc_details_toggle(s->doc,disclosure);
-    else if (!anchor && (n->tag == T_audio || n->tag == T_video)) web_media_activate(s->doc, n);
-    else if (anchor) {
-        if(node_attr(anchor,"download") && (sandbox_authority(s)&SB_DOWNLOADS))return JS_UNDEFINED;
-        struct web_hit action = {0};
-        if (web_link_action(s->doc, anchor, &action) && permitted_url(s, action.href, false)) {
-            web_doc *top=s->doc;while(top->frame_parent)top=top->frame_parent;
-            if(!web_frame_navigate(top,anchor,action.href,s->doc->sandbox_activation_until>uptime_ms()) && s->host.navigate){
-                /* The document follows the hyperlink as a click the user made does (frame.c:
-                   its target chooses the navigable), with its own activation; the top-level
-                   one is the host's. */
-                struct web_navigation navigation={.url=action.href,.history=WEB_NAVIGATE_PUSH};
-                web_navigation_source(s->doc,anchor,&navigation);
-                s->host.navigate(s->host.opaque,&navigation);
-            }
-        }
-    } else if (n->tag == T_input) {
-        const char *type = node_attr(n, "type");
-        if (type && (str_ieq(type, "checkbox") || str_ieq(type, "radio"))) {
-            if (input_events) { e.type = "input"; e.cancelable = false;  web_js_dispatch(s->doc, n, &e); e.type = "change";  web_js_dispatch(s->doc, n, &e); } s->doc->dirty = true;
-        } else if (type && (str_ieq(type, "submit") || str_ieq(type, "image"))) {
-            node_t *form = web_form_owner(s->doc, n); e.type = "submit";
-            e.submitter=n;
-            if (form && web_sandbox_forms_allowed(s->doc) && web_form_submission_validate(s->doc,n) && web_js_dispatch(s->doc, form, &e)) {
-                navigate_form_request(s,n);
-            }
-        } else if (type && str_ieq(type,"reset")) web_reset(s->doc,n);
-    } else if (n->tag == T_button) {
-        const char *type = node_attr(n, "type"); node_t *form = web_form_owner(s->doc, n);
-        if (type && str_ieq(type,"reset")) web_reset(s->doc,n);
-        else if (form && web_control_submit_button(n) && web_sandbox_forms_allowed(s->doc)) { e.type = "submit"; e.submitter=n; if (web_form_submission_validate(s->doc,n) && web_js_dispatch(s->doc, form, &e)) navigate_form_request(s,n); }
-    }
-    return JS_UNDEFINED;
-}
-static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    node_t *n = argc ? unwrap(ctx, argv[0]) : NULL;
-    if (!n) return JS_EXCEPTION;
-    if (n->click_in_progress) return JS_UNDEFINED;
+    if (web_control_disabled(n) || n->click_in_progress) return JS_UNDEFINED;
     n->click_in_progress = true;
-    JSValue result = native_click_impl(ctx, this_val, argc, argv);
-    n->click_in_progress = false;
-    return result;
+    struct web_event e = {.type="click", .bubbles=true, .cancelable=true, .synthetic=true};
+    web_js_dispatch(s->doc, n, &e);
+    n->click_in_progress = false; /* nodes are their document's allocations */
+    return JS_UNDEFINED;
 }
 static void release_timer(struct web_js_state *s, unsigned index) {
     /* Unpublish before releasing references. Never retain a slot pointer across
@@ -5577,6 +5627,7 @@ static JSValue native_cancel_post(JSContext *ctx, JSValueConst this_val, int arg
     }
     return JS_UNDEFINED;
 }
+#include "js_activation_native.h"
 /* Native idle-task source: no timer alias, no allocation until requested, and
    every callback reference/queue node uses the QuickJS allocator. */
 static struct js_idle_task *take_idle(struct js_idle_task **first, struct js_idle_task **last, uint32_t id) {
@@ -5651,6 +5702,39 @@ static JSValue native_transform_matrix(JSContext *ctx, JSValueConst this_val, in
     JS_SetPropertyUint32(ctx, result, 1, JS_NewBool(ctx, two_d));
     return result;
 }
+/* css-properties-values-api-1 §4.1 registerProperty(): [name, syntax, inherits, initialValue or
+   undefined] → 0 registered, 1 a SyntaxError, 2 an InvalidModificationError (already registered) */
+static JSValue native_css_register_property(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
+    (void)this_val;struct web_js_state *s=state(ctx);
+    if(argc<3)return JS_ThrowTypeError(ctx,"registerProperty requires a definition");
+    const char *name=JS_ToCString(ctx,argv[0]);if(!name)return JS_EXCEPTION;
+    const char *syntax=JS_ToCString(ctx,argv[1]);if(!syntax){JS_FreeCString(ctx,name);return JS_EXCEPTION;}
+    bool inherits=JS_ToBool(ctx,argv[2]);
+    const char *initial=NULL;
+    if(argc>3&&!JS_IsUndefined(argv[3])&&!(initial=JS_ToCString(ctx,argv[3]))) {
+        JS_FreeCString(ctx,name);JS_FreeCString(ctx,syntax);return JS_EXCEPTION;
+    }
+    int status=s->doc?css_register_property(s->doc,name,syntax,inherits,initial):CSS_REGISTER_SYNTAX;
+    JS_FreeCString(ctx,name);JS_FreeCString(ctx,syntax);if(initial)JS_FreeCString(ctx,initial);
+    if(status==CSS_REGISTER_MEMORY)return oom(ctx);
+    return JS_NewInt32(ctx,status==CSS_REGISTER_OK?0:status==CSS_REGISTER_DUPLICATE?2:1);
+}
+struct computed_custom_list {
+    JSContext *ctx; web_doc *doc; JSValue result; uint32_t index; unsigned work; int failure;
+};
+static bool computed_custom_entry(void *arg,const char *name,const char *value) {
+    struct computed_custom_list *l=arg;JSContext *ctx=l->ctx;
+    if(!(l->work++&63)&&!web_native_checkpoint(l->doc)){l->failure=1;return false;}
+    if(l->index==UINT32_MAX){l->failure=2;return false;}
+    JSValue entry=JS_NewArray(ctx);
+    if(JS_IsException(entry)){l->failure=3;return false;}
+    if(JS_SetPropertyUint32(ctx,entry,0,JS_NewString(ctx,name))<0||
+       JS_SetPropertyUint32(ctx,entry,1,JS_NewBool(ctx,value!=NULL))<0) {
+        JS_FreeValue(ctx,entry);l->failure=3;return false;
+    }
+    if(JS_SetPropertyUint32(ctx,l->result,l->index++,entry)<0){l->failure=3;return false;}
+    return true;
+}
 static JSValue native_css_properties(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     (void)this_val;JSValue result=JS_NewArray(ctx);if(JS_IsException(result))return result;
     if(argc) {
@@ -5664,17 +5748,14 @@ static JSValue native_css_properties(JSContext *ctx,JSValueConst this_val,int ar
         style_t fallback;style_t *style=computed_pseudo_style(node,computed_pseudo(pseudo),&fallback);
         JS_FreeCString(ctx,pseudo);
         if(!style){JS_FreeValue(ctx,result);return JS_NULL;}
-        uint32_t index=0;unsigned work=0;
-        for(const struct custom_prop *p=style->vars;p;p=p->next) {
-            if(!(work++&63)&&!web_native_checkpoint(owner->doc)){JS_FreeValue(ctx,result);return JS_ThrowInternalError(ctx,"Computed style enumeration interrupted");}
-            if(index==UINT32_MAX){JS_FreeValue(ctx,result);return JS_ThrowRangeError(ctx,"Computed CSS property index overflow");}
-            JSValue entry=JS_NewArray(ctx);
-            if(JS_IsException(entry)){JS_FreeValue(ctx,result);return entry;}
-            if(JS_SetPropertyUint32(ctx,entry,0,JS_NewString(ctx,p->name))<0||
-               JS_SetPropertyUint32(ctx,entry,1,JS_NewBool(ctx,p->value!=NULL))<0) {
-                JS_FreeValue(ctx,entry);JS_FreeValue(ctx,result);return JS_EXCEPTION;
-            }
-            if(JS_SetPropertyUint32(ctx,result,index++,entry)<0){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
+        /* the element's custom properties with their registrations applied (css-properties-values-api-1
+           §2.4): the registered ones it has no value of take their initial values */
+        struct computed_custom_list list={ctx,owner->doc,result,0,0,0};
+        if(!css_custom_values(owner->doc,style,computed_custom_entry,&list)) {
+            JS_FreeValue(ctx,result);
+            if(list.failure==1)return JS_ThrowInternalError(ctx,"Computed style enumeration interrupted");
+            if(list.failure==2)return JS_ThrowRangeError(ctx,"Computed CSS property index overflow");
+            return list.failure==3?JS_EXCEPTION:oom(ctx);
         }
         return result;
     }
@@ -5687,16 +5768,17 @@ static JSValue native_css_properties(JSContext *ctx,JSValueConst this_val,int ar
         }
         if(JS_SetPropertyUint32(ctx,result,(uint32_t)i,entry)<0){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
     }
-    /* the legacy name aliases: CSSOM attributes of their own, never computed longhands */
-    uint32_t index=(uint32_t)css_prop_count();
-    for(int i=0;css_prop_legacy_alias(i);i++) {
+    /* the legacy name aliases (font-stretch): their attributes reach the property under its own name, and
+       they are no computed longhands of their own (CSSOM §6.7.1) */
+    const char *alias;
+    for(int i=0;(alias=css_prop_legacy_alias_at(i,NULL));i++) {
         JSValue entry=JS_NewArray(ctx);
         if(JS_IsException(entry)){JS_FreeValue(ctx,result);return entry;}
-        if(JS_SetPropertyUint32(ctx,entry,0,JS_NewString(ctx,css_prop_legacy_alias(i)))<0||
-           JS_SetPropertyUint32(ctx,entry,1,JS_FALSE)<0) {
+        if(JS_SetPropertyUint32(ctx,entry,0,JS_NewString(ctx,alias))<0||
+           JS_SetPropertyUint32(ctx,entry,1,JS_NewBool(ctx,false))<0) {
             JS_FreeValue(ctx,entry);JS_FreeValue(ctx,result);return JS_EXCEPTION;
         }
-        if(JS_SetPropertyUint32(ctx,result,index++,entry)<0){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
+        if(JS_SetPropertyUint32(ctx,result,(uint32_t)(css_prop_count()+i),entry)<0){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
     }
     return result;
 }
@@ -8952,7 +9034,9 @@ bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *event) 
         return web_js_dispatch(target->owner,target,&local);
     }
     struct web_js_state *s = d ? d->js : NULL;
-    if (!s || s->disabled || !event || !event->type || JS_IsUndefined(s->dispatch)) return true;
+    /* No realm runs listeners: a click still has its activation. */
+    if (!s || s->disabled || JS_IsUndefined(s->dispatch)) return activation_dispatch_native(d, target, event);
+    if (!event || !event->type) return true;
     if(!event->synthetic && target && web_dialog_inert(d,target) &&
        (!strncmp(event->type,"key",3) || !strncmp(event->type,"mouse",5) || !strcmp(event->type,"click") || !strcmp(event->type,"dblclick"))) return false;
     if(!target && !event->synthetic && !strncmp(event->type,"key",3) && web_dialog_top(d)) target=web_dialog_top(d);
@@ -10210,7 +10294,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("windowHandler", 5, native_window_handler),
         JS_CFUNC_DEF("eventRealmInit", 2, native_event_realm_init), JS_CFUNC_DEF("customElementAgent", 2, native_custom_element_agent), JS_CFUNC_DEF("eventRealm", 1, native_event_realm),
         JS_CFUNC_DEF("eventActive", 2, native_event_active),
-        JS_CFUNC_DEF("click", 1, native_click), JS_CFUNC_DEF("timer", 4, native_timer), JS_CFUNC_DEF("clear", 1, native_clear),
+        JS_CFUNC_DEF("click", 1, native_click), JS_CFUNC_DEF("activation", 7, native_activation), JS_CFUNC_DEF("timer", 4, native_timer), JS_CFUNC_DEF("clear", 1, native_clear),
         JS_CFUNC_DEF("microtask", 1, native_microtask),
         JS_CFUNC_DEF("postTask", 1, native_post_task), JS_CFUNC_DEF("cancelPost", 1, native_cancel_post),
         JS_CFUNC_DEF("broadcast", 3, native_broadcast),
@@ -10219,6 +10303,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("cssSupports", 2, native_css_supports),
         JS_CFUNC_DEF("fonts", 4, native_fonts),
         JS_CFUNC_DEF("cssProperties", 1, native_css_properties),
+        JS_CFUNC_DEF("cssRegisterProperty", 4, native_css_register_property),
         JS_CFUNC_DEF("transformMatrix", 1, native_transform_matrix),
         JS_CFUNC_DEF("storage", 5, native_storage),
         JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("socketOpen", 3, native_socket_open),

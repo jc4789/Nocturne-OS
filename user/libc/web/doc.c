@@ -506,11 +506,14 @@ static int add_image_request(web_doc *d, const char *rel, bool css, bool retry_f
     int result=add_image_url(d,abs,retry_failed,preferred,image_upgrade,cors,referrer_policy);free(abs);return result;
 }
 static int add_image(web_doc *d, const char *rel, bool css) { return add_image_request(d, rel, css, false, -1,true,WEB_IMAGE_NO_CORS,WEBNET_REFERRER_DEFAULT); }
-int doc_css_image(web_doc *d, const struct css_image *image) {
+/* a CSS <image>'s url() in the document's images: cors WEB_IMAGE_NO_CORS (background-image,
+   list-style-image), or a CORS request's credentials mode (mask images, css-masking-1 §7.1: cors
+   mode, same-origin credentials; a response that fails the check is not drawn) */
+int doc_css_image(web_doc *d, const struct css_image *image, int cors) {
     if (!d || !image || image->kind != CSS_IMAGE_URL) return -1;
     struct css_image *cached = (struct css_image *)image; /* the value's cache of its document image */
     if (!cached->img) {
-        int i = add_image(d, image->url, true);
+        int i = add_image_request(d, image->url, true, false, -1, cors == WEB_IMAGE_NO_CORS, cors, WEBNET_REFERRER_DEFAULT);
         cached->img = i >= 0 ? i + 1 : -1;
     }
     return cached->img > 0 ? cached->img - 1 : -1;
@@ -1059,6 +1062,7 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
     /* HTML "activate history entry" (and "initialize the navigable" for a new navigable's
        first document) sets the initial visibility state to the traversable's system visibility
        state: the host's for a top-level document, the one its top document holds for a frame. */
+    if(host)d->host=*host;
     if(host && host->window_state){d->window_state=host->window_state;d->window_opaque=host->opaque;}
     if(parent){web_doc *top=parent;while(top->frame_parent)top=top->frame_parent;d->visible=top->system_visible;}
     else d->visible=d->system_visible=!d->window_state || (d->window_state(d->window_opaque)&WEB_WINDOW_VISIBLE);
@@ -1562,12 +1566,13 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
         if(!strcmp(e->type,"keydown"))focus_keyboard_input(input,e);
         else if(!strcmp(e->type,"mousedown")||!strcmp(e->type,"pointerdown"))input->focus_modality=WEB_MODALITY_POINTER;
     }
-    /* WHATWG image-button activation: capture the selected point in the
-       displayed image before click listeners can replace layout or reparent
-       it. Only an uncanceled explicit coordinate selection updates it;
-       keyboard/script activation retains the initially-zero selected point.
-       Padding/border clicks may yield negative CSS coordinates, not 0-clamped
-       bitmap pixels. No extra layout flush or mutable author getter is used. */
+    /* HTML image button: "if the user activated the control while explicitly selecting a
+       coordinate", the point in the displayed image, captured before click listeners can
+       replace layout or reparent it. The click's activation behavior (js_activation_native.h)
+       makes it the selected coordinate, only when the click is not canceled; keyboard and
+       script activation keep the initially-zero one. Padding/border clicks may yield negative
+       CSS coordinates, not 0-clamped bitmap pixels. No extra layout flush or mutable author
+       getter is used. */
     web_doc *owner=target?target->owner:NULL;bool image_point=false;int selected_x=0,selected_y=0;
     if(e&&e->type&&!strcmp(e->type,"click")&&!e->synthetic&&!e->keyboard_activation&&
        target&&target->type==N_ELEM&&!target->foreign&&target->tag==T_input&&
@@ -1589,17 +1594,19 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
     bool trace_wheel=d->profile_enabled && e && e->type && !strcmp(e->type,"wheel");
     unsigned target_tag=trace_wheel&&target?target->tag:0;
     uint64_t window_blocking=trace_wheel?(target&&target->owner?target->owner:d)->wheel_window_blocking:0;
+    node_t *saved_image=NULL;int saved_x=0,saved_y=0;
+    if(image_point){
+        saved_image=owner->image_activation;saved_x=owner->image_activation_x;saved_y=owner->image_activation_y;
+        owner->image_activation=target;owner->image_activation_x=selected_x;owner->image_activation_y=selected_y;
+    }
     bool allowed=web_js_dispatch(d,target,e);
+    if(image_point){owner->image_activation=saved_image;owner->image_activation_x=saved_x;owner->image_activation_y=saved_y;}
     if(trace_wheel) {
         char message[256];snprintf(message,sizeof message,
             "Native wheel default: allowed %d, cancelable %d, delta %.0f, tag %u, window-blocking %llu, coherent %d/ready %d, viewport %d/%d, view %d, style %d/boxes %d",
             allowed,e->cancelable,(double)e->delta_y,target_tag,(unsigned long long)window_blocking,
             scroll_input_coherent(d),web_native_input_ready(d,false),d->doc_h,d->height,d->view_y,d->need_style,d->need_boxes);
         web_js_console(d,1,message);
-    }
-    if(allowed&&image_point&&target->owner==owner&&owner->live&&
-       web_input_type(target)==WEB_INPUT_IMAGE&&web_form_owner(owner,target)){
-        target->image_submit_x=selected_x;target->image_submit_y=selected_y;
     }
     return allowed;
 }
@@ -1686,6 +1693,7 @@ static void doc_release(web_doc *d) {
     layout_cache_free(d);
     css_styles_release(d);
     css_styling_free(&d->sty);
+    css_registrations_free(&d->sty);
     web_dialog_free(d);
     web_avmedia_free(d);
     /* The frames' documents are released here, before this realm, and keep their nodes and
@@ -1926,17 +1934,23 @@ static void bg_images(web_doc *d, style_t *st) {
         int i = add_image(d, st->bg_image, true);
         st->bg_img = i >= 0 ? i + 1 : 0;
     }
-    if (st && st->mask_image && !st->mask_img) {
-        int i = add_image(d, st->mask_image, true);
-        st->mask_img = i >= 0 ? i + 1 : 0;
+    /* the mask layers' images (css-masking-1 §7.1): CORS requests; a url() naming an element of the
+       document itself is no fetch */
+    const struct css_mask *mask = st ? css_style_mask(st) : NULL;
+    for (uint32_t layer = 0; mask && layer < mask->image.n; layer++) {
+        const struct css_image *image = mask->image.v[layer];
+        if (image && image->kind == CSS_IMAGE_URL && !image->img && !doc_url_local(d, image->url))
+            doc_css_image(d, image, WEB_IMAGE_ANONYMOUS);
     }
-    /* border-image-source and mask-border-source: the same images, fetched and decoded once */
+    /* border-image-source and mask-border-source (CORS, as mask images: css-masking-1 §8.1): the same
+       images, fetched and decoded once */
     if (st && st->border_image && st->border_image->source.url && !st->border_image_img) {
         int i = add_image(d, st->border_image->source.url, true);
         st->border_image_img = i >= 0 ? i + 1 : 0;
     }
     if (st && st->mask_border && st->mask_border->source.url && !st->mask_border_img) {
-        int i = add_image(d, st->mask_border->source.url, true);
+        int i = add_image_request(d, st->mask_border->source.url, true, false, -1, false, WEB_IMAGE_ANONYMOUS,
+                                  WEBNET_REFERRER_DEFAULT);
         st->mask_border_img = i >= 0 ? i + 1 : 0;
     }
 }
@@ -2241,6 +2255,12 @@ bool doc_element_scroll(web_doc *d, node_t *n, double x, double y) {
     return element_scroll_commit(d, n, n->box, x, y);
 }
 
+double doc_element_scroll_max(web_doc *d, node_t *n, int axis) {
+    if (!doc_element_scroll_metrics(d, n, NULL, NULL) || !box_element_scrollable(n->box) ||
+        n == d->html) return 0;
+    return element_scroll_limit(n->box, axis ? 1 : 0);
+}
+
 static void element_scroll_input_unqueue(node_t *n) {
     web_doc *old = n->scroll_input_owner;
     if (old) {
@@ -2508,8 +2528,9 @@ static bool scroll_target_rect(node_t *n, double r[4]) {
 }
 
 int doc_element_scroll_into_view(web_doc *d, node_t *n, int block, int inline_, bool nearest_only,
-                                double *x, double *y, pvec *changed) {
-    if (!d || !n || !x || !y || !changed || changed->v || changed->n || changed->cap ||
+                                double *x, double *y, struct doc_scroll_target **targets, int *count_out) {
+    if (count_out) *count_out = 0;
+    if (!d || !n || !x || !y || !targets || *targets || !count_out ||
         block < DOC_SCROLL_START || block > DOC_SCROLL_NEAREST ||
         inline_ < DOC_SCROLL_START || inline_ > DOC_SCROLL_NEAREST || n->type != N_ELEM ||
         n->owner != d || !d->live || d->inert || !doc_node_connected(n) ||
@@ -2534,28 +2555,43 @@ int doc_element_scroll_into_view(web_doc *d, node_t *n, int block, int inline_, 
         }
     }
     if (!scroll_target_rect(n, target)) return 0;
+    struct doc_scroll_target *out = NULL;
+    double *from = NULL;
     if (count) {
-        if ((size_t)count > SIZE_MAX / sizeof *changed->v) return -3;
-        changed->v = malloc((size_t)count * sizeof *changed->v);
-        if (!changed->v) return -1;
-        changed->cap = count;
+        if ((size_t)count > SIZE_MAX / sizeof *out / 2) return -3;
+        out = malloc((size_t)count * sizeof *out);
+        from = malloc((size_t)count * 2 * sizeof *from);
+        if (!out || !from) { free(out); free(from); return -1; }
     }
+    int used = 0;
+    bool viewport = !fixed;
     for (box_t *a = first; a; a = a->cb) {
         if (!box_element_scrollable(a)) continue;
-        if (!scroll_target_rect(n, target)) return 1;
+        if (!scroll_target_rect(n, target)) { viewport = false; break; }
         double left = box_visual_x(a) - a->p[3], top = box_visual_y(a) - a->p[0];
         double dx = scroll_align_delta(target[0], target[0] + target[2], left, a->w + a->p[1] + a->p[3], inline_);
         double dy = scroll_align_delta(target[1], target[1] + target[3], top, a->h + a->p[0] + a->p[2], block);
-        if (doc_element_scroll(d, a->node, a->node->scroll_x + dx, a->node->scroll_y + dy))
-            changed->v[changed->n++] = a->node;
-        if (nearest_only) return 1;
+        node_t *e = a->node;
+        double old_x = e->scroll_x, old_y = e->scroll_y;
+        /* Each outer box is aligned as if this one already had its position. */
+        if (doc_element_scroll(d, e, e->scroll_x + dx, e->scroll_y + dy)) {
+            out[used] = (struct doc_scroll_target){e, e->scroll_x, e->scroll_y};
+            from[2 * used] = old_x; from[2 * used + 1] = old_y; used++;
+        }
+        if (nearest_only) { viewport = false; break; }
     }
-    if (!fixed && scroll_target_rect(n, target)) {
+    if (viewport && scroll_target_rect(n, target)) {
         /* This document's real viewport only. There is no traversal through a
            fabricated frame parent or access to a different-origin document. */
         *x += scroll_align_delta(target[0], target[0] + target[2], *x, d->width, inline_);
         *y += scroll_align_delta(target[1], target[1] + target[3], *y, d->height, block);
     }
+    /* Put every box back: performing the scrolls (and their events) is the caller's. */
+    for (int i = used; i-- > 0;) { out[i].node->scroll_x = from[2 * i]; out[i].node->scroll_y = from[2 * i + 1]; }
+    if (used) { d->visual_revision++; doc_paint_full(d); }
+    free(from);
+    if (!used) { free(out); out = NULL; }
+    *targets = out; *count_out = used;
     return 1;
 }
 

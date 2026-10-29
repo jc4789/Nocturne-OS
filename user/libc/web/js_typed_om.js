@@ -824,8 +824,33 @@ function typedOMInterfaces(options){
     }
     function mapValues(r,name){
         const text=r.kind==='declared'?declarations.read(r.block,name):declarations.computed(r.element,name);
+        if(Array.isArray(text))return reifyRegistered(name,text[0],text[1],text[2]);
         if(text===''&&(r.kind==='declared'||name.startsWith('--')))return null;
         return reifyValue(name,text,r.kind==='computed');
+    }
+    /* css-properties-values-api-1 §6.2 "reify a registered custom property value": a typed registered
+       property's computed value by the syntax component it matched (type: its data type name, or an
+       ident component's ident; multiplier: '', '+' or '#'), each item of a list on its own */
+    const REGISTERED_NUMERIC={'<length>':CALC.length,'<integer>':CALC.number,'<number>':CALC.number,'<angle>':CALC.angle,
+        '<time>':CALC.time,'<resolution>':CALC.resolution,'<percentage>':CALC.percent,'<length-percentage>':CALC.length|CALC.percent};
+    function reifyRegistered(name,text,type,multiplier){
+        const items=multiplier==='#'?splitList(text):multiplier==='+'?native.typedComponents(text).map(p=>p[0]==='function'?p[2]:p[1]):[text];
+        return items.map(item=>{
+            item=typeof item==='string'?item.trim():item;
+            const parts=native.typedComponents(item);
+            if(type in REGISTERED_NUMERIC){
+                const accept=REGISTERED_NUMERIC[type],v=reifyNumeric(item,accept,true,zeroUnitOf(accept));
+                if(v)return v;
+            }else if(type==='<transform-list>'||type==='<transform-function>'){
+                const v=reifyTransform(parts,true);
+                if(v)return v;
+            }else if(type==='<image>'){
+                return make(CSSImageValue,{kind:'image',text:item,property:name});
+            }else if(!type.startsWith('<')||type==='<custom-ident>'){
+                if(parts.length===1&&parts[0][0]==='ident')return keyword(parts[0][1]);
+            }
+            return styleValue(item,name);
+        });
     }
     function mapNames(r){return r.kind==='declared'?declarations.names(r.block):declarations.computedNames(r.element);}
     const declaredMaps=new WeakMap(),computedMaps=new WeakMap();

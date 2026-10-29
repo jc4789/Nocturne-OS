@@ -2,7 +2,7 @@
  * supplies WebIDL brands, live objects, reflection and submission events. */
 const formValidationBridge=(() => {
     const define=Object.defineProperty,create=Object.create;
-    const validityOwners=new WeakMap(),validityObjects=new WeakMap(),submitters=new WeakMap(),submitting=new WeakSet();
+    const validityOwners=new WeakMap(),validityObjects=new WeakMap(),submitters=new WeakMap();
     const controls=[['input',HTMLInputElement],['button',HTMLButtonElement],['select',HTMLSelectElement],
         ['textarea',HTMLTextAreaElement],['fieldset',HTMLFieldSetElement],['object',HTMLObjectElement],['output',HTMLOutputElement]];
     const flags=['valueMissing','typeMismatch','patternMismatch','tooLong','tooShort','rangeUnderflow','rangeOverflow','stepMismatch','badInput','customError'];
@@ -86,14 +86,10 @@ const formValidationBridge=(() => {
             if(!dom('validation',submitter,'submitButton'))throw new TypeError('submitter must be a submit button');
             if(rawDom.get(submitter,'form:'+tag)!==this)throw new DOMException('submitter belongs to another form','NotFoundError');
         }
-        if(host.sandboxFlags(this)&32)return;
-        if(submitting.has(this))return;
-        submitting.add(this);
-        try{
-            if(!dom('validation',submitter||this,'submission'))return;
-            const event=new SubmitEvent('submit',{bubbles:true,cancelable:true,submitter:submitter||null});
-            if(dispatch(this,event))dom('submit',submitter||this);
-        }finally{submitting.delete(this);}
+        /* HTML "submit" from submitter, or from the form itself: the sandbox, the
+           firing-submission-events guard, interactive validation, the SubmitEvent and the
+           navigation are js.c web_form_submit's (js_activation_native.h). */
+        host.activation(4,this,submitter==null?this:submitter);
     });
     Object.assign(globalThis,{ValidityState,SubmitEvent});
     return {ValidityState,SubmitEvent,validity};

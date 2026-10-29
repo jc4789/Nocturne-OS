@@ -32,7 +32,7 @@ static const struct decl_case declarations[] = {
     {"gap","nonsense",false}, {"gap","1px nonsense",false}, {"gap","1px 2px 3px",false},
     {"padding","1px 2px 3px 4px 5px",false}, {"inset","nonsense",false},
     {"overflow","nonsense",false}, {"text-decoration","nonsense",false},
-    {"background-image","nonsense()",false}, {"background-image","url(a),url(b)",false},
+    {"background-image","nonsense()",false}, {"background-image","url(a),url(b)",true}, /* <bg-image># */
     {"display","ruby",false}, {"text-wrap-mode","balance",false},
     {"color","var(test, red)",false}, {"color","var(--, red)",false},
     {"color","var(--test extra, red)",false}, {"color","var(--test",false},

@@ -223,7 +223,7 @@ int web_presentation_request(web_doc *d,node_t *n,int kind,const struct web_host
         for(web_doc *at=d;at;at=at->frame_parent){at->fullscreen_element=element;changed(at,element);element=at->frame_element;}}
     else{top->pip_owner=d;d->pip_element=n;events->session=++d->pip_session;events->width=d->pip_width;events->height=d->pip_height;changed(d,n);}
     events_publish(events);
-    if(consume_activation){top->sandbox_activation_until=0;for(struct web_frame *f=top->frames;f;f=web_frame_walk_next(top,f,true))if(f->document)f->document->sandbox_activation_until=0;}
+    if(consume_activation)web_user_activation_consume(top);
     return WEB_PRESENT_OK;
 }
 bool web_presentation_exit(web_doc *d,int kind){
@@ -280,7 +280,7 @@ struct web_direct {struct web_webgl *gl;uint64_t serial;bool shown;int rect[4];}
 /* Nothing of the element's own box is painted around, over or through its content. */
 static bool direct_plain(const box_t *b){
     const style_t *s=b->st;
-    if(!s||s->visibility||s->opacity<1||s->filter||s->backdrop_filter||s->box_shadow||s->mask_image||s->animated)return false;
+    if(!s||s->visibility||s->opacity<1||s->filter||s->backdrop_filter||s->box_shadow||css_mask_layers_set(css_style_mask(s))||s->animated)return false;
     if(s->bg_color>>24||s->has_grad||s->bg_image||s->outline_width>0)return false;
     for(int i=0;i<4;i++){if(b->b[i]>0)return false;
         for(int axis=0;axis<2;axis++)if(s->corner_radius[i].axis[axis].kind!=LK_AUTO&&len_resolve(&s->corner_radius[i].axis[axis],axis?b->h:b->w)!=0)return false;}

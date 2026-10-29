@@ -42,9 +42,13 @@ static int mask_performance(void){
 static int image_association(void){
     style_t parent,style;css_style_init(&parent,NULL);
     parent.bg_image="https://image.test/parent.svg";parent.bg_img=13;
-    parent.mask_image="https://image.test/parent-mask.svg";parent.mask_img=14;
+    /* the mask layers' group: its images carry their document images (css_image's img) */
+    struct css_image parent_mask_image={.kind=CSS_IMAGE_URL,.url="https://image.test/parent-mask.svg",.img=14};
+    const struct css_image *parent_mask_list=&parent_mask_image;
+    struct css_mask parent_mask=css_mask_initial;parent_mask.image=(struct css_layer_images){&parent_mask_list,1};
+    parent.mask=&parent_mask;
     css_style_init(&style,&parent);
-    check(!style.bg_image&&!style.bg_img&&!style.mask_image&&!style.mask_img,"non-inherited image values do not borrow registered parent handles");
+    check(!style.bg_image&&!style.bg_img&&!css_mask_layers_set(css_style_mask(&style)),"non-inherited image values do not borrow registered parent handles");
     arena_t arena={0};uint8_t property_bits[css_prop_count()];memset(property_bits,0,sizeof property_bits);
     struct cx cx={.s=&style,.parent=&parent,.em=16,.rem=16,.vw=800,.vh=600,.a=&arena,.set=property_bits};
     const struct propdef *bg=css_prop_lookup("background-image",16),*mask=css_prop_lookup("mask-image",10);
@@ -60,11 +64,13 @@ static int image_association(void){
     style.bg_img=21;memset(property_bits,0,sizeof property_bits);
     check(css_apply(bg,"none",4,&cx)&&!style.bg_image&&!style.bg_img&&!style.gradient&&!style.has_grad,"background none clears the registered handle too");
     memset(property_bits,0,sizeof property_bits);
-    check(css_apply(mask,"inherit",7,&cx)&&style.mask_image==parent.mask_image&&style.mask_img==14,"explicit inherited mask keeps its real association");
+    check(css_apply(mask,"inherit",7,&cx)&&css_style_mask(&style)->image.n==1&&css_style_mask(&style)->image.v[0]==&parent_mask_image&&
+          css_style_mask(&style)->image.v[0]->img==14,"explicit inherited mask keeps its real association");
     memset(property_bits,0,sizeof property_bits);
-    check(css_apply(mask,url,strlen(url),&cx)&&style.mask_image&&!style.mask_img,"replacement mask URL invalidates prior association");
-    style.mask_img=22;memset(property_bits,0,sizeof property_bits);
-    check(css_apply(mask,"none",4,&cx)&&!style.mask_image&&!style.mask_img,"mask none cannot retain a native icon handle");
+    check(css_apply(mask,url,strlen(url),&cx)&&css_style_mask(&style)->image.n==1&&css_style_mask(&style)->image.v[0]&&
+          !css_style_mask(&style)->image.v[0]->img,"replacement mask URL invalidates prior association");
+    memset(property_bits,0,sizeof property_bits);
+    check(css_apply(mask,"none",4,&cx)&&!css_mask_layers_set(css_style_mask(&style)),"mask none cannot retain a native icon handle");
     ar_free(&arena);printf("image-association-host: %d checks, %d failures\n",checks,failed);return failed!=0;
 }
 int main(int argc,char **argv){

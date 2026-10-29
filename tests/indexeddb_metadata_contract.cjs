@@ -13,6 +13,8 @@ function hostIDB(op,a,b,c){
     if(op==='value')return d.values.has(b)?[0,v8.deserialize(v8.serialize(d.values.get(b)))]:[3,null];
     if(op==='values')return b.every(ref=>d.values.has(ref))?[0,b.map(ref=>v8.deserialize(v8.serialize(d.values.get(ref))))]:[3,[]];
     if(op==='commit'){assert(Array.isArray(c));d.meta=v8.deserialize(v8.serialize(b));d.lease=0;return 0;}
+    /* webidb_save: the commit with the lease kept, for the realm's next scheduled transaction. */
+    if(op==='save'){assert(Array.isArray(c));d.meta=v8.deserialize(v8.serialize(b));return 0;}
     if(op==='connect'){const id=++serial;clients.set(id,{name:d.name,version:b,pending:null,notified:undefined});return[0,id];}
     if(op==='connections'){let n=0,unfired=0;for(const r of clients.values())if(r.name===d.name){n++;if(r.notified!==b){r.pending=b;r.notified=b;r.fired=false;}if(!r.fired)unfired++;}return[0,n,unfired];}
     throw new Error(op);

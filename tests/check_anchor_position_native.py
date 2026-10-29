@@ -1,6 +1,7 @@
 """CSS Anchor Positioning 1 の配置（layout.c の絶対配置の段）を、実物のコードで host で確かめる。
 
-layout.c から、配置の段の記録・形の助け（resolve_edges・spec_w・clamp_h・box_abs_x など）・
+layout.c から、配置の段の記録・形の助け（resolve_edges・spec_w・clamp_h・box_abs_x など）・大きさの値の節
+（spec_w・clamp_h が内在の大きさの語・fit-content()・calc-size() を解く size_w・size_h など。中身の大きさは道具が与える）・
 絶対配置と anchor positioning の節（abs_place・anchor_layout・layout_abs・box_anchor_*）を
 そのまま取り出し、性質の表（cssprop.c）で解析した装いの箱を手で置いた道具
 （tests/anchor_position_native_cases.c）で組んで走らせる。試すのは WPT の
@@ -41,8 +42,10 @@ production = layout[layout.index("struct layout_text_cache;"):marker("fonts")]
 # the geometry helpers the absolute positioning stage uses
 production += layout[marker("geometry helpers"):layout.index("static float mcollapse(")]
 for signature in ("float box_abs_x(", "float box_abs_y(", "bool box_element_scrollable(", "bool box_viewport_fixed(",
-                  "void box_abs_cb_rect("):
+                  "void box_abs_cb_rect(", "static bool is_flex_item("):
     production += function(signature)
+# the sizing values (keywords, fit-content(), calc-size()) spec_w and clamp_h resolve through, whole
+production += layout[marker("sizing values (css-sizing-3 §3.2, css-sizing-4 §3.2, §7)"):marker("replaced elements")]
 # absolute positioning and anchor positioning, whole
 production += layout[marker("absolute positioning"):marker("entry")]
 prefix = """#include <stdio.h>
@@ -60,6 +63,7 @@ void web_avmedia_checkpoint(void);
 struct bfc;
 static void layout_inner(box_t *b, struct bfc *f, float ox, float oy, float cbh);
 static float stf_width(box_t *b, float avail);
+static void intrinsic(box_t *b, float *mn, float *mx);
 static void size_atomic(box_t *c, float cbw, float cbh);
 static void table_width(box_t *t, float cw);
 static bool box_sticky(const box_t *b);

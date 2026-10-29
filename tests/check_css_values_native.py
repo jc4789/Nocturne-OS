@@ -12,7 +12,20 @@ guest の WPT の代わりではない。CSSOM の宣言の塊・cascade の全�
 #container に置くものを読む。数えないもの：性質が表に無いもの、道具が読まない性質の計算値
 （transform の行列は layout.c の仕事）、使用値の % （基が頁の配置）、試験の関数が上のどれでもないもの。
 
-  python -X utf8 tests/check_css_values_native.py [--verbose] [--file 名前の一部] [--out 出力の場所]
+interpolation-testcommon.js の test_interpolation・test_no_interpolation・test_not_animatable・
+test_composition は、方式（CSS Transitions の四つ・CSS Animations・Web Animations）と点ごとに一件と数える。
+道具は鍵の枠の組（下の値の上に replace・add・accumulate で重ね、t で補間）を cssprop.c の css_anim_* で
+標本にし、getComputedStyle の見え方を頁の期待の計算値と normalizeValue の形で比べる。補間できない組は
+animation と allow-discrete の transition で 0.5 で入れ替わり、ふつうの transition は始まらずに変更後の値を
+見せる（animation.c の transitionable と同じ判定。transition の時間の模型そのものは通らない）。頁の .target の
+規則が下の値、.parent の規則が inherit、target・parent・:root の順の interpolate-size を読む。width・height の
+ように解決値が使用値の性質は、頁の配置が要るので数えない。
+
+  python -X utf8 tests/check_css_values_native.py [--group values|sizing|sizing-animation] [--verbose]
+      [--file 名前の一部] [--out 出力の場所]
+  （--group sizing は calc-size()・interpolate-size の頁（css-values/calc-size）と大きさの性質の文法の頁
+  （css-sizing/parsing）、sizing-animation はその補間と合成の頁（css-values/calc-size/animation、
+  css-sizing/animation）。既定の values は css-values の直下）
   （--verbose は一件ごとに PASS・FAIL の行を出す。二つの版の行を比べると、同じ件の行き来が分かる）
 """
 from pathlib import Path
@@ -24,12 +37,18 @@ import sys
 
 root = Path(__file__).resolve().parent.parent
 wpt = Path(os.environ.get("NOCTURNE_WPT", "D:/Programes/cloned repos/wpt")) / "css"
-pages = sorted((wpt / "css-values").glob("*.html"))
+# --group sizing: calc-size() and interpolate-size (css-values/calc-size), the sizing properties' grammar
+# (css-sizing/parsing): their parsing, specified and computed values
+groups = {"values": ["css-values/*.html"], "sizing": ["css-values/calc-size/*.html", "css-sizing/parsing/*.html"],
+          "sizing-animation": ["css-values/calc-size/animation/*.html", "css-sizing/animation/*.html"]}
+group = sys.argv[sys.argv.index("--group") + 1] if "--group" in sys.argv else "values"
+pages = sorted(p for pattern in groups[group] for p in wpt.glob(pattern))
 if "--file" in sys.argv:
     part = sys.argv[sys.argv.index("--file") + 1]
     pages = [p for p in pages if part in p.name]
 verbose = "--verbose" in sys.argv
-out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else root / "build/check-css-values"
+out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else \
+    root / ("build/check-css-values" if group == "values" else "build/check-css-" + group)
 out.mkdir(parents=True, exist_ok=True)
 cc = next(p / "tools/msys64/ucrt64/bin/clang.exe" for p in (root, *root.parents)
           if (p / "tools/msys64/ucrt64/bin/clang.exe").exists())
@@ -84,6 +103,20 @@ if (!globalThis.test_serialization) globalThis.test_serialization = function (t,
   test_specified_serialization(prop || 'text-indent', t, s);
   test_computed_serialization(prop || 'text-indent', t, c);
   if (u) test_used_serialization(prop || 'margin-left', t, u);
+};
+// interpolation-testcommon.js: a keyframe pair's interpolation and composition
+const NEUTRAL = '\u0001neutral\u0001';
+globalThis.neutralKeyframe = NEUTRAL;
+const keyframe = v => v === undefined ? null : String(v);
+const points = e => (e || []).map(x => [x.at, typeof x.expect === 'object' ? null : keyframe(x.expect)]);
+const pair = o => [o.property, keyframe(o.from), keyframe(o.to), keyframe(o.underlying), o.method || ''];
+globalThis.test_interpolation = (o, e) => rec('interpolation', [...pair(o), points(e)]);
+globalThis.test_no_interpolation = o => rec('no-interpolation', pair(o));
+globalThis.test_not_animatable = o => rec('not-animatable', pair(o));
+globalThis.test_composition = (o, e) => {
+  const op = {accumulate: 'c', add: 'a', replace: 'r'};
+  const end = side => Object.keys(op).filter(c => (c + side) in o).map(c => [op[c], keyframe(o[c + side])])[0] || ['r', null];
+  rec('composition', [o.property, keyframe(o.underlying), end('From'), end('To'), points(e)]);
 };
 const styles = new Map();
 const element = id => {
@@ -172,6 +205,97 @@ def number(text):
     t = m.group(1).lower()
     return float("inf") if t == "infinity" else float("-inf") if t == "-infinity" else float("nan") if t == "nan" else float(t)
 
+def rules_of(page):
+    """the declarations of the page's style sheets: selector → {property: value}"""
+    html = page.read_text(encoding="utf-8")
+    rules = {}
+    for sheet in re.findall(r"<style[^>]*>(.*?)</style>", html, re.S):
+        sheet = re.sub(r"/\*.*?\*/", "", sheet, flags=re.S)
+        for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", sheet):
+            for s in selectors.split(","):
+                declarations = rules.setdefault(s.strip(), {})
+                for declaration in body.split(";"):
+                    name, colon, value = declaration.partition(":")
+                    if colon:
+                        declarations[name.strip()] = value.strip()
+    return rules
+
+# interpolation-testcommon.js: its methods, and the points expectFlip gives
+NEUTRAL = "\u0001neutral\u0001"
+TRANSITIONS = ["CSS Transitions", "CSS Transitions with transition: all"]
+ALLOW_DISCRETE = ["CSS Transitions with transition-behavior:allow-discrete",
+                  "CSS Transitions with transition-property:all and transition-behavor:allow-discrete"]
+ANIMATIONS = ["CSS Animations", "Web Animations"]
+FLIP = [-0.3, 0, 0.3, 0.5, 0.6, 1, 1.5]
+
+def normalize(value):
+    """interpolation-testcommon.js's normalizeValue: numbers to two places, a space after each token"""
+    def rounded(m):
+        t = "%.2f" % float(m.group(0))
+        t = re.sub(r"\.\d+", lambda d: d.group(0).rstrip("0"), t)
+        t = re.sub(r"\.$", "", t)
+        return "0" if t == "-0" else t
+    value = re.sub(r"-?\d*\.\d+(e-?\d+)?", rounded, value)
+    return re.sub(r"\s+", " ", re.sub(r"([\w\d.]+|[^\s])", r"\1 ", value))
+
+def animation_cases(kind, a, rules, font):
+    """one case per method and point: the sample the value layer gives (an A request) against the
+    computed value of what the page expects. A pair that does not interpolate flips at 0.5 in an
+    animation and a transition that allows discrete steps; a plain transition does not start and shows
+    the after-change value. A property that does not animate shows the underlying value in an animation
+    and the after-change value in a transition. The page's .target rule gives the underlying value,
+    its .parent rule what inherit is, and the target's, the parent's or :root's interpolate-size."""
+    prop = a[0]
+    physical = prop.replace("block-size", "height").replace("inline-size", "width")
+    target, parent = rules.get(".target", {}), rules.get(".parent", {})
+    mode = target.get("interpolate-size") or parent.get("interpolate-size") or rules.get(":root", {}).get("interpolate-size")
+    mode = "1" if mode == "allow-keywords" else "0"
+    def text(v):
+        if v == "inherit":
+            return parent.get(prop) or parent.get(physical) or "initial"
+        return v
+    if kind == "composition":
+        _, under, (fop, frm), (top, to), pts = a
+        methods, expectations = ANIMATIONS, {m: pts for m in ANIMATIONS}
+    else:
+        _, frm, to, under, method, *rest = a
+        if kind == "interpolation":
+            methods = TRANSITIONS + ANIMATIONS
+            expectations = {m: rest[0] for m in methods}
+        elif kind == "no-interpolation":
+            methods = ALLOW_DISCRETE + TRANSITIONS + ANIMATIONS
+            expectations = {m: [[at, to if m in TRANSITIONS or at >= 0.5 else frm] for at in FLIP] for m in methods}
+        else:
+            methods = ALLOW_DISCRETE + TRANSITIONS + ANIMATIONS
+            expectations = {m: [[at, under if m in ANIMATIONS else to] for at in FLIP] for m in methods}
+        methods = [m for m in methods if not method or m == method]
+        fop = top = "r"
+    if under is None:
+        under = target.get(prop) or target.get(physical) or "initial"
+    under = text(under)
+    frm = under if frm == NEUTRAL else text(frm)
+    to = under if to == NEUTRAL else text(to)
+    cases = []
+    for m in methods:
+        for at, expect in expectations[m]:
+            if expect is None:
+                continue
+            expect = under if expect == NEUTRAL else text(expect)
+            requests = [("A", prop, font, mode, under, fop, frm, top, to, str(at)), ("C", prop, font, expect or "initial"),
+                        ("C", prop, font, under or "initial"), ("C", prop, font, to or "initial")]
+            def judge(r, m=m, at=at):
+                got, want, shown_under, shown_to = r
+                if "<invalid>" in (got, want):
+                    return False
+                if got == "<none>":
+                    got = shown_under if m in ANIMATIONS else shown_to
+                elif got.startswith("<discrete>"):
+                    ends = got.split("\u0001")[1:]
+                    got = ends[1] if m in TRANSITIONS or at >= 0.5 else ends[0]
+                return normalize(got) == normalize(want)
+            cases.append((f"{m}: {prop} from {fop}[{frm}] to {top}[{to}] on [{under}] at {at} = {expect}", requests, judge))
+    return cases
+
 total = passed = 0
 uncounted = {}
 failures = []
@@ -188,6 +312,7 @@ for page in pages:
     # the target's font size, its parent's (#container or #parent) and the root's, as the page
     # sets them; its script may set the parent's later
     sizes = font_sizes(page)
+    rules = rules_of(page)
     root_font = sizes.get(":root") or sizes.get("html") or "16"
     parent_font = sizes.get("#container") or sizes.get("#parent") or root_font
     def site(target=""):
@@ -238,6 +363,13 @@ for page in pages:
             stage, p, t, e = a
             cases.append((f"{stage} {p}: {t} → {e}", [value_of(stage, p, t, page_font), value_of(stage, p, e, page_font)],
                           lambda r, e=e: r[0] == e and r[1] == e))
+        elif kind in ("interpolation", "no-interpolation", "not-animatable", "composition"):
+            found = animation_cases(kind, a, rules, page_font)
+            if resolved_used.match(a[0].replace("block-size", "height").replace("inline-size", "width")):
+                # getComputedStyle shows the used value, which is the page's layout
+                uncounted["使用値が頁の配置（動き）"] = uncounted.get("使用値が頁の配置（動き）", 0) + len(found)
+            else:
+                cases.extend(found)
         else:
             uncounted["上のどれでもない試験"] = uncounted.get("上のどれでもない試験", 0) + 1
     answers = tool.ask([q for _, rs, _ in cases for q in rs])

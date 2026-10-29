@@ -311,6 +311,58 @@ static int space_named(const char *s, size_t n) {
         if (name_is(s, n, space_names[i])) return i;
     return -1;
 }
+bool css_color_method_read(const char *s, size_t n, uint8_t *space, uint8_t *hue) {
+    const char *w[4];
+    size_t wl[4];
+    int k = 0;
+    for (const char *p = s, *e = s + n; p < e;) {
+        while (p < e && is_space((unsigned char)*p)) p++;
+        if (p == e) break;
+        if (k == 4) return false;
+        const char *q = p;
+        while (q < e && !is_space((unsigned char)*q)) q++;
+        w[k] = p;
+        wl[k++] = (size_t)(q - p);
+        p = q;
+    }
+    if ((k != 2 && k != 4) || !name_is(w[0], wl[0], "in")) return false;
+    int named = space_named(w[1], wl[1]);
+    if (named < 0) return false;
+    uint8_t method = CSS_HUE_SHORTER;
+    if (k == 4) {
+        int h = -1;
+        for (int i = 0; i < 4; i++) if (name_is(w[2], wl[2], hue_names[i])) h = i;
+        if (h < 0 || !space_polar((uint8_t)named) || !name_is(w[3], wl[3], "hue")) return false;
+        method = (uint8_t)h;
+    }
+    *space = (uint8_t)named;
+    *hue = method;
+    return true;
+}
+bool css_color_method_text(sbuf *out, uint8_t space, uint8_t hue) {
+    if (space == CSS_SPACE_OKLAB || space >= CSS_SPACES) return false;
+    sb_puts(out, "in ");
+    sb_puts(out, space_names[space]);
+    if (hue != CSS_HUE_SHORTER && hue < 4) { sb_putc(out, ' '); sb_puts(out, hue_names[hue]); sb_puts(out, " hue"); }
+    return true;
+}
+void css_mix_percentages(unsigned count, const double *given, const bool *math, double *put) {
+    bool any_math = false;
+    double sum = 0;
+    unsigned omitted = 0;
+    for (unsigned i = 0; i < count; i++) {
+        if (math[i]) any_math = true;
+        else if (isnan(given[i])) omitted++;
+        else sum += given[i];
+    }
+    double fill = omitted && sum < 100 ? (100 - sum) / omitted : 0;
+    double share = 100.0 / count;
+    bool even = !any_math;
+    for (unsigned i = 0; i < count && even; i++)
+        if (fabs((isnan(given[i]) ? fill : given[i]) - share) > 1e-9) even = false;
+    for (unsigned i = 0; i < count; i++)
+        put[i] = even || math[i] ? NAN : !isnan(given[i]) ? given[i] : any_math ? NAN : fill;
+}
 
 /* named colours (CSS Color 4, 6.1), sorted */
 static const struct { const char *name; uint32_t rgb; } named[] = {
@@ -1658,51 +1710,41 @@ static void chan_put(sbuf *b, const struct css_color_value *v, int i, const char
 static void spec_put(sbuf *b, const struct css_color_value *v);
 static void mix_put(sbuf *b, const struct css_color_value *v) {
     sb_puts(b, "color-mix(");
-    if (v->space != CSS_SPACE_OKLAB) {
-        sb_puts(b, "in ");
-        sb_puts(b, space_names[v->space]);
-        if (v->hue != CSS_HUE_SHORTER) { sb_putc(b, ' '); sb_puts(b, hue_names[v->hue]); sb_puts(b, " hue"); }
-        sb_puts(b, ", ");
+    if (css_color_method_text(b, v->space, v->hue)) sb_puts(b, ", ");
+    /* the percentages each item writes (css_mix_percentages) */
+    double small_given[8], small_put[8];
+    bool small_math[8];
+    double *given = small_given, *put = small_put;
+    bool *math = small_math;
+    if (v->count > 8) {
+        given = malloc(v->count * sizeof *given);
+        put = malloc(v->count * sizeof *put);
+        math = malloc(v->count * sizeof *math);
     }
-    /* percentages: omitted ones are filled in, unless one is a math function; all are
-       omitted when each is the even share */
-    bool math = false;
-    double sum = 0;
-    unsigned omitted = 0;
-    for (unsigned i = 0; i < v->count; i++) {
-        const struct chan *c = &v->items[i].pct;
-        if (c->kind == CH_MATH) math = true;
-        if (c->kind == CH_ABSENT) omitted++;
-        else if (c->kind == CH_LEAF) sum += c->v;
-    }
-    double fill = omitted && sum < 100 ? (100 - sum) / omitted : 0;
-    double share = 100.0 / v->count;
-    bool even = !math;
-    for (unsigned i = 0; i < v->count && even; i++) {
-        const struct chan *c = &v->items[i].pct;
-        double p = c->kind == CH_ABSENT ? fill : c->v;
-        if (fabs(p - share) > 1e-9) even = false;
+    bool shared = given && put && math;
+    if (shared) {
+        for (unsigned i = 0; i < v->count; i++) {
+            const struct chan *c = &v->items[i].pct;
+            math[i] = c->kind == CH_MATH;
+            given[i] = c->kind == CH_LEAF ? c->v : NAN;
+        }
+        css_mix_percentages(v->count, given, math, put);
     }
     for (unsigned i = 0; i < v->count; i++) {
         if (i) sb_puts(b, ", ");
         spec_put(b, v->items[i].color);
         const struct chan *c = &v->items[i].pct;
-        if (even) continue;
-        if (c->kind == CH_ABSENT) {
-            if (math) continue;
-            sb_putc(b, ' ');
-            num_put(b, fill);
-            sb_putc(b, '%');
-        } else if (c->kind == CH_LEAF) {
-            sb_putc(b, ' ');
-            num_put(b, c->v);
-            sb_putc(b, '%');
-        } else {
+        if (c->kind == CH_MATH) {
             sb_putc(b, ' ');
             css_calc_serialize(b, c->m, NULL);
+        } else if (shared ? !isnan(put[i]) : c->kind == CH_LEAF) {
+            sb_putc(b, ' ');
+            num_put(b, shared ? put[i] : c->v);
+            sb_putc(b, '%');
         }
     }
     sb_putc(b, ')');
+    if (given != small_given) { free(given); free(put); free(math); }
 }
 static void spec_put(sbuf *b, const struct css_color_value *v) {
     switch (v->kind) {

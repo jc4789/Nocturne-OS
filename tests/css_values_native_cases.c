@@ -8,12 +8,16 @@
      U<TAB>property<TAB>site<TAB>value
                                 the used value of a <length-percentage> property whose percentages are
                                 of 100px; other properties: the computed value
+     A<TAB>property<TAB>site<TAB>interpolate-size<TAB>underlying<TAB>op<TAB>from<TAB>op<TAB>to<TAB>t
+                                one keyframe pair of an effect sampled at t (animate() below)
    An invalid value answers <invalid>; a property this tool cannot read answers <unread>. */
 #include <stdio.h>
 #include "webi.h"
 
 /* reached only from properties these requests do not set */
 bool web_native_checkpoint(web_doc *d) { (void)d; return true; }
+/* web_url.c's, reached only from a registered <url> custom property (cssprop.c's syn_url_text) */
+int web_resolve_url_owned(const char *base, const char *rel, char **out) { (void)base; (void)rel; (void)out; abort(); }
 bool css_valid_declaration(const char *p, size_t pn, const char *v, size_t vn) { (void)p; (void)pn; (void)v; (void)vn; return false; }
 bool css_container_names_valid(const char *s, size_t n) { (void)s; (void)n; return false; }
 /* layout.c's, reached only from transform values */
@@ -104,6 +108,71 @@ static int computed(const char *property, const char *sizes, const char *value, 
     ar_free(&s.arena);
     return r;
 }
+/* what getComputedStyle shows once the cascade applies text: 1, 0 invalid, -1 unread */
+static int show(struct site *s, const struct propdef *p, const char *property, const char *text, bool computed_text, sbuf *out) {
+    style_t x;
+    if (!css_anim_parse(&s->ctx, p, text, strlen(text), computed_text, &x, NULL)) return 0;
+    int k = css_computed_longhand(&x, property, out, NULL);
+    return k == 1 ? 1 : k == 0 ? -1 : 0;
+}
+/* A request: one keyframe pair of an effect (animation.c's effect value) on the target, its
+   interpolate-size (cssprop.c's anim_combine reads the base style's) "0" numeric-only or "1"
+   allow-keywords. Each end composites ('r' replace, 'a' add, 'c' accumulate) onto the underlying value
+   (empty: the initial value), and the pair interpolates at t. The answer is the sample as
+   getComputedStyle shows it; a pair that does not interpolate (or a property that animates
+   discretely) answers <discrete>, its two composited ends as shown, each after a U+0001; a property
+   that does not animate answers <none>. */
+static int animate(const char *property, const char *sizes, char *fields, sbuf *out) {
+    const struct propdef *p = css_prop_lookup(property, strlen(property));
+    if (!p) return -1;
+    char *mode = field(&fields), *under = field(&fields), *ops[2], *ends[2];
+    ops[0] = field(&fields), ends[0] = field(&fields), ops[1] = field(&fields), ends[1] = field(&fields);
+    double t = strtod(fields, NULL);
+    if (css_prop_animation(p) == CSS_ANIM_NONE) { sb_puts(out, "<none>"); return 1; }
+    /* the composited ends and the sample, as text (kept across the arena's trap) */
+    static sbuf text[3];
+    for (int i = 0; i < 3; i++) { text[i].n = 0; if (text[i].p) text[i].p[0] = 0; }
+    struct site s;
+    site_init(&s, sizes);
+    /* the target's interpolate-size, through the property's own row (a tree without it has none) */
+    const struct propdef *ip = css_prop_lookup("interpolate-size", 16);
+    if (ip) {
+        uint8_t set[css_prop_count()];
+        memset(set, 0, sizeof set);
+        const char *v = *mode == '1' ? "allow-keywords" : "numeric-only";
+        struct cx cx = {.s = &s.base, .parent = &s.parent, .em = s.base.font_size, .rem = s.ctx.rem, .vw = 800, .vh = 600,
+                        .a = &s.arena, .set = set};
+        css_apply(ip, v, strlen(v), &cx);
+        css_style_finish(&s.base, &s.parent, false);
+    }
+    int r = 0;
+    if (!setjmp(s.trap)) {
+        style_t u, v[2];
+        bool composited[2] = {false, false}, ok = true;
+        if (!*under) under = "initial";
+        ok = css_anim_parse(&s.ctx, p, under, strlen(under), false, &u, NULL);
+        for (int i = 0; i < 2 && ok; i++) {
+            ok = css_anim_parse(&s.ctx, p, ends[i], strlen(ends[i]), false, &v[i], NULL);
+            /* a value that does not add replaces (Web Animations §5.4.4) */
+            if (ok && *ops[i] != 'r' && css_anim_compose(&s.ctx, p, &u, &v[i], *ops[i] == 'c', &text[i])) {
+                composited[i] = true;
+                ok = css_anim_parse(&s.ctx, p, sb_cstr(&text[i]), text[i].n, true, &v[i], NULL);
+            }
+        }
+        if (ok && css_anim_interpolate(&s.ctx, p, &v[0], &v[1], t, &text[2])) {
+            r = show(&s, p, property, sb_cstr(&text[2]), false, out);
+        } else if (ok) {
+            sb_puts(out, "<discrete>");
+            r = 1;
+            for (int i = 0; i < 2 && r == 1; i++) {
+                sb_putc(out, 1);
+                r = show(&s, p, property, composited[i] ? sb_cstr(&text[i]) : ends[i], composited[i], out);
+            }
+        }
+    }
+    ar_free(&s.arena);
+    return r;
+}
 int main(int argc, char **argv) {
     if (argc < 3) return 2;
     FILE *in = fopen(argv[1], "rb"), *answers = fopen(argv[2], "wb");
@@ -118,7 +187,10 @@ int main(int argc, char **argv) {
         if (out.p) out.p[0] = 0;
         int ok;
         if (!strcmp(op, "S")) ok = specified(property, value, &out);
-        else {
+        else if (!strcmp(op, "A")) {
+            char *sizes = field(&value);
+            ok = animate(property, sizes, value, &out);
+        } else {
             char *sizes = field(&value);
             ok = computed(property, sizes, value, !strcmp(op, "U"), &out);
         }

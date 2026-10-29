@@ -136,6 +136,18 @@ int main(void){fixture_serial=(unsigned)_getpid();char dir[100];snprintf(dir,siz
     check("native-versionchange-retry-once",webidb_connections(b,tb,2,&clients_count,&unfired)==0&&webidb_poll(b,client,&pending,&desired)==0&&!pending);
     check("native-versionchange-new-version-marks-again",webidb_connections(b,tb,3,&clients_count,&unfired)==0&&unfired==1&&webidb_poll(b,client,&pending,&desired)==0&&pending&&desired==3&&webidb_fired(b,client)==0);
     check("native-close-unblocks",webidb_disconnect(b,client)==0&&webidb_connections(b,tb,2,&clients_count,&unfired)==0&&clients_count==0&&unfired==0);
+    /* A connection that closed after its versionchange was fired while it was open: its opener
+       counts it once (it fires blocked), then not; one closed before (in its handler) is not. */
+    check("native-fired-then-closed-counted-once",webidb_connect(b,tb,1,&client)==0&&webidb_connections(b,tb,4,&clients_count,&unfired)==0&&clients_count==1&&unfired==1&&
+        webidb_poll(b,client,&pending,&desired)==0&&pending&&desired==4&&webidb_fired(b,client)==0&&webidb_disconnect(b,client)==0&&
+        webidb_connections(b,tb,4,&clients_count,&unfired)==0&&clients_count==1&&unfired==0&&
+        webidb_connections(b,tb,4,&clients_count,&unfired)==0&&clients_count==0&&unfired==0);
+    check("native-closed-before-fired-not-counted",webidb_connect(b,tb,1,&client)==0&&webidb_connections(b,tb,5,&clients_count,&unfired)==0&&clients_count==1&&
+        webidb_poll(b,client,&pending,&desired)==0&&pending&&webidb_disconnect(b,client)==0&&
+        webidb_connections(b,tb,5,&clients_count,&unfired)==0&&clients_count==0&&unfired==0);
+    check("native-stale-ghost-cleared",webidb_connect(b,tb,1,&client)==0&&webidb_connections(b,tb,6,&clients_count,&unfired)==0&&
+        webidb_poll(b,client,&pending,&desired)==0&&webidb_fired(b,client)==0&&webidb_disconnect(b,client)==0&&
+        webidb_connections(b,tb,7,&clients_count,&unfired)==0&&clients_count==0&&webidb_connections(b,tb,6,&clients_count,&unfired)==0&&clients_count==0);
     size_t before=written_bytes;check("unchanged-value-no-rewrite",webidb_stage(b,tb,large,1024*1024,unused)==0&&written_bytes==before&&!strcmp(ref,unused));
     fail_write=12;check("partial-manifest-fails",webidb_commit(b,tb,(const uint8_t *)"two",3,refs,1,2)==WEB_IDB_IO);fail_write=-1;webidb_abort(b,tb);
     check("catalog-partial-write-retains-old-version",webidb_databases(a,"https://idb.test",&catalog_items,&catalog_count)==0&&catalog_count==1&&catalog_items[0].version==1);webidb_databases_free(catalog_items,catalog_count);
@@ -170,6 +182,26 @@ int main(void){fixture_serial=(unsigned)_getpid();char dir[100];snprintf(dir,siz
     }
     check("journal-compaction-publishes-all-generations",compact_ok);webidb_free(a);a=webidb_create();
     check("compacted-cold-snapshot-reconstructs",webidb_begin(a,"https://idb.test","compact",7,&ta,&meta,&n)==0&&n==sizeof compact&&!memcmp(meta,compact,n));free(meta);webidb_abort(a,ta);
+    /* webidb_save: a commit that keeps the lease, for the realm's next scheduled transaction. Each
+       save is a generation of its own (the catalog and a cold begin read it); the payloads the
+       last two generations reference stay, the others go; webidb_commit or webidb_abort ends it. */
+    {char first[65],second[65];const char *one[1]={first},*two[1]={second};
+     check("save-begin",webidb_begin(a,"https://idb.test","saved",5,&ta,&meta,&n)==0&&!meta);
+     check("save-first-generation",webidb_stage(a,ta,(const uint8_t *)"value one",9,first)==0&&webidb_save(a,ta,(const uint8_t *)"m1",2,one,1,1)==0);
+     check("save-keeps-lease",webidb_begin(b,"https://idb.test","saved",5,&tb,&meta,&n)==WEB_IDB_BUSY);
+     check("save-saved-value-current",webidb_value(a,ta,first,&bytes,&bn)==0&&bn==9&&!memcmp(bytes,"value one",9));free(bytes);
+     check("save-second-generation",webidb_stage(a,ta,(const uint8_t *)"value two",9,second)==0&&webidb_save(a,ta,(const uint8_t *)"m2",2,two,1,2)==0);
+     check("save-unreferenced-not-readable",webidb_value(a,ta,first,&bytes,&bn)==WEB_IDB_SECURITY);
+     check("save-unstaged-reference-refused",webidb_save(a,ta,(const uint8_t *)"m3",2,(const char *const[]){"0000000000000000000000000000000000000000000000000000000000000000"},1,3)==WEB_IDB_SECURITY);
+     check("save-then-abort-keeps-saved",webidb_stage(a,ta,(const uint8_t *)"dropped",7,unused)==0&&webidb_abort(a,ta)==0);
+     webidb_free(a);a=webidb_create();
+     check("save-cold-begin-reads-last-save",webidb_begin(a,"https://idb.test","saved",5,&ta,&meta,&n)==0&&n==2&&!memcmp(meta,"m2",2));free(meta);
+     check("save-saved-payload-survives",webidb_value(a,ta,second,&bytes,&bn)==0&&bn==9&&!memcmp(bytes,"value two",9));free(bytes);
+     check("save-then-commit",webidb_save(a,ta,(const uint8_t *)"m4",2,two,1,4)==0&&webidb_commit(a,ta,(const uint8_t *)"m5",2,two,1,5)==0);
+     check("save-commit-releases",webidb_begin(b,"https://idb.test","saved",5,&tb,&meta,&n)==0&&n==2&&!memcmp(meta,"m5",2));free(meta);webidb_abort(b,tb);
+     int listed=webidb_databases(b,"https://idb.test",&catalog_items,&catalog_count)==0;uint64_t saved_version=0;
+     for(size_t i=0;listed&&i<catalog_count;i++)if(catalog_items[i].name_length==5&&!memcmp(catalog_items[i].name,"saved",5))saved_version=catalog_items[i].version;
+     check("save-catalog-last-commit",listed&&saved_version==5);webidb_databases_free(catalog_items,catalog_count);}
     /* Site data: each database's origin and bytes; clearing one origin's whole, a database in a
        transaction left (BUSY), the other origin untouched. */
     check("site-data-keep-other-origin",webidb_begin(b,"https://other.test","keep",4,&tb,&meta,&n)==0&&webidb_commit(b,tb,(const uint8_t *)"kept",4,NULL,0,1)==0);free(meta);
