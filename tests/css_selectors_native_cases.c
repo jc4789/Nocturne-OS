@@ -370,7 +370,7 @@ static const char *winning_color(web_doc *d, node_t *e, uint8_t pseudo) {
     int depth = scope_depth(doc_node_root(e, false));
     for (int i = 0; inline_block && i < inline_block->count; i++) {
         add_dent(&inline_block->values[i], 1ull << 62 | (uint64_t)0x3FFFFFFF << 32 | (uint64_t)(i < 255 ? i : 255),
-                 PE_NONE, depth);
+                 PE_NONE, depth, css_tree_scope(e));
         dents[ndents - 1].inline_style = true;
     }
     qsort(dents, (size_t)ndents, sizeof *dents, cmp_dent);
