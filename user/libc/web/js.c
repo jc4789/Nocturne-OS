@@ -102,6 +102,9 @@ struct js_script {
     bool module, deferred, asynchronous, dynamic, ready, failed, executed, notified;
     bool external, parser_released;
     bool muted; /* a classic script from another origin: its errors are muted (report_exception) */
+    /* A fetched classic script's fallback encoding: its charset attribute's, else its
+       document's, as prepare the script element chose it. */
+    web_encoding encoding;
     JSValue evaluation;
     uint64_t request, stream_generation;
     struct js_compile *compile; /* a fetched classic script's bytecode, compiled elsewhere */
@@ -4480,7 +4483,8 @@ static bool permitted_script_url(struct web_js_state *s,const char *url) {
     if (web_url_has_scheme(url,"blob")) return length<=UINT32_MAX;
     return length<=UINT32_MAX && permitted_url(s,url,false);
 }
-static char *script_data_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]);
+static char *script_data_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],char label[64]);
+static bool script_source_decode(struct web_js_state *s, char **source, size_t *length, web_encoding e, bool utf8_only);
 static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],bool *untyped,char label[64]);
 static void worker_blob(struct web_js_state *s,struct js_pending *p);
 /* Console text is author data, not a diagnostic excerpt. Grow on demand and
@@ -5865,10 +5869,12 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
        for a local data: or blob: resource too. */
     if(!csp_request_allowed(s,p,p->url,0)){pending_error(p,"Blocked by Content Security Policy");return false;}
     if ((p->kind==P_SCRIPT || p->kind==P_MODULE || p->kind==P_FONT || p->kind==P_CSS) && (web_url_has_scheme(p->url,"data") || web_url_has_scheme(p->url,"blob"))) {
-        char mime[128];
+        char mime[128], label[64] = "";
+        /* A classic script decodes in its type's charset (classic_script_text). */
+        char *charset = p->kind == P_SCRIPT ? label : NULL;
         p->response.body=web_url_has_scheme(p->url,"data")
-            ? script_data_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime)
-            : script_blob_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime,NULL,NULL);
+            ? script_data_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime,charset)
+            : script_blob_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime,NULL,charset);
         if (!p->response.body) {
             if (JS_HasException(s->ctx)) exception(s);
             pending_error(p,"Unavailable local resource URL or invalid MIME type"); return false;
@@ -5877,7 +5883,9 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
         /* No redirect occurred. The complete URL already belongs to the
            pending/script record; an HTTP-sized field would truncate source. */
         p->response.url[0]=0;
-        snprintf(p->response.headers,sizeof p->response.headers,"Content-Type: %s\r\n",mime);
+        web_encoding encoding = label[0] ? web_encoding_get(label, strlen(label)) : WEB_ENCODING_FAILURE;
+        snprintf(p->response.headers,sizeof p->response.headers,"Content-Type: %s%s%s\r\n",mime,
+                 encoding?";charset=":"",encoding?web_encoding_name(encoding):"");
         p->done=true; return true;
     }
     struct web_request r = {.id=p->id, .kind=kind, .url=p->url, .method=method, .headers=headers, .body=body, .body_len=len,
@@ -6854,13 +6862,60 @@ static bool valid_mime_essence(const char *v, const char *end) {
     }
     return slash && slash != v && slash + 1 != end;
 }
-/* Fetch "extract a MIME type" from a header block, as far as its essence:
-   the span of the last Content-Type member that parses (ASCII
-   case-insensitive). Fetch's get/decode/split honors quoted commas; each
-   successfully parsed member replaces the previous MIME type, malformed
-   members and the wildcard type do not. False when none parses. */
-static bool content_type_essence(const char *raw, const char **essence, size_t *length) {
+/* MIME Sniffing "parse a MIME type" step 11 over one member's parameters (p at
+   the ';' after its essence): the value of its charset parameter, the first
+   one that is valid, into label (cap bytes). False when it has none; a value
+   that does not fit is no encoding label and comes back as "". */
+static bool mime_charset_parameter(const char *p, const char *end, char *label, size_t cap) {
+    while (p < end) {
+        p++;
+        while (p < end && mime_space((unsigned char)*p)) p++;
+        const char *name = p;
+        while (p < end && *p != ';' && *p != '=') p++;
+        const char *name_end = p;
+        if (p >= end) break;
+        if (*p == ';') continue;
+        p++;
+        char value[64]; size_t vn = 0; bool fits = true, valid = true;
+        if (p < end && *p == '"') {
+            /* collect an HTTP quoted string, extracting the value */
+            for (p++; p < end && *p != '"'; p++) {
+                if (*p == '\\' && p + 1 < end) p++;
+                if (vn + 1 < sizeof value) value[vn++] = *p; else fits = false;
+            }
+            while (p < end && *p != ';') p++;
+        } else {
+            const char *v = p;
+            while (p < end && *p != ';') p++;
+            const char *v_end = p;
+            while (v_end > v && mime_space((unsigned char)v_end[-1])) v_end--;
+            if (v_end == v) continue;
+            for (; v < v_end; v++) if (vn + 1 < sizeof value) value[vn++] = *v; else fits = false;
+        }
+        for (size_t i = 0; i < vn; i++) {
+            unsigned char c = (unsigned char)value[i];
+            if (c != '\t' && (c < 0x20 || c == 0x7f)) valid = false;
+        }
+        bool token = name_end > name;
+        for (const char *q = name; q < name_end; q++) if (!mime_token((unsigned char)*q)) token = false;
+        if (!token || !valid || (size_t)(name_end - name) != 7 || !strn_ieq(name, "charset", 7)) continue;
+        if (fits && vn < cap) { memcpy(label, value, vn); label[vn] = 0; } else if (cap) label[0] = 0;
+        return true;
+    }
+    return false;
+}
+/* Fetch "extract a MIME type" from a header block: the span of the last
+   Content-Type member that parses (ASCII case-insensitive) as its essence.
+   Fetch's get/decode/split honors quoted commas; each successfully parsed
+   member replaces the previous MIME type, malformed members and the wildcard
+   type do not. When charset is not NULL, the extracted type's charset
+   parameter goes there ("" for none): a member's own, else the one an earlier
+   member of the same essence carried. False when none parses. */
+static bool content_type_extract(const char *raw, const char **essence, size_t *length, char *charset, size_t cap) {
     bool found = false;
+    const char *tracked_essence = NULL; size_t tracked_length = 0;
+    char tracked[64] = "", own[64];
+    if (charset && cap) charset[0] = 0;
     for (const char *p = raw; *p;) {
         const char *e = strchr(p, '\n'); if (!e) e = p + strlen(p);
         if ((size_t)(e - p) >= 13 && !strncasecmp(p, "content-type:", 13)) {
@@ -6879,6 +6934,14 @@ static bool content_type_essence(const char *raw, const char **essence, size_t *
                 while (end > v && mime_space((unsigned char)end[-1])) end--;
                 if (valid_mime_essence(v, end) && !strn_ieq(v, "*/*", (size_t)(end - v))) {
                     *essence = v; *length = (size_t)(end - v); found = true;
+                    if (charset) {
+                        bool has_own = essence_end && mime_charset_parameter(essence_end, p, own, sizeof own);
+                        if (!tracked_essence || tracked_length != *length || !strn_ieq(tracked_essence, v, *length)) {
+                            tracked_essence = v; tracked_length = *length;
+                            snprintf(tracked, sizeof tracked, "%s", has_own ? own : "");
+                        }
+                        snprintf(charset, cap, "%s", has_own ? own : tracked);
+                    }
                 }
                 if (p < e) p++;
             }
@@ -6886,6 +6949,9 @@ static bool content_type_essence(const char *raw, const char **essence, size_t *
         p = *e ? e + 1 : e;
     }
     return found;
+}
+static bool content_type_essence(const char *raw, const char **essence, size_t *length) {
+    return content_type_extract(raw, essence, length, NULL, 0);
 }
 static bool javascript_mime(const char *raw) {
     const char *essence; size_t length;
@@ -6930,7 +6996,7 @@ static bool script_data_checkpoint(void *opaque) {
 }
 /* Source loading shares Fetch's decoder; only the existing source-loader MIME
  * essence contract and its JavaScript-module check belong to this adapter. */
-static char *script_data_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]) {
+static char *script_data_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],char label[64]) {
     if (!permitted_script_url(s,url) || !web_url_has_scheme(url,"data")) {
         JS_ThrowTypeError(s->ctx,"Data script URL exceeds the URL limit"); return NULL;
     }
@@ -6939,6 +7005,8 @@ static char *script_data_source(struct web_js_state *s,const char *url,bool modu
     size_t mn=strcspn(data.mime,";");bool javascript=web_javascript_mime_essence(data.mime,mn);
     if(module&&!javascript){web_data_url_free(&data);JS_ThrowTypeError(s->ctx,"Data module requires a JavaScript MIME type");return NULL;}
     if(mn<128){memcpy(mime,data.mime,mn);mime[mn]=0;}else strcpy(mime,"text/plain");
+    /* The data: URL's type is a serialized MIME type: its charset parameter. */
+    if(label&&!mime_charset_parameter(data.mime+mn,data.mime+strlen(data.mime),label,64))label[0]=0;
     if(data.length>JS_BODY_LIMIT){web_data_url_free(&data);JS_ThrowRangeError(s->ctx,"Data source length is not representable");return NULL;}
     web_js_prepare_bytes(s->ctx,data.length+1);char *bytes=js_malloc(s->ctx,data.length+1);
     if(bytes){memcpy(bytes,data.body,data.length+1);*length=data.length;}
@@ -7119,7 +7187,8 @@ static void module_received(struct web_js_state *s,struct js_pending *p) {
             js_free(s->ctx,m->source);m->source=p->response.body;p->response.body=NULL;m->len=p->response.body_len;
             /* COMPILE_ONLY parses the root but neither resolves imports nor
                evaluates it. Link load does not wait for optional dependencies. */
-            JSValue compiled=compile_source(s,m->source?m->source:"",m->len,m->url,
+            JSValue compiled=!script_source_decode(s,&m->source,&m->len,WEB_ENCODING_UTF8,true)?
+                JS_ThrowOutOfMemory(s->ctx):compile_source(s,m->source?m->source:"",m->len,m->url,
                 JS_EVAL_TYPE_MODULE|JS_EVAL_FLAG_MODULE_PARSE_ONLY);
             if(JS_IsException(compiled))m->error=JS_GetException(s->ctx);
             else {set_import_meta(s->ctx,compiled,m->base);m->compiled=compiled;}
@@ -7282,9 +7351,10 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
     if (!m && (web_url_has_scheme(url,"data") || web_url_has_scheme(url,"blob"))) {
         size_t length; char mime[128];
         char *source=web_url_has_scheme(url,"data")
-            ? script_data_source(s,url,true,&length,mime)
+            ? script_data_source(s,url,true,&length,mime,NULL)
             : script_blob_source(s,url,true,&length,mime,NULL,NULL);
         if (!source) return NULL;
+        if (!script_source_decode(s,&source,&length,WEB_ENCODING_UTF8,true)) { js_free(ctx,source); JS_ThrowOutOfMemory(ctx); return NULL; }
         m=cache_module(s,url,source,length,url); js_free(ctx,source);
         if (!m) return NULL;
     } else if (!m) {
@@ -7345,6 +7415,9 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
         char *final = web_response_url(r)[0] ? module_url(s, "moduleURL", web_response_url(r), url) : js_strdup(ctx, url);
         web_js_prepare_bytes(ctx, r->body_len + 1);
         m = final ? cache_module(s, url, r->body, r->body_len, final) : NULL;
+        if (m && JS_IsUndefined(m->error) && !script_source_decode(s, &m->source, &m->len, WEB_ENCODING_UTF8, true)) {
+            JS_ThrowOutOfMemory(ctx); m->error = JS_GetException(ctx);
+        }
         js_free(ctx, final);
         web_response_free(r); js_free(ctx, diagnostic); if (!m) return NULL;
     }
@@ -7544,6 +7617,11 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
             begin_task(s); script->url=script_src_url(s,src);
             if (!script->url) { script->ready=script->failed=true; exception(s); }
             end_task(s);
+            /* HTML prepare the script element: the charset attribute's encoding, else the
+               node document's. */
+            const char *charset = node_attr(n, "charset");
+            if (charset) script->encoding = web_encoding_get(charset, strlen(charset));
+            if (!script->encoding) script->encoding = web_encoding_get(s->doc->encoding, strlen(s->doc->encoding));
         }
         if (!script->failed) {
             /* Diagnose the author-provided value before requesting it. Never
@@ -7817,6 +7895,47 @@ static void sync_parser_body_handlers(struct web_js_state *s) {
     if (JS_IsException(result)) exception(s);
     else { s->handler_body = body; JS_FreeValue(s->ctx, result); }
     JS_FreeValue(s->ctx, argument);
+}
+/* A fetched script's bytes as its text: Encoding's decode in the given encoding
+   (a classic script's), or UTF-8 decode when utf8_only (a module script's). A
+   BOM chooses first and is dropped; malformed bytes become U+FFFD. Valid UTF-8
+   under UTF-8 is already the text and stays. *source is js_malloc'd and
+   NUL-terminated, and the text replaces it; false when out of memory. */
+static bool script_source_decode(struct web_js_state *s, char **source, size_t *length, web_encoding e, bool utf8_only) {
+    const uint8_t *bytes = (const uint8_t *)*source;
+    size_t n = *length, bom = 0;
+    web_encoding sniffed = web_encoding_bom_sniff(bytes, n, &bom);
+    if (utf8_only && sniffed != WEB_ENCODING_UTF8) { sniffed = WEB_ENCODING_FAILURE; bom = 0; }
+    if (sniffed) e = sniffed;
+    if (!e) e = WEB_ENCODING_UTF8;
+    if (e == WEB_ENCODING_UTF8 && web_utf8_valid(bytes + bom, n - bom) == n - bom) {
+        if (bom) { memmove(*source, *source + bom, n - bom + 1); *length = n - bom; }
+        return true;
+    }
+    struct web_decoder *d = malloc(sizeof *d);
+    struct web_bytes out = {0};
+    int result = -1;
+    if (d) { web_decoder_init(d, e, false); result = web_decoder_run(d, bytes + bom, n - bom, true, &out); }
+    free(d);
+    if (result != 1 || out.length > JS_SOURCE_LIMIT) { free(out.data); return false; }
+    web_js_prepare_bytes(s->ctx, out.length + 1);
+    char *text = js_malloc(s->ctx, out.length + 1);
+    if (!text) { free(out.data); JSValue error = JS_GetException(s->ctx); JS_FreeValue(s->ctx, error); return false; }
+    if (out.length) memcpy(text, out.data, out.length);
+    text[out.length] = 0; free(out.data);
+    js_free(s->ctx, *source); *source = text; *length = out.length;
+    return true;
+}
+/* HTML "fetch a classic script": legacy extract an encoding from the response's
+   Content-Type, with the encoding prepare the script element chose as the
+   fallback, then decode the body. */
+static bool classic_script_text(struct web_js_state *s, struct js_script *script, const char *headers) {
+    const char *essence; size_t length; char label[64];
+    web_encoding e = WEB_ENCODING_FAILURE;
+    if (content_type_extract(headers, &essence, &length, label, sizeof label) && label[0])
+        e = web_encoding_get(label, strlen(label));
+    if (!e) e = script->encoding;
+    return script_source_decode(s, &script->source, &script->len, e, false);
 }
 /* A fetched classic script compiles on a compiler thread while the document
    goes on; ready_script runs it once that finishes. */
@@ -8547,6 +8666,9 @@ static bool process_pending(struct web_js_state *s) {
                     if (!script->failed && (web_url_has_scheme(script->url, "http") || web_url_has_scheme(script->url, "https"))) {
                         bool oom = false;
                         script->muted = !same_origin_urls(script->url, s->doc->url, &oom);
+                    }
+                    if (!script->failed && !classic_script_text(s, script, web_response_headers(&p->response))) {
+                        script->failed = true; diagnostic_resource(s, p, "out of memory while decoding the classic script");
                     }
                     if (!script->failed) compile_elsewhere(s, script);
                 }

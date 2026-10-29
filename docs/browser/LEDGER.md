@@ -58,6 +58,21 @@
 | R3 | 毎コマ描く WebGL が 7 fps から 2 fps | webglsamples.org の city | 一 CPU・4 GiB で基準も HEAD も 2 fps、4 CPU・4 GiB で基準 6〜7・HEAD 7 fps | 版の差ではなく VM の CPU の数 |
 | R4 | 全体的に遅い | — | 一 CPU の VM（R3 と同じ） | 版の差は未測定。性能の改善は続ける |
 
+### 2026-10-29 の報告（ユーザーが空の build/ から組んだ媒体、ea966154 からの 237 コミットの後）
+
+この会話の前の版の媒体は残っていないので、「退行かどうか」は版を並べて言えない。確かめは QEMU（WHPX、4 CPU、4 GiB、2560×1440、F12 を開いたまま、窓付き、`snapshot=on`）。
+
+| # | 欠陥（ブラウザーの層） | 再現 | 原因 | 状態 |
+|---|---|---|---|---|
+| R5 | 古典的な台本を、符号を解かずに生のバイトのまま QuickJS へ渡していた。Shift_JIS の台本が `SyntaxError: invalid UTF-8 sequence` で落ちる | 2ch.sc の板の頁（index.js・be.js、`application/x-javascript`、charset なし、文書は Shift_JIS） | HTML「fetch a classic script」の legacy extract an encoding と decode が無かった（ea966154 の js.c にも無い。前からの欠け） | 修理（js.c の `classic_script_text`・`script_source_decode`、`content_type_extract` が Fetch の extract a MIME type の charset を返す。prepare the script element で charset 属性か文書の符号を `js_script` の `encoding` へ。data:・blob: の古典的な台本は型の charset を Content-Type へ。モジュールの台本は UTF-8 decode）。QEMU で SyntaxError が消え、console で `beRanks[4].rank` が `S★`、index.js の関数の文が日本語で読めた |
+| R6 | YouTube の検索候補が化ける（U+FFFD と字の混じり） | YouTube の検索欄に「yukkuri」 | 候補は fetch() の text()（仕様どおり常に UTF-8）。サーバーは User-Agent が `Mozilla/5.0` で始まらないと `charset=Shift_JIS` で返す（ホストの curl：`Nocturne/1.0` → Shift_JIS、`Mozilla/5.0 Nocturne/1.0` → UTF-8）。Fetch の default User-Agent value の注は `Mozilla/5.0 (` で始めることを強く勧め、HTML の appVersion はそうでなければ空を返す。User-Agent は 10-10 の a8b239a3 から同じで、日本語の候補が出るようになったのは頁の言語が ja になったから（推測） | ユーザーの判断待ち（`browser_identity.h` の「Honest browser identity」を変えるか） |
+| R7 | 弾幕（CSS の animation で流れる要素）が出ない | bilibili の動画 | 未調査 | 未着手 |
+| R8 | YouTube の再生中に F12 を開くと落ちる | YouTube の動画 | 未調査 | 未着手 |
+| R9 | CNN が bilibili の再生より CPU を使う | CNN の頁、System Monitor | 未調査 | 未着手 |
+| R10 | 音と映像の時刻がずれる | 動画の再生 | 未調査 | 未着手 |
+| R11 | WASM が遅くなった | — | 未調査 | 未着手 |
+| R12 | Cloudflare の challenge を通らない。暗号の実装に欠けが多い | Cloudflare の頁 | 未調査 | 未着手 |
+
 ## 4. 既知の欠陥
 
 | # | 欠陥 | 根拠 | 状態 |
@@ -197,6 +212,7 @@
 | K129 | 退行（ゲストの WPT new1028m、new1028k と同じ条件）：css-anchor-position の 8 頁。うち 3 頁（anchor-name-in-shadow-002・anchor-scope-shadow-all・anchor-scope-shadow-names）は、anchor の名と参照が宣言の木を持たず、別の shadow の木の anchor を拾い、別の木の anchor-scope が名を囲っていた（CSS Shadow 1 §4.2 の tree-scoped な名）。残りの 5 頁は 1028k の合格が偶然で、今の値は仕様どおりの処理から出る：anchor-center-htb-vrl（writing-mode が無い）、anchor-position-multicol-001（段組みが無い）、try-tactic-alignment（`direction` が無く、`css_style_try_tactic` は horizontal-tb ltr を前提）、position-try-cascade-layer-reorder の 2 番目（js.c の offsetTop が static な body の padding edge を引く）、transform-023（OK から TIMEOUT、anchor に固まる所は静的には見つからない。同じ 2 回で rAF・animation に頼る他の頁も多く TIMEOUT に変わった） | new1028m の results.jsonl、anchor の枝の報告 | 3 頁を修理（be27abea、取り込み 54acda16：struct cx の `tree`・`css_tree_scope`、css.c の束縛の木、layout.c の `anchor_named`・`tree_reference_reaches`・`anchor_scope_of`）。check_anchor_position_native 634/0 → 674/0（足した 40 件）。ゲストの WPT は 1028o で確かめる。残りの 5 頁は未着手 |
 | K130 | 合成・3D・包含・操作の性質（mix-blend-mode・isolation・backface-visibility・perspective・perspective-origin・transform-style・contain・will-change・touch-action・user-select）が解析されなかった | WPT css/compositing・css-transforms・css-contain・css-ui の頁 | 修理（008ea3da、取り込み 63223e81：継がれない群 G_EFFECTS `struct css_effects`、layout.c の `box_containment`・`size_containment`・`box_backface_hidden`、paint.c の `paint_blended`、`user_select_used`、counter.c の `struct contained`）。ホストの検査：effects 389/396、counters 603/0 → 624/0、Typed OM 合格 9231 → 9235・不合格 1281 → 1177。落ちる 7 件は perspective-origin-composition の解決値（箱が要る）。ゲストの WPT は 1028o で確かめる |
 | K131 | 途中で見つけた欠け（追っていない）：(1) writing-mode・`direction`・段組みが無い。(2) justify-self の計算値が left・right・self-start・self-end を start・end に畳む。(3) animation の層が値を文字列にして要素自身の木で読み直し、tree-scoped な名の木を失う（anchor-transition-002/003）。(4) js.c の offsetTop・offsetLeft が static な body を offsetParent にしたとき body の padding edge を引く。(5) line-breaking の検査の道具が取り出す layout.c の断片で `size_w`・`size_h`・`size_h_content` が未定義の警告（数は 152/0）。(6) 配置の古いホストの道具（check_absolute_height18 ほか）が `struct cexpr` が無い・build/goal-20261009 が無いで動かない | anchor と合成の枝の報告 | 未着手 |
+| K132 | 途中で見つけた欠け（追っていない）：(1) 名のある form が Document の named property にならない（`document.f` が undefined、onLoad の `document.f.STR.focus()` が TypeError）。(2) 子の閲覧文脈が Window の named property にならない（`frames.cont` が undefined）。(3) Worker の古典的な台本と importScripts は UTF-8 decode の代わりに生のバイトを QuickJS へ渡す（R5 と同じ形）。(4) ホームの YouTube で googlevideo の videoplayback への fetch が HTTP 403 を続けて受ける | 2ch.sc（frameset と iyan.html）、YouTube のホーム、2026-10-29 | 未着手 |
 
 ## 5. 受入表（browser-hikaku の組）
 
