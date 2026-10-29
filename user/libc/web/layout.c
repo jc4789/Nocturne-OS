@@ -385,17 +385,25 @@ static void resolve_edges(box_t *b, float cbw) {
     if (b->kind == B_CELL) memset(b->m, 0, sizeof b->m);
 }
 
-/* a content width from a width-like length, or -1 for auto/none */
+/* the sizing constraint a width is resolved under (css-sizing-3 §2): none (layout), or the min-content or
+   max-content constraint of an intrinsic size contribution */
+enum { SC_NONE, SC_MIN, SC_MAX };
+static float size_w(const box_t *b, const len_t *l, float cbw, int sc, float auto_size);
+static float size_h(const box_t *b, const len_t *l, float cbh);
+static float size_h_content(const box_t *b, const len_t *l, float content, float cbh);
+
+/* a content width from a width-like length, or -1 for auto/none (and a sizing value that behaves as auto) */
 static float spec_w(const box_t *b, const len_t *l, float cbw) {
-    if (l->kind != LK_LEN && l->kind != LK_EXPR) return -1;
+    if (l->kind != LK_LEN && l->kind != LK_EXPR) return l->kind == LK_SIZE ? size_w(b, l, cbw, SC_NONE, NAN) : -1;
     if (len_has_pct(l) && cbw < 0) return -1;
     float w = len_resolve(l, cbw < 0 ? 0 : cbw);
     if (b->st->box_sizing) w -= hext(b);
     return w < 0 ? 0 : w;
 }
 
+/* a content height, or -1 for auto/none and a sizing value that is not definite before b's content is laid out */
 static float spec_h(const box_t *b, const len_t *l, float cbh) {
-    if (l->kind != LK_LEN && l->kind != LK_EXPR) return -1;
+    if (l->kind != LK_LEN && l->kind != LK_EXPR) return l->kind == LK_SIZE ? size_h(b, l, cbh) : -1;
     if (len_has_pct(l) && cbh < 0) return -1;
     float h = len_resolve(l, cbh < 0 ? 0 : cbh);
     if (b->st->box_sizing) h -= vext(b);
@@ -410,13 +418,18 @@ static float clamp_w(const box_t *b, float w, float cbw) {
     return w < 0 ? 0 : w;
 }
 
-static float clamp_h(const box_t *b, float h, float cbh) {
+/* content: b's laid-out content height, which min-height and max-height of an intrinsic sizing value
+   (min-content, calc-size(fit-content, ...), ...) are in terms of; -1 before it is known */
+static float clamp_hc(const box_t *b, float h, float cbh, float content) {
     float mx = spec_h(b, &b->st->max_height, cbh);
+    if (mx < 0 && content >= 0 && b->st->max_height.kind == LK_SIZE) mx = size_h_content(b, &b->st->max_height, content, cbh);
     if (mx >= 0 && h > mx) h = mx;
     float mn = spec_h(b, &b->st->min_height, cbh);
+    if (mn < 0 && content >= 0 && b->st->min_height.kind == LK_SIZE) mn = size_h_content(b, &b->st->min_height, content, cbh);
     if (mn >= 0 && h < mn) h = mn;
     return h < 0 ? 0 : h;
 }
+static float clamp_h(const box_t *b, float h, float cbh) { return clamp_hc(b, h, cbh, -1); }
 
 /* A non-replaced absolute/fixed box with auto height and both vertical
    insets specified has a definite content height before its descendants are
@@ -963,6 +976,156 @@ static float stf_width(box_t *c, float avail) {
     return fminf_(fmaxf_(mn, a), mx);
 }
 
+/* ---------------------------------------------------------------- sizing values (css-sizing-3 §3.2, css-sizing-4 §3.2, §7) */
+static bool replaced_box(const box_t *b) { return b->kind == B_ATOMIC && b->atomic != AT_INLINE_BLOCK; }
+/* an abspos box's horizontal insets that are not auto, against cbw */
+static float abs_insets_w(const box_t *b, float cbw) {
+    const len_t *in = b->st->inset;
+    return (len_auto(&in[3]) ? 0 : len_resolve(&in[3], cbw)) + (len_auto(&in[1]) ? 0 : len_resolve(&in[1], cbw));
+}
+/* stretch-fit (css-sizing-3 §3.2): the content width that fits b's margin box, auto margins as zero, to cbw */
+static float stretch_w(const box_t *b, float cbw) {
+    if (cbw < 0) return -1;
+    float w = cbw - (b->abspos ? abs_insets_w(b, cbw) : 0) - b->m[1] - b->m[3] - hext(b);
+    return w < 0 ? 0 : w;
+}
+/* the content width b's auto width is here (css-sizing-3 §3.1): what block_width, size_float, abs_place, the
+   flex and grid item sizing give an auto width, before they apply it */
+static float auto_w(box_t *b, float cbw, int sc) {
+    float avail = sc == SC_MIN ? 0 : sc == SC_MAX || cbw < 0 ? INF : cbw;
+    const box_t *p = b->parent;
+    if (is_flex_item(b) && p->kind == B_FLEX) {
+        bool column = p->st->flex_direction == FD_COLUMN || p->st->flex_direction == FD_COLUMN_REVERSE;
+        if (!column) { float mn, mx; intrinsic(b, &mn, &mx); return mx; } /* the content size (css-flexbox-1 §9.2) */
+        int al = ai_used(b->st->align_self != 255 ? b->st->align_self : p->st->align_items);
+        if (sc == SC_NONE && cbw >= 0 && p->st->flex_wrap == FW_NOWRAP && al == AI_STRETCH &&
+            !len_auto(&b->st->margin[1]) && !len_auto(&b->st->margin[3])) return stretch_w(b, cbw);
+        return stf_width(b, avail);
+    }
+    if (is_flex_item(b)) { /* a grid item: stretched in its area, or fit-content */
+        int js = ai_used(b->st->justify_self != 255 ? b->st->justify_self : p->st->justify_items);
+        if (sc == SC_NONE && cbw >= 0 && js == AI_STRETCH && !len_auto(&b->st->margin[1]) && !len_auto(&b->st->margin[3]))
+            return stretch_w(b, cbw);
+        return stf_width(b, avail);
+    }
+    if (b->abspos) {
+        if (sc == SC_NONE && cbw >= 0 && !len_auto(&b->st->inset[3]) && !len_auto(&b->st->inset[1])) return stretch_w(b, cbw);
+        return stf_width(b, sc == SC_NONE && cbw >= 0 ? cbw - abs_insets_w(b, cbw) : avail);
+    }
+    if (b->kind == B_ATOMIC || b->kind == B_TABLE || b->floated || (b->node && !b->anon && b->node->tag == T_button) ||
+        sc != SC_NONE || cbw < 0)
+        return stf_width(b, avail);
+    return stretch_w(b, cbw); /* a block-level box in normal flow fills its containing block */
+}
+/* a <length-percentage> argument (a len_t, or a tree) against cbw; -1 when its percentage is indefinite */
+static float size_argument(const len_t *arg, const struct css_calc *tree, float cbw) {
+    if (arg) return len_has_pct(arg) && cbw < 0 ? -1 : len_resolve(arg, cbw < 0 ? 0 : cbw);
+    if (cbw < 0 && !css_calc_percent_free(tree)) return -1;
+    double v = css_calc_value(tree, cbw < 0 ? 0 : cbw, NULL, NULL);
+    return isfinite(v) ? (float)v : 0;
+}
+/* the content width a sizing keyword (CSS_SIZING_*) gives b, fit-content()'s argument arg or tree; -1: it
+   behaves as auto (an indefinite stretch), or b is replaced, whose keywords size_replaced resolves from its
+   natural size. auto_size: what auto stands for (NAN: b's auto width) */
+static float keyword_w(box_t *b, int kind, const len_t *arg, const struct css_calc *tree, float cbw, int sc,
+                       float auto_size) {
+    if (kind == CSS_SIZING_STRETCH && sc == SC_NONE) return stretch_w(b, cbw);
+    if (replaced_box(b)) return -1;
+    float avail = sc == SC_MIN ? 0 : sc == SC_MAX || cbw < 0 ? INF : cbw, mn, mx;
+    switch (kind) {
+    case CSS_SIZING_AUTO: return isnan(auto_size) ? auto_w(b, cbw, sc) : auto_size;
+    case CSS_SIZING_STRETCH: return auto_w(b, cbw, sc); /* under a sizing constraint, as auto */
+    case CSS_SIZING_MIN_CONTENT: intrinsic(b, &mn, &mx); return mn;
+    case CSS_SIZING_MAX_CONTENT: case CSS_SIZING_CONTENT: intrinsic(b, &mn, &mx); return mx;
+    case CSS_SIZING_FIT_CONTENT: return stf_width(b, avail);
+    case CSS_SIZING_FIT_CONTENT_FN: { /* min(max-content, max(min-content, stretch(argument))) */
+        float a = size_argument(arg, tree, cbw);
+        return stf_width(b, a >= 0 ? a : avail);
+    }
+    }
+    return -1;
+}
+static float calc_size_px(const struct css_calc *expr, float size, float basis) {
+    double v = css_calc_size_value(expr, size, basis < 0 ? 0 : basis);
+    return v > 1e7 ? 1e7f : v < -1e7 ? -1e7f : (float)v;
+}
+/* the content width of a sizing value l (LK_SIZE) of b for the percentage basis cbw (-1: indefinite) under
+   the constraint sc; -1 when it behaves as auto. calc-size()'s size is its basis's width in the box
+   box-sizing names, and so is its result (§7.1); its percentages resolve against 0 when cbw is indefinite */
+static float size_w(const box_t *cb, const len_t *l, float cbw, int sc, float auto_size) {
+    box_t *b = (box_t *)cb; /* its intrinsic sizes are cached in it */
+    if (l->size != CSS_SIZING_CALC_SIZE) {
+        len_t arg = css_size_argument(l);
+        return keyword_w(b, l->size, l->size == CSS_SIZING_FIT_CONTENT_FN ? &arg : NULL, NULL, cbw, sc, auto_size);
+    }
+    const struct css_calc *tree;
+    int kind = css_calc_size_basis(l->expr, &tree);
+    float bs = b->st->box_sizing ? hext(b) : 0, size = 0;
+    if (kind == CSS_SIZING_LENGTH) {
+        if (cbw < 0 && !css_calc_percent_free(tree)) return -1; /* as the <calc-sum> would: auto */
+    } else if (kind != CSS_SIZING_ANY) {
+        float k = keyword_w(b, kind, NULL, tree, cbw, sc, auto_size);
+        if (k < 0) return -1;
+        size = k + bs;
+    }
+    float w = calc_size_px(l->expr, size, cbw) - bs;
+    return w < 0 ? 0 : w;
+}
+/* a block-axis stretch-fit: -1 when cbh is indefinite */
+static float stretch_h(const box_t *b, float cbh) {
+    if (cbh < 0) return -1;
+    float h = cbh - b->m[0] - b->m[2] - vext(b);
+    if (b->abspos) {
+        const len_t *in = b->st->inset;
+        h -= (len_auto(&in[0]) ? 0 : len_resolve(&in[0], cbh)) + (len_auto(&in[2]) ? 0 : len_resolve(&in[2], cbh));
+    }
+    return h < 0 ? 0 : h;
+}
+/* the content height a sizing value gives before b's content is laid out: stretch and calc-size() of any, a
+   <calc-sum> or stretch when they are definite; -1 otherwise. The intrinsic keywords are the automatic
+   height in the block axis (css-sizing-3 §3.2) and indefinite (§7: calc-size() with them too) */
+static float size_h(const box_t *b, const len_t *l, float cbh) {
+    if (l->size == CSS_SIZING_STRETCH) return stretch_h(b, cbh);
+    if (l->size != CSS_SIZING_CALC_SIZE) return -1;
+    const struct css_calc *tree;
+    int kind = css_calc_size_basis(l->expr, &tree);
+    float bs = b->st->box_sizing ? vext(b) : 0, size = 0;
+    if (kind == CSS_SIZING_LENGTH) {
+        if (cbh < 0 && !css_calc_percent_free(tree)) return -1;
+    } else if (kind == CSS_SIZING_STRETCH) {
+        float s = stretch_h(b, cbh);
+        if (s < 0) return -1;
+        size = s + bs;
+    } else if (kind != CSS_SIZING_ANY) return -1;
+    float h = calc_size_px(l->expr, size, cbh) - bs;
+    return h < 0 ? 0 : h;
+}
+/* after b's content is laid out, content its height: the content height an intrinsic sizing value gives
+   (calc-size() of one with content as its size); -1 for one that size_h resolves or that behaves as auto */
+static float size_h_content(const box_t *b, const len_t *l, float content, float cbh) {
+    if (l->kind != LK_SIZE || l->size == CSS_SIZING_STRETCH) return -1;
+    if (l->size != CSS_SIZING_CALC_SIZE) return content;
+    const struct css_calc *tree;
+    int kind = css_calc_size_basis(l->expr, &tree);
+    if (kind == CSS_SIZING_ANY || kind == CSS_SIZING_LENGTH || (kind == CSS_SIZING_STRETCH && cbh >= 0)) return -1;
+    float bs = b->st->box_sizing ? vext(b) : 0;
+    float h = calc_size_px(l->expr, content + bs, cbh) - bs;
+    return h < 0 ? 0 : h;
+}
+/* a replaced box's width (or height) under a sizing value whose basis is intrinsic: from size, the one its
+   natural size gives (for a replaced box min-content, max-content and fit-content are that size); -1 when
+   the value is resolved otherwise (spec_w, spec_h) or behaves as auto */
+static float replaced_size(const box_t *b, const len_t *l, float size, float base, bool horizontal) {
+    if (l->kind != LK_SIZE || l->size == CSS_SIZING_STRETCH) return -1;
+    if (l->size != CSS_SIZING_CALC_SIZE) return size;
+    const struct css_calc *tree;
+    int kind = css_calc_size_basis(l->expr, &tree);
+    if (kind == CSS_SIZING_ANY || kind == CSS_SIZING_LENGTH || kind == CSS_SIZING_STRETCH) return -1;
+    float bs = b->st->box_sizing ? horizontal ? hext(b) : vext(b) : 0;
+    float r = calc_size_px(l->expr, size + bs, base) - bs;
+    return r < 0 ? 0 : r;
+}
+
 /* ---------------------------------------------------------------- replaced elements */
 static const char *input_type(node_t *n) {
     const char *t = node_attr(n, "type");
@@ -1063,6 +1226,15 @@ static void size_replaced(box_t *c, float cbw, float cbh) {
     if (w < 0 && h < 0) w = iw, h = ih;
     else if (w < 0) w = ratio > 0 ? h * ratio : iw;
     else if (h < 0) h = ratio > 0 ? w / ratio : ih;
+    /* a sizing keyword or calc-size() of one: from the size the natural one gave, the other axis through the ratio */
+    if (derive_w && c->st->width.kind == LK_SIZE) {
+        float k = replaced_size(c, &c->st->width, w, cbw, true);
+        if (k >= 0 && k != w) { w = k; if (derive_h && ratio > 0) h = (float)(w / ratio); }
+    }
+    if (derive_h && c->st->height.kind == LK_SIZE) {
+        float k = replaced_size(c, &c->st->height, h, cbh, false);
+        if (k >= 0 && k != h) { h = k; if (derive_w && ratio > 0) w = (float)(h * ratio); }
+    }
     float mx = spec_w(c, &c->st->max_width, cbw);
     if (mx >= 0 && w > mx) {
         if (ratio > 0 && derive_h) h = mx / ratio;
@@ -1144,7 +1316,9 @@ static void size_control(box_t *c, float cbw, float cbh) {
     if(size_container(c)){w=0;if(st->container_type==CT_SIZE)h=0;}
     float sw = spec_w(c, &st->width, cbw), sh = spec_h(c, &st->height, cbh);
     if (sw >= 0) w = sw;
+    else if (st->width.kind == LK_SIZE) { float k = replaced_size(c, &st->width, w, cbw, true); if (k >= 0) w = k; }
     if (sh >= 0) h = sh;
+    else if (st->height.kind == LK_SIZE) { float k = replaced_size(c, &st->height, h, cbh, false); if (k >= 0) h = k; }
     c->w = clamp_w(c, w, cbw);
     c->h = clamp_h(c, h, cbh);
     if (c->atomic == AT_CHECKBOX || c->atomic == AT_RADIO) c->baseline = c->last_baseline = c->h - 2;
@@ -2634,7 +2808,8 @@ static bool collapses_top(const box_t *b) {
 static bool collapses_bottom(const box_t *b) {
     return b->kind == B_BLOCK && !is_bfc_root(b) && b->st->border_width[2] == 0 &&
            len_resolve(&b->st->padding[2], 0) == 0 && b->st->padding[2].pct == 0 && !b->inline_ctx &&
-           len_auto(&b->st->height) && (b->st->min_height.kind == LK_AUTO || len_resolve(&b->st->min_height, 0) == 0);
+           len_auto(&b->st->height) && (b->st->min_height.kind == LK_AUTO ||
+                                         (b->st->min_height.kind != LK_SIZE && len_resolve(&b->st->min_height, 0) == 0));
 }
 
 static box_t *first_inflow(const box_t *b) {
@@ -3017,7 +3192,7 @@ static void table_fixed_tracks(box_t *t,struct tgrid *g) {
     for(int j=0;j<g->ncols;j++)g->w[j]=-1;
     for(int j=0;j<g->columns.n;j++) {
         const style_t *s=g->columns.v[j];
-        if(!len_auto(&s->width)){float w=len_resolve(&s->width,t->w);if(w>=0)g->w[j]=w;}
+        if(s->width.kind==LK_LEN||s->width.kind==LK_EXPR){float w=len_resolve(&s->width,t->w);if(w>=0)g->w[j]=w;}
     }
     /* Explicit columns precede first-row cells. A spanning first-row width
        supplies only columns still unspecified; later rows cannot resize them. */
@@ -3901,6 +4076,11 @@ static void layout_flex(box_t *b, float defh) {
         if (fb->kind == LK_LEN || fb->kind == LK_EXPR) {
             base = len_resolve(fb, cw);
             if (c->st->box_sizing) base -= hext(c);
+        } else if (fb->kind == LK_SIZE) {
+            /* content, a sizing keyword or calc-size() (css-flexbox-1 §7.2, css-sizing-4 §7): its auto is flex-basis
+               auto, the width's value or else the content size */
+            float sw = spec_w(c, &c->st->width, cw);
+            base = size_w(c, fb, cw, SC_NONE, sw >= 0 ? sw : mx);
         }
         if (base < 0) base = spec_w(c, &c->st->width, cw);
         if (base < 0) base = mx;
@@ -4899,6 +5079,15 @@ static void outer_intrinsic(box_t *c, float *mn, float *mx) {
         *mn = *mx = w + ext;
         return;
     }
+    /* a sizing value: what it is under a min-content and a max-content constraint (css-sizing-3 §5.1) */
+    if (wl->kind == LK_SIZE && !replaced_box(c)) {
+        float lo = size_w(c, wl, -1, SC_MIN, NAN), hi = size_w(c, wl, -1, SC_MAX, NAN);
+        if (lo >= 0 && hi >= 0) {
+            *mn = clamp_w(c, lo, -1) + ext;
+            *mx = clamp_w(c, hi, -1) + ext;
+            return;
+        }
+    }
     intrinsic(c, mn, mx);
     float lo = spec_w(c, &c->st->min_width, -1), hi = spec_w(c, &c->st->max_width, -1);
     if (hi >= 0) {
@@ -5284,7 +5473,12 @@ static void layout_inner_body(box_t *b, struct bfc *f, float ox, float oy, float
     if (b->kind != B_TABLE) {
         float content = b->h;
         if (sh >= 0) b->h = sh;
-        if (!split_inline) b->h = clamp_h(b, b->h, cbh);
+        else if (!split_inline && b->st->height.kind == LK_SIZE) {
+            /* a sizing keyword or calc-size() of one: the content height, as its size */
+            float h = size_h_content(b, &b->st->height, content, cbh);
+            if (h >= 0) b->h = h;
+        }
+        if (!split_inline) b->h = clamp_hc(b, b->h, cbh, content);
         /* HTML rendering §15.5.3: a button's anonymous content box (not a flex or grid
            button's) is centred vertically when it does not overflow the button. */
         if (b->node && !b->anon && !b->node->foreign && b->node->tag == T_button) {
@@ -5453,6 +5647,8 @@ static bool layout_cache_prepare(box_t *b) {
         (b->kind==B_GRID && (grid_template_has_pct(s->grid_rows) || grid_template_has_pct(s->grid_auto_rows))) ||
         len_has_pct(&s->height) || len_has_pct(&s->flex_basis) ||
         len_has_pct(&s->min_height) || len_has_pct(&s->max_height) ||
+        s->height.kind == LK_SIZE || s->flex_basis.kind == LK_SIZE || s->min_height.kind == LK_SIZE ||
+        s->max_height.kind == LK_SIZE ||
         len_has_pct(&s->inset[0]) || len_has_pct(&s->inset[2]);
     for (box_t *c = b->first; c; c = c->next) {
         /* A cached parent must not suppress list_abs/static-position work.

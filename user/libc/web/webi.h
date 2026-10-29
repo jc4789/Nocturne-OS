@@ -302,13 +302,26 @@ node_t *node_ancestor(node_t *n, int tag); /* the nearest ancestor (or n) with t
 void node_text_content(const node_t *n, sbuf *out);
 
 /* ---------------------------------------------------------------- CSS values */
-/* a length or percentage, possibly a math function: resolved at layout time against a base */
-enum { LK_AUTO, LK_LEN, LK_NONE, LK_EXPR, LK_NORMAL, LK_NUMBER };
+/* a length or percentage, possibly a math function: resolved at layout time against a base.
+   LK_SIZE: a sizing value of the sizing properties (css-sizing-3 §3.2, css-sizing-4 §3.2, §7) that
+   layout resolves: a keyword, fit-content(<length-percentage>) or calc-size() */
+enum { LK_AUTO, LK_LEN, LK_NONE, LK_EXPR, LK_NORMAL, LK_NUMBER, LK_SIZE };
+/* the sizing keywords (<size-keyword>, and flex-basis's content), calc-size()'s other bases, and the
+   function forms: a len_t's size, a calc-size() tree's basis (cssmath.c) */
+enum { CSS_SIZING_AUTO = 1, CSS_SIZING_MIN_CONTENT, CSS_SIZING_MAX_CONTENT, CSS_SIZING_FIT_CONTENT, CSS_SIZING_STRETCH,
+       CSS_SIZING_CONTENT,
+       CSS_SIZING_FIT_CONTENT_FN, /* fit-content(<length-percentage>): its argument as a length */
+       CSS_SIZING_ANY,            /* calc-size(any, ...) */
+       CSS_SIZING_LENGTH,         /* calc-size(<calc-sum>, ...) */
+       CSS_SIZING_CALC_SIZE };    /* calc-size(): a len_t's expr is the tree; a basis: a nested calc-size() */
 struct css_calc;
 typedef struct len {
     uint8_t kind;
-    float px, pct; /* LK_LEN: px + pct% of the base; LK_NUMBER: px is the number */
-    struct css_calc *expr; /* LK_EXPR: a computed calculation (cssmath.c) that needs the base */
+    uint8_t size; /* LK_SIZE: CSS_SIZING_* (a keyword, CSS_SIZING_FIT_CONTENT_FN or CSS_SIZING_CALC_SIZE) */
+    float px, pct; /* LK_LEN: px + pct% of the base; LK_NUMBER: px is the number; fit-content()'s argument */
+    /* LK_EXPR: a computed calculation (cssmath.c) that needs the base; LK_SIZE: fit-content()'s argument
+       when it is one, calc-size()'s tree */
+    struct css_calc *expr;
 } len_t;
 float len_resolve(const len_t *l, float base); /* LK_AUTO/LK_NONE resolve to 0 */
 bool css_length_equal(const len_t *,const len_t *); /* semantic computed expression, not arena address */
@@ -327,6 +340,15 @@ bool css_number_token(const char **s, const char *end, float *out); /* a CSS <nu
 const char *css_parse_url(const char *s, size_t n, arena_t *a); /* url(...) (or a string) unescaped; NULL: not one */
 void css_length_complement(arena_t *a, const len_t *x, const len_t *y, len_t *out); /* 100% - x - y (y may be NULL) */
 void css_length_mix(arena_t *a, const len_t *x, const len_t *y, double ka, double kb, len_t *out); /* ka·x + kb·y */
+/* the sizing values (cssmath.c): a keyword by name (CSS_SIZING_*, 0: none) and its name */
+int css_sizing_keyword(const char *s, size_t n);
+const char *css_sizing_name(int size);
+/* fit-content()'s argument of l (LK_SIZE, CSS_SIZING_FIT_CONTENT_FN) as a <length-percentage> */
+len_t css_size_argument(const len_t *l);
+/* ka·x + kb·y of two values of a sizing property (css-sizing-4 §7.2) as computed-value text: either is
+   calc-size(), or keywords combine with <length-percentage>s (interpolate-size: allow-keywords); false:
+   they do not combine */
+bool css_size_mix(arena_t *a, const len_t *x, const len_t *y, double ka, double kb, bool allow_keywords, sbuf *out);
 bool css_query_length(const char *, size_t, float em, float rem, float vw, float vh, double *value);
 
 /* ---------------------------------------------------------------- units and math functions (cssmath.c) */
@@ -402,6 +424,17 @@ bool css_calc_anchored(const struct css_calc *c);
 struct css_calc *css_calc_map_anchors(arena_t *a, const struct css_calc *c, css_calc_anchor_map map, void *context);
 struct css_calc *css_calc_anchor(arena_t *a, const struct css_anchor_function *f); /* a <length> */
 struct css_calc *css_calc_length(arena_t *a, const len_t *l); /* a computed <length-percentage> as a tree */
+/* calc-size() (css-sizing-4 §7) from s..s+n: its tree, whose basis is any, a <calc-sum>, a nested calc-size(),
+   or one of keywords (bits 1 << CSS_SIZING_*; fit-content() with CSS_SIZING_FIT_CONTENT_FN); NULL: invalid.
+   A computed value (P->cx) resolves its relative lengths; neither is resolved further before layout (§7.1) */
+struct css_calc *css_calc_size_read(struct css_calc_parse *P, unsigned keywords, const char *s, size_t n);
+bool css_calc_is_size(const char *s, size_t n); /* s starts with calc-size( */
+/* its basis through its nesting: CSS_SIZING_* (a keyword, FIT_CONTENT_FN, ANY or LENGTH) and that basis's
+   tree (LENGTH: the <calc-sum>; FIT_CONTENT_FN: the argument; NULL otherwise) */
+int css_calc_size_basis(const struct css_calc *c, const struct css_calc **tree);
+/* its used value (§7.1): size is the innermost basis's size (a keyword's, fit-content()'s; LENGTH and ANY
+   need none), basis what its percentages are of (0 when that is indefinite) */
+double css_calc_size_value(const struct css_calc *c, double size, double basis);
 /* cssprop.c: an anchor function's arguments from *s, after its '(' up to and past its ')'; NULL: invalid.
    Its text and equality */
 const struct css_anchor_function *css_anchor_function_read(struct css_calc_parse *P, const char **s, const char *e,
@@ -1224,6 +1257,7 @@ typedef struct style {
     uint8_t box_orient;
     uint8_t transform_box; /* TB_*: the transform-origin/percentage reference box */
     bool legacy_box; /* authored -webkit-box/-webkit-inline-box display */
+    uint8_t interpolate_size; /* css-sizing-4 §7.3, inherited: 0 numeric-only, 1 allow-keywords */
     uint32_t line_clamp; /* legacy positive line budget; zero = none */
     const char *container_names; /* authored identifier list, NULL = none */
     uint16_t font_weight;
