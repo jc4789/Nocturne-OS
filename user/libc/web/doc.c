@@ -996,8 +996,13 @@ web_doc *web_live_child(const char *html, size_t len, const char *url, const cha
 static bool mime_token_char(char c) {
     return c > ' ' && c < 0x7f && !strchr("\"(),/:;<=>?@[\\]{}", c);
 }
-/* MIME Sniffing "parse a MIME type" as far as the essence, then HTML's
-   "HTML MIME type" and "XML MIME type". */
+/* MIME Sniffing "parse a MIME type" as far as the essence, then HTML "load a
+   document"'s types: an HTML MIME type, an XML MIME type, and the text
+   types (a JavaScript MIME type, a JSON MIME type, text/css, text/plain,
+   text/vtt). No JSON or XML type is explicitly supported: none has dedicated
+   processing rules or an external application here. The other text types
+   are text documents too: this user agent hands no type to external software,
+   and its processing rules for them are a text document's. */
 enum web_document_kind web_document_kind(const char *type) {
     if (!type) return WEB_DOCUMENT_OTHER;
     const char *p = type;
@@ -1015,6 +1020,9 @@ enum web_document_kind web_document_kind(const char *type) {
     if (text && strn_ieq(subtype, "html", subtype_length)) return WEB_DOCUMENT_HTML;
     if ((text || strn_ieq(p, "application", type_length)) && strn_ieq(subtype, "xml", subtype_length)) return WEB_DOCUMENT_XML;
     if (subtype_length >= 4 && strn_ieq(end - 4, "+xml", 4)) return WEB_DOCUMENT_XML;
+    size_t essence_length = (size_t)(end - p);
+    if (text || web_javascript_mime_essence(p, essence_length) || web_json_mime_essence(p, essence_length))
+        return WEB_DOCUMENT_TEXT;
     return WEB_DOCUMENT_OTHER;
 }
 /* The essence of a valid type, lowercase (malloc'd). */
@@ -1107,12 +1115,23 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
         if(transport_label[0])charset=transport_label;
     }
     d->html_srcdoc=parent && url && !strcmp(url,"about:srcdoc");
-    if (!d->html_srcdoc && web_document_kind(type) == WEB_DOCUMENT_XML) {
+    enum web_document_kind kind = d->html_srcdoc ? WEB_DOCUMENT_HTML : web_document_kind(type);
+    if (kind == WEB_DOCUMENT_XML) {
         /* HTML "load an XML document": a Document of type "xml" whose content
            type is the response's, in no-quirks mode, and its XML parser. */
         d->content_type = mime_essence(type);
         d->xml_parser = d->content_type ? xml_parser_begin(d, html ? html : "", html ? len : 0, charset) : NULL;
         if (!d->xml_parser) { web_free(d); return NULL; }
+    } else if (kind == WEB_DOCUMENT_TEXT) {
+        /* HTML "load a text document": a Document of type "html" whose content type is the
+           response's, its parser cannot change the mode flag set and its mode no-quirks, and
+           an HTML parser that reads every byte as text (html_begin_text). The bytes become
+           characters by the type's own rules (html_decode_text): a JSON MIME type's differ. */
+        d->text_document = true;
+        d->content_type = mime_essence(type);
+        d->parser = d->content_type ? html_begin_text(d, html ? html : "", html ? len : 0, charset,
+            web_json_mime_essence(d->content_type, strlen(d->content_type)), !(d->sandbox_flags&SB_SCRIPTS)) : NULL;
+        if (!d->parser) { web_free(d); return NULL; }
     } else {
         d->parser = d->html_srcdoc?html_begin_string(d,html?html:"",html?len:0,!(d->sandbox_flags&SB_SCRIPTS),true):
             html_begin(d, html ? html : "", html ? len : 0, charset, !(d->sandbox_flags&SB_SCRIPTS));

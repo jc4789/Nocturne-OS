@@ -19,7 +19,7 @@ def struct(text,name):
 types=''.join(struct(web,n) for n in ('web_request','web_response'))
 types+=struct((root / 'user/include/webnet.h').read_text(encoding='utf-8'),'webnet_request')
 at=js.index('struct js_module {'); types+=js[at:js.index(';\n',at)+2]
-loader=''.join(fn(js,s) for s in ('static JSValue module_bridge_call(', 'static char *module_url(', 'static char *normalize_module(', 'static bool javascript_essence(', 'static bool mime_space(', 'static bool mime_token(', 'static bool valid_mime_essence(', 'static bool javascript_mime(', 'static void set_import_meta(', 'static struct js_module *cache_module(', 'static bool module_context_current(', 'static JSModuleDef *load_module('))
+loader=''.join(fn(js,s) for s in ('static JSValue module_bridge_call(', 'static char *module_url(', 'static char *normalize_module(', 'bool web_javascript_mime_essence(', 'static bool mime_space(', 'static bool mime_token(', 'static bool valid_mime_essence(', 'static bool javascript_mime(', 'static void set_import_meta(', 'static struct js_module *cache_module(', 'static bool module_context_current(', 'static JSModuleDef *load_module('))
 host=fn(browser,'static enum webnet_kind network_kind(')+fn(browser,'static void response_copy(')
 host+=struct(browser,'synchronous_load')+''.join(fn(browser,s) for s in ('static void synchronous_completed(', 'static bool host_sync_request(', 'static bool host_sync_load('))
 cors='static const char *request_origin(const struct job *j) { return j->origin_tainted ? "null" : j->origin; }\n'+''.join(fn(fetch,s) for s in ('static bool field_slice(', 'static bool field(', 'static bool cors_allowed('))

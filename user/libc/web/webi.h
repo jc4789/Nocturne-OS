@@ -2387,6 +2387,9 @@ struct web_doc {
     char encoding[32]; /* canonical transport encoding; DOMString documents use UTF-8 */
     bool encoding_certain; /* BOM/transport/accepted meta/author entry; strings never reparse */
     bool html_srcdoc;
+    /* HTML "load a text document" made it (content_type is the text type), and its text is the
+       content: the user agent's text style (css.c) applies until document.open() replaces it. */
+    bool text_document;
     int32_t custom_registry_id;
     void *custom_registry_realm;
     struct web_html_policy *html_policy;
@@ -2521,6 +2524,9 @@ struct html_parser *html_begin(web_doc *d, const char *html, size_t n, const cha
 struct html_parser *html_begin_string(web_doc *d, const char *html, size_t n, bool scripting, bool allow_shadow);
 struct html_parser *html_begin_mode(web_doc *d, const char *html, size_t n, const char *charset, enum html_scripting_mode mode);
 struct html_parser *html_begin_string_mode(web_doc *d, const char *html, size_t n, enum html_scripting_mode mode, bool allow_shadow);
+/* HTML "load a text document": the parser of d (text_document set) after its pre start tag, in
+   the PLAINTEXT state for the bytes; json: the type is a JSON MIME type (their decoding). */
+struct html_parser *html_begin_text(web_doc *d, const char *bytes, size_t n, const char *charset, bool json, bool scripting);
 struct html_parser *html_open(web_doc *d);
 void html_close(struct html_parser *parser);
 int html_resume(struct html_parser *p, node_t **script);
@@ -2822,6 +2828,10 @@ int web_js_editing_action(web_doc *d,const char *action,bool extend,const char *
 /* The document selection's text, malloc owned; NULL when empty. */
 char *web_js_selection_text(web_doc *d,size_t *length);
 void web_js_selection_changed(web_doc *d, node_t *node);
+/* MIME Sniffing's groups of a MIME type's essence (length bytes, ASCII case-insensitive), as the
+   script loader (js.c) and the document loader (doc.c's web_document_kind) read them. */
+bool web_javascript_mime_essence(const char *essence, size_t length);
+bool web_json_mime_essence(const char *essence, size_t length);
 
 /* Fetch's data URL processor. Input is a serialized URL; outputs are malloc
  * owned, binary body is length-delimited (and also NUL terminated). Return 1

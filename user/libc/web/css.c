@@ -5755,7 +5755,7 @@ static struct ient *index_rule(arena_t *a, struct css_index *x, const struct rul
     return ie;
 }
 
-static sheet_t *ua_sheet, *quirks_sheet;
+static sheet_t *ua_sheet, *quirks_sheet, *text_sheet;
 static arena_t ua_arena;
 
 static unsigned selector_form_features(const struct compound *compound) {
@@ -6179,6 +6179,11 @@ static struct css_ctx *build_ctx(web_doc *d, int vw, int vh) {
                         " font-size: medium; font-style: normal; }";
         quirks_sheet = css_parse_sheet(&ua_arena, q, strlen(q), "about:blank", -1, NULL);
         quirks_sheet->ua = true;
+        /* A text document (HTML "load a text document", whose user agent may style it): its
+           text wraps at the viewport, as long lines and words break. */
+        const char *text = "pre { white-space: pre-wrap; overflow-wrap: break-word; }";
+        text_sheet = css_parse_sheet(&ua_arena, text, strlen(text), "about:blank", -1, NULL);
+        text_sheet->ua = true;
     }
     pvec *sh = &d->sty.sheets;
     if (!sheets_sort(d)) return x;
@@ -6190,10 +6195,10 @@ static struct css_ctx *build_ctx(web_doc *d, int vw, int vh) {
     uint32_t order = 1;
     const struct css_index **registering = sh->n ? ar_alloc(&x->a, (size_t)sh->n * sizeof *registering) : NULL;
     int nregistering = 0;
-    for (int i = -2; i < sh->n; i++) {
-        sheet_t *s = i == -2 ? ua_sheet : i == -1 ? quirks_sheet : sh->v[i];
+    for (int i = -3; i < sh->n; i++) {
+        sheet_t *s = i == -3 ? ua_sheet : i == -2 ? quirks_sheet : i == -1 ? text_sheet : sh->v[i];
         if (!sheet_media_ok(s,vw,vh,scripting)) continue;
-        if (i == -1 && !d->quirks) continue;
+        if ((i == -2 && !d->quirks) || (i == -1 && !d->text_document)) continue;
         struct css_index *index = sheet_index(d, s);
         if (!index) return x;
         if (i >= 0 && index->properties) registering[nregistering++] = index;
@@ -10306,6 +10311,7 @@ bool css_inspect_rules(web_doc *d, node_t *e, const struct css_inspect_sink *sin
     uint32_t order = 0;
     if (ua_sheet && !inspect_sheet(d, ua_sheet, e, &order, sink)) return false;
     if (quirks_sheet && d->quirks && !inspect_sheet(d, quirks_sheet, e, &order, sink)) return false;
+    if (text_sheet && d->text_document && !inspect_sheet(d, text_sheet, e, &order, sink)) return false;
     for (int i = 0; i < d->sty.sheets.n; i++)
         if (!inspect_sheet(d, d->sty.sheets.v[i], e, &order, sink)) return false;
     return true;

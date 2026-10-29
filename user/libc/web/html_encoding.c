@@ -61,7 +61,12 @@ void html_transport_label(const char *type, char *label, size_t capacity) {
     if (name && (size_t)(end - name) < capacity) { memcpy(label, name, end - name); label[end - name] = 0; }
 }
 
-char *html_decode_bytes(web_doc *d, const char *src, size_t n, const char *label, size_t *length) {
+/* What the bytes are: an HTML document's markup, or a text document's characters (HTML "load a
+   text document"), of a JSON MIME type or of another text type. */
+enum decoded { DECODED_MARKUP, DECODED_TEXT, DECODED_JSON };
+
+static char *decode_document(web_doc *d, const char *src, size_t n, const char *label, enum decoded kind,
+                             size_t *length) {
     if (!d || (!src && n) || !length) return NULL;
     const uint8_t *bytes = (const uint8_t *)(src ? src : "");
     size_t bom = 0;
@@ -69,7 +74,12 @@ char *html_decode_bytes(web_doc *d, const char *src, size_t n, const char *label
     web_encoding e = web_encoding_bom_sniff(bytes, n, &bom);
     if (!e && label && *label) e = web_encoding_get(label, strlen(label));
     d->encoding_certain = e != WEB_ENCODING_FAILURE;
-    if (!e) {
+    /* "load a text document" leaves how the bytes become characters to the specification of
+       the type. JSON text is UTF-8 (RFC 8259 §8.1); a BOM or the response's charset still
+       decides first (WPT encoding/json-document-utf8.html), never a container's encoding. */
+    if (!e && kind == DECODED_JSON) e = WEB_ENCODING_UTF8;
+    /* The prescan is optional, and a text document has no markup to declare an encoding. */
+    if (!e && kind == DECODED_MARKUP) {
         lxb_html_encoding_t scan = {0};
         if (lxb_html_encoding_init(&scan) != LXB_STATUS_OK) return NULL;
         size_t name_length = 0;
@@ -90,13 +100,22 @@ char *html_decode_bytes(web_doc *d, const char *src, size_t n, const char *label
         web_encoding inherited = web_encoding_get(container->encoding, strlen(container->encoding));
         if (inherited != LXB_ENCODING_UTF_16BE && inherited != LXB_ENCODING_UTF_16LE) e = inherited;
     }
-    /* Autodetection is discouraged for resources from the network: only a file from the local
-       file system is taken as UTF-8 when its bytes are valid UTF-8 throughout. Else the
+    /* Autodetection is discouraged for resources from the network, where an HTML document's
+       preamble is mostly ASCII markup: only a file from the local file system is taken as UTF-8
+       when its bytes are valid UTF-8 throughout. A text document's bytes are all its text, and
+       the whole of it is examined: valid UTF-8 throughout is UTF-8 from any URL. Else the
        windows-1252 default. */
-    if (!e && d->url && web_url_has_scheme(d->url, "file") && web_utf8_valid(bytes, n) == n) e = WEB_ENCODING_UTF8;
+    if (!e && (kind != DECODED_MARKUP || (d->url && web_url_has_scheme(d->url, "file"))) &&
+        web_utf8_valid(bytes, n) == n) e = WEB_ENCODING_UTF8;
     if (!e) e = LXB_ENCODING_WINDOWS_1252;
     web_encoding used;
     char *text = web_decode(bytes, n, e, &used, length);
     if (text) snprintf(d->encoding, sizeof d->encoding, "%s", web_encoding_name(used));
     return text;
+}
+char *html_decode_bytes(web_doc *d, const char *src, size_t n, const char *label, size_t *length) {
+    return decode_document(d, src, n, label, DECODED_MARKUP, length);
+}
+char *html_decode_text(web_doc *d, const char *src, size_t n, const char *label, bool json, size_t *length) {
+    return decode_document(d, src, n, label, json ? DECODED_JSON : DECODED_TEXT, length);
 }

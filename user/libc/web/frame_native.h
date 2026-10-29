@@ -69,50 +69,30 @@ static void frame_blob_commit(struct web_js_state *s,struct web_frame *f,const c
     web_doc *owner=f->navigation_owner?f->navigation_owner:s->doc;
     free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;web_frame_set_navigation_body(f,NULL,0,NULL);
     if(owner!=s->doc){f->navigation_owner=NULL;f->failed=true;log_text(s,1,"Frame blob URL belongs to another realm");return;}
-    char mime[128];size_t n=0;bool untyped=false;
-    char *body=script_blob_source(s,url,false,&n,mime,&untyped);
+    char mime[128],label[64];size_t n=0;bool untyped=false;
+    char *body=script_blob_source(s,url,false,&n,mime,&untyped,label);
     if(!body){
         JS_FreeValue(s->ctx,JS_GetException(s->ctx));
         f->navigation_owner=NULL;f->failed=true;log_text(s,1,"Frame blob URL is revoked or unavailable");return;
     }
-    /* An XML type loads an XML document; its encoding is the bytes' own. */
-    if(web_document_kind(mime)==WEB_DOCUMENT_XML){
+    /* HTML "load a document" by the Blob's type, its response's Content-Type: doc.c makes the
+       document of each kind. An untyped Blob is sniffed like an untyped navigation response:
+       markup is HTML, else plain text. The type's charset labels the bytes of an HTML or text
+       document (an unlabeled HTML Blob is sniffed: its container document is same origin); an
+       XML document's encoding is the bytes' own. */
+    const char *type=untyped?(n && memchr(body,'<',n<512?n:512)?"text/html":"text/plain"):mime;
+    enum web_document_kind kind=web_document_kind(type);
+    bool made=false;
+    if(kind!=WEB_DOCUMENT_OTHER){
         struct web_host host=frame_host(s,NULL);
-        bool made=web_frame_commit_response(f,body,n,url,NULL,NULL,mime,&host,true);
-        js_free(s->ctx,body);f->navigation_owner=NULL;
-        if(!made){f->failed=true;log_text(s,1,"Frame blob document was refused or could not be allocated");}
-        return;
+        made=web_frame_commit_response(f,body,n,url,kind==WEB_DOCUMENT_XML || !label[0]?NULL:label,NULL,type,&host,true);
     }
-    /* An untyped Blob is sniffed like an untyped navigation response. */
-    bool html=!strcasecmp(mime,"text/html") || (untyped && n && memchr(body,'<',n<512?n:512));
-    /* Text, script and JSON types render as a plain text document. */
-    bool text=!html && (!strncasecmp(mime,"text/",5) || strstr(mime,"javascript") || strstr(mime,"json") || strstr(mime,"xml"));
-    char *page=NULL;size_t used=0;
-    if(text && n<=(SIZE_MAX-32)/5 && (page=malloc(n*5+32))) {
-        memcpy(page,"<pre>",5);used=5;
-        for(size_t i=0;i<n;i++){
-            const char *entity=body[i]=='<'?"&lt;":body[i]=='&'?"&amp;":NULL;
-            if(entity){memcpy(page+used,entity,strlen(entity));used+=strlen(entity);}else page[used++]=body[i];
-        }
-        memcpy(page+used,"</pre>",6);used+=6;
-    }
-    if(text && !page)log_text(s,2,"Frame blob text document allocation failed");
-    bool made=page!=NULL;
-    /* The Blob's type is the response's Content-Type: its charset labels the bytes. An unlabeled
-       HTML Blob is sniffed (its container document is same origin); the text page is UTF-8. */
-    char charset[64]={0};
-    html_transport_label(mime,charset,sizeof charset);
-    if(!html && !charset[0])memcpy(charset,"utf-8",6);
-    struct web_host host=frame_host(s,NULL);
-    bool ok=(html || made) && web_frame_commit(f,made?page:body,made?used:n,url,charset,&host,true);
-    free(page);js_free(s->ctx,body);f->navigation_owner=NULL;
-    if(text && !made){f->failed=true;return;}
-    html=html || made;
-    if(!ok){
+    js_free(s->ctx,body);f->navigation_owner=NULL;
+    if(!made){
         /* The essence was validated as a MIME token; it is not free author text. */
         char message[192];
-        if(html)snprintf(message,sizeof message,"Frame blob document was refused or could not be allocated");
-        else snprintf(message,sizeof message,"Frame blob URL type cannot be displayed (%s%s)",untyped?"untyped ":"",mime);
+        if(kind!=WEB_DOCUMENT_OTHER)snprintf(message,sizeof message,"Frame blob document was refused or could not be allocated");
+        else snprintf(message,sizeof message,"Frame blob URL type cannot be displayed (%s)",mime);
         f->failed=true;log_text(s,1,message);
     }
 }
@@ -839,6 +819,9 @@ static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int a
         s->handler_body=NULL;
         html_finish(s->doc->parser);s->doc->parser=NULL;
         while(s->doc->root->first)doc_node_remove(s->doc,s->doc->root->first);
+        /* A text document's user agent style was for the text that "load a text document" made
+           (content the user agent may add to it); with that content gone, it no longer applies. */
+        if(s->doc->text_document){s->doc->text_document=false;s->doc->sty.index_dirty=true;}
         document_stream_reset(s);
         s->blocker=NULL;s->parsing_done=s->parsing_cancelled=s->domcontent_sent=s->load_sent=false;
         s->doc->parser=html_open(s->doc);
