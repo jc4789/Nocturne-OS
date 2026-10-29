@@ -956,7 +956,7 @@
         set selected(v) { dom('set',this,'selected',!!v); }
         get disabled() { return reflectedAttr(this,'disabled')!==null; }
         set disabled(v) { reflectedAttr(this,'disabled',v?'':null); }
-        focus(options = undefined) { dom('focus',this,focusOptionsVisible(options)); }
+        focus(options = undefined) { dom('focus',this,focusOptionsVisible(options),true); }
         blur() { dom('blur',this); }
         click() { host.click(this); }
     }
@@ -1521,6 +1521,26 @@
      }})[name];
      for(const name of ['moveTo','moveBy','resizeTo','resizeBy'])
         Object.defineProperty(globalThis,name,{configurable:true,enumerable:true,writable:true,value:windowGeometry(name)});}
+    /* HTML Window focus(), blur() and close(), which a cross-origin WindowProxy gives too
+       (CrossOriginProperties, js_frames.js), and the legacy captureEvents() and releaseEvents().
+       Their this is this realm's global or a WindowProxy the native registry knows, as
+       postMessage's. blur(), captureEvents() and releaseEvents() do nothing. */
+    const windowOperations=(()=>{
+        const receiver=self=>{
+            const window=self===undefined||self===null?globalThis:self;
+            if(!host.frame('windowBrand',window))throw new EventTypeError('Illegal Window receiver');
+            return window;
+        };
+        return {
+            focus(){host.frame('windowOperation',receiver(this),'focus');},
+            blur(){receiver(this);},
+            close(){host.frame('windowOperation',receiver(this),'close');},
+            captureEvents(){receiver(this);},
+            releaseEvents(){receiver(this);}
+        };
+    })();
+    for(const name of ['focus','blur','close','captureEvents','releaseEvents'])
+        Object.defineProperty(globalThis,name,{configurable:true,enumerable:true,writable:true,value:windowOperations[name]});
     Object.defineProperty(Document.prototype,'cookie',{get(){return this===document?host.cookie():'';},set(v){v=String(v);if(this===document)host.cookie(v);}});
     let historyEvent;
     /* @include js_encoding.js */
@@ -1833,7 +1853,7 @@
         selectionText:()=>documentCommandBridge.selectionText(),
         frameMethodOriginal:frameBridge.methodOriginal,
         frameWindowProxy:frameBridge.windowProxy,
-        windowMessageMethod:messagingBridge.postMessage,
+        windowCrossOriginMethods:{postMessage:messagingBridge.postMessage,focus:windowOperations.focus,blur:windowOperations.blur,close:windowOperations.close},
         windowMessageLocal:messagingBridge.local,
         windowMessagePrepare:messagingBridge.prepare,
         windowMessageImport:messagingBridge.importPacket,

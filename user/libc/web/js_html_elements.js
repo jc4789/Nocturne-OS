@@ -270,9 +270,10 @@ const htmlElementsBridge = (() => {
         }
         return false;
     }
+    // HTML dialog focusing steps: the allow focus steps of the dialog's node document first.
     function dialogFocus(node){
         const target=rawDom.dialogFocus(node);
-        if(target)dom('focus',target);
+        if(target)dom('focus',target,undefined,true);
     }
     function modalReady(node){
         const status=rawDom.dialogPrepare(node);

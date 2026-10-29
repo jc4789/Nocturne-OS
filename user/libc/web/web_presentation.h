@@ -4,6 +4,7 @@
 enum { WEB_PRESENT_OK,WEB_PRESENT_INACTIVE,WEB_PRESENT_ACTIVATION,WEB_PRESENT_UNSUPPORTED,WEB_PRESENT_MEDIA,WEB_PRESENT_BACKEND,WEB_PRESENT_POLICY };
 bool web_presentation_policy_init(web_doc *,const char *,const web_doc *);
 bool web_presentation_enabled(web_doc *,int,const struct web_host *);
+bool web_presentation_focus_allowed(web_doc *);
 bool web_presentation_matches(node_t *);
 struct web_presentation_event {struct web_presentation_event *next;web_doc *document;node_t *node;int kind,width,height;uint64_t session;};
 const struct web_presentation_event *web_presentation_event_peek(web_doc *);

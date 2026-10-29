@@ -29,7 +29,7 @@ static JSValue custom_element_hook(struct web_js_state *s,const char *key,int ar
 static JSValue host_frame(JSContext *ctx,JSValueConst receiver,int argc,JSValueConst *argv){
     struct web_js_state *s=state(ctx),*caller=s->runtime_owner->runtime_active?s->runtime_owner->runtime_active:s;
     const char *op=argc?JS_ToCString(ctx,argv[0]):NULL;if(!op)return JS_EXCEPTION;JSValue result=JS_UNDEFINED;
-    if(!strcmp(op,"messageBrand")){bool brand=false;if(argc>1)frame_message_receiver(s,argv[1],&brand);result=JS_NewBool(ctx,brand);}
+    if(!strcmp(op,"windowBrand")){bool brand=false;if(argc>1)frame_window_receiver(s,argv[1],&brand);result=JS_NewBool(ctx,brand);}
     else if(!strcmp(op,"message"))result=frame_message_send(ctx,s,caller,argc,argv);
     else{
         node_t *token=argc>1&&!JS_IsNull(argv[1])?unwrap(ctx,argv[1]):NULL;
@@ -45,7 +45,7 @@ static JSValue host_frame(JSContext *ctx,JSValueConst receiver,int argc,JSValueC
         else if(!strcmp(op,"closed"))result=JS_NewBool(ctx,!target||!target->live);
         else if(!strcmp(op,"length"))result=JS_NewInt32(ctx,0);
         else if(!strcmp(op,"frameElement"))result=JS_NULL;
-        else if(!strcmp(op,"messageMethod")){
+        else if(!strcmp(op,"crossOriginMethod")){
             /* NATIVE_MESSAGE_METHOD */
         }
         else if(!strcmp(op,"get")){

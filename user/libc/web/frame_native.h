@@ -310,6 +310,43 @@ static bool frame_scripted_access_refused(struct web_js_state *s) {
 static JSValue frame_security_error(JSContext *ctx) {
     return JS_ThrowTypeError(ctx,"SecurityError: cross-origin Window access is forbidden");
 }
+/* HTML Window focus(): the focusing steps for this Window's navigable (NULL when its Document is not
+   the active one), whose focusable area is its active document. As the WPT focus tests
+   (focus/activeelement-after-calling-window-focus) show, a document keeps a focused element that
+   is not a navigable container; one that is gives the focus to the document itself. The
+   ancestors' focus chain then leads to this navigable (doc.c web_focus_chain). */
+static void frame_window_focus(web_doc *target) {
+    if(!web_doc_fully_active(target) || !web_allow_focus(target))return;
+    node_t *focused=target->focus;
+    if(focused && web_frame_element(focused)) {
+        struct web_frame *f=web_frame_find(target,focused);
+        if(f && !f->detached && f->document)web_js_focus_control(target,NULL);
+    }
+    web_focus_chain(target,NULL);
+}
+/* HTML Window close(): only for a top-level traversable that is not closing already and is
+   script-closable. No browsing context here is auxiliary (there is no window.open), so that is a
+   session history of one entry. Every incumbent here is in this traversable's own tree, so it is
+   familiar with it; it must still be allowed by sandboxing to navigate it. The host queues the
+   "definitely close" task. */
+static void frame_window_close(struct web_js_state *caller,web_doc *target) {
+    struct web_js_state *s=target?target->js:NULL;
+    if(!web_doc_fully_active(target) || target->frame_parent || target->window_closing || !s || !s->host.close || !s->host.history)return;
+    struct web_history history={0};
+    if(!s->host.history(s->host.opaque,WEB_HISTORY_INFO,NULL,NULL,0,0,&history) || history.length!=1)return;
+    if(!web_sandbox_navigation_allowed(caller->doc,target,caller->doc->sandbox_activation_until>uptime_ms()))return;
+    if(s->host.close(s->host.opaque))target->window_closing=true;
+}
+/* The Window operations a realm installs as its own (js_bootstrap.js windowOperations): focus and
+   close act on the receiver's navigable, which may be cross-origin (CrossOriginProperties). */
+static JSValue frame_window_operation(JSContext *ctx,struct web_js_state *caller,web_doc *target,bool brand,JSValueConst name) {
+    if(!brand)return JS_ThrowTypeError(ctx,"Illegal Window receiver");
+    const char *op=JS_ToCString(ctx,name);if(!op)return JS_EXCEPTION;
+    if(!strcmp(op,"focus"))frame_window_focus(target);
+    else if(!strcmp(op,"close"))frame_window_close(caller,target);
+    JS_FreeCString(ctx,op);
+    return JS_UNDEFINED;
+}
 /* A Window message receiver is a genuine realm global or a canonical proxy in
  * this runtime's native registry, never an author-created lookalike/Proxy. */
 /* The private transfer plan is fully materialized before the first detach.
@@ -415,7 +452,7 @@ out:
     JS_FreeValue(ctx,bs);JS_FreeValue(ctx,ws);JS_FreeValue(ctx,cs);JS_FreeValue(ctx,gs);
 samples:JS_FreeValue(ctx,sample);JS_FreeValue(ctx,array);JS_FreeValue(ctx,buffer);return result;
 }
-static web_doc *frame_message_receiver(struct web_js_state *s,JSValueConst receiver,bool *brand) {
+static web_doc *frame_window_receiver(struct web_js_state *s,JSValueConst receiver,bool *brand) {
     JSValue global=JS_GetGlobalObject(s->ctx);
     bool own=JS_StrictEq(s->ctx,global,receiver);JS_FreeValue(s->ctx,global);
     if(own){*brand=true;return s->doc;}
@@ -428,6 +465,13 @@ static web_doc *frame_message_receiver(struct web_js_state *s,JSValueConst recei
     for(struct js_frame_proxy *p=s->runtime_owner->frame_proxies;p;p=p->next)
         if(JS_StrictEq(s->ctx,p->proxy,receiver)){*brand=true;return frame_window_document(p->token);}
     *brand=false;return NULL;
+}
+/* A realm's own operation that a WindowProxy gives for a member of CrossOriginProperties. */
+static JSValue frame_cross_origin_method(JSContext *ctx,struct web_js_state *s,const char *key) {
+    JSValue table=JS_GetPropertyStr(ctx,s->hooks,"windowCrossOriginMethods");
+    if(JS_IsException(table))return table;
+    JSValue method=JS_GetPropertyStr(ctx,table,key);JS_FreeValue(ctx,table);
+    return method;
 }
 static JSValue frame_message_deliver(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv,int magic,JSValue *data) {
     struct web_js_state *s=state(ctx);
@@ -498,7 +542,7 @@ static JSValue frame_message_send_data(JSContext *ctx,struct web_js_state *s,
     target->last_posted=p;target->posted_count++;return JS_UNDEFINED;
 }
 static JSValue frame_message_send(JSContext *ctx,struct web_js_state *s,struct web_js_state *caller,int argc,JSValueConst *argv) {
-    bool brand=false;web_doc *document=argc>1?frame_message_receiver(s,argv[1],&brand):NULL;
+    bool brand=false;web_doc *document=argc>1?frame_window_receiver(s,argv[1],&brand):NULL;
     if(!brand)return JS_ThrowTypeError(ctx,"Illegal Window receiver");
     struct web_js_state *target=document?document->js:NULL;
     if(argc<5 || !task_context_active(caller) || !task_context_active(target))return JS_ThrowTypeError(ctx,"Window message browsing context is inactive");
@@ -617,10 +661,11 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
             argc>1?frame_transfer_commit(ctx,s,argv[1]):JS_ThrowTypeError(ctx,"Private transfer plan required");
         JS_FreeCString(ctx,op);return result;
     }
-    if(!strcmp(op,"messageBrand") || !strcmp(op,"message")) {
+    if(!strcmp(op,"windowBrand") || !strcmp(op,"message") || !strcmp(op,"windowOperation")) {
         bool brand=false;
-        if(argc>1)frame_message_receiver(s,argv[1],&brand);
-        JSValue result=!strcmp(op,"messageBrand")?JS_NewBool(ctx,brand):frame_message_send(ctx,s,caller,argc,argv);
+        web_doc *receiver=argc>1?frame_window_receiver(s,argv[1],&brand):NULL;
+        JSValue result=!strcmp(op,"windowBrand")?JS_NewBool(ctx,brand):!strcmp(op,"message")?frame_message_send(ctx,s,caller,argc,argv):
+            frame_window_operation(ctx,caller,receiver,brand,argc>2?argv[2]:JS_UNDEFINED);
         JS_FreeCString(ctx,op);return result;
     }
     node_t *token=argc>1?unwrap(ctx,argv[1]):NULL;
@@ -650,7 +695,7 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
         if(d && d->frame_parent)d=d->frame_parent;
         if(!strcmp(op,"top"))while(d && d->frame_parent)d=d->frame_parent;
         result=wrap(s,frame_window_token(d));
-    }else if(!strcmp(op,"closed"))result=JS_NewBool(ctx,!target || !target->live);
+    }else if(!strcmp(op,"closed"))result=JS_NewBool(ctx,!target || !target->live || target->window_closing);
     else if(!strcmp(op,"opener")) {
         /* No native Window in this implementation has an opener browsing
            context. The original getter is cross-origin readable as null;
@@ -693,12 +738,17 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
             js_free(ctx,url);
         }
         JS_FreeCString(ctx,value);
-    }else if(!strcmp(op,"messageMethod")) {
+    }else if(!strcmp(op,"crossOriginMethod")) {
+        /* HTML CrossOriginProperties' operations (postMessage, focus, blur, close) on a
+           WindowProxy: this realm's own operation, which takes the proxy as its receiver, unless
+           the Window is same origin and its author replaced the property. */
         if(!target || !task_context_active(target->js)){result=JS_ThrowTypeError(ctx,"Child Window is closed");goto out;}
-        result=JS_GetPropertyStr(ctx,s->hooks,"windowMessageMethod");
-        if(web_frame_same_origin(caller->doc,target)) {
-            JSValue global=JS_GetGlobalObject(target->js->ctx),value=JS_GetPropertyStr(ctx,global,"postMessage");JS_FreeValue(ctx,global);
-            JSValue original=JS_GetPropertyStr(ctx,target->js->hooks,"windowMessageMethod");
+        const char *key=argc>2?JS_ToCString(ctx,argv[2]):NULL;
+        if(!key){result=JS_EXCEPTION;goto out;}
+        result=frame_cross_origin_method(ctx,s,key);
+        if(!JS_IsException(result) && web_frame_same_origin(caller->doc,target)) {
+            JSValue global=JS_GetGlobalObject(target->js->ctx),value=JS_GetPropertyStr(ctx,global,key);JS_FreeValue(ctx,global);
+            JSValue original=frame_cross_origin_method(ctx,target->js,key);
             if(JS_IsException(value)||JS_IsException(original)){
                 JS_FreeValue(ctx,result);result=JS_EXCEPTION;
             }else if(!JS_SameValue(ctx,value,original)){
@@ -706,6 +756,7 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
             }
             JS_FreeValue(ctx,original);JS_FreeValue(ctx,value);
         }
+        JS_FreeCString(ctx,key);
     }else {
         if(target && (target->sandbox_flags&SB_SCRIPTS) && !target->js){result=history_security_error(ctx,"Sandbox initial Document does not export author realm objects");goto out;}
         if(!target || !target->js || !target->js->ctx){result=JS_ThrowTypeError(ctx,"Child Window is closed");goto out;}

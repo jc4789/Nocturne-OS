@@ -200,6 +200,7 @@ struct tab {
     int nhist, hist_capacity, hpos;
     struct browser_history_task *history_queue, *history_queue_tail;
     unsigned history_queue_count;
+    bool close_requested; /* the page's close() was accepted (host_close) */
     int focus;
     bool find_open, find_error;
     struct url_text find_text;
@@ -1698,7 +1699,14 @@ static bool host_video_present(void *opaque, web_doc *document, const struct web
 }
 static bool host_navigation_pending(void *opaque) {
     SERVE(opaque);
-    return quit || tab->pending_navigation || tab->loading;
+    return quit || tab->pending_navigation || tab->loading || tab->close_requested;
+}
+/* A page's close() (HTML "definitely close"): the tab closes as the user's close would, in the
+   main loop once its scripts and native waits have returned. */
+static bool host_close(void *opaque) {
+    SERVE(opaque);
+    tab->close_requested = true;
+    return true;
 }
 /* Report the real native pointer at dequeue, not a synthetic DOM callback.
    A long author task may defer hover delivery; diagnostics must not re-enter it. */
@@ -2324,7 +2332,7 @@ static const struct web_host browser_host = {
     .navigate = host_navigate, .console = host_console, .scroll = host_scroll,
     .scroll_to = host_scroll_to, .history = host_history,
     .window_state=host_window_state,.window_size=host_window_size,
-    .navigation_pending=host_navigation_pending,
+    .navigation_pending=host_navigation_pending, .close=host_close,
     .script_checkpoint=host_script_checkpoint,
     .video_present=host_video_present,
     .presentation=host_presentation,
@@ -3934,6 +3942,8 @@ int main(int argc, char **argv) {
             apply_pending_history();
             apply_pending_navigation();
         }
+        /* tab_close leaves a tab whose script or native wait is still running for a later turn. */
+        for (int i = ntabs - 1; i >= 0 && !quit; i--) if (tabs[i]->close_requested) tab_close(tabs[i]);
         tab = front;
         if (quit) break;
         now = n_clock_uptime_ms();

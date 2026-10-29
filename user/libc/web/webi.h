@@ -2470,6 +2470,7 @@ struct web_doc {
     web_doc *frame_parent;
     uint32_t sandbox_flags; /* immutable active document restrictions */
     uint64_t sandbox_activation_until; /* only native trusted input writes this */
+    bool window_closing; /* HTML top-level traversable "is closing": its close() was accepted */
     /* The callbacks web_live was given: a document without a realm (a sandbox without
        allow-scripts) still follows its hyperlinks through them. */
     struct web_host host;
@@ -3032,6 +3033,8 @@ void web_js_visibility_changed(web_doc *d);
 bool web_js_tab_audible(web_doc *d);
 void web_js_focus_control(web_doc *d, node_t *control);
 void web_js_face_reset(web_doc *d, node_t *form);
+bool web_allow_focus(web_doc *d);
+void web_focus_chain(web_doc *child, web_doc *until);
 node_t *web_autofocus_candidate(web_doc *d);
 void web_js_tick(web_doc *d, uint64_t now);
 void web_js_free(web_doc *d);

@@ -6,10 +6,10 @@ import subprocess
 root = Path(__file__).resolve().parent.parent
 out = root / "build/goal-20261009"
 source = (root / "user/libc/web/frame_native.h").read_text(encoding="utf-8")
-start = source.index("static web_doc *frame_message_receiver(")
+start = source.index("static web_doc *frame_window_receiver(")
 helpers = source[start:source.index("static JSValue native_frame(",start)]
-start = source.index('}else if(!strcmp(op,"messageMethod")) {')
-method = source[start+len('}else if(!strcmp(op,"messageMethod")) {'):source.index("}else {",start)]
+start = source.index('}else if(!strcmp(op,"crossOriginMethod")) {')
+method = source[start+len('}else if(!strcmp(op,"crossOriginMethod")) {'):source.index("}else {",start)]
 prefix = (root / "tests/frame_messages_native_prefix.c").read_text(encoding="utf-8")
 cases = (root / "tests/frame_messages_native_cases.c").read_text(encoding="utf-8")
 c = out / "frame-messages-native-generated.c"
@@ -32,7 +32,7 @@ const document=globalThis.document={};const rawDom=()=>9,reflectedAttr=()=>null,
 """
 for name in ("js_encoding.js","js_url.js","js_clone.js","js_messaging.js","js_frames.js"):
     js += (root / "user/libc/web" / name).read_text(encoding="utf-8")+"\n"
-js += "return {frameWindowProxy:frameBridge.windowProxy,windowMessageMethod:messagingBridge.postMessage,windowMessageLocal:messagingBridge.local,windowMessagePrepare:messagingBridge.prepare,windowMessageReceive:messagingBridge.receive};})(fixtureHost);"
+js += "return {frameWindowProxy:frameBridge.windowProxy,windowCrossOriginMethods:{postMessage:messagingBridge.postMessage},windowMessageLocal:messagingBridge.local,windowMessagePrepare:messagingBridge.prepare,windowMessageReceive:messagingBridge.receive};})(fixtureHost);"
 (out / "frame-message-bindings.js").write_text(js,encoding="utf-8")
 cc=root / "tools/msys64/ucrt64/bin/clang.exe"
 env=dict(os.environ,PATH=str(cc.parent)+os.pathsep+os.environ.get("PATH",""))

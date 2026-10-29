@@ -31,7 +31,7 @@ const messagingBridge=(() => {
         const ps=cloneData.transferList(init.ports);
         for(let i=0;i<ps.length;i++)if(!portBrand(ps[i]))throw new TypeErr('Expected MessagePort');
         const source=init.source??null;
-        if(source!==null&&source!==globalThis&&!portBrand(source)&&!host.frame('messageBrand',source))throw new TypeErr('Invalid message source');
+        if(source!==null&&source!==globalThis&&!portBrand(source)&&!host.frame('windowBrand',source))throw new TypeErr('Invalid message source');
         return {data,origin:o,lastEventId:id,source,ports:freeze(ps)};
     }
     class MessageEvent extends Event {
@@ -280,7 +280,7 @@ const messagingBridge=(() => {
     messageHandlerTarget=(target,type)=>(portBrand(target)||has(broadcastChannels,target))&&(type==='message'||type==='messageerror');
     function postMessage(message,targetOrOptions={},transfer){
         const receiver=this===undefined||this===null?globalThis:this;
-        if(!host.frame('messageBrand',receiver))throw new TypeErr('Illegal Window receiver');
+        if(!host.frame('windowBrand',receiver))throw new TypeErr('Illegal Window receiver');
         if(!arguments.length)throw new TypeErr('Message required');
         let target='/',list;
         if(arguments.length>=3){target=string(targetOrOptions);list=transfer;}

@@ -50,7 +50,8 @@
                     if(key===Symbol.toStringTag)return 'Window';
                     if(typeof key==='symbol')return undefined;
                     if(/^(0|[1-9][0-9]*)$/.test(key))return windowProxy(access('index',token,Number(key)))||undefined;
-                    if(key==='postMessage')return access('messageMethod',token);
+                    // CrossOriginProperties' operations (frame_native.h crossOriginMethod)
+                    if(key==='postMessage'||key==='focus'||key==='blur'||key==='close')return access('crossOriginMethod',token,key);
                     if(methodNames.includes(key)) {
                         const record=access('method',token,key),fn=record[0],documentToken=record[1];
                         // Author replacements are ordinary property values, not
@@ -69,7 +70,7 @@
                     if(typeof key==='symbol')return false;
                     return access('set',token,key,value);
                 },
-                has(_,key){if(['window','self','frames','parent','top','opener','closed','length','location','postMessage'].includes(key))return true;return typeof key==='string'&&access('has',token,key);},
+                has(_,key){if(['window','self','frames','parent','top','opener','closed','length','location','postMessage','focus','blur','close'].includes(key))return true;return typeof key==='string'&&access('has',token,key);},
                 defineProperty(){throw new DOMException('WindowProxy property definition is not implemented','NotSupportedError');},
                 setPrototypeOf(){return false;},preventExtensions(){return false;}
             });proxy=access('proxySet',token,proxy);proxies.set(token,proxy);return proxy;
@@ -175,6 +176,8 @@
             parent:{configurable:true,get(){const token=host.frame('parent',selfToken);return token===selfToken?globalThis:windowProxy(token);}},
             top:{configurable:true,get(){const token=host.frame('top',selfToken);return token===selfToken?globalThis:windowProxy(token);}},
             frameElement:{configurable:true,get(){return access('frameElement',selfToken);}},
+            // HTML: true when this Window's navigable is null or is closing.
+            closed:{configurable:true,get(){return access('closed',selfToken);}},
             // As defaultView: a top-level Window's WindowProxy is its global
             // object, which answers frames[i] itself (quickjs.c's global index
             // methods); a child's is the proxy its embedder holds.

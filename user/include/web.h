@@ -231,6 +231,9 @@ struct web_host {
     void (*window_size)(void *opaque, int *width, int *height);
     /* Native-only getter: a queued navigation/close cancels stale default edits. */
     bool (*navigation_pending)(void *opaque);
+    /* HTML "definitely close" the top-level traversable this host shows (Window close()), in a
+       task after the current one: false when it cannot be queued. Optional. */
+    bool (*close)(void *opaque);
     bool (*video_present)(void *opaque, web_doc *document,
                           const struct web_video_patch *patch);
     /* Native window transition; no DOM/JS callback, no borrowed media pixels.

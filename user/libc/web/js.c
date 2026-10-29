@@ -3838,9 +3838,13 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             }
             n = NULL;
         }
+        /* focus(node, focusVisible, steps): steps is true for the element's focus() and the
+           dialog focusing steps, which run HTML's allow focus steps on the node document first. */
+        if (opcode == DOM_focus && argc > 3 && JS_ToBool(ctx, argv[3]) > 0 && !web_allow_focus(n && n->owner ? n->owner : d))
+            permitted = false;
         if (permitted) {
             /* FocusOptions' focusVisible: 0 absent, 1 false, 2 true */
-            uint8_t request = opcode == DOM_focus && argc > 3 && !JS_IsUndefined(argv[3]) ? (JS_ToBool(ctx, argv[3]) > 0 ? 2 : 1) : 0;
+            uint8_t request = opcode == DOM_focus && argc > 2 && !JS_IsUndefined(argv[2]) ? (JS_ToBool(ctx, argv[2]) > 0 ? 2 : 1) : 0;
             web_doc *target = n && n->owner ? n->owner : d;
             d->focus_visible_request = target->focus_visible_request = request;
             web_js_focus_control(d,n);
@@ -6637,10 +6641,10 @@ static JSValue native_automation(JSContext *ctx, JSValueConst this_val, int argc
    cookies"). A frame under a cross-origin parent asks through its top-level window's testdriver,
    which knows the frame as a message's source. The jar is the host's; no cookie is logged. */
 static web_doc *automation_window_document(struct web_js_state *s, JSValueConst window) {
-    /* A global, a WindowProxy (frame_message_receiver), or a frame realm's own global, which only
+    /* A global, a WindowProxy (frame_window_receiver), or a frame realm's own global, which only
        that realm holds: a frame's testdriver passes its own window. */
     bool brand = false;
-    web_doc *d = frame_message_receiver(s, window, &brand);
+    web_doc *d = frame_window_receiver(s, window, &brand);
     if (brand) return d;
     for (struct web_js_state *realm = s->runtime_owner->runtime_realms; realm; realm = realm->runtime_next) {
         if (!task_context_active(realm)) continue;

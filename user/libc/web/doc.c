@@ -3067,8 +3067,26 @@ static node_t *focus_descendants(web_doc *d, node_t *parent, bool autofocus) {
     }
     return NULL;
 }
+/* HTML "allow focus steps": d is allowed to use "focus-without-user-activation"
+   (Permissions Policy, web_presentation.c), or its Window has transient activation. */
+bool web_allow_focus(web_doc *d) {
+    return d && (web_presentation_focus_allowed(d) || d->sandbox_activation_until > uptime_ms());
+}
+/* The focus chain through the navigables: each ancestor document's focused area, up to until (or
+   the top-level traversable's when it is NULL), is the container of the child navigable that has
+   the focus. No events; the documents keep their own focused areas. */
+void web_focus_chain(web_doc *child, web_doc *until) {
+    for (web_doc *parent = child ? child->frame_parent : NULL; parent; child = parent, parent = parent->frame_parent) {
+        parent->focus = child->frame_element; parent->dirty = true;
+        if (parent == until) break;
+    }
+}
+/* HTML autofocus: not in a document with the sandboxed automatic features browsing context flag
+   (allow-scripts is the keyword that lifts it, so it goes with SB_SCRIPTS), nor where the allow
+   focus steps refuse. */
 node_t *web_autofocus_candidate(web_doc *d) {
-    if (!d || d->inert || d->focus || (d->url && strchr(d->url, '#'))) return NULL;
+    if (!d || d->inert || d->focus || (d->url && strchr(d->url, '#')) || (d->sandbox_flags & SB_SCRIPTS) ||
+        !web_allow_focus(d)) return NULL;
     web_layout(d, d->width > 0 ? d->width : 800, d->height > 0 ? d->height : 600);
     return focus_descendants(d, d->root, true);
 }
@@ -3102,12 +3120,7 @@ void web_focus(web_doc *d, web_node *n) {
     if(n && n->owner && n->owner!=d && n->owner->frame_parent){
         web_doc *child=n->owner,*ancestor=child;
         while(ancestor && ancestor!=d)ancestor=ancestor->frame_parent;
-        if(ancestor==d){
-            web_focus(child,n);
-            for(web_doc *parent=child->frame_parent;parent;child=parent,parent=parent->frame_parent){
-                parent->focus=child->frame_element;parent->dirty=true;if(parent==d)break;
-            }
-        }
+        if(ancestor==d){web_focus(child,n);web_focus_chain(child,d);}
         return;
     }
     if (n) {

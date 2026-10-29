@@ -9,8 +9,10 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
-static unsigned feature_bit(int kind){return kind==1?1u:kind==2?2u:0;}
-static const char *feature_name(int kind){return kind==1?"fullscreen":"picture-in-picture";}
+/* The Permissions Policy features this owner decides: 1 fullscreen and 3
+   focus-without-user-activation (default allowlist 'self'), 2 picture-in-picture ('*'). */
+static unsigned feature_bit(int kind){return kind==1?1u:kind==2?2u:kind==3?4u:0;}
+static const char *feature_name(int kind){return kind==1?"fullscreen":kind==2?"picture-in-picture":"focus-without-user-activation";}
 static web_doc *top_document(web_doc *d){while(d&&d->frame_parent)d=d->frame_parent;return d;}
 static bool active(web_doc *d){
     for(web_doc *at=d;at;at=at->frame_parent){
@@ -144,11 +146,18 @@ bool web_presentation_policy_init(web_doc *d,const char *headers,const web_doc *
                 const char *value=colon+1;while(value<stop&&(*value==' '||*value=='\t'))value++;size_t n=(size_t)(stop-value);
                 if(n>SIZE_MAX-used-2){free(policy);return false;}char *next=realloc(policy,used+n+2);if(!next){free(policy);return false;}policy=next;if(used)policy[used++]=',';memcpy(policy+used,value,n);used+=n;policy[used]=0;}
             p=*end?end+1:end;}}
-    unsigned inherited=3;
+    unsigned inherited=7;
     if(d->frame_parent&&d->frame_element){web_doc *parent=d->frame_parent;char *self=document_origin(parent),*origin=document_origin(d),*src=declared_origin(parent,d->frame_element,self);
-        for(int kind=1;kind<=2;kind++)if(!declared_feature(parent,kind,self)||!declared_feature(parent,kind,origin)||!container_feature(d->frame_element,kind,origin,self,src))inherited&=~feature_bit(kind);
+        for(int kind=1;kind<=3;kind++)if(!declared_feature(parent,kind,self)||!declared_feature(parent,kind,origin)||!container_feature(d->frame_element,kind,origin,self,src))inherited&=~feature_bit(kind);
         free(self);free(origin);free(src);}
     free(d->presentation_policy);d->presentation_policy=policy;d->presentation_inherited=(uint8_t)inherited;d->presentation_policy_ready=true;return true;
+}
+/* Permissions Policy "allowed to use" focus-without-user-activation, for HTML's allow focus
+   steps (doc.c web_allow_focus): a fully active document whose policy enables the feature for
+   its own origin. */
+bool web_presentation_focus_allowed(web_doc *d){
+    if(!d||!web_doc_fully_active(d))return false;
+    char *origin=document_origin(d);bool enabled=declared_feature(d,3,origin);free(origin);return enabled;
 }
 bool web_presentation_enabled(web_doc *d,int kind,const struct web_host *host){
     if(!feature_bit(kind)||!host||!host->presentation||!active(d))return false;

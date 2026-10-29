@@ -14,7 +14,7 @@ static unsigned assertions,failures;static JSContext *context;
 static void check(const char *label,bool ok){assertions++;printf("%s %s\n",ok?"PASS":"FAIL",label);if(!ok)failures++;}
 static void clear_exception(JSContext *ctx){if(JS_HasException(ctx)){JSValue e=JS_GetException(ctx);JS_FreeValue(ctx,e);}}
 static JSValue host_class(JSContext*c,JSValueConst t,int n,JSValueConst*a){(void)t;return JS_NewUint32(c,n?JS_GetClassID(a[0]):0);}
-static JSValue host_frame(JSContext*c,JSValueConst t,int n,JSValueConst*a){(void)t;const char*s=n?JS_ToCString(c,a[0]):NULL;JSValue r=JS_UNDEFINED;if(s&&!strcmp(s,"transferGeneration"))r=JS_NewUint32(c,271);else if(s&&!strcmp(s,"transferCommit"))r=worker_transfer_commit(c,a[1],!child_record.stopped);else if(s&&!strcmp(s,"messageBrand"))r=JS_TRUE;JS_FreeCString(c,s);return r;}
+static JSValue host_frame(JSContext*c,JSValueConst t,int n,JSValueConst*a){(void)t;const char*s=n?JS_ToCString(c,a[0]):NULL;JSValue r=JS_UNDEFINED;if(s&&!strcmp(s,"transferGeneration"))r=JS_NewUint32(c,271);else if(s&&!strcmp(s,"transferCommit"))r=worker_transfer_commit(c,a[1],!child_record.stopped);else if(s&&!strcmp(s,"windowBrand"))r=JS_TRUE;JS_FreeCString(c,s);return r;}
 static JSValue host_worker(JSContext*c,JSValueConst t,int n,JSValueConst*a){(void)t;uint32_t op=0,id=0,port=0,creator=0,lease=0;if(n<6||JS_ToUint32(c,&op,a[0])<0||JS_ToUint32(c,&id,a[1])<0||JS_ToUint32(c,&port,a[4])<0||JS_ToUint32(c,&creator,a[5])<0)return JS_EXCEPTION;
  if(op==8)return web_worker_capture(&window_workers,id,port,creator);if(op==9){web_worker_release_capture(&window_workers,port);return JS_UNDEFINED;}
  if(n>6&&JS_ToUint32(c,&lease,a[6])<0)return JS_EXCEPTION;

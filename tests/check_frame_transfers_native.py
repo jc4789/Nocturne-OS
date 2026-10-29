@@ -7,7 +7,7 @@ import sys
 root = Path(__file__).resolve().parent.parent
 out = root / "build/goal-20261009"
 source = (root / "user/libc/web/frame_native.h").read_text(encoding="utf-8")
-start = source.index("static web_doc *frame_message_receiver(")
+start = source.index("static web_doc *frame_window_receiver(")
 helpers = source[start:source.index("static JSValue native_frame(",start)]
 native_commit = source[source.index("struct frame_transfer_write"):start]
 if "--commit-fault-only" in sys.argv:
@@ -25,10 +25,10 @@ static void *transfer_task_malloc(JSContext *ctx,size_t n){
     return js_malloc(ctx,n);
 }
 ''' + helpers.replace('struct js_posted_task *p=js_malloc(dest,sizeof *p);','struct js_posted_task *p=transfer_task_malloc(dest,sizeof *p);')
-start = source.index('}else if(!strcmp(op,"messageMethod")) {')
-method = source[start+len('}else if(!strcmp(op,"messageMethod")) {'):source.index("}else {",start)]
+start = source.index('}else if(!strcmp(op,"crossOriginMethod")) {')
+method = source[start+len('}else if(!strcmp(op,"crossOriginMethod")) {'):source.index("}else {",start)]
 prefix = (root / "tests/frame_messages_native_prefix.c").read_text(encoding="utf-8")
-prefix = prefix.replace('if(!strcmp(op,"messageBrand")){', 'if(!strcmp(op,"transferGeneration"))result=wrap(s,s->doc->root);\n    else if(!strcmp(op,"transferCommit"))result=frame_transfer_commit(ctx,s,argv[1]);\n    else if(!strcmp(op,"messageBrand")){')
+prefix = prefix.replace('if(!strcmp(op,"windowBrand")){', 'if(!strcmp(op,"transferGeneration"))result=wrap(s,s->doc->root);\n    else if(!strcmp(op,"transferCommit"))result=frame_transfer_commit(ctx,s,argv[1]);\n    else if(!strcmp(op,"windowBrand")){')
 if "--commit-fault-only" in sys.argv:
     prefix = prefix.replace('else if(!strcmp(op,"transferCommit"))result=frame_transfer_commit(ctx,s,argv[1]);','else if(!strcmp(op,"transferCommit")){if(commit_retire_destination){commit_retire_destination=false;s->doc->live=false;}result=frame_transfer_commit(ctx,s,argv[1]);}')
 case_name = "frame_commit_fault_cases.c" if "--commit-fault-only" in sys.argv else "frame_transfers_poison_cases.c" if "--poison-only" in sys.argv else "frame_transfers_native_cases.c"
@@ -66,7 +66,7 @@ if "--poison-only" in sys.argv:
     js = js.replace("received.push(event)","Object.defineProperty(received,received.length,{value:event,writable:true,enumerable:true,configurable:true})")
 for name in ("js_encoding.js","js_url.js","js_clone.js","js_messaging.js","js_frames.js"):
     js += (root / "user/libc/web" / name).read_text(encoding="utf-8")+"\n"
-js += "return {frameWindowProxy:frameBridge.windowProxy,windowMessageMethod:messagingBridge.postMessage,windowMessageLocal:messagingBridge.local,windowMessagePrepare:messagingBridge.prepare,windowMessageImport:messagingBridge.importPacket,windowMessageCommit:messagingBridge.commitImported,windowMessageReceive:messagingBridge.receive};})(fixtureHost);"
+js += "return {frameWindowProxy:frameBridge.windowProxy,windowCrossOriginMethods:{postMessage:messagingBridge.postMessage},windowMessageLocal:messagingBridge.local,windowMessagePrepare:messagingBridge.prepare,windowMessageImport:messagingBridge.importPacket,windowMessageCommit:messagingBridge.commitImported,windowMessageReceive:messagingBridge.receive};})(fixtureHost);"
 (out / "frame-transfer-bindings.js").write_text(js,encoding="utf-8")
 cc=root / "tools/msys64/ucrt64/bin/clang.exe"
 env=dict(os.environ,PATH=str(cc.parent)+os.pathsep+os.environ.get("PATH",""))
