@@ -50,10 +50,10 @@ css_rule_info の text はシートの元の文（注釈を除いた写し）の
 確かめた: 2026-10-26 304be1a1 の次（併合の直し）
 枝の item 0 の鍵は、最初の子が外れた後や、それより小さい鍵が最初の子に入った後には、その子の鍵より上にも、二番目の鍵より上にもなる。枝を探す・調べる処理（child_index、walk）は item 0 の鍵を比べない。枝の鍵を使う処理を足すときも item 1 から見る。item 0 が二番目以降へ移る所（catalog_delete の枝の併合）では、その鍵の代わりに親の区切りの鍵を使う（右の枝の item 0 をそのまま写すと、その子の鍵を見失う。range の手元の試験で再現した）。目録を変えたら `store tree-test <seed> 200000` を幾つかの種で通す（`store test` は木を数枚の葉に保つので、枝の崩れを出さない。tree-test の四つ目の手番が範囲で消して枝を併合させる）。
 
-## 呼出しは BSP が受け持つ。長い核の処理は全部の app を止める
+## AP の kernel 継続と、BSP に残る呼出し
 対象: kernel/src/sys/sched.c, kernel/src/arch/idt.c, kernel/src/sys/syscall.c
-確かめた: 2026-10-26 304be1a1
-user の thread は AP で走るが、AP で片付かない呼出しは BSP へ回り（sched_ap_interrupt → isr_dispatch_remote → syscall_dispatch）、BSP が一つずつ行う。ファイルの読み込み（大きなプログラムの起動）や核の中の回り続けは、その間の他の app の呼出しを全部待たせる。ゲストが止まって見えたら、QEMU の HMP で `info registers -a` を取り、CPU0 の RIP と RBP の鎖（x /2gx）を build/kernel.elf で llvm-symbolizer に引く。
+確かめた: 2026-10-29（AP で眠る kernel 継続を入れた版）
+syscall_anywhere が名指す呼出しは AP でその task の kernel 継続として走る（ap_syscall）。継続は AP で眠り（t->block の ENROLLED→WOKEN／ASLEEP を CAS で渡す。ASLEEP の起こしは ap_woken_put がその AP の woken の列へ）、別の AP で続き、BSP の部品に触れる前に sched_enter_bsp する。眠りはどれも待ち行列に入れる（期限だけの眠りは deadline_wait）：BSP の拍の wq_take_blocked が「行列なし」を読んで起こすと、AP で登録の途中の task を行列に残したまま走らせ、行列が壊れる（2026-10-29 に一度そう書いて直した）。継続の途中で per-CPU の値を持ち越さない（眠る前の cpu_current_index は起きた後は別の CPU）。それ以外の呼出しは今も BSP へ回り、BSP が一つずつ行う。ゲストが止まって見えたら、QEMU の HMP で `info registers -a` を取り、CPU0 の RIP と RBP の鎖（x /2gx）を build/kernel.elf で llvm-symbolizer に引く。
 
 ## 外部の ArrayBuffer の free_func は二度呼ばれる
 対象: third_party/quickjs/quickjs.c, user/libc/web/js_webaudio.c, user/libc/web/*.c

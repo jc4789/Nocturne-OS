@@ -20,25 +20,22 @@ static bool reference_clock;
 static bool tickless;
 volatile bool tick_stopped;
 
-/* Set the count from the clock; false without one (then each tick adds one). */
+/* Set the count from the clock, on any CPU: it only moves forward, whoever reads the clock last.
+   False without one (then the BSP's tick adds one each time). */
 static bool catch_up(void) {
-    uint64_t reference;
-    if (reference_clock && vm_clock_read(&reference)) {
-        uint64_t ms = (reference - reference_base) / 10000;
-        if (ms > timer_ticks) timer_ticks = ms;
-    } else if (tsc_per_ms) {
-        uint64_t ms = (rdtsc() - tsc_base) / tsc_per_ms;
-        if (ms > timer_ticks) timer_ticks = ms;
-    } else {
-        return false;
-    }
+    uint64_t reference, ms;
+    if (reference_clock && vm_clock_read(&reference)) ms = (reference - reference_base) / 10000;
+    else if (tsc_per_ms) ms = (rdtsc() - tsc_base) / tsc_per_ms;
+    else return false;
+    uint64_t seen = __atomic_load_n(&timer_ticks, __ATOMIC_RELAXED);
+    while (ms > seen && !__atomic_compare_exchange_n(&timer_ticks, &seen, ms, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
     return true;
 }
 
 /* uptime_ms as the clock has it now rather than at the last tick, for a deadline that must not come
-   early. Only the BSP sets the count; elsewhere it is the last tick's. */
+   early. */
 uint64_t timer_now_ms(void) {
-    if (cpu_current_index() == 0) catch_up();
+    catch_up();
     return timer_ticks;
 }
 

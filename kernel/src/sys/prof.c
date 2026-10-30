@@ -340,9 +340,9 @@ static void dump(void) {
     sched_get_stats(&k);
 #define SD(f) (unsigned long long)(k.f - last_kei.f)
     kprintf("prof: kei handoffs %llu, AP-local switches %llu, retires dispatch %llu stop %llu, "
-            "steals %llu, balances %llu, kicks %llu, BSP borrows %llu, AP address parks %llu, AP yields %llu\n",
+            "steals %llu, balances %llu, kicks %llu, BSP borrows %llu, AP kernel sleeps %llu, AP yields %llu\n",
             SD(handoffs), SD(local_switches), SD(dispatch_retires), SD(stop_retires),
-            SD(steals), SD(balances), SD(kicks), SD(borrows), SD(parks), SD(yields));
+            SD(steals), SD(balances), SD(kicks), SD(borrows), SD(blocks), SD(yields));
 #undef SD
     last_kei = k;
     for (uint32_t i = 0; i < PROF_SLOTS; i++) {

@@ -2,13 +2,16 @@
 #include "kernel.h"
 struct regs;
 struct task;
+/* Any CPU: the app's call in r. On an AP it is a kernel continuation of the calling task
+   (sched.c), for the calls syscall_anywhere names: it may sleep there, go on on another AP, or move
+   to the BSP (sched_enter_bsp) where a part of it is still only the BSP's, and end there. */
 void syscall_dispatch(struct regs *r);
-/* An app's syscall on an AP (sched_ap_interrupt), served there when it changes no BSP state:
+bool syscall_anywhere(uint64_t number);
+/* An app's syscall on an AP (sched_ap_interrupt), answered there without a kernel continuation:
    identity and clock queries, network copies of mapped memory, polls that find nothing to take
-   or only read a seqcount, a window's state (AP read sections, arch/smp.h), and the waits that
-   sleep parked on an AP (sched.c's address park): the BSP serves it, or it is done (r->rax holds
-   the result), or the task parks. */
-enum ap_syscall { AP_SYSCALL_BSP, AP_SYSCALL_DONE, AP_SYSCALL_PARK };
+   or only read a seqcount, a window's state (AP read sections, arch/smp.h): done (r->rax holds
+   the result), or not (then a continuation or the BSP serves it). */
+enum ap_syscall { AP_SYSCALL_BSP, AP_SYSCALL_DONE };
 enum ap_syscall syscall_ap(struct regs *r);
 bool user_ok(const void *p, size_t n);   /* the process may read it */
 bool user_ok_w(void *p, size_t n);       /* the process may write it */

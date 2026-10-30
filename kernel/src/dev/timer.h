@@ -5,7 +5,7 @@ struct tm_parts {
     int year, mon, mday, hour, min, sec, wday;
 };
 void timer_init(void);
-uint64_t timer_now_ms(void); /* uptime_ms caught up with the clock (BSP), for deadlines */
+uint64_t timer_now_ms(void); /* uptime_ms caught up with the clock (any CPU), for deadlines */
 /* SYS_CLOCK_INFO's sample: uptime_ms now and the TSC and reference time (100 ns) at it */
 void timer_clock_sample(uint64_t *ms, uint64_t *tsc, uint64_t *reference_100ns);
 int64_t rtc_read_unix(void);

@@ -38,17 +38,24 @@ struct handle *handle_open(struct object *o, bool writable) {
 }
 
 struct handle *handle_ref(struct handle *h) {
-    uint64_t flags = irq_save();
-    h->refs++;
-    irq_restore(flags);
+    __atomic_add_fetch(&h->refs, 1, __ATOMIC_RELAXED);
     return h;
 }
 
 void handle_close(struct handle *h) {
     if (!h) return;
+    if (cpu_is_runner()) {
+        /* An AP drops any reference but one may be the last: ending a handle is the BSP's. */
+        int refs = __atomic_load_n(&h->refs, __ATOMIC_RELAXED);
+        while (refs > 1)
+            if (__atomic_compare_exchange_n(&h->refs, &refs, refs - 1, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+                return;
+        sched_enter_bsp();
+    }
     uint64_t flags = irq_save();
-    ASSERT(h->refs > 0);
-    bool last = --h->refs == 0;
+    int refs = __atomic_sub_fetch(&h->refs, 1, __ATOMIC_ACQ_REL);
+    ASSERT(refs >= 0);
+    bool last = refs == 0;
     struct event_watch *ended = last ? events_handle_closed(h) : NULL;
     irq_restore(flags);
     if (!last) return;
@@ -73,11 +80,9 @@ void object_notify(struct object *o) {
     if (!o) return;
     uint64_t flags = spin_lock(&o->lock);
     for (struct object_waiter *w = o->waiters; w; w = w->next) {
-        /* the new generation before the parked count is read: a waiter parking on an AP counts
-           itself before it reads the generation again */
+        /* the new generation before the wait queue's lock: a waiter reads it under that lock */
         __atomic_add_fetch(&w->wait->generation, 1, __ATOMIC_SEQ_CST);
         wq_wake_all(&w->wait->wq);
-        address_park_wake_word(&w->wait->generation);
     }
     spin_unlock(&o->lock, flags);
 }
@@ -156,9 +161,16 @@ struct handle *handle_ap_peek(int index) {
 }
 
 struct handle *handle_get(int index) {
+    /* The BSP changes the table; an AP reads it in a read section, which keeps h allocated while
+       its reference is taken, unless its last one went meanwhile. */
     uint64_t flags = irq_save();
-    struct handle *h = handle_peek(index);
-    if (h) h->refs++;
+    ap_read_begin();
+    struct handle *h = handle_ap_peek(index);
+    int refs = h ? __atomic_load_n(&h->refs, __ATOMIC_RELAXED) : 0;
+    do {
+        if (refs <= 0) { h = NULL; break; }
+    } while (!__atomic_compare_exchange_n(&h->refs, &refs, refs + 1, true, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED));
+    ap_read_end();
     irq_restore(flags);
     return h;
 }

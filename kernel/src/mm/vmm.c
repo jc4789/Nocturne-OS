@@ -118,9 +118,10 @@ static uint32_t cpu_gen[CPU_MAX_COUNT][USER_PAGE_COUNTS];
 static bool cpu_pcid0_user[CPU_MAX_COUNT];          /* PCID 0 holds an untracked user space */
 static struct { uint64_t pml4, va, pages; int slot; uint32_t gen; } tlb_req;
 static uint64_t tlb_req_seq, tlb_ack[CPU_MAX_COUNT];
-/* AP kernel copies to/from user memory (net_ap_syscall) run with IRQs off and
-   cannot take the shootdown IPI. They announce the space first; a revocation
-   waits for them instead of clearing a PTE under a running copy. */
+/* AP kernel code that reads or writes user memory (net_ap_syscall with IRQs off,
+   which cannot take the shootdown IPI; a kernel continuation's call, sched.c)
+   announces the space first; a revocation waits for it instead of clearing a PTE
+   under a running copy. */
 static uint64_t cpu_uaccess[CPU_MAX_COUNT], vmm_revoking;
 static uint64_t tlb_shootdowns, tlb_ipis;
 
@@ -196,6 +197,14 @@ bool vmm_ap_uaccess_begin(void) {
 
 void vmm_ap_uaccess_end(void) {
     __atomic_store_n(&cpu_uaccess[cpu_current_index()], 0, __ATOMIC_RELEASE);
+}
+
+void vmm_ap_uaccess_wait(void) {
+    while (!vmm_ap_uaccess_begin())
+        while (__atomic_load_n(&vmm_revoking, __ATOMIC_ACQUIRE) == current_task->pml4) {
+            vmm_tlb_poll(); /* the revocation's shootdown may wait for this CPU */
+            pause();
+        }
 }
 
 bool vmm_ap_user_ok(const void *pointer, size_t length, bool write) {

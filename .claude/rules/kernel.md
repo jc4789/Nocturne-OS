@@ -7,7 +7,7 @@ paths:
 ---
 # カーネルの領域に触れたとき
 
-- 呼出しは BSP が受け持つ。user の thread は AP で走るが、AP で片付かない呼出しは BSP へ回り（`sched_ap_interrupt` → `isr_dispatch_remote` → `syscall_dispatch`）、BSP が一つずつ行う。長い核の処理（大きなプログラムの読み込み、核の中の回り続け）は、その間の全部の app の呼出しを待たせる。
+- 対称のカーネルへの途中。user の thread は AP で走る。`syscall_anywhere`（syscall.c）が名指す呼出しはどの CPU でも同じ `syscall_dispatch` で走り、AP ではその task の kernel 継続として眠り、別の AP で続き、BSP の部品（handle の表への install、console、最後の handle_close など）に触れる前に `sched_enter_bsp` で BSP へ移る。それ以外の呼出しは BSP へ回り（`sched_ap_interrupt` → `isr_dispatch_remote` → `syscall_dispatch`）、BSP が一つずつ行う。長い核の処理（大きなプログラムの読み込み、核の中の回り続け）は、その間の BSP の呼出しを全部待たせる。眠りはどれも待ち行列に入り（期限だけの眠りは `deadline_wait`）、行列から外した者だけが起こす。
 - ゲストが止まって見えたら、QEMU の HMP で `info registers -a` を取り、CPU0 の RIP と RBP の鎖（`x /2gx`）を `build/kernel.elf` で llvm-symbolizer に引く。
 - カーネルの標本は、起動の cmdline に `prof`（または `prof_ms=<n>`）で有効になり、serial に窓（既定 10 秒）ごとに出る：`prof: cpu%u user … kernel … idle …`、`prof: task pid …`、`prof: <標本数> <rip> pid …`、AP から BSP への往復（`prof: … retired to BSP …`）。`scripts/platform_qa.py --cmdline prof`。
 - 起動の行：`memory: N MiB usable, M MiB free`、`video: monitor … at … Hz`（EDID が決める）、`store: C: "…" on sata0, …`。メモリー切れは `[memory] pid … no pages for …`（10 秒に 1 回まで）。カーネルの行には時刻が無い。

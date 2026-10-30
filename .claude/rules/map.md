@@ -35,13 +35,16 @@
 
 - syscall の番号：`common/abi.h` の enum `SYS_*`（結果は `N_ERR_*`）。仕様は `docs/nocturne-native-abi.md`。画面・GPU は `display_abi.h`（`struct screen_format`）、`gpu_abi.h`（OpenGL の ABI ではない）。
 - アプリのドライバー：`SYS_PCI_*`・`SYS_DMA_*` → `dev/pciuser.c`。claim するのは init だけで、NVIDIA の表示機能を `nvrm` へ渡す（`user/apps/init.c`）。
-- syscall の道（AP はアプリを走らせ、核の共有物は BSP の持ち物）：
+- syscall の道（AP はアプリを走らせる。対称のカーネルへの途中で、部品を SMP で安全にした呼出しはどの CPU でも同じ `syscall_dispatch` で走り、まだの部品は BSP の持ち物）：
 
 ```
 user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
   BSP: → syscall_dispatch (sys/syscall.c) → sched_user_return
-  AP:  → sched_ap_interrupt (sys/sched.c) → syscall_ap（時刻・TCP・事象待ち・窓の状態など）
-       → 片付かなければ文脈を BSP へ → isr_dispatch_remote (idt.c) → syscall_dispatch
+  AP:  → sched_ap_interrupt (sys/sched.c) → syscall_ap（時刻・TCP の写し・窓の状態などをその場で答える）
+       → syscall_anywhere の呼出し（channel の送受、事象の待ち、番地の待ちと起こし、眠り）は ap_syscall で
+         その task の kernel 継続として syscall_dispatch：AP で眠り（wq_sleep → ap_schedule）、別の AP で続き、
+         BSP の部品に触れる所で sched_enter_bsp して BSP で終わる
+       → ほかは文脈を BSP へ → isr_dispatch_remote (idt.c) → syscall_dispatch
 ```
 
 - VM と実機：`kernel/src/vm/vm.h` が唯一の入口（`vm_detect`、`vm_hosted()`、`vm_init`・`vm_storage_init`・`vm_net_probe`・`vm_audio_init`・`vm_session_init`。実機では即座に戻る）。裏に `hyperv.c`、`hv/`（VMBus・storvsc・netvsc）、`rdp.c`（拡張セッション）、`devices.h` の装置（ata・ac97・e1000・tulip・vbe）、`virtio_gpu.c`。`vm/` の外は `vm/vm.h` しか include しない。

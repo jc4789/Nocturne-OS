@@ -16,10 +16,10 @@ struct object;
 enum task_state { TASK_READY, TASK_RUNNING, TASK_BLOCKED, TASK_ZOMBIE };
 
 struct task;
-/* Tasks blocked on the BSP. Any CPU wakes them (wq_wake_all) under the queue's lock, which is
-   taken before the BSP's run queue's. A waiter whose condition another CPU changes reads it under
-   a lock that waker also holds while it wakes, or loses the wakeup between its check and its
-   sleep. */
+/* Blocked tasks: kernel continuations on the BSP, or on an AP (sched.c's BLOCK_*). Any CPU wakes
+   them (wq_wake_all) under the queue's lock, which is taken before a run queue's. A waiter whose
+   condition another CPU changes reads it under a lock that waker also holds while it wakes, or
+   loses the wakeup between its check and its sleep. */
 struct wait_queue {
     struct task *head;
     struct spinlock lock;
@@ -41,13 +41,9 @@ struct task {
     struct task *process;     /* shared VM / handles owner */
     uint64_t user_stack, user_stack_size;
     uint64_t wait_phys, wait_seq; /* address wait: physical key, FIFO order */
-    uint8_t address_park;     /* APで寝るaddress待ちの段階（sched.cのPARK_*、address_lockの下） */
-    bool address_woken;       /* 寝たaddress待ちが起こされた：再開でsyscallを0で終える */
-    bool address_timed_out;   /* その起こしは期限切れ（BSPの拍）：時間切れで終える */
-    bool address_retry;       /* 寝たのはカーネルの語（address_park_word）：起こされたらsyscallをやり直す */
-    uint64_t park_deadline;   /* 有限の寝るaddress待ちの期限（uptime_ms）。0は無期限 */
-    uint64_t wait_until;      /* APで寝た事象待ちと眠りを、やり直しでも守る最初の期限（uptime_ms、UINT64_MAXは無期限）。0はやり直しでない */
-    struct task *park_next;   /* APで寝るaddress待ちの一覧（到着順） */
+    uint8_t block;            /* APのkernel継続の眠りの段階（sched.cのBLOCK_*、どの移りもCAS） */
+    bool uaccess;             /* APのkernel継続がこのCPUのuser accessを持つ（眠る間は離す） */
+    uint32_t syscall_number;  /* APのkernel継続が走らせている呼出し（prof） */
     unsigned trap_cpu;
     uint64_t tls_base;
     uint64_t clock_page;
@@ -123,7 +119,10 @@ NORETURN void sched_ap_loop(void);
 void sched_ap_interrupt(struct regs *r);
 void sched_quiesce_space(uint64_t pml4); /* 0=shared kernel変更、他は該当user space */
 bool sched_runner_idle(unsigned cpu);    /* BSP: そのAPにuser taskが無い（kernel jobに使える） */
-struct sched_stats { uint64_t handoffs, local_switches, dispatch_retires, stop_retires, steals, balances, kicks, borrows, parks, yields; };
+/* An AP's kernel continuation (a call syscall_anywhere names) that comes to something only the BSP
+   does yet moves there and carries on: it ends on the BSP. Nothing on the BSP. */
+void sched_enter_bsp(void);
+struct sched_stats { uint64_t handoffs, local_switches, dispatch_retires, stop_retires, steals, balances, kicks, borrows, blocks, yields; };
 void sched_get_stats(struct sched_stats *out);
 /* stack_bytes 0 is THREAD_STACK_DEFAULT; others are rounded up to whole pages. */
 #define THREAD_STACK_DEFAULT (256 * 1024)
@@ -133,7 +132,7 @@ int task_thread_join(int tid);
 int task_thread_detach(int tid);
 /* wide: compare the 8-byte word at address (wasm memory.atomic.wait64). */
 int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsigned timeout_ms);
-/* Any CPU (an AP wakes through address_ap_syscall, with the same code). */
+/* Any CPU. */
 int task_wake_address(volatile uint32_t *address, unsigned count);
 /* Asynchronous address waiters. A watch joins the same physical-address FIFO
  * as blocked tasks; a notify that selects it moves its token to the queue's
@@ -145,15 +144,6 @@ int address_watch_remove(struct object *queue, uint64_t token);
 size_t address_watch_take(struct object *queue, uint64_t *tokens, size_t max);
 /* Any CPU, reading only: notified tokens wait to be taken (one notified meanwhile may be missed). */
 bool address_watch_pending(struct object *queue);
-/* A kernel word that changes when a wait must look again (an object_wait's generation). On an AP,
-   in an AP read section that keeps the word allocated: park the calling task on it while it still
-   reads seen, until a wake or deadline (uptime_ms; UINT64_MAX: none). False: it moved on, and
-   nothing was enrolled. A waker on any CPU moves the word on first, then wakes every task parked
-   on it. */
-bool address_park_word(const uint64_t *word, uint64_t seen, uint64_t deadline);
-void address_park_wake_word(const uint64_t *word);
-/* SYS_SLEEP on an AP (syscall_ap): the calling task parks until at least ms have passed. */
-enum ap_syscall sleep_ap(uint64_t ms);
 NORETURN void task_exit(int code);
 NORETURN void task_exit_app(int code); /* SYS_EXIT or a fatal user exception: the whole app ends, from any of its threads */
 struct task *task_find(int pid);
@@ -178,8 +168,6 @@ void wq_wake_all(struct wait_queue *wq);
    interrupt instead and lets the other kernel threads run. */
 void wq_nap(struct wait_queue *wq, volatile bool *kick, uint64_t ms);
 void sleep_ms(uint64_t ms);
-/* SYS_SLEEP on the BSP: until the deadline a sleep begun on an AP set (wait_until), else ms. */
-void sleep_resume(uint64_t ms);
 /* A sleeping lock for kernel code on the BSP, which a timer may preempt: state that stays
    borrowed across allocations, copies or disk transfers. The holder may take it again. Interrupt
    handlers never take one. The boot task, which cannot sleep, lets the holder run until it is

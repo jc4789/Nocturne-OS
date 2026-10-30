@@ -81,6 +81,9 @@ void vmm_tlb_ipi(void);   /* AP: VEC_TLB_SHOOTDOWN */
 /* AP kernel copy of user memory: begin=false なら解除中なのでBSPへfallback */
 bool vmm_ap_uaccess_begin(void);
 void vmm_ap_uaccess_end(void);
+/* The same, waiting out a revocation of the current space under way instead of failing (an AP's
+   kernel continuation, which holds it over its call: sched.c). */
+void vmm_ap_uaccess_wait(void);
 /* The same for [pointer, pointer+length) of the current app, already mapped (with write,
    writable): no stack growth or demand page on an AP. true holds off revocation until
    vmm_ap_uaccess_end; false (not mapped, or a revocation under way) means the BSP serves it. */

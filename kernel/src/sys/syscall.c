@@ -45,7 +45,10 @@ static bool shared_fault(uint64_t addr, bool write, bool *slept);
    pages are faulted in. The kernel must not write to a read-only user page itself: CR0.WP is on,
    so that would be a kernel page fault. A program page read from its document lets go of the
    caller's guard while the disk works: a sibling may unmap what was checked before it, so the
-   check starts over, and the caller's copy follows a pass that did not sleep. */
+   check starts over, and the caller's copy follows a pass that did not sleep. On an AP (a kernel
+   continuation, which holds its user access: no page it checked goes before its copy) a reserved
+   page is filled there; stack growth, shared pages and a pager's write access move the call to
+   the BSP, which looks at the page again. */
 static bool user_access(const void *p, size_t n, bool write) {
     uint64_t a = (uint64_t)p;
     if (n == 0) return true;
@@ -54,6 +57,10 @@ static bool user_access(const void *p, size_t n, bool write) {
     uint64_t pg = ALIGN_DOWN(a, PAGE_SIZE);
     while (pg < a + n) {
         uint64_t pte = vmm_get_pte(t->pml4, pg);
+        if (!(pte & PTE_P) && cpu_is_runner()) {
+            if (vmm_demand_fault(t->pml4, pg, write) <= 0) sched_enter_bsp();
+            continue;
+        }
         if (!(pte & PTE_P)) {
             if (pg >= USER_STACK_TOP - USER_STACK_MAX && pg < USER_STACK_TOP) {
                 if (vmm_user_alloc(t->pml4, pg, PAGE_SIZE, VM_W) < 0) return false;
@@ -72,7 +79,9 @@ static bool user_access(const void *p, size_t n, bool write) {
         if (write && !(pte & PTE_W)) {
             /* a pager's page may be given write access; it is looked at again after */
             bool slept = false;
-            if (!(pte & PTE_SHARED) || !shared_fault(pg, true, &slept)) return false;
+            if (!(pte & PTE_SHARED)) return false;
+            if (cpu_is_runner()) { sched_enter_bsp(); continue; }
+            if (!shared_fault(pg, true, &slept)) return false;
             if (slept) pg = ALIGN_DOWN(a, PAGE_SIZE);
             continue;
         }
@@ -2222,6 +2231,7 @@ static int64_t sys_channel_send(int h, const void *udata, size_t n, int attach) 
     } else if (message_channel_is(f)) {
         r = message_channel_send(f, udata, n, att);
     } else if (byte_stream(f)) {
+        sched_enter_bsp(); /* the console and the system log are the BSP's */
         r = att || !f->object->ops->write ? -N_ERR_UNSUPPORTED : f->object->ops->write(f, udata, n, true);
     } else {
         r = -N_ERR_WRONG_KIND;
@@ -2247,6 +2257,7 @@ static int64_t sys_channel_receive(int h, void *ubuf, size_t cap, int flags, voi
         if (credentials || peek || discard || !f->object->ops->read) r = -N_ERR_UNSUPPORTED;
         else if (!cap) r = 0;
         else {
+            sched_enter_bsp(); /* the console and the system log are the BSP's */
             r = f->object->ops->read(f, ubuf, cap, true, wait);
             if (r == 0) r = -N_ERR_CLOSED; /* nothing more will come */
         }
@@ -2256,6 +2267,7 @@ static int64_t sys_channel_receive(int h, void *ubuf, size_t cap, int flags, voi
     handle_close(f);
     if (r >= 0 && uoutput && (credentials || !peek)) {
         if (att && !peek) {
+            sched_enter_bsp(); /* the handle table is the BSP's */
             message.attached=(int32_t)handle_install(att);att=NULL;
             if (message.attached<0) r=message.attached;
         }
@@ -2500,38 +2512,11 @@ static int64_t sys_events_unwatch(int q, uint64_t token) {
 
 static int64_t sys_events_wait(int q, struct n_event *uout, size_t max, int64_t timeout_ms) {
     int64_t r;
-    timeout_ms = events_wait_resume(timeout_ms); /* before anything can end the call */
     struct handle *queue = handle_get_as(q, events_is, &r);
     if (!queue) return r;
     r = events_wait(queue, uout, max, timeout_ms);
     handle_close(queue);
     return r;
-}
-
-/* sys_channel_receive on an AP, for a message channel end: what it reports as an error, the BSP
-   reports. The output is checked before the message is taken and written under the same uaccess. */
-static enum ap_syscall channel_receive_ap(struct regs *r, struct handle *h, bool credentials, int64_t *result) {
-    void *ubuf = (void *)r->rsi, *uoutput = (void *)r->r8;
-    size_t cap = (size_t)r->rdx, output_size = credentials ? sizeof(struct n_channel_message) : sizeof(int32_t);
-    int flags = (int)r->r10;
-    bool peek = flags & N_CHANNEL_PEEK;
-    if (flags & ~(N_CHANNEL_WAIT | N_CHANNEL_PEEK | N_CHANNEL_DISCARD) || (peek && (flags & N_CHANNEL_DISCARD)) ||
-        (credentials && !uoutput) || !message_channel_is(h) || !vmm_ap_uaccess_begin())
-        return AP_SYSCALL_BSP;
-    struct n_channel_message message = {.attached = -1};
-    enum ap_syscall served = AP_SYSCALL_BSP;
-    if (!uoutput || vmm_ap_user_ok(uoutput, output_size, true))
-        served = message_channel_receive_ap(h, ubuf, cap, flags, &message.sender_app, result);
-    if (served == AP_SYSCALL_DONE && *result >= 0 && uoutput && (credentials || !peek))
-        memcpy(uoutput, credentials ? (const void *)&message : (const void *)&message.attached, output_size);
-    vmm_ap_uaccess_end();
-    return served;
-}
-
-/* sys_channel_send on an AP: a message channel end, no attachment (a handle: the BSP's). */
-static enum ap_syscall channel_send_ap(struct regs *r, struct handle *h, int64_t *result) {
-    if ((int)r->r10 >= 0 || !message_channel_is(h)) return AP_SYSCALL_BSP;
-    return message_channel_send_ap(h, (const void *)r->rsi, (size_t)r->rdx, result);
 }
 
 enum ap_syscall syscall_ap(struct regs *r) {
@@ -2542,30 +2527,18 @@ enum ap_syscall syscall_ap(struct regs *r) {
     case SYS_APP_SELF: result = task_process()->pid; break;
     case SYS_UPTIME: result = (int64_t)uptime_ms(); break;
     case SYS_TIME: result = time_now(); break;
-    case SYS_SLEEP: return sleep_ap(r->rdi);
     case SYS_TCP_SEND: case SYS_TCP_SEND_UNTIL: case SYS_TCP_RECV:
         return net_ap_syscall(r) ? AP_SYSCALL_DONE : AP_SYSCALL_BSP;
-    case SYS_AUDIO_STATUS: case SYS_CHANNEL_SEND: case SYS_CHANNEL_RECEIVE: case SYS_CHANNEL_RECEIVE_FROM:
-    case SYS_WIN_RECEIVE: case SYS_WIN_STATE: case SYS_EVENTS_WAIT: case SYS_APP_RESULT: {
+    case SYS_AUDIO_STATUS: case SYS_WIN_RECEIVE: case SYS_WIN_STATE: case SYS_APP_RESULT: {
         if (current_task->killed) return AP_SYSCALL_BSP; /* the BSP ends the process */
         ap_read_begin();
         struct handle *h = handle_ap_peek((int)r->rdi);
-        enum ap_syscall served;
-        if (r->rax == SYS_EVENTS_WAIT)
-            served = events_wait_ap(h, (struct n_event *)r->rsi, (size_t)r->rdx, (int64_t)r->r10, &result);
-        else if (r->rax == SYS_CHANNEL_SEND)
-            served = channel_send_ap(r, h, &result);
-        else if (r->rax == SYS_CHANNEL_RECEIVE || r->rax == SYS_CHANNEL_RECEIVE_FROM)
-            served = channel_receive_ap(r, h, r->rax == SYS_CHANNEL_RECEIVE_FROM, &result);
-        else {
-            bool done = r->rax == SYS_AUDIO_STATUS ? audio_stream_status_ap(h, (struct n_audio_status *)r->rsi, &result)
-                      : r->rax == SYS_WIN_RECEIVE ? wm_receive_ap(h, (size_t)r->rdx, (int64_t)r->r10, &result)
-                      : r->rax == SYS_WIN_STATE ? wm_state_ap(h, &result)
-                      : proc_app_result_ap(h, (int64_t)r->rsi, &result);
-            served = done ? AP_SYSCALL_DONE : AP_SYSCALL_BSP;
-        }
+        bool done = r->rax == SYS_AUDIO_STATUS ? audio_stream_status_ap(h, (struct n_audio_status *)r->rsi, &result)
+                  : r->rax == SYS_WIN_RECEIVE ? wm_receive_ap(h, (size_t)r->rdx, (int64_t)r->r10, &result)
+                  : r->rax == SYS_WIN_STATE ? wm_state_ap(h, &result)
+                  : proc_app_result_ap(h, (int64_t)r->rsi, &result);
         ap_read_end();
-        if (served != AP_SYSCALL_DONE) return served;
+        if (!done) return AP_SYSCALL_BSP;
         break;
     }
     default: return AP_SYSCALL_BSP;
@@ -2574,19 +2547,32 @@ enum ap_syscall syscall_ap(struct regs *r) {
     return AP_SYSCALL_DONE;
 }
 
+bool syscall_anywhere(uint64_t number) {
+    switch (number) {
+    case SYS_CHANNEL_SEND: case SYS_CHANNEL_RECEIVE: case SYS_CHANNEL_RECEIVE_FROM: case SYS_EVENTS_WAIT:
+    case SYS_WAIT_ADDRESS: case SYS_WAIT_ADDRESS64: case SYS_WAKE_ADDRESS: case SYS_SLEEP:
+        return true;
+    default:
+        return false;
+    }
+}
+
 void syscall_dispatch(struct regs *r) {
     /* An AP trap may be queued as a BSP continuation when a sibling aborts
        its process. Do not execute that pending syscall after it is killed:
        a blocking syscall could enroll a new wait after task_kill's wake and
        never reach the return-to-user kill check. */
-    if (current_task->killed) task_exit(current_task->kill_code);
+    if (current_task->killed) {
+        sched_enter_bsp();
+        task_exit(current_task->kill_code);
+    }
     sti();
     uint64_t a = r->rdi, b = r->rsi, c = r->rdx, d = r->r10, e = r->r8;
     int64_t ret = -N_ERR_UNSUPPORTED;
     switch (r->rax) {
     case SYS_EXIT: task_exit_app((int)a);
     case SYS_AUDIO_FLUSH: ret = sys_audio_flush((int)a); break;
-    case SYS_SLEEP: sleep_resume(a); ret = 0; break;
+    case SYS_SLEEP: sleep_ms(a); ret = 0; break;
     case SYS_UPTIME: ret = uptime_ms(); break;
     case SYS_TIME: ret = time_now(); break;
     case SYS_SHARED_CREATE: ret = sys_shared_create(a,false); break;

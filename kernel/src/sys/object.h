@@ -7,8 +7,9 @@
    places at once (the tables of the apps it was handed to, a message that carries it), each
    place holding a reference of its own.
 
-   Handles and tables are BSP-owned and changed under the BSP IRQ guard (irq_save). AP syscalls
-   only read them (handle_ap_peek); the BSP frees a handle, an object or a table only after
+   Tables are BSP-owned and changed under the BSP IRQ guard (irq_save). Any CPU takes and drops
+   a handle's references (atomic counts): an AP reads the table (handle_get, handle_ap_peek) and
+   leaves a handle's last close to the BSP, which frees a handle, an object or a table only after
    ap_read_synchronize. An object's reference count and its list of waits are any CPU's: the
    count is atomic, the list is under the object's lock (taken before a wait queue's and
    address_lock, never while holding a CPU queue's lock or address_lock). */
@@ -21,10 +22,9 @@ struct handle;
 struct event_watch;
 
 /* One wait for many objects (an event queue's): it stays registered with each object it watches.
-   Any change to one moves generation on and wakes whoever sleeps on wq or is parked on an AP on
-   generation's word (sched.c's address park), and they check again. A waiter reads generation
-   before it looks, and sleeps only while it still reads that (wq_wait_unless, address_park_word):
-   a change on another CPU between the look and the sleep is never missed. */
+   Any change to one moves generation on and wakes whoever sleeps on wq, and they check again. A
+   waiter reads generation before it looks, and sleeps only while it still reads that
+   (wq_wait_unless): a change on another CPU between the look and the sleep is never missed. */
 struct object_wait {
     struct wait_queue wq;
     uint64_t generation;
@@ -82,7 +82,8 @@ void object_unref(struct object *o);
 /* A new opening of o (NULL: no memory; o is left as it was). */
 struct handle *handle_open(struct object *o, bool writable);
 struct handle *handle_ref(struct handle *h);
-/* Drops one reference; the last one closes the opening and drops its object reference. */
+/* Drops one reference; the last one closes the opening and drops its object reference (on an AP,
+   a kernel continuation that may drop the last moves to the BSP first: sched_enter_bsp). */
 void handle_close(struct handle *h);
 static inline int handle_kind(const struct handle *h) { return h->object->ops->kind; }
 static inline bool handle_is(const struct handle *h, const struct object_ops *ops) {
@@ -95,8 +96,8 @@ void object_notify(struct object *o);
 void object_waiter_link(struct object_waiter *w, struct object_wait *wait, struct object *o);
 void object_waiter_unlink(struct object_waiter *w);
 
-/* The calling app's handle table. handle_get returns a reference (NULL: no such handle);
-   handle_peek a borrowed pointer valid only inside the caller's BSP IRQ guard. */
+/* The calling app's handle table. handle_get (any CPU) returns a reference (NULL: no such handle);
+   handle_peek (BSP) a borrowed pointer valid only inside the caller's BSP IRQ guard. */
 struct handle *handle_get(int index);
 struct handle *handle_peek(int index);
 /* The same on an AP, inside an AP read section (arch/smp.h) and without a reference: the handle

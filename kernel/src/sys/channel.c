@@ -2,7 +2,6 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "mm/heap.h"
-#include "mm/vmm.h"
 #include "sys/syscall.h"
 #include "sys/object.h"
 #include "sys/channel.h"
@@ -135,13 +134,12 @@ int channel_accept(struct handle *listener, struct handle **server) {
  * more not yet taken; a message into an empty queue is always accepted,
  * whatever its size.
  *
- * Any CPU sends and receives under the link's lock (an AP in its read section,
- * which keeps the link; attachments are handles, the BSP's). A wait for queue i
- * sleeps on the BSP in its wait queue, enrolled before the lock is given back;
- * on an AP it parks on changed[i], read before it looked. Whatever changes
- * queue i (a message in or out, an end closed) moves changed[i] on under the
- * lock and wakes both kinds once the lock is dropped. The lock is taken before
- * a wait queue's, an object's and address_lock. */
+ * Any CPU sends and receives under the link's lock (the caller's handle keeps
+ * the link; an attachment becomes a handle of the receiver at the BSP). A wait
+ * for queue i sleeps in its wait queue, enrolled before the lock is given back;
+ * whatever changes queue i (a message in or out, an end closed) wakes it once
+ * the lock is dropped. The lock is taken before a wait queue's, an object's and
+ * address_lock. */
 #define MESSAGE_QUEUE_LIMIT (1u << 20)
 struct message {
     struct message *next;
@@ -156,7 +154,6 @@ struct message_link {
     size_t queued[2];               /* bytes waiting in queue i */
     bool open[2];                   /* end i still has its handle */
     int objects;                    /* ends not yet released: the last frees the link */
-    uint64_t changed[2];            /* moves on with every change to queue i */
     struct wait_queue wait[2];      /* receivers of queue i */
     struct wait_queue send_wait[2]; /* senders into queue i */
     struct object end[2];
@@ -193,11 +190,6 @@ static struct message *message_new(size_t n, uint64_t sender_app) {
     return m;
 }
 
-/* The link's lock held: queue i changes. */
-static void message_changed(struct message_link *l, int i) {
-    __atomic_add_fetch(&l->changed[i], 1, __ATOMIC_SEQ_CST);
-}
-
 /* The lock held, queue i not full or not open: m joins it (taking a reference to attach), or is
    freed if end i has closed. Gives the lock back, with flags, and wakes queue i's receivers. */
 static int64_t message_put(struct message_link *l, int i, struct message *m, struct handle *attach, uint64_t flags) {
@@ -211,11 +203,9 @@ static int64_t message_put(struct message_link *l, int i, struct message *m, str
     *l->tail[i] = m;
     l->tail[i] = &m->next;
     l->queued[i] += n;
-    message_changed(l, i);
     spin_unlock(&l->lock, flags);
     wq_wake_all(&l->wait[i]);
     object_notify(&l->end[i]);
-    address_park_wake_word(&l->changed[i]);
     return (int64_t)n;
 }
 
@@ -226,11 +216,9 @@ static void message_take(struct message_link *l, int i, struct message *m, uint6
     if (!l->head[i]) l->tail[i] = &l->head[i];
     m->next = NULL;
     l->queued[i] -= m->size;
-    message_changed(l, i);
     spin_unlock(&l->lock, flags);
     wq_wake_all(&l->send_wait[i]);
     object_notify(&l->end[!i]); /* the sender may send again */
-    address_park_wake_word(&l->changed[i]);
 }
 
 /* Queues m for the peer of h, or frees it. With wait, a full queue is waited
@@ -263,30 +251,6 @@ int64_t message_channel_send(struct handle *h, const void *udata, size_t n, stru
         done += piece;
     }
     return message_queue(h, m, attach, true);
-}
-
-enum ap_syscall message_channel_send_ap(struct handle *h, const void *udata, size_t n, int64_t *result) {
-    struct message_link *l = message_link(h);
-    int peer = !message_side(h);
-    if (n > MESSAGE_QUEUE_LIMIT) return AP_SYSCALL_BSP; /* copied there in preemptible pieces */
-    struct message *m = message_new(n, (uint64_t)task_process()->pid);
-    if (!m) return AP_SYSCALL_BSP;
-    if (!vmm_ap_user_begin(udata, n, false)) { kfree(m); return AP_SYSCALL_BSP; }
-    memcpy(m->bytes, udata, n);
-    vmm_ap_uaccess_end();
-    /* A change between the look and the park sends it round again, a few times. */
-    for (unsigned tries = 0; tries < 4; tries++) {
-        uint64_t seen = __atomic_load_n(&l->changed[peer], __ATOMIC_ACQUIRE);
-        uint64_t fl = spin_lock(&l->lock);
-        if (!l->open[peer] || !message_queue_full(l, peer)) {
-            *result = message_put(l, peer, m, NULL, fl);
-            return AP_SYSCALL_DONE;
-        }
-        spin_unlock(&l->lock, fl);
-        if (address_park_word(&l->changed[peer], seen, UINT64_MAX)) { kfree(m); return AP_SYSCALL_PARK; }
-    }
-    kfree(m);
-    return AP_SYSCALL_BSP;
 }
 
 int64_t message_channel_post(struct handle *h, const void *data, size_t n, uint64_t sender_app) {
@@ -351,50 +315,6 @@ int64_t message_channel_receive(struct handle *h, void *ubuf, size_t cap, bool w
     }
 }
 
-enum ap_syscall message_channel_receive_ap(struct handle *h, void *ubuf, size_t cap, int flags,
-                                           uint64_t *sender_app, int64_t *result) {
-    struct message_link *l = message_link(h);
-    int side = message_side(h);
-    bool wait = flags & N_CHANNEL_WAIT, peek = flags & N_CHANNEL_PEEK, discard = flags & N_CHANNEL_DISCARD;
-    /* A change between the look and the park sends it round again, a few times. */
-    for (unsigned tries = 0; tries < 4; tries++) {
-        uint64_t seen = __atomic_load_n(&l->changed[side], __ATOMIC_ACQUIRE);
-        uint64_t fl = spin_lock(&l->lock);
-        struct message *m = l->head[side];
-        if (m) {
-            if (peek) {
-                *sender_app = m->sender_app;
-                *result = (int64_t)m->size;
-                spin_unlock(&l->lock, fl);
-                return AP_SYSCALL_DONE;
-            }
-            /* an attachment becomes a handle of the receiver: the BSP's */
-            if (m->attached) { spin_unlock(&l->lock, fl); return AP_SYSCALL_BSP; }
-            if (!discard && m->size > cap) {
-                spin_unlock(&l->lock, fl);
-                *result = -N_ERR_TOO_LARGE;
-                return AP_SYSCALL_DONE;
-            }
-            size_t copy = MIN(m->size, cap);
-            if (!vmm_ap_user_ok(ubuf, copy, true)) { spin_unlock(&l->lock, fl); return AP_SYSCALL_BSP; }
-            message_take(l, side, m, fl);
-            memcpy(ubuf, m->bytes, copy);
-            *sender_app = m->sender_app;
-            *result = (int64_t)m->size;
-            kfree(m);
-            return AP_SYSCALL_DONE;
-        }
-        bool closed = !l->open[!side];
-        spin_unlock(&l->lock, fl);
-        if (closed || !wait) {
-            *result = closed ? -N_ERR_CLOSED : -N_ERR_NOT_READY;
-            return AP_SYSCALL_DONE;
-        }
-        if (address_park_word(&l->changed[side], seen, UINT64_MAX)) return AP_SYSCALL_PARK;
-    }
-    return AP_SYSCALL_BSP;
-}
-
 static uint32_t message_ready(struct handle *h) {
     struct message_link *l = message_link(h);
     int side = message_side(h), peer = !side;
@@ -417,16 +337,12 @@ static void message_close(struct handle *h) {
     l->head[side] = NULL;
     l->tail[side] = &l->head[side];
     l->queued[side] = 0;
-    /* the peer's receivers now get N_ERR_CLOSED, and senders into this end */
-    message_changed(l, side);
-    message_changed(l, !side);
     spin_unlock(&l->lock, fl);
+    /* the peer's receivers now get N_ERR_CLOSED, and senders into this end */
     wq_wake_all(&l->wait[!side]);
     wq_wake_all(&l->wait[side]);
     wq_wake_all(&l->send_wait[side]);
     object_notify(&l->end[!side]);
-    address_park_wake_word(&l->changed[side]);
-    address_park_wake_word(&l->changed[!side]);
     message_free(dropped);
 }
 
@@ -437,10 +353,6 @@ static void message_release(struct object *o) {
     if (__atomic_sub_fetch(&l->objects, 1, __ATOMIC_ACQ_REL)) return;
     message_free(l->head[0]);
     message_free(l->head[1]);
-    /* A sibling that parked on a word after the last change, inside a read section this release
-       waited out, still names it: it wakes, finds its handle gone and ends at the BSP. */
-    address_park_wake_word(&l->changed[0]);
-    address_park_wake_word(&l->changed[1]);
     kfree(l);
 }
 
