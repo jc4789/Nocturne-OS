@@ -4,7 +4,8 @@
 #include <stddef.h>
 /* Drivers in apps (docs/nocturne-native-abi.md §9): the N_KIND_PCI handle. syscall.c owns the
    handle table, user copies and shared objects; this file owns claims, config space and
-   interrupts. Every function takes a handle the caller already holds. */
+   interrupts. Every function takes a handle the caller already holds, and is called from any
+   CPU in a thread that may sleep, holding no spinlock. */
 struct handle;
 struct n_pci_function;
 struct pci_claim;
@@ -13,7 +14,11 @@ bool pci_user_is_claim(struct handle *h);
 /* The claim record behind a handle, held by a BAR or DMA object for its whole life (NULL when h
    is no claim). revoked: its last handle closed, so its BARs are no longer the app's to map.
    dma_reusable: its driver still owns the live claim, or the IOMMU confirmed the ended claim's
-   group is blocked. BME clear alone does not let remaining DMA pages return to the allocator. BSP. */
+   group is blocked. BME clear alone does not let remaining DMA pages return to the allocator.
+   hold and the reads take no lock; drop of the last reference frees the claim's IOMMU domain
+   (dev/iommu.c locks, the heap). revoked turns true before the claim's end calls
+   shared_revoke_claim (syscall.c), which then finds every BAR mapping made before it: making a
+   BAR mapping and that revocation must exclude each other under syscall.c's own lock. */
 struct pci_claim *pci_user_hold(struct handle *h);
 void pci_user_drop(struct pci_claim *c);
 bool pci_user_revoked(const struct pci_claim *c);
@@ -22,7 +27,8 @@ bool pci_user_dma_reusable(const struct pci_claim *c);
 uint64_t pci_user_dma_limit(const struct pci_claim *c);
 /* DMA pages made through the claim (frames, or count pages from base when frames is NULL): where
    an IOMMU isolates the function, its domain maps them at their physical addresses. unmap is
-   false when the IOMMU did not confirm the function can no longer reach them. BSP. */
+   false when the IOMMU did not confirm the function can no longer reach them. They take the
+   domain's mutex and may sleep (table allocations, invalidation waits). */
 bool pci_user_dma_map(struct pci_claim *c, const uint64_t *frames, uint64_t base, size_t count);
 bool pci_user_dma_unmap(struct pci_claim *c, const uint64_t *frames, uint64_t base, size_t count);
 int64_t pci_user_info(struct handle *h, struct n_pci_function *out);

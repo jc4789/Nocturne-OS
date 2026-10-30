@@ -4,7 +4,10 @@
    Writing and persisting are separate requests. A write returns once the device has the data, which
    may still sit in its volatile cache; blk_persist returns once everything written before it is on
    the medium. A filesystem orders its writes with it (data before the record that names it) and asks
-   for it once per save, not once per write. */
+   for it once per save, not once per write.
+
+   Any CPU, any task: a driver serializes the requests it gets for a device itself (its own lock,
+   or the one thread that reaches it); blk.c keeps only the list of devices and the power gate. */
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -16,8 +19,9 @@ struct blkdev {
     uint64_t sectors;
     uint32_t block;  /* the device's own block in bytes (512 or 4096): a write covering whole blocks
                         needs no read-modify-write in the driver */
-    uint32_t errors; /* failed requests since the device appeared */
-    bool unpersisted; /* written to since its last persist (blk.c) */
+    uint32_t errors;    /* failed requests since the device appeared (atomic) */
+    uint64_t written;   /* writes the device took, ever (atomic, blk.c) */
+    uint64_t persisted; /* of them, the ones a persist that ended began after (atomic, blk.c) */
     int (*read)(struct blkdev *d, uint64_t lba, uint32_t count, void *buf);
     int (*write)(struct blkdev *d, uint64_t lba, uint32_t count, const void *buf);
     /* Everything written so far reaches the medium. NULL: the device keeps no volatile cache. */

@@ -10,6 +10,8 @@
 #include "vm/vm.h"
 
 struct fb_info fb;
+/* Boot options fbparallel and fbbench: presents are drawn by the idle CPUs as well (present_area). */
+static bool present_parallel;
 
 /* ---- where the screen is drawn ----
    A scanout is memory the display engine shows, in one pixel format. At boot it is the
@@ -98,12 +100,14 @@ void fb_init(struct limine_framebuffer *f) {
     o->native = fb.native;
     fb_monitor(f->edid, f->edid_size);
     fb_set_simulated(cmdline_has("fbsim10"));
+    present_parallel = cmdline_has("fbparallel") || cmdline_has("fbbench");
 }
 
 bool fb_dither_able(void) { return __atomic_load_n(&shown, __ATOMIC_ACQUIRE)->native; }
 
 /* Run the whole 10 bpc pipeline on an 8 bpc display and dither it at scanout (smooth gradients).
-   Only the window manager calls this after boot, between frames, and then reallocates its planes;
+   Only the window manager calls this after boot, between frames under its lock (which every
+   reader of fb.simulated, fb.bpc and fb.deep after boot holds), and then reallocates its planes;
    it turns it off when a scanout of another format is shown. */
 bool fb_set_simulated(bool on) {
     if (on && !fb_dither_able()) return false;
@@ -184,15 +188,17 @@ static void present_rows(size_t tile, void *context) {
    hold ends. Time never ends a hold: drawing while the driver still rebuilds is the very write
    the hold keeps out. A hold ends when the driver gives it back, or when its claim ends
    (dev/pciuser.c), which stops the device before it gives the holds back; that is also how a
-   driver stuck while holding is ended (pciuser.c, boot option fbhold=). Kernel code runs on the
-   BSP, but a present runs with interrupts on and can be preempted half way (fbparallel tiles join
-   before it returns): a hold, and a change of scanout, wait until no present is between its check
-   and its end. The panic screen is drawn whatever is held, on the scanout shown and on what the
-   display engine may show in its place (fb_present_last). */
+   driver stuck while holding is ended (pciuser.c, boot option fbhold=). A present runs on any CPU
+   (the compositor's thread, the console) while a hold or a change of scanout comes on another
+   (fbparallel tiles join before the present returns): a present counts itself in presenting before
+   it looks at hold_count and shown, a hold or a change of scanout changes those before it waits
+   for presenting to reach 0 (all four sequentially consistent), so either the present sees the
+   change or the change waits for the present. The panic screen is drawn whatever is held, on the
+   scanout shown and on what the display engine may show in its place (fb_present_last). */
 static unsigned hold_count;    /* atomic */
 static unsigned presenting;    /* atomic: fb_present calls between their check and return */
-static uint64_t hold_since_ms; /* when hold_count left 0 */
-static bool holds_dropped;     /* the kernel stopped (panic): nothing is held any more */
+static uint64_t hold_since_ms; /* atomic: when hold_count left 0 */
+static bool holds_dropped;     /* the kernel stopped (panic, every other CPU stopped): nothing is held any more */
 
 /* Returns once every present that began before it has ended. */
 static void presents_drain(void) {
@@ -201,8 +207,8 @@ static void presents_drain(void) {
 }
 
 void fb_hold(void) {
-    if (__atomic_fetch_add(&hold_count, 1, __ATOMIC_ACQ_REL) == 0) {
-        hold_since_ms = uptime_ms();
+    if (__atomic_fetch_add(&hold_count, 1, __ATOMIC_SEQ_CST) == 0) {
+        __atomic_store_n(&hold_since_ms, uptime_ms(), __ATOMIC_RELAXED);
         kprintf("fb: a display driver holds the screen\n");
     }
     presents_drain();
@@ -214,12 +220,13 @@ bool fb_release(void) {
                                                   __ATOMIC_ACQUIRE)) {
     }
     if (before != 1) return false;
-    kprintf("fb: the screen was released after %lu ms\n", (unsigned long)(uptime_ms() - hold_since_ms));
+    kprintf("fb: the screen was released after %lu ms\n",
+            (unsigned long)(uptime_ms() - __atomic_load_n(&hold_since_ms, __ATOMIC_RELAXED)));
     return true;
 }
 
 static bool hold_blocks(void) {
-    return !holds_dropped && __atomic_load_n(&hold_count, __ATOMIC_ACQUIRE);
+    return !holds_dropped && __atomic_load_n(&hold_count, __ATOMIC_SEQ_CST);
 }
 
 void fb_drop_holds(void) { holds_dropped = true; }
@@ -374,16 +381,16 @@ static void present_area(const struct scanout *out, const uint32_t *src, int src
     if (bottom>(int64_t)out->height) bottom=out->height;
     if (right<=x || bottom<=y) return;
     w=(int)(right-x); h=(int)(bottom-y);
-    /* User mappings are intentionally not accessible to kernel-only AP workers.
-     * Current callers are the high-mapped console/compositor RAM buffers. */
+    /* The tiles run on other CPUs in whatever address space each has, where only the kernel's half
+       is the same: the console's and the compositor's RAM canvases and the scanouts lie there. */
     /* Real WHPX fbbench measured 2.4x slower with IPI/tile overhead. Keep
        the known-faster scalar default; explicit fbparallel/fbbench can still
-       exercise AP display work without claiming a speedup. */
-    if ((cmdline_has("fbparallel") || cmdline_has("fbbench")) &&
+       exercise the work on other CPUs without claiming a speedup. */
+    if (present_parallel &&
         (uint64_t)src>=0xffff800000000000ULL && (uint64_t)out->addr>=0xffff800000000000ULL &&
         (uint64_t)w*h>=65536 && cpu_online_count()>1) {
-        /* A join holds BSP interrupts disabled. Bound each join to 128 rows,
-           restoring interrupts between batches for timer/audio delivery. */
+        /* The caller's interrupts stay off during a batch (cpu_parallel_for): batches of 128 rows
+           let them in between, CPU 0's ticks (audio, the scheduler's timeouts) among them. */
         for (int first=0;first<h;first+=128) {
             struct present_job job={out,src,deep,src_pitch,deep_pitch,x,y+first,w,MIN(h-first,128)};
             cpu_parallel_for(((size_t)job.h+15)/16,present_rows,&job);

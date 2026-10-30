@@ -1,8 +1,8 @@
 # Nocturne OS：作業の指示
 
-Nocturne は GUI が先の独自の OS で、カーネルと C ライブラリーは C で書いている。UNIX でも POSIX でも Linux でもなく、ユーザーはその三つを嫌う。対象は実機（ユーザーの PC：Ryzen 5 7600X、RAM 32 GB、RTX 4070 12 GB（AD104）、Resizable BAR 有効）で、QEMU と Hyper-V は試験の道具。VM で通ることは実機で動く証拠にならない。
+Nocturne は GUI が先の独自の OS で、カーネルと C ライブラリーは C で書いている。UNIX でも POSIX でも Linux でもなく、ユーザーはその三つを嫌う。対象は実機（ユーザーの PC：Ryzen 5 7600X、RAM 32 GB、RTX 4070 12 GB（AD104）、Resizable BAR 有効）で、QEMU と Hyper-V は試験の道具。VM で通ることは実機で動く証拠にならない。目標は汎用の OS（2026-10-30 ユーザー：「TREAT ALL OF YOUR WORK WITH THE INTENT TO MAKE THIS TOY OS INTO A GENERAL OS」）：どの作業も、CPU・メモリー・装置・プログラム・利用者の数が増えても成り立つ形で設計する。
 
-守ること（理由は各節にある）：Linux や他の OS のソースを参照しない。GPLv2 だけのコードを入れない。移植するのはプログラムで、Nocturne を移植先に合わせない。コードは一つの持ち主に入れ、分断と重複を作らない。ネイティブ ABI を迂回しない。
+守ること（理由は各節にある）：Linux や他の OS のソースを参照しない。GPLv2 だけのコードを入れない。移植するのはプログラムで、Nocturne を移植先に合わせない。コードは一つの持ち主に入れ、分断と重複を作らない。ネイティブ ABI を迂回しない。shim もスパゲッティも作らない（どこにも：カーネル、ports、ホストの道具、試験も）。抽象化の層は禁じていない。要る所に、規模に耐える形で作る。
 
 ## この文書と、ほかの置き場所
 
@@ -50,6 +50,10 @@ Nocturne は GUI が先の独自の OS で、カーネルと C ライブラリ�
 - **Web の標準を満たす。** ブラウザーは W3C（https://www.w3.org/standards/）と WHATWG（https://spec.whatwg.org/）の標準、つまり WPT（`D:\Programes\cloned repos\wpt`）が試すものを満たす（2026-10-27 ユーザー：「at all costs」）。欠けは症状に効く一部で止めず、仕様の手順と、それが触れる値を持ち主の層まで通して全部入れる。照らすのは記憶でなく仕様の原文と WPT。安全の規則（CORS・Mixed Content・Cookie・資格情報）を削って合わせない。
 - **サイト専用の処理を入れない。** ホスト名・URL での分岐、特定サイトの DOM を狙った特例、UA の偽装、注入した HTML・CSS・JS で「直った」画面を作らない。直すのは仕様と共通の境界。壊れているのは我々のブラウザーで、サイト名は「再現は◯◯」と添えるだけ。
 - **VM の処理は実機の処理と分ける。** QEMU・Hyper-V だけの処理は一か所の入口の後ろに置き、共通コードに hypervisor の判定やエミュレーターの装置を直接書かない。VM の測定値で実機の既定を決めない。Hyper-V 第 2 世代と拡張セッションは製品の要件。
+- **設計は規模に耐える形で、最初から正しく。** 書く前に問う：この部品の責務は何で、持ち主は誰か。CPU・メモリー・装置・二つ目三つ目の実装が十倍になったら、どこが詰まり、呼ぶ側の何が変わるか。一つの大きな lock、一つの CPU に寄せる仕事、決め打ちの上限と大きさは、その問いに答えられない。
+  - **shim は禁止。** ほかの部品の見出しになりすます代役、何もしない lock、偽の関数、製品のコードを偽の環境で組むこと。
+  - **スパゲッティは禁止。** 一つの呼ぶ側のための包み、ただ渡すだけの関数、その場の特例の分岐、決め打ちの値、ある環境の都合を別の部品の中へ持ち込むこと。2026-10-30、ホストの道具から shim を消すために、格納庫のカーネルのコードへ包みだけの口（`fs/port.h`）を通し、カーネルを道具に合わせて曲げた。ユーザー：「what you made was so bad that a shim is better」「architecture decisions … near sighted slop」「quick fixes are never allowed」。前提（なぜその二つが同じコードを要るのか）を問わずに、その上へ層を足したのが誤り。
+  - **抽象化の層は要る所に作る。** 責務の本当の継ぎ目（例：装置と driver の型、block の cache と格納の形式）に置き、名と契約を持ち、各側に本物の実装があり、実装や数が増えても呼ぶ側が変わらない。境界の案は書く前にユーザーへ示す。
 - **UNIX ではない。** POSIX・Linux の API を足さず、移植するプログラムの側を Nocturne のネイティブ ABI（`common/abi.h`・`common/display_abi.h`・`common/gpu_abi.h`。仕様は `docs/nocturne-native-abi.md`）へ書き換える。移植先が要る機能が ABI に無いときは、POSIX の名前や形を写さず、Nocturne の設計として足す（持ち主の問いを通す）。スレッド・SMP・スケジューラーも同じ。
 - **言語は C だけではない。** どの言語の標準ライブラリーもネイティブ ABI の上に載せてあり、POSIX を通らない。C++20（libc++、`user/apps/*.cpp`）、TypeScript・JavaScript（QuickJS、窓は `nocturne/ui`、`user/apps/*.ts` はホストの tsc で `C:\Nocturne\System\<名前>.js`）、Go（`GOOS=nocturne`、`ports/go/apps/<名前>/main.go`）、Rust（`x86_64-unknown-nocturne`、`ports/rust/apps/<名前>/main.rs`）。ゲストの中でも clang・clang++（`ports/llvm`）、tcc、tsc で作れる。tcc だけを前提にしない。
 - **GUI が先。** 機能には窓・設定の画面・クリックでの入口を作る。システムの内部をコマンドラインで組まず、ユーザーにコマンドを打たせない（2026-10-27 ユーザー：「CLI IS BANNED」。起動時の設定の適用を `--apply` の起動で組んだ案が否定された）。ブラウザーに要る UI・UX（設定の画面、タブなど）が欠けていれば、本物を足す（2026-10-27 ユーザー）。標準が利用者の選択（言語・権限など）を前提にするなら、固定値で済ませず設定とそれが効く経路まで作る。

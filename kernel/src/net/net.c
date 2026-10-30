@@ -1,119 +1,113 @@
 /* Nocturne network stack: Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS and a small TCP client.
-   Received frames are queued from the NIC interrupt and processed by the "net" kernel thread.
-   System calls run in the calling task and block on their socket's progress queue
-   (or net_wq for shared link/UDP state) until the thread reports progress.
-   Protocol control, timers, allocation and NIC output are BSP-owned. APs may
-   copy bounded TCP ring prefixes while the BSP gate is open. */
+
+   Any CPU. Received frames wait in the NIC's own ring (poll_rx) or in the receive queue below,
+   filled from interrupt handlers and driver threads; the "net" kernel thread takes them in.
+   System calls run the protocol themselves in the calling task, and sleep on their socket's
+   progress (or shared_progress for link, ARP, DNS and UDP state) until a change.
+
+   Locks, the first before the later ones:
+   - net_lock (a mutex): every piece of protocol state (sockets and their rings, ARP, DHCP, DNS,
+     pings, the output frame, the timers, the counters) and every call into the adapter (struct
+     netif). Held by a system call from entry to return, given back while it sleeps; held by the
+     net thread for one batch at a time. Allocations, copies of the app's memory and the adapter's
+     own locks happen under it. Never taken by an interrupt handler.
+   - a NIC driver's own lock (its rings and its interrupt state; see the driver).
+   - rxq_lock, config_lock (spinlocks): leaves, nothing but a wait queue's lock under them, so an
+     interrupt handler or any driver context may take them. */
 #include "kernel.h"
 #include "abi.h"
 #include "net.h"
 #include "../dev/entropy.h"
 #include "../arch/cpu.h"
+#include "../arch/smp.h"
+#include "../arch/spin.h"
 #include "../mm/heap.h"
 #include "../sys/sched.h"
 #include "../sys/syscall.h"
-#include "../mm/vmm.h"
 #include "../sys/object.h"
 #include "../vm/vm.h"
 #include "../sys/channel.h"
 #include "dns_name.h"
 
+static struct mutex net_lock;
+
+/* A condition the stack changes under net_lock, which its waiters sleep on without the lock:
+   whoever changes it moves generation on before it wakes wq, and a waiter that read generation
+   under the lock sleeps only while it still reads that (wq_wait_unless), so a change between its
+   look and its sleep is never missed. */
+struct net_progress {
+    struct wait_queue wq;
+    uint64_t generation;
+};
+static void progress_wake(struct net_progress *p) {
+    __atomic_add_fetch(&p->generation, 1, __ATOMIC_SEQ_CST);
+    wq_wake_all(&p->wq);
+}
+
+/* The adapter, its address and the IPv4 configuration: written under both net_lock and
+   config_lock, read under either (net_config, from any context, takes config_lock). */
+static struct spinlock config_lock;
 static struct netif *nif;
+static uint8_t link_mac[6];
+static const char *link_driver;
 static uint32_t my_ip, my_mask, my_gw, my_dns;
-static struct n_sockaddr dns_boot_resolver;
+static bool configured;
+static struct n_sockaddr dns_boot_resolver; /* set once by net_init, before the stack starts */
 static int dns_boot_setting; /* 0=DHCP, 1=explicit, negative=rejected boot setting */
 static struct n_sockaddr dns_default_resolver(void);
-static bool configured;
+
 static uint64_t rx_packets, tx_packets;
-/* BSP-owned wire work, used only at cooperative batch boundaries. */
-static uint64_t net_service_bytes;
-static struct wait_queue net_wq; /* shared link/ARP/DNS/UDP progress */
-static struct wait_queue rxq_wq; /* the net thread sleeps here */
-static volatile bool net_work_pending; /* IRQ wake latch, including TX resource returns */
-static bool receive_batch;
-/* BSP closes the gate before touching socket metadata. AP sections are at
-   most 64 KiB and never wait or allocate. The active count pins the registry,
-   rings and generations until BSP close has joined all preceding readers. */
-/* Keep the ownership gate, AP join count, producer mailbox and consumer wait
-   arm on separate cache lines. Their independent BSP/AP writers must not
-   invalidate the other controls merely by updating an adjacent word. The
-   full-size objects also exclude unrelated globals from their cache lines. */
-struct net_shared_word { unsigned value; } __attribute__((aligned(64)));
-_Static_assert(sizeof(struct net_shared_word)==64,"network control cache line");
-static struct net_shared_word net_gate_closed, net_ap_active, net_ap_pending;
-static struct net_shared_word net_ap_sleeping; /* consumer has armed its BSP wait boundary */
-static unsigned net_guard_depth; /* BSP-only nesting */
-static struct n_netstats net_counters;
-/* Temporary handoff diagnosis; disable after the controlled comparison. No
-   per-packet clock reads or automatic logs. SYS_NET_STATS emits one snapshot. */
-#define NET_HANDOFF_DIAG 0
-#if NET_HANDOFF_DIAG
-enum { ND_GATE,ND_GATE_RACE,ND_OWNER,ND_LEGACY_LARGE,ND_LEGACY_SPACE,ND_TX_FULL,ND_TX_MAP,ND_RX_WAIT,ND_RX_MAP,ND_REASONS };
-static struct {
-    uint64_t fallback[CPU_MAX_COUNT][ND_REASONS];
-    uint64_t gate_joins,gate_ticks,gate_max;
-    uint64_t handoffs,handoff_ticks,handoff_max,handoff_no_output;
-    uint64_t yields,yield_resched,yield_pending,yield_idle,yield_level[4];
-    uint64_t pushes[3],push_bytes[3]; /* caller, net thread, other kernel */
-} net_diag;
-static struct task *net_diag_thread;
-static void net_diag_fallback(unsigned cpu,unsigned reason) {
-    /* One writer per CPU; atomic load/store avoids adding a locked RMW to
-       the path being measured. Snapshot readers use the same atomic width. */
-    uint64_t *value=&net_diag.fallback[cpu][reason];
-    __atomic_store_n(value,__atomic_load_n(value,__ATOMIC_RELAXED)+1,__ATOMIC_RELAXED);
+static uint64_t net_service_bytes; /* wire bytes in and out: the net thread's service window */
+static struct net_progress shared_progress; /* link/ARP/DNS/UDP progress */
+static bool receive_batch; /* the net thread is taking in a batch: socket wakes wait for its end */
+
+/* Tasks other than the net thread that wait for net_lock, and the net thread's wish for one of
+   them to have it before its next batch (net_thread). */
+static unsigned net_callers_waiting;
+static bool net_turn_wanted;
+static struct net_progress net_turn;
+
+/* A system call (or another task) enters the stack. */
+static void net_enter(void) {
+    __atomic_add_fetch(&net_callers_waiting, 1, __ATOMIC_SEQ_CST);
+    mutex_lock(&net_lock);
+    __atomic_sub_fetch(&net_callers_waiting, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_exchange_n(&net_turn_wanted, false, __ATOMIC_SEQ_CST)) progress_wake(&net_turn);
 }
-#define ND_FALLBACK(cpu,reason) net_diag_fallback(cpu,reason)
-#else
-#define ND_FALLBACK(cpu,reason) ((void)0)
-#endif
-static void net_bsp_enter(void) {
-    if (net_guard_depth++) return;
-    __atomic_store_n(&net_gate_closed.value, 1, __ATOMIC_SEQ_CST);
-#if NET_HANDOFF_DIAG
-    uint64_t began=0;
-    while (__atomic_load_n(&net_ap_active.value, __ATOMIC_SEQ_CST)) {
-        if(!began)began=rdtsc();
-        pause();
-    }
-    if(began) {
-        uint64_t ticks=rdtsc()-began;
-        net_diag.gate_joins++;net_diag.gate_ticks+=ticks;net_diag.gate_max=MAX(net_diag.gate_max,ticks);
-    }
-#else
-    while (__atomic_load_n(&net_ap_active.value, __ATOMIC_SEQ_CST)) pause();
-#endif
-}
-static void net_bsp_leave(void) {
-    ASSERT(net_guard_depth);
-    if (!--net_guard_depth) __atomic_store_n(&net_gate_closed.value, 0, __ATOMIC_RELEASE);
-}
-/* Wait queues and allocations remain BSP-only. Release the data-plane gate
-   while sleeping so another CPU can use an unrelated ready connection. */
-static bool net_wait_timeout(struct wait_queue *queue, uint64_t ms) {
-    unsigned depth = net_guard_depth;
-    while (net_guard_depth) net_bsp_leave();
-    bool ready = wq_wait_timeout(queue, ms);
-    for (unsigned i=0;i<depth;i++) net_bsp_enter();
+static void net_leave(void) { mutex_unlock(&net_lock); }
+
+/* net_lock held once: sleep on p for up to ms without the lock, which is held again on return.
+   False when the time ran out. Every reference into the stack's state is looked at again after:
+   the socket may have closed and its slot may hold another connection. */
+static bool net_sleep(struct net_progress *p, uint64_t ms) {
+    ASSERT(mutex_held(&net_lock) && net_lock.depth == 1);
+    uint64_t seen = __atomic_load_n(&p->generation, __ATOMIC_SEQ_CST);
+    net_leave();
+    bool ready = wq_wait_unless(&p->wq, &p->generation, seen, ms ? ms : 1);
+    net_enter();
     return ready;
+}
+/* net_lock held once: another task may have this CPU if one is waiting for it. */
+static void net_yield(void) {
+    if (!need_resched) return;
+    net_leave();
+    schedule();
+    net_enter();
 }
 /* The retained handle identifies a channel end, independently of handle number
    reuse; its peer closing cancels. Only setup paths consult it: a cancelled HTTP/2
    stream must never abort a shared established TCP connection while pumping
-   another stream's records. */
+   another stream's records. The handle is the calling thread's own. */
 static bool net_setup_cancelled(void) {
     struct handle *h=current_task->net_setup_cancel;
-    if(!h)return false;
-    uint64_t flags=irq_save();
-    bool closed=handle_ready(h)&N_EVENT_CLOSED;
-    irq_restore(flags);
-    return closed;
+    return h && (handle_ready(h)&N_EVENT_CLOSED);
 }
-static bool net_setup_wait_timeout(struct wait_queue *queue,uint64_t ms) {
-    /* Task wait queues remain BSP-owned. Bound only the setup context's
-       sleep; normal TCP/UDP waits retain their existing progress semantics. */
+static bool net_setup_sleep(struct net_progress *p,uint64_t ms) {
+    /* Nothing wakes a setup wait when its channel closes: bound only the
+       setup context's sleep, so it looks again soon. Normal TCP/UDP waits
+       retain their existing progress semantics. */
     if(current_task->net_setup_cancel && ms>50)ms=50;
-    return net_wait_timeout(queue,ms);
+    return net_sleep(p,ms);
 }
 void net_task_exit(struct task *task) {
     struct handle *h=task->net_setup_cancel;
@@ -225,32 +219,68 @@ struct tcp_hdr {
     uint16_t win, csum, urg;
 } PACKED;
 
-/* ---------------------------------------------------------------- receive queue (IRQ -> thread) */
+/* ---------------------------------------------------------------- receive queue (drivers -> thread) */
 
+/* Frames copied in by interrupt handlers, driver threads and the loopback output, taken in by
+   the net thread, which reads the slot at the tail in place (a producer never writes it) and
+   gives it back after. rxq_lock guards head, tail, the counters and net_work_pending, the net
+   thread's wake latch (the condition it sleeps on, rxq_wq). */
 #define RXQ 64
 static uint8_t rxq_buf[RXQ][1536];
 static uint16_t rxq_len[RXQ];
-static volatile int rxq_head, rxq_tail;
+static int rxq_head, rxq_tail;
+static struct spinlock rxq_lock;
+static struct wait_queue rxq_wq;
+static bool net_work_pending;
+static uint64_t rxq_dropped, rxq_invalid, rxq_high_water;
 
 void net_rx_notify(void) {
+    uint64_t flags = spin_lock(&rxq_lock);
     net_work_pending = true;
+    spin_unlock(&rxq_lock, flags);
     wq_wake_all(&rxq_wq);
 }
 
-void net_rx(const void *frame, size_t len) {
-    if (len < 14 || len > 1536) {net_counters.rx_invalid++;return;}
+/* rxq_lock held: the frame into the queue, and the net thread told; false when it is full. */
+static bool rxq_put_locked(const void *frame, size_t len) {
     int next = (rxq_head + 1) % RXQ;
-    if (next == rxq_tail) {net_counters.rx_dropped++;return;}
+    if (next == rxq_tail) return false;
     memcpy(rxq_buf[rxq_head], frame, len);
     rxq_len[rxq_head] = (uint16_t)len;
     rxq_head = next;
-    uint64_t queued=(uint64_t)((rxq_head-rxq_tail+RXQ)%RXQ);
-    net_counters.rx_ring_high_water=MAX(net_counters.rx_ring_high_water,queued);
-    net_rx_notify();
+    rxq_high_water = MAX(rxq_high_water, (uint64_t)((rxq_head - rxq_tail + RXQ) % RXQ));
+    net_work_pending = true;
+    return true;
+}
+
+void net_rx(const void *frame, size_t len) {
+    uint64_t flags = spin_lock(&rxq_lock);
+    bool queued = false;
+    if (len < 14 || len > 1536) rxq_invalid++;
+    else if (!(queued = rxq_put_locked(frame, len))) rxq_dropped++;
+    spin_unlock(&rxq_lock, flags);
+    if (queued) wq_wake_all(&rxq_wq);
+}
+
+/* The net thread, net_lock held: every queued frame, including those queued meanwhile. */
+static void eth_input(const void *packet, size_t len);
+static void rxq_drain(void) {
+    for (;;) {
+        uint64_t flags = spin_lock(&rxq_lock);
+        int at = rxq_tail;
+        bool empty = at == rxq_head;
+        spin_unlock(&rxq_lock, flags);
+        if (empty) return;
+        eth_input(rxq_buf[at], rxq_len[at]);
+        flags = spin_lock(&rxq_lock);
+        rxq_tail = (at + 1) % RXQ;
+        spin_unlock(&rxq_lock, flags);
+    }
 }
 
 /* ---------------------------------------------------------------- output */
 
+/* The one frame every output is built in, under net_lock. */
 static uint8_t frame[1600];
 #define L4 (frame + 14 + 20) /* transport payload area */
 static uint16_t ip_ident;
@@ -259,7 +289,7 @@ static int eth_output(const uint8_t dst[6], uint16_t type, size_t len) {
     if (!nif) return -N_ERR_NETWORK_DOWN;
     struct eth_hdr *e = (struct eth_hdr *)frame;
     memcpy(e->dst, dst, 6);
-    memcpy(e->src, nif->mac, 6);
+    memcpy(e->src, link_mac, 6);
     e->type = htons(type);
     size_t total = 14 + len;
     if (total < 60) {
@@ -283,19 +313,20 @@ static uint32_t ip_source(uint32_t dst) { return (dst >> 24) == 127 ? dst : my_i
 static int ip_loopback(size_t len) {
     if (!nif) return -N_ERR_NETWORK_DOWN;
     struct eth_hdr *e = (struct eth_hdr *)frame;
-    memcpy(e->dst, nif->mac, 6);
-    memcpy(e->src, nif->mac, 6);
+    memcpy(e->dst, link_mac, 6);
+    memcpy(e->src, link_mac, 6);
     e->type = htons(0x0800);
-    uint64_t flags = irq_save(); /* the card's interrupt shares the queue */
-    bool full = (rxq_head + 1) % RXQ == rxq_tail;
-    if (!full) net_rx(frame, 14 + len);
-    irq_restore(flags);
-    if (full) return -N_ERR_BUSY;
+    uint64_t flags = spin_lock(&rxq_lock);
+    bool queued = rxq_put_locked(frame, 14 + len);
+    spin_unlock(&rxq_lock, flags);
+    if (!queued) return -N_ERR_BUSY;
+    wq_wake_all(&rxq_wq);
     tx_packets++;
     return 0;
 }
 
-static int ip_output(uint32_t dst, const uint8_t mac[6], uint8_t proto, size_t len) {
+/* src is the datagram's source address: ip_source(dst), or 0 for a DHCP client's broadcast. */
+static int ip_output(uint32_t src, uint32_t dst, const uint8_t mac[6], uint8_t proto, size_t len) {
     struct ip_hdr *ip = (struct ip_hdr *)(frame + 14);
     ip->vihl = 0x45;
     ip->tos = 0;
@@ -305,7 +336,7 @@ static int ip_output(uint32_t dst, const uint8_t mac[6], uint8_t proto, size_t l
     ip->ttl = 64;
     ip->proto = proto;
     ip->csum = 0;
-    ip_put(ip->src, ip_source(dst));
+    ip_put(ip->src, src);
     ip_put(ip->dst, dst);
     ip->csum = htons(csum_fold(csum_add(0, ip, 20)));
     if (ip_is_local(dst)) return ip_loopback(20 + len);
@@ -344,7 +375,7 @@ static void arp_store(uint32_t ip, const uint8_t mac[6]) {
     memcpy(arp_tab[slot].mac, mac, 6);
     arp_tab[slot].time = uptime_ms();
     arp_tab[slot].valid = true;
-    wq_wake_all(&net_wq);
+    progress_wake(&shared_progress);
 }
 
 static void arp_send(uint16_t op, const uint8_t tha[6], uint32_t tpa, const uint8_t dst[6]) {
@@ -354,7 +385,7 @@ static void arp_send(uint16_t op, const uint8_t tha[6], uint32_t tpa, const uint
     a->hlen = 6;
     a->plen = 4;
     a->op = htons(op);
-    memcpy(a->sha, nif->mac, 6);
+    memcpy(a->sha, link_mac, 6);
     ip_put(a->spa, my_ip);
     memcpy(a->tha, tha, 6);
     ip_put(a->tpa, tpa);
@@ -382,7 +413,7 @@ static int arp_resolve_until(uint32_t dst, uint8_t mac[6], uint64_t deadline) {
     if (!nif) return -N_ERR_NETWORK_DOWN;
     if(net_setup_cancelled())return -N_ERR_CANCELLED;
     if (ip_is_local(dst)) { /* delivered by ip_loopback */
-        memcpy(mac, nif->mac, 6);
+        memcpy(mac, link_mac, 6);
         return 0;
     }
     if (dst == 0xFFFFFFFF || dst == (my_ip | ~my_mask)) {
@@ -408,7 +439,7 @@ static int arp_resolve_until(uint32_t dst, uint8_t mac[6], uint64_t deadline) {
             if (deadline && now >= deadline) return -N_ERR_TIMEOUT;
             if (arp_lookup(hop, mac)) return 0;
             if (now >= until) break;
-            net_setup_wait_timeout(&net_wq, until - now);
+            net_setup_sleep(&shared_progress, until - now);
         }
     }
     return -N_ERR_UNREACHABLE;
@@ -434,11 +465,11 @@ static void icmp_input(const uint8_t *src_mac, uint32_t src, const uint8_t *p, s
         r->type = 0;
         r->csum = 0;
         r->csum = htons(csum_fold(csum_add(0, L4, len)));
-        ip_output(src, mac, 1, len);
+        ip_output(ip_source(src), src, mac, 1, len);
     } else if (h->type == 0) {
         for (int i = 0; i < PING_N; i++)
             if (pings[i].used && pings[i].id == ntohs(h->id) && pings[i].seq == ntohs(h->seq)) pings[i].done = true;
-        wq_wake_all(&net_wq);
+        progress_wake(&shared_progress);
     }
 }
 
@@ -465,7 +496,7 @@ static int64_t sys_ping(uint32_t dst, int seq, int timeout_ms) {
     memcpy(L4 + 8, "Nocturne says hello to the night.", 32);
     h->csum = htons(csum_fold(csum_add(0, L4, 40)));
     uint64_t t0 = uptime_ms(), until = t0 + (uint64_t)(timeout_ms > 0 ? timeout_ms : 1000);
-    ip_output(dst, mac, 1, 40);
+    ip_output(ip_source(dst), dst, mac, 1, 40);
     int64_t ret = -N_ERR_TIMEOUT;
     for (;;) {
         uint64_t now=uptime_ms();
@@ -478,7 +509,7 @@ static int64_t sys_ping(uint32_t dst, int seq, int timeout_ms) {
             ret = -N_ERR_STOPPED;
             break;
         }
-        net_wait_timeout(&net_wq, until - now);
+        net_sleep(&shared_progress, until - now);
     }
     if (w->done) ret = (int64_t)(uptime_ms() - t0);
     w->used = false;
@@ -520,8 +551,8 @@ static uint16_t ephemeral_port(void) {
     return next_port++;
 }
 
-static int udp_output(uint16_t sport, uint32_t dst, uint16_t dport, const uint8_t mac[6], const void *data,
-                      size_t len) {
+static int udp_output(uint16_t sport, uint32_t src, uint32_t dst, uint16_t dport, const uint8_t mac[6],
+                      const void *data, size_t len) {
     if (len > 1472) return -N_ERR_INVALID;
     struct udp_hdr *u = (struct udp_hdr *)L4;
     u->sport = htons(sport);
@@ -529,9 +560,9 @@ static int udp_output(uint16_t sport, uint32_t dst, uint16_t dport, const uint8_
     u->len = htons((uint16_t)(8 + len));
     u->csum = 0;
     memcpy(L4 + 8, data, len);
-    uint16_t c = l4_csum(ip_source(dst), dst, 17, L4, 8 + len);
+    uint16_t c = l4_csum(src, dst, 17, L4, 8 + len);
     u->csum = htons(c ? c : 0xFFFF);
-    return ip_output(dst, mac, 17, 8 + len);
+    return ip_output(src, dst, mac, 17, 8 + len);
 }
 
 static void dhcp_input(const uint8_t *p, size_t len);
@@ -558,7 +589,7 @@ static void udp_input(uint32_t src, uint32_t dst, const uint8_t *p, size_t len) 
         d->len = (uint16_t)(ulen - 8);
         memcpy(d->data, p + 8, ulen - 8);
         s->qh = next;
-        wq_wake_all(&net_wq);
+        progress_wake(&shared_progress);
         return;
     }
 }
@@ -571,7 +602,7 @@ static bool udp_port_used(uint16_t port) {
 static void udp_release(struct udp_sock *s) {
     if(!s || !s->used)return;
     s->used=false;kfree(s->q);s->q=NULL;s->qh=s->qt=0;
-    wq_wake_all(&net_wq);
+    progress_wake(&shared_progress);
 }
 static int udp_alloc(uint16_t port, int pid) {
     if(port) {if(udp_port_used(port))return -N_ERR_ADDRESS_IN_USE;}
@@ -632,8 +663,8 @@ static struct udp_dgram *udp_wait(int i, int timeout_ms, int *err) {
             *err = -N_ERR_NOT_READY;
             return NULL;
         }
-        if(s->internal)net_setup_wait_timeout(&net_wq, timeout_ms < 0 ? 1000 : until - now);
-        else net_wait_timeout(&net_wq, timeout_ms < 0 ? 1000 : until - now);
+        if(s->internal)net_setup_sleep(&shared_progress, timeout_ms < 0 ? 1000 : until - now);
+        else net_sleep(&shared_progress, timeout_ms < 0 ? 1000 : until - now);
     }
 }
 
@@ -662,7 +693,7 @@ static void dhcp_send(int type) {
     b[6] = (uint8_t)(dhcp_xid >> 8);
     b[7] = (uint8_t)dhcp_xid;
     b[10] = 0x80; /* broadcast replies please */
-    memcpy(b + 28, nif->mac, 6);
+    memcpy(b + 28, link_mac, 6);
     static const uint8_t magic[4] = {99, 130, 83, 99};
     memcpy(b + 236, magic, 4);
     int o = 240;
@@ -672,7 +703,7 @@ static void dhcp_send(int type) {
     b[o++] = 61; /* client id */
     b[o++] = 7;
     b[o++] = 1;
-    memcpy(b + o, nif->mac, 6);
+    memcpy(b + o, link_mac, 6);
     o += 6;
     if (type == 3) {
         b[o++] = 50;
@@ -697,10 +728,7 @@ static void dhcp_send(int type) {
     b[o++] = 6;
     b[o++] = 51;
     b[o++] = 255;
-    uint32_t saved = my_ip;
-    my_ip = 0;
-    udp_output(68, 0xFFFFFFFF, 67, bcast_mac, b, sizeof b);
-    my_ip = saved;
+    udp_output(68, 0, 0xFFFFFFFF, 67, bcast_mac, b, sizeof b); /* from 0.0.0.0, also while bound */
 }
 
 static void dhcp_start(void) {
@@ -743,11 +771,13 @@ static void dhcp_input(const uint8_t *p, size_t len) {
         dhcp_send(3);
         dhcp_next = uptime_ms() + 2000;
     } else if (dhcp_state == DHCP_REQUEST && type == 5) {
+        uint64_t flags = spin_lock(&config_lock);
         my_ip = yiaddr;
         my_mask = mask;
         my_gw = router;
         my_dns = dns ? dns : router;
         configured = true;
+        spin_unlock(&config_lock, flags);
         dhcp_state = DHCP_BOUND;
         if (lease < 60) lease = 60;
         dhcp_next = uptime_ms() + (uint64_t)lease * 500; /* renew at half the lease */
@@ -756,7 +786,7 @@ static void dhcp_input(const uint8_t *p, size_t len) {
                 (my_ip >> 8) & 255, my_ip & 255, __builtin_popcount(my_mask), my_gw >> 24, (my_gw >> 16) & 255,
                 (my_gw >> 8) & 255, my_gw & 255, resolver.ip >> 24, (resolver.ip >> 16) & 255, (resolver.ip >> 8) & 255,
                 resolver.ip & 255, resolver.port);
-        wq_wake_all(&net_wq);
+        progress_wake(&shared_progress);
     } else if (type == 6) {
         dhcp_start();
     }
@@ -1041,7 +1071,7 @@ static int dns_query(const char *source,uint32_t resolver,uint16_t port,struct d
     result=dns_failure(answer,N_DNS_TIMEOUT);
     for (unsigned attempt=0;attempt<3 && result==-N_ERR_TIMEOUT;attempt++) {
         if(net_setup_cancelled()){result=-N_ERR_CANCELLED;dns_failure(answer,N_DNS_CANCELLED);break;}
-        int sent=udp_output(udp_socks[sock]->port,resolver,port,mac,query,query_len);
+        int sent=udp_output(udp_socks[sock]->port,ip_source(resolver),resolver,port,mac,query,query_len);
         if (sent<0) {result=sent;dns_failure(answer,N_DNS_UNREACHABLE);break;}
         uint64_t until=uptime_ms()+2000;
         while (uptime_ms()<until) {
@@ -1079,6 +1109,9 @@ finished:
 #define TCP_WINDOW_SHIFT_MAX 14 /* RFC 7323 sequence/window arithmetic bound */
 #define TCP_WINDOW_MAX ((uint32_t)UINT16_MAX << TCP_WINDOW_SHIFT_MAX)
 #define TCP_MSS (1500u - 20u - 20u) /* interface IPv4 MTU minus IP/TCP headers */
+/* The most a system call copies between the app and a ring under one hold of net_lock (a
+   receive returns at most this; a send gives the lock back between chunks). */
+#define TCP_COPY_CHUNK (64u * 1024u)
 static uint32_t tcp_rx_target = TCP_BUFFER_DEFAULT, tcp_tx_target = TCP_BUFFER_DEFAULT;
 #define F_FIN 0x01
 #define F_SYN 0x02
@@ -1096,13 +1129,8 @@ enum { T_FREE, T_SYN_SENT, T_ESTABLISHED, T_FIN_WAIT1, T_FIN_WAIT2, T_CLOSE_WAIT
 
 struct tcb {
     int state, err, pid;
-    unsigned io_owner; /* 0=idle, CPU index+1 owns a bounded AP ring operation */
-    /* Stable metadata owns its progress waiters. One socket's ACK/data must
-       not reschedule every DNS/TCP helper that is waiting on another socket. */
-    struct wait_queue progress;
     bool user_open, fin_pending, fin_sent, rx_fin;
     bool window_scaled, ack_pending, progress_pending, tx_retry, probe_pending, resend_pending;
-    bool ap_output_pending; /* AP copy/window update awaiting BSP protocol output */
     uint8_t rx_shift, tx_shift;
     unsigned ack_segments;
     uint32_t rip;
@@ -1137,10 +1165,14 @@ struct tcb {
     uint32_t lip;
     bool accept_pending;
     uint64_t listener, accept_order;
-#if NET_HANDOFF_DIAG
-    uint64_t ap_enqueue_at;
-#endif
+    /* Last, and kept by tcb_clear: the slot's progress outlives each connection it holds, so a
+       task that read its generation for an earlier one and sleeps without net_lock is woken,
+       not lost. Stable metadata owns its progress waiters: one socket's ACK/data must not
+       reschedule every DNS/TCP helper that is waiting on another socket. */
+    struct net_progress progress;
 };
+/* The slot empty again, its progress kept. */
+static void tcb_clear(struct tcb *t) { memset(t, 0, offsetof(struct tcb, progress)); }
 /* Closed-but-lingering tuples remain valid until TCP releases them. They
    must not occupy a fixed sixteen-slot pool and serialize unrelated fetches. */
 static struct tcb *tcp_initial_slots[TCP_INITIAL];
@@ -1164,18 +1196,18 @@ static bool fault_hit(uint16_t per_mille) { return per_mille && rnd() % 1000 < p
 #define SEQ_LEQ(a, b) ((int32_t)((a) - (b)) <= 0)
 
 static void tcp_free(struct tcb *t) {
-    /* Detach sleeping tasks before clearing the stable slot; their generation
+    /* Wake sleeping tasks before clearing the stable slot; their generation
        checks reject a closed/reused connection when they next run. */
-    wq_wake_all(&t->progress);
+    progress_wake(&t->progress);
     kfree(t->rx);
     kfree(t->tx);
     kfree(t->ooo);
-    memset(t, 0, sizeof *t);
+    tcb_clear(t);
 }
 
 static void tcp_progress(struct tcb *t) {
     if (receive_batch) t->progress_pending = true;
-    else wq_wake_all(&t->progress);
+    else progress_wake(&t->progress);
 }
 
 static void tcp_ring_write(uint8_t *ring, uint32_t capacity, uint32_t at, const void *src, uint32_t n) {
@@ -1190,6 +1222,26 @@ static void tcp_ring_read(void *dst, const uint8_t *ring, uint32_t capacity, uin
     uint32_t first = MIN(n, capacity-at);
     memcpy(dst, ring+at, first);
     if (n>first) memcpy((uint8_t *)dst+first, ring, n-first);
+}
+
+/* The app's n bytes at usrc into the ring from at: 0, or -N_ERR_BAD_ADDRESS (whatever arrived
+   lies past the ring's data, where nothing reads it). */
+static int tcp_ring_write_user(uint8_t *ring, uint32_t capacity, uint32_t at, const void *usrc, uint32_t n) {
+    at %= capacity;
+    uint32_t first = MIN(n, capacity-at);
+    if (copy_from_user(ring+at, usrc, first) < 0) return -N_ERR_BAD_ADDRESS;
+    if (n>first && copy_from_user(ring, (const uint8_t *)usrc+first, n-first) < 0) return -N_ERR_BAD_ADDRESS;
+    return 0;
+}
+
+/* The ring's n bytes from at into the app's memory at udst: how many arrived (the first piece
+   when the second's page went), or -N_ERR_BAD_ADDRESS when none did. */
+static int64_t tcp_ring_read_user(void *udst, const uint8_t *ring, uint32_t capacity, uint32_t at, uint32_t n) {
+    at %= capacity;
+    uint32_t first = MIN(n, capacity-at);
+    if (copy_to_user(udst, ring+at, first) < 0) return -N_ERR_BAD_ADDRESS;
+    if (n>first && copy_to_user((uint8_t *)udst+first, ring, n-first) < 0) return first;
+    return n;
 }
 
 static uint32_t tcp_window(struct tcb *t) {
@@ -1236,7 +1288,7 @@ static int tcp_output(struct tcb *t, uint8_t flags, uint32_t seq, size_t len) {
     }
     if (len) tcp_ring_read(L4+hl,t->tx,t->tx_capacity,t->tx_head+(seq-t->snd_una),(uint32_t)len);
     h->csum = htons(l4_csum(ip_source(t->rip), t->rip, 6, L4, hl + len));
-    int result = ip_output(t->rip, t->mac, 6, hl+len);
+    int result = ip_output(ip_source(t->rip), t->rip, t->mac, 6, hl+len);
     if (result == -N_ERR_NOT_READY || result == -N_ERR_BUSY) {
         t->tx_retry = true;
         if (flags&F_ACK) t->ack_pending = true;
@@ -1269,37 +1321,17 @@ static void tcp_sent(struct tcb *t, uint32_t n) {
     tcp_arm(t);
 }
 
-/* Optional cooperative prefix budget, shared across the pre-RX output
-   handoff. Charge attempts, including local backpressure, to bound work. */
-struct tcp_output_budget { unsigned frames; size_t bytes; };
-static bool tcp_take_output_budget(struct tcp_output_budget *budget,uint8_t flags,size_t payload) {
-    if(!budget)return true;
-    size_t bytes=MAX((size_t)60,14+20+((flags&F_SYN)?28:20)+payload);
-    if(!budget->frames || bytes>budget->bytes)return false;
-    budget->frames--;budget->bytes-=bytes;
-    return true;
-}
-
 /* send whatever data (and FIN) the send and congestion windows allow, from snd_nxt on;
    force sends one byte into a zero window (a window probe) */
-static void tcp_push_with_budget(struct tcb *t, bool force,struct tcp_output_budget *budget) {
+static void tcp_push(struct tcb *t, bool force) {
     if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT && t->state != T_FIN_WAIT1 &&
         t->state != T_LAST_ACK && t->state != T_CLOSING)
         return;
-#if NET_HANDOFF_DIAG
-    bool handoff=t->ap_enqueue_at!=0;
-    if(handoff) {
-        uint64_t ticks=rdtsc()-t->ap_enqueue_at;t->ap_enqueue_at=0;
-        net_diag.handoffs++;net_diag.handoff_ticks+=ticks;net_diag.handoff_max=MAX(net_diag.handoff_max,ticks);
-    }
-    unsigned owner=current_task==net_diag_thread?1:current_task->is_user?0:2;
-    uint32_t submitted=0;
-#endif
     uint32_t wnd = MIN(t->snd_wnd, t->cwnd);
     if (force && wnd == 0) wnd = 1;
     t->tx_retry = false;
     t->probe_pending = force;
-    /* BSP ownership keeps tx_len, snd_una and wnd stable during this call.
+    /* net_lock keeps tx_len, snd_una and wnd stable during this call.
        Every successful data output advances snd_nxt by a nonzero MSS-bounded
        prefix; storage/window exhaustion or NIC backpressure ends the loop.
        There are no waits here, and at most one FIN follows the finite data. */
@@ -1308,16 +1340,11 @@ static void tcp_push_with_budget(struct tcb *t, bool force,struct tcp_output_bud
         if (off < t->tx_len) {
             if (off >= wnd) break;
             uint32_t n = MIN(t->tx_len - off, MIN((uint32_t)t->mss, wnd - off));
-            if(!tcp_take_output_budget(budget,F_ACK|F_PSH,n)) {t->tx_retry=true;break;}
             if (tcp_output(t, F_ACK | F_PSH, t->snd_nxt, n)<0) break;
             tcp_sent(t, n);
-#if NET_HANDOFF_DIAG
-            submitted+=n;
-#endif
             continue;
         }
         if (t->fin_pending && off == t->tx_len && (!t->fin_sent || t->snd_nxt == t->fin_seq)) {
-            if(!tcp_take_output_budget(budget,F_FIN|F_ACK,0)) {t->tx_retry=true;break;}
             if (tcp_output(t, F_FIN | F_ACK, t->snd_nxt, 0)<0) break;
             if (!t->fin_sent) {
                 t->fin_sent = true;
@@ -1332,12 +1359,7 @@ static void tcp_push_with_budget(struct tcb *t, bool force,struct tcp_output_bud
     /* data waiting behind a zero window: probe it from the retransmit timer */
     if (t->tx_len && t->snd_una == t->snd_max && t->snd_wnd == 0 && !t->tx_retry) tcp_arm(t);
     if (!t->tx_retry) t->probe_pending = false;
-#if NET_HANDOFF_DIAG
-    net_diag.pushes[owner]++;net_diag.push_bytes[owner]+=submitted;
-    if(handoff && !submitted)net_diag.handoff_no_output++;
-#endif
 }
-static void tcp_push(struct tcb *t,bool force) {tcp_push_with_budget(t,force,NULL);}
 
 /* retransmit the oldest unacknowledged segment */
 static void tcp_resend_first(struct tcb *t) {
@@ -1453,7 +1475,7 @@ static void tcp_output_reset(uint32_t dst, const uint8_t mac[6], uint16_t sport,
     h->csum = 0;
     h->urg = 0;
     h->csum = htons(l4_csum(ip_source(dst), dst, 6, L4, 20));
-    if (!ip_output(dst, mac, 6, 20)) tcp_stats.segs_out++;
+    if (!ip_output(ip_source(dst), dst, mac, 6, 20)) tcp_stats.segs_out++;
 }
 
 static void tcp_reset_unknown(uint32_t src, const uint8_t mac[6], const struct tcp_hdr *h, size_t len) {
@@ -1519,7 +1541,7 @@ static void tcp_listen_input(struct tcb *l, uint32_t src, const uint8_t mac[6], 
     int slot = tcp_alloc_slot();
     if (slot < 0) return;
     struct tcb *t = tcbs[slot];
-    memset(t, 0, sizeof *t);
+    tcb_clear(t);
     t->rx_capacity = tcp_rx_target;
     t->tx_capacity = tcp_tx_target;
     while (!(t->rx=kmalloc(t->rx_capacity)) && t->rx_capacity>PAGE_SIZE) t->rx_capacity/=2;
@@ -1873,108 +1895,6 @@ static struct tcb *user_tcb(int h) {
     return t && t->state!=T_FREE && t->user_open && t->pid==task_process()->pid?t:NULL;
 }
 
-/* Each AP owns only its own CPU-indexed counters. The DPL3 interrupt gate
-   enters with IRQs disabled; this bounded path neither enables them nor
-   waits/yields, and runner retirement/preemption happens after it returns.
-   No BSP/NMI path writes these slots. Atomic snapshot readers may race with
-   this single writer, so aligned relaxed loads/stores suffice without a
-   locked read-modify-write on every syscall, including early fallbacks. */
-static void net_ap_counter_add(uint64_t *counter,uint64_t amount) {
-    __atomic_store_n(counter,__atomic_load_n(counter,__ATOMIC_RELAXED)+amount,__ATOMIC_RELAXED);
-}
-
-bool net_ap_syscall(struct regs *regs) {
-    unsigned cpu = cpu_current_index();
-    bool send = regs->rax == SYS_TCP_SEND || regs->rax == SYS_TCP_SEND_UNTIL;
-    if (!cpu || (!send && regs->rax != SYS_TCP_RECV)) return false;
-    if (current_task->killed) return false; /* BSP performs process exit */
-    net_ap_counter_add(&net_counters.ap_calls[cpu],1);
-    if (__atomic_load_n(&net_gate_closed.value, __ATOMIC_SEQ_CST)) {ND_FALLBACK(cpu,ND_GATE);goto fallback;}
-    __atomic_fetch_add(&net_ap_active.value, 1, __ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&net_gate_closed.value, __ATOMIC_SEQ_CST)) {
-        __atomic_fetch_sub(&net_ap_active.value, 1, __ATOMIC_SEQ_CST);
-        ND_FALLBACK(cpu,ND_GATE_RACE);
-        goto fallback;
-    }
-    struct tcb *t = user_tcb((int)regs->rdi);
-    int64_t result = -N_ERR_NO_HANDLE;
-    bool handled = true, notify = false;
-    if (!t) goto release_gate;
-    unsigned expected = 0;
-    if (!__atomic_compare_exchange_n(&t->io_owner, &expected, cpu+1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-        ND_FALLBACK(cpu,ND_OWNER);
-        handled = false; goto release_gate;
-    }
-    size_t wanted = regs->rdx;
-    if (send && regs->rax==SYS_TCP_SEND_UNTIL && (regs->r8&~(uint64_t)N_TCP_SEND_NONBLOCK)) {
-        result=-N_ERR_INVALID;goto release_socket;
-    }
-    if (!wanted) { result=0; goto release_socket; }
-    if (send) {
-        bool nonblock=regs->rax==SYS_TCP_SEND_UNTIL && (regs->r8&N_TCP_SEND_NONBLOCK);
-        if (t->state!=T_ESTABLISHED && t->state!=T_CLOSE_WAIT) { result=t->err?t->err:-N_ERR_CLOSED; goto release_socket; }
-        if (t->fin_pending) { result=-N_ERR_CLOSED; goto release_socket; }
-        if (regs->rax==SYS_TCP_SEND_UNTIL && regs->r10 && uptime_ms()>=regs->r10) {
-            result=-N_ERR_TIMEOUT; goto release_socket;
-        }
-        /* Preserve the legacy send syscall's full enqueue on success. */
-        if (regs->rax==SYS_TCP_SEND && (wanted>65536 || wanted>t->tx_capacity-t->tx_len)) {
-            ND_FALLBACK(cpu,wanted>65536?ND_LEGACY_LARGE:ND_LEGACY_SPACE);handled=false;goto release_socket;
-        }
-        uint32_t n = (uint32_t)MIN(MIN(wanted, (size_t)65536), t->tx_capacity-t->tx_len);
-        if (!n) { if(nonblock)result=-N_ERR_NOT_READY;else {ND_FALLBACK(cpu,ND_TX_FULL);handled=false;} goto release_socket; }
-        if (!vmm_ap_user_begin((void *)regs->rsi,n,false)) { ND_FALLBACK(cpu,ND_TX_MAP);handled=false; goto release_socket; }
-        tcp_ring_write(t->tx,t->tx_capacity,t->tx_head+t->tx_len,(void *)regs->rsi,n);
-        vmm_ap_uaccess_end();
-        t->tx_len+=n;
-#if NET_HANDOFF_DIAG
-        if(!t->ap_enqueue_at)t->ap_enqueue_at=rdtsc();
-#endif
-        t->tx_retry=true; /* BSP owns segment construction, timers and NIC */
-        t->ap_output_pending=true;
-        net_ap_counter_add(&net_counters.ap_send_bytes[cpu],n);
-        result=n; notify=true;
-    } else {
-        if (!t->rx_len) {
-            if (t->rx_fin) result=0;
-            else if (t->state==T_CLOSED) result=t->err?t->err:0;
-            else if ((int)regs->r10==0) result=-N_ERR_NOT_READY;
-            else {ND_FALLBACK(cpu,ND_RX_WAIT);handled=false;}
-            goto release_socket;
-        }
-        uint32_t n = (uint32_t)MIN(MIN(wanted,(size_t)65536),t->rx_len);
-        if (!vmm_ap_user_begin((void *)regs->rsi,n,true)) { ND_FALLBACK(cpu,ND_RX_MAP);handled=false; goto release_socket; }
-        tcp_ring_read((void *)regs->rsi,t->rx,t->rx_capacity,t->rx_head,n);
-        vmm_ap_uaccess_end();
-        t->rx_head=(t->rx_head+n)%t->rx_capacity;
-        t->rx_len-=n;
-        uint32_t available=tcp_window(t), threshold=MIN(t->rx_capacity/2,TCP_MSS);
-        if (t->state!=T_CLOSED && available>t->adv_wnd &&
-            (!t->adv_wnd || available-t->adv_wnd>=threshold)) {
-            t->ack_pending=true;
-            t->ap_output_pending=true;
-            notify=true;
-        }
-        net_ap_counter_add(&net_counters.ap_recv_bytes[cpu],n);
-        result=n;
-    }
-release_socket:
-    __atomic_store_n(&t->io_owner,0,__ATOMIC_RELEASE);
-release_gate:
-    __atomic_fetch_sub(&net_ap_active.value,1,__ATOMIC_SEQ_CST);
-    if (!handled) goto fallback;
-    regs->rax=(uint64_t)result;
-    if (notify && !__atomic_fetch_or(&net_ap_pending.value,1u<<cpu,__ATOMIC_SEQ_CST) &&
-        __atomic_load_n(&net_ap_sleeping.value,__ATOMIC_SEQ_CST)) cpu_bsp_wake();
-    return true;
-fallback:
-    net_ap_counter_add(&net_counters.ap_fallbacks[cpu],1);
-    return false;
-}
-
-void net_ap_notify_bsp(void) {
-    if (__atomic_load_n(&net_ap_pending.value,__ATOMIC_ACQUIRE)) net_rx_notify();
-}
 static int tcp_alloc_slot(void) {
     size_t slot=0;
     while(slot<tcp_capacity && tcbs[slot] && tcbs[slot]->state!=T_FREE)slot++;
@@ -2026,7 +1946,7 @@ static int64_t sys_tcp_listen(uint32_t ip, uint16_t port, int backlog) {
     } else if (tcp_port_listening(ip, port)) return -N_ERR_ADDRESS_IN_USE;
     int h=tcp_alloc_slot();if(h<0)return h;
     struct tcb *t=tcbs[h];
-    memset(t,0,sizeof *t);
+    tcb_clear(t);
     t->pid=task_process()->pid;
     if(++tcp_generation==0)++tcp_generation;
     t->generation=tcp_generation;
@@ -2053,7 +1973,7 @@ static int64_t sys_tcp_accept(int h, int timeout_ms, struct n_sockaddr *remote) 
     struct tcb *l=user_tcb(h);
     if (!l) return -N_ERR_NO_HANDLE;
     if (l->state!=T_LISTEN && l->state!=T_CLOSED) return -N_ERR_INVALID;
-    if (remote && !user_ok_w(remote,sizeof *remote)) return -N_ERR_BAD_ADDRESS;
+    if (remote && !user_ok_w(remote,sizeof *remote)) return -N_ERR_BAD_ADDRESS; /* before the wait */
     uint64_t generation=l->generation;
     uint64_t until=uptime_ms()+(uint64_t)(timeout_ms>0?timeout_ms:0);
     for (;;) {
@@ -2061,17 +1981,18 @@ static int64_t sys_tcp_accept(int h, int timeout_ms, struct n_sockaddr *remote) 
         if (l->state!=T_LISTEN) return l->err?l->err:-N_ERR_CLOSED;
         struct tcb *c=tcp_next_accept(l);
         if (c) {
-            /* a sibling thread may have revoked the page while this one slept */
-            if (remote && !user_ok_w(remote,sizeof *remote)) return -N_ERR_BAD_ADDRESS;
+            /* a sibling thread may have revoked the page while this one slept:
+               the connection then stays for a later accept */
+            struct n_sockaddr peer={.ip=c->rip,.port=c->rport};
+            if (remote && copy_to_user(remote,&peer,sizeof peer)<0) return -N_ERR_BAD_ADDRESS;
             c->accept_pending=false;
             c->user_open=true;
-            if (remote) *remote=(struct n_sockaddr){.ip=c->rip,.port=c->rport};
             for (size_t i=0;i<tcp_capacity;i++) if (tcbs[i]==c) return (int64_t)i;
         }
         if (current_task->killed) return -N_ERR_STOPPED;
         uint64_t now=uptime_ms();
         if (timeout_ms>=0 && now>=until) return -N_ERR_NOT_READY;
-        net_wait_timeout(&l->progress, timeout_ms<0 ? 1000 : until-now);
+        net_sleep(&l->progress, timeout_ms<0 ? 1000 : until-now);
     }
 }
 
@@ -2088,7 +2009,7 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     if(!local)return -N_ERR_ADDRESS_IN_USE;
     int h=tcp_alloc_slot();if(h<0)return h;
     struct tcb *t=tcbs[h];
-    memset(t, 0, sizeof *t);
+    tcb_clear(t);
     t->rx_capacity = tcp_rx_target;
     t->tx_capacity = tcp_tx_target;
     /* Buffer size is real backing storage, not a transfer rejection. Allow
@@ -2128,7 +2049,7 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
             t->err = current_task->killed ? -N_ERR_STOPPED : cancelled ? -N_ERR_CANCELLED : -N_ERR_TIMEOUT;
             break;
         }
-        net_setup_wait_timeout(&t->progress, until - now);
+        net_setup_sleep(&t->progress, until - now);
     }
     if(t->generation!=generation || !t->user_open)return -N_ERR_NO_HANDLE;
     if(net_setup_cancelled()) {
@@ -2158,21 +2079,23 @@ static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t dea
         uint32_t space = t->tx_capacity - t->tx_len;
         if (!space) {
             if(nonblock)return done?(int64_t)done:-N_ERR_NOT_READY;
-            if(!user)net_setup_wait_timeout(&t->progress, deadline ? deadline-now : 1000);
-            else net_wait_timeout(&t->progress, deadline ? deadline-now : 1000);
+            if(!user)net_setup_sleep(&t->progress, deadline ? deadline-now : 1000);
+            else net_sleep(&t->progress, deadline ? deadline-now : 1000);
             continue;
         }
-        uint32_t n = (uint32_t)MIN(len - done, space);
-        if(nonblock)n=MIN(n,65536u); /* bounded immediate ring enqueue */
-        /* Validate exactly the chunk we will enqueue, not the entire request
+        /* A nonblocking call enqueues one chunk at once; a blocking one goes on chunk by chunk. */
+        uint32_t n = (uint32_t)MIN(MIN(len - done, (size_t)space), (size_t)TCP_COPY_CHUNK);
+        /* Copy exactly the chunk we will enqueue, not the entire request
            on every iteration. A late fault preserves the completed prefix. */
-        if ((uint64_t)buf>UINT64_MAX-done || (user && !user_ok((const void *)((uint64_t)buf+done),n)))
-            return done?(int64_t)done:-N_ERR_BAD_ADDRESS;
-        tcp_ring_write(t->tx,t->tx_capacity,t->tx_head+t->tx_len,buf+done,n);
+        if ((uint64_t)buf>UINT64_MAX-done) return done?(int64_t)done:-N_ERR_BAD_ADDRESS;
+        uint32_t at = t->tx_head+t->tx_len;
+        if (!user) tcp_ring_write(t->tx,t->tx_capacity,at,buf+done,n);
+        else if (tcp_ring_write_user(t->tx,t->tx_capacity,at,buf+done,n)<0) return done?(int64_t)done:-N_ERR_BAD_ADDRESS;
         t->tx_len += n;
         done += n;
         tcp_push(t, false);
         if(nonblock)return (int64_t)done;
+        if (done < len) net_yield();
     }
     return (int64_t)done;
 }
@@ -2193,13 +2116,19 @@ static int64_t tcp_recv_data(int h, uint8_t *buf, size_t len, int timeout_ms, bo
         if (current_task->killed) return -N_ERR_STOPPED;
         uint64_t now=uptime_ms();
         if (timeout_ms >= 0 && now >= until) return -N_ERR_NOT_READY;
-        if(!user)net_setup_wait_timeout(&t->progress, timeout_ms < 0 ? 1000 : until - now);
-        else net_wait_timeout(&t->progress, timeout_ms < 0 ? 1000 : until - now);
+        if(!user)net_setup_sleep(&t->progress, timeout_ms < 0 ? 1000 : until - now);
+        else net_sleep(&t->progress, timeout_ms < 0 ? 1000 : until - now);
     }
     if(t->generation!=generation || !t->user_open)return -N_ERR_NO_HANDLE;
-    uint32_t n = (uint32_t)MIN(len, t->rx_len);
-    if (user && !user_ok_w(buf,n)) return -N_ERR_BAD_ADDRESS;
-    tcp_ring_read(buf,t->rx,t->rx_capacity,t->rx_head,n);
+    /* At most one chunk a call (a short read is ordinary TCP), so net_lock never stays held
+       across a long copy. A page that went keeps the bytes it did not take for a later read. */
+    uint32_t n = (uint32_t)MIN(MIN(len, (size_t)t->rx_len), (size_t)TCP_COPY_CHUNK);
+    if (!user) tcp_ring_read(buf,t->rx,t->rx_capacity,t->rx_head,n);
+    else {
+        int64_t got = tcp_ring_read_user(buf,t->rx,t->rx_capacity,t->rx_head,n);
+        if (got < 0) return got;
+        n = (uint32_t)got;
+    }
     t->rx_head = (t->rx_head + n) % t->rx_capacity;
     t->rx_len -= n;
     /* window update if we had been squeezing the sender */
@@ -2218,7 +2147,7 @@ static void tcp_close(struct tcb *t) {
     /* Native TCP handles are not VFS descriptors. The helper's subsequent
        pipe write/close publishes poll readiness; a network packet itself
        must not wake every GUI/pipe poller before any fd can have changed. */
-    wq_wake_all(&t->progress);
+    progress_wake(&t->progress);
     t->linger_until = uptime_ms() + 20000;
     if (t->state == T_LISTEN) {
         tcp_refuse_pending(t);
@@ -2273,7 +2202,7 @@ static void eth_input(const void *packet, size_t len) {
     const uint8_t *p = packet;
     if (len<sizeof(struct eth_hdr)) return;
     const struct eth_hdr *e = (const struct eth_hdr *)p;
-    if (memcmp(e->dst, nif->mac, 6) != 0 && !(e->dst[0] & 1)) return; /* not for us (promiscuous NICs) */
+    if (memcmp(e->dst, link_mac, 6) != 0 && !(e->dst[0] & 1)) return; /* not for us (promiscuous NICs) */
     rx_packets++;
     net_service_bytes+=len;
     uint16_t type = ntohs(e->type);
@@ -2290,7 +2219,7 @@ static void eth_input(const void *packet, size_t len) {
         uint32_t src = ip_get(ip->src), dst = ip_get(ip->dst);
         /* 127/8 is only ever this system talking to itself (ip_loopback), never the wire */
         bool loopback = (dst >> 24) == 127;
-        if (loopback && memcmp(e->src, nif->mac, 6) != 0) return;
+        if (loopback && memcmp(e->src, link_mac, 6) != 0) return;
         if (configured && dst != my_ip && !loopback && dst != 0xFFFFFFFF && dst != (my_ip | ~my_mask)) return;
         if (ip->proto == 1) icmp_input(e->src, src, ipp + hl, tl - hl);
         else if (ip->proto == 17) udp_input(src, dst, ipp + hl, tl - hl);
@@ -2298,43 +2227,29 @@ static void eth_input(const void *packet, size_t len) {
     }
 }
 
-/* BSP-owned protocol output. APs only mark pending state while holding the
-   data-plane gate; they never call the NIC or mutate protocol timers. */
-static void tcp_flush_pending(bool ap_only) {
-    struct tcp_output_budget prefix={64,128u*1024u};
-    struct tcp_output_budget *budget=ap_only?&prefix:NULL;
+/* The output that waited: ACKs held for the end of a batch, segments the adapter had no room
+   for, retransmissions it refused. */
+static void tcp_flush_pending(void) {
     for (size_t i=0;i<tcp_capacity;i++) {
         struct tcb *t = tcbs[i];
         if (!t || t->state==T_FREE || t->state==T_CLOSED) continue;
-        if(ap_only && !t->ap_output_pending)continue;
-        /* A prefix yield leaves all remaining state for the ordinary flush
-           after RX; the optional early pass never drains every stream's
-           whole storage/window before making receive progress. */
-        if(budget && !budget->frames)break;
-        t->ap_output_pending=false;
         if ((t->state==T_SYN_SENT || t->state==T_SYN_RECEIVED) && t->tx_retry) {
             uint8_t flags=t->state==T_SYN_SENT?F_SYN:F_SYN|F_ACK;
-            if(!tcp_take_output_budget(budget,flags,0))break;
             if (!tcp_output(t,flags,t->iss,0)) {
                 t->snd_nxt = t->snd_max = t->iss+1;
                 t->tx_retry = false;
                 tcp_arm(t);
             }
         } else {
-            if (t->ack_pending) {
-                if(!tcp_take_output_budget(budget,F_ACK,0))break;
-                tcp_output(t,F_ACK,t->snd_nxt,0);
-            }
-            if (t->resend_pending) {
-                size_t n=MIN(t->tx_len,(uint32_t)t->mss);
-                if(!tcp_take_output_budget(budget,F_ACK,n))break;
-                tcp_resend_first(t);
-            }
-            if (t->tx_retry && !t->resend_pending) tcp_push_with_budget(t,t->probe_pending,budget);
+            if (t->ack_pending) tcp_output(t,F_ACK,t->snd_nxt,0);
+            if (t->resend_pending) tcp_resend_first(t);
+            if (t->tx_retry && !t->resend_pending) tcp_push(t,t->probe_pending);
         }
     }
 }
 
+/* The stack's own thread: frames in, the output that waited, the timers. One batch at a time
+   under net_lock; it sleeps on rxq_wq without it. */
 static void net_thread(void *arg) {
     (void)arg;
     uint64_t last_tick = 0;
@@ -2343,88 +2258,95 @@ static void net_thread(void *arg) {
        net task only to run it again and block immediately afterwards. */
     uint64_t service_started=0,service_start_bytes=0;
     bool serviced=false;
+    mutex_lock(&net_lock);
     for (;;) {
-        uint64_t f = irq_save();
-        /* SC arm -> pending recheck pairs with AP publish -> armed recheck:
-           both sides cannot observe zero. IRQs stay off from this condition
-           through wq enrollment, so an AP doorbell delivered after the check
-           wakes an enrolled consumer. A runnable consumer needs no new IPI. */
-        __atomic_store_n(&net_ap_sleeping.value,1,__ATOMIC_SEQ_CST);
-        bool rx_ready=rxq_tail!=rxq_head || (nif->rx_pending && nif->rx_pending());
-        bool ready=rx_ready || net_work_pending || __atomic_load_n(&net_ap_pending.value,__ATOMIC_SEQ_CST);
-        bool waited=!ready;
-        if (!ready)
-            wq_wait_timeout(&rxq_wq, 50);
-        __atomic_store_n(&net_ap_sleeping.value,0,__ATOMIC_SEQ_CST);
+        bool device_ready = nif->rx_pending && nif->rx_pending();
+        uint64_t service_bytes = net_service_bytes;
+        mutex_unlock(&net_lock);
+        /* Every producer sets net_work_pending under rxq_lock before it wakes rxq_wq: looked at
+           under that lock, an arrival after the look finds this thread enrolled. */
+        uint64_t f = spin_lock(&rxq_lock);
+        bool ready = device_ready || rxq_tail != rxq_head || net_work_pending;
+        if (!ready) {
+            wq_wait_locked_timeout(&rxq_wq, &rxq_lock, 50);
+            spin_take(&rxq_lock);
+        }
         net_work_pending = false;
-        irq_restore(f);
+        spin_unlock(&rxq_lock, f);
         uint64_t now=uptime_ms(); /* one clock read per bounded NIC batch */
-        if(waited || !serviced) {
-            service_started=now;service_start_bytes=net_service_bytes;serviced=false;
-        } else if(now-service_started>=2 || net_service_bytes-service_start_bytes>=256u*1024u) {
-            /* Honor timer/priority rescheduling at this maximum 2ms service
-               window (or earlier byte boundary). Each NIC poll is bounded,
-               and the AP gate is open before scheduling another task. */
-#if NET_HANDOFF_DIAG
-            net_diag.yields++;if(need_resched)net_diag.yield_resched++;if(rx_ready)net_diag.yield_pending++;
-            if(!ready)net_diag.yield_idle++;
-            net_diag.yield_level[current_task->is_user?1:0]++; /* 0=kernel thread, 1=user継続 */
-#endif
-            sched_yield();
-            service_started=uptime_ms();service_start_bytes=net_service_bytes;serviced=false;
+        if(!ready || !serviced) {
+            service_started=now;service_start_bytes=service_bytes;serviced=false;
+        } else if(now-service_started>=2 || service_bytes-service_start_bytes>=256u*1024u) {
+            /* At this maximum 2ms service window (or earlier byte boundary) the
+               system calls waiting for net_lock go first: one of them takes it
+               before the next batch (net_enter wakes this thread when one has).
+               Without them, honor timer/priority rescheduling. Each NIC poll is
+               bounded. */
+            if (__atomic_load_n(&net_callers_waiting, __ATOMIC_SEQ_CST)) {
+                uint64_t seen = __atomic_load_n(&net_turn.generation, __ATOMIC_SEQ_CST);
+                __atomic_store_n(&net_turn_wanted, true, __ATOMIC_SEQ_CST);
+                if (__atomic_load_n(&net_callers_waiting, __ATOMIC_SEQ_CST))
+                    wq_wait_unless(&net_turn.wq, &net_turn.generation, seen, 2);
+                __atomic_store_n(&net_turn_wanted, false, __ATOMIC_SEQ_CST);
+            } else {
+                sched_yield();
+            }
+            service_started=uptime_ms();service_start_bytes=service_bytes;serviced=false;
         }
-        net_bsp_enter();
-        uint32_t ap_pending=__atomic_exchange_n(&net_ap_pending.value, 0, __ATOMIC_SEQ_CST);
+        mutex_lock(&net_lock);
         receive_batch = true;
-        /* A completed AP copy/window update should reach the BSP-owned wire
-           before draining an unrelated RX batch. Ordinary NIC-only turns do
-           not pay another connection scan. RX may create new pending output,
-           so retain the shared end-of-drain flush below. */
-        if(ap_pending)tcp_flush_pending(true);
         if (nif->poll_rx) nif->poll_rx(eth_input);
-        while (rxq_tail != rxq_head) {
-            eth_input(rxq_buf[rxq_tail], rxq_len[rxq_tail]);
-            rxq_tail = (rxq_tail + 1) % RXQ;
-        }
+        rxq_drain();
         /* End-of-drain ACK and per-socket readiness, once per connection.
            Resource-blocked sends retry on NIC completion, not a fictitious
            packet loss/retransmission timeout. */
-        tcp_flush_pending(false);
+        tcp_flush_pending();
         receive_batch = false;
         for (size_t i=0;i<tcp_capacity;i++) {
             struct tcb *t = tcbs[i];
-            if (t && t->progress_pending) { t->progress_pending=false; wq_wake_all(&t->progress); }
+            if (t && t->progress_pending) { t->progress_pending=false; progress_wake(&t->progress); }
         }
         if (uptime_ms() - last_tick >= 50) {
             last_tick = uptime_ms();
             dhcp_tick();
             tcp_tick();
         }
-        net_bsp_leave();
         serviced=true;
     }
 }
 
-static bool net_initialized;
+static bool net_initialized, net_running;
 
-static void net_start(void) {
-#if NET_HANDOFF_DIAG
-    net_diag_thread=kthread_create("net", net_thread, NULL);
-#else
-    kthread_create("net", net_thread, NULL);
-#endif
+/* net_lock held: once both net_init has run and an adapter is there, the stack starts (true:
+   the caller makes its thread, without the lock). */
+static bool net_start_locked(void) {
+    if (!nif || !net_initialized || net_running) return false;
+    net_running = true;
     dhcp_start();
+    return true;
 }
 
 /* Adapters found by net_init's probes register before it starts the stack; a USB adapter may
-   arrive later, and when it is the first one the stack starts with it. */
+   arrive later, and when it is the first one the stack starts with it. The adapter already in
+   use registering again has a new address (another USB adapter in its place): the stack takes
+   it, and asks DHCP again when it changed. */
 void net_register(struct netif *n) {
-    if (nif) return;
-    nif = n;
-    if (net_initialized) {
-        kprintf("net: %s adapter arrived\n", n->driver);
-        net_start();
+    net_enter();
+    bool arrived = false, start = false;
+    if (!nif || nif == n) {
+        bool changed = !nif || memcmp(link_mac, n->mac, 6) != 0;
+        arrived = !nif && net_initialized;
+        uint64_t flags = spin_lock(&config_lock);
+        nif = n;
+        memcpy(link_mac, n->mac, 6);
+        spin_unlock(&config_lock, flags);
+        link_driver = n->driver;
+        if (changed && net_running) dhcp_start();
+        start = net_start_locked();
     }
+    net_leave();
+    if (arrived) kprintf("net: %s adapter arrived\n", n->driver);
+    if (start) kthread_create("net", net_thread, NULL);
 }
 
 static void tcp_buffer_configure(void) {
@@ -2456,106 +2378,86 @@ static void tcp_buffer_configure(void) {
 void net_init(void) {
     dns_configure();
     tcp_buffer_configure();
-    bool found = rtl8125_probe() || vm_net_probe();
+    if (!rtl8125_probe()) vm_net_probe();
+    net_enter();
     net_initialized = true;
-    if (!found || !nif) {
-        kprintf("net: no supported network card yet\n");
-        return;
-    }
-    net_start();
+    bool none = !nif, start = net_start_locked();
+    net_leave();
+    if (none) kprintf("net: no supported network card yet\n");
+    if (start) kthread_create("net", net_thread, NULL);
 }
 
 void net_process_exit(int pid) {
-    net_bsp_enter();
+    net_enter();
     if (pid == fault_pid) fault_pid = 0;
     for(size_t i=0;i<udp_capacity;i++)
         if(udp_socks[i] && udp_socks[i]->used && udp_socks[i]->pid==pid)udp_release(udp_socks[i]);
     for(size_t i=0;i<tcp_capacity;i++)
         if(tcbs[i] && tcbs[i]->state!=T_FREE && tcbs[i]->user_open && tcbs[i]->pid==pid)tcp_close(tcbs[i]);
-    net_bsp_leave();
+    net_leave();
 }
 
 bool net_config(uint8_t mac[6], uint32_t *ip, uint32_t *mask, uint32_t *gw, uint32_t *dns) {
-    if (!nif) return false;
-    memcpy(mac, nif->mac, 6);
+    uint64_t flags = spin_lock(&config_lock);
+    bool present = nif != NULL, up = configured;
+    memcpy(mac, link_mac, 6);
     *ip = my_ip;
     *mask = my_mask;
     *gw = my_gw;
     *dns = dns_default_resolver().ip;
-    return configured;
+    spin_unlock(&config_lock, flags);
+    return present && up;
 }
 
 static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
     switch (num) {
-    case SYS_NET_SETUP_CANCEL_CHANNEL: {
-        int index=(int)a;
-        if(index < -1)return -N_ERR_INVALID;
-        struct handle *h=NULL;
-        if(index>=0) {
-            uint64_t flags=irq_save();
-            h=handle_peek(index);
-            if(!h){irq_restore(flags);return -N_ERR_NO_HANDLE;}
-            if(!message_channel_is(h)){irq_restore(flags);return -N_ERR_INVALID;}
-            handle_ref(h);irq_restore(flags);
-        }
-        struct handle *old=current_task->net_setup_cancel;
-        current_task->net_setup_cancel=h;
-        handle_close(old);
-        return 0;
-    }
     case SYS_NET_INFO: {
-        struct n_netinfo *ni = (struct n_netinfo *)a;
-        if (!user_ok_w(ni, sizeof *ni)) return -N_ERR_BAD_ADDRESS;
-        memset(ni, 0, sizeof *ni);
-        if (!nif) return 0;
-        ni->present = 1;
-        ni->up = configured;
-        memcpy(ni->mac, nif->mac, 6);
-        ip_put(ni->ip, my_ip);
-        ip_put(ni->mask, my_mask);
-        ip_put(ni->gateway, my_gw);
-        ip_put(ni->dns, dns_default_resolver().ip);
-        ni->rx_packets = rx_packets;
-        ni->tx_packets = tx_packets;
-        strlcpy(ni->driver, nif->driver, sizeof ni->driver);
-        return 0;
+        struct n_netinfo ni = {0};
+        if (nif) {
+            ni.present = 1;
+            ni.up = configured;
+            memcpy(ni.mac, link_mac, 6);
+            ip_put(ni.ip, my_ip);
+            ip_put(ni.mask, my_mask);
+            ip_put(ni.gateway, my_gw);
+            ip_put(ni.dns, dns_default_resolver().ip);
+            ni.rx_packets = rx_packets;
+            ni.tx_packets = tx_packets;
+            strlcpy(ni.driver, link_driver, sizeof ni.driver);
+        }
+        return copy_to_user((void *)a, &ni, sizeof ni);
     }
     case SYS_NET_PING:
         if (!nif) return -N_ERR_NETWORK_DOWN;
         return sys_ping((uint32_t)a, (int)b, (int)c);
     case SYS_NET_DNS: {
         if (!user_ok_w((void *)b, 4)) return -N_ERR_BAD_ADDRESS;
-        char *name = NULL;
-        int r = dns_user_name_copy((const char *)a, &name);
+        char name[DNS_NAME_TEXT_BYTES + 1];
+        int r = user_str(name, (const char *)a, sizeof name);
         if (r < 0) return r;
         struct dns_answer answer;
         struct n_sockaddr resolver=dns_default_resolver();
         int64_t ret = dns_query(name, resolver.ip, resolver.port, &answer);
-        kfree(name);
-        if (ret == 0) {
-            if (!user_ok_w((void *)b,4)) ret=-N_ERR_BAD_ADDRESS;
-            else *(uint32_t *)b = answer.ips[0];
-        }
+        if (ret == 0 && copy_to_user((void *)b, &answer.ips[0], sizeof answer.ips[0]) < 0) ret = -N_ERR_BAD_ADDRESS;
         kfree(answer.ips);
         return ret;
     }
     case SYS_NET_DNS_ALL: {
         struct n_dns_result *out=(struct n_dns_result *)d;
         if (!user_ok_w(out,sizeof *out) || c>SIZE_MAX/sizeof(uint32_t) || !user_ok_w((void *)b,c*sizeof(uint32_t))) return -N_ERR_BAD_ADDRESS;
-        *out=(struct n_dns_result){.version=1,.status=N_DNS_FORMAT};
-        char *name=NULL;int result=dns_user_name_copy((const char *)a,&name);
+        struct n_dns_result summary={.version=1,.status=N_DNS_FORMAT};
+        if (copy_to_user(out,&summary,sizeof summary)<0) return -N_ERR_BAD_ADDRESS;
+        char name[DNS_NAME_TEXT_BYTES + 1];
+        int result=user_str(name,(const char *)a,sizeof name);
         if (result<0) return result;
         struct n_sockaddr resolver=dns_default_resolver();
-        if (e) {
-            if (!user_ok((void *)e,sizeof resolver)) {kfree(name);return -N_ERR_BAD_ADDRESS;}
-            resolver=*(const struct n_sockaddr *)e;
-        }
+        if (e && copy_from_user(&resolver,(const void *)e,sizeof resolver)<0) return -N_ERR_BAD_ADDRESS;
         struct dns_answer answer;
-        result=dns_query(name,resolver.ip,resolver.port,&answer);kfree(name);
-        /* A sibling may revoke user pages while resolution blocks. */
-        if (!user_ok_w(out,sizeof *out) || !user_ok_w((void *)b,MIN(c,(size_t)answer.count)*sizeof(uint32_t))) {kfree(answer.ips);return -N_ERR_BAD_ADDRESS;}
-        *out=(struct n_dns_result){.version=1,.status=answer.status,.count=answer.count,.ttl=answer.ttl};
-        if (!result && c) memcpy((void *)b,answer.ips,MIN(c,(size_t)answer.count)*sizeof(uint32_t));
+        result=dns_query(name,resolver.ip,resolver.port,&answer);
+        summary=(struct n_dns_result){.version=1,.status=answer.status,.count=answer.count,.ttl=answer.ttl};
+        size_t n=result?0:MIN(c,(size_t)answer.count);
+        if (copy_to_user(out,&summary,sizeof summary)<0 ||
+            (n && copy_to_user((void *)b,answer.ips,n*sizeof(uint32_t))<0)) result=-N_ERR_BAD_ADDRESS;
         kfree(answer.ips);return result;
     }
     case SYS_UDP_SOCKET:
@@ -2565,15 +2467,14 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         struct udp_sock *s = user_udp((int)a);
         if (!s) return -N_ERR_NO_HANDLE;
         if (e > 1472) return -N_ERR_INVALID;
-        if (!user_ok((void *)d, e)) return -N_ERR_BAD_ADDRESS;
+        uint8_t tmp[1472];
+        if (copy_from_user(tmp, (const void *)d, e) < 0) return -N_ERR_BAD_ADDRESS;
         uint8_t mac[6];
         uint64_t generation=s->generation;
         int r = arp_resolve((uint32_t)b, mac);
         if (r < 0) return r;
         if(!s->used || s->generation!=generation)return -N_ERR_NO_HANDLE;
-        uint8_t tmp[1472];
-        memcpy(tmp, (void *)d, e);
-        r = udp_output(s->port, (uint32_t)b, (uint16_t)c, mac, tmp, e);
+        r = udp_output(s->port, ip_source((uint32_t)b), (uint32_t)b, (uint16_t)c, mac, tmp, e);
         return r < 0 ? r : (int64_t)e;
     }
     case SYS_UDP_RECV: {
@@ -2585,12 +2486,11 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         int err = 0;
         struct udp_dgram *dg = udp_wait((int)a, (int)d, &err);
         if (!dg) return err;
+        /* The datagram is out of the queue: its slot stays as it is while net_lock is held. */
         size_t n = MIN(c, dg->len);
-        memcpy((void *)b, dg->data, n);
-        if (from) {
-            from->ip = dg->src;
-            from->port = dg->sport;
-        }
+        struct n_sockaddr source = {.ip = dg->src, .port = dg->sport};
+        if (copy_to_user((void *)b, dg->data, n) < 0 || (from && copy_to_user(from, &source, sizeof source) < 0))
+            return -N_ERR_BAD_ADDRESS;
         return (int64_t)n;
     }
     case SYS_UDP_CLOSE: {
@@ -2616,44 +2516,27 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         return 0;
     }
     case SYS_NET_STATS: {
-        struct n_netstats *out = (struct n_netstats *)a;
-        if (!user_ok_w(out, sizeof *out)) return -N_ERR_BAD_ADDRESS;
-        memset(out,0,sizeof *out);
-        out->rx_dropped=net_counters.rx_dropped;
-        out->rx_invalid=net_counters.rx_invalid;
-        out->rx_ring_high_water=net_counters.rx_ring_high_water;
-        for (unsigned cpu=1;cpu<CPU_MAX_COUNT;cpu++) {
-            out->ap_send_bytes[cpu]=__atomic_load_n(&net_counters.ap_send_bytes[cpu],__ATOMIC_RELAXED);
-            out->ap_recv_bytes[cpu]=__atomic_load_n(&net_counters.ap_recv_bytes[cpu],__ATOMIC_RELAXED);
-            out->ap_calls[cpu]=__atomic_load_n(&net_counters.ap_calls[cpu],__ATOMIC_RELAXED);
-            out->ap_fallbacks[cpu]=__atomic_load_n(&net_counters.ap_fallbacks[cpu],__ATOMIC_RELAXED);
-        }
-        if (nif && nif->get_stats) nif->get_stats(out);
-#if NET_HANDOFF_DIAG
-        uint64_t fallback[ND_REASONS]={0};
-        for(unsigned cpu=1;cpu<CPU_MAX_COUNT;cpu++)for(unsigned reason=0;reason<ND_REASONS;reason++)
-            fallback[reason]+=__atomic_load_n(&net_diag.fallback[cpu][reason],__ATOMIC_RELAXED);
-        kprintf("NETDIAG hz=%lu fb=%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu gate=%lu/%lu/%lu handoff=%lu/%lu/%lu/noout%lu yield=%lu/resched%lu/pending%lu/idle%lu level=%lu/%lu/%lu/%lu push=%lu/%lu/%lu bytes=%lu/%lu/%lu\n",
-                tsc_hz,fallback[0],fallback[1],fallback[2],fallback[3],fallback[4],fallback[5],fallback[6],fallback[7],fallback[8],
-                net_diag.gate_joins,net_diag.gate_ticks,net_diag.gate_max,
-                net_diag.handoffs,net_diag.handoff_ticks,net_diag.handoff_max,net_diag.handoff_no_output,
-                net_diag.yields,net_diag.yield_resched,net_diag.yield_pending,net_diag.yield_idle,
-                net_diag.yield_level[0],net_diag.yield_level[1],net_diag.yield_level[2],net_diag.yield_level[3],
-                net_diag.pushes[0],net_diag.pushes[1],net_diag.pushes[2],net_diag.push_bytes[0],net_diag.push_bytes[1],net_diag.push_bytes[2]);
-#endif
-        return 0;
+        struct n_netstats stats = {0};
+        uint64_t flags = spin_lock(&rxq_lock);
+        stats.rx_dropped = rxq_dropped;
+        stats.rx_invalid = rxq_invalid;
+        stats.rx_ring_high_water = rxq_high_water;
+        spin_unlock(&rxq_lock, flags);
+        if (nif && nif->get_stats) nif->get_stats(&stats);
+        return copy_to_user((void *)a, &stats, sizeof stats);
     }
     case SYS_TCP_RECV: return tcp_recv_data((int)a, (uint8_t *)b, c, (int)d, true);
     case SYS_NET_TEST: {
         /* a: fault settings for this process's TCP connections (or NULL); b: counters out (or NULL) */
         if (a) {
-            if (!user_ok((void *)a, sizeof(struct n_netfault))) return -N_ERR_BAD_ADDRESS;
-            fault = *(const struct n_netfault *)a;
+            struct n_netfault settings;
+            if (copy_from_user(&settings, (const void *)a, sizeof settings) < 0) return -N_ERR_BAD_ADDRESS;
+            fault = settings;
             fault_pid = fault.rx_drop || fault.rx_reorder || fault.tx_drop ? task_process()->pid : 0;
         }
         if (b) {
-            if (!user_ok_w((void *)b, sizeof(struct n_tcpstats))) return -N_ERR_BAD_ADDRESS;
-            *(struct n_tcpstats *)b = tcp_stats;
+            struct n_tcpstats counters = tcp_stats;
+            if (copy_to_user((void *)b, &counters, sizeof counters) < 0) return -N_ERR_BAD_ADDRESS;
         }
         return 0;
     }
@@ -2671,11 +2554,11 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     case SYS_TCP_ADDRESS: {
         struct tcb *t = user_tcb((int)a);
         if (!t) return -N_ERR_NO_HANDLE;
-        struct n_sockaddr *local = (struct n_sockaddr *)b, *remote = (struct n_sockaddr *)c;
-        if ((local && !user_ok_w(local, sizeof *local)) || (remote && !user_ok_w(remote, sizeof *remote)))
+        struct n_sockaddr local = {.ip = t->state == T_LISTEN ? t->lip : ip_source(t->rip), .port = t->lport};
+        struct n_sockaddr remote = {.ip = t->rip, .port = t->rport};
+        if ((b && copy_to_user((void *)b, &local, sizeof local) < 0) ||
+            (c && copy_to_user((void *)c, &remote, sizeof remote) < 0))
             return -N_ERR_BAD_ADDRESS;
-        if (local) *local = (struct n_sockaddr){.ip = t->state == T_LISTEN ? t->lip : ip_source(t->rip), .port = t->lport};
-        if (remote) *remote = (struct n_sockaddr){.ip = t->rip, .port = t->rport};
         return 0;
     }
     case SYS_TCP_FINISH: {
@@ -2692,9 +2575,28 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     return -N_ERR_UNSUPPORTED;
 }
 
+/* The calling thread's cancel channel for setup waits: its own, so outside the stack's lock. */
+static int64_t net_setup_cancel_channel(int index) {
+    if (index < -1) return -N_ERR_INVALID;
+    struct handle *h = NULL;
+    if (index >= 0) {
+        h = handle_get(index);
+        if (!h) return -N_ERR_NO_HANDLE;
+        if (!message_channel_is(h)) {
+            handle_close(h);
+            return -N_ERR_INVALID;
+        }
+    }
+    struct handle *old = current_task->net_setup_cancel;
+    current_task->net_setup_cancel = h;
+    handle_close(old);
+    return 0;
+}
+
 int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
-    net_bsp_enter();
+    if (num == SYS_NET_SETUP_CANCEL_CHANNEL) return net_setup_cancel_channel((int)a);
+    net_enter();
     int64_t result = net_syscall_inner(num, a, b, c, d, e);
-    net_bsp_leave();
+    net_leave();
     return result;
 }

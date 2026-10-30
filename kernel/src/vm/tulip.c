@@ -17,6 +17,10 @@ struct tdesc {
     volatile uint32_t status, ctl, buf1, buf2;
 };
 
+/* The receive ring belongs to the interrupt handler (CPU 0), which copies each frame into the
+   stack's queue (net_rx); the transmit ring to send, which the stack calls one at a time. The
+   two share no state and no register (CSR5 and CSR2 are the handler's, CSR1 send's), so
+   neither needs a lock of the driver's own. */
 static uint16_t iobase;
 static struct tdesc *rx, *tx;
 static uint8_t *rxbuf[NRX], *txbuf[NTX];

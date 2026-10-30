@@ -52,9 +52,10 @@ static void kbd_callback(struct vmbus_channel *ch) {
                 input_unicode(m->key.make_code, !(m->key.info & KBD_IS_BREAK));
                 continue;
             }
-            if (m->key.info & KBD_IS_E0) input_scancode(0xE0);
-            if (m->key.info & KBD_IS_E1) input_scancode(0xE1);
-            input_scancode((uint8_t)(m->key.make_code | ((m->key.info & KBD_IS_BREAK) ? 0x80 : 0)));
+            /* one key in one call, its 0xE0 with it; one after 0xE1 (KBD_IS_E1, Pause) goes as the
+               plain key, set 1 has nothing else for it */
+            input_key_set1((uint8_t)(m->key.make_code | ((m->key.info & KBD_IS_BREAK) ? 0x80 : 0)),
+                           (m->key.info & KBD_IS_E0) != 0);
         }
     }
 }

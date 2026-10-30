@@ -35,10 +35,16 @@ typedef void (*key_sink_t)(const struct key_event *e);
 typedef void (*mouse_sink_t)(const struct mouse_event *e);
 
 void input_init(void);
+/* The sinks get every key and pointer move, one at a time, with interrupts off under the input
+   lock: a sink does not sleep or take a mutex. */
 void input_set_sinks(key_sink_t k, mouse_sink_t m);
 bool input_mouse_present(void);
-/* for other keyboard and mouse drivers (Hyper-V synthetic devices) */
-void input_scancode(uint8_t sc); /* one byte of scancode set 1, including 0xE0 prefixes */
+/* For the other keyboard and mouse drivers (USB, Hyper-V, a remote viewer), any CPU, without
+   sleeping. input_key_set1 is one key of scan code set 1 (sc with its release bit, extended when
+   it came after 0xE0). input_scancode is one byte of set 1, 0xE0 prefixes included: the drivers
+   that use it share one prefix, so a key's two bytes from one of them can meet another's. */
+void input_key_set1(uint8_t sc, bool extended);
+void input_scancode(uint8_t sc);
 void input_unicode(uint16_t c, bool pressed); /* a typed character, independent of layout */
 void input_mouse(const struct mouse_event *e);
 void input_mouse_attach(void);

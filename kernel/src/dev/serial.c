@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "arch/spin.h"
+#include "dev/timer.h"
 #include "dev/serial.h"
 
 /* COM1, the log port. What is written goes into a ring and leaves through the UART's transmit
@@ -75,7 +76,9 @@ void serial_write(const char *s, size_t n) {
     }
     queue(s, n);
     pump();
+    bool waits = head != tail;
     spin_unlock(&serial_lock, f);
+    if (waits) timer_tick_needed(); /* CPU 0's tick gives the line the rest */
 }
 
 void serial_tick(void) {
@@ -89,6 +92,8 @@ bool serial_needs_tick(void) { return serial_ok && head != tail; }
 
 /* Everything queued, waiting on the line. A UART whose FIFO never empties again ends the wait
    (as many polls as a character took the old way: 100000), the rest of the ring unsent. */
+void serial_seize(void) { spin_seize(&serial_lock); }
+
 void serial_flush(void) {
     if (!serial_ok) return;
     uint64_t f = spin_lock(&serial_lock);

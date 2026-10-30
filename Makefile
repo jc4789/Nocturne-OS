@@ -28,7 +28,7 @@ KCFLAGS := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector 
            -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Ikernel/src -Icommon -MMD -MP
 KLDFLAGS := -m elf_x86_64 -nostdlib -static -z max-page-size=0x1000 -T kernel/linker.ld --no-dynamic-linker
 
-KSRC_C   := $(shell find kernel/src -name '*.c') common/gfx.c
+KSRC_C   := $(shell find kernel/src -name '*.c') common/gfx.c $(wildcard common/store/*.c)
 KSRC_ASM := $(shell find kernel/src -name '*.asm') common/unifont.asm
 # uACPI runs the firmware's AML inside the kernel (third_party/uacpi/README.nocturne.md)
 UACPI_C  := $(wildcard third_party/uacpi/source/*.c)
@@ -45,16 +45,15 @@ $(BUILD)/k/third_party/uacpi/%.o: third_party/uacpi/%.c
 	@echo "  CC   $<"
 	@$(CC) $(filter-out -W%,$(KCFLAGS)) -w -c $< -o $@
 
-# The build host's tool for the volume (host/store/store.c): it makes the boot disk and puts the
-# system on drive C: with the kernel's own store code, host/store/shim standing in for the kernel.
-STORE_C := host/store/store.c $(addprefix kernel/src/fs/,names.c volume.c space.c catalog.c namespace.c) \
-           kernel/src/lib/crc32c.c
-$(BUILD)/host/store.exe: $(STORE_C) $(wildcard host/store/shim/*.h host/store/shim/*/*.h kernel/src/fs/*.h) \
-                         common/store_format.h common/abi.h
+# The build host's tool for the volume (host/store/store.c), a Windows program: it makes the boot
+# disk and puts the system on drive C: with the store's own code (common/store), the library the
+# kernel's C: is built on as well; the tool gives it the program's memory and blocks of its own.
+STORE_C := host/store/store.c $(wildcard common/store/*.c)
+$(BUILD)/host/store.exe: $(STORE_C) $(wildcard common/store/*.h) common/store_format.h common/abi.h
 	@mkdir -p $(dir $@)
 	@echo "  CC   $@"
-	@$(CC) -O2 -g -std=gnu11 -fno-strict-aliasing -Wall -Wextra -Wno-unused-parameter -Ihost/store/shim -Ikernel/src \
-	    -Icommon $(STORE_C) -o $@
+	@$(CC) -O2 -g -std=gnu11 -fno-strict-aliasing -Wall -Wextra -Wno-unused-parameter -municode -Icommon \
+	    $(STORE_C) -o $@
 
 # Limine's installer, built from the source in its release (tools/limine): the release's limine.exe
 # cannot reach past 2 GiB of the boot disk (host/limine/seek64.h)

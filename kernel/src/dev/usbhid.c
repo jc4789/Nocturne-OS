@@ -47,6 +47,8 @@ struct hid {
     uint8_t buttons;
 };
 
+/* Everything in this file runs on the usb thread (dev/usb.h): the list, the lock keys' state and
+ * each device's state are its alone. The input layer takes its own lock. */
 static struct hid *hids;
 static bool caps_lock, leds_dirty;
 
@@ -68,10 +70,7 @@ static const uint16_t usage_set1[256] = {
 static void send_usage(uint16_t usage, bool pressed) {
     uint16_t sc = usage < 256 ? usage_set1[usage] : 0;
     if (!sc) return;
-    uint64_t f = irq_save();
-    if (sc >> 8) input_scancode(0xE0);
-    input_scancode((uint8_t)(sc & 0x7F) | (pressed ? 0 : 0x80));
-    irq_restore(f);
+    input_key_set1((uint8_t)((sc & 0x7F) | (pressed ? 0 : 0x80)), sc >> 8); /* one key, its 0xE0 with it */
 }
 
 static bool is_down(const uint32_t *set, unsigned u) { return set[u >> 5] & (1u << (u & 31)); }
@@ -213,9 +212,7 @@ static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, uns
     }
     if (!any) return;
     h->buttons = buttons;
-    uint64_t f = irq_save();
     input_mouse(&e);
-    irq_restore(f);
 }
 
 static void hid_report(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len) {
@@ -405,9 +402,7 @@ void usbhid_detach(struct usb_device *d) {
             if (is_down(h->down, u)) send_usage(u, false);
         if (h->mouse && h->buttons) {
             struct mouse_event e = {0};
-            uint64_t f = irq_save();
             input_mouse(&e);
-            irq_restore(f);
         }
         *pp = h->next;
         kfree(h);

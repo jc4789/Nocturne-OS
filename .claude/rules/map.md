@@ -1,6 +1,6 @@
 # Nocturne の地図
 
-探す前に読み、ここに無い所だけを codegraph・grep で探す。README と docs の報告より、この表と今のコードを先に信じる。違いを見つけたらその場で直す。確かめた: 2026-10-29 `54acda16`。
+探す前に読み、ここに無い所だけを codegraph・grep で探す。README と docs の報告より、この表と今のコードを先に信じる。違いを見つけたらその場で直す。確かめた: 2026-10-30 `2682d0cb`＋未コミット。
 
 ## 置き場所（K=カーネル、L=libc、A=アプリ、P=移植・上流、H=ホストの道具）
 
@@ -8,8 +8,9 @@
 |---|---|---|
 | `kernel/src/arch/` | GDT・IDT・`isr.asm`、APIC、SMP、FPU、PAT、P ステート、S3 復帰 | K |
 | `kernel/src/mm/` | `pmm`・`vmm`（空間ごとの 4 段ページ表）・`heap` | K |
-| `kernel/src/sys/` | `proc`（ELF）、`sched`（AP の実行キュー）、`kei`（継の選択核）、`syscall`、`object`、`channel`、`events`、`stream`（console・system log）、`watch`（見張りの共通の部品 `struct watched`、`n_watch_take`）、`keep`（システムの部品の状態の保存：持ち主の wm・audio・screenmode が自分の行を出し、`AppData\Nocturne\{Desktop,Sound,Displays}.conf` へ最後の変更の 500 ms 後に書き、init より前に読み戻す。鍵は知らない）、`prof` | K |
-| `kernel/src/fs/` | C: の格納庫（`store`・`volume`・`catalog` の B+木・`namespace`・`document`）、`watch`（C: の見張り `n_entry_watch`：名前空間の変更を volume の口から聞く）。`host/store` も同じコード（見張りの口は NULL） | K |
+| `kernel/src/sys/` | `proc`（ELF）、`sched`（CPU ごとの実行キューと idle task）、`kei`（継の選択核）、`syscall`、`object`、`channel`、`events`、`stream`（console・system log）、`watch`（見張りの共通の部品 `struct watched`、`n_watch_take`）、`keep`（システムの部品の状態の保存：持ち主の wm・audio・screenmode が自分の行を出し、`AppData\Nocturne\{Desktop,Sound,Displays}.conf` へ最後の変更の 500 ms 後に書き、init より前に読み戻す。鍵は知らない）、`prof` | K |
+| `kernel/src/fs/` | C: の格納庫の実行側：`store`（C: の mount、道での操作、変更と commit の間の門、フォルダーの lock、書き手）、`document`（開いた文書：文書ごとの mutex、差し替えは一時フォルダーの文書を名へ移すか `ns_take`）、`cache`（塊の溜め `struct store_supply` の実装）、`watch`（C: の見張り `n_entry_watch`：操作が返す `struct ns_told` を出す）。書式のエンジンは `common/store/` | K |
+| `common/store/` | 格納庫の書式のエンジン（library）：`names`・`fold_table`・`catalog`（B+木、latch）・`namespace`（`NS_GIVEN`：フォルダーが与える属性は移動でフォルダーと一緒に入れ替わる）・`space`・`volume`（mount・format・commit の凍結・書く・書き終え、`volume_commit`）・`crc32c`・`latch`。lock・待ち・log・時計を持たず、`store_device`・`store_supply`・`store_env` を受ける。カーネル（`kernel/src/fs`）とホストの道具（`host/store`）が組む | K+H |
 | `kernel/src/dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI・USB、IOMMU、音、`fb`・fbcon、入力、timer、電源 | K |
 | `kernel/src/net/` | `net.c`（Ethernet〜TCP・DHCP・DNS）、`rtl8125.c`（実機の NIC） | K |
 | `kernel/src/gui/` | `wm.c`（窓管理と合成）、`desktop.c`、`screenmode.c` | K |
@@ -22,7 +23,7 @@
 | `user/apps/` | システムのプログラム（`browser*.c`（タブは `browser.c` の `struct tab`、設定の頁 `about:settings` は `browser_settings.h`）・`webfetch.c`・`uihost.c`・`init.c`・`sh.c`・`agent.c`、`*.cpp`、`*.ts`→`System\*.js`） | A |
 | `ports/<名>/` | 移植の差分・設定：ffmpeg、freetype、go、lexbor、llvm、mesa（`nocturne_gl.c`）、nvidia（RM をアプリ `nvrm` にする OS 層）、rust、tcc、typescript、virgl（ホストの QEMU の DLL だけ）、wabt | P |
 | `third_party/<名>/` | 取り込んだ上流：webref（仕様の IDL）、quickjs、lexbor、bearssl・ca、ffmpeg、freetype・brotli・img、mesa、nvidia-open（615.78.08）、tinycc、wabt、uacpi、unicode・formatjs、unifont、web_streams | P |
-| `host/` | `store/store.c`（C: を作る・詰める・検査する）、`limine/` | H |
+| `host/` | `store/store.c`（C: を作る・詰める・検査する。`test`（模型との照合）・`tree-test`・`stress`（並行）の試験も）、`limine/` | H |
 | `boot/limine.conf` | 起動の項目は 2 つ（desktop と `nogui`）。解像度は持たない | H |
 | `rootfs/` | C: へそのまま入る（`Nocturne\`、`Users\User\` の見本） | — |
 | `scripts/` | ビルド・媒体・試験・Hyper-V の道具 | H |
@@ -35,16 +36,14 @@
 
 - syscall の番号：`common/abi.h` の enum `SYS_*`（結果は `N_ERR_*`）。仕様は `docs/nocturne-native-abi.md`。画面・GPU は `display_abi.h`（`struct screen_format`）、`gpu_abi.h`（OpenGL の ABI ではない）。
 - アプリのドライバー：`SYS_PCI_*`・`SYS_DMA_*` → `dev/pciuser.c`。claim するのは init だけで、NVIDIA の表示機能を `nvrm` へ渡す（`user/apps/init.c`）。
-- syscall の道（AP はアプリを走らせる。対称のカーネルへの途中で、部品を SMP で安全にした呼出しはどの CPU でも同じ `syscall_dispatch` で走り、まだの部品は BSP の持ち物）：
+- syscall の道（対称のカーネル：どの CPU も同じ道。CPU 0 だけの持ち物は無い）：
 
 ```
-user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
-  BSP: → syscall_dispatch (sys/syscall.c) → sched_user_return
-  AP:  → sched_ap_interrupt (sys/sched.c) → syscall_ap（時刻・TCP の写し・窓の状態などをその場で答える）
-       → syscall_anywhere の呼出し（channel の送受、事象の待ち、番地の待ちと起こし、眠り、音の送りと位置、窓の事象の受け取り）は ap_syscall で
-         その task の kernel 継続として syscall_dispatch：AP で眠り（wq_sleep → ap_schedule）、別の AP で続き、
-         BSP の部品に触れる所で sched_enter_bsp して BSP で終わる
-       → ほかは文脈を BSP へ → isr_dispatch_remote (idt.c) → syscall_dispatch
+user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)：起きた CPU で
+  → syscall_dispatch (sys/syscall.c)：その task の核の stack の上で。眠りは待ち行列（wq_sleep → schedule）、
+    起こされた task は空いた CPU へ（sys/sched.c）。利用者のメモリーは copy_from_user／copy_to_user だけ
+  → sched_user_return (sys/sched.c)：ring 3 へ戻る前の切り替えの点（核は横取りされない）
+装置の割り込み（IOAPIC・MSI）は CPU 0 へ。TLB の撃ち落とし・起こし・panic の NMI はどの CPU へも、同じ isr_dispatch
 ```
 
 - VM と実機：`kernel/src/vm/vm.h` が唯一の入口（`vm_detect`、`vm_hosted()`、`vm_init`・`vm_storage_init`・`vm_net_probe`・`vm_audio_init`・`vm_session_init`。実機では即座に戻る）。裏に `hyperv.c`、`hv/`（VMBus・storvsc・netvsc）、`rdp.c`（拡張セッション）、`devices.h` の装置（ata・ac97・e1000・tulip・vbe）、`virtio_gpu.c`。`vm/` の外は `vm/vm.h` しか include しない。

@@ -30,10 +30,6 @@ int main(void) {
         printf("  host ack  pending %lu  retries %lu  cancelled %lu\n",
                (unsigned long)stats.rx_completion_pending,(unsigned long)stats.rx_completion_retries,
                (unsigned long)stats.rx_completion_cancelled);
-        for(unsigned cpu=1;cpu<16;cpu++) if(stats.ap_calls[cpu])
-            printf("  cpu%-5u TCP rx %lu bytes  tx %lu bytes  calls %lu  deferred %lu\n",cpu,
-                   (unsigned long)stats.ap_recv_bytes[cpu],(unsigned long)stats.ap_send_bytes[cpu],
-                   (unsigned long)stats.ap_calls[cpu],(unsigned long)stats.ap_fallbacks[cpu]);
     }
     struct n_tcpstats tcp;
     if (net_test(NULL, &tcp)==0) {

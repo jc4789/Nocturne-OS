@@ -3,6 +3,7 @@
 #include "vm/devices.h"
 #include "net/net.h"
 #include "arch/cpu.h"
+#include "arch/spin.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
 #include "mm/pmm.h"
@@ -68,11 +69,17 @@ struct tx_desc {
 _Static_assert(sizeof(struct rx_desc) == 16 && sizeof(struct tx_desc) == 16, "e1000 descriptor ABI");
 _Static_assert(PAGE_SIZE % 128 == 0 && PAGE_SIZE % BUFSZ == 0, "e1000 DMA alignment");
 
+/* The receive ring belongs to the net thread (poll_rx, rx_pending), the transmit ring to send,
+   which the stack calls one at a time. The interrupt handler (CPU 0) and poll_rx, on any CPU,
+   share the receive interrupt mask and rx_irq_pending: e1000_lock, a leaf under the stack's
+   net_lock, guards them; net_rx_notify comes after it is given back. A power change runs
+   alone (every other CPU halted). */
 static volatile uint8_t *mmio;
 static volatile struct rx_desc *rx;
 static volatile struct tx_desc *tx;
 static uint8_t *rxbuf[NRX], *txbuf[NTX];
 static int rx_cur, tx_cur, tx_clean;
+static struct spinlock e1000_lock;
 static volatile bool rx_irq_pending;
 static bool new_eerd; /* 82574-style EERD layout */
 static struct netif nif = {.driver = "e1000"};
@@ -94,13 +101,16 @@ static uint16_t eeprom_read(uint8_t addr) {
 
 static void e1000_irq(struct regs *r) {
     (void)r;
+    spin_take(&e1000_lock);
     uint32_t icr = rd(REG_ICR); /* reading acknowledges */
-    if (!icr) return;
-    /* DMA ownership remains with the driver until the net thread has consumed
-       the frame. Suppress RX interrupts while that thread drains the ring. */
-    if (icr & RX_IRQS) wr(REG_IMC, RX_IRQS);
-    rx_irq_pending = true;
-    net_rx_notify();
+    if (icr) {
+        /* DMA ownership remains with the driver until the net thread has consumed
+           the frame. Suppress RX interrupts while that thread drains the ring. */
+        if (icr & RX_IRQS) wr(REG_IMC, RX_IRQS);
+        rx_irq_pending = true;
+    }
+    spin_give(&e1000_lock);
+    if (icr) net_rx_notify();
 }
 
 static bool e1000_rx_pending(void) {
@@ -127,7 +137,7 @@ static size_t e1000_poll_rx(void (*input)(const void *, size_t)) {
         rx_cur = (rx_cur + 1) % NRX;
         consumed++;
     }
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock(&e1000_lock);
     rx_irq_pending = false;
     if (returned >= 0) {
         __atomic_thread_fence(__ATOMIC_RELEASE);
@@ -136,28 +146,26 @@ static size_t e1000_poll_rx(void (*input)(const void *, size_t)) {
     wr(REG_IMS, RX_IRQS);
     /* A packet may arrive between the empty check and rearming. Never wait
        for a fresh edge if its descriptor is already visible. */
-    if (rx[rx_cur].status & DESC_DD) {
+    bool again = rx[rx_cur].status & DESC_DD;
+    if (again) {
         wr(REG_IMC, RX_IRQS);
         rx_irq_pending = true;
-        net_rx_notify();
     }
-    irq_restore(flags);
+    spin_unlock(&e1000_lock, flags);
+    if (again) net_rx_notify();
     return consumed;
 }
 
 static int e1000_send(const void *frame, size_t len) {
     if (len > BUFSZ) return -N_ERR_INVALID;
-    uint64_t flags = irq_save();
     while (tx_clean != tx_cur && (tx[tx_clean].status & DESC_DD))
         tx_clean = (tx_clean + 1) % NTX;
     int next = (tx_cur + 1) % NTX;
     volatile struct tx_desc *d = &tx[tx_cur];
     /* TDH == TDT denotes an empty hardware ring, so retain one descriptor to
        distinguish full from empty even before DMA has completed any send. */
-    if (next == tx_clean || !(d->status & DESC_DD)) {
-        irq_restore(flags);
+    if (next == tx_clean || !(d->status & DESC_DD))
         return -N_ERR_NOT_READY; /* local backpressure, not a packet lost on the wire */
-    }
     memcpy(txbuf[tx_cur], frame, len);
     d->len = (uint16_t)len;
     d->cmd = 0x0B; /* EOP | IFCS | RS */
@@ -165,7 +173,6 @@ static int e1000_send(const void *frame, size_t len) {
     tx_cur = next;
     __atomic_thread_fence(__ATOMIC_RELEASE);
     wr(REG_TDT, tx_cur);
-    irq_restore(flags);
     return 0;
 }
 

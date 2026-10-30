@@ -1,16 +1,31 @@
-/* i8042 PS/2 keyboard (scancode set 1 via translation) and mouse. */
+/* i8042 PS/2 keyboard (scancode set 1 via translation) and mouse, and the keys and pointer moves
+   of every other input driver (USB, Hyper-V, a remote viewer), on any CPU. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/spin.h"
 #include "dev/input.h"
 #include "dev/pm.h"
 #include "vm/vm.h"
 
+/* Locks, in the order they are taken:
+   - ps2_lock: the i8042's ports and the PS/2 bytes' state (ps2_e0, the mouse packet, ps2_quiet).
+     The IRQ handlers (CPU 0) and a resume on any CPU take it.
+   - input_lock: the modifiers and caps lock, the other drivers' scan code prefix (stream_e0) and
+     the sinks, which are called under it (interrupts off): a sink does not sleep or take a mutex,
+     and its own locks come after this one (gui/wm.c's input ring). Keys from several drivers
+     reach the sink one at a time, each with the modifiers as of it. */
+static struct spinlock ps2_lock, input_lock;
 static key_sink_t key_sink;
 static mouse_sink_t mouse_sink;
-static bool mouse_ok, mouse_wheel;
 static uint8_t mods;
 static bool caps;
-static bool e0;
+static bool stream_e0;
+static bool mouse_ok; /* atomic: any driver may attach a mouse */
+static bool mouse_wheel;
+static bool ps2_e0;
+/* ps2_setup talks to the controller: the IRQ handlers leave the ports alone meanwhile (it waits
+   on the device far too long to hold ps2_lock). */
+static bool ps2_quiet;
 
 static const char map_norm[128] = {
     0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b', '\t',
@@ -29,29 +44,18 @@ static const char map_shift[128] = {
     '2', '3', '0', '.', 0, 0, '|', 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
+/* input_lock held. */
 static void emit_key(uint16_t key, bool pressed) {
     struct key_event e = {key, mods, pressed};
     if (key_sink) key_sink(&e);
 }
 
-static void kbd_irq(struct regs *r) {
-    (void)r;
-    uint8_t st = inb(0x64);
-    if (!(st & 1)) return;
-    if (st & 0x20) { /* mouse data arrived on the keyboard IRQ: let IRQ12 path handle it */
-        return;
-    }
-    input_scancode(inb(0x60));
-}
-
-void input_scancode(uint8_t sc) {
-    if (sc == 0xE0) { e0 = true; return; }
-    if (sc == 0xE1) return;
+/* One key of scan code set 1, input_lock held. */
+static void key_set1(uint8_t sc, bool extended) {
     bool pressed = !(sc & 0x80);
     uint8_t code = sc & 0x7F;
     uint16_t key = 0;
-    if (e0) {
-        e0 = false;
+    if (extended) {
         switch (code) {
         case 0x48: key = KEY_UP; break;
         case 0x50: key = KEY_DOWN; break;
@@ -98,33 +102,74 @@ void input_scancode(uint8_t sc) {
     emit_key(key, pressed);
 }
 
+void input_key_set1(uint8_t sc, bool extended) {
+    uint64_t f = spin_lock(&input_lock);
+    key_set1(sc, extended);
+    spin_unlock(&input_lock, f);
+}
+
+void input_scancode(uint8_t sc) {
+    uint64_t f = spin_lock(&input_lock);
+    if (sc == 0xE0) stream_e0 = true;
+    else if (sc != 0xE1) {
+        bool extended = stream_e0;
+        stream_e0 = false;
+        key_set1(sc, extended);
+    }
+    spin_unlock(&input_lock, f);
+}
+
+static void kbd_irq(struct regs *r) {
+    (void)r;
+    uint64_t f = spin_lock(&ps2_lock);
+    uint8_t st = ps2_quiet ? 0 : inb(0x64);
+    /* nothing, or mouse data on the keyboard's IRQ: IRQ12's handler takes it */
+    if (!(st & 1) || (st & 0x20)) {
+        spin_unlock(&ps2_lock, f);
+        return;
+    }
+    uint8_t sc = inb(0x60);
+    bool extended = ps2_e0, key = sc != 0xE0 && sc != 0xE1;
+    if (sc == 0xE0) ps2_e0 = true;
+    else if (key) ps2_e0 = false;
+    spin_unlock(&ps2_lock, f);
+    if (key) input_key_set1(sc, extended);
+}
+
 /* ---- mouse ---- */
-static uint8_t packet[4];
+static uint8_t packet[4]; /* under ps2_lock, with pidx */
 static int pidx;
-static bool flip_y; /* the Y axis comes upside down (detect_flip_y) */
+static bool flip_y; /* the Y axis comes upside down (detect_flip_y), set before the IRQs come */
 
 static void mouse_irq(struct regs *r) {
     (void)r;
-    uint8_t st = inb(0x64);
-    if (!(st & 1) || !(st & 0x20)) return; /* nothing, or a keyboard byte: leave it for IRQ1 */
-    uint8_t b = inb(0x60);
-    if (pidx == 0 && !(b & 0x08)) return; /* resync */
-    packet[pidx++] = b;
-    int need = mouse_wheel ? 4 : 3;
-    if (pidx < need) return;
-    pidx = 0;
-    if (packet[0] & 0xC0) return; /* overflow */
-    struct mouse_event e = {0};
-    e.dx =(int)packet[1] - ((packet[0] & 0x10) ? 256 : 0);
-    e.dy = -((int)packet[2] - ((packet[0] & 0x20) ? 256 : 0));
-    if (flip_y) e.dy = -e.dy;
-    e.buttons = packet[0] & 7;
-    e.wheel = 0;
-    if (mouse_wheel) {
-        int8_t z = (int8_t)(packet[3] << 4) >> 4;
-        e.wheel = z;
+    uint64_t f = spin_lock(&ps2_lock);
+    uint8_t st = ps2_quiet ? 0 : inb(0x64);
+    if (!(st & 1) || !(st & 0x20)) { /* nothing, or a keyboard byte: leave it for IRQ1 */
+        spin_unlock(&ps2_lock, f);
+        return;
     }
-    if (mouse_sink) mouse_sink(&e);
+    uint8_t b = inb(0x60);
+    bool whole = false;
+    uint8_t p[4];
+    if (pidx || (b & 0x08)) { /* else a resync */
+        packet[pidx++] = b;
+        if (pidx == (mouse_wheel ? 4 : 3)) {
+            pidx = 0;
+            whole = !(packet[0] & 0xC0); /* else an overflow */
+            memcpy(p, packet, sizeof p);
+        }
+    }
+    bool wheel = mouse_wheel;
+    spin_unlock(&ps2_lock, f);
+    if (!whole) return;
+    struct mouse_event e = {0};
+    e.dx = (int)p[1] - ((p[0] & 0x10) ? 256 : 0);
+    e.dy = -((int)p[2] - ((p[0] & 0x20) ? 256 : 0));
+    if (flip_y) e.dy = -e.dy;
+    e.buttons = p[0] & 7;
+    e.wheel = wheel ? (int8_t)(p[3] << 4) >> 4 : 0;
+    input_mouse(&e);
 }
 
 static bool wait_write(void) {
@@ -167,7 +212,8 @@ static void flush(void) {
 
 /* The controller's configuration, keyboard scanning, and the mouse in wheel mode if it has one:
    at boot, and after a sleep, which reset the controller and both devices. Returns whether a
-   mouse answered. The IRQ handlers must not take the replies: their lines are masked. */
+   mouse answered. The IRQ handlers must not take the replies: at boot they are not registered
+   yet, after a sleep their lines are masked and ps2_quiet is set. */
 static bool ps2_setup(void) {
     ctl_cmd(0xAD); /* disable keyboard port */
     ctl_cmd(0xA7); /* disable aux port */
@@ -212,7 +258,7 @@ static bool ps2_setup(void) {
     }
     flush();
     pidx = 0;
-    e0 = false;
+    ps2_e0 = false;
     return found;
 }
 
@@ -220,10 +266,19 @@ static bool ps2_resume(void *arg) {
     (void)arg;
     pic_mask(1);
     pic_mask(12);
+    /* a handler already running on CPU 0 is done once this has the lock */
+    uint64_t f = spin_lock(&ps2_lock);
+    ps2_quiet = true;
+    spin_unlock(&ps2_lock, f);
+    f = spin_lock(&input_lock);
     mods = 0; /* keys held when it went to sleep were let go long ago */
-    bool had = mouse_ok, found = ps2_setup();
-    if (found) mouse_ok = true;
+    spin_unlock(&input_lock, f);
+    bool had = input_mouse_present(), found = ps2_setup();
+    if (found) input_mouse_attach();
     else if (had) kprintf("input: the PS/2 mouse did not answer after sleep\n");
+    f = spin_lock(&ps2_lock);
+    ps2_quiet = false;
+    spin_unlock(&ps2_lock, f);
     pic_unmask(1);
     pic_unmask(12);
     return found || !had; /* a mouse that was never there is not missing */
@@ -236,35 +291,40 @@ void input_init(void) {
         kprintf("input: no PS/2 controller\n");
         return;
     }
-    if (ps2_setup()) mouse_ok = true;
+    bool found = ps2_setup();
+    if (found) input_mouse_attach();
     pm_register(&ps2_pm);
-    flip_y = mouse_ok && detect_flip_y();
+    flip_y = found && detect_flip_y();
     irq_register(1, kbd_irq);
     irq_register(12, mouse_irq);
     pic_unmask(1);
     pic_unmask(2);
     pic_unmask(12);
-    kprintf("input: PS/2 keyboard ready, mouse %s%s%s\n", mouse_ok ? "ready" : "not found",
+    kprintf("input: PS/2 keyboard ready, mouse %s%s%s\n", found ? "ready" : "not found",
             mouse_wheel ? " (wheel)" : "", flip_y ? ", Y axis flipped" : "");
 }
 
 void input_set_sinks(key_sink_t k, mouse_sink_t m) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&input_lock);
     key_sink = k;
     mouse_sink = m;
-    irq_restore(f);
+    spin_unlock(&input_lock, f);
 }
 
-bool input_mouse_present(void) { return mouse_ok; }
+bool input_mouse_present(void) { return __atomic_load_n(&mouse_ok, __ATOMIC_RELAXED); }
 
 void input_unicode(uint16_t c, bool pressed) {
     if (c == '\r') c = '\n';
     if (c >= 0x80) c = KEY_UNKNOWN; /* the key codes have no room for other characters yet */
+    uint64_t f = spin_lock(&input_lock);
     emit_key(c, pressed);
+    spin_unlock(&input_lock, f);
 }
 
 void input_mouse(const struct mouse_event *e) {
+    uint64_t f = spin_lock(&input_lock);
     if (mouse_sink) mouse_sink(e);
+    spin_unlock(&input_lock, f);
 }
 
-void input_mouse_attach(void) { mouse_ok = true; }
+void input_mouse_attach(void) { __atomic_store_n(&mouse_ok, true, __ATOMIC_RELAXED); }

@@ -17,8 +17,8 @@
  * first offer already finds it. Every change of what SYS_SCREEN_INFO reports of the modes tells its
  * watches (wm_screen_info_changed).
  *
- * Under lock: everything below but shown_mhz. The trial's end is watched by a kernel thread of its
- * own.
+ * Under lock (a mutex, any CPU; the WM's lock comes after it): everything below but shown_mhz. The
+ * trial's end is watched by a kernel thread of its own, which waits under trial_lock.
  */
 #include "gui/screenmode.h"
 #include "gui/wm.h"
@@ -50,8 +50,10 @@ static struct {
     struct n_screen_mode mode;
 } choices[CHOICES_MAX];
 static unsigned nchoices, next_choice;
-/* A mode on trial: trial_from comes back at trial_until (uptime_ms) unless it is kept. Changed on
-   the BSP with interrupts on; the watch thread looks with interrupts off. */
+/* A mode on trial: trial_from comes back at trial_until (uptime_ms) unless it is kept. trial_on and
+   trial_until change under lock and trial_lock both, and trial_wq is woken after; the watch thread
+   waits on them under trial_lock alone. trial_lock comes after lock, before trial_wq's lock. */
+static struct spinlock trial_lock;
 static bool trial_on;
 static uint64_t trial_until;
 static struct n_screen_mode trial_from;
@@ -172,21 +174,29 @@ static void publish(void) {
     wm_screen_info_changed();
 }
 
-static void trial_end(void) {
-    trial_on = false;
+/* lock held: no trial, or one until until. */
+static void trial_set(bool on, uint64_t until) {
+    uint64_t f = spin_lock(&trial_lock);
+    trial_on = on;
+    trial_until = until;
+    spin_unlock(&trial_lock, f);
     wq_wake_all(&trial_wq);
 }
+
+static void trial_end(void) { trial_set(false, 0); }
 
 static void trial_watch(void *arg) {
     (void)arg;
     for (;;) {
-        uint64_t irq = irq_save();
+        uint64_t f = spin_lock(&trial_lock);
         uint64_t now = uptime_ms();
-        bool due = trial_on && now >= trial_until;
-        if (!trial_on) wq_wait(&trial_wq);
-        else if (!due) wq_wait_timeout(&trial_wq, trial_until - now);
-        irq_restore(irq);
-        if (!due) continue;
+        if (!trial_on || now < trial_until) {
+            if (!trial_on) wq_wait_locked(&trial_wq, &trial_lock);
+            else wq_wait_locked_timeout(&trial_wq, &trial_lock, trial_until - now);
+            irq_restore(f);
+            continue;
+        }
+        spin_unlock(&trial_lock, f);
         mutex_lock(&lock);
         bool back = trial_on && uptime_ms() >= trial_until;
         if (back) {
@@ -398,8 +408,7 @@ int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op) {
         else if (!m) r = -N_ERR_INVALID;
         else {
             if (!trial_on) trial_from = wanted;
-            trial_on = true;
-            trial_until = uptime_ms() + SCREEN_MODE_TRIAL_MS;
+            trial_set(true, uptime_ms() + SCREEN_MODE_TRIAL_MS);
             refused_last = false;
             unrefuse(m);
             wish(m, "on trial");
@@ -408,7 +417,6 @@ int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op) {
                 watch_started = true;
                 kthread_create("screen mode", trial_watch, NULL);
             }
-            wq_wake_all(&trial_wq);
         }
     } else if (s.how == SCREEN_MODE_KEEP || s.how == SCREEN_MODE_BACK) {
         if (!offered.count || !trial_on) r = -N_ERR_NOT_FOUND;

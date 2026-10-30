@@ -62,11 +62,16 @@ struct nvme {
     uint32_t rtd3e;
     struct queue admin, io;
     uint8_t vector;
-    volatile bool kick;
+    /* The interrupt handler (CPU 0) counts kicks up, then wakes wq; the command waiting on another
+       CPU reads kicks before it looks at its completion queue and sleeps only while kicks still
+       reads that (wq_wait_unless). */
+    uint64_t kicks;
     struct wait_queue wq;
     bool live, vwc;
-    bool woke; /* back from a sleep: enable again before the next command (under the lock) */
-    struct mutex lock;
+    /* back from a sleep: enable again before the next command. Set by resume while the disks are
+       held (blk_hold), read under the lock. */
+    bool woke;
+    struct mutex lock; /* one command at a time, from any CPU: the queues, cid, the bounce buffer */
     uint16_t cid;
     uint8_t *data;
     uint64_t data_phys;
@@ -99,7 +104,7 @@ static void nvme_isr(struct regs *r) {
     for (int i = 0; i < nctrls; i++) {
         struct nvme *c = &ctrls[i];
         if (c->vector != r->vector) continue;
-        c->kick = true;
+        __atomic_add_fetch(&c->kicks, 1, __ATOMIC_SEQ_CST);
         wq_wake_all(&c->wq);
     }
 }
@@ -132,6 +137,7 @@ static int command(struct nvme *c, struct queue *q, uint32_t cmd[16], unsigned t
     doorbell(c, q->qid, false, q->tail);
     uint64_t end = uptime_ms() + timeout_ms;
     for (;;) {
+        uint64_t seen = __atomic_load_n(&c->kicks, __ATOMIC_SEQ_CST); /* before the look */
         volatile uint32_t *e = q->cq + q->head * 4u;
         uint32_t dw3 = e[3];
         if (((dw3 >> 16) & 1) == q->phase) {
@@ -156,7 +162,7 @@ static int command(struct nvme *c, struct queue *q, uint32_t cmd[16], unsigned t
             kprintf("nvme%d: command %02x on queue %u timed out\n", c->index, cmd[0] & 0xFF, q->qid);
             return FAILED;
         }
-        wq_nap(&c->wq, &c->kick, c->vector ? 10 : 1);
+        wq_wait_unless(&c->wq, &c->kicks, seen, c->vector ? 10 : 1);
     }
 }
 
@@ -168,7 +174,7 @@ static bool wait_ready(struct nvme *c, bool ready) {
         if (ready && (csts & CSTS_CFS)) return false;
         if (!!(csts & CSTS_RDY) == ready) return true;
         if (uptime_ms() >= end) return false;
-        wq_nap(NULL, NULL, 1);
+        nap_ms(1);
     }
 }
 

@@ -1,6 +1,7 @@
 /* PCI configuration space access (mechanism #1 and PCIe ECAM) and bus enumeration. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/spin.h"
 #include "dev/pci.h"
 #include "dev/acpi.h"
 #include "dev/iommu.h"
@@ -17,7 +18,13 @@
 static const struct acpi_ecam *ecam;
 static unsigned necam;
 static bool ecam_off;
-static uint8_t ecam_active[65536 / 8]; /* one bit per bus/dev/func */
+/* One bit per bus/dev/func, set once its page is mapped, from any CPU. Two CPUs that find it clear
+   at once both map it, the same way (vmm_map_mmio), and one of them sets it. */
+static uint8_t ecam_active[65536 / 8];
+
+/* CPU 0's APIC ID, where device interrupts are handled: read by pci_init, which runs there (the
+   boot task, kmain_late), before any driver turns an interrupt on. */
+static uint32_t interrupt_dest;
 
 static volatile uint32_t *ecam_regs(uint8_t bus, uint8_t dev, uint8_t func, bool map) {
     if (ecam_off) return NULL;
@@ -26,22 +33,26 @@ static volatile uint32_t *ecam_regs(uint8_t bus, uint8_t dev, uint8_t func, bool
         unsigned bdf = (unsigned)bus << 8 | (unsigned)dev << 3 | func;
         uint64_t phys = ecam[i].base + ((uint64_t)(bus - ecam[i].start_bus) << 20 | (uint64_t)dev << 15 |
                                          (uint64_t)func << 12);
-        if (!(ecam_active[bdf >> 3] & (1u << (bdf & 7)))) {
+        uint8_t bit = (uint8_t)(1u << (bdf & 7));
+        if (!(__atomic_load_n(&ecam_active[bdf >> 3], __ATOMIC_ACQUIRE) & bit)) {
             if (!map || !vmm_map_mmio(phys, 4096)) return NULL;
-            ecam_active[bdf >> 3] |= 1u << (bdf & 7);
+            __atomic_fetch_or(&ecam_active[bdf >> 3], bit, __ATOMIC_RELEASE);
         }
         return phys_to_virt(phys);
     }
     return NULL;
 }
 
-/* Mechanism #1 is an address register and a data window: an interrupt handler's own access
-   between the two would redirect this one, so the pair runs with interrupts off. */
+/* Mechanism #1 is an address register and a data window, one pair for the machine: another
+   access between the two, on any CPU or in an interrupt handler, would redirect this one. The
+   pair is one step under cf8_lock, the last lock taken (after reset_lock). */
+static struct spinlock cf8_lock;
+
 static uint32_t cf8_read32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&cf8_lock);
     outl(0xCF8, 0x80000000u | (uint32_t)bus << 16 | (uint32_t)dev << 11 | (uint32_t)func << 8 | (off & 0xFC));
     uint32_t v = inl(0xCFC);
-    irq_restore(f);
+    spin_unlock(&cf8_lock, f);
     return v;
 }
 
@@ -68,12 +79,12 @@ static void config_write(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, u
         return;
     }
     if (off >= 256) return;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&cf8_lock);
     outl(0xCF8, 0x80000000u | (uint32_t)bus << 16 | (uint32_t)dev << 11 | (uint32_t)func << 8 | (off & 0xFC));
     if (bytes == 4) outl(0xCFC, v);
     else if (bytes == 2) outw(0xCFC + (off & 2), (uint16_t)v);
     else outb(0xCFC + (off & 3), (uint8_t)v);
-    irq_restore(f);
+    spin_unlock(&cf8_lock, f);
 }
 
 void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t v) {
@@ -183,6 +194,7 @@ static void pcie_identify(struct pci_device *d) {
 
 void pci_init(void) {
     uint64_t since = rdtsc(); /* the platform reset was before the firmware ran */
+    interrupt_dest = lapic_current_id();
     ecam = acpi_ecams(&necam);
     for (unsigned i = 0; i < necam; i++)
         if (ecam[i].segment == 0)
@@ -307,7 +319,9 @@ uint64_t pci_bar_address(const struct pci_device *d, unsigned bar) {
 /* Size a memory BAR by the standard all-ones probe, with memory decoding off meanwhile. Only
    during enumeration: while decoding is off the function answers nothing, so the same probe on a
    running device (a GPU the boot screen is drawn through, a driver's registers) would lose the
-   writes and read all-ones. */
+   writes and read all-ones. This CPU's interrupts stay off for the probe, so none of its own
+   handlers reaches the function then; the console on another CPU still may (dev/fbcon.c), and
+   its pixels drawn meanwhile are lost. */
 static uint64_t bar_probe(const struct pci_device *d, unsigned bar) {
     if (!pci_bar_address(d, bar)) return 0;
     bool wide = (d->bar[bar] & 6) == 4;
@@ -471,9 +485,11 @@ bool pci_msi_disable(struct pci_device *d) {
     return off && cleared;
 }
 
+uint32_t pci_interrupt_dest(void) { return interrupt_dest; }
+
 bool pci_msi_enable(struct pci_device *d, uint8_t vector) {
     if (!lapic_present()) return false;
-    uint32_t dest = lapic_current_id(); /* the BSP: device interrupts are only handled there */
+    uint32_t dest = interrupt_dest;
     if (dest > 0xFF) return false; /* not addressable by an MSI message; leave the device untouched */
     if (pci_find_cap(d, 0x05)) return pci_msi_enable_multi(d, vector, 1, dest);
     if (!pci_msix_init(d)) return false;
@@ -581,6 +597,11 @@ static void state_restore(const struct pci_device *d, const struct pci_saved *s)
 }
 
 /* ---- a function's requests, and its reset (PCI Express Base 6.0) ---- */
+/* Each function's d->reset pointer, the record fields AML's accesses read and write (phase,
+   since, ready, initializing, refused), and each Root Port's RRS holds and Root Control. An AML
+   access runs whole under it: one that has begun ends before a phase that keeps it out is set,
+   and one that begins after sees it. Taken after reset_mutex; only cf8_lock is taken under it. */
+static struct spinlock reset_lock;
 static bool present(const struct pci_device *d) {
     /* RRS Software Visibility may return Vendor ID 0001h: that is not a ready function. */
     return pci_read32(d->bus, d->dev, d->func, 0) == ((uint32_t)d->device << 16 | d->vendor);
@@ -617,21 +638,40 @@ static struct pci_device *rrs_port(const struct pci_device *d) {
     return NULL;
 }
 
-static void rrs_show(const struct pci_device *port, bool on) {
+/* reset_lock held: Root Control is read, changed and written in one step. */
+static void rrs_show_held(const struct pci_device *port, bool on) {
     uint16_t ctl = pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_ROOTCTL);
     uint16_t want = on ? ctl | PCIE_ROOTCTL_RRS_VISIBLE : ctl & ~PCIE_ROOTCTL_RRS_VISIBLE;
     if (want != ctl) pci_write16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_ROOTCTL, want);
 }
 
-static void rrs_hold(struct pci_device *port) {
+static void rrs_hold_held(struct pci_device *port) {
     if (!port->rrs_holds++)
         port->rrs_firmware = pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_ROOTCTL) &
                              PCIE_ROOTCTL_RRS_VISIBLE;
-    rrs_show(port, true);
+    rrs_show_held(port, true);
+}
+
+static void rrs_release_held(struct pci_device *port) {
+    if (!--port->rrs_holds && !port->rrs_firmware) rrs_show_held(port, false);
+}
+
+static void rrs_show(const struct pci_device *port, bool on) {
+    uint64_t f = spin_lock(&reset_lock);
+    rrs_show_held(port, on);
+    spin_unlock(&reset_lock, f);
+}
+
+static void rrs_hold(struct pci_device *port) {
+    uint64_t f = spin_lock(&reset_lock);
+    rrs_hold_held(port);
+    spin_unlock(&reset_lock, f);
 }
 
 static void rrs_release(struct pci_device *port) {
-    if (!--port->rrs_holds && !port->rrs_firmware) rrs_show(port, false);
+    uint64_t f = spin_lock(&reset_lock);
+    rrs_release_held(port);
+    spin_unlock(&reset_lock, f);
 }
 
 /* How long after a function stopped issuing Requests a Completion for one it still had
@@ -682,9 +722,12 @@ static unsigned flr_time_ms(const struct pci_device *d) {
 
 /* Owned by its enumerated device, not the app performing recovery. A cancelled or failed attempt
    must not lose the pre-FLR BARs/ACS, and a later one must not save over them what an FLR left.
-   PCI claim/recovery runs on the BSP; its caller reserves d->claimed across any sleep, so no
-   sleep comes inside an attempt. A bus reset holds the configuration of each function below
-   its port the same way (pci_bus_reset), until the function answers after it. */
+   Its caller reserves d->claimed across the attempt (dev/pciuser.c), so only that caller resets
+   d; resets of different functions go one at a time under reset_mutex, as they share the ports
+   above (RRS holds, link retraining, the times since a port's reset). A sleep does not start
+   while one runs (pci_suspend). A bus reset holds the configuration of each function below its
+   port the same way (pci_bus_reset), until the function answers after it. AML's accesses
+   (pci_config_firmware_read/write), on any CPU, read the record under reset_lock. */
 enum reset_phase {
     RESET_IDLE,     /* between attempts: the next one quiesces the function and issues an FLR */
     RESET_QUIESCED, /* this attempt stopped the function issuing Requests, at `quiesced` */
@@ -702,21 +745,49 @@ struct pci_reset {
     bool stuck;              /* it did not come back (pci_reset_stuck) */
     bool broken;             /* nor after its last Conventional Reset (pci_bus_reset_port) */
     bool initializing;       /* its last Vendor ID read completed with RRS */
-    bool refused;            /* another access was kept from the function (pci_config_blocked), logged */
+    bool refused;            /* another access was kept from the function (pci_config_firmware_*), logged */
 };
 
-/* Claim recovery and task_kill run on the BSP. Keep the cancellation check and the
-   scheduler's wait registration atomic against kill_locked: otherwise a kill just
-   before sleep_ms could lose its wake for the remaining FLR/readiness wait.
-   schedule switches stacks: the next task resumes its own irq_restore (or startup/
-   interrupt return), not this caller's IRQ guard. No IRQ-disabled busy wait or new
-   polling/deadline slice is imposed while this task is blocked. */
+static struct mutex reset_mutex;
+/* Taken by pci_function_reset and pci_bus_reset for their whole run: a sleep is refused while
+   one is counted (pci_suspend). reset_lock. */
+static unsigned resets_running;
+
+/* reset_lock taken around a record change AML's accesses read. */
+static void reset_phase_set(struct pci_reset *r, enum reset_phase phase) {
+    uint64_t f = spin_lock(&reset_lock);
+    r->phase = phase;
+    spin_unlock(&reset_lock, f);
+}
+
+static void reset_publish(struct pci_device *d, struct pci_reset *r) {
+    uint64_t f = spin_lock(&reset_lock);
+    d->reset = r;
+    spin_unlock(&reset_lock, f);
+}
+
+/* d's record off it and freed, no AML access still reading it. */
+static void reset_free(struct pci_device *d) {
+    uint64_t f = spin_lock(&reset_lock);
+    struct pci_reset *r = d->reset;
+    d->reset = NULL;
+    spin_unlock(&reset_lock, f);
+    kfree(r);
+}
+
+static void reset_initializing(struct pci_reset *r, uint32_t id) {
+    uint64_t f = spin_lock(&reset_lock);
+    r->initializing = id == PCI_CONFIG_RRS_ID;
+    spin_unlock(&reset_lock, f);
+}
+
+/* A scheduler wait of the attempt: false, without waiting, once its task is killed. A kill
+   during the wait wakes it, and one that came just before it ends it within KILLED_NAP_MS
+   (sys/sched.h): the caller looks at reset_cancelled again either way. */
 static bool reset_wait(uint64_t ms) {
-    uint64_t flags = irq_save();
-    bool cancelled = current_task && current_task->killed;
-    if (!cancelled) sleep_ms(ms);
-    irq_restore(flags);
-    return !cancelled;
+    if (current_task && current_task->killed) return false;
+    sleep_ms(ms);
+    return true;
 }
 
 static bool reset_cancelled(void) { return current_task && current_task->killed; }
@@ -752,7 +823,7 @@ static void links_retrain(bool sleeps) {
 static bool reset_quiesce(struct pci_device *d, struct pci_reset *r) {
     pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, PCI_COMMAND_INTX_DISABLE);
     if (!present(d) || (pci_read16(d->bus, d->dev, d->func, PCI_COMMAND) & PCI_COMMAND_MASTER)) return false;
-    r->phase = RESET_QUIESCED;
+    reset_phase_set(r, RESET_QUIESCED);
     r->quiesced = uptime_ms();
     r->window = completion_window_ms(d); /* the pre-FLR value: nothing changes it from here */
     return true;
@@ -777,13 +848,13 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
             kfree(r);
             return false;
         }
-        d->reset = r; /* publish before any cancellable wait */
+        reset_publish(d, r); /* before the FLR and any cancellable wait: AML's accesses are kept out */
     } else if (r->phase == RESET_IDLE) {
         /* An earlier FLR may have left it initializing, and a Configuration Write to a function
            that completes with RRS is retried by the Root Complex (2.3.2): no write goes to it,
            another FLR either, before its Vendor ID read gives its ID. */
         uint32_t id = pci_read32(d->bus, d->dev, d->func, 0);
-        r->initializing = id == PCI_CONFIG_RRS_ID;
+        reset_initializing(r, id);
         if (id != r->state.id) {
             r->stuck = true;
             kprintf("pci: %02x:%02x.%u: %s; it is reset again once it answers\n", d->bus, d->dev, d->func,
@@ -797,8 +868,7 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
             if (!d->pcie_cap ||
                 !(pci_read32(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR)) {
                 state_restore(d, &r->state);
-                d->reset = NULL;
-                kfree(r);
+                reset_free(d);
                 links_retrain(true);
                 return false;
             }
@@ -820,7 +890,7 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
         if (there) there = present(d);
         if (!there || reset_cancelled()) {
             r->stuck = !there;
-            r->phase = RESET_IDLE;
+            reset_phase_set(r, RESET_IDLE);
             return false;
         }
         if (pending)
@@ -829,10 +899,12 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
         unsigned rtr = flr_time_ms(d); /* read before the FLR, which may discard reads (6.6.2) */
         pci_write16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCTL,
                     r->state.pcie_ctl[0] | PCIE_DEVCTL_FLR);
+        uint64_t f = spin_lock(&reset_lock);
         r->since = uptime_ms(); /* allow the full delay after the initiating configuration write */
         r->phase = RESET_ISSUED;
         r->wait = rtr ? rtr : FLR_DONE_MS;
         r->ready = rtr ? rtr : READY_MS;
+        spin_unlock(&reset_lock, f);
     }
     /* Issued: a cancelled wait leaves the FLR's times for the next attempt to go on with. */
     for (;;) {
@@ -847,7 +919,7 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
     for (;;) {
         if (port) rrs_show(port, true); /* AML may have rewritten Root Control during a wait */
         id = pci_read32(d->bus, d->dev, d->func, 0);
-        r->initializing = id == PCI_CONFIG_RRS_ID;
+        reset_initializing(r, id);
         if (!id_pending(id, true) || uptime_ms() - r->since > r->ready) break;
         if (!reset_wait(1)) return false;
     }
@@ -859,24 +931,40 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
                 r->initializing ? "still initializing" : id != r->state.id ? "not answering" : "requests pending",
                 r->ready);
         r->stuck = true;
-        r->phase = RESET_IDLE;
+        reset_phase_set(r, RESET_IDLE);
         return false;
     }
     state_restore(d, &r->state);
     links_retrain(true);
     /* still mastering: the next attempt finds it ready and writes the configuration again */
     if (!present(d) || (pci_read16(d->bus, d->dev, d->func, PCI_COMMAND) & PCI_COMMAND_MASTER)) return false;
-    d->reset = NULL;
-    kfree(r);
+    reset_free(d);
     return true;
+}
+
+/* reset_mutex taken, and the reset counted for pci_suspend. */
+static void resets_enter(void) {
+    mutex_lock(&reset_mutex);
+    uint64_t f = spin_lock(&reset_lock);
+    resets_running++;
+    spin_unlock(&reset_lock, f);
+}
+
+static void resets_leave(void) {
+    uint64_t f = spin_lock(&reset_lock);
+    resets_running--;
+    spin_unlock(&reset_lock, f);
+    mutex_unlock(&reset_mutex);
 }
 
 bool pci_function_reset(struct pci_device *d) {
     if (reset_cancelled()) return false;
+    resets_enter();
     struct pci_device *port = rrs_port(d);
     if (port) rrs_hold(port);
     bool done = reset_attempt(d, port);
     if (port) rrs_release(port);
+    resets_leave();
     return done;
 }
 
@@ -887,10 +975,9 @@ bool pci_reset_stuck(const struct pci_device *d) { return d->reset && d->reset->
    an attempt or a bus reset runs, and up to the readiness limit of an FLR one left. A function
    that last answered RRS is kept from it too: with the Root Port not showing RRS the Root
    Complex would retry that read (2.3.2). Its Vendor ID is read again here, the Root Port showing
-   RRS, so that a function that came back is not kept from it for good. Like the reset, this
-   runs on the BSP, where kernel code is not preempted: d->reset cannot change between this
-   check and the access it guards. */
-bool pci_config_blocked(uint8_t bus, uint8_t dev, uint8_t func) {
+   RRS, so that a function that came back is not kept from it for good. reset_lock held, by the
+   caller's whole access: d->reset cannot change between this check and the access it guards. */
+static bool config_blocked_held(uint8_t bus, uint8_t dev, uint8_t func) {
     struct pci_device *d = pci_find_function(bus, dev, func);
     struct pci_reset *r = d ? d->reset : NULL;
     if (!r) return false;
@@ -898,9 +985,9 @@ bool pci_config_blocked(uint8_t bus, uint8_t dev, uint8_t func) {
                      (r->phase == RESET_ISSUED && uptime_ms() - r->since <= r->ready);
     struct pci_device *port = resetting || !r->initializing ? NULL : rrs_port(d);
     if (port) {
-        rrs_hold(port);
+        rrs_hold_held(port);
         r->initializing = pci_read32(bus, dev, func, 0) == PCI_CONFIG_RRS_ID;
-        rrs_release(port);
+        rrs_release_held(port);
     }
     if (!resetting && !r->initializing) return false;
     if (!r->refused)
@@ -908,6 +995,35 @@ bool pci_config_blocked(uint8_t bus, uint8_t dev, uint8_t func) {
                 bus, dev, func);
     r->refused = true;
     return true;
+}
+
+/* An extended register's ECAM page is mapped before reset_lock, which comes before the page
+   tables' locks: the access under it then finds the page mapped. */
+bool pci_config_firmware_read(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t *v) {
+    if (off >= 256) (void)ecam_regs(bus, dev, func, true);
+    uint64_t f = spin_lock(&reset_lock);
+    bool ok = !config_blocked_held(bus, dev, func);
+    *v = ok ? pci_read32(bus, dev, func, off & ~3u) : 0xFFFFFFFFu;
+    spin_unlock(&reset_lock, f);
+    return ok;
+}
+
+bool pci_config_read_unless_reset(const struct pci_device *d, uint16_t off, uint32_t *v) {
+    if (off >= 256) (void)ecam_regs(d->bus, d->dev, d->func, true);
+    uint64_t f = spin_lock(&reset_lock);
+    bool ok = !d->reset;
+    if (ok) *v = pci_read32(d->bus, d->dev, d->func, off & ~3u);
+    spin_unlock(&reset_lock, f);
+    return ok;
+}
+
+bool pci_config_firmware_write(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t v, unsigned bytes) {
+    if (off >= 256) (void)ecam_regs(bus, dev, func, true);
+    uint64_t f = spin_lock(&reset_lock);
+    bool ok = !config_blocked_held(bus, dev, func);
+    if (ok) config_write(bus, dev, func, bytes == 4 ? off & ~3u : bytes == 2 ? off & ~1u : off, v, bytes);
+    spin_unlock(&reset_lock, f);
+    return ok;
 }
 
 /* ---- Conventional Reset: a sleep's, or a Secondary Bus Reset's (6.6.1) ----
@@ -1008,15 +1124,14 @@ static bool bus_reset_hold(struct pci_device *port) {
         state_save(f, &r->state, false);
         r->state.pcie_ctl[0] &= ~PCIE_DEVCTL_FLR;
         r->phase = RESET_BUS;
-        f->reset = r;
+        reset_publish(f, r);
     }
     for (size_t i = 0; i < ndevices; i++) {
         struct pci_device *f = &devices[i];
         struct pci_reset *r = f->reset;
         if (!pci_below(port, f) || !r || r->phase != RESET_BUS) continue;
         if (why) {
-            f->reset = NULL;
-            kfree(r);
+            reset_free(f);
         } else if (f->bridge) {
             /* a bridge forwards the requests of what is below it (7.5.1.1.3); its own bus is
                not reset when its configuration goes back */
@@ -1036,7 +1151,16 @@ static void ltr_enable(const struct pci_device *port) {
     pci_write16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_DEVCTL2, control2 | PCIE_DEVCTL2_LTR);
 }
 
+static bool bus_reset(struct pci_device *port);
+
 bool pci_bus_reset(struct pci_device *port) {
+    resets_enter();
+    bool done = bus_reset(port);
+    resets_leave();
+    return done;
+}
+
+static bool bus_reset(struct pci_device *port) {
     const char *why = bus_reset_refused(port);
     if (why) {
         kprintf("pci: %02x:%02x.%u: no Secondary Bus Reset: %s\n", port->bus, port->dev, port->func, why);
@@ -1050,7 +1174,7 @@ bool pci_bus_reset(struct pci_device *port) {
         if (!pci_below(port, f)) continue;
         if (first) rrs = rrs_port(f); /* the same for every function below */
         first = false;
-        f->reset->phase = RESET_BUS;
+        reset_phase_set(f->reset, RESET_BUS);
         f->below = f->reset_end = 0;
     }
     uint16_t control = pci_read16(port->bus, port->dev, port->func, PCI_BRIDGE_CONTROL);
@@ -1085,8 +1209,10 @@ bool pci_bus_reset(struct pci_device *port) {
         /* reached once the bridge above has its bus numbers back */
         if ((f->upstream == port || !f->upstream->reset) && below_wait(f, &reset_end, true))
             id = ready_id(rrs, f->bus, f->dev, f->func, reset_end, true, true);
+        uint64_t held = spin_lock(&reset_lock);
         r->phase = RESET_IDLE;
         r->initializing = id == PCI_CONFIG_RRS_ID;
+        spin_unlock(&reset_lock, held);
         r->stuck = r->broken = id != r->state.id;
         if (r->stuck) {
             kprintf("pci: %02x:%02x.%u: %s after the Secondary Bus Reset; its configuration stays held\n", f->bus,
@@ -1100,8 +1226,7 @@ bool pci_bus_reset(struct pci_device *port) {
         }
         if (r->owed) continue; /* its FLR writes it back (pci_function_reset) */
         state_restore(f, &r->state);
-        f->reset = NULL;
-        kfree(r);
+        reset_free(f);
     }
     if (ltr) ltr_enable(port); /* for a function that answers later */
     uint16_t now = pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_LNKSTA);
@@ -1121,9 +1246,15 @@ static struct pci_saved *saved;
 static bool saved_valid;
 
 /* A function with a reset is left to it: the reset holds its configuration and writes it back
-   once an FLR has been seen through (pci_function_reset; after a sleep, pci_resume). */
+   once an FLR has been seen through (pci_function_reset; after a sleep, pci_resume). Every other
+   CPU is parked (smp_suspend): a reset still running is asleep in its waits, and the sleep is
+   called off rather than go on under it; none can start before pci_resume. */
 const char *pci_suspend(void) {
     saved_valid = false;
+    uint64_t f = spin_lock(&reset_lock);
+    bool resetting = resets_running != 0;
+    spin_unlock(&reset_lock, f);
+    if (resetting) return "PCI (a device is being reset)";
     if (!saved) saved = kzalloc(ndevices * sizeof *saved);
     if (!saved) return "PCI (no memory to save it)";
     for (size_t i = 0; i < ndevices; i++)
@@ -1208,7 +1339,7 @@ void pci_resume(bool slept, bool remake) {
         struct pci_device *d = &devices[i];
         struct pci_reset *r = d->reset;
         if (r && !slept) continue;
-        if (r) r->phase = RESET_IDLE;
+        if (r) reset_phase_set(r, RESET_IDLE);
         uint64_t reset_end = since;
         if (!below_wait(d, &reset_end, false)) {
             kprintf("pci: %02x:%02x.%x is not there after sleep (the link above it is down)\n", d->bus, d->dev,
@@ -1222,7 +1353,7 @@ void pci_resume(bool slept, bool remake) {
         if (port) rrs_release(port);
         uint32_t was = r ? r->state.id : saved[i].id;
         if (r) {
-            r->initializing = id == PCI_CONFIG_RRS_ID;
+            reset_initializing(r, id);
             r->stuck = r->broken = id != was;
         }
         if (id != was) {
@@ -1232,10 +1363,7 @@ void pci_resume(bool slept, bool remake) {
         }
         if (r && r->owed) continue;
         state_restore(d, r ? &r->state : &saved[i]);
-        if (r) {
-            d->reset = NULL;
-            kfree(r);
-        }
+        if (r) reset_free(d);
     }
     links_retrain(false);
 }

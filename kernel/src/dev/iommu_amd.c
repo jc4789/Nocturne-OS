@@ -14,6 +14,7 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
+#include "arch/spin.h"
 #include "dev/acpi.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
@@ -152,6 +153,11 @@ static uint64_t devtab, sems; /* device table; one completion word a unit */
 static size_t sem_pages;
 static uint64_t token;
 static int event_vector = -1;
+/* The units and what they read: every unit's command buffer, event log and registers, the
+   completion words and token, the device table, the domains' interrupt remapping tables. Every
+   call of the common part (struct iommu_hw) and the event handler (CPU 0) work under it; it is
+   taken after the common part's locks, and only iommu_fault_report's is taken under it. */
+static struct spinlock amd_lock;
 
 /* IVRS: requests of first..last arrive as `as` */
 struct alias {
@@ -482,7 +488,7 @@ static void commands_restart(struct unit *u) {
 }
 
 /* A command for one unit: one it has no room for in time is lost (u->lost), and so are the ones
-   after it until the sync, which would each wait as long with interrupts off. */
+   after it until the sync, which would each wait as long under amd_lock with interrupts off. */
 static void command(struct unit *u, unsigned op, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
     if (u->stalled) return;
     for (uint64_t t = iommu_deadline(100); (rd(u, R_CMD_HEAD) & 0x7FFF0) == (u->cmd_tail + 16) % RING_BYTES; pause()) {
@@ -563,7 +569,9 @@ static void events_drain(struct unit *u) {
 
 static void event_isr(struct regs *r) {
     (void)r;
+    spin_take(&amd_lock);
     for (size_t i = 0; i < nunits; i++) events_drain(&units[i]);
+    spin_give(&amd_lock);
 }
 
 /* Waits until every unit has done every command sent since the last sync: false when one was
@@ -622,7 +630,7 @@ static bool amd_attach(struct iommu_domain *dom) {
         return false;
     }
     if (!amd.coherent) iommu_cache_flush(phys_to_virt(dom->irt), PAGE_SIZE);
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&amd_lock);
     send_domain_flush(dom->id); /* nothing the firmware cached under this id is used */
     bool ok = sync();
     if (ok) {
@@ -633,7 +641,7 @@ static bool amd_attach(struct iommu_domain *dom) {
         send_entry_flush(dom);
         ok = sync();
     }
-    irq_restore(f);
+    spin_unlock(&amd_lock, f);
     return ok;
 }
 
@@ -641,21 +649,21 @@ static bool amd_attach(struct iommu_domain *dom) {
    aborts. Interrupts valid with IntCtl 00 and no pass bits: every interrupt aborts. What the
    units cached under the domain's own ID goes (2.4.2) before that ID is released. */
 static bool amd_block(struct iommu_domain *dom) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&amd_lock);
     for (unsigned i = 0; i < dom->nids; i++) dte_write(dom->ids[i], DTE_V | DTE_TV, BLOCK_DOMAIN, DTE_IV);
     send_entry_flush(dom);
     send_domain_flush(dom->id);
     bool ok = sync();
-    irq_restore(f);
+    spin_unlock(&amd_lock, f);
     return ok;
 }
 
 static bool amd_flush(struct iommu_domain *dom, bool unmapped) {
     if (!unmapped && !np_cache) return true;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&amd_lock);
     send_domain_flush(dom->id);
     bool ok = sync();
-    irq_restore(f);
+    spin_unlock(&amd_lock, f);
     return ok;
 }
 
@@ -700,6 +708,7 @@ static bool irt_write(struct iommu_domain *dom, unsigned first, unsigned count, 
                       bool on) {
     uint8_t *irt = phys_to_virt(dom->irt);
     size_t size = wide ? 16 : 4;
+    uint64_t f = spin_lock(&amd_lock);
     for (unsigned i = 0; i < count; i++) {
         uint8_t v = (uint8_t)(vector + i);
         if (wide)
@@ -709,10 +718,9 @@ static bool irt_write(struct iommu_domain *dom, unsigned first, unsigned count, 
             ((volatile uint32_t *)irt)[first + i] = on ? 1u | dest << 8 | (uint32_t)v << 16 : 0;
     }
     if (!amd.coherent) iommu_cache_flush(irt + first * size, count * size);
-    uint64_t f = irq_save();
     for (unsigned i = 0; i < dom->nids; i++) send(CMD_INV_IRT, dom->ids[i], 0, 0, 0);
     bool ok = sync();
-    irq_restore(f);
+    spin_unlock(&amd_lock, f);
     return ok;
 }
 
@@ -826,15 +834,22 @@ static bool units_off(void) {
     return ok;
 }
 
-static bool amd_shutdown(void) { return units_off(); }
+static bool amd_shutdown(void) {
+    uint64_t f = spin_lock(&amd_lock);
+    bool ok = units_off();
+    spin_unlock(&amd_lock, f);
+    return ok;
+}
 
 static bool amd_resume(void) {
     bool ok = true;
+    uint64_t f = spin_lock(&amd_lock);
     for (size_t i = 0; i < nunits; i++) ok &= program(&units[i]);
     if (ok) {
         send_everything_flush();
         ok = sync();
     }
+    spin_unlock(&amd_lock, f);
     if (!ok) kprintf("iommu: AMD-Vi did not come back after sleep\n");
     return ok;
 }
@@ -871,12 +886,14 @@ static void event_interrupts_enable(void) {
             struct unit *u = &units[j];
             if (u->fn != fn) continue;
             u->event_irq = entries ? u->msi_num < entries &&
-                pci_msix_route(fn, u->msi_num, (uint8_t)event_vector, lapic_current_id()) : msi && !u->msi_num;
+                pci_msix_route(fn, u->msi_num, (uint8_t)event_vector, pci_interrupt_dest()) : msi && !u->msi_num;
             if (u->event_irq && entries) pci_msix_mask(fn, u->msi_num, false);
             if (u->event_irq) {
+                uint64_t f = spin_lock(&amd_lock);
                 uint64_t ctl = rd(u, R_CONTROL);
                 if (!(rd(u, R_STATUS) & ST_CMDBUF_RUN)) ctl &= ~CTL_CMDBUF_EN;
                 wr(u, R_CONTROL, ctl | CTL_EVENTINT_EN);
+                spin_unlock(&amd_lock, f);
             } else {
                 kprintf("iommu: unit at %lx has no event interrupt: blocked requests show after commands only\n",
                         u->base);
@@ -907,14 +924,14 @@ static bool amd_start(bool translate) {
     if (!amd.coherent) iommu_cache_flush(phys_to_virt(devtab), DT_BYTES);
     event_vector = irq_vector_alloc(1, 1);
     if (event_vector >= 0) vector_register(event_vector, event_isr);
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&amd_lock);
     for (size_t i = 0; ok && i < nunits; i++) ok = program(&units[i]);
     if (ok) {
         send_everything_flush();
         ok = sync();
     }
     bool off = ok || units_off();
-    irq_restore(f);
+    spin_unlock(&amd_lock, f);
     if (!ok) {
         if (event_vector >= 0) irq_vector_free((unsigned)event_vector, 1);
         event_vector = -1;

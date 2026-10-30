@@ -3,6 +3,7 @@
    and back. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/spin.h"
 #include "dev/pm.h"
 #include "dev/acpi.h"
 #include "dev/blk.h"
@@ -28,36 +29,49 @@ void power_reboot(void);
 #define FORCE_MS   60000 /* from a menu, after a cancel: asking again closes them anyway */
 #define STOP_MS    3000  /* stopped apps get this long to end */
 
+/* Each stage's list only grows: a device joins at its end with a release store, and the walks
+   (any CPU, any time) follow the links with acquire loads, never under pm_lock. */
 static struct pm_device *stages[PM_STAGES];
 static struct wait_queue pm_wq;
-static volatile bool requested, forced, busy, stopping;
-static volatile enum pm_action wanted;
+/* The request and the power thread's progress: requested, busy, force_until, and every change of
+   forced, stopping and wanted; also the appends to the stages' lists. pm_request comes from tasks
+   on any CPU and from the power button's handler. Taken alone; only the wait queue's lock is taken
+   under it. forced, stopping and wanted are also read without it (atomic loads): what the power
+   thread or a caller does with a value a moment old is what it would have done just before. */
+static struct spinlock pm_lock;
+static bool requested, forced, busy, stopping;
+static enum pm_action wanted;
 static uint64_t force_until;
 
+static struct pm_device *first_of(int stage) { return __atomic_load_n(&stages[stage], __ATOMIC_ACQUIRE); }
+static struct pm_device *next_of(const struct pm_device *d) { return __atomic_load_n(&d->next, __ATOMIC_ACQUIRE); }
+static bool is_forced(void) { return __atomic_load_n(&forced, __ATOMIC_RELAXED); }
+static enum pm_action wanted_now(void) { return __atomic_load_n(&wanted, __ATOMIC_RELAXED); }
+
 void pm_register(struct pm_device *d) {
-    uint64_t f = irq_save();
+    d->next = NULL;
+    uint64_t f = spin_lock(&pm_lock);
     struct pm_device **pp = &stages[d->stage];
     while (*pp) pp = &(*pp)->next;
-    d->next = NULL;
-    *pp = d;
-    irq_restore(f);
+    __atomic_store_n(pp, d, __ATOMIC_RELEASE);
+    spin_unlock(&pm_lock, f);
 }
 
 void pm_request(enum pm_action action, bool interactive) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&pm_lock);
     /* sleep is never forced and never replaces a shutdown that is already waiting */
     bool nap = action == PM_SLEEP || action == PM_HIBERNATE;
     if (!stopping && !(nap && (busy || requested))) {
-        wanted = action;
+        __atomic_store_n(&wanted, action, __ATOMIC_RELAXED);
         /* asking again while apps are closing, or soon after a cancel, means "close them anyway" */
-        if (!interactive || busy || uptime_ms() < force_until) forced = true;
+        if (!interactive || busy || uptime_ms() < force_until) __atomic_store_n(&forced, true, __ATOMIC_RELAXED);
         requested = true;
         wq_wake_all(&pm_wq);
     }
-    irq_restore(f);
+    spin_unlock(&pm_lock, f);
 }
 
-bool pm_stopping(void) { return stopping; }
+bool pm_stopping(void) { return __atomic_load_n(&stopping, __ATOMIC_RELAXED); }
 
 /* Every window gets EV_CLOSE; an app may ask its user to save first. Returns
    false when a menu request is cancelled by an app that kept its window. */
@@ -73,20 +87,22 @@ static bool close_windows(void) {
     while ((left = wm_window_count(title, sizeof title)) > 0) {
         uint64_t now = uptime_ms();
         if (left < last) { last = left; progress = now; }
-        if (forced ? now - start >= GRACE_MS : now - progress >= STALL_MS) break;
+        if (is_forced() ? now - start >= GRACE_MS : now - progress >= STALL_MS) break;
         if (now - start >= 1000 && (strcmp(title, shown) || now - told >= 3000)) {
-            hint = !forced && !strcmp(title, shown) && !hint;
-            wm_notify(wanted == PM_REBOOT ? "Waiting to restart" : "Waiting to shut down",
+            hint = !is_forced() && !strcmp(title, shown) && !hint;
+            wm_notify(wanted_now() == PM_REBOOT ? "Waiting to restart" : "Waiting to shut down",
                       hint ? "Choose again to force it" : title);
             strlcpy(shown, title, sizeof shown);
             told = now;
         }
         sleep_ms(50);
     }
-    if (!left || forced) return true;
-    wm_notify(wanted == PM_REBOOT ? "Restart cancelled" : "Shutdown cancelled", title);
+    if (!left || is_forced()) return true;
+    wm_notify(wanted_now() == PM_REBOOT ? "Restart cancelled" : "Shutdown cancelled", title);
     kprintf("pm: cancelled, \"%s\" kept its window\n", title);
+    uint64_t f = spin_lock(&pm_lock);
     force_until = uptime_ms() + FORCE_MS;
+    spin_unlock(&pm_lock, f);
     return false;
 }
 
@@ -107,7 +123,7 @@ static bool flush_disks(void) {
 const char *pm_quiesce_devices(bool stop_at_failure) {
     const char *stuck = NULL;
     for (int s = 0; s < PM_STAGES; s++)
-        for (struct pm_device *d = stages[s]; d; d = d->next) {
+        for (struct pm_device *d = first_of(s); d; d = next_of(d)) {
             d->down = true; /* reached: resumed after a sleep, also one called off from here */
             if (!d->quiesce || d->quiesce(d->ctx)) continue;
             kprintf("pm: %s did not stop\n", d->name);
@@ -118,7 +134,8 @@ const char *pm_quiesce_devices(bool stop_at_failure) {
 }
 
 /* The volume's saves are on the disks before (pm_thread): after a hibernation's snapshot nothing
-   may be committed, the image has the machine as it was before any of it. */
+   may be committed, the image has the machine as it was before any of it. The interrupts it turns
+   off are its own CPU's: the other CPUs still run their kernel threads while the devices stop. */
 static NORETURN void finish(enum pm_action action) {
     flush_disks(); /* a disk that fails is logged: the power goes off all the same */
     if (action == PM_POWER_OFF) acpi_sleep_prepare(5); /* the firmware's _PTS(5), while interrupts still run */
@@ -138,7 +155,7 @@ static const char *sleep_blocker(bool hibernate) {
     if (why) return why;
     if (!wake_available()) return "no wake page below 1 MiB";
     for (int s = 0; s < PM_STAGES; s++)
-        for (struct pm_device *d = stages[s]; d; d = d->next)
+        for (struct pm_device *d = first_of(s); d; d = next_of(d))
             if (!d->resume && !(hibernate && d->cold_ok)) return d->name;
     return NULL;
 }
@@ -164,8 +181,9 @@ static void enter_s3(void) { acpi_sleep_enter(3); }
 
 /* Devices, interrupt controllers and the CPU down, enter(), and all of it back. True after a real
    sleep (S3 woke up, or a hibernation image was restored), false when enter() returned or a device
-   did not stop (*why says which; enter() is then not called). From the freeze to the thaw no other
-   thread runs: the devices are down or not back yet. */
+   did not stop (*why says which; enter() is then not called). On CPU 0, every other CPU parked
+   (smp_suspend): from the freeze to the thaw no other thread runs, the devices are down or not
+   back yet. The interrupts this saves and restores are CPU 0's own. */
 static bool machine_sleep(void (*enter)(void), unsigned state, const char **why) {
     acpi_freeze(true);
     const char *stuck = pci_suspend();
@@ -206,7 +224,7 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
     else acpi_links_forget();
     const char *lost = NULL;
     for (int s = PM_STAGES - 1; s >= 0; s--)
-        for (struct pm_device *d = stages[s]; d; d = d->next) {
+        for (struct pm_device *d = first_of(s); d; d = next_of(d)) {
             if (!d->down) continue; /* after a device that did not stop: it never stopped */
             d->down = false;
             if (!d->resume || d->resume(d->ctx)) continue;
@@ -232,7 +250,7 @@ static void sleep_now(bool hibernate) {
     for (int i = 0; i < pci_count() && !why; i++)
         if (pci_at(i)->claimed) why = "An app drives one of the PCI devices";
     for (int s = 0; s < PM_STAGES && !why; s++)
-        for (struct pm_device *d = stages[s]; d && !why; d = d->next)
+        for (struct pm_device *d = first_of(s); d && !why; d = next_of(d))
             if (d->refuse) why = d->refuse(d->ctx);
     if (!why && hibernate) hibernate_prepare(&why);
     if (why) {
@@ -260,7 +278,9 @@ static void sleep_now(bool hibernate) {
             /* the snapshot: the machine as it is from here on never comes back */
             wm_notify("Hibernating", "Saving the memory to C:");
             if (!(why = hibernate_write())) {
-                stopping = true;
+                uint64_t f = spin_lock(&pm_lock);
+                __atomic_store_n(&stopping, true, __ATOMIC_RELAXED);
+                spin_unlock(&pm_lock, f);
                 kprintf("pm: hibernated, power off\n");
                 finish(PM_POWER_OFF);
             }
@@ -281,25 +301,28 @@ static void sleep_now(bool hibernate) {
 static void pm_thread(void *arg) {
     (void)arg;
     for (;;) {
-        uint64_t f = irq_save();
-        while (!requested) wq_wait(&pm_wq);
+        uint64_t f = spin_lock(&pm_lock);
+        while (!requested) {
+            wq_wait_locked(&pm_wq, &pm_lock);
+            spin_take(&pm_lock);
+        }
         requested = false;
         busy = true;
-        irq_restore(f);
         enum pm_action action = wanted;
+        spin_unlock(&pm_lock, f);
         bool nap = action == PM_SLEEP || action == PM_HIBERNATE;
         if (nap) {
             kprintf("pm: %s requested\n", action == PM_SLEEP ? "sleep" : "hibernation");
             sleep_now(action == PM_HIBERNATE); /* apps keep running: they are only told the time moved */
         } else {
             kprintf("pm: %s requested%s\n", action == PM_REBOOT ? "restart" : "shutdown",
-                    forced ? "" : " (apps may keep their windows)");
+                    is_forced() ? "" : " (apps may keep their windows)");
         }
         if (!nap && close_windows()) {
-            f = irq_save();
-            stopping = true;
+            f = spin_lock(&pm_lock);
+            __atomic_store_n(&stopping, true, __ATOMIC_RELAXED);
             action = wanted;
-            irq_restore(f);
+            spin_unlock(&pm_lock, f);
             wm_notify(action == PM_REBOOT ? "Restarting" : "Shutting down",
                       action == PM_REBOOT ? "See you in a moment..." : "Good night!");
             stop_apps();
@@ -307,11 +330,14 @@ static void pm_thread(void *arg) {
             store_sync(); /* what was saved reaches its volume first */
             finish(action);
         }
-        f = irq_save();
+        f = spin_lock(&pm_lock);
         busy = false;
         /* a shutdown asked for while asleep (the power button wakes the machine) still happens */
-        if (!nap || wanted == PM_SLEEP || wanted == PM_HIBERNATE) forced = requested = false;
-        irq_restore(f);
+        if (!nap || wanted == PM_SLEEP || wanted == PM_HIBERNATE) {
+            __atomic_store_n(&forced, false, __ATOMIC_RELAXED);
+            requested = false;
+        }
+        spin_unlock(&pm_lock, f);
     }
 }
 

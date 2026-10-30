@@ -3,6 +3,7 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/ioapic.h"
+#include "arch/spin.h"
 #include "dev/acpi.h"
 #include "dev/iommu.h"
 #include "mm/vmm.h"
@@ -30,6 +31,11 @@ static unsigned nios;
    interrupt remapping comes on, goes off or is back from a sleep (ioapic_remap). */
 static uint64_t given[IOAPIC_MAX][256];
 
+/* Every chip's IOREGSEL/IOWIN pair (a register access is two writes or a write and a read) and
+   the given entries, from any CPU. Taken before the IOMMU back end's lock (rte_write calls
+   iommu_ioapic_entry under it); the IOMMU calls in with none of its locks held. */
+static struct spinlock ioapic_lock;
+
 static uint32_t rd(const struct ioapic *io, uint32_t reg) {
     mmio_write32(io->regs, reg);
     return mmio_read32(io->regs + 4);
@@ -51,10 +57,10 @@ void ioapic_init(void) {
             continue;
         }
         io->gsi_base = a[i].gsi_base;
-        uint64_t f = irq_save();
+        uint64_t f = spin_lock(&ioapic_lock);
         uint32_t ver = rd(io, REG_VER);
         if (ver == 0xFFFFFFFF) { /* nothing decodes this address */
-            irq_restore(f);
+            spin_unlock(&ioapic_lock, f);
             kprintf("ioapic: id %u at %x does not respond, ignored\n", a[i].id, a[i].addr);
             continue;
         }
@@ -74,7 +80,7 @@ void ioapic_init(void) {
             wr(io, REG_RTE(pin), RTE_MASK);
             given[nios][pin] = RTE_MASK;
         }
-        irq_restore(f);
+        spin_unlock(&ioapic_lock, f);
         kprintf("ioapic: id %u at %x, version %x, GSI %u-%u, all masked%s\n", io->id, a[i].addr, io->version,
                 io->gsi_base, io->gsi_base + io->pins - 1, kept ? " (ExtINT pin kept)" : "");
         nios++;
@@ -94,7 +100,7 @@ static struct ioapic *owner(uint32_t gsi, uint32_t *pin) {
 }
 
 /* An entry given in the plain format, as interrupt remapping wants it (dev/iommu.h): false when
-   it cannot be delivered, and the pin is masked. */
+   it cannot be delivered, and the pin is masked. ioapic_lock held. */
 static bool rte_write(struct ioapic *io, uint32_t pin, uint64_t rte) {
     given[io - ios][pin] = rte;
     if (!iommu_ioapic_entry(io->id, io->gsi_base + pin, &rte)) {
@@ -113,14 +119,14 @@ bool ioapic_route(uint32_t gsi, uint8_t vector, uint32_t dest_apic_id, bool leve
     struct ioapic *io = owner(gsi, &pin);
     if (!io || vector < 0x30 || vector == 0xFF || dest_apic_id > 0xFE || !lapic_addressable(dest_apic_id)) return false;
     uint32_t lo = vector | (level ? RTE_LEVEL : 0) | (active_low ? RTE_ACTIVELOW : 0); /* fixed, physical */
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&ioapic_lock);
     bool ok = rte_write(io, pin, lo | (uint64_t)dest_apic_id << 56);
-    irq_restore(f);
+    spin_unlock(&ioapic_lock, f);
     return ok;
 }
 
 bool ioapic_remap(void) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&ioapic_lock);
     bool ok = true;
     for (unsigned i = 0; i < nios; i++)
         for (uint32_t pin = 0; pin < ios[i].pins; pin++) {
@@ -130,7 +136,7 @@ bool ioapic_remap(void) {
                 ok = false;
             }
         }
-    irq_restore(f);
+    spin_unlock(&ioapic_lock, f);
     return ok;
 }
 
@@ -138,10 +144,10 @@ bool ioapic_mask(uint32_t gsi) {
     uint32_t pin;
     struct ioapic *io = owner(gsi, &pin);
     if (!io) return false;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&ioapic_lock);
     wr(io, REG_RTE(pin), rd(io, REG_RTE(pin)) | RTE_MASK);
     given[io - ios][pin] |= RTE_MASK;
-    irq_restore(f);
+    spin_unlock(&ioapic_lock, f);
     return true;
 }
 
@@ -170,17 +176,23 @@ uint32_t ioapic_isa_to_gsi(unsigned isa_irq, bool *level, bool *active_low) {
 static uint32_t saved_id[IOAPIC_MAX];
 
 void ioapic_suspend(void) {
+    uint64_t f = spin_lock(&ioapic_lock);
     for (unsigned i = 0; i < nios; i++) saved_id[i] = rd(&ios[i], REG_ID);
+    spin_unlock(&ioapic_lock, f);
     ioapic_mask_all(); /* the given entries are the requested routes; no source emits during unit restore */
 }
 
 void ioapic_mask_all(void) {
+    uint64_t f = spin_lock(&ioapic_lock);
     for (unsigned i = 0; i < nios; i++)
         for (uint32_t pin = 0; pin < ios[i].pins && pin < 256; pin++)
             wr(&ios[i], REG_RTE(pin), rd(&ios[i], REG_RTE(pin)) | RTE_MASK);
+    spin_unlock(&ioapic_lock, f);
 }
 
 void ioapic_resume(void) {
+    uint64_t f = spin_lock(&ioapic_lock);
     for (unsigned i = 0; i < nios; i++) wr(&ios[i], REG_ID, saved_id[i]);
+    spin_unlock(&ioapic_lock, f);
     if (!ioapic_remap()) kprintf("ioapic: an entry stays masked after sleep\n");
 }

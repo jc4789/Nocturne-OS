@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/smp.h"
+#include "arch/spin.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
 #include "mm/vmm.h"
@@ -23,6 +24,9 @@ extern uint64_t isr_stub_table[256];
 #define IRQ_SHARED 4 /* level-triggered PCI lines and the ACPI SCI can share an ISA IRQ */
 static irq_handler_t irq_handlers[16][IRQ_SHARED];
 static irq_handler_t vec_handlers[256]; /* LAPIC-delivered vectors (0x30 and up) */
+/* A driver on any CPU registers and allocates under it; isr_dispatch reads the slots without it,
+   each slot stored whole. */
+static struct spinlock vectors_lock;
 
 static void idt_set(int vec, uint64_t handler, uint8_t type, uint8_t ist) {
     idt[vec].off_lo = handler & 0xFFFF;
@@ -50,22 +54,23 @@ void idt_load(void) {
 }
 
 void irq_register(int irq, irq_handler_t h) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&vectors_lock);
     unsigned i = 0;
     while (i < IRQ_SHARED && irq_handlers[irq][i] && irq_handlers[irq][i] != h) i++;
     if (i == IRQ_SHARED) panic("idt: more than %d handlers on IRQ %d", IRQ_SHARED, irq);
-    irq_handlers[irq][i] = h;
-    irq_restore(f);
+    __atomic_store_n(&irq_handlers[irq][i], h, __ATOMIC_RELEASE);
+    spin_unlock(&vectors_lock, f);
 }
 
 void irq_unregister(int irq, irq_handler_t h) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&vectors_lock);
     for (unsigned i = 0; i < IRQ_SHARED; i++)
         if (irq_handlers[irq][i] == h) {
-            for (; i + 1 < IRQ_SHARED; i++) irq_handlers[irq][i] = irq_handlers[irq][i + 1];
-            irq_handlers[irq][IRQ_SHARED - 1] = NULL;
+            for (; i + 1 < IRQ_SHARED; i++)
+                __atomic_store_n(&irq_handlers[irq][i], irq_handlers[irq][i + 1], __ATOMIC_RELEASE);
+            __atomic_store_n(&irq_handlers[irq][IRQ_SHARED - 1], NULL, __ATOMIC_RELEASE);
         }
-    irq_restore(f);
+    spin_unlock(&vectors_lock, f);
 }
 
 /* ---- vector ownership ----
@@ -80,7 +85,7 @@ static bool vec_in_pool(unsigned v) { return v >= VEC_POOL_FIRST && v <= VEC_POO
 int irq_vector_alloc(unsigned count, unsigned align) {
     if (!align) align = 1;
     if (!count || (align & (align - 1)) || count > VEC_POOL_LAST) return -1;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&vectors_lock);
     int found = -1;
     for (unsigned base = ALIGN_UP(VEC_POOL_FIRST, align); base + count - 1 <= VEC_POOL_LAST; base += align) {
         bool free = true;
@@ -90,26 +95,28 @@ int irq_vector_alloc(unsigned count, unsigned align) {
         found = (int)base;
         break;
     }
-    irq_restore(f);
+    spin_unlock(&vectors_lock, f);
     return found;
 }
 
 void irq_vector_free(unsigned vector, unsigned count) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&vectors_lock);
     for (unsigned i = 0; i < count && vector + i < 256; i++) {
         if (!vec_in_pool(vector + i)) continue;
         vec_owned[vector + i] = false;
-        vec_handlers[vector + i] = NULL;
+        __atomic_store_n(&vec_handlers[vector + i], NULL, __ATOMIC_RELEASE);
     }
-    irq_restore(f);
+    spin_unlock(&vectors_lock, f);
 }
 
 void vector_register(int vec, irq_handler_t h) {
     if (vec < 0 || vec > 255) panic("idt: bad vector %d", vec);
+    uint64_t f = spin_lock(&vectors_lock);
     /* the same handler again (a controller re-initialising) is harmless; a different one is a collision */
     if (h && vec_handlers[vec] && vec_handlers[vec] != h) panic("idt: vector %#x registered twice", vec);
     if (h) vec_owned[vec] = true;
-    vec_handlers[vec] = h;
+    __atomic_store_n(&vec_handlers[vec], h, __ATOMIC_RELEASE);
+    spin_unlock(&vectors_lock, f);
 }
 
 /* ---- 8259 PIC ---- */
@@ -183,15 +190,27 @@ static const char *exc_names[32] = {
 
 void panic_regs(const char *what, struct regs *r);
 
-static void exception(struct regs *r, uint64_t cr2, unsigned source_cpu) {
+extern char user_copy_start[], user_copy_end[], user_copy_fault[];
+
+/* The kernel's copy of the app's memory (user_copy) touched a page that is not there yet, or
+   that it may not touch: resolved as the app's own fault would be when the copy runs with
+   interrupts on (it may sleep then), otherwise, or when it cannot be, the copy stops short. */
+static bool user_copy_fixup(struct regs *r, uint64_t cr2) {
+    if (r->rip < (uint64_t)user_copy_start || r->rip >= (uint64_t)user_copy_end || cr2 >= USER_TOP) return false;
+    if ((r->rflags & 0x200) && vmm_handle_user_fault(cr2, r->error | 4)) return true;
+    r->rip = (uint64_t)user_copy_fault;
+    return true;
+}
+
+static void exception(struct regs *r, uint64_t cr2) {
     const char *name = exc_names[r->vector];
     if (r->vector == 14) {
-        if (vmm_handle_user_fault(cr2, r->error)) return;
+        if ((r->cs & 3) == 3 ? vmm_handle_user_fault(cr2, r->error) : user_copy_fixup(r, cr2)) return;
     }
     if ((r->cs & 3) == 3) {
         struct task *t = current_task;
         kprintf("[%s] pid %d (%s) cpu%u: %s at rip=%p", r->vector == 14 ? "segfault" : "crash",
-                t->pid, t->name, source_cpu, name, (void *)r->rip);
+                t->pid, t->name, cpu_current_index(), name, (void *)r->rip);
         if (r->vector == 14) kprintf(" addr=%p err=%lx", (void *)cr2, r->error);
         /* The words at the stack top name the caller when the jump target
            itself was bad (rip == addr after a call through a stale pointer). */
@@ -215,6 +234,7 @@ static void exception(struct regs *r, uint64_t cr2, unsigned source_cpu) {
 
 extern char wrmsr_checked_write[], wrmsr_checked_refused[];
 
+/* Every CPU's traps, faults, system calls and interrupts, on the stack of the task it runs. */
 void isr_dispatch(struct regs *r) {
     uint64_t v = r->vector;
     if (v == 13 && !(r->cs & 3) && r->rip == (uint64_t)wrmsr_checked_write) { /* cpu.h: wrmsr_checked */
@@ -222,25 +242,15 @@ void isr_dispatch(struct regs *r) {
         return;
     }
     if (v == VEC_TLB_SHOOTDOWN) {
-        /* Any AP state: user (returns straight to ring 3), idle HLT or a job. */
         vmm_tlb_ipi();
         lapic_eoi();
         return;
     }
-    if (cpu_is_runner()) {
-        sched_ap_interrupt(r);
-        return;
-    }
-    /* pure workerはBSPのtask/entropy/IRQ handlerを実行しない。 */
-    if (cpu_is_worker()) {
-        if (v < 32) cpu_worker_fault(r);
-        if (v != 0xFF) lapic_eoi();
-        return;
-    }
-    if (tick_stopped) timer_wake(); /* the BSP was idle without its tick: uptime_ms catches up first */
+    if (v == 2) smp_panic_nmi(); /* another CPU's panic stops this one; any other NMI is reported */
+    timer_wake(); /* a CPU idle without its tick: uptime_ms catches up first */
     if (v < 32) {
-        exception(r, r->vector == 14 ? read_cr2() : 0, 0);
-    } else if (v < 48) {
+        exception(r, v == 14 ? read_cr2() : 0);
+    } else if (v < 48) { /* the 8259's lines, which reach CPU 0 only */
         int irq = (int)v - 32;
         if (irq == 7 && !(pic_isr(0x20) & 0x80)) return;
         if (irq == 15 && !(pic_isr(0xA0) & 0x80)) {
@@ -249,22 +259,18 @@ void isr_dispatch(struct regs *r) {
         }
         entropy_add(rdtsc() ^ (uint64_t)irq << 56);
         pic_eoi(irq);
-        for (unsigned i = 0; i < IRQ_SHARED && irq_handlers[irq][i]; i++) irq_handlers[irq][i](r);
+        for (unsigned i = 0; i < IRQ_SHARED; i++) {
+            irq_handler_t h = __atomic_load_n(&irq_handlers[irq][i], __ATOMIC_ACQUIRE);
+            if (!h) break;
+            h(r);
+        }
     } else if (v == 0x80) {
         syscall_dispatch(r);
     } else if (v < 0xFF) {
         entropy_add(rdtsc() ^ v << 56);
         lapic_eoi();
-        if (vec_handlers[v]) vec_handlers[v](r);
+        irq_handler_t h = __atomic_load_n(&vec_handlers[v], __ATOMIC_ACQUIRE);
+        if (h) h(r);
     }
     if ((r->cs & 3) == 3) sched_user_return(r);
-}
-
-void isr_dispatch_remote(struct regs *r, uint64_t cr2) {
-    cpu_require_bsp();
-    ASSERT((r->cs & 3) == 3);
-    if (r->vector < 32) exception(r, cr2, current_task->trap_cpu);
-    else if (r->vector == 0x80) syscall_dispatch(r);
-    else panic("smp: invalid remote user trap %lu", r->vector);
-    sched_user_return(r);
 }

@@ -3,16 +3,24 @@
    group of functions a claim isolates together (ACS on the way, PCI Express Base specification
    6.12 and 7.7.7), the firmware's descriptions the back ends found, and the calls the rest of
    the kernel makes, passed to the back end that found its units. The address and ID rules are
-   the PCI Express Base specification's (requester IDs, ACS) and the bridge specifications'. */
+   the PCI Express Base specification's (requester IDs, ACS) and the bridge specifications'.
+   Any CPU calls in. Domains come and go one at a time under attach_mutex (attach, block, free,
+   the retried blocks), which comes after dev/pciuser.c's claim_mutex and before the back end's
+   lock; the lists of them are under domains_lock, taken alone; a domain's page tables change
+   under its own mutex (iommu_map, iommu_unmap), before the back end's lock. The power calls
+   (iommu_init on CPU 0 at boot, iommu_resume and iommu_shutdown with every other CPU stopped)
+   change hw, restore_failed and lost_in_sleep, which the others only read. */
 #include "kernel.h"
 #include "abi.h"
 #include "arch/cpu.h"
 #include "arch/ioapic.h"
+#include "arch/spin.h"
 #include "dev/acpi.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
+#include "sys/sched.h"
 
 #define PTE_ADDR 0x000FFFFFFFFFF000ull
 
@@ -21,9 +29,22 @@ static bool restore_failed; /* never downgrade an active domain after an unconfi
 /* the units did not come back from a sleep (iommu_resume): no claim and no other sleep until a
    restart, however far iommu_init's way down took them */
 static bool lost_in_sleep;
-/* attached: the claims' domains; held: blocked without the units' confirmation (iommu_block) */
+/* attached: the claims' domains; held: blocked without the units' confirmation (iommu_block).
+   Both lists and domain_used are under domains_lock; they change with attach_mutex held too. */
 static struct iommu_domain *attached, *held;
 static uint8_t domain_used[65536 / 8];
+static struct spinlock domains_lock;
+/* attach, block and free, and each domain's written, blocked and unwanted and its members'
+   iommu_blocked: the back end's attach and block wait for the units, so this sleeps. */
+static struct mutex attach_mutex;
+
+/* A domain as this part allocates it: its page tables change under map (iommu_map, iommu_unmap),
+   which may allocate a table or wait for the units' invalidation. */
+struct domain_rec {
+    struct iommu_domain dom; /* first: the back ends see this */
+    struct mutex map;
+};
+static struct mutex *map_lock(struct iommu_domain *dom) { return &((struct domain_rec *)dom)->map; }
 
 /* ---- what the back ends found in the firmware's tables ---- */
 static struct reserved {
@@ -132,7 +153,9 @@ void iommu_init(void) {
     domain_used[0] |= 3; /* 0 is never used, 1 is the back end's */
     /* ExtINT may still be the firmware's virtual-wire PIC path. Prevent the PIC from
        emitting it until both the units and the IOAPIC route have changed format.
-       Mask-only restore preserves pending PIC requests, unlike PIC reinitialization. */
+       Mask-only restore preserves pending PIC requests, unlike PIC reinitialization. This runs
+       on CPU 0 (the boot task), where the PIC's and every device's interrupts arrive: with its
+       interrupts off none is taken half way. */
     uint64_t irq = irq_save();
     uint16_t pic = pic_mask_all();
     ioapic_mask_all();
@@ -161,27 +184,36 @@ bool iommu_power_ready(void) { return !restore_failed && !lost_in_sleep; }
 uint64_t iommu_deadline(unsigned ms) { return rdtsc() + tsc_hz / 1000 * ms; }
 bool iommu_expired(uint64_t deadline) { return !tsc_hz || (int64_t)(rdtsc() - deadline) >= 0; }
 
+/* The back ends' fault handlers (CPU 0) and their waits (any CPU) count against one second's
+   limit, under report_lock, taken last. */
 bool iommu_fault_report(void) {
+    static struct spinlock report_lock;
     static uint64_t second;
     static unsigned shown;
     uint64_t now = uptime_ms() / 1000;
+    uint64_t f = spin_lock(&report_lock);
     if (now != second) {
         second = now;
         shown = 0;
     }
-    if (shown == 8) kprintf("iommu: more blocked requests this second are not shown\n");
-    return shown++ < 8;
+    bool more = shown == 8, show = shown < 8;
+    if (shown <= 8) shown++;
+    spin_unlock(&report_lock, f);
+    if (more) kprintf("iommu: more blocked requests this second are not shown\n");
+    return show;
 }
 
 void iommu_cache_flush(const volatile void *p, size_t bytes) {
-    static unsigned line;
-    static bool known;
-    if (!known) {
+    /* the line size + 1 once read (CPUID.01H:EBX[15:8], eight-byte units), by any CPU: the same */
+    static unsigned known;
+    unsigned line = __atomic_load_n(&known, __ATOMIC_RELAXED);
+    if (!line) {
         uint32_t a, b, c, d;
         cpuid(1, 0, &a, &b, &c, &d);
-        if (d & (1u << 19)) line = ((b >> 8) & 0xFF) * 8; /* CPUID.01H:EBX[15:8], eight-byte units */
-        known = true;
+        line = (d & (1u << 19) ? ((b >> 8) & 0xFF) * 8 : 0) + 1;
+        __atomic_store_n(&known, line, __ATOMIC_RELAXED);
     }
+    line--;
     if (!line) { __asm__ volatile("wbinvd" ::: "memory"); return; }
     uintptr_t at = (uintptr_t)p / line * line, end = (uintptr_t)p + bytes;
     for (; at < end; at += line) __asm__ volatile("clflush (%0)" ::"r"(at) : "memory");
@@ -306,14 +338,27 @@ static bool dma_pages_allowed(const struct iommu_domain *dom, const uint64_t *fr
 
 bool iommu_map(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count) {
     if (!dma_pages_allowed(dom, frames, base, count)) return false;
-    return map_range(dom, frames, base, count, IOMMU_READ | IOMMU_WRITE) && (!dom->d || hw->flush(dom, false));
+    mutex_lock(map_lock(dom));
+    bool ok = map_range(dom, frames, base, count, IOMMU_READ | IOMMU_WRITE) && (!dom->d || hw->flush(dom, false));
+    mutex_unlock(map_lock(dom));
+    return ok;
 }
+
+static bool unmap_range(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count);
 
 bool iommu_unmap(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count) {
     ASSERT(dom->leaf_levels == 1);
     /* map_range preflights the complete input before changing any PTE. Its rejected input must
        not be truncated here either, but it has no mapping to invalidate or DMA pages to pin. */
     if (!pages_fit(dom, frames, base, count) || !dma_pages_allowed(dom, frames, base, count)) return true;
+    mutex_lock(map_lock(dom));
+    bool ok = unmap_range(dom, frames, base, count);
+    mutex_unlock(map_lock(dom));
+    return ok;
+}
+
+/* map_lock held. */
+static bool unmap_range(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count) {
     for (size_t i = 0; i < count; i++) {
         uint64_t pa = frames ? frames[i] : base + i * PAGE_SIZE;
         volatile uint64_t *e = entry(dom, pa, 1, false);
@@ -331,9 +376,10 @@ bool iommu_unmap(struct iommu_domain *dom, const uint64_t *frames, uint64_t base
 }
 
 static struct iommu_domain *domain_alloc(uint16_t id, unsigned levels, unsigned leaf_levels) {
-    struct iommu_domain *dom = kzalloc(sizeof *dom);
+    struct domain_rec *rec = kzalloc(sizeof *rec);
+    struct iommu_domain *dom = rec ? &rec->dom : NULL;
     if (dom && !(dom->root = table_new())) {
-        kfree(dom);
+        kfree(rec);
         dom = NULL;
     }
     if (!dom) return NULL;
@@ -347,10 +393,14 @@ struct iommu_domain *iommu_domain_new(unsigned levels, unsigned leaf_levels) {
     return domain_alloc(1, levels, leaf_levels);
 }
 
+/* The domain stays while its claim does: the callers ask for a claim's own function. */
 struct iommu_domain *iommu_domain_of(const struct pci_device *d) {
-    for (struct iommu_domain *dom = attached; dom; dom = dom->next)
-        if (dom->d == d) return dom;
-    return NULL;
+    uint64_t f = spin_lock(&domains_lock);
+    struct iommu_domain *found = NULL;
+    for (struct iommu_domain *dom = attached; dom && !found; dom = dom->next)
+        if (dom->d == d) found = dom;
+    spin_unlock(&domains_lock, f);
+    return found;
 }
 
 bool iommu_member(const struct iommu_domain *dom, const struct pci_device *d) {
@@ -360,11 +410,12 @@ bool iommu_member(const struct iommu_domain *dom, const struct pci_device *d) {
 }
 
 bool iommu_in_use(const struct pci_device *d) {
-    for (struct iommu_domain *dom = attached; dom; dom = dom->next)
-        if (iommu_member(dom, d)) return true;
-    for (struct iommu_domain *dom = held; dom; dom = dom->next)
-        if (iommu_member(dom, d)) return true;
-    return false;
+    uint64_t f = spin_lock(&domains_lock);
+    bool in = false;
+    for (struct iommu_domain *dom = attached; dom && !in; dom = dom->next) in = iommu_member(dom, d);
+    for (struct iommu_domain *dom = held; dom && !in; dom = dom->next) in = iommu_member(dom, d);
+    spin_unlock(&domains_lock, f);
+    return in;
 }
 
 /* ---- requester IDs ---- */
@@ -724,24 +775,35 @@ static int reserved_map(struct iommu_domain *dom) {
 
 /* ---- domains of claimed functions ---- */
 static uint16_t domain_id_new(void) {
-    for (unsigned id = 2; id < hw->domains; id++)
+    uint64_t f = spin_lock(&domains_lock);
+    uint16_t found = 0;
+    for (unsigned id = 2; id < hw->domains && !found; id++)
         if (!(domain_used[id / 8] & 1u << (id % 8))) {
             domain_used[id / 8] |= 1u << (id % 8);
-            return (uint16_t)id;
+            found = (uint16_t)id;
         }
-    return 0;
+    spin_unlock(&domains_lock, f);
+    return found;
 }
 
+static void domain_id_free(uint16_t id) {
+    uint64_t f = spin_lock(&domains_lock);
+    domain_used[id / 8] &= ~(1u << (id % 8));
+    spin_unlock(&domains_lock, f);
+}
+
+/* On no list, no unit walking its tables any more. */
 static void domain_release(struct iommu_domain *dom) {
     tables_free(dom->root, dom->levels);
     if (dom->irt) pmm_free(dom->irt);
-    domain_used[dom->id / 8] &= ~(1u << (dom->id % 8));
+    if (dom->id != 1) domain_id_free(dom->id); /* 1 is the back end's own, never given out */
     kfree(dom->members);
     kfree(dom->ids);
-    kfree(dom);
+    kfree((struct domain_rec *)dom);
 }
 
-static void unlink(struct iommu_domain **list, struct iommu_domain *dom) {
+/* domains_lock held. */
+static void list_remove(struct iommu_domain **list, struct iommu_domain *dom) {
     for (struct iommu_domain **p = list; *p; p = &(*p)->next)
         if (*p == dom) {
             *p = dom->next;
@@ -749,14 +811,31 @@ static void unlink(struct iommu_domain **list, struct iommu_domain *dom) {
         }
 }
 
+static void unlink(struct iommu_domain **list, struct iommu_domain *dom) {
+    uint64_t f = spin_lock(&domains_lock);
+    list_remove(list, dom);
+    spin_unlock(&domains_lock, f);
+}
+
+static void push(struct iommu_domain **list, struct iommu_domain *dom) {
+    uint64_t f = spin_lock(&domains_lock);
+    dom->next = *list;
+    *list = dom;
+    spin_unlock(&domains_lock, f);
+}
+
 /* Whether the units drop what dom's functions send (pci_device.iommu_blocked). */
 static void members_blocked(const struct iommu_domain *dom, bool blocked) {
     for (unsigned i = 0; i < dom->nmembers; i++) dom->members[i]->iommu_blocked = blocked;
 }
 
-/* The blocks not confirmed yet, tried again: a group comes free once one is. */
+/* The blocks not confirmed yet, tried again: a group comes free once one is. attach_mutex held,
+   so only this changes the held list meanwhile. */
 static void held_retry(void) {
-    for (struct iommu_domain *dom = held, *next; dom; dom = next) {
+    uint64_t f = spin_lock(&domains_lock);
+    struct iommu_domain *dom = held;
+    spin_unlock(&domains_lock, f);
+    for (struct iommu_domain *next; dom; dom = next) {
         next = dom->next;
         if (!hw->block(dom)) continue;
         dom->blocked = true;
@@ -783,7 +862,16 @@ static int unisolated(const struct pci_device *d, const struct fns *g, int r) {
     return r;
 }
 
+static int attach(struct pci_device *d, struct iommu_domain **out, struct pci_device **resetting);
+
 int iommu_attach(struct pci_device *d, struct iommu_domain **out, struct pci_device **resetting) {
+    mutex_lock(&attach_mutex);
+    int r = attach(d, out, resetting);
+    mutex_unlock(&attach_mutex);
+    return r;
+}
+
+static int attach(struct pci_device *d, struct iommu_domain **out, struct pci_device **resetting) {
     *out = NULL;
     *resetting = NULL;
     if (restore_failed) return -N_ERR_IO;
@@ -820,7 +908,7 @@ int iommu_attach(struct pci_device *d, struct iommu_domain **out, struct pci_dev
         r = -N_ERR_NO_MEMORY;
         uint16_t id = domain_id_new();
         if (!id) r = -N_ERR_BUSY;
-        else if (!(dom = domain_alloc(id, hw->levels, 1))) domain_used[id / 8] &= ~(1u << (id % 8));
+        else if (!(dom = domain_alloc(id, hw->levels, 1))) domain_id_free(id);
         else {
             dom->d = d;
             dom->members = g.at;
@@ -852,8 +940,7 @@ int iommu_attach(struct pci_device *d, struct iommu_domain **out, struct pci_dev
     kfree(ids.at);
     if (!dom) return r;
     members_blocked(dom, false);
-    dom->next = attached;
-    attached = dom;
+    push(&attached, dom);
     kprintf("iommu: %02x:%02x.%u isolated in domain %u\n", d->bus, d->dev, d->func, dom->id);
     for (unsigned i = 1; i < dom->nmembers; i++)
         kprintf("iommu: %02x:%02x.%u is in its group: its DMA reaches only that domain too\n", dom->members[i]->bus,
@@ -863,26 +950,30 @@ int iommu_attach(struct pci_device *d, struct iommu_domain **out, struct pci_dev
 }
 
 bool iommu_block(struct iommu_domain *dom) {
-    unlink(&attached, dom);
-    unlink(&held, dom);
+    mutex_lock(&attach_mutex);
+    uint64_t f = spin_lock(&domains_lock);
+    list_remove(&attached, dom);
+    list_remove(&held, dom);
+    spin_unlock(&domains_lock, f);
     if (!dom->blocked) dom->blocked = hw->block(dom);
     if (dom->blocked) members_blocked(dom, true);
     else {
         kprintf("iommu: %02x:%02x.%u: blocking it was not confirmed; its group stays out of every claim until it "
                 "is\n", dom->d->bus, dom->d->dev, dom->d->func);
-        dom->next = held;
-        held = dom;
+        push(&held, dom);
     }
-    return dom->blocked;
+    bool blocked = dom->blocked;
+    mutex_unlock(&attach_mutex);
+    return blocked;
 }
 
 void iommu_domain_free(struct iommu_domain *dom) {
+    mutex_lock(&attach_mutex);
     /* a unit may still walk the tables of a group it was not seen to block */
-    if (dom->written && !dom->blocked && !iommu_block(dom)) {
-        dom->unwanted = true;
-        return;
-    }
-    domain_release(dom);
+    bool keep = dom->written && !dom->blocked && !iommu_block(dom);
+    if (keep) dom->unwanted = true;
+    mutex_unlock(&attach_mutex);
+    if (!keep) domain_release(dom);
 }
 
 /* ---- interrupts and power ---- */

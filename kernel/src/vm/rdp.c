@@ -770,10 +770,10 @@ static int push_updates(struct rdp *c) {
 
 /* ---- input ---- */
 
-static void key(bool extended, bool extended1, bool release, uint8_t code) {
-    if (extended) input_scancode(0xE0);
-    if (extended1) input_scancode(0xE1);
-    input_scancode((uint8_t)((code & 0x7F) | (release ? 0x80 : 0)));
+/* One key in one call, its 0xE0 with it. A key after 0xE1 (Pause) goes as the plain key: set 1
+   has nothing else for it (dev/input.c). */
+static void key(bool extended, bool release, uint8_t code) {
+    input_key_set1((uint8_t)((code & 0x7F) | (release ? 0x80 : 0)), extended);
 }
 
 static void mouse(struct rdp *c, uint16_t flags, int x, int y, bool extended) {
@@ -819,7 +819,7 @@ static void fastpath_input(struct rdp *c, int len) {
         uint8_t flags = h & 0x1F;
         switch (h >> 5) {
         case 0: /* scancode */
-            key(flags & 0x02, flags & 0x04, flags & 0x01, r8(&r));
+            key(flags & 0x02, flags & 0x01, r8(&r)); /* 0x04: after 0xE1 */
             break;
         case 1: /* mouse */
         case 2: { /* extended mouse buttons */
@@ -853,7 +853,7 @@ static void slowpath_input(struct rdp *c, struct rbuf *r) {
         uint16_t a = r16(r), b = r16(r), d = r16(r);
         if (r->err) return;
         switch (type) {
-        case 0x0004: key(a & 0x0100, a & 0x0200, a & 0x8000, (uint8_t)b); break;
+        case 0x0004: key(a & 0x0100, a & 0x8000, (uint8_t)b); break; /* 0x0200: after 0xE1 */
         case 0x0005: input_unicode(b, !(a & 0x8000)); break;
         case 0x8001: mouse(c, a, b, d, false); break;
         case 0x8002: mouse(c, a, b, d, true); break;

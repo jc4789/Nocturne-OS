@@ -4,6 +4,7 @@
 #include "kernel.h"
 #include "limine.h"
 #include "arch/cpu.h"
+#include "arch/spin.h"
 #include "dev/acpi.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
@@ -278,16 +279,18 @@ const struct acpi_nmi *acpi_nmis(unsigned *count) { *count = nnmis; return nmis;
 const struct acpi_ecam *acpi_ecams(unsigned *count) { *count = necams; return ecams; }
 
 /* ---- AML: uACPI (third_party/uacpi) on Nocturne's own kernel services ----
-   Everything here runs on the BSP, like every other kernel thread. uACPI's locks and events are
-   counting semaphores on wait queues; its deferred work (GPE methods, Notify) runs in the "acpi"
-   kernel thread; the SCI is an ISA interrupt through the 8259 like the other legacy lines. */
+   uACPI is called from any CPU: the "acpi" kernel thread runs its deferred work (GPE methods,
+   Notify), and threads that evaluate a method (dev/pciuser.c) or change the power state call in
+   where they run. Its locks and events are counting semaphores, each a count under its own
+   spinlock with a wait queue; its spinlocks are the kernel's (arch/spin.h); the SCI is an ISA
+   interrupt through the 8259 like the other legacy lines, so it runs on CPU 0. */
 static bool aml_ready;
 
-/* The boot task becomes the idle task: it may not block, so it spins (letting other threads run)
-   where a thread would sleep. While frozen (acpi_freeze) nothing blocks and nothing else runs:
-   the devices are down or not yet back. */
+/* An idle task (the boot task becomes CPU 0's) may not block, so it spins (letting other threads
+   run) where a thread would sleep. While frozen (acpi_freeze) nothing blocks and nothing else
+   runs: every other CPU is parked, and the devices are down or not yet back. */
 static volatile bool frozen;
-static bool may_block(void) { return !frozen && current_task->pid != 0; }
+static bool may_block(void) { return !frozen && !current_task->is_idle; }
 
 static uint64_t ns_now(void) {
     if (!tsc_hz) return uptime_ms() * 1000000;
@@ -333,17 +336,15 @@ void uacpi_kernel_pci_device_close(uacpi_handle h) { kfree(h); }
 /* None goes to a function an FLR is under way on (dev/pci.h), which may discard it: a read gets
    all-ones, as from a function that does not answer, and a write is dropped. */
 static uint32_t cfg_read(struct pci_handle *h, uacpi_size off) {
-    if (pci_config_blocked(h->bus, h->dev, h->fn)) return 0xFFFFFFFFu;
-    return pci_read32(h->bus, h->dev, h->fn, off & ~3u);
+    uint32_t v;
+    pci_config_firmware_read(h->bus, h->dev, h->fn, (uint16_t)off, &v);
+    return v;
 }
 
 /* Writes as wide as asked: a read-modify-write of the dword would write back the registers beside
    it, and status registers clear their bits when written with 1. */
 static void cfg_write(struct pci_handle *h, uacpi_size off, uint32_t v, unsigned bytes) {
-    if (pci_config_blocked(h->bus, h->dev, h->fn)) return;
-    if (bytes == 1) pci_write8(h->bus, h->dev, h->fn, off, (uint8_t)v);
-    else if (bytes == 2) pci_write16(h->bus, h->dev, h->fn, off, (uint16_t)v);
-    else pci_write32(h->bus, h->dev, h->fn, off & ~3u, v);
+    pci_config_firmware_write(h->bus, h->dev, h->fn, (uint16_t)off, v, bytes);
 }
 
 uacpi_status uacpi_kernel_pci_read8(uacpi_handle h, uacpi_size off, uacpi_u8 *v) {
@@ -399,7 +400,10 @@ void uacpi_kernel_sleep(uacpi_u64 ms) {
 /* Frozen, a lock or event nobody gives would hang the machine: after this long its owner may run. */
 #define FROZEN_WAIT_MS 2000
 
+/* units under lock, which a giver takes in any context (interrupt handlers, under uACPI's
+   spinlocks) and which comes before wq's own lock. */
 struct sem {
+    struct spinlock lock;
     uint32_t units;
     struct wait_queue wq;
 };
@@ -414,47 +418,50 @@ void uacpi_kernel_free_semaphore(uacpi_handle s) { kfree(s); }
 uacpi_status uacpi_kernel_wait_for_semaphore(uacpi_handle h, uacpi_u16 timeout) {
     struct sem *s = h;
     uint64_t start = uptime_ms(), end = start + timeout;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&s->lock);
     while (!s->units) {
         uint64_t now = uptime_ms();
         if (timeout != 0xFFFF && now >= end) {
-            irq_restore(f);
+            spin_unlock(&s->lock, f);
             return UACPI_STATUS_TIMEOUT;
         }
         if (may_block()) {
-            if (timeout == 0xFFFF) wq_wait(&s->wq);
-            else wq_wait_timeout(&s->wq, end - now);
+            /* a giver on another CPU takes s->lock to give the unit, and finds this task enrolled */
+            if (timeout == 0xFFFF) wq_wait_locked(&s->wq, &s->lock);
+            else wq_wait_locked_timeout(&s->wq, &s->lock, end - now);
         } else if (frozen && (timeout != 0xFFFF || now - start < FROZEN_WAIT_MS)) {
             /* only an interrupt can give the unit now, and only where the caller allows them: with
                the devices stopped (machine_sleep's interrupts-off part) none is let in */
+            spin_give(&s->lock);
             if (f & (1u << 9)) sti();
             pause();
             cli();
         } else {
             static bool told;
-            if (frozen && !told) {
-                told = true;
+            spin_give(&s->lock);
+            if (frozen && !__atomic_exchange_n(&told, true, __ATOMIC_RELAXED))
                 kprintf("acpi: a lock is held across sleep, other threads run until it is given\n");
-            }
-            sti(); /* the boot task: let interrupts and other threads give the unit */
+            sti(); /* an idle task: let interrupts and other threads give the unit */
             schedule();
             cli();
         }
+        spin_take(&s->lock);
     }
     s->units--;
-    irq_restore(f);
+    spin_unlock(&s->lock, f);
     return UACPI_STATUS_OK;
 }
 
 void uacpi_kernel_signal_semaphore(uacpi_handle h) {
     struct sem *s = h;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&s->lock);
     s->units++;
     wq_wake_all(&s->wq);
-    irq_restore(f);
+    spin_unlock(&s->lock, f);
 }
 
 uacpi_thread_id uacpi_kernel_get_thread_id(void) { return current_task; }
+/* This CPU's interrupts only, as uACPI asks: its state across CPUs is under its spinlocks. */
 uacpi_interrupt_state uacpi_kernel_disable_interrupts(void) { return irq_save(); }
 void uacpi_kernel_restore_interrupts(uacpi_interrupt_state s) { irq_restore(s); }
 
@@ -465,21 +472,33 @@ uacpi_status uacpi_kernel_handle_firmware_request(uacpi_firmware_request *r) {
     return UACPI_STATUS_OK;
 }
 
-/* The SCI is the only interrupt uACPI installs. */
+/* The SCI is the only interrupt uACPI installs. It runs on CPU 0; sci_running counts the
+   handlers under way there, which uninstalling and uacpi_kernel_wait_for_work_completion, on
+   any CPU, wait out. */
 static uacpi_interrupt_handler sci_handler;
 static uacpi_handle sci_ctx;
 static int sci_irq = -1;
+static unsigned sci_running;
 
 static void sci_entry(struct regs *r) {
-    if (sci_handler) sci_handler(sci_ctx);
+    /* counted before the handler is read: an uninstall that saw none running then has its NULL
+       read here (both sequentially consistent) */
+    __atomic_fetch_add(&sci_running, 1, __ATOMIC_SEQ_CST);
+    uacpi_interrupt_handler h = __atomic_load_n(&sci_handler, __ATOMIC_SEQ_CST);
+    if (h) h(sci_ctx);
+    __atomic_fetch_sub(&sci_running, 1, __ATOMIC_RELEASE);
+}
+
+static void sci_wait_idle(void) {
+    while (__atomic_load_n(&sci_running, __ATOMIC_SEQ_CST)) pause();
 }
 
 uacpi_status uacpi_kernel_install_interrupt_handler(uacpi_u32 irq, uacpi_interrupt_handler h, uacpi_handle ctx,
                                                     uacpi_handle *out) {
     if (irq >= 16 || sci_handler) return UACPI_STATUS_UNIMPLEMENTED;
-    sci_handler = h;
     sci_ctx = ctx;
     sci_irq = (int)irq;
+    __atomic_store_n(&sci_handler, h, __ATOMIC_SEQ_CST);
     irq_register(sci_irq, sci_entry);
     pic_unmask(sci_irq);
     *out = &sci_irq;
@@ -489,32 +508,28 @@ uacpi_status uacpi_kernel_install_interrupt_handler(uacpi_u32 irq, uacpi_interru
 uacpi_status uacpi_kernel_uninstall_interrupt_handler(uacpi_interrupt_handler h, uacpi_handle irq) {
     if (h != sci_handler) return UACPI_STATUS_INVALID_ARGUMENT;
     irq_unregister(sci_irq, sci_entry);
-    sci_handler = NULL;
+    __atomic_store_n(&sci_handler, NULL, __ATOMIC_SEQ_CST);
+    sci_wait_idle(); /* ctx may be freed once this returns */
     return UACPI_STATUS_OK;
 }
 
-struct spin { volatile uint32_t held; };
-uacpi_handle uacpi_kernel_create_spinlock(void) { return kzalloc(sizeof(struct spin)); }
+/* uACPI's spinlocks are the kernel's: taken with this CPU's interrupts off, and while waiting
+   for one a CPU answers TLB shootdowns (arch/spin.h). */
+uacpi_handle uacpi_kernel_create_spinlock(void) { return kzalloc(sizeof(struct spinlock)); }
 void uacpi_kernel_free_spinlock(uacpi_handle h) { kfree(h); }
-uacpi_cpu_flags uacpi_kernel_lock_spinlock(uacpi_handle h) {
-    struct spin *l = h;
-    uint64_t f = irq_save();
-    while (__atomic_exchange_n(&l->held, 1, __ATOMIC_ACQUIRE)) pause();
-    return f;
-}
-void uacpi_kernel_unlock_spinlock(uacpi_handle h, uacpi_cpu_flags f) {
-    struct spin *l = h;
-    __atomic_store_n(&l->held, 0, __ATOMIC_RELEASE);
-    irq_restore(f);
-}
+uacpi_cpu_flags uacpi_kernel_lock_spinlock(uacpi_handle h) { return spin_lock(h); }
+void uacpi_kernel_unlock_spinlock(uacpi_handle h, uacpi_cpu_flags f) { spin_unlock(h, f); }
 
-/* Deferred work: one FIFO, run in order by the "acpi" thread (on the BSP, CPU0, as GPE methods
-   should be). `unfinished` counts queued plus running work for wait_for_work_completion. */
+/* Deferred work: one FIFO, run in order by the "acpi" thread, on whichever CPU it runs. uACPI asks
+   for GPE methods on CPU 0 (firmware bugs around SMIs): the scheduler has no way yet to keep a
+   thread there. `unfinished` counts queued plus running work for wait_for_work_completion. The
+   list and the count are under work_lock, which schedule_work takes in interrupt context too. */
 struct work {
     uacpi_work_handler fn;
     uacpi_handle ctx;
     struct work *next;
 };
+static struct spinlock work_lock;
 static struct work *work_head, *work_tail;
 static unsigned unfinished;
 static struct wait_queue work_wq, done_wq;
@@ -524,7 +539,7 @@ void uacpi_kernel_free_work_item(uacpi_handle w) { kfree(w); }
 
 void uacpi_kernel_schedule_work(uacpi_work_type type, uacpi_handle item, uacpi_work_handler fn, uacpi_handle ctx) {
     struct work *w = item;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&work_lock);
     w->fn = fn;
     w->ctx = ctx;
     w->next = NULL;
@@ -533,37 +548,48 @@ void uacpi_kernel_schedule_work(uacpi_work_type type, uacpi_handle item, uacpi_w
     work_tail = w;
     unfinished++;
     wq_wake_all(&work_wq);
-    irq_restore(f);
+    spin_unlock(&work_lock, f);
 }
 
 uacpi_status uacpi_kernel_wait_for_work_completion(void) {
-    /* interrupt handlers run to completion with interrupts off on this CPU: none is in flight here.
-       Frozen, the worker was idle when the freeze began (acpi_freeze) and cannot run: what is queued
-       since waits for the thaw. */
+    /* Frozen, the worker was idle when the freeze began (acpi_freeze) and cannot run: what is
+       queued since waits for the thaw. Otherwise the SCI handler under way on CPU 0 first (it may
+       still queue work), then the work. */
     if (frozen) return UACPI_STATUS_OK;
-    uint64_t f = irq_save();
+    sci_wait_idle();
+    uint64_t f = spin_lock(&work_lock);
     while (unfinished) {
-        if (may_block()) wq_wait(&done_wq);
-        else { sti(); schedule(); cli(); }
+        if (may_block()) {
+            wq_wait_locked(&done_wq, &work_lock);
+        } else {
+            spin_give(&work_lock);
+            sti();
+            schedule();
+            cli();
+        }
+        spin_take(&work_lock);
     }
-    irq_restore(f);
+    spin_unlock(&work_lock, f);
     return UACPI_STATUS_OK;
 }
 
 static void acpi_worker(void *arg) {
     for (;;) {
-        uint64_t f = irq_save();
-        while (!work_head) wq_wait(&work_wq);
+        uint64_t f = spin_lock(&work_lock);
+        while (!work_head) {
+            wq_wait_locked(&work_wq, &work_lock);
+            spin_take(&work_lock);
+        }
         struct work *w = work_head;
         work_head = w->next;
         if (!work_head) work_tail = NULL;
         uacpi_work_handler fn = w->fn; /* the item may be reused or freed by the handler */
         uacpi_handle ctx = w->ctx;
-        irq_restore(f);
+        spin_unlock(&work_lock, f);
         fn(ctx);
-        f = irq_save();
+        f = spin_lock(&work_lock);
         if (!--unfinished) wq_wake_all(&done_wq);
-        irq_restore(f);
+        spin_unlock(&work_lock, f);
     }
 }
 

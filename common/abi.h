@@ -632,7 +632,6 @@ struct n_dns_result { uint32_t version, status, count, ttl; };
 struct n_netstats {
     uint64_t rx_dropped, rx_invalid, rx_budget_yields;
     uint64_t rx_completion_pending, rx_completion_retries, rx_completion_cancelled, rx_ring_high_water;
-    uint64_t ap_send_bytes[16], ap_recv_bytes[16], ap_calls[16], ap_fallbacks[16];
 };
 /* SYS_NET_TEST: simulated loss and reordering on the calling process's TCP connections (for tests),
    in per mille of the segments that carry data; all zero turns it off. */

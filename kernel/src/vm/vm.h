@@ -21,7 +21,7 @@ enum vm_machine {
     VM_OTHER,      /* a hypervisor this code does not know: its devices are found by their identity */
 };
 
-/* boot.c, once on the BSP before anything asks: the CPUID hypervisor bit and signature, and the
+/* boot.c, once on CPU 0 before anything asks: the CPUID hypervisor bit and signature, and the
    ACPI firmware's OEM ID. */
 void vm_detect(void);
 enum vm_machine vm_machine(void);
@@ -33,7 +33,7 @@ static inline bool vm_hosted(void) { return vm_machine() != VM_NONE; }
 uint64_t vm_timer_hz(uint64_t *tsc_hz);
 /* The hypervisor's reference clock (100 ns units), false without one. */
 bool vm_clock_read(uint64_t *units_100ns);
-/* Its reference page, set up on the BSP at the first call; 0 without one. */
+/* Its reference page, set up at the first call (from any CPU); 0 without one. */
 uint64_t vm_clock_page(void);
 /* The hypervisor keeps the clock: programs get its reference page, not the TSC itself. */
 bool vm_clock_owned(void);

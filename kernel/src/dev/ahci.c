@@ -97,9 +97,12 @@ struct port {
     bool lba48, cache; /* 48-bit commands; a write cache that is on */
     bool live; /* set up: commands may be given. Cleared by a command that went wrong and by a sleep:
                   the next command sets the port up again first */
-    struct mutex lock;
+    struct mutex lock; /* one command at a time, from any CPU: the slot, the bounce buffer, live */
+    /* The interrupt handler (CPU 0) and the command waiting on another CPU: it adds to events and
+       counts kicks up, then wakes wq. A waiter reads kicks before it looks at the port and sleeps
+       only while kicks still reads that (wq_wait_unless). */
     struct wait_queue wq;
-    volatile bool kick;
+    uint64_t kicks;
     uint32_t events; /* PxIS bits the interrupt handler cleared since the command began */
 };
 
@@ -130,7 +133,7 @@ static void delay_ms(unsigned ms) {
         return;
     }
     uint64_t end = uptime_ms() + ms + 1; /* the current tick is partly gone */
-    while (uptime_ms() < end) wq_nap(NULL, NULL, 1);
+    while (uptime_ms() < end) nap_ms(1);
 }
 
 /* Until (register & mask) == want, for up to ms. */
@@ -142,7 +145,7 @@ static bool wait_reg(struct port *p, unsigned off, uint32_t mask, uint32_t want,
         if (v == 0xFFFFFFFFu) return false; /* the adapter is gone */
         if ((v & mask) == want) return true;
         if (clock ? uptime_ms() >= end : ++rounds >= ms * 1000ull) return false;
-        if (clock) wq_nap(NULL, NULL, 1);
+        if (clock) nap_ms(1);
         else io_wait();
     }
 }
@@ -160,7 +163,7 @@ static void ahci_isr(struct regs *r) {
             mmio_write32(regs + PxIS, events);
             if (!p) continue;
             __atomic_fetch_or(&p->events, events, __ATOMIC_SEQ_CST);
-            p->kick = true;
+            __atomic_add_fetch(&p->kicks, 1, __ATOMIC_SEQ_CST);
             wq_wake_all(&p->wq);
         }
         hba_wr(h, IS, is);
@@ -265,6 +268,7 @@ static int command(struct port *p, const uint8_t fis[20], bool write, unsigned b
     bool clock = clock_runs();
     uint64_t end = uptime_ms() + ms, rounds = 0;
     for (;;) {
+        uint64_t seen = __atomic_load_n(&p->kicks, __ATOMIC_SEQ_CST); /* before the look */
         uint32_t events = rd(p, PxIS) | __atomic_load_n(&p->events, __ATOMIC_SEQ_CST);
         bool done = !(rd(p, PxCI) & 1);
         uint32_t tfd = rd(p, PxTFD); /* after CI: the status the command ended with */
@@ -281,7 +285,7 @@ static int command(struct port *p, const uint8_t fis[20], bool write, unsigned b
             return -1;
         }
         if (!clock) io_wait();
-        else wq_nap(&p->wq, &p->kick, p->h->vector ? 10 : 1);
+        else wq_wait_unless(&p->wq, &p->kicks, seen, p->h->vector ? 10 : 1);
     }
 }
 
@@ -403,7 +407,7 @@ static void hba_take(struct hba *h) {
     if (hba_rd(h, CAP2) & CAP2_BOH) {
         hba_wr(h, BOHC, hba_rd(h, BOHC) | BOHC_OOS);
         uint64_t end = uptime_ms() + 25;
-        while (hba_rd(h, BOHC) & BOHC_BOS && uptime_ms() < end) wq_nap(NULL, NULL, 1);
+        while (hba_rd(h, BOHC) & BOHC_BOS && uptime_ms() < end) nap_ms(1);
         if (hba_rd(h, BOHC) & BOHC_BB) delay_ms(2000); /* the firmware finishes what it was doing */
     }
     hba_wr(h, GHC, hba_rd(h, GHC) | GHC_AE);

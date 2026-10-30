@@ -46,13 +46,22 @@ struct bd {
     uint16_t flags;
 } PACKED;
 
+/* fill() and unissue() run under the card's lock (dev/audio.h) and look at hw_ready first; it
+   changes under that lock too. While it is false they touch nothing else, so a power change
+   (quiesce, hw_init on resume) programs the engine and the fields below without the lock. */
 static uint16_t nam, nabm;
 static int16_t *bufs;
 static int lvi;
 static bool dma_live; /* RUN set; issued descriptors may still belong to the device */
-static volatile bool hw_ready; /* the codec and the PCM-out box are set up (not during sleep) */
+static bool hw_ready; /* the codec and the PCM-out box are set up (not during sleep) */
 static uint32_t bdl_phys;
 static uint64_t submitted_frames;
+
+static void hw_ready_set(bool ready) {
+    uint64_t f = audio_card_lock();
+    hw_ready = ready;
+    audio_card_unlock(f);
+}
 
 static void spin_ms(uint64_t ms) { /* early in boot: no sleeping yet */
     uint64_t until = uptime_ms() + ms + 1;
@@ -60,10 +69,10 @@ static void spin_ms(uint64_t ms) { /* early in boot: no sleeping yet */
 }
 
 static void ac97_fill(void) {
+    if (!hw_ready) return;             /* asleep, or the codec is being set up again */
     bool remote = audio_remote();
     bool pending = !remote && audio_pending();
     if (!dma_live && !pending) return; /* no DMA owner, no wake: zero VM exits */
-    if (!hw_ready) return;             /* asleep, or the codec is being set up again */
 
     /* ICH7 PRM 2.2.2-4 permits this aligned read; QEMU nabm_readl also returns
        CIV | LVI<<8 | SR<<16. One snapshot replaces separate CIV/SR reads. */
@@ -134,7 +143,7 @@ static void ac97_fill(void) {
    With take, LVI goes back to the descriptor before it: the engine stops there unless fill()
    issues more. Not while halted: nothing is queued then. */
 static uint64_t ac97_unissue(bool take) {
-    if (!dma_live || !hw_ready) return submitted_frames;
+    if (!hw_ready || !dma_live) return submitted_frames;
     uint32_t state = inl(nabm + PO_CIV);
     uint16_t remaining = inw(nabm + PO_PICB);
     uint32_t confirmed = inl(nabm + PO_CIV);
@@ -155,7 +164,7 @@ static uint64_t ac97_unissue(bool take) {
    (DMA controller halted). */
 static bool ac97_quiesce(void *arg) {
     (void)arg;
-    hw_ready = false;
+    hw_ready_set(false);
     outb(nabm + PO_CR, 0);
     dma_live = false;
     for (int i = 0; i < 1000; i++) {
@@ -186,7 +195,7 @@ static bool hw_init(void) {
     outl(nabm + PO_BDBAR, bdl_phys);
     lvi = NBUF - 1; /* no descriptor has been issued; reset PIV will start at 0 */
     dma_live = false; /* do not start a perpetual silence DMA stream */
-    hw_ready = true;
+    hw_ready_set(true);
     return codec && reset;
 }
 

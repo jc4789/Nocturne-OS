@@ -121,8 +121,12 @@ static struct {
     uint8_t rndis_reply[128];
     bool link_up;
     uint64_t tx_backpressure;
-    /* The callback only publishes notification. The BSP net thread (or the
-       probe's synchronous wait before registration) is the sole ring reader. */
+    /* The channel callback and the rescind (VMBus's interrupt handler, CPU 0) only set these
+       latches, mask the host's signal and wake the net thread. Everything else here (both rings,
+       the send sections, the receive borrow, the queues below) belongs to the stack's calls into
+       the adapter, which come one at a time from any CPU under the stack's lock, and before
+       registration to the probe alone: the net thread (or the probe's synchronous wait) is the
+       sole ring reader. */
     volatile bool event_pending, detaching;
     uint8_t *rx_packet;
     uint32_t rx_capacity, rx_len, rx_range, rx_position;
@@ -139,28 +143,20 @@ static struct netif nif = {.driver = "netvsc"};
 /* ---- send-buffer sections ---- */
 
 static uint32_t section_alloc(void) {
-    uint64_t f = irq_save();
-    if (!nv.section_used) {
-        irq_restore(f);
-        return INVALID_SECTION;
-    }
+    if (!nv.section_used) return INVALID_SECTION;
     for (uint32_t i = 0; i < nv.sections; i++) {
         if (!(nv.section_used[i / 64] & (1ull << (i % 64)))) {
             nv.section_used[i / 64] |= 1ull << (i % 64);
-            irq_restore(f);
             return i;
         }
     }
-    irq_restore(f);
     return INVALID_SECTION;
 }
 
 static bool section_free(uint32_t i) {
     if (i >= nv.sections || !nv.section_used) return false;
-    uint64_t f = irq_save();
     bool used = (nv.section_used[i / 64] & (1ull << (i % 64))) != 0;
     nv.section_used[i / 64] &= ~(1ull << (i % 64));
-    irq_restore(f);
     return used;
 }
 
@@ -181,7 +177,7 @@ static int send_rndis(const void *msg, uint32_t len, bool control) {
     return r;
 }
 
-/* ---- receive path (BSP thread context) ---- */
+/* ---- receive path (the net thread, or the probe before registration) ---- */
 
 static void receive_frame(const void *frame, uint32_t len, void (*input)(const void *, size_t)) {
     if (input) {
@@ -270,14 +266,14 @@ static bool complete_receive(void) {
 }
 
 static void netvsc_callback(struct vmbus_channel *ch) {
-    if (ch != nv.ch || ch->rescinded) return;
+    if (ch != __atomic_load_n(&nv.ch, __ATOMIC_ACQUIRE) || ch->rescinded) return;
     ch->in->interrupt_mask = 1;
     nv.event_pending = true;
     net_rx_notify();
 }
 
 static void netvsc_rescind(struct vmbus_channel *ch) {
-    if (ch != nv.ch) return;
+    if (ch != __atomic_load_n(&nv.ch, __ATOMIC_ACQUIRE)) return;
     nv.detaching = true;
     nv.link_up = false;
     net_rx_notify();
@@ -292,10 +288,13 @@ static void free_buffer(uint8_t *buffer, uint32_t pages) {
 static void netvsc_shutdown(void) {
     struct vmbus_channel *ch = nv.ch;
     if (!ch) return;
-    /* No callback can consume a descriptor or free memory. Closing this
-       claimed channel is done by its BSP owner, after any input borrow has
-       returned. A rescind invalidates pending IDs; they are never sent to a
-       later channel with a potentially reused relid. */
+    /* No callback can consume a descriptor or free memory. The net thread (or
+       the failed probe) closes this claimed channel, after any input borrow
+       has returned. From here on the callback and the rescind find nv.ch no
+       longer theirs and touch nothing; the rest uses ch. A rescind invalidates
+       pending IDs; they are never sent to a later channel with a potentially
+       reused relid. */
+    __atomic_store_n(&nv.ch, NULL, __ATOMIC_SEQ_CST);
     nv.link_up = false;
     if (nv.rx_borrowed) nv.rx_completion_cancelled++;
     nv.rx_borrowed = nv.completion_wait = false;
@@ -335,16 +334,16 @@ static void netvsc_shutdown(void) {
     }
     nv.keepalive_last = NULL;
     nv.deferred_bytes = 0;
-    uint64_t flags = irq_save();
-    nv.ch = NULL;
     nv.event_pending = nv.detaching = false;
     vmbus_release(ch);
-    irq_restore(flags);
 }
 
 static bool netvsc_rx_pending(void) {
+    /* Once shut down nothing is left to do, also when a rescind racing the shutdown on CPU 0
+       set detaching again. */
+    if (!nv.ch) return false;
     if (nv.detaching) return true;
-    if (!nv.ch || nv.ch->rescinded) return false;
+    if (nv.ch->rescinded) return false;
     if (nv.event_pending || nv.setup_first) return true;
     if (nv.completion_wait)
         return vmbus_write_ready(nv.ch, sizeof(struct vmpacket_desc) + NVSP_MSG_SIZE);
@@ -481,17 +480,18 @@ static size_t netvsc_poll_rx(void (*input)(const void *, size_t)) {
             nv.completion_wait = true;
     }
     if (nv.completion_wait && !completion_blocked) complete_receive();
-    uint64_t flags = irq_save();
     nv.ch->in->interrupt_mask = 0;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     /* Rearm before the final readiness check; an arrival crossing the empty
-       check cannot be lost. A blocked completion waits for host progress. */
+       check cannot be lost: the callback, on CPU 0 at any point of this, sets
+       event_pending before it wakes the net thread, so either the check below
+       sees the arrival or the callback's wake comes after it. A blocked
+       completion waits for host progress. */
     bool pending = netvsc_rx_pending();
     if (pending) {
         if (budget_exhausted) nv.rx_budget_yields++;
         net_rx_notify();
     }
-    irq_restore(flags);
     return frames;
 }
 
@@ -663,7 +663,7 @@ bool netvsc_probe(void) {
     if (!ch) return false;
     nv.ch = ch;
     ch->claimed = true;
-    ch->on_rescind = netvsc_rescind;
+    vmbus_set_rescind(ch, netvsc_rescind);
     if (vmbus_open(ch, 128 * 1024, 128 * 1024, netvsc_callback, NULL)) goto failed;
     nv.rx_capacity = ch->in_size;
     nv.rx_packet = kmalloc(nv.rx_capacity);

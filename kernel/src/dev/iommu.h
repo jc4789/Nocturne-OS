@@ -49,7 +49,8 @@ bool iommu_block(struct iommu_domain *dom);
 void iommu_domain_free(struct iommu_domain *dom);
 /* Pages (frames, or count pages from base when frames is NULL) at their own addresses. unmap
    returns once no request in flight can reach them any more: false when the units did not
-   confirm that. */
+   confirm that. Any CPU, in a thread that may sleep: the domain's tables change under a mutex
+   of its own. attach, block and domain_free sleep too (dev/iommu.c's attach_mutex). */
 bool iommu_map(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count);
 bool iommu_unmap(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count);
 
@@ -104,6 +105,11 @@ struct iommu_domain {
     bool unwanted; /* freed while its block was unconfirmed: freed once a block is confirmed */
     uint64_t irt;  /* AMD-Vi: its interrupt remapping table (VT-d shares one among all functions) */
 };
+/* The calls below come from any CPU: attach and block with dev/iommu.c's attach_mutex held,
+   flush with the domain's map mutex, ioapic under arch/ioapic.c's lock, msi and msi_clear from
+   a driver's thread or the sleep path, start, resume and shutdown from the power paths. Each back
+   end puts its units' queues and tables under one spinlock of its own, taken after all of those
+   and taken in its fault or event interrupt handler (CPU 0) too. */
 struct iommu_hw {
     const char *name;
     bool interrupt_remapping_required; /* stopped units cannot deliver plain interrupts (VT-d IRREQ) */

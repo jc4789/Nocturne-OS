@@ -4,16 +4,16 @@
    changed; every handle opened on one counts for itself from its opening, so one struct serves
    any number of watchers.
 
-   BSP-owned like every object: watched_changed and watched_gone run on the BSP, any context
-   (they take the BSP IRQ guard themselves and do not sleep); the ready op only reads, so an AP's
-   wait can look. */
+   Any CPU, any context: watched_changed and watched_gone do not sleep and take no lock but the
+   object's (object_notify), so an owner may call them with its own lock held. The counts are
+   atomic words: what the owner said is never lost to a take on another CPU. */
 #pragma once
 #include "sys/object.h"
 
 struct watched {
     struct object object;
-    uint64_t changes; /* the changes its owner said, ever */
-    bool gone;        /* what it watched is no more: its handles turn N_EVENT_CLOSED */
+    uint64_t changes; /* the changes its owner said, ever (atomic) */
+    bool gone;        /* what it watched is no more: its handles turn N_EVENT_CLOSED (atomic) */
     /* The last handle on it closed (NULL: its owner keeps it for good). */
     void (*release)(struct watched *w);
 };

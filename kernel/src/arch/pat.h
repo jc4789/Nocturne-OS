@@ -7,11 +7,12 @@
 #define PAT_NOCTURNE 0x0007010600070406ULL
 
 bool pat_supported(void);
-/* Program IA32_PAT on the calling CPU (cache and TLB flushed per the SDM/APM sequence). Run on the BSP
-   before the kernel page tables are built and on every AP before it uses them. Returns the MSR value
-   read back, or 0 when the CPU has no PAT. */
+/* Program IA32_PAT on the calling CPU (cache and TLB flushed per the SDM/APM sequence). Run on CPU 0
+   before the kernel page tables are built and on every other CPU before it uses them. Returns the MSR
+   value read back, or 0 when the CPU has no PAT. */
 uint64_t pat_init_cpu(void);
-/* MTRRs across a sleep: the BSP saves its set before it sleeps; mtrr_sync() on any CPU afterwards
-   (the BSP when it wakes, each AP the kernel starts) writes that set back if it differs. */
+/* MTRRs across a sleep: CPU 0 saves its set before it sleeps; mtrr_sync() on any CPU afterwards
+   (CPU 0 when it wakes, each other CPU the kernel starts) writes that set back into that CPU's own
+   MTRRs if they differ. */
 void mtrr_save(void);
 void mtrr_sync(void);

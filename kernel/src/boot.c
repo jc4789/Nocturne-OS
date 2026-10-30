@@ -132,14 +132,5 @@ void kmain(void) {
     input_init();
 
     kmain_late();
-    /* become the idle task */
-    for (;;) {
-        cli();
-        if (!need_resched) {
-            timer_idle();
-            __asm__ volatile("sti; hlt" : : : "memory"); /* a wake between the check and hlt ends the hlt */
-        }
-        sti();
-        schedule();
-    }
+    sched_idle(); /* the boot context is CPU 0's idle task */
 }

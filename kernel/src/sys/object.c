@@ -1,7 +1,6 @@
 /* Kernel objects, handles, waits on objects and the apps' handle tables (sys/object.h). */
 #include "kernel.h"
 #include "arch/cpu.h"
-#include "arch/smp.h"
 #include "mm/heap.h"
 #include "sys/object.h"
 #include "sys/events.h"
@@ -44,28 +43,13 @@ struct handle *handle_ref(struct handle *h) {
 
 void handle_close(struct handle *h) {
     if (!h) return;
-    if (cpu_is_runner()) {
-        /* An AP drops any reference but one may be the last: ending a handle is the BSP's. */
-        int refs = __atomic_load_n(&h->refs, __ATOMIC_RELAXED);
-        while (refs > 1)
-            if (__atomic_compare_exchange_n(&h->refs, &refs, refs - 1, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
-                return;
-        sched_enter_bsp();
-    }
-    uint64_t flags = irq_save();
     int refs = __atomic_sub_fetch(&h->refs, 1, __ATOMIC_ACQ_REL);
     ASSERT(refs >= 0);
-    bool last = refs == 0;
-    struct event_watch *ended = last ? events_handle_closed(h) : NULL;
-    irq_restore(flags);
-    if (!last) return;
-    /* No table holds h any more; an AP syscall that found it there before may still read it
-       and its object (handle_ap_peek) until its section ends, and an AP wait the watches that
-       ended with it. */
-    ap_read_synchronize();
-    events_watches_free(ended);
+    if (refs) return;
+    /* No table holds h any more, and no one else has a reference: its watches end. */
+    events_watches_free(events_handle_closed(h));
     /* A last close may sleep (an audio stream plays out what it has): the reference this
-       caller held, not a guard, keeps the detached handle alive meanwhile. */
+       caller held keeps the detached handle alive meanwhile. */
     struct object *o = h->object;
     if (o->ops->close) o->ops->close(h);
     object_unref(o);
@@ -107,100 +91,137 @@ void object_waiter_unlink(struct object_waiter *w) {
 
 /* ---- handle tables ---- */
 
-int handle_table_reserve(struct task *owner, size_t minimum) {
+/* The table's lock held: a free slot, or -1 when the table is full. */
+static int table_free_slot(struct task *owner) {
+    for (size_t i = owner->handle_hint; i < owner->handle_capacity; i++)
+        if (!owner->handles[i]) return (int)i;
+    return -1;
+}
+
+/* The table's lock held, given back meanwhile: room for minimum slots (an error without memory). */
+static int table_grow(struct task *owner, size_t minimum, uint64_t *flags) {
     const size_t limit = (size_t)INT32_MAX + 1; /* handle numbers are non-negative int32_t */
     if (minimum > limit || minimum > SIZE_MAX / sizeof *owner->handles) return -N_ERR_NO_MEMORY;
-    if (minimum <= owner->handle_capacity) return 0;
-    size_t capacity = owner->handle_capacity;
-    while (capacity < minimum) {
-        if (capacity > limit / 2) { capacity = minimum; break; }
-        capacity *= 2;
-    }
-    struct handle **table = kzalloc(capacity * sizeof *table);
-    if (!table) return -N_ERR_NO_MEMORY;
-    memcpy(table, owner->handles, owner->handle_capacity * sizeof *table);
-    struct handle **old = owner->handles;
-    /* handle_ap_peek reads the capacity first: a larger one comes with the larger table */
-    __atomic_store_n(&owner->handles, table, __ATOMIC_RELEASE);
-    __atomic_store_n(&owner->handle_capacity, capacity, __ATOMIC_RELEASE);
-    if (old != owner->initial_handles) {
-        ap_read_synchronize();
-        kfree(old);
+    while (minimum > owner->handle_capacity) {
+        size_t capacity = owner->handle_capacity;
+        while (capacity < minimum) {
+            if (capacity > limit / 2) { capacity = minimum; break; }
+            capacity *= 2;
+        }
+        spin_unlock(&owner->handles_lock, *flags);
+        struct handle **table = kzalloc(capacity * sizeof *table);
+        *flags = spin_lock(&owner->handles_lock);
+        if (!table) return -N_ERR_NO_MEMORY;
+        if (capacity <= owner->handle_capacity) { /* another thread grew it meanwhile */
+            spin_unlock(&owner->handles_lock, *flags);
+            kfree(table);
+            *flags = spin_lock(&owner->handles_lock);
+            continue;
+        }
+        memcpy(table, owner->handles, owner->handle_capacity * sizeof *table);
+        struct handle **old = owner->handles;
+        owner->handles = table;
+        owner->handle_capacity = capacity;
+        if (old != owner->initial_handles) {
+            spin_unlock(&owner->handles_lock, *flags);
+            kfree(old); /* no one reads a table but under its lock */
+            *flags = spin_lock(&owner->handles_lock);
+        }
     }
     return 0;
 }
 
-int handle_table_find(struct task *owner) {
-    for (size_t i = owner->handle_hint; i < owner->handle_capacity; i++)
-        if (!owner->handles[i]) return (int)i;
-    size_t index = owner->handle_capacity;
-    int e = handle_table_reserve(owner, index + 1);
-    return e ? e : (int)index;
-}
-
-int handle_table_add(struct task *owner, struct handle *h) {
-    int index = handle_table_find(owner);
-    if (index < 0) return index;
-    __atomic_store_n(&owner->handles[index], h, __ATOMIC_RELEASE); /* handle_ap_peek */
+/* The table's lock held: h in a free slot (its number), or an error. */
+static int table_add(struct task *owner, struct handle *h, uint64_t *flags) {
+    int index;
+    while ((index = table_free_slot(owner)) < 0) {
+        int e = table_grow(owner, owner->handle_capacity + 1, flags);
+        if (e < 0) return e;
+    }
+    owner->handles[index] = h;
     owner->handle_hint = (size_t)index + 1;
     return index;
 }
 
-struct handle *handle_peek(int index) {
-    struct task *owner = task_process();
-    if (index < 0 || (size_t)index >= owner->handle_capacity) return NULL;
-    return owner->handles[index];
-}
-
-struct handle *handle_ap_peek(int index) {
-    struct task *owner = task_process();
-    size_t capacity = __atomic_load_n(&owner->handle_capacity, __ATOMIC_ACQUIRE);
-    if (index < 0 || (size_t)index >= capacity) return NULL;
-    struct handle **table = __atomic_load_n(&owner->handles, __ATOMIC_ACQUIRE);
-    return __atomic_load_n(&table[index], __ATOMIC_ACQUIRE);
-}
-
-struct handle *handle_get(int index) {
-    /* The BSP changes the table; an AP reads it in a read section, which keeps h allocated while
-       its reference is taken, unless its last one went meanwhile. */
-    uint64_t flags = irq_save();
-    ap_read_begin();
-    struct handle *h = handle_ap_peek(index);
-    int refs = h ? __atomic_load_n(&h->refs, __ATOMIC_RELAXED) : 0;
-    do {
-        if (refs <= 0) { h = NULL; break; }
-    } while (!__atomic_compare_exchange_n(&h->refs, &refs, refs + 1, true, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED));
-    ap_read_end();
-    irq_restore(flags);
+/* The table's lock held. */
+static struct handle *table_take(struct task *owner, size_t index) {
+    if (index >= owner->handle_capacity || !owner->handles[index]) return NULL;
+    struct handle *h = owner->handles[index];
+    owner->handles[index] = NULL;
+    if (index < owner->handle_hint) owner->handle_hint = index;
     return h;
 }
 
-int handle_install_locked(struct handle *h) { return handle_table_add(task_process(), h); }
+struct handle *handle_get_of(struct task *owner, int index) {
+    if (index < 0) return NULL;
+    uint64_t flags = spin_lock(&owner->handles_lock);
+    struct handle *h = (size_t)index < owner->handle_capacity ? owner->handles[index] : NULL;
+    if (h) handle_ref(h); /* the table's reference keeps it until this one is taken */
+    spin_unlock(&owner->handles_lock, flags);
+    return h;
+}
+
+struct handle *handle_get(int index) { return handle_get_of(task_process(), index); }
 
 int handle_install(struct handle *h) {
-    uint64_t flags = irq_save();
-    int index = handle_install_locked(h);
-    irq_restore(flags);
+    struct task *owner = task_process();
+    uint64_t flags = spin_lock(&owner->handles_lock);
+    int index = table_add(owner, h, &flags);
+    spin_unlock(&owner->handles_lock, flags);
     if (index < 0) handle_close(h);
     return index;
 }
 
-struct handle *handle_take_locked(int index) {
-    struct handle *h = handle_peek(index);
-    if (!h) return NULL;
+int handle_install_pair(struct handle *a, struct handle *b, int *ia, int *ib) {
     struct task *owner = task_process();
-    __atomic_store_n(&owner->handles[index], NULL, __ATOMIC_RELAXED); /* handle_ap_peek */
-    if ((size_t)index < owner->handle_hint) owner->handle_hint = (size_t)index;
-    object_notify(h->object);
-    return h;
+    uint64_t flags = spin_lock(&owner->handles_lock);
+    int first = table_add(owner, a, &flags), second = first < 0 ? first : table_add(owner, b, &flags);
+    if (second < 0 && first >= 0) table_take(owner, (size_t)first);
+    spin_unlock(&owner->handles_lock, flags);
+    if (second < 0) return second;
+    *ia = first;
+    *ib = second;
+    return 0;
 }
 
 int handle_remove(int index) {
-    uint64_t flags = irq_save();
-    struct handle *h = handle_take_locked(index);
-    irq_restore(flags);
+    struct task *owner = task_process();
+    if (index < 0) return -N_ERR_NO_HANDLE;
+    uint64_t flags = spin_lock(&owner->handles_lock);
+    struct handle *h = table_take(owner, (size_t)index);
+    spin_unlock(&owner->handles_lock, flags);
     if (!h) return -N_ERR_NO_HANDLE;
+    object_notify(h->object);
     /* The last close may sleep: the reference taken out of the table owns h. */
     handle_close(h);
     return 0;
 }
+
+int handle_table_put(struct task *owner, size_t index, struct handle *h) {
+    uint64_t flags = spin_lock(&owner->handles_lock);
+    int e = table_grow(owner, index + 1, &flags);
+    if (!e) {
+        ASSERT(!owner->handles[index]);
+        owner->handles[index] = h;
+    }
+    spin_unlock(&owner->handles_lock, flags);
+    return e;
+}
+
+struct handle *handle_table_next(struct task *owner, size_t *at, bool (*which)(struct handle *)) {
+    uint64_t flags = spin_lock(&owner->handles_lock);
+    struct handle *h = NULL;
+    for (; *at < owner->handle_capacity && !h; ++*at) {
+        struct handle *in = owner->handles[*at];
+        if (in && (!which || which(in))) h = table_take(owner, *at);
+    }
+    spin_unlock(&owner->handles_lock, flags);
+    return h;
+}
+
+void handle_table_free(struct task *owner) {
+    if (owner->handles != owner->initial_handles) kfree(owner->handles);
+    owner->handles = owner->initial_handles;
+    owner->handle_capacity = INITIAL_HANDLES;
+}
+/* ---- handle tables ---- */

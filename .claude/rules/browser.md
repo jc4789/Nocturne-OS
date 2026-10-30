@@ -16,10 +16,10 @@ paths:
 
 ## ログを先に読む
 
-- 口は二つ：ホストの serial.log（QEMU の `-serial file:`）と、ゲストの F12。F12 の Console の札は頁の行、Trace の札はブラウザー自身の計測（`WEB_CONSOLE_TRACE`）。どちらも `console_add`（browser.c）から出る。serial へ出るのは `--log-console` か `--debug-js` のときだけ。GUI からは旗を付けられない：ゲストの Terminal で `browser --debug-js <URL>` を打つ。
+- 口は二つ：ホストの serial.log（QEMU の `-serial file:`）と、ゲストの F12。F12 の Console の札は全部の行（頁の行とブラウザー自身の計測）、Trace の札は計測（`WEB_CONSOLE_TRACE`）だけ（2026-10-30 ユーザー：計測を Trace の札だけに置いたら、要る行が隠れた）。どちらも `console_add`（browser.c）から出る。serial へ出るのは `--log-console` か `--debug-js` のときだけ。GUI からは旗を付けられない：ゲストの Terminal で `browser --debug-js <URL>` を打つ。
 - 行の形は `[browser log @秒.ミリ秒] 本文`（`warn`・`error` も同じ形）。計測の行は `[browser trace @…]`。秒はゲストの起動からの時間。カーネルの行には時刻が無い。
-- 動画のかくつき・落ちるコマ・音：`Native media timing:` の `decoded N/drop M`、`presented`、`queued`、`starved`、`silence`。再生中は 2 秒ごとに出る。旗なしでも F12 の Trace の札には出る。
-- 頁が try/catch で握りつぶした例外は `JavaScript caught exception:`、Promise の拒否は `JavaScript promise rejected:`（どちらも Trace の札）。欠けた API を探す入口。
+- 動画のかくつき・落ちるコマ・音：`Native media timing:` の `decoded N/drop M`、`presented`、`queued`、`starved`、`silence`。再生中は 2 秒ごとに出る。旗なしでも F12 の Console と Trace の札には出る。
+- 頁が try/catch で握りつぶした例外は `JavaScript caught exception:`、Promise の拒否は `JavaScript promise rejected:`（`trace` の水準。Console と Trace の札の両方）。欠けた API を探す入口。
 - 描画と待ち（`--debug-js`、2 秒ごと）：`Browser loop profile:`（wall・ticks・draw・wait）、`Browser damage profile:`（部分描画）、`Native paint profile:`（walk・video probe）、`Document tick profile:`、`Script deadline profile:`。fps を直接出す行は無い。全面の `draw` と部分の `partial draw` の回数を wall で割る。
 - JS の重い関数：`JavaScript profile:`（標本の JS 時間が 1000 ms たまるごと）。`JavaScript heap census` は heap 全体を歩くので計測を歪める。通信は `Net #N …`。
 - 全部の行の意味・出る条件・取り方は `nocturne-project` スキルの `references/logs.md`。
@@ -30,7 +30,7 @@ paths:
 - 変える前に、今の媒体（`build/nocturne.img` の一つ）で `browser-hikaku` の組の全部を同じ条件（2560×1440、F12 を開いたまま、QEMU は窓付き。速さは一台だけ動かして）で測り、値と行を書き残す。前の写しは一つまで（`build/mae.img`）、旧版の組み直しで基準を作らない。参照は実ブラウザー（内蔵ブラウザーで同じ時に開いた画面か、Floorp の画像）で、前の回の Nocturne ではない。
 - 変更が触れた仕様のディレクトリーの WPT を対象を絞って走らせる（全部は多すぎる、2026-10-29 ユーザー）。道具の使い方と直すべき所は `nocturne-project` スキル「試験の道具について」。
 - 比べて見つけた違いは、撮り直さずコード（`rg`・codegraph で場所を絞り、原文を読む）と仕様の原文で追って直す。確かめは直す前に一度、直した後に一度。
-- 計測の道具を足したら、その道具自身の費用を測る。計測の行は `web_js_trace`・`WEB_CONSOLE_TRACE` で出し、頁の console（level 0〜2）へ混ぜない。
+- 計測の道具を足したら、その道具自身の費用を測る。計測の行は `web_js_trace`・`WEB_CONSOLE_TRACE` の水準で出し、頁の console の水準（0〜2）を使わない（Trace の札と serial の `[browser trace]` はこの水準で分かれる）。
 - 「速くなった」は同じ条件の実時間と fps が動いたときだけ。内部の数が減っただけでは言わない。
 
 ## 触るときの約束

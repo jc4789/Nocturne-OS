@@ -7,12 +7,12 @@
    places at once (the tables of the apps it was handed to, a message that carries it), each
    place holding a reference of its own.
 
-   Tables are BSP-owned and changed under the BSP IRQ guard (irq_save). Any CPU takes and drops
-   a handle's references (atomic counts): an AP reads the table (handle_get, handle_ap_peek) and
-   leaves a handle's last close to the BSP, which frees a handle, an object or a table only after
-   ap_read_synchronize. An object's reference count and its list of waits are any CPU's: the
-   count is atomic, the list is under the object's lock (taken before a wait queue's and
-   address_lock, never while holding a CPU queue's lock or address_lock). */
+   Any CPU. Each app's table is under its own lock (the process task's handles_lock), held only
+   to read or change slots: a table holds a reference to each handle in it, so a reference taken
+   under the lock (handle_get) keeps the handle once the lock is dropped. A handle's references
+   and an object's are atomic counts; the last one ends it on the CPU that dropped it. An object's
+   list of waits is under the object's lock (taken before a wait queue's and address_lock, never
+   while holding a CPU queue's lock or address_lock). */
 #pragma once
 #include "kernel.h"
 #include "sys/sched.h"
@@ -45,8 +45,9 @@ struct object_ops {
        the object is not a byte stream. */
     int64_t (*read)(struct handle *h, void *buf, size_t n, bool user, bool wait);
     int64_t (*write)(struct handle *h, const void *buf, size_t n, bool user);
-    /* The N_EVENT_* conditions true for h now; BSP IRQ guard held, or an AP read section
-       (arch/smp.h), so it only reads: no lock, wait, allocation or write. NULL: never any. */
+    /* The N_EVENT_* conditions true for h now, with an event queue's lock held: it only reads
+       (a waiter that misses a change is woken by the change's notify): no wait, allocation or
+       write, and no lock but the spinlocks that come after an event queue's. NULL: never any. */
     uint32_t (*ready)(struct handle *h);
     /* The handle's last reference is gone (it may sleep: an audio stream plays out). */
     void (*close)(struct handle *h);
@@ -82,8 +83,8 @@ void object_unref(struct object *o);
 /* A new opening of o (NULL: no memory; o is left as it was). */
 struct handle *handle_open(struct object *o, bool writable);
 struct handle *handle_ref(struct handle *h);
-/* Drops one reference; the last one closes the opening and drops its object reference (on an AP,
-   a kernel continuation that may drop the last moves to the BSP first: sched_enter_bsp). */
+/* Drops one reference; the last one closes the opening and drops its object reference. It may
+   sleep (an audio stream plays out what it has): never with a spinlock held. */
 void handle_close(struct handle *h);
 static inline int handle_kind(const struct handle *h) { return h->object->ops->kind; }
 static inline bool handle_is(const struct handle *h, const struct object_ops *ops) {
@@ -96,25 +97,20 @@ void object_notify(struct object *o);
 void object_waiter_link(struct object_waiter *w, struct object_wait *wait, struct object *o);
 void object_waiter_unlink(struct object_waiter *w);
 
-/* The calling app's handle table. handle_get (any CPU) returns a reference (NULL: no such handle);
-   handle_peek (BSP) a borrowed pointer valid only inside the caller's BSP IRQ guard. */
-struct handle *handle_get(int index);
-struct handle *handle_peek(int index);
-/* The same on an AP, inside an AP read section (arch/smp.h) and without a reference: the handle
-   and its object stay allocated until ap_read_end, but the BSP may change them meanwhile. */
-struct handle *handle_ap_peek(int index);
+/* The calling app's handle table (the process's, for any of its threads). */
+struct handle *handle_get(int index); /* a reference to close, or NULL: no such handle */
+struct handle *handle_get_of(struct task *owner, int index);
 /* Puts h in the table: its number, or an error (then h is closed). Consumes the reference. */
 int handle_install(struct handle *h);
-/* The same with the caller's guard held; the reference is consumed only on success. */
-int handle_install_locked(struct handle *h);
+/* Both or neither: 0 with their numbers, the references consumed; an error, and both are still
+   the caller's. */
+int handle_install_pair(struct handle *a, struct handle *b, int *ia, int *ib);
 /* Takes the handle out of the table and drops the table's reference. */
 int handle_remove(int index);
-/* The same with the caller's guard held, handing the table's reference to the caller (NULL: no
-   such handle). */
-struct handle *handle_take_locked(int index);
 
-/* Handle tables of any task; caller holds the BSP IRQ guard. A table grows as far as memory
-   allows: its initial size is no limit. */
-int handle_table_reserve(struct task *owner, size_t minimum);
-int handle_table_find(struct task *owner);
-int handle_table_add(struct task *owner, struct handle *h);
+/* A task not started yet (sys/proc.c): h, a reference of its own, at index of its table. */
+int handle_table_put(struct task *owner, size_t index, struct handle *h);
+/* The app ends (sched.c): from *at on, the next handle which(h) holds for (NULL: any) leaves the
+   table, its reference the caller's; NULL when there is none. */
+struct handle *handle_table_next(struct task *owner, size_t *at, bool (*which)(struct handle *));
+void handle_table_free(struct task *owner); /* the task is freed: its grown table goes */

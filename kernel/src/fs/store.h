@@ -15,6 +15,7 @@
 struct blkdev;
 struct handle;
 struct n_entry;
+struct volume;
 
 /* Mounts C: from the disk the system started from, writing nothing to it (a hibernated system may
    still come back to it); panics when there is none. Started from a CD or DVD, C: is the volume the

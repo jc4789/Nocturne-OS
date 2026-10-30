@@ -46,14 +46,14 @@ module script（外部・inline）と import() は、module_graph_settled がグ
 css_rule_info の text はシートの元の文（注釈を除いた写し）の中を指し、text_len バイトで終わる。NUL で終わらないので strstr・strcmp・strdup を使わず、text_len と memcmp・strndup・JS_NewStringLen を使う。@import の URL と media は import（struct css_rule_import）にあり、@import でない規則では NULL。
 
 ## 目録の枝の最初の鍵は何も区切らない
-対象: kernel/src/fs/catalog.c, common/store_format.h, host/store/store.c
+対象: common/store/catalog.c, common/store_format.h, host/store/store.c
 確かめた: 2026-10-26 304be1a1 の次（併合の直し）
 枝の item 0 の鍵は、最初の子が外れた後や、それより小さい鍵が最初の子に入った後には、その子の鍵より上にも、二番目の鍵より上にもなる。枝を探す・調べる処理（child_index、walk）は item 0 の鍵を比べない。枝の鍵を使う処理を足すときも item 1 から見る。item 0 が二番目以降へ移る所（catalog_delete の枝の併合）では、その鍵の代わりに親の区切りの鍵を使う（右の枝の item 0 をそのまま写すと、その子の鍵を見失う。range の手元の試験で再現した）。目録を変えたら `store tree-test <seed> 200000` を幾つかの種で通す（`store test` は木を数枚の葉に保つので、枝の崩れを出さない。tree-test の四つ目の手番が範囲で消して枝を併合させる）。
 
-## AP の kernel 継続と、BSP に残る呼出し
-対象: kernel/src/sys/sched.c, kernel/src/arch/idt.c, kernel/src/sys/syscall.c
-確かめた: 2026-10-29（AP で眠る kernel 継続を入れた版）
-syscall_anywhere が名指す呼出しは AP でその task の kernel 継続として走る（ap_syscall）。継続は AP で眠り（t->block の ENROLLED→WOKEN／ASLEEP を CAS で渡す。ASLEEP の起こしは ap_woken_put がその AP の woken の列へ）、別の AP で続き、BSP の部品に触れる前に sched_enter_bsp する。眠りはどれも待ち行列に入れる（期限だけの眠りは deadline_wait）：BSP の拍の wq_take_blocked が「行列なし」を読んで起こすと、AP で登録の途中の task を行列に残したまま走らせ、行列が壊れる（2026-10-29 に一度そう書いて直した）。継続の途中で per-CPU の値を持ち越さない（眠る前の cpu_current_index は起きた後は別の CPU）。それ以外の呼出しは今も BSP へ回り、BSP が一つずつ行う。ゲストが止まって見えたら、QEMU の HMP で `info registers -a` を取り、CPU0 の RIP と RBP の鎖（x /2gx）を build/kernel.elf で llvm-symbolizer に引く。
+## 対称のカーネル：ファイルをまたぐ約束
+対象: kernel/src/sys/syscall.c, kernel/src/sys/sched.c, kernel/src/arch/idt.c, kernel/src/arch/isr.asm, kernel/src/mm/vmm.c
+確かめた: 2026-10-29（BSP へ回す道を消した版、未コミット）
+copy_from_user／copy_to_user は isr.asm の user_copy（rep movsb）で写し、頁違反は idt.c の user_copy_fixup が拾う：割り込みが開いていれば vmm_handle_user_fault で頁を作って続け（眠りうる）、閉じていれば user_copy_fault へ飛んで残りのバイト数を返す。だから spinlock の下で写すと、頁が無いときは必ず失敗し、あるときも眠りうる。利用者の指を写し以外で読むと、別の CPU の兄弟 thread が外した頁で核が panic する（その頁違反は直されない）。task_exit は空間を kernel_pml4 へ付け替えるのを task_lock の下で行い、その後に vmm_free_space する：task_lock の下で読んだ t->pml4 の表は lock の間は消えない（proc_user_pages・vmm_user_pages_split を task_lock の下で呼べる理由）。番地の待ち（task_wait_address）は利用者の番地を物理へ訳して直写像で読むので、写しを使わない。panic は panic_enter（printf.c）で他の CPU を NMI で止めてから、止まった CPU が持っていた記録の lock を spin_seize する。
 
 ## 外部の ArrayBuffer の free_func は二度呼ばれる
 対象: third_party/quickjs/quickjs.c, user/libc/web/js_webaudio.c, user/libc/web/*.c

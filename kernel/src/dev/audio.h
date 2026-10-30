@@ -11,7 +11,7 @@
 #define AUDIO_FRAME 4 /* bytes */
 
 void audio_init(void);
-void audio_tick(void); /* from the timer interrupt, every millisecond */
+void audio_tick(void); /* from CPU 0's timer interrupt, every millisecond */
 
 /* The apps' streams (docs/nocturne-native-abi.md §9). The others take a handle audio_stream_is
    said yes to. */
@@ -48,14 +48,21 @@ bool audio_ready(int frames, bool low);
 bool audio_needs_tick(void); /* tickless idle: the timer must keep calling audio_tick */
 
 /* A sound card: fill() tops up its buffers with audio_card_mix() (deciding with audio_ready); it is
-   called from audio_tick(). While audio_remote() it may only drain already-issued buffers, not mix
-   new PCM. An idle sink should return without device I/O; the next tick wakes it on new PCM.
-   unissue(take) is where the card's PCM that its device has not begun to fetch starts, as an
-   ordinal of audio_card_mix's frames (the ordinal after the last issued frame when there is none);
-   with take, the card also stops the device short of it, forgets it and lets fill() mix it again.
-   The mixer takes back from that ordinal when a stream is flushed (audio_stream_flush). */
+   called from audio_tick() and after a flush. While audio_remote() it may only drain already-issued
+   buffers, not mix new PCM. An idle sink should return without device I/O; the next tick wakes it
+   on new PCM. unissue(take) is where the card's PCM that its device has not begun to fetch starts,
+   as an ordinal of audio_card_mix's frames (the ordinal after the last issued frame when there is
+   none); with take, the card also stops the device short of it, forgets it and lets fill() mix it
+   again. The mixer takes back from that ordinal when a stream is flushed (audio_stream_flush).
+   fill() and unissue() run on any CPU, one at a time, under the card's lock with interrupts off:
+   they never sleep. */
 void audio_set_card(const char *name, void (*fill)(void), uint64_t (*unissue)(bool take));
 const char *audio_card(void); /* NULL without one */
+/* The card's lock, for the card's own code that changes what fill() and unissue() read (its power
+   changes): neither runs while it is held. It comes before the mixer's lock, so audio_card_mix and
+   the others may be called under it. Never held across a sleep or a long wait. */
+uint64_t audio_card_lock(void);
+void audio_card_unlock(uint64_t flags);
 
 /* A remote desktop client plays the sound: while one is attached the card is silent, and the
    client's session calls audio_mix() at its own pace. */
@@ -67,7 +74,8 @@ bool audio_remote(void); /* a remote client is playing the sound */
 const char *audio_output(void);
 
 /* The master volume, 0-100 (setting it also unmutes), and mute: the user's. Sound keeps them in
-   the user's AppData\Nocturne\Sound.conf (sys/keep.c) and reads them back at the start. BSP. */
+   the user's AppData\Nocturne\Sound.conf (sys/keep.c) and reads them back at the start. Any CPU;
+   a read may be a moment old, and the watches hear of every change. */
 int audio_volume(void);
 void audio_set_volume(int percent);
 bool audio_muted(void);
@@ -81,9 +89,10 @@ int64_t audio_output_watch(void);
 void audio_system_tone(int hz, int ms);
 
 
-/* Opt-in WM diagnostic only. BSP-owned, finite counters, no I/O in the
-   measured interval. Queue shortages are raw observations, not EOF-aware
-   underrun verdicts. This is an internal kernel interface, not a user ABI. */
+/* Opt-in WM diagnostic only: finite counters, no I/O in the measured interval. Queue shortages are
+   raw observations, not EOF-aware underrun verdicts. This is an internal kernel interface, not a
+   user ABI. audio_trace_active changes under both the card's lock and the mixer's; a card reads it
+   and calls audio_trace_ac97 from fill(). */
 extern bool audio_trace_active;
 void audio_trace_begin(void);
 void audio_trace_end(void);

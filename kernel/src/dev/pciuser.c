@@ -12,11 +12,16 @@
    arrived. Release never waits for a failed device or resets it (syscall.c asks
    pci_user_dma_reusable).
    BAR and DMA objects hold the claim record, so a later claim of the same function is a new
-   record and the old objects stay dead. */
+   record and the old objects stay dead.
+   Every call comes from any CPU. Claiming and a claim's end go one at a time under claim_mutex,
+   which holds every function's reservation (d->claimed) and is taken before pci.c's reset and
+   dev/iommu.c's locks. claim_irq_lock holds the vector table and what the interrupt handler on
+   CPU 0 reads; each claim's notes_lock its ACPI Notify values. */
 #include "kernel.h"
 #include "abi.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
+#include "arch/spin.h"
 #include "dev/acpi.h"
 #include "dev/fb.h"
 #include "dev/fbcon.h"
@@ -44,13 +49,14 @@ struct guard {
 struct pci_claim {
     struct pci_device *d;
     struct object object; /* what the claim's handle reaches */
-    volatile uint32_t pending; /* message n arrived; cleared by take */
+    uint32_t pending; /* message n arrived; cleared by take. Changed under claim_irq_lock; claim_ready reads it bare */
     struct wait_queue wq;
-    unsigned vector_base, vectors;
-    unsigned refs;   /* the object and every BAR or DMA object made through it */
-    bool released;   /* the last handle closed: BAR objects are revoked, the function stopped */
-    bool dma_unsafe; /* the ended claim's IOMMU block was not confirmed: retain its DMA pages */
-    unsigned screen_holds; /* n_pci_hold_screen nesting; given back when the claim ends */
+    unsigned vector_base, vectors; /* changed under claim_irq_lock, by one pci_user_interrupts at a time */
+    struct mutex vectors_mutex;    /* pci_user_interrupts of the claim's threads, one at a time */
+    unsigned refs;   /* the object and every BAR or DMA object made through it: atomic */
+    bool released;   /* the last handle closed: BAR objects are revoked, the function stopped. Atomic */
+    bool dma_unsafe; /* the ended claim's IOMMU block was not confirmed: retain its DMA pages. Atomic */
+    unsigned screen_holds; /* n_pci_hold_screen nesting, under screen_lock; given back when the claim ends */
     struct guard guards[CLAIM_GUARDS];
     unsigned guard_count;
     uint16_t pmcsr; /* the power management capability's control register, or 0 */
@@ -64,37 +70,53 @@ struct pci_claim {
     void *acpi_node, *acpi_upstream;
     struct acpi_watch *acpi_watch;
     uint32_t acpi_notes[CLAIM_ACPI_NOTES];
-    unsigned acpi_first, acpi_count; /* interrupts off */
+    unsigned acpi_first, acpi_count; /* notes_lock */
+    struct spinlock notes_lock;      /* the ring above; before acpi_wq's lock */
     struct wait_queue acpi_wq;
 };
+
+/* Claiming and a claim's end, and every function's d->claimed (dev/pci.h): one at a time, as a
+   claim's resets and its group's reservations span sleeps. Before screen_lock, and before
+   pci.c's and dev/iommu.c's locks. */
+static struct mutex claim_mutex;
+
+/* claim_of_vector, and each claim's pending, vector_base and vectors as the interrupt handler
+   reads them. The handler (CPU 0) wakes and notifies under it, so once a claim's vectors are off
+   the table no handler still reaches the claim. Before the wait queue and event locks. */
+static struct spinlock claim_irq_lock;
 static struct pci_claim *claim_of_vector[256];
 
 static void claim_drop(struct pci_claim *c) {
-    ASSERT(c->refs);
-    if (--c->refs) return;
+    unsigned left = __atomic_sub_fetch(&c->refs, 1, __ATOMIC_ACQ_REL);
+    ASSERT(left != UINT32_MAX);
+    if (left) return;
     if (c->domain) iommu_domain_free(c->domain); /* every DMA object of the claim is gone */
     kfree(c);
 }
 
 static void claim_isr(struct regs *r) {
+    spin_take(&claim_irq_lock);
     struct pci_claim *c = claim_of_vector[r->vector & 0xFF];
-    if (!c) return;
-    c->pending |= 1u << (r->vector - c->vector_base);
-    wq_wake_all(&c->wq);
-    object_notify(&c->object);
+    if (c) {
+        __atomic_fetch_or(&c->pending, 1u << (r->vector - c->vector_base), __ATOMIC_RELEASE);
+        wq_wake_all(&c->wq);
+        object_notify(&c->object);
+    }
+    spin_give(&claim_irq_lock);
 }
 
 static void interrupts_off(struct pci_claim *c) {
     if (!c->vectors) return;
     bool cleared = pci_msi_disable(c->d);
-    uint64_t irq = irq_save();
+    uint64_t irq = spin_lock(&claim_irq_lock);
     for (unsigned i = 0; i < c->vectors; i++) claim_of_vector[c->vector_base + i] = NULL;
-    c->pending = 0;
-    irq_restore(irq);
-    /* a remapping entry the units may still hold could reach them: they stay taken, unhandled */
-    if (cleared) irq_vector_free(c->vector_base, c->vectors);
-    else kprintf("pci: %02x:%02x.%u: its interrupt vectors stay out of use\n", c->d->bus, c->d->dev, c->d->func);
+    __atomic_store_n(&c->pending, 0, __ATOMIC_RELAXED);
+    unsigned base = c->vector_base, vectors = c->vectors;
     c->vectors = 0;
+    spin_unlock(&claim_irq_lock, irq);
+    /* a remapping entry the units may still hold could reach them: they stay taken, unhandled */
+    if (cleared) irq_vector_free(base, vectors);
+    else kprintf("pci: %02x:%02x.%u: its interrupt vectors stay out of use\n", c->d->bus, c->d->dev, c->d->func);
     /* A waiter must observe NOT_READY instead of sleeping forever after the
        driver disables its last interrupt (including an infinite take). */
     wq_wake_all(&c->wq);
@@ -102,7 +124,7 @@ static void interrupts_off(struct pci_claim *c) {
 }
 
 static uint32_t claim_ready(struct handle *h) {
-    return ((struct pci_claim *)h->object->priv)->pending ? N_EVENT_RECEIVABLE : 0;
+    return __atomic_load_n(&((struct pci_claim *)h->object->priv)->pending, __ATOMIC_ACQUIRE) ? N_EVENT_RECEIVABLE : 0;
 }
 
 /* The memory BAR the boot screen is drawn through, or -1. */
@@ -126,7 +148,11 @@ static int screen_bar(const struct pci_device *d) {
    stops the driver's app, and its claim's end gives the screen back. No time ends a hold by
    default: RM's waits follow one another without a bound a limit could be checked against, and
    stopping a driver that is only slow loses its GPU. */
-static struct pci_claim *screen_holder; /* BSP, interrupts off */
+/* The hold the watch thread looks at: screen_holder and the three after it, under
+   screen_hold_lock (taken alone, before screen_watch_wq's lock). The hold counts themselves and
+   screen_watch_started change under screen_lock (pci_user_hold_screen). */
+static struct spinlock screen_hold_lock;
+static struct pci_claim *screen_holder;
 static int screen_holder_app;
 static uint64_t screen_held_since, screen_hold_limit_ms;
 static bool screen_holder_stopped, screen_watch_started;
@@ -134,11 +160,11 @@ static struct wait_queue screen_watch_wq;
 
 /* Stops the app whose driver holds the screen, once a hold: false when none does. */
 static bool screen_holder_stop(const char *why) {
-    uint64_t irq = irq_save();
+    uint64_t irq = spin_lock(&screen_hold_lock);
     int app = screen_holder && !screen_holder_stopped ? screen_holder_app : 0;
     struct pci_device *d = app ? screen_holder->d : NULL;
     if (app) screen_holder_stopped = true;
-    irq_restore(irq);
+    spin_unlock(&screen_hold_lock, irq);
     if (!app) return false;
     kprintf("pci: %02x:%02x.%u: %s; stopping app %d; framebuffer writes resume at release, device recovery may be needed\n", d->bus,
             d->dev, d->func, why, app);
@@ -153,17 +179,22 @@ static void screen_watch(void *arg) {
     ksnprintf(limit, sizeof limit, "its driver has held the screen for %lu s (fbhold=)",
               (unsigned long)(screen_hold_limit_ms / 1000));
     for (;;) {
-        uint64_t irq = irq_save();
-        bool holding = screen_holder && !screen_holder_stopped, over = false;
+        uint64_t irq = spin_lock(&screen_hold_lock);
+        bool holding = screen_holder && !screen_holder_stopped;
         uint64_t held = holding ? uptime_ms() - screen_held_since : 0;
-        if (!holding) wq_wait(&screen_watch_wq);
-        else if (held < screen_hold_limit_ms) wq_wait_timeout(&screen_watch_wq, screen_hold_limit_ms - held);
-        else over = true;
+        if (holding && held >= screen_hold_limit_ms) {
+            spin_unlock(&screen_hold_lock, irq);
+            screen_holder_stop(limit);
+            continue;
+        }
+        /* a hold that begins or ends takes screen_hold_lock first, then wakes this */
+        if (!holding) wq_wait_locked(&screen_watch_wq, &screen_hold_lock);
+        else wq_wait_locked_timeout(&screen_watch_wq, &screen_hold_lock, screen_hold_limit_ms - held);
         irq_restore(irq);
-        if (over) screen_holder_stop(limit);
     }
 }
 
+/* screen_lock held. */
 static void screen_hold_begin(struct pci_claim *c) {
     if (!screen_watch_started) {
         screen_watch_started = true;
@@ -176,20 +207,21 @@ static void screen_hold_begin(struct pci_claim *c) {
     /* Said while the screen still shows it: a screen that stops changing next tells why. */
     kprintf("pci: %02x:%02x.%u: app %d holds the screen while its driver starts or stops the device\n",
             c->d->bus, c->d->dev, c->d->func, task_process()->pid);
-    uint64_t irq = irq_save();
+    int app = task_process()->pid;
+    uint64_t irq = spin_lock(&screen_hold_lock);
     screen_holder = c;
-    screen_holder_app = task_process()->pid;
+    screen_holder_app = app;
     screen_held_since = uptime_ms();
     screen_holder_stopped = false;
     wq_wake_all(&screen_watch_wq);
-    irq_restore(irq);
+    spin_unlock(&screen_hold_lock, irq);
 }
 
 static void screen_hold_end(struct pci_claim *c) {
-    uint64_t irq = irq_save();
+    uint64_t irq = spin_lock(&screen_hold_lock);
     if (screen_holder == c) screen_holder = NULL;
     wq_wake_all(&screen_watch_wq);
-    irq_restore(irq);
+    spin_unlock(&screen_hold_lock, irq);
 }
 
 /* Whoever draws the screen (the desktop, or the text console when there is none) draws all of it
@@ -282,9 +314,10 @@ static bool screen_give_back(struct pci_claim *c) {
 static void claim_release(struct object *o) {
     struct pci_claim *c = o->priv;
     struct pci_device *d = c->d;
-    c->released = true;
+    __atomic_store_n(&c->released, true, __ATOMIC_SEQ_CST);
     shared_revoke_claim(c); /* no process reaches the registers any more */
     interrupts_off(c);
+    mutex_lock(&claim_mutex); /* no claim forms a group with these functions meanwhile */
     bool left_running;
     bool stopped = pci_disable_busmaster(d, &left_running);
     if (c->domain && c->domain->nmembers > 1) {
@@ -303,7 +336,7 @@ static void claim_release(struct object *o) {
     bool blocked = c->domain && iommu_block(c->domain);
     bool running = left_running || !stopped || !pci_requests_done(d);
     d->needs_reset |= running;
-    c->dma_unsafe = !blocked;
+    __atomic_store_n(&c->dma_unsafe, !blocked, __ATOMIC_RELEASE);
     if (running)
         kprintf("pci: %02x:%02x.%u: %s; %s%s\n", d->bus, d->dev, d->func,
                 left_running ? "its driver ended without stopping it (bus mastering was on)"
@@ -314,6 +347,7 @@ static void claim_release(struct object *o) {
     else if (!blocked)
         kprintf("pci: %02x:%02x.%u: bus mastering is off, but posted DMA drain is unconfirmed; remaining DMA memory stays out of use\n",
                 d->bus, d->dev, d->func);
+    mutex_unlock(&claim_mutex);
     /* Revoke CPU access before returning screen holds. Resuming CPU framebuffer writes is only
        a best-effort redraw: neither BME clear nor IOMMU blocking rebuilds a GPU's BAR/scanout. */
     acpi_node_unwatch(c->acpi_watch); /* no Notify reaches the claim any more */
@@ -330,11 +364,14 @@ static void claim_release(struct object *o) {
         screen_say(c, "its driver ended while the desktop was drawn into its scanout; the boot screen is drawn "
                       "again, but the display may not show it: nothing sets the display engine back");
     }
+    /* the last handle is closed: no pci_user_hold_screen of the claim's runs any more */
     if (c->screen_holds) screen_hold_end(c);
     if (!c->screen_holds && given_back) screen_repaint();
     for (; c->screen_holds; c->screen_holds--)
         screen_release();
+    mutex_lock(&claim_mutex);
     d->claimed = false;
+    mutex_unlock(&claim_mutex);
     kprintf("pci: %02x:%02x.%u released\n", d->bus, d->dev, d->func);
     claim_drop(c);
 }
@@ -345,12 +382,12 @@ static struct pci_claim *claim_of(struct handle *h) { return pci_user_is_claim(h
 
 struct pci_claim *pci_user_hold(struct handle *h) {
     struct pci_claim *c = claim_of(h);
-    if (c) c->refs++;
+    if (c) __atomic_fetch_add(&c->refs, 1, __ATOMIC_RELAXED); /* h holds one already */
     return c;
 }
 void pci_user_drop(struct pci_claim *c) { if (c) claim_drop(c); }
-bool pci_user_revoked(const struct pci_claim *c) { return c && c->released; }
-bool pci_user_dma_reusable(const struct pci_claim *c) { return !c || !c->dma_unsafe; }
+bool pci_user_revoked(const struct pci_claim *c) { return c && __atomic_load_n(&c->released, __ATOMIC_SEQ_CST); }
+bool pci_user_dma_reusable(const struct pci_claim *c) { return !c || !__atomic_load_n(&c->dma_unsafe, __ATOMIC_ACQUIRE); }
 uint64_t pci_user_dma_limit(const struct pci_claim *c) { return iommu_dma_limit(c->domain); }
 bool pci_user_dma_map(struct pci_claim *c, const uint64_t *frames, uint64_t base, size_t count) {
     return !c->domain || iommu_map(c->domain, frames, base, count);
@@ -437,6 +474,7 @@ static bool claim_owns(const struct pci_claim *c, const struct pci_device *m, co
     return f == c->d || f == m || (c->domain && iommu_member(c->domain, f));
 }
 
+/* claim_mutex held. */
 static void others_reserve(const struct pci_claim *c, const struct pci_device *m, const struct pci_device *port,
                            bool reserve) {
     for (int i = 0; i < pci_count(); i++) {
@@ -482,7 +520,8 @@ static bool reset_finish(struct pci_claim *c, struct pci_device *m) {
     return true;
 }
 
-/* The claim's domain (iommu_attach). Forming the group reads its functions' ACS, which no
+/* claim_mutex held, from here to pci_user_claim.
+   The claim's domain (iommu_attach). Forming the group reads its functions' ACS, which no
    access but a reset's own may reach while one is under reset (dev/pci.h): such a reset is
    finished first, its function reserved meanwhile, and the group formed again. Only the
    group's own resets: a claim does not wait on other functions'. One that another claim or
@@ -559,6 +598,36 @@ static bool claim_recover(struct pci_claim *c) {
     return !(current_task && current_task->killed);
 }
 
+/* claim_mutex held: the claim formed, or nothing of it left and d free again. */
+static int64_t claim_form(struct pci_claim *c, struct handle **out) {
+    struct pci_device *d = c->d;
+    d->claimed = true; /* reserved across the resets' waits */
+    /* From here the function reaches only the DMA objects made through the claim. */
+    int r = claim_attach(c);
+    if (r < 0) {
+        d->claimed = false;
+        return r;
+    }
+    if (!claim_recover(c)) {
+        /* FLR may still be pending on any member: retain its device-owned saved state,
+           expose no handle, and re-block the whole group before dropping the reservation. */
+        if (c->domain) iommu_domain_free(c->domain);
+        d->claimed = false;
+        return -N_ERR_NOT_READY;
+    }
+    guards_init(c); /* pending FLR is complete: capability offsets/control now describe the handle */
+    /* BAR sizes come from enumeration (pci_bar_size): measuring them here would switch memory
+       decoding off under a running function, and the boot screen may be drawn through it. */
+    struct handle *h = handle_open(&c->object, true);
+    if (!h) {
+        if (c->domain) iommu_domain_free(c->domain);
+        d->claimed = false;
+        return -N_ERR_NO_MEMORY;
+    }
+    *out = h;
+    return 0;
+}
+
 int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct handle **out) {
     struct task *t = task_process();
     /* Boot options: noappdrivers keeps every function with the kernel; appdrivers=any lets any
@@ -570,42 +639,21 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct handle **o
     if (!d) return -N_ERR_NOT_FOUND;
     /* A bridge's registers route other devices' memory, buses and resets. */
     if (d->cls == 0x06) return -N_ERR_DENIED;
-    if (d->kernel_owned || d->claimed) return -N_ERR_BUSY;
     struct pci_claim *c = kzalloc(sizeof *c);
     if (!c) return -N_ERR_NO_MEMORY;
     object_init(&c->object, &claim_ops, c); /* the claim ends when its last handle closes */
     c->d = d;
     c->refs = 1;
-    d->claimed = true; /* reserved across the resets' waits */
-    /* From here the function reaches only the DMA objects made through the claim. */
-    int r = claim_attach(c);
+    mutex_lock(&claim_mutex);
+    int64_t r = d->kernel_owned || d->claimed ? -N_ERR_BUSY : claim_form(c, out);
+    mutex_unlock(&claim_mutex);
     if (r < 0) {
-        d->claimed = false;
         kfree(c);
         return r;
-    }
-    if (!claim_recover(c)) {
-        /* FLR may still be pending on any member: retain its device-owned saved state,
-           expose no handle, and re-block the whole group before dropping the reservation. */
-        if (c->domain) iommu_domain_free(c->domain);
-        d->claimed = false;
-        kfree(c);
-        return -N_ERR_NOT_READY;
-    }
-    guards_init(c); /* pending FLR is complete: capability offsets/control now describe the handle */
-    /* BAR sizes come from enumeration (pci_bar_size): measuring them here would switch memory
-       decoding off under a running function, and the boot screen may be drawn through it. */
-    struct handle *h = handle_open(&c->object, true);
-    if (!h) {
-        if (c->domain) iommu_domain_free(c->domain);
-        d->claimed = false;
-        kfree(c);
-        return -N_ERR_NO_MEMORY;
     }
     kprintf("pci: %02x:%02x.%u (%04x:%04x) claimed by pid %d%s\n", bus, dev, func, d->vendor, d->device, t->pid,
             c->domain ? "" : iommu_active() ? "; the IOMMU cannot isolate it: its DMA reaches all of memory"
                                             : "; no IOMMU isolates it: its DMA reaches all of memory");
-    *out = h;
     return 0;
 }
 
@@ -851,17 +899,17 @@ int64_t pci_user_acpi_eval(struct handle *h, uint32_t which, const char *name, c
     return acpi_node_eval(node, name, args, nargs, data, data_size, out, out_size);
 }
 
-/* Notify(function node, value), on the acpi thread. */
+/* Notify(function node, value), on the acpi thread (any CPU). */
 static void acpi_noted(void *context, uint64_t value) {
     struct pci_claim *c = context;
-    uint64_t irq = irq_save();
+    uint64_t irq = spin_lock(&c->notes_lock);
     if (c->acpi_count == CLAIM_ACPI_NOTES) {
         c->acpi_first = (c->acpi_first + 1) % CLAIM_ACPI_NOTES;
         c->acpi_count--;
     }
     c->acpi_notes[(c->acpi_first + c->acpi_count++) % CLAIM_ACPI_NOTES] = (uint32_t)value;
     wq_wake_all(&c->acpi_wq);
-    irq_restore(irq);
+    spin_unlock(&c->notes_lock, irq);
 }
 
 int64_t pci_user_acpi_notify_take(struct handle *h, int64_t timeout_ms) {
@@ -875,45 +923,48 @@ int64_t pci_user_acpi_notify_take(struct handle *h, int64_t timeout_ms) {
     mutex_unlock(&c->acpi_lock);
     if (!watched) return c->acpi_node ? -N_ERR_NO_MEMORY : -N_ERR_NOT_FOUND;
     uint64_t give_up = timeout_ms > 0 ? uptime_ms() + (uint64_t)timeout_ms : 0;
+    uint64_t irq = spin_lock(&c->notes_lock);
     for (;;) {
-        uint64_t irq = irq_save();
         if (c->acpi_count) {
             uint32_t value = c->acpi_notes[c->acpi_first];
             c->acpi_first = (c->acpi_first + 1) % CLAIM_ACPI_NOTES;
             c->acpi_count--;
-            irq_restore(irq);
+            spin_unlock(&c->notes_lock, irq);
             return value;
         }
-        if (current_task->killed) { irq_restore(irq); return -N_ERR_STOPPED; }
-        if (!timeout_ms) { irq_restore(irq); return -N_ERR_TIMEOUT; }
-        if (timeout_ms < 0) wq_wait(&c->acpi_wq);
-        else {
-            uint64_t now = uptime_ms();
-            if (now >= give_up || !wq_wait_timeout(&c->acpi_wq, give_up - now)) {
-                bool late = c->acpi_count != 0;
-                irq_restore(irq);
-                if (!late) return -N_ERR_TIMEOUT;
-                continue;
-            }
-        }
-        irq_restore(irq);
+        if (current_task->killed) { spin_unlock(&c->notes_lock, irq); return -N_ERR_STOPPED; }
+        if (!timeout_ms) { spin_unlock(&c->notes_lock, irq); return -N_ERR_TIMEOUT; }
+        uint64_t now = uptime_ms();
+        if (timeout_ms > 0 && now >= give_up) { spin_unlock(&c->notes_lock, irq); return -N_ERR_TIMEOUT; }
+        /* acpi_noted takes notes_lock to add a value, then wakes acpi_wq */
+        if (timeout_ms < 0) wq_wait_locked(&c->acpi_wq, &c->notes_lock);
+        else wq_wait_locked_timeout(&c->acpi_wq, &c->notes_lock, give_up - now);
+        spin_take(&c->notes_lock); /* a value that came at the time limit is still taken */
     }
 }
 
+/* The claim's threads one at a time under screen_lock: a count and the hold it begins or ends
+   change together. The redraw after the last hold comes after it. */
 int64_t pci_user_hold_screen(struct handle *h, bool hold) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (screen_bar(c->d) < 0 && __atomic_load_n(&screen_owner, __ATOMIC_ACQUIRE) != c) return -N_ERR_NOT_FOUND;
+    int64_t r = 0;
+    mutex_lock(&screen_lock);
     if (hold) {
-        if (c->screen_holds == UINT32_MAX) return -N_ERR_BUSY;
-        if (!c->screen_holds++) screen_hold_begin(c);
-        fb_hold();
-        return 0;
+        if (c->screen_holds == UINT32_MAX) r = -N_ERR_BUSY;
+        else {
+            if (!c->screen_holds++) screen_hold_begin(c);
+            fb_hold();
+        }
+    } else if (!c->screen_holds) {
+        r = -N_ERR_INVALID;
+    } else if (!--c->screen_holds) {
+        screen_hold_end(c);
     }
-    if (!c->screen_holds) return -N_ERR_INVALID;
-    if (!--c->screen_holds) screen_hold_end(c);
-    screen_release();
-    return 0;
+    mutex_unlock(&screen_lock);
+    if (!hold && !r) screen_release();
+    return r;
 }
 
 static bool config_access_ok(uint32_t offset, uint32_t width) {
@@ -943,10 +994,13 @@ int64_t pci_user_config_read(struct handle *h, uint32_t target, uint32_t offset,
         t = pci_find_function(target >> 8, (target >> 3) & 31, target & 7);
         if (!t) return -N_ERR_NOT_FOUND;
         if (!may_read(c->d, t)) return -N_ERR_DENIED;
-        /* under an FLR (dev/pci.h): another claim's, or one an ended claim left for a later claim to finish */
-        if (t->reset) return -N_ERR_NOT_READY;
     }
-    uint32_t v = pci_read32(t->bus, t->dev, t->func, offset & ~3u) >> ((offset & 3) * 8);
+    uint32_t v;
+    if (t == c->d) v = pci_read32(t->bus, t->dev, t->func, offset & ~3u);
+    /* under an FLR (dev/pci.h): another claim's, or one an ended claim left for a later claim to
+       finish; checked and read in one step against a reset beginning on another CPU */
+    else if (!pci_config_read_unless_reset(t, (uint16_t)offset, &v)) return -N_ERR_NOT_READY;
+    v >>= (offset & 3) * 8;
     return width == 4 ? v : v & ((1u << (width * 8)) - 1);
 }
 
@@ -1009,14 +1063,24 @@ static unsigned floor_pow2(unsigned n) {
     return p;
 }
 
+static int64_t interrupts_on(struct pci_claim *c, uint32_t count);
+
 int64_t pci_user_interrupts(struct handle *h, uint32_t count) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
+    mutex_lock(&c->vectors_mutex);
+    int64_t r = interrupts_on(c, count);
+    mutex_unlock(&c->vectors_mutex);
+    return r;
+}
+
+/* vectors_mutex held. */
+static int64_t interrupts_on(struct pci_claim *c, uint32_t count) {
     struct pci_device *d = c->d;
     interrupts_off(c);
     if (!count) return 0;
     if (count > CLAIM_VECTORS) count = CLAIM_VECTORS;
-    uint32_t dest = lapic_current_id(); /* the BSP: device interrupts are only handled there */
+    uint32_t dest = pci_interrupt_dest(); /* CPU 0: device interrupts are handled there */
     if (dest > 0xFF) return -N_ERR_UNSUPPORTED;
     unsigned table = msix_table_size(d), most = pci_msi_max_vectors(d);
     bool msix = table != 0;
@@ -1026,12 +1090,12 @@ int64_t pci_user_interrupts(struct handle *h, uint32_t count) {
     for (; n; n = msix ? n - 1 : n / 2)
         if ((base = irq_vector_alloc(n, msix ? 1 : n)) >= 0) break;
     if (base < 0) return -N_ERR_BUSY;
-    uint64_t irq = irq_save();
+    uint64_t irq = spin_lock(&claim_irq_lock);
     c->vector_base = (unsigned)base;
     c->vectors = n;
-    c->pending = 0;
+    __atomic_store_n(&c->pending, 0, __ATOMIC_RELAXED);
     for (unsigned i = 0; i < n; i++) claim_of_vector[base + i] = c;
-    irq_restore(irq);
+    spin_unlock(&claim_irq_lock, irq);
     for (unsigned i = 0; i < n; i++) vector_register(base + (int)i, claim_isr);
     bool ok;
     if (msix) {
@@ -1050,23 +1114,19 @@ int64_t pci_user_interrupt_take(struct handle *h, int64_t timeout_ms) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     uint64_t give_up = timeout_ms > 0 ? uptime_ms() + (uint64_t)timeout_ms : 0;
+    uint64_t irq = spin_lock(&claim_irq_lock);
     for (;;) {
-        uint64_t irq = irq_save();
-        uint32_t got = c->pending;
-        c->pending = 0;
-        if (got) { irq_restore(irq); return got; }
-        if (current_task->killed) { irq_restore(irq); return -N_ERR_STOPPED; }
-        if (!timeout_ms || !c->vectors) { irq_restore(irq); return c->vectors ? -N_ERR_TIMEOUT : -N_ERR_NOT_READY; }
-        if (timeout_ms < 0) wq_wait(&c->wq);
-        else {
-            uint64_t now = uptime_ms();
-            if (now >= give_up || !wq_wait_timeout(&c->wq, give_up - now)) {
-                bool late = c->pending != 0;
-                irq_restore(irq);
-                if (!late) return -N_ERR_TIMEOUT;
-                continue;
-            }
-        }
-        irq_restore(irq);
+        uint32_t got = __atomic_exchange_n(&c->pending, 0, __ATOMIC_ACQUIRE);
+        if (got) { spin_unlock(&claim_irq_lock, irq); return got; }
+        int64_t r = 0;
+        uint64_t now = uptime_ms();
+        if (current_task->killed) r = -N_ERR_STOPPED;
+        else if (!c->vectors) r = -N_ERR_NOT_READY;
+        else if (!timeout_ms || (timeout_ms > 0 && now >= give_up)) r = -N_ERR_TIMEOUT;
+        if (r) { spin_unlock(&claim_irq_lock, irq); return r; }
+        /* the interrupt handler and interrupts_off take claim_irq_lock, then wake c->wq */
+        if (timeout_ms < 0) wq_wait_locked(&c->wq, &claim_irq_lock);
+        else wq_wait_locked_timeout(&c->wq, &claim_irq_lock, give_up - now);
+        spin_take(&claim_irq_lock); /* a message that came at the time limit is still taken */
     }
 }

@@ -44,13 +44,15 @@ struct app_record {
     int pid;
     int status;
     bool ended;
-    struct wait_queue wait;
+    struct wait_queue wait; /* its lock guards pid, status and ended */
     struct object object; /* freed when the app has ended and its last handle is closed */
 };
 
 static struct app_record *app_record(struct handle *h) { return h->object->priv; }
 
-static uint32_t app_ready(struct handle *h) { return app_record(h)->ended ? N_EVENT_APP_ENDED : 0; }
+static uint32_t app_ready(struct handle *h) {
+    return __atomic_load_n(&app_record(h)->ended, __ATOMIC_ACQUIRE) ? N_EVENT_APP_ENDED : 0;
+}
 static void app_release(struct object *o) { kfree(o->priv); }
 static const struct object_ops app_ops = {.kind = N_KIND_APP, .ready = app_ready, .release = app_release};
 
@@ -70,11 +72,12 @@ int proc_app_create(struct handle **out) {
     return 0;
 }
 
-/* The app's process is ending; BSP IRQ guard held. */
 void proc_app_ended(struct object *o, int status) {
     struct app_record *rec = o->priv;
+    uint64_t flags = spin_lock(&rec->wait.lock);
     rec->status = status;
-    rec->ended = true;
+    __atomic_store_n(&rec->ended, true, __ATOMIC_RELEASE);
+    spin_unlock(&rec->wait.lock, flags);
     wq_wake_all(&rec->wait);
     object_notify(o);
 }
@@ -86,35 +89,30 @@ int proc_app_id(struct handle *h) { return app_record(h)->pid; }
 
 int proc_app_pid(struct handle *h) {
     struct app_record *rec = app_record(h);
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock(&rec->wait.lock);
     int pid = rec->ended ? 0 : rec->pid;
-    irq_restore(flags);
+    spin_unlock(&rec->wait.lock, flags);
     return pid;
 }
 
 int proc_app_result(struct handle *h, uint64_t timeout_ms, int *status) {
     struct app_record *rec = app_record(h);
     uint64_t deadline = uptime_ms() + timeout_ms;
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock(&rec->wait.lock);
     while (!rec->ended) {
         uint64_t now = uptime_ms();
         if (timeout_ms != UINT64_MAX && now >= deadline) {
-            irq_restore(flags);
+            spin_unlock(&rec->wait.lock, flags);
             return timeout_ms ? -N_ERR_TIMEOUT : -N_ERR_NOT_READY;
         }
-        if (current_task->killed) { irq_restore(flags); return -N_ERR_STOPPED; }
-        if (timeout_ms == UINT64_MAX) wq_wait(&rec->wait);
-        else wq_wait_timeout(&rec->wait, deadline - now);
+        if (current_task->killed) { spin_unlock(&rec->wait.lock, flags); return -N_ERR_STOPPED; }
+        if (timeout_ms == UINT64_MAX) wq_wait_locked(&rec->wait, &rec->wait.lock);
+        else wq_wait_locked_timeout(&rec->wait, &rec->wait.lock, deadline - now);
+        spin_take(&rec->wait.lock);
     }
     *status = rec->status;
-    irq_restore(flags);
+    spin_unlock(&rec->wait.lock, flags);
     return 0;
-}
-
-bool proc_app_result_ap(struct handle *h, int64_t timeout_ms, int64_t *result) {
-    if (!proc_app_is(h) || timeout_ms != 0 || __atomic_load_n(&app_record(h)->ended, __ATOMIC_ACQUIRE)) return false;
-    *result = -N_ERR_NOT_READY;
-    return true;
 }
 
 /* A new handle on a running app, by the identifier the app list shows. An app
@@ -122,7 +120,7 @@ bool proc_app_result_ap(struct handle *h, int64_t timeout_ms, int64_t *result) {
 int proc_app_open(int pid, struct handle **out) {
     struct object *spare = app_new();
     if (!spare) return -N_ERR_NO_MEMORY;
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock(&task_lock);
     struct task *t = task_find(pid);
     struct object *o = NULL;
     if (t && t->is_user && !t->is_thread && t->state != TASK_ZOMBIE && !t->exiting) {
@@ -135,7 +133,7 @@ int proc_app_open(int pid, struct handle **out) {
         o = t->app;
         object_ref(o);
     }
-    irq_restore(flags);
+    spin_unlock(&task_lock, flags);
     if (spare) app_release(spare);
     if (!o) return -N_ERR_NO_APP;
     *out = handle_open(o, false);
@@ -286,7 +284,12 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     /* pre-fault what the start needs plus 64 KiB; the rest grows on demand */
     uint64_t prefault = ALIGN_UP(strings + pointer_bytes + 64 + 65536, PAGE_SIZE);
     if (vmm_user_alloc(t->pml4, USER_STACK_TOP - prefault, prefault, VM_W) < 0) { r = -N_ERR_NO_MEMORY; goto fail; }
-    if (handle_table_reserve(t, l->handle_count) < 0) { r = -N_ERR_NO_MEMORY; goto fail; }
+    for (size_t i = 0; i < l->handle_count; i++)
+        if (l->handles[i] && handle_table_put(t, i, handle_ref(l->handles[i])) < 0) {
+            handle_close(l->handles[i]);
+            r = -N_ERR_NO_MEMORY;
+            goto fail;
+        }
     uint64_t sp = USER_STACK_TOP;
     for (int i = settings - 1; i >= 0; i--) {
         size_t n = strlen(SETTING(i)) + 1;
@@ -328,16 +331,19 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     kpush(t, (uint64_t)user_trampoline);
     for (int i = 0; i < 6; i++) kpush(t, 0);
 
-    for (size_t i = 0; i < l->handle_count; i++)
-        if (l->handles[i]) t->handles[i] = handle_ref(l->handles[i]);
-    t->parent = l->parent;
     if (l->app) {
         /* The task's own reference keeps the record until it has reported. */
         object_ref(l->app);
-        ((struct app_record *)l->app->priv)->pid = t->pid;
-        t->app = l->app;
-        t->app_launched = true;
+        struct app_record *rec = l->app->priv;
+        uint64_t f = spin_lock(&rec->wait.lock);
+        rec->pid = t->pid;
+        spin_unlock(&rec->wait.lock, f);
     }
+    uint64_t f = spin_lock(&task_lock); /* its family's links */
+    t->parent = l->parent;
+    t->app = l->app;
+    t->app_launched = l->app != NULL;
+    spin_unlock(&task_lock, f);
     sched_make_ready(t);
     return t->pid;
 
@@ -353,19 +359,11 @@ fail:
         vmm_free_space(t->pml4);
     }
     t->pml4 = kernel_pml4;
-    t->state = TASK_ZOMBIE;
     t->parent = NULL;
-    /* nobody waits for it: free right away */
-    {
-        uint64_t f = irq_save();
-        struct task **pp = &task_list;
-        while (*pp && *pp != t) pp = &(*pp)->all_next;
-        if (*pp) *pp = t->all_next;
-        irq_restore(f);
-        vfree(t->kstack, KSTACK_PAGES);
-        if (t->handles != t->initial_handles) kfree(t->handles);
-        kfree(t);
-    }
+    /* nobody waits for it: its handles are closed and it is freed right away */
+    size_t at = 0;
+    for (struct handle *h; (h = handle_table_next(t, &at, NULL));) handle_close(h);
+    task_discard(t);
     return r;
 }
 

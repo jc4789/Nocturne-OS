@@ -22,16 +22,19 @@
    still take part when it comes back by itself after a cold boot (cold_ok:
    the firmware's display).
 
-   Quiesce callbacks run on the BSP with interrupts off: they may only poll
-   (io_wait, the TSC), never sleep or wait for uptime_ms, which stands still.
-   They return false when the device did not confirm it stopped (its DMA may
-   still run): a sleep or hibernation is then called off and the devices
-   stopped so far are resumed; a shut down goes on.
-   Resume callbacks run on the BSP with interrupts on, before any other thread
-   (the AML of _WAK is frozen too, dev/acpi.h): they may poll uptime_ms but
-   must not sleep. The device lost its state, or was only quiesced (a sleep
-   called off); its PCI configuration space is already back (dev/pci.c). They
-   return false when the device did not come back, which the user is told. */
+   Quiesce callbacks run on one CPU with its interrupts off: they may only poll
+   (io_wait, the TSC), never sleep or wait for uptime_ms, which may stand still.
+   For a sleep or hibernation that CPU is CPU 0 and every other CPU is parked;
+   for a shut down or restart it is the power thread's, and the other CPUs
+   still run kernel threads. They return false when the device did not
+   confirm it stopped (its DMA may still run): a sleep or hibernation is then
+   called off and the devices stopped so far are resumed; a shut down goes on.
+   Resume callbacks run on CPU 0 with interrupts on, every other CPU still
+   parked and no other thread running (the AML of _WAK is frozen too,
+   dev/acpi.h): they may poll uptime_ms but must not sleep. The device lost
+   its state, or was only quiesced (a sleep called off); its PCI configuration
+   space is already back (dev/pci.c). They return false when the device did
+   not come back, which the user is told. */
 #pragma once
 #include <stdbool.h>
 
@@ -57,11 +60,12 @@ struct pm_device {
 enum pm_action { PM_POWER_OFF, PM_REBOOT, PM_SLEEP, PM_HIBERNATE };
 
 void pm_init(void);
-void pm_register(struct pm_device *d); /* d stays owned by the driver for good */
+void pm_register(struct pm_device *d); /* any CPU; d stays owned by the driver for good */
 /* Ask for a power change. From a menu (interactive), apps that keep a window
    open cancel a shut down or restart; asking again within a minute closes them
    anyway. Otherwise (an app, the host) apps get a few seconds and are then
-   stopped. Sleep closes nothing. Never blocks. */
+   stopped. Sleep closes nothing. Never blocks: any CPU, any context, also an
+   interrupt handler or under a spinlock other than the wait queues'. */
 void pm_request(enum pm_action action, bool interactive);
 bool pm_stopping(void); /* a power change has passed the point of no return */
 /* Whether sleep can be offered: the firmware has S3, there is a wake page, every registered

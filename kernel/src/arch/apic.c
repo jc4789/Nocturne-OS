@@ -326,7 +326,7 @@ void lapic_ident(struct lapic_ident *out) {
     out->xaidn = xaidn();
 }
 
-bool lapic_worker_init(void) {
+bool lapic_ap_init(void) {
     if (!available) return false;
     uint32_t a, b, c, d;
     cpuid(1, 0, &a, &b, &c, &d);
@@ -363,6 +363,26 @@ bool lapic_send_ipi(uint32_t apic_id, uint8_t vector) {
             /* ICR highはxAPIC専用。汎用MSR helperへ0x310を渡さない。 */
             mmio_write32(lapic + 0x310 / 4, apic_id << 24);
             mmio_write32(lapic + 0x300 / 4, vector); /* fixed, physical, edge-triggered */
+            ok = xapic_ipi_ready();
+        }
+    }
+    irq_restore(flags);
+    return ok;
+}
+
+/* An NMI (delivery mode 100b, the vector ignored): it reaches a CPU whose interrupts are off. */
+bool lapic_send_nmi(uint32_t apic_id) {
+    if (!lapic_addressable(apic_id)) return false;
+    uint64_t flags = irq_save();
+    bool ok = true;
+    if (x2_mode) {
+        __asm__ volatile("mfence; lfence" : : : "memory");
+        wrmsr(X2APIC_ICR, ((uint64_t)apic_id << 32) | 0x400);
+    } else {
+        ok = xapic_ipi_ready();
+        if (ok) {
+            mmio_write32(lapic + 0x310 / 4, apic_id << 24);
+            mmio_write32(lapic + 0x300 / 4, 0x400);
             ok = xapic_ipi_ready();
         }
     }
@@ -428,7 +448,7 @@ bool lapic_timer_start(unsigned hz, int vector) {
     return true;
 }
 
-bool lapic_runner_timer_start(void) {
+bool lapic_tick_start(void) {
     if (!available || !timer_reload) return false;
     lapic_write(LAPIC_TIMER_DIV, 0xB);
     lapic_write(LAPIC_LVT_TIMER, 0x20000 | (uint32_t)timer_vector);

@@ -112,12 +112,12 @@ static struct transfer *transfers;
 _Static_assert(WEB_RESPONSE_HEADERS_MAX >= WEBNET_RESPONSE_HEADERS_MAX, "Browser must retain complete native response headers");
 
 #define CONSOLE_LINE 1024
-/* The page's console, and the engine's own measurement (WEB_CONSOLE_TRACE:
-   profiles, requests, media timing) in a panel of its own, so that a trace
-   every two seconds never buries what the page itself reported. */
+/* Every line, the page's and the engine's own measurement (WEB_CONSOLE_TRACE:
+   profiles, requests, media timing), is in the Console panel; the Trace panel
+   has the engine's alone, so that they can be read without the page's. */
 struct console_log { char (*lines)[CONSOLE_LINE]; int n, capacity, skip; };
-/* Traces arrive for as long as a page plays: the panel keeps the newer half of a long session. */
-#define CONSOLE_TRACE_MAX 8192
+/* Traces arrive for as long as a page plays: a log keeps the newer half of a long session. */
+#define CONSOLE_MAX 8192
 static unsigned long console_sequence;
 static char *console_startup;
 static size_t console_startup_length;
@@ -631,7 +631,7 @@ static void draw_console(void) {
         gfx_fill(c, 0, top, view.w, h, DT_BG);
         char heading[192];
         snprintf(heading, sizeof heading, "%s  [PgUp/PgDn: history] [Ctrl+Shift+C: copy log] [Ctrl+K: clear]  %d/%d%s",
-                 log == &tab->console_trace ? "Engine trace: profiles, requests, media timing" : "JavaScript console",
+                 log == &tab->console_trace ? "Engine trace: profiles, requests, media timing" : "Console: the page's lines and the engine's trace",
                  log->n - log->skip, log->n, log->skip ? " (paused)" : "");
         gfx_text(c, 8, top + 4, heading, ui_theme.textDim, TRANSPARENT, FONT_SMALL);
         canvas_t clip = *c;
@@ -668,15 +668,28 @@ static void console_system_log(const char *level, const char *message) {
         off += part;
     } while (off < len);
 }
-static void console_add(const char *level, const char *message) {
-    const char *p = message ? message : "";
-    if (log_console) console_system_log(level, p);
-    struct console_log *log = level && !strcmp(level, "trace") ? &tab->console_trace : &tab->console_page;
-    if (log == &tab->console_trace && log->n >= CONSOLE_TRACE_MAX) {
+/* one line at the end of log. false: no memory for it */
+static bool console_push(struct console_log *log, const char *line) {
+    if (log->n >= CONSOLE_MAX) {
         int drop = log->n / 2;
         memmove(log->lines, log->lines + drop, (size_t)(log->n - drop) * sizeof *log->lines);
         log->n -= drop; log->skip = MAX(0, log->skip - drop);
     }
+    if (log->n == log->capacity) {
+        int capacity = log->capacity ? MIN(log->capacity * 2, CONSOLE_MAX) : 64;
+        void *grown = realloc(log->lines, (size_t)capacity * sizeof *log->lines);
+        if (!grown) return false; /* Keep existing log; host serial logging remains available. */
+        log->lines = grown; log->capacity = capacity;
+    }
+    memcpy(log->lines[log->n], line, strlen(line) + 1);
+    log->n++;
+    if (log->skip) log->skip = MIN(log->skip + 1, MAX(log->n - console_visible(), 0));
+    return true;
+}
+static void console_add(const char *level, const char *message) {
+    const char *p = message ? message : "";
+    if (log_console) console_system_log(level, p);
+    bool trace = level && !strcmp(level, "trace");
     uint64_t now = n_clock_uptime_ms();
     unsigned long sequence = ++console_sequence;
     int glyph = w ? MAX(gfx_text_width("M", FONT_SMALL), 1) : 8;
@@ -690,19 +703,11 @@ static void console_add(const char *level, const char *message) {
             if (offset + part < n)
                 while (part && ((unsigned char)p[offset + part] & 0xc0) == 0x80) part--;
             if (!part && offset < n) part = MIN(n - offset, 4);
-            if (log->n == log->capacity) {
-                if (log->n == INT_MAX) return;
-                int capacity = log->capacity ? (log->capacity > INT_MAX / 2 ? INT_MAX : log->capacity * 2) : 64;
-                if ((size_t)capacity > SIZE_MAX / sizeof *log->lines) return;
-                void *grown = realloc(log->lines, (size_t)capacity * sizeof *log->lines);
-                if (!grown) return; /* Keep existing log; host serial logging remains available. */
-                log->lines = grown; log->capacity = capacity;
-            }
-            snprintf(log->lines[log->n], CONSOLE_LINE, "[%s] #%lu @%lu.%03lu%s %.*s",
+            char line[CONSOLE_LINE];
+            snprintf(line, sizeof line, "[%s] #%lu @%lu.%03lu%s %.*s",
                      level ? level : "log", sequence, (unsigned long)(now / 1000),
                      (unsigned long)(now % 1000), offset ? " +" : "", (int)part, p + offset);
-            log->n++;
-            if (log->skip && log->skip < INT_MAX) log->skip = MIN(log->skip + 1, MAX(log->n - console_visible(), 0));
+            if (!console_push(&tab->console_page, line) || (trace && !console_push(&tab->console_trace, line))) return;
             offset += part;
         } while (offset < n);
         tab->console_dirty = true;

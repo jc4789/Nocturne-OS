@@ -6,6 +6,7 @@
 #include "dev/usb.h"
 #include "mm/heap.h"
 #include "net/net.h"
+#include "sys/sched.h"
 
 #define CDC_ECM 0x06
 #define CDC_NCM 0x0D
@@ -35,9 +36,15 @@ struct usbnet {
     unsigned header; /* NTH16, padding, NDP16 and padding before the datagram */
 };
 
-static struct usbnet *adapter; /* the one the stack uses */
-static struct netif usb_netif;
-static bool registered;
+/* The adapter the stack uses. Sends come from the stack on any CPU (under its lock, one at a
+   time), arrival and removal from the usb thread: usbnet_lock (a mutex, as usb_send is a call
+   that may take the host controller's locks) guards adapter and its dev, so a removed device is
+   never sent to. Order: the stack's net_lock, then usbnet_lock, then the host controller's
+   locks; net_register is called without usbnet_lock. */
+static struct mutex usbnet_lock;
+static struct usbnet *adapter;
+static int usbnet_send(const void *frame, size_t len);
+static struct netif usb_netif = {.send = usbnet_send};
 
 static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t get32(const uint8_t *p) { return get16(p) | (uint32_t)get16(p + 2) << 16; }
@@ -56,10 +63,8 @@ bool usbnet_claims(const struct usb_interface_desc *intf) {
 
 /* ---- data path ---- */
 
-static int usbnet_send(const void *frame, size_t len) {
-    struct usbnet *n = adapter;
-    if (!n || !n->dev) return -N_ERR_NETWORK_DOWN;
-    if (len > n->max_segment) return -N_ERR_INVALID;
+/* usbnet_lock held, n->dev there. */
+static int usbnet_queue(struct usbnet *n, const void *frame, size_t len) {
     int r;
     if (!n->ncm) {
         r = usb_send(n->dev, n->out, frame, (unsigned)len, NULL, 0);
@@ -80,6 +85,17 @@ static int usbnet_send(const void *frame, size_t len) {
         r = usb_send(n->dev, n->out, h, n->header, frame, (unsigned)len);
     }
     return r > 0 ? 0 : r == 0 ? -N_ERR_NOT_READY : -N_ERR_IO;
+}
+
+static int usbnet_send(const void *frame, size_t len) {
+    mutex_lock(&usbnet_lock);
+    struct usbnet *n = adapter;
+    int r;
+    if (!n || !n->dev) r = -N_ERR_NETWORK_DOWN;
+    else if (len > n->max_segment) r = -N_ERR_INVALID;
+    else r = usbnet_queue(n, frame, len);
+    mutex_unlock(&usbnet_lock);
+    return r;
 }
 
 static void tx_done(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len) {
@@ -232,7 +248,10 @@ void usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
         kprintf("usbnet: slot %u CDC function incomplete (data interface, MAC string)\n", d->slot);
         return;
     }
-    if (adapter && adapter->dev) {
+    mutex_lock(&usbnet_lock);
+    bool busy = adapter && adapter->dev;
+    mutex_unlock(&usbnet_lock);
+    if (busy) {
         kprintf("usbnet: slot %u ignored, another USB adapter is in use\n", d->slot);
         return;
     }
@@ -283,16 +302,16 @@ void usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
     }
     kprintf("usbnet: slot %u CDC %s adapter %02x:%02x:%02x:%02x:%02x:%02x\n", d->slot, n->ncm ? "NCM" : "ECM", mac[0],
             mac[1], mac[2], mac[3], mac[4], mac[5]);
+    mutex_lock(&usbnet_lock);
     struct usbnet *old = adapter;
     adapter = n;
-    kfree(old);
+    /* only net_register reads these, after this */
     memcpy(usb_netif.mac, mac, 6);
     usb_netif.driver = n->ncm ? "usb-ncm" : "usb-ecm";
-    usb_netif.send = usbnet_send;
-    if (!registered) {
-        registered = true;
-        net_register(&usb_netif);
-    }
+    mutex_unlock(&usbnet_lock);
+    kfree(old);
+    /* the first adapter of the system, or this one again with another address */
+    net_register(&usb_netif);
     return;
 fail:
     kfree(n);
@@ -302,6 +321,8 @@ void usbnet_detach(struct usb_device *d) {
     struct usbnet *n = d->net;
     if (!n) return;
     d->net = NULL;
-    n->dev = NULL; /* sends fail until an adapter comes back */
+    mutex_lock(&usbnet_lock);
+    n->dev = NULL; /* sends fail until an adapter comes back; none is inside usb_send now */
+    mutex_unlock(&usbnet_lock);
     kprintf("usbnet: adapter unplugged\n");
 }

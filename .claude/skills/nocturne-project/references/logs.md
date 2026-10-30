@@ -7,8 +7,8 @@
 | 口 | 場所 | 出る条件 |
 |---|---|---|
 | ホストの serial.log | 手で起動した QEMU の `-serial file:<作業場>/serial.log`（この会話の scratchpad。build の下に置かない） | カーネルの行は常に。ブラウザーの行は `--log-console` か `--debug-js` のときだけ |
-| ゲストの F12 の Console の札 | ブラウザーの窓（F12 で開閉） | 頁の `console.*`、例外、ブラウザー自身の warn・error。旗は要らない |
-| ゲストの F12 の Trace の札 | 同じ窓の Console の右の右（Ctrl+] で回る） | ブラウザー自身の計測（`WEB_CONSOLE_TRACE`）：profile 群、`Net #`、媒体の timing、捕まった例外。旗は要らない（出る行の多くは旗が決める） |
+| ゲストの F12 の Console の札 | ブラウザーの窓（F12 で開閉） | 全部の行：頁の `console.*`、例外、ブラウザー自身の warn・error と計測（`trace`）。旗は要らない |
+| ゲストの F12 の Trace の札 | 同じ窓の Console の右の右（札を押す） | ブラウザー自身の計測（`WEB_CONSOLE_TRACE`）だけ：profile 群、`Net #`、媒体の timing、捕まった例外。旗は要らない（出る行の多くは旗が決める） |
 | ゲストの system log | `C:\Users\<名前>\AppData\Nocturne\System.log`（前回の起動の分は `System-previous.log`。`kernel/src/sys/stream.c`） | serial と同じ内容。ゲストの Files から読める |
 
 ブラウザーの旗は GUI からは付けられない。ゲストの Terminal で `browser --debug-js <URL>` を打つ（HMP の `sendkey` で）。
@@ -27,7 +27,7 @@
 
 ## 行の形
 
-- ブラウザー：`[browser log @秒.ミリ秒] 本文`。水準は `log`・`warn`・`error`（頁の console と F12 の Console の札）と `trace`（ブラウザー自身の計測、F12 の Trace の札）。1900 字を越える本文は `[browser log+ @…]` の行に続く。秒はゲストの起動からの uptime で、F12 の `@秒` と同じ時計。
+- ブラウザー：`[browser log @秒.ミリ秒] 本文`。水準は `log`・`warn`・`error`（頁の console）と `trace`（ブラウザー自身の計測）。F12 の Console の札は全部の水準、Trace の札は `trace` だけ。1900 字を越える本文は `[browser log+ @…]` の行に続く。秒はゲストの起動からの uptime で、F12 の `@秒` と同じ時計。
 - カーネル：接頭辞だけで時刻が無い（`memory:`、`video:`、`store:`、`prof:`、`[memory]`）。
 - 計測の行は全部 `[browser trace @…]`。頁の行（`[browser log|warn|error @…]`）と grep で分けられる：`grep -a "\[browser trace" serial.log`、頁だけなら `grep -a "\[browser \(log\|warn\|error\)"`。2026-10-27 までの serial.log では計測の行も `[browser log @…]` だった。
 
@@ -64,7 +64,7 @@ fps を直接出す行は無い。一組（wall ≈ 2000 ms）の `draw` の回�
 ## 動画と音（avmedia.c）
 
 - `Native media timing: generation G, input MSE|Range|buffer, clock C ms, presented P at T ms, decoded D/drop X, window-published W; audio open|closed, queued Q frames, written/silence …, end/played-estimate … ms, pending …/ahead …, starved S/ended E, window-unpublished <理由>@<行>`
-  - 再生中は 2 秒ごと、止まったら一度。**旗は要らない**（F12 の Trace の札には常に。serial へは `--log-console`）。
+  - 再生中は 2 秒ごと、止まったら一度。**旗は要らない**（F12 の Console と Trace の札には常に。serial へは `--log-console`）。
   - `written/silence`：音の出口へ書いたフレーム数のうち、PTS の隙間を埋めた無音の数。連続した音なら silence はほとんど増えない（2026-10-27 まで、ミリ秒の PTS の丸めを隙間と見て 1 秒に約 300 フレームの無音を挟んでいた）。
   - かくつきは `drop` の増え方と `starved`。`presented` が `decoded` よりずっと少なければ、解読は追い付いて提示が追い付いていない。`window-unpublished` は窓へ直接出せなかった理由と avmedia.c の行番号。
 - `Native media transition: reason …, generation a->b, …`、`Native audio sink: …`、`Native media supply: …`：`--debug-js` のときだけ。

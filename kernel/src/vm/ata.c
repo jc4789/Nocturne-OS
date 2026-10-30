@@ -1,9 +1,12 @@
 /* ATA hard disks on the legacy IDE ports, PIO mode with polling (interrupts off via nIEN).
    That is all a Hyper-V Generation 1 VM or QEMU's "pc" machine needs. ATAPI (DVD) drives are
-   skipped. The kernel is non-preemptive, so a transfer simply runs to completion. */
+   skipped. A master and its slave share their channel's registers: a command on a channel holds
+   the channel's lock from its setup to its end, whichever CPU gives it, and runs to completion
+   (the kernel is not preempted; it gives up the CPU between commands when another task waits). */
 #include "kernel.h"
 #include "vm/devices.h"
 #include "arch/cpu.h"
+#include "sys/sched.h"
 #include "vm/ata.h"
 
 #define REG_DATA    0
@@ -23,6 +26,9 @@
 
 static struct ata_disk disks[4];
 static int ndisks;
+static struct mutex channels[2]; /* the primary's (0x1F0) and the secondary's registers */
+
+static struct mutex *channel_of(const struct ata_disk *d) { return &channels[d->io == 0x1F0 ? 0 : 1]; }
 
 /* Transfer exactly one 512-byte DRQ sector. Use one bounded string I/O
    operation instead of 256 scalar instructions; device
@@ -153,19 +159,42 @@ static int setup(struct ata_disk *d, uint64_t lba, uint32_t count, bool write) {
     return 0;
 }
 
+/* One READ SECTORS (EXT) of n sectors, the channel's lock held. */
+static int read_command(struct ata_disk *d, uint64_t lba, uint32_t n, uint16_t *p) {
+    int r = setup(d, lba, n, false);
+    if (r < 0) return r;
+    for (uint32_t s = 0; s < n; s++) {
+        if (wait_drq(d) < 0) return -N_ERR_IO;
+        pio_read_sector(d->io + REG_DATA, p); p += 256;
+        delay400(d->ctl);
+    }
+    return 0;
+}
+
+/* One WRITE SECTORS (EXT) of n sectors, the channel's lock held. */
+static int write_command(struct ata_disk *d, uint64_t lba, uint32_t n, const uint16_t *p) {
+    int r = setup(d, lba, n, true);
+    if (r < 0) return r;
+    for (uint32_t s = 0; s < n; s++) {
+        if (wait_drq(d) < 0) return -N_ERR_IO;
+        pio_write_sector(d->io + REG_DATA, p); p += 256;
+        delay400(d->ctl);
+    }
+    return wait_not_busy(d) < 0 ? -N_ERR_IO : 0;
+}
+
 int ata_read(struct ata_disk *d, uint64_t lba, uint32_t count, void *buf) {
     uint16_t *p = buf;
     while (count) {
         uint32_t n = MIN(count, 128u);
-        int r = setup(d, lba, n, false);
+        mutex_lock(channel_of(d));
+        int r = read_command(d, lba, n, p);
+        mutex_unlock(channel_of(d));
         if (r < 0) return r;
-        for (uint32_t s = 0; s < n; s++) {
-            if (wait_drq(d) < 0) return -N_ERR_IO;
-            pio_read_sector(d->io + REG_DATA, p); p += 256;
-            delay400(d->ctl);
-        }
+        p += n * 256;
         lba += n;
         count -= n;
+        if (count && need_resched) schedule();
     }
     return 0;
 }
@@ -174,27 +203,32 @@ int ata_write(struct ata_disk *d, uint64_t lba, uint32_t count, const void *buf)
     const uint16_t *p = buf;
     while (count) {
         uint32_t n = MIN(count, 128u);
-        int r = setup(d, lba, n, true);
+        mutex_lock(channel_of(d));
+        int r = write_command(d, lba, n, p);
+        mutex_unlock(channel_of(d));
         if (r < 0) return r;
-        for (uint32_t s = 0; s < n; s++) {
-            if (wait_drq(d) < 0) return -N_ERR_IO;
-            pio_write_sector(d->io + REG_DATA, p); p += 256;
-            delay400(d->ctl);
-        }
+        p += n * 256;
         lba += n;
         count -= n;
+        if (count && need_resched) schedule();
     }
-    return wait_not_busy(d) < 0 ? -N_ERR_IO : 0;
+    return 0;
 }
 
 /* FLUSH CACHE (EXT): the drive's write cache reaches the medium (ATA8-ACS 7.10, 7.11). */
 int ata_flush(struct ata_disk *d) {
-    if (wait_not_busy(d) < 0) return -N_ERR_IO;
-    outb(d->io + REG_DRIVE, 0xA0 | (d->slave ? 0x10 : 0));
-    delay400(d->ctl);
-    if (wait_not_busy(d) < 0) return -N_ERR_IO;
-    outb(d->io + REG_COMMAND, d->lba48 ? 0xEA : 0xE7);
-    delay400(d->ctl);
+    mutex_lock(channel_of(d));
     int s = wait_not_busy(d);
+    if (s >= 0) {
+        outb(d->io + REG_DRIVE, 0xA0 | (d->slave ? 0x10 : 0));
+        delay400(d->ctl);
+        s = wait_not_busy(d);
+    }
+    if (s >= 0) {
+        outb(d->io + REG_COMMAND, d->lba48 ? 0xEA : 0xE7);
+        delay400(d->ctl);
+        s = wait_not_busy(d);
+    }
+    mutex_unlock(channel_of(d));
     return s < 0 || s & (ST_ERR | ST_DF) ? -N_ERR_IO : 0;
 }

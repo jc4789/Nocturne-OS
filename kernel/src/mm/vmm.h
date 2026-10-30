@@ -63,33 +63,17 @@ int vmm_user_reserve(uint64_t pml4, uint64_t va, uint64_t size, int prot); /* ze
 /* First touch of a reserved page: 1 when mapped (or already present), 0 when
    va is no reserved page, -N_ERR_NO_MEMORY when no frame is left. */
 int vmm_demand_fault(uint64_t pml4, uint64_t va, bool write);
-/* The same for the current app thread's page fault (the error code) on an AP: true when the page
-   is present now; false when the BSP must decide (no reserved page, a protection violation, no
-   frame left). */
-bool vmm_ap_demand_fault(uint64_t va, uint64_t err);
-void vmm_ap_touch_stats(uint64_t *touches, uint64_t *cycles); /* served so since boot, TSC cycles */
 /* shared: pages of one shared mapping whose access the caller checked; absent pages are skipped */
 int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot, bool shared);
 void vmm_user_free(uint64_t pml4, uint64_t va, uint64_t size);
 void vmm_user_write_protect(uint64_t pml4, uint64_t va, uint64_t size); /* present pages lose W for good */
 int vmm_copy_to_space(uint64_t pml4, uint64_t va, const void *src, size_t n);
+/* The current app's page fault (ring 3, or user_copy), interrupts on; may sleep. */
 bool vmm_handle_user_fault(uint64_t addr, uint64_t err);
 void vmm_switch(uint64_t pml4); /* PCID対応。gen が進んだ space のtagだけ破棄 */
 void vmm_flush_all(void); /* PGEのglobal entryと全PCIDを含めてローカルTLBを破棄 */
 void vmm_init_cpu(void);  /* 各CPU: CR3=kernel_pml4の後、PCIDEを揃える */
-void vmm_tlb_ipi(void);   /* AP: VEC_TLB_SHOOTDOWN */
-/* AP kernel copy of user memory: begin=false なら解除中なのでBSPへfallback */
-bool vmm_ap_uaccess_begin(void);
-void vmm_ap_uaccess_end(void);
-/* The same, waiting out a revocation of the current space under way instead of failing (an AP's
-   kernel continuation, which holds it over its call: sched.c). */
-void vmm_ap_uaccess_wait(void);
-/* The same for [pointer, pointer+length) of the current app, already mapped (with write,
-   writable): no stack growth or demand page on an AP. true holds off revocation until
-   vmm_ap_uaccess_end; false (not mapped, or a revocation under way) means the BSP serves it. */
-bool vmm_ap_user_begin(const void *pointer, size_t length, bool write);
-/* With uaccess already held: the same test for another range, which the same end covers. */
-bool vmm_ap_user_ok(const void *pointer, size_t length, bool write);
+void vmm_tlb_ipi(void);   /* VEC_TLB_SHOOTDOWN: a shootdown another CPU asked for */
 void vmm_tlb_stats(uint64_t *shootdowns, uint64_t *ipis);
 
 void *vmalloc(size_t pages);

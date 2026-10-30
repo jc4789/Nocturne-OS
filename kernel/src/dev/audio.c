@@ -1,5 +1,6 @@
 /* Sound: the apps' streams, the mixer and the clock that drives the sink (see audio.h). */
 #include "dev/audio.h"
+#include "dev/timer.h"
 #include "sys/syscall.h"
 #include "arch/cpu.h"
 #include "mm/heap.h"
@@ -16,8 +17,9 @@
 #define RING_BYTES  (2 * QUEUE_BYTES)    /* the queue, and the PCM a card may still give back (retained) */
 #define TICK_MS     5
 
-/* A ring of bytes: the writer moves head, the mixer (the timer interrupt, or a remote session's
-   thread) moves tail, both under audio_lock; head - tail is the number of bytes queued. The writer
+/* A ring of bytes: the writer moves head, the mixer (a card's fill() from CPU 0's tick or after a
+   flush, or a remote session's thread) moves tail, both under audio_lock; head - tail is the number
+   of bytes queued. The writer
    copies its PCM past head without the lock, and the mixer reads only up to head. Whole frames
    never wrap, since the ring holds a whole number of them. The `retained` frames just before tail
    were mixed into a card's buffers, which may give them back (take_back): the writer leaves them
@@ -38,11 +40,15 @@ struct stream {
     struct object object; /* an app's stream: what its handle reaches */
 };
 
+/* The card and the calls into it: its fill() (from CPU 0's tick, audio_tick, and after a flush)
+   and its unissue() (take_back) run under card_lock, and the card is set under it; a card's own
+   code takes it (audio_card_lock) to change what those two read. The trace's tick and card
+   counters are under it too. Taken before audio_lock: fill() mixes with audio_card_mix. */
+static struct spinlock card_lock;
 /* The streams' queues and clocks (every field of a stream above but ring and object), the list of
-   streams, the card's ordinals and the trace: any CPU, interrupts off (the mixer runs in the
-   timer interrupt). Taken before a wait queue's and an object's lock. The card's device stays the
-   BSP's: its fill() runs from the BSP's tick and after a flush, without this lock (it takes it in
-   audio_card_mix and audio_card_played); its unissue() runs under it, in take_back. */
+   streams, the card's ordinals, the volume and muting, the remote clients, the system tone's writer,
+   the card's identity (also under card_lock) and the trace's stream counters: any CPU, any context.
+   Taken after card_lock, before a wait queue's and an object's lock. */
 static struct spinlock audio_lock;
 static uint64_t card_submitted,card_consumed;
 
@@ -53,10 +59,19 @@ static struct wait_queue audio_wq; /* writers waiting for room or for the writer
 static int volume = 80;            /* percent */
 static bool muted;
 static int32_t gain = 80 * 80 * 65536 / 10000; /* volume squared, 16.16: loudness feels linear */
+/* Written under both locks; read under either, or (the atomic loads below) as a hint that may be a
+   moment old: what plays the sound, whether a card does. */
 static const char *card_name;
 static void (*card_fill)(void);
 static uint64_t (*card_unissue)(bool take);
 static int remote_users;
+static bool tone_writing; /* audio_system_tone is copying past the system stream's head */
+
+static int remote_now(void) { return __atomic_load_n(&remote_users, __ATOMIC_RELAXED); }
+static bool card_now(void) { return __atomic_load_n(&card_fill, __ATOMIC_RELAXED) != NULL; }
+
+uint64_t audio_card_lock(void) { return spin_lock(&card_lock); }
+void audio_card_unlock(uint64_t flags) { spin_unlock(&card_lock, flags); }
 /* What SYS_AUDIO_OUTPUT reports (the volume, muting, what plays the sound) changed: its watches
    (SYS_AUDIO_OUTPUT_WATCH) hear of it, whoever changed it. */
 static struct watched output_watched;
@@ -76,24 +91,31 @@ static struct {
 static uint64_t trace_us(uint64_t ticks) {
     return tsc_hz ? ticks * 1000000 / tsc_hz : 0;
 }
+/* audio_trace_active changes under both locks, and every writer of the trace looks at it under the
+   lock it holds: from begin to end the counters are written, and after end nothing writes them. */
 void audio_trace_begin(void) {
-    /* WM invokes this before arming its timed interval. No reset under a
-       long IRQ-disabled region; IRQ writers still see active=false. */
-    audio_trace_active = false;
+    /* WM invokes this before arming its timed interval. */
+    uint64_t f = spin_lock(&card_lock);
+    spin_take(&audio_lock);
     memset(&trace, 0, sizeof trace);
     for (int i = 0; i < MAX_STREAMS; i++) trace.stream[i].min_queue = QUEUE_BYTES / AUDIO_FRAME;
-    uint64_t f = spin_lock(&audio_lock);
     trace.start = rdtsc(); trace.last_tick = trace.start;
     audio_trace_active = true;
-    spin_unlock(&audio_lock, f);
+    spin_give(&audio_lock);
+    spin_unlock(&card_lock, f);
 }
 void audio_trace_end(void) {
-    uint64_t f = spin_lock(&audio_lock), end = rdtsc();
+    uint64_t f = spin_lock(&card_lock), end = rdtsc();
+    spin_take(&audio_lock);
     audio_trace_active = false;
-    spin_unlock(&audio_lock, f);
+    const char *card = card_name;
+    int remote = remote_users;
+    bool quiet = muted;
+    spin_give(&audio_lock);
+    spin_unlock(&card_lock, f);
     kprintf("audiotrace: elapsed_us=%lu service_calls=%lu max_service_gap_us=%lu card=%s remote=%d muted=%d\n",
             trace_us(end-trace.start), trace.ticks, trace_us(trace.max_tick_gap),
-            card_name ? card_name : "none", remote_users, muted);
+            card ? card : "none", remote, quiet);
     kprintf("audiotrace: ac97_calls=%lu filled=%lu restart_actions=%lu raw_sr_low5_before_after\n",
             trace.card_calls, trace.filled, trace.restarts);
     for (int i = 0; i < 32; i++) if (trace.sr_before[i] || trace.sr_after[i])
@@ -110,6 +132,7 @@ void audio_trace_end(void) {
             kprintf("audiotrace: slot=%d second=%d committed_frames=%lu\n", i, j, trace.stream[i].by_second[j]);
     }
 }
+/* The card's fill(), card_lock held. */
 void audio_trace_ac97(uint16_t before, uint16_t after, unsigned filled, bool restarted) {
     if (!audio_trace_active) return;
     trace.card_calls++; trace.filled += filled; trace.restarts += restarted;
@@ -222,15 +245,24 @@ void audio_card_played(uint64_t ordinal){
     spin_unlock(&audio_lock,f);
 }
 
-bool audio_pending(void) {
+/* audio_lock held. */
+static bool pending_locked(void) {
     for (int i = 0; i <= MAX_STREAMS; i++)
         if (streams[i]&&!streams[i]->clock_error&&streams[i]->head-streams[i]->tail>=AUDIO_FRAME&&
             streams[i]->head-streams[i]->tail<=RING_BYTES) return true;
     return false;
 }
 
+bool audio_pending(void) {
+    uint64_t f = spin_lock(&audio_lock);
+    bool any = pending_locked();
+    spin_unlock(&audio_lock, f);
+    return any;
+}
+
 bool audio_ready(int frames, bool low) {
     bool any = false, whole = true;
+    uint64_t f = spin_lock(&audio_lock);
     for (int i = 0; i <= MAX_STREAMS; i++) {
         struct stream *s = streams[i];
         if (!s || s->clock_error || s->head - s->tail > RING_BYTES) continue;
@@ -239,18 +271,26 @@ bool audio_ready(int frames, bool low) {
         any = true;
         if (have < (uint32_t)frames) whole = false;
     }
+    spin_unlock(&audio_lock, f);
     return any && (whole || low);
 }
 
 /* audio_tick has work: frames wait, or the card has not yet played all it was given. */
-bool audio_needs_tick(void) { return audio_pending() || card_consumed != card_submitted; }
+bool audio_needs_tick(void) {
+    uint64_t f = spin_lock(&audio_lock);
+    bool work = pending_locked() || card_consumed != card_submitted;
+    spin_unlock(&audio_lock, f);
+    return work;
+}
 
+/* CPU 0's tick only: `last` is its own. */
 void audio_tick(void) {
     static uint64_t last;
     uint64_t now = uptime_ms();
     if (now - last < TICK_MS) return;
     uint64_t elapsed = MIN(now - last, 100);
     last = now;
+    uint64_t f = spin_lock(&card_lock);
     if (audio_trace_active) {
         uint64_t at = rdtsc();
         trace.max_tick_gap = MAX(trace.max_tick_gap, at-trace.last_tick);
@@ -259,34 +299,40 @@ void audio_tick(void) {
     /* A card may finish already-issued DMA while remote owns new PCM. Its
        fill() must not mix from our streams in remote mode; idle is I/O-free. */
     if (card_fill) card_fill();
-    else if (!remote_users) audio_mix(NULL, (int)(elapsed * AUDIO_RATE / 1000)); /* no card: play into nothing */
+    else if (!remote_now()) audio_mix(NULL, (int)(elapsed * AUDIO_RATE / 1000)); /* no card: play into nothing */
+    spin_unlock(&card_lock, f);
 }
 
 void audio_set_card(const char *name, void (*fill)(void), uint64_t (*unissue)(bool take)) {
+    uint64_t f = spin_lock(&card_lock);
+    spin_take(&audio_lock);
     bool changed = name != card_name;
-    card_name = name;
-    card_fill = fill;
+    __atomic_store_n(&card_name, name, __ATOMIC_RELAXED);
+    __atomic_store_n(&card_fill, fill, __ATOMIC_RELAXED);
     card_unissue = unissue;
+    spin_give(&audio_lock);
+    spin_unlock(&card_lock, f);
     if (changed) watched_changed(&output_watched);
 }
-const char *audio_card(void) { return card_name; }
+const char *audio_card(void) { return __atomic_load_n(&card_name, __ATOMIC_RELAXED); }
 
-/* From a remote session's thread (vm/rdp.c, a kernel thread: the BSP). */
+/* From a remote session's thread (vm/rdp.c), any CPU. */
 void audio_remote_attach(void) {
     uint64_t f = spin_lock(&audio_lock);
-    bool first = remote_users++ == 0;
+    bool first = remote_users == 0;
+    __atomic_store_n(&remote_users, remote_users + 1, __ATOMIC_RELAXED);
     spin_unlock(&audio_lock, f);
     if (first) watched_changed(&output_watched); /* "Remote desktop" plays the sound now */
 }
 void audio_remote_detach(void) {
     uint64_t f = spin_lock(&audio_lock);
     bool last = remote_users == 1;
-    if (remote_users > 0) remote_users--;
+    if (remote_users > 0) __atomic_store_n(&remote_users, remote_users - 1, __ATOMIC_RELAXED);
     spin_unlock(&audio_lock, f);
     if (last) watched_changed(&output_watched);
 }
-bool audio_remote(void) { return remote_users > 0; }
-const char *audio_output(void) { return remote_users ? "Remote desktop" : card_name; }
+bool audio_remote(void) { return remote_now() > 0; }
+const char *audio_output(void) { return remote_now() ? "Remote desktop" : audio_card(); }
 
 /* ---- the volume and muting: the user's, kept in AppData\Nocturne\Sound.conf (sys/keep.c) ---- */
 
@@ -294,42 +340,49 @@ static bool sound_line(const char *key, const char *value, bool apply);
 static size_t sound_text(char *out, size_t cap);
 static struct keep sound_keep = {.name = "Sound", .line = sound_line, .text = sound_text};
 
-/* The volume and muting as v and m; whoever changes them (a program, the taskbar's volume control,
-   the document read back), the watches hear of it and the change is kept. */
-static void sound_put(int v, bool m) {
-    bool changed = v != volume || m != muted;
-    volume = v;
-    muted = m;
-    gain = muted ? 0 : volume * volume * 65536 / 10000;
+/* The volume and muting as v and m, KEEP for either one leaves it as it is when the change is made;
+   whoever changes them (a program, the taskbar's volume control, the document read back), the
+   watches hear of it and the change is kept. */
+#define KEEP (-1)
+static void sound_put(int v, int m) {
+    uint64_t f = spin_lock(&audio_lock);
+    if (v == KEEP) v = volume;
+    bool quiet = m == KEEP ? muted : m != 0;
+    bool changed = v != volume || quiet != muted;
+    __atomic_store_n(&volume, v, __ATOMIC_RELAXED);
+    __atomic_store_n(&muted, quiet, __ATOMIC_RELAXED);
+    gain = quiet ? 0 : v * v * 65536 / 10000;
+    spin_unlock(&audio_lock, f);
     if (!changed) return;
     keep_changed(&sound_keep);
     watched_changed(&output_watched);
 }
-int audio_volume(void) { return volume; }
-bool audio_muted(void) { return muted; }
+/* A moment old at most: the watches hear of every change after it is made. */
+int audio_volume(void) { return __atomic_load_n(&volume, __ATOMIC_RELAXED); }
+bool audio_muted(void) { return __atomic_load_n(&muted, __ATOMIC_RELAXED); }
 void audio_set_volume(int percent) { sound_put(MAX(0, MIN(100, percent)), false); }
-void audio_set_muted(bool m) { sound_put(volume, m); }
+void audio_set_muted(bool m) { sound_put(KEEP, m); }
 
 /* Sound.conf: volume=<0-100>, muted=on|off. */
 static bool sound_line(const char *key, const char *value, bool apply) {
     int64_t v;
     bool on = !strcmp(value, "on"), off = !strcmp(value, "off");
     if (!strcmp(key, "volume")) {
-        if (apply && keep_number(value, 0, 100, &v)) sound_put((int)v, muted);
+        if (apply && keep_number(value, 0, 100, &v)) sound_put((int)v, KEEP);
         return true;
     }
     if (!strcmp(key, "muted")) {
-        if (apply && (on || off)) sound_put(volume, on);
+        if (apply && (on || off)) sound_put(KEEP, on);
         return true;
     }
     return false;
 }
 
 static size_t sound_text(char *out, size_t cap) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&audio_lock);
     int v = volume;
     bool m = muted;
-    irq_restore(f);
+    spin_unlock(&audio_lock, f);
     size_t n = 0;
     keep_put(out, cap, &n, "# The volume and muting. Nocturne keeps this: change them in Settings or with the taskbar's speaker.\n");
     keep_put(out, cap, &n, "volume=%d\nmuted=%s\n", v, m ? "on" : "off");
@@ -341,14 +394,17 @@ int64_t audio_output_watch(void) { return watched_open(&output_watched); }
 static uint8_t system_ring[RING_BYTES];
 static struct stream system_stream = {.ring = system_ring};
 
-/* a triangle wave (no floating point in the kernel) that fades out, with a 2 ms start */
+/* a triangle wave (no floating point in the kernel) that fades out, with a 2 ms start; one caller
+   at a time writes it (tone_writing), another one's tone is dropped as one that still sounds is */
 void audio_system_tone(int hz, int ms) {
     struct stream *s = &system_stream;
     uint64_t f = spin_lock(&audio_lock);
     streams[MAX_STREAMS] = s;
     uint32_t head = s->head, queued = head - s->tail, retained = s->retained;
+    bool drop = hz <= 0 || queued >= AUDIO_FRAME || tone_writing;
+    if (!drop) tone_writing = true;
     spin_unlock(&audio_lock, f);
-    if (hz <= 0 || queued >= AUDIO_FRAME) return;
+    if (drop) return;
     /* the queue's worth at most, and never over what a card may still give back */
     int room = (int)((RING_BYTES - retained * AUDIO_FRAME) / AUDIO_FRAME);
     int frames = MIN(ms * (AUDIO_RATE / 1000), MIN((int)(QUEUE_BYTES / AUDIO_FRAME), room)), period = AUDIO_RATE / hz;
@@ -362,7 +418,9 @@ void audio_system_tone(int hz, int ms) {
     }
     f = spin_lock(&audio_lock);
     s->head += (uint32_t)frames * AUDIO_FRAME;
+    tone_writing = false;
     spin_unlock(&audio_lock, f);
+    timer_tick_needed(); /* CPU 0's tick mixes it */
 }
 
 /* ---- the apps' streams (docs/nocturne-native-abi.md §9) ---- */
@@ -379,7 +437,7 @@ static bool stream_broken(const struct stream *s) {
 static bool stream_full(const struct stream *s) {
     uint32_t queued = s->head - s->tail;
     return queued >= QUEUE_BYTES || queued + s->retained * AUDIO_FRAME >= RING_BYTES ||
-           (card_fill && !remote_users && s->issued_count == ARRAY_SIZE(s->issued));
+           (card_now() && !remote_now() && s->issued_count == ARRAY_SIZE(s->issued));
 }
 /* Bytes a writer may add past head now. */
 static uint32_t stream_room(const struct stream *s) {
@@ -403,7 +461,7 @@ static uint32_t frames_from(const struct stream *s, uint64_t at) {
    again by the card's fill() (audio.h, audio_set_card). Only when s has PCM there, and when every
    stream still keeps its PCM from there in its ring (retained: not after a remote client mixed
    from it). The PCM keeps its order: each stream's frames from `at` on are the last it gave the
-   card, just before its tail. audio_lock held, on the BSP (the card's unissue). */
+   card, just before its tail. card_lock (the card's unissue) and audio_lock held. */
 static bool take_back(struct stream *s) {
     if (!card_unissue || remote_users) return false;
     uint64_t at = card_unissue(false);
@@ -433,9 +491,10 @@ static bool take_back(struct stream *s) {
 }
 
 /* s's PCM goes at once, with what of it the card can still give back; the card mixes the other
-   streams' again. The clock starts a new generation. BSP (the card's unissue and fill), interrupts
-   off. */
+   streams' again. The clock starts a new generation. Any CPU: the card's unissue and fill run
+   under card_lock. */
 static void stream_drop(struct stream *s, bool flush) {
+    uint64_t f = spin_lock(&card_lock);
     spin_take(&audio_lock);
     bool taken = s->device_pending && take_back(s);
     s->tail = s->head;
@@ -446,10 +505,12 @@ static void stream_drop(struct stream *s, bool flush) {
     streams_changed();
     spin_give(&audio_lock);
     if (taken && card_fill) card_fill();
+    spin_unlock(&card_lock, f);
 }
 
 /* Without audio_lock (an events wait asks under the object's lock, which audio_lock comes before):
-   every change notifies the object after it, and the wait asks again. */
+   a hint read from the fields as they are; every change notifies the object after it, and the wait
+   asks again. */
 static uint32_t stream_ready(struct handle *h) {
     struct stream *s = stream_of(h);
     return s->clock_error||!stream_full(s) ? N_EVENT_SENDABLE : 0;
@@ -460,21 +521,22 @@ static uint32_t stream_ready(struct handle *h) {
 static void stream_close(struct handle *h) {
     struct stream *s = stream_of(h);
     uint64_t give_up = uptime_ms() + 1000;
+    /* the mixer and the card's clock wake audio_wq at each change; the 20 ms bound looks at the
+       time and at a kill */
+    uint64_t fl = spin_lock(&audio_lock);
     while (!current_task->killed && !s->clock_error && (s->head - s->tail >= AUDIO_FRAME||s->device_pending) && uptime_ms() < give_up) {
-        uint64_t fl = irq_save();
-        wq_wait_timeout(&audio_wq, 20);
-        irq_restore(fl);
+        wq_wait_locked_timeout(&audio_wq, &audio_lock, 20);
+        spin_take(&audio_lock);
     }
-    uint64_t fl = irq_save();
+    spin_unlock(&audio_lock, fl);
     if (current_task->killed) stream_drop(s, false);
-    spin_take(&audio_lock);
+    fl = spin_lock(&audio_lock);
     for (int i = 0; i < MAX_STREAMS; i++)
         if (streams[i] == s) {
             if (audio_trace_active) trace.stream[i].closes++;
             streams[i] = NULL;
         }
-    spin_give(&audio_lock);
-    irq_restore(fl);
+    spin_unlock(&audio_lock, fl);
 }
 
 static void stream_release(struct object *o) {
@@ -536,13 +598,10 @@ int64_t audio_stream_submit(struct handle *h, const void *frames, size_t count, 
         uint32_t c = (uint32_t)MIN((size_t)room, n - done), at = s->head % RING_BYTES, first = MIN(c, RING_BYTES - at);
         spin_unlock(&audio_lock, fl);
         /* past head, which only the writer moves: the mixer does not read there until it does */
-        bool ok = user_ok(p + done, c);
-        if (ok) {
-            memcpy(s->ring + at, p + done, first);
-            memcpy(s->ring, p + done + first, c - first);
-        }
+        int bad = copy_from_user(s->ring + at, p + done, first);
+        if (!bad) bad = copy_from_user(s->ring, p + done + first, c - first);
         fl = spin_lock(&audio_lock);
-        if (!ok) { error = -N_ERR_BAD_ADDRESS; break; }
+        if (bad) { error = -N_ERR_BAD_ADDRESS; break; }
         s->head += c;
         s->committed_bytes += c;
         trace_commit(s, c);
@@ -551,6 +610,7 @@ int64_t audio_stream_submit(struct handle *h, const void *frames, size_t count, 
     s->writer = NULL;
     wq_wake_all(&audio_wq); /* a writer waiting for this one */
     spin_unlock(&audio_lock, fl);
+    if (done) timer_tick_needed(); /* CPU 0's tick mixes it */
     return done ? (int64_t)(done / AUDIO_FRAME) : error;
 }
 
@@ -576,12 +636,9 @@ int audio_stream_status(struct handle *h, struct n_audio_status *user_out) {
     return copy_to_user(user_out, &status, sizeof status) < 0 ? -N_ERR_BAD_ADDRESS : 0;
 }
 
-/* The BSP: the card's device. */
+/* Any CPU. */
 int audio_stream_flush(struct handle *h) {
-    struct stream *s = stream_of(h);
-    uint64_t fl = irq_save();
-    stream_drop(s, true);
-    irq_restore(fl);
+    stream_drop(stream_of(h), true);
     return 0;
 }
 

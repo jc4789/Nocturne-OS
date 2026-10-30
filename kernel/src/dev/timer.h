@@ -14,10 +14,13 @@ void time_set(int64_t unix_time); /* set the wall clock */
 void time_to_parts(int64_t t, struct tm_parts *p);
 int64_t time_from_parts(const struct tm_parts *p);
 /* Tickless idle (dev/timer.c). */
-extern volatile bool tick_stopped;
-bool timer_tickless(void); /* the BSP may stop its tick when idle (APs keep theirs) */
-void timer_idle(void);     /* BSP idle task, interrupts off: maybe stop the tick */
-void timer_wake(void);     /* BSP, any interrupt while tick_stopped: tick again */
+bool timer_tickless(void); /* an idle CPU may stop its tick */
+void timer_idle(void);     /* the idle task, interrupts off: maybe stop this CPU's tick */
+void timer_wake(void);     /* any interrupt: this CPU ticks again if it had stopped */
+/* Any CPU, after publishing the work: a sleeper's deadline at uptime_ms at, or sound or serial
+   output that CPU 0's tick serves (timer_tick_needed). CPU 0 ticks again in time for it. */
+void timer_deadline(uint64_t at);
+void timer_tick_needed(void);
 /* Sleep: uptime_ms leaves the time asleep out, the wall clock takes it from the RTC. suspend before
    S3, resume after it with interrupts off (the TSC may have started again from 0). resume returns
    the seconds slept. */

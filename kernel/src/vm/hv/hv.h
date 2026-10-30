@@ -23,19 +23,23 @@ struct hv_message {
 
 extern uint32_t hv_vp_index;
 
-/* Set up the hypercall page and the SynIC; SINT2 interrupts go to `isr`. False if unavailable. */
+/* Set up the hypercall page and the SynIC; SINT2 interrupts go to `isr`. False if unavailable.
+   CPU 0: only its SynIC is enabled, so every VMBus message and event interrupts CPU 0 (VP
+   hv_vp_index); the hypercall page serves every CPU. */
 bool hv_core_init(void (*isr)(void));
-/* Hypercall page and SynIC overlays off (before a restored image is copied), and on again. */
+/* Hypercall page and SynIC overlays off (before a restored image is copied), and on again. CPU 0,
+   whose SynIC they are. */
 void hv_core_suspend(void);
 void hv_core_resume(void);
-/* HvPostMessage: send a message to the host on a connection. Returns an HV status. */
+/* HvPostMessage: send a message to the host on a connection. Returns an HV status. Any CPU, any
+   context: one shared input page under a lock of its own. */
 uint16_t hv_post_message(uint32_t connection_id, uint32_t type, const void *data, uint32_t len);
-/* HvSignalEvent: signal the host on an event connection. */
+/* HvSignalEvent: signal the host on an event connection. Any CPU, any context. */
 uint16_t hv_signal_event(uint32_t connection_id);
 /* The message slot and event flags (2048 bits) for a SINT. */
 struct hv_message *hv_message_slot(int sint);
 volatile uint64_t *hv_event_flags(int sint);
-/* Release the current message slot (call after copying it out). */
+/* Release the current message slot (call after copying it out). CPU 0's SINT handler. */
 void hv_message_done(struct hv_message *m);
 
 static inline void hv_mb(void) { __asm__ volatile("mfence" ::: "memory"); }

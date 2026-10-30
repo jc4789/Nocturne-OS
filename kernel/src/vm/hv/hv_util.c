@@ -6,6 +6,7 @@
    framework and message versions. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/spin.h"
 #include "dev/pm.h"
 #include "dev/timer.h"
 #include "vm/hv/vmbus.h"
@@ -52,18 +53,30 @@ static const uint32_t frame_versions[] = {0x30000, 0x10000};
 /* ---- deferred work: power actions must not run in interrupt context ---- */
 
 enum { ACT_NONE, ACT_SHUTDOWN, ACT_REBOOT, ACT_HIBERNATE };
-static volatile int pending_action;
+/* pending_action: set by the shutdown service (CPU 0's handler), taken by the thread. Only the wait
+   queue's lock under it. */
+static struct spinlock util_lock;
+static int pending_action;
 static struct wait_queue util_wq;
+
+static void util_ask(int action) {
+    uint64_t f = spin_lock(&util_lock);
+    pending_action = action;
+    wq_wake_all(&util_wq);
+    spin_unlock(&util_lock, f);
+}
 
 static void util_thread(void *arg) {
     (void)arg;
     for (;;) {
-        uint64_t f = irq_save();
-        if (pending_action == ACT_NONE) wq_wait_timeout(&util_wq, 1000);
-        irq_restore(f);
+        uint64_t f = spin_lock(&util_lock);
+        while (pending_action == ACT_NONE) {
+            wq_wait_locked(&util_wq, &util_lock);
+            spin_take(&util_lock);
+        }
         int a = pending_action;
-        if (a == ACT_NONE) continue;
         pending_action = ACT_NONE;
+        spin_unlock(&util_lock, f);
         kprintf("hv-util: the host asked us to %s\n",
                 a == ACT_REBOOT ? "restart" : a == ACT_HIBERNATE ? "hibernate" : "shut down");
         sleep_ms(100); /* let our reply reach the host */
@@ -83,9 +96,9 @@ static void shutdown(struct service *s, struct ic_header *h, uint8_t *body, uint
     (void)s;
     if (len < 12) return;
     uint32_t flags = ((uint32_t *)body)[2];
-    if (flags <= 1) pending_action = ACT_SHUTDOWN;
-    else if (flags <= 3) pending_action = ACT_REBOOT;
-    else if (pm_can_hibernate()) pending_action = ACT_HIBERNATE;
+    if (flags <= 1) util_ask(ACT_SHUTDOWN);
+    else if (flags <= 3) util_ask(ACT_REBOOT);
+    else if (pm_can_hibernate()) util_ask(ACT_HIBERNATE);
     else h->status = IC_E_FAIL; /* no hibernation on this machine */
 }
 
@@ -292,7 +305,7 @@ static void negotiate(struct service *s, struct ic_header *h, uint8_t *body, uin
 }
 
 static void util_callback(struct vmbus_channel *ch) {
-    static uint8_t pkt[16384]; /* interrupt context: callbacks do not nest. KVP needs ~7.5 KiB */
+    static uint8_t pkt[16384]; /* CPU 0's handler only: callbacks do not nest. KVP needs ~7.5 KiB */
     struct service *s = ch->priv;
     int n;
     while ((n = vmbus_recv(ch, pkt, sizeof pkt)) != 0) {
@@ -309,7 +322,6 @@ static void util_callback(struct vmbus_channel *ch) {
         else s->handle(s, h, body, blen);
         h->flags = IC_FLAG_TRANSACTION | IC_FLAG_RESPONSE;
         vmbus_send(ch, VM_PKT_DATA_INBAND, 0, h, len, d->trans_id);
-        if (pending_action != ACT_NONE) wq_wake_all(&util_wq);
     }
 }
 

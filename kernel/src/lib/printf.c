@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "arch/spin.h"
+#include "arch/smp.h"
 #include "dev/serial.h"
 #include "dev/fbcon.h"
 
@@ -129,7 +130,6 @@ int ksnprintf(char *buf, size_t size, const char *fmt, ...) {
 
 /* ---- kernel log ring buffer (for dmesg) ---- */
 
-#define KLOG_SIZE 65536
 static char klog_buf[KLOG_SIZE];
 static size_t klog_head; /* total bytes ever written */
 static struct spinlock klog_lock; /* any CPU logs */
@@ -179,8 +179,16 @@ int kprintf(const char *fmt, ...) {
 
 void panic_screen(const char *msg);
 
-NORETURN void panic(const char *fmt, ...) {
+void panic_enter(void) {
     cli();
+    if (!smp_panic_enter()) for (;;) hlt();
+    spin_seize(&klog_lock);
+    serial_seize();
+    fbcon_seize();
+}
+
+NORETURN void panic(const char *fmt, ...) {
+    panic_enter();
     char buf[512];
     va_list ap;
     va_start(ap, fmt);

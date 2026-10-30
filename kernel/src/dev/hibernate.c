@@ -616,7 +616,12 @@ void hibernate_restore(void) {
             uptime_ms() - t0);
 
     blk_hold();
-    smp_suspend();
+    if (!smp_suspend()) {
+        /* a CPU still running would run on through the copy, and may hold a lock the devices'
+           quiesce takes; the image is used up, so the next boot is a normal one */
+        kprintf("hibernate: a processor did not stop, restarting instead of restoring\n");
+        power_reboot();
+    }
     smp_hold_in_init(); /* out of every page the copy overwrites */
     cli();
     if (pm_quiesce_devices(false)) {

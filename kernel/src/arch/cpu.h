@@ -146,11 +146,12 @@ uint32_t lapic_current_id(void);
 /* A physical destination the APIC mode in use addresses, not its broadcast: below FFh in xAPIC
    mode (below Fh on an AMD APIC without the 8-bit ID), below FFFFFFFFh in x2APIC mode. */
 bool lapic_addressable(uint32_t apic_id);
-bool lapic_worker_init(void);
+bool lapic_ap_init(void);
 bool lapic_send_ipi(uint32_t apic_id, uint8_t vector);
+bool lapic_send_nmi(uint32_t apic_id);
 void lapic_eoi(void);
 bool lapic_timer_start(unsigned hz, int vector);
-bool lapic_runner_timer_start(void); /* BSPで較正済みのperiodic tickだけをAPで再使用 */
+bool lapic_tick_start(void); /* another CPU: the periodic tick lapic_timer_start measured on CPU 0 */
 void lapic_resume(void); /* BSP after S3: registers and the calibrated tick again */
 bool lapic_send_init(uint32_t apic_id); /* INIT: the AP waits for a STARTUP, running nothing */
 bool lapic_send_startup(uint32_t apic_id, uint64_t page); /* after an INIT: into real mode at page */
@@ -170,7 +171,6 @@ void lapic_ident(struct lapic_ident *out);
 void lapic_tick_stop(void);
 void lapic_tick_once(unsigned ms);
 void lapic_tick_resume(void);
-void isr_dispatch_remote(struct regs *r, uint64_t cr2);
 extern uint64_t tsc_hz; /* measured by lapic_timer_start(); 0 if unknown */
 #define VEC_TIMER 0x30
 void pic_init(void);

@@ -82,7 +82,7 @@ tramp_lm64:
     jmp .own
 .xapic:
     bt eax, 10                  ; the kernel's xAPIC mode, which an APIC in x2APIC mode takes later,
-    jc .x2                      ; where it may (arch/apic.c), lapic_worker_init
+    jc .x2                      ; where it may (arch/apic.c), lapic_ap_init
     shl rdx, 32
     or rax, rdx
     and rax, [rbx + TD_BASE_MASK]

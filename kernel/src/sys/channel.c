@@ -10,7 +10,12 @@
 
 /* Named native rendezvous: a registry of listeners. Each connection is an
  * ordinary message channel pair; the server end waits in the listener until
- * accepted. No path lookup, network socket family or fixed client capacity. */
+ * accepted. No path lookup, network socket family or fixed client capacity.
+ *
+ * Any CPU. names_lock guards the registry and every listener's pending
+ * servers (published, head, tail, next): a listener in the registry is there
+ * while the lock is held, so a connect notifies it under the lock. Nothing is
+ * allocated or closed under it. It comes before an object's lock. */
 struct channel_pending { struct channel_pending *next; struct handle *server; };
 struct channel_listener {
     struct channel_listener *next;
@@ -22,6 +27,7 @@ struct channel_listener {
     char key[];
 };
 enum { CHANNEL_BUCKETS = 64 };
+static struct spinlock names_lock;
 static struct channel_listener *channel_names[CHANNEL_BUCKETS];
 
 static uint64_t channel_hash(const char *key, size_t length) {
@@ -30,20 +36,22 @@ static uint64_t channel_hash(const char *key, size_t length) {
     return h;
 }
 
+/* names_lock held. */
 static struct channel_listener *channel_find(const char *key, size_t length, uint64_t hash) {
     for (struct channel_listener *l = channel_names[hash & (CHANNEL_BUCKETS - 1)]; l; l = l->next)
         if (l->hash == hash && l->key_length == length && !memcmp(l->key, key, length)) return l;
     return NULL;
 }
 
+/* It only reads: a connect or accept after the look notifies the listener. */
 static uint32_t listener_ready(struct handle *h) {
     struct channel_listener *l = h->object->priv;
-    return l->head ? N_EVENT_RECEIVABLE : 0;
+    return __atomic_load_n(&l->head, __ATOMIC_RELAXED) ? N_EVENT_RECEIVABLE : 0;
 }
 
 static void listener_close(struct handle *h) {
     struct channel_listener *l = h->object->priv;
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock(&names_lock);
     if (l->published) {
         struct channel_listener **at = &channel_names[l->hash & (CHANNEL_BUCKETS - 1)];
         while (*at && *at != l) at = &(*at)->next;
@@ -52,8 +60,8 @@ static void listener_close(struct handle *h) {
     }
     struct channel_pending *pending = l->head;
     l->head = l->tail = NULL;
+    spin_unlock(&names_lock, flags);
     object_notify(&l->object);
-    irq_restore(flags);
     /* A pending server reference is an ordinary owner. Closing it propagates
      * N_ERR_CLOSED to the client and wakes it, even after owner death. */
     while (pending) {
@@ -81,49 +89,67 @@ int channel_listen(const char *key, size_t length, struct handle **listener) {
     object_init(&l->object, &listener_ops, l);
     struct handle *h = handle_open(&l->object, false);
     if (!h) { kfree(l); return -N_ERR_NO_MEMORY; }
-    uint64_t flags = irq_save();
-    if (channel_find(key, length, hash)) { irq_restore(flags); handle_close(h); return -N_ERR_EXISTS; }
+    uint64_t flags = spin_lock(&names_lock);
+    if (channel_find(key, length, hash)) { spin_unlock(&names_lock, flags); handle_close(h); return -N_ERR_EXISTS; }
     unsigned bucket = hash & (CHANNEL_BUCKETS - 1);
     l->next = channel_names[bucket];
     channel_names[bucket] = l;
     l->published = true;
-    irq_restore(flags);
+    spin_unlock(&names_lock, flags);
     *listener = h;
     return 0;
 }
 
+static bool channel_listened(const char *key, size_t length, uint64_t hash) {
+    uint64_t flags = spin_lock(&names_lock);
+    bool there = channel_find(key, length, hash) != NULL;
+    spin_unlock(&names_lock, flags);
+    return there;
+}
+
+/* The listener is looked for, the pair made without the lock, then the listener looked for again
+   (it may have closed meanwhile; the pair then goes). */
 int channel_connect(const char *key, size_t length, struct handle **client) {
     if (!length) return -N_ERR_INVALID;
     uint64_t hash = channel_hash(key, length);
-    uint64_t flags = irq_save();
-    struct channel_listener *l = channel_find(key, length, hash);
-    if (!l) { irq_restore(flags); return -N_ERR_NOT_FOUND; }
+    if (!channel_listened(key, length, hash)) return -N_ERR_NOT_FOUND;
     struct channel_pending *pending = kmalloc(sizeof *pending);
-    if (!pending) { irq_restore(flags); return -N_ERR_NO_MEMORY; }
+    if (!pending) return -N_ERR_NO_MEMORY;
     struct handle *server;
     int e = message_channel_pair(client, &server);
-    if (e) { kfree(pending); irq_restore(flags); return e; }
+    if (e) { kfree(pending); return e; }
     pending->next = NULL;
     pending->server = server;
-    if (l->tail) l->tail->next = pending;
-    else l->head = pending;
-    l->tail = pending;
-    object_notify(&l->object);
-    irq_restore(flags);
-    return 0;
+    uint64_t flags = spin_lock(&names_lock);
+    struct channel_listener *l = channel_find(key, length, hash);
+    if (l) {
+        if (l->tail) l->tail->next = pending;
+        else l->head = pending;
+        l->tail = pending;
+        object_notify(&l->object);
+    }
+    spin_unlock(&names_lock, flags);
+    if (l) return 0;
+    handle_close(*client);
+    *client = NULL;
+    handle_close(server);
+    kfree(pending);
+    return -N_ERR_NOT_FOUND;
 }
 
 int channel_accept(struct handle *listener, struct handle **server) {
     if (!handle_is(listener, &listener_ops)) return -N_ERR_WRONG_KIND;
     struct channel_listener *l = listener->object->priv;
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock(&names_lock);
     struct channel_pending *pending = l->head;
-    if (!pending) { irq_restore(flags); return -N_ERR_NOT_READY; }
-    l->head = pending->next;
-    if (!l->head) l->tail = NULL;
+    if (pending) {
+        l->head = pending->next;
+        if (!l->head) l->tail = NULL;
+    }
+    spin_unlock(&names_lock, flags);
+    if (!pending) return -N_ERR_NOT_READY;
     *server = pending->server;
     kfree(pending);
-    irq_restore(flags);
     return 0;
 }
 
@@ -135,7 +161,7 @@ int channel_accept(struct handle *listener, struct handle **server) {
  * whatever its size.
  *
  * Any CPU sends and receives under the link's lock (the caller's handle keeps
- * the link; an attachment becomes a handle of the receiver at the BSP). A wait
+ * the link); the app's memory is copied without it. A wait
  * for queue i sleeps in its wait queue, enrolled before the lock is given back;
  * whatever changes queue i (a message in or out, an end closed) wakes it once
  * the lock is dropped. The lock is taken before a wait queue's, an object's and
@@ -239,16 +265,13 @@ static int64_t message_queue(struct handle *h, struct message *m, struct handle 
 int64_t message_channel_send(struct handle *h, const void *udata, size_t n, struct handle *attach) {
     struct message *m = message_new(n, (uint64_t)task_process()->pid);
     if (!m) return n > SIZE_MAX - sizeof(struct message) ? -N_ERR_TOO_LARGE : -N_ERR_NO_MEMORY;
-    /* Copy in fixed pieces: a large message never makes one long
-       non-preemptible copy, and a sibling unmapping the source is caught. */
+    /* In pieces, the CPU given up between them when another task waits for it: kernel code is
+       not preempted. */
     for (size_t done = 0; done < n;) {
         size_t piece = MIN(n - done, (size_t)COPY_PIECE);
-        uint64_t fl = irq_save();
-        bool ok = user_ok((const uint8_t *)udata + done, piece);
-        if (ok) memcpy(m->bytes + done, (const uint8_t *)udata + done, piece);
-        irq_restore(fl);
-        if (!ok) { kfree(m); return -N_ERR_BAD_ADDRESS; }
+        if (copy_from_user(m->bytes + done, (const uint8_t *)udata + done, piece) < 0) { kfree(m); return -N_ERR_BAD_ADDRESS; }
         done += piece;
+        if (need_resched) schedule();
     }
     return message_queue(h, m, attach, true);
 }
@@ -288,16 +311,13 @@ int64_t message_channel_receive(struct handle *h, void *ubuf, size_t cap, bool w
             fl = spin_lock(&l->lock);
             if (l->head[side] != m || MIN(m->size, cap) != copy) { spin_unlock(&l->lock, fl); continue; }
             message_take(l, side, m, fl);
-            /* Taken off the queue: copy out in pieces without holding the
-               guard. Only a sibling unmapping the buffer meanwhile loses it. */
+            /* Taken off the queue: copied out in pieces without the lock. Only a sibling
+               unmapping the buffer meanwhile loses it. */
             for (size_t done = 0; done < copy;) {
                 size_t piece = MIN(copy - done, (size_t)COPY_PIECE);
-                uint64_t cf = irq_save();
-                bool ok = user_ok_w((uint8_t *)ubuf + done, piece);
-                if (ok) memcpy((uint8_t *)ubuf + done, m->bytes + done, piece);
-                irq_restore(cf);
-                if (!ok) { message_free(m); return -N_ERR_BAD_ADDRESS; }
+                if (copy_to_user((uint8_t *)ubuf + done, m->bytes + done, piece) < 0) { message_free(m); return -N_ERR_BAD_ADDRESS; }
                 done += piece;
+                if (need_resched) schedule();
             }
             int64_t size = (int64_t)m->size;
             if (sender_app) *sender_app = m->sender_app;
@@ -346,8 +366,8 @@ static void message_close(struct handle *h) {
     message_free(dropped);
 }
 
-/* Every handle of the end was closed (and synchronized with AP readers) before its last
-   reference went. */
+/* Every handle of the end was closed before its last reference went: nothing reaches the link
+   through it any more. The other end's last release frees it. */
 static void message_release(struct object *o) {
     struct message_link *l = o->priv;
     if (__atomic_sub_fetch(&l->objects, 1, __ATOMIC_ACQ_REL)) return;

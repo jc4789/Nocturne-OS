@@ -11,9 +11,10 @@
    system kept them all in, once. The documents are no interface: a program asks the part (its
    system call) and watches it (sys/watch.h).
 
-   BSP. keep_changed and keep_register take no lock and do not sleep (a part may hold its own
-   lock); keep_start and keep_flush may sleep. line and text run on keep's thread, or on the thread
-   that calls keep_flush, and may take the part's own lock. */
+   Any CPU. keep_changed and keep_register do not sleep and take only keep's own spinlock, which
+   comes after any lock a part holds (a part's spinlock too); keep_start and keep_flush may sleep.
+   line and text run on keep's thread, or on the thread that calls keep_flush, with no lock of
+   keep's held, and may take the part's own lock. */
 #pragma once
 #include "kernel.h"
 
@@ -36,7 +37,7 @@ struct keep {
     bool reading;    /* in the round of reading going on */
     bool missing;    /* it has no document of its own (that round) */
     bool took;       /* it took a line of an older system's document (that round) */
-    uint64_t dirty_at; /* uptime_ms of the last change */
+    uint64_t dirty_at; /* timer_now_ms of the last change: a deadline on any CPU */
 };
 
 /* A part, before keep_start or after (then it is read at once, on keep's thread). */

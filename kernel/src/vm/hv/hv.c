@@ -3,6 +3,7 @@
    read+execute only, so W^X holds for it too. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/spin.h"
 #include "vm/hyperv.h"
 #include "vm/hv/hv.h"
 #include "mm/pmm.h"
@@ -26,6 +27,7 @@ static void *hypercall_page;
 static uint64_t hc_pa, simp_pa, siefp_pa; /* the overlays, for hv_core_resume */
 static uint8_t *post_buf; /* HvPostMessage input: must not cross a page */
 static uint64_t post_buf_pa;
+static struct spinlock post_lock; /* post_buf, from any CPU and from the SINT handler; taken alone */
 static struct hv_message *msg_page;
 static uint8_t *event_page;
 static void (*sint_isr)(void);
@@ -77,7 +79,7 @@ bool hv_core_init(void (*isr)(void)) {
 
 uint16_t hv_post_message(uint32_t connection_id, uint32_t type, const void *data, uint32_t len) {
     if (len > HV_MESSAGE_PAYLOAD_BYTES) return 5; /* HV_STATUS_INVALID_PARAMETER */
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&post_lock);
     uint32_t *h = (uint32_t *)post_buf;
     h[0] = connection_id;
     h[1] = 0;
@@ -85,7 +87,7 @@ uint16_t hv_post_message(uint32_t connection_id, uint32_t type, const void *data
     h[3] = len;
     memcpy(post_buf + 16, data, len);
     uint16_t st = (uint16_t)hypercall(HVCALL_POST_MESSAGE, post_buf_pa, 0);
-    irq_restore(f);
+    spin_unlock(&post_lock, f);
     return st;
 }
 

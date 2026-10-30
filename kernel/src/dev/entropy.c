@@ -1,23 +1,50 @@
 /* Kernel random numbers for SYS_RANDOM (and through it, TLS keys in userland).
-   Every interrupt mixes its timestamp-counter value into a 256-bit pool; RDRAND is added when the
-   CPU has it. Output is a ChaCha20 keystream whose key is re-derived from the pool on every read,
-   so the generator never repeats and later interrupts keep feeding fresh jitter in. */
+   Every interrupt mixes its timestamp-counter value into its CPU's 256-bit feed; a read folds
+   every CPU's feed and RDRAND (when the CPU has it) into the pool. Output is a ChaCha20 keystream
+   whose key is re-derived from the pool on every read, so the generator never repeats and later
+   interrupts keep feeding fresh jitter in. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/smp.h"
+#include "arch/spin.h"
 #include "dev/entropy.h"
 
+/* The pool and the key counter: a read derives its key and replaces the pool under pool_lock, so
+   no two reads, on any CPUs, ever get the same key. Taken alone. */
+static struct spinlock pool_lock;
 static uint64_t pool[4] = {0x6A09E667F3BCC908ULL, 0xBB67AE8584CAA73BULL, 0x3C6EF372FE94F82BULL,
                            0xA54FF53A5F1D36F1ULL};
 static unsigned pool_pos;
 static uint64_t counter;
 static bool have_rdrand;
 
+/* Each CPU's interrupts mix into its own feed, with that CPU's interrupts off: no other CPU writes
+   it, and a read folds it in with plain word loads (a word half a mix behind is jitter all the
+   same). */
+static struct feed {
+    uint64_t word[4];
+    unsigned pos;
+} __attribute__((aligned(64))) feeds[CPU_MAX_COUNT];
+
 static inline uint64_t rotl64(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
 
-/* cheap enough for every interrupt: one multiply-rotate mix into the next pool word */
-void entropy_add(uint64_t v) {
+static inline uint64_t mix(uint64_t w, uint64_t next, uint64_t v) {
+    return rotl64(w ^ (v * 0x9E3779B97F4A7C15ULL), 23) + next;
+}
+
+/* pool_lock held. */
+static void pool_add(uint64_t v) {
     unsigned i = pool_pos++ & 3;
-    pool[i] = rotl64(pool[i] ^ (v * 0x9E3779B97F4A7C15ULL), 23) + pool[(i + 1) & 3];
+    pool[i] = mix(pool[i], pool[(i + 1) & 3], v);
+}
+
+/* cheap enough for every interrupt: one multiply-rotate mix into the next word of this CPU's feed */
+void entropy_add(uint64_t v) {
+    uint64_t f = irq_save();
+    struct feed *s = &feeds[cpu_current_index()];
+    unsigned i = s->pos++ & 3;
+    __atomic_store_n(&s->word[i], mix(s->word[i], s->word[(i + 1) & 3], v), __ATOMIC_RELAXED);
+    irq_restore(f);
 }
 
 static bool rdrand64(uint64_t *out) {
@@ -52,13 +79,16 @@ static void chacha_block(const uint32_t key[8], uint64_t ctr, uint32_t out[16]) 
 }
 
 void entropy_get(void *buf, size_t n) {
-    uint64_t f = irq_save();
-    entropy_add(rdtsc());
-    if (have_rdrand) {
-        uint64_t r;
+    uint64_t hw[4];
+    unsigned nhw = 0;
+    if (have_rdrand)
         for (int i = 0; i < 4; i++)
-            if (rdrand64(&r)) entropy_add(r);
-    }
+            if (rdrand64(&hw[nhw])) nhw++;
+    uint64_t f = spin_lock(&pool_lock);
+    pool_add(rdtsc());
+    for (unsigned i = 0; i < nhw; i++) pool_add(hw[i]);
+    for (unsigned c = 0; c < CPU_MAX_COUNT; c++)
+        for (unsigned i = 0; i < 4; i++) pool_add(__atomic_load_n(&feeds[c].word[i], __ATOMIC_RELAXED));
     /* key = first block of ChaCha20 under the pool; the pool is then replaced by the second block
        (forward secrecy: earlier outputs can't be recomputed from the new pool) */
     uint32_t key[8], blk[16];
@@ -66,7 +96,8 @@ void entropy_get(void *buf, size_t n) {
     chacha_block(key, counter++, blk);
     memcpy(key, blk, 32);
     memcpy(pool, blk + 8, 32);
-    irq_restore(f);
+    spin_unlock(&pool_lock, f);
+    memset(hw, 0, sizeof hw);
 
     uint8_t *b = buf;
     uint64_t ctr = 0;
@@ -86,7 +117,7 @@ void entropy_init(void) {
     cpuid(1, 0, &a, &b, &c, &d);
     have_rdrand = c & (1u << 30);
     for (int i = 0; i < 64; i++) {
-        entropy_add(rdtsc());
+        entropy_add(rdtsc()); /* into this CPU's feed, which the first read folds in */
         for (volatile int j = 0; j < (i & 7) * 50; j++) {
         }
     }

@@ -25,11 +25,6 @@ static void count_free(void*p){if(p){live--;free(p);}}
 #undef calloc
 #undef realloc
 #undef free
-static const char *user_source;
-static size_t user_bytes;
-static bool short_copy;
-static bool user_ok(const void*p,size_t n){uintptr_t a=(uintptr_t)p,b=(uintptr_t)user_source;return a>=b&&n<=user_bytes&&a-b<=user_bytes-n;}
-static int user_str(char*dst,const char*src,size_t n){if(short_copy){dst[0]=0;return 0;}for(size_t i=0;i<n;i++){if(!user_ok(src+i,1))return -EFAULT;dst[i]=src[i];if(!dst[i])return(int)i;}dst[n-1]=0;return -ENAMETOOLONG;}
 #define kmalloc count_malloc
 #define kfree count_free
 #include "../kernel/src/net/dns_name.h"
@@ -95,16 +90,5 @@ int main(void){
     memset(host,'a',64);host[64]=0;
     CHECK("DNS 64 byte individual label remains protocol error",!dns_name_encode(host,64,encoded,sizeof encoded,&n));
     CHECK("DNS embedded NUL explicit span and empty middle label rejected",!dns_name_encode("a\0b",3,encoded,sizeof encoded,&n)&&!dns_name_encode("a..b",4,encoded,sizeof encoded,&n));
-    hostname(host,253);host[253]='.';host[254]=0;user_source=host;user_bytes=255;char *copied=NULL;
-    r=dns_user_name_copy(host,&copied);
-    CHECK("DNS syscall accepts full254 text with exact255 allocation",r==0&&copied&&!strcmp(copied,host)&&last_size==255);count_free(copied);CHECK("DNS syscall copied lifetime releases after request",live==0);
-    fail_malloc=1;copied=(char*)1;r=dns_user_name_copy(host,&copied);
-    CHECK("DNS allocation failure is explicit and owns nothing",r==-ENOMEM&&!copied&&live==0);fail_malloc=0;
-    user_bytes=120;copied=NULL;r=dns_user_name_copy(host,&copied);
-    CHECK("invalid user span rejected before allocation",r==-EFAULT&&!copied&&live==0);
-    user_bytes=255;short_copy=true;r=dns_user_name_copy(host,&copied);short_copy=false;
-    CHECK("user string shrink between measurement and copy frees snapshot",r==-EINVAL&&!copied&&live==0);
-    memset(host,'a',255);host[255]=0;user_bytes=256;size_t before=malloc_calls;r=dns_user_name_copy(host,&copied);
-    CHECK("unrepresentable DNS text does not allocate giant backing",r==-ENAMETOOLONG&&!copied&&live==0&&malloc_calls==before);
     printf("new owned hostname/DNS boundaries: %u checks / %u failed\n",checks,failed);return failed?1:0;
 }

@@ -8,8 +8,8 @@
 void wm_init(void);
 bool wm_running(void);
 /* Something SYS_SCREEN_INFO reports changed (the screen's mode, gui/screenmode.c): its watches
-   (SCREEN_WATCH, display_abi.h) hear of it. BSP, any lock held; it does not sleep. Nothing without
-   the desktop. */
+   (SCREEN_WATCH, display_abi.h) hear of it. Any CPU; it does not sleep, so the caller may hold a
+   lock (watched_changed, sys/watch.c). Nothing without the desktop. */
 void wm_screen_info_changed(void);
 void wm_screen_size(uint32_t *w, uint32_t *h); /* the desktop's size, which a remote viewer may have changed */
 /* The scanout the screen is drawn into is about to be, or now is, w x h (dev/pciuser.c: a display
@@ -18,18 +18,16 @@ void wm_screen_size(uint32_t *w, uint32_t *h); /* the desktop's size, which a re
    leaves). False when the desktop's planes do not fit in memory at that size: it keeps its own. */
 bool wm_screen_resized(uint32_t w, uint32_t h);
 
-/* UTF-8 clipboard metadata or a caller-owned snapshot (release with kfree).
-   Never lend mutable storage across BSP timer preemption. */
+/* The UTF-8 clipboard, any CPU, under the WM lock: a call on another CPU may replace it at any
+   time, so it is read as a caller-owned snapshot (release with kfree). wm_clipboard_set copies
+   text (kernel memory). */
 #define WM_CLIPBOARD_MAX (1 << 20)
 bool wm_clipboard_set(const char *text, size_t n);
 void wm_clipboard_info(size_t *len, uint32_t *seq);
 char *wm_clipboard_snapshot(size_t *len);
 void wm_process_exit(int pid);
+/* The window and screen calls, any CPU (SYS_WIN_RECEIVE without the WM lock). */
 int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
-/* SYS_WIN_STATE on an AP inside an AP read section, for any handle h: true with *result for a
-   window of the calling app, false when the BSP must serve it. (SYS_WIN_RECEIVE runs on any CPU.) */
-struct handle;
-bool wm_state_ap(struct handle *h, int64_t *result);
 void wm_notify(const char *title, const char *text); /* desktop toast */
 /* Power changes (dev/pm.c): how many app windows are open (the top one's
    title in top_title), and ask every one of them to close. */
@@ -38,8 +36,8 @@ void wm_close_windows(void);
 void wm_repaint(void); /* the screen lost what was on it (after sleep): draw all of it again */
 /* A vertical blank of the display driver's scanout the screen is drawn into (dev/pciuser.c): count
    is the driver's count of blanks, timestamp_ns its time of this one. While blanks come, frames
-   start at them instead of after the configured period. Cheap: it wakes the compositor only when
-   a frame waits for the blank. */
+   start at them instead of after the configured period. Any CPU, without sleeping; cheap: it wakes
+   the compositor only when a frame waits for the blank. */
 void wm_vblank(uint64_t count, uint64_t timestamp_ns);
 /* Direct scanout (dev/pciuser.c): whether the display driver whose scanout the screen is drawn
    into can show a window's own images (N_SCANOUT_DIRECT), and what the screen should show: waits up to

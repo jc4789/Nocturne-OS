@@ -5,12 +5,13 @@
 #include "display_abi.h"
 #include "mm/heap.h"
 
-static uint32_t seed = 0x5EED1234;
-static uint32_t rnd(void) {
-    seed ^= seed << 13;
-    seed ^= seed >> 17;
-    seed ^= seed << 5;
-    return seed;
+/* xorshift32 over the caller's state: each part of the wallpaper starts its own from a constant,
+   so the art is the same every time it is drawn. */
+static uint32_t rnd(uint32_t *seed) {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 17;
+    *seed ^= *seed << 5;
+    return *seed;
 }
 
 static uint32_t isqrt(uint32_t v) {
@@ -40,14 +41,14 @@ static void ridge(int *hgt, int w, int base, int amp, uint32_t s) {
     /* midpoint displacement over a power-of-two grid, then sampled */
     enum { N = 256 };
     int pts[N + 1];
-    seed = s;
-    pts[0] = base + (int)(rnd() % (amp + 1)) - amp / 2;
-    pts[N] = base + (int)(rnd() % (amp + 1)) - amp / 2;
+    uint32_t seed = s;
+    pts[0] = base + (int)(rnd(&seed) % (amp + 1)) - amp / 2;
+    pts[N] = base + (int)(rnd(&seed) % (amp + 1)) - amp / 2;
     for (int step = N; step > 1; step /= 2) {
         for (int i = 0; i < N; i += step) {
             int mid = i + step / 2;
             int disp = amp * step / N;
-            pts[mid] = (pts[i] + pts[i + step]) / 2 + (disp ? (int)(rnd() % (2 * disp + 1)) - disp : 0);
+            pts[mid] = (pts[i] + pts[i + step]) / 2 + (disp ? (int)(rnd(&seed) % (2 * disp + 1)) - disp : 0);
         }
     }
     for (int x = 0; x < w; x++) {
@@ -136,17 +137,17 @@ void desktop_draw_wallpaper(canvas_t *c, uint8_t *deep) {
     }
 
     /* stars, behind the far mountains */
-    seed = 0xC0DEF00D;
+    uint32_t seed = 0xC0DEF00D;
     int nstars = w * h / 2200;
     for (int i = 0; i < nstars; i++) {
-        int x = rnd() % w, y = rnd() % (h * 80 / 100);
+        int x = rnd(&seed) % w, y = rnd(&seed) % (h * 80 / 100);
         int dx = x - mx, dy = y - my;
         if (dx * dx + dy * dy < (mr + 6) * (mr + 6)) continue;
-        int b = 70 + rnd() % 186;
-        uint32_t tint = rnd() % 3;
+        int b = 70 + rnd(&seed) % 186;
+        uint32_t tint = rnd(&seed) % 3;
         uint32_t col = tint == 0 ? RGB(b, b, b) : tint == 1 ? RGB(b * 9 / 10, b * 9 / 10, b) : RGB(b, b * 95 / 100, b * 8 / 10);
         if (y < hgt[x]) put_crisp(c, deep, x, y, gfx_mix(c->px[y * c->pitch + x], col, 230));
-        if (b > 240 && rnd() % 3 == 0) {
+        if (b > 240 && rnd(&seed) % 3 == 0) {
             uint32_t dim = gfx_mix(sky_at(y, h), col, 110);
             static const int8_t arm[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
             for (int k = 0; k < 4; k++) {
@@ -187,8 +188,8 @@ void desktop_draw_wallpaper(canvas_t *c, uint8_t *deep) {
     /* a few pine trees on the front ridge */
     seed = 0xBADA55;
     for (int i = 0; i < w / 40; i++) {
-        int x = rnd() % w;
-        int th = 10 + rnd() % 18;
+        int x = rnd(&seed) % w;
+        int th = 10 + rnd(&seed) % 18;
         int base = front[x] + 2;
         gfx_triangle(c, x, base - th, x - th / 3, base, x + th / 3, base, RGB(10, 8, 20));
         if (!deep) continue;

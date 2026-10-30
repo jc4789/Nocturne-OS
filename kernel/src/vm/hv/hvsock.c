@@ -6,6 +6,7 @@
    here: that is all a server needs. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/spin.h"
 #include "vm/hv/hv.h"
 #include "vm/hv/hvsock.h"
 #include "vm/hv/vmbus.h"
@@ -25,14 +26,22 @@ struct pipe_header {
     uint32_t size;
 } PACKED;
 
+/* A socket is its user's task's; the channel's callbacks (CPU 0's handler) only move signals on
+   and wake wq, and a rescind sets rescinded first. A waiter reads signals, looks, and sleeps
+   unless it moved (wq_wait_unless). */
 struct hvsock {
     struct vmbus_channel *ch;
     struct wait_queue wq;
-    volatile bool rescinded;
+    uint64_t signals;
+    bool rescinded; /* atomic */
     bool eof;
     uint8_t *pkt; /* the packet being read */
     uint32_t pkt_cap, off, end;
 };
+
+/* The listeners and the offers waiting for the hvsock thread: hvsock_listen, the offer hook (CPU
+   0's handler, under the VMBus channel lock) and the thread. Only a wait queue's lock under it. */
+static struct spinlock hvsock_lock;
 
 #define MAX_LISTEN 4
 static struct {
@@ -45,9 +54,12 @@ static int nlisteners;
 /* offers waiting for the hvsock thread to open them */
 #define PENDING 16
 static struct vmbus_channel *pending[PENDING];
-static volatile int pend_head, pend_tail;
+static int pend_head, pend_tail;
 static struct wait_queue thread_wq;
 
+static bool socket_rescinded(struct hvsock *s) { return __atomic_load_n(&s->rescinded, __ATOMIC_ACQUIRE); }
+
+/* hvsock_lock held. */
 static int listener_for(const struct guid *service) {
     if (memcmp(service->b + 4, port_template.b + 4, 12)) return -1;
     uint32_t port;
@@ -57,74 +69,93 @@ static int listener_for(const struct guid *service) {
     return -1;
 }
 
-/* interrupt context: a socket channel was offered */
-static void socket_offer(struct vmbus_channel *ch) {
-    if (listener_for(&ch->type) < 0) return; /* nobody listens: the host rescinds it after a while */
+/* CPU 0's handler, under the VMBus channel lock: a socket channel was offered. True keeps it. */
+static bool socket_offer(struct vmbus_channel *ch) {
+    spin_take(&hvsock_lock);
     int next = (pend_head + 1) % PENDING;
-    if (next == pend_tail) return;
-    ch->claimed = true;
-    pending[pend_head] = ch;
-    pend_head = next;
-    wq_wake_all(&thread_wq);
+    /* nobody listens: the host rescinds it after a while */
+    bool keep = listener_for(&ch->type) >= 0 && next != pend_tail;
+    if (keep) {
+        pending[pend_head] = ch;
+        pend_head = next;
+        wq_wake_all(&thread_wq);
+    }
+    spin_give(&hvsock_lock);
+    return keep;
 }
 
-static void sock_callback(struct vmbus_channel *ch) {
-    struct hvsock *s = ch->priv;
+/* CPU 0's handler: the host wrote, read, or withdrew the channel. */
+static void sock_signal(struct hvsock *s) {
+    __atomic_fetch_add(&s->signals, 1, __ATOMIC_SEQ_CST);
     wq_wake_all(&s->wq);
 }
 
+static void sock_callback(struct vmbus_channel *ch) { sock_signal(ch->priv); }
+
+/* Set before the open, which hands the channel its priv: a rescind before it has no socket. */
 static void sock_rescind(struct vmbus_channel *ch) {
     struct hvsock *s = ch->priv;
-    s->rescinded = true;
-    wq_wake_all(&s->wq);
+    if (!s) return;
+    __atomic_store_n(&s->rescinded, true, __ATOMIC_RELEASE);
+    sock_signal(s);
 }
 
 static void accept_channel(struct vmbus_channel *ch) {
+    uint64_t f = spin_lock(&hvsock_lock);
     int l = listener_for(&ch->type);
+    void (*accept)(struct hvsock *s, void *arg) = l >= 0 ? listeners[l].accept : NULL;
+    void *accept_arg = l >= 0 ? listeners[l].arg : NULL;
+    spin_unlock(&hvsock_lock, f);
     struct hvsock *s = kzalloc(sizeof *s);
     if (s) s->pkt = kmalloc(RECV_RING);
-    if (l < 0 || !s || !s->pkt || ch->rescinded) goto fail;
+    if (!accept || !s || !s->pkt || __atomic_load_n(&ch->rescinded, __ATOMIC_ACQUIRE)) goto fail;
     s->ch = ch;
     s->pkt_cap = RECV_RING;
-    ch->on_rescind = sock_rescind;
+    vmbus_set_rescind(ch, sock_rescind);
     if (vmbus_open(ch, SEND_RING, RECV_RING, sock_callback, s)) goto fail;
-    listeners[l].accept(s, listeners[l].arg);
+    accept(s, accept_arg);
     return;
 fail:
+    vmbus_release(ch); /* from here on neither sock_rescind nor sock_callback runs for s */
     if (s) kfree(s->pkt);
     kfree(s);
-    vmbus_release(ch);
 }
 
 static void hvsock_thread(void *arg) {
     (void)arg;
     for (;;) {
-        uint64_t f = irq_save();
-        if (pend_tail == pend_head) wq_wait(&thread_wq);
-        irq_restore(f);
-        while (pend_tail != pend_head) {
-            struct vmbus_channel *ch = pending[pend_tail];
-            pend_tail = (pend_tail + 1) % PENDING;
-            accept_channel(ch);
+        uint64_t f = spin_lock(&hvsock_lock);
+        while (pend_tail == pend_head) {
+            wq_wait_locked(&thread_wq, &hvsock_lock);
+            spin_take(&hvsock_lock);
         }
+        struct vmbus_channel *ch = pending[pend_tail];
+        pend_tail = (pend_tail + 1) % PENDING;
+        spin_unlock(&hvsock_lock, f);
+        accept_channel(ch);
     }
 }
 
 int hvsock_listen(uint32_t port, void (*accept)(struct hvsock *s, void *arg), void *arg) {
     if (!vmbus_ready()) return -N_ERR_IO;
-    if (nlisteners == MAX_LISTEN) return -N_ERR_NO_MEMORY;
-    listeners[nlisteners].accept = accept;
-    listeners[nlisteners].arg = arg;
-    __asm__ volatile("" ::: "memory");
-    listeners[nlisteners++].port = port;
-    return 0;
+    uint64_t f = spin_lock(&hvsock_lock);
+    int r = 0;
+    if (nlisteners == MAX_LISTEN) {
+        r = -N_ERR_NO_MEMORY;
+    } else {
+        listeners[nlisteners].accept = accept;
+        listeners[nlisteners].arg = arg;
+        listeners[nlisteners++].port = port;
+    }
+    spin_unlock(&hvsock_lock, f);
+    return r;
 }
 
 /* Make the next stream bytes available in pkt[off..end). False if there are none yet. */
 static bool fill(struct hvsock *s) {
     while (s->off >= s->end && !s->eof) {
         int n = vmbus_recv(s->ch, s->pkt, s->pkt_cap);
-        if (n == 0) return s->rescinded;
+        if (n == 0) return socket_rescinded(s);
         if (n < 0) continue;
         struct vmpacket_desc *d = (void *)s->pkt;
         uint32_t dl = vmpacket_datalen(s->pkt);
@@ -143,13 +174,11 @@ static bool fill(struct hvsock *s) {
 bool hvsock_wait(struct hvsock *s, uint64_t timeout_ms) {
     uint64_t end = uptime_ms() + timeout_ms;
     for (;;) {
-        uint64_t f = irq_save();
-        bool ready = fill(s);
+        uint64_t seen = __atomic_load_n(&s->signals, __ATOMIC_SEQ_CST);
+        if (fill(s)) return true;
         uint64_t now = uptime_ms();
-        if (!ready && now < end) wq_wait_timeout(&s->wq, end - now);
-        irq_restore(f);
-        if (ready) return true;
         if (now >= end) return false;
+        wq_wait_unless(&s->wq, &s->signals, seen, end - now);
     }
 }
 
@@ -179,22 +208,16 @@ static int send_packet(struct hvsock *s, const void *data, uint32_t n) {
         struct vmpacket_desc d;
         struct pipe_header h;
     } PACKED hdr = {{VM_PKT_DATA_INBAND, 2, (uint16_t)((sizeof hdr + n + 7) / 8), 0, 0}, {1, n}};
-    uint32_t need = (uint32_t)ALIGN_UP(sizeof hdr + n, 8) + 8;
     uint64_t give_up = uptime_ms() + 10000; /* a host that reads nothing for this long is gone */
     for (;;) {
-        if (s->rescinded) return -N_ERR_CLOSED;
-        if (uptime_ms() > give_up) return -N_ERR_TIMEOUT;
+        uint64_t seen = __atomic_load_n(&s->signals, __ATOMIC_SEQ_CST);
+        if (socket_rescinded(s)) return -N_ERR_CLOSED;
+        uint64_t now = uptime_ms();
+        if (now > give_up) return -N_ERR_TIMEOUT;
+        /* full: the ring has asked the host (pending_send_sz) to signal once it has made room */
         int r = vmbus_send_raw(s->ch, &hdr, sizeof hdr, data, n);
         if (r != -N_ERR_NOT_READY) return r;
-        /* full: ask the host to signal us once it has made room, then wait */
-        uint64_t f = irq_save();
-        s->ch->out->pending_send_sz = need;
-        hv_mb();
-        r = vmbus_send_raw(s->ch, &hdr, sizeof hdr, data, n);
-        if (r == -N_ERR_NOT_READY) wq_wait_timeout(&s->wq, 100);
-        s->ch->out->pending_send_sz = 0;
-        irq_restore(f);
-        if (r != -N_ERR_NOT_READY) return r;
+        wq_wait_unless(&s->wq, &s->signals, seen, MIN(give_up - now + 1, (uint64_t)100));
     }
 }
 
@@ -211,7 +234,7 @@ int hvsock_write(struct hvsock *s, const void *buf, size_t len) {
 }
 
 void hvsock_close(struct hvsock *s) {
-    if (!s->rescinded) send_packet(s, NULL, 0); /* end of stream */
+    if (!socket_rescinded(s)) send_packet(s, NULL, 0); /* end of stream */
     vmbus_close(s->ch);
     vmbus_release(s->ch);
     kfree(s->pkt);

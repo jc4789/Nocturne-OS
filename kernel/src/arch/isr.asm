@@ -173,3 +173,18 @@ wrmsr_checked_write:
 wrmsr_checked_refused:
     xor eax, eax
     ret
+
+; size_t user_copy(void *dst, const void *src, size_t n): the bytes left, 0 when all went. A page
+; fault on the user side that the app's memory does not resolve resumes at user_copy_fault
+; (arch/idt.c), with rcx the bytes rep movsb had left.
+global user_copy, user_copy_start, user_copy_end, user_copy_fault
+user_copy:
+    mov rcx, rdx
+user_copy_start:
+    rep movsb
+user_copy_end:
+    xor eax, eax
+    ret
+user_copy_fault:
+    mov rax, rcx
+    ret

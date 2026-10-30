@@ -288,18 +288,10 @@ static void download_worker(void *argument) {
     free(buffer);tcp_close(s);work->result=same&&got==262144?0:-1;
 }
 static void parallel_transfers(void) {
-    struct n_netstats before,after;struct n_cpuinfo info;net_stats(&before);cpu_info(&info);
     struct transfer transfers[4]={{.id=0},{.id=1},{.id=2},{.id=3}};int tids[4];
     for(unsigned i=0;i<4;i++)tids[i]=thread_create(download_worker,&transfers[i]);
     bool correct=true;for(unsigned i=0;i<4;i++)if(tids[i]<0 || thread_join(tids[i])<0 || transfers[i].result)correct=false;
     check(correct,"parallel native TCP connections preserve every byte");
-    check(net_stats(&after)==0,"network CPU counters readable");
-    uint64_t bytes=0,mask=0;
-    for(unsigned cpu=1;cpu<16;cpu++)if(after.ap_recv_bytes[cpu]>before.ap_recv_bytes[cpu]) {
-        bytes+=after.ap_recv_bytes[cpu]-before.ap_recv_bytes[cpu];mask|=1ull<<cpu;
-    }
-    printf("NETWORK-CPU online=%u scheduler=%u ap_rx=%lu mask=%lx\n",info.online_cpus,info.scheduler_cpus,(unsigned long)bytes,(unsigned long)mask);
-    check(info.scheduler_cpus<=1 || (bytes>0 && mask!=0),"available APs perform actual TCP receive copies");
 }
 static bool stream_default_dns(void){
     struct n_netinfo info;bool configured=net_info(&info)==0&&info.up&&

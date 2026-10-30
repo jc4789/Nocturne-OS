@@ -43,6 +43,8 @@ static inline void spin_unlock(struct spinlock *l, uint64_t flags) {
     spin_give(l);
     irq_restore(flags);
 }
+/* A panic, every other CPU stopped: the lock is free again, whoever held it. */
+static inline void spin_seize(struct spinlock *l) { spin_give(l); }
 static inline bool spin_held(const struct spinlock *l) {
     return __atomic_load_n(&l->holder, __ATOMIC_RELAXED) == cpu_current_index() + 1;
 }

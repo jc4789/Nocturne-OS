@@ -1,11 +1,15 @@
 /* Hyper-V detection and the bits of its CPUID/MSR interface the rest of the kernel needs. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/spin.h"
 #include "vm/hyperv.h"
 #include "mm/pmm.h"
 #include "abi.h"
 
 struct hv_info hv;
+/* Set once, under reference_lock (taken alone, only the PMM's lock under it); read without it.
+   The reference MSR is the partition's, so any CPU may write it. */
+static struct spinlock reference_lock;
 static uint64_t reference_page;
 
 void hv_detect(void) {
@@ -42,14 +46,17 @@ uint64_t hv_tsc_hz(void) {
 uint64_t hv_reference_tsc_page(void) {
     if (!hv.present || !(hv.features & HV_ACCESS_REFERENCE_TSC) ||
         !(hv.features & HV_ACCESS_TIME_REF_COUNT)) return 0;
-    if (reference_page) return reference_page;
-    uint64_t page = pmm_alloc_zeroed();
-    if (!page) return 0;
-    /* Preserve the MSR's reserved bits per TLFS. This page remains hypervisor
-       owned for the partition lifetime and is never returned to the PMM. */
-    uint64_t previous = rdmsr(HV_MSR_REFERENCE_TSC);
-    wrmsr(HV_MSR_REFERENCE_TSC, page | (previous & 0xFFE) | 1);
-    reference_page = page;
+    uint64_t page = __atomic_load_n(&reference_page, __ATOMIC_ACQUIRE);
+    if (page) return page;
+    uint64_t f = spin_lock(&reference_lock);
+    if (!(page = reference_page) && (page = pmm_alloc_zeroed())) {
+        /* Preserve the MSR's reserved bits per TLFS. This page remains hypervisor
+           owned for the partition lifetime and is never returned to the PMM. */
+        uint64_t previous = rdmsr(HV_MSR_REFERENCE_TSC);
+        wrmsr(HV_MSR_REFERENCE_TSC, page | (previous & 0xFFE) | 1);
+        __atomic_store_n(&reference_page, page, __ATOMIC_RELEASE);
+    }
+    spin_unlock(&reference_lock, f);
     return page;
 }
 
@@ -64,8 +71,9 @@ void hv_reference_resume(void) {
 
 bool hv_reference_time(uint64_t *units_100ns) {
     if (!hv.present || !(hv.features & HV_ACCESS_TIME_REF_COUNT)) return false;
-    if (reference_page) {
-        const struct n_reference_tsc *p = phys_to_virt(reference_page);
+    uint64_t page = __atomic_load_n(&reference_page, __ATOMIC_ACQUIRE);
+    if (page) {
+        const struct n_reference_tsc *p = phys_to_virt(page);
         for (unsigned attempt = 0; attempt < 4; attempt++) {
             uint32_t sequence = __atomic_load_n(&p->sequence, __ATOMIC_ACQUIRE);
             if (!sequence) break;

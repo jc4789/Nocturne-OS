@@ -16,6 +16,7 @@
 #include "arch/cpu.h"
 #include "arch/ioapic.h"
 #include "arch/irq.h"
+#include "arch/spin.h"
 #include "dev/acpi.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
@@ -181,9 +182,15 @@ static uint64_t sems, irt;
 static size_t sem_pages;
 static uint32_t token;
 static int fault_vector = -1;
-static uint32_t fault_cpu; /* the BSP's APIC ID, the fault events' destination: after sleep its APIC
-                              is in the kernel's mode only after the units (dev/pm.c) */
+static uint32_t fault_cpu; /* CPU 0's APIC ID (pci_interrupt_dest), the fault events' destination:
+                              after sleep its APIC is in the kernel's mode only after the units (dev/pm.c) */
 static const struct pci_device *msi_owner[MSI_BLOCKS];
+/* The units and what they read: every unit's queue, registers and records, the status words
+   and token, the interrupt remapping table and msi_owner, the root and context tables. Every
+   call of the common part (struct iommu_hw) and the fault handler (CPU 0) work under it; it is
+   taken after the common part's locks and arch/ioapic.c's, and only iommu_fault_report's and
+   the page allocator's are taken under it. */
+static struct spinlock units_lock;
 
 static struct iommu_hw intel;
 static bool queue_check(struct unit *u);
@@ -594,9 +601,11 @@ static void faults_drain(struct unit *u) {
 }
 
 /* An ICE is cleared here. IQE and ITE wait for the queue's next user (queue_check), whose
-   recovery submits and waits; no fault event comes while they are set (7.3). */
+   recovery submits and waits; no fault event comes while they are set (7.3). A wait under
+   units_lock on another CPU drains the records itself; this one waits for it. */
 static void fault_isr(struct regs *r) {
     (void)r;
+    spin_take(&units_lock);
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
         if (rd32(u, R_FSTS) & FSTS_ICE) {
@@ -605,6 +614,7 @@ static void fault_isr(struct regs *r) {
         }
         faults_drain(u);
     }
+    spin_give(&units_lock);
 }
 
 static uint32_t token_next(void) {
@@ -765,21 +775,21 @@ static int msi_block(const struct pci_device *d, bool create) {
     return free;
 }
 
+/* units_lock held. */
 static bool msi_release(const struct pci_device *d) {
     int b = msi_block(d, false);
     if (b < 0) return true;
     unsigned first = IOAPIC_ENTRIES + (unsigned)b * MSI_BLOCK;
     for (unsigned i = 0; i < MSI_BLOCK; i++) irte_write(first + i, 0, 0);
-    uint64_t f = irq_save();
     send_iec(first, MSI_BLOCK_LOG2);
     bool ok = sync();
-    irq_restore(f);
     if (ok) msi_owner[b] = NULL; /* else kept: an entry may still be cached */
     return ok;
 }
 
 /* Message n of d's block arrives through entry block + index + n: the address carries the
-   block entry of message 0, the data the subhandle the function adds the message number to. */
+   block entry of message 0, the data the subhandle the function adds the message number to.
+   The entries' source is worked out (an allocation) before units_lock. */
 static bool intel_msi(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
                       uint32_t *address, uint32_t *data) {
     if (!x2 && dest > 0xFF) return false; /* the 8-bit destination of a plain message and an xAPIC IRTE */
@@ -788,21 +798,34 @@ static bool intel_msi(struct pci_device *d, unsigned index, unsigned count, uint
         *data = vector;
         return true;
     }
-    int b = msi_block(d, true);
-    uint64_t source = b < 0 ? 0 : irte_source(d);
+    uint64_t source = irte_source(d);
     if (!source || index + count > MSI_BLOCK) return false;
-    unsigned first = IOAPIC_ENTRIES + (unsigned)b * MSI_BLOCK, at = first + index;
-    for (unsigned i = 0; i < count; i++) irte_write(at + i, IRTE_P | IRTE_VECTOR(vector + i) | irte_dest(dest), source);
-    uint64_t f = irq_save();
-    send_iec(first, MSI_BLOCK_LOG2);
-    bool ok = sync();
-    irq_restore(f);
+    uint64_t f = spin_lock(&units_lock);
+    int b = msi_block(d, true);
+    bool ok = b >= 0;
+    unsigned at = 0;
+    if (ok) {
+        unsigned first = IOAPIC_ENTRIES + (unsigned)b * MSI_BLOCK;
+        at = first + index;
+        for (unsigned i = 0; i < count; i++)
+            irte_write(at + i, IRTE_P | IRTE_VECTOR(vector + i) | irte_dest(dest), source);
+        send_iec(first, MSI_BLOCK_LOG2);
+        ok = sync();
+    }
+    spin_unlock(&units_lock, f);
+    if (b < 0) return false;
     *address = 0xFEE00000u | (at & 0x7FFF) << 5 | 1u << 4 | 1u << 3 | (at >> 15 & 1) << 2; /* remappable, SHV */
     *data = 0;
     return ok;
 }
 
-static bool intel_msi_clear(struct pci_device *d) { return !remap || msi_release(d); }
+static bool intel_msi_clear(struct pci_device *d) {
+    if (!remap) return true;
+    uint64_t f = spin_lock(&units_lock);
+    bool ok = msi_release(d);
+    spin_unlock(&units_lock, f);
+    return ok;
+}
 
 /* Pin `gsi` is entry gsi; the IRTE takes what the plain entry said (delivery mode, logical
    destination, trigger, vector, 8-bit destination), the pin keeps polarity, trigger, vector
@@ -820,12 +843,12 @@ static bool intel_ioapic(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
         kprintf("iommu: IOAPIC %u is under no VT-d unit: GSI %u left masked\n", ioapic_id, gsi);
         return false;
     }
+    uint64_t f = spin_lock(&units_lock);
     irte_write(gsi, IRTE_P | (v >> 11 & 1 ? IRTE_DM : 0) | (v >> 15 & 1 ? IRTE_TM : 0) | IRTE_DLM(v >> 8 & 7) |
                         IRTE_VECTOR(v) | irte_dest((uint32_t)(v >> 56)), source);
-    uint64_t f = irq_save();
     send_iec(gsi, 0);
     bool ok = sync();
-    irq_restore(f);
+    spin_unlock(&units_lock, f);
     if (!ok) {
         kprintf("iommu: the units did not confirm the entry of GSI %u: left masked\n", gsi);
         return false;
@@ -857,17 +880,19 @@ static bool dma_draining(void) {
 /* A present context entry does not change in place: it goes not present, the caches drop it,
    then it comes back pointing at the domain. */
 static bool intel_attach(struct iommu_domain *dom) {
+    uint64_t f = spin_lock(&units_lock);
     if (!dma_draining()) {
+        spin_unlock(&units_lock, f);
         kprintf("iommu: VT-d lacks DMA read/write draining: an app domain cannot be isolated safely\n");
         return false; /* no context published: the common layer can release this unused domain */
     }
     for (size_t i = 0; i < nunits; i++) /* memory first: nothing changes for the group when there is none */
         for (unsigned n = 0; n < dom->nids; n++)
             if (!context_entry(&units[i], dom->ids[n], true)) {
+                spin_unlock(&units_lock, f);
                 kprintf("iommu: no memory for a context table\n");
                 return false;
             }
-    uint64_t f = irq_save();
     dom->written = true;
     contexts_write(dom, 0, 0);
     send_context_flush();
@@ -877,24 +902,25 @@ static bool intel_attach(struct iommu_domain *dom) {
         send_context_flush();
         ok = sync();
     }
-    irq_restore(f);
+    spin_unlock(&units_lock, f);
     return ok;
 }
 
 static bool intel_block(struct iommu_domain *dom) {
+    uint64_t f = spin_lock(&units_lock);
     bool ok = !remap || msi_release(dom->d);
-    uint64_t f = irq_save();
     contexts_write(dom, 0, 0);
     send_context_flush();
     ok &= sync();
-    irq_restore(f);
-    return ok && dma_draining(); /* otherwise retain the domain and its DMA pages in quarantine */
+    ok = ok && dma_draining(); /* otherwise retain the domain and its DMA pages in quarantine */
+    spin_unlock(&units_lock, f);
+    return ok;
 }
 
 /* New entries need no invalidation but where the units cache not-present ones (CAP.CM); then
    only the write buffers are flushed, which an invalidation does itself (6.8). */
 static bool intel_flush(struct iommu_domain *dom, bool unmapped) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&units_lock);
     bool ok;
     if (!unmapped && !caching_mode) {
         ok = write_buffers_flush();
@@ -902,8 +928,9 @@ static bool intel_flush(struct iommu_domain *dom, bool unmapped) {
         send(INV_IOTLB_DOMAIN(dom->id));
         ok = sync();
     }
-    irq_restore(f);
-    return ok && (!unmapped || dma_draining());
+    ok = ok && (!unmapped || dma_draining());
+    spin_unlock(&units_lock, f);
+    return ok;
 }
 
 /* ---- the units ---- */
@@ -1091,7 +1118,7 @@ static bool translation_on(bool open) {
     return true;
 }
 
-static bool unit_tables(struct unit *u, uint32_t bsp) {
+static bool unit_tables(struct unit *u, uint32_t dest) {
     wr64(u, R_RTADDR, u->root); /* legacy mode */
     bool ok = command(u, GCMD_SRTP, true) && queue_start(u);
     if (ok && remap) {
@@ -1101,10 +1128,10 @@ static bool unit_tables(struct unit *u, uint32_t bsp) {
     /* the fault event message (5.1.6): in x2APIC mode the destination's bits 31:8 in FEUADDR,
        which a unit with EIM implements (11.4.7.5). The unit reads it in x2APIC mode once the
        pointer above set EIME (5.1.6.2), so it is unmasked only then. */
-    if (ok && fault_vector >= 0 && (x2 || bsp <= 0xFF)) {
+    if (ok && fault_vector >= 0 && (x2 || dest <= 0xFF)) {
         wr32(u, R_FEDATA, (uint32_t)fault_vector);
-        wr32(u, R_FEADDR, iommu_msi_plain(bsp & 0xFF));
-        wr32(u, R_FEUADDR, x2 ? bsp & ~0xFFu : 0);
+        wr32(u, R_FEADDR, iommu_msi_plain(dest & 0xFF));
+        wr32(u, R_FEUADDR, x2 ? dest & ~0xFFu : 0);
         wr32(u, R_FECTL, 0);
     }
     return ok;
@@ -1156,15 +1183,22 @@ static bool units_off(void) {
 
 /* Off as on a machine without VT-d (what units_plain_safe takes as plain): the protected memory
    ranges too, once every unit confirmed it is off. */
-static bool intel_shutdown(void) { return units_off() && pmrs_release(); }
+static bool intel_shutdown(void) {
+    uint64_t f = spin_lock(&units_lock);
+    bool ok = units_off() && pmrs_release();
+    spin_unlock(&units_lock, f);
+    return ok;
+}
 
 static bool intel_resume(void) {
     /* Called only after the machine really slept. Registers may have reset or been
        reprogrammed by wake firmware: the old software producer state is not evidence
        that this is still our queue. Treat any active queue as inherited, retaining all
        uncertainty latches and the memory a late status write could still address. */
+    uint64_t f = spin_lock(&units_lock);
     for (size_t i = 0; i < nunits; i++) units[i].queue_on = false;
     bool ok = units_on();
+    spin_unlock(&units_lock, f);
     if (!ok) kprintf("iommu: VT-d did not come back after sleep\n");
     return ok;
 }
@@ -1253,14 +1287,14 @@ static bool intel_start(bool translate) {
     }
     if (remap && !intel.coherent) iommu_cache_flush(phys_to_virt(irt), IRT_ENTRIES * 16);
     if (fault_vector < 0 && (fault_vector = irq_vector_alloc(1, 1)) >= 0) vector_register(fault_vector, fault_isr);
-    fault_cpu = lapic_current_id();
-    uint64_t f = irq_save();
+    fault_cpu = pci_interrupt_dest();
+    uint64_t f = spin_lock(&units_lock);
     ok = units_start(translate);
     if (!ok && translate && irreq) {
         kprintf("iommu: VT-d did not start translating; a unit requires interrupt remapping: trying that alone\n");
         ok = units_start(false);
     }
-    irq_restore(f);
+    spin_unlock(&units_lock, f);
     if (!ok) {
         if (irreq) kprintf("iommu: a VT-d unit that requires interrupt remapping is off: it blocks every interrupt message\n");
         return false; /* the tables stay: a unit may still read them */

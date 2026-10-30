@@ -8,3 +8,4 @@ void fbcon_set_enabled(bool on);
 void fbcon_repaint(void); /* the screen lost the console (a display driver held it): draw all of it again */
 bool fbcon_enabled(void);
 void fbcon_clear(void);
+void fbcon_seize(void); /* panic_enter: the console's lock, whoever held it */

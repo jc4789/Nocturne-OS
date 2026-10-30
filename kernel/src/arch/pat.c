@@ -21,6 +21,7 @@ static void flush_tlb_all(uint64_t cr4) {
     if (cr4 & CR4_PGE) write_cr4(cr4);
 }
 
+/* CR0, the caches and IA32_PAT are this CPU's own: closing its interrupts is the whole guard. */
 uint64_t pat_init_cpu(void) {
     if (!pat_supported()) return 0;
     if (rdmsr(MSR_PAT) == PAT_NOCTURNE) return PAT_NOCTURNE; /* already right: nothing to flush */
@@ -41,7 +42,8 @@ uint64_t pat_init_cpu(void) {
 
 /* ---- MTRRs across a sleep ----
    The firmware sets the memory types at power on; after S3 it may not set them as before, and a
-   CPU the kernel starts itself gets them from nobody. The BSP's set from before is the reference. */
+   CPU the kernel starts itself gets them from nobody. The set CPU 0 had before (mtrr_save, while
+   every other CPU is parked) is the reference; each CPU writes it into its own MTRRs. */
 #define MSR_MTRRCAP 0xFE
 #define MSR_MTRR_DEF 0x2FF
 #define MTRR_VAR_MAX 16

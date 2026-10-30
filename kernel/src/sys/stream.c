@@ -10,22 +10,20 @@
 #include "sys/object.h"
 #include "sys/stream.h"
 
-#define COPY_PIECE 512 /* an app's bytes are copied in under the guard this much at a time */
+#define COPY_PIECE 512 /* an app's bytes are copied into the kernel this much at a time */
 
-/* Hands what was sent to out, piece by piece: a sibling thread may unmap the app's memory
-   meanwhile, so each piece is checked and copied with the guard held. */
+/* Hands what was sent to out, piece by piece, each copied in from the app's memory first (a
+   sibling thread may unmap it meanwhile: the copy then ends the send). The CPU is given up between
+   pieces when another task waits for it: kernel code is not preempted. */
 static int64_t stream_put(const void *buf, size_t n, bool user, void (*out)(const char *, size_t)) {
     if (!user) { out(buf, n); return (int64_t)n; }
     char piece[COPY_PIECE];
     for (size_t done = 0; done < n;) {
         size_t c = MIN(n - done, sizeof piece);
-        uint64_t flags = irq_save();
-        bool ok = user_ok((const char *)buf + done, c);
-        if (ok) memcpy(piece, (const char *)buf + done, c);
-        irq_restore(flags);
-        if (!ok) return -N_ERR_BAD_ADDRESS;
+        if (copy_from_user(piece, (const char *)buf + done, c) < 0) return -N_ERR_BAD_ADDRESS;
         out(piece, c);
         done += c;
+        if (need_resched) schedule();
     }
     return (int64_t)n;
 }
@@ -120,7 +118,12 @@ void stream_system_log_keep(void) {
 
 /* ---- the console: text on the screen, keys from the keyboard ---- */
 
+/* The keys typed and not read yet. console_lock guards the ring: the keyboard's interrupt handler
+   (CPU 0) puts keys in and a reader on any CPU takes them, looking under it before it waits in
+   console_wait. It comes before console_wait's lock. */
 #define CONSOLE_INPUT 1024
+#define CONSOLE_PIECE 256 /* bytes a read into an app's memory takes at a time */
+static struct spinlock console_lock;
 static char console_in[CONSOLE_INPUT];
 static size_t console_head, console_tail, console_count;
 static struct wait_queue console_wait;
@@ -128,41 +131,46 @@ static const struct object_ops console_ops;
 static struct object console_object = {.ops = &console_ops};
 
 void console_input_char(char c) {
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock(&console_lock);
     if (console_count < CONSOLE_INPUT) {
         console_in[console_head] = c;
         console_head = (console_head + 1) % CONSOLE_INPUT;
         console_count++;
     }
+    spin_unlock(&console_lock, flags);
     wq_wake_all(&console_wait);
     object_notify(&console_object);
-    irq_restore(flags);
 }
 
 void console_input_str(const char *s) {
     while (*s) console_input_char(*s++);
 }
 
+/* An app's read takes at most CONSOLE_PIECE bytes, into the kernel under the lock and then out to
+   its memory, which is looked at first: only a sibling unmapping the buffer meanwhile loses them. */
 static int64_t console_read(struct handle *h, void *buf, size_t n, bool user, bool wait) {
     (void)h;
-    char *out = buf;
+    char piece[CONSOLE_PIECE];
     if (!n) return 0;
+    if (user && !user_ok_w(buf, MIN(n, sizeof piece))) return -N_ERR_BAD_ADDRESS;
     for (;;) {
-        uint64_t flags = irq_save();
+        uint64_t flags = spin_lock(&console_lock);
         if (console_count) {
             size_t got = MIN(n, console_count);
-            if (user && !user_ok_w(buf, got)) { irq_restore(flags); return -N_ERR_BAD_ADDRESS; }
+            if (user) got = MIN(got, sizeof piece);
+            char *out = user ? piece : buf;
             size_t first = MIN(got, CONSOLE_INPUT - console_tail);
             memcpy(out, console_in + console_tail, first);
             memcpy(out + first, console_in, got - first);
             console_tail = (console_tail + got) % CONSOLE_INPUT;
             console_count -= got;
-            irq_restore(flags);
+            spin_unlock(&console_lock, flags);
+            if (user && copy_to_user(buf, piece, got) < 0) return -N_ERR_BAD_ADDRESS;
             return (int64_t)got;
         }
-        if (!wait) { irq_restore(flags); return -N_ERR_NOT_READY; }
-        if (current_task->killed) { irq_restore(flags); return -N_ERR_STOPPED; }
-        wq_wait(&console_wait);
+        if (!wait) { spin_unlock(&console_lock, flags); return -N_ERR_NOT_READY; }
+        if (current_task->killed) { spin_unlock(&console_lock, flags); return -N_ERR_STOPPED; }
+        wq_wait_locked(&console_wait, &console_lock);
         irq_restore(flags);
     }
 }

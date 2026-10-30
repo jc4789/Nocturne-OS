@@ -79,6 +79,7 @@ static uint64_t next_fence = 1;
 static bool attempted, ready, broken, validating_runtime;
 static uint32_t busy;
 static struct wait_queue completion_wait;
+static uint64_t completions; /* moved on by gpu_isr (CPU 0) before it wakes completion_wait */
 static bool completion_irq;
 static struct n_gpu_info statistics;
 static bool gpu_checkpoint(void) {
@@ -94,17 +95,21 @@ static bool gpu_copy(void *destination,const void *source,size_t bytes) {
     return true;
 }
 
-static void gpu_isr(struct regs *r) { wq_wake_all(&completion_wait); }
+static void gpu_isr(struct regs *r) {
+    (void)r;
+    __atomic_fetch_add(&completions, 1, __ATOMIC_SEQ_CST);
+    wq_wake_all(&completion_wait);
+}
 /* Boot runs on the future idle task, which cannot block on a wait queue.
- * Normal requests sleep as native continuations and let the GUI run. Without
- * MSI-X, poll once per scheduler millisecond instead of monopolising the BSP. */
+ * Normal requests sleep as native continuations and let the GUI run; the one
+ * holding busy (any CPU) sleeps unless an interrupt came since it looked at the
+ * used ring. Without MSI-X, poll once per scheduler millisecond instead of
+ * monopolising the CPU. */
 static void completion_nap(uint64_t remaining) {
-    uint64_t flags=irq_save();
-    if(used->idx==seen_used){
-        if(current_task->kstack)wq_wait_timeout(&completion_wait,completion_irq?remaining:MIN(remaining,1u));
-        else {sti();hlt();schedule();}
-    }
-    irq_restore(flags);
+    uint64_t seen=__atomic_load_n(&completions,__ATOMIC_SEQ_CST);
+    if(used->idx!=seen_used)return;
+    if(current_task->kstack)wq_wait_unless(&completion_wait,&completions,seen,completion_irq?remaining:MIN(remaining,1u));
+    else {sti();hlt();schedule();}
 }
 
 static inline void barrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
@@ -196,7 +201,7 @@ static bool transport_init(struct pci_device *d) {
     int vector=irq_vector_alloc(1,1);
     if(vector>=0){
         vector_register(vector,gpu_isr);
-        if(pci_msix_init(d) && pci_msix_route(d,0,(uint8_t)vector,lapic_current_id())){
+        if(pci_msix_init(d) && pci_msix_route(d,0,(uint8_t)vector,pci_interrupt_dest())){
             mmio_write16(&common->queue_msix_vector, 0);
             if(mmio_read16(&common->queue_msix_vector)==0){
                 pci_msix_mask(d,0,false);pci_msix_function_mask(d,false);

@@ -16,12 +16,18 @@ static uint64_t tsc_base, tsc_per_ms;
 static uint64_t reference_base;
 static bool reference_clock;
 
-/* Tickless idle: with a clock to catch up from, an idle machine stops the 1 kHz tick. */
+/* Tickless idle: with a clock to catch up from, an idle CPU stops its 1 kHz tick. CPU 0's tick
+   keeps the clock's work (the count without a clock, the sound, the serial line, the deadlines),
+   so it comes back by the earliest of them; another CPU's has only its queue's accounting. */
 static bool tickless;
-volatile bool tick_stopped;
+static volatile bool tick_stopped[CPU_MAX_COUNT];
+/* While CPU 0's tick is stopped: the uptime_ms it comes back at by itself (0 while it ticks). A
+   CPU that gives it work sooner reads it after publishing the work, and CPU 0 looks at the work
+   again after setting it, so one of the two sees the other. */
+static uint64_t tick_back;
 
 /* Set the count from the clock, on any CPU: it only moves forward, whoever reads the clock last.
-   False without one (then the BSP's tick adds one each time). */
+   False without one (then CPU 0's tick adds one each time). */
 static bool catch_up(void) {
     uint64_t reference, ms;
     if (reference_clock && vm_clock_read(&reference)) ms = (reference - reference_base) / 10000;
@@ -51,43 +57,72 @@ void timer_clock_sample(uint64_t *ms, uint64_t *tsc, uint64_t *reference_100ns) 
     else if (!vm_clock_read(reference_100ns)) *reference_100ns = 0;
 }
 
-/* The tick counts milliseconds. An emulator may drop timer interrupts when it falls behind (QEMU
-   without acceleration loses a quarter of them), so with a measured TSC the count is set from it
-   instead: a late tick catches up the time it missed. */
+/* Every CPU's tick: its run queue (sched_tick) and samples. CPU 0's also counts milliseconds. An
+   emulator may drop timer interrupts when it falls behind (QEMU without acceleration loses a quarter
+   of them), so with a measured TSC the count is set from it instead: a late tick catches up the
+   time it missed. */
 static void timer_irq(struct regs *r) {
-    prof_tick(r, current_task->pid == 0);
+    prof_tick(r, current_task->is_idle);
     if (pstate_sampling()) pstate_tick();
-    if (!catch_up()) timer_ticks++;
-    audio_tick();
-    serial_tick();
+    if (!cpu_current_index()) {
+        if (!catch_up()) timer_ticks++;
+        audio_tick();
+        serial_tick();
+        sched_timeouts();
+    }
     sched_tick();
 }
 
-/* The frequency samples (arch/pstate.c) are ratios over TSC time: a stopped tick only makes the
-   BSP's window longer while it idles, so they do not keep the tick running. */
+/* The frequency samples (arch/pstate.c) are ratios over TSC time: a stopped tick only makes a
+   CPU's window longer while it idles, so they do not keep the tick running. */
 bool timer_tickless(void) { return tickless && !prof_enabled(); }
 
-/* BSP idle task, interrupts off. When nothing runs anywhere, no sound plays and no log output
-   waits for the serial line, the tick waits for the earliest timeout instead (at most a second).
-   Any interrupt starts it again (timer_wake), so handlers always see the current uptime_ms.
-   Quiet is asked first: a thread on an AP queues its sound (audio_stream_submit) before it leaves
-   its CPU, so once no AP holds one, what it queued is seen here. */
+static bool clock_work(uint64_t back) {
+    return audio_needs_tick() || serial_needs_tick() || sched_next_wake() < back;
+}
+
+/* The idle task, interrupts off: with nothing due before the next tick, the tick waits instead
+   (at most a second). Any interrupt starts it again (timer_wake). */
 void timer_idle(void) {
-    if (tick_stopped || !timer_tickless() || !sched_bsp_quiet()) return;
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    if (audio_needs_tick() || serial_needs_tick()) return;
+    unsigned self = cpu_current_index();
+    if (tick_stopped[self] || !timer_tickless()) return;
+    if (self) {
+        lapic_tick_once(1000);
+        tick_stopped[self] = true;
+        return;
+    }
     catch_up();
     uint64_t now = timer_ticks, next = sched_next_wake();
     if (next <= now + 1) return; /* due by the next tick anyway */
-    lapic_tick_once(next - now > 1000 ? 1000 : (unsigned)(next - now));
-    tick_stopped = true;
+    uint64_t back = next - now > 1000 ? now + 1000 : next;
+    __atomic_store_n(&tick_back, back, __ATOMIC_SEQ_CST);
+    if (clock_work(back)) {
+        __atomic_store_n(&tick_back, 0, __ATOMIC_RELAXED);
+        return;
+    }
+    lapic_tick_once((unsigned)(back - now));
+    tick_stopped[0] = true;
 }
 
 void timer_wake(void) {
-    tick_stopped = false;
+    unsigned self = cpu_current_index();
+    if (!tick_stopped[self]) return;
+    tick_stopped[self] = false;
+    if (!self) __atomic_store_n(&tick_back, 0, __ATOMIC_RELAXED);
     lapic_tick_resume();
     catch_up();
 }
+
+/* After the work is published: CPU 0 ticks again if it would come back later. */
+static void tick_by(uint64_t at) {
+    /* the caller's work is stored before tick_back is read, as CPU 0 stores tick_back before it
+       looks at the work (timer_idle) */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    uint64_t back = __atomic_load_n(&tick_back, __ATOMIC_SEQ_CST);
+    if (back && at < back && cpu_current_index()) cpu_kick(0);
+}
+void timer_deadline(uint64_t at) { tick_by(at); }
+void timer_tick_needed(void) { tick_by(0); }
 
 static uint8_t cmos(uint8_t reg) {
     outb(0x70, reg);
@@ -154,8 +189,11 @@ void timer_init(void) {
     boot_unix_time = rtc_read_unix();
 }
 
-int64_t time_now(void) { return boot_unix_time + (int64_t)(timer_ticks / 1000); }
-void time_set(int64_t t) { boot_unix_time = t - (int64_t)(timer_ticks / 1000); }
+/* Any CPU: the wall clock is the boot's moment, which time_set moves whole, plus the uptime. */
+int64_t time_now(void) {
+    return __atomic_load_n(&boot_unix_time, __ATOMIC_RELAXED) + (int64_t)(uptime_ms() / 1000);
+}
+void time_set(int64_t t) { __atomic_store_n(&boot_unix_time, t - (int64_t)(uptime_ms() / 1000), __ATOMIC_RELAXED); }
 
 void time_to_parts(int64_t t, struct tm_parts *p) {
     int64_t days = t / 86400;
@@ -193,7 +231,8 @@ int64_t timer_resume(void) {
     uint64_t reference;
     if (reference_clock && vm_clock_read(&reference)) reference_base = reference - timer_ticks * 10000;
     if (tsc_per_ms) tsc_base = rdtsc() - timer_ticks * tsc_per_ms;
-    tick_stopped = false;
+    tick_stopped[0] = false;
+    tick_back = 0;
     int64_t slept = rtc_read_unix() - rtc_before;
     if (slept < 0) slept = 0;
     boot_unix_time += slept;

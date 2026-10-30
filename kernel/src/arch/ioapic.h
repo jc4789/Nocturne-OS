@@ -9,8 +9,8 @@
    dev/iommu.c writes carry no more), not FFh, the broadcast, nor one lapic_addressable refuses
    (an AMD APIC's 4-bit IDs), and the vector must be a LAPIC vector >= 0x30 (0x20-0x2F
    belong to the PIC). Entries go through iommu_ioapic_entry, which makes them remappable where
-   interrupt remapping is on. Call from the BSP only; register access is serialised by disabling
-   interrupts. */
+   interrupt remapping is on. Any CPU: a register access and the entries are under the driver's
+   lock, which is taken before the IOMMU back end's, so the IOMMU calls in holding none of its own. */
 void ioapic_init(void); /* after acpi_tables_init(), before apic_init(); masks non-ExtINT pins of each IOAPIC found in the MADT */
 unsigned ioapic_count(void);
 /* Redirect GSI `gsi` to `vector` on the CPU with physical APIC id `dest_apic_id` (fixed delivery),
@@ -28,7 +28,7 @@ bool ioapic_remap(void);
 /* ISA IRQ -> GSI honoring MADT interrupt source overrides. level/active_low (may be NULL) receive the
    trigger mode and polarity to use for that source (ISA default: edge, active high). */
 uint32_t ioapic_isa_to_gsi(unsigned isa_irq, bool *level, bool *active_low);
-/* Sleep (dev/pm.c), interrupts off: mask every entry before S3; after the IOMMU (iommu_resume),
+/* Sleep (dev/pm.c): mask every entry before S3; after the IOMMU (iommu_resume),
    the ids back and every entry made again from the one it was given (ioapic_remap). */
 void ioapic_suspend(void);
 void ioapic_resume(void);

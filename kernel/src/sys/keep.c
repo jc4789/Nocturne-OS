@@ -1,8 +1,8 @@
 /* Keeping the system's state on C: (sys/keep.h). One thread of its own reads the parts' documents
    and writes their changes: reading and writing C: may sleep, and the parts change their state from
-   anywhere on the BSP (a system call, the compositor, a remote session). */
+   anywhere (a system call on any CPU, the compositor, a remote session). */
 #include "sys/keep.h"
-#include "arch/cpu.h"
+#include "dev/timer.h"
 #include "fs/store.h"
 #include "mm/heap.h"
 #include "sys/object.h"
@@ -16,8 +16,13 @@
    the first one there is read for the parts that have no document of their own yet. */
 static const char *const older[] = {"AppData\\Nocturne\\Settings.conf", "AppData\\Settings\\desktop.conf"};
 
-/* The parts, in the order they registered; appended under the BSP IRQ guard, never removed. Their
-   flags change under it too. */
+/* The parts, in the order they registered: appended, never removed. parts_lock guards the list's
+   end, started, and each part's read, dirty, retry and dirty_at, which any CPU changes; keep's
+   thread alone has reading, missing and took. keep's thread looks at what is due under the lock and
+   is in keep_wq before it is given back. The lock comes after any lock a part holds when it calls
+   keep_changed, and before keep_wq's. A walk without it reads each next with acquire: a part is
+   whole before it is linked. */
+static struct spinlock parts_lock;
 static struct keep *parts, **parts_end = &parts;
 static bool started; /* keep_start ran: a part registered now is read on keep's thread */
 static bool ready;   /* the parts registered before keep_start were read */
@@ -25,28 +30,31 @@ static struct wait_queue keep_wq;
 /* One write at a time (keep's thread, keep_flush's caller), so an older text never lands last. */
 static struct mutex write_lock;
 
+static struct keep *first_part(void) { return __atomic_load_n(&parts, __ATOMIC_ACQUIRE); }
+static struct keep *next_part(const struct keep *k) { return __atomic_load_n(&k->next, __ATOMIC_ACQUIRE); }
+
 /* ---- the parts ---- */
 
 void keep_register(struct keep *k) {
-    uint64_t f = irq_save();
     k->next = NULL;
     k->read = k->dirty = k->retry = k->reading = k->missing = k->took = false;
-    *parts_end = k;
+    uint64_t f = spin_lock(&parts_lock);
+    __atomic_store_n(parts_end, k, __ATOMIC_RELEASE);
     parts_end = &k->next;
     bool wake = started;
-    irq_restore(f);
+    spin_unlock(&parts_lock, f);
     if (wake) wq_wake_all(&keep_wq);
 }
 
 void keep_changed(struct keep *k) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&parts_lock);
     bool kept = k->read;
     if (kept) {
         k->dirty = true;
         k->retry = false;
-        k->dirty_at = uptime_ms();
+        k->dirty_at = timer_now_ms();
     }
-    irq_restore(f);
+    spin_unlock(&parts_lock, f);
     if (kept) wq_wake_all(&keep_wq);
 }
 
@@ -158,25 +166,25 @@ static int write_part(struct keep *k) {
    keep_flush. */
 static int save(struct keep *k) {
     mutex_lock(&write_lock);
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&parts_lock);
     bool changed = k->dirty;
     k->dirty = k->retry = false;
-    irq_restore(f);
+    spin_unlock(&parts_lock, f);
     int r = changed ? write_part(k) : 0;
     if (r < 0) {
-        f = irq_save();
+        f = spin_lock(&parts_lock);
         if (!k->dirty) k->dirty = k->retry = true; /* a change meanwhile is due as it says */
-        irq_restore(f);
+        spin_unlock(&parts_lock, f);
     }
     mutex_unlock(&write_lock);
     return r;
 }
 
 void keep_flush(void) {
-    for (struct keep *k = parts; k; k = k->next) {
-        uint64_t f = irq_save();
+    for (struct keep *k = first_part(); k; k = next_part(k)) {
+        uint64_t f = spin_lock(&parts_lock);
         bool changed = k->dirty;
-        irq_restore(f);
+        spin_unlock(&parts_lock, f);
         if (changed) save(k);
     }
 }
@@ -196,7 +204,7 @@ struct older_read {
 static void older_line(const char *key, const char *value, void *arg) {
     struct older_read *o = arg;
     bool owned = false;
-    for (struct keep *k = parts; k; k = k->next) {
+    for (struct keep *k = first_part(); k; k = next_part(k)) {
         bool take = k->reading && k->missing;
         if (!k->line(key, value, take)) continue;
         owned = true;
@@ -222,11 +230,11 @@ static void read_older(void) {
         each_line(text, older_line, &o);
         kfree(text);
         bool written = true;
-        for (struct keep *k = parts; k; k = k->next) {
+        for (struct keep *k = first_part(); k; k = next_part(k)) {
             if (!k->reading || !k->took) continue;
-            uint64_t f = irq_save();
+            uint64_t f = spin_lock(&parts_lock);
             k->read = k->dirty = true; /* written now: from here on its changes are kept */
-            irq_restore(f);
+            spin_unlock(&parts_lock, f);
             int r = save(k);
             kprintf("keep: %s taken over from %s%s\n", k->name, path, r < 0 ? ", but not saved" : "");
             written = written && r >= 0;
@@ -245,15 +253,15 @@ static void read_older(void) {
    system's. */
 static void read_parts(void) {
     bool any = false, missing = false;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&parts_lock);
     for (struct keep *k = parts; k; k = k->next)
         if (!k->read) {
             k->reading = any = true;
             k->missing = k->took = false;
         }
-    irq_restore(f);
+    spin_unlock(&parts_lock, f);
     if (!any) return;
-    for (struct keep *k = parts; k; k = k->next) {
+    for (struct keep *k = first_part(); k; k = next_part(k)) {
         if (!k->reading) continue;
         char path[PATH_ROOM], *text = NULL;
         int64_t n = part_path(k, path, sizeof path) ? document_read(path, &text) : -N_ERR_TOO_LARGE;
@@ -265,14 +273,14 @@ static void read_parts(void) {
         kfree(text);
     }
     if (missing) read_older();
-    f = irq_save();
+    f = spin_lock(&parts_lock);
     for (struct keep *k = parts; k; k = k->next)
         if (k->reading) k->read = true, k->reading = false;
-    irq_restore(f);
+    spin_unlock(&parts_lock, f);
 }
 
-/* When keep's thread has work next (uptime_ms): 0 for a part not read yet, UINT64_MAX for none.
-   Guard held. */
+/* When keep's thread has work next (timer_now_ms): 0 for a part not read yet, UINT64_MAX for none.
+   parts_lock held. */
 static uint64_t next_work(void) {
     uint64_t due = UINT64_MAX;
     for (struct keep *k = parts; k; k = k->next) {
@@ -286,11 +294,11 @@ static uint64_t next_work(void) {
 static void keep_work(void) {
     read_parts();
     __atomic_store_n(&ready, true, __ATOMIC_RELEASE);
-    uint64_t now = uptime_ms();
-    for (struct keep *k = parts; k; k = k->next) {
-        uint64_t f = irq_save();
+    uint64_t now = timer_now_ms();
+    for (struct keep *k = first_part(); k; k = next_part(k)) {
+        uint64_t f = spin_lock(&parts_lock);
         bool due = k->dirty && !k->retry && now >= k->dirty_at + KEEP_AFTER_MS;
-        irq_restore(f);
+        spin_unlock(&parts_lock, f);
         if (due) save(k);
     }
 }
@@ -304,23 +312,24 @@ static void keep_thread(void *arg) {
     }
     for (;;) {
         keep_work();
-        uint64_t f = irq_save();
-        uint64_t due = next_work(), now = uptime_ms();
-        if (due == UINT64_MAX) wq_wait(&keep_wq);
-        else if (due > now) wq_wait_timeout(&keep_wq, due - now);
+        uint64_t f = spin_lock(&parts_lock);
+        uint64_t due = next_work(), now = timer_now_ms();
+        if (due == UINT64_MAX) wq_wait_locked(&keep_wq, &parts_lock);
+        else if (due > now) wq_wait_locked_timeout(&keep_wq, &parts_lock, due - now);
+        else spin_give(&parts_lock);
         irq_restore(f);
     }
 }
 
 void keep_start(void) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&parts_lock);
     started = true;
-    irq_restore(f);
+    spin_unlock(&parts_lock, f);
     if (!kthread_create("keep", keep_thread, NULL)) {
         kprintf("keep: the system's state is neither read back nor kept (no thread)\n");
         return;
     }
     /* Back before the first program starts (a display driver offers its monitor's modes). The boot
        task has no stack to sleep on a wait queue with: it lets the thread run until then. */
-    while (!__atomic_load_n(&ready, __ATOMIC_ACQUIRE)) wq_nap(NULL, NULL, 0);
+    while (!__atomic_load_n(&ready, __ATOMIC_ACQUIRE)) nap_ms(0);
 }

@@ -39,6 +39,7 @@
 #include "kernel.h"
 #include "net.h"
 #include "../arch/cpu.h"
+#include "../arch/spin.h"
 #include "../dev/pci.h"
 #include "../dev/entropy.h"
 #include "../dev/pm.h"
@@ -138,10 +139,17 @@ struct desc {
 #define BUFS_PER_PAGE (PAGE_SIZE / BUFSZ)
 _Static_assert(sizeof(struct desc) == 16, "RTL8125 descriptor ABI");
 
+/* The receive ring and the link state belong to the net thread (poll_rx, rx_pending); the
+   transmit ring to send, which the stack calls one at a time. The interrupt handler (CPU 0) and
+   poll_rx, on any CPU, share the interrupt mask and the two latches below: rtl_lock, a leaf
+   under the stack's net_lock, guards them; net_rx_notify comes after it is given back. A
+   power change (quiesce, resume) runs alone: every other CPU halted, no other task of CPU 0's
+   running in the middle. */
 static volatile uint8_t *mmio;
 static volatile struct desc *rx, *tx;
 static uint8_t *rxbuf[NRX], *txbuf[NTX];
 static unsigned rx_cur, tx_cur, tx_clean;
+static struct spinlock rtl_lock;
 static volatile bool rx_irq_pending, link_event;
 static bool link;
 static uint64_t link_checked;
@@ -440,14 +448,18 @@ static void check_link(void) {
 
 static void rtl_irq(struct regs *r) {
     (void)r;
+    spin_take(&rtl_lock);
     uint32_t isr = rd32(ISR);
-    if (!isr || isr == 0xFFFFFFFF) return;
-    /* The net thread owns the rings: hold interrupts off until it has drained them. */
-    wr32(IMR_CLEAR, 0xFFFFFFFF);
-    wr32(ISR, isr);
-    if (isr & INT_LINK) link_event = true;
-    rx_irq_pending = true;
-    net_rx_notify();
+    bool ours = isr && isr != 0xFFFFFFFF;
+    if (ours) {
+        /* The net thread drains the rings: interrupts stay off until poll_rx rearms them. */
+        wr32(IMR_CLEAR, 0xFFFFFFFF);
+        wr32(ISR, isr);
+        if (isr & INT_LINK) link_event = true;
+        rx_irq_pending = true;
+    }
+    spin_give(&rtl_lock);
+    if (ours) net_rx_notify();
 }
 
 static bool rtl_rx_pending(void) {
@@ -455,10 +467,11 @@ static bool rtl_rx_pending(void) {
 }
 
 static size_t rtl_poll_rx(void (*input)(const void *, size_t)) {
-    if (link_event || uptime_ms() - link_checked >= 1000) {
-        link_event = false;
-        check_link();
-    }
+    uint64_t flags = spin_lock(&rtl_lock);
+    bool event = link_event;
+    link_event = false;
+    spin_unlock(&rtl_lock, flags);
+    if (event || uptime_ms() - link_checked >= 1000) check_link();
     (void)rd8(INT_CFG0); /* a register read orders the descriptor writes the NIC posted before it */
     size_t consumed = 0;
     while (consumed < NRX && !(rx[rx_cur].opts1 & D_OWN)) {
@@ -472,28 +485,25 @@ static size_t rtl_poll_rx(void (*input)(const void *, size_t)) {
         rx_cur = (rx_cur + 1) % NRX;
         consumed++;
     }
-    uint64_t flags = irq_save();
+    flags = spin_lock(&rtl_lock);
     rx_irq_pending = false;
     wr32(IMR_SET, INT_MASK);
     /* A frame may have landed between the last check and rearming: never wait for a new edge. */
-    if (!(rx[rx_cur].opts1 & D_OWN)) {
+    bool again = !(rx[rx_cur].opts1 & D_OWN);
+    if (again) {
         wr32(IMR_CLEAR, 0xFFFFFFFF);
         rx_irq_pending = true;
-        net_rx_notify();
     }
-    irq_restore(flags);
+    spin_unlock(&rtl_lock, flags);
+    if (again) net_rx_notify();
     return consumed;
 }
 
 static int rtl_send(const void *frame, size_t len) {
     if (len > FRAME_MAX - 4) return -N_ERR_INVALID;
-    uint64_t flags = irq_save();
     while (tx_clean != tx_cur && !(tx[tx_clean].opts1 & D_OWN)) tx_clean = (tx_clean + 1) % NTX;
     unsigned next = (tx_cur + 1) % NTX;
-    if (next == tx_clean) {
-        irq_restore(flags);
-        return -N_ERR_NOT_READY; /* local backpressure */
-    }
+    if (next == tx_clean) return -N_ERR_NOT_READY; /* local backpressure */
     uint8_t *b = txbuf[tx_cur];
     memcpy(b, frame, len);
     const uint8_t *f = frame;
@@ -508,7 +518,6 @@ static int rtl_send(const void *frame, size_t len) {
     tx[tx_cur].opts1 = D_OWN | D_FS | D_LS | (tx_cur == NTX - 1 ? D_EOR : 0) | (uint32_t)len;
     tx_cur = next;
     wr16(TPPOLL, 1); /* normal-priority queue 0 */
-    irq_restore(flags);
     return 0;
 }
 

@@ -87,9 +87,11 @@ int usb_clear_halt(struct usb_device *d, uint8_t address);
  * flight; `done` runs on the usb thread whenever one finishes. */
 bool usb_send_open(struct usb_device *d, uint8_t address, unsigned size, unsigned slots, usb_report_fn done, void *ctx);
 /* Queue `a` followed by `b` as one transfer (with the zero-length packet that ends a transfer
- * of whole packets). 1: queued, 0: every slot busy, -1: cannot send. Not from interrupts. */
+ * of whole packets). 1: queued, 0: every slot busy, -1: cannot send. Any task on any CPU, not from
+ * interrupts, holding no spinlock: it takes the controller's send lock. The caller keeps the device
+ * from being removed meanwhile (its class driver's detach waits for it). */
 int usb_send(struct usb_device *d, uint8_t address, const void *a, unsigned alen, const void *b, unsigned blen);
-/* Run fn(arg) on the usb thread and wait for it: how other tasks reach a device. */
+/* Run fn(arg) on the usb thread and wait for it: how other tasks reach a device. Sleeps. */
 void usb_run(void (*fn)(void *arg), void *arg);
 /* The devices there at start are still being looked at: their disks may yet appear. */
 bool usb_enumerating(void);

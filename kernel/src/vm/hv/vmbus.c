@@ -1,10 +1,12 @@
 /* VMBus: version negotiation, channel offers, GPADLs (guest memory shared with the host), opening
    channels and the ring buffers that carry their packets. Control messages arrive through the
-   SynIC message slot of SINT2 and are handled in interrupt context; channel interrupts arrive as
-   bits (one per channel relid) in SINT2's event flags. Only protocol versions from Windows 8 on
-   are supported, so the event flags page is all we need for host-to-guest signalling. */
+   SynIC message slot of SINT2 and are handled in CPU 0's interrupt handler; channel interrupts
+   arrive as bits (one per channel relid) in SINT2's event flags. Only protocol versions from
+   Windows 8 on are supported, so the event flags page is all we need for host-to-guest signalling.
+   The drivers call in from tasks on any CPU. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/spin.h"
 #include "vm/hv/hv.h"
 #include "vm/hv/vmbus.h"
 #include "mm/heap.h"
@@ -101,20 +103,47 @@ struct msg_gpadl_created {
 } PACKED;
 
 #define MAX_RELID 2048
+/* The channel list and by_relid, and each channel's opened, claimed, callback, priv and on_rescind
+   (and rescinded, set by a rescind): changed under chan_lock, by CPU 0's handler (offers,
+   rescinds) and by the drivers' tasks. Taken alone; only the socket hook's own lock and a wait
+   queue's are taken under it. The handler calls a channel's callbacks without it. */
+static struct spinlock chan_lock;
 static struct vmbus_channel *channels, **channels_tail = &channels;
 static struct vmbus_channel *by_relid[MAX_RELID];
+/* Handlers running now (CPU 0's SINT handler, perhaps inside a channel's callback): a channel, or
+   its rings, is freed only once no handler that may have seen it open is left (isr_quiet). */
+static unsigned isr_active;
+/* Moved on by each handler run, after everything it did: vmbus_wait sleeps on isr_wq unless it
+   moved since the flag was looked at. */
+static uint64_t isr_runs;
+static struct wait_queue isr_wq;
 static uint32_t msg_conn_id = VMBUS_CONN_ID_MESSAGE;
 static uint32_t next_gpadl = 0xE1E10;
-static volatile bool offers_done, connected;
-static void (*socket_hook)(struct vmbus_channel *ch);
+static bool offers_done, connected; /* atomic: set once, read anywhere */
+static bool (*socket_hook)(struct vmbus_channel *ch);
 int vmbus_version_major, vmbus_version_minor;
 
-/* one outstanding request at a time; the interrupt handler fills in the reply */
+/* One request at a time (request_mutex, held from arming the waiter to taking its reply); the
+   handler fills in the reply. waiter's fields under waiter_lock. */
+static struct mutex request_mutex;
+static struct spinlock waiter_lock;
 static struct {
-    volatile bool done;
+    bool done;
     uint32_t type, key;
     uint8_t reply[HV_MESSAGE_PAYLOAD_BYTES];
 } waiter;
+
+static bool channel_open(const struct vmbus_channel *ch) { return __atomic_load_n(&ch->opened, __ATOMIC_ACQUIRE); }
+static bool channel_rescinded(const struct vmbus_channel *ch) {
+    return __atomic_load_n(&ch->rescinded, __ATOMIC_ACQUIRE);
+}
+
+/* Every handler that may have seen what the caller just changed under chan_lock has finished. A
+   task on CPU 0 finds none (the handler runs to its end before the task goes on); one on another
+   CPU waits for CPU 0's. Never from a channel's callback. */
+static void isr_quiet(void) {
+    while (__atomic_load_n(&isr_active, __ATOMIC_SEQ_CST)) pause();
+}
 
 static const struct {
     struct guid g;
@@ -151,7 +180,7 @@ static const char *guid_name(const struct guid *g) {
     return NULL;
 }
 
-/* ---- control messages (interrupt context) ---- */
+/* ---- control messages (CPU 0's interrupt handler) ---- */
 
 static void on_offer(const struct msg_offer *o) {
     if (o->relid >= MAX_RELID) return;
@@ -165,12 +194,16 @@ static void on_offer(const struct msg_offer *o) {
     ch->sub_index = o->sub_index;
     ch->relid = o->relid;
     ch->conn_id = o->conn_id;
+    bool late = __atomic_load_n(&offers_done, __ATOMIC_ACQUIRE);
+    bool (*hook)(struct vmbus_channel *) = __atomic_load_n(&socket_hook, __ATOMIC_ACQUIRE);
+    spin_take(&chan_lock);
     by_relid[o->relid] = ch;
     *channels_tail = ch;
     channels_tail = &ch->next;
-    if (offers_done && (ch->chn_flags & VMBUS_CHANNEL_SOCKET)) {
-        if (socket_hook) socket_hook(ch);
-    } else if (offers_done) {
+    /* claimed before anyone can release it: the hook hands it to a thread on another CPU */
+    if (late && (ch->chn_flags & VMBUS_CHANNEL_SOCKET) && hook) ch->claimed = hook(ch);
+    spin_give(&chan_lock);
+    if (late && !(ch->chn_flags & VMBUS_CHANNEL_SOCKET)) {
         char gs[37], is[37];
         guid_format(&ch->type, gs);
         guid_format(&ch->instance, is);
@@ -178,10 +211,8 @@ static void on_offer(const struct msg_offer *o) {
     }
 }
 
-/* Forget a rescinded channel and hand its relid back to the host. Interrupts off. */
-static void free_channel(struct vmbus_channel *ch) {
-    uint32_t m[2 + 1] = {CHMSG_RELID_RELEASED, 0, ch->relid};
-    hv_post_message(msg_conn_id, 1, m, sizeof m);
+/* chan_lock held: the channel leaves the list; channel_free hands its relid back and frees it. */
+static void channel_unlink(struct vmbus_channel *ch) {
     by_relid[ch->relid] = NULL;
     for (struct vmbus_channel **pp = &channels; *pp; pp = &(*pp)->next) {
         if (*pp == ch) {
@@ -190,6 +221,12 @@ static void free_channel(struct vmbus_channel *ch) {
             break;
         }
     }
+}
+
+/* Unlinked, and no handler that saw it is left (the handler itself, or after isr_quiet). */
+static void channel_free(struct vmbus_channel *ch) {
+    uint32_t m[2 + 1] = {CHMSG_RELID_RELEASED, 0, ch->relid};
+    hv_post_message(msg_conn_id, 1, m, sizeof m);
     kfree(ch);
 }
 
@@ -198,15 +235,22 @@ static void handle_message(const uint8_t *p, uint32_t len) {
     uint32_t key = 0;
     switch (type) {
     case CHMSG_OFFER: on_offer((const struct msg_offer *)p); return;
-    case CHMSG_ALL_OFFERS_DELIVERED: offers_done = true; return;
+    case CHMSG_ALL_OFFERS_DELIVERED: __atomic_store_n(&offers_done, true, __ATOMIC_RELEASE); return;
     case CHMSG_RESCIND: {
         uint32_t relid = ((const uint32_t *)p)[2];
+        spin_take(&chan_lock);
         struct vmbus_channel *ch = relid < MAX_RELID ? by_relid[relid] : NULL;
+        vmbus_callback_t rescind = ch ? ch->on_rescind : NULL;
+        if (ch) __atomic_store_n(&ch->rescinded, true, __ATOMIC_RELEASE);
+        spin_give(&chan_lock);
         if (!ch) return;
-        ch->rescinded = true;
         if (!(ch->chn_flags & VMBUS_CHANNEL_SOCKET)) kprintf("vmbus: channel %u rescinded\n", relid);
-        if (ch->on_rescind) ch->on_rescind(ch);
-        if (!ch->claimed && !ch->opened) free_channel(ch);
+        if (rescind) rescind(ch); /* a release waits for this handler before it frees what it uses */
+        spin_take(&chan_lock);
+        bool unused = !ch->claimed && !ch->opened;
+        if (unused) channel_unlink(ch);
+        spin_give(&chan_lock);
+        if (unused) channel_free(ch);
         return;
     }
     case CHMSG_OPEN_RESULT: key = ((const struct msg_open_result *)p)->relid; break;
@@ -215,13 +259,16 @@ static void handle_message(const uint8_t *p, uint32_t len) {
     case CHMSG_VERSION_RESPONSE: break;
     default: return;
     }
+    spin_take(&waiter_lock);
     if (!waiter.done && waiter.type == type && waiter.key == key) {
         memcpy(waiter.reply, p, MIN(len, sizeof waiter.reply));
-        waiter.done = true;
+        __atomic_store_n(&waiter.done, true, __ATOMIC_RELEASE);
     }
+    spin_give(&waiter_lock);
 }
 
 static void vmbus_isr(void) {
+    __atomic_fetch_add(&isr_active, 1, __ATOMIC_SEQ_CST);
     struct hv_message *m = hv_message_slot(VMBUS_MESSAGE_SINT);
     while (m->type != 0) {
         uint8_t buf[HV_MESSAGE_PAYLOAD_BYTES];
@@ -237,21 +284,54 @@ static void vmbus_isr(void) {
         while (bits) {
             int b = __builtin_ctzll(bits);
             bits &= bits - 1;
+            spin_take(&chan_lock);
             struct vmbus_channel *ch = by_relid[w * 64 + b];
-            if (ch && ch->opened && ch->callback) ch->callback(ch);
+            vmbus_callback_t cb = ch && ch->opened ? ch->callback : NULL;
+            spin_give(&chan_lock);
+            if (cb) cb(ch); /* a close waits for this handler before the channel or its rings go */
         }
     }
+    __atomic_fetch_add(&isr_runs, 1, __ATOMIC_SEQ_CST);
+    wq_wake_all(&isr_wq);
+    __atomic_fetch_sub(&isr_active, 1, __ATOMIC_SEQ_CST);
 }
 
 /* ---- requests ---- */
 
+/* The flags a waiter waits for are set by the handler, before it moves isr_runs on. CPU 0's idle
+   task (the boot task) halts instead: the handler interrupts that halt. */
 bool vmbus_wait(volatile bool *flag, uint64_t ms) {
     uint64_t end = uptime_ms() + ms;
-    while (!*flag) {
-        if (uptime_ms() >= end) return false;
-        sti();
-        hlt();
+    for (;;) {
+        uint64_t seen = __atomic_load_n(&isr_runs, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(flag, __ATOMIC_ACQUIRE)) return true;
+        uint64_t now = uptime_ms();
+        if (now >= end) return false;
+        if (current_task->is_idle) {
+            sti();
+            hlt();
+        } else {
+            wq_wait_unless(&isr_wq, &isr_runs, seen, end - now);
+        }
     }
+}
+
+/* request_mutex held: the reply of `type` carrying `key` is the next one taken. */
+static void waiter_arm(uint32_t type, uint32_t key) {
+    uint64_t f = spin_lock(&waiter_lock);
+    waiter.type = type;
+    waiter.key = key;
+    waiter.done = false;
+    spin_unlock(&waiter_lock, f);
+}
+
+/* request_mutex held: false on timeout, else the reply's first `len` bytes in out (out may be
+   NULL). */
+static bool waiter_take(uint64_t ms, void *out, size_t len) {
+    if (!vmbus_wait(&waiter.done, ms)) return false;
+    uint64_t f = spin_lock(&waiter_lock);
+    if (out) memcpy(out, waiter.reply, MIN(len, sizeof waiter.reply));
+    spin_unlock(&waiter_lock, f);
     return true;
 }
 
@@ -265,17 +345,17 @@ static uint16_t post(const void *msg, uint32_t len) {
     return st;
 }
 
-/* Post a message and wait for the reply of `type` carrying `key`. */
-static bool request(const void *msg, uint32_t len, uint32_t type, uint32_t key, uint64_t ms) {
-    waiter.type = type;
-    waiter.key = key;
-    waiter.done = false;
+/* Post a message and wait for the reply of `type` carrying `key`, whose first reply_len bytes go
+   to reply (NULL: none needed). One request at a time, from any task. */
+static bool request(const void *msg, uint32_t len, uint32_t type, uint32_t key, uint64_t ms, void *reply,
+                    size_t reply_len) {
+    mutex_lock(&request_mutex);
+    waiter_arm(type, key);
     uint16_t st = post(msg, len);
-    if (st != HV_STATUS_SUCCESS) {
-        kprintf("vmbus: post message failed (status %x)\n", st);
-        return false;
-    }
-    return vmbus_wait(&waiter.done, ms);
+    bool ok = st == HV_STATUS_SUCCESS && waiter_take(ms, reply, reply_len);
+    mutex_unlock(&request_mutex);
+    if (st != HV_STATUS_SUCCESS) kprintf("vmbus: post message failed (status %x)\n", st);
+    return ok;
 }
 
 static bool try_version(uint32_t version) {
@@ -293,10 +373,10 @@ static bool try_version(uint32_t version) {
     }
     m.monitor_page1 = pmm_alloc_zeroed();
     m.monitor_page2 = pmm_alloc_zeroed();
-    if (!request(&m, sizeof m, CHMSG_VERSION_RESPONSE, 0, 1000)) return false;
-    struct msg_version_response *r = (void *)waiter.reply;
-    if (!r->supported) return false;
-    if (version >= 0x50000 && r->msg_conn_id) msg_conn_id = r->msg_conn_id;
+    struct msg_version_response r;
+    if (!request(&m, sizeof m, CHMSG_VERSION_RESPONSE, 0, 1000, &r, sizeof r)) return false;
+    if (!r.supported) return false;
+    if (version >= 0x50000 && r.msg_conn_id) msg_conn_id = r.msg_conn_id;
     vmbus_version_major = version >> 16;
     vmbus_version_minor = version & 0xFFFF;
     return true;
@@ -306,14 +386,18 @@ bool vmbus_init(void) {
     if (!hv_core_init(vmbus_isr)) return false;
     /* newest first: 5.3 .. 5.0 (Windows 10 1809+), 4.1, 4.0 (Windows 10), 3.0 (8.1), 2.4 (8) */
     static const uint32_t versions[] = {0x50003, 0x50002, 0x50001, 0x50000, 0x40001, 0x40000, 0x30000, 0x20004};
-    for (size_t i = 0; i < ARRAY_SIZE(versions) && !connected; i++) connected = try_version(versions[i]);
-    if (!connected) {
+    bool up = false;
+    for (size_t i = 0; i < ARRAY_SIZE(versions) && !up; i++) up = try_version(versions[i]);
+    if (!up) {
         kprintf("vmbus: the host accepted no protocol version\n");
         return false;
     }
+    __atomic_store_n(&connected, true, __ATOMIC_RELEASE);
     struct msg_header req = {CHMSG_REQUEST_OFFERS, 0};
     if (post(&req, sizeof req) != HV_STATUS_SUCCESS || !vmbus_wait(&offers_done, 3000))
         kprintf("vmbus: offers did not complete\n");
+    /* CPU 0, at boot: the handler, which may add or remove channels, waits for the lock */
+    uint64_t f = spin_lock(&chan_lock);
     int n = 0;
     for (struct vmbus_channel *ch = channels; ch; ch = ch->next) n++;
     kprintf("vmbus: protocol %d.%d, %d offers\n", vmbus_version_major, vmbus_version_minor, n);
@@ -324,15 +408,19 @@ bool vmbus_init(void) {
         kprintf("  relid %-3u %s %s%s\n", ch->relid, gs, name ? name : "?",
                 (ch->chn_flags & 0x2000) ? " (socket)" : "");
     }
+    spin_unlock(&chan_lock, f);
     return true;
 }
 
-bool vmbus_ready(void) { return connected; }
+bool vmbus_ready(void) { return __atomic_load_n(&connected, __ATOMIC_ACQUIRE); }
 
 struct vmbus_channel *vmbus_find(const struct guid *type, int n) {
-    for (struct vmbus_channel *ch = channels; ch; ch = ch->next)
-        if (!ch->rescinded && !memcmp(&ch->type, type, sizeof *type) && n-- == 0) return ch;
-    return NULL;
+    uint64_t f = spin_lock(&chan_lock);
+    struct vmbus_channel *found = NULL;
+    for (struct vmbus_channel *ch = channels; ch && !found; ch = ch->next)
+        if (!ch->rescinded && !memcmp(&ch->type, type, sizeof *type) && n-- == 0) found = ch;
+    spin_unlock(&chan_lock, f);
+    return found;
 }
 
 uint32_t vmbus_gpadl_create(struct vmbus_channel *ch, uint64_t pa, uint32_t pages) {
@@ -354,11 +442,10 @@ uint32_t vmbus_gpadl_create(struct vmbus_channel *ch, uint64_t pa, uint32_t page
     for (uint32_t i = 0; i < n; i++) h->pfn[i] = (pa >> 12) + i;
     uint32_t sent = n;
 
-    waiter.type = CHMSG_GPADL_CREATED;
-    waiter.key = gpadl;
-    waiter.done = false;
-    if (post(buf, sizeof *h + n * 8) != HV_STATUS_SUCCESS) return 0;
-    while (sent < pages) {
+    mutex_lock(&request_mutex);
+    waiter_arm(CHMSG_GPADL_CREATED, gpadl);
+    bool posted = post(buf, sizeof *h + n * 8) == HV_STATUS_SUCCESS;
+    while (posted && sent < pages) {
         struct msg_gpadl_body *b = (void *)buf;
         memset(buf, 0, sizeof buf);
         b->h.type = CHMSG_GPADL_BODY;
@@ -366,22 +453,36 @@ uint32_t vmbus_gpadl_create(struct vmbus_channel *ch, uint64_t pa, uint32_t page
         n = MIN(pages - sent, body_max);
         for (uint32_t i = 0; i < n; i++) b->pfn[i] = (pa >> 12) + sent + i;
         sent += n;
-        if (post(buf, sizeof *b + n * 8) != HV_STATUS_SUCCESS) return 0;
+        posted = post(buf, sizeof *b + n * 8) == HV_STATUS_SUCCESS;
     }
-    if (!vmbus_wait(&waiter.done, 3000)) {
+    struct msg_gpadl_created r;
+    bool answered = posted && waiter_take(3000, &r, sizeof r);
+    mutex_unlock(&request_mutex);
+    if (!posted) return 0;
+    if (!answered) {
         kprintf("vmbus: GPADL %x for relid %u timed out\n", gpadl, ch->relid);
         return 0;
     }
-    struct msg_gpadl_created *r = (void *)waiter.reply;
-    if (r->status) {
-        kprintf("vmbus: GPADL %x for relid %u failed (%x)\n", gpadl, ch->relid, r->status);
+    if (r.status) {
+        kprintf("vmbus: GPADL %x for relid %u failed (%x)\n", gpadl, ch->relid, r.status);
         return 0;
     }
     return gpadl;
 }
 
+/* The channel's callbacks see it open (opened, callback, priv) or not, all at once. */
+static void channel_set_open(struct vmbus_channel *ch, bool open, vmbus_callback_t cb, void *priv) {
+    uint64_t f = spin_lock(&chan_lock);
+    if (open) {
+        ch->callback = cb;
+        ch->priv = priv;
+    }
+    __atomic_store_n(&ch->opened, open, __ATOMIC_RELEASE);
+    spin_unlock(&chan_lock, f);
+}
+
 int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, vmbus_callback_t cb, void *priv) {
-    if (ch->opened) return -N_ERR_BUSY;
+    if (channel_open(ch)) return -N_ERR_BUSY;
     ch->ring_pages_out = (uint32_t)(ALIGN_UP(out_bytes, PAGE_SIZE) / PAGE_SIZE) + 1;
     ch->ring_pages_in = (uint32_t)(ALIGN_UP(in_bytes, PAGE_SIZE) / PAGE_SIZE) + 1;
     uint32_t total = ch->ring_pages_out + ch->ring_pages_in;
@@ -397,8 +498,6 @@ int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, 
     ch->in_size = (ch->ring_pages_in - 1) * PAGE_SIZE;
     ch->out->feature_bits = 1; /* we honour pending_send_sz */
     ch->in->feature_bits = 1;
-    ch->callback = cb;
-    ch->priv = priv;
 
     ch->ring_gpadl = vmbus_gpadl_create(ch, pa, total);
     if (!ch->ring_gpadl) return -N_ERR_IO;
@@ -411,16 +510,16 @@ int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, 
     m.gpadl = ch->ring_gpadl;
     m.target_vp = hv_vp_index;
     m.in_page_offset = ch->ring_pages_out;
-    ch->opened = true; /* events may arrive as soon as the host opens its side */
-    if (!request(&m, sizeof m, CHMSG_OPEN_RESULT, ch->relid, 3000)) {
-        ch->opened = false;
+    channel_set_open(ch, true, cb, priv); /* events may arrive as soon as the host opens its side */
+    struct msg_open_result r;
+    if (!request(&m, sizeof m, CHMSG_OPEN_RESULT, ch->relid, 3000, &r, sizeof r)) {
+        channel_set_open(ch, false, NULL, NULL);
         kprintf("vmbus: open of relid %u timed out\n", ch->relid);
         return -N_ERR_TIMEOUT;
     }
-    struct msg_open_result *r = (void *)waiter.reply;
-    if (r->status) {
-        ch->opened = false;
-        kprintf("vmbus: open of relid %u failed (%x)\n", ch->relid, r->status);
+    if (r.status) {
+        channel_set_open(ch, false, NULL, NULL);
+        kprintf("vmbus: open of relid %u failed (%x)\n", ch->relid, r.status);
         return -N_ERR_IO;
     }
     return 0;
@@ -428,7 +527,7 @@ int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, 
 
 bool vmbus_gpadl_teardown(struct vmbus_channel *ch, uint32_t gpadl) {
     uint32_t m[2 + 2] = {CHMSG_GPADL_TEARDOWN, 0, ch->relid, gpadl};
-    if (!request(m, sizeof m, CHMSG_GPADL_TORNDOWN, gpadl, 3000)) {
+    if (!request(m, sizeof m, CHMSG_GPADL_TORNDOWN, gpadl, 3000, NULL, 0)) {
         kprintf("vmbus: GPADL %x teardown timed out\n", gpadl);
         return false;
     }
@@ -436,16 +535,24 @@ bool vmbus_gpadl_teardown(struct vmbus_channel *ch, uint32_t gpadl) {
 }
 
 static bool close_channel(struct vmbus_channel *ch, bool require_ack) {
-    if (!ch->opened) return false;
-    uint64_t f = irq_save();
-    ch->opened = false; /* no more callbacks */
-    irq_restore(f);
+    uint64_t f = spin_lock(&chan_lock);
+    bool was = ch->opened;
+    __atomic_store_n(&ch->opened, false, __ATOMIC_RELEASE); /* no more callbacks */
+    spin_unlock(&chan_lock, f);
+    if (!was) return false;
+    isr_quiet();
+    /* a send or a receive under way on another CPU ends before the rings can go; later ones find
+       the channel closed */
+    f = spin_lock(&ch->out_lock);
+    spin_unlock(&ch->out_lock, f);
+    f = spin_lock(&ch->in_lock);
+    spin_unlock(&ch->in_lock, f);
     bool ok = !require_ack;
-    if (!ch->rescinded) {
+    if (!channel_rescinded(ch)) {
         uint32_t m[2 + 1] = {CHMSG_CLOSE, 0, ch->relid};
         post(m, sizeof m);
         uint32_t t[2 + 2] = {CHMSG_GPADL_TEARDOWN, 0, ch->relid, ch->ring_gpadl};
-        ok = request(t, sizeof t, CHMSG_GPADL_TORNDOWN, ch->ring_gpadl, 3000);
+        ok = request(t, sizeof t, CHMSG_GPADL_TORNDOWN, ch->ring_gpadl, 3000, NULL, 0);
         if (!ok) kprintf("vmbus: GPADL %x teardown timed out\n", ch->ring_gpadl);
     }
     /* Drivers with explicit GPADL ownership do not infer a teardown ACK from
@@ -464,15 +571,26 @@ void vmbus_close(struct vmbus_channel *ch) { close_channel(ch, false); }
 bool vmbus_close_confirmed(struct vmbus_channel *ch) { return close_channel(ch, true); }
 
 void vmbus_release(struct vmbus_channel *ch) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&chan_lock);
     ch->claimed = false;
     ch->callback = NULL;
     ch->on_rescind = NULL;
-    if (ch->rescinded && !ch->opened) free_channel(ch);
-    irq_restore(f);
+    bool gone = ch->rescinded && !ch->opened;
+    if (gone) channel_unlink(ch);
+    spin_unlock(&chan_lock, f);
+    isr_quiet(); /* a rescind under way may still be calling the driver's on_rescind */
+    if (gone) channel_free(ch);
 }
 
-void vmbus_set_socket_hook(void (*hook)(struct vmbus_channel *ch)) { socket_hook = hook; }
+void vmbus_set_rescind(struct vmbus_channel *ch, vmbus_callback_t on_rescind) {
+    uint64_t f = spin_lock(&chan_lock);
+    ch->on_rescind = on_rescind;
+    spin_unlock(&chan_lock, f);
+}
+
+void vmbus_set_socket_hook(bool (*hook)(struct vmbus_channel *ch)) {
+    __atomic_store_n(&socket_hook, hook, __ATOMIC_RELEASE);
+}
 
 /* ---- ring buffers ---- */
 
@@ -488,14 +606,21 @@ static void ring_copy_in(struct vmbus_channel *ch, uint32_t *pos, const void *sr
     }
 }
 
+/* Any CPU, any context: one writer at a time under the channel's out_lock. */
 static int ring_write(struct vmbus_channel *ch, const void *a, uint32_t alen, const void *b, uint32_t blen) {
-    if (!ch->opened || ch->rescinded) return -N_ERR_IO;
     if (alen > UINT32_MAX - blen || alen + blen > UINT32_MAX - 15) return -N_ERR_TOO_LARGE;
     uint32_t len = alen + blen;
     uint32_t aligned = (uint32_t)ALIGN_UP(len, 8);
     uint32_t need = aligned + 8;
-    if (need >= ch->out_size) return -N_ERR_TOO_LARGE;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&ch->out_lock);
+    if (!channel_open(ch) || channel_rescinded(ch)) {
+        spin_unlock(&ch->out_lock, f);
+        return -N_ERR_IO;
+    }
+    if (need >= ch->out_size) {
+        spin_unlock(&ch->out_lock, f);
+        return -N_ERR_TOO_LARGE;
+    }
     uint32_t w = ch->out->write_index, r = ch->out->read_index;
     uint32_t avail = w >= r ? ch->out_size - (w - r) : r - w;
     if (avail <= need) {
@@ -507,7 +632,7 @@ static int ring_write(struct vmbus_channel *ch, const void *a, uint32_t alen, co
         r = ch->out->read_index;
         avail = w >= r ? ch->out_size - (w - r) : r - w;
         if (avail <= need) {
-            irq_restore(f);
+            spin_unlock(&ch->out_lock, f);
             return -N_ERR_NOT_READY;
         }
     }
@@ -522,7 +647,7 @@ static int ring_write(struct vmbus_channel *ch, const void *a, uint32_t alen, co
     ch->out->write_index = pos;
     hv_mb();
     bool signal = !ch->out->interrupt_mask && ch->out->read_index == w;
-    irq_restore(f);
+    spin_unlock(&ch->out_lock, f);
     if (signal) {
         uint16_t st = hv_signal_event(ch->conn_id);
         if (st) kprintf("vmbus: signal on connection %u failed (%x)\n", ch->conn_id, st);
@@ -551,12 +676,16 @@ static void ring_copy_out(struct vmbus_channel *ch, uint32_t pos, void *dst, uin
     }
 }
 
+/* Any CPU, any context: one reader at a time under the channel's in_lock. */
 int vmbus_recv(struct vmbus_channel *ch, void *buf, uint32_t len) {
-    if (!ch->opened) return 0;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&ch->in_lock);
+    if (!channel_open(ch)) {
+        spin_unlock(&ch->in_lock, f);
+        return 0;
+    }
     uint32_t r = ch->in->read_index, w = ch->in->write_index;
     if (r == w) {
-        irq_restore(f);
+        spin_unlock(&ch->in_lock, f);
         return 0;
     }
     __asm__ volatile("" ::: "memory");
@@ -565,7 +694,7 @@ int vmbus_recv(struct vmbus_channel *ch, void *buf, uint32_t len) {
     ring_copy_out(ch, r, &d, sizeof d);
     uint32_t plen = d.len8 * 8u;
     if (plen < sizeof d || avail < plen + 8) {
-        irq_restore(f);
+        spin_unlock(&ch->in_lock, f);
         return 0;
     }
     int ret = (int)plen;
@@ -576,17 +705,17 @@ int vmbus_recv(struct vmbus_channel *ch, void *buf, uint32_t len) {
     hv_mb();
     /* the host may be waiting for room to write its next packet */
     bool signal = ch->in->pending_send_sz != 0;
-    irq_restore(f);
+    spin_unlock(&ch->in_lock, f);
     if (signal) hv_signal_event(ch->conn_id);
     return ret;
 }
 
 bool vmbus_rx_pending(struct vmbus_channel *ch) {
-    return ch && ch->opened && !ch->rescinded && ch->in->read_index != ch->in->write_index;
+    return ch && channel_open(ch) && !channel_rescinded(ch) && ch->in->read_index != ch->in->write_index;
 }
 
 bool vmbus_write_ready(struct vmbus_channel *ch, uint32_t packet_len) {
-    if (!ch || !ch->opened || ch->rescinded || packet_len > UINT32_MAX - 15) return false;
+    if (!ch || !channel_open(ch) || channel_rescinded(ch) || packet_len > UINT32_MAX - 15) return false;
     uint32_t need = (uint32_t)ALIGN_UP(packet_len, 8) + 8;
     uint32_t w = ch->out->write_index, r = ch->out->read_index;
     uint32_t avail = w >= r ? ch->out_size - (w - r) : r - w;

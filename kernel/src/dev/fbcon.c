@@ -351,8 +351,10 @@ static void panic_draw(const char *msg, struct regs *r) {
 
 void panic_screen(const char *msg) { panic_draw(msg, NULL); }
 
+void fbcon_seize(void) { spin_seize(&fbcon_lock); }
+
 void panic_regs(const char *what, struct regs *r) {
-    cli();
+    panic_enter();
     char buf[256];
     ksnprintf(buf, sizeof buf, "%s (error %lx) at %p", what, r->error, (void *)r->rip);
     kprintf("\n*** KERNEL PANIC: %s\n", buf);

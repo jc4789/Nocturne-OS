@@ -3,7 +3,6 @@
    ready is reported by every wait. */
 #include "kernel.h"
 #include "arch/cpu.h"
-#include "arch/smp.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
 #include "sys/object.h"
@@ -27,6 +26,10 @@ struct event_timer {
     struct event_timer *next;
     uint64_t due, period, token;
 };
+/* Every handle's list of watches (struct handle's watchers, chained by handle_next). Taken
+   before a queue's lock. */
+static struct spinlock watchers_lock;
+
 struct event_queue {
     /* Its watches and timers, which a wait on any CPU reads and changes (timers that fire). A
        watch's handle stays allocated while its watch is on the list: its last close takes the
@@ -42,7 +45,7 @@ struct event_queue {
     struct object object;
 };
 
-/* BSP IRQ guard held (a handle's list of watches is the BSP's), and the watch's queue's lock. */
+/* watchers_lock held, and the watch's queue's lock. */
 static void watch_unlink(struct event_watch *w) {
     object_waiter_unlink(&w->waiter);
     *w->queue_prev = w->queue_next;
@@ -55,6 +58,7 @@ static void watch_unlink(struct event_watch *w) {
 /* Ended watches are chained by handle_next. */
 struct event_watch *events_handle_closed(struct handle *h) {
     struct event_watch *ended = NULL;
+    uint64_t flags = spin_lock(&watchers_lock);
     while (h->watchers) {
         struct event_watch *w = h->watchers;
         struct event_queue *q = w->queue;
@@ -64,6 +68,7 @@ struct event_watch *events_handle_closed(struct handle *h) {
         w->handle_next = ended;
         ended = w;
     }
+    spin_unlock(&watchers_lock, flags);
     return ended;
 }
 
@@ -76,10 +81,11 @@ void events_watches_free(struct event_watch *ended) {
 }
 
 /* Every handle of the queue was closed before its last reference went: no wait reads it any
-   more. Its handles were the BSP's to end, and so is this. */
+   more. */
 static void queue_release(struct object *o) {
     struct event_queue *q = o->priv;
-    uint64_t flags = spin_lock(&q->lock);
+    uint64_t flags = spin_lock(&watchers_lock);
+    spin_take(&q->lock);
     struct event_watch *ended = NULL;
     while (q->watches) {
         struct event_watch *w = q->watches;
@@ -89,7 +95,8 @@ static void queue_release(struct object *o) {
     }
     struct event_timer *timers = q->timers;
     q->timers = NULL;
-    spin_unlock(&q->lock, flags);
+    spin_give(&q->lock);
+    spin_unlock(&watchers_lock, flags);
     events_watches_free(ended);
     object_waiter_unlink(&q->self);
     if (q->addresses) object_waiter_unlink(&q->on_addresses);
@@ -120,12 +127,13 @@ static struct event_queue *queue_of(struct handle *h) { return h->object->priv; 
 
 size_t events_watch_size(void) { return sizeof(struct event_watch); }
 
-/* Watch h (looked up under the caller's guard, which is still held). A second
-   watch of the same handle with the same token changes its interest. */
-int events_watch_locked(struct handle *queue, struct handle *h, uint32_t interest, uint64_t token,
-                        struct event_watch **spare) {
+/* A second watch of the same handle with the same token changes its interest. The caller's
+   reference keeps h from its last close until the watch is on its list. */
+int events_watch(struct handle *queue, struct handle *h, uint32_t interest, uint64_t token,
+                 struct event_watch **spare) {
     struct event_queue *q = queue_of(queue);
     if (events_is(h)) return -N_ERR_WRONG_KIND; /* queues do not nest */
+    uint64_t flags = spin_lock(&watchers_lock);
     spin_take(&q->lock);
     struct event_watch *w = q->watches;
     while (w && (w->handle != h || w->token != token)) w = w->queue_next;
@@ -142,6 +150,7 @@ int events_watch_locked(struct handle *queue, struct handle *h, uint32_t interes
         object_waiter_link(&w->waiter, &q->wait, h->object);
     }
     spin_give(&q->lock);
+    spin_unlock(&watchers_lock, flags);
     object_notify(&q->object); /* a waiting sibling thread rescans */
     return 0;
 }
@@ -152,13 +161,13 @@ int events_watch_address(struct handle *queue, volatile uint32_t *address, uint3
         struct object *a = address_watch_queue_new();
         if (!a) return -N_ERR_NO_MEMORY;
         object_ref(a);
-        uint64_t flags = irq_save();
+        uint64_t flags = spin_lock(&q->lock);
         if (!q->addresses) {
             object_waiter_link(&q->on_addresses, &q->wait, a);
             __atomic_store_n(&q->addresses, a, __ATOMIC_RELEASE);
             a = NULL;
         }
-        irq_restore(flags);
+        spin_unlock(&q->lock, flags);
         object_unref(a);
     }
     int r = address_watch_add(q->addresses, address, expected, token);
@@ -189,7 +198,8 @@ int events_unwatch(struct handle *queue, uint64_t token) {
     int result = 0;
     struct event_timer *dropped = NULL;
     struct event_watch *ended = NULL;
-    uint64_t flags = spin_lock(&q->lock);
+    uint64_t flags = spin_lock(&watchers_lock);
+    spin_take(&q->lock);
     for (struct event_watch *w = q->watches, *next; w; w = next) {
         next = w->queue_next;
         if (w->token != token) continue;
@@ -206,7 +216,8 @@ int events_unwatch(struct handle *queue, uint64_t token) {
         dropped = t;
         result = 1;
     }
-    spin_unlock(&q->lock, flags);
+    spin_give(&q->lock);
+    spin_unlock(&watchers_lock, flags);
     events_watches_free(ended);
     while (dropped) { struct event_timer *next = dropped->next; kfree(dropped); dropped = next; }
     if (q->addresses) {

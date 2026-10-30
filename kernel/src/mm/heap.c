@@ -255,7 +255,7 @@ void kfree(void *p) {
 
 /* Gives the interior pages of large free blocks back to the page allocator.
    Runs in the heap's own task: never inside kfree, whose callers may hold
-   interrupts off while APs wait on them, where a TLB shootdown could stall.
+   spinlocks, under which a long walk and its TLB shootdowns would keep other CPUs waiting.
    Blocks of TRIM_MIN bytes and more are in the classes from TRIM_MIN's on. */
 static void heap_trim(void) {
     uint64_t f = spin_lock(&heap_lock);
@@ -279,10 +279,11 @@ static void heap_trim(void) {
 static void heap_thread(void *arg) {
     (void)arg;
     for (;;) {
-        uint64_t f = irq_save();
-        /* A kfree on another CPU may set it just after this reads it: that block waits for the
-           next large free, which wakes this task again. */
-        if (!__atomic_load_n(&trim_pending, __ATOMIC_RELAXED)) wq_wait(&trim_wq);
+        /* kfree sets trim_pending under heap_lock and wakes trim_wq after: looked at under the
+           lock, no large free is missed. */
+        uint64_t f = spin_lock(&heap_lock);
+        if (!trim_pending) wq_wait_locked(&trim_wq, &heap_lock);
+        else spin_give(&heap_lock);
         irq_restore(f);
         heap_trim();
     }

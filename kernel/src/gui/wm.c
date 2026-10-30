@@ -56,9 +56,10 @@ struct window {
     size_t pages;
     uint64_t uaddr;
     uint64_t second_uaddr;
-    int front_index, pending_index;
-    /* The app's mailbox (ev, frame_event and frame_ready, and dead's change): any CPU, under
-       ev_lock, interrupts off (an input handler queues). Taken before w->wq's and the object's. */
+    int front_index, pending_index; /* under wm_lock and ev_lock both (buffers_set) */
+    /* The app's mailbox (ev, frame_event and frame_ready), dead's change, and the buffer indices'
+       (SYS_WIN_MAP waits for them under it): any CPU, without wm_lock (SYS_WIN_RECEIVE). It comes
+       after wm_lock, and before w->wq's lock and the object's. */
     struct spinlock ev_lock;
     bool frame_ready;
     struct gui_event frame_event; /* durable mailbox, not a droppable input event */
@@ -83,13 +84,27 @@ struct window {
     struct object object; /* what the app's window handle reaches */
 };
 
-/* ---- state ---- */
-static bool running;
+/* ---- state ----
+   Locks, in the order they are taken:
+   - wm_mutex (wm_lock): all of the window manager's state that names no other lock: the windows,
+     their stacking and focus, the damage, the pointer, the desktop's own state, direct scanout,
+     the remote viewers, the clipboard. A sleeping lock, any CPU: it stays held across
+     allocations, mappings and copies, and while the compositor draws a frame (not while it
+     presents one). Reentrant: notifications and a window handle's last close come from inside a
+     WM call. dev/pciuser.c's screen lock and sys/keep.c's write lock come before it.
+   - then one of a window's ev_lock, in_lock (the input ring) and vblank_lock: spinlocks, never
+     two of them at once. dev/input.c's lock comes before in_lock (the input sinks).
+   - then the locks of wait queues and objects (the wakes and notifies made under them).
+   The compositor sleeps on wm_wq unless wm_wakes moved (wake_compositor). */
+static bool running; /* set once, before the compositor starts */
 static int sw, sh;
 static canvas_t back, wall;
 /* Deep planes (display_abi.h) of back and wall, pitch sw; NULL on an 8 bpc display. */
 static uint8_t *back_deep, *wall_deep;
 static struct wait_queue wm_wq;
+/* Moves on before every wake of wm_wq, after a change of what the compositor waits for: damage,
+   a present, a frame asked for, input, the vertical blank it waits for. */
+static uint64_t wm_wakes;
 static unsigned pending_frames;
 /* Without vertical blanks, a frame with damage starts at frame_next_us (µs of uptime) at the
    earliest, and the one after it a frame period later: the refresh of the mode the screen shows
@@ -103,9 +118,11 @@ static uint32_t frame_mhz;
 /* A display driver's vertical blanks (n_pci_screen_vblank, dev/pciuser.c) of the scanout the
    screen is drawn into: while they come, a frame with damage starts at the next blank, not after
    a frame period; VBLANK_LOST_MS without one and the period paces frames again. vblank_count is
-   the driver's count of the last blank, vblank_drawn the one the last frame started at. BSP,
-   changed with interrupts off. */
+   the driver's count of the last blank, vblank_drawn the one the last frame started at;
+   vblank_waiting: the compositor sleeps until the next one. Under vblank_lock (the driver's call
+   comes on any CPU); vblank_pacing is the compositor's own. */
 #define VBLANK_LOST_MS 100
+static struct spinlock vblank_lock;
 static uint64_t vblank_count, vblank_ns, vblank_at_ms, vblank_drawn;
 static bool vblank_seen, vblank_waiting, vblank_pacing;
 /* Direct scanout (n_pci_screen_state, dev/pciuser.c): a display driver whose scanout has
@@ -115,8 +132,8 @@ static bool vblank_seen, vblank_waiting, vblank_pacing;
    It then draws the pointer itself. The desktop is still composited into the driver's surface
    meanwhile, so it is current the moment the driver shows it again. direct_state is what the
    driver reads, with the mode the system wants it to show (gui/screenmode.c); its serial changes
-   with every change of it, the pointer's moves included while a window is shown. Under the WM
-   lock. */
+   with every change of it, the pointer's moves included while a window is shown (direct_changed;
+   a waiter reads the serial without the lock). Under the WM lock. */
 static bool direct_able;
 static struct window *direct_win;
 static uint32_t direct_pointer; /* the pointer_serial of the image in direct_state, 0 for none */
@@ -133,12 +150,12 @@ static bool deep_wanted;
    seen_dither_able and seen_boot are the scanout shown as the compositor last saw it. */
 static struct watched screen_watched;
 static bool screen_watchable, seen_dither_able, seen_boot;
+/* The compositor presents back without wm_lock (composite): back and its planes stay as they are
+   meanwhile. back_presents moves on as each such present ends, before present_wait is woken. */
 static bool presenting_back;
+static uint64_t back_presents;
 static struct wait_queue present_wait;
 
-/* Window and frame state stays borrowed across allocations and copies. Reentrant: notifications
-   and a window handle's last close come from inside a WM call. IRQ input sinks only enqueue
-   input; they never take it. */
 static struct mutex wm_mutex;
 static void wm_lock(void) { mutex_lock(&wm_mutex); }
 static void wm_unlock(void) { mutex_unlock(&wm_mutex); }
@@ -150,7 +167,8 @@ static struct window *focus_owner;
 
 static int mx, my, mbuttons;
 
-/* remote display (RDP): what changed since the remote side last looked */
+/* remote display (RDP): what changed since the remote side last looked. remote_users changes
+   under wm_lock and is read without it too (wm_remote_viewing). */
 #define MAX_RDAMAGE 16
 static int remote_users;
 static struct rect rdamage[MAX_RDAMAGE];
@@ -160,7 +178,8 @@ static int nrdamage;
    and chooses what it shows (pointer_update): one of its own shapes (desktop_pointer), or the image
    the window under it gave. pointer_px is that image, pointer_shape the shape it was chosen as and
    pointer_from the id of the window whose image it is (0 for the WM's art) as of that window's
-   pointer_from_serial. pointer_serial changes with the image and is never 0. Under the WM lock. */
+   pointer_from_serial. pointer_serial changes with the image and is never 0. Under the WM lock
+   (wm_pointer_image reads pointer_serial without it first). */
 static uint32_t pointer_px[POINTER_SIZE * POINTER_SIZE];
 static int pointer_hx, pointer_hy;
 static int pointer_shape = -1, pointer_from;
@@ -225,9 +244,18 @@ static bool canvas_hits(const canvas_t *c, int x, int y, int w, int h) {
     return x < c->cx1 && y < c->cy1 && (int64_t)x + w > c->cx0 && (int64_t)y + h > c->cy0;
 }
 
+/* After a change of what the compositor waits for, from any CPU or context: wm_wakes first, so
+   that a compositor that looked before the change does not sleep (wm_thread). */
+static void wake_compositor(void) {
+    __atomic_add_fetch(&wm_wakes, 1, __ATOMIC_SEQ_CST);
+    wq_wake_all(&wm_wq);
+}
+
+/* wm_lock held. Damage made outside the compositor (a window's call) wakes it, as all does. */
 static void damage_rect(int x, int y, int w, int h) {
     struct rect r = {x, y, w, h};
     if (!rect_clip(&r)) return;
+    wake_compositor();
     /* merge with any overlapping rect (repeat until stable) */
     for (int i = 0; i < ndamage; i++) {
         if (rect_overlap(&r, &damage[i])) {
@@ -246,8 +274,6 @@ static void damage_rect(int x, int y, int w, int h) {
 }
 
 static void damage_all(void) { damage_rect(0, 0, sw, sh); }
-
-static void wake_compositor(void) { wq_wake_all(&wm_wq); }
 
 /* ---- window geometry ---- */
 static bool decorated(struct window *w) { return !w->fullscreen&&!(w->flags & WIN_NO_DECOR); }
@@ -421,6 +447,12 @@ static void direct_event(struct window *w, bool shown) {
     push_event(w, &e);
 }
 
+/* direct_state changed (wm_lock held): its serial moves on, then its waiters are woken. */
+static void direct_changed(void) {
+    __atomic_store_n(&direct_state.serial, direct_state.serial + 1, __ATOMIC_SEQ_CST);
+    wq_wake_all(&direct_wq);
+}
+
 /* Brings direct_state up to what the screen should show; the driver and the windows concerned
    hear of a change. The compositor does this once per pass, after its input; a window's end does
    it at once, so direct_win never outlives its window. */
@@ -455,10 +487,7 @@ static void direct_update(void) {
             changed = true;
         }
     }
-    if (changed) {
-        direct_state.serial++;
-        wq_wake_all(&direct_wq);
-    }
+    if (changed) direct_changed();
 }
 
 void wm_screen_direct(bool able) {
@@ -477,8 +506,7 @@ void wm_screen_mode(const struct n_screen_mode *mode, uint64_t serial) {
     if (serial > direct_state.mode_serial) {
         direct_state.mode = *mode;
         direct_state.mode_serial = serial;
-        direct_state.serial++;
-        wq_wake_all(&direct_wq);
+        direct_changed();
     }
     wm_unlock();
 }
@@ -491,15 +519,10 @@ int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, int64_t timeo
         uint64_t now = timeout_ms > 0 ? uptime_ms() : 0;
         if (current_task->killed) { result = -N_ERR_STOPPED; break; }
         if (timeout_ms == 0 || (timeout_ms > 0 && now >= deadline)) { result = -N_ERR_TIMEOUT; break; }
-        /* Syscalls and the compositor run on the BSP: with interrupts off nothing changes the state
-           between the look and the wait. */
-        uint64_t fl = irq_save();
+        /* A change on another CPU after this look moves the serial on before it wakes direct_wq:
+           the wait does not begin once it has. */
         wm_unlock();
-        if (direct_state.serial == seen) {
-            if (timeout_ms > 0) wq_wait_timeout(&direct_wq, deadline - now);
-            else wq_wait(&direct_wq);
-        }
-        irq_restore(fl);
+        wq_wait_unless(&direct_wq, &direct_state.serial, seen, timeout_ms > 0 ? deadline - now : 0);
         wm_lock();
     }
     *out = direct_state;
@@ -518,9 +541,18 @@ static void unmap_user(struct window *w) {
     w->second_uaddr = 0;
 }
 
+/* The buffer indices change (wm_lock held). Whoever's change can end a SYS_WIN_MAP wait wakes w->wq
+   after it. */
+static void buffers_set(struct window *w, int front, int pending) {
+    uint64_t fl = spin_lock(&w->ev_lock);
+    w->front_index = front;
+    w->pending_index = pending;
+    spin_unlock(&w->ev_lock, fl);
+}
+
 static void win_destroy_locked(struct window *w) {
     if (w->dead) return;
-    if (w->pending_index >= 0) { pending_frames--; w->pending_index = -1; }
+    if (w->pending_index >= 0) pending_frames--;
     if(focus_owner==w)focus_owner=NULL;
     if (w->shown) damage_window(w);
     damage_taskbar(); /* its button goes away even when focus does not change */
@@ -536,9 +568,11 @@ static void win_destroy_locked(struct window *w) {
         for (; i < nwin - 1; i++) zorder[i] = zorder[i + 1];
         nwin--;
     }
-    /* under ev_lock: a receiver that saw it alive is in w->wq by now, for the wake below */
+    /* under ev_lock: a receiver or a SYS_WIN_MAP waiter that saw it alive is in w->wq by now, for
+       the wake below */
     uint64_t ev = spin_lock(&w->ev_lock);
     w->dead = true;
+    w->pending_index = -1;
     spin_unlock(&w->ev_lock, ev);
     if (drag_win == w) {
         drag_win = NULL;
@@ -561,31 +595,40 @@ static void win_destroy(struct window *w) {
     wm_unlock();
 }
 
-/* Takes every queued event that fits in out[max], waiting up to timeout_ms
-   (negative: until one arrives). The count, 0 when the time ran out, or
-   N_ERR_CLOSED once a closed window has handed out its last event. Any CPU: out is checked
-   before ev_lock (a check may move the call to the BSP, or wait for the disk), and the events go
-   there under it; no page checked goes before the copy (syscall.c, user_access). */
+/* Takes every queued event that fits in out[max] (the app's memory), waiting up to timeout_ms
+   (negative: until one arrives). The count, 0 when the time ran out, or N_ERR_CLOSED once a
+   closed window has handed out its last event. Any CPU, without wm_lock: the events leave the
+   mailbox under ev_lock a batch at a time, into the kernel's memory, and are copied to out after
+   it (a copy may sleep). out's pages are made present first; events taken for a page another
+   thread took away meanwhile are lost, with N_ERR_BAD_ADDRESS. */
+#define RECEIVE_BATCH 16
 static int64_t win_receive(struct window *w, struct gui_event *out, size_t max, int64_t timeout_ms) {
     if (max == 0 || max > SIZE_MAX / sizeof *out) return -N_ERR_INVALID;
     uint64_t deadline = timeout_ms > 0 ? uptime_ms() + (uint64_t)timeout_ms : 0;
     size_t room = MIN(max, (size_t)EVQ + 1); /* the queue, and the frame's mailbox */
+    if (!user_ok_w(out, room * sizeof *out)) return -N_ERR_BAD_ADDRESS;
+    size_t got = 0;
     for (;;) {
-        if (!user_ok_w(out, room * sizeof *out)) return -N_ERR_BAD_ADDRESS;
+        struct gui_event batch[RECEIVE_BATCH];
+        size_t n = 0, want = MIN(max - got, (size_t)RECEIVE_BATCH);
         uint64_t fl = spin_lock(&w->ev_lock);
-        if (w->ev_count || w->frame_ready) {
-            size_t got = 0;
-            while (got < max && w->ev_count) {
-                out[got++] = w->ev[w->ev_tail];
-                w->ev_tail = (w->ev_tail + 1) % EVQ;
-                w->ev_count--;
-            }
-            if (got < max && w->frame_ready) {
-                out[got++] = w->frame_event;
-                w->frame_ready = false;
-            }
+        for (; n < want && w->ev_count; n++) {
+            batch[n] = w->ev[w->ev_tail];
+            w->ev_tail = (w->ev_tail + 1) % EVQ;
+            w->ev_count--;
+        }
+        if (n < want && w->frame_ready) { /* after the queue */
+            batch[n++] = w->frame_event;
+            w->frame_ready = false;
+        }
+        if (n || got) {
             spin_unlock(&w->ev_lock, fl);
-            return (int64_t)got;
+            if (!n) return (int64_t)got;
+            int copied = copy_to_user(out + got, batch, n * sizeof *batch);
+            if (copied < 0) return copied;
+            got += n;
+            if (n < want || got == max) return (int64_t)got;
+            continue; /* a full batch: there may be more */
         }
         int64_t result = 1;
         uint64_t now = timeout_ms > 0 ? uptime_ms() : 0;
@@ -603,7 +646,10 @@ static int64_t win_receive(struct window *w, struct gui_event *out, size_t max, 
    change notifies the object after it, and the wait asks again. */
 static uint32_t win_ready(struct handle *h) {
     struct window *w = h->object->priv;
-    return w->ev_count > 0 || w->frame_ready || w->dead ? N_EVENT_RECEIVABLE : 0;
+    return __atomic_load_n(&w->ev_count, __ATOMIC_RELAXED) > 0 || __atomic_load_n(&w->frame_ready, __ATOMIC_RELAXED) ||
+                   __atomic_load_n(&w->dead, __ATOMIC_RELAXED)
+               ? N_EVENT_RECEIVABLE
+               : 0;
 }
 
 static void win_close(struct handle *h) { win_destroy(h->object->priv); }
@@ -613,23 +659,13 @@ static void win_release(struct object *o) { kfree(o->priv); }
 static const struct object_ops win_ops = {
     .kind = N_KIND_WINDOW, .ready = win_ready, .close = win_close, .release = win_release};
 
-/* What WIN_STATE answers, on the BSP and on an AP (wm_state_ap): the window's own flags, and
-   whether it is the one update_focus last gave the focus to (focused() whenever the WM is between
-   changes) and the one shown directly. No other window is read. */
+/* What WIN_STATE answers, wm_lock held: the window's own flags, and whether it is the one
+   update_focus last gave the focus to (focused() whenever the WM is between changes) and the one
+   shown directly. */
 static int64_t win_state_of(struct window *w) {
-    bool shown = !__atomic_load_n(&w->dead, __ATOMIC_ACQUIRE) && __atomic_load_n(&w->shown, __ATOMIC_RELAXED) &&
-                 !__atomic_load_n(&w->minimized, __ATOMIC_RELAXED);
-    return (shown ? WIN_STATE_VISIBLE : 0) | (__atomic_load_n(&last_focus, __ATOMIC_RELAXED) == w ? WIN_STATE_FOCUSED : 0) |
-           (__atomic_load_n(&w->fullscreen, __ATOMIC_RELAXED) ? WIN_STATE_FULLSCREEN : 0) |
-           (__atomic_load_n(&direct_win, __ATOMIC_RELAXED) == w ? WIN_STATE_DIRECT : 0);
-}
-
-bool wm_state_ap(struct handle *h, int64_t *result) {
-    if (!handle_is(h, &win_ops)) return false;
-    struct window *w = h->object->priv;
-    if (w->pml4 != current_task->pml4) return false; /* the BSP refuses it */
-    *result = win_state_of(w);
-    return true;
+    bool shown = !w->dead && w->shown && !w->minimized;
+    return (shown ? WIN_STATE_VISIBLE : 0) | (last_focus == w ? WIN_STATE_FOCUSED : 0) |
+           (w->fullscreen ? WIN_STATE_FULLSCREEN : 0) | (direct_win == w ? WIN_STATE_DIRECT : 0);
 }
 
 static bool alloc_buffer(struct window *w, int cw, int ch) {
@@ -649,28 +685,24 @@ static bool alloc_buffer(struct window *w, int cw, int ch) {
     w->pages = pages;
     w->cw = cw;
     w->ch = ch;
-    w->front_index = w->pending_index = -1;
     uint64_t ev = spin_lock(&w->ev_lock);
+    w->front_index = w->pending_index = -1;
     w->frame_ready = false;
     spin_unlock(&w->ev_lock, ev);
     return true;
 }
 
+/* A surface of w into t's mmap region (with its guard page after it), wm_lock held. */
 static uint64_t map_user(struct window *w, struct task *t, unsigned index) {
-    uint64_t flags = irq_save();
-    uint64_t va = t->mmap_next;
-    uint64_t bytes = (w->pages + 1) * PAGE_SIZE;
-    if (va >= USER_STACK_TOP - USER_STACK_MAX ||
-        bytes > USER_STACK_TOP - USER_STACK_MAX - va) {
-        irq_restore(flags); return 0;
-    }
-    t->mmap_next = va + bytes; /* reserve before an IRQ-enabled page loop */
-    irq_restore(flags);
+    uint64_t bytes = w->pages * PAGE_SIZE;
+    uint64_t va = mmap_reserve(t, bytes);
+    if (!va) return 0;
     for (size_t i = 0; i < w->pages; i++) {
         uint32_t *pixels = w->flags & WIN_DOUBLE_BUFFER ? (index ? w->user_buf : w->buf) : w->user_buf;
         uint64_t pa = vmm_translate(kernel_pml4, (uint64_t)pixels + i * PAGE_SIZE);
         if (!vmm_map_page(t->pml4, va + i * PAGE_SIZE, pa, PTE_P | PTE_W | PTE_U | PTE_SHARED | pte_nx)) {
             vmm_user_free(t->pml4, va, i * PAGE_SIZE); /* PTE_SHARED: unmap only */
+            mmap_hole_add(t, va, bytes + PAGE_SIZE);
             return 0;
         }
     }
@@ -762,28 +794,28 @@ struct app {
 #define PROGRAMS N_FOLDER_PROGRAMS "\\"
 
 static const struct app apps[] = {
-    {"Terminal", SYSTEM "term", ICON_TERMINAL},
-    {"Files", SYSTEM "files", ICON_FILES},
-    {"Web Browser", PROGRAMS "Browser\\browser", ICON_NET},
-    {"Text Editor", PROGRAMS "Notepad\\notepad", ICON_EDITOR},
-    {"Paint", PROGRAMS "Paint\\paint", ICON_PAINT},
-    {"Calculator", PROGRAMS "Calculator\\calc", ICON_CALC},
-    {"Clock", PROGRAMS "Clock\\clock", ICON_CLOCK},
-    {"System Monitor", SYSTEM "sysmon", ICON_MONITOR},
-    {"Piano", PROGRAMS "Piano\\piano", ICON_PIANO},
-    {"Sound Player", PROGRAMS "Player\\player", ICON_SOUND},
-    {"Snake", PROGRAMS "Snake\\snake", ICON_SNAKE},
-    {"Tetris", PROGRAMS "Tetris\\tetris", ICON_TETRIS},
-    {"Minesweeper", PROGRAMS "Minesweeper\\mines", ICON_MINES},
-    {"Mandelbrot", PROGRAMS "Mandelbrot\\mandel", ICON_FRACTAL},
-    {"3D Cube", PROGRAMS "Cube\\cube", ICON_CUBE},
-    {"Game of Life", PROGRAMS "Life\\life", ICON_LIFE},
+    {"Terminal", SYSTEM "term", ICON_TERMINAL, NULL},
+    {"Files", SYSTEM "files", ICON_FILES, NULL},
+    {"Web Browser", PROGRAMS "Browser\\browser", ICON_NET, NULL},
+    {"Text Editor", PROGRAMS "Notepad\\notepad", ICON_EDITOR, NULL},
+    {"Paint", PROGRAMS "Paint\\paint", ICON_PAINT, NULL},
+    {"Calculator", PROGRAMS "Calculator\\calc", ICON_CALC, NULL},
+    {"Clock", PROGRAMS "Clock\\clock", ICON_CLOCK, NULL},
+    {"System Monitor", SYSTEM "sysmon", ICON_MONITOR, NULL},
+    {"Piano", PROGRAMS "Piano\\piano", ICON_PIANO, NULL},
+    {"Sound Player", PROGRAMS "Player\\player", ICON_SOUND, NULL},
+    {"Snake", PROGRAMS "Snake\\snake", ICON_SNAKE, NULL},
+    {"Tetris", PROGRAMS "Tetris\\tetris", ICON_TETRIS, NULL},
+    {"Minesweeper", PROGRAMS "Minesweeper\\mines", ICON_MINES, NULL},
+    {"Mandelbrot", PROGRAMS "Mandelbrot\\mandel", ICON_FRACTAL, NULL},
+    {"3D Cube", PROGRAMS "Cube\\cube", ICON_CUBE, NULL},
+    {"Game of Life", PROGRAMS "Life\\life", ICON_LIFE, NULL},
     {"Settings", SYSTEM "js", ICON_SETTINGS, SYSTEM "settings.js"},
     {"About Nocturne", SYSTEM "js", ICON_ABOUT, SYSTEM "about.js"},
-    {"Sleep", "@sleep", ICON_SLEEP},
-    {"Hibernate", "@hibernate", ICON_HIBERNATE},
-    {"Restart", "@reboot", ICON_REBOOT},
-    {"Shut Down", "@poweroff", ICON_POWER},
+    {"Sleep", "@sleep", ICON_SLEEP, NULL},
+    {"Hibernate", "@hibernate", ICON_HIBERNATE, NULL},
+    {"Restart", "@reboot", ICON_REBOOT, NULL},
+    {"Shut Down", "@poweroff", ICON_POWER, NULL},
 };
 #define NAPPS ((int)ARRAY_SIZE(apps))
 #define APP_SLEEP (NAPPS - 4) /* the power items close the menu: Sleep, Hibernate, Restart, Shut Down */
@@ -1260,14 +1292,15 @@ static int taskbar_window_at(int x, int y, struct window **out) {
 }
 
 /* ---- window drawing ---- */
-/* BSP captures only drawing data, never event queues or live window ownership.
-   All borrowed pixel aliases are high kernel mappings. The current scheduler
-   never preempts kernel execution; each AP batch also disables BSP IRQs until
-   synchronous join. General scheduler SMP would require explicit buffer pins. */
+/* A window as a frame draws it: what the compositor captures of it under wm_lock, which it holds
+   until the frame's last batch has joined (composite_ram). The pixels a layer points at are a
+   window's buffers, kernel mappings that only a resize or the window's end (both under wm_lock)
+   replace or free, so they stay while the shares of the batches (cpu_parallel_for, on whichever
+   CPUs are idle) read them. Never the event queues or the windows themselves. */
 struct draw_layer {
     int x, y, cw, ch, fw, fh, cx, cy, flags, hover;
     bool focus, maximized;
-    bool client_raw_overwrite; /* renderer契約。snapshot中は不変。 */
+    bool client_raw_overwrite; /* the client area replaces what lies below it (gfx_blit); fixed while drawn */
     const uint32_t *pixels;
     const uint8_t *deep; /* the client's deep plane, or NULL */
     char title[64];
@@ -1421,7 +1454,7 @@ struct draw_scene {
     struct draw_layer layers[MAX_WIN];
     unsigned count;
     struct rect selection;
-    bool selected, fault_test, shadow_strip, occlusion;
+    bool selected, shadow_strip, occlusion;
 };
 
 /* Deep-plane bookkeeping inside the canvas clip. 8-bit drawing marks its
@@ -1451,7 +1484,7 @@ struct scene_job {
 
 static bool wm_parallel, wm_parallel_force, wm_verify, wm_yield, wm_shadow_strip, wm_occlusion;
 static bool wm_trace, trace_done, trace_chord;
-static volatile bool trace_active;
+static bool trace_active; /* the compositor changes it under in_lock; the sinks read it under it */
 static canvas_t verify_back;
 /* Keep width*layers*rows work budgets, not stale row ceilings. This preserves
    useful tiles even after a 64-layer scene returns to 17 or a single layer. */
@@ -1471,8 +1504,8 @@ static unsigned scene_density(unsigned layers) {
     return layers<=1 ? 0 : layers<=4 ? 1 : layers<=16 ? 2 : 3;
 }
 
-/* onlineにはring3専用runnerも含む。描画に参加できるCPUだけを数える。 */
-static unsigned scene_cpu_count(void) { return cpu_worker_count() + 1; }
+/* Every CPU may take shares of a batch while it is idle (cpu_parallel_for). */
+static unsigned scene_cpu_count(void) { return cpu_online_count(); }
 
 static unsigned scene_rows(unsigned layers, unsigned width) {
     unsigned cpus=scene_cpu_count();
@@ -1490,7 +1523,7 @@ static void scene_shrink(unsigned layers,unsigned width,unsigned rows,uint64_t m
 /* A client is raw-replaced by gfx_blit, even when its stored alpha is zero.
  * Only complete coverage of this exact clip can hide all lower drawing.
  * A partial rectangle, frame, rounded title or shadow is never an occluder.
- * This operates on the immutable BSP snapshot, not live window ownership. */
+ * This reads the captured scene, not the windows themselves. */
 static unsigned scene_first_layer(const struct draw_scene *s, struct rect r, bool *covered) {
     *covered=false;
     if (!s->occlusion) return 0;
@@ -1506,16 +1539,15 @@ static unsigned scene_first_layer(const struct draw_scene *s, struct rect r, boo
     return 0;
 }
 
+/* wm_lock held (or wm_init, before the compositor starts). */
 static void capture_scene(struct draw_scene *s, canvas_t dst) {
-    cpu_require_bsp();
     s->dst = dst;
     s->wallpaper = wall;
     s->dst_deep = back_deep;
     s->wallpaper_deep = wall_deep;
     s->count = 0;
     s->selected = sel_icon >= 0;
-    s->fault_test = false;
-    s->shadow_strip = wm_shadow_strip; /* BSPが発行前に選択、join中は不変。 */
+    s->shadow_strip = wm_shadow_strip; /* chosen before the batches, fixed until they join */
     s->occlusion = wm_occlusion;
     if (s->selected) {
         int x, y;
@@ -1527,11 +1559,10 @@ static void capture_scene(struct draw_scene *s, canvas_t dst) {
         if (visible(zorder[i]) && capture_layer(&s->layers[s->count], zorder[i], zorder[i]==f)) s->count++;
 }
 
+/* One share of a batch (cpu_parallel_for): it reads only the scene and writes only its own rows. */
 static void scene_tile(size_t index, void *arg) {
     struct scene_job *job = arg;
     const struct draw_scene *s = job->scene;
-    /* Explicit negative test only: fault after a live RAM descriptor is published. */
-    if (s->fault_test && cpu_is_worker()) cpu_require_bsp();
     struct rect r = job->batch;
     /* Proportional boundaries cover every row once, including 5/6/9-row
        batches which ceil-sized cells previously reduced below online CPUs. */
@@ -1540,7 +1571,7 @@ static void scene_tile(size_t index, void *arg) {
     r.y += (int)begin;
     r.h = (int)(end-begin);
     if (r.h <= 0) return;
-    canvas_t c = s->dst; /* AP never modifies the global back clip */
+    canvas_t c = s->dst; /* a share never changes the scene's clip */
     gfx_noclip(&c);
     gfx_clip(&c, r.x, r.y, r.w, r.h);
     bool covered=false;
@@ -1566,9 +1597,8 @@ static void scene_tile(size_t index, void *arg) {
     job->cpu[index] = cpu_current_index();
 }
 
-/* Equal callback, tiles, snapshot and row limits for both benchmark modes.
-   IRQs may run between joins, but current kernel execution cannot schedule another
-   process there; only input queues/audio IRQ work changes, not window ownership. */
+/* Both modes run the same callback over the same tiles, scene and row limits. Interrupts come in
+   between batches; what the scene points at stays, since its caller holds wm_lock throughout. */
 static uint64_t render_scene(const struct draw_scene *s, struct rect r, bool parallel,
                              unsigned batch_rows, uint64_t *cpu_mask, uint64_t *maximum) {
     uint64_t ticks = 0;
@@ -1592,9 +1622,9 @@ static void render_scene_direct(const struct draw_scene *s, struct rect r) {
     scene_tile(0,&job);
 }
 
-/* 元generic shadow専用oracle。BSPの同期render前後だけ選択を保存／復元する。 */
+/* The reference picture: the scene in one tile on this CPU, with the original shadows and no
+   occlusion; the scene's own choices are put back after it. */
 static void render_scene_original(struct draw_scene *s, struct rect r) {
-    cpu_require_bsp();
     bool saved=s->shadow_strip, saved_occlusion=s->occlusion;
     s->shadow_strip=false;
     s->occlusion=false;
@@ -1679,10 +1709,11 @@ static void scene_benchmark(void) {
                 parallel+=render_scene(&s,r,true,rows,&mask,&maximum);
             }
             if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: parallel pixels/guards differ layers=%u",s.count);
-            /* 測定外。APと反対側を元shadowで再描画し共通shortcut誤りを避ける。 */
+            /* Untimed: the buffer the parallel pass did not draw is drawn again with the original
+               shadows, so an error both shortcut passes share still shows. */
             s.dst.px=(round&1)?out+16:ref+16;
             render_scene_original(&s,r);
-            if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: original/AP pixels differ layers=%u",s.count);
+            if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: original/parallel pixels differ layers=%u",s.count);
             /* Off-origin, odd width/height, last row, and tiny jobs must not write
                outside their damage region or disagree at a tile boundary. */
             struct rect clips[]={{1,3,MIN(sw-1,97),MIN(sh-3,131)},
@@ -1726,7 +1757,7 @@ static void scene_benchmark(void) {
         scene_shrink(s.count,(unsigned)sw,rows,maximum);
     }
     vfree(ref,pages);vfree(out,pages);
-    kprintf("wmbench: PASS full/clipped/tiny/odd-pitch/extrema/guards; kernel/GUI BSP-owned, user runner excluded\n");
+    kprintf("wmbench: PASS full/clipped/tiny/odd-pitch/extrema/guards\n");
 }
 
 static void composite_ram(struct rect r) {
@@ -1739,7 +1770,8 @@ static void composite_ram(struct rect r) {
     bool covered=false;
     unsigned active_layers=scene.count-scene_first_layer(&scene,r,&covered);
     bool verify=wm_verify && verify_back.w==back.w && verify_back.h==back.h;
-    /* 自動利用は多層・大damageだけ。明示onでも既存の安全条件を保つ。 */
+    /* In shares by default only for many layers over a large damage; forced (wmparallel), still
+       only where the same conditions hold. */
     bool parallel = wm_parallel && scene_cpu_count()>1 && r.h>=2 &&
                     (uint64_t)r.w*r.h>=65536 && scene.count>0 &&
                     (wm_parallel_force || (active_layers>=16 && (uint64_t)r.w*r.h>=262144));
@@ -1764,7 +1796,6 @@ static void composite_ram(struct rect r) {
     uint64_t direct=0,serial=0;
     bool parallel_first=verify && (scene_frames&1);
     if (verify && !parallel_first) measure_reference(&scene,r,rows,&direct,&serial);
-    scene.fault_test=cmdline_has("wm-test-ap-fault");
     uint64_t ticks=render_scene(&scene,r,true,rows,&mask,&maximum);
     if (parallel_first) measure_reference(&scene,r,rows,&direct,&serial);
     if (verify) {
@@ -1783,8 +1814,8 @@ static void composite_ram(struct rect r) {
                 scene_jobs,scene_density(scene.count),rows,scene_us(maximum),scene_us(scene_max_ticks),verify?"PASS":"unchecked",(unsigned)verify,scene.shadow_strip?"strip":"original");
 }
 
+/* The compositor, wm_lock held. */
 static void composite_rect(struct rect r) {
-    cpu_require_bsp();
     composite_ram(r);
     canvas_t *c = &back;
     gfx_noclip(c);
@@ -1855,41 +1886,48 @@ static void composite(void) {
             push_event(w, &(struct gui_event){.type = EV_FRAME, .y = period});
         }
         if (w->pending_index < 0) continue;
-        w->front_index = w->pending_index;
-        w->pending_index = -1;
+        int front = w->pending_index;
+        buffers_set(w, front, -1);
         pending_frames--;
-        struct gui_event event = {.type=EV_FRAME, .key=w->front_index, .x=w->front_index ^ 1, .y=period};
+        /* its wake ends a SYS_WIN_MAP wait for the buffer that was in front */
+        struct gui_event event = {.type=EV_FRAME, .key=front, .x=front ^ 1, .y=period};
         push_event(w, &event);
     }
     if (n) {
         /* Raster jobs and all window reads have already joined. Only the
-           compositor writes this RAM canvas; resize waits for this borrow.
-           GUI syscalls may now destroy/resize/present windows without sleeping
-           behind the write-combined VRAM transfer. No window pixel pin is
+           compositor writes this RAM canvas; a resize of the desktop waits for this borrow
+           (set_screen_size). Window calls on other CPUs may now destroy, resize or present
+           windows without sleeping behind the write-combined VRAM transfer. No window pixel pin is
            needed because fb_present reads back, never a window surface. */
         canvas_t frame = back;
+        uint8_t *deep = back_deep;
         presenting_back = true;
         wm_unlock();
         for (int i = 0; i < n; i++)
-            fb_present(frame.px, frame.pitch, back_deep, frame.pitch, list[i].x, list[i].y, list[i].w, list[i].h);
+            fb_present(frame.px, frame.pitch, deep, frame.pitch, list[i].x, list[i].y, list[i].w, list[i].h);
         wm_lock();
         presenting_back = false;
+        __atomic_store_n(&back_presents, back_presents + 1, __ATOMIC_SEQ_CST);
         wq_wake_all(&present_wait);
     }
 }
 
 static void damage_cursor(void) { damage_rect(mx - pointer_hx, my - pointer_hy, POINTER_SIZE, POINTER_SIZE); }
 
-/* ---- input handling (compositor thread) ---- */
+/* ---- input handling (compositor thread) ----
+   The input ring: the input drivers' sinks (key_sink, mouse_sink: any CPU, interrupt handlers
+   included, dev/input.c's lock held) put events in at in_head, the compositor takes them at
+   in_tail, both under in_lock. in_head is read without it to see whether input waits. */
 #define INQ 256
 struct in_ev {
     bool is_key;
     struct key_event k;
     struct mouse_event m;
-    uint64_t stamp, seq; /* 診断専用。client ABIへは出さない。 */
+    uint64_t stamp, seq; /* wmtrace's alone: never in an app's event */
 };
+static struct spinlock in_lock;
 static struct in_ev inq[INQ];
-static volatile int in_head, in_tail;
+static int in_head, in_tail;
 
 #define TRACE_FRAMES 256
 struct trace_frame {
@@ -1901,17 +1939,18 @@ static struct {
     uint64_t start, deadline, frames, empty, waits, wait_ticks, max_wait;
     uint64_t nowait, streak, max_streak, streak_start, max_run, max_frame, max_proxy, max_dequeue;
     uint64_t dequeue_hist[16], frame_hist[16], raw_lost, yield_calls;
-    volatile uint64_t received, dropped, skipped;
-    volatile unsigned depth;
+    uint64_t received, dropped, skipped; /* the sinks', under in_lock */
+    unsigned depth;                      /* the sinks', under in_lock */
     unsigned records;
 } wt;
-_Static_assert(sizeof(trace_frames)+sizeof(wt)+INQ*16 <= 24*1024,"WM診断RAM上限");
+_Static_assert(sizeof(trace_frames)+sizeof(wt)+INQ*16 <= 24*1024,"wmtrace's memory");
 
 static void trace_hist(uint64_t *bins, uint64_t ticks) {
     uint64_t us=scene_us(ticks); unsigned b=0;
     while (us>1 && b<15) { us>>=1; b++; }
     bins[b]++;
 }
+/* in_lock held (a sink). */
 static void trace_stamp(struct in_ev *ev) {
     ev->stamp=ev->seq=0;
     if (!trace_active) return;
@@ -1928,11 +1967,12 @@ static void trace_begin(void) {
     memset(&wt,0,sizeof wt);
     kprintf("wmtrace: START seconds=20 CPUs=%u parallel=%u yield=%u proxy=WM-loop-not-app-paint\n",scene_cpu_count(),(unsigned)wm_parallel,(unsigned)wm_yield);
     audio_trace_begin();
-    uint64_t f=irq_save(); wt.start=rdtsc(); wt.deadline=wt.start+20*tsc_hz;
-    trace_active=true; irq_restore(f);
+    uint64_t f=spin_lock(&in_lock); wt.start=rdtsc(); wt.deadline=wt.start+20*tsc_hz;
+    trace_active=true; spin_unlock(&in_lock,f);
 }
 static void trace_finish(uint64_t end) {
-    uint64_t f=irq_save(); trace_active=false; trace_done=true; irq_restore(f);
+    /* no sink counts in wt once this is done */
+    uint64_t f=spin_lock(&in_lock); trace_active=false; trace_done=true; spin_unlock(&in_lock,f);
     audio_trace_end();
     kprintf("wmtrace: DONE elapsed_us=%lu overshoot_us=%lu received=%lu dropped=%lu excluded=%lu depth=%u frames=%lu empty=%lu waits=%lu wait_us=%lu max_wait_us=%lu nowait=%lu max_streak=%lu max_run_us=%lu max_frame_us=%lu max_dequeue_us=%lu max_proxy_us=%lu records=%u raw_lost=%lu yield_calls=%lu run_proxy=loop-no-wait-including-yield\n",
             scene_us(end-wt.start),scene_us(end-wt.deadline),wt.received,wt.dropped,wt.skipped,wt.depth,
@@ -1947,7 +1987,7 @@ static void trace_finish(uint64_t end) {
 }
 static void trace_frame_end(struct trace_frame *r) {
     if (!trace_active) return;
-    if (!r->begin) r->begin=wt.start; /* 開始chordを消費した最初のloop。 */
+    if (!r->begin) r->begin=wt.start; /* the pass that took the starting chord */
     r->end=rdtsc(); r->jobs=cpu_parallel_jobs()-r->jobs;
     if (r->waited) { wt.streak=0; wt.streak_start=0; }
     else { wt.nowait++; if (!wt.streak) wt.streak_start=r->begin; wt.streak++;
@@ -1960,25 +2000,42 @@ static void trace_frame_end(struct trace_frame *r) {
     if (r->end>=wt.deadline) trace_finish(r->end);
 }
 
-static void key_sink(const struct key_event *e) {
+/* An input event into the ring (dropped when it is full); the compositor is woken after it. */
+static void input_put(bool is_key, const struct key_event *k, const struct mouse_event *m) {
+    uint64_t f = spin_lock(&in_lock);
     int nh = (in_head + 1) % INQ;
-    if (nh == in_tail) { if (trace_active) wt.dropped++; return; }
-    inq[in_head].is_key = true;
-    inq[in_head].k = *e;
-    trace_stamp(&inq[in_head]);
-    in_head = nh;
-    wake_compositor();
+    bool full = nh == in_tail;
+    if (full) {
+        if (trace_active) wt.dropped++;
+    } else {
+        struct in_ev *ev = &inq[in_head];
+        ev->is_key = is_key;
+        if (is_key) ev->k = *k;
+        else ev->m = *m;
+        trace_stamp(ev);
+        __atomic_store_n(&in_head, nh, __ATOMIC_RELEASE);
+    }
+    spin_unlock(&in_lock, f);
+    if (!full) wake_compositor();
 }
 
-static void mouse_sink(const struct mouse_event *e) {
-    int nh = (in_head + 1) % INQ;
-    if (nh == in_tail) { if (trace_active) wt.dropped++; return; }
-    inq[in_head].is_key = false;
-    inq[in_head].m = *e;
-    trace_stamp(&inq[in_head]);
-    in_head = nh;
-    wake_compositor();
+static void key_sink(const struct key_event *e) { input_put(true, e, NULL); }
+static void mouse_sink(const struct mouse_event *e) { input_put(false, NULL, e); }
+
+/* The compositor: the oldest input event, false when there is none. */
+static bool input_take(struct in_ev *out) {
+    uint64_t f = spin_lock(&in_lock);
+    bool any = in_tail != in_head;
+    if (any) {
+        *out = inq[in_tail];
+        in_tail = (in_tail + 1) % INQ;
+    }
+    spin_unlock(&in_lock, f);
+    return any;
 }
+
+/* Whether input waits for the compositor (in_tail is its own). */
+static bool input_waiting(void) { return __atomic_load_n(&in_head, __ATOMIC_ACQUIRE) != in_tail; }
 
 static void toggle_maximize(struct window *w) {
     if(w->fullscreen)return;
@@ -2128,7 +2185,7 @@ static void pointer_update(void) {
     pointer_shape = shape;
     pointer_from = from;
     pointer_from_serial = serial;
-    if (!++pointer_serial) pointer_serial = 1;
+    __atomic_store_n(&pointer_serial, pointer_serial + 1 ? pointer_serial + 1 : 1, __ATOMIC_RELAXED);
     damage_cursor();
     wake_compositor();
 }
@@ -2397,21 +2454,21 @@ static void handle_mouse(const struct mouse_event *m) {
 }
 
 void wm_vblank(uint64_t count, uint64_t timestamp_ns) {
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock(&vblank_lock);
     vblank_count = count;
     vblank_ns = timestamp_ns;
     vblank_at_ms = uptime_ms();
     vblank_seen = true;
-    if (vblank_waiting) {
-        vblank_waiting = false;
-        wake_compositor();
-    }
-    irq_restore(fl);
+    bool wake = vblank_waiting;
+    vblank_waiting = false;
+    spin_unlock(&vblank_lock, fl);
+    if (wake) wake_compositor();
 }
 
-/* Whether vertical blanks pace frames at now. Interrupts off. */
+/* Whether vertical blanks pace frames at now (read under vblank_lock, after the last blank's
+   vblank_at_ms). vblank_lock held. */
 static bool vblank_paced(uint64_t now) { return vblank_seen && now - vblank_at_ms < VBLANK_LOST_MS; }
-/* Whether a frame with damage may start at now. Interrupts off. */
+/* Whether a frame with damage may start at now. vblank_lock held. */
 static bool frame_due(uint64_t now) {
     return vblank_paced(now) ? vblank_count != vblank_drawn : now * 1000 >= frame_next_us;
 }
@@ -2426,8 +2483,8 @@ static uint64_t frame_period(void) {
     }
     return 1000000000ull / mhz;
 }
-/* Whether a shown window waits for a frame without damage to make it (SYS_WIN_FRAME). The windows
-   change only on this CPU, so a look with interrupts off holds until the wait. */
+/* Whether a shown window waits for a frame without damage to make it (SYS_WIN_FRAME). wm_lock
+   held; whoever asks for one wakes the compositor after it. */
 static bool frames_asked(void) {
     for (int i = 0; i < nwin; i++)
         if (zorder[i]->frame_wanted && visible(zorder[i])) return true;
@@ -2439,26 +2496,41 @@ static void frame_started(uint64_t now) {
     frame_next_us = us - frame_next_us < period ? frame_next_us + period : us + period;
 }
 
-/* ---- compositor thread ---- */
+/* ---- compositor thread ----
+   Each pass ends reading wm_wakes and then, under wm_lock, whether work is left (damage, a
+   present, a frame asked for). The next sleeps only while wm_wakes still reads the same
+   (wq_wait_unless): whoever makes work on another CPU after that look moved it on before its
+   wake. A vertical blank that came before the sleep makes the frame due; one after it wakes the
+   thread (vblank_waiting). */
 static void wm_thread(void *arg) {
+    wm_lock();
     damage_all();
+    uint64_t seen = __atomic_load_n(&wm_wakes, __ATOMIC_SEQ_CST);
+    bool work = true;
+    wm_unlock();
     for (;;) {
         bool waited=false; uint64_t waiting=0;
-        uint64_t fl = irq_save();
-        uint64_t now = uptime_ms();
-        bool work = ndamage || pending_frames || frames_asked();
-        if (in_head == in_tail && (!work || !frame_due(now))) {
+        uint64_t wait_ms = 0;
+        if (!input_waiting()) {
+            uint64_t fl = spin_lock(&vblank_lock);
+            uint64_t now = uptime_ms();
+            if (!work) wait_ms = 250; /* the clock and a toast's end */
+            else if (!frame_due(now)) {
+                vblank_waiting = vblank_paced(now);
+                wait_ms = vblank_waiting ? VBLANK_LOST_MS - (now - vblank_at_ms) : (frame_next_us - now * 1000 + 999) / 1000;
+            }
+            spin_unlock(&vblank_lock, fl);
+        }
+        if (wait_ms) {
             if (trace_active) { waited=true; waiting=rdtsc(); wt.waits++; }
-            bool paced = work && vblank_paced(now);
-            vblank_waiting = paced; /* the next blank wakes the thread */
-            wq_wait_timeout(&wm_wq, !work ? 250 : paced ? VBLANK_LOST_MS - (now - vblank_at_ms)
-                                                        : (frame_next_us - now * 1000 + 999) / 1000);
-            vblank_waiting = false;
+            wq_wait_unless(&wm_wq, &wm_wakes, seen, wait_ms);
             if (waiting) { uint64_t ticks=rdtsc()-waiting; wt.wait_ticks+=ticks; wt.max_wait=MAX(wt.max_wait,ticks); }
         }
+        uint64_t fl = spin_lock(&vblank_lock);
+        vblank_waiting = false;
         bool pacing = vblank_paced(uptime_ms());
         uint64_t first_count = vblank_count, first_ns = vblank_ns;
-        irq_restore(fl);
+        spin_unlock(&vblank_lock, fl);
         if (pacing != vblank_pacing) {
             vblank_pacing = pacing;
             if (pacing)
@@ -2471,9 +2543,8 @@ static void wm_thread(void *arg) {
         wm_lock();
         struct trace_frame frame={.begin=trace_active?rdtsc():0,.waited=waited};
 
-        while (in_tail != in_head) {
-            struct in_ev ev = inq[in_tail];
-            in_tail = (in_tail + 1) % INQ;
+        struct in_ev ev;
+        while (input_take(&ev)) {
             if (trace_active && ev.stamp>=wt.start && ev.seq) {
                 uint64_t delay=rdtsc()-ev.stamp; wt.max_dequeue=MAX(wt.max_dequeue,delay); trace_hist(wt.dequeue_hist,delay);
                 if (!frame.oldest) frame.oldest=ev.stamp;
@@ -2509,11 +2580,12 @@ static void wm_thread(void *arg) {
         }
         pointer_update();
         direct_update();
-        fl = irq_save();
-        now = uptime_ms();
-        bool render = (ndamage || pending_frames || frames_asked()) && frame_due(now);
+        bool want = ndamage || pending_frames || frames_asked();
+        fl = spin_lock(&vblank_lock);
+        uint64_t now = uptime_ms();
+        bool render = want && frame_due(now);
         if (render) vblank_drawn = vblank_count;
-        irq_restore(fl);
+        spin_unlock(&vblank_lock, fl);
         if (trace_active && render) {
             frame.rects=ndamage; frame.jobs=cpu_parallel_jobs();
             for (int i=0;i<ndamage;i++) frame.area+=(uint64_t)damage[i].w*damage[i].h;
@@ -2523,20 +2595,34 @@ static void wm_thread(void *arg) {
             composite();
         }
         trace_frame_end(&frame);
+        seen = __atomic_load_n(&wm_wakes, __ATOMIC_SEQ_CST);
+        work = ndamage || pending_frames || frames_asked();
         wm_unlock();
-        /* 全join/presentと借用終了後だけ譲る。合成中のkernel preemptionではない。 */
+        /* only once every batch and present has ended and wm_lock is given back */
         if (wm_yield) {
-            if (trace_active) wt.yield_calls++; /* switch数ではなく実呼出数。 */
+            if (trace_active) wt.yield_calls++; /* calls, not switches */
             sched_yield();
         }
     }
 }
 
-bool wm_running(void) { return running; }
+bool wm_running(void) { return __atomic_load_n(&running, __ATOMIC_ACQUIRE); }
 
 void wm_screen_size(uint32_t *w, uint32_t *h) {
+    wm_lock();
     *w = (uint32_t)sw;
     *h = (uint32_t)sh;
+    wm_unlock();
+}
+
+/* The clipboard is now nb's n bytes (kmalloc'd, with a NUL after them), which it keeps. */
+static void clipboard_put(char *nb, size_t n) {
+    wm_lock();
+    kfree(clipboard);
+    clipboard = nb;
+    clipboard_len = n;
+    clipboard_seq++;
+    wm_unlock();
 }
 
 bool wm_clipboard_set(const char *text, size_t n) {
@@ -2545,12 +2631,7 @@ bool wm_clipboard_set(const char *text, size_t n) {
     if (!nb) return false;
     memcpy(nb, text, n);
     nb[n] = 0;
-    wm_lock();
-    if (clipboard) kfree(clipboard);
-    clipboard = nb;
-    clipboard_len = n;
-    clipboard_seq++;
-    wm_unlock();
+    clipboard_put(nb, n);
     return true;
 }
 
@@ -2577,15 +2658,15 @@ char *wm_clipboard_snapshot(size_t *len) {
 
 /* Change the size of the desktop: to the scanout's when a display driver shows another mode
    (wm_screen_resized), or to a remote viewer's window's (the scanout keeps its own size;
-   fb_present clips to it). Not from the compositor: it must not be in the middle of a frame. */
+   fb_present clips to it). Not from the compositor: it must not be in the middle of a frame.
+   wm_lock held once (not nested): it is given back while the compositor presents back. */
 static bool set_screen_size(int w, int h) {
-    cpu_require_bsp();
     if (w == sw && h == sh) return true;
     while (presenting_back) {
-        uint64_t flags = irq_save();
+        /* the present's end moves back_presents on under wm_lock, then wakes present_wait */
+        uint64_t seen = back_presents;
         wm_unlock();
-        if (presenting_back) wq_wait(&present_wait);
-        irq_restore(flags);
+        wq_wait_unless(&present_wait, &back_presents, seen, 0);
         wm_lock();
         if (w == sw && h == sh) return true;
     }
@@ -2658,8 +2739,9 @@ void wm_remote_resize(int *w, int *h) {
 
 bool wm_remote_attach(int *w, int *h) {
     wm_lock();
-    if (!running) { wm_unlock(); return false; }
-    if (!remote_users++) wm_screen_info_changed(); /* the source is the remote viewer's window now */
+    if (!wm_running()) { wm_unlock(); return false; }
+    if (!__atomic_fetch_add(&remote_users, 1, __ATOMIC_RELAXED))
+        wm_screen_info_changed(); /* the source is the remote viewer's window now */
     /* Do not nest WM ownership: set_screen_size may release it while waiting
        for the compositor's VRAM borrow of the previous backbuffer. */
     if (*w > 0 && *h > 0) set_screen_size(MAX(640, MIN(*w, 3840)), MAX(480, MIN(*h, 2160)));
@@ -2672,7 +2754,7 @@ bool wm_remote_attach(int *w, int *h) {
 }
 
 void wm_repaint(void) {
-    if (!running) return;
+    if (!wm_running()) return;
     wm_lock();
     damage_all();
     wake_compositor();
@@ -2683,7 +2765,7 @@ void wm_remote_detach(void) {
     uint32_t w, h;
     fb_screen_size(&w, &h);
     wm_lock();
-    if (remote_users > 0 && !--remote_users) wm_screen_info_changed();
+    if (remote_users > 0 && __atomic_sub_fetch(&remote_users, 1, __ATOMIC_RELAXED) == 0) wm_screen_info_changed();
     if (!remote_users) set_screen_size((int)w, (int)h);
     damage_all();
     wake_compositor();
@@ -2691,11 +2773,11 @@ void wm_remote_detach(void) {
 }
 
 /* Whether a remote viewer has the desktop at its window's size now. Read without wm_lock, so a
-   caller holding another lock may ask. */
+   caller holding another lock (or a spinlock) may ask. */
 bool wm_remote_viewing(void) { return __atomic_load_n(&remote_users, __ATOMIC_RELAXED) > 0; }
 
 bool wm_screen_resized(uint32_t w, uint32_t h) {
-    if (!running) return true;
+    if (!wm_running()) return true;
     wm_lock();
     bool ok = remote_users || set_screen_size((int)w, (int)h);
     if (!ok) kprintf("wm: no memory for a %ux%u desktop; it keeps its size\n", w, h);
@@ -2768,8 +2850,8 @@ void wm_init(void) {
     wm_yield=cmdline_has("wmyield");
     wm_shadow_strip=!cmdline_has("wmshadowstrip=off"); /* default on; legacy shadow path is opt-out */
     wm_occlusion=!cmdline_has("wmocclusion=off"); /* diagnostic original layer traversal */
-    wm_parallel_force=cmdline_has("wmparallel") || wm_verify || cmdline_has("wm-test-ap-fault");
-    wm_parallel=!cmdline_has("wmparallel=off"); /* 明示offは診断のforceより優先。 */
+    wm_parallel_force=cmdline_has("wmparallel") || wm_verify;
+    wm_parallel=!cmdline_has("wmparallel=off"); /* off wins over the diagnostics that force it */
     if (wm_verify) {
         uint32_t *reference=vmalloc(pages);
         if (!reference) panic("wmverify: cannot allocate reference RAM");
@@ -2778,7 +2860,7 @@ void wm_init(void) {
     scene_benchmark();
     mx = sw / 2;
     my = sh / 2;
-    running = true;
+    __atomic_store_n(&running, true, __ATOMIC_RELEASE); /* after everything a WM call reads */
     fbcon_set_enabled(false);
     input_set_sinks(key_sink, mouse_sink);
     kthread_create("compositor", wm_thread, NULL);
@@ -2787,7 +2869,7 @@ void wm_init(void) {
 }
 
 void wm_notify(const char *title, const char *text) {
-    if (!running) {
+    if (!wm_running()) {
         kprintf("[%s] %s\n", title, text);
         return;
     }
@@ -2802,7 +2884,7 @@ void wm_notify(const char *title, const char *text) {
 }
 
 void wm_process_exit(int pid) {
-    if (!running) return;
+    if (!wm_running()) return;
     wm_lock();
     for (int i = nwin - 1; i >= 0; i--) {
         if (i >= nwin) continue;
@@ -2812,7 +2894,7 @@ void wm_process_exit(int pid) {
 }
 
 int wm_window_count(char *top_title, size_t n) {
-    if (!running) return 0;
+    if (!wm_running()) return 0;
     int count = 0;
     wm_lock();
     for (int i = nwin - 1; i >= 0; i--) {
@@ -2824,7 +2906,7 @@ int wm_window_count(char *top_title, size_t n) {
 }
 
 void wm_close_windows(void) {
-    if (!running) return;
+    if (!wm_running()) return;
     wm_lock();
     for (int i = 0; i < nwin; i++)
         if (!zorder[i]->dead) send_simple(zorder[i], EV_CLOSE);
@@ -2849,8 +2931,41 @@ static int user_title(char *dst, const char *src, size_t max) {
     return (int)n + 3;
 }
 
-static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
-    if (!running) return -N_ERR_UNSUPPORTED;
+/* What a window call brings from the program's memory, copied before wm_lock is taken: a copy
+   can sleep (a page the program has not touched yet), and another thread of the program may
+   unmap that memory at any time. */
+struct call_input {
+    int64_t error;                  /* the copy's failure, reported after the handle's checks */
+    char title[sizeof ((struct window *)0)->title];
+    struct n_win_pointer pointer;
+    uint32_t *image;                /* the pointer's pixels (kmalloc'd): the call keeps them or they are freed */
+};
+
+/* SYS_WIN_POINTER's description and pixels, checked. */
+static int64_t pointer_read(uint64_t b, uint64_t c, struct n_win_pointer *p, uint32_t **image) {
+    if (c != sizeof *p) return -N_ERR_INVALID;
+    int r = copy_from_user(p, (const void *)b, sizeof *p);
+    if (r < 0) return r;
+    if (p->shape >= N_POINTER_SHAPES || p->reserved) return -N_ERR_INVALID;
+    if (!p->width && !p->height) return p->hot_x || p->hot_y ? -N_ERR_INVALID : 0;
+    if (!p->width || !p->height || p->width > N_POINTER_IMAGE_MAX || p->height > N_POINTER_IMAGE_MAX ||
+        p->hot_x >= p->width || p->hot_y >= p->height)
+        return -N_ERR_INVALID;
+    size_t bytes = (size_t)p->width * p->height * 4;
+    if (!p->pixels || !user_ok(p->pixels, bytes)) return -N_ERR_BAD_ADDRESS;
+    uint32_t *pixels = kmalloc(bytes);
+    if (!pixels) return -N_ERR_NO_MEMORY;
+    r = copy_from_user(pixels, p->pixels, bytes);
+    if (r < 0) {
+        kfree(pixels);
+        return r;
+    }
+    *image = pixels;
+    return 0;
+}
+
+static int64_t sys_win_create(int cw, int ch, const char *title, int flags) {
+    if (!wm_running()) return -N_ERR_UNSUPPORTED;
     if (nwin >= MAX_WIN) return -N_ERR_NO_MEMORY;
     if (cw < 16) cw = 16;
     if (ch < 16) ch = 16;
@@ -2858,8 +2973,7 @@ static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
     if (ch > sh) ch = sh;
     struct window *w = kzalloc(sizeof *w);
     if (!w) return -N_ERR_NO_MEMORY;
-    if (utitle && user_title(w->title, utitle, sizeof w->title) < 0) strcpy(w->title, "window");
-    if (!utitle) strcpy(w->title, current_task->name);
+    memcpy(w->title, title, sizeof w->title);
     w->flags = flags;
     w->pid = task_process()->pid;
     w->id = next_win_id++;
@@ -2904,9 +3018,11 @@ static void show_if_needed(struct window *w) {
     damage_rect(0, sh - TASKBAR_H, sw, TASKBAR_H);
 }
 
-static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, struct handle *handle) {
+/* wm_lock held once (wm_syscall): a SYS_WIN_MAP wait gives it back while it sleeps. */
+static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e,
+                                 struct handle *handle, struct call_input *in) {
     switch (num) {
-    case SYS_WIN_CREATE: return sys_win_create((int)a, (int)b, (const char *)c, (int)d);
+    case SYS_WIN_CREATE: return sys_win_create((int)a, (int)b, in->title, (int)d);
     case SYS_WIN_MAP: {
         struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
@@ -2914,11 +3030,15 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         if (b >= ((w->flags & WIN_DOUBLE_BUFFER) ? WIN_BUFFER_COUNT : 1) || c > WIN_MAP_ACQUIRE) return -N_ERR_INVALID;
         if (c && !(w->flags & WIN_DOUBLE_BUFFER)) return -N_ERR_INVALID;
         while (c && (w->pending_index >= 0 || w->front_index == (int)b)) {
-            uint64_t flags = irq_save();
+            /* The indices change under ev_lock too (buffers_set), and whoever changes them wakes
+               w->wq after; the handle's reference keeps w while wm_lock is given back. */
             wm_unlock();
-            if (!w->dead && !current_task->killed &&
-                (w->pending_index >= 0 || w->front_index == (int)b)) wq_wait(&w->wq);
-            irq_restore(flags);
+            uint64_t fl = spin_lock(&w->ev_lock);
+            if (!w->dead && !current_task->killed && (w->pending_index >= 0 || w->front_index == (int)b))
+                wq_wait_locked(&w->wq, &w->ev_lock);
+            else
+                spin_give(&w->ev_lock);
+            irq_restore(fl);
             wm_lock();
             if (w->dead) return -N_ERR_NO_HANDLE;
             if (current_task->killed) return -N_ERR_STOPPED;
@@ -2956,31 +3076,16 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
         if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
-        if (c != sizeof(struct n_win_pointer)) return -N_ERR_INVALID;
-        if (!user_ok((const void *)b, sizeof(struct n_win_pointer))) return -N_ERR_BAD_ADDRESS;
-        struct n_win_pointer p;
-        memcpy(&p, (const void *)b, sizeof p);
-        if (p.shape >= N_POINTER_SHAPES || p.reserved) return -N_ERR_INVALID;
-        uint32_t *image = NULL;
-        if (p.width || p.height) {
-            if (!p.width || !p.height || p.width > N_POINTER_IMAGE_MAX || p.height > N_POINTER_IMAGE_MAX ||
-                p.hot_x >= p.width || p.hot_y >= p.height)
-                return -N_ERR_INVALID;
-            size_t bytes = (size_t)p.width * p.height * 4;
-            if (!p.pixels || !user_ok(p.pixels, bytes)) return -N_ERR_BAD_ADDRESS;
-            image = kmalloc(bytes);
-            if (!image) return -N_ERR_NO_MEMORY;
-            memcpy(image, p.pixels, bytes);
-        } else if (p.hot_x || p.hot_y) {
-            return -N_ERR_INVALID;
-        }
+        if (in->error) return in->error;
+        const struct n_win_pointer *p = &in->pointer;
         kfree(w->pointer_image);
-        w->pointer_image = image;
-        w->pointer_shape = p.shape;
-        w->pointer_w = (int)p.width;
-        w->pointer_h = (int)p.height;
-        w->pointer_hx = (int)p.hot_x;
-        w->pointer_hy = (int)p.hot_y;
+        w->pointer_image = in->image;
+        in->image = NULL;
+        w->pointer_shape = p->shape;
+        w->pointer_w = (int)p->width;
+        w->pointer_h = (int)p->height;
+        w->pointer_hx = (int)p->hot_x;
+        w->pointer_hy = (int)p->hot_y;
         w->pointer_serial++;
         pointer_update();
         return 0;
@@ -3003,7 +3108,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
             int index = (int)e - 1;
             if (w->pending_index >= 0 || w->front_index == index) return -N_ERR_BUSY;
             if (!(index ? w->second_uaddr : w->uaddr)) return -N_ERR_INVALID;
-            w->pending_index = index;
+            buffers_set(w, w->front_index, index);
             pending_frames++;
             if (!w->shown) show_if_needed(w);
             else if (visible(w)) damage_rect(client_x(w), client_y(w), w->cw, w->ch);
@@ -3034,47 +3139,14 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     case SYS_WIN_SET_TITLE: {
         struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
-        if (user_title(w->title, (const char *)b, sizeof w->title) < 0) return -N_ERR_BAD_ADDRESS;
+        if (in->error) return in->error;
+        memcpy(w->title, in->title, sizeof w->title);
         if (w->shown) {
             damage_rect(w->x, w->y, frame_w(w), TITLE_H);
             damage_rect(0, sh - TASKBAR_H, sw, TASKBAR_H);
             wake_compositor();
         }
         return 0;
-    }
-    case SYS_SCREEN_INFO: {
-        if (c == SCREEN_SETTINGS_GET || c == SCREEN_SETTINGS_SET) {
-            if (b != sizeof(struct desktop_settings)) return -N_ERR_INVALID;
-            struct desktop_settings *ds = (struct desktop_settings *)a;
-            if (c == SCREEN_SETTINGS_SET) {
-                if (!user_ok(ds, sizeof *ds)) return -N_ERR_BAD_ADDRESS;
-                struct desktop_settings n = *ds;
-                if (n.pointer_speed < -2 || n.pointer_speed > 2 || n.smooth_gradients > 1) return -N_ERR_INVALID;
-                desktop_settings_put(n.pointer_speed, n.smooth_gradients != 0);
-            }
-            if (!user_ok_w(ds, sizeof *ds)) return -N_ERR_BAD_ADDRESS;
-            memset(ds, 0, sizeof *ds);
-            ds->pointer_speed = (int8_t)pointer_speed;
-            ds->smooth_gradients = deep_wanted;
-            ds->smooth_gradients_available = fb_dither_able();
-            return 0;
-        }
-        /* b == 0: the original struct screen_info; b == sizeof(struct
-           screen_format): the colour format as well (display_abi.h). */
-        if (b && b != sizeof(struct screen_format)) return -N_ERR_INVALID;
-        struct screen_format *si = (struct screen_format *)a;
-        if (!user_ok_w(si, b ? sizeof *si : sizeof(struct screen_info))) return -N_ERR_BAD_ADDRESS;
-        si->width = running ? sw : fb.width;
-        si->height = running ? sh - TASKBAR_H : fb.height;
-        if (b) {
-            si->bits_per_pixel = fb.bpp;
-            si->red_bits = fb.simulated ? 10 : fb.rsize;
-            si->green_bits = fb.simulated ? 10 : fb.gsize;
-            si->blue_bits = fb.simulated ? 10 : fb.bsize;
-            /* Without deep planes the desktop delivers 8 bits per channel. */
-            si->bits_per_channel = back_deep ? fb.bpc : MIN(fb.bpc, 8);
-        }
-        return running ? 0 : -N_ERR_UNSUPPORTED;
     }
     case SYS_WIN_MOVE: {
         struct window *w = handle_window(handle);
@@ -3085,18 +3157,6 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         damage_window(w);
         wake_compositor();
         return 0;
-    }
-    case SYS_CLIPBOARD_SET: {
-        size_t n = b;
-        if (n > WM_CLIPBOARD_MAX) return -N_ERR_TOO_LARGE;
-        if (!user_ok((void *)a, n)) return -N_ERR_BAD_ADDRESS;
-        return wm_clipboard_set((const char *)a, n) ? 0 : -N_ERR_NO_MEMORY;
-    }
-    case SYS_CLIPBOARD_GET: {
-        size_t n = MIN(b, clipboard_len);
-        if (!user_ok_w((void *)a, n)) return -N_ERR_BAD_ADDRESS;
-        if (n) memcpy((void *)a, clipboard, n);
-        return (int64_t)clipboard_len;
     }
     case SYS_WIN_RESIZE: {
         struct window *w = handle_window(handle);
@@ -3137,54 +3197,145 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     case SYS_SCREEN_GRAB: {
         /* copy the composed screen (desktop, windows, taskbar) as 0xAARRGGBB pixels; returns
            width << 16 | height. The buffer must hold width * height pixels (bytes = 0: size only). */
-        if (!running) return -N_ERR_UNSUPPORTED;
+        if (!wm_running()) return -N_ERR_UNSUPPORTED;
         uint32_t *dst = (uint32_t *)a;
         size_t need = (size_t)sw * (size_t)sh * 4;
         if (b == 0) return (int64_t)sw << 16 | sh; /* just the size */
         if (b < need) return -N_ERR_TOO_LARGE;
         if (!user_ok_w(dst, need)) return -N_ERR_BAD_ADDRESS;
-        for (int y = 0; y < sh; y++) memcpy(dst + (size_t)y * (size_t)sw, back.px + (size_t)y * (size_t)back.pitch, (size_t)sw * 4);
+        /* The compositor writes the canvas only under wm_lock, which this sleeping copy holds. */
+        for (int y = 0; y < sh; y++) {
+            int r = copy_to_user(dst + (size_t)y * (size_t)sw, back.px + (size_t)y * (size_t)back.pitch, (size_t)sw * 4);
+            if (r < 0) return r;
+        }
         return (int64_t)sw << 16 | sh;
-    }
-    case SYS_GUI_LAUNCH: {
-        char *path, *arg = NULL;
-        int r = user_string((const char *)a, &path);
-        if (r < 0) return r;
-        if (b && (r = user_string((const char *)b, &arg)) < 0) { kfree(path); return r; }
-        r = proc_spawn_simple(path, arg, NULL);
-        kfree(path);
-        kfree(arg);
-        return r;
     }
     default: return -N_ERR_UNSUPPORTED;
     }
 }
 
+/* Starts the program at path a (with the one argument b, or none), without wm_lock. */
+static int64_t sys_gui_launch(uint64_t a, uint64_t b) {
+    char *path, *arg = NULL;
+    int r = user_string((const char *)a, &path);
+    if (r < 0) return r;
+    if (b && (r = user_string((const char *)b, &arg)) < 0) {
+        kfree(path);
+        return r;
+    }
+    r = proc_spawn_simple(path, arg, NULL);
+    kfree(path);
+    kfree(arg);
+    return r;
+}
+
+/* SYS_SCREEN_INFO's settings and screen format: the reply is made under wm_lock and copied out
+   after it. */
+static int64_t sys_screen_info(uint64_t a, uint64_t b, uint64_t c) {
+    if (c == SCREEN_SETTINGS_GET || c == SCREEN_SETTINGS_SET) {
+        if (b != sizeof(struct desktop_settings)) return -N_ERR_INVALID;
+        struct desktop_settings ds;
+        if (c == SCREEN_SETTINGS_SET) {
+            int r = copy_from_user(&ds, (const void *)a, sizeof ds);
+            if (r < 0) return r;
+            if (ds.pointer_speed < -2 || ds.pointer_speed > 2 || ds.smooth_gradients > 1) return -N_ERR_INVALID;
+        }
+        wm_lock();
+        if (c == SCREEN_SETTINGS_SET) desktop_settings_put(ds.pointer_speed, ds.smooth_gradients != 0);
+        ds = (struct desktop_settings){
+            .pointer_speed = (int8_t)pointer_speed,
+            .smooth_gradients = deep_wanted,
+            .smooth_gradients_available = fb_dither_able(),
+        };
+        wm_unlock();
+        return copy_to_user((void *)a, &ds, sizeof ds);
+    }
+    /* b == 0: the original struct screen_info; b == sizeof(struct
+       screen_format): the colour format as well (display_abi.h). */
+    if (b && b != sizeof(struct screen_format)) return -N_ERR_INVALID;
+    struct screen_format si = {0};
+    wm_lock();
+    bool on = wm_running();
+    si.width = on ? sw : fb.width;
+    si.height = on ? sh - TASKBAR_H : fb.height;
+    si.bits_per_pixel = fb.bpp;
+    si.red_bits = fb.simulated ? 10 : fb.rsize;
+    si.green_bits = fb.simulated ? 10 : fb.gsize;
+    si.blue_bits = fb.simulated ? 10 : fb.bsize;
+    /* Without deep planes the desktop delivers 8 bits per channel. */
+    si.bits_per_channel = back_deep ? fb.bpc : MIN(fb.bpc, 8);
+    wm_unlock();
+    int r = copy_to_user((void *)a, &si, b ? sizeof si : sizeof(struct screen_info));
+    if (r < 0) return r;
+    return on ? 0 : -N_ERR_UNSUPPORTED;
+}
+
+static int64_t sys_clipboard_set(uint64_t a, uint64_t b) {
+    size_t n = b;
+    if (n > WM_CLIPBOARD_MAX) return -N_ERR_TOO_LARGE;
+    if (!user_ok((const void *)a, n)) return -N_ERR_BAD_ADDRESS;
+    char *nb = kmalloc(n + 1);
+    if (!nb) return -N_ERR_NO_MEMORY;
+    int r = copy_from_user(nb, (const void *)a, n);
+    if (r < 0) {
+        kfree(nb);
+        return r;
+    }
+    nb[n] = 0;
+    clipboard_put(nb, n);
+    return 0;
+}
+
+/* Up to b bytes of the clipboard: its whole length. */
+static int64_t sys_clipboard_get(uint64_t a, uint64_t b) {
+    size_t len;
+    char *text = wm_clipboard_snapshot(&len);
+    if (!text) return -N_ERR_NO_MEMORY;
+    size_t n = MIN(b, len);
+    int r = n ? copy_to_user((void *)a, text, n) : 0;
+    kfree(text);
+    return r < 0 ? r : (int64_t)len;
+}
+
 int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
-    if (num == SYS_GUI_LAUNCH) return wm_syscall_locked(num,a,b,c,d,e,NULL);
-    /* The monitor's mode: its own lock, which comes before the WM's (it tells the driver through
-       wm_screen_mode). */
-    if (num == SYS_SCREEN_INFO && (c == SCREEN_MODES_GET || c == SCREEN_MODE_SET)) return screen_modes_syscall((void *)a, b, c);
-    /* A watch on what all of SYS_SCREEN_INFO reports: no lock (else 5 would be read as the reply's
-       size below). */
-    if (num == SYS_SCREEN_INFO && c == SCREEN_WATCH)
-        return a || b ? -N_ERR_INVALID : !screen_watchable ? -N_ERR_UNSUPPORTED : watched_open(&screen_watched);
+    if (num == SYS_GUI_LAUNCH) return sys_gui_launch(a, b);
+    if (num == SYS_SCREEN_INFO) {
+        /* The monitor's mode: its own lock, which comes before the WM's (it tells the driver
+           through wm_screen_mode). */
+        if (c == SCREEN_MODES_GET || c == SCREEN_MODE_SET) return screen_modes_syscall((void *)a, b, c);
+        /* A watch on what all of SYS_SCREEN_INFO reports (else 5 would be read as the reply's size). */
+        if (c == SCREEN_WATCH)
+            return a || b ? -N_ERR_INVALID : !screen_watchable ? -N_ERR_UNSUPPORTED : watched_open(&screen_watched);
+        return sys_screen_info(a, b, c);
+    }
+    if (num == SYS_CLIPBOARD_SET) return sys_clipboard_set(a, b);
+    if (num == SYS_CLIPBOARD_GET) return sys_clipboard_get(a, b);
     struct handle *handle = NULL;
     if (num == SYS_WIN_RECEIVE) {
-        /* Any CPU, without the WM lock (ev_lock); the handle's reference keeps the window's memory. */
+        /* Without the WM lock (ev_lock); the handle's reference keeps the window's memory. */
         handle = handle_get((int)a);
         int64_t result = !handle ? -N_ERR_NO_HANDLE : !handle_is(handle, &win_ops) ? -N_ERR_WRONG_KIND
                        : win_receive(handle->object->priv, (struct gui_event *)b, (size_t)c, (int64_t)d);
         handle_close(handle);
         return result;
     }
+    struct call_input in = {0};
+    if (num == SYS_WIN_CREATE) {
+        if (!c) strcpy(in.title, current_task->name);
+        else if (user_title(in.title, (const char *)c, sizeof in.title) < 0) strcpy(in.title, "window");
+    } else if (num == SYS_WIN_SET_TITLE) {
+        if (user_title(in.title, (const char *)b, sizeof in.title) < 0) in.error = -N_ERR_BAD_ADDRESS;
+    } else if (num == SYS_WIN_POINTER) {
+        in.error = pointer_read(b, c, &in.pointer, &in.image);
+    }
     if (num == SYS_WIN_MAP || num == SYS_WIN_STATE || num == SYS_WIN_PRESENTATION || num == SYS_WIN_PRESENT ||
         num == SYS_WIN_SET_TITLE || num == SYS_WIN_MOVE || num == SYS_WIN_RESIZE || num == SYS_WIN_DIRECT ||
         num == SYS_WIN_FRAME || num == SYS_WIN_POINTER)
         handle = handle_get((int)a);
     wm_lock();
-    int64_t result = wm_syscall_locked(num,a,b,c,d,e,handle);
+    int64_t result = wm_syscall_locked(num, a, b, c, d, e, handle, &in);
     wm_unlock();
+    kfree(in.image); /* a pointer image the call did not keep */
     handle_close(handle);
     return result;
 }

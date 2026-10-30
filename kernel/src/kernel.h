@@ -46,11 +46,15 @@ int kvsnprintf(char *buf, size_t size, const char *fmt, va_list ap);
 int ksnprintf(char *buf, size_t size, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 int kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 NORETURN void panic(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* The start of every panic report (panic, panic_regs): interrupts off, every other CPU stopped
+   and the log's locks free; a CPU that is not to report halts in it. */
+void panic_enter(void);
 void klog_write(const char *s, size_t n);
 /* true if the kernel command line contains this exact word (init.c) */
 bool cmdline_has(const char *word);
 /* key=<decimal> on the kernel command line: the last well-formed one (init.c) */
 bool cmdline_number(const char *key, uint64_t *out);
+#define KLOG_SIZE 65536 /* the system log keeps its last this many bytes */
 size_t klog_read(char *buf, size_t max);
 /* The log's text from its at'th byte ever written on, up to max bytes, and at moved past it. What
    the ring no longer holds is skipped: lost tells how many bytes. */

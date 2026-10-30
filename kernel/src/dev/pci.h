@@ -30,7 +30,7 @@ struct pci_device {
     /* While set, the function is being reset (pci_function_reset) and its configuration from
        before is held to be written back: kept when an attempt is cancelled or fails, or a sleep
        comes between, until an FLR has been seen through. A function may discard Requests during
-       its FLR (6.6.2): software that does not own the reset asks pci_config_blocked. */
+       its FLR (6.6.2): software that does not own the reset goes through pci_config_firmware_*. */
     struct pci_reset *reset;
     unsigned rrs_holds;  /* a Root Port: reset attempts or readiness waits below it running (pci.c) */
     bool rrs_firmware;   /* a Root Port: RRS Software Visibility was already on at the first hold */
@@ -91,8 +91,9 @@ uint16_t pci_find_ext_cap(const struct pci_device *d, uint16_t id);
 /* Message-signalled interrupts. All of them target a physical APIC id of at most 8 bits (the MSI
    address, and the remapping entries dev/iommu.c writes, carry no more), so ids above 255 (x2APIC
    systems with many CPUs) are refused. The address and data come from iommu_msi_message.
-   Device interrupts are handled on the BSP only: pass lapic_current_id() from the BSP. */
-/* Deliver the function's interrupt as `vector` on the BSP through MSI or MSI-X (entry 0). */
+   Device interrupts are handled on CPU 0: every message names pci_interrupt_dest(). */
+uint32_t pci_interrupt_dest(void); /* CPU 0's APIC ID, any CPU (read by pci_init on CPU 0) */
+/* Deliver the function's interrupt as `vector` on CPU 0 through MSI or MSI-X (entry 0). */
 bool pci_msi_enable(struct pci_device *d, uint8_t vector);
 /* Number of messages the device's MSI capability supports (1, 2, 4 .. 32), 0 without MSI. */
 unsigned pci_msi_max_vectors(const struct pci_device *d);
@@ -175,7 +176,8 @@ bool pci_requests_done(const struct pci_device *d);
    A sleep or a bus reset in between counts as no FLR (pci_resume, pci_bus_reset). A function
    without FLR whose configuration a bus reset left held gets it back once it answers, and the
    call is false. This resets device state, not an IOMMU drain confirmation: its success alone
-   must not release quarantined DMA pages. May sleep, with cancellation during scheduler waits.
+   must not release quarantined DMA pages. May sleep, with cancellation during scheduler waits;
+   any CPU, holding no spinlock. Resets (this and pci_bus_reset) run one at a time.
    The Root Port above shows RRS during each call and then gets its former Root Control back;
    without one that supports it (an RCiEP, an RCRB root) the Root Complex retries inside the
    configuration read, which no cancellation can interrupt. */
@@ -185,7 +187,7 @@ bool pci_function_reset(struct pci_device *d);
    not answer after a Conventional Reset (pci_bus_reset, sleep). Its Bus Master Enable is off,
    cleared before its FLR or by the reset. The kernel reaches it only through its reset (its ACS
    is not read either, dev/iommu.c); the firmware's AML not at all while it answers RRS
-   (pci_config_blocked). What remains is a Conventional Reset (pci_bus_reset). */
+   (pci_config_firmware_*). What remains is a Conventional Reset (pci_bus_reset). */
 bool pci_reset_stuck(const struct pci_device *d);
 /* The Downstream Port whose Secondary Bus Reset resets d (pci_bus_reset), or NULL: d is not
    right below a Root Port or a Switch Downstream Port; that port's link leads to a hot-plug
@@ -212,14 +214,23 @@ struct pci_device *pci_bus_reset_port(const struct pci_device *d);
    which are not known here: 6.6.1, PCI Local Bus 3.0 4.3.2), or the port is in reset already or
    set to Enter Compliance (4.2.7.2.2). */
 bool pci_bus_reset(struct pci_device *port);
-/* True while bus:dev.func is kept from software other than its reset's (AML's PCI_Config
-   regions, dev/acpi.c), which drops the access: during a reset attempt or a bus reset, up to the
-   readiness limit of an FLR issued, and while it last answered RRS (until its Vendor ID read,
-   repeated here, gives its ID). The first refusal during each reset is logged. */
-bool pci_config_blocked(uint8_t bus, uint8_t dev, uint8_t func);
-/* Sleep (dev/pm.c): save every function's configuration before S3, write it back after (BSP,
-   before the drivers resume). pci_suspend allocates and so runs with interrupts on; it returns
-   NULL, or what could not be saved (the sleep is then called off and pci_resume writes nothing).
+/* A configuration access by software other than the function's reset (AML's PCI_Config regions,
+   dev/acpi.c), from any CPU: false, and nothing reaches bus:dev.func, while it is kept from such
+   software: during a reset attempt or a bus reset, up to the readiness limit of an FLR issued,
+   and while it last answered RRS (until its Vendor ID read, repeated here, gives its ID). The
+   check and the access are one step: a reset that begins on another CPU waits for an access
+   under way. A read gives the dword at off & ~3 (all-ones when dropped); a write is bytes wide
+   (1, 2 or 4) at off aligned to it. The first refusal during each reset is logged. */
+bool pci_config_firmware_read(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t *v);
+bool pci_config_firmware_write(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t v, unsigned bytes);
+/* A driver's read of another function on its path (dev/pciuser.c): false while d has a reset
+   record (d->reset: a reset under way, or one left to finish), checked and read in one step like
+   the firmware's accesses. The dword at off & ~3. */
+bool pci_config_read_unless_reset(const struct pci_device *d, uint16_t off, uint32_t *v);
+/* Sleep (dev/pm.c): save every function's configuration before S3, write it back after (CPU 0,
+   every other CPU parked, before the drivers resume). pci_suspend allocates and so runs with
+   interrupts on; it returns NULL, or what could not be saved or why not (a reset under way: the
+   sleep is then called off and pci_resume writes nothing).
    slept: the machine went to sleep, or a hibernation image was restored (machine_sleep).
    remake: the IOMMU's units did not come back (iommu_resume): each function's messages are made
    again from what they were given (iommu_msi_message), one that cannot be is left off, and a
