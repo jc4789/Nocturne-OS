@@ -67,6 +67,20 @@ const char *kernel_cmdline = "";
 void apic_init(const struct limine_mp_response *mp);
 void kmain_late(void);
 
+/* CPU 0 from here on its boot task's own stack (sys/sched.h), as each other CPU from ap_entry. */
+static NORETURN void kmain_scheduled(void *unused) {
+    (void)unused;
+    alarm_init_cpu(); /* CPU 0's wake device: no periodic tick on any CPU */
+    prof_init();      /* before the APs: each starts its samples as it comes up */
+    pstate_init_bsp();
+    smp_init(mp_req.response);
+    sti();
+    input_init();
+
+    kmain_late();
+    sched_idle(); /* the boot context is CPU 0's idle task */
+}
+
 static const char *memtype(uint64_t t) {
     static const char *n[] = {"usable", "reserved", "ACPI reclaim", "ACPI NVS", "bad", "bootloader", "kernel+modules", "framebuffer", "reserved-mapped"};
     return t < ARRAY_SIZE(n) ? n[t] : "?";
@@ -139,13 +153,5 @@ void kmain(void) {
     ioapic_init();
     apic_init(mp_req.response);
     sched_init();
-    alarm_init_cpu(); /* CPU 0's wake device: no periodic tick on any CPU */
-    prof_init();      /* before the APs: each starts its samples as it comes up */
-    pstate_init_bsp();
-    smp_init(mp_req.response);
-    sti();
-    input_init();
-
-    kmain_late();
-    sched_idle(); /* the boot context is CPU 0's idle task */
+    cpu_switch_stack(sched_cpu_stack(0), kmain_scheduled, NULL); /* the bootloader's is left */
 }

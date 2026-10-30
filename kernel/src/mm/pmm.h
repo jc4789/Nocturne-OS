@@ -9,8 +9,9 @@ void pmm_init(struct limine_memmap_response *mm); /* after percpu_init (arch/per
 /* One frame; 0 when there is none. */
 uint64_t pmm_alloc(void);
 uint64_t pmm_alloc_zeroed(void);
-/* One frame whose whole page has an address of at most bits bits (a device's DMA width; 64: any). */
-uint64_t pmm_alloc_within(unsigned bits);
+/* One frame from node's memory first, then the nearest (through the calling CPU's cache when node
+   is its home): for memory another CPU will use. 0 when there is none. */
+uint64_t pmm_alloc_node(unsigned node);
 /* count contiguous frames whose addresses have at most bits bits, at an address that is a multiple
    of the power of two at or above count pages; 0 when there is no such run. */
 uint64_t pmm_alloc_contig(uint64_t count, unsigned bits);

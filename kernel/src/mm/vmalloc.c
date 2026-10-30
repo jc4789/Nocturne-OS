@@ -13,7 +13,9 @@
    lock guards the three; it is a spinlock (vfree under others' spinlocks), held for tree steps
    only: records are allocated before it is taken and freed after. */
 #include "kernel.h"
+#include "arch/smp.h"
 #include "arch/spin.h"
+#include "arch/topology.h"
 #include "lib/span.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
@@ -158,16 +160,19 @@ static void unfilled(uint64_t va, size_t pages, size_t mapped, bool frames) {
     give_back_now(a);
 }
 
-void *vmalloc(size_t pages) {
+void *vmalloc(size_t pages) { return vmalloc_node(pages, topology.cpu[cpu_current_index()].home); }
+
+void *vmalloc_node(size_t pages, unsigned node) {
     uint64_t va = take(pages, true);
     if (!va) return NULL;
     for (size_t i = 0; i < pages; i++) {
-        uint64_t frame = pmm_alloc_zeroed();
+        uint64_t frame = pmm_alloc_node(node);
         if (!frame || !vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, frame, PTE_W | PTE_NX)) {
             if (frame) pmm_free(frame);
             unfilled(va, pages, i, true);
             return NULL;
         }
+        memset(phys_to_virt(frame), 0, PAGE_SIZE);
     }
     return (void *)va;
 }

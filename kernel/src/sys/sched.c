@@ -227,9 +227,14 @@ static struct task *task_record(void) {
     return t;
 }
 
-static struct task *idle_task_new(const char *name) {
+static struct task *idle_task_new(const char *name, unsigned cpu) {
     struct task *t = task_record();
     if (!t) return NULL;
+    t->kstack = vmalloc_node(KSTACK_PAGES, topology.cpu[cpu].home);
+    if (!t->kstack) {
+        kfree(t);
+        return NULL;
+    }
     t->handles = t->initial_handles;
     t->handle_capacity = INITIAL_HANDLES;
     t->is_idle = true;
@@ -250,8 +255,12 @@ bool sched_cpu_prepare(unsigned cpu) {
     if (per_cpu(queue, cpu).prepared) return true;
     char name[16];
     ksnprintf(name, sizeof name, "idle%u", cpu);
-    struct task *idle = idle_task_new(name);
+    struct task *idle = idle_task_new(name, cpu);
     return idle && queue_prepare(cpu, idle);
+}
+
+uint64_t sched_cpu_stack(unsigned cpu) {
+    return (uint64_t)per_cpu(queue, cpu).idle->kstack + KSTACK_PAGES * PAGE_SIZE;
 }
 
 /* The CPU other than self with the most waiting tasks, at least at_least of them; self when none. */
@@ -600,7 +609,7 @@ static void task_free(struct task *t) {
         if (t->process && t->process != t && t->process->pml4 == t->pml4)
             mmap_hole_add(t->process, t->user_stack - PAGE_SIZE, t->user_stack_size + 2 * PAGE_SIZE);
     }
-    if (t->kstack) kstack_free(t->kstack); /* an idle task runs on its CPU's own stack */
+    if (t->kstack) kstack_free(t->kstack);
     handle_table_free(t);
     kfree((void *)t->allowed.words);
     kfree(t);
@@ -651,6 +660,7 @@ void sched_init(void) {
     boot->pid = next_pid++;
     boot->is_idle = true;
     strlcpy(boot->name, "idle0", sizeof boot->name);
+    if (!(boot->kstack = vmalloc(KSTACK_PAGES))) panic("sched: no memory");
     boot->state = TASK_RUNNING;
     boot->pml4 = kernel_pml4;
     alarm_init(&boot->wake_alarm, wake_fire);
@@ -784,9 +794,10 @@ static bool wq_sleep(struct wait_queue *wq, const uint64_t *word, uint64_t seen,
     if (!sleep) return true;
     if (deadline != CLOCK_NEVER) alarm_set(&t->wake_alarm, deadline);
     if (t->is_idle) {
-        /* An idle task (the boot task) has no stack of its own to sleep on: it stays in wq and lets
-           this CPU's other tasks run, halting in between, until a waker takes it out and kicks
-           this CPU (sched_make_ready), or its alarm does. */
+        /* An idle task (the boot task) cannot leave its CPU's queue to sleep, being what runs when
+           nothing else does: it stays in wq and lets this CPU's other tasks run, halting in
+           between, until a waker takes it out and kicks this CPU (sched_make_ready), or its
+           alarm does. */
         while (__atomic_load_n(&t->wq, __ATOMIC_ACQUIRE)) {
             __asm__ volatile("sti; hlt; cli" : : : "memory");
             schedule();

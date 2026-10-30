@@ -176,6 +176,10 @@ static inline uint64_t user_gs_base_read(void) {
 }
 static inline void user_gs_base_write(uint64_t v) { __asm__ volatile("swapgs; wrgsbase %0; swapgs" : : "r"(v) : "memory"); }
 
+/* Onto the stack below top (aligned down to 16), calling entry(argument), which does not return
+   (arch/smp.asm): a CPU leaving the stack the bootloader started it on for its idle task's. */
+__attribute__((noreturn)) void cpu_switch_stack(uint64_t top, void (*entry)(void *), void *argument);
+
 /* Each CPU's stacks for the exceptions that may come where the stack in use cannot be trusted
    (the TSS's IST, arch/gdt.c): NMI, #DB and #MC anywhere, #DF after a stack went bad. */
 enum { IST_DOUBLE_FAULT = 1, IST_NMI, IST_DEBUG, IST_MACHINE_CHECK, IST_STACKS = IST_MACHINE_CHECK };

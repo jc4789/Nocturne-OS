@@ -402,6 +402,16 @@ static struct frame *run(uint64_t count, uint64_t bands, unsigned home) {
     return from_nodes(home, count, order, bands);
 }
 
+uint64_t pmm_alloc_node(unsigned node) {
+    if (node == this_cpu(cpu_cache).node) return pmm_alloc();
+    struct frame *f = run(1, ~0ull, node);
+    if (!f) {
+        drain_all();
+        f = run(1, ~0ull, node);
+    }
+    return f ? f->pfn * PAGE_SIZE : 0;
+}
+
 uint64_t pmm_alloc_contig(uint64_t count, unsigned bits) {
     uint64_t bands = bands_within(bits);
     unsigned home = this_cpu(cpu_cache).node;

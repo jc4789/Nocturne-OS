@@ -9,6 +9,8 @@ void vmalloc_purge_start(void); /* once threads run */
 
 /* pages zeroed frames; NULL without memory. Any context but an interrupt handler. */
 void *vmalloc(size_t pages);
+/* As vmalloc, the frames from node's memory first (mm/pmm.h): for memory another CPU will use. */
+void *vmalloc_node(size_t pages, unsigned node);
 /* What vmalloc gave, with its size. Changes no page table and waits for nothing: any context, a
    holder of spinlocks too. The addresses and frames come back after a TLB shootdown. */
 void vfree(void *p, size_t pages);

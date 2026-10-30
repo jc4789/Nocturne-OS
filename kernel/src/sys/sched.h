@@ -110,6 +110,9 @@ static inline struct task *task_process(void) {
    blocks, yields or goes back to ring 3. */
 void sched_init(void);                 /* CPU 0, at boot: its queue, the boot context as its idle task */
 bool sched_cpu_prepare(unsigned cpu);  /* CPU 0, before that CPU starts: its queue and idle task */
+/* The top of cpu's idle task's stack, a kernel stack as every task's, on the CPU's home node: a CPU
+   moves onto it from the bootloader's (arch/cpu.h), and starts on it again after a sleep. */
+uint64_t sched_cpu_stack(unsigned cpu);
 NORETURN void sched_cpu_start(void);   /* a CPU starting: its idle task from here on */
 NORETURN void sched_idle(void);        /* the idle task's loop (CPU 0's after boot) */
 bool sched_cpu_idle(unsigned cpu);     /* running its idle task now (a hint) */

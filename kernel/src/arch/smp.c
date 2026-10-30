@@ -21,7 +21,6 @@
 #include "arch/pat.h"
 #include "arch/wake.h"
 
-#define AP_STACK_SIZE (32 * 1024)
 #define START_TIMEOUT_MS 2000
 #define PARK_TIMEOUT_MS 2000
 
@@ -30,7 +29,6 @@ struct cpu_slot {
     uint32_t start;  /* START_: where it is in being started */
     uint32_t parked;
     bool asleep; /* parked for a sleep: smp_resume starts it again */
-    uint8_t stack[AP_STACK_SIZE] __attribute__((aligned(16))); /* its idle task's stack */
 };
 PERCPU static struct cpu_slot slot;
 
@@ -46,7 +44,6 @@ static unsigned detected = 1;
 static uint64_t bsp_pat;
 static struct wake_cpu *restart; /* smp_suspend to smp_resume: the rows of the CPUs to start again */
 
-extern NORETURN void smp_switch_stack(uint64_t top, void (*entry)(void *), void *argument);
 extern uint8_t __percpu_start[], __percpu_end[];
 
 void percpu_load(unsigned cpu) {
@@ -258,8 +255,8 @@ static NORETURN void ap_main(void *argument) {
     mtrr_sync(); /* after a sleep the firmware's memory types may be gone: the BSP's again */
     pat_init_cpu(); /* same PAT as the BSP before any MMIO/WC mapping is touched */
     if (rdmsr(MSR_PAT) != bsp_pat) fail(c);
-    /* The kernel's tables before any of its memory is used: the bootloader's, which a CPU it
-       started runs on, map the direct map and the image only, no heap and no vmalloc range. */
+    /* The kernel's tables, at PCID 0: at boot ap_entry loaded them; after a sleep the wake page's
+       are in use (arch/wake.c), which map the kernel half and the low page only. */
     write_cr3(kernel_pml4);
     vmm_init_cpu();
     gdt_init_cpu(index);
@@ -278,10 +275,14 @@ static NORETURN void ap_main(void *argument) {
     sched_cpu_start(); /* this CPU's idle task from here on */
 }
 
+/* On the bootloader's stack and tables, which map the direct map and the image only: the kernel's
+   tables first, whose leaves may be NX (EFER.NXE before them), for its idle task's stack in
+   vmalloc; the rest of its start on that stack. */
 static NORETURN void ap_entry(struct limine_mp_info *info) {
     unsigned index = (unsigned)info->extra_argument;
-    struct cpu_slot *c = &per_cpu(slot, index);
-    smp_switch_stack((uint64_t)c->stack + sizeof c->stack, ap_main, (void *)(uintptr_t)index);
+    wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_NXE);
+    write_cr3(kernel_pml4);
+    cpu_switch_stack(sched_cpu_stack(index), ap_main, (void *)(uintptr_t)index);
 }
 
 /* CPU 0, after starting count CPUs (their slots waiting) with before CPUs online: waits for
@@ -388,7 +389,7 @@ void smp_resume(void) {
             continue;
         }
         /* ap_main as if called: the return address slot below an aligned top */
-        restart[rows++] = (struct wake_cpu){.stack = (uint64_t)c->stack + sizeof c->stack - 8, .arg = i, .apic_id = apic_id};
+        restart[rows++] = (struct wake_cpu){.stack = sched_cpu_stack(i) - 8, .arg = i, .apic_id = apic_id};
         __atomic_store_n(&c->start, START_WAITING, __ATOMIC_RELAXED);
     }
     if (rows) {
