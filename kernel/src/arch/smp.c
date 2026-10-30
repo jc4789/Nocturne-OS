@@ -6,6 +6,7 @@
 #include "arch/fpu.h"
 #include "arch/smp.h"
 #include "arch/spin.h"
+#include "arch/topology.h"
 #include "limine.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
@@ -425,21 +426,22 @@ void smp_init(struct limine_mp_response *response) {
     cpus[0].apic_id = response->bsp_lapic_id;
     cpus[0].ready = 1;
     bsp_pat = rdmsr(MSR_PAT);
-    for (uint64_t i = 0; i < response->cpu_count && slots < CPU_MAX_COUNT; i++) {
-        struct limine_mp_info *info = response->cpus[i];
-        if (!info || info->lapic_id == cpus[0].apic_id || !lapic_addressable(info->lapic_id)) continue;
-        bool duplicate = false;
-        for (unsigned j = 1; j < slots; j++) if (cpus[j].apic_id == info->lapic_id) duplicate = true;
-        if (duplicate) continue;
-        struct cpu_slot *slot = &cpus[slots];
-        slot->index = slots++;
-        slot->apic_id = info->lapic_id;
+    /* slot i is topology's CPU i (the first CPU is its 0): what is kept per CPU is found by it */
+    slots = MIN(topology.cpus, CPU_MAX_COUNT);
+    for (unsigned i = 1; i < slots; i++) {
+        cpus[i].index = i;
+        cpus[i].apic_id = topology.cpu[i].apic_id;
     }
     for (unsigned i = 1; i < slots; i++) {
         struct cpu_slot *slot = &cpus[i];
         struct limine_mp_info *info = NULL;
         for (uint64_t j = 0; j < response->cpu_count; j++)
             if (response->cpus[j] && response->cpus[j]->lapic_id == slot->apic_id) info = response->cpus[j];
+        if (!info || !lapic_addressable(slot->apic_id)) {
+            kprintf("smp: cpu%u (APIC ID %u) %s; excluded\n", i, slot->apic_id,
+                    info ? "cannot be sent an interrupt" : "is not in the bootloader's list");
+            continue;
+        }
         if (!sched_cpu_prepare(i)) {
             kprintf("smp: cpu%u has no memory for its scheduler; excluded\n", i);
             continue;

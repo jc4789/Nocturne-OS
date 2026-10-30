@@ -54,7 +54,7 @@ static void draw_banner(void) {
 
 void fbcon_init(void) {
     uint64_t bytes = (uint64_t)fb.width * fb.height * 4;
-    uint64_t phys = pmm_alloc_contig(ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE);
+    uint64_t phys = pmm_alloc_contig(ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE, 64);
     if (!phys) return;
     gfx_init(&cv, phys_to_virt(phys), fb.width, fb.height, fb.width);
     top = BANNER_H + 4;

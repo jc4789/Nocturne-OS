@@ -323,7 +323,7 @@ static int blk_ahci_persist(struct blkdev *b) {
 }
 
 static uint64_t alloc_dma(struct hba *h, unsigned pages) {
-    return h->s64 ? pmm_alloc_contig(pages) : pmm_alloc_contig_below(pages, 1ull << 32);
+    return pmm_alloc_contig(pages, h->s64 ? 64 : 32);
 }
 
 /* IDENTIFY DEVICE (ACS-3 7.12): its size, sector size, commands and write cache. */

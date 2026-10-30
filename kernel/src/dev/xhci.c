@@ -240,18 +240,15 @@ static void *dma_page(uint64_t *phys) {
 }
 
 /* `pages` (at most 16) contiguous zeroed pages inside one 64 KiB block: no xHCI structure of up
- * to 64 KiB may span such a boundary (6.0, Table 6-1). Twice the run always holds one that fits;
- * the pages around it go back. */
+ * to 64 KiB may span such a boundary (6.0, Table 6-1). A run starts at a multiple of the power of
+ * two at or above its size, so one of at most 16 pages never crosses one. */
 static void *dma_block(unsigned pages, uint64_t *phys) {
-    uint64_t base = pmm_alloc_contig(pages * 2ull);
+    ASSERT(pages <= 16);
+    uint64_t base = pmm_alloc_contig(pages, 64);
     if (!base) return NULL;
-    uint64_t start = base, boundary = (base | 0xFFFF) + 1;
-    if (base + pages * 4096ull > boundary) start = boundary;
-    for (uint64_t p = base; p < base + pages * 2 * 4096ull; p += 4096)
-        if (p < start || p >= start + pages * 4096ull) pmm_free(p);
-    memset(phys_to_virt(start), 0, pages * 4096ull);
-    *phys = start;
-    return phys_to_virt(start);
+    memset(phys_to_virt(base), 0, pages * 4096ull);
+    *phys = base;
+    return phys_to_virt(base);
 }
 
 static bool ring_init(struct ring *r) {
@@ -619,7 +616,7 @@ static bool endpoint_buffer(struct endpoint *ep, unsigned len, unsigned count) {
     if (ep->buf) return ep->len >= len && ep->count >= count;
     if (!len || !count || count > EP_XFERS) return false;
     unsigned stride = (len + 63) & ~63u, pages = (stride * count + 4095) / 4096;
-    uint64_t phys = pmm_alloc_contig(pages);
+    uint64_t phys = pmm_alloc_contig(pages, 64);
     if (!phys) return false;
     ep->buf = phys_to_virt(phys);
     memset(ep->buf, 0, pages * 4096ull);

@@ -265,13 +265,16 @@ void ac97_init(void) {
     hw_init();
 
     /* descriptors and buffers, below 4 GiB for the 32-bit addresses */
-    uint64_t bdl = pmm_alloc_zeroed();
+    uint64_t bdl = pmm_alloc_contig(1, 32);
     uint64_t pages = ALIGN_UP(NBUF * BUF_FRAMES * AUDIO_FRAME, PAGE_SIZE) / PAGE_SIZE;
-    uint64_t buf_phys = pmm_alloc_contig(pages);
-    if (!bdl || !buf_phys || buf_phys + pages * PAGE_SIZE > 0x100000000ULL || bdl >= 0x100000000ULL) {
-        kprintf("audio: AC'97 found, but no memory for its buffers\n");
+    uint64_t buf_phys = pmm_alloc_contig(pages, 32);
+    if (!bdl || !buf_phys) {
+        if (bdl) pmm_free(bdl);
+        if (buf_phys) pmm_free_contig(buf_phys, pages);
+        kprintf("audio: AC'97 found, but no memory below 4 GiB for its buffers\n");
         return;
     }
+    memset(phys_to_virt(bdl), 0, PAGE_SIZE);
     volatile struct bd *bdl_ring = phys_to_virt(bdl);
     bufs = phys_to_virt(buf_phys);
     memset(bufs, 0, pages * PAGE_SIZE);

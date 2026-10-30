@@ -303,7 +303,7 @@ static void storvsc_start(struct vmbus_channel *ch) {
     struct storvsc *s = kzalloc(sizeof *s);
     if (!s) return;
     s->ch = ch;
-    s->bounce_pa = pmm_alloc_contig(BOUNCE_PAGES);
+    s->bounce_pa = pmm_alloc_contig(BOUNCE_PAGES, 64);
     if (!s->bounce_pa) return;
     s->bounce = phys_to_virt(s->bounce_pa);
     if (vmbus_open(ch, 64 * 1024, 64 * 1024, storvsc_callback, s)) return;

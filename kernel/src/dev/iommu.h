@@ -176,14 +176,13 @@ uint16_t *iommu_requester_ids(const struct pci_device *d, unsigned *n);
 void iommu_entry_write(volatile uint64_t *e, uint64_t v);
 void iommu_cache_flush(const volatile void *p, size_t bytes);
 /* Zeroed physically contiguous pages for hardware tables/queues. Addresses fit every unit's
-   physical width and the page-table format; freed with pmm_free, one page at a time. */
+   physical width and the page-table format; freed with pmm_free_contig. */
 uint64_t iommu_alloc_pages(size_t count);
 /* Whether physical start..end (exclusive) may hold RAM the OS owns (the allocator's, the
-   bootloader's, the modules'), where a structure the firmware left live may have been reused:
-   true also when the memory map was not kept whole, which is no evidence that it does not. */
+   bootloader's, the modules'), where a structure the firmware left live may have been reused. */
 bool iommu_os_ram(uint64_t start, uint64_t end);
-/* Exclusive physical ceiling for identity-mapped DMA; UINT64_MAX for an unisolated claim. */
-uint64_t iommu_dma_limit(const struct iommu_domain *dom);
+/* The bits an identity-mapped DMA address may have; 64 for an unisolated claim, 0 for none. */
+unsigned iommu_dma_bits(const struct iommu_domain *dom);
 /* Whether to log one more blocked request: a few a second, so a device that keeps sending
    them cannot drown the log. */
 bool iommu_fault_report(void);

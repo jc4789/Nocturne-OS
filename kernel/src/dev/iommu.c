@@ -230,25 +230,23 @@ uint64_t iommu_alloc_pages(size_t count) {
     /* Both back ends encode table addresses in bits 51:12. */
     if (bits > 52) bits = 52;
     if (!bits) return 0;
-    uint64_t limit = 1ull << bits;
-    uint64_t base = count == 1 ? pmm_alloc_below(limit) : pmm_alloc_contig_below(count, limit);
+    uint64_t base = pmm_alloc_contig(count, bits);
     if (base) memset(phys_to_virt(base), 0, count * PAGE_SIZE);
     return base;
 }
 
-uint64_t iommu_dma_limit(const struct iommu_domain *dom) {
-    if (!dom) return UINT64_MAX;
+unsigned iommu_dma_bits(const struct iommu_domain *dom) {
+    if (!dom) return 64;
     unsigned bits = MIN(hw->iova_bits, hw->phys_bits);
     unsigned indexed = shift_of(dom->levels) + 9;
     if (bits > indexed) bits = indexed;
     if (bits > 52) bits = 52; /* the leaf's physical address field */
-    return bits ? 1ull << bits : 0;
+    return bits;
 }
 
 static bool pages_fit(const struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count) {
-    uint64_t limit = iommu_dma_limit(dom);
-    if (!limit || count > SIZE_MAX / PAGE_SIZE) return false;
-    unsigned bits = 63 - __builtin_clzll(limit);
+    unsigned bits = iommu_dma_bits(dom);
+    if (!bits || count > SIZE_MAX / PAGE_SIZE) return false;
     if (!frames) return range_fits(base, count, bits);
     for (size_t i = 0; i < count; i++)
         if (!range_fits(frames[i], 1, bits)) return false;
@@ -704,7 +702,6 @@ static bool reserved_for(const struct reserved *r, const struct iommu_domain *do
 }
 
 bool iommu_os_ram(uint64_t start, uint64_t end) {
-    if (!pmm_ram_complete()) return true;
     const struct pmm_range *ram;
     unsigned count = pmm_ram_ranges(&ram);
     for (unsigned i = 0; i < count; i++)

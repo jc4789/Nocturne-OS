@@ -366,3 +366,18 @@ void topology_init(void) {
     read_levels();
     read_nodes(read_cpus());
 }
+
+unsigned topology_node_span(uint64_t at, uint64_t end, uint64_t *run_end) {
+    unsigned lo = 0, hi = topology.ranges;
+    while (lo < hi) { /* the first range that starts above at */
+        unsigned mid = lo + (hi - lo) / 2;
+        if (topology.range[mid].base <= at) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo && at < topology.range[lo - 1].end) {
+        *run_end = MIN(end, topology.range[lo - 1].end);
+        return topology.range[lo - 1].node;
+    }
+    *run_end = lo < topology.ranges ? MIN(end, topology.range[lo].base) : end;
+    return 0;
+}

@@ -23,8 +23,8 @@ struct pci_claim *pci_user_hold(struct handle *h);
 void pci_user_drop(struct pci_claim *c);
 bool pci_user_revoked(const struct pci_claim *c);
 bool pci_user_dma_reusable(const struct pci_claim *c);
-/* Exclusive physical address limit imposed by the attached IOMMU's translation widths. */
-uint64_t pci_user_dma_limit(const struct pci_claim *c);
+/* The bits a DMA address may have under the attached IOMMU's translation widths (64: no limit). */
+unsigned pci_user_dma_bits(const struct pci_claim *c);
 /* DMA pages made through the claim (frames, or count pages from base when frames is NULL): where
    an IOMMU isolates the function, its domain maps them at their physical addresses. unmap is
    false when the IOMMU did not confirm the function can no longer reach them. They take the

@@ -481,7 +481,7 @@ int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, 
     ch->ring_pages_out = (uint32_t)(ALIGN_UP(out_bytes, PAGE_SIZE) / PAGE_SIZE) + 1;
     ch->ring_pages_in = (uint32_t)(ALIGN_UP(in_bytes, PAGE_SIZE) / PAGE_SIZE) + 1;
     uint32_t total = ch->ring_pages_out + ch->ring_pages_in;
-    uint64_t pa = pmm_alloc_contig(total);
+    uint64_t pa = pmm_alloc_contig(total, 64);
     if (!pa) return -N_ERR_NO_MEMORY;
     ch->ring = phys_to_virt(pa);
     memset(ch->ring, 0, total * PAGE_SIZE);
@@ -554,7 +554,7 @@ static bool close_channel(struct vmbus_channel *ch, bool require_ack) {
        rescind. Preserve the existing close contract for other drivers. */
     if (ok) {
         uint64_t pa = hhdm_virt_to_phys(ch->ring);
-        for (uint32_t i = 0; i < ch->ring_pages_out + ch->ring_pages_in; i++) pmm_free(pa + (uint64_t)i * PAGE_SIZE);
+        pmm_free_contig(pa, ch->ring_pages_out + ch->ring_pages_in);
     }
     else kprintf("vmbus: preserving ring GPADL %x without teardown ACK\n", ch->ring_gpadl);
     ch->ring = NULL;

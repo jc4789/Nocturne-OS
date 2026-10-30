@@ -857,8 +857,8 @@ static bool amd_resume(void) {
 }
 
 static void tables_free(void) {
-    for (uint64_t at = 0; devtab && at < DT_BYTES; at += PAGE_SIZE) pmm_free(devtab + at);
-    for (size_t p = 0; sems && p < sem_pages; p++) pmm_free(sems + p * PAGE_SIZE);
+    if (devtab) pmm_free_contig(devtab, DT_BYTES / PAGE_SIZE);
+    if (sems) pmm_free_contig(sems, sem_pages);
     for (size_t i = 0; i < nunits; i++) {
         if (units[i].cmd) pmm_free(units[i].cmd);
         if (units[i].events) pmm_free(units[i].events);
@@ -1059,7 +1059,7 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
     if (ivinfo & 2) kprintf("iommu: the firmware protected memory from DMA with AMD-Vi before boot (IVinfo %x)\n", ivinfo);
     amd.iova_bits = MIN(amd.iova_bits, HOST_PAGE_SHIFT + HOST_INDEX_BITS * max_levels);
     /* HATS is a maximum, not a required depth. Domains currently use identity DMA;
-       iommu_dma_limit accepts only min(input, physical, PTE physical width). Retain
+       iommu_dma_bits accepts only min(input, physical, PTE physical width). Retain
        the real input capability, but do not walk levels that those mappings never use. */
     unsigned bits = MIN(amd.iova_bits, MIN(amd.phys_bits, HOST_PHYS_BITS));
     amd.levels = 1;

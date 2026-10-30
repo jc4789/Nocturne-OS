@@ -179,7 +179,7 @@ static bool transport_init(struct pci_device *d) {
     if (!(mmio_read8(&common->device_status) & 8)) return false;
 
     uint64_t ring_phys = pmm_alloc_zeroed();
-    packets_phys = pmm_alloc_contig(2);
+    packets_phys = pmm_alloc_contig(2, 64);
     if (!ring_phys || !packets_phys) return false;
     packets = phys_to_virt(packets_phys); memset(packets, 0, PAGE_SIZE * 2);
     desc = phys_to_virt(ring_phys);
@@ -338,7 +338,7 @@ static bool submit(struct stream *s) {
 }
 static void free_backing(uint64_t phys,uint32_t w,uint32_t h) {
     size_t pages=ALIGN_UP(n_gpu_frame_bytes(w,h),PAGE_SIZE)/PAGE_SIZE;
-    for(size_t i=0;i<pages;i++){pmm_free(phys+i*PAGE_SIZE);gpu_checkpoint();}
+    pmm_free_contig(phys,pages);
 }
 static bool retire_resource(uint32_t id) {
     struct {struct header h;uint32_t id,pad;} PACKED p={.h=hdr(0x203,true),.id=id};
@@ -362,14 +362,14 @@ static bool image_resource(bool input,uint32_t w,uint32_t h) {
     w=MAX(w,*cw);h=MAX(h,*ch); /* keep capacity for smaller subsequent frames */
     size_t bytes=n_gpu_frame_bytes(w,h);
     size_t pages=bytes && bytes<=UINT32_MAX?ALIGN_UP(bytes,PAGE_SIZE)/PAGE_SIZE:0;
-    uint64_t fresh=pages && pages<=pmm_free_pages()?pmm_alloc_contig(pages):0;
+    uint64_t fresh=pages && pages<=pmm_free_pages()?pmm_alloc_contig(pages,64):0;
     if(!fresh && (w!=requested_w || h!=requested_h)){
         /* Orthogonal image shapes must not inherit a huge cross-product
            allocation from unrelated earlier requests. Retry the exact shape
            when keeping both dimensions would exceed real available memory. */
         w=requested_w;h=requested_h;bytes=n_gpu_frame_bytes(w,h);
         pages=bytes && bytes<=UINT32_MAX?ALIGN_UP(bytes,PAGE_SIZE)/PAGE_SIZE:0;
-        fresh=pages && pages<=pmm_free_pages()?pmm_alloc_contig(pages):0;
+        fresh=pages && pages<=pmm_free_pages()?pmm_alloc_contig(pages,64):0;
     }
     if(!fresh)return false;
     uint32_t fresh_id=*phys?(input?(*id==3?5:3):(*id==1?4:1)):*id;

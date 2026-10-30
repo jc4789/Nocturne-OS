@@ -42,3 +42,6 @@ struct topology {
 extern struct topology topology;
 
 void topology_init(void); /* the first CPU: after acpi_tables_init, before the page allocator */
+/* The node of the memory at physical at, and in *run_end where its run on that node ends, at most
+   end. Memory no SRAT range describes is node 0's. */
+unsigned topology_node_span(uint64_t at, uint64_t end, uint64_t *run_end);

@@ -962,7 +962,7 @@ static bool queues_address_safe(void) {
 static void handoff_free(struct unit *u) {
     if (!u->handoff) return;
     size_t pages = ((size_t)1 << (u->handoff_config & IQA_QS)) + 1;
-    for (size_t i = 0; i < pages; i++) pmm_free(u->handoff + i * PAGE_SIZE);
+    pmm_free_contig(u->handoff, pages);
     u->handoff = 0;
 }
 
@@ -1209,8 +1209,8 @@ static bool intel_resume(void) {
 }
 
 static void tables_free(void) {
-    for (size_t p = 0; sems && p < sem_pages; p++) pmm_free(sems + p * PAGE_SIZE);
-    for (unsigned at = 0; irt && at < IRT_ENTRIES * 16; at += PAGE_SIZE) pmm_free(irt + at);
+    if (sems) pmm_free_contig(sems, sem_pages);
+    if (irt) pmm_free_contig(irt, IRT_ENTRIES * 16 / PAGE_SIZE);
     for (size_t i = 0; i < nunits; i++) {
         if (units[i].root) pmm_free(units[i].root);
         if (units[i].pass) pmm_free(units[i].pass);

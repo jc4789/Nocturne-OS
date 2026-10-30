@@ -388,7 +388,7 @@ struct pci_claim *pci_user_hold(struct handle *h) {
 void pci_user_drop(struct pci_claim *c) { if (c) claim_drop(c); }
 bool pci_user_revoked(const struct pci_claim *c) { return c && __atomic_load_n(&c->released, __ATOMIC_SEQ_CST); }
 bool pci_user_dma_reusable(const struct pci_claim *c) { return !c || !__atomic_load_n(&c->dma_unsafe, __ATOMIC_ACQUIRE); }
-uint64_t pci_user_dma_limit(const struct pci_claim *c) { return iommu_dma_limit(c->domain); }
+unsigned pci_user_dma_bits(const struct pci_claim *c) { return iommu_dma_bits(c->domain); }
 bool pci_user_dma_map(struct pci_claim *c, const uint64_t *frames, uint64_t base, size_t count) {
     return !c->domain || iommu_map(c->domain, frames, base, count);
 }

@@ -295,7 +295,7 @@ static void netvsc_rescind(struct vmbus_channel *ch) {
 static void free_buffer(uint8_t *buffer, uint32_t pages) {
     if (!buffer) return;
     uint64_t pa = hhdm_virt_to_phys(buffer);
-    for (uint32_t i = 0; i < pages; i++) pmm_free(pa + (uint64_t)i * PAGE_SIZE);
+    pmm_free_contig(pa, pages);
 }
 
 static void netvsc_shutdown(void) {
@@ -576,7 +576,7 @@ static bool setup_buffers(void) {
     uint32_t v[NVSP_MSG_SIZE / 4] = {NVSP_SEND_NDIS_VERSION, ndis >> 16, ndis & 0xFFFF};
     if (vmbus_send(nv.ch, VM_PKT_DATA_INBAND, 0, v, sizeof v, 0)) return false;
 
-    uint64_t pa = pmm_alloc_contig(RECV_BUF_PAGES);
+    uint64_t pa = pmm_alloc_contig(RECV_BUF_PAGES, 64);
     if (!pa) return false;
     nv.recv_buf = phys_to_virt(pa);
     nv.recv_size = RECV_BUF_PAGES * PAGE_SIZE;
@@ -591,7 +591,7 @@ static bool setup_buffers(void) {
         return false;
     }
 
-    pa = pmm_alloc_contig(SEND_BUF_PAGES);
+    pa = pmm_alloc_contig(SEND_BUF_PAGES, 64);
     if (!pa) return false;
     nv.send_buf = phys_to_virt(pa);
     memset(nv.send_buf, 0, SEND_BUF_PAGES * PAGE_SIZE);

@@ -115,7 +115,7 @@ static bool queue_init(struct queue *q, uint16_t qid, uint16_t size) {
     q->qid = qid;
     q->size = size;
     if (!q->sq) {
-        if (!(q->sq_phys = pmm_alloc_contig(1)) || !(q->cq_phys = pmm_alloc_contig(1))) return false;
+        if (!(q->sq_phys = pmm_alloc_contig(1, 64)) || !(q->cq_phys = pmm_alloc_contig(1, 64))) return false;
         q->sq = phys_to_virt(q->sq_phys);
         q->cq = phys_to_virt(q->cq_phys);
     }
@@ -370,7 +370,7 @@ static void start(struct nvme *c) {
         kprintf("nvme%d: no NVM command set or no 4 KiB pages (capabilities %lx), skipped\n", c->index, cap);
         return;
     }
-    if (!(c->data_phys = pmm_alloc_contig(XFER_PAGES)) || !(c->prp_phys = pmm_alloc_contig(1))) return;
+    if (!(c->data_phys = pmm_alloc_contig(XFER_PAGES, 64)) || !(c->prp_phys = pmm_alloc_contig(1, 64))) return;
     c->data = phys_to_virt(c->data_phys);
     c->prp = phys_to_virt(c->prp_phys);
     c->vector = (uint8_t)(VEC_NVME + c->index);

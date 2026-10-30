@@ -96,6 +96,7 @@ void kmain(void) {
     bootmem_init(mm);
     acpi_tables_init(mm);
     topology_init();
+    bootmem_by_node();
     pmm_init(mm);
     vmm_init(mm, ka_req.response);
     wake_init(); /* the real-mode page for waking from sleep and restarting the APs */

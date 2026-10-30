@@ -145,7 +145,6 @@ const char *hibernate_blocker(void) {
     if (!wake_available() || !wake_spare_page()) return "no room below 1 MiB";
     const char *vm = vm_hibernate_blocker();
     if (vm) return vm;
-    if (!pmm_ram_complete()) return "the memory map has more ranges than can be saved";
     if (!store_raw_possible()) return "C: is not on a disk";
     return NULL;
 }
@@ -180,7 +179,7 @@ static bool disk_flush(void) { return blk_persist(h.image.disk) >= 0; }
 
 /* ---- memory set aside ---- */
 static void *nosave_pages(uint64_t n) {
-    uint64_t p = n == 1 ? pmm_alloc() : pmm_alloc_contig(n);
+    uint64_t p = n == 1 ? pmm_alloc() : pmm_alloc_contig(n, 64);
     if (!p) return NULL;
     for (uint64_t i = 0; i < n; i++) set_bit(h.nosave, p / PAGE_SIZE + i);
     return phys_to_virt(p);
@@ -544,8 +543,6 @@ void hibernate_restore(void) {
     if (found < 0 || !(h.stage = kmalloc(STAGE_BYTES)) || disk_at(0, h.stage, PAGE_SIZE, false) < 0) goto drop;
     memcpy(&hd, h.stage, sizeof hd);
     if ((why = check(&hd))) goto drop;
-    why = "the memory map has more ranges than can be restored";
-    if (!pmm_ram_complete()) goto drop;
     why = "the image is damaged";
     if (hd.data_off + hd.data_bytes > h.image.size) goto drop;
 

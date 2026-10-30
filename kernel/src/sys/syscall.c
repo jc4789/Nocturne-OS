@@ -521,7 +521,7 @@ static void shared_release(struct object *o) {
                 for(size_t j=0;j<SHARED_LEAF;j++)if(leaf[j])pmm_free(leaf[j]);}
             pmm_free(p->pages[i]);
         }
-        if(p->kind==SHARED_RANGE && p->owned && !keep)for(size_t i=0;i<p->count;i++)pmm_free(p->base+i*PAGE_SIZE);
+        if(p->kind==SHARED_RANGE && p->owned && !keep)pmm_free_contig(p->base,p->count);
         object_unref(p->parent);
         for(size_t i=0;i<p->part_count;i++)object_unref(p->parts[i].object);
         for(size_t i=0;i<p->dependency_count;i++)scope_drop(p->dependencies[i]);
@@ -840,8 +840,8 @@ static int64_t sys_pci_bar(int h,uint32_t bar) {
     r=shared_open(p,true,&range);
     return new_handle(r,range);
 }
-/* Zeroed RAM a claimed function may reach by DMA. A contiguous run is allocated whole;
-   independent pages use the allocator's hint even with a device/IOMMU address ceiling. */
+/* Zeroed RAM a claimed function may reach by DMA, within the device's and the IOMMU's address
+   width. A contiguous run is allocated whole. */
 static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
     struct handle *pci=handle_get(h);
     if(!pci)return -N_ERR_NO_HANDLE;
@@ -852,15 +852,13 @@ static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
     else if(ALIGN_UP(bytes,PAGE_SIZE)/PAGE_SIZE>pmm_free_pages())r=-N_ERR_NO_MEMORY;
     if(r<0){pci_user_drop(claim);return r;}
     bytes=ALIGN_UP(bytes,PAGE_SIZE);size_t count=bytes/PAGE_SIZE;
-    uint64_t limit=flags&N_DMA_32BIT?0x100000000ull:UINT64_MAX;
-    uint64_t iommu_limit=pci_user_dma_limit(claim);
-    if(iommu_limit<limit)limit=iommu_limit;
+    unsigned bits=MIN(flags&N_DMA_32BIT?32u:64u,pci_user_dma_bits(claim));
     struct shared_pages *p;
     if(flags&N_DMA_CONTIGUOUS){
-        uint64_t base=pmm_alloc_contig_below(count,limit);
+        uint64_t base=pmm_alloc_contig(count,bits);
         if(!base){pci_user_drop(claim);return -N_ERR_NO_MEMORY;}
         if(!(p=shared_new(bytes,SHARED_RANGE,0))){
-            for(size_t i=0;i<count;i++)pmm_free(base+i*PAGE_SIZE);
+            pmm_free_contig(base,count);
             pci_user_drop(claim);return -N_ERR_NO_MEMORY;
         }
         p->claim=claim;
@@ -870,7 +868,7 @@ static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
         if(!(p=shared_new(bytes,SHARED_RAM,count))){pci_user_drop(claim);return -N_ERR_NO_MEMORY;}
         p->claim=claim;
         for(;p->count<count;p->count++){
-            uint64_t frame=pmm_alloc_below(limit);
+            uint64_t frame=pmm_alloc_contig(1,bits);
             if(!frame){shared_release(&p->object);return -N_ERR_NO_MEMORY;}
             memset(phys_to_virt(frame),0,PAGE_SIZE);
             p->pages[p->count]=frame;
