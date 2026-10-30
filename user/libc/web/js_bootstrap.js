@@ -151,7 +151,7 @@
     Object.assign(Event.prototype, {NONE:0, CAPTURING_PHASE:1, AT_TARGET:2, BUBBLING_PHASE:3});
     /* @include js_error_event.js */
     /* @include js_promise_rejection.js */
-    const rejectionBridge=promiseRejectionBridge(event=>dispatch(globalThis,event),host.promiseIsHandled,fn=>setTimeout(fn,0));
+    const rejectionBridge=promiseRejectionBridge(event=>dispatch(globalThis,event),host.promiseIsHandled,fn=>host.timer(0,fn,0,[]));
     /* @include js_custom_event.js */
     const CustomEvent=customEventInterface(Event,eventState);
     class UIEvent extends Event {
@@ -1457,8 +1457,9 @@
     document.location=location;
     /* @include js_console.js */
     const console=consoleNamespace((level,values)=>host.log(level,...values),()=>host.now());
-    const timer=(kind,fn,ms,args)=>{const callback=typeof fn==='function'?fn:new Function(String(fn));return host.timer(kind,kind===2?callback:function(){return apply(callback,this,args);},Number(ms)||0,[]);};
-    function setTimeout(fn,ms,...args){return timer(0,fn,ms,args);}function setInterval(fn,ms,...args){return timer(1,fn,ms,args);}
+    // The timeout is a Web IDL long (ToInt32: 2**32 is 0). Kinds as js.c's struct js_timer: 3 setTimeout, 1 setInterval, 2 an animation frame.
+    const timer=(kind,fn,ms,args)=>{const callback=typeof fn==='function'?fn:new Function(String(fn));return host.timer(kind,kind===2?callback:function(){return apply(callback,this,args);},ms|0,[]);};
+    function setTimeout(fn,ms,...args){return timer(3,fn,ms,args);}function setInterval(fn,ms,...args){return timer(1,fn,ms,args);}
     function clearTimeout(id){host.clear(Number(id));}function clearInterval(id){host.clear(Number(id));}
     function requestAnimationFrame(fn){if(typeof fn!=='function')throw new TypeError('Expected callback');return timer(2,fn,16,[]);}
     function cancelAnimationFrame(id){host.clear(Number(id));}

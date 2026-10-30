@@ -37,6 +37,8 @@
 #define NBUF       32
 #define BUF_FRAMES 480 /* 10 ms */
 #define AHEAD      6   /* buffers queued past the playing one */
+#define LOW        2   /* fewer queued past the playing one: the engine soon runs dry, mix what there is */
+#define TAKE_MARGIN 192 /* PICB samples (2 ms): the playing buffer may end before a take-back is done */
 
 struct bd {
     uint32_t addr;
@@ -102,12 +104,15 @@ static void ac97_fill(void) {
     /* On first start/reset PIV is 0 and lvi is 31. After a complete drain PIV
        is the successor of lvi. Only these unpublished successors are writable.
        While live, a stale CIV can only under-estimate room as DMA advances. */
-    int room = dma_live ? AHEAD - ((lvi - civ) & (NBUF - 1)) : AHEAD;
-    while (!remote && room-- > 0 && audio_pending()) {
+    int queued = dma_live ? (lvi - civ) & (NBUF - 1) : 0, room = AHEAD - queued;
+    /* Whole buffers while the engine has enough queued: a stream fed a little at a time (Web
+       Audio's quanta) is not cut into sound and silence (audio.h, audio_ready). */
+    while (!remote && room-- > 0 && audio_ready(BUF_FRAMES, queued < LOW)) {
         int next = (lvi + 1) & (NBUF - 1);
         if (!audio_card_mix(bufs + next * BUF_FRAMES * 2, BUF_FRAMES)) break;
         submitted_frames+=BUF_FRAMES;
         lvi = next;
+        queued++;
         filled++;
     }
     if (filled) {
@@ -121,6 +126,29 @@ static void ac97_fill(void) {
     }
     /* The extra raw after-snapshot is opt-in only, not normal sink traffic. */
     if (audio_trace_active) audio_trace_ac97(before, inw(nabm + PO_SR), filled, restarted);
+}
+
+/* Where the PCM the engine has not begun to fetch starts (audio.h, audio_set_card). CIV plays
+   and the ICH fetches the descriptor at PIV, CIV + 1, ahead of it; the first that can still be
+   written is CIV + 2, or CIV + 3 when CIV is about to end and the engine may move on meanwhile.
+   With take, LVI goes back to the descriptor before it: the engine stops there unless fill()
+   issues more. Not while halted: nothing is queued then. */
+static uint64_t ac97_unissue(bool take) {
+    if (!dma_live || !hw_ready) return submitted_frames;
+    uint32_t state = inl(nabm + PO_CIV);
+    uint16_t remaining = inw(nabm + PO_PICB);
+    uint32_t confirmed = inl(nabm + PO_CIV);
+    int civ = (int)(state & (NBUF - 1));
+    if ((confirmed & (NBUF - 1)) != (uint32_t)civ || ((state >> 16) & SR_HALTED)) return submitted_frames;
+    int first = remaining < TAKE_MARGIN ? 3 : 2, queued = (lvi - civ) & (NBUF - 1);
+    if (queued < first) return submitted_frames;
+    uint64_t at = submitted_frames - (uint64_t)(queued - first + 1) * BUF_FRAMES;
+    if (take) {
+        lvi = (civ + first - 1) & (NBUF - 1);
+        submitted_frames = at;
+        outb(nabm + PO_LVI, (uint8_t)lvi);
+    }
+    return at;
 }
 
 /* Power change (dev/pm.h): the PCM-out engine stops reading descriptors and buffers, and says so
@@ -201,7 +229,7 @@ void ac97_init(void) {
     lvi = NBUF - 1; /* no descriptor has been issued; reset PIV will start at 0 */
     dma_live = false; /* do not start a perpetual silence DMA stream at boot */
     hw_ready = true;
-    audio_set_card("AC'97", ac97_fill);
+    audio_set_card("AC'97", ac97_fill, ac97_unissue);
     pm_register(&ac97_pm);
     kprintf("audio: AC'97 (%04x) at ports %#x/%#x, 48 kHz stereo\n", d->device, nam, nabm);
 }

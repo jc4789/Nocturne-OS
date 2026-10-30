@@ -24,9 +24,13 @@ int audio_stream_status(struct handle *h, struct n_audio_status *user_out);
 /* The same on an AP inside an AP read section, for any handle h: true with *result when served
    there, false when the BSP must (not a stream, the mixer kept changing it, out not mapped). */
 bool audio_stream_status_ap(struct handle *h, struct n_audio_status *user_out, int64_t *result);
-/* Drop this stream's not-yet-mixed PCM and retire its old clock generation.
- * Already mixed card/remote samples cannot be unmixed here, but they never
- * become the new generation's played samples. Ordinary close drains DMA too. */
+/* Drop this stream's PCM at once and retire its old clock generation. What a card had mixed but
+ * its device had not begun to fetch is taken back and mixed again without it (audio_set_card's
+ * unissue), so after a flush the stream is heard only for what the device already holds (AC'97:
+ * the rest of the playing descriptor and the prefetched one, at most 20 ms). A remote client's
+ * blocks were sent and stay heard. None of it becomes the new generation's played samples.
+ * Ordinary close lets the queue play out (a program that writes a sound and exits); the close of
+ * a stopped program drops it as a flush does. */
 int audio_stream_flush(struct handle *h);
 
 /* Mix `frames` frames from every stream into out (NULL: just consume them). Returns false, with
@@ -38,12 +42,21 @@ bool audio_mix(int16_t *out, int frames);
 bool audio_card_mix(int16_t *out, int frames);
 void audio_card_played(uint64_t ordinal);
 bool audio_pending(void); /* some stream has frames waiting */
+/* Whether a sink should mix a block of `frames` now: some stream has PCM, and every stream that
+   has any has a whole block of it, or the sink's device is about to run dry (`low`). A block mixed
+   from a stream that has only part of one plays the rest as silence in the middle of its sound
+   when its next PCM comes a moment later; while the device has enough queued, waiting does not. */
+bool audio_ready(int frames, bool low);
 bool audio_needs_tick(void); /* tickless idle: the timer must keep calling audio_tick */
 
-/* A sound card: fill() tops up its buffers with audio_mix(); it is called from audio_tick().
-   While audio_remote() it may only drain already-issued buffers, not mix new PCM.
-   An idle sink should return without device I/O; the next tick wakes it on new PCM. */
-void audio_set_card(const char *name, void (*fill)(void));
+/* A sound card: fill() tops up its buffers with audio_card_mix() (deciding with audio_ready); it is
+   called from audio_tick(). While audio_remote() it may only drain already-issued buffers, not mix
+   new PCM. An idle sink should return without device I/O; the next tick wakes it on new PCM.
+   unissue(take) is where the card's PCM that its device has not begun to fetch starts, as an
+   ordinal of audio_card_mix's frames (the ordinal after the last issued frame when there is none);
+   with take, the card also stops the device short of it, forgets it and lets fill() mix it again.
+   The mixer takes back from that ordinal when a stream is flushed (audio_stream_flush). */
+void audio_set_card(const char *name, void (*fill)(void), uint64_t (*unissue)(bool take));
 const char *audio_card(void); /* NULL without one */
 
 /* A remote desktop client plays the sound: while one is attached the card is silent, and the

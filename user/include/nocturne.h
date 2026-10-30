@@ -261,7 +261,9 @@ n_result n_pager_fail(n_handle pager, uint64_t offset, uint64_t bytes);
    of its own, mixed with the others and scaled by the master volume. A stream holds about
    170 ms; n_audio_submit takes what fits and returns the frames taken (with N_AUDIO_WAIT it
    waits for room; without, a full stream gives N_ERR_NOT_READY and N_EVENT_SENDABLE reports
-   room). Closing lets the queued sound play out; n_audio_flush drops it at once. */
+   room). Closing lets the queued sound play out; n_audio_flush drops it at once, with what the
+   sound card was given but has not begun to play (only what the device already holds is still
+   heard: on AC'97 at most 20 ms). */
 n_handle n_audio_open(void); /* N_ERR_BUSY when every stream is taken */
 n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_t flags);
 n_result n_audio_status(n_handle a, struct n_audio_status *out);

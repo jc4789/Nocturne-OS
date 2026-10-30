@@ -12,8 +12,10 @@
 const performanceBridge = (() => {
     const call=Reflect.apply,define=Object.defineProperty,create=Object.create,freeze=Object.freeze;
     const StringType=String,TypeErr=TypeError,DomError=DOMException;
-    const isWindow=typeof host.timing==="function",hostNow=host.now,base=isWindow?0:hostNow();
-    const finite=Number.isFinite,floor=Math.floor,random=Math.random,now=isWindow?hostNow:()=>hostNow()-base,navigationTime=host.timing,dateNow=Date.now;
+    // A Worker's host.now() is its clock since boot (coarsened to 100 us) and host.timeOrigin its
+    // creation; the window's host.now() is already relative to its document's origin.
+    const isWindow=typeof host.timing==="function",hostNow=host.now,base=isWindow?0:typeof host.timeOrigin==="number"?host.timeOrigin:hostNow();
+    const finite=Number.isFinite,floor=Math.floor,random=Math.random,now=isWindow?hostNow:()=>Math.round((hostNow()-base)*10)/10,navigationTime=host.timing,dateNow=Date.now;
     const serialize=cloneData.serialize,deserialize=cloneData.deserialize;
     const entries=new WeakMap(),observers=new WeakMap(),lists=new WeakMap(),performances=new WeakMap(),timings=new WeakMap(),fullHandlers=new WeakMap();
     const getWeak=WeakMap.prototype.get,setWeak=WeakMap.prototype.set;

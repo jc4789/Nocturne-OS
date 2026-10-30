@@ -515,7 +515,10 @@ static JSValue native_buffer_transferable(JSContext *ctx,JSValueConst thisv,int 
 /* The private structured-clone graph IndexedDB stores (as js.c's pack and unpack). */
 static JSValue native_pack(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;size_t size=0;uint8_t *data=JS_WriteObject(ctx,&size,argc?argv[0]:JS_UNDEFINED,JS_WRITE_OBJ_REFERENCE);if(!data)return JS_EXCEPTION;JSValue out=JS_NewArrayBufferCopy(ctx,data,size);js_free(ctx,data);return out;}
 static JSValue native_unpack(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;size_t size=0;uint8_t *data=argc?JS_GetArrayBuffer(ctx,&size,argv[0]):NULL;if(!data)return JS_EXCEPTION;return JS_ReadObject(ctx,data,size,JS_READ_OBJ_REFERENCE);}
-static JSValue native_now(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;return JS_NewFloat64(ctx,(double)n_clock_uptime_ms());}
+/* The monotonic clock in ms, coarsened to 100 microseconds (HR Time "coarsen time" outside
+   cross-origin isolation) and floored, so it never decreases. js_worker_runtime.js takes this
+   realm's time origin from it; the timers keep whole milliseconds of it. */
+static JSValue native_now(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;return JS_NewFloat64(ctx,(double)(uptime_us()/100)/10.0);}
 /* Web IDL promise reactions: no page Promise constructor or @@species lookup. */
 static JSValue native_promise_then(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
     (void)thisv;if(!argc)return JS_ThrowTypeError(ctx,"promiseThen requires a promise");

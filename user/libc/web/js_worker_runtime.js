@@ -3,6 +3,11 @@
 (function(host){
     const apply=Reflect.apply;
     delete globalThis.__workerHost;
+    // HR Time: this realm's time origin is its creation. host.now() is the monotonic clock in ms,
+    // coarsened to 100 us; a difference of two is rounded back to that grain (floating error).
+    // performance (js_performance.js) reads the same origin, so Event.timeStamp and
+    // performance.now() are one timeline.
+    const timeOrigin=host.now(),relativeNow=()=>Math.round((host.now()-timeOrigin)*10)/10;host.timeOrigin=timeOrigin;
     // SharedArrayBuffer and Atomics stay for the platform bootstrap; the
     // native policy start removes the constructor outside isolation.
     /* @include js_dom_exception.js */
@@ -17,7 +22,7 @@
         constructor(type,init={}){
             if(!arguments.length)throw new TypeError('Event requires type');type=eventString(type);init=init==null?{}:Object(init);
             apply(eventSet,eventStates,[this,{type,bubbles:!!init.bubbles,cancelable:!!init.cancelable,composed:!!init.composed,
-                target:null,currentTarget:null,eventPhase:0,defaultPrevented:false,isTrusted:false,timeStamp:host.now(),
+                target:null,currentTarget:null,eventPhase:0,defaultPrevented:false,isTrusted:false,timeStamp:relativeNow(),
                 stop:false,immediate:false,passive:false,dispatching:false,initialized:true,path:[]}]);
             eventDefine(this,'isTrusted',{enumerable:true,get(){return eventState(this).isTrusted;}});
         }
@@ -154,7 +159,7 @@
     /* @include js_html_safety.js */
     const {MessageEvent,MessagePort,MessageChannel}=workerMessagingBridge;
     Object.assign(globalThis,{MessageEvent,MessagePort,MessageChannel});
-    const target=new EventTarget(),timers=new Map(),timerHeap=[],fetches=new Map();let nextTimer=0,timerOrder=0,closed=false,address='',workerName='',workerCanCancel=false,workerStreaming=false,reporting=false,lastPortTask=false,shared=false;
+    const target=new EventTarget(),timers=new Map(),timerHeap=[],fetches=new Map();let nextTimer=0,timerOrder=0,timerNesting=0,closed=false,address='',workerName='',workerCanCancel=false,workerStreaming=false,reporting=false,lastPortTask=false,shared=false;
     /* The crypto task source of this event loop (js_crypto.js queues its "queue a global
        task" steps on host.postTask), taking turns with the other tasks in tick. */
     const cryptoTasks=[];let cryptoTaskHead=0,lastCryptoTask=false;
@@ -194,7 +199,12 @@
         for(;;){const left=index*2+1;if(left>=timerHeap.length)break;const right=left+1,child=right<timerHeap.length&&timerBefore(timerHeap[right],timerHeap[left])?right:left;if(!timerBefore(timerHeap[child],timerHeap[index]))break;timerSwap(index,child);index=child;}
     }
     function clearTimer(id){const t=timers.get(Number(id));if(!t)return;timers.delete(t.id);const index=t.index,last=timerHeap.pop();if(index<timerHeap.length){timerHeap[index]=last;last.index=index;timerFix(index);}}
-    function timer(fn,ms,args,repeat){if(closed)return 0;if(typeof fn!=='function'){fn=htmlSafetyBridge.timerCode(fn,repeat?'setInterval':'setTimeout');if(fn===null)return 0;}let id;for(let i=0;i<=timers.size;i++){nextTimer=nextTimer===4294967295?1:nextTimer+1;if(!timers.has(nextTimer)){id=nextTimer;break;}}if(id===undefined)throw new RangeError('Worker timer identifier space exhausted');if(timerOrder===9007199254740991){timerOrder=0;for(const t of timers.values())t.order=++timerOrder;for(let i=Math.floor(timerHeap.length/2)-1;i>=0;i--)timerFix(i);}const delay=Math.max(1,Math.min(2147483647,Number(ms)||0)),t={id,order:++timerOrder,fn,args,repeat,delay,due:host.now()+delay,index:timerHeap.length};timers.set(id,t);timerHeap.push(t);timerFix(t.index);return id;}
+    // HTML timer initialization steps. setTimeout and setInterval (html) take the timeout as a Web
+    // IDL long and inherit the nesting level of the timer task whose callback runs (timerNesting;
+    // 0 in other tasks and in microtasks); above 5 a timeout below 4 ms becomes 4. The worker's own
+    // tasks (html false) neither nest nor clamp, and never run before their time. Deadlines are
+    // whole milliseconds of host.now()'s clock, as tick's now.
+    function timer(fn,ms,args,repeat,html){if(closed)return 0;if(typeof fn!=='function'){fn=htmlSafetyBridge.timerCode(fn,repeat?'setInterval':'setTimeout');if(fn===null)return 0;}let id;for(let i=0;i<=timers.size;i++){nextTimer=nextTimer===4294967295?1:nextTimer+1;if(!timers.has(nextTimer)){id=nextTimer;break;}}if(id===undefined)throw new RangeError('Worker timer identifier space exhausted');if(timerOrder===9007199254740991){timerOrder=0;for(const t of timers.values())t.order=++timerOrder;for(let i=Math.floor(timerHeap.length/2)-1;i>=0;i--)timerFix(i);}const delay=Math.max(0,html?ms|0:Math.min(2147483647,Math.ceil(Number(ms)||0))),level=html?timerNesting:0,t={id,order:++timerOrder,fn,args,repeat,html:!!html,delay,nesting:html?(level>5?level:level+1):0,due:Math.floor(host.now())+(level>5&&delay<4?4:delay),index:timerHeap.length};timers.set(id,t);timerHeap.push(t);timerFix(t.index);return id;}
     function importScripts(...urls){for(const u of urls){const url=new URL(htmlSafetyBridge.check(u,3,'WorkerGlobalScope importScripts'),address).href;const r=host.import(url);performanceBridge.monotonicResource(0,IMPORT_REQUEST,url,wireField(r,LOADED_TIMING));if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker script load failed','NetworkError');evalSource(new TextDecoder().decode(r[3]),r[1]||url);}}
     /* @include js_abort.js */
     /* This Worker's events for AbortSignal: a trusted abort event through this realm's dispatch,
@@ -359,7 +369,7 @@
     /* @include js_performance.js */
     /* @include js_console.js */
     Object.assign(globalThis,{self:globalThis,navigator,WorkerNavigator,postMessage,close,importScripts,Headers,Request,Response,AbortSignal,AbortController,fetch,
-        setTimeout:(fn,ms,...args)=>timer(fn,ms,args,false),setInterval:(fn,ms,...args)=>timer(fn,ms,args,true),
+        setTimeout:(fn,ms,...args)=>timer(fn,ms,args,false,true),setInterval:(fn,ms,...args)=>timer(fn,ms,args,true,true),
         clearTimeout:clearTimer,clearInterval:clearTimer,
         queueMicrotask:fn=>{if(typeof fn!=='function')throw new TypeError('Callback required');Promise.resolve().then(fn).catch(report);},
         reportError(e){if(!arguments.length)throw new TypeError("Failed to execute 'reportError': 1 argument required");report(e);},
@@ -411,7 +421,7 @@
         receive(packet,op=2,id=0,kind=0){try{if(op===8||op===9||op===10){workerMessagingBridge.receivePort(id,kind,packet,op!==8);return;}const payload=kind===3?workerMessagingBridge.importExternal(packet):{data:cloneData.deserialize(packet),ports:[]};if(!closed){if(op===13){if(!shared||payload.ports.length!==1)throw new TypeError('Invalid shared worker connection');dispatchNativeWorkerEvent(target,new MessageEvent('connect',{data:'',source:payload.ports[0],ports:payload.ports}));}else dispatchNativeWorkerEvent(target,new MessageEvent('message',{data:payload.data,ports:payload.ports}));}}catch(e){if(!closed)dispatchNativeWorkerEvent(target,new MessageEvent('messageerror'));}},
         loaded(id,r,flags=0){workerFetchTransport.loaded(id,r,flags);},
         frame(id,value,kind){workerFetchTransport.frame(id,value,kind);},
-        tick(now){if(closed)return false;if(cryptoTaskReady()&&!lastCryptoTask)return runCryptoTask();lastCryptoTask=false;const ports=workerMessagingBridge.ready();if(ports&&!lastPortTask){lastPortTask=true;return workerMessagingBridge.runOne();}const t=timerHeap[0];if(t&&t.due<=now){lastPortTask=false;if(t.repeat){t.due=now+t.delay;timerFix(0);}else clearTimer(t.id);try{t.fn(...t.args);}catch(e){report(e);}return true;}lastPortTask=ports;return ports?workerMessagingBridge.runOne():cryptoTaskReady()?runCryptoTask():false;},
+        tick(now){if(closed)return false;if(cryptoTaskReady()&&!lastCryptoTask)return runCryptoTask();lastCryptoTask=false;const ports=workerMessagingBridge.ready();if(ports&&!lastPortTask){lastPortTask=true;return workerMessagingBridge.runOne();}const t=timerHeap[0];if(t&&t.due<=now){lastPortTask=false;const level=t.nesting,outer=timerNesting;if(t.repeat){t.due=now+(level>5&&t.delay<4?4:t.delay);t.nesting=level>5?level:level+1;if(timerOrder<9007199254740991)t.order=++timerOrder;timerFix(0);}else clearTimer(t.id);timerNesting=t.html?level:0;try{t.fn(...t.args);}catch(e){report(e);}finally{timerNesting=outer;}return true;}lastPortTask=ports;return ports?workerMessagingBridge.runOne():cryptoTaskReady()?runCryptoTask():false;},
         deadline(){if(workerMessagingBridge.ready()||cryptoTaskReady())return host.now();return timerHeap.length?timerHeap[0].due:-1;},report,
         storageOrigin:urlBridge.storageOrigin,
         indexedDBTaskEnd:indexedDBBridge.taskEnd

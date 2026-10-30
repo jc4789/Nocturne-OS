@@ -408,8 +408,12 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     `N_ERR_NOT_READY`（空きは `N_EVENT_SENDABLE` で分かる）。
   - `n_audio_status(a, struct n_audio_status *)`：待っているフレーム、装置に渡したフレーム、
     再生済み（推定を含む。`flags` が時計の出所）、世代。
-  - `n_audio_flush(a)`：まだ混ぜていない音を捨て、世代を進める。
-  - `n_handle_close` は残りを鳴らし終えてから閉じる（停止中のアプリは待たない）。
+  - `n_audio_flush(a)`：待っている音を捨て、世代を進める。音の装置へ渡したが装置がまだ読み
+    始めていない分も取り戻し、他の流れだけで混ぜ直す。止めた後に聞こえるのは装置が既に持つ分
+    だけ（AC'97 は鳴っている塊の残りと先読みの一つ、最大 20 ms）。遠隔の画面の相手へ送った分は
+    取り戻せない。
+  - `n_handle_close` は残りを鳴らし終えてから閉じる。止められたアプリの流れは待たず、flush と
+    同じに捨てる。
   - 主音量と出力先：`n_audio_output(struct n_audio_output *io, set)` 一つ。`set` が 0 なら読むだけ、
     `N_AUDIO_SET_VOLUME` で `io->volume`（0〜100。消音も解く）、`N_AUDIO_SET_MUTED` で
     `io->muted`（0／1）を設定する（両方なら音量が先）。戻ると `io` に今の

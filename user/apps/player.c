@@ -1,8 +1,9 @@
 /* Sound Player: plays WAV files. Opened with a file (from Files) it plays it, and lists the other
    sounds in the same folder; opened on its own it shows the Music folder. The sound is read and
-   resampled here and kept about 100 ms ahead of the speaker, so pausing and seeking answer at
-   once. The title, seek slider, buttons and sound list are widgets of the interface engine
-   (libc/ui.c); the waveform is a surface this program draws itself. */
+   resampled here and kept about 100 ms ahead of the speaker; pausing, stopping and seeking drop
+   what is queued (n_audio_flush), so they answer at once. The title, seek slider, buttons and
+   sound list are widgets of the interface engine (libc/ui.c); the waveform is a surface this
+   program draws itself. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,18 +50,21 @@ static void load_dir(const char *path) {
     qsort(names, ntracks, sizeof names[0], by_name);
 }
 
-/* where the speaker is now, in the file's frames: what was sent, less what is still queued */
+/* where the speaker is now, in the file's frames: what was sent, less what is still queued and
+   what the sound card holds but has not played */
 static uint32_t now_frame(void) {
     if (!loaded) return 0;
-    uint32_t queued = 0;
+    uint64_t queued = 0;
     struct n_audio_status st;
-    if (stream >= 0 && playing && n_audio_status(stream, &st) == 0) queued = st.queued_frames;
+    if (stream >= 0 && playing && n_audio_status(stream, &st) == 0)
+        queued = (uint64_t)st.queued_frames + st.device_pending_frames;
     uint64_t heard = sent > queued ? sent - queued : 0;
     uint64_t f = base + heard * wav.rate / SOUND_RATE;
     return (uint32_t)MIN(f, (uint64_t)wav.frames);
 }
 
 static void stop(void) {
+    if (stream >= 0) n_audio_flush(stream); /* what is queued is not heard any more */
     playing = false;
     if (loaded) wav_close(&wav);
     loaded = false;
@@ -85,6 +89,7 @@ static void play_track(int i) {
 
 static void seek_to(uint32_t frame) {
     if (!loaded) return;
+    if (stream >= 0) n_audio_flush(stream); /* the old place's queued sound is not heard */
     wav_seek(&wav, frame);
     base = frame;
     sent = 0;
@@ -227,7 +232,11 @@ static void show(struct ui_session *s) {
 
 static void toggle(void) {
     if (!loaded) play_track(cur >= 0 ? cur : 0);
-    else playing = !playing && stream >= 0;
+    else if (playing) { /* pause: silent at once, and later on from where the speaker was */
+        uint32_t at = now_frame();
+        playing = false;
+        seek_to(at);
+    } else playing = stream >= 0;
     if (playing && wav.eof) seek_to(0);
 }
 

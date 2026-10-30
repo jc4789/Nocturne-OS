@@ -88,7 +88,10 @@ struct js_node_ref {
     struct js_node_ref *next, **prev, *hash_next, **hash_prev, *update_next;
     uint64_t wheel_blocking;
 };
-struct js_timer { uint32_t id; int kind; uint64_t due, interval, order; JSValue fn, args; };
+/* kind: 0 a task the engine queues (not an HTML timer), 1 setInterval, 2 an animation frame,
+   3 setTimeout. interval is the timeout as given (before the nesting clamp); nesting is the timer
+   nesting level of the task (HTML timer initialization steps), saturated above 5. */
+struct js_timer { uint32_t id; int kind; uint64_t due, interval, order; uint8_t nesting; JSValue fn, args; };
 /* CSP3 §5.5's queued task: the event's fields, the header policy whose report-uri
    is sent (meta rules may be rewound before the task runs), and the element
    the event targets while it stays connected (a wrapper; zero for none). */
@@ -347,6 +350,10 @@ struct web_js_state {
     uint64_t rendering_due, rendering_next, rendering_period_ms, next_timer_order;
     int observer_x, observer_y, observer_w, observer_h;
     uint32_t next_timer;
+    /* The timer nesting level of the setTimeout/setInterval task whose callback is running; 0 in
+       any other task and in the microtask checkpoint (HTML: each microtask is then the running
+       task). */
+    uint8_t timer_nesting;
     unsigned pending_count;
     int running;
     unsigned long diagnostic_sequence;
@@ -4741,8 +4748,14 @@ static void navigation_legacy_timing(struct web_js_state *s, uint64_t now) {
     for (size_t i = 0; i < sizeof times / sizeof *times; i++)
         if (times[i].at && times[i].at >= s->now && times[i].at <= now) timing_record(s, times[i].milestone, times[i].at);
 }
+/* performance.now() and the timeStamp of the events this realm makes: the monotonic clock since
+   the time origin, coarsened as HR Time's "coarsen time" asks of a context that is not
+   cross-origin isolated (100 microseconds), floored, so a later read is never less. The origin
+   is a whole millisecond of the same clock. */
 static JSValue native_now(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    return JS_NewFloat64(ctx, (double)relative_time(state(ctx), uptime_ms()));
+    struct web_js_state *s = state(ctx);
+    uint64_t us = uptime_us(), origin = s->now * 1000;
+    return JS_NewFloat64(ctx, us > origin ? (double)((us - origin) / 100) / 10.0 : 0.0);
 }
 static JSValue native_window_state(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
@@ -5710,15 +5723,24 @@ static uint32_t allocate_timer_id(struct web_js_state *s) {
         if (i == s->timer_capacity) return id;
     }
 }
+/* HTML timer initialization steps 3-5 and 9-10: a timer made in a timer task inherits its nesting
+   level; above 5, a timeout below 4 ms becomes 4. Only whether the level is above 5 matters, so it
+   stops counting there. */
+static uint64_t timer_timeout(uint64_t ms, uint8_t level) { return level > 5 && ms < 4 ? 4 : ms; }
+static uint8_t timer_nested(uint8_t level) { return level > 5 ? level : (uint8_t)(level + 1); }
 static JSValue native_timer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); int32_t kind = 0; double delay = 0;
     if((sandbox_authority(s)&SB_SCRIPTS) || sandbox_borrowed(s))return history_security_error(ctx,"Sandbox denied borrowed timer authority");
     if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "Timer browsing context is inactive");
-    if (argc < 4 || JS_ToInt32(ctx, &kind, argv[0]) || !JS_IsFunction(ctx, argv[1]) || JS_ToFloat64(ctx, &delay, argv[2])) return JS_ThrowTypeError(ctx, "Invalid timer");
+    if (argc < 4 || JS_ToInt32(ctx, &kind, argv[0]) || kind < 0 || kind > 3 || !JS_IsFunction(ctx, argv[1]) || JS_ToFloat64(ctx, &delay, argv[2])) return JS_ThrowTypeError(ctx, "Invalid timer");
     if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "Timer browsing context retired during conversion");
     if (!isfinite(delay) || delay < 0) delay = 0;
     if (delay > 2147483647.0) delay = 2147483647.0;
-    uint64_t ms = (uint64_t)delay; if (kind == 1 && ms < 4) ms = 4; if (kind == 2) ms = 0;
+    /* setTimeout and setInterval pass the timeout as a Web IDL long; the engine's own delays may
+       have a fraction, and a task never runs before its time. */
+    uint64_t ms = kind == 2 ? 0 : (uint64_t)ceil(delay);
+    bool html_timer = kind == 1 || kind == 3;
+    uint8_t level = html_timer ? s->timer_nesting : 0;
     if(s->next_timer_order==UINT64_MAX)return JS_ThrowOutOfMemory(ctx);
     unsigned index;
     for (index = 0; index < s->timer_capacity; ++index) if (!s->timers[index].id) break;
@@ -5737,7 +5759,8 @@ static JSValue native_timer(JSContext *ctx, JSValueConst this_val, int argc, JSV
     }
     uint32_t id = allocate_timer_id(s);
     struct js_timer *t = &s->timers[index];
-    t->id = id; t->kind = kind; t->interval = ms; t->due = uptime_ms() + ms;
+    t->id = id; t->kind = kind; t->interval = ms; t->due = uptime_ms() + timer_timeout(ms, level);
+    t->nesting = html_timer ? timer_nested(level) : 0;
     t->order=++s->next_timer_order;
     t->fn = JS_DupValue(ctx, argv[1]); t->args = JS_DupValue(ctx, argv[3]);
     return JS_NewUint32(ctx, id);
@@ -9108,7 +9131,14 @@ static bool run_timer_index(struct web_js_state *s, unsigned timer_index, uint64
     uint32_t timer_id = timer->id;
     JSValue fn = JS_DupValue(s->ctx, timer->fn), args_array = JS_DupValue(s->ctx, timer->args);
     int kind = timer->kind;
-    if (kind == 1) timer->due = now + timer->interval;
+    uint8_t level = timer->nesting;
+    /* setInterval runs the timer initialization steps again from its own task: the next one nests
+       one deeper and is ordered after the timers made before it. */
+    if (kind == 1) {
+        timer->due = now + timer_timeout(timer->interval, level);
+        timer->nesting = timer_nested(level);
+        if (s->next_timer_order < UINT64_MAX) timer->order = ++s->next_timer_order;
+    }
     else release_timer(s, timer_index);
     /* The callback/microtask checkpoint may grow the table, clear its interval
        or reuse a one-shot slot. Only local JSValue roots survive that boundary. */
@@ -9116,7 +9146,7 @@ static bool run_timer_index(struct web_js_state *s, unsigned timer_index, uint64
     uint64_t start = s->host.debug_js?uptime_ms():0;
     struct web_profile before = s->doc->profile;
     uint64_t initial_dom_rev = s->doc ? s->doc->dom_revision : 0;
-    begin_named_task(s,kind==2?"animation frame":kind==1?"interval":"timeout",timer_id);
+    begin_named_task(s,kind==2?"animation frame":kind==1?"interval":kind==3?"timeout":"task",timer_id);
     uint64_t initial_layout_ms = s->task_layout_ms;
     unsigned initial_flushes = s->task_layout_flushes;
     JSValue frame_arg=JS_UNDEFINED,*args=NULL;int count=0;bool prepared=true,heap_args=false;
@@ -9136,8 +9166,11 @@ static bool run_timer_index(struct web_js_state *s, unsigned timer_index, uint64
     }
     uint64_t js_start = s->host.debug_js?uptime_ms():0;
     JSValue global=JS_UNDEFINED,result=JS_EXCEPTION;
+    uint8_t outer_nesting = s->timer_nesting;
+    s->timer_nesting = kind == 1 || kind == 3 ? level : 0;
     if(prepared&&task_context_active(s)){global=JS_GetGlobalObject(s->ctx);result=JS_Call(s->ctx,fn,global,count,args);}
     else if(prepared)result=JS_UNDEFINED;
+    s->timer_nesting = outer_nesting; /* the microtask checkpoint (end_task) is not this task */
     uint64_t js_ms = s->host.debug_js?uptime_ms() - js_start:0;
     if (JS_IsException(result)) exception(s); else JS_FreeValue(s->ctx, result);
     for (int i = 0; i < count; i++) JS_FreeValue(s->ctx, args[i]);

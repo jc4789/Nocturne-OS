@@ -1120,8 +1120,10 @@ static void realtime(struct wa_context *c) {
             if (taken < 0) { n_handle_close(c->sink); c->sink = -1; }
         } else clock_frames += made;
     }
-    /* closed: the stream goes, so another context can have it */
-    if (c->sink >= 0) n_handle_close(c->sink);
+    /* Closed (close(), or the page let go of it): rendering stops and no more of its output is
+       heard (Web Audio, AudioContext close(): "stop processing audio data"), so what is still
+       queued is dropped, not played out. The stream goes, so another context can have it. */
+    if (c->sink >= 0) { n_audio_flush(c->sink); n_handle_close(c->sink); }
     c->sink = -1;
     mtx_unlock(&c->lock);
 }

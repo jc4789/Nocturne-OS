@@ -1324,13 +1324,15 @@ static int snd_wave(struct rdp *c, uint8_t *buf, uint32_t len) {
 }
 
 /* Send the sound that is due within the lead time. When nothing is playing nothing is sent;
-   the next sound starts its timeline afresh. */
+   the next sound starts its timeline afresh. A block goes out when every stream has a whole one
+   (audio_ready), or when the client would soon have nothing left: a stream fed in small pieces
+   (Web Audio) is not padded with silence in the middle of its sound. */
 static int snd_push(struct rdp *c) {
     if (c->snd_state == SND_WAIT && uptime_ms() >= c->snd_start_at) return snd_offer(c);
     if (c->snd_state != SND_PLAYING) return 0;
     uint64_t now = uptime_ms();
     if (c->snd_until < now) c->snd_until = now;
-    while (c->snd_until < now + SND_LEAD_MS && audio_pending()) {
+    while (c->snd_until < now + SND_LEAD_MS && audio_ready(SND_BLOCK_FRAMES, c->snd_until < now + 2 * SND_BLOCK_MS)) {
         audio_mix((int16_t *)(c->snd_buf + 16), SND_BLOCK_FRAMES);
         int e = snd_wave(c, c->snd_buf, SND_BLOCK_FRAMES * AUDIO_FRAME);
         if (e) return e;
