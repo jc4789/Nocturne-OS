@@ -322,6 +322,8 @@ native の URL の解決の速さ（K80。2026-10-28、ホストの Windows で 
 
 窓の事象の受け取り（WIN_RECEIVE を窓ごとの `ev_lock` でどの CPU でも）の後、音の段と同じ条件（AC'97 付き）で：WIN_RECEIVE の回り道 474〜544 → 0、落ち着いた再生の窓の retires dispatch 1818〜1972 → 1149〜1324、cpu0 の kernel 272〜401 → 217〜389 ms（重なる。動いたとは言えない）、WIN_PRESENT が BSP へ着くまで 48〜95 → 18〜62 µs。console への打鍵、`pause()` で WAV が 3 秒伸びない、`play()` で鳴り直すことを見た。YouTube の再生は 30〜40 秒で K7 の誤りで止まる（前の回も同じ）。
 
+ユーザーに見える物差し（同じ日 22:40 頃、`build/mae.img`（961c3e7c）と今の媒体（52764138）を順に一台ずつ、prof なし、`browser --maximized --log-console`、AC'97 付き、F12 を開いたまま、各一回）：`Native media timing` の最後の行で、前は clock 42979 ms に presented 2382・drop 198、今は clock 40666 ms に presented 2248・drop 193。どちらも media の時計の 1 秒あたり約 55 枚で、落ちるコマの大半は再生の最初の 20 秒（前 173・今 154）。対称のカーネルの段（BSP への回り道 21486 → 約 1200、cpu0 の kernel 1230 → 約 300 ms／10 秒）は、QEMU のこの動画の fps と落ちるコマを動かしていない。始まりの 20 秒は AP 三つの user の時間が 10 秒の窓で 19 秒（三つの 63%）、cpu0 は user をほとんど走らせない。一回ずつなので揺れの幅は未確認。
+
 ## 7. 決定
 
 | # | 決定 | 理由 |
