@@ -1,5 +1,5 @@
 #include "kernel.h"
-#include "arch/cpu.h"
+#include "arch/spin.h"
 #include "dev/serial.h"
 #include "dev/fbcon.h"
 
@@ -132,30 +132,35 @@ int ksnprintf(char *buf, size_t size, const char *fmt, ...) {
 #define KLOG_SIZE 65536
 static char klog_buf[KLOG_SIZE];
 static size_t klog_head; /* total bytes ever written */
+static struct spinlock klog_lock; /* any CPU logs */
 
 void klog_write(const char *s, size_t n) {
+    uint64_t f = spin_lock(&klog_lock);
     for (size_t i = 0; i < n; i++) klog_buf[(klog_head + i) % KLOG_SIZE] = s[i];
     klog_head += n;
+    spin_unlock(&klog_lock, f);
 }
 
 size_t klog_read(char *buf, size_t max) {
+    uint64_t f = spin_lock(&klog_lock);
     size_t avail = klog_head < KLOG_SIZE ? klog_head : KLOG_SIZE;
     size_t start = klog_head - avail;
     size_t n = avail < max ? avail : max;
     /* return the most recent n bytes */
     start = klog_head - n;
     for (size_t i = 0; i < n; i++) buf[i] = klog_buf[(start + i) % KLOG_SIZE];
+    spin_unlock(&klog_lock, f);
     return n;
 }
 
 size_t klog_since(size_t *at, char *buf, size_t max, size_t *lost) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&klog_lock);
     size_t oldest = klog_head < KLOG_SIZE ? 0 : klog_head - KLOG_SIZE;
     *lost = *at < oldest ? oldest - *at : 0;
     size_t from = *at + *lost, n = MIN(klog_head - from, max);
     for (size_t i = 0; i < n; i++) buf[i] = klog_buf[(from + i) % KLOG_SIZE];
     *at = from + n;
-    irq_restore(f);
+    spin_unlock(&klog_lock, f);
     return n;
 }
 
@@ -166,11 +171,9 @@ int kprintf(const char *fmt, ...) {
     int n = kvsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     if (n > (int)sizeof buf - 1) n = sizeof buf - 1;
-    uint64_t f = irq_save();
     serial_write(buf, n);
     klog_write(buf, n);
     fbcon_write_kernel(buf, n);
-    irq_restore(f);
     return n;
 }
 

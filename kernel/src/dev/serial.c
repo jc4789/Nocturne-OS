@@ -1,5 +1,5 @@
 #include "kernel.h"
-#include "arch/cpu.h"
+#include "arch/spin.h"
 #include "dev/serial.h"
 
 /* COM1, the log port. What is written goes into a ring and leaves through the UART's transmit
@@ -20,6 +20,7 @@ static unsigned fifo_depth = 1;
 static char ring[RING];
 static size_t head, tail; /* characters ever queued and sent: head - tail wait (interrupts off) */
 static uint64_t dropped;
+static struct spinlock serial_lock; /* the ring and the port: any CPU logs */
 
 void serial_init(void) {
     outb(COM1 + 1, 0x00); /* no interrupts */
@@ -63,7 +64,7 @@ static void queue(const char *s, size_t n) {
 
 void serial_write(const char *s, size_t n) {
     if (!serial_ok) return;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&serial_lock);
     if (dropped) {
         char note[48];
         int len = ksnprintf(note, sizeof note, "\n[serial: %lu bytes dropped]\n", (unsigned long)dropped);
@@ -74,14 +75,14 @@ void serial_write(const char *s, size_t n) {
     }
     queue(s, n);
     pump();
-    irq_restore(f);
+    spin_unlock(&serial_lock, f);
 }
 
 void serial_tick(void) {
     if (!serial_ok) return;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&serial_lock);
     pump();
-    irq_restore(f);
+    spin_unlock(&serial_lock, f);
 }
 
 bool serial_needs_tick(void) { return serial_ok && head != tail; }
@@ -90,12 +91,12 @@ bool serial_needs_tick(void) { return serial_ok && head != tail; }
    (as many polls as a character took the old way: 100000), the rest of the ring unsent. */
 void serial_flush(void) {
     if (!serial_ok) return;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&serial_lock);
     while (head != tail) {
         unsigned spin = 0;
         while (!(inb(COM1 + 5) & LSR_THRE) && ++spin < 100000) pause();
         if (spin == 100000) break;
         send_burst();
     }
-    irq_restore(f);
+    spin_unlock(&serial_lock, f);
 }

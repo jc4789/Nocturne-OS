@@ -10,19 +10,21 @@ void object_init(struct object *o, const struct object_ops *ops, void *priv) {
     *o = (struct object){.ops = ops, .priv = priv};
 }
 
-void object_ref(struct object *o) {
-    uint64_t flags = irq_save();
-    o->refs++;
-    irq_restore(flags);
+void object_ref(struct object *o) { __atomic_add_fetch(&o->refs, 1, __ATOMIC_RELAXED); }
+
+bool object_ref_live(struct object *o) {
+    int refs = __atomic_load_n(&o->refs, __ATOMIC_RELAXED);
+    do {
+        if (refs <= 0) return false;
+    } while (!__atomic_compare_exchange_n(&o->refs, &refs, refs + 1, true, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED));
+    return true;
 }
 
 void object_unref(struct object *o) {
     if (!o) return;
-    uint64_t flags = irq_save();
-    ASSERT(o->refs > 0);
-    bool last = --o->refs == 0;
-    irq_restore(flags);
-    if (last && o->ops->release) o->ops->release(o);
+    int refs = __atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL);
+    ASSERT(refs >= 0);
+    if (!refs && o->ops->release) o->ops->release(o);
 }
 
 struct handle *handle_open(struct object *o, bool writable) {
@@ -69,7 +71,7 @@ uint32_t handle_ready(struct handle *h) {
 
 void object_notify(struct object *o) {
     if (!o) return;
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock(&o->lock);
     for (struct object_waiter *w = o->waiters; w; w = w->next) {
         /* the new generation before the parked count is read: a waiter parking on an AP counts
            itself before it reads the generation again */
@@ -77,22 +79,25 @@ void object_notify(struct object *o) {
         wq_wake_all(&w->wait->wq);
         address_park_wake_word(&w->wait->generation);
     }
-    irq_restore(flags);
+    spin_unlock(&o->lock, flags);
 }
 
 void object_waiter_link(struct object_waiter *w, struct object_wait *wait, struct object *o) {
-    uint64_t flags = irq_save();
-    *w = (struct object_waiter){.next = o->waiters, .prev = &o->waiters, .wait = wait};
+    uint64_t flags = spin_lock(&o->lock);
+    *w = (struct object_waiter){.next = o->waiters, .prev = &o->waiters, .wait = wait, .object = o};
     if (w->next) w->next->prev = &w->next;
     o->waiters = w;
-    irq_restore(flags);
+    spin_unlock(&o->lock, flags);
 }
 
+/* A notification on another CPU that found w is over once this has the lock: the wait w names may
+   go after this returns. */
 void object_waiter_unlink(struct object_waiter *w) {
-    uint64_t flags = irq_save();
+    struct object *o = w->object;
+    uint64_t flags = spin_lock(&o->lock);
     *w->prev = w->next;
     if (w->next) w->next->prev = w->prev;
-    irq_restore(flags);
+    spin_unlock(&o->lock, flags);
 }
 
 /* ---- handle tables ---- */

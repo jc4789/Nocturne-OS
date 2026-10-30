@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include "arch/fpu.h"
 #include "arch/smp.h"
+#include "arch/spin.h"
 #include "sys/kei.h"
 #include "sys/syscall.h"
 
@@ -15,8 +16,13 @@ struct object;
 enum task_state { TASK_READY, TASK_RUNNING, TASK_BLOCKED, TASK_ZOMBIE };
 
 struct task;
+/* Tasks blocked on the BSP. Any CPU wakes them (wq_wake_all) under the queue's lock, which is
+   taken before the BSP's run queue's. A waiter whose condition another CPU changes reads it under
+   a lock that waker also holds while it wakes, or loses the wakeup between its check and its
+   sleep. */
 struct wait_queue {
     struct task *head;
+    struct spinlock lock;
 };
 
 struct task {
@@ -101,6 +107,8 @@ static inline struct task *task_process(void) {
 void sched_init(void);
 struct task *task_alloc(const char *name);
 struct task *kthread_create(const char *name, void (*fn)(void *), void *arg);
+/* Any CPU: a new task, one an AP gave back, or a blocked one woken. From an AP only a blocked
+   task: the BSP is told to look at its run queue. */
 void sched_make_ready(struct task *t);
 void schedule(void);
 void sched_yield(void);
@@ -124,6 +132,7 @@ int task_thread_join(int tid);
 int task_thread_detach(int tid);
 /* wide: compare the 8-byte word at address (wasm memory.atomic.wait64). */
 int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsigned timeout_ms);
+/* Any CPU (an AP wakes through address_ap_syscall, with the same code). */
 int task_wake_address(volatile uint32_t *address, unsigned count);
 /* Asynchronous address waiters. A watch joins the same physical-address FIFO
  * as blocked tasks; a notify that selects it moves its token to the queue's
@@ -154,6 +163,10 @@ void task_printf_stderr(struct task *t, const char *fmt, ...);
 /* wait queues; call with interrupts disabled for race-free condition checks */
 void wq_wait(struct wait_queue *wq);
 bool wq_wait_timeout(struct wait_queue *wq, uint64_t ms); /* returns false on timeout */
+/* For a condition another CPU changes without a lock this waiter can hold: sleep on wq unless
+   *word (which the waker moves on before it wakes wq) no longer reads seen, the value read before
+   the condition was checked. ms 0: no limit; false on timeout. */
+bool wq_wait_unless(struct wait_queue *wq, const uint64_t *word, uint64_t seen, uint64_t ms);
 void wq_wake_all(struct wait_queue *wq);
 /* A driver waiting for its device: asleep on wq until *kick is set (its interrupt handler sets it,
    then wakes wq) or for up to ms; *kick is cleared. wq and kick may be NULL: just the time. The

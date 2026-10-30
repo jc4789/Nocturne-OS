@@ -1,9 +1,13 @@
 /* Kernel heap: an address-ordered block list whose free neighbours merge, and an index of the free
    blocks by size (two-level segregated fit), so that a block is found in a few steps however many
-   blocks the heap holds (the store's cache alone holds tens of thousands). */
+   blocks the heap holds (the store's cache alone holds tens of thousands).
+
+   Any CPU allocates and frees, under heap_lock (taken before the kernel page tables' and pmm's).
+   The heap grows and backs released pages by adding mappings, which needs no shootdown; only the
+   heap's own task, on the BSP, takes pages away (heap_trim). */
 #include "kernel.h"
 #include "arch/cpu.h"
-#include "arch/smp.h"
+#include "arch/spin.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
@@ -32,6 +36,7 @@ static uint64_t heap_end = KHEAP_BASE;
 static uint64_t heap_used;
 static bool trim_pending;
 static struct wait_queue trim_wq;
+static struct spinlock heap_lock;
 
 /* The free blocks' size classes: below SMALL bytes one per 16 bytes, from there SL_COUNT for each
    power of two. A bit of class_map says which lists of a power of two have blocks, a bit of
@@ -95,20 +100,15 @@ static struct block *find(uint64_t size) {
     return lists[fl][__builtin_ctz(classes)];
 }
 
-/* All or nothing: pages mapped before a failure go back, so heap_end never
-   covers pages that no block accounts for. */
+/* Maps pages at heap_end until bytes more are there; false when memory ran out first. The pages
+   mapped stay: the caller's block (the free tail, or a new one) takes whatever heap_end reached,
+   so it never covers pages that no block accounts for, and nothing is unmapped here. */
 static bool grow(uint64_t bytes) {
-    bytes = ALIGN_UP(bytes, PAGE_SIZE);
-    uint64_t start = heap_end;
-    for (uint64_t off = 0; off < bytes; off += PAGE_SIZE) {
+    uint64_t end = heap_end + ALIGN_UP(bytes, PAGE_SIZE);
+    while (heap_end < end) {
         uint64_t p = pmm_alloc();
         if (!p || !vmm_map_page(kernel_pml4, heap_end, p, PTE_W | pte_nx)) {
             if (p) pmm_free(p);
-            while (heap_end > start) {
-                heap_end -= PAGE_SIZE;
-                uint64_t old = vmm_unmap_page(kernel_pml4, heap_end);
-                if (old & PTE_P) pmm_free(old & PTE_ADDR);
-            }
             return false;
         }
         heap_end += PAGE_SIZE;
@@ -163,29 +163,32 @@ static bool take(struct block *b, size_t size) {
 }
 
 void *kmalloc(size_t size) {
-    cpu_require_bsp();
     if (size == 0) size = 1;
     /* A size from user space (a channel message, a document) must not wrap
        the alignment or the block header arithmetic into a tiny block. */
     if (size > (uint64_t)1 << 40) return NULL;
     size = ALIGN_UP(size, 16);
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&heap_lock);
     struct block *b = find(size);
     if (b) {
         list_remove(b);
     } else if (tail && tail->free) { /* the heap grows under its last block */
         b = tail;
         list_remove(b);
-        if (b->size < size && !grow(size - b->size)) {
+        bool grown = b->size >= size || grow(size - b->size);
+        b->size = heap_end - (uint64_t)(b + 1);
+        if (!grown) {
             list_add(b);
-            irq_restore(f);
+            spin_unlock(&heap_lock, f);
             return NULL;
         }
-        b->size = heap_end - (uint64_t)(b + 1);
     } else {
-        uint64_t need = size + sizeof(struct block);
         uint64_t start = heap_end;
-        if (!grow(need)) { irq_restore(f); return NULL; }
+        bool grown = grow(size + sizeof(struct block));
+        if (heap_end - start <= sizeof(struct block)) { /* not even a header's room */
+            spin_unlock(&heap_lock, f);
+            return NULL;
+        }
         b = (struct block *)start;
         b->magic = HEAP_MAGIC;
         b->prev = tail;
@@ -195,9 +198,14 @@ void *kmalloc(size_t size) {
         if (tail) tail->next = b;
         else head = b;
         tail = b;
+        if (!grown) {
+            list_add(b);
+            spin_unlock(&heap_lock, f);
+            return NULL;
+        }
     }
     bool ok = take(b, size);
-    irq_restore(f);
+    spin_unlock(&heap_lock, f);
     return ok ? b + 1 : NULL;
 }
 
@@ -208,13 +216,12 @@ void *kzalloc(size_t size) {
 }
 
 void kfree(void *p) {
-    cpu_require_bsp();
     if (!p) return;
     struct block *b = (struct block *)p - 1;
     if (b->magic != HEAP_MAGIC || b->free) {
         panic("kfree: bad pointer %p (magic %x free %d)", p, b->magic, b->free);
     }
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&heap_lock);
     b->free = BLOCK_FREE;
     heap_used -= b->size;
     struct block *n = b->next;
@@ -239,10 +246,11 @@ void kfree(void *p) {
         b = pr;
     }
     /* The freed bytes are backed: a large block has pages to give back. */
-    if (b->size >= TRIM_MIN) { b->free |= BLOCK_TRIM; trim_pending = true; }
+    bool trim = b->size >= TRIM_MIN;
+    if (trim) { b->free |= BLOCK_TRIM; trim_pending = true; }
     list_add(b);
-    irq_restore(f);
-    if (trim_pending) wq_wake_all(&trim_wq);
+    spin_unlock(&heap_lock, f);
+    if (trim) wq_wake_all(&trim_wq);
 }
 
 /* Gives the interior pages of large free blocks back to the page allocator.
@@ -250,7 +258,7 @@ void kfree(void *p) {
    interrupts off while APs wait on them, where a TLB shootdown could stall.
    Blocks of TRIM_MIN bytes and more are in the classes from TRIM_MIN's on. */
 static void heap_trim(void) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&heap_lock);
     trim_pending = false;
     unsigned first_fl, first_sl;
     class_of(TRIM_MIN, &first_fl, &first_sl);
@@ -265,14 +273,16 @@ static void heap_trim(void) {
                 vfree((void *)first, (last - first) / PAGE_SIZE); /* frees only mapped pages */
                 b->free |= BLOCK_RELEASED;
             }
-    irq_restore(f);
+    spin_unlock(&heap_lock, f);
 }
 
 static void heap_thread(void *arg) {
     (void)arg;
     for (;;) {
         uint64_t f = irq_save();
-        if (!trim_pending) wq_wait(&trim_wq);
+        /* A kfree on another CPU may set it just after this reads it: that block waits for the
+           next large free, which wakes this task again. */
+        if (!__atomic_load_n(&trim_pending, __ATOMIC_RELAXED)) wq_wait(&trim_wq);
         irq_restore(f);
         heap_trim();
     }

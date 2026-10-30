@@ -244,6 +244,9 @@ int64_t events_wait(struct handle *queue, struct n_event *uout, size_t max, int6
     int64_t result;
     for (;;) {
         uint64_t fl = irq_save();
+        /* Read before the scan: a change on any CPU after it moves the word on before it wakes the
+           queue, and the sleep below then does not begin. */
+        uint64_t seen = __atomic_load_n(&q->wait.generation, __ATOMIC_ACQUIRE);
         uint64_t now = uptime_ms(), next_due = UINT64_MAX;
         size_t n = 0;
         for (struct event_timer **at = &q->timers; *at;) {
@@ -280,12 +283,10 @@ int64_t events_wait(struct handle *queue, struct n_event *uout, size_t max, int6
             break;
         }
         if (current_task->killed) { irq_restore(fl); result = -N_ERR_STOPPED; break; }
-        /* Changes come from the BSP under its guard, held from the scan to the sleep: none is
-           missed in between. */
         uint64_t until = timeout_ms > 0 ? deadline : UINT64_MAX;
         if (next_due < until) until = next_due;
-        if (until == UINT64_MAX) wq_wait(&q->wait.wq);
-        else if (until > now) wq_wait_timeout(&q->wait.wq, until - now);
+        if (until == UINT64_MAX) wq_wait_unless(&q->wait.wq, &q->wait.generation, seen, 0);
+        else if (until > now) wq_wait_unless(&q->wait.wq, &q->wait.generation, seen, until - now);
         irq_restore(fl);
     }
     return result;

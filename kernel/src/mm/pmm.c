@@ -1,7 +1,7 @@
 /* Physical memory manager: a simple bitmap of 4 KiB frames. */
 #include "kernel.h"
 #include "arch/cpu.h"
-#include "arch/smp.h"
+#include "arch/spin.h"
 #include "mm/pmm.h"
 #include "limine.h"
 
@@ -11,6 +11,9 @@ static uint64_t free_pages;
 static uint64_t usable_pages;
 static uint64_t search_hint;
 static uint64_t low_base, low_pages; /* usable below 1 MiB; never allocated */
+/* The bitmap and its counts: any CPU allocates and frees frames. Taken inside the heap's and the
+   kernel page tables' locks; it takes none itself. */
+static struct spinlock pmm_lock;
 
 static inline void set_used(uint64_t p) { bitmap[p / 64] |= (1ULL << (p % 64)); }
 static inline void set_free(uint64_t p) { bitmap[p / 64] &= ~(1ULL << (p % 64)); }
@@ -130,8 +133,7 @@ uint64_t pmm_low_range(uint64_t *pages) {
 }
 
 uint64_t pmm_alloc_below(uint64_t limit) {
-    cpu_require_bsp();
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&pmm_lock);
     uint64_t pages = MIN(total_pages, limit / PAGE_SIZE);
     uint64_t words = (pages + 63) / 64;
     for (uint64_t n = 0; n < words; n++) {
@@ -144,10 +146,10 @@ uint64_t pmm_alloc_below(uint64_t limit) {
         set_used(p);
         free_pages--;
         search_hint = p;
-        irq_restore(f);
+        spin_unlock(&pmm_lock, f);
         return p * PAGE_SIZE;
     }
-    irq_restore(f);
+    spin_unlock(&pmm_lock, f);
     return 0;
 }
 
@@ -160,8 +162,7 @@ uint64_t pmm_alloc_zeroed(void) {
 }
 
 uint64_t pmm_alloc_contig_below(uint64_t count, uint64_t limit) {
-    cpu_require_bsp();
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&pmm_lock);
     uint64_t run = 0, pages = MIN(total_pages, limit / PAGE_SIZE);
     for (uint64_t p = 256; p < pages; p++) {
         if (is_used(p)) { run = 0; continue; }
@@ -169,29 +170,27 @@ uint64_t pmm_alloc_contig_below(uint64_t count, uint64_t limit) {
             uint64_t start = p - count + 1;
             for (uint64_t q = start; q <= p; q++) set_used(q);
             free_pages -= count;
-            irq_restore(f);
+            spin_unlock(&pmm_lock, f);
             return start * PAGE_SIZE;
         }
     }
-    irq_restore(f);
+    spin_unlock(&pmm_lock, f);
     return 0;
 }
 
 uint64_t pmm_alloc_contig(uint64_t count) { return pmm_alloc_contig_below(count, UINT64_MAX); }
 
 void pmm_free(uint64_t phys) {
-    cpu_require_bsp();
     uint64_t p = phys / PAGE_SIZE;
     if (p >= total_pages) return;
-    uint64_t f = irq_save();
-    if (!is_used(p)) {
-        irq_restore(f);
-        kprintf("pmm: double free of %p\n", (void *)phys);
-        return;
+    uint64_t f = spin_lock(&pmm_lock);
+    bool twice = !is_used(p);
+    if (!twice) {
+        set_free(p);
+        free_pages++;
     }
-    set_free(p);
-    free_pages++;
-    irq_restore(f);
+    spin_unlock(&pmm_lock, f);
+    if (twice) kprintf("pmm: double free of %p\n", (void *)phys);
 }
 
 uint64_t pmm_free_pages(void) { return free_pages; }
@@ -199,15 +198,14 @@ uint64_t pmm_page_count(void) { return total_pages; }
 bool pmm_page_used(uint64_t pfn) { return pfn >= total_pages || is_used(pfn); }
 
 bool pmm_claim(uint64_t pfn) {
-    cpu_require_bsp();
     if (pfn >= total_pages) return false;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&pmm_lock);
     bool was_free = !is_used(pfn);
     if (was_free) {
         set_used(pfn);
         free_pages--;
     }
-    irq_restore(f);
+    spin_unlock(&pmm_lock, f);
     return was_free;
 }
 uint64_t pmm_total_pages(void) { return usable_pages; }

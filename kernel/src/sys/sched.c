@@ -23,9 +23,12 @@
 struct task *task_list;
 
 static struct task *idle_task;
-/* kq: kernel threadとBSPのkernel継続にいるuser task（起床・新規・APからの返却）。 */
+/* kq: kernel threadとBSPのkernel継続にいるuser task（起床・新規・APからの返却）。
+   どのCPUも入れ（sched_make_ready）、取り出すのはBSPだけ。kq_lockはwait queueとaddress_lockの
+   後に取り、持ったままCPUのキューの排他を取らない。 */
 struct run_queue { struct task *head, *tail; };
 static struct run_queue kq;
+static struct spinlock kq_lock;
 static struct task *dead_list;
 /* The public app/thread IDs are signed 32-bit. Never wrap or reuse an ID:
    queued channel credentials remain meaningful after their sender ends. */
@@ -113,6 +116,7 @@ static struct task *address_park_pull(void);
 static void address_transit_wait(void);
 static void address_park_expire(uint64_t now);
 static uint64_t address_park_next(void);
+static bool wq_take_blocked(struct task *t);
 
 /* The BSP's tick takes queue locks (address_park_expire places woken tasks, ap_balance moves
    them), so a holder keeps interrupts off, as address_lock's: a tick arriving on the holder's
@@ -374,7 +378,8 @@ static void runner_return_irq(struct regs *r) {
     (void)__atomic_exchange_n(&runner_return_pending, 0, __ATOMIC_ACQ_REL);
     net_ap_notify_bsp();
     vmm_ap_stock_fill();
-    if (collect_runner()) need_resched = true;
+    /* A task an AP gave back, or one it woke into kq. */
+    if (collect_runner() || __atomic_load_n(&kq.head, __ATOMIC_ACQUIRE)) need_resched = true;
     /* Do not schedule inside a kernel IRQ: existing kernel continuations are
        non-preemptive. User return and idle's HLT return are safe switch points. */
 }
@@ -683,15 +688,22 @@ void kthread_start(void (*fn)(void *), void *arg) {
 }
 
 void sched_make_ready(struct task *t) {
-    uint64_t f = irq_save();
+    bool ap = cpu_current_index() != 0, queued = false;
+    uint64_t f = spin_lock(&kq_lock);
     ASSERT(t->owner_cpu == 0);
-    if (t->state != TASK_ZOMBIE && t != idle_task && !t->on_rq && t != current_task) {
+    if (ap) {
+        /* A blocked task may still be the BSP's current one, between its enrollment and its
+           switch: queued all the same, schedule() leaves it where it is and the BSP takes it
+           from kq like any other (only the BSP takes from kq, so its context is saved first). */
+        if (t->state == TASK_BLOCKED && !t->on_rq) { rq_push(t); queued = true; }
+    } else if (t->state != TASK_ZOMBIE && t != idle_task && !t->on_rq && t != current_task) {
         rq_push(t);
         bsp_preempt_check();
     } else if (t == current_task && t->state == TASK_BLOCKED) {
         t->state = TASK_RUNNING;
     }
-    irq_restore(f);
+    spin_unlock(&kq_lock, f);
+    if (queued) ap_doorbell();
 }
 
 static void free_task(struct task *t) {
@@ -732,10 +744,13 @@ void schedule(void) {
     struct task *prev = current_task;
     if (prev->owner_cpu) ASSERT(prev == bsp_handoff); /* post_switchでAPのキューへ入る */
     if (prev->state != TASK_RUNNING) prev->bsp_borrow = false;
-    if (prev->state == TASK_RUNNING && prev != idle_task && !prev->owner_cpu) {
+    spin_take(&kq_lock);
+    /* An AP may have woken prev into kq already: it stays there. */
+    if (prev->state == TASK_RUNNING && prev != idle_task && !prev->owner_cpu && !prev->on_rq) {
         rq_push(prev);
     }
     struct task *next = rq_pop();
+    spin_give(&kq_lock);
     if (!next) next = bsp_borrow_task(); /* kernelの仕事がない：待っているring3を借りる */
     if (!next) next = idle_task;
     need_resched = false;
@@ -770,16 +785,9 @@ void sched_tick(void) {
         ap_balance();
     }
     for (struct task *t = task_list; t; t = t->all_next) {
-        if (t->state == TASK_BLOCKED && t->wake_at && now >= t->wake_at) {
-            t->wake_at = 0;
+        if (t->state != TASK_BLOCKED || !t->wake_at || now < t->wake_at) continue;
+        if (wq_take_blocked(t)) {
             t->timed_out = true;
-            /* remove from its wait queue, if any */
-            if (t->wq) {
-                struct task **pp = &t->wq->head;
-                while (*pp && *pp != t) pp = &(*pp)->wq_next;
-                if (*pp) *pp = t->wq_next;
-                t->wq = NULL;
-            }
             sched_make_ready(t);
         }
     }
@@ -854,38 +862,77 @@ void sched_user_return(struct regs *r) {
 
 /* ---- wait queues ---- */
 
+/* Interrupts off. The task sleeps on wq (NULL: on its deadline alone) until a waker or its
+   deadline (ms from now by the clock apps read; 0: none) comes, unless word, read under wq's lock,
+   has moved on from seen. held, a lock the caller took to decide that it sleeps, is given back
+   once the task is enrolled. A waker on any CPU that moves the word on, or takes held, before it
+   wakes wq finds the task there. False when the deadline ended the sleep. */
+static bool wq_sleep(struct wait_queue *wq, const uint64_t *word, uint64_t seen, struct spinlock *held,
+                     uint64_t ms) {
+    struct task *t = current_task;
+    t->timed_out = false;
+    if (ms) {
+        uint64_t now = timer_now_ms();
+        t->wake_at = ms > UINT64_MAX - now ? UINT64_MAX : now + ms;
+    }
+    bool sleep = true;
+    if (wq) {
+        spin_take(&wq->lock);
+        sleep = !word || __atomic_load_n(word, __ATOMIC_SEQ_CST) == seen;
+        if (sleep) {
+            t->state = TASK_BLOCKED;
+            t->wq = wq;
+            t->wq_next = wq->head;
+            wq->head = t;
+        }
+        spin_give(&wq->lock);
+    } else t->state = TASK_BLOCKED;
+    if (held) spin_give(held);
+    if (sleep) schedule();
+    t->wake_at = 0;
+    return !t->timed_out;
+}
+
+/* BSP, interrupts off: blocked t leaves its wait queue, unless a waker on another CPU took it out
+   first (and wakes it). True: the caller wakes it. A blocked BSP task cannot run meanwhile and wait
+   on another queue: the BSP is here. */
+static bool wq_take_blocked(struct task *t) {
+    struct wait_queue *wq = __atomic_load_n(&t->wq, __ATOMIC_ACQUIRE);
+    if (wq) spin_take(&wq->lock);
+    bool here = t->wq == wq && t->state == TASK_BLOCKED;
+    if (here && wq) {
+        struct task **pp = &wq->head;
+        while (*pp && *pp != t) pp = &(*pp)->wq_next;
+        if (*pp) *pp = t->wq_next;
+        t->wq = NULL;
+    }
+    if (here) t->wake_at = 0;
+    if (wq) spin_give(&wq->lock);
+    return here;
+}
+
 void wq_wait(struct wait_queue *wq) {
     uint64_t f = irq_save();
-    struct task *t = current_task;
-    t->state = TASK_BLOCKED;
-    t->wq = wq;
-    t->wq_next = wq->head;
-    wq->head = t;
-    schedule();
+    wq_sleep(wq, NULL, 0, NULL, 0);
     irq_restore(f);
 }
 
 bool wq_wait_timeout(struct wait_queue *wq, uint64_t ms) {
     uint64_t f = irq_save();
-    struct task *t = current_task;
-    t->timed_out = false;
-    uint64_t now = timer_now_ms(), delay = ms ? ms : 1; /* at least ms, by the clock apps read */
-    t->wake_at = delay > UINT64_MAX - now ? UINT64_MAX : now + delay;
-    if (wq) {
-        t->wq = wq;
-        t->wq_next = wq->head;
-        wq->head = t;
-    }
-    t->state = TASK_BLOCKED;
-    schedule();
-    t->wake_at = 0;
-    bool ok = !t->timed_out;
+    bool ok = wq_sleep(wq, NULL, 0, NULL, ms ? ms : 1);
+    irq_restore(f);
+    return ok;
+}
+
+bool wq_wait_unless(struct wait_queue *wq, const uint64_t *word, uint64_t seen, uint64_t ms) {
+    uint64_t f = irq_save();
+    bool ok = wq_sleep(wq, word, seen, NULL, ms);
     irq_restore(f);
     return ok;
 }
 
 void wq_wake_all(struct wait_queue *wq) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&wq->lock);
     struct task *t = wq->head;
     wq->head = NULL;
     while (t) {
@@ -896,7 +943,7 @@ void wq_wake_all(struct wait_queue *wq) {
         sched_make_ready(t);
         t = n;
     }
-    irq_restore(f);
+    spin_unlock(&wq->lock, f);
 }
 
 void wq_nap(struct wait_queue *wq, volatile bool *kick, uint64_t ms) {
@@ -1079,32 +1126,22 @@ static inline uint32_t *address_bucket(uint64_t phys) { return &address_waiters[
 
 /* A wait issued on an AP that may block parks there: the task leaves its queue
    (kei SLEEP) without visiting the BSP, and a waker on any CPU hands it to an
-   AP queue again; the BSP's tick does the same at a finite wait's deadline. The BSP's blocked list and the watches stay BSP-owned; a
-   bucket counting any of them is woken on the BSP, which wakes parked tasks
-   too, in the one enrollment order. address_lock guards the parked list and
-   its counts. Never take a queue lock while holding it: ap_retired takes the
-   queue first. A woken task in transit to a queue is counted, so quiescing
-   waits until it is either in a queue or back on the BSP. */
+   AP queue again; the BSP's tick does the same at a finite wait's deadline.
+   address_lock guards every waiter of a word: the parked list, the tasks
+   blocked on the BSP (address_wait, whose own lock comes after it) and the
+   watches. A waker on any CPU takes them in the one enrollment order. Never
+   take a queue lock while holding it: ap_retired takes the queue first. A
+   woken task in transit to a queue is counted, so quiescing waits until it is
+   either in a queue or back on the BSP. */
 enum { PARK_NONE, PARK_ENROLLED, PARK_ASLEEP, PARK_WOKEN };
-static uint32_t address_lock;
+static struct spinlock address_lock;
 static struct task *address_parked, **address_parked_tail = &address_parked;
-static uint32_t address_parked_count[ADDRESS_BUCKETS];
 static uint32_t address_transit;
 static uint32_t address_timed_parks; /* parked tasks with a deadline */
 
 /* The BSP's tick takes address_lock (address_park_expire, from the timer interrupt), so its
-   holder keeps interrupts off: a tick arriving on the holder's own CPU would spin on itself.
-   (2026-10-28: queue_release woke a word with interrupts on and the BSP froze in its tick.) */
-static uint64_t address_lock_take(void) {
-    uint64_t flags = irq_save();
-    while (__atomic_exchange_n(&address_lock, 1, __ATOMIC_ACQUIRE))
-        while (__atomic_load_n(&address_lock, __ATOMIC_RELAXED)) pause();
-    return flags;
-}
-static void address_lock_drop(uint64_t flags) {
-    __atomic_store_n(&address_lock, 0, __ATOMIC_RELEASE);
-    irq_restore(flags);
-}
+   holder keeps interrupts off (spin_lock): a tick arriving on the holder's own CPU would spin on
+   itself. (2026-10-28: queue_release woke a word with interrupts on and the BSP froze in its tick.) */
 
 /* address_lock held. */
 static void address_park_unlink(struct task **link) {
@@ -1112,9 +1149,7 @@ static void address_park_unlink(struct task **link) {
     *link = t->park_next;
     if (address_parked_tail == &t->park_next) address_parked_tail = link;
     t->park_next = NULL;
-    unsigned b = address_bucket_index(t->wait_phys);
-    address_parked_count[b]--;
-    __atomic_sub_fetch(&address_waiters[b], 1, __ATOMIC_RELEASE);
+    __atomic_sub_fetch(&address_waiters[address_bucket_index(t->wait_phys)], 1, __ATOMIC_RELEASE);
     t->wait_phys = 0;
     if (t->park_deadline) {
         t->park_deadline = 0;
@@ -1129,7 +1164,6 @@ static struct task **address_park_link(struct task *t) {
 /* address_lock held, key's bucket counted: t sleeps on key until a waker or deadline
    (UINT64_MAX: none) comes, and its caller retires it as RET_PARK. */
 static void address_park_enroll(struct task *t, uint64_t key, uint64_t deadline) {
-    address_parked_count[address_bucket_index(key)]++;
     t->wait_phys = key;
     t->wait_seq = __atomic_add_fetch(&address_seq, 1, __ATOMIC_SEQ_CST);
     if (deadline != UINT64_MAX) {
@@ -1188,17 +1222,17 @@ static void address_park_place(struct task *placing) {
    a pull that runs later finds the task asleep. */
 static unsigned address_park_settle(struct task *t) {
     unsigned reason = RET_PARK;
-    uint64_t held = address_lock_take();
+    uint64_t held = spin_lock(&address_lock);
     if (t->address_park == PARK_WOKEN) reason = RET_LOCAL;
     else if (quiesce_match(t)) { address_park_unlink(address_park_link(t)); reason = RET_STOP; }
     t->address_park = reason == RET_PARK ? PARK_ASLEEP : PARK_NONE;
-    address_lock_drop(held);
+    spin_unlock(&address_lock, held);
     return reason;
 }
 /* BSP, quiescing: asleep parked tasks of the space, unwoken, on rq_next. */
 static struct task *address_park_pull(void) {
     struct task *pulled = NULL;
-    uint64_t held = address_lock_take();
+    uint64_t held = spin_lock(&address_lock);
     for (struct task **pp = &address_parked; *pp;) {
         struct task *t = *pp;
         if (t->address_park != PARK_ASLEEP || !quiesce_match(t)) { pp = &t->park_next; continue; }
@@ -1207,14 +1241,14 @@ static struct task *address_park_pull(void) {
         t->rq_next = pulled;
         pulled = t;
     }
-    address_lock_drop(held);
+    spin_unlock(&address_lock, held);
     return pulled;
 }
 /* BSP tick: parked waits past their deadline are woken, to end in a timeout. */
 static void address_park_expire(uint64_t now) {
     if (!__atomic_load_n(&address_timed_parks, __ATOMIC_RELAXED)) return;
     struct task *placing = NULL;
-    uint64_t held = address_lock_take();
+    uint64_t held = spin_lock(&address_lock);
     for (struct task **pp = &address_parked; *pp;) {
         struct task *t = *pp;
         if (!t->park_deadline || now < t->park_deadline) { pp = &t->park_next; continue; }
@@ -1222,17 +1256,17 @@ static void address_park_expire(uint64_t now) {
         t->address_timed_out = true;
         address_park_wake(t, &placing);
     }
-    address_lock_drop(held);
+    spin_unlock(&address_lock, held);
     address_park_place(placing);
 }
 /* The earliest of those deadlines, for a stopped tick (sched_next_wake). */
 static uint64_t address_park_next(void) {
     uint64_t next = UINT64_MAX;
     if (!__atomic_load_n(&address_timed_parks, __ATOMIC_RELAXED)) return next;
-    uint64_t held = address_lock_take();
+    uint64_t held = spin_lock(&address_lock);
     for (struct task *t = address_parked; t; t = t->park_next)
         if (t->park_deadline && t->park_deadline < next) next = t->park_deadline;
-    address_lock_drop(held);
+    spin_unlock(&address_lock, held);
     return next;
 }
 static void address_transit_wait(void) {
@@ -1254,20 +1288,22 @@ int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsi
     uint64_t phys = vmm_translate(t->pml4, (uint64_t)address);
     if (!phys && vmm_demand_fault(t->pml4, (uint64_t)address, false) > 0) phys = vmm_translate(t->pml4, (uint64_t)address);
     if (!phys) { irq_restore(flags); return -N_ERR_BAD_ADDRESS; }
+    /* Counted, read and enrolled under address_lock, which a waker on any CPU holds while it
+       looks: either it finds this task or this task reads its new value. */
     uint32_t *bucket = address_bucket(phys);
+    spin_take(&address_lock);
     __atomic_add_fetch(bucket, 1, __ATOMIC_SEQ_CST);
     uint64_t current = wide ? __atomic_load_n((volatile uint64_t *)address, __ATOMIC_SEQ_CST)
                             : __atomic_load_n((volatile uint32_t *)address, __ATOMIC_SEQ_CST);
     if (current != expected || !timeout_ms) {
         __atomic_sub_fetch(bucket, 1, __ATOMIC_RELEASE);
+        spin_give(&address_lock);
         irq_restore(flags);
         return current != expected ? -N_ERR_NOT_READY : -N_ERR_TIMEOUT;
     }
     t->wait_phys = phys;
     t->wait_seq = __atomic_add_fetch(&address_seq, 1, __ATOMIC_SEQ_CST);
-    bool awake = true;
-    if (timeout_ms == UINT32_MAX) wq_wait(&address_wait);
-    else awake = wq_wait_timeout(&address_wait, timeout_ms);
+    bool awake = wq_sleep(&address_wait, NULL, 0, &address_lock, timeout_ms == UINT32_MAX ? 0 : timeout_ms);
     t->wait_phys = 0;
     __atomic_sub_fetch(bucket, 1, __ATOMIC_RELEASE);
     irq_restore(flags);
@@ -1275,6 +1311,7 @@ int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsi
     return awake ? 0 : -N_ERR_TIMEOUT;
 }
 
+/* address_lock held. */
 static void address_watch_unlink(struct address_watch **link) {
     struct address_watch *w = *link;
     *link = w->next;
@@ -1283,11 +1320,13 @@ static void address_watch_unlink(struct address_watch **link) {
     __atomic_sub_fetch(address_bucket(w->phys), 1, __ATOMIC_RELEASE);
 }
 
-/* AP: a wake whose key has no waiter, or only parked ones, completes here;
-   so does a wait whose value already differs or that may not block. A wait
-   that may block enrolls in the parked list (with its deadline, if finite)
-   and the caller retires the task as RET_PARK. Everything else is the BSP's. The PTE is read before the key:
-   a present user page cannot be revoked while this CPU holds uaccess. */
+static unsigned address_wake(uint64_t phys, unsigned count);
+
+/* AP: a wake completes here, whoever waits; so does a wait whose value already
+   differs or that may not block. A wait that may block enrolls in the parked
+   list (with its deadline, if finite) and the caller retires the task as
+   RET_PARK. Everything else is the BSP's. The PTE is read before the key: a
+   present user page cannot be revoked while this CPU holds uaccess. */
 static enum ap_syscall address_ap_syscall(struct regs *r) {
     uint64_t a = r->rdi;
     struct task *t = current_task;
@@ -1295,26 +1334,7 @@ static enum ap_syscall address_ap_syscall(struct regs *r) {
         if ((a & 3) || a >= USER_TOP - sizeof(uint32_t)) return AP_SYSCALL_BSP;
         uint64_t pte = vmm_get_pte(t->pml4, a), phys = vmm_translate(t->pml4, a);
         if ((pte & (PTE_P | PTE_U)) != (PTE_P | PTE_U) || !phys) return AP_SYSCALL_BSP;
-        unsigned b = address_bucket_index(phys), count = (unsigned)r->rsi, done = 0;
-        __atomic_thread_fence(__ATOMIC_SEQ_CST); /* the user's store before the count */
-        if (__atomic_load_n(&address_waiters[b], __ATOMIC_RELAXED)) {
-            struct task *placing = NULL;
-            uint64_t held = address_lock_take();
-            if (__atomic_load_n(&address_waiters[b], __ATOMIC_RELAXED) != address_parked_count[b]) {
-                address_lock_drop(held);
-                return AP_SYSCALL_BSP; /* a BSP-blocked task or a watch shares the bucket */
-            }
-            for (struct task **pp = &address_parked; *pp && (!count || done < count);) {
-                struct task *w = *pp;
-                if (w->wait_phys != phys) { pp = &w->park_next; continue; }
-                address_park_unlink(pp);
-                address_park_wake(w, &placing);
-                done++;
-            }
-            address_lock_drop(held);
-            address_park_place(placing);
-        }
-        r->rax = done;
+        r->rax = address_wake(phys, (unsigned)r->rsi);
         return AP_SYSCALL_DONE;
     }
     if (r->rax != SYS_WAIT_ADDRESS && r->rax != SYS_WAIT_ADDRESS64) return AP_SYSCALL_BSP;
@@ -1331,7 +1351,7 @@ static enum ap_syscall address_ap_syscall(struct regs *r) {
     bool park = timeout != 0;
     uint64_t held = 0;
     if (park) {
-        held = address_lock_take();
+        held = spin_lock(&address_lock);
         __atomic_add_fetch(&address_waiters[b], 1, __ATOMIC_SEQ_CST);
     }
     uint64_t current = wide ? __atomic_load_n((volatile uint64_t *)a, __ATOMIC_SEQ_CST)
@@ -1340,7 +1360,7 @@ static enum ap_syscall address_ap_syscall(struct regs *r) {
         address_park_enroll(t, phys, timeout != UINT32_MAX ? uptime_ms() + timeout : UINT64_MAX);
     else if (park)
         __atomic_sub_fetch(&address_waiters[b], 1, __ATOMIC_RELEASE);
-    if (park) address_lock_drop(held);
+    if (park) spin_unlock(&address_lock, held);
     vmm_ap_uaccess_end();
     if (current != expected) { r->rax = (uint64_t)(int64_t)-N_ERR_NOT_READY; return AP_SYSCALL_DONE; }
     if (park) return AP_SYSCALL_PARK;
@@ -1356,10 +1376,10 @@ enum ap_syscall sleep_ap(uint64_t ms) {
     uint64_t now = uptime_ms(), delay = (ms ? ms : 1) + 1;
     uint64_t key = (uint64_t)&t->park_next, until = delay > UINT64_MAX - now ? UINT64_MAX : now + delay;
     t->wait_until = until; /* a sleep the BSP takes over (quiescing) keeps it: sleep_resume */
-    uint64_t held = address_lock_take();
+    uint64_t held = spin_lock(&address_lock);
     __atomic_add_fetch(&address_waiters[address_bucket_index(key)], 1, __ATOMIC_SEQ_CST);
     address_park_enroll(t, key, until);
-    address_lock_drop(held);
+    spin_unlock(&address_lock, held);
     return AP_SYSCALL_PARK;
 }
 
@@ -1367,12 +1387,12 @@ enum ap_syscall sleep_ap(uint64_t ms) {
 bool address_park_word(const uint64_t *word, uint64_t seen, uint64_t deadline) {
     uint64_t key = (uint64_t)word;
     unsigned b = address_bucket_index(key);
-    uint64_t held = address_lock_take();
+    uint64_t held = spin_lock(&address_lock);
     __atomic_add_fetch(&address_waiters[b], 1, __ATOMIC_SEQ_CST);
     bool park = __atomic_load_n(word, __ATOMIC_SEQ_CST) == seen;
     if (park) address_park_enroll(current_task, key, deadline);
     else __atomic_sub_fetch(&address_waiters[b], 1, __ATOMIC_RELEASE);
-    address_lock_drop(held);
+    spin_unlock(&address_lock, held);
     return park;
 }
 
@@ -1382,29 +1402,31 @@ void address_park_wake_word(const uint64_t *word) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST); /* the word's change before the count */
     if (!__atomic_load_n(&address_waiters[b], __ATOMIC_RELAXED)) return;
     struct task *placing = NULL;
-    uint64_t held = address_lock_take();
+    uint64_t held = spin_lock(&address_lock);
     for (struct task **pp = &address_parked; *pp;) {
         struct task *t = *pp;
         if (t->wait_phys != key) { pp = &t->park_next; continue; }
         address_park_unlink(pp);
         address_park_wake(t, &placing);
     }
-    address_lock_drop(held);
+    spin_unlock(&address_lock, held);
     address_park_place(placing);
 }
 
-/* BSP: the oldest waiters of the key first, whether blocked here, parked on
-   an AP or watching. */
-int task_wake_address(volatile uint32_t *address, unsigned count) {
-    uint64_t flags = irq_save();
+/* Any CPU: the oldest waiters of the physical word first, whether blocked on
+   the BSP, parked on an AP or watching. A watch's queue is notified once
+   address_lock is dropped (the notification wakes the words tasks park on,
+   under that lock), with a reference that keeps it meanwhile; a queue whose
+   last reference is already gone is ending and is not notified. */
+static unsigned address_wake(uint64_t phys, unsigned count) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST); /* the waker's store before the count */
+    if (!__atomic_load_n(&address_waiters[address_bucket_index(phys)], __ATOMIC_RELAXED)) return 0;
     unsigned done = 0;
     struct task *placing = NULL;
-    /* A watch's queue is notified after address_lock is dropped: the notification wakes the
-       words tasks park on, under that lock. The BSP guard keeps the queues alive meanwhile. */
     struct address_watch_queue *notify = NULL;
-    uint64_t phys = vmm_translate(current_task->pml4, (uint64_t)address);
-    uint64_t held = address_lock_take();
-    while (phys && (!count || done < count)) {
+    uint64_t held = spin_lock(&address_lock);
+    spin_take(&address_wait.lock);
+    while (!count || done < count) {
         uint64_t best = UINT64_MAX;
         struct task **task_link = NULL, **park_link = NULL;
         struct address_watch **watch_link = NULL;
@@ -1429,9 +1451,13 @@ int task_wake_address(volatile uint32_t *address, unsigned count) {
             struct address_watch *w = *watch_link;
             address_watch_unlink(watch_link);
             struct address_watch_queue *q = w->queue;
-            *q->ready_tail = w;
+            __atomic_store_n(q->ready_tail, w, __ATOMIC_RELEASE); /* address_watch_pending */
             q->ready_tail = &w->next;
-            if (!q->notify_pending) { q->notify_pending = true; q->notify_next = notify; notify = q; }
+            if (!__atomic_load_n(&q->notify_pending, __ATOMIC_ACQUIRE) && object_ref_live(&q->object)) {
+                q->notify_pending = true;
+                q->notify_next = notify;
+                notify = q;
+            }
         } else if (task_link) {
             struct task *t = *task_link;
             *task_link = t->wq_next;
@@ -1442,16 +1468,23 @@ int task_wake_address(volatile uint32_t *address, unsigned count) {
         } else break;
         done++;
     }
-    address_lock_drop(held);
+    spin_give(&address_wait.lock);
+    spin_unlock(&address_lock, held);
     address_park_place(placing);
     while (notify) {
         struct address_watch_queue *q = notify;
         notify = q->notify_next;
-        q->notify_pending = false;
+        /* next is read first: a waker that finds the flag clear chains q into its own list */
+        __atomic_store_n(&q->notify_pending, false, __ATOMIC_RELEASE);
         object_notify(&q->object);
+        object_unref(&q->object);
     }
-    irq_restore(flags);
-    return (int)done;
+    return done;
+}
+
+int task_wake_address(volatile uint32_t *address, unsigned count) {
+    uint64_t phys = vmm_translate(current_task->pml4, (uint64_t)address);
+    return phys ? (int)address_wake(phys, count) : 0;
 }
 
 bool address_watch_pending(struct object *queue) {
@@ -1459,30 +1492,35 @@ bool address_watch_pending(struct object *queue) {
     return __atomic_load_n(&q->ready, __ATOMIC_ACQUIRE) != NULL;
 }
 
-/* Take up to max notified tokens into a kernel array; BSP IRQ guard held. */
 size_t address_watch_take(struct object *queue, uint64_t *tokens, size_t max) {
     struct address_watch_queue *q = queue->priv;
+    struct address_watch *taken = NULL;
     size_t got = 0;
+    uint64_t held = spin_lock(&address_lock);
     while (q->ready && got < max) {
         struct address_watch *w = q->ready;
         q->ready = w->next;
         if (!q->ready) q->ready_tail = &q->ready;
         tokens[got++] = w->token;
-        kfree(w);
+        w->next = taken;
+        taken = w;
     }
+    spin_unlock(&address_lock, held);
+    while (taken) { struct address_watch *next = taken->next; kfree(taken); taken = next; }
     return got;
 }
+/* Any CPU: a waker's reference may be the last (address_wake). */
 static void address_watch_release(struct object *o) {
     struct address_watch_queue *q = o->priv;
     struct address_watch *done = NULL;
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock(&address_lock);
     for (struct address_watch **pw = &address_watches; *pw;) {
         if ((*pw)->queue != q) { pw = &(*pw)->next; continue; }
         struct address_watch *w = *pw;
         address_watch_unlink(pw);
         w->next = done; done = w;
     }
-    irq_restore(flags);
+    spin_unlock(&address_lock, flags);
     while (q->ready) { struct address_watch *next = q->ready->next; kfree(q->ready); q->ready = next; }
     while (done) { struct address_watch *next = done->next; kfree(done); done = next; }
     kfree(q);
@@ -1506,15 +1544,19 @@ int address_watch_add(struct object *queue, volatile uint32_t *address, uint32_t
     if (!phys && vmm_demand_fault(current_task->pml4, (uint64_t)address, false) > 0)
         phys = vmm_translate(current_task->pml4, (uint64_t)address);
     if (!phys) { irq_restore(flags); kfree(w); return -N_ERR_BAD_ADDRESS; }
-    /* Counted before the value check, as task_wait_address; unlink uncounts. */
+    /* Counted before the value check and linked under address_lock, as task_wait_address; unlink
+       uncounts. */
+    spin_take(&address_lock);
     __atomic_add_fetch(address_bucket(phys), 1, __ATOMIC_SEQ_CST);
     if (__atomic_load_n(address, __ATOMIC_SEQ_CST) != expected) {
         __atomic_sub_fetch(address_bucket(phys), 1, __ATOMIC_RELEASE);
+        spin_give(&address_lock);
         irq_restore(flags); kfree(w); return -N_ERR_NOT_READY;
     }
     w->queue = queue->priv; w->phys = phys; w->seq = __atomic_add_fetch(&address_seq, 1, __ATOMIC_SEQ_CST); w->token = token;
     *address_watch_tail = w;
     address_watch_tail = &w->next;
+    spin_give(&address_lock);
     irq_restore(flags);
     return 0;
 }
@@ -1524,7 +1566,7 @@ int address_watch_remove(struct object *queue, uint64_t token) {
     struct address_watch_queue *q = queue->priv;
     struct address_watch *found = NULL;
     int result = 0;
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock(&address_lock);
     for (struct address_watch **pw = &address_watches; *pw; pw = &(*pw)->next)
         if ((*pw)->queue == q && (*pw)->token == token) { found = *pw; address_watch_unlink(pw); result = 1; break; }
     if (!found)
@@ -1534,7 +1576,7 @@ int address_watch_remove(struct object *queue, uint64_t token) {
                 if (q->ready_tail == &found->next) q->ready_tail = pw;
                 result = 2; break;
             }
-    irq_restore(flags);
+    spin_unlock(&address_lock, flags);
     kfree(found);
     return result;
 }
@@ -1668,16 +1710,7 @@ static void kill_locked(struct task *t) {
     sched_quiesce_space(t->pml4);
     if (!t->killed) t->kill_code = 130;
     t->killed = true;
-    if (t->state == TASK_BLOCKED) {
-        if (t->wq) {
-            struct task **pp = &t->wq->head;
-            while (*pp && *pp != t) pp = &(*pp)->wq_next;
-            if (*pp) *pp = t->wq_next;
-            t->wq = NULL;
-        }
-        t->wake_at = 0;
-        sched_make_ready(t);
-    }
+    if (t->state == TASK_BLOCKED && wq_take_blocked(t)) sched_make_ready(t);
 }
 
 int task_kill(int pid) {

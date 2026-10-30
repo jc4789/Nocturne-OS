@@ -3,13 +3,26 @@
 #include "arch/cpu.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
-#include "arch/smp.h"
+#include "arch/spin.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
 #include "limine.h"
 
 uint64_t kernel_pml4;
 uint64_t pte_nx;
+
+/* The kernel half's tables, which every space shares: any CPU maps kernel pages (the heap grows,
+   a kernel stack is made, on whichever CPU allocates). A user space's lower half stays the BSP's,
+   changed under its IRQ guard. Taken before pmm's lock. Removing or changing a present kernel
+   translation needs a shootdown, which only the BSP starts. */
+static struct spinlock kmap_lock;
+static uint64_t tables_lock(uint64_t pml4, uint64_t va) {
+    return pml4 == kernel_pml4 || va >= USER_TOP ? spin_lock(&kmap_lock) : irq_save();
+}
+static void tables_unlock(uint64_t pml4, uint64_t va, uint64_t flags) {
+    if (pml4 == kernel_pml4 || va >= USER_TOP) spin_unlock(&kmap_lock, flags);
+    else irq_restore(flags);
+}
 
 /* memory map regions that are RAM (usable, ACPI tables and NVS, bootloader, kernel): the direct
    map already reaches them write-back, so vmm_map_phys leaves them as they are. Neighbours are
@@ -162,6 +175,15 @@ void vmm_tlb_ipi(void) {
     __atomic_store_n(&tlb_ack[cpu], seq, __ATOMIC_RELEASE);
 }
 
+/* An AP spinning with IRQs off (arch/spin.h): a shootdown it has not acknowledged is served here,
+   so the BSP never waits on a CPU that waits on a lock the BSP holds. A request that did not name
+   this CPU is served too; that only flushes. */
+void vmm_tlb_poll(void) {
+    unsigned cpu = cpu_current_index();
+    if (cpu && __atomic_load_n(&tlb_req_seq, __ATOMIC_ACQUIRE) != __atomic_load_n(&tlb_ack[cpu], __ATOMIC_RELAXED))
+        vmm_tlb_ipi();
+}
+
 bool vmm_ap_uaccess_begin(void) {
     unsigned cpu = cpu_current_index();
     uint64_t pml4 = current_task->pml4;
@@ -212,6 +234,7 @@ static void revoke_begin(uint64_t pml4) {
 /* BSP: drop [va, va+pages) of pml4 from every TLB (kernel addresses: from every
    space). Called with the PTEs already changed and IRQs disabled. */
 static void tlb_shootdown(uint64_t pml4, uint64_t va, uint64_t pages) {
+    cpu_require_bsp();
     bool kernel = va >= USER_TOP || pml4 == kernel_pml4;
     int slot = -1;
     uint32_t gen = 0;
@@ -310,9 +333,9 @@ static bool vmm_map_page_locked(uint64_t pml4, uint64_t va, uint64_t pa, uint64_
 bool vmm_map_page(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags) {
     /* Retiring APs does not exclude another BSP syscall. In particular, the
        next_level lookup/allocate/publication must not lose a sibling's table. */
-    uint64_t saved = irq_save();
+    uint64_t saved = tables_lock(pml4, va);
     bool result = vmm_map_page_locked(pml4, va, pa, flags);
-    irq_restore(saved);
+    tables_unlock(pml4, va, saved);
     return result;
 }
 
@@ -381,7 +404,7 @@ uint64_t vmm_translate(uint64_t pml4, uint64_t va) {
    once; old[i] receives each previous PTE (0 when nothing was mapped). The
    frames stay valid for the caller to free only after this returns. */
 static void unmap_range(uint64_t pml4, uint64_t va, uint64_t pages, uint64_t *old) {
-    uint64_t flags = irq_save();
+    uint64_t flags = tables_lock(pml4, va);
     bool any = false;
     for (uint64_t i = 0; i < pages; i++) {
         bool huge = false;
@@ -400,7 +423,7 @@ static void unmap_range(uint64_t pml4, uint64_t va, uint64_t pages, uint64_t *ol
         user_page_count_change(pml4, va + i * PAGE_SIZE, old[i], 0);
     }
     if (any) tlb_shootdown(pml4, va, pages);
-    irq_restore(flags);
+    tables_unlock(pml4, va, flags);
 }
 
 #define UNMAP_BATCH 64
@@ -494,7 +517,7 @@ void *vmm_map_mmio(uint64_t phys, uint64_t size) {
    memory for that); the run is shot down once; then lines cached while it was write-back are
    flushed out of every cache (clflush works whatever the type of the page). BSP. */
 bool vmm_direct_type(const uint64_t *frames, uint64_t base, size_t pages, uint64_t type) {
-    uint64_t f = irq_save(), splits = 0, last = ~0ull;
+    uint64_t f = spin_lock(&kmap_lock), splits = 0, last = ~0ull;
     for (size_t i = 0; i < pages; i++) {
         uint64_t va = hhdm_offset + (frames ? frames[i] : base + i * PAGE_SIZE);
         bool huge = false;
@@ -503,7 +526,7 @@ bool vmm_direct_type(const uint64_t *frames, uint64_t base, size_t pages, uint64
             last = ALIGN_DOWN(va, 1ULL << 21);
         }
     }
-    if (splits && pmm_free_pages() < splits + 16) { irq_restore(f); return false; }
+    if (splits && pmm_free_pages() < splits + 16) { spin_unlock(&kmap_lock, f); return false; }
     for (size_t i = 0; i < pages; i++) {
         uint64_t va = hhdm_offset + (frames ? frames[i] : base + i * PAGE_SIZE);
         bool stale = false;
@@ -522,7 +545,7 @@ bool vmm_direct_type(const uint64_t *frames, uint64_t base, size_t pages, uint64
             for (size_t at = 0; at < PAGE_SIZE; at += 64) __asm__ volatile("clflush (%0)" ::"r"(p + at) : "memory");
         }
     __asm__ volatile("mfence" ::: "memory");
-    irq_restore(f);
+    spin_unlock(&kmap_lock, f);
     return true;
 }
 
@@ -960,10 +983,7 @@ bool vmm_handle_user_fault(uint64_t addr, uint64_t err) {
 static uint64_t vmalloc_next = VMALLOC_BASE;
 
 void *vmalloc(size_t pages) {
-    uint64_t f = irq_save();
-    uint64_t va = vmalloc_next;
-    vmalloc_next += (pages + 1) * PAGE_SIZE; /* leave a guard page */
-    irq_restore(f);
+    uint64_t va = __atomic_fetch_add(&vmalloc_next, (pages + 1) * PAGE_SIZE, __ATOMIC_RELAXED); /* a guard page */
     for (size_t i = 0; i < pages; i++) {
         uint64_t p = pmm_alloc_zeroed();
         if (!p) {
@@ -986,10 +1006,7 @@ static void unmap_kernel(uint64_t va, size_t pages, bool free_frames) {
 
 /* Existing frames (frames[i], or a run from pa) at fresh kernel addresses (e.g. read+execute only). */
 static void *map_frames(const uint64_t *frames, uint64_t pa, size_t pages, uint64_t flags) {
-    uint64_t f = irq_save();
-    uint64_t va = vmalloc_next;
-    vmalloc_next += (pages + 1) * PAGE_SIZE;
-    irq_restore(f);
+    uint64_t va = __atomic_fetch_add(&vmalloc_next, (pages + 1) * PAGE_SIZE, __ATOMIC_RELAXED);
     for (size_t i = 0; i < pages; i++)
         if (!vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, frames ? frames[i] : pa + i * PAGE_SIZE, flags)) {
             unmap_kernel(va, i, false);

@@ -1,6 +1,6 @@
 /* Framebuffer text console with a tiny ANSI escape parser. */
 #include "kernel.h"
-#include "arch/cpu.h"
+#include "arch/spin.h"
 #include "dev/fb.h"
 #include "dev/fbcon.h"
 #include "mm/pmm.h"
@@ -10,6 +10,7 @@
 
 static canvas_t cv;
 static bool ready, enabled;
+static struct spinlock fbcon_lock; /* the console's state and its pixels: any CPU logs */
 static int cols, rows, cx, cy, top;
 /* 0 empty, 1 narrow, 2 wide lead, 3 wide continuation. */
 static uint8_t *cell_spans;
@@ -240,12 +241,12 @@ static void putc_raw(char ch) {
 
 void fbcon_write(const char *s, size_t n) {
     if (!ready || !enabled) return;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&fbcon_lock);
     draw_cursor(false);
     for (size_t i = 0; i < n; i++) putc_raw(s[i]);
     draw_cursor(true);
     flush();
-    irq_restore(f);
+    spin_unlock(&fbcon_lock, f);
 }
 
 void fbcon_write_kernel(const char *s, size_t n) {
@@ -254,10 +255,10 @@ void fbcon_write_kernel(const char *s, size_t n) {
 
 void fbcon_repaint(void) {
     if (!ready || !enabled) return;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&fbcon_lock);
     mark(0, cv.h);
     flush();
-    irq_restore(f);
+    spin_unlock(&fbcon_lock, f);
 }
 
 void fbcon_set_enabled(bool on) {

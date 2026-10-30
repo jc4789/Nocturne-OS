@@ -7,9 +7,11 @@
    places at once (the tables of the apps it was handed to, a message that carries it), each
    place holding a reference of its own.
 
-   All of this state is BSP-owned and changed under the BSP IRQ guard (irq_save). AP syscalls
-   only read it (handle_ap_peek); the BSP frees a handle, an object or a table only after
-   ap_read_synchronize. */
+   Handles and tables are BSP-owned and changed under the BSP IRQ guard (irq_save). AP syscalls
+   only read them (handle_ap_peek); the BSP frees a handle, an object or a table only after
+   ap_read_synchronize. An object's reference count and its list of waits are any CPU's: the
+   count is atomic, the list is under the object's lock (taken before a wait queue's and
+   address_lock, never while holding a CPU queue's lock or address_lock). */
 #pragma once
 #include "kernel.h"
 #include "sys/sched.h"
@@ -20,7 +22,9 @@ struct event_watch;
 
 /* One wait for many objects (an event queue's): it stays registered with each object it watches.
    Any change to one moves generation on and wakes whoever sleeps on wq or is parked on an AP on
-   generation's word (sched.c's address park), and they check again. */
+   generation's word (sched.c's address park), and they check again. A waiter reads generation
+   before it looks, and sleeps only while it still reads that (wq_wait_unless, address_park_word):
+   a change on another CPU between the look and the sleep is never missed. */
 struct object_wait {
     struct wait_queue wq;
     uint64_t generation;
@@ -31,6 +35,7 @@ struct object_wait {
 struct object_waiter {
     struct object_waiter *next, **prev;
     struct object_wait *wait;
+    struct object *object; /* whose list it is on */
 };
 
 struct object_ops {
@@ -54,6 +59,7 @@ struct object {
     int refs;
     void *priv;
     struct object_waiter *waiters;
+    struct spinlock lock; /* waiters */
 };
 
 struct handle {
@@ -67,6 +73,10 @@ struct handle {
 /* An object with no references yet: the first handle opened on it takes one. */
 void object_init(struct object *o, const struct object_ops *ops, void *priv);
 void object_ref(struct object *o);
+/* A reference unless the last one is already gone (its release may be under way): false then. */
+bool object_ref_live(struct object *o);
+/* Any CPU; the last reference releases the object there (an object some CPU may drop last has a
+   release that any CPU can run). */
 void object_unref(struct object *o);
 
 /* A new opening of o (NULL: no memory; o is left as it was). */
@@ -80,7 +90,7 @@ static inline bool handle_is(const struct handle *h, const struct object_ops *op
 }
 uint32_t handle_ready(struct handle *h); /* as ops->ready */
 
-/* Waiting, on the BSP: a change to o notifies every wait registered with it. */
+/* Any CPU: a change to o notifies every wait registered with it. */
 void object_notify(struct object *o);
 void object_waiter_link(struct object_waiter *w, struct object_wait *wait, struct object *o);
 void object_waiter_unlink(struct object_waiter *w);
