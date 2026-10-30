@@ -44,6 +44,7 @@ struct task {
     uint8_t address_park;     /* APで寝るaddress待ちの段階（sched.cのPARK_*、address_lockの下） */
     bool address_woken;       /* 寝たaddress待ちが起こされた：再開でsyscallを0で終える */
     bool address_timed_out;   /* その起こしは期限切れ（BSPの拍）：時間切れで終える */
+    bool address_retry;       /* 寝たのはカーネルの語（address_park_word）：起こされたらsyscallをやり直す */
     uint64_t park_deadline;   /* 有限の寝るaddress待ちの期限（uptime_ms）。0は無期限 */
     uint64_t wait_until;      /* APで寝た事象待ちと眠りを、やり直しでも守る最初の期限（uptime_ms、UINT64_MAXは無期限）。0はやり直しでない */
     struct task *park_next;   /* APで寝るaddress待ちの一覧（到着順） */
@@ -167,6 +168,9 @@ bool wq_wait_timeout(struct wait_queue *wq, uint64_t ms); /* returns false on ti
    *word (which the waker moves on before it wakes wq) no longer reads seen, the value read before
    the condition was checked. ms 0: no limit; false on timeout. */
 bool wq_wait_unless(struct wait_queue *wq, const uint64_t *word, uint64_t seen, uint64_t ms);
+/* Interrupts off, held taken: sleep on wq, held given back once enrolled (a waker that takes held
+   to change the condition, then wakes wq, finds the task there). Returns without held. */
+void wq_wait_locked(struct wait_queue *wq, struct spinlock *held);
 void wq_wake_all(struct wait_queue *wq);
 /* A driver waiting for its device: asleep on wq until *kick is set (its interrupt handler sets it,
    then wakes wq) or for up to ms; *kick is cleared. wq and kick may be NULL: just the time. The

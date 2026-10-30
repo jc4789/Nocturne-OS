@@ -377,7 +377,6 @@ static void runner_return_irq(struct regs *r) {
        send a fresh IPI rather than disappear behind the consumed doorbell. */
     (void)__atomic_exchange_n(&runner_return_pending, 0, __ATOMIC_ACQ_REL);
     net_ap_notify_bsp();
-    vmm_ap_stock_fill();
     /* A task an AP gave back, or one it woke into kq. */
     if (collect_runner() || __atomic_load_n(&kq.head, __ATOMIC_ACQUIRE)) need_resched = true;
     /* Do not schedule inside a kernel IRQ: existing kernel continuations are
@@ -497,20 +496,20 @@ redo:;
     sched_set_current(NULL);
     context_switch(&t->ksp, runner_idle_sp[cpu]);
     if (reason == RET_PARK) {
-        /* 起こされたaddress待ちは0か時間切れで、眠りは期限で0で終わる。起こされた事象待ちは
-           再開したAPで見直す（見張る対象が変わったか、期限が来た）。起こされずにBSPへ戻った待ちは
-           BSPがやり直す。 */
-        bool woken = t->address_woken, events = r->rax == SYS_EVENTS_WAIT;
-        if (woken && events && cpu_is_runner()) {
-            t->address_woken = t->address_timed_out = false;
+        /* 起こされたaddress待ちは0か時間切れで、眠りは期限で0で終わる。カーネルの語で寝た呼出し
+           （事象待ち・channelの送受）は再開したAPでやり直す（見る対象が変わったか、期限が来た）。
+           起こされずにBSPへ戻った待ちはBSPがやり直す。 */
+        bool woken = t->address_woken, retry = t->address_retry;
+        if (woken && retry && cpu_is_runner()) {
+            t->address_woken = t->address_timed_out = t->address_retry = false;
             goto redo;
         }
-        if (woken && !events) {
+        if (woken && !retry) {
             r->rax = t->address_timed_out && r->rax != SYS_SLEEP ? (uint64_t)(int64_t)-N_ERR_TIMEOUT : 0;
             t->wait_until = 0;
         }
-        dispatch = !woken || events;
-        t->address_woken = t->address_timed_out = false;
+        dispatch = !woken || retry;
+        t->address_woken = t->address_timed_out = t->address_retry = false;
     }
     /* APのキューから再開した（同じAPとは限らない）：launchが状態を整えた。 */
     if (cpu_is_runner()) return;
@@ -924,6 +923,8 @@ bool wq_wait_timeout(struct wait_queue *wq, uint64_t ms) {
     return ok;
 }
 
+void wq_wait_locked(struct wait_queue *wq, struct spinlock *held) { wq_sleep(wq, NULL, 0, held, 0); }
+
 bool wq_wait_unless(struct wait_queue *wq, const uint64_t *word, uint64_t seen, uint64_t ms) {
     uint64_t f = irq_save();
     bool ok = wq_sleep(wq, word, seen, NULL, ms);
@@ -1171,7 +1172,7 @@ static void address_park_enroll(struct task *t, uint64_t key, uint64_t deadline)
         __atomic_add_fetch(&address_timed_parks, 1, __ATOMIC_RELAXED);
     }
     t->address_park = PARK_ENROLLED;
-    t->address_woken = t->address_timed_out = false;
+    t->address_woken = t->address_timed_out = t->address_retry = false;
     t->park_next = NULL;
     *address_parked_tail = t;
     address_parked_tail = &t->park_next;
@@ -1390,7 +1391,10 @@ bool address_park_word(const uint64_t *word, uint64_t seen, uint64_t deadline) {
     uint64_t held = spin_lock(&address_lock);
     __atomic_add_fetch(&address_waiters[b], 1, __ATOMIC_SEQ_CST);
     bool park = __atomic_load_n(word, __ATOMIC_SEQ_CST) == seen;
-    if (park) address_park_enroll(current_task, key, deadline);
+    if (park) {
+        address_park_enroll(current_task, key, deadline);
+        current_task->address_retry = true;
+    }
     else __atomic_sub_fetch(&address_waiters[b], 1, __ATOMIC_RELEASE);
     spin_unlock(&address_lock, held);
     return park;

@@ -228,7 +228,7 @@ static int64_t sys_sysinfo(struct n_sysinfo *si) {
     si->total_mem = pmm_total_pages() * PAGE_SIZE;
     /* What an app can have: idle programs give their frames to one that asks (frames_free), and
        the frames set aside for the APs' first touches are no one's yet. */
-    si->free_mem = (pmm_free_pages() + programs_idle() + vmm_ap_stock_pages()) * PAGE_SIZE;
+    si->free_mem = (pmm_free_pages() + programs_idle()) * PAGE_SIZE;
     si->heap_used = heap_used_bytes();
     si->uptime_ms = uptime_ms();
     uint64_t flags = irq_save();
@@ -2508,18 +2508,30 @@ static int64_t sys_events_wait(int q, struct n_event *uout, size_t max, int64_t 
     return r;
 }
 
-/* sys_channel_receive's checks, in its order, before a message channel end's AP poll. */
-static bool channel_receive_ap(struct regs *r, struct handle *h, bool credentials, int64_t *result) {
-    void *uoutput = (void *)r->r8;
+/* sys_channel_receive on an AP, for a message channel end: what it reports as an error, the BSP
+   reports. The output is checked before the message is taken and written under the same uaccess. */
+static enum ap_syscall channel_receive_ap(struct regs *r, struct handle *h, bool credentials, int64_t *result) {
+    void *ubuf = (void *)r->rsi, *uoutput = (void *)r->r8;
+    size_t cap = (size_t)r->rdx, output_size = credentials ? sizeof(struct n_channel_message) : sizeof(int32_t);
     int flags = (int)r->r10;
-    if (flags & ~(N_CHANNEL_WAIT | N_CHANNEL_PEEK | N_CHANNEL_DISCARD) ||
-        ((flags & N_CHANNEL_PEEK) && (flags & N_CHANNEL_DISCARD)) || (credentials && !uoutput)) return false;
-    if (uoutput) {
-        if (!vmm_ap_user_begin(uoutput, credentials ? sizeof(struct n_channel_message) : sizeof(int32_t), true))
-            return false;
-        vmm_ap_uaccess_end();
-    }
-    return message_channel_is(h) && message_channel_receive_ap(h, flags & N_CHANNEL_WAIT, result);
+    bool peek = flags & N_CHANNEL_PEEK;
+    if (flags & ~(N_CHANNEL_WAIT | N_CHANNEL_PEEK | N_CHANNEL_DISCARD) || (peek && (flags & N_CHANNEL_DISCARD)) ||
+        (credentials && !uoutput) || !message_channel_is(h) || !vmm_ap_uaccess_begin())
+        return AP_SYSCALL_BSP;
+    struct n_channel_message message = {.attached = -1};
+    enum ap_syscall served = AP_SYSCALL_BSP;
+    if (!uoutput || vmm_ap_user_ok(uoutput, output_size, true))
+        served = message_channel_receive_ap(h, ubuf, cap, flags, &message.sender_app, result);
+    if (served == AP_SYSCALL_DONE && *result >= 0 && uoutput && (credentials || !peek))
+        memcpy(uoutput, credentials ? (const void *)&message : (const void *)&message.attached, output_size);
+    vmm_ap_uaccess_end();
+    return served;
+}
+
+/* sys_channel_send on an AP: a message channel end, no attachment (a handle: the BSP's). */
+static enum ap_syscall channel_send_ap(struct regs *r, struct handle *h, int64_t *result) {
+    if ((int)r->r10 >= 0 || !message_channel_is(h)) return AP_SYSCALL_BSP;
+    return message_channel_send_ap(h, (const void *)r->rsi, (size_t)r->rdx, result);
 }
 
 enum ap_syscall syscall_ap(struct regs *r) {
@@ -2533,20 +2545,23 @@ enum ap_syscall syscall_ap(struct regs *r) {
     case SYS_SLEEP: return sleep_ap(r->rdi);
     case SYS_TCP_SEND: case SYS_TCP_SEND_UNTIL: case SYS_TCP_RECV:
         return net_ap_syscall(r) ? AP_SYSCALL_DONE : AP_SYSCALL_BSP;
-    case SYS_AUDIO_STATUS: case SYS_CHANNEL_RECEIVE: case SYS_CHANNEL_RECEIVE_FROM: case SYS_WIN_RECEIVE:
-    case SYS_WIN_STATE: case SYS_EVENTS_WAIT: case SYS_APP_RESULT: {
+    case SYS_AUDIO_STATUS: case SYS_CHANNEL_SEND: case SYS_CHANNEL_RECEIVE: case SYS_CHANNEL_RECEIVE_FROM:
+    case SYS_WIN_RECEIVE: case SYS_WIN_STATE: case SYS_EVENTS_WAIT: case SYS_APP_RESULT: {
         if (current_task->killed) return AP_SYSCALL_BSP; /* the BSP ends the process */
         ap_read_begin();
         struct handle *h = handle_ap_peek((int)r->rdi);
         enum ap_syscall served;
         if (r->rax == SYS_EVENTS_WAIT)
             served = events_wait_ap(h, (struct n_event *)r->rsi, (size_t)r->rdx, (int64_t)r->r10, &result);
+        else if (r->rax == SYS_CHANNEL_SEND)
+            served = channel_send_ap(r, h, &result);
+        else if (r->rax == SYS_CHANNEL_RECEIVE || r->rax == SYS_CHANNEL_RECEIVE_FROM)
+            served = channel_receive_ap(r, h, r->rax == SYS_CHANNEL_RECEIVE_FROM, &result);
         else {
             bool done = r->rax == SYS_AUDIO_STATUS ? audio_stream_status_ap(h, (struct n_audio_status *)r->rsi, &result)
                       : r->rax == SYS_WIN_RECEIVE ? wm_receive_ap(h, (size_t)r->rdx, (int64_t)r->r10, &result)
                       : r->rax == SYS_WIN_STATE ? wm_state_ap(h, &result)
-                      : r->rax == SYS_APP_RESULT ? proc_app_result_ap(h, (int64_t)r->rsi, &result)
-                      : channel_receive_ap(r, h, r->rax == SYS_CHANNEL_RECEIVE_FROM, &result);
+                      : proc_app_result_ap(h, (int64_t)r->rsi, &result);
             served = done ? AP_SYSCALL_DONE : AP_SYSCALL_BSP;
         }
         ap_read_end();

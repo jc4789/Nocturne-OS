@@ -198,18 +198,22 @@ void vmm_ap_uaccess_end(void) {
     __atomic_store_n(&cpu_uaccess[cpu_current_index()], 0, __ATOMIC_RELEASE);
 }
 
-bool vmm_ap_user_begin(const void *pointer, size_t length, bool write) {
+bool vmm_ap_user_ok(const void *pointer, size_t length, bool write) {
     uint64_t address = (uint64_t)pointer;
+    if (!length) return true;
     if (address >= USER_TOP || length > USER_TOP - address) return false;
-    if (!vmm_ap_uaccess_begin()) return false;
     for (uint64_t at = ALIGN_DOWN(address, PAGE_SIZE); at < address + length; at += PAGE_SIZE) {
         uint64_t pte = vmm_get_pte(current_task->pml4, at);
-        if ((pte & (PTE_P | PTE_U)) != (PTE_P | PTE_U) || (write && !(pte & PTE_W))) {
-            vmm_ap_uaccess_end();
-            return false;
-        }
+        if ((pte & (PTE_P | PTE_U)) != (PTE_P | PTE_U) || (write && !(pte & PTE_W))) return false;
     }
     return true;
+}
+
+bool vmm_ap_user_begin(const void *pointer, size_t length, bool write) {
+    if (!vmm_ap_uaccess_begin()) return false;
+    if (vmm_ap_user_ok(pointer, length, write)) return true;
+    vmm_ap_uaccess_end();
+    return false;
 }
 
 static bool tlb_wait(uint64_t *word, uint64_t want, bool equal) {
@@ -754,18 +758,12 @@ int vmm_user_reserve(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
    the same table, so ascending first touches fault once per 64 KiB. */
 #define DEMAND_AROUND 16
 
-/* Where a fill's zeroed frames come from: take(first) gives one (0: none, which stops a fill
-   around), put takes back one a fill could not use. */
-struct frame_source {
-    uint64_t (*take)(bool first);
-    void (*put)(uint64_t frame);
-};
-
 /* A first touch of the reserved page at va (write: a write), and the reserved pages after it in
-   its table: 1 when va's page is present now, 0 when it is no reserved page it may touch so,
-   -N_ERR_NO_MEMORY when no frame came for it. The BSP and an AP may fill one table at once, and
-   the BSP change reserved leaves meanwhile: a leaf is filled by compare-and-swap. */
-static int demand_fill(uint64_t pml4, uint64_t va, bool write, const struct frame_source *frames) {
+   its table (while memory is not short): 1 when va's page is present now, 0 when it is no reserved
+   page it may touch so, -N_ERR_NO_MEMORY when no frame came for it. Any CPU: two may fill one
+   table at once, and the BSP change reserved leaves meanwhile: a leaf is filled by
+   compare-and-swap. */
+static int demand_fill(uint64_t pml4, uint64_t va, bool write) {
     bool huge = false;
     uint64_t page = ALIGN_DOWN(va, PAGE_SIZE), *pte = walk(pml4, page, &huge);
     if (!pte || huge) return 0;
@@ -775,11 +773,11 @@ static int demand_fill(uint64_t pml4, uint64_t va, bool write, const struct fram
         uint64_t e = __atomic_load_n(&l1[idx], __ATOMIC_RELAXED);
         if (!n && (e & PTE_P)) return 1; /* a sibling filled it first */
         if ((e & (PTE_P | PTE_DEMAND)) != PTE_DEMAND || (!n && write && !(e & PTE_W))) break;
-        uint64_t frame = frames->take(!n);
+        uint64_t frame = !n || pmm_free_pages() >= 4096 ? pmm_alloc_zeroed() : 0;
         if (!frame) return n ? result : -N_ERR_NO_MEMORY;
         uint64_t now = frame | (e & ~PTE_DEMAND) | PTE_P;
         if (!__atomic_compare_exchange_n(&l1[idx], &e, now, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
-            frames->put(frame);
+            pmm_free(frame);
             return n ? result : (e & PTE_P) != 0;
         }
         user_page_count_change(pml4, page + n * PAGE_SIZE, e, now);
@@ -788,100 +786,38 @@ static int demand_fill(uint64_t pml4, uint64_t va, bool write, const struct fram
     return result;
 }
 
-static uint64_t bsp_frame_take(bool first) { return first || pmm_free_pages() >= 4096 ? pmm_alloc_zeroed() : 0; }
-static const struct frame_source bsp_frames = {bsp_frame_take, pmm_free};
-
 int vmm_demand_fault(uint64_t pml4, uint64_t va, bool write) {
     if (va >= USER_TOP || !pml4 || pml4 == kernel_pml4) return 0;
     uint64_t f = irq_save();
-    int result = demand_fill(pml4, va, write, &bsp_frames);
+    int result = demand_fill(pml4, va, write);
     irq_restore(f);
     return result;
 }
 
 /* ---- first touches on an AP ----
-   An app thread's first touch of a reserved page on an AP is filled there, from frames the BSP set
-   aside for that AP, instead of a trip to the BSP and back. The fill runs inside an AP user access,
-   so a revocation of the space (revoke_begin) waits for it. */
-#define AP_FRAMES 512            /* 2 MiB for each AP: 32 first touches */
-#define AP_FRAMES_KEEP_FREE 16384 /* pages: with fewer free, the BSP sets none aside */
-static struct ap_stock {
-    uint64_t frame[AP_FRAMES];
-    uint32_t given, taken; /* the BSP's count and the AP's: given - taken frames wait */
-    uint64_t spare;        /* one the AP took and could not use, for its next fill */
-} __attribute__((aligned(64))) ap_stock[CPU_MAX_COUNT];
-static uint32_t ap_stock_wanted; /* a bit for each AP whose stock ran low */
+   An app thread's first touch of a reserved page on an AP is filled there instead of a trip to the
+   BSP and back. The fill runs inside an AP user access, so a revocation of the space
+   (revoke_begin) waits for it. */
 static uint64_t ap_touches, ap_touch_cycles; /* served on an AP: count, TSC cycles (prof) */
-
-static uint64_t ap_frame_take(bool first) {
-    (void)first;
-    struct ap_stock *s = &ap_stock[cpu_current_index()];
-    uint64_t frame = s->spare;
-    if (frame) __atomic_store_n(&s->spare, 0, __ATOMIC_RELAXED);
-    else {
-        uint32_t taken = s->taken;
-        if (taken == __atomic_load_n(&s->given, __ATOMIC_ACQUIRE)) return 0;
-        frame = s->frame[taken % AP_FRAMES];
-        __atomic_store_n(&s->taken, taken + 1, __ATOMIC_RELEASE);
-    }
-    memset(phys_to_virt(frame), 0, PAGE_SIZE);
-    return frame;
-}
-static void ap_frame_put(uint64_t frame) { __atomic_store_n(&ap_stock[cpu_current_index()].spare, frame, __ATOMIC_RELAXED); }
-static const struct frame_source ap_frames = {ap_frame_take, ap_frame_put};
 
 bool vmm_ap_demand_fault(uint64_t va, uint64_t err) {
     if ((err & 1) || va >= USER_TOP) return false; /* a protection violation: the BSP decides */
-    unsigned cpu = cpu_current_index();
     bool filled = false;
     uint64_t began = rdtsc();
     if (vmm_ap_uaccess_begin()) {
-        filled = demand_fill(current_task->pml4, va, err & 2, &ap_frames) > 0;
+        filled = demand_fill(current_task->pml4, va, err & 2) > 0;
         vmm_ap_uaccess_end();
     }
     if (filled) {
         __atomic_add_fetch(&ap_touches, 1, __ATOMIC_RELAXED);
         __atomic_add_fetch(&ap_touch_cycles, rdtsc() - began, __ATOMIC_RELAXED);
     }
-    struct ap_stock *s = &ap_stock[cpu];
-    if (__atomic_load_n(&s->given, __ATOMIC_RELAXED) - s->taken < AP_FRAMES / 2 &&
-        !(__atomic_fetch_or(&ap_stock_wanted, 1u << cpu, __ATOMIC_ACQ_REL) & (1u << cpu)))
-        cpu_bsp_wake();
     return filled;
-}
-
-void vmm_ap_stock_fill(void) {
-    cpu_require_bsp();
-    uint32_t wanted = __atomic_exchange_n(&ap_stock_wanted, 0, __ATOMIC_ACQ_REL);
-    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
-        if (!(wanted & (1u << cpu))) continue;
-        struct ap_stock *s = &ap_stock[cpu];
-        uint32_t given = s->given, taken = __atomic_load_n(&s->taken, __ATOMIC_ACQUIRE);
-        while (given - taken < AP_FRAMES && pmm_free_pages() > AP_FRAMES_KEEP_FREE) {
-            uint64_t frame = pmm_alloc();
-            if (!frame) break;
-            s->frame[given % AP_FRAMES] = frame;
-            given++;
-        }
-        __atomic_store_n(&s->given, given, __ATOMIC_RELEASE);
-    }
 }
 
 void vmm_ap_touch_stats(uint64_t *touches, uint64_t *cycles) {
     *touches = __atomic_load_n(&ap_touches, __ATOMIC_RELAXED);
     *cycles = __atomic_load_n(&ap_touch_cycles, __ATOMIC_RELAXED);
-}
-
-uint64_t vmm_ap_stock_pages(void) {
-    uint64_t pages = 0;
-    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
-        struct ap_stock *s = &ap_stock[cpu];
-        /* taken first: given only grows past it */
-        uint32_t taken = __atomic_load_n(&s->taken, __ATOMIC_ACQUIRE);
-        pages += __atomic_load_n(&s->given, __ATOMIC_ACQUIRE) - taken;
-        pages += __atomic_load_n(&s->spare, __ATOMIC_RELAXED) != 0;
-    }
-    return pages;
 }
 
 /* mprotect: set exactly these permissions on already-mapped user pages. shared: pages of one shared

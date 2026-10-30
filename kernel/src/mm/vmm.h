@@ -63,13 +63,10 @@ int vmm_user_reserve(uint64_t pml4, uint64_t va, uint64_t size, int prot); /* ze
 /* First touch of a reserved page: 1 when mapped (or already present), 0 when
    va is no reserved page, -N_ERR_NO_MEMORY when no frame is left. */
 int vmm_demand_fault(uint64_t pml4, uint64_t va, bool write);
-/* The same for the current app thread's page fault (the error code) on an AP, with frames the
-   BSP set aside for it: true when the page is present now; false when the BSP must decide (no
-   reserved page, a protection violation, no frame set aside). vmm_ap_stock_fill (BSP) sets
-   frames aside for the APs that asked. */
+/* The same for the current app thread's page fault (the error code) on an AP: true when the page
+   is present now; false when the BSP must decide (no reserved page, a protection violation, no
+   frame left). */
 bool vmm_ap_demand_fault(uint64_t va, uint64_t err);
-void vmm_ap_stock_fill(void);
-uint64_t vmm_ap_stock_pages(void); /* frames set aside so and not yet taken: free memory too */
 void vmm_ap_touch_stats(uint64_t *touches, uint64_t *cycles); /* served so since boot, TSC cycles */
 /* shared: pages of one shared mapping whose access the caller checked; absent pages are skipped */
 int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot, bool shared);
@@ -88,6 +85,8 @@ void vmm_ap_uaccess_end(void);
    writable): no stack growth or demand page on an AP. true holds off revocation until
    vmm_ap_uaccess_end; false (not mapped, or a revocation under way) means the BSP serves it. */
 bool vmm_ap_user_begin(const void *pointer, size_t length, bool write);
+/* With uaccess already held: the same test for another range, which the same end covers. */
+bool vmm_ap_user_ok(const void *pointer, size_t length, bool write);
 void vmm_tlb_stats(uint64_t *shootdowns, uint64_t *ipis);
 
 void *vmalloc(size_t pages);
