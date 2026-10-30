@@ -16,7 +16,6 @@ static uint64_t pool[4] = {0x6A09E667F3BCC908ULL, 0xBB67AE8584CAA73BULL, 0x3C6EF
                            0xA54FF53A5F1D36F1ULL};
 static unsigned pool_pos;
 static uint64_t counter;
-static bool have_rdrand;
 
 /* Each CPU's interrupts mix into its own feed, with that CPU's interrupts off: no other CPU writes
    it, and a read folds it in with plain word loads (a word half a mix behind is jitter all the
@@ -81,9 +80,8 @@ static void chacha_block(const uint32_t key[8], uint64_t ctr, uint32_t out[16]) 
 void entropy_get(void *buf, size_t n) {
     uint64_t hw[4];
     unsigned nhw = 0;
-    if (have_rdrand)
-        for (int i = 0; i < 4; i++)
-            if (rdrand64(&hw[nhw])) nhw++;
+    for (int i = 0; i < 4; i++)
+        if (rdrand64(&hw[nhw])) nhw++;
     uint64_t f = spin_lock(&pool_lock);
     pool_add(rdtsc());
     for (unsigned i = 0; i < nhw; i++) pool_add(hw[i]);
@@ -113,13 +111,10 @@ void entropy_get(void *buf, size_t n) {
 }
 
 void entropy_init(void) {
-    uint32_t a, b, c, d;
-    cpuid(1, 0, &a, &b, &c, &d);
-    have_rdrand = c & (1u << 30);
     for (int i = 0; i < 64; i++) {
         entropy_add(rdtsc()); /* into this CPU's feed, which the first read folds in */
         for (volatile int j = 0; j < (i & 7) * 50; j++) {
         }
     }
-    kprintf("random: entropy pool ready%s\n", have_rdrand ? " (rdrand)" : "");
+    kprintf("random: entropy pool ready\n");
 }

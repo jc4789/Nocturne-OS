@@ -700,7 +700,7 @@ static uint64_t map_user(struct window *w, struct task *t, unsigned index) {
     for (size_t i = 0; i < w->pages; i++) {
         uint32_t *pixels = w->flags & WIN_DOUBLE_BUFFER ? (index ? w->user_buf : w->buf) : w->user_buf;
         uint64_t pa = vmm_translate(kernel_pml4, (uint64_t)pixels + i * PAGE_SIZE);
-        if (!vmm_map_page(t->pml4, va + i * PAGE_SIZE, pa, PTE_P | PTE_W | PTE_U | PTE_SHARED | pte_nx)) {
+        if (!vmm_map_page(t->pml4, va + i * PAGE_SIZE, pa, PTE_P | PTE_W | PTE_U | PTE_SHARED | PTE_NX)) {
             vmm_user_free(t->pml4, va, i * PAGE_SIZE); /* PTE_SHARED: unmap only */
             mmap_hole_add(t, va, bytes + PAGE_SIZE);
             return 0;

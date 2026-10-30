@@ -60,7 +60,6 @@ static volatile uint64_t requests_end[] = LIMINE_REQUESTS_END_MARKER;
 
 uint64_t hhdm_offset;
 const char *kernel_cmdline = "";
-char cpu_brand[64];
 
 void apic_init(const struct limine_mp_response *mp);
 void kmain_late(void);
@@ -81,13 +80,14 @@ void kmain(void) {
     hhdm_offset = hhdm_req.response->offset;
     if (cmdline_req.response && cmdline_req.response->cmdline) kernel_cmdline = cmdline_req.response->cmdline;
 
+    cpu_features_init();
+    cpu_setup();
     gdt_init();
     idt_init();
     fpu_init();
     /* IA32_PAT before any page table is built: vmm.c maps MMIO as index 3 (UC), the framebuffer as 5 (WC) */
     uint64_t pat = pat_init_cpu();
-    kprintf("cpu: PAT %016lx%s\n", pat, pat == PAT_NOCTURNE ? "" : pat ? " (unexpected)" : " (unsupported)");
-    cpu_get_brand(cpu_brand);
+    if (pat != PAT_NOCTURNE) kprintf("cpu: PAT %016lx (unexpected)\n", pat);
 
     struct limine_memmap_response *mm = mm_req.response;
     pmm_init(mm);
@@ -97,17 +97,6 @@ void kmain(void) {
     if (fb_req.response && fb_req.response->framebuffer_count > 0) {
         fb_init(fb_req.response->framebuffers[0]);
         fbcon_init();
-    }
-    kprintf("cpu: %s\n", cpu_brand);
-    {
-        /* The leaves the feature checks read, as the CPU (or the hypervisor) reports them. */
-        uint32_t a1, b1, c1, d1, a7, b7, c7, d7, ad, bd, cd, dd, ae, be, ce, de;
-        cpuid(1, 0, &a1, &b1, &c1, &d1);
-        cpuid(7, 0, &a7, &b7, &c7, &d7);
-        cpuid(0xD, 0, &ad, &bd, &cd, &dd);
-        cpuid(0x80000001, 0, &ae, &be, &ce, &de);
-        kprintf("cpu: cpuid 1 ecx %08x edx %08x, 7 ebx %08x ecx %08x edx %08x, d eax %08x ebx %08x ecx %08x, "
-                "80000001 ecx %08x edx %08x\n", c1, d1, b7, c7, d7, ad, bd, cd, ce, de);
     }
     vm_detect();
     kprintf("video: %ux%u, %u bpp, %u bpc (R%u@%u G%u@%u B%u@%u)%s, pitch %u\n", fb.width, fb.height,

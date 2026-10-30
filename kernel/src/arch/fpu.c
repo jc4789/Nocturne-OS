@@ -1,126 +1,107 @@
+/* The extended state (XSTATE). The first CPU fixes the components and the area's layout once;
+   every other CPU has to match it. The layout is the compacted form (SDM Vol. 1 13.4.3): the
+   512-byte legacy region, the 64-byte header, then each enabled component from 2 up at its own
+   size, 64-byte aligned where CPUID leaf 0xD says so. It is computed from those sizes, not read
+   from the leaf's size of what is enabled now, which a hypervisor may report from stale state
+   (QEMU's WHPX gives 0xD.0 EBX for the XCR0 before the last XSETBV). */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/fpu.h"
+#include "sys/sched.h"
 
+#define CR0_MP      (1ULL << 1)
+#define CR0_EM      (1ULL << 2)
+#define CR0_TS      (1ULL << 3)
+#define CR0_NE      (1ULL << 5)
+#define CR4_OSFXSR  (1ULL << 9)
+#define CR4_OSXMMEXCPT (1ULL << 10)
 #define CR4_OSXSAVE (1ULL << 18)
-#define LEGACY_MASK 3u
-#define AVX_MASK 7u
-#define AVX_OFFSET 576u
-#define AVX_BYTES 256u
 
-/* BSPで一度だけ選び、AP publication/task生成後には変更しない。 */
-static uint32_t xstate_mask, state_bytes = 512;
-static bool policy_ready;
-static struct fpu_state initial_state;
+/* x87, SSE, AVX, AVX-512's opmask, ZMM_Hi256 and Hi16_ZMM: what Nocturne enables (its floor has
+   them all). Components the CPU has beyond these (PKRU, AMX) stay off. */
+#define USER_COMPONENTS 0xE7UL
+#define LEGACY_BYTES 512u
+#define HEADER_BYTES 64u
+#define XCOMP_COMPACTED (1ULL << 63)
 
-const uint8_t *fpu_state_data(const struct fpu_state *state) {
-    return (const uint8_t *)ALIGN_UP(state->storage, 64);
+struct fpu_state { uint8_t bytes[1]; }; /* fpu_state_bytes of them, 64-byte aligned */
+
+static uint32_t area_bytes;
+static uint32_t offset[64]; /* each enabled component's place in the compacted area */
+static struct fpu_state *initial;
+static uint8_t initial_storage[LEGACY_BYTES + HEADER_BYTES + 63] __attribute__((aligned(64)));
+
+size_t fpu_storage_bytes(void) { return area_bytes + 63; }
+struct fpu_state *fpu_state_in(void *storage) { return (struct fpu_state *)ALIGN_UP((uintptr_t)storage, 64); }
+
+/* What every CPU turns on: SSE with its exceptions, no x87 emulation, XSAVE with the components.
+   IA32_XSS keeps its reset value 0: no supervisor component. */
+static bool setup(void) {
+    write_cr0((read_cr0() & ~(CR0_EM | CR0_TS)) | CR0_MP | CR0_NE);
+    write_cr4(read_cr4() | CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE);
+    xsetbv0(USER_COMPONENTS);
+    return xgetbv0() == USER_COMPONENTS;
 }
-
-bool fpu_has_avx(void) { return xstate_mask == AVX_MASK; }
-
-static bool legacy_supported(uint32_t *features) {
-    uint32_t a, b, c, d;
-    cpuid(1, 0, &a, &b, &c, &d);
-    *features = c;
-    return (d & ((1u << 0) | (1u << 24) | (1u << 25) | (1u << 26))) ==
-                ((1u << 0) | (1u << 24) | (1u << 25) | (1u << 26));
-}
-
-static void legacy_setup(void) {
-    write_cr0((read_cr0() & ~((1ULL << 2) | (1ULL << 3))) | (1ULL << 1) | (1ULL << 5));
-    write_cr4((read_cr4() & ~CR4_OSXSAVE) | (1ULL << 9) | (1ULL << 10));
-}
-
-static bool xsave_supported(uint32_t features, uint32_t mask) {
-    uint32_t a, b, c, d;
-    if (!(features & (1u << 26))) return false;
-    cpuid(0, 0, &a, &b, &c, &d);
-    if (a < 0xD) return false;
-    cpuid(0xD, 0, &a, &b, &c, &d);
-    if ((a & mask) != mask || c < 576) return false;
-    if (mask == AVX_MASK) {
-        if (!(features & (1u << 28))) return false;
-        cpuid(0xD, 2, &a, &b, &c, &d);
-        /* 標準形式のYMM上半部。未知layout/XSS/XFDは採用しない。 */
-        if (a != AVX_BYTES || b != AVX_OFFSET || (c & 5u)) return false;
-    }
-    return true;
-}
-
-static bool xsave_setup(uint32_t mask, uint32_t expected_bytes) {
-    uint32_t a, b, c, d;
-    write_cr4(read_cr4() | CR4_OSXSAVE);
-    /* CPUID mask検査後だけXSETBV、OSXSAVE確認後だけXGETBVを実行する。 */
-    cpuid(1, 0, &a, &b, &c, &d);
-    if (!(c & (1u << 27))) goto fail;
-    xsetbv0(mask);
-    if (xgetbv0() != mask) goto fail;
-    cpuid(0xD, 0, &a, &b, &c, &d);
-    if (b != expected_bytes || b > FPU_STATE_BYTES) goto fail;
-    return true;
-fail:
-    /* XGETBVもFXSAVE modeで呼ばない。AVXはOSXSAVE clearで使用不可。 */
-    write_cr4(read_cr4() & ~CR4_OSXSAVE);
-    return false;
-}
-
-void fpu_save(struct fpu_state *state) {
-    uint8_t *data = (uint8_t *)fpu_state_data(state);
-    if (xstate_mask) {
-        /* XSAVEはheader reserved/XCOMP_BVを初期化しない。標準形式だけを保持。 */
-        memset(data + 512, 0, 64);
-        __asm__ volatile("xsave64 (%0)" : : "r"(data), "a"(xstate_mask), "d"(0u) : "memory");
-    } else {
-        __asm__ volatile("fxsave64 (%0)" : : "r"(data) : "memory");
-    }
-}
-
-void fpu_restore(const struct fpu_state *state) {
-    const uint8_t *data = fpu_state_data(state);
-    if (xstate_mask)
-        __asm__ volatile("xrstor64 (%0)" : : "r"(data), "a"(xstate_mask), "d"(0u) : "memory");
-    else
-        __asm__ volatile("fxrstor64 (%0)" : : "r"(data) : "memory");
-}
-
-void fpu_state_init(struct fpu_state *state) {
-    memset(state->storage, 0, sizeof state->storage);
-    memcpy((void *)fpu_state_data(state), fpu_state_data(&initial_state), FPU_STATE_BYTES);
-}
-
-void fpu_reset(void) { fpu_restore(&initial_state); }
 
 void fpu_init(void) {
-    uint32_t features;
-    ASSERT(!policy_ready);
-    if (!legacy_supported(&features)) panic("cpu: x87/FXSR/SSE2 required by Nocturne");
-    legacy_setup();
-    if (!cmdline_has("noxsave") && xsave_supported(features, LEGACY_MASK)) {
-        uint32_t wanted = !cmdline_has("noavx") && xsave_supported(features, AVX_MASK) ? AVX_MASK : LEGACY_MASK;
-        uint32_t bytes = wanted == AVX_MASK ? AVX_OFFSET + AVX_BYTES : 576;
-        if (xsave_setup(wanted, bytes)) {
-            xstate_mask = wanted;
-            state_bytes = bytes;
-        }
+    uint32_t a, b, c, d;
+    cpuid(0xD, 0, &a, &b, &c, &d);
+    uint64_t has = a | (uint64_t)d << 32;
+    if ((has & USER_COMPONENTS) != USER_COMPONENTS) panic("fpu: XSAVE lacks components %lx", USER_COMPONENTS & ~has);
+    uint32_t at = LEGACY_BYTES + HEADER_BYTES;
+    for (unsigned i = 2; i < 64; i++) {
+        if (!(USER_COMPONENTS & (1ULL << i))) continue;
+        cpuid(0xD, i, &a, &b, &c, &d);
+        if (c & 2) at = ALIGN_UP(at, 64);
+        offset[i] = at;
+        at += a;
     }
-    uint8_t *data = (uint8_t *)fpu_state_data(&initial_state);
-    memset(data, 0, FPU_STATE_BYTES);
-    *(uint16_t *)(data + 0) = 0x037F; /* FXSAVE fallbackのx87 control、tag=empty */
-    *(uint32_t *)(data + 24) = 0x1F80; /* XRSTORもMXCSRはmemoryから復帰する */
-    /* XSAVE header XSTATE_BV=0で全許可componentをinitial状態へ。XMM/YMMも零。 */
+    area_bytes = at;
+    if (!setup()) panic("fpu: XCR0 does not hold %lx", USER_COMPONENTS);
+    /* The initial area: every component in its initial state (XSTATE_BV 0), which XRSTORS loads
+       as the architecture's initial values; FCW and MXCSR are written too, so the area also reads
+       as them. It is the header and the legacy region only: XRSTORS reads nothing past the header
+       for a component whose XSTATE_BV bit is 0. */
+    initial = fpu_state_in(initial_storage);
+    memset(initial, 0, LEGACY_BYTES + HEADER_BYTES);
+    *(uint16_t *)(initial->bytes + 0) = 0x037F;
+    *(uint32_t *)(initial->bytes + 24) = 0x1F80;
+    *(uint64_t *)(initial->bytes + LEGACY_BYTES + 8) = XCOMP_COMPACTED | USER_COMPONENTS;
     fpu_reset();
-    policy_ready = true;
-    kprintf("fpu: %s bytes=%u mask=%x AVX=%s\n", xstate_mask ? "XSAVE64" : "FXSAVE64",
-            state_bytes, xstate_mask, fpu_has_avx() ? "enabled" : "disabled");
+    kprintf("fpu: XSAVES, components %lx, %u bytes a task\n", USER_COMPONENTS, area_bytes);
 }
 
 bool fpu_init_ap(void) {
-    uint32_t features;
-    if (!policy_ready || !legacy_supported(&features)) return false;
-    legacy_setup();
-    if (xstate_mask && (!xsave_supported(features, xstate_mask) || !xsave_setup(xstate_mask, state_bytes)))
-        return false;
+    if (!area_bytes || !setup()) return false;
     fpu_reset();
     return true;
 }
+
+void fpu_state_init(struct fpu_state *state) {
+    memset(state, 0, area_bytes);
+    memcpy(state, initial, LEGACY_BYTES + HEADER_BYTES);
+}
+
+void fpu_save(struct fpu_state *state) {
+    __asm__ volatile("xsaves64 (%0)" : : "r"(state), "a"((uint32_t)USER_COMPONENTS), "d"(0u) : "memory");
+}
+
+void fpu_restore(const struct fpu_state *state) {
+    __asm__ volatile("xrstors64 (%0)" : : "r"(state), "a"((uint32_t)USER_COMPONENTS), "d"(0u) : "memory");
+}
+
+void fpu_reset(void) { fpu_restore(initial); }
+
+const uint8_t *fpu_state_component(const struct fpu_state *state, unsigned component) {
+    if (component < 2) return state->bytes;
+    if (component >= 64 || !(USER_COMPONENTS & (1ULL << component))) return NULL;
+    uint64_t present = *(const uint64_t *)(state->bytes + LEGACY_BYTES);
+    return present & (1ULL << component) ? state->bytes + offset[component] : NULL;
+}
+
+void fpu_kernel_begin(void) {
+    fpu_save(current_task->fpu);
+    fpu_reset();
+}
+
+void fpu_kernel_end(void) { fpu_restore(current_task->fpu); }

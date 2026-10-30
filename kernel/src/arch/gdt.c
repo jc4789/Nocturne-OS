@@ -63,24 +63,3 @@ void gdt_init_cpu(unsigned index) {
         : : "m"(g) : "rax", "memory");
     cpu_local_init(index);
 }
-
-void cpu_get_brand(char *out) {
-    uint32_t a, b, c, d;
-    cpuid(0x80000000, 0, &a, &b, &c, &d);
-    if (a < 0x80000004) {
-        uint32_t v[3];
-        cpuid(0, 0, &a, &v[0], &v[2], &v[1]);
-        memcpy(out, v, 12);
-        out[12] = 0;
-        return;
-    }
-    uint32_t *o = (uint32_t *)out;
-    for (uint32_t i = 0; i < 3; i++) {
-        cpuid(0x80000002 + i, 0, &o[i * 4], &o[i * 4 + 1], &o[i * 4 + 2], &o[i * 4 + 3]);
-    }
-    out[48] = 0;
-    /* trim leading spaces */
-    char *p = out;
-    while (*p == ' ') p++;
-    if (p != out) memmove(out, p, strlen(p) + 1);
-}

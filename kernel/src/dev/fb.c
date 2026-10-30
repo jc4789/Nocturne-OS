@@ -265,7 +265,7 @@ int64_t fb_scanout_check(const struct n_scanout *d, uint64_t *bytes) {
 /* o drawn into the given pages in d's format (fb_scanout_check passed). */
 static int64_t scanout_map(struct scanout *o, const uint64_t *frames, size_t pages, uint64_t type,
                            size_t first_byte, const struct n_scanout *d) {
-    void *map = vmalloc_map_frames(frames, pages, PTE_W | type | pte_nx);
+    void *map = vmalloc_map_frames(frames, pages, PTE_W | type | PTE_NX);
     if (!map) return -N_ERR_NO_MEMORY;
     uint32_t format = d->format & N_SCANOUT_FORMAT_MASK;
     bool deep = format == N_SCANOUT_XRGB2101010, bgr = format == N_SCANOUT_XBGR8888;

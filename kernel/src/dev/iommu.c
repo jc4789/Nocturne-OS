@@ -200,17 +200,7 @@ bool iommu_fault_report(void) {
 }
 
 void iommu_cache_flush(const volatile void *p, size_t bytes) {
-    /* the line size + 1 once read (CPUID.01H:EBX[15:8], eight-byte units), by any CPU: the same */
-    static unsigned known;
-    unsigned line = __atomic_load_n(&known, __ATOMIC_RELAXED);
-    if (!line) {
-        uint32_t a, b, c, d;
-        cpuid(1, 0, &a, &b, &c, &d);
-        line = (d & (1u << 19) ? ((b >> 8) & 0xFF) * 8 : 0) + 1;
-        __atomic_store_n(&known, line, __ATOMIC_RELAXED);
-    }
-    line--;
-    if (!line) { __asm__ volatile("wbinvd" ::: "memory"); return; }
+    unsigned line = cpu_features.clflush_bytes;
     uintptr_t at = (uintptr_t)p / line * line, end = (uintptr_t)p + bytes;
     for (; at < end; at += line) __asm__ volatile("clflush (%0)" ::"r"(at) : "memory");
     __asm__ volatile("mfence" ::: "memory");

@@ -10,20 +10,16 @@
 #include "arch/wake.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "mm/heap.h"
 
 #define TRAMP_DATA 0x200 /* keep in step with arch/wake.asm */
 #define WAKE_PAGES 4     /* code and data, PML4, PDPT, PD */
-#define MSR_EFER   0xC0000080u
 #define MSR_STAR   0xC0000081u
 #define MSR_LSTAR  0xC0000082u
 #define MSR_CSTAR  0xC0000083u
 #define MSR_SFMASK 0xC0000084u
 #define MSR_FS_BASE 0xC0000100u
 #define MSR_TSC_AUX 0xC0000103u
-#define MSR_PAT    0x277u
-#define EFER_LME   (1u << 8)
-#define EFER_NXE   (1u << 11)
-#define EFER_LMA   (1u << 10)
 #define CR4_PCIDE  (1ULL << 17)
 
 struct tramp_data {
@@ -114,7 +110,7 @@ void wake_prepare(uint64_t entry, uint64_t stack, uint64_t arg, uint32_t apic_id
     d->far64 = (uint32_t)(page + (uint64_t)(tramp_lm64 - tramp_start));
     d->far64_sel = 0x18;
     d->cr3 = (uint32_t)(page + 0x1000);
-    d->efer = EFER_LME | (pte_nx ? EFER_NXE : 0);
+    d->efer = EFER_LME | EFER_NXE;
     d->entry = entry;
     d->stack = stack;
     d->arg = arg;
@@ -136,9 +132,8 @@ void wake_prepare(uint64_t entry, uint64_t stack, uint64_t arg, uint32_t apic_id
 static struct {
     uint64_t cr0, cr3, cr4, efer, pat, star, lstar, cstar, sfmask, fs, gs, kgs, tsc_aux;
     struct { uint16_t limit; uint64_t base; } PACKED idtr;
-    bool rdtscp, pat_ok;
 } cpu;
-static struct fpu_state fpu;
+static void *fpu_storage; /* the first CPU's extended state across the sleep */
 
 /* Called by wake_resume64 on the saved stack, with the kernel's GDT loaded and nothing else:
    no IDT, no GS base. Touches no per-CPU data. */
@@ -149,7 +144,7 @@ void wake_restore_cpu(void) {
     write_cr3(cpu.cr3);
     write_cr0(cpu.cr0);
     wrmsr(MSR_EFER, cpu.efer & ~(uint64_t)EFER_LMA);
-    if (cpu.pat_ok) wrmsr(MSR_PAT, cpu.pat);
+    wrmsr(MSR_PAT, cpu.pat);
     wrmsr(MSR_STAR, cpu.star);
     wrmsr(MSR_LSTAR, cpu.lstar);
     wrmsr(MSR_CSTAR, cpu.cstar);
@@ -157,7 +152,7 @@ void wake_restore_cpu(void) {
     wrmsr(MSR_FS_BASE, cpu.fs);
     wrmsr(MSR_GS_BASE, cpu.gs);
     wrmsr(MSR_KERNEL_GS_BASE, cpu.kgs);
-    if (cpu.rdtscp) wrmsr(MSR_TSC_AUX, cpu.tsc_aux);
+    wrmsr(MSR_TSC_AUX, cpu.tsc_aux);
     ((uint64_t *)wake_gdtr.base)[TSS_SEL / 8] &= ~(1ULL << 41); /* the TSS is marked busy: ltr refuses that */
     __asm__ volatile("ltr %w0" : : "r"((uint16_t)TSS_SEL));
     __asm__ volatile("lidt %0" : : "m"(cpu.idtr));
@@ -165,15 +160,11 @@ void wake_restore_cpu(void) {
 
 bool wake_sleep(void (*enter)(void)) {
     if (!page) return false;
-    uint32_t a, b, c, d;
-    cpuid(0x80000001, 0, &a, &b, &c, &d);
-    cpu.rdtscp = (d & (1u << 27)) != 0;
-    cpu.pat_ok = pat_supported();
     cpu.cr0 = read_cr0();
     cpu.cr3 = read_cr3();
     cpu.cr4 = read_cr4();
     cpu.efer = rdmsr(MSR_EFER);
-    if (cpu.pat_ok) cpu.pat = rdmsr(MSR_PAT);
+    cpu.pat = rdmsr(MSR_PAT);
     cpu.star = rdmsr(MSR_STAR);
     cpu.lstar = rdmsr(MSR_LSTAR);
     cpu.cstar = rdmsr(MSR_CSTAR);
@@ -181,10 +172,11 @@ bool wake_sleep(void (*enter)(void)) {
     cpu.fs = rdmsr(MSR_FS_BASE);
     cpu.gs = rdmsr(MSR_GS_BASE);
     cpu.kgs = rdmsr(MSR_KERNEL_GS_BASE);
-    if (cpu.rdtscp) cpu.tsc_aux = rdmsr(MSR_TSC_AUX);
+    cpu.tsc_aux = rdmsr(MSR_TSC_AUX);
     __asm__ volatile("sgdt %0" : "=m"(wake_gdtr));
     __asm__ volatile("sidt %0" : "=m"(cpu.idtr));
-    fpu_save(&fpu);
+    if (!fpu_storage && !(fpu_storage = kmalloc(fpu_storage_bytes()))) return false;
+    fpu_save(fpu_state_in(fpu_storage));
     mtrr_save();
     wake_prepare((uint64_t)wake_resume64, (uint64_t)resume_stack + sizeof resume_stack, 0, WAKE_ANY_CPU);
     if (!wake_suspend(enter)) return false;
@@ -192,7 +184,7 @@ bool wake_sleep(void (*enter)(void)) {
     mtrr_sync();
     vmm_flush_all();
     if (!fpu_init_ap()) panic("wake: the FPU came back different");
-    fpu_restore(&fpu);
+    fpu_restore(fpu_state_in(fpu_storage));
     pstate_init_ap(); /* the firmware's clock policy, again ours */
     return true;
 }

@@ -10,7 +10,6 @@
 #include "limine.h"
 
 uint64_t kernel_pml4;
-uint64_t pte_nx;
 
 /* Page tables, on any CPU. The kernel half's tables, which every space shares, change under
    kmap_lock; a user space's lower half under its space's lock (one of a few, by its PML4). A
@@ -445,19 +444,6 @@ static void map_range(uint64_t va, uint64_t pa, uint64_t size, uint64_t flags4k,
 }
 
 void vmm_init(struct limine_memmap_response *mm, struct limine_executable_address_response *ka) {
-    /* no-execute pages, if the CPU has them (EFER.NXE must be on before any PTE uses bit 63) */
-    uint32_t a, b, c, d;
-    cpuid(0x80000000, 0, &a, &b, &c, &d);
-    if (a >= 0x80000001) {
-        cpuid(0x80000001, 0, &a, &b, &c, &d);
-        if (d & (1u << 20)) {
-            wrmsr(0xC0000080, rdmsr(0xC0000080) | (1ULL << 11));
-            pte_nx = PTE_NX;
-        }
-    }
-    /* write-protect also applies to the kernel, so read-only pages really are read-only */
-    write_cr0(read_cr0() | (1ULL << 16));
-
     kernel_pml4 = pmm_alloc_zeroed();
     uint64_t *l4 = tbl(kernel_pml4);
     /* pre-create every upper-half PDPT so all address spaces share kernel mappings */
@@ -470,13 +456,13 @@ void vmm_init(struct limine_memmap_response *mm, struct limine_executable_addres
         uint64_t end = ALIGN_UP(e->base + e->length, PAGE_SIZE);
         if (e->type == LIMINE_MEMMAP_FRAMEBUFFER) {
             /* write-combining: PAT index 5 */
-            map_range(hhdm_offset + base, base, end - base, PTE_W | PTE_PWT | PTE_PAT4K | pte_nx,
-                      PTE_W | PTE_PWT | PTE_PAT2M | pte_nx);
+            map_range(hhdm_offset + base, base, end - base, PTE_W | PTE_PWT | PTE_PAT4K | PTE_NX,
+                      PTE_W | PTE_PWT | PTE_PAT2M | PTE_NX);
         } else if (e->type == LIMINE_MEMMAP_BAD_MEMORY) {
             continue;
         } else {
             if (e->type != LIMINE_MEMMAP_RESERVED) ram_add(base, end);
-            map_range(hhdm_offset + base, base, end - base, PTE_W | pte_nx, PTE_W | pte_nx);
+            map_range(hhdm_offset + base, base, end - base, PTE_W | PTE_NX, PTE_W | PTE_NX);
         }
     }
 
@@ -485,14 +471,13 @@ void vmm_init(struct limine_memmap_response *mm, struct limine_executable_addres
     uint64_t kstart = ALIGN_DOWN((uint64_t)__kernel_start, PAGE_SIZE);
     uint64_t kend = ALIGN_UP((uint64_t)__kernel_end, PAGE_SIZE);
     for (uint64_t va = kstart; va < kend; va += PAGE_SIZE) {
-        uint64_t f = PTE_G | PTE_W | pte_nx;
+        uint64_t f = PTE_G | PTE_W | PTE_NX;
         if (va >= (uint64_t)__text_start && va < (uint64_t)__rodata_start) f = PTE_G;
-        else if (va >= (uint64_t)__rodata_start && va < (uint64_t)__data_start) f = PTE_G | pte_nx;
+        else if (va >= (uint64_t)__rodata_start && va < (uint64_t)__data_start) f = PTE_G | PTE_NX;
         vmm_map_page(kernel_pml4, va, va - ka->virtual_base + ka->physical_base, f);
     }
     write_cr3(kernel_pml4);
-    cpuid(1, 0, &a, &b, &c, &d);
-    pcid_on = (c & (1u << 17)) && !cmdline_has("nopcid");
+    pcid_on = cpu_features.pcid && !cmdline_has("nopcid");
     vmm_init_cpu();
     kprintf("vmm: PCID %s, TLB shootdown by IPI\n", pcid_on ? "on" : "off");
 }
@@ -501,7 +486,7 @@ void *vmm_map_mmio(uint64_t phys, uint64_t size) {
     uint64_t base = ALIGN_DOWN(phys, PAGE_SIZE);
     uint64_t end = ALIGN_UP(phys + size, PAGE_SIZE);
     for (uint64_t p = base; p < end; p += PAGE_SIZE)
-        if (!vmm_map_page(kernel_pml4, hhdm_offset + p, p, PTE_W | PTE_PCD | PTE_PWT | pte_nx)) return NULL;
+        if (!vmm_map_page(kernel_pml4, hhdm_offset + p, p, PTE_W | PTE_PCD | PTE_PWT | PTE_NX)) return NULL;
     return phys_to_virt(phys);
 }
 
@@ -646,7 +631,7 @@ void vmm_user_pages_split(uint64_t pml4, uint64_t out[6]) {
 }
 
 static uint64_t prot_flags(int prot) {
-    return PTE_U | (prot & VM_W ? PTE_W : 0) | (prot & VM_X ? 0 : pte_nx);
+    return PTE_U | (prot & VM_W ? PTE_W : 0) | (prot & VM_X ? 0 : PTE_NX);
 }
 
 /* The space's tables lock held, the leaf present: it gains prot's permissions. False when a
@@ -876,7 +861,7 @@ void *vmalloc(size_t pages) {
             vfree((void *)va, i);
             return NULL;
         }
-        vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, p, PTE_W | pte_nx);
+        vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, p, PTE_W | PTE_NX);
     }
     return (void *)va;
 }

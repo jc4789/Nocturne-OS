@@ -107,7 +107,7 @@ static bool grow(uint64_t bytes) {
     uint64_t end = heap_end + ALIGN_UP(bytes, PAGE_SIZE);
     while (heap_end < end) {
         uint64_t p = pmm_alloc();
-        if (!p || !vmm_map_page(kernel_pml4, heap_end, p, PTE_W | pte_nx)) {
+        if (!p || !vmm_map_page(kernel_pml4, heap_end, p, PTE_W | PTE_NX)) {
             if (p) pmm_free(p);
             return false;
         }
@@ -121,7 +121,7 @@ static bool back(uint64_t start, uint64_t end) {
     for (uint64_t a = ALIGN_DOWN(start, PAGE_SIZE); a < end; a += PAGE_SIZE) {
         if (vmm_translate(kernel_pml4, a)) continue;
         uint64_t p = pmm_alloc();
-        if (!p || !vmm_map_page(kernel_pml4, a, p, PTE_W | pte_nx)) {
+        if (!p || !vmm_map_page(kernel_pml4, a, p, PTE_W | PTE_NX)) {
             if (p) pmm_free(p);
             return false; /* what was mapped stays: the block remains released */
         }

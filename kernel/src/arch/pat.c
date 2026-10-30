@@ -4,16 +4,9 @@
 #include "arch/cpu.h"
 #include "arch/pat.h"
 
-#define MSR_PAT   0x277
 #define CR0_NW    (1ULL << 29)
 #define CR0_CD    (1ULL << 30)
 #define CR4_PGE   (1ULL << 7)
-
-bool pat_supported(void) {
-    uint32_t a, b, c, d;
-    cpuid(1, 0, &a, &b, &c, &d);
-    return (d & (1u << 16)) != 0;
-}
 
 static void flush_tlb_all(uint64_t cr4) {
     if (cr4 & CR4_PGE) write_cr4(cr4 & ~CR4_PGE); /* PGE off so global entries go too */
@@ -23,7 +16,6 @@ static void flush_tlb_all(uint64_t cr4) {
 
 /* CR0, the caches and IA32_PAT are this CPU's own: closing its interrupts is the whole guard. */
 uint64_t pat_init_cpu(void) {
-    if (!pat_supported()) return 0;
     if (rdmsr(MSR_PAT) == PAT_NOCTURNE) return PAT_NOCTURNE; /* already right: nothing to flush */
     uint64_t flags = irq_save();
     uint64_t cr0 = read_cr0(), cr4 = read_cr4();
@@ -55,9 +47,6 @@ static struct {
 } mtrr;
 
 void mtrr_save(void) {
-    uint32_t a, b, c, d;
-    cpuid(1, 0, &a, &b, &c, &d);
-    if (!(d & (1u << 12))) return;
     uint64_t cap = rdmsr(MSR_MTRRCAP);
     mtrr.nvar = MIN((unsigned)(cap & 0xFF), MTRR_VAR_MAX);
     mtrr.fixed = (cap & (1u << 8)) != 0;

@@ -136,25 +136,6 @@ static void conv_set(uint64_t at, uint64_t ns, uint64_t hz) {
 
 /* ---- the TSC's rate ---- */
 
-static bool invariant_tsc(void) {
-    uint32_t a, b, c, d, max;
-    cpuid(0x80000000, 0, &max, &b, &c, &d);
-    if (max < 0x80000007) return false;
-    cpuid(0x80000007, 0, &a, &b, &c, &d);
-    return d & (1u << 8);
-}
-
-/* CPUID 15h: the TSC's ratio to the core crystal clock and, where it is given, the crystal's
-   frequency (Intel SDM vol. 2A, CPUID leaf 15h). 0 where it does not say. */
-static uint64_t cpuid_tsc_hz(void) {
-    uint32_t max, a, b, c, d;
-    cpuid(0, 0, &max, &b, &c, &d);
-    if (max < 0x15) return 0;
-    cpuid(0x15, 0, &a, &b, &c, &d);
-    if (!a || !b || !c) return 0;
-    return (uint64_t)c * b / a;
-}
-
 static uint32_t pm_read(void) { return inl(pm_port) & pm_mask; }
 
 /* The FADT's PM timer, in system I/O space: X_PM_TMR_BLK where it is given, else PM_TMR_BLK
@@ -356,7 +337,7 @@ void clock_init(void) {
     } else {
         uint64_t hz = vm_tsc_hz();
         rate_from = "the hypervisor's word";
-        if (!hz && (hz = cpuid_tsc_hz())) rate_from = "CPUID 15h";
+        if (!hz && (hz = cpu_features.tsc_crystal_hz)) rate_from = "CPUID 15h";
         if (!hz) {
             pm_timer_find();
             if (pm_port && (hz = median_of(measure_pm))) {
@@ -371,7 +352,7 @@ void clock_init(void) {
         conv_set(tsc_read(), 0, hz);
         spin_unlock(&conv_lock, f);
         kprintf("clock: TSC %lu kHz by %s%s\n", hz / 1000, rate_from,
-                invariant_tsc() ? "" : "; not invariant, so the clock drifts as its rate changes");
+                cpu_features.invariant_tsc ? "" : "; not invariant, so the clock drifts as its rate changes");
     }
     wall_offset_ns = rtc_read_unix() * (int64_t)NS_PER_S - (int64_t)clock_now_ns();
     if (remeasuring) {

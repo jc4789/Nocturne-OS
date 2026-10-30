@@ -78,15 +78,32 @@ static inline void wrmsr(uint32_t msr, uint64_t v) {
 /* A write the manuals allow but a model's own document says faults (arch/apic.c): false where
    it raised #GP, which isr_dispatch resumes past (arch/isr.asm). */
 bool wrmsr_checked(uint32_t msr, uint64_t v);
-/* The vendor CPUID leaf 0 names in EBX, EDX, ECX ("GenuineIntel"; "AuthenticAMD", and
-   "HygonGenuine", which follows AMD's manuals). */
 enum cpu_vendor { CPU_VENDOR_OTHER, CPU_VENDOR_INTEL, CPU_VENDOR_AMD };
-static inline enum cpu_vendor cpu_vendor_of(uint32_t b, uint32_t c, uint32_t d) {
-    if (b == 0x756E6547 && d == 0x49656E69 && c == 0x6C65746E) return CPU_VENDOR_INTEL;
-    if ((b == 0x68747541 && d == 0x69746E65 && c == 0x444D4163) || (b == 0x6F677948 && d == 0x6E65476E && c == 0x656E6975))
-        return CPU_VENDOR_AMD;
-    return CPU_VENDOR_OTHER;
-}
+/* What the CPUs have (arch/cpu.c): set by cpu_features_init on the first CPU, before anything
+   reads it, and the same on every CPU after (cpu_features_same). The features Nocturne requires
+   have no field: every CPU has them. The flags are the optional ones. */
+struct cpu_features {
+    enum cpu_vendor vendor;
+    unsigned family, model, stepping;
+    unsigned phys_bits;      /* physical address width */
+    unsigned clflush_bytes;  /* the line CLFLUSH and CLFLUSHOPT act on */
+    unsigned invlpgb_pages;  /* most pages one INVLPGB names, beyond the first */
+    uint64_t tsc_crystal_hz; /* the TSC's rate as CPUID 15h states it; 0 where it does not */
+    bool hypervisor, mwait, pcid, tsc_deadline, invariant_tsc, aperf_mperf, intel_hwp, cppc,
+        invlpgb, tme, arch_capabilities;
+    char brand[49];
+};
+extern struct cpu_features cpu_features;
+void cpu_features_init(void); /* the first CPU, first: stops when a required feature is missing */
+bool cpu_features_same(void); /* another CPU as it starts: true when it has what the first one has */
+void cpu_setup(void);         /* each CPU, before its page tables: what every one turns on */
+
+#define MSR_EFER  0xC0000080u
+#define EFER_LME  (1u << 8)
+#define EFER_LMA  (1u << 10)
+#define EFER_NXE  (1u << 11)
+#define MSR_PAT   0x277u
+#define CR0_WP    (1ULL << 16)
 static inline uint64_t read_cr0(void) { uint64_t v; __asm__ volatile("mov %%cr0, %0" : "=r"(v)); return v; }
 static inline void write_cr0(uint64_t v) { __asm__ volatile("mov %0, %%cr0" : : "r"(v) : "memory"); }
 static inline uint64_t read_cr2(void) { uint64_t v; __asm__ volatile("mov %%cr2, %0" : "=r"(v)); return v; }
@@ -180,4 +197,3 @@ uint16_t pic_mask_all(void);        /* mask every source; return the previous ma
 void pic_restore_mask(uint16_t masks); /* restore masks only, preserving pending PIC requests */
 void pic_restore(uint32_t state);   /* after S3: pic_init, then that state again */
 void fpu_init(void);
-void cpu_get_brand(char *out);

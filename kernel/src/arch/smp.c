@@ -36,7 +36,6 @@ static unsigned slots = 1, online = 1;
 static unsigned detected = 1;
 static uint32_t online_mask = 1;
 static uint64_t bsp_pat;
-static bool have_pat;
 
 extern NORETURN void smp_switch_stack(uint64_t top, void (*entry)(void *), void *argument);
 
@@ -156,9 +155,7 @@ void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context) {
     if (!count || !fn) return;
     ASSERT((uint64_t)fn >= 0xFFFF800000000000ULL && (!context || (uint64_t)context >= 0xFFFF800000000000ULL));
     uint64_t flags = irq_save(), since = clock_now_ns();
-    struct fpu_state saved;
-    fpu_save(&saved);
-    fpu_reset();
+    fpu_kernel_begin();
     uint32_t free = 0;
     if (online == 1 || count == 1 || count >= UINT32_MAX ||
         !__atomic_compare_exchange_n(&batch_taken, &free, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
@@ -186,7 +183,7 @@ void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context) {
         __atomic_store_n(&batch_taken, 0, __ATOMIC_RELEASE);
         __atomic_fetch_add(&jobs, 1, __ATOMIC_RELAXED);
     }
-    fpu_restore(&saved);
+    fpu_kernel_end();
     uint64_t took = clock_now_ns() - since, most = __atomic_load_n(&max_job_ns, __ATOMIC_RELAXED);
     while (took > most && !__atomic_compare_exchange_n(&max_job_ns, &most, took, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
     irq_restore(flags);
@@ -202,8 +199,7 @@ void smp_get_info(struct n_cpuinfo *info) {
     info->online_cpus = cpu_online_count();
     info->scheduler_cpus = info->online_cpus;
     info->worker_cpus = info->online_cpus - 1; /* the others take shares of a kernel batch */
-    info->flags = N_CPU_SSE2 | N_CPU_USER_THREADS | (info->worker_cpus ? N_CPU_AP_WORKERS : 0) |
-                  (fpu_has_avx() ? N_CPU_AVX : 0);
+    info->flags = N_CPU_SSE2 | N_CPU_USER_THREADS | (info->worker_cpus ? N_CPU_AP_WORKERS : 0) | N_CPU_AVX;
     info->parallel_jobs = cpu_parallel_jobs();
 }
 
@@ -217,15 +213,15 @@ static NORETURN void fail(struct cpu_slot *c) {
 static NORETURN void ap_main(void *argument) {
     struct cpu_slot *c = argument;
     cli();
+    if (!cpu_features_same()) fail(c);
+    cpu_setup();
     gdt_init_cpu(c->index);
     idt_load();
     if (!fpu_init_ap()) fail(c);
     pstate_init_ap();
-    if (pte_nx) wrmsr(0xC0000080, rdmsr(0xC0000080) | (1ULL << 11));
-    write_cr0(read_cr0() | (1ULL << 16)); /* kernel write protection */
     mtrr_sync(); /* after a sleep the firmware's memory types may be gone: the BSP's again */
-    if (have_pat) pat_init_cpu(); /* same PAT as the BSP before any MMIO/WC mapping is touched */
-    if (have_pat && rdmsr(0x277) != bsp_pat) fail(c);
+    pat_init_cpu(); /* same PAT as the BSP before any MMIO/WC mapping is touched */
+    if (rdmsr(MSR_PAT) != bsp_pat) fail(c);
     write_cr3(kernel_pml4);
     vmm_init_cpu();
     if (!lapic_ap_init() || lapic_current_id() != c->apic_id) fail(c);
@@ -354,7 +350,7 @@ static void probe_job(size_t i, void *arg) {
     /* compiler は general-regs-only。明示 SSE2 callback の実行も検査する。 */
     __asm__ volatile("movdqu %1, %%xmm0; paddq %%xmm0, %%xmm0; movdqu %%xmm0, %0"
                      : "=m"(p->sse[i]) : "m"(words) : "memory");
-    if (fpu_has_avx()) {
+    {
         uint64_t in[4] = {i + 1, i + 17, i + 33, i + 49}, out[4];
         /* AVX1だけを使用（256bit整数算術/AVX2は要求しない）。復帰検査用に全YMM0を破壊。 */
         __asm__ volatile("vmovdqu %1, %%ymm0; vmovdqu %%ymm0, %0; vxorps %%ymm0, %%ymm0, %%ymm0"
@@ -367,7 +363,7 @@ static void probe_job(size_t i, void *arg) {
 static bool probe_ok(const struct probe *p, const uint64_t *reference, size_t count) {
     for (size_t i = 0; i < count; i++)
         if (p->value[i] != reference[i] || p->sse[i][0] != (i + 1) * 2 || p->sse[i][1] != (i + 17) * 2 ||
-            (fpu_has_avx() && !p->avx_ok[i])) return false;
+            !p->avx_ok[i]) return false;
     for (size_t i = count; i < ARRAY_SIZE(p->value); i++)
         if (p->value[i] || p->sse[i][0] || p->sse[i][1] || p->avx_ok[i]) return false;
     return true;
@@ -377,28 +373,28 @@ static void selftest(void) {
     static struct probe p;
     static uint64_t reference[257];
     for (size_t i = 0; i < ARRAY_SIZE(reference); i++) reference[i] = probe_value(i);
-    struct fpu_state *original = kmalloc(sizeof *original), *checked = kmalloc(sizeof *checked);
-    if (!original || !checked) panic("smp: selftest without memory");
+    void *original_storage = kmalloc(fpu_storage_bytes()), *checked_storage = kmalloc(fpu_storage_bytes());
+    if (!original_storage || !checked_storage) panic("smp: selftest without memory");
+    struct fpu_state *original = fpu_state_in(original_storage), *checked = fpu_state_in(checked_storage);
     uint64_t sentinel[4] = {0x123456789ABCDEF0ULL, 0xFEDCBA9876543210ULL,
                           0x0F0E0D0C0B0A0908ULL, 0x8877665544332211ULL};
     fpu_save(original);
-    if (fpu_has_avx()) __asm__ volatile("vmovdqu %0, %%ymm0" : : "m"(sentinel) : "memory");
-    else __asm__ volatile("movdqu %0, %%xmm0" : : "m"(sentinel) : "memory");
+    __asm__ volatile("vmovdqu %0, %%ymm0" : : "m"(sentinel) : "memory");
     memset(&p, 0, sizeof p);
     uint64_t since = clock_now_ns();
     cpu_parallel_for(ARRAY_SIZE(p.value), probe_job, &p);
     uint64_t took = clock_now_ns() - since, mask = 0;
     fpu_save(checked);
-    if (memcmp(fpu_state_data(checked) + 160, sentinel, 16)) panic("smp: caller SSE state not restored");
-    if (fpu_has_avx() && memcmp(fpu_state_data(checked) + 576, sentinel + 2, 16))
-        panic("smp: caller YMM state not restored");
+    const uint8_t *upper = fpu_state_component(checked, 2);
+    if (memcmp(fpu_state_component(checked, 1) + 160, sentinel, 16)) panic("smp: caller SSE state not restored");
+    if (!upper || memcmp(upper, sentinel + 2, 16)) panic("smp: caller YMM state not restored");
     fpu_restore(original);
-    kfree(original);
-    kfree(checked);
+    kfree(original_storage);
+    kfree(checked_storage);
     if (!probe_ok(&p, reference, ARRAY_SIZE(p.value))) panic("smp: selftest mismatch");
     for (size_t i = 0; i < ARRAY_SIZE(p.value); i++) mask |= 1ULL << p.cpu[i];
-    kprintf("smp: batch selftest PASS items=257 cpus=%u mask=%lx %lu us AVX=%s\n",
-            __builtin_popcountll(mask), mask, took / NS_PER_US, fpu_has_avx() ? "PASS" : "disabled");
+    kprintf("smp: batch selftest PASS items=257 cpus=%u mask=%lx %lu us\n", __builtin_popcountll(mask), mask,
+            took / NS_PER_US);
     if (cmdline_has("smp-test")) {
         static const size_t counts[] = {0, 1, 3, 7, 16, 256, 257};
         for (unsigned round = 0; round < 32; round++)
@@ -428,10 +424,7 @@ void smp_init(struct limine_mp_response *response) {
     }
     cpus[0].apic_id = response->bsp_lapic_id;
     cpus[0].ready = 1;
-    uint32_t a, b, c, d;
-    cpuid(1, 0, &a, &b, &c, &d);
-    have_pat = (d & (1u << 16)) != 0;
-    if (have_pat) bsp_pat = rdmsr(0x277);
+    bsp_pat = rdmsr(MSR_PAT);
     for (uint64_t i = 0; i < response->cpu_count && slots < CPU_MAX_COUNT; i++) {
         struct limine_mp_info *info = response->cpus[i];
         if (!info || info->lapic_id == cpus[0].apic_id || !lapic_addressable(info->lapic_id)) continue;

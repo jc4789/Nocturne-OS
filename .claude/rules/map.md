@@ -6,7 +6,7 @@
 
 | 場所 | 役目 | 主 |
 |---|---|---|
-| `kernel/src/arch/` | GDT・IDT・`isr.asm`、APIC、SMP、FPU、PAT、P ステート、S3 復帰 | K |
+| `kernel/src/arch/` | CPU の機能（`cpu.c`：CPUID の機能の葉の唯一の読み手、下限 Zen 4 の照らし、hypervisor が隠しうる機能の印。葉 0xD は `fpu.c`、0x4000xxxx は vm/）、GDT・IDT・`isr.asm`、APIC、SMP、FPU（XSAVES の詰めた形、AVX-512 まで、大きさは起動で決まる）、PAT、P ステート、S3 復帰 | K |
 | `kernel/src/mm/` | `pmm`・`vmm`（空間ごとの 4 段ページ表）・`heap` | K |
 | `kernel/src/sys/` | `proc`（ELF）、`sched`（CPU ごとの実行キューと idle task）、`kei`（継の選択核）、`clock`（ns の時計：TSC か Hyper-V の参照の頁）、`alarm`（CPU ごとの期限の heap と LAPIC の deadline。周期の拍は無い）、`syscall`、`object`、`channel`、`events`、`stream`（console・system log）、`watch`（見張りの共通の部品 `struct watched`、`n_watch_take`）、`keep`（システムの部品の状態の保存：持ち主の wm・audio・screenmode が自分の行を出し、`AppData\Nocturne\{Desktop,Sound,Displays}.conf` へ最後の変更の 500 ms 後に書き、init より前に読み戻す。鍵は知らない）、`prof` | K |
 | `kernel/src/fs/` | C: の格納庫の実行側：`store`（C: の mount、道での操作、変更と commit の間の門、フォルダーの lock、書き手）、`document`（開いた文書：文書ごとの mutex、差し替えは一時フォルダーの文書を名へ移すか `ns_take`）、`cache`（塊の溜め `struct store_supply` の実装）、`watch`（C: の見張り `n_entry_watch`：操作が返す `struct ns_told` を出す）。書式のエンジンは `common/store/` | K |

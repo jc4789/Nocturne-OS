@@ -29,9 +29,7 @@ static bool firmware_oem(char oem[7]) {
 }
 
 void vm_detect(void) {
-    uint32_t a, b, c, d;
-    cpuid(1, 0, &a, &b, &c, &d);
-    bool hypervisor = c & (1u << 31);
+    bool hypervisor = cpu_features.hypervisor;
     hv_detect(); /* the Hyper-V interface, wherever it is offered (WHPX offers it to QEMU too) */
     char oem[7];
     bool have_oem = firmware_oem(oem);

@@ -32,7 +32,6 @@ _Static_assert(sizeof(struct n_gpu_blit) == 32, "GPU blit ABI");
 _Static_assert(SYS_WATCH_TAKE == 207 && SYS_AUDIO_OUTPUT_WATCH < SYS_MAX, "every system call number is below SYS_MAX");
 _Static_assert(sizeof(struct n_pager_fault) == 16 && sizeof(struct n_pager_supply) == 32, "pager ABI");
 
-extern char cpu_brand[64];
 int pci_list(struct n_pciinfo *out, int max);
 void vmm_user_pages_split(uint64_t pml4, uint64_t out[6]);
 int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
@@ -254,7 +253,7 @@ static int64_t sys_sysinfo(struct n_sysinfo *usi) {
     si->fb_w = fb.width;
     si->fb_h = fb.height;
     if (wm_running()) wm_screen_size(&si->fb_w, &si->fb_h); /* the desktop may be a remote viewer's size */
-    strlcpy(si->cpu, cpu_brand, sizeof si->cpu);
+    strlcpy(si->cpu, cpu_features.brand, sizeof si->cpu);
     strlcpy(si->os, OS_NAME " " OS_VERSION, sizeof si->os);
     return copy_to_user(usi, si, sizeof *si);
 }
@@ -581,8 +580,8 @@ static int64_t sys_shared_create(size_t bytes,bool demand) {
     return new_handle(r,h);
 }
 static uint64_t cache_pte(unsigned cache) {
-    if(cache==N_CACHE_WRITE_COMBINE && pat_supported())return PTE_PWT|PTE_PAT4K; /* PAT index 5 */
-    if(cache==N_CACHE_WRITE_COMBINE || cache==N_CACHE_UNCACHED)return PTE_PCD|PTE_PWT; /* index 3 */
+    if(cache==N_CACHE_WRITE_COMBINE)return PTE_PWT|PTE_PAT4K; /* PAT index 5 */
+    if(cache==N_CACHE_UNCACHED)return PTE_PCD|PTE_PWT; /* index 3 */
     return 0;
 }
 
@@ -608,9 +607,6 @@ static void pin_work_spares(struct pin_work *w,size_t n) {
         if(!d)return; /* a pin that finds no record fails with -N_ERR_NO_MEMORY */
         d->next=w->spares;w->spares=d;
     }
-}
-static uint8_t device_cache(uint8_t cache) { /* the type a mapping really gets */
-    return cache==N_CACHE_WRITE_COMBINE && !pat_supported()?N_CACHE_UNCACHED:cache;
 }
 static const char *cache_name(uint8_t cache) {
     return cache==N_CACHE_WRITE_COMBINE?"write-combined":cache==N_CACHE_UNCACHED?"uncached":"write-back";
@@ -642,8 +638,8 @@ static size_t device_segments(struct shared_pages *p) {
 /* shared_lock held. */
 static bool device_pin(const struct pci_claim *claim,uint64_t start,uint64_t end,uint8_t cache,struct pin_work *w) {
     uint64_t screen=ALIGN_DOWN(fb.phys,PAGE_SIZE),screen_end=ALIGN_UP(fb.phys+(uint64_t)fb.pitch*fb.height,PAGE_SIZE);
-    uint8_t other=fb.addr && start<screen_end && screen<end && cache!=device_cache(N_CACHE_WRITE_COMBINE)?
-                  device_cache(N_CACHE_WRITE_COMBINE):N_CACHE_DEFAULT;
+    uint8_t other=fb.addr && start<screen_end && screen<end && cache!=N_CACHE_WRITE_COMBINE?
+                  N_CACHE_WRITE_COMBINE:N_CACHE_DEFAULT;
     struct device_pin *same=NULL;
     for(struct device_pin *d=device_pins;d && other==N_CACHE_DEFAULT;d=d->next){
         if(start<d->end && d->start<end && d->cache!=cache)other=d->cache;
@@ -681,7 +677,6 @@ static size_t device_pins_walk(struct shared_pages *p,bool add,size_t limit,stru
         span=MIN(span,p->count-at);at+=span;
         if(leaf->kind!=SHARED_RANGE || leaf->owned)continue;
         uint64_t start=leaf->base+page*PAGE_SIZE,end=start+span*PAGE_SIZE;
-        cache=device_cache(cache);
         if(add && !device_pin(leaf->claim,start,end,cache,w))break;
         if(!add)device_unpin(leaf->claim,start,end,cache,w);
         done++;
@@ -723,7 +718,7 @@ int64_t shared_scanout_open(struct handle *surface,const struct pci_claim *claim
     if(bar)pin_work_spares(&pins,1);
     uint64_t lock=spin_lock(&shared_lock);
     /* a DMA root's type is read with its maps: a view changes it only while nothing maps it */
-    uint8_t cache=bar?device_cache(N_CACHE_WRITE_COMBINE):root->cache;
+    uint8_t cache=bar?N_CACHE_WRITE_COMBINE:root->cache;
     if(!bar && cache==N_CACHE_WRITE_BACK)pins.error=-N_ERR_DENIED;
     else{
         for(size_t i=0;i<pages;i++)frames[i]=shared_frame(p,first+i,false);
@@ -746,7 +741,7 @@ void shared_scanout_close(struct shared_scanout *s) {
     struct pin_work pins={0};
     uint64_t lock=spin_lock(&shared_lock);
     if(root->dma)shared_dma_maps(p,false);
-    else device_unpin(root->claim,s->frames[0],s->frames[s->pages-1]+PAGE_SIZE,device_cache(N_CACHE_WRITE_COMBINE),&pins);
+    else device_unpin(root->claim,s->frames[0],s->frames[s->pages-1]+PAGE_SIZE,N_CACHE_WRITE_COMBINE,&pins);
     spin_unlock(&shared_lock,lock);
     pin_work_end(&pins);
     kfree(s->frames);
@@ -1610,7 +1605,7 @@ int program_map(struct task *t,struct program *prog,struct handle *doc,uint64_t 
         return -N_ERR_NO_MEMORY;
     }
     /* The frames a peer read already are mapped now; the others on first touch. */
-    uint64_t flags=PTE_U|PTE_SHARED|PTE_SHARED_RO|(exec?0:pte_nx),lock;bool ok=true;
+    uint64_t flags=PTE_U|PTE_SHARED|PTE_SHARED_RO|(exec?0:PTE_NX),lock;bool ok=true;
     for(size_t i=0;ok && i<p->count;i++){
         lock=spin_lock(&shared_lock);
         bool any=p->resident;
@@ -1699,7 +1694,7 @@ static uint64_t shared_mapping_flags(const struct shared_mapping *m,size_t page)
     uint8_t access=leaf?((const uint8_t *)phys_to_virt(leaf))[page%PAGE_SIZE]:0;
     if(!access)return m->flags;
     uint64_t flags=access==N_MEMORY_READ_WRITE?m->flags:m->flags&~PTE_W;
-    return access==N_MEMORY_READ_EXECUTE?flags&~PTE_NX:flags|pte_nx;
+    return access==N_MEMORY_READ_EXECUTE?flags&~PTE_NX:flags|PTE_NX;
 }
 static size_t shared_access_leaves(const struct shared_mapping *m) {
     return (m->bytes/PAGE_SIZE+PAGE_SIZE-1)/PAGE_SIZE;
@@ -2024,7 +2019,7 @@ static int64_t sys_shared_map(int h,size_t bytes,int access) {
     if(bytes!=p->bytes){object_unref(&p->object);return -N_ERR_INVALID;}
     struct shared_mapping *m=kzalloc(sizeof *m);
     if(!m){object_unref(&p->object);return -N_ERR_NO_MEMORY;}
-    uint64_t flags=PTE_U|PTE_SHARED|pte_nx|(access==N_MEMORY_READ_WRITE?PTE_W:PTE_SHARED_RO);
+    uint64_t flags=PTE_U|PTE_SHARED|PTE_NX|(access==N_MEMORY_READ_WRITE?PTE_W:PTE_SHARED_RO);
     *m=(struct shared_mapping){.object=&p->object,.flags=flags,.bytes=bytes,.owner=owner,.building=true};
     struct pin_work pins={0};struct mmap_hole *gone=NULL;
     pin_work_spares(&pins,device_segments(p));
@@ -2257,7 +2252,7 @@ static uint64_t clock_page_of(struct task *owner) {
     struct mmap_hole *spare = kmalloc(sizeof *spare), *gone = NULL;
     uint64_t lock = spin_lock(&owner->space.lock);
     if (!(va = owner->clock_page) && (va = space_take_locked(owner, false, PAGE_SIZE, &gone))) {
-        if (vmm_map_page(owner->pml4, va, reference, PTE_P | PTE_U | PTE_SHARED | PTE_SHARED_RO | pte_nx))
+        if (vmm_map_page(owner->pml4, va, reference, PTE_P | PTE_U | PTE_SHARED | PTE_SHARED_RO | PTE_NX))
             __atomic_store_n(&owner->clock_page, va, __ATOMIC_RELEASE);
         else {
             hole_add_locked(owner, va, 2 * PAGE_SIZE, &spare, &gone);

@@ -38,7 +38,6 @@ struct limine_memmap_response;
 struct limine_executable_address_response;
 
 extern uint64_t kernel_pml4;
-extern uint64_t pte_nx; /* PTE_NX when the CPU supports no-execute, else 0 */
 
 void vmm_init(struct limine_memmap_response *mm, struct limine_executable_address_response *ka);
 bool vmm_map_page(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags);

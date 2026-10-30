@@ -179,15 +179,23 @@ static bool queue_prepare(unsigned cpu, struct task *idle) {
     }
 }
 
+/* A task's record and its extended state's area after it, in one allocation (kfree frees both). */
+static struct task *task_record(void) {
+    struct task *t = kzalloc(sizeof *t + fpu_storage_bytes());
+    if (!t) return NULL;
+    t->fpu = fpu_state_in(t + 1);
+    fpu_state_init(t->fpu);
+    return t;
+}
+
 static struct task *idle_task_new(const char *name) {
-    struct task *t = kzalloc(sizeof *t);
+    struct task *t = task_record();
     if (!t) return NULL;
     t->handles = t->initial_handles;
     t->handle_capacity = INITIAL_HANDLES;
     t->is_idle = true;
     t->state = TASK_RUNNING;
     t->pml4 = kernel_pml4;
-    fpu_state_init(&t->fpu);
     alarm_init(&t->wake_alarm, wake_fire);
     strlcpy(t->name, name, sizeof t->name);
     uint64_t f = spin_lock(&task_lock);
@@ -401,8 +409,8 @@ void schedule(void) {
     if (next->kstack) tss_set_rsp0((uint64_t)next->kstack + KSTACK_PAGES * PAGE_SIZE);
     vmm_switch(next->pml4);
     wrmsr(0xC0000100, next->tls_base);
-    fpu_save(&prev->fpu);
-    fpu_restore(&next->fpu);
+    fpu_save(prev->fpu);
+    fpu_restore(next->fpu);
     context_switch(&prev->ksp, next->ksp);
     /* prev again, on whichever CPU took it: sched_post_switch gave that CPU's lock back */
     irq_restore(f);
@@ -590,7 +598,7 @@ static void reaper(void *arg) {
 
 void sched_init(void) {
     kei_retention_v = kei_retention_from_cost(KEI_SWITCH_COST_NS, KEI_OVERHEAD_PPM, 500000, 4000000);
-    struct task *boot = kzalloc(sizeof *boot);
+    struct task *boot = task_record();
     if (!boot) panic("sched: no memory");
     boot->handles = boot->initial_handles;
     boot->handle_capacity = INITIAL_HANDLES;
@@ -599,7 +607,6 @@ void sched_init(void) {
     strlcpy(boot->name, "idle0", sizeof boot->name);
     boot->state = TASK_RUNNING;
     boot->pml4 = kernel_pml4;
-    fpu_state_init(&boot->fpu);
     alarm_init(&boot->wake_alarm, wake_fire);
     sched_set_current(boot);
     task_list = boot;
@@ -610,7 +617,7 @@ void sched_init(void) {
 }
 
 struct task *task_alloc(const char *name) {
-    struct task *t = kzalloc(sizeof(struct task));
+    struct task *t = task_record();
     if (!t) return NULL;
     t->handles = t->initial_handles;
     t->handle_capacity = INITIAL_HANDLES;
@@ -622,7 +629,6 @@ struct task *task_alloc(const char *name) {
     strlcpy(t->name, name, sizeof t->name);
     t->state = TASK_BLOCKED; /* not runnable until made ready */
     t->pml4 = kernel_pml4;
-    fpu_state_init(&t->fpu);
     alarm_init(&t->wake_alarm, wake_fire);
     t->start_ns = clock_now_ns();
     t->ksp = (uint64_t)t->kstack + KSTACK_PAGES * PAGE_SIZE;

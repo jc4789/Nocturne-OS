@@ -1,7 +1,7 @@
 /* CPU performance state. Firmware hands the OS each core at whatever clock it
    chose for booting; nothing raises it again unless the OS asks. On bare metal
-   every CPU requests its highest performance here: AMD through CPPC (or the
-   P-state control MSR on parts without it), Intel through HWP. Under a
+   every CPU requests its highest performance here: AMD through CPPC, Intel
+   through HWP. Under a
    hypervisor the host owns the clock and nothing is written.
 
    APERF/MPERF, where present, give the effective clock: MPERF counts at the
@@ -20,14 +20,11 @@
 #define MSR_HWP_ENABLE     0x770
 #define MSR_HWP_CAPS       0x771
 #define MSR_HWP_REQUEST    0x774
-#define MSR_AMD_PSTATE_LIM 0xC0010061
-#define MSR_AMD_PSTATE_CTL 0xC0010062
-#define MSR_AMD_PSTATE_ST  0xC0010063
 #define MSR_AMD_CPPC_CAP1  0xC00102B0
 #define MSR_AMD_CPPC_EN    0xC00102B1
 #define MSR_AMD_CPPC_REQ   0xC00102B3
 
-enum pstate_method { PSTATE_NONE, PSTATE_AMD_CPPC, PSTATE_AMD_LEGACY, PSTATE_INTEL_HWP };
+enum pstate_method { PSTATE_NONE, PSTATE_AMD_CPPC, PSTATE_INTEL_HWP };
 
 static enum pstate_method method;
 static bool have_aperf;
@@ -40,26 +37,10 @@ static struct pstate_sample {
 } samples[CPU_MAX_COUNT];
 
 static void detect(void) {
-    uint32_t a, b, c, d, max, ext;
-    cpuid(0, 0, &max, &b, &c, &d);
-    enum cpu_vendor vendor = cpu_vendor_of(b, c, d);
     hypervisor = vm_hosted();
-    if (max >= 6) {
-        cpuid(6, 0, &a, &b, &c, &d);
-        have_aperf = c & 1u;
-        if (vendor == CPU_VENDOR_INTEL && (a & (1u << 7))) method = PSTATE_INTEL_HWP;
-    }
-    cpuid(0x80000000, 0, &ext, &b, &c, &d);
-    if (vendor == CPU_VENDOR_AMD) {
-        if (ext >= 0x80000008) {
-            cpuid(0x80000008, 0, &a, &b, &c, &d);
-            if (b & (1u << 27)) method = PSTATE_AMD_CPPC;
-        }
-        if (method == PSTATE_NONE && ext >= 0x80000007) {
-            cpuid(0x80000007, 0, &a, &b, &c, &d);
-            if (d & (1u << 7)) method = PSTATE_AMD_LEGACY;
-        }
-    }
+    have_aperf = cpu_features.aperf_mperf;
+    if (cpu_features.vendor == CPU_VENDOR_AMD && cpu_features.cppc) method = PSTATE_AMD_CPPC;
+    if (cpu_features.vendor == CPU_VENDOR_INTEL && cpu_features.intel_hwp) method = PSTATE_INTEL_HWP;
     if (hypervisor) method = PSTATE_NONE;
 }
 
@@ -77,13 +58,6 @@ static const char *raise(char *buf, size_t n) {
            while awake), desired 0 = hardware picks, EPP 0 = performance */
         wrmsr(MSR_AMD_CPPC_REQ, (uint64_t)highest | (uint64_t)nominal << 8);
         ksnprintf(buf, n, "AMD CPPC highest %u nominal %u lowest %u", highest, nominal, lowest);
-        return buf;
-    }
-    case PSTATE_AMD_LEGACY: {
-        unsigned before = rdmsr(MSR_AMD_PSTATE_ST) & 7;
-        unsigned best = rdmsr(MSR_AMD_PSTATE_LIM) & 7; /* CurPstateLimit: the fastest allowed */
-        wrmsr(MSR_AMD_PSTATE_CTL, best);
-        ksnprintf(buf, n, "AMD P-state P%u -> P%u", before, best);
         return buf;
     }
     case PSTATE_INTEL_HWP: {

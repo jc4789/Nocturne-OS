@@ -30,7 +30,7 @@ struct wait_queue {
 };
 
 struct task {
-    struct fpu_state fpu;
+    struct fpu_state *fpu;    /* its extended state, in the same allocation (task_record) */
     int pid;
     char name[32];
     enum task_state state;    /* changes under its run queue's lock (and a wait queue's to block) */

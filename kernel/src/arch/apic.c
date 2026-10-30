@@ -58,11 +58,7 @@ static uint32_t lapic_read(uint32_t reg) {
 /* The firmware locked the APIC in x2APIC mode: IA32_XAPIC_DISABLE_STATUS, there where
    IA32_ARCH_CAPABILITIES says so, itself there where CPUID.(EAX=7,ECX=0):EDX[29] does. */
 static bool x2apic_locked(void) {
-    uint32_t a, b, c, d;
-    cpuid(0, 0, &a, &b, &c, &d);
-    if (a < 7) return false;
-    cpuid(7, 0, &a, &b, &c, &d);
-    return (d & (1u << 29)) && (rdmsr(IA32_ARCH_CAPABILITIES) & ARCH_CAP_XAPIC_DISABLE_STATUS) &&
+    return cpu_features.arch_capabilities && (rdmsr(IA32_ARCH_CAPABILITIES) & ARCH_CAP_XAPIC_DISABLE_STATUS) &&
            (rdmsr(IA32_XAPIC_DISABLE_STATUS) & LEGACY_XAPIC_DISABLED);
 }
 
@@ -193,17 +189,10 @@ static bool x2apic_leave(const struct limine_mp_response *mp) {
    KeyIDs configured (SDM Vol. 4 Table 2-2: the MSR is there where CPUID.(EAX=7,ECX=0):ECX[13]
    says, a bit AMD reserves). A width below 32, which cannot hold the reset address FEE00000h, is
    no CPU's: the 36 bits of a CPU without the leaf then. */
-static uint64_t xapic_base(uint64_t base, uint32_t max_leaf) {
-    uint32_t a, b, c, d;
-    unsigned bits = 36;
-    cpuid(0x80000000, 0, &a, &b, &c, &d);
-    if (a >= 0x80000008) {
-        cpuid(0x80000008, 0, &a, &b, &c, &d);
-        if ((a & 0xFF) >= 32) bits = MIN(a & 0xFF, 52u);
-    }
-    if (!amd && max_leaf >= 7) {
-        cpuid(7, 0, &a, &b, &c, &d);
-        uint64_t tme = c & (1u << 13) ? rdmsr(IA32_TME_ACTIVATE) : 0;
+static uint64_t xapic_base(uint64_t base) {
+    unsigned bits = cpu_features.phys_bits >= 32 ? MIN(cpu_features.phys_bits, 52u) : 36;
+    if (!amd && cpu_features.tme) {
+        uint64_t tme = rdmsr(IA32_TME_ACTIVATE);
         if ((tme >> 36) & 0xF) bits -= (tme >> 32) & 0xF;
     }
     return base & ((1ULL << bits) - 1) & ~0xFFFULL;
@@ -211,28 +200,17 @@ static uint64_t xapic_base(uint64_t base, uint32_t max_leaf) {
 
 /* mp: the bootloader's description of the CPUs, or NULL. */
 void apic_init(const struct limine_mp_response *mp) {
-    uint32_t a, b, c, d;
-    cpuid(0, 0, &a, &b, &c, &d);
-    amd = cpu_vendor_of(b, c, d) == CPU_VENDOR_AMD;
-    uint32_t max_leaf = a;
-    cpuid(1, 0, &a, &b, &c, &d);
-    family = (a >> 8) & 0xF;
-    if (family == 0xF) family += (a >> 20) & 0xFF;
-    if (!(d & (1 << 9))) {
-        kprintf("apic: no local APIC, using plain PIC\n");
-        return;
-    }
-    /* IA32_MCG_CAP is read where the CPU has the machine-check exception and architecture
-       (CPUID.1:EDX[7], EDX[14]; SDM Vol. 3B 18.8); MCG_CMCI_P is Intel's, the bit reserved on AMD
-       (APM 9.3.1.1), whose APIC has no such entry. */
-    cmci = !amd && (d & (1u << 7)) && (d & (1u << 14)) && (rdmsr(IA32_MCG_CAP) & MCG_CMCI_P);
+    amd = cpu_features.vendor == CPU_VENDOR_AMD;
+    family = cpu_features.family;
+    /* MCG_CMCI_P in IA32_MCG_CAP is Intel's (SDM Vol. 3B 18.8), the bit reserved on AMD (APM
+       9.3.1.1), whose APIC has no such entry. */
+    cmci = !amd && (rdmsr(IA32_MCG_CAP) & MCG_CMCI_P);
     uint64_t base = rdmsr(IA32_APIC_BASE);
     if (!(base & APIC_BASE_ENABLE)) {
         kprintf("apic: local APIC globally disabled, using plain PIC\n");
         return;
     }
     x2_mode = (base & APIC_BASE_X2) != 0;
-    if (x2_mode && !(c & (1u << 21))) panic("apic: x2APIC enabled without CPU support");
     if (x2_mode && x2apic_leave(mp)) {
         x2_mode = false;
         if (!lapic_mode_restore()) {
@@ -244,7 +222,7 @@ void apic_init(const struct limine_mp_response *mp) {
     }
     uint64_t phys = 0;
     if (!x2_mode) {
-        phys = xapic_base(base, max_leaf);
+        phys = xapic_base(base);
         lapic = vmm_map_mmio(phys, 4096);
         if (!lapic) panic("apic: cannot map local APIC");
         lapic_phys = phys;
@@ -313,20 +291,15 @@ bool lapic_send_startup(uint32_t apic_id, uint64_t page) {
 void lapic_ident(struct lapic_ident *out) {
     *out = (struct lapic_ident){.x2 = x2_mode};
     if (!available || x2_mode) return;
-    uint32_t max_leaf, b, c, d;
-    cpuid(0, 0, &max_leaf, &b, &c, &d);
     out->id_reg = lapic + LAPIC_ID / 4;
     out->id_mask = xapic_id_bits();
     out->base = lapic_phys | APIC_BASE_ENABLE;
-    out->base_mask = xapic_base(~0ULL, max_leaf) | APIC_BASE_ENABLE;
+    out->base_mask = xapic_base(~0ULL) | APIC_BASE_ENABLE;
     out->xaidn = xaidn();
 }
 
 bool lapic_ap_init(void) {
     if (!available) return false;
-    uint32_t a, b, c, d;
-    cpuid(1, 0, &a, &b, &c, &d);
-    if (x2_mode && !(c & (1u << 21))) return false;
     /* BSPのmode（Limineの選択、またはIOMMUの要件でapic_initが戻したxAPIC）に揃える。
        無効状態のAPICではCPUID.1:EDX[9]も0になる（SDM 11.4.3）ため、有無ではなく遷移の結果で判断する。 */
     if (!lapic_mode_restore()) return false;
@@ -421,10 +394,8 @@ static uint64_t measure_lapic_hz(void) {
 bool lapic_wake_init(int vector) {
     if (!available || vector < 32 || vector >= 0xFF) return false;
     if (!wake_vector) {
-        uint32_t a, b, c, d;
-        cpuid(1, 0, &a, &b, &c, &d);
         uint64_t tsc;
-        wake_tsc = (c & (1u << 24)) && clock_tsc_at(clock_now_ns(), &tsc);
+        wake_tsc = cpu_features.tsc_deadline && clock_tsc_at(clock_now_ns(), &tsc);
         uint64_t hz = 0;
         const char *from = "the TSC";
         if (!wake_tsc) {
