@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 struct limine_memmap_response;
-void pmm_init(struct limine_memmap_response *mm); /* after topology_init and bootmem_by_node */
+void pmm_init(struct limine_memmap_response *mm); /* after percpu_init (arch/percpu.h) */
 /* One frame; 0 when there is none. */
 uint64_t pmm_alloc(void);
 uint64_t pmm_alloc_zeroed(void);

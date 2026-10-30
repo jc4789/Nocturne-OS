@@ -30,11 +30,11 @@ static enum pstate_method method;
 static bool have_aperf;
 static bool hypervisor;
 
-static struct pstate_sample {
+PERCPU static struct pstate_sample {
     uint64_t aperf, mperf, tsc;
     uint64_t at;                    /* clock_now_ns when the window began */
     uint32_t mhz, awake_permille;   /* last completed window */
-} samples[CPU_MAX_COUNT];
+} sample;
 
 static void detect(void) {
     hypervisor = vm_hosted();
@@ -105,9 +105,7 @@ void pstate_init_ap(void) {
 bool pstate_sampling(void) { return have_aperf && !hypervisor; }
 
 void pstate_sample(void) {
-    unsigned cpu = cpu_current_index();
-    if (cpu >= CPU_MAX_COUNT) return;
-    struct pstate_sample *s = &samples[cpu];
+    struct pstate_sample *s = this_cpu_ptr(sample);
     uint64_t now = clock_now_ns();
     if (s->tsc && now - s->at < NS_PER_S) return;
     s->at = now;
@@ -121,8 +119,8 @@ void pstate_sample(void) {
 }
 
 bool pstate_cpu(unsigned cpu, unsigned *mhz, unsigned *awake_permille) {
-    if (cpu >= CPU_MAX_COUNT || !pstate_sampling()) return false;
-    *mhz = __atomic_load_n(&samples[cpu].mhz, __ATOMIC_RELAXED);
-    *awake_permille = __atomic_load_n(&samples[cpu].awake_permille, __ATOMIC_RELAXED);
+    if (cpu >= topology.cpus || !pstate_sampling()) return false;
+    *mhz = __atomic_load_n(&per_cpu(sample, cpu).mhz, __ATOMIC_RELAXED);
+    *awake_permille = __atomic_load_n(&per_cpu(sample, cpu).awake_permille, __ATOMIC_RELAXED);
     return *mhz != 0;
 }

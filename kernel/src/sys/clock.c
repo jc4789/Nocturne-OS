@@ -44,7 +44,7 @@ static struct spinlock conv_lock;
 static uint64_t hv_base;
 
 /* Per CPU: what its TSC reads more than CPU 0's (clock_cpu_join). */
-static int64_t tsc_offset[CPU_MAX_COUNT];
+PERCPU static int64_t tsc_offset;
 static bool tsc_offsets;
 
 /* The ACPI PM timer: its port and the bits that count. */
@@ -79,7 +79,7 @@ static uint64_t ns_of(uint64_t tsc) {
 
 static uint64_t tsc_now(void) {
     uint64_t tsc = tsc_read();
-    if (__atomic_load_n(&tsc_offsets, __ATOMIC_ACQUIRE)) tsc -= (uint64_t)tsc_offset[cpu_current_index()];
+    if (__atomic_load_n(&tsc_offsets, __ATOMIC_ACQUIRE)) tsc -= (uint64_t)this_cpu(tsc_offset);
     return tsc;
 }
 
@@ -111,7 +111,7 @@ bool clock_tsc_at(uint64_t ns, uint64_t *tsc) {
         unsigned __int128 ticks = ((unsigned __int128)delta * inverse + ((1u << 24) - 1)) >> 24;
         if (ticks >> 62) return false; /* past any TSC this machine reaches */
         *tsc = base_tsc + (uint64_t)ticks;
-        if (__atomic_load_n(&tsc_offsets, __ATOMIC_ACQUIRE)) *tsc += (uint64_t)tsc_offset[cpu_current_index()];
+        if (__atomic_load_n(&tsc_offsets, __ATOMIC_ACQUIRE)) *tsc += (uint64_t)this_cpu(tsc_offset);
         return true;
     }
 }
@@ -257,7 +257,7 @@ bool clock_cpu_lead(unsigned cpu, uint64_t until) {
         if (other > own && other - own > sync.ahead) sync.ahead = other - own;
     }
     int64_t offset = (int64_t)sync.ahead - (int64_t)sync.behind;
-    tsc_offset[cpu] = offset;
+    per_cpu(tsc_offset, cpu) = offset;
     if (offset) {
         __atomic_store_n(&tsc_offsets, true, __ATOMIC_RELEASE);
         kprintf("clock: cpu%u's TSC reads %ld counts off cpu0's; taken off its readings\n", cpu, (long)offset);
@@ -383,7 +383,7 @@ int64_t clock_resume(void) {
     }
     /* the other CPUs start again (smp_resume) and are compared with CPU 0 afresh */
     __atomic_store_n(&tsc_offsets, false, __ATOMIC_RELEASE);
-    for (unsigned i = 0; i < CPU_MAX_COUNT; i++) tsc_offset[i] = 0;
+    for (unsigned i = 0; i < topology.cpus; i++) per_cpu(tsc_offset, i) = 0;
     int64_t slept = rtc_read_unix() - rtc_before;
     if (slept < 0) slept = 0;
     __atomic_fetch_add(&wall_offset_ns, slept * (int64_t)NS_PER_S, __ATOMIC_RELAXED);

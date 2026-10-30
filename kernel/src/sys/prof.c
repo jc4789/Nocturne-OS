@@ -43,12 +43,13 @@ struct prof_pair {
 static struct prof_slot *slots;
 static struct prof_pair *pairs;
 static bool enabled;
-static uint32_t cpu_user[CPU_MAX_COUNT], cpu_kernel[CPU_MAX_COUNT], cpu_idle[CPU_MAX_COUNT];
 static uint32_t lost;
-/* Each CPU's sampling alarm, armed on it as it starts (prof_cpu_start). */
-static struct sampler {
+/* Each CPU's sampling alarm, armed on it as it starts (prof_cpu_start), and its samples in the
+   window. */
+PERCPU static struct sampler {
     struct alarm alarm;
-} __attribute__((aligned(64))) samplers[CPU_MAX_COUNT];
+    uint32_t user, kernel, idle;
+} __attribute__((aligned(64))) sampler;
 
 static void record(uint64_t rip, int pid) {
     uint64_t key = rip ? rip : 1;
@@ -112,13 +113,13 @@ static void sample(const struct regs *r, unsigned cpu) {
     struct task *t = current_task;
     bool idle = t && t->is_idle;
     if ((r->cs & 3) == 3 && t) {
-        __atomic_add_fetch(&cpu_user[cpu], 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&per_cpu(sampler, cpu).user, 1, __ATOMIC_RELAXED);
         record(r->rip & ~0x3full, t->pid);
         record_pair(r->rip, user_stack_top(r, t), t->pid);
     } else if (idle || !t) {
-        __atomic_add_fetch(&cpu_idle[cpu], 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&per_cpu(sampler, cpu).idle, 1, __ATOMIC_RELAXED);
     } else {
-        __atomic_add_fetch(&cpu_kernel[cpu], 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&per_cpu(sampler, cpu).kernel, 1, __ATOMIC_RELAXED);
         record(r->rip, -1);
     }
 }
@@ -126,7 +127,7 @@ static void sample(const struct regs *r, unsigned cpu) {
 static void sample_fire(struct alarm *a, struct regs *r) {
     unsigned cpu = cpu_current_index();
     /* a stopped CPU's (alarm_cpu_leave gave it to CPU 0): its CPU arms it again as it starts */
-    if (a != &samplers[cpu].alarm) return;
+    if (a != &per_cpu(sampler, cpu).alarm) return;
     if (enabled) {
         sample(r, cpu);
         if (pstate_sampling()) pstate_sample();
@@ -138,7 +139,7 @@ static void sample_fire(struct alarm *a, struct regs *r) {
 
 void prof_cpu_start(void) {
     if (!slots || !pairs) return;
-    struct alarm *a = &samplers[cpu_current_index()].alarm;
+    struct alarm *a = &this_cpu_ptr(sampler)->alarm;
     if (!a->fire) alarm_init(a, sample_fire); /* once: after a sleep it may still be armed on CPU 0 */
     alarm_set(a, clock_after(SAMPLE_NS));
 }
@@ -156,10 +157,10 @@ static void task_name(int pid, char name[32], bool *thread) {
 static void dump(void) {
     uint64_t total = 0;
     kprintf("prof: ---- %u ms window ----\n", period_ms);
-    for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++) {
-        uint32_t u = __atomic_exchange_n(&cpu_user[cpu], 0, __ATOMIC_RELAXED);
-        uint32_t k = __atomic_exchange_n(&cpu_kernel[cpu], 0, __ATOMIC_RELAXED);
-        uint32_t i = __atomic_exchange_n(&cpu_idle[cpu], 0, __ATOMIC_RELAXED);
+    for (unsigned cpu = 0; cpu < topology.cpus; cpu++) {
+        uint32_t u = __atomic_exchange_n(&per_cpu(sampler, cpu).user, 0, __ATOMIC_RELAXED);
+        uint32_t k = __atomic_exchange_n(&per_cpu(sampler, cpu).kernel, 0, __ATOMIC_RELAXED);
+        uint32_t i = __atomic_exchange_n(&per_cpu(sampler, cpu).idle, 0, __ATOMIC_RELAXED);
         unsigned mhz, awake;
         if (u + k + i && pstate_cpu(cpu, &mhz, &awake))
             kprintf("prof: cpu%u user %u kernel %u idle %u, %u MHz awake %u.%u%%\n", cpu, u, k, i, mhz,

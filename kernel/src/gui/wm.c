@@ -1479,7 +1479,6 @@ struct scene_job {
     const struct draw_scene *scene;
     struct rect batch;
     unsigned cell_count;
-    unsigned cpu[CPU_MAX_COUNT]; /* one independent cell per tile */
 };
 
 static bool wm_parallel, wm_parallel_force, wm_verify, wm_yield, wm_shadow_strip, wm_occlusion;
@@ -1587,13 +1586,12 @@ static void scene_tile(size_t index, void *arg) {
         deep_clear(deep, &c, l->bounds.x, l->bounds.y, l->bounds.w, l->bounds.h);
         if (l->deep) deep_copy(deep, &c, l->cx, l->cy, l->deep, l->cw, l->cw, l->ch);
     }
-    job->cpu[index] = cpu_current_index();
 }
 
 /* Both modes run the same callback over the same tiles, scene and row limits. Interrupts come in
    between batches; what the scene points at stays, since its caller holds wm_lock throughout. */
 static uint64_t render_scene(const struct draw_scene *s, struct rect r, bool parallel,
-                             unsigned batch_rows, uint64_t *cpu_mask, uint64_t *maximum) {
+                             unsigned batch_rows, uint64_t *maximum) {
     uint64_t ns = 0;
     unsigned cpus = scene_cpu_count();
     for (int y = r.y; y < r.y+r.h; y += (int)batch_rows) {
@@ -1605,7 +1603,6 @@ static uint64_t render_scene(const struct draw_scene *s, struct rect r, bool par
         uint64_t elapsed = clock_now_ns()-start;
         ns += elapsed;
         if (maximum) *maximum = MAX(*maximum, elapsed);
-        if (cpu_mask) for (size_t i=0;i<count;i++) *cpu_mask |= 1ULL << job.cpu[i];
     }
     return ns;
 }
@@ -1638,7 +1635,7 @@ static void measure_reference(struct draw_scene *s,struct rect r,unsigned rows,
     uint64_t start=clock_now_ns();
     render_scene_direct(s,r);
     *direct=clock_now_ns()-start;
-    *serial=render_scene(s,r,false,rows,NULL,NULL);
+    *serial=render_scene(s,r,false,rows,NULL);
     s->dst=original;
     s->dst_deep=original_deep;
     s->shadow_strip=saved;
@@ -1679,7 +1676,7 @@ static void scene_benchmark(void) {
         }
         unsigned rows=scene_rows(s.count,(unsigned)sw);
         struct rect r={0,0,sw,sh};
-        uint64_t serial=0,parallel=0,direct=0,mask=0,maximum=0,begin_jobs=cpu_parallel_jobs();
+        uint64_t serial=0,parallel=0,direct=0,maximum=0,begin_jobs=cpu_parallel_jobs();
         for (unsigned round=0;round<6;round++) {
             for (size_t p=0;p<pixels+32;p++) ref[p]=out[p]=0x5a5aa5a5;
             s.dst=(canvas_t){.px=ref+16,.w=sw,.h=sh,.pitch=sw};
@@ -1687,19 +1684,19 @@ static void scene_benchmark(void) {
             render_scene_original(&s,r);
             direct+=clock_now_ns()-start;
             s.dst.px=out+16;
-            render_scene(&s,r,false,rows,NULL,NULL);
+            render_scene(&s,r,false,rows,NULL);
             if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: direct/tiled mismatch layers=%u",s.count);
             /* Alternate destination/order to avoid always timing a cold serial buffer. */
             if (round&1) {
                 s.dst.px=ref+16;
-                parallel+=render_scene(&s,r,true,rows,&mask,&maximum);
+                parallel+=render_scene(&s,r,true,rows,&maximum);
                 s.dst.px=out+16;
-                serial+=render_scene(&s,r,false,rows,NULL,NULL);
+                serial+=render_scene(&s,r,false,rows,NULL);
             } else {
                 s.dst.px=ref+16;
-                serial+=render_scene(&s,r,false,rows,NULL,NULL);
+                serial+=render_scene(&s,r,false,rows,NULL);
                 s.dst.px=out+16;
-                parallel+=render_scene(&s,r,true,rows,&mask,&maximum);
+                parallel+=render_scene(&s,r,true,rows,&maximum);
             }
             if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: parallel pixels/guards differ layers=%u",s.count);
             /* Untimed: the buffer the parallel pass did not draw is drawn again with the original
@@ -1714,25 +1711,25 @@ static void scene_benchmark(void) {
             for (unsigned k=0;k<ARRAY_SIZE(clips);k++) {
                 for (size_t p=0;p<pixels+32;p++) ref[p]=out[p]=0x5a5aa5a5;
                 s.dst.px=ref+16;render_scene_original(&s,clips[k]);
-                s.dst.px=out+16;render_scene(&s,clips[k],true,rows,&mask,&maximum);
+                s.dst.px=out+16;render_scene(&s,clips[k],true,rows,&maximum);
                 if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: clipped pixels/guards differ case=%u",k);
             }
         }
         if (s.count==17) {
             const unsigned uneven[]={4,5,6,9};
             struct rect clip={1,3,MIN(sw-1,97),MIN(sh-3,35)};
-            uint64_t jobs=cpu_parallel_jobs(),uneven_mask=0;
+            uint64_t jobs=cpu_parallel_jobs();
             for (unsigned k=0;k<ARRAY_SIZE(uneven);k++) {
                 for (size_t p=0;p<pixels+32;p++) ref[p]=out[p]=0x5a5aa5a5;
                 s.dst.px=ref+16;render_scene_original(&s,clip);
                 uint64_t before=cpu_parallel_jobs();
-                s.dst.px=out+16;render_scene(&s,clip,true,uneven[k],&uneven_mask,NULL);
+                s.dst.px=out+16;render_scene(&s,clip,true,uneven[k],NULL);
                 if (memcmp(ref,out,(pixels+32)*4) ||
                     (scene_cpu_count()>1 && uneven[k]>=2 &&
                      cpu_parallel_jobs()==before)) panic("wmbench: uneven batch failed rows=%u",uneven[k]);
             }
-            kprintf("wmbench: uneven-batches PASS rows=4,5,6,9 mask=%lx jobs=%lu pixels=PASS guards=PASS\n",
-                    uneven_mask,cpu_parallel_jobs()-jobs);
+            kprintf("wmbench: uneven-batches PASS rows=4,5,6,9 jobs=%lu pixels=PASS guards=PASS\n",
+                    cpu_parallel_jobs()-jobs);
         }
         /* RDP can choose an odd pitch: adjacent non-overlapping rows may share
            a cache line, but neither clip nor guard pixels may be changed. */
@@ -1741,10 +1738,10 @@ static void scene_benchmark(void) {
         struct rect odd={1,1,sw-2,sh-2};
         render_scene_original(&s,odd);
         s.dst.px=out+16;
-        render_scene(&s,odd,true,rows,&mask,&maximum);
+        render_scene(&s,odd,true,rows,&maximum);
         if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: odd-pitch pixels/guards differ");
-        kprintf("wmbench: %dx%d layers=%u rounds=6 CPUs=%u mask=%lx direct_ns=%lu serial_ns=%lu parallel_ns=%lu jobs=%lu batch_rows=%u max_join_us=%lu pixels=PASS guards=PASS direct_shadow=original serial_shadow=%s parallel_shadow=%s oracle_shadow=original\n",
-                sw,sh,s.count,scene_cpu_count(),mask,direct,serial,parallel,
+        kprintf("wmbench: %dx%d layers=%u rounds=6 CPUs=%u direct_ns=%lu serial_ns=%lu parallel_ns=%lu jobs=%lu batch_rows=%u max_join_us=%lu pixels=PASS guards=PASS direct_shadow=original serial_shadow=%s parallel_shadow=%s oracle_shadow=original\n",
+                sw,sh,s.count,scene_cpu_count(),direct,serial,parallel,
                 cpu_parallel_jobs()-begin_jobs,rows,maximum/NS_PER_US,
                 s.shadow_strip?"strip":"original",s.shadow_strip?"strip":"original");
         scene_shrink(s.count,(unsigned)sw,rows,maximum);
@@ -1785,11 +1782,11 @@ static void composite_ram(struct rect r) {
     }
     /* Many overlapping alpha shadows need shorter joins, not a fixed giant job. */
     unsigned rows=scene_rows(active_layers,(unsigned)r.w);
-    uint64_t start_jobs=cpu_parallel_jobs(), maximum=0, mask=0;
+    uint64_t start_jobs=cpu_parallel_jobs(), maximum=0;
     uint64_t direct=0,serial=0;
     bool parallel_first=verify && (scene_frames&1);
     if (verify && !parallel_first) measure_reference(&scene,r,rows,&direct,&serial);
-    uint64_t ns=render_scene(&scene,r,true,rows,&mask,&maximum);
+    uint64_t ns=render_scene(&scene,r,true,rows,&maximum);
     if (parallel_first) measure_reference(&scene,r,rows,&direct,&serial);
     if (verify) {
         for (int y=r.y;y<r.y+r.h;y++)
@@ -1802,8 +1799,8 @@ static void composite_ram(struct rect r) {
     scene_max_ns=MAX(scene_max_ns,maximum);
     scene_shrink(active_layers,(unsigned)r.w,rows,maximum);
     if (!trace_active && (verify || scene_frames==1 || !(scene_frames%64)))
-        kprintf("wmram: frame=%lu rect=%dx%d layers=%u CPUs=%u mask=%lx direct_ns=%lu serial_ns=%lu parallel_ns=%lu jobs=%lu density=%u batch_rows=%u join_us=%lu max_join_us=%lu pixels=%s reference_timed=%u direct_shadow=original serial_shadow=original parallel_shadow=%s\n",
-                scene_frames,r.w,r.h,scene.count,scene_cpu_count(),mask,direct,serial,ns,
+        kprintf("wmram: frame=%lu rect=%dx%d layers=%u CPUs=%u direct_ns=%lu serial_ns=%lu parallel_ns=%lu jobs=%lu density=%u batch_rows=%u join_us=%lu max_join_us=%lu pixels=%s reference_timed=%u direct_shadow=original serial_shadow=original parallel_shadow=%s\n",
+                scene_frames,r.w,r.h,scene.count,scene_cpu_count(),direct,serial,ns,
                 scene_jobs,scene_density(scene.count),rows,maximum/NS_PER_US,scene_max_ns/NS_PER_US,verify?"PASS":"unchecked",(unsigned)verify,scene.shadow_strip?"strip":"original");
 }
 

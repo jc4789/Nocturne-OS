@@ -40,7 +40,7 @@ extern void kthread_trampoline(void);
 #define KEI_OVERHEAD_PPM 10000    /* aim at 1% lost to switching: the retention is about 99 times it */
 #define KILLED_NAP_NS (10 * NS_PER_MS) /* a killed task's waits end this soon, whether a waker comes or not */
 
-static struct cpu_queue {
+PERCPU static struct cpu_queue {
     struct spinlock lock;
     struct kei_rq rq;
     struct task *idle;
@@ -51,8 +51,12 @@ static struct cpu_queue {
        (slice_arm). A stale one finds nothing to do. */
     struct alarm slice;
     size_t steal_cursor;
+    unsigned cpu;
     bool prepared, leaving;
-} __attribute__((aligned(64))) queues[CPU_MAX_COUNT];
+} __attribute__((aligned(64))) queue;
+
+PERCPU struct task *sched_task;
+PERCPU volatile bool sched_resched;
 
 /* Every queue's heap holds every task there is, so none ever fills. capacity_lock comes before a
    queue's lock. */
@@ -90,31 +94,31 @@ static void charge(struct cpu_queue *q) {
 
 /* ---- queues ---- */
 
-static struct cpu_queue *this_queue(void) { return &queues[cpu_current_index()]; }
+static struct cpu_queue *this_queue(void) { return this_cpu_ptr(queue); }
 
 static void lock2(unsigned a, unsigned b) {
-    spin_take(&queues[a < b ? a : b].lock);
-    if (a != b) spin_take(&queues[a < b ? b : a].lock);
+    spin_take(&per_cpu(queue, a < b ? a : b).lock);
+    if (a != b) spin_take(&per_cpu(queue, a < b ? b : a).lock);
 }
 static void unlock2(unsigned a, unsigned b) {
-    spin_give(&queues[a].lock);
-    if (a != b) spin_give(&queues[b].lock);
+    spin_give(&per_cpu(queue, a).lock);
+    if (a != b) spin_give(&per_cpu(queue, b).lock);
 }
 
 /* Hints, read without the lock: the decisions are made again under it. */
-static size_t waiting(unsigned cpu) { return __atomic_load_n(&queues[cpu].rq.count, __ATOMIC_RELAXED); }
+static size_t waiting(unsigned cpu) { return __atomic_load_n(&per_cpu(queue, cpu).rq.count, __ATOMIC_RELAXED); }
 static size_t resident(unsigned cpu) {
-    return waiting(cpu) + (__atomic_load_n(&queues[cpu].rq.current, __ATOMIC_RELAXED) != NULL);
+    return waiting(cpu) + (__atomic_load_n(&per_cpu(queue, cpu).rq.current, __ATOMIC_RELAXED) != NULL);
 }
 static bool usable(unsigned cpu) {
-    return __atomic_load_n(&queues[cpu].prepared, __ATOMIC_ACQUIRE) && cpu_online_at(cpu) &&
-           !__atomic_load_n(&queues[cpu].leaving, __ATOMIC_ACQUIRE);
+    return __atomic_load_n(&per_cpu(queue, cpu).prepared, __ATOMIC_ACQUIRE) && cpu_online_at(cpu) &&
+           !__atomic_load_n(&per_cpu(queue, cpu).leaving, __ATOMIC_ACQUIRE);
 }
 bool sched_cpu_idle(unsigned cpu) {
-    return cpu < CPU_MAX_COUNT && __atomic_load_n(&queues[cpu].prepared, __ATOMIC_ACQUIRE) && !resident(cpu);
+    return cpu < topology.cpus && __atomic_load_n(&per_cpu(queue, cpu).prepared, __ATOMIC_ACQUIRE) && !resident(cpu);
 }
 bool sched_cpu_empty(unsigned cpu) {
-    return !resident(cpu) && !__atomic_load_n(&queues[cpu].evicted, __ATOMIC_ACQUIRE);
+    return !resident(cpu) && !__atomic_load_n(&per_cpu(queue, cpu).evicted, __ATOMIC_ACQUIRE);
 }
 
 /* Every prepared queue's heap holds at least need tasks. False without memory. */
@@ -126,14 +130,17 @@ static bool capacity_reserve(size_t need) {
         if (need <= cap) return true;
         size_t want = cap ? cap * 2 : 64;
         while (want < need) want *= 2;
-        struct kei_task **heaps[CPU_MAX_COUNT] = {0}, **old[CPU_MAX_COUNT] = {0};
+        /* each prepared queue's new heap, then its old one */
+        struct kei_task ***heaps = kzalloc(2 * (size_t)topology.cpus * sizeof *heaps);
+        if (!heaps) return false;
+        struct kei_task ***old = heaps + topology.cpus;
         bool ok = true;
-        for (unsigned cpu = 0; cpu < CPU_MAX_COUNT && ok; cpu++)
-            if (queues[cpu].prepared && !(heaps[cpu] = kzalloc(want * sizeof **heaps))) ok = false;
+        for (unsigned cpu = 0; cpu < topology.cpus && ok; cpu++)
+            if (per_cpu(queue, cpu).prepared && !(heaps[cpu] = kzalloc(want * sizeof **heaps))) ok = false;
         f = spin_lock(&capacity_lock);
         if (ok && queue_capacity < want) {
-            for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++) {
-                struct cpu_queue *q = &queues[cpu];
+            for (unsigned cpu = 0; cpu < topology.cpus; cpu++) {
+                struct cpu_queue *q = &per_cpu(queue, cpu);
                 if (!q->prepared || !heaps[cpu]) continue;
                 spin_take(&q->lock);
                 old[cpu] = q->rq.heap;
@@ -144,17 +151,18 @@ static bool capacity_reserve(size_t need) {
             queue_capacity = want;
         }
         spin_unlock(&capacity_lock, f);
-        for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++) {
+        for (unsigned cpu = 0; cpu < topology.cpus; cpu++) {
             kfree(heaps[cpu]);
             kfree(old[cpu]);
         }
+        kfree(heaps);
         if (!ok) return false;
     }
 }
 
 /* A queue with an idle task, at the capacity every queue has. */
 static bool queue_prepare(unsigned cpu, struct task *idle) {
-    struct cpu_queue *q = &queues[cpu];
+    struct cpu_queue *q = &per_cpu(queue, cpu);
     for (;;) {
         uint64_t f = spin_lock(&capacity_lock);
         size_t cap = queue_capacity ? queue_capacity : 64;
@@ -170,6 +178,7 @@ static bool queue_prepare(unsigned cpu, struct task *idle) {
         if (kei_rq_init(&q->rq, cpu, heap, cap, kei_retention_v, 0) != KEI_OK) panic("kei: queue %u setup failed", cpu);
         queue_capacity = cap;
         q->idle = idle;
+        q->cpu = cpu;
         idle->cpu = cpu;
         q->stamp = clock_now_ns();
         alarm_init(&q->slice, slice_fire);
@@ -207,8 +216,8 @@ static struct task *idle_task_new(const char *name) {
 }
 
 bool sched_cpu_prepare(unsigned cpu) {
-    if (cpu >= CPU_MAX_COUNT) return false;
-    if (queues[cpu].prepared) return true;
+    if (cpu >= topology.cpus) return false;
+    if (per_cpu(queue, cpu).prepared) return true;
     char name[16];
     ksnprintf(name, sizeof name, "idle%u", cpu);
     struct task *idle = idle_task_new(name);
@@ -219,8 +228,8 @@ bool sched_cpu_prepare(unsigned cpu) {
 static unsigned busiest(unsigned self, size_t at_least) {
     unsigned best = self;
     size_t most = at_least ? at_least - 1 : 0;
-    for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++) {
-        if (cpu == self || !__atomic_load_n(&queues[cpu].prepared, __ATOMIC_ACQUIRE)) continue;
+    for (unsigned cpu = 0; cpu < topology.cpus; cpu++) {
+        if (cpu == self || !__atomic_load_n(&per_cpu(queue, cpu).prepared, __ATOMIC_ACQUIRE)) continue;
         size_t n = waiting(cpu);
         if (n > most) { most = n; best = cpu; }
     }
@@ -229,7 +238,7 @@ static unsigned busiest(unsigned self, size_t at_least) {
 
 /* Interrupts off: one waiting task of src's moves to dst's queue (its lead kept). */
 static bool take_from(unsigned src, unsigned dst) {
-    struct cpu_queue *s = &queues[src], *d = &queues[dst];
+    struct cpu_queue *s = &per_cpu(queue, src), *d = &per_cpu(queue, dst);
     bool moved = false;
     lock2(src, dst);
     if (!d->leaving && d->rq.online) {
@@ -261,7 +270,7 @@ static unsigned choose(struct task *t) {
     bool home_ok = usable(home);
     if (home_ok && !resident(home)) return home;
     size_t fewest = home_ok ? resident(home) : SIZE_MAX;
-    for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++) {
+    for (unsigned cpu = 0; cpu < topology.cpus; cpu++) {
         if (cpu == home || !usable(cpu)) continue;
         size_t n = resident(cpu);
         if (n < fewest) { fewest = n; best = cpu; }
@@ -282,13 +291,13 @@ static void slice_arm(struct cpu_queue *q) {
 /* Interrupts off, at most every BALANCE_NS on a CPU with tasks waiting: one of them to the queue
    with the fewest, when that has two fewer, whose CPU is told to look. */
 static void rebalance(unsigned self) {
-    struct cpu_queue *q = &queues[self];
+    struct cpu_queue *q = &per_cpu(queue, self);
     uint64_t now = clock_now_ns();
     if (now - q->balanced_at < BALANCE_NS || !usable(self)) return;
     q->balanced_at = now;
     unsigned to = self;
     size_t fewest = resident(self);
-    for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++) {
+    for (unsigned cpu = 0; cpu < topology.cpus; cpu++) {
         if (cpu == self || !usable(cpu)) continue;
         size_t n = resident(cpu);
         if (n + 2 <= fewest) { fewest = n; to = cpu; }
@@ -301,7 +310,7 @@ static void rebalance(unsigned self) {
 
 static void slice_fire(struct alarm *a, struct regs *r) {
     struct cpu_queue *q = (struct cpu_queue *)((char *)a - __builtin_offsetof(struct cpu_queue, slice));
-    unsigned cpu = (unsigned)(q - queues);
+    unsigned cpu = q->cpu;
     if (cpu != cpu_current_index()) {
         cpu_kick(cpu);
         return;
@@ -324,7 +333,7 @@ static void enqueue(struct task *t) {
         lock2(from, to);
         if (t->cpu != from) { unlock2(from, to); continue; }
         if (t->kei.state != KEI_NEW && t->kei.state != KEI_SLEEP) { unlock2(from, to); return; }
-        struct cpu_queue *q = &queues[to];
+        struct cpu_queue *q = &per_cpu(queue, to);
         if (q->leaving || !q->rq.online) { unlock2(from, to); continue; }
         enum kei_error e = kei_wake(&q->rq, &t->kei);
         if (e != KEI_OK) panic("kei: task %d into cpu%u failed %d", t->pid, to, e);
@@ -352,7 +361,7 @@ void sched_make_ready(struct task *t) {
     struct cpu_queue *q;
     for (;;) {
         unsigned cpu = __atomic_load_n(&t->cpu, __ATOMIC_ACQUIRE);
-        q = &queues[cpu];
+        q = &per_cpu(queue, cpu);
         spin_take(&q->lock);
         if (t->cpu == cpu) break;
         spin_give(&q->lock);
@@ -439,7 +448,7 @@ uint64_t sched_task_cpu_ns(struct task *t) {
     uint64_t f = irq_save();
     for (;;) {
         unsigned cpu = __atomic_load_n(&t->cpu, __ATOMIC_ACQUIRE);
-        struct cpu_queue *q = &queues[cpu];
+        struct cpu_queue *q = &per_cpu(queue, cpu);
         spin_take(&q->lock);
         if (t->cpu != cpu) {
             spin_give(&q->lock);
@@ -494,14 +503,14 @@ NORETURN void sched_cpu_start(void) {
 }
 
 void sched_cpu_leave(unsigned cpu) {
-    if (!cpu || cpu >= CPU_MAX_COUNT || !queues[cpu].prepared) return;
+    if (!cpu || cpu >= topology.cpus || !per_cpu(queue, cpu).prepared) return;
     uint64_t f = irq_save();
     lock2(0, cpu);
-    struct cpu_queue *q = &queues[cpu];
+    struct cpu_queue *q = &per_cpu(queue, cpu);
     __atomic_store_n(&q->leaving, true, __ATOMIC_RELEASE);
     while (q->rq.count) {
         struct kei_task *k = q->rq.heap[0];
-        if (kei_migrate(&q->rq, &queues[0].rq, k) != KEI_OK) panic("kei: cpu%u could not give its tasks back", cpu);
+        if (kei_migrate(&q->rq, &per_cpu(queue, 0).rq, k) != KEI_OK) panic("kei: cpu%u could not give its tasks back", cpu);
         __atomic_store_n(&KEI_OWNER(k)->cpu, 0, __ATOMIC_RELEASE);
     }
     unlock2(0, cpu);
@@ -527,9 +536,9 @@ static void off_cpu_wait(struct task *t) {
     for (;;) {
         uint64_t f = irq_save();
         unsigned cpu = __atomic_load_n(&t->cpu, __ATOMIC_ACQUIRE);
-        spin_take(&queues[cpu].lock);
+        spin_take(&per_cpu(queue, cpu).lock);
         bool off = t->kei.state == KEI_DEAD || t->kei.state == KEI_NEW;
-        spin_give(&queues[cpu].lock);
+        spin_give(&per_cpu(queue, cpu).lock);
         irq_restore(f);
         if (off) return;
         pause();

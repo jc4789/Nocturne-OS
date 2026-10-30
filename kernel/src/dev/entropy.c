@@ -20,10 +20,10 @@ static uint64_t counter;
 /* Each CPU's interrupts mix into its own feed, with that CPU's interrupts off: no other CPU writes
    it, and a read folds it in with plain word loads (a word half a mix behind is jitter all the
    same). */
-static struct feed {
+PERCPU static struct feed {
     uint64_t word[4];
     unsigned pos;
-} __attribute__((aligned(64))) feeds[CPU_MAX_COUNT];
+} __attribute__((aligned(64))) feed;
 
 static inline uint64_t rotl64(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
 
@@ -40,7 +40,7 @@ static void pool_add(uint64_t v) {
 /* cheap enough for every interrupt: one multiply-rotate mix into the next word of this CPU's feed */
 void entropy_add(uint64_t v) {
     uint64_t f = irq_save();
-    struct feed *s = &feeds[cpu_current_index()];
+    struct feed *s = this_cpu_ptr(feed);
     unsigned i = s->pos++ & 3;
     __atomic_store_n(&s->word[i], mix(s->word[i], s->word[(i + 1) & 3], v), __ATOMIC_RELAXED);
     irq_restore(f);
@@ -85,8 +85,8 @@ void entropy_get(void *buf, size_t n) {
     uint64_t f = spin_lock(&pool_lock);
     pool_add(rdtsc());
     for (unsigned i = 0; i < nhw; i++) pool_add(hw[i]);
-    for (unsigned c = 0; c < CPU_MAX_COUNT; c++)
-        for (unsigned i = 0; i < 4; i++) pool_add(__atomic_load_n(&feeds[c].word[i], __ATOMIC_RELAXED));
+    for (unsigned c = 0; c < topology.cpus; c++)
+        for (unsigned i = 0; i < 4; i++) pool_add(__atomic_load_n(&per_cpu(feed, c).word[i], __ATOMIC_RELAXED));
     /* key = first block of ChaCha20 under the pool; the pool is then replaced by the second block
        (forward secrecy: earlier outputs can't be recomputed from the new pool) */
     uint32_t key[8], blk[16];

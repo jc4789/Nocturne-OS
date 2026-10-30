@@ -88,19 +88,12 @@ struct task {
     struct kei_task kei;      /* its run queue's lock guards it */
 };
 
-static inline struct task *sched_current(void) {
-    struct task *task;
-    __asm__ volatile("movq %%gs:%c1, %0" : "=r"(task)
-                     : "i"(__builtin_offsetof(struct cpu_local, task)));
-    return task;
-}
-static inline void sched_set_current(struct task *task) {
-    __asm__ volatile("movq %0, %%gs:%c1" : : "r"(task),
-                     "i"(__builtin_offsetof(struct cpu_local, task)) : "memory");
-}
-static inline volatile bool *sched_resched_slot(void) { return &cpu_local_get()->resched; }
+extern PERCPU struct task *sched_task;     /* the task this CPU runs */
+extern PERCPU volatile bool sched_resched; /* this CPU is to call the scheduler */
+static inline struct task *sched_current(void) { return this_cpu(sched_task); }
+static inline void sched_set_current(struct task *task) { this_cpu(sched_task) = task; }
 #define current_task sched_current()
-#define need_resched (*sched_resched_slot())
+#define need_resched this_cpu(sched_resched)
 /* Every task, newest first. task_lock guards the list and the links of a task's family (parent,
    process, app); a task leaves the list, and is freed, only under it. It comes before a wait
    queue's lock. */

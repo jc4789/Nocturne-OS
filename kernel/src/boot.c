@@ -72,6 +72,7 @@ static const char *memtype(uint64_t t) {
 }
 
 void kmain(void) {
+    percpu_load(0); /* the first CPU's per-CPU variables: the template, until percpu_init */
     serial_init();
     kprintf("\n" OS_NAME " " OS_VERSION " booting...\n");
     if (!LIMINE_BASE_REVISION_SUPPORTED(base_revision)) kprintf("warning: Limine base revision not supported\n");
@@ -97,6 +98,7 @@ void kmain(void) {
     acpi_tables_init(mm);
     topology_init();
     bootmem_by_node();
+    percpu_init();
     pmm_init(mm);
     vmm_init(mm, ka_req.response);
     wake_init(); /* the real-mode page for waking from sleep and restarting the APs */

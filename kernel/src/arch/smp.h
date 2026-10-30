@@ -2,26 +2,14 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "arch/percpu.h"
+#include "arch/topology.h"
 
-#define CPU_MAX_COUNT 16
 #define VEC_RESCHED 0x32       /* look at this CPU's run queue (sys/sched.c), or stop for a sleep */
 #define VEC_TLB_SHOOTDOWN 0x35 /* mm/vmm.c */
 
-struct task;
-/* GS is kernel-owned; user TLS remains in FS. The self pointer makes current
-   task/reschedule access independent of APIC registers and CPU enumeration. */
-struct cpu_local {
-    struct cpu_local *self;
-    unsigned index;
-    struct task *task;
-    volatile bool resched;
-} __attribute__((aligned(64)));
-static inline struct cpu_local *cpu_local_get(void) {
-    struct cpu_local *local;
-    __asm__ volatile("movq %%gs:0, %0" : "=r"(local));
-    return local;
-}
-void cpu_local_init(unsigned index); /* after loading this CPU's GDT, before IDT */
+/* The CPUs are topology's (arch/topology.h): CPU i is topology.cpu[i], the first CPU 0. */
+static inline unsigned cpu_current_index(void) { return this_cpu(cpu_index); }
 
 struct limine_mp_response;
 struct n_cpuinfo;
@@ -32,7 +20,6 @@ typedef void (*cpu_job_fn)(size_t index, void *context);
    The BSP is CPU 0 only in that it starts the others and takes the devices' interrupts. */
 void smp_init(struct limine_mp_response *response);
 unsigned cpu_online_count(void);
-unsigned cpu_current_index(void);
 bool cpu_online_at(unsigned index);
 /* Interrupt the scheduler on that CPU (it looks at its run queue). Never the calling CPU. */
 void cpu_kick(unsigned index);

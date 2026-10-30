@@ -12,12 +12,12 @@
 #include "sys/alarm.h"
 #include "sys/clock.h"
 
-static struct alarm_cpu {
+PERCPU static struct alarm_cpu {
     struct spinlock lock;
     struct alarm *root;
     uint64_t programmed; /* when its wake device comes, CLOCK_NEVER: not set */
     bool ready;          /* its wake device is set up (alarm_init_cpu) */
-} __attribute__((aligned(64))) cpus[CPU_MAX_COUNT];
+} __attribute__((aligned(64))) alarms;
 
 /* ---- the heap ---- */
 
@@ -91,7 +91,7 @@ static bool unlink(struct alarm *a) {
     for (;;) {
         uint32_t on = __atomic_load_n(&a->armed_on, __ATOMIC_ACQUIRE);
         if (!on) return false;
-        struct alarm_cpu *c = &cpus[on - 1];
+        struct alarm_cpu *c = &per_cpu(alarms, on - 1);
         spin_take(&c->lock);
         if (__atomic_load_n(&a->armed_on, __ATOMIC_RELAXED) != on) { /* moved meanwhile */
             spin_give(&c->lock);
@@ -108,7 +108,7 @@ void alarm_set(struct alarm *a, uint64_t at) {
     uint64_t f = irq_save();
     unlink(a);
     unsigned self = cpu_current_index();
-    struct alarm_cpu *c = &cpus[self];
+    struct alarm_cpu *c = &per_cpu(alarms, self);
     spin_take(&c->lock);
     a->at = at;
     heap_insert(c, a);
@@ -134,7 +134,7 @@ bool alarm_cancel(struct alarm *a) {
 
 void alarm_interrupt(struct regs *r) {
     unsigned self = cpu_current_index();
-    struct alarm_cpu *c = &cpus[self];
+    struct alarm_cpu *c = &per_cpu(alarms, self);
     spin_take(&c->lock);
     for (;;) {
         uint64_t now = clock_now_ns();
@@ -155,7 +155,7 @@ void alarm_interrupt(struct regs *r) {
 
 void alarm_init_cpu(void) {
     unsigned self = cpu_current_index();
-    struct alarm_cpu *c = &cpus[self];
+    struct alarm_cpu *c = &per_cpu(alarms, self);
     if (!self) vector_register(VEC_TIMER, alarm_interrupt);
     if (!lapic_wake_init(VEC_TIMER)) panic("alarm: cpu%u has no LAPIC timer to wake it", self);
     uint64_t f = spin_lock(&c->lock);
@@ -168,7 +168,7 @@ void alarm_init_cpu(void) {
 void alarm_cpu_leave(void) {
     unsigned self = cpu_current_index();
     if (!self) return;
-    struct alarm_cpu *c = &cpus[self], *to = &cpus[0];
+    struct alarm_cpu *c = &per_cpu(alarms, self), *to = &per_cpu(alarms, 0);
     spin_take(&to->lock); /* CPU order */
     spin_take(&c->lock);
     lapic_wake_at(CLOCK_NEVER);
@@ -186,7 +186,7 @@ void alarm_cpu_leave(void) {
 }
 
 void alarm_resume(void) {
-    struct alarm_cpu *c = &cpus[0];
+    struct alarm_cpu *c = &per_cpu(alarms, 0);
     if (!lapic_wake_init(VEC_TIMER)) panic("alarm: no LAPIC timer after sleep");
     uint64_t f = spin_lock(&c->lock);
     c->programmed = CLOCK_NEVER;

@@ -70,14 +70,14 @@ struct node {
 struct cache {
     struct spinlock lock;
     struct frame *hot, *cold; /* given and taken at hot, drained from cold */
-    unsigned count, high, batch, node;
+    unsigned count, high, batch, node, cpu;
 } __attribute__((aligned(64)));
 
 static struct section *sections;
 static uint64_t nsections;
 static struct node **nodes;
 static unsigned nnodes, nbands;
-static struct cache *caches; /* [topology.cpus], by CPU index */
+PERCPU static struct cache cpu_cache;
 static uint64_t page_count, usable_frames;
 static uint64_t low_base, low_pages; /* usable below 1 MiB; never allocated */
 
@@ -277,7 +277,7 @@ static struct frame *from_nodes(unsigned home, uint64_t count, unsigned order, u
 
 static void cache_put(struct cache *c, struct frame *f) {
     f->state = CACHED;
-    f->cpu = (uint32_t)(c - caches);
+    f->cpu = c->cpu;
     f->prev = NULL;
     f->next = c->hot;
     if (c->hot) c->hot->prev = f;
@@ -332,7 +332,7 @@ static void drain(struct cache *c, unsigned count) {
 /* Memory ran short: a frame from another CPU's cache. */
 static struct frame *steal(const struct cache *mine) {
     for (unsigned i = 0; i < topology.cpus; i++) {
-        struct cache *c = &caches[i];
+        struct cache *c = &per_cpu(cpu_cache, i);
         if (c == mine || !__atomic_load_n(&c->count, __ATOMIC_RELAXED)) continue;
         uint64_t flags = spin_lock(&c->lock);
         struct frame *f = cache_take(c);
@@ -345,7 +345,7 @@ static struct frame *steal(const struct cache *mine) {
 /* Every cache back to its node, so that cached frames can merge into a run again. */
 static void drain_all(void) {
     for (unsigned i = 0; i < topology.cpus; i++) {
-        struct cache *c = &caches[i];
+        struct cache *c = &per_cpu(cpu_cache, i);
         if (!__atomic_load_n(&c->count, __ATOMIC_RELAXED)) continue;
         uint64_t flags = spin_lock(&c->lock);
         drain(c, c->count);
@@ -356,7 +356,7 @@ static void drain_all(void) {
 /* ---- the interface ---- */
 
 uint64_t pmm_alloc(void) {
-    struct cache *c = &caches[cpu_current_index()];
+    struct cache *c = this_cpu_ptr(cpu_cache);
     uint64_t flags = spin_lock(&c->lock);
     if (!c->count) refill(c);
     struct frame *f = cache_take(c);
@@ -376,7 +376,7 @@ uint64_t pmm_alloc_contig(uint64_t count, unsigned bits) {
     if (!count || count > 1ull << (ORDERS - 1)) return 0;
     unsigned order = count == 1 ? 0 : 64u - (unsigned)__builtin_clzll(count - 1);
     uint64_t bands = bands_within(bits);
-    unsigned home = caches[cpu_current_index()].node;
+    unsigned home = this_cpu(cpu_cache).node;
     struct frame *f = from_nodes(home, count, order, bands);
     if (!f) {
         drain_all();
@@ -396,7 +396,7 @@ void pmm_free(uint64_t phys) {
         bad_free(phys, f);
         return;
     }
-    struct cache *c = &caches[cpu_current_index()];
+    struct cache *c = this_cpu_ptr(cpu_cache);
     if (f->node == c->node) {
         uint64_t flags = spin_lock(&c->lock);
         cache_put(c, f);
@@ -461,9 +461,9 @@ bool pmm_claim(uint64_t pfn) {
         if (state == USED || state == RESERVED) return false;
         bool claimed;
         if (state == CACHED) {
-            struct cache *c = &caches[__atomic_load_n(&f->cpu, __ATOMIC_RELAXED)];
+            struct cache *c = &per_cpu(cpu_cache, __atomic_load_n(&f->cpu, __ATOMIC_RELAXED));
             uint64_t flags = spin_lock(&c->lock);
-            if ((claimed = f->state == CACHED && &caches[f->cpu] == c)) {
+            if ((claimed = f->state == CACHED && f->cpu == c->cpu)) {
                 cache_unlink(c, f);
                 f->state = USED;
             }
@@ -547,7 +547,6 @@ void pmm_init(struct limine_memmap_response *mm) {
         n->near = &near[i * nnodes];
         nodes[i] = n;
     }
-    caches = bootmem_alloc(topology.cpus * sizeof *caches, _Alignof(struct cache));
 
     /* what boot memory did not give out is free; all else stays RESERVED */
     bootmem_handoff(untaken, NULL);
@@ -562,7 +561,8 @@ void pmm_init(struct limine_memmap_response *mm) {
         n->batch = 1u << (63 - __builtin_clzll(batch));
     }
     for (unsigned i = 0; i < topology.cpus; i++) {
-        struct cache *c = &caches[i];
+        struct cache *c = &per_cpu(cpu_cache, i);
+        c->cpu = i;
         c->node = topology.cpu[i].node;
         c->high = nodes[c->node]->high;
         c->batch = nodes[c->node]->batch;

@@ -38,6 +38,13 @@ SECTIONS
         *(.data .data.*)
     } :data
 
+    /* per-CPU variables' template (arch/percpu.h): each CPU has its own copy */
+    .percpu : ALIGN(4096) {
+        __percpu_start = .;
+        KEEP(*(.percpu))
+        __percpu_end = .;
+    } :data
+
     .bss : {
         *(.bss .bss.*)
         *(COMMON)

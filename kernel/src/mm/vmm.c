@@ -121,15 +121,20 @@ static inline uint64_t *tbl(uint64_t phys) { return (uint64_t *)phys_to_virt(phy
 #define TLB_ACK_NS (5 * NS_PER_S) /* a CPU that does not answer for this long is broken */
 
 static bool pcid_on;
-static uint64_t cpu_loaded[CPU_MAX_COUNT];          /* pml4 in CR3, published before its gen is read */
-static uint32_t cpu_gen[CPU_MAX_COUNT][USER_PAGE_COUNTS];
-static bool cpu_pcid0_user[CPU_MAX_COUNT];          /* PCID 0 holds an untracked user space */
+/* Each CPU's: the space it has loaded, and its answers. */
+PERCPU static struct tlb_cpu {
+    uint64_t loaded;     /* pml4 in CR3, published before its gen is read */
+    uint64_t ack;        /* the last request it answered */
+    uint64_t owed;       /* the request it was sent (tlb_shootdown, under tlb_lock) */
+    bool pcid0_user;     /* PCID 0 holds an untracked user space */
+    uint32_t gen[USER_PAGE_COUNTS];
+} __attribute__((aligned(64))) tlb_cpu;
 /* One request at a time, under tlb_lock (after every tables lock). tlb_req_seq is odd while the
    request is being written, even once it is published; a CPU acknowledges the even number. A
    request's fields stay as they are until every CPU it named acknowledged it. */
 static struct spinlock tlb_lock;
 static struct { uint64_t pml4, va, pages; int slot; uint32_t gen; } tlb_req;
-static uint64_t tlb_req_seq, tlb_ack[CPU_MAX_COUNT];
+static uint64_t tlb_req_seq;
 static uint64_t tlb_shootdowns, tlb_ipis;
 
 static int space_slot(uint64_t pml4) {
@@ -144,23 +149,23 @@ static void flush_range_local(uint64_t va, uint64_t pages) {
 }
 
 void vmm_switch(uint64_t pml4) {
-    unsigned cpu = cpu_current_index();
+    struct tlb_cpu *me = this_cpu_ptr(tlb_cpu);
     if ((read_cr3() & PTE_ADDR) == pml4) return;
     /* Dekker with tlb_shootdown: either it sees this CPU in the space and IPIs
        it, or this CPU sees the gen it bumped and flushes the tag below. */
-    __atomic_store_n(&cpu_loaded[cpu], pml4, __ATOMIC_RELAXED);
+    __atomic_store_n(&me->loaded, pml4, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (!pcid_on) { write_cr3(pml4); return; }
     if (pml4 == kernel_pml4) {
-        write_cr3(pml4 | (cpu_pcid0_user[cpu] ? 0 : CR3_NOFLUSH));
-        cpu_pcid0_user[cpu] = false;
+        write_cr3(pml4 | (me->pcid0_user ? 0 : CR3_NOFLUSH));
+        me->pcid0_user = false;
         return;
     }
     int slot = space_slot(pml4);
-    if (slot < 0) { write_cr3(pml4); cpu_pcid0_user[cpu] = true; return; }
+    if (slot < 0) { write_cr3(pml4); me->pcid0_user = true; return; }
     uint32_t gen = __atomic_load_n(&user_page_counts[slot].gen, __ATOMIC_ACQUIRE);
-    bool fresh = cpu_gen[cpu][slot] == gen;
-    cpu_gen[cpu][slot] = gen;
+    bool fresh = me->gen[slot] == gen;
+    me->gen[slot] = gen;
     write_cr3(pml4 | (uint64_t)(slot + 1) | (fresh ? CR3_NOFLUSH : 0));
 }
 
@@ -175,9 +180,9 @@ void vmm_flush_all(void) {
    this CPU has not acknowledged. One it reads while the next is being written is one it does not
    owe (the request it owes cannot end before it answers): it lets that go. */
 void vmm_tlb_ipi(void) {
-    unsigned cpu = cpu_current_index();
+    struct tlb_cpu *me = this_cpu_ptr(tlb_cpu);
     uint64_t seq = __atomic_load_n(&tlb_req_seq, __ATOMIC_ACQUIRE);
-    if ((seq & 1) || seq == __atomic_load_n(&tlb_ack[cpu], __ATOMIC_RELAXED)) return;
+    if ((seq & 1) || seq == __atomic_load_n(&me->ack, __ATOMIC_RELAXED)) return;
     uint64_t pml4 = __atomic_load_n(&tlb_req.pml4, __ATOMIC_RELAXED), va = __atomic_load_n(&tlb_req.va, __ATOMIC_RELAXED);
     uint64_t pages = __atomic_load_n(&tlb_req.pages, __ATOMIC_RELAXED);
     int slot = __atomic_load_n(&tlb_req.slot, __ATOMIC_RELAXED);
@@ -187,21 +192,21 @@ void vmm_tlb_ipi(void) {
     if (!pml4) vmm_flush_all(); /* shared kernel half: cached under every tag */
     else if ((read_cr3() & PTE_ADDR) == pml4) {
         flush_range_local(va, pages);
-        if (slot >= 0) cpu_gen[cpu][slot] = gen;
+        if (slot >= 0) me->gen[slot] = gen;
     }
-    __atomic_store_n(&tlb_ack[cpu], seq, __ATOMIC_RELEASE);
+    __atomic_store_n(&me->ack, seq, __ATOMIC_RELEASE);
 }
 
 /* A CPU waiting with interrupts off (arch/spin.h): a shootdown it has not acknowledged is served
    here, so a CPU that changes mappings under a lock never waits on one that waits for that lock. */
 void vmm_tlb_poll(void) {
-    unsigned cpu = cpu_current_index();
-    if (__atomic_load_n(&tlb_req_seq, __ATOMIC_ACQUIRE) != __atomic_load_n(&tlb_ack[cpu], __ATOMIC_RELAXED))
+    struct tlb_cpu *me = this_cpu_ptr(tlb_cpu);
+    if (__atomic_load_n(&tlb_req_seq, __ATOMIC_ACQUIRE) != __atomic_load_n(&me->ack, __ATOMIC_RELAXED))
         vmm_tlb_ipi();
 }
 
 static bool tlb_wait(unsigned cpu, uint64_t seq, uint64_t deadline) {
-    while (__atomic_load_n(&tlb_ack[cpu], __ATOMIC_ACQUIRE) != seq) {
+    while (__atomic_load_n(&per_cpu(tlb_cpu, cpu).ack, __ATOMIC_ACQUIRE) != seq) {
         if (clock_now_ns() >= deadline) return false;
         pause();
     }
@@ -212,6 +217,7 @@ static bool tlb_wait(unsigned cpu, uint64_t seq, uint64_t deadline) {
    space), the PTEs already changed. */
 static void tlb_shootdown(uint64_t pml4, uint64_t va, uint64_t pages) {
     unsigned self = cpu_current_index();
+    struct tlb_cpu *me = this_cpu_ptr(tlb_cpu);
     bool kernel = va >= USER_TOP || pml4 == kernel_pml4;
     int slot = -1;
     uint32_t gen = 0;
@@ -224,7 +230,7 @@ static void tlb_shootdown(uint64_t pml4, uint64_t va, uint64_t pages) {
         else flush_range_local(va, pages);
     } else if ((read_cr3() & PTE_ADDR) == pml4) {
         flush_range_local(va, pages);
-        if (slot >= 0) cpu_gen[self][slot] = gen;
+        if (slot >= 0) me->gen[slot] = gen;
     }
     if (cpu_online_count() < 2) return;
     spin_take(&tlb_lock);
@@ -237,19 +243,19 @@ static void tlb_shootdown(uint64_t pml4, uint64_t va, uint64_t pages) {
     __atomic_store_n(&tlb_req.slot, slot, __ATOMIC_RELAXED);
     __atomic_store_n(&tlb_req.gen, gen, __ATOMIC_RELAXED);
     __atomic_store_n(&tlb_req_seq, seq, __ATOMIC_RELEASE);
-    __atomic_store_n(&tlb_ack[self], seq, __ATOMIC_RELAXED);
+    __atomic_store_n(&me->ack, seq, __ATOMIC_RELAXED);
     /* published before the CPUs are counted: one that leaves the online set (a sleep) looks at
        the request after it left, and is not waited for */
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    uint32_t sent = 0;
-    for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++) {
+    for (unsigned cpu = 0; cpu < topology.cpus; cpu++) {
+        struct tlb_cpu *c = &per_cpu(tlb_cpu, cpu);
         if (cpu == self) continue;
-        if (!kernel && __atomic_load_n(&cpu_loaded[cpu], __ATOMIC_RELAXED) != pml4) continue;
-        if (cpu_tlb_ipi(cpu)) { sent |= 1u << cpu; __atomic_add_fetch(&tlb_ipis, 1, __ATOMIC_RELAXED); }
+        if (!kernel && __atomic_load_n(&c->loaded, __ATOMIC_RELAXED) != pml4) continue;
+        if (cpu_tlb_ipi(cpu)) { c->owed = seq; __atomic_add_fetch(&tlb_ipis, 1, __ATOMIC_RELAXED); }
     }
     uint64_t deadline = clock_after(TLB_ACK_NS); /* the IPIs went out together */
-    for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++)
-        if ((sent & (1u << cpu)) && !tlb_wait(cpu, seq, deadline) && cpu_online_at(cpu))
+    for (unsigned cpu = 0; cpu < topology.cpus; cpu++)
+        if (per_cpu(tlb_cpu, cpu).owed == seq && !tlb_wait(cpu, seq, deadline) && cpu_online_at(cpu))
             panic("vmm: TLB shootdown ACK timeout cpu %u", cpu);
     spin_give(&tlb_lock);
 }
@@ -261,8 +267,7 @@ void vmm_tlb_stats(uint64_t *shootdowns, uint64_t *ipis) {
 
 /* Each CPU, with CR3 = kernel_pml4 (PCID 0): enable PCIDs when the BSP did. */
 void vmm_init_cpu(void) {
-    unsigned cpu = cpu_current_index();
-    cpu_loaded[cpu] = kernel_pml4;
+    this_cpu_ptr(tlb_cpu)->loaded = kernel_pml4;
     if (pcid_on) write_cr4(read_cr4() | CR4_PCIDE);
 }
 
