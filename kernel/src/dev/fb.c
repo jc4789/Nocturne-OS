@@ -5,6 +5,7 @@
 #include "arch/cpu.h"
 #include "dev/pm.h"
 #include "mm/heap.h"
+#include "mm/vmalloc.h"
 #include "mm/vmm.h"
 #include "sys/clock.h"
 #include "sys/sched.h"

@@ -114,8 +114,6 @@ static inline uint64_t *tbl(uint64_t phys) { return (uint64_t *)phys_to_virt(phy
  * revoked keeps stale entries under that tag, and vmm_switch flushes them on
  * its next entry because the space's gen moved past the one it last
  * synchronised with. */
-#define CR4_PGE      (1ULL << 7)
-#define CR4_PCIDE    (1ULL << 17)
 #define CR3_NOFLUSH  (1ULL << 63)
 #define TLB_RANGE_MAX 32 /* above this a local flush is cheaper than invlpg per page */
 #define TLB_ACK_NS (5 * NS_PER_S) /* a CPU that does not answer for this long is broken */
@@ -146,6 +144,14 @@ static int space_slot(uint64_t pml4) {
 static void flush_range_local(uint64_t va, uint64_t pages) {
     if (pages > TLB_RANGE_MAX) { write_cr3(read_cr3() & ~CR3_NOFLUSH); return; } /* current PCID */
     for (uint64_t i = 0; i < pages; i++) invlpg(va + i * PAGE_SIZE);
+}
+
+/* The kernel half's leaves are global (vmm_map_page_locked): invlpg drops a global entry whatever
+   the PCID (SDM 3A 5.10.4.1), and its tables above the leaves are never taken away, so no stale
+   paging-structure entry of another PCID is left. */
+static void flush_kernel_local(uint64_t va, uint64_t pages) {
+    if (pages > TLB_RANGE_MAX) vmm_flush_all();
+    else for (uint64_t i = 0; i < pages; i++) invlpg(va + i * PAGE_SIZE);
 }
 
 void vmm_switch(uint64_t pml4) {
@@ -189,7 +195,7 @@ void vmm_tlb_ipi(void) {
     uint32_t gen = __atomic_load_n(&tlb_req.gen, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     if (__atomic_load_n(&tlb_req_seq, __ATOMIC_RELAXED) != seq) return;
-    if (!pml4) vmm_flush_all(); /* shared kernel half: cached under every tag */
+    if (!pml4) flush_kernel_local(va, pages);
     else if ((read_cr3() & PTE_ADDR) == pml4) {
         flush_range_local(va, pages);
         if (slot >= 0) me->gen[slot] = gen;
@@ -226,8 +232,7 @@ static void tlb_shootdown(uint64_t pml4, uint64_t va, uint64_t pages) {
         gen = __atomic_add_fetch(&user_page_counts[slot].gen, 1, __ATOMIC_SEQ_CST);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (kernel) {
-        if (pcid_on || pages > TLB_RANGE_MAX) vmm_flush_all(); /* invlpg reaches only the current PCID */
-        else flush_range_local(va, pages);
+        flush_kernel_local(va, pages);
     } else if ((read_cr3() & PTE_ADDR) == pml4) {
         flush_range_local(va, pages);
         if (slot >= 0) me->gen[slot] = gen;
@@ -322,6 +327,7 @@ static uint64_t *leaf_make(uint64_t pml4, uint64_t va, bool user) {
 }
 
 static bool vmm_map_page_locked(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags) {
+    if (va >= USER_TOP) flags |= PTE_G; /* the same in every space: no CR3 load drops it */
     uint64_t *leaf = leaf_make(pml4, va, flags & PTE_U);
     if (!leaf) return false;
     uint64_t old = *leaf, now = (pa & PTE_ADDR) | flags | PTE_P;
@@ -358,7 +364,7 @@ static bool map_2m(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags) {
         for (int i = 0; i < 512; i++) vmm_map_page(pml4, va + i * PAGE_SIZE, pa + i * PAGE_SIZE, f4);
         return true;
     }
-    *e = (pa & PTE_ADDR) | flags | PTE_PS | PTE_P;
+    *e = (pa & PTE_ADDR) | flags | (va >= USER_TOP ? PTE_G : 0) | PTE_PS | PTE_P;
     invlpg(va);
     return true;
 }
@@ -855,45 +861,28 @@ bool vmm_handle_user_fault(uint64_t addr, uint64_t err) {
     return shared_demand_fault(addr, err & 2);
 }
 
-/* ---- vmalloc: virtually contiguous kernel memory from scattered frames ---- */
-static uint64_t vmalloc_next = VMALLOC_BASE;
+/* ---- gathered changes ---- */
 
-void *vmalloc(size_t pages) {
-    uint64_t va = __atomic_fetch_add(&vmalloc_next, (pages + 1) * PAGE_SIZE, __ATOMIC_RELAXED); /* a guard page */
+void vmm_gather_finish(struct vmm_gather *g) {
+    if (g->lo < g->hi) {
+        uint64_t f = irq_save();
+        tlb_shootdown(g->pml4, g->lo, (g->hi - g->lo) / PAGE_SIZE);
+        irq_restore(f);
+    }
+    pmm_list_free(&g->frames);
+}
+
+void vmm_kernel_unmap(struct vmm_gather *g, uint64_t va, size_t pages, bool frames) {
+    uint64_t f = spin_lock(&kmap_lock);
     for (size_t i = 0; i < pages; i++) {
-        uint64_t p = pmm_alloc_zeroed();
-        if (!p) {
-            vfree((void *)va, i);
-            return NULL;
-        }
-        vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, p, PTE_W | PTE_NX);
+        uint64_t at = va + i * PAGE_SIZE;
+        bool huge = false;
+        uint64_t *p = walk(kernel_pml4, at, &huge), e = p && !huge ? *p : 0;
+        if (!(e & PTE_P)) continue;
+        __atomic_store_n(p, 0, __ATOMIC_RELEASE);
+        if (frames) pmm_list_add(&g->frames, e & PTE_ADDR);
+        g->lo = MIN(g->lo, at);
+        g->hi = MAX(g->hi, at + PAGE_SIZE);
     }
-    return (void *)va;
+    spin_unlock(&kmap_lock, f);
 }
-
-static void unmap_kernel(uint64_t va, size_t pages, bool free_frames) {
-    uint64_t old[UNMAP_BATCH];
-    for (size_t i = 0; i < pages; i += UNMAP_BATCH) {
-        size_t n = MIN((size_t)UNMAP_BATCH, pages - i);
-        unmap_range(kernel_pml4, va + i * PAGE_SIZE, n, old);
-        for (size_t j = 0; free_frames && j < n; j++) if (old[j] & PTE_P) pmm_free(old[j] & PTE_ADDR);
-    }
-}
-
-/* Existing frames (frames[i], or a run from pa) at fresh kernel addresses (e.g. read+execute only). */
-static void *map_frames(const uint64_t *frames, uint64_t pa, size_t pages, uint64_t flags) {
-    uint64_t va = __atomic_fetch_add(&vmalloc_next, (pages + 1) * PAGE_SIZE, __ATOMIC_RELAXED);
-    for (size_t i = 0; i < pages; i++)
-        if (!vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, frames ? frames[i] : pa + i * PAGE_SIZE, flags)) {
-            unmap_kernel(va, i, false);
-            return NULL;
-        }
-    return (void *)va;
-}
-void *vmalloc_map_phys(uint64_t pa, size_t pages, uint64_t flags) { return map_frames(NULL, pa, pages, flags); }
-void *vmalloc_map_frames(const uint64_t *frames, size_t pages, uint64_t flags) {
-    return map_frames(frames, 0, pages, flags);
-}
-void vunmap(void *ptr, size_t pages) { unmap_kernel((uint64_t)ptr, pages, false); }
-
-void vfree(void *ptr, size_t pages) { unmap_kernel((uint64_t)ptr, pages, true); }

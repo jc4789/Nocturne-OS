@@ -20,6 +20,7 @@
 #include "sys/keep.h"
 #include "gui/screenmode.h"
 #include "mm/heap.h"
+#include "mm/vmalloc.h"
 
 extern const char *kernel_cmdline;
 void acpi_init(void);
@@ -83,6 +84,7 @@ bool cmdline_number(const char *key, uint64_t *out) {
 void kmain_late(void) {
     entropy_init();
     heap_trim_start();
+    vmalloc_purge_start();
     acpi_init();
     pm_init(); /* the power thread: every shutdown and restart goes through it */
     vm_init(); /* only in a VM: its own bus and the devices on it */

@@ -3,6 +3,7 @@
 #include "arch/smp.h"
 #include "arch/spin.h"
 #include "sys/sched.h"
+#include "mm/vmalloc.h"
 #include "mm/vmm.h"
 #include "dev/entropy.h"
 #include "arch/irq.h"

@@ -255,16 +255,18 @@ static NORETURN void ap_main(void *argument) {
     percpu_load(index); /* before anything that takes a lock: a spinlock names its holder by it */
     if (!cpu_features_same()) fail(c);
     cpu_setup();
+    mtrr_sync(); /* after a sleep the firmware's memory types may be gone: the BSP's again */
+    pat_init_cpu(); /* same PAT as the BSP before any MMIO/WC mapping is touched */
+    if (rdmsr(MSR_PAT) != bsp_pat) fail(c);
+    /* The kernel's tables before any of its memory is used: the bootloader's, which a CPU it
+       started runs on, map the direct map and the image only, no heap and no vmalloc range. */
+    write_cr3(kernel_pml4);
+    vmm_init_cpu();
     gdt_init_cpu(index);
     entry_load();
     if (!entry_stacks_init()) fail(c); /* no NMI comes before it: the panic's go to online CPUs */
     if (!fpu_init_ap()) fail(c);
     pstate_init_ap();
-    mtrr_sync(); /* after a sleep the firmware's memory types may be gone: the BSP's again */
-    pat_init_cpu(); /* same PAT as the BSP before any MMIO/WC mapping is touched */
-    if (rdmsr(MSR_PAT) != bsp_pat) fail(c);
-    write_cr3(kernel_pml4);
-    vmm_init_cpu();
     if (!lapic_ap_init() || lapic_current_id() != topology.cpu[index].apic_id) fail(c);
     answer(c, START_ARRIVED);
     clock_cpu_compare(); /* with every CPU that arrived, once CPU 0 has their count */

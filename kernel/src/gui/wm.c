@@ -20,6 +20,7 @@
 #include "dev/input.h"
 #include "dev/pciuser.h"
 #include "sys/object.h"
+#include "mm/vmalloc.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
 #include "sys/clock.h"

@@ -112,7 +112,9 @@ void cpu_setup(void);         /* each CPU, before its page tables: what every on
 #define MSR_TSC_AUX 0xC0000103u
 #define MSR_PAT   0x277u
 #define CR0_WP    (1ULL << 16)
+#define CR4_PGE      (1ULL << 7)
 #define CR4_FSGSBASE (1ULL << 16)
+#define CR4_PCIDE    (1ULL << 17)
 #define CR4_SMEP     (1ULL << 20)
 #define CR4_SMAP     (1ULL << 21)
 static inline uint64_t read_cr0(void) { uint64_t v; __asm__ volatile("mov %%cr0, %0" : "=r"(v)); return v; }

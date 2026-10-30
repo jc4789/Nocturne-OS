@@ -162,9 +162,10 @@ bool cpu_features_same(void) {
    63), write protection in the kernel too, so read-only pages really are read-only; the app's
    pages neither run nor are touched by the kernel (SMEP, SMAP: user_copy alone opens them,
    arch/isr.asm); and FS and GS bases the app writes itself (FSGSBASE: a task switch keeps them,
-   sys/sched.c, and the kernel's GS base is never told from the app's by its value). */
+   sys/sched.c, and the kernel's GS base is never told from the app's by its value); and global
+   pages, which a CR3 load keeps: the kernel half's leaves, the same in every space (mm/vmm.c). */
 void cpu_setup(void) {
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_NXE);
     write_cr0(read_cr0() | CR0_WP);
-    write_cr4(read_cr4() | CR4_FSGSBASE | CR4_SMEP | CR4_SMAP);
+    write_cr4(read_cr4() | CR4_PGE | CR4_FSGSBASE | CR4_SMEP | CR4_SMAP);
 }

@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "mm/pmm.h"
 
 #define PTE_P      (1ULL << 0)
 #define PTE_W      (1ULL << 1)
@@ -32,7 +33,8 @@
 #define USER_LOW_TOP   0x0000000080000000ULL
 
 #define KHEAP_BASE   0xFFFFC00000000000ULL
-#define VMALLOC_BASE 0xFFFFD00000000000ULL
+#define VMALLOC_BASE 0xFFFFD00000000000ULL /* mm/vmalloc.c's ranges, 16 TiB */
+#define VMALLOC_END  0xFFFFE00000000000ULL
 
 struct limine_memmap_response;
 struct limine_executable_address_response;
@@ -75,11 +77,20 @@ void vmm_init_cpu(void);  /* 各CPU: CR3=kernel_pml4の後、PCIDEを揃える *
 void vmm_tlb_ipi(void);   /* VEC_TLB_SHOOTDOWN: a shootdown another CPU asked for */
 void vmm_tlb_stats(uint64_t *shootdowns, uint64_t *ipis);
 
-void *vmalloc(size_t pages);
-void vfree(void *p, size_t pages);
-/* Existing frames at fresh kernel addresses with the given flags: a run from pa, or frames[i]
-   (NULL when a page table could not be allocated; nothing stays mapped then). vunmap takes such a
-   mapping away again; the frames stay their owner's. */
-void *vmalloc_map_phys(uint64_t pa, size_t pages, uint64_t flags);
-void *vmalloc_map_frames(const uint64_t *frames, size_t pages, uint64_t flags);
-void vunmap(void *p, size_t pages);
+/* What a change of page tables leaves to do once their locks are let go: drop the old
+   translations of [lo, hi) from the TLBs of the CPUs that may hold them (every CPU, for the kernel
+   half), then give back the frames that were mapped there. */
+struct vmm_gather {
+    uint64_t pml4;
+    uint64_t lo, hi; /* lo >= hi: nothing to drop */
+    struct pmm_list frames;
+};
+static inline void vmm_gather_init(struct vmm_gather *g, uint64_t pml4) {
+    g->pml4 = pml4;
+    g->lo = UINT64_MAX;
+    g->hi = 0;
+    g->frames.first = NULL;
+}
+void vmm_gather_finish(struct vmm_gather *g);
+/* The kernel half's 4 KiB leaves of [va, va + pages) cleared; their frames join g's when frames. */
+void vmm_kernel_unmap(struct vmm_gather *g, uint64_t va, size_t pages, bool frames);

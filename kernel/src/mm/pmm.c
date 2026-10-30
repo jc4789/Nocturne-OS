@@ -34,10 +34,11 @@
 /* The most frames a cache and its node exchange at once: how long the node's lock is held. */
 #define BATCH_MOST 64
 
-enum { RESERVED, USED, FREE, TAIL, CACHED }; /* RESERVED is 0: what boot memory gives */
+/* RESERVED is 0: what boot memory gives. LISTED: in use, on its way back on a struct pmm_list. */
+enum { RESERVED, USED, FREE, TAIL, CACHED, LISTED };
 
 struct frame {
-    struct frame *next, *prev; /* FREE: its band's list of its order; CACHED: its cache's */
+    struct frame *next, *prev; /* FREE: its band's list of its order; CACHED: its cache's; LISTED: next */
     uint64_t pfn;              /* set once the frame is the allocator's (not RESERVED) */
     uint32_t cpu;              /* CACHED: whose cache */
     uint16_t node;
@@ -386,7 +387,7 @@ uint64_t pmm_alloc_contig(uint64_t count, unsigned bits) {
 }
 
 static void bad_free(uint64_t phys, const struct frame *f) {
-    static const char *const what[] = {"not the allocator's", "in use", "free", "free", "free"};
+    static const char *const what[] = {"not the allocator's", "in use", "free", "free", "free", "on a list"};
     kprintf("pmm: free of %p, which is %s\n", (void *)phys, f ? what[f->state] : "no RAM the allocator has");
 }
 
@@ -408,6 +409,23 @@ void pmm_free(uint64_t phys) {
     uint64_t flags = spin_lock(&n->lock);
     give(n, f->pfn, 0);
     spin_unlock(&n->lock, flags);
+}
+
+void pmm_list_add(struct pmm_list *l, uint64_t phys) {
+    struct frame *f = frame_of(phys / PAGE_SIZE);
+    if (!f || f->state != USED) panic("pmm: %p put on a list, which is %s", (void *)phys, f ? "not in use" : "no RAM");
+    f->state = LISTED;
+    f->next = l->first;
+    l->first = f;
+}
+
+void pmm_list_free(struct pmm_list *l) {
+    for (struct frame *f = l->first, *next; f; f = next) {
+        next = f->next;
+        f->state = USED;
+        pmm_free(f->pfn * PAGE_SIZE);
+    }
+    l->first = NULL;
 }
 
 void pmm_free_contig(uint64_t phys, uint64_t count) {
@@ -450,7 +468,7 @@ bool pmm_page_used(uint64_t pfn) {
     const struct frame *f = frame_of(pfn);
     if (!f) return true;
     uint8_t state = __atomic_load_n(&f->state, __ATOMIC_RELAXED);
-    return state == USED || state == RESERVED;
+    return state == USED || state == RESERVED || state == LISTED;
 }
 
 bool pmm_claim(uint64_t pfn) {
@@ -458,7 +476,7 @@ bool pmm_claim(uint64_t pfn) {
     if (!f) return false;
     for (;;) {
         uint8_t state = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE);
-        if (state == USED || state == RESERVED) return false;
+        if (state == USED || state == RESERVED || state == LISTED) return false;
         bool claimed;
         if (state == CACHED) {
             struct cache *c = &per_cpu(cpu_cache, __atomic_load_n(&f->cpu, __ATOMIC_RELAXED));

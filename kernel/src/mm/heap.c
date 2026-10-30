@@ -4,7 +4,7 @@
 
    Any CPU allocates and frees, under heap_lock (taken before the kernel page tables' and pmm's).
    The heap grows and backs released pages by adding mappings, which needs no shootdown; only the
-   heap's own task, on the BSP, takes pages away (heap_trim). */
+   heap's own task takes pages away (heap_trim). */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/spin.h"
@@ -258,6 +258,8 @@ void kfree(void *p) {
    spinlocks, under which a long walk and its TLB shootdowns would keep other CPUs waiting.
    Blocks of TRIM_MIN bytes and more are in the classes from TRIM_MIN's on. */
 static void heap_trim(void) {
+    struct vmm_gather g;
+    vmm_gather_init(&g, kernel_pml4);
     uint64_t f = spin_lock(&heap_lock);
     trim_pending = false;
     unsigned first_fl, first_sl;
@@ -270,9 +272,11 @@ static void heap_trim(void) {
                 uint64_t first = ALIGN_UP((uint64_t)(b + 1), PAGE_SIZE);
                 uint64_t last = ALIGN_DOWN((uint64_t)(b + 1) + b->size, PAGE_SIZE);
                 if (last <= first) continue;
-                vfree((void *)first, (last - first) / PAGE_SIZE); /* frees only mapped pages */
+                vmm_kernel_unmap(&g, first, (last - first) / PAGE_SIZE, true); /* the mapped pages */
                 b->free |= BLOCK_RELEASED;
             }
+    /* under heap_lock still: no block is backed again before the old translations are gone */
+    vmm_gather_finish(&g);
     spin_unlock(&heap_lock, f);
 }
 

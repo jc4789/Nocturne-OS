@@ -6,7 +6,6 @@
 
 #define CR0_NW    (1ULL << 29)
 #define CR0_CD    (1ULL << 30)
-#define CR4_PGE   (1ULL << 7)
 
 static void flush_tlb_all(uint64_t cr4) {
     if (cr4 & CR4_PGE) write_cr4(cr4 & ~CR4_PGE); /* PGE off so global entries go too */

@@ -16,6 +16,7 @@
 #include "sys/prof.h"
 #include "sys/syscall.h"
 #include "mm/heap.h"
+#include "mm/vmalloc.h"
 #include "mm/vmm.h"
 #include "sys/object.h"
 #include "sys/channel.h"
@@ -71,6 +72,34 @@ static struct sched_stats stats;
 /* Ended tasks no one else collects: the reaper frees them once they are off their CPUs. */
 static struct task *dead;
 static struct wait_queue dead_wait;
+
+/* Kernel stacks a CPU keeps from the tasks that ended there for the next it makes: a thread that
+   ends and one that starts cost no mapping and no shootdown. Two, as a CPU's churn of threads is
+   one ending while another starts; more would hold memory on every CPU for little. */
+#define KSTACK_KEPT 2
+PERCPU static struct kstack_stash {
+    uint8_t *stack[KSTACK_KEPT];
+    unsigned count;
+} kstack_stash;
+
+static uint8_t *kstack_alloc(void) {
+    uint64_t f = irq_save();
+    struct kstack_stash *s = this_cpu_ptr(kstack_stash);
+    uint8_t *stack = s->count ? s->stack[--s->count] : NULL;
+    irq_restore(f);
+    if (!stack) return vmalloc(KSTACK_PAGES);
+    memset(stack, 0, KSTACK_PAGES * PAGE_SIZE); /* nothing of the task before */
+    return stack;
+}
+
+static void kstack_free(uint8_t *stack) {
+    uint64_t f = irq_save();
+    struct kstack_stash *s = this_cpu_ptr(kstack_stash);
+    bool kept = s->count < KSTACK_KEPT;
+    if (kept) s->stack[s->count++] = stack;
+    irq_restore(f);
+    if (!kept) vfree(stack, KSTACK_PAGES);
+}
 
 static bool wq_take_blocked(struct task *t, bool timed);
 static void wake_fire(struct alarm *a, struct regs *r);
@@ -571,7 +600,7 @@ static void task_free(struct task *t) {
         if (t->process && t->process != t && t->process->pml4 == t->pml4)
             mmap_hole_add(t->process, t->user_stack - PAGE_SIZE, t->user_stack_size + 2 * PAGE_SIZE);
     }
-    vfree(t->kstack, KSTACK_PAGES);
+    if (t->kstack) kstack_free(t->kstack); /* an idle task runs on its CPU's own stack */
     handle_table_free(t);
     kfree((void *)t->allowed.words);
     kfree(t);
@@ -638,7 +667,7 @@ struct task *task_alloc(const char *name) {
     if (!t) return NULL;
     t->handles = t->initial_handles;
     t->handle_capacity = INITIAL_HANDLES;
-    t->kstack = vmalloc(KSTACK_PAGES);
+    t->kstack = kstack_alloc();
     if (!t->kstack) {
         kfree(t);
         return NULL;
@@ -653,7 +682,7 @@ struct task *task_alloc(const char *name) {
     uint64_t f = spin_lock(&task_lock);
     if (next_pid > INT32_MAX) {
         spin_unlock(&task_lock, f);
-        vfree(t->kstack, KSTACK_PAGES);
+        kstack_free(t->kstack);
         kfree(t);
         return NULL;
     }
@@ -668,7 +697,7 @@ struct task *task_alloc(const char *name) {
         f = spin_lock(&task_lock);
         task_unlink_locked(t);
         spin_unlock(&task_lock, f);
-        vfree(t->kstack, KSTACK_PAGES);
+        kstack_free(t->kstack);
         kfree(t);
         return NULL;
     }

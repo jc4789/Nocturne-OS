@@ -7,6 +7,7 @@
 #include "vm/hyperv.h"
 #include "vm/hv/hv.h"
 #include "mm/pmm.h"
+#include "mm/vmalloc.h"
 #include "mm/vmm.h"
 
 #define HV_MSR_SCONTROL 0x40000080

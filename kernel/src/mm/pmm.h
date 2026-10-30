@@ -15,6 +15,15 @@ uint64_t pmm_alloc_within(unsigned bits);
 uint64_t pmm_alloc_contig(uint64_t count, unsigned bits);
 void pmm_free(uint64_t phys);
 void pmm_free_contig(uint64_t phys, uint64_t count); /* count frames from phys, as pmm_free each */
+/* Frames in use whose freeing must wait (until a TLB shootdown): each joins the list through its
+   own record, whose links a frame in use leaves free, so a list holds any number. A listed frame
+   is freed by pmm_list_free only. */
+struct frame;
+struct pmm_list {
+    struct frame *first;
+};
+void pmm_list_add(struct pmm_list *l, uint64_t phys);
+void pmm_list_free(struct pmm_list *l);
 /* Frames free on the nodes: the few waiting in the CPUs' caches are not counted. */
 uint64_t pmm_free_pages(void);
 /* Usable RAM below 1 MiB (the allocator never hands it out): base and page count, 0 when none. */

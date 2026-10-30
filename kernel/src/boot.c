@@ -16,6 +16,7 @@
 #include "dev/input.h"
 #include "mm/bootmem.h"
 #include "mm/pmm.h"
+#include "mm/vmalloc.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
 #include "sys/sched.h"
@@ -101,6 +102,7 @@ void kmain(void) {
     percpu_init();
     pmm_init(mm);
     vmm_init(mm, ka_req.response);
+    vmalloc_init();
     if (!entry_stacks_init()) panic("boot: no memory for the interrupt stacks");
     wake_init(); /* the real-mode page for waking from sleep and restarting the APs */
 

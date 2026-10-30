@@ -14,7 +14,6 @@
 
 #define TRAMP_DATA 0x200 /* keep in step with arch/wake.asm */
 #define WAKE_PAGES 4     /* code and data, PML4, PDPT, PD */
-#define CR4_PCIDE  (1ULL << 17)
 
 struct tramp_data {
     uint64_t gdt[4];      /* null, 0x08 code32, 0x10 data, 0x18 code64 */
@@ -88,7 +87,7 @@ NORETURN void wake_hibernate_jump(uint64_t pml4, uint64_t list, uint64_t image_w
     uint64_t *p = phys_to_virt(pml4), *k = phys_to_virt(kernel_pml4 & PTE_ADDR);
     for (unsigned i = 256; i < 512; i++) p[i] = k[i];
     cli();
-    write_cr4(read_cr4() & ~(1ULL << 7)); /* PGE off: every TLB entry goes, global ones too */
+    write_cr4(read_cr4() & ~CR4_PGE); /* every TLB entry goes, global ones too */
     write_cr3(pml4);
     ((void (*)(uint64_t, uint64_t))spare)(list, image_wake_page);
     for (;;) hlt();

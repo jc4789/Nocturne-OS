@@ -102,3 +102,8 @@ QEMU を -accel whpx で起こして眠り（S3）を選ぶと、入るまでは
 対象: kernel/src/arch/isr.asm, kernel/src/arch/idt.c, kernel/src/arch/cpu.h, kernel/src/arch/gdt.c, kernel/src/sys/sched.c, user/libc/sys.c, ports/go/
 確かめた: 2026-10-30（段①の 2、未コミット）
 isr.asm の REGS_* の位置と FRAME_BYTES（私的な語一つ＋struct regs）、REGS_SYSCALL（256）、TSS_RSP0（4）は cpu.h の struct regs と gdt.c の struct tss に合わせて手で書いてある（gdt.c だけ _Static_assert がある）。枠の下の私的な語は「出口で swapgs する」の 1/0 で、核から IST に来た回だけは置き直す前の GS の基を持つ。GS の決め方は CS の下位 2 bit だけ（核から来て GS が利用者のものなのは isr_iret の iretq が違反した時だけ）：swapgs と sysret／iretq の間で割り込みを開かない（sched_user_return が cli して戻る）。核の中の FS は使わない：schedule が前の task の FS と利用者の GS（swapgs を挟んで RDGSBASE）を保ち、次のものを書く。SMAP なので、利用者の頁に触れてよいのは user_copy（stac と clac の間）だけで、ほかの所の違反は panic。割り込みと IST の stack は各 CPU が entry_stacks_init で vmalloc から取る（下に守りの頁）。AP は online_set に入る前に取るので、panic の NMI（online の CPU へだけ送る）が IST の無い間に来ることはない。Go の移植（ports/go/nocturne.patch、上流の写しは D:\Programes\cloned repos\go）はまだ INT $0x80 と SYS_THREAD_TLS（52）を使い、Go のアプリ（calc・gotest・tsc）は最初の呼出しで止まる。休止の往復（作業場の qcow2 の上書き層）で、戻った後もアプリの SYSCALL が通ることを確かめた（IST の stack と RDPID が戻った後に使われる場面は作っていない）。
+
+## AP は ap_main の write_cr3 まで limine の頁表で走る
+対象: kernel/src/arch/smp.c, kernel/src/mm/vmalloc.c, kernel/src/mm/heap.c
+確かめた: 2026-10-30（段①の 13-1、未コミット）
+limine が起こした AP の CR3 は limine の表（QEMU で 0xbff7d000）で、直写像と核の像しか写していない：heap と vmalloc の番地は無い。ap_main は write_cr3(kernel_pml4) を cpu_setup・mtrr_sync・PAT の確かめの直後に置き、その前で kmalloc・vmalloc・entry_stacks_init を呼ばない。13-1 の最初の起動で、entry_stacks_init の中の vmalloc の kzalloc が AP で頁違反（CR2 ffffc00000003250）になり、panic の文は serial に出ず klog（klog_buf・klog_head）を HMP の x で読んで分かった。
