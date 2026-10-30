@@ -344,4 +344,6 @@ static void pm_thread(void *arg) {
     }
 }
 
-void pm_init(void) { kthread_create("power", pm_thread, NULL); }
+/* On the first CPU: the sleep it runs (smp_suspend, wake_sleep) comes back on the CPU the firmware
+   wakes. */
+void pm_init(void) { kthread_create_on("power", pm_thread, NULL, 0); }

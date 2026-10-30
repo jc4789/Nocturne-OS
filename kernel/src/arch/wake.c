@@ -33,24 +33,30 @@ struct tramp_data {
     uint16_t far64_sel, pad2;
     uint32_t cr3, pad3;   /* 56 */
     uint32_t efer, pad4;  /* 64 */
-    uint64_t entry, stack, arg; /* 72, 80, 88 */
+    uint64_t entry, stack, arg; /* 72, 80, 88: stack and arg TDF_ANY's */
     uint64_t id_reg;      /* 96: struct lapic_ident's */
-    uint32_t apic_id;     /* 104: WAKE_ANY_CPU for any CPU */
+    uint32_t count;       /* 104: the table's rows */
     uint32_t id_mask;     /* 108 */
     uint64_t base, base_mask; /* 112, 120 */
     uint32_t flags;       /* 128: TDF_ */
+    uint32_t pad5;
+    uint64_t table;       /* 136: struct wake_cpu[count] */
 } PACKED;
 #define TDF_X2    1u
 #define TDF_XAIDN 2u
+#define TDF_ANY   4u
 _Static_assert(__builtin_offsetof(struct tramp_data, far32) == 40, "wake.asm TD_FAR32");
 _Static_assert(__builtin_offsetof(struct tramp_data, cr3) == 56, "wake.asm TD_CR3");
 _Static_assert(__builtin_offsetof(struct tramp_data, arg) == 88, "wake.asm TD_ARG");
 _Static_assert(__builtin_offsetof(struct tramp_data, id_reg) == 96, "wake.asm TD_ID_REG");
-_Static_assert(__builtin_offsetof(struct tramp_data, apic_id) == 104, "wake.asm TD_APIC_ID");
+_Static_assert(__builtin_offsetof(struct tramp_data, count) == 104, "wake.asm TD_COUNT");
 _Static_assert(__builtin_offsetof(struct tramp_data, id_mask) == 108, "wake.asm TD_ID_MASK");
 _Static_assert(__builtin_offsetof(struct tramp_data, base) == 112, "wake.asm TD_BASE");
 _Static_assert(__builtin_offsetof(struct tramp_data, base_mask) == 120, "wake.asm TD_BASE_MASK");
 _Static_assert(__builtin_offsetof(struct tramp_data, flags) == 128, "wake.asm TD_FLAGS");
+_Static_assert(__builtin_offsetof(struct tramp_data, table) == 136, "wake.asm TD_TABLE");
+_Static_assert(__builtin_offsetof(struct wake_cpu, arg) == 8 && __builtin_offsetof(struct wake_cpu, apic_id) == 16 &&
+                   sizeof(struct wake_cpu) == 24, "wake.asm ROW_");
 
 extern const uint8_t tramp_start[], tramp_pm32[], tramp_lm64[], tramp_end[];
 extern struct { uint16_t limit; uint64_t base; } PACKED wake_gdtr;
@@ -95,7 +101,9 @@ NORETURN void wake_hibernate_jump(uint64_t pml4, uint64_t list, uint64_t image_w
 }
 uint64_t wake_page(void) { return page; }
 
-void wake_prepare(uint64_t entry, uint64_t stack, uint64_t arg, uint32_t apic_id) {
+/* The page as the next CPUs find it: the code, the GDT, the way into long mode, entry and how a
+   CPU reads its APIC ID; the caller adds whom it is for, then wake_publish. */
+static struct tramp_data *wake_fill(uint64_t entry) {
     uint8_t *p = phys_to_virt(page);
     memcpy(p, tramp_start, (size_t)(tramp_end - tramp_start));
     struct tramp_data *d = (struct tramp_data *)(p + TRAMP_DATA);
@@ -112,12 +120,9 @@ void wake_prepare(uint64_t entry, uint64_t stack, uint64_t arg, uint32_t apic_id
     d->cr3 = (uint32_t)(page + 0x1000);
     d->efer = EFER_LME | EFER_NXE;
     d->entry = entry;
-    d->stack = stack;
-    d->arg = arg;
     struct lapic_ident id;
     lapic_ident(&id);
     d->id_reg = (uint64_t)(uintptr_t)id.id_reg;
-    d->apic_id = apic_id;
     d->id_mask = id.id_mask;
     d->base = id.base;
     d->base_mask = id.base_mask;
@@ -125,7 +130,25 @@ void wake_prepare(uint64_t entry, uint64_t stack, uint64_t arg, uint32_t apic_id
     /* the kernel half as it is now: entries added since the last time count too */
     uint64_t *low = phys_to_virt(page + 0x1000), *kernel = phys_to_virt(kernel_pml4 & PTE_ADDR);
     for (unsigned i = 256; i < 512; i++) low[i] = kernel[i];
-    __asm__ volatile("wbinvd" : : : "memory"); /* the firmware and a starting AP read it uncached */
+    return d;
+}
+
+/* The firmware and a starting AP read the page and the table uncached. */
+static void wake_publish(void) { __asm__ volatile("wbinvd" : : : "memory"); }
+
+void wake_prepare_any(uint64_t entry, uint64_t stack, uint64_t arg) {
+    struct tramp_data *d = wake_fill(entry);
+    d->stack = stack;
+    d->arg = arg;
+    d->flags |= TDF_ANY;
+    wake_publish();
+}
+
+void wake_prepare_cpus(uint64_t entry, const struct wake_cpu *table, uint32_t count) {
+    struct tramp_data *d = wake_fill(entry);
+    d->table = (uint64_t)(uintptr_t)table;
+    d->count = count;
+    wake_publish();
 }
 
 /* ---- the BSP across S3 ---- */
@@ -178,7 +201,7 @@ bool wake_sleep(void (*enter)(void)) {
     if (!fpu_storage && !(fpu_storage = kmalloc(fpu_storage_bytes()))) return false;
     fpu_save(fpu_state_in(fpu_storage));
     mtrr_save();
-    wake_prepare((uint64_t)wake_resume64, (uint64_t)resume_stack + sizeof resume_stack, 0, WAKE_ANY_CPU);
+    wake_prepare_any((uint64_t)wake_resume64, (uint64_t)resume_stack + sizeof resume_stack, 0);
     if (!wake_suspend(enter)) return false;
     /* back from the firmware: memory types first, everything after runs faster for it */
     mtrr_sync();

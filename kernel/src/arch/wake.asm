@@ -3,7 +3,8 @@
 ; arch/wake.c copies tramp_start..tramp_end to a page below 1 MiB and fills the data block at
 ; TRAMP_DATA in that page. Real mode -> 32-bit protected mode -> long mode through a page table
 ; in low memory that maps the page itself and the kernel's upper half, then, for the CPU the data
-; block names (arch/wake.h), a jump to `entry` with rsp = `stack` and rdi = `arg`.
+; block is for (arch/wake.h), a jump to `entry` with rsp = `stack` and rdi = `arg`: the block's
+; own for the BSP the firmware wakes, else those of the CPU's row in the table.
 bits 16
 section .text
 
@@ -17,13 +18,19 @@ section .text
 %define TD_STACK   (TRAMP_DATA + 80)
 %define TD_ARG     (TRAMP_DATA + 88)
 %define TD_ID_REG  (TRAMP_DATA + 96)
-%define TD_APIC_ID (TRAMP_DATA + 104)
+%define TD_COUNT   (TRAMP_DATA + 104)
 %define TD_ID_MASK (TRAMP_DATA + 108)
 %define TD_BASE    (TRAMP_DATA + 112)
 %define TD_BASE_MASK (TRAMP_DATA + 120)
 %define TD_FLAGS   (TRAMP_DATA + 128)
+%define TD_TABLE   (TRAMP_DATA + 136)
 %define TDF_X2     1            ; the kernel is in x2APIC mode
 %define TDF_XAIDN  2            ; AMD's 8-bit xAPIC ID is to be turned on (arch/apic.c)
+%define TDF_ANY    4            ; the one CPU coming in takes the block's stack and arg
+%define ROW_STACK  0            ; struct wake_cpu
+%define ROW_ARG    8
+%define ROW_ID     16
+%define ROW_SIZE   24
 
 global tramp_start, tramp_pm32, tramp_lm64, tramp_end
 tramp_start:
@@ -63,10 +70,10 @@ tramp_pm32:
 bits 64
 tramp_lm64:
     mov ebx, ebx
-    mov r8d, [rbx + TD_APIC_ID] ; a STARTUP that may have reached other CPUs (arch/wake.h):
-    cmp r8d, -1                 ; this one goes on only with the APIC ID it was sent to
-    je .own
-    mov ecx, 0x1B               ; IA32_APIC_BASE
+    test dword [rbx + TD_FLAGS], TDF_ANY
+    jnz .any
+    mov ecx, 0x1B               ; IA32_APIC_BASE: a STARTUP may have reached other CPUs (arch/wake.h),
+                                ; and this one goes on only with a row for its APIC ID
     rdmsr
     test dword [rbx + TD_FLAGS], TDF_X2
     jz .xapic
@@ -77,9 +84,7 @@ tramp_lm64:
 .x2:
     mov ecx, 0x802              ; the x2APIC ID
     rdmsr
-    cmp eax, r8d
-    jne .other
-    jmp .own
+    jmp .find
 .xapic:
     bt eax, 10                  ; the kernel's xAPIC mode, which an APIC in x2APIC mode takes later,
     jc .x2                      ; where it may (arch/apic.c), lapic_ap_init
@@ -96,11 +101,25 @@ tramp_lm64:
     mov eax, [rsi]
     shr eax, 24
     and eax, [rbx + TD_ID_MASK]
-    cmp eax, r8d
-    jne .other
+.find:                          ; eax: its APIC ID
+    mov rsi, [rbx + TD_TABLE]
+    mov ecx, [rbx + TD_COUNT]
+.row:
+    test ecx, ecx
+    jz .other
+    cmp eax, [rsi + ROW_ID]
+    je .own
+    add rsi, ROW_SIZE
+    dec ecx
+    jmp .row
 .own:
+    mov rsp, [rsi + ROW_STACK]
+    mov rdi, [rsi + ROW_ARG]
+    jmp .enter
+.any:
     mov rsp, [rbx + TD_STACK]
     mov rdi, [rbx + TD_ARG]
+.enter:
     mov rax, [rbx + TD_ENTRY]
     jmp rax
 .other:                         ; nothing written: halted until an INIT

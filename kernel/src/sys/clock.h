@@ -5,7 +5,7 @@
    device's count and clock_now_ns at it.
 
    The counter is the hypervisor's reference counter (vm/vm.h), else the TSC (every CPU's
-   agreeing, checked as each starts). Its rate comes from a
+   agreeing, checked as they start). Its rate comes from a
    reference of known frequency (the hypervisor's word, CPUID, the ACPI PM timer, the PIT, the
    first there is), measured at boot and again over a longer span later; the clock runs on through
    a new rate without a step. It never goes back on one CPU, nor across CPUs by more than a cache
@@ -20,10 +20,12 @@
 #define CLOCK_NEVER UINT64_MAX /* a deadline that never comes */
 
 void clock_init(void); /* CPU 0 at boot, after the ACPI tables, before any other CPU starts */
-/* A CPU starting (arch/smp.c) compares its TSC with CPU 0's: it in clock_cpu_join, CPU 0 in
-   clock_cpu_lead meanwhile (false when that CPU did not come by until). */
-void clock_cpu_join(void);
-bool clock_cpu_lead(unsigned cpu, uint64_t until);
+/* The CPUs starting (arch/smp.c) compare their TSCs with each other and with the CPU starting
+   them, all at once: it calls clock_cpus_compare with the count of CPUs comparing (itself among
+   them) once every one has called clock_cpu_compare, after its LAPIC is up. Each returns with
+   this CPU's readings set. */
+void clock_cpu_compare(void);
+void clock_cpus_compare(unsigned cpus);
 uint64_t clock_now_ns(void);
 uint64_t clock_tsc_hz(void); /* the TSC's rate as the clock has it, 0 where it is not known */
 /* The deadline ns from now (CLOCK_NEVER past the end). */

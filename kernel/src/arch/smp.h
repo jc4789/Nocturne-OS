@@ -47,8 +47,9 @@ uint64_t cpu_parallel_jobs(void);
 uint64_t cpu_max_job_us(void);
 
 /* Sleep: smp_suspend (CPU 0, interrupts on, every app stopped) takes every other CPU's tasks
-   back to CPU 0 and halts each of those CPUs with interrupts off, false when one did not stop;
-   smp_resume starts them again with INIT-SIPI, after S3 or after a sleep that failed.
+   back to CPU 0 and halts each of those CPUs with interrupts off, false when one did not stop
+   (or there is no wake page or memory to start them again with); smp_resume starts them all again
+   at once with INIT-SIPI, after S3 or after a sleep that failed.
    cpu_park_check is the idle loop's side, interrupts off. */
 bool smp_suspend(void);
 void smp_resume(void);

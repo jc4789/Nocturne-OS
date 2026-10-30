@@ -11,6 +11,7 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/smp.h"
+#include "arch/cpuset.h"
 #include "sys/sched.h"
 #include "sys/prof.h"
 #include "sys/syscall.h"
@@ -266,12 +267,13 @@ static bool steal(unsigned self) {
 /* Where a waking task goes: its last CPU if that has nothing to run, else one that has nothing,
    else the queue with the fewest tasks (its last on a tie). */
 static unsigned choose(struct task *t) {
+    const struct kei_mask *allowed = t->kei.allowed;
     unsigned home = __atomic_load_n(&t->cpu, __ATOMIC_ACQUIRE), best = home;
-    bool home_ok = usable(home);
+    bool home_ok = usable(home) && kei_mask_test(allowed, home);
     if (home_ok && !resident(home)) return home;
     size_t fewest = home_ok ? resident(home) : SIZE_MAX;
     for (unsigned cpu = 0; cpu < topology.cpus; cpu++) {
-        if (cpu == home || !usable(cpu)) continue;
+        if (cpu == home || !usable(cpu) || !kei_mask_test(allowed, cpu)) continue;
         size_t n = resident(cpu);
         if (n < fewest) { fewest = n; best = cpu; }
     }
@@ -566,6 +568,7 @@ static void task_free(struct task *t) {
     }
     vfree(t->kstack, KSTACK_PAGES);
     handle_table_free(t);
+    kfree((void *)t->allowed.words);
     kfree(t);
 }
 
@@ -672,9 +675,22 @@ static void push(struct task *t, uint64_t v) {
     *(uint64_t *)t->ksp = v;
 }
 
-struct task *kthread_create(const char *name, void (*fn)(void *), void *arg) {
+#define ANY_CPU UINT32_MAX
+
+static struct task *kthread_new(const char *name, void (*fn)(void *), void *arg, unsigned cpu) {
     struct task *t = task_alloc(name);
     if (!t) return NULL;
+    if (cpu != ANY_CPU) {
+        uint64_t *words = cpu < topology.cpus ? kzalloc(cpuset_words(topology.cpus) * sizeof *words) : NULL;
+        if (!words) {
+            task_discard(t);
+            return NULL;
+        }
+        cpuset_add(words, cpu);
+        t->allowed = (struct kei_mask){words, topology.cpus};
+        t->kei.allowed = &t->allowed;
+        t->cpu = cpu; /* in no queue yet: its home, which choose keeps */
+    }
     push(t, (uint64_t)kthread_trampoline); /* ret target of context_switch */
     push(t, 0);                           /* rbp */
     push(t, 0);                           /* rbx */
@@ -685,6 +701,14 @@ struct task *kthread_create(const char *name, void (*fn)(void *), void *arg) {
     t->parent = NULL;
     sched_make_ready(t);
     return t;
+}
+
+struct task *kthread_create(const char *name, void (*fn)(void *), void *arg) {
+    return kthread_new(name, fn, arg, ANY_CPU);
+}
+
+struct task *kthread_create_on(const char *name, void (*fn)(void *), void *arg, unsigned cpu) {
+    return kthread_new(name, fn, arg, cpu);
 }
 
 void kthread_start(void (*fn)(void *), void *arg) {

@@ -7,7 +7,6 @@
 #include "sys/clock.h"
 #include "vm/vm.h"
 #include "dev/iommu.h"
-#include "dev/pci.h"
 #include "limine.h"
 #include "mm/vmm.h"
 
@@ -42,7 +41,6 @@ static volatile uint32_t *lapic;
 static uint64_t lapic_phys;      /* the xAPIC page's address (IA32_APIC_BASE), 0 in x2APIC mode */
 static bool available, x2_mode;
 static bool amd, cmci;           /* AMD's APIC architecture; the CMCI LVT entry is there (apic_init) */
-static unsigned family;          /* CPUID.1:EAX family, the extended one added at Fh */
 static uint32_t xapic_id_max = 0xFE;
 
 /* x2APICではMMIO pageを読むこと自体が無効。通常32bit registerは
@@ -81,35 +79,13 @@ static bool lapic_mode_restore(void) {
     return ((rdmsr(IA32_APIC_BASE) & APIC_BASE_X2) != 0) == x2_mode;
 }
 
-/* Families 0Fh, 10h and 15h: whether every node's northbridge has 8-bit APIC IDs on, ApicExtId
-   (bit 18) and ApicExtBrdCst (bit 17) of F0x68, at bus 0, device 18h + node, function 0 (BKDG
-   32559 4.1, 4.3.9 and 7.8.1; 31116 F0x68 and APIC20; 42300 D18F0x68). The firmware sets them;
-   configuration mechanism #1 reaches them before pci_init. */
-static bool northbridge_8bit_ids(void) {
-    unsigned nodes = 0;
-    for (uint8_t dev = 0x18; dev < 0x20; dev++) {
-        if ((pci_read32(0, dev, 0, 0) & 0xFFFF) != 0x1022) continue;
-        nodes++;
-        if ((pci_read32(0, dev, 0, 0x68) & (3u << 17)) != (3u << 17)) return false;
-    }
-    return nodes != 0;
-}
-
 /* The highest APIC ID xAPIC mode addresses, FFh being its broadcast (SDM 11.6.2.1). An AMD APIC
    with 4-bit IDs uses the low four bits only (APM 16.3.6), broadcasting at xxxx1111b (31116 and
    42300 APIC410). The APM's 8-bit ID is the extended register space's (16.3.4, 16.3.5: XAIDC),
-   which lapic_setup turns on (16.3.6: XAIDN). The guides for three families add the northbridge's,
-   ApicExtId and ApicExtBrdCst (northbridge_8bit_ids): Family 0Fh's APIC has no ID bit of its own
-   (32559 7.8.26), and the northbridge's alone makes 8-bit IDs; so it does in Family 10h, whose
-   ExtApicIdEn may be set only with it (31116 APIC410); in Family 15h the IDs are 8-bit with
-   ExtApicIdEn, set only with the northbridge's (42300 APIC410: "If ExtApicIdEn=1 then program
-   D18F0x68[ApicExtId]=1 and D18F0x68[ApicExtBrdCst]=1"). The others follow the APM. Either
-   mode. */
+   which lapic_setup turns on (16.3.6: XAIDN). Either mode. */
 static uint32_t xapic_id_limit(void) {
     if (!amd) return 0xFE;
-    if (family == 0x0F || family == 0x10) return northbridge_8bit_ids() ? 0xFE : 0x0E;
     bool xaidc = (lapic_read(LAPIC_VERSION) & VERSION_EAS) && (lapic_read(LAPIC_EXT_FEATURE) & EXT_XAIDC);
-    if (family == 0x15) xaidc = xaidc && northbridge_8bit_ids();
     return xaidc ? 0xFE : 0x0E;
 }
 
@@ -118,11 +94,8 @@ static uint32_t xapic_id_limit(void) {
 static uint32_t xapic_id_bits(void) { return xapic_id_max < 0xFE ? 0x0F : 0xFF; }
 
 /* The 8-bit ID of AMD's extended register space is to be turned on in xAPIC mode, which INIT
-   turns off (APM 16.3.2, Table 16-2: 410h after INIT; 42300 2.4.8.1.15). Not in Families 0Fh and
-   10h, whose 8-bit IDs are the northbridge's. */
-static bool xaidn(void) {
-    return !x2_mode && amd && family != 0x0F && family != 0x10 && xapic_id_max == 0xFE;
-}
+   turns off (APM 16.3.2, Table 16-2: 410h after INIT). */
+static bool xaidn(void) { return !x2_mode && amd && xapic_id_max == 0xFE; }
 
 /* This CPU's APIC registers, whatever they hold: the reset values after INIT, undefined ones
    after leaving x2APIC mode, else the firmware's. The task priority accepts everything. Every
@@ -201,7 +174,6 @@ static uint64_t xapic_base(uint64_t base) {
 /* mp: the bootloader's description of the CPUs, or NULL. */
 void apic_init(const struct limine_mp_response *mp) {
     amd = cpu_features.vendor == CPU_VENDOR_AMD;
-    family = cpu_features.family;
     /* MCG_CMCI_P in IA32_MCG_CAP is Intel's (SDM Vol. 3B 18.8), the bit reserved on AMD (APM
        9.3.1.1), whose APIC has no such entry. */
     cmci = !amd && (rdmsr(IA32_MCG_CAP) & MCG_CMCI_P);
@@ -257,14 +229,8 @@ void lapic_resume(void) {
 
 static bool xapic_ipi_ready(void);
 
-static void spin_us(unsigned us) {
-    uint64_t until = clock_after(us * NS_PER_US);
-    while (clock_now_ns() < until) pause();
-}
-
-/* One INIT or STARTUP, then the wait that follows it: 10 ms after an INIT, 200 us after a
-   STARTUP (SDM 9.4.4.1, Table 9-1). */
-static bool lapic_send_start(uint32_t apic_id, uint32_t cmd, unsigned wait_us) {
+/* One INIT or STARTUP, sent; the waits after them are the caller's (arch/cpu.h). */
+static bool lapic_send_start(uint32_t apic_id, uint32_t cmd) {
     if (!lapic_addressable(apic_id)) return false;
     if (x2_mode) {
         wrmsr(X2APIC_ICR, ((uint64_t)apic_id << 32) | cmd);
@@ -274,17 +240,14 @@ static bool lapic_send_start(uint32_t apic_id, uint32_t cmd, unsigned wait_us) {
         mmio_write32(lapic + 0x300 / 4, cmd);
         if (!xapic_ipi_ready()) return false;
     }
-    spin_us(wait_us);
     return true;
 }
 
-bool lapic_send_init(uint32_t apic_id) { return lapic_send_start(apic_id, 0x4500, 10000); }
+bool lapic_send_init(uint32_t apic_id) { return lapic_send_start(apic_id, 0x4500); }
 
-/* STARTUP twice, the second ignored by a CPU that already runs. */
 bool lapic_send_startup(uint32_t apic_id, uint64_t page) {
     if (page & 0xFFF || page >= 0x100000) return false;
-    uint32_t cmd = 0x4600 | (uint32_t)(page >> 12);
-    return lapic_send_start(apic_id, cmd, 200) && lapic_send_start(apic_id, cmd, 200);
+    return lapic_send_start(apic_id, 0x4600 | (uint32_t)(page >> 12));
 }
 
 /* In xAPIC mode IA32_APIC_BASE's address bits (xapic_base) and EN. */

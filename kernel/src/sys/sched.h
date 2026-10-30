@@ -86,6 +86,7 @@ struct task {
     uint64_t cpu_ns;          /* charged under its run queue's lock (sched.c) */
     uint64_t start_ns;        /* clock_now_ns when it was made */
     struct kei_task kei;      /* its run queue's lock guards it */
+    struct kei_mask allowed;  /* kei.allowed when it is bound (kthread_create_on); its words are its own */
 };
 
 extern PERCPU struct task *sched_task;     /* the task this CPU runs */
@@ -117,6 +118,9 @@ void sched_cpu_leave(unsigned cpu);    /* for a sleep: its tasks go to CPU 0, an
 struct task *task_alloc(const char *name);
 void task_discard(struct task *t); /* a task_alloc'd task that never ran: unlinked and freed */
 struct task *kthread_create(const char *name, void (*fn)(void *), void *arg);
+/* A kernel thread that runs on that CPU alone: a sequence the CPU has to run itself (the power
+   transitions, on the first CPU, which the firmware wakes from S3). */
+struct task *kthread_create_on(const char *name, void (*fn)(void *), void *arg, unsigned cpu);
 /* Any CPU, any context: a new task, or a blocked one its waker took out of its wait queue. */
 void sched_make_ready(struct task *t);
 void schedule(void);

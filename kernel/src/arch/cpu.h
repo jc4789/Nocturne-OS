@@ -174,6 +174,12 @@ void lapic_eoi(void);
 bool lapic_wake_init(int vector);
 void lapic_wake_at(uint64_t ns);
 void lapic_resume(void); /* BSP after S3: its registers again (the wake device: alarm_resume) */
+/* INIT and STARTUP, sent and not waited for (SDM 9.4.4.1, Table 9-1): the caller waits
+   LAPIC_INIT_WAIT_NS after its INITs before any STARTUP, and sends STARTUP twice, waiting
+   LAPIC_STARTUP_WAIT_NS after each round, the second ignored by a CPU already running. One wait
+   serves every CPU sent to. */
+#define LAPIC_INIT_WAIT_NS 10000000ULL
+#define LAPIC_STARTUP_WAIT_NS 200000ULL
 bool lapic_send_init(uint32_t apic_id); /* INIT: the AP waits for a STARTUP, running nothing */
 bool lapic_send_startup(uint32_t apic_id, uint64_t page); /* after an INIT: into real mode at page */
 /* What a CPU a STARTUP reached needs to learn whether the STARTUP was its own (arch/wake.h): the

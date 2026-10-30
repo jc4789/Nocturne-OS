@@ -87,3 +87,13 @@ CWriter の Write には char の重ね書きが無く、Write('.') や Write(Ma
 対象: scripts/test.py, tests/runtests.c, user/libc/web/webi.h
 確かめた: 2026-10-28 cd5be8b6
 test.py の test_files は、始まった時点の作業木の tests/*.c と webi.h・cssom.h・quickjs.h などを C:\Tests へ写し、guest の tcc がそれで試験を組む。媒体の libc はビルドした時点のヘッダーで組まれている。だから媒体を作った後に webi.h（style_t・struct cx・web_doc などの形）を変えて test.py を始めると、試験と libc の構造体の形が食い違い、webi.h を含む試験（csscachetest・lexbortest・html5lib_tree_test・paintperformancetest など）が番地 0 や stack の壊れで落ちる。2026-10-28 の 1028i の回で起きた（媒体は 11:09 に組み終え、11:08 の取り込みが webi.h を変え、試験は 11:12 に始まった）。媒体を作った後に作業を続けるなら、媒体のコミットの写し（`git archive <commit> tests user scripts third_party/quickjs/quickjs.h` を build の下へ展開）を `--source-tree` で渡す。test.py が照合する sha256 は kernel と programs だけで、ヘッダーの食い違いは見ない。
+
+## S3 の復帰は QEMU（WHPX）では試せない：休止の往復で確かめる
+対象: kernel/src/arch/wake.c, kernel/src/arch/wake.asm, kernel/src/arch/smp.c, kernel/src/dev/pm.c, kernel/src/sys/clock.c
+確かめた: 2026-10-30（段①の 1b-2）
+QEMU を -accel whpx で起こして眠り（S3）を選ぶと、入るまでは通る（pm の thread が CPU 0 で AP を止め、VM が suspend する）が、起こすと QEMU が「WHPX: Unexpected VP exit code 4」を出して F000:FFF0 で止まり、我々のコードまで来ない。復帰の道（wake の頁、smp_resume の表での AP の一斉の再起動、clock_resume、装置の再開）は休止の往復で通る：scratchpad に build/nocturne.img を下にした qcow2 を作り（qemu-img create -f qcow2 -b … -F raw）、snapshot なしで起こし、Nocturne の menu の Hibernate で休止し、同じ qcow2 で起こし直す。serial に「hibernate: restoring …」「smp: N/N CPUs online after sleep」「hibernate: back, the image is removed」が出る。媒体を組み直したら qcow2 は作り直す（下の媒体が変わると壊れる）。休止で VM を起こし直すと hypervisor の基準時刻は 0 から始まり、休止の前の時計より小さい（clock.c の hv_base はそのため 2^64 を法とする）。
+
+## QEMU が媒体を開いている間に組むと、媒体が古いまま残ることがある
+対象: scripts/mkimage.sh, scripts/build.py
+確かめた: 2026-10-30
+2026-10-30、panic で止まった QEMU（build/nocturne.img を snapshot=on で開いたまま）を残して qemu-image を組むと、出力に IMG の行は出たが、媒体の時刻は kernel.elf より古いままで、次の起動は古い kernel だった（HMP で task の欄が無いのを見て気づいた）。どこで書き損じたか（mkimage.sh の rm -f か store.exe disk か）は未確認。組む前に QEMU を quit し、組んだ後に build/kernel.elf と build/nocturne.img の時刻を並べる。

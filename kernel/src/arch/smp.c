@@ -27,7 +27,8 @@
 
 /* Each CPU's part in starting and stopping; its APIC ID is topology's. */
 struct cpu_slot {
-    unsigned ready, failed, parked;
+    uint32_t start;  /* START_: where it is in being started */
+    uint32_t parked;
     bool asleep; /* parked for a sleep: smp_resume starts it again */
     uint8_t stack[AP_STACK_SIZE] __attribute__((aligned(16))); /* its idle task's stack */
 };
@@ -43,6 +44,7 @@ static uint64_t boot_online = 1, *online_set = &boot_online;
 static unsigned online = 1;
 static unsigned detected = 1;
 static uint64_t bsp_pat;
+static struct wake_cpu *restart; /* smp_suspend to smp_resume: the rows of the CPUs to start again */
 
 extern NORETURN void smp_switch_stack(uint64_t top, void (*entry)(void *), void *argument);
 extern uint8_t __percpu_start[], __percpu_end[];
@@ -218,11 +220,34 @@ void smp_get_info(struct n_cpuinfo *info) {
     info->parallel_jobs = cpu_parallel_jobs();
 }
 
-/* ---- starting a CPU ---- */
+/* ---- starting the CPUs ----
+   CPU 0 starts every other CPU at once (at boot through the bootloader, each one spinning on its
+   entry's goto_address; after a sleep with INIT and STARTUP through the wake page) and waits for
+   all of them until one deadline. A CPU arrives (ap_main) once it has checked and set itself up
+   to its LAPIC, or fails there; one that has not answered by the deadline is excluded, and halts
+   if it comes after all: of it and CPU 0, whichever changes its state from waiting first decides.
+   Those that arrived compare their TSCs with each other and CPU 0's all at once (sys/clock.h),
+   then each one joins the online set itself and runs the scheduler. */
+enum { START_NONE, START_WAITING, START_ARRIVED, START_FAILED, START_EXCLUDED };
+static unsigned answered; /* CPUs of this round that arrived or failed */
+
+static NORETURN void halt(void) {
+    for (;;) {
+        cli();
+        hlt();
+    }
+}
+
+/* Its answer, unless CPU 0 excluded it first: then it halts. */
+static void answer(struct cpu_slot *c, uint32_t state) {
+    uint32_t waiting = START_WAITING;
+    if (!__atomic_compare_exchange_n(&c->start, &waiting, state, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) halt();
+    __atomic_fetch_add(&answered, 1, __ATOMIC_RELEASE);
+}
 
 static NORETURN void fail(struct cpu_slot *c) {
-    __atomic_store_n(&c->failed, 1, __ATOMIC_RELEASE);
-    for (;;) hlt();
+    answer(c, START_FAILED);
+    halt();
 }
 
 static NORETURN void ap_main(void *argument) {
@@ -242,10 +267,13 @@ static NORETURN void ap_main(void *argument) {
     write_cr3(kernel_pml4);
     vmm_init_cpu();
     if (!lapic_ap_init() || lapic_current_id() != topology.cpu[index].apic_id) fail(c);
-    clock_cpu_join(); /* CPU 0 waits for it in started() */
+    answer(c, START_ARRIVED);
+    clock_cpu_compare(); /* with every CPU that arrived, once CPU 0 has their count */
     alarm_init_cpu();
     prof_cpu_start();
-    __atomic_store_n(&c->ready, 1, __ATOMIC_RELEASE);
+    /* IPIs reach it from here on, taken once its idle task has interrupts on */
+    cpuset_add(online_set, index);
+    __atomic_fetch_add(&online, 1, __ATOMIC_ACQ_REL);
     sched_cpu_start(); /* this CPU's idle task from here on */
 }
 
@@ -255,24 +283,38 @@ static NORETURN void ap_entry(struct limine_mp_info *info) {
     smp_switch_stack((uint64_t)c->stack + sizeof c->stack, ap_main, (void *)(uintptr_t)index);
 }
 
-/* CPU 0: CPU index is running its idle task now, or failed or timed out. */
-static bool started(unsigned index) {
-    struct cpu_slot *c = &per_cpu(slot, index);
+/* CPU 0, after starting count CPUs (their slots waiting) with before CPUs online: waits for
+   their answers until the deadline and excludes the rest, has those that arrived compare their
+   TSCs with it, and waits for them to come online. after: when, for the lines it writes. */
+static void start_wait(unsigned count, unsigned before, const char *after) {
     uint64_t until = clock_after(START_TIMEOUT_MS * NS_PER_MS);
-    /* its TSC against this one's, while it waits in clock_cpu_join (after its LAPIC is up) */
-    if (clock_cpu_lead(index, until))
-        while (!__atomic_load_n(&c->ready, __ATOMIC_ACQUIRE) && !__atomic_load_n(&c->failed, __ATOMIC_ACQUIRE) &&
-               clock_now_ns() < until) pause();
-    if (!__atomic_load_n(&c->ready, __ATOMIC_ACQUIRE)) return false;
-    cpuset_add(online_set, index);
-    __atomic_fetch_add(&online, 1, __ATOMIC_ACQ_REL);
-    return true;
+    while (__atomic_load_n(&answered, __ATOMIC_ACQUIRE) < count && clock_now_ns() < until) pause();
+    unsigned arrived = 0;
+    for (unsigned i = 1; i < topology.cpus; i++) {
+        struct cpu_slot *c = &per_cpu(slot, i);
+        uint32_t state = START_WAITING;
+        if (__atomic_compare_exchange_n(&c->start, &state, START_EXCLUDED, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            kprintf("smp: cpu%u did not start%s; excluded\n", i, after);
+        else if (state == START_FAILED)
+            kprintf("smp: cpu%u failed its checks%s; excluded\n", i, after);
+        else if (state == START_ARRIVED)
+            arrived++;
+        /* not waiting: one that comes late still finds it so */
+        __atomic_store_n(&c->start, START_NONE, __ATOMIC_RELAXED);
+    }
+    __atomic_store_n(&answered, 0, __ATOMIC_RELAXED);
+    clock_cpus_compare(arrived + 1);
+    until = clock_after(START_TIMEOUT_MS * NS_PER_MS);
+    while (cpu_online_count() < before + arrived) {
+        if (clock_now_ns() >= until) panic("smp: CPUs that arrived did not come online%s", after);
+        pause();
+    }
 }
 
 /* ---- sleep ----
    Before S3 every other CPU gives its tasks to CPU 0 (sched_cpu_leave) and halts in its idle loop
-   with interrupts off; after it (or after a sleep that failed) each one is started again with
-   INIT-SIPI through the wake page and comes back through ap_main as at boot. */
+   with interrupts off; after it (or after a sleep that failed) all are started again at once with
+   INIT-SIPI through the wake page and come back through ap_main as at boot. */
 static volatile bool parking;
 
 void cpu_park_check(void) {
@@ -295,6 +337,7 @@ bool smp_suspend(void) {
     ASSERT(cpu_current_index() == 0);
     if (cpu_online_count() == 1) return true;
     if (!wake_available()) return false;
+    if (!restart && !(restart = kmalloc(topology.cpus * sizeof *restart))) return false;
     for (unsigned i = 1; i < topology.cpus; i++) {
         struct cpu_slot *c = &per_cpu(slot, i);
         c->asleep = cpu_online_at(i);
@@ -322,32 +365,41 @@ bool smp_suspend(void) {
 void smp_hold_in_init(void) {
     for (unsigned i = 1; i < topology.cpus; i++)
         if (per_cpu(slot, i).asleep) lapic_send_init(topology.cpu[i].apic_id);
+    clock_spin(LAPIC_INIT_WAIT_NS); /* each has taken its INIT before the copy begins */
 }
 
 void smp_resume(void) {
     ASSERT(cpu_current_index() == 0);
     __atomic_store_n(&parking, false, __ATOMIC_RELEASE);
-    unsigned asleep = 0;
+    unsigned before = cpu_online_count(), rows = 0;
+    /* INIT first, to every one: one still on its way through the page from an earlier STARTUP
+       (wake.h) is reset, not let in on the new table */
     for (unsigned i = 1; i < topology.cpus; i++) {
         struct cpu_slot *c = &per_cpu(slot, i);
         if (!c->asleep) continue;
         c->asleep = false;
         if (cpu_online_at(i)) continue; /* it never stopped */
-        __atomic_store_n(&c->ready, 0, __ATOMIC_RELEASE);
-        __atomic_store_n(&c->failed, 0, __ATOMIC_RELEASE);
-        /* The INIT before the wake page names this CPU: one still on its way through the page from
-           an earlier STARTUP (wake.h) is reset, not let in as this one. ap_main as if called: the
-           return address slot below an aligned top. */
-        asleep++;
         uint32_t apic_id = topology.cpu[i].apic_id;
-        bool sent = lapic_send_init(apic_id);
-        if (sent) {
-            wake_prepare((uint64_t)ap_main, (uint64_t)c->stack + sizeof c->stack - 8, i, apic_id);
-            sent = lapic_send_startup(apic_id, wake_page());
+        if (!lapic_send_init(apic_id)) {
+            kprintf("smp: cpu%u could not be sent INIT after sleep; excluded\n", i);
+            continue;
         }
-        if (!sent || !started(i)) kprintf("smp: cpu%u did not start again after sleep; excluded\n", i);
+        /* ap_main as if called: the return address slot below an aligned top */
+        restart[rows++] = (struct wake_cpu){.stack = (uint64_t)c->stack + sizeof c->stack - 8, .arg = i, .apic_id = apic_id};
+        __atomic_store_n(&c->start, START_WAITING, __ATOMIC_RELAXED);
     }
-    if (asleep) kprintf("smp: %u/%u CPUs online after sleep\n", cpu_online_count(), topology.cpus);
+    if (rows) {
+        clock_spin(LAPIC_INIT_WAIT_NS);
+        wake_prepare_cpus((uint64_t)ap_main, restart, rows);
+        for (unsigned round = 0; round < 2; round++) {
+            for (unsigned r = 0; r < rows; r++) lapic_send_startup(restart[r].apic_id, wake_page());
+            clock_spin(LAPIC_STARTUP_WAIT_NS);
+        }
+        start_wait(rows, before, " after sleep");
+        kprintf("smp: %u/%u CPUs online after sleep\n", cpu_online_count(), topology.cpus);
+    }
+    kfree(restart);
+    restart = NULL;
 }
 
 /* ---- the boot check of batches ---- */
@@ -450,26 +502,35 @@ void smp_init(struct limine_mp_response *response) {
         selftest();
         return;
     }
-    per_cpu(slot, 0).ready = 1;
     bsp_pat = rdmsr(MSR_PAT);
+    /* the bootloader's entry of each CPU, by its APIC ID */
+    struct limine_mp_info **entry = kzalloc(topology.cpus * sizeof *entry);
+    if (!entry) panic("smp: no memory to start the CPUs");
+    for (uint64_t j = 0; j < response->cpu_count; j++) {
+        struct limine_mp_info *info = response->cpus[j];
+        unsigned i = info ? topology_cpu_of(info->lapic_id) : topology.cpus;
+        if (i < topology.cpus) entry[i] = info;
+    }
+    /* each one starts as soon as its scheduler is ready, while the next one's is made */
+    unsigned count = 0;
     for (unsigned i = 1; i < topology.cpus; i++) {
         uint32_t apic_id = topology.cpu[i].apic_id;
-        struct limine_mp_info *info = NULL;
-        for (uint64_t j = 0; j < response->cpu_count; j++)
-            if (response->cpus[j] && response->cpus[j]->lapic_id == apic_id) info = response->cpus[j];
-        if (!info || !lapic_addressable(apic_id)) {
+        if (!entry[i] || !lapic_addressable(apic_id)) {
             kprintf("smp: cpu%u (APIC ID %u) %s; excluded\n", i, apic_id,
-                    info ? "cannot be sent an interrupt" : "is not in the bootloader's list");
+                    entry[i] ? "cannot be sent an interrupt" : "is not in the bootloader's list");
             continue;
         }
         if (!sched_cpu_prepare(i)) {
             kprintf("smp: cpu%u has no memory for its scheduler; excluded\n", i);
             continue;
         }
-        info->extra_argument = i;
-        __atomic_store_n(&info->goto_address, ap_entry, __ATOMIC_RELEASE);
-        if (!started(i)) kprintf("smp: cpu%u did not start; excluded\n", i);
+        __atomic_store_n(&per_cpu(slot, i).start, START_WAITING, __ATOMIC_RELAXED);
+        entry[i]->extra_argument = i;
+        __atomic_store_n(&entry[i]->goto_address, ap_entry, __ATOMIC_RELEASE);
+        count++;
     }
+    kfree(entry);
+    start_wait(count, 1, "");
     kprintf("smp: %u/%lu CPUs online, each running the scheduler\n", cpu_online_count(), response->cpu_count);
     selftest();
 }

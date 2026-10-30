@@ -367,6 +367,17 @@ void topology_init(void) {
     read_nodes(read_cpus());
 }
 
+unsigned topology_cpu_of(uint32_t apic_id) {
+    if (topology.cpu[0].apic_id == apic_id) return 0;
+    unsigned lo = 1, hi = topology.cpus;
+    while (lo < hi) { /* the others by APIC ID */
+        unsigned mid = lo + (hi - lo) / 2;
+        if (topology.cpu[mid].apic_id < apic_id) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < topology.cpus && topology.cpu[lo].apic_id == apic_id ? lo : topology.cpus;
+}
+
 unsigned topology_node_span(uint64_t at, uint64_t end, uint64_t *run_end) {
     unsigned lo = 0, hi = topology.ranges;
     while (lo < hi) { /* the first range that starts above at */

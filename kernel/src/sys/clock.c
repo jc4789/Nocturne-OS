@@ -7,8 +7,8 @@
      else measured against the ACPI PM timer (3.579545 MHz, ACPI 6.5 4.8.3.3), else the PIT's
      channel 2 (1.193182 MHz): at boot over five short spans (their median), and with the PM
      timer once more over CLOCK_REMEASURE_S, after which the clock runs on at the better rate
-     from the value it had. Each other CPU's TSC is compared with CPU 0's as it starts; an offset
-     a CPU could see is taken off that CPU's readings.
+     from the value it had. The CPUs' TSCs are compared with each other, all at once, when they
+     start (clock_cpus_compare); what a CPU's TSC is seen behind by is added to its readings.
 
    A TSC that is not invariant is used too, with a warning: a general machine without either is
    one this clock does not serve well yet (the HPET would). */
@@ -25,7 +25,7 @@
 #define PIT_HZ 1193182u
 #define MEASURE_SPANS 5
 #define CLOCK_REMEASURE_S 64
-#define SYNC_ROUNDS 2000
+#define COMPARE_ROUNDS 256
 
 static enum { SOURCE_NONE, SOURCE_HYPERVISOR, SOURCE_TSC } source;
 static uint64_t tsc_hz;
@@ -40,10 +40,12 @@ static struct {
 static uint32_t conv_seq;
 static struct spinlock conv_lock;
 
-/* The hypervisor's time (ns) at which the clock read 0. */
+/* The hypervisor's time (ns) at which the clock read 0, modulo 2^64: after a hibernation image is
+   restored the hypervisor's time began again, below the clock's, and this is "negative". */
 static uint64_t hv_base;
 
-/* Per CPU: what its TSC reads more than CPU 0's (clock_cpu_join). */
+/* Per CPU: what its TSC reads more than the clock's TSC (clock_cpus_compare); taken off its
+   readings. */
 PERCPU static int64_t tsc_offset;
 static bool tsc_offsets;
 
@@ -89,7 +91,7 @@ uint64_t clock_now_ns(void) {
     case SOURCE_TSC: return ns_of(tsc_now());
     case SOURCE_HYPERVISOR:
         if (!vm_clock_ns(&ns)) return 0;
-        return ns > hv_base ? ns - hv_base : 0;
+        return (int64_t)(ns - hv_base) > 0 ? ns - hv_base : 0;
     default: return 0;
     }
 }
@@ -225,63 +227,119 @@ static void remeasure_fire(struct alarm *a, struct regs *r) {
     }
     /* below 2^64: 64 s of a TSC under 70 GHz, times the PM timer's rate */
     uint64_t hz = (tsc - remeasure.start_tsc) * PM_TIMER_HZ / remeasure.pm_total;
-    uint64_t was = tsc_hz;
+    uint64_t was = tsc_hz, at = tsc_now();
     uint64_t f = spin_lock(&conv_lock);
-    conv_set(tsc, ns_of(tsc), hz);
+    conv_set(at, ns_of(at), hz);
     spin_unlock(&conv_lock, f);
     int64_t ppm = ((int64_t)hz - (int64_t)was) * 1000000 / (int64_t)hz;
     kprintf("clock: TSC %lu.%06lu MHz over %u s of the PM timer (%ld ppm from the boot's)\n",
             hz / 1000000, hz % 1000000, CLOCK_REMEASURE_S, (long)ppm);
 }
 
-/* ---- the other CPUs' TSCs ----
-   A starting CPU and CPU 0 read their TSCs in turn, each publishing its reading and checking the
-   other's last one against its own taken after it: a TSC another CPU can see ahead of its own (by
-   more than a cache line takes to cross) would let the clock go back between them. What each side
-   saw is taken off the starting CPU's readings. */
+/* ---- the CPUs' TSCs against each other ----
+   Every CPU comparing reads its TSC, COMPARE_ROUNDS times, against the highest reading any of
+   them has published, and publishes its own when it is higher. A reading below one that another
+   CPU published before this one read its own is a TSC behind that one's, by at least the
+   difference: the clock could go back between them. Each CPU takes the most it saw behind as
+   what its readings are short by, and all compare once more with that added; what any still sees
+   behind then is a disagreement the offsets did not take away. All compare at once: the line of
+   the highest reading crosses once a reading, so the time grows with the CPUs, not their pairs,
+   and every CPU is compared with every other one that published while it read. */
+static uint64_t highest __attribute__((aligned(64))); /* the highest reading of this pass */
+static uint32_t compare_pass __attribute__((aligned(64))); /* 1, 2: the pass on; 0 between */
 static struct {
-    uint64_t lead, follow;
-    uint64_t ahead, behind;
-    uint32_t state; /* 1: the follower is there, 2: go, 3: it is done, 4: its offset is set */
-} sync;
+    uint32_t cpus, through;    /* comparing; through this pass */
+    uint32_t short_cpus;       /* whose readings were short */
+    uint64_t most_short, still; /* the most added to a CPU's readings; the most seen behind after */
+} __attribute__((aligned(64))) compare;
 
-bool clock_cpu_lead(unsigned cpu, uint64_t until) {
-    if (source != SOURCE_TSC) return true;
-    while (__atomic_load_n(&sync.state, __ATOMIC_ACQUIRE) != 1)
-        if (clock_now_ns() >= until) return false;
-    sync.ahead = 0;
-    __atomic_store_n(&sync.state, 2, __ATOMIC_RELEASE);
-    while (__atomic_load_n(&sync.state, __ATOMIC_ACQUIRE) != 3) {
-        __atomic_store_n(&sync.lead, tsc_read(), __ATOMIC_RELEASE);
-        uint64_t other = __atomic_load_n(&sync.follow, __ATOMIC_ACQUIRE), own = tsc_read();
-        if (other > own && other - own > sync.ahead) sync.ahead = other - own;
-    }
-    int64_t offset = (int64_t)sync.ahead - (int64_t)sync.behind;
-    per_cpu(tsc_offset, cpu) = offset;
-    if (offset) {
-        __atomic_store_n(&tsc_offsets, true, __ATOMIC_RELEASE);
-        kprintf("clock: cpu%u's TSC reads %ld counts off cpu0's; taken off its readings\n", cpu, (long)offset);
-    }
-    __atomic_store_n(&sync.state, 4, __ATOMIC_RELEASE);
-    while (__atomic_load_n(&sync.state, __ATOMIC_ACQUIRE) != 0) pause();
-    return true;
+static void raise_to(uint64_t *word, uint64_t value) {
+    uint64_t was = __atomic_load_n(word, __ATOMIC_RELAXED);
+    while (value > was && !__atomic_compare_exchange_n(word, &was, value, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
 }
 
-void clock_cpu_join(void) {
-    if (source != SOURCE_TSC) return;
-    __atomic_store_n(&sync.follow, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&sync.lead, 0, __ATOMIC_RELAXED);
-    sync.behind = 0;
-    __atomic_store_n(&sync.state, 1, __ATOMIC_RELEASE);
-    while (__atomic_load_n(&sync.state, __ATOMIC_ACQUIRE) != 2) pause();
-    for (unsigned i = 0; i < SYNC_ROUNDS; i++) {
-        __atomic_store_n(&sync.follow, tsc_read(), __ATOMIC_RELEASE);
-        uint64_t other = __atomic_load_n(&sync.lead, __ATOMIC_ACQUIRE), own = tsc_read();
-        if (other > own && other - own > sync.behind) sync.behind = other - own;
+/* The TSC read once the loads before it are done: RDTSCP waits for every older instruction (SDM
+   Vol. 2B RDTSCP, APM Vol. 3 RDTSCP), on either vendor, where LFENCE orders RDTSC on AMD only
+   when made dispatch serializing. */
+static inline uint64_t tsc_read_after(void) {
+    uint32_t lo, hi, aux;
+    __asm__ volatile("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux) : : "memory");
+    return (uint64_t)hi << 32 | lo;
+}
+
+/* One pass on this CPU: the most its readings (its offset taken off) were behind one published
+   before them. */
+static uint64_t compare_readings(void) {
+    uint64_t most = 0;
+    int64_t offset = this_cpu(tsc_offset);
+    for (unsigned i = 0; i < COMPARE_ROUNDS; i++) {
+        uint64_t seen = __atomic_load_n(&highest, __ATOMIC_ACQUIRE);
+        uint64_t own = tsc_read_after() - (uint64_t)offset;
+        if (own < seen) {
+            if (seen - own > most) most = seen - own;
+        } else if (own > seen) {
+            __atomic_compare_exchange_n(&highest, &seen, own, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+        }
     }
-    __atomic_store_n(&sync.state, 3, __ATOMIC_RELEASE);
-    while (__atomic_load_n(&sync.state, __ATOMIC_ACQUIRE) != 4) pause();
-    __atomic_store_n(&sync.state, 0, __ATOMIC_RELEASE);
+    return most;
+}
+
+static void compare_through(void) { __atomic_fetch_add(&compare.through, 1, __ATOMIC_ACQ_REL); }
+
+/* This CPU's first pass: what its readings were short by is added to them. */
+static void compare_first(void) {
+    uint64_t short_by = compare_readings();
+    if (short_by) {
+        this_cpu(tsc_offset) = -(int64_t)short_by;
+        __atomic_fetch_add(&compare.short_cpus, 1, __ATOMIC_RELAXED);
+        raise_to(&compare.most_short, short_by);
+        __atomic_store_n(&tsc_offsets, true, __ATOMIC_RELEASE);
+    }
+    compare_through();
+}
+
+/* Its second, with that added. */
+static void compare_second(void) {
+    raise_to(&compare.still, compare_readings());
+    compare_through();
+}
+
+/* The lead's wait for every CPU comparing to be through the pass. */
+static void compare_wait(void) {
+    while (__atomic_load_n(&compare.through, __ATOMIC_ACQUIRE) != compare.cpus) pause();
+}
+
+void clock_cpu_compare(void) {
+    if (source != SOURCE_TSC) return;
+    while (__atomic_load_n(&compare_pass, __ATOMIC_ACQUIRE) != 1) pause();
+    compare_first();
+    while (__atomic_load_n(&compare_pass, __ATOMIC_ACQUIRE) != 2) pause();
+    compare_second();
+}
+
+void clock_cpus_compare(unsigned cpus) {
+    if (source != SOURCE_TSC || cpus < 2) return;
+    compare.cpus = cpus;
+    compare.through = compare.short_cpus = 0;
+    compare.most_short = compare.still = 0;
+    __atomic_store_n(&highest, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&compare_pass, 1, __ATOMIC_RELEASE);
+    compare_first();
+    compare_wait();
+    compare.through = 0;
+    __atomic_store_n(&highest, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&compare_pass, 2, __ATOMIC_RELEASE);
+    compare_second();
+    compare_wait();
+    __atomic_store_n(&compare_pass, 0, __ATOMIC_RELEASE);
+    if (compare.short_cpus)
+        kprintf("clock: %u of %u CPUs read their TSCs behind, by up to %lu counts; added to their readings\n",
+                compare.short_cpus, cpus, compare.most_short);
+    if (compare.still)
+        kprintf("clock: the TSCs still disagree by up to %lu counts: the clock can go back by that much between CPUs\n",
+                compare.still);
+    else if (!compare.short_cpus)
+        kprintf("clock: the TSCs of %u CPUs agree\n", cpus);
 }
 
 /* ---- boot and sleep ---- */
@@ -381,7 +439,7 @@ int64_t clock_resume(void) {
         uint64_t ns;
         if (vm_clock_ns(&ns)) hv_base = ns - stopped_ns;
     }
-    /* the other CPUs start again (smp_resume) and are compared with CPU 0 afresh */
+    /* the other CPUs start again (smp_resume), and all compare afresh */
     __atomic_store_n(&tsc_offsets, false, __ATOMIC_RELEASE);
     for (unsigned i = 0; i < topology.cpus; i++) per_cpu(tsc_offset, i) = 0;
     int64_t slept = rtc_read_unix() - rtc_before;
