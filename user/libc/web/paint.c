@@ -3787,12 +3787,31 @@ struct transformed_job {
     int sw, sh, dx, dy, dw, dh;
     float ox, oy;
     double sx0, sy0, inv[6];
+    uint64_t (*digest)[2]; /* each 32-row tile's digest of the result (filter_digest_mix), or NULL */
 };
+/* A digest of a surface's pixels, two lanes. Each lane takes a word through a chain of bijections of
+   its state, so any one changed word changes both lanes. */
+static inline void filter_digest_mix(uint64_t h[2], uint64_t v) {
+    h[0] = (h[0] ^ v) * UINT64_C(0x9E3779B97F4A7C15); h[0] ^= h[0] >> 31;
+    h[1] = (h[1] + v) * UINT64_C(0xC2B2AE3D27D4EB4F); h[1] ^= h[1] >> 29;
+}
+static inline void filter_digest_begin(uint64_t h[2], size_t tile) {
+    h[0] = h[1] = 0;
+    filter_digest_mix(h, tile + 1);
+}
+/* the surface's digest: its size, then its tiles' in order */
+static void filter_digest_join(const uint64_t (*tiles)[2], size_t n, int w, int h, uint64_t out[2]) {
+    out[0] = out[1] = 0;
+    filter_digest_mix(out, (uint64_t)(uint32_t)w << 32 | (uint32_t)h);
+    for (size_t t = 0; t < n; t++) { filter_digest_mix(out, tiles[t][0]); filter_digest_mix(out, tiles[t][1]); }
+}
 /* Coverage is what the white pass shows through: the black result becomes
    premultiplied ARGB, its colour clamped to the recovered alpha. */
 static void transformed_coverage(size_t tile, void *context) {
     const struct transformed_job *j = context;
     size_t first = tile * 32 * (size_t)j->sw, end = MIN((tile + 1) * 32, (size_t)j->sh) * (size_t)j->sw;
+    uint64_t digest[2];
+    filter_digest_begin(digest, tile);
     for (size_t i = first; i < end; i++) {
         uint32_t k = j->black[i], w = j->white[i];
         int alpha = 0;
@@ -3801,7 +3820,9 @@ static void transformed_coverage(size_t tile, void *context) {
         uint32_t r = (k >> 16) & 255, g = (k >> 8) & 255, bl = k & 255;
         if (r > (uint32_t)alpha) r = (uint32_t)alpha; if (g > (uint32_t)alpha) g = (uint32_t)alpha; if (bl > (uint32_t)alpha) bl = (uint32_t)alpha;
         j->black[i] = (uint32_t)alpha << 24 | r << 16 | g << 8 | bl;
+        if (j->digest) filter_digest_mix(digest, j->black[i]);
     }
+    if (j->digest) memcpy(j->digest[tile], digest, sizeof digest);
     parallel_record_work(PARALLEL_RASTER, end - first);
 }
 /* Bilinear samples of the premultiplied surface, composited over the opaque
@@ -3924,7 +3945,7 @@ static void paint_transformed_surface(struct pctx *P, box_t *b, bool layer_root,
     /* Both steps write disjoint 32-row bands: coverage per surface row, then
        the destination rows the inverse matrix samples it into. Every band of
        a step completes, so a cancellation never leaves half a resampled box. */
-    struct transformed_job j = {black, white, c, sw, sh, dx, dy, dw, dh, P->ox, P->oy, sx0, sy0, {0}};
+    struct transformed_job j = {black, white, c, sw, sh, dx, dy, dw, dh, P->ox, P->oy, sx0, sy0, {0}, NULL};
     memcpy(j.inv, inv, sizeof j.inv);
     transformed_run(P->d, transformed_coverage, sh, count, &j);
     free(white); j.white = NULL;
@@ -4043,6 +4064,82 @@ static void filtered_composite(size_t tile, void *context) {
     }
     parallel_record_work(PARALLEL_RASTER, (uint64_t)j->dw * (uint64_t)MAX(0, last - (int)tile * 32));
 }
+/* ---------------------------------------------------------------- kept filter outputs */
+/* A filter's output is a function of its input's pixels, the surface's size, the edge mode and the
+   steps' used values (web_filter_used), whatever box or paint the input comes from. The document
+   keeps recent outputs by all of those, so a paint that draws a filtered subtree or a backdrop as
+   an earlier one did takes the output instead of filtering again: a page that lays itself out
+   again and again around a still blurred element blurs it once. The input is known by its digest,
+   taken where its pixels are written. The least recently used go first past a budget of a few
+   viewports. */
+struct filter_kept {
+    int w, h;
+    bool mirror;
+    uint64_t digest[2], used_at;
+    size_t steps;
+    struct web_filter_used *used;
+    uint32_t *output;
+};
+static size_t filter_kept_budget(const web_doc *d) {
+    double viewport = fmax(d->width, 1) * fmax(d->height, 1);
+    return (size_t)fmin(3 * viewport * sizeof(uint32_t), (double)(SIZE_MAX / 2));
+}
+static void filter_kept_drop(web_doc *d, size_t i) {
+    struct filter_kept *k = &d->filter_kept[i];
+    d->filter_kept_bytes -= (size_t)k->w * (size_t)k->h * sizeof *k->output;
+    free(k->output); free(k->used);
+    d->filter_kept[i] = d->filter_kept[--d->filter_kept_n];
+}
+static void filter_kept_free(web_doc *d) {
+    while (d->filter_kept_n) filter_kept_drop(d, d->filter_kept_n - 1);
+    free(d->filter_kept); d->filter_kept = NULL; d->filter_kept_capacity = 0;
+}
+/* f over the w × h surface *px, whose pixels' digest is digest, as web_filter_apply would leave it:
+   a kept output, or *px filtered, which the document then keeps (*px becomes NULL). NULL: cancelled
+   or out of memory. */
+static const uint32_t *filter_kept_apply(web_doc *d, const style_t *st, const struct css_filter *f, uint32_t **px, int w, int h,
+                                         bool mirror, const uint64_t digest[2]) {
+    struct web_filter_used near[8], *used = near;
+    size_t steps = web_filter_used(st, f, near, 8);
+    if (steps > 8) {
+        if (!(used = malloc(steps * sizeof *used))) return NULL;
+        web_filter_used(st, f, used, steps);
+    }
+    const uint32_t *out = NULL;
+    for (size_t i = 0; i < d->filter_kept_n && !out; i++) {
+        struct filter_kept *k = &d->filter_kept[i];
+        if (k->w == w && k->h == h && k->mirror == mirror && k->digest[0] == digest[0] && k->digest[1] == digest[1] &&
+            k->steps == steps && !memcmp(k->used, used, steps * sizeof *used)) {
+            k->used_at = ++d->filter_kept_clock;
+            out = k->output;
+        }
+    }
+    if (out || !web_filter_apply(d, st, f, *px, w, h, mirror)) goto done;
+    out = *px;
+    size_t bytes = (size_t)w * (size_t)h * sizeof **px, budget = filter_kept_budget(d);
+    if (bytes > budget) goto done;
+    while (d->filter_kept_n && d->filter_kept_bytes + bytes > budget) {
+        size_t oldest = 0;
+        for (size_t i = 1; i < d->filter_kept_n; i++) if (d->filter_kept[i].used_at < d->filter_kept[oldest].used_at) oldest = i;
+        filter_kept_drop(d, oldest);
+    }
+    if (d->filter_kept_n == d->filter_kept_capacity) {
+        size_t capacity = d->filter_kept_capacity ? d->filter_kept_capacity * 2 : 8;
+        struct filter_kept *grown = realloc(d->filter_kept, capacity * sizeof *grown);
+        if (!grown) goto done;
+        d->filter_kept = grown; d->filter_kept_capacity = capacity;
+    }
+    struct web_filter_used *kept_used = malloc(steps ? steps * sizeof *kept_used : 1);
+    if (!kept_used) goto done;
+    memcpy(kept_used, used, steps * sizeof *used);
+    d->filter_kept[d->filter_kept_n++] = (struct filter_kept){w, h, mirror, {digest[0], digest[1]}, ++d->filter_kept_clock, steps,
+                                                              kept_used, *px};
+    d->filter_kept_bytes += bytes;
+    *px = NULL;
+done:
+    if (used != near) free(used);
+    return out;
+}
 /* A surface past this many pixels reads less of its reach (a blur of hundreds of pixels across the
    viewport): the pixels past it read as the transparent black beyond any edge. */
 #define FILTER_SURFACE_MAX (16.0 * 1024 * 1024)
@@ -4057,6 +4154,7 @@ static void paint_filtered(struct pctx *P, box_t *b, bool layer_root, const stru
     const int clip_saved[4] = {c->cx0, c->cy0, c->cx1, c->cy1};
     const struct gfx_mask_clip *clip_prior = c->mask_clip; struct gfx_mask_clip clip_cut;
     uint32_t *black = NULL, *white = NULL;
+    uint64_t (*digests)[2] = NULL;
     struct clip_used u;
     if (clip_used(b, &u) && !clip_push(P, b, &u, &clip_cut)) goto done;
     /* what b paints unfiltered, in document space; a private bounds generation, as a transform's */
@@ -4101,19 +4199,26 @@ static void paint_filtered(struct pctx *P, box_t *b, bool layer_root, const stru
         P->painted |= S.painted; P->contentful |= S.contentful;
     }
     if (P->failed) goto done;
-    struct transformed_job coverage = {.black = black, .white = white, .sw = sw, .sh = sh};
+    size_t tiles = ((size_t)sh + 31) / 32;
+    if (!(digests = malloc(tiles * sizeof *digests))) { P->failed = true; goto done; }
+    struct transformed_job coverage = {.black = black, .white = white, .sw = sw, .sh = sh, .digest = digests};
     transformed_run(P->d, transformed_coverage, sh, count, &coverage);
     free(white); white = NULL;
-    if (!web_native_checkpoint(P->d) || !web_filter_apply(P->d, b->st, f, black, sw, sh, false)) { P->failed = true; goto done; }
+    uint64_t digest[2];
+    filter_digest_join((const uint64_t (*)[2])digests, tiles, sw, sh, digest);
+    const uint32_t *filtered;
+    if (!web_native_checkpoint(P->d) || !(filtered = filter_kept_apply(P->d, b->st, f, &black, sw, sh, false, digest))) {
+        P->failed = true; goto done;
+    }
     /* The result is a fixed surface over what is under it, as an opacity group mixes it; a video
        inside it painted into the private surface, which the snapshot refuses. */
     web_avmedia_snapshot_blend_region(c, (int)l, (int)t, (int)dw, (int)dh);
     float opacity = b->st->opacity;
-    struct filtered_job j = {black, c, sw, (int)sx0, (int)sy0, (int)l, (int)t, (int)dw, (int)dh,
+    struct filtered_job j = {filtered, c, sw, (int)sx0, (int)sy0, (int)l, (int)t, (int)dw, (int)dh,
                              (uint32_t)(fminf(1, fmaxf(0, opacity)) * 255 + .5f)};
     transformed_run(NULL, filtered_composite, (int)dh, (size_t)dw * (size_t)dh, &j);
 done:
-    free(black); free(white);
+    free(black); free(white); free(digests);
     clip_pop(c, clip_saved, clip_prior);
 }
 /* The border boxes whose backdrop the canvas gave, for web_take_paint_damage. */
@@ -4208,20 +4313,27 @@ static void paint_backdrop(struct pctx *P, const box_t *b, const double *m, floa
     if (!(r > l && bt > t)) return;
     j.x = (int)l; j.y = (int)t; j.w = (int)(r - l); j.h = (int)(bt - t);
     size_t count = (size_t)j.w * (size_t)j.h;
+    size_t tiles = ((size_t)j.h + 31) / 32;
     uint32_t *px = malloc(count * sizeof *px);
-    if (!px) { P->failed = true; return; }
+    uint64_t (*digests)[2] = malloc(tiles * sizeof *digests);
+    if (!px || !digests) { P->failed = true; free(px); free(digests); return; }
     for (int row = 0; row < j.h; row++) {
         const uint32_t *from = c->px + (size_t)(j.y + row) * c->pitch + j.x;
         uint32_t *to = px + (size_t)row * j.w;
-        for (int i = 0; i < j.w; i++) to[i] = from[i] | 0xFF000000u;
+        if (!(row & 31)) filter_digest_begin(digests[row / 32], (size_t)row / 32);
+        uint64_t *digest = digests[row / 32];
+        for (int i = 0; i < j.w; i++) { to[i] = from[i] | 0xFF000000u; filter_digest_mix(digest, to[i]); }
     }
+    uint64_t digest[2];
+    filter_digest_join((const uint64_t (*)[2])digests, tiles, j.w, j.h, digest);
+    free(digests);
     /* the result reads its neighbours: a video under it repaints with it */
     web_avmedia_snapshot_reject_region(c, j.x, j.y, j.w, j.h);
     if (P->d->profile_enabled) { paint_profile.groups++; paint_profile.group_pixels += count; }
-    if (!web_filter_apply(P->d, b->st, b->st->backdrop_filter, px, j.w, j.h, true) || !web_native_checkpoint(P->d)) {
+    if (!(j.filtered = filter_kept_apply(P->d, b->st, b->st->backdrop_filter, &px, j.w, j.h, true, digest)) ||
+        !web_native_checkpoint(P->d)) {
         P->failed = true; free(px); return;
     }
-    j.filtered = px;
     transformed_run(NULL, backdrop_composite, j.h, count, &j);
     free(px);
 }
@@ -4914,6 +5026,7 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
 void web_paint_free(web_doc *d) {
     if(!d)return;
     free(d->paint_rollback);d->paint_rollback=NULL;d->paint_rollback_pixels=0;
+    filter_kept_free(d);
 }
 void web_hit_index_free(web_doc *d) {
     if(!d||!d->hit_index)return;

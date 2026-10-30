@@ -148,11 +148,12 @@ static inline int mirrored(int i, int n) {
     if (i < 0) i += period;
     return i >= n ? period - 1 - i : i;
 }
-/* a channel's samples along one line, past its ends transparent or mirrored */
-static inline uint32_t sample(const uint8_t *line, int n, int stride, int i, bool mirror) {
-    if (i >= 0 && i < n) return line[(size_t)i * (size_t)stride];
-    if (!mirror) return 0;
-    return line[(size_t)mirrored(i, n) * (size_t)stride];
+/* sample i of a line of n, stride bytes apart: inside it, or past its ends transparent (NULL) or
+   mirrored */
+static inline const uint8_t *line_at(const uint8_t *line, int n, size_t stride, int i, bool mirror) {
+    if (i >= 0 && i < n) return line + (size_t)i * stride;
+    if (!mirror) return NULL;
+    return line + (size_t)mirrored(i, n) * stride;
 }
 struct blur_job {
     uint8_t *a, *b;   /* the image and a scratch of its size; the result ends in a */
@@ -162,14 +163,27 @@ struct blur_job {
     int radius;
     bool mirror;
 };
-/* one line (n samples, stride apart) from src to dst: a box of [x - before, x + after], or the kernel */
-static void blur_line(const struct blur_job *j, const uint8_t *src, uint8_t *dst, int n, int stride, int pass) {
+/* One pass along a line of n samples, stride bytes apart, from src to dst: a box of
+   [i - before, i + after], or the kernel. A sample is `lanes` bytes side by side, each blurred apart:
+   a pixel's channels along a row, a band of columns' pixels down them, so a column pass reads its
+   rows in order. */
+static inline void blur_pass(const struct blur_job *j, const uint8_t *src, uint8_t *dst, int n, size_t stride, int lanes,
+                             int pass) {
     if (j->kernel) {
-        for (int x = 0; x < n; x++) {
-            float sum = 0;
-            for (int k = -j->radius; k <= j->radius; k++) sum += j->kernel[k + j->radius] * (float)sample(src, n, stride, x + k, j->mirror);
-            uint32_t v = (uint32_t)(sum + .5f);
-            dst[(size_t)x * (size_t)stride] = (uint8_t)(v > 255 ? 255 : v);
+        float sum[BAND * 4];
+        for (int i = 0; i < n; i++) {
+            for (int l = 0; l < lanes; l++) sum[l] = 0;
+            for (int k = -j->radius; k <= j->radius; k++) {
+                const uint8_t *s = line_at(src, n, stride, i + k, j->mirror);
+                if (!s) continue; /* transparent: nothing to add */
+                float weight = j->kernel[k + j->radius];
+                for (int l = 0; l < lanes; l++) sum[l] += weight * (float)s[l];
+            }
+            uint8_t *d = dst + (size_t)i * stride;
+            for (int l = 0; l < lanes; l++) {
+                uint32_t v = (uint32_t)(sum[l] + .5f);
+                d[l] = (uint8_t)(v > 255 ? 255 : v);
+            }
         }
         return;
     }
@@ -177,13 +191,23 @@ static void blur_line(const struct blur_job *j, const uint8_t *src, uint8_t *dst
     /* the mean, rounded half up: (sum + size / 2) / size by a multiply, exact while the sum fits 32 bits */
     uint32_t size = (uint32_t)(before + after + 1), half = size / 2;
     uint64_t magic = ((UINT64_C(1) << 32) + size - 1) / size;
-    uint32_t sum = 0;
-    for (int k = -before; k <= after; k++) sum += sample(src, n, stride, k, j->mirror);
-    for (int x = 0; x < n; x++) {
-        uint32_t v = (uint32_t)(((uint64_t)(sum + half) * magic) >> 32);
-        dst[(size_t)x * (size_t)stride] = (uint8_t)(v > 255 ? 255 : v);
-        sum += sample(src, n, stride, x + after + 1, j->mirror);
-        sum -= sample(src, n, stride, x - before, j->mirror);
+    uint32_t sum[BAND * 4];
+    for (int l = 0; l < lanes; l++) sum[l] = 0;
+    /* past the ends a transparent line adds nothing; a mirrored one repeats itself */
+    int first = j->mirror ? -before : MAX(-before, 0), last = j->mirror ? after : MIN(after, n - 1);
+    for (int k = first; k <= last; k++) {
+        const uint8_t *s = line_at(src, n, stride, k, j->mirror);
+        for (int l = 0; l < lanes; l++) sum[l] += s[l];
+    }
+    for (int i = 0; i < n; i++) {
+        uint8_t *d = dst + (size_t)i * stride;
+        for (int l = 0; l < lanes; l++) {
+            uint32_t v = (uint32_t)(((uint64_t)(sum[l] + half) * magic) >> 32);
+            d[l] = (uint8_t)(v > 255 ? 255 : v);
+        }
+        const uint8_t *in = line_at(src, n, stride, i + after + 1, j->mirror), *out = line_at(src, n, stride, i - before, j->mirror);
+        if (in) for (int l = 0; l < lanes; l++) sum[l] += in[l];
+        if (out) for (int l = 0; l < lanes; l++) sum[l] -= out[l];
     }
 }
 /* the horizontal passes of a band of rows, through a row of scratch each */
@@ -193,32 +217,32 @@ static void blur_rows(size_t band, void *context) {
     size_t pitch = (size_t)j->w * (size_t)j->channels;
     for (int y = (int)band * BAND; y < last; y++) {
         uint8_t *row = j->a + (size_t)y * pitch, *scratch = j->b + (size_t)y * pitch;
-        for (int c = 0; c < j->channels; c++)
-            for (int pass = 0; pass < passes; pass++) {
-                const uint8_t *from = pass & 1 ? scratch : row;
-                uint8_t *to = pass & 1 ? row : scratch;
-                blur_line(j, from + c, to + c, j->w, j->channels, pass);
-            }
+        for (int pass = 0; pass < passes; pass++) {
+            const uint8_t *from = pass & 1 ? scratch : row;
+            uint8_t *to = pass & 1 ? row : scratch;
+            /* a pixel's channels together, as many as the image has */
+            if (j->channels == 4) blur_pass(j, from, to, j->w, 4, 4, pass);
+            else blur_pass(j, from, to, j->w, 1, 1, pass);
+        }
         if (passes & 1) memcpy(row, scratch, pitch);
     }
     parallel_record_work(PARALLEL_RASTER, (uint64_t)j->w * (uint64_t)MAX(0, last - (int)band * BAND) * (uint64_t)passes);
 }
-/* the vertical passes of a band of columns */
+/* the vertical passes of a band of columns, down its rows together */
 static void blur_columns(size_t band, void *context) {
     const struct blur_job *j = context;
-    int last = (int)MIN((band + 1) * BAND, (size_t)j->w), passes = j->kernel ? 1 : j->boxes;
-    int stride = j->w * j->channels;
-    for (int x = (int)band * BAND; x < last; x++)
-        for (int c = 0; c < j->channels; c++) {
-            uint8_t *column = j->a + (size_t)x * (size_t)j->channels + c, *scratch = j->b + (size_t)x * (size_t)j->channels + c;
-            for (int pass = 0; pass < passes; pass++) {
-                const uint8_t *from = pass & 1 ? scratch : column;
-                uint8_t *to = pass & 1 ? column : scratch;
-                blur_line(j, from, to, j->h, stride, pass);
-            }
-            if (passes & 1) for (int y = 0; y < j->h; y++) column[(size_t)y * (size_t)stride] = scratch[(size_t)y * (size_t)stride];
-        }
-    parallel_record_work(PARALLEL_RASTER, (uint64_t)j->h * (uint64_t)MAX(0, last - (int)band * BAND) * (uint64_t)passes);
+    int x0 = (int)band * BAND, last = (int)MIN((band + 1) * BAND, (size_t)j->w), passes = j->kernel ? 1 : j->boxes;
+    size_t pitch = (size_t)j->w * (size_t)j->channels, offset = (size_t)x0 * (size_t)j->channels;
+    int lanes = (last - x0) * j->channels;
+    uint8_t *column = j->a + offset, *scratch = j->b + offset;
+    for (int pass = 0; pass < passes; pass++) {
+        const uint8_t *from = pass & 1 ? scratch : column;
+        uint8_t *to = pass & 1 ? column : scratch;
+        blur_pass(j, from, to, j->h, pitch, lanes, pass);
+    }
+    if (passes & 1)
+        for (int y = 0; y < j->h; y++) memcpy(column + (size_t)y * pitch, scratch + (size_t)y * pitch, (size_t)lanes);
+    parallel_record_work(PARALLEL_RASTER, (uint64_t)j->h * (uint64_t)MAX(0, last - x0) * (uint64_t)passes);
 }
 static void filter_service(void *d) { web_native_checkpoint(d); }
 static bool cancelled(web_doc *d) { return d && __atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE); }
@@ -308,6 +332,18 @@ static bool drop_shadow(web_doc *d, const style_t *st, const struct css_filter_s
 }
 
 /* ---------------------------------------------------------------- the list */
+size_t web_filter_used(const style_t *st, const struct css_filter *f, struct web_filter_used *used, size_t room) {
+    size_t n = 0;
+    for (size_t i = 0; f && i < f->count; i++) {
+        const struct css_filter_step *s = &f->steps[i];
+        if (s->kind == CSS_FILTER_URL) continue; /* web_filter_apply passes over it */
+        if (n < room)
+            used[n] = (struct web_filter_used){s->kind, s->kind == CSS_FILTER_DROP_SHADOW ? web_filter_shadow_color(st, s) : 0,
+                                               s->value, s->x, s->y};
+        n++;
+    }
+    return n;
+}
 bool web_filter_apply(web_doc *d, const style_t *st, const struct css_filter *f, uint32_t *px, int w, int h, bool mirror) {
     if (!f || w <= 0 || h <= 0) return true;
     for (size_t i = 0; i < f->count;) {

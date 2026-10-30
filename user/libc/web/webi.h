@@ -518,6 +518,12 @@ void web_filter_extent(const struct css_filter *f, float outset[4], float reach[
    NULL): checkpoints and cancellation. False: cancelled or out of memory */
 bool web_filter_apply(web_doc *d, const struct style *st, const struct css_filter *f, uint32_t *px, int w, int h,
                       bool mirror);
+/* What web_filter_apply's output depends on besides the surface's pixels, its size and the edge
+   mode: each step it applies, with the values it maps by (a drop-shadow()'s colour as st has it).
+   Up to room of them into used; the count, past room when they do not fit. Two lists with the same
+   steps map the same surface alike (paint.c keeps outputs by them). */
+struct web_filter_used { uint32_t kind, color; float value, x, y; };
+size_t web_filter_used(const struct style *st, const struct css_filter *f, struct web_filter_used *used, size_t room);
 /* color-interpolation-filters (§10): the initial linearRGB is 0 */
 enum { CIF_LINEARRGB, CIF_AUTO, CIF_SRGB };
 /* The shape values (shape.c): <basic-shape> (css-shapes-1 §3: inset(), circle(), ellipse(),
@@ -2546,6 +2552,9 @@ struct web_doc {
     struct web_hit_index *hit_index; /* paint-order spatial index, no DOM ownership */
     uint32_t *paint_rollback; /* an alpha-group paint's copy of the committed pixels, kept for the next paint */
     size_t paint_rollback_pixels;
+    struct filter_kept *filter_kept; /* paint.c: recent filter outputs, by what they are made of */
+    size_t filter_kept_n, filter_kept_capacity, filter_kept_bytes;
+    uint64_t filter_kept_clock;
     uint64_t paint_order_layout;
     uint64_t paint_order_visual; /* fractional scroll/translation invalidates shadow mask alignment */
     bool paint_shadow_crop;
