@@ -51,9 +51,9 @@ static __attribute__((noinline)) int stack_probe(void) {
 }
 static __attribute__((noinline)) long avx_sleep(const unsigned long *in, unsigned long *out) {
     long result;
-    __asm__ volatile(".byte 0xc5,0xfe,0x6f,0x06\nint $0x80\n"
+    __asm__ volatile(".byte 0xc5,0xfe,0x6f,0x06\n.byte 0x0f,0x05\n" /* vmovdqu (%rsi), %ymm0; syscall */
                      ".byte 0xc5,0xfe,0x7f,0x02\n.byte 0xc5,0xf8,0x77\n"
-                     : "=a"(result) : "0"((long)SYS_SLEEP), "D"(2L), "S"(in), "d"(out) : "memory", "cc");
+                     : "=a"(result) : "0"((long)SYS_SLEEP), "D"(2L), "S"(in), "d"(out) : "rcx", "r11", "memory", "cc");
     return result;
 }
 static int child(unsigned long start, unsigned seed) {

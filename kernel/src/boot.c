@@ -101,6 +101,7 @@ void kmain(void) {
     percpu_init();
     pmm_init(mm);
     vmm_init(mm, ka_req.response);
+    if (!entry_stacks_init()) panic("boot: no memory for the interrupt stacks");
     wake_init(); /* the real-mode page for waking from sleep and restarting the APs */
 
     if (fb_req.response && fb_req.response->framebuffer_count > 0) {

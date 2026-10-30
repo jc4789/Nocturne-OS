@@ -45,8 +45,9 @@
 
 /* System call numbers. A number keeps its meaning for as long as it exists, so
    programs built inside Nocturne keep working; the numbers of the first ABI's
-   calls (removed at stage 5 of docs/nocturne-native-abi.md) and 203-206 (the user's settings the
-   kernel kept, removed when each part came to keep its own) stay unassigned. */
+   calls (removed at stage 5 of docs/nocturne-native-abi.md), 51-52 (this CPU's index and the
+   thread's TLS base: RDPID and WRFSBASE now) and 203-206 (the user's settings the kernel kept,
+   removed when each part came to keep its own) stay unassigned. */
 enum {
     SYS_EXIT = 0,
     SYS_SLEEP = 19, SYS_UPTIME, SYS_TIME,
@@ -56,9 +57,8 @@ enum {
     SYS_GPU_RENDER_BATCH,
     SYS_GPU_BLIT,
     SYS_CLOCK_INFO, SYS_THREAD_CREATE, SYS_THREAD_JOIN, SYS_THREAD_EXIT,
-    SYS_WAIT_ADDRESS, SYS_WAKE_ADDRESS, SYS_THREAD_ID, SYS_CPU_INDEX,
-    SYS_THREAD_TLS,
-    SYS_CHANNEL_LISTEN, SYS_CHANNEL_CONNECT, SYS_CHANNEL_ACCEPT,
+    SYS_WAIT_ADDRESS, SYS_WAKE_ADDRESS, SYS_THREAD_ID,
+    SYS_CHANNEL_LISTEN = 53, SYS_CHANNEL_CONNECT, SYS_CHANNEL_ACCEPT,
     SYS_SHARED_CREATE,
     SYS_THREAD_STACK_BOUNDS = 58, SYS_THREAD_DETACH,
     SYS_WIN_CREATE = 64, SYS_WIN_MAP, SYS_WIN_PRESENT, SYS_WIN_SET_TITLE, SYS_SCREEN_INFO,

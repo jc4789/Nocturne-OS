@@ -36,7 +36,7 @@ static const struct feature {
     {L7, EBX, 8, "BMI2"}, {L7, EBX, 9, "ERMS"}, {L7, EBX, 10, "INVPCID"}, {L7, EBX, 16, "AVX512F"},
     {L7, EBX, 17, "AVX512DQ"}, {L7, EBX, 18, "RDSEED"}, {L7, EBX, 19, "ADX"}, {L7, EBX, 20, "SMAP"},
     {L7, EBX, 23, "CLFLUSHOPT"}, {L7, EBX, 24, "CLWB"}, {L7, EBX, 28, "AVX512CD"},
-    {L7, EBX, 30, "AVX512BW"}, {L7, EBX, 31, "AVX512VL"},
+    {L7, EBX, 30, "AVX512BW"}, {L7, EBX, 31, "AVX512VL"}, {L7, ECX, 22, "RDPID"},
     {LD1, EAX, 1, "XSAVEC"}, {LD1, EAX, 3, "XSAVES"},
     {LE1, ECX, 0, "LAHF"}, {LE1, ECX, 5, "LZCNT"}, {LE1, ECX, 8, "PREFETCHW"},
     {LE1, EDX, 11, "SYSCALL"}, {LE1, EDX, 20, "NX"}, {LE1, EDX, 26, "1 GiB pages"},
@@ -159,8 +159,12 @@ bool cpu_features_same(void) {
 }
 
 /* Each CPU's own controls for what every one has: no-execute pages (before a page table uses bit
-   63) and write protection in the kernel too, so read-only pages really are read-only. */
+   63), write protection in the kernel too, so read-only pages really are read-only; the app's
+   pages neither run nor are touched by the kernel (SMEP, SMAP: user_copy alone opens them,
+   arch/isr.asm); and FS and GS bases the app writes itself (FSGSBASE: a task switch keeps them,
+   sys/sched.c, and the kernel's GS base is never told from the app's by its value). */
 void cpu_setup(void) {
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_NXE);
     write_cr0(read_cr0() | CR0_WP);
+    write_cr4(read_cr4() | CR4_FSGSBASE | CR4_SMEP | CR4_SMAP);
 }

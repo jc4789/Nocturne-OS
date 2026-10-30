@@ -24,13 +24,15 @@ make GO=<Go のソース>/bin/go.exe                                  # ports/go
 Nocturne は UNIX でも POSIX でもないので、Go 側を Nocturne の API に合わせています
 （`internal/syslist` の `UnixOS` には入れていません）。
 
-- **システムコール**：`INT $0x80`、番号は AX、引数は DI・SI・DX・R10・R8、結果は AX
-  （負なら結果コード）。`syscall` パッケージは Nocturne の API そのもの
+- **システムコール**：`SYSCALL`、番号は AX、引数は DI・SI・DX・R10・R8、結果は AX
+  （負なら結果コード）。CX と R11 は命令が使う（`docs/nocturne-native-abi.md` §0）。
+  **今の差分（`nocturne.patch`）はまだ廃止した `INT $0x80` と `SYS_THREAD_TLS` を使っていて、
+  作り直すまで Go のプログラムは最初の呼出しで止まる（2026-10-30）。**`syscall` パッケージは Nocturne の API そのもの
   （`DocumentOpen`、`DocumentReadAt`、`FolderList`、`ChannelSend`、`AppLaunch` 等）を出し、
   標準ライブラリーが使う `ENOENT` 等の名前は Nocturne の結果コードの別名です。
 - **起動**：ELF（ET_EXEC、0x400000 から）。カーネルが渡す設定（`rdx`）を環境として読みます。
 - **スレッド**：`SYS_THREAD_CREATE` のスタック（カーネルが確保）を g0 に使い、TLS は
-  `SYS_THREAD_TLS`（FS）。ロックは `SYS_WAIT_ADDRESS`／`SYS_WAKE_ADDRESS`。
+  `WRFSBASE` で FS の基底を直に書く。ロックは `SYS_WAIT_ADDRESS`／`SYS_WAKE_ADDRESS`。
 - **メモリー**：需要ゼロの共有領域（`SYS_SHARED_RESERVE`＋`SYS_SHARED_MAP`）。アドレスは
   カーネルが選ぶので、ヒープのアドレス希望は使いません。
 - **時刻**：Hyper-V の参照ページ、または TSC（`SYS_CLOCK_INFO`）。壁時計は `SYS_TIME` を基点にします。

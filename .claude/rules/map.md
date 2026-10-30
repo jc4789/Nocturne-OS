@@ -39,11 +39,15 @@
 - syscall の道（対称のカーネル：どの CPU も同じ道。CPU 0 だけの持ち物は無い）：
 
 ```
-user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)：起きた CPU で
+user/libc/sys.c SYSCALL → arch/isr.asm の syscall_entry：起きた CPU で（swapgs、TSS の rsp0 の task の核の stack へ）
   → syscall_dispatch (sys/syscall.c)：その task の核の stack の上で。眠りは待ち行列（wq_sleep → schedule）、
     起こされた task は空いた CPU へ（sys/sched.c）。利用者のメモリーは copy_from_user／copy_to_user だけ
-  → sched_user_return (sys/sched.c)：ring 3 へ戻る前の切り替えの点（核は横取りされない）
-装置の割り込み（IOAPIC・MSI）は CPU 0 へ。TLB の撃ち落とし・起こし・panic の NMI はどの CPU へも、同じ isr_dispatch
+  → sched_user_return (sys/sched.c)：ring 3 へ戻る前の切り替えの点（核は横取りされない）→ SYSRET（できないときは IRET）
+例外（0〜31）→ isr_exception (arch/idt.c)：起きた stack の上で（アプリからなら task の stack、眠れる）。
+  NMI・#DB・#MC・#DF は CPU ごとの IST の stack へ。核から来たら GS を RDPID の番号で置き直す（isr_ist_kernel）
+割り込み（32〜）→ isr_interrupt (arch/idt.c)：CPU ごとの割り込みの stack の上で（眠らない、schedule しない）。
+  装置の割り込み（IOAPIC・MSI）は CPU 0 へ。TLB の撃ち落とし・起こしの IPI はどの CPU へも
+割り込みと IST の stack は各 CPU が vmalloc で自分の node に取り、下に守りの頁がある（entry_stacks_init）
 ```
 
 - VM と実機：`kernel/src/vm/vm.h` が唯一の入口（`vm_detect`、`vm_hosted()`、`vm_init`・`vm_storage_init`・`vm_net_probe`・`vm_audio_init`・`vm_session_init`。実機では即座に戻る）。裏に `hyperv.c`、`hv/`（VMBus・storvsc・netvsc）、`rdp.c`（拡張セッション）、`devices.h` の装置（ata・ac97・e1000・tulip・vbe）、`virtio_gpu.c`。`vm/` の外は `vm/vm.h` しか include しない。

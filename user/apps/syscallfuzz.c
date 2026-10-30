@@ -163,7 +163,6 @@ static bool skipped(long n) {
     case SYS_THREAD_EXIT: case SYS_WAIT_ADDRESS: case SYS_WAIT_ADDRESS64: case SYS_GUI_LAUNCH:
     case SYS_APP_LAUNCH: case SYS_APP_OPEN: case SYS_WIN_CREATE: case SYS_PCI_CLAIM:
     case SYS_AUDIO_OUTPUT: /* the volume, kept on C: for the user */
-    case SYS_THREAD_TLS: /* a valid block would redirect this thread's TLS base */
         return true;
     }
     return n >= SYS_NET_INFO && n < SYS_NET_LIMIT;
@@ -350,7 +349,6 @@ static void checks(void) {
             call5(SYS_MEMORY_RELEASE, p, 4096, 0, 0, 0);
             call5(SYS_MEMORY_PROTECT, p, 4096, N_MEMORY_READ, 0, 0);
         }
-        MUST_FAIL("thread_tls at a bad block", call5(SYS_THREAD_TLS, p, 64, 0, 0, 0));
         n_handle pr[2];
         if (n_channel_pair(pr) == 0) {
             MUST_FAIL("channel_send from a bad buffer", call5(SYS_CHANNEL_SEND, pr[0], p, 16, -1, 0));

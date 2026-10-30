@@ -50,11 +50,9 @@ extern NORETURN void smp_switch_stack(uint64_t top, void (*entry)(void *), void 
 extern uint8_t __percpu_start[], __percpu_end[];
 
 void percpu_load(unsigned cpu) {
-    /* Users can load a GS selector (all user descriptors have base zero), but
-       must not use WRGSBASE to impersonate the high-half kernel GS base. */
-    write_cr4(read_cr4() & ~CR4_FSGSBASE);
     wrmsr(MSR_GS_BASE, percpu_offsets[cpu]);
     wrmsr(MSR_KERNEL_GS_BASE, 0);
+    wrmsr(MSR_TSC_AUX, cpu); /* RDPID: this CPU's index, for the entries that cannot trust GS */
 }
 
 void percpu_init(void) {
@@ -258,7 +256,8 @@ static NORETURN void ap_main(void *argument) {
     if (!cpu_features_same()) fail(c);
     cpu_setup();
     gdt_init_cpu(index);
-    idt_load();
+    entry_load();
+    if (!entry_stacks_init()) fail(c); /* no NMI comes before it: the panic's go to online CPUs */
     if (!fpu_init_ap()) fail(c);
     pstate_init_ap();
     mtrr_sync(); /* after a sleep the firmware's memory types may be gone: the BSP's again */

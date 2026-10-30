@@ -14,12 +14,6 @@
 
 #define TRAMP_DATA 0x200 /* keep in step with arch/wake.asm */
 #define WAKE_PAGES 4     /* code and data, PML4, PDPT, PD */
-#define MSR_STAR   0xC0000081u
-#define MSR_LSTAR  0xC0000082u
-#define MSR_CSTAR  0xC0000083u
-#define MSR_SFMASK 0xC0000084u
-#define MSR_FS_BASE 0xC0000100u
-#define MSR_TSC_AUX 0xC0000103u
 #define CR4_PCIDE  (1ULL << 17)
 
 struct tramp_data {

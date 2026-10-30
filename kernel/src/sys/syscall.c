@@ -1,4 +1,4 @@
-/* System call dispatch (int 0x80). */
+/* System call dispatch (SYSCALL, arch/isr.asm). */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/smp.h"
@@ -2899,11 +2899,6 @@ void syscall_dispatch(struct regs *r) {
     case SYS_THREAD_DETACH: ret = task_thread_detach((int)a); break;
     case SYS_THREAD_EXIT: task_exit(0);
     case SYS_THREAD_ID: ret = current_task->pid; break;
-    case SYS_CPU_INDEX: ret = cpu_current_index(); break;
-    case SYS_THREAD_TLS:
-        if (!user_ok_w((void *)a, b) || b < 16 || b > PAGE_SIZE) ret = -N_ERR_BAD_ADDRESS;
-        else { current_task->tls_base = a; wrmsr(0xC0000100, a); ret = 0; }
-        break;
     case SYS_THREAD_STACK_BOUNDS: {
         /* Main stacks grow on demand within the VM's reserved interval.
            Native threads instead own their scheduler-allocated mapping. */

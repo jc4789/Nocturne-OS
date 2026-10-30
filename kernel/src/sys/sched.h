@@ -45,7 +45,7 @@ struct task {
     struct task *process;     /* shared VM / handles owner */
     uint64_t user_stack, user_stack_size;
     uint64_t wait_phys, wait_seq; /* address wait: physical key, FIFO order */
-    uint64_t tls_base;
+    uint64_t fs_base, gs_base; /* the app's, while it is not on a CPU (schedule) */
     uint64_t clock_page;      /* a process's mapping of the hypervisor clock page: set once under space's lock, read atomically */
     uint64_t ksp;
     uint8_t *kstack;

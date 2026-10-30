@@ -11,10 +11,12 @@ struct tss {
     uint16_t reserved3;
     uint16_t iomap_base;
 } PACKED;
+_Static_assert(__builtin_offsetof(struct tss, rsp0) == 4, "arch/isr.asm reads rsp0 at 4");
 
-PERCPU static struct tss cpu_tss;
+/* rsp0 is the stack of the task this CPU runs (tss_set_rsp0), where SYSCALL's entry goes too
+   (arch/isr.asm); ist the entry's own stacks (entry_stacks_init). */
+PERCPU struct tss cpu_tss;
 PERCPU static uint64_t cpu_gdt[7];
-PERCPU static uint8_t double_fault_stack[16384] __attribute__((aligned(16)));
 
 struct gdtr {
     uint16_t limit;
@@ -22,6 +24,9 @@ struct gdtr {
 } PACKED;
 
 void tss_set_rsp0(uint64_t rsp0) { this_cpu(cpu_tss).rsp0 = rsp0; }
+void tss_set_ist(const uint64_t top[IST_STACKS]) {
+    for (unsigned i = 0; i < IST_STACKS; i++) this_cpu(cpu_tss).ist[i] = top[i];
+}
 
 void gdt_init(void) { gdt_init_cpu(0); }
 
@@ -38,7 +43,6 @@ void gdt_init_cpu(unsigned index) {
     gdt[4] = 0x00AFFA000000FFFFULL; /* 0x20 user code 64 (DPL3) */
     memset(tss, 0, sizeof *tss);
     tss->iomap_base = sizeof *tss;
-    tss->ist[0] = (uint64_t)per_cpu(double_fault_stack, index) + sizeof double_fault_stack;
     uint64_t base = (uint64_t)tss;
     uint64_t limit = sizeof *tss - 1;
     gdt[5] = (limit & 0xFFFF) | ((base & 0xFFFFFF) << 16) | (0x89ULL << 40) |

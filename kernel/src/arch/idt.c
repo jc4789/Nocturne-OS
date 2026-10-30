@@ -3,7 +3,6 @@
 #include "arch/smp.h"
 #include "arch/spin.h"
 #include "sys/sched.h"
-#include "sys/syscall.h"
 #include "mm/vmm.h"
 #include "dev/entropy.h"
 #include "arch/irq.h"
@@ -20,10 +19,34 @@ struct idt_entry {
 
 static struct idt_entry idt[256];
 extern uint64_t isr_stub_table[256];
+extern char syscall_entry[];
+
+/* Each CPU's stacks for its entries: the interrupt stack, for the handlers of vector 32 and up, so
+   that neither a task's stack nor a nested interrupt pays for them (arch/isr.asm switches to it),
+   and the IST stacks. Each has a guard page below it (vmalloc's), so that an overflow faults
+   instead of writing over what lies below; the CPU allocates its own, from its node. The user's
+   rsp in SYSCALL's entry, until the frame holds it. */
+#define ENTRY_STACK_PAGES 4
+PERCPU uint64_t irq_stack_top;
+PERCPU static uint64_t ist_top[IST_STACKS];
+PERCPU uint32_t irq_nesting;
+PERCPU uint64_t syscall_user_rsp;
+static bool ist_gates; /* the gates below take their IST stacks: the first CPU's are there */
+
+/* SYSCALL's flag mask: the entry runs with interrupts off (until syscall_dispatch turns them on),
+   no single-stepping, the string direction up, SMAP's check on (AC), no task nesting, I/O
+   privilege 0. */
+#define RFLAGS_TF   (1u << 8)
+#define RFLAGS_IF   (1u << 9)
+#define RFLAGS_DF   (1u << 10)
+#define RFLAGS_IOPL (3u << 12)
+#define RFLAGS_NT   (1u << 14)
+#define RFLAGS_AC   (1u << 18)
+#define SYSCALL_FLAGS_MASK (RFLAGS_TF | RFLAGS_IF | RFLAGS_DF | RFLAGS_IOPL | RFLAGS_NT | RFLAGS_AC)
 #define IRQ_SHARED 4 /* level-triggered PCI lines and the ACPI SCI can share an ISA IRQ */
 static irq_handler_t irq_handlers[16][IRQ_SHARED];
 static irq_handler_t vec_handlers[256]; /* LAPIC-delivered vectors (0x30 and up) */
-/* A driver on any CPU registers and allocates under it; isr_dispatch reads the slots without it,
+/* A driver on any CPU registers and allocates under it; isr_interrupt reads the slots without it,
    each slot stored whole. */
 static struct spinlock vectors_lock;
 
@@ -37,19 +60,49 @@ static void idt_set(int vec, uint64_t handler, uint8_t type, uint8_t ist) {
     idt[vec].zero = 0;
 }
 
+/* Until the first CPU has its IST stacks every gate runs on the stack in use (early boot's). */
 void idt_init(void) {
     for (int i = 0; i < 256; i++) idt_set(i, isr_stub_table[i], 0x8E, 0);
-    idt_set(8, isr_stub_table[8], 0x8E, 1);      /* double fault on IST1 */
-    idt_set(0x80, isr_stub_table[0x80], 0xEE, 0); /* syscall gate, DPL 3 */
-    idt_load();
+    entry_load();
 }
 
-void idt_load(void) {
+bool entry_stacks_init(void) {
+    if (!this_cpu(irq_stack_top)) { /* a CPU started again after a sleep keeps its own */
+        uint64_t top[1 + IST_STACKS];
+        for (unsigned i = 0; i < 1 + IST_STACKS; i++) {
+            uint8_t *stack = vmalloc(ENTRY_STACK_PAGES);
+            if (!stack) {
+                while (i--) vfree((void *)(top[i] - ENTRY_STACK_PAGES * PAGE_SIZE), ENTRY_STACK_PAGES);
+                return false;
+            }
+            top[i] = (uint64_t)stack + ENTRY_STACK_PAGES * PAGE_SIZE;
+        }
+        for (unsigned i = 0; i < IST_STACKS; i++) this_cpu(ist_top)[i] = top[1 + i];
+        this_cpu(irq_stack_top) = top[0];
+    }
+    tss_set_ist(*this_cpu_ptr(ist_top)); /* gdt_init_cpu cleared the TSS */
+    if (!ist_gates) { /* the first CPU's, before any other starts */
+        idt_set(1, isr_stub_table[1], 0x8E, IST_DEBUG);
+        idt_set(2, isr_stub_table[2], 0x8E, IST_NMI);
+        idt_set(8, isr_stub_table[8], 0x8E, IST_DOUBLE_FAULT);
+        idt_set(18, isr_stub_table[18], 0x8E, IST_MACHINE_CHECK);
+        ist_gates = true;
+    }
+    return true;
+}
+
+void entry_load(void) {
     struct {
         uint16_t limit;
         uint64_t base;
     } PACKED idtr = {sizeof idt - 1, (uint64_t)idt};
     __asm__ volatile("lidt %0" : : "m"(idtr));
+    /* SYSCALL into the kernel's code (0x08, its stack 0x10); SYSRET to the app's (0x13 + 16 =
+       0x23, its stack 0x13 + 8 = 0x1B) */
+    wrmsr(MSR_STAR, (uint64_t)(USER_DS - 8) << 48 | (uint64_t)KERNEL_CS << 32);
+    wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
+    wrmsr(MSR_SFMASK, SYSCALL_FLAGS_MASK);
+    wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_SCE);
 }
 
 void irq_register(int irq, irq_handler_t h) {
@@ -79,7 +132,7 @@ void irq_unregister(int irq, irq_handler_t h) {
 #define VEC_POOL_LAST  0xEF
 static bool vec_owned[256];
 
-static bool vec_in_pool(unsigned v) { return v >= VEC_POOL_FIRST && v <= VEC_POOL_LAST && v != 0x80; }
+static bool vec_in_pool(unsigned v) { return v >= VEC_POOL_FIRST && v <= VEC_POOL_LAST; }
 
 int irq_vector_alloc(unsigned count, unsigned align) {
     if (!align) align = 1;
@@ -201,11 +254,27 @@ static bool user_copy_fixup(struct regs *r, uint64_t cr2) {
     return true;
 }
 
+static inline uint64_t read_dr6(void) { uint64_t v; __asm__ volatile("mov %%dr6, %0" : "=r"(v)); return v; }
+static inline void write_dr6(uint64_t v) { __asm__ volatile("mov %0, %%dr6" : : "r"(v)); }
+#define DR6_BS (1u << 14) /* the #DB is a single step */
+#define DR6_INIT 0xFFFF0FF0u
+
 static void exception(struct regs *r, uint64_t cr2) {
     const char *name = exc_names[r->vector];
     if (r->vector == 14) {
         if ((r->cs & 3) == 3 ? vmm_handle_user_fault(cr2, r->error) : user_copy_fixup(r, cr2)) return;
+        if (!(r->cs & 3) && cr2 < USER_TOP) name = "Page fault on the app's memory outside user_copy (SMAP)";
     }
+    if (r->vector == 1 && !(r->cs & 3)) {
+        /* The kernel sets no breakpoint: a step in it is the app's TF carried across SYSCALL's
+           first instruction. The app keeps its TF (the return is an IRET then, arch/isr.asm). */
+        uint64_t dr6 = read_dr6();
+        write_dr6(DR6_INIT);
+        if (dr6 & DR6_BS) return;
+    }
+    /* NMI, #DF and #MC are the machine's, not the code it was running (#DF's saved CS is not
+       even defined): never the app's end */
+    if (r->vector == 2 || r->vector == 8 || r->vector == 18) panic_regs(name, r);
     if ((r->cs & 3) == 3) {
         struct task *t = current_task;
         kprintf("[%s] pid %d (%s) cpu%u: %s at rip=%p", r->vector == 14 ? "segfault" : "crash",
@@ -233,22 +302,29 @@ static void exception(struct regs *r, uint64_t cr2) {
 
 extern char wrmsr_checked_write[], wrmsr_checked_refused[];
 
-/* Every CPU's traps, faults, system calls and interrupts, on the stack of the task it runs. */
-void isr_dispatch(struct regs *r) {
+/* Every CPU's exceptions (vector below 32), on the stack they came in on: the task's, which an
+   exception from the app may sleep on (a page fault), or, from the kernel, the IST stack of an
+   NMI, #DB, #DF or #MC (arch/isr.asm moves one from the app to the task's). */
+void isr_exception(struct regs *r) {
     uint64_t v = r->vector;
     if (v == 13 && !(r->cs & 3) && r->rip == (uint64_t)wrmsr_checked_write) { /* cpu.h: wrmsr_checked */
         r->rip = (uint64_t)wrmsr_checked_refused;
         return;
     }
+    if (v == 2) smp_panic_nmi(); /* another CPU's panic stops this one; any other NMI is reported */
+    exception(r, v == 14 ? read_cr2() : 0);
+}
+
+/* Every CPU's interrupts (vector 32 and up: the devices', and the other CPUs'), on this CPU's
+   interrupt stack: their handlers never sleep. */
+void isr_interrupt(struct regs *r) {
+    uint64_t v = r->vector;
     if (v == VEC_TLB_SHOOTDOWN) {
         vmm_tlb_ipi();
         lapic_eoi();
         return;
     }
-    if (v == 2) smp_panic_nmi(); /* another CPU's panic stops this one; any other NMI is reported */
-    if (v < 32) {
-        exception(r, v == 14 ? read_cr2() : 0);
-    } else if (v < 48) { /* the 8259's lines, which reach CPU 0 only */
+    if (v < 48) { /* the 8259's lines, which reach CPU 0 only */
         int irq = (int)v - 32;
         if (irq == 7 && !(pic_isr(0x20) & 0x80)) return;
         if (irq == 15 && !(pic_isr(0xA0) & 0x80)) {
@@ -262,13 +338,10 @@ void isr_dispatch(struct regs *r) {
             if (!h) break;
             h(r);
         }
-    } else if (v == 0x80) {
-        syscall_dispatch(r);
     } else if (v < 0xFF) {
         entropy_add(rdtsc() ^ v << 56);
         lapic_eoi();
         irq_handler_t h = __atomic_load_n(&vec_handlers[v], __ATOMIC_ACQUIRE);
         if (h) h(r);
     }
-    if ((r->cs & 3) == 3) sched_user_return(r);
 }

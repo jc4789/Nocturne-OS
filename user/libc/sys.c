@@ -33,11 +33,13 @@ int *__errno_location(void) {
 }
 #define errno (*__errno_location())
 
+/* SYSCALL (docs/nocturne-native-abi.md): the number in rax, the arguments in rdi, rsi, rdx, r10
+   and r8, the result in rax; the instruction itself takes rcx and r11. */
 long __syscall(long n, long a, long b, long c, long d, long e) {
     long r;
     register long r10 __asm__("r10") = d;
     register long r8 __asm__("r8") = e;
-    __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8) : "memory");
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8) : "rcx", "r11", "memory");
     return r;
 }
 
@@ -161,7 +163,7 @@ static struct libc_thread *libc_thread_init(void *area) {
     memset(t, 0, sizeof *t);
     t->self = t;
     t->tid = (int)SC0(SYS_THREAD_ID);
-    SC2(SYS_THREAD_TLS, t, sizeof *t);
+    __asm__ volatile("wrfsbase %0" : : "r"(t) : "memory"); /* the thread's own FS base */
     return t;
 }
 static _Noreturn void libc_thread_entry(void (*fn)(void *), void *arg) {
@@ -192,7 +194,12 @@ int thread_id(void) {
     struct libc_thread *t = libc_thread_current();
     return t ? t->tid : (int)SC0(SYS_THREAD_ID);
 }
-unsigned cpu_index(void) { return (unsigned)SC0(SYS_CPU_INDEX); }
+/* RDPID: the CPU's index, which the kernel keeps in its TSC_AUX. */
+unsigned cpu_index(void) {
+    uint64_t index;
+    __asm__ volatile("rdpid %0" : "=r"(index));
+    return (unsigned)index;
+}
 n_result thread_stack_bounds(uintptr_t *low, uintptr_t *high) { return SC2(SYS_THREAD_STACK_BOUNDS, low, high); }
 /* The calling thread's C11 tss value array with room for `need` keys, or
    NULL when it cannot grow (need == 0 only queries the current array). */

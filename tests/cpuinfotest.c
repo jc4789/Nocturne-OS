@@ -8,12 +8,12 @@
 static __attribute__((noinline)) long avx_sleep_round(const unsigned long *in, unsigned long *out) {
     long result;
     __asm__ volatile(".byte 0xc5,0xfe,0x6f,0x06\n" /* vmovdqu (%rsi), %ymm0 */
-                     "int $0x80\n"
+                     ".byte 0x0f,0x05\n"         /* syscall */
                      ".byte 0xc5,0xfe,0x7f,0x02\n" /* vmovdqu %ymm0, (%rdx) */
                      ".byte 0xc5,0xf8,0x77\n"     /* vzeroupper */
                      : "=a"(result)
                      : "0"((long)SYS_SLEEP), "D"(2L), "S"(in), "d"(out)
-                     : "memory", "cc");
+                     : "rcx", "r11", "memory", "cc");
     return result;
 }
 

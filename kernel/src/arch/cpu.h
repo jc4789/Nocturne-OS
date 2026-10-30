@@ -1,6 +1,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include "arch/percpu.h"
 
 static inline void outb(uint16_t port, uint8_t v) { __asm__ volatile("outb %0, %1" : : "a"(v), "Nd"(port)); }
 static inline void outw(uint16_t port, uint16_t v) { __asm__ volatile("outw %0, %1" : : "a"(v), "Nd"(port)); }
@@ -76,7 +77,7 @@ static inline void wrmsr(uint32_t msr, uint64_t v) {
     __asm__ volatile("wrmsr" : : "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
 }
 /* A write the manuals allow but a model's own document says faults (arch/apic.c): false where
-   it raised #GP, which isr_dispatch resumes past (arch/isr.asm). */
+   it raised #GP, which isr_exception resumes past (arch/isr.asm). */
 bool wrmsr_checked(uint32_t msr, uint64_t v);
 enum cpu_vendor { CPU_VENDOR_OTHER, CPU_VENDOR_INTEL, CPU_VENDOR_AMD };
 /* What the CPUs have (arch/cpu.c): set by cpu_features_init on the first CPU, before anything
@@ -99,11 +100,21 @@ bool cpu_features_same(void); /* another CPU as it starts: true when it has what
 void cpu_setup(void);         /* each CPU, before its page tables: what every one turns on */
 
 #define MSR_EFER  0xC0000080u
+#define EFER_SCE  (1u << 0)
 #define EFER_LME  (1u << 8)
 #define EFER_LMA  (1u << 10)
 #define EFER_NXE  (1u << 11)
+#define MSR_STAR    0xC0000081u
+#define MSR_LSTAR   0xC0000082u
+#define MSR_CSTAR   0xC0000083u
+#define MSR_SFMASK  0xC0000084u
+#define MSR_FS_BASE 0xC0000100u
+#define MSR_TSC_AUX 0xC0000103u
 #define MSR_PAT   0x277u
 #define CR0_WP    (1ULL << 16)
+#define CR4_FSGSBASE (1ULL << 16)
+#define CR4_SMEP     (1ULL << 20)
+#define CR4_SMAP     (1ULL << 21)
 static inline uint64_t read_cr0(void) { uint64_t v; __asm__ volatile("mov %%cr0, %0" : "=r"(v)); return v; }
 static inline void write_cr0(uint64_t v) { __asm__ volatile("mov %0, %%cr0" : : "r"(v) : "memory"); }
 static inline uint64_t read_cr2(void) { uint64_t v; __asm__ volatile("mov %%cr2, %0" : "=r"(v)); return v; }
@@ -130,13 +141,16 @@ static inline void xsetbv0(uint64_t value) {
     __asm__ volatile("xsetbv" : : "a"((uint32_t)value), "d"((uint32_t)(value >> 32)), "c"(0u) : "memory");
 }
 
-/* interrupt frame pushed by isr.asm */
+/* The frame every way into the kernel leaves on the stack (arch/isr.asm): an interrupt's or an
+   exception's vector, or REGS_SYSCALL for a system call (SYSCALL: rcx and r11 then hold rip and
+   rflags, which the instruction put there). */
 struct regs {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
     uint64_t vector, error;
     uint64_t rip, cs, rflags, rsp, ss;
 };
+#define REGS_SYSCALL 256
 
 #define KERNEL_CS 0x08
 #define KERNEL_DS 0x10
@@ -146,13 +160,37 @@ struct regs {
 
 #define MSR_GS_BASE        0xC0000101u
 #define MSR_KERNEL_GS_BASE 0xC0000102u
-#define CR4_FSGSBASE       (1ULL << 16)
+
+/* The app's FS and GS bases, which it writes itself (WRFSBASE, WRGSBASE): a task switch reads the
+   one leaving's and writes the one coming's. While the kernel runs, the app's GS base is the one
+   swapgs put aside; interrupts off around these, since an interrupt from the kernel takes the GS
+   base in use for the kernel's. */
+static inline uint64_t fs_base_read(void) { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
+static inline void fs_base_write(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v) : "memory"); }
+static inline uint64_t user_gs_base_read(void) {
+    uint64_t v;
+    __asm__ volatile("swapgs; rdgsbase %0; swapgs" : "=r"(v) : : "memory");
+    return v;
+}
+static inline void user_gs_base_write(uint64_t v) { __asm__ volatile("swapgs; wrgsbase %0; swapgs" : : "r"(v) : "memory"); }
+
+/* Each CPU's stacks for the exceptions that may come where the stack in use cannot be trusted
+   (the TSS's IST, arch/gdt.c): NMI, #DB and #MC anywhere, #DF after a stack went bad. */
+enum { IST_DOUBLE_FAULT = 1, IST_NMI, IST_DEBUG, IST_MACHINE_CHECK, IST_STACKS = IST_MACHINE_CHECK };
 
 void gdt_init(void);
 void gdt_init_cpu(unsigned index);
 void tss_set_rsp0(uint64_t rsp0);
+void tss_set_ist(const uint64_t top[IST_STACKS]);
+/* The ways into the kernel (arch/idt.c, arch/isr.asm): idt_init builds the IDT on the first CPU
+   and loads its entries there, entry_load loads them on each other CPU as it starts (the IDT and
+   SYSCALL's MSRs). entry_stacks_init gives this CPU its interrupt and IST stacks, once the page
+   tables can map them (vmm_init), before its interrupts are on: false without the memory. */
 void idt_init(void);
-void idt_load(void);
+void entry_load(void);
+bool entry_stacks_init(void);
+/* This CPU's handlers running on its interrupt stack (arch/isr.asm): 0 outside them. */
+extern PERCPU uint32_t irq_nesting;
 typedef void (*irq_handler_t)(struct regs *r);
 void irq_register(int irq, irq_handler_t h); /* a line may have a few handlers; each checks its device */
 void irq_unregister(int irq, irq_handler_t h);

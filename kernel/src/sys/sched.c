@@ -387,6 +387,7 @@ void sched_post_switch(void) {
 }
 
 void schedule(void) {
+    ASSERT(!this_cpu(irq_nesting)); /* never from an interrupt's handler, on its CPU's stack */
     uint64_t f = irq_save();
     struct cpu_queue *q = this_queue();
     struct task *prev = current_task;
@@ -419,7 +420,11 @@ void schedule(void) {
     sched_set_current(next);
     if (next->kstack) tss_set_rsp0((uint64_t)next->kstack + KSTACK_PAGES * PAGE_SIZE);
     vmm_switch(next->pml4);
-    wrmsr(0xC0000100, next->tls_base);
+    /* the app's own FS and GS bases (arch/cpu.h), as each left them */
+    prev->fs_base = fs_base_read();
+    prev->gs_base = user_gs_base_read();
+    fs_base_write(next->fs_base);
+    user_gs_base_write(next->gs_base);
     fpu_save(prev->fpu);
     fpu_restore(next->fpu);
     context_switch(&prev->ksp, next->ksp);

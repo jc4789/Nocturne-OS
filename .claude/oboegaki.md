@@ -90,10 +90,15 @@ test.py の test_files は、始まった時点の作業木の tests/*.c と web
 
 ## S3 の復帰は QEMU（WHPX）では試せない：休止の往復で確かめる
 対象: kernel/src/arch/wake.c, kernel/src/arch/wake.asm, kernel/src/arch/smp.c, kernel/src/dev/pm.c, kernel/src/sys/clock.c
-確かめた: 2026-10-30（段①の 1b-2）
+確かめた: 2026-10-30 b00ec703
 QEMU を -accel whpx で起こして眠り（S3）を選ぶと、入るまでは通る（pm の thread が CPU 0 で AP を止め、VM が suspend する）が、起こすと QEMU が「WHPX: Unexpected VP exit code 4」を出して F000:FFF0 で止まり、我々のコードまで来ない。復帰の道（wake の頁、smp_resume の表での AP の一斉の再起動、clock_resume、装置の再開）は休止の往復で通る：scratchpad に build/nocturne.img を下にした qcow2 を作り（qemu-img create -f qcow2 -b … -F raw）、snapshot なしで起こし、Nocturne の menu の Hibernate で休止し、同じ qcow2 で起こし直す。serial に「hibernate: restoring …」「smp: N/N CPUs online after sleep」「hibernate: back, the image is removed」が出る。媒体を組み直したら qcow2 は作り直す（下の媒体が変わると壊れる）。休止で VM を起こし直すと hypervisor の基準時刻は 0 から始まり、休止の前の時計より小さい（clock.c の hv_base はそのため 2^64 を法とする）。
 
 ## QEMU が媒体を開いている間に組むと、媒体が古いまま残ることがある
 対象: scripts/mkimage.sh, scripts/build.py
 確かめた: 2026-10-30
 2026-10-30、panic で止まった QEMU（build/nocturne.img を snapshot=on で開いたまま）を残して qemu-image を組むと、出力に IMG の行は出たが、媒体の時刻は kernel.elf より古いままで、次の起動は古い kernel だった（HMP で task の欄が無いのを見て気づいた）。どこで書き損じたか（mkimage.sh の rm -f か store.exe disk か）は未確認。組む前に QEMU を quit し、組んだ後に build/kernel.elf と build/nocturne.img の時刻を並べる。
+
+## 核の入口：isr.asm と C の間の約束
+対象: kernel/src/arch/isr.asm, kernel/src/arch/idt.c, kernel/src/arch/cpu.h, kernel/src/arch/gdt.c, kernel/src/sys/sched.c, user/libc/sys.c, ports/go/
+確かめた: 2026-10-30（段①の 2、未コミット）
+isr.asm の REGS_* の位置と FRAME_BYTES（私的な語一つ＋struct regs）、REGS_SYSCALL（256）、TSS_RSP0（4）は cpu.h の struct regs と gdt.c の struct tss に合わせて手で書いてある（gdt.c だけ _Static_assert がある）。枠の下の私的な語は「出口で swapgs する」の 1/0 で、核から IST に来た回だけは置き直す前の GS の基を持つ。GS の決め方は CS の下位 2 bit だけ（核から来て GS が利用者のものなのは isr_iret の iretq が違反した時だけ）：swapgs と sysret／iretq の間で割り込みを開かない（sched_user_return が cli して戻る）。核の中の FS は使わない：schedule が前の task の FS と利用者の GS（swapgs を挟んで RDGSBASE）を保ち、次のものを書く。SMAP なので、利用者の頁に触れてよいのは user_copy（stac と clac の間）だけで、ほかの所の違反は panic。割り込みと IST の stack は各 CPU が entry_stacks_init で vmalloc から取る（下に守りの頁）。AP は online_set に入る前に取るので、panic の NMI（online の CPU へだけ送る）が IST の無い間に来ることはない。Go の移植（ports/go/nocturne.patch、上流の写しは D:\Programes\cloned repos\go）はまだ INT $0x80 と SYS_THREAD_TLS（52）を使い、Go のアプリ（calc・gotest・tsc）は最初の呼出しで止まる。休止の往復（作業場の qcow2 の上書き層）で、戻った後もアプリの SYSCALL が通ることを確かめた（IST の stack と RDPID が戻った後に使われる場面は作っていない）。

@@ -3,8 +3,8 @@
    template: every CPU has a copy of the whole section, in memory on its own node (percpu_init),
    and its GS base is that copy's distance from the template, so that the GS-relative form of a
    variable's own address (clang's __seg_gs, RIP-relative) is this CPU's copy, one instruction.
-   The distance is a negative number (the copies are in the direct map, below the kernel's image),
-   which is how isr.asm tells the kernel's GS base from a user's; user TLS stays in FS.
+   Its TSC_AUX is its index (RDPID), from which the entries that may come in under the app's GS
+   base (NMI, #DB, #MC, #DF; arch/isr.asm) find the distance in percpu_offsets.
 
    Before percpu_init the first CPU's GS base is 0: the template is its copy. Only its GDT and TSS
    are written there meanwhile, and every CPU writes its own afresh (gdt_init_cpu). */
@@ -26,5 +26,6 @@ extern uintptr_t *percpu_offsets;      /* [topology.cpus] */
 /* The first CPU, after topology_init and bootmem_by_node and before anything keeps state per CPU:
    a copy for every CPU on its node, and the first CPU onto its own. */
 void percpu_init(void);
-/* This CPU's GS base, its copy's (cpu: its index), once its GDT's segments are loaded. */
+/* This CPU's GS base, its copy's (cpu: its index), once its GDT's segments are loaded; and its
+   TSC_AUX, the index. */
 void percpu_load(unsigned cpu);
