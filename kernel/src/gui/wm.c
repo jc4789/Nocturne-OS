@@ -57,6 +57,9 @@ struct window {
     uint64_t uaddr;
     uint64_t second_uaddr;
     int front_index, pending_index;
+    /* The app's mailbox (ev, frame_event and frame_ready, and dead's change): any CPU, under
+       ev_lock, interrupts off (an input handler queues). Taken before w->wq's and the object's. */
+    struct spinlock ev_lock;
     bool frame_ready;
     struct gui_event frame_event; /* durable mailbox, not a droppable input event */
     bool frame_wanted; /* WIN_FRAME_EVENTS: presented or asked (SYS_WIN_FRAME) since the last frame that showed it */
@@ -307,29 +310,30 @@ static bool in_resize_grip(struct window *w, int x, int y) {
 
 /* ---- event queues ---- */
 static void push_event(struct window *w, const struct gui_event *e) {
-    uint64_t flags = irq_save();
-    if (!w || w->dead) { irq_restore(flags); return; }
+    if (!w) return;
+    uint64_t flags = spin_lock(&w->ev_lock);
+    if (w->dead) { spin_unlock(&w->ev_lock, flags); return; }
     if (e->type == EV_FRAME) {
         w->frame_event = *e;
         w->frame_ready = true;
         wq_wake_all(&w->wq);
         object_notify(&w->object);
-        irq_restore(flags); return;
+        spin_unlock(&w->ev_lock, flags); return;
     }
     if (e->type == EV_MOUSE_MOVE && w->ev_count) {
         int last = (w->ev_head + EVQ - 1) % EVQ;
         if (w->ev[last].type == EV_MOUSE_MOVE) {
             w->ev[last] = *e;
-            irq_restore(flags); return;
+            spin_unlock(&w->ev_lock, flags); return;
         }
     }
-    if (w->ev_count == EVQ) { irq_restore(flags); return; }
+    if (w->ev_count == EVQ) { spin_unlock(&w->ev_lock, flags); return; }
     w->ev[w->ev_head] = *e;
     w->ev_head = (w->ev_head + 1) % EVQ;
     w->ev_count++;
     wq_wake_all(&w->wq);
     object_notify(&w->object);
-    irq_restore(flags);
+    spin_unlock(&w->ev_lock, flags);
 }
 
 static void send_simple(struct window *w, int type) {
@@ -532,7 +536,10 @@ static void win_destroy_locked(struct window *w) {
         for (; i < nwin - 1; i++) zorder[i] = zorder[i + 1];
         nwin--;
     }
+    /* under ev_lock: a receiver that saw it alive is in w->wq by now, for the wake below */
+    uint64_t ev = spin_lock(&w->ev_lock);
     w->dead = true;
+    spin_unlock(&w->ev_lock, ev);
     if (drag_win == w) {
         drag_win = NULL;
         drag_mode = DRAG_NONE;
@@ -556,15 +563,17 @@ static void win_destroy(struct window *w) {
 
 /* Takes every queued event that fits in out[max], waiting up to timeout_ms
    (negative: until one arrives). The count, 0 when the time ran out, or
-   N_ERR_CLOSED once a closed window has handed out its last event. */
+   N_ERR_CLOSED once a closed window has handed out its last event. Any CPU: out is checked
+   before ev_lock (a check may move the call to the BSP, or wait for the disk), and the events go
+   there under it; no page checked goes before the copy (syscall.c, user_access). */
 static int64_t win_receive(struct window *w, struct gui_event *out, size_t max, int64_t timeout_ms) {
     if (max == 0 || max > SIZE_MAX / sizeof *out) return -N_ERR_INVALID;
     uint64_t deadline = timeout_ms > 0 ? uptime_ms() + (uint64_t)timeout_ms : 0;
+    size_t room = MIN(max, (size_t)EVQ + 1); /* the queue, and the frame's mailbox */
     for (;;) {
-        uint64_t fl = irq_save();
+        if (!user_ok_w(out, room * sizeof *out)) return -N_ERR_BAD_ADDRESS;
+        uint64_t fl = spin_lock(&w->ev_lock);
         if (w->ev_count || w->frame_ready) {
-            size_t available = (size_t)w->ev_count + (w->frame_ready ? 1u : 0u);
-            if (!user_ok_w(out, MIN(max, available) * sizeof *out)) { irq_restore(fl); return -N_ERR_BAD_ADDRESS; }
             size_t got = 0;
             while (got < max && w->ev_count) {
                 out[got++] = w->ev[w->ev_tail];
@@ -575,7 +584,7 @@ static int64_t win_receive(struct window *w, struct gui_event *out, size_t max, 
                 out[got++] = w->frame_event;
                 w->frame_ready = false;
             }
-            irq_restore(fl);
+            spin_unlock(&w->ev_lock, fl);
             return (int64_t)got;
         }
         int64_t result = 1;
@@ -583,13 +592,15 @@ static int64_t win_receive(struct window *w, struct gui_event *out, size_t max, 
         if (w->dead) result = -N_ERR_CLOSED;
         else if (current_task->killed) result = -N_ERR_STOPPED;
         else if (timeout_ms == 0 || (timeout_ms > 0 && now >= deadline)) result = 0;
-        else if (timeout_ms > 0) wq_wait_timeout(&w->wq, deadline - now);
-        else wq_wait(&w->wq);
+        if (result <= 0) { spin_unlock(&w->ev_lock, fl); return result; }
+        if (timeout_ms > 0) wq_wait_locked_timeout(&w->wq, &w->ev_lock, deadline - now);
+        else wq_wait_locked(&w->wq, &w->ev_lock);
         irq_restore(fl);
-        if (result <= 0) return result;
     }
 }
 
+/* Without ev_lock (an events wait asks under the object's lock, which ev_lock comes before): every
+   change notifies the object after it, and the wait asks again. */
 static uint32_t win_ready(struct handle *h) {
     struct window *w = h->object->priv;
     return w->ev_count > 0 || w->frame_ready || w->dead ? N_EVENT_RECEIVABLE : 0;
@@ -621,17 +632,6 @@ bool wm_state_ap(struct handle *h, int64_t *result) {
     return true;
 }
 
-bool wm_receive_ap(struct handle *h, size_t max, int64_t timeout_ms, int64_t *result) {
-    if (!handle_is(h, &win_ops) || max == 0 || max > SIZE_MAX / sizeof(struct gui_event)) return false;
-    struct window *w = h->object->priv;
-    if (__atomic_load_n(&w->ev_count, __ATOMIC_ACQUIRE) || __atomic_load_n(&w->frame_ready, __ATOMIC_ACQUIRE))
-        return false;
-    if (__atomic_load_n(&w->dead, __ATOMIC_ACQUIRE)) *result = -N_ERR_CLOSED;
-    else if (timeout_ms != 0) return false;
-    else *result = 0;
-    return true;
-}
-
 static bool alloc_buffer(struct window *w, int cw, int ch) {
     w->deep = (w->flags & WIN_DEEP_COLOR) != 0; /* kept on 8 bpc: the depth can change */
     size_t pixels = (size_t)cw * ch;
@@ -650,7 +650,9 @@ static bool alloc_buffer(struct window *w, int cw, int ch) {
     w->cw = cw;
     w->ch = ch;
     w->front_index = w->pending_index = -1;
+    uint64_t ev = spin_lock(&w->ev_lock);
     w->frame_ready = false;
+    spin_unlock(&w->ev_lock, ev);
     return true;
 }
 
@@ -3169,7 +3171,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
         return a || b ? -N_ERR_INVALID : !screen_watchable ? -N_ERR_UNSUPPORTED : watched_open(&screen_watched);
     struct handle *handle = NULL;
     if (num == SYS_WIN_RECEIVE) {
-        /* Waits without the WM lock; the handle's reference keeps the window's memory. */
+        /* Any CPU, without the WM lock (ev_lock); the handle's reference keeps the window's memory. */
         handle = handle_get((int)a);
         int64_t result = !handle ? -N_ERR_NO_HANDLE : !handle_is(handle, &win_ops) ? -N_ERR_WRONG_KIND
                        : win_receive(handle->object->priv, (struct gui_event *)b, (size_t)c, (int64_t)d);

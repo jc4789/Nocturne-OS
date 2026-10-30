@@ -36,7 +36,7 @@ typedef void (*cpu_job_fn)(size_t index, void *context);
    netのBSP gateとsocket io_ownerで寿命/単一所有を保ち、CPU別doorbellで制御を返す。
    もう一つはsyscall_apの読むだけの問い合わせ（窓の状態、走っているアプリの結果）。AP読み取り区間
    （ap_read_begin）の中で取っ手と対象を読み、BSPは解放の前にap_read_synchronizeで待つ。
-   部品ごとのlockを持つ呼出し（syscall_anywhere：channel・事象の待ち・番地の待ちと起こし・眠り・音の送りと位置）は
+   部品ごとのlockを持つ呼出し（syscall_anywhere：channel・事象の待ち・番地の待ちと起こし・眠り・音の送りと位置・窓の事象の受け取り）は
    APでそのtaskのkernel継続として走り、そこで眠る（sched.c）。
    三つ目は予約ページの初回の接触（vmm_ap_demand_fault）。BSPがAPごとに取り置いたframeで
    予約の葉を比較交換で埋める。取り置きが減ればcpu_bsp_wakeでBSPに足させる。

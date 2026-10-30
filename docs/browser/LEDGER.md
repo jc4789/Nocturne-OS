@@ -320,6 +320,8 @@ native の URL の解決の速さ（K80。2026-10-28、ホストの Windows で 
 
 音の段（`audio_lock`、AUDIO_SUBMIT・AUDIO_STATUS をどの CPU でも）の後、同じ手順で AC'97 を付けて（`-audiodev wav` で録る。上の二つの回は音の装置なし）再生中の窓を四つ：AUDIO_SUBMIT の回り道 1064〜1173 → 0、retires dispatch 3004〜3476 → 1818〜1972、cpu0 の kernel 335〜362 → 272〜401 ms（動かない。回り道は BSP で 0〜1 µs の軽いものだった）、borrows 688〜783 → 744〜849。録った WAV に再生中の音があり、console の `pause()` の 3 秒は WAV が伸びず、`play()` で鳴り直した。装置の有無が違うので cpu0 の値は同じ条件の比べではない。
 
+窓の事象の受け取り（WIN_RECEIVE を窓ごとの `ev_lock` でどの CPU でも）の後、音の段と同じ条件（AC'97 付き）で：WIN_RECEIVE の回り道 474〜544 → 0、落ち着いた再生の窓の retires dispatch 1818〜1972 → 1149〜1324、cpu0 の kernel 272〜401 → 217〜389 ms（重なる。動いたとは言えない）、WIN_PRESENT が BSP へ着くまで 48〜95 → 18〜62 µs。console への打鍵、`pause()` で WAV が 3 秒伸びない、`play()` で鳴り直すことを見た。YouTube の再生は 30〜40 秒で K7 の誤りで止まる（前の回も同じ）。
+
 ## 7. 決定
 
 | # | 決定 | 理由 |

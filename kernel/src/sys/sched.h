@@ -161,6 +161,7 @@ bool wq_wait_unless(struct wait_queue *wq, const uint64_t *word, uint64_t seen, 
 /* Interrupts off, held taken: sleep on wq, held given back once enrolled (a waker that takes held
    to change the condition, then wakes wq, finds the task there). Returns without held. */
 void wq_wait_locked(struct wait_queue *wq, struct spinlock *held);
+bool wq_wait_locked_timeout(struct wait_queue *wq, struct spinlock *held, uint64_t ms); /* false on timeout */
 void wq_wake_all(struct wait_queue *wq);
 /* A driver waiting for its device: asleep on wq until *kick is set (its interrupt handler sets it,
    then wakes wq) or for up to ms; *kick is cleared. wq and kick may be NULL: just the time. The

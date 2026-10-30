@@ -26,11 +26,9 @@ void wm_clipboard_info(size_t *len, uint32_t *seq);
 char *wm_clipboard_snapshot(size_t *len);
 void wm_process_exit(int pid);
 int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
-/* SYS_WIN_RECEIVE on an AP inside an AP read section, for any handle h with no event queued:
-   true with *result (N_ERR_CLOSED, or 0 for a timeout of 0), false when the BSP must serve it. */
+/* SYS_WIN_STATE on an AP inside an AP read section, for any handle h: true with *result for a
+   window of the calling app, false when the BSP must serve it. (SYS_WIN_RECEIVE runs on any CPU.) */
 struct handle;
-bool wm_receive_ap(struct handle *h, size_t max, int64_t timeout_ms, int64_t *result);
-/* SYS_WIN_STATE likewise: true with *result for a window of the calling app. */
 bool wm_state_ap(struct handle *h, int64_t *result);
 void wm_notify(const char *title, const char *text); /* desktop toast */
 /* Power changes (dev/pm.c): how many app windows are open (the top one's

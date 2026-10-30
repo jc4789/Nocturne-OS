@@ -1040,6 +1040,10 @@ bool wq_wait_timeout(struct wait_queue *wq, uint64_t ms) {
 
 void wq_wait_locked(struct wait_queue *wq, struct spinlock *held) { wq_sleep(wq, NULL, 0, held, 0); }
 
+bool wq_wait_locked_timeout(struct wait_queue *wq, struct spinlock *held, uint64_t ms) {
+    return wq_sleep(wq, NULL, 0, held, ms ? ms : 1);
+}
+
 bool wq_wait_unless(struct wait_queue *wq, const uint64_t *word, uint64_t seen, uint64_t ms) {
     uint64_t f = irq_save();
     bool ok = wq_sleep(wq, word, seen, NULL, ms);

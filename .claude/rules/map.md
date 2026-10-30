@@ -41,7 +41,7 @@
 user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
   BSP: → syscall_dispatch (sys/syscall.c) → sched_user_return
   AP:  → sched_ap_interrupt (sys/sched.c) → syscall_ap（時刻・TCP の写し・窓の状態などをその場で答える）
-       → syscall_anywhere の呼出し（channel の送受、事象の待ち、番地の待ちと起こし、眠り、音の送りと位置）は ap_syscall で
+       → syscall_anywhere の呼出し（channel の送受、事象の待ち、番地の待ちと起こし、眠り、音の送りと位置、窓の事象の受け取り）は ap_syscall で
          その task の kernel 継続として syscall_dispatch：AP で眠り（wq_sleep → ap_schedule）、別の AP で続き、
          BSP の部品に触れる所で sched_enter_bsp して BSP で終わる
        → ほかは文脈を BSP へ → isr_dispatch_remote (idt.c) → syscall_dispatch
