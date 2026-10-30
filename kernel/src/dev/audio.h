@@ -19,11 +19,9 @@ struct handle;
 struct n_audio_status;
 int audio_stream_open(struct handle **out); /* N_ERR_BUSY when every stream is taken */
 bool audio_stream_is(struct handle *h);
-int64_t audio_stream_submit(struct handle *h, const void *user_frames, size_t count, bool wait); /* frames taken */
+/* Any CPU: frames taken (one writer at a time), and the stream's clock. */
+int64_t audio_stream_submit(struct handle *h, const void *user_frames, size_t count, bool wait);
 int audio_stream_status(struct handle *h, struct n_audio_status *user_out);
-/* The same on an AP inside an AP read section, for any handle h: true with *result when served
-   there, false when the BSP must (not a stream, the mixer kept changing it, out not mapped). */
-bool audio_stream_status_ap(struct handle *h, struct n_audio_status *user_out, int64_t *result);
 /* Drop this stream's PCM at once and retire its old clock generation. What a card had mixed but
  * its device had not begun to fetch is taken back and mixed again without it (audio_set_card's
  * unissue), so after a flush the stream is heard only for what the device already holds (AC'97:

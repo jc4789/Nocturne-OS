@@ -16,14 +16,15 @@
 #define RING_BYTES  (2 * QUEUE_BYTES)    /* the queue, and the PCM a card may still give back (retained) */
 #define TICK_MS     5
 
-/* A ring of bytes: the writer (one task) moves head, the mixer (the timer interrupt, or a
-   remote session's thread with interrupts off) moves tail. Both run free; head - tail is the
-   number of bytes queued. Whole frames never wrap, since the ring holds a whole number of them.
-   The `retained` frames just before tail were mixed into a card's buffers, which may give them
-   back (take_back): the writer leaves them alone until the card has played them. */
+/* A ring of bytes: the writer moves head, the mixer (the timer interrupt, or a remote session's
+   thread) moves tail, both under audio_lock; head - tail is the number of bytes queued. The writer
+   copies its PCM past head without the lock, and the mixer reads only up to head. Whole frames
+   never wrap, since the ring holds a whole number of them. The `retained` frames just before tail
+   were mixed into a card's buffers, which may give them back (take_back): the writer leaves them
+   alone until the card has played them. */
 struct stream {
     uint8_t *ring;
-    volatile uint32_t head, tail;
+    uint32_t head, tail;
     uint64_t committed_bytes;
     uint32_t generation;
     /* At most the actual 32 AC97 descriptors can own outstanding runs. No
@@ -33,33 +34,22 @@ struct stream {
     uint32_t device_pending;
     uint32_t retained; /* the last of device_pending, still in the ring before tail */
     bool clock_error;
-    /* Odd while a writer changes what status_of reports, so that an AP reads it between two
-       equal even values (audio_stream_status_ap). Every writer runs on the BSP with interrupts
-       off, so writers never nest. */
-    uint32_t status_seq;
+    struct task *writer; /* the one submit copying past head; another waits for it */
     struct object object; /* an app's stream: what its handle reaches */
 };
 
-static void status_begin(struct stream *s) {
-    __atomic_store_n(&s->status_seq, s->status_seq + 1, __ATOMIC_RELAXED);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-}
-static void status_end(struct stream *s) {
-    __atomic_store_n(&s->status_seq, s->status_seq + 1, __ATOMIC_RELEASE);
-}
+/* The streams' queues and clocks (every field of a stream above but ring and object), the list of
+   streams, the card's ordinals and the trace: any CPU, interrupts off (the mixer runs in the
+   timer interrupt). Taken before a wait queue's and an object's lock. The card's device stays the
+   BSP's: its fill() runs from the BSP's tick and after a flush, without this lock (it takes it in
+   audio_card_mix and audio_card_played); its unissue() runs under it, in take_back. */
+static struct spinlock audio_lock;
 static uint64_t card_submitted,card_consumed;
 
 /* the last slot is the system's own stream, which no app owns */
 static struct stream *streams[MAX_STREAMS + 1];
 
-/* The same around a change to every stream at once (the mixer, the card's progress). */
-static void streams_status_begin(void) {
-    for (int i = 0; i <= MAX_STREAMS; i++) if (streams[i]) status_begin(streams[i]);
-}
-static void streams_status_end(void) {
-    for (int i = 0; i <= MAX_STREAMS; i++) if (streams[i]) status_end(streams[i]);
-}
-static struct wait_queue audio_wq; /* writers waiting for room, closers waiting to drain */
+static struct wait_queue audio_wq; /* writers waiting for room or for the writer, closers waiting to drain */
 static int volume = 80;            /* percent */
 static bool muted;
 static int32_t gain = 80 * 80 * 65536 / 10000; /* volume squared, 16.16: loudness feels linear */
@@ -92,15 +82,15 @@ void audio_trace_begin(void) {
     audio_trace_active = false;
     memset(&trace, 0, sizeof trace);
     for (int i = 0; i < MAX_STREAMS; i++) trace.stream[i].min_queue = QUEUE_BYTES / AUDIO_FRAME;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&audio_lock);
     trace.start = rdtsc(); trace.last_tick = trace.start;
     audio_trace_active = true;
-    irq_restore(f);
+    spin_unlock(&audio_lock, f);
 }
 void audio_trace_end(void) {
-    uint64_t f = irq_save(), end = rdtsc();
+    uint64_t f = spin_lock(&audio_lock), end = rdtsc();
     audio_trace_active = false;
-    irq_restore(f);
+    spin_unlock(&audio_lock, f);
     kprintf("audiotrace: elapsed_us=%lu service_calls=%lu max_service_gap_us=%lu card=%s remote=%d muted=%d\n",
             trace_us(end-trace.start), trace.ticks, trace_us(trace.max_tick_gap),
             card_name ? card_name : "none", remote_users, muted);
@@ -125,9 +115,10 @@ void audio_trace_ac97(uint16_t before, uint16_t after, unsigned filled, bool res
     trace.card_calls++; trace.filled += filled; trace.restarts += restarted;
     trace.sr_before[before & 31]++; trace.sr_after[after & 31]++;
 }
+/* audio_lock held. */
 static void trace_commit(struct stream *s, uint32_t bytes) {
     if (!audio_trace_active) return;
-    uint64_t f = irq_save(), now = rdtsc();
+    uint64_t now = rdtsc();
     for (int i = 0; i < MAX_STREAMS; i++) if (streams[i] == s) {
         uint64_t last = trace.stream[i].last ? trace.stream[i].last : trace.start;
         trace.stream[i].max_gap = MAX(trace.stream[i].max_gap, now-last);
@@ -143,10 +134,9 @@ static void trace_commit(struct stream *s, uint32_t bytes) {
         trace.stream[i].by_second[second] += bytes / AUDIO_FRAME;
         break;
     }
-    irq_restore(f);
 }
 
-/* The apps' streams moved on: waits for room look again. Interrupts off. */
+/* The apps' streams moved on: waits for room look again. audio_lock held. */
 static void streams_changed(void) {
     wq_wake_all(&audio_wq);
     for (int i = 0; i < MAX_STREAMS; i++) if (streams[i]) object_notify(&streams[i]->object);
@@ -154,11 +144,10 @@ static void streams_changed(void) {
 
 static bool mix(int16_t *out, int frames,bool card) {
     if(frames<=0||(unsigned)frames>RING_BYTES/AUDIO_FRAME)return false;
-    uint64_t f = irq_save();
-    if(card&&(uint64_t)frames>UINT64_MAX-card_submitted){irq_restore(f);return false;}
+    uint64_t f = spin_lock(&audio_lock);
+    if(card&&(uint64_t)frames>UINT64_MAX-card_submitted){spin_unlock(&audio_lock,f);return false;}
     bool any = false,error = false;
     if (out) memset(out, 0, (size_t)frames * AUDIO_FRAME);
-    streams_status_begin();
     for (int i = 0; i <= MAX_STREAMS; i++) {
         struct stream *s = streams[i];
         if (!s) continue;
@@ -203,19 +192,17 @@ static bool mix(int16_t *out, int frames,bool card) {
         }
         s->tail += (uint32_t)n * AUDIO_FRAME;
     }
-    streams_status_end();
     if(card&&any)card_submitted+=(uint32_t)frames;
     if (any||error) streams_changed();
-    irq_restore(f);
+    spin_unlock(&audio_lock, f);
     return any;
 }
 bool audio_mix(int16_t *out,int frames){return mix(out,frames,false);}
 bool audio_card_mix(int16_t *out,int frames){return mix(out,frames,true);}
 void audio_card_played(uint64_t ordinal){
-    uint64_t f=irq_save();ordinal=MIN(ordinal,card_submitted);
+    uint64_t f=spin_lock(&audio_lock);ordinal=MIN(ordinal,card_submitted);
     if(ordinal>card_consumed){
         card_consumed=ordinal;
-        streams_status_begin();
         for(unsigned i=0;i<=MAX_STREAMS;i++){
             struct stream *s=streams[i];if(!s)continue;
             if(s->issued_head>=ARRAY_SIZE(s->issued)||s->issued_count>ARRAY_SIZE(s->issued)){s->clock_error=true;continue;}
@@ -230,10 +217,9 @@ void audio_card_played(uint64_t ordinal){
             }
             if(s->retained>s->device_pending)s->retained=s->device_pending; /* played: the writer may reuse it */
         }
-        streams_status_end();
         streams_changed();
     }
-    irq_restore(f);
+    spin_unlock(&audio_lock,f);
 }
 
 bool audio_pending(void) {
@@ -287,16 +273,16 @@ const char *audio_card(void) { return card_name; }
 
 /* From a remote session's thread (vm/rdp.c, a kernel thread: the BSP). */
 void audio_remote_attach(void) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&audio_lock);
     bool first = remote_users++ == 0;
-    irq_restore(f);
+    spin_unlock(&audio_lock, f);
     if (first) watched_changed(&output_watched); /* "Remote desktop" plays the sound now */
 }
 void audio_remote_detach(void) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&audio_lock);
     bool last = remote_users == 1;
     if (remote_users > 0) remote_users--;
-    irq_restore(f);
+    spin_unlock(&audio_lock, f);
     if (last) watched_changed(&output_watched);
 }
 bool audio_remote(void) { return remote_users > 0; }
@@ -358,21 +344,25 @@ static struct stream system_stream = {.ring = system_ring};
 /* a triangle wave (no floating point in the kernel) that fades out, with a 2 ms start */
 void audio_system_tone(int hz, int ms) {
     struct stream *s = &system_stream;
+    uint64_t f = spin_lock(&audio_lock);
     streams[MAX_STREAMS] = s;
-    if (hz <= 0 || s->head - s->tail >= AUDIO_FRAME) return;
+    uint32_t head = s->head, queued = head - s->tail, retained = s->retained;
+    spin_unlock(&audio_lock, f);
+    if (hz <= 0 || queued >= AUDIO_FRAME) return;
     /* the queue's worth at most, and never over what a card may still give back */
-    int room = (int)((RING_BYTES - s->retained * AUDIO_FRAME) / AUDIO_FRAME);
+    int room = (int)((RING_BYTES - retained * AUDIO_FRAME) / AUDIO_FRAME);
     int frames = MIN(ms * (AUDIO_RATE / 1000), MIN((int)(QUEUE_BYTES / AUDIO_FRAME), room)), period = AUDIO_RATE / hz;
     for (int k = 0; k < frames; k++) {
         int ph = k % period, tri = ph < period / 2 ? 4 * ph - period : 3 * period - 4 * ph; /* -period..period */
         int amp = 7000 * (frames - k) / frames;
         if (k < 96) amp = amp * k / 96;
         int16_t v = (int16_t)(tri * amp / period);
-        int16_t *at = (int16_t *)(s->ring + (s->head + (uint32_t)k * AUDIO_FRAME) % RING_BYTES);
+        int16_t *at = (int16_t *)(s->ring + (head + (uint32_t)k * AUDIO_FRAME) % RING_BYTES);
         at[0] = at[1] = v;
     }
-    __sync_synchronize();
+    f = spin_lock(&audio_lock);
     s->head += (uint32_t)frames * AUDIO_FRAME;
+    spin_unlock(&audio_lock, f);
 }
 
 /* ---- the apps' streams (docs/nocturne-native-abi.md §9) ---- */
@@ -413,7 +403,7 @@ static uint32_t frames_from(const struct stream *s, uint64_t at) {
    again by the card's fill() (audio.h, audio_set_card). Only when s has PCM there, and when every
    stream still keeps its PCM from there in its ring (retained: not after a remote client mixed
    from it). The PCM keeps its order: each stream's frames from `at` on are the last it gave the
-   card, just before its tail. Interrupts off, inside streams_status_begin. */
+   card, just before its tail. audio_lock held, on the BSP (the card's unissue). */
 static bool take_back(struct stream *s) {
     if (!card_unissue || remote_users) return false;
     uint64_t at = card_unissue(false);
@@ -443,18 +433,23 @@ static bool take_back(struct stream *s) {
 }
 
 /* s's PCM goes at once, with what of it the card can still give back; the card mixes the other
-   streams' again. The clock starts a new generation. Interrupts off. */
-static void stream_drop(struct stream *s) {
-    streams_status_begin();
+   streams' again. The clock starts a new generation. BSP (the card's unissue and fill), interrupts
+   off. */
+static void stream_drop(struct stream *s, bool flush) {
+    spin_take(&audio_lock);
     bool taken = s->device_pending && take_back(s);
     s->tail = s->head;
     s->committed_bytes = 0; s->issued_head = s->issued_count = 0; s->device_pending = 0; s->retained = 0;
     s->generation++; s->clock_error = false;
-    streams_status_end();
-    if (taken && card_fill) card_fill();
+    if (flush && audio_trace_active) for (int i = 0; i < MAX_STREAMS; i++)
+        if (streams[i] == s) trace.stream[i].flushes++;
     streams_changed();
+    spin_give(&audio_lock);
+    if (taken && card_fill) card_fill();
 }
 
+/* Without audio_lock (an events wait asks under the object's lock, which audio_lock comes before):
+   every change notifies the object after it, and the wait asks again. */
 static uint32_t stream_ready(struct handle *h) {
     struct stream *s = stream_of(h);
     return s->clock_error||!stream_full(s) ? N_EVENT_SENDABLE : 0;
@@ -471,12 +466,14 @@ static void stream_close(struct handle *h) {
         irq_restore(fl);
     }
     uint64_t fl = irq_save();
-    if (current_task->killed) stream_drop(s);
+    if (current_task->killed) stream_drop(s, false);
+    spin_take(&audio_lock);
     for (int i = 0; i < MAX_STREAMS; i++)
         if (streams[i] == s) {
             if (audio_trace_active) trace.stream[i].closes++;
             streams[i] = NULL;
         }
+    spin_give(&audio_lock);
     irq_restore(fl);
 }
 
@@ -499,52 +496,62 @@ int audio_stream_open(struct handle **out) {
     object_init(&s->object, &stream_ops, s);
     struct handle *h = handle_open(&s->object, true);
     if (!h) { stream_release(&s->object); return -N_ERR_NO_MEMORY; }
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock(&audio_lock);
     int slot = -1;
     for (int i = 0; i < MAX_STREAMS && slot < 0; i++) if (!streams[i]) slot = i;
     if (slot >= 0) streams[slot] = s;
-    irq_restore(fl);
+    spin_unlock(&audio_lock, fl);
     if (slot < 0) { handle_close(h); return -N_ERR_BUSY; } /* nothing queued: no wait */
     *out = h;
     return 0;
 }
 
-/* Queue frames from the app's memory; returns the frames taken. Without wait a full stream gives
-   N_ERR_NOT_READY. */
+/* Queue frames from the app's memory, on any CPU; returns the frames taken. Without wait a full
+   stream (or one another thread is writing) gives N_ERR_NOT_READY. */
 int64_t audio_stream_submit(struct handle *h, const void *frames, size_t count, bool wait) {
     struct stream *s = stream_of(h);
     if (count > SIZE_MAX / AUDIO_FRAME) return -N_ERR_TOO_LARGE;
     const uint8_t *p = frames;
     size_t n = count * AUDIO_FRAME, done = 0;
+    int64_t error = 0;
+    uint64_t fl = spin_lock(&audio_lock);
+    for (;;) {
+        if (!s->writer) { s->writer = current_task; break; }
+        if (!wait) { spin_unlock(&audio_lock, fl); return -N_ERR_NOT_READY; }
+        if (current_task->killed) { spin_unlock(&audio_lock, fl); return -N_ERR_STOPPED; }
+        wq_wait_locked(&audio_wq, &audio_lock);
+        spin_take(&audio_lock);
+    }
     while (done < n) {
-        if (stream_broken(s)) return done ? (int64_t)(done / AUDIO_FRAME) : -N_ERR_IO;
+        if (stream_broken(s)) { error = -N_ERR_IO; break; }
         uint32_t room = stream_room(s);
         if (!room) {
             if (done) break; /* report what went in; the caller sends the rest */
-            if (!wait) return -N_ERR_NOT_READY;
-            if (current_task->killed) return -N_ERR_STOPPED;
-            uint64_t fl = irq_save();
-            if (stream_full(s)) wq_wait(&audio_wq);
-            irq_restore(fl);
+            if (!wait) { error = -N_ERR_NOT_READY; break; }
+            if (current_task->killed) { error = -N_ERR_STOPPED; break; }
+            wq_wait_locked(&audio_wq, &audio_lock);
+            spin_take(&audio_lock);
             continue;
         }
-        /* copy outside the lock: only this task writes past head */
-        uint32_t c = (uint32_t)MIN((size_t)room, n - done);
-        if (!user_ok(p + done, c)) return done ? (int64_t)(done / AUDIO_FRAME) : -N_ERR_BAD_ADDRESS;
-        uint32_t at = s->head % RING_BYTES, first = MIN(c, RING_BYTES - at);
-        memcpy(s->ring + at, p + done, first);
-        memcpy(s->ring, p + done + first, c - first);
-        __sync_synchronize();
-        uint64_t fl = irq_save();
-        status_begin(s);
+        uint32_t c = (uint32_t)MIN((size_t)room, n - done), at = s->head % RING_BYTES, first = MIN(c, RING_BYTES - at);
+        spin_unlock(&audio_lock, fl);
+        /* past head, which only the writer moves: the mixer does not read there until it does */
+        bool ok = user_ok(p + done, c);
+        if (ok) {
+            memcpy(s->ring + at, p + done, first);
+            memcpy(s->ring, p + done + first, c - first);
+        }
+        fl = spin_lock(&audio_lock);
+        if (!ok) { error = -N_ERR_BAD_ADDRESS; break; }
         s->head += c;
-        s->committed_bytes+=c;
-        status_end(s);
-        irq_restore(fl);
+        s->committed_bytes += c;
         trace_commit(s, c);
         done += c;
     }
-    return (int64_t)(done / AUDIO_FRAME);
+    s->writer = NULL;
+    wq_wake_all(&audio_wq); /* a writer waiting for this one */
+    spin_unlock(&audio_lock, fl);
+    return done ? (int64_t)(done / AUDIO_FRAME) : error;
 }
 
 /* How far ahead of the sink the stream is, and how much of it was played. */
@@ -558,45 +565,22 @@ static struct n_audio_status status_of(const struct stream *s) {
         .generation=s->generation,.flags=remote_users?N_AUDIO_CLOCK_ESTIMATED|N_AUDIO_CLOCK_REMOTE:card_fill?N_AUDIO_CLOCK_DEVICE:N_AUDIO_CLOCK_ESTIMATED};
 }
 
+/* Any CPU. */
 int audio_stream_status(struct handle *h, struct n_audio_status *user_out) {
     struct stream *s = stream_of(h);
-    if (stream_broken(s)) return -N_ERR_IO;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock(&audio_lock);
+    bool broken = stream_broken(s);
     struct n_audio_status status = status_of(s);
-    bool ok = user_ok_w(user_out, sizeof status);
-    if (ok) memcpy(user_out, &status, sizeof status);
-    irq_restore(fl);
-    return ok ? 0 : -N_ERR_BAD_ADDRESS;
+    spin_unlock(&audio_lock, fl);
+    if (broken) return -N_ERR_IO;
+    return copy_to_user(user_out, &status, sizeof status) < 0 ? -N_ERR_BAD_ADDRESS : 0;
 }
 
-bool audio_stream_status_ap(struct handle *h, struct n_audio_status *user_out, int64_t *result) {
-    if (!handle_is(h, &stream_ops)) return false;
-    struct stream *s = stream_of(h);
-    struct n_audio_status status;
-    bool broken;
-    for (int tries = 0;; tries++) {
-        if (tries == 8) return false; /* the mixer kept changing it: the BSP reads it in order */
-        uint32_t seq = __atomic_load_n(&s->status_seq, __ATOMIC_ACQUIRE);
-        if (seq & 1) { __builtin_ia32_pause(); continue; }
-        broken = stream_broken(s);
-        status = status_of(s);
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        if (__atomic_load_n(&s->status_seq, __ATOMIC_RELAXED) == seq) break;
-    }
-    if (broken) { *result = -N_ERR_IO; return true; }
-    if (!vmm_ap_user_begin(user_out, sizeof status, true)) return false;
-    memcpy(user_out, &status, sizeof status);
-    vmm_ap_uaccess_end();
-    *result = 0;
-    return true;
-}
-
+/* The BSP: the card's device. */
 int audio_stream_flush(struct handle *h) {
     struct stream *s = stream_of(h);
     uint64_t fl = irq_save();
-    stream_drop(s);
-    if (audio_trace_active) for (int i = 0; i < MAX_STREAMS; i++)
-        if (streams[i] == s) trace.stream[i].flushes++;
+    stream_drop(s, true);
     irq_restore(fl);
     return 0;
 }

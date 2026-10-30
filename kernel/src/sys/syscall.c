@@ -2529,12 +2529,11 @@ enum ap_syscall syscall_ap(struct regs *r) {
     case SYS_TIME: result = time_now(); break;
     case SYS_TCP_SEND: case SYS_TCP_SEND_UNTIL: case SYS_TCP_RECV:
         return net_ap_syscall(r) ? AP_SYSCALL_DONE : AP_SYSCALL_BSP;
-    case SYS_AUDIO_STATUS: case SYS_WIN_RECEIVE: case SYS_WIN_STATE: case SYS_APP_RESULT: {
+    case SYS_WIN_RECEIVE: case SYS_WIN_STATE: case SYS_APP_RESULT: {
         if (current_task->killed) return AP_SYSCALL_BSP; /* the BSP ends the process */
         ap_read_begin();
         struct handle *h = handle_ap_peek((int)r->rdi);
-        bool done = r->rax == SYS_AUDIO_STATUS ? audio_stream_status_ap(h, (struct n_audio_status *)r->rsi, &result)
-                  : r->rax == SYS_WIN_RECEIVE ? wm_receive_ap(h, (size_t)r->rdx, (int64_t)r->r10, &result)
+        bool done = r->rax == SYS_WIN_RECEIVE ? wm_receive_ap(h, (size_t)r->rdx, (int64_t)r->r10, &result)
                   : r->rax == SYS_WIN_STATE ? wm_state_ap(h, &result)
                   : proc_app_result_ap(h, (int64_t)r->rsi, &result);
         ap_read_end();
@@ -2551,6 +2550,7 @@ bool syscall_anywhere(uint64_t number) {
     switch (number) {
     case SYS_CHANNEL_SEND: case SYS_CHANNEL_RECEIVE: case SYS_CHANNEL_RECEIVE_FROM: case SYS_EVENTS_WAIT:
     case SYS_WAIT_ADDRESS: case SYS_WAIT_ADDRESS64: case SYS_WAKE_ADDRESS: case SYS_SLEEP:
+    case SYS_AUDIO_SUBMIT: case SYS_AUDIO_STATUS:
         return true;
     default:
         return false;

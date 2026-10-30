@@ -69,10 +69,13 @@ bool timer_tickless(void) { return tickless && !prof_enabled(); }
 
 /* BSP idle task, interrupts off. When nothing runs anywhere, no sound plays and no log output
    waits for the serial line, the tick waits for the earliest timeout instead (at most a second).
-   Any interrupt starts it again (timer_wake), so handlers always see the current uptime_ms. */
+   Any interrupt starts it again (timer_wake), so handlers always see the current uptime_ms.
+   Quiet is asked first: a thread on an AP queues its sound (audio_stream_submit) before it leaves
+   its CPU, so once no AP holds one, what it queued is seen here. */
 void timer_idle(void) {
-    if (tick_stopped || !timer_tickless() || audio_needs_tick() || serial_needs_tick() || !sched_bsp_quiet())
-        return;
+    if (tick_stopped || !timer_tickless() || !sched_bsp_quiet()) return;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (audio_needs_tick() || serial_needs_tick()) return;
     catch_up();
     uint64_t now = timer_ticks, next = sched_next_wake();
     if (next <= now + 1) return; /* due by the next tick anyway */
