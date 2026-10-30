@@ -47,26 +47,27 @@ static void wr(const struct ioapic *io, uint32_t reg, uint32_t v) {
 }
 
 void ioapic_init(void) {
-    unsigned n;
-    const struct acpi_ioapic *a = acpi_ioapics(&n);
-    for (unsigned i = 0; i < n && nios < IOAPIC_MAX; i++) {
-        if (!a[i].addr) continue;
+    const struct acpi_sdt *madt = acpi_find("APIC", 0);
+    for (const struct acpi_entry *e = madt ? acpi_entry_next(madt, ACPI_MADT_ENTRIES, NULL) : NULL; e && nios < IOAPIC_MAX;
+         e = acpi_entry_next(madt, ACPI_MADT_ENTRIES, e)) {
+        const struct acpi_madt_ioapic *a = (const void *)e;
+        if (e->type != ACPI_MADT_IOAPIC || e->length < sizeof *a || !a->address) continue;
         struct ioapic *io = &ios[nios];
-        if (!(io->regs = vmm_map_mmio(a[i].addr, 4096))) {
-            kprintf("ioapic: id %u at %x: no memory to map it, ignored\n", a[i].id, a[i].addr);
+        if (!(io->regs = vmm_map_mmio(a->address, 4096))) {
+            kprintf("ioapic: id %u at %x: no memory to map it, ignored\n", a->id, a->address);
             continue;
         }
-        io->gsi_base = a[i].gsi_base;
+        io->gsi_base = a->gsi_base;
         uint64_t f = spin_lock(&ioapic_lock);
         uint32_t ver = rd(io, REG_VER);
         if (ver == 0xFFFFFFFF) { /* nothing decodes this address */
             spin_unlock(&ioapic_lock, f);
-            kprintf("ioapic: id %u at %x does not respond, ignored\n", a[i].id, a[i].addr);
+            kprintf("ioapic: id %u at %x does not respond, ignored\n", a->id, a->address);
             continue;
         }
         io->version = ver & 0xFF;
         io->pins = ((ver >> 16) & 0xFF) + 1;
-        io->id = a[i].id; /* the MADT's: the one the DMAR's scopes name (its register may differ) */
+        io->id = a->id; /* the MADT's: the one the DMAR's scopes name (its register may differ) */
         unsigned kept = 0;
         for (uint32_t pin = 0; pin < io->pins; pin++) {
             uint32_t lo = rd(io, REG_RTE(pin));
@@ -81,7 +82,7 @@ void ioapic_init(void) {
             given[nios][pin] = RTE_MASK;
         }
         spin_unlock(&ioapic_lock, f);
-        kprintf("ioapic: id %u at %x, version %x, GSI %u-%u, all masked%s\n", io->id, a[i].addr, io->version,
+        kprintf("ioapic: id %u at %x, version %x, GSI %u-%u, all masked%s\n", io->id, a->address, io->version,
                 io->gsi_base, io->gsi_base + io->pins - 1, kept ? " (ExtINT pin kept)" : "");
         nios++;
     }
@@ -152,14 +153,15 @@ bool ioapic_mask(uint32_t gsi) {
 }
 
 uint32_t ioapic_isa_to_gsi(unsigned isa_irq, bool *level, bool *active_low) {
-    unsigned n;
-    const struct acpi_iso *o = acpi_isos(&n);
+    const struct acpi_sdt *madt = acpi_find("APIC", 0);
     bool lv = false, low = false; /* ISA: edge-triggered, active high */
     uint32_t gsi = isa_irq;
-    for (unsigned i = 0; i < n; i++) {
-        if (o[i].bus != 0 || o[i].source != isa_irq) continue;
-        gsi = o[i].gsi;
-        unsigned pol = o[i].flags & 3, trg = (o[i].flags >> 2) & 3;
+    for (const struct acpi_entry *e = madt ? acpi_entry_next(madt, ACPI_MADT_ENTRIES, NULL) : NULL; e;
+         e = acpi_entry_next(madt, ACPI_MADT_ENTRIES, e)) {
+        const struct acpi_madt_override *o = (const void *)e;
+        if (e->type != ACPI_MADT_OVERRIDE || e->length < sizeof *o || o->bus != 0 || o->source != isa_irq) continue;
+        gsi = o->gsi;
+        unsigned pol = o->flags & 3, trg = (o->flags >> 2) & 3;
         if (pol == 3) low = true;     /* 00 and 01 keep the ISA default / active high */
         if (trg == 3) lv = true;      /* 00 and 01 keep the ISA default / edge */
         break;

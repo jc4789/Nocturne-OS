@@ -41,6 +41,9 @@ char *strdup(const char *s);
 int toupper(int c);
 int tolower(int c);
 
+/* lib/sort.c: count items of size bytes, in place by cmp's order (negative: a before b). */
+void sort(void *items, size_t count, size_t size, int (*cmp)(const void *a, const void *b));
+
 /* lib/printf.c */
 int kvsnprintf(char *buf, size_t size, const char *fmt, va_list ap);
 int ksnprintf(char *buf, size_t size, const char *fmt, ...) __attribute__((format(printf, 3, 4)));

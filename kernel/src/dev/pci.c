@@ -16,7 +16,7 @@
    (uncached) once enumeration has found it, so the 256 MiB window is never mapped as a whole. Until a
    function is active, offsets below 256 go through CF8/CFC, which is also what enumeration probes with.
    Without an MCFG, or if an ECAM read disagrees with CF8, everything stays on CF8/CFC. */
-static const struct acpi_ecam *ecam;
+static const struct acpi_mcfg_entry *ecam; /* the MCFG's own entries */
 static unsigned necam;
 static bool ecam_off;
 /* One bit per bus/dev/func, set once its page is mapped, from any CPU. Two CPUs that find it clear
@@ -30,7 +30,7 @@ static uint32_t interrupt_dest;
 static volatile uint32_t *ecam_regs(uint8_t bus, uint8_t dev, uint8_t func, bool map) {
     if (ecam_off) return NULL;
     for (unsigned i = 0; i < necam; i++) {
-        if (ecam[i].segment != 0 || bus < ecam[i].start_bus || bus > ecam[i].end_bus) continue;
+        if (ecam[i].segment != 0 || !ecam[i].base || bus < ecam[i].start_bus || bus > ecam[i].end_bus) continue;
         unsigned bdf = (unsigned)bus << 8 | (unsigned)dev << 3 | func;
         uint64_t phys = ecam[i].base + ((uint64_t)(bus - ecam[i].start_bus) << 20 | (uint64_t)dev << 15 |
                                          (uint64_t)func << 12);
@@ -198,9 +198,13 @@ static void pcie_identify(struct pci_device *d) {
 void pci_init(void) {
     uint64_t since = clock_now_ns(); /* the platform reset was before the firmware ran */
     interrupt_dest = lapic_current_id();
-    ecam = acpi_ecams(&necam);
+    const struct acpi_sdt *mcfg = acpi_find("MCFG", 0);
+    if (mcfg && mcfg->length >= ACPI_MCFG_ENTRIES) {
+        ecam = (const struct acpi_mcfg_entry *)((const uint8_t *)mcfg + ACPI_MCFG_ENTRIES);
+        necam = (mcfg->length - ACPI_MCFG_ENTRIES) / sizeof *ecam;
+    }
     for (unsigned i = 0; i < necam; i++)
-        if (ecam[i].segment == 0)
+        if (ecam[i].segment == 0 && ecam[i].base && ecam[i].start_bus <= ecam[i].end_bus)
             kprintf("pci: ECAM segment 0 buses %u-%u at %lx\n", ecam[i].start_bus, ecam[i].end_bus, ecam[i].base);
     if (!necam) kprintf("pci: no MCFG, config space via CF8/CFC only (no extended capabilities)\n");
     for (int bus = 0; bus < 256; bus++) {

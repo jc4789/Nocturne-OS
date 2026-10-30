@@ -5,6 +5,7 @@
 #include "arch/smp.h"
 #include "vm/vm.h"
 #include "arch/pat.h"
+#include "arch/topology.h"
 #include "arch/ioapic.h"
 #include "dev/acpi.h"
 #include "dev/serial.h"
@@ -13,6 +14,7 @@
 #include "sys/alarm.h"
 #include "sys/clock.h"
 #include "dev/input.h"
+#include "mm/bootmem.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
@@ -89,7 +91,11 @@ void kmain(void) {
     uint64_t pat = pat_init_cpu();
     if (pat != PAT_NOCTURNE) kprintf("cpu: PAT %016lx (unexpected)\n", pat);
 
+    /* the machine's tables, in boot memory: what the page allocator is built on */
     struct limine_memmap_response *mm = mm_req.response;
+    bootmem_init(mm);
+    acpi_tables_init(mm);
+    topology_init();
     pmm_init(mm);
     vmm_init(mm, ka_req.response);
     wake_init(); /* the real-mode page for waking from sleep and restarting the APs */
@@ -122,7 +128,6 @@ void kmain(void) {
     /* The IOAPICs' pins masked (but a firmware virtual-wire PIC path, the PIC masked above) before
        the APICs change mode: apic_init may leave x2APIC mode and the APs take the BSP's, through
        the disabled state, where no interrupt may be sent to the APIC (SDM 11.4.3). */
-    acpi_tables_init();
     clock_init(); /* the hypervisor's reference time, or the TSC by the PM timer's measure */
     ioapic_init();
     apic_init(mp_req.response);

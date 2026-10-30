@@ -6,12 +6,12 @@
 
 | 場所 | 役目 | 主 |
 |---|---|---|
-| `kernel/src/arch/` | CPU の機能（`cpu.c`：CPUID の機能の葉の唯一の読み手、下限 Zen 4 の照らし、hypervisor が隠しうる機能の印。葉 0xD は `fpu.c`、0x4000xxxx は vm/）、GDT・IDT・`isr.asm`、APIC、SMP、FPU（XSAVES の詰めた形、AVX-512 まで、大きさは起動で決まる）、PAT、P ステート、S3 復帰 | K |
-| `kernel/src/mm/` | `pmm`・`vmm`（空間ごとの 4 段ページ表）・`heap` | K |
+| `kernel/src/arch/` | CPU の機能（`cpu.c`：CPUID の機能の葉の唯一の読み手、下限 Zen 4 の照らし、hypervisor が隠しうる機能の印。葉 0xD は `fpu.c`、topology の葉は `topology.c`、0x4000xxxx は vm/）、`topology.c`（起動時にある CPU の数え（MADT）・各 CPU の core・LLC・die・socket・node の密な番号（APIC ID の shift）・NUMA の node と記憶の範囲（SRAT、記憶だけの node も）と距離（SLIT）。上限なし、起動の記憶に置く。`smp.c` はまだ自分で数える：1b で topology の上に建て直す）、GDT・IDT・`isr.asm`、APIC、SMP、FPU（XSAVES の詰めた形、AVX-512 まで、大きさは起動で決まる）、PAT、P ステート、S3 復帰 | K |
+| `kernel/src/mm/` | `bootmem`（頁の確保より前の確保：memmap の usable の頂から切り、頁の確保へ渡す）・`pmm`・`vmm`（空間ごとの 4 段ページ表）・`heap` | K |
 | `kernel/src/sys/` | `proc`（ELF）、`sched`（CPU ごとの実行キューと idle task）、`kei`（継の選択核）、`clock`（ns の時計：TSC か Hyper-V の参照の頁）、`alarm`（CPU ごとの期限の heap と LAPIC の deadline。周期の拍は無い）、`syscall`、`object`、`channel`、`events`、`stream`（console・system log）、`watch`（見張りの共通の部品 `struct watched`、`n_watch_take`）、`keep`（システムの部品の状態の保存：持ち主の wm・audio・screenmode が自分の行を出し、`AppData\Nocturne\{Desktop,Sound,Displays}.conf` へ最後の変更の 500 ms 後に書き、init より前に読み戻す。鍵は知らない）、`prof` | K |
 | `kernel/src/fs/` | C: の格納庫の実行側：`store`（C: の mount、道での操作、変更と commit の間の門、フォルダーの lock、書き手）、`document`（開いた文書：文書ごとの mutex、差し替えは一時フォルダーの文書を名へ移すか `ns_take`）、`cache`（塊の溜め `struct store_supply` の実装）、`watch`（C: の見張り `n_entry_watch`：操作が返す `struct ns_told` を出す）。書式のエンジンは `common/store/` | K |
 | `common/store/` | 格納庫の書式のエンジン（library）：`names`・`fold_table`・`catalog`（B+木、latch）・`namespace`（`NS_GIVEN`：フォルダーが与える属性は移動でフォルダーと一緒に入れ替わる）・`space`・`volume`（mount・format・commit の凍結・書く・書き終え、`volume_commit`）・`crc32c`・`latch`。lock・待ち・log・時計を持たず、`store_device`・`store_supply`・`store_env` を受ける。カーネル（`kernel/src/fs`）とホストの道具（`host/store`）が組む | K+H |
-| `kernel/src/dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI・USB、IOMMU、音、`fb`・fbcon、入力、電源 | K |
+| `kernel/src/dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（`acpi.c`：XSDT の項目を一度だけ照らした登録、表は直接の写像でその場で読む。MADT・SRAT は `acpi_entry_next` で項目を順に、形は `acpi.h`。AML は uACPI）、AHCI、NVMe、xHCI・USB、IOMMU、音、`fb`・fbcon、入力、電源 | K |
 | `kernel/src/net/` | `net.c`（Ethernet〜TCP・DHCP・DNS）、`rtl8125.c`（実機の NIC） | K |
 | `kernel/src/gui/` | `wm.c`（窓管理と合成）、`desktop.c`、`screenmode.c` | K |
 | `kernel/src/vm/` | VM だけの処理のすべて（下の「境界」） | K |

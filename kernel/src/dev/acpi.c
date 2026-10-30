@@ -1,6 +1,6 @@
-/* ACPI table registry (RSDP/XSDT/RSDT), MADT and MCFG parsing. Hardware specs only: ACPI 6.x
-   chapter 5 (table formats) and the PCI Firmware specification (MCFG). The AML is uACPI's: the
-   second half of this file gives it the kernel services it asks for (uacpi/kernel_api.h). */
+/* The ACPI tables (dev/acpi.h): the root table and what it lists, read in place. Formats from
+   ACPI 6.5 chapter 5. The AML is uACPI's: the second half of this file gives it the kernel
+   services it asks for (uacpi/kernel_api.h). */
 #include "kernel.h"
 #include "limine.h"
 #include "arch/cpu.h"
@@ -8,6 +8,7 @@
 #include "dev/acpi.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
+#include "mm/bootmem.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
@@ -21,30 +22,21 @@
 #include <uacpi/resources.h>
 #include "arch/wake.h"
 
+_Static_assert(sizeof(struct acpi_madt_lapic) == 8 && sizeof(struct acpi_madt_ioapic) == 12 &&
+               sizeof(struct acpi_madt_override) == 10 && sizeof(struct acpi_madt_x2apic) == 16,
+               "the MADT entries' formats");
+_Static_assert(sizeof(struct acpi_srat_apic) == 16 && sizeof(struct acpi_srat_memory) == 40 &&
+               sizeof(struct acpi_srat_x2apic) == 24 && sizeof(struct acpi_slit) == 44 &&
+               sizeof(struct acpi_mcfg_entry) == 16, "the SRAT's, SLIT's and MCFG's formats");
+
 extern volatile struct limine_rsdp_request rsdp_req;
 
-#define MAX_TABLES  96
-#define MAX_LAPICS  256
-#define MAX_IOAPICS 8
-#define MAX_ISOS    32
-#define MAX_NMIS    16
-#define MAX_ECAMS   8
-#define MAX_TABLE_LEN (16u << 20)
-
-static struct {
-    uint64_t phys;
-    const struct acpi_sdt *t;
-} tables[MAX_TABLES];
-static unsigned ntables;
-static bool registry_done, tables_done;
-
-static struct acpi_lapic lapics[MAX_LAPICS];
-static struct acpi_ioapic ioapics[MAX_IOAPICS];
-static struct acpi_iso isos[MAX_ISOS];
-static struct acpi_nmi nmis[MAX_NMIS];
-static struct acpi_ecam ecams[MAX_ECAMS];
-static unsigned nlapics, nioapics, nisos, nnmis, necams;
-static uint64_t madt_lapic_addr;
+static struct limine_memmap_response *map;
+/* The root table (XSDT, else RSDT): its entries are the registry, each a physical address of
+   entry_size bytes; valid[i] says the i-th passed its checks. */
+static const uint8_t *entries;
+static uint32_t nentries, entry_size;
+static uint64_t *valid;
 
 static bool checksum_ok(const void *p, size_t n) {
     const uint8_t *b = p;
@@ -53,231 +45,113 @@ static bool checksum_ok(const void *p, size_t n) {
     return sum == 0;
 }
 
-const struct acpi_sdt *acpi_map_table(uint64_t phys) {
-    /* the header first (uncached is fine for tables), then the length it gives */
-    const struct acpi_sdt *h = vmm_map_mmio(phys, 4096);
-    if (!h) return NULL;
-    uint32_t len = h->length;
-    if (len > 4096 && len <= MAX_TABLE_LEN && !vmm_map_mmio(phys, len)) return NULL;
-    return h;
+/* The bootloader maps the tables within these ranges, before the kernel's page tables and after
+   (base revision 4; vmm_init maps every range of the map). */
+static bool where_tables_lie(uint64_t base, uint64_t length) {
+    for (uint64_t i = 0; i < map->entry_count; i++) {
+        const struct limine_memmap_entry *e = map->entries[i];
+        if (e->type != LIMINE_MEMMAP_ACPI_RECLAIMABLE && e->type != LIMINE_MEMMAP_ACPI_NVS &&
+            e->type != LIMINE_MEMMAP_RESERVED_MAPPED)
+            continue;
+        if (base >= e->base && length <= e->length && base - e->base <= e->length - length) return true;
+    }
+    return false;
 }
 
-static void add_table(uint64_t phys) {
-    if (!phys) return;
-    const struct acpi_sdt *t = acpi_map_table(phys);
-    if (!t) {
-        kprintf("acpi: no memory to map the table at %lx, skipped\n", phys);
-        return;
-    }
-    if (t->length < sizeof *t || t->length > MAX_TABLE_LEN) {
-        kprintf("acpi: table at %lx has bad length %u, skipped\n", phys, t->length);
-        return;
-    }
-    if (!checksum_ok(t, t->length)) {
-        kprintf("acpi: table %.4s at %lx fails its checksum, skipped\n", t->sig, phys);
-        return;
-    }
-    if (ntables >= MAX_TABLES) {
-        kprintf("acpi: more than %d tables, %.4s ignored\n", MAX_TABLES, t->sig);
-        return;
-    }
-    tables[ntables].phys = phys;
-    tables[ntables].t = t;
-    ntables++;
+const struct acpi_sdt *acpi_table_at(uint64_t phys) {
+    if (!phys || !where_tables_lie(phys, sizeof(struct acpi_sdt))) return NULL;
+    const struct acpi_sdt *t = phys_to_virt(phys);
+    return t->length >= sizeof *t && where_tables_lie(phys, t->length) ? t : NULL;
 }
 
-/* Walk one root table (XSDT: 8-byte entries, RSDT: 4-byte entries). False if the root is unusable. */
-static bool walk_root(uint64_t phys, unsigned entry_size, const char *sig) {
-    const struct acpi_sdt *r = acpi_map_table(phys);
-    if (!r || memcmp(r->sig, sig, 4) || r->length < sizeof *r || r->length > MAX_TABLE_LEN ||
-        !checksum_ok(r, r->length))
-        return false;
-    unsigned n = (r->length - sizeof *r) / entry_size;
-    const uint8_t *e = (const uint8_t *)(r + 1);
-    for (unsigned i = 0; i < n; i++) {
-        uint64_t p = 0;
-        memcpy(&p, e + (size_t)i * entry_size, entry_size);
-        add_table(p);
-    }
-    return true;
+static uint64_t entry_phys(uint32_t i) {
+    uint64_t p = 0;
+    memcpy(&p, entries + (size_t)i * entry_size, entry_size);
+    return p;
 }
 
-void acpi_registry_init(void) {
-    if (registry_done) return;
-    registry_done = true;
-    if (!rsdp_req.response) return;
-    uint8_t *rsdp = (uint8_t *)rsdp_req.response->address;
-    if ((uint64_t)rsdp < hhdm_offset) rsdp = phys_to_virt((uint64_t)rsdp);
+/* The root the RSDP names (5.2.5): the XSDT when there is one that checks, else the RSDT. */
+static const struct acpi_sdt *root(void) {
+    if (!rsdp_req.response) return NULL;
+    /* base revision 4 gives the RSDP's address in the direct map */
+    const uint8_t *rsdp = (const uint8_t *)rsdp_req.response->address;
     if (memcmp(rsdp, "RSD PTR ", 8) || !checksum_ok(rsdp, 20)) {
         kprintf("acpi: RSDP signature or checksum invalid\n");
-        return;
+        return NULL;
     }
-    uint8_t rev = rsdp[15];
     uint32_t rsdt = 0, length = 0;
     uint64_t xsdt = 0;
     memcpy(&rsdt, rsdp + 16, 4);
-    if (rev >= 2) {
+    if (rsdp[15] >= 2) {
         memcpy(&length, rsdp + 20, 4);
-        if (length >= 36 && length <= 4096 && checksum_ok(rsdp, length)) memcpy(&xsdt, rsdp + 24, 8);
-        else kprintf("acpi: RSDP extended checksum invalid, using RSDT\n");
+        if (length >= 36 && where_tables_lie(hhdm_virt_to_phys(rsdp), length) && checksum_ok(rsdp, length))
+            memcpy(&xsdt, rsdp + 24, 8);
+        else kprintf("acpi: RSDP extended checksum invalid, using the RSDT\n");
     }
-    if (xsdt && walk_root(xsdt, 8, "XSDT")) return;
-    if (xsdt) kprintf("acpi: XSDT invalid, trying RSDT\n");
-    if (rsdt && !walk_root(rsdt, 4, "RSDT")) kprintf("acpi: RSDT invalid\n");
-}
-
-const void *acpi_find(const char sig[4], unsigned index) {
-    acpi_registry_init();
-    for (unsigned i = 0; i < ntables; i++)
-        if (!memcmp(tables[i].t->sig, sig, 4) && index-- == 0) return tables[i].t;
+    const struct acpi_sdt *x = acpi_table_at(xsdt);
+    if (x && !memcmp(x->sig, "XSDT", 4) && checksum_ok(x, x->length)) {
+        entry_size = 8;
+        return x;
+    }
+    if (xsdt) kprintf("acpi: XSDT invalid, trying the RSDT\n");
+    const struct acpi_sdt *r = acpi_table_at(rsdt);
+    if (r && !memcmp(r->sig, "RSDT", 4) && checksum_ok(r, r->length)) {
+        entry_size = 4;
+        return r;
+    }
+    kprintf("acpi: RSDT invalid\n");
     return NULL;
 }
 
-unsigned acpi_table_count(void) {
-    acpi_registry_init();
-    return ntables;
-}
-
-const struct acpi_sdt *acpi_table_at(unsigned index) {
-    acpi_registry_init();
-    return index < ntables ? tables[index].t : NULL;
-}
-
-/* ---- MADT ---- */
-static void parse_madt(void) {
-    const struct acpi_sdt *h = acpi_find("APIC", 0); /* there is only one MADT */
-    if (!h || h->length < sizeof *h + 8) return;
-    {
-        const uint8_t *b = (const uint8_t *)h;
-        uint32_t a;
-        memcpy(&a, b + sizeof *h, 4);
-        madt_lapic_addr = a;
-        for (uint32_t off = sizeof *h + 8; off + 2 <= h->length;) {
-            const uint8_t *e = b + off;
-            uint8_t type = e[0], len = e[1];
-            if (len < 2 || off + len > h->length) break;
-            off += len;
-            switch (type) {
-            case 0: /* processor local APIC */
-                if (len >= 8 && nlapics < MAX_LAPICS) {
-                    uint32_t flags;
-                    memcpy(&flags, e + 4, 4);
-                    lapics[nlapics++] = (struct acpi_lapic){.apic_id = e[3], .uid = e[2], .flags = flags};
-                }
-                break;
-            case 9: /* processor local x2APIC */
-                if (len >= 16 && nlapics < MAX_LAPICS) {
-                    uint32_t id, flags, uid;
-                    memcpy(&id, e + 4, 4);
-                    memcpy(&flags, e + 8, 4);
-                    memcpy(&uid, e + 12, 4);
-                    lapics[nlapics++] = (struct acpi_lapic){.apic_id = id, .uid = uid, .flags = flags, .x2apic = true};
-                }
-                break;
-            case 1: /* I/O APIC */
-                if (len >= 12 && nioapics < MAX_IOAPICS) {
-                    uint32_t addr, base;
-                    memcpy(&addr, e + 4, 4);
-                    memcpy(&base, e + 8, 4);
-                    ioapics[nioapics++] = (struct acpi_ioapic){.id = e[2], .addr = addr, .gsi_base = base};
-                }
-                break;
-            case 2: /* interrupt source override */
-                if (len >= 10 && nisos < MAX_ISOS) {
-                    uint32_t gsi;
-                    uint16_t flags;
-                    memcpy(&gsi, e + 4, 4);
-                    memcpy(&flags, e + 8, 2);
-                    isos[nisos++] = (struct acpi_iso){.bus = e[2], .source = e[3], .gsi = gsi, .flags = flags};
-                }
-                break;
-            case 3: /* NMI source */
-                if (len >= 8 && nnmis < MAX_NMIS) {
-                    uint32_t gsi;
-                    uint16_t flags;
-                    memcpy(&flags, e + 2, 2);
-                    memcpy(&gsi, e + 4, 4);
-                    nmis[nnmis++] = (struct acpi_nmi){.is_lapic = false, .gsi = gsi, .flags = flags, .uid = 0xFFFFFFFF};
-                }
-                break;
-            case 4: /* local APIC NMI */
-                if (len >= 6 && nnmis < MAX_NMIS) {
-                    uint16_t flags;
-                    memcpy(&flags, e + 3, 2);
-                    nmis[nnmis++] = (struct acpi_nmi){.is_lapic = true, .uid = e[2] == 0xFF ? 0xFFFFFFFF : e[2],
-                                                      .flags = flags, .lint = e[5]};
-                }
-                break;
-            case 10: /* local x2APIC NMI */
-                if (len >= 12 && nnmis < MAX_NMIS) {
-                    uint16_t flags;
-                    uint32_t uid;
-                    memcpy(&flags, e + 2, 2);
-                    memcpy(&uid, e + 4, 4);
-                    nmis[nnmis++] = (struct acpi_nmi){.is_lapic = true, .uid = uid, .flags = flags, .lint = e[8]};
-                }
-                break;
-            case 5: /* local APIC address override */
-                if (len >= 12) memcpy(&madt_lapic_addr, e + 4, 8);
-                break;
-            default: break;
-            }
-        }
-    }
-    unsigned enabled = 0, x2 = 0;
-    for (unsigned i = 0; i < nlapics; i++) {
-        if (lapics[i].flags & 3) enabled++;
-        if (lapics[i].x2apic) x2++;
-    }
-    kprintf("acpi: MADT lapic %lx, %u CPUs (%u enabled, %u x2APIC entries), %u IOAPIC, %u overrides, %u NMI\n",
-            madt_lapic_addr, nlapics, enabled, x2, nioapics, nisos, nnmis);
-    for (unsigned i = 0; i < nioapics; i++)
-        kprintf("acpi:   IOAPIC id %u at %x, GSI base %u\n", ioapics[i].id, ioapics[i].addr, ioapics[i].gsi_base);
-    for (unsigned i = 0; i < nisos; i++)
-        kprintf("acpi:   override bus %u IRQ %u -> GSI %u flags %x\n", isos[i].bus, isos[i].source, isos[i].gsi,
-                isos[i].flags);
-}
-
-/* ---- MCFG ---- */
-static void parse_mcfg(void) {
-    const struct acpi_sdt *h = acpi_find("MCFG", 0);
-    if (!h || h->length < sizeof *h + 8) return;
-    const uint8_t *b = (const uint8_t *)h;
-    for (uint32_t off = sizeof *h + 8; off + 16 <= h->length && necams < MAX_ECAMS; off += 16) {
-        struct acpi_ecam e;
-        memcpy(&e.base, b + off, 8);
-        memcpy(&e.segment, b + off + 8, 2);
-        e.start_bus = b[off + 10];
-        e.end_bus = b[off + 11];
-        if (!e.base || e.end_bus < e.start_bus) continue;
-        ecams[necams++] = e;
-        kprintf("acpi: MCFG segment %u buses %u-%u at %lx\n", e.segment, e.start_bus, e.end_bus, e.base);
-    }
-}
-
-void acpi_tables_init(void) {
-    if (tables_done) return;
-    tables_done = true;
-    acpi_registry_init();
-    char line[160];
+void acpi_tables_init(struct limine_memmap_response *mm) {
+    map = mm;
+    const struct acpi_sdt *r = root();
+    if (!r) return;
+    entries = (const uint8_t *)(r + 1);
+    nentries = (r->length - sizeof *r) / entry_size;
+    valid = bootmem_alloc(ALIGN_UP(MAX(nentries, 1u), 64) / 8, 8);
+    char line[128];
     size_t n = 0;
-    for (unsigned i = 0; i < ntables && n + 6 < sizeof line; i++) {
-        memcpy(line + n, tables[i].t->sig, 4);
-        line[n + 4] = ' ';
-        n += 5;
+    unsigned listed = 0;
+    for (uint32_t i = 0; i < nentries; i++) {
+        uint64_t phys = entry_phys(i);
+        const struct acpi_sdt *t = acpi_table_at(phys);
+        if (!t) {
+            if (phys) kprintf("acpi: the table at %lx lies outside the firmware's ranges, skipped\n", phys);
+            continue;
+        }
+        if (!checksum_ok(t, t->length)) {
+            kprintf("acpi: table %.4s at %lx fails its checksum, skipped\n", t->sig, phys);
+            continue;
+        }
+        valid[i / 64] |= 1ULL << (i % 64);
+        if (n + 6 > sizeof line) {
+            kprintf("acpi: tables%s\n", line);
+            n = 0;
+        }
+        n += ksnprintf(line + n, sizeof line - n, " %.4s", t->sig);
+        listed++;
     }
-    line[n] = 0;
-    kprintf("acpi: tables %s\n", line);
-    parse_madt();
-    parse_mcfg();
+    if (n) kprintf("acpi: tables%s\n", line);
+    if (!listed) kprintf("acpi: the root table lists no valid table\n");
 }
 
-uint64_t acpi_madt_lapic_addr(void) { return madt_lapic_addr; }
-const struct acpi_lapic *acpi_lapics(unsigned *count) { *count = nlapics; return lapics; }
-const struct acpi_ioapic *acpi_ioapics(unsigned *count) { *count = nioapics; return ioapics; }
-const struct acpi_iso *acpi_isos(unsigned *count) { *count = nisos; return isos; }
-const struct acpi_nmi *acpi_nmis(unsigned *count) { *count = nnmis; return nmis; }
-const struct acpi_ecam *acpi_ecams(unsigned *count) { *count = necams; return ecams; }
+const void *acpi_find(const char sig[4], unsigned index) {
+    for (uint32_t i = 0; i < nentries; i++) {
+        if (!(valid[i / 64] & (1ULL << (i % 64)))) continue;
+        const struct acpi_sdt *t = phys_to_virt(entry_phys(i));
+        if (!memcmp(t->sig, sig, 4) && index-- == 0) return t;
+    }
+    return NULL;
+}
+
+const struct acpi_entry *acpi_entry_next(const struct acpi_sdt *table, uint32_t first, const struct acpi_entry *after) {
+    const uint8_t *b = (const uint8_t *)table;
+    uint32_t off = after ? (uint32_t)((const uint8_t *)after - b) + after->length : first;
+    if (off + sizeof(struct acpi_entry) > table->length) return NULL;
+    const struct acpi_entry *e = (const struct acpi_entry *)(b + off);
+    return e->length >= sizeof *e && e->length <= table->length - off ? e : NULL;
+}
 
 /* ---- AML: uACPI (third_party/uacpi) on Nocturne's own kernel services ----
    uACPI is called from any CPU: the "acpi" kernel thread runs its deferred work (GPE methods,

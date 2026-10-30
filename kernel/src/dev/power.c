@@ -35,15 +35,14 @@ static void gas_write(const struct acpi_gas *g, uint64_t v) {
 static bool fadt_has(size_t end) { return fadt && fadt->h.length >= end; }
 
 void acpi_init(void) {
-    acpi_tables_init(); /* registry (+ "acpi: tables" line), MADT, MCFG */
     fadt = acpi_find("FACP", 0);
     if (!fadt) {
         kprintf("acpi: no FADT found\n");
         return;
     }
     uint64_t dsdt_phys = (fadt->h.length >= 148 && fadt->x_dsdt) ? fadt->x_dsdt : fadt->dsdt;
-    const struct acpi_sdt *dsdt = acpi_map_table(dsdt_phys);
-    if (!dsdt) kprintf("acpi: no memory to map the DSDT\n"); /* no S5 from it; the AML interpreter still runs */
+    const struct acpi_sdt *dsdt = acpi_table_at(dsdt_phys);
+    if (!dsdt) kprintf("acpi: the DSDT lies outside the firmware's ranges\n"); /* no S5 from it; the AML interpreter still runs */
     const uint8_t *p = dsdt ? (const uint8_t *)(dsdt + 1) : NULL;
     const uint8_t *end = dsdt ? (const uint8_t *)dsdt + dsdt->length : NULL;
     for (; p && p + 4 < end; p++) {

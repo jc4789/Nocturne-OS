@@ -90,7 +90,7 @@ struct cpu_features {
     unsigned invlpgb_pages;  /* most pages one INVLPGB names, beyond the first */
     uint64_t tsc_crystal_hz; /* the TSC's rate as CPUID 15h states it; 0 where it does not */
     bool hypervisor, mwait, pcid, tsc_deadline, invariant_tsc, aperf_mperf, intel_hwp, cppc,
-        invlpgb, tme, arch_capabilities;
+        invlpgb, tme, arch_capabilities, topology_extensions;
     char brand[49];
 };
 extern struct cpu_features cpu_features;

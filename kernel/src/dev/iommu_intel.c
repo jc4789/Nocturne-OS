@@ -395,13 +395,15 @@ static bool parse_dmar(void) {
 /* Every IOAPIC of the MADT in the scope of exactly one unit (8.3.1.1): the source check of its
    pins' entries needs the ID it sends with. */
 static bool ioapics_described(void) {
-    unsigned n;
-    const struct acpi_ioapic *a = acpi_ioapics(&n);
-    for (unsigned i = 0; i < n; i++) {
+    const struct acpi_sdt *madt = acpi_find("APIC", 0);
+    for (const struct acpi_entry *e = madt ? acpi_entry_next(madt, ACPI_MADT_ENTRIES, NULL) : NULL; e;
+         e = acpi_entry_next(madt, ACPI_MADT_ENTRIES, e)) {
+        const struct acpi_madt_ioapic *a = (const void *)e;
+        if (e->type != ACPI_MADT_IOAPIC || e->length < sizeof *a || !a->address) continue;
         unsigned found = 0;
-        for (size_t k = 0; k < nioapics; k++) found += ioapics[k].id == a[i].id;
+        for (size_t k = 0; k < nioapics; k++) found += ioapics[k].id == a->id;
         if (found != 1) {
-            kprintf("iommu: the DMAR names IOAPIC %u %s\n", a[i].id, found ? "more than once" : "under no unit");
+            kprintf("iommu: the DMAR names IOAPIC %u %s\n", a->id, found ? "more than once" : "under no unit");
             return false;
         }
     }

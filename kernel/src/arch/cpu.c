@@ -3,8 +3,8 @@
    set below of every CPU (x86-64-v4, the system features the kernel builds on, and nothing older:
    the floor is Zen 4) and stops at boot when one is missing. The optional features are the ones a
    hypervisor or a model may lack (WHPX shows no PCID, MWAIT or invariant TSC bit): their users
-   choose a path by them. Leaf 0xD (the XSAVE layout) is arch/fpu.c's, the hypervisor's leaves
-   from 0x40000000 are vm/'s. */
+   choose a path by them. Leaf 0xD (the XSAVE layout) is arch/fpu.c's, the topology leaves (0xB,
+   0x1F, 4, 0x8000001D) arch/topology.c's, the hypervisor's leaves from 0x40000000 vm/'s. */
 #include "kernel.h"
 #include "arch/cpu.h"
 
@@ -53,6 +53,7 @@ static const struct {
     OPTIONAL(L1, ECX, 24, "TSC deadline", tsc_deadline), OPTIONAL(L1, ECX, 31, "hypervisor", hypervisor),
     OPTIONAL(L6, EAX, 7, "HWP", intel_hwp), OPTIONAL(L6, ECX, 0, "APERF/MPERF", aperf_mperf),
     OPTIONAL(L7, ECX, 13, "TME", tme), OPTIONAL(L7, EDX, 29, "IA32_ARCH_CAPABILITIES", arch_capabilities),
+    OPTIONAL(LE1, ECX, 22, "topology extensions", topology_extensions),
     OPTIONAL(LE7, EDX, 8, "invariant TSC", invariant_tsc), OPTIONAL(LE8, EBX, 3, "INVLPGB", invlpgb),
     OPTIONAL(LE8, EBX, 27, "CPPC", cppc),
 };

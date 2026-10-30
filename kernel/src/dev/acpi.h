@@ -1,6 +1,10 @@
 #pragma once
-/* ACPI table registry: RSDP -> XSDT/RSDT walk with checksum validation, plus the MADT and MCFG
-   parsers. Tables are looked up by signature. The AML interpreter (uACPI) is at the end. */
+/* The ACPI tables: the root table's entries, each checked once (checksum, and that it lies where
+   the bootloader maps ACPI tables), looked up by signature, and the formats of the static tables
+   the kernel reads (ACPI 6.5 chapter 5; MCFG: the PCI Firmware specification). A table is read in
+   place, through the direct map, for good: nothing is copied out of it, so nothing here has a
+   size of its own. Each reader decodes the entries it needs. The AML interpreter (uACPI) is at
+   the end. */
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -12,15 +16,23 @@ struct acpi_sdt {
     uint32_t oem_rev, creator, creator_rev;
 } __attribute__((packed));
 
-/* Walk the RSDP and cache every table whose checksum is valid. Idempotent; acpi_find() calls it. */
-void acpi_registry_init(void);
-/* index-th valid table with this signature ("FACP", "APIC", "MCFG", ...), or NULL. Mapped, never freed. */
+/* The root table, once, from boot before anything reads a table: mm is the bootloader's memory
+   map, which says where the tables may lie. Logs the signatures. */
+struct limine_memmap_response;
+void acpi_tables_init(struct limine_memmap_response *mm);
+/* The index-th valid table with this signature ("FACP", "APIC", "SRAT", ...), or NULL. */
 const void *acpi_find(const char sig[4], unsigned index);
-/* Map a table that is not in the root tables (the DSDT) given its physical address; no checksum check.
-   NULL when no page table could be allocated for it. */
-const struct acpi_sdt *acpi_map_table(uint64_t phys);
-unsigned acpi_table_count(void);
-const struct acpi_sdt *acpi_table_at(unsigned index);
+/* A table the root does not list (the DSDT, from the FADT) at that physical address: its header's
+   length checked to lie where tables may, its checksum not. NULL when it does not. */
+const struct acpi_sdt *acpi_table_at(uint64_t phys);
+
+/* The entries of a table made of (type, length) records after a fixed part (the MADT's and the
+   SRAT's): the one after `after` (NULL: the first), or NULL past the last. Each lies inside the
+   table and is at least 2 bytes long; a reader checks the length its type needs. */
+struct acpi_entry {
+    uint8_t type, length;
+} __attribute__((packed));
+const struct acpi_entry *acpi_entry_next(const struct acpi_sdt *table, uint32_t first, const struct acpi_entry *after);
 
 /* ---- FADT ("FACP", ACPI 6.5 5.2.9): fields past h.length are not there ---- */
 struct acpi_gas {
@@ -54,45 +66,85 @@ struct acpi_fadt {
 #define FADT_RESET_REG_SUP (1u << 10)
 #define FADT_HW_REDUCED    (1u << 20)
 
-/* ---- MADT ("APIC") ---- */
-struct acpi_lapic {
-    uint32_t apic_id, uid, flags; /* flags bit 0: enabled, bit 1: online-capable */
-    bool x2apic;                  /* from a type-9 (x2APIC) entry */
+/* ---- MADT ("APIC", 5.2.12): entries from byte 44 ---- */
+#define ACPI_MADT_ENTRIES 44
+enum {
+    ACPI_MADT_LAPIC = 0,      /* struct acpi_madt_lapic */
+    ACPI_MADT_IOAPIC = 1,     /* struct acpi_madt_ioapic */
+    ACPI_MADT_OVERRIDE = 2,   /* struct acpi_madt_override */
+    ACPI_MADT_X2APIC = 9,     /* struct acpi_madt_x2apic */
 };
-struct acpi_ioapic {
-    uint8_t id;
-    uint32_t addr, gsi_base;
-};
-struct acpi_iso { /* interrupt source override */
+#define ACPI_CPU_ENABLED        1u /* a processor entry's flags: present and usable now */
+#define ACPI_CPU_ONLINE_CAPABLE 2u /* not enabled now, may be brought online later */
+struct acpi_madt_lapic {
+    struct acpi_entry e;
+    uint8_t uid, apic_id;
+    uint32_t flags;
+} __attribute__((packed));
+struct acpi_madt_ioapic {
+    struct acpi_entry e;
+    uint8_t id, reserved;
+    uint32_t address, gsi_base;
+} __attribute__((packed));
+struct acpi_madt_override { /* an ISA interrupt's GSI and signal */
+    struct acpi_entry e;
     uint8_t bus, source;
     uint32_t gsi;
     uint16_t flags; /* bits 0-1 polarity (3 = active low), bits 2-3 trigger (3 = level) */
-};
-struct acpi_nmi {
-    bool is_lapic;   /* true: processor LINT NMI (uid/lint), false: NMI source (gsi) */
-    uint32_t uid;    /* 0xFFFFFFFF = all processors */
-    uint32_t gsi;
-    uint16_t flags;
-    uint8_t lint;
-};
-uint64_t acpi_madt_lapic_addr(void); /* 0 if there is no MADT */
-const struct acpi_lapic *acpi_lapics(unsigned *count);
-const struct acpi_ioapic *acpi_ioapics(unsigned *count);
-const struct acpi_iso *acpi_isos(unsigned *count);
-const struct acpi_nmi *acpi_nmis(unsigned *count);
+} __attribute__((packed));
+struct acpi_madt_x2apic {
+    struct acpi_entry e;
+    uint16_t reserved;
+    uint32_t apic_id, flags, uid;
+} __attribute__((packed));
 
-/* ---- MCFG: PCIe enhanced configuration access regions ---- */
-struct acpi_ecam {
+/* ---- SRAT (5.2.16): entries from byte 48 ---- */
+#define ACPI_SRAT_ENTRIES 48
+enum {
+    ACPI_SRAT_APIC = 0,   /* struct acpi_srat_apic */
+    ACPI_SRAT_MEMORY = 1, /* struct acpi_srat_memory */
+    ACPI_SRAT_X2APIC = 2, /* struct acpi_srat_x2apic */
+};
+#define ACPI_SRAT_ENABLED     1u
+#define ACPI_SRAT_HOTPLUG     2u /* memory: may be added and removed while running */
+#define ACPI_SRAT_NONVOLATILE 4u /* memory: non-volatile */
+struct acpi_srat_apic {
+    struct acpi_entry e;
+    uint8_t domain_low, apic_id; /* proximity domain bits 7:0 */
+    uint32_t flags;
+    uint8_t sapic_eid, domain_high[3]; /* bits 31:8 */
+    uint32_t clock_domain;
+} __attribute__((packed));
+struct acpi_srat_memory {
+    struct acpi_entry e;
+    uint32_t domain;
+    uint16_t reserved;
+    uint64_t base, length;
+    uint32_t reserved2, flags;
+    uint64_t reserved3;
+} __attribute__((packed));
+struct acpi_srat_x2apic {
+    struct acpi_entry e;
+    uint16_t reserved;
+    uint32_t domain, apic_id, flags, clock_domain, reserved2;
+} __attribute__((packed));
+
+/* ---- SLIT (5.2.17): distance[i * localities + j] from locality (proximity domain) i to j;
+   10 is a locality's own, 0-9 have no meaning, 255 is unreachable ---- */
+struct acpi_slit {
+    struct acpi_sdt h;
+    uint64_t localities;
+    uint8_t distance[];
+} __attribute__((packed));
+
+/* ---- MCFG: PCIe enhanced configuration access regions, from byte 44 ---- */
+#define ACPI_MCFG_ENTRIES 44
+struct acpi_mcfg_entry {
     uint64_t base; /* physical address of bus start_bus, device 0, function 0 */
     uint16_t segment;
     uint8_t start_bus, end_bus;
-};
-const struct acpi_ecam *acpi_ecams(unsigned *count);
-
-/* Registry + MADT + MCFG, with a log summary of each, once: from boot (the IOAPICs are masked
-   before the APIC is set up) and acpi_init(). The IOMMU tables (DMAR, IVRS) are
-   dev/iommu_intel.c's and dev/iommu_amd.c's. */
-void acpi_tables_init(void);
+    uint32_t reserved;
+} __attribute__((packed));
 
 /* ---- AML (uACPI) ----
    acpi_aml_init: load the namespace, run the devices' _INI, take the SCI, the power button

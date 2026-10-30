@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/spin.h"
+#include "mm/bootmem.h"
 #include "mm/pmm.h"
 #include "limine.h"
 
@@ -69,6 +70,14 @@ bool pmm_ram_complete(void) { return !ram_lost; }
 
 uint64_t pmm_map_signature(void) { return map_sig; }
 
+static void reserve(uint64_t base, uint64_t end, void *context) {
+    for (uint64_t p = base / PAGE_SIZE; p < end / PAGE_SIZE; p++)
+        if (!is_used(p)) {
+            set_used(p);
+            free_pages--;
+        }
+}
+
 void pmm_init(struct limine_memmap_response *mm) {
     note_ranges(mm);
     uint64_t top = 0;
@@ -82,16 +91,7 @@ void pmm_init(struct limine_memmap_response *mm) {
     pmm_highest_usable = top;
     total_pages = top / PAGE_SIZE;
     uint64_t bitmap_bytes = ALIGN_UP((total_pages + 63) / 64 * 8, PAGE_SIZE);
-
-    /* find a home for the bitmap */
-    for (uint64_t i = 0; i < mm->entry_count; i++) {
-        struct limine_memmap_entry *e = mm->entries[i];
-        if (e->type == LIMINE_MEMMAP_USABLE && e->length >= bitmap_bytes && e->base >= 0x100000) {
-            bitmap = phys_to_virt(e->base);
-            break;
-        }
-    }
-    if (!bitmap) panic("pmm: no room for the frame bitmap");
+    bitmap = bootmem_alloc(bitmap_bytes, PAGE_SIZE);
     memset(bitmap, 0xFF, bitmap_bytes);
 
     for (uint64_t i = 0; i < mm->entry_count; i++) {
@@ -105,11 +105,8 @@ void pmm_init(struct limine_memmap_response *mm) {
             usable_pages++;
         }
     }
-    /* reserve the bitmap itself and the first megabyte */
-    uint64_t bstart = hhdm_virt_to_phys(bitmap) / PAGE_SIZE;
-    for (uint64_t p = bstart; p < bstart + bitmap_bytes / PAGE_SIZE; p++) {
-        if (!is_used(p)) { set_used(p); free_pages--; }
-    }
+    /* what was given out before (the bitmap among it), and the first megabyte */
+    bootmem_handoff(reserve, NULL);
     for (uint64_t p = 0; p < 256 && p < total_pages; p++) {
         if (!is_used(p)) { set_used(p); free_pages--; }
     }
