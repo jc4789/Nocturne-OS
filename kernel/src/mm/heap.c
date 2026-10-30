@@ -1,309 +1,473 @@
-/* Kernel heap: an address-ordered block list whose free neighbours merge, and an index of the free
-   blocks by size (two-level segregated fit), so that a block is found in a few steps however many
-   blocks the heap holds (the store's cache alone holds tens of thousands).
+/* The kernel heap (mm/heap.h): an object smaller than a page from a slab of its size class, a
+   larger one as whole pages.
 
-   Any CPU allocates and frees, under heap_lock (taken before the kernel page tables' and pmm's).
-   The heap grows and backs released pages by adding mappings, which needs no shootdown; only the
-   heap's own task takes pages away (heap_trim). */
+   A slab is a run of 2^order frames used through the direct map, cut into objects of one class;
+   nothing is mapped or unmapped for it, so nothing waits for a TLB shootdown. Every frame of a
+   slab carries the heap's mark (pmm_mark): its class, its slab's order and home, and its slab's
+   record, so that kfree reads one frame record and no more. An object of pages is a run of
+   frames, its count in the first one's mark; when no run of free frames holds it, vmalloc's
+   pages, marked the same way.
+
+   Free objects wait in front of the slabs in chains linked through their first words. Each CPU
+   has three per class: `loaded`, taken from and given to; `previous`, full or empty, which with
+   loaded makes Bonwick's two magazines; and `away`, the objects of other homes' slabs, given back
+   to them a chain at a time. Behind them each node keeps a depot of full chains per class, which
+   a CPU's chain joins or leaves in one step. A CPU works its own chains with its interrupts off
+   (the kernel is not preempted) and takes no lock; a depot and the slabs behind it are under the
+   depot's lock.
+
+   A CPU's home is the node its memory comes from first (arch/topology.h). A slab belongs to the
+   home of the CPU that made it, wherever its frames came from: its depot lists it, and its objects
+   go back to that depot's chains or to the slab. A chain is B objects, B set per node and class
+   so that the chains of every CPU at home there (three and a share of the depot each) hold at
+   most 1/CACHE_SHARE of the node's memory, the share pmm's CPU caches keep too.
+
+   Locks: a depot's, never two at once and none inside it; pmm's are taken outside it. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/percpu.h"
 #include "arch/spin.h"
+#include "arch/topology.h"
 #include "mm/heap.h"
-#include "mm/vmm.h"
 #include "mm/pmm.h"
-#include "sys/sched.h"
+#include "mm/vmalloc.h"
+#include "mm/vmm.h"
 
-#define HEAP_MAGIC 0xC0FFEE42u
-/* struct block's free word: bit 0 free; the others only on a free block. */
-#define BLOCK_FREE     1u
-#define BLOCK_RELEASED 2u /* some whole payload pages went back to the page allocator */
-#define BLOCK_TRIM     4u /* large and holding backed payload pages worth releasing */
-/* A free block this large gives its interior pages back. Smaller ones keep
-   theirs: freeing and refilling them is common and costs TLB shootdowns. */
-#define TRIM_MIN (1ULL << 20)
+#define GRAIN 16 /* the classes up to SMALL: one per GRAIN bytes */
+#define SMALL_SHIFT 7
+#define SMALL (1u << SMALL_SHIFT)
+#define STEP_BITS 2 /* above SMALL: 2^STEP_BITS classes per power of two */
+#define STEPS (1u << STEP_BITS)
+#define PAGE_BITS __builtin_ctzll(PAGE_SIZE)
+/* every class below a page: the classes up to SMALL, then STEPS per power of two up to a page's */
+#define CLASSES (SMALL / GRAIN + STEPS * (PAGE_BITS - SMALL_SHIFT) - 1)
+/* A slab is at most 2^ORDER_MOST frames, at least OBJECTS_LEAST objects when that fits, and wastes
+   at most 1/WASTE of itself. Longer runs are the likelier to be missing as memory fragments (and
+   nothing here waits for them): when its run is missing a slab is one frame. */
+#define ORDER_MOST 3
+#define OBJECTS_LEAST 8
+#define WASTE 8
+#define CHAIN_MOST 64    /* the most objects a chain moves under a depot's lock */
+#define CACHE_SHARE 1024 /* as pmm's (mm/pmm.c) */
+#define CHAINS_PER_CPU 4 /* loaded, previous, away, and the one the depot keeps for it */
 
-struct block {
-    uint32_t magic;
-    uint32_t free;
-    uint64_t size; /* payload bytes */
-    struct block *prev, *next;           /* address order */
-    struct block *free_prev, *free_next; /* its size class's list, while free (a released block's
-                                            payload is not there to hold them) */
+enum { MARK_SLAB = 1, MARK_PAGES }; /* the kinds of the heap's marks; MARK_PAGES: word = frames */
+
+struct class {
+    uint32_t size;
+    uint32_t inverse; /* ceil(2^32 / size): an offset in a slab times it, >> 32, is its object's index */
+    uint8_t order;    /* its slabs' when that run is free */
+    uint16_t objects[ORDER_MOST + 1]; /* a slab's of each order */
+    bool inside[ORDER_MOST + 1];      /* a slab of that order keeps its record in its last bytes */
 };
 
-static struct block *head, *tail;
-static uint64_t heap_end = KHEAP_BASE;
-static uint64_t heap_used;
-static bool trim_pending;
-static struct wait_queue trim_wq;
-static struct spinlock heap_lock;
+/* A slab's record: in the slab's last bytes when they are room left over (and always in the record
+   class's own slabs), else an object of the record class. */
+struct slab {
+    struct slab *next, *prev; /* its depot's partial list */
+    void *free;               /* its objects given back, through their first words */
+    uintptr_t base;           /* its first byte (the direct map) */
+    uint32_t used;            /* its objects given out: in use or waiting in chains */
+    uint32_t fresh;           /* its objects from this index on were never given out */
+    uint16_t home;
+    uint8_t class, order;
+};
 
-/* The free blocks' size classes: below SMALL bytes one per 16 bytes, from there SL_COUNT for each
-   power of two. A bit of class_map says which lists of a power of two have blocks, a bit of
-   power_map which powers of two have any. */
-#define SL_BITS 4
-#define SL_COUNT (1u << SL_BITS)
-#define SMALL_SHIFT (SL_BITS + 4)
-#define SMALL (1ULL << SMALL_SHIFT)
-#define FL_COUNT (64 - SMALL_SHIFT + 1)
-static struct block *lists[FL_COUNT][SL_COUNT];
-static uint16_t class_map[FL_COUNT];
-static uint64_t power_map;
+struct depot {
+    struct spinlock lock;
+    struct slab *partial; /* its slabs that have objects to give, but the spare */
+    struct slab *spare;   /* one empty slab kept */
+    void **chains;        /* full chains: a chain's first object's second word is the next chain */
+    unsigned count, most; /* the chains it holds, and the most it keeps: one per CPU at home */
+} __attribute__((aligned(64)));
 
-static void class_of(uint64_t size, unsigned *fl, unsigned *sl) {
-    if (size < SMALL) {
-        *fl = 0;
-        *sl = (unsigned)(size >> 4);
+struct chain {
+    void **first;
+    unsigned count;
+};
+
+struct cpu_class {
+    struct chain loaded, previous, away;
+    unsigned most; /* B: its home's chain of the class */
+};
+
+PERCPU static struct heap_cpu {
+    struct cpu_class class[CLASSES];
+    int64_t used; /* bytes given out on this CPU less the bytes freed on it */
+    unsigned home;
+} heap_cpu;
+
+static struct class classes[CLASSES];
+static unsigned record_class;
+static struct depot **depots; /* [node][CLASSES]; NULL for a node that is no CPU's home */
+
+static unsigned class_of(size_t size) {
+    if (size <= SMALL) return size ? (unsigned)((size - 1) / GRAIN) : 0;
+    unsigned top = 63u - (unsigned)__builtin_clzll(size - 1); /* 2^top < size <= 2^(top+1) */
+    return SMALL / GRAIN + (top - SMALL_SHIFT) * STEPS + (unsigned)((size - 1 - (1ull << top)) >> (top - STEP_BITS));
+}
+
+static uint32_t mark_word(unsigned class, unsigned order, unsigned home) {
+    return class | order << 8 | home << 16;
+}
+
+static void chain_push(struct chain *c, void *p) {
+    *(void **)p = c->first;
+    c->first = p;
+    c->count++;
+}
+
+static void *chain_pop(struct chain *c) {
+    void **p = c->first;
+    c->first = *p;
+    c->count--;
+    return p;
+}
+
+static void account(int64_t bytes) {
+    uint64_t f = irq_save();
+    this_cpu(heap_cpu).used += bytes;
+    irq_restore(f);
+}
+
+/* ---- slabs (under their depot's lock) ---- */
+
+static bool slab_has(const struct slab *s) { return s->free || s->fresh < classes[s->class].objects[s->order]; }
+
+static void *slab_take(struct slab *s) {
+    void **p = s->free;
+    if (p) s->free = *p;
+    else p = (void **)(s->base + (uintptr_t)s->fresh++ * classes[s->class].size);
+    s->used++;
+    return p;
+}
+
+static void list_add(struct slab **list, struct slab *s) {
+    s->prev = NULL;
+    s->next = *list;
+    if (*list) (*list)->prev = s;
+    *list = s;
+}
+
+static void list_remove(struct slab **list, struct slab *s) {
+    if (s->next) s->next->prev = s->prev;
+    if (s->prev) s->prev->next = s->next;
+    else *list = s->next;
+}
+
+/* Objects of d's slabs into c until it holds want. */
+static void carve(struct depot *d, struct chain *c, unsigned want) {
+    while (c->count < want) {
+        struct slab *s = d->partial;
+        if (!s) {
+            if (!(s = d->spare)) return;
+            d->spare = NULL;
+            list_add(&d->partial, s);
+        }
+        while (c->count < want && slab_has(s)) chain_push(c, slab_take(s));
+        if (!slab_has(s)) list_remove(&d->partial, s);
+    }
+}
+
+/* Empty slabs back to pmm, once no lock is held: their frames, and their records. */
+static void release(struct slab *gone) {
+    while (gone) {
+        struct slab *s = gone;
+        gone = s->next;
+        uint64_t phys = hhdm_virt_to_phys((void *)s->base);
+        unsigned order = s->order;
+        bool inside = classes[s->class].inside[order];
+        if (order) pmm_free_contig(phys, 1ull << order);
+        else pmm_free(phys);
+        if (!inside) kfree(s);
+    }
+}
+
+/* A list of home's objects of class k (through their first words) back into their slabs. */
+static void to_slabs(unsigned home, unsigned k, void **first) {
+    /* each one's slab, found before the lock is taken: the frames' records are the cold reads */
+    for (void **p = first; p; p = *p) {
+        uint32_t word;
+        void *slab;
+        pmm_marked(hhdm_virt_to_phys(p), &word, &slab);
+        p[1] = slab;
+    }
+    struct depot *d = &depots[home][k];
+    struct slab *gone = NULL;
+    uint64_t f = spin_lock(&d->lock);
+    for (void **p = first, **next; p; p = next) {
+        next = *p;
+        struct slab *s = p[1];
+        bool listed = slab_has(s);
+        *p = s->free;
+        s->free = p;
+        if (--s->used) {
+            if (!listed) list_add(&d->partial, s);
+            continue;
+        }
+        if (listed) list_remove(&d->partial, s);
+        if (!d->spare) {
+            d->spare = s;
+        } else {
+            s->next = gone;
+            gone = s;
+        }
+    }
+    spin_unlock(&d->lock, f);
+    release(gone);
+}
+
+/* An away chain back to the homes of its objects, one home at a time. */
+static void send_away(unsigned k, struct chain *away) {
+    void **rest = away->first;
+    *away = (struct chain){0};
+    while (rest) {
+        uint32_t word;
+        void *slab;
+        pmm_marked(hhdm_virt_to_phys(rest), &word, &slab);
+        unsigned home = word >> 16;
+        void **mine = NULL, **others = NULL;
+        for (void **p = rest, **next; p; p = next) {
+            next = *p;
+            pmm_marked(hhdm_virt_to_phys(p), &word, &slab);
+            if (word >> 16 == home) {
+                *p = mine;
+                mine = p;
+            } else {
+                *p = others;
+                others = p;
+            }
+        }
+        to_slabs(home, k, mine);
+        rest = others;
+    }
+}
+
+/* Every depot's chains and spare slab back to pmm: memory ran short. */
+static void drain_depots(void) {
+    for (unsigned n = 0; n < topology.nodes; n++) {
+        if (!depots[n]) continue;
+        for (unsigned k = 0; k < CLASSES; k++) {
+            struct depot *d = &depots[n][k];
+            uint64_t f = spin_lock(&d->lock);
+            void **chains = d->chains;
+            struct slab *spare = d->spare;
+            d->chains = NULL;
+            d->count = 0;
+            d->spare = NULL;
+            spin_unlock(&d->lock, f);
+            for (void **next; chains; chains = next) {
+                next = chains[1];
+                to_slabs(n, k, chains);
+            }
+            if (spare) {
+                spare->next = NULL;
+                release(spare);
+            }
+        }
+    }
+}
+
+/* A new slab of class k for home, its frames marked; NULL without memory. Any interrupt state. */
+static struct slab *grow(unsigned k, unsigned home) {
+    const struct class *c = &classes[k];
+    unsigned order = c->order;
+    uint64_t phys = order ? pmm_alloc_run(1ull << order, home) : 0;
+    if (!phys) {
+        order = 0;
+        if (!(phys = pmm_alloc())) {
+            drain_depots();
+            phys = pmm_alloc();
+        }
+    }
+    if (!phys) return NULL;
+    uintptr_t base = (uintptr_t)phys_to_virt(phys);
+    struct slab *s = c->inside[order] ? (struct slab *)(base + (PAGE_SIZE << order) - sizeof *s) : kmalloc(sizeof *s);
+    if (!s) {
+        if (order) pmm_free_contig(phys, 1ull << order);
+        else pmm_free(phys);
+        return NULL;
+    }
+    *s = (struct slab){.base = base, .home = (uint16_t)home, .class = (uint8_t)k, .order = (uint8_t)order};
+    for (uint64_t i = 0; i < 1ull << order; i++) pmm_mark(phys + i * PAGE_SIZE, MARK_SLAB, mark_word(k, order, home), s);
+    return s;
+}
+
+/* ---- a CPU's chains (its interrupts off) ---- */
+
+/* An empty loaded chain from the home's depot: a full chain, else objects of its slabs (fresh, a new
+   slab, joins them first). It may stay empty. */
+static void refill(struct heap_cpu *h, unsigned k, struct slab *fresh) {
+    struct cpu_class *c = &h->class[k];
+    struct depot *d = &depots[h->home][k];
+    spin_take(&d->lock);
+    if (fresh) {
+        list_add(&d->partial, fresh);
+    } else if (d->chains) {
+        c->loaded = (struct chain){d->chains, c->most};
+        d->chains = d->chains[1];
+        d->count--;
+    }
+    if (!c->loaded.count) carve(d, &c->loaded, c->most);
+    spin_give(&d->lock);
+}
+
+/* A full chain to the home's depot, or back to the slabs when the depot has its most. */
+static void depot_put(struct heap_cpu *h, unsigned k, struct chain *c) {
+    struct depot *d = &depots[h->home][k];
+    void **first = c->first;
+    *c = (struct chain){0};
+    spin_take(&d->lock);
+    if (d->count < d->most) {
+        first[1] = d->chains;
+        d->chains = first;
+        d->count++;
+        spin_give(&d->lock);
         return;
     }
-    unsigned top = 63u - (unsigned)__builtin_clzll(size);
-    *fl = top - SMALL_SHIFT + 1;
-    *sl = (unsigned)(size >> (top - SL_BITS)) & (SL_COUNT - 1);
+    spin_give(&d->lock);
+    to_slabs(h->home, k, first);
 }
 
-static void list_add(struct block *b) {
-    unsigned fl, sl;
-    class_of(b->size, &fl, &sl);
-    b->free_prev = NULL;
-    b->free_next = lists[fl][sl];
-    if (b->free_next) b->free_next->free_prev = b;
-    lists[fl][sl] = b;
-    class_map[fl] |= (uint16_t)(1u << sl);
-    power_map |= 1ULL << fl;
-}
-
-static void list_remove(struct block *b) {
-    unsigned fl, sl;
-    class_of(b->size, &fl, &sl);
-    if (b->free_next) b->free_next->free_prev = b->free_prev;
-    if (b->free_prev) {
-        b->free_prev->free_next = b->free_next;
-    } else if (!(lists[fl][sl] = b->free_next)) {
-        class_map[fl] &= (uint16_t)~(1u << sl);
-        if (!class_map[fl]) power_map &= ~(1ULL << fl);
-    }
-}
-
-/* A free block of at least size bytes, or NULL. The size is rounded up to the next class, so any
-   block of the class found is large enough. */
-static struct block *find(uint64_t size) {
-    if (size >= SMALL) size += (1ULL << (63u - (unsigned)__builtin_clzll(size) - SL_BITS)) - 1;
-    unsigned fl, sl;
-    class_of(size, &fl, &sl);
-    unsigned classes = class_map[fl] & (~0u << sl);
-    if (!classes) {
-        uint64_t powers = power_map & (~0ULL << fl << 1);
-        if (!powers) return NULL;
-        fl = (unsigned)__builtin_ctzll(powers);
-        classes = class_map[fl];
-    }
-    return lists[fl][__builtin_ctz(classes)];
-}
-
-/* Maps pages at heap_end until bytes more are there; false when memory ran out first. The pages
-   mapped stay: the caller's block (the free tail, or a new one) takes whatever heap_end reached,
-   so it never covers pages that no block accounts for, and nothing is unmapped here. */
-static bool grow(uint64_t bytes) {
-    uint64_t end = heap_end + ALIGN_UP(bytes, PAGE_SIZE);
-    while (heap_end < end) {
-        uint64_t p = pmm_alloc();
-        if (!p || !vmm_map_page(kernel_pml4, heap_end, p, PTE_W | PTE_NX)) {
-            if (p) pmm_free(p);
-            return false;
+static void *slab_alloc(unsigned k) {
+    uint64_t f = irq_save();
+    for (;;) {
+        struct heap_cpu *h = this_cpu_ptr(heap_cpu);
+        struct cpu_class *c = &h->class[k];
+        if (!c->loaded.count && c->previous.count) {
+            c->loaded = c->previous;
+            c->previous = (struct chain){0};
         }
-        heap_end += PAGE_SIZE;
-    }
-    return true;
-}
-
-/* Pages of a released block are mapped again before its bytes are used. */
-static bool back(uint64_t start, uint64_t end) {
-    for (uint64_t a = ALIGN_DOWN(start, PAGE_SIZE); a < end; a += PAGE_SIZE) {
-        if (vmm_translate(kernel_pml4, a)) continue;
-        uint64_t p = pmm_alloc();
-        if (!p || !vmm_map_page(kernel_pml4, a, p, PTE_W | PTE_NX)) {
-            if (p) pmm_free(p);
-            return false; /* what was mapped stays: the block remains released */
+        if (!c->loaded.count) refill(h, k, NULL);
+        if (c->loaded.count) {
+            void *p = chain_pop(&c->loaded);
+            h->used += classes[k].size;
+            irq_restore(f);
+            return p;
         }
-    }
-    return true;
-}
-
-static void split(struct block *b, size_t size) {
-    if (b->size >= size + sizeof(struct block) + 32) {
-        struct block *n = (struct block *)((uint8_t *)(b + 1) + size);
-        n->magic = HEAP_MAGIC;
-        n->free = b->free; /* the remainder may lack pages, or still hold releasable ones */
-        n->size = b->size - size - sizeof(struct block);
-        n->prev = b;
-        n->next = b->next;
-        if (b->next) b->next->prev = n;
-        else tail = n;
-        b->next = n;
-        b->size = size;
-        list_add(n);
+        unsigned home = h->home;
+        irq_restore(f);
+        struct slab *s = grow(k, home); /* in the caller's interrupt state: pmm may take long */
+        f = irq_save();
+        if (!s) {
+            irq_restore(f);
+            return NULL;
+        }
+        refill(this_cpu_ptr(heap_cpu), k, s); /* the chains again: an interrupt may have filled them */
     }
 }
 
-/* Hands out free block b, which no list holds, for size bytes; false when its pages cannot be
-   backed (b is listed again). */
-static bool take(struct block *b, size_t size) {
-    if (b->free & BLOCK_RELEASED) {
-        /* The payload and the header split() may write after it. */
-        uint64_t start = (uint64_t)(b + 1), end = start + MIN(b->size, size + sizeof(struct block));
-        if (!back(start, end)) {
-            list_add(b);
-            return false;
+static void slab_free(void *p, uint32_t word) {
+    unsigned k = word & 0xFF, home = word >> 16;
+    uint64_t f = irq_save();
+    struct heap_cpu *h = this_cpu_ptr(heap_cpu);
+    struct cpu_class *c = &h->class[k];
+    h->used -= classes[k].size;
+    if (home == h->home) {
+        if (c->loaded.first == p) panic("kfree: %p freed twice", p);
+        if (c->loaded.count == c->most) {
+            if (c->previous.count) depot_put(h, k, &c->previous);
+            c->previous = c->loaded;
+            c->loaded = (struct chain){0};
+        }
+        chain_push(&c->loaded, p);
+    } else {
+        if (c->away.first == p) panic("kfree: %p freed twice", p);
+        chain_push(&c->away, p);
+        if (c->away.count == c->most) send_away(k, &c->away);
+    }
+    irq_restore(f);
+}
+
+/* ---- objects of pages ---- */
+
+static void *pages_alloc(size_t size, bool *zeroed) {
+    if (size > pmm_total_pages() * PAGE_SIZE) return NULL; /* nor does the rounding wrap */
+    uint64_t count = ALIGN_UP(size, PAGE_SIZE) / PAGE_SIZE;
+    if (count > UINT32_MAX) return NULL; /* the mark's word */
+    uint64_t phys = count == 1 ? pmm_alloc() : pmm_alloc_run(count, this_cpu(heap_cpu).home);
+    void *p = phys ? phys_to_virt(phys) : vmalloc(count);
+    if (!p) return NULL;
+    if (!phys) {
+        phys = vmm_translate(kernel_pml4, (uint64_t)p);
+        *zeroed = true;
+    }
+    pmm_mark(phys, MARK_PAGES, (uint32_t)count, NULL);
+    account((int64_t)(count * PAGE_SIZE));
+    return p;
+}
+
+/* ---- the interface ---- */
+
+/* What the heap gave at p: its kind, its first frame's mark word and physical address. Anything
+   else, an object's inside included, stops the system. */
+static unsigned object_at(const void *p, uint64_t *phys, uint32_t *word) {
+    uintptr_t va = (uintptr_t)p;
+    void *ref;
+    unsigned kind = 0;
+    if (va >= VMALLOC_BASE && va < VMALLOC_END) {
+        *phys = va & (PAGE_SIZE - 1) ? 0 : vmm_translate(kernel_pml4, va);
+        if (*phys && pmm_marked(*phys, word, &ref) == MARK_PAGES) kind = MARK_PAGES;
+    } else if (va >= hhdm_offset && va - hhdm_offset < pmm_page_count() * PAGE_SIZE) {
+        *phys = hhdm_virt_to_phys(p);
+        kind = pmm_marked(*phys, word, &ref);
+        if (kind == MARK_PAGES && *phys & (PAGE_SIZE - 1)) kind = 0;
+        if (kind == MARK_SLAB) {
+            const struct class *c = &classes[*word & 0xFF];
+            unsigned order = *word >> 8 & 0xFF;
+            uint64_t offset = *phys & ((PAGE_SIZE << order) - 1), index = offset * c->inverse >> 32;
+            if (index * c->size != offset || index >= c->objects[order]) kind = 0;
         }
     }
-    split(b, size);
-    b->free = 0;
-    heap_used += b->size;
-    return true;
+    if (kind != MARK_SLAB && kind != MARK_PAGES) panic("heap: %p, which the heap did not give", p);
+    return kind;
+}
+
+static void *alloc(size_t size, bool *zeroed) {
+    *zeroed = false;
+    return size <= classes[CLASSES - 1].size ? slab_alloc(class_of(size)) : pages_alloc(size, zeroed);
 }
 
 void *kmalloc(size_t size) {
-    if (size == 0) size = 1;
-    /* A size from user space (a channel message, a document) must not wrap
-       the alignment or the block header arithmetic into a tiny block. */
-    if (size > (uint64_t)1 << 40) return NULL;
-    size = ALIGN_UP(size, 16);
-    uint64_t f = spin_lock(&heap_lock);
-    struct block *b = find(size);
-    if (b) {
-        list_remove(b);
-    } else if (tail && tail->free) { /* the heap grows under its last block */
-        b = tail;
-        list_remove(b);
-        bool grown = b->size >= size || grow(size - b->size);
-        b->size = heap_end - (uint64_t)(b + 1);
-        if (!grown) {
-            list_add(b);
-            spin_unlock(&heap_lock, f);
-            return NULL;
-        }
-    } else {
-        uint64_t start = heap_end;
-        bool grown = grow(size + sizeof(struct block));
-        if (heap_end - start <= sizeof(struct block)) { /* not even a header's room */
-            spin_unlock(&heap_lock, f);
-            return NULL;
-        }
-        b = (struct block *)start;
-        b->magic = HEAP_MAGIC;
-        b->prev = tail;
-        b->next = NULL;
-        b->size = heap_end - start - sizeof(struct block);
-        b->free = BLOCK_FREE;
-        if (tail) tail->next = b;
-        else head = b;
-        tail = b;
-        if (!grown) {
-            list_add(b);
-            spin_unlock(&heap_lock, f);
-            return NULL;
-        }
-    }
-    bool ok = take(b, size);
-    spin_unlock(&heap_lock, f);
-    return ok ? b + 1 : NULL;
+    bool zeroed;
+    return alloc(size, &zeroed);
 }
 
 void *kzalloc(size_t size) {
-    void *p = kmalloc(size);
-    if (p) memset(p, 0, size);
+    bool zeroed;
+    void *p = alloc(size, &zeroed);
+    if (p && !zeroed) memset(p, 0, size);
     return p;
 }
 
 void kfree(void *p) {
     if (!p) return;
-    struct block *b = (struct block *)p - 1;
-    if (b->magic != HEAP_MAGIC || b->free) {
-        panic("kfree: bad pointer %p (magic %x free %d)", p, b->magic, b->free);
+    uint64_t phys;
+    uint32_t word;
+    if (object_at(p, &phys, &word) == MARK_SLAB) {
+        slab_free(p, word);
+        return;
     }
-    uint64_t f = spin_lock(&heap_lock);
-    b->free = BLOCK_FREE;
-    heap_used -= b->size;
-    struct block *n = b->next;
-    if (n && n->free) {
-        list_remove(n);
-        b->free |= n->free;
-        b->size += sizeof(struct block) + n->size;
-        b->next = n->next;
-        if (n->next) n->next->prev = b;
-        else tail = b;
-        n->magic = 0;
+    account(-(int64_t)((uint64_t)word * PAGE_SIZE));
+    if ((uintptr_t)p >= VMALLOC_BASE && (uintptr_t)p < VMALLOC_END) {
+        pmm_mark(phys, 0, 0, NULL); /* its frames stay in use, mapped, until vmalloc purges them */
+        vfree(p, word);
+    } else if (word == 1) {
+        pmm_free(phys);
+    } else {
+        pmm_free_contig(phys, word);
     }
-    struct block *pr = b->prev;
-    if (pr && pr->free) {
-        list_remove(pr);
-        pr->free |= b->free;
-        pr->size += sizeof(struct block) + b->size;
-        pr->next = b->next;
-        if (b->next) b->next->prev = pr;
-        else tail = pr;
-        b->magic = 0;
-        b = pr;
-    }
-    /* The freed bytes are backed: a large block has pages to give back. */
-    bool trim = b->size >= TRIM_MIN;
-    if (trim) { b->free |= BLOCK_TRIM; trim_pending = true; }
-    list_add(b);
-    spin_unlock(&heap_lock, f);
-    if (trim) wq_wake_all(&trim_wq);
-}
-
-/* Gives the interior pages of large free blocks back to the page allocator.
-   Runs in the heap's own task: never inside kfree, whose callers may hold
-   spinlocks, under which a long walk and its TLB shootdowns would keep other CPUs waiting.
-   Blocks of TRIM_MIN bytes and more are in the classes from TRIM_MIN's on. */
-static void heap_trim(void) {
-    struct vmm_gather g;
-    vmm_gather_init(&g, kernel_pml4);
-    uint64_t f = spin_lock(&heap_lock);
-    trim_pending = false;
-    unsigned first_fl, first_sl;
-    class_of(TRIM_MIN, &first_fl, &first_sl);
-    for (unsigned fl = first_fl; fl < FL_COUNT; fl++)
-        for (unsigned sl = 0; sl < SL_COUNT; sl++)
-            for (struct block *b = lists[fl][sl]; b; b = b->free_next) {
-                if (!(b->free & BLOCK_TRIM)) continue;
-                b->free &= ~BLOCK_TRIM;
-                uint64_t first = ALIGN_UP((uint64_t)(b + 1), PAGE_SIZE);
-                uint64_t last = ALIGN_DOWN((uint64_t)(b + 1) + b->size, PAGE_SIZE);
-                if (last <= first) continue;
-                vmm_kernel_unmap(&g, first, (last - first) / PAGE_SIZE, true); /* the mapped pages */
-                b->free |= BLOCK_RELEASED;
-            }
-    /* under heap_lock still: no block is backed again before the old translations are gone */
-    vmm_gather_finish(&g);
-    spin_unlock(&heap_lock, f);
-}
-
-static void heap_thread(void *arg) {
-    (void)arg;
-    for (;;) {
-        /* kfree sets trim_pending under heap_lock and wakes trim_wq after: looked at under the
-           lock, no large free is missed. */
-        uint64_t f = spin_lock(&heap_lock);
-        if (!trim_pending) wq_wait_locked(&trim_wq, &heap_lock);
-        else spin_give(&heap_lock);
-        irq_restore(f);
-        heap_trim();
-    }
-}
-
-void heap_trim_start(void) {
-    kthread_create("heap", heap_thread, NULL);
 }
 
 void *krealloc(void *p, size_t size) {
     if (!p) return kmalloc(size);
-    struct block *b = (struct block *)p - 1;
-    if (b->size >= size) return p;
+    uint64_t phys;
+    uint32_t word;
+    size_t have = object_at(p, &phys, &word) == MARK_SLAB ? classes[word & 0xFF].size : (size_t)word * PAGE_SIZE;
+    if (have >= size) return p;
     void *n = kmalloc(size);
     if (!n) return NULL;
-    memcpy(n, p, b->size);
+    memcpy(n, p, have);
     kfree(p);
     return n;
 }
@@ -321,5 +485,80 @@ void *kappend(void *array_at, size_t *count, size_t *room, size_t size) {
     return (uint8_t *)*array + (*count)++ * size;
 }
 
-uint64_t heap_used_bytes(void) { return heap_used; }
-uint64_t heap_size_bytes(void) { return heap_end - KHEAP_BASE; }
+uint64_t heap_used_bytes(void) {
+    int64_t used = 0;
+    for (unsigned i = 0; i < topology.cpus; i++) used += __atomic_load_n(&per_cpu(heap_cpu, i).used, __ATOMIC_RELAXED);
+    return used > 0 ? (uint64_t)used : 0;
+}
+
+void heap_cpu_gone(unsigned cpu) {
+    struct heap_cpu *h = &per_cpu(heap_cpu, cpu);
+    for (unsigned k = 0; k < CLASSES; k++) {
+        struct cpu_class *c = &h->class[k];
+        if (c->loaded.first) to_slabs(h->home, k, c->loaded.first);
+        if (c->previous.first) to_slabs(h->home, k, c->previous.first);
+        if (c->away.first) send_away(k, &c->away);
+        c->loaded = c->previous = (struct chain){0};
+    }
+}
+
+/* ---- building it ---- */
+
+static void lay_out(struct class *c, unsigned order, bool record) {
+    uint32_t bytes = (uint32_t)(PAGE_SIZE << order), objects = bytes / c->size;
+    bool inside = record || bytes - objects * c->size >= sizeof(struct slab);
+    if (inside) objects = (bytes - (uint32_t)sizeof(struct slab)) / c->size;
+    c->objects[order] = (uint16_t)objects;
+    c->inside[order] = inside;
+}
+
+static void *node_pages(uint64_t bytes, unsigned node) {
+    uint64_t phys = pmm_alloc_run(ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE, node);
+    if (!phys) panic("heap: no memory for its depots");
+    return memset(phys_to_virt(phys), 0, bytes);
+}
+
+void heap_init(void) {
+    if (topology.nodes > 1u << 16) panic("heap: %u nodes do not fit a mark", topology.nodes);
+    record_class = class_of(sizeof(struct slab));
+    for (unsigned k = 0; k < CLASSES; k++) {
+        struct class *c = &classes[k];
+        if (k < SMALL / GRAIN) {
+            c->size = (k + 1) * GRAIN;
+        } else {
+            unsigned j = k - SMALL / GRAIN, top = SMALL_SHIFT + j / STEPS;
+            c->size = (1u << top) + ((j % STEPS + 1) << (top - STEP_BITS));
+        }
+        c->inverse = (uint32_t)(((1ull << 32) + c->size - 1) / c->size);
+        c->order = ORDER_MOST;
+        for (unsigned order = ORDER_MOST + 1; order--;) lay_out(c, order, k == record_class);
+        for (unsigned order = 0; order <= ORDER_MOST; order++) {
+            uint32_t bytes = (uint32_t)(PAGE_SIZE << order), waste = bytes - c->objects[order] * c->size;
+            if (c->objects[order] >= OBJECTS_LEAST && waste <= bytes / WASTE) {
+                c->order = (uint8_t)order;
+                break;
+            }
+        }
+    }
+
+    depots = node_pages(topology.nodes * sizeof *depots, topology.cpu[0].home);
+    for (unsigned n = 0; n < topology.nodes; n++) {
+        unsigned cpus = topology.node[n].homed;
+        if (!cpus) continue;
+        struct depot *d = depots[n] = node_pages(CLASSES * sizeof *d, n);
+        /* the node's memory: the SRAT's, or the RAM shared out when it gives none */
+        uint64_t bytes = topology.node[n].bytes ? topology.node[n].bytes : pmm_total_pages() * PAGE_SIZE / topology.nodes;
+        uint64_t chain = bytes / ((uint64_t)CACHE_SHARE * cpus * CLASSES * CHAINS_PER_CPU);
+        for (unsigned k = 0; k < CLASSES; k++) d[k].most = cpus;
+        kprintf("heap: node %u: %u CPUs at home, chains of %u (%u bytes) to %u (%u bytes) objects\n", n, cpus,
+                (unsigned)MIN(MAX(chain / classes[0].size, 1), CHAIN_MOST), classes[0].size,
+                (unsigned)MIN(MAX(chain / classes[CLASSES - 1].size, 1), CHAIN_MOST), classes[CLASSES - 1].size);
+        for (unsigned i = 0; i < topology.cpus; i++) {
+            if (topology.cpu[i].home != n) continue;
+            struct heap_cpu *h = &per_cpu(heap_cpu, i);
+            h->home = n;
+            for (unsigned k = 0; k < CLASSES; k++)
+                h->class[k].most = (unsigned)MIN(MAX(chain / classes[k].size, 1), CHAIN_MOST);
+        }
+    }
+}

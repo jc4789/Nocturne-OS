@@ -83,7 +83,6 @@ bool cmdline_number(const char *key, uint64_t *out) {
 
 void kmain_late(void) {
     entropy_init();
-    heap_trim_start();
     vmalloc_purge_start();
     acpi_init();
     pm_init(); /* the power thread: every shutdown and restart goes through it */

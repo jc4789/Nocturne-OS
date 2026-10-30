@@ -1,5 +1,6 @@
 #pragma once
-/* The physical page allocator: 4 KiB frames, from the memory of the calling CPU's node first.
+/* The physical page allocator: 4 KiB frames, from the memory of the calling CPU's home first
+   (its node, or the nearest with memory: arch/topology.h).
    Any CPU, any context with interrupts on or off; it never sleeps. */
 #include <stdbool.h>
 #include <stdint.h>
@@ -13,6 +14,10 @@ uint64_t pmm_alloc_within(unsigned bits);
 /* count contiguous frames whose addresses have at most bits bits, at an address that is a multiple
    of the power of two at or above count pages; 0 when there is no such run. */
 uint64_t pmm_alloc_contig(uint64_t count, unsigned bits);
+/* count contiguous frames, aligned as pmm_alloc_contig's, from node's memory first and then the
+   nearest, as the nodes' free blocks are now: 0 when none holds them, the CPUs' caches left as
+   they are (for an allocation that has another way). */
+uint64_t pmm_alloc_run(uint64_t count, unsigned node);
 void pmm_free(uint64_t phys);
 void pmm_free_contig(uint64_t phys, uint64_t count); /* count frames from phys, as pmm_free each */
 /* Frames in use whose freeing must wait (until a TLB shootdown): each joins the list through its
@@ -24,6 +29,11 @@ struct pmm_list {
 };
 void pmm_list_add(struct pmm_list *l, uint64_t phys);
 void pmm_list_free(struct pmm_list *l);
+/* A frame in use carries its user's mark in its record: a kind (the user's numbering, not 0), a
+   word and a pointer. A frame is handed out unmarked; pmm never reads a mark. pmm_marked gives the
+   kind, 0 when the frame is unmarked, not in use or no RAM, and then leaves word and ref alone. */
+void pmm_mark(uint64_t phys, uint8_t kind, uint32_t word, void *ref);
+uint8_t pmm_marked(uint64_t phys, uint32_t *word, void **ref);
 /* Frames free on the nodes: the few waiting in the CPUs' caches are not counted. */
 uint64_t pmm_free_pages(void);
 /* Usable RAM below 1 MiB (the allocator never hands it out): base and page count, 0 when none. */

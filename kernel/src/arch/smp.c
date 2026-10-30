@@ -296,9 +296,10 @@ static void start_wait(unsigned count, unsigned before, const char *after) {
         uint32_t state = START_WAITING;
         if (__atomic_compare_exchange_n(&c->start, &state, START_EXCLUDED, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             kprintf("smp: cpu%u did not start%s; excluded\n", i, after);
-        else if (state == START_FAILED)
+        else if (state == START_FAILED) {
             kprintf("smp: cpu%u failed its checks%s; excluded\n", i, after);
-        else if (state == START_ARRIVED)
+            heap_cpu_gone(i); /* it halted on answering; one that never answered may still run */
+        } else if (state == START_ARRIVED)
             arrived++;
         /* not waiting: one that comes late still finds it so */
         __atomic_store_n(&c->start, START_NONE, __ATOMIC_RELAXED);
@@ -383,6 +384,7 @@ void smp_resume(void) {
         uint32_t apic_id = topology.cpu[i].apic_id;
         if (!lapic_send_init(apic_id)) {
             kprintf("smp: cpu%u could not be sent INIT after sleep; excluded\n", i);
+            heap_cpu_gone(i); /* halted for the sleep */
             continue;
         }
         /* ap_main as if called: the return address slot below an aligned top */

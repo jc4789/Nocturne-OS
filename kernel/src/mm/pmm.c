@@ -7,7 +7,7 @@
    same number of bits ([2^k, 2^(k+1)) from 1 MiB up), so that a device's DMA width picks bands
    rather than frames; an allocation without a width takes from the highest band, which leaves low
    memory to the devices that need it. In front of the nodes each CPU caches single frames of its
-   own node, filled and drained a batch at a time, so that most allocations and frees take no lock
+   home node, filled and drained a batch at a time, so that most allocations and frees take no lock
    another CPU takes.
 
    Locks: a CPU's cache (its own; another CPU takes it only when memory runs short), then a
@@ -38,12 +38,22 @@
 enum { RESERVED, USED, FREE, TAIL, CACHED, LISTED };
 
 struct frame {
-    struct frame *next, *prev; /* FREE: its band's list of its order; CACHED: its cache's; LISTED: next */
-    uint64_t pfn;              /* set once the frame is the allocator's (not RESERVED) */
-    uint32_t cpu;              /* CACHED: whose cache */
+    union {
+        struct frame *next; /* FREE: its band's list of its order; CACHED: its cache's; LISTED: next */
+        void *mark_ref;     /* USED: its user's (pmm_mark) */
+    };
+    struct frame *prev;
+    uint64_t pfn; /* set once the frame is the allocator's (not RESERVED) */
+    union {
+        uint32_t cpu;       /* CACHED: whose cache */
+        uint32_t mark_word; /* USED: its user's */
+    };
     uint16_t node;
-    uint8_t order;             /* FREE: its block's */
-    uint8_t state;             /* FREE heads a free block, TAIL is the rest of one */
+    union {
+        uint8_t order; /* FREE: its block's */
+        uint8_t mark;  /* USED: its user's kind, 0 for none; handed out 0 */
+    };
+    uint8_t state; /* FREE heads a free block, TAIL is the rest of one */
 };
 _Static_assert(sizeof(struct frame) == 32, "a frame's record is 32 bytes");
 
@@ -138,6 +148,15 @@ static struct frame *frame_of(uint64_t pfn) {
 
 static void set_state(uint64_t pfn, uint64_t count, uint8_t state) {
     for (uint64_t i = 0; i < count; i++) frame_of(pfn + i)->state = state;
+}
+
+/* count frames from pfn become the caller's: used and unmarked. */
+static void hand_out(uint64_t pfn, uint64_t count) {
+    for (uint64_t i = 0; i < count; i++) {
+        struct frame *f = frame_of(pfn + i);
+        f->state = USED;
+        f->mark = 0;
+    }
 }
 
 static unsigned band_of(uint64_t pfn) { return 63u - (unsigned)__builtin_clzll(pfn) - BAND_SHIFT; }
@@ -248,6 +267,7 @@ static void isolate(struct node *n, struct frame *f) {
         }
     }
     f->state = USED;
+    f->mark = 0;
     n->free--;
 }
 
@@ -261,7 +281,7 @@ static struct frame *from_nodes(unsigned home, uint64_t count, unsigned order, u
         uint64_t flags = spin_lock(&n->lock);
         struct frame *f = take(n, order, bands);
         if (f) {
-            set_state(f->pfn, count, USED);
+            hand_out(f->pfn, count);
             for (uint64_t at = f->pfn + count, end = f->pfn + (1ull << order); at < end;) {
                 unsigned k = block_at(at, end);
                 give(n, at, k);
@@ -300,6 +320,7 @@ static struct frame *cache_take(struct cache *c) {
     if (f) {
         cache_unlink(c, f);
         f->state = USED;
+        f->mark = 0;
     }
     return f;
 }
@@ -373,16 +394,27 @@ uint64_t pmm_alloc_zeroed(void) {
     return p;
 }
 
-uint64_t pmm_alloc_contig(uint64_t count, unsigned bits) {
-    if (!count || count > 1ull << (ORDERS - 1)) return 0;
+/* count frames from a block of the bands, home's or the nearest node's that has one, as the nodes
+   are. */
+static struct frame *run(uint64_t count, uint64_t bands, unsigned home) {
+    if (!count || count > 1ull << (ORDERS - 1) || home >= nnodes) return NULL;
     unsigned order = count == 1 ? 0 : 64u - (unsigned)__builtin_clzll(count - 1);
+    return from_nodes(home, count, order, bands);
+}
+
+uint64_t pmm_alloc_contig(uint64_t count, unsigned bits) {
     uint64_t bands = bands_within(bits);
     unsigned home = this_cpu(cpu_cache).node;
-    struct frame *f = from_nodes(home, count, order, bands);
-    if (!f) {
+    struct frame *f = run(count, bands, home);
+    if (!f && count && count <= 1ull << (ORDERS - 1)) {
         drain_all();
-        f = from_nodes(home, count, order, bands);
+        f = run(count, bands, home);
     }
+    return f ? f->pfn * PAGE_SIZE : 0;
+}
+
+uint64_t pmm_alloc_run(uint64_t count, unsigned node) {
+    struct frame *f = run(count, ~0ull, node);
     return f ? f->pfn * PAGE_SIZE : 0;
 }
 
@@ -409,6 +441,22 @@ void pmm_free(uint64_t phys) {
     uint64_t flags = spin_lock(&n->lock);
     give(n, f->pfn, 0);
     spin_unlock(&n->lock, flags);
+}
+
+void pmm_mark(uint64_t phys, uint8_t kind, uint32_t word, void *ref) {
+    struct frame *f = frame_of(phys / PAGE_SIZE);
+    if (!f || f->state != USED) panic("pmm: %p marked, which is %s", (void *)phys, f ? "not in use" : "no RAM");
+    f->mark_ref = ref;
+    f->mark_word = word;
+    f->mark = kind;
+}
+
+uint8_t pmm_marked(uint64_t phys, uint32_t *word, void **ref) {
+    const struct frame *f = frame_of(phys / PAGE_SIZE);
+    if (!f || f->state != USED || !f->mark) return 0;
+    *word = f->mark_word;
+    *ref = f->mark_ref;
+    return f->mark;
 }
 
 void pmm_list_add(struct pmm_list *l, uint64_t phys) {
@@ -484,6 +532,7 @@ bool pmm_claim(uint64_t pfn) {
             if ((claimed = f->state == CACHED && f->cpu == c->cpu)) {
                 cache_unlink(c, f);
                 f->state = USED;
+                f->mark = 0;
             }
             spin_unlock(&c->lock, flags);
         } else {
@@ -571,7 +620,7 @@ void pmm_init(struct limine_memmap_response *mm) {
 
     for (unsigned i = 0; i < nnodes; i++) {
         struct node *n = nodes[i];
-        unsigned cpus = topology.node[i].cpus;
+        unsigned cpus = topology.node[i].homed;
         if (!cpus) continue;
         uint64_t high = MAX(n->frames / ((uint64_t)CACHE_SHARE * cpus), 1);
         n->high = (unsigned)MIN(high, UINT32_MAX);
@@ -581,7 +630,7 @@ void pmm_init(struct limine_memmap_response *mm) {
     for (unsigned i = 0; i < topology.cpus; i++) {
         struct cache *c = &per_cpu(cpu_cache, i);
         c->cpu = i;
-        c->node = topology.cpu[i].node;
+        c->node = topology.cpu[i].home;
         c->high = nodes[c->node]->high;
         c->batch = nodes[c->node]->batch;
     }
@@ -602,10 +651,10 @@ void pmm_init(struct limine_memmap_response *mm) {
             records * sizeof(struct frame) >> 20, nsections, nbands);
     for (unsigned i = 0; i < nnodes; i++) {
         const struct node *n = nodes[i];
-        if (topology.node[i].cpus)
-            kprintf("memory: node %u: %lu MiB free, each of its %u CPUs caches up to %u frames, %u at a time\n", i,
-                    (uint64_t)(n->free * PAGE_SIZE >> 20), topology.node[i].cpus, n->high, n->batch);
+        if (topology.node[i].homed)
+            kprintf("memory: node %u: %lu MiB free, each of the %u CPUs at home caches up to %u frames, %u at a time\n",
+                    i, (uint64_t)(n->free * PAGE_SIZE >> 20), topology.node[i].homed, n->high, n->batch);
         else
-            kprintf("memory: node %u: %lu MiB free, no CPUs\n", i, (uint64_t)(n->free * PAGE_SIZE >> 20));
+            kprintf("memory: node %u: %lu MiB free, home of no CPUs\n", i, (uint64_t)(n->free * PAGE_SIZE >> 20));
     }
 }

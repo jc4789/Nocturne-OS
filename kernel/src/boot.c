@@ -101,6 +101,7 @@ void kmain(void) {
     bootmem_by_node();
     percpu_init();
     pmm_init(mm);
+    heap_init();
     vmm_init(mm, ka_req.response);
     vmalloc_init();
     if (!entry_stacks_init()) panic("boot: no memory for the interrupt stacks");

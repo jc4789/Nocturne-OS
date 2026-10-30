@@ -254,11 +254,26 @@ static const struct acpi_slit *read_slit(void) {
     return s;
 }
 
-static void one_node(void) {
+/* Each CPU's home: its own node when the SRAT gives that memory, else the nearest node it gives
+   memory to (a CPU of a memory-less node), else its own (no SRAT memory at all: one node). */
+static void place_homes(struct cpu_place *cpu, struct numa_node *node, unsigned nodes, const uint8_t *distance) {
+    for (unsigned i = 0; i < topology.cpus; i++) {
+        unsigned own = cpu[i].node, home = own;
+        const uint8_t *from = &distance[own * nodes];
+        if (!node[own].bytes)
+            for (unsigned j = 0; j < nodes; j++)
+                if (node[j].bytes && (home == own || from[j] < from[home])) home = j;
+        cpu[i].home = home;
+        node[home].homed++;
+    }
+}
+
+static void one_node(struct cpu_place *cpu) {
     struct numa_node *node = bootmem_alloc(sizeof *node, 64);
     uint8_t *distance = bootmem_alloc(1, 1);
     node->cpus = topology.cpus;
     distance[0] = LOCAL_DISTANCE;
+    place_homes(cpu, node, 1, distance);
     topology.node = node;
     topology.nodes = 1;
     topology.distance = distance;
@@ -274,7 +289,7 @@ static void read_nodes(struct cpu_place *cpu) {
         else if (memory_affinity(e)) nmem++;
     }
     if (!ncpu && !nmem) {
-        one_node();
+        one_node(cpu);
         kprintf("numa: %s: one node\n", srat ? "the SRAT names no domain" : "no SRAT");
         return;
     }
@@ -333,6 +348,7 @@ static void read_nodes(struct cpu_place *cpu) {
                                           : i == j ? LOCAL_DISTANCE : REMOTE_DISTANCE;
         }
 
+    place_homes(cpu, node, nodes, distance);
     topology.node = node;
     topology.nodes = nodes;
     topology.range = range;
@@ -342,8 +358,8 @@ static void read_nodes(struct cpu_place *cpu) {
     for (unsigned i = 0; i < nodes; i++) {
         char hot[48] = "";
         if (node[i].hotplug_bytes) ksnprintf(hot, sizeof hot, ", %lu MiB of it hot-pluggable", node[i].hotplug_bytes >> 20);
-        kprintf("numa: node %u (domain %u): %u CPUs, %lu MiB%s%s\n", i, node[i].domain, node[i].cpus,
-                node[i].bytes >> 20, hot, node[i].cpus ? "" : " (memory only)");
+        kprintf("numa: node %u (domain %u): %u CPUs, %lu MiB%s%s, home of %u CPUs\n", i, node[i].domain,
+                node[i].cpus, node[i].bytes >> 20, hot, node[i].cpus ? "" : " (memory only)", node[i].homed);
     }
     if (nodes > 1)
         for (unsigned i = 0; i < nodes; i++) {

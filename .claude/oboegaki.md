@@ -105,5 +105,5 @@ isr.asm の REGS_* の位置と FRAME_BYTES（私的な語一つ＋struct regs�
 
 ## AP は ap_main の write_cr3 まで limine の頁表で走る
 対象: kernel/src/arch/smp.c, kernel/src/mm/vmalloc.c, kernel/src/mm/heap.c
-確かめた: 2026-10-30（段①の 13-1、未コミット）
-limine が起こした AP の CR3 は limine の表（QEMU で 0xbff7d000）で、直写像と核の像しか写していない：heap と vmalloc の番地は無い。ap_main は write_cr3(kernel_pml4) を cpu_setup・mtrr_sync・PAT の確かめの直後に置き、その前で kmalloc・vmalloc・entry_stacks_init を呼ばない。13-1 の最初の起動で、entry_stacks_init の中の vmalloc の kzalloc が AP で頁違反（CR2 ffffc00000003250）になり、panic の文は serial に出ず klog（klog_buf・klog_head）を HMP の x で読んで分かった。
+確かめた: 2026-10-30（段①の 3b、未コミット）
+limine が起こした AP の CR3 は limine の表（QEMU で 0xbff7d000）で、直写像と核の像しか写していない：vmalloc の番地は無い（heap の slab と頁の物は直写像にあるが、続いた frame が無いときの大きな物と、CPU ごとの節の写しより前の GS は使えない）。ap_main は write_cr3(kernel_pml4) を cpu_setup・mtrr_sync・PAT の確かめの直後に置き、その前で kmalloc・vmalloc・entry_stacks_init を呼ばない。13-1 の最初の起動で、entry_stacks_init の中の vmalloc の kzalloc が AP で頁違反（CR2 ffffc00000003250）になり、panic の文は serial に出ず klog（klog_buf・klog_head）を HMP の x で読んで分かった。

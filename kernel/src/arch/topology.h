@@ -16,11 +16,13 @@ struct cpu_place {
     unsigned die;     /* the socket's own where the CPU names no die level */
     unsigned socket;
     unsigned node;
+    unsigned home;    /* the node its memory comes from first: its own, or the nearest with memory */
 };
 
 struct numa_node {
     uint32_t domain;        /* the ACPI proximity domain */
     unsigned cpus;          /* none: memory only (CXL memory, ...) */
+    unsigned homed;         /* the CPUs whose home it is */
     uint64_t bytes;         /* its enabled memory ranges, the hot-pluggable ones among them */
     uint64_t hotplug_bytes;
 };

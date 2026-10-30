@@ -132,20 +132,6 @@ void vfree(void *p, size_t pages) {
     if (full) wq_wake_all(&purge_wq);
 }
 
-void *vmalloc(size_t pages) {
-    uint64_t va = take(pages, true);
-    if (!va) return NULL;
-    for (size_t i = 0; i < pages; i++) {
-        uint64_t frame = pmm_alloc_zeroed();
-        if (!frame || !vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, frame, PTE_W | PTE_NX)) {
-            if (frame) pmm_free(frame);
-            vfree((void *)va, pages); /* the pages mapped so far go with the range */
-            return NULL;
-        }
-    }
-    return (void *)va;
-}
-
 static void give_back_now(struct area *a) {
     struct area *spare = NULL;
     uint64_t f = spin_lock(&lock);
@@ -154,12 +140,36 @@ static void give_back_now(struct area *a) {
     free_records(spare);
 }
 
-/* Unmapped and shot down at once: the frames stay the mapper's. */
-static void unmap_now(uint64_t va, size_t pages) {
+/* Unmapped and shot down at once; the frames freed after, when they are the range's own. */
+static void unmap_now(uint64_t va, size_t pages, bool frames) {
     struct vmm_gather g;
     vmm_gather_init(&g, kernel_pml4);
-    vmm_kernel_unmap(&g, va, pages, false);
+    vmm_kernel_unmap(&g, va, pages, frames);
     vmm_gather_finish(&g);
+}
+
+/* A range that could not be filled, its first mapped pages mapped: given back at once with what
+   was mapped, since no one was handed it (a retired range would hold its frames until a purge). */
+static void unfilled(uint64_t va, size_t pages, size_t mapped, bool frames) {
+    uint64_t f = spin_lock(&lock);
+    struct area *a = busy_take(va, pages, frames);
+    spin_unlock(&lock, f);
+    unmap_now(va, mapped, frames);
+    give_back_now(a);
+}
+
+void *vmalloc(size_t pages) {
+    uint64_t va = take(pages, true);
+    if (!va) return NULL;
+    for (size_t i = 0; i < pages; i++) {
+        uint64_t frame = pmm_alloc_zeroed();
+        if (!frame || !vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, frame, PTE_W | PTE_NX)) {
+            if (frame) pmm_free(frame);
+            unfilled(va, pages, i, true);
+            return NULL;
+        }
+    }
+    return (void *)va;
 }
 
 static void *map_frames(const uint64_t *frames, uint64_t pa, size_t pages, uint64_t flags) {
@@ -167,11 +177,7 @@ static void *map_frames(const uint64_t *frames, uint64_t pa, size_t pages, uint6
     if (!va) return NULL;
     for (size_t i = 0; i < pages; i++)
         if (!vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, frames ? frames[i] : pa + i * PAGE_SIZE, flags)) {
-            uint64_t f = spin_lock(&lock);
-            struct area *a = busy_take(va, pages, false);
-            spin_unlock(&lock, f);
-            unmap_now(va, i);
-            give_back_now(a);
+            unfilled(va, pages, i, false);
             return NULL;
         }
     return (void *)va;
@@ -186,7 +192,7 @@ void vunmap(void *p, size_t pages) {
     uint64_t f = spin_lock(&lock);
     struct area *a = busy_take((uint64_t)p, pages, false);
     spin_unlock(&lock, f);
-    unmap_now((uint64_t)p, pages);
+    unmap_now((uint64_t)p, pages, false);
     give_back_now(a);
 }
 
