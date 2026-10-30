@@ -6,13 +6,14 @@
 #include "dev/input.h"
 #include "dev/usb.h"
 #include "mm/heap.h"
+#include "sys/clock.h"
 
 #define HID_GET_REPORT_DESC 0x06
 #define HID_SET_REPORT 0x09
 #define HID_SET_IDLE 0x0A
 #define HID_SET_PROTOCOL 0x0B
-#define REPEAT_DELAY 500
-#define REPEAT_RATE 33
+#define REPEAT_DELAY (500 * NS_PER_MS)
+#define REPEAT_RATE (33 * NS_PER_MS)
 
 struct value { /* one parsed input value */
     uint16_t bit, size;
@@ -141,7 +142,7 @@ static void key_report(struct hid *h, uint8_t report, const uint8_t *data, unsig
     /* a modifier pressed in the same report as a key applies to it, and one released in the same
      * report as a key still applied to it: modifier presses first, then key releases and key
      * presses, then modifier releases */
-    uint64_t now = uptime_ms();
+    uint64_t now = clock_now_ns();
     for (unsigned u = 0xE0; u < 0xE8; u++)
         if (!is_down(h->down, u) && is_down(now_down, u)) send_usage(u, true);
     for (unsigned u = 0; u < 256; u++)
@@ -473,14 +474,14 @@ uint64_t usbhid_tick(uint64_t now) {
             if (h->keyboard && h->leds && !h->ids)
                 usb_control(h->dev, 0x21, HID_SET_REPORT, 0x0200, h->interface, &leds, 1);
     }
-    uint64_t next = 0;
+    uint64_t next = CLOCK_NEVER;
     for (struct hid *h = hids; h; h = h->next) {
         if (!h->repeat_usage) continue;
         if (now >= h->repeat_at) {
             send_usage(h->repeat_usage, true);
             h->repeat_at = now + REPEAT_RATE;
         }
-        if (!next || h->repeat_at < next) next = h->repeat_at;
+        next = MIN(next, h->repeat_at);
     }
     return next;
 }

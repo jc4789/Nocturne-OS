@@ -35,6 +35,6 @@ void hv_detect(void);
 uint64_t hv_apic_hz(void);
 uint64_t hv_tsc_hz(void); /* the TSC's, likewise */
 uint64_t hv_reference_tsc_page(void); /* set up at the first call, from any CPU; physical page or 0 */
-bool hv_reference_time(uint64_t *units_100ns); /* reference page, MSR fallback */
+bool hv_reference_ns(uint64_t *ns); /* reference page (set up at the first call), MSR fallback */
 void hv_reference_suspend(void); /* the reference page overlay off, and on again; CPU 0, the others parked */
 void hv_reference_resume(void);

@@ -28,8 +28,8 @@ struct n_cpuinfo;
 typedef void (*cpu_job_fn)(size_t index, void *context);
 
 /* Every CPU is the same: each runs the scheduler's tasks (sys/sched.c), takes its own traps,
-   faults and system calls, and serves interrupts sent to it. The BSP is CPU 0 only in that it
-   starts the others and keeps the clock (dev/timer.c). */
+   faults and system calls, serves interrupts sent to it and fires its own alarms (sys/alarm.c).
+   The BSP is CPU 0 only in that it starts the others and takes the devices' interrupts. */
 void smp_init(struct limine_mp_response *response);
 unsigned cpu_online_count(void);
 unsigned cpu_current_index(void);
@@ -37,6 +37,8 @@ bool cpu_online_at(unsigned index);
 /* Interrupt the scheduler on that CPU (it looks at its run queue). Never the calling CPU. */
 void cpu_kick(unsigned index);
 bool cpu_tlb_ipi(unsigned index); /* false when that CPU is not running */
+/* Interrupt that CPU's alarms (sys/alarm.c): it fires what is due and sets its wake device again. */
+void cpu_alarm(unsigned index);
 void smp_get_info(struct n_cpuinfo *info);
 /* panic (lib/printf.c): true on the CPU that reports, every other CPU stopped first; false on one
    that is to halt (another CPU reports, or this one faulted while reporting too often). */

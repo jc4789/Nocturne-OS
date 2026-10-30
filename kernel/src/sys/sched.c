@@ -13,7 +13,6 @@
 #include "arch/smp.h"
 #include "sys/sched.h"
 #include "sys/prof.h"
-#include "dev/timer.h"
 #include "sys/syscall.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
@@ -35,19 +34,22 @@ static uint32_t next_pid;
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 extern void kthread_trampoline(void);
 
-#define BALANCE_MS 4              /* how often a CPU looks for a much busier queue to take from */
+#define BALANCE_NS (4 * NS_PER_MS) /* how often a CPU with tasks waiting looks for a much idler one */
 #define STEAL_PROBES 8            /* waiting tasks one look at another queue examines */
 #define KEI_SWITCH_COST_NS 10000  /* a switch (XSAVE, CR3, the caches' recovery), estimated */
 #define KEI_OVERHEAD_PPM 10000    /* aim at 1% lost to switching: the retention is about 99 times it */
-#define KILLED_NAP_MS 10          /* a killed task's waits end this soon, whether a waker comes or not */
+#define KILLED_NAP_NS (10 * NS_PER_MS) /* a killed task's waits end this soon, whether a waker comes or not */
 
 static struct cpu_queue {
     struct spinlock lock;
     struct kei_rq rq;
     struct task *idle;
     struct task *evicted;   /* sched_cpu_leave: the task this CPU left, for another queue */
-    uint64_t stamp;         /* when rq.current (or the idle task) was last charged (run_stamp) */
-    uint64_t balance_ms;
+    uint64_t stamp;         /* when rq.current (or the idle task) was last charged (clock_now_ns) */
+    uint64_t balanced_at;   /* its last look for an idler queue (rebalance) */
+    /* While tasks wait behind the one that runs: when kei would let one of them run instead
+       (slice_arm). A stale one finds nothing to do. */
+    struct alarm slice;
     size_t steal_cursor;
     bool prepared, leaving;
 } __attribute__((aligned(64))) queues[CPU_MAX_COUNT];
@@ -61,44 +63,28 @@ static struct sched_stats stats;
 #define KEI_OWNER(k) ((struct task *)((char *)(k) - __builtin_offsetof(struct task, kei)))
 #define STAT(f) __atomic_fetch_add(&stats.f, 1, __ATOMIC_RELAXED)
 
-/* No sleeper's deadline comes before this (sched_timeouts makes it exact again). */
-static uint64_t deadline_hint = UINT64_MAX;
-
 /* Ended tasks no one else collects: the reaper frees them once they are off their CPUs. */
 static struct task *dead;
 static struct wait_queue dead_wait;
 
-static bool wq_take_blocked(struct task *t, uint64_t now);
+static bool wq_take_blocked(struct task *t, bool timed);
+static void wake_fire(struct alarm *a, struct regs *r);
+static void slice_fire(struct alarm *a, struct regs *r);
 
 /* ---- time ---- */
 
-/* TSC subtraction also accounts IRQ-delayed/kernel CPU time and sub-ms bursts. Before calibration
-   only the tick charges, a millisecond each. */
-static uint64_t run_stamp(void) { return tsc_hz >= 1000000 ? rdtsc() : 0; }
-static uint64_t run_elapsed_ns(uint64_t since, uint64_t now) {
-    if (tsc_hz < 1000000 || now <= since) return 0;
-    uint64_t delta = now - since, per_ms = tsc_hz / 1000;
-    uint64_t whole = delta / per_ms;
-    if (whole > UINT64_MAX / 2000000) return UINT64_MAX / 2;
-    return whole * 1000000 + (delta % per_ms) * 1000000 / per_ms;
-}
 
-static void task_cpu_time(struct task *t, uint64_t us) {
-    unsigned subms = (unsigned)(us % 1000) + t->cpu_subms_us;
-    t->cpu_ms += us / 1000 + subms / 1000;
-    t->cpu_subms_us = subms % 1000;
-}
 
-/* q's lock held: what ran on its CPU since the last charge. */
-static void charge(struct cpu_queue *q, bool tick) {
-    uint64_t now = run_stamp(), ns = run_elapsed_ns(q->stamp, now);
+/* q's lock held: what ran on its CPU since the last charge, interrupts and kernel time included. */
+static void charge(struct cpu_queue *q) {
+    uint64_t now = clock_now_ns();
+    if (now <= q->stamp) return;
+    uint64_t ns = now - q->stamp;
     q->stamp = now;
-    if (!ns && tick && tsc_hz < 1000000) ns = 1000000;
-    if (!ns) return;
     if (q->rq.current) {
-        if (kei_charge(&q->rq, ns) == KEI_OK) task_cpu_time(KEI_OWNER(q->rq.current), ns / 1000);
+        if (kei_charge(&q->rq, ns) == KEI_OK) KEI_OWNER(q->rq.current)->cpu_ns += ns;
     } else {
-        task_cpu_time(q->idle, ns / 1000);
+        q->idle->cpu_ns += ns;
     }
 }
 
@@ -185,7 +171,8 @@ static bool queue_prepare(unsigned cpu, struct task *idle) {
         queue_capacity = cap;
         q->idle = idle;
         idle->cpu = cpu;
-        q->stamp = run_stamp();
+        q->stamp = clock_now_ns();
+        alarm_init(&q->slice, slice_fire);
         __atomic_store_n(&q->prepared, true, __ATOMIC_RELEASE);
         spin_unlock(&capacity_lock, f);
         return true;
@@ -201,6 +188,7 @@ static struct task *idle_task_new(const char *name) {
     t->state = TASK_RUNNING;
     t->pml4 = kernel_pml4;
     fpu_state_init(&t->fpu);
+    alarm_init(&t->wake_alarm, wake_fire);
     strlcpy(t->name, name, sizeof t->name);
     uint64_t f = spin_lock(&task_lock);
     t->pid = next_pid++;
@@ -256,15 +244,7 @@ static bool steal(unsigned self) {
     return true;
 }
 
-/* Interrupts off, now and then on each CPU: a task from a queue two longer than this one. */
-static void balance(unsigned self) {
-    if (!usable(self)) return;
-    unsigned src = busiest(self, resident(self) + 2);
-    if (src != self && take_from(src, self)) {
-        STAT(balances);
-        need_resched = true;
-    }
-}
+
 
 /* Where a waking task goes: its last CPU if that has nothing to run, else one that has nothing,
    else the queue with the fewest tasks (its last on a tie). */
@@ -281,6 +261,53 @@ static unsigned choose(struct task *t) {
     return fewest == SIZE_MAX ? 0 : best;
 }
 
+/* q's lock held, interrupts off: q's slice alarm, while tasks wait behind the one that runs, for
+   the moment kei would let one of them run instead. Armed from another CPU (a waker's), it kicks
+   q's CPU when it comes. */
+static void slice_arm(struct cpu_queue *q) {
+    if (!q->rq.current || !q->rq.count) return;
+    struct kei_decision d = kei_decide(&q->rq);
+    if (d.switch_needed || d.service_until_recheck_ns == KEI_NO_TIMER) return;
+    alarm_set(&q->slice, clock_after(d.service_until_recheck_ns));
+}
+
+/* Interrupts off, at most every BALANCE_NS on a CPU with tasks waiting: one of them to the queue
+   with the fewest, when that has two fewer, whose CPU is told to look. */
+static void rebalance(unsigned self) {
+    struct cpu_queue *q = &queues[self];
+    uint64_t now = clock_now_ns();
+    if (now - q->balanced_at < BALANCE_NS || !usable(self)) return;
+    q->balanced_at = now;
+    unsigned to = self;
+    size_t fewest = resident(self);
+    for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++) {
+        if (cpu == self || !usable(cpu)) continue;
+        size_t n = resident(cpu);
+        if (n + 2 <= fewest) { fewest = n; to = cpu; }
+    }
+    if (to != self && take_from(self, to)) {
+        STAT(balances);
+        cpu_kick(to);
+    }
+}
+
+static void slice_fire(struct alarm *a, struct regs *r) {
+    struct cpu_queue *q = (struct cpu_queue *)((char *)a - __builtin_offsetof(struct cpu_queue, slice));
+    unsigned cpu = (unsigned)(q - queues);
+    if (cpu != cpu_current_index()) {
+        cpu_kick(cpu);
+        return;
+    }
+    if (!q->prepared) return;
+    spin_take(&q->lock);
+    charge(q);
+    bool switch_needed = q->rq.current ? kei_decide(&q->rq).switch_needed : q->rq.count != 0;
+    if (!switch_needed) slice_arm(q);
+    spin_give(&q->lock);
+    if (switch_needed) need_resched = true;
+    rebalance(cpu);
+}
+
 /* Interrupts off, no queue's lock held: t, in no queue (kei NEW or SLEEP), joins one; its CPU is
    told when t should run before what runs there. Nothing when another waker came first. */
 static void enqueue(struct task *t) {
@@ -295,6 +322,7 @@ static void enqueue(struct task *t) {
         if (e != KEI_OK) panic("kei: task %d into cpu%u failed %d", t->pid, to, e);
         __atomic_store_n(&t->cpu, to, __ATOMIC_RELEASE);
         bool kick = !q->rq.current || kei_decide(&q->rq).switch_needed;
+        if (!kick) slice_arm(q);
         unlock2(from, to);
         STAT(wakes);
         if (from != to) STAT(moved_wakes);
@@ -307,8 +335,9 @@ static void enqueue(struct task *t) {
 }
 
 void sched_make_ready(struct task *t) {
-    if (t->is_idle) { /* the boot task waited on something: it looks again by itself */
+    if (t->is_idle) { /* the boot task, taken out of a wait: it halts until an interrupt, this one */
         __atomic_store_n(&t->state, TASK_RUNNING, __ATOMIC_RELEASE);
+        cpu_kick(__atomic_load_n(&t->cpu, __ATOMIC_ACQUIRE));
         return;
     }
     uint64_t f = irq_save();
@@ -343,7 +372,7 @@ void schedule(void) {
     struct cpu_queue *q = this_queue();
     struct task *prev = current_task;
     spin_take(&q->lock);
-    charge(q, false);
+    charge(q);
     need_resched = false;
     if (!prev->is_idle) {
         /* The lock stays held until this CPU is on the next stack: no one acts on prev before. */
@@ -361,6 +390,7 @@ void schedule(void) {
         if (kei_commit(&q->rq, d.next) != KEI_OK) panic("kei: commit on cpu%u failed", cpu_current_index());
         next = KEI_OWNER(d.next);
     }
+    slice_arm(q);
     if (next == prev) {
         spin_give(&q->lock);
         irq_restore(f);
@@ -382,7 +412,7 @@ void sched_yield(void) {
     uint64_t f = irq_save();
     struct cpu_queue *q = this_queue();
     spin_take(&q->lock);
-    charge(q, false);
+    charge(q);
     if (q->rq.current) kei_yield(&q->rq);
     spin_give(&q->lock);
     STAT(yields);
@@ -390,52 +420,29 @@ void sched_yield(void) {
     irq_restore(f);
 }
 
+
+
 static void resched_irq(struct regs *r) {
     (void)r;
     need_resched = true;
 }
 
-void sched_tick(void) {
-    unsigned self = cpu_current_index();
-    struct cpu_queue *q = &queues[self];
-    if (!q->prepared) return;
-    spin_take(&q->lock);
-    charge(q, true);
-    bool switch_needed = q->rq.current ? kei_decide(&q->rq).switch_needed : q->rq.count != 0;
-    spin_give(&q->lock);
-    if (switch_needed) need_resched = true;
-    uint64_t now = uptime_ms();
-    if (now - q->balance_ms >= BALANCE_MS) {
-        q->balance_ms = now;
-        balance(self);
-    }
-}
-
-/* Interrupts off. The hint is cleared before the look: a sleeper that sets its deadline meanwhile
-   either is seen here or lowers the hint again itself. */
-void sched_timeouts(void) {
-    uint64_t now = uptime_ms();
-    if (now < __atomic_load_n(&deadline_hint, __ATOMIC_ACQUIRE)) return;
-    __atomic_store_n(&deadline_hint, UINT64_MAX, __ATOMIC_SEQ_CST);
-    spin_take(&task_lock);
-    for (struct task *t = task_list; t; t = t->all_next) {
-        uint64_t at = __atomic_load_n(&t->wake_at, __ATOMIC_ACQUIRE);
-        if (!at || __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != TASK_BLOCKED) continue;
-        if (now >= at && wq_take_blocked(t, now)) {
-            sched_make_ready(t);
+uint64_t sched_task_cpu_ns(struct task *t) {
+    uint64_t f = irq_save();
+    for (;;) {
+        unsigned cpu = __atomic_load_n(&t->cpu, __ATOMIC_ACQUIRE);
+        struct cpu_queue *q = &queues[cpu];
+        spin_take(&q->lock);
+        if (t->cpu != cpu) {
+            spin_give(&q->lock);
             continue;
         }
-        uint64_t hint = __atomic_load_n(&deadline_hint, __ATOMIC_RELAXED);
-        while (at < hint && !__atomic_compare_exchange_n(&deadline_hint, &hint, at, true, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {}
+        if (t->is_idle ? q->idle == t && !q->rq.current : q->rq.current == &t->kei) charge(q);
+        uint64_t ns = t->cpu_ns;
+        spin_give(&q->lock);
+        irq_restore(f);
+        return ns;
     }
-    spin_give(&task_lock);
-}
-
-uint64_t sched_next_wake(void) { return __atomic_load_n(&deadline_hint, __ATOMIC_SEQ_CST); }
-
-/* After S3 the TSC may have started again from 0: the running stamps start over. */
-void sched_clock_resume(void) {
-    for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++) queues[cpu].stamp = run_stamp();
 }
 
 void sched_user_return(struct regs *r) {
@@ -462,8 +469,8 @@ NORETURN void sched_idle(void) {
             schedule();
             continue;
         }
-        timer_idle();
-        /* A kick between the look and hlt is held pending, and ends the hlt. */
+        /* A kick between the look and hlt is held pending, and ends the hlt; this CPU's alarms
+           (sys/alarm.c) end it when one is due. */
         __asm__ volatile("sti; hlt" : : : "memory");
     }
 }
@@ -472,7 +479,7 @@ NORETURN void sched_cpu_start(void) {
     struct cpu_queue *q = this_queue();
     sched_set_current(q->idle);
     spin_take(&q->lock);
-    q->stamp = run_stamp();
+    q->stamp = clock_now_ns();
     __atomic_store_n(&q->leaving, false, __ATOMIC_RELEASE);
     spin_give(&q->lock);
     sched_idle();
@@ -593,6 +600,7 @@ void sched_init(void) {
     boot->state = TASK_RUNNING;
     boot->pml4 = kernel_pml4;
     fpu_state_init(&boot->fpu);
+    alarm_init(&boot->wake_alarm, wake_fire);
     sched_set_current(boot);
     task_list = boot;
     if (!queue_prepare(0, boot)) panic("sched: no memory");
@@ -615,7 +623,8 @@ struct task *task_alloc(const char *name) {
     t->state = TASK_BLOCKED; /* not runnable until made ready */
     t->pml4 = kernel_pml4;
     fpu_state_init(&t->fpu);
-    t->start_ms = uptime_ms();
+    alarm_init(&t->wake_alarm, wake_fire);
+    t->start_ns = clock_now_ns();
     t->ksp = (uint64_t)t->kstack + KSTACK_PAGES * PAGE_SIZE;
     t->cpu = cpu_current_index();
     uint64_t f = spin_lock(&task_lock);
@@ -676,25 +685,13 @@ void kthread_start(void (*fn)(void *), void *arg) {
 static struct wait_queue deadline_wait;
 
 /* Interrupts off. The task sleeps on wq (NULL: on its deadline alone) until a waker or its deadline
-   (ms from now by the clock apps read; 0: none) comes, unless word, read under wq's lock, has moved
-   on from seen. held, a lock the caller took to decide that it sleeps (it may be wq's own), is
-   given back once the task is enrolled. False when the deadline ended the sleep. An idle task
-   cannot sleep: it halts once and lets the others run, and its caller looks again. */
+   (clock_now_ns; CLOCK_NEVER: none) comes, unless word, read under wq's lock, has moved on from
+   seen. held, a lock the caller took to decide that it sleeps (it may be wq's own), is given back
+   once the task is enrolled. False when the deadline ended the sleep. */
 static bool wq_sleep(struct wait_queue *wq, const uint64_t *word, uint64_t seen, struct spinlock *held,
-                     uint64_t ms) {
+                     uint64_t deadline) {
     struct task *t = current_task;
     if (!wq) wq = &deadline_wait;
-    uint64_t at = 0;
-    if (ms) {
-        uint64_t now = timer_now_ms();
-        at = ms > UINT64_MAX - now ? UINT64_MAX : now + ms;
-    }
-    if (t->is_idle) {
-        if (held) spin_give(held);
-        __asm__ volatile("sti; hlt; cli" : : : "memory");
-        schedule();
-        return !at || timer_now_ms() < at;
-    }
     t->timed_out = false;
     if (held != &wq->lock) spin_take(&wq->lock);
     bool sleep = !word || __atomic_load_n(word, __ATOMIC_SEQ_CST) == seen;
@@ -702,72 +699,80 @@ static bool wq_sleep(struct wait_queue *wq, const uint64_t *word, uint64_t seen,
         t->wq = wq;
         t->wq_next = wq->head;
         wq->head = t;
-        __atomic_store_n(&t->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
-        /* A kill after this finds it blocked and wakes it (kill_locked); one before is seen here,
-           and the wait ends soon: the caller looks at killed again, or waits on. */
-        if (__atomic_load_n(&t->killed, __ATOMIC_SEQ_CST)) {
-            uint64_t soon = timer_now_ms() + KILLED_NAP_MS;
-            if (!at || at > soon) at = soon;
+        if (!t->is_idle) {
+            __atomic_store_n(&t->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
+            /* A kill after this finds it blocked and wakes it (kill_locked); one before is seen
+               here, and the wait ends soon: the caller looks at killed again, or waits on. */
+            if (__atomic_load_n(&t->killed, __ATOMIC_SEQ_CST)) deadline = MIN(deadline, clock_after(KILLED_NAP_NS));
         }
-        __atomic_store_n(&t->wake_at, at, __ATOMIC_RELEASE);
     }
     spin_give(&wq->lock);
     if (held && held != &wq->lock) spin_give(held);
     if (!sleep) return true;
-    if (at) {
-        uint64_t hint = __atomic_load_n(&deadline_hint, __ATOMIC_RELAXED);
-        while (at < hint && !__atomic_compare_exchange_n(&deadline_hint, &hint, at, true, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {}
-        timer_deadline(at); /* CPU 0's tick, stopped, may come back after it */
+    if (deadline != CLOCK_NEVER) alarm_set(&t->wake_alarm, deadline);
+    if (t->is_idle) {
+        /* An idle task (the boot task) has no stack of its own to sleep on: it stays in wq and lets
+           this CPU's other tasks run, halting in between, until a waker takes it out and kicks
+           this CPU (sched_make_ready), or its alarm does. */
+        while (__atomic_load_n(&t->wq, __ATOMIC_ACQUIRE)) {
+            __asm__ volatile("sti; hlt; cli" : : : "memory");
+            schedule();
+        }
+    } else {
+        schedule();
     }
-    schedule();
-    t->wake_at = 0;
+    if (deadline != CLOCK_NEVER) alarm_cancel(&t->wake_alarm);
     return !t->timed_out;
 }
 
-/* Interrupts off: blocked t leaves its wait queue, unless a waker on another CPU took it out first
-   (and wakes it), or it is not in one (a task not started yet). True: the caller wakes it. now
-   (not 0): only if its deadline has come by then, read again under the queue's lock. */
-static bool wq_take_blocked(struct task *t, uint64_t now) {
+/* Interrupts off: t, blocked (or an idle task waiting), leaves its wait queue, unless a waker on
+   another CPU took it out first (and wakes it), or it is not in one (a task not started yet).
+   True: the caller wakes it. timed: its deadline ended the wait. */
+static bool wq_take_blocked(struct task *t, bool timed) {
     struct wait_queue *wq = __atomic_load_n(&t->wq, __ATOMIC_ACQUIRE);
     if (!wq) return false;
     spin_take(&wq->lock);
-    bool here = t->wq == wq && __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == TASK_BLOCKED &&
-                (!now || (t->wake_at && now >= t->wake_at));
+    bool here = t->wq == wq && (t->is_idle || __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == TASK_BLOCKED);
     if (here) {
         struct task **pp = &wq->head;
         while (*pp && *pp != t) pp = &(*pp)->wq_next;
         if (*pp) *pp = t->wq_next;
-        t->wq = NULL;
         t->wq_next = NULL;
-        t->wake_at = 0;
-        t->timed_out = now != 0;
+        t->timed_out = timed;
+        __atomic_store_n(&t->wq, NULL, __ATOMIC_RELEASE);
     }
     spin_give(&wq->lock);
     return here;
 }
 
+/* A sleeper's deadline (wq_sleep), on the CPU it slept on. */
+static void wake_fire(struct alarm *a, struct regs *r) {
+    struct task *t = (struct task *)((char *)a - __builtin_offsetof(struct task, wake_alarm));
+    if (wq_take_blocked(t, true)) sched_make_ready(t);
+}
+
 void wq_wait(struct wait_queue *wq) {
     uint64_t f = irq_save();
-    wq_sleep(wq, NULL, 0, NULL, 0);
+    wq_sleep(wq, NULL, 0, NULL, CLOCK_NEVER);
     irq_restore(f);
 }
 
-bool wq_wait_timeout(struct wait_queue *wq, uint64_t ms) {
+bool wq_wait_until(struct wait_queue *wq, uint64_t deadline) {
     uint64_t f = irq_save();
-    bool ok = wq_sleep(wq, NULL, 0, NULL, ms ? ms : 1);
+    bool ok = wq_sleep(wq, NULL, 0, NULL, deadline);
     irq_restore(f);
     return ok;
 }
 
-void wq_wait_locked(struct wait_queue *wq, struct spinlock *held) { wq_sleep(wq, NULL, 0, held, 0); }
+void wq_wait_locked(struct wait_queue *wq, struct spinlock *held) { wq_sleep(wq, NULL, 0, held, CLOCK_NEVER); }
 
-bool wq_wait_locked_timeout(struct wait_queue *wq, struct spinlock *held, uint64_t ms) {
-    return wq_sleep(wq, NULL, 0, held, ms ? ms : 1);
+bool wq_wait_locked_until(struct wait_queue *wq, struct spinlock *held, uint64_t deadline) {
+    return wq_sleep(wq, NULL, 0, held, deadline);
 }
 
-bool wq_wait_unless(struct wait_queue *wq, const uint64_t *word, uint64_t seen, uint64_t ms) {
+bool wq_wait_unless(struct wait_queue *wq, const uint64_t *word, uint64_t seen, uint64_t deadline) {
     uint64_t f = irq_save();
-    bool ok = wq_sleep(wq, word, seen, NULL, ms);
+    bool ok = wq_sleep(wq, word, seen, NULL, deadline);
     irq_restore(f);
     return ok;
 }
@@ -779,8 +784,7 @@ static void wake_all_held(struct wait_queue *wq) {
     while (t) {
         struct task *n = t->wq_next;
         t->wq_next = NULL;
-        t->wq = NULL;
-        t->wake_at = 0;
+        __atomic_store_n(&t->wq, NULL, __ATOMIC_RELEASE);
         sched_make_ready(t);
         t = n;
     }
@@ -792,20 +796,17 @@ void wq_wake_all(struct wait_queue *wq) {
     spin_unlock(&wq->lock, f);
 }
 
-void nap_ms(uint64_t ms) {
+void sleep_until(uint64_t deadline) {
     uint64_t f = irq_save();
-    wq_sleep(NULL, NULL, 0, NULL, current_task->is_idle ? 0 : ms ? ms : 1);
+    wq_sleep(NULL, NULL, 0, NULL, deadline);
     irq_restore(f);
 }
-
-void sleep_ms(uint64_t ms) { wq_wait_timeout(NULL, ms); }
 
 void mutex_lock(struct mutex *m) {
     struct task *self = current_task;
     uint64_t f = spin_lock(&m->wait.lock);
     while (m->owner && m->owner != self) {
-        /* The boot task halts once (wq_sleep) and lets the holder run, then looks again. */
-        wq_sleep(self->is_idle ? NULL : &m->wait, NULL, 0, &m->wait.lock, 0);
+        wq_sleep(&m->wait, NULL, 0, &m->wait.lock, CLOCK_NEVER);
         spin_take(&m->wait.lock);
     }
     m->owner = self;
@@ -979,7 +980,7 @@ static uint64_t address_read(uint64_t phys, bool wide) {
                 : __atomic_load_n((volatile uint32_t *)word, __ATOMIC_SEQ_CST);
 }
 
-int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsigned timeout_ms) {
+int task_wait_address(volatile void *address, uint64_t expected, bool wide, uint64_t deadline) {
     struct task *t = current_task;
     if (t->killed) return -N_ERR_STOPPED;
     uint64_t phys = address_phys(address, wide);
@@ -990,14 +991,14 @@ int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsi
     uint64_t flags = spin_lock(&address_lock);
     __atomic_add_fetch(bucket, 1, __ATOMIC_SEQ_CST);
     uint64_t current = address_read(phys, wide);
-    if (current != expected || !timeout_ms) {
+    if (current != expected || clock_now_ns() >= deadline) {
         __atomic_sub_fetch(bucket, 1, __ATOMIC_RELEASE);
         spin_unlock(&address_lock, flags);
         return current != expected ? -N_ERR_NOT_READY : -N_ERR_TIMEOUT;
     }
     t->wait_phys = phys;
     t->wait_seq = __atomic_add_fetch(&address_seq, 1, __ATOMIC_SEQ_CST);
-    bool awake = wq_sleep(&address_wait, NULL, 0, &address_lock, timeout_ms == UINT32_MAX ? 0 : timeout_ms);
+    bool awake = wq_sleep(&address_wait, NULL, 0, &address_lock, deadline);
     t->wait_phys = 0;
     __atomic_sub_fetch(bucket, 1, __ATOMIC_RELEASE);
     irq_restore(flags);
@@ -1051,8 +1052,7 @@ static unsigned address_wake(uint64_t phys, unsigned count) {
             struct task *t = *task_link;
             *task_link = t->wq_next;
             t->wq_next = NULL;
-            t->wq = NULL;
-            t->wake_at = 0;
+            __atomic_store_n(&t->wq, NULL, __ATOMIC_RELEASE);
             sched_make_ready(t);
         } else break;
         done++;
@@ -1181,7 +1181,7 @@ static void kill_locked(struct task *t) {
     if (!t->killed) t->kill_code = 130;
     __atomic_store_n(&t->killed, true, __ATOMIC_SEQ_CST);
     if (__atomic_load_n(&t->state, __ATOMIC_SEQ_CST) == TASK_BLOCKED) {
-        if (wq_take_blocked(t, 0)) sched_make_ready(t);
+        if (wq_take_blocked(t, false)) sched_make_ready(t);
     } else {
         cpu_kick(__atomic_load_n(&t->cpu, __ATOMIC_ACQUIRE));
     }

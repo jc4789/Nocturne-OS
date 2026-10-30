@@ -10,8 +10,11 @@
 #include "mm/vmm.h"
 #include "mm/heap.h"
 #include "abi.h"
+#include "sys/alarm.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 #include "arch/pstate.h"
+#include "sys/prof.h"
 #include "arch/pat.h"
 #include "arch/wake.h"
 
@@ -75,8 +78,8 @@ bool smp_panic_enter(void) {
     for (unsigned i = 0; i < CPU_MAX_COUNT; i++)
         if (i + 1 != self && cpu_online_at(i) && lapic_send_nmi(cpus[i].apic_id)) others++;
     /* a while for them to stop; one that does not cannot be helped */
-    uint64_t start = rdtsc(), wait = tsc_hz ? tsc_hz / 10 : 100000000;
-    while (__atomic_load_n(&panic_stopped, __ATOMIC_ACQUIRE) < others && rdtsc() - start < wait) pause();
+    uint64_t until = clock_after(100 * NS_PER_MS);
+    while (__atomic_load_n(&panic_stopped, __ATOMIC_ACQUIRE) < others && clock_now_ns() < until) pause();
     return true;
 }
 
@@ -99,6 +102,11 @@ void cpu_kick(unsigned i) {
     if (!lapic_send_ipi(cpus[i].apic_id, VEC_RESCHED)) panic("smp: IPI to cpu%u failed", i);
 }
 
+void cpu_alarm(unsigned i) {
+    if (i == cpu_current_index() || !cpu_online_at(i)) return;
+    if (!lapic_send_ipi(cpus[i].apic_id, VEC_TIMER)) panic("smp: alarm IPI to cpu%u failed", i);
+}
+
 bool cpu_tlb_ipi(unsigned i) {
     if (!cpu_online_at(i)) return false;
     if (!lapic_send_ipi(cpus[i].apic_id, VEC_TLB_SHOOTDOWN)) panic("smp: TLB shootdown IPI to cpu%u failed", i);
@@ -118,7 +126,7 @@ static struct {
     uint64_t done;      /* items finished */
 } batch;
 static uint32_t batch_taken, batch_number;
-static uint64_t jobs, max_job_ticks;
+static uint64_t jobs, max_job_ns;
 
 static size_t take_items(uint32_t number) {
     size_t ran = 0;
@@ -147,7 +155,7 @@ bool cpu_jobs_poll(void) {
 void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context) {
     if (!count || !fn) return;
     ASSERT((uint64_t)fn >= 0xFFFF800000000000ULL && (!context || (uint64_t)context >= 0xFFFF800000000000ULL));
-    uint64_t flags = irq_save(), since = rdtsc();
+    uint64_t flags = irq_save(), since = clock_now_ns();
     struct fpu_state saved;
     fpu_save(&saved);
     fpu_reset();
@@ -179,15 +187,13 @@ void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context) {
         __atomic_fetch_add(&jobs, 1, __ATOMIC_RELAXED);
     }
     fpu_restore(&saved);
-    uint64_t ticks = rdtsc() - since, most = __atomic_load_n(&max_job_ticks, __ATOMIC_RELAXED);
-    while (ticks > most && !__atomic_compare_exchange_n(&max_job_ticks, &most, ticks, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    uint64_t took = clock_now_ns() - since, most = __atomic_load_n(&max_job_ns, __ATOMIC_RELAXED);
+    while (took > most && !__atomic_compare_exchange_n(&max_job_ns, &most, took, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
     irq_restore(flags);
 }
 
 uint64_t cpu_parallel_jobs(void) { return __atomic_load_n(&jobs, __ATOMIC_RELAXED); }
-uint64_t cpu_max_job_us(void) {
-    return tsc_hz >= 1000000 ? __atomic_load_n(&max_job_ticks, __ATOMIC_RELAXED) / (tsc_hz / 1000000) : 0;
-}
+uint64_t cpu_max_job_us(void) { return __atomic_load_n(&max_job_ns, __ATOMIC_RELAXED) / NS_PER_US; }
 
 void smp_get_info(struct n_cpuinfo *info) {
     memset(info, 0, sizeof *info);
@@ -202,10 +208,6 @@ void smp_get_info(struct n_cpuinfo *info) {
 }
 
 /* ---- starting a CPU ---- */
-static bool deadline(uint64_t since, unsigned ms, uint64_t spins) {
-    if (tsc_hz >= 1000000) return rdtsc() - since > (tsc_hz / 1000) * ms;
-    return spins > 100000000;
-}
 
 static NORETURN void fail(struct cpu_slot *c) {
     __atomic_store_n(&c->failed, 1, __ATOMIC_RELEASE);
@@ -226,7 +228,10 @@ static NORETURN void ap_main(void *argument) {
     if (have_pat && rdmsr(0x277) != bsp_pat) fail(c);
     write_cr3(kernel_pml4);
     vmm_init_cpu();
-    if (!lapic_ap_init() || lapic_current_id() != c->apic_id || !lapic_tick_start()) fail(c);
+    if (!lapic_ap_init() || lapic_current_id() != c->apic_id) fail(c);
+    clock_cpu_join(); /* CPU 0 waits for it in started() */
+    alarm_init_cpu();
+    prof_cpu_start();
     __atomic_store_n(&c->ready, 1, __ATOMIC_RELEASE);
     sched_cpu_start(); /* this CPU's idle task from here on */
 }
@@ -238,9 +243,11 @@ static NORETURN void ap_entry(struct limine_mp_info *info) {
 
 /* CPU 0: c is running its idle task now, or failed or timed out. */
 static bool started(struct cpu_slot *c) {
-    uint64_t since = rdtsc(), spins = 0;
-    while (!__atomic_load_n(&c->ready, __ATOMIC_ACQUIRE) && !__atomic_load_n(&c->failed, __ATOMIC_ACQUIRE) &&
-           !deadline(since, START_TIMEOUT_MS, ++spins)) pause();
+    uint64_t until = clock_after(START_TIMEOUT_MS * NS_PER_MS);
+    /* its TSC against this one's, while it waits in clock_cpu_join (after its LAPIC is up) */
+    if (clock_cpu_lead(c->index, until))
+        while (!__atomic_load_n(&c->ready, __ATOMIC_ACQUIRE) && !__atomic_load_n(&c->failed, __ATOMIC_ACQUIRE) &&
+               clock_now_ns() < until) pause();
     if (!__atomic_load_n(&c->ready, __ATOMIC_ACQUIRE)) return false;
     __atomic_fetch_or(&online_mask, 1u << c->index, __ATOMIC_ACQ_REL);
     __atomic_fetch_add(&online, 1, __ATOMIC_ACQ_REL);
@@ -259,7 +266,7 @@ void cpu_park_check(void) {
     if (!self || !sched_cpu_empty(self)) return;
     struct cpu_slot *c = &cpus[self];
     cli();
-    lapic_tick_stop();
+    alarm_cpu_leave(); /* its alarms to CPU 0, its wake device stopped */
     /* Out of the online set before its last look at the shootdowns: a CPU that still counted it
        published its request before (mm/vmm.c), and is answered here. */
     __atomic_fetch_and(&online_mask, ~(1u << self), __ATOMIC_SEQ_CST);
@@ -284,8 +291,8 @@ bool smp_suspend(void) {
         struct cpu_slot *c = &cpus[i];
         if (!c->asleep) continue;
         sched_cpu_leave(i); /* its tasks to CPU 0's queue; it sees parking once it has none */
-        uint64_t since = rdtsc(), spins = 0;
-        while (!__atomic_load_n(&c->parked, __ATOMIC_ACQUIRE) && !deadline(since, PARK_TIMEOUT_MS, ++spins)) {
+        uint64_t until = clock_after(PARK_TIMEOUT_MS * NS_PER_MS);
+        while (!__atomic_load_n(&c->parked, __ATOMIC_ACQUIRE) && clock_now_ns() < until) {
             vmm_tlb_poll();
             pause();
         }
@@ -378,9 +385,9 @@ static void selftest(void) {
     if (fpu_has_avx()) __asm__ volatile("vmovdqu %0, %%ymm0" : : "m"(sentinel) : "memory");
     else __asm__ volatile("movdqu %0, %%xmm0" : : "m"(sentinel) : "memory");
     memset(&p, 0, sizeof p);
-    uint64_t since = rdtsc();
+    uint64_t since = clock_now_ns();
     cpu_parallel_for(ARRAY_SIZE(p.value), probe_job, &p);
-    uint64_t ticks = rdtsc() - since, mask = 0;
+    uint64_t took = clock_now_ns() - since, mask = 0;
     fpu_save(checked);
     if (memcmp(fpu_state_data(checked) + 160, sentinel, 16)) panic("smp: caller SSE state not restored");
     if (fpu_has_avx() && memcmp(fpu_state_data(checked) + 576, sentinel + 2, 16))
@@ -390,8 +397,8 @@ static void selftest(void) {
     kfree(checked);
     if (!probe_ok(&p, reference, ARRAY_SIZE(p.value))) panic("smp: selftest mismatch");
     for (size_t i = 0; i < ARRAY_SIZE(p.value); i++) mask |= 1ULL << p.cpu[i];
-    kprintf("smp: batch selftest PASS items=257 cpus=%u mask=%lx ticks=%lu AVX=%s\n",
-            __builtin_popcountll(mask), mask, ticks, fpu_has_avx() ? "PASS" : "disabled");
+    kprintf("smp: batch selftest PASS items=257 cpus=%u mask=%lx %lu us AVX=%s\n",
+            __builtin_popcountll(mask), mask, took / NS_PER_US, fpu_has_avx() ? "PASS" : "disabled");
     if (cmdline_has("smp-test")) {
         static const size_t counts[] = {0, 1, 3, 7, 16, 256, 257};
         for (unsigned round = 0; round < 32; round++)

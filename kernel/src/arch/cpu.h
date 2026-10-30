@@ -150,9 +150,13 @@ bool lapic_ap_init(void);
 bool lapic_send_ipi(uint32_t apic_id, uint8_t vector);
 bool lapic_send_nmi(uint32_t apic_id);
 void lapic_eoi(void);
-bool lapic_timer_start(unsigned hz, int vector);
-bool lapic_tick_start(void); /* another CPU: the periodic tick lapic_timer_start measured on CPU 0 */
-void lapic_resume(void); /* BSP after S3: registers and the calibrated tick again */
+/* The wake device of sys/alarm.c: this CPU's LAPIC timer, interrupting it once on vector at the
+   moment lapic_wake_at names (clock_now_ns; CLOCK_NEVER: not at all) or soon after, never long
+   before (the alarm code sets it again when it comes early). lapic_wake_init on each CPU as it
+   starts, CPU 0 first; both with this CPU's interrupts off or from its own code only. */
+bool lapic_wake_init(int vector);
+void lapic_wake_at(uint64_t ns);
+void lapic_resume(void); /* BSP after S3: its registers again (the wake device: alarm_resume) */
 bool lapic_send_init(uint32_t apic_id); /* INIT: the AP waits for a STARTUP, running nothing */
 bool lapic_send_startup(uint32_t apic_id, uint64_t page); /* after an INIT: into real mode at page */
 /* What a CPU a STARTUP reached needs to learn whether the STARTUP was its own (arch/wake.h): the
@@ -166,12 +170,6 @@ struct lapic_ident {
     uint64_t base, base_mask;
 };
 void lapic_ident(struct lapic_ident *out);
-/* Tickless idle, after lapic_timer_start: stop this CPU's tick, fire it once after ms, or go
-   back to the periodic tick. */
-void lapic_tick_stop(void);
-void lapic_tick_once(unsigned ms);
-void lapic_tick_resume(void);
-extern uint64_t tsc_hz; /* measured by lapic_timer_start(); 0 if unknown */
 #define VEC_TIMER 0x30
 void pic_init(void);
 void pic_unmask(int irq);

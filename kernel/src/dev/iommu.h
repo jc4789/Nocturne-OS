@@ -187,9 +187,5 @@ uint64_t iommu_dma_limit(const struct iommu_domain *dom);
 /* Whether to log one more blocked request: a few a second, so a device that keeps sending
    them cannot drown the log. */
 bool iommu_fault_report(void);
-/* A measured-TSC deadline `ms` from now: units are polled with interrupts off. An unknown
-   TSC rate cannot prove elapsed time and expires immediately; unconfirmed hardware stays owned. */
-uint64_t iommu_deadline(unsigned ms);
-bool iommu_expired(uint64_t deadline);
 /* The plain MSI address for a physical APIC id (bits 19:12, no redirection hint). */
 static inline uint32_t iommu_msi_plain(uint32_t dest) { return 0xFEE00000u | dest << 12; }

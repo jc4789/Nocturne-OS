@@ -3,17 +3,20 @@
    Any CPU. Received frames wait in the NIC's own ring (poll_rx) or in the receive queue below,
    filled from interrupt handlers and driver threads; the "net" kernel thread takes them in.
    System calls run the protocol themselves in the calling task, and sleep on their socket's
-   progress (or shared_progress for link, ARP, DNS and UDP state) until a change.
+   progress (or shared_progress for link, ARP, DNS and UDP state) until a change or their
+   deadline. Every time here is on the clock's axis (sys/clock.h): a moment is clock_now_ns, a
+   deadline the moment it ends (CLOCK_NEVER: none). Nothing polls: the net thread sleeps until a
+   frame, a driver's notice or one of its timers (struct net_timer) wakes it.
 
    Locks, the first before the later ones:
    - net_lock (a mutex): every piece of protocol state (sockets and their rings, ARP, DHCP, DNS,
-     pings, the output frame, the timers, the counters) and every call into the adapter (struct
-     netif). Held by a system call from entry to return, given back while it sleeps; held by the
-     net thread for one batch at a time. Allocations, copies of the app's memory and the adapter's
-     own locks happen under it. Never taken by an interrupt handler.
+     pings, the output frame, the timers' moments, the counters) and every call into the adapter
+     (struct netif). Held by a system call from entry to return, given back while it sleeps; held
+     by the net thread for one batch at a time. Allocations, copies of the app's memory and the
+     adapter's own locks happen under it. Never taken by an interrupt handler or an alarm's fire.
    - a NIC driver's own lock (its rings and its interrupt state; see the driver).
    - rxq_lock, config_lock (spinlocks): leaves, nothing but a wait queue's lock under them, so an
-     interrupt handler or any driver context may take them. */
+     interrupt handler, an alarm's fire or any driver context may take them. */
 #include "kernel.h"
 #include "abi.h"
 #include "net.h"
@@ -22,6 +25,8 @@
 #include "../arch/smp.h"
 #include "../arch/spin.h"
 #include "../mm/heap.h"
+#include "../sys/alarm.h"
+#include "../sys/clock.h"
 #include "../sys/sched.h"
 #include "../sys/syscall.h"
 #include "../sys/object.h"
@@ -76,14 +81,15 @@ static void net_enter(void) {
 }
 static void net_leave(void) { mutex_unlock(&net_lock); }
 
-/* net_lock held once: sleep on p for up to ms without the lock, which is held again on return.
-   False when the time ran out. Every reference into the stack's state is looked at again after:
-   the socket may have closed and its slot may hold another connection. */
-static bool net_sleep(struct net_progress *p, uint64_t ms) {
+/* net_lock held once: sleep on p until deadline without the lock, which is held again on return.
+   False when the deadline came first. Every reference into the stack's state is looked at again
+   after: the socket may have closed and its slot may hold another connection. A kill wakes the
+   sleeper (sys/sched.h), so a wait without a deadline needs no limit of its own. */
+static bool net_sleep(struct net_progress *p, uint64_t deadline) {
     ASSERT(mutex_held(&net_lock) && net_lock.depth == 1);
     uint64_t seen = __atomic_load_n(&p->generation, __ATOMIC_SEQ_CST);
     net_leave();
-    bool ready = wq_wait_unless(&p->wq, &p->generation, seen, ms ? ms : 1);
+    bool ready = wq_wait_unless(&p->wq, &p->generation, seen, deadline);
     net_enter();
     return ready;
 }
@@ -102,13 +108,15 @@ static bool net_setup_cancelled(void) {
     struct handle *h=current_task->net_setup_cancel;
     return h && (handle_ready(h)&N_EVENT_CLOSED);
 }
-static bool net_setup_sleep(struct net_progress *p,uint64_t ms) {
-    /* Nothing wakes a setup wait when its channel closes: bound only the
-       setup context's sleep, so it looks again soon. Normal TCP/UDP waits
-       retain their existing progress semantics. */
-    if(current_task->net_setup_cancel && ms>50)ms=50;
-    return net_sleep(p,ms);
+/* Nothing wakes a setup wait when its cancel channel closes: a setup context's sleep ends this
+   soon after it starts, so it looks again. Normal TCP/UDP waits keep their own deadlines. */
+#define NET_SETUP_LOOK (50 * NS_PER_MS)
+static bool net_setup_sleep(struct net_progress *p,uint64_t deadline) {
+    if(current_task->net_setup_cancel)deadline=MIN(deadline,clock_after(NET_SETUP_LOOK));
+    return net_sleep(p,deadline);
 }
+/* The time from then to now, two moments read on any CPUs (which may disagree by a few ns). */
+static uint64_t ns_between(uint64_t then, uint64_t now) { return now>then?now-then:0; }
 void net_task_exit(struct task *task) {
     struct handle *h=task->net_setup_cancel;
     task->net_setup_cancel=NULL;
@@ -136,11 +144,6 @@ static uint32_t rnd(void) {
     rng_state ^= rng_state >> 7;
     rng_state ^= rng_state << 17;
     return (uint32_t)rng_state;
-}
-
-void net_delay_ms(uint64_t ms) {
-    uint64_t until = uptime_ms() + ms + 1;
-    while (uptime_ms() < until) pause();
 }
 
 static uint32_t csum_add(uint32_t sum, const void *data, size_t len) {
@@ -223,8 +226,8 @@ struct tcp_hdr {
 
 /* Frames copied in by interrupt handlers, driver threads and the loopback output, taken in by
    the net thread, which reads the slot at the tail in place (a producer never writes it) and
-   gives it back after. rxq_lock guards head, tail, the counters and net_work_pending, the net
-   thread's wake latch (the condition it sleeps on, rxq_wq). */
+   gives it back after. rxq_lock guards head, tail, the counters, the fired timers' queue below
+   and net_work_pending, the net thread's wake latch (the conditions it sleeps on, rxq_wq). */
 #define RXQ 64
 static uint8_t rxq_buf[RXQ][1536];
 static uint16_t rxq_len[RXQ];
@@ -233,6 +236,68 @@ static struct spinlock rxq_lock;
 static struct wait_queue rxq_wq;
 static bool net_work_pending;
 static uint64_t rxq_dropped, rxq_invalid, rxq_high_water;
+
+/* Work the net thread does at a moment of the clock: a TCP connection's next look, DHCP's next
+   message, a held-back test segment. Its alarm (sys/alarm.h) fires in a timer interrupt, where
+   net_lock, a mutex, cannot be taken: the fire queues it and wakes the thread, which runs it under
+   net_lock. A timer is armed for no more than the earliest moment it is wanted by and only ever
+   moved earlier (net_timer_at); one that fires before its work is due makes the thread look and
+   arm it again for the moment it now has, so a moment that keeps moving later (a retransmission
+   timer each ACK restarts) costs one look per period, not an alarm move per change. A timer's
+   memory is never freed; one whose work has gone is cancelled (alarm_cancel) under net_lock,
+   which no fire takes. One cancelled after it fired may still be queued: its run finds no work. */
+struct net_timer {
+    struct alarm alarm;                             /* first: the fire finds its timer from it */
+    void (*run)(struct net_timer *nt, uint64_t now); /* the net thread, net_lock held */
+    struct net_timer *due_next;                     /* rxq_lock: the queue of fired ones */
+    bool due;
+};
+static struct net_timer *net_due_first, **net_due_last = &net_due_first;
+
+static void net_timer_fire(struct alarm *a, struct regs *r) {
+    (void)r;
+    struct net_timer *nt = (struct net_timer *)a;
+    spin_take(&rxq_lock);
+    if (!nt->due) {
+        nt->due = true;
+        nt->due_next = NULL;
+        *net_due_last = nt;
+        net_due_last = &nt->due_next;
+    }
+    net_work_pending = true;
+    spin_give(&rxq_lock);
+    wq_wake_all(&rxq_wq);
+}
+
+static void net_timer_init(struct net_timer *nt, void (*run)(struct net_timer *, uint64_t)) {
+    alarm_init(&nt->alarm, net_timer_fire);
+    nt->run = run;
+    nt->due_next = NULL;
+    nt->due = false;
+}
+
+/* net_lock held: nt runs by at (in the past: at once; CLOCK_NEVER: not for this). net_lock
+   orders every arming, so the alarm's moment is read here without the alarm's lock. */
+static void net_timer_at(struct net_timer *nt, uint64_t at) {
+    if (at == CLOCK_NEVER || (alarm_armed(&nt->alarm) && nt->alarm.at <= at)) return;
+    alarm_set(&nt->alarm, at);
+}
+
+/* The net thread, net_lock held: every timer that has fired, those that fire meanwhile too. */
+static void net_timers_run(void) {
+    for (;;) {
+        uint64_t flags = spin_lock(&rxq_lock);
+        struct net_timer *nt = net_due_first;
+        if (nt) {
+            net_due_first = nt->due_next;
+            if (!net_due_first) net_due_last = &net_due_first;
+            nt->due = false; /* a fire from here on queues it again */
+        }
+        spin_unlock(&rxq_lock, flags);
+        if (!nt) return;
+        nt->run(nt, clock_now_ns());
+    }
+}
 
 void net_rx_notify(void) {
     uint64_t flags = spin_lock(&rxq_lock);
@@ -346,16 +411,19 @@ static int ip_output(uint32_t src, uint32_t dst, const uint8_t mac[6], uint8_t p
 /* ---------------------------------------------------------------- ARP */
 
 #define ARP_N 16
+#define ARP_LIFETIME (600 * NS_PER_S) /* a learnt address is asked for again after this */
+#define ARP_RETRY    NS_PER_S         /* a request unanswered this long is sent again */
 static struct arp_entry {
     uint32_t ip;
     uint8_t mac[6];
-    uint64_t time;
+    uint64_t time; /* when it was learnt */
     bool valid;
 } arp_tab[ARP_N];
 
 static bool arp_lookup(uint32_t ip, uint8_t mac[6]) {
+    uint64_t now = clock_now_ns();
     for (int i = 0; i < ARP_N; i++)
-        if (arp_tab[i].valid && arp_tab[i].ip == ip && uptime_ms() - arp_tab[i].time < 600000) {
+        if (arp_tab[i].valid && arp_tab[i].ip == ip && now < arp_tab[i].time + ARP_LIFETIME) {
             memcpy(mac, arp_tab[i].mac, 6);
             return true;
         }
@@ -373,7 +441,7 @@ static void arp_store(uint32_t ip, const uint8_t mac[6]) {
     }
     arp_tab[slot].ip = ip;
     memcpy(arp_tab[slot].mac, mac, 6);
-    arp_tab[slot].time = uptime_ms();
+    arp_tab[slot].time = clock_now_ns();
     arp_tab[slot].valid = true;
     progress_wake(&shared_progress);
 }
@@ -407,8 +475,8 @@ static void arp_input(const uint8_t *p, size_t len) {
 
 static uint32_t next_hop(uint32_t dst) { return ((dst ^ my_ip) & my_mask) == 0 ? dst : my_gw; }
 
-/* Resolve the link address (system call context: may block). A nonzero
-   deadline shares TCP's connect budget; zero preserves ordinary ARP retries. */
+/* Resolve the link address (system call context: may block): three requests ARP_RETRY apart,
+   all of it by deadline (the caller's budget; CLOCK_NEVER: the requests alone bound it). */
 static int arp_resolve_until(uint32_t dst, uint8_t mac[6], uint64_t deadline) {
     if (!nif) return -N_ERR_NETWORK_DOWN;
     if(net_setup_cancelled())return -N_ERR_CANCELLED;
@@ -426,32 +494,32 @@ static int arp_resolve_until(uint32_t dst, uint8_t mac[6], uint64_t deadline) {
     for (int tries = 0; tries < 3; tries++) {
         if (current_task->killed) return -N_ERR_STOPPED;
         if(net_setup_cancelled())return -N_ERR_CANCELLED;
-        uint64_t now = uptime_ms();
-        if (deadline && now >= deadline) return -N_ERR_TIMEOUT;
+        if (clock_now_ns() >= deadline) return -N_ERR_TIMEOUT;
         if (arp_lookup(hop, mac)) return 0;
         arp_send(1, (const uint8_t *)"\0\0\0\0\0\0", hop, bcast_mac);
-        uint64_t until = now + 1000;
-        if (deadline && deadline < until) until = deadline;
+        uint64_t until = MIN(clock_after(ARP_RETRY), deadline);
         for (;;) {
             if (current_task->killed) return -N_ERR_STOPPED;
             if(net_setup_cancelled())return -N_ERR_CANCELLED;
-            now = uptime_ms();
-            if (deadline && now >= deadline) return -N_ERR_TIMEOUT;
+            uint64_t now = clock_now_ns();
+            if (now >= deadline) return -N_ERR_TIMEOUT;
             if (arp_lookup(hop, mac)) return 0;
             if (now >= until) break;
-            net_setup_sleep(&shared_progress, until - now);
+            net_setup_sleep(&shared_progress, until);
         }
     }
     return -N_ERR_UNREACHABLE;
 }
-static int arp_resolve(uint32_t dst, uint8_t mac[6]) { return arp_resolve_until(dst, mac, 0); }
+static int arp_resolve(uint32_t dst, uint8_t mac[6]) { return arp_resolve_until(dst, mac, CLOCK_NEVER); }
 
 /* ---------------------------------------------------------------- ICMP */
 
 #define PING_N 8
+#define PING_TIMEOUT_DEFAULT 1000 /* ms: SYS_NET_PING's timeout_ms of 0 or less */
 static struct ping_wait {
     bool used, done;
     uint16_t id, seq;
+    uint64_t replied; /* the moment the echo reply came in */
 } pings[PING_N];
 
 static void icmp_input(const uint8_t *src_mac, uint32_t src, const uint8_t *p, size_t len) {
@@ -467,16 +535,21 @@ static void icmp_input(const uint8_t *src_mac, uint32_t src, const uint8_t *p, s
         r->csum = htons(csum_fold(csum_add(0, L4, len)));
         ip_output(ip_source(src), src, mac, 1, len);
     } else if (h->type == 0) {
+        uint64_t now = clock_now_ns();
         for (int i = 0; i < PING_N; i++)
-            if (pings[i].used && pings[i].id == ntohs(h->id) && pings[i].seq == ntohs(h->seq)) pings[i].done = true;
+            if (pings[i].used && !pings[i].done && pings[i].id == ntohs(h->id) && pings[i].seq == ntohs(h->seq)) {
+                pings[i].done = true;
+                pings[i].replied = now;
+            }
         progress_wake(&shared_progress);
     }
 }
 
-static int64_t sys_ping(uint32_t dst, int seq, int timeout_ms) {
+/* SYS_NET_PING: the round trip in ms, the address resolution and the echo both by deadline. */
+static int64_t sys_ping(uint32_t dst, int seq, uint64_t deadline) {
     if (dst == my_ip || (dst >> 24) == 127) return 0;
     uint8_t mac[6];
-    int r = arp_resolve(dst, mac);
+    int r = arp_resolve_until(dst, mac, deadline);
     if (r < 0) return r;
     int slot = -1;
     for (int i = 0; i < PING_N; i++)
@@ -495,23 +568,17 @@ static int64_t sys_ping(uint32_t dst, int seq, int timeout_ms) {
     h->csum = 0;
     memcpy(L4 + 8, "Nocturne says hello to the night.", 32);
     h->csum = htons(csum_fold(csum_add(0, L4, 40)));
-    uint64_t t0 = uptime_ms(), until = t0 + (uint64_t)(timeout_ms > 0 ? timeout_ms : 1000);
+    uint64_t sent = clock_now_ns();
     ip_output(ip_source(dst), dst, mac, 1, 40);
     int64_t ret = -N_ERR_TIMEOUT;
-    for (;;) {
-        uint64_t now=uptime_ms();
-        if(now>=until)break;
-        if (w->done) {
-            ret = (int64_t)(now - t0);
-            break;
-        }
+    while (!w->done && clock_now_ns() < deadline) {
         if (current_task->killed) {
             ret = -N_ERR_STOPPED;
             break;
         }
-        net_sleep(&shared_progress, until - now);
+        net_sleep(&shared_progress, deadline);
     }
-    if (w->done) ret = (int64_t)(uptime_ms() - t0);
+    if (w->done) ret = (int64_t)(ns_between(sent, w->replied) / NS_PER_MS);
     w->used = false;
     return ret;
 }
@@ -639,11 +706,11 @@ static int udp_alloc(uint16_t port, int pid) {
     return (int)slot;
 }
 
-/* wait for a datagram on socket i; returns pointer or NULL on timeout (and sets *err) */
-static struct udp_dgram *udp_wait(int i, int timeout_ms, int *err) {
+/* Wait for a datagram on socket i until deadline: the datagram, or NULL with *err set
+   (-N_ERR_NOT_READY once the deadline has come). */
+static struct udp_dgram *udp_wait(int i, uint64_t deadline, int *err) {
     struct udp_sock *s = udp_socks[i];
     uint64_t generation=s->generation;
-    uint64_t until = uptime_ms() + (uint64_t)(timeout_ms < 0 ? 0 : timeout_ms);
     for (;;) {
         /* A sibling thread can close/reuse this handle while we sleep. Never
            consume another socket generation or touch its freed queue. */
@@ -658,13 +725,12 @@ static struct udp_dgram *udp_wait(int i, int timeout_ms, int *err) {
             *err = -N_ERR_STOPPED;
             return NULL;
         }
-        uint64_t now=uptime_ms();
-        if (timeout_ms >= 0 && now >= until) {
+        if (clock_now_ns() >= deadline) {
             *err = -N_ERR_NOT_READY;
             return NULL;
         }
-        if(s->internal)net_setup_sleep(&shared_progress, timeout_ms < 0 ? 1000 : until - now);
-        else net_sleep(&shared_progress, timeout_ms < 0 ? 1000 : until - now);
+        if(s->internal)net_setup_sleep(&shared_progress, deadline);
+        else net_sleep(&shared_progress, deadline);
     }
 }
 
@@ -679,8 +745,14 @@ static struct udp_sock *user_udp(int h) {
 enum { DHCP_IDLE, DHCP_DISCOVER, DHCP_REQUEST, DHCP_BOUND };
 static int dhcp_state;
 static uint32_t dhcp_xid, dhcp_offer, dhcp_server;
-static uint64_t dhcp_next;
+static uint64_t dhcp_next; /* the moment of the next message (a retry, or the renewal) */
 static int dhcp_tries;
+static struct net_timer dhcp_timer;
+
+static void dhcp_at(uint64_t at) {
+    dhcp_next = at;
+    net_timer_at(&dhcp_timer, at);
+}
 
 static void dhcp_send(int type) {
     uint8_t b[300];
@@ -735,7 +807,7 @@ static void dhcp_start(void) {
     dhcp_state = DHCP_DISCOVER;
     dhcp_xid = rnd();
     dhcp_tries = 0;
-    dhcp_next = uptime_ms();
+    dhcp_at(clock_now_ns());
 }
 
 static void dhcp_input(const uint8_t *p, size_t len) {
@@ -769,7 +841,7 @@ static void dhcp_input(const uint8_t *p, size_t len) {
         dhcp_state = DHCP_REQUEST;
         dhcp_tries = 0;
         dhcp_send(3);
-        dhcp_next = uptime_ms() + 2000;
+        dhcp_at(clock_after(2 * NS_PER_S));
     } else if (dhcp_state == DHCP_REQUEST && type == 5) {
         uint64_t flags = spin_lock(&config_lock);
         my_ip = yiaddr;
@@ -780,7 +852,7 @@ static void dhcp_input(const uint8_t *p, size_t len) {
         spin_unlock(&config_lock, flags);
         dhcp_state = DHCP_BOUND;
         if (lease < 60) lease = 60;
-        dhcp_next = uptime_ms() + (uint64_t)lease * 500; /* renew at half the lease */
+        dhcp_at(clock_after((uint64_t)lease * (NS_PER_S / 2))); /* renew at half the lease */
         struct n_sockaddr resolver=dns_default_resolver();
         kprintf("net: %u.%u.%u.%u/%d gateway %u.%u.%u.%u dns %u.%u.%u.%u:%u (DHCP)\n", my_ip >> 24, (my_ip >> 16) & 255,
                 (my_ip >> 8) & 255, my_ip & 255, __builtin_popcount(my_mask), my_gw >> 24, (my_gw >> 16) & 255,
@@ -792,8 +864,13 @@ static void dhcp_input(const uint8_t *p, size_t len) {
     }
 }
 
-static void dhcp_tick(void) {
-    if (dhcp_state == DHCP_IDLE || uptime_ms() < dhcp_next) return;
+/* dhcp_timer's work: the message whose moment has come, and the moment of the next. */
+static void dhcp_timer_run(struct net_timer *nt, uint64_t now) {
+    if (dhcp_state == DHCP_IDLE) return;
+    if (now < dhcp_next) { /* fired for a moment that has moved later since */
+        net_timer_at(nt, dhcp_next);
+        return;
+    }
     if (dhcp_state == DHCP_BOUND) {
         /* renew: re-request the same address */
         dhcp_offer = my_ip;
@@ -809,7 +886,7 @@ static void dhcp_tick(void) {
     }
     dhcp_send(dhcp_state == DHCP_DISCOVER ? 1 : 3);
     dhcp_tries++;
-    dhcp_next = uptime_ms() + (dhcp_tries < 4 ? 2000 : dhcp_tries < 10 ? 5000 : 30000);
+    dhcp_at(now + (dhcp_tries < 4 ? 2 : dhcp_tries < 10 ? 5 : 30) * NS_PER_S);
 }
 
 /* ---------------------------------------------------------------- DNS */
@@ -893,9 +970,10 @@ static void dns_configure(void) {
 /* The cache has a byte budget and exact-size names/candidate vectors. Its
    capacity is not a hostname length or answer-count restriction. */
 #define DNS_CACHE_BYTES (256u*1024u)
+#define DNS_ATTEMPT (2 * NS_PER_S) /* a query unanswered this long is sent again, three times in all */
 struct dns_cache_entry {
     struct dns_cache_entry *next;
-    uint64_t expires, used;
+    uint64_t expires, used; /* moments: its TTL's end, its last use */
     size_t bytes;
     uint32_t count, resolver;
     uint16_t port;
@@ -947,9 +1025,9 @@ static void dns_cache_store(const char *name,uint32_t resolver,uint16_t port,con
     entry->name=(char *)(entry+1);
     entry->ips=(uint32_t *)((uint8_t *)(entry+1)+name_storage);
     memcpy(entry->name,name,namesz); memcpy(entry->ips,answer->ips,(size_t)answer->count*4);
-    entry->count=answer->count; entry->bytes=bytes; entry->used=uptime_ms();
+    entry->count=answer->count; entry->bytes=bytes; entry->used=clock_now_ns();
     entry->resolver=resolver;entry->port=port;
-    uint64_t duration=(uint64_t)answer->ttl*1000;
+    uint64_t duration=(uint64_t)answer->ttl*NS_PER_S;
     entry->expires=duration>UINT64_MAX-entry->used?UINT64_MAX:entry->used+duration;
     entry->next=dns_cache; dns_cache=entry; dns_cache_bytes+=bytes;
 }
@@ -1046,14 +1124,16 @@ static int dns_query(const char *source,uint32_t resolver,uint16_t port,struct d
         answer->ips=kmalloc(4);if (!answer->ips) return dns_failure(answer,N_DNS_RESOURCE);
         answer->ips[0]=literal;answer->count=1;answer->status=N_DNS_OK;return 0;
     }
-    uint64_t now=uptime_ms();
+    uint64_t now=clock_now_ns();
     for (struct dns_cache_entry **at=&dns_cache;*at;) {
         struct dns_cache_entry *entry=*at;
         if (entry->expires<=now) { *at=entry->next;dns_cache_bytes-=entry->bytes;kfree(entry);continue; }
         if (entry->resolver==resolver && entry->port==port && !strcmp(entry->name,name)) {
             answer->ips=kmalloc((size_t)entry->count*4);if (!answer->ips) return dns_failure(answer,N_DNS_RESOURCE);
             memcpy(answer->ips,entry->ips,(size_t)entry->count*4);answer->count=entry->count;
-            answer->ttl=(uint32_t)((entry->expires-now+999)/1000);answer->status=N_DNS_OK;entry->used=now;return 0;
+            uint64_t left=entry->expires-now; /* whole seconds, rounded up */
+            answer->ttl=(uint32_t)MIN(left/NS_PER_S+(left%NS_PER_S!=0),(uint64_t)UINT32_MAX);
+            answer->status=N_DNS_OK;entry->used=now;return 0;
         }
         at=&entry->next;
     }
@@ -1073,10 +1153,10 @@ static int dns_query(const char *source,uint32_t resolver,uint16_t port,struct d
         if(net_setup_cancelled()){result=-N_ERR_CANCELLED;dns_failure(answer,N_DNS_CANCELLED);break;}
         int sent=udp_output(udp_socks[sock]->port,ip_source(resolver),resolver,port,mac,query,query_len);
         if (sent<0) {result=sent;dns_failure(answer,N_DNS_UNREACHABLE);break;}
-        uint64_t until=uptime_ms()+2000;
-        while (uptime_ms()<until) {
-            int err=0;uint64_t tick=uptime_ms();if(tick>=until)break;uint64_t remain=until-tick;
-            struct udp_dgram *packet=udp_wait(sock,(int)remain,&err);
+        uint64_t until=clock_after(DNS_ATTEMPT);
+        while (clock_now_ns()<until) {
+            int err=0;
+            struct udp_dgram *packet=udp_wait(sock,until,&err);
             if (!packet) {if (err && err!=-N_ERR_NOT_READY) {result=err;dns_failure(answer,dns_error_status(err));}break;}
             const uint8_t *p=packet->data;size_t length=packet->len;
             if (packet->src!=resolver || packet->sport!=port || length<12 || !(p[2]&0x80) || p[0]!=query[0] || p[1]!=query[1]) continue;
@@ -1124,8 +1204,18 @@ enum { T_FREE, T_SYN_SENT, T_ESTABLISHED, T_FIN_WAIT1, T_FIN_WAIT2, T_CLOSE_WAIT
 #define TCP_BACKLOG_DEFAULT 128 /* listen() without an application backlog */
 
 #define TCP_OOO   8    /* out-of-order ranges remembered per connection */
-#define RTO_MIN   200  /* ms */
-#define RTO_MAX   16000
+/* The retransmission timeout (RFC 6298), in clock ns: 1 s before any sample, then from the RTT
+   estimate, held between these. G, the clock's granularity in RFC 6298 2.3: the clock and the
+   alarms that time retransmissions resolve finer than this. */
+#define RTO_INITIAL NS_PER_S
+#define RTO_MIN   (200 * NS_PER_MS)
+#define RTO_MAX   (16 * NS_PER_S)
+#define RTO_G     NS_PER_US
+/* TIME-WAIT, kept short of RFC 9293's 2 MSL (3.6), and how long a connection no app holds any
+   more may take to finish before it is reset. */
+#define TCP_TIME_WAIT     (2 * NS_PER_S)
+#define TCP_ORPHAN_LINGER (20 * NS_PER_S)
+#define TCP_CONNECT_DEFAULT 15000 /* ms: SYS_TCP_CONNECT's timeout_ms of 0 or less */
 
 struct tcb {
     int state, err, pid;
@@ -1143,8 +1233,9 @@ struct tcb {
     uint32_t cwnd, ssthresh, recover;
     int dupacks;
     bool in_recovery;
-    /* RTT estimate (RFC 6298, ms); one segment is timed at a time, never a retransmitted one */
-    int srtt, rttvar;
+    /* RTT estimate (RFC 6298, clock ns; srtt 0: no sample yet); one segment is timed at a time,
+       never a retransmitted one: rtt_at is the moment it was sent (0: none is) */
+    uint64_t srtt, rttvar;
     uint32_t rtt_seq;
     uint64_t rtt_at;
     /* receive side. rx is a ring: rx_len bytes are in order and readable; segments that arrive
@@ -1154,9 +1245,12 @@ struct tcb {
     size_t nooo, ooo_capacity;
     uint8_t *rx, *tx;
     uint32_t rx_head, rx_len, tx_head, tx_len, rx_capacity, tx_capacity;
+    /* Moments: the retransmission (or SYN, or zero-window probe) is due (0: not timed), and
+       TIME-WAIT ends or, once no app holds the connection, it is reset (tcp_timer_run). */
     uint64_t rto_at, linger_until;
     uint64_t generation;
-    int rto, retries;
+    uint64_t rto; /* ns */
+    int retries;
     /* Passive open. A listener (T_LISTEN) keeps only lip (0: every local
        address), lport and backlog. Each connection it spawned names it by
        generation and stays owned by the stack (accept_pending, not user_open)
@@ -1168,10 +1262,12 @@ struct tcb {
     /* Last, and kept by tcb_clear: the slot's progress outlives each connection it holds, so a
        task that read its generation for an earlier one and sleeps without net_lock is woken,
        not lost. Stable metadata owns its progress waiters: one socket's ACK/data must not
-       reschedule every DNS/TCP helper that is waiting on another socket. */
+       reschedule every DNS/TCP helper that is waiting on another socket. So does its timer,
+       which the alarm and the thread's queue may still hold for the connection before. */
     struct net_progress progress;
+    struct net_timer timer; /* the connection's next look at rto_at and linger_until */
 };
-/* The slot empty again, its progress kept. */
+/* The slot empty again, its progress and timer kept. */
 static void tcb_clear(struct tcb *t) { memset(t, 0, offsetof(struct tcb, progress)); }
 /* Closed-but-lingering tuples remain valid until TCP releases them. They
    must not occupy a fixed sixteen-slot pool and serialize unrelated fetches. */
@@ -1188,7 +1284,9 @@ static int fault_pid;
 static uint8_t fault_held[1600];
 static size_t fault_held_len;
 static uint32_t fault_held_src;
-static uint64_t fault_held_at;
+#define FAULT_HOLD (200 * NS_PER_MS) /* a held-back segment whose successor does not come goes in after this */
+static uint64_t fault_held_until;
+static struct net_timer fault_timer;
 
 static bool fault_hit(uint16_t per_mille) { return per_mille && rnd() % 1000 < per_mille; }
 
@@ -1199,6 +1297,7 @@ static void tcp_free(struct tcb *t) {
     /* Wake sleeping tasks before clearing the stable slot; their generation
        checks reject a closed/reused connection when they next run. */
     progress_wake(&t->progress);
+    alarm_cancel(&t->timer.alarm);
     kfree(t->rx);
     kfree(t->tx);
     kfree(t->ooo);
@@ -1208,6 +1307,23 @@ static void tcp_free(struct tcb *t) {
 static void tcp_progress(struct tcb *t) {
     if (receive_batch) t->progress_pending = true;
     else progress_wake(&t->progress);
+}
+
+/* The connection is over: CLOSED with err (0: an orderly end), nothing more retransmitted, its
+   waiters told. One no app holds goes at the net thread's next look (tcp_timer_run). */
+static void tcp_end(struct tcb *t, int err) {
+    t->state = T_CLOSED;
+    t->err = err;
+    t->rto_at = 0;
+    tcp_progress(t);
+    if (!t->user_open) net_timer_at(&t->timer, 0);
+}
+
+/* RFC 9293 3.6: the side that closed first waits out the peer's last segments, then ends. */
+static void tcp_time_wait(struct tcb *t) {
+    t->state = T_TIME_WAIT;
+    t->linger_until = clock_after(TCP_TIME_WAIT);
+    net_timer_at(&t->timer, t->linger_until);
 }
 
 static void tcp_ring_write(uint8_t *ring, uint32_t capacity, uint32_t at, const void *src, uint32_t n) {
@@ -1295,10 +1411,7 @@ static int tcp_output(struct tcb *t, uint8_t flags, uint32_t seq, size_t len) {
         return result; /* no sequence advance, retransmit timer or cwnd loss */
     }
     if (result < 0) {
-        t->state = T_CLOSED;
-        t->err = result;
-        t->rto_at = 0;
-        tcp_progress(t);
+        tcp_end(t, result);
         return result;
     }
     tcp_stats.segs_out++;
@@ -1307,13 +1420,16 @@ static int tcp_output(struct tcb *t, uint8_t flags, uint32_t seq, size_t len) {
     return 0;
 }
 
+/* The retransmission timer runs (from now, at the current RTO) unless it already does. */
 static void tcp_arm(struct tcb *t) {
-    if (!t->rto_at) t->rto_at = uptime_ms() + (uint64_t)t->rto;
+    if (t->rto_at) return;
+    t->rto_at = clock_after(t->rto);
+    net_timer_at(&t->timer, t->rto_at);
 }
 
 static void tcp_sent(struct tcb *t, uint32_t n) {
     if (!t->rtt_at && t->snd_nxt == t->snd_max) { /* time new data only (Karn) */
-        t->rtt_at = uptime_ms();
+        t->rtt_at = clock_now_ns();
         t->rtt_seq = t->snd_nxt + n;
     }
     t->snd_nxt += n;
@@ -1372,17 +1488,18 @@ static void tcp_resend_first(struct tcb *t) {
     if (!result && (n || (t->fin_sent && t->snd_una==t->fin_seq))) tcp_stats.retransmits++;
 }
 
-static void tcp_rtt_sample(struct tcb *t, int r) {
-    if (r < 1) r = 1;
+/* RFC 6298 2.2-2.4 on a round trip of r ns: RTO = SRTT + max(G, 4 RTTVAR), held to its bounds. */
+static void tcp_rtt_sample(struct tcb *t, uint64_t r) {
+    if (!r) r = 1; /* srtt 0 means no sample yet */
     if (!t->srtt) {
         t->srtt = r;
         t->rttvar = r / 2;
     } else {
-        int d = t->srtt > r ? t->srtt - r : r - t->srtt;
+        uint64_t d = t->srtt > r ? t->srtt - r : r - t->srtt;
         t->rttvar = (3 * t->rttvar + d) / 4;
         t->srtt = (7 * t->srtt + r) / 8;
     }
-    t->rto = MIN(MAX(t->srtt + MAX(4 * t->rttvar, 50), RTO_MIN), RTO_MAX);
+    t->rto = MIN(MAX(t->srtt + MAX(4 * t->rttvar, RTO_G), RTO_MIN), RTO_MAX);
 }
 
 /* the congestion window starts at RFC 3390's initial window */
@@ -1435,7 +1552,7 @@ static void tcp_ooo_pull(struct tcb *t) {
 static void tcp_reset(struct tcb *t, int err);
 
 /* A listener that ends refuses (RST) every connection it has not handed out;
-   tcp_tick then releases them, since nobody owns them. */
+   tcp_timer_run then releases them, since nobody owns them. */
 static void tcp_refuse_pending(struct tcb *listener) {
     for (size_t i=0;i<tcp_capacity;i++) {
         struct tcb *c=tcbs[i];
@@ -1450,10 +1567,7 @@ static void tcp_reset(struct tcb *t, int err) {
     if (t->state == T_LISTEN) tcp_refuse_pending(t);
     else if (t->state != T_SYN_SENT && t->state != T_CLOSED && t->state != T_FREE)
         tcp_output(t, F_RST | F_ACK, t->snd_nxt, 0);
-    t->state = T_CLOSED;
-    t->err = err;
-    t->rto_at = 0;
-    tcp_progress(t);
+    tcp_end(t, err);
 }
 
 static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len);
@@ -1568,7 +1682,7 @@ static void tcp_listen_input(struct tcb *l, uint32_t src, const uint8_t mac[6], 
     t->iss = rnd();
     t->snd_una = t->snd_wl2 = t->iss;
     t->snd_nxt = t->snd_max = t->iss;
-    t->rto = 1000;
+    t->rto = RTO_INITIAL;
     t->state = T_SYN_RECEIVED;
     if (!tcp_output(t, F_SYN | F_ACK, t->iss, 0)) {
         t->snd_nxt = t->snd_max = t->iss + 1;
@@ -1612,7 +1726,8 @@ static void tcp_input(uint32_t src, uint32_t dst, const uint8_t *src_mac, const 
             memcpy(fault_held, p, len);
             fault_held_len = len;
             fault_held_src = src;
-            fault_held_at = uptime_ms();
+            fault_held_until = clock_after(FAULT_HOLD);
+            net_timer_at(&fault_timer, fault_held_until);
             tcp_stats.faults_reordered++;
             return;
         }
@@ -1633,18 +1748,15 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
     const uint8_t *data = p + hl;
     uint32_t dlen = (uint32_t)(len - hl);
 
+    /* RFC 9293 3.10.7.3-4: a reset is acceptable when it acknowledges our <SYN> (SYN-SENT) or
+       lies in the receive window; any other one is dropped, the connection and its timers as
+       they were. */
     if (fl & F_RST) {
         if (t->state == T_SYN_SENT) {
-            if ((fl & F_ACK) && ack == t->iss + 1) {
-                t->state = T_CLOSED;
-                t->err = -N_ERR_CONNECTION_REFUSED;
-            }
+            if ((fl & F_ACK) && ack == t->iss + 1) tcp_end(t, -N_ERR_CONNECTION_REFUSED);
         } else if (SEQ_LEQ(t->rcv_nxt, seq) && SEQ_LT(seq, t->rcv_nxt + MAX(t->adv_wnd, 1u))) {
-            t->state = T_CLOSED;
-            t->err = -N_ERR_CONNECTION_RESET;
+            tcp_end(t, -N_ERR_CONNECTION_RESET);
         }
-        t->rto_at = 0;
-        tcp_progress(t);
         return;
     }
 
@@ -1659,7 +1771,7 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
         t->state = T_ESTABLISHED;
         t->rto_at = 0;
         t->retries = 0;
-        t->rto = 1000;
+        t->rto = RTO_INITIAL;
         t->snd_max = t->snd_nxt;
         tcp_cc_init(t);
         tcp_output(t, F_ACK, t->snd_nxt, 0);
@@ -1688,7 +1800,7 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
         t->snd_wl2 = ack;
         t->rto_at = 0;
         t->retries = 0;
-        t->rto = 1000;
+        t->rto = RTO_INITIAL;
         tcp_cc_init(t);
         t->accept_order = ++tcp_accept_counter;
         struct tcb *listener = tcp_listener_of(t);
@@ -1712,7 +1824,7 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
             t->snd_una = ack;
             if (SEQ_LT(t->snd_nxt, ack)) t->snd_nxt = ack; /* the peer had kept what we were resending */
             if (t->rtt_at && SEQ_LEQ(t->rtt_seq, ack)) {
-                tcp_rtt_sample(t, (int)(uptime_ms() - t->rtt_at));
+                tcp_rtt_sample(t, ns_between(t->rtt_at, clock_now_ns()));
                 t->rtt_at = 0;
             }
             t->retries = 0;
@@ -1736,10 +1848,8 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
             if (t->snd_una != t->snd_max) tcp_arm(t);
             if (fin_acked) {
                 if (t->state == T_FIN_WAIT1) t->state = T_FIN_WAIT2;
-                else if (t->state == T_CLOSING) {
-                    t->state = T_TIME_WAIT;
-                    t->linger_until = uptime_ms() + 2000;
-                } else if (t->state == T_LAST_ACK) t->state = T_CLOSED;
+                else if (t->state == T_CLOSING) tcp_time_wait(t);
+                else if (t->state == T_LAST_ACK) tcp_end(t, 0);
             }
             tcp_progress(t);
         } else if (ack == t->snd_una && t->snd_una != t->snd_max && dlen == 0 && !(fl & (F_SYN | F_FIN)) &&
@@ -1806,10 +1916,7 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
         need_ack = immediate_ack = true;
         if (t->state == T_ESTABLISHED) t->state = T_CLOSE_WAIT;
         else if (t->state == T_FIN_WAIT1) t->state = T_CLOSING;
-        else if (t->state == T_FIN_WAIT2) {
-            t->state = T_TIME_WAIT;
-            t->linger_until = uptime_ms() + 2000;
-        }
+        else if (t->state == T_FIN_WAIT2) tcp_time_wait(t);
         tcp_progress(t);
     }
     if (need_ack) {
@@ -1823,26 +1930,26 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
     tcp_push(t, false);
 }
 
-static void tcp_tick(void) {
-    uint64_t now = uptime_ms();
-    for(size_t i=0;i<tcp_capacity;i++) {
-        struct tcb *t=tcbs[i];
-        if(!t || t->state==T_FREE)continue;
-        if (t->state == T_TIME_WAIT && now >= t->linger_until) t->state = T_CLOSED;
-        /* a connection waiting for accept belongs to its listener, not to a linger timer */
-        if (!t->user_open && (t->state == T_CLOSED || (!t->accept_pending && now >= t->linger_until))) {
-            if (t->state != T_CLOSED) tcp_reset(t, -N_ERR_CONNECTION_RESET);
-            tcp_free(t);
-            continue;
-        }
-        if (t->rto_at && now >= t->rto_at) {
-            t->rto_at = 0;
-            bool syn = t->state == T_SYN_SENT || t->state == T_SYN_RECEIVED;
-            bool probe = !syn && t->snd_wnd == 0; /* persist: the peer is just not reading */
-            if (!probe && ++t->retries > (syn ? 5 : 8)) {
-                tcp_reset(t, -N_ERR_TIMEOUT);
-                continue;
-            }
+/* A connection's timer runs (struct net_timer): TIME-WAIT's end, the end of one no app holds, the
+   retransmission (a <SYN>'s, data's, or a zero-window probe) due by now; then it is armed for the
+   next of them. */
+static void tcp_timer_run(struct net_timer *nt, uint64_t now) {
+    struct tcb *t = (struct tcb *)((uint8_t *)nt - offsetof(struct tcb, timer));
+    if (t->state == T_FREE) return; /* fired for a connection that has gone since */
+    if (t->state == T_TIME_WAIT && now >= t->linger_until) tcp_end(t, 0);
+    /* a connection waiting for accept belongs to its listener, not to a linger timer */
+    if (!t->user_open && (t->state == T_CLOSED || (!t->accept_pending && now >= t->linger_until))) {
+        if (t->state != T_CLOSED) tcp_reset(t, -N_ERR_CONNECTION_RESET);
+        tcp_free(t);
+        return;
+    }
+    if (t->rto_at && now >= t->rto_at) {
+        t->rto_at = 0;
+        bool syn = t->state == T_SYN_SENT || t->state == T_SYN_RECEIVED;
+        bool probe = !syn && t->snd_wnd == 0; /* persist: the peer is just not reading */
+        if (!probe && ++t->retries > (syn ? 5 : 8)) {
+            tcp_reset(t, -N_ERR_TIMEOUT);
+        } else {
             t->rto = MIN(t->rto * 2, RTO_MAX);
             if (syn) {
                 if (!tcp_output(t, t->state == T_SYN_SENT ? F_SYN : F_SYN | F_ACK, t->iss, 0)) {
@@ -1869,12 +1976,24 @@ static void tcp_tick(void) {
             }
         }
     }
-    /* a held-back (reordered) segment whose successor never came */
-    if (fault_held_len && now - fault_held_at > 200) {
-        size_t n = fault_held_len;
-        fault_held_len = 0;
-        tcp_input_held(n);
+    /* The next look: the retransmission, TIME-WAIT's end, or the end of one no app holds (at
+       once when it is over already). */
+    uint64_t at = t->rto_at ? t->rto_at : CLOCK_NEVER;
+    if (t->state == T_TIME_WAIT || (!t->user_open && !t->accept_pending)) at = MIN(at, t->linger_until);
+    if (!t->user_open && t->state == T_CLOSED) at = 0;
+    net_timer_at(nt, at);
+}
+
+/* fault_timer's work: a held-back (reordered) segment whose successor never came goes in. */
+static void fault_timer_run(struct net_timer *nt, uint64_t now) {
+    if (!fault_held_len) return;
+    if (now < fault_held_until) { /* fired for an earlier hold */
+        net_timer_at(nt, fault_held_until);
+        return;
     }
+    size_t n = fault_held_len;
+    fault_held_len = 0;
+    tcp_input_held(n);
 }
 
 static void tcp_input_held(size_t n) {
@@ -1909,7 +2028,7 @@ static int tcp_alloc_slot(void) {
     }
     if(!tcbs[slot]) {
         struct tcb *t=kmalloc(sizeof *t);if(!t)return -N_ERR_NO_MEMORY;
-        memset(t,0,sizeof *t);tcbs[slot]=t;
+        memset(t,0,sizeof *t);net_timer_init(&t->timer,tcp_timer_run);tcbs[slot]=t;
     }
     return (int)slot;
 }
@@ -1969,13 +2088,12 @@ static struct tcb *tcp_next_accept(const struct tcb *listener) {
     return best;
 }
 
-static int64_t sys_tcp_accept(int h, int timeout_ms, struct n_sockaddr *remote) {
+static int64_t sys_tcp_accept(int h, uint64_t deadline, struct n_sockaddr *remote) {
     struct tcb *l=user_tcb(h);
     if (!l) return -N_ERR_NO_HANDLE;
     if (l->state!=T_LISTEN && l->state!=T_CLOSED) return -N_ERR_INVALID;
     if (remote && !user_ok_w(remote,sizeof *remote)) return -N_ERR_BAD_ADDRESS; /* before the wait */
     uint64_t generation=l->generation;
-    uint64_t until=uptime_ms()+(uint64_t)(timeout_ms>0?timeout_ms:0);
     for (;;) {
         if (l->generation!=generation || !l->user_open) return -N_ERR_NO_HANDLE;
         if (l->state!=T_LISTEN) return l->err?l->err:-N_ERR_CLOSED;
@@ -1990,21 +2108,21 @@ static int64_t sys_tcp_accept(int h, int timeout_ms, struct n_sockaddr *remote) 
             for (size_t i=0;i<tcp_capacity;i++) if (tcbs[i]==c) return (int64_t)i;
         }
         if (current_task->killed) return -N_ERR_STOPPED;
-        uint64_t now=uptime_ms();
-        if (timeout_ms>=0 && now>=until) return -N_ERR_NOT_READY;
-        net_sleep(&l->progress, timeout_ms<0 ? 1000 : until-now);
+        if (clock_now_ns()>=deadline) return -N_ERR_NOT_READY;
+        net_sleep(&l->progress, deadline);
     }
 }
 
-static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
+/* An active open, the address resolution and the handshake both by deadline: the connection's
+   number, or an error. */
+static int64_t tcp_connect_until(uint32_t ip, uint16_t port, uint64_t deadline) {
     if(net_setup_cancelled())return -N_ERR_CANCELLED;
-    uint64_t until = uptime_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 15000);
     uint8_t mac[6];
-    int r = arp_resolve_until(ip, mac, until);
+    int r = arp_resolve_until(ip, mac, deadline);
     if (r < 0) return r;
     if(current_task->killed)return -N_ERR_STOPPED;
     if(net_setup_cancelled())return -N_ERR_CANCELLED;
-    if(uptime_ms()>=until)return -N_ERR_TIMEOUT;
+    if(clock_now_ns()>=deadline)return -N_ERR_TIMEOUT;
     uint16_t local=tcp_local_port(ip,port);
     if(!local)return -N_ERR_ADDRESS_IN_USE;
     int h=tcp_alloc_slot();if(h<0)return h;
@@ -2033,7 +2151,7 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     t->snd_una = t->iss;
     t->snd_nxt = t->snd_max = t->iss;
     t->mss = 536;
-    t->rto = 1000;
+    t->rto = RTO_INITIAL;
     t->state = T_SYN_SENT;
     if (!tcp_output(t, F_SYN, t->iss, 0)) {
         t->snd_nxt = t->snd_max = t->iss+1;
@@ -2042,14 +2160,13 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     uint64_t generation=t->generation;
     while (t->state == T_SYN_SENT) {
         if(t->generation!=generation || !t->user_open)return -N_ERR_NO_HANDLE;
-        uint64_t now = uptime_ms();
         bool cancelled=net_setup_cancelled();
-        if (current_task->killed || cancelled || now >= until) {
+        if (current_task->killed || cancelled || clock_now_ns() >= deadline) {
             t->state = T_CLOSED;
             t->err = current_task->killed ? -N_ERR_STOPPED : cancelled ? -N_ERR_CANCELLED : -N_ERR_TIMEOUT;
             break;
         }
-        net_setup_sleep(&t->progress, until - now);
+        net_setup_sleep(&t->progress, deadline);
     }
     if(t->generation!=generation || !t->user_open)return -N_ERR_NO_HANDLE;
     if(net_setup_cancelled()) {
@@ -2063,6 +2180,8 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     return h;
 }
 
+/* Queue len bytes for sending, waiting for room until deadline (CLOCK_NEVER: no limit): how many
+   were queued, or an error when none were. */
 static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t deadline, bool user, bool nonblock) {
     struct tcb *t = user_tcb(h);
     if (!t) return -N_ERR_NO_HANDLE;
@@ -2073,14 +2192,13 @@ static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t dea
         if(!user && net_setup_cancelled())return done?(int64_t)done:-N_ERR_CANCELLED;
         if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT) return done ? (int64_t)done : (t->err ? t->err : -N_ERR_CLOSED);
         if (t->fin_pending) return done ? (int64_t)done : -N_ERR_CLOSED;
-        uint64_t now = uptime_ms();
         if (current_task->killed) return done ? (int64_t)done : -N_ERR_STOPPED;
-        if (deadline && now >= deadline) return done ? (int64_t)done : -N_ERR_TIMEOUT;
+        if (clock_now_ns() >= deadline) return done ? (int64_t)done : -N_ERR_TIMEOUT;
         uint32_t space = t->tx_capacity - t->tx_len;
         if (!space) {
             if(nonblock)return done?(int64_t)done:-N_ERR_NOT_READY;
-            if(!user)net_setup_sleep(&t->progress, deadline ? deadline-now : 1000);
-            else net_sleep(&t->progress, deadline ? deadline-now : 1000);
+            if(!user)net_setup_sleep(&t->progress, deadline);
+            else net_sleep(&t->progress, deadline);
             continue;
         }
         /* A nonblocking call enqueues one chunk at once; a blocking one goes on chunk by chunk. */
@@ -2100,13 +2218,14 @@ static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t dea
     return (int64_t)done;
 }
 
-static int64_t tcp_recv_data(int h, uint8_t *buf, size_t len, int timeout_ms, bool user) {
+/* Take up to len received bytes, waiting for some until deadline (-N_ERR_NOT_READY once it has
+   come): how many, 0 at the end of the stream. */
+static int64_t tcp_recv_data(int h, uint8_t *buf, size_t len, uint64_t deadline, bool user) {
     struct tcb *t = user_tcb(h);
     if (!t) return -N_ERR_NO_HANDLE;
     if (t->state == T_LISTEN) return -N_ERR_INVALID; /* a listener carries no data */
     if (!len) return 0;
     uint64_t generation=t->generation;
-    uint64_t until = uptime_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0);
     if(!user && net_setup_cancelled())return -N_ERR_CANCELLED;
     while (t->rx_len == 0) {
         if(t->generation!=generation || !t->user_open)return -N_ERR_NO_HANDLE;
@@ -2114,10 +2233,9 @@ static int64_t tcp_recv_data(int h, uint8_t *buf, size_t len, int timeout_ms, bo
         if (t->rx_fin) return 0;
         if (t->state == T_CLOSED) return t->err ? t->err : 0;
         if (current_task->killed) return -N_ERR_STOPPED;
-        uint64_t now=uptime_ms();
-        if (timeout_ms >= 0 && now >= until) return -N_ERR_NOT_READY;
-        if(!user)net_setup_sleep(&t->progress, timeout_ms < 0 ? 1000 : until - now);
-        else net_sleep(&t->progress, timeout_ms < 0 ? 1000 : until - now);
+        if (clock_now_ns() >= deadline) return -N_ERR_NOT_READY;
+        if(!user)net_setup_sleep(&t->progress, deadline);
+        else net_sleep(&t->progress, deadline);
     }
     if(t->generation!=generation || !t->user_open)return -N_ERR_NO_HANDLE;
     /* At most one chunk a call (a short read is ordinary TCP), so net_lock never stays held
@@ -2148,15 +2266,18 @@ static void tcp_close(struct tcb *t) {
        pipe write/close publishes poll readiness; a network packet itself
        must not wake every GUI/pipe poller before any fd can have changed. */
     progress_wake(&t->progress);
-    t->linger_until = uptime_ms() + 20000;
+    t->linger_until = clock_after(TCP_ORPHAN_LINGER);
     if (t->state == T_LISTEN) {
         tcp_refuse_pending(t);
         tcp_free(t);
-    } else if (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT) {
-        t->fin_pending = true;
-        tcp_push(t, false);
     } else if (t->state == T_SYN_SENT || t->state == T_CLOSED) {
         tcp_free(t);
+    } else {
+        if (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT) {
+            t->fin_pending = true;
+            tcp_push(t, false);
+        }
+        net_timer_at(&t->timer, t->linger_until);
     }
 }
 
@@ -2165,8 +2286,8 @@ static void tcp_close(struct tcb *t) {
 static int dns_tcp_exchange(uint32_t resolver,uint16_t port,uint64_t deadline,
                             const uint8_t *query,size_t query_len,uint8_t **reply,size_t *reply_len) {
     *reply=NULL;*reply_len=0;
-    uint64_t now=uptime_ms();if(now>=deadline)return -N_ERR_TIMEOUT;
-    int handle=(int)sys_tcp_connect(resolver,port,(int)(deadline-now));
+    if(clock_now_ns()>=deadline)return -N_ERR_TIMEOUT;
+    int handle=(int)tcp_connect_until(resolver,port,deadline);
     if (handle<0) return handle;
     uint8_t prefix[2]={(uint8_t)(query_len>>8),(uint8_t)query_len};
     int result=0;
@@ -2176,8 +2297,8 @@ static int dns_tcp_exchange(uint32_t resolver,uint16_t port,uint64_t deadline,
     if (n!=(long)query_len) {result=n<0?(int)n:net_setup_cancelled()?-N_ERR_CANCELLED:-N_ERR_TIMEOUT;goto close;}
     size_t done=0;
     while (done<2) {
-        uint64_t now=uptime_ms();if (now>=deadline) {result=-N_ERR_TIMEOUT;goto close;}
-        n=tcp_recv_data(handle,prefix+done,2-done,(int)(deadline-now),false);
+        if (clock_now_ns()>=deadline) {result=-N_ERR_TIMEOUT;goto close;}
+        n=tcp_recv_data(handle,prefix+done,2-done,deadline,false);
         if (n<=0) {result=n<0?(int)n:-N_ERR_PROTOCOL;goto close;} done+=(size_t)n;
     }
     size_t length=(size_t)prefix[0]<<8|prefix[1];
@@ -2185,8 +2306,8 @@ static int dns_tcp_exchange(uint32_t resolver,uint16_t port,uint64_t deadline,
     uint8_t *response=kmalloc(length);if (!response) {result=-N_ERR_NO_MEMORY;goto close;}
     done=0;
     while (done<length) {
-        uint64_t now=uptime_ms();if (now>=deadline) {result=-N_ERR_TIMEOUT;break;}
-        n=tcp_recv_data(handle,response+done,length-done,(int)(deadline-now),false);
+        if (clock_now_ns()>=deadline) {result=-N_ERR_TIMEOUT;break;}
+        n=tcp_recv_data(handle,response+done,length-done,deadline,false);
         if (n<=0) {result=n<0?(int)n:-N_ERR_PROTOCOL;break;} done+=(size_t)n;
     }
     if (!result) {*reply=response;*reply_len=length;} else kfree(response);
@@ -2248,14 +2369,21 @@ static void tcp_flush_pending(void) {
     }
 }
 
-/* The stack's own thread: frames in, the output that waited, the timers. One batch at a time
-   under net_lock; it sleeps on rxq_wq without it. */
+/* Several short NIC batches may share one service window: at its end (or once this many bytes
+   went through it) the system calls waiting for net_lock go first, the thread waiting at most
+   NET_TURN_WAIT for one of them to take it. */
+#define NET_SERVICE_WINDOW (2 * NS_PER_MS)
+#define NET_SERVICE_BYTES  (256u * 1024u)
+#define NET_TURN_WAIT      (2 * NS_PER_MS)
+
+/* The stack's own thread: frames in, the output that waited, the timers that fired. One batch at
+   a time under net_lock; without it, it sleeps on rxq_wq until there is work: a frame queued, a
+   driver's notice (net_rx_notify: an interrupt, room to send again), a timer's alarm. It never
+   wakes only to look. */
 static void net_thread(void *arg) {
     (void)arg;
-    uint64_t last_tick = 0;
-    /* Several short NIC batches may share one bounded service window. A
-       no-work wait is already a scheduler boundary; do not first requeue the
-       net task only to run it again and block immediately afterwards. */
+    /* A no-work wait is already a scheduler boundary; do not first requeue the net task only to
+       run it again and block immediately afterwards. */
     uint64_t service_started=0,service_start_bytes=0;
     bool serviced=false;
     mutex_lock(&net_lock);
@@ -2263,35 +2391,34 @@ static void net_thread(void *arg) {
         bool device_ready = nif->rx_pending && nif->rx_pending();
         uint64_t service_bytes = net_service_bytes;
         mutex_unlock(&net_lock);
-        /* Every producer sets net_work_pending under rxq_lock before it wakes rxq_wq: looked at
-           under that lock, an arrival after the look finds this thread enrolled. */
+        /* Every producer, and every timer's fire, sets net_work_pending under rxq_lock before it
+           wakes rxq_wq: looked at under that lock, an arrival after the look finds this thread
+           enrolled. */
         uint64_t f = spin_lock(&rxq_lock);
-        bool ready = device_ready || rxq_tail != rxq_head || net_work_pending;
+        bool ready = device_ready || rxq_tail != rxq_head || net_work_pending || net_due_first;
         if (!ready) {
-            wq_wait_locked_timeout(&rxq_wq, &rxq_lock, 50);
+            wq_wait_locked(&rxq_wq, &rxq_lock);
             spin_take(&rxq_lock);
         }
         net_work_pending = false;
         spin_unlock(&rxq_lock, f);
-        uint64_t now=uptime_ms(); /* one clock read per bounded NIC batch */
+        uint64_t now=clock_now_ns();
         if(!ready || !serviced) {
             service_started=now;service_start_bytes=service_bytes;serviced=false;
-        } else if(now-service_started>=2 || service_bytes-service_start_bytes>=256u*1024u) {
-            /* At this maximum 2ms service window (or earlier byte boundary) the
-               system calls waiting for net_lock go first: one of them takes it
-               before the next batch (net_enter wakes this thread when one has).
-               Without them, honor timer/priority rescheduling. Each NIC poll is
-               bounded. */
+        } else if(now>=service_started+NET_SERVICE_WINDOW || service_bytes-service_start_bytes>=NET_SERVICE_BYTES) {
+            /* One of the system calls waiting for net_lock takes it before the next batch
+               (net_enter wakes this thread when one has). Without them, honor priority
+               rescheduling. Each NIC poll is bounded. */
             if (__atomic_load_n(&net_callers_waiting, __ATOMIC_SEQ_CST)) {
                 uint64_t seen = __atomic_load_n(&net_turn.generation, __ATOMIC_SEQ_CST);
                 __atomic_store_n(&net_turn_wanted, true, __ATOMIC_SEQ_CST);
                 if (__atomic_load_n(&net_callers_waiting, __ATOMIC_SEQ_CST))
-                    wq_wait_unless(&net_turn.wq, &net_turn.generation, seen, 2);
+                    wq_wait_unless(&net_turn.wq, &net_turn.generation, seen, clock_after(NET_TURN_WAIT));
                 __atomic_store_n(&net_turn_wanted, false, __ATOMIC_SEQ_CST);
             } else {
                 sched_yield();
             }
-            service_started=uptime_ms();service_start_bytes=service_bytes;serviced=false;
+            service_started=clock_now_ns();service_start_bytes=service_bytes;serviced=false;
         }
         mutex_lock(&net_lock);
         receive_batch = true;
@@ -2306,11 +2433,7 @@ static void net_thread(void *arg) {
             struct tcb *t = tcbs[i];
             if (t && t->progress_pending) { t->progress_pending=false; progress_wake(&t->progress); }
         }
-        if (uptime_ms() - last_tick >= 50) {
-            last_tick = uptime_ms();
-            dhcp_tick();
-            tcp_tick();
-        }
+        net_timers_run();
         serviced=true;
     }
 }
@@ -2376,6 +2499,8 @@ static void tcp_buffer_configure(void) {
 }
 
 void net_init(void) {
+    net_timer_init(&dhcp_timer, dhcp_timer_run);
+    net_timer_init(&fault_timer, fault_timer_run);
     dns_configure();
     tcp_buffer_configure();
     if (!rtl8125_probe()) vm_net_probe();
@@ -2429,7 +2554,8 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_NET_PING:
         if (!nif) return -N_ERR_NETWORK_DOWN;
-        return sys_ping((uint32_t)a, (int)b, (int)c);
+        return sys_ping((uint32_t)a, (int)b,
+                        clock_after((uint64_t)((int)c > 0 ? (int)c : PING_TIMEOUT_DEFAULT) * NS_PER_MS));
     case SYS_NET_DNS: {
         if (!user_ok_w((void *)b, 4)) return -N_ERR_BAD_ADDRESS;
         char name[DNS_NAME_TEXT_BYTES + 1];
@@ -2484,7 +2610,7 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         struct n_sockaddr *from = (struct n_sockaddr *)e;
         if (from && !user_ok_w(from, sizeof *from)) return -N_ERR_BAD_ADDRESS;
         int err = 0;
-        struct udp_dgram *dg = udp_wait((int)a, (int)d, &err);
+        struct udp_dgram *dg = udp_wait((int)a, syscall_deadline((int)d), &err);
         if (!dg) return err;
         /* The datagram is out of the queue: its slot stays as it is while net_lock is held. */
         size_t n = MIN(c, dg->len);
@@ -2501,11 +2627,15 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_TCP_CONNECT:
         if (!nif) return -N_ERR_NETWORK_DOWN;
-        return sys_tcp_connect((uint32_t)a, (uint16_t)b, (int)c);
-    case SYS_TCP_SEND: return tcp_send_data((int)a, (const uint8_t *)b, c, 0, true, false);
+        return tcp_connect_until((uint32_t)a, (uint16_t)b,
+                                 clock_after((uint64_t)((int)c > 0 ? (int)c : TCP_CONNECT_DEFAULT) * NS_PER_MS));
+    case SYS_TCP_SEND: return tcp_send_data((int)a, (const uint8_t *)b, c, CLOCK_NEVER, true, false);
     case SYS_TCP_SEND_UNTIL:
+        /* d: the ms since boot it gives up at (on the clock's axis), 0 for none */
         if(e&~(uint64_t)N_TCP_SEND_NONBLOCK)return -N_ERR_INVALID;
-        return tcp_send_data((int)a, (const uint8_t *)b, c, d, true, (e&N_TCP_SEND_NONBLOCK)!=0);
+        return tcp_send_data((int)a, (const uint8_t *)b, c,
+                             !d || d > CLOCK_NEVER / NS_PER_MS ? CLOCK_NEVER : d * NS_PER_MS, true,
+                             (e&N_TCP_SEND_NONBLOCK)!=0);
     case SYS_TCP_CANCEL: {
         struct tcb *t = user_tcb((int)a);
         if (!t) return -N_ERR_NO_HANDLE;
@@ -2525,7 +2655,7 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         if (nif && nif->get_stats) nif->get_stats(&stats);
         return copy_to_user((void *)a, &stats, sizeof stats);
     }
-    case SYS_TCP_RECV: return tcp_recv_data((int)a, (uint8_t *)b, c, (int)d, true);
+    case SYS_TCP_RECV: return tcp_recv_data((int)a, (uint8_t *)b, c, syscall_deadline((int)d), true);
     case SYS_NET_TEST: {
         /* a: fault settings for this process's TCP connections (or NULL); b: counters out (or NULL) */
         if (a) {
@@ -2550,7 +2680,7 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         if (!nif) return -N_ERR_NETWORK_DOWN;
         if (a > UINT32_MAX || b > UINT16_MAX) return -N_ERR_INVALID;
         return sys_tcp_listen((uint32_t)a, (uint16_t)b, (int)c);
-    case SYS_TCP_ACCEPT: return sys_tcp_accept((int)a, (int)b, (struct n_sockaddr *)c);
+    case SYS_TCP_ACCEPT: return sys_tcp_accept((int)a, syscall_deadline((int)b), (struct n_sockaddr *)c);
     case SYS_TCP_ADDRESS: {
         struct tcb *t = user_tcb((int)a);
         if (!t) return -N_ERR_NO_HANDLE;

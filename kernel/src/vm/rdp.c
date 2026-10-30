@@ -13,7 +13,11 @@
    control, and rdpsnd for sound (with the little of rdpdr it needs: drives, printers and the
    rest are turned down). The desktop takes the size of the
    client's window when it connects and whenever the window is resized, and goes back to its
-   own when the client leaves. */
+   own when the client leaves.
+
+   A session is two threads: the session's own reads the client and sends the desktop, and the
+   sound's sends the sound at the client's pace (snd_thread). Every time is on the clock
+   (sys/clock.h). */
 #include "kernel.h"
 #include "vm/devices.h"
 #include "dev/audio.h"
@@ -21,6 +25,7 @@
 #include "gui/wm.h"
 #include "vm/hv/hvsock.h"
 #include "mm/heap.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 
 #define RDP_PORT 3389
@@ -184,19 +189,34 @@ struct rdp {
     uint64_t resize_at;    /* when to take it: a window being dragged sends many */
     /* sound (rdpsnd), and the device redirection channel it waits for (rdpdr) */
     int snd, rdpdr;        /* indexes into channel_ids, -1 without one */
-    int snd_state;         /* SND_* */
+    int snd_state;         /* SND_*, the session thread's */
     uint64_t snd_start_at; /* when to offer sound if rdpdr has not finished by then */
     uint16_t snd_version;  /* the client's */
     uint16_t snd_format;   /* our format's number in the client's list */
-    uint8_t snd_block;
-    uint64_t snd_until;    /* the sound sent covers up to this time */
-    uint32_t snd_blocks, snd_confirmed;
+    /* the sound thread (snd_thread), from SND_PLAYING on, and what it alone uses */
+    struct task *snd_task;
+    struct audio_remote snd_remote; /* it sleeps on its wq */
     uint8_t *snd_buf;      /* one block, with room for its headers */
+    uint8_t *snd_out;      /* its PDUs are built here: out is the session thread's */
+    /* Under snd_lock, between the sound thread and the session thread, which reads the client's
+       confirmations: the blocks sent and not yet confirmed (numbers snd_oldest up to snd_next),
+       when the client will have played everything sent (snd_end), and the thread's end. */
+    struct spinlock snd_lock;
+    struct {
+        uint64_t sent, end; /* when it was sent, and the mixer's ordinal after it */
+    } snd_sent[256];        /* by block number */
+    uint8_t snd_oldest, snd_next;
+    uint64_t snd_end;
+    uint32_t snd_blocks, snd_confirmed;
+    bool snd_stop, snd_done;
+    int snd_err;            /* why the sound thread ended, which ends the session */
+    struct mutex send_lock; /* one PDU at a time on the socket, from either thread */
     struct {               /* a channel message being reassembled, per channel */
         uint8_t *buf;
         uint32_t len, total;
     } vc[16];
     bool fastpath_output, attached, started, active, suppress;
+    bool screen_busy;      /* the desktop was redrawn since the last look: look again sooner */
     uint32_t *shadow; /* the picture the client has, for spotting changed tiles */
     uint32_t tile[TILE * TILE]; /* owned snapshot; never borrow the WM frame */
     uint8_t *dirty;   /* tiles to look at */
@@ -205,17 +225,22 @@ struct rdp {
     int mouse_buttons;
 };
 
+/* Either thread: the whole PDU goes out before the other's. */
 static int send_raw(struct rdp *c, struct wbuf *w) {
     if (w->n > w->cap) {
         kprintf("rdp: PDU of %u bytes too big\n", w->n);
         return -N_ERR_INVALID;
     }
-    return hvsock_write(c->s, w->b, w->n);
+    mutex_lock(&c->send_lock);
+    int r = hvsock_write(c->s, w->b, w->n);
+    mutex_unlock(&c->send_lock);
+    return r;
 }
 
-/* Start an X.224 data PDU (TPKT + data TPDU); finish with x224_end(). */
-static struct wbuf x224_begin(struct rdp *c) {
-    struct wbuf w = {c->out, 0, MAX_PDU};
+/* Start an X.224 data PDU (TPKT + data TPDU) in out, a sending thread's MAX_PDU buffer; finish
+   with x224_end(). */
+static struct wbuf x224_begin(uint8_t *out) {
+    struct wbuf w = {out, 0, MAX_PDU};
     w8(&w, 3);
     w8(&w, 0);
     w16be(&w, 0); /* length, patched */
@@ -243,7 +268,7 @@ static void sdi_end(struct wbuf *w, uint32_t start) { put16be(w, start - 2, (uin
 /* A share data PDU on the I/O channel: write the payload with fill() */
 static int send_data_pdu(struct rdp *c, uint8_t type2, void (*fill)(struct rdp *c, struct wbuf *w, void *arg),
                          void *arg) {
-    struct wbuf w = x224_begin(c);
+    struct wbuf w = x224_begin(c->out);
     uint32_t start = sdi_begin(&w, IO_CHANNEL);
     uint32_t sc = w.n;
     w16(&w, 0); /* totalLength */
@@ -265,26 +290,27 @@ static int send_data_pdu(struct rdp *c, uint8_t type2, void (*fill)(struct rdp *
 
 /* ---- connection sequence ---- */
 
-/* Read one PDU: a TPKT (X.224) one or a fast-path one. Returns its length or -errno. */
-static int read_pdu(struct rdp *c, uint64_t timeout_ms) {
-    int r = hvsock_read_full(c->s, c->in, 2, timeout_ms);
+/* Read one PDU: a TPKT (X.224) one or a fast-path one, all of it by the deadline (clock ns).
+   Returns its length or -errno. */
+static int read_pdu(struct rdp *c, uint64_t deadline) {
+    int r = hvsock_read_full(c->s, c->in, 2, deadline);
     if (r) return r;
     uint32_t len;
     if (c->in[0] == 3) {
-        if ((r = hvsock_read_full(c->s, c->in + 2, 2, 5000))) return r;
+        if ((r = hvsock_read_full(c->s, c->in + 2, 2, deadline))) return r;
         len = (uint32_t)c->in[2] << 8 | c->in[3];
         if (len < 4) return -N_ERR_INVALID;
-        if ((r = hvsock_read_full(c->s, c->in + 4, len - 4, 5000))) return r;
+        if ((r = hvsock_read_full(c->s, c->in + 4, len - 4, deadline))) return r;
     } else {
         len = c->in[1];
         uint32_t hdr = 2;
         if (len & 0x80) {
-            if ((r = hvsock_read_full(c->s, c->in + 2, 1, 5000))) return r;
+            if ((r = hvsock_read_full(c->s, c->in + 2, 1, deadline))) return r;
             len = (len & 0x7F) << 8 | c->in[2];
             hdr = 3;
         }
         if (len < hdr) return -N_ERR_INVALID;
-        if ((r = hvsock_read_full(c->s, c->in + hdr, len - hdr, 5000))) return r;
+        if ((r = hvsock_read_full(c->s, c->in + hdr, len - hdr, deadline))) return r;
     }
     return (int)len;
 }
@@ -435,7 +461,7 @@ static int connect_initial(struct rdp *c, int len) {
                                             0x02, 0x03, 0x00, 0xFF, 0xF8, 0x02, 0x01, 0x02};
     uint32_t body = 3 + 3 + sizeof domain_params + 4 + gcc_len;
 
-    struct wbuf w = x224_begin(c);
+    struct wbuf w = x224_begin(c->out);
     w8(&w, 0x7F);
     w8(&w, 0x66);
     w8(&w, 0x82);
@@ -455,7 +481,7 @@ static int connect_initial(struct rdp *c, int len) {
 }
 
 static int send_license(struct rdp *c) {
-    struct wbuf w = x224_begin(c);
+    struct wbuf w = x224_begin(c->out);
     uint32_t start = sdi_begin(&w, IO_CHANNEL);
     w16(&w, SEC_LICENSE_PKT);
     w16(&w, 0);
@@ -478,7 +504,7 @@ static void cap(struct wbuf *w, uint16_t type, uint32_t *at) {
 static void cap_end(struct wbuf *w, uint32_t at) { put16(w, at, (uint16_t)(w->n - at + 2)); }
 
 static int send_demand_active(struct rdp *c) {
-    struct wbuf w = x224_begin(c);
+    struct wbuf w = x224_begin(c->out);
     uint32_t start = sdi_begin(&w, IO_CHANNEL);
     uint32_t sc = w.n;
     w16(&w, 0);
@@ -587,7 +613,7 @@ static int send_demand_active(struct rdp *c) {
 
 /* The first half of a deactivation-reactivation: a demand active with the new size follows. */
 static int send_deactivate_all(struct rdp *c) {
-    struct wbuf w = x224_begin(c);
+    struct wbuf w = x224_begin(c->out);
     uint32_t start = sdi_begin(&w, IO_CHANNEL);
     w16(&w, 13);
     w16(&w, PDUTYPE_DEACTIVATEALL | 0x10);
@@ -741,6 +767,7 @@ static int send_pointer(struct rdp *c) {
 static int push_updates(struct rdp *c) {
     struct wm_rect d[16];
     int n = wm_remote_damage(d, 16);
+    c->screen_busy = n > 0;
     for (int i = 0; i < n; i++) mark_dirty(c, d[i].x, d[i].y, d[i].w, d[i].h);
     if (!c->active || c->suppress) return 0;
     int pointer = send_pointer(c);
@@ -870,13 +897,14 @@ static void slowpath_input(struct rdp *c, struct rbuf *r) {
 #define CHANNEL_OPTION_SHOW_PROTOCOL 0x00200000
 #define CHANNEL_CHUNK 1600 /* what every client takes */
 
-/* Send one channel message, split into chunks. */
-static int vc_send(struct rdp *c, int k, const uint8_t *data, uint32_t len) {
+/* Send one channel message, split into chunks, each built in out (x224_begin). A channel's
+   messages all come from one thread, so its chunks never interleave with each other. */
+static int vc_send(struct rdp *c, uint8_t *out, int k, const uint8_t *data, uint32_t len) {
     uint32_t show = (c->channel_opts[k] & CHANNEL_OPTION_SHOW_PROTOCOL) ? CHANNEL_FLAG_SHOW_PROTOCOL : 0;
     uint32_t off = 0;
     do {
         uint32_t n = MIN(CHANNEL_CHUNK, len - off);
-        struct wbuf w = x224_begin(c);
+        struct wbuf w = x224_begin(out);
         uint32_t start = sdi_begin(&w, c->channel_ids[k]);
         w32(&w, len);
         w32(&w, (off == 0 ? CHANNEL_FLAG_FIRST : 0) | (off + n == len ? CHANNEL_FLAG_LAST : 0) | show);
@@ -909,7 +937,7 @@ static int clip_send(struct rdp *c, uint16_t type, uint16_t flags, const void *d
     w16(&w, flags);
     w32(&w, len);
     if (len) wbytes(&w, data, len);
-    int r = vc_send(c, c->clip, m, w.n);
+    int r = vc_send(c, c->out, c->clip, m, w.n);
     kfree(m);
     return r;
 }
@@ -1092,14 +1120,14 @@ enum { DVC_CREATE = 1, DVC_DATA_FIRST, DVC_DATA, DVC_CLOSE, DVC_CAPS };
 static int dvc_start(struct rdp *c) {
     if (c->dvc < 0) return 0;
     static const uint8_t caps[] = {DVC_CAPS << 4, 0, 1, 0}; /* version 1 */
-    return vc_send(c, c->dvc, caps, sizeof caps);
+    return vc_send(c, c->out, c->dvc, caps, sizeof caps);
 }
 
 static int dvc_open_display(struct rdp *c) {
     static const char name[] = "Microsoft::Windows::RDS::DisplayControl";
     uint8_t m[2 + sizeof name] = {DVC_CREATE << 4, DISP_CHANNEL_ID}; /* one-byte channel id */
     memcpy(m + 2, name, sizeof name);
-    return vc_send(c, c->dvc, m, sizeof m);
+    return vc_send(c, c->out, c->dvc, m, sizeof m);
 }
 
 static int disp_caps(struct rdp *c) {
@@ -1110,7 +1138,7 @@ static int disp_caps(struct rdp *c) {
     w32(&w, 1);    /* monitors */
     w32(&w, 3840); /* the largest area, as wm_remote_resize allows it */
     w32(&w, 2160);
-    return vc_send(c, c->dvc, m, sizeof m);
+    return vc_send(c, c->out, c->dvc, m, sizeof m);
 }
 
 /* the client's monitor layout: the primary monitor's size is the window's */
@@ -1132,7 +1160,7 @@ static void disp_message(struct rdp *c, struct rbuf *r) {
             c->want_h = h;
         }
     }
-    c->resize_at = uptime_ms() + 250;
+    c->resize_at = clock_after(250 * NS_PER_MS);
 }
 
 static uint32_t dvc_field(struct rbuf *r, int size_code) {
@@ -1163,7 +1191,7 @@ static int dvc_message(struct rdp *c, const uint8_t *m, uint32_t n) {
 
 /* Take the size the client asked for, once its window has stopped changing for a moment. */
 static int apply_resize(struct rdp *c) {
-    if (!c->want_w || !c->active || uptime_ms() < c->resize_at) return 0;
+    if (!c->want_w || !c->active || clock_now_ns() < c->resize_at) return 0;
     int w = c->want_w & ~1, h = c->want_h, ow = c->width, oh = c->height;
     c->want_w = c->want_h = 0;
     wm_remote_resize(&w, &h);
@@ -1192,8 +1220,15 @@ static int apply_resize(struct rdp *c) {
 
 /* ---- sound (MS-RDPEA) ----
    We offer one format, the mixer's own (PCM, 48 kHz, 16-bit stereo). A client that takes it gets
-   a training round trip, then the mixed sound in 20 ms blocks, each sent a little before it is
-   due; while it takes the sound the card is silent (see audio.h). Windows' client starts sound
+   a training round trip, then the mixed sound in 20 ms blocks from the session's sound thread, at
+   the client's pace. Each block carries its number and a time stamp, the milliseconds of our clock
+   as it was sent; the client confirms each block it has played with that stamp plus the time it
+   took (Wave Confirm), which puts on our clock the moment the client played it. From that moment
+   and the blocks sent after it, the thread knows when the client will have played everything it
+   was sent (snd_end; never sooner than the blocks could play from when they were sent), and mixes
+   the next block once that is less than SND_LEAD away. In between it sleeps until then, or, with
+   nothing to play, until a stream gets some (audio_remote_ready): nothing runs while nothing plays.
+   While the client takes the sound the card is silent (see audio.h). Windows' client starts sound
    only once the device redirection channel has introduced itself, so that gets a minimal answer
    too (MS-RDPEFS): every drive, printer or port it offers is turned down. */
 
@@ -1203,9 +1238,12 @@ enum { SNDC_CLOSE = 1, SNDC_WAVE, SNDC_SETVOLUME, SNDC_SETPITCH, SNDC_WAVECONFIR
 #define TSSNDCAPS_ALIVE 1
 #define SND_VERSION 8
 #define SND_BLOCK_FRAMES 960 /* 20 ms */
-#define SND_BLOCK_MS 20
-#define SND_LEAD_MS 160      /* how far ahead of time the sound goes out */
+#define SND_BLOCK_NS (SND_BLOCK_FRAMES * NS_PER_S / AUDIO_RATE)
+#define SND_LEAD_NS (160 * NS_PER_MS) /* how far ahead of the client's playing the sound goes out */
+#define SND_LOW_NS (2 * SND_BLOCK_NS) /* less than this left: part of a block is worth sending */
 #define SND_BUF (16 + SND_BLOCK_FRAMES * AUDIO_FRAME)
+
+static uint16_t snd_stamp(uint64_t ns) { return (uint16_t)(ns / NS_PER_MS); }
 
 static void snd_header(struct wbuf *w, uint8_t type, uint16_t body) {
     w8(w, type);
@@ -1233,7 +1271,7 @@ static int snd_offer(struct rdp *c) {
     w16(&w, 16);
     w16(&w, 0);
     c->snd_state = SND_FORMATS;
-    return vc_send(c, c->snd, m, w.n);
+    return vc_send(c, c->out, c->snd, m, w.n);
 }
 
 /* the formats the client can play, from ours: if ours is there, train */
@@ -1261,10 +1299,150 @@ static int snd_client_formats(struct rdp *c, struct rbuf *r) {
     uint8_t m[8];
     struct wbuf w = {m, 0, sizeof m};
     snd_header(&w, SNDC_TRAINING, 4);
-    w16(&w, (uint16_t)uptime_ms());
+    w16(&w, snd_stamp(clock_now_ns()));
     w16(&w, 0); /* no pack: just the round trip */
     c->snd_state = SND_TRAINING;
-    return vc_send(c, c->snd, m, w.n);
+    return vc_send(c, c->out, c->snd, m, w.n);
+}
+
+/* The sound thread: one block of sound, mixed and sent. Its number, when it was sent and the
+   mixer's ordinal after it are kept until the client confirms it (snd_confirm); a client that
+   leaves 255 blocks unconfirmed has the oldest taken as played, so that the 8-bit numbers stay
+   unambiguous. snd_buf has 16 bytes of room for headers before the samples. */
+static int snd_wave(struct rdp *c) {
+    uint8_t *buf = c->snd_buf, *d = buf + 16;
+    uint32_t len = SND_BLOCK_FRAMES * AUDIO_FRAME;
+    uint64_t end, lost = 0;
+    if (!audio_remote_mix(&c->snd_remote, (int16_t *)d, SND_BLOCK_FRAMES, &end)) return 0;
+    uint64_t now = clock_now_ns();
+    uint16_t stamp = snd_stamp(now);
+    uint64_t f = spin_lock(&c->snd_lock);
+    if ((uint8_t)(c->snd_next - c->snd_oldest) == 255) lost = c->snd_sent[c->snd_oldest++].end;
+    uint8_t block = c->snd_next++;
+    c->snd_sent[block].sent = now;
+    c->snd_sent[block].end = end;
+    c->snd_end = MAX(c->snd_end, now) + SND_BLOCK_NS; /* a client cannot play it sooner */
+    c->snd_blocks++;
+    spin_unlock(&c->snd_lock, f);
+    if (lost) audio_played(lost, now);
+    if (c->snd_version >= 8) { /* one message */
+        struct wbuf w = {buf, 0, 16};
+        snd_header(&w, SNDC_WAVE2, (uint16_t)(12 + len));
+        w16(&w, stamp);
+        w16(&w, c->snd_format);
+        w8(&w, block);
+        wzero(&w, 3);
+        w32(&w, (uint32_t)(now / NS_PER_MS)); /* when its samples were taken from the mixer */
+        return vc_send(c, c->snd_out, c->snd, buf, 16 + len);
+    }
+    /* older clients: a wave info message with the first four bytes, then the rest in a wave
+       message whose first four bytes are padding */
+    uint8_t info[16];
+    struct wbuf w = {info, 0, sizeof info};
+    snd_header(&w, SNDC_WAVE, (uint16_t)(len + 8));
+    w16(&w, stamp);
+    w16(&w, c->snd_format);
+    w8(&w, block);
+    wzero(&w, 3);
+    wbytes(&w, d, 4);
+    int e = vc_send(c, c->snd_out, c->snd, info, w.n);
+    if (e) return e;
+    memset(d, 0, 4);
+    return vc_send(c, c->snd_out, c->snd, d, len);
+}
+
+/* The session thread: the client has played a block. Its confirmation's stamp is the block's plus
+   the milliseconds it took, a time on our clock's milliseconds: unwrapped near now, and never
+   before the block was sent. Every block before it has been played too, and those after it play
+   after it. */
+static void snd_confirm(struct rdp *c, struct rbuf *r) {
+    uint16_t stamp = r16(r);
+    uint8_t block = r8(r);
+    if (r->err) return;
+    uint64_t now = clock_now_ns(), heard = 0, ordinal = 0;
+    int64_t off = (int16_t)(uint16_t)(stamp - snd_stamp(now));
+    uint64_t f = spin_lock(&c->snd_lock);
+    uint8_t unconfirmed = (uint8_t)(c->snd_next - c->snd_oldest), place = (uint8_t)(block - c->snd_oldest);
+    if (place < unconfirmed) {
+        heard = MAX(c->snd_sent[block].sent, (uint64_t)((int64_t)(now / NS_PER_MS) + off) * NS_PER_MS);
+        ordinal = c->snd_sent[block].end;
+        c->snd_oldest = (uint8_t)(block + 1);
+        c->snd_end = MAX(c->snd_end, heard + (uint64_t)(unconfirmed - place - 1) * SND_BLOCK_NS);
+        c->snd_confirmed++;
+    }
+    spin_unlock(&c->snd_lock, f);
+    if (ordinal) audio_played(ordinal, heard);
+}
+
+/* The sound thread. A block goes out while the client would play everything it has within
+   SND_LEAD, and every stream has a whole block (audio_ready) or the client would have played
+   everything within SND_LOW: a stream fed in small pieces (Web Audio) is not padded with silence
+   in the middle of its sound. Otherwise it sleeps until the client's queue falls to where that
+   changes, or until a stream gets the PCM it waits for; with nothing at the client and nothing
+   to play, until then alone. It ends when the session tells it to (snd_finish) or a send fails. */
+static void snd_thread(void *arg) {
+    struct rdp *c = arg;
+    struct audio_remote *r = &c->snd_remote;
+    int err = 0;
+    for (;;) {
+        uint64_t seen = __atomic_load_n(&r->signals, __ATOMIC_SEQ_CST);
+        uint64_t f = spin_lock(&c->snd_lock);
+        bool stop = c->snd_stop;
+        uint64_t end = c->snd_end;
+        spin_unlock(&c->snd_lock, f);
+        if (stop) break;
+        uint64_t now = clock_now_ns(), ahead = end > now ? end - now : 0, wake = CLOCK_NEVER;
+        if (ahead >= SND_LEAD_NS) {
+            wake = end - SND_LEAD_NS;
+        } else if (audio_remote_ready(r, SND_BLOCK_FRAMES, ahead < SND_LOW_NS)) {
+            if ((err = snd_wave(c))) break;
+            continue;
+        } else if (ahead >= SND_LOW_NS) {
+            wake = end - SND_LOW_NS; /* part of a block will do then */
+        }
+        wq_wait_unless(&r->wq, &r->signals, seen, wake);
+    }
+    uint64_t f = spin_lock(&c->snd_lock);
+    c->snd_err = err;
+    c->snd_done = true;
+    wq_wake_all(&r->wq); /* the session thread, in snd_finish; after this, c is not touched */
+    spin_unlock(&c->snd_lock, f);
+}
+
+/* The training came back: the sound comes to this client, from its own thread. */
+static int snd_start(struct rdp *c) {
+    c->snd_buf = kmalloc(SND_BUF);
+    c->snd_out = kmalloc(MAX_PDU);
+    if (!c->snd_buf || !c->snd_out) {
+        c->snd_state = SND_OFF;
+        return 0;
+    }
+    c->snd_state = SND_PLAYING;
+    audio_remote_attach(&c->snd_remote);
+    c->snd_task = kthread_create("rdpsnd", snd_thread, c);
+    if (!c->snd_task) {
+        audio_remote_detach(&c->snd_remote);
+        c->snd_state = SND_OFF;
+        return 0;
+    }
+    kprintf("rdp: sound goes to \"%s\" (version %u)\n", c->client_name, c->snd_version);
+    return 0;
+}
+
+/* The session ends: its sound thread ends first, then the sound leaves this client. */
+static void snd_finish(struct rdp *c) {
+    if (!c->snd_task) return;
+    struct audio_remote *r = &c->snd_remote;
+    uint64_t f = spin_lock(&c->snd_lock);
+    c->snd_stop = true;
+    __atomic_add_fetch(&r->signals, 1, __ATOMIC_SEQ_CST);
+    wq_wake_all(&r->wq);
+    while (!c->snd_done) {
+        wq_wait_locked(&r->wq, &c->snd_lock);
+        spin_take(&c->snd_lock);
+    }
+    spin_unlock(&c->snd_lock, f);
+    audio_remote_detach(r);
 }
 
 static int snd_message(struct rdp *c, const uint8_t *m, uint32_t n) {
@@ -1274,71 +1452,12 @@ static int snd_message(struct rdp *c, const uint8_t *m, uint32_t n) {
     if (r.err) return 0;
     switch (type) {
     case SNDC_FORMATS: return c->snd_state == SND_FORMATS ? snd_client_formats(c, &r) : 0;
-    case SNDC_TRAINING:
-        if (c->snd_state != SND_TRAINING) return 0;
-        c->snd_buf = kmalloc(SND_BUF);
-        if (!c->snd_buf) {
-            c->snd_state = SND_OFF;
-            return 0;
-        }
-        c->snd_state = SND_PLAYING;
-        c->snd_until = 0;
-        audio_remote_attach();
-        kprintf("rdp: sound goes to \"%s\" (version %u)\n", c->client_name, c->snd_version);
+    case SNDC_TRAINING: return c->snd_state == SND_TRAINING ? snd_start(c) : 0;
+    case SNDC_WAVECONFIRM:
+        if (c->snd_state == SND_PLAYING) snd_confirm(c, &r);
         return 0;
-    case SNDC_WAVECONFIRM: c->snd_confirmed++; return 0;
     default: return 0; /* quality mode */
     }
-}
-
-/* One block of sound. buf has 16 bytes of room for headers before the samples. */
-static int snd_wave(struct rdp *c, uint8_t *buf, uint32_t len) {
-    uint8_t *d = buf + 16;
-    uint16_t ts = (uint16_t)c->snd_until;
-    c->snd_block++;
-    c->snd_blocks++;
-    if (c->snd_version >= 8) { /* one message */
-        struct wbuf w = {buf, 0, 16};
-        snd_header(&w, SNDC_WAVE2, (uint16_t)(12 + len));
-        w16(&w, ts);
-        w16(&w, c->snd_format);
-        w8(&w, c->snd_block);
-        wzero(&w, 3);
-        w32(&w, (uint32_t)c->snd_until);
-        return vc_send(c, c->snd, buf, 16 + len);
-    }
-    /* older clients: a wave info message with the first four bytes, then the rest in a wave
-       message whose first four bytes are padding */
-    uint8_t info[16];
-    struct wbuf w = {info, 0, sizeof info};
-    snd_header(&w, SNDC_WAVE, (uint16_t)(len + 8));
-    w16(&w, ts);
-    w16(&w, c->snd_format);
-    w8(&w, c->snd_block);
-    wzero(&w, 3);
-    wbytes(&w, d, 4);
-    int e = vc_send(c, c->snd, info, w.n);
-    if (e) return e;
-    memset(d, 0, 4);
-    return vc_send(c, c->snd, d, len);
-}
-
-/* Send the sound that is due within the lead time. When nothing is playing nothing is sent;
-   the next sound starts its timeline afresh. A block goes out when every stream has a whole one
-   (audio_ready), or when the client would soon have nothing left: a stream fed in small pieces
-   (Web Audio) is not padded with silence in the middle of its sound. */
-static int snd_push(struct rdp *c) {
-    if (c->snd_state == SND_WAIT && uptime_ms() >= c->snd_start_at) return snd_offer(c);
-    if (c->snd_state != SND_PLAYING) return 0;
-    uint64_t now = uptime_ms();
-    if (c->snd_until < now) c->snd_until = now;
-    while (c->snd_until < now + SND_LEAD_MS && audio_ready(SND_BLOCK_FRAMES, c->snd_until < now + 2 * SND_BLOCK_MS)) {
-        audio_mix((int16_t *)(c->snd_buf + 16), SND_BLOCK_FRAMES);
-        int e = snd_wave(c, c->snd_buf, SND_BLOCK_FRAMES * AUDIO_FRAME);
-        if (e) return e;
-        c->snd_until += SND_BLOCK_MS;
-    }
-    return 0;
 }
 
 #define RDPDR_CTYP_CORE 0x4472
@@ -1356,7 +1475,7 @@ static int rdpdr_send(struct rdp *c, uint16_t packet, const uint8_t *body, uint3
     w16(&w, RDPDR_CTYP_CORE);
     w16(&w, packet);
     wbytes(&w, body, n);
-    return vc_send(c, c->rdpdr, m, w.n);
+    return vc_send(c, c->out, c->rdpdr, m, w.n);
 }
 
 /* the server's version and the client id: the start of the handshake */
@@ -1482,7 +1601,7 @@ static int share_pdu(struct rdp *c, struct rbuf *r) {
             if (!e) e = rdpdr_start(c);
             if (c->snd >= 0) {
                 c->snd_state = SND_WAIT;
-                c->snd_start_at = uptime_ms() + (c->rdpdr >= 0 ? 3000 : 0); /* should rdpdr stall */
+                c->snd_start_at = clock_after(c->rdpdr >= 0 ? 3 * NS_PER_S : 0); /* should rdpdr stall */
             }
         }
         c->active = true;
@@ -1548,7 +1667,7 @@ static int mcs_pdu(struct rdp *c, int len) {
     case 1: return 0; /* erect domain */
     case 8: return -N_ERR_CLOSED; /* disconnect provider ultimatum */
     case 10: { /* attach user: confirm with our user id */
-        struct wbuf w = x224_begin(c);
+        struct wbuf w = x224_begin(c->out);
         w8(&w, (11 << 2) | 2);
         w8(&w, 0);
         w16be(&w, (uint16_t)(c->user_id - 1001));
@@ -1556,7 +1675,7 @@ static int mcs_pdu(struct rdp *c, int len) {
     }
     case 14: { /* channel join: everything the client asked for is fine */
         uint16_t initiator = r16be(&r), channel = r16be(&r);
-        struct wbuf w = x224_begin(c);
+        struct wbuf w = x224_begin(c->out);
         w8(&w, (15 << 2) | 2);
         w8(&w, 0);
         w16be(&w, initiator);
@@ -1578,6 +1697,11 @@ static int mcs_pdu(struct rdp *c, int len) {
     }
 }
 
+/* No notice comes when the desktop is redrawn (wm_remote_damage) or the clipboard changes: the
+   session looks at them after every wake, which comes this soon at the latest. */
+#define LOOK_NS      (30 * NS_PER_MS)
+#define LOOK_BUSY_NS (10 * NS_PER_MS) /* while the desktop keeps being redrawn */
+
 static void session(void *arg) {
     struct rdp *c = kzalloc(sizeof *c);
     struct hvsock *s = arg;
@@ -1589,12 +1713,12 @@ static void session(void *arg) {
     if (!c->in || !c->out) goto out;
 
     /* VMConnect's availability probe connects and hangs up without a word */
-    int len = read_pdu(c, 10000);
+    int len = read_pdu(c, clock_after(10 * NS_PER_S));
     if (len <= 0) goto out;
     if (c->in[0] != 3 || connection_request(c, len)) goto out;
     c->bpp = 16;
     /* a client that wants TLS or CredSSP hangs up after our answer and tries again without */
-    if ((len = read_pdu(c, 10000)) <= 0 || c->in[0] != 3 || connect_initial(c, len)) goto out;
+    if ((len = read_pdu(c, clock_after(10 * NS_PER_S))) <= 0 || c->in[0] != 3 || connect_initial(c, len)) goto out;
 
     /* the desktop takes the size of the client's window */
     if (!wm_remote_attach(&c->width, &c->height)) {
@@ -1610,9 +1734,12 @@ static void session(void *arg) {
 
     int err = 0;
     while (!err) {
-        bool playing = c->snd_state == SND_PLAYING && audio_pending();
-        if (hvsock_wait(s, playing ? 10 : 30)) {
-            len = read_pdu(c, 5000);
+        /* the next look, the size the client asked for once it has settled, sound to offer */
+        uint64_t wake = clock_after(c->screen_busy ? LOOK_BUSY_NS : LOOK_NS);
+        if (c->want_w && c->active) wake = MIN(wake, c->resize_at);
+        if (c->snd_state == SND_WAIT) wake = MIN(wake, c->snd_start_at);
+        if (hvsock_wait(s, wake)) {
+            len = read_pdu(c, clock_after(5 * NS_PER_S));
             if (len <= 0) {
                 err = len ? len : -N_ERR_CLOSED;
                 break;
@@ -1623,20 +1750,22 @@ static void session(void *arg) {
         if (!err) err = apply_resize(c);
         if (!err) err = push_updates(c);
         if (!err) err = clip_poll(c);
-        if (!err) err = snd_push(c);
+        if (!err && c->snd_state == SND_WAIT && clock_now_ns() >= c->snd_start_at) err = snd_offer(c);
+        if (!err) err = __atomic_load_n(&c->snd_err, __ATOMIC_RELAXED); /* the sound thread could not send */
     }
     if (c->started && err != -N_ERR_CLOSED) kprintf("rdp: session with \"%s\" failed (%d)\n", c->client_name, err);
     else if (c->started) kprintf("rdp: session with \"%s\" ended\n", c->client_name);
-    if (c->snd_blocks) kprintf("rdp: %u blocks of sound sent, %u confirmed\n", c->snd_blocks, c->snd_confirmed);
 out:
+    if (c) snd_finish(c);
+    if (c && c->snd_blocks) kprintf("rdp: %u blocks of sound sent, %u confirmed\n", c->snd_blocks, c->snd_confirmed);
     if (c && c->attached) wm_remote_detach();
-    if (c && c->snd_state == SND_PLAYING) audio_remote_detach();
     if (c) {
         kfree(c->in);
         kfree(c->out);
         kfree(c->shadow);
         kfree(c->dirty);
         kfree(c->snd_buf);
+        kfree(c->snd_out);
         for (int k = 0; k < (int)ARRAY_SIZE(c->vc); k++) kfree(c->vc[k].buf);
         kfree(c);
     }

@@ -1,7 +1,7 @@
 #pragma once
 #include "kernel.h"
 
-struct regs;
+/* CPU 0 at boot, before the other CPUs start: whether the command line asks for samples. */
 void prof_init(void);
-bool prof_enabled(void);
-void prof_tick(const struct regs *r, bool idle);
+/* Each CPU as it starts, after its alarms (sys/alarm.h): its samples begin. */
+void prof_cpu_start(void);

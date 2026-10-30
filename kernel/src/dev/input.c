@@ -5,6 +5,7 @@
 #include "arch/spin.h"
 #include "dev/input.h"
 #include "dev/pm.h"
+#include "sys/clock.h"
 #include "vm/vm.h"
 
 /* Locks, in the order they are taken:
@@ -172,21 +173,20 @@ static void mouse_irq(struct regs *r) {
     input_mouse(&e);
 }
 
-static bool wait_write(void) {
-    for (int i = 0; i < 100000; i++) {
-        if (!(inb(0x64) & 2)) return true;
+/* The controller's input buffer empty, or a byte in its output buffer, within PS2_WAIT_NS: a
+   device answers a command in a few of its own bytes, a millisecond each. */
+#define PS2_WAIT_NS (100 * NS_PER_MS)
+static bool wait_status(uint8_t bit, bool set) {
+    uint64_t deadline = clock_after(PS2_WAIT_NS);
+    for (;;) {
+        if (((inb(0x64) & bit) != 0) == set) return true;
+        if (clock_now_ns() >= deadline) return false;
         pause();
     }
-    return false;
 }
 
-static bool wait_read(void) {
-    for (int i = 0; i < 100000; i++) {
-        if (inb(0x64) & 1) return true;
-        pause();
-    }
-    return false;
-}
+static bool wait_write(void) { return wait_status(2, false); }
+static bool wait_read(void) { return wait_status(1, true); }
 
 static void ctl_cmd(uint8_t c) { wait_write(); outb(0x64, c); }
 

@@ -154,7 +154,7 @@ static int screen_bar(const struct pci_device *d) {
 static struct spinlock screen_hold_lock;
 static struct pci_claim *screen_holder;
 static int screen_holder_app;
-static uint64_t screen_held_since, screen_hold_limit_ms;
+static uint64_t screen_held_since, screen_hold_limit_ns;
 static bool screen_holder_stopped, screen_watch_started;
 static struct wait_queue screen_watch_wq;
 
@@ -177,19 +177,18 @@ static void screen_watch(void *arg) {
     (void)arg;
     char limit[64];
     ksnprintf(limit, sizeof limit, "its driver has held the screen for %lu s (fbhold=)",
-              (unsigned long)(screen_hold_limit_ms / 1000));
+              (unsigned long)(screen_hold_limit_ns / NS_PER_S));
     for (;;) {
         uint64_t irq = spin_lock(&screen_hold_lock);
         bool holding = screen_holder && !screen_holder_stopped;
-        uint64_t held = holding ? uptime_ms() - screen_held_since : 0;
-        if (holding && held >= screen_hold_limit_ms) {
+        uint64_t until = holding ? screen_held_since + screen_hold_limit_ns : CLOCK_NEVER;
+        if (holding && clock_now_ns() >= until) {
             spin_unlock(&screen_hold_lock, irq);
             screen_holder_stop(limit);
             continue;
         }
         /* a hold that begins or ends takes screen_hold_lock first, then wakes this */
-        if (!holding) wq_wait_locked(&screen_watch_wq, &screen_hold_lock);
-        else wq_wait_locked_timeout(&screen_watch_wq, &screen_hold_lock, screen_hold_limit_ms - held);
+        wq_wait_locked_until(&screen_watch_wq, &screen_hold_lock, until);
         irq_restore(irq);
     }
 }
@@ -200,7 +199,8 @@ static void screen_hold_begin(struct pci_claim *c) {
         screen_watch_started = true;
         uint64_t seconds;
         if (cmdline_number("fbhold", &seconds) && seconds) {
-            screen_hold_limit_ms = seconds > UINT64_MAX / 1000 ? UINT64_MAX : seconds * 1000;
+            /* at most a century: the hold's end stays a moment the clock reaches */
+            screen_hold_limit_ns = MIN(seconds, (uint64_t)100 * 365 * 86400) * NS_PER_S;
             kthread_create("screen hold", screen_watch, NULL);
         }
     }
@@ -211,7 +211,7 @@ static void screen_hold_begin(struct pci_claim *c) {
     uint64_t irq = spin_lock(&screen_hold_lock);
     screen_holder = c;
     screen_holder_app = app;
-    screen_held_since = uptime_ms();
+    screen_held_since = clock_now_ns();
     screen_holder_stopped = false;
     wq_wake_all(&screen_watch_wq);
     spin_unlock(&screen_hold_lock, irq);
@@ -764,14 +764,14 @@ int64_t pci_user_screen_vblank(struct handle *h, uint64_t count, uint64_t timest
     return 0;
 }
 
-int64_t pci_user_screen_state(struct handle *h, uint64_t seen, struct n_screen_state *out, int64_t timeout_ms) {
+int64_t pci_user_screen_state(struct handle *h, uint64_t seen, struct n_screen_state *out, uint64_t deadline) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     mutex_lock(&screen_lock);
     bool ours = screen_owner == c || screen_modes_from == c;
     mutex_unlock(&screen_lock);
     if (!ours) return -N_ERR_DENIED;
-    return wm_screen_state(seen, out, timeout_ms);
+    return wm_screen_state(seen, out, deadline);
 }
 
 int64_t pci_user_screen_modes(struct handle *h, const struct n_screen_modes *m) {
@@ -912,7 +912,7 @@ static void acpi_noted(void *context, uint64_t value) {
     spin_unlock(&c->notes_lock, irq);
 }
 
-int64_t pci_user_acpi_notify_take(struct handle *h, int64_t timeout_ms) {
+int64_t pci_user_acpi_notify_take(struct handle *h, uint64_t deadline) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (!acpi_aml_ready()) return -N_ERR_UNSUPPORTED;
@@ -922,7 +922,6 @@ int64_t pci_user_acpi_notify_take(struct handle *h, int64_t timeout_ms) {
     bool watched = c->acpi_watch != NULL;
     mutex_unlock(&c->acpi_lock);
     if (!watched) return c->acpi_node ? -N_ERR_NO_MEMORY : -N_ERR_NOT_FOUND;
-    uint64_t give_up = timeout_ms > 0 ? uptime_ms() + (uint64_t)timeout_ms : 0;
     uint64_t irq = spin_lock(&c->notes_lock);
     for (;;) {
         if (c->acpi_count) {
@@ -933,12 +932,9 @@ int64_t pci_user_acpi_notify_take(struct handle *h, int64_t timeout_ms) {
             return value;
         }
         if (current_task->killed) { spin_unlock(&c->notes_lock, irq); return -N_ERR_STOPPED; }
-        if (!timeout_ms) { spin_unlock(&c->notes_lock, irq); return -N_ERR_TIMEOUT; }
-        uint64_t now = uptime_ms();
-        if (timeout_ms > 0 && now >= give_up) { spin_unlock(&c->notes_lock, irq); return -N_ERR_TIMEOUT; }
+        if (clock_now_ns() >= deadline) { spin_unlock(&c->notes_lock, irq); return -N_ERR_TIMEOUT; }
         /* acpi_noted takes notes_lock to add a value, then wakes acpi_wq */
-        if (timeout_ms < 0) wq_wait_locked(&c->acpi_wq, &c->notes_lock);
-        else wq_wait_locked_timeout(&c->acpi_wq, &c->notes_lock, give_up - now);
+        wq_wait_locked_until(&c->acpi_wq, &c->notes_lock, deadline);
         spin_take(&c->notes_lock); /* a value that came at the time limit is still taken */
     }
 }
@@ -1110,23 +1106,20 @@ static int64_t interrupts_on(struct pci_claim *c, uint32_t count) {
     return n;
 }
 
-int64_t pci_user_interrupt_take(struct handle *h, int64_t timeout_ms) {
+int64_t pci_user_interrupt_take(struct handle *h, uint64_t deadline) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
-    uint64_t give_up = timeout_ms > 0 ? uptime_ms() + (uint64_t)timeout_ms : 0;
     uint64_t irq = spin_lock(&claim_irq_lock);
     for (;;) {
         uint32_t got = __atomic_exchange_n(&c->pending, 0, __ATOMIC_ACQUIRE);
         if (got) { spin_unlock(&claim_irq_lock, irq); return got; }
         int64_t r = 0;
-        uint64_t now = uptime_ms();
         if (current_task->killed) r = -N_ERR_STOPPED;
         else if (!c->vectors) r = -N_ERR_NOT_READY;
-        else if (!timeout_ms || (timeout_ms > 0 && now >= give_up)) r = -N_ERR_TIMEOUT;
+        else if (clock_now_ns() >= deadline) r = -N_ERR_TIMEOUT;
         if (r) { spin_unlock(&claim_irq_lock, irq); return r; }
         /* the interrupt handler and interrupts_off take claim_irq_lock, then wake c->wq */
-        if (timeout_ms < 0) wq_wait_locked(&c->wq, &claim_irq_lock);
-        else wq_wait_locked_timeout(&c->wq, &claim_irq_lock, give_up - now);
+        wq_wait_locked_until(&c->wq, &claim_irq_lock, deadline);
         spin_take(&claim_irq_lock); /* a message that came at the time limit is still taken */
     }
 }

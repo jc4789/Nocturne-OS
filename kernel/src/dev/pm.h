@@ -23,7 +23,7 @@
    the firmware's display).
 
    Quiesce callbacks run on one CPU with its interrupts off: they may only poll
-   (io_wait, the TSC), never sleep or wait for uptime_ms, which may stand still.
+   (io_wait, the clock: clock_spin and clock_now_ns, sys/clock.h), never sleep.
    For a sleep or hibernation that CPU is CPU 0 and every other CPU is parked;
    for a shut down or restart it is the power thread's, and the other CPUs
    still run kernel threads. They return false when the device did not
@@ -31,7 +31,7 @@
    called off and the devices stopped so far are resumed; a shut down goes on.
    Resume callbacks run on CPU 0 with interrupts on, every other CPU still
    parked and no other thread running (the AML of _WAK is frozen too,
-   dev/acpi.h): they may poll uptime_ms but must not sleep. The device lost
+   dev/acpi.h): they may poll the clock but must not sleep. The device lost
    its state, or was only quiesced (a sleep called off); its PCI configuration
    space is already back (dev/pci.c). They return false when the device did
    not come back, which the user is told. */

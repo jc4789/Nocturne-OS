@@ -21,6 +21,7 @@
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "sys/clock.h"
 
 /* MMIO registers */
 #define R_DEVTAB    0x0000
@@ -429,8 +430,8 @@ static bool ivrs_plain_safe(const struct acpi_sdt *h) {
 /* ---- commands and events ---- */
 /* Waits until the status bits `bits` read `want`: false when they did not in time. */
 static bool register_wait(const struct unit *u, unsigned off, uint32_t bits, uint32_t want) {
-    for (uint64_t t = iommu_deadline(10); (rd(u, off) & bits) != want; pause())
-        if (iommu_expired(t)) return false;
+    for (uint64_t t = clock_after(10 * NS_PER_MS); (rd(u, off) & bits) != want; pause())
+        if (clock_now_ns() >= t) return false;
     return true;
 }
 
@@ -491,12 +492,13 @@ static void commands_restart(struct unit *u) {
    after it until the sync, which would each wait as long under amd_lock with interrupts off. */
 static void command(struct unit *u, unsigned op, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
     if (u->stalled) return;
-    for (uint64_t t = iommu_deadline(100); (rd(u, R_CMD_HEAD) & 0x7FFF0) == (u->cmd_tail + 16) % RING_BYTES; pause()) {
+    for (uint64_t t = clock_after(100 * NS_PER_MS); (rd(u, R_CMD_HEAD) & 0x7FFF0) == (u->cmd_tail + 16) % RING_BYTES;
+         pause()) {
         if (!(rd(u, R_STATUS) & ST_CMDBUF_RUN)) {
             commands_restart(u);
             break;
         }
-        if (iommu_expired(t)) {
+        if (clock_now_ns() >= t) {
             u->lost = u->stalled = true;
             return;
         }
@@ -588,10 +590,10 @@ static bool sync(void) {
     }
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
-        for (uint64_t t = iommu_deadline(100); !u->lost && word[i] != token; pause()) {
+        for (uint64_t t = clock_after(100 * NS_PER_MS); !u->lost && word[i] != token; pause()) {
             if (!(rd(u, R_STATUS) & ST_CMDBUF_RUN)) {
                 commands_restart(u);
-            } else if (iommu_expired(t)) {
+            } else if (clock_now_ns() >= t) {
                 kprintf("iommu: unit at %lx did not finish its commands\n", u->base);
                 u->lost = true;
             }

@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include "vm/devices.h"
 #include "net/net.h"
+#include "sys/clock.h"
 #include "arch/cpu.h"
 #include "arch/spin.h"
 #include "dev/pci.h"
@@ -201,8 +202,9 @@ static uint32_t itr_ticks; /* 0: the 82544GC/EI, which has no ITR */
 static void hw_reset(void) {
     wr(REG_IMC, 0xFFFFFFFF);
     wr(REG_CTRL, rd(REG_CTRL) | (1u << 26)); /* device reset */
-    net_delay_ms(10);
-    for (int i = 0; i < 1000 && (rd(REG_CTRL) & (1u << 26)); i++) net_delay_ms(1);
+    clock_spin(10 * NS_PER_MS);
+    for (uint64_t until = clock_after(NS_PER_S); (rd(REG_CTRL) & (1u << 26)) && clock_now_ns() < until;)
+        clock_spin(NS_PER_MS);
     wr(REG_IMC, 0xFFFFFFFF);
     uint32_t ctrl = rd(REG_CTRL);
     ctrl |= (1u << 6) | (1u << 5);                  /* SLU, ASDE */

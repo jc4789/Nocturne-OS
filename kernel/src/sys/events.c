@@ -8,7 +8,7 @@
 #include "sys/object.h"
 #include "sys/events.h"
 #include "mm/heap.h"
-#include "dev/timer.h"
+#include "sys/clock.h"
 
 /* A watch names a handle without holding it: the handle's last close ends the
    watch, so watching never keeps a channel end or an app record open. */
@@ -24,7 +24,7 @@ struct event_watch {
 };
 struct event_timer {
     struct event_timer *next;
-    uint64_t due, period, token;
+    uint64_t due, period, token; /* due: clock_now_ns; period: ns, 0 for once */
 };
 /* Every handle's list of watches (struct handle's watchers, chained by handle_next). Taken
    before a queue's lock. */
@@ -175,13 +175,13 @@ int events_watch_address(struct handle *queue, volatile uint32_t *address, uint3
     return r;
 }
 
-int events_timer(struct handle *queue, uint64_t ms, bool repeat, uint64_t token) {
+int events_timer(struct handle *queue, uint64_t ns, bool repeat, uint64_t token) {
     struct event_queue *q = queue_of(queue);
-    if (repeat && !ms) return -N_ERR_INVALID;
+    if (repeat && !ns) return -N_ERR_INVALID;
     struct event_timer *t = kmalloc(sizeof *t);
     if (!t) return -N_ERR_NO_MEMORY;
-    t->due = timer_now_ms() + ms;
-    t->period = repeat ? ms : 0;
+    t->due = clock_after(ns);
+    t->period = repeat ? ns : 0;
     t->token = token;
     uint64_t flags = spin_lock(&q->lock);
     t->next = q->timers;
@@ -229,20 +229,18 @@ int events_unwatch(struct handle *queue, uint64_t token) {
 
 #define EVENTS_BATCH 64
 
-int64_t events_wait(struct handle *queue, struct n_event *uout, size_t max, int64_t timeout_ms) {
+int64_t events_wait(struct handle *queue, struct n_event *uout, size_t max, uint64_t deadline) {
     struct event_queue *q = queue_of(queue);
     if (!max) return -N_ERR_INVALID;
     if (max > EVENTS_BATCH) max = EVENTS_BATCH; /* the rest stays for the next wait */
     struct n_event out[EVENTS_BATCH];
     uint64_t tokens[EVENTS_BATCH];
-    uint64_t deadline = timeout_ms > 0 ? timer_now_ms() + (uint64_t)timeout_ms : 0;
-    bool block = timeout_ms != 0;
     for (;;) {
         uint64_t fl = spin_lock(&q->lock);
         /* Read before the scan: a change on any CPU after it moves the word on before it wakes the
            queue, and the sleep below then does not begin. */
         uint64_t seen = __atomic_load_n(&q->wait.generation, __ATOMIC_ACQUIRE);
-        uint64_t now = timer_now_ms(), next_due = UINT64_MAX;
+        uint64_t now = clock_now_ns(), next_due = CLOCK_NEVER;
         struct event_timer *fired = NULL;
         size_t n = 0;
         for (struct event_timer **at = &q->timers; *at;) {
@@ -251,8 +249,8 @@ int64_t events_wait(struct handle *queue, struct n_event *uout, size_t max, int6
                 out[n++] = (struct n_event){.token = t->token, .events = N_EVENT_TIMER};
                 if (!t->period) { *at = t->next; t->next = fired; fired = t; continue; }
                 /* keep the cadence; a late wait does not report the missed ticks */
-                t->due += t->period;
-                if (t->due <= now) t->due = now + t->period;
+                t->due = t->due < CLOCK_NEVER - t->period ? t->due + t->period : CLOCK_NEVER;
+                if (t->due <= now) t->due = clock_after(t->period);
             }
             if (t->due < next_due) next_due = t->due;
             at = &t->next;
@@ -270,15 +268,11 @@ int64_t events_wait(struct handle *queue, struct n_event *uout, size_t max, int6
         }
         spin_unlock(&q->lock, fl);
         while (fired) { struct event_timer *next = fired->next; kfree(fired); fired = next; }
-        bool expired = timeout_ms > 0 && now >= deadline;
-        if (n || !block || expired) {
+        if (n || now >= deadline) {
             if (n && copy_to_user(uout, out, n * sizeof *uout) < 0) return -N_ERR_BAD_ADDRESS;
             return (int64_t)n;
         }
         if (current_task->killed) return -N_ERR_STOPPED;
-        uint64_t until = timeout_ms > 0 ? deadline : UINT64_MAX;
-        if (next_due < until) until = next_due;
-        if (until == UINT64_MAX) wq_wait_unless(&q->wait.wq, &q->wait.generation, seen, 0);
-        else if (until > now) wq_wait_unless(&q->wait.wq, &q->wait.generation, seen, until - now);
+        wq_wait_unless(&q->wait.wq, &q->wait.generation, seen, MIN(deadline, next_due));
     }
 }

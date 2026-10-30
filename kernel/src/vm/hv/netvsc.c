@@ -12,6 +12,7 @@
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "net/net.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 
 static const struct guid net_guid =
@@ -42,7 +43,8 @@ enum {
    A cursor and host-owned receive credit survive a budget boundary. */
 #define RX_MESSAGE_BUDGET 128
 #define RX_BYTE_BUDGET (128 * 1024)
-#define RX_TIME_BUDGET_MS 2
+#define RX_TIME_BUDGET (2 * NS_PER_MS)
+#define SETUP_REPLY_WAIT (5 * NS_PER_S) /* how long the probe waits for each NVSP or RNDIS reply */
 
 enum {
     RNDIS_PACKET = 1,
@@ -122,12 +124,15 @@ static struct {
     bool link_up;
     uint64_t tx_backpressure;
     /* The channel callback and the rescind (VMBus's interrupt handler, CPU 0) only set these
-       latches, mask the host's signal and wake the net thread. Everything else here (both rings,
+       latches, mask the host's signal, count the signal and wake the net thread and the probe's
+       wait (netvsc_wait). Everything else here (both rings,
        the send sections, the receive borrow, the queues below) belongs to the stack's calls into
        the adapter, which come one at a time from any CPU under the stack's lock, and before
        registration to the probe alone: the net thread (or the probe's synchronous wait) is the
        sole ring reader. */
     volatile bool event_pending, detaching;
+    uint64_t signals; /* every callback and rescind; the probe's wait sleeps until it moves */
+    struct wait_queue signal_wq;
     uint8_t *rx_packet;
     uint32_t rx_capacity, rx_len, rx_range, rx_position;
     bool rx_borrowed, completion_wait;
@@ -265,18 +270,26 @@ static bool complete_receive(void) {
     return true;
 }
 
+/* The host moved something: a packet came, room came in the outbound ring (pending_send_sz), or
+   the channel went. Interrupt context. */
+static void netvsc_signal(void) {
+    __atomic_fetch_add(&nv.signals, 1, __ATOMIC_SEQ_CST);
+    wq_wake_all(&nv.signal_wq);
+    net_rx_notify();
+}
+
 static void netvsc_callback(struct vmbus_channel *ch) {
     if (ch != __atomic_load_n(&nv.ch, __ATOMIC_ACQUIRE) || ch->rescinded) return;
     ch->in->interrupt_mask = 1;
     nv.event_pending = true;
-    net_rx_notify();
+    netvsc_signal();
 }
 
 static void netvsc_rescind(struct vmbus_channel *ch) {
     if (ch != __atomic_load_n(&nv.ch, __ATOMIC_ACQUIRE)) return;
     nv.detaching = true;
     nv.link_up = false;
-    net_rx_notify();
+    netvsc_signal();
 }
 
 static void free_buffer(uint8_t *buffer, uint32_t pages) {
@@ -360,7 +373,7 @@ static bool netvsc_rx_pending(void) {
 static size_t netvsc_poll_rx(void (*input)(const void *, size_t)) {
     if (nv.detaching || (nv.ch && nv.ch->rescinded)) { netvsc_shutdown(); return 0; }
     if (!nv.ch || !nv.rx_packet) return 0;
-    uint64_t started = uptime_ms();
+    uint64_t started = clock_now_ns();
     uint32_t messages = 0, bytes = 0;
     size_t frames = 0;
     bool completion_blocked = false;
@@ -369,7 +382,7 @@ static size_t netvsc_poll_rx(void (*input)(const void *, size_t)) {
     nv.ch->in->interrupt_mask = 1;
     nv.event_pending = false;
     while (messages < RX_MESSAGE_BUDGET && bytes < RX_BYTE_BUDGET) {
-        if ((messages & 7) == 0 && uptime_ms() - started >= RX_TIME_BUDGET_MS) {
+        if ((messages & 7) == 0 && clock_now_ns() >= started + RX_TIME_BUDGET) {
             budget_exhausted = true;
             break;
         }
@@ -505,20 +518,21 @@ static void netvsc_get_stats(struct n_netstats *stats) {
     stats->rx_ring_high_water = nv.rx_ring_high_water;
 }
 
-static bool netvsc_wait(volatile bool *flag, uint64_t ms) {
-    uint64_t started = uptime_ms();
+/* The probe, before registration: read the channel until *flag, or until the deadline (false).
+   Between reads it sleeps until the host's next signal (netvsc_signal): a packet, or room for the
+   completion a full outbound ring refused (vmbus asks the host for that through pending_send_sz). */
+static bool netvsc_wait(volatile bool *flag, uint64_t deadline) {
     while (!*flag) {
-        if (!nv.ch || nv.ch->rescinded || uptime_ms() - started >= ms) return false;
+        if (!nv.ch || nv.ch->rescinded || clock_now_ns() >= deadline) return false;
+        uint64_t seen = __atomic_load_n(&nv.signals, __ATOMIC_SEQ_CST);
         netvsc_poll_rx(NULL);
-        if (*flag) return nv.ch && !nv.detaching && !nv.ch->rescinded;
-        /* No IRQ-side parsing, and no pause-loop on a blocked completion.
-           The timer provides a fallback on hosts without ring-space events. */
+        if (*flag || !nv.ch) break;
         if ((nv.rx_borrowed && !nv.completion_wait) || vmbus_rx_pending(nv.ch) ||
             (nv.completion_wait && vmbus_write_ready(nv.ch, sizeof(struct vmpacket_desc) + NVSP_MSG_SIZE)))
             sched_yield();
-        else sleep_ms(1);
+        else wq_wait_unless(&nv.signal_wq, &nv.signals, seen, deadline);
     }
-    return nv.ch && !nv.detaching && !nv.ch->rescinded;
+    return *flag && nv.ch && !nv.detaching && !nv.ch->rescinded;
 }
 
 /* ---- setup ---- */
@@ -530,7 +544,7 @@ static bool nvsp_request(const void *msg, uint32_t reply) {
     nv.nvsp_done = false;
     nv.nvsp_wait_type = reply;
     if (vmbus_send(nv.ch, VM_PKT_DATA_INBAND, VMBUS_FLAG_COMPLETION_REQUESTED, m, sizeof m, 1)) return false;
-    if (!netvsc_wait(&nv.nvsp_done, 5000)) {
+    if (!netvsc_wait(&nv.nvsp_done, clock_after(SETUP_REPLY_WAIT))) {
         kprintf("netvsc: no reply to NVSP message %u\n", *(uint32_t *)m);
         return false;
     }
@@ -605,7 +619,7 @@ static bool rndis_request(void *msg, uint32_t len) {
     nv.rndis_done = false;
     nv.rndis_wait_id = m[2];
     if (send_rndis(msg, len, true)) return false;
-    if (!netvsc_wait(&nv.rndis_done, 5000)) {
+    if (!netvsc_wait(&nv.rndis_done, clock_after(SETUP_REPLY_WAIT))) {
         kprintf("netvsc: no reply to RNDIS message %u\n", m[0]);
         return false;
     }

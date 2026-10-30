@@ -4,6 +4,7 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "arch/spin.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
 #include "limine.h"
@@ -118,7 +119,7 @@ static inline uint64_t *tbl(uint64_t phys) { return (uint64_t *)phys_to_virt(phy
 #define CR4_PCIDE    (1ULL << 17)
 #define CR3_NOFLUSH  (1ULL << 63)
 #define TLB_RANGE_MAX 32 /* above this a local flush is cheaper than invlpg per page */
-#define TLB_ACK_MS 5000  /* a CPU that does not answer for this long is broken */
+#define TLB_ACK_NS (5 * NS_PER_S) /* a CPU that does not answer for this long is broken */
 
 static bool pcid_on;
 static uint64_t cpu_loaded[CPU_MAX_COUNT];          /* pml4 in CR3, published before its gen is read */
@@ -200,10 +201,9 @@ void vmm_tlb_poll(void) {
         vmm_tlb_ipi();
 }
 
-static bool tlb_wait(unsigned cpu, uint64_t seq) {
-    uint64_t since = rdtsc(), spins = 0;
+static bool tlb_wait(unsigned cpu, uint64_t seq, uint64_t deadline) {
     while (__atomic_load_n(&tlb_ack[cpu], __ATOMIC_ACQUIRE) != seq) {
-        if ((tsc_hz && rdtsc() - since > tsc_hz / 1000 * TLB_ACK_MS) || ++spins > 1000000000) return false;
+        if (clock_now_ns() >= deadline) return false;
         pause();
     }
     return true;
@@ -248,8 +248,9 @@ static void tlb_shootdown(uint64_t pml4, uint64_t va, uint64_t pages) {
         if (!kernel && __atomic_load_n(&cpu_loaded[cpu], __ATOMIC_RELAXED) != pml4) continue;
         if (cpu_tlb_ipi(cpu)) { sent |= 1u << cpu; __atomic_add_fetch(&tlb_ipis, 1, __ATOMIC_RELAXED); }
     }
+    uint64_t deadline = clock_after(TLB_ACK_NS); /* the IPIs went out together */
     for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++)
-        if ((sent & (1u << cpu)) && !tlb_wait(cpu, seq) && cpu_online_at(cpu))
+        if ((sent & (1u << cpu)) && !tlb_wait(cpu, seq, deadline) && cpu_online_at(cpu))
             panic("vmm: TLB shootdown ACK timeout cpu %u", cpu);
     spin_give(&tlb_lock);
 }

@@ -59,6 +59,8 @@ size_t klog_read(char *buf, size_t max);
 /* The log's text from its at'th byte ever written on, up to max bytes, and at moved past it. What
    the ring no longer holds is skipped: lost tells how many bytes. */
 size_t klog_since(size_t *at, char *buf, size_t max, size_t *lost);
+/* A thread: asleep until text past the at'th byte is written, or the deadline (sys/sched.h). */
+void klog_wait(size_t at, uint64_t deadline);
 
 #define ASSERT(x) do { if (!(x)) panic("assertion failed: %s (%s:%d)", #x, __FILE__, __LINE__); } while (0)
 
@@ -67,6 +69,3 @@ extern uint64_t hhdm_offset;
 static inline void *phys_to_virt(uint64_t p) { return (void *)(p + hhdm_offset); }
 static inline uint64_t hhdm_virt_to_phys(const void *v) { return (uint64_t)v - hhdm_offset; }
 
-/* timekeeping */
-extern volatile uint64_t timer_ticks; /* milliseconds since boot */
-static inline uint64_t uptime_ms(void) { return timer_ticks; }

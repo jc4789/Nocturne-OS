@@ -6,7 +6,6 @@
 #include "sys/syscall.h"
 #include "mm/vmm.h"
 #include "dev/entropy.h"
-#include "dev/timer.h"
 #include "arch/irq.h"
 
 struct idt_entry {
@@ -247,7 +246,6 @@ void isr_dispatch(struct regs *r) {
         return;
     }
     if (v == 2) smp_panic_nmi(); /* another CPU's panic stops this one; any other NMI is reported */
-    timer_wake(); /* a CPU idle without its tick: uptime_ms catches up first */
     if (v < 32) {
         exception(r, v == 14 ? read_cr2() : 0);
     } else if (v < 48) { /* the 8259's lines, which reach CPU 0 only */

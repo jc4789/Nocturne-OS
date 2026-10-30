@@ -6,6 +6,7 @@
 #include "dev/blk.h"
 #include "dev/usb.h"
 #include "mm/heap.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 
 #define CBW_SIG 0x43425355u /* "USBC" */
@@ -130,7 +131,7 @@ static bool unit_ready(struct msc *m, unsigned lun) {
                 started = true;
             }
         }
-        sleep_ms(250);
+        sleep_until(clock_after(250 * NS_PER_MS));
     }
     return false;
 }

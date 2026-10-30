@@ -1,8 +1,10 @@
 /* Local APIC. Legacy device IRQs still come from the 8259 PIC, routed through LINT0 (virtual wire
-   mode); the scheduler tick comes from the LAPIC timer, because Hyper-V Generation 2 VMs have no
-   PIT. Vectors 0x30 and up are LAPIC-delivered (timer, and later Hyper-V's SynIC) and need a LAPIC EOI. */
+   mode); each CPU's alarms are woken by its LAPIC timer (sys/alarm.c), which every machine has,
+   Hyper-V Generation 2 VMs included, which have no PIT. Vectors 0x30 and up are LAPIC-delivered
+   (the timer, IPIs, and Hyper-V's SynIC) and need a LAPIC EOI. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "sys/clock.h"
 #include "vm/vm.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
@@ -42,8 +44,6 @@ static bool available, x2_mode;
 static bool amd, cmci;           /* AMD's APIC architecture; the CMCI LVT entry is there (apic_init) */
 static unsigned family;          /* CPUID.1:EAX family, the extended one added at Fh */
 static uint32_t xapic_id_max = 0xFE;
-static uint32_t timer_reload;
-static int timer_vector;
 
 /* x2APICではMMIO pageを読むこと自体が無効。通常32bit registerは
    offset/16 + 0x800 のMSR、64bit ICRだけは送信側で別扱いする。 */
@@ -270,28 +270,24 @@ uint32_t lapic_current_id(void) {
     return x2_mode ? id : (id >> 24) & xapic_id_bits();
 }
 
-/* The BSP after S3: the same registers as apic_init, and the tick with its calibration. */
+/* The BSP after S3: the same registers as apic_init. */
 void lapic_resume(void) {
     if (!available) return;
     if (!lapic_mode_restore()) panic("apic: cannot return to %s mode after sleep", x2_mode ? "x2APIC" : "xAPIC");
     lapic_setup(true);
-    if (timer_reload) {
-        lapic_write(LAPIC_TIMER_DIV, 0xB);
-        lapic_tick_resume();
-    }
 }
 
 static bool xapic_ipi_ready(void);
 
 static void spin_us(unsigned us) {
-    uint64_t t0 = rdtsc(), n = tsc_hz / 1000000 * us;
-    while (rdtsc() - t0 < n) pause();
+    uint64_t until = clock_after(us * NS_PER_US);
+    while (clock_now_ns() < until) pause();
 }
 
 /* One INIT or STARTUP, then the wait that follows it: 10 ms after an INIT, 200 us after a
    STARTUP (SDM 9.4.4.1, Table 9-1). */
 static bool lapic_send_start(uint32_t apic_id, uint32_t cmd, unsigned wait_us) {
-    if (!lapic_addressable(apic_id) || tsc_hz < 1000000) return false;
+    if (!lapic_addressable(apic_id)) return false;
     if (x2_mode) {
         wrmsr(X2APIC_ICR, ((uint64_t)apic_id << 32) | cmd);
     } else {
@@ -394,79 +390,85 @@ void lapic_eoi(void) {
     if (available) lapic_write(LAPIC_EOI, 0);
 }
 
-uint64_t tsc_hz;
+/* ---- the wake device (sys/alarm.c) ----
+   The LAPIC timer interrupts this CPU once: in TSC-deadline mode where the CPU has it and the
+   clock is the TSC itself (CPUID.01H:ECX[24]; SDM vol. 3A 13.5.4.1), else counting down once
+   from a count of its input clock (APM vol. 2 16.4.1: one-shot, the count started by writing the
+   initial count, stopped by writing 0), at most 2^32 - 1 counts ahead: a later alarm sets it again
+   when it has come. Its input rate (divide by 1) is the hypervisor's word, else measured against
+   the clock; the count is taken from a rate a little above it, so the interrupt comes a little
+   after the moment rather than before it. */
+#define IA32_TSC_DEADLINE 0x6E0
+#define LVT_TSC_DEADLINE (2u << 17)
+#define WAKE_LATE_SHIFT 13 /* the rate taken 1/8192 high: under 0.013% late */
 
-/* Count LAPIC timer ticks (divide by 1) over 10 ms of PIT channel 2, and the TSC's into tsc_hz.
-   Returns Hz, or 0 if the PIT is missing. Channel 2 is polled through port 0x61, so no PIT
-   interrupt is needed. */
-static uint64_t calibrate_with_pit(void) {
-    uint8_t p61 = inb(0x61);
-    if (p61 == 0xFF) return 0;                /* nothing decodes the port */
-    outb(0x61, (p61 & ~0x02) | 0x01);         /* speaker off, gate on */
-    outb(0x43, 0xB0);                         /* channel 2, lo/hi byte, mode 0 */
-    uint16_t count = 11932;                   /* 1193182 Hz / 100 */
-    outb(0x42, count & 0xFF);
-    outb(0x42, count >> 8);
-    outb(0x61, inb(0x61) & ~0x01);            /* restart the count: gate low ... */
+static uint64_t wake_mult;      /* counts per ns, times 2^32 */
+static bool wake_tsc;
+static int wake_vector;
+
+/* The input clock's rate over 20 ms of the clock, with the timer masked. */
+static uint64_t measure_lapic_hz(void) {
+    lapic_write(LAPIC_TIMER_DIV, 0xB); /* divide by 1 */
+    lapic_write(LAPIC_LVT_TIMER, LVT_UNUSED);
     lapic_write(LAPIC_TIMER_INIT, 0xFFFFFFFF);
-    uint64_t tsc0 = rdtsc();
-    outb(0x61, inb(0x61) | 0x01);             /* ... and high */
-    uint64_t spins = 0;
-    while (!(inb(0x61) & 0x20) && ++spins <= 50000000) pause();
-    uint32_t elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CUR);
-    uint64_t tsc_ticks = rdtsc() - tsc0;
+    uint64_t start = clock_now_ns(), until = start + 20 * NS_PER_MS, now;
+    while ((now = clock_now_ns()) < until) pause();
+    uint32_t counted = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CUR);
     lapic_write(LAPIC_TIMER_INIT, 0);
-    outb(0x61, p61);
-    if (spins > 50000000 || elapsed < 1000) return 0; /* PITなしでもtimer/portを復旧 */
-    tsc_hz = tsc_ticks * 100;
-    return (uint64_t)elapsed * 100;
+    return (uint64_t)counted * NS_PER_S / (now - start);
 }
 
-/* Start the LAPIC timer as a periodic interrupt on `vector`. Returns false if that is impossible. */
-bool lapic_timer_start(unsigned hz, int vector) {
-    if (!available || !hz || vector < 32 || vector >= 0xFF) return false;
-    lapic_write(LAPIC_TIMER_DIV, 0xB);        /* divide by 1 */
-    lapic_write(LAPIC_LVT_TIMER, 0x10000 | (uint32_t)vector);
-    const char *src = "the hypervisor";
-    uint64_t freq = vm_timer_hz(&tsc_hz);
-    if (!freq) {
-        src = "PIT";
-        freq = calibrate_with_pit();
+bool lapic_wake_init(int vector) {
+    if (!available || vector < 32 || vector >= 0xFF) return false;
+    if (!wake_vector) {
+        uint32_t a, b, c, d;
+        cpuid(1, 0, &a, &b, &c, &d);
+        uint64_t tsc;
+        wake_tsc = (c & (1u << 24)) && clock_tsc_at(clock_now_ns(), &tsc);
+        uint64_t hz = 0;
+        const char *from = "the TSC";
+        if (!wake_tsc) {
+            from = "the hypervisor's word";
+            if (!(hz = vm_lapic_hz())) {
+                from = "the clock";
+                hz = measure_lapic_hz();
+            }
+            if (hz < 1000000) {
+                kprintf("apic: the LAPIC timer does not count (%lu Hz)\n", hz);
+                return false;
+            }
+            hz += hz >> WAKE_LATE_SHIFT;
+            wake_mult = (hz << 32) / NS_PER_S;
+        }
+        wake_vector = vector;
+        if (wake_tsc) kprintf("apic: alarms by TSC deadline\n");
+        else kprintf("apic: alarms by one-shot count, LAPIC timer %lu kHz by %s\n", hz / 1000, from);
     }
-    if (!freq) {
-        kprintf("apic: cannot measure the LAPIC timer frequency\n");
-        return false;
+    if (wake_tsc) {
+        lapic_write(LAPIC_LVT_TIMER, LVT_TSC_DEADLINE | (uint32_t)vector);
+        /* an MMIO write to the LVT before a WRMSR to the deadline, in order (SDM 13.5.4.1) */
+        __asm__ volatile("mfence" ::: "memory");
+        wrmsr(IA32_TSC_DEADLINE, 0);
+    } else {
+        lapic_write(LAPIC_TIMER_DIV, 0xB);
+        lapic_write(LAPIC_LVT_TIMER, (uint32_t)vector); /* one-shot, unmasked */
+        lapic_write(LAPIC_TIMER_INIT, 0);
     }
-    uint64_t reload = freq / hz;
-    if (!reload || reload > UINT32_MAX) return false;
-    uint32_t init = (uint32_t)reload;
-    timer_reload = init;
-    timer_vector = vector;
-    lapic_write(LAPIC_LVT_TIMER, 0x20000 | (uint32_t)vector); /* periodic, unmasked */
-    lapic_write(LAPIC_TIMER_INIT, init);
-    kprintf("apic: timer %lu kHz (from %s), %u Hz tick, TSC %lu kHz\n", freq / 1000, src, hz, tsc_hz / 1000);
     return true;
 }
 
-bool lapic_tick_start(void) {
-    if (!available || !timer_reload) return false;
-    lapic_write(LAPIC_TIMER_DIV, 0xB);
-    lapic_write(LAPIC_LVT_TIMER, 0x20000 | (uint32_t)timer_vector);
-    lapic_write(LAPIC_TIMER_INIT, timer_reload);
-    return true;
-}
-
-/* Tickless idle. An initial count of 0 stops the timer in either mode; one-shot mode counts
-   down once and stops. The CPU's own LAPIC only, with interrupts off. */
-void lapic_tick_stop(void) { lapic_write(LAPIC_TIMER_INIT, 0); }
-
-void lapic_tick_once(unsigned ms) {
-    if (ms > UINT32_MAX / timer_reload) ms = UINT32_MAX / timer_reload;
-    lapic_write(LAPIC_LVT_TIMER, (uint32_t)timer_vector);
-    lapic_write(LAPIC_TIMER_INIT, ms * timer_reload);
-}
-
-void lapic_tick_resume(void) {
-    lapic_write(LAPIC_LVT_TIMER, 0x20000 | (uint32_t)timer_vector);
-    lapic_write(LAPIC_TIMER_INIT, timer_reload);
+void lapic_wake_at(uint64_t ns) {
+    if (wake_tsc) {
+        uint64_t tsc;
+        /* 0 disarms it: never, or beyond the TSC's reach */
+        wrmsr(IA32_TSC_DEADLINE, ns != CLOCK_NEVER && clock_tsc_at(ns, &tsc) && tsc ? tsc : 0);
+        return;
+    }
+    if (ns == CLOCK_NEVER) {
+        lapic_write(LAPIC_TIMER_INIT, 0);
+        return;
+    }
+    uint64_t now = clock_now_ns(), delta = ns > now ? ns - now : 0;
+    unsigned __int128 count = ((unsigned __int128)delta * wake_mult) >> 32;
+    lapic_write(LAPIC_TIMER_INIT, count >= 0xFFFFFFFF ? 0xFFFFFFFF : count ? (uint32_t)count : 1);
 }

@@ -10,9 +10,9 @@ bool events_is(struct handle *h);
 int events_watch(struct handle *queue, struct handle *h, uint32_t interest, uint64_t token,
                  struct event_watch **spare);
 int events_watch_address(struct handle *queue, volatile uint32_t *address, uint32_t expected, uint64_t token);
-int events_timer(struct handle *queue, uint64_t ms, bool repeat, uint64_t token);
+int events_timer(struct handle *queue, uint64_t ns, bool repeat, uint64_t token);
 int events_unwatch(struct handle *queue, uint64_t token);
-int64_t events_wait(struct handle *queue, struct n_event *uout, size_t max, int64_t timeout_ms);
+int64_t events_wait(struct handle *queue, struct n_event *uout, size_t max, uint64_t deadline);
 size_t events_watch_size(void);
 /* The handle's last close: its watches end (each off its queue under the queue's lock). The
    caller frees them with events_watches_free. */

@@ -73,7 +73,6 @@ struct handle *stream_system_log_open(void) { return stream_open(&log_object); }
    System.log for this start, System-previous.log for the one before. It can be read from Files,
    or from another system (host/store). The writer commits it within seconds (fs/store.c). */
 
-#define KEEP_MS 500             /* how often new text goes to C: */
 #define KEEP_PIECE 65536        /* text taken from the log at a time */
 #define KEEP_MOST (32ull << 20) /* a start keeps this much at most: C: has its other uses */
 
@@ -89,7 +88,7 @@ static void log_keep(void *arg) {
     uint64_t kept = 0;
     for (size_t at = 0, lost, n;;) {
         if (!(n = klog_since(&at, piece, KEEP_PIECE, &lost))) {
-            sleep_ms(KEEP_MS);
+            klog_wait(at, CLOCK_NEVER);
             continue;
         }
         if (lost) keep_note(path, "\n[system log: %llu bytes were not kept here]\n", lost);

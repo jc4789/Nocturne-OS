@@ -7,42 +7,12 @@
 #include "mm/vmm.h"
 #include "vm/vm.h"
 
-struct gas {
-    uint8_t space, bit_width, bit_offset, access;
-    uint64_t address;
-} PACKED;
-
-struct fadt {
-    struct acpi_sdt h;
-    uint32_t firmware_ctrl, dsdt;
-    uint8_t reserved, pm_profile;
-    uint16_t sci_int;
-    uint32_t smi_cmd;
-    uint8_t acpi_enable, acpi_disable, s4bios_req, pstate_cnt;
-    uint32_t pm1a_evt, pm1b_evt, pm1a_cnt, pm1b_cnt, pm2_cnt, pm_tmr, gpe0, gpe1;
-    uint8_t pm1_evt_len, pm1_cnt_len, pm2_cnt_len, pm_tmr_len, gpe0_len, gpe1_len, gpe1_base, cst_cnt;
-    uint16_t p_lvl2_lat, p_lvl3_lat, flush_size, flush_stride;
-    uint8_t duty_offset, duty_width, day_alarm, mon_alarm, century;
-    uint16_t boot_arch;
-    uint8_t reserved2;
-    uint32_t flags;
-    struct gas reset_reg;
-    uint8_t reset_value;
-    uint8_t reserved3[3];
-    uint64_t x_firmware_ctrl, x_dsdt;
-    struct gas x_pm1a_evt, x_pm1b_evt, x_pm1a_cnt, x_pm1b_cnt, x_pm2_cnt, x_pm_tmr, x_gpe0, x_gpe1;
-    struct gas sleep_control, sleep_status; /* ACPI 5: hardware-reduced platforms */
-} PACKED;
-
-#define FADT_RESET_REG_SUP (1u << 10)
-#define FADT_HW_REDUCED    (1u << 20)
-
-static struct fadt *fadt;
+static const struct acpi_fadt *fadt;
 static uint16_t slp_typa, slp_typb;
 static bool s5_ok;
 
 /* Write a Generic Address Structure register (system memory or I/O space). */
-static void gas_write(const struct gas *g, uint64_t v) {
+static void gas_write(const struct acpi_gas *g, uint64_t v) {
     if (g->space == 0) {
         uint8_t *p = vmm_map_mmio(g->address & ~0xFFFULL, 4096);
         if (!p) return;
@@ -66,7 +36,7 @@ static bool fadt_has(size_t end) { return fadt && fadt->h.length >= end; }
 
 void acpi_init(void) {
     acpi_tables_init(); /* registry (+ "acpi: tables" line), MADT, MCFG */
-    fadt = (struct fadt *)acpi_find("FACP", 0);
+    fadt = acpi_find("FACP", 0);
     if (!fadt) {
         kprintf("acpi: no FADT found\n");
         return;

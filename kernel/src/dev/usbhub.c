@@ -5,6 +5,7 @@
 #include "kernel.h"
 #include "dev/usb.h"
 #include "mm/heap.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 
 #define HUB_PORTS 15 /* a route string tier has four bits */
@@ -125,7 +126,7 @@ void usbhub_detach(struct usb_device *d) {
 
 static void power_ports(struct hub *h) {
     for (unsigned p = 1; p <= h->ports; p++) port_feature(h->dev, USB_REQ_SET_FEATURE, PORT_POWER, p);
-    sleep_ms(h->power_ms);
+    sleep_until(clock_after(h->power_ms * NS_PER_MS));
     for (unsigned p = 1; p <= h->ports; p++) h->pending |= 1u << p;
 }
 
@@ -165,15 +166,16 @@ static void hub_status(struct hub *h) {
     }
 }
 
-/* Reset a port (warm: the SuperSpeed link reset) and wait until the hub reports it done. */
+/* Reset a port (warm: the SuperSpeed link reset) and wait until the hub reports it done, asking
+   each 10 ms for up to 500 ms. */
 static bool port_reset(struct hub *h, unsigned port, bool warm, uint16_t *status) {
     struct usb_device *d = h->dev;
     uint16_t change = 0, done = warm ? CH_BH_RESET : CH_RESET;
     port_feature(d, USB_REQ_SET_FEATURE, warm ? BH_PORT_RESET : PORT_RESET, port);
-    for (int t = 0; t < 50; t++) {
-        sleep_ms(10);
+    for (uint64_t deadline = clock_after(500 * NS_PER_MS);;) {
+        sleep_until(clock_after(10 * NS_PER_MS));
         if (!port_status(d, port, status, &change)) return false;
-        if (change & done) break;
+        if ((change & done) || clock_now_ns() >= deadline) break;
     }
     clear_changes(h, port, change);
     return true;
@@ -199,7 +201,7 @@ static void hub_port(struct hub *h, unsigned port) {
     if (change & CH_OVER_CURRENT) { /* over: the port was switched off and needs power again */
         kprintf("usbhub: slot %u port %u over-current ended, powering it again\n", d->slot, port);
         port_feature(d, USB_REQ_SET_FEATURE, PORT_POWER, port);
-        sleep_ms(h->power_ms);
+        sleep_until(clock_after(h->power_ms * NS_PER_MS));
         if (!port_status(d, port, &status, &change)) return;
         clear_changes(h, port, change);
         connected = status & PS_CONNECTION;
@@ -207,9 +209,10 @@ static void hub_port(struct hub *h, unsigned port) {
     unsigned link = PS_LINK(status);
     bool stuck = h->ss && (link == LINK_INACTIVE || link == LINK_COMPLIANCE); /* needs a warm reset */
     if ((!connected && !stuck) || h->child[port] || d->removed) return;
-    if (!h->ss) sleep_ms(100); /* connect debounce; SuperSpeed links train first, then connect */
+    /* connect debounce; SuperSpeed links train first, then connect */
+    if (!h->ss) sleep_until(clock_after(100 * NS_PER_MS));
     for (int attempt = 0; attempt < 3 && !h->child[port] && !d->removed; attempt++) {
-        if (attempt) sleep_ms(100);
+        if (attempt) sleep_until(clock_after(100 * NS_PER_MS));
         if (!port_status(d, port, &status, &change)) return;
         link = PS_LINK(status);
         stuck = h->ss && (link == LINK_INACTIVE || link == LINK_COMPLIANCE);
@@ -223,7 +226,7 @@ static void hub_port(struct hub *h, unsigned port) {
             kprintf("usbhub: slot %u port %u did not enable\n", d->slot, port);
             continue;
         }
-        sleep_ms(10); /* reset recovery */
+        sleep_until(clock_after(10 * NS_PER_MS)); /* reset recovery */
         unsigned speed = h->ss ? USB_SPEED_SUPER
                          : (status & PS_LOW_SPEED) ? USB_SPEED_LOW
                          : (status & PS_HIGH_SPEED) ? USB_SPEED_HIGH : USB_SPEED_FULL;

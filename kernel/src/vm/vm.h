@@ -28,15 +28,17 @@ enum vm_machine vm_machine(void);
 static inline bool vm_hosted(void) { return vm_machine() != VM_NONE; }
 
 /* ---- clock ---- */
-/* The LAPIC timer's input frequency in Hz as the hypervisor reports it (and the TSC's in
-   *tsc_hz), or 0: then it is measured as on real hardware. */
-uint64_t vm_timer_hz(uint64_t *tsc_hz);
-/* The hypervisor's reference clock (100 ns units), false without one. */
-bool vm_clock_read(uint64_t *units_100ns);
+/* The LAPIC timer's input frequency and the TSC's, in Hz, as the hypervisor reports them, or 0:
+   then they are measured as on real hardware. */
+uint64_t vm_lapic_hz(void);
+uint64_t vm_tsc_hz(void);
+/* The hypervisor's reference time in ns (its own epoch), false without one: the clock
+   (sys/clock.c) where there is one. */
+bool vm_clock_ns(uint64_t *ns);
 /* Its reference page, set up at the first call (from any CPU); 0 without one. */
 uint64_t vm_clock_page(void);
-/* The hypervisor keeps the clock: programs get its reference page, not the TSC itself. */
-bool vm_clock_owned(void);
+/* After a sleep, before the clock reads it again (clock_resume): the reference page on again. */
+void vm_clock_resume(void);
 
 /* ---- devices, at the places the kernel looks for each kind ---- */
 void vm_init(void);              /* the hypervisor's own bus (VMBus) and what rides on it; before PCI */
@@ -53,4 +55,4 @@ void vm_power_off(void);         /* the emulator's own power-off ports, after AC
 /* ---- sleep and hibernation ---- */
 const char *vm_hibernate_blocker(void); /* NULL, or why the VM's devices cannot hibernate */
 void vm_suspend(void);           /* the hypervisor's overlay pages off before an image is copied */
-void vm_resume(void);            /* and on again */
+void vm_resume(void);            /* and on again (the reference page: vm_clock_resume) */

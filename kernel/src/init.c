@@ -16,7 +16,6 @@
 #include "sys/object.h"
 #include "sys/proc.h"
 #include "sys/sched.h"
-#include "sys/prof.h"
 #include "sys/stream.h"
 #include "sys/keep.h"
 #include "gui/screenmode.h"
@@ -83,7 +82,6 @@ bool cmdline_number(const char *key, uint64_t *out) {
 
 void kmain_late(void) {
     entropy_init();
-    prof_init();
     heap_trim_start();
     acpi_init();
     pm_init(); /* the power thread: every shutdown and restart goes through it */

@@ -34,18 +34,24 @@ void wm_notify(const char *title, const char *text); /* desktop toast */
 int wm_window_count(char *top_title, size_t n);
 void wm_close_windows(void);
 void wm_repaint(void); /* the screen lost what was on it (after sleep): draw all of it again */
+/* What the taskbar shows of state the desktop does not own changed by another's hand: the volume or
+   the muting (dev/audio.c), the wall clock set (sys/clock.c). The compositor looks at them again;
+   without this call it would see them only at its next pass, at the latest the next minute. Any
+   CPU, any context, without sleeping; nothing without the desktop. */
+void wm_taskbar_changed(void);
 /* A vertical blank of the display driver's scanout the screen is drawn into (dev/pciuser.c): count
-   is the driver's count of blanks, timestamp_ns its time of this one. While blanks come, frames
-   start at them instead of after the configured period. Any CPU, without sleeping; cheap: it wakes
-   the compositor only when a frame waits for the blank. */
+   is the driver's count of blanks, timestamp_ns its time of this one on the driver's own axis
+   (only reported); the blank's moment on the clock is when this is called. While blanks come,
+   frames start at them instead of on the mode's period. Any CPU, without sleeping; cheap: it
+   wakes the compositor only when a frame waits for the blank. */
 void wm_vblank(uint64_t count, uint64_t timestamp_ns);
 /* Direct scanout (dev/pciuser.c): whether the display driver whose scanout the screen is drawn
-   into can show a window's own images (N_SCANOUT_DIRECT), and what the screen should show: waits up to
-   timeout_ms (-1: no limit) while the state is still numbered seen, then copies it to *out (kernel
+   into can show a window's own images (N_SCANOUT_DIRECT), and what the screen should show: waits until
+   deadline (sys/sched.h) while the state is still numbered seen, then copies it to *out (kernel
    memory). N_ERR_TIMEOUT with *out the unchanged state; N_ERR_STOPPED when the caller is stopped. */
 struct n_screen_state;
 void wm_screen_direct(bool able);
-int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, int64_t timeout_ms);
+int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, uint64_t deadline);
 /* The mode the system wants the display driver to show (gui/screenmode.c), wish number serial:
    into the state the driver reads, unless a later wish is there already. */
 struct n_screen_mode;

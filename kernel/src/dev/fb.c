@@ -6,6 +6,7 @@
 #include "dev/pm.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 #include "vm/vm.h"
 
@@ -195,20 +196,23 @@ static void present_rows(size_t tile, void *context) {
    for presenting to reach 0 (all four sequentially consistent), so either the present sees the
    change or the change waits for the present. The panic screen is drawn whatever is held, on the
    scanout shown and on what the display engine may show in its place (fb_present_last). */
-static unsigned hold_count;    /* atomic */
-static unsigned presenting;    /* atomic: fb_present calls between their check and return */
-static uint64_t hold_since_ms; /* atomic: when hold_count left 0 */
-static bool holds_dropped;     /* the kernel stopped (panic, every other CPU stopped): nothing is held any more */
+static unsigned hold_count; /* atomic */
+static unsigned presenting; /* atomic: fb_present calls between their check and return */
+static uint64_t hold_since; /* atomic: clock ns when hold_count left 0 */
+static bool holds_dropped;  /* the kernel stopped (panic, every other CPU stopped): nothing is held any more */
 
-/* Returns once every present that began before it has ended. */
+/* Returns once every present that began before it has ended. A present wakes no one (the
+   console's come from any context, a log line under the scheduler's locks among them), so this
+   looks again every DRAIN_POLL_NS: a present is one copy of at most the screen. */
+#define DRAIN_POLL_NS (100 * NS_PER_US)
 static void presents_drain(void) {
-    while (__atomic_load_n(&presenting, __ATOMIC_SEQ_CST)) sleep_ms(1);
+    while (__atomic_load_n(&presenting, __ATOMIC_SEQ_CST)) sleep_until(clock_after(DRAIN_POLL_NS));
     __asm__ volatile("sfence" ::: "memory"); /* write-combined pixels already sent leave the CPU now */
 }
 
 void fb_hold(void) {
     if (__atomic_fetch_add(&hold_count, 1, __ATOMIC_SEQ_CST) == 0) {
-        __atomic_store_n(&hold_since_ms, uptime_ms(), __ATOMIC_RELAXED);
+        __atomic_store_n(&hold_since, clock_now_ns(), __ATOMIC_RELAXED);
         kprintf("fb: a display driver holds the screen\n");
     }
     presents_drain();
@@ -221,7 +225,7 @@ bool fb_release(void) {
     }
     if (before != 1) return false;
     kprintf("fb: the screen was released after %lu ms\n",
-            (unsigned long)(uptime_ms() - __atomic_load_n(&hold_since_ms, __ATOMIC_RELAXED)));
+            (unsigned long)((clock_now_ns() - __atomic_load_n(&hold_since, __ATOMIC_RELAXED)) / NS_PER_MS));
     return true;
 }
 
@@ -390,7 +394,7 @@ static void present_area(const struct scanout *out, const uint32_t *src, int src
         (uint64_t)src>=0xffff800000000000ULL && (uint64_t)out->addr>=0xffff800000000000ULL &&
         (uint64_t)w*h>=65536 && cpu_online_count()>1) {
         /* The caller's interrupts stay off during a batch (cpu_parallel_for): batches of 128 rows
-           let them in between, CPU 0's ticks (audio, the scheduler's timeouts) among them. */
+           let them in between, the alarms due on this CPU (sys/alarm.h) among them. */
         for (int first=0;first<h;first+=128) {
             struct present_job job={out,src,deep,src_pitch,deep_pitch,x,y+first,w,MIN(h-first,128)};
             cpu_parallel_for(((size_t)job.h+15)/16,present_rows,&job);
@@ -401,20 +405,20 @@ static void present_area(const struct scanout *out, const uint32_t *src, int src
     }
 }
 
-static uint64_t measured_tick(void) {
-    /* Order write-combined framebuffer writes before the measurement. */
-    __asm__ volatile("sfence; lfence" ::: "memory");
-    return rdtsc();
+/* The clock, after the write-combined framebuffer writes before it. */
+static uint64_t measured_now(void) {
+    __asm__ volatile("sfence" ::: "memory");
+    return clock_now_ns();
 }
 void fb_benchmark(const uint32_t *src,int src_pitch) {
     if (!cmdline_has("fbbench") || !src || !fb.native || src_pitch<(int)fb.width) return;
     struct present_job job={&scanouts[0],src,NULL,src_pitch,0,0,0,(int)fb.width,(int)fb.height};
-    uint64_t start=measured_tick();
+    uint64_t start=measured_now();
     for (unsigned n=0;n<3;n++) for (size_t tile=0;tile<(fb.height+15)/16;tile++) present_rows(tile,&job);
-    uint64_t serial=measured_tick()-start,jobs=cpu_parallel_jobs();
-    start=measured_tick();
+    uint64_t serial=measured_now()-start,jobs=cpu_parallel_jobs();
+    start=measured_now();
     for (unsigned n=0;n<3;n++) fb_present(src,src_pitch,NULL,0,0,0,fb.width,fb.height);
-    uint64_t parallel=measured_tick()-start;
+    uint64_t parallel=measured_now()-start;
     bool same=true;
     for (unsigned y=0;y<fb.height;y++) {
         volatile uint32_t *row=(volatile uint32_t *)(fb.addr+(uint64_t)y*fb.pitch);
@@ -422,7 +426,7 @@ void fb_benchmark(const uint32_t *src,int src_pitch) {
         for (unsigned x=0;x<fb.width;x++) if (row[x]!=src[(size_t)y*src_pitch+x]) { same=false; break; }
         if (!same) break;
     }
-    kprintf("fbbench: %ux%u rounds=3 CPUs=%u serial_ticks=%lu parallel_ticks=%lu jobs=%lu max_job_us=%lu pixels=%s\n",
+    kprintf("fbbench: %ux%u rounds=3 CPUs=%u serial_ns=%lu parallel_ns=%lu jobs=%lu max_job_us=%lu pixels=%s\n",
         fb.width,fb.height,cpu_online_count(),serial,parallel,cpu_parallel_jobs()-jobs,cpu_max_job_us(),same?"PASS":"FAIL");
     if (!same) panic("fbbench: display pixels differ after SMP presentation");
 }

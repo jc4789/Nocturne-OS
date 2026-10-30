@@ -69,9 +69,10 @@ void hv_reference_resume(void) {
     if (reference_page) wrmsr(HV_MSR_REFERENCE_TSC, reference_page | (rdmsr(HV_MSR_REFERENCE_TSC) & 0xFFE) | 1);
 }
 
-bool hv_reference_time(uint64_t *units_100ns) {
+bool hv_reference_ns(uint64_t *ns) {
     if (!hv.present || !(hv.features & HV_ACCESS_TIME_REF_COUNT)) return false;
     uint64_t page = __atomic_load_n(&reference_page, __ATOMIC_ACQUIRE);
+    if (!page) page = hv_reference_tsc_page();
     if (page) {
         const struct n_reference_tsc *p = phys_to_virt(page);
         for (unsigned attempt = 0; attempt < 4; attempt++) {
@@ -84,12 +85,15 @@ bool hv_reference_time(uint64_t *units_100ns) {
             int64_t offset = p->offset;
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
             if (sequence != __atomic_load_n(&p->sequence, __ATOMIC_ACQUIRE)) continue;
-            *units_100ns = (uint64_t)(((__uint128_t)tsc * scale) >> 64) + offset;
+            /* the time in 100 ns units is (tsc * scale) / 2^64 + offset, as the page's users
+               (n_reference_tsc, common/abi.h) read it; its fraction is kept to the ns */
+            __uint128_t units_q32 = ((__uint128_t)tsc * scale) >> 32;
+            *ns = (uint64_t)((units_q32 * 100) >> 32) + (uint64_t)(offset * 100);
             return true;
         }
     }
     /* Sequence zero explicitly means the enlightenment is unavailable, e.g.
        during restore/migration; the reference counter stays rate constant. */
-    *units_100ns = rdmsr(HV_MSR_TIME_REF_COUNT);
+    *ns = rdmsr(HV_MSR_TIME_REF_COUNT) * 100;
     return true;
 }

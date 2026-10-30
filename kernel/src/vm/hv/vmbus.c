@@ -11,6 +11,7 @@
 #include "vm/hv/vmbus.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 
 enum {
@@ -298,21 +299,15 @@ static void vmbus_isr(void) {
 
 /* ---- requests ---- */
 
-/* The flags a waiter waits for are set by the handler, before it moves isr_runs on. CPU 0's idle
-   task (the boot task) halts instead: the handler interrupts that halt. */
+/* The flags a waiter waits for are set by the handler, before it moves isr_runs on. The boot task
+   waits the same way: it lets the others run and halts in between (sys/sched.h). */
 bool vmbus_wait(volatile bool *flag, uint64_t ms) {
-    uint64_t end = uptime_ms() + ms;
+    uint64_t deadline = clock_after(ms * NS_PER_MS);
     for (;;) {
         uint64_t seen = __atomic_load_n(&isr_runs, __ATOMIC_SEQ_CST);
         if (__atomic_load_n(flag, __ATOMIC_ACQUIRE)) return true;
-        uint64_t now = uptime_ms();
-        if (now >= end) return false;
-        if (current_task->is_idle) {
-            sti();
-            hlt();
-        } else {
-            wq_wait_unless(&isr_wq, &isr_runs, seen, end - now);
-        }
+        if (clock_now_ns() >= deadline) return false;
+        wq_wait_unless(&isr_wq, &isr_runs, seen, deadline);
     }
 }
 
@@ -335,14 +330,14 @@ static bool waiter_take(uint64_t ms, void *out, size_t len) {
     return true;
 }
 
+/* A full message queue (insufficient buffers) is tried again each millisecond, for up to 100 ms. */
 static uint16_t post(const void *msg, uint32_t len) {
-    uint16_t st = 0;
-    for (int tries = 0; tries < 100; tries++) {
-        st = hv_post_message(msg_conn_id, 1, msg, len);
-        if (st != HV_STATUS_INSUFFICIENT_BUFFERS) break;
-        sleep_ms(1);
+    uint64_t deadline = clock_after(100 * NS_PER_MS);
+    for (;;) {
+        uint16_t st = hv_post_message(msg_conn_id, 1, msg, len);
+        if (st != HV_STATUS_INSUFFICIENT_BUFFERS || clock_now_ns() >= deadline) return st;
+        sleep_until(clock_after(NS_PER_MS));
     }
-    return st;
 }
 
 /* Post a message and wait for the reply of `type` carrying `key`, whose first reply_len bytes go

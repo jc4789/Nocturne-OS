@@ -11,6 +11,7 @@
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 
 #define MAX_CTRL 4
@@ -19,8 +20,8 @@
 #define ADMIN_ENTRIES 32
 #define IO_ENTRIES 64
 #define XFER_PAGES 32 /* bounce buffer: 128 KiB, described by PRP1 and one PRP list page */
-#define ADMIN_MS 5000
-#define IO_MS 30000
+#define ADMIN_NS (5 * NS_PER_S)
+#define IO_NS (30 * NS_PER_S)
 
 /* controller registers */
 #define CAP 0x00
@@ -58,7 +59,8 @@ struct nvme {
     int index;
     struct pci_device *pci;
     volatile uint8_t *regs;
-    unsigned stride, ready_ms, max_xfer;
+    unsigned stride, max_xfer;
+    uint64_t ready_ns; /* CC.EN to CSTS.RDY at most (CAP.TO, CRTO) */
     uint32_t rtd3e;
     struct queue admin, io;
     uint8_t vector;
@@ -127,7 +129,7 @@ static bool queue_init(struct queue *q, uint16_t qid, uint16_t size) {
 
 /* Submit one command and wait for its completion. Returns 0, the 15-bit status field of a failed
    command, or FAILED when the controller stopped answering. */
-static int command(struct nvme *c, struct queue *q, uint32_t cmd[16], unsigned timeout_ms, uint32_t *result) {
+static int command(struct nvme *c, struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t *result) {
     if (!c->live) return FAILED;
     c->cid = (uint16_t)((c->cid + 1) & 0x7FFF);
     cmd[0] = (cmd[0] & 0xFFFF) | (uint32_t)c->cid << 16; /* PRPs, not fused */
@@ -135,7 +137,7 @@ static int command(struct nvme *c, struct queue *q, uint32_t cmd[16], unsigned t
     q->tail = (uint16_t)((q->tail + 1) % q->size);
     __sync_synchronize();
     doorbell(c, q->qid, false, q->tail);
-    uint64_t end = uptime_ms() + timeout_ms;
+    uint64_t deadline = clock_after(timeout_ns);
     for (;;) {
         uint64_t seen = __atomic_load_n(&c->kicks, __ATOMIC_SEQ_CST); /* before the look */
         volatile uint32_t *e = q->cq + q->head * 4u;
@@ -158,23 +160,24 @@ static int command(struct nvme *c, struct queue *q, uint32_t cmd[16], unsigned t
             c->live = false;
             return FAILED;
         }
-        if (uptime_ms() >= end) {
+        if (clock_now_ns() >= deadline) {
             kprintf("nvme%d: command %02x on queue %u timed out\n", c->index, cmd[0] & 0xFF, q->qid);
             return FAILED;
         }
-        wq_wait_unless(&c->wq, &c->kicks, seen, c->vector ? 10 : 1);
+        /* with MSI the interrupt wakes it, the 10 ms only in case one is lost; polled each ms */
+        wq_wait_unless(&c->wq, &c->kicks, seen, clock_after(c->vector ? 10 * NS_PER_MS : NS_PER_MS));
     }
 }
 
 static bool wait_ready(struct nvme *c, bool ready) {
-    uint64_t end = uptime_ms() + c->ready_ms;
+    uint64_t deadline = clock_after(c->ready_ns);
     for (;;) {
         uint32_t csts = rd32(c, CSTS);
         if (csts == 0xFFFFFFFFu) return false;
         if (ready && (csts & CSTS_CFS)) return false;
         if (!!(csts & CSTS_RDY) == ready) return true;
-        if (uptime_ms() >= end) return false;
-        nap_ms(1);
+        if (clock_now_ns() >= deadline) return false;
+        sleep_until(clock_after(NS_PER_MS));
     }
 }
 
@@ -206,20 +209,20 @@ static bool enable(struct nvme *c) {
     c->live = true;
     uint32_t cmd[16] = {OP_SET_FEATURES}, got;
     cmd[10] = 0x07; /* Number of Queues: one submission and one completion queue (0-based) */
-    int r = command(c, &c->admin, cmd, ADMIN_MS, &got);
+    int r = command(c, &c->admin, cmd, ADMIN_NS, &got);
     if (r) goto fail;
     memset(cmd, 0, sizeof cmd);
     cmd[0] = OP_CREATE_CQ;
     *(uint64_t *)&cmd[6] = c->io.cq_phys;
     cmd[10] = (uint32_t)(c->io.size - 1) << 16 | 1;
     cmd[11] = (c->vector ? 2u : 0u) | 1u; /* vector 0, interrupts on when we have one, contiguous */
-    if ((r = command(c, &c->admin, cmd, ADMIN_MS, NULL))) goto fail;
+    if ((r = command(c, &c->admin, cmd, ADMIN_NS, NULL))) goto fail;
     memset(cmd, 0, sizeof cmd);
     cmd[0] = OP_CREATE_SQ;
     *(uint64_t *)&cmd[6] = c->io.sq_phys;
     cmd[10] = (uint32_t)(c->io.size - 1) << 16 | 1;
     cmd[11] = 1u << 16 | 1u; /* completion queue 1, contiguous */
-    if ((r = command(c, &c->admin, cmd, ADMIN_MS, NULL))) goto fail;
+    if ((r = command(c, &c->admin, cmd, ADMIN_NS, NULL))) goto fail;
     return true;
 fail:
     kprintf("nvme%d: setting up the I/O queues failed (%x)\n", c->index, r);
@@ -233,7 +236,7 @@ static int identify(struct nvme *c, uint32_t cns, uint32_t nsid) {
     *(uint64_t *)&cmd[6] = c->data_phys;
     cmd[10] = cns;
     memset(c->data, 0, 4096);
-    return command(c, &c->admin, cmd, ADMIN_MS, NULL);
+    return command(c, &c->admin, cmd, ADMIN_NS, NULL);
 }
 
 /* Describe `bytes` of the bounce buffer: the first page in PRP1, then the second page or a list. */
@@ -261,7 +264,7 @@ static int transfer(void *ctx, bool write, uint64_t lba, unsigned n, uint8_t *bu
         cmd[10] = (uint32_t)lba;
         cmd[11] = (uint32_t)(lba >> 32);
         cmd[12] = n - 1;
-        int r = command(c, &c->io, cmd, IO_MS, NULL);
+        int r = command(c, &c->io, cmd, IO_NS, NULL);
         if (!r) return 0;
         if (attempt == 2) return -1;
         if (r == FAILED) {
@@ -277,7 +280,7 @@ static int transfer(void *ctx, bool write, uint64_t lba, unsigned n, uint8_t *bu
 static int flush(struct ns *s) {
     uint32_t cmd[16] = {OP_FLUSH};
     cmd[1] = s->nsid;
-    return command(s->c, &s->c->io, cmd, IO_MS, NULL) ? -1 : 0;
+    return command(s->c, &s->c->io, cmd, IO_NS, NULL) ? -1 : 0;
 }
 
 /* The controller for one request: back from a sleep, it is enabled again first. */
@@ -362,7 +365,7 @@ static void start(struct nvme *c) {
         unsigned crwmt = rd32(c, CRTO) & 0xFFFF;
         if (crwmt > to) to = crwmt;
     }
-    c->ready_ms = to * 500 < 2000 ? 2000 : to * 500;
+    c->ready_ns = MAX(to, 4u) * 500 * NS_PER_MS; /* 500 ms units, at least 2 s */
     if (!(cap >> 37 & 1) || (cap >> 48 & 0xF)) {
         kprintf("nvme%d: no NVM command set or no 4 KiB pages (capabilities %lx), skipped\n", c->index, cap);
         return;
@@ -416,7 +419,9 @@ static bool nvme_shutdown(void *arg) {
         if (!c->live) continue;
         wr32(c, CC, (rd32(c, CC) & ~0xC000u) | 0x4000u);
         uint64_t us = c->rtd3e < 1000000 ? 1000000 : c->rtd3e > 10000000 ? 10000000 : c->rtd3e;
-        for (uint64_t t = 0; t < us && (rd32(c, CSTS) >> 2 & 3) != 2; t++) io_wait(); /* ~1 us each */
+        for (uint64_t deadline = clock_after(us * NS_PER_US);
+             (rd32(c, CSTS) >> 2 & 3) != 2 && clock_now_ns() < deadline;)
+            pause();
         if ((rd32(c, CSTS) >> 2 & 3) != 2) all = false; /* its cache may not be on the flash */
         c->live = false;
     }

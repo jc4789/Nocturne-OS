@@ -10,6 +10,7 @@
 #include "dev/pm.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 #include <uacpi/kernel_api.h>
 #include <uacpi/uacpi.h>
@@ -286,26 +287,10 @@ const struct acpi_ecam *acpi_ecams(unsigned *count) { *count = necams; return ec
    interrupt through the 8259 like the other legacy lines, so it runs on CPU 0. */
 static bool aml_ready;
 
-/* An idle task (the boot task becomes CPU 0's) may not block, so it spins (letting other threads
-   run) where a thread would sleep. While frozen (acpi_freeze) nothing blocks and nothing else
-   runs: every other CPU is parked, and the devices are down or not yet back. */
+/* Any task waits where uACPI waits, the boot task too (it halts between the other tasks' turns,
+   sys/sched.h). While frozen (acpi_freeze) nothing blocks and nothing else runs: every other CPU
+   is parked, and the devices are down or not yet back; a wait then spins on the clock. */
 static volatile bool frozen;
-static bool may_block(void) { return !frozen && !current_task->is_idle; }
-
-static uint64_t ns_now(void) {
-    if (!tsc_hz) return uptime_ms() * 1000000;
-    uint64_t t = rdtsc();
-    return t / tsc_hz * 1000000000 + t % tsc_hz * 1000000000 / tsc_hz;
-}
-
-static void spin_ns(uint64_t ns) {
-    if (!tsc_hz) {
-        for (uint64_t i = 0; i < ns / 1000 + 1; i++) io_wait(); /* about a microsecond each */
-        return;
-    }
-    uint64_t end = ns_now() + ns;
-    while (ns_now() < end) pause();
-}
 
 uacpi_status uacpi_kernel_get_rsdp(uacpi_phys_addr *out) {
     if (!rsdp_req.response) return UACPI_STATUS_NOT_FOUND;
@@ -390,15 +375,16 @@ uacpi_status uacpi_kernel_io_write32(uacpi_handle h, uacpi_size off, uacpi_u32 v
 void *uacpi_kernel_alloc(uacpi_size size) { return kmalloc(size); }
 void uacpi_kernel_free(void *p) { kfree(p); }
 
-uacpi_u64 uacpi_kernel_get_nanoseconds_since_boot(void) { return ns_now(); }
-void uacpi_kernel_stall(uacpi_u8 us) { spin_ns(us * 1000ull); }
+uacpi_u64 uacpi_kernel_get_nanoseconds_since_boot(void) { return clock_now_ns(); }
+void uacpi_kernel_stall(uacpi_u8 us) { clock_spin(us * NS_PER_US); }
 void uacpi_kernel_sleep(uacpi_u64 ms) {
-    if (may_block()) sleep_ms(ms);
-    else spin_ns(ms * 1000000);
+    uint64_t ns = MIN(ms, CLOCK_NEVER / NS_PER_MS) * NS_PER_MS;
+    if (!frozen) sleep_until(clock_after(ns));
+    else clock_spin(ns);
 }
 
 /* Frozen, a lock or event nobody gives would hang the machine: after this long its owner may run. */
-#define FROZEN_WAIT_MS 2000
+#define FROZEN_WAIT_NS (2 * NS_PER_S)
 
 /* units under lock, which a giver takes in any context (interrupt handlers, under uACPI's
    spinlocks) and which comes before wq's own lock. */
@@ -417,19 +403,18 @@ void uacpi_kernel_free_semaphore(uacpi_handle s) { kfree(s); }
 
 uacpi_status uacpi_kernel_wait_for_semaphore(uacpi_handle h, uacpi_u16 timeout) {
     struct sem *s = h;
-    uint64_t start = uptime_ms(), end = start + timeout;
+    uint64_t start = clock_now_ns(), end = timeout == 0xFFFF ? CLOCK_NEVER : start + timeout * NS_PER_MS;
     uint64_t f = spin_lock(&s->lock);
     while (!s->units) {
-        uint64_t now = uptime_ms();
-        if (timeout != 0xFFFF && now >= end) {
+        uint64_t now = clock_now_ns();
+        if (now >= end) {
             spin_unlock(&s->lock, f);
             return UACPI_STATUS_TIMEOUT;
         }
-        if (may_block()) {
+        if (!frozen) {
             /* a giver on another CPU takes s->lock to give the unit, and finds this task enrolled */
-            if (timeout == 0xFFFF) wq_wait_locked(&s->wq, &s->lock);
-            else wq_wait_locked_timeout(&s->wq, &s->lock, end - now);
-        } else if (frozen && (timeout != 0xFFFF || now - start < FROZEN_WAIT_MS)) {
+            wq_wait_locked_until(&s->wq, &s->lock, end);
+        } else if (timeout != 0xFFFF || now - start < FROZEN_WAIT_NS) {
             /* only an interrupt can give the unit now, and only where the caller allows them: with
                the devices stopped (machine_sleep's interrupts-off part) none is let in */
             spin_give(&s->lock);
@@ -439,9 +424,9 @@ uacpi_status uacpi_kernel_wait_for_semaphore(uacpi_handle h, uacpi_u16 timeout) 
         } else {
             static bool told;
             spin_give(&s->lock);
-            if (frozen && !__atomic_exchange_n(&told, true, __ATOMIC_RELAXED))
+            if (!__atomic_exchange_n(&told, true, __ATOMIC_RELAXED))
                 kprintf("acpi: a lock is held across sleep, other threads run until it is given\n");
-            sti(); /* an idle task: let interrupts and other threads give the unit */
+            sti(); /* let interrupts and other threads give the unit */
             schedule();
             cli();
         }
@@ -559,14 +544,7 @@ uacpi_status uacpi_kernel_wait_for_work_completion(void) {
     sci_wait_idle();
     uint64_t f = spin_lock(&work_lock);
     while (unfinished) {
-        if (may_block()) {
-            wq_wait_locked(&done_wq, &work_lock);
-        } else {
-            spin_give(&work_lock);
-            sti();
-            schedule();
-            cli();
-        }
+        wq_wait_locked(&done_wq, &work_lock);
         spin_take(&work_lock);
     }
     spin_unlock(&work_lock, f);
@@ -624,7 +602,7 @@ void acpi_aml_init(void) {
         return;
     }
     kthread_create("acpi", acpi_worker, NULL);
-    uint64_t t0 = ns_now();
+    uint64_t t0 = clock_now_ns();
     if (!aml_ok(uacpi_initialize(0), "uACPI initialisation")) return;
     if (!aml_ok(uacpi_namespace_load(), "loading the namespace")) return;
     if (!aml_ok(uacpi_namespace_initialize(), "initialising devices")) return;
@@ -637,7 +615,7 @@ void acpi_aml_init(void) {
     if (!hw_reduced) aml_ok(uacpi_finalize_gpe_initialization(), "enabling GPEs");
     aml_ready = true;
     kprintf("acpi: AML ready in %lu ms, SCI IRQ %d, power button: %s%s%u in the namespace\n",
-            (ns_now() - t0) / 1000000, sci_irq, fixed ? "fixed" : "", fixed ? " + " : "", buttons);
+            (clock_now_ns() - t0) / NS_PER_MS, sci_irq, fixed ? "fixed" : "", fixed ? " + " : "", buttons);
 }
 
 bool acpi_aml_ready(void) { return aml_ready; }

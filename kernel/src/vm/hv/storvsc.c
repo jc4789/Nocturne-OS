@@ -5,10 +5,10 @@
    the request sleeps until then. */
 #include "kernel.h"
 #include "dev/blk.h"
-#include "dev/timer.h"
 #include "vm/hv/vmbus.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 
 static const struct guid scsi_guid =
@@ -108,17 +108,15 @@ static void storvsc_callback(struct vmbus_channel *ch) {
     }
 }
 
-/* Until the reply to request tid has come, for up to ms: false when it did not. A late reply to
+/* Until the reply to request tid has come, or the deadline: false when it did not. A late reply to
    the one before, whose callback read the old number, comes before this one's: the reply this one
    reads is its own. */
-static bool reply_wait(struct storvsc *s, uint64_t tid, uint64_t ms) {
-    uint64_t end = timer_now_ms() + ms;
+static bool reply_wait(struct storvsc *s, uint64_t tid, uint64_t deadline) {
     for (;;) {
         uint64_t seen = __atomic_load_n(&s->replies, __ATOMIC_SEQ_CST);
         if (__atomic_load_n(&s->answered, __ATOMIC_ACQUIRE) == tid) return true;
-        uint64_t now = timer_now_ms();
-        if (now >= end) return false;
-        wq_wait_unless(&s->wq, &s->replies, seen, end - now);
+        if (clock_now_ns() >= deadline) return false;
+        wq_wait_unless(&s->wq, &s->replies, seen, deadline);
     }
 }
 
@@ -146,7 +144,7 @@ static int exchange(struct storvsc *s, struct vstor_packet *p, uint32_t len) {
         r = vmbus_send(s->ch, VM_PKT_DATA_INBAND, VMBUS_FLAG_COMPLETION_REQUESTED, p, sizeof *p, s->tid);
     }
     if (r < 0) return r;
-    if (!reply_wait(s, tid, 10000)) {
+    if (!reply_wait(s, tid, clock_after(10 * NS_PER_S))) {
         kprintf("storvsc: request timed out\n");
         return -N_ERR_TIMEOUT;
     }

@@ -17,17 +17,18 @@
 #include "arch/smp.h"
 #include "arch/wake.h"
 #include "dev/pci.h"
-#include "dev/timer.h"
+#include "sys/alarm.h"
+#include "sys/clock.h"
 #include "dev/serial.h"
 #include "vm/vm.h"
 
 void power_off(void);
 void power_reboot(void);
 
-#define GRACE_MS   5000  /* not from a menu: time the apps get to close */
-#define STALL_MS   15000 /* from a menu: no window closed for this long cancels */
-#define FORCE_MS   60000 /* from a menu, after a cancel: asking again closes them anyway */
-#define STOP_MS    3000  /* stopped apps get this long to end */
+#define GRACE_NS   (5 * NS_PER_S)  /* not from a menu: time the apps get to close */
+#define STALL_NS   (15 * NS_PER_S) /* from a menu: no window closed for this long cancels */
+#define FORCE_NS   (60 * NS_PER_S) /* from a menu, after a cancel: asking again closes them anyway */
+#define STOP_NS    (3 * NS_PER_S)  /* stopped apps get this long to end */
 
 /* Each stage's list only grows: a device joins at its end with a release store, and the walks
    (any CPU, any time) follow the links with acquire loads, never under pm_lock. */
@@ -64,7 +65,7 @@ void pm_request(enum pm_action action, bool interactive) {
     if (!stopping && !(nap && (busy || requested))) {
         __atomic_store_n(&wanted, action, __ATOMIC_RELAXED);
         /* asking again while apps are closing, or soon after a cancel, means "close them anyway" */
-        if (!interactive || busy || uptime_ms() < force_until) __atomic_store_n(&forced, true, __ATOMIC_RELAXED);
+        if (!interactive || busy || clock_now_ns() < force_until) __atomic_store_n(&forced, true, __ATOMIC_RELAXED);
         requested = true;
         wq_wake_all(&pm_wq);
     }
@@ -81,35 +82,35 @@ static bool close_windows(void) {
     if (!left) return true;
     kprintf("pm: asking %d windows to close\n", left);
     wm_close_windows();
-    uint64_t start = uptime_ms(), progress = start, told = 0;
+    uint64_t start = clock_now_ns(), progress = start, told = 0;
     int last = left;
     bool hint = false; /* the toast is narrow: the window's title and the way out take turns */
     while ((left = wm_window_count(title, sizeof title)) > 0) {
-        uint64_t now = uptime_ms();
+        uint64_t now = clock_now_ns();
         if (left < last) { last = left; progress = now; }
-        if (is_forced() ? now - start >= GRACE_MS : now - progress >= STALL_MS) break;
-        if (now - start >= 1000 && (strcmp(title, shown) || now - told >= 3000)) {
+        if (is_forced() ? now - start >= GRACE_NS : now - progress >= STALL_NS) break;
+        if (now - start >= NS_PER_S && (strcmp(title, shown) || now - told >= 3 * NS_PER_S)) {
             hint = !is_forced() && !strcmp(title, shown) && !hint;
             wm_notify(wanted_now() == PM_REBOOT ? "Waiting to restart" : "Waiting to shut down",
                       hint ? "Choose again to force it" : title);
             strlcpy(shown, title, sizeof shown);
             told = now;
         }
-        sleep_ms(50);
+        sleep_until(clock_after(50 * NS_PER_MS));
     }
     if (!left || is_forced()) return true;
     wm_notify(wanted_now() == PM_REBOOT ? "Restart cancelled" : "Shutdown cancelled", title);
     kprintf("pm: cancelled, \"%s\" kept its window\n", title);
     uint64_t f = spin_lock(&pm_lock);
-    force_until = uptime_ms() + FORCE_MS;
+    force_until = clock_after(FORCE_NS);
     spin_unlock(&pm_lock, f);
     return false;
 }
 
 static void stop_apps(void) {
-    uint64_t end = uptime_ms() + STOP_MS;
+    uint64_t end = clock_after(STOP_NS);
     int left;
-    while ((left = task_stop_apps()) && uptime_ms() < end) sleep_ms(20);
+    while ((left = task_stop_apps()) && clock_now_ns() < end) sleep_until(clock_after(20 * NS_PER_MS));
     if (left) kprintf("pm: %d app tasks did not end\n", left);
 }
 
@@ -192,8 +193,8 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
     uint32_t pic = pic_state();
     pic_mask_all();
     ioapic_suspend();
-    timer_suspend();
-    serial_flush(); /* the tick that drains the log port is stopped */
+    clock_suspend();
+    serial_flush(); /* the alarm that drains the log port does not come while asleep */
     /* called off, the way back is the one after an enter() that returned */
     bool slept = !stuck && wake_sleep(enter);
     /* awake (or never asleep): the CPU is back; now what it talks to */
@@ -202,6 +203,9 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
     pic_mask_all();
     ioapic_mask_all();
     serial_init(); /* the log port, reset with the rest */
+    /* The clock first: every wait from here on (a unit's or a link's that does not answer) is
+       bounded on it, and until it is back it stands still (the TSC began again from 0). */
+    int64_t secs = clock_resume();
     /* before anything sends it an interrupt or a request, and before the APICs go back to x2APIC
        mode, which comes after interrupt remapping with extended IDs (SDM 11.12.7); units that
        never slept are still on, translating with the claims' tables, and are left alone. Units
@@ -213,9 +217,8 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
     ioapic_resume();
     if (slept) pic_restore(pic);
     else pic_restore_mask((uint16_t)pic); /* no reset occurred: do not erase a pending edge */
-    vm_resume(); /* the hypervisor's overlay pages: reset, or the restoring kernel's */
-    int64_t secs = timer_resume();
-    sched_clock_resume();
+    vm_resume(); /* the hypervisor's other overlay pages and its interrupts, after the LAPIC */
+    alarm_resume(); /* CPU 0's wake device, after its LAPIC */
     acpi_wake_prepare(state);
     pci_resume(slept, units_lost != NULL);
     irq_restore(f);

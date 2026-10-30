@@ -1,9 +1,21 @@
 #pragma once
 #include "kernel.h"
+#include "sys/clock.h"
 struct regs;
 struct task;
 /* Any CPU: the app's call in r, on the stack of the calling thread. */
 void syscall_dispatch(struct regs *r);
+/* An app's timeout (the ABI's milliseconds: negative for no limit, 0 for no wait) as the deadline
+   the kernel's waits take (sys/sched.h), made once as the call comes in: CLOCK_NEVER for no limit,
+   now for no wait. */
+static inline uint64_t syscall_deadline(int64_t timeout_ms) {
+    if (timeout_ms < 0 || (uint64_t)timeout_ms >= CLOCK_NEVER / NS_PER_MS) return CLOCK_NEVER;
+    return clock_after((uint64_t)timeout_ms * NS_PER_MS);
+}
+/* The address waits' timeout: unsigned milliseconds, UINT32_MAX for no limit (the ABI's §7). */
+static inline uint64_t address_deadline(unsigned timeout_ms) {
+    return syscall_deadline(timeout_ms == UINT32_MAX ? -1 : (int64_t)timeout_ms);
+}
 /* The calling app's memory. A sibling thread on another CPU may unmap or protect any page of it at
    any time, so the kernel reads and writes it only through these copies, never through the app's
    pointer itself: a page that went meanwhile ends the copy with -N_ERR_BAD_ADDRESS instead of a

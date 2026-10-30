@@ -20,6 +20,7 @@
 #include "dev/pci.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 
 #define PTE_ADDR 0x000FFFFFFFFFF000ull
@@ -179,18 +180,13 @@ void iommu_init(void) {
 bool iommu_active(void) { return hw && hw->translating && !restore_failed; }
 bool iommu_power_ready(void) { return !restore_failed && !lost_in_sleep; }
 
-/* An unknown clock cannot establish a millisecond wait. Check ready status once, then fail
-   conservatively instead of inventing a maximum x86 frequency or spinning without a bound. */
-uint64_t iommu_deadline(unsigned ms) { return rdtsc() + tsc_hz / 1000 * ms; }
-bool iommu_expired(uint64_t deadline) { return !tsc_hz || (int64_t)(rdtsc() - deadline) >= 0; }
-
 /* The back ends' fault handlers (CPU 0) and their waits (any CPU) count against one second's
    limit, under report_lock, taken last. */
 bool iommu_fault_report(void) {
     static struct spinlock report_lock;
     static uint64_t second;
     static unsigned shown;
-    uint64_t now = uptime_ms() / 1000;
+    uint64_t now = clock_now_ns() / NS_PER_S;
     uint64_t f = spin_lock(&report_lock);
     if (now != second) {
         second = now;

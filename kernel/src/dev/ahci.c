@@ -12,16 +12,17 @@
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 
 #define MAX_HBA 4
 #define MAX_PORTS 32
 #define XFER_PAGES 32  /* bounce buffer: 128 KiB, one PRD entry */
-#define SPINUP_MS 50   /* links come up after the spin-up bit is set */
-#define LINK_MS 1000   /* after a COMRESET the link is up within this */
-#define READY_MS 10000 /* a disk that was asleep or spinning up answers within this */
-#define STOP_MS 500    /* a port's engines stop within this (10.1.2) */
-#define IO_MS 30000
+#define SPINUP_NS (50 * NS_PER_MS) /* links come up after the spin-up bit is set */
+#define LINK_NS NS_PER_S            /* after a COMRESET the link is up within this */
+#define READY_NS (10 * NS_PER_S)    /* a disk that was asleep or spinning up answers within this */
+#define STOP_NS (500 * NS_PER_MS)   /* a port's engines stop within this (10.1.2) */
+#define IO_NS (30 * NS_PER_S)
 
 /* HBA registers (3.1) */
 #define CAP 0x00
@@ -123,30 +124,20 @@ static void hba_wr(struct hba *h, unsigned off, uint32_t v) { mmio_write32(h->re
 static uint32_t rd(struct port *p, unsigned off) { return mmio_read32(p->regs + off); }
 static void wr(struct port *p, unsigned off, uint32_t v) { mmio_write32(p->regs + off, v); }
 
-/* With interrupts off (a power change) the clock stands still: waits count port writes of about
-   a microsecond each instead. */
-static bool clock_runs(void) { return read_rflags() & 0x200; }
+/* With interrupts off (a power change) nothing may sleep: waits spin on the clock instead. */
+static bool may_sleep(void) { return read_rflags() & 0x200; }
 
-static void delay_ms(unsigned ms) {
-    if (!clock_runs()) {
-        for (unsigned i = 0; i < ms * 1000; i++) io_wait();
-        return;
-    }
-    uint64_t end = uptime_ms() + ms + 1; /* the current tick is partly gone */
-    while (uptime_ms() < end) nap_ms(1);
-}
-
-/* Until (register & mask) == want, for up to ms. */
-static bool wait_reg(struct port *p, unsigned off, uint32_t mask, uint32_t want, unsigned ms) {
-    bool clock = clock_runs();
-    uint64_t end = uptime_ms() + ms, rounds = 0;
+/* Until (register & mask) == want, for up to ns: looked at each millisecond, or spinning. */
+static bool wait_reg(struct port *p, unsigned off, uint32_t mask, uint32_t want, uint64_t ns) {
+    bool sleeps = may_sleep();
+    uint64_t deadline = clock_after(ns);
     for (;;) {
         uint32_t v = rd(p, off);
         if (v == 0xFFFFFFFFu) return false; /* the adapter is gone */
         if ((v & mask) == want) return true;
-        if (clock ? uptime_ms() >= end : ++rounds >= ms * 1000ull) return false;
-        if (clock) nap_ms(1);
-        else io_wait();
+        if (clock_now_ns() >= deadline) return false;
+        if (sleeps) sleep_until(clock_after(NS_PER_MS));
+        else pause();
     }
 }
 
@@ -175,10 +166,10 @@ static void ahci_isr(struct regs *r) {
 static bool port_stop(struct port *p) {
     uint32_t cmd = rd(p, PxCMD);
     if (cmd & CMD_ST) wr(p, PxCMD, cmd & ~CMD_ST);
-    if (!wait_reg(p, PxCMD, CMD_CR, 0, STOP_MS)) return false;
+    if (!wait_reg(p, PxCMD, CMD_CR, 0, STOP_NS)) return false;
     cmd = rd(p, PxCMD);
     if (cmd & CMD_FRE) wr(p, PxCMD, cmd & ~CMD_FRE);
-    return wait_reg(p, PxCMD, CMD_FR, 0, STOP_MS);
+    return wait_reg(p, PxCMD, CMD_FR, 0, STOP_NS);
 }
 
 /* COMRESET (10.4.2): the link set up again and the device reset; it then sends its signature in a
@@ -186,9 +177,9 @@ static bool port_stop(struct port *p) {
 static bool comreset(struct port *p) {
     uint32_t sctl = rd(p, PxSCTL) & ~0xF0Fu;
     wr(p, PxSCTL, sctl | 0x300u | 1u);
-    delay_ms(2); /* at least 1 ms */
+    clock_spin(2 * NS_PER_MS); /* at least 1 ms, also where nothing may sleep */
     wr(p, PxSCTL, sctl | 0x300u);
-    bool up = wait_reg(p, PxSSTS, 0xF, DET_UP, LINK_MS);
+    bool up = wait_reg(p, PxSSTS, 0xF, DET_UP, LINK_NS);
     wr(p, PxSERR, 0xFFFFFFFFu); /* coming up sets the link's diagnostics */
     return up;
 }
@@ -210,7 +201,7 @@ static bool port_start(struct port *p) {
     wr(p, PxFB + 4, (uint32_t)((p->mem_phys + FIS_AT) >> 32));
     wr(p, PxCMD, rd(p, PxCMD) | CMD_SUD | CMD_POD | CMD_FRE);
     if (!comreset(p)) return false;
-    if (!wait_reg(p, PxTFD, TFD_BSY | TFD_DRQ, 0, READY_MS)) {
+    if (!wait_reg(p, PxTFD, TFD_BSY | TFD_DRQ, 0, READY_NS)) {
         kprintf("ahci%d: port %u: the disk does not become ready (status %x)\n", h->index, p->no, rd(p, PxTFD));
         return false;
     }
@@ -245,7 +236,7 @@ static void fis_make(uint8_t f[20], uint8_t command, uint64_t lba, unsigned coun
 
 /* Give one command in slot 0, with `bytes` of the bounce buffer, and wait for its end. 0, or -1
    when the disk reported an error, the adapter one of its own or the time ran out. */
-static int command(struct port *p, const uint8_t fis[20], bool write, unsigned bytes, unsigned ms) {
+static int command(struct port *p, const uint8_t fis[20], bool write, unsigned bytes, uint64_t ns) {
     if (!p->live && !port_start(p)) return -1;
     uint32_t *hdr = (uint32_t *)(p->mem + LIST_AT);
     uint8_t *table = p->mem + TABLE_AT;
@@ -265,8 +256,8 @@ static int command(struct port *p, const uint8_t fis[20], bool write, unsigned b
     wr(p, PxIS, 0xFFFFFFFFu);
     __sync_synchronize();
     wr(p, PxCI, 1);
-    bool clock = clock_runs();
-    uint64_t end = uptime_ms() + ms, rounds = 0;
+    bool sleeps = may_sleep();
+    uint64_t deadline = clock_after(ns);
     for (;;) {
         uint64_t seen = __atomic_load_n(&p->kicks, __ATOMIC_SEQ_CST); /* before the look */
         uint32_t events = rd(p, PxIS) | __atomic_load_n(&p->events, __ATOMIC_SEQ_CST);
@@ -279,13 +270,14 @@ static int command(struct port *p, const uint8_t fis[20], bool write, unsigned b
             p->live = false;
             return -1;
         }
-        if (clock ? uptime_ms() >= end : ++rounds >= ms * 1000ull) {
+        if (clock_now_ns() >= deadline) {
             kprintf("ahci%d: port %u: command %02x timed out\n", p->h->index, p->no, fis[2]);
             p->live = false;
             return -1;
         }
-        if (!clock) io_wait();
-        else wq_wait_unless(&p->wq, &p->kicks, seen, p->h->vector ? 10 : 1);
+        /* with MSI the interrupt wakes it, the 10 ms only in case one is lost; polled each ms */
+        if (!sleeps) pause();
+        else wq_wait_unless(&p->wq, &p->kicks, seen, clock_after(p->h->vector ? 10 * NS_PER_MS : NS_PER_MS));
     }
 }
 
@@ -298,14 +290,14 @@ static int transfer(void *ctx, bool write, uint64_t lba, unsigned n, uint8_t *bu
     uint8_t op = p->lba48 ? (write ? ATA_WRITE_DMA_EXT : ATA_READ_DMA_EXT) : (write ? ATA_WRITE_DMA : ATA_READ_DMA);
     fis_make(fis, op, lba, n, p->lba48);
     for (int attempt = 0; attempt < 3; attempt++)
-        if (!command(p, fis, write, n * p->block, IO_MS)) return 0;
+        if (!command(p, fis, write, n * p->block, IO_NS)) return 0;
     return -1;
 }
 
 static int flush(struct port *p) {
     uint8_t fis[20];
     fis_make(fis, p->lba48 ? ATA_FLUSH_CACHE_EXT : ATA_FLUSH_CACHE, 0, 0, false);
-    return command(p, fis, false, 0, IO_MS);
+    return command(p, fis, false, 0, IO_NS);
 }
 
 static int rw(struct port *p, bool write, uint64_t lba, uint32_t count, uint8_t *buf) {
@@ -340,7 +332,7 @@ static bool identify(struct port *p, char model[41]) {
     fis_make(fis, ATA_IDENTIFY, 0, 0, false);
     fis[7] = 0;
     memset(p->data, 0, 512);
-    if (command(p, fis, false, 512, IO_MS)) return false;
+    if (command(p, fis, false, 512, IO_NS)) return false;
     const uint16_t *id = (const uint16_t *)p->data;
     unsigned n = 0;
     for (int w = 27; w <= 46; w++)
@@ -406,9 +398,10 @@ static void add_port(struct hba *h, unsigned no) {
 static void hba_take(struct hba *h) {
     if (hba_rd(h, CAP2) & CAP2_BOH) {
         hba_wr(h, BOHC, hba_rd(h, BOHC) | BOHC_OOS);
-        uint64_t end = uptime_ms() + 25;
-        while (hba_rd(h, BOHC) & BOHC_BOS && uptime_ms() < end) nap_ms(1);
-        if (hba_rd(h, BOHC) & BOHC_BB) delay_ms(2000); /* the firmware finishes what it was doing */
+        uint64_t deadline = clock_after(25 * NS_PER_MS);
+        while (hba_rd(h, BOHC) & BOHC_BOS && clock_now_ns() < deadline) sleep_until(clock_after(NS_PER_MS));
+        /* the firmware finishes what it was doing */
+        if (hba_rd(h, BOHC) & BOHC_BB) sleep_until(clock_after(2 * NS_PER_S));
     }
     hba_wr(h, GHC, hba_rd(h, GHC) | GHC_AE);
 }
@@ -450,7 +443,7 @@ static void start(struct hba *h) {
             spun = true;
         }
     }
-    if (spun && (cap & CAP_SSS)) delay_ms(SPINUP_MS);
+    if (spun && (cap & CAP_SSS)) sleep_until(clock_after(SPINUP_NS));
     if (h->vector) hba_wr(h, GHC, hba_rd(h, GHC) | GHC_IE);
     for (unsigned n = 0; n < MAX_PORTS; n++) {
         if (!(implemented & 1u << n)) continue;
@@ -472,7 +465,7 @@ static bool ahci_quiesce(void *arg) {
             uint8_t fis[20];
             fis_make(fis, ATA_STANDBY_IMMEDIATE, 0, 0, false);
             fis[7] = 0;
-            if ((p->cache && flush(p)) || command(p, fis, false, 0, READY_MS)) all = false;
+            if ((p->cache && flush(p)) || command(p, fis, false, 0, READY_NS)) all = false;
             if (!port_stop(p)) all = false;
             p->live = false;
         }

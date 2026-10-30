@@ -23,6 +23,7 @@
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "sys/clock.h"
 
 /* registers */
 #define R_VER     0x00
@@ -424,7 +425,7 @@ static bool command_idle(struct unit *u) {
     if (u->command_failed) return false;
     /* Do not overlap firmware's register invalidation/write-buffer/protected-range/enhanced command (6.9,
        11.4.4.1). A timed-out interface remains hardware-owned, not free for cleanup writes. */
-    for (uint64_t t = iommu_deadline(100);; pause()) {
+    for (uint64_t t = clock_after(100 * NS_PER_MS);; pause()) {
         uint32_t pmen = rd32(u, R_PMEN);
         bool busy = (rd64(u, R_CCMD) >> 63) || /* ICC */
                     (rd64(u, ECAP_IRO(u->ecap) + 8) >> 63) || /* IVT */
@@ -432,7 +433,7 @@ static bool command_idle(struct unit *u) {
                     (u->cap & CAP_ECMDS && rd64(u, R_ECRSP) & 1) ||
                     (u->cap & (CAP_PLMR | CAP_PHMR) && !!(pmen & PMEN_EPM) != !!(pmen & PMEN_PRS));
         if (!busy) break;
-        if (iommu_expired(t)) {
+        if (clock_now_ns() >= t) {
             u->command_failed = true;
             return false;
         }
@@ -445,8 +446,8 @@ static bool command(struct unit *u, uint32_t bit, bool on) {
     uint32_t sts = rd32(u, R_GSTS) & ~GSTS_ONESHOT;
     wr32(u, R_GCMD, on ? sts | bit : sts & ~bit);
     bool completed = bit == GCMD_WBF ? false : on; /* WBFS clears on completion, unlike RTPS/IRTPS */
-    for (uint64_t t = iommu_deadline(100); !!(rd32(u, R_GSTS) & bit) != completed; pause())
-        if (iommu_expired(t)) {
+    for (uint64_t t = clock_after(100 * NS_PER_MS); !!(rd32(u, R_GSTS) & bit) != completed; pause())
+        if (clock_now_ns() >= t) {
             kprintf("iommu: VT-d unit at %lx did not %s %s\n", u->base,
                     bit & GSTS_ONESHOT ? "take" : on ? "turn on" : "turn off", command_name(bit));
             u->command_failed = true;
@@ -538,9 +539,10 @@ static bool queue_check(struct unit *u) {
 static bool submit(struct unit *u, uint64_t lo, uint64_t hi) {
     if (!u->queue_on || !queue_check(u)) return false;
     if ((lo & 0xF) == 2) lo |= (u->cap & CAP_DRD ? INV_IOTLB_DR : 0) | (u->cap & CAP_DWD ? INV_IOTLB_DW : 0);
-    for (uint64_t t = iommu_deadline(100); (rd64(u, R_IQH) & (PAGE_SIZE - 16)) == (u->tail + 16) % PAGE_SIZE; pause()) {
+    for (uint64_t t = clock_after(100 * NS_PER_MS); (rd64(u, R_IQH) & (PAGE_SIZE - 16)) == (u->tail + 16) % PAGE_SIZE;
+         pause()) {
         if (!queue_check(u)) return false;
-        if (iommu_expired(t)) {
+        if (clock_now_ns() >= t) {
             u->failed = true;
             return false;
         }
@@ -639,9 +641,9 @@ static bool sync_units(size_t first, size_t n) {
     }
     for (size_t i = first; i < first + n; i++) {
         struct unit *u = &units[i];
-        for (uint64_t t = iommu_deadline(100); u->waiting && word[i] != u->token; pause()) {
+        for (uint64_t t = clock_after(100 * NS_PER_MS); u->waiting && word[i] != u->token; pause()) {
             if (!queue_check(u)) break;
-            if (iommu_expired(t)) {
+            if (clock_now_ns() >= t) {
                 kprintf("iommu: VT-d unit at %lx did not finish its commands\n", u->base);
                 u->failed = true;
                 break;
@@ -994,16 +996,16 @@ static bool queue_quiet(struct unit *u) {
         u->tail = (uint32_t)tail;
         if (!sync_units((size_t)(u - units), 1)) return false;
         /* Status writes precede all effects being visible in the head register. */
-        for (uint64_t t = iommu_deadline(100); rd64(u, R_IQH) != u->tail; pause())
-            if (!queue_check(u) || iommu_expired(t)) {
+        for (uint64_t t = clock_after(100 * NS_PER_MS); rd64(u, R_IQH) != u->tail; pause())
+            if (!queue_check(u) || clock_now_ns() >= t) {
                 u->failed = true;
                 return false;
             }
         if (rd64(u, R_IQT) != u->tail) { u->failed = true; return false; }
         return queue_check(u);
     }
-    for (uint64_t t = iommu_deadline(100); rd64(u, R_IQH) != tail; pause())
-        if (!queue_check(u) || iommu_expired(t)) return false;
+    for (uint64_t t = clock_after(100 * NS_PER_MS); rd64(u, R_IQH) != tail; pause())
+        if (!queue_check(u) || clock_now_ns() >= t) return false;
     if (u->handoff) return false; /* never overwrite retained, possibly hardware-owned storage */
     u->handoff_config = (unsigned)(iqa & (IQA_QS | IQA_DW));
     u->handoff = iommu_alloc_pages(bytes / PAGE_SIZE + 1);
@@ -1032,9 +1034,10 @@ static bool queue_quiet(struct unit *u) {
     }
     u->handoff_tail = (uint32_t)((tail + width) % bytes);
     wr64(u, R_IQT, u->handoff_tail);
-    for (uint64_t t = iommu_deadline(100); *word != u->handoff_token || rd64(u, R_IQH) != u->handoff_tail; pause()) {
+    for (uint64_t t = clock_after(100 * NS_PER_MS); *word != u->handoff_token || rd64(u, R_IQH) != u->handoff_tail;
+         pause()) {
         if (!queue_check(u)) return false;
-        if (iommu_expired(t)) {
+        if (clock_now_ns() >= t) {
             u->failed = true;
             return false;
         }
@@ -1086,8 +1089,8 @@ static bool pmr_release(struct unit *u) {
     if (!command_idle(u)) return false; /* also an EPM change still in flight */
     uint32_t pmen = rd32(u, R_PMEN);
     if (pmen & PMEN_EPM) wr32(u, R_PMEN, pmen & ~PMEN_EPM);
-    for (uint64_t t = iommu_deadline(100); rd32(u, R_PMEN) & PMEN_PRS; pause())
-        if (iommu_expired(t)) {
+    for (uint64_t t = clock_after(100 * NS_PER_MS); rd32(u, R_PMEN) & PMEN_PRS; pause())
+        if (clock_now_ns() >= t) {
             kprintf("iommu: VT-d unit at %lx did not confirm its protected memory ranges off\n", u->base);
             u->command_failed = true;
             return false;

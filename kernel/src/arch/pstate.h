@@ -6,5 +6,5 @@
 void pstate_init_bsp(void);     /* after the TSC is calibrated */
 void pstate_init_ap(void);      /* on each AP before it runs work */
 bool pstate_sampling(void);
-void pstate_tick(void);         /* timer tick of the calling CPU, only when sampling */
+void pstate_sample(void);       /* the calling CPU, interrupts off, often: closes a window of a second */
 bool pstate_cpu(unsigned cpu, unsigned *mhz, unsigned *awake_permille);

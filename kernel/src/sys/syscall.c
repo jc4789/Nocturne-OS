@@ -15,7 +15,6 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "mm/heap.h"
-#include "dev/timer.h"
 #include "dev/fb.h"
 #include "dev/gpu.h"
 #include "dev/audio.h"
@@ -154,8 +153,8 @@ int user_string(const char *u, char **out) {
    processes once per interval, so the owner of the memory is visible. */
 static void report_memory_exhaustion(struct task *t, int64_t inc) {
     static uint64_t last_report; /* any CPU: the one that moves it on reports */
-    uint64_t now = uptime_ms(), last = __atomic_load_n(&last_report, __ATOMIC_RELAXED);
-    if (last && now - last < 10000) return;
+    uint64_t now = clock_now_ns(), last = __atomic_load_n(&last_report, __ATOMIC_RELAXED);
+    if (last && now - last < 10 * NS_PER_S) return;
     if (!__atomic_compare_exchange_n(&last_report, &last, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
     struct { int pid; char name[32]; uint64_t kb; } top[8];
     int n = 0;
@@ -226,9 +225,9 @@ static int64_t sys_proclist(struct n_procinfo *out, int max) {
         p->state = t->state;
         p->is_user = t->is_user;
         strlcpy(p->name, t->name, sizeof p->name);
-        p->cpu_ms = t->cpu_ms;
+        p->cpu_ms = sched_task_cpu_ns(t) / NS_PER_MS;
         p->mem_kb = proc_user_pages(t) * 4;
-        p->start_ms = t->start_ms;
+        p->start_ms = t->start_ns / NS_PER_MS;
         p->wait_phys = t->wait_phys;
     }
     spin_unlock(&task_lock, flags);
@@ -246,7 +245,7 @@ static int64_t sys_sysinfo(struct n_sysinfo *usi) {
        the frames set aside for the APs' first touches are no one's yet. */
     si->free_mem = (pmm_free_pages() + programs_idle()) * PAGE_SIZE;
     si->heap_used = heap_used_bytes();
-    si->uptime_ms = uptime_ms();
+    si->uptime_ms = clock_now_ns() / NS_PER_MS;
     uint64_t flags = spin_lock(&task_lock);
     int n = 0;
     for (struct task *t = task_list; t; t = t->all_next) n++;
@@ -780,11 +779,12 @@ static int64_t sys_pci_screen_image(int h,int surface,const struct n_scanout *ud
 /* What the screen should show, for a driver whose scanout shows windows directly (dev/pciuser.c,
    gui/wm.c). The state is copied out even when the time ran out. */
 static int64_t sys_pci_screen_state(int h,uint64_t seen,struct n_screen_state *uout,int64_t timeout_ms) {
+    uint64_t deadline=syscall_deadline(timeout_ms);
     if(!user_ok_w(uout,sizeof *uout))return -N_ERR_BAD_ADDRESS;
     struct handle *pci=handle_get(h);
     if(!pci)return -N_ERR_NO_HANDLE;
     struct n_screen_state *st=kmalloc(sizeof *st);
-    int64_t r=st?pci_user_screen_state(pci,seen,st,timeout_ms):-N_ERR_NO_MEMORY;
+    int64_t r=st?pci_user_screen_state(pci,seen,st,deadline):-N_ERR_NO_MEMORY;
     handle_close(pci);
     if((r==0||r==-N_ERR_TIMEOUT)&&copy_to_user(uout,st,sizeof *st))r=-N_ERR_BAD_ADDRESS;
     kfree(st);
@@ -1320,7 +1320,7 @@ static int64_t sys_pager_take(int h,struct n_pager_fault *uout,size_t max,int64_
     if(!g)return r;
     if(!max){handle_close(f);return -N_ERR_INVALID;}
     struct n_pager_fault out[32];uint64_t ids[32];size_t k=0;
-    uint64_t deadline=timeout_ms>0?uptime_ms()+(uint64_t)timeout_ms:0;
+    uint64_t deadline=syscall_deadline(timeout_ms);
     uint64_t lock=spin_lock(&shared_lock);
     for(;;){
         for(struct pager_fault *q=g->faults;q && k<MIN(max,ARRAY_SIZE(out));q=q->next){
@@ -1331,13 +1331,8 @@ static int64_t sys_pager_take(int h,struct n_pager_fault *uout,size_t max,int64_
         if(k){r=(int64_t)k;break;}
         if(!g->memory){r=-N_ERR_CLOSED;break;}
         if(current_task->killed){r=-N_ERR_STOPPED;break;}
-        if(!timeout_ms){r=-N_ERR_TIMEOUT;break;}
-        if(timeout_ms<0)wq_wait_locked(&g->taker,&shared_lock);
-        else{
-            uint64_t now=uptime_ms();
-            if(now>=deadline){r=-N_ERR_TIMEOUT;break;}
-            wq_wait_locked_timeout(&g->taker,&shared_lock,deadline-now);
-        }
+        if(clock_now_ns()>=deadline){r=-N_ERR_TIMEOUT;break;}
+        wq_wait_locked_until(&g->taker,&shared_lock,deadline);
         spin_take(&shared_lock);
     }
     spin_unlock(&shared_lock,lock);
@@ -2647,7 +2642,8 @@ static int64_t sys_app_result(int h, int64_t timeout_ms, int *ustatus) {
     struct handle *app = handle_get_as(h, proc_app_is, &r);
     if (!app) return r;
     int status = 0;
-    r = proc_app_result(app, timeout_ms < 0 ? UINT64_MAX : (uint64_t)timeout_ms, &status);
+    r = proc_app_result(app, syscall_deadline(timeout_ms), &status);
+    if (r == -N_ERR_TIMEOUT && !timeout_ms) r = -N_ERR_NOT_READY; /* a look that does not wait */
     handle_close(app);
     if (!r && ustatus) r = copy_to_user(ustatus, &status, sizeof status);
     return r;
@@ -2792,7 +2788,7 @@ static int64_t sys_events_timer(int q, uint64_t ms, int repeat, uint64_t token) 
     int64_t r;
     struct handle *queue = handle_get_as(q, events_is, &r);
     if (!queue) return r;
-    r = events_timer(queue, ms, repeat != 0, token);
+    r = events_timer(queue, ms < CLOCK_NEVER / NS_PER_MS ? ms * NS_PER_MS : CLOCK_NEVER, repeat != 0, token);
     handle_close(queue);
     return r;
 }
@@ -2810,7 +2806,7 @@ static int64_t sys_events_wait(int q, struct n_event *uout, size_t max, int64_t 
     int64_t r;
     struct handle *queue = handle_get_as(q, events_is, &r);
     if (!queue) return r;
-    r = events_wait(queue, uout, max, timeout_ms);
+    r = events_wait(queue, uout, max, syscall_deadline(timeout_ms));
     handle_close(queue);
     return r;
 }
@@ -2824,9 +2820,9 @@ void syscall_dispatch(struct regs *r) {
     switch (r->rax) {
     case SYS_EXIT: task_exit_app((int)a);
     case SYS_AUDIO_FLUSH: ret = sys_audio_flush((int)a); break;
-    case SYS_SLEEP: sleep_ms(a); ret = 0; break;
-    case SYS_UPTIME: ret = uptime_ms(); break;
-    case SYS_TIME: ret = time_now(); break;
+    case SYS_SLEEP: sleep_until(syscall_deadline((int64_t)a)); ret = 0; break;
+    case SYS_UPTIME: ret = (int64_t)(clock_now_ns() / NS_PER_MS); break;
+    case SYS_TIME: ret = clock_wall_seconds(); break;
     case SYS_SHARED_CREATE: ret = sys_shared_create(a,false); break;
     case SYS_SHARED_RESERVE: ret = sys_shared_create(a,true); break;
     case SYS_SHARED_MAP: ret = sys_shared_map((int)a,b,(int)c); break;
@@ -2861,9 +2857,9 @@ void syscall_dispatch(struct regs *r) {
         else if (r->rax == SYS_PCI_INTERRUPTS) ret = pci_user_interrupts(f,(uint32_t)b);
         else if (r->rax == SYS_PCI_HOLD_SCREEN) ret = pci_user_hold_screen(f, b != 0);
         else if (r->rax == SYS_PCI_SCREEN_VBLANK) ret = pci_user_screen_vblank(f, b, c);
-        else if (r->rax == SYS_PCI_ACPI_NOTIFY_TAKE) ret = pci_user_acpi_notify_take(f, (int64_t)b);
+        else if (r->rax == SYS_PCI_ACPI_NOTIFY_TAKE) ret = pci_user_acpi_notify_take(f, syscall_deadline((int64_t)b));
         else if (r->rax == SYS_PCI_SCREEN_IMAGE_END) ret = pci_user_screen_image_end(f, (int64_t)b);
-        else ret = pci_user_interrupt_take(f,(int64_t)b);
+        else ret = pci_user_interrupt_take(f,syscall_deadline((int64_t)b));
         handle_close(f);
         break;
     }
@@ -2882,21 +2878,21 @@ void syscall_dispatch(struct regs *r) {
         break;
     }
     case SYS_CLOCK_INFO: {
+        /* A whole millisecond of the clock and what the program's own counter (the clock's source)
+           read at it: the program carries the clock on from there by itself. */
         struct n_clockinfo info = {.version = 1};
-        uint32_t ca, cb, cc, cd, max;
-        cpuid(0x80000000, 0, &max, &cb, &cc, &cd);
-        cd = 0;
-        if (max >= 0x80000007) cpuid(0x80000007, 0, &ca, &cb, &cc, &cd);
-        if (!vm_clock_owned() && tsc_hz >= 1000000 && (cd & (1u << 8))) {
+        info.uptime_ms = clock_now_ns() / NS_PER_MS;
+        uint64_t at = info.uptime_ms * NS_PER_MS, reference_ns, reference;
+        if (clock_hypervisor_at(at, &reference_ns)) {
+            if ((reference = clock_page_of(task_process()))) {
+                info.flags = N_CLOCK_HV_REFERENCE;
+                info.reference_page = reference;
+                info.reference_sample_100ns = reference_ns / 100;
+            }
+        } else if (clock_tsc_at(at, &info.tsc_sample)) {
             info.flags = N_CLOCK_USER_TSC;
-            info.tsc_hz = tsc_hz;
+            info.tsc_hz = clock_tsc_hz();
         }
-        uint64_t reference = clock_page_of(task_process());
-        if (reference) {
-            info.flags = N_CLOCK_HV_REFERENCE;
-            info.reference_page = reference;
-        }
-        timer_clock_sample(&info.uptime_ms, &info.tsc_sample, &info.reference_sample_100ns);
         ret = copy_to_user((void *)a, &info, sizeof info);
         break;
     }
@@ -2926,11 +2922,11 @@ void syscall_dispatch(struct regs *r) {
     }
     case SYS_WAIT_ADDRESS:
         if ((a & 3) || !user_ok((void *)a, sizeof(uint32_t))) ret = -N_ERR_BAD_ADDRESS;
-        else ret = task_wait_address((volatile void *)a, (uint32_t)b, false, (unsigned)c);
+        else ret = task_wait_address((volatile void *)a, (uint32_t)b, false, address_deadline((unsigned)c));
         break;
     case SYS_WAIT_ADDRESS64:
         if ((a & 7) || !user_ok((void *)a, sizeof(uint64_t))) ret = -N_ERR_BAD_ADDRESS;
-        else ret = task_wait_address((volatile void *)a, b, true, (unsigned)c);
+        else ret = task_wait_address((volatile void *)a, b, true, address_deadline((unsigned)c));
         break;
     case SYS_WAKE_ADDRESS:
         if ((a & 3) || !user_ok((void *)a, sizeof(uint32_t))) ret = -N_ERR_BAD_ADDRESS;
@@ -3030,7 +3026,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_POWER:
         /* the power thread ends this app with the others */
         pm_request(a == POWER_REBOOT ? PM_REBOOT : PM_POWER_OFF, false);
-        while (!current_task->killed) sleep_ms(1000);
+        while (!current_task->killed) sleep_until(CLOCK_NEVER); /* the kill wakes it */
         ret = -N_ERR_STOPPED;
         break;
     case SYS_SYSTEM_LOG: ret = sys_system_log((char *)a, b); break;

@@ -8,6 +8,7 @@
 #include "abi.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 
 /* ---- ECAM (MCFG) ----
@@ -158,25 +159,27 @@ static bool id_pending(uint32_t id, bool there) {
     return id == PCI_CONFIG_RRS_ID || (there && (id & 0xFFFF) == 0xFFFF);
 }
 
-/* A step of a wait: a scheduler tick, or a spin where interrupts are off (boot, sleep). */
+/* A step of a polled wait: a millisecond asleep, or a spin where interrupts are off (boot, sleep). */
 static void wait_step(bool sleeps) {
-    if (sleeps) sleep_ms(1);
+    if (sleeps) sleep_until(clock_after(NS_PER_MS));
     else pause();
 }
 
 static void rrs_show(const struct pci_device *port, bool on);
 
 /* A function still initializing counts as broken only once 1.0 s has passed since its
-   Conventional Reset without a Successful Completion (6.6.1). `since` is a TSC count no earlier
-   than the end of that reset. At boot a failed read is an empty slot, as the platform guarantees
-   the functions it shows are ready by then (6.6.1). rrs: the Root Port above, shown RRS again
-   before each read (AML may rewrite Root Control while this sleeps), or NULL. */
+   Conventional Reset without a Successful Completion (6.6.1). `since` is a clock reading
+   (clock_now_ns) no earlier than the end of that reset. At boot a failed read is an empty slot,
+   as the platform guarantees the functions it shows are ready by then (6.6.1). rrs: the Root
+   Port above, shown RRS again before each read (AML may rewrite Root Control while this sleeps),
+   or NULL. */
 static uint32_t ready_id(const struct pci_device *rrs, uint8_t bus, uint8_t dev, uint8_t func, uint64_t since,
                          bool there, bool sleeps) {
+    uint64_t broken_at = since + NS_PER_S;
     for (;;) {
         if (rrs) rrs_show(rrs, true);
         uint32_t id = pci_read32(bus, dev, func, 0);
-        if (!id_pending(id, there) || rdtsc() - since >= tsc_hz) return id;
+        if (!id_pending(id, there) || clock_now_ns() >= broken_at) return id;
         wait_step(sleeps);
     }
 }
@@ -193,7 +196,7 @@ static void pcie_identify(struct pci_device *d) {
 }
 
 void pci_init(void) {
-    uint64_t since = rdtsc(); /* the platform reset was before the firmware ran */
+    uint64_t since = clock_now_ns(); /* the platform reset was before the firmware ran */
     interrupt_dest = lapic_current_id();
     ecam = acpi_ecams(&necam);
     for (unsigned i = 0; i < necam; i++)
@@ -675,7 +678,7 @@ static void rrs_release(struct pci_device *port) {
 }
 
 /* How long after a function stopped issuing Requests a Completion for one it still had
-   outstanding may arrive, in ms. 6.6.2 recommends "as much time as provided by the pre-FLR value
+   outstanding may arrive, in ns. 6.6.2 recommends "as much time as provided by the pre-FLR value
    for Completion Timeout": the top of the range its Completion Timeout Value selects (7.5.3.16;
    0 marks a reserved encoding, which selects none: the longest defined is taken). A Request
    pending when that value was changed may keep the old one, so the longest range the function
@@ -686,7 +689,7 @@ static void rrs_release(struct pci_device *port) {
    1 s, what 6.6.1 gives a device before software may decide it is broken. A structure before
    version 2 has neither register: its function has the default value. */
 #define COMPLETION_FLOOR_MS 1000
-static unsigned completion_window_ms(const struct pci_device *d) {
+static uint64_t completion_window_ns(const struct pci_device *d) {
     static const unsigned top_ms[16] = {[0x0] = 50, [0x1] = 1, [0x2] = 10, [0x5] = 55, [0x6] = 210,
                                         [0x9] = 900, [0xA] = 3500, [0xD] = 13000, [0xE] = 64000};
     static const uint8_t range_longest[4] = {0x2, 0x6, 0xA, 0xE};
@@ -698,26 +701,24 @@ static unsigned completion_window_ms(const struct pci_device *d) {
     unsigned ms = top_ms[value] ? top_ms[value] : top_ms[0xE];
     for (unsigned r = 0; r < 4; r++)
         if ((ranges & (1u << r)) && top_ms[range_longest[r]] > ms) ms = top_ms[range_longest[r]];
-    return ms > COMPLETION_FLOOR_MS ? ms : COMPLETION_FLOOR_MS;
+    return MAX(ms, COMPLETION_FLOOR_MS) * NS_PER_MS;
 }
 
 /* FLR must finish in 100 ms (6.6.2); device-specific initialization may then still return RRS.
    A valid Readiness Time Reporting FLR Time (7.9.16) is when the function must be
    Configuration-Ready: its 9-bit value times 32^scale ns (at most A1Eh, 1.007 s, which also
-   rules out the reserved scales 6 and 7), rounded up to the scheduler's millisecond; 0 without
-   one. 6.6.2 itself sets no such limit. 6.6.1 gives a device 1.0 s after a Conventional Reset,
-   and 5.10.1 a VF 1.0 s after an FLR, before software may decide it is broken: that is the
-   limit without one. */
-#define FLR_DONE_MS 100
-#define READY_MS    1000
-static unsigned flr_time_ms(const struct pci_device *d) {
+   rules out the reserved scales 6 and 7); 0 without one. 6.6.2 itself sets no such limit.
+   6.6.1 gives a device 1.0 s after a Conventional Reset, and 5.10.1 a VF 1.0 s after an FLR,
+   before software may decide it is broken: that is the limit without one. */
+#define FLR_DONE_NS (100 * NS_PER_MS)
+#define READY_NS    NS_PER_S
+static uint64_t flr_time_ns(const struct pci_device *d) {
     uint16_t cap = pci_find_ext_cap(d, 0x22);
     if (!cap || !(pci_read32(d->bus, d->dev, d->func, cap + 4) & (1u << 31))) return 0;
     unsigned time = pci_read32(d->bus, d->dev, d->func, cap + 8) & 0xFFF;
     if (time > 0xA1E) return 0;
     uint64_t ns = (uint64_t)(time & 0x1FF) << (5 * (time >> 9));
-    unsigned ms = (unsigned)((ns + 1000000 - 1) / 1000000);
-    return ms > FLR_DONE_MS ? ms : FLR_DONE_MS;
+    return MAX(ns, FLR_DONE_NS);
 }
 
 /* Owned by its enumerated device, not the app performing recovery. A cancelled or failed attempt
@@ -730,17 +731,18 @@ static unsigned flr_time_ms(const struct pci_device *d) {
    (pci_config_firmware_read/write), on any CPU, read the record under reset_lock. */
 enum reset_phase {
     RESET_IDLE,     /* between attempts: the next one quiesces the function and issues an FLR */
-    RESET_QUIESCED, /* this attempt stopped the function issuing Requests, at `quiesced` */
+    RESET_QUIESCED, /* this attempt stopped the function issuing Requests (until `drained`) */
     RESET_ISSUED,   /* an FLR was initiated at `since` and the function not yet seen ready */
     RESET_BUS,      /* a bus reset above it is under way */
 };
 struct pci_reset {
     struct pci_saved state;  /* from before the first quiesce or the bus reset, Bus Master Enable cleared */
     enum reset_phase phase;
-    uint64_t quiesced;
-    unsigned window;         /* how long after `quiesced` a Completion may still arrive (ms) */
-    uint64_t since;
-    unsigned wait, ready;    /* ms after `since`: FLR complete (first access), readiness limit */
+    /* On the clock (clock_now_ns): */
+    uint64_t window;         /* how long after the quiesce a Completion may still arrive (ns) */
+    uint64_t drained;        /* the end of that window */
+    uint64_t since;          /* the FLR's initiating write */
+    uint64_t done, ready;    /* after it: FLR complete (first access), the readiness limit */
     bool owed;               /* an FLR is to come: pci_function_reset's, not only a bus reset's */
     bool stuck;              /* it did not come back (pci_reset_stuck) */
     bool broken;             /* nor after its last Conventional Reset (pci_bus_reset_port) */
@@ -781,12 +783,12 @@ static void reset_initializing(struct pci_reset *r, uint32_t id) {
     spin_unlock(&reset_lock, f);
 }
 
-/* A scheduler wait of the attempt: false, without waiting, once its task is killed. A kill
-   during the wait wakes it, and one that came just before it ends it within KILLED_NAP_MS
-   (sys/sched.h): the caller looks at reset_cancelled again either way. */
-static bool reset_wait(uint64_t ms) {
+/* A sleep of the attempt until deadline: false, without waiting, once its task is killed. A kill
+   during the sleep wakes it, and one that came just before it ends it within KILLED_NAP_NS
+   (sys/sched.c): the caller looks at reset_cancelled again either way. */
+static bool reset_wait(uint64_t deadline) {
     if (current_task && current_task->killed) return false;
-    sleep_ms(ms);
+    sleep_until(deadline);
     return true;
 }
 
@@ -803,8 +805,9 @@ static void links_retrain(bool sleeps) {
         if (!p->retrain) continue;
         p->retrain = false;
         uint16_t status;
-        for (uint64_t since = rdtsc(); ((status = pci_read16(p->bus, p->dev, p->func, p->pcie_cap + PCIE_LNKSTA)) &
-                                        PCIE_LNKSTA_TRAINING) && rdtsc() - since < tsc_hz;)
+        for (uint64_t until = clock_after(NS_PER_S);
+             ((status = pci_read16(p->bus, p->dev, p->func, p->pcie_cap + PCIE_LNKSTA)) & PCIE_LNKSTA_TRAINING) &&
+             clock_now_ns() < until;)
             wait_step(sleeps);
         if (status & PCIE_LNKSTA_TRAINING) {
             kprintf("pci: %02x:%02x.%u: its link is still training; not retrained for the clock configuration below it\n",
@@ -824,8 +827,8 @@ static bool reset_quiesce(struct pci_device *d, struct pci_reset *r) {
     pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, PCI_COMMAND_INTX_DISABLE);
     if (!present(d) || (pci_read16(d->bus, d->dev, d->func, PCI_COMMAND) & PCI_COMMAND_MASTER)) return false;
     reset_phase_set(r, RESET_QUIESCED);
-    r->quiesced = uptime_ms();
-    r->window = completion_window_ms(d); /* the pre-FLR value: nothing changes it from here */
+    r->window = completion_window_ns(d); /* the pre-FLR value: nothing changes it from here */
+    r->drained = clock_after(r->window);
     return true;
 }
 
@@ -876,16 +879,16 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
         }
         if (!reset_quiesce(d, r)) return false;
     }
-    /* Times are whole ticks counted from a reading taken just after the event, which may be up
-       to one short of the time since it: n ms have passed only once more than n are counted. */
+    /* Times count from a clock reading taken just after the event: once the clock reaches one,
+       the whole of it has passed. */
     if (r->phase == RESET_QUIESCED) {
         /* Transactions Pending: until it clears, or until no Completion can still arrive, the
            FLR issued either way (6.6.2 permits it with the bit set). Polled to the end of the
            window, nothing of it remains to be waited out after the FLR. An attempt that ends
            before its FLR leaves the next one to stop the function and wait again. */
         bool pending, there = true;
-        while ((pending = transactions_pending(d)) && uptime_ms() - r->quiesced <= r->window) {
-            if (!(there = present(d)) || !reset_wait(1)) break; /* scheduler resolution, not a deadline */
+        while ((pending = transactions_pending(d)) && clock_now_ns() < r->drained) {
+            if (!(there = present(d)) || !reset_wait(clock_after(NS_PER_MS))) break; /* looked at each ms */
         }
         if (there) there = present(d);
         if (!there || reset_cancelled()) {
@@ -895,23 +898,22 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
         }
         if (pending)
             kprintf("pci: %02x:%02x.%u: requests still pending %u ms after it stopped issuing them; reset anyway\n",
-                    d->bus, d->dev, d->func, r->window);
-        unsigned rtr = flr_time_ms(d); /* read before the FLR, which may discard reads (6.6.2) */
+                    d->bus, d->dev, d->func, (unsigned)(r->window / NS_PER_MS));
+        uint64_t rtr = flr_time_ns(d); /* read before the FLR, which may discard reads (6.6.2) */
         pci_write16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCTL,
                     r->state.pcie_ctl[0] | PCIE_DEVCTL_FLR);
         uint64_t f = spin_lock(&reset_lock);
-        r->since = uptime_ms(); /* allow the full delay after the initiating configuration write */
+        r->since = clock_now_ns(); /* allow the full delay after the initiating configuration write */
         r->phase = RESET_ISSUED;
-        r->wait = rtr ? rtr : FLR_DONE_MS;
-        r->ready = rtr ? rtr : READY_MS;
+        r->done = r->since + (rtr ? rtr : FLR_DONE_NS);
+        r->ready = r->since + (rtr ? rtr : READY_NS);
         spin_unlock(&reset_lock, f);
     }
     /* Issued: a cancelled wait leaves the FLR's times for the next attempt to go on with. */
     for (;;) {
-        uint64_t elapsed = uptime_ms() - r->since;
         if (reset_cancelled()) return false;
-        if (elapsed > r->wait) break;
-        if (!reset_wait(r->wait - elapsed + 1)) return false;
+        if (clock_now_ns() >= r->done) break;
+        if (!reset_wait(r->done)) return false;
     }
     /* The first access is this Vendor ID read (2.3.1). While the function initializes after the
        FLR's 100 ms (6.6.2) it does not give the ID (id_pending), up to the readiness limit. */
@@ -920,8 +922,8 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
         if (port) rrs_show(port, true); /* AML may have rewritten Root Control during a wait */
         id = pci_read32(d->bus, d->dev, d->func, 0);
         reset_initializing(r, id);
-        if (!id_pending(id, true) || uptime_ms() - r->since > r->ready) break;
-        if (!reset_wait(1)) return false;
+        if (!id_pending(id, true) || clock_now_ns() >= r->ready) break;
+        if (!reset_wait(clock_after(NS_PER_MS))) return false;
     }
     /* Transactions Pending must be clear once the FLR has completed (6.6.2). Initiate Function
        Level Reset may be written again (7.5.3.4): the next attempt issues another FLR. */
@@ -929,7 +931,7 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
         kprintf("pci: %02x:%02x.%u: %s %u ms after its FLR; its saved configuration is kept for another FLR\n",
                 d->bus, d->dev, d->func,
                 r->initializing ? "still initializing" : id != r->state.id ? "not answering" : "requests pending",
-                r->ready);
+                (unsigned)((r->ready - r->since) / NS_PER_MS));
         r->stuck = true;
         reset_phase_set(r, RESET_IDLE);
         return false;
@@ -982,7 +984,7 @@ static bool config_blocked_held(uint8_t bus, uint8_t dev, uint8_t func) {
     struct pci_reset *r = d ? d->reset : NULL;
     if (!r) return false;
     bool resetting = r->phase == RESET_QUIESCED || r->phase == RESET_BUS ||
-                     (r->phase == RESET_ISSUED && uptime_ms() - r->since <= r->ready);
+                     (r->phase == RESET_ISSUED && clock_now_ns() < r->ready);
     struct pci_device *port = resetting || !r->initializing ? NULL : rrs_port(d);
     if (port) {
         rrs_hold_held(port);
@@ -1035,17 +1037,12 @@ bool pci_config_firmware_write(uint8_t bus, uint8_t dev, uint8_t func, uint16_t 
    sets b->below and returns true. */
 static bool below_ready(struct pci_device *b) {
     uint32_t cap = pci_read32(b->bus, b->dev, b->func, b->pcie_cap + PCIE_LNKCAP);
-    if ((cap & PCIE_LNKCAP_SPEED) <= 2 || !(cap & PCIE_LNKCAP_DLL_REPORTING)) b->below = b->reset_end + tsc_hz / 10;
+    if ((cap & PCIE_LNKCAP_SPEED) <= 2 || !(cap & PCIE_LNKCAP_DLL_REPORTING)) b->below = b->reset_end + 100 * NS_PER_MS;
     else if (pci_read16(b->bus, b->dev, b->func, b->pcie_cap + PCIE_LNKSTA) & PCIE_LNKSTA_DLL_ACTIVE)
-        b->below = rdtsc() + tsc_hz / 10;
-    else if (rdtsc() - b->reset_end >= tsc_hz) b->below = UINT64_MAX;
+        b->below = clock_after(100 * NS_PER_MS);
+    else if (clock_now_ns() >= b->reset_end + NS_PER_S) b->below = CLOCK_NEVER;
     else return false;
     return true;
-}
-
-/* At least ms by the TSC, which no kill shortens: a reset once sent is seen through. */
-static void reset_hold(unsigned ms, bool sleeps) {
-    for (uint64_t t = rdtsc(); rdtsc() - t < tsc_hz / 1000 * ms;) wait_step(sleeps);
 }
 
 /* The Downstream Port whose link d's device is on: the bridge above d, or above the switch d is
@@ -1067,13 +1064,13 @@ static bool below_wait(const struct pci_device *d, uint64_t *since, bool sleeps)
     struct pci_device *b = port_above(d);
     if (!b) return true;
     if (!b->reset_end) {
-        reset_hold(4, sleeps);
-        b->reset_end = rdtsc();
+        for (uint64_t until = clock_after(4 * NS_PER_MS); clock_now_ns() < until;) wait_step(sleeps);
+        b->reset_end = clock_now_ns();
     }
     *since = b->reset_end;
     while (!b->below && !below_ready(b)) wait_step(sleeps);
-    if (b->below == UINT64_MAX) return false;
-    while (rdtsc() < b->below) wait_step(sleeps);
+    if (b->below == CLOCK_NEVER) return false;
+    while (clock_now_ns() < b->below) wait_step(sleeps);
     return true;
 }
 
@@ -1186,18 +1183,21 @@ static bool bus_reset(struct pci_device *port) {
     if (rrs) rrs_hold(rrs);
     kprintf("pci: %02x:%02x.%u: Secondary Bus Reset\n", port->bus, port->dev, port->func);
     pci_write16(port->bus, port->dev, port->func, PCI_BRIDGE_CONTROL, control | PCI_BRIDGE_CONTROL_SBR);
-    reset_hold(1, true); /* Trst */
+    /* the times after the reset is sent are held in whole: a kill does not shorten them */
+    for (uint64_t until = clock_after(NS_PER_MS); clock_now_ns() < until;) wait_step(true); /* Trst */
     if (dll) {
         uint16_t status;
-        for (uint64_t t = rdtsc(); ((status = pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_LNKSTA)) &
-                                    PCIE_LNKSTA_DLL_ACTIVE) && rdtsc() - t < tsc_hz;)
+        for (uint64_t until = clock_after(NS_PER_S);
+             ((status = pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_LNKSTA)) &
+              PCIE_LNKSTA_DLL_ACTIVE) &&
+             clock_now_ns() < until;)
             wait_step(true);
         if (status & PCIE_LNKSTA_DLL_ACTIVE)
             kprintf("pci: %02x:%02x.%u: its link stayed up 1 s into the reset\n", port->bus, port->dev, port->func);
     }
     pci_write16(port->bus, port->dev, port->func, PCI_BRIDGE_CONTROL, control);
-    reset_hold(2, true);
-    port->reset_end = rdtsc();
+    for (uint64_t until = clock_after(2 * NS_PER_MS); clock_now_ns() < until;) wait_step(true);
+    port->reset_end = clock_now_ns();
     port->below = 0;
     bool came = false;
     for (size_t i = 0; i < ndevices; i++) {
@@ -1317,7 +1317,7 @@ static void state_remake(struct pci_device *d, struct pci_saved *s) {
    sleep called off) such a reset is left as it was. */
 void pci_resume(bool slept, bool remake) {
     if (!saved_valid) return; /* the sleep was called off before anything went down */
-    uint64_t since = rdtsc();
+    uint64_t since = clock_now_ns();
     for (size_t i = 0; remake && i < ndevices; i++)
         state_remake(&devices[i], devices[i].reset ? &devices[i].reset->state : &saved[i]);
     for (size_t i = 0; i < ndevices; i++) {

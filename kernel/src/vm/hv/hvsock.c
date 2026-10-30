@@ -11,6 +11,7 @@
 #include "vm/hv/hvsock.h"
 #include "vm/hv/vmbus.h"
 #include "mm/heap.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 
 /* vsock-style service IDs: <port>-facb-11e6-bd58-64006a7986d3 */
@@ -20,6 +21,7 @@ static const struct guid port_template =
 #define SEND_RING (256 * 1024)
 #define RECV_RING (64 * 1024)
 #define MAX_SEND_DATA (4096 - 8) /* data per packet, as Linux sends: a page with the pipe header */
+#define SEND_GIVE_UP (10 * NS_PER_S) /* a host that makes no room for a packet this long is gone */
 
 struct pipe_header {
     uint32_t type; /* 1: data */
@@ -171,19 +173,17 @@ static bool fill(struct hvsock *s) {
     return true;
 }
 
-bool hvsock_wait(struct hvsock *s, uint64_t timeout_ms) {
-    uint64_t end = uptime_ms() + timeout_ms;
+bool hvsock_wait(struct hvsock *s, uint64_t deadline) {
     for (;;) {
         uint64_t seen = __atomic_load_n(&s->signals, __ATOMIC_SEQ_CST);
         if (fill(s)) return true;
-        uint64_t now = uptime_ms();
-        if (now >= end) return false;
-        wq_wait_unless(&s->wq, &s->signals, seen, end - now);
+        if (clock_now_ns() >= deadline) return false;
+        wq_wait_unless(&s->wq, &s->signals, seen, deadline);
     }
 }
 
-int hvsock_read(struct hvsock *s, void *buf, size_t len, uint64_t timeout_ms) {
-    if (!hvsock_wait(s, timeout_ms)) return -N_ERR_TIMEOUT;
+int hvsock_read(struct hvsock *s, void *buf, size_t len, uint64_t deadline) {
+    if (!hvsock_wait(s, deadline)) return -N_ERR_TIMEOUT;
     if (s->off >= s->end) return 0; /* end of stream */
     uint32_t n = (uint32_t)MIN(len, (size_t)(s->end - s->off));
     memcpy(buf, s->pkt + s->off, n);
@@ -191,10 +191,10 @@ int hvsock_read(struct hvsock *s, void *buf, size_t len, uint64_t timeout_ms) {
     return (int)n;
 }
 
-int hvsock_read_full(struct hvsock *s, void *buf, size_t len, uint64_t timeout_ms) {
+int hvsock_read_full(struct hvsock *s, void *buf, size_t len, uint64_t deadline) {
     uint8_t *p = buf;
     while (len) {
-        int n = hvsock_read(s, p, len, timeout_ms);
+        int n = hvsock_read(s, p, len, deadline);
         if (n < 0) return n;
         if (n == 0) return -N_ERR_CLOSED;
         p += n;
@@ -208,16 +208,16 @@ static int send_packet(struct hvsock *s, const void *data, uint32_t n) {
         struct vmpacket_desc d;
         struct pipe_header h;
     } PACKED hdr = {{VM_PKT_DATA_INBAND, 2, (uint16_t)((sizeof hdr + n + 7) / 8), 0, 0}, {1, n}};
-    uint64_t give_up = uptime_ms() + 10000; /* a host that reads nothing for this long is gone */
+    uint64_t give_up = clock_after(SEND_GIVE_UP);
     for (;;) {
         uint64_t seen = __atomic_load_n(&s->signals, __ATOMIC_SEQ_CST);
         if (socket_rescinded(s)) return -N_ERR_CLOSED;
-        uint64_t now = uptime_ms();
-        if (now > give_up) return -N_ERR_TIMEOUT;
-        /* full: the ring has asked the host (pending_send_sz) to signal once it has made room */
         int r = vmbus_send_raw(s->ch, &hdr, sizeof hdr, data, n);
         if (r != -N_ERR_NOT_READY) return r;
-        wq_wait_unless(&s->wq, &s->signals, seen, MIN(give_up - now + 1, (uint64_t)100));
+        if (clock_now_ns() >= give_up) return -N_ERR_TIMEOUT;
+        /* full: the ring has asked the host (pending_send_sz) to signal once it has made room,
+           and the signal moves s->signals */
+        wq_wait_unless(&s->wq, &s->signals, seen, give_up);
     }
 }
 

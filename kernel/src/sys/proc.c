@@ -95,19 +95,16 @@ int proc_app_pid(struct handle *h) {
     return pid;
 }
 
-int proc_app_result(struct handle *h, uint64_t timeout_ms, int *status) {
+int proc_app_result(struct handle *h, uint64_t deadline, int *status) {
     struct app_record *rec = app_record(h);
-    uint64_t deadline = uptime_ms() + timeout_ms;
     uint64_t flags = spin_lock(&rec->wait.lock);
     while (!rec->ended) {
-        uint64_t now = uptime_ms();
-        if (timeout_ms != UINT64_MAX && now >= deadline) {
+        if (clock_now_ns() >= deadline) {
             spin_unlock(&rec->wait.lock, flags);
-            return timeout_ms ? -N_ERR_TIMEOUT : -N_ERR_NOT_READY;
+            return -N_ERR_TIMEOUT;
         }
         if (current_task->killed) { spin_unlock(&rec->wait.lock, flags); return -N_ERR_STOPPED; }
-        if (timeout_ms == UINT64_MAX) wq_wait_locked(&rec->wait, &rec->wait.lock);
-        else wq_wait_locked_timeout(&rec->wait, &rec->wait.lock, deadline - now);
+        wq_wait_locked_until(&rec->wait, &rec->wait.lock, deadline);
         spin_take(&rec->wait.lock);
     }
     *status = rec->status;

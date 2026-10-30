@@ -24,6 +24,7 @@
 #include "gui/wm.h"
 #include "arch/cpu.h"
 #include "dev/fb.h"
+#include "sys/clock.h"
 #include "sys/keep.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
@@ -50,9 +51,10 @@ static struct {
     struct n_screen_mode mode;
 } choices[CHOICES_MAX];
 static unsigned nchoices, next_choice;
-/* A mode on trial: trial_from comes back at trial_until (uptime_ms) unless it is kept. trial_on and
-   trial_until change under lock and trial_lock both, and trial_wq is woken after; the watch thread
-   waits on them under trial_lock alone. trial_lock comes after lock, before trial_wq's lock. */
+/* A mode on trial: trial_from comes back at trial_until (clock ns, sys/clock.h) unless it is kept.
+   trial_on and trial_until change under lock and trial_lock both, and trial_wq is woken after; the
+   watch thread waits on them under trial_lock alone, until trial_until. trial_lock comes after
+   lock, before trial_wq's lock. */
 static struct spinlock trial_lock;
 static bool trial_on;
 static uint64_t trial_until;
@@ -189,16 +191,14 @@ static void trial_watch(void *arg) {
     (void)arg;
     for (;;) {
         uint64_t f = spin_lock(&trial_lock);
-        uint64_t now = uptime_ms();
-        if (!trial_on || now < trial_until) {
-            if (!trial_on) wq_wait_locked(&trial_wq, &trial_lock);
-            else wq_wait_locked_timeout(&trial_wq, &trial_lock, trial_until - now);
+        if (!trial_on || clock_now_ns() < trial_until) {
+            wq_wait_locked_until(&trial_wq, &trial_lock, trial_on ? trial_until : CLOCK_NEVER);
             irq_restore(f);
             continue;
         }
         spin_unlock(&trial_lock, f);
         mutex_lock(&lock);
-        bool back = trial_on && uptime_ms() >= trial_until;
+        bool back = trial_on && clock_now_ns() >= trial_until;
         if (back) {
             trial_end();
             wish(&trial_from, "the mode on trial was not kept; back to");
@@ -377,8 +377,9 @@ int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op) {
         mutex_lock(&lock);
         out->offered = offered;
         out->wanted = wanted;
-        uint64_t now = uptime_ms();
-        out->trial_ms = trial_on ? (uint32_t)(trial_until > now ? trial_until - now : 0) : 0;
+        uint64_t now = clock_now_ns();
+        /* the ABI's ms, rounded up: 0 says no trial */
+        out->trial_ms = trial_on && trial_until > now ? (uint32_t)((trial_until - now + NS_PER_MS - 1) / NS_PER_MS) : 0;
         out->refused = refused_last;
         out->source = remote  ? SCREEN_SOURCE_REMOTE
                       : !boot ? SCREEN_SOURCE_DRIVER
@@ -408,7 +409,7 @@ int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op) {
         else if (!m) r = -N_ERR_INVALID;
         else {
             if (!trial_on) trial_from = wanted;
-            trial_set(true, uptime_ms() + SCREEN_MODE_TRIAL_MS);
+            trial_set(true, clock_after((uint64_t)SCREEN_MODE_TRIAL_MS * NS_PER_MS));
             refused_last = false;
             unrefuse(m);
             wish(m, "on trial");

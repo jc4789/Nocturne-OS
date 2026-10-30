@@ -27,8 +27,11 @@ struct netif {
 void net_register(struct netif *nif);
 /* hand a received frame (without FCS) to the stack; any context, an interrupt handler too */
 void net_rx(const void *frame, size_t len);
-/* Wake the net thread without copying a packet; any context, an interrupt handler too.
-   Also used for TX completion so a resource-blocked sender can retry. */
+/* Wake the net thread without copying a packet; any context, an interrupt handler too. The
+   stack never polls an adapter on a period: the net thread calls rx_pending and poll_rx when
+   something woke it, so a frame the adapter holds waits for its notice, and a send refused for
+   want of room (-N_ERR_NOT_READY or -N_ERR_BUSY) is tried again once the adapter's notice says
+   room has come (its transmit completion). */
 void net_rx_notify(void);
 
 bool rtl8125_probe(void);
@@ -37,7 +40,5 @@ bool rtl8125_probe(void);
    Any context, an interrupt handler too. */
 bool net_config(uint8_t mac[6], uint32_t *ip, uint32_t *mask, uint32_t *gw, uint32_t *dns);
 
-/* busy-wait helper usable before the scheduler can block us */
-void net_delay_ms(uint64_t ms);
 void net_process_exit(int pid);
 void net_task_exit(struct task *task); /* release per-thread setup cancellation ref */

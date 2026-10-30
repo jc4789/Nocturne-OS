@@ -241,6 +241,9 @@
 | K135 | ホストの `store test 64 4 20000` が「a space map block is damaged」を一度知らせる（試験は通る）。電源の切れた commit か壊れた superblock の後の mount で、前の世代の地図の塊が読めなかった見込み。地図の写しの交互の約束（space_freeze）と照らす | 10-30 の R14 の修理の後に 6 種を回して見た。修理の前の同じ種の回は無い | 未調査 |
 | K136 | QEMU の PS/2 の指が上へ動かない（`mouse_move 0 -50` が下へ動く、`mouse_move 0 -10` は動かない）。横は動く | 10-30、前の写しの YouTube で F12 の札を押そうとした | 未調査 |
 | K137 | 再生回数と日付の行（`display:flex` の要素の中の、空の `display:flex; height:100%` の子）が高さ 100 px になり、説明の箱の上に大きな空白ができる。親の高さは auto なので、百分率は auto として振る舞うはず（CSS 2 §10.5、flex の交差軸の大きさが不定）。100 px は百分率をそのまま px に読んだ形（未確認） | YouTube の動画の頁の説明の箱（`yt-animated-rolling-number` と `.animatedRollingNumberDigits { display:flex; height:100% }`）、F12 で getBoundingClientRect と規則を読んだ（10-30） | 未着手 |
+| K138 | 文書から外した media 要素が止まらない：`video.remove()` の後、画面から消えても再生と音が続く（媒体の時計 15.9→23.9 s）。HTML の removing steps（stable state の後、文書に無ければ internal pause steps）が無く、avmedia.c 1311 は owner が変わった時だけ切る（外しても ownerDocument は変わらない）。再現は YouTube の再生中に F12 で | 10-30 土台の媒体（6296dc41＋未コミットの拍を消した差分）、QEMU、録音と F12 | 未修理。核の作り直しの段④（音）で直す（模型 25） |
+| K139 | Hyper-V の拡張セッションでは、止めた音が最大 160 ms と相手の溜めの分鳴り続ける：rdp.c は相手の再生より 160 ms 先まで送り（`SND_LEAD_NS`、コミット済みの版も `SND_LEAD_MS 160`）、遠隔の相手がいると audio.c の `take_back` は何もしない。核の `stream_close` は閉じた流れの鳴り残りを最大 1 秒鳴らす | 原文（rdp.c 1242、audio.c 582・636〜639）。Hyper-V では未測定 | 未修理。段④で直す（模型 25）。ユーザーの「100 ms ほど鳴り続ける」の元の見込み（推測） |
+| K140 | YouTube の再生が媒体の時計 46 s 前後で頁の JS に要素を作り直され（`reason author-reset`）、プレーヤーが「エラーが発生しました」を出す。videoplayback の要求はどれも 200 | 10-30 土台の媒体、QEMU、二回 | 原因の層は未確定。前の版で 46 s より先を見た記録が無く、退行かは未確認 |
 
 ## 5. 受入表（browser-hikaku の組）
 

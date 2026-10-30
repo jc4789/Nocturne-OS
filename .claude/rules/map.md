@@ -1,6 +1,6 @@
 # Nocturne の地図
 
-探す前に読み、ここに無い所だけを codegraph・grep で探す。README と docs の報告より、この表と今のコードを先に信じる。違いを見つけたらその場で直す。確かめた: 2026-10-30 `2682d0cb`＋未コミット。
+探す前に読み、ここに無い所だけを codegraph・grep で探す。README と docs の報告より、この表と今のコードを先に信じる。違いを見つけたらその場で直す。確かめた: 2026-10-30 `6296dc41`＋未コミット（拍を消した差分）。
 
 ## 置き場所（K=カーネル、L=libc、A=アプリ、P=移植・上流、H=ホストの道具）
 
@@ -8,10 +8,10 @@
 |---|---|---|
 | `kernel/src/arch/` | GDT・IDT・`isr.asm`、APIC、SMP、FPU、PAT、P ステート、S3 復帰 | K |
 | `kernel/src/mm/` | `pmm`・`vmm`（空間ごとの 4 段ページ表）・`heap` | K |
-| `kernel/src/sys/` | `proc`（ELF）、`sched`（CPU ごとの実行キューと idle task）、`kei`（継の選択核）、`syscall`、`object`、`channel`、`events`、`stream`（console・system log）、`watch`（見張りの共通の部品 `struct watched`、`n_watch_take`）、`keep`（システムの部品の状態の保存：持ち主の wm・audio・screenmode が自分の行を出し、`AppData\Nocturne\{Desktop,Sound,Displays}.conf` へ最後の変更の 500 ms 後に書き、init より前に読み戻す。鍵は知らない）、`prof` | K |
+| `kernel/src/sys/` | `proc`（ELF）、`sched`（CPU ごとの実行キューと idle task）、`kei`（継の選択核）、`clock`（ns の時計：TSC か Hyper-V の参照の頁）、`alarm`（CPU ごとの期限の heap と LAPIC の deadline。周期の拍は無い）、`syscall`、`object`、`channel`、`events`、`stream`（console・system log）、`watch`（見張りの共通の部品 `struct watched`、`n_watch_take`）、`keep`（システムの部品の状態の保存：持ち主の wm・audio・screenmode が自分の行を出し、`AppData\Nocturne\{Desktop,Sound,Displays}.conf` へ最後の変更の 500 ms 後に書き、init より前に読み戻す。鍵は知らない）、`prof` | K |
 | `kernel/src/fs/` | C: の格納庫の実行側：`store`（C: の mount、道での操作、変更と commit の間の門、フォルダーの lock、書き手）、`document`（開いた文書：文書ごとの mutex、差し替えは一時フォルダーの文書を名へ移すか `ns_take`）、`cache`（塊の溜め `struct store_supply` の実装）、`watch`（C: の見張り `n_entry_watch`：操作が返す `struct ns_told` を出す）。書式のエンジンは `common/store/` | K |
 | `common/store/` | 格納庫の書式のエンジン（library）：`names`・`fold_table`・`catalog`（B+木、latch）・`namespace`（`NS_GIVEN`：フォルダーが与える属性は移動でフォルダーと一緒に入れ替わる）・`space`・`volume`（mount・format・commit の凍結・書く・書き終え、`volume_commit`）・`crc32c`・`latch`。lock・待ち・log・時計を持たず、`store_device`・`store_supply`・`store_env` を受ける。カーネル（`kernel/src/fs`）とホストの道具（`host/store`）が組む | K+H |
-| `kernel/src/dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI・USB、IOMMU、音、`fb`・fbcon、入力、timer、電源 | K |
+| `kernel/src/dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI・USB、IOMMU、音、`fb`・fbcon、入力、電源 | K |
 | `kernel/src/net/` | `net.c`（Ethernet〜TCP・DHCP・DNS）、`rtl8125.c`（実機の NIC） | K |
 | `kernel/src/gui/` | `wm.c`（窓管理と合成）、`desktop.c`、`screenmode.c` | K |
 | `kernel/src/vm/` | VM だけの処理のすべて（下の「境界」） | K |

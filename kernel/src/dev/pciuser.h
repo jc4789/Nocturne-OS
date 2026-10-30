@@ -38,7 +38,7 @@ int64_t pci_user_config_write(struct handle *h, uint32_t offset, uint32_t width,
 int64_t pci_user_bar(struct handle *h, uint32_t bar, uint64_t *address, uint64_t *size);
 bool pci_user_bar_prefetchable(struct handle *h, uint32_t bar);
 int64_t pci_user_interrupts(struct handle *h, uint32_t count);
-int64_t pci_user_interrupt_take(struct handle *h, int64_t timeout_ms);
+int64_t pci_user_interrupt_take(struct handle *h, uint64_t deadline);
 /* n_pci_hold_screen: only for the function whose BAR the boot screen is drawn through, or the
    one whose surface the screen is drawn into. */
 int64_t pci_user_hold_screen(struct handle *h, bool hold);
@@ -54,7 +54,7 @@ int64_t pci_user_screen_vblank(struct handle *h, uint64_t count, uint64_t timest
    the system to choose from (gui/screenmode.c); count 0 withdraws them. */
 struct n_screen_state;
 struct n_screen_modes;
-int64_t pci_user_screen_state(struct handle *h, uint64_t seen, struct n_screen_state *out, int64_t timeout_ms);
+int64_t pci_user_screen_state(struct handle *h, uint64_t seen, struct n_screen_state *out, uint64_t deadline);
 int64_t pci_user_screen_modes(struct handle *h, const struct n_screen_modes *m);
 /* n_pci_screen_image: for that claim, a surface (as n_pci_give_screen's, without N_SCANOUT_DIRECT)
    the display engine may show in its scanout's place, which the panic screen is drawn into too;
@@ -70,4 +70,4 @@ int64_t pci_user_screen_image_end(struct handle *h, int64_t number);
 struct n_acpi_value;
 int64_t pci_user_acpi_eval(struct handle *h, uint32_t which, const char *name, const struct n_acpi_value *args,
                            uint32_t nargs, const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size);
-int64_t pci_user_acpi_notify_take(struct handle *h, int64_t timeout_ms);
+int64_t pci_user_acpi_notify_take(struct handle *h, uint64_t deadline);

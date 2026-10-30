@@ -22,6 +22,38 @@ const struct acpi_sdt *acpi_map_table(uint64_t phys);
 unsigned acpi_table_count(void);
 const struct acpi_sdt *acpi_table_at(unsigned index);
 
+/* ---- FADT ("FACP", ACPI 6.5 5.2.9): fields past h.length are not there ---- */
+struct acpi_gas {
+    uint8_t space, bit_width, bit_offset, access;
+    uint64_t address;
+} __attribute__((packed));
+
+struct acpi_fadt {
+    struct acpi_sdt h;
+    uint32_t firmware_ctrl, dsdt;
+    uint8_t reserved, pm_profile;
+    uint16_t sci_int;
+    uint32_t smi_cmd;
+    uint8_t acpi_enable, acpi_disable, s4bios_req, pstate_cnt;
+    uint32_t pm1a_evt, pm1b_evt, pm1a_cnt, pm1b_cnt, pm2_cnt, pm_tmr, gpe0, gpe1;
+    uint8_t pm1_evt_len, pm1_cnt_len, pm2_cnt_len, pm_tmr_len, gpe0_len, gpe1_len, gpe1_base, cst_cnt;
+    uint16_t p_lvl2_lat, p_lvl3_lat, flush_size, flush_stride;
+    uint8_t duty_offset, duty_width, day_alarm, mon_alarm, century;
+    uint16_t boot_arch;
+    uint8_t reserved2;
+    uint32_t flags;
+    struct acpi_gas reset_reg;
+    uint8_t reset_value;
+    uint8_t reserved3[3];
+    uint64_t x_firmware_ctrl, x_dsdt;
+    struct acpi_gas x_pm1a_evt, x_pm1b_evt, x_pm1a_cnt, x_pm1b_cnt, x_pm2_cnt, x_pm_tmr, x_gpe0, x_gpe1;
+    struct acpi_gas sleep_control, sleep_status; /* ACPI 5: hardware-reduced platforms */
+} __attribute__((packed));
+
+#define FADT_TMR_VAL_EXT   (1u << 8)  /* the PM timer counts 32 bits, else 24 */
+#define FADT_RESET_REG_SUP (1u << 10)
+#define FADT_HW_REDUCED    (1u << 20)
+
 /* ---- MADT ("APIC") ---- */
 struct acpi_lapic {
     uint32_t apic_id, uid, flags; /* flags bit 0: enabled, bit 1: online-capable */

@@ -1,6 +1,9 @@
 #include "kernel.h"
 #include "arch/spin.h"
 #include "arch/smp.h"
+#include "sys/alarm.h"
+#include "sys/clock.h"
+#include "sys/sched.h"
 #include "dev/serial.h"
 #include "dev/fbcon.h"
 
@@ -133,12 +136,25 @@ int ksnprintf(char *buf, size_t size, const char *fmt, ...) {
 static char klog_buf[KLOG_SIZE];
 static size_t klog_head; /* total bytes ever written */
 static struct spinlock klog_lock; /* any CPU logs */
+/* A reader asleep in klog_wait is woken by an alarm, not by the write: a line may be written with
+   any lock held, a wait queue's or a run queue's too (an alarm fires with none held). */
+static bool klog_waited;
+static struct wait_queue klog_wq;
+static void klog_told(struct alarm *a, struct regs *r) { wq_wake_all(&klog_wq); }
+static struct alarm klog_tell = {.fire = klog_told};
 
 void klog_write(const char *s, size_t n) {
     uint64_t f = spin_lock(&klog_lock);
     for (size_t i = 0; i < n; i++) klog_buf[(klog_head + i) % KLOG_SIZE] = s[i];
-    klog_head += n;
+    __atomic_store_n(&klog_head, klog_head + n, __ATOMIC_SEQ_CST);
     spin_unlock(&klog_lock, f);
+    /* after the move: a reader that said it waits before this looks finds it, or is woken after */
+    if (__atomic_exchange_n(&klog_waited, false, __ATOMIC_SEQ_CST)) alarm_set(&klog_tell, clock_now_ns());
+}
+
+void klog_wait(size_t at, uint64_t deadline) {
+    __atomic_store_n(&klog_waited, true, __ATOMIC_SEQ_CST);
+    wq_wait_unless(&klog_wq, (const uint64_t *)&klog_head, at, deadline);
 }
 
 size_t klog_read(char *buf, size_t max) {

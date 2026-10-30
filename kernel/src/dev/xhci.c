@@ -9,6 +9,7 @@
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 
 #define MAX_HC 8
@@ -126,7 +127,7 @@ struct endpoint {
     void *ctx;
     bool halted, dead;
     unsigned fails;   /* failed recoveries since the last good transfer */
-    uint64_t retry_at; /* when the next recovery may run */
+    uint64_t retry_at; /* when the next recovery may run (clock_now_ns) */
 };
 
 struct xdev {
@@ -186,7 +187,7 @@ static struct spinlock usb_lock;
 static struct wait_queue usb_wq;
 static bool usb_kick; /* wakes whichever wait runs; nested waits consume it */
 static bool usb_more; /* work for the main loop; only the main loop clears it */
-static uint64_t usb_deadline;  /* earliest endpoint recovery retry (0 = none) */
+static uint64_t usb_deadline;  /* earliest endpoint recovery retry (CLOCK_NEVER = none) */
 static struct task *usb_task;
 static bool usb_settled; /* the first pass over every port and hub is done (atomic: read by others) */
 /* The endpoints that send (struct endpoint): usb_send on any task, the usb thread's completions and
@@ -458,17 +459,18 @@ static bool any_polled(void) {
     return false;
 }
 
-/* Wait for a completion flag, handling every controller's events meanwhile. */
-static bool hc_wait(volatile bool *flag, unsigned ms) {
-    uint64_t end = uptime_ms() + ms;
+/* Wait for a completion flag until the deadline, handling every controller's events meanwhile:
+   looked at again each millisecond while a controller is polled, else each 10 ms. */
+static bool hc_wait(volatile bool *flag, uint64_t deadline) {
     for (;;) {
         poll_all();
         if (*flag) return true;
-        if (uptime_ms() >= end) return false;
-        unsigned ms = any_polled() ? 1 : 10;
+        uint64_t now = clock_now_ns();
+        if (now >= deadline) return false;
+        uint64_t look = now + (any_polled() ? NS_PER_MS : 10 * NS_PER_MS);
         uint64_t f = spin_lock(&usb_lock);
         if (!usb_kick) {
-            wq_wait_locked_timeout(&usb_wq, &usb_lock, ms);
+            wq_wait_locked_until(&usb_wq, &usb_lock, MIN(look, deadline));
             spin_take(&usb_lock);
         }
         usb_kick = false;
@@ -504,15 +506,15 @@ static int hc_command(struct usb_hc *hc, uint64_t param, uint32_t control, uint8
     hc->cmd_done = false;
     hc->cmd_trb = ring_push(&hc->cmd, param, 0, control);
     doorbell(hc, 0, 0);
-    if (!hc_wait(&hc->cmd_done, 3000)) {
+    if (!hc_wait(&hc->cmd_done, clock_after(3 * NS_PER_S))) {
         kprintf("usb: controller %d command %u timed out\n", hc->index, (control >> 10) & 63);
         /* abort it so the commands queued after it can run; the ring stops with a completion event */
         wr32(hc->op, CRCR, CRCR_CA);
         wr32(hc->op, CRCR + 4, 0);
-        uint64_t end = uptime_ms() + 5000;
-        while ((rd32(hc->op, CRCR) & CRCR_CRR) && uptime_ms() < end) {
+        uint64_t deadline = clock_after(5 * NS_PER_S);
+        while ((rd32(hc->op, CRCR) & CRCR_CRR) && clock_now_ns() < deadline) {
             poll_all();
-            sleep_ms(1);
+            sleep_until(clock_after(NS_PER_MS));
         }
         poll_all();
         return -1;
@@ -579,7 +581,7 @@ int usb_control(struct usb_device *d, uint8_t type, uint8_t request, uint16_t va
     if (length) ring_push(&xd->ep0, xd->xfer_phys, length, TRB_TYPE(TRB_DATA) | TRB_ISP | (in ? TRB_DIR_IN : 0));
     xd->ctl_status_trb = ring_push(&xd->ep0, 0, 0, TRB_TYPE(TRB_STATUS) | TRB_IOC | (length && in ? 0 : TRB_DIR_IN));
     doorbell(hc, d->slot, 1);
-    if (!hc_wait(&xd->ctl_done, 2000)) {
+    if (!hc_wait(&xd->ctl_done, clock_after(2 * NS_PER_S))) {
         kprintf("usb: slot %u request %02x:%02x timed out\n", d->slot, type, request);
         control_recover(xd);
         return -1;
@@ -836,7 +838,7 @@ int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, uns
     ep->sync_done = false;
     endpoint_push(ep, 0, len, false);
     doorbell(d->hc, d->slot, ep->dci);
-    if (!hc_wait(&ep->sync_done, timeout_ms)) {
+    if (!hc_wait(&ep->sync_done, clock_after(timeout_ms * NS_PER_MS))) {
         if (d->removed) return -1;
         kprintf("usb: slot %u endpoint %02x transfer timed out\n", d->slot, address);
         endpoint_restart(ep, ep->halted);
@@ -1029,7 +1031,7 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
         kprintf("usb: port %u address assignment failed (%d)\n", port, cc);
         goto fail;
     }
-    sleep_ms(2);
+    sleep_until(clock_after(2 * NS_PER_MS));
     if (usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_DEVICE << 8, 0, &d->desc, 8) < 8) {
         kprintf("usb: port %u device descriptor unreadable\n", port);
         goto fail;
@@ -1054,7 +1056,7 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
     uint8_t *cfg = NULL;
     /* devices still busy after reset (or slow to fetch their descriptors) answer a moment later */
     for (int attempt = 0; attempt < 3 && !d->removed && !xd->ctl_broken; attempt++) {
-        if (attempt) sleep_ms(100 << attempt);
+        if (attempt) sleep_until(clock_after((100 * NS_PER_MS) << attempt));
         if ((cfg = choose_configuration(d, &got)) && usb_control(d, 0, USB_REQ_SET_CONFIG, cfg[5], 0, NULL, 0) >= 0)
             break;
         kfree(cfg);
@@ -1107,10 +1109,12 @@ void usb_remove(struct usb_device *d) {
 static bool port_reset(struct usb_hc *hc, unsigned p, bool warm) {
     uint32_t sc = rd32(hc->op, PORTSC(p)), done = warm ? PS_WRC | PS_PRC : PS_PRC;
     wr32(hc->op, PORTSC(p), (sc & PS_KEEP) | (warm ? PS_WPR : PS_PR));
-    for (int t = 0; t < 500 && !(rd32(hc->op, PORTSC(p)) & done); t++) sleep_ms(1);
+    for (uint64_t deadline = clock_after(500 * NS_PER_MS);
+         !(rd32(hc->op, PORTSC(p)) & done) && clock_now_ns() < deadline;)
+        sleep_until(clock_after(NS_PER_MS));
     sc = rd32(hc->op, PORTSC(p));
     wr32(hc->op, PORTSC(p), (sc & PS_KEEP) | (sc & PS_CHANGES));
-    sleep_ms(10); /* reset recovery */
+    sleep_until(clock_after(10 * NS_PER_MS)); /* reset recovery */
     return rd32(hc->op, PORTSC(p)) & PS_PED;
 }
 
@@ -1126,16 +1130,17 @@ static void root_port(struct usb_hc *hc, unsigned p) {
     if (!(sc & PS_CCS) || hc->root[p]) return;
     bool usb3 = hc->port_major[p] >= 3;
     if (!usb3) {
-        sleep_ms(100); /* connect debounce */
+        sleep_until(clock_after(100 * NS_PER_MS)); /* connect debounce */
         if (!(rd32(hc->op, PORTSC(p)) & PS_CCS)) return;
     }
     for (int attempt = 0; attempt < 3; attempt++) {
         if (usb3) {
             /* USB3 links train on their own; a stuck link (inactive, compliance) needs a warm reset */
-            for (int t = 0; t < 1000 && !(rd32(hc->op, PORTSC(p)) & PS_PED); t++) {
+            for (uint64_t deadline = clock_after(NS_PER_S);
+                 !(rd32(hc->op, PORTSC(p)) & PS_PED) && clock_now_ns() < deadline;) {
                 unsigned pls = PS_PLS(rd32(hc->op, PORTSC(p)));
                 if (pls == PLS_INACTIVE || pls == PLS_COMPLIANCE) break;
-                sleep_ms(1);
+                sleep_until(clock_after(NS_PER_MS));
             }
             if (attempt || !(rd32(hc->op, PORTSC(p)) & PS_PED)) port_reset(hc, p, true);
         } else {
@@ -1148,7 +1153,7 @@ static void root_port(struct usb_hc *hc, unsigned p) {
             continue;
         }
         if ((hc->root[p] = device_attach(hc, NULL, p, p, 0, (sc >> 10) & 15, 0, 0, 0))) break;
-        sleep_ms(100);
+        sleep_until(clock_after(100 * NS_PER_MS));
     }
 }
 
@@ -1164,7 +1169,7 @@ static void hc_work(struct usb_hc *hc) {
     }
     if (!hc->recover) return;
     hc->recover = false;
-    uint64_t now = uptime_ms();
+    uint64_t now = clock_now_ns();
     for (unsigned s = 1; s <= hc->max_slots; s++) {
         struct xdev *xd = hc->slots[s];
         for (int i = 2; xd && !xd->dev.removed && i < 32; i++) {
@@ -1172,7 +1177,7 @@ static void hc_work(struct usb_hc *hc) {
             if (!ep || !ep->halted || ep->dead || ep->mode == EP_SYNC) continue; /* usb_bulk's caller recovers */
             if (now < ep->retry_at) { /* backing off: come back later */
                 hc->recover = true;
-                if (!usb_deadline || ep->retry_at < usb_deadline) usb_deadline = ep->retry_at;
+                usb_deadline = MIN(usb_deadline, ep->retry_at);
                 continue;
             }
             bool ok = endpoint_recover(xd, i, &ep->ring);
@@ -1188,10 +1193,10 @@ static void hc_work(struct usb_hc *hc) {
                 spin_unlock(&send_lock, f);
                 continue;
             }
-            ep->retry_at = now + (10u << ep->fails);
+            ep->retry_at = now + ((10 * NS_PER_MS) << ep->fails);
             if (!ok) {
                 hc->recover = true;
-                if (!usb_deadline || ep->retry_at < usb_deadline) usb_deadline = ep->retry_at;
+                usb_deadline = MIN(usb_deadline, ep->retry_at);
                 continue;
             }
             endpoint_restart(ep, false); /* the ring restarts past everything that was queued */
@@ -1203,12 +1208,13 @@ static void hc_work(struct usb_hc *hc) {
 
 /* ---- controller bring-up ---- */
 
-static bool wait_reg(volatile uint8_t *b, unsigned off, uint32_t mask, uint32_t want, unsigned ms) {
-    for (unsigned t = 0; t <= ms; t++) {
+static bool wait_reg(volatile uint8_t *b, unsigned off, uint32_t mask, uint32_t want, uint64_t ns) {
+    uint64_t deadline = clock_after(ns);
+    for (;;) {
         if ((rd32(b, off) & mask) == want) return true;
-        sleep_ms(1);
+        if (clock_now_ns() >= deadline) return false;
+        sleep_until(clock_after(NS_PER_MS));
     }
-    return false;
 }
 
 static bool hc_start(struct usb_hc *hc) {
@@ -1245,7 +1251,7 @@ static bool hc_start(struct usb_hc *hc) {
                 /* only the OS semaphore byte: a whole-register write could put back a BIOS bit
                  * the firmware cleared in between */
                 mmio_write8(hc->cap + x + 3, 1);
-                if (!wait_reg(hc->cap, x, 1u << 16, 0, 1000))
+                if (!wait_reg(hc->cap, x, 1u << 16, 0, NS_PER_S))
                     kprintf("usb: controller %d firmware kept ownership, taking it anyway\n", hc->index);
             }
             uint32_t legacy = rd32(hc->cap, x + 4);
@@ -1264,18 +1270,18 @@ static bool hc_start(struct usb_hc *hc) {
     }
     /* no operational register may be written before Controller Not Ready clears (4.2), and a
      * reset is only allowed once the controller has halted (5.4.1) */
-    if (!wait_reg(hc->op, USBSTS, STS_CNR, 0, 1000)) {
+    if (!wait_reg(hc->op, USBSTS, STS_CNR, 0, NS_PER_S)) {
         kprintf("usb: controller %d never became ready\n", hc->index);
         return false;
     }
     wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~1u);
-    if (!wait_reg(hc->op, USBSTS, STS_HCH, STS_HCH, 50)) {
+    if (!wait_reg(hc->op, USBSTS, STS_HCH, STS_HCH, 50 * NS_PER_MS)) {
         kprintf("usb: controller %d did not halt\n", hc->index);
         return false;
     }
     wr32(hc->op, USBCMD, 2);
-    sleep_ms(2);
-    if (!wait_reg(hc->op, USBCMD, 2, 0, 1000) || !wait_reg(hc->op, USBSTS, STS_CNR, 0, 1000)) {
+    sleep_until(clock_after(2 * NS_PER_MS));
+    if (!wait_reg(hc->op, USBCMD, 2, 0, NS_PER_S) || !wait_reg(hc->op, USBSTS, STS_CNR, 0, NS_PER_S)) {
         kprintf("usb: controller %d did not come out of reset\n", hc->index);
         return false;
     }
@@ -1337,7 +1343,7 @@ static bool hc_start(struct usb_hc *hc) {
     wr32(hc->rt, IMAN, vector ? 3 : 1);
     hc_set_irq(hc, true, vector);
     wr32(hc->op, USBCMD, 1 | (vector ? CMD_INTE : 0));
-    if (!wait_reg(hc->op, USBSTS, STS_HCH, 0, 100)) {
+    if (!wait_reg(hc->op, USBSTS, STS_HCH, 0, 100 * NS_PER_MS)) {
         kprintf("usb: controller %d did not start\n", hc->index);
         hc_set_irq(hc, false, vector);
         return false;
@@ -1347,7 +1353,7 @@ static bool hc_start(struct usb_hc *hc) {
             uint32_t sc = rd32(hc->op, PORTSC(p));
             if (!(sc & PS_PP)) wr32(hc->op, PORTSC(p), (sc & PS_KEEP) | PS_PP);
         }
-    sleep_ms(20);
+    sleep_until(clock_after(20 * NS_PER_MS));
     for (unsigned p = 1; p <= hc->max_ports; p++) hc->port_pending[p >> 5] |= 1u << (p & 31);
     kprintf("usb: xHCI %d (%04x:%04x) version %x, %u ports, %u slots, %s\n", hc->index, pci->vendor, pci->device,
             rd32(hc->cap, 0) >> 16, hc->max_ports, hc->max_slots, hc->vector ? "MSI" : "polled");
@@ -1361,10 +1367,10 @@ static bool hc_start(struct usb_hc *hc) {
 static void hc_restart(struct usb_hc *hc, bool after_sleep) {
     hc_set_irq(hc, false, hc->vector);
     wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~(1u | CMD_INTE));
-    wait_reg(hc->op, USBSTS, STS_HCH, STS_HCH, 50);
+    wait_reg(hc->op, USBSTS, STS_HCH, STS_HCH, 50 * NS_PER_MS);
     wr32(hc->op, USBCMD, 2);
-    sleep_ms(2);
-    wait_reg(hc->op, USBCMD, 2, 0, 1000);
+    sleep_until(clock_after(2 * NS_PER_MS));
+    wait_reg(hc->op, USBCMD, 2, 0, NS_PER_S);
     for (unsigned p = 1; p <= hc->max_ports; p++) {
         struct xdev *gone = hc->root[p];
         hc->root[p] = NULL;
@@ -1407,25 +1413,14 @@ static void run_calls(void) {
 }
 
 /* Until the usb thread has run the call. The boot task, which runs kmain_late and then becomes the
- * idle task, has no stack of its own and must never sit on a wait queue: it lets the others run
- * until the call is done. */
+ * idle task, waits the same way: it lets the others run and halts in between (sys/sched.h). */
 static void wait_call(struct usb_call *c) {
-    for (;;) {
-        uint64_t f = spin_lock(&usb_lock);
-        if (c->done) {
-            spin_unlock(&usb_lock, f);
-            return;
-        }
-        if (current_task->kstack) {
-            wq_wait_locked(&calls_wq, &usb_lock);
-            irq_restore(f);
-            continue;
-        }
-        spin_unlock(&usb_lock, f);
-        sti();
-        hlt();
-        schedule();
+    uint64_t f = spin_lock(&usb_lock);
+    while (!c->done) {
+        wq_wait_locked(&calls_wq, &usb_lock);
+        spin_take(&usb_lock);
     }
+    spin_unlock(&usb_lock, f);
 }
 
 void usb_run(void (*fn)(void *arg), void *arg) {
@@ -1455,12 +1450,12 @@ static bool any_port_pending(void) {
 static void usb_thread(void *arg) {
     (void)arg;
     for (int i = 0; i < ncontrollers; i++) hc_start(&controllers[i]);
-    uint64_t started = uptime_ms();
+    uint64_t settle_at = clock_after(500 * NS_PER_MS);
     for (;;) {
         uint64_t f = spin_lock(&usb_lock);
         usb_more = false;
         spin_unlock(&usb_lock, f);
-        usb_deadline = 0;
+        usb_deadline = CLOCK_NEVER;
         poll_all();
         run_calls();
         for (int i = 0; i < ncontrollers; i++) {
@@ -1496,18 +1491,18 @@ static void usb_thread(void *arg) {
         f = spin_lock(&usb_lock);
         bool more = usb_more;
         spin_unlock(&usb_lock, f);
-        if (!usb_settled && !more && !any_port_pending() && !usbhub_pending() &&
-            uptime_ms() - started >= 500)
+        if (!usb_settled && !more && !any_port_pending() && !usbhub_pending() && clock_now_ns() >= settle_at)
             __atomic_store_n(&usb_settled, true, __ATOMIC_RELEASE);
-        uint64_t now = uptime_ms(), next = usbhid_tick(now);
-        if (!usb_settled && (!next || next > now + 50)) next = now + 50;
-        uint64_t wait = any_polled() ? 4 : 1000;
-        if (usb_deadline && (!next || usb_deadline < next)) next = usb_deadline;
-        if (next) wait = next <= now ? 0 : (next - now < wait ? next - now : wait);
+        /* the next look: a key repeat, a recovery retry, settling, else a polled controller's 4 ms
+           or the second after which the controllers' status is looked at again */
+        uint64_t now = clock_now_ns(), next = usbhid_tick(now);
+        next = MIN(next, usb_deadline);
+        if (!usb_settled) next = MIN(next, now + 50 * NS_PER_MS);
+        next = MIN(next, now + (any_polled() ? 4 * NS_PER_MS : NS_PER_S));
         f = spin_lock(&usb_lock);
-        if (usb_more) wait = 0; /* work arrived during a nested wait, which used up the kick */
-        if (wait && !usb_kick) {
-            wq_wait_locked_timeout(&usb_wq, &usb_lock, wait);
+        /* usb_more: work arrived during a nested wait, which used up the kick */
+        if (!usb_more && !usb_kick && next > now) {
+            wq_wait_locked_until(&usb_wq, &usb_lock, next);
             spin_take(&usb_lock);
         }
         usb_kick = false;
@@ -1524,7 +1519,9 @@ static bool xhci_quiesce(void *arg) {
         struct usb_hc *hc = &controllers[i];
         if (!hc->op) continue;
         wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~(1u | CMD_INTE));
-        for (int t = 0; t < 20000 && !(rd32(hc->op, USBSTS) & STS_HCH); t++) io_wait(); /* ~1 us each */
+        for (uint64_t deadline = clock_after(20 * NS_PER_MS);
+             !(rd32(hc->op, USBSTS) & STS_HCH) && clock_now_ns() < deadline;)
+            pause();
         if (!(rd32(hc->op, USBSTS) & STS_HCH)) all = false;
     }
     return all;

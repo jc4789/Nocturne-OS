@@ -14,6 +14,7 @@
 #include "arch/irq.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 
 #define SIDE target_width
@@ -100,16 +101,17 @@ static void gpu_isr(struct regs *r) {
     __atomic_fetch_add(&completions, 1, __ATOMIC_SEQ_CST);
     wq_wake_all(&completion_wait);
 }
-/* Boot runs on the future idle task, which cannot block on a wait queue.
- * Normal requests sleep as native continuations and let the GUI run; the one
- * holding busy (any CPU) sleeps unless an interrupt came since it looked at the
- * used ring. Without MSI-X, poll once per scheduler millisecond instead of
- * monopolising the CPU. */
-static void completion_nap(uint64_t remaining) {
+/* Normal requests sleep as native continuations and let the GUI run; the one
+ * holding busy (any CPU) sleeps until deadline (clock ns) unless an interrupt
+ * came since it looked at the used ring. Without MSI-X, and on the boot task
+ * (the future idle task, which cannot block on a wait queue), the ring is read
+ * again every COMPLETION_POLL_NS instead of monopolising the CPU. */
+#define COMPLETION_POLL_NS NS_PER_MS
+static void completion_nap(uint64_t deadline) {
     uint64_t seen=__atomic_load_n(&completions,__ATOMIC_SEQ_CST);
     if(used->idx!=seen_used)return;
-    if(current_task->kstack)wq_wait_unless(&completion_wait,&completions,seen,completion_irq?remaining:MIN(remaining,1u));
-    else {sti();hlt();schedule();}
+    if(completion_irq && current_task->kstack)wq_wait_unless(&completion_wait,&completions,seen,deadline);
+    else sleep_until(MIN(deadline,clock_after(COMPLETION_POLL_NS)));
 }
 
 static inline void barrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
@@ -159,9 +161,9 @@ static bool transport_init(struct pci_device *d) {
     if (!common || !notify_base) return false;
     pci_enable_busmaster(d);
     mmio_write8(&common->device_status, 0);
-    uint64_t deadline = uptime_ms() + 100;
-    for (unsigned spins = 0; mmio_read8(&common->device_status); spins++) {
-        if (uptime_ms() >= deadline || spins > 1000000) return false;
+    uint64_t deadline = clock_after(100 * NS_PER_MS); /* the reset reads 0 once it is done */
+    while (mmio_read8(&common->device_status)) {
+        if (clock_now_ns() >= deadline) return false;
         pause();
     }
     mmio_write8(&common->device_status, 1 | 2); /* ACKNOWLEDGE | DRIVER */
@@ -237,22 +239,19 @@ static bool exchange(const void *request, size_t len, uint32_t response_type) {
     /* The descriptor, packet and resource backing stay driver-owned while
      * this continuation sleeps. Timeout retires the device without freeing
      * any possibly in-flight DMA or reusing the serialized packet buffers. */
-    uint64_t started=uptime_ms(),started_tsc=rdtsc();
-    uint64_t budget_ms=validating_runtime || (ready&&!cmdline_has("gpu-slow-test"))?2000:10000,deadline=started+budget_ms;
+    uint64_t started=clock_now_ns();
+    uint64_t budget=(validating_runtime || (ready&&!cmdline_has("gpu-slow-test"))?2:10)*NS_PER_S,deadline=started+budget;
     unsigned spins = 0;
     while (used->idx == seen_used) {
-        uint64_t now=uptime_ms();
-        if (now>=deadline || (current_task->kstack && current_task->killed)) {
-                uint64_t ticks=rdtsc()-started_tsc;
+        if (clock_now_ns()>=deadline || (current_task->kstack && current_task->killed)) {
                 unsigned status=mmio_read8(&common->device_status);
-                kprintf("gpu: timeout request=%x ctx=%u fence=%lu len=%lu used=%u seen=%u avail=%u elapsed_ms=%lu tsc_ms=%lu spins=%u status=%x desc0=%lx/%u desc1=%lx/%u notify=%p\n",
-                    h->type,h->ctx,h->fence,len,used->idx,seen_used,avail->idx,uptime_ms()-started,
-                    tsc_hz?ticks/(tsc_hz/1000):0,spins,status,
-                    desc[0].addr,desc[0].len,desc[1].addr,desc[1].len,notify);
+                kprintf("gpu: timeout request=%x ctx=%u fence=%lu len=%lu used=%u seen=%u avail=%u elapsed_us=%lu spins=%u status=%x desc0=%lx/%u desc1=%lx/%u notify=%p\n",
+                    h->type,h->ctx,h->fence,len,used->idx,seen_used,avail->idx,(clock_now_ns()-started)/NS_PER_US,
+                    spins,status,desc[0].addr,desc[0].len,desc[1].addr,desc[1].len,notify);
                 goto failed;
         }
         spins++;
-        completion_nap(deadline-now);
+        completion_nap(deadline);
     }
     barrier();
     struct used_entry *u = &used->ring[seen_used % QSIZE];
@@ -267,10 +266,9 @@ static bool exchange(const void *request, size_t len, uint32_t response_type) {
     statistics.submissions++;
     reply_bytes=u->len;
     if (cmdline_has("gpu-timing") || cmdline_has("gpu-slow-test")) {
-        uint64_t ticks=rdtsc()-started_tsc;
-        kprintf("gpu: complete request=%x ctx=%u fence=%lu stage=%s elapsed_ms=%lu tsc_us=%lu spins=%u\n",
-            h->type,h->ctx,h->fence,validating_runtime?"validation":ready?"runtime":"init",uptime_ms()-started,
-            tsc_hz?ticks/(tsc_hz/1000000):0,spins);
+        kprintf("gpu: complete request=%x ctx=%u fence=%lu stage=%s elapsed_us=%lu spins=%u\n",
+            h->type,h->ctx,h->fence,validating_runtime?"validation":ready?"runtime":"init",
+            (clock_now_ns()-started)/NS_PER_US,spins);
     }
     return true;
 failed:

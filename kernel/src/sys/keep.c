@@ -2,7 +2,6 @@
    and writes their changes: reading and writing C: may sleep, and the parts change their state from
    anywhere (a system call on any CPU, the compositor, a remote session). */
 #include "sys/keep.h"
-#include "dev/timer.h"
 #include "fs/store.h"
 #include "mm/heap.h"
 #include "sys/object.h"
@@ -17,7 +16,7 @@
 static const char *const older[] = {"AppData\\Nocturne\\Settings.conf", "AppData\\Settings\\desktop.conf"};
 
 /* The parts, in the order they registered: appended, never removed. parts_lock guards the list's
-   end, started, and each part's read, dirty, retry and dirty_at, which any CPU changes; keep's
+   end, started, ready, and each part's read, dirty, retry and dirty_at, which any CPU changes; keep's
    thread alone has reading, missing and took. keep's thread looks at what is due under the lock and
    is in keep_wq before it is given back. The lock comes after any lock a part holds when it calls
    keep_changed, and before keep_wq's. A walk without it reads each next with acquire: a part is
@@ -26,7 +25,7 @@ static struct spinlock parts_lock;
 static struct keep *parts, **parts_end = &parts;
 static bool started; /* keep_start ran: a part registered now is read on keep's thread */
 static bool ready;   /* the parts registered before keep_start were read */
-static struct wait_queue keep_wq;
+static struct wait_queue keep_wq, ready_wq;
 /* One write at a time (keep's thread, keep_flush's caller), so an older text never lands last. */
 static struct mutex write_lock;
 
@@ -52,7 +51,7 @@ void keep_changed(struct keep *k) {
     if (kept) {
         k->dirty = true;
         k->retry = false;
-        k->dirty_at = timer_now_ms();
+        k->dirty_at = clock_now_ns();
     }
     spin_unlock(&parts_lock, f);
     if (kept) wq_wake_all(&keep_wq);
@@ -279,13 +278,13 @@ static void read_parts(void) {
     spin_unlock(&parts_lock, f);
 }
 
-/* When keep's thread has work next (timer_now_ms): 0 for a part not read yet, UINT64_MAX for none.
+/* When keep's thread has work next (clock_now_ns): 0 for a part not read yet, CLOCK_NEVER for none.
    parts_lock held. */
 static uint64_t next_work(void) {
-    uint64_t due = UINT64_MAX;
+    uint64_t due = CLOCK_NEVER;
     for (struct keep *k = parts; k; k = k->next) {
         if (!k->read) return 0;
-        if (k->dirty && !k->retry) due = MIN(due, k->dirty_at + KEEP_AFTER_MS);
+        if (k->dirty && !k->retry) due = MIN(due, k->dirty_at + KEEP_AFTER_NS);
     }
     return due;
 }
@@ -293,11 +292,16 @@ static uint64_t next_work(void) {
 /* One round of keep's thread: the parts not read yet read, the changes that are due written. */
 static void keep_work(void) {
     read_parts();
-    __atomic_store_n(&ready, true, __ATOMIC_RELEASE);
-    uint64_t now = timer_now_ms();
+    uint64_t f = spin_lock(&parts_lock);
+    if (!ready) {
+        ready = true;
+        wq_wake_all(&ready_wq); /* keep_start */
+    }
+    spin_unlock(&parts_lock, f);
+    uint64_t now = clock_now_ns();
     for (struct keep *k = first_part(); k; k = next_part(k)) {
-        uint64_t f = spin_lock(&parts_lock);
-        bool due = k->dirty && !k->retry && now >= k->dirty_at + KEEP_AFTER_MS;
+        f = spin_lock(&parts_lock);
+        bool due = k->dirty && !k->retry && now >= k->dirty_at + KEEP_AFTER_NS;
         spin_unlock(&parts_lock, f);
         if (due) save(k);
     }
@@ -313,9 +317,8 @@ static void keep_thread(void *arg) {
     for (;;) {
         keep_work();
         uint64_t f = spin_lock(&parts_lock);
-        uint64_t due = next_work(), now = timer_now_ms();
-        if (due == UINT64_MAX) wq_wait_locked(&keep_wq, &parts_lock);
-        else if (due > now) wq_wait_locked_timeout(&keep_wq, &parts_lock, due - now);
+        uint64_t due = next_work();
+        if (due > clock_now_ns()) wq_wait_locked_until(&keep_wq, &parts_lock, due);
         else spin_give(&parts_lock);
         irq_restore(f);
     }
@@ -329,7 +332,11 @@ void keep_start(void) {
         kprintf("keep: the system's state is neither read back nor kept (no thread)\n");
         return;
     }
-    /* Back before the first program starts (a display driver offers its monitor's modes). The boot
-       task has no stack to sleep on a wait queue with: it lets the thread run until then. */
-    while (!__atomic_load_n(&ready, __ATOMIC_ACQUIRE)) nap_ms(0);
+    /* Back before the first program starts (a display driver offers its monitor's modes). */
+    f = spin_lock(&parts_lock);
+    while (!ready) {
+        wq_wait_locked(&ready_wq, &parts_lock);
+        spin_take(&parts_lock);
+    }
+    spin_unlock(&parts_lock, f);
 }

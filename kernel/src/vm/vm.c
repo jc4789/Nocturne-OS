@@ -50,15 +50,10 @@ void vm_detect(void) {
 enum vm_machine vm_machine(void) { return machine; }
 
 /* ---- clock ---- */
-uint64_t vm_timer_hz(uint64_t *tsc_hz) {
-    uint64_t hz = hv_apic_hz();
-    if (hz) *tsc_hz = hv_tsc_hz();
-    return hz;
-}
-
-bool vm_clock_read(uint64_t *units_100ns) { return hv_reference_time(units_100ns); }
+uint64_t vm_lapic_hz(void) { return hv_apic_hz(); }
+uint64_t vm_tsc_hz(void) { return hv_tsc_hz(); }
+bool vm_clock_ns(uint64_t *ns) { return hv_reference_ns(ns); }
 uint64_t vm_clock_page(void) { return hv_reference_tsc_page(); }
-bool vm_clock_owned(void) { return hv.present; }
 
 /* ---- devices ---- */
 void vm_init(void) {
@@ -122,7 +117,5 @@ void vm_suspend(void) {
     hv_reference_suspend();
 }
 
-void vm_resume(void) {
-    hv_reference_resume(); /* the hypervisor's overlay pages: reset, or the restoring kernel's */
-    hv_core_resume();
-}
+void vm_clock_resume(void) { hv_reference_resume(); /* reset, or the restoring kernel's */ }
+void vm_resume(void) { hv_core_resume(); }

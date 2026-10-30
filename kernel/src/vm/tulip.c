@@ -3,6 +3,7 @@
 #include "kernel.h"
 #include "vm/devices.h"
 #include "net/net.h"
+#include "sys/clock.h"
 #include "arch/cpu.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
@@ -117,9 +118,9 @@ bool tulip_probe(void) {
     iobase = (uint16_t)(d->bar[0] & ~3u);
 
     csr_wr(0, 1); /* software reset */
-    net_delay_ms(10);
+    clock_spin(10 * NS_PER_MS);
     csr_wr(0, 0);
-    net_delay_ms(10);
+    clock_spin(10 * NS_PER_MS);
 
     int alen = (eeprom_read(0xFF, 8) & 0x40000) ? 8 : 6;
     uint8_t ee[128];

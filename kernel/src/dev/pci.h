@@ -34,9 +34,9 @@ struct pci_device {
     struct pci_reset *reset;
     unsigned rrs_holds;  /* a Root Port: reset attempts or readiness waits below it running (pci.c) */
     bool rrs_firmware;   /* a Root Port: RRS Software Visibility was already on at the first hold */
-    /* A Downstream Port after a Conventional Reset (sleep, pci_bus_reset), as TSC counts, 0 while
-       not yet known: when the reset of its link ended, and from when what is below it may be
-       read (UINT64_MAX: its link is down) */
+    /* A Downstream Port after a Conventional Reset (sleep, pci_bus_reset), on the clock
+       (clock_now_ns), 0 while not yet known: when the reset of its link ended, and from when what
+       is below it may be read (CLOCK_NEVER: its link is down) */
     uint64_t reset_end, below;
     /* A Downstream Port: a configuration written back changed the Common Clock Configuration of
        the device below since its link trained, which takes effect once the link retrains (pci.c) */

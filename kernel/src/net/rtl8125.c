@@ -45,6 +45,7 @@
 #include "../dev/pm.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
+#include "../sys/clock.h"
 
 #define VEC_RTL 0x4C /* after the NVMe vectors 0x48..0x4B */
 
@@ -129,6 +130,7 @@
 #define BUFSZ 2048
 #define FRAME_MAX 1522 /* 1500 + header + VLAN tag + FCS */
 #define UDP_PAD 121 /* short IPv4 UDP frames this length or shorter go out padded (8125A/B) */
+#define LINK_LOOK NS_PER_S /* poll_rx reads the link state again after this, besides the link interrupt */
 
 struct desc {
     uint32_t opts1, opts2;
@@ -152,7 +154,7 @@ static unsigned rx_cur, tx_cur, tx_clean;
 static struct spinlock rtl_lock;
 static volatile bool rx_irq_pending, link_event;
 static bool link;
-static uint64_t link_checked;
+static uint64_t link_checked; /* the moment check_link last read the PHY */
 static uint32_t macver;
 static struct netif nif = {.driver = "rtl8125"};
 
@@ -163,12 +165,17 @@ static void wr8(uint32_t r, uint8_t v) { mmio_write8(mmio + r, v); }
 static void wr16(uint32_t r, uint16_t v) { mmio_write16(mmio + r, v); }
 static void wr32(uint32_t r, uint32_t v) { mmio_write32(mmio + r, v); }
 
-static void udelay(unsigned us) {
-    if (tsc_hz >= 1000000) {
-        uint64_t start = rdtsc(), span = tsc_hz / 1000000 * us;
-        while (rdtsc() - start < span) pause();
-    } else {
-        while (us--) io_wait();
+/* The register sequences run at probe and in a power change (the other CPUs halted), where nothing
+   may sleep: their waits spin on the clock (clock_spin). */
+/* The size-byte register r is read after each step until (its value & mask) == want, for at most
+   ns (looking after the step, as Realtek's sequences do): true when it came. */
+static bool wait_reg(uint32_t r, unsigned size, uint32_t mask, uint32_t want, uint64_t step, uint64_t ns) {
+    uint64_t until = clock_after(ns);
+    for (;;) {
+        clock_spin(step);
+        uint32_t v = size == 1 ? rd8(r) : size == 2 ? rd16(r) : rd32(r);
+        if ((v & mask) == want) return true;
+        if (clock_now_ns() >= until) return false;
     }
 }
 
@@ -186,20 +193,18 @@ static void mac_ocp_modify(uint16_t a, uint16_t clear, uint16_t set) {
 
 static uint16_t phy_read(uint16_t a) {
     wr32(PHY_OCP, (uint32_t)(a / 2) << 16);
-    uint32_t v = 0;
-    for (int i = 0; i < 100; i++) {
-        udelay(1);
-        if ((v = rd32(PHY_OCP)) & (1u << 31)) break;
-    }
+    uint64_t until = clock_after(100 * NS_PER_US);
+    uint32_t v;
+    do {
+        clock_spin(NS_PER_US);
+        v = rd32(PHY_OCP);
+    } while (!(v & (1u << 31)) && clock_now_ns() < until);
     return (uint16_t)v;
 }
 
 static void phy_write(uint16_t a, uint16_t v) {
     wr32(PHY_OCP, 1u << 31 | (uint32_t)(a / 2) << 16 | v);
-    for (int i = 0; i < 100; i++) {
-        udelay(1);
-        if (!(rd32(PHY_OCP) & (1u << 31))) break;
-    }
+    wait_reg(PHY_OCP, 4, 1u << 31, 0, NS_PER_US, 100 * NS_PER_US);
 }
 
 static void phy_modify(uint16_t a, uint16_t clear, uint16_t set) { phy_write(a, (phy_read(a) & ~clear) | set); }
@@ -209,53 +214,41 @@ static void mii_write(unsigned reg, uint16_t v) { phy_write((uint16_t)(0xA400 + 
 /* PCI Express PHY */
 static void ephy_write(uint8_t a, uint16_t v) {
     wr32(EPHYAR, 1u << 31 | (uint32_t)a << 16 | v);
-    for (int i = 0; i < 5; i++) {
-        net_delay_ms(1);
-        if (!(rd32(EPHYAR) & (1u << 31))) break;
-    }
+    wait_reg(EPHYAR, 4, 1u << 31, 0, NS_PER_MS, 5 * NS_PER_MS);
 }
 
 static void cfg_unlock(void) { wr8(EECMD, rd8(EECMD) | EECMD_UNLOCK); }
 static void cfg_lock(void) { wr8(EECMD, rd8(EECMD) & ~EECMD_UNLOCK); }
 
-static bool wait8(uint32_t r, uint8_t mask, uint8_t want, unsigned tries, unsigned us) {
-    for (unsigned i = 0; i < tries; i++) {
-        udelay(us);
-        if ((rd8(r) & mask) == want) return true;
-    }
-    return false;
-}
-
 static unsigned phy_state(void) { return phy_read(0xA420) & 7; }
 
 static void wait_phy_state(unsigned state) {
-    for (int i = 0; i < 100 && phy_state() != state; i++) net_delay_ms(1);
+    uint64_t until = clock_after(100 * NS_PER_MS);
+    while (phy_state() != state && clock_now_ns() < until) clock_spin(NS_PER_MS);
 }
 
 /* Take the MAC from the firmware's out-of-band (wake/management) mode to driver mode. */
 static void exit_oob(void) {
     cfg_lock();
     wr8(0xF2, rd8(0xF2) | 0x08);
-    net_delay_ms(2);
+    clock_spin(2 * NS_PER_MS);
     if (rd8(CMD) & (CMD_TX_EN | CMD_RX_EN)) {
-        udelay(100);
+        clock_spin(100 * NS_PER_US);
         wr8(CMD, rd8(CMD) & ~(CMD_TX_EN | CMD_RX_EN));
     }
     wr8(CMD, rd8(CMD) | CMD_STOP_REQ);
-    if (!wait8(MCU_CMD, MCU_FIFOS_EMPTY, MCU_FIFOS_EMPTY, 3000, 50)) kprintf("rtl8125: FIFOs did not drain\n");
-    for (int i = 0; i < 3000; i++) {
-        udelay(50);
-        if ((rd16(INTR_MIT) & 0x103) == 0x103) break;
-    }
+    if (!wait_reg(MCU_CMD, 1, MCU_FIFOS_EMPTY, MCU_FIFOS_EMPTY, 50 * NS_PER_US, 150 * NS_PER_MS))
+        kprintf("rtl8125: FIFOs did not drain\n");
+    wait_reg(INTR_MIT, 2, 0x103, 0x103, 50 * NS_PER_US, 150 * NS_PER_MS);
     mac_ocp_modify(0xC0B4, 1, 0); /* reset the MAC MCU packet filter */
     mac_ocp_modify(0xC0B4, 0, 1);
     wr8(MCU_CMD, rd8(MCU_CMD) & ~MCU_NOW_IS_OOB);
     mac_ocp_modify(0xE8DE, 1u << 14, 0);
-    for (int i = 0; i < 10 && !(rd16(TWI_CMD) & (1u << 9)); i++) udelay(100);
+    wait_reg(TWI_CMD, 2, 1u << 9, 1u << 9, 100 * NS_PER_US, NS_PER_MS);
     mac_ocp_write(0xC0AA, 0x07D0);
     mac_ocp_write(0xC0A6, 0x01B5);
     mac_ocp_write(0xC01E, 0x5555);
-    for (int i = 0; i < 10 && !(rd16(TWI_CMD) & (1u << 9)); i++) udelay(100);
+    wait_reg(TWI_CMD, 2, 1u << 9, 1u << 9, 100 * NS_PER_US, NS_PER_MS);
     if (mac_ocp_read(0xD42C) & (1u << 8)) { /* resuming from the PHY's power-saving (UPS) state */
         wait_phy_state(2);
         mac_ocp_modify(0xD42C, 1u << 8, 0);
@@ -268,10 +261,9 @@ static void mac_reset(void) {
     wr32(RXCFG, rd32(RXCFG) & ~0x3Fu); /* accept nothing while the reset runs */
     wr32(IMR_CLEAR, 0xFFFFFFFF);
     wr32(ISR, 0xFFFFFFFF);
-    net_delay_ms(2);
-    udelay(200);
+    clock_spin(2 * NS_PER_MS + 200 * NS_PER_US);
     wr8(CMD, CMD_RESET);
-    if (!wait8(CMD, CMD_RESET, 0, 1000, 10)) kprintf("rtl8125: reset did not complete\n");
+    if (!wait_reg(CMD, 1, CMD_RESET, 0, 10 * NS_PER_US, 10 * NS_PER_MS)) kprintf("rtl8125: reset did not complete\n");
 }
 
 /* Power change (dev/pm.h): interrupts off, then the reset ends every DMA. Polled waits only. */
@@ -280,9 +272,9 @@ static bool rtl_quiesce(void *arg) {
     wr32(IMR_CLEAR, 0xFFFFFFFF);
     wr32(RXCFG, rd32(RXCFG) & ~0x3Fu);
     wr8(CMD, rd8(CMD) & ~(CMD_TX_EN | CMD_RX_EN));
-    udelay(100);
+    clock_spin(100 * NS_PER_US);
     wr8(CMD, CMD_RESET);
-    return wait8(CMD, CMD_RESET, 0, 1000, 10);
+    return wait_reg(CMD, 1, CMD_RESET, 0, 10 * NS_PER_US, 10 * NS_PER_MS);
 }
 
 static void aspm_clkreq_off(void) {
@@ -303,7 +295,7 @@ static void hw_init(void) {
 
     /* Breakpoints of a MAC microcode patch a boot ROM may have left: the MAC runs its ROM code. */
     for (uint16_t a = 0xFC28; a <= 0xFC48; a += 2) mac_ocp_write(a, 0);
-    net_delay_ms(3);
+    clock_spin(3 * NS_PER_MS);
     mac_ocp_write(0xFC26, 0);
 
     /* PHY power up */
@@ -362,7 +354,7 @@ static void hw_init(void) {
     wr8(0xD0, rd8(0xD0) | 0x80);
     mac_ocp_modify(0xEA1C, 1u << 2, 0);
     mac_ocp_modify(0xEB54, 0, 1);
-    udelay(1);
+    clock_spin(NS_PER_US);
     mac_ocp_modify(0xEB54, 1, 0);
     wr16(0x1880, rd16(0x1880) & ~0x30);
     for (uint32_t r = 0x0A00; r < 0x0A80; r += 4) wr32(r, 0);
@@ -431,7 +423,7 @@ static struct pm_device rtl_pm = {.name = "rtl8125", .stage = PM_STAGE_IO, .quie
 static void check_link(void) {
     uint32_t s = rd32(PHY_STATUS);
     bool up = s != 0xFFFFFFFF && (s & LINK_UP);
-    link_checked = uptime_ms();
+    link_checked = clock_now_ns();
     if (up == link) return;
     link = up;
     if (!up) {
@@ -471,7 +463,7 @@ static size_t rtl_poll_rx(void (*input)(const void *, size_t)) {
     bool event = link_event;
     link_event = false;
     spin_unlock(&rtl_lock, flags);
-    if (event || uptime_ms() - link_checked >= 1000) check_link();
+    if (event || clock_now_ns() >= link_checked + LINK_LOOK) check_link();
     (void)rd8(INT_CFG0); /* a register read orders the descriptor writes the NIC posted before it */
     size_t consumed = 0;
     while (consumed < NRX && !(rx[rx_cur].opts1 & D_OWN)) {
@@ -552,7 +544,7 @@ bool rtl8125_probe(void) {
         uint32_t pmcsr = pci_read32(d->bus, d->dev, d->func, pm + 4);
         if (pmcsr & 3) {
             pci_write32(d->bus, d->dev, d->func, pm + 4, pmcsr & ~3u);
-            net_delay_ms(10);
+            clock_spin(10 * NS_PER_MS);
         }
     }
     if (!(mmio = vmm_map_mmio(base, size && size < 0x10000 ? size : 0x10000))) return false;

@@ -5,13 +5,14 @@
    hypervisor the host owns the clock and nothing is written.
 
    APERF/MPERF, where present, give the effective clock: MPERF counts at the
-   nominal rate while the core is awake and APERF at the actual one. Each CPU
-   samples them on its own timer tick (pstate_tick), so the profiler can print
-   every CPU's real frequency and awake share. */
+   nominal rate while the core is awake and APERF at the actual one. While the
+   profiler samples (sys/prof.c), each CPU closes a window of them every second
+   (pstate_sample), so it can print every CPU's real frequency and awake share. */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/smp.h"
 #include "arch/pstate.h"
+#include "sys/clock.h"
 #include "vm/vm.h"
 
 #define MSR_MPERF          0xE7
@@ -34,7 +35,7 @@ static bool hypervisor;
 
 static struct pstate_sample {
     uint64_t aperf, mperf, tsc;
-    uint32_t ticks;
+    uint64_t at;                    /* clock_now_ns when the window began */
     uint32_t mhz, awake_permille;   /* last completed window */
 } samples[CPU_MAX_COUNT];
 
@@ -102,11 +103,12 @@ static const char *raise(char *buf, size_t n) {
 
 /* Effective clock of the calling CPU over a short busy interval. */
 static unsigned measure_mhz(void) {
-    if (!have_aperf || tsc_hz < 1000000) return 0;
-    uint64_t a0 = rdmsr(MSR_APERF), m0 = rdmsr(MSR_MPERF), t0 = rdtsc();
-    while (rdtsc() - t0 < tsc_hz / 200) pause(); /* 5 ms */
+    uint64_t hz = clock_tsc_hz();
+    if (!have_aperf || hz < 1000000) return 0;
+    uint64_t a0 = rdmsr(MSR_APERF), m0 = rdmsr(MSR_MPERF);
+    for (uint64_t until = clock_after(5 * NS_PER_MS); clock_now_ns() < until;) pause();
     uint64_t da = rdmsr(MSR_APERF) - a0, dm = rdmsr(MSR_MPERF) - m0;
-    return dm ? (unsigned)(tsc_hz / 1000000 * da / dm) : 0;
+    return dm ? (unsigned)(hz / 1000000 * da / dm) : 0;
 }
 
 void pstate_init_bsp(void) {
@@ -116,7 +118,7 @@ void pstate_init_bsp(void) {
     const char *what = raise(buf, sizeof buf);
     unsigned after = measure_mhz();
     if (have_aperf && !hypervisor)
-        kprintf("pstate: %s; cpu0 %u MHz -> %u MHz (TSC %lu MHz)\n", what, before, after, tsc_hz / 1000000);
+        kprintf("pstate: %s; cpu0 %u MHz -> %u MHz (TSC %lu MHz)\n", what, before, after, clock_tsc_hz() / 1000000);
     else
         kprintf("pstate: %s\n", what);
 }
@@ -128,16 +130,17 @@ void pstate_init_ap(void) {
 
 bool pstate_sampling(void) { return have_aperf && !hypervisor; }
 
-void pstate_tick(void) {
+void pstate_sample(void) {
     unsigned cpu = cpu_current_index();
     if (cpu >= CPU_MAX_COUNT) return;
     struct pstate_sample *s = &samples[cpu];
-    if (++s->ticks < 1000) return;
-    s->ticks = 0;
+    uint64_t now = clock_now_ns();
+    if (s->tsc && now - s->at < NS_PER_S) return;
+    s->at = now;
     uint64_t a = rdmsr(MSR_APERF), m = rdmsr(MSR_MPERF), t = rdtsc();
     if (s->tsc) {
         uint64_t da = a - s->aperf, dm = m - s->mperf, dt = t - s->tsc;
-        if (dm) __atomic_store_n(&s->mhz, (uint32_t)(tsc_hz / 1000000 * da / dm), __ATOMIC_RELAXED);
+        if (dm) __atomic_store_n(&s->mhz, (uint32_t)(clock_tsc_hz() / 1000000 * da / dm), __ATOMIC_RELAXED);
         if (dt) __atomic_store_n(&s->awake_permille, (uint32_t)(dm * 1000 / dt), __ATOMIC_RELAXED);
     }
     s->aperf = a; s->mperf = m; s->tsc = t;

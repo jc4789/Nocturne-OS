@@ -6,7 +6,7 @@
    its own, the user's AppData\Nocturne\<name>.conf: lines of key=value, a line that begins with '#'
    a note. The part says which keys are its and puts a value in place; keep knows no key. It reads
    every part's document back before the first program starts (keep_start), writes a part's
-   document KEEP_AFTER_MS after its last change, and writes at once before the power goes
+   document KEEP_AFTER_NS after its last change, and writes at once before the power goes
    (keep_flush). A part without a document of its own takes its lines from the document an older
    system kept them all in, once. The documents are no interface: a program asks the part (its
    system call) and watches it (sys/watch.h).
@@ -17,8 +17,9 @@
    keep's held, and may take the part's own lock. */
 #pragma once
 #include "kernel.h"
+#include "sys/clock.h"
 
-#define KEEP_AFTER_MS 500 /* a change goes to C: once its part has stopped changing this long */
+#define KEEP_AFTER_NS (500 * NS_PER_MS) /* a change goes to C: once its part has stopped changing this long */
 
 struct keep {
     const char *name; /* its document in AppData\Nocturne: "Desktop" is Desktop.conf */
@@ -37,7 +38,7 @@ struct keep {
     bool reading;    /* in the round of reading going on */
     bool missing;    /* it has no document of its own (that round) */
     bool took;       /* it took a line of an older system's document (that round) */
-    uint64_t dirty_at; /* timer_now_ms of the last change: a deadline on any CPU */
+    uint64_t dirty_at; /* clock_now_ns of the last change */
 };
 
 /* A part, before keep_start or after (then it is read at once, on keep's thread). */
@@ -45,7 +46,7 @@ void keep_register(struct keep *k);
 /* C: and the user's folder are ready (store_start): every part registered so far is read back,
    then this returns. Changes are kept from then on. */
 void keep_start(void);
-/* The part changed its state: written KEEP_AFTER_MS after the last change. Nothing before the
+/* The part changed its state: written KEEP_AFTER_NS after the last change. Nothing before the
    part's document was read. */
 void keep_changed(struct keep *k);
 /* Every part changed and not written yet is written now (a power change, before store_sync). */

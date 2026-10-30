@@ -3,6 +3,8 @@
 #include "arch/fpu.h"
 #include "arch/smp.h"
 #include "arch/spin.h"
+#include "sys/alarm.h"
+#include "sys/clock.h"
 #include "sys/kei.h"
 #include "sys/syscall.h"
 
@@ -58,7 +60,7 @@ struct task {
     bool app_launched;        /* by n_app_launch: no parent collects it */
     int exit_code;
     int kill_code;          /* ordinary kill=130; fatal sibling keeps exception status */
-    uint64_t wake_at;        /* ms; 0 = no timeout */
+    struct alarm wake_alarm;  /* its sleep's deadline, armed while it sleeps on one */
     bool timed_out;
     struct task *dead_next;   /* the reaper's list */
     struct task *all_next;    /* global task list (task_lock) */
@@ -81,9 +83,8 @@ struct task {
     uint64_t low_base, low_next;
     struct mmap_hole *low_holes;
     struct shared_mapping *shared_mappings; /* shared pages this app has mapped, also being built */
-    uint64_t cpu_ms;
-    uint64_t start_ms;
-    uint16_t cpu_subms_us;
+    uint64_t cpu_ns;          /* charged under its run queue's lock (sched.c) */
+    uint64_t start_ns;        /* clock_now_ns when it was made */
     struct kei_task kei;      /* its run queue's lock guards it */
 };
 
@@ -127,10 +128,8 @@ struct task *kthread_create(const char *name, void (*fn)(void *), void *arg);
 void sched_make_ready(struct task *t);
 void schedule(void);
 void sched_yield(void);
-void sched_tick(void);          /* each CPU's timer interrupt */
-void sched_timeouts(void);      /* CPU 0's timer interrupt: the deadlines that have come */
-uint64_t sched_next_wake(void); /* the earliest timeout (uptime_ms), UINT64_MAX: none */
-void sched_clock_resume(void);  /* after S3 (the TSC may have restarted), interrupts off */
+/* t's CPU time so far, the running stretch included (any CPU). */
+uint64_t sched_task_cpu_ns(struct task *t);
 void sched_user_return(struct regs *r);
 void sched_post_switch(void);   /* context_switch, on the new task's stack */
 struct sched_stats { uint64_t switches, wakes, moved_wakes, steals, balances, kicks, yields; };
@@ -142,7 +141,7 @@ int task_thread_join(int tid);
 /* No one will join the thread: it is freed once it has ended. */
 int task_thread_detach(int tid);
 /* wide: compare the 8-byte word at address (wasm memory.atomic.wait64). */
-int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsigned timeout_ms);
+int task_wait_address(volatile void *address, uint64_t expected, bool wide, uint64_t deadline);
 int task_wake_address(volatile uint32_t *address, unsigned count);
 /* Asynchronous address waiters. A watch joins the same physical-address FIFO
  * as blocked tasks; a notify that selects it moves its token to the queue's
@@ -165,24 +164,25 @@ int task_stop_apps(void); /* power change: kill every app task; returns how many
 int task_wait(int pid, int *status, bool nohang);
 void task_printf_stderr(struct task *t, const char *fmt, ...);
 /* Wait queues. A condition another CPU changes is looked at under the lock its changer holds,
-   then wq_wait_locked; plain wq_wait fits a waiter that looks again after each wake anyway. */
+   then wq_wait_locked; plain wq_wait fits a waiter that looks again after each wake anyway.
+   A deadline is a moment on the clock (clock_now_ns; clock_after(ns) for one ns from now),
+   CLOCK_NEVER for none: the _until waits return false when it came before a waker did. */
 void wq_wait(struct wait_queue *wq);
-bool wq_wait_timeout(struct wait_queue *wq, uint64_t ms); /* returns false on timeout */
+bool wq_wait_until(struct wait_queue *wq, uint64_t deadline);
 /* For a condition another CPU changes without a lock this waiter can hold: sleep on wq unless
    *word (which the waker moves on before it wakes wq) no longer reads seen, the value read before
-   the condition was checked. ms 0: no limit; false on timeout. */
-bool wq_wait_unless(struct wait_queue *wq, const uint64_t *word, uint64_t seen, uint64_t ms);
+   the condition was checked. */
+bool wq_wait_unless(struct wait_queue *wq, const uint64_t *word, uint64_t seen, uint64_t deadline);
 /* Interrupts off, held taken: sleep on wq, held given back once enrolled (a waker that takes held
    to change the condition, then wakes wq, finds the task there). Returns without held. held may be
    wq's own lock. */
 void wq_wait_locked(struct wait_queue *wq, struct spinlock *held);
-bool wq_wait_locked_timeout(struct wait_queue *wq, struct spinlock *held, uint64_t ms); /* false on timeout */
+bool wq_wait_locked_until(struct wait_queue *wq, struct spinlock *held, uint64_t deadline);
 void wq_wake_all(struct wait_queue *wq);
-/* A short wait while polling a device or a flag: asleep for up to ms (at least 1). The boot task
-   (later the idle task) has no stack of its own to sleep on: it halts until the next interrupt
-   instead and lets the other tasks run. */
-void nap_ms(uint64_t ms);
-void sleep_ms(uint64_t ms);
+/* Asleep until the deadline (a killed task: until soon after). The boot task, which is CPU 0's
+   idle task and has no stack of its own to sleep on, lets the other tasks run and halts in
+   between. */
+void sleep_until(uint64_t deadline);
 /* A sleeping lock: state that stays borrowed across allocations, copies, waits or disk transfers.
    The holder may take it again. Interrupt handlers never take one. The boot task, which cannot
    sleep, lets the holder run until it is free. */

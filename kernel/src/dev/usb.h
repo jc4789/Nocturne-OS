@@ -110,7 +110,8 @@ bool usbhub_prepare(struct usb_device *d); /* reads the hub descriptor and calls
 void usbhub_attach(struct usb_device *d, const struct usb_endpoint_desc *ep);
 void usbhub_work(void);                    /* port changes noticed by the hub interrupt endpoints */
 bool usbhub_pending(void);                 /* port changes not handled yet */
-uint64_t usbhid_tick(uint64_t now);        /* key repeat; returns the next deadline (0 = none) */
+/* key repeat at now (clock_now_ns); returns the next deadline (CLOCK_NEVER = none) */
+uint64_t usbhid_tick(uint64_t now);
 /* class drivers that read the whole configuration: does one of its interfaces suit them, and
  * take the device once it is configured */
 bool usbmsc_claims(const struct usb_interface_desc *intf);

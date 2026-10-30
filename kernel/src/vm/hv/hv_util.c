@@ -8,7 +8,8 @@
 #include "arch/cpu.h"
 #include "arch/spin.h"
 #include "dev/pm.h"
-#include "dev/timer.h"
+#include "gui/wm.h"
+#include "sys/clock.h"
 #include "vm/hv/vmbus.h"
 #include "net/net.h"
 #include "sys/sched.h"
@@ -79,7 +80,7 @@ static void util_thread(void *arg) {
         spin_unlock(&util_lock, f);
         kprintf("hv-util: the host asked us to %s\n",
                 a == ACT_REBOOT ? "restart" : a == ACT_HIBERNATE ? "hibernate" : "shut down");
-        sleep_ms(100); /* let our reply reach the host */
+        sleep_until(clock_after(100 * NS_PER_MS)); /* let our reply reach the host */
         pm_request(a == ACT_REBOOT ? PM_REBOOT : a == ACT_HIBERNATE ? PM_HIBERNATE : PM_POWER_OFF, false);
     }
 }
@@ -122,18 +123,20 @@ static void timesync(struct service *s, struct ic_header *h, uint8_t *body, uint
         flags = body[24];
     }
     /* 100 ns units since 1601 */
-    int64_t utc = (int64_t)(parent / 10000000) - 11644473600LL;
+    int64_t utc = ((int64_t)parent - 116444736000000000LL) * 100;
     if (!tz_known) {
-        int64_t d = time_now() - utc;
+        int64_t d = clock_wall_seconds() - utc / (int64_t)NS_PER_S;
         tz_offset = (d >= 0 ? d + 450 : d - 450) / 900 * 900;
         tz_known = true;
     }
     if (flags & 3) { /* SYNC (after boot or resume) or SAMPLE */
-        int64_t want = utc + tz_offset;
-        int64_t diff = want - time_now();
-        if (diff > 1 || diff < -1) {
-            time_set(want);
-            if (flags & 1) kprintf("hv-util: clock adjusted by %ld s\n", diff);
+        int64_t want = utc + tz_offset * (int64_t)NS_PER_S, diff = want - clock_wall_ns();
+        /* SYNC sets it to the host's time; a SAMPLE moves it only when it is a second off */
+        if ((flags & 1) || diff > (int64_t)NS_PER_S || diff < -(int64_t)NS_PER_S) {
+            clock_set_wall(want);
+            wm_taskbar_changed();
+            if (diff >= (int64_t)NS_PER_S || diff <= -(int64_t)NS_PER_S)
+                kprintf("hv-util: clock adjusted by %ld s\n", diff / (int64_t)NS_PER_S);
         }
     }
 }

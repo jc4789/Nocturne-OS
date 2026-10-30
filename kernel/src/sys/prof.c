@@ -1,6 +1,7 @@
-/* Sampling profiler, enabled by the "prof" kernel command line word. Every
-   timer tick on every CPU records where that CPU was: the user instruction
-   of the task it ran, the kernel instruction, or idle. A kernel thread
+/* Sampling profiler, enabled by the "prof" kernel command line word. Each
+   CPU, on an alarm of its own every millisecond (there is no periodic tick
+   otherwise), records where it was: the user instruction of the task it
+   ran, the kernel instruction, or idle. A kernel thread
    prints the hottest addresses with their task names every 10 seconds and
    clears the counts; addresses are resolved against the unstripped ELFs on
    the build host. The scheduler's switches, wakes and moves between CPUs
@@ -12,6 +13,8 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/smp.h"
+#include "sys/alarm.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 #include "sys/prof.h"
 #include "mm/vmm.h"
@@ -19,6 +22,7 @@
 #include "mm/heap.h"
 
 #define PROF_SLOTS (1u << 16)
+#define SAMPLE_NS NS_PER_MS
 /* The window is "prof_ms=<n>" on the command line, 10 s by default; a short
    window prints shorter lists, so a stall of a few hundred ms can be told
    from its neighbours without flooding the serial line. */
@@ -41,8 +45,10 @@ static struct prof_pair *pairs;
 static bool enabled;
 static uint32_t cpu_user[CPU_MAX_COUNT], cpu_kernel[CPU_MAX_COUNT], cpu_idle[CPU_MAX_COUNT];
 static uint32_t lost;
-
-bool prof_enabled(void) { return enabled; }
+/* Each CPU's sampling alarm, armed on it as it starts (prof_cpu_start). */
+static struct sampler {
+    struct alarm alarm;
+} __attribute__((aligned(64))) samplers[CPU_MAX_COUNT];
 
 static void record(uint64_t rip, int pid) {
     uint64_t key = rip ? rip : 1;
@@ -102,11 +108,9 @@ static uint64_t user_stack_top(const struct regs *r, struct task *t) {
     return __atomic_load_n((volatile uint64_t *)phys_to_virt((pte & PTE_ADDR) + (sp & 0xFFF)), __ATOMIC_RELAXED);
 }
 
-void prof_tick(const struct regs *r, bool idle) {
-    if (!enabled) return;
-    unsigned cpu = cpu_current_index();
-    if (cpu >= CPU_MAX_COUNT) return;
+static void sample(const struct regs *r, unsigned cpu) {
     struct task *t = current_task;
+    bool idle = t && t->is_idle;
     if ((r->cs & 3) == 3 && t) {
         __atomic_add_fetch(&cpu_user[cpu], 1, __ATOMIC_RELAXED);
         record(r->rip & ~0x3full, t->pid);
@@ -117,6 +121,26 @@ void prof_tick(const struct regs *r, bool idle) {
         __atomic_add_fetch(&cpu_kernel[cpu], 1, __ATOMIC_RELAXED);
         record(r->rip, -1);
     }
+}
+
+static void sample_fire(struct alarm *a, struct regs *r) {
+    unsigned cpu = cpu_current_index();
+    /* a stopped CPU's (alarm_cpu_leave gave it to CPU 0): its CPU arms it again as it starts */
+    if (a != &samplers[cpu].alarm) return;
+    if (enabled) {
+        sample(r, cpu);
+        if (pstate_sampling()) pstate_sample();
+    }
+    /* its own cadence; samples missed while it came late are not made up */
+    uint64_t next = a->at + SAMPLE_NS, now = clock_now_ns();
+    alarm_set(a, next > now ? next : now + SAMPLE_NS);
+}
+
+void prof_cpu_start(void) {
+    if (!slots || !pairs) return;
+    struct alarm *a = &samplers[cpu_current_index()].alarm;
+    if (!a->fire) alarm_init(a, sample_fire); /* once: after a sleep it may still be armed on CPU 0 */
+    alarm_set(a, clock_after(SAMPLE_NS));
 }
 
 /* The name of the task with that ID now, into name. */
@@ -229,8 +253,9 @@ static void dump(void) {
 
 static void prof_thread(void *arg) {
     (void)arg;
-    for (;;) {
-        sleep_ms(period_ms);
+    for (uint64_t at = clock_now_ns();;) {
+        at += period_ms * NS_PER_MS;
+        sleep_until(at);
         /* Stop sampling while the table is read and cleared. */
         enabled = false;
         dump();
@@ -251,5 +276,6 @@ void prof_init(void) {
     if (!slots || !pairs) return;
     enabled = true;
     kthread_create("prof", prof_thread, NULL);
-    kprintf("prof: sampling every timer tick on every CPU\n");
+    kprintf("prof: sampling every CPU every millisecond\n");
+    prof_cpu_start();
 }

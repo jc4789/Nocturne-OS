@@ -21,7 +21,7 @@
 #include "dev/iommu.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
-#include "dev/timer.h"
+#include "sys/clock.h"
 #include "fs/store.h"
 #include "vm/vm.h"
 #include "lib/lz.h"
@@ -351,7 +351,7 @@ static void put(struct writer *w, const void *src, size_t n) {
 
 const char *hibernate_write(void) {
     if (h.overflow) return "The image did not fit in memory or on C:";
-    uint64_t t0 = uptime_ms(), maps = 2 * h.map_bytes;
+    uint64_t t0 = clock_now_ns(), maps = 2 * h.map_bytes;
     struct header hd;
     describe(&hd);
     hd.state = VALID;
@@ -375,7 +375,7 @@ const char *hibernate_write(void) {
     memcpy(h.stage, &hd, sizeof hd);
     if (disk_at(0, h.stage, PAGE_SIZE, true) < 0 || !disk_flush()) return "C: could not be written";
     kprintf("hibernate: %lu frames saved, %lu of zeros left out, %lu MiB written in %lu ms\n", h.saved, h.zero,
-            (unsigned long)((h.data_off + h.stream) >> 20), (unsigned long)(uptime_ms() - t0));
+            (unsigned long)((h.data_off + h.stream) >> 20), (clock_now_ns() - t0) / NS_PER_MS);
     return NULL;
 }
 
@@ -534,7 +534,7 @@ void hibernate_restore(void) {
     if (found == -N_ERR_NOT_FOUND || found == -N_ERR_UNSUPPORTED) return;
     struct restore r = {0};
     struct header hd;
-    uint64_t total = pmm_page_count(), t0 = uptime_ms();
+    uint64_t total = pmm_page_count(), t0 = clock_now_ns();
     uint8_t *raw = NULL, *packed = NULL;
     const char *why = "it cannot be read";
     if (cmdline_has("noresume")) {
@@ -613,7 +613,7 @@ void hibernate_restore(void) {
     why = "C: could not be written";
     if (disk_at(0, h.stage, PAGE_SIZE, true) < 0 || !disk_flush()) goto drop;
     kprintf("hibernate: restoring %lu frames (%lu copied last) after %lu ms\n", hd.saved + hd.zero, r.pairs,
-            uptime_ms() - t0);
+            (clock_now_ns() - t0) / NS_PER_MS);
 
     blk_hold();
     if (!smp_suspend()) {
@@ -636,7 +636,7 @@ void hibernate_restore(void) {
         kprintf("hibernate: IOMMU did not stop; restarting without overwriting live DMA tables\n");
         power_reboot();
     } /* the image's tables come with it, and its own resume turns the units on */
-    lapic_tick_stop();
+    lapic_wake_at(CLOCK_NEVER);
     vm_suspend(); /* the hypervisor's overlays would swallow the copy's writes to their frames */
     wake_hibernate_jump(pml4, r.first, hd.wake_page);
 

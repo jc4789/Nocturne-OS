@@ -6,7 +6,7 @@
 #include "fs/watch.h"
 #include "store/space.h"
 #include "dev/blk.h"
-#include "dev/timer.h"
+#include "sys/clock.h"
 #include "dev/usb.h"
 #include "lib/idtable.h"
 #include "limine.h"
@@ -14,9 +14,9 @@
 #include "mm/pmm.h"
 #include "sys/object.h"
 
-#define WRITE_DELAY_MS 5000 /* the first change waits this long for more to commit with it */
-#define FIND_MS 10000       /* how long the disk the system started from may take to appear */
-#define FIND_MOST_MS 60000  /* ... while USB devices are still being looked at */
+#define WRITE_DELAY_NS (5 * NS_PER_S) /* the first change waits this long for more to commit with it */
+#define FIND_NS (10 * NS_PER_S)       /* how long the disk the system started from may take to appear */
+#define FIND_MOST_NS (60 * NS_PER_S)  /* ... while USB devices are still being looked at */
 #define GPT_ENTRIES_MAX (1u << 20)
 #define MEMORY_KEPT 1024u   /* blocks kept of a volume in memory: reading one again is a copy */
 
@@ -279,7 +279,7 @@ static void device_find(void) {
     bool known = memcmp(want, none, 16) != 0;
     uint8_t *buf = kmalloc(16 * 512);
     if (!buf) panic("store: no memory to find C:");
-    uint64_t start = uptime_ms(), blocks = 0;
+    uint64_t start = clock_now_ns(), blocks = 0;
     uint32_t looked = 0; /* the disks whose GPT was read; one that could not be is tried again */
     bool boot = false, said = false;
     for (;;) {
@@ -298,15 +298,15 @@ static void device_find(void) {
                 blocks = n;
             }
         }
-        /* A USB stick appears once its bus has been looked at, which can take longer than FIND_MS
+        /* A USB stick appears once its bus has been looked at, which can take longer than FIND_NS
            on a machine with many devices. */
-        uint64_t waited = uptime_ms() - start;
-        if (boot || waited >= FIND_MOST_MS || (waited >= FIND_MS && !usb_enumerating())) break;
-        if (waited >= FIND_MS && !said) {
+        uint64_t waited = clock_now_ns() - start;
+        if (boot || waited >= FIND_MOST_NS || (waited >= FIND_NS && !usb_enumerating())) break;
+        if (waited >= FIND_NS && !said) {
             said = true;
             kprintf("store: waiting for the disk the system started from: USB devices are still being looked at\n");
         }
-        sleep_ms(100);
+        sleep_until(clock_after(100 * NS_PER_MS));
     }
     kfree(buf);
     if (!medium.disk) panic("store: no disk holds a Nocturne volume (C:)");
@@ -322,7 +322,7 @@ static void trouble(enum store_trouble t, uint64_t block, int error) {
 
 static const struct store_env env = {.alloc = kmalloc, .realloc = krealloc, .free = kfree, .trouble = trouble};
 
-int64_t store_now(void) { return time_now() * 1000000000LL; }
+int64_t store_now(void) { return clock_wall_ns(); }
 
 /* ---- mounting ---- */
 
@@ -518,8 +518,8 @@ static void writer(void *arg) {
             wq_wait_locked(&store.kick, &store.dirty_lock);
             spin_take(&store.dirty_lock);
         }
-        for (uint64_t until = uptime_ms() + WRITE_DELAY_MS, now; !store.soon && (now = uptime_ms()) < until;) {
-            wq_wait_locked_timeout(&store.kick, &store.dirty_lock, until - now);
+        for (uint64_t until = clock_after(WRITE_DELAY_NS); !store.soon && clock_now_ns() < until;) {
+            wq_wait_locked_until(&store.kick, &store.dirty_lock, until);
             spin_take(&store.dirty_lock);
         }
         store.dirty = store.soon = false;

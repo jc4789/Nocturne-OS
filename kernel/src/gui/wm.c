@@ -19,10 +19,10 @@
 #include "dev/audio.h"
 #include "dev/input.h"
 #include "dev/pciuser.h"
-#include "dev/timer.h"
 #include "sys/object.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
+#include "sys/clock.h"
 #include "sys/sched.h"
 #include "sys/proc.h"
 #include "sys/syscall.h"
@@ -106,24 +106,26 @@ static struct wait_queue wm_wq;
    a present, a frame asked for, input, the vertical blank it waits for. */
 static uint64_t wm_wakes;
 static unsigned pending_frames;
-/* Without vertical blanks, a frame with damage starts at frame_next_us (µs of uptime) at the
-   earliest, and the one after it a frame period later: the refresh of the mode the screen shows
-   (frame_period), so the desktop draws no frame the monitor would not show. Frames start on the
-   scheduler's millisecond, the deadlines keep the period's fraction, so 59.95 Hz is 59.95 frames a
-   second and not one every 16 ms. A frame later than a period starts the count anew.
-   frame_mhz is the refresh paced at last. Compositor thread. */
+/* Without vertical blanks, a frame with damage starts at frame_next (clock ns, sys/clock.h) at the
+   earliest. The due times lie a frame period apart: the refresh of the mode the screen shows
+   (frame_period), so the desktop draws no frame the monitor would not show. Each next one is the
+   first of them after the frame that started, counted on from the due time and not from when it
+   started, so 59.95 Hz is 59.95 frames a second and a late frame moves none after it; the
+   compositor sleeps until exactly that moment. frame_mhz is the refresh paced at last.
+   Compositor thread. */
 #define FALLBACK_REFRESH_MHZ 60000u /* a mode whose refresh nobody says */
-static uint64_t frame_next_us;
+static uint64_t frame_next;
 static uint32_t frame_mhz;
 /* A display driver's vertical blanks (n_pci_screen_vblank, dev/pciuser.c) of the scanout the
    screen is drawn into: while they come, a frame with damage starts at the next blank, not after
-   a frame period; VBLANK_LOST_MS without one and the period paces frames again. vblank_count is
-   the driver's count of the last blank, vblank_drawn the one the last frame started at;
-   vblank_waiting: the compositor sleeps until the next one. Under vblank_lock (the driver's call
-   comes on any CPU); vblank_pacing is the compositor's own. */
-#define VBLANK_LOST_MS 100
+   a frame period; VBLANK_LOST_NS without one and the period paces frames again. vblank_count is
+   the driver's count of the last blank, vblank_at its moment on the clock (when the driver said
+   so), vblank_ns the driver's own time of it (on the driver's axis: only reported), vblank_drawn
+   the count the last frame started at; vblank_waiting: the compositor sleeps until the next one.
+   Under vblank_lock (the driver's call comes on any CPU); vblank_pacing is the compositor's own. */
+#define VBLANK_LOST_NS (100 * NS_PER_MS)
 static struct spinlock vblank_lock;
-static uint64_t vblank_count, vblank_ns, vblank_at_ms, vblank_drawn;
+static uint64_t vblank_count, vblank_ns, vblank_at, vblank_drawn;
 static bool vblank_seen, vblank_waiting, vblank_pacing;
 /* Direct scanout (n_pci_screen_state, dev/pciuser.c): a display driver whose scanout has
    N_SCANOUT_DIRECT (direct_able) shows one app's own images instead of the desktop while that app's
@@ -202,9 +204,12 @@ static int shown_volume = -1; /* what the speaker was last drawn showing */
 static bool shown_muted;
 static void set_volume_panel(bool open);
 static int sel_icon = -1;
-static uint64_t last_click_ms;
+#define DOUBLE_CLICK_NS (450 * NS_PER_MS)
+static uint64_t last_click; /* clock ns of the last left press, 0 after a double click */
 static int last_click_x, last_click_y;
 
+/* The toast shown until toast_until (clock ns), 0 for none. */
+#define TOAST_NS (4 * NS_PER_S)
 static char toast_title[64], toast_text[128];
 static uint64_t toast_until;
 static int last_clock_min = -1;
@@ -511,18 +516,16 @@ void wm_screen_mode(const struct n_screen_mode *mode, uint64_t serial) {
     wm_unlock();
 }
 
-int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, int64_t timeout_ms) {
-    uint64_t deadline = timeout_ms > 0 ? uptime_ms() + (uint64_t)timeout_ms : 0;
+int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, uint64_t deadline) {
     int64_t result = 0;
     wm_lock();
     while (direct_state.serial == seen) {
-        uint64_t now = timeout_ms > 0 ? uptime_ms() : 0;
         if (current_task->killed) { result = -N_ERR_STOPPED; break; }
-        if (timeout_ms == 0 || (timeout_ms > 0 && now >= deadline)) { result = -N_ERR_TIMEOUT; break; }
+        if (clock_now_ns() >= deadline) { result = -N_ERR_TIMEOUT; break; }
         /* A change on another CPU after this look moves the serial on before it wakes direct_wq:
            the wait does not begin once it has. */
         wm_unlock();
-        wq_wait_unless(&direct_wq, &direct_state.serial, seen, timeout_ms > 0 ? deadline - now : 0);
+        wq_wait_unless(&direct_wq, &direct_state.serial, seen, deadline);
         wm_lock();
     }
     *out = direct_state;
@@ -602,9 +605,8 @@ static void win_destroy(struct window *w) {
    it (a copy may sleep). out's pages are made present first; events taken for a page another
    thread took away meanwhile are lost, with N_ERR_BAD_ADDRESS. */
 #define RECEIVE_BATCH 16
-static int64_t win_receive(struct window *w, struct gui_event *out, size_t max, int64_t timeout_ms) {
+static int64_t win_receive(struct window *w, struct gui_event *out, size_t max, uint64_t deadline) {
     if (max == 0 || max > SIZE_MAX / sizeof *out) return -N_ERR_INVALID;
-    uint64_t deadline = timeout_ms > 0 ? uptime_ms() + (uint64_t)timeout_ms : 0;
     size_t room = MIN(max, (size_t)EVQ + 1); /* the queue, and the frame's mailbox */
     if (!user_ok_w(out, room * sizeof *out)) return -N_ERR_BAD_ADDRESS;
     size_t got = 0;
@@ -631,13 +633,11 @@ static int64_t win_receive(struct window *w, struct gui_event *out, size_t max, 
             continue; /* a full batch: there may be more */
         }
         int64_t result = 1;
-        uint64_t now = timeout_ms > 0 ? uptime_ms() : 0;
         if (w->dead) result = -N_ERR_CLOSED;
         else if (current_task->killed) result = -N_ERR_STOPPED;
-        else if (timeout_ms == 0 || (timeout_ms > 0 && now >= deadline)) result = 0;
+        else if (clock_now_ns() >= deadline) result = 0;
         if (result <= 0) { spin_unlock(&w->ev_lock, fl); return result; }
-        if (timeout_ms > 0) wq_wait_locked_timeout(&w->wq, &w->ev_lock, deadline - now);
-        else wq_wait_locked(&w->wq, &w->ev_lock);
+        wq_wait_locked_until(&w->wq, &w->ev_lock, deadline);
         irq_restore(fl);
     }
 }
@@ -1263,7 +1263,7 @@ static void draw_taskbar(canvas_t *c) {
     /* clock */
     if (!canvas_hits(c, sw-TB_CLOCK_W, y, TB_CLOCK_W, TASKBAR_H)) return;
     struct tm_parts tp;
-    time_to_parts(time_now(), &tp);
+    time_to_parts(clock_wall_seconds(), &tp);
     static const char *wd[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
     static const char *mo[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
@@ -1489,16 +1489,9 @@ static canvas_t verify_back;
 /* Keep width*layers*rows work budgets, not stale row ceilings. This preserves
    useful tiles even after a 64-layer scene returns to 17 or a single layer. */
 static uint64_t wm_work_budget[4] = {512ULL*1280,512ULL*1280,512ULL*1280,512ULL*1280};
-static uint64_t scene_frames, scene_jobs, scene_max_ticks;
-
-static uint64_t scene_tick(void) {
-    __asm__ volatile("lfence" : : : "memory");
-    return rdtsc();
-}
-
-static uint64_t scene_us(uint64_t ticks) {
-    return tsc_hz >= 1000000 ? ticks / (tsc_hz / 1000000) : 0;
-}
+/* The scene's spans, as wmtrace's, are ns on the clock (sys/clock.h). */
+#define JOIN_SHRINK_NS NS_PER_MS /* a batch's join longer than this halves its density's budget */
+static uint64_t scene_frames, scene_jobs, scene_max_ns;
 
 static unsigned scene_density(unsigned layers) {
     return layers<=1 ? 0 : layers<=4 ? 1 : layers<=16 ? 2 : 3;
@@ -1515,7 +1508,7 @@ static unsigned scene_rows(unsigned layers, unsigned width) {
 }
 
 static void scene_shrink(unsigned layers,unsigned width,unsigned rows,uint64_t maximum) {
-    if (scene_us(maximum)>1000 && rows>scene_cpu_count())
+    if (maximum>JOIN_SHRINK_NS && rows>scene_cpu_count())
         wm_work_budget[scene_density(layers)]=MIN(wm_work_budget[scene_density(layers)],
             (uint64_t)MAX(scene_cpu_count(),rows/2)*width*MAX(layers,4u));
 }
@@ -1601,20 +1594,20 @@ static void scene_tile(size_t index, void *arg) {
    between batches; what the scene points at stays, since its caller holds wm_lock throughout. */
 static uint64_t render_scene(const struct draw_scene *s, struct rect r, bool parallel,
                              unsigned batch_rows, uint64_t *cpu_mask, uint64_t *maximum) {
-    uint64_t ticks = 0;
+    uint64_t ns = 0;
     unsigned cpus = scene_cpu_count();
     for (int y = r.y; y < r.y+r.h; y += (int)batch_rows) {
         struct scene_job job = {.scene=s, .batch={r.x,y,r.w,MIN((int)batch_rows,r.y+r.h-y)}};
         size_t count = job.cell_count = MIN(cpus,(unsigned)job.batch.h);
-        uint64_t start = scene_tick();
+        uint64_t start = clock_now_ns();
         if (parallel) cpu_parallel_for(count, scene_tile, &job);
         else for (size_t i = 0; i < count; i++) scene_tile(i, &job);
-        uint64_t elapsed = scene_tick()-start;
-        ticks += elapsed;
+        uint64_t elapsed = clock_now_ns()-start;
+        ns += elapsed;
         if (maximum) *maximum = MAX(*maximum, elapsed);
         if (cpu_mask) for (size_t i=0;i<count;i++) *cpu_mask |= 1ULL << job.cpu[i];
     }
-    return ticks;
+    return ns;
 }
 
 static void render_scene_direct(const struct draw_scene *s, struct rect r) {
@@ -1642,9 +1635,9 @@ static void measure_reference(struct draw_scene *s,struct rect r,unsigned rows,
     s->shadow_strip=false;
     s->occlusion=false;
     s->dst=verify_back;
-    uint64_t start=scene_tick();
+    uint64_t start=clock_now_ns();
     render_scene_direct(s,r);
-    *direct=scene_tick()-start;
+    *direct=clock_now_ns()-start;
     *serial=render_scene(s,r,false,rows,NULL,NULL);
     s->dst=original;
     s->dst_deep=original_deep;
@@ -1690,9 +1683,9 @@ static void scene_benchmark(void) {
         for (unsigned round=0;round<6;round++) {
             for (size_t p=0;p<pixels+32;p++) ref[p]=out[p]=0x5a5aa5a5;
             s.dst=(canvas_t){.px=ref+16,.w=sw,.h=sh,.pitch=sw};
-            uint64_t start=scene_tick();
+            uint64_t start=clock_now_ns();
             render_scene_original(&s,r);
-            direct+=scene_tick()-start;
+            direct+=clock_now_ns()-start;
             s.dst.px=out+16;
             render_scene(&s,r,false,rows,NULL,NULL);
             if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: direct/tiled mismatch layers=%u",s.count);
@@ -1750,9 +1743,9 @@ static void scene_benchmark(void) {
         s.dst.px=out+16;
         render_scene(&s,odd,true,rows,&mask,&maximum);
         if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: odd-pitch pixels/guards differ");
-        kprintf("wmbench: %dx%d layers=%u rounds=6 CPUs=%u mask=%lx direct_ticks=%lu serial_ticks=%lu parallel_ticks=%lu jobs=%lu batch_rows=%u max_join_us=%lu pixels=PASS guards=PASS direct_shadow=original serial_shadow=%s parallel_shadow=%s oracle_shadow=original\n",
+        kprintf("wmbench: %dx%d layers=%u rounds=6 CPUs=%u mask=%lx direct_ns=%lu serial_ns=%lu parallel_ns=%lu jobs=%lu batch_rows=%u max_join_us=%lu pixels=PASS guards=PASS direct_shadow=original serial_shadow=%s parallel_shadow=%s oracle_shadow=original\n",
                 sw,sh,s.count,scene_cpu_count(),mask,direct,serial,parallel,
-                cpu_parallel_jobs()-begin_jobs,rows,scene_us(maximum),
+                cpu_parallel_jobs()-begin_jobs,rows,maximum/NS_PER_US,
                 s.shadow_strip?"strip":"original",s.shadow_strip?"strip":"original");
         scene_shrink(s.count,(unsigned)sw,rows,maximum);
     }
@@ -1796,7 +1789,7 @@ static void composite_ram(struct rect r) {
     uint64_t direct=0,serial=0;
     bool parallel_first=verify && (scene_frames&1);
     if (verify && !parallel_first) measure_reference(&scene,r,rows,&direct,&serial);
-    uint64_t ticks=render_scene(&scene,r,true,rows,&mask,&maximum);
+    uint64_t ns=render_scene(&scene,r,true,rows,&mask,&maximum);
     if (parallel_first) measure_reference(&scene,r,rows,&direct,&serial);
     if (verify) {
         for (int y=r.y;y<r.y+r.h;y++)
@@ -1806,12 +1799,12 @@ static void composite_ram(struct rect r) {
     }
     scene_frames++;
     scene_jobs+=cpu_parallel_jobs()-start_jobs;
-    scene_max_ticks=MAX(scene_max_ticks,maximum);
+    scene_max_ns=MAX(scene_max_ns,maximum);
     scene_shrink(active_layers,(unsigned)r.w,rows,maximum);
     if (!trace_active && (verify || scene_frames==1 || !(scene_frames%64)))
-        kprintf("wmram: frame=%lu rect=%dx%d layers=%u CPUs=%u mask=%lx direct_ticks=%lu serial_ticks=%lu parallel_ticks=%lu jobs=%lu density=%u batch_rows=%u join_us=%lu max_join_us=%lu pixels=%s reference_timed=%u direct_shadow=original serial_shadow=original parallel_shadow=%s\n",
-                scene_frames,r.w,r.h,scene.count,scene_cpu_count(),mask,direct,serial,ticks,
-                scene_jobs,scene_density(scene.count),rows,scene_us(maximum),scene_us(scene_max_ticks),verify?"PASS":"unchecked",(unsigned)verify,scene.shadow_strip?"strip":"original");
+        kprintf("wmram: frame=%lu rect=%dx%d layers=%u CPUs=%u mask=%lx direct_ns=%lu serial_ns=%lu parallel_ns=%lu jobs=%lu density=%u batch_rows=%u join_us=%lu max_join_us=%lu pixels=%s reference_timed=%u direct_shadow=original serial_shadow=original parallel_shadow=%s\n",
+                scene_frames,r.w,r.h,scene.count,scene_cpu_count(),mask,direct,serial,ns,
+                scene_jobs,scene_density(scene.count),rows,maximum/NS_PER_US,scene_max_ns/NS_PER_US,verify?"PASS":"unchecked",(unsigned)verify,scene.shadow_strip?"strip":"original");
 }
 
 /* The compositor, wm_lock held. */
@@ -1923,7 +1916,8 @@ struct in_ev {
     bool is_key;
     struct key_event k;
     struct mouse_event m;
-    uint64_t stamp, seq; /* wmtrace's alone: never in an app's event */
+    uint64_t at;  /* its moment on the clock: when the driver's sink took it */
+    uint64_t seq; /* wmtrace's number of it, 0 when not traced */
 };
 static struct spinlock in_lock;
 static struct in_ev inq[INQ];
@@ -1935,8 +1929,9 @@ struct trace_frame {
     uint32_t rects, inputs, waited, reserved;
 };
 static struct trace_frame trace_frames[TRACE_FRAMES];
+#define TRACE_NS (20 * NS_PER_S)
 static struct {
-    uint64_t start, deadline, frames, empty, waits, wait_ticks, max_wait;
+    uint64_t start, deadline, frames, empty, waits, wait_ns, max_wait;
     uint64_t nowait, streak, max_streak, streak_start, max_run, max_frame, max_proxy, max_dequeue;
     uint64_t dequeue_hist[16], frame_hist[16], raw_lost, yield_calls;
     uint64_t received, dropped, skipped; /* the sinks', under in_lock */
@@ -1945,29 +1940,29 @@ static struct {
 } wt;
 _Static_assert(sizeof(trace_frames)+sizeof(wt)+INQ*16 <= 24*1024,"wmtrace's memory");
 
-static void trace_hist(uint64_t *bins, uint64_t ticks) {
-    uint64_t us=scene_us(ticks); unsigned b=0;
+static void trace_hist(uint64_t *bins, uint64_t ns) {
+    uint64_t us=ns/NS_PER_US; unsigned b=0;
     while (us>1 && b<15) { us>>=1; b++; }
     bins[b]++;
 }
 /* in_lock held (a sink). */
-static void trace_stamp(struct in_ev *ev) {
-    ev->stamp=ev->seq=0;
+static void trace_count(struct in_ev *ev) {
+    ev->seq=0;
     if (!trace_active) return;
     if (ev->is_key && (ev->k.key==KEY_F10 || ev->k.key==KEY_LCTRL || ev->k.key==KEY_RCTRL ||
                       ev->k.key==KEY_LALT || ev->k.key==KEY_RALT)) { wt.skipped++; return; }
-    ev->stamp=rdtsc(); ev->seq=++wt.received;
+    ev->seq=++wt.received;
     wt.depth=MAX(wt.depth,(unsigned)((in_head-in_tail+INQ)%INQ+1));
 }
 static void trace_begin(void) {
     if (trace_done || trace_active) return;
-    if (wm_verify || !tsc_hz || tsc_hz>UINT64_MAX/20) {
-        trace_done=true; kprintf("wmtrace: REJECT wmverify or unavailable TSC\n"); return;
+    if (wm_verify) {
+        trace_done=true; kprintf("wmtrace: REJECT wmverify\n"); return;
     }
     memset(&wt,0,sizeof wt);
-    kprintf("wmtrace: START seconds=20 CPUs=%u parallel=%u yield=%u proxy=WM-loop-not-app-paint\n",scene_cpu_count(),(unsigned)wm_parallel,(unsigned)wm_yield);
+    kprintf("wmtrace: START seconds=%u CPUs=%u parallel=%u yield=%u proxy=WM-loop-not-app-paint\n",(unsigned)(TRACE_NS/NS_PER_S),scene_cpu_count(),(unsigned)wm_parallel,(unsigned)wm_yield);
     audio_trace_begin();
-    uint64_t f=spin_lock(&in_lock); wt.start=rdtsc(); wt.deadline=wt.start+20*tsc_hz;
+    uint64_t f=spin_lock(&in_lock); wt.start=clock_now_ns(); wt.deadline=wt.start+TRACE_NS;
     trace_active=true; spin_unlock(&in_lock,f);
 }
 static void trace_finish(uint64_t end) {
@@ -1975,20 +1970,20 @@ static void trace_finish(uint64_t end) {
     uint64_t f=spin_lock(&in_lock); trace_active=false; trace_done=true; spin_unlock(&in_lock,f);
     audio_trace_end();
     kprintf("wmtrace: DONE elapsed_us=%lu overshoot_us=%lu received=%lu dropped=%lu excluded=%lu depth=%u frames=%lu empty=%lu waits=%lu wait_us=%lu max_wait_us=%lu nowait=%lu max_streak=%lu max_run_us=%lu max_frame_us=%lu max_dequeue_us=%lu max_proxy_us=%lu records=%u raw_lost=%lu yield_calls=%lu run_proxy=loop-no-wait-including-yield\n",
-            scene_us(end-wt.start),scene_us(end-wt.deadline),wt.received,wt.dropped,wt.skipped,wt.depth,
-            wt.frames,wt.empty,wt.waits,scene_us(wt.wait_ticks),scene_us(wt.max_wait),wt.nowait,wt.max_streak,
-            scene_us(wt.max_run),scene_us(wt.max_frame),scene_us(wt.max_dequeue),scene_us(wt.max_proxy),wt.records,wt.raw_lost,wt.yield_calls);
+            (end-wt.start)/NS_PER_US,(end-wt.deadline)/NS_PER_US,wt.received,wt.dropped,wt.skipped,wt.depth,
+            wt.frames,wt.empty,wt.waits,wt.wait_ns/NS_PER_US,wt.max_wait/NS_PER_US,wt.nowait,wt.max_streak,
+            wt.max_run/NS_PER_US,wt.max_frame/NS_PER_US,wt.max_dequeue/NS_PER_US,wt.max_proxy/NS_PER_US,wt.records,wt.raw_lost,wt.yield_calls);
     for (unsigned b=0;b<16;b++) kprintf("wmtrace: hist bin=%u dequeue=%lu frame=%lu unit=log2-us-last-saturated\n",b,wt.dequeue_hist[b],wt.frame_hist[b]);
     for (unsigned i=0;i<wt.records;i++) {
         struct trace_frame *r=&trace_frames[i];
-        kprintf("wmtrace: raw frame=%u begin_ticks=%lu end_ticks=%lu oldest_ticks=%lu seq=%lu inputs=%u rects=%u area=%lu waited=%u jobs=%lu\n",
+        kprintf("wmtrace: raw frame=%u begin_ns=%lu end_ns=%lu oldest_ns=%lu seq=%lu inputs=%u rects=%u area=%lu waited=%u jobs=%lu\n",
                 i,r->begin-wt.start,r->end-wt.start,r->oldest?r->oldest-wt.start:0,r->seq,r->inputs,r->rects,r->area,r->waited,r->jobs);
     }
 }
 static void trace_frame_end(struct trace_frame *r) {
     if (!trace_active) return;
     if (!r->begin) r->begin=wt.start; /* the pass that took the starting chord */
-    r->end=rdtsc(); r->jobs=cpu_parallel_jobs()-r->jobs;
+    r->end=clock_now_ns(); r->jobs=cpu_parallel_jobs()-r->jobs;
     if (r->waited) { wt.streak=0; wt.streak_start=0; }
     else { wt.nowait++; if (!wt.streak) wt.streak_start=r->begin; wt.streak++;
         wt.max_streak=MAX(wt.max_streak,wt.streak); wt.max_run=MAX(wt.max_run,r->end-wt.streak_start); }
@@ -2002,6 +1997,7 @@ static void trace_frame_end(struct trace_frame *r) {
 
 /* An input event into the ring (dropped when it is full); the compositor is woken after it. */
 static void input_put(bool is_key, const struct key_event *k, const struct mouse_event *m) {
+    uint64_t at = clock_now_ns();
     uint64_t f = spin_lock(&in_lock);
     int nh = (in_head + 1) % INQ;
     bool full = nh == in_tail;
@@ -2012,7 +2008,8 @@ static void input_put(bool is_key, const struct key_event *k, const struct mouse
         ev->is_key = is_key;
         if (is_key) ev->k = *k;
         else ev->m = *m;
-        trace_stamp(ev);
+        ev->at = at;
+        trace_count(ev);
         __atomic_store_n(&in_head, nh, __ATOMIC_RELEASE);
     }
     spin_unlock(&in_lock, f);
@@ -2202,10 +2199,11 @@ static void update_hover(void) {
     pointer_update();
 }
 
-static void left_press(void) {
-    uint64_t now = uptime_ms();
-    bool dbl = now - last_click_ms < 450 && ABS(mx - last_click_x) < 6 && ABS(my - last_click_y) < 6;
-    last_click_ms = dbl ? 0 : now;
+/* The left button went down at the clock's at: a double click when the last press was less than
+   DOUBLE_CLICK_NS before it, at about the same place. */
+static void left_press(uint64_t at) {
+    bool dbl = at - last_click < DOUBLE_CLICK_NS && ABS(mx - last_click_x) < 6 && ABS(my - last_click_y) < 6;
+    last_click = dbl ? 0 : at;
     last_click_x = mx;
     last_click_y = my;
 
@@ -2346,7 +2344,8 @@ static void left_release(void) {
     }
 }
 
-static void handle_mouse(const struct mouse_event *m) {
+/* A pointer move or button that came at the clock's at (struct in_ev). */
+static void handle_mouse(const struct mouse_event *m, uint64_t at) {
     int dx = m->dx, dy = m->dy;
     if (m->absolute) {
         /* a tablet-style pointer (Hyper-V's synthetic mouse): go exactly where the host cursor is */
@@ -2423,7 +2422,7 @@ static void handle_mouse(const struct mouse_event *m) {
 
     int changed = old_buttons ^ mbuttons;
     if (changed & 1) {
-        if (mbuttons & 1) left_press();
+        if (mbuttons & 1) left_press(at);
         else left_release();
         update_hover();
     }
@@ -2457,7 +2456,7 @@ void wm_vblank(uint64_t count, uint64_t timestamp_ns) {
     uint64_t fl = spin_lock(&vblank_lock);
     vblank_count = count;
     vblank_ns = timestamp_ns;
-    vblank_at_ms = uptime_ms();
+    vblank_at = clock_now_ns(); /* the driver says so as the blank comes */
     vblank_seen = true;
     bool wake = vblank_waiting;
     vblank_waiting = false;
@@ -2466,13 +2465,13 @@ void wm_vblank(uint64_t count, uint64_t timestamp_ns) {
 }
 
 /* Whether vertical blanks pace frames at now (read under vblank_lock, after the last blank's
-   vblank_at_ms). vblank_lock held. */
-static bool vblank_paced(uint64_t now) { return vblank_seen && now - vblank_at_ms < VBLANK_LOST_MS; }
+   vblank_at). vblank_lock held. */
+static bool vblank_paced(uint64_t now) { return vblank_seen && now - vblank_at < VBLANK_LOST_NS; }
 /* Whether a frame with damage may start at now. vblank_lock held. */
 static bool frame_due(uint64_t now) {
-    return vblank_paced(now) ? vblank_count != vblank_drawn : now * 1000 >= frame_next_us;
+    return vblank_paced(now) ? vblank_count != vblank_drawn : now >= frame_next;
 }
-/* The frame period in µs: the refresh of the mode the screen shows, the display driver's while its
+/* The frame period in ns: the refresh of the mode the screen shows, the display driver's while its
    scanout is shown, else the firmware's (from the monitor's EDID), else FALLBACK_REFRESH_MHZ. */
 static uint64_t frame_period(void) {
     uint32_t mhz = fb_boot_shown() ? fb.refresh_mhz : screen_shown_refresh_mhz();
@@ -2481,7 +2480,7 @@ static uint64_t frame_period(void) {
         frame_mhz = mhz;
         kprintf("wm: without vertical blanks, frames are paced at the mode's %u.%03u Hz\n", mhz / 1000, mhz % 1000);
     }
-    return 1000000000ull / mhz;
+    return NS_PER_S * 1000 / mhz;
 }
 /* Whether a shown window waits for a frame without damage to make it (SYS_WIN_FRAME). wm_lock
    held; whoever asks for one wakes the compositor after it. */
@@ -2490,15 +2489,18 @@ static bool frames_asked(void) {
         if (zorder[i]->frame_wanted && visible(zorder[i])) return true;
     return false;
 }
-/* The next frame's earliest start, after one started at now (ms). */
+/* After a frame that started at now: the next one's earliest start, the first due time after now
+   (the due times one period apart, counted on from the last). */
 static void frame_started(uint64_t now) {
-    uint64_t us = now * 1000, period = frame_period();
-    frame_next_us = us - frame_next_us < period ? frame_next_us + period : us + period;
+    uint64_t period = frame_period();
+    if (now >= frame_next) frame_next += ((now - frame_next) / period + 1) * period;
 }
 
 /* ---- compositor thread ----
    Each pass ends reading wm_wakes and then, under wm_lock, whether work is left (damage, a
-   present, a frame asked for). The next sleeps only while wm_wakes still reads the same
+   present, a frame asked for) and when what the desktop shows changes by itself next (idle_until:
+   the taskbar clock's minute, a toast's end, wmtrace's end). The next pass sleeps until that
+   moment, or with work until its frame is due, only while wm_wakes still reads the same
    (wq_wait_unless): whoever makes work on another CPU after that look moved it on before its
    wake. A vertical blank that came before the sleep makes the frame due; one after it wakes the
    thread (vblank_waiting). */
@@ -2507,28 +2509,32 @@ static void wm_thread(void *arg) {
     damage_all();
     uint64_t seen = __atomic_load_n(&wm_wakes, __ATOMIC_SEQ_CST);
     bool work = true;
+    uint64_t idle_until = CLOCK_NEVER;
     wm_unlock();
     for (;;) {
-        bool waited=false; uint64_t waiting=0;
-        uint64_t wait_ms = 0;
+        bool waited = false, sleep = false;
+        uint64_t until = CLOCK_NEVER, waiting = 0;
         if (!input_waiting()) {
             uint64_t fl = spin_lock(&vblank_lock);
-            uint64_t now = uptime_ms();
-            if (!work) wait_ms = 250; /* the clock and a toast's end */
-            else if (!frame_due(now)) {
+            uint64_t now = clock_now_ns();
+            if (!work) {
+                sleep = true;
+                until = idle_until;
+            } else if (!frame_due(now)) {
+                sleep = true;
                 vblank_waiting = vblank_paced(now);
-                wait_ms = vblank_waiting ? VBLANK_LOST_MS - (now - vblank_at_ms) : (frame_next_us - now * 1000 + 999) / 1000;
+                until = vblank_waiting ? vblank_at + VBLANK_LOST_NS : frame_next;
             }
             spin_unlock(&vblank_lock, fl);
         }
-        if (wait_ms) {
-            if (trace_active) { waited=true; waiting=rdtsc(); wt.waits++; }
-            wq_wait_unless(&wm_wq, &wm_wakes, seen, wait_ms);
-            if (waiting) { uint64_t ticks=rdtsc()-waiting; wt.wait_ticks+=ticks; wt.max_wait=MAX(wt.max_wait,ticks); }
+        if (sleep) {
+            if (trace_active) { waited=true; waiting=clock_now_ns(); wt.waits++; }
+            wq_wait_unless(&wm_wq, &wm_wakes, seen, until);
+            if (waited) { uint64_t ns=clock_now_ns()-waiting; wt.wait_ns+=ns; wt.max_wait=MAX(wt.max_wait,ns); }
         }
         uint64_t fl = spin_lock(&vblank_lock);
         vblank_waiting = false;
-        bool pacing = vblank_paced(uptime_ms());
+        bool pacing = vblank_paced(clock_now_ns());
         uint64_t first_count = vblank_count, first_ns = vblank_ns;
         spin_unlock(&vblank_lock, fl);
         if (pacing != vblank_pacing) {
@@ -2538,20 +2544,20 @@ static void wm_thread(void *arg) {
                         (unsigned long)first_count, (unsigned long)first_ns);
             else
                 kprintf("wm: no vertical blank for %u ms; frames are paced at the mode's refresh again\n",
-                        VBLANK_LOST_MS);
+                        (unsigned)(VBLANK_LOST_NS / NS_PER_MS));
         }
         wm_lock();
-        struct trace_frame frame={.begin=trace_active?rdtsc():0,.waited=waited};
+        struct trace_frame frame={.begin=trace_active?clock_now_ns():0,.waited=waited};
 
         struct in_ev ev;
         while (input_take(&ev)) {
-            if (trace_active && ev.stamp>=wt.start && ev.seq) {
-                uint64_t delay=rdtsc()-ev.stamp; wt.max_dequeue=MAX(wt.max_dequeue,delay); trace_hist(wt.dequeue_hist,delay);
-                if (!frame.oldest) frame.oldest=ev.stamp;
+            if (trace_active && ev.at>=wt.start && ev.seq) {
+                uint64_t delay=clock_now_ns()-ev.at; wt.max_dequeue=MAX(wt.max_dequeue,delay); trace_hist(wt.dequeue_hist,delay);
+                if (!frame.oldest) frame.oldest=ev.at;
                 frame.seq=ev.seq; frame.inputs++;
             }
             if (ev.is_key) handle_key(&ev.k);
-            else handle_mouse(&ev.m);
+            else handle_mouse(&ev.m, ev.at);
         }
 
         /* Nothing is presenting between frames: the planes can be replaced. */
@@ -2567,13 +2573,16 @@ static void wm_thread(void *arg) {
         }
 
         struct tm_parts tp;
-        time_to_parts(time_now(), &tp);
+        int64_t wall = clock_wall_ns();
+        time_to_parts(wall / (int64_t)NS_PER_S, &tp);
         if (tp.min != last_clock_min) {
             last_clock_min = tp.min;
             damage_rect(sw - TB_CLOCK_W, sh - TASKBAR_H, TB_CLOCK_W, TASKBAR_H);
         }
+        /* when the minute shown changes next (a wall clock set meanwhile tells, wm_taskbar_changed) */
+        uint64_t minute_at = clock_after(60 * NS_PER_S - (uint64_t)wall % (60 * NS_PER_S));
         if (audio_volume() != shown_volume || audio_muted() != shown_muted) damage_volume();
-        if (toast_until && uptime_ms() > toast_until) {
+        if (toast_until && clock_now_ns() >= toast_until) {
             toast_until = 0;
             struct rect t = toast_rect();
             damage_rect(t.x, t.y, t.w, t.h);
@@ -2582,7 +2591,7 @@ static void wm_thread(void *arg) {
         direct_update();
         bool want = ndamage || pending_frames || frames_asked();
         fl = spin_lock(&vblank_lock);
-        uint64_t now = uptime_ms();
+        uint64_t now = clock_now_ns();
         bool render = want && frame_due(now);
         if (render) vblank_drawn = vblank_count;
         spin_unlock(&vblank_lock, fl);
@@ -2597,6 +2606,8 @@ static void wm_thread(void *arg) {
         trace_frame_end(&frame);
         seen = __atomic_load_n(&wm_wakes, __ATOMIC_SEQ_CST);
         work = ndamage || pending_frames || frames_asked();
+        idle_until = MIN(minute_at, toast_until ? toast_until : CLOCK_NEVER);
+        if (trace_active) idle_until = MIN(idle_until, wt.deadline);
         wm_unlock();
         /* only once every batch and present has ended and wm_lock is given back */
         if (wm_yield) {
@@ -2666,7 +2677,7 @@ static bool set_screen_size(int w, int h) {
         /* the present's end moves back_presents on under wm_lock, then wakes present_wait */
         uint64_t seen = back_presents;
         wm_unlock();
-        wq_wait_unless(&present_wait, &back_presents, seen, 0);
+        wq_wait_unless(&present_wait, &back_presents, seen, CLOCK_NEVER);
         wm_lock();
         if (w == sw && h == sh) return true;
     }
@@ -2759,6 +2770,14 @@ void wm_repaint(void) {
     damage_all();
     wake_compositor();
     wm_unlock();
+}
+
+/* Each pass compares the volume, the muting and the wall clock's minute with what the taskbar shows
+   and draws what differs; it sleeps until the minute's next change counted from the wall clock as
+   it read it. The owners of those (dev/audio.c, whoever sets the wall clock) call this after a
+   change. */
+void wm_taskbar_changed(void) {
+    if (wm_running()) wake_compositor();
 }
 
 void wm_remote_detach(void) {
@@ -2876,7 +2895,7 @@ void wm_notify(const char *title, const char *text) {
     wm_lock();
     strlcpy(toast_title, title, sizeof toast_title);
     strlcpy(toast_text, text, sizeof toast_text);
-    toast_until = uptime_ms() + 4000;
+    toast_until = clock_after(TOAST_NS);
     struct rect t = toast_rect();
     damage_rect(t.x, t.y, t.w, t.h);
     wake_compositor();
@@ -3315,7 +3334,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
         /* Without the WM lock (ev_lock); the handle's reference keeps the window's memory. */
         handle = handle_get((int)a);
         int64_t result = !handle ? -N_ERR_NO_HANDLE : !handle_is(handle, &win_ops) ? -N_ERR_WRONG_KIND
-                       : win_receive(handle->object->priv, (struct gui_event *)b, (size_t)c, (int64_t)d);
+                       : win_receive(handle->object->priv, (struct gui_event *)b, (size_t)c, syscall_deadline((int64_t)d));
         handle_close(handle);
         return result;
     }
