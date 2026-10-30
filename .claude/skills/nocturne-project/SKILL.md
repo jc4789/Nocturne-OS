@@ -35,7 +35,7 @@ description: Nocturne OS の実物を動かして確かめる手順。媒体は 
 ## QEMU を窓付きで起動する（二台まで）
 
 ```text
-"C:/Program Files/qemu/qemu-system-x86_64.exe" -M pc -m 4096M -smp 4 -accel whpx -vga none -device VGA,xres=2560,yres=1440,vgamem_mb=32
+"C:/Program Files/qemu/qemu-system-x86_64.exe" -M pc -m 4096M -smp 4 -accel whpx -cpu host -vga none -device VGA,xres=2560,yres=1440,vgamem_mb=32
   -serial file:<作業場>/serial.log -monitor tcp:127.0.0.1:45454,server,nowait
   -device ahci,id=ahci -drive id=boot,file=build/nocturne.img,format=raw,if=none,snapshot=on
   -device ide-hd,drive=boot,bus=ahci.0,bootindex=0 -netdev user,id=qa -device e1000,netdev=qa
@@ -43,6 +43,7 @@ description: Nocturne OS の実物を動かして確かめる手順。媒体は 
 
 - 起動する前に、動いている QEMU の数を見る。二台動いていれば三台目を起動せず、どちらかを `quit` する。二台目は `-monitor tcp:127.0.0.1:45455` と別名の serial（`<作業場>/serial-2.log`）で起こす（同じ img を `snapshot=on` で二台が読んでよい）。速さを測る回は一台だけ動かし、もう一台は `quit` する（RAM と CPU を取り合うと値が歪む）。
 - **窓が出たことを確かめる。** PowerShell の `Get-Process qemu-system-x86_64 | Select-Object Id,MainWindowHandle` で MainWindowHandle が 0 でないこと。`-display none`・`-nographic` を付けない。窓なしの QEMU は禁止（2026-10-29 ユーザー）。ユーザーはその窓を見ている。
+- `-cpu host` は外さない。CPU の下限は Zen 4 で、WHPX はこれで XSAVE・AVX-512・FSGSBASE・INVPCID・SMEP・SMAP・x2APIC を見せる（PCID は見せない。2026-10-30 に起動の行 `cpu: cpuid …` で確かめた）。付けないと「QEMU Virtual CPU version 2.5+」になり、下限を満たさない。
 - 起動は `serial.log` の `store: C: "…" on sata0` で確かめる。数秒で出なければ待たずに異常として扱う。
 - HMP（TCP 45454）へ一行ずつ送る：`screendump "<作業場>/now.png" -f png`（スラッシュ区切りの絶対 path）、`sendkey ctrl-l`、`mouse_move 400 300`、`mouse_button 1`／`0`。撮った PNG は自分で開いて見る。固定秒数の一発スクリプトや、デスクトップの computer-use の撮影で代用しない。
 - `snapshot=on` なので媒体は汚れず、ゲストの変更も残らない。再起動をまたぐ保存の確認は qemu-visual.md。

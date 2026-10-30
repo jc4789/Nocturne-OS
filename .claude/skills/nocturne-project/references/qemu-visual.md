@@ -8,7 +8,7 @@
 2. 起動する。serial.log の置き場所は、この会話の作業場（システムプロンプトにある scratchpad の場所）。build の下に置かない。
 
    ```text
-   "C:/Program Files/qemu/qemu-system-x86_64.exe" -M pc -m 4096M -smp 4 -accel whpx -vga none -device VGA,xres=2560,yres=1440,vgamem_mb=32
+   "C:/Program Files/qemu/qemu-system-x86_64.exe" -M pc -m 4096M -smp 4 -accel whpx -cpu host -vga none -device VGA,xres=2560,yres=1440,vgamem_mb=32
      -serial file:<作業場>/serial.log -monitor tcp:127.0.0.1:45454,server,nowait
      -device ahci,id=ahci
      -drive id=boot,file=build/nocturne.img,format=raw,if=none,snapshot=on

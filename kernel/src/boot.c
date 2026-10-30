@@ -99,6 +99,16 @@ void kmain(void) {
         fbcon_init();
     }
     kprintf("cpu: %s\n", cpu_brand);
+    {
+        /* The leaves the feature checks read, as the CPU (or the hypervisor) reports them. */
+        uint32_t a1, b1, c1, d1, a7, b7, c7, d7, ad, bd, cd, dd, ae, be, ce, de;
+        cpuid(1, 0, &a1, &b1, &c1, &d1);
+        cpuid(7, 0, &a7, &b7, &c7, &d7);
+        cpuid(0xD, 0, &ad, &bd, &cd, &dd);
+        cpuid(0x80000001, 0, &ae, &be, &ce, &de);
+        kprintf("cpu: cpuid 1 ecx %08x edx %08x, 7 ebx %08x ecx %08x edx %08x, d eax %08x ebx %08x ecx %08x, "
+                "80000001 ecx %08x edx %08x\n", c1, d1, b7, c7, d7, ad, bd, cd, ce, de);
+    }
     vm_detect();
     kprintf("video: %ux%u, %u bpp, %u bpc (R%u@%u G%u@%u B%u@%u)%s, pitch %u\n", fb.width, fb.height,
             fb.bpp, fb.bpc, fb.rsize, fb.rshift, fb.gsize, fb.gshift, fb.bsize, fb.bshift,
