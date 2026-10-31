@@ -145,7 +145,7 @@ static void give_back_now(struct area *a) {
 /* Unmapped and shot down at once; the frames freed after, when they are the range's own. */
 static void unmap_now(uint64_t va, size_t pages, bool frames) {
     struct vmm_gather g;
-    vmm_gather_init(&g, kernel_pml4);
+    vmm_gather_init(&g);
     vmm_kernel_unmap(&g, va, pages, frames);
     vmm_gather_finish(&g);
 }
@@ -167,7 +167,7 @@ void *vmalloc_node(size_t pages, unsigned node) {
     if (!va) return NULL;
     for (size_t i = 0; i < pages; i++) {
         uint64_t frame = pmm_alloc_node(node);
-        if (!frame || !vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, frame, PTE_W | PTE_NX)) {
+        if (!frame || !vmm_kernel_map(va + i * PAGE_SIZE, frame, PTE_W | PTE_NX)) {
             if (frame) pmm_free(frame);
             unfilled(va, pages, i, true);
             return NULL;
@@ -181,7 +181,7 @@ static void *map_frames(const uint64_t *frames, uint64_t pa, size_t pages, uint6
     uint64_t va = take(pages, false);
     if (!va) return NULL;
     for (size_t i = 0; i < pages; i++)
-        if (!vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, frames ? frames[i] : pa + i * PAGE_SIZE, flags)) {
+        if (!vmm_kernel_map(va + i * PAGE_SIZE, frames ? frames[i] : pa + i * PAGE_SIZE, flags)) {
             unfilled(va, pages, i, false);
             return NULL;
         }
@@ -204,7 +204,7 @@ void vunmap(void *p, size_t pages) {
 /* Every retired range at once: one shootdown for all of them. */
 static void purge(struct area *list) {
     struct vmm_gather g;
-    vmm_gather_init(&g, kernel_pml4);
+    vmm_gather_init(&g);
     for (struct area *a = list; a; a = a->next)
         vmm_kernel_unmap(&g, a->span.start, a->span.length / PAGE_SIZE - 1, true);
     vmm_gather_finish(&g);

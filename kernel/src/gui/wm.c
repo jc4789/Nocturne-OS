@@ -49,7 +49,7 @@ struct rect {
 
 struct window {
     int id, pid;
-    uint64_t pml4;
+    struct vmm_space *vmm_space; /* its app's page tables (a reference): where its surfaces are mapped */
     int x, y;   /* outer frame position */
     int cw, ch; /* client size */
     uint32_t *buf;
@@ -536,11 +536,11 @@ int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, uint64_t dead
 
 /* ---- window lifetime ---- */
 static void unmap_user(struct window *w) {
-    if (!w->pml4) return;
+    if (!w->vmm_space) return;
     if (w->uaddr)
-        vmm_user_free(w->pml4, w->uaddr, w->pages * PAGE_SIZE); /* PTE_SHARED: frames stay with the window */
+        vmm_user_free(w->vmm_space, w->uaddr, w->pages * PAGE_SIZE); /* PTE_SHARED: frames stay with the window */
     if (w->second_uaddr)
-        vmm_user_free(w->pml4, w->second_uaddr, w->pages * PAGE_SIZE);
+        vmm_user_free(w->vmm_space, w->second_uaddr, w->pages * PAGE_SIZE);
     w->uaddr = 0;
     w->second_uaddr = 0;
 }
@@ -655,7 +655,11 @@ static uint32_t win_ready(struct handle *h) {
 
 static void win_close(struct handle *h) { win_destroy(h->object->priv); }
 
-static void win_release(struct object *o) { kfree(o->priv); }
+static void win_release(struct object *o) {
+    struct window *w = o->priv;
+    if (w->vmm_space) vmm_space_put(w->vmm_space);
+    kfree(w);
+}
 
 static const struct object_ops win_ops = {
     .kind = N_KIND_WINDOW, .ready = win_ready, .close = win_close, .release = win_release};
@@ -700,16 +704,15 @@ static uint64_t map_user(struct window *w, struct task *t, unsigned index) {
     if (!va) return 0;
     for (size_t i = 0; i < w->pages; i++) {
         uint32_t *pixels = w->flags & WIN_DOUBLE_BUFFER ? (index ? w->user_buf : w->buf) : w->user_buf;
-        uint64_t pa = vmm_translate(kernel_pml4, (uint64_t)pixels + i * PAGE_SIZE);
-        if (!vmm_map_page(t->pml4, va + i * PAGE_SIZE, pa, PTE_P | PTE_W | PTE_U | PTE_SHARED | PTE_NX)) {
-            vmm_user_free(t->pml4, va, i * PAGE_SIZE); /* PTE_SHARED: unmap only */
+        uint64_t pa = vmm_kernel_translate((uint64_t)pixels + i * PAGE_SIZE);
+        if (vmm_map_page(t->vmm_space, va + i * PAGE_SIZE, pa, PTE_P | PTE_W | PTE_U | PTE_SHARED | PTE_NX)) {
+            vmm_user_free(t->vmm_space, va, i * PAGE_SIZE); /* PTE_SHARED: unmap only */
             mmap_hole_add(t, va, bytes + PAGE_SIZE);
             return 0;
         }
     }
     if (index) w->second_uaddr = va;
     else w->uaddr = va;
-    w->pml4 = t->pml4;
     return va;
 }
 
@@ -3019,7 +3022,8 @@ static int64_t sys_win_create(int cw, int ch, const char *title, int flags) {
     }
     int index = handle_install(h);
     if (index < 0) return index; /* closing it destroyed the window and freed everything */
-    w->pml4 = current_task->pml4;
+    w->vmm_space = current_task->vmm_space;
+    vmm_space_get(w->vmm_space);
     zorder[nwin++] = w;
     /* Use the ordinary WM transition and resize event. The client still owns
        its real framebuffer allocation; startup must not invent a viewport. */
@@ -3043,7 +3047,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     case SYS_WIN_MAP: {
         struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
-        if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
+        if (w->vmm_space != current_task->vmm_space) return -N_ERR_DENIED;
         if (b >= ((w->flags & WIN_DOUBLE_BUFFER) ? WIN_BUFFER_COUNT : 1) || c > WIN_MAP_ACQUIRE) return -N_ERR_INVALID;
         if (c && !(w->flags & WIN_DOUBLE_BUFFER)) return -N_ERR_INVALID;
         while (c && (w->pending_index >= 0 || w->front_index == (int)b)) {
@@ -3068,13 +3072,13 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     case SYS_WIN_STATE: {
         struct window *w=handle_window(handle);
         if(!w)return -N_ERR_NO_HANDLE;
-        if(w->pml4!=current_task->pml4)return -N_ERR_DENIED;
+        if(w->vmm_space!=current_task->vmm_space)return -N_ERR_DENIED;
         return win_state_of(w);
     }
     case SYS_WIN_DIRECT: {
         struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
-        if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
+        if (w->vmm_space != current_task->vmm_space) return -N_ERR_DENIED;
         if (b > 1) return -N_ERR_INVALID;
         w->direct_wanted = b != 0;
         direct_update();
@@ -3083,7 +3087,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     case SYS_WIN_FRAME: {
         struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
-        if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
+        if (w->vmm_space != current_task->vmm_space) return -N_ERR_DENIED;
         if (!(w->flags & WIN_FRAME_EVENTS)) return -N_ERR_INVALID;
         w->frame_wanted = true; /* the compositor makes a frame for it (frames_asked) */
         wake_compositor();
@@ -3092,7 +3096,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     case SYS_WIN_POINTER: {
         struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
-        if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
+        if (w->vmm_space != current_task->vmm_space) return -N_ERR_DENIED;
         if (in->error) return in->error;
         const struct n_win_pointer *p = &in->pointer;
         kfree(w->pointer_image);
@@ -3109,7 +3113,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_WIN_PRESENTATION: {
         struct window *w=handle_window(handle);if(!w)return -N_ERR_NO_HANDLE;
-        if(w->pml4!=current_task->pml4)return -N_ERR_DENIED;if(b>1)return -N_ERR_INVALID;
+        if(w->vmm_space!=current_task->vmm_space)return -N_ERR_DENIED;if(b>1)return -N_ERR_INVALID;
         if(w->fullscreen==!!b)return 0;
         damage_window(w);struct gui_event resize={.type=EV_RESIZE};
         if(b){w->fullscreen_restore=(struct rect){w->x,w->y,w->cw,w->ch};w->fullscreen=true;w->x=w->y=0;resize.x=sw;resize.y=sh;}
@@ -3119,7 +3123,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     case SYS_WIN_PRESENT: {
         struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
-        if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
+        if (w->vmm_space != current_task->vmm_space) return -N_ERR_DENIED;
         if (w->flags & WIN_DOUBLE_BUFFER) {
             if (!e || e > WIN_BUFFER_COUNT || b || c || d) return -N_ERR_INVALID;
             int index = (int)e - 1;
@@ -3178,7 +3182,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     case SYS_WIN_RESIZE: {
         struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
-        if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
+        if (w->vmm_space != current_task->vmm_space) return -N_ERR_DENIED;
         int ncw = MAX(16, MIN((int)b, sw)), nch = MAX(16, MIN((int)c, sh));
         damage_window(w);
         uint32_t *obuf = w->buf;
@@ -3198,9 +3202,9 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         }
         /* unmap the old buffer from the owner */
         if (w->uaddr)
-            vmm_user_free(w->pml4, w->uaddr, opages * PAGE_SIZE); /* PTE_SHARED: unmap only */
+            vmm_user_free(w->vmm_space, w->uaddr, opages * PAGE_SIZE); /* PTE_SHARED: unmap only */
         if (w->second_uaddr)
-            vmm_user_free(w->pml4, w->second_uaddr, opages * PAGE_SIZE);
+            vmm_user_free(w->vmm_space, w->second_uaddr, opages * PAGE_SIZE);
         w->uaddr = w->second_uaddr = 0;
         if (was_pending) pending_frames--;
         wq_wake_all(&w->wq);

@@ -389,7 +389,7 @@ static void *pages_alloc(size_t size, bool *zeroed) {
     void *p = phys ? phys_to_virt(phys) : vmalloc(count);
     if (!p) return NULL;
     if (!phys) {
-        phys = vmm_translate(kernel_pml4, (uint64_t)p);
+        phys = vmm_kernel_translate((uint64_t)p);
         *zeroed = true;
     }
     pmm_mark(phys, MARK_PAGES, (uint32_t)count, NULL);
@@ -406,7 +406,7 @@ static unsigned object_at(const void *p, uint64_t *phys, uint32_t *word) {
     void *ref;
     unsigned kind = 0;
     if (va >= VMALLOC_BASE && va < VMALLOC_END) {
-        *phys = va & (PAGE_SIZE - 1) ? 0 : vmm_translate(kernel_pml4, va);
+        *phys = va & (PAGE_SIZE - 1) ? 0 : vmm_kernel_translate(va);
         if (*phys && pmm_marked(*phys, word, &ref) == MARK_PAGES) kind = MARK_PAGES;
     } else if (va >= hhdm_offset && va - hhdm_offset < pmm_page_count() * PAGE_SIZE) {
         *phys = hhdm_virt_to_phys(p);

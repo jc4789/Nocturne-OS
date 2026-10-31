@@ -21,6 +21,9 @@ typedef void (*cpu_job_fn)(size_t index, void *context);
 void smp_init(struct limine_mp_response *response);
 unsigned cpu_online_count(void);
 bool cpu_online_at(unsigned index);
+/* The CPUs running the scheduler (arch/cpuset.h, topology.cpus bits): a CPU joins it as it starts
+   and leaves it for a sleep. */
+const uint64_t *cpu_online_set(void);
 /* Interrupt the scheduler on that CPU (it looks at its run queue). Never the calling CPU. */
 void cpu_kick(unsigned index);
 bool cpu_tlb_ipi(unsigned index); /* false when that CPU is not running */

@@ -33,7 +33,6 @@ _Static_assert(SYS_WATCH_TAKE == 207 && SYS_AUDIO_OUTPUT_WATCH < SYS_MAX, "every
 _Static_assert(sizeof(struct n_pager_fault) == 16 && sizeof(struct n_pager_supply) == 32, "pager ABI");
 
 int pci_list(struct n_pciinfo *out, int max);
-void vmm_user_pages_split(uint64_t pml4, uint64_t out[6]);
 int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
 
 /* ---- user memory access ---- */
@@ -52,10 +51,10 @@ static bool user_access(const void *p, size_t n, bool write) {
     struct task *t = current_task;
     uint64_t pg = ALIGN_DOWN(a, PAGE_SIZE);
     while (pg < a + n) {
-        uint64_t pte = vmm_get_pte(t->pml4, pg);
+        uint64_t pte = vmm_get_pte(t->vmm_space, pg);
         if (!(pte & PTE_P)) {
             if (pg >= USER_STACK_TOP - USER_STACK_MAX && pg < USER_STACK_TOP) {
-                if (vmm_user_alloc(t->pml4, pg, PAGE_SIZE, VM_W) < 0) return false;
+                if (vmm_user_alloc(t->vmm_space, pg, PAGE_SIZE, VM_W) < 0) return false;
                 pg += PAGE_SIZE;
                 continue;
             }
@@ -65,7 +64,7 @@ static bool user_access(const void *p, size_t n, bool write) {
                 pg = ALIGN_DOWN(a, PAGE_SIZE);
                 continue;
             }
-            pte = vmm_get_pte(t->pml4, pg);
+            pte = vmm_get_pte(t->vmm_space, pg);
         }
         if (!(pte & PTE_U)) return false;
         if (write && !(pte & PTE_W)) {
@@ -174,10 +173,10 @@ static void report_memory_exhaustion(struct task *t, int64_t inc) {
        outweigh the largest. task_lock keeps each space: task_exit drops it under the lock. */
     flags = spin_lock(&task_lock);
     for (struct task *p = task_list; p; p = p->all_next) {
-        if (!p->is_user || p->is_thread) continue;
+        if (!p->is_user || p->is_thread || !p->vmm_space) continue;
         uint64_t s[6];
         unsigned threads = 0;
-        vmm_user_pages_split(p->pml4, s);
+        vmm_user_pages_split(p->vmm_space, s);
         for (struct task *q = task_list; q; q = q->all_next)
             if (q->is_thread && q->process == p && q->state != TASK_ZOMBIE) threads++;
         kprintf("[memory]  %d/%s image %luK low %luK reserved %luK stack %luK shared %luK tables %luK threads %u\n",
@@ -302,6 +301,7 @@ struct shared_scope {struct shared_scope *parent;size_t refs;int issuer;bool rev
 struct shared_part {struct object *object;size_t first,end;uint8_t cache;};
 struct shared_pages {
     size_t count,bytes;uint8_t kind,cache;bool dma,owned,wc_allowed;
+    bool typing;              /* a DMA root: its direct map's type changes now (sys_shared_view, shared_lock) */
     struct shared_scope *scope;
     size_t maps;              /* a DMA root: mapping references, including composite segments (shared_lock) */
     struct pci_claim *claim;  /* a BAR or DMA root: the claim it was made through */
@@ -345,6 +345,7 @@ struct shared_mapping {
    pmm's. Held, nothing sleeps, copies user memory, waits for the disk or allocates from the heap:
    records are allocated before and freed after it. */
 static struct spinlock shared_lock;
+static struct wait_queue shared_typed; /* those that wait for a DMA root's type change to end */
 static struct shared_mapping *shared_all;
 static void shared_all_link(struct shared_mapping *m) {
     m->all_prev=NULL;m->all_next=shared_all;
@@ -444,10 +445,10 @@ static void shared_withdraw(const struct shared_scope *scope,const struct pci_cl
         if(!match){m=m->all_next;continue;}
         if((scope || claim) && m->building)m->cancelled=true;
         m->busy++;
-        uint64_t pml4=m->owner->pml4,va=m->va+offset,n=bytes?bytes:m->bytes;
+        struct vmm_space *space=m->owner->vmm_space;uint64_t va=m->va+offset,n=bytes?bytes:m->bytes;
         spin_unlock(&shared_lock,lock);
-        if(write_only)vmm_user_write_protect(pml4,va,n);
-        else vmm_user_free(pml4,va,n);
+        if(write_only)vmm_user_write_protect(space,va,n);
+        else vmm_user_free(space,va,n);
         lock=spin_lock(&shared_lock);
         struct shared_mapping *next=m->all_next;
         if(!--m->busy)wq_wake_all(&m->idle);
@@ -463,6 +464,16 @@ static void shared_dma_maps(struct shared_pages *p,bool add) {
         if(leaf->dma){if(add)leaf->maps++;else {ASSERT(leaf->maps);leaf->maps--;}}
         at+=MIN(span,p->count-at);
     }
+}
+/* shared_lock held: a DMA root of p's has its type changed now. */
+static bool shared_dma_typing(struct shared_pages *p) {
+    for(size_t at=0;at<p->count;){
+        size_t page=at,span;uint8_t cache;
+        struct shared_pages *leaf=shared_leaf(p,&page,&cache,NULL,&span);
+        if(leaf->dma && leaf->typing)return true;
+        at+=MIN(span,p->count-at);
+    }
+    return false;
 }
 /* A demand object's slot for page index, its table made when create; NULL when there is none.
    shared_lock held. */
@@ -937,17 +948,27 @@ static int64_t sys_shared_view(int h,size_t offset,size_t bytes,uint32_t cache,u
         }
         spin_unlock(&shared_lock,lock);
     }else if(root->dma){
-        /* The type changes only while nothing maps the root (maps), checked and changed together:
-           a mapping made meanwhile counts first, or finds the new type. */
+        /* The type changes only while nothing maps the root (maps), checked under shared_lock with
+           typing set: a mapping made meanwhile counts first, or waits for the new type. The direct
+           map changes with no lock held, as its shootdown waits for every CPU. */
         uint64_t lock=spin_lock(&shared_lock);
+        while(root->typing){wq_wait_locked(&shared_typed,&shared_lock);spin_take(&shared_lock);}
+        bool retype=false;
         if(cache==N_CACHE_DEFAULT)cache=root->cache;
         else if(cache!=root->cache){
             if(root->cache!=N_CACHE_WRITE_BACK || root->maps)r=-N_ERR_DENIED;
-            else if(!vmm_direct_type(root->kind==SHARED_RAM?root->pages:NULL,root->base,root->count,cache_pte(cache)))
-                r=-N_ERR_NO_MEMORY;
-            else root->cache=(uint8_t)cache;
+            else retype=root->typing=true;
         }
         spin_unlock(&shared_lock,lock);
+        if(retype){
+            bool typed=vmm_direct_type(root->kind==SHARED_RAM?root->pages:NULL,root->base,root->count,cache_pte(cache));
+            lock=spin_lock(&shared_lock);
+            if(typed)root->cache=(uint8_t)cache;
+            else r=-N_ERR_NO_MEMORY;
+            root->typing=false;
+            spin_unlock(&shared_lock,lock);
+            wq_wake_all(&shared_typed);
+        }
     }else if(cache==N_CACHE_DEFAULT)cache=src->cache;
     else if(device?(cache==N_CACHE_WRITE_BACK || (cache==N_CACHE_WRITE_COMBINE && !root->wc_allowed)):cache!=src->cache)r=-N_ERR_DENIED;
     if(r<0){handle_close(f);return r;}
@@ -1608,12 +1629,12 @@ int program_map(struct task *t,struct program *prog,struct handle *doc,uint64_t 
         lock=spin_lock(&shared_lock);
         bool any=p->resident;
         uint64_t frame=any?shared_frame(p,i,false):0;
-        ok=!frame || vmm_map_page(t->pml4,start+i*PAGE_SIZE,frame,flags);
+        ok=!frame || !vmm_map_page(t->vmm_space,start+i*PAGE_SIZE,frame,flags);
         spin_unlock(&shared_lock,lock);
         if(!any)break;
     }
     if(!ok){
-        vmm_user_free(t->pml4,start,end-start);kfree(m);
+        vmm_user_free(t->vmm_space,start,end-start);kfree(m);
         if(fresh){shared_release(&p->object);kfree(fresh);}
         return -N_ERR_NO_MEMORY;
     }
@@ -1733,7 +1754,7 @@ static int64_t shared_protect(struct task *t,struct shared_mapping *m,uint64_t v
         spin_unlock(&shared_lock,lock);
         at+=n;
     }
-    return vmm_user_protect(t->pml4,va,bytes,vp,true);
+    return vmm_user_protect(t->vmm_space,va,bytes,vp,true);
 }
 /* A first touch of a reserved shared page, from user code or a kernel copy
  * on its behalf: allocate the object's frame (or adopt the one a peer already
@@ -1746,14 +1767,14 @@ static int64_t shared_protect(struct task *t,struct shared_mapping *m,uint64_t v
 static bool shared_fault(uint64_t addr,bool write,bool *slept) {
     struct task *owner=task_process();
     if(!owner)return false;
-    uint64_t page=ALIGN_DOWN(addr,PAGE_SIZE),present=vmm_get_pte(owner->pml4,page);
+    uint64_t page=ALIGN_DOWN(addr,PAGE_SIZE),present=vmm_get_pte(owner->vmm_space,page);
     if(present&PTE_P){
         /* A sibling mapped it first, or a write to a page without write access, which only a
            pager's page can be given (below); anything else stays a protection violation. */
         if(!write || (present&PTE_W))return true;
         if(!(present&PTE_SHARED))return false;
     }else{
-        int reserved=vmm_demand_fault(owner->pml4,addr,write); /* a private reserved page */
+        int reserved=vmm_demand_fault(owner->vmm_space,addr,write); /* a private reserved page */
         if(reserved>0)return true;
         if(reserved<0){
             kprintf("[memory] pid %d (%s): no frame for reserved page %p, %lu pages free\n",
@@ -1780,7 +1801,8 @@ again:;
             uint64_t entry=slot?*slot:0;
             if(entry && shared_cancelled((*from)->priv))entry=0; /* its source's revocation is unbinding it */
             if((entry&PAGED_BOUND) && (!write || (entry&PAGED_WRITE))){
-                ok=vmm_map_page(owner->pml4,page,entry&PTE_ADDR,shared_page_flags(leaf,index,flags));
+                int r=vmm_map_page(owner->vmm_space,page,entry&PTE_ADDR,shared_page_flags(leaf,index,flags));
+                ok=!r || r==-N_ERR_EXISTS;starved=r==-N_ERR_NO_MEMORY; /* exists: a sibling's map, the access retried */
                 break;
             }
             /* The pager is asked; the mapping is looked up again once it answered. */
@@ -1795,15 +1817,15 @@ again:;
                doorbell) land nowhere that matters. */
             if(write && !(flags&PTE_W))break;
             if(!gone_device_page && (gone_device_page=pmm_alloc()))memset(phys_to_virt(gone_device_page),0xFF,PAGE_SIZE);
-            starved=!gone_device_page;
-            ok=gone_device_page && vmm_map_page(owner->pml4,page,gone_device_page,
-                                                flags&~(PTE_PWT|PTE_PCD|PTE_PAT4K));
+            int r=gone_device_page?vmm_map_page(owner->vmm_space,page,gone_device_page,flags&~(PTE_PWT|PTE_PCD|PTE_PAT4K)):
+                  -N_ERR_NO_MEMORY;
+            ok=!r || r==-N_ERR_EXISTS;starved=r==-N_ERR_NO_MEMORY;
             break;
         }
         /* Claim loss removes the entire composite mapping. Its other RAM or
            live-device segments still refer to their own valid backing. */
         if((leaf->kind!=SHARED_DEMAND && !shared_device_gone(p,NULL)) || (write && !(flags&PTE_W)))break;
-        if(vmm_get_pte(owner->pml4,page)&PTE_P){ok=!write || (vmm_get_pte(owner->pml4,page)&PTE_W);break;}
+        if(vmm_get_pte(owner->vmm_space,page)&PTE_P){ok=!write || (vmm_get_pte(owner->vmm_space,page)&PTE_W);break;}
         if(leaf->source && !shared_frame(leaf,index,false)){
             /* A program's page no task has read: the object and its opening stay while it is read. */
             fill=leaf;at=index;source=handle_ref(leaf->source);
@@ -1811,8 +1833,8 @@ again:;
             break;
         }
         uint64_t frame=shared_frame(p,(page-m->va)/PAGE_SIZE,true);
-        starved=!frame;
-        ok=frame && vmm_map_page(owner->pml4,page,frame,flags|cache_pte(cache));
+        int r=frame?vmm_map_page(owner->vmm_space,page,frame,flags|cache_pte(cache)):-N_ERR_NO_MEMORY;
+        ok=!r || r==-N_ERR_EXISTS;starved=r==-N_ERR_NO_MEMORY;
         break;
     }
     spin_unlock(&shared_lock,lock);
@@ -2026,6 +2048,13 @@ static int64_t sys_shared_map(int h,size_t bytes,int access) {
        the partially mapped span, and a revocation from here on finds the mapping. */
     uint64_t va=0,lock=spin_lock(&owner->space.lock);
     spin_take(&shared_lock);
+    while(shared_dma_typing(p)){
+        /* the mapping takes the type being set */
+        spin_give(&owner->space.lock);
+        wq_wait_locked(&shared_typed,&shared_lock);
+        spin_take(&owner->space.lock);
+        spin_take(&shared_lock);
+    }
     if(!shared_device_pin(p,&pins) && !(va=space_take_locked(owner,false,bytes,&gone)))shared_device_unpin(p,&pins);
     if(va){
         shared_dma_maps(p,true);
@@ -2046,8 +2075,8 @@ static int64_t sys_shared_map(int h,size_t bytes,int access) {
         if(m->cancelled || current_task->killed){spin_unlock(&shared_lock,lock);break;}
         shared_leaf(p,&index,&cache,NULL,NULL);
         uint64_t frame=shared_frame(p,mapped,false);
-        bool ok=!frame || vmm_map_page(owner->pml4,va+mapped*PAGE_SIZE,frame,
-                                       shared_page_flags(p,mapped,flags)|cache_pte(cache));
+        bool ok=!frame || !vmm_map_page(owner->vmm_space,va+mapped*PAGE_SIZE,frame,
+                                        shared_page_flags(p,mapped,flags)|cache_pte(cache));
         spin_unlock(&shared_lock,lock);
         if(!ok)break;
         if(need_resched)schedule();
@@ -2078,7 +2107,7 @@ static void shared_unmap(struct task *owner,struct shared_mapping *m,struct spac
     struct pin_work pins={0};
     /* Keep every DMA cache pin through PTE removal and the completed TLB
        shootdown. A view cannot retype still-reachable old pages. */
-    vmm_user_free(owner->pml4,m->va,m->bytes);
+    vmm_user_free(owner->vmm_space,m->va,m->bytes);
     uint64_t lock=spin_lock(&shared_lock);
     while(m->busy){
         wq_wait_locked(&m->idle,&shared_lock);
@@ -2156,9 +2185,9 @@ static int64_t sys_memory_reserve(size_t len, int access) {
     spin_unlock(&t->space.lock, lock);
     holes_free(gone);
     if (!va) return -N_ERR_NO_MEMORY;
-    int r = len <= RESERVE_EAGER ? vmm_user_alloc(t->pml4, va, len, vp) : vmm_user_reserve(t->pml4, va, len, vp);
+    int r = len <= RESERVE_EAGER ? vmm_user_alloc(t->vmm_space, va, len, vp) : vmm_user_reserve(t->vmm_space, va, len, vp);
     if (r < 0) {
-        vmm_user_free(t->pml4, va, len);
+        vmm_user_free(t->vmm_space, va, len);
         space_op_finish(t, &op, va, len + PAGE_SIZE);
         report_memory_exhaustion(t, len);
         return -N_ERR_NO_MEMORY;
@@ -2197,15 +2226,15 @@ static int64_t sys_memory_release(uint64_t va, size_t len) {
     /* sys_shared_map reserved the range and its guard page: they are reused */
     if (m) { shared_unmap(t, m, &op, !low); return 0; }
     for (uint64_t a = va; a < end; a += PAGE_SIZE)
-        if (vmm_get_pte(t->pml4, a) & PTE_SHARED) { space_op_finish(t, &op, 0, 0); return -N_ERR_INVALID; } /* a window buffer */
-    vmm_user_free(t->pml4, va, end - va);
+        if (vmm_get_pte(t->vmm_space, a) & PTE_SHARED) { space_op_finish(t, &op, 0, 0); return -N_ERR_INVALID; } /* a window buffer */
+    vmm_user_free(t->vmm_space, va, end - va);
     struct mmap_hole *spare = kmalloc(sizeof *spare), *gone = NULL;
     lock = spin_lock(&t->space.lock);
     /* The unmapped page right after the range is the reservation's guard, unless it was handed
        out: an untouched reserved page, a shared mapping's page (also an untouched demand one), or
        a range another thread is reserving or changing. */
     bool guard = end < (low ? t->low_next : t->mmap_next) && !space_busy(t, end, end + PAGE_SIZE) &&
-                 !(vmm_get_leaf(t->pml4, end) & (PTE_P | PTE_DEMAND)) && !space_mapping(t, end, end + PAGE_SIZE);
+                 !(vmm_get_leaf(t->vmm_space, end) & (PTE_P | PTE_DEMAND)) && !space_mapping(t, end, end + PAGE_SIZE);
     hole_add_locked(t, va, end - va + (guard ? PAGE_SIZE : 0), &spare, &gone);
     space_op_remove(t, &op);
     spin_unlock(&t->space.lock, lock);
@@ -2235,7 +2264,7 @@ static int64_t sys_memory_protect(uint64_t va, size_t len, int access) {
     else space_op_add(t, &op, va, end);
     spin_unlock(&t->space.lock, lock);
     if (r < 0) return r;
-    r = m ? shared_protect(t, m, va, end - va, access, vp) : vmm_user_protect(t->pml4, va, len, vp, false);
+    r = m ? shared_protect(t, m, va, end - va, access, vp) : vmm_user_protect(t->vmm_space, va, len, vp, false);
     space_op_finish(t, &op, 0, 0);
     return r;
 }
@@ -2250,7 +2279,7 @@ static uint64_t clock_page_of(struct task *owner) {
     struct mmap_hole *spare = kmalloc(sizeof *spare), *gone = NULL;
     uint64_t lock = spin_lock(&owner->space.lock);
     if (!(va = owner->clock_page) && (va = space_take_locked(owner, false, PAGE_SIZE, &gone))) {
-        if (vmm_map_page(owner->pml4, va, reference, PTE_P | PTE_U | PTE_SHARED | PTE_SHARED_RO | PTE_NX))
+        if (!vmm_map_page(owner->vmm_space, va, reference, PTE_P | PTE_U | PTE_SHARED | PTE_SHARED_RO | PTE_NX))
             __atomic_store_n(&owner->clock_page, va, __ATOMIC_RELEASE);
         else {
             hole_add_locked(owner, va, 2 * PAGE_SIZE, &spare, &gone);
@@ -2891,8 +2920,8 @@ void syscall_dispatch(struct regs *r) {
     }
     case SYS_THREAD_CREATE:
         if (!user_ok((void *)a, 1) || !user_ok((void *)c, 1) ||
-            (vmm_get_pte(current_task->pml4, a) & PTE_NX) ||
-            (vmm_get_pte(current_task->pml4, c) & PTE_NX)) ret = -N_ERR_BAD_ADDRESS;
+            (vmm_get_pte(current_task->vmm_space, a) & PTE_NX) ||
+            (vmm_get_pte(current_task->vmm_space, c) & PTE_NX)) ret = -N_ERR_BAD_ADDRESS;
         else ret = task_thread_create(c, a, b, d);
         break;
     case SYS_THREAD_JOIN: ret = task_thread_join((int)a); break;

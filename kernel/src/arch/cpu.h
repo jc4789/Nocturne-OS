@@ -125,6 +125,12 @@ static inline void write_cr3(uint64_t v) { __asm__ volatile("mov %0, %%cr3" : : 
 static inline uint64_t read_cr4(void) { uint64_t v; __asm__ volatile("mov %%cr4, %0" : "=r"(v)); return v; }
 static inline void write_cr4(uint64_t v) { __asm__ volatile("mov %0, %%cr4" : : "r"(v) : "memory"); }
 static inline void invlpg(uint64_t va) { __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory"); }
+#define INVPCID_ONE 1 /* every translation of one PCID, global ones excepted */
+#define INVPCID_ALL 2 /* every translation of every PCID, global ones included */
+static inline void invpcid(uint64_t type, uint64_t pcid, uint64_t va) {
+    struct { uint64_t pcid, va; } d = {pcid, va};
+    __asm__ volatile("invpcid %0, %1" : : "m"(d), "r"(type) : "memory");
+}
 static inline uint64_t rdtsc(void) {
     uint32_t lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));

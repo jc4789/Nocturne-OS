@@ -2,9 +2,9 @@
    holder's own CPU, whose interrupts stay off while it holds the lock).
 
    A CPU waiting for a lock has its interrupts off, so it cannot take a TLB shootdown's IPI; it
-   serves a shootdown waiting for it while it spins instead (vmm_tlb_poll), so that a holder
-   that changes mappings never waits on a CPU that waits on it. Holders never sleep and never
-   wait for another CPU in any other way.
+   serves the shootdowns waiting for it while it spins instead (vmm_tlb_poll). Holders never sleep
+   and never wait for another CPU: a shootdown, which waits for the others, is never sent under a
+   spinlock (spins_held counts the ones this CPU holds).
 
    Taking one lock while holding another follows the order the locks' owners document. */
 #pragma once
@@ -12,6 +12,7 @@
 #include "arch/smp.h"
 
 void vmm_tlb_poll(void);
+extern PERCPU uint32_t spins_held; /* arch/smp.c */
 
 struct spinlock {
     uint32_t taken;
@@ -28,8 +29,10 @@ static inline void spin_take(struct spinlock *l) {
         }
     }
     __atomic_store_n(&l->holder, self, __ATOMIC_RELAXED);
+    this_cpu(spins_held)++;
 }
 static inline void spin_give(struct spinlock *l) {
+    this_cpu(spins_held)--;
     __atomic_store_n(&l->holder, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&l->taken, 0, __ATOMIC_RELEASE);
 }
@@ -44,7 +47,10 @@ static inline void spin_unlock(struct spinlock *l, uint64_t flags) {
     irq_restore(flags);
 }
 /* A panic, every other CPU stopped: the lock is free again, whoever held it. */
-static inline void spin_seize(struct spinlock *l) { spin_give(l); }
+static inline void spin_seize(struct spinlock *l) {
+    __atomic_store_n(&l->holder, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&l->taken, 0, __ATOMIC_RELEASE);
+}
 static inline bool spin_held(const struct spinlock *l) {
     return __atomic_load_n(&l->holder, __ATOMIC_RELAXED) == cpu_current_index() + 1;
 }

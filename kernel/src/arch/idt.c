@@ -246,10 +246,12 @@ void panic_regs(const char *what, struct regs *r);
 extern char user_copy_start[], user_copy_end[], user_copy_fault[];
 
 /* The kernel's copy of the app's memory (user_copy) touched a page that is not there yet, or
-   that it may not touch: resolved as the app's own fault would be when the copy runs with
-   interrupts on (it may sleep then), otherwise, or when it cannot be, the copy stops short. */
+   that it may not touch: an access the tables allow now runs on (a translation cached before they
+   gave it, mm/vmm.c); otherwise resolved as the app's own fault would be when the copy runs with
+   interrupts on (it may sleep then), or else, or when it cannot be, the copy stops short. */
 static bool user_copy_fixup(struct regs *r, uint64_t cr2) {
     if (r->rip < (uint64_t)user_copy_start || r->rip >= (uint64_t)user_copy_end || cr2 >= USER_TOP) return false;
+    if (vmm_fault_spurious(cr2, r->error | 4)) return true;
     if ((r->rflags & 0x200) && vmm_handle_user_fault(cr2, r->error | 4)) return true;
     r->rip = (uint64_t)user_copy_fault;
     return true;
@@ -285,7 +287,7 @@ static void exception(struct regs *r, uint64_t cr2) {
            itself was bad (rip == addr after a call through a stale pointer). */
         kprintf(" rsp=%p stack", (void *)r->rsp);
         for (unsigned i = 0; i < 4; i++) {
-            uint64_t va = r->rsp + i * 8, pa = t->pml4 ? vmm_translate(t->pml4, va) : 0;
+            uint64_t va = r->rsp + i * 8, pa = t->vmm_space ? vmm_translate(t->vmm_space, va) : 0;
             if (!pa || (va & 0xFFF) > 0xFF8) break;
             kprintf(" %p", (void *)*(uint64_t *)phys_to_virt(pa));
         }
@@ -321,7 +323,7 @@ void isr_exception(struct regs *r) {
 void isr_interrupt(struct regs *r) {
     uint64_t v = r->vector;
     if (v == VEC_TLB_SHOOTDOWN) {
-        vmm_tlb_ipi();
+        vmm_tlb_poll();
         lapic_eoi();
         return;
     }

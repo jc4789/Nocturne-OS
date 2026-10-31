@@ -34,6 +34,7 @@ PERCPU static struct cpu_slot slot;
 
 PERCPU uintptr_t percpu_offset;
 PERCPU unsigned cpu_index;
+PERCPU uint32_t spins_held;
 static uintptr_t boot_offset; /* until percpu_init the first CPU alone, on the template */
 uintptr_t *percpu_offsets = &boot_offset;
 
@@ -106,6 +107,7 @@ void smp_panic_nmi(void) {
     }
 }
 bool cpu_online_at(unsigned i) { return i < topology.cpus && cpuset_has(online_set, i); }
+const uint64_t *cpu_online_set(void) { return online_set; }
 
 void cpu_kick(unsigned i) {
     if (i == cpu_current_index() || !cpu_online_at(i)) return;
@@ -272,6 +274,7 @@ static NORETURN void ap_main(void *argument) {
     /* IPIs reach it from here on, taken once its idle task has interrupts on */
     cpuset_add(online_set, index);
     __atomic_fetch_add(&online, 1, __ATOMIC_ACQ_REL);
+    vmm_online(); /* a shootdown of the kernel half before it was online did not ask it */
     sched_cpu_start(); /* this CPU's idle task from here on */
 }
 
@@ -327,8 +330,10 @@ void cpu_park_check(void) {
     struct cpu_slot *c = this_cpu_ptr(slot);
     cli();
     alarm_cpu_leave(); /* its alarms to CPU 0, its wake device stopped */
-    /* Out of the online set before its last look at the shootdowns: a CPU that still counted it
-       published its request before (mm/vmm.c), and is answered here. */
+    /* Off the space it held (lazily, under its idle task), then out of the online set before its
+       last look at its inbox: a CPU that still counted it posted its request before (mm/vmm.c),
+       and is answered here. */
+    vmm_leave();
     cpuset_remove(online_set, self);
     __atomic_fetch_sub(&online, 1, __ATOMIC_SEQ_CST);
     vmm_tlb_poll();

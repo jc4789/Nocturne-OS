@@ -103,8 +103,8 @@ static void record_pair(uint64_t rip, uint64_t ret, int pid) {
    being freed is only a wrong sample). */
 static uint64_t user_stack_top(const struct regs *r, struct task *t) {
     uint64_t sp = r->rsp;
-    if ((sp & 7) || sp >= USER_TOP - sizeof(uint64_t)) return 0;
-    uint64_t pte = vmm_get_pte(t->pml4, sp);
+    if ((sp & 7) || sp >= USER_TOP - sizeof(uint64_t) || !t->vmm_space) return 0;
+    uint64_t pte = vmm_get_pte(t->vmm_space, sp);
     if ((pte & (PTE_P | PTE_U)) != (PTE_P | PTE_U)) return 0;
     return __atomic_load_n((volatile uint64_t *)phys_to_virt((pte & PTE_ADDR) + (sp & 0xFFF)), __ATOMIC_RELAXED);
 }
@@ -223,11 +223,12 @@ static void dump(void) {
     }
     kprintf("prof: lost samples %u, busy samples %llu\n", __atomic_exchange_n(&lost, 0, __ATOMIC_RELAXED),
             (unsigned long long)total);
-    static uint64_t last_sd, last_ipi;
-    uint64_t sd, ipi;
-    vmm_tlb_stats(&sd, &ipi);
-    kprintf("prof: TLB shootdowns %llu, IPIs %llu\n", (unsigned long long)(sd - last_sd), (unsigned long long)(ipi - last_ipi));
-    last_sd = sd; last_ipi = ipi;
+    static uint64_t last_sd, last_ipi, last_ev;
+    uint64_t sd, ipi, ev;
+    vmm_tlb_stats(&sd, &ipi, &ev);
+    kprintf("prof: TLB shootdowns %llu, IPIs %llu, PCID slots taken over %llu\n", (unsigned long long)(sd - last_sd),
+            (unsigned long long)(ipi - last_ipi), (unsigned long long)(ev - last_ev));
+    last_sd = sd; last_ipi = ipi; last_ev = ev;
     static struct sched_stats last_kei;
     struct sched_stats k;
     sched_get_stats(&k);

@@ -11,6 +11,7 @@
 struct regs;
 struct handle;
 struct object;
+struct vmm_space;
 
 #define INITIAL_HANDLES 32 /* the inline table's size, never a handle limit */
 #define KSTACK_PAGES 8
@@ -49,7 +50,7 @@ struct task {
     uint64_t clock_page;      /* a process's mapping of the hypervisor clock page: set once under space's lock, read atomically */
     uint64_t ksp;
     uint8_t *kstack;
-    uint64_t pml4;
+    struct vmm_space *vmm_space; /* its app's page tables (a reference, mm/vmm.c), NULL for a kernel task */
     struct handle *initial_handles[INITIAL_HANDLES];
     struct handle **handles;          /* a process's table, under handles_lock (sys/object.c) */
     struct handle *net_setup_cancel; /* thread-owned strong ref; never inherited */

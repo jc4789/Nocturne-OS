@@ -239,7 +239,6 @@ static struct task *idle_task_new(const char *name, unsigned cpu) {
     t->handle_capacity = INITIAL_HANDLES;
     t->is_idle = true;
     t->state = TASK_RUNNING;
-    t->pml4 = kernel_pml4;
     alarm_init(&t->wake_alarm, wake_fire);
     strlcpy(t->name, name, sizeof t->name);
     uint64_t f = spin_lock(&task_lock);
@@ -457,7 +456,7 @@ void schedule(void) {
     STAT(switches);
     sched_set_current(next);
     if (next->kstack) tss_set_rsp0((uint64_t)next->kstack + KSTACK_PAGES * PAGE_SIZE);
-    vmm_switch(next->pml4);
+    vmm_switch(next->vmm_space);
     /* the app's own FS and GS bases (arch/cpu.h), as each left them */
     prev->fs_base = fs_base_read();
     prev->gs_base = user_gs_base_read();
@@ -603,12 +602,13 @@ static void task_unlink_locked(struct task *t) {
 static void task_free(struct task *t) {
     off_cpu_wait(t);
     net_task_exit(t);
-    if (t->is_thread && t->user_stack && t->pml4 != kernel_pml4) {
-        vmm_user_free(t->pml4, t->user_stack, t->user_stack_size);
+    if (t->is_thread && t->user_stack && t->vmm_space) {
+        vmm_user_free(t->vmm_space, t->user_stack, t->user_stack_size);
         /* Both guard pages belong to the stack's reservation. */
-        if (t->process && t->process != t && t->process->pml4 == t->pml4)
+        if (t->process && t->process != t && t->process->vmm_space == t->vmm_space)
             mmap_hole_add(t->process, t->user_stack - PAGE_SIZE, t->user_stack_size + 2 * PAGE_SIZE);
     }
+    if (t->vmm_space) vmm_space_put(t->vmm_space);
     if (t->kstack) kstack_free(t->kstack);
     handle_table_free(t);
     kfree((void *)t->allowed.words);
@@ -662,7 +662,6 @@ void sched_init(void) {
     strlcpy(boot->name, "idle0", sizeof boot->name);
     if (!(boot->kstack = vmalloc(KSTACK_PAGES))) panic("sched: no memory");
     boot->state = TASK_RUNNING;
-    boot->pml4 = kernel_pml4;
     alarm_init(&boot->wake_alarm, wake_fire);
     sched_set_current(boot);
     task_list = boot;
@@ -684,7 +683,6 @@ struct task *task_alloc(const char *name) {
     }
     strlcpy(t->name, name, sizeof t->name);
     t->state = TASK_BLOCKED; /* not runnable until made ready */
-    t->pml4 = kernel_pml4;
     alarm_init(&t->wake_alarm, wake_fire);
     t->start_ns = clock_now_ns();
     t->ksp = (uint64_t)t->kstack + KSTACK_PAGES * PAGE_SIZE;
@@ -937,12 +935,13 @@ int task_thread_create(uint64_t entry, uint64_t function, uint64_t argument, uin
     if (!t) return -N_ERR_NO_MEMORY;
     t->is_user = t->is_thread = true;
     t->process = t->parent = owner;
-    t->pml4 = owner->pml4;
+    t->vmm_space = owner->vmm_space;
+    vmm_space_get(t->vmm_space);
     t->user_stack_size = stack_bytes;
     /* Unmapped page at each end, distinct from every other thread's stack. */
     uint64_t reserved = mmap_reserve(owner, t->user_stack_size + PAGE_SIZE);
     if (reserved) t->user_stack = reserved + PAGE_SIZE; /* task_free gives the reservation back */
-    if (!reserved || vmm_user_reserve(t->pml4, t->user_stack, t->user_stack_size, VM_W) < 0) {
+    if (!reserved || vmm_user_reserve(t->vmm_space, t->user_stack, t->user_stack_size, VM_W) < 0) {
         f = spin_lock(&task_lock);
         task_unlink_locked(t);
         spin_unlock(&task_lock, f);
@@ -1054,8 +1053,9 @@ static struct spinlock address_lock;
 static uint64_t address_phys(volatile void *address, bool wide) {
     uint64_t va = (uint64_t)address;
     if ((va & (wide ? 7 : 3)) || va >= USER_TOP) return 0;
-    uint64_t pml4 = current_task->pml4, phys = vmm_translate(pml4, va);
-    if (!phys && vmm_demand_fault(pml4, va, false) > 0) phys = vmm_translate(pml4, va);
+    struct vmm_space *space = current_task->vmm_space;
+    uint64_t phys = vmm_translate(space, va);
+    if (!phys && vmm_demand_fault(space, va, false) > 0) phys = vmm_translate(space, va);
     return phys;
 }
 static uint64_t address_read(uint64_t phys, bool wide) {
@@ -1156,7 +1156,7 @@ static unsigned address_wake(uint64_t phys, unsigned count) {
 
 int task_wake_address(volatile uint32_t *address, unsigned count) {
     uint64_t va = (uint64_t)address;
-    uint64_t phys = va < USER_TOP && !(va & 3) ? vmm_translate(current_task->pml4, va) : 0;
+    uint64_t phys = va < USER_TOP && !(va & 3) ? vmm_translate(current_task->vmm_space, va) : 0;
     return phys ? (int)address_wake(phys, count) : 0;
 }
 
@@ -1295,16 +1295,19 @@ static NORETURN void thread_exit(struct task *t) {
     /* The thread never returns to ring 3, so its user stack is dead now. An unjoined zombie keeps
        only its kernel stack and task record instead of its address space and the pages it touched. */
     struct task *owner = t->process;
-    if (t->user_stack && owner && !owner->exiting && owner->pml4 == t->pml4 && t->pml4 != kernel_pml4) {
+    if (t->user_stack && owner && !owner->exiting && owner->vmm_space == t->vmm_space) {
         uint64_t stack = t->user_stack, size = t->user_stack_size;
         t->user_stack = t->user_stack_size = 0;
-        vmm_user_free(t->pml4, stack, size);
+        vmm_user_free(t->vmm_space, stack, size);
         mmap_hole_add(owner, stack - PAGE_SIZE, size + 2 * PAGE_SIZE);
     }
     /* Otherwise the app is ending and its space goes whole once its threads are joined. A detached
        thread's record may reach the reaper after the owner and its space are gone: it keeps no
        stack for task_free to give back. */
     t->user_stack = t->user_stack_size = 0;
+    /* Off the space before it is seen ended: once its owner sees no thread left, the space ends
+       (task_exit), and no CPU may run this one over it then. */
+    vmm_leave();
     /* No shared descriptor closes, no child is orphaned, the VM stays: they are the app's. Its end
        is set under task_lock, which a joiner holds while it enrolls on child_wait. */
     cli();
@@ -1362,15 +1365,16 @@ NORETURN void task_exit(int code) {
     }
     wm_process_exit(t->pid);
     net_process_exit(t->pid);
-    if (t->is_user && t->pml4 != kernel_pml4) {
+    if (t->vmm_space) {
         sys_shared_cleanup(t);
-        uint64_t old = t->pml4;
-        /* under task_lock: one who read the old space under it is done with its tables */
+        struct vmm_space *old = t->vmm_space;
+        /* under task_lock: one who read the space under it is done with its tables */
         f = spin_lock(&task_lock);
-        t->pml4 = kernel_pml4;
-        vmm_switch(kernel_pml4);
+        t->vmm_space = NULL;
         spin_unlock(&task_lock, f);
-        vmm_free_space(old);
+        vmm_leave();
+        vmm_space_end(old);
+        vmm_space_put(old);
     }
     struct object *app = t->app;
     t->app = NULL;

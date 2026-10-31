@@ -163,7 +163,7 @@ static int load_bytes(struct task *t, struct handle *doc, uint64_t offset, uint6
         int64_t got = store_document_read(doc, offset + done, buf, k, false);
         if (got < 0) return (int)got;
         if ((size_t)got != k) return -N_ERR_IO;
-        if (vmm_copy_to_space(t->pml4, va + done, buf, k) < 0) return -N_ERR_NO_MEMORY;
+        if (vmm_copy_to_space(t->vmm_space, va + done, buf, k) < 0) return -N_ERR_NO_MEMORY;
         done += k;
     }
     return 0;
@@ -210,8 +210,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
         return -N_ERR_NO_MEMORY;
     }
     t->is_user = true;
-    t->pml4 = vmm_new_space();
-    if (!t->pml4) goto fail;
+    if (!(t->vmm_space = vmm_space_new())) goto fail;
 
     uint64_t top = 0;
     program = program_get(doc);
@@ -238,7 +237,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
         if (alone && program_map(t, program, doc, ph[i].offset, ph[i].vaddr, ph[i].filesz, ph[i].memsz, prot & VM_X) == 0)
             continue;
         /* Otherwise the file's bytes are copied now; the zero tail (.bss) gets frames on first touch. */
-        if (vmm_user_reserve(t->pml4, ph[i].vaddr, ph[i].memsz, prot) < 0) goto fail;
+        if (vmm_user_reserve(t->vmm_space, ph[i].vaddr, ph[i].memsz, prot) < 0) goto fail;
         if ((r = load_bytes(t, doc, ph[i].offset, ph[i].vaddr, ph[i].filesz, buf)) < 0) goto fail;
     }
     program_put(program, true);
@@ -280,7 +279,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     if (!pointers) { r = -N_ERR_NO_MEMORY; goto fail; }
     /* pre-fault what the start needs plus 64 KiB; the rest grows on demand */
     uint64_t prefault = ALIGN_UP(strings + pointer_bytes + 64 + 65536, PAGE_SIZE);
-    if (vmm_user_alloc(t->pml4, USER_STACK_TOP - prefault, prefault, VM_W) < 0) { r = -N_ERR_NO_MEMORY; goto fail; }
+    if (vmm_user_alloc(t->vmm_space, USER_STACK_TOP - prefault, prefault, VM_W) < 0) { r = -N_ERR_NO_MEMORY; goto fail; }
     for (size_t i = 0; i < l->handle_count; i++)
         if (l->handles[i] && handle_table_put(t, i, handle_ref(l->handles[i])) < 0) {
             handle_close(l->handles[i]);
@@ -291,14 +290,14 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     for (int i = settings - 1; i >= 0; i--) {
         size_t n = strlen(SETTING(i)) + 1;
         sp -= n;
-        if (vmm_copy_to_space(t->pml4, sp, SETTING(i), n) < 0) goto fail;
+        if (vmm_copy_to_space(t->vmm_space, sp, SETTING(i), n) < 0) goto fail;
         pointers[argc + 1 + i] = sp;
     }
 #undef SETTING
     for (int i = argc - 1; i >= 0; i--) {
         size_t n = strlen(argv[i]) + 1;
         sp -= n;
-        if (vmm_copy_to_space(t->pml4, sp, argv[i], n) < 0) goto fail;
+        if (vmm_copy_to_space(t->vmm_space, sp, argv[i], n) < 0) goto fail;
         pointers[i] = sp;
     }
     pointers[argc] = 0;
@@ -306,7 +305,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     sp = ALIGN_DOWN(sp, 16);
     sp -= pointer_bytes;
     sp = ALIGN_DOWN(sp, 16);
-    if (vmm_copy_to_space(t->pml4, sp, pointers, pointer_bytes) < 0) goto fail;
+    if (vmm_copy_to_space(t->vmm_space, sp, pointers, pointer_bytes) < 0) goto fail;
     uint64_t argv_ptr = sp, settings_ptr = sp + ((uint64_t)argc + 1) * 8;
     kfree(pointers);
     pointers = NULL;
@@ -351,11 +350,16 @@ fail:
     kfree(buf);
     kfree(ph);
     if (doc) handle_close(doc);
-    if (t->pml4) {
+    if (t->vmm_space) {
         sys_shared_cleanup(t);
-        vmm_free_space(t->pml4);
+        struct vmm_space *old = t->vmm_space;
+        /* under task_lock: one who read the space under it (the task is listed) is done with it */
+        uint64_t f = spin_lock(&task_lock);
+        t->vmm_space = NULL;
+        spin_unlock(&task_lock, f);
+        vmm_space_end(old);
+        vmm_space_put(old);
     }
-    t->pml4 = kernel_pml4;
     t->parent = NULL;
     /* nobody waits for it: its handles are closed and it is freed right away */
     size_t at = 0;
@@ -379,6 +383,6 @@ int proc_spawn_simple(const char *path, const char *arg1, struct task *parent) {
 }
 
 uint64_t proc_user_pages(struct task *t) {
-    if (!t->is_user || t->is_thread || t->pml4 == kernel_pml4) return 0;
-    return vmm_user_pages(t->pml4);
+    if (!t->is_user || t->is_thread || !t->vmm_space) return 0;
+    return vmm_user_pages(t->vmm_space);
 }
