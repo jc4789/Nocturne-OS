@@ -14,14 +14,25 @@ def main():
     if args.jobs < 1:
         parser.error('並列数は1以上を指定してください')
     root = Path(__file__).resolve().parents[1]
-    bash = root / 'tools/msys64/usr/bin/bash.exe'
+    # 作業木（git worktree）には無視されたフォルダー（tools/・build/）が無い。道具は本体のものを使い、
+    # 出力は本体の build/wt/<作業木の名>/ に置く。make の BUILD は空白を含まない相対の道で渡す。
+    main_root = root
+    common = subprocess.run(['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                            cwd=root, capture_output=True, text=True)
+    if common.returncode == 0 and common.stdout.strip():
+        main_root = Path(common.stdout.strip()).resolve().parent
+    make_vars = []
+    if main_root != root:
+        out = main_root / 'build' / 'wt' / root.name
+        make_vars.append('BUILD=' + Path(os.path.relpath(out, root)).as_posix())
+    bash = main_root / 'tools/msys64/usr/bin/bash.exe'
     # ログイン時の既定PATHはWindows側のRustなどを落とす。
     # 継承してもMSYS2はUCRT64と/usr/binを先頭に置くため、同梱ツールを優先できる。
     env = dict(os.environ, MSYSTEM='UCRT64', CHERE_INVOKING='1',
                MSYS2_PATH_TYPE='inherit', NOCTURNE_BUILD_ROOT=root.as_posix())
     # Targets remain individual argv entries, never shell-source interpolation.
     command = [str(bash), '-lc', 'cd "$NOCTURNE_BUILD_ROOT" && exec make "$@"',
-               'nocturne-build', '-j'+str(args.jobs), *(args.targets or ['all'])]
+               'nocturne-build', '-j'+str(args.jobs), *make_vars, *(args.targets or ['all'])]
     if args.log:
         log = Path(args.log)
         log.parent.mkdir(parents=True, exist_ok=True)
