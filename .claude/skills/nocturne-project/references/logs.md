@@ -28,8 +28,8 @@
 ## 行の形
 
 - ブラウザー：`[browser log @秒.ミリ秒] 本文`。水準は `log`・`warn`・`error`（頁の console）と `trace`（ブラウザー自身の計測）。F12 の Console の札は全部の水準、Trace の札は `trace` だけ。1900 字を越える本文は `[browser log+ @…]` の行に続く。秒はゲストの起動からの uptime で、F12 の `@秒` と同じ時計。
-- カーネル：接頭辞だけで時刻が無い（`memory:`、`video:`、`store:`、`prof:`、`[memory]`）。
-- 計測の行は全部 `[browser trace @…]`。頁の行（`[browser log|warn|error @…]`）と grep で分けられる：`grep -a "\[browser trace" serial.log`、頁だけなら `grep -a "\[browser \(log\|warn\|error\)"`。2026-10-27 までの serial.log では計測の行も `[browser log @…]` だった。
+- serial の全部の行（カーネルの行も、アプリが system log へ出す行も）の頭は `[秒.マイクロ秒 CPU:tid]`（時計が動く前は 0、thread の無い行は `-`、重さが INFO でなければ ` E`・` W`・` D`）。その後に部品の接頭辞（`memory:`、`video:`、`store:`、`prof:`、`[memory]`、`[browser log @…]`）。console の文字（init の「Welcome」など）には頭が無い。grep は行頭に `^` を付けずに接頭辞で拾う。
+- 計測の行は全部 `[browser trace @…]`。頁の行（`[browser log|warn|error @…]`）と grep で分けられる：`grep -a "\[browser trace" serial.log`、頁だけなら `grep -a "\[browser \(log\|warn\|error\)"`。
 
 ## ブラウザーの計測の行
 
@@ -65,13 +65,13 @@ fps を直接出す行は無い。一組（wall ≈ 2000 ms）の `draw` の回�
 
 - `Native media timing: generation G, input MSE|Range|buffer, clock C ms, presented P at T ms, decoded D/drop X, window-published W; audio open|closed, queued Q frames, written/silence …, end/played-estimate … ms, pending …/ahead …, starved S/ended E, window-unpublished <理由>@<行>`
   - 再生中は 2 秒ごと、止まったら一度。**旗は要らない**（F12 の Console と Trace の札には常に。serial へは `--log-console`）。
-  - `written/silence`：音の出口へ書いたフレーム数のうち、PTS の隙間を埋めた無音の数。連続した音なら silence はほとんど増えない（2026-10-27 まで、ミリ秒の PTS の丸めを隙間と見て 1 秒に約 300 フレームの無音を挟んでいた）。
+  - `written/silence`：音の出口へ書いたフレーム数のうち、PTS の隙間を埋めた無音の数。連続した音なら silence はほとんど増えない。増えるなら PTS の丸めを隙間と見ている。
   - かくつきは `drop` の増え方と `starved`。`presented` が `decoded` よりずっと少なければ、解読は追い付いて提示が追い付いていない。`window-unpublished` は窓へ直接出せなかった理由と avmedia.c の行番号。
 - `Native media transition: reason …, generation a->b, …`、`Native audio sink: …`、`Native media supply: …`：`--debug-js` のときだけ。
 
 ## カーネルの行
 
-- 起動：`memory: N MiB usable, M MiB free`、`video: WxH, bpp …`、`video: monitor <名>, at R Hz`（EDID が決めた拍。`the firmware passed no EDID` なら EDID 無し）、`store: C: "<label>" on sata0, N MiB, M MiB free`。`store:` の他の行（`read only from now on`、`damaged`）は C: の異常。
+- 起動：`memory: N MiB usable, M MiB free`、`video: WxH, bpp …`、`video: monitor <名>, at R Hz`（EDID が決めた拍。`the firmware passed no EDID` なら EDID 無し）、`store: C: "<label>" on nvme0, N MiB, M MiB free`（SATA なら `sata0`）。`store:` の他の行（`read only from now on`、`damaged`）は C: の異常。
 - メモリー切れ：`[memory] pid P … no pages for …`（10 秒に 1 回まで）。
 - 標本（起動の cmdline に `prof` か `prof_ms=<n>` を付ける。Limine のメニューで項目を編集する。できなければ `boot/limine.conf` の cmdline を一時的に変えて `qemu-image` で組み、済んだら戻す。窓は既定 10 秒）：
   - `prof: ---- N ms window ----` で一組が始まる。
@@ -86,5 +86,5 @@ fps を直接出す行は無い。一組（wall ≈ 2000 ms）の `draw` の回�
 - 行を拾う：`grep -a "Native media timing" "<serial.log>" | tail -n 20`（`-a` は二進の混入に備える）。時刻の範囲で切るなら `@秒` を見る。
 - 製品の速さは `--log-console` だけ（または旗なしで F12 を読む）の回で測る。`--debug-js` は原因を探す回に使い、その回の数字を製品の速さとして書かない。
 - 変える前に、今の媒体で同じ行を取って書き残す。前後は同じサイト・同じ操作・同じ秒数の範囲で並べる。組み直す前に写した二つ目の媒体（`build/mae.img`）があれば、二台で同じ時に取れる。旧版を組み直して「前」を作らない。
-- F12 を開いたまま撮る（ユーザーの硬い規則、2026-10-27）。撮影の画像の console の行も読む。
+- F12 を開いたまま撮り、撮影の画像の console の行も読む。
 - ホスト側にこれらの行を解析する道具は無い。要るときは一度きりの Python を作業場（scratchpad）に置き、リポジトリへ入れない。

@@ -1,9 +1,11 @@
 # コードの覚え書き
 
-コードを読んでも分からない、次にこのコードを触る人が知らないと困ることを、ファイルに結び付けて置く。
-対象のファイルを読む・書くと、mokei のフック（.claude/hooks/mokei.py）がその覚え書きを出し、
-確かめた後に対象へ入ったコミットの数を添える。違っていたら、見つけた人がその場で直すか消す。
-書き方は .claude/skills/mokei/SKILL.md の「コードの覚え書き」。
+コードを読んでも分からない、次にこのコードを触る人が知らないと困ることを、ファイルに結び付けて置く：
+ファイルをまたぐ暗黙の約束、落とし穴と確かめ方、文書の古い箇所。一か所で完結する約束はその場所の注釈に書く。
+対象のファイルに触れる前に、その道でここを引く（`rg -n "^対象:.*<道の一部>" .claude/oboegaki.md`）。
+`確かめた:` の後に対象が変わっていれば（`git log --oneline <確かめたコミット>.. -- <対象>`）今のコードと照らし、
+違っていたら見つけた人がその場で直すか消す。
+一件の形：`## ` の題、`対象:`（リポジトリからの道。glob 可、末尾の `/` は下全部）、`確かめた:`（日付とコミット）、本文（何を、なぜ、何で確かめたか）。
 
 ## 締切は絶対の uptime_ms か -1
 対象: user/libc/web/doc.c, user/libc/web/css.c, user/libc/web/marquee.c, user/libc/web/js.c, user/libc/web/avmedia.c, user/libc/web/frame.c, user/apps/browser.c
@@ -52,8 +54,8 @@ css_rule_info の text はシートの元の文（注釈を除いた写し）の
 
 ## 対称のカーネル：ファイルをまたぐ約束
 対象: kernel/src/sys/syscall.c, kernel/src/sys/sched.c, kernel/src/arch/idt.c, kernel/src/arch/isr.asm, kernel/src/mm/vmm.c
-確かめた: 2026-10-29（BSP へ回す道を消した版、未コミット）
-copy_from_user／copy_to_user は isr.asm の user_copy（rep movsb）で写し、頁違反は idt.c の user_copy_fixup が拾う：割り込みが開いていれば vmm_handle_user_fault で頁を作って続け（眠りうる）、閉じていれば user_copy_fault へ飛んで残りのバイト数を返す。だから spinlock の下で写すと、頁が無いときは必ず失敗し、あるときも眠りうる。利用者の指を写し以外で読むと、別の CPU の兄弟 thread が外した頁で核が panic する（その頁違反は直されない）。task_exit は空間を kernel_pml4 へ付け替えるのを task_lock の下で行い、その後に vmm_free_space する：task_lock の下で読んだ t->pml4 の表は lock の間は消えない（proc_user_pages・vmm_user_pages_split を task_lock の下で呼べる理由）。番地の待ち（task_wait_address）は利用者の番地を物理へ訳して直写像で読むので、写しを使わない。panic は panic_enter（printf.c）で他の CPU を NMI で止めてから、止まった CPU が持っていた記録の lock を spin_seize する。
+確かめた: 2026-10-30（段①の 13-2、未コミット）
+copy_from_user／copy_to_user は isr.asm の user_copy（rep movsb）で写し、頁違反は idt.c の user_copy_fixup が拾う：まず vmm_fault_spurious（広げた写像は撃ち落とさないので、古い狭い訳が残した違反は割り込みの状態によらずそのまま続ける）、次に割り込みが開いていれば vmm_handle_user_fault で頁を作って続け（眠りうる）、閉じていれば user_copy_fault へ飛んで残りのバイト数を返す。だから spinlock の下で写すと、頁が無いときは必ず失敗し、あるときも眠りうる。利用者の指を写し以外で読むと、別の CPU の兄弟 thread が外した頁で核が panic する（その頁違反は直されない）。task_exit（と proc.c の起動の失敗）は task の vmm_space を task_lock の下で NULL にし、lock を放してから vmm_leave・vmm_space_end・vmm_space_put する：task_lock の下で読んだ t->vmm_space の表は lock の間は消えない（proc_user_pages・vmm_user_pages_split を task_lock の下で呼べる理由）。thread は thread_exit で ZOMBIE になる前に vmm_leave し、vmm_space_end は「どの CPU も持っていない」を ASSERT する。task の `space` は別物で、syscall.c の予約の配置の待ち行列（その `.lock` が配置の lock）。窓（wm.c）も空間の参照を持ち、win_release で放す。番地の待ち（task_wait_address）は利用者の番地を物理へ訳して直写像で読むので、写しを使わない。panic は panic_enter（printf.c）で他の CPU を NMI で止めてから、止まった CPU が持っていた記録の lock を spin_seize する。
 
 ## 外部の ArrayBuffer の free_func は二度呼ばれる
 対象: third_party/quickjs/quickjs.c, user/libc/web/js_webaudio.c, user/libc/web/*.c

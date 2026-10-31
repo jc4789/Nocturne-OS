@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "python -I \"$env:CLAUDE_PROJECT_DIR/.claude/hooks/ban.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|Agent|Task|EnterWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "python -I \"$env:CLAUDE_PROJECT_DIR/.claude/hooks/ban.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "python -I \"$env:CLAUDE_PROJECT_DIR/.claude/hooks/ban.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

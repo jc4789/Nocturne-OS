@@ -1,6 +1,13 @@
 # 波 4 の一：装置の層（kernel/src/dev/）の設計の決定
 
-元は `4-dev-plan.md` の報告（Plan の型の書き手の下書き、全文）。本文の設計（装置の木、照合、寿命、割り込み、DMA と IOMMU、電源、通知の無い待ち、vm/ との境、各部品、段の割り方）は下書きをそのまま採る。この文書には、下書きを照らした結果と、下書きが本体に残した判断と、下書きから変えた所だけを書く。
+元は `4-dev-plan.md` の報告（Plan の型の書き手の下書き、全文）。この文書には、下書きを照らした結果と、下書きが本体に残した判断と、下書きから変えた所だけを書く。
+
+**下書きをそのまま採らない所**（ユーザー、2026-10-31「GUI FIRST MEANS, FIRST CLASS WINDOWING AND GPU SUPPORT」「THIS IS NO LINUX」。00-design.md §3）
+- 下書きは Linux の形に寄っている：driver core の bus・device・driver と probe、KMS に似た connector・CRTC・plane、blk-mq、dpm の名と分け方。
+- 表示・GPU・窓（下書き §2.8 の「表示 ↔ 窓」、§3.11、§3.12、§5 の表示の行）は採らない。
+  - ここは GUI が先の設計（窓と GPU の層の下書き、`4-gui-gpu-plan.md`）から決める。
+  - 装置の層はそれに仕える。
+- 装置の木・寿命・割り込み・DMA・電源・通知の無い待ちの中身は採る。ただし名と分け方は Nocturne の目的から決め直す。各段の依頼文を書く時に、Linux の名をそのまま使っていないかを照らす。
 
 ## 1. 照らした結果
 
@@ -81,29 +88,36 @@
 - 理由：D0 と B の間に `all` の媒体を渡すと、実機が disk を失いうるため。
 - 実機の C: が NVMe か SATA かは、ユーザーへの実機の一覧に入れる。
 
-### 6. virgl の 3D の道を消す
+### 6. GPU（virgl の道）は残す
 
-下書きより範囲を広くする。
+**経緯**
+- 一度、消すと決めて消した（791b1980）。理由は、監査 02 が「VM だけの実装が vm.h を通らずに共通コードと ABI とブラウザーへ漏れている」と判定したこと。
+- ユーザーの指示（2026-10-31「undelete the gpu」）で戻した。下書きの D0 の「`dev/gpu.h`・virtio の 3D・`gpu_init`・`SYS_GPU_*` を消す」は取り下げる。
 
-**消す物**
-- 核：`dev/gpu.h`、`vm/virtio_gpu.c` の 3D の部分（2D の scanout は表示の提供者として残す）、`gui/wm.c` の `gpu_init`、`sys/syscall.c` の `SYS_GPU_INFO`・`SYS_GPU_RENDER`・`SYS_GPU_RENDER_BATCH`・`SYS_GPU_BLIT`・`SYS_GPU_RENDER_LIST`。
-- ABI：`common/gpu_abi.h`。
-- libc：`user/libc/gpu.c`、`user/include/gpu.h`。
-- ブラウザー：`js_canvas.c` の gpu の blit と clear（CPU の道が残る）。
-- アプリと試験：`user/apps/gpu_demo.c`、`tests/gputest.c`、`tests/canvastest.c` の gpu の部分。
-- 道具：Makefile・`scripts/mksdk.sh` の行、`ports/virgl`（virgl の道のためだけにあるホストの QEMU の DLL の直し）、README の記述。
+**残る物**
+- `dev/gpu.h`、`vm/virtio_gpu.c`、`common/gpu_abi.h`、`SYS_GPU_*`、libc の gpu、canvas の GPU の blit と clear、`gpu_demo`、試験、`ports/virgl`。
 
-**理由**
-- 監査 02 の判定：VM だけの実装が、vm.h を通らずに共通コードと ABI と ブラウザーへ漏れている。実機では `SYS_GPU_*` に実装が無い。
-- 実機の GPU の道は nvrm と Mesa で、この ABI を使わない。
+**後の段への影響**
+- 3-S は `SYS_GPU_*` の手続きも、他と同じく持ち主へ移す。
+- 段 D（表示）は、この道を消さない形で設計する。
+- `vm/virtio_gpu.c` の中身は virgl の描画だけで、2D の scanout は無い。下書き §2.7 の「2D の scanout を表示の提供者に」は、今のコードには当たらない。
 
-**時機**
-- 3-S が syscall の表を建てる前に消す。表へ写す手間を無くすため。
-- 本体で行う。
-
-**AGENTS.md との食い違い**
-- AGENTS.md は、ネイティブ ABI の一つとして `gpu_abi.h` の名を挙げている。
-- AGENTS.md は直さない。ユーザーに伝える。
+**NVIDIA の GPU を支える**（ユーザーの指示、2026-10-31「We need to SUPPORT gpus」「WE SUPPORT NVIDIA GPUS」）
+- Nocturne は NVIDIA の GPU を支える。実機の RTX 4070 を、移植した NV のドライバー（nvrm、`ports/nvidia`）と Mesa（`ports/mesa`）で動かす。
+- 装置の層のどの段も、この道を壊さない。下書きが「消して建て直す」とした部品のうち、NVIDIA の道が通るもの：
+  - `pciuser`（claim・BAR・DMA・割り込み・ACPI・画面の hold）→ 段 C。
+  - IOMMU（nvrm の claim の domain）→ 段 I。
+  - `fb`（画面の渡し、panic の面）→ 段 D。
+  - `pm`（claim を持ったままの眠り）→ 段 P。
+  - 建て直しは中身を新しい形にすることで、nvrm が使う機能を一つも減らさない。各段の依頼文に「nvrm が使う口の一覧と、その後も同じに動くこと」を書く。
+- 波 0〜2 で、NVIDIA の道の核の側を変えた（`pciuser.c`・`iommu.c`・`iommu_amd.c`・`fb.c`・`init.c`）。中身：割り込みを CPU ごとの vector へ、claim ごとの錠、handle の権利、process と thread の分け。
+  - nvrm は組めて link も通る。
+  - RTX 4070 の実機では、まだ動かしていない（QEMU に NVIDIA の GPU は無い）。
+- VM：virtio-gpu の virgl も残す。
+- 表示の模型（§3.11）と claim（§3.12）は、NVIDIA の GPU を支える道として設計する。消す・痩せさせる側に倒さない。
+- 監査 02 の境界の指摘は残っている。`gui/wm.c` と `sys/syscall.c` が vm.h を通らずに `dev/gpu.h` を呼んでいる。
+  - 直す向きは、機能を消すことではない。GPU の口を本当の抽象化の層にする（名と契約を持ち、各側に本物の実装がある：VM の virgl と、実機の GPU）。
+  - この層の設計は段 D の前に書く。
 
 ### 7. `vm/ac97.c`
 
@@ -115,9 +129,6 @@
 - D0 で消す。媒体は UEFI・q35・第 2 世代だけになった（main 463abe7f）。
 
 ## 3. 段と順（下書き §6 を採る。変えた所）
-
-**波 3 の前**
-- 本体：§2 の 6（virgl を消す）。
 
 **前提**
 - 波 3（3-V、3-S、3-T）。
@@ -149,6 +160,7 @@
 
 ## 5. 実機で見ること（`all` を渡す時に、ユーザーへの短い一覧に入れる）
 
+- RTX 4070：nvrm が claim し、画面が nvrm へ渡り、窓とブラウザーの WebGL が動くか。波 0〜2 の後、まだ見ていない。
 - C: が NVMe か SATA か（§2 の 5）。
 - root port の DRS・FRS・Readiness Time Reporting・Immediate Readiness。
 - firmware に S3 があるか（Low Power S0 Idle だけではないか）。
