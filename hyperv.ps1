@@ -5,16 +5,17 @@
 
 .DESCRIPTION
     Nocturne has one disk: its boot part and drive C:, with the system (C:\Nocturne), the apps
-    (C:\Programs) and the user's files (C:\Users). The VM's disk is .\hyperv\<Name>.vhdx (Gen 2) or
-    .\hyperv\<Name>.vhd (Gen 1), the VM's own: -Update replaces only the system on it (the boot part,
-    C:\Nocturne and the desktop apps' folders, scripts\mkimage.sh --update), so the user's files and
-    the apps the user put in C:\Programs stay. A new VM's disk is a copy of build\nocturne.img; one
-    left by -Remove is taken up again.
+    (C:\Programs) and the user's files (C:\Users). The VM's disk is .\hyperv\<Name>.vhdx, the VM's
+    own: -Update replaces only the system on it (the boot part, C:\Nocturne and the desktop apps'
+    folders, scripts\mkimage.sh --update), so the user's files and the apps the user put in
+    C:\Programs stay. A new VM's disk is a copy of build\nocturne.img; one left by -Remove is taken
+    up again.
 
-    Generation 2 (the default for a new VM) is the native Hyper-V machine: UEFI, VMBus and only
-    synthetic devices, which Nocturne drives (keyboard, mouse, SCSI disks, network, heartbeat,
-    shutdown, time sync) - plus the Enhanced Session: VMConnect talks RDP to Nocturne over a
-    Hyper-V socket, so the desktop takes the size of the window. For a Gen 2 VM this script:
+    The VM is a Generation 2 machine, the native Hyper-V one: UEFI, VMBus and only synthetic
+    devices, which Nocturne drives (keyboard, mouse, SCSI disks, network, heartbeat, shutdown, time
+    sync) - plus the Enhanced Session: VMConnect talks RDP to Nocturne over a Hyper-V socket, so the
+    desktop takes the size of the window. A Generation 1 VM is not one Nocturne boots on; the
+    script stops at one. This script:
       * writes the disk (above) and attaches it on SCSI 0:0 as the first boot device,
       * creates the VM with static memory (-MemoryMB, 4096), four CPUs (-Cpus), no checkpoints, Secure Boot off (the boot loader
         is not signed) and a synthetic network adapter on the "Default Switch" for NAT internet access,
@@ -25,17 +26,12 @@
       * routes COM1 to the named pipe \\.\pipe\<name>-com1 (kernel log),
       * starts the VM and opens a VMConnect window.
 
-    Generation 1 (-Generation 1) emulates a legacy PC: the disk is a fixed VHD on IDE 0:0, and the
-    network adapter a legacy one (an emulated DEC 21140).
-
-    -Update keeps the generation of the existing VM. The disk is rewritten through a raw copy next
-    to it (.\hyperv\<Name>-work.img, sparse), so the folder needs room for twice what the disk
-    holds (its file's size, not the size the guest sees).
+    -Update rewrites the disk through a raw copy next to it (.\hyperv\<Name>-work.img, sparse), so
+    the folder needs room for twice what the disk holds (its file's size, not the size the guest
+    sees).
 
 .EXAMPLE
-    .\hyperv.ps1                 # create and start the Gen 2 VM "Nocturne"
-.EXAMPLE
-    .\hyperv.ps1 -Name Nocturne-G1 -Generation 1   # a Gen 1 VM instead
+    .\hyperv.ps1                 # create and start the VM "Nocturne"
 .EXAMPLE
     .\hyperv.ps1 -Update         # after rebuilding: turn the VM off, put the new system on its disk, start it again
 .EXAMPLE
@@ -50,7 +46,6 @@
 #>
 param(
     [string]$Name = "Nocturne",
-    [ValidateSet(1, 2)][int]$Generation = 2,
     # What the browser needs for today's sites, and the CPUs its parallel work spreads over: with one
     # CPU and 512 MB a video page runs out of memory and per-frame WebGL runs at a third of its speed.
     [int]$MemoryMB = 4096,
@@ -90,13 +85,14 @@ function Stop-IfRunning($vm) {
 }
 
 $existing = Get-VM -Name $Name -ErrorAction SilentlyContinue
-if ($existing) { $Generation = $existing.Generation }
+if ($existing -and $existing.Generation -ne 2) {
+    throw "VM '$Name' is a Generation $($existing.Generation) VM; Nocturne boots only on Generation 2. Delete it in Hyper-V Manager (its disk stays on the host) and run this script again."
+}
 
-# Gen 1 boots a fixed-size VHD on IDE; Gen 2 a VHDX on SCSI
-if ($Generation -eq 1) { $Ext = ".vhd"; $Bus = "IDE" } else { $Ext = ".vhdx"; $Bus = "SCSI" }
-$Disk = Join-Path $VmDir "$Name$Ext"
+# the VHDX on SCSI 0:0
+$Disk = Join-Path $VmDir "$Name.vhdx"
 if ($existing) {
-    $drive = Get-VMHardDiskDrive -VM $existing -ControllerType $Bus -ControllerNumber 0 -ControllerLocation 0
+    $drive = Get-VMHardDiskDrive -VM $existing -ControllerType SCSI -ControllerNumber 0 -ControllerLocation 0
     if ($drive) { $Disk = $drive.Path }
 }
 
@@ -153,9 +149,9 @@ function Write-Disk {
     }
     $env:NOCTURNE_DISK = $Disk
     $env:NOCTURNE_WORK = "hyperv/$Name-work.img"
-    $env:NOCTURNE_NEW = "hyperv/$Name-new$Ext"
+    $env:NOCTURNE_NEW = "hyperv/$Name-new.vhdx"
     $work = Join-Path $VmDir "$Name-work.img"
-    $new = Join-Path $VmDir "$Name-new$Ext"
+    $new = Join-Path $VmDir "$Name-new.vhdx"
     try {
         if (-not $fresh) {
             Say "reading $Disk"
@@ -206,22 +202,14 @@ function Test-Switch {
 
 function Add-Nic($vm) {
     if ($NoNetwork) { return }
-    if ($Generation -eq 1) {
-        if (Get-VMNetworkAdapter -VM $vm | Where-Object { $_.IsLegacy }) { return }
-        if (-not (Test-Switch)) { return }
-        Say "adding a legacy network adapter on '$Switch'"
-        Add-VMNetworkAdapter -VM $vm -IsLegacy $true -SwitchName $Switch
-    }
-    else {
-        if (Get-VMNetworkAdapter -VM $vm) { return }
-        if (-not (Test-Switch)) { return }
-        Say "adding a network adapter on '$Switch'"
-        Add-VMNetworkAdapter -VM $vm -SwitchName $Switch
-    }
+    if (Get-VMNetworkAdapter -VM $vm) { return }
+    if (-not (Test-Switch)) { return }
+    Say "adding a network adapter on '$Switch'"
+    Add-VMNetworkAdapter -VM $vm -SwitchName $Switch
 }
 
-# Gen 2: the DVD drive (for -Iso) and the boot order
-function Set-Gen2Boot($vm) {
+# the DVD drive (for -Iso) and the boot order
+function Set-Boot($vm) {
     $first = Get-VMHardDiskDrive -VM $vm | Where-Object { $_.Path -eq $Disk }
     if ($Iso) {
         $dvd = Get-VMDvdDrive -VM $vm | Select-Object -First 1
@@ -249,8 +237,7 @@ if ($existing -and $Update) {
         Say "giving '$Name' $MemoryMB MB for the ISO's C:"
         Set-VMMemory -VM $existing -StartupBytes ($MemoryMB * 1MB)
     }
-    if ($Iso -and $Generation -eq 1) { Set-VMDvdDrive -VMName $Name -ControllerNumber 1 -ControllerLocation 0 -Path $IsoCopy }
-    if ($Generation -eq 2) { Set-Gen2Boot $existing }
+    Set-Boot $existing
 }
 elseif ($existing) {
     throw "A VM called '$Name' already exists. Use -Update to put the new system on its disk, or -Remove to delete it."
@@ -258,8 +245,8 @@ elseif ($existing) {
 else {
     Write-Disk
     Copy-Iso
-    Say "creating Generation $Generation VM '$Name' ($MemoryMB MB, $Cpus CPUs)"
-    $vm = New-VM -Name $Name -Generation $Generation -MemoryStartupBytes ($MemoryMB * 1MB) -VHDPath $Disk -Path $VmDir
+    Say "creating VM '$Name' ($MemoryMB MB, $Cpus CPUs)"
+    $vm = New-VM -Name $Name -Generation 2 -MemoryStartupBytes ($MemoryMB * 1MB) -VHDPath $Disk -Path $VmDir
     Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
     Set-VMProcessor -VM $vm -Count ([Math]::Min($Cpus, [Environment]::ProcessorCount))
     Get-VMNetworkAdapter -VM $vm | Remove-VMNetworkAdapter
@@ -268,24 +255,13 @@ else {
     Set-VM -VM $vm -AutomaticStopAction TurnOff
     # kernel log on COM1 -> named pipe (read it with scripts\hv-serial.ps1, PuTTY or any pipe client)
     Set-VMComPort -VM $vm -Number 1 -Path $Pipe
-    if ($Generation -eq 1) {
-        if ($Iso) {
-            Set-VMDvdDrive -VMName $Name -ControllerNumber 1 -ControllerLocation 0 -Path $IsoCopy
-            Set-VMBios -VM $vm -StartupOrder @("CD", "IDE", "LegacyNetworkAdapter", "Floppy")
-        }
-        else {
-            Set-VMBios -VM $vm -StartupOrder @("IDE", "CD", "LegacyNetworkAdapter", "Floppy")
-        }
-    }
-    else {
-        Set-VMFirmware -VM $vm -EnableSecureBoot Off
-        Set-Gen2Boot $vm
-        # VMConnect's Enhanced Session: RDP to Nocturne over a Hyper-V socket
-        Set-VM -VM $vm -EnhancedSessionTransportType HvSocket
-    }
+    Set-VMFirmware -VM $vm -EnableSecureBoot Off
+    Set-Boot $vm
+    # VMConnect's Enhanced Session: RDP to Nocturne over a Hyper-V socket
+    Set-VM -VM $vm -EnhancedSessionTransportType HvSocket
 }
 
-if ($Generation -eq 2 -and -not (Get-VMHost).EnableEnhancedSessionMode) {
+if (-not (Get-VMHost).EnableEnhancedSessionMode) {
     Say "turning on Enhanced Session Mode for this Hyper-V host"
     Set-VMHost -EnableEnhancedSessionMode $true
 }
@@ -294,10 +270,5 @@ if (-not $NoStart) {
     Say "starting '$Name'"
     Start-VM -Name $Name
     Start-Process vmconnect.exe -ArgumentList "localhost", "`"$Name`""
-    if ($Generation -eq 2) {
-        Say "VMConnect asks for a display size: that is the Enhanced Session, the desktop takes that size."
-    }
-    else {
-        Say "click inside the VM window to capture the mouse; Ctrl+Alt+Left releases it."
-    }
+    Say "VMConnect asks for a display size: that is the Enhanced Session, the desktop takes that size."
 }

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Build the boot disk: one GPT disk with an EFI system partition (Limine and the kernel) and the
-# Nocturne partition, drive C: (scripts/layout.py says what goes on it). From the raw disk (QEMU)
-# come a fixed VHD (Hyper-V Gen1) and a dynamic VHDX (Hyper-V Gen2). The ISO (BIOS and UEFI) is a
-# live system: Limine brings its C:, a bare volume, into memory with the kernel.
+# Build the boot disk: one GPT disk with an EFI system partition (Limine's UEFI loader and the
+# kernel) and the Nocturne partition, drive C: (scripts/layout.py says what goes on it). The machine
+# boots it through UEFI only. From the raw disk (QEMU, a USB stick) comes a dynamic VHDX (Hyper-V
+# Generation 2). The ISO (UEFI) is a live system: Limine brings its C:, a bare volume, into memory
+# with the kernel.
 #   --raw-only    the raw disk alone, for a QEMU test boot
 #   --run         the raw disk, then `make run`'s own disk, build/run.img: a copy of it the first
 #                 time, updated (--update) after that
@@ -10,7 +11,7 @@
 #                 desktop apps' folders) is replaced by the built one; the user's files and the
 #                 apps the user put in C:\Programs stay (hyperv.ps1 uses it)
 #   --hyperv RAW DISK
-#                 only this: Hyper-V's disk DISK (.vhd or .vhdx) from the raw disk RAW
+#                 only this: Hyper-V's disk DISK (.vhdx) from the raw disk RAW
 set -e
 cd "$(dirname "$0")/.."
 B=build
@@ -26,8 +27,7 @@ FREE_MB=128     # room on C: before it grows: the kernel takes C: to the end of 
 ISO_FREE_MB=256 # the room on the ISO's C:, which takes its whole size of memory and never grows
 MIB=$((1024 * 1024))
 
-# The boot part of disk $1: its EFI system partition (FAT: Limine and the kernel) and Limine's BIOS
-# stage in its BIOS boot partition, the first.
+# The boot part of disk $1: its EFI system partition (FAT: Limine's UEFI loader and the kernel).
 boot_install() {
     local offset sectors
     read -r offset sectors <<< "$($STORE esp "$1")"
@@ -35,25 +35,18 @@ boot_install() {
     mformat -i "$esp" -F -T "$sectors" -H $((offset / 512)) -h 64 -s 32 -v NOCTURNE ::
     mmd -i "$esp" ::/boot ::/boot/limine ::/EFI ::/EFI/BOOT
     mcopy -i "$esp" $B/kernel.elf ::/boot/kernel.elf
-    mcopy -i "$esp" boot/limine.conf $LIMINE/limine-bios.sys ::/boot/limine/
+    mcopy -i "$esp" boot/limine.conf ::/boot/limine/
     mcopy -i "$esp" $LIMINE/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
-    local out
-    out=$($B/host/limine.exe bios-install "$1" 1 2>&1) || { echo "$out" >&2; return 1; }
 }
 
-# Hyper-V's disk $2 from the raw disk $1: a fixed VHD (.vhd, Generation 1) or a dynamic VHDX
-# (.vhdx, Generation 2), of the raw disk's size. Made larger in Hyper-V, the disk takes C: with it
-# on the next start.
+# Hyper-V's disk $2 from the raw disk $1: a dynamic VHDX (Generation 2) of the raw disk's size.
+# Made larger in Hyper-V, the disk takes C: with it on the next start.
 hyperv_disk() {
     rm -f "$2"
-    case "$2" in
-    *.vhd) qemu-img convert -f raw -O vpc -o subformat=fixed,force_size=on "$1" "$2" ;;
-    *.vhdx) qemu-img convert -f raw -O vhdx -o subformat=dynamic "$1" "$2" ;;
-    *) echo "mkimage: $2 is neither a .vhd nor a .vhdx" >&2; return 1 ;;
-    esac
+    qemu-img convert -f raw -O vhdx -o subformat=dynamic "$1" "$2"
 }
 
-# The ISO: Limine for BIOS and UEFI, the kernel, and C: as boot/c.img, a bare volume of the size
+# The ISO: Limine's UEFI loader, the kernel, and C: as boot/c.img, a bare volume of the size
 # $1 MiB, which every entry of boot/limine.conf brings along as the module "C:"
 iso_make() {
     local root=$B/iso_root
@@ -62,17 +55,14 @@ iso_make() {
     cp $B/kernel.elf $root/boot/
     sed 's|^\( *\)path: boot():/boot/kernel.elf$|&\n\1module_path: boot():/boot/c.img\n\1module_string: C:|' \
         boot/limine.conf > $root/boot/limine/limine.conf
-    cp $LIMINE/limine-bios.sys $LIMINE/limine-bios-cd.bin $LIMINE/limine-uefi-cd.bin $root/boot/limine/
+    cp $LIMINE/limine-uefi-cd.bin $root/boot/limine/
     cp $LIMINE/BOOTX64.EFI $root/EFI/BOOT/
     truncate -s "$1M" $root/boot/c.img
     $STORE format $root/boot/c.img Nocturne
     echo "  C:   $($STORE fill $root/boot/c.img $B/c.list)"
-    xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin -no-emul-boot -boot-load-size 4 \
-        -boot-info-table -hfsplus -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \
+    xorriso -as mkisofs -R -r -J -hfsplus -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \
         -efi-boot-part --efi-boot-image --protective-msdos-label $root -o $ISO 2>/dev/null
     rm -rf $root
-    local out
-    out=$($B/host/limine.exe bios-install $ISO 2>&1) || { echo "$out" >&2; return 1; }
 }
 
 # The built system in place of the one on disk $1.
@@ -120,8 +110,6 @@ case "$1" in
     exit 0 ;;
 esac
 
-echo "  VHD  $B/nocturne.vhd"
-hyperv_disk $IMG $B/nocturne.vhd
 echo "  VHDX $B/nocturne.vhdx"
 hyperv_disk $IMG $B/nocturne.vhdx
 ISO_C_MB=$(((64 + PAYLOAD / MIB * 105 / 100 + ISO_FREE_MB + 63) / 64 * 64))

@@ -28,7 +28,7 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
 
 ## 特徴
 
-- **カーネル**：Limine で BIOS・UEFI から起動。複数 CPU で動くユーザースレッド、公平スケジューラー「継」、
+- **カーネル**：Limine で UEFI から起動。複数 CPU で動くユーザースレッド、公平スケジューラー「継」、
   W^X を守るメモリー管理、ネイティブのシステムコール ABI。
 - **デスクトップ**：カーネル内の合成ウィンドウマネージャー。影、二重バッファー、タスクバー、スタートメニュー、
   通知、クリップボード、夜空の壁紙。既定の解像度は 1920×1080。
@@ -47,8 +47,8 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
 
 ### カーネル（`kernel/`、C とアセンブリーで約 43,000 行）
 
-- **起動**：Limine（BIOS・UEFI）から上位半分の 64 ビットカーネルへ。起動メニューには既定の
-  1920×1080、1024×768、文字コンソールだけ（`nogui`）の 3 項目があります。
+- **起動**：UEFI から Limine を経て、上位半分の 64 ビットカーネルへ。BIOS 起動はありません。起動メニューには
+  デスクトップと文字コンソールだけ（`nogui`）の 2 項目があり、解像度は持ちません（モニターの EDID が決めます）。
 - **CPU**：最大 16 CPU。CPU 0（BSP）がカーネル、割り込み、ドライバー、GUI、ネットワークを持ち、
   ほかの CPU（AP）はそれぞれ自分の実行キューでアプリのスレッドを動かします。
   - スケジューラー「継」（`sys/kei.c`、`sys/sched.c`）：重み付きの仮想時間による公平な選択、
@@ -82,7 +82,7 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
     Hyper-V ソケット、その上の拡張セッション用 RDP サーバーと音声送信。
   - エミュレーターの装置：ATA（PIO）、Intel e1000、DEC 21140／21143（tulip）、Intel AC'97、Bochs VBE
     （スリープからの画面の復帰）、virtio-gpu（virgl。試験的で既定では使いません、`gpu-enable`）。
-  - 模倣 PS/2 マウスの縦軸の反転（Windows 11 の Hyper-V）と、QEMU・VirtualBox の電源断ポート。
+  - QEMU・VirtualBox の電源断ポート。
 - **GUI**：ウィンドウマネージャーはカーネルのスレッドで動きます。単純で速い反面、その不具合はシステム全体を止めます。
   - 窓の画素はアプリと共有するメモリーで、変わった部分だけを描き直します。合成と画面への転送は AP にも分けます。
   - 二重バッファーの窓と描画完了のイベント（`EV_FRAME`）。合成の周期は画面のモードのリフレッシュレート
@@ -171,18 +171,25 @@ powershell -ExecutionPolicy Bypass -File build.ps1 run
 
 `build.ps1 run`（`make run`）は既定で 2048 MiB、4 CPU、TCG（エミュレーション）です。
 `make run QEMU_ACCEL=whpx QEMU_MEMORY=4096M` のように変数で変えられます。
-音は AC'97、ネットワークは QEMU 既定の e1000 とユーザーモードの NAT です。
+機械は q35 を UEFI で起動し、ディスクは NVMe、入力は USB（xHCI）です。音は AC'97、ネットワークは e1000 と
+ユーザーモードの NAT です。
 起動するのは自分用のディスク `build\run.img` です。最初は `build\nocturne.img` をコピーし、その後のビルドでは
 中のシステムだけを置き換えるので、C: に保存したファイルは残ります（[ドライブ C: と保存](#ドライブ-c-と保存)）。
 
-カーネルの ATA ドライバーは PIO なので、起動ディスクは AHCI（DMA）につなぎます。ビルドしたディスクを
-そのまま試すときの構成は次のとおりです（`snapshot=on` なので、C: への書込みは QEMU の終了で捨てられます）。
+QEMU の機械は実機と同じ形にします：q35 を UEFI（edk2）で起動し、起動ディスクは NVMe、キーボードとポインターは
+USB です。ビルドしたディスクをそのまま試すときの構成は次のとおりです（`snapshot=on` なので、C: への書込みは QEMU の
+終了で捨てられます）。`vars.fd` は `share\edk2-i386-vars.fd`（edk2 の空の変数の置き場）の書ける写しで、起動のたびに作り直します。
+SATA の道を試すときは、NVMe の代わりに `-device ahci,id=ahci` と `-device ide-hd,drive=boot,bus=ahci.0` をつなぎます。
 
 ```powershell
-& "C:\Program Files\qemu\qemu-system-x86_64.exe" -M pc -accel whpx -smp 4 -m 4096M -vga std `
-  -device ahci,id=ahci `
+Copy-Item "C:\Program Files\qemu\share\edk2-i386-vars.fd" vars.fd
+& "C:\Program Files\qemu\qemu-system-x86_64.exe" -M q35 -accel whpx -cpu host -smp 4 -m 4096M -vga std `
+  -drive "if=pflash,format=raw,readonly=on,file=C:/Program Files/qemu/share/edk2-x86_64-code.fd" `
+  -drive if=pflash,format=raw,file=vars.fd `
   -drive id=boot,file=build/nocturne.img,format=raw,if=none,snapshot=on `
-  -device ide-hd,drive=boot,bus=ahci.0,bootindex=0 `
+  -device nvme,serial=nocturne,drive=boot,bootindex=0 `
+  -netdev user,id=net -device e1000,netdev=net `
+  -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 `
   -audiodev dsound,id=snd -device AC97,audiodev=snd -serial stdio
 ```
 
@@ -217,7 +224,6 @@ RDP サーバーにつながり、デスクトップは選んだ大きさにな�
 | コマンド | 内容 |
 |---|---|
 | `hyperv.ps1 -Update` | VM を止め、新しくビルドしたシステム（起動部分、`C:\Nocturne`、付属アプリのフォルダー）を VM のディスクへ入れて起動し直します。ユーザーのファイルと、ユーザーが `C:\Programs` に入れたアプリは残ります。書換えには `hyperv\` に、ディスクが使っている分の 2 倍の空きが要ります。古い版の VM のデータディスク（`<名前>-data.vhdx`）は外し、ホストに残します。 |
-| `hyperv.ps1 -Generation 1` | 第 1 世代の VM を作ります（下記）。 |
 | `hyperv.ps1 -Iso` | ディスクの代わりにライブ ISO（`build\nocturne.iso`）を DVD ドライブから起動します。C: はメモリー上にあり、変更は電源を切ると消えます。既存の VM に `-Update -Iso` とすると、起動メモリーが `-MemoryMB`（既定 4096 MB）より少なければ引き上げます。 |
 | `hyperv.ps1 -Remove` | VM を削除します。ディスクはユーザーのファイルごと残り、同じ名前で作り直した VM がまた使います。`-DeleteDisk` を付けるとディスクも消します。 |
 | `hyperv.ps1 -NoStart` | VM を作るだけで起動しません。 |
@@ -227,10 +233,8 @@ RDP サーバーにつながり、デスクトップは選んだ大きさにな�
 | `hyperv.ps1 -Update -ApiKeyFile KEYFILE` | AI エージェントの API キーを VM のディスクの C: へ書きます（`-Endpoint`、`-Model` も指定可）。 |
 
 手で第 2 世代の VM を作るなら、セキュアブートを切って `build\nocturne.vhdx` を SCSI ディスクとしてつなぎ、
-拡張セッションには `Set-VM -EnhancedSessionTransportType HvSocket` を設定します。
-
-**第 1 世代**は旧来の PC を模倣します。ディスクは固定長の VHD（`hyperv\<名前>.vhd`、`build\nocturne.vhd` と同じ形式）で
-IDE 0:0 に、*レガシー*ネットワークアダプター（DEC 21140 の模倣）をつなぎます。VMConnect は基本のコンソールだけです。
+拡張セッションには `Set-VM -EnhancedSessionTransportType HvSocket` を設定します。第 1 世代の VM では起動しません
+（`hyperv.ps1` は第 1 世代の VM を見つけると止まります）。
 
 **VMConnect のこつ**
 - 基本のコンソールでは、窓の中をクリックするとマウスを捕まえます。**Ctrl+Alt+←** で離します。
@@ -240,8 +244,6 @@ IDE 0:0 に、*レガシー*ネットワークアダプター（DEC 21140 の模
   起動メニューには文字コンソールだけの項目もあります。
 - カーネルのログは COM1 です。PuTTY などの名前付きパイプのクライアント（Serial、`\\.\pipe\nocturne-com1`）で
   見られます。`scripts\hv-serial.ps1` はファイルへ書き写します。
-- **下へ動かすとマウスが上へ動く場合**：第 1 世代では、Windows 11 ホストの Hyper-V が模倣 PS/2 マウスの縦軸を
-  逆に報告します。Nocturne は Hyper-V（とホストのビルド）を見分けて自分で軸を反転します。
 
 **開発用のスクリプト**（`scripts\`、管理者で実行）：
 
@@ -257,7 +259,7 @@ IDE 0:0 に、*レガシー*ネットワークアダプター（DEC 21140 の模
 
 ### 実機
 
-`build\nocturne.img`（GPT の起動ディスク、BIOS・UEFI の両方で起動）を USB メモリーへそのまま（DD モードで）
+`build\nocturne.img`（GPT の起動ディスク、UEFI で起動）を USB メモリーへそのまま（DD モードで）
 書き込み、セキュアブートを切って起動します。ISO を書き込むと C: はメモリー上になり、ログも保存も残りません。12 スレッドの AMD 機（USB 起動、RTL8125B の有線 LAN、USB の
 キーボード・マウス）で、デスクトップとブラウザーでの動画ページの表示まで確認しました。この確認は 1 台のディスクと
 ドライブ C: の形式になる前のもので、今の形式の実機ではまだ確かめていません。まだ初期段階です。
@@ -270,7 +272,7 @@ IDE 0:0 に、*レガシー*ネットワークアダプター（DEC 21140 の模
 
 ホストは Windows です。ツール一式は `tools/` に置きます（リポジトリーには含まれず、`.gitignore` されています）。
 - `tools/msys64`：MSYS2（UCRT64）。clang 22、lld、nasm、mtools、xorriso、Python、make、QEMU。
-- `tools/limine`：Limine のバイナリー。
+- `tools/limine`：Limine の UEFI 用のバイナリー（`BOOTX64.EFI`、`limine-uefi-cd.bin`）。
 - `tools/mesa-tools`：Mesa の解析器を作り直すときの bison・flex・m4。
 - ホストの LLVM 18.1.8（`C:\Program Files\LLVM\bin`、`NOCTURNE_LLVM_BIN` で変更可）：C++ のアプリと
   WebAssembly の部分に使います。libc++ は llvm-project の `llvmorg-18.1.8` から取り出し
@@ -287,9 +289,8 @@ python -X utf8 scripts/build.py -j 8 cxx                    # Makefile の任意
 - `kernel.elf`：カーネル。
 - `nocturne.img`：GPT の起動ディスク（EFI システムパーティションとドライブ C:。QEMU、USB メモリー）。中身の分だけの
   大きさ（今は約 1 GB）で、C: は最初の起動で書き込んだディスクの最後まで広がります。
-- `nocturne.vhd`：Hyper-V 第 1 世代用の固定長 VHD（イメージと同じ大きさ）。
 - `nocturne.vhdx`：Hyper-V 第 2 世代用の可変長 VHDX（イメージと同じ大きさ）。
-- `nocturne.iso`：BIOS・UEFI 両用のライブ ISO。Limine、カーネル、C:（`boot/c.img`、GPT の無い単独のボリューム）が入り、
+- `nocturne.iso`：UEFI 用のライブ ISO。Limine、カーネル、C:（`boot/c.img`、GPT の無い単独のボリューム）が入り、
   Limine が C: をモジュールとしてメモリーへ読みます。C: への変更は電源を切ると消え、ハイバネーションはできません。
   C: の空きは 256 MiB 以上で、C: の大きさ分（今は 1 GiB）の RAM を使います。全体のビルドで作り、
   `qemu-image` と `run` では作りません。
@@ -428,9 +429,9 @@ Hyper-V にはサウンドカードがないので、拡張セッションが VM
 ネットワークはひとりでに立ち上がります。カーネルの DHCP クライアントが起動時に動くので、`ifconfig` は
 ふつうデスクトップが出て 1、2 秒でアドレスを表示します。
 
-- **QEMU**：既定の e1000 とユーザーモードの NAT がそのまま使えます。`-nic user,model=tulip` で tulip
-  （Hyper-V 第 1 世代のレガシーアダプター）のドライバーを試せます。
-- **Hyper-V**：第 2 世代は合成アダプター（VMBus）、第 1 世代はレガシーアダプターを使います。
+- **QEMU**：e1000（`-netdev user,id=net -device e1000,netdev=net`）とユーザーモードの NAT を使います。
+  `-nic user,model=tulip` で tulip のドライバーを試せます。
+- **Hyper-V**：合成アダプター（VMBus）を使います。
 
 ```
 ping -c 3 example.com
@@ -668,7 +669,7 @@ kernel/src/   arch/（GDT、IDT、APIC、SMP、FPU、PAT、P ステート、Hype
               hv/（VMBus と Hyper-V の装置）、rdp/（拡張セッションの RDP サーバー）
 user/         libc/（web/ はブラウザーのエンジン）、include/、apps/（アプリ、ブラウザーの補助処理、js の .js）
 rootfs/       C: へ入れるファイル（Nocturne\ はシステムの文書・フォント・型定義、Users\ は見本のファイル）
-host/         ホストの道具（store：C: の作成・読み書き・検査、limine：2 GiB を超えるディスクへの Limine の導入の補い）
+host/         ホストの道具（store：C: の作成・読み書き・検査）
 ports/        Nocturne への移植の設定と差分（tcc、go、rust、typescript、lexbor、freetype、ffmpeg、mesa、nvidia、wabt、virgl）
 third_party/  取り込んだソース（下のクレジット）
 scripts/      起動ディスク（mkimage.sh、layout.py）と SDK（mksdk.sh）の作成、test.py、qtest.py、setkey.py、hv-*.ps1

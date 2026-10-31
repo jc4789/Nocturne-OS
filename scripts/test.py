@@ -4,8 +4,9 @@
 The built disk (build/nocturne.img, `make qemu-image`) is one GPT disk: the EFI system partition
 (FAT: Limine and the kernel) and drive C:. The test copies it to build/test.img, checks that the
 copy's kernel and system programs are the current build's, and puts tests/ and an autorun.sh in
-C:\\Tests with build/host/store.exe. The copy is the VM's only disk, on AHCI and without a
-snapshot, 4 GiB larger than the image: C: grows into that on its first start. init runs C:\\Tests\\autorun.sh at boot: it compiles tests/runtests.c with the in-OS tcc
+C:\\Tests with build/host/store.exe. The copy is the VM's only disk, on NVMe (the VM is a q35 booted
+through UEFI, like the real machine) and without a snapshot, 4 GiB larger than the image: C: grows
+into that on its first start. init runs C:\\Tests\\autorun.sh at boot: it compiles tests/runtests.c with the in-OS tcc
 and runs it, then powers off. Results come back over the serial port. Afterwards the host checks
 the volume the OS just wrote to with `store check`, and deletes the copy (it is kept only when the
 check finds problems, for looking into them). For the TCP tests the host also runs a small server
@@ -52,6 +53,7 @@ BUILD = os.path.join(ROOT, "build")
 CORE_BUILD = BUILD  # Generated toolchain inputs stay here when outputs are isolated.
 STORE = os.path.join(CORE_BUILD, "host", "store.exe")
 DISK = os.path.join(BUILD, "test.img")
+VARS = os.path.join(BUILD, "test-vars.fd")  # the UEFI variable store of the run's machine (vm_machine)
 SERIAL = os.path.join(BUILD, "test-serial.log")
 AUDIO = os.path.join(BUILD, "test-audio.wav")
 
@@ -515,25 +517,50 @@ def vm_display(device, resolution):
     return ["-vga", "none", "-device", "%s,xres=%s,yres=%s" % (device, width, height)]
 
 
+def qemu_file(path):
+    """path as the file= of a QEMU drive: absolute, with forward slashes, and a comma doubled"""
+    return os.path.abspath(path).replace("\\", "/").replace(",", ",,")
+
+
+def vm_machine(qemu, vars_path, disk):
+    """The machine both tools boot, the real one's shape: a q35 started through UEFI (edk2: its code,
+    read-only, and a variable store at vars_path, a fresh copy of the empty one the QEMU ships, so
+    every run starts alike) with the disk on NVMe. The firmware is in the QEMU's own share folder:
+    next to the installed QEMU, or in the bundled MSYS2's."""
+    folder = os.path.dirname(os.path.abspath(qemu))
+    for share in (os.path.join(folder, "share"), os.path.join(folder, "..", "share", "qemu")):
+        code, empty = os.path.join(share, "edk2-x86_64-code.fd"), os.path.join(share, "edk2-i386-vars.fd")
+        if os.path.isfile(code) and os.path.isfile(empty):
+            break
+    else:
+        sys.exit("test: the QEMU at %s has no edk2 firmware (edk2-x86_64-code.fd, edk2-i386-vars.fd)" % qemu)
+    shutil.copyfile(empty, vars_path)
+    return ["-M", "q35",
+            "-drive", "if=pflash,format=raw,readonly=on,file=" + qemu_file(code),
+            "-drive", "if=pflash,format=raw,file=" + qemu_file(vars_path),
+            "-drive", "id=boot,file=%s,format=raw,if=none" % qemu_file(disk),
+            "-device", "nvme,serial=nocturne,drive=boot,bootindex=0"]
+
+
 def run_vm(a, tcp_port, web_ports, processes):
     image_hash, payload = prepare_disk(a, tcp_port, web_ports)
     dns_endpoint = "10.0.2.2:%d" % a.dns_port if getattr(a, "dns_port", None) else None
     if os.path.exists(SERIAL):
         os.remove(SERIAL)
-    # The disk on AHCI, like a real machine's SATA; no snapshot: the volume is checked afterwards.
-    cmd = [a.qemu, "-M", "pc", "-m", str(a.memory) + "M", "-smp", str(a.cpus), "-accel", a.accel,
-           "-display", "egl-headless" if a.gpu == "virgl" else "none", *vm_display("VGA", a.resolution), "-no-reboot",
+    # No snapshot: the volume is checked afterwards. The VM shows in a window of its own, as every QEMU
+    # here does (virgl's in a GL one), with the host's CPU under WHPX (the floor is Zen 4).
+    display = ["-display", "sdl,gl=on"] if a.gpu == "virgl" else []
+    cmd = [a.qemu, *vm_machine(a.qemu, VARS, DISK), "-m", str(a.memory) + "M", "-smp", str(a.cpus), "-accel", a.accel,
+           "-cpu", "host" if a.accel == "whpx" else "max", *display, *vm_display("VGA", a.resolution), "-no-reboot",
            "-serial", "file:" + SERIAL,
-           "-device", "ahci,id=ahci", "-drive", "id=boot,file=%s,format=raw,if=none" % DISK,
-           "-device", "ide-hd,drive=boot,bus=ahci.0,bootindex=0",
+           "-netdev", "user,id=net", "-device", "e1000,netdev=net",
            "-audiodev", "wav,id=snd,path=%s,out.frequency=48000,out.buffer-length=20000,in.voices=0" % AUDIO, "-device", "AC97,audiodev=snd"]
     if a.gpu == "virgl":
         cmd += ["-device", "virtio-gpu-gl-pci"]
     if os.path.exists(AUDIO):
         os.remove(AUDIO)
     t0 = time.time()
-    q = subprocess.Popen(cmd, cwd=ROOT, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    q = subprocess.Popen(cmd, cwd=ROOT, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     processes.append(q)
     metadata = {"pid": q.pid, "arguments": cmd, "boot_sha256": image_hash,
                 "boot_source": a.boot_image, "boot_payload_sha256": payload, "user_data_attached": False,
@@ -650,7 +677,7 @@ def run_vm(a, tcp_port, web_ports, processes):
 
 
 def main():
-    global BUILD, DISK, SERIAL, AUDIO
+    global BUILD, DISK, VARS, SERIAL, AUDIO
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--full", action="store_true")
@@ -713,8 +740,9 @@ def main():
             ap.error("--output-dir must be a new directory strictly under build/")
         os.makedirs(output, exist_ok=False)
         BUILD = output
-        DISK, SERIAL, AUDIO = [os.path.join(BUILD, name) for name in ("test.img", "test-serial.log", "test-audio.wav")]
-    overwritten = (DISK, SERIAL, AUDIO, os.path.join(BUILD, "test-metadata.json"))
+        DISK, VARS, SERIAL, AUDIO = [os.path.join(BUILD, name) for name in
+                                     ("test.img", "test-vars.fd", "test-serial.log", "test-audio.wav")]
+    overwritten = (DISK, VARS, SERIAL, AUDIO, os.path.join(BUILD, "test-metadata.json"))
     if os.path.normcase(os.path.realpath(a.boot_image)) in {os.path.normcase(os.path.realpath(p)) for p in overwritten}:
         ap.error("--boot-image must not be a test output path")
     servers, processes = [], []

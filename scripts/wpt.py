@@ -667,15 +667,13 @@ def main():
         prepare_disk(a, test, disk, dns_port, control.getsockname()[1])
         serial = os.path.join(out, "serial.log")
         monitor = free_port()
-        cmd = [test.QEMU, "-M", "pc", "-m", "%dM" % a.memory, "-smp", str(a.cpus), "-accel", a.accel,
-               "-display", "none", *test.vm_display("VGA", a.resolution), "-no-reboot",
+        cmd = [test.QEMU, *test.vm_machine(test.QEMU, os.path.join(BUILD, "wpt", "wpt-vars.fd"), disk),
+               "-m", "%dM" % a.memory, "-smp", str(a.cpus), "-accel", a.accel,
+               "-cpu", "host" if a.accel == "whpx" else "max", *test.vm_display("VGA", a.resolution), "-no-reboot",
                "-serial", "file:" + serial, "-monitor", "tcp:127.0.0.1:%d,server,nowait" % monitor,
-               "-device", "ahci,id=ahci", "-drive", "id=boot,file=%s,format=raw,if=none" % disk,
-               "-device", "ide-hd,drive=boot,bus=ahci.0,bootindex=0",
                "-netdev", "user,id=net", "-device", "e1000,netdev=net",
                "-audiodev", "none,id=snd", "-device", "AC97,audiodev=snd"]
-        q = subprocess.Popen(cmd, cwd=ROOT, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        q = subprocess.Popen(cmd, cwd=ROOT, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with open(os.path.join(out, "run.json"), "w", encoding="utf-8") as f:
             json.dump({"pid": q.pid, "arguments": cmd, "tests": len(tests), "slots": a.slots,
                        "started": time.strftime("%Y-%m-%d %H:%M:%S")}, f, ensure_ascii=False, indent=1)

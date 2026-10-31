@@ -55,13 +55,6 @@ $(BUILD)/host/store.exe: $(STORE_C) $(wildcard common/store/*.h) common/store_fo
 	@$(CC) -O2 -g -std=gnu11 -fno-strict-aliasing -Wall -Wextra -Wno-unused-parameter -municode -Icommon \
 	    $(STORE_C) -o $@
 
-# Limine's installer, built from the source in its release (tools/limine): the release's limine.exe
-# cannot reach past 2 GiB of the boot disk (host/limine/seek64.h)
-$(BUILD)/host/limine.exe: tools/limine/limine.c tools/limine/limine-bios-hdd.h host/limine/seek64.h
-	@mkdir -p $(dir $@)
-	@echo "  CC   $@"
-	@$(CC) -O2 -std=gnu99 -w -include host/limine/seek64.h -Itools/limine $< -o $@
-
 $(BUILD)/k/%.asm.o: %.asm
 	@mkdir -p $(dir $@)
 	@echo "  NASM $<"
@@ -556,21 +549,29 @@ $(BUILD)/sounds.stamp: scripts/mksounds.py
 	@$(PY) scripts/mksounds.py $(BUILD)/sounds
 	@touch $@
 
-# the boot disk, build/nocturne.img, its VHD and VHDX, and the live ISO (scripts/mkimage.sh)
-image: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(BUILD)/host/limine.exe $(DISK_FILES)
+# the boot disk, build/nocturne.img, its VHDX, and the live ISO (scripts/mkimage.sh)
+image: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(DISK_FILES)
 	@bash scripts/mkimage.sh
 
-# the raw QEMU boot disk only, for test iterations (no VHD/VHDX)
-qemu-image: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(BUILD)/host/limine.exe $(DISK_FILES)
+# the raw QEMU boot disk only, for test iterations (no VHDX, no ISO)
+qemu-image: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(DISK_FILES)
 	@bash scripts/mkimage.sh --raw-only
 
 # QEMU on build/run.img, a disk of its own whose C:\Users stays from one run to the next while its
-# system is replaced by the new one (mkimage.sh --run)
-run: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(BUILD)/host/limine.exe $(DISK_FILES)
+# system is replaced by the new one (mkimage.sh --run). The machine is a q35 booted through UEFI
+# (the QEMU's edk2 firmware: its code, and a fresh copy of its empty variable store, build/run-vars.fd,
+# for each start) with the disk on NVMe and the keyboard and the pointer on USB.
+QEMU_SHARE ?= $(shell cygpath -m "$$(dirname "$$(command -v $(QEMU))")/../share/qemu")
+run: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(DISK_FILES)
 	@bash scripts/mkimage.sh --run
-	@$(QEMU) -M pc -m $(QEMU_MEMORY) -smp $(QEMU_CPUS) -accel $(QEMU_ACCEL) $(QEMU_GRAPHICS) \
-		-device ahci,id=ahci -drive id=boot,file=$(BUILD)/run.img,format=raw,if=none \
-		-device ide-hd,drive=boot,bus=ahci.0,bootindex=0 -serial stdio -vga std \
+	@cp -f "$(QEMU_SHARE)/edk2-i386-vars.fd" $(BUILD)/run-vars.fd
+	@$(QEMU) -M q35 -m $(QEMU_MEMORY) -smp $(QEMU_CPUS) -accel $(QEMU_ACCEL) $(QEMU_GRAPHICS) \
+		-drive if=pflash,format=raw,readonly=on,file="$(QEMU_SHARE)/edk2-x86_64-code.fd" \
+		-drive if=pflash,format=raw,file=$(BUILD)/run-vars.fd \
+		-drive id=boot,file=$(BUILD)/run.img,format=raw,if=none \
+		-device nvme,serial=nocturne,drive=boot,bootindex=0 -serial stdio -vga std \
+		-netdev user,id=net -device e1000,netdev=net \
+		-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
 		-audiodev dsound,id=snd -device AC97,audiodev=snd
 
 # the in-OS test suite on its own copy of build/nocturne.img (build/test.img, deleted after its store check;

@@ -27,7 +27,7 @@ general-purpose OS for daily use (see [Limits](#limits)).
 
 ## Highlights
 
-- **Kernel**: boots from BIOS or UEFI through Limine. User threads on several CPUs, the "Kei" (継) fair scheduler,
+- **Kernel**: boots from UEFI through Limine. User threads on several CPUs, the "Kei" (継) fair scheduler,
   W^X memory management and a native system-call ABI.
 - **Desktop**: a compositing window manager in the kernel, with shadows, double buffering, a taskbar, a start menu,
   notifications, a clipboard and a night-sky wallpaper. The default resolution is 1920×1080.
@@ -47,8 +47,8 @@ general-purpose OS for daily use (see [Limits](#limits)).
 
 ### Kernel (`kernel/`, about 43,000 lines of C and assembly)
 
-- **Boot**: Limine (BIOS or UEFI) into a 64-bit higher-half kernel. The boot menu has three entries: the default
-  1920×1080, 1024×768, and text console only (`nogui`).
+- **Boot**: UEFI, then Limine, into a 64-bit higher-half kernel. There is no BIOS boot. The boot menu has two
+  entries, the desktop and text console only (`nogui`); it sets no resolution (the monitor's EDID decides).
 - **CPUs**: up to 16. CPU 0 (the BSP) owns the kernel, interrupts, drivers, the GUI and the network stack; every
   other CPU (AP) runs app threads from its own run queue.
   - The "Kei" scheduler (`sys/kei.c`, `sys/sched.c`): fair selection by weighted virtual time, one queue per AP,
@@ -67,7 +67,7 @@ general-purpose OS for daily use (see [Limits](#limits)).
 - **Drivers**
   - Storage: AHCI (SATA, DMA), ATA (PIO), NVMe, USB mass storage (BOT + SCSI) and Hyper-V SCSI.
   - USB: xHCI, USB 2.0 and SuperSpeed hubs, HID keyboards and mice.
-  - Input: PS/2 keyboard and wheel mouse, Hyper-V synthetic keyboard and absolute mouse, USB HID.
+  - Input: Hyper-V synthetic keyboard and absolute mouse, USB HID.
   - Network: Intel e1000, DEC 21140/21143 (tulip), Hyper-V's synthetic adapter, Realtek RTL8125B (2.5GbE) and
     USB Ethernet (CDC ECM/NCM).
   - Display: the framebuffer Limine hands over. virtio-gpu (virgl) is experimental and off by default (`gpu-enable`).
@@ -172,19 +172,26 @@ powershell -ExecutionPolicy Bypass -File build.ps1 run
 ```
 
 `build.ps1 run` (`make run`) uses 2048 MiB, 4 CPUs and TCG (emulation) by default. Change them with variables,
-for example `make run QEMU_ACCEL=whpx QEMU_MEMORY=4096M`. Sound is an AC'97 card and the network is QEMU's
-default e1000 with user-mode NAT. It boots a disk of its own, `build\run.img`: a copy of `build\nocturne.img` the
+for example `make run QEMU_ACCEL=whpx QEMU_MEMORY=4096M`. The machine is a q35 booted through UEFI, with the
+disk on NVMe and input on USB (xHCI); sound is an AC'97 card and the network is an e1000 with user-mode NAT.
+It boots a disk of its own, `build\run.img`: a copy of `build\nocturne.img` the
 first time, and after that only the system on it is replaced by each new build, so files saved on C: stay (see
 [Drive C: and saving](#drive-c-and-saving)).
 
-The kernel's ATA driver uses PIO, so attach the boot disk to AHCI (DMA). To try the built disk as it is
-(`snapshot=on`: whatever is written to C: is dropped when QEMU stops):
+QEMU's machine has the real one's shape: a q35 booted through UEFI (edk2), the boot disk on NVMe, the keyboard and
+pointer on USB. To try the built disk as it is (`snapshot=on`: whatever is written to C: is dropped when QEMU
+stops). `vars.fd` is a writable copy of `share\edk2-i386-vars.fd` (edk2's empty variable store), made anew for each
+start. To try the SATA path, attach `-device ahci,id=ahci` and `-device ide-hd,drive=boot,bus=ahci.0` in place of NVMe.
 
 ```powershell
-& "C:\Program Files\qemu\qemu-system-x86_64.exe" -M pc -accel whpx -smp 4 -m 4096M -vga std `
-  -device ahci,id=ahci `
+Copy-Item "C:\Program Files\qemu\share\edk2-i386-vars.fd" vars.fd
+& "C:\Program Files\qemu\qemu-system-x86_64.exe" -M q35 -accel whpx -cpu host -smp 4 -m 4096M -vga std `
+  -drive "if=pflash,format=raw,readonly=on,file=C:/Program Files/qemu/share/edk2-x86_64-code.fd" `
+  -drive if=pflash,format=raw,file=vars.fd `
   -drive id=boot,file=build/nocturne.img,format=raw,if=none,snapshot=on `
-  -device ide-hd,drive=boot,bus=ahci.0,bootindex=0 `
+  -device nvme,serial=nocturne,drive=boot,bootindex=0 `
+  -netdev user,id=net -device e1000,netdev=net `
+  -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 `
   -audiodev dsound,id=snd -device AC97,audiodev=snd -serial stdio
 ```
 
@@ -219,7 +226,6 @@ Other options:
 | Command | What it does |
 |---|---|
 | `hyperv.ps1 -Update` | Turn the VM off, put the newly built system (the boot part, `C:\Nocturne` and the bundled apps' folders) on its disk and start it again. The user's files and the apps the user put in `C:\Programs` stay. Rewriting needs free space of twice the disk's size in `hyperv\`. An older VM's data disk (`<Name>-data.vhdx`) is detached and left on the host. |
-| `hyperv.ps1 -Generation 1` | Create a Generation 1 VM instead (see below). |
 | `hyperv.ps1 -Iso` | Boot the live ISO (`build\nocturne.iso`) on the DVD drive instead of the disk. Its C: is in memory, and changes are lost at power-off. Without `-MemoryMB` the VM gets 2048 MB; `-Update -Iso` on an existing VM raises its startup memory if it is less. |
 | `hyperv.ps1 -Remove` | Delete the VM. Its disk stays, with the user's files, and a new VM with the same name takes it up again. `-DeleteDisk` deletes the disk too. |
 | `hyperv.ps1 -NoStart` | Create the VM without starting it. |
@@ -229,10 +235,8 @@ Other options:
 | `hyperv.ps1 -Update -ApiKeyFile KEYFILE` | Write the AI agent's API key to C: on the VM's disk (`-Endpoint` and `-Model` too). |
 
 To create a Gen 2 VM by hand, turn Secure Boot off, attach `build\nocturne.vhdx` as a SCSI disk, and set
-`Set-VM -EnhancedSessionTransportType HvSocket` for the Enhanced Session.
-
-**Generation 1** emulates a legacy PC: the disk is a fixed VHD (`hyperv\<Name>.vhd`, the same format as
-`build\nocturne.vhd`) on IDE 0:0, with a *legacy* network adapter (an emulated DEC 21140). VMConnect shows the basic console only.
+`Set-VM -EnhancedSessionTransportType HvSocket` for the Enhanced Session. Nocturne does not boot on a Generation 1
+VM (`hyperv.ps1` stops when it finds one).
 
 **Tips for VMConnect**
 - In the basic console, click inside the window to capture the mouse. **Ctrl+Alt+Left Arrow** releases it.
@@ -242,8 +246,6 @@ To create a Gen 2 VM by hand, turn Secure Boot off, attach `build\nocturne.vhdx`
   follows the window. The boot menu also has a text-console-only entry.
 - The kernel log goes to COM1. Any named-pipe client, such as PuTTY (Serial, `\\.\pipe\nocturne-com1`), shows it.
   `scripts\hv-serial.ps1` copies it to a file.
-- **Mouse moving up when you move down?** On Gen 1, Hyper-V on Windows 11 hosts reports the emulated PS/2 mouse's
-  vertical axis backwards. Nocturne detects Hyper-V (and the host build) and flips the axis itself.
 
 **Development scripts** (`scripts\`, elevated):
 
@@ -259,7 +261,7 @@ To create a Gen 2 VM by hand, turn Secure Boot off, attach `build\nocturne.vhdx`
 
 ### Real hardware
 
-Write `build\nocturne.img` (a GPT disk that boots from both BIOS and UEFI) to a USB stick, turn Secure Boot off
+Write `build\nocturne.img` (a GPT disk that boots through UEFI) to a USB stick, turn Secure Boot off
 and boot it. On a 12-thread AMD machine (booted from USB, RTL8125B wired LAN, USB keyboard and mouse) it reached
 the desktop and showed a video page in the browser. That was before the single disk with drive C:, which has not
 been tried on real hardware yet. This is still early:
@@ -273,7 +275,7 @@ been tried on real hardware yet. This is still early:
 
 The host is Windows. The toolchain lives in `tools/`, which is not part of the repository (it is in `.gitignore`):
 - `tools/msys64`: MSYS2 (UCRT64) with clang 22, lld, nasm, mtools, xorriso, Python, make and QEMU.
-- `tools/limine`: the Limine binaries.
+- `tools/limine`: the Limine UEFI binaries (`BOOTX64.EFI`, `limine-uefi-cd.bin`).
 - `tools/mesa-tools`: bison, flex and m4, for regenerating Mesa's parsers.
 - Host LLVM 18.1.8 (`C:\Program Files\LLVM\bin`, or set `NOCTURNE_LLVM_BIN`) for C++ apps and the WebAssembly
   parts. libc++ is extracted from llvm-project at `llvmorg-18.1.8` (`NOCTURNE_LLVM_SOURCE`) and cached in `build/cxx`.
@@ -288,9 +290,8 @@ python -X utf8 scripts/build.py -j 8 cxx                    # any Makefile targe
 Outputs in `build\`:
 - `kernel.elf`: the kernel.
 - `nocturne.img`: the raw GPT boot disk, with the EFI system partition and drive C: (QEMU, USB sticks).
-- `nocturne.vhd`: fixed VHD for Hyper-V Generation 1.
 - `nocturne.vhdx`: dynamic VHDX for Hyper-V Generation 2.
-- `nocturne.iso`: a live BIOS/UEFI ISO with Limine, the kernel and C: (`boot/c.img`, a bare volume without a GPT),
+- `nocturne.iso`: a live UEFI ISO with Limine, the kernel and C: (`boot/c.img`, a bare volume without a GPT),
   which Limine loads into memory as a module. Changes to C: are lost at power-off, and it cannot hibernate. C: has
   at least 256 MiB free (about 390 MiB now) and takes its whole size in RAM (about 960 MiB now). The full build makes it; `qemu-image` and
   `run` do not.
@@ -419,9 +420,9 @@ stereo (`nocturne.h`). Scripts can use `beep`, `play` and `volume`.
 The network comes up by itself: a DHCP client runs in the kernel at boot, so `ifconfig` normally shows an address
 a second or two after the desktop appears.
 
-- **QEMU**: the default e1000 card with user-mode NAT works as-is. `-nic user,model=tulip` exercises the tulip
-  driver (Hyper-V Generation 1's legacy adapter).
-- **Hyper-V**: Generation 2 uses the synthetic (VMBus) adapter, Generation 1 a legacy one.
+- **QEMU**: an e1000 card (`-netdev user,id=net -device e1000,netdev=net`) with user-mode NAT. `-nic user,model=tulip`
+  exercises the tulip driver.
+- **Hyper-V**: the synthetic (VMBus) adapter.
 
 ```
 ping -c 3 example.com
@@ -665,7 +666,7 @@ kernel/src/   arch/ (GDT, IDT, APIC, SMP, FPU, PAT, P-states, Hyper-V detection)
               hv/ (VMBus and Hyper-V devices), rdp/ (the Enhanced Session's RDP server)
 user/         libc/ (web/ is the browser engine), include/, apps/ (apps, browser helper processes, js's .js files)
 rootfs/       files put on C: (Nocturne\: the system's documents, fonts and type definitions; Users\: samples)
-host/         host tools (store: makes, reads, writes and checks C:; limine: lets Limine's installer handle disks over 2 GiB)
+host/         host tools (store: makes, reads, writes and checks C:)
 ports/        build settings and patches for ported code (tcc, go, rust, typescript, lexbor, freetype, ffmpeg, mesa, nvidia, wabt, virgl)
 third_party/  vendored sources (see Credits)
 scripts/      boot disk (mkimage.sh, layout.py) and SDK (mksdk.sh) builders, test.py, qtest.py, setkey.py, hv-*.ps1

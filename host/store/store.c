@@ -5,8 +5,7 @@
    own. It is a Windows program: its files, folders and arguments are Windows' own, their names in
    UTF-8 inside as names on the volume are. Over a disk image:
 
-     store disk <image> <MiB> <ESP MiB>      a new GPT disk: BIOS boot, EFI system and Nocturne
-                                             partitions
+     store disk <image> <MiB> <ESP MiB>      a new GPT disk: EFI system and Nocturne partitions
      store esp <image>                       the EFI system partition's byte offset and its
                                              512-byte sectors
      store format <image> <label>            a new empty volume
@@ -772,13 +771,12 @@ static void gpt_name(struct gpt_entry *e, const char *name) {
     for (size_t i = 0; name[i] && i < 36; i++) e->name[i] = (uint8_t)name[i];
 }
 
-static const uint8_t bios_boot_type[16] = {'H', 'a', 'h', '!', 'I', 'd', 'o', 'n', 't', 'N', 'e', 'e', 'd', 'E', 'F', 'I'};
 static const uint8_t esp_type[16] = {0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11,
                                      0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b};
 static const uint8_t store_type[16] = STORE_PARTITION_TYPE;
 
 static int disk_make(const char *path, uint64_t mib, uint64_t esp_mib) {
-    uint64_t sectors = mib * 2048, bios = 2048, esp = 4096, esp_end = esp + esp_mib * 2048;
+    uint64_t sectors = mib * 2048, esp = 2048, esp_end = esp + esp_mib * 2048; /* the ESP at 1 MiB, after the GPT */
     uint64_t store = esp_end, last_usable = sectors - 1 - 1 - GPT_SECTORS;
     if (!esp_mib || store + 64 * 2048 > last_usable) {
         fprintf(stderr, "store: %llu MiB has no room for a %llu MiB EFI system partition and a volume\n",
@@ -794,12 +792,11 @@ static int disk_make(const char *path, uint64_t mib, uint64_t esp_mib) {
                            .count = GPT_ENTRIES, .entry_size = GPT_ENTRY};
     memcpy(h.signature, "EFI PART", 8);
     random_guid(h.disk);
-    struct { const uint8_t *type; uint64_t first, last; const char *name; } part[3] = {
-        {bios_boot_type, bios, esp - 1, "BIOS boot"},
+    struct { const uint8_t *type; uint64_t first, last; const char *name; } part[2] = {
         {esp_type, esp, esp_end - 1, "EFI system"},
         {store_type, store, store_end - 1, "Nocturne"},
     };
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         memcpy(entries[i].type, part[i].type, 16);
         random_guid(entries[i].unique);
         entries[i].first = part[i].first;
