@@ -147,16 +147,15 @@ struct unit {
 static struct unit *units;
 static size_t nunits, units_room;
 static bool np_cache; /* a unit caches not-present entries */
-/* The CPUs are in x2APIC mode: every unit has XTEn and GAEn (2.2.5.3), which select the 128-bit
-   remapping entry with its 32-bit destination, all units using one entry size (2.2.5.2). */
-static bool wide;
+/* The CPUs are in x2APIC mode (arch/apic.c): every unit has XTEn and GAEn (2.2.5.3), which
+   select the 128-bit remapping entry with its 32-bit destination, all units using one entry size
+   (2.2.5.2). */
 static uint64_t devtab, sems; /* device table; one completion word a unit */
 static size_t sem_pages;
 static uint64_t token;
-static int event_vector = -1;
 /* The units and what they read: every unit's command buffer, event log and registers, the
    completion words and token, the device table, the domains' interrupt remapping tables. Every
-   call of the common part (struct iommu_hw) and the event handler (CPU 0) work under it; it is
+   call of the common part (struct iommu_hw) and the event handler work under it; it is
    taken after the common part's locks, and only iommu_fault_report's is taken under it. */
 static struct spinlock amd_lock;
 
@@ -296,43 +295,6 @@ static uint64_t ivhd_features(const uint8_t *s, uint32_t info) {
     memcpy(&r, s + 20, sizeof r);
     return (r & 1 ? EFR_XT : 0) | (r & (1u << 5) ? EFR_IA : 0) | (r & (1u << 6) ? EFR_GA : 0) |
            (uint64_t)(r >> 30) << 10;
-}
-
-/* The next whole IVHD of segment 0 this code reads from *off on, *off then past it; NULL at the
-   end or at a structure that does not fit the table. */
-static const uint8_t *ivhd_next(const struct acpi_sdt *h, uint32_t info, uint32_t *off) {
-    const uint8_t *b = (const uint8_t *)h;
-    while (h->length - *off >= 4) {
-        const uint8_t *s = b + *off;
-        uint16_t len = u16(s + 2);
-        if (len < 4 || len > h->length - *off) return NULL;
-        *off += len;
-        if (ivhd_read(h, s[0], info) && len >= (s[0] == 0x10 ? 24 : 40) && !u16(s + 16)) return s;
-    }
-    return NULL;
-}
-
-/* x2APIC mode needs XTEn and GAEn on every unit (2.2.5.3), so XTSup and GASup where the IVHD read
-   for it reports its features, which supersede the register's (1.3): the probe's test, before
-   the probe, and without the registers (program confirms the enables). A unit this code does
-   not use (another segment, an invalid register address) asks nothing. */
-const char *iommu_amd_x2apic_conflict(void) {
-    const struct acpi_sdt *h = acpi_find("IVRS", 0);
-    if (!h || h->length < 48 || (h->revision != 1 && h->revision != 2)) return NULL;
-    uint32_t info;
-    memcpy(&info, (const uint8_t *)h + 36, sizeof info);
-    const uint8_t *s, *t;
-    for (uint32_t off = 48; (s = ivhd_next(h, info, &off));) {
-        bool superseded = false;
-        for (uint32_t at = 48; !superseded && (t = ivhd_next(h, info, &at));)
-            superseded = t[0] > s[0] && !memcmp(t + 8, s + 8, 8);
-        uint64_t base;
-        memcpy(&base, s + 8, sizeof base);
-        if (superseded || !base || (base & (MMIO_BYTES - 1)) || base > UINT64_MAX - MMIO_BYTES) continue;
-        if ((ivhd_features(s, info) & (EFR_XT | EFR_GA)) != (EFR_XT | EFR_GA))
-            return "an AMD-Vi unit's IVHD does not report x2APIC interrupt remapping (XTSup, GASup)";
-    }
-    return NULL;
 }
 
 static bool parse_ivrs(const struct acpi_sdt *h) {
@@ -569,11 +531,12 @@ static void events_drain(struct unit *u) {
     }
 }
 
-static void event_isr(struct regs *r) {
-    (void)r;
+static enum irq_result event_isr(void *context) {
+    (void)context;
     spin_take(&amd_lock);
     for (size_t i = 0; i < nunits; i++) events_drain(&units[i]);
     spin_give(&amd_lock);
+    return IRQ_HANDLED;
 }
 
 /* Waits until every unit has done every command sent since the last sync: false when one was
@@ -690,9 +653,9 @@ static uint16_t amd_alias(uint16_t id) {
 /* ---- interrupts ----
    A claimed function's message carries its remapping table index in data bits 10:0 and no
    destination: entry n is message n, fixed delivery to a physical APIC id. The entries are the
-   128-bit format with GuestMode 0 (Figure 19), whose destination has 32 bits, with the CPUs in
-   x2APIC mode (wide), else the 32-bit format (Figure 15) with 8. The table is cached: every
-   change is invalidated (2.3.2). */
+   128-bit format with GuestMode 0 (Figure 19), whose destination has 32 bits: the CPUs are in
+   x2APIC mode, which makes the units take that format (XTEn, GAEn: program). The table is
+   cached: every change is invalidated (2.3.2). */
 
 /* A 128-bit entry changes in one store the unit cannot see half done, as one that remaps must
    (2.3.2): cmpxchg16b on the 16-byte aligned entry. */
@@ -709,15 +672,12 @@ static void irte_store(volatile uint64_t *e, uint64_t lo, uint64_t hi) {
 static bool irt_write(struct iommu_domain *dom, unsigned first, unsigned count, uint8_t vector, uint32_t dest,
                       bool on) {
     uint8_t *irt = phys_to_virt(dom->irt);
-    size_t size = wide ? 16 : 4;
+    const size_t size = 16;
     uint64_t f = spin_lock(&amd_lock);
     for (unsigned i = 0; i < count; i++) {
         uint8_t v = (uint8_t)(vector + i);
-        if (wide)
-            irte_store((volatile uint64_t *)(irt + (first + i) * size), on ? 1u | (uint64_t)(dest & 0xFFFFFF) << 8 : 0,
-                       on ? v | (uint64_t)(dest >> 24) << 56 : 0);
-        else
-            ((volatile uint32_t *)irt)[first + i] = on ? 1u | dest << 8 | (uint32_t)v << 16 : 0;
+        irte_store((volatile uint64_t *)(irt + (first + i) * size), on ? 1u | (uint64_t)(dest & 0xFFFFFF) << 8 : 0,
+                   on ? v | (uint64_t)(dest >> 24) << 56 : 0);
     }
     if (!amd.coherent) iommu_cache_flush(irt + first * size, count * size);
     for (unsigned i = 0; i < dom->nids; i++) send(CMD_INV_IRT, dom->ids[i], 0, 0, 0);
@@ -729,7 +689,7 @@ static bool irt_write(struct iommu_domain *dom, unsigned first, unsigned count, 
 static bool amd_msi(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
                     uint32_t *address, uint32_t *data) {
     struct iommu_domain *dom = iommu_domain_of(d);
-    if (dest > 0xFF && !(dom && wide)) return false;
+    if (dest > 0xFF && !dom) return false;
     *address = iommu_msi_plain(dom ? 0 : dest);
     *data = dom ? index : vector;
     if (!dom) return true;
@@ -742,9 +702,10 @@ static bool amd_msi_clear(struct pci_device *d) {
     return !dom || irt_write(dom, 0, 1u << IRT_LOG2, 0, 0, false);
 }
 
-static bool amd_ioapic(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
+/* AMD-Vi remaps no IOAPIC pin here: the entry stays the plain one, its destination of 8 bits. */
+static bool amd_ioapic(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_t *rte) {
     (void)ioapic_id, (void)gsi, (void)rte;
-    return true;
+    return dest <= 0xFF;
 }
 
 /* ---- the units ---- */
@@ -787,7 +748,7 @@ static bool program(struct unit *u) {
     /* the IVHD flags HtTunEn, PassPW, ResPassPW, Isoc and Coherent are the firmware's settings
        for control bits 1, 8, 9, 11 and 10 */
     uint64_t ctl = kept | CTL_IOMMU_EN | CTL_EVENTLOG_EN | CTL_CMDBUF_EN;
-    if (wide) ctl |= CTL_XT_EN | CTL_GA_EN; /* GAMEn 000b: remapping only, no guest APIC */
+    ctl |= CTL_XT_EN | CTL_GA_EN; /* the CPUs' x2APIC mode (2.2.5.3); GAMEn 000b: remapping only */
     if (u->flags & 1) ctl |= 1ull << 1;
     if (u->flags & 2) ctl |= 1ull << 8;
     if (u->flags & 4) ctl |= 1ull << 9;
@@ -797,7 +758,7 @@ static bool program(struct unit *u) {
     wr(u, R_CONTROL, ctl);
     /* the IVHD's XTSup and GASup, which this follows (1.3), confirmed: without the register's,
        XTEn is reserved and GAEn ignored (3.4, offset 0018h) */
-    if (wide && (rd(u, R_CONTROL) & (CTL_XT_EN | CTL_GA_EN)) != (CTL_XT_EN | CTL_GA_EN)) {
+    if ((rd(u, R_CONTROL) & (CTL_XT_EN | CTL_GA_EN)) != (CTL_XT_EN | CTL_GA_EN)) {
         kprintf("iommu: unit at %lx did not take x2APIC interrupt remapping (XTEn, GAEn)\n", u->base);
         return false;
     }
@@ -868,28 +829,28 @@ static void tables_free(void) {
 }
 
 /* One PCI function may represent several units and exposes MSI or MSI-X, not necessarily MSI
-   (3.1, Capability+10h). Initialize its MSI-X table once so later units do not mask earlier
-   entries. Every unit keeps its IVHD event message number (Table 91). */
+   (3.1, Capability+10h): its messages are enabled once, up to the highest event message number
+   (IVHD IOMMU info[4:0], Table 91) of its units, so that each unit's arrives; every message
+   drains every unit. */
 static void event_interrupts_enable(void) {
+    struct irq_spec specs[32]; /* the message number has 5 bits */
+    for (unsigned i = 0; i < 32; i++)
+        specs[i] = (struct irq_spec){.name = "AMD-Vi events", .handler = event_isr, .node = -1};
     for (size_t i = 0; i < nunits; i++) {
         struct pci_device *fn = units[i].fn;
         if (!fn) continue;
         bool seen = false;
+        unsigned top = 0;
         for (size_t j = 0; j < i; j++) seen |= units[j].fn == fn;
         if (seen) continue;
+        for (size_t j = i; j < nunits; j++)
+            if (units[j].fn == fn) top = MAX(top, units[j].msi_num);
         pci_enable_busmaster(fn);
-        if (event_vector < 0) {
-            kprintf("iommu: function %02x:%02x.%u has no event vector\n", fn->bus, fn->dev, fn->func);
-            continue;
-        }
-        unsigned entries = pci_msix_init(fn);
-        bool msi = !entries && pci_msi_enable(fn, (uint8_t)event_vector);
+        unsigned messages = pci_irq_enable(fn, specs, top + 1, NULL);
         for (size_t j = i; j < nunits; j++) {
             struct unit *u = &units[j];
             if (u->fn != fn) continue;
-            u->event_irq = entries ? u->msi_num < entries &&
-                pci_msix_route(fn, u->msi_num, (uint8_t)event_vector, pci_interrupt_dest()) : msi && !u->msi_num;
-            if (u->event_irq && entries) pci_msix_mask(fn, u->msi_num, false);
+            u->event_irq = u->msi_num < messages;
             if (u->event_irq) {
                 uint64_t f = spin_lock(&amd_lock);
                 uint64_t ctl = rd(u, R_CONTROL);
@@ -901,7 +862,6 @@ static void event_interrupts_enable(void) {
                         u->base);
             }
         }
-        if (entries) pci_msix_function_mask(fn, false);
     }
 }
 
@@ -924,8 +884,6 @@ static bool amd_start(bool translate) {
         return false;
     }
     if (!amd.coherent) iommu_cache_flush(phys_to_virt(devtab), DT_BYTES);
-    event_vector = irq_vector_alloc(1, 1);
-    if (event_vector >= 0) vector_register(event_vector, event_isr);
     uint64_t f = spin_lock(&amd_lock);
     for (size_t i = 0; ok && i < nunits; i++) ok = program(&units[i]);
     if (ok) {
@@ -935,8 +893,6 @@ static bool amd_start(bool translate) {
     bool off = ok || units_off();
     spin_unlock(&amd_lock, f);
     if (!ok) {
-        if (event_vector >= 0) irq_vector_free((unsigned)event_vector, 1);
-        event_vector = -1;
         if (off) tables_free(); /* else a unit may still read them: they stay */
         return false;
     }
@@ -1008,7 +964,6 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
     amd.iova_bits = va_width_valid(summary_va) ? summary_va : 64;
     amd.phys_bits = pa_width_valid(summary_pa) ? summary_pa : HOST_PHYS_BITS;
     unsigned max_levels = HOST_MAX_LEVELS;
-    wide = lapic_x2apic();
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
         if (u->hat_dis) {
@@ -1048,9 +1003,9 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
         if (u->mmio_efr && ((u->efr ^ u->mmio_efr) & selected))
             kprintf("iommu: unit at %lx: the IVHD's features (XTSup, GASup, IASup, HATS) differ from its "
                     "register's; the IVHD's are used (1.3)\n", u->base);
-        /* 2.2.5.3: with the CPUs in x2APIC mode every unit must have XTEn and GAEn, whatever it
-           remaps; where the IVHD lacks them, the firmware withdrew them (1.3). */
-        if (wide && (u->efr & (EFR_XT | EFR_GA)) != (EFR_XT | EFR_GA)) {
+        /* 2.2.5.3: with the CPUs in x2APIC mode (always, arch/apic.c) every unit must have XTEn
+           and GAEn, whatever it remaps; where the IVHD lacks them, the firmware withdrew them (1.3). */
+        if ((u->efr & (EFR_XT | EFR_GA)) != (EFR_XT | EFR_GA)) {
             kprintf("iommu: unit at %lx lacks the x2APIC interrupt remapping (XTSup, GASup) the CPUs' x2APIC "
                     "mode requires: AMD-Vi not used\n", u->base);
             goto rejected;

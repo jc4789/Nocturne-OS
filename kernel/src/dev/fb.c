@@ -8,12 +8,10 @@
 #include "mm/vmalloc.h"
 #include "mm/vmm.h"
 #include "sys/clock.h"
-#include "sys/sched.h"
+#include "sys/wait.h"
 #include "vm/vm.h"
 
 struct fb_info fb;
-/* Boot options fbparallel and fbbench: presents are drawn by the idle CPUs as well (present_area). */
-static bool present_parallel;
 
 /* ---- where the screen is drawn ----
    A scanout is memory the display engine shows, in one pixel format. At boot it is the
@@ -102,7 +100,6 @@ void fb_init(struct limine_framebuffer *f) {
     o->native = fb.native;
     fb_monitor(f->edid, f->edid_size);
     fb_set_simulated(cmdline_has("fbsim10"));
-    present_parallel = cmdline_has("fbparallel") || cmdline_has("fbbench");
 }
 
 bool fb_dither_able(void) { return __atomic_load_n(&shown, __ATOMIC_ACQUIRE)->native; }
@@ -191,8 +188,8 @@ static void present_rows(size_t tile, void *context) {
    the hold keeps out. A hold ends when the driver gives it back, or when its claim ends
    (dev/pciuser.c), which stops the device before it gives the holds back; that is also how a
    driver stuck while holding is ended (pciuser.c, boot option fbhold=). A present runs on any CPU
-   (the compositor's thread, the console) while a hold or a change of scanout comes on another
-   (fbparallel tiles join before the present returns): a present counts itself in presenting before
+   (the compositor's thread, the console) while a hold or a change of scanout comes on another:
+   a present counts itself in presenting before
    it looks at hold_count and shown, a hold or a change of scanout changes those before it waits
    for presenting to reach 0 (all four sequentially consistent), so either the present sees the
    change or the change waits for the present. The panic screen is drawn whatever is held, on the
@@ -386,24 +383,8 @@ static void present_area(const struct scanout *out, const uint32_t *src, int src
     if (bottom>(int64_t)out->height) bottom=out->height;
     if (right<=x || bottom<=y) return;
     w=(int)(right-x); h=(int)(bottom-y);
-    /* The tiles run on other CPUs in whatever address space each has, where only the kernel's half
-       is the same: the console's and the compositor's RAM canvases and the scanouts lie there. */
-    /* Real WHPX fbbench measured 2.4x slower with IPI/tile overhead. Keep
-       the known-faster scalar default; explicit fbparallel/fbbench can still
-       exercise the work on other CPUs without claiming a speedup. */
-    if (present_parallel &&
-        (uint64_t)src>=0xffff800000000000ULL && (uint64_t)out->addr>=0xffff800000000000ULL &&
-        (uint64_t)w*h>=65536 && cpu_online_count()>1) {
-        /* The caller's interrupts stay off during a batch (cpu_parallel_for): batches of 128 rows
-           let them in between, the alarms due on this CPU (sys/alarm.h) among them. */
-        for (int first=0;first<h;first+=128) {
-            struct present_job job={out,src,deep,src_pitch,deep_pitch,x,y+first,w,MIN(h-first,128)};
-            cpu_parallel_for(((size_t)job.h+15)/16,present_rows,&job);
-        }
-    } else {
-        struct present_job job={out,src,deep,src_pitch,deep_pitch,x,y,w,h};
-        for (size_t tile=0;tile<((size_t)h+15)/16;tile++) present_rows(tile,&job);
-    }
+    struct present_job job={out,src,deep,src_pitch,deep_pitch,x,y,w,h};
+    for (size_t tile=0;tile<((size_t)h+15)/16;tile++) present_rows(tile,&job);
 }
 
 /* The clock, after the write-combined framebuffer writes before it. */
@@ -416,10 +397,10 @@ void fb_benchmark(const uint32_t *src,int src_pitch) {
     struct present_job job={&scanouts[0],src,NULL,src_pitch,0,0,0,(int)fb.width,(int)fb.height};
     uint64_t start=measured_now();
     for (unsigned n=0;n<3;n++) for (size_t tile=0;tile<(fb.height+15)/16;tile++) present_rows(tile,&job);
-    uint64_t serial=measured_now()-start,jobs=cpu_parallel_jobs();
+    uint64_t serial=measured_now()-start;
     start=measured_now();
     for (unsigned n=0;n<3;n++) fb_present(src,src_pitch,NULL,0,0,0,fb.width,fb.height);
-    uint64_t parallel=measured_now()-start;
+    uint64_t presented=measured_now()-start;
     bool same=true;
     for (unsigned y=0;y<fb.height;y++) {
         volatile uint32_t *row=(volatile uint32_t *)(fb.addr+(uint64_t)y*fb.pitch);
@@ -427,9 +408,9 @@ void fb_benchmark(const uint32_t *src,int src_pitch) {
         for (unsigned x=0;x<fb.width;x++) if (row[x]!=src[(size_t)y*src_pitch+x]) { same=false; break; }
         if (!same) break;
     }
-    kprintf("fbbench: %ux%u rounds=3 CPUs=%u serial_ns=%lu parallel_ns=%lu jobs=%lu max_job_us=%lu pixels=%s\n",
-        fb.width,fb.height,cpu_online_count(),serial,parallel,cpu_parallel_jobs()-jobs,cpu_max_job_us(),same?"PASS":"FAIL");
-    if (!same) panic("fbbench: display pixels differ after SMP presentation");
+    kprintf("fbbench: %ux%u rounds=3 rows_ns=%lu present_ns=%lu pixels=%s\n",
+        fb.width,fb.height,serial,presented,same?"PASS":"FAIL");
+    if (!same) panic("fbbench: display pixels differ after presentation");
 }
 
 /* ---- sleep ----

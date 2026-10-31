@@ -3554,7 +3554,7 @@ new file mode 100644
 index 00000000..5f226169
 --- /dev/null
 +++ b/src/runtime/os_nocturne.go
-@@ -0,0 +1,428 @@
+@@ -0,0 +1,378 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -3601,8 +3601,7 @@ index 00000000..5f226169
 +	_N_DOCUMENT_READ     = 1
 +	_N_CHANNEL_WAIT      = 1
 +
-+	_N_CLOCK_USER_TSC     = 1
-+	_N_CLOCK_HV_REFERENCE = 2
++	_N_CLOCK_USER_TSC = 1
 +)
 +
 +// syscall5 makes Nocturne system call n.
@@ -3625,20 +3624,10 @@ index 00000000..5f226169
 +
 +// struct n_clockinfo
 +type nocturneClockInfo struct {
-+	version, flags  uint32
-+	tscHz           uint64
-+	tscSample       uint64
-+	uptimeMs        uint64
-+	referencePage   uint64
-+	referenceSample uint64 // 100ns units
-+}
-+
-+// struct n_reference_tsc, the Hyper-V reference page
-+type nocturneReferenceTSC struct {
-+	sequence uint32
-+	reserved uint32
-+	scale    uint64
-+	offset   uint64
++	version, flags uint32
++	tscHz          uint64
++	tscSample      uint64
++	uptimeMs       uint64
 +}
 +
 +var nocturneClock nocturneClockInfo
@@ -3650,27 +3639,7 @@ index 00000000..5f226169
 +//go:nosplit
 +func nanotime1() int64 {
 +	c := &nocturneClock
-+	if c.flags&_N_CLOCK_HV_REFERENCE != 0 && c.referencePage != 0 {
-+		p := (*nocturneReferenceTSC)(unsafe.Pointer(uintptr(c.referencePage)))
-+		for attempt := 0; attempt < 4; attempt++ {
-+			sequence := atomic.Load(&p.sequence)
-+			if sequence == 0 {
-+				break
-+			}
-+			tsc := uint64(cputicks())
-+			scale := atomic.Load64(&p.scale)
-+			offset := atomic.Load64(&p.offset)
-+			if sequence != atomic.Load(&p.sequence) {
-+				continue
-+			}
-+			hi, _ := mul64(tsc, scale)
-+			reference := hi + offset
-+			if reference < c.referenceSample {
-+				break
-+			}
-+			return int64(c.uptimeMs)*1e6 + int64(reference-c.referenceSample)*100
-+		}
-+	} else if c.flags&_N_CLOCK_USER_TSC != 0 && c.tscHz >= 1e6 {
++	if c.flags&_N_CLOCK_USER_TSC != 0 && c.tscHz >= 1e6 {
 +		now := uint64(cputicks())
 +		if now >= c.tscSample {
 +			d := now - c.tscSample
@@ -3678,25 +3647,6 @@ index 00000000..5f226169
 +		}
 +	}
 +	return syscall5(_SYS_UPTIME, 0, 0, 0, 0, 0) * 1e6
-+}
-+
-+// mul64 returns the 128-bit product of x and y.
-+//
-+//go:nosplit
-+func mul64(x, y uint64) (hi, lo uint64) {
-+	const mask32 = 1<<32 - 1
-+	x0 := x & mask32
-+	x1 := x >> 32
-+	y0 := y & mask32
-+	y1 := y >> 32
-+	w0 := x0 * y0
-+	t := x1*y0 + w0>>32
-+	w1 := t & mask32
-+	w2 := t >> 32
-+	w1 += x0 * y1
-+	hi = x1*y1 + w2 + w1>>32
-+	lo = x * y
-+	return
 +}
 +
 +//go:nosplit

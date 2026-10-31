@@ -88,8 +88,8 @@ static uint64_t clock_publish(uint64_t *last, uint64_t value) {
                                                            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
     return value < previous ? previous : value;
 }
-/* Microseconds since boot from the Hyper-V reference page or the TSC, without
-   a system call; false when only the kernel can tell. */
+/* Microseconds since boot from the TSC, without a system call; false when only
+   the kernel can tell. */
 static bool user_clock_us(uint64_t *us) {
     if (__atomic_load_n(&clock_initialized, __ATOMIC_ACQUIRE) != 2) {
         unsigned expected = 0;
@@ -97,23 +97,6 @@ static bool user_clock_us(uint64_t *us) {
             return false;
         if (clock_info(&user_clock) < 0) memset(&user_clock, 0, sizeof user_clock);
         __atomic_store_n(&clock_initialized, 2, __ATOMIC_RELEASE);
-    }
-    if ((user_clock.flags & N_CLOCK_HV_REFERENCE) && user_clock.reference_page) {
-        const struct n_reference_tsc *p = (const struct n_reference_tsc *)(uintptr_t)user_clock.reference_page;
-        for (unsigned attempt = 0; attempt < 4; attempt++) {
-            uint32_t sequence = __atomic_load_n(&p->sequence, __ATOMIC_ACQUIRE);
-            if (!sequence) break;
-            uint64_t tsc = user_rdtsc();
-            uint64_t scale = p->scale;
-            int64_t offset = p->offset;
-            __atomic_thread_fence(__ATOMIC_ACQUIRE);
-            if (sequence != __atomic_load_n(&p->sequence, __ATOMIC_ACQUIRE)) continue;
-            uint64_t reference = (uint64_t)(((__uint128_t)tsc * scale) >> 64) + offset;
-            if (reference < user_clock.reference_sample_100ns) break;
-            *us = user_clock.uptime_ms * 1000 + (reference - user_clock.reference_sample_100ns) / 10;
-            return true;
-        }
-        return false;
     }
     if (!(user_clock.flags & N_CLOCK_USER_TSC) || user_clock.tsc_hz < 1000000) return false;
     uint64_t now = user_rdtsc();

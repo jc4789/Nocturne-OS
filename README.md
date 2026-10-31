@@ -49,13 +49,18 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
 
 - **起動**：UEFI から Limine を経て、上位半分の 64 ビットカーネルへ。BIOS 起動はありません。起動メニューには
   デスクトップと文字コンソールだけ（`nogui`）の 2 項目があり、解像度は持ちません（モニターの EDID が決めます）。
-- **CPU**：最大 16 CPU。CPU 0（BSP）がカーネル、割り込み、ドライバー、GUI、ネットワークを持ち、
-  ほかの CPU（AP）はそれぞれ自分の実行キューでアプリのスレッドを動かします。
-  - スケジューラー「継」（`sys/kei.c`、`sys/sched.c`）：重み付きの仮想時間による公平な選択、
-    AP ごとのキュー、空いた AP によるスレッドの取得、切替えの費用を考えた保持。
+- **CPU**：CPU の数は機械が持つだけで、上限の定数はありません。どの CPU も同じ役目で、自分の実行キューと
+  idle を持ち、システムコール・例外・割り込みは起きた CPU で処理します。下限は Zen 4（x2APIC、PCID、AVX-512 など）。
+  - スケジューラー（`sys/sched.c`）：CPU ごとのキュー。級は二つで、実時間（固定の優先度、周期ごとの予算）と
+    公平（EEVDF：仮想時間・lag・締め切り）。核も横取りされます。起こしは前の CPU のキャッシュの空いた CPU へ、
+    空いた CPU は近い階層（SMT の兄弟・キャッシュ・node・全体）から引き、忙しい CPU は slice の終わりに渡します。
+  - 割り込み：x2APIC だけ。vector の表は CPU ごとにあり、装置の割り込みはその装置の NUMA node の CPU へ配ります。
   - IPI による TLB の撃ち落とし、PCID、XSAVE による AVX 状態の保存、
-    実機での CPPC・HWP による最高性能の設定、サンプリングによるプロファイラー（`prof`）。
-  - 時計は 1 kHz のローカル APIC タイマー（周波数は PIT で測ります）。刻みは TSC から求めます（Hyper-V では参照時計）。
+    実機での CPPC による性能の要求、サンプリングによるプロファイラー（`prof`）。
+  - 時計：TSC だけ（実機では不変 TSC が要件）。速さは起動の瞬間から、実機では P0 の P-state の名目の値
+    （PStateDef の FID と DID）、VM では hypervisor が伝える値。実機では HPET と倍になる窓で比べ続けて直し
+    （spread spectrum などの外れ）、HPET が無ければ名目のままです。壁の時計は RTC の秒の境から合わせます。
+    周期の拍は無く、各 CPU の LAPIC タイマーが次の期限に一度だけ割り込みます。
 - **メモリー**：4 段のページング、アプリごとのアドレス空間、カーネルヒープ。
   - W^X：書込み可能かつ実行可能なページは作りません。生成したコードは書いてから実行可能へ切り替えます。
   - ネイティブのメモリー API（`n_memory_reserve`・`protect`・`release`）と共有ページ。
@@ -67,7 +72,6 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
 - **ドライバー（実機）**
   - 記憶装置：AHCI（SATA、DMA）、NVMe、USB 大容量記憶装置（BOT＋SCSI）。
   - USB：xHCI、USB 2.0 と SuperSpeed のハブ、HID のキーボード・マウス。
-  - 入力：PS/2 のキーボードとホイールマウス、USB HID。
   - ネットワーク：Realtek RTL8125B（2.5GbE）、USB Ethernet（CDC ECM／NCM）。
   - 画面：Limine が渡すフレームバッファー。NVIDIA の GPU（確かめたのは RTX 4070）は nvrm（NVIDIA の RM 615.78.08 の
     移植、[ports/nvidia](ports/nvidia/README.md)）がモード設定・垂直帰線・リフレッシュの変更を受け持ち、WebGL は Zink と NVK で
@@ -77,7 +81,7 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
 - **仮想マシンだけのもの（`kernel/src/vm/`）**：実機の処理とは分けてあり、カーネルは `vm/vm.h` の入口からだけ
   呼びます。起動時に CPUID とファームウェアで VM かどうかを見分け、実機では入口がすぐ戻るので、エミュレーターの
   ポートや装置には触れません。
-  - Hyper-V：参照時計、VMBus と合成デバイス（SCSI、キーボード・絶対座標マウス、ネットワーク）、
+  - Hyper-V：TSC の速さ（hypervisor が伝える値）、VMBus と合成デバイス（SCSI、キーボード・絶対座標マウス、ネットワーク）、
     ハートビート、Hyper-V マネージャーからの終了と再起動、時刻の同期、KVP（VM の IP アドレスと OS を表示）、
     Hyper-V ソケット、その上の拡張セッション用 RDP サーバーと音声送信。
   - エミュレーターの装置：ATA（PIO）、Intel e1000、DEC 21140／21143（tulip）、Intel AC'97、Bochs VBE
@@ -688,7 +692,6 @@ hyperv.ps1    Hyper-V の VM の作成
 - [BearSSL](https://bearssl.org/) TLS（MIT）。
 - [TinyCC](https://bellard.org/tcc/) 0.9.28rc C コンパイラー（LGPL-2.1、ソースは `third_party/tinycc`）。
 - Mozilla の CA 証明書（[curl](https://curl.se/docs/caextract.html) 経由、MPL-2.0）。
-- スケジューラー「継」の選択核 kei_sched（MIT、`kernel/src/sys/kei.c`）。
 - NVIDIA の [open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules) 615.78.08 の RM と NVKMS
   （MIT ほか、`third_party/nvidia-open/NOTICES`）。
 - RTL8125B ドライバー（`kernel/src/net/rtl8125.c`）のレジスターと初期化の手順は Realtek の FreeBSD 用ドライバー

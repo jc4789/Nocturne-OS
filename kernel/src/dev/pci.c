@@ -1,6 +1,7 @@
 /* PCI configuration space access (mechanism #1 and PCIe ECAM) and bus enumeration. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/irq.h"
 #include "arch/spin.h"
 #include "dev/pci.h"
 #include "dev/acpi.h"
@@ -9,7 +10,8 @@
 #include "mm/heap.h"
 #include "mm/vmm.h"
 #include "sys/clock.h"
-#include "sys/sched.h"
+#include "sys/thread.h"
+#include "sys/wait.h"
 
 /* ---- ECAM (MCFG) ----
    Only segment 0 is used (struct pci_device has no segment). A function's 4 KiB config page is mapped
@@ -22,10 +24,6 @@ static bool ecam_off;
 /* One bit per bus/dev/func, set once its page is mapped, from any CPU. Two CPUs that find it clear
    at once both map it, the same way (vmm_map_mmio), and one of them sets it. */
 static uint8_t ecam_active[65536 / 8];
-
-/* CPU 0's APIC ID, where device interrupts are handled: read by pci_init, which runs there (the
-   boot task, kmain_late), before any driver turns an interrupt on. */
-static uint32_t interrupt_dest;
 
 static volatile uint32_t *ecam_regs(uint8_t bus, uint8_t dev, uint8_t func, bool map) {
     if (ecam_off) return NULL;
@@ -197,7 +195,6 @@ static void pcie_identify(struct pci_device *d) {
 
 void pci_init(void) {
     uint64_t since = clock_now_ns(); /* the platform reset was before the firmware ran */
-    interrupt_dest = lapic_current_id();
     const struct acpi_sdt *mcfg = acpi_find("MCFG", 0);
     if (mcfg && mcfg->length >= ACPI_MCFG_ENTRIES) {
         ecam = (const struct acpi_mcfg_entry *)((const uint8_t *)mcfg + ACPI_MCFG_ENTRIES);
@@ -390,120 +387,187 @@ unsigned pci_msi_max_vectors(const struct pci_device *d) {
     return 1u << ((pci_read32(d->bus, d->dev, d->func, cap) >> 17) & 7);
 }
 
-bool pci_msi_enable_multi(struct pci_device *d, uint8_t base_vector, unsigned count, uint32_t dest_apic_id) {
-    if (!lapic_present()) return false;
-    uint8_t cap = pci_find_cap(d, 0x05);
-    if (!cap || !count || count > 32 || (count & (count - 1)) || (base_vector & (count - 1))) return false;
-    uint32_t h = pci_read32(d->bus, d->dev, d->func, cap);
-    uint16_t ctl = h >> 16;
-    if (count > (1u << ((ctl >> 1) & 7))) return false;
+unsigned pci_msix_max_vectors(const struct pci_device *d) {
+    uint8_t cap = pci_find_cap(d, 0x11);
+    return cap ? ((pci_read32(d->bus, d->dev, d->func, cap) >> 16) & 0x7FF) + 1 : 0;
+}
+
+/* The MSI capability's registers (PCI Local Bus 3.0, 6.8.1): the message control word at +2, the
+   data at +8, or +0xC with a 64-bit address, the mask bits after the data. */
+#define MSI_CTL_ENABLE  0x0001u
+#define MSI_CTL_64BIT   0x0080u
+#define MSI_CTL_MASKING 0x0100u
+static uint8_t msi_data_at(uint8_t cap, uint16_t ctl) { return cap + (ctl & MSI_CTL_64BIT ? 0x0C : 0x08); }
+
+/* Address and data for count messages from irq's (iommu_msi_message), with MSI off or the
+   messages masked: none goes half old, half new. */
+static bool msi_write(struct pci_device *d, uint8_t cap, unsigned count, const struct irq *irq) {
+    uint16_t ctl = pci_read16(d->bus, d->dev, d->func, cap + 2);
     uint32_t address, message;
-    if (!iommu_msi_message(d, 0, count, base_vector, dest_apic_id, &address, &message)) return false;
-    bool wide = ctl & 0x80;
-    /* off while address and data change (firmware may have left it on): no message half old, half new */
-    if (ctl & 1) pci_write16(d->bus, d->dev, d->func, cap + 2, ctl & ~1u);
+    if (!iommu_msi_message(d, 0, count, irq, &address, &message)) return false;
     pci_write32(d->bus, d->dev, d->func, cap + 4, address);
-    if (wide) pci_write32(d->bus, d->dev, d->func, cap + 8, 0);
-    uint8_t data_off = cap + (wide ? 0x0C : 0x08);
-    uint32_t data = pci_read32(d->bus, d->dev, d->func, data_off);
-    pci_write32(d->bus, d->dev, d->func, data_off, (data & 0xFFFF0000u) | message);
-    if (ctl & 0x100) pci_write32(d->bus, d->dev, d->func, data_off + 4, 0); /* per-vector masking: all open */
-    uint8_t msix = pci_find_cap(d, 0x11); /* never both: firmware may have left MSI-X on */
-    if (msix) {
-        uint32_t xh = pci_read32(d->bus, d->dev, d->func, msix);
-        pci_write32(d->bus, d->dev, d->func, msix, xh & ~0x80000000u);
-    }
-    unsigned log2 = __builtin_ctz(count);
-    ctl = (ctl & ~0x70u) | (uint16_t)(log2 << 4) | 1; /* `count` messages, enabled */
-    pci_write16(d->bus, d->dev, d->func, cap + 2, ctl);
-    intx_disable(d);
-    d->msi_given = (struct pci_msi_given){dest_apic_id, base_vector, (uint8_t)count};
+    if (ctl & MSI_CTL_64BIT) pci_write32(d->bus, d->dev, d->func, cap + 8, 0);
+    uint8_t at = msi_data_at(cap, ctl);
+    uint32_t data = pci_read32(d->bus, d->dev, d->func, at);
+    pci_write32(d->bus, d->dev, d->func, at, (data & 0xFFFF0000u) | message);
     return true;
 }
 
-unsigned pci_msix_init(struct pci_device *d) {
-    uint8_t cap = pci_find_cap(d, 0x11);
-    if (!cap) return 0;
-    uint32_t h = pci_read32(d->bus, d->dev, d->func, cap);
-    uint32_t table = pci_read32(d->bus, d->dev, d->func, cap + 4);
-    uint64_t base = pci_bar_address(d, table & 7);
-    unsigned entries = ((h >> 16) & 0x7FF) + 1;
-    if (!base) return 0;
-    if (!d->msix_table && !(d->msix_table = vmm_map_mmio(base + (table & ~7u), entries * 16))) return 0;
-    if (!d->msix_given && !(d->msix_given = kzalloc(entries * sizeof *d->msix_given))) return 0;
-    d->msix_entries = entries;
-    uint8_t msi = pci_find_cap(d, 0x05); /* never both */
-    if (msi) {
-        uint32_t mh = pci_read32(d->bus, d->dev, d->func, msi);
-        pci_write32(d->bus, d->dev, d->func, msi, mh & ~0x00010000u);
-    }
-    /* enable with the whole function masked while the entries are written */
-    pci_write32(d->bus, d->dev, d->func, cap, (h & 0x3FFFFFFF) | 0xC0000000u);
-    for (unsigned i = 0; i < entries; i++) {
-        volatile uint32_t *vc = d->msix_table + i * 4 + 3;
-        mmio_write32(vc, mmio_read32(vc) | 1);
-    }
-    intx_disable(d);
-    return entries;
-}
-
-bool pci_msix_route(struct pci_device *d, unsigned entry, uint8_t vector, uint32_t dest_apic_id) {
-    if (!lapic_present() || !d->msix_table || entry >= d->msix_entries) return false;
+/* An MSI-X entry's message for irq, written with the entry masked (6.8.3.5: an unmasked entry
+   that changes gives undefined results), its mask then as it was. */
+static bool msix_write(struct pci_device *d, unsigned entry, const struct irq *irq) {
     volatile uint32_t *t = d->msix_table + entry * 4;
     uint32_t vc = mmio_read32(t + 3);
-    mmio_write32(t + 3, vc | 1); /* entry masked while its address/data change */
+    mmio_write32(t + 3, vc | 1);
     uint32_t address, data;
-    bool ok = iommu_msi_message(d, entry, 1, vector, dest_apic_id, &address, &data);
+    bool ok = iommu_msi_message(d, entry, 1, irq, &address, &data);
     if (ok) {
         mmio_write32(t, address);
         mmio_write32(t + 1, 0);
         mmio_write32(t + 2, data);
-        d->msix_given[entry] = (struct pci_msi_given){dest_apic_id, vector, 1};
     }
     mmio_write32(t + 3, vc);
     return ok;
 }
 
-void pci_msix_mask(struct pci_device *d, unsigned entry, bool masked) {
-    if (!d->msix_table || entry >= d->msix_entries) return;
-    volatile uint32_t *t = d->msix_table + entry * 4;
-    uint32_t vc = mmio_read32(t + 3);
-    mmio_write32(t + 3, masked ? vc | 1 : vc & ~1u);
-    (void)mmio_read32(t + 3); /* read back: the unmask must reach the device before the caller proceeds */
+/* irq_set_cpu's (arch/irq.h): the message delivering irq written again for its new target, a
+   single MSI message masked by its mask bit meanwhile (pci_irq_enable registers no other). */
+static bool message_rewrite(struct irq *irq, void *writer) {
+    struct pci_device *d = writer;
+    if (!d->msi_count) {
+        for (unsigned i = 0; i < d->msix_entries; i++)
+            if (d->msix_irqs[i] == irq) return msix_write(d, i, irq);
+        return false;
+    }
+    uint8_t cap = pci_find_cap(d, 0x05);
+    uint8_t mask_at = msi_data_at(cap, pci_read16(d->bus, d->dev, d->func, cap + 2)) + 4;
+    uint32_t mask = pci_read32(d->bus, d->dev, d->func, mask_at);
+    pci_write32(d->bus, d->dev, d->func, mask_at, mask | 1);
+    bool ok = msi_write(d, cap, 1, irq);
+    pci_write32(d->bus, d->dev, d->func, mask_at, mask);
+    return ok;
 }
 
-void pci_msix_function_mask(struct pci_device *d, bool masked) {
-    uint8_t cap = pci_find_cap(d, 0x11);
-    if (!cap) return;
+/* The MSI-X table mapped and the record of its entries' irqs, once per function. */
+static bool msix_map(struct pci_device *d, uint8_t cap) {
+    unsigned entries = pci_msix_max_vectors(d);
+    if (!d->msix_table) {
+        uint32_t table = pci_read32(d->bus, d->dev, d->func, cap + 4);
+        uint64_t base = pci_bar_address(d, table & 7);
+        if (!base || !(d->msix_table = vmm_map_mmio(base + (table & ~7u), entries * 16))) return false;
+    }
+    if (!d->msix_irqs && !(d->msix_irqs = kzalloc(entries * sizeof *d->msix_irqs))) return false;
+    d->msix_entries = entries;
+    return true;
+}
+
+static unsigned msix_enable(struct pci_device *d, uint8_t cap, uint8_t msi, const struct irq_spec *specs,
+                            unsigned count) {
+    if (!msix_map(d, cap)) return 0;
+    unsigned n = 0;
+    for (count = MIN(count, d->msix_entries); n < count; n++)
+        if (!(d->msix_irqs[n] = irq_request_msi(&specs[n], IRQ_CPU_ANY))) break;
+    if (!n) return 0;
+    if (msi) /* never both: firmware may have left MSI on */
+        pci_write32(d->bus, d->dev, d->func, msi,
+                    pci_read32(d->bus, d->dev, d->func, msi) & ~((uint32_t)MSI_CTL_ENABLE << 16));
+    /* enabled with the whole function masked, and every entry, while the entries are written */
     uint32_t h = pci_read32(d->bus, d->dev, d->func, cap);
-    pci_write32(d->bus, d->dev, d->func, cap, masked ? h | 0x40000000u : h & ~0x40000000u);
+    pci_write32(d->bus, d->dev, d->func, cap, (h & 0x3FFFFFFF) | 0xC0000000u);
+    for (unsigned i = 0; i < d->msix_entries; i++) {
+        volatile uint32_t *vc = d->msix_table + i * 4 + 3;
+        mmio_write32(vc, mmio_read32(vc) | 1);
+    }
+    intx_disable(d);
+    unsigned written = 0;
+    while (written < n && msix_write(d, written, d->msix_irqs[written])) written++;
+    for (unsigned i = written; i < n; i++) { /* masked: nothing comes */
+        irq_free(d->msix_irqs[i]);
+        d->msix_irqs[i] = NULL;
+    }
+    if (!written) {
+        pci_write32(d->bus, d->dev, d->func, cap, h & 0x3FFFFFFF);
+        return 0;
+    }
+    for (unsigned i = 0; i < written; i++) {
+        volatile uint32_t *vc = d->msix_table + i * 4 + 3;
+        mmio_write32(vc, mmio_read32(vc) & ~1u);
+        irq_msi_writer(d->msix_irqs[i], message_rewrite, d);
+    }
+    (void)mmio_read32(d->msix_table + 3); /* the unmasks reach the function before its mask drops */
+    pci_write32(d->bus, d->dev, d->func, cap, (h & 0x3FFFFFFF) | 0x80000000u);
+    return written;
 }
 
-bool pci_msi_disable(struct pci_device *d) {
+static unsigned msi_enable(struct pci_device *d, uint8_t cap, uint8_t msix, const struct irq_spec *specs,
+                           unsigned count) {
+    struct irq *got[32]; /* MSI's most (6.8.1.3) */
+    unsigned n = pci_msi_max_vectors(d);
+    while (n > count) n /= 2;
+    for (; n; n /= 2)
+        if (irq_request_msi_block(specs, n, IRQ_CPU_ANY, got)) break;
+    if (!n || !(d->msi_irqs = kmalloc(n * sizeof *d->msi_irqs))) {
+        for (unsigned i = 0; i < n; i++) irq_free(got[i]);
+        return 0;
+    }
+    uint16_t ctl = pci_read16(d->bus, d->dev, d->func, cap + 2);
+    /* off while address and data change (firmware may have left it on) */
+    if (ctl & MSI_CTL_ENABLE) pci_write16(d->bus, d->dev, d->func, cap + 2, ctl & ~MSI_CTL_ENABLE);
+    if (!msi_write(d, cap, n, got[0])) {
+        for (unsigned i = 0; i < n; i++) irq_free(got[i]);
+        kfree(d->msi_irqs);
+        d->msi_irqs = NULL;
+        return 0;
+    }
+    if (ctl & MSI_CTL_MASKING) pci_write32(d->bus, d->dev, d->func, msi_data_at(cap, ctl) + 4, 0); /* all open */
+    if (msix) /* never both: firmware may have left MSI-X on */
+        pci_write32(d->bus, d->dev, d->func, msix, pci_read32(d->bus, d->dev, d->func, msix) & ~0x80000000u);
+    ctl = (ctl & ~0x70u) | (uint16_t)(__builtin_ctz(n) << 4) | MSI_CTL_ENABLE; /* n messages, enabled */
+    pci_write16(d->bus, d->dev, d->func, cap + 2, ctl);
+    intx_disable(d);
+    for (unsigned i = 0; i < n; i++) d->msi_irqs[i] = got[i];
+    d->msi_count = (uint8_t)n;
+    if (n == 1 && (ctl & MSI_CTL_MASKING)) irq_msi_writer(got[0], message_rewrite, d);
+    return n;
+}
+
+unsigned pci_irq_enable(struct pci_device *d, const struct irq_spec *specs, unsigned count, struct irq **irqs) {
+    uint8_t msi = pci_find_cap(d, 0x05), msix = pci_find_cap(d, 0x11);
+    if (!count || d->msi_count || (d->msix_irqs && d->msix_irqs[0])) return 0; /* pci_irq_disable first */
+    unsigned n = msix ? msix_enable(d, msix, msi, specs, count) : msi ? msi_enable(d, msi, msix, specs, count) : 0;
+    for (unsigned i = 0; irqs && i < n; i++) irqs[i] = msix ? d->msix_irqs[i] : d->msi_irqs[i];
+    return n;
+}
+
+bool pci_irq_disable(struct pci_device *d) {
+    /* first no move writes a message, or a remapping entry, again */
+    unsigned held = 0;
+    for (unsigned i = 0; i < d->msi_count; i++, held++) irq_msi_writer(d->msi_irqs[i], NULL, NULL);
+    for (unsigned i = 0; d->msix_irqs && i < d->msix_entries; i++)
+        if (d->msix_irqs[i]) irq_msi_writer(d->msix_irqs[i], NULL, NULL), held++;
     uint8_t cap = pci_find_cap(d, 0x05), msix = pci_find_cap(d, 0x11);
-    if (cap) pci_write32(d->bus, d->dev, d->func, cap, pci_read32(d->bus, d->dev, d->func, cap) & ~0x00010000u);
+    if (cap) pci_write32(d->bus, d->dev, d->func, cap,
+                         pci_read32(d->bus, d->dev, d->func, cap) & ~((uint32_t)MSI_CTL_ENABLE << 16));
     if (msix) pci_write32(d->bus, d->dev, d->func, msix,
                           pci_read32(d->bus, d->dev, d->func, msix) & ~0x80000000u);
-    /* A stale Enable must not be saved and replayed by a later FLR, nor may its vector
-       be recycled merely because interrupt-table invalidation completed. */
-    bool off = (!cap || !(pci_read32(d->bus, d->dev, d->func, cap) & 0x00010000u)) &&
+    /* A stale Enable must not be saved and replayed by a later FLR, nor may its vectors
+       be given again merely because interrupt-table invalidation completed. */
+    bool off = (!cap || !(pci_read32(d->bus, d->dev, d->func, cap) & ((uint32_t)MSI_CTL_ENABLE << 16))) &&
                (!msix || !(pci_read32(d->bus, d->dev, d->func, msix) & 0x80000000u));
-    bool cleared = iommu_msi_clear(d); /* still revoke its remapping entry when a device refuses */
-    return off && cleared;
-}
-
-uint32_t pci_interrupt_dest(void) { return interrupt_dest; }
-
-bool pci_msi_enable(struct pci_device *d, uint8_t vector) {
-    if (!lapic_present()) return false;
-    uint32_t dest = interrupt_dest;
-    if (dest > 0xFF) return false; /* not addressable by an MSI message; leave the device untouched */
-    if (pci_find_cap(d, 0x05)) return pci_msi_enable_multi(d, vector, 1, dest);
-    if (!pci_msix_init(d)) return false;
-    if (!pci_msix_route(d, 0, vector, dest)) return false;
-    pci_msix_mask(d, 0, false);
-    pci_msix_function_mask(d, false);
-    return true;
+    bool cleared = iommu_msi_clear(d); /* still revoke its remapping entries when a device refuses */
+    bool done = off && cleared;
+    if (!done && held)
+        kprintf("pci: %02x:%02x.%u: its interrupt vectors stay out of use\n", d->bus, d->dev, d->func);
+    for (unsigned i = 0; i < d->msi_count; i++)
+        if (done) irq_free(d->msi_irqs[i]);
+    for (unsigned i = 0; d->msix_irqs && i < d->msix_entries; i++) {
+        if (done && d->msix_irqs[i]) irq_free(d->msix_irqs[i]);
+        d->msix_irqs[i] = NULL;
+    }
+    kfree(d->msi_irqs);
+    d->msi_irqs = NULL;
+    d->msi_count = 0;
+    return done;
 }
 
 /* ---- a function's configuration, kept across a reset ----
@@ -787,16 +851,16 @@ static void reset_initializing(struct pci_reset *r, uint32_t id) {
     spin_unlock(&reset_lock, f);
 }
 
-/* A sleep of the attempt until deadline: false, without waiting, once its task is killed. A kill
-   during the sleep wakes it, and one that came just before it ends it within KILLED_NAP_NS
-   (sys/sched.c): the caller looks at reset_cancelled again either way. */
+static bool reset_cancelled(void) { return thread_current() && thread_current()->killed; }
+
+/* A sleep of the attempt until deadline: false, without waiting, once its thread is killed. A
+   kill during the sleep ends it, and so does one that came just before it (sys/wait.h): the
+   caller looks at reset_cancelled again either way. */
 static bool reset_wait(uint64_t deadline) {
-    if (current_task && current_task->killed) return false;
+    if (reset_cancelled()) return false;
     sleep_until(deadline);
     return true;
 }
-
-static bool reset_cancelled(void) { return current_task && current_task->killed; }
 
 /* The links whose device got a Common Clock Configuration back (state_restore) retrained by their
    Downstream Port, as 7.5.3.7 has software do once the bit changed. A retrain asked while the
@@ -1276,11 +1340,10 @@ static void state_remake(struct pci_device *d, struct pci_saved *s) {
     uint32_t address, data;
     bool off = false;
     if (d->iommu_blocked) s->hdr[1] &= ~(uint32_t)PCI_COMMAND_MASTER;
-    const struct pci_msi_given *g = &d->msi_given;
-    if (s->msi && g->vector) {
-        bool wide = (s->msi_regs[0] >> 16) & 0x80;
+    if (s->msi && d->msi_count) {
+        bool wide = (s->msi_regs[0] >> 16) & MSI_CTL_64BIT;
         uint32_t *at = &s->msi_regs[wide ? 3 : 2];
-        if (iommu_msi_message(d, 0, g->count, g->vector, g->dest, &address, &data)) {
+        if (iommu_msi_message(d, 0, d->msi_count, d->msi_irqs[0], &address, &data)) {
             s->msi_regs[1] = address;
             if (wide) s->msi_regs[2] = 0;
             *at = (*at & 0xFFFF0000u) | data;
@@ -1291,9 +1354,8 @@ static void state_remake(struct pci_device *d, struct pci_saved *s) {
     }
     for (unsigned i = 0; s->msix && s->msix_table && i < d->msix_entries; i++) {
         uint32_t *e = s->msix_table + i * 4;
-        g = &d->msix_given[i];
-        if (!g->vector) continue;
-        if (iommu_msi_message(d, i, 1, g->vector, g->dest, &address, &data)) {
+        if (!d->msix_irqs[i]) continue;
+        if (iommu_msi_message(d, i, 1, d->msix_irqs[i], &address, &data)) {
             e[0] = address;
             e[1] = 0;
             e[2] = data;

@@ -1,6 +1,6 @@
 #pragma once
 #include "kernel.h"
-#include "sys/sched.h"
+#include "sys/wait.h"
 
 /* Sound. An app's audio handle is a stream of 48 kHz stereo frames (two signed 16-bit
    little-endian samples, left first); a submit waits while the stream's buffer is full. The

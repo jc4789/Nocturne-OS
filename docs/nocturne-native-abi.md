@@ -237,7 +237,7 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   `sender_app` はカーネルが実送信時に記録する `n_app_self()` と同じ識別子で、
   endpoint の作成者・接続者の固定値でも、本文で申告された番号でもない。
   同じアプリの全 thread と別接続で一致し、endpoint を起動先へ引き渡すと起動先の主体になる。
-  識別子は再利用せず、送信者終了後の待ちメッセージにも値を保持する。
+  識別子は 2^31 個を配り終えるまで再利用せず、送信者終了後の待ちメッセージにも値を保持する。
   `message` は必須。`PEEK` は主体を調べられるが添付を取り出さず、`DISCARD` は添付を閉じる。
   両者の `attached` は -1。旧 receive の番号と形式は変えない。
   添付の設置失敗や出力先の失効は負の結果を返し、設置済み添付も回収する。
@@ -257,8 +257,14 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   `INTERRUPTS=3`）、Ctrl+C ごとにメッセージを一つ送る。シェルは前面のジョブを
   `n_app_stop(h, N_APP_STOP_TREE)` で止め、プロンプトでは入力中の行を取り消す。
   シグナルは無い。
-- システムログ：`n_system_log_open()` は、送ったメッセージがシステムログ（とシリアル
-  ポート、デスクトップが無いときのテキストコンソール）へ加わるハンドルを返す。`n_system_log(buf, cap)` は最新のログを読む。
+- システムログ：`n_system_log_open()` は、送ったメッセージがシステムログ（カーネルの記録の輪。
+  シリアルポートと、デスクトップが画面を取るまでの起動の画面が読む）へ加わるハンドルを返す。
+  同じハンドルを `n_channel_receive` で読むと、ログの文字が来る：ハンドルごとに読んだ所を持ち、
+  最初の受け取りの時に輪が持つ一番古い記録から始まる。各行の頭は `[秒.マイクロ秒 CPU:task] `
+  （重さが情報でなければ task の後に ` E`・` W`・` D`）。読む前に上書きされた分は、その所に
+  `[log: … bytes …]` の一行で言う。`N_CHANNEL_WAIT` は新しい記録が来るまで待つ。
+  `n_system_log(buf, cap)` は最新のログを読む。C: への保存は init の仕事
+  （`AppData\Nocturne\System.log`、前の起動の分は `System-previous.log`）。
 
 ## 5. アプリ（`spawn`／`waitpid`／`kill`／`getpid` の置き換え）
 
@@ -291,7 +297,7 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - `n_app_self()`、`n_app_parent()`：アプリ識別子（共有ページの受渡しの許可判定用）。
 - `n_app_open(id)`：アプリ一覧の識別子から、動作中のアプリのハンドルを得る（タスク
   マネージャーや `kill` が `n_app_stop` するため）。`n_app_id(h)`：ハンドルの識別子
-  （終了後も同じ。識別子は再利用しない）。
+  （終了後も同じ。識別子は 2^31 個を配り終えるまで再利用しない）。
 - `n_app_list`、`n_system_info` 等の状態取得は現行の `proclist`（件数）／`sysinfo`（0）を
   引き継ぐ。どちらも失敗では負の `n_result`。
 
@@ -414,6 +420,11 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 
 - 音声、PCI一覧、カーネルログ等の `/dev` ファイルは、種類つきハンドルと専用の関数へ移す。
   ファイルとして読み書きしない。
+- CPU：`cpu_info(struct n_cpuinfo *)`（`SYS_CPU_INFO`）。`detected_cpus` はファームウェアが
+  示す CPU の数、`online_cpus` は動いている数、`scheduler_cpus` はアプリの thread を走らせる数で、
+  動いている全部。`flags` は全 CPU が持つ機能（`N_CPU_SSE2`・`N_CPU_AVX`・`N_CPU_USER_THREADS`）。
+  カーネルは自分の仕事を CPU に配らないので、`worker_cpus`・`parallel_jobs`・`worker_chunks` は 0
+  で、`N_CPU_AP_WORKERS` は立たない。
 - 音声：`n_audio_open()` が混合器の上の自分専用の流れ（`N_KIND_DEVICE`）を返す。全部
   使用中なら `N_ERR_BUSY`。形式は `N_AUDIO_RATE`（48kHz）のステレオ、1フレーム＝int16_t
   二つ（左が先）。
@@ -440,8 +451,8 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   - `n_audio_output_watch()`（`SYS_AUDIO_OUTPUT_WATCH`）：`n_audio_output` が返すもの（音量、消音、
     `device`）が変わると受け取れる見張り（`N_KIND_WATCH`、§12）。誰が変えても知らせ、同じ値を
     当て直すのは変化ではない。
-- システムログ：`n_system_log(buf, cap)` で読み、`n_system_log_open()` の
-  ハンドルへ `n_channel_send` で書く。
+- システムログ：`n_system_log(buf, cap)` か `n_system_log_open()` のハンドルの
+  `n_channel_receive` で読み、そのハンドルへ `n_channel_send` で書く（§4）。
 - アプリの中の装置ドライバー（例：NVIDIA の資源管理 `C:\Nocturne\System\nvrm`、`docs/nvidia/LEDGER.md`）：
   - `n_pci_claim(bus, dev, func)` は PCI 機能を動かす権利（`N_KIND_PCI`）を返す。呼べるのは
     init だけで、init は起動するドライバーアプリへハンドルを渡す。カーネルのドライバーが使う

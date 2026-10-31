@@ -7,7 +7,8 @@
 #include "mm/vmm.h"
 #include "sys/alarm.h"
 #include "sys/clock.h"
-#include "sys/sched.h"
+#include "sys/thread.h"
+#include "sys/wait.h"
 #include "sys/object.h"
 #include "sys/keep.h"
 #include "sys/watch.h"
@@ -40,7 +41,7 @@ struct stream {
     uint32_t device_pending;
     uint32_t retained; /* the last of device_pending, still in the ring before tail */
     bool clock_error;
-    struct task *writer; /* the one submit copying past head; another waits for it */
+    struct thread *writer; /* the one submit copying past head; another waits for it */
     struct object object; /* an app's stream: what its handle reaches */
 };
 
@@ -52,8 +53,8 @@ static struct spinlock card_lock;
 /* The streams' queues and clocks (every field of a stream above but ring and object), the list of
    streams, the sinks' ordinals, the volume and muting, the remote clients, the sink of nothing, the
    system tone's writer, the card's identity (also under card_lock) and the trace's stream and
-   service counters: any CPU, any context. Taken after card_lock, before a wait queue's and an
-   object's lock and an alarm's (alarm_set). */
+   service counters: any CPU, any context. Taken after card_lock, before a wait queue's (an
+   object's waiters', object_notify) and an alarm's lock (alarm_set). */
 static struct spinlock audio_lock;
 /* Every frame mixed for a sink has an ordinal: sink_mixed is the next one, and the sink has heard
    those before sink_played, at the clock time sink_played_at (the time every stream's played
@@ -161,7 +162,7 @@ static void trace_commit(struct stream *s, uint32_t bytes) {
         trace.stream[i].max_gap = MAX(trace.stream[i].max_gap, now-last);
         trace.stream[i].last = now; trace.stream[i].writes++;
         trace.stream[i].frames += bytes / AUDIO_FRAME;
-        uint32_t pid = (uint32_t)current_task->pid;
+        uint32_t pid = (uint32_t)thread_current()->tid;
         if (trace.stream[i].pid && trace.stream[i].pid != pid) trace.stream[i].owner_changes++;
         trace.stream[i].pid = pid;
         uint32_t queue = (s->head-s->tail) / AUDIO_FRAME;
@@ -625,7 +626,7 @@ static void stream_drop(struct stream *s, bool flush) {
     spin_unlock(&card_lock, f);
 }
 
-/* Without audio_lock (an events wait asks under the object's lock, which audio_lock comes before):
+/* Without audio_lock (an events wait asks under its queue's lock, which audio_lock comes before):
    a hint read from the fields as they are; every change notifies the object after it, and the wait
    asks again. */
 static uint32_t stream_ready(struct handle *h) {
@@ -641,13 +642,13 @@ static void stream_close(struct handle *h) {
     uint64_t give_up = clock_after(NS_PER_S);
     /* the mixer and the sinks' reports wake audio_wq at each change, and a kill wakes the task */
     uint64_t fl = spin_lock(&audio_lock);
-    while (!current_task->killed && !s->clock_error && (s->head - s->tail >= AUDIO_FRAME||s->device_pending)) {
+    while (!thread_current()->killed && !s->clock_error && (s->head - s->tail >= AUDIO_FRAME||s->device_pending)) {
         bool woken = wq_wait_locked_until(&audio_wq, &audio_lock, give_up);
         spin_take(&audio_lock);
         if (!woken) break;
     }
     spin_unlock(&audio_lock, fl);
-    if (current_task->killed) stream_drop(s, false);
+    if (thread_current()->killed) stream_drop(s, false);
     fl = spin_lock(&audio_lock);
     for (int i = 0; i < MAX_STREAMS; i++)
         if (streams[i] == s) {
@@ -674,7 +675,7 @@ int audio_stream_open(struct handle **out) {
     if (s) s->ring = kmalloc(RING_BYTES);
     if (!s || !s->ring) { if (s) kfree(s); return -N_ERR_NO_MEMORY; }
     object_init(&s->object, &stream_ops, s);
-    struct handle *h = handle_open(&s->object, true);
+    struct handle *h = handle_open(&s->object, HANDLE_WRITE);
     if (!h) { stream_release(&s->object); return -N_ERR_NO_MEMORY; }
     uint64_t fl = spin_lock(&audio_lock);
     int slot = -1;
@@ -696,9 +697,9 @@ int64_t audio_stream_submit(struct handle *h, const void *frames, size_t count, 
     int64_t error = 0;
     uint64_t fl = spin_lock(&audio_lock);
     for (;;) {
-        if (!s->writer) { s->writer = current_task; break; }
+        if (!s->writer) { s->writer = thread_current(); break; }
         if (!wait) { spin_unlock(&audio_lock, fl); return -N_ERR_NOT_READY; }
-        if (current_task->killed) { spin_unlock(&audio_lock, fl); return -N_ERR_STOPPED; }
+        if (thread_current()->killed) { spin_unlock(&audio_lock, fl); return -N_ERR_STOPPED; }
         wq_wait_locked(&audio_wq, &audio_lock);
         spin_take(&audio_lock);
     }
@@ -708,7 +709,7 @@ int64_t audio_stream_submit(struct handle *h, const void *frames, size_t count, 
         if (!room) {
             if (done) break; /* report what went in; the caller sends the rest */
             if (!wait) { error = -N_ERR_NOT_READY; break; }
-            if (current_task->killed) { error = -N_ERR_STOPPED; break; }
+            if (thread_current()->killed) { error = -N_ERR_STOPPED; break; }
             wq_wait_locked(&audio_wq, &audio_lock);
             spin_take(&audio_lock);
             continue;

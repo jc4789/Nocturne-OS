@@ -13,7 +13,7 @@
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "sys/clock.h"
-#include "sys/sched.h"
+#include "sys/wait.h"
 
 #define MAX_HBA 4
 #define MAX_PORTS 32
@@ -99,7 +99,7 @@ struct port {
     bool live; /* set up: commands may be given. Cleared by a command that went wrong and by a sleep:
                   the next command sets the port up again first */
     struct mutex lock; /* one command at a time, from any CPU: the slot, the bounce buffer, live */
-    /* The interrupt handler (CPU 0) and the command waiting on another CPU: it adds to events and
+    /* The interrupt handler and the command waiting on another CPU: it adds to events and
        counts kicks up, then wakes wq. A waiter reads kicks before it looks at the port and sleeps
        only while kicks still reads that (wq_wait_unless). */
     struct wait_queue wq;
@@ -112,7 +112,7 @@ struct hba {
     struct pci_device *pci;
     volatile uint8_t *regs;
     bool s64;
-    uint8_t vector;
+    struct irq *irq; /* its message (pci_irq_enable), NULL: polled */
     struct port *ports[MAX_PORTS];
 };
 
@@ -141,24 +141,22 @@ static bool wait_reg(struct port *p, unsigned off, uint32_t mask, uint32_t want,
     }
 }
 
-static void ahci_isr(struct regs *r) {
-    for (int i = 0; i < nhbas; i++) {
-        struct hba *h = &hbas[i];
-        if (h->vector != r->vector) continue;
-        uint32_t is = hba_rd(h, IS);
-        for (unsigned n = 0; n < MAX_PORTS; n++) {
-            if (!(is & 1u << n)) continue;
-            struct port *p = h->ports[n];
-            volatile uint8_t *regs = h->regs + 0x100 + 0x80 * n;
-            uint32_t events = mmio_read32(regs + PxIS);
-            mmio_write32(regs + PxIS, events);
-            if (!p) continue;
-            __atomic_fetch_or(&p->events, events, __ATOMIC_SEQ_CST);
-            __atomic_add_fetch(&p->kicks, 1, __ATOMIC_SEQ_CST);
-            wq_wake_all(&p->wq);
-        }
-        hba_wr(h, IS, is);
+static enum irq_result ahci_isr(void *context) {
+    struct hba *h = context;
+    uint32_t is = hba_rd(h, IS);
+    for (unsigned n = 0; n < MAX_PORTS; n++) {
+        if (!(is & 1u << n)) continue;
+        struct port *p = h->ports[n];
+        volatile uint8_t *regs = h->regs + 0x100 + 0x80 * n;
+        uint32_t events = mmio_read32(regs + PxIS);
+        mmio_write32(regs + PxIS, events);
+        if (!p) continue;
+        __atomic_fetch_or(&p->events, events, __ATOMIC_SEQ_CST);
+        __atomic_add_fetch(&p->kicks, 1, __ATOMIC_SEQ_CST);
+        wq_wake_all(&p->wq);
     }
+    hba_wr(h, IS, is);
+    return IRQ_HANDLED;
 }
 
 /* The port's command list and FIS receive engines stopped (10.1.2), so its memory may change and
@@ -207,7 +205,7 @@ static bool port_start(struct port *p) {
     }
     wr(p, PxSERR, 0xFFFFFFFFu);
     wr(p, PxIS, 0xFFFFFFFFu);
-    wr(p, PxIE, h->vector ? IS_DHRS | IS_ERRORS : 0);
+    wr(p, PxIE, h->irq ? IS_DHRS | IS_ERRORS : 0);
     wr(p, PxCMD, rd(p, PxCMD) | CMD_ST);
     p->live = true;
     return true;
@@ -277,7 +275,7 @@ static int command(struct port *p, const uint8_t fis[20], bool write, unsigned b
         }
         /* with MSI the interrupt wakes it, the 10 ms only in case one is lost; polled each ms */
         if (!sleeps) pause();
-        else wq_wait_unless(&p->wq, &p->kicks, seen, clock_after(p->h->vector ? 10 * NS_PER_MS : NS_PER_MS));
+        else wq_wait_unless(&p->wq, &p->kicks, seen, clock_after(p->h->irq ? 10 * NS_PER_MS : NS_PER_MS));
     }
 }
 
@@ -422,17 +420,9 @@ static void start(struct hba *h) {
     hba_take(h);
     uint32_t cap = hba_rd(h, CAP), implemented = hba_rd(h, PI);
     h->s64 = cap & CAP_S64A;
-    int vector = irq_vector_alloc(1, 1);
-    if (vector >= 0) {
-        h->vector = (uint8_t)vector;
-        vector_register(vector, ahci_isr);
-        if (!pci_msi_enable(pci, h->vector)) {
-            irq_vector_free(vector, 1);
-            h->vector = 0;
-        }
-    }
+    pci_irq_enable(pci, &(struct irq_spec){.name = "AHCI", .handler = ahci_isr, .context = h, .node = -1}, 1, &h->irq);
     kprintf("ahci%d: %04x:%04x, version %x, ports %x, %s\n", h->index, pci->vendor, pci->device, hba_rd(h, VS),
-            implemented, h->vector ? "MSI" : "polled");
+            implemented, h->irq ? "MSI" : "polled");
     /* staggered spin-up: every port's link first, so the disks spin up together */
     bool spun = false;
     for (unsigned n = 0; n < MAX_PORTS; n++) {
@@ -444,7 +434,7 @@ static void start(struct hba *h) {
         }
     }
     if (spun && (cap & CAP_SSS)) sleep_until(clock_after(SPINUP_NS));
-    if (h->vector) hba_wr(h, GHC, hba_rd(h, GHC) | GHC_IE);
+    if (h->irq) hba_wr(h, GHC, hba_rd(h, GHC) | GHC_IE);
     for (unsigned n = 0; n < MAX_PORTS; n++) {
         if (!(implemented & 1u << n)) continue;
         uint32_t det = mmio_read32(h->regs + 0x100 + 0x80 * n + PxSSTS) & 0xF;
@@ -479,7 +469,7 @@ static bool ahci_resume(void *arg) {
     (void)arg;
     for (int i = 0; i < nhbas; i++) {
         struct hba *h = &hbas[i];
-        if (h->regs) hba_wr(h, GHC, hba_rd(h, GHC) | GHC_AE | (h->vector ? GHC_IE : 0));
+        if (h->regs) hba_wr(h, GHC, hba_rd(h, GHC) | GHC_AE | (h->irq ? GHC_IE : 0));
     }
     return true;
 }

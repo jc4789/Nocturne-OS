@@ -6,7 +6,7 @@
 #include "dev/usb.h"
 #include "mm/heap.h"
 #include "net/net.h"
-#include "sys/sched.h"
+#include "sys/wait.h"
 
 #define CDC_ECM 0x06
 #define CDC_NCM 0x0D

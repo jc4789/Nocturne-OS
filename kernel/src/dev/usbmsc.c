@@ -7,7 +7,7 @@
 #include "dev/usb.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
-#include "sys/sched.h"
+#include "sys/wait.h"
 
 #define CBW_SIG 0x43425355u /* "USBC" */
 #define CSW_SIG 0x53425355u /* "USBS" */

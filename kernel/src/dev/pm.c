@@ -3,6 +3,8 @@
    and back. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/irq.h"
+#include "arch/apic.h"
 #include "arch/spin.h"
 #include "dev/pm.h"
 #include "dev/acpi.h"
@@ -11,7 +13,9 @@
 #include "dev/hibernate.h"
 #include "dev/iommu.h"
 #include "gui/wm.h"
-#include "sys/sched.h"
+#include "sys/process.h"
+#include "sys/thread.h"
+#include "sys/wait.h"
 #include "sys/keep.h"
 #include "arch/ioapic.h"
 #include "arch/smp.h"
@@ -20,6 +24,7 @@
 #include "sys/alarm.h"
 #include "sys/clock.h"
 #include "dev/serial.h"
+#include "sys/log.h"
 #include "vm/vm.h"
 
 void power_off(void);
@@ -110,7 +115,7 @@ static bool close_windows(void) {
 static void stop_apps(void) {
     uint64_t end = clock_after(STOP_NS);
     int left;
-    while ((left = task_stop_apps()) && clock_now_ns() < end) sleep_until(clock_after(20 * NS_PER_MS));
+    while ((left = process_stop_all()) && clock_now_ns() < end) sleep_until(clock_after(20 * NS_PER_MS));
     if (left) kprintf("pm: %d app tasks did not end\n", left);
 }
 
@@ -190,33 +195,31 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
     const char *stuck = pci_suspend();
     uint64_t f = irq_save();
     if (!stuck) stuck = pm_quiesce_devices(true);
-    uint32_t pic = pic_state();
-    pic_mask_all();
-    ioapic_suspend();
+    irq_suspend();
+    /* the log's readers are told again in log_resume, once the APICs are back; before the clock
+       stops, which bounds the serial port's last wait */
+    log_suspend();
+    alarm_suspend(); /* until its LAPIC is back: the clock's own alarms as it comes back wait */
     clock_suspend();
-    serial_flush(); /* the alarm that drains the log port does not come while asleep */
     /* called off, the way back is the one after an enter() that returned */
     bool slept = !stuck && wake_sleep(enter);
     /* awake (or never asleep): the CPU is back; now what it talks to */
     /* Wake firmware may have enabled plain routes. Stop their sources before any
        remapping mode transition; the saved routes remain intact for the final restore. */
-    pic_mask_all();
     ioapic_mask_all();
-    serial_init(); /* the log port, reset with the rest */
     /* The clock first: every wait from here on (a unit's or a link's that does not answer) is
        bounded on it, and until it is back it stands still (the TSC began again from 0). */
     int64_t secs = clock_resume();
-    /* before anything sends it an interrupt or a request, and before the APICs go back to x2APIC
-       mode, which comes after interrupt remapping with extended IDs (SDM 11.12.7); units that
+    /* before anything sends it an interrupt or a request, and before the APIC goes back to x2APIC
+       mode, which comes after interrupt remapping with extended IDs (SDM 13.12.7); units that
        never slept are still on, translating with the claims' tables, and are left alone. Units
        that do not come back are turned off where they confirm it (iommu_resume): the IOAPICs'
        entries and the PCI functions' messages are then made again plain, or left off, and x2APIC
        mode comes back without remapping, the deviation arch/apic.c describes for the boot. */
     const char *units_lost = slept ? iommu_resume() : NULL;
-    lapic_resume();
-    ioapic_resume();
-    if (slept) pic_restore(pic);
-    else pic_restore_mask((uint16_t)pic); /* no reset occurred: do not erase a pending edge */
+    if (!apic_init_cpu()) panic("pm: this CPU's APIC did not come back in x2APIC mode");
+    irq_resume(); /* the 8259 masked again, every IOAPIC entry written again */
+    log_resume(); /* the serial port set up again, its interrupt routed again above */
     vm_resume(); /* the hypervisor's other overlay pages and its interrupts, after the LAPIC */
     alarm_resume(); /* CPU 0's wake device, after its LAPIC */
     acpi_wake_prepare(state);

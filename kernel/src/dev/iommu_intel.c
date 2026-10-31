@@ -9,11 +9,11 @@
    interrupts are refused (they would let any device send any vector), so each MSI and IOAPIC
    pin is an entry of one shared table, checked against the requester ID of its source.
    Entries 0..255 are the IOAPIC pins by GSI, then 32 for each function with MSI or MSI-X on.
-   The entries take the CPUs' APIC mode: in x2APIC mode every unit uses the x2APIC format
-   (Extended Interrupt Mode), and remapping is off where a unit lacks EIM, or, in xAPIC mode,
-   requires it (EIMER). */
+   The CPUs are in x2APIC mode (arch/apic.c): every unit uses the x2APIC format (Extended
+   Interrupt Mode), and remapping is off where a unit lacks EIM. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/apic.h"
 #include "arch/ioapic.h"
 #include "arch/irq.h"
 #include "arch/spin.h"
@@ -174,7 +174,9 @@ static struct ioapic_scope {
 static size_t nioapics, ioapics_room;
 static uint8_t dmar_flags;
 static unsigned host_bits;
-static bool remap, x2, caching_mode, write_buffers, parse_lost;
+/* remap: interrupts are remapped, always in x2APIC format (Extended Interrupt Mode): the CPUs are
+   in x2APIC mode (arch/apic.c), which needs it (11.4.10) */
+static bool remap, caching_mode, write_buffers, parse_lost;
 static bool units_incomplete; /* separate from unsupported/malformed device-scope policy */
 static bool irreq; /* a unit requires interrupt remapping (ECAP.IRREQ) */
 static unsigned iec_mask = 15; /* the largest IEC invalidation mask every unit takes (MHMV) */
@@ -182,13 +184,11 @@ static struct iommu_domain *identity; /* units without pass-through */
 static uint64_t sems, irt;
 static size_t sem_pages;
 static uint32_t token;
-static int fault_vector = -1;
-static uint32_t fault_cpu; /* CPU 0's APIC ID (pci_interrupt_dest), the fault events' destination:
-                              after sleep its APIC is in the kernel's mode only after the units (dev/pm.c) */
+static struct irq *fault_irq; /* the fault events' (fault_isr) */
 static const struct pci_device *msi_owner[MSI_BLOCKS];
 /* The units and what they read: every unit's queue, registers and records, the status words
    and token, the interrupt remapping table and msi_owner, the root and context tables. Every
-   call of the common part (struct iommu_hw) and the fault handler (CPU 0) work under it; it is
+   call of the common part (struct iommu_hw) and the fault handler work under it; it is
    taken after the common part's locks and arch/ioapic.c's, and only iommu_fault_report's and
    the page allocator's are taken under it. */
 static struct spinlock units_lock;
@@ -298,36 +298,6 @@ static bool drhd_registers(const uint8_t *s, uint64_t *base, uint64_t *bytes) {
 /* X2APIC_OPT_OUT counts only with INTR_REMAP set (8.1). */
 static bool x2apic_opt_out(uint8_t flags) {
     return (flags & (DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT)) == (DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT);
-}
-
-/* With interrupt remapping (INTR_REMAP), CPUs in x2APIC mode need every unit in Extended
-   Interrupt Mode, "x2APIC mode is active" (11.4.10), which a unit supports where it reports EIM
-   (5.1.6); the firmware may also ask the OS not to enable that mode (X2APIC_OPT_OUT, 8.1). A unit
-   that remaps in that mode only (EIMER) requires it (5.1.4), and the flag must then be Clear
-   (8.1): nothing keeps the CPUs out of it. A unit whose registers cannot be read remaps nothing
-   here (the probe does not use VT-d then). acpi_find walks the root tables on its first call. */
-const char *iommu_intel_x2apic_conflict(void) {
-    const struct acpi_sdt *h = dmar_table();
-    if (!h) return NULL;
-    const uint8_t *b = (const uint8_t *)h;
-    if (!(b[DMAR_FLAGS] & DMAR_INTR_REMAP)) return NULL;
-    bool remaps = true, eim = true, eimer = false;
-    for (uint32_t off = DMAR_HEADER; h->length - off >= 4;) {
-        uint16_t type = u16(b + off), len = u16(b + off + 2);
-        if (len < 4 || len > h->length - off) break;
-        uint64_t base, bytes;
-        if (type == 0 && len >= 16) {
-            volatile uint8_t *regs = drhd_registers(b + off, &base, &bytes) ? vmm_map_mmio(base, PAGE_SIZE) : NULL;
-            uint64_t ecap = regs ? mmio_read64(regs + R_ECAP) : UINT64_MAX;
-            remaps &= ecap != UINT64_MAX && (ecap & ECAP_IR);
-            eim &= (ecap & ECAP_EIM) != 0;
-            eimer |= ecap != UINT64_MAX && (ecap & ECAP_EIMER);
-        }
-        off += len;
-    }
-    if (eimer) return NULL;
-    if (x2apic_opt_out(b[DMAR_FLAGS])) return "the DMAR asks for it (X2APIC_OPT_OUT)";
-    return remaps && !eim ? "a VT-d unit remaps interrupts in xAPIC format only (no EIM)" : NULL;
 }
 
 static bool parse_dmar(void) {
@@ -607,8 +577,8 @@ static void faults_drain(struct unit *u) {
 /* An ICE is cleared here. IQE and ITE wait for the queue's next user (queue_check), whose
    recovery submits and waits; no fault event comes while they are set (7.3). A wait under
    units_lock on another CPU drains the records itself; this one waits for it. */
-static void fault_isr(struct regs *r) {
-    (void)r;
+static enum irq_result fault_isr(void *context) {
+    (void)context;
     spin_take(&units_lock);
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
@@ -619,6 +589,7 @@ static void fault_isr(struct regs *r) {
         faults_drain(u);
     }
     spin_give(&units_lock);
+    return IRQ_HANDLED;
 }
 
 static uint32_t token_next(void) {
@@ -742,8 +713,8 @@ static void irte_write(unsigned index, uint64_t lo, uint64_t hi) {
     if (!intel.coherent) iommu_cache_flush(e, 16);
 }
 
-/* The destination field (9.9): an xAPIC id in bits 47:40, or an x2APIC one in 63:32. */
-static uint64_t irte_dest(uint32_t dest) { return x2 ? (uint64_t)dest << 32 : (uint64_t)(dest & 0xFF) << 40; }
+/* The destination field (9.9): an x2APIC ID in bits 63:32 (Extended Interrupt Mode). */
+static uint64_t irte_dest(uint32_t dest) { return (uint64_t)dest << 32; }
 
 /* What an entry checks the sender against: d's requester ID, or the buses of its IDs when a
    bridge sends its requests as its own. 0 without memory. */
@@ -796,8 +767,8 @@ static bool msi_release(const struct pci_device *d) {
    The entries' source is worked out (an allocation) before units_lock. */
 static bool intel_msi(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
                       uint32_t *address, uint32_t *data) {
-    if (!x2 && dest > 0xFF) return false; /* the 8-bit destination of a plain message and an xAPIC IRTE */
     if (!remap) {
+        if (dest > 0xFF) return false; /* the 8-bit destination of a plain message */
         *address = iommu_msi_plain(dest);
         *data = vector;
         return true;
@@ -832,10 +803,10 @@ static bool intel_msi_clear(struct pci_device *d) {
 }
 
 /* Pin `gsi` is entry gsi; the IRTE takes what the plain entry said (delivery mode, logical
-   destination, trigger, vector, 8-bit destination), the pin keeps polarity, trigger, vector
-   (for the EOI of a level pin) and mask, with delivery mode 000. */
-static bool intel_ioapic(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
-    if (!remap) return true;
+   destination, trigger, vector) and the 32-bit destination dest, the pin keeps polarity, trigger,
+   vector (for the EOI of a level pin) and mask, with delivery mode 000. */
+static bool intel_ioapic(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_t *rte) {
+    if (!remap) return dest <= 0xFF; /* the plain entry's 8-bit destination */
     if (gsi >= IOAPIC_ENTRIES) {
         kprintf("iommu: GSI %u is beyond the IOAPIC entries: left masked\n", gsi);
         return false;
@@ -849,7 +820,7 @@ static bool intel_ioapic(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
     }
     uint64_t f = spin_lock(&units_lock);
     irte_write(gsi, IRTE_P | (v >> 11 & 1 ? IRTE_DM : 0) | (v >> 15 & 1 ? IRTE_TM : 0) | IRTE_DLM(v >> 8 & 7) |
-                        IRTE_VECTOR(v) | irte_dest((uint32_t)(v >> 56)), source);
+                        IRTE_VECTOR(v) | irte_dest(dest), source);
     send_iec(gsi, 0);
     bool ok = sync();
     spin_unlock(&units_lock, f);
@@ -1123,30 +1094,30 @@ static bool translation_on(bool open) {
     return true;
 }
 
-static bool unit_tables(struct unit *u, uint32_t dest) {
+static bool unit_tables(struct unit *u) {
     wr64(u, R_RTADDR, u->root); /* legacy mode */
     bool ok = command(u, GCMD_SRTP, true) && queue_start(u);
     if (ok && remap) {
-        wr64(u, R_IRTA, irt | (x2 ? IRTA_EIME : 0) | IRT_S);
+        wr64(u, R_IRTA, irt | IRTA_EIME | IRT_S);
         ok = command(u, GCMD_SIRTP, true);
     }
-    /* the fault event message (5.1.6): in x2APIC mode the destination's bits 31:8 in FEUADDR,
-       which a unit with EIM implements (11.4.7.5). The unit reads it in x2APIC mode once the
-       pointer above set EIME (5.1.6.2), so it is unmasked only then. */
-    if (ok && fault_vector >= 0 && (x2 || dest <= 0xFF)) {
-        wr32(u, R_FEDATA, (uint32_t)fault_vector);
-        wr32(u, R_FEADDR, iommu_msi_plain(dest & 0xFF));
-        wr32(u, R_FEUADDR, x2 ? dest & ~0xFFu : 0);
+    /* the fault event message (5.1.6): with remapping in x2APIC format the destination's bits
+       31:8 in FEUADDR, which a unit with EIM implements (11.4.7.5). The unit reads it in x2APIC
+       mode once the pointer above set EIME (5.1.6.2), so it is unmasked only then. */
+    struct irq_target to = fault_irq ? irq_target(fault_irq) : (struct irq_target){0};
+    if (ok && fault_irq && (remap || to.apic_id <= 0xFF)) {
+        wr32(u, R_FEDATA, to.vector);
+        wr32(u, R_FEADDR, iommu_msi_plain(to.apic_id & 0xFF));
+        wr32(u, R_FEUADDR, remap ? to.apic_id & ~0xFFu : 0);
         wr32(u, R_FECTL, 0);
     }
     return ok;
 }
 
-/* Compatibility-format interrupts must not bypass the interrupt table (5.1.4). In xAPIC mode,
-   clear CFI on every unit before enabling any IRE, both at boot and after sleep. EIME blocks
-   compatibility format independently of CFIS; its pointer is installed by SIRTP first.
-   Enabling CFI temporarily is not a prerequisite for remapping (11.4.4.1). A plain IOAPIC entry may be blocked
-   until its caller converts/restores it, not delivered through an isolation bypass.
+/* Compatibility-format interrupts must not bypass the interrupt table (5.1.4): EIME, set with the
+   table's pointer by SIRTP first (unit_tables), blocks them independently of CFIS, both at boot
+   and after sleep. A plain IOAPIC entry may be blocked until its caller converts/restores it, not
+   delivered through an isolation bypass.
    The global invalidations flush the table write buffers (6.8). Translation goes on only
    when intel.translating. The firmware's protected memory ranges stay on until every unit
    confirmed its remapping and translation, so a start that fails keeps them; only a unit that
@@ -1155,13 +1126,11 @@ static bool unit_tables(struct unit *u, uint32_t dest) {
 static bool units_on(void) {
     if (!units_off()) return false; /* also when firmware left any unit on */
     for (size_t i = 0; i < nunits; i++)
-        if (!unit_tables(&units[i], fault_cpu)) return false;
+        if (!unit_tables(&units[i])) return false;
     send(INV_CONTEXT_GLOBAL);
     send(INV_IOTLB_GLOBAL);
     if (remap) send(INV_IEC_GLOBAL);
     bool ok = sync();
-    for (size_t i = 0; ok && remap && !x2 && i < nunits; i++)
-        ok = command(&units[i], GCMD_CFI, false);
     for (size_t i = 0; ok && remap && i < nunits; i++)
         ok = command(&units[i], GCMD_IRE, true);
     if (ok && intel.translating) ok = translation_on(false) && translation_on(true);
@@ -1291,8 +1260,9 @@ static bool intel_start(bool translate) {
         }
     }
     if (remap && !intel.coherent) iommu_cache_flush(phys_to_virt(irt), IRT_ENTRIES * 16);
-    if (fault_vector < 0 && (fault_vector = irq_vector_alloc(1, 1)) >= 0) vector_register(fault_vector, fault_isr);
-    fault_cpu = pci_interrupt_dest();
+    /* any CPU the unit's message can name: a 32-bit destination with remapping (unit_tables) */
+    if (!fault_irq)
+        fault_irq = irq_request_msi(&(struct irq_spec){.name = "VT-d faults", .handler = fault_isr, .node = -1}, IRQ_CPU_ANY);
     uint64_t f = spin_lock(&units_lock);
     ok = units_start(translate);
     if (!ok && translate && irreq) {
@@ -1305,14 +1275,14 @@ static bool intel_start(bool translate) {
         return false; /* the tables stay: a unit may still read them */
     }
     if (!intel.translating) {
-        kprintf("iommu: VT-d remaps interrupts only%s, %lu unit%s\n", x2 ? " (x2APIC format)" : "",
-                (unsigned long)nunits, nunits == 1 ? "" : "s");
+        kprintf("iommu: VT-d remaps interrupts only (x2APIC format), %lu unit%s\n", (unsigned long)nunits,
+                nunits == 1 ? "" : "s");
         return true;
     }
     kprintf("iommu: VT-d on, %lu unit%s, %u-level tables%s, interrupt remapping %s, %u reserved range%s: every "
             "function passes through until an app claims it\n", (unsigned long)nunits, nunits == 1 ? "" : "s",
             intel.levels, pass_all ? "" : " (identity domain for units without pass-through)",
-            remap ? (x2 ? "on (x2APIC format)" : "on")
+            remap ? "on (x2APIC format)"
                   : dmar_flags & DMAR_INTR_REMAP ? "not possible on these units" : "not offered by the firmware",
             iommu_reserved_count(), iommu_reserved_count() == 1 ? "" : "s");
     if (!remap) kprintf("iommu: interrupts are not remapped: a device given to an app can send any vector\n");
@@ -1429,26 +1399,22 @@ const struct iommu_hw *iommu_intel_probe(bool *plain_safe) {
         remap = false;
     }
     /* X2APIC_OPT_OUT asks the OS to keep the CPUs out of x2APIC mode, and must be Clear where a
-       unit reports EIMER (8.1), which requires that mode (iommu_intel_x2apic_conflict): the units'
-       requirements and the CPUs' actual mode decide below, not the flag. */
+       unit reports EIMER (8.1), which requires that mode: the CPUs are in it whatever the flag
+       says (arch/apic.c), and the units' requirements decide below. */
     if (x2apic_opt_out(dmar_flags)) {
-        if (lapic_x2apic())
-            kprintf("iommu: the DMAR asks the OS not to use x2APIC mode (X2APIC_OPT_OUT), but the CPUs are in it\n");
+        kprintf("iommu: the DMAR asks the OS not to use x2APIC mode (X2APIC_OPT_OUT), but the CPUs are in it\n");
         if (eimer)
             kprintf("iommu: the DMAR sets X2APIC_OPT_OUT although a VT-d unit remaps interrupts in x2APIC "
                     "format only (EIMER), which the firmware must not do\n");
     }
     /* Every unit remaps in the CPUs' mode: Extended Interrupt Mode, "x2APIC mode is active"
-       (11.4.10), needs each unit's EIM (5.1.6) with the CPUs in x2APIC mode; with them in xAPIC
-       mode a unit that remaps in that mode only (EIMER) blocks every interrupt (5.1.4). */
-    if (remap && (lapic_x2apic() ? !eim : eimer)) {
-        kprintf("iommu: %s: interrupts are not remapped\n",
-                lapic_x2apic() ? "a VT-d unit remaps interrupts in xAPIC format only (no EIM), and the CPUs are in "
-                                 "x2APIC mode"
-                               : "a VT-d unit remaps interrupts in x2APIC format only (EIMER), which the CPUs do not use");
+       (11.4.10), needs each unit's EIM (5.1.6). */
+    if (remap && !eim) {
+        kprintf("iommu: a VT-d unit remaps interrupts in xAPIC format only (no EIM), and the CPUs are in x2APIC "
+                "mode: interrupts are not remapped\n");
         remap = false;
     }
-    x2 = remap && lapic_x2apic();
+    intel.irq_wide = remap; /* every message and IOAPIC entry goes through the table, 32-bit destinations */
     intel.interrupt_remapping_required = irreq;
     if (parse_lost) {
         kprintf("iommu: the DMAR scope or structure is not supported: VT-d not used\n");

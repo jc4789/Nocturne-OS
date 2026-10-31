@@ -29,6 +29,68 @@ static n_handle start(const char *path, const char *name, const char *arg, int32
     return start2(path, name, arg, NULL, in, out, extra);
 }
 
+/* The system log kept on C: in the user's AppData\Nocturne: System.log for this start, the one
+   before moved to System-previous.log. A machine without a serial port loses the kernel's log
+   (its rings in memory) with its power, and what a start said before it stopped is what one wants
+   to read; it can be read from Files, or from another system (host/store). A thread reads the
+   system log stream from the oldest record the kernel holds on and appends what comes; the
+   kernel says in the text what was overwritten before it was read. A start keeps at most
+   KEEP_MOST bytes: C: has its other uses. */
+#define KEEP_PIECE 65536        /* text taken from the log at a time */
+#define KEEP_MOST (32ull << 20)
+
+static char kept_log[4200];
+
+static void keep_note(const char *fmt, unsigned long long n) {
+    char note[96];
+    int k = snprintf(note, sizeof note, fmt, n);
+    if (k > 0) n_document_append(kept_log, note, (size_t)k < sizeof note ? (size_t)k : sizeof note - 1);
+}
+
+static void keep_log(void *arg) {
+    n_handle log = (n_handle)(intptr_t)arg;
+    char *piece = malloc(KEEP_PIECE);
+    for (unsigned long long kept = 0; piece;) {
+        n_result n = n_channel_receive(log, piece, KEEP_PIECE, N_CHANNEL_WAIT, NULL);
+        if (n <= 0) {
+            printf("init: the system log stopped (%s)\n", n_result_text(n));
+            break;
+        }
+        if (kept + (unsigned long long)n > KEEP_MOST) {
+            keep_note("\n[init: this start said more than %llu MiB; the rest is not kept here]\n", KEEP_MOST >> 20);
+            break;
+        }
+        n_result r = n_document_append(kept_log, piece, (size_t)n);
+        if (r < 0) {
+            printf("init: the system log cannot be kept on C: (%s)\n", n_result_text(r));
+            break;
+        }
+        kept += (unsigned long long)n;
+    }
+    fflush(stdout);
+    free(piece);
+    n_handle_close(log);
+}
+
+static void keep_system_log(void) {
+    char folder[4096], previous[sizeof kept_log];
+    n_result r = n_app_data_folder("Nocturne", folder, sizeof folder);
+    if (r >= 0) {
+        snprintf(kept_log, sizeof kept_log, "%s\\System.log", folder);
+        snprintf(previous, sizeof previous, "%s\\System-previous.log", folder);
+        r = n_entry_replace(kept_log, previous);
+        if (r == -N_ERR_NOT_FOUND) r = 0; /* the first start */
+    }
+    n_handle log = r >= 0 ? n_system_log_open() : r;
+    n_result thread = log >= 0 ? thread_create(keep_log, (void *)(intptr_t)log) : log;
+    if (thread >= 0) {
+        thread_detach((int)thread);
+        return;
+    }
+    if (log >= 0) n_handle_close(log);
+    printf("init: the system log cannot be kept on C: (%s)\n", n_result_text(thread));
+}
+
 /* Test disks (scripts/test.py) carry C:\Tests\autorun.sh: run it with its output in the system
    log (the serial port), then power off. Other disks don't have it. */
 static void autorun(void) {
@@ -93,6 +155,7 @@ static void start_drivers(void) {
 int main(void) {
     printf("\n\x1b[1;35m*\x1b[0m Welcome to \x1b[1mNocturne " "\x1b[0m- a small operating system for quiet nights.\n");
     fflush(stdout);
+    keep_system_log();
     start_drivers();
     if (gui_available()) {
         /* desktop session: the desktop is the user's from here (the system has put the user's

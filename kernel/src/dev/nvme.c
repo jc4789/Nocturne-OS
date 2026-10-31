@@ -5,6 +5,7 @@
    when the platform offers neither. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/irq.h"
 #include "dev/blk.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
@@ -12,11 +13,10 @@
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "sys/clock.h"
-#include "sys/sched.h"
+#include "sys/wait.h"
 
 #define MAX_CTRL 4
 #define MAX_NS 8
-#define VEC_NVME 0x48 /* MSI vectors 0x48.. one per controller (xHCI owns 0x40..0x47) */
 #define ADMIN_ENTRIES 32
 #define IO_ENTRIES 64
 #define XFER_PAGES 32 /* bounce buffer: 128 KiB, described by PRP1 and one PRP list page */
@@ -63,8 +63,8 @@ struct nvme {
     uint64_t ready_ns; /* CC.EN to CSTS.RDY at most (CAP.TO, CRTO) */
     uint32_t rtd3e;
     struct queue admin, io;
-    uint8_t vector;
-    /* The interrupt handler (CPU 0) counts kicks up, then wakes wq; the command waiting on another
+    struct irq *irq; /* its message 0 (pci_irq_enable), NULL: polled */
+    /* The interrupt handler counts kicks up, then wakes wq; the command waiting on another
        CPU reads kicks before it looks at its completion queue and sleeps only while kicks still
        reads that (wq_wait_unless). */
     uint64_t kicks;
@@ -102,13 +102,11 @@ static void doorbell(struct nvme *c, uint16_t qid, bool cq, uint16_t v) {
     wr32(c, 0x1000 + (2u * qid + (cq ? 1 : 0)) * c->stride, v);
 }
 
-static void nvme_isr(struct regs *r) {
-    for (int i = 0; i < nctrls; i++) {
-        struct nvme *c = &ctrls[i];
-        if (c->vector != r->vector) continue;
-        __atomic_add_fetch(&c->kicks, 1, __ATOMIC_SEQ_CST);
-        wq_wake_all(&c->wq);
-    }
+static enum irq_result nvme_isr(void *context) {
+    struct nvme *c = context;
+    __atomic_add_fetch(&c->kicks, 1, __ATOMIC_SEQ_CST);
+    wq_wake_all(&c->wq);
+    return IRQ_HANDLED;
 }
 
 static bool queue_init(struct queue *q, uint16_t qid, uint16_t size) {
@@ -165,7 +163,7 @@ static int command(struct nvme *c, struct queue *q, uint32_t cmd[16], uint64_t t
             return FAILED;
         }
         /* with MSI the interrupt wakes it, the 10 ms only in case one is lost; polled each ms */
-        wq_wait_unless(&c->wq, &c->kicks, seen, clock_after(c->vector ? 10 * NS_PER_MS : NS_PER_MS));
+        wq_wait_unless(&c->wq, &c->kicks, seen, clock_after(c->irq ? 10 * NS_PER_MS : NS_PER_MS));
     }
 }
 
@@ -215,7 +213,7 @@ static bool enable(struct nvme *c) {
     cmd[0] = OP_CREATE_CQ;
     *(uint64_t *)&cmd[6] = c->io.cq_phys;
     cmd[10] = (uint32_t)(c->io.size - 1) << 16 | 1;
-    cmd[11] = (c->vector ? 2u : 0u) | 1u; /* vector 0, interrupts on when we have one, contiguous */
+    cmd[11] = (c->irq ? 2u : 0u) | 1u; /* vector 0, interrupts on when we have one, contiguous */
     if ((r = command(c, &c->admin, cmd, ADMIN_NS, NULL))) goto fail;
     memset(cmd, 0, sizeof cmd);
     cmd[0] = OP_CREATE_SQ;
@@ -373,9 +371,7 @@ static void start(struct nvme *c) {
     if (!(c->data_phys = pmm_alloc_contig(XFER_PAGES, 64)) || !(c->prp_phys = pmm_alloc_contig(1, 64))) return;
     c->data = phys_to_virt(c->data_phys);
     c->prp = phys_to_virt(c->prp_phys);
-    c->vector = (uint8_t)(VEC_NVME + c->index);
-    vector_register(c->vector, nvme_isr);
-    if (!pci_msi_enable(pci, c->vector)) c->vector = 0;
+    pci_irq_enable(pci, &(struct irq_spec){.name = "NVMe", .handler = nvme_isr, .context = c, .node = -1}, 1, &c->irq);
     if (!enable(c)) return;
 
     if (identify(c, 1, 0)) {
@@ -400,7 +396,7 @@ static void start(struct nvme *c) {
     uint32_t count = *(const uint32_t *)(id + 516), nsids[MAX_NS];
     unsigned found = 0;
     kprintf("nvme%d: %s (%04x:%04x), version %x, %u namespaces, %s%s\n", c->index, model, pci->vendor, pci->device,
-            rd32(c, VS), count, c->vector ? "MSI" : "polled", c->vwc ? ", write cache" : "");
+            rd32(c, VS), count, c->irq ? "MSI" : "polled", c->vwc ? ", write cache" : "");
     if (!identify(c, 2, 0)) /* active namespace list */
         for (const uint32_t *l = (const uint32_t *)c->data; found < MAX_NS && found < 1024 && l[found]; found++)
             nsids[found] = l[found];

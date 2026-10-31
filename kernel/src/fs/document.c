@@ -25,10 +25,11 @@
 #include "lib/idtable.h"
 #include "mm/heap.h"
 #include "sys/object.h"
+#include "sys/thread.h"
 
 #define WORK_PAGES 4096u     /* 16 MiB of pages: then the work goes into the catalog */
 #define COMMIT_BLOCKS 16384u /* 64 MiB written and not yet committed: then a writer commits */
-#define YIELD_PAGES 64u      /* pages written before the CPU is offered to others */
+#define STOP_PAGES 64u       /* pages written between looks at whether the writer was stopped */
 #define READ_BLOCKS 64u
 #define NO_SIZE UINT64_MAX
 
@@ -351,7 +352,7 @@ static int64_t version_read(struct doc *d, struct version *ver, uint64_t offset,
             kfree(mine);
             break;
         }
-        if (user && current_task->killed) {
+        if (user && thread_current()->killed) {
             r = -N_ERR_STOPPED;
             break;
         }
@@ -532,10 +533,7 @@ static int64_t work_write(struct doc *d, uint64_t offset, const uint8_t *buf, si
         w->changed = true;
         work_listed(d);
         if (w->n >= WORK_PAGES) r = flush(d);
-        if (pages % YIELD_PAGES == 0) {
-            if (user && current_task->killed) r = -N_ERR_STOPPED;
-            if (need_resched) schedule();
-        }
+        if (user && pages % STOP_PAGES == 0 && thread_current()->killed) r = -N_ERR_STOPPED;
     }
     return done ? (int64_t)done : r;
 }
@@ -627,7 +625,7 @@ static int opening_new(struct doc *d, int access, bool user, struct version *ver
     if (!op) return -N_ERR_NO_MEMORY;
     *op = (struct opening){.doc = d, .access = access, .user = user, .version = ver};
     object_init(&op->object, &document_ops, op);
-    if (!(*out = handle_open(&op->object, access != N_DOCUMENT_READ))) {
+    if (!(*out = handle_open(&op->object, access != N_DOCUMENT_READ ? HANDLE_WRITE : 0))) {
         kfree(op);
         return -N_ERR_NO_MEMORY;
     }
@@ -872,7 +870,7 @@ int store_document_claim(struct handle *h, bool wait) {
         int r = 0;
         while (d->owner && d->owner != op && op->doc == d) {
             if (!wait) r = -N_ERR_NOT_READY;
-            else if (current_task->killed) r = -N_ERR_STOPPED;
+            else if (thread_current()->killed) r = -N_ERR_STOPPED;
             if (r < 0) break;
             mutex_wait(&d->lock, &d->claim_wait);
         }

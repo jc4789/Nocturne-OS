@@ -109,7 +109,9 @@ n_result n_app_self(void);
 n_result n_app_parent(void);
 n_handle n_app_open(int64_t id); /* a running app by the identifier the app list shows */
 n_result n_system_log(char *buf, size_t cap); /* the newest system log text; its length */
-n_handle n_system_log_open(void); /* a handle whose messages are added to the system log */
+/* A handle whose messages are added to the system log, and which receives the log's text from the
+   oldest record the kernel holds at its first receive on. */
+n_handle n_system_log_open(void);
 n_result n_app_id(n_handle app); /* its identifier, also after its end (identifiers are not reused) */
 /* Drivers in apps (docs/nocturne-native-abi.md §9). Only init may claim a PCI function; it
    hands the N_KIND_PCI handle to the driver app it launches. A claim is exclusive until its

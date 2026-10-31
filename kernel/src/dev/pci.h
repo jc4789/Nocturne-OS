@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 struct pci_reset;
+struct irq;
 struct pci_device {
     uint8_t bus, dev, func;
     uint16_t vendor, device;
@@ -14,15 +15,14 @@ struct pci_device {
     bool bridge;                  /* a PCI-to-PCI bridge (header type 1) */
     uint8_t secondary, subordinate; /* a bridge's buses: those below it, as enumeration found them */
     struct pci_device *upstream;  /* the bridge whose secondary bus this function is on, or NULL */
-    uint16_t msix_entries;      /* set by pci_msix_init() */
+    uint16_t msix_entries;      /* the MSI-X table's size, once mapped (pci_irq_enable) */
     volatile uint32_t *msix_table; /* mapped MSI-X table, 16 bytes per entry */
-    /* What its MSI and each MSI-X entry were last given (pci_msi_enable_multi, pci_msix_route),
-       vector 0 for nothing: made again where the units that remapped them did not come back
-       from a sleep (pci_resume). msix_given has msix_entries entries, allocated with the table. */
-    struct pci_msi_given {
-        uint32_t dest;
-        uint8_t vector, count;
-    } msi_given, *msix_given;
+    /* The irqs its messages deliver (pci_irq_enable): MSI's msi_count from the first, each MSI-X
+       entry's (msix_entries of them, allocated with the table), NULL for none. A message is
+       written again when its irq moves (irq_set_cpu) and made again where the units that
+       remapped it did not come back from a sleep (pci_resume). */
+    struct irq **msi_irqs, **msix_irqs;
+    uint8_t msi_count;
     bool kernel_owned; /* a kernel driver enabled it (pci_enable_busmaster): no app may claim it */
     bool claimed;      /* an app drives it (dev/pciuser.c) */
     bool iommu_blocked; /* in an ended claim's group: the IOMMU drops what it sends (dev/iommu.c) */
@@ -88,28 +88,24 @@ uint8_t pci_find_cap(const struct pci_device *d, uint8_t id);
 /* Extended capability (config offset 0x100 chain, PCIe): its offset, or 0. Needs ECAM. */
 uint16_t pci_find_ext_cap(const struct pci_device *d, uint16_t id);
 
-/* Message-signalled interrupts. All of them target a physical APIC id of at most 8 bits (the MSI
-   address, and the remapping entries dev/iommu.c writes, carry no more), so ids above 255 (x2APIC
-   systems with many CPUs) are refused. The address and data come from iommu_msi_message.
-   Device interrupts are handled on CPU 0: every message names pci_interrupt_dest(). */
-uint32_t pci_interrupt_dest(void); /* CPU 0's APIC ID, any CPU (read by pci_init on CPU 0) */
-/* Deliver the function's interrupt as `vector` on CPU 0 through MSI or MSI-X (entry 0). */
-bool pci_msi_enable(struct pci_device *d, uint8_t vector);
+/* Message-signalled interrupts, each message an irq of its own (arch/irq.h) whose address and
+   data come from iommu_msi_message. enable: up to count messages, specs[i] for message i, through
+   MSI-X where the function has it (entries 0 on, each on the CPU the interrupt layer chooses),
+   else MSI (a power of two up to its capability's, one aligned run of vectors on one CPU, PCI
+   Local Bus 3.0 6.8.1.3); INTx off. Returns how many it enabled, from the first, their irqs in
+   irqs (may be NULL); 0, and nothing changed, when none. An MSI-X entry, and a single MSI message
+   whose function can mask it, moves with irq_set_cpu (its message written again masked, 6.8.3.5).
+   disable: MSI and MSI-X off and the irqs freed; false when Enable readback or interrupt
+   remapping did not confirm the messages lead nowhere: the irqs then stay, never freed (their
+   vectors given to nothing else), their handlers still called with their contexts.
+   Any CPU, sleeping (arch/irq.h); one caller at a time per function. */
+struct irq_spec;
+unsigned pci_irq_enable(struct pci_device *d, const struct irq_spec *specs, unsigned count, struct irq **irqs);
+bool pci_irq_disable(struct pci_device *d);
 /* Number of messages the device's MSI capability supports (1, 2, 4 .. 32), 0 without MSI. */
 unsigned pci_msi_max_vectors(const struct pci_device *d);
-/* Enable `count` (power of two, <= pci_msi_max_vectors) MSI messages: message n arrives as base_vector + n,
-   so base_vector must be a multiple of count (irq_vector_alloc(count, count)). Clears any per-vector masks. */
-bool pci_msi_enable_multi(struct pci_device *d, uint8_t base_vector, unsigned count, uint32_t dest_apic_id);
-/* MSI-X: init enables MSI-X with the function mask set and every entry masked; returns the table size
-   (0 if unsupported). route programs an entry's address/data and leaves its mask state alone. Unmask the
-   entries you want with pci_msix_mask(), then drop the function mask. INTx is disabled by init. */
-unsigned pci_msix_init(struct pci_device *d);
-bool pci_msix_route(struct pci_device *d, unsigned entry, uint8_t vector, uint32_t dest_apic_id);
-void pci_msix_mask(struct pci_device *d, unsigned entry, bool masked);
-void pci_msix_function_mask(struct pci_device *d, bool masked);
-/* Turns off both MSI and MSI-X: false when Enable readback or interrupt remapping did not
-   confirm the function's messages lead nowhere; its vectors must not be given to anything else. */
-bool pci_msi_disable(struct pci_device *d);
+/* The MSI-X table's size from its capability, 0 without MSI-X. */
+unsigned pci_msix_max_vectors(const struct pci_device *d);
 /* Registers of the PCI Express capability (PCI Express Base 6.0, 7.5.3), at pcie_cap + offset */
 #define PCIE_CAPS    0x02
 #define PCIE_DEVCAP  0x04

@@ -4,6 +4,8 @@
 #include "kernel.h"
 #include "limine.h"
 #include "arch/cpu.h"
+#include "arch/ioapic.h"
+#include "arch/irq.h"
 #include "arch/spin.h"
 #include "dev/acpi.h"
 #include "dev/pci.h"
@@ -13,6 +15,8 @@
 #include "mm/heap.h"
 #include "sys/clock.h"
 #include "sys/sched.h"
+#include "sys/thread.h"
+#include "sys/wait.h"
 #include <uacpi/kernel_api.h>
 #include <uacpi/uacpi.h>
 #include <uacpi/event.h>
@@ -23,7 +27,9 @@
 #include "arch/wake.h"
 
 _Static_assert(sizeof(struct acpi_madt_lapic) == 8 && sizeof(struct acpi_madt_ioapic) == 12 &&
-               sizeof(struct acpi_madt_override) == 10 && sizeof(struct acpi_madt_x2apic) == 16,
+               sizeof(struct acpi_madt_override) == 10 && sizeof(struct acpi_madt_x2apic) == 16 &&
+               sizeof(struct acpi_madt_nmi_source) == 8 && sizeof(struct acpi_madt_lapic_nmi) == 6 &&
+               sizeof(struct acpi_madt_x2apic_nmi) == 12,
                "the MADT entries' formats");
 _Static_assert(sizeof(struct acpi_srat_apic) == 16 && sizeof(struct acpi_srat_memory) == 40 &&
                sizeof(struct acpi_srat_x2apic) == 24 && sizeof(struct acpi_slit) == 44 &&
@@ -157,12 +163,12 @@ const struct acpi_entry *acpi_entry_next(const struct acpi_sdt *table, uint32_t 
    uACPI is called from any CPU: the "acpi" kernel thread runs its deferred work (GPE methods,
    Notify), and threads that evaluate a method (dev/pciuser.c) or change the power state call in
    where they run. Its locks and events are counting semaphores, each a count under its own
-   spinlock with a wait queue; its spinlocks are the kernel's (arch/spin.h); the SCI is an ISA
-   interrupt through the 8259 like the other legacy lines, so it runs on CPU 0. */
+   spinlock with a wait queue; its spinlocks are the kernel's (arch/spin.h); the SCI is an IOAPIC
+   line of the interrupt layer's (uacpi_kernel_install_interrupt_handler). */
 static bool aml_ready;
 
-/* Any task waits where uACPI waits, the boot task too (it halts between the other tasks' turns,
-   sys/sched.h). While frozen (acpi_freeze) nothing blocks and nothing else runs: every other CPU
+/* Any thread waits where uACPI waits, the boot thread too (it halts between the other threads'
+   turns, sys/wait.h). While frozen (acpi_freeze) nothing blocks and nothing else runs: every other CPU
    is parked, and the devices are down or not yet back; a wait then spins on the clock. */
 static volatile bool frozen;
 
@@ -301,7 +307,7 @@ uacpi_status uacpi_kernel_wait_for_semaphore(uacpi_handle h, uacpi_u16 timeout) 
             if (!__atomic_exchange_n(&told, true, __ATOMIC_RELAXED))
                 kprintf("acpi: a lock is held across sleep, other threads run until it is given\n");
             sti(); /* let interrupts and other threads give the unit */
-            schedule();
+            sched_yield();
             cli();
         }
         spin_take(&s->lock);
@@ -319,7 +325,7 @@ void uacpi_kernel_signal_semaphore(uacpi_handle h) {
     spin_unlock(&s->lock, f);
 }
 
-uacpi_thread_id uacpi_kernel_get_thread_id(void) { return current_task; }
+uacpi_thread_id uacpi_kernel_get_thread_id(void) { return thread_current(); }
 /* This CPU's interrupts only, as uACPI asks: its state across CPUs is under its spinlocks. */
 uacpi_interrupt_state uacpi_kernel_disable_interrupts(void) { return irq_save(); }
 void uacpi_kernel_restore_interrupts(uacpi_interrupt_state s) { irq_restore(s); }
@@ -331,21 +337,22 @@ uacpi_status uacpi_kernel_handle_firmware_request(uacpi_firmware_request *r) {
     return UACPI_STATUS_OK;
 }
 
-/* The SCI is the only interrupt uACPI installs. It runs on CPU 0; sci_running counts the
-   handlers under way there, which uninstalling and uacpi_kernel_wait_for_work_completion, on
-   any CPU, wait out. */
+/* The SCI is the only interrupt uACPI installs: the FADT's SCI_INT, through the MADT's override
+   of it where there is one (ioapic_isa_gsi), an IOAPIC line that is level and shared, on the CPU
+   the interrupt layer chose. sci_running counts the handlers under way, which
+   uacpi_kernel_wait_for_work_completion waits out (irq_free does for uninstalling). */
 static uacpi_interrupt_handler sci_handler;
 static uacpi_handle sci_ctx;
-static int sci_irq = -1;
+static struct irq *sci;
+static uint32_t sci_gsi;
 static unsigned sci_running;
 
-static void sci_entry(struct regs *r) {
-    /* counted before the handler is read: an uninstall that saw none running then has its NULL
-       read here (both sequentially consistent) */
+static enum irq_result sci_entry(void *context) {
+    (void)context;
     __atomic_fetch_add(&sci_running, 1, __ATOMIC_SEQ_CST);
-    uacpi_interrupt_handler h = __atomic_load_n(&sci_handler, __ATOMIC_SEQ_CST);
-    if (h) h(sci_ctx);
+    uacpi_interrupt_ret r = sci_handler(sci_ctx);
     __atomic_fetch_sub(&sci_running, 1, __ATOMIC_RELEASE);
+    return r & UACPI_INTERRUPT_HANDLED ? IRQ_HANDLED : IRQ_NONE;
 }
 
 static void sci_wait_idle(void) {
@@ -354,21 +361,20 @@ static void sci_wait_idle(void) {
 
 uacpi_status uacpi_kernel_install_interrupt_handler(uacpi_u32 irq, uacpi_interrupt_handler h, uacpi_handle ctx,
                                                     uacpi_handle *out) {
-    if (irq >= 16 || sci_handler) return UACPI_STATUS_UNIMPLEMENTED;
+    if (sci) return UACPI_STATUS_UNIMPLEMENTED;
+    sci_handler = h;
     sci_ctx = ctx;
-    sci_irq = (int)irq;
-    __atomic_store_n(&sci_handler, h, __ATOMIC_SEQ_CST);
-    irq_register(sci_irq, sci_entry);
-    pic_unmask(sci_irq);
-    *out = &sci_irq;
+    sci_gsi = ioapic_isa_gsi(irq);
+    sci = irq_request_gsi(&(struct irq_spec){.name = "ACPI SCI", .handler = sci_entry, .node = -1}, sci_gsi);
+    if (!sci) return UACPI_STATUS_INTERNAL_ERROR;
+    *out = sci;
     return UACPI_STATUS_OK;
 }
 
 uacpi_status uacpi_kernel_uninstall_interrupt_handler(uacpi_interrupt_handler h, uacpi_handle irq) {
-    if (h != sci_handler) return UACPI_STATUS_INVALID_ARGUMENT;
-    irq_unregister(sci_irq, sci_entry);
-    __atomic_store_n(&sci_handler, NULL, __ATOMIC_SEQ_CST);
-    sci_wait_idle(); /* ctx may be freed once this returns */
+    if (!sci || h != sci_handler || irq != sci) return UACPI_STATUS_INVALID_ARGUMENT;
+    irq_free(sci); /* no handler runs from here on: ctx may be freed once this returns */
+    sci = NULL;
     return UACPI_STATUS_OK;
 }
 
@@ -412,8 +418,8 @@ void uacpi_kernel_schedule_work(uacpi_work_type type, uacpi_handle item, uacpi_w
 
 uacpi_status uacpi_kernel_wait_for_work_completion(void) {
     /* Frozen, the worker was idle when the freeze began (acpi_freeze) and cannot run: what is
-       queued since waits for the thaw. Otherwise the SCI handler under way on CPU 0 first (it may
-       still queue work), then the work. */
+       queued since waits for the thaw. Otherwise the SCI handler under way first (it may still
+       queue work), then the work. */
     if (frozen) return UACPI_STATUS_OK;
     sci_wait_idle();
     uint64_t f = spin_lock(&work_lock);
@@ -479,6 +485,9 @@ void acpi_aml_init(void) {
     uint64_t t0 = clock_now_ns();
     if (!aml_ok(uacpi_initialize(0), "uACPI initialisation")) return;
     if (!aml_ok(uacpi_namespace_load(), "loading the namespace")) return;
+    /* \_PIC(1) before any _INI or _PRT: the interrupts go through the IOAPICs (ACPI 6.5 5.8.1) */
+    if (!aml_ok(uacpi_set_interrupt_model(UACPI_INTERRUPT_MODEL_IOAPIC), "telling the firmware of the IOAPICs"))
+        return;
     if (!aml_ok(uacpi_namespace_initialize(), "initialising devices")) return;
     uacpi_bool hw_reduced = false;
     uacpi_is_platform_reduced_hardware(&hw_reduced);
@@ -488,8 +497,9 @@ void acpi_aml_init(void) {
     uacpi_find_devices("PNP0C0C", found_button, &buttons);
     if (!hw_reduced) aml_ok(uacpi_finalize_gpe_initialization(), "enabling GPEs");
     aml_ready = true;
-    kprintf("acpi: AML ready in %lu ms, SCI IRQ %d, power button: %s%s%u in the namespace\n",
-            (clock_now_ns() - t0) / NS_PER_MS, sci_irq, fixed ? "fixed" : "", fixed ? " + " : "", buttons);
+    kprintf("acpi: AML ready in %lu ms, SCI GSI %d, power button: %s%s%u in the namespace\n",
+            (clock_now_ns() - t0) / NS_PER_MS, sci ? (int)sci_gsi : -1, fixed ? "fixed" : "", fixed ? " + " : "",
+            buttons);
 }
 
 bool acpi_aml_ready(void) { return aml_ready; }
@@ -638,6 +648,69 @@ void *acpi_pci_node(const struct pci_device *d) {
         node = child_at(node, chain[n]->dev, chain[n]->func);
     }
     return node;
+}
+
+/* The interrupt descriptor number index of a link device's current resources (_CRS): its first
+   interrupt, a small IRQ descriptor's an ISA IRQ, an extended one's a GSI. */
+struct link_irq {
+    uint32_t index, at, gsi;
+    bool found, level, low;
+};
+
+static uacpi_iteration_decision link_irq_at(void *user, uacpi_resource *r) {
+    struct link_irq *l = user;
+    if (l->at++ != l->index) return UACPI_ITERATION_DECISION_CONTINUE;
+    if (r->type == UACPI_RESOURCE_TYPE_IRQ && r->irq.num_irqs) {
+        l->gsi = ioapic_isa_gsi(r->irq.irqs[0]);
+        l->level = r->irq.triggering == UACPI_TRIGGERING_LEVEL;
+        l->low = r->irq.polarity == UACPI_POLARITY_ACTIVE_LOW;
+        l->found = true;
+    } else if (r->type == UACPI_RESOURCE_TYPE_EXTENDED_IRQ && r->extended_irq.num_irqs) {
+        l->gsi = r->extended_irq.irqs[0];
+        l->level = r->extended_irq.triggering == UACPI_TRIGGERING_LEVEL;
+        l->low = r->extended_irq.polarity == UACPI_POLARITY_ACTIVE_LOW;
+        l->found = true;
+    }
+    return UACPI_ITERATION_DECISION_BREAK;
+}
+
+/* The entry of a _PRT for device dev's pin (0 = INTA): a GSI, level and active low, or the
+   interrupt its link device has now (ACPI 6.5 6.2.13). */
+static bool prt_gsi(const uacpi_pci_routing_table *t, uint8_t dev, unsigned pin, uint32_t *gsi) {
+    for (size_t i = 0; i < t->num_entries; i++) {
+        const uacpi_pci_routing_table_entry *e = &t->entries[i];
+        if (e->address >> 16 != dev || e->pin != pin) continue;
+        if (!e->source) {
+            *gsi = e->index;
+            return ioapic_gsi_signal(e->index, true, true);
+        }
+        struct link_irq l = {.index = e->index};
+        if (uacpi_for_each_device_resource(e->source, "_CRS", link_irq_at, &l) != UACPI_STATUS_OK || !l.found)
+            return false;
+        *gsi = l.gsi;
+        return ioapic_gsi_signal(l.gsi, l.level, l.low);
+    }
+    return false;
+}
+
+bool acpi_pci_gsi(const struct pci_device *d, uint32_t *gsi) {
+    if (!aml_ready || !d) return false;
+    unsigned pin = (pci_read32(d->bus, d->dev, d->func, 0x3C) >> 8) & 0xFF; /* 1 = INTA .. 4 = INTD */
+    if (pin < 1 || pin > 4) return false;
+    pin--;
+    for (unsigned depth = 0; d && depth < PCI_DEPTH_MAX; depth++) {
+        uacpi_namespace_node *bus = d->upstream ? acpi_pci_node(d->upstream) : acpi_pci_host(d);
+        uacpi_pci_routing_table *table;
+        if (bus && uacpi_get_pci_routing_table(bus, &table) == UACPI_STATUS_OK) {
+            bool found = prt_gsi(table, d->dev, pin, gsi);
+            uacpi_free_pci_routing_table(table);
+            return found;
+        }
+        /* a bridge without a _PRT: its own pin carries it (PCI-to-PCI Bridge 1.2, 9.1) */
+        pin = (pin + d->dev) % 4;
+        d = d->upstream;
+    }
+    return false;
 }
 
 void *acpi_node_child(void *node, uint32_t index) {

@@ -6,7 +6,7 @@
 #include "dev/usb.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
-#include "sys/sched.h"
+#include "sys/wait.h"
 
 #define HUB_PORTS 15 /* a route string tier has four bits */
 

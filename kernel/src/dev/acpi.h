@@ -72,8 +72,18 @@ enum {
     ACPI_MADT_LAPIC = 0,      /* struct acpi_madt_lapic */
     ACPI_MADT_IOAPIC = 1,     /* struct acpi_madt_ioapic */
     ACPI_MADT_OVERRIDE = 2,   /* struct acpi_madt_override */
+    ACPI_MADT_NMI_SOURCE = 3, /* struct acpi_madt_nmi_source */
+    ACPI_MADT_LAPIC_NMI = 4,  /* struct acpi_madt_lapic_nmi */
     ACPI_MADT_X2APIC = 9,     /* struct acpi_madt_x2apic */
+    ACPI_MADT_X2APIC_NMI = 10, /* struct acpi_madt_x2apic_nmi */
 };
+/* The MPS INTI flags of an override and an NMI entry (Table 5.26): polarity in bits 1:0, trigger
+   in bits 3:2; 00 is the bus's own, 01 active high / edge, 11 active low / level. */
+#define ACPI_INTI_POLARITY(flags) ((flags) & 3u)
+#define ACPI_INTI_TRIGGER(flags)  (((flags) >> 2) & 3u)
+#define ACPI_INTI_BUS  0u
+#define ACPI_INTI_HIGH 1u /* polarity: active high; trigger: edge */
+#define ACPI_INTI_LOW  3u /* polarity: active low; trigger: level */
 #define ACPI_CPU_ENABLED        1u /* a processor entry's flags: present and usable now */
 #define ACPI_CPU_ONLINE_CAPABLE 2u /* not enabled now, may be brought online later */
 struct acpi_madt_lapic {
@@ -96,6 +106,23 @@ struct acpi_madt_x2apic {
     struct acpi_entry e;
     uint16_t reserved;
     uint32_t apic_id, flags, uid;
+} __attribute__((packed));
+struct acpi_madt_nmi_source { /* an IOAPIC input that is an NMI, no device's (5.2.12.6) */
+    struct acpi_entry e;
+    uint16_t flags;
+    uint32_t gsi;
+} __attribute__((packed));
+struct acpi_madt_lapic_nmi { /* the LINT# NMI comes in on (5.2.12.7) */
+    struct acpi_entry e;
+    uint8_t uid; /* FFh: every processor */
+    uint16_t flags;
+    uint8_t lint;
+} __attribute__((packed));
+struct acpi_madt_x2apic_nmi { /* the same with a 32-bit UID, FFFFFFFFh: every one (5.2.12.13) */
+    struct acpi_entry e;
+    uint16_t flags;
+    uint32_t uid;
+    uint8_t lint, reserved[3];
 } __attribute__((packed));
 
 /* ---- SRAT (5.2.16): entries from byte 48 ---- */
@@ -180,6 +207,12 @@ bool acpi_reset(void);
 struct pci_device;
 void *acpi_pci_node(const struct pci_device *d);
 void *acpi_pci_host(const struct pci_device *d);
+/* The GSI a function's INTx reaches (ACPI 6.5 6.2.13, _PRT): its Interrupt Pin, swizzled at each
+   bridge without a _PRT of its own, looked up in the nearest _PRT above it, a GSI there or the
+   current interrupt of the link device it names; its signal told to the IOAPICs
+   (ioapic_gsi_signal) for irq_request_gsi. False without a pin, a route, a link setting, or AML.
+   Sleeps. */
+bool acpi_pci_gsi(const struct pci_device *d, uint32_t *gsi);
 void *acpi_node_child(void *node, uint32_t index);
 /* Whether s is one name segment: 4 characters of A-Z, 0-9 and _, the first not a digit (names of
    fewer characters are padded with _, as "_ON_"). Names starting with _ are ACPI's predefined

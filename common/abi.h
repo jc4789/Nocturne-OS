@@ -273,20 +273,13 @@ struct n_sysinfo {
 struct n_clockinfo {
     uint32_t version, flags;
     uint64_t tsc_hz, tsc_sample, uptime_ms;
-    uint64_t reference_page, reference_sample_100ns;
 };
 #define N_CLOCK_USER_TSC 1u
-#define N_CLOCK_HV_REFERENCE 2u
-/* Read-only Hyper-V reference page. Hypervisor updates use sequence protocol. */
-struct n_reference_tsc {
-    volatile uint32_t sequence;
-    uint32_t reserved;
-    volatile uint64_t scale;
-    volatile int64_t offset;
-};
 
-/* worker_cpus: the online APs, all of which run kernel jobs. scheduler_cpus:
-   CPU 0 plus the APs that also run user tasks, so the two overlap. */
+/* SYS_CPU_INFO. detected_cpus: the CPUs the firmware lists; online_cpus: those running;
+   scheduler_cpus: those that run apps' threads, every online one. The kernel spreads no work of its
+   own over CPUs: worker_cpus, parallel_jobs and worker_chunks are 0, and N_CPU_AP_WORKERS is never
+   set. */
 struct n_cpuinfo {
     uint32_t version, detected_cpus, online_cpus, worker_cpus, scheduler_cpus, flags;
     uint64_t parallel_jobs, worker_chunks;

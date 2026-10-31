@@ -55,18 +55,25 @@ bool iommu_map(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, 
 bool iommu_unmap(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count);
 
 /* Interrupt messages (dev/pci.c). The address and data that make message `index` of d (the
-   first of `count` for MSI, whose message n arrives as vector + n; an MSI-X entry with count 1)
-   arrive as `vector` on the CPU with APIC id dest: the remappable form where the units remap
-   that function's interrupts, the plain one otherwise. False when it cannot be delivered.
+   first of `count` for MSI, whose message n arrives as the irq's vector + n, arch/irq.h; an MSI-X
+   entry with count 1) arrive where irq is delivered (irq_target): the remappable form where the
+   units remap that function's interrupts, the plain one otherwise (irq_msi_message). False when
+   it cannot be delivered.
    clear: the function's messages lead nowhere any more (its MSI and MSI-X are off); false when
    the units did not confirm that, so that its vectors may still be reached. */
-bool iommu_msi_message(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
+struct irq;
+bool iommu_msi_message(struct pci_device *d, unsigned index, unsigned count, const struct irq *irq,
                        uint32_t *address, uint32_t *data);
 bool iommu_msi_clear(struct pci_device *d);
-/* An IOAPIC redirection entry (arch/ioapic.c) for GSI gsi of the IOAPIC with this MADT id, given
-   in the plain format and made what to write: remappable where interrupt remapping covers the
-   IOAPICs. False when it cannot be delivered (the pin then stays masked). */
-bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte);
+/* An IOAPIC redirection entry (arch/ioapic.c) for GSI gsi of the IOAPIC with this MADT id to the
+   CPU with APIC ID dest, given in the plain format (an 8-bit destination there, 0 above 255) and
+   made what to write: remappable where interrupt remapping covers the IOAPICs. False when it
+   cannot be delivered (the pin then stays masked). */
+bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_t *rte);
+/* Every interrupt route the units give now carries a 32-bit destination: messages and IOAPIC
+   pins alike are remapped in x2APIC format (VT-d Extended Interrupt Mode). Without it a device's
+   interrupt names an APIC ID of 8 bits only (arch/irq.c). Any CPU. */
+bool iommu_irq_wide(void);
 /* Sleep (dev/pm.c): the units come back reset; resume programs them again from the tables in
    memory, before the IOAPICs and devices are, and only after the machine really slept (an
    aborted sleep leaves them on). NULL once they are back. Units that do not come back are
@@ -78,11 +85,6 @@ bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte);
    whose image brings tables of its own. Interrupts off. */
 const char *iommu_resume(void);
 bool iommu_shutdown(void); /* false: do not overwrite the hardware's live tables */
-/* Why the units keep the CPUs out of x2APIC mode, or NULL: the firmware asks for it (VT-d
-   X2APIC_OPT_OUT), or a unit remaps interrupts in xAPIC format only (VT-d without EIM, AMD-Vi
-   without XTSup and GASup). For apic_init, before pci_init and iommu_init: read from the
-   firmware's tables and the units' registers alone, nothing written. */
-const char *iommu_x2apic_conflict(void);
 
 /* ---- for the back ends ---- */
 #define IOMMU_READ  1u
@@ -109,10 +111,11 @@ struct iommu_domain {
    flush with the domain's map mutex, ioapic under arch/ioapic.c's lock, msi and msi_clear from
    a driver's thread or the sleep path, start, resume and shutdown from the power paths. Each back
    end puts its units' queues and tables under one spinlock of its own, taken after all of those
-   and taken in its fault or event interrupt handler (CPU 0) too. */
+   and taken in its fault or event interrupt handler (on whichever CPU that is) too. */
 struct iommu_hw {
     const char *name;
     bool interrupt_remapping_required; /* stopped units cannot deliver plain interrupts (VT-d IRREQ) */
+    bool irq_wide; /* set by probe: every message and IOAPIC entry is remapped with a 32-bit destination */
     bool coherent;   /* the units snoop their table reads; else every written entry is flushed */
     unsigned levels; /* of a claimed function's page tables */
     unsigned iova_bits; /* usable input address width shared by every translating unit */
@@ -139,7 +142,7 @@ struct iommu_hw {
     bool (*msi)(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
                 uint32_t *address, uint32_t *data);
     bool (*msi_clear)(struct pci_device *d);
-    bool (*ioapic)(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte);
+    bool (*ioapic)(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_t *rte);
     bool (*resume)(void);
     bool (*shutdown)(void);
 };
@@ -150,9 +153,6 @@ struct iommu_hw {
    mandatory interrupt remapping (VT-d IRREQ) is not plain-safe even with every enable clear. */
 const struct iommu_hw *iommu_amd_probe(bool *plain_safe);
 const struct iommu_hw *iommu_intel_probe(bool *plain_safe);
-/* iommu_x2apic_conflict for the units each back end describes */
-const char *iommu_amd_x2apic_conflict(void);
-const char *iommu_intel_x2apic_conflict(void);
 /* What the back ends find in the firmware's tables while they probe.
    reserved: memory the functions with requester IDs first..last reach by DMA as it is (AMD-Vi
    IVMD, VT-d RMRR) with IOMMU_READ / IOMMU_WRITE access, mapped in their domains when claimed.

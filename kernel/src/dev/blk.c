@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "dev/blk.h"
-#include "sys/sched.h"
+#include "sys/thread.h"
+#include "sys/wait.h"
 
 /* The devices, in the order their drivers found them (a USB disk at any time), never removed.
    devs_lock serializes the appends; a reader reads ndevs with acquire, then the entries below it,
@@ -29,18 +30,18 @@ int blk_count(void) { return __atomic_load_n(&ndevs, __ATOMIC_ACQUIRE); }
 
 struct blkdev *blk_get(int i) { return i >= 0 && i < blk_count() ? devs[i] : NULL; }
 
-/* The power gate: holder (the one task that reaches the disks while it is set) and inflight (the
-   requests under way), under gate_lock. A request waits for holder, and blk_hold for inflight, in
-   gate_wq, looking under the lock and enrolled before it is given back. The lock comes before
-   gate_wq's. */
+/* The power gate: holder (the one thread that reaches the disks while it is set) and inflight
+   (the requests under way), under gate_lock. A request waits for holder, and blk_hold for
+   inflight, in gate_wq, looking under the lock and enrolled before it is given back. The lock
+   comes before gate_wq's. */
 static struct spinlock gate_lock;
 static struct wait_queue gate_wq;
-static struct task *holder;
+static struct thread *holder;
 static unsigned inflight;
 
 static void enter(void) {
     uint64_t f = spin_lock(&gate_lock);
-    while (holder && holder != current_task) {
+    while (holder && holder != thread_current()) {
         wq_wait_locked(&gate_wq, &gate_lock);
         spin_take(&gate_lock);
     }
@@ -128,7 +129,7 @@ int blk_persist(struct blkdev *d) {
 
 void blk_hold(void) {
     uint64_t f = spin_lock(&gate_lock);
-    holder = current_task;
+    holder = thread_current();
     while (inflight) {
         wq_wait_locked(&gate_wq, &gate_lock);
         spin_take(&gate_lock);

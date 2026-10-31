@@ -9,7 +9,7 @@
 #include "fs/cache.h"
 #include "kernel.h"
 #include "mm/heap.h"
-#include "sys/sched.h"
+#include "sys/wait.h"
 
 #define STAGE_BLOCKS 64u   /* blocks read in one request */
 #define FIRST_BUCKETS 1024u

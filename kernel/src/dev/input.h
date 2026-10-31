@@ -34,6 +34,7 @@ struct mouse_event {
 typedef void (*key_sink_t)(const struct key_event *e);
 typedef void (*mouse_sink_t)(const struct mouse_event *e);
 
+/* Once at boot: the modifiers back to none after each sleep. */
 void input_init(void);
 /* The sinks get every key and pointer move, one at a time, with interrupts off under the input
    lock: a sink does not sleep or take a mutex. */

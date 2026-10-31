@@ -16,8 +16,8 @@
 #include "store/namespace.h"
 #include "fs/store.h"
 #include "arch/spin.h"
-#include "sys/sched.h"
 #include "sys/syscall.h"
+#include "sys/wait.h"
 
 struct handle;
 
@@ -28,12 +28,10 @@ struct store {
     uint64_t temp_names;     /* the last name given there (atomic) */
     struct mutex moves;      /* moves from one folder to another, one at a time */
     struct mutex committing; /* commits, one at a time */
-    /* The gate: changes under way, and a freeze that waits for them to end (closing), which a
-       change that comes after it waits for in turn (open). */
-    struct spinlock gate;
-    unsigned changes;
-    bool closing;
-    struct wait_queue open, drained;
+    /* The gate: changes hold it to read, many at once; a commit's freeze holds it to write, once
+       the changes under way have ended, and a change that comes after the freeze began waits for
+       it in turn. */
+    struct rwmutex gate;
     /* The writer: changes reach the medium a few seconds after the first of them. dirty_lock
        guards dirty and soon, which any CPU sets (store_dirty) and the writer waits for in kick; it
        comes before kick's lock. */

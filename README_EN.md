@@ -55,7 +55,11 @@ general-purpose OS for daily use (see [Limits](#limits)).
     idle APs taking waiting threads, and keeping a thread when a switch costs more than it gains.
   - TLB shootdown by IPI, PCID, AVX state saved with XSAVE, top performance set through CPPC or HWP on real
     hardware, and a sampling profiler (`prof`).
-  - The clock is a 1 kHz local APIC timer (or the PIT); ticks are derived from the TSC or Hyper-V's reference clock.
+  - The clock is the TSC alone (an invariant TSC is required on hardware). Its rate starts at boot from the P0
+    P-state's nominal frequency (PStateDef's FID and DID) on hardware, or the hypervisor's word in a VM; on hardware
+    it is measured on against the HPET over windows that double (spread spectrum and the like), and stays nominal
+    where there is no HPET. The wall clock is set from the RTC's second edge. There is no periodic tick: each CPU's
+    local APIC timer interrupts once, at its next deadline.
 - **Memory**: 4-level paging, an address space for every app, and a kernel heap.
   - W^X: no page is ever both writable and executable. Generated code is written first and then made executable.
   - The native memory API (`n_memory_reserve`, `protect`, `release`) and shared pages. Shared pages reach another

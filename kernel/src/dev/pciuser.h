@@ -10,7 +10,6 @@ struct handle;
 struct n_pci_function;
 struct pci_claim;
 int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct handle **out);
-bool pci_user_is_claim(struct handle *h);
 /* The claim record behind a handle, held by a BAR or DMA object for its whole life (NULL when h
    is no claim). revoked: its last handle closed, so its BARs are no longer the app's to map.
    dma_reusable: its driver still owns the live claim, or the IOMMU confirmed the ended claim's

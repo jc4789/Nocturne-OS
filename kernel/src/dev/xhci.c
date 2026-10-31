@@ -2,6 +2,7 @@
  * lifecycle on them, and the single "usb" thread that drives every controller and class driver. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/irq.h"
 #include "arch/spin.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
@@ -10,13 +11,13 @@
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "sys/clock.h"
-#include "sys/sched.h"
+#include "sys/thread.h"
+#include "sys/wait.h"
 
 #define MAX_HC 8
 #define RING_TRBS 256 /* one page; the last entry links back to the first */
 #define EV_PAGES 4    /* the event ring: one contiguous segment */
 #define EV_TRBS (EV_PAGES * 256)
-#define VEC_XHCI 0x40 /* MSI vectors 0x40.. one per controller */
 
 struct trb {
     uint64_t param;
@@ -166,7 +167,8 @@ struct usb_hc {
     volatile bool cmd_done;
     uint64_t cmd_trb;
     uint8_t cmd_cc, cmd_slot;
-    uint8_t vector; /* 0: polled */
+    struct irq *irq; /* its MSI or MSI-X message, once enabled (pci_irq_enable) */
+    bool irq_on;     /* interrupts are handled; else polled */
     bool running, recover, irq_seen, failed;
     volatile bool woke; /* back from a sleep, which reset it: start over on the usb thread */
     volatile uint32_t interrupts;
@@ -181,14 +183,14 @@ struct usb_hc {
 static struct usb_hc controllers[MAX_HC];
 static int ncontrollers;
 /* Between the usb thread and the others: usb_kick, usb_more, the calls and each call's done, and
-   what CPU 0's interrupt handler reads of a controller (running, vector). The usb thread's waits
+   what the interrupt handler reads of a controller (running, irq_on). The usb thread's waits
    look at usb_kick under it (wq_wait_locked). Taken alone: only the wait queues' locks under it. */
 static struct spinlock usb_lock;
 static struct wait_queue usb_wq;
 static bool usb_kick; /* wakes whichever wait runs; nested waits consume it */
 static bool usb_more; /* work for the main loop; only the main loop clears it */
 static uint64_t usb_deadline;  /* earliest endpoint recovery retry (CLOCK_NEVER = none) */
-static struct task *usb_task;
+static struct thread *usb_task;
 static bool usb_settled; /* the first pass over every port and hub is done (atomic: read by others) */
 /* The endpoints that send (struct endpoint): usb_send on any task, the usb thread's completions and
    recoveries. Taken alone, never across a wait. */
@@ -224,11 +226,11 @@ static void usb_wake(bool more) {
 
 void usb_note_work(void) { usb_wake(true); }
 
-/* What CPU 0's handler (xhci_isr) reads of a controller. */
-static void hc_set_irq(struct usb_hc *hc, bool running, uint8_t vector) {
+/* What the handler (xhci_isr) reads of a controller. */
+static void hc_set_irq(struct usb_hc *hc, bool running, bool irq_on) {
     uint64_t f = spin_lock(&usb_lock);
     hc->running = running;
-    hc->vector = vector;
+    hc->irq_on = irq_on;
     spin_unlock(&usb_lock, f);
 }
 
@@ -452,7 +454,7 @@ static void poll_all(void) {
 
 static bool any_polled(void) {
     for (int i = 0; i < ncontrollers; i++)
-        if (controllers[i].running && !controllers[i].vector) return true;
+        if (controllers[i].running && !controllers[i].irq_on) return true;
     return false;
 }
 
@@ -475,12 +477,11 @@ static bool hc_wait(volatile bool *flag, uint64_t deadline) {
     }
 }
 
-/* CPU 0. */
-static void xhci_isr(struct regs *r) {
+/* The controller's message, on the CPU its irq is delivered to. */
+static enum irq_result xhci_isr(void *context) {
+    struct usb_hc *hc = context;
     uint64_t f = spin_lock(&usb_lock);
-    for (int i = 0; i < ncontrollers; i++) {
-        struct usb_hc *hc = &controllers[i];
-        if (!hc->running || hc->vector != r->vector) continue;
+    if (hc->running && hc->irq_on) {
         wr32(hc->op, USBSTS, STS_EINT);
         wr32(hc->rt, IMAN, 3);
         __atomic_fetch_add(&hc->interrupts, 1, __ATOMIC_RELAXED);
@@ -488,6 +489,7 @@ static void xhci_isr(struct regs *r) {
     usb_kick = true;
     wq_wake_all(&usb_wq);
     spin_unlock(&usb_lock, f);
+    return IRQ_HANDLED;
 }
 
 /* Stopped, halted by a fatal error, or gone from the bus (reads all ones): nothing it is given
@@ -822,7 +824,7 @@ int usb_clear_halt(struct usb_device *d, uint8_t address) {
 int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, unsigned timeout_ms) {
     struct xdev *xd = (struct xdev *)d;
     struct endpoint *ep = find_endpoint(d, address);
-    if (!ep || current_task != usb_task || ep->type != 2 || (ep->mode && ep->mode != EP_SYNC) || len > SYNC_BYTES ||
+    if (!ep || thread_current() != usb_task || ep->type != 2 || (ep->mode && ep->mode != EP_SYNC) || len > SYNC_BYTES ||
         hc_dead(d->hc))
         return -1;
     if (!ep->mode) {
@@ -1333,16 +1335,17 @@ static bool hc_start(struct usb_hc *hc) {
     wr64(hc->rt, ERDP, hc->ev_phys);
     wr64(hc->rt, ERSTBA, hc->erst_phys);
     wr32(hc->rt, IMOD, 1000); /* at most one interrupt per 250 us */
-    uint8_t vector = (uint8_t)(VEC_XHCI + hc->index);
-    vector_register(vector, xhci_isr);
-    if (!pci_msi_enable(pci, vector)) vector = 0;
+    /* once: a restart's reset leaves the function's configuration as it was */
+    if (!hc->irq) pci_irq_enable(pci, &(struct irq_spec){.name = "xHCI", .handler = xhci_isr, .context = hc, .node = -1},
+                                 1, &hc->irq);
+    bool irq_on = hc->irq;
     /* a polled controller raises no interrupt at all: its legacy line may be shared and unhandled */
-    wr32(hc->rt, IMAN, vector ? 3 : 1);
-    hc_set_irq(hc, true, vector);
-    wr32(hc->op, USBCMD, 1 | (vector ? CMD_INTE : 0));
+    wr32(hc->rt, IMAN, irq_on ? 3 : 1);
+    hc_set_irq(hc, true, irq_on);
+    wr32(hc->op, USBCMD, 1 | (irq_on ? CMD_INTE : 0));
     if (!wait_reg(hc->op, USBSTS, STS_HCH, 0, 100 * NS_PER_MS)) {
         kprintf("usb: controller %d did not start\n", hc->index);
-        hc_set_irq(hc, false, vector);
+        hc_set_irq(hc, false, irq_on);
         return false;
     }
     if (hcc1 & 8) /* port power control */
@@ -1353,7 +1356,7 @@ static bool hc_start(struct usb_hc *hc) {
     sleep_until(clock_after(20 * NS_PER_MS));
     for (unsigned p = 1; p <= hc->max_ports; p++) hc->port_pending[p >> 5] |= 1u << (p & 31);
     kprintf("usb: xHCI %d (%04x:%04x) version %x, %u ports, %u slots, %s\n", hc->index, pci->vendor, pci->device,
-            rd32(hc->cap, 0) >> 16, hc->max_ports, hc->max_slots, hc->vector ? "MSI" : "polled");
+            rd32(hc->cap, 0) >> 16, hc->max_ports, hc->max_slots, hc->irq_on ? "MSI" : "polled");
     return true;
 }
 
@@ -1362,7 +1365,7 @@ static bool hc_start(struct usb_hc *hc) {
  * then bring it up again and enumerate from scratch. A controller that keeps failing is left off.
  * After a sleep the same happens, without counting as a failure: the devices lost their addresses. */
 static void hc_restart(struct usb_hc *hc, bool after_sleep) {
-    hc_set_irq(hc, false, hc->vector);
+    hc_set_irq(hc, false, hc->irq_on);
     wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~(1u | CMD_INTE));
     wait_reg(hc->op, USBSTS, STS_HCH, STS_HCH, 50 * NS_PER_MS);
     wr32(hc->op, USBCMD, 2);
@@ -1409,8 +1412,9 @@ static void run_calls(void) {
     }
 }
 
-/* Until the usb thread has run the call. The boot task, which runs kmain_late and then becomes the
- * idle task, waits the same way: it lets the others run and halts in between (sys/sched.h). */
+/* Until the usb thread has run the call. The boot thread, which runs kmain_late and then becomes
+ * CPU 0's idle thread, waits the same way: it lets the others run and halts in between
+ * (sys/wait.h). */
 static void wait_call(struct usb_call *c) {
     uint64_t f = spin_lock(&usb_lock);
     while (!c->done) {
@@ -1421,7 +1425,7 @@ static void wait_call(struct usb_call *c) {
 }
 
 void usb_run(void (*fn)(void *arg), void *arg) {
-    if (current_task == usb_task) {
+    if (thread_current() == usb_task) {
         fn(arg);
         return;
     }
@@ -1446,6 +1450,7 @@ static bool any_port_pending(void) {
 
 static void usb_thread(void *arg) {
     (void)arg;
+    sched_set_policy(thread_current(), sched_realtime(SCHED_PRIORITY_INPUT)); /* the keyboard's and the pointer's reports */
     for (int i = 0; i < ncontrollers; i++) hc_start(&controllers[i]);
     uint64_t settle_at = clock_after(500 * NS_PER_MS);
     for (;;) {
@@ -1460,14 +1465,16 @@ static void usb_thread(void *arg) {
             uint32_t interrupts = __atomic_load_n(&hc->interrupts, __ATOMIC_RELAXED);
             if (interrupts && !hc->irq_seen) { /* the boot log shows that MSI really arrives */
                 hc->irq_seen = true;
-                kprintf("usb: controller %d interrupts arriving (vector 0x%x)\n", hc->index, hc->vector);
+                struct irq_target to = irq_target(hc->irq);
+                kprintf("usb: controller %d interrupts arriving (cpu %u, vector 0x%x)\n", hc->index, to.cpu,
+                        to.vector);
             }
-            if (hc->running && hc->vector && !interrupts && hc->events >= 16) {
+            if (hc->running && hc->irq_on && !interrupts && hc->events >= 16) {
                 /* events keep coming but no interrupt ever did: the message goes nowhere */
                 kprintf("usb: controller %d interrupts never arrive, polling instead\n", hc->index);
                 wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~CMD_INTE);
                 wr32(hc->rt, IMAN, 1);
-                hc_set_irq(hc, hc->running, 0);
+                hc_set_irq(hc, hc->running, false);
             }
             if (hc->woke) {
                 hc->woke = false;

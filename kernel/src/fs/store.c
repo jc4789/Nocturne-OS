@@ -13,6 +13,7 @@
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "sys/object.h"
+#include "sys/thread.h"
 
 #define WRITE_DELAY_NS (5 * NS_PER_S) /* the first change waits this long for more to commit with it */
 #define FIND_NS (10 * NS_PER_S)       /* how long the disk the system started from may take to appear */
@@ -419,16 +420,14 @@ static int user_ready(uint64_t users) {
 }
 
 static void writer(void *arg);
-static void gate_close(void);
-static void gate_open(void);
 
 void store_start(void) {
     struct volume *v = store.v;
     /* not before: a hibernation image goes back to the volume as it was */
     mutex_lock(&store.committing);
-    gate_close();
+    rwmutex_lock_write(&store.gate);
     store_grow(v);
-    gate_open();
+    rwmutex_unlock_write(&store.gate);
     mutex_unlock(&store.committing);
     uint64_t system = 0, users = 0;
     int r = folder_at(STORE_ID_ROOT, "Nocturne", STORE_SYSTEM, &system);
@@ -443,51 +442,22 @@ void store_start(void) {
 
 /* ---- the gate ---- */
 
+/* A change holds the gate to read: no freeze from here to change_end. */
 uint64_t change_begin(void) {
-    uint64_t flags = spin_lock(&store.gate);
-    while (store.closing) {
-        wq_wait_locked(&store.open, &store.gate);
-        spin_take(&store.gate);
-    }
-    store.changes++;
-    uint64_t g = __atomic_load_n(&store.v->generation, __ATOMIC_ACQUIRE);
-    spin_unlock(&store.gate, flags);
-    return g;
+    rwmutex_lock_read(&store.gate);
+    return __atomic_load_n(&store.v->generation, __ATOMIC_ACQUIRE);
 }
 
-void change_end(void) {
-    uint64_t flags = spin_lock(&store.gate);
-    bool last = !--store.changes && store.closing;
-    spin_unlock(&store.gate, flags);
-    if (last) wq_wake_all(&store.drained);
-}
+void change_end(void) { rwmutex_unlock_read(&store.gate); }
 
-/* No change under way from gate_close to gate_open, and none begins: the changes under way end
-   first, and the ones that come after wait. store.committing held. */
-static void gate_close(void) {
-    uint64_t flags = spin_lock(&store.gate);
-    store.closing = true;
-    while (store.changes) {
-        wq_wait_locked(&store.drained, &store.gate);
-        spin_take(&store.gate);
-    }
-    spin_unlock(&store.gate, flags);
-}
-
-static void gate_open(void) {
-    uint64_t flags = spin_lock(&store.gate);
-    store.closing = false;
-    spin_unlock(&store.gate, flags);
-    wq_wake_all(&store.open);
-}
-
-/* The open generation's commit (1: nothing changed in it). store.committing held. */
+/* The open generation's commit (1: nothing changed in it). store.committing held. The freeze holds
+   the gate to write: the changes under way end first, and the ones that come after wait. */
 static int commit_locked(void) {
     struct volume *v = store.v;
     struct store_commit c;
-    gate_close();
+    rwmutex_lock_write(&store.gate);
     int r = volume_freeze(v, &c);
-    gate_open();
+    rwmutex_unlock_write(&store.gate);
     if (!r) {
         r = volume_write(v, &c);
         volume_written(v, &c, r);

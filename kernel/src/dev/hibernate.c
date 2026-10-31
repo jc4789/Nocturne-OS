@@ -12,6 +12,8 @@
    before the snapshot, so the restored kernel finds in it what to free. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/irq.h"
+#include "arch/lapic_timer.h"
 #include "arch/ioapic.h"
 #include "arch/smp.h"
 #include "arch/wake.h"
@@ -32,7 +34,7 @@
 void power_reboot(void); /* dev/power.c */
 
 #define IMAGE_PATH  "C:\\Nocturne\\Hibernate"
-#define VERSION     2
+#define VERSION     3 /* 3: the wake page's layout (arch/wake.asm) and the last copy changed */
 #define VALID       1
 #define CONSUMED    2
 #define BLOCK_PAGES 16
@@ -60,7 +62,7 @@ struct block {
     uint64_t check;        /* of the pages */
 };
 
-/* the last copy's list (arch/wake.asm): physical addresses, src 0 for a page of zeros */
+/* the last copy's list (hib_copy_start): physical addresses, src 0 for a page of zeros */
 #define PAIRS ((PAGE_SIZE - 16) / 16)
 struct pair_page {
     uint64_t next, count;
@@ -488,7 +490,7 @@ static bool get(struct reader *rd, void *dst, size_t n) {
     return true;
 }
 
-/* all of RAM one to one in 2 MiB pages, for the last copy (its kernel half comes in arch/wake.c) */
+/* all of RAM one to one in 2 MiB pages, for the last copy (its kernel half comes in restore_jump) */
 static uint64_t identity_tables(struct restore *r) {
     uint64_t gib = (pmm_page_count() * PAGE_SIZE + (1ULL << 30) - 1) >> 30;
     if (gib > 256 * 512) return 0;
@@ -508,6 +510,65 @@ static uint64_t identity_tables(struct restore *r) {
         l3[g % 512] = pd | PTE_P | PTE_W;
     }
     return pml4;
+}
+
+/* The last copy, which runs from the spare page below 1 MiB (arch/wake.h) that neither this kernel
+   nor the image uses, on identity_tables' page table, interrupts off:
+     rdi  the first page of the copy list (struct pair_page), physical
+     rsi  the image's wake page, which the image's wake_sleep prepared before its snapshot
+     rdx  where a CPU in long mode enters that page's code (wake_long_entry)
+   Every pair is copied, then the image's own wake page table (the first 2 MiB one to one and the
+   image's kernel half) is loaded, and the image comes back through its wake page as from S3, with
+   rbx = the page. Its jumps are relative, so it runs wherever it is copied. */
+extern const uint8_t hib_copy_start[], hib_copy_end[];
+__asm__(".pushsection .text\n"
+        ".globl hib_copy_start, hib_copy_end\n"
+        "hib_copy_start:\n"
+        "    movq %rdi, %r12\n"
+        "    movq %rsi, %r15\n"
+        "    movq %rdx, %r11\n"
+        "    cld\n"
+        "1:  testq %r12, %r12\n" /* the next page of pairs */
+        "    jz 5f\n"
+        "    movq 8(%r12), %r13\n"
+        "    leaq 16(%r12), %r14\n"
+        "2:  testq %r13, %r13\n" /* the next pair */
+        "    jz 4f\n"
+        "    movq (%r14), %rdi\n"
+        "    movq 8(%r14), %rsi\n"
+        "    movl $512, %ecx\n"
+        "    testq %rsi, %rsi\n"
+        "    jz 3f\n"
+        "    rep movsq\n"
+        "    jmp 6f\n"
+        "3:  xorl %eax, %eax\n"
+        "    rep stosq\n"
+        "6:  addq $16, %r14\n"
+        "    decq %r13\n"
+        "    jmp 2b\n"
+        "4:  movq (%r12), %r12\n"
+        "    jmp 1b\n"
+        "5:  leaq 0x1000(%r15), %rax\n"
+        "    movq %rax, %cr3\n"
+        "    movl %r15d, %ebx\n"
+        "    jmp *%r11\n"
+        "hib_copy_end:\n"
+        ".popsection\n");
+
+static NORETURN void restore_jump(uint64_t pml4, uint64_t list, uint64_t image_wake_page) {
+    uint64_t spare = wake_spare_page(), entry = wake_long_entry(image_wake_page);
+    ASSERT((size_t)(hib_copy_end - hib_copy_start) <= PAGE_SIZE);
+    memcpy(phys_to_virt(spare), hib_copy_start, (size_t)(hib_copy_end - hib_copy_start));
+    /* the kernel half stays mapped until the jump into the spare page */
+    uint64_t *p = phys_to_virt(pml4), *k = phys_to_virt(kernel_pml4 & PTE_ADDR);
+    for (unsigned i = 256; i < 512; i++) p[i] = k[i];
+    cli();
+    /* every TLB entry goes, global ones too, and none is made global again before the image's
+       own cpu_setup (Intel SDM vol. 3A 5.10.4.1) */
+    write_cr4(read_cr4() & ~CR4_PGE);
+    write_cr3(pml4);
+    ((void (*)(uint64_t, uint64_t, uint64_t))spare)(list, image_wake_page, entry);
+    for (;;) hlt();
 }
 
 static const char *check(const struct header *hd) {
@@ -627,15 +688,14 @@ void hibernate_restore(void) {
         kprintf("hibernate: a device did not stop, restarting instead of restoring\n");
         power_reboot();
     }
-    for (int irq = 0; irq < 16; irq++) pic_mask(irq);
-    ioapic_mask_all();
+    ioapic_mask_all(); /* the 8259 has been masked since boot (arch/irq.h) */
     if (!iommu_shutdown()) {
         kprintf("hibernate: IOMMU did not stop; restarting without overwriting live DMA tables\n");
         power_reboot();
     } /* the image's tables come with it, and its own resume turns the units on */
     lapic_wake_at(CLOCK_NEVER);
     vm_suspend(); /* the hypervisor's overlays would swallow the copy's writes to their frames */
-    wake_hibernate_jump(pml4, r.first, hd.wake_page);
+    restore_jump(pml4, r.first, hd.wake_page);
 
 nomem:
     why = "not enough memory to restore it";

@@ -13,6 +13,7 @@
 #include "kernel.h"
 #include "abi.h"
 #include "arch/cpu.h"
+#include "arch/irq.h"
 #include "arch/ioapic.h"
 #include "arch/spin.h"
 #include "dev/acpi.h"
@@ -21,7 +22,7 @@
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "sys/clock.h"
-#include "sys/sched.h"
+#include "sys/wait.h"
 
 #define PTE_ADDR 0x000FFFFFFFFFF000ull
 
@@ -110,13 +111,8 @@ static bool is_kernel_id(uint16_t id) {
     return false;
 }
 
-const char *iommu_x2apic_conflict(void) {
-    const char *why = iommu_amd_x2apic_conflict();
-    return why ? why : iommu_intel_x2apic_conflict();
-}
-
-/* Units that did not start (iommu_init) or come back from a sleep (iommu_resume), with the PIC
-   and the IOAPICs masked: off where they confirm it. Interrupts then go in the plain format
+/* Units that did not start (iommu_init) or come back from a sleep (iommu_resume), with the
+   IOAPICs masked: off where they confirm it. Interrupts then go in the plain format
    unless a unit must remap them (VT-d ECAP.IRREQ: every interrupt is blocked while it is off,
    5.1.4); else no interrupt route is given out (restore_failed). True: plain. */
 static bool units_abandon(void) {
@@ -152,13 +148,10 @@ void iommu_init(void) {
     if (!off && described_lost) off = "not used (the firmware's descriptions were not all kept)";
     hw = found; /* table writes need it from here on */
     domain_used[0] |= 3; /* 0 is never used, 1 is the back end's */
-    /* ExtINT may still be the firmware's virtual-wire PIC path. Prevent the PIC from
-       emitting it until both the units and the IOAPIC route have changed format.
-       Mask-only restore preserves pending PIC requests, unlike PIC reinitialization. This runs
-       on CPU 0 (the boot task), where the PIC's and every device's interrupts arrive: with its
-       interrupts off none is taken half way. */
+    /* No IOAPIC pin delivers while the units and the entries change format: masked, their routes
+       kept and written again in the new format (ioapic_remap). This boot task's interrupts off
+       meanwhile; the devices' messages wait for their drivers, which come after. */
     uint64_t irq = irq_save();
-    uint16_t pic = pic_mask_all();
     ioapic_mask_all();
     bool started = hw->start(!off);
     if (started) started = ioapic_remap();
@@ -173,14 +166,13 @@ void iommu_init(void) {
     } else if (!hw->translating) {
         kprintf("iommu: %s remaps interrupts only: app drivers require appdrivers-unisolated\n", hw->name);
     }
-    pic_restore_mask(pic);
     irq_restore(irq);
 }
 
 bool iommu_active(void) { return hw && hw->translating && !restore_failed; }
 bool iommu_power_ready(void) { return !restore_failed && !lost_in_sleep; }
 
-/* The back ends' fault handlers (CPU 0) and their waits (any CPU) count against one second's
+/* The back ends' fault handlers and their waits (any CPU) count against one second's
    limit, under report_lock, taken last. */
 bool iommu_fault_report(void) {
     static struct spinlock report_lock;
@@ -960,21 +952,26 @@ void iommu_domain_free(struct iommu_domain *dom) {
 }
 
 /* ---- interrupts and power ---- */
-bool iommu_msi_message(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
+bool iommu_msi_message(struct pci_device *d, unsigned index, unsigned count, const struct irq *irq,
                        uint32_t *address, uint32_t *data) {
     if (restore_failed) return false;
-    if (hw) return hw->msi(d, index, count, vector, dest, address, data);
-    if (dest > 0xFF) return false;
-    *address = iommu_msi_plain(dest);
-    *data = vector;
+    struct irq_target to = irq_target(irq);
+    if (hw) return hw->msi(d, index, count, to.vector, to.apic_id, address, data);
+    if (to.apic_id > 0xFF) return false;
+    uint64_t plain;
+    irq_msi_message(irq, &plain, data);
+    *address = (uint32_t)plain;
     return true;
 }
 
 bool iommu_msi_clear(struct pci_device *d) { return !restore_failed && (!hw || hw->msi_clear(d)); }
 
-bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
-    return !restore_failed && (!hw || hw->ioapic(ioapic_id, gsi, rte));
+bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_t *rte) {
+    if (restore_failed) return false;
+    return hw ? hw->ioapic(ioapic_id, gsi, dest, rte) : dest <= 0xFF;
 }
+
+bool iommu_irq_wide(void) { return !restore_failed && hw && hw->irq_wide; }
 
 const char *iommu_resume(void) {
     if (!hw || hw->resume()) return NULL;

@@ -15,8 +15,8 @@
    record and the old objects stay dead.
    Every call comes from any CPU. Claiming and a claim's end go one at a time under claim_mutex,
    which holds every function's reservation (d->claimed) and is taken before pci.c's reset and
-   dev/iommu.c's locks. claim_irq_lock holds the vector table and what the interrupt handler on
-   CPU 0 reads; each claim's notes_lock its ACPI Notify values. */
+   dev/iommu.c's locks. Each claim's irq_lock holds what its interrupt handlers read, on whichever
+   CPUs its messages arrive; its notes_lock its ACPI Notify values. */
 #include "kernel.h"
 #include "abi.h"
 #include "arch/cpu.h"
@@ -33,10 +33,12 @@
 #include "mm/heap.h"
 #include "sys/proc.h"
 #include "sys/object.h"
-#include "sys/sched.h"
+#include "sys/process.h"
 #include "sys/syscall.h"
+#include "sys/thread.h"
+#include "sys/wait.h"
 
-#define CLAIM_VECTORS 32 /* one pending bit each */
+#define CLAIM_VECTORS 32 /* one pending bit each (the ABI's 32-bit word); MSI's most too */
 #define CLAIM_GUARDS 32  /* registers with bits only the kernel changes (guards_init) */
 #define CLAIM_ACPI_NOTES 32 /* Notify values of the function's node not yet taken */
 
@@ -49,10 +51,17 @@ struct guard {
 struct pci_claim {
     struct pci_device *d;
     struct object object; /* what the claim's handle reaches */
-    uint32_t pending; /* message n arrived; cleared by take. Changed under claim_irq_lock; claim_ready reads it bare */
+    uint32_t pending; /* message n arrived; cleared by take. Changed under irq_lock; claim_ready reads it bare */
     struct wait_queue wq;
-    unsigned vector_base, vectors; /* changed under claim_irq_lock, by one pci_user_interrupts at a time */
+    /* Its handlers, pending and vectors as they read them. They wake and notify under it, so once
+       vectors is 0 no handler still reaches the claim. Before the wait queue and event locks. */
+    struct spinlock irq_lock;
+    unsigned vectors;              /* messages on: changed under irq_lock, by one pci_user_interrupts at a time */
     struct mutex vectors_mutex;    /* pci_user_interrupts of the claim's threads, one at a time */
+    struct claim_message {         /* message n's irq's context */
+        struct pci_claim *claim;
+        unsigned n;
+    } messages[CLAIM_VECTORS];
     unsigned refs;   /* the object and every BAR or DMA object made through it: atomic */
     bool released;   /* the last handle closed: BAR objects are revoked, the function stopped. Atomic */
     bool dma_unsafe; /* the ended claim's IOMMU block was not confirmed: retain its DMA pages. Atomic */
@@ -80,12 +89,6 @@ struct pci_claim {
    pci.c's and dev/iommu.c's locks. */
 static struct mutex claim_mutex;
 
-/* claim_of_vector, and each claim's pending, vector_base and vectors as the interrupt handler
-   reads them. The handler (CPU 0) wakes and notifies under it, so once a claim's vectors are off
-   the table no handler still reaches the claim. Before the wait queue and event locks. */
-static struct spinlock claim_irq_lock;
-static struct pci_claim *claim_of_vector[256];
-
 static void claim_drop(struct pci_claim *c) {
     unsigned left = __atomic_sub_fetch(&c->refs, 1, __ATOMIC_ACQ_REL);
     ASSERT(left != UINT32_MAX);
@@ -94,29 +97,29 @@ static void claim_drop(struct pci_claim *c) {
     kfree(c);
 }
 
-static void claim_isr(struct regs *r) {
-    spin_take(&claim_irq_lock);
-    struct pci_claim *c = claim_of_vector[r->vector & 0xFF];
-    if (c) {
-        __atomic_fetch_or(&c->pending, 1u << (r->vector - c->vector_base), __ATOMIC_RELEASE);
+/* Message n of the claim's, on the CPU its irq is delivered to. */
+static enum irq_result claim_isr(void *context) {
+    struct claim_message *m = context;
+    struct pci_claim *c = m->claim;
+    spin_take(&c->irq_lock);
+    if (m->n < c->vectors) {
+        __atomic_fetch_or(&c->pending, 1u << m->n, __ATOMIC_RELEASE);
         wq_wake_all(&c->wq);
         object_notify(&c->object);
     }
-    spin_give(&claim_irq_lock);
+    spin_give(&c->irq_lock);
+    return IRQ_HANDLED;
 }
 
 static void interrupts_off(struct pci_claim *c) {
     if (!c->vectors) return;
-    bool cleared = pci_msi_disable(c->d);
-    uint64_t irq = spin_lock(&claim_irq_lock);
-    for (unsigned i = 0; i < c->vectors; i++) claim_of_vector[c->vector_base + i] = NULL;
-    __atomic_store_n(&c->pending, 0, __ATOMIC_RELAXED);
-    unsigned base = c->vector_base, vectors = c->vectors;
+    uint64_t irq = spin_lock(&c->irq_lock);
     c->vectors = 0;
-    spin_unlock(&claim_irq_lock, irq);
-    /* a remapping entry the units may still hold could reach them: they stay taken, unhandled */
-    if (cleared) irq_vector_free(base, vectors);
-    else kprintf("pci: %02x:%02x.%u: its interrupt vectors stay out of use\n", c->d->bus, c->d->dev, c->d->func);
+    __atomic_store_n(&c->pending, 0, __ATOMIC_RELAXED);
+    spin_unlock(&c->irq_lock, irq);
+    /* irqs a remapping entry the units may still hold could reach stay (pci_irq_disable), their
+       handlers given this claim: it stays with them */
+    if (!pci_irq_disable(c->d)) __atomic_add_fetch(&c->refs, 1, __ATOMIC_ACQ_REL);
     /* A waiter must observe NOT_READY instead of sleeping forever after the
        driver disables its last interrupt (including an infinite take). */
     wq_wake_all(&c->wq);
@@ -168,7 +171,7 @@ static bool screen_holder_stop(const char *why) {
     if (!app) return false;
     kprintf("pci: %02x:%02x.%u: %s; stopping app %d; framebuffer writes resume at release, device recovery may be needed\n", d->bus,
             d->dev, d->func, why, app);
-    if (task_kill(app) < 0) kprintf("pci: app %d cannot be stopped; the screen stays held\n", app);
+    if (process_kill(app) < 0) kprintf("pci: app %d cannot be stopped; the screen stays held\n", app);
     return true;
 }
 
@@ -206,8 +209,8 @@ static void screen_hold_begin(struct pci_claim *c) {
     }
     /* Said while the screen still shows it: a screen that stops changing next tells why. */
     kprintf("pci: %02x:%02x.%u: app %d holds the screen while its driver starts or stops the device\n",
-            c->d->bus, c->d->dev, c->d->func, task_process()->pid);
-    int app = task_process()->pid;
+            c->d->bus, c->d->dev, c->d->func, process_current()->pid);
+    int app = process_current()->pid;
     uint64_t irq = spin_lock(&screen_hold_lock);
     screen_holder = c;
     screen_holder_app = app;
@@ -375,10 +378,12 @@ static void claim_release(struct object *o) {
     kprintf("pci: %02x:%02x.%u released\n", d->bus, d->dev, d->func);
     claim_drop(c);
 }
-static const struct object_ops claim_ops = {.kind = N_KIND_PCI, .ready = claim_ready, .release = claim_release};
+/* An app's claims close before its other handles and its mappings at its end: its device is
+   stopped (and seen to have no DMA in flight) before the DMA objects among them can free RAM. */
+static const struct object_ops claim_ops = {
+    .kind = N_KIND_PCI, .ready = claim_ready, .release = claim_release, .closes_first = true};
 
-bool pci_user_is_claim(struct handle *h) { return handle_is(h, &claim_ops); }
-static struct pci_claim *claim_of(struct handle *h) { return pci_user_is_claim(h) ? h->object->priv : NULL; }
+static struct pci_claim *claim_of(struct handle *h) { return handle_is(h, &claim_ops) ? h->object->priv : NULL; }
 
 struct pci_claim *pci_user_hold(struct handle *h) {
     struct pci_claim *c = claim_of(h);
@@ -485,7 +490,7 @@ static void others_reserve(const struct pci_claim *c, const struct pci_device *m
 
 static bool bus_reset(struct pci_claim *c, struct pci_device *m) {
     struct pci_device *port = pci_bus_reset_port(m);
-    if (!port || port == c->reset_port || (current_task && current_task->killed)) return false;
+    if (!port || port == c->reset_port || thread_current()->killed) return false;
     for (int i = 0; i < pci_count(); i++) {
         struct pci_device *f = pci_at(i);
         if (!pci_below(port, f)) continue;
@@ -515,7 +520,7 @@ static bool bus_reset(struct pci_claim *c, struct pci_device *m) {
 static bool reset_finish(struct pci_claim *c, struct pci_device *m) {
     bool done = pci_function_reset(m);
     if (!done && pci_reset_stuck(m) && bus_reset(c, m)) done = pci_function_reset(m);
-    if (!done || !pci_msi_disable(m)) return false;
+    if (!done || !pci_irq_disable(m)) return false;
     m->needs_reset = false;
     return true;
 }
@@ -555,7 +560,7 @@ static bool claim_recover(struct pci_claim *c) {
     if (d->needs_reset && !c->domain) return false;
     for (unsigned i = 0; i < count; i++) {
         struct pci_device *m = c->domain ? c->domain->members[i] : d;
-        if (current_task && current_task->killed) return false;
+        if (thread_current()->killed) return false;
         /* A reset left unfinished that forming the group did not read (claim_attach). Rejoin
            it before BME/MSI accesses: Requests can be discarded during an FLR (6.6.2), so their
            readback is not a replacement for its remaining wait. */
@@ -568,7 +573,7 @@ static bool claim_recover(struct pci_claim *c) {
             return false;
         }
         if (!m->needs_reset) continue;
-        if (!pci_msi_disable(m)) return false; /* do not preserve an old MSI Enable in FLR state */
+        if (!pci_irq_disable(m)) return false; /* do not preserve an old MSI Enable in FLR state */
         bool screen = screen_bar(m) >= 0;
         bool flr = m->pcie_cap && (pci_read32(m->bus, m->dev, m->func, m->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR);
         if (!screen && flr) {
@@ -595,7 +600,7 @@ static bool claim_recover(struct pci_claim *c) {
         kprintf("pci: %02x:%02x.%u does not answer after its resets: left as it is, bus mastering off, what it "
                 "sends kept in the domain of %02x:%02x.%u\n", m->bus, m->dev, m->func, d->bus, d->dev, d->func);
     }
-    return !(current_task && current_task->killed);
+    return !thread_current()->killed;
 }
 
 /* claim_mutex held: the claim formed, or nothing of it left and d free again. */
@@ -618,7 +623,7 @@ static int64_t claim_form(struct pci_claim *c, struct handle **out) {
     guards_init(c); /* pending FLR is complete: capability offsets/control now describe the handle */
     /* BAR sizes come from enumeration (pci_bar_size): measuring them here would switch memory
        decoding off under a running function, and the boot screen may be drawn through it. */
-    struct handle *h = handle_open(&c->object, true);
+    struct handle *h = handle_open(&c->object, HANDLE_WRITE);
     if (!h) {
         if (c->domain) iommu_domain_free(c->domain);
         d->claimed = false;
@@ -629,7 +634,7 @@ static int64_t claim_form(struct pci_claim *c, struct handle **out) {
 }
 
 int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct handle **out) {
-    struct task *t = task_process();
+    struct process *t = process_current();
     /* Boot options: noappdrivers keeps every function with the kernel; appdrivers=any lets any
        app claim (tests drive QEMU's edu device from a program they compile) */
     if (!t || cmdline_has("noappdrivers")) return -N_ERR_DENIED;
@@ -657,11 +662,6 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct handle **o
     return 0;
 }
 
-static unsigned msix_table_size(const struct pci_device *d) {
-    uint8_t cap = pci_find_cap(d, 0x11);
-    return cap ? ((pci_read32(d->bus, d->dev, d->func, cap) >> 16) & 0x7FF) + 1 : 0;
-}
-
 int64_t pci_user_info(struct handle *h, struct n_pci_function *out) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
@@ -675,7 +675,7 @@ int64_t pci_user_info(struct handle *h, struct n_pci_function *out) {
     out->cls = d->cls; out->subcls = d->subcls; out->progif = d->progif;
     out->interrupt_pin = (pci_read32(d->bus, d->dev, d->func, 0x3C) >> 8) & 0xFF;
     out->msi_vectors = pci_msi_max_vectors(d);
-    out->msix_vectors = msix_table_size(d);
+    out->msix_vectors = pci_msix_max_vectors(d);
     struct pci_device *up = pci_upstream(d);
     out->upstream = up ? N_PCI_TARGET(up->bus, up->dev, up->func) : N_PCI_NONE;
     out->flags = c->domain ? N_PCI_ISOLATED : 0;
@@ -931,7 +931,7 @@ int64_t pci_user_acpi_notify_take(struct handle *h, uint64_t deadline) {
             spin_unlock(&c->notes_lock, irq);
             return value;
         }
-        if (current_task->killed) { spin_unlock(&c->notes_lock, irq); return -N_ERR_STOPPED; }
+        if (thread_current()->killed) { spin_unlock(&c->notes_lock, irq); return -N_ERR_STOPPED; }
         if (clock_now_ns() >= deadline) { spin_unlock(&c->notes_lock, irq); return -N_ERR_TIMEOUT; }
         /* acpi_noted takes notes_lock to add a value, then wakes acpi_wq */
         wq_wait_locked_until(&c->acpi_wq, &c->notes_lock, deadline);
@@ -1053,12 +1053,6 @@ bool pci_user_bar_prefetchable(struct handle *h, uint32_t bar) {
     return c && bar<6 && !(c->d->bar[bar]&1) && (c->d->bar[bar]&8);
 }
 
-static unsigned floor_pow2(unsigned n) {
-    unsigned p = 1;
-    while (p * 2 <= n) p *= 2;
-    return p;
-}
-
 static int64_t interrupts_on(struct pci_claim *c, uint32_t count);
 
 int64_t pci_user_interrupts(struct handle *h, uint32_t count) {
@@ -1076,50 +1070,43 @@ static int64_t interrupts_on(struct pci_claim *c, uint32_t count) {
     interrupts_off(c);
     if (!count) return 0;
     if (count > CLAIM_VECTORS) count = CLAIM_VECTORS;
-    uint32_t dest = pci_interrupt_dest(); /* CPU 0: device interrupts are handled there */
-    if (dest > 0xFF) return -N_ERR_UNSUPPORTED;
-    unsigned table = msix_table_size(d), most = pci_msi_max_vectors(d);
-    bool msix = table != 0;
-    unsigned n = msix ? MIN(count, table) : most ? floor_pow2(MIN(count, most)) : 0;
-    if (!n) return -N_ERR_UNSUPPORTED; /* no legacy INTx for apps */
-    int base = -1;
-    for (; n; n = msix ? n - 1 : n / 2)
-        if ((base = irq_vector_alloc(n, msix ? 1 : n)) >= 0) break;
-    if (base < 0) return -N_ERR_BUSY;
-    uint64_t irq = spin_lock(&claim_irq_lock);
-    c->vector_base = (unsigned)base;
-    c->vectors = n;
-    __atomic_store_n(&c->pending, 0, __ATOMIC_RELAXED);
-    for (unsigned i = 0; i < n; i++) claim_of_vector[base + i] = c;
-    spin_unlock(&claim_irq_lock, irq);
-    for (unsigned i = 0; i < n; i++) vector_register(base + (int)i, claim_isr);
-    bool ok;
-    if (msix) {
-        ok = pci_msix_init(d) >= n;
-        for (unsigned i = 0; ok && i < n; i++) ok = pci_msix_route(d, i, (uint8_t)(base + i), dest);
-        for (unsigned i = 0; ok && i < n; i++) pci_msix_mask(d, i, false);
-        if (ok) pci_msix_function_mask(d, false);
-    } else {
-        ok = pci_msi_enable_multi(d, (uint8_t)base, n, dest);
+    if (!pci_msix_max_vectors(d) && !pci_msi_max_vectors(d)) return -N_ERR_UNSUPPORTED; /* no legacy INTx for apps */
+    struct irq_spec specs[CLAIM_VECTORS];
+    for (unsigned i = 0; i < count; i++) {
+        c->messages[i] = (struct claim_message){c, i};
+        specs[i] = (struct irq_spec){.name = "app driver", .handler = claim_isr, .context = &c->messages[i], .node = -1};
     }
-    if (!ok) { interrupts_off(c); return -N_ERR_UNSUPPORTED; }
+    /* on before the messages are: one may come as soon as its entry is written */
+    uint64_t irq = spin_lock(&c->irq_lock);
+    c->vectors = count;
+    __atomic_store_n(&c->pending, 0, __ATOMIC_RELAXED);
+    spin_unlock(&c->irq_lock, irq);
+    unsigned n = pci_irq_enable(d, specs, count, NULL);
+    irq = spin_lock(&c->irq_lock);
+    c->vectors = n;
+    spin_unlock(&c->irq_lock, irq);
+    if (!n) { /* no CPU it may name has a vector free, or its messages could not be made */
+        wq_wake_all(&c->wq);
+        object_notify(&c->object);
+        return -N_ERR_BUSY;
+    }
     return n;
 }
 
 int64_t pci_user_interrupt_take(struct handle *h, uint64_t deadline) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
-    uint64_t irq = spin_lock(&claim_irq_lock);
+    uint64_t irq = spin_lock(&c->irq_lock);
     for (;;) {
         uint32_t got = __atomic_exchange_n(&c->pending, 0, __ATOMIC_ACQUIRE);
-        if (got) { spin_unlock(&claim_irq_lock, irq); return got; }
+        if (got) { spin_unlock(&c->irq_lock, irq); return got; }
         int64_t r = 0;
-        if (current_task->killed) r = -N_ERR_STOPPED;
+        if (thread_current()->killed) r = -N_ERR_STOPPED;
         else if (!c->vectors) r = -N_ERR_NOT_READY;
         else if (clock_now_ns() >= deadline) r = -N_ERR_TIMEOUT;
-        if (r) { spin_unlock(&claim_irq_lock, irq); return r; }
-        /* the interrupt handler and interrupts_off take claim_irq_lock, then wake c->wq */
-        wq_wait_locked_until(&c->wq, &claim_irq_lock, deadline);
-        spin_take(&claim_irq_lock); /* a message that came at the time limit is still taken */
+        if (r) { spin_unlock(&c->irq_lock, irq); return r; }
+        /* the interrupt handlers and interrupts_off take irq_lock, then wake c->wq */
+        wq_wait_locked_until(&c->wq, &c->irq_lock, deadline);
+        spin_take(&c->irq_lock); /* a message that came at the time limit is still taken */
     }
 }
