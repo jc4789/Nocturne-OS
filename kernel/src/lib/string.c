@@ -38,6 +38,12 @@ size_t strlen(const char *s) {
     return n;
 }
 
+size_t strnlen(const char *s, size_t max) {
+    size_t n = 0;
+    while (n < max && s[n]) n++;
+    return n;
+}
+
 int strcmp(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return (uint8_t)*a - (uint8_t)*b;
@@ -53,10 +59,31 @@ int strncmp(const char *a, const char *b, size_t n) {
 int toupper(int c) { return (c >= 'a' && c <= 'z') ? c - 32 : c; }
 int tolower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
+int strcasecmp(const char *a, const char *b) {
+    while (*a && tolower(*a) == tolower(*b)) { a++; b++; }
+    return tolower((uint8_t)*a) - tolower((uint8_t)*b);
+}
+
 char *strcpy(char *d, const char *s) {
     char *r = d;
     while ((*d++ = *s++)) {}
     return r;
+}
+
+size_t strlcpy(char *d, const char *s, size_t n) {
+    size_t len = strlen(s);
+    if (n) {
+        size_t c = len >= n ? n - 1 : len;
+        memcpy(d, s, c);
+        d[c] = 0;
+    }
+    return len;
+}
+
+size_t strlcat(char *d, const char *s, size_t n) {
+    size_t dl = strnlen(d, n);
+    if (dl == n) return n + strlen(s);
+    return dl + strlcpy(d + dl, s, n - dl);
 }
 
 char *strchr(const char *s, int c) {

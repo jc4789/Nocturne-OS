@@ -1,31 +1,33 @@
-/* Event queues (docs/nocturne-native-abi.md §6): one wait for many handles and timers. Reports
-   are level-triggered: a handle that stays ready is reported by every wait.
+/* Event queues (docs/nocturne-native-abi.md §6): one wait for many handles, timers and memory
+   words. Reports are level-triggered: a handle that stays ready is reported by every wait.
 
-   A queue's sources are its watches of handles and its timers, in a tree by token (lib/avl.h). A
-   wait looks only at the sources something told. A source waits armed where its change is said: a
-   watch as a callback item on its handle's object's waiters (sys/object.h), a timer as its alarm.
-   The change calls the item back (or fires the alarm), which puts the source on the queue's
+   A queue's sources are its watches of handles, its timers and its watches of memory words, in a
+   tree by token (lib/avl.h). A wait looks only at the sources something told. A source waits armed
+   where its change is said: a watch as a callback item on its handle's object's waiters
+   (sys/object.h), a word's watch among the word's waiters (sys/address_wait.h), a timer as its
+   alarm. The change calls the item back (or fires the alarm), which puts the source on the queue's
    pending line and wakes one thread waiting on the queue. A wait takes the pending line: a handle
    found ready is reported and stays pending after what came meanwhile, for the next wait to look
    at again; one found not ready is armed again, then looked at once more (a change between the
-   look and the arm told no one); a timer is reported once. A thread woken for a source that it
-   leaves on the line (its batch is full) wakes the next.
+   look and the arm told no one); a timer or a word is reported once. A thread woken for a source
+   that it leaves on the line (its batch is full) wakes the next.
 
    Locks, the first taken first:
    - The queue's lock: its sources and their arming, held by a wait as it looks, by watch, unwatch
-     and the queue's close. Under it: an object's waiters' lock (arming; no callback runs there),
-     the watched handle's watch_lock, the pending line's lock, the queue's object's waiters' lock
-     (a wake), a CPU's alarm lock, and whatever ops->ready takes.
+     and the queue's close. Under it: an object's waiters' lock and a word's bucket's lock (arming;
+     no callback runs there), the watched handle's watch_lock, the pending line's lock, the queue's
+     object's waiters' lock (a wake), a CPU's alarm lock, and whatever ops->ready takes.
    - told: the pending line, a leaf. A source's callback takes it, called by a waker that holds an
-     object's waiters' lock, in any context (sys/wait.h's contract), and so does a timer's fire;
-     then each wakes one of the queue's threads (the queue's object's waiters, whose lock then
-     nests under the waker's).
+     object's waiters' lock or a bucket's lock, in any context (sys/wait.h's contract), and so does
+     a timer's fire; then each wakes one of the queue's threads (the queue's object's waiters,
+     whose lock then nests under the waker's).
    - A handle's watch_lock: its list of watches, a leaf. Its last close takes the list whole, then
      each watch's queue's lock alone. */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "lib/avl.h"
 #include "mm/heap.h"
+#include "sys/address_wait.h"
 #include "sys/alarm.h"
 #include "sys/clock.h"
 #include "sys/events.h"
@@ -34,7 +36,7 @@
 #include "sys/thread.h"
 #include "sys/wait.h"
 
-enum source_kind { SOURCE_HANDLE, SOURCE_TIMER };
+enum source_kind { SOURCE_HANDLE, SOURCE_TIMER, SOURCE_ADDRESS };
 
 struct event_queue;
 
@@ -45,7 +47,8 @@ struct event_queue;
    2 period...: the grid of its period, kept however late it is reported. It falls due in its
    alarm's interrupt and waits on the pending line until a wait reports it; a repeating one is set
    again then, for its first moment after that wait on the grid, so missed moments are reported
-   once and a timer no one waits for interrupts nothing. */
+   once and a timer no one waits for interrupts nothing.
+   A word's watch is told once, by the wake that takes it, and reported once. */
 struct event_source {
     struct avl_node node;              /* in its queue's sources, while linked */
     struct event_source *next, **prev; /* on its queue's pending line; prev NULL when off it (told) */
@@ -56,7 +59,7 @@ struct event_source {
     enum source_kind kind;
     bool linked;                       /* in its queue's sources (the queue's lock) */
     bool gone;                         /* off its queue: a timer's fire meanwhile tells nothing (told) */
-    struct wait_item item;             /* a watch's, while armed */
+    struct wait_item item;             /* a watch's or a word's, while armed */
     union {
         struct {
             struct handle *handle;
@@ -137,7 +140,7 @@ static void source_tell(struct event_source *s) {
     if (fresh) wq_wake(&q->object.waiters, 1);
 }
 
-/* A watch's item, taken by a wake (sys/wait.h's callback). */
+/* A watch's or a word's item, taken by a wake (sys/wait.h's callback). */
 static void source_told(struct wait_item *item) {
     source_tell((struct event_source *)((char *)item - offsetof(struct event_source, item)));
 }
@@ -181,6 +184,8 @@ static bool source_unlink(struct event_queue *q, struct event_source *s, int *re
     s->linked = false;
     int r = 1;
     if (s->kind == SOURCE_HANDLE) watch_disarm(s);
+    else if (s->kind == SOURCE_ADDRESS && !address_watch_disarm(&s->item))
+        r = 2; /* a wake took it: its event, on the pending line, is withdrawn */
     spin_take(&q->told);
     pending_drop(q, s);
     s->gone = true;
@@ -299,6 +304,25 @@ int events_watch(struct handle *queue, struct handle *h, uint32_t interest, uint
     return 0;
 }
 
+/* Armed and put in the tree under the queue's lock: a wake that tells it at once is looked at by a
+   wait only once it is the queue's. */
+int events_watch_address(struct handle *queue, volatile uint32_t *address, uint32_t expected, uint64_t token) {
+    struct event_queue *q = queue_of(queue);
+    uint64_t phys = address_word(address, false);
+    if (!phys) return -N_ERR_BAD_ADDRESS;
+    struct event_source *s = kmalloc(sizeof *s);
+    if (!s) return -N_ERR_NO_MEMORY;
+    *s = (struct event_source){.queue = q, .token = token, .tag = (uintptr_t)s, .kind = SOURCE_ADDRESS,
+                               .linked = true, .item = {.callback = source_told}};
+    uint64_t flags = spin_lock(&q->lock);
+    bool armed = address_watch_arm(&s->item, phys, expected);
+    if (armed) avl_insert(&q->sources, &by_token, &s->node);
+    spin_unlock(&q->lock, flags);
+    if (armed) return 0;
+    kfree(s);
+    return -N_ERR_NOT_READY;
+}
+
 int events_timer(struct handle *queue, uint64_t due, uint64_t period, uint64_t token) {
     struct event_queue *q = queue_of(queue);
     struct event_source *t = kmalloc(sizeof *t);
@@ -313,7 +337,8 @@ int events_timer(struct handle *queue, uint64_t due, uint64_t period, uint64_t t
     return 0;
 }
 
-/* 0 nothing had the token; 1 removed. */
+/* 0 nothing had the token; 1 removed before its event; 2 its memory-word event had already been
+   queued (and is now withdrawn). */
 int events_unwatch(struct handle *queue, uint64_t token) {
     struct event_queue *q = queue_of(queue);
     int result = 0;
@@ -366,6 +391,12 @@ int64_t events_wait(struct handle *queue, struct n_event *uout, size_t max, uint
                     s->timer.due = timer_next(s, now);
                     if (s->timer.due != CLOCK_NEVER) alarm_set(&s->timer.alarm, s->timer.due);
                 } else if (source_unlink(q, s, NULL)) {
+                    s->next = gone;
+                    gone = s;
+                }
+            } else {
+                found[n++] = (struct event){.token = s->token, .events = N_EVENT_ADDRESS, .at = s->at};
+                if (source_unlink(q, s, NULL)) {
                     s->next = gone;
                     gone = s;
                 }

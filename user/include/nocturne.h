@@ -104,8 +104,9 @@ n_handle n_channel_accept(n_handle listener);
 /* Apps: the handle reports the end (N_EVENT_APP_ENDED); there is no zombie to reap. */
 n_handle n_app_launch(const char *path, const struct n_launch *launch);
 n_result n_app_result(n_handle app, int64_t timeout_ms, int *status); /* -1 waits; 0 polls */
-n_result n_app_stop(n_handle app, int flags);                         /* flags: 0 */
+n_result n_app_stop(n_handle app, int flags);                         /* N_APP_STOP_TREE */
 n_result n_app_self(void);
+n_result n_app_parent(void);
 n_handle n_app_open(int64_t id); /* a running app by the identifier the app list shows */
 n_result n_system_log(char *buf, size_t cap); /* the newest system log text; its length */
 /* A handle whose messages are added to the system log, and which receives the log's text from the
@@ -282,21 +283,26 @@ n_result n_watch_take(n_handle watch);
 /* Event queues: level-triggered; a ready handle is reported by every wait. */
 n_handle n_events_create(void);
 n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t token);
+n_result n_events_watch_address(n_handle q, volatile uint32_t *address, uint32_t expected, uint64_t token);
 n_result n_events_timer(n_handle q, uint64_t ms, bool repeat, uint64_t token);
-n_result n_events_unwatch(n_handle q, uint64_t token); /* 0 unknown, 1 removed */
+n_result n_events_unwatch(n_handle q, uint64_t token); /* 0 unknown, 1 removed, 2 already notified */
 n_result n_events_wait(n_handle q, struct n_event *out, size_t max, int64_t timeout_ms); /* count */
 uint64_t n_clock_uptime_ms(void);
 n_result n_random(void *buf, size_t n); /* n bytes from the system entropy pool */
 int64_t n_clock_wall(void); /* seconds since 1970-01-01 UTC */
 void n_sleep_ms(uint64_t ms);
+/* The launch settings ("name=value"), NULL-terminated. */
+extern char *const *n_settings;
 /* Whether path is complete: "C:\...", "\..." or "/...". "C:" and "C:a" are not: they are in the
    current folder, like "a". */
 bool n_path_is_complete(const char *path);
 /* name taken inside folder (a complete path; the root when it is not one), written as "C:\a\b"
    with "." and ".." resolved. A complete name stands alone. Returns the length, or N_ERR_TOO_LARGE. */
 n_result n_path_join(const char *folder, const char *name, char *out, size_t cap);
-/* A complete path for a name the user typed: n_path_join inside "C:\". */
+/* A complete path for a name the user typed: n_path_join inside the launch setting FOLDER (the
+   launcher's current folder, "C:\" if it gave none). */
 n_result n_path_complete(const char *name, char *out, size_t cap);
+n_result n_folder_set(const char *name); /* this app's FOLDER; N_ERR_NOT_FOLDER if it is not one */
 /* The last name of path, inside it ("" for the root). */
 const char *n_path_name(const char *path);
 /* The complete path a file: URL names: "file:///C:/Users/User/a%20b.html" is C:\Users\User\a b.html,
@@ -313,6 +319,9 @@ const char *n_temp_folder(void);
 /* The folder an app keeps its data in, <user's folder>\AppData\<name>, made when missing.
    Returns the length of the path written to out. */
 n_result n_app_data_folder(const char *name, char *out, size_t cap);
+/* Whether handle h reaches a terminal: the launcher names such handles in the
+   setting TERMINAL, e.g. "0 1 2". */
+bool n_terminal(n_handle h);
 
 /* The count of processes and threads (at most max written), or a negative n_result. */
 n_result proclist(struct n_procinfo *out, int max);
@@ -346,6 +355,14 @@ void *thread_local_get(unsigned slot);
 void thread_local_set(unsigned slot, void *value);
 /* Actual reserved stack interval of the calling native task: 0, or a negative n_result. */
 n_result thread_stack_bounds(uintptr_t *low, uintptr_t *high);
+/* timeout_ms == UINT32_MAX waits indefinitely; count == 0 wakes all.
+ * The wait returns 0 when woken, -N_ERR_NOT_READY when *address no longer
+ * holds expected, -N_ERR_TIMEOUT or -N_ERR_STOPPED; wake returns how many
+ * waiters it woke.  errno is left alone. */
+n_result wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms);
+/* The 8-byte form; wake_address on the same address wakes it. */
+n_result wait_on_address64(volatile uint64_t *address, uint64_t expected, unsigned timeout_ms);
+n_result wake_address(volatile uint32_t *address, unsigned count);
 void yield(void);
 /* These return only on failure, with a negative n_result. */
 n_result poweroff(void);
@@ -384,6 +401,29 @@ n_result net_stats(struct n_netstats *stats);
 n_result net_set_setup_cancel_channel(n_handle channel);
 bool ip_parse(const char *s, uint32_t *ip);
 char *ip_format(uint32_t ip, char *buf); /* buf: at least 16 bytes */
+n_result udp_socket(uint16_t port);      /* a connection handle; 0 picks an ephemeral port */
+n_result udp_sendto(n_handle s, uint32_t ip, uint16_t port, const void *buf, size_t len);
+n_result udp_recvfrom(n_handle s, void *buf, size_t len, int timeout_ms, struct n_sockaddr *from);
+n_result udp_close(n_handle s);
+n_result tcp_connect(uint32_t ip, uint16_t port, int timeout_ms); /* a connection handle */
+n_result tcp_send(n_handle s, const void *buf, size_t len);
+/* Absolute uptime_ms deadline; zero waits without a deadline. A positive
+   result is the accepted prefix, never a claim that the peer acknowledged it. */
+n_result tcp_send_until(n_handle s, const void *buf, size_t len, uint64_t deadline_ms);
+/* The accepted prefix, or -N_ERR_NOT_READY; never waits for space. */
+n_result tcp_send_some(n_handle s, const void *buf, size_t len);
+/* Abort the connection, waking send/receive waiters with -N_ERR_CANCELLED. */
+n_result tcp_cancel(n_handle s);
+n_result tcp_recv(n_handle s, void *buf, size_t len, int timeout_ms); /* 0 = connection closed */
+n_result tcp_close(n_handle s);
+/* Passive open: tcp_listen returns a listener on a local address (0: all of them, or e.g.
+   127.0.0.1 for this system only; port 0 picks one; backlog <= 0 uses a default), tcp_accept
+   the next established connection, ordinary for tcp_send/tcp_recv/tcp_close.
+   tcp_close on the listener refuses connections not yet accepted. */
+n_result tcp_listen(uint32_t ip, uint16_t port, int backlog);
+n_result tcp_accept(n_handle listener, int timeout_ms, struct n_sockaddr *remote);
+n_result tcp_address(n_handle s, struct n_sockaddr *local, struct n_sockaddr *remote); /* either may be NULL */
+n_result tcp_finish(n_handle s); /* stop sending (FIN after the queued data) but keep receiving; tcp_close later */
 /* simulated packet loss/reordering on this process's TCP connections, and TCP counters (either may be NULL) */
 n_result net_test(const struct n_netfault *set, struct n_tcpstats *stats);
 bool net_wait_up(int timeout_ms); /* wait for DHCP; false if no network */

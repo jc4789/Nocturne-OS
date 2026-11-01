@@ -4,13 +4,18 @@ struct handle;
 struct object;
 struct process;
 
-/* Start a program. Handle i of the new app is handles[i] (NULL: none). When
-   app is set, that handle record reports the app's end. */
+/* Start a program. Handle i of the new app is handles[i] (NULL: none). Its
+   settings are "NAME=value" strings, passed beside its arguments. When app is
+   set, that handle record reports the app's end. parent: the app that launches
+   it, NULL for one the kernel starts. */
 struct proc_launch {
     int argc;
     char **argv;
+    int setting_count;
+    char **settings;
     struct handle **handles;
     size_t handle_count;
+    struct process *parent;
     struct object *app;
 };
 int proc_launch(const char *path, const struct proc_launch *launch);

@@ -88,7 +88,7 @@
 ```
 user/libc/sys.c の SYSCALL
   → arch/isr.asm の syscall_entry（thread のカーネル stack へ移る）
-  → sys/syscall.c の syscall_dispatch
+  → sys/syscall.c の syscall_dispatch（アプリのメモリーは copy_from_user・copy_to_user だけで触る）
   → SYSRET
 例外は arch/idt.c の isr_exception。NMI・#DB・#MC・#DF は CPU ごとの IST の stack で受ける。
 割り込みは arch/irq.c の isr_interrupt。CPU ごとの割り込みの stack で受け、眠らない。

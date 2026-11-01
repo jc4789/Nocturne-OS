@@ -4,10 +4,48 @@
 /* x86-64 native mapping granule: n_memory and shared pages come in these. */
 #define N_PAGE_SIZE 4096ULL
 
+/* Nocturne results. A system call that fails returns the negated code; the
+   numbering is Nocturne's own (docs/nocturne-native-abi.md). Plain numbers,
+   so preprocessor conditions can use them. */
+#define N_OK 0
+#define N_ERR_NOT_FOUND 1          /* no such entry, name or channel */
+#define N_ERR_EXISTS 2             /* the name is already taken */
+#define N_ERR_DENIED 3             /* not permitted for this caller */
+#define N_ERR_NO_MEMORY 4
+#define N_ERR_INVALID 5            /* malformed request */
+#define N_ERR_WRONG_KIND 6         /* the handle cannot perform this operation */
+#define N_ERR_NO_HANDLE 7          /* the handle is not open in this app */
+#define N_ERR_BUSY 8
+#define N_ERR_NOT_READY 9          /* nothing to take yet; wait for its event */
+#define N_ERR_CLOSED 10            /* the other end has gone */
+#define N_ERR_TIMEOUT 11
+#define N_ERR_CANCELLED 12
+#define N_ERR_TOO_LARGE 13         /* does not fit the given buffer or range */
+#define N_ERR_NOT_EMPTY 14
+#define N_ERR_IO 15                /* the device failed */
+#define N_ERR_UNSUPPORTED 16
+#define N_ERR_BAD_ADDRESS 17       /* memory the caller passed is not usable */
+#define N_ERR_STOPPED 18           /* the calling app is being stopped */
+#define N_ERR_NOT_FOLDER 19
+#define N_ERR_IS_FOLDER 20
+#define N_ERR_READ_ONLY 21
+#define N_ERR_NO_SPACE 22
+#define N_ERR_NOT_PROGRAM 23       /* the file is not a Nocturne program */
+#define N_ERR_NAME_TOO_LONG 24
+#define N_ERR_NO_APP 25            /* no such app (or no such child of the caller) */
+#define N_ERR_TOO_MANY_ARGUMENTS 26
+#define N_ERR_CONNECTION_RESET 27
+#define N_ERR_CONNECTION_REFUSED 28
+#define N_ERR_ADDRESS_IN_USE 29
+#define N_ERR_NETWORK_DOWN 30
+#define N_ERR_NOT_CONNECTED 31
+#define N_ERR_UNREACHABLE 32
+#define N_ERR_PROTOCOL 33
+#define N_RESULT_CODES 34
+
 /* System call numbers. A number keeps its meaning for as long as it exists, so
-   programs built inside Nocturne keep working. 1-18, 22-25, 30-32, 35-37, 48-49,
-   51-52, 57, 60-63, 89, 90, 99-106, 109-110, 113-116, 151, 155 and 203-206 stay
-   unassigned. */
+   programs built inside Nocturne keep working. 1-18, 22-25, 30-32, 35-37, 51-52,
+   57, 60-63, 90 and 203-206 stay unassigned. */
 enum {
     SYS_EXIT = 0,
     SYS_SLEEP = 19, SYS_UPTIME, SYS_TIME,
@@ -17,7 +55,7 @@ enum {
     SYS_GPU_RENDER_BATCH,
     SYS_GPU_BLIT,
     SYS_CLOCK_INFO, SYS_THREAD_CREATE, SYS_THREAD_JOIN, SYS_THREAD_EXIT,
-    SYS_THREAD_ID = 50,
+    SYS_WAIT_ADDRESS, SYS_WAKE_ADDRESS, SYS_THREAD_ID,
     SYS_CHANNEL_LISTEN = 53, SYS_CHANNEL_CONNECT, SYS_CHANNEL_ACCEPT,
     SYS_SHARED_CREATE,
     SYS_THREAD_STACK_BOUNDS = 58, SYS_THREAD_DETACH,
@@ -28,10 +66,20 @@ enum {
     SYS_WIN_DIRECT,  /* (window, wanted): ask to be shown by the display driver directly (EV_DIRECT) */
     SYS_WIN_FRAME,   /* (window): EV_FRAME at the display's next frame, presented or not (WIN_FRAME_EVENTS) */
     SYS_WIN_POINTER, /* (window, const struct n_win_pointer *, size): the pointer over the client area */
-    SYS_SHARED_RESERVE = 88,
-    SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS,
-    SYS_NET_TEST = 107, SYS_NET_DNS_ALL,
-    SYS_NET_STATS = 111, SYS_NET_SETUP_CANCEL_CHANNEL,
+    SYS_SHARED_RESERVE = 88, SYS_WAIT_ADDRESS64,
+    SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
+    SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
+    SYS_NET_DNS_ALL, SYS_TCP_SEND_UNTIL, SYS_TCP_CANCEL, SYS_NET_STATS,
+    SYS_NET_SETUP_CANCEL_CHANNEL,
+    /* Passive open (RFC 9293). A listener shares the TCP id space: TCP_CLOSE
+       ends it and refuses its unaccepted connections, TCP_CANCEL wakes waiters.
+       LISTEN (ip, port, backlog): ip 0 takes every local address, otherwise one of
+       them (127/8 or the interface's); port 0 picks one, backlog <= 0 a default.
+       ACCEPT (listener, timeout_ms like TCP_RECV, struct n_sockaddr *remote or 0).
+       ADDRESS (id, struct n_sockaddr *local, struct n_sockaddr *remote; either 0).
+       FINISH (id): RFC 9293 CLOSE, the FIN after the queued data; receiving goes
+       on until the peer finishes too, and the id stays the caller's until TCP_CLOSE. */
+    SYS_TCP_LISTEN, SYS_TCP_ACCEPT, SYS_TCP_ADDRESS, SYS_TCP_FINISH,
     SYS_NET_LIMIT = 128,
     /* Native ABI (docs/nocturne-native-abi.md): typed handles, documents and
        folders by full path, message channels, apps and event queues. */
@@ -41,9 +89,9 @@ enum {
     SYS_DOCUMENT_APPEND,
     SYS_ENTRY_INFO, SYS_ENTRY_REMOVE, SYS_ENTRY_MOVE, SYS_FOLDER_CREATE, SYS_FOLDER_LIST,
     SYS_CHANNEL_PAIR, SYS_CHANNEL_SEND, SYS_CHANNEL_RECEIVE,
-    SYS_APP_LAUNCH, SYS_APP_RESULT, SYS_APP_STOP, SYS_APP_SELF,
-    SYS_EVENTS_CREATE = 152, SYS_EVENTS_WATCH, SYS_EVENTS_UNWATCH,
-    SYS_EVENTS_TIMER = 156, SYS_EVENTS_WAIT,
+    SYS_APP_LAUNCH, SYS_APP_RESULT, SYS_APP_STOP, SYS_APP_SELF, SYS_APP_PARENT,
+    SYS_EVENTS_CREATE, SYS_EVENTS_WATCH, SYS_EVENTS_UNWATCH, SYS_EVENTS_WATCH_ADDRESS,
+    SYS_EVENTS_TIMER, SYS_EVENTS_WAIT,
     SYS_APP_OPEN, SYS_APP_ID, SYS_SYSTEM_LOG_OPEN,
     SYS_AUDIO_OPEN, SYS_AUDIO_SUBMIT, SYS_AUDIO_STATUS, SYS_AUDIO_OUTPUT,
     SYS_RANDOM,
@@ -113,7 +161,8 @@ enum {
 /* SYS_WATCH_TAKE counts up to this and stays there until the count is taken */
 #define N_WATCH_CHANGES_MAX 0xffffffffu
 
-/* The folders of C: every app and the system know. */
+/* The folders of C: every app and the system know. Apps start in the user's folder, C:\Users\<name>,
+   which the setting USERFOLDER names; its AppData\Temp, emptied at every start, is the setting TEMP. */
 #define N_FOLDER_SYSTEM   "C:\\Nocturne\\System"  /* the system's programs */
 #define N_FOLDER_PROGRAMS "C:\\Programs"           /* the apps, each in a folder of its own */
 /* certificate authorities the system trusts besides the roots built into TLS (user/libc/tls.c) */
@@ -122,20 +171,20 @@ enum {
 /* n_document_open access: one of these, not a bit set. */
 #define N_DOCUMENT_READ 1     /* read an existing document */
 #define N_DOCUMENT_EDIT 2     /* read and write an existing document */
-#define N_DOCUMENT_CREATE 3   /* a new, empty document; fails if the name is taken */
+#define N_DOCUMENT_CREATE 3   /* a new, empty document; N_ERR_EXISTS if the name is taken */
 #define N_DOCUMENT_REPLACE 4  /* new content, swapped in whole when saved (or by n_handle_close) */
 
 /* n_document_commit: save the document (a REPLACE handle's version is published first and the
    handle reads it from then on). */
 #define N_COMMIT_WAIT 1       /* until it is on the medium */
 #define N_COMMIT_START 2      /* return at once; N_EVENT_SAVED reports the outcome */
-#define N_COMMIT_RESULT 3     /* the last started save's outcome */
+#define N_COMMIT_RESULT 3     /* the last started save's outcome (N_ERR_NOT_READY: not yet) */
 
 /* An entry of a folder, or the entry a path names. id is the entry itself on C:: it
    stays with the entry when it moves and is never given to another one. New fields come at
    the end: a call that returns entries takes the size of the caller's struct n_entry and
-   writes that much of each, entries that far apart (it fails below N_ENTRY_FIRST_BYTES and
-   past what the kernel knows). SYS_ENTRY_INFO and SYS_FOLDER_LIST, the
+   writes that much of each, entries that far apart (N_ERR_INVALID below N_ENTRY_FIRST_BYTES,
+   N_ERR_UNSUPPORTED past what the kernel knows). SYS_ENTRY_INFO and SYS_FOLDER_LIST, the
    calls of programs built before id, write N_ENTRY_FIRST_BYTES. */
 struct n_entry {
     char name[256];
@@ -161,15 +210,18 @@ struct n_channel_message {
 };
 
 /* n_app_launch. Handle i of the new app is handles[i] of the launcher (-1:
-   none); by convention 0 is its input, 1 its output and 2 its log. */
+   none); by convention 0 is its input, 1 its output and 2 its log. Settings
+   are "NAME=value" strings that ISO C getenv reads. */
 struct n_launch {
     const char *const *arguments;
+    const char *const *settings;
     const int32_t *handles;
-    uint32_t argument_count, handle_count, flags;
+    uint32_t argument_count, setting_count, handle_count, flags;
 };
-/* The most bytes a launch's argument strings (each with its nul) and their
-   null-terminated pointer array (8 bytes a pointer) may take. */
+/* The most bytes a launch's argument and setting strings (each with its nul) and their two
+   null-terminated pointer arrays (8 bytes a pointer) may take: N_ERR_TOO_MANY_ARGUMENTS past it. */
 #define N_LAUNCH_MAX_BYTES (4ULL << 20)
+#define N_APP_STOP_TREE 1  /* n_app_stop: also stop every app it launched */
 
 /* Event interests and reports (level-triggered). */
 #define N_EVENT_RECEIVABLE 1u  /* a message, input, connection or data waits */
@@ -177,6 +229,7 @@ struct n_launch {
 #define N_EVENT_CLOSED 4u      /* the other end has gone */
 #define N_EVENT_APP_ENDED 8u
 #define N_EVENT_TIMER 16u
+#define N_EVENT_ADDRESS 32u    /* a watched memory word was notified */
 #define N_EVENT_SAVED 64u      /* a document save started with N_COMMIT_START has its outcome */
 struct n_event {
     uint64_t token;
@@ -194,13 +247,14 @@ struct n_event {
 #define N_MEMORY_LOW 0x10
 
 struct n_procinfo {
-    int pid;
+    int pid, ppid;
     int state; /* 0 ready 1 running 2 blocked 3 ended */
     int is_user;
     char name[32];
     uint64_t cpu_ms;
     uint64_t mem_kb;
     uint64_t start_ms;
+    uint64_t wait_phys; /* blocked in an address wait: the physical word, else 0 */
 };
 
 /* free_mem: what an app can have now, the free frames and those of programs no task runs, which
@@ -417,7 +471,7 @@ struct n_audio_status {
 #define N_AUDIO_CLOCK_ESTIMATED 2u
 #define N_AUDIO_CLOCK_REMOTE 4u
 #define N_AUDIO_RATE 48000     /* n_audio_submit: frames of two int16_t, left first */
-#define N_AUDIO_WAIT 1u        /* n_audio_submit: wait for room instead of failing */
+#define N_AUDIO_WAIT 1u        /* n_audio_submit: wait for room instead of N_ERR_NOT_READY */
 
 /* n_audio_output: the sound's way out. With set's N_AUDIO_SET_VOLUME the master volume becomes
    volume (0 to 100; it also unmutes), with N_AUDIO_SET_MUTED muting becomes muted (both: in that
@@ -565,6 +619,7 @@ enum n_dns_status {
     N_DNS_FORMAT, N_DNS_TIMEOUT, N_DNS_UNREACHABLE, N_DNS_CANCELLED, N_DNS_RESOURCE,
 };
 struct n_dns_result { uint32_t version, status, count, ttl; };
+#define N_TCP_SEND_NONBLOCK 1u /* SYS_TCP_SEND_UNTIL final flags argument */
 struct n_netstats {
     uint64_t rx_dropped, rx_invalid, rx_budget_yields;
     uint64_t rx_completion_pending, rx_completion_retries, rx_completion_cancelled, rx_ring_high_water;
@@ -577,4 +632,8 @@ struct n_netfault {
 struct n_tcpstats { /* since boot, all connections */
     uint64_t segs_out, segs_in, retransmits, fast_retransmits, timeouts, dupacks_in, ooo_in;
     uint64_t faults_dropped, faults_reordered;
+};
+struct n_sockaddr {
+    uint32_t ip; /* host byte order: a.b.c.d is a<<24 | b<<16 | c<<8 | d */
+    uint16_t port;
 };

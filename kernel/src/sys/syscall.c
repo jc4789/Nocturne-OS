@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/smp.h"
+#include "sys/address_wait.h"
 #include "sys/process.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
@@ -100,6 +101,8 @@ static int user_transfer(void *dst, const void *src, size_t n, const void *user,
     return 0;
 }
 
+int copy_from_user(void *dst, const void *usrc, size_t n) { return user_transfer(dst, usrc, n, usrc, false); }
+int copy_to_user(void *udst, const void *src, size_t n) { return user_transfer(udst, src, n, udst, true); }
 
 int user_str(char *dst, const char *src, size_t max) {
     if (!max) return -N_ERR_NAME_TOO_LONG;
@@ -229,12 +232,15 @@ static int64_t sys_proclist(struct n_procinfo *out, int max) {
         struct n_procinfo *info = &list[n++];
         struct process *p = t->process, *main = process_of_main(t);
         info->pid = t->tid;
+        /* an app's other thread is shown under its app; an app under the app that launched it */
+        info->ppid = !p ? 0 : !main ? p->pid : p->parent ? p->parent->pid : 0;
         info->state = t->sched.state;
         info->is_user = p != NULL;
         strlcpy(info->name, t->name, sizeof info->name);
         info->cpu_ms = sched_thread_cpu_ns(t) / NS_PER_MS;
         info->mem_kb = main ? process_pages(main) * 4 : 0;
         info->start_ms = t->start_ns / NS_PER_MS;
+        info->wait_phys = __atomic_load_n(&t->wait.item.key, __ATOMIC_RELAXED);
     }
     spin_unlock(&thread_lock, flags);
     int r = copy_to_user(out, list, (size_t)n * sizeof *list);
@@ -2583,22 +2589,23 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
     int r = user_string(upath, &path);
     if (r < 0) return r;
     struct n_launch l = {0};
-    char **argv = NULL;
+    char **argv = NULL, **settings = NULL;
     struct handle **handles = NULL, *app = NULL;
     size_t argc = 0, bytes = 0;
     int64_t ret = copy_from_user(&l, ul, sizeof l);
     const size_t limit = USER_STACK_MAX / 2; /* what the new app's stack can hold */
     if (ret < 0) goto out;
     if (l.flags) { ret = -N_ERR_INVALID; goto out; }
-    if (l.argument_count > limit / 8 || l.handle_count > 4096) {
+    if (l.argument_count > limit / 8 || l.setting_count > limit / 8 || l.handle_count > 4096) {
         l = (struct n_launch){0};
         ret = -N_ERR_TOO_MANY_ARGUMENTS;
         goto out;
     }
     argc = l.argument_count ? l.argument_count : 1;
     argv = kzalloc(argc * sizeof *argv);
+    settings = kzalloc((l.setting_count + 1) * sizeof *settings);
     handles = kzalloc((l.handle_count + 1) * sizeof *handles);
-    if (!argv || !handles) { ret = -N_ERR_NO_MEMORY; goto out; }
+    if (!argv || !settings || !handles) { ret = -N_ERR_NO_MEMORY; goto out; }
     if (!l.argument_count) {
         argv[0] = strdup(path);
         if (!argv[0]) { ret = -N_ERR_NO_MEMORY; goto out; }
@@ -2609,6 +2616,13 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
         if ((r = user_string(ua, &argv[i])) < 0) { ret = r; goto out; }
         bytes += strlen(argv[i]) + 1;
     }
+    for (size_t i = 0; i < l.setting_count; i++) {
+        const char *us;
+        if ((r = copy_from_user(&us, &l.settings[i], sizeof us)) < 0) { ret = r; goto out; }
+        if ((r = user_string(us, &settings[i])) < 0) { ret = r; goto out; }
+        bytes += strlen(settings[i]) + 1;
+        if (!strchr(settings[i], '=')) { ret = -N_ERR_INVALID; goto out; }
+    }
     if (bytes > limit) { ret = -N_ERR_TOO_MANY_ARGUMENTS; goto out; }
     for (size_t i = 0; i < l.handle_count; i++) {
         int32_t h;
@@ -2617,16 +2631,19 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
         if (!(handles[i] = handle_get(h))) { ret = -N_ERR_NO_HANDLE; goto out; }
     }
     if ((r = proc_app_create(&app)) < 0) { ret = r; goto out; }
-    struct proc_launch launch = {.argc = (int)argc, .argv = argv, .handles = handles,
-                                 .handle_count = l.handle_count, .app = app->object};
+    struct proc_launch launch = {.argc = (int)argc, .argv = argv, .setting_count = (int)l.setting_count,
+                                 .settings = settings, .handles = handles, .handle_count = l.handle_count,
+                                 .parent = process_current(), .app = app->object};
     r = proc_launch(path, &launch);
     if (r < 0) ret = r;
     else { ret = handle_install(app); app = NULL; }
 out:
     handle_close(app);
     if (argv) for (size_t i = 0; i < argc; i++) kfree(argv[i]);
+    if (settings) for (size_t i = 0; i < l.setting_count; i++) kfree(settings[i]);
     if (handles) for (size_t i = 0; i < l.handle_count; i++) handle_close(handles[i]);
     kfree(argv);
+    kfree(settings);
     kfree(handles);
     kfree(path);
     return ret;
@@ -2650,9 +2667,10 @@ static int64_t sys_app_stop(int h, int flags) {
     if (!app) return r;
     int pid = proc_app_pid(app);
     handle_close(app);
-    if (flags) return -N_ERR_INVALID;
+    if (flags & ~N_APP_STOP_TREE) return -N_ERR_INVALID;
     if (!pid) return 0; /* it has already ended */
-    process_kill(pid);
+    if (flags & N_APP_STOP_TREE) process_kill_tree(pid, true);
+    else process_kill(pid);
     return 0;
 }
 
@@ -2765,6 +2783,16 @@ static int64_t sys_events_watch(int q, int h, uint32_t interest, uint64_t token)
     r = watched ? events_watch(queue, watched, interest, token, &spare) : -N_ERR_NO_HANDLE;
     handle_close(watched);
     kfree(spare);
+    handle_close(queue);
+    return r;
+}
+
+static int64_t sys_events_watch_address(int q, uint64_t address, uint32_t expected, uint64_t token) {
+    if ((address & 3) || !user_ok((void *)address, sizeof(uint32_t))) return -N_ERR_BAD_ADDRESS;
+    int64_t r;
+    struct handle *queue = handle_get_as(q, events_is, &r);
+    if (!queue) return r;
+    r = events_watch_address(queue, (volatile uint32_t *)address, expected, token);
     handle_close(queue);
     return r;
 }
@@ -2898,6 +2926,18 @@ void syscall_dispatch(struct regs *r) {
         if (!ret) ret = copy_to_user((void *)b, &high, sizeof high);
         break;
     }
+    case SYS_WAIT_ADDRESS:
+        if ((a & 3) || !user_ok((void *)a, sizeof(uint32_t))) ret = -N_ERR_BAD_ADDRESS;
+        else ret = address_wait((volatile void *)a, (uint32_t)b, false, address_deadline((unsigned)c));
+        break;
+    case SYS_WAIT_ADDRESS64:
+        if ((a & 7) || !user_ok((void *)a, sizeof(uint64_t))) ret = -N_ERR_BAD_ADDRESS;
+        else ret = address_wait((volatile void *)a, b, true, address_deadline((unsigned)c));
+        break;
+    case SYS_WAKE_ADDRESS:
+        if ((a & 3) || !user_ok((void *)a, sizeof(uint32_t))) ret = -N_ERR_BAD_ADDRESS;
+        else ret = address_wake((volatile uint32_t *)a, (unsigned)b);
+        break;
     case SYS_GPU_INFO: {
         struct n_gpu_info info;
         gpu_get_info(&info);
@@ -3036,9 +3076,17 @@ void syscall_dispatch(struct regs *r) {
     case SYS_APP_RESULT: ret = sys_app_result((int)a, (int64_t)b, (int *)c); break;
     case SYS_APP_STOP: ret = sys_app_stop((int)a, (int)b); break;
     case SYS_APP_SELF: ret = self->process->pid; break;
+    case SYS_APP_PARENT: {
+        uint64_t f = spin_lock(&thread_lock); /* the family's links */
+        struct process *parent = self->process->parent;
+        ret = parent ? parent->pid : 0;
+        spin_unlock(&thread_lock, f);
+        break;
+    }
     case SYS_EVENTS_CREATE: ret = sys_events_create(); break;
     case SYS_EVENTS_WATCH: ret = sys_events_watch((int)a, (int)b, (uint32_t)c, d); break;
     case SYS_EVENTS_UNWATCH: ret = sys_events_unwatch((int)a, b); break;
+    case SYS_EVENTS_WATCH_ADDRESS: ret = sys_events_watch_address((int)a, b, (uint32_t)c, d); break;
     case SYS_EVENTS_TIMER: ret = sys_events_timer((int)a, b, (int)c, d); break;
     case SYS_EVENTS_WAIT: ret = sys_events_wait((int)a, (struct n_event *)b, c, (int64_t)d); break;
     case SYS_APP_OPEN: ret = sys_app_open((int64_t)a); break;

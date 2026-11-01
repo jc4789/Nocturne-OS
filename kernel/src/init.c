@@ -60,8 +60,12 @@ void kmain_late(void) {
     /* its input, output and log are the console */
     struct handle *con = stream_console_open();
     struct handle *handles[3] = {con, con, con};
+    char folder[sizeof "FOLDER=C:\\Users\\" + 255];
+    ksnprintf(folder, sizeof folder, "FOLDER=%s", store_user_folder());
     char *argv[] = {INIT_PATH, NULL};
-    struct proc_launch l = {.argc = 1, .argv = argv, .handles = handles, .handle_count = 3};
+    char *settings[] = {folder, "TERMINAL=0 1 2"};
+    struct proc_launch l = {.argc = 1, .argv = argv, .setting_count = 2, .settings = settings,
+                            .handles = handles, .handle_count = 3};
     int pid = proc_launch(INIT_PATH, &l);
     if (pid > 0) init_pid = pid;
     if (pid < 0) kprintf("init: failed to start %s (%d)\n", INIT_PATH, pid);

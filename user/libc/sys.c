@@ -224,6 +224,15 @@ n_result n_shared_map(n_handle shared, size_t bytes, int access, void **mapping)
 
 /* ---- native ABI: results come back as they are, errno is left alone ---- */
 #define NC5(n, a, b, c, d, e) __syscall(n, (long)(a), (long)(b), (long)(c), (long)(d), (long)(e))
+n_result wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms) {
+    return NC5(SYS_WAIT_ADDRESS, address, expected, timeout_ms, 0, 0);
+}
+n_result wait_on_address64(volatile uint64_t *address, uint64_t expected, unsigned timeout_ms) {
+    return NC5(SYS_WAIT_ADDRESS64, address, expected, timeout_ms, 0, 0);
+}
+n_result wake_address(volatile uint32_t *address, unsigned count) {
+    return NC5(SYS_WAKE_ADDRESS, address, count, 0, 0, 0);
+}
 const char *n_result_text(n_result r) { return strerror((int)(r < 0 ? -r : r)); }
 n_result n_handle_close(n_handle h) { return NC5(SYS_HANDLE_CLOSE, h, 0, 0, 0, 0); }
 n_result n_handle_kind(n_handle h) { return NC5(SYS_HANDLE_KIND, h, 0, 0, 0, 0); }
@@ -349,8 +358,43 @@ static n_handle launch_program(const char *path, const struct n_launch *launch) 
     return app;
 }
 
+/* Whether the launch gives the setting name ("NAME=..."). */
+static bool launch_gives(const struct n_launch *l, const char *name) {
+    size_t n = strlen(name);
+    for (uint32_t i = 0; i < l->setting_count; i++)
+        if (l->settings[i] && !strncmp(l->settings[i], name, n) && l->settings[i][n] == '=') return true;
+    return false;
+}
+
 n_handle n_app_launch(const char *path, const struct n_launch *launch) {
-    return launch_program(path, launch);
+    if (!launch) return launch_program(path, launch);
+    /* A child works for this app's user: it gets this app's USERFOLDER and TEMP unless the launch
+       names its own (the kernel gives the system's to an app launched without them). */
+    static const char *const user[] = {"USERFOLDER", "TEMP"};
+    char *own[2] = {0};
+    const char **settings = NULL;
+    uint32_t owned = 0;
+    struct n_launch l = *launch;
+    n_handle app = -N_ERR_NO_MEMORY;
+    for (int i = 0; i < 2; i++) {
+        const char *v = getenv(user[i]);
+        if (!v || launch_gives(launch, user[i])) continue;
+        size_t n = strlen(user[i]) + strlen(v) + 2;
+        if (!(own[owned] = malloc(n))) goto out;
+        snprintf(own[owned++], n, "%s=%s", user[i], v);
+    }
+    if (owned) {
+        if (!(settings = malloc((launch->setting_count + owned) * sizeof *settings))) goto out;
+        for (uint32_t i = 0; i < launch->setting_count; i++) settings[i] = launch->settings[i];
+        for (uint32_t i = 0; i < owned; i++) settings[launch->setting_count + i] = own[i];
+        l.settings = settings;
+        l.setting_count += owned;
+    }
+    app = launch_program(path, &l);
+out:
+    free(settings);
+    for (uint32_t i = 0; i < owned; i++) free(own[i]);
+    return app;
 }
 n_result n_app_result(n_handle app, int64_t timeout_ms, int *status) {
     return NC5(SYS_APP_RESULT, app, timeout_ms, status, 0, 0);
@@ -358,6 +402,7 @@ n_result n_app_result(n_handle app, int64_t timeout_ms, int *status) {
 n_result n_app_stop(n_handle app, int flags) { return NC5(SYS_APP_STOP, app, flags, 0, 0, 0); }
 n_result n_random(void *buf, size_t n) { return NC5(SYS_RANDOM, buf, n, 0, 0, 0); }
 n_result n_app_self(void) { return NC5(SYS_APP_SELF, 0, 0, 0, 0, 0); }
+n_result n_app_parent(void) { return NC5(SYS_APP_PARENT, 0, 0, 0, 0, 0); }
 n_result n_system_log(char *buf, size_t cap) { return NC5(SYS_SYSTEM_LOG, buf, cap, 0, 0, 0); }
 n_handle n_system_log_open(void) { return (n_handle)NC5(SYS_SYSTEM_LOG_OPEN, 0, 0, 0, 0, 0); }
 n_handle n_app_open(int64_t id) { return (n_handle)NC5(SYS_APP_OPEN, id, 0, 0, 0, 0); }
@@ -442,6 +487,9 @@ n_handle n_events_create(void) { return (n_handle)NC5(SYS_EVENTS_CREATE, 0, 0, 0
 n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t token) {
     return NC5(SYS_EVENTS_WATCH, q, h, interest, token, 0);
 }
+n_result n_events_watch_address(n_handle q, volatile uint32_t *address, uint32_t expected, uint64_t token) {
+    return NC5(SYS_EVENTS_WATCH_ADDRESS, q, address, expected, token, 0);
+}
 n_result n_events_timer(n_handle q, uint64_t ms, bool repeat, uint64_t token) {
     return NC5(SYS_EVENTS_TIMER, q, ms, repeat, token, 0);
 }
@@ -485,14 +533,25 @@ bool program_folder(const char *folder) {
 }
 
 /* Run a program in place of this app: it gets this app's input, output and log,
-   and its result is returned (or a negative n_result). */
+   folder and terminal, and its result is returned (or a negative n_result). */
 static int run_here(const char *full, char *const argv[]) {
     uint32_t argc = 0;
     while (argv[argc]) argc++;
     int32_t handles[3];
     for (int i = 0; i < 3; i++) handles[i] = n_handle_kind(i) >= 0 ? i : -1;
-    struct n_launch l = {.arguments = (const char *const *)argv, .handles = handles,
-                         .argument_count = argc, .handle_count = 3};
+    char folder[4104], terminal[64];
+    const char *settings[2];
+    uint32_t ns = 0;
+    const char *f = getenv("FOLDER"), *t = getenv("TERMINAL");
+    if (!f || !n_path_is_complete(f)) f = "C:\\";
+    snprintf(folder, sizeof folder, "FOLDER=%s", f);
+    settings[ns++] = folder;
+    if (t) {
+        snprintf(terminal, sizeof terminal, "TERMINAL=%s", t);
+        settings[ns++] = terminal;
+    }
+    struct n_launch l = {.arguments = (const char *const *)argv, .settings = settings, .handles = handles,
+                         .argument_count = argc, .setting_count = ns, .handle_count = 3};
     n_handle app = n_app_launch(full, &l);
     if (app < 0) return (int)app;
     int st = 0;
@@ -512,9 +571,51 @@ int system(const char *cmd) {
     return run_wait("sh", argv);
 }
 
-/* ISO C: the environment list is the implementation's; Nocturne's is empty. */
+/* Environment: there is no inherited environment, just the launch settings plus the FOLDER that
+   n_folder_set gives this app. */
+static char **env_names, **env_vals;
+static int env_n;
+
+static int env_find(const char *name) {
+    for (int i = 0; i < env_n; i++)
+        if (!strcmp(env_names[i], name)) return i;
+    return -1;
+}
+
+/* Sets this app's own setting name to value: n_folder_set's FOLDER, which getenv and the
+   apps it launches then see. */
+static int setting_set(const char *name, const char *value) {
+    int i = env_find(name);
+    char *v = strdup(value);
+    if (!v) return -1;
+    if (i >= 0) {
+        free(env_vals[i]);
+        env_vals[i] = v;
+        return 0;
+    }
+    char **nn = realloc(env_names, sizeof(char *) * (size_t)(env_n + 1));
+    if (nn) env_names = nn;
+    char **nv = realloc(env_vals, sizeof(char *) * (size_t)(env_n + 1));
+    if (nv) env_vals = nv;
+    char *n = strdup(name);
+    if (!nn || !nv || !n) {
+        free(v);
+        free(n);
+        return -1;
+    }
+    env_names[env_n] = n;
+    env_vals[env_n++] = v;
+    return 0;
+}
+
+char *const *n_settings = (char *const[]){NULL};
+
 char *getenv(const char *name) {
-    (void)name;
+    int i = env_find(name);
+    if (i >= 0) return env_vals[i];
+    size_t len = strlen(name);
+    for (char *const *s = n_settings; *s; s++)
+        if (!strncmp(*s, name, len) && (*s)[len] == '=') return *s + len + 1;
     return NULL;
 }
 
@@ -562,7 +663,8 @@ n_result n_path_join(const char *folder, const char *name, char *out, size_t cap
 }
 
 n_result n_path_complete(const char *name, char *out, size_t cap) {
-    return n_path_join("C:\\", name, out, cap);
+    const char *folder = getenv("FOLDER");
+    return n_path_join(folder && n_path_is_complete(folder) ? folder : "C:\\", name, out, cap);
 }
 
 const char *n_path_name(const char *path) {
@@ -645,6 +747,32 @@ n_result n_app_data_folder(const char *name, char *out, size_t cap) {
     if (r >= 0) r = n_path_join(data, name, out, cap);
     if (r >= 0 && (made = folder_ready(data)) >= 0) made = folder_ready(out);
     return r < 0 ? r : made < 0 ? made : r;
+}
+
+n_result n_folder_set(const char *name) {
+    char full[4096];
+    n_result r = n_path_complete(name, full, sizeof full);
+    if (r < 0) return r;
+    struct n_entry e;
+    r = n_entry_info(full, &e);
+    if (r < 0) return r;
+    if (e.kind != N_KIND_FOLDER) return -N_ERR_NOT_FOLDER;
+    return setting_set("FOLDER", full) < 0 ? -N_ERR_NO_MEMORY : 0;
+}
+
+bool n_terminal(n_handle h) {
+    const char *s = getenv("TERMINAL");
+    while (s && *s) {
+        char *end;
+        long v = strtol(s, &end, 10);
+        if (end == s) {
+            s++;
+            continue;
+        }
+        if (v == h) return true;
+        s = end;
+    }
+    return false;
 }
 
 /* ---- startup / exit ---- */
@@ -737,7 +865,8 @@ void __libc_init(void) {
     tls_initialized = 1;
     __stdio_init();
 }
-void __libc_start(int argc, char **argv) {
+void __libc_start(int argc, char **argv, char **settings) {
+    if (settings) n_settings = settings;
     __libc_init();
     /* Weak symbols also keep libc usable by the in-OS C compiler, whose link
        path need not supply these sections. Empty arrays are a no-op for C. */

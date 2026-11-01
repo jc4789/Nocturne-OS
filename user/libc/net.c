@@ -40,6 +40,33 @@ char *ip_format(uint32_t ip, char *buf) {
     return buf;
 }
 
+n_result udp_socket(uint16_t port) { return NET(SYS_UDP_SOCKET, port, 0, 0, 0, 0); }
+n_result udp_sendto(n_handle s, uint32_t ip, uint16_t port, const void *buf, size_t len) {
+    return NET(SYS_UDP_SEND, s, ip, port, buf, len);
+}
+n_result udp_recvfrom(n_handle s, void *buf, size_t len, int timeout_ms, struct n_sockaddr *from) {
+    return NET(SYS_UDP_RECV, s, buf, len, timeout_ms, from);
+}
+n_result udp_close(n_handle s) { return NET(SYS_UDP_CLOSE, s, 0, 0, 0, 0); }
+n_result tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) { return NET(SYS_TCP_CONNECT, ip, port, timeout_ms, 0, 0); }
+n_result tcp_send(n_handle s, const void *buf, size_t len) { return NET(SYS_TCP_SEND, s, buf, len, 0, 0); }
+n_result tcp_send_until(n_handle s, const void *buf, size_t len, uint64_t deadline_ms) {
+    return NET(SYS_TCP_SEND_UNTIL, s, buf, len, deadline_ms, 0);
+}
+n_result tcp_send_some(n_handle s, const void *buf, size_t len) {
+    return NET(SYS_TCP_SEND_UNTIL, s, buf, len, 0, N_TCP_SEND_NONBLOCK);
+}
+n_result tcp_cancel(n_handle s) { return NET(SYS_TCP_CANCEL, s, 0, 0, 0, 0); }
+n_result tcp_recv(n_handle s, void *buf, size_t len, int timeout_ms) { return NET(SYS_TCP_RECV, s, buf, len, timeout_ms, 0); }
+n_result tcp_close(n_handle s) { return NET(SYS_TCP_CLOSE, s, 0, 0, 0, 0); }
+n_result tcp_listen(uint32_t ip, uint16_t port, int backlog) { return NET(SYS_TCP_LISTEN, ip, port, backlog, 0, 0); }
+n_result tcp_accept(n_handle listener, int timeout_ms, struct n_sockaddr *remote) {
+    return NET(SYS_TCP_ACCEPT, listener, timeout_ms, remote, 0, 0);
+}
+n_result tcp_address(n_handle s, struct n_sockaddr *local, struct n_sockaddr *remote) {
+    return NET(SYS_TCP_ADDRESS, s, local, remote, 0, 0);
+}
+n_result tcp_finish(n_handle s) { return NET(SYS_TCP_FINISH, s, 0, 0, 0, 0); }
 n_result net_test(const struct n_netfault *set, struct n_tcpstats *stats) { return NET(SYS_NET_TEST, set, stats, 0, 0, 0); }
 
 /* wait for the interface to get an address (DHCP runs in the background after boot) */
