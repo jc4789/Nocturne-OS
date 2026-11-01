@@ -164,6 +164,7 @@ struct nvme {
     struct mutex stop_lock;
     uint64_t stops;
     bool stopped;
+    bool called_off; /* the last stop only gave up, its thread being killed (atomic) */
     bool cut;
     struct mutex reset_lock; /* enable: at start, after a sleep, after a timeout */
     uint8_t *ident;          /* a page for identify, at start */
@@ -335,13 +336,16 @@ static bool controller_idle(struct nvme *c) {
    (Figure 41, EN); nothing says that of a fatal status, of one gone from the bus or of a Function
    Level Reset, and its cache may be gone. One that still does not stop has its bus mastering turned
    off, and stays out of use with its namespaces. If the reset was only called off, its thread being
-   killed (dev/pci.h), the next request goes on with it. `seen`: c->stops as the caller read it; a stop
-   that ended since has done this for it. What the last stop came to is returned. */
+   killed (dev/pci.h), the next request goes on with it. A Function Level Reset left unfinished is not
+   to be reached by anything but its next call, and has its bus mastering off already (dev/pci.h, 6.6.2):
+   neither the registers nor the configuration are touched before that. `seen`: c->stops as the caller
+   read it; a stop that ended since has done this for it. What the last stop came to is returned. */
 static bool controller_stop(struct nvme *c, uint64_t seen) {
     mutex_lock(&c->stop_lock);
     if (__atomic_load_n(&c->stops, __ATOMIC_ACQUIRE) == seen) {
         controller_down(c);
-        uint32_t cc = rd32(c, CC), csts = rd32(c, CSTS);
+        bool resetting = pci_reset_left(c->pci);
+        uint32_t cc = resetting ? 0xFFFFFFFFu : rd32(c, CC), csts = resetting ? 0xFFFFFFFFu : rd32(c, CSTS);
         bool stopped = false, lost = csts == 0xFFFFFFFFu || csts & CSTS_CFS;
         if (cc != 0xFFFFFFFFu && cc & CC_EN) {
             wait_ready(c, true, true);
@@ -358,9 +362,11 @@ static bool controller_stop(struct nvme *c, uint64_t seen) {
         }
         if (lost)
             for (struct ns *s = c->found; s; s = s->next) blk_cache_lost(&s->blk);
+        bool called_off = false;
         if (!stopped) {
-            pci_disable_busmaster(c->pci, NULL);
-            if (thread_current() && thread_current()->killed) {
+            if (!pci_reset_left(c->pci)) pci_disable_busmaster(c->pci, NULL);
+            called_off = thread_current() && thread_current()->killed;
+            if (called_off) {
                 kprintf("nvme%d: its reset was called off with its thread\n", c->index);
             } else {
                 kprintf("nvme%d: controller did not reset, turned off\n", c->index);
@@ -369,6 +375,7 @@ static bool controller_stop(struct nvme *c, uint64_t seen) {
             }
         }
         c->stopped = stopped;
+        __atomic_store_n(&c->called_off, called_off, __ATOMIC_RELEASE);
         queue_clear(&c->admin);
         unsigned nio = __atomic_load_n(&c->nio, __ATOMIC_ACQUIRE);
         for (unsigned i = 0; i < nio; i++) queue_clear(&c->io[i]);
@@ -393,8 +400,8 @@ static void submit(struct queue *q, int id, uint32_t cmd[16]) {
    command, or FAILED when the controller stopped answering. Then it has been stopped, and nothing
    of the command moves any more: the caller may take its memory back. It is down until a reset.
    Waiting for a free slot takes no time from the command: every command in the queue ends, or
-   stops the controller, within its own time. */
-static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t *result) {
+   stops the controller, within its own time. `writing`: the device whose write this is. */
+static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t *result, struct blkdev *writing) {
     struct nvme *c = q->c;
     int id;
     uint64_t f;
@@ -414,6 +421,7 @@ static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t 
     struct slot *s = &q->slots[id];
     uint64_t start = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
     uint64_t stops = __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE);
+    if (writing) blk_write_given(writing);
     submit(q, id, cmd);
     spin_unlock(&q->sq_lock, f);
 
@@ -443,6 +451,7 @@ static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t 
         /* the completion's interrupt wakes it; polled, it looks again each millisecond */
         wq_wait_unless(&s->wq, &s->seq, seen, c->nvectors ? deadline : MIN(deadline, clock_after(NS_PER_MS)));
     }
+    if (writing) blk_write_ended(writing);
     slot_give(q, (unsigned)id);
     return status;
 }
@@ -500,7 +509,7 @@ static int identify(struct nvme *c, uint32_t cns, uint32_t nsid) {
     *(uint64_t *)&cmd[6] = c->ident_phys;
     cmd[10] = cns;
     memset(c->ident, 0, PAGE_SIZE);
-    return run(&c->admin, cmd, ADMIN_NS, NULL);
+    return run(&c->admin, cmd, ADMIN_NS, NULL, NULL);
 }
 
 /* Identify Controller (3.5.1 step 7), with what the host sets from it: the I/O queue entry sizes,
@@ -544,7 +553,7 @@ static bool select_command_set(struct nvme *c) {
     *(uint64_t *)&cmd[6] = c->ident_phys;
     cmd[10] = (uint32_t)CNTID_THIS << 16 | CNS_COMMAND_SETS;
     memset(c->ident, 0, PAGE_SIZE);
-    int r = run(&c->admin, cmd, ADMIN_NS, NULL);
+    int r = run(&c->admin, cmd, ADMIN_NS, NULL, NULL);
     if (r) {
         kprintf("nvme%d: identify of its command sets failed (%x)\n", c->index, r);
         return false;
@@ -560,7 +569,7 @@ static bool select_command_set(struct nvme *c) {
     cmd[0] = OP_SET_FEATURES;
     cmd[10] = FEATURE_COMMAND_SETS;
     cmd[11] = combination;
-    if ((r = run(&c->admin, cmd, ADMIN_NS, NULL)) == FAILED) return false;
+    if ((r = run(&c->admin, cmd, ADMIN_NS, NULL, NULL)) == FAILED) return false;
     if (r) kprintf("nvme%d: refused command set combination %u (%x)\n", c->index, combination, r);
     return true;
 }
@@ -687,7 +696,7 @@ static bool enable(struct nvme *c) {
     uint32_t cmd[16] = {OP_SET_FEATURES}, got = 0;
     cmd[10] = FEATURE_QUEUES;
     cmd[11] = (want - 1) << 16 | (want - 1);
-    r = run(&c->admin, cmd, ADMIN_NS, &got);
+    r = run(&c->admin, cmd, ADMIN_NS, &got, NULL);
     if (r) goto fail;
     unsigned given = MIN((got & 0xFFFF) + 1, (got >> 16) + 1);
     if (!c->nio) {
@@ -710,7 +719,7 @@ static bool enable(struct nvme *c) {
         cmd[10] = (uint32_t)(q->size - 1) << 16 | q->qid;
         /* its vector, interrupts on when there are any, contiguous */
         cmd[11] = (c->nvectors ? (i % c->nvectors) << 16 | 2u : 0u) | 1u;
-        if ((r = run(&c->admin, cmd, ADMIN_NS, NULL))) goto fail;
+        if ((r = run(&c->admin, cmd, ADMIN_NS, NULL, NULL))) goto fail;
     }
     for (unsigned i = 0; i < c->nio; i++) { /* step 11: the submission queues */
         struct queue *q = &c->io[i];
@@ -719,7 +728,7 @@ static bool enable(struct nvme *c) {
         *(uint64_t *)&cmd[6] = q->sq_phys;
         cmd[10] = (uint32_t)(q->size - 1) << 16 | q->qid;
         cmd[11] = (uint32_t)q->qid << 16 | 1u; /* its completion queue, contiguous */
-        if ((r = run(&c->admin, cmd, ADMIN_NS, NULL))) goto fail;
+        if ((r = run(&c->admin, cmd, ADMIN_NS, NULL, NULL))) goto fail;
     }
     __atomic_store_n(&c->ready, true, __ATOMIC_RELEASE);
     return true;
@@ -731,11 +740,13 @@ down:
 }
 
 /* After a command failed with FAILED: the controller reset once by whichever caller comes first
-   (generation still `seen`), the others then finding it up again. */
+   (generation still `seen`), the others then finding it up again; or, if that caller's thread was
+   killed and gave up on it, going on with it themselves. */
 static bool recover(struct nvme *c, uint64_t seen) {
     mutex_lock(&c->reset_lock);
-    bool ok = __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE) != seen ? __atomic_load_n(&c->ready, __ATOMIC_ACQUIRE)
-                                                                         : enable(c);
+    bool moved = __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE) != seen;
+    bool ready = __atomic_load_n(&c->ready, __ATOMIC_ACQUIRE);
+    bool ok = moved && (ready || !__atomic_load_n(&c->called_off, __ATOMIC_ACQUIRE)) ? ready : enable(c);
     mutex_unlock(&c->reset_lock);
     return ok;
 }
@@ -795,7 +806,7 @@ static int transfer(void *ctx, bool write, uint64_t lba, unsigned n, uint8_t *bu
         cmd[10] = (uint32_t)lba;
         cmd[11] = (uint32_t)(lba >> 32);
         cmd[12] = n - 1;
-        int r = described ? run(io_queue(c), cmd, IO_NS, NULL) : -2;
+        int r = described ? run(io_queue(c), cmd, IO_NS, NULL, write ? &s->blk : NULL) : -2;
         if (list) pmm_free(list);
         if (!r) return 0;
         if (r == -2) {
@@ -848,7 +859,7 @@ static int blk_nvme_persist(struct blkdev *b) {
         uint64_t gen = __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE);
         uint32_t cmd[16] = {OP_FLUSH};
         cmd[1] = s->nsid;
-        int r = run(io_queue(c), cmd, IO_NS, NULL);
+        int r = run(io_queue(c), cmd, IO_NS, NULL, NULL);
         if (!r) return 0;
         if (r != FAILED || !recover(c, gen)) break;
     }

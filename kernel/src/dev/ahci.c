@@ -872,6 +872,11 @@ static void fis_make(uint8_t f[20], uint8_t command, uint64_t lba, unsigned coun
 /* One command with `bytes` at buf, given in the slot the caller entered with, and its end waited
    for. 0; -1 when the disk reported an error, the adapter one of its own or the time ran out; -2
    when buf cannot be described to the adapter. */
+/* The disk may have started over: only a cache that was on has anything to lose. */
+static void disk_cache_lost(struct disk *d) {
+    if (__atomic_load_n(&d->cache, __ATOMIC_ACQUIRE)) blk_cache_lost(&d->blk);
+}
+
 static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queued, bool write, const uint8_t *buf,
                       unsigned bytes, uint64_t ns) {
     uint32_t bit = 1u << slot;
@@ -900,6 +905,7 @@ static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queu
         s->status = PENDING;
         p->issued |= bit;
         if (queued) p->queued |= bit;
+        if (write) blk_write_given(&p->disk->blk);
         __atomic_thread_fence(__ATOMIC_RELEASE); /* the table and header before the port sees them */
         if (queued) wr(p, PxSACT, bit); /* before PxCI (3.3.13) */
         wr(p, PxCI, bit);
@@ -922,7 +928,7 @@ static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queu
         if (clock_now_ns() >= deadline) {
             if (!timed_out) {
                 kprintf("ahci%d: port %u: command %02x timed out\n", p->h->index, p->no, fis[2]);
-                if (p->disk) blk_cache_lost(&p->disk->blk); /* a disk that does not answer may have started over */
+                if (p->disk) disk_cache_lost(p->disk);
             }
             timed_out = true;
             halt(p, bit); /* fails it, or another caller is doing so */
@@ -937,6 +943,7 @@ static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queu
         wq_wait_unless(&s->wq, &s->seq, seen, MIN(deadline, clock_after(p->h->irq ? 10 * NS_PER_MS : NS_PER_MS)));
         looked = true;
     }
+    if (write) blk_write_ended(&p->disk->blk);
     f = spin_lock(&p->lock);
     int status = s->status;
     uint32_t is = p->error_is, tfd = p->error_tfd;
@@ -1019,8 +1026,8 @@ static int blk_ahci_write(struct blkdev *b, uint64_t lba, uint32_t n, const void
     return rw(b->priv, true, lba, n, (uint8_t *)buf);
 }
 
-/* FLUSH CACHE (EXT): the write cache reaches the medium, with every write that ended before it. */
-/* A disk's cache may come on or go off with its power: IDENTIFY says each time it is looked at (word 85). */
+/* FLUSH CACHE (EXT): the write cache reaches the medium, with every write that ended before it. A
+   disk's cache may come on or go off with its power: IDENTIFY says each time it is looked at (word 85). */
 static int blk_ahci_persist(struct blkdev *b) {
     struct disk *d = b->priv;
     return __atomic_load_n(&d->cache, __ATOMIC_ACQUIRE) && flush(d) < 0 ? -N_ERR_IO : 0;
@@ -1157,7 +1164,7 @@ static void port_examine(struct port *p) {
         if (known) {
             if (__atomic_exchange_n(&known->blk.gone, false, __ATOMIC_ACQ_REL))
                 kprintf("ahci%d: port %u: %s is back\n", h->index, p->no, known->blk.name);
-            blk_cache_lost(&known->blk); /* it says nothing of whether the power went with the link (7.3) */
+            disk_cache_lost(known); /* it says nothing of whether the power went with the link (7.3) */
             __atomic_store_n(&known->cache, found->cache, __ATOMIC_RELEASE);
             p->disk = known;
         } else if (is_disk) {

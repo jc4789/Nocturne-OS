@@ -809,8 +809,9 @@ static uint64_t flr_time_ns(const struct pci_device *d) {
 
 /* Owned by its enumerated device, not the app performing recovery. A cancelled or failed attempt
    must not lose the pre-FLR BARs/ACS, and a later one must not save over them what an FLR left.
-   Its caller reserves d->claimed across the attempt (dev/pciuser.c), so only that caller resets
-   d; resets of different functions go one at a time under reset_mutex, as they share the ports
+   Only one caller resets d: an app's, which reserves d->claimed across the attempt (dev/pciuser.c),
+   or the kernel driver that owns it (dev/nvme.c, under its lock);
+   resets of different functions go one at a time under reset_mutex, as they share the ports
    above (RRS holds, link retraining, the times since a port's reset). A sleep does not start
    while one runs (pci_suspend). A bus reset holds the configuration of each function below its
    port the same way (pci_bus_reset), until the function answers after it. AML's accesses
@@ -841,8 +842,9 @@ static struct mutex reset_mutex;
    one is counted (pci_suspend). reset_lock. */
 static unsigned resets_running;
 
-/* An FLR left every entry of the MSI-X table masked with its message forgotten (7.7.2.8), and the
-   table is not in what a reset saves: the entries with an irq get their messages again and open. */
+/* An FLR leaves every entry of the MSI-X table masked (7.7.2.8) and its message undefined (7.7.2.5
+   to 7.7.2.7), and the table is not in what a reset saves: the entries with an irq get their
+   messages again and open. */
 static void msix_entries_again(struct pci_device *d) {
     if (!d->msix_table || !d->msix_irqs) return;
     for (unsigned i = 0; i < d->msix_entries; i++) {
@@ -1074,6 +1076,13 @@ bool pci_function_reset(struct pci_device *d) {
 }
 
 bool pci_reset_stuck(const struct pci_device *d) { return d->reset && d->reset->stuck; }
+
+bool pci_reset_left(const struct pci_device *d) {
+    uint64_t f = spin_lock(&reset_lock);
+    bool left = d->reset != NULL;
+    spin_unlock(&reset_lock, f);
+    return left;
+}
 
 /* Software performing an FLR keeps the other software that may access the function from it
    until the FLR is done (6.6.2), and a Request reaching it meanwhile may be discarded: so while

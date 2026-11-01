@@ -155,7 +155,7 @@ unsigned pci_msix_max_vectors(const struct pci_device *d);
    to still be there. False for a function gone from the bus. */
 bool pci_requests_done(const struct pci_device *d);
 /* Function Level Reset (6.6.2), its configuration saved before and written back after (the MSI-X
-   table's entries excepted: a driver's, which it set up for itself), with Bus Master Enable
+   table's entries apart: those are written again, below), with Bus Master Enable
    always cleared in the restored configuration. Following 6.6.2's algorithm: the Command
    register is cleared but for Interrupt Disable (set, it keeps INTx deasserted), Transactions
    Pending is polled until it clears or no Completion can still arrive (the longest Completion
@@ -189,6 +189,9 @@ bool pci_function_reset(struct pci_device *d);
    is not read either, dev/iommu.c); the firmware's AML not at all while it answers RRS
    (pci_config_firmware_*). What remains is a Conventional Reset (pci_bus_reset). */
 bool pci_reset_stuck(const struct pci_device *d);
+/* d has a reset record (d->reset: a reset under way, or one left to finish): nothing but the next
+   pci_function_reset is to reach the function, whose Bus Master Enable is off. */
+bool pci_reset_left(const struct pci_device *d);
 /* The Downstream Port whose Secondary Bus Reset resets d (pci_bus_reset), or NULL: d is not
    right below a Root Port or a Switch Downstream Port; that port's link leads to a hot-plug
    slot, whose link changes are events for the slot's software (6.7.3.3), the firmware's here;

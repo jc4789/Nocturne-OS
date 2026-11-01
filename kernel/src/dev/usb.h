@@ -11,6 +11,32 @@
  * device that is not removed meanwhile (its class driver's detach waits for its users). */
 #include <stdint.h>
 #include <stdbool.h>
+#include "sys/clock.h"
+
+/* A port whose device does not come up, or that stays stuck, tried less and less often: at most 64 s
+   apart, for a good device to come, and never in the way of the worker's other work. No document
+   sets these times. The port's own, on its controller's worker. */
+#define USB_PORT_TRY_DOUBLINGS 6
+struct usb_port_tries {
+    uint64_t at;   /* when the next try may be; 0: none has failed */
+    uint8_t count; /* tries in a row */
+};
+/* Whether to try now; a try is counted if so. */
+static inline bool usb_port_try(struct usb_port_tries *t) {
+    if (clock_now_ns() < t->at) return false;
+    if (t->count < USB_PORT_TRY_DOUBLINGS) t->count++;
+    return true;
+}
+/* A try is over: the device came, or it did not. */
+static inline void usb_port_tried(struct usb_port_tries *t, bool came) {
+    t->at = came ? 0 : clock_now_ns() + (NS_PER_S << t->count);
+    if (came) t->count = 0;
+}
+/* Nothing is at the port any more. */
+static inline void usb_port_free(struct usb_port_tries *t) {
+    t->at = 0;
+    t->count = 0;
+}
 
 /* The kind of a device's speed. The numbers a Slot Context takes are the root port's own (xhci.c). */
 enum { USB_SPEED_FULL = 1, USB_SPEED_LOW = 2, USB_SPEED_HIGH = 3, USB_SPEED_SUPER = 4, USB_SPEED_SUPER_PLUS = 5 };
@@ -99,8 +125,8 @@ bool usb_open_endpoints(struct usb_device *d, const struct usb_ep_info *eps, int
 bool usb_stream_start(struct usb_device *d, uint8_t address, unsigned len, unsigned count, usb_report_fn fn, void *ctx);
 /* One bulk transfer of up to 64 KiB, waited for. One caller at a time on an endpoint (the class
  * driver's lock). Returns 0, USB_STALL, USB_TIMEOUT, or -1 (error or removal); after any but 0 the
- * endpoint needs usb_clear_halt; *moved, but for USB_TIMEOUT where it is 0, is the bytes that did move,
- * received ones in buf. */
+ * endpoint needs usb_clear_halt; *moved is the bytes that did move, received ones in buf, when the
+ * transfer's completion came, and 0 at USB_TIMEOUT and when the device or its controller went. */
 int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, unsigned timeout_ms, unsigned *moved);
 /* Reset a pipe on both sides: the controller's endpoint state and data toggle, then
  * CLEAR_FEATURE(ENDPOINT_HALT) on the device. */

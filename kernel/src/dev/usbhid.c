@@ -246,8 +246,8 @@ static bool value_came(const struct value *v, uint8_t report, unsigned len) {
     return v->present && v->report == report && v->bit + v->size <= len * 8;
 }
 
-/* Buttons, motion and wheel may each come in a report of their own (HID 1.11 5.6): a report
- * updates what it carries, and buttons it does not carry keep their last state. */
+/* Buttons, each axis and wheel may each come in a report of their own (HID 1.11 5.6): a report
+ * updates what it carries, and what it does not carry keeps its last state. */
 static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, unsigned len, uint64_t at) {
     struct mouse_event e = {.time_ns = at};
     bool any = false;
@@ -259,12 +259,12 @@ static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, uns
         else buttons &= ~(1u << i);
     }
     e.buttons = buttons & 7;
-    if (value_came(&h->x, report, len)) {
+    bool x_came = value_came(&h->x, report, len), y_came = value_came(&h->y, report, len);
+    if (x_came || y_came) {
         any = true;
-        bool has_y = value_came(&h->y, report, len);
-        int32_t x = value_of(&h->x, data, len), y = has_y ? value_of(&h->y, data, len) : 0;
-        bool x_good = in_range(&h->x, x), y_good = has_y && in_range(&h->y, y);
-        if (h->x.relative) {
+        int32_t x = x_came ? value_of(&h->x, data, len) : 0, y = y_came ? value_of(&h->y, data, len) : 0;
+        bool x_good = x_came && in_range(&h->x, x), y_good = y_came && in_range(&h->y, y);
+        if (x_came ? h->x.relative : h->y.relative) {
             e.dx = x_good ? x : 0;
             e.dy = y_good ? y : 0;
         } else {
