@@ -39,6 +39,7 @@ static inline void usb_port_free(struct usb_port_tries *t) {
 }
 /* A try that failed. */
 static inline void usb_port_failed(struct usb_port_tries *t, bool stuck) {
+    if (t->stuck && !stuck) t->count = 1; /* a device has come at last: its tries begin */
     t->stuck = stuck;
     t->at = t->count >= USB_PORT_TRIES && !stuck ? CLOCK_NEVER : clock_after(NS_PER_S << (t->count ? t->count - 1 : 0));
 }
@@ -175,6 +176,7 @@ void usbhub_attach(struct usb_device *d, const struct usb_endpoint_desc *ep);
 void usbhub_work(struct usb_device *d);       /* port changes noticed by its interrupt endpoint */
 bool usbhub_pending(struct usb_device *d);    /* port changes not handled yet, or a port's next try */
 bool usbhub_trying(struct usb_device *d);     /* a device at a port is yet to get another try */
+void usbhub_reports_lost(struct usb_device *d); /* its status change endpoint was given up */
 /* class drivers that read the whole configuration: does one of its interfaces suit them, and
  * take the device once it is configured */
 bool usbmsc_claims(const struct usb_interface_desc *intf);

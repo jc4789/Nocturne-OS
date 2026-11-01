@@ -139,6 +139,7 @@ struct nvme {
     uint32_t rtd3e;            /* Identify Controller: the shutdown's microseconds, 0 not reported */
     uint32_t namespaces;       /* Identify Controller: NN */
     char model[41];
+    uint8_t identity[60];      /* its SN and MN, bytes 23:04 and 63:24 of Identify Controller (4.5.2) */
     uint16_t mqes;             /* the largest queue's entries, 0-based (CAP.MQES) */
     struct queue admin;
     struct queue *io;          /* I/O queue i is queue ID i + 1 */
@@ -198,6 +199,10 @@ static void doorbell(struct nvme *c, uint16_t qid, bool cq, uint16_t v) {
 }
 
 /* ---- queues ---- */
+static bool queue_up(const struct queue *q) {
+    return __atomic_load_n(q == &q->c->admin ? &q->c->live : &q->c->ready, __ATOMIC_ACQUIRE);
+}
+
 /* cq_lock held: every new completion entry ends its slot's wait. */
 static void reap(struct queue *q) {
     bool moved = false;
@@ -221,7 +226,7 @@ static void reap(struct queue *q) {
         __atomic_add_fetch(&s->seq, 1, __ATOMIC_RELEASE);
         wq_wake_all(&s->wq);
     }
-    if (moved) doorbell(q->c, q->qid, true, q->head);
+    if (moved && queue_up(q)) doorbell(q->c, q->qid, true, q->head); /* else the stop's queue_clear empties it */
 }
 
 static enum irq_result nvme_isr(void *context) {
@@ -339,12 +344,13 @@ static bool controller_idle(struct nvme *c) {
    off, and stays out of use with its namespaces. If the reset was only called off, its thread being
    killed (dev/pci.h), the next request goes on with it. A Function Level Reset left unfinished is not
    to be reached by anything but its next call, and has its bus mastering off already (dev/pci.h, 6.6.2):
-   neither the registers nor the configuration are touched before that. `seen`: c->stops as the caller
+   neither the registers nor the configuration are touched before that; nor does anyone that read the
+   queue up go on past its cq_lock (run, reap). `seen`: c->stops as the caller
    read it; a stop that ended since has done this for it. What the last stop came to is returned. */
 static bool controller_stop(struct nvme *c, uint64_t seen) {
     mutex_lock(&c->stop_lock);
     if (__atomic_load_n(&c->stops, __ATOMIC_ACQUIRE) == seen) {
-        bool in_use = __atomic_load_n(&c->live, __ATOMIC_ACQUIRE);
+        bool was_live = __atomic_load_n(&c->live, __ATOMIC_ACQUIRE);
         controller_down(c);
         bool resetting = pci_reset_left(c->pci);
         uint32_t cc = resetting ? 0xFFFFFFFFu : rd32(c, CC), csts = resetting ? 0xFFFFFFFFu : rd32(c, CSTS);
@@ -356,11 +362,14 @@ static bool controller_stop(struct nvme *c, uint64_t seen) {
                 stopped = controller_idle(c);
             }
         } else if (cc != 0xFFFFFFFFu) {
-            lost = lost || in_use;
+            lost = lost || was_live;
             stopped = controller_idle(c);
         }
         if (!stopped) {
             lost = true;
+            unsigned queues = __atomic_load_n(&c->nio, __ATOMIC_ACQUIRE);
+            spin_unlock(&c->admin.cq_lock, spin_lock(&c->admin.cq_lock));
+            for (unsigned i = 0; i < queues; i++) spin_unlock(&c->io[i].cq_lock, spin_lock(&c->io[i].cq_lock));
             if (pci_function_reset(c->pci)) stopped = controller_idle(c);
         }
         if (lost)
@@ -436,19 +445,19 @@ static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t 
             if (result) *result = s->result;
             break;
         }
-        /* A stop is under way, which ends this command: the function may be in its Function Level
-           Reset, which nothing else is to reach (PCIe 6.6.2). */
-        if (!__atomic_load_n(q == &c->admin ? &c->live : &c->ready, __ATOMIC_ACQUIRE)) {
+        /* Down: a stop is under way, which ends this command, and the function may be in its Function
+           Level Reset, which nothing else is to reach (PCIe 6.6.2). Up: read under the lock the stop
+           passes through before that reset. */
+        f = spin_lock(&q->cq_lock);
+        bool up = queue_up(q);
+        if (up && !c->nvectors) reap(q);
+        uint32_t csts = up ? rd32(c, CSTS) : 0;
+        spin_unlock(&q->cq_lock, f);
+        if (!up) {
             wq_wait_unless(&s->wq, &s->seq, seen, clock_after(NS_PER_MS));
             continue;
         }
-        if (!c->nvectors) {
-            f = spin_lock(&q->cq_lock);
-            reap(q);
-            spin_unlock(&q->cq_lock, f);
-            if (__atomic_load_n(&s->seq, __ATOMIC_ACQUIRE) != start) continue;
-        }
-        uint32_t csts = rd32(c, CSTS);
+        if (!c->nvectors && __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE) != start) continue;
         if (csts == 0xFFFFFFFFu || (csts & CSTS_CFS) || clock_now_ns() >= deadline) {
             if (csts == 0xFFFFFFFFu || (csts & CSTS_CFS))
                 kprintf("nvme%d: controller %s\n", c->index, csts == 0xFFFFFFFFu ? "vanished" : "reported a fatal error");
@@ -531,6 +540,16 @@ static bool read_controller(struct nvme *c) {
         return false;
     }
     const uint8_t *id = c->ident;
+    /* Not the device it was before a sleep: its namespaces are not the ones here, and nothing is
+       written to it. */
+    if (c->discovered && memcmp(c->identity, id + 4, sizeof c->identity)) {
+        kprintf("nvme%d: another device is here since it slept, turned off\n", c->index);
+        pci_disable_busmaster(c->pci, NULL);
+        __atomic_store_n(&c->cut, true, __ATOMIC_RELEASE);
+        for (struct ns *s = c->found; s; s = s->next) __atomic_store_n(&s->blk.gone, true, __ATOMIC_RELEASE);
+        return false;
+    }
+    memcpy(c->identity, id + 4, sizeof c->identity);
     unsigned n = 0;
     for (int i = 24; i < 64 && n < sizeof c->model - 1; i++) {
         char ch = id[i] >= 0x20 && id[i] < 0x7F ? (char)id[i] : ' ';

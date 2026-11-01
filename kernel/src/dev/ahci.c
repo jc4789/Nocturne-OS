@@ -303,7 +303,9 @@ static uint32_t settle(struct port *p, uint32_t is) {
         p->error_is = is;
         p->error_tfd = tfd;
         p->live = false;
-        p->need_reset = true;
+        /* Only busy or asking for data does a device of non-queued commands need a COMRESET
+           (6.2.2, 6.2.2.1), which port_up reads; queued ones it may still hold (6.2.2.2). */
+        if (is == 0xFFFFFFFFu || p->queued) p->need_reset = true;
         p->attention = true;
         p->fatal = true;
         return p->issued; /* each waiter looks at attention */
@@ -312,7 +314,8 @@ static uint32_t settle(struct port *p, uint32_t is) {
     p->error_is = is;
     p->error_tfd = tfd;
     p->live = false;
-    /* A queued command's error is cleared by a reset: its log page is the other way (6.2.2.2). */
+    /* A queued command's error is cleared by a reset. The other way is READ LOG EXT (6.2.2.2), whose
+       command and page are in documents not at hand. */
     if (p->queued) p->need_reset = true;
     uint32_t woken = finish(p, p->issued & p->queued & ~sact, DONE);
     return woken | finish(p, p->issued, FAILED);
@@ -324,7 +327,6 @@ static void attention_over(struct port *p) {
     if (!p->attention || p->issued) return;
     p->attention = false;
     p->live = false;
-    p->need_reset = true;
 }
 
 /* Port no's link change is for the adapter's thread to see to. */
@@ -360,7 +362,6 @@ static void reap(struct port *p) {
         attention_over(p);
     } else if (!gone && !p->halting && !p->resetting && is & (IS_ERRORS | IS_OFS)) {
         p->live = false;
-        p->need_reset = true;
     }
     spin_unlock(&p->lock, f);
     wake_slots(p, woken);
@@ -402,14 +403,14 @@ static bool port_stop(struct port *p) {
     return wait_reg(p, PxCMD, CMD_FR, 0, STOP_NS);
 }
 
-/* COMRESET (10.4.2): the link set up again and the device reset; it then sends its signature in a
-   register FIS. Its power states are kept to active. DET 1h asks for SUD set (10.10.1), which an
-   adapter of no staggered spin-up has always. */
 /* The disk may have started over: only a cache that was on has anything to lose. */
 static void disk_cache_lost(struct disk *d) {
     if (__atomic_load_n(&d->cache, __ATOMIC_ACQUIRE)) blk_cache_lost(&d->blk);
 }
 
+/* COMRESET (10.4.2): the link set up again and the device reset; it then sends its signature in a
+   register FIS. Its power states are kept to active. DET 1h asks for SUD set (10.10.1), which an
+   adapter of no staggered spin-up has always. */
 static bool comreset(struct port *p) {
     if (p->disk) disk_cache_lost(p->disk); /* no document here says its cache outlives this */
     wr(p, PxCMD, rd(p, PxCMD) | CMD_SUD);
@@ -800,7 +801,7 @@ static void halt(struct port *p, uint32_t bit) {
     }
     p->halting = true;
     p->live = false;
-    p->need_reset = true;
+    if (p->queued) p->need_reset = true; /* the disk may hold them; else port_up reads BSY and DRQ (6.2.2.1) */
     if (!p->attention) {
         p->error_is = 0;
         p->error_tfd = rd(p, PxTFD);
@@ -929,7 +930,6 @@ static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queu
         if (clock_now_ns() >= deadline) {
             if (!timed_out) {
                 kprintf("ahci%d: port %u: command %02x timed out\n", p->h->index, p->no, fis[2]);
-                if (p->disk) disk_cache_lost(p->disk);
             }
             timed_out = true;
             halt(p, bit); /* fails it, or another caller is doing so */
