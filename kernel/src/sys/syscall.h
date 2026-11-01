@@ -78,3 +78,11 @@ struct shared_scanout {
 int64_t shared_scanout_open(struct handle *surface, const struct pci_claim *claim, uint64_t offset, uint64_t bytes,
                             struct shared_scanout *out);
 void shared_scanout_close(struct shared_scanout *s);
+/* A shared object of RAM (N_KIND_SHARED) the kernel reads and writes too (a window's surface,
+   gui/wm.c): bytes rounded up to pages, zeroed, mapped into the kernel at *view. The caller holds
+   its one reference: shared_kernel_end unmaps the view and drops that reference (the pages go
+   with the last one, the apps' mappings and handles included). shared_kernel_handle opens a
+   writable handle on it in the calling app: its number. Thread context, no spinlock held. */
+struct object *shared_kernel_new(size_t bytes, void **view);
+void shared_kernel_end(struct object *o, void *view);
+int64_t shared_kernel_handle(struct object *o);

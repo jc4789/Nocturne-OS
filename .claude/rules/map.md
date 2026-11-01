@@ -28,9 +28,9 @@
 | `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console と system log の stream、profiler。 |
 | `sys/keep.c` | wm・audio・screenmode の設定を `AppData\Nocturne\` の `.conf` に保存し、init の前に読み戻す。 |
 | `fs/` | C: の store の実行側。mount とパスの操作は `store.c`、開いた文書は `document.c`、block cache は `cache.c`、変更の watch は `watch.c`。書式のエンジンは `common/store/`。 |
-| `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音、`fb` と `fbcon`、入力（USB HID）、`serial`、`refclock`（HPET と RTC）、電源と hibernate。 |
+| `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（USB HID）、`serial`、`refclock`（HPET と RTC）、電源と hibernate。 |
 | `net/` | `net.c`（Ethernet から TCP・DHCP・DNS まで）と `rtl8125.c`（実機の NIC）。 |
-| `gui/` | `wm.c`（窓管理と合成）、`desktop.c`、`screenmode.c`。 |
+| `gui/` | `wm.c`（窓管理と、画面ごとの合成のスレッド）、`desktop.c`、`screenmode.c`（画面ごとのモードの選択）。 |
 | `vm/` | VM だけの処理。下の「境界」を見る。 |
 
 ## 共有 `common/`

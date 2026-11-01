@@ -4,42 +4,47 @@
  *   allocateDevice -> grabOwnership -> declareEventInterest -> getDeviceResourcesInfo
  *   -> RM's boot displays (the ones the firmware lit) -> getDisplays, each display's connector,
  *      static and dynamic information (connection, EDID) -> the display the firmware lit
- *   -> the pointer's cursor surface (32x32 A8R8G8B8, mapped): with it the desktop's surface is
+ *   -> the pointer's cursor surface (32x32 A8R8G8B8, mapped): with it the desktop's buffers are
  *      offered for direct scanout (N_SCANOUT_DIRECT)
  *   -> getDisplayMode: the display's valid modes, offered to the system with its monitor's name
  *      (n_pci_screen_modes). Which of them the screen shows is the system's to say, and the
  *      user's (n_pci_screen_state's mode: the monitor's preferred mode until the user chooses
  *      another); nvrm says back what the head shows, so a mode it could not show is refused and
  *      the system's next best one comes
- *   -> for the mode the system asks for: validateDisplayMode -> allocateMemory (video memory,
- *      pitch linear, for scanout, the mode's size) -> mapMemory (RM's kernel mapping, through
- *      BAR1) -> createSurface (X8R8G8B8) -> the boot screen's pixels copied into the first one
- *      when it has the boot screen's size, so the switch shows no black or stale frame
+ *   -> for the mode the system asks for: validateDisplayMode -> DESK_BUFFERS desktop buffers,
+ *      each allocateMemory (video memory, pitch linear, for scanout, the mode's size) ->
+ *      mapMemory (RM's kernel mapping, through BAR1) -> createSurface (X8R8G8B8) -> the boot
+ *      screen's pixels copied into the first when it has the boot screen's size, so the switch
+ *      shows no black or stale frame
  *   -> applyModeSetConfig checked -> n_pci_give_screen: the system draws the desktop into the
- *      surface, at its size, from then on (without N_SCANOUT_DIRECT when the system or the
- *      display engine cannot show windows directly) -> committed -> the flip performed (the
- *      completion notifier KAPI names in the commit, which nvkms_kapi_rm.c clears before it and
- *      reads "begun" once the display engine has flipped)
- *   -> registerVblankIntrCallback: each vertical blank goes to n_pci_screen_vblank
+ *      buffers, at their size, from then on (without N_SCANOUT_DIRECT when the system or the
+ *      display engine cannot show windows directly) -> registerVblankIntrCallback: each vertical
+ *      blank goes to n_pci_screen_vblank, with the flip it shows -> committed with the first
+ *      buffer on the head -> the flip performed (the completion notifier KAPI names in the
+ *      commit, which nvkms_kapi_rm.c clears before it and reads "begun" once the display engine
+ *      has flipped; the vertical blanks wake the wait for it)
  *   -> what the head shows read back for the log (head_state_log): after each mode set, and as
  *      the screen is handed back for a flip not performed
  *
- * The surface is given to the system as a view of BAR1 over the same pages RM mapped
- * (os_pci.c records where its kernel mappings lie on the bus). A mode of another size gets a
- * surface of its own, given to the system between NVKMS's check of the mode set and its commit,
- * so the desktop is drawn at the new size by the time the head shows it; the one before is
- * freed after. A mode of the same size is a mode set alone. The surface stays given while
- * monitors come and go: a display that goes away has its head turned off, and the first display
- * that is connected (the firmware's first, then any) has its modes offered in turn.
+ * The buffers are given to the system as views of BAR1 over the same pages RM mapped
+ * (os_pci.c records where its kernel mappings lie on the bus). The system draws each frame into
+ * the buffer the head does not show and asks for it (n_pci_screen_flips): the flip thread puts
+ * it on the head's primary layer, and the vertical blank that shows it tells the system (its
+ * time the display engine's), so nothing is written into the buffer scanned out. A mode of
+ * another size gets buffers of their own, given to the system between NVKMS's check of the mode
+ * set and its commit, so the desktop is drawn at the new size by the time the head shows it; the
+ * ones before are freed after. A mode of the same size is a mode set alone. The buffers stay
+ * given while monitors come and go: a display that goes away has its head turned off, and the
+ * first display that is connected (the firmware's first, then any) has its modes offered in turn.
  *
  * Direct scanout (NVRM_SCANOUT, include/nvrm_protocol.h): an app's images are video memory of
  * the desktop's size (allocateMemory, createSurface X8B8G8R8) that its GPU work writes into
  * (IMPORT duplicates the memory into the app's RM client). While n_pci_screen_state names the
  * app, PRESENT flips the head's primary layer to an image (a flip, not a mode set: only the
  * surface changes), and the display engine draws the pointer as its cursor. When the state
- * names another app or none, the state thread flips back to the desktop's surface, which the
- * system has kept drawing into, and the cursor goes. An image is off the screen, and its last
- * flip away from it complete, before it is freed.
+ * names another app or none, the state thread flips back to the desktop's buffer the system
+ * asked for last, as it has kept drawing, and the cursor goes. An image is off the screen, and
+ * its last flip away from it complete, before it is freed.
  *
  * hand_back gives the screen back while nvrm runs on: the boot screen back to the system, then
  * releaseOwnership, with which NVKMS shows the firmware's framebuffer console again
@@ -48,17 +53,19 @@
  * follows on: the system's next wish takes the display again (take_again), the user's mode
  * tried in Settings among them (SCREEN_SOURCE_HANDED_BACK, display_abi.h). Only
  * nvrm_display_stop withdraws the modes (modes_withdraw) before it hands the screen back, and
- * frees the images, the cursor, the surface and the device after it.
+ * frees the images, the cursor, the buffers and the device after it.
  *
  * Threads: KAPI's event callback runs on NVKMS's work thread and only wakes this file's
  * display thread, which does the KAPI calls of a reconnection (they take NVKMS's lock). The
  * state thread follows n_pci_screen_state: the mode the system asks for, and what the screen
- * shows directly. Requests come on nvrm's client threads (nvrm_display_scanout), between
- * nvrm_display_start and nvrm_display_stop. All of them change the head, the surfaces, the
- * images and the KAPI structures below under head_lock, one at a time. The vertical-blank
- * callback runs under NVKMS's lock on its timer thread and only counts and tells the system.
- * Before the threads start and after they are joined, the calling thread (nvrm's main thread)
- * is the only one that touches the state below.
+ * shows directly. The flip thread takes the system's flips (n_pci_screen_flips). Requests come
+ * on nvrm's client threads (nvrm_display_scanout), between nvrm_display_start and
+ * nvrm_display_stop. All of them change the head, the buffers, the images and the KAPI
+ * structures below under head_lock, one at a time. The vertical-blank callback runs under
+ * NVKMS's lock on its timer thread: it reads the flip's completion notifier, tells the system
+ * and wakes those waiting for a flip (flip_lock, which is taken last and never across a KAPI
+ * call). Before the threads start and after they are joined, the calling thread (nvrm's main
+ * thread) is the only one that touches the state below.
  */
 #include "display.h"
 #include "edid.h"
@@ -86,7 +93,9 @@
 #define LOG "NVRM display: "
 #define FLIP_TIMEOUT_MS 3000         /* a committed flip that has not completed by then failed */
 #define PAGE_BYTES 4096u
-#define STATE_WAIT_MS 1000           /* the state thread looks at its stop flag at least this often */
+#define STATE_WAIT_MS 1000           /* the state and flip threads look at their stop flag at least this often */
+#define DESK_BUFFERS 2               /* the desktop's buffers: one scanned out, the next frame drawn into the other */
+#define FLIPS_TAKEN 4                /* the system's flips taken at once (one an output: the newest replaces the rest) */
 #define CURSOR_MIN_PITCH 256u        /* NVKMS's for a 32x32 cursor (nvEvoGetHeadSetControlCursorValueC3) */
 #define MODE_TRIES 4                 /* the system's modes tried at once after modes are offered: its next
                                         best after each one the display could not show; the state thread
@@ -94,7 +103,7 @@
 
 static struct NvKmsKapiFunctionsTable kapi = { .versionString = NV_VERSION_STRING };
 
-/* The desktop's surface: video memory of the mode's size the system draws the desktop into. */
+/* A desktop buffer: video memory of the mode's size the system draws the desktop into. */
 struct desk {
     struct NvKmsKapiMemory *memory;
     void *pixels;                    /* RM's kernel mapping of memory (KAPI mapMemory) */
@@ -127,8 +136,12 @@ static struct {
     struct NvKmsKapiDeviceResourcesInfo res;
     uint32_t boot_mask;              /* RM's boot displays, as display handles (dpy id bits) */
 
-    struct desk desk;                /* what the system draws the desktop into (none before the first mode) */
+    struct desk desk[DESK_BUFFERS];  /* what the system draws the desktop into (none before the first mode) */
     bool given;                      /* atomic: the system draws into desk */
+    uint64_t given_serial;           /* the system's last flip before desk was given: those up to it are of
+                                        buffers gone (head_lock) */
+    uint32_t desk_on;                /* the buffer the system asked for last: the desktop's on the head (head_lock) */
+    uint32_t desk_shown;             /* the buffer the head shows, while it shows the desktop (head_lock) */
 
     NvKmsKapiDisplay target;         /* the display whose modes the system is offered, 0 none */
     uint32_t target_head;            /* the head it is shown on (the lowest it can use) */
@@ -144,10 +157,23 @@ static struct {
     uint64_t vblanks;                /* atomic */
     bool vblank_refused;             /* atomic: the system refused one (logged once) */
 
+    /* The system's flips (the flip thread) and their showing (the vertical-blank callback), under
+       flip_lock: the flip waiting for the blank that shows it (wait_serial, 0 none; wait_buffer),
+       which needs the head's flip performed first when wait_commit (else the desktop is not on
+       the head and the next blank shows it); the last one shown. flip_cnd wakes at each blank. */
+    mtx_t flip_lock;
+    cnd_t flip_cnd;
+    uint64_t wait_serial, shown_serial;
+    uint32_t wait_buffer, shown_buffer;
+    bool wait_commit;
+    bool unpaced_said;               /* the flip thread said once that there are no vertical blanks */
+    thrd_t flip_thread;
+    bool flip_running;
+
     /* Direct scanout. The cursor shows the pointer over an image; its pixels stay mapped. */
     bool serving;                    /* atomic: between start and stop, nvrm's clients' requests are taken */
     bool direct;                     /* apps' images are made and shown: nvrm has the cursor, the system took
-                                        the desktop's surface with N_SCANOUT_DIRECT and the state thread
+                                        the desktop's buffers with N_SCANOUT_DIRECT and the state thread
                                         follows what it shows (head_lock) */
     struct NvKmsKapiMemory *cursor_memory;
     void *cursor_pixels;
@@ -171,7 +197,7 @@ static struct {
     bool lost;                    /* a flip back to the desktop failed: the head may show no surface (NVKMS
                                         took a freed image off it) until a flip puts one on it again */
 
-    bool sync_ready;                 /* lock, wake and head_lock are initialised */
+    bool sync_ready;                 /* lock, wake, head_lock, flip_lock and flip_cnd are initialised */
     mtx_t lock;
     cnd_t wake;
     bool rescan, stop;               /* under lock */
@@ -180,8 +206,8 @@ static struct {
     mtx_t head_lock;                 /* the head, the images, the KAPI structures below */
     thrd_t state_thread;
     bool state_running;
-    bool state_stop;                 /* atomic */
-} scr = { .desk.view = -1 };
+    bool state_stop;                 /* atomic: the state and flip threads end */
+} scr = { .desk = { [0 ... DESK_BUFFERS - 1] = { .view = -1 } } };
 
 /* Large KAPI structures, used under head_lock or by the main thread alone (see the top of the
    file). */
@@ -545,10 +571,23 @@ static void desk_free(struct desk *d) {
     *d = (struct desk){ .view = -1 };
 }
 
-/* A new surface's first pixels: what the boot screen shows, when it is the first surface and has
-   the boot screen's size (the switch from the boot screen then shows no black or stale frame);
-   black otherwise, or when the boot screen cannot be read. The system draws the desktop over it
-   once it is given. */
+/* The DESK_BUFFERS buffers of a desktop of width x height (desk_create); false when one cannot be
+   made, desks_free then frees what was. */
+static bool desks_create(struct desk *set, uint32_t width, uint32_t height) {
+    for (unsigned i = 0; i < DESK_BUFFERS; i++)
+        if (!desk_create(&set[i], width, height)) return false;
+    return true;
+}
+
+static void desks_free(struct desk *set) {
+    for (unsigned i = 0; i < DESK_BUFFERS; i++) desk_free(&set[i]);
+}
+
+/* The first pixels of a new desktop's first buffer, the one the mode set shows: what the boot
+   screen shows, when it is the first desktop and has the boot screen's size (the switch from the
+   boot screen then shows no black or stale frame); black otherwise, or when the boot screen
+   cannot be read. The system draws the desktop over it once it is given; the other buffers it
+   draws in full before it asks for them. */
 static void desk_fill(const struct desk *d, bool first) {
     const struct n_pci_function *g = &nvrm_dev.info;
     uint8_t *dst = d->pixels;
@@ -627,14 +666,14 @@ static void cursor_destroy(void) {
 }
 
 /* Apps' images are shown when the display engine has the cursor for the pointer over them: the
-   desktop's surface is then offered with N_SCANOUT_DIRECT. At the start, and as the display is
+   desktop's buffers are then offered with N_SCANOUT_DIRECT. At the start, and as the display is
    taken again after hand_back. */
 static void direct_on(void) {
     scr.direct = cursor_create();
     if (!scr.direct) cursor_destroy();
 }
 
-/* Apps' images are not shown any more: the system does not take the desktop's surface with
+/* Apps' images are not shown any more: the system does not take the desktop's buffers with
    N_SCANOUT_DIRECT, or the screen is handed back. The cursor goes (NVKMS takes it off the head
    first); an image on the screen leaves it once the system's state no longer names its app
    (follow). Under head_lock. */
@@ -712,7 +751,8 @@ static void head_request(uint32_t head, NvKmsKapiDisplay display, const struct N
 }
 
 /* Commits the request. flip is the head whose primary layer it puts a surface on, -1 none: that
-   flip's completion is awaited by flip_completed (nvkms_kapi_rm.c reads the completion notifier
+   flip's completion is awaited by flip_completed, and the vertical-blank callback reads it for a
+   flip of the system's (nvkms_kapi_rm.c reads the completion notifier
    KAPI names in the commit, since KAPI's table does not say). KAPI names one in every commit that
    puts a surface on a layer, a mode set's too (nvkms-kapi.c, as it builds the flip request), and
    NVKMS has the display engine write it (nvkms-hw-flip.c, nvAssignCompletionNotifierEvoHwState),
@@ -785,32 +825,61 @@ static void flip_seen_log(const struct nvrm_flip_seen *seen) {
     scr.flip_status_told = seen->status + 1;
 }
 
+/* Sleeps under flip_lock until the next vertical blank wakes flip_cnd, until_ns (nvrm_now_ns) at
+   the latest. Without the head's vertical-blank interrupt (scr.vblank), one refresh of the head's
+   mode at most: the display engine flips at a blank, which nothing then reports. Under head_lock
+   too. */
+static void blank_wait(uint64_t until_ns) {
+    uint64_t now = nvrm_now_ns();
+    if (now >= until_ns) return;
+    uint64_t wait = until_ns - now;
+    if (!scr.vblank && scr.head_on && scr.mode.timings.refreshRate) {
+        uint64_t period = 1000000000000ull / scr.mode.timings.refreshRate; /* refreshRate is in mHz */
+        if (period < wait) wait = period;
+    }
+    /* cnd_timedwait takes a TIME_UTC moment and counts whole milliseconds: rounded up, so it sleeps */
+    uint64_t ms = wait / 1000000u + 1;
+    struct timespec at;
+    timespec_get(&at, TIME_UTC);
+    at.tv_sec += (time_t)(ms / 1000u);
+    at.tv_nsec += (long)(ms % 1000u) * 1000000L;
+    if (at.tv_nsec >= 1000000000L) {
+        at.tv_sec++;
+        at.tv_nsec -= 1000000000L;
+    }
+    cnd_timedwait(&scr.flip_cnd, &scr.flip_lock, &at);
+}
+
 /* The last commit that put a surface on a primary layer has been performed: its completion
-   notifier no longer reads "not begun" (nvkms_kapi_rm.c). One whose flip is not seen performed in
-   FLIP_TIMEOUT_MS may have left the display showing nothing of nvrm's, or nothing at all: the
-   screen is handed back (hand_back), so the firmware's framebuffer console NVKMS restores shows
-   the boot screen the system draws again. The notifier's words are logged first, to tell a
-   display engine that did not write it from one whose write is not seen. What a flip takes off
-   the head is not freed while it is scanned out, as NVKMS takes a surface off the heads before it
-   destroys it. */
+   notifier no longer reads "not begun" (nvkms_kapi_rm.c). The display engine writes it at the
+   vertical blank it flips at, and each blank wakes the wait (vblank_arrived). One whose flip is
+   not seen performed in FLIP_TIMEOUT_MS may have left the display showing nothing of nvrm's, or
+   nothing at all: the screen is handed back (hand_back), so the firmware's framebuffer console
+   NVKMS restores shows the boot screen the system draws again. The notifier's words are logged
+   first, to tell a display engine that did not write it from one whose write is not seen. What a
+   flip takes off the head is not freed while it is scanned out, as NVKMS takes a surface off the
+   heads before it destroys it. Under head_lock. */
 static bool flip_completed(void) {
     if (!scr.flipping) return true;
     uint64_t until = nvrm_now_ns() + (uint64_t)FLIP_TIMEOUT_MS * 1000000u;
     struct nvrm_flip_seen seen;
-    while (!nvrm_nvkms_flip_done(scr.device, scr.flip_head, NVKMS_KAPI_LAYER_PRIMARY_IDX, &seen)) {
-        if (nvrm_now_ns() >= until) {
-            uint32_t slot = 0, words[2][4] = { { 0 } };
-            nvrm_nvkms_flip_words(scr.device, scr.flip_head, NVKMS_KAPI_LAYER_PRIMARY_IDX, &slot, words);
-            nvrm_log(LOG "the display engine has not performed the flip on head %u %d ms after its commit, which "
-                     "took NVKMS %llu ms: the primary layer's completion notifier %u, of words %08x %08x %08x %08x "
-                     "and %08x %08x %08x %08x, does not read begun", (unsigned)scr.flip_head, FLIP_TIMEOUT_MS,
-                     (unsigned long long)(scr.flip_commit_ns / 1000000u), (unsigned)slot, words[0][0], words[0][1],
-                     words[0][2], words[0][3], words[1][0], words[1][1], words[1][2], words[1][3]);
-            scr.flipping = false;
-            hand_back("nvrm's surface is not seen on the display");
-            return false;
-        }
-        n_sleep_ms(1);
+    mtx_lock(&scr.flip_lock);
+    bool done;
+    while (!(done = nvrm_nvkms_flip_done(scr.device, scr.flip_head, NVKMS_KAPI_LAYER_PRIMARY_IDX, &seen)) &&
+           nvrm_now_ns() < until)
+        blank_wait(until);
+    mtx_unlock(&scr.flip_lock);
+    if (!done) {
+        uint32_t slot = 0, words[2][4] = { { 0 } };
+        nvrm_nvkms_flip_words(scr.device, scr.flip_head, NVKMS_KAPI_LAYER_PRIMARY_IDX, &slot, words);
+        nvrm_log(LOG "the display engine has not performed the flip on head %u %d ms after its commit, which "
+                 "took NVKMS %llu ms: the primary layer's completion notifier %u, of words %08x %08x %08x %08x "
+                 "and %08x %08x %08x %08x, does not read begun", (unsigned)scr.flip_head, FLIP_TIMEOUT_MS,
+                 (unsigned long long)(scr.flip_commit_ns / 1000000u), (unsigned)slot, words[0][0], words[0][1],
+                 words[0][2], words[0][3], words[1][0], words[1][1], words[1][2], words[1][3]);
+        scr.flipping = false;
+        hand_back("nvrm's buffer is not seen on the display");
+        return false;
     }
     scr.flipping = false;
     if (scr.flip_told || seen.status + 1 != scr.flip_status_told) flip_seen_log(&seen);
@@ -843,6 +912,7 @@ static bool mode_set(NvKmsKapiDisplay display, uint32_t head, const struct NvKms
     scr.mode = *mode;
     scr.leaving = scr.shown;
     scr.shown = NULL;
+    scr.desk_shown = scr.desk_on; /* mode_show's request put that buffer on the head */
     scr.lost = false;
     scr.cursor_on = false;
     if (!flip_completed()) return false;
@@ -864,7 +934,7 @@ static bool head_off(void) {
 }
 
 /* ------------------------------------------------------------------------------------------
- * Flips: an app's image or the desktop's surface on the lit head, and the cursor over an image
+ * Flips: an app's image or the desktop's buffer on the lit head, and the cursor over an image
  * (head_lock)
  * ---------------------------------------------------------------------------------------- */
 
@@ -878,22 +948,22 @@ static bool settle(void) {
 /* Where the cursor's top left goes for the pointer of st, in the mode's pixels (the desktop, and
    an image over it, are scaled to the mode). */
 static void cursor_place(const struct n_screen_state *st, int32_t *x, int32_t *y) {
-    int64_t px = ((int64_t)st->pointer_x - st->hot_x) * scr.mode.timings.hVisible / scr.desk.width;
-    int64_t py = ((int64_t)st->pointer_y - st->hot_y) * scr.mode.timings.vVisible / scr.desk.height;
+    int64_t px = ((int64_t)st->pointer_x - st->hot_x) * scr.mode.timings.hVisible / scr.desk[0].width;
+    int64_t py = ((int64_t)st->pointer_y - st->hot_y) * scr.mode.timings.vVisible / scr.desk[0].height;
     *x = (int32_t)(px < INT16_MIN ? INT16_MIN : px > INT16_MAX ? INT16_MAX : px);
     *y = (int32_t)(py < INT16_MIN ? INT16_MIN : py > INT16_MAX ? INT16_MAX : py);
 }
 
-/* The head shows image (NULL: the desktop's surface) from its next vertical blank, with the
-   pointer of st drawn by the cursor over an image; the desktop's surface has the pointer in it.
-   Waits for the flip before to complete first, not for this one. A flip, not a mode set: NVKMS
-   checks it as it commits it. */
+/* The head shows image (NULL: the desktop's buffer the system asked for last, desk_on) from its
+   next vertical blank, with the pointer of st drawn by the cursor over an image; the desktop has
+   the pointer in it. Waits for the flip before to complete first, not for this one. A flip, not a
+   mode set: NVKMS checks it as it commits it. */
 static bool show(struct image *image, const struct n_screen_state *st) {
     if (!scr.head_on || !settle()) return false;
     bool cursor = image && st && st->pointer_shown && scr.cursor_surface;
     int32_t x = 0, y = 0;
     if (cursor) cursor_place(st, &x, &y);
-    bool surface_changed = scr.lost || image != scr.shown;
+    bool surface_changed = scr.lost || image != scr.shown || (!image && scr.desk_shown != scr.desk_on);
     bool cursor_changed = cursor != scr.cursor_on;
     bool moved = cursor && (cursor_changed || x != scr.cursor_x || y != scr.cursor_y);
     if (cursor && !(scr.cursor_drawn && scr.cursor_serial == st->pointer_serial)) {
@@ -912,7 +982,10 @@ static bool show(struct image *image, const struct n_screen_state *st) {
     active_request(h, scr.display, &scr.mode);
     if (surface_changed) {
         if (image) primary_request(h, image->surface, image->width, image->height, &scr.mode);
-        else primary_request(h, scr.desk.surface, scr.desk.width, scr.desk.height, &scr.mode);
+        else {
+            const struct desk *d = &scr.desk[scr.desk_on];
+            primary_request(h, d->surface, d->width, d->height, &scr.mode);
+        }
     }
     struct NvKmsKapiCursorRequestedConfig *c = &h->cursorRequestedConfig;
     if (cursor_changed) {
@@ -933,10 +1006,11 @@ static bool show(struct image *image, const struct n_screen_state *st) {
     }
     if (surface_changed) {
         if (image && !scr.shown) nvrm_log(LOG "app %u's images are shown directly", (unsigned)image->app);
-        else if (!image) nvrm_log(LOG "the desktop is shown again");
+        else if (!image && (scr.shown || scr.lost)) nvrm_log(LOG "the desktop is shown again");
         scr.leaving = scr.shown;
         scr.shown = image;
         scr.lost = false;
+        if (!image) scr.desk_shown = scr.desk_on;
     }
     scr.cursor_on = cursor;
     if (moved) {
@@ -970,22 +1044,41 @@ static void recover(void) {
 /* ------------------------------------------------------------------------------------------
  * Vertical blanks (under NVKMS's lock on its timer thread: nothing here may call KAPI)
  * ---------------------------------------------------------------------------------------- */
+
+/* A vertical blank of the head nvrm lit, at the display engine's time stamp (NVKMS sets the GPU's
+   time against the system's monotonic clock; the moment it ran when there is none). The system's
+   flip waiting for it is shown from it on once the head's flip is performed (its completion
+   notifier, which only reads memory), or at once when the desktop is not on the head; the system
+   hears of the blank with the last flip shown. Those waiting for a flip wake. */
 static void vblank_arrived(NvU64 data, NvU64 timestamp) {
     (void)data;
-    if (!__atomic_load_n(&scr.given, __ATOMIC_ACQUIRE)) return;
     uint64_t count = __atomic_add_fetch(&scr.vblanks, 1, __ATOMIC_RELAXED);
-    n_result r = n_pci_screen_vblank(nvrm_dev.pci, count, timestamp ? timestamp : nvrm_now_ns());
+    struct n_screen_vblank v = { .output = 0, .count = count, .time_ns = timestamp ? timestamp : nvrm_now_ns() };
+    mtx_lock(&scr.flip_lock);
+    if (scr.wait_serial &&
+        (!scr.wait_commit || nvrm_nvkms_flip_done(scr.device, scr.vblank_head, NVKMS_KAPI_LAYER_PRIMARY_IDX, NULL))) {
+        scr.shown_serial = scr.wait_serial;
+        scr.shown_buffer = scr.wait_buffer;
+        scr.wait_serial = 0;
+    }
+    v.buffer = scr.shown_buffer;
+    v.flip_serial = scr.shown_serial;
+    cnd_broadcast(&scr.flip_cnd);
+    mtx_unlock(&scr.flip_lock);
+    if (!__atomic_load_n(&scr.given, __ATOMIC_ACQUIRE)) return;
+    n_result r = n_pci_screen_vblank(nvrm_dev.pci, &v);
     if (r < 0 && !__atomic_exchange_n(&scr.vblank_refused, true, __ATOMIC_RELAXED))
         nvrm_log(LOG "the system refuses vertical blank %llu: %s", (unsigned long long)count, n_result_text(r));
 }
 
+/* The vertical blanks of head, before a mode set lights it (NVKMS sets the interrupt up once the
+   head is active). */
 static void vblank_on(uint32_t head) {
-    scr.vblank = kapi.registerVblankIntrCallback(scr.device, head, vblank_arrived, 0);
-    if (!scr.vblank) {
-        nvrm_log(LOG "no vertical-blank interrupt on head %u; the desktop keeps its own frame period", (unsigned)head);
-        return;
-    }
     scr.vblank_head = head;
+    scr.vblank = kapi.registerVblankIntrCallback(scr.device, head, vblank_arrived, 0);
+    if (!scr.vblank)
+        nvrm_log(LOG "no vertical-blank interrupt on head %u; the system's flips are said shown once seen performed, "
+                 "and the desktop keeps its mode's frame period", (unsigned)head);
 }
 
 static void vblank_off(void) {
@@ -995,25 +1088,29 @@ static void vblank_off(void) {
 }
 
 /* ------------------------------------------------------------------------------------------
- * The system's screen: the modes offered, the one it asks for shown, the surface given
+ * The system's screen: the modes offered, the one it asks for shown, the buffers given
  * (head_lock, or the main thread before the threads start)
  * ---------------------------------------------------------------------------------------- */
 
-/* d to the system: it draws the desktop into d, at d's size, from then on (n_pci_give_screen),
-   with N_SCANOUT_DIRECT while nvrm shows apps' images. When the system refuses that and takes d
-   without it, apps' images are not shown any more (direct_off). */
-static n_result desk_give(const struct desk *d) {
-    struct n_scanout desc = {
-        .width = d->width,
-        .height = d->height,
-        .pitch = d->pitch,
+/* The desktop buffers of set to the system, set[0] the one the head shows: it draws the desktop
+   into them, at their size, from then on (n_pci_give_screen, output 0), with N_SCANOUT_DIRECT
+   while nvrm shows apps' images. When the system refuses that and takes them without it, apps'
+   images are not shown any more (direct_off). The system's flips before are of the buffers gone
+   (given_serial). */
+static n_result desk_give(const struct desk *set) {
+    struct n_screen_buffers b = {
+        .width = set[0].width,
+        .height = set[0].height,
+        .pitch = set[0].pitch,
         .format = N_SCANOUT_XRGB8888 | (scr.direct ? N_SCANOUT_DIRECT : 0),
-        .offset = d->view_offset,
+        .count = DESK_BUFFERS,
     };
-    n_result r = n_pci_give_screen(nvrm_dev.pci, d->view, &desc);
+    for (unsigned i = 0; i < DESK_BUFFERS; i++)
+        b.buffer[i] = (struct n_screen_buffer){ .surface = set[i].view, .offset = set[i].view_offset };
+    n_result r = n_pci_give_screen(nvrm_dev.pci, 0, &b);
     if (r < 0 && scr.direct) {
-        desc.format = N_SCANOUT_XRGB8888;
-        n_result plain = n_pci_give_screen(nvrm_dev.pci, d->view, &desc);
+        b.format = N_SCANOUT_XRGB8888;
+        n_result plain = n_pci_give_screen(nvrm_dev.pci, 0, &b);
         if (plain >= 0) {
             nvrm_log(LOG "the system does not let nvrm show windows directly (%s); it composites them",
                      n_result_text(r));
@@ -1021,19 +1118,83 @@ static n_result desk_give(const struct desk *d) {
         }
         r = plain;
     }
-    if (r < 0)
-        nvrm_log(LOG "the system does not take the %ux%u surface: %s", (unsigned)d->width, (unsigned)d->height,
+    if (r < 0) {
+        nvrm_log(LOG "the system does not take the %ux%u buffers: %s", (unsigned)b.width, (unsigned)b.height,
                  n_result_text(r));
-    else __atomic_store_n(&scr.given, true, __ATOMIC_RELEASE);
-    return r;
+        return r;
+    }
+    scr.given_serial = (uint64_t)r;
+    scr.desk_on = 0;
+    mtx_lock(&scr.flip_lock);
+    scr.wait_serial = scr.shown_serial = 0;
+    scr.shown_buffer = 0;
+    mtx_unlock(&scr.flip_lock);
+    __atomic_store_n(&scr.given, true, __ATOMIC_RELEASE);
+    return 0;
+}
+
+/* scr.desk given again (without N_SCANOUT_DIRECT, or as a mode set fell through), the buffer on
+   the head first: the desktop's own, or the one the system asked for last while an image is
+   shown. */
+static n_result desks_regive(void) {
+    uint32_t first = scr.shown ? scr.desk_on : scr.desk_shown;
+    struct desk was[DESK_BUFFERS];
+    memcpy(was, scr.desk, sizeof was);
+    for (unsigned i = 0; i < DESK_BUFFERS; i++) scr.desk[i] = was[(first + i) % DESK_BUFFERS];
+    scr.desk_shown = 0;
+    return desk_give(scr.desk);
 }
 
 /* The boot screen back to the system: nothing of nvrm's is drawn into any more. */
 static void give_boot(void) {
     if (!__atomic_load_n(&scr.given, __ATOMIC_ACQUIRE)) return;
-    n_result r = n_pci_give_screen(nvrm_dev.pci, N_SCANOUT_BOOT, NULL);
+    n_result r = n_pci_give_screen(nvrm_dev.pci, 0, NULL);
     __atomic_store_n(&scr.given, false, __ATOMIC_RELEASE);
     if (r < 0) nvrm_log(LOG "the system does not take the boot screen back: %s", n_result_text(r));
+}
+
+/* The system's flip of desktop buffer `buffer` (its serial, n_pci_screen_flips): put on the head's
+   primary layer when the head shows the desktop, the blank whose flip is performed then telling
+   the system it is shown (vblank_arrived). While an app's image is shown instead it is the
+   desktop's from then on (desk_on) and the next blank says it is shown, as nothing scans the
+   desktop out. Without vertical blanks (no interrupt, or the head off) the flip thread says so
+   itself, once the head's flip is seen performed. A flip of buffers given before is gone with
+   them. Under head_lock. */
+static void desk_flip(uint32_t buffer, uint64_t serial) {
+    if (!__atomic_load_n(&scr.given, __ATOMIC_ACQUIRE) || serial <= scr.given_serial || buffer >= DESK_BUFFERS) return;
+    scr.desk_on = buffer;
+    bool committed = false;
+    if (scr.head_on && !scr.shown && !scr.lost) {
+        committed = show(NULL, NULL);
+        if (!committed && __atomic_load_n(&scr.given, __ATOMIC_ACQUIRE))
+            nvrm_log(LOG "the flip to desktop buffer %u on head %u failed; it is said shown at the next blank",
+                     (unsigned)buffer, (unsigned)scr.head);
+    }
+    if (!__atomic_load_n(&scr.given, __ATOMIC_ACQUIRE)) return; /* the screen was handed back */
+    if (scr.vblank) {
+        mtx_lock(&scr.flip_lock);
+        scr.wait_serial = serial;
+        scr.wait_buffer = buffer;
+        scr.wait_commit = committed;
+        mtx_unlock(&scr.flip_lock);
+        return;
+    }
+    if (!scr.unpaced_said) {
+        nvrm_log(LOG "head %u reports no vertical blanks: the system's flips are said shown as they are performed",
+                 (unsigned)scr.head);
+        scr.unpaced_said = true;
+    }
+    if (committed && !flip_completed()) return; /* handed back */
+    mtx_lock(&scr.flip_lock);
+    scr.shown_serial = serial;
+    scr.shown_buffer = buffer;
+    scr.wait_serial = 0;
+    mtx_unlock(&scr.flip_lock);
+    struct n_screen_vblank v = { .output = 0, .buffer = buffer, .count = __atomic_load_n(&scr.vblanks, __ATOMIC_RELAXED),
+                                 .time_ns = nvrm_now_ns(), .flip_serial = serial };
+    n_result r = n_pci_screen_vblank(nvrm_dev.pci, &v);
+    if (r < 0) nvrm_log(LOG "the system does not hear that flip %llu is shown: %s", (unsigned long long)serial,
+                        n_result_text(r));
 }
 
 /* What the lit head shows, read back for the log where that may be nothing: after a mode set,
@@ -1070,7 +1231,7 @@ static void head_state_log(const char *when) {
    firmware's framebuffer) on the boot displays again (nvkms.c RestoreConsole), or hands the
    display back to RM without one. Apps' images are not shown any more: the system let go of them
    for its panic screen as the boot screen came back (they are held again once the display is
-   taken again, images_held_again). The desktop's surface is freed. The offered display and its
+   taken again, images_held_again). The desktop's buffers are freed. The offered display and its
    modes stay the system's, and the state thread follows on: the system's next wish takes the
    display again (mode_follow, take_again); until then the screen is the firmware's. why, when
    not NULL, is logged first. Under head_lock, or by the main thread while no other thread runs. */
@@ -1093,7 +1254,7 @@ static void hand_back(const char *why) {
     scr.cursor_on = false;
     direct_off();
     for (struct image *i = scr.images; i; i = i->next) i->panic = 0;
-    desk_free(&scr.desk);
+    desks_free(scr.desk);
 }
 
 /* The offered display's modes withdrawn: the system chooses none for a display nvrm no longer
@@ -1101,7 +1262,7 @@ static void hand_back(const char *why) {
 static void modes_withdraw(void) {
     if (offered.count) {
         memset(&offer, 0, sizeof offer);
-        n_result r = n_pci_screen_modes(nvrm_dev.pci, &offer);
+        n_result r = n_pci_screen_modes(nvrm_dev.pci, 0, &offer);
         if (r < 0) nvrm_log(LOG "the system keeps the display's modes: %s", n_result_text(r));
     }
     memset(&offered, 0, sizeof offered);
@@ -1122,16 +1283,17 @@ static bool take_again(void) {
     return true;
 }
 
-/* km, one of kmodes, shown on the offered display with a surface of its size for the desktop: a
-   new one when the size changes, given to the system between NVKMS's check of the mode set and
-   its commit, so the desktop is drawn at that size by the time the head shows it. True when the
-   head shows km. When the commit fails, the head shows what it showed before, and the system
-   draws into what it drew into before (the boot screen, when nvrm had no surface yet); when its
-   flip is not seen to complete, the screen has been handed back (flip_completed). */
+/* km, one of kmodes, shown on the offered display with desktop buffers of its size: new ones when
+   the size changes, given to the system between NVKMS's check of the mode set and its commit, so
+   the desktop is drawn at that size by the time the head shows it. The head's vertical blanks are
+   asked for before the commit, so the first blank after it counts. True when the head shows km.
+   When the commit fails, the head shows what it showed before, and the system draws into what it
+   drew into before (the boot screen, when nvrm had no buffers yet); when its flip is not seen to
+   complete, the screen has been handed back (flip_completed). */
 static bool mode_show(const struct NvKmsKapiDisplayMode *km) {
     NvKmsKapiDisplay display = scr.target;
     uint32_t head = scr.target_head, width = km->timings.hVisible, height = km->timings.vVisible;
-    bool resize = !scr.desk.surface || scr.desk.width != width || scr.desk.height != height;
+    bool resize = !scr.desk[0].surface || scr.desk[0].width != width || scr.desk[0].height != height;
     bool given = __atomic_load_n(&scr.given, __ATOMIC_ACQUIRE);
     if (!resize && given && scr.head_on && !scr.lost && scr.display == display && scr.head == head &&
         same_mode(&scr.mode, km))
@@ -1142,39 +1304,47 @@ static bool mode_show(const struct NvKmsKapiDisplayMode *km) {
         nvrm_log(LOG "display 0x%08x cannot show %s", (unsigned)display, text);
         return false;
     }
-    struct desk next = { .view = -1 };
+    struct desk next[DESK_BUFFERS] = { [0 ... DESK_BUFFERS - 1] = { .view = -1 } };
     if (resize) {
-        if (!desk_create(&next, width, height)) {
-            desk_free(&next);
+        if (!desks_create(next, width, height)) {
+            desks_free(next);
             return false;
         }
-        desk_fill(&next, !scr.desk.surface);
+        desk_fill(&next[0], !scr.desk[0].surface);
     }
-    struct desk *shown = resize ? &next : &scr.desk;
-    mode_request(display, head, km, shown);
-    if (!checked("the mode set") || ((resize || !given) && desk_give(shown) < 0)) {
-        desk_free(&next);
+    /* buffers given now are shown from their first; the ones given before from the system's last */
+    bool give = resize || !given;
+    const struct desk *set = resize ? next : scr.desk;
+    mode_request(display, head, km, give ? &set[0] : &scr.desk[scr.desk_on]);
+    if (!checked("the mode set") || (give && desk_give(set) < 0)) {
+        desks_free(next);
         return false;
     }
-    struct desk was = scr.desk;
-    if (resize) scr.desk = next;
+    struct desk was[DESK_BUFFERS];
+    memcpy(was, scr.desk, sizeof was);
+    if (resize) memcpy(scr.desk, next, sizeof next);
+    bool vblank_moved = !scr.vblank || scr.vblank_head != head;
+    if (vblank_moved) {
+        vblank_off();
+        vblank_on(head);
+    }
     bool lit = false, flipped = mode_set(display, head, km, &lit);
     if (!lit) {
+        if (vblank_moved) {
+            vblank_off();
+            if (scr.head_on) vblank_on(scr.head);
+        }
         if (resize) {
-            scr.desk = was;
-            if (!was.surface || desk_give(&was) < 0) give_boot(); /* never into memory that is freed */
-            desk_free(&next);
+            memcpy(scr.desk, was, sizeof was);
+            if (!was[0].surface || desks_regive() < 0) give_boot(); /* never into memory that is freed */
+            desks_free(next);
         }
         nvrm_log(LOG "display 0x%08x %s", (unsigned)display, scr.head_on ? "shows what it showed before" : "stays dark");
         return false;
     }
-    if (resize) desk_free(&was); /* hand_back frees the new one */
+    if (resize) desks_free(was); /* hand_back frees the new ones */
     if (!flipped) return false;
     scr.unshown_said = false;
-    if (!scr.vblank || scr.vblank_head != head) {
-        vblank_off();
-        vblank_on(head);
-    }
     nvrm_log(LOG "the desktop is shown on display 0x%08x (head %u) at %s", (unsigned)display, (unsigned)head, text);
     head_state_log("after the mode set");
     return true;
@@ -1186,7 +1356,7 @@ static bool mode_show(const struct NvKmsKapiDisplayMode *km) {
 static bool modes_offer(bool anew) {
     modes_list(scr.target);
     if (!anew && !memcmp(&offer, &offered, sizeof offer)) return false;
-    n_result r = n_pci_screen_modes(nvrm_dev.pci, &offer);
+    n_result r = n_pci_screen_modes(nvrm_dev.pci, 0, &offer);
     if (r < 0) {
         nvrm_log(LOG "the system does not take the modes of display 0x%08x: %s", (unsigned)scr.target, n_result_text(r));
         return false;
@@ -1249,7 +1419,7 @@ static void mode_follow(const struct n_screen_state *st) {
     offer.done = st->mode_serial;
     if (scr.head_on && scr.display == scr.target && __atomic_load_n(&scr.given, __ATOMIC_ACQUIRE))
         offer.shown = mode_of(&scr.mode);
-    n_result r = n_pci_screen_modes(nvrm_dev.pci, &offer);
+    n_result r = n_pci_screen_modes(nvrm_dev.pci, 0, &offer);
     offer.done = 0;
     offer.shown = (struct n_screen_mode){ 0 };
     if (r < 0) nvrm_log(LOG "the system does not hear what display 0x%08x shows: %s", (unsigned)scr.target, n_result_text(r));
@@ -1259,7 +1429,7 @@ static void mode_follow(const struct n_screen_state *st) {
    (MODE_TRIES at most): after modes are offered anew, without waiting for the state thread. */
 static void mode_follow_now(void) {
     for (int i = 0; i < MODE_TRIES; i++) {
-        if (n_pci_screen_state(nvrm_dev.pci, 0, &state_now, 0) < 0 || state_now.mode_serial <= scr.mode_serial) return;
+        if (n_pci_screen_state(nvrm_dev.pci, 0, 0, &state_now, 0) < 0 || state_now.mode_serial <= scr.mode_serial) return;
         mode_follow(&state_now);
     }
 }
@@ -1337,10 +1507,10 @@ static int state_thread(void *unused) {
     uint64_t seen = 0;
     bool refused = false;
     while (!__atomic_load_n(&scr.state_stop, __ATOMIC_ACQUIRE)) {
-        n_result r = n_pci_screen_state(nvrm_dev.pci, seen, &state_followed, STATE_WAIT_MS);
+        n_result r = n_pci_screen_state(nvrm_dev.pci, 0, seen, &state_followed, STATE_WAIT_MS);
         if (r == -N_ERR_TIMEOUT) continue;
         if (r < 0) {
-            /* Not while nvrm neither shows its surface nor offers modes; looked at again later. */
+            /* Not while nvrm neither shows its buffers nor offers modes; looked at again later. */
             if (__atomic_load_n(&scr.state_stop, __ATOMIC_ACQUIRE)) break; /* nvrm stops */
             if (!refused) nvrm_log(LOG "the system does not say what the screen shows: %s", n_result_text(r));
             refused = true;
@@ -1357,6 +1527,30 @@ static int state_thread(void *unused) {
     return 0;
 }
 
+/* The flips the system asks of output 0 (desk_flip), as they come. */
+static int flip_thread(void *unused) {
+    (void)unused;
+    struct n_screen_flip flips[FLIPS_TAKEN];
+    bool refused = false;
+    while (!__atomic_load_n(&scr.state_stop, __ATOMIC_ACQUIRE)) {
+        n_result n = n_pci_screen_flips(nvrm_dev.pci, flips, FLIPS_TAKEN, STATE_WAIT_MS);
+        if (n < 0) {
+            if (__atomic_load_n(&scr.state_stop, __ATOMIC_ACQUIRE)) break; /* nvrm stops */
+            if (!refused) nvrm_log(LOG "the system does not give its flips: %s", n_result_text(n));
+            refused = true;
+            n_sleep_ms(STATE_WAIT_MS);
+            continue;
+        }
+        refused = false;
+        if (!n) continue;
+        mtx_lock(&scr.head_lock);
+        for (n_result i = 0; i < n; i++)
+            if (flips[i].output == 0) desk_flip(flips[i].buffer, flips[i].serial);
+        mtx_unlock(&scr.head_lock);
+    }
+    return 0;
+}
+
 static struct image *image_find(uint32_t number) {
     for (struct image *i = scr.images; i; i = i->next)
         if (i->number == number) return i;
@@ -1364,7 +1558,7 @@ static struct image *image_find(uint32_t number) {
 }
 
 /* What image_create made, given back; none of it is shown. The system's hold on the image ends
-   first, when it still holds it: it lets go of every image itself once nvrm's surface is no
+   first, when it still holds it: it lets go of every image itself once nvrm's buffers are no
    longer the screen's (hand_back, which nvrm_display_stop calls first, leaves panic 0). */
 static void image_release(struct image *image) {
     if (image->panic > 0) n_pci_screen_image_end(nvrm_dev.pci, image->panic);
@@ -1388,7 +1582,7 @@ static void image_free(struct image *image) {
 
 /* The system draws its panic screen into the image too (n_pci_screen_image): when the kernel
    stops, the display engine goes on showing the image flipped last, and nvrm no longer runs to
-   show the desktop's surface again. A view of the BAR pages RM's mapping shows; the system holds
+   show the desktop's buffers again. A view of the BAR pages RM's mapping shows; the system holds
    what it draws into, so the view's handle closes at once. Returns the image's number there. */
 static n_result image_for_panic(const struct image *image) {
     uint64_t phys = 0, offset = 0;
@@ -1401,13 +1595,13 @@ static n_result image_for_panic(const struct image *image) {
         .format = N_SCANOUT_XBGR8888,
         .offset = offset,
     };
-    n_result r = n_pci_screen_image(nvrm_dev.pci, view, &desc);
+    n_result r = n_pci_screen_image(nvrm_dev.pci, 0, view, &desc);
     n_handle_close(view);
     return r ? r : -N_ERR_INVALID;
 }
 
 /* Apps' images made before the screen was handed back, held for the system's panic screen again
-   once the desktop's surface is the screen's with N_SCANOUT_DIRECT again (mode_follow): one the
+   once the desktop's buffers are the screen's with N_SCANOUT_DIRECT again (mode_follow): one the
    system does not hold is not presented (image_present). Under head_lock. */
 static void images_held_again(void) {
     if (!scr.direct) return;
@@ -1418,10 +1612,10 @@ static void images_held_again(void) {
 static uint32_t image_create(uint32_t app, const void *connection, struct nvrm_scanout_request *r) {
     struct image *image = calloc(1, sizeof *image);
     if (!image) return NV_ERR_NO_MEMORY;
-    image->width = scr.desk.width;
-    image->height = scr.desk.height;
-    image->pitch = scr.desk.pitch;
-    image->bytes = scr.desk.bytes;
+    image->width = scr.desk[0].width;
+    image->height = scr.desk[0].height;
+    image->pitch = scr.desk[0].pitch;
+    image->bytes = scr.desk[0].bytes;
     image->memory = scanout_memory(image->bytes);
     if (image->memory)
         image->surface = surface_of(image->memory, image->width, image->height, image->pitch,
@@ -1462,7 +1656,7 @@ static uint32_t image_create(uint32_t app, const void *connection, struct nvrm_s
 
 static uint32_t image_present(uint32_t app, struct image *image) {
     /* The latest state, not the one the state thread follows: that one may be older. */
-    n_result r = n_pci_screen_state(nvrm_dev.pci, 0, &state_now, 0);
+    n_result r = n_pci_screen_state(nvrm_dev.pci, 0, 0, &state_now, 0);
     if (r < 0 || state_now.app != app || !scr.head_on || image->panic <= 0) return NV_ERR_INVALID_STATE;
     return show(image, &state_now) ? NV_OK : NV_ERR_INVALID_STATE;
 }
@@ -1567,6 +1761,19 @@ bool nvrm_display_start(void) {
         mtx_destroy(&scr.lock);
         return false;
     }
+    if (mtx_init(&scr.flip_lock, mtx_plain) != thrd_success) {
+        mtx_destroy(&scr.head_lock);
+        cnd_destroy(&scr.wake);
+        mtx_destroy(&scr.lock);
+        return false;
+    }
+    if (cnd_init(&scr.flip_cnd) != thrd_success) {
+        mtx_destroy(&scr.flip_lock);
+        mtx_destroy(&scr.head_lock);
+        cnd_destroy(&scr.wake);
+        mtx_destroy(&scr.lock);
+        return false;
+    }
     scr.sync_ready = true;
     scr.rescan = scr.stop = false;
 
@@ -1615,6 +1822,11 @@ bool nvrm_display_start(void) {
     }
 
     __atomic_store_n(&scr.state_stop, false, __ATOMIC_RELEASE);
+    if (thrd_create(&scr.flip_thread, flip_thread, NULL) == thrd_success) scr.flip_running = true;
+    else {
+        why = "cannot start the flip thread, without which no frame of the system's would be shown";
+        goto fail;
+    }
     if (thrd_create(&scr.state_thread, state_thread, NULL) == thrd_success) scr.state_running = true;
     else if (!scr.owner) {
         why = "the screen was handed back, and without the state thread no wish of the system's would take it again";
@@ -1624,7 +1836,7 @@ bool nvrm_display_start(void) {
         if (scr.direct) {
             direct_off();
             /* The system would still hand fullscreen windows to nvrm, which shows none. */
-            if (desk_give(&scr.desk) < 0) {
+            if (desks_regive() < 0) {
                 why = "the system would show windows directly that nvrm does not show";
                 goto fail;
             }
@@ -1635,7 +1847,7 @@ bool nvrm_display_start(void) {
     if (thrd_create(&scr.thread, display_thread, NULL) == thrd_success) scr.thread_running = true;
     else nvrm_log(LOG "cannot start the display thread; displays coming and going are not followed");
     if (scr.owner)
-        nvrm_log(LOG "the desktop is drawn into nvrm's surface, shown on display 0x%08x (head %u)%s",
+        nvrm_log(LOG "the desktop is drawn into nvrm's buffers, shown on display 0x%08x (head %u)%s",
                  (unsigned)scr.display, (unsigned)scr.head,
                  scr.direct ? "; apps' fullscreen windows can be shown directly" : "");
     else
@@ -1651,10 +1863,14 @@ fail:
 
 void nvrm_display_stop(void) {
     __atomic_store_n(&scr.serving, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
     if (scr.state_running) {
-        __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
         thrd_join(scr.state_thread, NULL); /* within STATE_WAIT_MS */
         scr.state_running = false;
+    }
+    if (scr.flip_running) {
+        thrd_join(scr.flip_thread, NULL); /* within STATE_WAIT_MS */
+        scr.flip_running = false;
     }
     if (scr.thread_running) {
         mtx_lock(&scr.lock);
@@ -1676,6 +1892,8 @@ void nvrm_display_stop(void) {
     if (scr.device) kapi.freeDevice(scr.device);
     scr.device = NULL;
     if (scr.sync_ready) {
+        cnd_destroy(&scr.flip_cnd);
+        mtx_destroy(&scr.flip_lock);
         mtx_destroy(&scr.head_lock);
         cnd_destroy(&scr.wake);
         mtx_destroy(&scr.lock);

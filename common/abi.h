@@ -59,13 +59,19 @@ enum {
     SYS_CHANNEL_LISTEN = 53, SYS_CHANNEL_CONNECT, SYS_CHANNEL_ACCEPT,
     SYS_SHARED_CREATE,
     SYS_THREAD_STACK_BOUNDS = 58, SYS_THREAD_DETACH,
-    SYS_WIN_CREATE = 64, SYS_WIN_MAP, SYS_WIN_PRESENT, SYS_WIN_SET_TITLE, SYS_SCREEN_INFO,
-    SYS_WIN_MOVE, SYS_CLIPBOARD_SET, SYS_CLIPBOARD_GET, SYS_WIN_RESIZE, SYS_GUI_LAUNCH,
+    SYS_WIN_CREATE = 64, /* (width, height, title, flags, surfaces): the window handle */
+    SYS_WIN_SURFACE,     /* (window, index): a handle to that surface of the window's size */
+    SYS_WIN_PRESENT,     /* (window, x, y, width << 32 | height, index + 1 or 0): the present's number */
+    SYS_WIN_SET_TITLE, SYS_SCREEN_INFO,
+    SYS_WIN_MOVE, SYS_CLIPBOARD_SET, SYS_CLIPBOARD_GET,
+    SYS_WIN_RESIZE,      /* (window, width, height): new surfaces of that size (SYS_WIN_SURFACE) */
+    SYS_GUI_LAUNCH,
     SYS_SCREEN_GRAB, SYS_WIN_STATE, SYS_WIN_PRESENTATION,
     SYS_WIN_RECEIVE, /* (window, struct gui_event *out, max, timeout_ms): count, 0 on timeout */
     SYS_WIN_DIRECT,  /* (window, wanted): ask to be shown by the display driver directly (EV_DIRECT) */
     SYS_WIN_FRAME,   /* (window): EV_FRAME at the display's next frame, presented or not (WIN_FRAME_EVENTS) */
     SYS_WIN_POINTER, /* (window, const struct n_win_pointer *, size): the pointer over the client area */
+    SYS_WIN_ACQUIRE, /* (window, timeout_ms): a surface of a WIN_FRAME_QUEUE window free to draw into */
     SYS_SHARED_RESERVE = 88, SYS_WAIT_ADDRESS64,
     SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
     SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
@@ -112,9 +118,9 @@ enum {
     /* SYS_ENTRY_INFO and SYS_FOLDER_LIST with the size of the caller's struct n_entry */
     SYS_ENTRY_INFO_SIZED,  /* (path, struct n_entry *out, sizeof *out) */
     SYS_FOLDER_LIST_SIZED, /* (path, struct n_entry *out, max, start, sizeof *out): count */
-    /* A display driver draws the screen's scanout (docs/nocturne-native-abi.md §9) */
-    SYS_PCI_GIVE_SCREEN,   /* (pci, surface or N_SCANOUT_BOOT, const struct n_scanout *) */
-    SYS_PCI_SCREEN_VBLANK, /* (pci, count, timestamp_ns): one vertical blank of that scanout */
+    /* A display driver shows screens (docs/nocturne-native-abi.md §9): its outputs' buffers */
+    SYS_PCI_GIVE_SCREEN,   /* (pci, output, const struct n_screen_buffers *, or 0 to give it back) */
+    SYS_PCI_SCREEN_VBLANK, /* (pci, const struct n_screen_vblank *): a vertical blank of an output */
     /* Paged memory and its pager (docs/nocturne-native-abi.md §7) */
     SYS_PAGER_CREATE,      /* (bytes, int32_t *memory_out): the pager handle */
     SYS_PAGER_TAKE,        /* (pager, struct n_pager_fault *out, max, timeout_ms): count */
@@ -124,15 +130,16 @@ enum {
     /* A claimed function's part of the ACPI namespace (docs/nocturne-native-abi.md §9) */
     SYS_PCI_ACPI_EVAL,     /* (pci, const struct n_acpi_eval *, out, out_size): bytes written */
     SYS_PCI_ACPI_NOTIFY_TAKE, /* (pci, timeout_ms): the next Notify value of the function's node */
-    /* A display driver follows the screen: the mode it is to show, and with N_SCANOUT_DIRECT the
+    /* A display driver follows a screen: the mode it is to show, and with N_SCANOUT_DIRECT the
        window it shows directly */
-    SYS_PCI_SCREEN_STATE,  /* (pci, seen serial, struct n_screen_state *out, timeout_ms) */
-    /* What such a driver may show in its scanout's place, which the panic screen is drawn into too */
-    SYS_PCI_SCREEN_IMAGE,     /* (pci, surface, const struct n_scanout *): the image's number */
+    SYS_PCI_SCREEN_STATE,  /* (pci, output, seen serial, struct n_screen_state *out, timeout_ms) */
+    /* What such a driver may show in its buffers' place, which the panic screen is drawn into too */
+    SYS_PCI_SCREEN_IMAGE,     /* (pci, output, surface, const struct n_scanout *): the image's number */
     SYS_PCI_SCREEN_IMAGE_END, /* (pci, number) */
-    /* A display driver's monitor: the modes it can show and the one it shows (the system says
-       which it wants in struct n_screen_state) */
-    SYS_PCI_SCREEN_MODES,     /* (pci, const struct n_screen_modes *) */
+    /* A display driver's monitor on an output: the modes it can show and the one it shows (the
+       system says which it wants in struct n_screen_state) */
+    SYS_PCI_SCREEN_MODES,     /* (pci, output, const struct n_screen_modes *) */
+    SYS_PCI_SCREEN_FLIPS,     /* (pci, struct n_screen_flip *out, max, timeout_ms): count, 0 on timeout */
     /* Watches (docs/nocturne-native-abi.md §1): a handle receivable once what it watches has
        changed, until SYS_WATCH_TAKE takes the count. Each call after it gives one. */
     SYS_WATCH_TAKE = 207,     /* (watch): the changes since its last take (0: none) */
@@ -332,25 +339,61 @@ struct n_pci_function {
 #define N_CACHE_WRITE_COMBINE 2u
 #define N_CACHE_UNCACHED 3u
 
-/* n_pci_give_screen: where in a surface the display engine reads the screen from. width and
-   height are the size the desktop is drawn at (the mode's the driver shows; the desktop takes
-   it), pitch is the bytes from one row to the next, offset the first row's place in the surface. */
+/* The pixel formats of a display's buffers and images. */
 #define N_SCANOUT_XRGB8888 1u    /* 32 bits: x8 r8 g8 b8, blue in the lowest byte */
 #define N_SCANOUT_XRGB2101010 2u /* 32 bits: x2 r10 g10 b10, blue in the lowest bits */
 #define N_SCANOUT_XBGR8888 3u    /* 32 bits: x8 b8 g8 r8, red in the lowest byte */
-#define N_SCANOUT_BOOT (-1)      /* the surface argument: the firmware's framebuffer again */
 /* A flag in format: the driver can show a window's own images instead of the desktop and draw
    the pointer itself while it does (n_pci_screen_state says when and where). */
 #define N_SCANOUT_DIRECT 0x100u
 #define N_SCANOUT_FORMAT_MASK 0xffu
+/* n_pci_screen_image: where in a surface the display engine reads an image from: width x height
+   pixels, pitch bytes from one row to the next, the first row offset bytes into the surface. */
 struct n_scanout {
     uint32_t width, height, pitch, format;
     uint64_t offset;
 };
+/* n_pci_give_screen: the buffers an output shows a screen from, all of one mode and format. width
+   and height are the mode's (the screen takes that size), pitch the bytes from one row to the
+   next, format N_SCANOUT_* (with N_SCANOUT_DIRECT when the driver can show windows directly).
+   Each buffer is a surface (a writable shared object made through the claim) and the offset of
+   its first row in it; count of them, 1 to N_SCREEN_BUFFERS_MAX. The system draws a frame only
+   into a buffer the output does not show and then asks for it (n_pci_screen_flips); with one
+   buffer it has no other and draws into the one shown. */
+#define N_SCREEN_BUFFERS_MAX 4u
+struct n_screen_buffer {
+    int32_t surface;
+    uint32_t reserved;
+    uint64_t offset;
+};
+struct n_screen_buffers {
+    uint32_t width, height, pitch, format;
+    uint32_t count, reserved;
+    struct n_screen_buffer buffer[N_SCREEN_BUFFERS_MAX];
+};
+/* n_pci_screen_flips: show buffer of output from its next vertical blank on. serial counts the
+   output's flips from 1; the driver says when the flip was shown (n_pci_screen_vblank). A newer
+   flip of the same output replaces one not taken yet. */
+struct n_screen_flip {
+    uint32_t output, buffer;
+    uint64_t serial;
+};
+/* n_pci_screen_vblank: a vertical blank of output. count is the driver's count of its blanks,
+   time_ns the moment it began on the system's monotonic clock in nanoseconds (the axis of
+   SYS_UPTIME: the driver converts the display engine's time to it), buffer the buffer shown from
+   it on and flip_serial the last flip that blank shows (0: none yet). A driver reports each blank
+   that shows a flip as the display engine signals it, and the others while a flip waits. */
+struct n_screen_vblank {
+    uint32_t output, buffer;
+    uint64_t count, time_ns, flip_serial;
+};
 
 /* A display mode: the visible pixels and the vertical refresh in millihertz (59940 is 59.94 Hz).
-   N_SCREEN_MODE_PREFERRED marks the monitor's own preferred timing (its EDID's). */
+   N_SCREEN_MODE_PREFERRED marks the monitor's own preferred timing (its EDID's). N_SCREEN_MODE_VRR:
+   the monitor shows the mode at a variable refresh, a frame as soon as it is ready, from
+   refresh_mhz down to its n_screen_modes vrr_min_mhz. */
 #define N_SCREEN_MODE_PREFERRED 1u
+#define N_SCREEN_MODE_VRR 2u
 struct n_screen_mode {
     uint32_t width, height;
     uint32_t refresh_mhz;
@@ -362,25 +405,27 @@ struct n_screen_mode {
    the EDID's maker, product and serial number), name is the monitor's for people (may be empty);
    both end with a zero. modes are the progressive modes the driver checked it can show, count of
    them, no two alike (width, height, refresh). shown is the mode the driver shows now, all zero
-   when it shows none; done is the n_screen_state mode_serial it acted on last (0: none yet). */
+   when it shows none; done is the n_screen_state mode_serial it acted on last (0: none yet).
+   vrr_min_mhz is the lowest refresh of the monitor's variable refresh range (its EDID's), 0
+   without one. */
 #define N_SCREEN_MODES_MAX 128u
 struct n_screen_modes {
     char monitor[32];
     char name[32];
     uint64_t done;
     struct n_screen_mode shown;
-    uint32_t count, reserved;
+    uint32_t count, vrr_min_mhz;
     struct n_screen_mode modes[N_SCREEN_MODES_MAX];
 };
 
-/* n_pci_screen_state: what the screen should show, for the driver whose scanout the screen is
-   drawn into or whose monitor's modes the system has. serial changes with every change of what
-   follows and is never 0.
+/* n_pci_screen_state: what an output's screen should show, for the driver whose buffers the
+   screen is drawn into or whose monitor's modes the system has. serial changes with every change
+   of what follows and is never 0.
    mode is the mode the system wants the driver to show (one of the modes it gave, all zero while
    it wants none); mode_serial changes with every wish, even for the same mode again (a monitor
    offered anew). The driver shows it at that size (n_pci_give_screen) and gives n_pci_screen_modes
    with done = mode_serial and what it shows then.
-   For a driver whose scanout has N_SCANOUT_DIRECT: app is the app (n_app_self's number) whose
+   For a driver whose buffers have N_SCANOUT_DIRECT: app is the app (n_app_self's number) whose
    fullscreen window the system lets show its own images directly, 0 when the desktop is shown.
    While app is not 0 the driver draws the pointer: at pointer_x, pointer_y on the screen (where
    its hot spot goes) when pointer_shown, the image in pointer (rows of N_SCREEN_POINTER_SIZE
@@ -490,9 +535,18 @@ struct n_audio_output {
 enum {
     EV_NONE = 0, EV_KEY, EV_MOUSE_MOVE, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_CLOSE, EV_FOCUS, EV_UNFOCUS,
     EV_WHEEL, EV_RESIZE, EV_FRAME,
-    EV_DIRECT, /* key 1: the window's own images are shown directly (win_direct); 0: no longer */
+    EV_DIRECT,     /* key 1: the window's own images are shown directly (win_direct); 0: no longer */
+    EV_SURFACE,    /* buttons: the surfaces (bit i: surface i) given back to the app to draw into */
+    /* Input for the window was lost: the mailbox held as many events as the system keeps for a
+       window that does not take them. Keys and buttons held before it are to be taken as released;
+       the next events are the ones that came after. */
+    EV_INPUT_LOST,
 };
 
+/* A window's event. time_ns is a moment on the system's monotonic clock in nanoseconds (the axis
+   of SYS_UPTIME): for input, when the device's report reached the system; for EV_FRAME, when the
+   frame was shown (the vertical blank the display device measured, or the copy's end on a screen
+   that has none). */
 struct gui_event {
     uint32_t type;
     int32_t x, y;       /* mouse position in client coordinates / new size for EV_RESIZE */
@@ -501,6 +555,8 @@ struct gui_event {
     uint32_t buttons;
     int32_t wheel;
     uint32_t pressed;
+    uint64_t time_ns;
+    uint64_t serial;    /* EV_FRAME: the number of the last present the frame showed */
 };
 
 /* window flags */
@@ -509,24 +565,36 @@ struct gui_event {
 #define WIN_CENTER 4
 #define WIN_START_MAXIMIZED 8
 #define WIN_ALWAYS_ON_TOP 16
-/* Opt-in full-frame protocol. MAP(fd, index, WIN_MAP_ACQUIRE) waits until
-   the compositor releases that buffer. PRESENT's final argument is index+1.
-   No writes are allowed between submission and acquisition. Legacy calls
-   (final argument zero) retain their rectangle snapshot semantics. */
-#define WIN_DOUBLE_BUFFER 32
-#define WIN_BUFFER_COUNT 2
-#define WIN_MAP_ACQUIRE 1
-/* EV_FRAME: key = completed index, x = reusable index; completion means all
-   compositor reads have joined, not hardware vblank or physical scanout.
-   Every EV_FRAME has y = the display's frame period in µs: the next frame comes
-   about that long after this one. */
-/* The display's pace for a window presented by rectangles: after a frame of the
-   screen took what the window presented, it gets EV_FRAME (key and x 0), one for
-   any number of presents. Frames come at the display's vertical blanks (else its
-   mode's refresh), so an app that draws on EV_FRAME draws once a frame at any
-   refresh rate. SYS_WIN_FRAME asks for the next one without presenting (an
-   animation that waits for the display before it decides to draw). A window that
-   is not shown gets it when it is shown again.
+/* A window's pixels are surfaces: shared objects (N_KIND_SHARED) of width * height pixels of
+   0xAARRGGBB (and the deep plane after them with WIN_DEEP_COLOR), which SYS_WIN_SURFACE hands out
+   and the app maps (n_shared_map) or passes on to another app that draws for it. The compositor
+   reads the same pages.
+   A window without WIN_FRAME_QUEUE has one surface, which it keeps and draws into in part: each
+   SYS_WIN_PRESENT names the rectangle it changed, and the system takes a copy of that rectangle
+   (what is shown never has half of a change).
+   A window with WIN_FRAME_QUEUE has SYS_WIN_CREATE's surface count of surfaces (2 to
+   N_WIN_SURFACES_MAX; 0 is 2), each a whole frame: SYS_WIN_ACQUIRE gives a surface the app may
+   draw into, SYS_WIN_PRESENT queues it whole, and the compositor reads it without a copy. The
+   surface on the screen stays the compositor's until another is shown; then EV_SURFACE gives it
+   back. Presents wait in turn, one shown a frame; with WIN_MAILBOX a present replaces the one
+   still waiting, which EV_SURFACE gives back at once (a game that draws faster than the screen
+   shows the newest frame). No writes are allowed to a surface between its present and its return. */
+#define WIN_FRAME_QUEUE 32
+#define WIN_MAILBOX 256
+#define N_WIN_SURFACES_MAX 8
+/* A window's client area is 1 to N_WIN_SIZE_MAX pixels each way (SYS_WIN_CREATE, SYS_WIN_RESIZE);
+   it may be larger than the screens, which show what fits. */
+#define N_WIN_SIZE_MAX 16384
+/* EV_FRAME: a frame of the screen took what the window presented and was shown. y is the
+   screen's frame period in nanoseconds (the next frame comes about that long after this one; on
+   a variable-refresh screen, the shortest), time_ns when the frame was shown, serial the number
+   of the last present it showed (SYS_WIN_PRESENT's result), key the surface it shows (a
+   WIN_FRAME_QUEUE window's). One EV_FRAME answers any number of presents. Frames come at the
+   screen's vertical blanks (else its mode's refresh), so an app that draws on EV_FRAME draws once
+   a frame at any refresh rate. With WIN_FRAME_EVENTS, SYS_WIN_FRAME asks for the next one without
+   presenting (an animation that waits for the display before it decides to draw). A window that
+   is not shown gets it when it is shown again. A window on two screens is paced by the one under
+   its centre.
    (WIN_DEEP_COLOR, 64, is in display_abi.h.) */
 #define WIN_FRAME_EVENTS 128
 #define WIN_STATE_VISIBLE 1

@@ -11,6 +11,8 @@ bool e1000_probe(void);   /* vm/e1000.c: Intel 8254x (QEMU, VirtualBox) */
 bool tulip_probe(void);   /* vm/tulip.c: DEC 21140/21143 (Hyper-V's legacy adapter, QEMU) */
 bool netvsc_probe(void);  /* vm/hv/netvsc.c: Hyper-V's synthetic network adapter */
 void rdp_init(void);      /* vm/rdp.c: the enhanced session's RDP server over a Hyper-V socket */
-/* vm/vbe.c: the Bochs VBE display (QEMU's standard VGA, VirtualBox's) can set its mode again
-   after a sleep; false when it is not there. */
+/* vm/vbe.c: the Bochs VBE displays (QEMU's standard VGA, VirtualBox's): each a screen with its
+   own buffers (vbe_display_init), and their modes set again after a sleep (false when there is
+   none). */
+void vbe_display_init(void);
 bool vbe_display_pm(struct pm_device *display);

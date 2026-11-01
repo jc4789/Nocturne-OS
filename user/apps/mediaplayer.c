@@ -206,7 +206,7 @@ static bool pump(void) {
 int main(int argc,char **argv) {
     ui=ui_session_new();
     /* the engine paces each picture with win_begin_frame and paints it whole */
-    if (!ui || ui_window(ui,WINDOW,WIDTH,HEIGHT,WIN_DOUBLE_BUFFER|WIN_DEEP_COLOR,"Media Player",NULL,NULL)<0) return 1;
+    if (!ui || ui_window(ui,WINDOW,WIDTH,HEIGHT,WIN_FRAME_QUEUE|WIN_DEEP_COLOR,"Media Player",NULL,NULL)<0) return 1;
     if (!ui_surface(ui,VIDEO,VIDEO_W,VIDEO_H,UI_SURFACE_DEEP)) return 1;
     if (argc>1) {
         if(strlen(argv[1])>=sizeof path)strlcpy(error,"Media path/URL is too long; nothing was opened.",sizeof error);

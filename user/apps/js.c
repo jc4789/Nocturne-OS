@@ -902,8 +902,9 @@ static JSValue h_desktop_set(JSContext *c, JSValueConst this, int argc, JSValueC
     return JS_NewBool(ctx, __syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_SETTINGS_SET, 0, 0) == 0);
 }
 
-/* The monitor's modes (struct screen_modes): what the display driver offers, the one shown, the
-   one the system asks for and the trial. */
+/* A screen's monitor and its modes (struct screen_modes): what the display driver offers, the one
+   shown, the one the system asks for and the trial. The screen is the call's argument (0 without
+   one: the one with the taskbar). */
 static JSValue screen_mode_value(const struct n_screen_mode *m) {
     if (!m->width) return JS_NULL;
     JSValue o = JS_NewObject(ctx);
@@ -911,12 +912,19 @@ static JSValue screen_mode_value(const struct n_screen_mode *m) {
     JS_SetPropertyStr(ctx, o, "height", JS_NewUint32(ctx, m->height));
     JS_SetPropertyStr(ctx, o, "refreshMillihertz", JS_NewUint32(ctx, m->refresh_mhz));
     JS_SetPropertyStr(ctx, o, "preferred", JS_NewBool(ctx, m->flags & N_SCREEN_MODE_PREFERRED));
+    JS_SetPropertyStr(ctx, o, "variableRefresh", JS_NewBool(ctx, m->flags & N_SCREEN_MODE_VRR));
     return o;
 }
+static uint32_t screen_argument(int argc, JSValueConst *argv, int at) {
+    uint32_t screen = 0;
+    if (argc > at && !JS_IsUndefined(argv[at])) JS_ToUint32(ctx, &screen, argv[at]);
+    return screen > 0xFFFFFF ? 0xFFFFFF : screen;
+}
 static JSValue h_screen_modes(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    uint32_t screen = screen_argument(argc, argv, 0);
     struct screen_modes *s = malloc(sizeof *s);
     if (!s) return JS_NULL;
-    if (__syscall(SYS_SCREEN_INFO, (long)s, sizeof *s, SCREEN_MODES_GET, 0, 0) != 0) {
+    if (__syscall(SYS_SCREEN_INFO, (long)s, sizeof *s, SCREEN_MODES_GET | (uint64_t)screen << 8, 0, 0) != 0) {
         free(s);
         return JS_NULL;
     }
@@ -933,6 +941,9 @@ static JSValue h_screen_modes(JSContext *c, JSValueConst this, int argc, JSValue
     };
     JS_SetPropertyStr(ctx, o, "source", JS_NewString(ctx, s->source < sizeof sources / sizeof *sources
                                                               ? sources[s->source] : "firmware"));
+    JS_SetPropertyStr(ctx, o, "screen", JS_NewUint32(ctx, screen));
+    JS_SetPropertyStr(ctx, o, "screens", JS_NewUint32(ctx, s->screens));
+    JS_SetPropertyStr(ctx, o, "variableRefreshMinMillihertz", JS_NewUint32(ctx, s->offered.vrr_min_mhz));
     JS_SetPropertyStr(ctx, o, "monitor", JS_NewString(ctx, s->offered.monitor));
     JS_SetPropertyStr(ctx, o, "name", JS_NewString(ctx, s->offered.name));
     JS_SetPropertyStr(ctx, o, "modes", modes);
@@ -945,8 +956,8 @@ static JSValue h_screen_modes(JSContext *c, JSValueConst this, int argc, JSValue
     return o;
 }
 
-/* (how: "try", "keep" or "back"; width, height, refresh in mHz): SCREEN_MODE_SET; whether the
-   system took it */
+/* (how: "try", "keep" or "back"; width, height, refresh in mHz; the screen, 0 without it):
+   SCREEN_MODE_SET; whether the system took it */
 static JSValue h_screen_mode_set(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
     static const char *const hows[] = {[SCREEN_MODE_TRY] = "try", [SCREEN_MODE_KEEP] = "keep", [SCREEN_MODE_BACK] = "back"};
     struct screen_mode_set s = {0};
@@ -959,7 +970,8 @@ static JSValue h_screen_mode_set(JSContext *c, JSValueConst this, int argc, JSVa
     JS_ToUint32(ctx, &s.mode.width, argv[1]);
     JS_ToUint32(ctx, &s.mode.height, argv[2]);
     JS_ToUint32(ctx, &s.mode.refresh_mhz, argv[3]);
-    return JS_NewBool(ctx, __syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_MODE_SET, 0, 0) == 0);
+    uint64_t op = SCREEN_MODE_SET | (uint64_t)screen_argument(argc, argv, 4) << 8;
+    return JS_NewBool(ctx, __syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, op, 0, 0) == 0);
 }
 
 /* What desktop, screenModes and sound report, watched where it is kept (display_abi.h's
@@ -1456,8 +1468,8 @@ static const JSCFunctionListEntry host_functions[] = {
     JS_CFUNC_DEF("uiLaunch", 2, h_ui_launch),
     JS_CFUNC_DEF("desktop", 0, h_desktop),
     JS_CFUNC_DEF("desktopSet", 2, h_desktop_set),
-    JS_CFUNC_DEF("screenModes", 0, h_screen_modes),
-    JS_CFUNC_DEF("screenModeSet", 4, h_screen_mode_set),
+    JS_CFUNC_DEF("screenModes", 1, h_screen_modes),
+    JS_CFUNC_DEF("screenModeSet", 5, h_screen_mode_set),
     JS_CFUNC_DEF("systemWatch", 1, h_system_watch),
     JS_CFUNC_DEF("sound", 2, h_sound),
     JS_CFUNC_DEF("systemInfo", 0, h_system_info),

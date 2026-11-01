@@ -1,6 +1,5 @@
-/* Client side of the Nocturne window system. Results come back as they are:
-   a value, or a negative n_result. Window addresses are user addresses, so a
-   mapping call is either a positive address or a negative n_result. */
+/* Client side of the Nocturne window system. Results come back as they are: a value, or a
+   negative n_result. A window's surfaces are shared objects the app maps (SYS_WIN_SURFACE). */
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
@@ -37,26 +36,53 @@ uint8_t *win_deep(window_t *win) {
     return (uint8_t *)(win->c.px + (size_t)win->w * win->h);
 }
 
+/* The window's surfaces of w x h mapped into this app (SYS_WIN_SURFACE); each handle is closed
+   after its mapping, which keeps the pages. */
+static size_t surface_bytes(int w, int h, int flags) {
+    size_t bytes = (size_t)w * h * ((flags & WIN_DEEP_COLOR) ? 5 : 4);
+    return (bytes + 4095) & ~(size_t)4095;
+}
+
+static void surfaces_unmap(window_t *win) {
+    for (unsigned i = 0; i < win->nsurf; i++)
+        if (win->surface[i]) n_memory_release(win->surface[i], win->surface_bytes);
+    memset(win->surface, 0, sizeof win->surface);
+    win->c.px = NULL;
+}
+
+static n_result surfaces_map(window_t *win, int w, int h) {
+    size_t bytes = surface_bytes(w, h, win->flags);
+    win->surface_bytes = bytes;
+    for (unsigned i = 0; i < win->nsurf; i++) {
+        n_result handle = __syscall(SYS_WIN_SURFACE, win->handle, i, 0, 0, 0);
+        if (handle < 0) return handle;
+        void *p = NULL;
+        n_result r = n_shared_map((n_handle)handle, bytes, N_MEMORY_READ_WRITE, &p);
+        n_handle_close((n_handle)handle);
+        if (r < 0) return r;
+        win->surface[i] = p;
+    }
+    win->w = w;
+    win->h = h;
+    win->current = -1;
+    if (win->flags & WIN_FRAME_QUEUE) win->c = (canvas_t){0};
+    else gfx_init(&win->c, win->surface[0], w, h, w);
+    return 0;
+}
+
 n_result win_open(int w, int h, const char *title, int flags, window_t **out) {
     *out = NULL;
-    n_result handle = __syscall(SYS_WIN_CREATE, w, h, (long)title, flags, 0);
+    /* a mailbox keeps one shown, one waiting and one being drawn */
+    unsigned count = (flags & WIN_FRAME_QUEUE) ? ((flags & WIN_MAILBOX) ? 3 : 2) : 1;
+    n_result handle = __syscall(SYS_WIN_CREATE, w, h, (long)title, flags, (flags & WIN_FRAME_QUEUE) ? count : 0);
     if (handle < 0) return handle;
-    n_result addr = __syscall(SYS_WIN_MAP, handle, 0, 0, 0, 0);
-    if (addr < 0) { n_handle_close((n_handle)handle); return addr; }
     window_t *win = calloc(1, sizeof *win);
     if (!win) { n_handle_close((n_handle)handle); return -N_ERR_NO_MEMORY; }
     win->handle = (n_handle)handle;
-    win->w = w;
-    win->h = h;
     win->flags = flags;
-    win->buffers[0] = (uint32_t *)addr;
-    win->frame_acquired = true;
-    if (flags & WIN_DOUBLE_BUFFER) {
-        n_result other = __syscall(SYS_WIN_MAP, handle, 1, 0, 0, 0);
-        if (other < 0) { n_handle_close((n_handle)handle); free(win); return other; }
-        win->buffers[1] = (uint32_t *)other;
-    }
-    gfx_init(&win->c, (uint32_t *)addr, w, h, w);
+    win->nsurf = count;
+    n_result r = surfaces_map(win, w, h);
+    if (r < 0) { win_close(win); return r; }
     *out = win;
     return 0;
 }
@@ -64,36 +90,51 @@ n_result win_open(int w, int h, const char *title, int flags, window_t **out) {
 void win_close(window_t *win) {
     if (!win) return;
     n_handle_close(win->handle);
+    surfaces_unmap(win);
     free(win);
 }
 
 n_result win_begin_frame(window_t *win) {
     if (!win || win->closed) return -N_ERR_NO_HANDLE;
-    if (!(win->flags & WIN_DOUBLE_BUFFER) || win->frame_acquired) return 0;
-    n_result address = __syscall(SYS_WIN_MAP, win->handle, win->buffer_index, WIN_MAP_ACQUIRE, 0, 0);
-    if (address < 0) return address;
-    win->buffers[win->buffer_index] = (uint32_t *)address;
-    gfx_init(&win->c, (uint32_t *)address, win->w, win->h, win->w);
-    win->frame_acquired = true;
+    if (!(win->flags & WIN_FRAME_QUEUE) || win->current >= 0) return 0;
+    n_result index = __syscall(SYS_WIN_ACQUIRE, win->handle, -1, 0, 0, 0);
+    if (index < 0) return index;
+    win->current = (int)index;
+    gfx_init(&win->c, win->surface[index], win->w, win->h, win->w);
+    return 0;
+}
+
+static n_result presented(window_t *win, n_result number) {
+    if (number < 0) return number;
+    win->presented = (uint64_t)number;
     return 0;
 }
 
 n_result win_update(window_t *win) {
     if (!win || win->closed) return -N_ERR_NO_HANDLE;
-    if (!(win->flags & WIN_DOUBLE_BUFFER)) return __syscall(SYS_WIN_PRESENT, win->handle, 0, 0, 0, 0);
-    if (!win->frame_acquired) return -N_ERR_BUSY;
-    n_result result = __syscall(SYS_WIN_PRESENT, win->handle, 0, 0, 0, win->buffer_index + 1);
-    if (result < 0) return result;
-    win->buffer_index ^= 1;
-    win->frame_acquired = false;
-    win->c.px = NULL; /* a submitted surface is no longer a writable canvas */
+    if (!(win->flags & WIN_FRAME_QUEUE)) return presented(win, __syscall(SYS_WIN_PRESENT, win->handle, 0, 0, 0, 0));
+    if (win->current < 0) return -N_ERR_BUSY;
+    n_result r = presented(win, __syscall(SYS_WIN_PRESENT, win->handle, 0, 0, 0, win->current + 1));
+    if (r < 0) return r;
+    win->current = -1;
+    win->c.px = NULL; /* a presented surface is the system's until EV_SURFACE gives it back */
     return 0;
 }
 
 n_result win_update_rect(window_t *win, int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return 0;
-    if (win->flags & WIN_DOUBLE_BUFFER) return win_update(win);
-    return __syscall(SYS_WIN_PRESENT, win->handle, x, y, ((long)w << 32) | (unsigned)h, 0);
+    if (win->flags & WIN_FRAME_QUEUE) return win_update(win);
+    return presented(win, __syscall(SYS_WIN_PRESENT, win->handle, x, y, ((long)w << 32) | (unsigned)h, 0));
+}
+
+n_result win_resize(window_t *win, int w, int h) {
+    if (!win || win->closed) return -N_ERR_NO_HANDLE;
+    n_result r = __syscall(SYS_WIN_RESIZE, win->handle, w, h, 0, 0);
+    if (r < 0) return r;
+    surfaces_unmap(win);
+    r = surfaces_map(win, w, h);
+    if (r < 0) win->closed = true;
+    return r;
 }
 
 n_result win_set_title(window_t *win, const char *title) { return __syscall(SYS_WIN_SET_TITLE, win->handle, (long)title, 0, 0, 0); }
@@ -137,26 +178,15 @@ n_result win_event(window_t *win, struct gui_event *e, int timeout_ms) {
     }
     *e = win->q[win->qi++];
     if (e->type == EV_RESIZE) {
-        n_result addr = __syscall(SYS_WIN_RESIZE, win->handle, e->x, e->y, 0, 0);
-        if (addr > 0) {
-            win->w = e->x;
-            win->h = e->y;
-            gfx_init(&win->c, (uint32_t *)addr, e->x, e->y, e->x);
-            win->buffers[0] = (uint32_t *)addr;
-            win->buffer_index = 0;
-            win->frame_acquired = true;
-            if (win->flags & WIN_DOUBLE_BUFFER) {
-                /* fetch may have batched a completion for the OLD surfaces
-                   behind this resize. Preserve input, discard stale releases. */
-                int kept = win->qi;
-                for (int i = win->qi; i < win->qn; i++)
-                    if (win->q[i].type != EV_FRAME) win->q[kept++] = win->q[i];
-                win->qn = kept;
-                n_result other = __syscall(SYS_WIN_MAP, win->handle, 1, 0, 0, 0);
-                if (other < 0) { win->closed = true; return other; }
-                win->buffers[1] = (uint32_t *)other;
-            }
-        }
+        n_result r = win_resize(win, e->x, e->y);
+        if (r < 0 && win->closed) return r;
+        e->x = win->w; /* without memory for the new size it keeps the old one */
+        e->y = win->h;
+        /* surfaces given back before the resize went with the old ones */
+        int kept = win->qi;
+        for (int i = win->qi; i < win->qn; i++)
+            if (win->q[i].type != EV_SURFACE) win->q[kept++] = win->q[i];
+        win->qn = kept;
     }
     return 1;
 }

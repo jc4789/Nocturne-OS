@@ -82,6 +82,16 @@ struct pci_claim {
     unsigned acpi_first, acpi_count; /* notes_lock */
     struct spinlock notes_lock;      /* the ring above; before acpi_wq's lock */
     struct wait_queue acpi_wq;
+    /* Its display outputs (struct pci_output), under screen_lock; and the flips its screens ask
+       and the driver has not taken yet (flips, a slot for each output with buffers: a newer flip
+       of an output takes its slot), under flip_lock, which the driver's n_pci_screen_flips waits
+       on (flip_wq). */
+    struct pci_output **outputs;
+    size_t noutputs, outputs_room;
+    struct spinlock flip_lock;
+    struct wait_queue flip_wq;
+    struct n_screen_flip *flips;
+    size_t nflips, flips_room;
 };
 
 /* Claiming and a claim's end, and every function's d->claimed (dev/pci.h): one at a time, as a
@@ -240,29 +250,44 @@ static void screen_release(void) {
     if (fb_release()) screen_repaint();
 }
 
-/* ---- a display driver's own scanout (n_pci_give_screen, dev/fb.c) ----
-   A display function's driver offers the modes of its monitor (n_pci_screen_modes; the system
-   chooses one, gui/screenmode.c), sets the one chosen up with a scanout of its size and gives the
-   system that surface: the desktop takes its size and is drawn there instead of the boot screen.
-   One claim at a time shows its surface (screen_owner) and offers modes (screen_modes_from); it
-   gives the boot screen back itself, or its claim's end does once the function is stopped. Then
-   the boot screen's memory is drawn into again, at its size, though the display engine may no
-   longer show it: the driver that left reprogrammed it and nothing sets it back. */
-static struct mutex screen_lock; /* the screen's claims, screen_surface and screen_direct change under it */
-static struct pci_claim *screen_owner;
-static struct pci_claim *screen_modes_from;
-/* The claim that offered modes last, until it ends: its driver may withdraw them and run on (it
-   drives no monitor, or gave the screen back); its end is the driver's (screen_modes_gone). */
-static struct pci_claim *screen_modes_last;
-static struct shared_scanout screen_surface;
-/* The scanout shown has N_SCANOUT_DIRECT: its driver shows the windows the window manager lets it
-   show directly (gui/wm.c, n_pci_screen_state). */
-static bool screen_direct;
-/* The images such a driver may show in its scanout's place (n_pci_screen_image): the panic screen
-   is drawn into them too (dev/fb.c, fb_scanout_also), as no driver runs then to show the desktop's
-   surface again. They live while the owner's scanout has N_SCANOUT_DIRECT. Under screen_lock. */
+/* ---- a display driver's outputs (n_pci_give_screen, dev/fb.c) ----
+   A display function's driver drives outputs, each a monitor. It offers the modes of an output's
+   monitor (n_pci_screen_modes; the system chooses one, gui/screenmode.c), sets the one chosen up
+   with buffers of its size and gives them to the output's screen (n_pci_give_screen): the screen
+   takes that size, its frames are drawn into the buffer the output does not show, and each is
+   asked for as a flip (n_pci_screen_flips); the driver says when the flip was shown, with the
+   vertical blank the display engine measured (n_pci_screen_vblank). Output 0 of the function the
+   boot screen is drawn through is screen 0; every other output of a function has a screen of its
+   own, the same one each time a driver of that function drives it (output_screens). An output's
+   screen is off when the driver gives its buffers back, and when its claim ends once the
+   function is stopped; screen 0 then shows the firmware's framebuffer again, though the display
+   engine may no longer show it: the driver that left reprogrammed it and nothing sets it back. */
+static struct mutex screen_lock; /* the outputs of every claim, output_screens and the images */
+struct output_screen {
+    uint8_t bus, dev, func;
+    uint32_t output;
+    struct screen *screen;
+};
+static struct output_screen *output_screens;
+static size_t noutput_screens, output_screens_room;
+
+struct pci_output {
+    struct pci_claim *claim;
+    uint32_t output;
+    struct screen *screen;
+    bool modes;  /* it offers modes */
+    bool direct; /* its buffers have N_SCANOUT_DIRECT */
+    unsigned count; /* its buffers, 0: none given */
+    struct shared_scanout surface[SCREEN_BUFFERS_MAX];
+    struct scanout *buf[SCREEN_BUFFERS_MAX];
+};
+
+/* The images such a driver may show in an output's buffers' place (n_pci_screen_image): the panic
+   screen is drawn into them too (dev/fb.c, fb_image_add), as no driver runs then to show the
+   desktop's buffers again. They live while their output's buffers have N_SCANOUT_DIRECT. */
 struct screen_image {
     struct screen_image *next;
+    struct pci_output *output;
     int64_t number;          /* never 0 or negative */
     struct shared_scanout surface;
     struct scanout *out;
@@ -270,37 +295,166 @@ struct screen_image {
 static struct screen_image *screen_images;
 static int64_t screen_image_last;
 
-static void screen_say(const struct pci_claim *c, const char *what) {
-    kprintf("pci: %02x:%02x.%u: %s\n", c->d->bus, c->d->dev, c->d->func, what);
+static void screen_say(const struct pci_claim *c, uint32_t output, const char *what) {
+    kprintf("pci: %02x:%02x.%u: output %u: %s\n", c->d->bus, c->d->dev, c->d->func, output, what);
 }
 
 /* Nothing is drawn into it any more, nor mapped or pinned. screen_lock held, out of the list. */
 static void screen_image_free(struct screen_image *i) {
-    fb_scanout_also_end(i->out);
+    fb_image_remove(i->out);
+    fb_buffer_unmap(i->out);
     shared_scanout_close(&i->surface);
     kfree(i);
 }
 
-/* Every image of the owner's: when its scanout is gone or no longer N_SCANOUT_DIRECT. */
-static void screen_images_end(void) {
-    while (screen_images) {
-        struct screen_image *i = screen_images;
-        screen_images = i->next;
+/* Every image of output o: when its buffers are gone or no longer N_SCANOUT_DIRECT. */
+static void screen_images_end(struct pci_output *o) {
+    for (struct screen_image **at = &screen_images; *at;) {
+        struct screen_image *i = *at;
+        if (i->output != o) {
+            at = &i->next;
+            continue;
+        }
+        *at = i->next;
         screen_image_free(i);
     }
 }
 
-/* The boot screen again, when c shows its surface, and the desktop at its size: true when it did.
-   screen_lock held. */
-static bool screen_give_back(struct pci_claim *c) {
-    if (screen_owner != c) return false;
-    screen_images_end();
-    fb_scanout_boot();
-    shared_scanout_close(&screen_surface);
-    __atomic_store_n(&screen_owner, NULL, __ATOMIC_RELEASE);
-    screen_direct = false;
-    wm_screen_resized(fb.width, fb.height);
+/* The screen of output of function d: screen 0 for output 0 of the function the boot screen is
+   drawn through, else the one it had before or a new one. screen_lock held; NULL without memory. */
+static struct screen *output_screen_of(struct pci_device *d, uint32_t output) {
+    if (output == 0 && screen_bar(d) >= 0) return screen_get(0);
+    for (size_t i = 0; i < noutput_screens; i++) {
+        struct output_screen *e = &output_screens[i];
+        if (e->bus == d->bus && e->dev == d->dev && e->func == d->func && e->output == output) return e->screen;
+    }
+    struct screen *s = screen_new();
+    if (!s) return NULL;
+    struct output_screen *e = kappend(&output_screens, &noutput_screens, &output_screens_room, sizeof *e);
+    if (!e) return NULL; /* the screen stays, off: screens are never freed */
+    *e = (struct output_screen){d->bus, d->dev, d->func, output, s};
+    return s;
+}
+
+/* Claim c's output, made when make (NULL: none, or no memory). screen_lock held. */
+static struct pci_output *output_of(struct pci_claim *c, uint32_t output, bool make) {
+    for (size_t i = 0; i < c->noutputs; i++)
+        if (c->outputs[i]->output == output) return c->outputs[i];
+    if (!make) return NULL;
+    struct screen *s = output_screen_of(c->d, output);
+    struct pci_output *o = s ? kzalloc(sizeof *o) : NULL;
+    if (!o) return NULL;
+    struct pci_output **at = kappend(&c->outputs, &c->noutputs, &c->outputs_room, sizeof *at);
+    if (!at) {
+        kfree(o);
+        return NULL;
+    }
+    *o = (struct pci_output){.claim = c, .output = output, .screen = s};
+    *at = o;
+    return o;
+}
+
+/* Whether c gives a screen buffers now. screen_lock held. */
+static bool claim_shows(struct pci_claim *c) {
+    for (size_t i = 0; i < c->noutputs; i++)
+        if (c->outputs[i]->count) return true;
+    return false;
+}
+
+/* The screen's frame asks for a flip (dev/fb.h): into the claim's slot for the output, which a
+   flip the driver has not taken yet gives up. In the compositor's thread; the slot is there
+   (give_buffers made room for every output with buffers). */
+static void output_flip(struct screen *s, void *owner, unsigned buffer, uint64_t serial) {
+    (void)s;
+    struct pci_output *o = owner;
+    struct pci_claim *c = o->claim;
+    struct n_screen_flip f = {o->output, buffer, serial};
+    uint64_t irq = spin_lock(&c->flip_lock);
+    size_t i = 0;
+    while (i < c->nflips && c->flips[i].output != o->output) i++;
+    if (i == c->nflips && c->nflips < c->flips_room) c->nflips++;
+    if (i < c->nflips) c->flips[i] = f;
+    spin_unlock(&c->flip_lock, irq);
+    wq_wake_all(&c->flip_wq);
+}
+static const struct screen_ops output_ops = {.flip = output_flip};
+
+/* The output's buffers to its screen (count 0: given back, the screen off or screen 0 the boot
+   screen again). The old ones are taken away once no frame writes there, then unmapped and their
+   surfaces closed; a flip of them the driver has not taken goes. Returns the serial of the last
+   flip of the old buffers (dev/fb.h). screen_lock held. */
+static uint64_t output_buffers(struct pci_output *o, const struct screen_mode_desc *desc, struct shared_scanout *surface,
+                               struct scanout **buf, unsigned count) {
+    struct shared_scanout old_surface[SCREEN_BUFFERS_MAX];
+    struct scanout *old_buf[SCREEN_BUFFERS_MAX];
+    unsigned old = o->count;
+    memcpy(old_surface, o->surface, sizeof old_surface);
+    memcpy(old_buf, o->buf, sizeof old_buf);
+    memset(o->surface, 0, sizeof o->surface);
+    memset(o->buf, 0, sizeof o->buf);
+    for (unsigned i = 0; i < count; i++) {
+        o->surface[i] = surface[i];
+        o->buf[i] = buf[i];
+    }
+    o->count = count;
+    o->direct = count && desc->direct;
+    if (!o->direct) screen_images_end(o); /* nothing is shown in the buffers' place now */
+    uint64_t last = screen_set_buffers(o->screen, &output_ops, o, desc, buf, count, 0);
+    struct pci_claim *c = o->claim;
+    uint64_t irq = spin_lock(&c->flip_lock);
+    for (size_t i = 0; i < c->nflips; i++)
+        if (c->flips[i].output == o->output && c->flips[i].serial <= last) {
+            c->flips[i] = c->flips[--c->nflips];
+            break;
+        }
+    spin_unlock(&c->flip_lock, irq);
+    for (unsigned i = 0; i < old; i++) {
+        fb_buffer_unmap(old_buf[i]);
+        shared_scanout_close(&old_surface[i]);
+    }
+    wm_screen_direct(screen_id(o->screen), o->direct);
+    return last;
+}
+
+/* Room in the claim's flips for every output with buffers. */
+static bool flips_room(struct pci_claim *c) {
+    size_t want = c->noutputs;
+    if (want <= c->flips_room) return true;
+    struct n_screen_flip *room = kmalloc(want * sizeof *room);
+    if (!room) return false;
+    uint64_t irq = spin_lock(&c->flip_lock);
+    memcpy(room, c->flips, c->nflips * sizeof *room);
+    struct n_screen_flip *old = c->flips;
+    c->flips = room;
+    c->flips_room = want;
+    spin_unlock(&c->flip_lock, irq);
+    kfree(old);
     return true;
+}
+
+/* Every output of c given back, its modes withdrawn: its claim ended. screen_lock held. True when
+   it gave a screen buffers. */
+static bool outputs_end(struct pci_claim *c) {
+    bool shown = false;
+    for (size_t i = 0; i < c->noutputs; i++) {
+        struct pci_output *o = c->outputs[i];
+        if (o->count) {
+            shown = true;
+            output_buffers(o, NULL, NULL, NULL, 0);
+            screen_say(c, o->output, "its driver ended while a screen was drawn into its buffers; the screen is off "
+                                     "(screen 0 the boot screen again, which the display may not show: nothing sets the "
+                                     "display engine back)");
+        }
+        if (o->modes) screen_modes_gone(screen_id(o->screen));
+        kfree(o);
+    }
+    kfree(c->outputs);
+    c->outputs = NULL;
+    c->noutputs = c->outputs_room = 0;
+    kfree(c->flips);
+    c->flips = NULL;
+    c->nflips = c->flips_room = 0;
+    return shown;
 }
 
 /* A driver that is done with its device stops it and then switches bus mastering off: that is
@@ -356,17 +510,8 @@ static void claim_release(struct object *o) {
     acpi_node_unwatch(c->acpi_watch); /* no Notify reaches the claim any more */
     c->acpi_watch = NULL;
     mutex_lock(&screen_lock);
-    bool given_back = screen_give_back(c);
-    if (screen_modes_last == c) { /* screen_modes_from is c or none */
-        screen_modes_from = screen_modes_last = NULL;
-        screen_modes_gone();
-    }
+    bool given_back = outputs_end(c);
     mutex_unlock(&screen_lock);
-    if (given_back) {
-        wm_screen_direct(false);
-        screen_say(c, "its driver ended while the desktop was drawn into its scanout; the boot screen is drawn "
-                      "again, but the display may not show it: nothing sets the display engine back");
-    }
     /* the last handle is closed: no pci_user_hold_screen of the claim's runs any more */
     if (c->screen_holds) screen_hold_end(c);
     if (!c->screen_holds && given_back) screen_repaint();
@@ -705,76 +850,121 @@ int64_t pci_user_info(struct handle *h, struct n_pci_function *out) {
     return 0;
 }
 
-int64_t pci_user_give_screen(struct handle *h, struct handle *surface, const struct n_scanout *desc) {
+static const char *format_name(uint32_t format) {
+    format &= N_SCANOUT_FORMAT_MASK;
+    return format == N_SCANOUT_XRGB2101010 ? "XRGB2101010" : format == N_SCANOUT_XBGR8888 ? "XBGR8888" : "XRGB8888";
+}
+
+int64_t pci_user_give_screen(struct handle *h, uint32_t output, const struct n_screen_buffers *b) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (c->d->cls != 0x03) return -N_ERR_DENIED;
-    mutex_lock(&screen_lock);
+    if (b && (!b->count || b->count > SCREEN_BUFFERS_MAX)) return -N_ERR_INVALID;
+    uint64_t bytes = 0;
     int64_t r = 0;
-    if (screen_owner && screen_owner != c) r = -N_ERR_BUSY;
-    else if (!surface) {
-        if (!screen_give_back(c)) r = -N_ERR_INVALID;
-        else screen_say(c, "its driver gives the boot screen back; the desktop is drawn there again");
-    } else {
-        uint64_t bytes = 0;
-        struct shared_scanout s = {0};
-        uint32_t was_w, was_h;
-        fb_screen_size(&was_w, &was_h);
-        r = fb_scanout_check(desc, &bytes);
-        if (!r) r = shared_scanout_open(surface, c, desc->offset, bytes, &s);
-        /* The desktop takes the scanout's size first: where its planes do not fit in memory, the
-           screen stays as it is. */
-        if (!r && !wm_screen_resized(desc->width, desc->height)) r = -N_ERR_NO_MEMORY;
-        if (!r) {
-            r = fb_scanout_take(s.frames, s.pages, s.type, s.first_byte, desc);
-            if (r) wm_screen_resized(was_w, was_h);
-        }
-        if (r) shared_scanout_close(&s);
-        else {
-            shared_scanout_close(&screen_surface); /* the surface shown before, no longer mapped */
-            screen_surface = s;
-            __atomic_store_n(&screen_owner, c, __ATOMIC_RELEASE);
-            screen_direct = (desc->format & N_SCANOUT_DIRECT) != 0;
-            if (!screen_direct) screen_images_end(); /* nothing is shown in the scanout's place now */
-            uint32_t format = desc->format & N_SCANOUT_FORMAT_MASK;
-            char line[160];
-            ksnprintf(line, sizeof line, "the desktop is drawn into its driver's %ux%u %s scanout (pitch %u)%s",
-                      desc->width, desc->height,
-                      format == N_SCANOUT_XRGB2101010 ? "XRGB2101010"
-                      : format == N_SCANOUT_XBGR8888  ? "XBGR8888"
-                                                      : "XRGB8888",
-                      desc->pitch, screen_direct ? ", which can show fullscreen windows directly" : "");
-            screen_say(c, line);
-        }
+    for (uint32_t i = 0; b && i < b->count && !r; i++)
+        r = fb_buffer_check(b->width, b->height, b->pitch, b->format, b->buffer[i].offset, &bytes);
+    if (r) return r;
+    /* the surfaces, before screen_lock: a handle's lookup may sleep */
+    struct handle *surfaces[SCREEN_BUFFERS_MAX] = {0};
+    for (uint32_t i = 0; b && i < b->count && !r; i++)
+        if (!(surfaces[i] = handle_get(b->buffer[i].surface))) r = -N_ERR_NO_HANDLE;
+    struct shared_scanout surface[SCREEN_BUFFERS_MAX] = {0};
+    struct scanout *buf[SCREEN_BUFFERS_MAX] = {0};
+    for (uint32_t i = 0; b && i < b->count && !r; i++) {
+        r = shared_scanout_open(surfaces[i], c, b->buffer[i].offset, bytes, &surface[i]);
+        if (!r && !(buf[i] = fb_buffer_map(surface[i].frames, surface[i].pages, surface[i].type, surface[i].first_byte,
+                                           b->width, b->height, b->pitch, b->format)))
+            r = -N_ERR_NO_MEMORY;
     }
-    bool direct = screen_direct;
-    mutex_unlock(&screen_lock);
+    for (uint32_t i = 0; i < SCREEN_BUFFERS_MAX; i++) handle_close(surfaces[i]);
+    mutex_lock(&screen_lock);
+    struct pci_output *o = r ? NULL : output_of(c, output, b != NULL);
+    if (!r && b && (!o || !flips_room(c))) r = -N_ERR_NO_MEMORY;
+    if (!r && !b && (!o || !o->count)) r = -N_ERR_INVALID;
     if (!r) {
-        wm_screen_direct(direct);
-        screen_repaint();
+        struct screen_mode_desc desc = {0};
+        if (b) {
+            desc = (struct screen_mode_desc){.width = b->width, .height = b->height,
+                                             .direct = (b->format & N_SCANOUT_DIRECT) != 0};
+            screen_modes_shown(screen_id(o->screen), &desc);
+        }
+        uint64_t last = output_buffers(o, &desc, surface, buf, b ? b->count : 0);
+        r = (int64_t)last;
+        char line[200];
+        if (b)
+            ksnprintf(line, sizeof line, "screen %u is drawn into its driver's %u %ux%u %s buffer%s (pitch %u)%s",
+                      screen_id(o->screen), b->count, b->width, b->height, format_name(b->format),
+                      b->count > 1 ? "s" : "", b->pitch, desc.direct ? ", which can show fullscreen windows directly" : "");
+        else
+            ksnprintf(line, sizeof line, "its driver gives screen %u back", screen_id(o->screen));
+        screen_say(c, output, line);
     }
+    mutex_unlock(&screen_lock);
+    if (r < 0)
+        for (uint32_t i = 0; b && i < b->count; i++) {
+            fb_buffer_unmap(buf[i]);
+            shared_scanout_close(&surface[i]);
+        }
     return r;
 }
 
-int64_t pci_user_screen_vblank(struct handle *h, uint64_t count, uint64_t timestamp_ns) {
+int64_t pci_user_screen_flips(struct handle *h, struct n_screen_flip *out, size_t max, uint64_t deadline) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
-    if (__atomic_load_n(&screen_owner, __ATOMIC_ACQUIRE) != c) return -N_ERR_DENIED;
-    wm_vblank(count, timestamp_ns);
+    if (!max) return -N_ERR_INVALID;
+    uint64_t irq = spin_lock(&c->flip_lock);
+    for (;;) {
+        if (c->nflips) {
+            size_t n = MIN(max, c->nflips);
+            memcpy(out, c->flips, n * sizeof *out);
+            memmove(c->flips, c->flips + n, (c->nflips - n) * sizeof *out);
+            c->nflips -= n;
+            spin_unlock(&c->flip_lock, irq);
+            return (int64_t)n;
+        }
+        int64_t r = 1;
+        if (thread_current()->killed) r = -N_ERR_STOPPED;
+        else if (clock_now_ns() >= deadline) r = 0;
+        if (r <= 0) {
+            spin_unlock(&c->flip_lock, irq);
+            return r;
+        }
+        /* output_flip takes flip_lock to fill a slot, then wakes flip_wq */
+        wq_wait_locked_until(&c->flip_wq, &c->flip_lock, deadline);
+        spin_take(&c->flip_lock);
+    }
+}
+
+int64_t pci_user_screen_vblank(struct handle *h, const struct n_screen_vblank *v) {
+    struct pci_claim *c = claim_of(h);
+    if (!c) return -N_ERR_WRONG_KIND;
+    if (v->buffer >= SCREEN_BUFFERS_MAX) return -N_ERR_INVALID;
+    mutex_lock(&screen_lock);
+    struct pci_output *o = output_of(c, v->output, false);
+    struct screen *s = o && o->count ? o->screen : NULL;
+    mutex_unlock(&screen_lock);
+    if (!s) return -N_ERR_DENIED;
+    /* the screen outlives the claim (screens are never freed): a blank reported as the output's
+       buffers go is a blank of a screen that no longer waits for it */
+    if (v->flip_serial) screen_flipped(s, v->buffer, v->flip_serial, v->time_ns);
+    screen_vblank(s, v->count, v->time_ns);
     return 0;
 }
 
-int64_t pci_user_screen_state(struct handle *h, uint64_t seen, struct n_screen_state *out, uint64_t deadline) {
+int64_t pci_user_screen_state(struct handle *h, uint32_t output, uint64_t seen, struct n_screen_state *out,
+                              uint64_t deadline) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     mutex_lock(&screen_lock);
-    bool ours = screen_owner == c || screen_modes_from == c;
+    struct pci_output *o = output_of(c, output, false);
+    int64_t screen = o && (o->count || o->modes) ? (int64_t)screen_id(o->screen) : -1;
     mutex_unlock(&screen_lock);
-    if (!ours) return -N_ERR_DENIED;
-    return wm_screen_state(seen, out, deadline);
+    if (screen < 0) return -N_ERR_DENIED;
+    return wm_screen_state((unsigned)screen, seen, out, deadline);
 }
 
-int64_t pci_user_screen_modes(struct handle *h, const struct n_screen_modes *m) {
+int64_t pci_user_screen_modes(struct handle *h, uint32_t output, const struct n_screen_modes *m) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (c->d->cls != 0x03) return -N_ERR_DENIED;
@@ -785,34 +975,38 @@ int64_t pci_user_screen_modes(struct handle *h, const struct n_screen_modes *m) 
             return -N_ERR_INVALID;
     int64_t r = 0;
     mutex_lock(&screen_lock);
-    if ((screen_owner && screen_owner != c) || (screen_modes_from && screen_modes_from != c)) r = -N_ERR_BUSY;
+    struct pci_output *o = output_of(c, output, m->count != 0);
+    if (!o) r = m->count ? -N_ERR_NO_MEMORY : 0;
     else {
-        screen_modes_from = m->count ? c : NULL;
-        if (m->count) screen_modes_last = c;
-        screen_modes_offer(m);
+        o->modes = m->count != 0;
+        screen_modes_offer(screen_id(o->screen), m);
     }
     mutex_unlock(&screen_lock);
     return r;
 }
 
-int64_t pci_user_screen_image(struct handle *h, struct handle *surface, const struct n_scanout *desc) {
+int64_t pci_user_screen_image(struct handle *h, uint32_t output, struct handle *surface, const struct n_scanout *desc) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     uint64_t bytes = 0;
-    int64_t r = desc->format & N_SCANOUT_DIRECT ? -N_ERR_INVALID : fb_scanout_check(desc, &bytes);
+    int64_t r = desc->format & N_SCANOUT_DIRECT
+                    ? -N_ERR_INVALID
+                    : fb_buffer_check(desc->width, desc->height, desc->pitch, desc->format, desc->offset, &bytes);
     if (r) return r;
-    struct screen_image *i = kmalloc(sizeof *i);
+    struct screen_image *i = kzalloc(sizeof *i);
     if (!i) return -N_ERR_NO_MEMORY;
-    memset(i, 0, sizeof *i);
     mutex_lock(&screen_lock);
-    if (screen_owner != c || !screen_direct) r = -N_ERR_DENIED;
+    struct pci_output *o = output_of(c, output, false);
+    if (!o || !o->direct) r = -N_ERR_DENIED;
     if (!r) r = shared_scanout_open(surface, c, desc->offset, bytes, &i->surface);
-    if (!r) {
-        r = fb_scanout_also(i->surface.frames, i->surface.pages, i->surface.type, i->surface.first_byte, desc,
-                            &i->out);
-        if (r) shared_scanout_close(&i->surface);
+    if (!r && !(i->out = fb_buffer_map(i->surface.frames, i->surface.pages, i->surface.type, i->surface.first_byte,
+                                       desc->width, desc->height, desc->pitch, desc->format))) {
+        shared_scanout_close(&i->surface);
+        r = -N_ERR_NO_MEMORY;
     }
     if (!r) {
+        fb_image_add(i->out);
+        i->output = o;
         i->number = r = ++screen_image_last;
         i->next = screen_images;
         screen_images = i;
@@ -827,8 +1021,8 @@ int64_t pci_user_screen_image_end(struct handle *h, int64_t number) {
     if (!c) return -N_ERR_WRONG_KIND;
     int64_t r = -N_ERR_INVALID;
     mutex_lock(&screen_lock);
-    for (struct screen_image **at = &screen_images; screen_owner == c && *at; at = &(*at)->next)
-        if ((*at)->number == number) {
+    for (struct screen_image **at = &screen_images; *at; at = &(*at)->next)
+        if ((*at)->number == number && (*at)->output->claim == c) {
             struct screen_image *i = *at;
             *at = i->next;
             screen_image_free(i);
@@ -944,10 +1138,10 @@ int64_t pci_user_acpi_notify_take(struct handle *h, uint64_t deadline) {
 int64_t pci_user_hold_screen(struct handle *h, bool hold) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
-    if (screen_bar(c->d) < 0 && __atomic_load_n(&screen_owner, __ATOMIC_ACQUIRE) != c) return -N_ERR_NOT_FOUND;
     int64_t r = 0;
     mutex_lock(&screen_lock);
-    if (hold) {
+    if (screen_bar(c->d) < 0 && !claim_shows(c)) r = -N_ERR_NOT_FOUND;
+    else if (hold) {
         if (c->screen_holds == UINT32_MAX) r = -N_ERR_BUSY;
         else {
             if (!c->screen_holds++) screen_hold_begin(c);

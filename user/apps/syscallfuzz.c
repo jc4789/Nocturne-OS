@@ -147,7 +147,7 @@ static const struct sysinfo_ hinfo[] = {
     {SYS_SHARED_MAP, 1}, {SYS_SHARED_VIEW, 1}, {SYS_PCI_INFO, 1}, {SYS_PCI_CONFIG_READ, 1},
     {SYS_PCI_CONFIG_WRITE, 1}, {SYS_PCI_BAR, 1}, {SYS_PCI_INTERRUPTS, 1}, {SYS_PCI_INTERRUPT_TAKE, 1},
     {SYS_DMA_CREATE, 1}, {SYS_DMA_ADDRESSES, 1},
-    {SYS_WIN_MAP, 1}, {SYS_WIN_PRESENT, 1}, {SYS_WIN_SET_TITLE, 1}, {SYS_WIN_MOVE, 1}, {SYS_WIN_RESIZE, 1},
+    {SYS_WIN_SURFACE, 1}, {SYS_WIN_ACQUIRE, 1}, {SYS_WIN_PRESENT, 1}, {SYS_WIN_SET_TITLE, 1}, {SYS_WIN_MOVE, 1}, {SYS_WIN_RESIZE, 1},
     {SYS_WIN_STATE, 1}, {SYS_WIN_PRESENTATION, 1}, {SYS_WIN_RECEIVE, 1}, {SYS_WIN_DIRECT, 1}, {SYS_WIN_FRAME, 1},
     {SYS_WATCH_TAKE, 1},
 };
@@ -173,7 +173,7 @@ static bool skipped(long n) {
 static bool badptr_only(long n) {
     switch (n) {
     case SYS_MEMORY_RELEASE: case SYS_MEMORY_PROTECT: case SYS_SHARED_MAP: case SYS_GPU_RENDER:
-    case SYS_GPU_RENDER_BATCH: case SYS_GPU_BLIT: case SYS_WIN_MAP: case SYS_WIN_PRESENT:
+    case SYS_GPU_RENDER_BATCH: case SYS_GPU_BLIT: case SYS_WIN_PRESENT:
         return true;
     }
     return false;
@@ -182,7 +182,7 @@ static bool badptr_only(long n) {
 static bool creates_handle(long n) {
     switch (n) {
     case SYS_DOCUMENT_OPEN: case SYS_CHANNEL_LISTEN: case SYS_CHANNEL_CONNECT: case SYS_CHANNEL_ACCEPT:
-    case SYS_SHARED_CREATE: case SYS_SHARED_RESERVE: case SYS_EVENTS_CREATE: case SYS_SYSTEM_LOG_OPEN:
+    case SYS_SHARED_CREATE: case SYS_SHARED_RESERVE: case SYS_EVENTS_CREATE: case SYS_SYSTEM_LOG_OPEN: case SYS_WIN_SURFACE:
     case SYS_AUDIO_OPEN: case SYS_PCI_BAR: case SYS_DMA_CREATE: case SYS_SHARED_VIEW: case SYS_AUDIO_OUTPUT_WATCH:
     case SYS_ENTRY_WATCH:
         return true;

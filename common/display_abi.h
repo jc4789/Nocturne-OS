@@ -50,7 +50,10 @@ struct desktop_settings {
    shown, shown is the firmware's mode whether or not modes are offered, its refresh 0 where no
    timing of the EDID names that size. source says what decides the desktop's size, chosen the
    mode the user chose for the monitor offered names (all 0: none), whether or not it is offered
-   now. A program built before chosen passes SCREEN_MODES_FIRST_BYTES and gets that much. */
+   now. A program built before chosen passes SCREEN_MODES_FIRST_BYTES and gets that much.
+   Each screen has its own: the third argument is the op with the screen's number in its bits
+   from 8 on (op | screen << 8; screen 0 holds the taskbar), and screens says how many there are
+   (an unknown screen: N_ERR_NOT_FOUND). */
 #define SCREEN_MODES_GET 3
 #define SCREEN_MODE_SET 4
 /* SYS_SCREEN_INFO with its third argument SCREEN_WATCH (the first two 0): a watch (N_KIND_WATCH,
@@ -78,10 +81,10 @@ struct screen_modes {
     uint32_t trial_ms;             /* the mode on trial goes back after this; 0: none is on trial */
     uint32_t refused;              /* the mode tried last could not be shown: the one before is back */
     uint32_t source;               /* SCREEN_SOURCE_* */
-    uint32_t reserved;
+    uint32_t screens;              /* the number of screens */
     struct n_screen_mode chosen;   /* the user's choice for offered.monitor (all 0: none) */
 };
-#define SCREEN_MODES_FIRST_BYTES 2176u /* the first struct screen_modes: offered to reserved */
+#define SCREEN_MODES_FIRST_BYTES 2176u /* the first struct screen_modes: offered to screens */
 /* TRY: mode (one offered, as listed) is shown on trial, and goes back to the mode before it
    unless KEEP comes within SCREEN_MODE_TRIAL_MS (BACK: at once). Another TRY during a trial
    keeps the mode to go back to. KEEP makes it the user's choice for that monitor, which the

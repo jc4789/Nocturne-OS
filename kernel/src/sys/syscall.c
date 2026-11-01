@@ -19,6 +19,7 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "mm/heap.h"
+#include "mm/vmalloc.h"
 #include "dev/fb.h"
 #include "dev/gpu.h"
 #include "dev/audio.h"
@@ -770,49 +771,93 @@ void shared_scanout_close(struct shared_scanout *s) {
     *s=(struct shared_scanout){0};
 }
 
-/* The screen drawn into a display driver's surface, or the boot screen again (dev/pciuser.c). */
-static int64_t sys_pci_give_screen(int h,int surface,const struct n_scanout *udesc) {
-    struct n_scanout desc={0};
-    if(surface!=N_SCANOUT_BOOT && copy_from_user(&desc,udesc,sizeof desc))return -N_ERR_BAD_ADDRESS;
+struct object *shared_kernel_new(size_t bytes,void **view) {
+    struct shared_pages *p;
+    if(shared_object(bytes,false,&p)<0)return NULL;
+    void *v=vmalloc_map_frames(p->pages,p->count,PTE_W|PTE_NX);
+    if(!v){shared_release(&p->object);return NULL;}
+    object_ref(&p->object);
+    *view=v;
+    return &p->object;
+}
+void shared_kernel_end(struct object *o,void *view) {
+    struct shared_pages *p=o->priv;
+    vunmap(view,p->count);
+    object_unref(o);
+}
+int64_t shared_kernel_handle(struct object *o) {
+    struct handle *h=handle_open(o,HANDLE_WRITE);
+    return h?handle_install(h):-N_ERR_NO_MEMORY;
+}
+
+/* An output's buffers a screen is drawn into, or given back (dev/pciuser.c). */
+static int64_t sys_pci_give_screen(int h,uint32_t output,const struct n_screen_buffers *ub) {
+    struct n_screen_buffers b;
+    if(ub && copy_from_user(&b,ub,sizeof b))return -N_ERR_BAD_ADDRESS;
     struct handle *pci=handle_get(h);
     if(!pci)return -N_ERR_NO_HANDLE;
-    struct handle *s=surface==N_SCANOUT_BOOT?NULL:handle_get(surface);
-    int64_t r=surface!=N_SCANOUT_BOOT && !s?-N_ERR_NO_HANDLE:pci_user_give_screen(pci,s,&desc);
-    handle_close(s);handle_close(pci);
+    int64_t r=pci_user_give_screen(pci,output,ub?&b:NULL);
+    handle_close(pci);
     return r;
 }
-/* A surface a display driver may show in its scanout's place, for the panic screen (dev/pciuser.c). */
-static int64_t sys_pci_screen_image(int h,int surface,const struct n_scanout *udesc) {
+/* The flips the screens ask of a display driver's outputs (dev/pciuser.c), copied out after. */
+#define SCREEN_FLIPS_MAX 64u
+static int64_t sys_pci_screen_flips(int h,struct n_screen_flip *uout,size_t max,int64_t timeout_ms) {
+    uint64_t deadline=syscall_deadline(timeout_ms);
+    if(!max)return -N_ERR_INVALID;
+    max=MIN(max,(size_t)SCREEN_FLIPS_MAX);
+    if(!user_ok_w(uout,max*sizeof *uout))return -N_ERR_BAD_ADDRESS;
+    struct n_screen_flip flips[SCREEN_FLIPS_MAX];
+    struct handle *pci=handle_get(h);
+    if(!pci)return -N_ERR_NO_HANDLE;
+    int64_t r=pci_user_screen_flips(pci,flips,max,deadline);
+    handle_close(pci);
+    if(r>0 && copy_to_user(uout,flips,(size_t)r*sizeof *flips))r=-N_ERR_BAD_ADDRESS;
+    return r;
+}
+/* A vertical blank of a display driver's output (dev/pciuser.c). */
+static int64_t sys_pci_screen_vblank(int h,const struct n_screen_vblank *uv) {
+    struct n_screen_vblank v;
+    if(copy_from_user(&v,uv,sizeof v))return -N_ERR_BAD_ADDRESS;
+    struct handle *pci=handle_get(h);
+    if(!pci)return -N_ERR_NO_HANDLE;
+    int64_t r=pci_user_screen_vblank(pci,&v);
+    handle_close(pci);
+    return r;
+}
+/* A surface a display driver may show in an output's buffers' place, for the panic screen. */
+static int64_t sys_pci_screen_image(int h,uint32_t output,int surface,const struct n_scanout *udesc) {
     struct n_scanout desc;
     if(copy_from_user(&desc,udesc,sizeof desc))return -N_ERR_BAD_ADDRESS;
     struct handle *pci=handle_get(h);
     if(!pci)return -N_ERR_NO_HANDLE;
     struct handle *s=handle_get(surface);
-    int64_t r=s?pci_user_screen_image(pci,s,&desc):-N_ERR_NO_HANDLE;
+    int64_t r=s?pci_user_screen_image(pci,output,s,&desc):-N_ERR_NO_HANDLE;
     handle_close(s);handle_close(pci);
     return r;
 }
-/* What the screen should show, for a driver whose scanout shows windows directly (dev/pciuser.c,
-   gui/wm.c). The state is copied out even when the time ran out. */
-static int64_t sys_pci_screen_state(int h,uint64_t seen,struct n_screen_state *uout,int64_t timeout_ms) {
+/* What an output's screen should show (dev/pciuser.c, gui/wm.c). The state is copied out even
+   when the time ran out. */
+static int64_t sys_pci_screen_state(int h,uint32_t output,uint64_t seen,struct n_screen_state *uout,int64_t timeout_ms) {
     uint64_t deadline=syscall_deadline(timeout_ms);
     if(!user_ok_w(uout,sizeof *uout))return -N_ERR_BAD_ADDRESS;
     struct handle *pci=handle_get(h);
     if(!pci)return -N_ERR_NO_HANDLE;
     struct n_screen_state *st=kmalloc(sizeof *st);
-    int64_t r=st?pci_user_screen_state(pci,seen,st,deadline):-N_ERR_NO_MEMORY;
+    int64_t r=st?pci_user_screen_state(pci,output,seen,st,deadline):-N_ERR_NO_MEMORY;
     handle_close(pci);
     if((r==0||r==-N_ERR_TIMEOUT)&&copy_to_user(uout,st,sizeof *st))r=-N_ERR_BAD_ADDRESS;
     kfree(st);
     return r;
 }
-/* A display driver's monitor and the modes it can show there (dev/pciuser.c, gui/screenmode.c). */
-static int64_t sys_pci_screen_modes(int h,const struct n_screen_modes *um) {
+/* The monitor on a display driver's output and the modes it can show there (dev/pciuser.c,
+   gui/screenmode.c). */
+static int64_t sys_pci_screen_modes(int h,uint32_t output,const struct n_screen_modes *um) {
     struct n_screen_modes *m=kmalloc(sizeof *m);
     if(!m)return -N_ERR_NO_MEMORY;
     int64_t r=copy_from_user(m,um,sizeof *m)?-N_ERR_BAD_ADDRESS:0;
     struct handle *pci=r?NULL:handle_get(h);
-    if(!r)r=pci?pci_user_screen_modes(pci,m):-N_ERR_NO_HANDLE;
+    if(!r)r=pci?pci_user_screen_modes(pci,output,m):-N_ERR_NO_HANDLE;
     handle_close(pci);
     kfree(m);
     return r;
@@ -2854,15 +2899,17 @@ void syscall_dispatch(struct regs *r) {
         break;
     }
     case SYS_PCI_BAR: ret = sys_pci_bar((int)a,(uint32_t)b); break;
-    case SYS_PCI_GIVE_SCREEN: ret = sys_pci_give_screen((int)a,(int)b,(const struct n_scanout *)c); break;
+    case SYS_PCI_GIVE_SCREEN: ret = sys_pci_give_screen((int)a,(uint32_t)b,(const struct n_screen_buffers *)c); break;
+    case SYS_PCI_SCREEN_FLIPS: ret = sys_pci_screen_flips((int)a,(struct n_screen_flip *)b,(size_t)c,(int64_t)d); break;
+    case SYS_PCI_SCREEN_VBLANK: ret = sys_pci_screen_vblank((int)a,(const struct n_screen_vblank *)b); break;
     case SYS_PCI_ACPI_EVAL: ret = sys_pci_acpi_eval((int)a,(const struct n_acpi_eval *)b,(void *)c,d); break;
-    case SYS_PCI_SCREEN_STATE: ret = sys_pci_screen_state((int)a,b,(struct n_screen_state *)c,(int64_t)d); break;
-    case SYS_PCI_SCREEN_IMAGE: ret = sys_pci_screen_image((int)a,(int)b,(const struct n_scanout *)c); break;
-    case SYS_PCI_SCREEN_MODES: ret = sys_pci_screen_modes((int)a,(const struct n_screen_modes *)b); break;
+    case SYS_PCI_SCREEN_STATE: ret = sys_pci_screen_state((int)a,(uint32_t)b,c,(struct n_screen_state *)d,(int64_t)e); break;
+    case SYS_PCI_SCREEN_IMAGE: ret = sys_pci_screen_image((int)a,(uint32_t)b,(int)c,(const struct n_scanout *)d); break;
+    case SYS_PCI_SCREEN_MODES: ret = sys_pci_screen_modes((int)a,(uint32_t)b,(const struct n_screen_modes *)c); break;
     case SYS_DMA_CREATE: ret = sys_dma_create((int)a,b,(uint32_t)c); break;
     case SYS_DMA_ADDRESSES: ret = sys_dma_addresses((int)a,b,(uint64_t *)c,d); break;
     case SYS_PCI_INFO: case SYS_PCI_CONFIG_READ: case SYS_PCI_CONFIG_WRITE:
-    case SYS_PCI_INTERRUPTS: case SYS_PCI_INTERRUPT_TAKE: case SYS_PCI_HOLD_SCREEN: case SYS_PCI_SCREEN_VBLANK:
+    case SYS_PCI_INTERRUPTS: case SYS_PCI_INTERRUPT_TAKE: case SYS_PCI_HOLD_SCREEN:
     case SYS_PCI_ACPI_NOTIFY_TAKE: case SYS_PCI_SCREEN_IMAGE_END: {
         struct handle *f = handle_get((int)a);
         if (!f) { ret = -N_ERR_NO_HANDLE; break; }
@@ -2874,7 +2921,6 @@ void syscall_dispatch(struct regs *r) {
         else if (r->rax == SYS_PCI_CONFIG_WRITE) ret = pci_user_config_write(f,(uint32_t)b,(uint32_t)c,(uint32_t)d);
         else if (r->rax == SYS_PCI_INTERRUPTS) ret = pci_user_interrupts(f,(uint32_t)b);
         else if (r->rax == SYS_PCI_HOLD_SCREEN) ret = pci_user_hold_screen(f, b != 0);
-        else if (r->rax == SYS_PCI_SCREEN_VBLANK) ret = pci_user_screen_vblank(f, b, c);
         else if (r->rax == SYS_PCI_ACPI_NOTIFY_TAKE) ret = pci_user_acpi_notify_take(f, syscall_deadline((int64_t)b));
         else if (r->rax == SYS_PCI_SCREEN_IMAGE_END) ret = pci_user_screen_image_end(f, (int64_t)b);
         else ret = pci_user_interrupt_take(f,syscall_deadline((int64_t)b));

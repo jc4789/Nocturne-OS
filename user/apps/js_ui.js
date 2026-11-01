@@ -423,11 +423,13 @@ internal.ui = Object.freeze({
         sound: () => host.sound(),
         setVolume: volume => host.sound(Math.round(Number(volume))),
         setMuted: muted => host.sound(undefined, !!muted),
-        /* The monitor's modes (struct screen_modes, display_abi.h). */
-        modes: () => host.screenModes(),
-        tryMode: m => host.screenModeSet('try', m.width >>> 0, m.height >>> 0, m.refreshMillihertz >>> 0),
-        keepMode: () => host.screenModeSet('keep', 0, 0, 0),
-        backMode: () => host.screenModeSet('back', 0, 0, 0),
+        /* A screen's monitor and its modes (struct screen_modes, display_abi.h); screen 0 has the
+           taskbar. */
+        modes: (screen = 0) => host.screenModes(screen >>> 0),
+        tryMode: (m, screen = 0) =>
+            host.screenModeSet('try', m.width >>> 0, m.height >>> 0, m.refreshMillihertz >>> 0, screen >>> 0),
+        keepMode: (screen = 0) => host.screenModeSet('keep', 0, 0, 0, screen >>> 0),
+        backMode: (screen = 0) => host.screenModeSet('back', 0, 0, 0, screen >>> 0),
         /* listener(changed: "screen", "sound") after what get(), modes() or sound() report changed,
            whoever changed it; returns the function that stops it. A watch alone does not keep the
            program running. */

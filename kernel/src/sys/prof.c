@@ -267,6 +267,8 @@ static void prof_thread(void *arg) {
     }
 }
 
+uint64_t prof_window_ns(void) { return __atomic_load_n(&enabled, __ATOMIC_ACQUIRE) ? (uint64_t)period_ms * NS_PER_MS : 0; }
+
 void prof_init(void) {
     uint64_t ms = 0;
     bool timed = cmdline_number("prof_ms", &ms) && ms >= 100 && ms <= 600000;
