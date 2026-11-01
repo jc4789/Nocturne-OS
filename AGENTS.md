@@ -99,4 +99,4 @@ Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは
 
 
 ## 
-The User's machine has a Ryzen 5 7600X, 32GB of DDR5 RAM, and a RTX 4070, resizable bar enabled.
+The User's machine has a Ryzen 5 7600X, 32GB of DDR5 RAM, and a RTX 4070, resizable bar enabled. WE should not hardcode or harddesgin to this specific machine
