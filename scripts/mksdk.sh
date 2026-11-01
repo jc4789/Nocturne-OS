@@ -85,7 +85,7 @@ while ((${#pending[@]})); do
     done < <(sed -n 's/^[[:space:]]*#[[:space:]]*\(include\|embed\)[[:space:]]*"\([^"]*\)".*/\1 \2/p' "$f")
 done
 
-strip_obj() { objcopy --strip-debug -R .eh_frame -R .llvm_addrsig -R .comment "$1" "$2"; }
+strip_obj() { objcopy --strip-debug -R .llvm_addrsig -R .comment "$1" "$2"; }
 
 dest=libc
 crt0=
