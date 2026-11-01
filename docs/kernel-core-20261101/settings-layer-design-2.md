@@ -1462,6 +1462,8 @@ AGENTS.md「カーネルを変えずに済まない案なら書く前にユー�
 - 再起動を要る設定は例外である。持ち主の言葉は「A reboot should never be needed in 99%of cases.」である。
 - 全部をファイルとして扱う考えは禁止である。持ち主の言葉は「everything as a file is a BANNED concept.」である。
 
+持ち主の指摘：「multiple layers are getting blurred right now. One is ui. One is system process, one is kernel. 3 different things」。この設計は三つを混ぜている。§0 の 3・4・12 と §2 の仲立ちは、値の写し・保存・試行・文法をカーネルに置く。作り直しでは、窓、システムのプロセス、カーネルの責務を分けて書き、適用のボタンは窓だけの事とする。
+
 次は設計の中で決めきれなかったことである。
 
 - `nvrm/*` の 3D の値を利用者の持ち手に置いた。NVIDIA の公式の文書に、全体の profile が機械か利用者かの記述を読めなかった。
