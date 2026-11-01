@@ -364,6 +364,7 @@ struct uiwin {
     uint64_t now, redraw_at, caret_at;
     bool dirty, animating, caret_on, hold;
     bool frame_wanted;       /* a surface changed, or the app asked ('F'), since the last UI_EVENT_FRAME */
+    bool animation_frame;    /* an animation's next picture waits for the display's next frame */
     /* The focused field's text as the engine edits it: ahead of the app's views, so keys
        that come before the app has sent back the last value build on it, not on the view. */
     char *edit;
@@ -2648,6 +2649,10 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
         }
         break;
     case EV_FRAME: /* also after pictures of widgets alone, which nobody waits for */
+        if (w->animation_frame) {
+            w->animation_frame = false;
+            w->dirty = true;
+        }
         if (w->frame_wanted) {
             w->frame_wanted = false;
             emit(w, UI_EVENT_FRAME, NULL, 0, 0, e->y / 1e6, 0, NULL, 0); /* ns to ms */
@@ -2827,10 +2832,14 @@ static bool find_damage(struct uiwin *w) {
     return true;
 }
 
-/* When the window needs its next picture (0: when something changes). */
-static uint64_t next_picture(const struct uiwin *w) {
+/* When the window needs its next picture (0: when something changes). An animation's comes with
+   the display's next frame (EV_FRAME), at any refresh rate, and waits while the window is not shown. */
+static uint64_t next_picture(struct uiwin *w) {
     if (w->hold) return w->now + 100;
-    if (w->animating) return w->now + 16;
+    if (w->animating && win_frame(w->win) == 0) {
+        w->animation_frame = true;
+        return 0;
+    }
     if (w->spin) return w->now + 33 - w->now % 33; /* the next step of a spinner */
     return 0;
 }
