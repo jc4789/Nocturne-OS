@@ -538,7 +538,7 @@ static bool port_up_failed(struct port *p) {
 }
 
 /* PxCMD.ST set, which needs a working device (10.1.2). After a non-queued command's error the
-   engine is stopped alone (6.2.2.1, 10.4.1); a COMRESET is for a device that stays busy or has no
+   engine is stopped alone (6.2.2.1); a COMRESET is for a device that stays busy or has no
    link, a queued command's error, and the start. h->reset held where a thread may sleep, the port
    to the caller (sole), no command in it. A reset asked for meanwhile (a link change) is left asked
    for, the port not live. False leaves it not live. */
@@ -663,15 +663,20 @@ static bool hba_set_up(struct hba *h, bool after_reset) {
     return true;
 }
 
-/* The port running with its disk ready for commands (10.1.2, 10.3.1): the adapter set up if it
-   needs that, then the port. Where nothing may sleep (a power change, the disks held) it spins, and
-   no other thread is at the adapter. */
+/* The adapter set up if it needs that. h->reset held where a thread may sleep. */
+static bool hba_ready(struct hba *h) {
+    bool ok = !__atomic_load_n(&h->dead, __ATOMIC_ACQUIRE);
+    if (ok && __atomic_exchange_n(&h->lost, false, __ATOMIC_ACQ_REL)) ok = hba_set_up(h, false);
+    return ok;
+}
+
+/* The port running with its disk ready for commands (10.1.2, 10.3.1): the adapter first, then the
+   port. Where nothing may sleep (a power change, the disks held) it spins, and no other thread is
+   at the adapter. */
 static bool port_start(struct port *p) {
     struct hba *h = p->h;
     bool held = hba_lock(h);
-    bool ok = !__atomic_load_n(&h->dead, __ATOMIC_ACQUIRE);
-    if (ok && __atomic_exchange_n(&h->lost, false, __ATOMIC_ACQ_REL)) ok = hba_set_up(h, false);
-    ok = ok && port_up(p);
+    bool ok = hba_ready(h) && port_up(p);
     hba_unlock(h, held);
     return ok;
 }
@@ -797,12 +802,11 @@ static void halt(struct port *p, uint32_t bit) {
     p->attention = false;
     spin_unlock(&p->lock, f);
     wake_slots(p, woken);
-    /* after an adapter reset its engines are stopped, and what it set up is not this one's to stop */
-    if (!__atomic_load_n(&p->h->lost, __ATOMIC_ACQUIRE) && !port_stop(p)) {
-        bool held = hba_lock(p->h);
-        port_force_stop(p);
-        hba_unlock(p->h, held);
-    }
+    /* An adapter reset under way ends first: until GHC.HR falls (10.4.3) its engines may still move
+       data. After one they are stopped, and what it set up is not this one's to stop. */
+    bool held = hba_lock(p->h);
+    if (!__atomic_load_n(&p->h->lost, __ATOMIC_ACQUIRE) && !port_stop(p)) port_force_stop(p);
+    hba_unlock(p->h, held);
     f = spin_lock(&p->lock);
     woken = finish(p, p->issued, FAILED);
     p->halting = false;
@@ -916,7 +920,10 @@ static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queu
             continue;
         }
         if (clock_now_ns() >= deadline) {
-            if (!timed_out) kprintf("ahci%d: port %u: command %02x timed out\n", p->h->index, p->no, fis[2]);
+            if (!timed_out) {
+                kprintf("ahci%d: port %u: command %02x timed out\n", p->h->index, p->no, fis[2]);
+                if (p->disk) blk_cache_lost(&p->disk->blk); /* a disk that does not answer may have started over */
+            }
             timed_out = true;
             halt(p, bit); /* fails it, or another caller is doing so */
             deadline = clock_after(NS_PER_MS);
@@ -1013,7 +1020,11 @@ static int blk_ahci_write(struct blkdev *b, uint64_t lba, uint32_t n, const void
 }
 
 /* FLUSH CACHE (EXT): the write cache reaches the medium, with every write that ended before it. */
-static int blk_ahci_persist(struct blkdev *b) { return flush(b->priv) < 0 ? -N_ERR_IO : 0; }
+/* A disk's cache may come on or go off with its power: IDENTIFY says each time it is looked at (word 85). */
+static int blk_ahci_persist(struct blkdev *b) {
+    struct disk *d = b->priv;
+    return __atomic_load_n(&d->cache, __ATOMIC_ACQUIRE) && flush(d) < 0 ? -N_ERR_IO : 0;
+}
 
 /* count contiguous pages the adapter reaches, on its node first. */
 static uint64_t alloc_dma(struct hba *h, unsigned count) {
@@ -1135,10 +1146,10 @@ static void port_examine(struct port *p) {
     if (again) {
         uint64_t wait = p->retry_ns ? MIN(2 * p->retry_ns, (uint64_t)RETRY_MOST_NS) : RETRY_NS;
         __atomic_store_n(&p->retry_ns, wait, __ATOMIC_RELEASE);
-        p->retry_at = clock_after(wait);
+        __atomic_store_n(&p->retry_at, clock_after(wait), __ATOMIC_RELEASE);
     } else {
         __atomic_store_n(&p->retry_ns, 0, __ATOMIC_RELEASE);
-        p->retry_at = 0;
+        __atomic_store_n(&p->retry_at, 0, __ATOMIC_RELEASE);
         for (struct disk *d = p->disks; is_disk && d && !known; d = d->older)
             if (same_disk(d, found)) known = d;
         if (had && had != known && !__atomic_exchange_n(&had->blk.gone, true, __ATOMIC_ACQ_REL))
@@ -1147,6 +1158,7 @@ static void port_examine(struct port *p) {
             if (__atomic_exchange_n(&known->blk.gone, false, __ATOMIC_ACQ_REL))
                 kprintf("ahci%d: port %u: %s is back\n", h->index, p->no, known->blk.name);
             blk_cache_lost(&known->blk); /* it says nothing of whether the power went with the link (7.3) */
+            __atomic_store_n(&known->cache, found->cache, __ATOMIC_RELEASE);
             p->disk = known;
         } else if (is_disk) {
             found->p = p;
@@ -1179,13 +1191,14 @@ static void port_examine(struct port *p) {
     found->blk.block = found->block;
     found->blk.read = blk_ahci_read;
     found->blk.write = blk_ahci_write;
-    if (found->cache) found->blk.persist = blk_ahci_persist;
+    found->blk.persist = blk_ahci_persist;
     found->blk.priv = found;
+    const char *cache = found->cache ? "" : ", no write cache now";
     if (found->ncq)
-        kprintf("ahci%d: port %u: %s, %u queued commands at once\n", h->index, p->no, model,
-                (unsigned)__builtin_popcount(found->all));
+        kprintf("ahci%d: port %u: %s, %u queued commands at once%s\n", h->index, p->no, model,
+                (unsigned)__builtin_popcount(found->all), cache);
     else
-        kprintf("ahci%d: port %u: %s, one command at a time\n", h->index, p->no, model);
+        kprintf("ahci%d: port %u: %s, one command at a time%s\n", h->index, p->no, model, cache);
     blk_register(&found->blk);
 }
 
@@ -1204,7 +1217,9 @@ static void port_changed(struct port *p) {
 
 /* The adapter's thread. What it does counts as a request of the disks (blk_busy_begin): a power
    change waits for it, and it waits for that. It looks again at the ports whose devices did not
-   answer, once their time comes. Polled, it looks at the links itself each second. */
+   answer, once their time comes. Polled, it looks at the links itself each second. Of the ports to
+   look at, the next is one where a device shows: an empty one takes its COMRESET's whole time, and a
+   disk's callers are waiting. */
 static void ahci_worker(void *arg) {
     struct hba *h = arg;
     for (;;) {
@@ -1216,9 +1231,10 @@ static void ahci_worker(void *arg) {
             struct port *p = h->ports[n];
             if (!p) continue;
             if (!h->irq) reap(p);
-            if (!p->retry_at) continue;
-            if (now >= p->retry_at) changed |= 1u << n;
-            else next = MIN(next, p->retry_at);
+            uint64_t retry_at = __atomic_load_n(&p->retry_at, __ATOMIC_ACQUIRE);
+            if (!retry_at) continue;
+            if (now >= retry_at) changed |= 1u << n;
+            else next = MIN(next, retry_at);
         }
         changed &= h->implemented;
         if (!changed) {
@@ -1226,8 +1242,21 @@ static void ahci_worker(void *arg) {
             continue;
         }
         blk_busy_begin();
-        for (uint32_t m = changed; m; m &= m - 1)
-            if (h->ports[__builtin_ctz(m)]) port_changed(h->ports[__builtin_ctz(m)]);
+        bool held = hba_lock(h);
+        hba_ready(h);
+        hba_unlock(h, held);
+        while (changed) {
+            unsigned pick = (unsigned)__builtin_ctz(changed);
+            for (uint32_t m = changed; m; m &= m - 1) {
+                struct port *p = h->ports[__builtin_ctz(m)];
+                if (p && rd(p, PxSSTS) & DET_FOUND) {
+                    pick = (unsigned)__builtin_ctz(m);
+                    break;
+                }
+            }
+            changed &= ~(1u << pick);
+            if (h->ports[pick]) port_changed(h->ports[pick]);
+        }
         blk_busy_end();
     }
 }
@@ -1278,10 +1307,12 @@ static void start(struct hba *h) {
 
 /* On a board that spins its disks up in turn, before the power goes away (10.10.3): a disk told to
    stand by has its interface put in Slumber (step 2), by an adapter that may (3.1.1 SSC), with the
-   engine still running, which is where it takes the request (5.3.2.11, 5.3.4.2). */
+   engine still running, which is where it takes the request (5.3.2.11, 5.3.4.2). Its PhyRdy going is
+   no event (7.3.1.2): port_listen opens the port's interrupts again. */
 static void port_to_slumber(struct port *p) {
     if (!p->h->sss || !p->h->ssc || !__atomic_load_n(&p->live, __ATOMIC_ACQUIRE)) return;
     if ((rd(p, PxSSTS) & IPM_MASK) != IPM_ACTIVE) return;
+    wr(p, PxIE, 0);
     wr(p, PxSCTL, (rd(p, PxSCTL) & ~0xF0Fu) | SCTL_SLUMBER_ALONE(p->h));
     wr(p, PxCMD, (rd(p, PxCMD) & ~CMD_ICC) | CMD_ICC_SLUMBER);
     wait_reg(p, PxSSTS, IPM_MASK, IPM_SLUMBER, LINK_NS);
@@ -1316,7 +1347,7 @@ static bool ahci_quiesce(void *arg) {
                 uint8_t fis[20];
                 fis_make(fis, ATA_STANDBY_IMMEDIATE, 0, 0, false, false);
                 fis[7] = 0;
-                if ((d->cache && flush(d)) || command(d, fis, false, true, false, NULL, 0, READY_NS)) all = false;
+                if ((__atomic_load_n(&d->cache, __ATOMIC_ACQUIRE) && flush(d)) || command(d, fis, false, true, false, NULL, 0, READY_NS)) all = false;
                 else port_to_slumber(p);
             }
             if (port_stop(p)) {

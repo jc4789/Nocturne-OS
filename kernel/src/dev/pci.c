@@ -841,6 +841,22 @@ static struct mutex reset_mutex;
    one is counted (pci_suspend). reset_lock. */
 static unsigned resets_running;
 
+/* An FLR left every entry of the MSI-X table masked with its message forgotten (7.7.2.8), and the
+   table is not in what a reset saves: the entries with an irq get their messages again and open. */
+static void msix_entries_again(struct pci_device *d) {
+    if (!d->msix_table || !d->msix_irqs) return;
+    for (unsigned i = 0; i < d->msix_entries; i++) {
+        if (!d->msix_irqs[i]) continue;
+        if (!irq_msi_rewrite(d->msix_irqs[i])) {
+            kprintf("pci: %02x:%02x.%u: MSI-X entry %u could not be written after its reset\n", d->bus, d->dev, d->func, i);
+            continue;
+        }
+        volatile uint32_t *vc = d->msix_table + i * 4 + 3;
+        mmio_write32(vc, mmio_read32(vc) & ~1u);
+    }
+    (void)mmio_read32(d->msix_table + 3);
+}
+
 /* reset_lock taken around a record change AML's accesses read. */
 static void reset_phase_set(struct pci_reset *r, enum reset_phase phase) {
     uint64_t f = spin_lock(&reset_lock);
@@ -1026,6 +1042,7 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
     links_retrain(true);
     /* still mastering: the next attempt finds it ready and writes the configuration again */
     if (!present(d) || (pci_read16(d->bus, d->dev, d->func, PCI_COMMAND) & PCI_COMMAND_MASTER)) return false;
+    msix_entries_again(d);
     reset_free(d);
     return true;
 }

@@ -397,6 +397,13 @@ void irq_msi_writer(struct irq *irq, bool (*write)(struct irq *irq, void *writer
     mutex_unlock(&requests);
 }
 
+bool irq_msi_rewrite(struct irq *irq) {
+    mutex_lock(&requests);
+    bool ok = irq->write && irq->write(irq, irq->writer);
+    mutex_unlock(&requests);
+    return ok;
+}
+
 struct irq *irq_request_gsi(const struct irq_spec *spec, unsigned gsi) {
     struct irq *irq = irq_new(spec, KIND_GSI);
     struct line *fresh = kzalloc(sizeof *fresh), *l;

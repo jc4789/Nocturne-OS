@@ -165,7 +165,8 @@ bool pci_requests_done(const struct pci_device *d);
    mastering off. Configuration waits for the FLR to complete (100 ms, or a valid Readiness
    Time Reporting FLR Time); then the Vendor ID read may give RRS, or fail where the Root
    Complex stops retrying, until the reported FLR Time, or 1.0 s without one (the time 6.6.1
-   and 5.10.1 give before a function may be declared broken; 6.6.2 itself sets no limit). False
+   and 5.10.1 give before a function may be declared broken; 6.6.2 itself sets no limit). The MSI-X
+   entries of the irqs pci_irq_enable gave it are written again and opened. False
    when it has no FLR, is gone, is still mastering afterwards, or is not configuration-ready
    yet. An unfinished reset keeps its saved configuration for a later call (d->reset);
    cancellation must not discard or recapture that state. A call cancelled in an FLR's waits

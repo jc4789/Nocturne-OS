@@ -27,6 +27,7 @@
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "sys/clock.h"
+#include "sys/thread.h"
 #include "sys/wait.h"
 
 #define ADMIN_ENTRIES 32
@@ -158,10 +159,11 @@ struct nvme {
        held (blk_hold). */
     bool woke;
     /* One stop at a time (controller_stop), taken inside reset_lock and alone by a command that
-       ran out of time. stops moves on when one has ended; cut: the controller does not stop, its
-       bus mastering is off and it stays out of use. */
+       ran out of time. stops moves on when one has ended; stopped: the last one's end, its bus
+       mastering off if false; cut: the controller does not stop, and it stays out of use. */
     struct mutex stop_lock;
     uint64_t stops;
+    bool stopped;
     bool cut;
     struct mutex reset_lock; /* enable: at start, after a sleep, after a timeout */
     uint8_t *ident;          /* a page for identify, at start */
@@ -318,46 +320,63 @@ static bool wait_ready(struct nvme *c, bool ready, bool past_fatal) {
     }
 }
 
+/* CSTS.RDY fallen, and no fatal status left that the reset was to clear (9.5). */
+static bool controller_idle(struct nvme *c) {
+    return wait_ready(c, false, false) && !(rd32(c, CSTS) & CSTS_CFS);
+}
+
 /* The controller stopped by a Controller Reset (CC.EN to 0 and CSTS.RDY following, 3.7.2): nothing
    it held moves any more, so every command in it fails and its caller may take the memory back.
    A shutdown it may have notified ends with this write: SHN is written back as 00b, or the
    same write would begin another (Figure 41). EN does not fall while RDY reads 0, which is undefined
    (Figure 41): RDY is given its time to rise, whatever else the status says. A controller where this
-   cannot be done, or does not end, gets the other Controller Level Reset, the Function Level Reset
-   (3.7.2), the fatal status asking for a reset above all (9.5). One that still does not stop has its
-   bus mastering turned off, and stays out of use with its namespaces. `seen`: c->stops as the caller
-   read it; a stop that ended since has done this for it. */
-static void controller_stop(struct nvme *c, uint64_t seen) {
+   cannot be done, or does not end, or stays fatal, gets the other Controller Level Reset, the
+   Function Level Reset (3.7.2). The reset of a healthy controller loses nothing of what it completed
+   (Figure 41, EN); nothing says that of a fatal status, of one gone from the bus or of a Function
+   Level Reset, and its cache may be gone. One that still does not stop has its bus mastering turned
+   off, and stays out of use with its namespaces. If the reset was only called off, its thread being
+   killed (dev/pci.h), the next request goes on with it. `seen`: c->stops as the caller read it; a stop
+   that ended since has done this for it. What the last stop came to is returned. */
+static bool controller_stop(struct nvme *c, uint64_t seen) {
     mutex_lock(&c->stop_lock);
     if (__atomic_load_n(&c->stops, __ATOMIC_ACQUIRE) == seen) {
         controller_down(c);
-        uint32_t cc = rd32(c, CC);
-        bool stopped = false;
+        uint32_t cc = rd32(c, CC), csts = rd32(c, CSTS);
+        bool stopped = false, lost = csts == 0xFFFFFFFFu || csts & CSTS_CFS;
         if (cc != 0xFFFFFFFFu && cc & CC_EN) {
             wait_ready(c, true, true);
             if (rd32(c, CSTS) & CSTS_RDY) {
                 wr32(c, CC, cc & ~(CC_EN | CC_SHN));
-                stopped = wait_ready(c, false, false);
+                stopped = controller_idle(c);
             }
         } else if (cc != 0xFFFFFFFFu) {
-            stopped = wait_ready(c, false, false);
-        }
-        if (!stopped && pci_function_reset(c->pci)) { /* its configuration comes back with no bus mastering */
-            pci_enable_busmaster(c->pci);
-            stopped = wait_ready(c, false, false);
+            stopped = controller_idle(c);
         }
         if (!stopped) {
-            kprintf("nvme%d: controller did not reset, turned off\n", c->index);
-            __atomic_store_n(&c->cut, true, __ATOMIC_RELEASE);
-            pci_disable_busmaster(c->pci, NULL);
-            for (struct ns *s = c->found; s; s = s->next) __atomic_store_n(&s->blk.gone, true, __ATOMIC_RELEASE);
+            lost = true;
+            if (pci_function_reset(c->pci)) stopped = controller_idle(c);
         }
+        if (lost)
+            for (struct ns *s = c->found; s; s = s->next) blk_cache_lost(&s->blk);
+        if (!stopped) {
+            pci_disable_busmaster(c->pci, NULL);
+            if (thread_current() && thread_current()->killed) {
+                kprintf("nvme%d: its reset was called off with its thread\n", c->index);
+            } else {
+                kprintf("nvme%d: controller did not reset, turned off\n", c->index);
+                __atomic_store_n(&c->cut, true, __ATOMIC_RELEASE);
+                for (struct ns *s = c->found; s; s = s->next) __atomic_store_n(&s->blk.gone, true, __ATOMIC_RELEASE);
+            }
+        }
+        c->stopped = stopped;
         queue_clear(&c->admin);
         unsigned nio = __atomic_load_n(&c->nio, __ATOMIC_ACQUIRE);
         for (unsigned i = 0; i < nio; i++) queue_clear(&c->io[i]);
         __atomic_add_fetch(&c->stops, 1, __ATOMIC_RELEASE);
     }
+    bool stopped = c->stopped;
     mutex_unlock(&c->stop_lock);
+    return stopped;
 }
 
 /* Enters a command on q in the free slot `id` (sq_lock held): the entry, then its doorbell. */
@@ -643,8 +662,8 @@ static void vectors_enable(struct nvme *c) {
 static bool enable(struct nvme *c) {
     if (__atomic_load_n(&c->cut, __ATOMIC_ACQUIRE)) return false;
     __atomic_add_fetch(&c->generation, 1, __ATOMIC_RELEASE);
-    controller_stop(c, __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE));
-    if (__atomic_load_n(&c->cut, __ATOMIC_ACQUIRE)) return false;
+    if (!controller_stop(c, __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE))) return false;
+    pci_enable_busmaster(c->pci); /* a Function Level Reset's configuration comes back without it */
     wr32(c, AQA, (ADMIN_ENTRIES - 1u) << 16 | (ADMIN_ENTRIES - 1u));
     wr64(c, ASQ, c->admin.sq_phys);
     wr64(c, ACQ, c->admin.cq_phys);

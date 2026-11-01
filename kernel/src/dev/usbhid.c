@@ -240,6 +240,12 @@ static int scale_abs(const struct value *v, int32_t raw) {
     return (int)((int64_t)(raw - v->min) * MOUSE_ABS_MAX / (v->max - v->min));
 }
 
+/* The value is in this report: of its ID, and whole in the `len` bytes that came (a short packet ends
+   a report, HID 8.4). */
+static bool value_came(const struct value *v, uint8_t report, unsigned len) {
+    return v->present && v->report == report && v->bit + v->size <= len * 8;
+}
+
 /* Buttons, motion and wheel may each come in a report of their own (HID 1.11 5.6): a report
  * updates what it carries, and buttons it does not carry keep their last state. */
 static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, unsigned len, uint64_t at) {
@@ -247,15 +253,15 @@ static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, uns
     bool any = false;
     uint8_t buttons = h->buttons;
     for (int i = 0; i < 8; i++) {
-        if (!h->button[i].present || h->button[i].report != report) continue;
+        if (!value_came(&h->button[i], report, len)) continue;
         any = true;
         if (bits_at(data, len, h->button[i].bit, 1)) buttons |= 1u << i;
         else buttons &= ~(1u << i);
     }
     e.buttons = buttons & 7;
-    if (h->x.present && h->x.report == report) {
+    if (value_came(&h->x, report, len)) {
         any = true;
-        bool has_y = h->y.present && h->y.report == report;
+        bool has_y = value_came(&h->y, report, len);
         int32_t x = value_of(&h->x, data, len), y = has_y ? value_of(&h->y, data, len) : 0;
         bool x_good = in_range(&h->x, x), y_good = has_y && in_range(&h->y, y);
         if (h->x.relative) {
@@ -269,7 +275,7 @@ static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, uns
             e.y = h->last_y;
         }
     }
-    if (h->wheel.present && h->wheel.report == report) {
+    if (value_came(&h->wheel, report, len)) {
         any = true;
         int32_t w = value_of(&h->wheel, data, len);
         e.wheel = in_range(&h->wheel, w) ? -w : 0;

@@ -99,7 +99,8 @@ bool usb_open_endpoints(struct usb_device *d, const struct usb_ep_info *eps, int
 bool usb_stream_start(struct usb_device *d, uint8_t address, unsigned len, unsigned count, usb_report_fn fn, void *ctx);
 /* One bulk transfer of up to 64 KiB, waited for. One caller at a time on an endpoint (the class
  * driver's lock). Returns 0, USB_STALL, USB_TIMEOUT, or -1 (error or removal); after any but 0 the
- * endpoint needs usb_clear_halt; *moved, in each case, is the bytes that did move, received ones in buf. */
+ * endpoint needs usb_clear_halt; *moved, but for USB_TIMEOUT where it is 0, is the bytes that did move,
+ * received ones in buf. */
 int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, unsigned timeout_ms, unsigned *moved);
 /* Reset a pipe on both sides: the controller's endpoint state and data toggle, then
  * CLEAR_FEATURE(ENDPOINT_HALT) on the device. */

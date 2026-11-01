@@ -95,6 +95,9 @@ enum { EP_DISABLED, EP_RUNNING, EP_HALTED, EP_STOPPED, EP_ERROR };
 #define PS_WRC (1u << 19)
 #define PS_PRC (1u << 21)
 #define PS_WPR (1u << 31)
+#define PS_PLC (1u << 22)
+#define WARM_DOUBLINGS 6 /* a stuck root port's next warm reset: at most 64 s on */
+#define PLS_RXDETECT 5
 #define PLS_INACTIVE 6
 #define PLS_COMPLIANCE 10
 #define PS_CHANGES (0x7Fu << 17)
@@ -113,8 +116,8 @@ enum { EP_DISABLED, EP_RUNNING, EP_HALTED, EP_STOPPED, EP_ERROR };
 #define ERDP_EHB 8u
 /* IMODI of an interrupter without interrupt endpoints: at most one interrupt per 250 us (in 250 ns
    units, 5.5.2.2) gathers the completions of bulk streams and command bursts. The one that carries
-   the interrupt endpoints has none: each of those completes at most once per its own service
-   interval, so it cannot storm, and a report waits for nothing. */
+   the interrupt endpoints has none: each of those completes at most once per packet of its own
+   service interval, so it cannot storm, and a report waits for nothing. */
 #define IMODI_GATHER 1000
 #define HALT_NS (16 * NS_PER_MS)      /* USBSTS.HCH follows USBCMD.R/S within this (5.4.2) */
 #define COMMAND_ABORT_NS (5 * NS_PER_S) /* an aborted command's ring stops within this (4.6.1.2) */
@@ -262,7 +265,10 @@ struct usb_hc {
     uint8_t port_major[256]; /* USB major revision of each root port, from the protocol capabilities */
     uint8_t port_slot_type[256];
     uint8_t port_hubs[256];  /* the most hubs before a root port's devices, 0: USB's own limit (Table 7-14) */
-    uint8_t port_warms[256]; /* warm resets of a root port that stays stuck (the worker's) */
+    /* A root port that stays stuck (the worker's): its warm resets in a row, and when the next may
+       be, longer each time; 0: not stuck. */
+    uint8_t port_warms[256];
+    uint64_t port_warm_at[256];
     const uint32_t *port_psi[256]; /* its protocol's speed table (7.2.1), once for good */
     uint8_t port_psic[256];
 };
@@ -858,12 +864,13 @@ static bool set_dequeue(struct xdev *xd, unsigned dci, struct ring *r) {
 }
 
 /* Bring a halted or stuck endpoint back to its ring's enqueue point on the controller's side alone: a
-   control endpoint, or a transfer given up (pipe_reset is for the device's side too). False leaves the
-   old TRBs in place, so nothing may be queued after them. */
+   control endpoint, or a transfer given up (pipe_reset is for the device's side too). A split transaction
+   that failed can leave its TT's buffer busy (USB 2.0 11.17.5), one given up as much as one that halted.
+   False leaves the old TRBs in place, so nothing may be queued after them. */
 static bool endpoint_recover(struct xdev *xd, unsigned dci, struct ring *r, unsigned type, unsigned address) {
     bool halted;
     if (!endpoint_quiet(xd, dci, &halted)) return false;
-    if (halted) tt_clear(xd, type, address, out_ctx(xd, 0)[3] & 0xFF);
+    tt_clear(xd, type, address, out_ctx(xd, 0)[3] & 0xFF);
     return set_dequeue(xd, dci, r);
 }
 
@@ -921,7 +928,7 @@ static int control(struct xdev *xd, uint8_t type, uint8_t request, uint16_t valu
 }
 
 /* A data stage that does not fit the device's page has 64 KiB of its own, all of wLength (USB 2.0
-   9.3.5), aligned as they are, so one TRB may cover it (4.11.7.1); kept if the controller may still
+   9.3.5), aligned as they are, so one TRB may cover it (6.4.1); kept if the controller may still
    be using it. */
 #define CONTROL_LONG_PAGES 16
 
@@ -1244,6 +1251,7 @@ static bool pipe_reset(struct xdev *xd, struct endpoint *ep) {
         return false;
     }
     state_set(xd, dci, EP_RUNNING);
+    tt_clear(xd, ep->type, ep->address, out_ctx(xd, 0)[3] & 0xFF);
     return usb_control(d, 0x02, USB_REQ_CLEAR_FEATURE, 0, ep->address, NULL, 0) >= 0;
 }
 
@@ -1549,18 +1557,23 @@ static unsigned speed_kind_of_psi(unsigned major, uint32_t psi) {
 }
 
 /* The Port Speed of a device of this kind and rank (USB 3.2 7.5.4.5.1) behind root port p: the listed one
-   of its rate, 20 Gb/s for Gen2x2 and 10 for the two below (Table 7-13); by default the ID of Table 7-13. */
+   of its rate, 20 Gb/s for Gen2x2 and 10 for the two below (Table 7-13), the ID of Table 7-13 if that is
+   among them, since a PSI does not say the lanes of Gen1x2 and Gen2x1; by default that ID. */
 static unsigned port_speed_id(const struct usb_hc *hc, unsigned p, unsigned kind, unsigned rank) {
     uint64_t rate = rank == 3 ? 20000000000ull : 10000000000ull;
-    unsigned first = 0;
+    unsigned own = kind != USB_SPEED_SUPER_PLUS ? kind : rank == 1 ? 6 : rank == 3 ? 7 : 5;
+    unsigned of_rate = 0, of_kind = 0;
     for (unsigned i = 0; i < hc->port_psic[p]; i++) {
         uint32_t psi = hc->port_psi[p][i];
         if (speed_kind_of_psi(hc->port_major[p], psi) != kind) continue;
-        if (kind != USB_SPEED_SUPER_PLUS || psi_rate(psi) == rate) return psi & 15;
-        if (!first) first = psi & 15;
+        if (kind != USB_SPEED_SUPER_PLUS) return psi & 15;
+        if (psi_rate(psi) == rate) {
+            if ((psi & 15) == own) return own;
+            if (!of_rate) of_rate = psi & 15;
+        }
+        if (!of_kind) of_kind = psi & 15;
     }
-    if (first) return first;
-    return kind != USB_SPEED_SUPER_PLUS ? kind : rank == 1 ? 6 : rank == 3 ? 7 : 5;
+    return of_rate ? of_rate : of_kind ? of_kind : own;
 }
 
 /* The kind of a Port Speed that root port p reads. */
@@ -1752,6 +1765,15 @@ static bool link_trained(struct usb_hc *hc, unsigned p) {
     return false;
 }
 
+/* In Error (Inactive) or Compliance a USB3 port reads no connection (Figure 4-27), and a device that
+   stays there has only a reset to take it out (4.19.1.2.5). A device that leaves passes through
+   Inactive by itself, which alone sets no PLC (Table 5-27, footnote 94); so Inactive is taken from a
+   read with PLC, or from a port that was stuck before. */
+static bool port_stuck(const struct usb_hc *hc, unsigned p, uint32_t sc) {
+    unsigned pls = PS_PLS(sc);
+    return pls == PLS_COMPLIANCE || (pls == PLS_INACTIVE && (sc & PS_PLC || hc->port_warm_at[p]));
+}
+
 static void root_port(struct usb_hc *hc, unsigned p) {
     uint32_t sc = rd32(hc->op, PORTSC(p));
     wr32(hc->op, PORTSC(p), (sc & PS_KEEP) | (sc & PS_CHANGES));
@@ -1761,12 +1783,14 @@ static void root_port(struct usb_hc *hc, unsigned p) {
         hc->root[p] = NULL;
         usb_remove(&gone->dev);
     }
-    bool usb3 = hc->port_major[p] >= 3;
-    /* In Error (Inactive) or Compliance a USB3 port reads no connection, and only a reset takes it out
-       (Figure 4-27, 4.19.1.2.5). A warm reset that does not help comes back here: a few tries. */
-    bool stuck = usb3 && (PS_PLS(sc) == PLS_INACTIVE || PS_PLS(sc) == PLS_COMPLIANCE);
-    if (!stuck) hc->port_warms[p] = 0;
-    else if (++hc->port_warms[p] > 3) return;
+    bool usb3 = hc->port_major[p] >= 3, stuck = usb3 && port_stuck(hc, p, sc);
+    if (stuck) {
+        /* it stays stuck or comes back here: tried less and less often, for a good device to come */
+        uint64_t now = clock_now_ns();
+        if (now < hc->port_warm_at[p]) return;
+        if (hc->port_warms[p] < WARM_DOUBLINGS) hc->port_warms[p]++;
+        hc->port_warm_at[p] = now + (NS_PER_S << hc->port_warms[p]);
+    }
     if ((!(sc & PS_CCS) && !stuck) || hc->root[p]) return;
     if (!usb3) {
         sleep_until(clock_after(100 * NS_PER_MS)); /* connect debounce (USB 2.0 7.1.7.3, TATTDB) */
@@ -1786,9 +1810,28 @@ static void root_port(struct usb_hc *hc, unsigned p) {
         }
         unsigned id = (sc >> 10) & 15;
         if ((hc->root[p] = device_attach(hc, NULL, p, p, 0, port_speed_kind(hc, p, id), id, port_speed_rank(hc, p, id),
-                                         0, 0, 0)))
+                                         0, 0, 0))) {
+            hc->port_warms[p] = 0;
+            hc->port_warm_at[p] = 0;
             break;
+        }
         sleep_until(clock_after(100 * NS_PER_MS));
+    }
+}
+
+/* A USB3 port entering Compliance sets no change flag (4.19.1.2.4.1), and one tried again and still
+   stuck has none left: looked at on the worker's second. One that has become free of it is forgotten. */
+static void hc_stuck_ports(struct usb_hc *hc) {
+    uint64_t now = clock_now_ns();
+    for (unsigned p = 1; p <= hc->max_ports; p++) {
+        if (hc->port_major[p] < 3 || hc->root[p] || now < hc->port_warm_at[p]) continue;
+        uint32_t sc = rd32(hc->op, PORTSC(p));
+        if (port_stuck(hc, p, sc)) {
+            __atomic_fetch_or(&hc->port_pending[p >> 5], 1u << (p & 31), __ATOMIC_RELEASE);
+        } else if (PS_PLS(sc) == PLS_RXDETECT && !(sc & PS_CCS)) {
+            hc->port_warms[p] = 0;
+            hc->port_warm_at[p] = 0;
+        }
     }
 }
 
@@ -2160,6 +2203,7 @@ static void hc_worker(void *arg) {
             hc->failed = true;
             hc_restart(hc, false);
         }
+        if (hc_running(hc)) hc_stuck_ports(hc);
         hc_ports(hc);
         hc_recover(hc);
         hc_devices(hc);

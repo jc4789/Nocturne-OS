@@ -88,9 +88,11 @@ int blk_read(struct blkdev *d, uint64_t lba, uint32_t n, void *buf) {
 }
 
 /* A write is counted once the device has it (or gave up on it, which may have changed the medium
-   too); a persist covers the writes counted before it began. */
+   too); a persist covers the writes counted before it began. From its beginning its first parts may
+   be in the device's cache: blk_cache_lost looks at that. */
 int blk_write(struct blkdev *d, uint64_t lba, uint32_t n, const void *buf) {
     enter();
+    __atomic_add_fetch(&d->began, 1, __ATOMIC_SEQ_CST);
     int r = d->write(d, lba, n, buf);
     __atomic_add_fetch(&d->written, 1, __ATOMIC_SEQ_CST);
     leave();
@@ -112,7 +114,8 @@ int blk_by_blocks(struct blkdev *d, bool write, uint64_t lba, uint32_t count, ui
         if (whole && direct) {
             if (move(ctx, write, first, n, p) < 0) return -N_ERR_IO;
         } else if (write) {
-            /* another request's bytes in the same block are not to be written back as they were */
+            /* another part of the same block being written is not written back as it was; a write
+               of a whole block beside this one is the caller's to keep apart, as any two that overlap */
             if (!whole) mutex_lock(&d->partial);
             int r = whole ? 0 : move(ctx, false, first, n, bounce);
             if (r >= 0) {
@@ -134,11 +137,11 @@ int blk_by_blocks(struct blkdev *d, bool write, uint64_t lba, uint32_t count, ui
 
 /* Nothing written since a persist that ended began: the medium has it all already. Persists on
    other CPUs at once each flush what they found unpersisted; the device's driver puts them one
-   after the other. */
+   after the other. A loss of its cache is looked at after the flush, which may have waited for the
+   device to come back. */
 int blk_persist(struct blkdev *d) {
     if (!d->persist) return 0;
     enter();
-    bool lost = __atomic_exchange_n(&d->cache_lost, false, __ATOMIC_SEQ_CST);
     uint64_t upto = __atomic_load_n(&d->written, __ATOMIC_SEQ_CST);
     int r = 0;
     if (__atomic_load_n(&d->persisted, __ATOMIC_SEQ_CST) < upto && !(r = d->persist(d))) {
@@ -146,7 +149,7 @@ int blk_persist(struct blkdev *d) {
         while (was < upto && !__atomic_compare_exchange_n(&d->persisted, &was, upto, false, __ATOMIC_SEQ_CST,
                                                           __ATOMIC_SEQ_CST)) {}
     }
-    if (!r && lost) r = -N_ERR_IO;
+    if (!r && __atomic_load_n(&d->cache_lost, __ATOMIC_SEQ_CST)) r = -N_ERR_IO;
     leave();
     return r ? failed(d, "cache flush", 0, 0, r) : 0;
 }
@@ -176,6 +179,6 @@ struct thread *blk_holder(void) {
 }
 
 void blk_cache_lost(struct blkdev *d) {
-    if (__atomic_load_n(&d->persisted, __ATOMIC_SEQ_CST) < __atomic_load_n(&d->written, __ATOMIC_SEQ_CST))
+    if (__atomic_load_n(&d->persisted, __ATOMIC_SEQ_CST) < __atomic_load_n(&d->began, __ATOMIC_SEQ_CST))
         __atomic_store_n(&d->cache_lost, true, __ATOMIC_SEQ_CST);
 }

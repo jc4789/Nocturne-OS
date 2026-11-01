@@ -124,7 +124,8 @@ static bool flush_disks(void) {
     for (int i = 0; i < blk_count(); i++) {
         struct blkdev *d = blk_get(i);
         if (__atomic_load_n(&d->gone, __ATOMIC_ACQUIRE)) continue; /* what it held left with it */
-        if (blk_persist(d) < 0) ok = false; /* blk logs it */
+        /* blk logs it; what a disk's cache lost before (blk_cache_lost) a sleep does not make worse */
+        if (blk_persist(d) < 0 && !__atomic_load_n(&d->cache_lost, __ATOMIC_ACQUIRE)) ok = false;
     }
     return ok;
 }

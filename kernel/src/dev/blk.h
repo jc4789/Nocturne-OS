@@ -24,10 +24,12 @@ struct blkdev {
     bool gone;       /* atomic: the device left (unplugged, its adapter dead). The device stays listed
                         and its requests fail; a power change does not wait for what it cannot keep */
     uint32_t errors;    /* failed requests since the device appeared (atomic) */
-    uint64_t written;   /* writes the device took, ever (atomic, blk.c) */
+    uint64_t began;     /* writes given to the device, ever (atomic, blk.c) */
+    uint64_t written;   /* of them, the ones it took (atomic, blk.c) */
     uint64_t persisted; /* of them, the ones a persist that ended began after (atomic, blk.c) */
-    bool cache_lost;    /* written since the last persist may be gone, whatever the next one says (atomic) */
-    struct mutex partial; /* a write of part of a block: its read, change and write, one at a time */
+    bool cache_lost;    /* blk_cache_lost: for good, every persist fails (atomic) */
+    struct mutex partial; /* parts of a block written at once: each one's read, change and write
+                             whole, so none writes back another's bytes as they were */
     int (*read)(struct blkdev *d, uint64_t lba, uint32_t count, void *buf);
     int (*write)(struct blkdev *d, uint64_t lba, uint32_t count, const void *buf);
     /* Everything written so far reaches the medium. NULL: the device keeps no volatile cache. */
@@ -57,9 +59,12 @@ void blk_hold(void);
 void blk_release(void);
 /* The thread blk_hold let through, NULL when there is none. */
 struct thread *blk_holder(void);
-/* The device came back from losing its link, and may have lost power with it: what its volatile
-   cache held may be gone, which a flush of what is left cannot tell. The next blk_persist fails if
-   anything was written since the last one. */
+/* The device may have started over (it lost its link and maybe its power with it, it stopped
+   answering, its controller failed), with no document saying that its volatile cache outlives that:
+   what that held may be gone, which a flush of what is left cannot tell. If anything was given to
+   it since the last blk_persist, every blk_persist fails from here on, once it has flushed, so that
+   whoever wrote that finds out, whichever of them comes first. A volume there goes no further, and
+   the medium keeps the last commit that was whole. */
 void blk_cache_lost(struct blkdev *d);
 /* A driver's own thread at work on its disks counts as a transfer under way: blk_hold waits for it,
    and it waits for blk_release. */
