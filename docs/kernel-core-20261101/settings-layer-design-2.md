@@ -1456,6 +1456,12 @@ AGENTS.md「カーネルを変えずに済まない案なら書く前にユー�
 6. §10.5 の起動の項目「既定の設定で」である。起動の画面に項目が一つ増え、カーネルの起動引数を一つ読む。
 7. `C:\Users` を `STORE_SYSTEM` にする案は、4 の文書の場所のためのものなので、4 と一緒に作り直す。
 
+持ち主が足した条件。この設計の全部がこれに従う。
+
+- 設定は、適用のボタンが押された時に効く。持ち主の言葉は「Settings are applied when the apply button is pressed.」である。
+- 再起動を要る設定は例外である。持ち主の言葉は「A reboot should never be needed in 99%of cases.」である。
+- 全部をファイルとして扱う考えは禁止である。持ち主の言葉は「everything as a file is a BANNED concept.」である。
+
 次は設計の中で決めきれなかったことである。
 
 - `nvrm/*` の 3D の値を利用者の持ち手に置いた。NVIDIA の公式の文書に、全体の profile が機械か利用者かの記述を読めなかった。
