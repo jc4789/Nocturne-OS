@@ -707,7 +707,7 @@ static int claim_attach(struct pci_claim *c) {
         int r = iommu_attach(c->d, &c->domain, &m);
         if (r != -N_ERR_NOT_READY || !m) return r;
         bool peer = m != c->d; /* c->d is reserved by the caller */
-        if (peer && (m->claimed || iommu_in_use(m))) return r;
+        if (peer && (m->claimed || m->kernel_owned || iommu_in_use(m))) return r;
         if (peer) m->claimed = true;
         bool done = reset_finish(c, m);
         if (peer) m->claimed = false;

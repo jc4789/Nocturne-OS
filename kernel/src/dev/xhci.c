@@ -88,6 +88,7 @@ enum { EP_DISABLED, EP_RUNNING, EP_HALTED, EP_STOPPED, EP_ERROR };
 #define HCC2_LEC (1u << 4)
 #define PS_CCS 1u
 #define PS_PED (1u << 1)
+#define PS_OCA (1u << 3)
 #define PS_PR (1u << 4)
 #define PS_PLS(sc) (((sc) >> 5) & 15)
 #define PS_PP (1u << 9)
@@ -1746,13 +1747,13 @@ static bool port_reset(struct usb_hc *hc, unsigned p, bool warm) {
         seen = __atomic_load_n(&hc->kicks, __ATOMIC_ACQUIRE);
     }
     sc = rd32(hc->op, PORTSC(p));
-    /* this PLC, gone with the write, is all that may ever say the link fell Inactive (port_stuck) */
-    if (hc->port_major[p] >= 3 && PS_PLS(sc) == PLS_INACTIVE && (sc & PS_PLC) && !hc->port_tries[p].at)
-        hc->port_tries[p].at = clock_now_ns();
     wr32(hc->op, PORTSC(p), (sc & PS_KEEP) | (sc & PS_CHANGES));
     sleep_until(clock_after(10 * NS_PER_MS)); /* reset recovery (USB 2.0 7.1.7.5, TRSTRCY) */
     return rd32(hc->op, PORTSC(p)) & PS_PED;
 }
+
+/* PLS means something: not during a reset (4.19.1.2.5), not without power (Table 5-27). */
+static bool link_known(uint32_t sc) { return (sc & PS_PP) && !(sc & PS_PR); }
 
 /* A USB3 root port's link trains by itself and is enabled then, which comes as a port status
    change; a stuck link (inactive, compliance) does not, and asks for a warm reset. False at the deadline. */
@@ -1762,7 +1763,7 @@ static bool link_trained(struct usb_hc *hc, unsigned p) {
         uint32_t sc = rd32(hc->op, PORTSC(p));
         if (sc & PS_PED) return true;
         unsigned pls = PS_PLS(sc);
-        if (pls == PLS_INACTIVE || pls == PLS_COMPLIANCE || clock_now_ns() >= deadline) return false;
+        if ((link_known(sc) && (pls == PLS_INACTIVE || pls == PLS_COMPLIANCE)) || clock_now_ns() >= deadline) return false;
         wq_wait_unless(&hc->work_wq, &hc->kicks, seen, deadline);
         seen = __atomic_load_n(&hc->kicks, __ATOMIC_ACQUIRE);
     }
@@ -1772,37 +1773,52 @@ static bool link_trained(struct usb_hc *hc, unsigned p) {
 /* In Error (Inactive) or Compliance a USB3 port reads no connection (Figure 4-27), and a device that
    stays there has only a reset to take it out (4.19.1.2.5). A device that leaves passes through
    Inactive by itself, which alone sets no PLC (Table 5-27, footnote 94); so Inactive is taken from a
-   read with PLC, or from a port being tried. During a reset PLS means nothing (4.19.1.2.5). */
+   read with PLC, or from a port being tried. */
 static bool port_stuck(const struct usb_hc *hc, unsigned p, uint32_t sc) {
     unsigned pls = PS_PLS(sc);
-    if (sc & PS_PR) return false;
+    if (!link_known(sc)) return false;
     return pls == PLS_COMPLIANCE || (pls == PLS_INACTIVE && (sc & PS_PLC || hc->port_tries[p].at));
 }
 
-/* A port with something at it and no device yet: a few resets, or a warm one for a link stuck. */
-static void root_port_attach(struct usb_hc *hc, unsigned p) {
-    bool usb3 = hc->port_major[p] >= 3;
-    if (!usb3) {
-        sleep_until(clock_after(100 * NS_PER_MS)); /* connect debounce (USB 2.0 7.1.7.3, TATTDB) */
-        if (!(rd32(hc->op, PORTSC(p)) & PS_CCS)) return;
-    }
-    for (int attempt = 0; attempt < 3 && hc_running(hc); attempt++) {
-        if (usb3) {
-            if (!link_trained(hc, p) || attempt) port_reset(hc, p, true);
-        } else {
-            port_reset(hc, p, false);
-        }
-        uint32_t sc = rd32(hc->op, PORTSC(p));
-        if (!(sc & PS_CCS)) return;
-        if (!(sc & PS_PED)) {
-            kprintf("usb: controller %d port %u connected but not enabled (%08x)\n", hc->index, p, sc);
-            continue;
-        }
-        unsigned id = (sc >> 10) & 15;
-        if ((hc->root[p] = device_attach(hc, NULL, p, p, 0, port_speed_kind(hc, p, id), id, port_speed_rank(hc, p, id),
-                                         0, 0, 0)))
-            return;
+/* Nothing is at the port: a USB3 port that is back in RxDetect, a USB2 port with no connection. */
+static bool port_empty(const struct usb_hc *hc, unsigned p, uint32_t sc) {
+    return !(sc & PS_CCS) && link_known(sc) && (hc->port_major[p] < 3 || PS_PLS(sc) == PLS_RXDETECT);
+}
+
+/* The connection stable for TATTDB, which a disconnection begins again (USB 2.0 7.1.7.3). */
+static bool connect_debounced(struct usb_hc *hc, unsigned p) {
+    for (int i = 0; i < USB_DEBOUNCES; i++) {
         sleep_until(clock_after(100 * NS_PER_MS));
+        uint32_t sc = rd32(hc->op, PORTSC(p));
+        if (!(sc & PS_CCS)) return false;
+        if (!(sc & PS_CSC)) return true;
+        wr32(hc->op, PORTSC(p), (sc & PS_KEEP) | PS_CSC);
+    }
+    return false;
+}
+
+/* One try at a port with something at it and no device yet. */
+static void root_port_attach(struct usb_hc *hc, unsigned p) {
+    bool usb3 = hc->port_major[p] >= 3, retry = hc->port_tries[p].count > 1;
+    if (usb3) {
+        if (!link_trained(hc, p) || retry) port_reset(hc, p, true);
+    } else {
+        if (!retry && !connect_debounced(hc, p)) return;
+        port_reset(hc, p, false);
+    }
+    uint32_t sc = rd32(hc->op, PORTSC(p));
+    if (!(sc & PS_CCS)) return;
+    if (!(sc & PS_PED)) {
+        kprintf("usb: controller %d port %u connected but not enabled (%08x)\n", hc->index, p, sc);
+        return;
+    }
+    unsigned id = (sc >> 10) & 15;
+    hc->root[p] = device_attach(hc, NULL, p, p, 0, port_speed_kind(hc, p, id), id, port_speed_rank(hc, p, id), 0, 0, 0);
+    /* not left in its Default state (4.19.5's note). A USB3 port is not disabled: its way back is a
+       write to PLS (Table 5-27), and a warm reset comes first. */
+    if (!hc->root[p] && !usb3) {
+        sc = rd32(hc->op, PORTSC(p));
+        wr32(hc->op, PORTSC(p), (sc & PS_KEEP) | PS_PED);
     }
 }
 
@@ -1815,13 +1831,23 @@ static void root_port(struct usb_hc *hc, unsigned p) {
         hc->root[p] = NULL;
         usb_remove(&gone->dev);
     }
-    bool stuck = hc->port_major[p] >= 3 && port_stuck(hc, p, sc);
-    if ((!(sc & PS_CCS) && !stuck) || hc->root[p] || !usb_port_try(&hc->port_tries[p])) return;
+    struct usb_port_tries *t = &hc->port_tries[p];
+    if (sc & PS_CSC) usb_port_free(t); /* what was being tried is not what comes now */
+    if (!(sc & PS_PP) && !(sc & PS_OCA)) {
+        /* an over-current took its power and is over: on again, its 20 ms (Table 5-27, 5.4.8; USB 2.0 11.12.5) */
+        wr32(hc->op, PORTSC(p), (sc & PS_KEEP) | PS_PP);
+        sleep_until(clock_after(20 * NS_PER_MS));
+        sc = rd32(hc->op, PORTSC(p));
+    }
+    bool usb3 = hc->port_major[p] >= 3, stuck = usb3 && port_stuck(hc, p, sc);
+    if ((!(sc & PS_CCS) && !stuck) || hc->root[p] || !usb_port_try(t)) return;
     root_port_attach(hc, p);
-    usb_port_tried(&hc->port_tries[p], hc->root[p] != NULL);
+    sc = rd32(hc->op, PORTSC(p));
+    if (hc->root[p] || port_empty(hc, p, sc)) usb_port_free(t);
+    else usb_port_failed(t, usb3 && !(sc & PS_CCS));
 }
 
-/* What no event tells, on the worker's second. A change flag that came between a read and its write
+/* What no event tells, each round of the worker, at the latest a second apart. A change flag that came between a read and its write
    back stays set, and no event comes while one does (4.19.2). A USB3 port entering Compliance sets no
    flag: neither the PLC table of Table 5-27 nor 4.19.2 has it, and a controller without CTC goes in by
    itself (5.3.9, 4.19.1.2.4.1). Leaving Inactive for RxDetect sets none either (4.19.1.2.6). And a
@@ -1833,9 +1859,8 @@ static void hc_ports_again(struct usb_hc *hc) {
         if (!hc->port_major[p]) continue;
         uint32_t sc = rd32(hc->op, PORTSC(p));
         if (sc == 0xFFFFFFFFu) continue;
-        bool usb3 = hc->port_major[p] >= 3, stuck = usb3 && port_stuck(hc, p, sc);
-        if (!(sc & PS_CCS) && !(sc & PS_PR) && !stuck && (!usb3 || PS_PLS(sc) == PLS_RXDETECT))
-            usb_port_free(&hc->port_tries[p]);
+        bool stuck = hc->port_major[p] >= 3 && port_stuck(hc, p, sc);
+        if (port_empty(hc, p, sc)) usb_port_free(&hc->port_tries[p]);
         if ((sc & PS_CHANGES) || (!hc->root[p] && now >= hc->port_tries[p].at && (stuck || sc & PS_CCS)))
             __atomic_fetch_or(&hc->port_pending[p >> 5], 1u << (p & 31), __ATOMIC_RELEASE);
     }
@@ -1850,7 +1875,7 @@ static void hc_ports(struct usb_hc *hc) {
             unsigned b = __builtin_ctz(bits);
             bits &= bits - 1;
             unsigned p = w * 32 + b;
-            if (p >= 1 && p <= hc->max_ports) root_port(hc, p);
+            if (p >= 1 && p <= hc->max_ports && hc->port_major[p]) root_port(hc, p);
         }
     }
 }
@@ -1912,12 +1937,17 @@ static void hc_devices(struct usb_hc *hc) {
     }
 }
 
+/* Its devices may yet appear. A controller that does not run has none coming. */
 static bool hc_busy(struct usb_hc *hc) {
+    if (!hc_running(hc)) return false;
     for (unsigned w = 0; w < 8; w++)
         if (__atomic_load_n(&hc->port_pending[w], __ATOMIC_ACQUIRE)) return true;
+    for (unsigned p = 1; p <= hc->max_ports; p++)
+        if (usb_port_trying(&hc->port_tries[p])) return true;
     for (unsigned s = 1; s <= hc->max_slots; s++) {
         struct xdev *xd = hc->slots[s];
-        if (xd && !removed(&xd->dev) && (__atomic_load_n(&xd->work, __ATOMIC_ACQUIRE) || usbhub_pending(&xd->dev)))
+        if (xd && !removed(&xd->dev) && (__atomic_load_n(&xd->work, __ATOMIC_ACQUIRE) || usbhub_pending(&xd->dev) ||
+                                         usbhub_trying(&xd->dev)))
             return true;
     }
     return false;
@@ -2227,7 +2257,7 @@ static void hc_worker(void *arg) {
         /* the next look: a recovery retry, settling, else the second after which the controller's
            status is looked at again (a fatal error raises no event) */
         uint64_t next = MIN(hc->retry_at, now + NS_PER_S);
-        if (!hc->settled) next = MIN(next, settle_at);
+        if (!hc->settled && now < settle_at) next = MIN(next, settle_at);
         if (next > now) wq_wait_unless(&hc->work_wq, &hc->kicks, seen, next);
     }
 }

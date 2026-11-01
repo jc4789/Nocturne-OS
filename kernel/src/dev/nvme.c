@@ -333,8 +333,9 @@ static bool controller_idle(struct nvme *c) {
    (Figure 41): RDY is given its time to rise, whatever else the status says. A controller where this
    cannot be done, or does not end, or stays fatal, gets the other Controller Level Reset, the
    Function Level Reset (3.7.2). The reset of a healthy controller loses nothing of what it completed
-   (Figure 41, EN); nothing says that of a fatal status, of one gone from the bus or of a Function
-   Level Reset, and its cache may be gone. One that still does not stop has its bus mastering turned
+   (Figure 41, EN); nothing says that of a fatal status, of one gone from the bus, of a Function
+   Level Reset or of EN found 0 while it was in use, a reset no one here asked for (3.7.2), and its
+   cache may be gone. One that still does not stop has its bus mastering turned
    off, and stays out of use with its namespaces. If the reset was only called off, its thread being
    killed (dev/pci.h), the next request goes on with it. A Function Level Reset left unfinished is not
    to be reached by anything but its next call, and has its bus mastering off already (dev/pci.h, 6.6.2):
@@ -343,6 +344,7 @@ static bool controller_idle(struct nvme *c) {
 static bool controller_stop(struct nvme *c, uint64_t seen) {
     mutex_lock(&c->stop_lock);
     if (__atomic_load_n(&c->stops, __ATOMIC_ACQUIRE) == seen) {
+        bool in_use = __atomic_load_n(&c->live, __ATOMIC_ACQUIRE);
         controller_down(c);
         bool resetting = pci_reset_left(c->pci);
         uint32_t cc = resetting ? 0xFFFFFFFFu : rd32(c, CC), csts = resetting ? 0xFFFFFFFFu : rd32(c, CSTS);
@@ -354,6 +356,7 @@ static bool controller_stop(struct nvme *c, uint64_t seen) {
                 stopped = controller_idle(c);
             }
         } else if (cc != 0xFFFFFFFFu) {
+            lost = lost || in_use;
             stopped = controller_idle(c);
         }
         if (!stopped) {
@@ -432,6 +435,12 @@ static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t 
             status = s->status;
             if (result) *result = s->result;
             break;
+        }
+        /* A stop is under way, which ends this command: the function may be in its Function Level
+           Reset, which nothing else is to reach (PCIe 6.6.2). */
+        if (!__atomic_load_n(q == &c->admin ? &c->live : &c->ready, __ATOMIC_ACQUIRE)) {
+            wq_wait_unless(&s->wq, &s->seq, seen, clock_after(NS_PER_MS));
+            continue;
         }
         if (!c->nvectors) {
             f = spin_lock(&q->cq_lock);
@@ -671,7 +680,10 @@ static void vectors_enable(struct nvme *c) {
 static bool enable(struct nvme *c) {
     if (__atomic_load_n(&c->cut, __ATOMIC_ACQUIRE)) return false;
     __atomic_add_fetch(&c->generation, 1, __ATOMIC_RELEASE);
-    if (!controller_stop(c, __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE))) return false;
+    /* a stop whose thread gave up, ended just as this came, is not this thread's answer */
+    if (!controller_stop(c, __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE)) &&
+        !(__atomic_load_n(&c->called_off, __ATOMIC_ACQUIRE) && controller_stop(c, __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE))))
+        return false;
     pci_enable_busmaster(c->pci); /* a Function Level Reset's configuration comes back without it */
     wr32(c, AQA, (ADMIN_ENTRIES - 1u) << 16 | (ADMIN_ENTRIES - 1u));
     wr64(c, ASQ, c->admin.sq_phys);
@@ -739,14 +751,14 @@ down:
     return false;
 }
 
-/* After a command failed with FAILED: the controller reset once by whichever caller comes first
-   (generation still `seen`), the others then finding it up again; or, if that caller's thread was
-   killed and gave up on it, going on with it themselves. */
+/* After a command failed with FAILED: up now, a reset has been done since. Else the controller reset
+   once by whichever caller comes first (generation still `seen`), the others finding that it did not
+   come up; or, if that caller's thread was killed and gave up on it, going on with it themselves. */
 static bool recover(struct nvme *c, uint64_t seen) {
     mutex_lock(&c->reset_lock);
     bool moved = __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE) != seen;
     bool ready = __atomic_load_n(&c->ready, __ATOMIC_ACQUIRE);
-    bool ok = moved && (ready || !__atomic_load_n(&c->called_off, __ATOMIC_ACQUIRE)) ? ready : enable(c);
+    bool ok = ready || (moved && !__atomic_load_n(&c->called_off, __ATOMIC_ACQUIRE) ? false : enable(c));
     mutex_unlock(&c->reset_lock);
     return ok;
 }
@@ -987,7 +999,10 @@ static bool nvme_shutdown(void *arg) {
     (void)arg;
     bool all = true;
     for (struct nvme *c = ctrls; c; c = c->next) {
-        if (!c->regs || __atomic_load_n(&c->cut, __ATOMIC_ACQUIRE) || CSTS_SHST(rd32(c, CSTS)) == SHST_DONE) continue;
+        /* a Function Level Reset left unfinished is not to be reached, and counted its cache lost */
+        if (!c->regs || __atomic_load_n(&c->cut, __ATOMIC_ACQUIRE) || pci_reset_left(c->pci) ||
+            CSTS_SHST(rd32(c, CSTS)) == SHST_DONE)
+            continue;
         if (__atomic_load_n(&c->live, __ATOMIC_ACQUIRE)) {
             __atomic_store_n(&c->ready, false, __ATOMIC_RELEASE);
             delete_queues(c);

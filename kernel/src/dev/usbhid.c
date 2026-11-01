@@ -67,6 +67,7 @@ struct hid {
     struct value x, y, wheel, button[8];
     uint8_t buttons;
     int last_x, last_y;   /* an absolute pointer's place, kept through a value out of range (HID 5.10) */
+    bool x_known, y_known;
 };
 
 /* Every HID interface, under hids_lock: a caps lock press on one keyboard asks every keyboard's
@@ -264,12 +265,18 @@ static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, uns
         any = true;
         int32_t x = x_came ? value_of(&h->x, data, len) : 0, y = y_came ? value_of(&h->y, data, len) : 0;
         bool x_good = x_came && in_range(&h->x, x), y_good = y_came && in_range(&h->y, y);
-        if (x_came ? h->x.relative : h->y.relative) {
-            e.dx = x_good ? x : 0;
-            e.dy = y_good ? y : 0;
-        } else {
-            if (x_good) h->last_x = scale_abs(&h->x, x);
-            if (y_good) h->last_y = scale_abs(&h->y, y);
+        if (x_good && h->x.relative) e.dx = x;
+        if (y_good && h->y.relative) e.dy = y;
+        if (x_good && !h->x.relative) {
+            h->last_x = scale_abs(&h->x, x);
+            h->x_known = true;
+        }
+        if (y_good && !h->y.relative) {
+            h->last_y = scale_abs(&h->y, y);
+            h->y_known = true;
+        }
+        /* a place only once each of its axes has said where */
+        if ((h->x.present && !h->x.relative && h->x_known) && (!h->y.present || h->y.relative || h->y_known)) {
             e.absolute = true;
             e.x = h->last_x;
             e.y = h->last_y;

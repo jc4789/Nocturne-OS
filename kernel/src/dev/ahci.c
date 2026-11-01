@@ -405,7 +405,13 @@ static bool port_stop(struct port *p) {
 /* COMRESET (10.4.2): the link set up again and the device reset; it then sends its signature in a
    register FIS. Its power states are kept to active. DET 1h asks for SUD set (10.10.1), which an
    adapter of no staggered spin-up has always. */
+/* The disk may have started over: only a cache that was on has anything to lose. */
+static void disk_cache_lost(struct disk *d) {
+    if (__atomic_load_n(&d->cache, __ATOMIC_ACQUIRE)) blk_cache_lost(&d->blk);
+}
+
 static bool comreset(struct port *p) {
+    if (p->disk) disk_cache_lost(p->disk); /* no document here says its cache outlives this */
     wr(p, PxCMD, rd(p, PxCMD) | CMD_SUD);
     uint32_t sctl = (rd(p, PxSCTL) & ~0xF0Fu) | SCTL_NO_POWER_STATES(p->h);
     wr(p, PxSCTL, sctl | 1u);
@@ -872,11 +878,6 @@ static void fis_make(uint8_t f[20], uint8_t command, uint64_t lba, unsigned coun
 /* One command with `bytes` at buf, given in the slot the caller entered with, and its end waited
    for. 0; -1 when the disk reported an error, the adapter one of its own or the time ran out; -2
    when buf cannot be described to the adapter. */
-/* The disk may have started over: only a cache that was on has anything to lose. */
-static void disk_cache_lost(struct disk *d) {
-    if (__atomic_load_n(&d->cache, __ATOMIC_ACQUIRE)) blk_cache_lost(&d->blk);
-}
-
 static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queued, bool write, const uint8_t *buf,
                       unsigned bytes, uint64_t ns) {
     uint32_t bit = 1u << slot;

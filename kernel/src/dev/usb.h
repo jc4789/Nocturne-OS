@@ -13,29 +13,38 @@
 #include <stdbool.h>
 #include "sys/clock.h"
 
-/* A port whose device does not come up, or that stays stuck, tried less and less often: at most 64 s
-   apart, for a good device to come, and never in the way of the worker's other work. No document
-   sets these times. The port's own, on its controller's worker. */
-#define USB_PORT_TRY_DOUBLINGS 6
+/* A port whose device does not come up, or that stays stuck, is tried one reset at a time, with the
+   worker's other work in between, and less and less often: 1, 2, 4 ... 64 s apart. No document sets
+   these times. One with a device connected is left after USB_PORT_TRIES, until its connection
+   changes; a stuck one reads no connection, and may have no change to tell of a good device coming,
+   so it goes on at the longest. The port's own, on its controller's worker. */
+#define USB_PORT_TRIES 7
+#define USB_DEBOUNCES 5 /* the connect debounce begun again for a connection that came and went */
 struct usb_port_tries {
-    uint64_t at;   /* when the next try may be; 0: none has failed */
-    uint8_t count; /* tries in a row */
+    uint64_t at;   /* when the next try may be; 0: none has failed; CLOCK_NEVER: left */
+    uint8_t count; /* tries in a row, this one with them */
+    bool stuck;
 };
 /* Whether to try now; a try is counted if so. */
 static inline bool usb_port_try(struct usb_port_tries *t) {
     if (clock_now_ns() < t->at) return false;
-    if (t->count < USB_PORT_TRY_DOUBLINGS) t->count++;
+    if (t->count < USB_PORT_TRIES) t->count++;
     return true;
 }
-/* A try is over: the device came, or it did not. */
-static inline void usb_port_tried(struct usb_port_tries *t, bool came) {
-    t->at = came ? 0 : clock_now_ns() + (NS_PER_S << t->count);
-    if (came) t->count = 0;
-}
-/* Nothing is at the port any more. */
+/* Nothing being tried is at the port any more, or what is there came up. */
 static inline void usb_port_free(struct usb_port_tries *t) {
     t->at = 0;
     t->count = 0;
+    t->stuck = false;
+}
+/* A try that failed. */
+static inline void usb_port_failed(struct usb_port_tries *t, bool stuck) {
+    t->stuck = stuck;
+    t->at = t->count >= USB_PORT_TRIES && !stuck ? CLOCK_NEVER : clock_after(NS_PER_S << (t->count ? t->count - 1 : 0));
+}
+/* A device is there, and another try is to come. */
+static inline bool usb_port_trying(const struct usb_port_tries *t) {
+    return t->at && t->at != CLOCK_NEVER && !t->stuck;
 }
 
 /* The kind of a device's speed. The numbers a Slot Context takes are the root port's own (xhci.c). */
@@ -164,7 +173,8 @@ bool usbhub_prepare(struct usb_device *d);    /* configured: reads the hub descr
 bool usbhub_reset_port(struct usb_device *hub, unsigned port); /* reset the device on it; true once enabled */
 void usbhub_attach(struct usb_device *d, const struct usb_endpoint_desc *ep);
 void usbhub_work(struct usb_device *d);       /* port changes noticed by its interrupt endpoint */
-bool usbhub_pending(struct usb_device *d);    /* port changes not handled yet */
+bool usbhub_pending(struct usb_device *d);    /* port changes not handled yet, or a port's next try */
+bool usbhub_trying(struct usb_device *d);     /* a device at a port is yet to get another try */
 /* class drivers that read the whole configuration: does one of its interfaces suit them, and
  * take the device once it is configured */
 bool usbmsc_claims(const struct usb_interface_desc *intf);

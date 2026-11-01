@@ -809,8 +809,8 @@ static uint64_t flr_time_ns(const struct pci_device *d) {
 
 /* Owned by its enumerated device, not the app performing recovery. A cancelled or failed attempt
    must not lose the pre-FLR BARs/ACS, and a later one must not save over them what an FLR left.
-   Only one caller resets d: an app's, which reserves d->claimed across the attempt (dev/pciuser.c),
-   or the kernel driver that owns it (dev/nvme.c, under its lock);
+   Only one caller resets d: an app's, which reserves d->claimed across the attempt and never takes
+   up a function a kernel driver owns (dev/pciuser.c), or that kernel driver, under its lock (dev/nvme.c);
    resets of different functions go one at a time under reset_mutex, as they share the ports
    above (RRS holds, link retraining, the times since a port's reset). A sleep does not start
    while one runs (pci_suspend). A bus reset holds the configuration of each function below its
@@ -1075,7 +1075,12 @@ bool pci_function_reset(struct pci_device *d) {
     return done;
 }
 
-bool pci_reset_stuck(const struct pci_device *d) { return d->reset && d->reset->stuck; }
+bool pci_reset_stuck(const struct pci_device *d) {
+    uint64_t f = spin_lock(&reset_lock);
+    bool stuck = d->reset && d->reset->stuck;
+    spin_unlock(&reset_lock, f);
+    return stuck;
+}
 
 bool pci_reset_left(const struct pci_device *d) {
     uint64_t f = spin_lock(&reset_lock);

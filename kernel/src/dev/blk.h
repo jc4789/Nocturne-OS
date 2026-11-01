@@ -68,8 +68,9 @@ struct thread *blk_holder(void);
    what that held may be gone, which a flush of what is left cannot tell. If a write command went
    into it that no blk_persist covers, every blk_persist fails from here on, once it has flushed, so
    that whoever wrote that finds out, whichever of them comes first. A volume there goes no further,
-   and the medium keeps the last commit that was whole. A device without such a cache at the time
-   has nothing to lose: the driver does not call this. */
+   and the medium keeps the last commit that was whole. On a device with no persist this changes
+   nothing; a driver that knows the cache to be off at the time does not call this. A flush that has
+   ended but is not counted yet counts as not done: that may fail a persist, and loses nothing. */
 void blk_cache_lost(struct blkdev *d);
 /* The driver's count of its write commands: before the device can see one, and once that one is
    over, whether it took it or not, or nothing of it moves any more. Each try of a request counts.
