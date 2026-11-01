@@ -1,7 +1,12 @@
 # Nocturne OS：作業の指示
-WE ARE TARGETING REAL HARDWARE, NOT VM'S THIS IS NOT UNIX. THIS IS NOT POSIX. THIS IS NOT LINUX. AND THE USER HATES ALL THREE. ZERO GPLv2 only CODE IS ALLOWED TO BE ADDED BY YOU. LINUX SOURCE CODE OR ANY OTHER OS'S SOURCE CODE IS NEVER ALLOWED TO BE REFERENCED. We should never on purpose add support for unix/posix/linux. We should port programs, not port Nocturne OS THE CODE HAS TO BE CLEAN, UNNEEDED fracturing and duplication of code IS NOT ALLOWED. MODULAR CODE AND architecture IS TO BE PREFERRED. abstraction layers Can be a good thing. Nocturne OS'S NATIVE ABI MUST NOT BE BYPASSED.
+WE ARE TARGETING REAL HARDWARE, NOT VM'S THIS IS NOT UNIX. THIS IS NOT POSIX. 
+THIS IS NOT LINUX. AND THE USER HATES ALL THREE. ZERO GPLv2 only CODE IS ALLOWED TO BE ADDED BY YOU. 
+LINUX SOURCE CODE OR ANY OTHER OS'S SOURCE CODE IS NEVER ALLOWED TO BE REFERENCED.
+ We should never on purpose add support for unix/posix/linux. We should port programs, not port Nocturne OS THE CODE HAS TO BE CLEAN, UNNEEDED fracturing and duplication of code IS NOT ALLOWED.
+ MODULAR CODE AND architecture IS TO BE PREFERRED. Abstraction layers Can be a good thing, Services can be a good thing. 
+ Nocturne OS'S NATIVE ABI MUST NOT BE BYPASSED, YOU MUST RESPECT, USE AND IMPROVE WHEN NEEDED: common/abi.h`・`display_abi.h`・`gpu_abi.h`、仕様 `docs/nocturne-native-abi.md!
 
-Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは C。対象は実機（Ryzen 5 7600X、RTX 4070）。QEMU と Hyper-V は試験の道具で、VM で通ることは実機で動く証拠にならない。汎用の OS を目指す：CPU・メモリー・装置・プログラム・利用者の数が増えても成り立つ形で設計する。shim もスパゲッティも作らない。抽象化の層は要る所に、規模に耐える形で作る。
+Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは C。対象は実機。QEMU と Hyper-V は試験の道具で、VM で通ることは実機で動く証拠にならない。汎用の OS を目指す：CPU・メモリー・装置・プログラム・利用者の数が増えても成り立つ形で設計する。shim もスパゲッティも作らない。抽象化の層は要る所に、規模に耐える形で作る。
 
 ## 置き場所
 
@@ -27,7 +32,7 @@ Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは
 - 区切りごとに：物差しは目的の方へ動いたか。説明が細かくなることは近づくことではない。
 - 言う前に：何と何を比べてそう言えるか。「直った」「速くなった」「前から」「別件」は、同じ条件の二つの版を言えるときだけ。比べた二つと限界を同じ文に書く。
 
-長い作業・性能・設計・原因の調査は `ban` の盤で。広く読む仕事と前提の監査はサブエージェントへ回してよい。並べて書かせるときは、サブエージェントごとに作業木（`isolation: worktree`）で働かせる。作業木の中の `scripts/build.py` は本体の道具を使い、出力を本体の `build/wt/<作業木の名>/` に置く（作業木ではカーネルまでを組み、媒体は本体で組む）。任せた差分は取り込む前に自分で読み、同じ媒体で確かめる。
+長い作業・性能・設計・原因の調査は `ban` の盤で。広く読む仕事と前提の監査はサブエージェントへ回してよい。並べて書かせるときは、サブエージェントごとに作業木（`isolation: worktree`）で働かせる。Work trees are not allowed to build, ever. there should never be worktree specific builds.
 
 ## 区切りと報告
 
@@ -37,7 +42,7 @@ Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは
 
 ## 製品のコード
 
-- **悪いコードは消してから建てる。** 規模に耐えない形、ポーリング、決め打ちの上限、継ぎ足しは、持ち主の単位でまるごと消し、設計し直してから建てる。形を変えて残す hot fix はしない。建て終わるまでビルドが通らない間があってよい。消す対象はこのリポジトリのコードだけ。
+- **悪いコードは消してから建てる。** 形を変えて残す hot fix はしない。建て終わるまでビルドが通らない間があってよい。消す対象はこのリポジトリのコードだけ。
 - **互換は持たない。** 更地で、新しい機械が的。下限は Zen 4（x86-64-v4、AVX-512、FSGSBASE・PCID・INVPCID・SMEP・SMAP・x2APIC・不変の TSC を前提にしてよい）、上は 2 ソケットの EPYC（論理 CPU 1024、NUMA、CXL）。古い CPU・装置（PIC・PIT・xAPIC・FXSAVE だけ・BIOS 起動・Hyper-V 第 1 世代）・古い ABI のための道を作らず、見つけたら消す。Hyper-V 第 2 世代と拡張セッションは要件。
 - **設計は全体から。** 目的が通る道の全部を一つの設計として盤に書いてから書く。各部品で問う：責務と持ち主は何か。数が十倍になったら、どこが詰まり、呼ぶ側の何が変わるか。一つの大きな lock、一つの CPU に寄せる仕事、決め打ちの上限はその問いに答えられない。CPU の数はハードウェアが持つだけ、表の大きさは実際の数から。一番よい設計が分かるなら承認を待たずに作ってよいが、急ぐ理由にはならない。汚れと分かる設計を「後で直す」で入れない。今の制約を規則として書かない。
   - **shim は禁止。** 他の部品の見出しになりすます代役、何もしない lock、偽の関数、偽の環境で組むこと。shim を消すためにカーネル側へ口や包みを足さない。カーネルを変えずに済まない案なら書く前にユーザーに聞く。
@@ -48,7 +53,7 @@ Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは
 - **Web の標準を満たす。** W3C と WHATWG の標準、つまり WPT（`D:\Programes\cloned repos\wpt`）が試すもの。欠けは症状に効く一部で止めず、仕様の手順と、それが触れる値を持ち主の層まで通して全部入れる。照らすのは仕様の原文と WPT。安全の規則（CORS・Mixed Content・Cookie・資格情報）を削らない。
 - **サイト専用の処理を入れない。** ホスト名・URL の分岐、特定サイトの DOM の特例、UA の偽装、注入した HTML・CSS・JS で「直った」画面を作らない。壊れているのは我々のブラウザーで、主語はブラウザーの欠陥、サイト名は「再現は◯◯」と添えるだけ。
 - **VM の処理は実機と分ける。** VM だけの処理は `kernel/src/vm/vm.h` の後ろに置き、共通コードに hypervisor の判定や VM の装置を書かない。VM の測定値で実機の既定を決めない。
-- **UNIX ではない。** POSIX・Linux の API をカーネルにも libc にも足さない。移植する側を Nocturne のネイティブ ABI（`common/abi.h`・`display_abi.h`・`gpu_abi.h`、仕様 `docs/nocturne-native-abi.md`）へ書き換える。POSIX 名のヘッダー・API は `n_` の名に置き換え、第三者のソースも Nocturne の API を直接呼ぶように条件コンパイルで書き換える。互換の仲介ヘッダーは ports/ にも置かない。ISO C の標準ライブラリはよい。ABI に無い機能は POSIX の形を写さず Nocturne の設計として足す。
+- **UNIX・POSIX・LINUX ではない。** POSIX・Linux の API をカーネルにも libc にも足さない。移植する側を Nocturne のネイティブ ABI（`common/abi.h`・`display_abi.h`・`gpu_abi.h`、仕様 `docs/nocturne-native-abi.md`）へ書き換える. 
 - **言語は C だけではない。** C++20、TypeScript・JavaScript（QuickJS）、Go、Rust の標準ライブラリーはネイティブ ABI の上にある。ゲストにも clang・clang++・tcc・tsc がある。性能に関わる道具は clang の最適化つきで組む。
 - **GUI が先。** 機能には窓・設定の画面・クリックの入口を作り、CLI は付け足し。システムの内部を引数や旗の起動で組まず、ユーザーにコマンドを打たせない。設定の持ち主はシステムで、変えた瞬間に効き、設定アプリは窓だけ。プログラムの設定はそのプログラムの持ち物で、カーネルや共有ファイルに持たせない。標準が利用者の選択を前提にするなら、固定値で済ませず設定とそれが効く経路まで作る。
 - **ディスクは一台。** 起動の区画と C: が同じ媒体（`C:\Nocturne`、`C:\Programs\<アプリ>`、`C:\Users\<名前>`）。二台目のディスク、`/data`、`/bin`、PATH を持ち込まない。
@@ -66,7 +71,7 @@ Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは
 - **性能と退行を言うなら、変える前に今の媒体で測って書き残す。** 「前」は、組み直す前に同じ条件（2560×1440、F12 を開いたまま、旗なし）で取った記録か、組み直す前の写し `build/mae.img` の一つ。旧版を組み直して「前」を作らない。前の記録も写しも無ければ未確認と書く。前の値があるなら測り直さない。
 - **回帰を許さない。** 表示・入力・遷移・スクロール・動画・応答・性能のどれかが悪くなれば失敗。新機能や試験の合格で相殺しない。一つのサイトが直っても他が悪くなれば退行。
 - **証拠の範囲を分ける。** 静的な確認、ビルド、試験、QEMU の実サイト、GUI 操作、性能、Hyper-V・実機は別々に書く。サブエージェントの PASS は自分で差分と製品を見るまで受け入れない。Hyper-V で見つかった退行は QEMU での確かめの漏れ。実機の記録は写真だけで、頼むときは見てほしいことを短い一覧に。
-- **QEMU は窓付きで二台まで。** `-display none`・`-nographic` は禁止。速さを測る回は一台。HMP で直接操作し、固定秒数の一発スクリプトや computer-use の撮影で代用しない。撮った画像は自分で開く。ブラウザーは最大化、F12 の console を開いたまま撮り、console の行も読む。画像と serial.log は作業場（scratchpad）へ。
+- **QEMU は窓付きで二台まで。** `-display none`・`-nographic` は禁止。速さを測る回は一台。HMP で直接操作し、固定秒数の一発スクリプトの撮影で代用しない。撮った画像は自分で開く。ブラウザーは最大化、F12 の console を開いたまま撮り、console の行も読む。画像と serial.log は作業場（scratchpad）へ。
 - **ブラウザーは実サイトと実ブラウザーの参照で。** 参照は内蔵ブラウザーで同じ URL を同じ時に開いた画面か、Floorp の画像。前の回の Nocturne は参照ではない。読み込みは load の事象でなく、参照の部品が全部出るまでの実時間。動画は時間どおりに進み、音が出て、停止・シーク・再再生ができるまで。自作の HTML・ローカルページ・example.com は使わない。
 - **同じ試験を繰り返さない。** 再実行は、製品を直した、試験を直した、別の条件で切り分ける、のときだけ。期待値を弱める・skip・迂回で合格を作らない。
 
@@ -80,12 +85,6 @@ Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは
 - 渡す媒体に今のソースの kernel と C: が入っていることを確かめる。
 - Hyper-V と実機はユーザーの担当。VM の起動・停止・設定・媒体に触れない。
 
-## 変更の扱い
-
-- 始める前に差分を見て、他の作業の変更と自分の変更を分ける。広い reset・restore・clean をしない。取り消しは自分の差分だけ。
-- QEMU は `snapshot=on`。消すときは、その絶対パスが `build` の中でこの作業が作ったものかを先に確かめる。ユーザーの媒体と Hyper-V の媒体に触れない。自動の審査が拒んだら迂回しない。
-- 資格情報・Cookie・token・API キーをソース・媒体・報告へ写さない。
-- 済んだ仕事は main に commit してよい（「Area: what it does」）。push はしない。
 
 ## 手元の資料
 
@@ -97,4 +96,8 @@ Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは
 ## 書き方
 
 - フックは日本語の無い返事を書き直させる。
-- wrap_up は recap だけ。質問の箱・ボタン・AskUserQuestion は使わない。
+
+
+
+## 
+The User's machine has a Ryzen 5 7600X, 32GB of DDR5 RAM, and a RTX 4070, resizable bar enabled.
