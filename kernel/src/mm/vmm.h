@@ -89,7 +89,8 @@ void vmm_user_pages_split(struct vmm_space *s, uint64_t out[6]);
 int vmm_user_alloc(struct vmm_space *s, uint64_t va, uint64_t size, int prot);
 int vmm_user_reserve(struct vmm_space *s, uint64_t va, uint64_t size, int prot); /* zeroed on first touch */
 /* First touch of a reserved page: 1 when mapped (or already present), 0 when va is no reserved
-   page, -N_ERR_NO_MEMORY when no frame is left. Any context. */
+   page, -N_ERR_NO_MEMORY when no frame is left. In a thread of s's process, or its starter before
+   it runs; no spinlock held, as its frames are zeroed before any is taken. */
 int vmm_demand_fault(struct vmm_space *s, uint64_t va, bool write);
 /* The calls that narrow or remove translations return once no CPU uses the old ones (they shoot
    them down): no spinlock held, not in an interrupt's handler.

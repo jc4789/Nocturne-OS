@@ -12,7 +12,7 @@
  * picture, a canvas in RAM, without it, writes them into a buffer the display does not show and
  * asks for a flip. Input, window calls and presents never wait for a frame being drawn.
  *
- * A window's pixels are surfaces: shared objects (sys/syscall.h, shared_kernel_new) the app maps
+ * A window's pixels are surfaces: shared objects (mm/shared.h, shared_kernel_new) the app maps
  * (SYS_WIN_SURFACE) and the compositor reads through its own view of the same pages. A window
  * presented by rectangles has one surface and a kernel copy of it: each present copies its
  * rectangle into the copy under the copy's lock, which a frame takes while it reads it. A window
@@ -40,6 +40,7 @@
 #include "sys/sched.h"
 #include "sys/proc.h"
 #include "sys/prof.h"
+#include "mm/shared.h"
 #include "sys/syscall.h"
 #include "sys/keep.h"
 #include "sys/thread.h"
