@@ -26,8 +26,7 @@ Nocturne は UNIX でも POSIX でもないので、Go 側を Nocturne の API �
 
 - **システムコール**：`SYSCALL`、番号は AX、引数は DI・SI・DX・R10・R8、結果は AX
   （負なら結果コード）。CX と R11 は命令が使う（`docs/nocturne-native-abi.md` §0）。
-  **今の差分（`nocturne.patch`）はまだ廃止した `INT $0x80` と `SYS_THREAD_TLS` を使っていて、
-  作り直すまで Go のプログラムは最初の呼出しで止まる（2026-10-30）。**`syscall` パッケージは Nocturne の API そのもの
+  `syscall` パッケージは Nocturne の API そのもの
   （`DocumentOpen`、`DocumentReadAt`、`FolderList`、`ChannelSend`、`AppLaunch` 等）を出し、
   標準ライブラリーが使う `ENOENT` 等の名前は Nocturne の結果コードの別名です。
 - **起動**：ELF（ET_EXEC、0x400000 から）。カーネルが渡す設定（`rdx`）を環境として読みます。

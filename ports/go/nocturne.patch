@@ -4045,19 +4045,20 @@ index c3749f34..d39d3f1f 100644
  
 diff --git a/src/runtime/sys_nocturne_amd64.s b/src/runtime/sys_nocturne_amd64.s
 new file mode 100644
-index 00000000..4179a948
+index 00000000..914069f6
 --- /dev/null
 +++ b/src/runtime/sys_nocturne_amd64.s
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,100 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
 +
 +//
 +// System calls for AMD64, Nocturne.
-+// A call is INT $0x80 with the number in AX and the arguments in
++// A call is SYSCALL with the number in AX and the arguments in
 +// DI, SI, DX, R10 and R8; the result (or a negated Nocturne result code)
-+// comes back in AX and every other register is preserved.
++// comes back in AX. The instruction itself uses CX and R11; every other
++// register is preserved.
 +//
 +
 +#include "go_asm.h"
@@ -4068,7 +4069,6 @@ index 00000000..4179a948
 +#define SYS_YIELD		28
 +#define SYS_THREAD_EXIT		47
 +#define SYS_THREAD_ID		50
-+#define SYS_THREAD_TLS		52
 +
 +// func syscall5(n, a1, a2, a3, a4, a5 uintptr) int64
 +TEXT runtime·syscall5(SB),NOSPLIT,$0-56
@@ -4078,7 +4078,7 @@ index 00000000..4179a948
 +	MOVQ	a3+24(FP), DX
 +	MOVQ	a4+32(FP), R10
 +	MOVQ	a5+40(FP), R8
-+	INT	$0x80
++	SYSCALL
 +	MOVQ	AX, ret+48(FP)
 +	RET
 +
@@ -4086,7 +4086,7 @@ index 00000000..4179a948
 +TEXT runtime·exit(SB),NOSPLIT,$0-4
 +	MOVL	code+0(FP), DI
 +	MOVL	$SYS_EXIT, AX
-+	INT	$0x80
++	SYSCALL
 +	INT	$3
 +	JMP	0(PC)
 +
@@ -4096,7 +4096,7 @@ index 00000000..4179a948
 +	// We're done using the stack.
 +	MOVL	$0, (AX)
 +	MOVL	$SYS_THREAD_EXIT, AX
-+	INT	$0x80
++	SYSCALL
 +	INT	$3
 +	JMP	0(PC)
 +
@@ -4113,18 +4113,14 @@ index 00000000..4179a948
 +
 +TEXT runtime·osyield(SB),NOSPLIT,$0
 +	MOVL	$SYS_YIELD, AX
-+	INT	$0x80
++	SYSCALL
 +	RET
 +
 +// set tls base to DI
++// The FS base belongs to the thread, which writes it itself.
 +TEXT runtime·settls(SB),NOSPLIT,$0
 +	ADDQ	$8, DI	// ELF wants to use -8(FS)
-+	MOVQ	$16, SI	// g lives in the 8 bytes below FS
-+	MOVL	$SYS_THREAD_TLS, AX
-+	INT	$0x80
-+	CMPQ	AX, $0
-+	JEQ	2(PC)
-+	MOVL	$0xf1, 0xf1  // crash
++	WRFSBASEQ	DI
 +	RET
 +
 +// The first instruction of a thread made by newosproc. The kernel starts
@@ -4137,7 +4133,7 @@ index 00000000..4179a948
 +	CALL	runtime·settls(SB)
 +
 +	MOVL	$SYS_THREAD_ID, AX
-+	INT	$0x80
++	SYSCALL
 +	MOVQ	AX, m_procid(R13)
 +
 +	MOVQ	m_g0(R13), R9
@@ -4150,7 +4146,7 @@ index 00000000..4179a948
 +
 +	// mstart returns when an M on a system stack exits.
 +	MOVL	$SYS_THREAD_EXIT, AX
-+	INT	$0x80
++	SYSCALL
 +	INT	$3
 +	JMP	0(PC)
 diff --git a/src/runtime/timestub2.go b/src/runtime/timestub2.go
@@ -4168,10 +4164,10 @@ index 336bac4b..64875a18 100644
  
 diff --git a/src/syscall/asm_nocturne_amd64.s b/src/syscall/asm_nocturne_amd64.s
 new file mode 100644
-index 00000000..65dc6502
+index 00000000..dd9dbda9
 --- /dev/null
 +++ b/src/syscall/asm_nocturne_amd64.s
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,21 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -4179,9 +4175,10 @@ index 00000000..65dc6502
 +#include "textflag.h"
 +
 +// func rawSyscall(n, a1, a2, a3, a4, a5 uintptr) int64
-+// A Nocturne system call: INT $0x80 with the number in AX and the
++// A Nocturne system call: SYSCALL with the number in AX and the
 +// arguments in DI, SI, DX, R10 and R8. AX returns the result, or a
-+// negated Nocturne result code; every other register is preserved.
++// negated Nocturne result code. The instruction itself uses CX and R11;
++// every other register is preserved.
 +TEXT ·rawSyscall(SB),NOSPLIT,$0-56
 +	MOVQ	n+0(FP), AX
 +	MOVQ	a1+8(FP), DI
@@ -4189,7 +4186,7 @@ index 00000000..65dc6502
 +	MOVQ	a3+24(FP), DX
 +	MOVQ	a4+32(FP), R10
 +	MOVQ	a5+40(FP), R8
-+	INT	$0x80
++	SYSCALL
 +	MOVQ	AX, ret+48(FP)
 +	RET
 diff --git a/src/syscall/env_unix.go b/src/syscall/env_unix.go

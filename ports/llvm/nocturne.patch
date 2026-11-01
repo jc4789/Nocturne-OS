@@ -996,28 +996,50 @@ index 00000000..8d7da118
 +
 +#endif // _LIBCPP___LOCALE_DIR_SUPPORT_NOCTURNE_H
 diff --git a/libcxx/include/fstream b/libcxx/include/fstream
-index 92c79e81..299d9356 100644
+index 92c79e81..50fd78af 100644
 --- a/libcxx/include/fstream
 +++ b/libcxx/include/fstream
-@@ -240,6 +240,8 @@ public:
+@@ -235,7 +235,9 @@ public:
+   typedef typename traits_type::pos_type pos_type;
+   typedef typename traits_type::off_type off_type;
+   typedef typename traits_type::state_type state_type;
+-#    if _LIBCPP_STD_VER >= 26
++// Nocturne's C library opens a FILE by its name only and names no handle
++// behind it: there a filebuf has no native handle and is not opened on one.
++#    if _LIBCPP_STD_VER >= 26 && !defined(__nocturne__)
+ #      if defined(_LIBCPP_WIN32API)
    using native_handle_type = void*; // HANDLE
  #      elif __has_include(<unistd.h>)
-   using native_handle_type = int; // POSIX file descriptor
-+#      elif defined(__nocturne__)
-+  using native_handle_type = int; // n_handle
- #      else
- #        error "Provide a native file handle!"
- #      endif
-@@ -274,7 +276,7 @@ public:
+@@ -267,9 +269,11 @@ public:
+     return open(__p.c_str(), __mode);
+   }
+ #    endif
++#    if !defined(__nocturne__)
+   _LIBCPP_HIDE_FROM_ABI basic_filebuf* __open(int __fd, ios_base::openmode __mode);
++#    endif
+   basic_filebuf* close();
+-#    if _LIBCPP_STD_VER >= 26
++#    if _LIBCPP_STD_VER >= 26 && !defined(__nocturne__)
+   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI native_handle_type native_handle() const noexcept {
      _LIBCPP_ASSERT_UNCATEGORIZED(this->is_open(), "File must be opened");
  #      if defined(_LIBCPP_WIN32API)
-     return std::__filebuf_windows_native_handle(__file_);
--#      elif __has_include(<unistd.h>)
-+#      elif __has_include(<unistd.h>) || defined(__nocturne__)
-     return fileno(__file_);
- #      else
- #        error "Provide a way to determine the file native handle!"
-@@ -1063,7 +1065,8 @@ template <class _CharT, class _Traits>
+@@ -788,6 +792,7 @@ basic_filebuf<_CharT, _Traits>* basic_filebuf<_CharT, _Traits>::open(const char*
+   return __do_open(std::fopen(__s, __mdstr), __mode);
+ }
+ 
++#    if !defined(__nocturne__)
+ template <class _CharT, class _Traits>
+ inline basic_filebuf<_CharT, _Traits>* basic_filebuf<_CharT, _Traits>::__open(int __fd, ios_base::openmode __mode) {
+   if (__file_)
+@@ -798,6 +803,7 @@ inline basic_filebuf<_CharT, _Traits>* basic_filebuf<_CharT, _Traits>::__open(in
+ 
+   return __do_open(fdopen(__fd, __mdstr), __mode);
+ }
++#    endif
+ 
+ #    if _LIBCPP_HAS_OPEN_WITH_WCHAR
+ // This is basically the same as the char* overload except that it uses _wfopen
+@@ -1063,7 +1069,8 @@ template <class _CharT, class _Traits>
  int basic_filebuf<_CharT, _Traits>::__fseek(FILE* __file, pos_type __offset, int __whence) {
  #    if defined(_LIBCPP_MSVCRT_LIKE)
    return _fseeki64(__file, __offset, __whence);
@@ -1027,7 +1049,7 @@ index 92c79e81..299d9356 100644
    return fseek(__file, __offset, __whence);
  #    else
    return ::fseeko(__file, __offset, __whence);
-@@ -1074,7 +1077,7 @@ template <class _CharT, class _Traits>
+@@ -1074,7 +1081,7 @@ template <class _CharT, class _Traits>
  typename basic_filebuf<_CharT, _Traits>::pos_type basic_filebuf<_CharT, _Traits>::__ftell(FILE* __file) {
  #    if defined(_LIBCPP_MSVCRT_LIKE)
    return _ftelli64(__file);
@@ -1036,6 +1058,112 @@ index 92c79e81..299d9356 100644
    return ftell(__file);
  #    else
    return ftello(__file);
+@@ -1207,7 +1214,7 @@ public:
+   typedef typename traits_type::int_type int_type;
+   typedef typename traits_type::pos_type pos_type;
+   typedef typename traits_type::off_type off_type;
+-#    if _LIBCPP_STD_VER >= 26
++#    if _LIBCPP_STD_VER >= 26 && !defined(__nocturne__)
+   using native_handle_type = typename basic_filebuf<_CharT, _Traits>::native_handle_type;
+ #    endif
+ 
+@@ -1227,7 +1234,7 @@ public:
+   _LIBCPP_HIDE_FROM_ABI void swap(basic_ifstream& __rhs);
+ 
+   [[__nodiscard__]] _LIBCPP_HIDE_FROM_ABI basic_filebuf<char_type, traits_type>* rdbuf() const;
+-#    if _LIBCPP_STD_VER >= 26
++#    if _LIBCPP_STD_VER >= 26 && !defined(__nocturne__)
+   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI native_handle_type native_handle() const noexcept {
+     return rdbuf()->native_handle();
+   }
+@@ -1244,7 +1251,9 @@ public:
+   }
+ #    endif // _LIBCPP_STD_VER >= 17
+ 
++#    if !defined(__nocturne__)
+   _LIBCPP_HIDE_FROM_ABI void __open(int __fd, ios_base::openmode __mode);
++#    endif
+   _LIBCPP_HIDE_FROM_ABI void close();
+ 
+ private:
+@@ -1339,6 +1348,7 @@ void basic_ifstream<_CharT, _Traits>::open(const string& __s, ios_base::openmode
+     this->setstate(ios_base::failbit);
+ }
+ 
++#    if !defined(__nocturne__)
+ template <class _CharT, class _Traits>
+ inline void basic_ifstream<_CharT, _Traits>::__open(int __fd, ios_base::openmode __mode) {
+   if (__sb_.__open(__fd, __mode | ios_base::in))
+@@ -1346,6 +1356,7 @@ inline void basic_ifstream<_CharT, _Traits>::__open(int __fd, ios_base::openmode
+   else
+     this->setstate(ios_base::failbit);
+ }
++#    endif
+ 
+ template <class _CharT, class _Traits>
+ inline void basic_ifstream<_CharT, _Traits>::close() {
+@@ -1363,7 +1374,7 @@ public:
+   typedef typename traits_type::int_type int_type;
+   typedef typename traits_type::pos_type pos_type;
+   typedef typename traits_type::off_type off_type;
+-#    if _LIBCPP_STD_VER >= 26
++#    if _LIBCPP_STD_VER >= 26 && !defined(__nocturne__)
+   using native_handle_type = typename basic_filebuf<_CharT, _Traits>::native_handle_type;
+ #    endif
+ 
+@@ -1385,7 +1396,7 @@ public:
+   _LIBCPP_HIDE_FROM_ABI void swap(basic_ofstream& __rhs);
+ 
+   [[__nodiscard__]] _LIBCPP_HIDE_FROM_ABI basic_filebuf<char_type, traits_type>* rdbuf() const;
+-#    if _LIBCPP_STD_VER >= 26
++#    if _LIBCPP_STD_VER >= 26 && !defined(__nocturne__)
+   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI native_handle_type native_handle() const noexcept {
+     return rdbuf()->native_handle();
+   }
+@@ -1403,7 +1414,9 @@ public:
+   }
+ #    endif // _LIBCPP_STD_VER >= 17
+ 
++#    if !defined(__nocturne__)
+   _LIBCPP_HIDE_FROM_ABI void __open(int __fd, ios_base::openmode __mode);
++#    endif
+   _LIBCPP_HIDE_FROM_ABI void close();
+ 
+ private:
+@@ -1498,6 +1511,7 @@ void basic_ofstream<_CharT, _Traits>::open(const string& __s, ios_base::openmode
+     this->setstate(ios_base::failbit);
+ }
+ 
++#    if !defined(__nocturne__)
+ template <class _CharT, class _Traits>
+ inline void basic_ofstream<_CharT, _Traits>::__open(int __fd, ios_base::openmode __mode) {
+   if (__sb_.__open(__fd, __mode | ios_base::out))
+@@ -1505,6 +1519,7 @@ inline void basic_ofstream<_CharT, _Traits>::__open(int __fd, ios_base::openmode
+   else
+     this->setstate(ios_base::failbit);
+ }
++#    endif
+ 
+ template <class _CharT, class _Traits>
+ inline void basic_ofstream<_CharT, _Traits>::close() {
+@@ -1522,7 +1537,7 @@ public:
+   typedef typename traits_type::int_type int_type;
+   typedef typename traits_type::pos_type pos_type;
+   typedef typename traits_type::off_type off_type;
+-#    if _LIBCPP_STD_VER >= 26
++#    if _LIBCPP_STD_VER >= 26 && !defined(__nocturne__)
+   using native_handle_type = typename basic_filebuf<_CharT, _Traits>::native_handle_type;
+ #    endif
+ 
+@@ -1549,7 +1564,7 @@ public:
+   _LIBCPP_HIDE_FROM_ABI void swap(basic_fstream& __rhs);
+ 
+   [[__nodiscard__]] _LIBCPP_HIDE_FROM_ABI basic_filebuf<char_type, traits_type>* rdbuf() const;
+-#    if _LIBCPP_STD_VER >= 26
++#    if _LIBCPP_STD_VER >= 26 && !defined(__nocturne__)
+   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI native_handle_type native_handle() const noexcept {
+     return rdbuf()->native_handle();
+   }
 diff --git a/libcxx/include/module.modulemap.in b/libcxx/include/module.modulemap.in
 index 39b4e0bb..8b80cb78 100644
 --- a/libcxx/include/module.modulemap.in
@@ -1048,6 +1176,19 @@ index 39b4e0bb..8b80cb78 100644
        textual header "__locale_dir/support/no_locale/characters.h"
        textual header "__locale_dir/support/no_locale/strtonum.h"
        textual header "__locale_dir/support/openbsd.h"
+diff --git a/libcxx/include/version b/libcxx/include/version
+index 4a6b0109..3c47a08d 100644
+--- a/libcxx/include/version
++++ b/libcxx/include/version
+@@ -590,7 +590,7 @@ __cpp_lib_void_t                                        201411L <type_traits>
+ // # define __cpp_lib_freestanding_optional                202311L
+ // # define __cpp_lib_freestanding_string_view             202311L
+ // # define __cpp_lib_freestanding_variant                 202311L
+-# if _LIBCPP_HAS_FILESYSTEM && _LIBCPP_HAS_LOCALIZATION
++# if _LIBCPP_HAS_FILESYSTEM && _LIBCPP_HAS_LOCALIZATION && !defined(__nocturne__)
+ #   define __cpp_lib_fstream_native_handle              202306L
+ # endif
+ // # define __cpp_lib_function_ref                         202306L
 diff --git a/libcxx/src/atomic.cpp b/libcxx/src/atomic.cpp
 index 15e06921..0d9a2cfc 100644
 --- a/libcxx/src/atomic.cpp
