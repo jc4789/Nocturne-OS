@@ -27,9 +27,6 @@ void log_init(void);
    wakes the readers; the boot screen draws in its own thread. Until then the boot screen draws as
    each record is written (one CPU, interrupts off). */
 void log_start(void);
-/* A round of the "log" thread owed (the serial port's transmit interrupt). Any context but an
-   NMI. */
-void log_kick(void);
 /* A sleep (dev/pm.c), CPU 0 with interrupts off and the other CPUs parked. log_suspend, before
    the interrupt controllers go down: the writers stop telling the readers (no interrupt to itself
    reaches a CPU whose APIC is not back), the serial port goes quiet. log_resume, once the APICs

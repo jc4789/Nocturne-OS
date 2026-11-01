@@ -106,7 +106,7 @@ static struct wait_queue told_wq;
 /* The rings written since the drain last took them, a bit a ring (log_init: a word per 64). */
 static uint64_t *written;
 static unsigned written_words;
-static uint64_t drain_owed; /* a writer (or the serial port) asked for a drain */
+static uint64_t drain_owed; /* a writer asked for a drain */
 static struct wait_queue drain_wq;
 /* The cursors the drain hands the written bits to (all but the panic's). A leaf. */
 static struct spinlock cursors_lock;
@@ -192,7 +192,7 @@ static void drain_wake(void) {
     else apic_send_ipi(cpu_current_index(), VEC_LOG);
 }
 
-void log_kick(void) {
+static void log_kick(void) {
     if (!__atomic_exchange_n(&drain_owed, 1, __ATOMIC_SEQ_CST)) drain_wake();
 }
 
@@ -695,8 +695,8 @@ static bool written_take(void) {
     return any;
 }
 
-/* The "log" thread: a round for each drain owed. The serial port may ask to be filled again at a
-   time (a port without its interrupt, serial_drain): the wait ends then too. */
+/* The "log" thread: a round for each drain owed. The serial port asks to be filled again at a time
+   (serial_drain): the wait ends then too. */
 static void drain_thread(void *arg) {
     (void)arg;
     uint64_t again = CLOCK_NEVER;

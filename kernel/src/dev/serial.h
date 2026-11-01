@@ -8,11 +8,11 @@
 struct panic_line;
 /* The first thing at boot: COM1 when it answers, set up for a panic until serial_start. */
 void serial_init(void);
-/* sys/log.c's log_start, CPU 0 with interrupts off: the port the ACPI SPCR names (else COM1), its
-   interrupt, and the log from its oldest record on. */
+/* sys/log.c's log_start, CPU 0 with interrupts off: the port the ACPI SPCR names (else COM1), and
+   the log from its oldest record on. */
 void serial_start(void);
-/* The log's thread (sys/log.c), a round: an empty transmitter is filled again. The time to be
-   called again for a port without its interrupt that still has text to send, else CLOCK_NEVER. */
+/* The log's thread (sys/log.c), a round: an empty transmitter whose time has come is filled again.
+   The time to be called again while there is text to send, else CLOCK_NEVER. */
 uint64_t serial_drain(void);
 /* Interrupts off, the power about to go (dev/pm.c): what the log holds goes out, the caller
    waiting on the line. */

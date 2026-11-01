@@ -253,11 +253,13 @@ void pci_init(void) {
         for (size_t k = 0; k < ndevices && !devices[i].upstream; k++)
             if (k != i && devices[k].bridge && devices[k].secondary == devices[i].bus)
                 devices[i].upstream = &devices[k];
-    /* each function's node, for its memory and the CPUs its interrupts go to */
+    /* each function's node, for its memory and the CPUs its interrupts go to. Finding a function's
+       ACPI object evaluates its neighbours' _ADR: with one node there is nothing to choose. */
     for (size_t i = 0; i < ndevices; i++) {
         uint32_t domain;
         devices[i].node = -1;
-        for (unsigned n = 0; acpi_pci_proximity(&devices[i], &domain) && n < topology.nodes; n++)
+        if (topology.nodes < 2 || !acpi_pci_proximity(&devices[i], &domain)) continue;
+        for (unsigned n = 0; n < topology.nodes; n++)
             if (topology.node[n].domain == domain) {
                 devices[i].node = (int)n;
                 break;

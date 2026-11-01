@@ -98,7 +98,7 @@ bool cmdline_number(const char *key, uint64_t *out) {
 static NORETURN void kmain_scheduled(void *unused) {
     (void)unused;
     alarm_init_cpu(); /* CPU 0's wake device: no periodic tick on any CPU */
-    log_start();      /* the log's readers: the boot screen's thread, the serial port's interrupt */
+    log_start();      /* the log's readers: the boot screen's thread, the serial port's */
     prof_init();      /* before the other CPUs: each starts its samples as it comes up */
     smp_init();
     sti();
