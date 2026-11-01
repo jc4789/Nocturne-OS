@@ -112,9 +112,15 @@ int blk_by_blocks(struct blkdev *d, bool write, uint64_t lba, uint32_t count, ui
         if (whole && direct) {
             if (move(ctx, write, first, n, p) < 0) return -N_ERR_IO;
         } else if (write) {
-            if (!whole && move(ctx, false, first, n, bounce) < 0) return -N_ERR_IO;
-            memcpy(bounce + off, p, take);
-            if (move(ctx, true, first, n, bounce) < 0) return -N_ERR_IO;
+            /* another request's bytes in the same block are not to be written back as they were */
+            if (!whole) mutex_lock(&d->partial);
+            int r = whole ? 0 : move(ctx, false, first, n, bounce);
+            if (r >= 0) {
+                memcpy(bounce + off, p, take);
+                r = move(ctx, true, first, n, bounce);
+            }
+            if (!whole) mutex_unlock(&d->partial);
+            if (r < 0) return -N_ERR_IO;
         } else {
             if (move(ctx, false, first, n, bounce) < 0) return -N_ERR_IO;
             memcpy(p, bounce + off, take);
@@ -132,6 +138,7 @@ int blk_by_blocks(struct blkdev *d, bool write, uint64_t lba, uint32_t count, ui
 int blk_persist(struct blkdev *d) {
     if (!d->persist) return 0;
     enter();
+    bool lost = __atomic_exchange_n(&d->cache_lost, false, __ATOMIC_SEQ_CST);
     uint64_t upto = __atomic_load_n(&d->written, __ATOMIC_SEQ_CST);
     int r = 0;
     if (__atomic_load_n(&d->persisted, __ATOMIC_SEQ_CST) < upto && !(r = d->persist(d))) {
@@ -139,6 +146,7 @@ int blk_persist(struct blkdev *d) {
         while (was < upto && !__atomic_compare_exchange_n(&d->persisted, &was, upto, false, __ATOMIC_SEQ_CST,
                                                           __ATOMIC_SEQ_CST)) {}
     }
+    if (!r && lost) r = -N_ERR_IO;
     leave();
     return r ? failed(d, "cache flush", 0, 0, r) : 0;
 }
@@ -158,4 +166,16 @@ void blk_release(void) {
     holder = NULL;
     spin_unlock(&gate_lock, f);
     wq_wake_all(&gate_wq);
+}
+
+struct thread *blk_holder(void) {
+    uint64_t f = spin_lock(&gate_lock);
+    struct thread *t = holder;
+    spin_unlock(&gate_lock, f);
+    return t;
+}
+
+void blk_cache_lost(struct blkdev *d) {
+    if (__atomic_load_n(&d->persisted, __ATOMIC_SEQ_CST) < __atomic_load_n(&d->written, __ATOMIC_SEQ_CST))
+        __atomic_store_n(&d->cache_lost, true, __ATOMIC_SEQ_CST);
 }

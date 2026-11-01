@@ -103,7 +103,7 @@ static int bot(struct msc *m, unsigned lun, const uint8_t *cdb, unsigned cdb_len
         }
     }
     int r = usb_bulk(d, m->in, csw, 13, timeout, &moved);
-    if (r == USB_STALL) { /* Figure 2: clear the halt and read the CSW once more */
+    if (r < 0 && r != USB_TIMEOUT) { /* Figure 2, a stall or a bulk error: clear the halt and read the CSW once more */
         usb_clear_halt(d, m->in);
         r = usb_bulk(d, m->in, csw, 13, timeout, &moved);
     }

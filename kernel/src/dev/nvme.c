@@ -34,6 +34,7 @@
 #define PRPS_PER_PAGE 512         /* one PRP list page: a command of up to 2 MiB */
 #define ADMIN_NS (5 * NS_PER_S)
 #define IO_NS (30 * NS_PER_S)
+#define SHUTDOWN_MOST_NS (60 * NS_PER_S) /* our limit for a shutdown under way: 3.6.1 gives none */
 
 /* controller registers */
 #define CAP 0x00
@@ -48,7 +49,6 @@
 #define CSTS_CFS 2u
 #define CSTS_SHST(v) ((v) >> 2 & 3)
 #define SHST_NONE 0u
-#define SHST_BUSY 1u
 #define SHST_DONE 2u
 #define SHST_RESERVED 3u
 /* CAP.CSS (Figure 36), and what each makes of CC.CSS (3.5.1 step 3) */
@@ -304,13 +304,14 @@ static void controller_down(struct nvme *c) {
     __atomic_store_n(&c->live, false, __ATOMIC_RELEASE);
 }
 
-/* CSTS.RDY to follow CC.EN, within CAP.TO or CRTO; a fatal status does not keep it from falling. */
-static bool wait_ready(struct nvme *c, bool ready) {
+/* CSTS.RDY to follow CC.EN, within CAP.TO or CRTO; a fatal status does not keep it from falling, and
+   ends the wait for it to rise only for one that will not use it (past_fatal false). */
+static bool wait_ready(struct nvme *c, bool ready, bool past_fatal) {
     uint64_t deadline = clock_after(c->ready_ns);
     for (;;) {
         uint32_t csts = rd32(c, CSTS);
         if (csts == 0xFFFFFFFFu) return false;
-        if (ready && (csts & CSTS_CFS)) return false;
+        if (ready && !past_fatal && (csts & CSTS_CFS)) return false;
         if (!!(csts & CSTS_RDY) == ready) return true;
         if (clock_now_ns() >= deadline) return false;
         sleep_until(clock_after(NS_PER_MS));
@@ -320,19 +321,32 @@ static bool wait_ready(struct nvme *c, bool ready) {
 /* The controller stopped by a Controller Reset (CC.EN to 0 and CSTS.RDY following, 3.7.2): nothing
    it held moves any more, so every command in it fails and its caller may take the memory back.
    A shutdown it may have notified ends with this write: SHN is written back as 00b, or the
-   same write would begin another (Figure 41). One that does not stop has its bus mastering turned
-   off, and stays out of use with its namespaces. `seen`: c->stops as the caller read it; a stop that
-   ended since has done this for it. */
+   same write would begin another (Figure 41). EN does not fall while RDY reads 0, which is undefined
+   (Figure 41): RDY is given its time to rise, whatever else the status says. A controller where this
+   cannot be done, or does not end, gets the other Controller Level Reset, the Function Level Reset
+   (3.7.2), the fatal status asking for a reset above all (9.5). One that still does not stop has its
+   bus mastering turned off, and stays out of use with its namespaces. `seen`: c->stops as the caller
+   read it; a stop that ended since has done this for it. */
 static void controller_stop(struct nvme *c, uint64_t seen) {
     mutex_lock(&c->stop_lock);
     if (__atomic_load_n(&c->stops, __ATOMIC_ACQUIRE) == seen) {
         controller_down(c);
         uint32_t cc = rd32(c, CC);
+        bool stopped = false;
         if (cc != 0xFFFFFFFFu && cc & CC_EN) {
-            wait_ready(c, true); /* EN may only fall once RDY followed it up */
-            wr32(c, CC, cc & ~(CC_EN | CC_SHN));
+            wait_ready(c, true, true);
+            if (rd32(c, CSTS) & CSTS_RDY) {
+                wr32(c, CC, cc & ~(CC_EN | CC_SHN));
+                stopped = wait_ready(c, false, false);
+            }
+        } else if (cc != 0xFFFFFFFFu) {
+            stopped = wait_ready(c, false, false);
         }
-        if (!wait_ready(c, false)) {
+        if (!stopped && pci_function_reset(c->pci)) { /* its configuration comes back with no bus mastering */
+            pci_enable_busmaster(c->pci);
+            stopped = wait_ready(c, false, false);
+        }
+        if (!stopped) {
             kprintf("nvme%d: controller did not reset, turned off\n", c->index);
             __atomic_store_n(&c->cut, true, __ATOMIC_RELEASE);
             pci_disable_busmaster(c->pci, NULL);
@@ -358,10 +372,11 @@ static void submit(struct queue *q, int id, uint32_t cmd[16]) {
 
 /* Submit a command on q and wait for its completion. Returns 0, the 15-bit status field of a failed
    command, or FAILED when the controller stopped answering. Then it has been stopped, and nothing
-   of the command moves any more: the caller may take its memory back. It is down until a reset. */
+   of the command moves any more: the caller may take its memory back. It is down until a reset.
+   Waiting for a free slot takes no time from the command: every command in the queue ends, or
+   stops the controller, within its own time. */
 static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t *result) {
     struct nvme *c = q->c;
-    uint64_t deadline = clock_after(timeout_ns);
     int id;
     uint64_t f;
     for (;;) {
@@ -374,9 +389,9 @@ static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t 
         if ((id = slot_take(q)) >= 0) break;
         uint64_t seen = __atomic_load_n(&q->freed, __ATOMIC_ACQUIRE);
         spin_unlock(&q->sq_lock, f);
-        if (clock_now_ns() >= deadline) return FAILED;
-        wq_wait_unless(&q->room, &q->freed, seen, deadline);
+        wq_wait_unless(&q->room, &q->freed, seen, clock_after(timeout_ns));
     }
+    uint64_t deadline = clock_after(timeout_ns);
     struct slot *s = &q->slots[id];
     uint64_t start = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
     uint64_t stops = __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE);
@@ -487,9 +502,9 @@ static bool read_controller(struct nvme *c) {
     }
     while (n && c->model[n - 1] == ' ') n--;
     c->model[n] = 0;
-    unsigned mdts = id[77];
-    c->max_xfer = PRPS_PER_PAGE * PAGE_SIZE;
-    if (mdts && mdts < 20 && (PAGE_SIZE << mdts) < c->max_xfer) c->max_xfer = PAGE_SIZE << mdts;
+    unsigned mdts = id[77], most = PRPS_PER_PAGE * PAGE_SIZE;
+    if (mdts && mdts < 20 && (PAGE_SIZE << mdts) < most) most = PAGE_SIZE << mdts;
+    __atomic_store_n(&c->max_xfer, most, __ATOMIC_RELEASE); /* a reset's read beside the callers' */
     c->vwc = id[525] & 1;
     c->rtd3e = *(const uint32_t *)(id + 88);
     c->namespaces = *(const uint32_t *)(id + 516);
@@ -580,7 +595,7 @@ static void identify_command_set(struct nvme *c, uint32_t nsid) {
    02h where it is not known: up to 1024 IDs above the one given, in order), each noted; a controller
    without the list (NVMe 1.0) has namespaces 1 to its count. */
 static void add_namespaces(struct nvme *c) {
-    uint32_t after = 0, cns = CNS_ACTIVE_OF_SET;
+    uint32_t cns = CNS_ACTIVE_OF_SET;
     if (identify(c, cns, 0) && identify(c, cns = CNS_ACTIVE, 0)) {
         for (uint32_t nsid = 1; nsid && nsid <= c->namespaces; nsid++) add_namespace(c, nsid);
         return;
@@ -594,7 +609,7 @@ static void add_namespaces(struct nvme *c) {
             add_namespace(c, ids[i]);
             if (cns == CNS_ACTIVE_OF_SET) identify_command_set(c, ids[i]);
         }
-        more = n == PAGE_SIZE / 4 && !identify(c, cns, after = ids[n - 1]);
+        more = n == PAGE_SIZE / 4 && !identify(c, cns, ids[n - 1]);
     }
     if (!ids) kprintf("nvme%d: no memory for its namespace list\n", c->index);
     kfree(ids);
@@ -636,7 +651,7 @@ static bool enable(struct nvme *c) {
     /* its command sets, 4 KiB pages, round robin */
     bool sets = c->cap & CAP_CSS_SETS;
     wr32(c, CC, CC_EN | (sets ? CC_CSS_SETS : CC_CSS_NVM));
-    if (!wait_ready(c, true)) {
+    if (!wait_ready(c, true, false)) {
         kprintf("nvme%d: controller did not become ready (status %x)\n", c->index, rd32(c, CSTS));
         return false;
     }
@@ -785,7 +800,8 @@ static int transfer(void *ctx, bool write, uint64_t lba, unsigned n, uint8_t *bu
 static int rw(struct ns *s, bool write, uint64_t lba, uint32_t count, uint8_t *p) {
     struct nvme *c = s->c;
     awake(c);
-    unsigned per = s->block / 512, most = c->max_xfer / s->block;
+    unsigned per = s->block / 512, most = __atomic_load_n(&c->max_xfer, __ATOMIC_ACQUIRE) / s->block;
+    if (!most) return -N_ERR_IO; /* a reset found it takes less than a block now */
     bool direct = !((uint64_t)p & 3), whole = !(lba % per) && !(count % per);
     uint8_t *bounce = NULL;
     if (!direct || !whole) {
@@ -903,13 +919,12 @@ static void delete_queues(struct nvme *c) {
 /* CC.SHN set: until CSTS.SHST reads complete, which is when the controller may lose power (3.6.1).
    With CSTS.ST set the whole subsystem is shutting down, by another controller's hand, and its
    complete says as much (3.6.3). The specification gives the least to wait (RTD3E, or one second when
-   that is not reported) and no limit: a controller that has begun is given that and the time it
-   reports for becoming ready (CAP.TO, CRTO), its cache being worth more than the time. One that has
-   not begun by the least, reads the reserved value (Figure 42), reported a fatal status or vanished
-   will not finish. */
+   that is not reported) and no limit: a controller that has begun is waited for up to our own
+   limit, its cache being worth more than the time. One that has not begun by the least, reads the
+   reserved value (Figure 42), reported a fatal status or vanished will not finish. */
 static bool shutdown_done(struct nvme *c) {
     uint64_t least = c->rtd3e ? c->rtd3e * NS_PER_US : NS_PER_S, deadline = clock_after(least);
-    uint64_t last = clock_after(least + c->ready_ns);
+    uint64_t last = clock_after(MAX(least, (uint64_t)SHUTDOWN_MOST_NS));
     bool told = false;
     for (;;) {
         uint32_t csts = rd32(c, CSTS);
@@ -931,25 +946,27 @@ static bool shutdown_done(struct nvme *c) {
     }
 }
 
-/* Normal shutdown before power goes away (3.6.1): the controller writes its cache back and the
-   drive does not count an unsafe shutdown. Its I/O queues go first if it still takes commands;
-   the notification has no such condition: a reset that failed left its cache as it was. Interrupts
-   are already off, the disks held (no command in flight). A controller with no block devices was
-   given nothing, one back from a sleep with no command since has nothing new, and one cut off can
-   keep nothing. */
+/* Normal shutdown before power goes away (3.6.1), for every controller of the machine: SHN is to be
+   written before any power down (Figure 41), whoever used it, and the drive then does not count an
+   unsafe shutdown. Its I/O queues go first if it still takes commands; the notification has no such
+   condition: a reset that failed left its cache as it was. One that reports complete stays ready
+   to lose power (3.6.1), and one cut off can keep nothing. Only one holding block devices, given
+   commands since it last lost power, keeps a power change from going on. Interrupts are already
+   off, the disks held (no command in flight). */
 static bool nvme_shutdown(void *arg) {
     (void)arg;
     bool all = true;
     for (struct nvme *c = ctrls; c; c = c->next) {
-        if (!__atomic_load_n(&c->in_use, __ATOMIC_ACQUIRE) || __atomic_load_n(&c->cut, __ATOMIC_ACQUIRE) ||
-            __atomic_load_n(&c->woke, __ATOMIC_ACQUIRE))
-            continue;
+        if (!c->regs || __atomic_load_n(&c->cut, __ATOMIC_ACQUIRE) || CSTS_SHST(rd32(c, CSTS)) == SHST_DONE) continue;
         if (__atomic_load_n(&c->live, __ATOMIC_ACQUIRE)) {
             __atomic_store_n(&c->ready, false, __ATOMIC_RELEASE);
             delete_queues(c);
         }
         wr32(c, CC, (rd32(c, CC) & ~CC_SHN) | CC_SHN_NORMAL);
-        if (!shutdown_done(c)) all = false; /* its cache may not be on the flash */
+        /* its cache may not be on the flash */
+        if (!shutdown_done(c) && __atomic_load_n(&c->in_use, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&c->woke, __ATOMIC_ACQUIRE))
+            all = false;
         controller_down(c);
     }
     return all;

@@ -6,11 +6,13 @@
    the medium. A filesystem orders its writes with it (data before the record that names it) and asks
    for it once per save, not once per write.
 
-   Any CPU, any task: a driver serializes the requests it gets for a device itself (its own lock,
-   or the one thread that reaches it); blk.c keeps only the list of devices and the power gate. */
+   Any CPU, any task: a driver orders the requests it gets for a device itself, one at a time or
+   side by side as the device takes them; blk.c keeps the list of devices and the power gate, and
+   writes of part of a device block one at a time (blk_by_blocks). */
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include "sys/wait.h"
 
 struct blkdev {
     int index;
@@ -24,6 +26,8 @@ struct blkdev {
     uint32_t errors;    /* failed requests since the device appeared (atomic) */
     uint64_t written;   /* writes the device took, ever (atomic, blk.c) */
     uint64_t persisted; /* of them, the ones a persist that ended began after (atomic, blk.c) */
+    bool cache_lost;    /* written since the last persist may be gone, whatever the next one says (atomic) */
+    struct mutex partial; /* a write of part of a block: its read, change and write, one at a time */
     int (*read)(struct blkdev *d, uint64_t lba, uint32_t count, void *buf);
     int (*write)(struct blkdev *d, uint64_t lba, uint32_t count, const void *buf);
     /* Everything written so far reaches the medium. NULL: the device keeps no volatile cache. */
@@ -51,6 +55,12 @@ int blk_by_blocks(struct blkdev *d, bool write, uint64_t lba, uint32_t count, ui
    snapshot and the power going off nothing changes on disk that the snapshot does not know. */
 void blk_hold(void);
 void blk_release(void);
+/* The thread blk_hold let through, NULL when there is none. */
+struct thread *blk_holder(void);
+/* The device came back from losing its link, and may have lost power with it: what its volatile
+   cache held may be gone, which a flush of what is left cannot tell. The next blk_persist fails if
+   anything was written since the last one. */
+void blk_cache_lost(struct blkdev *d);
 /* A driver's own thread at work on its disks counts as a transfer under way: blk_hold waits for it,
    and it waits for blk_release. */
 void blk_busy_begin(void);

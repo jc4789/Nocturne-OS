@@ -75,6 +75,7 @@ enum { EP_DISABLED, EP_RUNNING, EP_HALTED, EP_STOPPED, EP_ERROR };
 #define DCBAAP 0x30
 #define CONFIG 0x38
 #define PORTSC(p) (0x400 + 0x10 * ((p) - 1))
+#define PORTLI(p) (PORTSC(p) + 8)
 #define CMD_INTE (1u << 2)
 #define STS_HCH 1u
 #define STS_HSE (1u << 2)
@@ -98,6 +99,7 @@ enum { EP_DISABLED, EP_RUNNING, EP_HALTED, EP_STOPPED, EP_ERROR };
 #define PLS_COMPLIANCE 10
 #define PS_CHANGES (0x7Fu << 17)
 #define PS_PIC (3u << 14)
+#define SLOT_CONFIGURED 3u /* the Slot Context's Slot State (Table 6-7) */
 #define PS_KEEP (PS_PP | PS_PIC | 7u << 25) /* bits a write must carry over; the rest are RW1C or actions */
 /* an interrupter's register set in the runtime registers (5.5.2): 0x20 + 32 * n */
 #define IR_SET(n) (0x20 + 32 * (n))
@@ -158,7 +160,7 @@ struct endpoint {
     uint8_t *buf; /* contiguous DMA area: `count` transfers `stride` bytes apart */
     uint64_t buf_phys;
     unsigned pages;
-    unsigned len;           /* bytes per transfer (streams: one interrupt service interval's payload) */
+    unsigned len;           /* bytes per transfer (streams: as usb_stream_start's caller says) */
     unsigned stride, count;
     uint32_t busy;          /* transfers in flight */
     uint16_t gen[EP_XFERS];
@@ -174,7 +176,7 @@ struct endpoint {
     usb_report_fn fn;
     void *ctx;
     bool halted, dead;
-    unsigned fails;    /* failed recoveries since the last good transfer (the worker's) */
+    unsigned fails;    /* recoveries since the last good transfer, the end of it at 8 (the worker's and a drain's) */
     uint64_t retry_at; /* when the next recovery may run (clock_now_ns; the worker's) */
 };
 
@@ -240,7 +242,7 @@ struct usb_hc {
     struct interrupter *intr;
     unsigned nintr;
     uint8_t target[RING_KINDS]; /* the interrupter each kind of event goes to */
-    bool running; /* atomic; written under every interrupter's lock (hc_set_running) */
+    bool running; /* atomic; written under every interrupter's lock (hc_set_running), or by resume, where no drain runs */
     bool polled;  /* atomic: no interrupt comes, the poll alarm drains the rings */
     struct alarm poll;
     uint32_t periodic[16]; /* open interrupt endpoints by service interval exponent (atomic) */
@@ -260,6 +262,7 @@ struct usb_hc {
     uint8_t port_major[256]; /* USB major revision of each root port, from the protocol capabilities */
     uint8_t port_slot_type[256];
     uint8_t port_hubs[256];  /* the most hubs before a root port's devices, 0: USB's own limit (Table 7-14) */
+    uint8_t port_warms[256]; /* warm resets of a root port that stays stuck (the worker's) */
     const uint32_t *port_psi[256]; /* its protocol's speed table (7.2.1), once for good */
     uint8_t port_psic[256];
 };
@@ -341,6 +344,10 @@ static void *dma_block(unsigned pages, uint64_t *phys) {
     return phys_to_virt(base);
 }
 
+static void dma_free(uint64_t phys, unsigned pages) {
+    for (unsigned i = 0; i < pages; i++) pmm_free(phys + i * 4096ull);
+}
+
 static void ring_reset(struct ring *r) {
     memset(r->trb, 0, 4096);
     r->enq = 0;
@@ -393,7 +400,7 @@ static void ring_release(struct trb *first) {
 
 /* A TD of `trbs` on a Transfer Ring lies in one segment before the Link TRB (4.11.7.1, 4.9.2): what does
    not fit starts after the link, the entries left filled with No Op TDs, which end at once and report
-   nothing (4.11.5.1). Returns how many; meta marks them as no transfer's. */
+   nothing (6.4.1.4, 4.11.7). Returns how many; meta marks them as no transfer's. */
 static unsigned ring_fit(struct ring *r, unsigned trbs, uint32_t target, struct trb_meta *meta) {
     unsigned left = RING_TRBS - 1 - r->enq;
     if (trbs <= left) return 0;
@@ -521,8 +528,9 @@ static void transfer_event(struct usb_hc *hc, uint64_t param, uint32_t status, u
     struct trb_meta m = idx < RING_TRBS - 1 ? ep->meta[idx] : (struct trb_meta){0};
     unsigned b = m.td - 1u;
     bool live = m.td && b < EP_XFERS && (ep->busy & (1u << b)) && m.gen == ep->gen[b];
-    /* a late event of a TD that is gone says nothing of the endpoint as it is now (4.8.3) */
-    if (!live) {
+    /* A TD that is gone was given up by a recovery, which has dealt with the endpoint since. An error
+       on an entry of no TD (the No Op of a wrap, a Link TRB) is the endpoint's as it is now. */
+    if (!live && (m.td || cc == CC_SUCCESS || cc == CC_SHORT)) {
         spin_give(&ep->lock);
         return;
     }
@@ -763,7 +771,7 @@ static uint32_t *out_ctx(struct xdev *xd, unsigned index) {
     return (uint32_t *)(xd->out_ctx + index * xd->dev.hc->ctx_size);
 }
 
-/* The input Slot Context. hub_fields: for Configure Endpoint (6.2.2.3); Address Device takes none. */
+/* The input Slot Context. hub_fields: for Configure Endpoint (6.2.2.2); Address Device takes none. */
 static void slot_context(struct xdev *xd, unsigned entries, bool hub_fields) {
     struct usb_device *d = &xd->dev;
     uint32_t *s = in_ctx(xd, 1);
@@ -849,43 +857,43 @@ static bool set_dequeue(struct xdev *xd, unsigned dci, struct ring *r) {
     return true;
 }
 
-/* Bring a halted or stuck endpoint back to its ring's enqueue point, in the order of 4.6.8's note:
-   the controller's side, a translator's buffer, then (clear_device, never for a control endpoint)
-   the device's halt and data toggle, and only then the ring moved. False leaves the old TRBs in place,
-   so nothing may be queued after them. */
-static bool endpoint_recover(struct xdev *xd, unsigned dci, struct ring *r, unsigned type, unsigned address,
-                             bool clear_device) {
+/* Bring a halted or stuck endpoint back to its ring's enqueue point on the controller's side alone: a
+   control endpoint, or a transfer given up (pipe_reset is for the device's side too). False leaves the
+   old TRBs in place, so nothing may be queued after them. */
+static bool endpoint_recover(struct xdev *xd, unsigned dci, struct ring *r, unsigned type, unsigned address) {
     bool halted;
     if (!endpoint_quiet(xd, dci, &halted)) return false;
     if (halted) tt_clear(xd, type, address, out_ctx(xd, 0)[3] & 0xFF);
-    if (clear_device && usb_control(&xd->dev, 0x02, USB_REQ_CLEAR_FEATURE, 0, address, NULL, 0) < 0) return false;
     return set_dequeue(xd, dci, r);
 }
 
 /* After a failed control transfer the ring's dequeue point is wherever the controller stopped;
  * if it cannot be moved past the dead TD, a new request would run behind it or never at all.
- * ctl_mutex held. */
-static void control_recover(struct xdev *xd) {
-    if (removed(&xd->dev) || endpoint_recover(xd, 1, &xd->ep0, 0, 0, false)) return;
+ * ctl_mutex held. True when the TD is off the ring. */
+static bool control_recover(struct xdev *xd) {
+    if (removed(&xd->dev)) return false;
+    if (endpoint_recover(xd, 1, &xd->ep0, 0, 0)) return true;
     xd->ctl_broken = true;
     kprintf("usb: slot %u control pipe is stuck, the device needs replugging\n", xd->dev.slot);
+    return false;
 }
 
-/* ctl_mutex held. */
+/* ctl_mutex held. mem, phys: the data stage's memory, not the controller's any more if *over is set. */
 static int control(struct xdev *xd, uint8_t type, uint8_t request, uint16_t value, uint16_t index, void *buffer,
-                   uint16_t length) {
+                   uint16_t length, uint8_t *mem, uint64_t phys, bool *over) {
     struct usb_device *d = &xd->dev;
     struct usb_hc *hc = d->hc;
+    *over = true;
     if (removed(d) || xd->ctl_broken || hc_dead(hc)) return -1;
     bool in = type & 0x80;
-    if (!in && length) memcpy(xd->xfer, buffer, length);
+    if (!in && length) memcpy(mem, buffer, length);
     uint64_t setup = type | (uint64_t)request << 8 | (uint64_t)value << 16 | (uint64_t)index << 32 |
                      (uint64_t)length << 48;
     uint64_t f = spin_lock(&xd->ctl_lock);
     xd->ctl_done = false;
     xd->ctl_residual = 0;
     struct trb *first = ring_hold(&xd->ep0, setup, 8, TRB_TYPE(TRB_SETUP) | TRB_IDT | (length ? (in ? 3u : 2u) << 16 : 0), NULL);
-    if (length) ring_push(&xd->ep0, xd->xfer_phys, length, TRB_TYPE(TRB_DATA) | TRB_ISP | (in ? TRB_DIR_IN : 0));
+    if (length) ring_push(&xd->ep0, phys, length, TRB_TYPE(TRB_DATA) | TRB_ISP | (in ? TRB_DIR_IN : 0));
     xd->ctl_status_trb = ring_push(&xd->ep0, 0, 0, TRB_TYPE(TRB_STATUS) | TRB_IOC | (length && in ? 0 : TRB_DIR_IN));
     ring_release(first);
     xd->ep0_state = EP_RUNNING;
@@ -897,27 +905,37 @@ static int control(struct xdev *xd, uint8_t type, uint8_t request, uint16_t valu
     uint32_t residual = xd->ctl_residual;
     spin_unlock(&xd->ctl_lock, f);
     if (!done) {
+        *over = false;
         if (removed(d) || !hc_running(hc)) return -1;
         kprintf("usb: slot %u request %02x:%02x timed out\n", d->slot, type, request);
-        control_recover(xd);
+        *over = control_recover(xd);
         return -1;
     }
     if (cc != CC_SUCCESS) {
-        control_recover(xd);
+        control_recover(xd); /* halted, it moves no more */
         return -1;
     }
     int got = length - (int)(residual < length ? residual : length);
-    if (in && got > 0) memcpy(buffer, xd->xfer, got);
+    if (in && got > 0) memcpy(buffer, mem, got);
     return got;
 }
+
+/* A data stage that does not fit the device's page has 64 KiB of its own, all of wLength (USB 2.0
+   9.3.5), aligned as they are, so one TRB may cover it (4.11.7.1); kept if the controller may still
+   be using it. */
+#define CONTROL_LONG_PAGES 16
 
 int usb_control(struct usb_device *d, uint8_t type, uint8_t request, uint16_t value, uint16_t index,
                 void *buffer, uint16_t length) {
     struct xdev *xd = (struct xdev *)d;
-    if (length > 4096) return -1;
+    bool lng = length > 4096, over;
+    uint64_t phys = xd->xfer_phys;
+    uint8_t *mem = lng ? dma_block(CONTROL_LONG_PAGES, &phys) : xd->xfer;
+    if (!mem) return -1;
     mutex_lock(&xd->ctl_mutex);
-    int r = control(xd, type, request, value, index, buffer, length);
+    int r = control(xd, type, request, value, index, buffer, length, mem, phys, &over);
     mutex_unlock(&xd->ctl_mutex);
+    if (lng && over) dma_free(phys, CONTROL_LONG_PAGES);
     return r;
 }
 
@@ -939,10 +957,6 @@ static unsigned endpoint_interval(unsigned speed, unsigned type, unsigned interv
 }
 
 static unsigned address_dci(uint8_t address) { return (address & 15) * 2 + ((address & 0x80) ? 1 : 0); }
-
-static void dma_free(uint64_t phys, unsigned pages) {
-    for (unsigned i = 0; i < pages; i++) pmm_free(phys + i * 4096ull);
-}
 
 static void free_endpoint(struct usb_hc *hc, struct endpoint *ep) {
     if (!ep) return;
@@ -988,7 +1002,9 @@ static bool set_dequeue(struct xdev *xd, unsigned dci, struct ring *r);
 /* What Disable Slot asks first (4.6.4's note): each endpoint stopped, one halted or in error brought to
    stopped its own way, and the events of what was in them received; no driver waits for them now. */
 static void slot_quiet(struct usb_hc *hc, unsigned slot, struct xdev *xd) {
-    for (unsigned dci = 1; xd && dci < 32; dci++) {
+    /* an Enabled slot, whose Slot State reads 0, has no endpoint to stop (4.6.9) */
+    bool addressed = xd && xd->out_ctx && out_ctx(xd, 0)[3] >> 27;
+    for (unsigned dci = 1; addressed && dci < 32; dci++) {
         struct endpoint *ep = dci == 1 ? NULL : xd->ep[dci];
         if (dci != 1 && !ep) continue;
         if (hc_command(hc, 0, TRB_TYPE(TRB_STOP_EP) | dci << 16 | slot << 24, NULL) != CC_CONTEXT_STATE) continue;
@@ -1068,8 +1084,9 @@ static void endpoint_context(struct xdev *xd, const struct endpoint *ep, unsigne
     c[1] = (ep->type == 1 ? 0u : 3u << 1) | ep_type << 3 | burst << 8 | ep->mps << 16;
     c[2] = (uint32_t)(ep->ring.phys + ep->ring.enq * sizeof(struct trb)) | ep->ring.cycle;
     c[3] = (uint32_t)((ep->ring.phys + ep->ring.enq * sizeof(struct trb)) >> 32);
-    /* average TRB length (4.14.1.1: 1 KiB interrupt, 3 KiB bulk and isochronous) and Max ESIT Payload */
-    c[4] = (ep->type == 3 ? 1024u : 3072u) | (timed ? (ep->esit & 0xFFFF) << 16 : 0);
+    /* Average TRB Length, to matter most for a periodic endpoint (4.14.1.1): an interrupt endpoint's
+       transfers are a packet or a few; 3 KiB for bulk and isochronous. Max ESIT Payload. */
+    c[4] = (ep->type == 3 ? (uint32_t)ep->mps : 3072u) | (timed ? (ep->esit & 0xFFFF) << 16 : 0);
 }
 
 /* Every endpoint but the control one is gone from the controller: nothing refers to them. */
@@ -1109,7 +1126,8 @@ static bool open_endpoints(struct xdev *xd, const struct usb_ep_info *eps, int n
         unsigned burst = 0, mult = 0;
         uint32_t esit = 0;
         if (type == 1 || type == 3) {
-            burst = (e->max_packet >> 11) & 3; /* high speed: extra transactions per microframe */
+            /* high speed: extra transactions per microframe; low and full speed have none (6.2.3.4) */
+            burst = xd->dev.speed == USB_SPEED_HIGH ? (e->max_packet >> 11) & 3 : 0;
             esit = mps * (burst + 1);
         }
         if (xd->dev.speed >= USB_SPEED_SUPER) { /* burst and payload come from the companion */
@@ -1128,7 +1146,8 @@ static bool open_endpoints(struct xdev *xd, const struct usb_ep_info *eps, int n
         ep->esit = esit;
         ep->target = hc->target[type == 3 ? RING_PERIODIC : RING_BULK];
         if (type == 1 || type == 3) ep->interval = (uint8_t)endpoint_interval(xd->dev.speed, type, e->interval);
-        else if (xd->dev.speed == USB_SPEED_HIGH && !(e->address & 0x80)) ep->interval = e->interval;
+        /* bulk OUT: its NAK rate, of 0 to 255 in USB 2.0 Table 9-13 and 0 to 15 in the field (6.2.3.6) */
+        else if (xd->dev.speed == USB_SPEED_HIGH && !(e->address & 0x80)) ep->interval = MIN(e->interval, 15);
         if (type == 3) __atomic_fetch_add(&hc->periodic[ep->interval], 1, __ATOMIC_RELAXED);
         endpoint_context(xd, ep, burst, mult);
         made[dci] = ep;
@@ -1177,12 +1196,12 @@ bool usb_stream_start(struct usb_device *d, uint8_t address, unsigned len, unsig
     return true;
 }
 
-/* A TD ends at a short packet or at its length: with `longest`, that in whole packets, so a shorter
- * transfer is not held waiting for more. With none, one service interval's payload. */
+/* A TD ends at a short packet or at its length: `longest` in whole packets, so a shorter transfer is
+ * not held waiting for more. */
 unsigned usb_interrupt_length(struct usb_device *d, const struct usb_endpoint_desc *e, unsigned longest) {
     struct endpoint *ep = find_endpoint(d, e->address);
     if (!ep) return 0;
-    return longest ? (longest + ep->mps - 1) / ep->mps * ep->mps : ep->esit ? ep->esit : ep->mps;
+    return (longest + ep->mps - 1) / ep->mps * ep->mps;
 }
 
 bool usb_interrupt_start(struct usb_device *d, const struct usb_endpoint_desc *e, unsigned longest, usb_report_fn fn,
@@ -1196,46 +1215,48 @@ bool usb_interrupt_start(struct usb_device *d, const struct usb_endpoint_desc *e
 /* Reset a pipe on both sides. Halted, Reset Endpoint clears the controller's data toggle; otherwise
  * stopped (one in error by Set TR Dequeue, 4.8.3) and Dropped and Added in one Configure Endpoint
  * (4.6.8's last note). The device's side is CLEAR_FEATURE(ENDPOINT_HALT), in between for a halted one
- * (4.6.8's note); until both are done the pipe stays halted and transfers are refused. */
+ * (4.6.8's note). Its ring goes on from the enqueue point. False: a part did not go through, and
+ * the caller keeps the pipe halted. */
+static bool pipe_reset(struct xdev *xd, struct endpoint *ep) {
+    struct usb_device *d = &xd->dev;
+    unsigned slot = d->slot, dci = ep->dci;
+    bool halted;
+    if (!endpoint_quiet(xd, dci, &halted)) return false;
+    if (halted) {
+        tt_clear(xd, ep->type, ep->address, out_ctx(xd, 0)[3] & 0xFF);
+        return usb_control(d, 0x02, USB_REQ_CLEAR_FEATURE, 0, ep->address, NULL, 0) >= 0 && set_dequeue(xd, dci, &ep->ring);
+    }
+    if (state_get(xd, dci) == EP_ERROR && !set_dequeue(xd, dci, &ep->ring)) return false;
+    mutex_lock(&xd->in_mutex);
+    memset(xd->in_ctx, 0, 4096);
+    uint32_t *icc = in_ctx(xd, 0), *c = in_ctx(xd, dci + 1);
+    icc[0] = 1u << dci;
+    icc[1] = 1u | 1u << dci;
+    memcpy(c, out_ctx(xd, dci), 5 * sizeof *c); /* what follows is the controller's (6.2.3) */
+    c[0] &= ~7u;
+    c[2] = (uint32_t)(ep->ring.phys + ep->ring.enq * sizeof(struct trb)) | ep->ring.cycle;
+    c[3] = (uint32_t)((ep->ring.phys + ep->ring.enq * sizeof(struct trb)) >> 32);
+    slot_context(xd, out_ctx(xd, 0)[0] >> 27, true);
+    int cc = hc_command(d->hc, xd->in_phys, TRB_TYPE(TRB_CONFIGURE) | slot << 24, NULL);
+    mutex_unlock(&xd->in_mutex);
+    if (cc != CC_SUCCESS) {
+        kprintf("usb: slot %u endpoint %u could not be reset (%d)\n", slot, dci, cc);
+        return false;
+    }
+    state_set(xd, dci, EP_RUNNING);
+    return usb_control(d, 0x02, USB_REQ_CLEAR_FEATURE, 0, ep->address, NULL, 0) >= 0;
+}
+
+/* From here until both sides are done the pipe is halted and transfers are refused, whatever it was. */
 int usb_clear_halt(struct usb_device *d, uint8_t address) {
-    struct xdev *xd = (struct xdev *)d;
     struct endpoint *ep = find_endpoint(d, address);
     if (!ep) return -1;
-    struct usb_hc *hc = d->hc;
-    unsigned slot = d->slot, dci = ep->dci;
-    bool halted = false, ok = endpoint_quiet(xd, dci, &halted);
-    endpoint_restart(ep, ep->halted);
-    if (ok && state_get(xd, dci) == EP_ERROR) ok = set_dequeue(xd, dci, &ep->ring);
-    if (ok && halted) {
-        tt_clear(xd, ep->type, address, out_ctx(xd, 0)[3] & 0xFF);
-        ok = usb_control(d, 0x02, USB_REQ_CLEAR_FEATURE, 0, address, NULL, 0) >= 0 && set_dequeue(xd, dci, &ep->ring);
-    } else if (ok) {
-        mutex_lock(&xd->in_mutex);
-        memset(xd->in_ctx, 0, 4096);
-        uint32_t *icc = in_ctx(xd, 0), *c = in_ctx(xd, dci + 1);
-        icc[0] = 1u << dci;
-        icc[1] = 1u | 1u << dci;
-        memcpy(c, out_ctx(xd, dci), 5 * sizeof *c); /* what follows is the controller's (6.2.3) */
-        c[0] &= ~7u;
-        c[2] = (uint32_t)(ep->ring.phys + ep->ring.enq * sizeof(struct trb)) | ep->ring.cycle;
-        c[3] = (uint32_t)((ep->ring.phys + ep->ring.enq * sizeof(struct trb)) >> 32);
-        slot_context(xd, out_ctx(xd, 0)[0] >> 27, true);
-        int cc = hc_command(hc, xd->in_phys, TRB_TYPE(TRB_CONFIGURE) | slot << 24, NULL);
-        mutex_unlock(&xd->in_mutex);
-        if (cc != CC_SUCCESS) {
-            kprintf("usb: slot %u endpoint %u could not be reset (%d)\n", slot, dci, cc);
-            ok = false;
-        } else {
-            state_set(xd, dci, EP_RUNNING);
-            ok = usb_control(d, 0x02, USB_REQ_CLEAR_FEATURE, 0, address, NULL, 0) >= 0;
-        }
-    }
-    if (ok) {
-        uint64_t f = spin_lock(&ep->lock);
-        ep->halted = false;
-        spin_unlock(&ep->lock, f);
-    }
-    return ok ? 0 : -1;
+    endpoint_restart(ep, true);
+    if (!pipe_reset((struct xdev *)d, ep)) return -1;
+    uint64_t f = spin_lock(&ep->lock);
+    ep->halted = false;
+    spin_unlock(&ep->lock, f);
+    return 0;
 }
 
 int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, unsigned timeout_ms, unsigned *moved) {
@@ -1268,9 +1289,9 @@ int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, uns
     if (!done) {
         if (removed(d) || !hc_running(d->hc)) return -1;
         kprintf("usb: slot %u endpoint %02x transfer timed out\n", d->slot, address);
-        bool stuck = !endpoint_recover(xd, ep->dci, &ep->ring, ep->type, address, false); /* stop it and skip the TD */
+        bool stuck = !endpoint_recover(xd, ep->dci, &ep->ring, ep->type, address); /* stop it and skip the TD */
         endpoint_restart(ep, stuck);
-        return -1;
+        return USB_TIMEOUT;
     }
     /* what arrived before a stall or an error is the caller's too (BOT 6.7.2) */
     *moved = got;
@@ -1406,7 +1427,7 @@ static bool configure(struct xdev *xd, const uint8_t *cfg, unsigned total) {
     kfree(eps);
     if (!opened) return false;
     if (usb_control(d, 0, USB_REQ_SET_CONFIG, cfg[5], 0, NULL, 0) >= 0) return true;
-    if (n) deconfigure(xd);
+    if (out_ctx(xd, 0)[3] >> 27 == SLOT_CONFIGURED) deconfigure(xd); /* no endpoint added: it never was */
     return false;
 }
 
@@ -1435,7 +1456,6 @@ static uint8_t *choose_configuration(struct usb_device *d, int *got) {
         if (usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_CONFIG << 8 | i, 0, head, 9) < 9) continue;
         unsigned total = head[2] | head[3] << 8;
         if (total < 9) continue;
-        if (total > 4096) total = 4096;
         uint8_t *cfg = kmalloc(total);
         if (!cfg) break;
         int n = usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_CONFIG << 8 | i, 0, cfg, total);
@@ -1528,10 +1548,19 @@ static unsigned speed_kind_of_psi(unsigned major, uint32_t psi) {
     return rate <= 1500000 ? USB_SPEED_LOW : rate <= 12000000 ? USB_SPEED_FULL : USB_SPEED_HIGH;
 }
 
-static unsigned port_speed_id(const struct usb_hc *hc, unsigned p, unsigned kind) {
-    for (unsigned i = 0; i < hc->port_psic[p]; i++)
-        if (speed_kind_of_psi(hc->port_major[p], hc->port_psi[p][i]) == kind) return hc->port_psi[p][i] & 15;
-    return kind == USB_SPEED_SUPER_PLUS ? 5 : kind;
+/* The Port Speed of a device of this kind and rank (USB 3.2 7.5.4.5.1) behind root port p: the listed one
+   of its rate, 20 Gb/s for Gen2x2 and 10 for the two below (Table 7-13); by default the ID of Table 7-13. */
+static unsigned port_speed_id(const struct usb_hc *hc, unsigned p, unsigned kind, unsigned rank) {
+    uint64_t rate = rank == 3 ? 20000000000ull : 10000000000ull;
+    unsigned first = 0;
+    for (unsigned i = 0; i < hc->port_psic[p]; i++) {
+        uint32_t psi = hc->port_psi[p][i];
+        if (speed_kind_of_psi(hc->port_major[p], psi) != kind) continue;
+        if (kind != USB_SPEED_SUPER_PLUS || psi_rate(psi) == rate) return psi & 15;
+        if (!first) first = psi & 15;
+    }
+    if (first) return first;
+    return kind != USB_SPEED_SUPER_PLUS ? kind : rank == 1 ? 6 : rank == 3 ? 7 : 5;
 }
 
 /* The kind of a Port Speed that root port p reads. */
@@ -1542,13 +1571,15 @@ static unsigned port_speed_kind(const struct usb_hc *hc, unsigned p, unsigned id
 }
 
 /* The rank of the link root port p reads (USB 3.2 7.5.4.5.1). By default its ID says (Table 7-13); a listed
-   one says its rate, which tells 20 Gb/s from less but not Gen2x1 from Gen1x2. */
+   one says the rate of all its lanes, of which PORTLI.RLC has the number (5.4.10.1, 7.2.1). */
 static unsigned port_speed_rank(const struct usb_hc *hc, unsigned p, unsigned id) {
     for (unsigned i = 0; i < hc->port_psic[p]; i++) {
         uint32_t psi = hc->port_psi[p][i];
         if ((psi & 15) != id) continue;
         if (speed_kind_of_psi(hc->port_major[p], psi) != USB_SPEED_SUPER_PLUS) return 0;
-        return psi_rate(psi) >= 20000000000ull ? 3 : 2;
+        unsigned lanes = (rd32(hc->op, PORTLI(p)) >> 16 & 15) + 1;
+        bool gen2 = psi_rate(psi) / lanes >= 10000000000ull;
+        return lanes > 1 ? (gen2 ? 3 : 1) : (gen2 ? 2 : 0);
     }
     return id == 5 ? 2 : id == 6 ? 1 : id == 7 ? 3 : 0;
 }
@@ -1623,7 +1654,7 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
     }
     /* A hub's descriptor may only be asked of it configured (USB 2.0 11.24.2.5, USB 3.2 10.16.2.3), and
        what it says goes into the Slot Context by the first Configure Endpoint after the slot's Default
-       state (xHCI 4.5.2, 6.2.2.3): so a hub is configured as a function, asked, and made anew. */
+       state (xHCI 4.5.2, 6.2.2.2): so a hub is configured as a function, asked, and made anew. */
     if (configuration_has_hub(cfg, (unsigned)got) && usbhub_prepare(d) &&
         (!device_readdress(xd) || !configure(xd, cfg, (unsigned)got))) {
         kprintf("usb: slot %u could not be configured as a hub\n", slot);
@@ -1656,7 +1687,7 @@ struct usb_device *usb_attach_child(struct usb_device *hub, unsigned port, unsig
         tt_port = port;
     }
     struct xdev *xd = device_attach(hub->hc, hub, port, hub->root_port, route, speed,
-                                    port_speed_id(hub->hc, hub->root_port, speed), rank, hub->depth + 1, tt_slot, tt_port);
+                                    port_speed_id(hub->hc, hub->root_port, speed, rank), rank, hub->depth + 1, tt_slot, tt_port);
     return xd ? &xd->dev : NULL;
 }
 
@@ -1707,7 +1738,7 @@ static bool port_reset(struct usb_hc *hc, unsigned p, bool warm) {
 }
 
 /* A USB3 root port's link trains by itself and is enabled then, which comes as a port status
-   change; a stuck link (inactive, compliance) does not. False at the deadline. */
+   change; a stuck link (inactive, compliance) does not, and asks for a warm reset. False at the deadline. */
 static bool link_trained(struct usb_hc *hc, unsigned p) {
     uint64_t seen = __atomic_load_n(&hc->kicks, __ATOMIC_ACQUIRE);
     for (uint64_t deadline = clock_after(NS_PER_S); hc_running(hc);) {
@@ -1730,8 +1761,13 @@ static void root_port(struct usb_hc *hc, unsigned p) {
         hc->root[p] = NULL;
         usb_remove(&gone->dev);
     }
-    if (!(sc & PS_CCS) || hc->root[p]) return;
     bool usb3 = hc->port_major[p] >= 3;
+    /* In Error (Inactive) or Compliance a USB3 port reads no connection, and only a reset takes it out
+       (Figure 4-27, 4.19.1.2.5). A warm reset that does not help comes back here: a few tries. */
+    bool stuck = usb3 && (PS_PLS(sc) == PLS_INACTIVE || PS_PLS(sc) == PLS_COMPLIANCE);
+    if (!stuck) hc->port_warms[p] = 0;
+    else if (++hc->port_warms[p] > 3) return;
+    if ((!(sc & PS_CCS) && !stuck) || hc->root[p]) return;
     if (!usb3) {
         sleep_until(clock_after(100 * NS_PER_MS)); /* connect debounce (USB 2.0 7.1.7.3, TATTDB) */
         if (!(rd32(hc->op, PORTSC(p)) & PS_CCS)) return;
@@ -1784,7 +1820,7 @@ static void hc_recover(struct usb_hc *hc) {
             }
             /* the device keeps its own halt and data toggle until told; if that does not get through,
              * the pipe is still halted and is retried later */
-            bool ok = endpoint_recover(xd, i, &ep->ring, ep->type, ep->address, true);
+            bool ok = pipe_reset(xd, ep);
             if (removed(&xd->dev)) break;
             if (++ep->fails >= 8) {
                 kprintf("usb: slot %u endpoint %u keeps failing, given up until it is replugged\n", s, i);
@@ -1934,13 +1970,12 @@ static bool hc_start(struct usb_hc *hc) {
     for (unsigned x = (hcc1 >> 16) << 2; x && x + 16 <= hc->bar_size;) {
         uint32_t v = rd32(hc->cap, x);
         if ((v & 0xFF) == 1) {
-            if (v & (1u << 16)) {
-                /* only the OS semaphore byte: a whole-register write could put back a BIOS bit
-                 * the firmware cleared in between */
-                mmio_write8(hc->cap + x + 3, 1);
-                if (!wait_reg(hc->cap, x, 1u << 16, 0, NS_PER_S))
-                    kprintf("usb: controller %d firmware kept ownership, taking it anyway\n", hc->index);
-            }
+            /* Ownership: the OS semaphore set and the BIOS's clear (Table 7-4), whoever had it, or the
+             * firmware may take it later (4.22.1). Only the OS semaphore's byte: a whole-register write
+             * could put back a BIOS bit the firmware cleared in between. */
+            mmio_write8(hc->cap + x + 3, (uint8_t)(v >> 24) | 1);
+            if (!wait_reg(hc->cap, x, 1u << 16, 0, NS_PER_S))
+                kprintf("usb: controller %d firmware kept ownership, taking it anyway\n", hc->index);
             uint32_t legacy = rd32(hc->cap, x + 4);
             wr32(hc->cap, x + 4, (legacy & ~0xE011u) | 0xE0000000u); /* SMIs off, stale events acked */
         } else if ((v & 0xFF) == 2) {
@@ -1989,8 +2024,10 @@ static bool hc_start(struct usb_hc *hc) {
     if (!hc->intr && !interrupters_init(hc)) return false;
     unsigned scratch = ((hcs2 >> 21) & 0x1F) << 5 | hcs2 >> 27;
     if (scratch && !hc->scratch_phys) {
-        /* buffers of its PAGESIZE, 2^(n+12) bytes on that boundary, zeroed (5.4.3, 4.20). Up to 1023 entries
-           in the array, which two pages aligned as a pair hold (Table 6-1) */
+        /* buffers of its PAGESIZE, 2^(n+12) bytes on that boundary, zeroed (5.4.3, 4.20). The array has as
+           many entries as Max Scratchpad Buffers says, Hi and Lo (5.3.4, 4.20, 6.6), up to 1023: two pages
+           aligned as a pair. Table 6-1 gives it at most 248 bytes, and within a PAGESIZE; the two do not agree
+           for the largest, and this holds them all, within a PAGESIZE up to 512. */
         uint32_t pagesize = rd32(hc->op, PAGESIZE) & 0xFFFF;
         unsigned pages = pagesize ? 1u << __builtin_ctz(pagesize) : 1;
         uint64_t array_phys;

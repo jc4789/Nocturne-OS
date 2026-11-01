@@ -30,6 +30,7 @@ enum { USB_SPEED_FULL = 1, USB_SPEED_LOW = 2, USB_SPEED_HIGH = 3, USB_SPEED_SUPE
 #define USB_DESC_COMPANION 0x30 /* SuperSpeed endpoint companion */
 #define USB_DESC_SSP_COMPANION 0x31 /* SuperSpeedPlus isochronous endpoint companion */
 #define USB_STALL (-2)          /* a transfer the endpoint refused (it is halted until usb_clear_halt) */
+#define USB_TIMEOUT (-3)        /* the device did not answer in the time given */
 
 struct usb_device_desc {
     uint8_t length, type;
@@ -81,8 +82,8 @@ typedef void (*usb_report_fn)(struct usb_device *d, void *ctx, const uint8_t *da
 /* A control transfer; returns the bytes moved, or -1 (stall, error, timeout, removal). */
 int usb_control(struct usb_device *d, uint8_t type, uint8_t request, uint16_t value, uint16_t index,
                 void *buffer, uint16_t length);
-/* Keep the interrupt IN endpoint polled, handing each transfer of up to `longest` bytes to `fn` as it
- * comes; 0: each service interval's data, as usb_interrupt_length says how much that is. */
+/* Keep the interrupt IN endpoint polled, handing each transfer of up to `longest` bytes, in whole
+ * packets, to `fn` as it comes; usb_interrupt_length says how many bytes that is. */
 unsigned usb_interrupt_length(struct usb_device *d, const struct usb_endpoint_desc *ep, unsigned longest);
 bool usb_interrupt_start(struct usb_device *d, const struct usb_endpoint_desc *ep, unsigned longest, usb_report_fn fn,
                          void *ctx);
@@ -97,8 +98,8 @@ bool usb_open_endpoints(struct usb_device *d, const struct usb_ep_info *eps, int
  * are queued anew, after a recovery dropped them all (data NULL, len 0). */
 bool usb_stream_start(struct usb_device *d, uint8_t address, unsigned len, unsigned count, usb_report_fn fn, void *ctx);
 /* One bulk transfer of up to 64 KiB, waited for. One caller at a time on an endpoint (the class
- * driver's lock). Returns 0, USB_STALL, or -1 (error, timeout or removal: the endpoint then needs
- * usb_clear_halt too); *moved, in each case, is the bytes that did move, received ones in buf. */
+ * driver's lock). Returns 0, USB_STALL, USB_TIMEOUT, or -1 (error or removal); after any but 0 the
+ * endpoint needs usb_clear_halt; *moved, in each case, is the bytes that did move, received ones in buf. */
 int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, unsigned timeout_ms, unsigned *moved);
 /* Reset a pipe on both sides: the controller's endpoint state and data toggle, then
  * CLEAR_FEATURE(ENDPOINT_HALT) on the device. */
