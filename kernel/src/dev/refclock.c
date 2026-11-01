@@ -1,4 +1,4 @@
-/* The platform's reference clocks (dev/refclock.h): the HPET and the CMOS RTC.
+/* The platform's reference clocks (dev/refclock.h): the HPET, the ACPI PM timer and the CMOS RTC.
 
    The HPET (IA-PC HPET 1.0a): its block of registers at the BASE_ADDRESS of the ACPI table
    "HPET" (3.2.4), mapped uncached. The main counter (2.3.7, offset 0F0h) counts up at
@@ -9,9 +9,18 @@
    one wraps, and is read at least every quarter of its wrap, so its count runs on past the wraps
    without doubt. Its readings may be 2 counts early or late (2.4.1 rule 2). Its registers, the
    counter among them, are not kept through S3 (2.3.3 rule 1): ENABLE_CNF is set again after it,
-   and a new count begins. It is the clock's rate reference: each reading, between two TSC
-   readings, is a sample given to clock_rate_sample when the clock wants one, from an alarm set
-   for the moment it answers.
+   and a new count begins.
+
+   The ACPI PM timer (ACPI 6.5 4.8.2.1, 4.8.3.3): a free-running count-up timer at 3.579545 MHz,
+   read-only, read as 32 bits at the FADT's X_PM_TMR_BLK (I/O or memory space) or else PM_TMR_BLK
+   (I/O space, PM_TMR_LEN 4), 32 bits wide where TMR_VAL_EXT says so and 24 otherwise. Both blocks are
+   optional, and a hardware-reduced platform's are to be ignored (5.2.9). It counts in S0 and may
+   begin from any value after another state. ACPI states no error for a reading.
+
+   The clock's rate reference is the first of these two that is there and counts, the HPET before
+   the PM timer: it is read in one memory access, and the timer's run off the same 14.31818 MHz.
+   Each reading, between two TSC readings, is a sample given to clock_rate_sample when the clock
+   wants one, from an alarm set for the moment it answers.
 
    The RTC: the MC146818-compatible CMOS clock at ports 70h (index) and 71h (data), registers 00h
    seconds, 02h minutes, 04h hours, 07h day, 08h month, 09h year, 0Ah status A (bit 7 UIP: an
@@ -53,11 +62,12 @@ struct acpi_hpet { /* IA-PC HPET 1.0a 3.2.4 */
 
 static volatile uint32_t *hpet;
 
-/* The HPET as the clock's rate reference: one CPU at a time touches this, the alarm's fire, or
-   CPU 0 starting it at boot or after a sleep, before alarms come. */
+/* The rate reference: one CPU at a time touches this, the alarm's fire, or CPU 0 starting it at
+   boot or after a sleep, before alarms come. */
 static struct {
     struct clock_rate_reference ref;
     uint64_t (*read)(uint64_t *ta, uint64_t *tb, uint32_t *cpu);
+    uint32_t jitter;     /* counts a reading may be early or late */
     uint64_t mask;       /* its readings: modulo mask + 1 */
     uint64_t span_ns;    /* the longest time between readings: a quarter of its wrap */
     uint64_t raw, count; /* the last reading, and the count run on past the wraps at it */
@@ -93,28 +103,44 @@ static uint64_t hpet_read64(uint64_t *ta, uint64_t *tb, uint32_t *cpu) {
     }
 }
 
+static uint16_t pm_port;           /* where the timer is, in I/O space */
+static volatile uint32_t *pm_mmio; /* or in memory */
+
+static uint64_t pm_read(uint64_t *ta, uint64_t *tb, uint32_t *cpu) {
+    *ta = clock_tsc_read(cpu);
+    uint32_t count = pm_mmio ? mmio_read32(pm_mmio) : inl(pm_port);
+    *tb = clock_tsc_read(NULL);
+    return count;
+}
+
 /* The counter read again while each try is narrower than the last (a strictly smaller width each
-   time, so it ends), the count run on by the narrowest; then given to the clock when it wants it,
-   and the alarm set for its next wish, or sooner where the counter would wrap past doubt first.
-   A 64th of the wait late is as good (the alarm shares an interrupt then). Interrupts off. */
-static void hpet_sample(void) {
-    struct clock_rate_sample s = {.jitter = HPET_JITTER};
+   time, so it ends), the count run on by the narrowest. Interrupts off. */
+static void rate_read(struct clock_rate_sample *s) {
     uint64_t width = UINT64_MAX, raw = 0;
+    s->jitter = rate.jitter;
     for (;;) {
         uint64_t ta, tb;
         uint32_t cpu;
         uint64_t r = rate.read(&ta, &tb, &cpu);
         if (tb - ta >= width) break;
         width = tb - ta;
-        s.tsc_a = ta;
-        s.tsc_b = tb;
-        s.cpu = cpu;
+        s->tsc_a = ta;
+        s->tsc_b = tb;
+        s->cpu = cpu;
         raw = r;
     }
     if (!rate.fresh) rate.count += (raw - rate.raw) & rate.mask;
     rate.fresh = false;
     rate.raw = raw;
-    s.count = rate.count;
+    s->count = rate.count;
+}
+
+/* A reading, given to the clock when it wants it, and the alarm set for its next wish, or sooner
+   where the counter would wrap past doubt first. A 64th of the wait late is as good (the alarm
+   shares an interrupt then). Interrupts off. */
+static void rate_sample(void) {
+    struct clock_rate_sample s;
+    rate_read(&s);
     uint64_t now = clock_now_ns();
     if (now >= rate.wanted) rate.wanted = clock_rate_sample(&rate.ref, &s);
     if (rate.wanted == CLOCK_NEVER) return;
@@ -124,21 +150,35 @@ static void hpet_sample(void) {
     alarm_set_range(&rate.alarm, at, late > CLOCK_NEVER - at ? CLOCK_NEVER : at + late);
 }
 
-static void hpet_fire(struct alarm *a, struct regs *r) {
+static void rate_fire(struct alarm *a, struct regs *r) {
     (void)a;
     (void)r;
-    hpet_sample();
+    rate_sample();
 }
 
-/* After a sleep (clock_resume): the counter on again, a new count, and its first sample now. */
-static void hpet_resume(void) {
-    hpet_enable();
+/* At the start and after a sleep: the counter on, a new count, and its first sample now. */
+static void rate_begin(void) {
+    if (hpet) hpet_enable();
     rate.fresh = true;
     rate.wanted = 0;
-    hpet_sample();
+    rate_sample();
 }
 
-bool refclock_hpet_start(void) {
+/* The device just found counts: a counter that does not move past any count's period, whatever
+   the TSC's rate (2^26 counts, 6 ms at 10 GHz; the slowest here counts at 3.58 MHz), is none. */
+#define COUNTING_TSC (1ull << 26)
+static bool rate_counting(void) {
+    struct clock_rate_sample a, b;
+    rate.fresh = true;
+    rate_read(&a);
+    do {
+        rate_read(&b);
+        if (b.count != a.count) return true;
+    } while (b.tsc_b - a.tsc_a < COUNTING_TSC);
+    return false;
+}
+
+static bool hpet_find(void) {
     const struct acpi_hpet *t = acpi_find("HPET", 0);
     if (!t) return false;
     if (t->h.length < sizeof *t || t->base.space != 0 || !t->base.address) {
@@ -157,18 +197,61 @@ bool refclock_hpet_start(void) {
     hpet_enable();
     bool wide = caps & HPET_COUNT_SIZE_CAP;
     rate.ref = (struct clock_rate_reference){.name = "the HPET", .hz_num = FS_PER_S, .hz_den = period,
-                                             .resume = hpet_resume};
+                                             .read = rate_read, .begin = rate_begin};
     rate.read = wide ? hpet_read64 : hpet_read32;
+    rate.jitter = HPET_JITTER;
     rate.mask = wide ? UINT64_MAX : UINT32_MAX;
     /* a quarter of a 32-bit counter's wrap: 2^30 counts of at most 10^8 fs, under 2^57 fs */
     rate.span_ns = wide ? CLOCK_NEVER : ((uint64_t)period << 30) / (FS_PER_S / NS_PER_S);
-    rate.fresh = true;
-    rate.wanted = 0;
-    alarm_init(&rate.alarm, hpet_fire);
+    if (!rate_counting()) {
+        kprintf("refclock: the HPET at %lx does not count\n", t->base.address);
+        hpet = NULL;
+        return false;
+    }
     kprintf("refclock: HPET at %lx, %u bits, %lu.%06lu MHz\n", t->base.address, wide ? 64 : 32,
             FS_PER_S / period / 1000000, FS_PER_S / period % 1000000);
-    hpet_sample();
     return true;
+}
+
+#define PM_TIMER_HZ 3579545u
+#define GAS_MEMORY 0
+#define GAS_IO 1
+
+static bool pm_find(void) {
+    const struct acpi_fadt *f = acpi_find("FACP", 0);
+    if (!f || f->h.length < offsetof(struct acpi_fadt, reset_reg) || (f->flags & FADT_HW_REDUCED)) return false;
+    const struct acpi_gas *x = f->h.length >= offsetof(struct acpi_fadt, x_gpe0) ? &f->x_pm_tmr : NULL;
+    uint64_t at = 0;
+    bool memory = false;
+    if (x && x->address && (x->space == GAS_MEMORY || (x->space == GAS_IO && x->address <= UINT16_MAX))) {
+        at = x->address;
+        memory = x->space == GAS_MEMORY;
+    } else if (f->pm_tmr && f->pm_tmr_len == 4 && f->pm_tmr <= UINT16_MAX) {
+        at = f->pm_tmr;
+    }
+    if (!at) return false;
+    if (memory && !(pm_mmio = vmm_map_mmio(at, sizeof *pm_mmio))) return false;
+    if (!memory) pm_port = (uint16_t)at;
+    bool wide = f->flags & FADT_TMR_VAL_EXT;
+    rate.ref = (struct clock_rate_reference){.name = "the ACPI PM timer", .hz_num = PM_TIMER_HZ, .hz_den = 1,
+                                             .read = rate_read, .begin = rate_begin};
+    rate.read = pm_read;
+    rate.jitter = 0;
+    rate.mask = wide ? UINT32_MAX : 0xFFFFFF;
+    rate.span_ns = (rate.mask + 1) / 4 * NS_PER_S / PM_TIMER_HZ;
+    if (!rate_counting()) {
+        kprintf("refclock: the ACPI PM timer at %s %lx does not count\n", memory ? "memory" : "port", at);
+        pm_mmio = NULL;
+        return false;
+    }
+    kprintf("refclock: ACPI PM timer at %s %lx, %u bits, 3.579545 MHz\n", memory ? "memory" : "port", at, wide ? 32 : 24);
+    return true;
+}
+
+const struct clock_rate_reference *refclock_rate_reference(void) {
+    if (!hpet_find() && !pm_find()) return NULL;
+    alarm_init(&rate.alarm, rate_fire);
+    return &rate.ref;
 }
 
 /* ---- the RTC ---- */

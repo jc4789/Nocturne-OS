@@ -13,7 +13,8 @@
      was armed: each arming is a measurement whose lower bound replaces the ratio when higher.
 
    The timer counts at a rate that does not vary with P-states or C-states, in steps of up to 8
-   (PPR 55898 2.1.12: "the APIC timer may increment in units of between 1 and 8"); it goes on in
+   (PPR 55898 and 57238 2.1.12: "the APIC timer may increment in units of between 1 and 8"; a CPU
+   that steps by less only makes the bound below looser); it goes on in
    every C-state where CPUID 06h EAX[2] (ARAT) says so (PPR 55898, CPUID_Fn00000006_EAX;
    cpu_features.arat): where it does not, an idle CPU may not enter a C-state that stops it while
    an alarm is armed. */
@@ -30,7 +31,7 @@
 #define LAPIC_DIVIDE_BY_1 0xB
 #define IA32_TSC_DEADLINE 0x6E0
 #define LVT_TSC_DEADLINE (2u << 17)
-#define COUNT_STEP 8         /* PPR 55898 2.1.12 */
+#define COUNT_STEP 8         /* the largest step any manual gives */
 #define RATIO_SHIFT 48       /* the ratio's fixed point */
 #define RATIO_ONE (1ull << RATIO_SHIFT)
 /* The first measurement runs until the TSC has gone 2^10 times the readings' width and the timer

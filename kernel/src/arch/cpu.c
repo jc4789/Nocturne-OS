@@ -3,19 +3,22 @@
    The leaves that name features are read here once, on the first CPU, before anything uses them;
    every other CPU is checked against them as it starts. Nocturne requires the set below of every
    CPU (x86-64-v4, the system features the kernel builds on, and nothing older: the floor is Zen 4)
-   and stops at boot when one is missing. The optional features are the ones a hypervisor or a
-   model may lack (WHPX shows no PCID, MWAIT or invariant TSC bit): their users choose a path by
-   them. Of those, what Nocturne needs of the hardware itself (an invariant TSC) is required
-   where no hypervisor shows itself. Leaf 0xD (the XSAVE layout) is arch/fpu.c's, the topology
-   leaves (0xB, 0x1F, 4, 0x8000001D) arch/topology.c's, the hypervisor's leaves from 0x40000000
-   vm/'s.
+   and stops at boot when one is missing, whoever made it. The optional features are the ones a
+   hypervisor or a model may lack (WHPX shows no PCID, MWAIT or invariant TSC bit): their users
+   choose a path by them, and where makers differ (the TSC's rate, performance requests, corrected
+   machine checks, speculation controls) each maker's way is here by its own manual. Of those,
+   what Nocturne needs of the hardware itself (an invariant TSC) is required where no hypervisor
+   shows itself. Leaf 0xD (the XSAVE layout) is arch/fpu.c's, the topology leaves (0xB, 0x1F, 4,
+   0x8000001D, 0x80000026) arch/topology.c's, the hypervisor's leaves from 0x40000000 vm/'s.
 
-   What the CPU states of its TSC's rate is read here too, with the leaves: on the hardware the
-   P0 P-state's definition (tsc_p0), which the clock starts from (sys/clock.c).
+   What the CPU states of its TSC's rate is read here too, with the leaves (arch/tsc_rate.h says
+   what the registers mean); the clock starts from it, and measures the rate where it states none
+   (sys/clock.c).
 
    cpu_setup is the one way a CPU gets into the state the kernel runs it in: CPU 0 at boot, each
    other CPU as it starts, CPU 0 again after S3. Nothing is copied back from before a sleep. */
 #include "kernel.h"
+#include "arch/apic.h"
 #include "arch/cpu.h"
 #include "arch/fpu.h"
 #include "arch/gdt.h"
@@ -24,6 +27,7 @@
 #include "arch/pat.h"
 #include "arch/smp.h"
 #include "arch/spin.h"
+#include "arch/tsc_rate.h"
 
 struct cpu_features cpu_features;
 
@@ -72,9 +76,11 @@ static const struct {
 } optional[] = {
     OPTIONAL(L1, ECX, 3, "MWAIT", mwait), OPTIONAL(L1, ECX, 17, "PCID", pcid),
     OPTIONAL(L1, ECX, 24, "TSC deadline", tsc_deadline), OPTIONAL(L1, ECX, 31, "hypervisor", hypervisor),
-    OPTIONAL(L6, EAX, 2, "ARAT", arat), OPTIONAL(L6, ECX, 0, "APERF/MPERF", aperf_mperf),
+    OPTIONAL(L6, EAX, 2, "ARAT", arat), OPTIONAL(L6, EAX, 7, "HWP", hwp), OPTIONAL(L6, EAX, 10, "HWP EPP", hwp_epp),
+    OPTIONAL(L6, ECX, 0, "APERF/MPERF", aperf_mperf),
     OPTIONAL(L7, ECX, 2, "UMIP", umip),
-    OPTIONAL(L7, ECX, 13, "TME", tme), OPTIONAL(L7, EDX, 26, "IBRS and IBPB", ibpb),
+    OPTIONAL(L7, ECX, 13, "TME", tme), OPTIONAL(L7, EDX, 26, "IBPB", ibpb), OPTIONAL(L7, EDX, 26, "IBRS", ibrs),
+    OPTIONAL(L7, EDX, 27, "STIBP", stibp),
     OPTIONAL(L7, EDX, 29, "IA32_ARCH_CAPABILITIES", arch_capabilities),
     OPTIONAL(LE1, ECX, 22, "topology extensions", topology_extensions),
     OPTIONAL(LE7, EBX, 3, "scalable MCA", scalable_mca), HARDWARE(LE7, EDX, 8, "invariant TSC", invariant_tsc),
@@ -125,41 +131,31 @@ static void read_brand(char *out) {
 }
 
 /* ---- the TSC's rate ----
-   On the hardware the TSC counts at the P0 P-state's frequency (PPR 56713 for Family 19h Model
-   61h, 2.1.9; HWCR[TscFreqSel], MSR C001_0015 bit 24, read-only: "1=The TSC increments at the P0
-   frequency"). PStateDef[0] (MSR C001_0064) defines P0: PstateEn (bit 63) says the definition is
-   valid; CpuFid (bits 7:0, 10h-FFh) times 25 MHz is the VCO; CpuDfsId (bits 13:8) divides it by
-   DID/8, its valid values 08h-1Ah and the even ones 1Ch-2Ch (the rest reserved, 00h off). So the
-   TSC counts 200 MHz * FID / DID a second, the glossary's CoreCOF; the register's own line "The core
-   COF is defined as CpuFid * 5MHz" reaches 1275 MHz at most and agrees with neither table.
-   PStateDef's frequency fields are the same on every core of the coherent fabric (PPR,
-   PStateDef), and HWCR[LockTscToCurrentP0] 0 keeps the TSC at P0's frequency, which nothing here
-   changes; each CPU is checked as it starts (cpu_features_same). The rate is nominal: spread
-   spectrum lowers it (the glossary), and its crystal is off by its tolerance; the clock measures
-   what the TSC really counts (sys/clock.c). A hypervisor's guest reads nothing of its own TSC
-   here (a TSC ratio may scale it): vm/ registers that rate. They are read before the IDT is up,
-   where a fault would end the boot with nothing said; every AMD CPU with what Nocturne requires
-   (AVX-512: Zen 4 on) has both registers. */
+   What this CPU's registers state of it, by its maker's manual (arch/tsc_rate.h). A hypervisor's
+   guest reads nothing of its own TSC in them (a TSC ratio may scale it): vm/ registers that rate
+   where the hypervisor states one. AMD's MSRs are read before the IDT is up, where a fault would
+   end the boot with nothing said: only for a family whose manual gives them. */
 #define MSR_HWCR 0xC0010015u
-#define HWCR_TSC_FREQ_SEL (1ull << 24)
 #define MSR_PSTATE_DEF0 0xC0010064u
-#define PSTATE_EN (1ull << 63)
-#define PSTATE_FID(v) ((unsigned)(v) & 0xFF)
-#define PSTATE_DID(v) ((unsigned)((v) >> 8) & 0x3F)
 
-static bool did_valid(unsigned did) { return (did >= 0x08 && did <= 0x1A) || (did >= 0x1C && did <= 0x2C && !(did & 1)); }
-
-/* This CPU's P0 IDs; NULL, or why there is no rate in them. */
-static const char *tsc_p0(unsigned *fid, unsigned *did) {
-    if (cpu_features.vendor != CPU_VENDOR_AMD) return "only an AMD CPU's P0 P-state states its TSC's rate";
-    if (!(rdmsr(MSR_HWCR) & HWCR_TSC_FREQ_SEL)) return "HWCR[TscFreqSel] is 0: the TSC does not count at P0";
-    uint64_t def = rdmsr(MSR_PSTATE_DEF0);
-    *fid = PSTATE_FID(def);
-    *did = PSTATE_DID(def);
-    if (!(def & PSTATE_EN)) return "PStateDef[0] is not valid (PstateEn 0)";
-    if (*fid < 0x10 || !did_valid(*did)) return "PStateDef[0]'s FID or DID is reserved";
-    return NULL;
+static void tsc_stated(const struct cpu_features *f, struct tsc_rate *r) {
+    uint32_t max, a, b, c, d;
+    if (f->hypervisor) return tsc_rate_none(r, "a hypervisor runs this CPU");
+    switch (f->vendor) {
+    case CPU_VENDOR_AMD:
+        if (!tsc_amd_family_known(f->family)) return tsc_rate_none(r, "no manual here gives this family's P-states");
+        return tsc_rate_amd(f->family, rdmsr(MSR_HWCR), rdmsr(MSR_PSTATE_DEF0), r);
+    case CPU_VENDOR_INTEL:
+        cpuid(0, 0, &max, &b, &c, &d);
+        cpuid(0x15, 0, &a, &b, &c, &d);
+        return tsc_rate_intel(max, a, b, c, r);
+    default:
+        return tsc_rate_none(r, "no manual here gives this maker's registers");
+    }
 }
+
+#define MSR_MCG_CAP 0x179u
+#define MCG_CMCI_P  (1ULL << 10) /* the banks have CTL2 and corrected errors an LVT entry (SDM vol. 3B 18.3.1.1); AMD reserves it */
 
 static leaf_regs first;
 
@@ -189,10 +185,6 @@ void cpu_features_init(void) {
             strlcat(missing, optional[i].f.name, sizeof missing);
         }
     if (missing[0]) panic("cpu: %s lacks what Nocturne requires: %s", f->brand, missing);
-    if (!f->hypervisor) {
-        const char *why = tsc_p0(&f->p0_fid, &f->p0_did);
-        if (why) panic("cpu: %s states no TSC rate Nocturne can use: %s", f->brand, why);
-    }
 
     a = first[L1][EAX];
     f->family = (a >> 8) & 0xF;
@@ -202,10 +194,15 @@ void cpu_features_init(void) {
         f->model |= ((a >> 16) & 0xF) << 4;
     }
     f->stepping = a & 0xF;
+    struct tsc_rate rate;
+    tsc_stated(f, &rate);
+    f->tsc_num = rate.num;
+    f->tsc_den = rate.den;
+    f->tsc_by = rate.by;
     f->clflush_bytes = ((first[L1][EBX] >> 8) & 0xFF) * 8;
     f->phys_bits = first[LE8][EAX] & 0xFF;
     f->invlpgb_pages = first[LE8][EDX] & 0xFFFF;
-    char present[384];
+    char present[512];
     present[0] = 0;
     for (unsigned i = 0; i < ARRAY_SIZE(optional); i++)
         if (has(first, &optional[i].f)) {
@@ -223,9 +220,12 @@ bool cpu_features_same(void) {
         if (!has(here, &required[i])) return false;
     for (unsigned i = 0; i < ARRAY_SIZE(optional); i++)
         if (has(here, &optional[i].f) != has(first, &optional[i].f)) return false;
-    unsigned fid, did;
-    if (!cpu_features.hypervisor && (tsc_p0(&fid, &did) || fid != cpu_features.p0_fid || did != cpu_features.p0_did))
+    struct tsc_rate rate;
+    tsc_stated(&cpu_features, &rate);
+    if (rate.num != cpu_features.tsc_num || (rate.num && rate.den != cpu_features.tsc_den))
         return false; /* its TSC would count at another rate than the clock's */
+    /* its banks would have no CTL2 for cpu_mca_interrupt_on */
+    if (cpu_features.cmci && !(rdmsr(MSR_MCG_CAP) & MCG_CMCI_P)) return false;
     return true;
 }
 
@@ -235,7 +235,6 @@ bool cpu_features_same(void) {
    0 to 31 (400h-47Fh; 9.3.2, as Intel SDM vol. 3B's IA32_MCi_CTL); with scalable MCA (CPUID
    8000_0007h EBX[3]) every bank has its own block at C000_2000h + 10h * i, up to 64 banks (9.3.3,
    Figure 9-10), the first four registers the same and MCA_CONFIG fifth. */
-#define MSR_MCG_CAP    0x179u
 #define MSR_MCG_STATUS 0x17Au
 #define MSR_MCG_CTL    0x17Bu
 #define MCG_CTL_P      (1ULL << 8)
@@ -306,11 +305,17 @@ static void mca_setup(void) {
     write_cr4(read_cr4() | CR4_MCE);
 }
 
-/* The banks' corrected errors (AMD): each bank whose counter has an interrupt (MISC0: VAL, CNTP,
-   IntP, not LKD, 9.3.2.6) signals it through one entry of the APIC's extended LVT (16.4.5), the
-   offset the firmware set (LVTOFF, the same for every bank: an alias of MCA_INTR_CFG's, 9.3.1.4),
-   on the system vector VEC_MCE_THRESHOLD. With scalable MCA a bank interrupts on each corrected
-   error through MCA_CONFIG's IntEn instead (9.3.3.1). */
+/* The banks' corrected errors, told on the system vector VEC_MCE_THRESHOLD, each maker's way.
+
+   AMD: each bank whose counter has an interrupt (MISC0: VAL, CNTP, IntP, not LKD, 9.3.2.6) signals
+   it through one entry of the APIC's extended LVT (16.4.5), the offset the firmware set (LVTOFF,
+   the same for every bank: an alias of MCA_INTR_CFG's, 9.3.1.4). With scalable MCA a bank
+   interrupts on each corrected error through MCA_CONFIG's IntEn instead (9.3.3.1).
+
+   Intel (CMCI, SDM vol. 3B 18.3.2.5, 18.5): a bank signals the LVT's CMCI entry when its corrected
+   count reaches the threshold in IA32_MCi_CTL2. Sibling threads may share a bank: each CPU in turn
+   claims the banks whose CMCI_EN no one set yet and that keep it when written (18.5.2.1), and
+   looks only at its own when the interrupt comes, which may reach several. */
 static struct irq *threshold_irq;
 static uint16_t threshold_start[LEGACY_BANKS]; /* the count a legacy bank's counter starts from */
 
@@ -318,16 +323,23 @@ static bool threshold_bank(uint64_t misc) {
     return (misc & (MISC_VAL | MISC_CNTP | MISC_INTP | MISC_LKD)) == (MISC_VAL | MISC_CNTP | MISC_INTP);
 }
 
+#define MSR_MC_CTL2 0x280u
+#define CTL2_CMCI_EN (1ULL << 30)
+#define CTL2_THRESHOLD 0x7FFFULL
+static struct spinlock cmci_lock; /* a bank's claim: the check and the write. A leaf */
+PERCPU static uint32_t cmci_banks; /* the banks this CPU claimed */
+
 static enum irq_result mca_threshold(void *context) {
     (void)context;
     unsigned banks = mca_banks();
     for (unsigned i = 0; i < banks; i++) {
+        if (cpu_features.cmci && !(this_cpu(cmci_banks) & (1u << i))) continue;
         uint64_t status = rdmsr(mca_msr(i, MCA_STATUS));
         if ((status & MCI_VAL) && !(status & (MCI_UC | MCI_PCC))) {
             mca_report(i, status, "told");
             wrmsr_checked(mca_msr(i, MCA_STATUS), 0);
         }
-        if (cpu_features.scalable_mca) continue;
+        if (cpu_features.scalable_mca || cpu_features.cmci) continue;
         uint64_t misc = rdmsr(mca_msr(i, MCA_MISC0));
         if (threshold_bank(misc) && (misc & MISC_OF))
             wrmsr_checked(mca_msr(i, MCA_MISC0),
@@ -342,7 +354,45 @@ static enum irq_result mca_threshold(void *context) {
 #define X2APIC_EXT_FEATURE 0x840u
 #define X2APIC_EXT_LVT     0x850u
 
+/* The vector's handler, set once: the first CPU, at boot. */
+static void threshold_vector(void) {
+    if (!threshold_irq &&
+        !(threshold_irq = irq_request_system(
+              &(struct irq_spec){.name = "machine-check threshold", .handler = mca_threshold, .node = -1},
+              VEC_MCE_THRESHOLD)))
+        panic("cpu: VEC_MCE_THRESHOLD is taken");
+}
+
+/* 18.5.2.1: the claims, the LVT entry where any was made, then what the claimed banks hold logged
+   and cleared. The threshold is 1, so that each error is told as it happens (18.5.2.2). */
+static void cmci_on(void) {
+    unsigned banks = mca_banks();
+    uint32_t mine = 0;
+    uint64_t f = spin_lock(&cmci_lock);
+    for (unsigned i = 0; i < banks; i++) {
+        uint64_t ctl2 = rdmsr(MSR_MC_CTL2 + i);
+        if (ctl2 & CTL2_CMCI_EN) continue; /* a sibling's */
+        if (!wrmsr_checked(MSR_MC_CTL2 + i, (ctl2 & ~CTL2_THRESHOLD) | CTL2_CMCI_EN | 1)) continue;
+        if (rdmsr(MSR_MC_CTL2 + i) & CTL2_CMCI_EN) mine |= 1u << i;
+    }
+    spin_unlock(&cmci_lock, f);
+    this_cpu(cmci_banks) = mine;
+    threshold_vector();
+    if (mine) lapic_write(LAPIC_LVT_CMCI, VEC_MCE_THRESHOLD); /* fixed, unmasked */
+    for (unsigned i = 0; i < banks; i++) {
+        if (!(mine & (1u << i))) continue;
+        uint64_t status = rdmsr(mca_msr(i, MCA_STATUS));
+        if (!(status & MCI_VAL) || (status & (MCI_UC | MCI_PCC))) continue;
+        mca_report(i, status, "from before");
+        wrmsr_checked(mca_msr(i, MCA_STATUS), 0);
+    }
+    if (!cpu_current_index())
+        kprintf("cpu: corrected machine checks of %u banks interrupt on vector %u (CMCI)\n",
+                (unsigned)__builtin_popcount(mine), VEC_MCE_THRESHOLD);
+}
+
 void cpu_mca_interrupt_on(void) {
+    if (cpu_features.cmci) return cmci_on();
     if (cpu_features.vendor != CPU_VENDOR_AMD) return;
     unsigned banks = mca_banks(), offset = 16;
     for (unsigned i = 0; i < banks && offset == 16; i++) {
@@ -354,11 +404,7 @@ void cpu_mca_interrupt_on(void) {
         if (!cpu_current_index()) kprintf("cpu: machine-check thresholds name LVT entry %u, which the APIC lacks\n", offset);
         return;
     }
-    if (!threshold_irq && /* the first CPU, at boot */
-        !(threshold_irq = irq_request_system(
-              &(struct irq_spec){.name = "machine-check threshold", .handler = mca_threshold, .node = -1},
-              VEC_MCE_THRESHOLD)))
-        panic("cpu: VEC_MCE_THRESHOLD is taken");
+    threshold_vector();
     /* the entry first: a counter enabled before it may interrupt through anything (9.3.2.6) */
     wrmsr(X2APIC_EXT_LVT + offset, VEC_MCE_THRESHOLD); /* fixed, unmasked */
     unsigned told = 0;
@@ -404,12 +450,24 @@ void cpu_machine_check(struct regs *r) {
 }
 
 /* ---- the state of each CPU ---- */
-/* Speculation controls, as APM vol. 2 3.2.9 and 3.1.7 give them. Automatic IBRS keeps what the
-   app trained out of the kernel's indirect branches without a write on each entry; without it,
-   IBRS on a CPU that prefers it set once at boot ("IBRS always on"). STIBP where the CPU prefers it
-   set once, so that apps on sibling threads do not train each other's. The kernel's half and the
-   app's are apart by more than a page and SMEP is on, so return predictions need no clearing
-   (3.2.9). IBPB between apps is cpu_ibpb's. */
+/* What only an MSR states, read once a fault has a handler. CMCI: MCG_CMCI_P, on Intel's. Enhanced
+   IBRS: IA32_ARCH_CAPABILITIES[IBRS_ALL], MSR 10AH (SDM vol. 4 Table 2-2), Intel's counterpart of
+   "IBRS always on". */
+#define MSR_ARCH_CAPABILITIES 0x10Au
+#define ARCH_CAP_IBRS_ALL (1ULL << 1)
+static void msr_features(void) {
+    if (cpu_features.vendor != CPU_VENDOR_INTEL) return;
+    cpu_features.cmci = rdmsr(MSR_MCG_CAP) & MCG_CMCI_P;
+    if (cpu_features.arch_capabilities && (rdmsr(MSR_ARCH_CAPABILITIES) & ARCH_CAP_IBRS_ALL))
+        cpu_features.ibrs_always_on = true;
+}
+
+/* Speculation controls, as APM vol. 2 3.2.9 and 3.1.7 and SDM vol. 4 (IA32_SPEC_CTRL) give them.
+   Automatic IBRS keeps what the app trained out of the kernel's indirect branches without a write
+   on each entry; without it, IBRS on a CPU that prefers it set once at boot ("IBRS always on",
+   Intel's enhanced IBRS). STIBP where the CPU prefers it set once, so that apps on sibling threads
+   do not train each other's. The kernel's half and the app's are apart by more than a page and SMEP
+   is on, so return predictions need no clearing (3.2.9). IBPB between apps is cpu_ibpb's. */
 static void speculation_setup(void) {
     if (cpu_features.auto_ibrs) wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_AIBRSE);
     uint64_t spec = 0;
@@ -436,6 +494,7 @@ bool cpu_setup(unsigned index) {
               CR4_OSXSAVE | (cpu_features.umip ? CR4_UMIP : 0));
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_NXE | EFER_SCE);
     entry_load(); /* from here a fault has a handler, wrmsr_checked among them */
+    if (!index) msr_features();
     speculation_setup();
     if (!pat_cpu_setup()) return false;
     if (!fpu_cpu_setup()) return false;
@@ -448,7 +507,10 @@ bool cpu_setup(unsigned index) {
            vol. 2 7.6.4); the MSR that makes it so on older AMD CPUs is in none of the manuals here */
         if (cpu_features.vendor != CPU_VENDOR_INTEL && !cpu_features.lfence_serializing)
             kprintf("cpu: LFENCE is not known to be dispatch serializing here; a TSC read may pass what comes before it\n");
-        kprintf("cpu: %s%s%s%s\n", cpu_features.auto_ibrs ? "automatic IBRS" : "no automatic IBRS",
+        kprintf("cpu: %s%s%s%s\n",
+                cpu_features.auto_ibrs ? "automatic IBRS"
+                : cpu_features.ibrs && cpu_features.ibrs_always_on ? "IBRS set once"
+                                                                   : "no automatic IBRS",
                 cpu_features.ibpb ? ", IBPB between apps" : ", no IBPB",
                 cpu_features.stibp && cpu_features.stibp_always_on ? ", STIBP" : "",
                 cpu_features.umip ? ", UMIP" : "");

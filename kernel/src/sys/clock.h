@@ -9,19 +9,20 @@
    - The wall clock: Unix time, from a wall-time reference (the RTC at a second's edge) and on with
      the boot clock; clock_set_wall steps it, clock_adjust_wall slews it.
 
-   The TSC is the only counter. Its rate is stated from the start: on the hardware the P0
-   P-state's (arch/cpu.h: the TSC counts at its frequency), under a hypervisor the one it
-   registers (clock_register_tsc_hz). The P0 rate is nominal (spread spectrum lowers it, the
-   crystal is off by its tolerance): on the hardware a rate reference (the HPET, dev/refclock.h)
-   measures it again and again over windows that double, each new rate taken from the clock's
-   present reading on (its slope changes, the clock never steps or goes back), each with the bound
+   The TSC is the only counter. Its rate is known from the first reading: what a hypervisor
+   registers (clock_register_tsc_hz), else what the CPU's registers state by its maker's manual
+   (arch/tsc_rate.h), else measured against a rate reference before the clock begins. A CPU's
+   stated rate is nominal (spread spectrum may lower it, the crystal is off by its tolerance), and
+   a first measure is short: unless a hypervisor stated it, a rate reference (the HPET or the ACPI
+   PM timer, dev/refclock.h) measures it again and again over windows that double, each new rate
+   taken from the clock's present reading on (its slope changes, the clock never steps or goes back), each with the bound
    of its error that the measurement proves. The CPUs' TSCs are compared as they start
    (clock_cpus_compare); what one is seen behind by is added to its readings. A reading never goes
    back on one CPU, nor across CPUs by more than the comparison can see (a cache line's crossing).
 
    The references. What keeps better time than the stated rate tells the clock through one entry
    for each kind, whoever tells it: a rate reference gives samples of its count
-   (clock_rate_sample; the HPET now), a wall-time reference proves the time
+   (clock_rate_sample; the HPET or the PM timer now), a wall-time reference proves the time
    (clock_wall_proof; the RTC now, which the clock reads itself). A network time service would be
    one of each.
 
@@ -80,18 +81,23 @@ static inline bool clock_muldiv_up(uint64_t a, uint64_t b, uint64_t d, uint64_t 
 void clock_init(void);
 /* A hypervisor's word for its guest's TSC rate (its CPUID leaf or MSR, vm/), before clock_init:
    the clock runs at it as stated (the first one registered), the CPU stating none there; source
-   names it in the log. */
+   names it in the log. A hypervisor that registers none is measured like any machine. */
 void clock_register_tsc_hz(uint64_t hz, const char *source);
 
+struct clock_rate_sample;
 /* A rate reference: a count of a known rate. Its owner reads the count between two readings of
    one CPU's TSC (a sample), runs it on past the device's wraps, and gives each sample to
    clock_rate_sample at the moment the clock asked for (or later). */
 struct clock_rate_reference {
     const char *name;        /* in the log */
     uint64_t hz_num, hz_den; /* its count's rate: hz_num / hz_den a second */
-    /* After a sleep, from clock_resume (CPU 0, interrupts off, the other CPUs stopped): its count
-       may have stopped or begun again; it begins a new one and gives a sample of it. */
-    void (*resume)(void);
+    /* A sample now, for the clock's first measure (below), giving it to nothing: CPU 0, interrupts
+       off. */
+    void (*read)(struct clock_rate_sample *s);
+    /* From clock_init once the clock runs, and after a sleep from clock_resume (CPU 0, interrupts
+       off, the other CPUs stopped): its count may have stopped or begun again; it begins a new
+       one, gives a sample of it, and goes on giving them. */
+    void (*begin)(void);
 };
 struct clock_rate_sample {
     uint64_t tsc_a, tsc_b; /* the CPU's TSC (clock_tsc_read) just before and just after the count was taken */
@@ -100,7 +106,7 @@ struct clock_rate_sample {
     uint64_t count;
 };
 /* A sample of ref, interrupts off, any CPU but in no NMI: the moment (the monotonic clock's ns)
-   the clock wants the next one at, CLOCK_NEVER when it wants none (a hypervisor states the rate).
+   the clock wants the next one at, CLOCK_NEVER when it wants none (the sample cannot be used).
    A sample of another reference than the last one's begins the windows on it. */
 uint64_t clock_rate_sample(const struct clock_rate_reference *ref, const struct clock_rate_sample *s);
 

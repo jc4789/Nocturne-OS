@@ -174,8 +174,8 @@ static inline unsigned dither8(unsigned v10, unsigned threshold) {
     return v > 255 ? 255 : v;
 }
 
-/* Rows y..y+h of a rectangle into o. No allocation, scheduling, device commands or FPU. The writes
-   to display memory stay scalar: WHPX does not emulate SIMD MMIO. The 10 bpc simulation dithers
+/* Rows y..y+h of a rectangle into o. No allocation, scheduling, device commands or FPU, which the
+   kernel's code does not use. The 10 bpc simulation dithers
    only onto an 8 bpc xRGB buffer; onto another the deep plane is converted as it is. */
 static void present_area(const struct scanout *o, const uint32_t *src, int src_pitch, const uint8_t *deep,
                          int deep_pitch, int x, int y, int w, int h) {
