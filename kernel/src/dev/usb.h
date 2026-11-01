@@ -12,7 +12,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-enum { USB_SPEED_FULL = 1, USB_SPEED_LOW = 2, USB_SPEED_HIGH = 3, USB_SPEED_SUPER = 4 };
+/* The kind of a device's speed. The numbers a Slot Context takes are the root port's own (xhci.c). */
+enum { USB_SPEED_FULL = 1, USB_SPEED_LOW = 2, USB_SPEED_HIGH = 3, USB_SPEED_SUPER = 4, USB_SPEED_SUPER_PLUS = 5 };
 
 /* standard requests and descriptor types (USB 2.0 chapter 9) */
 #define USB_REQ_GET_STATUS     0x00
@@ -64,6 +65,7 @@ struct usb_device {
 /* An endpoint as a class driver found it in the configuration descriptor. */
 struct usb_ep_info {
     uint8_t address, attributes, interval, burst; /* burst: SuperSpeed companion */
+    uint8_t companion_attributes;                /* its bmAttributes: Mult of an isochronous endpoint */
     uint16_t max_packet;                         /* bits 12:11: extra high-speed transactions */
     uint16_t esit;                               /* SuperSpeed bytes per service interval, 0 if none */
 };
@@ -75,22 +77,23 @@ typedef void (*usb_report_fn)(struct usb_device *d, void *ctx, const uint8_t *da
 /* A control transfer; returns the bytes moved, or -1 (stall, error, timeout, removal). */
 int usb_control(struct usb_device *d, uint8_t type, uint8_t request, uint16_t value, uint16_t index,
                 void *buffer, uint16_t length);
-/* Keep the interrupt IN endpoint polled, handing each service interval's data to `fn`. The
- * endpoint must belong to an interface the class driver claimed. */
-bool usb_interrupt_start(struct usb_device *d, const struct usb_endpoint_desc *ep, usb_report_fn fn, void *ctx);
+/* Keep the interrupt IN endpoint polled, handing each report of up to `longest` bytes to `fn` as it
+ * comes; 0: each service interval's data. */
+bool usb_interrupt_start(struct usb_device *d, const struct usb_endpoint_desc *ep, unsigned longest, usb_report_fn fn,
+                         void *ctx);
 
 /* The endpoint descriptor at cfg[off], with the SuperSpeed companion that may follow it. */
 bool usb_endpoint_info(const uint8_t *cfg, unsigned total, unsigned off, struct usb_ep_info *ep);
-/* Give endpoints device contexts. An alternate setting's endpoints are opened before
- * SET_INTERFACE selects it (xHCI 4.6.6). Endpoints already open are left as they are. */
+/* Give an alternate setting's endpoints device contexts, before SET_INTERFACE selects it (xHCI
+ * 4.6.6): those of alternate 0 came with the configuration. Endpoints already open are left as they are. */
 bool usb_open_endpoints(struct usb_device *d, const struct usb_ep_info *eps, int n);
 /* Keep `count` (at most 16) transfers of `len` bytes queued on a bulk or interrupt IN endpoint,
  * handing each one that finishes to `fn` with the bytes that arrived. */
 bool usb_stream_start(struct usb_device *d, uint8_t address, unsigned len, unsigned count, usb_report_fn fn, void *ctx);
 /* One bulk transfer of up to 64 KiB, waited for. One caller at a time on an endpoint (the class
- * driver's lock). Returns the bytes moved, USB_STALL, or -1 (error, timeout or removal: the
- * endpoint then needs usb_clear_halt too). */
-int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, unsigned timeout_ms);
+ * driver's lock). Returns 0, USB_STALL, or -1 (error, timeout or removal: the endpoint then needs
+ * usb_clear_halt too); *moved, in each case, is the bytes that did move, received ones in buf. */
+int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, unsigned timeout_ms, unsigned *moved);
 /* Reset a pipe on both sides: the controller's endpoint state and data toggle, then
  * CLEAR_FEATURE(ENDPOINT_HALT) on the device. */
 int usb_clear_halt(struct usb_device *d, uint8_t address);
@@ -123,7 +126,8 @@ bool usbhid_claims(const struct usb_interface_desc *intf);
 void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, const uint8_t *extra,
                    unsigned extra_len, const struct usb_endpoint_desc *ep);
 void usbhid_work(struct usb_device *d);       /* the keyboard lights asked for */
-bool usbhub_prepare(struct usb_device *d);    /* reads the hub descriptor and calls usb_hub_info */
+bool usbhub_prepare(struct usb_device *d);    /* configured: reads the hub descriptor and calls usb_hub_info */
+bool usbhub_reset_port(struct usb_device *hub, unsigned port); /* reset the device on it; true once enabled */
 void usbhub_attach(struct usb_device *d, const struct usb_endpoint_desc *ep);
 void usbhub_work(struct usb_device *d);       /* port changes noticed by its interrupt endpoint */
 bool usbhub_pending(struct usb_device *d);    /* port changes not handled yet */

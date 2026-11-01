@@ -63,7 +63,9 @@ void pci_write8(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint8_t v)
 #define PCI_BRIDGE_CONTROL_SBR (1u << 6) /* Secondary Bus Reset */
 struct pci_device *pci_find(uint16_t vendor, uint16_t device);
 struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls);
+/* Its memory BARs and its DMA on. The I/O space is for a driver that uses a port BAR: pci_enable_io. */
 void pci_enable_busmaster(struct pci_device *d);
+void pci_enable_io(struct pci_device *d);
 /* Clear BME and confirm the same function still answers with BME off. Optionally report its
    previous BME state. This stops new Memory/I/O Requests, not a posted DMA drain. No wait. */
 bool pci_disable_busmaster(struct pci_device *d, bool *was_mastering);

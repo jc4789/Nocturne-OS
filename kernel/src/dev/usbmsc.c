@@ -13,7 +13,7 @@
 #define CBW_SIG 0x43425355u /* "USBC" */
 #define CSW_SIG 0x53425355u /* "USBS" */
 #define XFER 0x10000         /* bytes per command: usb_bulk's limit */
-#define MAX_LUNS 8
+#define MAX_LUNS 16      /* Get Max LUN says 0 to 15 (BOT 3.2) */
 #define BOT_FAILED (-1)      /* the command failed (CHECK CONDITION): sense data waits */
 #define BOT_BROKEN (-2)      /* the transport broke; reset recovery ran */
 /* How long a command's data and status may take: a medium error retried inside the device, or a
@@ -52,8 +52,11 @@ static void put_be(uint8_t *p, uint64_t v, int bytes) {
     for (int i = 0; i < bytes; i++) p[i] = (uint8_t)(v >> (8 * (bytes - 1 - i)));
 }
 
+/* Bulk-only, with a command set that speaks SCSI (MSC Overview Table 1): not reported 00h, RBC 01h,
+   MMC-5 02h, SCSI transparent 06h. */
 bool usbmsc_claims(const struct usb_interface_desc *intf) {
-    return intf->cls == 8 && intf->protocol == 0x50 && intf->alternate == 0;
+    bool scsi = intf->subcls == 0x00 || intf->subcls == 0x01 || intf->subcls == 0x02 || intf->subcls == 0x06;
+    return intf->cls == 8 && scsi && intf->protocol == 0x50 && intf->alternate == 0;
 }
 
 static bool gone(const struct usb_device *d) { return !d || __atomic_load_n(&d->removed, __ATOMIC_ACQUIRE); }
@@ -81,29 +84,34 @@ static int bot(struct msc *m, unsigned lun, const uint8_t *cdb, unsigned cdb_len
     cbw[13] = (uint8_t)lun;
     cbw[14] = (uint8_t)cdb_len;
     memcpy(cbw + 15, cdb, cdb_len);
-    if (usb_bulk(d, m->out, cbw, 31, 5000) != 31) {
+    unsigned moved = 0, data_moved = 0;
+    if (usb_bulk(d, m->out, cbw, 31, 5000, &moved) || moved != 31) {
         reset_recovery(m);
         return BOT_BROKEN;
     }
     if (len) {
         uint8_t pipe = in ? m->in : m->out;
-        int r = usb_bulk(d, pipe, data, len, timeout);
-        if (r == USB_STALL) { /* the device ends the data stage early (cases 5, 11): the CSW follows */
+        /* a stall ends the data stage early (cases 5, 11): what came before it is kept (6.7.2), the CSW follows */
+        int r = usb_bulk(d, pipe, data, len, timeout, &data_moved);
+        if (r == USB_STALL) {
             usb_clear_halt(d, pipe);
         } else if (r < 0) {
             reset_recovery(m);
             return BOT_BROKEN;
         }
     }
-    int r = usb_bulk(d, m->in, csw, 13, timeout);
+    int r = usb_bulk(d, m->in, csw, 13, timeout, &moved);
     if (r == USB_STALL) { /* Figure 2: clear the halt and read the CSW once more */
         usb_clear_halt(d, m->in);
-        r = usb_bulk(d, m->in, csw, 13, timeout);
+        r = usb_bulk(d, m->in, csw, 13, timeout, &moved);
     }
     /* 6.3: a CSW is valid when it is 13 bytes with the signature and our tag; a phase error
-     * (status 2) or a residue beyond the request means the two sides disagree */
-    uint32_t residue = r == 13 ? get32(csw + 8) : 0;
-    if (r != 13 || get32(csw) != CSW_SIG || get32(csw + 4) != tag || csw[12] > 1 || residue > len) {
+     * (status 2), a residue beyond the request, or one that claims more than moved (6.5: not
+     * meaningful) means the two sides disagree */
+    bool whole = !r && moved == 13;
+    uint32_t residue = whole ? get32(csw + 8) : 0;
+    if (!whole || get32(csw) != CSW_SIG || get32(csw + 4) != tag || csw[12] > 1 || residue > len ||
+        (!csw[12] && len - residue > data_moved)) {
         reset_recovery(m);
         return BOT_BROKEN;
     }
@@ -116,9 +124,11 @@ static int scsi_waiting(struct msc *m, unsigned lun, const uint8_t *cdb, unsigne
                         bool in, unsigned timeout) {
     int r = bot(m, lun, cdb, cdb_len, data, len, in, timeout);
     if (r != BOT_FAILED) return r;
-    uint8_t sense[18] = {0}, rs[6] = {0x03, 0, 0, 0, sizeof sense, 0};
+    /* 252 bytes, and the fixed format: the command clears what it does not return (SPC, Seagate
+       manual 3.37, 2.4.1) */
+    uint8_t sense[252] = {0}, rs[6] = {0x03, 0, 0, 0, sizeof sense, 0};
     m->sense_key = m->asc = m->ascq = 0;
-    if (bot(m, lun, rs, 6, sense, sizeof sense, true, 5000) >= 14) {
+    if (bot(m, lun, rs, 6, sense, sizeof sense, true, 5000) >= 14 && ((sense[0] & 0x7F) == 0x70 || (sense[0] & 0x7F) == 0x71)) {
         m->sense_key = sense[2] & 15;
         m->asc = sense[12];
         m->ascq = sense[13];
@@ -315,7 +325,7 @@ void usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
         }
     }
     if (!intf) return;
-    if (!have_in || !have_out || !usb_open_endpoints(d, eps, 2)) {
+    if (!have_in || !have_out) {
         kprintf("usbmsc: slot %u has no usable bulk endpoints\n", d->slot);
         return;
     }

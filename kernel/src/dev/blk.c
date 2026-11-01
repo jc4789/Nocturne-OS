@@ -69,6 +69,9 @@ static void leave(void) {
     if (wake) wq_wake_all(&gate_wq);
 }
 
+void blk_busy_begin(void) { enter(); }
+void blk_busy_end(void) { leave(); }
+
 /* A failed request is counted, and the first few are logged: a dying disk must not flood the log.
    Drivers fail with -1 or a code of their own; callers see N_ERR_IO, or N_ERR_TIMEOUT. */
 static int failed(struct blkdev *d, const char *what, uint64_t lba, uint32_t n, int r) {

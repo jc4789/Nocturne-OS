@@ -45,9 +45,31 @@
 #define CRTO 0x68
 #define CSTS_RDY 1u
 #define CSTS_CFS 2u
+#define CSTS_SHST(v) ((v) >> 2 & 3)
+#define SHST_NONE 0u
+#define SHST_BUSY 1u
+#define SHST_DONE 2u
+/* CAP.CSS (Figure 36), and what each makes of CC.CSS (3.5.1 step 3) */
+#define CAP_CSS_NVM (1ull << 37)
+#define CAP_CSS_SETS (1ull << 43)
+#define CC_EN 1u
+#define CC_CSS_NVM (0u << 4)
+#define CC_CSS_SETS (6u << 4)
+#define CC_IOSQES(n) ((uint32_t)(n) << 16)
+#define CC_IOCQES(n) ((uint32_t)(n) << 20)
+#define SQES 6u /* 64-byte submission queue entries */
+#define CQES 4u /* 16-byte completion queue entries */
+#define CNS_NAMESPACE 0x00
+#define CNS_CONTROLLER 0x01
+#define CNS_ACTIVE 0x02
+#define CNS_ACTIVE_OF_SET 0x07
+#define CNS_COMMAND_SETS 0x1C
+#define CNTID_THIS 0xFFFFu
 
 /* admin and NVM command opcodes */
+#define OP_DELETE_SQ 0x00
 #define OP_CREATE_SQ 0x01
+#define OP_DELETE_CQ 0x04
 #define OP_CREATE_CQ 0x05
 #define OP_IDENTIFY 0x06
 #define OP_SET_FEATURES 0x09
@@ -55,6 +77,7 @@
 #define OP_WRITE 0x01
 #define OP_READ 0x02
 #define FEATURE_QUEUES 0x07
+#define FEATURE_COMMAND_SETS 0x19
 
 #define FAILED (-1) /* timeout or a dead controller; command errors return the status field */
 
@@ -100,9 +123,12 @@ struct nvme {
     int index;
     struct pci_device *pci;
     volatile uint8_t *regs;
+    uint64_t cap;
     unsigned stride, max_xfer; /* max_xfer: bytes a command moves at most */
     uint64_t ready_ns;         /* CC.EN to CSTS.RDY at most (CAP.TO, CRTO) */
-    uint32_t rtd3e;
+    uint32_t rtd3e;            /* Identify Controller: the shutdown's microseconds, 0 not reported */
+    uint32_t namespaces;       /* Identify Controller: NN */
+    char model[41];
     uint16_t mqes;             /* the largest queue's entries, 0-based (CAP.MQES) */
     struct queue admin;
     struct queue *io;          /* I/O queue i is queue ID i + 1 */
@@ -119,6 +145,12 @@ struct nvme {
     /* back from a sleep: enabled again before the next command. Set by resume while the disks are
        held (blk_hold). */
     bool woke;
+    /* One stop at a time (controller_stop), taken inside reset_lock and alone by a command that
+       ran out of time. stops moves on when one has ended; cut: the controller does not stop, its
+       bus mastering is off and it stays out of use. */
+    struct mutex stop_lock;
+    uint64_t stops;
+    bool cut;
     struct mutex reset_lock; /* enable: at start, after a sleep, after a timeout */
     uint8_t *ident;          /* a page for identify, at start */
     uint64_t ident_phys;
@@ -189,9 +221,9 @@ static enum irq_result nvme_isr(void *context) {
     return IRQ_HANDLED;
 }
 
-/* The controller off (enable), or a new queue: the queue empty again, every command in it failed.
-   The submission lock first: a submitter is either through it (its slot busy, failed here) or
-   finds the controller down. */
+/* The controller off (controller_stop), or a new queue: the queue empty again, every command in it
+   failed, each one's slot given back by its waiter. The submission lock first: a submitter is either
+   through it (its slot busy, failed here) or finds the controller down. */
 static void queue_clear(struct queue *q) {
     uint64_t f = spin_lock(&q->sq_lock);
     spin_take(&q->cq_lock);
@@ -201,7 +233,6 @@ static void queue_clear(struct queue *q) {
     q->phase = 1;
     for (unsigned i = 0; i < q->depth; i++) {
         struct slot *s = &q->slots[i];
-        q->free[i / 64] |= 1ull << (i % 64);
         if (!s->busy) continue;
         s->status = FAILED;
         s->busy = false;
@@ -225,6 +256,7 @@ static bool queue_alloc(struct queue *q, struct nvme *c, uint16_t qid, uint16_t 
     q->slots = kzalloc(q->depth * sizeof *q->slots);
     q->free = kzalloc((q->depth + 63) / 64 * sizeof *q->free);
     if (!q->slots || !q->free) return false;
+    for (unsigned i = 0; i < q->depth; i++) q->free[i / 64] |= 1ull << (i % 64);
     queue_clear(q);
     return true;
 }
@@ -255,8 +287,58 @@ static void controller_down(struct nvme *c) {
     __atomic_store_n(&c->live, false, __ATOMIC_RELEASE);
 }
 
+/* CSTS.RDY to follow CC.EN, within CAP.TO or CRTO; a fatal status does not keep it from falling. */
+static bool wait_ready(struct nvme *c, bool ready) {
+    uint64_t deadline = clock_after(c->ready_ns);
+    for (;;) {
+        uint32_t csts = rd32(c, CSTS);
+        if (csts == 0xFFFFFFFFu) return false;
+        if (ready && (csts & CSTS_CFS)) return false;
+        if (!!(csts & CSTS_RDY) == ready) return true;
+        if (clock_now_ns() >= deadline) return false;
+        sleep_until(clock_after(NS_PER_MS));
+    }
+}
+
+/* The controller stopped by a Controller Reset (CC.EN to 0 and CSTS.RDY following, 3.7.2): nothing
+   it held moves any more, so every command in it fails and its caller may take the memory back.
+   One that does not stop has its bus mastering turned off, and stays out of use. `seen`: c->stops as
+   the caller read it; a stop that ended since has done this for it. */
+static void controller_stop(struct nvme *c, uint64_t seen) {
+    mutex_lock(&c->stop_lock);
+    if (__atomic_load_n(&c->stops, __ATOMIC_ACQUIRE) == seen) {
+        controller_down(c);
+        uint32_t cc = rd32(c, CC);
+        if (cc != 0xFFFFFFFFu && cc & CC_EN) {
+            wait_ready(c, true); /* EN may only fall once RDY followed it up */
+            wr32(c, CC, cc & ~CC_EN);
+        }
+        if (!wait_ready(c, false)) {
+            kprintf("nvme%d: controller did not reset, turned off\n", c->index);
+            __atomic_store_n(&c->cut, true, __ATOMIC_RELEASE);
+            pci_disable_busmaster(c->pci, NULL);
+        }
+        queue_clear(&c->admin);
+        unsigned nio = __atomic_load_n(&c->nio, __ATOMIC_ACQUIRE);
+        for (unsigned i = 0; i < nio; i++) queue_clear(&c->io[i]);
+        __atomic_add_fetch(&c->stops, 1, __ATOMIC_RELEASE);
+    }
+    mutex_unlock(&c->stop_lock);
+}
+
+/* Enters a command on q in the free slot `id` (sq_lock held): the entry, then its doorbell. */
+static void submit(struct queue *q, int id, uint32_t cmd[16]) {
+    q->slots[id].busy = true;
+    cmd[0] = (cmd[0] & 0xFFFF) | (uint32_t)id << 16; /* PRPs, not fused */
+    memcpy(q->sq + q->tail * 64u, cmd, 64);
+    q->tail = (uint16_t)((q->tail + 1) % q->size);
+    __atomic_thread_fence(__ATOMIC_RELEASE); /* the entry before the doorbell */
+    doorbell(q->c, q->qid, false, q->tail);
+}
+
 /* Submit a command on q and wait for its completion. Returns 0, the 15-bit status field of a failed
-   command, or FAILED when the controller stopped answering (it is then down until a reset). */
+   command, or FAILED when the controller stopped answering. Then it has been stopped, and nothing
+   of the command moves any more: the caller may take its memory back. It is down until a reset. */
 static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t *result) {
     struct nvme *c = q->c;
     uint64_t deadline = clock_after(timeout_ns);
@@ -277,12 +359,8 @@ static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t 
     }
     struct slot *s = &q->slots[id];
     uint64_t start = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
-    s->busy = true;
-    cmd[0] = (cmd[0] & 0xFFFF) | (uint32_t)id << 16; /* PRPs, not fused */
-    memcpy(q->sq + q->tail * 64u, cmd, 64);
-    q->tail = (uint16_t)((q->tail + 1) % q->size);
-    __atomic_thread_fence(__ATOMIC_RELEASE); /* the entry before the doorbell */
-    doorbell(c, q->qid, false, q->tail);
+    uint64_t stops = __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE);
+    submit(q, id, cmd);
     spin_unlock(&q->sq_lock, f);
 
     int status = FAILED;
@@ -300,15 +378,13 @@ static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t 
             if (__atomic_load_n(&s->seq, __ATOMIC_ACQUIRE) != start) continue;
         }
         uint32_t csts = rd32(c, CSTS);
-        if (csts == 0xFFFFFFFFu || (csts & CSTS_CFS)) {
-            kprintf("nvme%d: controller %s\n", c->index, csts == 0xFFFFFFFFu ? "vanished" : "reported a fatal error");
-            controller_down(c);
-            break;
-        }
-        if (clock_now_ns() >= deadline) {
-            kprintf("nvme%d: command %02x on queue %u timed out\n", c->index, cmd[0] & 0xFF, q->qid);
-            controller_down(c);
-            break;
+        if (csts == 0xFFFFFFFFu || (csts & CSTS_CFS) || clock_now_ns() >= deadline) {
+            if (csts == 0xFFFFFFFFu || (csts & CSTS_CFS))
+                kprintf("nvme%d: controller %s\n", c->index, csts == 0xFFFFFFFFu ? "vanished" : "reported a fatal error");
+            else
+                kprintf("nvme%d: command %02x on queue %u timed out\n", c->index, cmd[0] & 0xFF, q->qid);
+            controller_stop(c, stops); /* fails the command, seq moves on */
+            continue;
         }
         /* the completion's interrupt wakes it; polled, it looks again each millisecond */
         wq_wait_unless(&s->wq, &s->seq, seen, c->nvectors ? deadline : MIN(deadline, clock_after(NS_PER_MS)));
@@ -317,16 +393,33 @@ static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t 
     return status;
 }
 
-static bool wait_ready(struct nvme *c, bool ready) {
-    uint64_t deadline = clock_after(c->ready_ns);
-    for (;;) {
-        uint32_t csts = rd32(c, CSTS);
-        if (csts == 0xFFFFFFFFu) return false;
-        if (ready && (csts & CSTS_CFS)) return false;
-        if (!!(csts & CSTS_RDY) == ready) return true;
-        if (clock_now_ns() >= deadline) return false;
-        sleep_until(clock_after(NS_PER_MS));
+/* An admin command where interrupts are off and nothing may sleep (a power change: no other command
+   is in the controller): its completion looked for by this CPU. 0, the status field, or FAILED. */
+static int run_polled(struct nvme *c, uint32_t cmd[16], uint64_t timeout_ns) {
+    struct queue *q = &c->admin;
+    uint64_t f = spin_lock(&q->sq_lock);
+    int id = slot_take(q);
+    if (id < 0) {
+        spin_unlock(&q->sq_lock, f);
+        return FAILED;
     }
+    struct slot *s = &q->slots[id];
+    uint64_t start = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
+    submit(q, id, cmd);
+    spin_unlock(&q->sq_lock, f);
+    int status = FAILED;
+    for (uint64_t deadline = clock_after(timeout_ns); clock_now_ns() < deadline; pause()) {
+        f = spin_lock(&q->cq_lock);
+        reap(q);
+        spin_unlock(&q->cq_lock, f);
+        if (__atomic_load_n(&s->seq, __ATOMIC_ACQUIRE) != start) {
+            status = s->status;
+            break;
+        }
+        if (rd32(c, CSTS) & CSTS_CFS) break;
+    }
+    slot_give(q, (unsigned)id);
+    return status;
 }
 
 /* The I/O queues the controller gives, at most one a CPU: their memory, once. */
@@ -343,45 +436,109 @@ static bool io_alloc(struct nvme *c, unsigned want) {
     return true;
 }
 
-/* Reset the controller and bring up the admin and I/O queues (section 3.5.1). Also the way back
-   after a command timed out: the reset aborts whatever was outstanding, and every command still
-   waiting fails. reset_lock held. */
-static bool enable(struct nvme *c) {
-    controller_down(c);
-    __atomic_add_fetch(&c->generation, 1, __ATOMIC_RELEASE);
-    uint32_t cc = rd32(c, CC);
-    if (cc & 1) {
-        wait_ready(c, true); /* EN may only fall once RDY followed it up */
-        wr32(c, CC, cc & ~1u);
-    }
-    if (!wait_ready(c, false)) {
-        kprintf("nvme%d: controller did not reset\n", c->index);
+static int identify(struct nvme *c, uint32_t cns, uint32_t nsid) {
+    uint32_t cmd[16] = {OP_IDENTIFY};
+    cmd[1] = nsid;
+    *(uint64_t *)&cmd[6] = c->ident_phys;
+    cmd[10] = cns;
+    memset(c->ident, 0, PAGE_SIZE);
+    return run(&c->admin, cmd, ADMIN_NS, NULL);
+}
+
+/* Identify Controller (3.5.1 step 7), with what the host sets from it: the I/O queue entry sizes,
+   which the data structure's SQES and CQES bound (Figure 338), written while no I/O queue exists
+   (Figure 41). False when this controller cannot take the entries we build. */
+static bool read_controller(struct nvme *c) {
+    int r = identify(c, CNS_CONTROLLER, 0);
+    if (r) {
+        kprintf("nvme%d: identify failed (%x)\n", c->index, r);
         return false;
     }
-    queue_clear(&c->admin);
-    for (unsigned i = 0; i < c->nio; i++) queue_clear(&c->io[i]);
+    const uint8_t *id = c->ident;
+    unsigned n = 0;
+    for (int i = 24; i < 64 && n < sizeof c->model - 1; i++) {
+        char ch = id[i] >= 0x20 && id[i] < 0x7F ? (char)id[i] : ' ';
+        if (ch == ' ' && (!n || c->model[n - 1] == ' ')) continue;
+        c->model[n++] = ch;
+    }
+    while (n && c->model[n - 1] == ' ') n--;
+    c->model[n] = 0;
+    unsigned mdts = id[77];
+    c->max_xfer = PRPS_PER_PAGE * PAGE_SIZE;
+    if (mdts && mdts < 20 && (PAGE_SIZE << mdts) < c->max_xfer) c->max_xfer = PAGE_SIZE << mdts;
+    c->vwc = id[525] & 1;
+    c->rtd3e = *(const uint32_t *)(id + 88);
+    c->namespaces = *(const uint32_t *)(id + 516);
+    unsigned sqes = id[512], cqes = id[513];
+    if ((sqes & 0xF) > SQES || (sqes >> 4) < SQES || (cqes & 0xF) > CQES || (cqes >> 4) < CQES) {
+        kprintf("nvme%d: takes no 64-byte and 16-byte queue entries (%02x, %02x), skipped\n", c->index, sqes, cqes);
+        return false;
+    }
+    wr32(c, CC, rd32(c, CC) | CC_IOSQES(SQES) | CC_IOCQES(CQES));
+    return true;
+}
+
+/* A controller of several I/O command sets (CAP.CSS.IOCSS, CC.CSS 110b): the first combination it
+   has with the NVM command set selected (3.5.1 step 8.a, I/O Command Set Profile). The ones we do
+   not drive are not enabled by any namespace we use. A refusal leaves the one it had. */
+static bool select_command_set(struct nvme *c) {
+    uint32_t cmd[16] = {OP_IDENTIFY};
+    *(uint64_t *)&cmd[6] = c->ident_phys;
+    cmd[10] = (uint32_t)CNTID_THIS << 16 | CNS_COMMAND_SETS;
+    memset(c->ident, 0, PAGE_SIZE);
+    int r = run(&c->admin, cmd, ADMIN_NS, NULL);
+    if (r) {
+        kprintf("nvme%d: identify of its command sets failed (%x)\n", c->index, r);
+        return false;
+    }
+    const uint64_t *vectors = (const uint64_t *)c->ident;
+    unsigned combination = 0;
+    while (combination < PAGE_SIZE / 8 && !(vectors[combination] & 1)) combination++;
+    if (combination == PAGE_SIZE / 8) {
+        kprintf("nvme%d: no combination of its command sets has the NVM one, skipped\n", c->index);
+        return false;
+    }
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = OP_SET_FEATURES;
+    cmd[10] = FEATURE_COMMAND_SETS;
+    cmd[11] = combination;
+    if ((r = run(&c->admin, cmd, ADMIN_NS, NULL)) == FAILED) return false;
+    if (r) kprintf("nvme%d: refused command set combination %u (%x)\n", c->index, combination, r);
+    return true;
+}
+
+/* Reset the controller and bring up the admin and I/O queues, in the order of 3.5.1. Also the way
+   back after a command timed out: the stop aborts whatever was outstanding, and every command still
+   waiting fails. reset_lock held. */
+static bool enable(struct nvme *c) {
+    __atomic_add_fetch(&c->generation, 1, __ATOMIC_RELEASE);
+    controller_stop(c, __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE));
+    if (__atomic_load_n(&c->cut, __ATOMIC_ACQUIRE)) return false;
     wr32(c, AQA, (ADMIN_ENTRIES - 1u) << 16 | (ADMIN_ENTRIES - 1u));
     wr64(c, ASQ, c->admin.sq_phys);
     wr64(c, ACQ, c->admin.cq_phys);
-    /* NVM command set, 4 KiB pages, round robin, 64-byte SQ and 16-byte CQ entries */
-    wr32(c, CC, 1u | 6u << 16 | 4u << 20);
+    /* its command sets, 4 KiB pages, round robin */
+    bool sets = c->cap & CAP_CSS_SETS;
+    wr32(c, CC, CC_EN | (sets ? CC_CSS_SETS : CC_CSS_NVM));
     if (!wait_ready(c, true)) {
         kprintf("nvme%d: controller did not become ready (status %x)\n", c->index, rd32(c, CSTS));
         return false;
     }
     __atomic_store_n(&c->live, true, __ATOMIC_RELEASE);
+    int r = FAILED;
+    if (!read_controller(c) || (sets && !select_command_set(c))) goto down;
     /* Number of Queues (5.27.1.5): as many submission and completion queues as CPUs, 0-based; the
        controller says how many it gives. After a reset the same count again, the memory made. */
     unsigned want = c->nio ? c->nio : MIN(topology.cpus, 65535u);
     uint32_t cmd[16] = {OP_SET_FEATURES}, got = 0;
     cmd[10] = FEATURE_QUEUES;
     cmd[11] = (want - 1) << 16 | (want - 1);
-    int r = run(&c->admin, cmd, ADMIN_NS, &got);
+    r = run(&c->admin, cmd, ADMIN_NS, &got);
     if (r) goto fail;
     unsigned given = MIN((got & 0xFFFF) + 1, (got >> 16) + 1);
     if (!c->nio && !io_alloc(c, MIN(want, given))) {
         kprintf("nvme%d: no memory for its I/O queues\n", c->index);
-        return false;
+        goto down;
     }
     if (given < c->nio) {
         kprintf("nvme%d: gives %u I/O queues now, %u before\n", c->index, given, c->nio);
@@ -408,6 +565,7 @@ static bool enable(struct nvme *c) {
     return true;
 fail:
     kprintf("nvme%d: setting up the I/O queues failed (%x)\n", c->index, r);
+down:
     controller_down(c);
     return false;
 }
@@ -438,15 +596,6 @@ static void awake(struct nvme *c) {
 static struct queue *io_queue(struct nvme *c) {
     unsigned nio = __atomic_load_n(&c->nio, __ATOMIC_ACQUIRE);
     return &c->io[(uint64_t)cpu_current_index() * nio / topology.cpus];
-}
-
-static int identify(struct nvme *c, uint32_t cns, uint32_t nsid) {
-    uint32_t cmd[16] = {OP_IDENTIFY};
-    cmd[1] = nsid;
-    *(uint64_t *)&cmd[6] = c->ident_phys;
-    cmd[10] = cns;
-    memset(c->ident, 0, PAGE_SIZE);
-    return run(&c->admin, cmd, ADMIN_NS, NULL);
 }
 
 /* ---- transfers ---- */
@@ -494,11 +643,11 @@ static int transfer(void *ctx, bool write, uint64_t lba, unsigned n, uint8_t *bu
                     write ? "write" : "read", lba);
             return -1;
         }
-        if (attempt == 2) return -1;
-        if (r == FAILED) {
-            if (!recover(c, gen)) return -1; /* a timeout: reset and reissue */
+        if (r == FAILED) { /* a timeout: reset, whether it is given again or not, so others can go on */
+            if (!recover(c, gen) || attempt == 2) return -1;
             continue;
         }
+        if (attempt == 2) return -1;
         unsigned sct = (unsigned)r >> 8 & 7, sc = (unsigned)r & 0xFF;
         kprintf("nvme%d: %s of block %lu failed (type %u code %02x)\n", c->index, write ? "write" : "read", lba, sct, sc);
         if (r & 0x4000 || sct == 2) return -1; /* do not retry, or a media error */
@@ -528,8 +677,8 @@ static int blk_nvme_write(struct blkdev *b, uint64_t lba, uint32_t n, const void
     return rw(b->priv, true, lba, n, (uint8_t *)buf);
 }
 
-/* Flush (NVM Command Set 3.2.2): the volatile write cache reaches the medium, the writes every
-   queue completed before it with it. */
+/* Flush (Base 7.2): the volatile write cache reaches the medium, the writes every queue completed
+   before it with it. */
 static int blk_nvme_persist(struct blkdev *b) {
     struct ns *s = b->priv;
     struct nvme *c = s->c;
@@ -546,14 +695,17 @@ static int blk_nvme_persist(struct blkdev *b) {
 }
 
 static void add_namespace(struct nvme *c, uint32_t nsid, const char *model) {
-    if (identify(c, 0, nsid)) return;
+    if (identify(c, CNS_NAMESPACE, nsid)) return;
     const uint8_t *id = c->ident;
     uint64_t blocks = *(const uint64_t *)id;
     if (!blocks) return; /* inactive */
-    unsigned format = id[26] & 0xF;
+    /* FLBAS's Format Index, its upper bits meant only with more than 16 formats (NVM Command Set Figure
+       114; NLBAF is 0-based, NULBAF 1-based, 5.5). A block a command cannot move is out, none other. */
+    unsigned formats = id[25] + 1u + id[83];
+    unsigned format = (id[26] & 0xF) | (formats > 16 ? (id[26] >> 5 & 3u) << 4 : 0);
     uint32_t lbaf = *(const uint32_t *)(id + 128 + 4 * format);
     unsigned shift = lbaf >> 16 & 0xFF, metadata = lbaf & 0xFFFF, protection = id[29] & 7;
-    if (metadata || protection || shift < 9 || shift > 12) {
+    if (metadata || protection || shift < 9 || shift >= 32 || (1u << shift) > c->max_xfer) {
         kprintf("nvme%d: namespace %u uses %u-byte blocks with %u bytes of metadata, skipped\n", c->index, nsid,
                 shift < 32 ? 1u << shift : 0, metadata);
         return;
@@ -574,11 +726,13 @@ static void add_namespace(struct nvme *c, uint32_t nsid, const char *model) {
     blk_register(&s->blk);
 }
 
-/* The active namespaces (Identify CNS 02h: up to 1024 IDs above the one given, in order), each
-   added; a controller without the list (NVMe 1.0) has namespaces 1 to its count. */
+/* The active namespaces of the NVM command set (Identify CNS 07h with CSI 00h, 3.5.1 step 8.b, or CNS
+   02h where it is not known: up to 1024 IDs above the one given, in order), each added; a controller
+   without the list (NVMe 1.0) has namespaces 1 to its count. The NVM command set's own data
+   structures of step 8.b.ii.2 say nothing we use, and are not asked for. */
 static void add_namespaces(struct nvme *c, uint32_t count, const char *model) {
-    uint32_t after = 0;
-    if (identify(c, 2, 0)) {
+    uint32_t after = 0, cns = CNS_ACTIVE_OF_SET;
+    if (identify(c, cns, 0) && identify(c, cns = CNS_ACTIVE, 0)) {
         for (uint32_t nsid = 1; nsid && nsid <= count; nsid++) add_namespace(c, nsid, model);
         return;
     }
@@ -588,7 +742,7 @@ static void add_namespaces(struct nvme *c, uint32_t count, const char *model) {
         memcpy(ids, c->ident, PAGE_SIZE);
         while (n < PAGE_SIZE / 4 && ids[n]) n++;
         for (uint32_t i = 0; i < n; i++) add_namespace(c, ids[i], model);
-        more = n == PAGE_SIZE / 4 && !identify(c, 2, after = ids[n - 1]);
+        more = n == PAGE_SIZE / 4 && !identify(c, cns, after = ids[n - 1]);
     }
     if (!ids) kprintf("nvme%d: no memory for its namespace list\n", c->index);
     kfree(ids);
@@ -637,7 +791,7 @@ static void start(struct nvme *c) {
         return;
     }
     pci_enable_busmaster(pci);
-    uint64_t cap = rd64(c, CAP);
+    uint64_t cap = c->cap = rd64(c, CAP);
     c->stride = 4u << (cap >> 32 & 0xF);
     c->mqes = (uint16_t)(cap & 0xFFFF);
     unsigned to = (unsigned)(cap >> 24 & 0xFF);
@@ -645,8 +799,8 @@ static void start(struct nvme *c) {
         unsigned crwmt = rd32(c, CRTO) & 0xFFFF;
         if (crwmt > to) to = crwmt;
     }
-    c->ready_ns = MAX(to, 4u) * 500 * NS_PER_MS; /* 500 ms units, at least 2 s */
-    if (!(cap >> 37 & 1) || (cap >> 48 & 0xF)) {
+    c->ready_ns = MAX(to, 1u) * 500 * NS_PER_MS; /* 500 ms units, the field rounding down */
+    if (!(cap & (CAP_CSS_NVM | CAP_CSS_SETS)) || (cap >> 48 & 0xF)) {
         kprintf("nvme%d: no NVM command set or no 4 KiB pages (capabilities %lx), skipped\n", c->index, cap);
         return;
     }
@@ -661,47 +815,67 @@ static void start(struct nvme *c) {
     if (!up) return;
     vectors_place(c);
 
-    if (identify(c, 1, 0)) {
-        kprintf("nvme%d: identify failed\n", c->index);
-        return;
-    }
-    const uint8_t *id = c->ident;
-    char model[41];
-    unsigned n = 0;
-    for (int i = 24; i < 64 && n < sizeof model - 1; i++) {
-        char ch = id[i] >= 0x20 && id[i] < 0x7F ? (char)id[i] : ' ';
-        if (ch == ' ' && (!n || model[n - 1] == ' ')) continue;
-        model[n++] = ch;
-    }
-    while (n && model[n - 1] == ' ') n--;
-    model[n] = 0;
-    unsigned mdts = id[77];
-    c->max_xfer = PRPS_PER_PAGE * PAGE_SIZE;
-    if (mdts && mdts < 20 && (PAGE_SIZE << mdts) < c->max_xfer) c->max_xfer = PAGE_SIZE << mdts;
-    c->vwc = id[525] & 1;
-    c->rtd3e = *(const uint32_t *)(id + 88);
-    uint32_t count = *(const uint32_t *)(id + 516);
-    kprintf("nvme%d: %s (%04x:%04x), version %x, %u namespaces, %u I/O queues of %u, %u %s%s\n", c->index, model,
+    uint32_t count = c->namespaces;
+    kprintf("nvme%d: %s (%04x:%04x), version %x, %u namespaces, %u I/O queues of %u, %u %s%s\n", c->index, c->model,
             pci->vendor, pci->device, rd32(c, VS), count, c->nio, c->io[0].depth, c->nvectors,
             !c->nvectors ? "vectors: polled" : pci_msix_max_vectors(pci) ? "MSI-X vectors" : "MSI vectors",
             c->vwc ? ", write cache" : "");
-    add_namespaces(c, count, model);
+    add_namespaces(c, count, c->model);
 }
 
-/* Normal shutdown notification before power goes away (section 3.6.1): the controller writes its
-   cache back and the drive does not count an unsafe shutdown. Interrupts are already off, the
-   disks held (no command in flight). */
+/* The I/O queues deleted, submission queues before completion queues (3.6.1 steps 1b, 1c; 5.3.4,
+   5.3.3): a queue that does not go does not keep the shutdown from being notified. */
+static void delete_queues(struct nvme *c) {
+    for (int op = OP_DELETE_SQ; op >= 0; op = op == OP_DELETE_SQ ? OP_DELETE_CQ : -1)
+        for (unsigned i = 0; i < c->nio; i++) {
+            uint32_t cmd[16] = {(uint32_t)op};
+            cmd[10] = c->io[i].qid;
+            int r = run_polled(c, cmd, ADMIN_NS);
+            if (r) {
+                kprintf("nvme%d: deleting I/O queue %u failed (%x)\n", c->index, c->io[i].qid, r);
+                return;
+            }
+        }
+}
+
+/* CC.SHN set: until CSTS.SHST reads complete, which is when the controller may lose power (3.6.1).
+   With CSTS.ST set the whole subsystem is shutting down, by another controller's hand, and its
+   complete says as much (3.6.3). The specification gives a controller that has begun no limit, only
+   the least to give it (RTD3E, or one second when that is not reported), so it is waited for; its
+   cache is worth more than the time, and a report tells of the wait. A controller that has not
+   begun by then, reported a fatal status or vanished will not finish. */
+static bool shutdown_done(struct nvme *c) {
+    uint64_t least = c->rtd3e ? c->rtd3e * NS_PER_US : NS_PER_S, deadline = clock_after(least);
+    bool told = false;
+    for (;;) {
+        uint32_t csts = rd32(c, CSTS);
+        if (csts == 0xFFFFFFFFu || csts & CSTS_CFS) return false;
+        unsigned shst = CSTS_SHST(csts);
+        if (shst == SHST_DONE) return true;
+        if (clock_now_ns() >= deadline) {
+            if (shst == SHST_NONE) return false;
+            if (shst == SHST_BUSY && !told) {
+                kprintf("nvme%d: its shutdown takes longer than the %lu us it reports\n", c->index,
+                        (unsigned long)(least / NS_PER_US));
+                told = true;
+            }
+        }
+        pause();
+    }
+}
+
+/* Normal shutdown before power goes away (3.6.1): the controller writes its cache back and the
+   drive does not count an unsafe shutdown. Interrupts are already off, the disks held (no command
+   in flight). */
 static bool nvme_shutdown(void *arg) {
     (void)arg;
     bool all = true;
     for (struct nvme *c = ctrls; c; c = c->next) {
         if (!c->live) continue;
+        __atomic_store_n(&c->ready, false, __ATOMIC_RELEASE);
+        delete_queues(c);
         wr32(c, CC, (rd32(c, CC) & ~0xC000u) | 0x4000u);
-        uint64_t us = c->rtd3e < 1000000 ? 1000000 : c->rtd3e > 10000000 ? 10000000 : c->rtd3e;
-        for (uint64_t deadline = clock_after(us * NS_PER_US);
-             (rd32(c, CSTS) >> 2 & 3) != 2 && clock_now_ns() < deadline;)
-            pause();
-        if ((rd32(c, CSTS) >> 2 & 3) != 2) all = false; /* its cache may not be on the flash */
+        if (!shutdown_done(c)) all = false; /* its cache may not be on the flash */
         controller_down(c);
     }
     return all;

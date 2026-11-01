@@ -49,3 +49,7 @@ int blk_by_blocks(struct blkdev *d, bool write, uint64_t lba, uint32_t count, ui
    snapshot and the power going off nothing changes on disk that the snapshot does not know. */
 void blk_hold(void);
 void blk_release(void);
+/* A driver's own thread at work on its disks counts as a transfer under way: blk_hold waits for it,
+   and it waits for blk_release. */
+void blk_busy_begin(void);
+void blk_busy_end(void);

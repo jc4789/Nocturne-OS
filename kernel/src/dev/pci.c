@@ -282,8 +282,13 @@ struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls) {
 void pci_enable_busmaster(struct pci_device *d) {
     d->kernel_owned = true;
     uint16_t cmd = pci_read16(d->bus, d->dev, d->func, PCI_COMMAND);
-    cmd |= PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
+    cmd |= PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
     pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, cmd);
+}
+
+void pci_enable_io(struct pci_device *d) {
+    uint16_t cmd = pci_read16(d->bus, d->dev, d->func, PCI_COMMAND);
+    pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, cmd | PCI_COMMAND_IO);
 }
 
 int pci_list(struct n_pciinfo *out, int max) {

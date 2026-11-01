@@ -9,8 +9,6 @@
 #include "sys/clock.h"
 #include "sys/wait.h"
 
-#define HUB_PORTS 15 /* a route string tier has four bits */
-
 /* feature selectors (USB 2.0 Table 11-17, USB 3.2 Table 10-9) */
 #define C_HUB_LOCAL_POWER 0
 #define C_HUB_OVER_CURRENT 1
@@ -26,6 +24,10 @@
 #define BH_PORT_RESET 28
 #define C_BH_PORT_RESET 29
 #define SET_HUB_DEPTH 12
+#define DESC_BOS 0x0F
+#define DEVICE_CAPABILITY 0x10
+#define CAP_SSP 0x0A       /* SuperSpeedPlus USB device capability (USB 3.2 9.6.2.5) */
+#define PORT_STATUS_EXT 2  /* Get Port Status's wValue: with dwExtPortStatus (USB 3.2 10.16.2.6) */
 
 /* wPortStatus / wPortChange (USB 2.0 Tables 11-21, 11-22; USB 3.2 Tables 10-13, 10-14) */
 #define PS_CONNECTION (1u << 0)
@@ -48,9 +50,18 @@ struct hub {
     bool ss;         /* Enhanced SuperSpeed hub */
     bool hub_change; /* atomic: bit 0 of the status change report, the hub's own status changed */
     bool reporting;  /* its status change endpoint runs: a port change comes as a report */
-    struct usb_device *child[HUB_PORTS + 1];
-    uint32_t pending; /* atomic: ports whose status changed */
+    /* a SuperSpeedPlus hub's Sublink Speed Attributes (USB 3.2 9.6.2.5), NULL for any other */
+    uint32_t *sublinks;
+    unsigned nsublinks;
+    struct usb_device **child; /* by port, from 1 */
+    uint32_t *pending; /* atomic words: bit p of the words, the ports whose status changed */
 };
+
+static unsigned pending_words(const struct hub *h) { return (h->ports >> 5) + 1; }
+
+static void pending_mark(struct hub *h, unsigned port) {
+    __atomic_fetch_or(&h->pending[port >> 5], 1u << (port & 31), __ATOMIC_RELEASE);
+}
 
 static bool removed_hub(const struct hub *h) { return __atomic_load_n(&h->dev->removed, __ATOMIC_ACQUIRE); }
 
@@ -79,6 +90,33 @@ static void clear_changes(struct hub *h, unsigned port, uint16_t change) {
         if ((change & (1u << b)) && map[b]) port_feature(h->dev, USB_REQ_CLEAR_FEATURE, map[b], port);
 }
 
+/* A SuperSpeedPlus hub says so in its BOS descriptor (USB 3.2 9.6.2): its Sublink Speed Attributes, by
+   which the speed in a port's extended status is read. */
+static void read_sublinks(struct hub *h) {
+    struct usb_device *d = h->dev;
+    uint8_t head[5];
+    if (usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, DESC_BOS << 8, 0, head, sizeof head) < 5) return;
+    unsigned total = head[2] | (unsigned)head[3] << 8;
+    if (total < 5 || total > 4096) return;
+    uint8_t *bos = kmalloc(total);
+    if (!bos) return;
+    int got = usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, DESC_BOS << 8, 0, bos, (uint16_t)total);
+    for (unsigned off = 5; got > 0 && off + 3 <= (unsigned)got && bos[off] >= 3 && off + bos[off] <= (unsigned)got;
+         off += bos[off]) {
+        if (bos[off + 1] != DEVICE_CAPABILITY || bos[off + 2] != CAP_SSP || bos[off] < 12) continue;
+        unsigned attrs = bos[off + 4] & 31;
+        unsigned count = attrs + 1u;
+        if (12 + count * 4 > bos[off] || !(h->sublinks = kmalloc(count * sizeof *h->sublinks))) break;
+        for (unsigned i = 0; i < count; i++) {
+            const uint8_t *a = bos + off + 12 + i * 4;
+            h->sublinks[i] = a[0] | a[1] << 8 | a[2] << 16 | (uint32_t)a[3] << 24;
+        }
+        h->nsublinks = count;
+        break;
+    }
+    kfree(bos);
+}
+
 bool usbhub_prepare(struct usb_device *d) {
     bool ss = d->speed >= USB_SPEED_SUPER;
     uint8_t desc[16];
@@ -92,20 +130,32 @@ bool usbhub_prepare(struct usb_device *d) {
     if (!h) return false;
     h->dev = d;
     h->ss = ss;
-    h->ports = desc[2] > HUB_PORTS ? HUB_PORTS : desc[2];
+    h->ports = desc[2];
     h->power_ms = desc[5] * 2u < 100 ? 100 : desc[5] * 2u;
+    h->child = kzalloc((h->ports + 1u) * sizeof *h->child);
+    h->pending = kzalloc(pending_words(h) * sizeof *h->pending);
+    if (!h->child || !h->pending) {
+        kfree(h->child);
+        kfree(h->pending);
+        kfree(h);
+        return false;
+    }
+    if (ss) read_sublinks(h);
     d->hub = h; /* usbhub_detach frees it even if the hub never gets configured */
-    usb_hub_info(d, desc[2], ss ? 0 : (desc[3] >> 5) & 3, false);
+    usb_hub_info(d, h->ports, ss ? 0 : (desc[3] >> 5) & 3, false);
     return true;
 }
 
+/* The status change report: bit 0 the hub, bit p port p (USB 2.0 11.12.4). */
 static void hub_report(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len, uint64_t at) {
     (void)at;
     struct hub *h = ctx;
-    uint32_t bits = 0;
-    for (unsigned i = 0; i < len && i < 4; i++) bits |= (uint32_t)data[i] << (8 * i);
-    __atomic_fetch_or(&h->pending, bits & ~1u, __ATOMIC_RELEASE);
-    if (bits & 1) __atomic_store_n(&h->hub_change, true, __ATOMIC_RELEASE); /* bit 0 is the hub itself */
+    for (unsigned i = 0; i < len && i <= h->ports >> 3; i++) {
+        uint32_t bits = data[i];
+        if (!i && bits & 1) __atomic_store_n(&h->hub_change, true, __ATOMIC_RELEASE);
+        if (!i) bits &= ~1u;
+        if (bits) __atomic_fetch_or(&h->pending[i >> 2], bits << (8 * (i & 3)), __ATOMIC_RELEASE);
+    }
     usb_note_work(d);
 }
 
@@ -115,6 +165,9 @@ void usbhub_detach(struct usb_device *d) {
     for (unsigned p = 1; p <= h->ports; p++)
         if (h->child[p]) usb_remove(h->child[p]);
     d->hub = NULL;
+    kfree(h->sublinks);
+    kfree(h->child);
+    kfree(h->pending);
     kfree(h);
 }
 
@@ -122,9 +175,7 @@ void usbhub_detach(struct usb_device *d) {
 static void power_ports(struct hub *h) {
     for (unsigned p = 1; p <= h->ports; p++) port_feature(h->dev, USB_REQ_SET_FEATURE, PORT_POWER, p);
     sleep_until(clock_after(h->power_ms * NS_PER_MS));
-    uint32_t all = 0;
-    for (unsigned p = 1; p <= h->ports; p++) all |= 1u << p;
-    __atomic_fetch_or(&h->pending, all, __ATOMIC_RELEASE);
+    for (unsigned p = 1; p <= h->ports; p++) pending_mark(h, p);
     usb_note_work(h->dev);
 }
 
@@ -139,7 +190,7 @@ void usbhub_attach(struct usb_device *d, const struct usb_endpoint_desc *ep) {
     }
     power_ports(h);
     kprintf("usbhub: slot %u %shub with %u ports\n", d->slot, h->ss ? "SuperSpeed " : "", h->ports);
-    h->reporting = usb_interrupt_start(d, ep, hub_report, h);
+    h->reporting = usb_interrupt_start(d, ep, (h->ports + 8) / 8, hub_report, h); /* a bit a port, and the hub's */
 }
 
 /* The hub's own status: its local power supply, or an over-current across all ports, which
@@ -166,11 +217,11 @@ static void hub_status(struct hub *h) {
 static bool port_reset(struct hub *h, unsigned port, bool warm, uint16_t *status) {
     struct usb_device *d = h->dev;
     uint16_t change = 0, done = warm ? CH_BH_RESET : CH_RESET;
-    uint32_t bit = 1u << port;
+    uint32_t bit = 1u << (port & 31), *word = &h->pending[port >> 5];
     port_feature(d, USB_REQ_SET_FEATURE, warm ? BH_PORT_RESET : PORT_RESET, port);
     for (uint64_t deadline = clock_after(500 * NS_PER_MS);;) {
         uint64_t seen = usb_kicks(d);
-        bool told = __atomic_fetch_and(&h->pending, ~bit, __ATOMIC_ACQ_REL) & bit;
+        bool told = __atomic_fetch_and(word, ~bit, __ATOMIC_ACQ_REL) & bit;
         bool late = clock_now_ns() >= deadline;
         if (told || late || !h->reporting || removed_hub(h)) {
             if (!port_status(d, port, status, &change)) return false;
@@ -180,6 +231,26 @@ static bool port_reset(struct hub *h, unsigned port, bool warm, uint16_t *status
     }
     clear_changes(h, port, change);
     return true;
+}
+
+bool usbhub_reset_port(struct usb_device *hub, unsigned port) {
+    struct hub *h = hub->hub;
+    uint16_t status = 0;
+    if (!h || !port_reset(h, port, false, &status) || !(status & PS_ENABLE)) return false;
+    sleep_until(clock_after(10 * NS_PER_MS)); /* reset recovery */
+    return true;
+}
+
+/* A SuperSpeedPlus hub's port: the extended status's Rx Sublink Speed ID (USB 3.2 Table 10-15), and that
+   attribute's Link Protocol says which it is running (9.6.2.5). */
+static unsigned ss_speed(struct hub *h, unsigned port) {
+    uint8_t st[8];
+    if (!h->sublinks || usb_control(h->dev, 0xA3, USB_REQ_GET_STATUS, PORT_STATUS_EXT, (uint16_t)port, st, 8) < 8)
+        return USB_SPEED_SUPER;
+    unsigned id = st[4] & 15;
+    for (unsigned i = 0; i < h->nsublinks; i++)
+        if ((h->sublinks[i] & 15) == id && (h->sublinks[i] >> 14 & 3) == 1) return USB_SPEED_SUPER_PLUS;
+    return USB_SPEED_SUPER;
 }
 
 static void hub_port(struct hub *h, unsigned port) {
@@ -228,7 +299,7 @@ static void hub_port(struct hub *h, unsigned port) {
             continue;
         }
         sleep_until(clock_after(10 * NS_PER_MS)); /* reset recovery */
-        unsigned speed = h->ss ? USB_SPEED_SUPER
+        unsigned speed = h->ss ? ss_speed(h, port)
                          : (status & PS_LOW_SPEED) ? USB_SPEED_LOW
                          : (status & PS_HIGH_SPEED) ? USB_SPEED_HIGH : USB_SPEED_FULL;
         h->child[port] = usb_attach_child(d, port, speed);
@@ -237,17 +308,22 @@ static void hub_port(struct hub *h, unsigned port) {
 
 bool usbhub_pending(struct usb_device *d) {
     struct hub *h = d->hub;
-    return h && (__atomic_load_n(&h->pending, __ATOMIC_ACQUIRE) || __atomic_load_n(&h->hub_change, __ATOMIC_ACQUIRE));
+    if (!h) return false;
+    if (__atomic_load_n(&h->hub_change, __ATOMIC_ACQUIRE)) return true;
+    for (unsigned w = 0; w < pending_words(h); w++)
+        if (__atomic_load_n(&h->pending[w], __ATOMIC_ACQUIRE)) return true;
+    return false;
 }
 
 void usbhub_work(struct usb_device *d) {
     struct hub *h = d->hub;
     if (!h) return;
     if (__atomic_exchange_n(&h->hub_change, false, __ATOMIC_ACQ_REL) && !removed_hub(h)) hub_status(h);
-    for (uint32_t bits; !removed_hub(h) && (bits = __atomic_exchange_n(&h->pending, 0, __ATOMIC_ACQ_REL));)
-        while (bits && !removed_hub(h)) {
-            unsigned port = __builtin_ctz(bits);
-            bits &= bits - 1;
-            if (port >= 1 && port <= h->ports) hub_port(h, port);
-        }
+    for (unsigned w = 0; w < pending_words(h) && !removed_hub(h); w++)
+        for (uint32_t bits; !removed_hub(h) && (bits = __atomic_exchange_n(&h->pending[w], 0, __ATOMIC_ACQ_REL));)
+            while (bits && !removed_hub(h)) {
+                unsigned port = w * 32 + (unsigned)__builtin_ctz(bits);
+                bits &= bits - 1;
+                if (port >= 1 && port <= h->ports) hub_port(h, port);
+            }
 }
