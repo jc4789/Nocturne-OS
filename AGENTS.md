@@ -9,6 +9,10 @@ LINUX SOURCE CODE OR ANY OTHER OS'S SOURCE CODE IS NEVER ALLOWED TO BE REFERENCE
 
 Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは C。対象は実機。QEMU と Hyper-V は試験の道具で、VM で通ることは実機で動く証拠にならない。汎用の OS を目指す：CPU・メモリー・装置・プログラム・利用者の数が増えても成り立つ形で設計する。shim もスパゲッティも作らない。抽象化の層は要る所に作る。
 
+## ユーザーの意図（2026-11-01）
+
+- worktree とビルド：使ってよい。終わったら片付ける。何百 GB のビルドや何十もの worktree を残さない。理由は SSD の負担と、Windows が重くなること。
+
 ## 置き場所
 
 - 全プロジェクト共通（言葉、サブエージェント、編集、シェル、メモリー）：`~/.claude/CLAUDE.md`。
@@ -33,7 +37,7 @@ Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは
 - 区切りごとに：物差しは目的の方へ動いたか。説明が細かくなることは近づくことではない。
 - 言う前に：何と何を比べてそう言えるか。「直った」「速くなった」「前から」「別件」は、同じ条件の二つの版を言えるときだけ。比べた二つと限界を同じ文に書く。
 
-長い作業・性能・設計・原因の調査は `ban` の盤で。広く読む仕事と前提の監査はサブエージェントへ回してよい。並べて書かせるときは、サブエージェントごとに作業木（`isolation: worktree`）で働かせる。Work trees are not allowed to build, ever. there should never be worktree specific builds.
+長い作業・性能・設計・原因の調査は `ban` の盤で。広く読む仕事と前提の監査はサブエージェントへ回してよい。並べて書かせるときは、サブエージェントごとに作業木（`isolation: worktree`）で働かせる。
 
 ## 区切りと報告
 
