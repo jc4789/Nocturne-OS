@@ -42,7 +42,8 @@ static atomic_int waiter_started;
 static n_result waiter_result;
 static int interrupt_waiter(void *arg) {
     atomic_store(&waiter_started,1);
-    waiter_result=n_pci_interrupt_take((n_handle)(intptr_t)arg,N_CLOCK_NEVER);
+    uint64_t bits;
+    waiter_result=n_pci_interrupt_take((n_handle)(intptr_t)arg,&bits,1,N_CLOCK_NEVER);
     return 0;
 }
 static uint32_t rd32(uint32_t at) { return *(volatile uint32_t *)(regs + at); }
@@ -55,10 +56,11 @@ static int dma(n_handle pci, uint64_t ram, uint32_t count, int to_ram) {
     wr64(EDU_DMA_DST, to_ram ? ram : EDU_DMA_BUFFER);
     wr64(EDU_DMA_COUNT, count);
     wr64(EDU_DMA_CMD, 1 | (to_ram ? 2 : 0) | 4); /* start, direction, interrupt when done */
-    n_result got = n_pci_interrupt_take(pci, n_clock_after(2000 * N_NS_PER_MS));
+    uint64_t bits = 0;
+    n_result got = n_pci_interrupt_take(pci, &bits, 1, n_clock_after(2000 * N_NS_PER_MS));
     uint32_t why = rd32(EDU_IRQ_STATUS);
     wr32(EDU_IRQ_ACK, why);
-    return got > 0 && (why & 0x100);
+    return got == 1 && bits && (why & 0x100);
 }
 
 static int revoked_reader(void) {
@@ -1377,11 +1379,12 @@ int main(int argc,char **argv) {
 
     n_result vectors = n_pci_interrupts(pci, 4);
     CHECK(vectors >= 1, "interrupts: %s", n_result_text(vectors));
-    CHECK(n_pci_interrupt_take(pci, 0) == -N_ERR_TIMEOUT, "nothing pending yet");
+    uint64_t bits = 0;
+    CHECK(n_pci_interrupt_take(pci, &bits, 1, 0) == -N_ERR_TIMEOUT, "nothing pending yet");
     if (regs && vectors >= 1) {
         wr32(EDU_IRQ_RAISE, 0x5);
-        n_result got = n_pci_interrupt_take(pci, n_clock_after(2000 * N_NS_PER_MS));
-        CHECK(got == 1, "interrupt bits %lld", (long long)got);
+        n_result got = n_pci_interrupt_take(pci, &bits, 1, n_clock_after(2000 * N_NS_PER_MS));
+        CHECK(got == 1 && bits == 1, "interrupt words %lld, bits %llx", (long long)got, (unsigned long long)bits);
         CHECK(rd32(EDU_IRQ_STATUS) == 0x5, "irq status %x", rd32(EDU_IRQ_STATUS));
         wr32(EDU_IRQ_ACK, 0x5);
     }

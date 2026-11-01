@@ -38,7 +38,7 @@
 #include "sys/thread.h"
 #include "sys/wait.h"
 
-#define CLAIM_VECTORS 32 /* one pending bit each (the ABI's 32-bit word); MSI's most too */
+#define MSIX_MOST 2048 /* the most entries an MSI-X table has (PCIe 6.0, 7.7.2.2): a function's most messages */
 #define CLAIM_GUARDS 32  /* registers with bits only the kernel changes (guards_init) */
 #define CLAIM_ACPI_NOTES 32 /* Notify values of the function's node not yet taken */
 
@@ -48,20 +48,32 @@ struct guard {
     uint32_t bits;
 };
 
+/* A claim's messages as one pci_user_interrupts turned them on: each one's irq context, and a
+   pending bit each (message n in word n / 64), set by its handler and cleared by take. A larger
+   count makes a new block; the older ones stay with the claim, since an irq a remapping entry
+   may still hold keeps its context (interrupts_off). */
+struct claim_message {
+    struct pci_claim *claim;
+    unsigned n;
+};
+struct claim_vectors {
+    struct claim_vectors *older;
+    unsigned room;
+    uint64_t *pending; /* [(room + 63) / 64], after messages */
+    struct claim_message messages[];
+};
+
 struct pci_claim {
     struct pci_device *d;
     struct object object; /* what the claim's handle reaches */
-    uint32_t pending; /* message n arrived; cleared by take. Changed under irq_lock; claim_ready reads it bare */
     struct wait_queue wq;
     /* Its handlers, pending and vectors as they read them. They wake and notify under it, so once
        vectors is 0 no handler still reaches the claim. Before the wait queue and event locks. */
     struct spinlock irq_lock;
     unsigned vectors;              /* messages on: changed under irq_lock, by one pci_user_interrupts at a time */
+    unsigned pending;              /* messages whose bit is set: changed under irq_lock; claim_ready reads it bare */
+    struct claim_vectors *vec;     /* the newest block, set under irq_lock and vectors_mutex */
     struct mutex vectors_mutex;    /* pci_user_interrupts of the claim's threads, one at a time */
-    struct claim_message {         /* message n's irq's context */
-        struct pci_claim *claim;
-        unsigned n;
-    } messages[CLAIM_VECTORS];
     unsigned refs;   /* the object and every BAR or DMA object made through it: atomic */
     bool released;   /* the last handle closed: BAR objects are revoked, the function stopped. Atomic */
     bool dma_unsafe; /* the ended claim's IOMMU block was not confirmed: retain its DMA pages. Atomic */
@@ -94,6 +106,10 @@ static void claim_drop(struct pci_claim *c) {
     ASSERT(left != UINT32_MAX);
     if (left) return;
     if (c->domain) iommu_domain_free(c->domain); /* every DMA object of the claim is gone */
+    for (struct claim_vectors *v = c->vec, *older; v; v = older) {
+        older = v->older;
+        kfree(v);
+    }
     kfree(c);
 }
 
@@ -103,7 +119,11 @@ static enum irq_result claim_isr(void *context) {
     struct pci_claim *c = m->claim;
     spin_take(&c->irq_lock);
     if (m->n < c->vectors) {
-        __atomic_fetch_or(&c->pending, 1u << m->n, __ATOMIC_RELEASE);
+        uint64_t *word = &c->vec->pending[m->n / 64], bit = 1ull << (m->n % 64);
+        if (!(*word & bit)) {
+            *word |= bit;
+            __atomic_store_n(&c->pending, c->pending + 1, __ATOMIC_RELEASE);
+        }
         wq_wake_all(&c->wq);
         object_notify(&c->object);
     }
@@ -115,6 +135,7 @@ static void interrupts_off(struct pci_claim *c) {
     if (!c->vectors) return;
     uint64_t irq = spin_lock(&c->irq_lock);
     c->vectors = 0;
+    memset(c->vec->pending, 0, (c->vec->room + 63) / 64 * sizeof *c->vec->pending);
     __atomic_store_n(&c->pending, 0, __ATOMIC_RELAXED);
     spin_unlock(&c->irq_lock, irq);
     /* irqs a remapping entry the units may still hold could reach stay (pci_irq_disable), their
@@ -1069,19 +1090,33 @@ static int64_t interrupts_on(struct pci_claim *c, uint32_t count) {
     struct pci_device *d = c->d;
     interrupts_off(c);
     if (!count) return 0;
-    if (count > CLAIM_VECTORS) count = CLAIM_VECTORS;
-    if (!pci_msix_max_vectors(d) && !pci_msi_max_vectors(d)) return -N_ERR_UNSUPPORTED; /* no legacy INTx for apps */
-    struct irq_spec specs[CLAIM_VECTORS];
-    for (unsigned i = 0; i < count; i++) {
-        c->messages[i] = (struct claim_message){c, i};
-        specs[i] = (struct irq_spec){.name = "app driver", .handler = claim_isr, .context = &c->messages[i], .node = d->node};
+    unsigned most = MAX(pci_msix_max_vectors(d), pci_msi_max_vectors(d));
+    if (!most) return -N_ERR_UNSUPPORTED; /* no legacy INTx for apps */
+    count = MIN(count, most);
+    struct claim_vectors *v = c->vec;
+    if (!v || v->room < count) {
+        size_t words = (count + 63) / 64;
+        v = kzalloc(sizeof *v + count * sizeof *v->messages + words * sizeof *v->pending);
+        if (!v) return -N_ERR_NO_MEMORY;
+        v->room = count;
+        v->pending = (uint64_t *)&v->messages[count];
+        for (unsigned i = 0; i < count; i++) v->messages[i] = (struct claim_message){c, i};
+        v->older = c->vec;
     }
+    struct irq_spec *specs = kmalloc(count * sizeof *specs);
+    if (!specs) {
+        if (v != c->vec) kfree(v);
+        return -N_ERR_NO_MEMORY;
+    }
+    for (unsigned i = 0; i < count; i++)
+        specs[i] = (struct irq_spec){.name = "app driver", .handler = claim_isr, .context = &v->messages[i], .node = d->node};
     /* on before the messages are: one may come as soon as its entry is written */
     uint64_t irq = spin_lock(&c->irq_lock);
+    c->vec = v;
     c->vectors = count;
-    __atomic_store_n(&c->pending, 0, __ATOMIC_RELAXED);
     spin_unlock(&c->irq_lock, irq);
     unsigned n = pci_irq_enable(d, specs, count, NULL);
+    kfree(specs);
     irq = spin_lock(&c->irq_lock);
     c->vectors = n;
     spin_unlock(&c->irq_lock, irq);
@@ -1093,13 +1128,44 @@ static int64_t interrupts_on(struct pci_claim *c, uint32_t count) {
     return n;
 }
 
-int64_t pci_user_interrupt_take(struct handle *h, uint64_t deadline) {
+/* irq_lock held: the pending bits of the first `words` words into got, cleared there; how many
+   words that is (the claim's, at most). */
+static unsigned pending_take(struct pci_claim *c, uint64_t *got, unsigned words) {
+    unsigned n = MIN(words, (c->vectors + 63) / 64), taken = 0;
+    for (unsigned i = 0; i < n; i++) {
+        got[i] = c->vec->pending[i];
+        c->vec->pending[i] = 0;
+        taken += (unsigned)__builtin_popcountll(got[i]);
+    }
+    __atomic_store_n(&c->pending, c->pending - taken, __ATOMIC_RELEASE);
+    return n;
+}
+
+int64_t pci_user_interrupt_take(struct handle *h, uint64_t deadline, uint64_t *ubits, uint32_t words) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
+    if (!words) return -N_ERR_INVALID;
+    uint64_t got[MSIX_MOST / 64];
+    words = MIN(words, (uint32_t)(MSIX_MOST / 64));
     uint64_t irq = spin_lock(&c->irq_lock);
     for (;;) {
-        uint32_t got = __atomic_exchange_n(&c->pending, 0, __ATOMIC_ACQUIRE);
-        if (got) { spin_unlock(&c->irq_lock, irq); return got; }
+        /* a message among the first words' that arrived */
+        bool any = false;
+        for (unsigned i = 0; c->pending && !any && i < MIN(words, (c->vectors + 63) / 64); i++) any = c->vec->pending[i];
+        if (any) {
+            unsigned n = pending_take(c, got, words);
+            spin_unlock(&c->irq_lock, irq);
+            if (!copy_to_user(ubits, got, n * sizeof *got)) return n;
+            /* not delivered: the bits stay for the next take */
+            irq = spin_lock(&c->irq_lock);
+            for (unsigned i = 0; i < n && c->vectors; i++)
+                for (uint64_t m = got[i] & ~c->vec->pending[i]; m; m &= m - 1) {
+                    c->vec->pending[i] |= m & -m;
+                    c->pending++;
+                }
+            spin_unlock(&c->irq_lock, irq);
+            return -N_ERR_BAD_ADDRESS;
+        }
         int64_t r = 0;
         if (thread_current()->killed) r = -N_ERR_STOPPED;
         else if (!c->vectors) r = -N_ERR_NOT_READY;

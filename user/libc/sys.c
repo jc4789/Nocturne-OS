@@ -431,7 +431,9 @@ n_result n_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, uint3
 }
 n_handle n_pci_bar(n_handle pci, uint32_t bar) { return (n_handle)NC5(SYS_PCI_BAR, pci, bar, 0, 0, 0); }
 n_result n_pci_interrupts(n_handle pci, uint32_t count) { return NC5(SYS_PCI_INTERRUPTS, pci, count, 0, 0, 0); }
-n_result n_pci_interrupt_take(n_handle pci, uint64_t deadline) { return NC5(SYS_PCI_INTERRUPT_TAKE, pci, deadline, 0, 0, 0); }
+n_result n_pci_interrupt_take(n_handle pci, uint64_t *bits, uint32_t words, uint64_t deadline) {
+    return NC5(SYS_PCI_INTERRUPT_TAKE, pci, deadline, bits, words, 0);
+}
 n_result n_pci_hold_screen(n_handle pci, bool hold) { return NC5(SYS_PCI_HOLD_SCREEN, pci, hold ? 1 : 0, 0, 0, 0); }
 n_result n_pci_give_screen(n_handle pci, n_handle surface, const struct n_scanout *desc) {
     return NC5(SYS_PCI_GIVE_SCREEN, pci, surface, desc, 0, 0);

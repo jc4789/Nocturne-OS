@@ -2905,7 +2905,7 @@ void syscall_dispatch(struct regs *r) {
         else if (r->rax == SYS_PCI_SCREEN_VBLANK) ret = pci_user_screen_vblank(f, b, c);
         else if (r->rax == SYS_PCI_ACPI_NOTIFY_TAKE) ret = pci_user_acpi_notify_take(f, b);
         else if (r->rax == SYS_PCI_SCREEN_IMAGE_END) ret = pci_user_screen_image_end(f, (int64_t)b);
-        else ret = pci_user_interrupt_take(f,b);
+        else ret = pci_user_interrupt_take(f, b, (uint64_t *)c, (uint32_t)d);
         handle_close(f);
         break;
     }

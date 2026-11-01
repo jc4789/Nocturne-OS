@@ -729,9 +729,11 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     無ければ `N_ERR_NOT_FOUND`。
   - `n_pci_bar(pci, i)` はメモリ BAR を装置メモリの共有オブジェクト（既定は非キャッシュ）にする。
     1 ページ未満や境界の合わない BAR、I/O ポートは扱わない。
-  - `n_pci_interrupts(pci, count)` は MSI-X（無ければ MSI）を最大 32 本つなぎ、本数を返す。
-    INTx はアプリへ渡さない。届いた割り込みは番号のビットを立て、ビットがある間ハンドルは
-    `N_EVENT_RECEIVABLE`。`n_pci_interrupt_take(pci, deadline)` がビットを取り出して消す（期限は §8）。
+  - `n_pci_interrupts(pci, count)` は MSI-X（無ければ MSI）を、機能と系が出せる本数まで
+    つなぎ、本数を返す。INTx はアプリへ渡さない。届いた割り込みは番号のビットを立て、ビットが
+    ある間ハンドルは `N_EVENT_RECEIVABLE`。`n_pci_interrupt_take(pci, bits, words, deadline)` は
+    先頭 `64 × words` 本のどれかが届くまで待ち（期限は §8）、それらのビットを `bits` へ書いて
+    消し、書いた語の数を返す。番号 n は `bits[n / 64]` のビット `n % 64`。後ろの番号のビットは残る。
   - `n_dma_create(pci, bytes, flags)` は装置が DMA で読み書きできる 0 埋めの RAM（共有
     オブジェクト）。`N_DMA_CONTIGUOUS` は物理的に一続き、`N_DMA_32BIT` は 4GiB 未満。
     `n_dma_addresses` が各ページのバスアドレスを返す（物理アドレス。IOMMU が隔離していても
