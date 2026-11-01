@@ -30,7 +30,8 @@ if [ "${1:-}" = --llvm ]; then
 fi
 T=third_party/tinycc
 W=$S.tmp
-build_root=$(realpath -e -- build)
+# make's BUILD: the only folder this script removes things from
+build_root=$(realpath -e -- "${BUILD:-build}")
 for target in "$S" "$W"; do
     absolute=$(realpath -m -- "$target")
     case "$absolute" in

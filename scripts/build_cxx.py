@@ -9,7 +9,9 @@ import subprocess
 import tarfile
 
 ROOT = Path(__file__).resolve().parent.parent
-BUILD = ROOT / 'build' / 'cxx'
+# make's BUILD (--build): the libc++ objects go to <BUILD>/cxx, wabt's to <BUILD>/wabt.
+OUTPUT = ROOT / 'build'
+BUILD = OUTPUT / 'cxx'
 # Match the supplied Windows LLVM compiler; never modify the external checkout.
 UPSTREAM_REF = 'llvmorg-18.1.8'
 UPSTREAM_COMMIT = '3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff'
@@ -86,9 +88,10 @@ def flags(upstream):
 def build_path(path):
     # GNU Make reads .d files in MSYS2. Relative Unix paths avoid Windows drive
     # colons and backslashes being interpreted as rule syntax.
+    # A worktree's BUILD is outside ROOT: a relative path with '..' still has no drive colon.
     absolute = path.resolve()
     try:
-        return absolute.relative_to(ROOT).as_posix()
+        return Path(os.path.relpath(absolute, ROOT)).as_posix()
     except ValueError:
         return absolute.as_posix()
 
@@ -181,7 +184,7 @@ def wabt_library(upstream, translator=False):
             ('wasm2c_atomicops_source_declarations', 'wasm2c_atomicops.declarations.c', 's_atomicops_source_declarations'))
         for name, template, symbol in templates:
             source = source_root / 'src' / 'template' / template
-            output = ROOT / 'build' / 'wabt' / 'generated' / (name + '.cc')
+            output = OUTPUT / 'wabt' / 'generated' / (name + '.cc')
             generator = source_root / 'scripts' / 'gen-wasm2c-templates.cmake'
             if not output.is_file() or output.stat().st_mtime_ns < max(source.stat().st_mtime_ns, generator.stat().st_mtime_ns):
                 output.parent.mkdir(parents=True, exist_ok=True)
@@ -203,19 +206,20 @@ def wabt_library(upstream, translator=False):
         if name in WABT_PORT_SOURCES:
             source = ROOT / 'ports' / 'wabt' / name
         if name.startswith('prebuilt/'):
-            source = ROOT / 'build' / 'wabt' / 'generated' / Path(name).name
-        output = ROOT / 'build' / 'wabt' / (name + '.o')
+            source = OUTPUT / 'wabt' / 'generated' / Path(name).name
+        output = OUTPUT / 'wabt' / (name + '.o')
         if not output.is_file() or output.stat().st_mtime_ns < max(newest_header, source.stat().st_mtime_ns):
             print('  CXX  wabt/' + name, flush=True)
             compile_source(source, output, upstream, extra)
         objects.append(output)
-    archive = ROOT / 'build' / 'wabt' / ('libwasm2c.a' if translator else 'libwabt.a')
+    archive = OUTPUT / 'wabt' / ('libwasm2c.a' if translator else 'libwabt.a')
     if not archive.is_file() or any(obj.stat().st_mtime_ns > archive.stat().st_mtime_ns for obj in objects):
         subprocess.run([tool('llvm-ar'), 'rcs', str(archive), *map(str, objects)], check=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--build', type=Path, default=Path('build'), help="make's BUILD")
     actions = parser.add_subparsers(dest='action', required=True)
     actions.add_parser('library')
     actions.add_parser('wabt')
@@ -232,6 +236,9 @@ def main():
     archive_parser.add_argument('output', type=Path)
     archive_parser.add_argument('objects', type=Path, nargs='+')
     args = parser.parse_args()
+    global OUTPUT, BUILD
+    OUTPUT = (ROOT / args.build).resolve()
+    BUILD = OUTPUT / 'cxx'
     if args.action == 'archive':
         args.output.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run([tool('llvm-ar'), 'rcs', str(args.output), *map(str, args.objects)], check=True)

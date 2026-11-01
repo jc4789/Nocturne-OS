@@ -134,7 +134,7 @@ MESA_GEN_INPUTS := ports/mesa/generate.py $(shell find $(MESA)/src -name '*.py' 
     -o -name '*.csv' -o -name '*.json' -o -name '*.glsl' -o -name '*.conf' -o -name '*.rnc' -o -name '*.txt')
 $(MESA_GEN_STAMP): $(MESA_GEN_INPUTS)
 	@echo "  GEN  mesa"
-	@$(PY) ports/mesa/generate.py
+	@$(PY) ports/mesa/generate.py $(MESA_GEN)
 	@touch $@
 # every generated source of MESA_SRC, llvmpipe's (LLVMPIPE_SRC) too: a clean build has none of them
 $(filter $(MESA_GEN)/%,$(MESA_SRC)): $(MESA_GEN_STAMP)

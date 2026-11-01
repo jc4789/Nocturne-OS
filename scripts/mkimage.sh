@@ -14,8 +14,9 @@
 #                 only this: Hyper-V's disk DISK (.vhdx) from the raw disk RAW
 set -e
 cd "$(dirname "$0")/.."
-B=build
-LIMINE=tools/limine
+# make's BUILD and TOOLS
+B=${BUILD:-build}
+LIMINE=${TOOLS:-tools}/limine
 STORE=$B/host/store.exe
 IMG=$B/nocturne.img
 ISO=$B/nocturne.iso
@@ -67,7 +68,7 @@ iso_make() {
 
 # The built system in place of the one on disk $1.
 update() {
-    python scripts/layout.py --firmware-manifest $FIRMWARE --system $B/system.list >/dev/null
+    python scripts/layout.py --build $B --firmware-manifest $FIRMWARE --system $B/system.list >/dev/null
     boot_install "$1"
     echo "  C:   $($STORE fill "$1" $B/system.list)"
 }
@@ -84,7 +85,7 @@ if [ "$1" = --hyperv ]; then
     exit 0
 fi
 
-PAYLOAD=$(python scripts/layout.py --firmware-manifest $FIRMWARE $B/c.list)
+PAYLOAD=$(python scripts/layout.py --build $B --firmware-manifest $FIRMWARE $B/c.list)
 # C: holds what is put on it, its catalog and a little room; the disk is whole 64 MiB
 SIZE_MB=$(((ESP_MB + 64 + PAYLOAD / MIB * 105 / 100 + FREE_MB + 63) / 64 * 64))
 

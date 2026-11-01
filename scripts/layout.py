@@ -21,6 +21,7 @@ import json
 import os
 from pathlib import Path
 
+# make's BUILD (--build)
 BUILD = Path("build")
 PROGRAMS = BUILD / "programs"
 FIRMWARE_FILES = ("firmware/gsp_ga10x.bin", "firmware/ucodes_ga10x.bin", "LICENSE")
@@ -112,6 +113,7 @@ def main():
     parser.add_argument("--firmware-version", default="")
     parser.add_argument("--firmware-manifest")
     parser.add_argument("--system", action="store_true")
+    parser.add_argument("--build", default="build", help="make's BUILD")
     parser.add_argument("list", nargs="?")
     args = parser.parse_args()
     if args.firmware_state:
@@ -121,6 +123,9 @@ def main():
         return
     if not args.list:
         parser.error("the list to write is missing")
+    global BUILD, PROGRAMS
+    BUILD = Path(args.build)
+    PROGRAMS = BUILD / "programs"
     entries = layout(args.firmware_manifest, args.system)
     lines = ["# made by scripts/layout.py: a path on C:, the host's file or folder, its attributes"]
     lines += [f"{path}\t{host}\t{attributes}" for path, host, attributes in entries]

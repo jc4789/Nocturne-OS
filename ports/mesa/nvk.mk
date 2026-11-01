@@ -29,8 +29,8 @@ NVK_RS_H := $(NV_GEN)/nil/nil.h $(NV_GEN)/vulkan/nvk_rust.h
 # bundled into one static library; the procedural macros (paste, NAK's derives) are host DLLs
 # from ports/mesa/rust-host, built offline with cargo.
 RUST_HOST := $(BUILD)/mesa/rust-host/release
-NVK_RUSTC := RUSTC_BOOTSTRAP=1 rustc --edition 2021 -Zunstable-options --target ports/rust/x86_64-unknown-nocturne.json \
-    --sysroot tools/rust/sysroot -C opt-level=2 -C panic=abort -C debuginfo=0 -C codegen-units=1 --cap-lints allow \
+NVK_RUSTC = RUSTC_BOOTSTRAP=1 rustc --edition 2021 -Zunstable-options --target ports/rust/x86_64-unknown-nocturne.json \
+    --sysroot $(RUST_SYSROOT) -C opt-level=2 -C panic=abort -C debuginfo=0 -C codegen-units=1 --cap-lints allow \
     -L dependency=$(NVK_RS)
 nvk_rlib = $(NVK_RS)/lib$(1).rlib
 nvk_extern = $(foreach c,$(1),--extern $(c)=$(call nvk_rlib,$(c)))

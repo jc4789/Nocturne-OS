@@ -8,6 +8,11 @@ NASM := nasm
 PY   := python
 
 BUILD := build
+# The tools that are not in git (MSYS2, LLVM, Rust, Go, TypeScript, Limine) and the local files that
+# are never distributed (the NVIDIA firmware). scripts/build.py names the main checkout's from a
+# git worktree, which has neither.
+TOOLS ?= tools
+LOCAL ?= local
 # Where the system's parts are made before scripts/layout.py places them on C: every program, the
 # licences that go to C:\Nocturne\Licenses, and C:\Nocturne\SDK (scripts/mksdk.sh)
 PROGRAMS := $(BUILD)/programs
@@ -335,26 +340,26 @@ CXX_HEADERS := $(shell find user/include -type f) common/abi.h common/gfx.h
 # One producer owns the archive and all generated members. A missing member
 # re-enters the incremental builder once even when its archive still exists.
 $(BUILD)/cxx/libc++.a $(CXX_RUNTIME_OBJ) &: scripts/build_cxx.py $(CXX_HEADERS)
-	@$(PY) scripts/build_cxx.py library
+	@$(PY) scripts/build_cxx.py --build $(BUILD) library
 
 WABT_INPUTS := $(WABT_SRC) $(WABT_PORT_SRC) ports/wabt/include/wasm-rt-nocturne.h $(wildcard third_party/wabt/include/wabt/* third_party/wabt/include/wabt/interp/* ports/wabt/include/wabt/*) third_party/wabt/UPSTREAM.json
 $(BUILD)/wabt/libwabt.a $(WABT_OBJ) &: scripts/build_cxx.py $(WABT_INPUTS) $(BUILD)/cxx/libc++.a
-	@$(PY) scripts/build_cxx.py wabt
+	@$(PY) scripts/build_cxx.py --build $(BUILD) wabt
 
 $(BUILD)/wabt/libwasm2c.a $(WASM2C_OBJ) &: scripts/build_cxx.py $(WASM2C_SRC) $(wildcard third_party/wabt/src/template/*) third_party/wabt/scripts/gen-wasm2c-templates.cmake $(WABT_INPUTS) $(BUILD)/cxx/libc++.a
-	@$(PY) scripts/build_cxx.py wasm2c
+	@$(PY) scripts/build_cxx.py --build $(BUILD) wasm2c
 
 $(WASM_RT_OBJ) $(BUILD)/u/ports/wabt/wasm_rt_symbols.o: UCFLAGS += -Iports/wabt/include -Ithird_party/wabt/wasm2c -Ithird_party/tinycc
 $(WASM_RT_OBJ) $(BUILD)/u/ports/wabt/wasm_rt_symbols.o: $(WASM_RT_INPUTS)
 $(BUILD)/wabt/libwasm-rt.a: $(WASM_RT_OBJ)
-	@$(PY) scripts/build_cxx.py archive $@ $^
+	@$(PY) scripts/build_cxx.py --build $(BUILD) archive $@ $^
 
 $(WASM_BRIDGE): user/libc/web/js_wasm.cpp $(BUILD)/wabt/libwabt.a $(CXX_HEADERS) third_party/quickjs/quickjs.h
 	@echo "  CXX  $<"
-	@$(PY) scripts/build_cxx.py compile $< -o $@ -I ports/wabt/include -I third_party/wabt/include -I third_party/quickjs -I third_party/tinycc -I third_party/wabt/wasm2c
+	@$(PY) scripts/build_cxx.py --build $(BUILD) compile $< -o $@ -I ports/wabt/include -I third_party/wabt/include -I third_party/quickjs -I third_party/tinycc -I third_party/wabt/wasm2c
 
 $(BUILD)/u/third_party/wabt/src/tools/wasm2c.cc.o: third_party/wabt/src/tools/wasm2c.cc $(BUILD)/wabt/libwasm2c.a $(BUILD)/wabt/libwabt.a
-	@$(PY) scripts/build_cxx.py compile $< -o $@ -I ports/wabt/include -I third_party/wabt/include
+	@$(PY) scripts/build_cxx.py --build $(BUILD) compile $< -o $@ -I ports/wabt/include -I third_party/wabt/include
 
 APP_BINS += $(PROGRAMS)/wasm2c
 $(PROGRAMS)/wasm2c: $(BUILD)/u/third_party/wabt/src/tools/wasm2c.cc.o $(LIBC_RSP) $(BUILD)/u/user/libc/crt0.asm.o user/cxx.ld user/user.ld
@@ -364,10 +369,10 @@ $(PROGRAMS)/wasm2c: $(BUILD)/u/third_party/wabt/src/tools/wasm2c.cc.o $(LIBC_RSP
 
 # Go programs (ports/go/README.md), built when GO names a Go toolchain with the
 # Nocturne port: make GO=/path/to/go/bin/go.exe. Without GO, a toolchain in
-# tools/go (a copy or a link) is used; likewise TYPESCRIPT and tools/TypeScript.
+# $(TOOLS)/go (a copy or a link) is used; likewise TYPESCRIPT and $(TOOLS)/TypeScript.
 # Desktop apps are written in Go and TypeScript, so a full system needs both.
-GO ?= $(if $(wildcard tools/go/bin/go.exe),$(CURDIR)/tools/go/bin/go.exe)
-TYPESCRIPT ?= $(if $(wildcard tools/TypeScript/tsc/go.mod),tools/TypeScript)
+GO ?= $(if $(wildcard $(TOOLS)/go/bin/go.exe),$(CURDIR)/$(TOOLS)/go/bin/go.exe)
+TYPESCRIPT ?= $(if $(wildcard $(TOOLS)/TypeScript/tsc/go.mod),$(TOOLS)/TypeScript)
 ifneq ($(GO),)
 # the MSYS2 shell may not have the Windows folders Go keeps its cache in
 GOCACHE ?= $(CURDIR)/$(BUILD)/go-cache
@@ -455,7 +460,7 @@ $(LICENSES)/libcxx/LICENSE.TXT: $(BUILD)/cxx/libc++.a
 
 $(BUILD)/u/%.cpp.o: %.cpp $(BUILD)/cxx/libc++.a $(CXX_HEADERS)
 	@echo "  CXX  $<"
-	@$(PY) scripts/build_cxx.py compile $< -o $@
+	@$(PY) scripts/build_cxx.py --build $(BUILD) compile $< -o $@
 
 # The C++ runtime is among the libc's members (CXX_RUNTIME_LINK).
 $(CPP_BINS): $(PROGRAMS)/%: $(BUILD)/u/user/apps/%.cpp.o $(LIBC_RSP) $(BUILD)/u/user/libc/crt0.asm.o user/user.ld user/cxx.ld
@@ -511,7 +516,7 @@ $(BUILD)/sdk.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC
 		common/abi.h common/gfx.h common/gpu_abi.h common/display_abi.h user/user.ld \
 		$(wildcard user/apps/*.c user/apps/*.h user/apps/*.js user/apps/*.ts) $(LLVM_SDK_FILES)
 	@echo "  SDK"
-	@bash scripts/mksdk.sh $(SDK) $(if $(LLVM_SDK),--llvm $(LLVM_SDK)) $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ) --wasmrt $(WASM_RT_OBJ)
+	@BUILD="$(BUILD)" bash scripts/mksdk.sh $(SDK) $(if $(LLVM_SDK),--llvm $(LLVM_SDK)) $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ) --wasmrt $(WASM_RT_OBJ)
 	@touch $@
 
 # ---------------------------------------------------------------- images
@@ -527,7 +532,7 @@ lexbor: $(LXB_OBJ)
 # NVIDIA GSP firmware for nvrm (docs/nvidia/LEDGER.md D9), C:\Nocturne\Firmware\NVIDIA\<version>.
 # It is never in git and never distributed: a copy unpacked into local/ (ignored) goes onto disks
 # built on this machine, and disks get none without it. NVIDIA_FIRMWARE= leaves it out explicitly.
-NVIDIA_FIRMWARE ?= local/firmware/nvidia/615.78.08
+NVIDIA_FIRMWARE ?= $(LOCAL)/firmware/nvidia/615.78.08
 NVIDIA_FW_VERSION := 615.78.08
 NVIDIA_FW_STATE := $(BUILD)/nvidia-firmware.json
 # RM (osinit.c) needs both images of the GPU family: Ampere and Ada (the RTX 4070) use ga10x.
@@ -551,11 +556,11 @@ $(BUILD)/sounds.stamp: scripts/mksounds.py
 
 # the boot disk, build/nocturne.img, its VHDX, and the live ISO (scripts/mkimage.sh)
 image: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(DISK_FILES)
-	@bash scripts/mkimage.sh
+	@BUILD="$(BUILD)" TOOLS="$(TOOLS)" bash scripts/mkimage.sh
 
 # the raw QEMU boot disk only, for test iterations (no VHDX, no ISO)
 qemu-image: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(DISK_FILES)
-	@bash scripts/mkimage.sh --raw-only
+	@BUILD="$(BUILD)" TOOLS="$(TOOLS)" bash scripts/mkimage.sh --raw-only
 
 # QEMU on build/run.img, a disk of its own whose C:\Users stays from one run to the next while its
 # system is replaced by the new one (mkimage.sh --run). The machine is a q35 booted through UEFI
@@ -563,7 +568,7 @@ qemu-image: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(DISK_FILES)
 # for each start) with the disk on NVMe and the keyboard and the pointer on USB.
 QEMU_SHARE ?= $(shell cygpath -m "$$(dirname "$$(command -v $(QEMU))")/../share/qemu")
 run: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(DISK_FILES)
-	@bash scripts/mkimage.sh --run
+	@BUILD="$(BUILD)" TOOLS="$(TOOLS)" bash scripts/mkimage.sh --run
 	@cp -f "$(QEMU_SHARE)/edk2-i386-vars.fd" $(BUILD)/run-vars.fd
 	@$(QEMU) -M q35 -m $(QEMU_MEMORY) -smp $(QEMU_CPUS) -accel $(QEMU_ACCEL) $(QEMU_GRAPHICS) \
 		-drive if=pflash,format=raw,readonly=on,file="$(QEMU_SHARE)/edk2-x86_64-code.fd" \

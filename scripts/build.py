@@ -14,8 +14,9 @@ def main():
     if args.jobs < 1:
         parser.error('並列数は1以上を指定してください')
     root = Path(__file__).resolve().parents[1]
-    # 作業木（git worktree）には無視されたフォルダー（tools/・build/）が無い。道具は本体のものを使い、
-    # 出力は本体の build/wt/<作業木の名>/ に置く。make の BUILD は空白を含まない相対の道で渡す。
+    # 作業木（git worktree）には無視されたフォルダー（tools/・local/・build/）が無い。道具と local は
+    # 本体のものを使い、出力は本体の build/wt/<作業木の名>/ に置く。make の TOOLS・LOCAL・BUILD は
+    # 空白を含まない相対の道で渡す。
     main_root = root
     common = subprocess.run(['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'],
                             cwd=root, capture_output=True, text=True)
@@ -23,8 +24,9 @@ def main():
         main_root = Path(common.stdout.strip()).resolve().parent
     make_vars = []
     if main_root != root:
-        out = main_root / 'build' / 'wt' / root.name
-        make_vars.append('BUILD=' + Path(os.path.relpath(out, root)).as_posix())
+        relative = lambda path: Path(os.path.relpath(path, root)).as_posix()
+        make_vars += ['BUILD=' + relative(main_root / 'build' / 'wt' / root.name),
+                      'TOOLS=' + relative(main_root / 'tools'), 'LOCAL=' + relative(main_root / 'local')]
     bash = main_root / 'tools/msys64/usr/bin/bash.exe'
     # ログイン時の既定PATHはWindows側のRustなどを落とす。
     # 継承してもMSYS2はUCRT64と/usr/binを先頭に置くため、同梱ツールを優先できる。
