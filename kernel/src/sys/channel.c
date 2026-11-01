@@ -3,6 +3,7 @@
 #include "arch/cpu.h"
 #include "lib/idtable.h"
 #include "mm/heap.h"
+#include "mm/pmm.h"
 #include "sys/clock.h"
 #include "sys/syscall.h"
 #include "sys/object.h"
@@ -191,13 +192,20 @@ int channel_accept(struct handle *listener, struct handle **server) {
    sender that waited and leaves room after its message wakes the next; a receiver that waited and
    leaves the message where it was (it only looked, it does not fit, or its buffer is bad) wakes
    the next; an end closed wakes them all. The lock is taken before a wait queue's (an object's
-   waiters' among them, object_notify). */
+   waiters' among them, object_notify).
+
+   A message lives in the kernel's heap from its send to its receipt. One an app sends is charged to
+   it (struct process's messages) until then: the messages an app has waiting in all its channels
+   together may take at most half the memory free when it sends another, so no app takes the heap
+   from the rest, and a message that would go beyond is refused (N_ERR_NO_MEMORY). The kernel's own
+   messages (message_channel_post) are not charged. */
 #define CHANNEL_CREDIT ((size_t)1 << 20)
 struct message {
     struct message *next;
     struct handle *attached;
     size_t size;
     uint64_t sender_app;
+    struct process *charged; /* the app the bytes are charged to (a reference), NULL: the kernel's */
     uint8_t bytes[];
 };
 struct message_link {
@@ -221,25 +229,50 @@ static const struct object_ops message_ops;
 static struct message_link *message_link(struct handle *h) { return h->object->priv; }
 static int message_side(struct handle *h) { return h->object == &message_link(h)->end[1]; }
 
+/* m's memory back, and its charge (not its attachment). */
+static void message_drop(struct message *m) {
+    struct process *p = m->charged;
+    if (p) {
+        __atomic_sub_fetch(&p->messages, m->size, __ATOMIC_RELAXED);
+        process_put(p);
+    }
+    kfree(m);
+}
+
 static void message_free(struct message *m) {
     while (m) {
         struct message *next = m->next;
         handle_close(m->attached);
-        kfree(m);
+        message_drop(m);
         m = next;
     }
 }
 
 bool message_channel_is(struct handle *h) { return handle_is(h, &message_ops); }
 
-static struct message *message_new(size_t n, uint64_t sender_app) {
+/* A message of n bytes, charged to app (NULL: the kernel's). NULL when the app's messages would go
+   beyond their share, or without memory. */
+static struct message *message_new(size_t n, uint64_t sender_app, struct process *app) {
     if (n > SIZE_MAX - sizeof(struct message)) return NULL;
+    if (app) {
+        uint64_t share = pmm_free_pages() * PAGE_SIZE / 2;
+        uint64_t had = __atomic_fetch_add(&app->messages, n, __ATOMIC_RELAXED);
+        if (had + n > share || had + n < had) {
+            __atomic_sub_fetch(&app->messages, n, __ATOMIC_RELAXED);
+            return NULL;
+        }
+    }
     struct message *m = kmalloc(sizeof *m + n);
-    if (!m) return NULL;
+    if (!m) {
+        if (app) __atomic_sub_fetch(&app->messages, n, __ATOMIC_RELAXED);
+        return NULL;
+    }
     m->next = NULL;
     m->size = n;
     m->attached = NULL;
     m->sender_app = sender_app;
+    m->charged = app;
+    if (app) __atomic_add_fetch(&app->refs, 1, __ATOMIC_RELAXED); /* the sender is running: refs > 0 */
     return m;
 }
 
@@ -250,7 +283,7 @@ static int64_t message_put(struct message_link *l, int i, struct message *m, str
                            bool waited) {
     if (!l->open[i]) {
         spin_unlock(&l->lock, flags);
-        kfree(m);
+        message_drop(m);
         return -N_ERR_CLOSED;
     }
     size_t n = m->size;
@@ -287,7 +320,7 @@ static int64_t message_queue(struct handle *h, struct message *m, struct handle 
     for (; l->open[peer] && message_queue_full(l, peer); waited = true) {
         int e = wait_over(deadline, waited);
         if (!e && thread_current()->killed) e = -N_ERR_STOPPED;
-        if (e) { spin_unlock(&l->lock, fl); kfree(m); return e; }
+        if (e) { spin_unlock(&l->lock, fl); message_drop(m); return e; }
         wq_wait_locked_exclusive_until(&l->send_wait[peer], &l->lock, deadline);
         spin_take(&l->lock);
     }
@@ -295,14 +328,15 @@ static int64_t message_queue(struct handle *h, struct message *m, struct handle 
 }
 
 int64_t message_channel_send(struct handle *h, const void *udata, size_t n, struct handle *attach, uint64_t deadline) {
-    struct message *m = message_new(n, (uint64_t)process_current()->pid);
+    struct process *app = process_current();
+    struct message *m = message_new(n, (uint64_t)app->pid, app);
     if (!m) return n > SIZE_MAX - sizeof(struct message) ? -N_ERR_TOO_LARGE : -N_ERR_NO_MEMORY;
-    if (copy_from_user(m->bytes, udata, n) < 0) { kfree(m); return -N_ERR_BAD_ADDRESS; }
+    if (copy_from_user(m->bytes, udata, n) < 0) { message_drop(m); return -N_ERR_BAD_ADDRESS; }
     return message_queue(h, m, attach, deadline);
 }
 
 int64_t message_channel_post(struct handle *h, const void *data, size_t n, uint64_t sender_app) {
-    struct message *m = message_new(n, sender_app);
+    struct message *m = message_new(n, sender_app, NULL);
     if (!m) return -N_ERR_NO_MEMORY;
     memcpy(m->bytes, data, n);
     return message_queue(h, m, NULL, 0);
@@ -353,7 +387,7 @@ int64_t message_channel_receive(struct handle *h, void *ubuf, size_t cap, uint64
             if (discard) { message_free(m); return size; }
             *attached = m->attached;
             m->attached = NULL;
-            kfree(m);
+            message_drop(m);
             return size;
         }
         int e = !l->open[!side] ? -N_ERR_CLOSED : wait_over(deadline, waited);

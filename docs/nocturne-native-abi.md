@@ -212,6 +212,9 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - `n_channel_send(h, data, n, attach)`、`n_channel_receive(h, buf, cap, flags, &attached)`。
   - 流量制御：受け手が未だ受け取っていない量が1MiBに達している間、送信は待つ
     （`N_EVENT_SENDABLE` で送れることを知れる）。空の待ち行列へは大きさに関係なく送れる。
+  - 送ったメッセージは受け取られるまでカーネルの記憶にあり、送ったアプリの分として数える。
+    一つのアプリが全部のチャンネルに待たせているメッセージの合計は、送るときの空きメモリーの
+    半分まで。超える送信は `N_ERR_NO_MEMORY` で、送られない。
   - `N_CHANNEL_WAIT` で待つ。待たない場合は `N_ERR_NOT_READY`。相手が閉じて
     残りも無ければ `N_ERR_CLOSED`。
   - `N_CHANNEL_PEEK` は次のメッセージの大きさだけを返し、取り出さない。

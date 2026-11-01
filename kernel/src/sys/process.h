@@ -46,6 +46,9 @@ struct process {
     uint64_t low_base, low_next;
     struct mmap_hole *low_holes;
     struct shared_mapping *shared_mappings; /* shared pages this app has mapped, also being built */
+    /* The bytes of the messages it sent that wait in a channel (sys/channel.c), atomic. Each such
+       message keeps a reference to the record. */
+    uint64_t messages;
 };
 
 /* The calling thread's process; NULL in a kernel thread. */
