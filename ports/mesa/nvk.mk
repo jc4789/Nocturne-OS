@@ -187,6 +187,12 @@ $(NVK_RS_LIB): ports/mesa/nvk_rs.rs $(foreach c,nak nil nvk_rs,$(call nvk_rlib,$
 	@$(NVK_RUSTC) --crate-type staticlib --crate-name nvk_mesa_rs $< $(call nvk_extern,nak nil nvk_rs) $(NVK_PROC_EXTERN) \
 	    --emit=link=$@,dep-info=$(@:.a=.d)
 
+# Every crate is built against the sysroot's std: a std built again makes them all stale.
+NVK_RS_CRATES := compiler rustc_hash mesa_util nvidia_headers nv_push_rs nak_latencies nak_bindings nak \
+    nil_rs_bindings nil nvk_bindings_rs nvk_rs
+$(foreach c,$(NVK_RS_CRATES),$(call nvk_rlib,$(c))) $(NVK_RS_LIB): \
+    $(wildcard $(RUST_SYSROOT)/lib/rustlib/x86_64-unknown-nocturne/lib/*.rlib)
+
 -include $(wildcard $(NVK_RS)/*.d)
 
 # ---- C: Mesa's Vulkan runtime and NVK --------------------------------------------------------

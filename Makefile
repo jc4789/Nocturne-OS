@@ -13,6 +13,10 @@ BUILD := build
 # git worktree, which has neither.
 TOOLS ?= tools
 LOCAL ?= local
+# The Rust standard library for x86_64-unknown-nocturne (ports/rust/build-std.sh), here because
+# Mesa's crates (ports/mesa/nvk.mk) and the Rust programs (ports/rust/rust.mk) both name it in
+# their prerequisites.
+RUST_SYSROOT ?= $(TOOLS)/rust/sysroot
 # Where the system's parts are made before scripts/layout.py places them on C: every program, the
 # licences that go to C:\Nocturne\Licenses, and C:\Nocturne\SDK (scripts/mksdk.sh)
 PROGRAMS := $(BUILD)/programs
