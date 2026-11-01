@@ -20,16 +20,22 @@
    overwritten meanwhile: the reader goes on from tail and counts the bytes it missed.
 
    ---- the order ----
-   A cursor reads in rounds: it looks at every ring once (where each ring's head is, whether its
-   next record is whole) and takes the records the round found, the soonest first (a heap of the
-   rings by the ns of their next record), up to where each head was. The rings' records come out in
-   the order of their time but for the records written while the round was taken, which the next
-   round puts after it: a look at every ring is once a round, not once a record.
+   A cursor reads in rounds: it looks at the rings written since its last round once (where each
+   ring's head is, whether its next record is whole) and takes the records the round found, the
+   soonest first (a heap of the rings by the ns of their next record), up to where each head was.
+   The rings' records come out in the order of their time but for the records written while the
+   round was taken, which the next round puts after it. A new cursor's first round, and every
+   round of the panic's, looks at every ring.
 
    ---- telling the readers ----
-   A writer cannot take a wait queue's lock (it may hold that lock, a run queue's, any), so it sends
-   its own CPU an interrupt (told_isr), at most one on its way at a time: the interrupt comes when
-   the CPU's interrupts are on again, with no spinlock held, and wakes the readers there. Before
+   A writer sets its ring's bit in `written` (a bit a ring, set only when it is clear) and, when no
+   drain is owed yet, owes one and wakes the "log" thread: directly when it holds no spinlock, else
+   by an interrupt to its own CPU (told_isr), which comes once its interrupts are on again and
+   wakes the thread there (the writer may hold a wait queue's lock, a run queue's, any). The
+   thread takes the written bits, hands them to every cursor (each cursor's `pending`), and then,
+   outside any interrupt: the serial port is filled (dev/serial.c), the readers waiting in
+   log_wait are woken, the system log stream's watchers told. The work of a round grows with the
+   rings written and the readers, not with the CPUs, and none of it is in an interrupt. Before
    log_start there is one CPU, interrupts off and no thread: the boot screen is drawn by the writer
    (fbcon_boot_draw), and the serial port has not started. */
 #include "kernel.h"
@@ -47,6 +53,7 @@
 #include "sys/thread.h"
 #include "sys/wait.h"
 #include "sys/stream.h"
+#include "arch/spin.h"
 
 struct log_record {
     uint64_t seal;   /* its place + 1, stored last: the record is whole */
@@ -70,7 +77,6 @@ struct log_ring {
     uint64_t tail;  /* the oldest whole record's place */
     uint64_t size;  /* a power of two */
     uint8_t *data;
-    bool telling;   /* its CPU's interrupt to itself (told_isr) is on its way */
 } __attribute__((aligned(64)));
 
 /* The boot's ring: every record written before log_init (CPU 0's, before the clock runs), read as
@@ -93,9 +99,18 @@ static unsigned ring_count = 1;
 #define LOG_RING_MIN (64u * 1024)
 _Static_assert(LOG_RING_MIN >= 4 * LOG_RECORD_MAX, "two records in flight fit a ring");
 
-static bool telling_on; /* the readers' interrupt (VEC_LOG): from log_start, but in a sleep */
+static bool telling_on; /* writers tell the drain: from log_start, but in a sleep */
 static uint64_t told;   /* moved on each time the readers are told */
 static struct wait_queue told_wq;
+
+/* The rings written since the drain last took them, a bit a ring (log_init: a word per 64). */
+static uint64_t *written;
+static unsigned written_words;
+static uint64_t drain_owed; /* a writer (or the serial port) asked for a drain */
+static struct wait_queue drain_wq;
+/* The cursors the drain hands the written bits to (all but the panic's). A leaf. */
+static struct spinlock cursors_lock;
+static struct log_cursor *cursors;
 
 /* ---- writing ---- */
 
@@ -108,11 +123,12 @@ static struct log_ring **ring_list(unsigned *count) {
     return __atomic_load_n(&rings, __ATOMIC_RELAXED);
 }
 
-/* Interrupts off: the ring this CPU writes. */
-static struct log_ring *own_ring(void) {
+/* Interrupts off: the ring this CPU writes, and its index. */
+static struct log_ring *own_ring(unsigned *index) {
     unsigned count;
     struct log_ring **list = ring_list(&count);
-    return count > 1 ? list[1 + cpu_current_index()] : &boot_ring;
+    *index = count > 1 ? 1 + cpu_current_index() : 0;
+    return list[*index];
 }
 
 static int32_t own_task(void) {
@@ -169,14 +185,29 @@ static void seal(struct log_record *rec, uint64_t place, uint64_t ns, uint8_t le
     __atomic_store_n(&rec->seal, place + 1, __ATOMIC_RELEASE);
 }
 
-/* Interrupts off, on r's CPU, a record sealed: the readers learn of it. False before log_start,
+/* A drain owed: the "log" thread woken, at once when this CPU holds no spinlock and is not in an
+   NMI, else by the interrupt to itself. */
+static void drain_wake(void) {
+    if (!in_nmi() && spin_none_here()) wq_wake_all(&drain_wq);
+    else apic_send_ipi(cpu_current_index(), VEC_LOG);
+}
+
+void log_kick(void) {
+    if (!__atomic_exchange_n(&drain_owed, 1, __ATOMIC_SEQ_CST)) drain_wake();
+}
+
+/* Interrupts off, on ring's CPU, a record sealed: the drain learns of it. False before log_start,
    when the caller draws the boot screen itself, and in a sleep (log_suspend to log_resume, which
-   tells them then). The exchange orders the seal before the look at
-   telling (told_isr clears it with an exchange before it reads the rings): either the interrupt on
-   its way finds the record, or this sends another. */
-static bool tell(struct log_ring *r) {
+   drains then). The fence orders the seal before the looks at the bit and at drain_owed; the drain
+   clears drain_owed before it takes the bits, and takes a bit before a reader reads the ring:
+   either the drain owed finds the record, or this owes another. */
+static bool tell(unsigned ring) {
     if (!__atomic_load_n(&telling_on, __ATOMIC_ACQUIRE)) return false;
-    if (!__atomic_exchange_n(&r->telling, true, __ATOMIC_SEQ_CST)) apic_send_ipi(cpu_current_index(), VEC_LOG);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    uint64_t *word = &written[ring / 64], bit = 1ull << (ring % 64);
+    if (!(__atomic_load_n(word, __ATOMIC_RELAXED) & bit)) __atomic_fetch_or(word, bit, __ATOMIC_SEQ_CST);
+    if (!__atomic_load_n(&drain_owed, __ATOMIC_RELAXED) && !__atomic_exchange_n(&drain_owed, 1, __ATOMIC_SEQ_CST))
+        drain_wake();
     return true;
 }
 
@@ -187,11 +218,12 @@ int kvlog(enum log_level level, const char *fmt, va_list ap) {
     uint64_t ns = clock_now_ns();
     int whole = kvsnprintf(NULL, 0, fmt, ap); /* measured, then formatted in place */
     size_t length = MIN((size_t)MAX(whole, 0), (size_t)LOG_TEXT_MAX), place;
-    struct log_ring *r = own_ring();
+    unsigned index;
+    struct log_ring *r = own_ring(&index);
     struct log_record *rec = reserve(r, length, &place);
-    int written = kvsnprintf(rec->text, length + 1, fmt, again);
-    seal(rec, place, ns, (uint8_t)level, RECORD_LINE, MIN((size_t)MAX(written, 0), length));
-    bool telling = tell(r);
+    int put = kvsnprintf(rec->text, length + 1, fmt, again);
+    seal(rec, place, ns, (uint8_t)level, RECORD_LINE, MIN((size_t)MAX(put, 0), length));
+    bool telling = tell(index);
     irq_restore(flags);
     va_end(again);
     if (!telling) fbcon_boot_draw();
@@ -230,11 +262,12 @@ static void put_text(uint8_t level, uint8_t kind, const char *s, size_t n) {
             piece = cut;
         }
         uint64_t flags = irq_save(), ns = clock_now_ns(), place;
-        struct log_ring *r = own_ring();
+        unsigned index;
+        struct log_ring *r = own_ring(&index);
         struct log_record *rec = reserve(r, piece, &place);
         memcpy(rec->text, s, piece);
         seal(rec, place, ns, level, kind, piece);
-        bool telling = tell(r);
+        bool telling = tell(index);
         irq_restore(flags);
         if (!telling) fbcon_boot_draw();
         s += piece;
@@ -245,14 +278,11 @@ static void put_text(uint8_t level, uint8_t kind, const char *s, size_t n) {
 void log_text(enum log_level level, const char *s, size_t n) { put_text((uint8_t)level, RECORD_LINE, s, n); }
 void log_console(const char *s, size_t n) { put_text(LOG_INFO, RECORD_CONSOLE, s, n); }
 
-/* ---- the readers' interrupt ---- */
-
-static void tell_all(void);
+/* ---- the drain's interrupt ---- */
 
 static enum irq_result told_isr(void *context) {
     (void)context;
-    __atomic_exchange_n(&own_ring()->telling, false, __ATOMIC_SEQ_CST);
-    tell_all();
+    wq_wake_all(&drain_wq);
     return IRQ_HANDLED;
 }
 
@@ -264,6 +294,10 @@ bool log_wait(uint64_t seen, uint64_t deadline) { return wq_wait_unless(&told_wq
 
 struct log_cursor {
     unsigned flags, rings; /* rings: the places it has room for */
+    struct log_cursor *next; /* in cursors, the drain's list */
+    uint64_t *pending;     /* [written_words] the rings written since its last round (the drain's bits);
+                              NULL for the panic's, whose every round looks at every ring */
+    bool whole;            /* its next round looks at every ring */
     uint64_t *at;          /* [rings] the place of each ring's next record to read */
     uint64_t *end;         /* [rings] this round: where the ring's head was when it was looked at */
     uint64_t *key;         /* [rings] this round: the ns of the ring's next record */
@@ -286,10 +320,15 @@ struct log_cursor {
 #define CURSOR_ARRAY_BYTES (3 * sizeof(uint64_t) + sizeof(unsigned))
 
 /* Before the oldest record each ring holds now: what was overwritten before is not this reader's
-   loss. */
+   loss. Its first round looks at every ring. */
 static void cursor_setup(struct log_cursor *c, unsigned flags, unsigned n, uint64_t *arrays) {
+    struct log_cursor *next = c->next;
+    uint64_t *pending = c->pending;
     memset(c, 0, offsetof(struct log_cursor, text));
     memset(arrays, 0, n * CURSOR_ARRAY_BYTES);
+    c->next = next;
+    c->pending = pending;
+    c->whole = true;
     c->flags = flags;
     c->rings = n;
     c->at = arrays;
@@ -306,14 +345,34 @@ static uint64_t boot_cursor_arrays[(CURSOR_ARRAY_BYTES + sizeof(uint64_t) - 1) /
 static struct log_cursor boot_cursor;
 static struct log_cursor *panic_cursor;
 
-struct log_cursor *log_cursor_new(unsigned flags) {
+/* words: the written bits it is handed (0 for the panic's, which looks at every ring). */
+static struct log_cursor *cursor_make(unsigned flags, unsigned words) {
     unsigned n = __atomic_load_n(&ring_count, __ATOMIC_ACQUIRE);
-    struct log_cursor *c = kmalloc(sizeof *c + n * CURSOR_ARRAY_BYTES);
-    if (c) cursor_setup(c, flags, n, (uint64_t *)(c + 1));
+    struct log_cursor *c = kzalloc(sizeof *c + n * CURSOR_ARRAY_BYTES + words * sizeof(uint64_t));
+    if (!c) return NULL;
+    if (words) c->pending = (uint64_t *)((uint8_t *)(c + 1) + n * CURSOR_ARRAY_BYTES);
+    cursor_setup(c, flags, n, (uint64_t *)(c + 1));
+    if (c->pending) {
+        uint64_t f = spin_lock(&cursors_lock);
+        c->next = cursors;
+        cursors = c;
+        spin_unlock(&cursors_lock, f);
+    }
     return c;
 }
 
-void log_cursor_free(struct log_cursor *c) { kfree(c); }
+struct log_cursor *log_cursor_new(unsigned flags) { return cursor_make(flags, written_words); }
+
+void log_cursor_free(struct log_cursor *c) {
+    if (c && c->pending) {
+        uint64_t f = spin_lock(&cursors_lock);
+        struct log_cursor **at = &cursors;
+        while (*at != c) at = &(*at)->next;
+        *at = c->next;
+        spin_unlock(&cursors_lock, f);
+    }
+    kfree(c);
+}
 
 void log_cursor_rewind(struct log_cursor *c) { cursor_setup(c, c->flags, c->rings, c->at); }
 
@@ -368,20 +427,36 @@ static bool next_whole(const struct log_cursor *c, struct log_ring *const *list,
     return true;
 }
 
-/* A new round: every ring looked at once. */
+/* Ring i into the round: where its head is, and its next record when that is whole. */
+static void scan_ring(struct log_cursor *c, struct log_ring *const *list, unsigned i) {
+    c->end[i] = __atomic_load_n(&list[i]->head, __ATOMIC_ACQUIRE);
+    uint64_t tail = __atomic_load_n(&list[i]->tail, __ATOMIC_ACQUIRE), ns;
+    if (c->at[i] < tail) {
+        c->lost += tail - c->at[i];
+        c->at[i] = tail;
+    }
+    if (next_whole(c, list, i, &ns)) heap_push(c, i, ns);
+}
+
+/* A new round: the rings written since the last one looked at once (every ring when whole). */
 static void scan(struct log_cursor *c) {
     unsigned count;
     struct log_ring **list = ring_list(&count);
     count = MIN(count, c->rings);
     c->count = 0;
-    for (unsigned i = 0; i < count; i++) {
-        c->end[i] = __atomic_load_n(&list[i]->head, __ATOMIC_ACQUIRE);
-        uint64_t tail = __atomic_load_n(&list[i]->tail, __ATOMIC_ACQUIRE), ns;
-        if (c->at[i] < tail) {
-            c->lost += tail - c->at[i];
-            c->at[i] = tail;
+    if (!c->pending || c->whole) {
+        if (c->pending)
+            for (unsigned w = 0; w < written_words; w++) __atomic_store_n(&c->pending[w], 0, __ATOMIC_RELAXED);
+        c->whole = false;
+        for (unsigned i = 0; i < count; i++) scan_ring(c, list, i);
+        return;
+    }
+    for (unsigned w = 0; w < written_words; w++) {
+        if (!__atomic_load_n(&c->pending[w], __ATOMIC_RELAXED)) continue;
+        for (uint64_t bits = __atomic_exchange_n(&c->pending[w], 0, __ATOMIC_ACQUIRE); bits; bits &= bits - 1) {
+            unsigned i = w * 64 + (unsigned)__builtin_ctzll(bits);
+            if (i < count) scan_ring(c, list, i);
         }
-        if (next_whole(c, list, i, &ns)) heap_push(c, i, ns);
     }
 }
 
@@ -525,6 +600,11 @@ size_t log_read(struct log_cursor *c, char *out, size_t cap) {
 
 bool log_pending(const struct log_cursor *c) {
     if (c->stage_at < c->stage_len || c->have || c->lost || c->count) return true;
+    if (c->pending && !c->whole) {
+        for (unsigned w = 0; w < written_words; w++)
+            if (__atomic_load_n(&c->pending[w], __ATOMIC_RELAXED)) return true;
+        return false;
+    }
     unsigned count;
     struct log_ring **list = ring_list(&count);
     count = MIN(count, c->rings);
@@ -575,6 +655,8 @@ void log_init(void) {
     uint64_t share = pmm_total_pages() * PAGE_SIZE / LOG_RAM_SHARE / cpus, size = LOG_RING_MIN;
     while (size * 2 <= share) size *= 2;
     struct log_ring **list = kzalloc((cpus + 1) * sizeof *list);
+    written_words = (cpus + 1 + 63) / 64;
+    if (!(written = kzalloc(written_words * sizeof *written))) panic("log: no memory for the rings' written bits");
     uint64_t header_pages = ALIGN_UP((uint64_t)cpus * sizeof(struct log_ring), PAGE_SIZE) / PAGE_SIZE;
     uint64_t headers = pmm_alloc_contig(header_pages, 64);
     if (!list || !headers) panic("log: no memory for the table of %u rings", cpus);
@@ -591,19 +673,43 @@ void log_init(void) {
     }
     __atomic_store_n(&rings, list, __ATOMIC_RELEASE);
     __atomic_store_n(&ring_count, cpus + 1, __ATOMIC_RELEASE);
-    __atomic_store_n(&panic_cursor, log_cursor_new(0), __ATOMIC_RELEASE);
+    __atomic_store_n(&panic_cursor, cursor_make(0, 0), __ATOMIC_RELEASE);
     kprintf("log: a ring of %lu KiB for each of %u CPUs\n", size >> 10, cpus);
     if (boot_ring.tail)
         kprintf("log: the boot's first %lu bytes of records were overwritten before the rings were made\n",
                 boot_ring.tail);
 }
 
-/* The readers learn of everything written while nobody told them. */
-static void tell_all(void) {
-    __atomic_add_fetch(&told, 1, __ATOMIC_SEQ_CST);
-    serial_log_ready();
-    wq_wake_all(&told_wq);
-    stream_system_log_told();
+/* The rings written since the last round, handed to every cursor: true when there were some. */
+static bool written_take(void) {
+    bool any = false;
+    uint64_t f = spin_lock(&cursors_lock);
+    for (unsigned w = 0; w < written_words; w++) {
+        if (!__atomic_load_n(&written[w], __ATOMIC_RELAXED)) continue;
+        uint64_t bits = __atomic_exchange_n(&written[w], 0, __ATOMIC_ACQ_REL);
+        if (!bits) continue;
+        any = true;
+        for (struct log_cursor *c = cursors; c; c = c->next) __atomic_fetch_or(&c->pending[w], bits, __ATOMIC_RELEASE);
+    }
+    spin_unlock(&cursors_lock, f);
+    return any;
+}
+
+/* The "log" thread: a round for each drain owed. The serial port may ask to be filled again at a
+   time (a port without its interrupt, serial_drain): the wait ends then too. */
+static void drain_thread(void *arg) {
+    (void)arg;
+    uint64_t again = CLOCK_NEVER;
+    for (;;) {
+        wq_wait_unless(&drain_wq, &drain_owed, 0, again);
+        __atomic_exchange_n(&drain_owed, 0, __ATOMIC_SEQ_CST);
+        bool fresh = written_take();
+        again = serial_drain();
+        if (!fresh) continue;
+        __atomic_add_fetch(&told, 1, __ATOMIC_SEQ_CST);
+        wq_wake_all(&told_wq);
+        stream_system_log_told();
+    }
 }
 
 void log_start(void) {
@@ -611,8 +717,9 @@ void log_start(void) {
         panic("log: VEC_LOG is taken");
     fbcon_start();
     serial_start();
+    if (!kthread_create("log", drain_thread, NULL)) panic("log: no memory for the drain's thread");
     __atomic_store_n(&telling_on, true, __ATOMIC_RELEASE);
-    tell_all(); /* what was written since the two started, before a writer could tell them */
+    log_kick(); /* what was written since the two started, before a writer could tell them */
 }
 
 void log_suspend(void) {
@@ -620,12 +727,12 @@ void log_suspend(void) {
     serial_suspend();
 }
 
+/* The drain runs once the scheduler does again: it sends what the port had not sent and tells
+   the readers of what was written meanwhile (every ring's bit: the writers did not tell). */
 void log_resume(void) {
-    unsigned count;
-    struct log_ring **list = ring_list(&count);
-    /* an interrupt on its way to a CPU when it stopped is gone with it */
-    for (unsigned i = 0; i < count; i++) __atomic_store_n(&list[i]->telling, false, __ATOMIC_RELEASE);
     serial_resume();
+    for (unsigned w = 0; w < written_words; w++) __atomic_store_n(&written[w], ~0ull, __ATOMIC_RELAXED);
     __atomic_store_n(&telling_on, true, __ATOMIC_RELEASE);
-    tell_all();
+    __atomic_store_n(&drain_owed, 1, __ATOMIC_SEQ_CST);
+    wq_wake_all(&drain_wq);
 }

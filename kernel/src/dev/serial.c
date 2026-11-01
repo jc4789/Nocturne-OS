@@ -9,11 +9,12 @@
    keeps what is written to it.
 
    How it sends: from the log's rings (sys/log.h) through a cursor of its own, a FIFO's worth at a
-   time. The UART interrupts when its transmit holding register empties (IER bit 1), and the
-   interrupt fills the FIFO again from the cursor; when the cursor has nothing more the port stays
-   quiet, and the next records' telling (serial_log_ready, from sys/log.c's interrupt) fills it
-   again if the holding register is empty. No writer waits for the line: what a ring overwrites
-   before the port sends it, the cursor says it lost.
+   time, in the log's thread (serial_drain). The UART interrupts when its transmit holding register
+   empties (IER bit 1); the interrupt only reads the cause and owes the log's thread a round
+   (log_kick), which fills the FIFO again. When the cursor has nothing more the port stays quiet,
+   and the next records' round fills it again if the holding register is empty. A port without
+   its interrupt is filled at the rounds and again once its FIFO has had time to empty. No writer
+   waits for the line: what a ring overwrites before the port sends it, the cursor says it lost.
 
    The waits on the line's status (LSR) are where nothing else may run: a panic, the power going
    off, a sleep's start. Each is bounded by twice the time the FIFO and the shift register take at
@@ -100,7 +101,10 @@ struct uart {
 };
 
 static struct uart uart;
-static struct spinlock serial_lock; /* the port and the cursor: a leaf */
+/* The port's transmitter and the cursor: a leaf. The log's thread takes it with interrupts on (no
+   interrupt handler takes it: serial_isr only reads the cause and status), the polled paths with
+   them off. */
+static struct spinlock serial_lock;
 static struct log_cursor *cursor;   /* from serial_start */
 static bool started;
 static struct irq *irq;             /* its interrupt, NULL for none */
@@ -217,11 +221,12 @@ static bool fill(void) {
     return n != 0;
 }
 
-/* Its interrupt's handler: IRQ_NONE when the UART had no cause (a shared line's other device). */
+/* Its interrupt's handler: IRQ_NONE when the UART had no cause (a shared line's other device). The
+   identification, status and receive registers are read beside the log's thread writing the
+   transmitter: reading them changes nothing it uses. */
 static enum irq_result serial_isr(void *context) {
     (void)context;
     enum irq_result mine = IRQ_NONE;
-    spin_take(&serial_lock);
     for (uint8_t iir; uart.present && !((iir = reg_in(REG_IIR)) & IIR_NONE);) {
         mine = IRQ_HANDLED;
         switch (iir & IIR_CAUSE) {
@@ -229,11 +234,10 @@ static enum irq_result serial_isr(void *context) {
         case IIR_DATA:
         case IIR_TIMEOUT: reg_in(REG_DATA); break;
         case IIR_MODEM: reg_in(REG_MSR); break;
-        case IIR_THRE: fill(); break; /* reading IIR cleared it: nothing more until the next fill empties */
+        case IIR_THRE: log_kick(); break; /* reading IIR cleared it: nothing more until the next fill empties */
         default: break;
         }
     }
-    spin_give(&serial_lock);
     return mine;
 }
 
@@ -268,11 +272,14 @@ void serial_start(void) {
     if (irq) reg_out(REG_IER, IER_THRE);
 }
 
-void serial_log_ready(void) {
-    if (!started) return;
+uint64_t serial_drain(void) {
+    if (!started) return CLOCK_NEVER;
     spin_take(&serial_lock);
-    if (uart.present && (reg_in(REG_LSR) & LSR_THRE)) fill();
+    bool sending = uart.present;
+    if (sending && (reg_in(REG_LSR) & LSR_THRE)) sending = fill() && log_pending(cursor);
     spin_give(&serial_lock);
+    if (irq || !sending) return CLOCK_NEVER;
+    return clock_now_ns() + uart.depth * uart.char_ns; /* a FIFO's time on the line */
 }
 
 /* Interrupts off: until the line status shows bit (see the top). False, the port given up, when it
@@ -338,9 +345,8 @@ void serial_resume(void) {
     if (uart.present) {
         setup();
         if (irq) reg_out(REG_IER, IER_THRE); /* empty: it interrupts at once */
-        else fill();
     }
-    spin_give(&serial_lock);
+    spin_give(&serial_lock); /* log_resume owes the log's thread a round, which fills it */
 }
 
 /* The report, ahead of what the port had not sent of the log: a line far behind the log
