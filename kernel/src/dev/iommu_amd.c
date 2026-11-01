@@ -21,7 +21,9 @@
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "arch/preempt.h"
 #include "sys/clock.h"
+#include "sys/wait.h"
 
 /* MMIO registers */
 #define R_DEVTAB    0x0000
@@ -137,10 +139,23 @@ struct unit {
     uint8_t msi_num;       /* event-log MSI-X entry, IVHD IOMMU info[4:0] */
     bool hat_dis, event_irq;
     uint64_t cmd, events;  /* rings */
+    /* The unit's command buffer, registers and event log: a leaf, also taken in its event handler.
+       A caller's commands and the COMPLETION_WAIT after them go in under one hold (a batch); the
+       wait for that completion is outside it. */
+    struct spinlock lock;
     uint32_t cmd_tail;
-    bool lost;             /* a command since the last sync was not done: that sync fails */
-    bool stalled;          /* it took no command in time: none more are sent until that sync */
+    bool batch_lost;       /* a command of the batch was not taken: the batch fails */
+    bool stalled;          /* it took no command in time: none more of the batch are sent */
     bool overflow_told;    /* its event log overflowed and is still writing: said once */
+    /* Completion: each batch's COMPLETION_WAIT stores the next token in the unit's word; the unit
+       finishes them in order, so a word at or past a batch's token says its commands are done.
+       restarted: the last token given before the unit was started again after halting, which
+       voids every batch up to it that had not finished. done: the batches' waiters, woken by the
+       completion interrupt (ComWaitInt) where the unit has its event interrupt. */
+    volatile uint64_t *word;
+    uint64_t word_at; /* its physical address */
+    uint64_t token, restarted;
+    struct wait_queue done;
     struct span *listed;   /* the IDs its IVHD names: those it may have cached entries of */
     size_t nlisted, listed_room;
 };
@@ -150,14 +165,11 @@ static bool np_cache; /* a unit caches not-present entries */
 /* The CPUs are in x2APIC mode (arch/apic.c): every unit has XTEn and GAEn (2.2.5.3), which
    select the 128-bit remapping entry with its 32-bit destination, all units using one entry size
    (2.2.5.2). */
-static uint64_t devtab, sems; /* device table; one completion word a unit */
+/* The device table and the completion words. A device table entry belongs to the domain of its
+   ID, whose attach and block the common part's attach_mutex orders; an interrupt remapping entry
+   changes in one store (irte_store). What a unit reads of them is invalidated by its own batch. */
+static uint64_t devtab, sems;
 static size_t sem_pages;
-static uint64_t token;
-/* The units and what they read: every unit's command buffer, event log and registers, the
-   completion words and token, the device table, the domains' interrupt remapping tables. Every
-   call of the common part (struct iommu_hw) and the event handler work under it; it is
-   taken after the common part's locks, and only iommu_fault_report's is taken under it. */
-static struct spinlock amd_lock;
 
 /* IVRS: requests of first..last arrive as `as` */
 struct alias {
@@ -438,6 +450,7 @@ static bool commands_started(const struct unit *u) {
     return false;
 }
 
+/* u->lock held. Every batch given a token so far and not finished is void. */
 static void commands_restart(struct unit *u) {
     kprintf("iommu: unit at %lx stopped taking commands; started again\n", u->base);
     uint64_t ctl = rd(u, R_CONTROL);
@@ -445,13 +458,15 @@ static void commands_restart(struct unit *u) {
     wr(u, R_CMD_HEAD, 0);
     wr(u, R_CMD_TAIL, 0);
     u->cmd_tail = 0;
-    u->lost = true;
+    u->batch_lost = true;
+    __atomic_store_n(&u->restarted, u->token, __ATOMIC_RELEASE);
     wr(u, R_CONTROL, ctl | CTL_CMDBUF_EN);
     commands_started(u);
 }
 
-/* A command for one unit: one it has no room for in time is lost (u->lost), and so are the ones
-   after it until the sync, which would each wait as long under amd_lock with interrupts off. */
+/* A command for one unit, u->lock held: one it has no room for in time is lost (u->batch_lost),
+   and so are the ones after it in the batch, which would each wait as long. The room is waited
+   for here only when the ring of 256 commands is full. */
 static void command(struct unit *u, unsigned op, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
     if (u->stalled) return;
     for (uint64_t t = clock_after(100 * NS_PER_MS); (rd(u, R_CMD_HEAD) & 0x7FFF0) == (u->cmd_tail + 16) % RING_BYTES;
@@ -461,7 +476,7 @@ static void command(struct unit *u, unsigned op, uint32_t a, uint32_t b, uint32_
             break;
         }
         if (clock_now_ns() >= t) {
-            u->lost = u->stalled = true;
+            u->batch_lost = u->stalled = true;
             return;
         }
     }
@@ -475,15 +490,8 @@ static void command(struct unit *u, unsigned op, uint32_t a, uint32_t b, uint32_
     wr(u, R_CMD_TAIL, u->cmd_tail);
 }
 
-static void send(unsigned op, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
-    for (size_t i = 0; i < nunits; i++) command(&units[i], op, a, b, c, d);
-}
-
 /* Every page of a domain, the page directory caches with them. */
 static void domain_flush(struct unit *u, uint16_t id) { command(u, CMD_INV_PAGES, 0, id, 0xFFFFF000u | 3, 0x7FFFFFFFu); }
-static void send_domain_flush(uint16_t id) {
-    for (size_t i = 0; i < nunits; i++) domain_flush(&units[i], id);
-}
 
 static void event_show(const struct unit *u, const volatile uint32_t *e) {
     unsigned code = e[1] >> 28;
@@ -501,9 +509,10 @@ static void event_show(const struct unit *u, const volatile uint32_t *e) {
     }
 }
 
+/* u->lock held: the events it logged said, and its completion interrupt's status cleared. */
 static void events_drain(struct unit *u) {
     uint32_t status = (uint32_t)rd(u, R_STATUS);
-    wr(u, R_STATUS, status & ST_EVENT_INT);
+    wr(u, R_STATUS, status & (ST_EVENT_INT | ST_COMWAIT_INT));
     uint32_t head = rd(u, R_EVT_HEAD) & 0x7FFF0, tail = rd(u, R_EVT_TAIL) & 0x7FFF0;
     for (; head != tail; head = (head + 16) % RING_BYTES)
         event_show(u, (const volatile uint32_t *)((uint8_t *)phys_to_virt(u->events) + head));
@@ -531,42 +540,88 @@ static void events_drain(struct unit *u) {
     }
 }
 
+/* Every message drains every unit (event_interrupts_enable), and wakes the batches waiting on
+   one that finished a COMPLETION_WAIT or halted its commands (started again here, which voids
+   them). */
 static enum irq_result event_isr(void *context) {
     (void)context;
-    spin_take(&amd_lock);
-    for (size_t i = 0; i < nunits; i++) events_drain(&units[i]);
-    spin_give(&amd_lock);
+    for (size_t i = 0; i < nunits; i++) {
+        struct unit *u = &units[i];
+        spin_take(&u->lock);
+        bool halted = u->cmd && !(rd(u, R_STATUS) & ST_CMDBUF_RUN) && (rd(u, R_CONTROL) & CTL_CMDBUF_EN);
+        if (halted) commands_restart(u);
+        events_drain(u);
+        spin_give(&u->lock);
+        wq_wake_all(&u->done);
+    }
     return IRQ_HANDLED;
 }
 
-/* Waits until every unit has done every command sent since the last sync: false when one was
-   lost or a unit did not finish them in time. */
-static bool sync(void) {
-    volatile uint64_t *word = phys_to_virt(sems);
-    /* Zero is the pending word, never completion, including at the store field's wrap. */
-    if (!++token) ++token;
-    for (size_t i = 0; i < nunits; i++) {
-        uint64_t at = sems + i * 8;
-        word[i] = 0;
-        command(&units[i], CMD_COMPLETION_WAIT, (uint32_t)at | 1, (uint32_t)(at >> 32) & 0xFFFFF, (uint32_t)token,
-                (uint32_t)(token >> 32));
+/* The batch's end, u->lock held: its COMPLETION_WAIT, storing the next token and raising the
+   completion interrupt where the unit has one. The token to wait for, 0 when the batch lost a
+   command (nothing to wait for: it failed). */
+static uint64_t batch_end(struct unit *u) {
+    uint64_t at = u->word_at, token = u->token + 1;
+    command(u, CMD_COMPLETION_WAIT, (uint32_t)at | (u->event_irq ? 2 : 0) | 1, (uint32_t)(at >> 32) & 0xFFFFF,
+            (uint32_t)token, (uint32_t)(token >> 32));
+    if (!u->stalled) u->token = token; /* in the ring: its store comes, whatever else the batch lost */
+    return u->batch_lost ? 0 : token;
+}
+
+/* Waits for the unit to finish a batch's token, outside u->lock: asleep where the caller may sleep
+   and the unit's completion interrupt wakes it, else spinning (start, resume, a message rewritten
+   under a spinlock). False when the unit was started again before it finished, or did not finish
+   in time. */
+static bool batch_wait(struct unit *u, uint64_t token) {
+    uint64_t deadline = clock_after(100 * NS_PER_MS);
+    bool sleep = u->event_irq && preemptible();
+    for (;;) {
+        uint64_t seen = *u->word;
+        if (seen >= token) return true;
+        if (__atomic_load_n(&u->restarted, __ATOMIC_ACQUIRE) >= token) return false;
+        if (clock_now_ns() >= deadline) {
+            kprintf("iommu: unit at %lx did not finish its commands\n", u->base);
+            return false;
+        }
+        if (sleep) {
+            wq_wait_unless(&u->done, (const uint64_t *)u->word, seen, deadline);
+            continue;
+        }
+        if (!(rd(u, R_STATUS) & ST_CMDBUF_RUN)) {
+            uint64_t f = spin_lock(&u->lock);
+            if (!(rd(u, R_STATUS) & ST_CMDBUF_RUN)) commands_restart(u);
+            spin_unlock(&u->lock, f);
+        }
+        pause();
     }
-    for (size_t i = 0; i < nunits; i++) {
-        struct unit *u = &units[i];
-        for (uint64_t t = clock_after(100 * NS_PER_MS); !u->lost && word[i] != token; pause()) {
-            if (!(rd(u, R_STATUS) & ST_CMDBUF_RUN)) {
-                commands_restart(u);
-            } else if (clock_now_ns() >= t) {
-                kprintf("iommu: unit at %lx did not finish its commands\n", u->base);
-                u->lost = true;
+}
+
+/* A batch on every unit: fill's commands for it, then its COMPLETION_WAIT, the units given theirs
+   a group at a time before the group is waited for. True once every unit finished its batch. A
+   unit without its event interrupt has its events said after its batch. */
+#define UNITS_AT_ONCE 16
+static bool on_every_unit(void (*fill)(struct unit *u, const void *arg), const void *arg) {
+    bool ok = true;
+    for (size_t from = 0; from < nunits; from += UNITS_AT_ONCE) {
+        size_t n = MIN(nunits - from, (size_t)UNITS_AT_ONCE);
+        uint64_t tokens[UNITS_AT_ONCE];
+        for (size_t i = 0; i < n; i++) {
+            struct unit *u = &units[from + i];
+            uint64_t f = spin_lock(&u->lock);
+            u->batch_lost = u->stalled = false;
+            if (fill) fill(u, arg);
+            tokens[i] = batch_end(u);
+            spin_unlock(&u->lock, f);
+        }
+        for (size_t i = 0; i < n; i++) {
+            struct unit *u = &units[from + i];
+            ok &= tokens[i] && batch_wait(u, tokens[i]);
+            if (!u->event_irq) {
+                uint64_t f = spin_lock(&u->lock);
+                events_drain(u);
+                spin_unlock(&u->lock, f);
             }
         }
-    }
-    bool ok = true;
-    for (size_t i = 0; i < nunits; i++) {
-        events_drain(&units[i]);
-        ok &= !units[i].lost;
-        units[i].lost = units[i].stalled = false;
     }
     return ok;
 }
@@ -581,12 +636,23 @@ static void dte_write(uint16_t id, uint64_t q0, uint64_t q1, uint64_t q2) {
     if (!amd.coherent) iommu_cache_flush(e, 32);
 }
 
-/* The device table and interrupt remapping caches keep the IDs' entries (2.3.2): both go. */
-static void send_entry_flush(const struct iommu_domain *dom) {
+/* The batches' commands. The device table and interrupt remapping caches keep the IDs' entries
+   (2.3.2): both go. */
+static void entry_flush(struct unit *u, const void *arg) {
+    const struct iommu_domain *dom = arg;
     for (unsigned i = 0; i < dom->nids; i++) {
-        send(CMD_INV_DEVTAB, dom->ids[i], 0, 0, 0);
-        send(CMD_INV_IRT, dom->ids[i], 0, 0, 0);
+        command(u, CMD_INV_DEVTAB, dom->ids[i], 0, 0, 0);
+        command(u, CMD_INV_IRT, dom->ids[i], 0, 0, 0);
     }
+}
+static void pages_flush(struct unit *u, const void *arg) { domain_flush(u, ((const struct iommu_domain *)arg)->id); }
+static void block_flush(struct unit *u, const void *arg) {
+    entry_flush(u, arg);
+    pages_flush(u, arg);
+}
+static void irt_flush(struct unit *u, const void *arg) {
+    const struct iommu_domain *dom = arg;
+    for (unsigned i = 0; i < dom->nids; i++) command(u, CMD_INV_IRT, dom->ids[i], 0, 0, 0);
 }
 
 static bool amd_attach(struct iommu_domain *dom) {
@@ -595,41 +661,26 @@ static bool amd_attach(struct iommu_domain *dom) {
         return false;
     }
     if (!amd.coherent) iommu_cache_flush(phys_to_virt(dom->irt), PAGE_SIZE);
-    uint64_t f = spin_lock(&amd_lock);
-    send_domain_flush(dom->id); /* nothing the firmware cached under this id is used */
-    bool ok = sync();
-    if (ok) {
-        dom->written = true;
-        for (unsigned i = 0; i < dom->nids; i++)
-            dte_write(dom->ids[i], DTE_V | DTE_TV | DTE_MODE(dom->levels) | dom->root | DTE_IR | DTE_IW, dom->id,
-                      DTE_IV | DTE_IRT_LEN(IRT_LOG2) | dom->irt | DTE_INT_REMAP);
-        send_entry_flush(dom);
-        ok = sync();
-    }
-    spin_unlock(&amd_lock, f);
-    return ok;
+    /* nothing the firmware cached under this id is used */
+    if (!on_every_unit(pages_flush, dom)) return false;
+    dom->written = true;
+    for (unsigned i = 0; i < dom->nids; i++)
+        dte_write(dom->ids[i], DTE_V | DTE_TV | DTE_MODE(dom->levels) | dom->root | DTE_IR | DTE_IW, dom->id,
+                  DTE_IV | DTE_IRT_LEN(IRT_LOG2) | dom->irt | DTE_INT_REMAP);
+    return on_every_unit(entry_flush, dom);
 }
 
 /* Valid, translation on, mode 0 (no page tables) with neither read nor write allowed: every DMA
    aborts. Interrupts valid with IntCtl 00 and no pass bits: every interrupt aborts. What the
    units cached under the domain's own ID goes (2.4.2) before that ID is released. */
 static bool amd_block(struct iommu_domain *dom) {
-    uint64_t f = spin_lock(&amd_lock);
     for (unsigned i = 0; i < dom->nids; i++) dte_write(dom->ids[i], DTE_V | DTE_TV, BLOCK_DOMAIN, DTE_IV);
-    send_entry_flush(dom);
-    send_domain_flush(dom->id);
-    bool ok = sync();
-    spin_unlock(&amd_lock, f);
-    return ok;
+    return on_every_unit(block_flush, dom);
 }
 
 static bool amd_flush(struct iommu_domain *dom, bool unmapped) {
     if (!unmapped && !np_cache) return true;
-    uint64_t f = spin_lock(&amd_lock);
-    send_domain_flush(dom->id);
-    bool ok = sync();
-    spin_unlock(&amd_lock, f);
-    return ok;
+    return on_every_unit(pages_flush, dom);
 }
 
 static uint64_t amd_table(uint64_t phys, unsigned level) {
@@ -673,17 +724,13 @@ static bool irt_write(struct iommu_domain *dom, unsigned first, unsigned count, 
                       bool on) {
     uint8_t *irt = phys_to_virt(dom->irt);
     const size_t size = 16;
-    uint64_t f = spin_lock(&amd_lock);
     for (unsigned i = 0; i < count; i++) {
         uint8_t v = (uint8_t)(vector + i);
         irte_store((volatile uint64_t *)(irt + (first + i) * size), on ? 1u | (uint64_t)(dest & 0xFFFFFF) << 8 : 0,
                    on ? v | (uint64_t)(dest >> 24) << 56 : 0);
     }
     if (!amd.coherent) iommu_cache_flush(irt + first * size, count * size);
-    for (unsigned i = 0; i < dom->nids; i++) send(CMD_INV_IRT, dom->ids[i], 0, 0, 0);
-    bool ok = sync();
-    spin_unlock(&amd_lock, f);
-    return ok;
+    return on_every_unit(irt_flush, dom);
 }
 
 static bool amd_msi(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
@@ -743,7 +790,8 @@ static bool program(struct unit *u) {
     wr(u, R_EVT_HEAD, 0);
     wr(u, R_EVT_TAIL, 0);
     u->cmd_tail = 0;
-    u->lost = u->stalled = false;
+    u->batch_lost = u->stalled = false;
+    __atomic_store_n(&u->restarted, u->token, __ATOMIC_RELEASE); /* what it had queued is gone */
     wr(u, R_STATUS, ST_EVENT_OVERFLOW | ST_EVENT_INT | ST_COMWAIT_INT);
     /* the IVHD flags HtTunEn, PassPW, ResPassPW, Isoc and Coherent are the firmware's settings
        for control bits 1, 8, 9, 11 and 10 */
@@ -754,7 +802,7 @@ static bool program(struct unit *u) {
     if (u->flags & 4) ctl |= 1ull << 9;
     if (u->flags & 8) ctl |= 1ull << 11;
     if (u->flags & 32) ctl |= 1ull << 10;
-    if (u->event_irq) ctl |= CTL_EVENTINT_EN;
+    if (u->event_irq) ctl |= CTL_EVENTINT_EN | CTL_COMWAITINT_EN;
     wr(u, R_CONTROL, ctl);
     /* the IVHD's XTSup and GASup, which this follows (1.3), confirmed: without the register's,
        XTEn is reserved and GAEn ignored (3.4, offset 0018h) */
@@ -768,51 +816,52 @@ static bool program(struct unit *u) {
 /* What a unit may have cached before it was ours, or before a sleep: everything at once where
    it can be told so, else the entries of every ID its IVHD names and the pages of the blocked
    entries' domain (a claim's are invalidated before the claim first uses them). */
-static void send_everything_flush(void) {
-    for (size_t i = 0; i < nunits; i++) {
-        struct unit *u = &units[i];
-        if (u->efr & EFR_IA) {
-            command(u, CMD_INV_ALL, 0, 0, 0, 0);
-            continue;
-        }
-        domain_flush(u, BLOCK_DOMAIN);
-        for (size_t s = 0; s < u->nlisted; s++)
-            for (uint32_t id = u->listed[s].first; id <= u->listed[s].last; id++) {
-                command(u, CMD_INV_DEVTAB, id, 0, 0, 0);
-                command(u, CMD_INV_IRT, id, 0, 0, 0);
-            }
+static void everything_flush(struct unit *u, const void *arg) {
+    (void)arg;
+    if (u->efr & EFR_IA) {
+        command(u, CMD_INV_ALL, 0, 0, 0, 0);
+        return;
     }
+    domain_flush(u, BLOCK_DOMAIN);
+    for (size_t s = 0; s < u->nlisted; s++)
+        for (uint32_t id = u->listed[s].first; id <= u->listed[s].last; id++) {
+            command(u, CMD_INV_DEVTAB, id, 0, 0, 0);
+            command(u, CMD_INV_IRT, id, 0, 0, 0);
+        }
 }
 
 /* Every unit off; false when one did not stop reading its buffers. */
 static bool units_off(void) {
     bool ok = true;
     for (size_t i = 0; i < nunits; i++) {
-        wr(&units[i], R_CONTROL, rd(&units[i], R_CONTROL) & CTL_FIRMWARE);
-        if (!engines_off(&units[i], true)) {
-            kprintf("iommu: unit at %lx does not stop\n", units[i].base);
+        struct unit *u = &units[i];
+        uint64_t f = spin_lock(&u->lock);
+        wr(u, R_CONTROL, rd(u, R_CONTROL) & CTL_FIRMWARE);
+        if (!engines_off(u, true)) {
+            kprintf("iommu: unit at %lx does not stop\n", u->base);
             ok = false;
         }
+        spin_unlock(&u->lock, f);
     }
     return ok;
 }
 
-static bool amd_shutdown(void) {
-    uint64_t f = spin_lock(&amd_lock);
-    bool ok = units_off();
-    spin_unlock(&amd_lock, f);
-    return ok;
+static bool amd_shutdown(void) { return units_off(); }
+
+/* Each unit programmed again, then a batch on every unit. */
+static bool units_program(void) {
+    bool ok = true;
+    for (size_t i = 0; ok && i < nunits; i++) {
+        struct unit *u = &units[i];
+        uint64_t f = spin_lock(&u->lock);
+        ok = program(u);
+        spin_unlock(&u->lock, f);
+    }
+    return ok && on_every_unit(everything_flush, NULL);
 }
 
 static bool amd_resume(void) {
-    bool ok = true;
-    uint64_t f = spin_lock(&amd_lock);
-    for (size_t i = 0; i < nunits; i++) ok &= program(&units[i]);
-    if (ok) {
-        send_everything_flush();
-        ok = sync();
-    }
-    spin_unlock(&amd_lock, f);
+    bool ok = units_program();
     if (!ok) kprintf("iommu: AMD-Vi did not come back after sleep\n");
     return ok;
 }
@@ -850,13 +899,13 @@ static void event_interrupts_enable(void) {
         for (size_t j = i; j < nunits; j++) {
             struct unit *u = &units[j];
             if (u->fn != fn) continue;
-            u->event_irq = u->msi_num < messages;
-            if (u->event_irq) {
-                uint64_t f = spin_lock(&amd_lock);
+            if (u->msi_num < messages) {
+                uint64_t f = spin_lock(&u->lock);
                 uint64_t ctl = rd(u, R_CONTROL);
                 if (!(rd(u, R_STATUS) & ST_CMDBUF_RUN)) ctl &= ~CTL_CMDBUF_EN;
-                wr(u, R_CONTROL, ctl | CTL_EVENTINT_EN);
-                spin_unlock(&amd_lock, f);
+                wr(u, R_CONTROL, ctl | CTL_EVENTINT_EN | CTL_COMWAITINT_EN);
+                u->event_irq = true; /* batches from now on ask for the completion interrupt */
+                spin_unlock(&u->lock, f);
             } else {
                 kprintf("iommu: unit at %lx has no event interrupt: blocked requests show after commands only\n",
                         u->base);
@@ -869,7 +918,7 @@ static void event_interrupts_enable(void) {
    nothing like VT-d's ECAP.IRREQ), so there is no reason to start one without. */
 static bool amd_start(bool translate) {
     if (!translate) return false;
-    sem_pages = ALIGN_UP(nunits * 8, PAGE_SIZE) / PAGE_SIZE;
+    sem_pages = ALIGN_UP(nunits * sizeof(uint64_t), PAGE_SIZE) / PAGE_SIZE;
     devtab = iommu_alloc_pages(DT_BYTES / PAGE_SIZE);
     sems = iommu_alloc_pages(sem_pages);
     bool ok = devtab && sems;
@@ -884,14 +933,13 @@ static bool amd_start(bool translate) {
         return false;
     }
     if (!amd.coherent) iommu_cache_flush(phys_to_virt(devtab), DT_BYTES);
-    uint64_t f = spin_lock(&amd_lock);
-    for (size_t i = 0; ok && i < nunits; i++) ok = program(&units[i]);
-    if (ok) {
-        send_everything_flush();
-        ok = sync();
+    for (size_t i = 0; i < nunits; i++) {
+        units[i].word_at = sems + i * sizeof(uint64_t);
+        units[i].word = phys_to_virt(units[i].word_at); /* zero: no token is */
+        units[i].token = units[i].restarted = 0;
     }
+    ok = units_program();
     bool off = ok || units_off();
-    spin_unlock(&amd_lock, f);
     if (!ok) {
         if (off) tables_free(); /* else a unit may still read them: they stay */
         return false;
