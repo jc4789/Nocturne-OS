@@ -38,28 +38,33 @@ int64_t pci_user_bar(struct handle *h, uint32_t bar, uint64_t *address, uint64_t
 bool pci_user_bar_prefetchable(struct handle *h, uint32_t bar);
 int64_t pci_user_interrupts(struct handle *h, uint32_t count);
 int64_t pci_user_interrupt_take(struct handle *h, uint64_t deadline);
-/* n_pci_hold_screen: only for the function whose BAR the boot screen is drawn through, or the
-   one whose surface the screen is drawn into. */
+/* n_pci_hold_screen: only for the function whose BAR the boot screen is drawn through, or one
+   whose buffers a screen is drawn into. */
 int64_t pci_user_hold_screen(struct handle *h, bool hold);
-/* n_pci_give_screen: a display function's surface (a shared object made through its claim; NULL
-   for the boot screen again) becomes where the screen is drawn; desc says how. n_pci_screen_vblank:
-   the surface shown had a vertical blank, which paces the desktop's frames (gui/wm.c). */
+/* A display driver's outputs (docs/nocturne-native-abi.md §9; b, v, m, out are kernel copies).
+   n_pci_give_screen: the output's buffers (NULL: given back) become what its screen is drawn into;
+   returns the serial of the output's last flip before them.
+   n_pci_screen_flips: the flips the screens ask of the claim's outputs, waiting until deadline
+   (sys/wait.h) for one; out has room for max. n_pci_screen_vblank: a vertical blank of an output,
+   with the flip it shows. n_pci_screen_state: what the output's screen should show (gui/wm.c
+   keeps it). n_pci_screen_modes: the monitor on an output, the modes the driver can show there
+   and what it showed, for the system to choose from (gui/screenmode.c); count 0 withdraws them.
+   n_pci_screen_image: a surface the display engine may show in the output's buffers' place,
+   which the panic screen is drawn into too; returns its number. n_pci_screen_image_end: that one
+   no longer. The output's buffers given back, or given without N_SCANOUT_DIRECT, end them all. */
 struct n_scanout;
-int64_t pci_user_give_screen(struct handle *h, struct handle *surface, const struct n_scanout *desc);
-int64_t pci_user_screen_vblank(struct handle *h, uint64_t count, uint64_t timestamp_ns);
-/* n_pci_screen_state: for the claim whose scanout the screen is drawn into or whose monitor's
-   modes the system has (gui/wm.c keeps the state). n_pci_screen_modes: a display function's
-   monitor and the modes its driver can show there, and what it showed (m: a kernel copy), for
-   the system to choose from (gui/screenmode.c); count 0 withdraws them. */
+struct n_screen_buffers;
+struct n_screen_flip;
+struct n_screen_vblank;
 struct n_screen_state;
 struct n_screen_modes;
-int64_t pci_user_screen_state(struct handle *h, uint64_t seen, struct n_screen_state *out, uint64_t deadline);
-int64_t pci_user_screen_modes(struct handle *h, const struct n_screen_modes *m);
-/* n_pci_screen_image: for that claim, a surface (as n_pci_give_screen's, without N_SCANOUT_DIRECT)
-   the display engine may show in its scanout's place, which the panic screen is drawn into too;
-   returns its number. n_pci_screen_image_end: that one no longer. The scanout's end, or a scanout
-   without N_SCANOUT_DIRECT, ends them all. */
-int64_t pci_user_screen_image(struct handle *h, struct handle *surface, const struct n_scanout *desc);
+int64_t pci_user_give_screen(struct handle *h, uint32_t output, const struct n_screen_buffers *b);
+int64_t pci_user_screen_flips(struct handle *h, struct n_screen_flip *out, size_t max, uint64_t deadline);
+int64_t pci_user_screen_vblank(struct handle *h, const struct n_screen_vblank *v);
+int64_t pci_user_screen_state(struct handle *h, uint32_t output, uint64_t seen, struct n_screen_state *out,
+                              uint64_t deadline);
+int64_t pci_user_screen_modes(struct handle *h, uint32_t output, const struct n_screen_modes *m);
+int64_t pci_user_screen_image(struct handle *h, uint32_t output, struct handle *surface, const struct n_scanout *desc);
 int64_t pci_user_screen_image_end(struct handle *h, int64_t number);
 /* n_pci_acpi_eval and n_pci_acpi_notify_take: the function's part of the ACPI namespace
    (dev/acpi.c). which is N_ACPI_SELF, N_ACPI_UPSTREAM or N_ACPI_CHILD(i); the arguments, their

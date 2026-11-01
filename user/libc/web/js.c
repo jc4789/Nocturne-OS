@@ -344,10 +344,12 @@ struct web_js_state {
     bool mutation_job_pending;
     bool observers_active, observers_force, pointer_capture_pending;
     uint64_t observer_layout, observer_dom;
-    /* The next rendering opportunity: our clock's (16 ms after the last), or with host.display_frames
+    /* The next rendering opportunity: our clock's (a period after the last), or with host.display_frames
        the display's frame once it came (UINT64_MAX before); rendering_next is when that frame is
-       expected, rendering_period_ms apart (the display's, from web_js_rendering_now). */
-    uint64_t rendering_due, rendering_next, rendering_period_ms, next_timer_order;
+       expected, rendering_period_ms apart (the display's, from web_js_rendering_now; 16 before it
+       says). */
+    uint64_t rendering_due, rendering_next, next_timer_order;
+    double rendering_period_ms;
     int observer_x, observer_y, observer_w, observer_h;
     uint32_t next_timer;
     /* The timer nesting level of the setTimeout/setInterval task whose callback is running; 0 in
@@ -616,9 +618,9 @@ void web_js_rendering_now(web_doc *d, double period_ms) {
        frames follow the display, and the next frame comes a period later. */
     struct web_js_state *s = d ? d->js : NULL;
     if (!s || s->disabled || !d->visible) return;
-    if (period_ms >= 1 && period_ms <= 1000) s->rendering_period_ms = (uint64_t)period_ms;
+    if (period_ms > 0 && period_ms <= 1000) s->rendering_period_ms = period_ms;
     s->rendering_due = (n_clock_monotonic() / N_NS_PER_MS);
-    s->rendering_next = s->rendering_due + s->rendering_period_ms;
+    s->rendering_next = s->rendering_due + (uint64_t)(s->rendering_period_ms + 0.5);
 }
 static bool observers_dirty(struct web_js_state *s);
 static bool resize_steps_due(const struct web_js_state *s);
@@ -9634,16 +9636,16 @@ static bool run_observers(struct web_js_state *s,uint64_t now) {
     return true;
 }
 /* The opportunity is taken: the next is the display's next frame (web_js_rendering_now), else our
-   clock's, 16 ms on. */
+   clock's, a period on. */
 static void rendering_taken(struct web_js_state *s){
-    s->rendering_due=s->host.display_frames?UINT64_MAX:(n_clock_monotonic() / N_NS_PER_MS)+16;
+    s->rendering_due=s->host.display_frames?UINT64_MAX:(n_clock_monotonic() / N_NS_PER_MS)+(uint64_t)(s->rendering_period_ms+0.5);
 }
 /* When the next rendering opportunity is expected, for an idle period to end before it: our clock's,
    else the display's next frame, or a period from now when that is late (or the window is not
    shown and gets no frames). */
 static uint64_t rendering_expected(const struct web_js_state *s,uint64_t now){
     if(!s->host.display_frames)return s->rendering_due;
-    return s->rendering_next>now?s->rendering_next:now+s->rendering_period_ms;
+    return s->rendering_next>now?s->rendering_next:now+(uint64_t)(s->rendering_period_ms+0.5);
 }
 /* CSSOM View "run the resize steps", the first of update-the-rendering's steps here. They first
    run once the document has a viewport (a frame's comes with its container, even 0x0 while it is

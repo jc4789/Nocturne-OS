@@ -141,63 +141,74 @@ n_result n_pci_interrupt_take(n_handle pci, uint64_t deadline);
    and bus mastering) before CPU drawing resumes. A hold that lasts as long as the boot option
    fbhold=<s> says (no time by default) stops the driver's app, and the end of its claim releases
    the hold.
-   The driver whose surface the screen is drawn into (n_pci_give_screen) holds it the same way.
-   N_ERR_NOT_FOUND: the boot screen is elsewhere and the screen is not drawn into its surface. */
+   The driver whose buffers screen 0 is drawn into (n_pci_give_screen) holds it the same way.
+   N_ERR_NOT_FOUND: the boot screen is elsewhere and screen 0 is not drawn into its buffers. */
 n_result n_pci_hold_screen(n_handle pci, bool hold);
-/* A display function's driver (PCI class 03) that set up its own scanout gives the system that
-   surface: from the return on the desktop is drawn there, and never into the boot screen, until
-   the driver gives N_SCANOUT_BOOT, or its claim ends (crash included), which stops the function
-   first. Drawing then resumes in the boot screen's memory, but the display engine may not show it
-   any more. surface: a writable shared object made through this claim, its BAR (prefetchable;
-   drawn write-combined, so a view of it the driver maps must be write-combining too) or a DMA
-   object whose type is not write-back (a write-combining or uncached view sets it), or a view of
-   either; desc says where in it (offset, pitch) and how (N_SCANOUT_XRGB8888, XRGB2101010 or
-   XBGR8888).
-   Its width and height are the mode's the display engine shows (the one the system chose, struct
-   n_screen_state's mode, once the driver offered modes; up to 65535 each): the desktop takes that
-   size, and windows fullscreen or maximized follow it. Giving the same surface again at another
-   size changes the desktop's size the same way; the boot screen given back is drawn at its own.
-   Returns once nothing is drawn into what was shown before; the new surface is drawn in full.
-   N_ERR_DENIED: not a display function, another claim's object, or a type the surface cannot have;
-   N_ERR_INVALID: a size of 0 or above 65535, an unknown format, a range beyond the object;
-   N_ERR_NO_MEMORY: the desktop does not fit in memory at that size (the screen stays as it was);
-   N_ERR_BUSY: another claim's surface is shown. */
-n_result n_pci_give_screen(n_handle pci, n_handle surface, const struct n_scanout *desc);
-/* A display function's driver tells the system the monitor it drives and the modes it can show
-   there (struct n_screen_modes): the system chooses the one shown (a mode on trial in Settings,
-   else the user's choice for that monitor, else the monitor's preferred mode, else the largest
-   near 60 Hz) and says so in struct n_screen_state's mode, which n_pci_screen_state reads. The
-   driver shows that mode (n_pci_give_screen at its size) and gives the modes again with done set
-   to the state's mode_serial and the mode it shows: when that is not the mode wanted, the system
-   never asks for that one again on this monitor and chooses another. Given with done 0 (when the
-   driver starts, or the monitor changed or was plugged in), the system chooses anew, even the
-   same mode again. count 0: the driver drives no monitor any more (and its claim's end does the
-   same). N_ERR_DENIED: not a display function; N_ERR_INVALID: more than N_SCREEN_MODES_MAX modes,
-   or a mode with a size or refresh of 0, or a size above 65535; N_ERR_BUSY: another claim's
-   surface is shown or its modes offered. */
-n_result n_pci_screen_modes(n_handle pci, const struct n_screen_modes *modes);
-/* The surface given had vertical blank number count at timestamp_ns (the driver's clock). While
-   blanks come, the desktop starts its frames at them instead of its own period; 100 ms without
-   one and the period paces again. N_ERR_DENIED: the screen is not drawn into this claim's surface. */
-n_result n_pci_screen_vblank(n_handle pci, uint64_t count, uint64_t timestamp_ns);
-/* For the driver whose surface the screen is drawn into or whose modes the system has: waits until
-   deadline (N_CLOCK_NEVER: no limit) while the screen's state is still the one numbered seen (0 never
-   is), then writes it to out (struct n_screen_state says the mode to show, and with
+/* A display function's driver (PCI class 03) shows screens on its outputs (output: the driver's
+   own number for a connector, a head or a display engine's pipe). Output 0 of the function the
+   boot screen is drawn through is screen 0, the one with the taskbar; every other output has a
+   screen of its own, the same one each time a driver of that function drives it.
+   n_pci_give_screen: the buffers the output shows its screen from (struct n_screen_buffers): from
+   the return on, the screen is drawn there and takes their size, and never into the boot screen
+   any more for screen 0, until the driver gives them back (buffers NULL) or its claim ends (crash
+   included), which stops the function first; the screen is then off, and screen 0 drawn into the
+   boot screen's memory again, which the display engine may no longer show. Each buffer is a
+   writable shared object made through this claim, its BAR (prefetchable; drawn write-combined, so
+   a view of it the driver maps must be write-combining too) or a DMA object whose type is not
+   write-back (a write-combining or uncached view sets it), or a view of either. The size is the
+   mode's the display engine shows (the one the system chose, struct n_screen_state's mode, once
+   the driver offered modes; up to 65535 each); windows fullscreen or maximized on the screen
+   follow it. Returns once nothing is drawn into the output's buffers before; the new ones are
+   drawn in full; the first of them is the one shown. A frame is drawn only into a buffer the
+   output does not show (with one buffer, into the one shown) and asked for as a flip. Returns the
+   serial of the output's last flip before (0: none): a flip up to it was of the buffers before,
+   and one not taken yet is gone.
+   N_ERR_DENIED: not a display function, another claim's object, or a type the buffer cannot have;
+   N_ERR_INVALID: a count of 0 or above N_SCREEN_BUFFERS_MAX, a size of 0 or above 65535, an
+   unknown format, a range beyond the object, or nothing to give back. */
+n_result n_pci_give_screen(n_handle pci, uint32_t output, const struct n_screen_buffers *buffers);
+/* The flips the screens ask of the claim's outputs (struct n_screen_flip), at most max into out,
+   waiting until deadline (N_CLOCK_NEVER: no limit) for one: their count, 0 at the deadline. A flip
+   not taken yet is replaced by the output's next one. The driver shows the flip's buffer from the
+   next vertical blank on and says so with n_pci_screen_vblank. */
+n_result n_pci_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max, uint64_t deadline);
+/* A vertical blank of an output whose buffers its screen is drawn into (struct n_screen_vblank):
+   the moment the display engine measured, on the system's monotonic clock, and the flip it shows.
+   The screen's next frame waits for the flip's blank; a screen without blanks reported shows
+   flips as they are asked. N_ERR_DENIED: the output shows no buffers of this claim. */
+n_result n_pci_screen_vblank(n_handle pci, const struct n_screen_vblank *vblank);
+/* A display function's driver tells the system the monitor it drives on an output and the modes
+   it can show there (struct n_screen_modes): the system chooses the one shown (a mode on trial in
+   Settings, else the user's choice for that monitor, else the monitor's preferred mode, else the
+   largest at the highest refresh) and says so in struct n_screen_state's mode, which
+   n_pci_screen_state reads. The driver shows that mode (n_pci_give_screen at its size) and gives
+   the modes again with done set to the state's mode_serial and the mode it shows: when that is not
+   the mode wanted, the system never asks for that one again on this monitor and chooses another.
+   Given with done 0 (when the driver starts, or the monitor changed or was plugged in), the system
+   chooses anew, even the same mode again. count 0: the driver drives no monitor on that output
+   any more (and its claim's end does the same). N_ERR_DENIED: not a display function;
+   N_ERR_INVALID: more than N_SCREEN_MODES_MAX modes, or a mode with a size or refresh of 0, or a
+   size above 65535. */
+n_result n_pci_screen_modes(n_handle pci, uint32_t output, const struct n_screen_modes *modes);
+/* For the driver whose buffers an output's screen is drawn into or whose modes on it the system
+   has: waits until deadline (N_CLOCK_NEVER: no limit) while the screen's state is still the one
+   numbered seen (0 never is), then writes it to out (struct n_screen_state says the mode to show, and with
    N_SCANOUT_DIRECT what the driver shows and draws while an app's window is shown directly).
-   N_ERR_TIMEOUT: out is the state numbered seen. N_ERR_DENIED: the screen is not drawn into this
-   claim's surface and it offered no modes. */
-n_result n_pci_screen_state(n_handle pci, uint64_t seen, struct n_screen_state *out, uint64_t deadline);
-/* For that driver: a surface its display engine may show in its scanout's place (an app's image
-   shown directly), given as n_pci_give_screen's surface is (format without N_SCANOUT_DIRECT;
-   N_SCANOUT_XBGR8888 too), of its own size (the engine may scale it to the mode's). The system
-   never draws there but once: its panic screen, which goes to the scanout and to every such
-   surface at its size, as the engine keeps showing what it was flipped to last and no driver runs
-   any more. Returns the surface's number (positive); n_pci_screen_image_end with it lets go before
-   the driver frees the memory. A scanout without N_SCANOUT_DIRECT, the boot screen given back, or
-   the claim's end lets go of them all. N_ERR_DENIED: the screen is not drawn into this claim's
-   N_SCANOUT_DIRECT scanout, or the object is not one n_pci_give_screen takes; N_ERR_INVALID: a size
-   of 0 or above 65535, an unknown format, a range beyond the object, or (end) no such number. */
-n_result n_pci_screen_image(n_handle pci, n_handle surface, const struct n_scanout *desc);
+   N_ERR_TIMEOUT: out is the state numbered seen. N_ERR_DENIED: the output shows no buffers of
+   this claim and it offered no modes there. */
+n_result n_pci_screen_state(n_handle pci, uint32_t output, uint64_t seen, struct n_screen_state *out,
+                            uint64_t deadline);
+/* For that driver: a surface the output's display engine may show in its buffers' place (an app's
+   image shown directly), given as a buffer is (format without N_SCANOUT_DIRECT; N_SCANOUT_XBGR8888
+   too), of its own size (the engine may scale it to the mode's). The system never draws there but
+   once: its panic screen, which goes to the buffers and to every such surface at its size, as the
+   engine keeps showing what it was flipped to last and no driver runs any more. Returns the
+   surface's number (positive); n_pci_screen_image_end with it lets go before the driver frees the
+   memory. Buffers without N_SCANOUT_DIRECT, the buffers given back, or the claim's end let go of
+   them all. N_ERR_DENIED: the output shows no N_SCANOUT_DIRECT buffers of this claim, or the
+   object is not one n_pci_give_screen takes; N_ERR_INVALID: a size of 0 or above 65535, an unknown
+   format, a range beyond the object, or (end) no such number. */
+n_result n_pci_screen_image(n_handle pci, uint32_t output, n_handle surface, const struct n_scanout *desc);
 n_result n_pci_screen_image_end(n_handle pci, n_result image);
 /* The function's part of the ACPI namespace, as the firmware describes it: its device node
    (N_ACPI_SELF), that node's device children (N_ACPI_CHILD(i), in namespace order), and the node
@@ -437,14 +448,18 @@ bool net_wait_up(uint64_t deadline); /* wait for DHCP; false if no network */
 typedef struct window {
     n_handle handle; /* N_KIND_WINDOW: its input is reported by n_events_watch as N_EVENT_RECEIVABLE */
     int w, h; /* client size */
+    /* What the app draws into: the window's surface (WIN_FRAME_QUEUE: the one acquired, px NULL
+       while none is) */
     canvas_t c;
     int flags;
     struct gui_event q[32];
     int qn, qi;
     bool closed;
-    uint32_t *buffers[WIN_BUFFER_COUNT];
-    unsigned buffer_index;
-    bool frame_acquired;
+    unsigned nsurf;                        /* its surfaces, mapped here */
+    uint32_t *surface[N_WIN_SURFACES_MAX];
+    size_t surface_bytes;
+    int current;                           /* WIN_FRAME_QUEUE: the surface acquired, -1 for none */
+    uint64_t presented;                    /* the last present's number (EV_FRAME's serial) */
 } window_t;
 
 /* The calls below return their result (0 unless noted), or a negative n_result,
@@ -454,13 +469,19 @@ n_result screen_size(int *w, int *h); /* w and h are written only on success */
 /* Opens a window into *out; *out is NULL on failure. */
 n_result win_open(int w, int h, const char *title, int flags, window_t **out);
 void win_close(window_t *win);
-/* -N_ERR_BUSY for a double-buffered window whose frame was not begun. */
+/* Presents what was drawn; its number goes to presented (EV_FRAME's serial says which present a
+   frame showed). A window without WIN_FRAME_QUEUE presents a rectangle of its surface (win_update: all
+   of it), which the system copies. A WIN_FRAME_QUEUE window presents its acquired surface whole
+   and has none after it; -N_ERR_BUSY when no frame was begun. */
 n_result win_update(window_t *win);
 n_result win_update_rect(window_t *win, int x, int y, int w, int h);
-/* WIN_DOUBLE_BUFFER only: acquire a writable canvas before drawing a complete
-   frame. No retained/partial drawing across submissions; update invalidates c.
-   Completion is also reported as EV_FRAME. */
+/* WIN_FRAME_QUEUE only: waits for a surface free to draw into (SYS_WIN_ACQUIRE) and makes it c. A
+   frame is drawn whole: the surface holds an older picture, not the one presented last. */
 n_result win_begin_frame(window_t *win);
+/* New surfaces of w x h (1 to N_WIN_SIZE_MAX each) with as much of the picture shown as fits, in
+   place of the window's; win_event does this for EV_RESIZE. Without memory the window keeps what it
+   had (N_ERR_NO_MEMORY). */
+n_result win_resize(window_t *win, int w, int h);
 n_result win_set_title(window_t *win, const char *title);
 n_result win_move(window_t *win, int x, int y);
 n_result win_state(window_t *win); /* WIN_STATE_* bitmask */
@@ -481,8 +502,9 @@ n_result win_frame(window_t *win);
    N_POINTER_DEFAULT. */
 n_result win_pointer(window_t *win, const struct n_win_pointer *pointer);
 n_result win_pointer_shape(window_t *win, uint32_t shape);
-/* wait until deadline (N_CLOCK_NEVER: no limit) for an event; returns 1 if *e was filled, 0 at the deadline,
-   negative once the window is gone. EV_RESIZE is handled (buffer reallocated) before being returned. */
+/* wait until deadline (N_CLOCK_NEVER: no limit) for an event; returns 1 if *e was filled, 0 at the
+   deadline, negative once the window is gone. EV_RESIZE is handled before it is returned: the window has new
+   surfaces of the size in the event, with as much of the picture shown as fits. */
 n_result win_event(window_t *win, struct gui_event *e, uint64_t deadline);
 n_result clipboard_set(const char *s, size_t n);
 n_result clipboard_get(char *buf, size_t n); /* the whole length; at most n bytes are copied */

@@ -2650,7 +2650,7 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
     case EV_FRAME: /* also after pictures of widgets alone, which nobody waits for */
         if (w->frame_wanted) {
             w->frame_wanted = false;
-            emit(w, UI_EVENT_FRAME, NULL, 0, 0, e->y / 1000.0, 0, NULL, 0);
+            emit(w, UI_EVENT_FRAME, NULL, 0, 0, e->y / 1e6, 0, NULL, 0); /* ns to ms */
         }
         break;
     }
@@ -2855,16 +2855,16 @@ static void render(struct uiwin *w) {
     w->dirty = false;
     w->hold = false;
     w->animating = false;
-    if (win_begin_frame(w->win) < 0 || !c->px) { /* a double-buffered window waits for a free buffer: ask again soon, the picture is not lost */
+    if (win_begin_frame(w->win) < 0 || !c->px) { /* no surface to draw into: ask again soon, the picture is not lost */
         w->redraw_at = w->now + 8;
         return;
     }
     if (w->n) layout(w);
     w->deep = win_deep(w->win);
-    /* a new canvas, a deep plane come or gone and the other buffer of a double-buffered window
+    /* a new canvas, a deep plane come or gone and the next surface of a WIN_FRAME_QUEUE window
        hold older pictures, so they are painted whole */
     bool whole = !find_damage(w) || c->px != w->shown_px || !!w->deep != w->shown_deep ||
-                 (w->win->flags & WIN_DOUBLE_BUFFER);
+                 (w->win->flags & WIN_FRAME_QUEUE);
     w->shown_px = c->px;
     w->shown_deep = w->deep;
     float *d = w->damage;
@@ -3065,8 +3065,8 @@ static void set_surface(struct ui_session *s, uint32_t id, uint32_t width, uint3
 /* Shows a part (x, y, width, height) of a surface the app drew again by copying only that part into the window,
    when the rest of the window's picture is up to date; false when the window has to be painted again instead. */
 static bool show_surface(struct uiwin *w, const struct node *n, const struct surface *sf, const int *rect) {
-    /* the other buffer of a double-buffered window holds an older picture, so it is painted whole */
-    if (w->dirty || w->hold || !w->win || !w->win->c.px || (w->win->flags & WIN_DOUBLE_BUFFER)) return false;
+    /* a WIN_FRAME_QUEUE window's next surface holds an older picture, so it is painted whole */
+    if (w->dirty || w->hold || !w->win || !w->win->c.px || (w->win->flags & WIN_FRAME_QUEUE)) return false;
     if ((int)lroundf(n->w) != sf->c.w || (int)lroundf(n->h) != sf->c.h) return false;
     for (uint32_t i = 0; i < w->n; i++) { /* the bar of a scroll box is painted over what it holds */
         const struct node *b = &w->nodes[i];

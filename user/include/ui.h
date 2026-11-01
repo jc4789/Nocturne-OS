@@ -151,11 +151,12 @@ enum {
 #define UI_CANCEL 16u /* focus: Escape gave the keyboard up */
 #define UI_BUTTONS(flags) ((flags) >> 8 & 0xFFu)
 
-/* The window flags an app may ask for: as for win_open. With WIN_DOUBLE_BUFFER each
-   picture waits for a free buffer (paced by the display) and is painted whole; with
-   WIN_DEEP_COLOR deep surfaces keep their extra bits on a 10 bpc desktop. */
+/* The window flags an app may ask for: as for win_open. With WIN_FRAME_QUEUE each
+   picture waits for a free surface (paced by the display) and is painted whole (WIN_MAILBOX:
+   the newest is shown); with WIN_DEEP_COLOR deep surfaces keep their extra bits on a 10 bpc
+   desktop. */
 #define UI_WINDOW_FLAGS \
-    (WIN_RESIZABLE | WIN_CENTER | WIN_START_MAXIMIZED | WIN_ALWAYS_ON_TOP | WIN_DOUBLE_BUFFER | WIN_DEEP_COLOR)
+    (WIN_RESIZABLE | WIN_CENTER | WIN_START_MAXIMIZED | WIN_ALWAYS_ON_TOP | WIN_FRAME_QUEUE | WIN_MAILBOX | WIN_DEEP_COLOR)
 /* A surface with a deep plane after its pixels: one byte a pixel, laid out as for
    win_deep (display.h). */
 #define UI_SURFACE_DEEP 1u

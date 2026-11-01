@@ -33,6 +33,7 @@ void vm_init(void);              /* the hypervisor's own bus (VMBus) and what ri
 void vm_storage_init(void);      /* the emulated disks */
 bool vm_net_probe(void);         /* an emulated or synthetic network adapter, when no real one */
 void vm_audio_init(void);        /* emulated sound */
+void vm_display_init(void);      /* the emulated displays: screens with buffers of their own (dev/fb.h) */
 void vm_display_pm(struct pm_device *display); /* how the emulated display comes back from sleep */
 void vm_session_init(void);      /* the host's enhanced session, once the desktop runs */
 

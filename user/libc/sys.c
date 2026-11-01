@@ -433,20 +433,24 @@ n_handle n_pci_bar(n_handle pci, uint32_t bar) { return (n_handle)NC5(SYS_PCI_BA
 n_result n_pci_interrupts(n_handle pci, uint32_t count) { return NC5(SYS_PCI_INTERRUPTS, pci, count, 0, 0, 0); }
 n_result n_pci_interrupt_take(n_handle pci, uint64_t deadline) { return NC5(SYS_PCI_INTERRUPT_TAKE, pci, deadline, 0, 0, 0); }
 n_result n_pci_hold_screen(n_handle pci, bool hold) { return NC5(SYS_PCI_HOLD_SCREEN, pci, hold ? 1 : 0, 0, 0, 0); }
-n_result n_pci_give_screen(n_handle pci, n_handle surface, const struct n_scanout *desc) {
-    return NC5(SYS_PCI_GIVE_SCREEN, pci, surface, desc, 0, 0);
+n_result n_pci_give_screen(n_handle pci, uint32_t output, const struct n_screen_buffers *buffers) {
+    return NC5(SYS_PCI_GIVE_SCREEN, pci, output, buffers, 0, 0);
 }
-n_result n_pci_screen_modes(n_handle pci, const struct n_screen_modes *modes) {
-    return NC5(SYS_PCI_SCREEN_MODES, pci, modes, 0, 0, 0);
+n_result n_pci_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max, uint64_t deadline) {
+    return NC5(SYS_PCI_SCREEN_FLIPS, pci, out, max, deadline, 0);
 }
-n_result n_pci_screen_vblank(n_handle pci, uint64_t count, uint64_t timestamp_ns) {
-    return NC5(SYS_PCI_SCREEN_VBLANK, pci, count, timestamp_ns, 0, 0);
+n_result n_pci_screen_vblank(n_handle pci, const struct n_screen_vblank *vblank) {
+    return NC5(SYS_PCI_SCREEN_VBLANK, pci, vblank, 0, 0, 0);
 }
-n_result n_pci_screen_state(n_handle pci, uint64_t seen, struct n_screen_state *out, uint64_t deadline) {
-    return NC5(SYS_PCI_SCREEN_STATE, pci, seen, out, deadline, 0);
+n_result n_pci_screen_modes(n_handle pci, uint32_t output, const struct n_screen_modes *modes) {
+    return NC5(SYS_PCI_SCREEN_MODES, pci, output, modes, 0, 0);
 }
-n_result n_pci_screen_image(n_handle pci, n_handle surface, const struct n_scanout *desc) {
-    return NC5(SYS_PCI_SCREEN_IMAGE, pci, surface, desc, 0, 0);
+n_result n_pci_screen_state(n_handle pci, uint32_t output, uint64_t seen, struct n_screen_state *out,
+                            uint64_t deadline) {
+    return NC5(SYS_PCI_SCREEN_STATE, pci, output, seen, out, deadline);
+}
+n_result n_pci_screen_image(n_handle pci, uint32_t output, n_handle surface, const struct n_scanout *desc) {
+    return NC5(SYS_PCI_SCREEN_IMAGE, pci, output, surface, desc, 0);
 }
 n_result n_pci_screen_image_end(n_handle pci, n_result image) {
     return NC5(SYS_PCI_SCREEN_IMAGE_END, pci, image, 0, 0, 0);

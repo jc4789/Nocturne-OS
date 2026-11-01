@@ -3,9 +3,12 @@
    mode (kernel/src/gui/screenmode.c as the driver sees it). It checks the order of the bring-up
    and of the tear-down, the choice of display, the modes offered to the system (valid,
    progressive, each once, the EDID's preferred marked, the monitor told apart by its EDID), that
-   the mode shown is the one the system asks for, at its size (a surface of that size given
-   between NVKMS's check and its commit, the one before freed after; a refresh alone a mode set on
-   the same surface), that a mode the display cannot show is said back and refused, that the
+   the mode shown is the one the system asks for, at its size (the desktop's buffers of that size
+   given between NVKMS's check and its commit, the ones before freed after; a refresh alone a mode
+   set on the same buffers), the system's flips (put on the head, said shown by the vertical blank
+   whose flip is performed, a flip of buffers given before never shown, the buffer on the head
+   given first when they are given again), that a mode the display cannot show is said back and
+   refused, that the
    system never draws into freed memory when a step fails, the reconnection of displays, and
    direct scanout: apps' images made, presented only while the system lets the app be shown
    directly (one flip waiting at a time), the pointer as the cursor over them, the desktop shown
@@ -105,13 +108,14 @@ static uint64_t clock_ns;
 
 uint64_t nvrm_now_ns(void) { return clock_ns; }
 uint64_t n_clock_monotonic(void) { return clock_ns; }
+uint64_t n_clock_after(uint64_t ns) { return clock_ns + ns; }
 void n_sleep_until(uint64_t deadline) { if (deadline > clock_ns) clock_ns = deadline; }
 const char *n_result_text(n_result r) { (void)r; return "error"; }
 
 /* KAPI's memory and surfaces, in the order allocated: the cursor first, then the desktop's
    surface, then apps' images (and the desktop's next surfaces). Each memory's pixels are its
    own. */
-#define POOL 16
+#define POOL 32
 static int mem_pool[POOL], surf_pool[POOL];
 static uint8_t *mem_pixels[POOL];
 static uint64_t mem_size[POOL];
@@ -185,26 +189,36 @@ static unsigned panic_images(void) {
     return n;
 }
 static struct n_screen_state screen;
+/* The system's flips of output 0 (n_pci_screen_flips): serial counts them; a give returns the
+   last one asked before. given_surface is the first buffer's view (GIVEN_BOOT: given back),
+   given_desc its place, given_second the other buffer's view. */
+#define GIVEN_BOOT (-2)
+static uint64_t flip_serial;
+static n_handle given_second;
+static unsigned given_count;
 /* The boot screen back: the system lets go of the images (pciuser.c screen_give_back). */
-n_result n_pci_give_screen(n_handle pci, n_handle surface, const struct n_scanout *desc) {
+n_result n_pci_give_screen(n_handle pci, uint32_t output, const struct n_screen_buffers *b) {
     (void)pci;
-    if (surface == N_SCANOUT_BOOT) {
+    CHECK(output == 0);
+    if (!b) {
         called("give-boot");
-        given_surface = N_SCANOUT_BOOT;
+        given_surface = GIVEN_BOOT;
         memset(panic_held, 0, sizeof panic_held);
-        return 0;
+        return (n_result)flip_serial;
     }
-    called((desc->format & N_SCANOUT_DIRECT) ? "give-surface-direct" : "give-surface");
-    if (direct_refused && (desc->format & N_SCANOUT_DIRECT)) return -N_ERR_INVALID;
-    if (plain_refused && !(desc->format & N_SCANOUT_DIRECT)) return -N_ERR_INVALID;
+    called((b->format & N_SCANOUT_DIRECT) ? "give-surface-direct" : "give-surface");
+    if (direct_refused && (b->format & N_SCANOUT_DIRECT)) return -N_ERR_INVALID;
+    if (plain_refused && !(b->format & N_SCANOUT_DIRECT)) return -N_ERR_INVALID;
     if (give_result) return give_result;
-    given_surface = surface;
-    given_desc = *desc;
-    if (!(desc->format & N_SCANOUT_DIRECT)) memset(panic_held, 0, sizeof panic_held);
-    return 0;
+    given_surface = b->buffer[0].surface;
+    given_second = b->count > 1 ? b->buffer[1].surface : -1;
+    given_count = b->count;
+    given_desc = (struct n_scanout){ b->width, b->height, b->pitch, b->format, b->buffer[0].offset };
+    if (!(b->format & N_SCANOUT_DIRECT)) memset(panic_held, 0, sizeof panic_held);
+    return (n_result)flip_serial;
 }
-n_result n_pci_screen_image(n_handle pci, n_handle surface, const struct n_scanout *desc) {
-    CHECK(pci == nvrm_dev.pci && surface == IMAGE_VIEW);
+n_result n_pci_screen_image(n_handle pci, uint32_t output, n_handle surface, const struct n_scanout *desc) {
+    CHECK(pci == nvrm_dev.pci && output == 0 && surface == IMAGE_VIEW);
     called("panic-image");
     if (panic_refused) return panic_refused;
     panic_desc = *desc;
@@ -226,15 +240,16 @@ n_result n_pci_screen_image_end(n_handle pci, n_result image) {
    not logged, so the first one must not stop it. */
 static n_result screen_result;
 static unsigned screen_refusals;
-n_result n_pci_screen_state(n_handle pci, uint64_t seen, struct n_screen_state *out, int64_t timeout_ms) {
-    CHECK(pci == nvrm_dev.pci);
+n_result n_pci_screen_state(n_handle pci, uint32_t output, uint64_t seen, struct n_screen_state *out,
+                            uint64_t deadline) {
+    CHECK(pci == nvrm_dev.pci && output == 0);
     if (screen_result) {
-        if (timeout_ms > 0 && ++screen_refusals >= 2) __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
+        if (deadline > clock_ns && ++screen_refusals >= 2) __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
         return screen_result;
     }
     *out = screen;
     if (seen != screen.serial) return 0;
-    if (timeout_ms > 0) __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
+    if (deadline > clock_ns) __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
     return -N_ERR_TIMEOUT;
 }
 static void screen_says(uint32_t app, bool pointer, int32_t x, int32_t y) {
@@ -314,8 +329,8 @@ static void system_wishes(struct n_screen_mode m) {
 static void system_wants(uint32_t width, uint32_t height, uint32_t mhz) {
     system_wishes((struct n_screen_mode){ width, height, mhz, 0 });
 }
-n_result n_pci_screen_modes(n_handle pci, const struct n_screen_modes *m) {
-    CHECK(pci == nvrm_dev.pci);
+n_result n_pci_screen_modes(n_handle pci, uint32_t output, const struct n_screen_modes *m) {
+    CHECK(pci == nvrm_dev.pci && output == 0);
     if (modes_result) {
         called("modes-refused");
         return modes_result;
@@ -344,23 +359,55 @@ n_result n_pci_screen_modes(n_handle pci, const struct n_screen_modes *m) {
     return 0;
 }
 
-static uint64_t vblank_count, vblank_ts;
+static uint64_t vblank_count, vblank_ts, vblank_flip;
+static uint32_t vblank_buffer;
 static int vblank_calls;
-n_result n_pci_screen_vblank(n_handle pci, uint64_t count, uint64_t timestamp_ns) {
+n_result n_pci_screen_vblank(n_handle pci, const struct n_screen_vblank *v) {
     (void)pci;
+    CHECK(v->output == 0);
     vblank_calls++;
-    vblank_count = count;
-    vblank_ts = timestamp_ns;
+    vblank_count = v->count;
+    vblank_ts = v->time_ns;
+    vblank_flip = v->flip_serial;
+    vblank_buffer = v->buffer;
     return 0;
 }
 
-/* Single-threaded: the threads are created but never run; the test calls rescan() and
-   state_thread(). */
-static bool thread_fails;
+/* The system asks for a flip of buffer: the flip thread takes it (flip_thread()). */
+static struct n_screen_flip flip_asked;
+static bool flip_waiting;
+static uint64_t system_flips(uint32_t buffer) {
+    flip_asked = (struct n_screen_flip){ .output = 0, .buffer = buffer, .serial = ++flip_serial };
+    flip_waiting = true;
+    return flip_serial;
+}
+/* With no flip waiting, a wait stops the flip thread, so the test runs flip_thread() once per flip. */
+n_result n_pci_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max, uint64_t deadline) {
+    CHECK(pci == nvrm_dev.pci && max >= 1);
+    (void)deadline;
+    if (!flip_waiting) {
+        __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
+        return 0;
+    }
+    flip_waiting = false;
+    out[0] = flip_asked;
+    return 1;
+}
+static void take_flips(void) {
+    __atomic_store_n(&scr.state_stop, false, __ATOMIC_RELEASE);
+    flip_thread(NULL);
+}
+
+/* Single-threaded: the threads are created but never run; the test calls rescan(),
+   state_thread() and flip_thread(). A wait for a vertical blank lets a millisecond go by. */
+static bool thread_fails;       /* no thread starts */
+static bool flip_thread_starts; /* but the flip thread */
+static int flip_thread(void *unused);
 int thrd_create(thrd_t *thr, thrd_start_t func, void *arg) {
-    (void)thr; (void)func; (void)arg;
-    called(thread_fails ? "thread-fails" : "thread");
-    return thread_fails ? thrd_error : thrd_success;
+    (void)thr; (void)arg;
+    bool fails = thread_fails && !(flip_thread_starts && func == flip_thread);
+    called(fails ? "thread-fails" : "thread");
+    return fails ? thrd_error : thrd_success;
 }
 int thrd_join(thrd_t thr, int *res) { (void)thr; (void)res; called("join"); return thrd_success; }
 int mtx_init(mtx_t *m, int type) { (void)m; (void)type; return thrd_success; }
@@ -370,7 +417,13 @@ int mtx_unlock(mtx_t *m) { (void)m; return thrd_success; }
 int cnd_init(cnd_t *c) { (void)c; return thrd_success; }
 void cnd_destroy(cnd_t *c) { (void)c; }
 int cnd_signal(cnd_t *c) { (void)c; return thrd_success; }
+int cnd_broadcast(cnd_t *c) { (void)c; return thrd_success; }
 int cnd_wait(cnd_t *c, mtx_t *m) { (void)c; (void)m; return thrd_success; }
+int cnd_timedwait(cnd_t *c, mtx_t *m, const struct timespec *ts) {
+    (void)c; (void)m; (void)ts;
+    clock_ns += 1000000u;
+    return thrd_timedout;
+}
 
 /* ---------------------------------------------------------------- RM's kernel client */
 #define NVKMS_CLIENT 0xc1d0000au /* the RM client NVKMS's memory belongs to */
@@ -692,12 +745,14 @@ void nvrm_nvkms_flip_words(const struct NvKmsKapiDevice *d, uint32_t head, uint3
 #define FLIP_STAMP_NS 0x18e1aa5b68bd73a0ull /* the 8th run's: 2026-10-25 04:10:36.246 UTC */
 bool nvrm_nvkms_flip_done(const struct NvKmsKapiDevice *d, uint32_t head, uint32_t layer, struct nvrm_flip_seen *seen) {
     CHECK(d == (const struct NvKmsKapiDevice *)&dev_obj && layer == NVKMS_KAPI_LAYER_PRIMARY_IDX);
-    /* A flip that never completes is polled every millisecond: record its first poll only. */
+    /* A flip that never completes is looked at every millisecond: record its first look only. A
+       vertical blank reads it without what it saw (seen NULL). */
     bool never_done = flip_pending_forever || !armed_notified;
     if (!never_done || !armed_polled) called("flipPending-%u", (unsigned)head);
     armed_polled = true;
     bool pending = never_done || pending_polls;
     if (pending_polls) pending_polls--;
+    if (!seen) return !pending;
     *seen = (struct nvrm_flip_seen){ .slot = 1 };
     if (!pending) {
         seen->status = 1; /* NVKMS_NOTIFIER_STATUS_BEGUN (nvkms_os.h) */
@@ -761,7 +816,11 @@ NvBool nvKmsKapiGetFunctionsTable(struct NvKmsKapiFunctionsTable *t) {
 /* ---------------------------------------------------------------- scenarios */
 static void reset(void) {
     memset(&scr, 0, sizeof scr);
-    scr.desk.view = -1;
+    for (unsigned i = 0; i < DESK_BUFFERS; i++) scr.desk[i].view = -1;
+    flip_serial = 0;
+    flip_waiting = false;
+    given_second = -1;
+    given_count = 0;
     memset(&offer, 0, sizeof offer);
     memset(&offered, 0, sizeof offered);
     calls[0] = logs[0] = 0;
@@ -792,7 +851,7 @@ static void reset(void) {
     pending_polls = commit_failures = 0;
     armed_head = -1;
     armed_notified = armed_polled = false;
-    thread_fails = plain_refused = false;
+    thread_fails = flip_thread_starts = plain_refused = false;
     memset(panic_held, 0, sizeof panic_held);
     panic_last = panic_refused = 0;
     memset(&panic_desc, 0, sizeof panic_desc);
@@ -850,17 +909,18 @@ static void bring_up_and_tear_down(void) {
     CHECK(in_order("allocateDevice grabOwnership declareEventInterest-3 getDeviceResourcesInfo "
                    "rm-alloc-0 rm-control-205 rm-alloc-80 rm-alloc-73 rm-control-73011e rm-free getDisplays "
                    "allocateMemory mapMemory createSurface modes-offered "
-                   "allocateMemory mapMemory view-desk createSurface view-gop map-gop close40 unmap-gop "
-                   "apply-check give-surface-direct flipArm-1 apply-commit flipPending-1 registerVblank-1 modes-shown "
-                   "thread thread"));
-    /* The mode set that lights the head puts the desktop's surface on its primary layer: KAPI
+                   "allocateMemory mapMemory view-desk createSurface allocateMemory mapMemory view-desk createSurface "
+                   "view-gop map-gop close40 unmap-gop "
+                   "apply-check give-surface-direct registerVblank-1 flipArm-1 apply-commit flipPending-1 modes-shown "
+                   "thread thread thread"));
+    /* The mode set that lights the head puts the desktop's first buffer on its primary layer: KAPI
        names a completion notifier for that flip too, and it is awaited. */
     CHECK(!scr.flipping);
     CHECK(interest == (1u << NVKMS_EVENT_TYPE_DPY_CHANGED | 1u << NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED));
     CHECK(never("framebufferConsoleDisabled"));
     /* The cursor: 32x32 A8R8G8B8, pitch 256 (NVKMS's least for that size), video memory, mapped
-       for the pointer's pixels; made before the surface is given with N_SCANOUT_DIRECT. */
-    CHECK(mem_used == 2 && surf_used == 2);
+       for the pointer's pixels; made before the buffers are given with N_SCANOUT_DIRECT. */
+    CHECK(mem_used == 3 && surf_used == 3);
     CHECK(alloc_log[0].layout == NvKmsSurfaceMemoryLayoutPitch && alloc_log[0].useVideoMemory &&
           alloc_log[0].size == 8192 && alloc_log[0].type == NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT);
     CHECK(surface_log[0].format == NvKmsSurfaceMemoryFormatA8R8G8B8 && surface_log[0].width == 32 &&
@@ -872,10 +932,13 @@ static void bring_up_and_tear_down(void) {
     CHECK(alloc_log[1].useVideoMemory && alloc_log[1].noDisplayCaching && alloc_log[1].size == 7680ull * H);
     CHECK(surface_log[1].format == NvKmsSurfaceMemoryFormatX8R8G8B8 && surface_log[1].planes[0].pitch == 7680 &&
           surface_log[1].width == W && surface_log[1].height == H);
-    /* The views: the surface write-combined and writable, the boot screen write-combined, read. */
+    CHECK(alloc_log[2].size == 7680ull * H && surface_log[2].format == NvKmsSurfaceMemoryFormatX8R8G8B8 &&
+          surface_log[2].width == W && surface_log[2].height == H);
+    /* The views: the buffers write-combined and writable, the boot screen write-combined, read. */
     CHECK(view_phys[0] == VRAM_BUS + SLOT && view_bytes[0] == 7680ull * H && view_caching[0] == NV_MEMORY_WRITECOMBINED &&
           view_access[0] == N_MEMORY_READ_WRITE);
-    CHECK(view_phys[1] == GOP_BUS && view_caching[1] == NV_MEMORY_WRITECOMBINED && view_access[1] == N_MEMORY_READ);
+    CHECK(view_phys[1] == VRAM_BUS + 2 * SLOT && view_access[1] == N_MEMORY_READ_WRITE);
+    CHECK(view_phys[2] == GOP_BUS && view_caching[2] == NV_MEMORY_WRITECOMBINED && view_access[2] == N_MEMORY_READ);
     /* The boot screen's pixels, row by row into the other pitch (the mode has its size). */
     CHECK(PIXEL(1, 0) == 0 && PIXEL(1, 7680u * 500 + 700 * 4) == (500u << 16 | 700));
     CHECK(PIXEL(1, 7680u * (H - 1) + (W - 1) * 4) == ((H - 1) << 16 | (W - 1)));
@@ -908,10 +971,10 @@ static void bring_up_and_tear_down(void) {
     CHECK(modes_seen.done == screen.mode_serial && modes_seen.shown.width == W && modes_seen.shown.height == H &&
           modes_seen.shown.refresh_mhz == 120000);
     /* What the system was given. */
-    CHECK(given_surface == DESK_VIEW(1) && given_desc.width == W && given_desc.height == H &&
-          given_desc.pitch == 7680 && given_desc.format == (N_SCANOUT_XRGB8888 | N_SCANOUT_DIRECT) &&
-          given_desc.offset == 0);
-    CHECK(scr.direct && scr.state_running && scr.thread_running);
+    CHECK(given_surface == DESK_VIEW(1) && given_second == DESK_VIEW(2) && given_count == 2 && given_desc.width == W &&
+          given_desc.height == H && given_desc.pitch == 7680 &&
+          given_desc.format == (N_SCANOUT_XRGB8888 | N_SCANOUT_DIRECT) && given_desc.offset == 0);
+    CHECK(scr.direct && scr.state_running && scr.thread_running && scr.flip_running);
     CHECK(strstr(logs, "display 0x00000002: DP-2, heads 0x6, connected, DEL1202 TEST MON, lit by the firmware"));
     CHECK(strstr(logs, "monitor DEL1202-00c0ffee (TEST MON): 4 modes offered to the system, preferred 1920x1080 at 120.000 Hz"));
     CHECK(strstr(logs, "the desktop is shown on display 0x00000002 (head 1) at 1920x1080 at 120.000 Hz"));
@@ -919,24 +982,48 @@ static void bring_up_and_tear_down(void) {
        writes a window's "finished"), logged with the GPU's time stamp; the head read back after. */
     CHECK(strstr(logs, "the flip on head 1 was performed: the primary layer's completion notifier 1 reads begun, "
                        "written at the GPU's time 1792901436.246160288 s, "));
-    CHECK(in_order("flipPending-1 registerVblank-1 getCRC32-1 modes-shown"));
+    CHECK(in_order("registerVblank-1 apply-commit flipPending-1 getCRC32-1 modes-shown"));
     CHECK(strstr(logs, "head 1 after the mode set: display 0x00000002 at 1920x1080 at 120.000 Hz, output LUT scale "
                        "0xffffffff in each mode set, 0 vertical blanks; CRC32 compositor 12345678, raster generator "
                        "9abcdef0, output none"));
 
-    /* Vertical blanks go to the system, counted, with NVKMS's timestamp. */
+    /* Vertical blanks go to the system, counted, with NVKMS's timestamp; no flip shown yet. */
     CHECK(vblank_proc != NULL);
     if (vblank_proc) { vblank_proc(0, 123456789); vblank_proc(0, 0); }
-    CHECK(vblank_calls == 2 && vblank_count == 2 && vblank_ts == clock_ns && nvrm_display_vblanks() == 2);
+    CHECK(vblank_calls == 2 && vblank_count == 2 && vblank_ts == clock_ns && nvrm_display_vblanks() == 2 &&
+          vblank_flip == 0 && vblank_buffer == 0);
+
+    /* The system's frame in the other buffer: a flip puts it on the head's primary layer, and the
+       blank whose flip is performed says it is shown, at the display engine's time. */
+    uint64_t serial = system_flips(1);
+    calls[0] = 0;
+    take_flips();
+    CHECK(in_order("flipArm-1 apply-commit") && never("apply-check") &&
+          head_cfg(1)->layerRequestedConfig[0].config.surface == SURF(2) && !head_cfg(1)->flags.modeChanged);
+    CHECK(scr.desk_on == 1 && scr.desk_shown == 1 && scr.flipping);
+    pending_polls = 1;
+    if (vblank_proc) vblank_proc(0, 222);
+    CHECK(vblank_count == 3 && vblank_ts == 222 && vblank_flip == 0);
+    if (vblank_proc) vblank_proc(0, 333);
+    CHECK(vblank_count == 4 && vblank_ts == 333 && vblank_flip == serial && vblank_buffer == 1);
+    /* The next one back into the first buffer: the flip before is seen performed at once. */
+    serial = system_flips(0);
+    calls[0] = 0;
+    take_flips();
+    CHECK(in_order("flipPending-1 flipArm-1 apply-commit") && head_cfg(1)->layerRequestedConfig[0].config.surface == SURF(1));
+    if (vblank_proc) vblank_proc(0, 444);
+    CHECK(vblank_flip == serial && vblank_buffer == 0);
 
     calls[0] = 0;
     nvrm_display_stop();
-    /* Both threads joined; the modes withdrawn and the boot screen back before ownership is
-       released; the cursor and the surface (its view first) freed after. */
-    CHECK(in_order("join join modes-withdrawn give-boot unregisterVblank-1 releaseOwnership destroySurface unmapMemory "
-                   "freeMemory close101 destroySurface unmapMemory freeMemory declareEventInterest-0 freeDevice"));
+    /* The threads joined; the modes withdrawn and the boot screen back before ownership is
+       released; the cursor and the buffers (each view first) freed after. */
+    CHECK(in_order("join join join modes-withdrawn give-boot unregisterVblank-1 releaseOwnership destroySurface "
+                   "unmapMemory freeMemory close101 destroySurface unmapMemory freeMemory close102 destroySurface "
+                   "unmapMemory freeMemory declareEventInterest-0 freeDevice"));
     CHECK(never("getCRC32-1"));
-    CHECK(!scr.direct && !scr.state_running && mem_freed == 2 && surf_destroyed == 2 && !scr.desk.surface);
+    CHECK(!scr.direct && !scr.state_running && !scr.flip_running && mem_freed == 3 && surf_destroyed == 3 &&
+          !scr.desk[0].surface && !scr.desk[1].surface);
     CHECK(modes_seen.count == 0 && screen.mode.width == 0 && !offered.count);
     /* After the boot screen is back, a late blank is not passed on. */
     vblank_calls = 0;
@@ -969,21 +1056,28 @@ static void modes_from_the_system(void) {
     follow_screen();
     CHECK(in_order("modes-shown") && never("apply-check") && never("apply-commit") && modes_seen.done == screen.mode_serial);
 
-    /* 2560x1440: a surface of that size, black, given before the commit; the one before freed
-       after its flip completed. */
+    /* 2560x1440: buffers of that size, black, given before the commit; the ones before freed
+       after its flip completed. A flip the system asked of the buffers before, not taken yet, is
+       of buffers gone: never put on the head. */
     system_wants(2560, 1440, 144000);
+    system_flips(1);
     calls[0] = 0;
     follow_screen();
-    CHECK(in_order("allocateMemory mapMemory view-desk createSurface apply-check give-surface-direct flipArm-1 "
-                   "apply-commit flipPending-1 close101 destroySurface unmapMemory freeMemory modes-shown"));
-    CHECK(never("view-gop") && PIXEL(2, 0) == 0 && PIXEL(2, 10240u * 1439 + 2559 * 4) == 0);
-    CHECK(given_surface == DESK_VIEW(2) && given_desc.width == 2560 && given_desc.height == 1440 &&
-          given_desc.pitch == 10240 && given_desc.format == (N_SCANOUT_XRGB8888 | N_SCANOUT_DIRECT));
+    CHECK(in_order("allocateMemory mapMemory view-desk createSurface allocateMemory mapMemory view-desk createSurface "
+                   "apply-check give-surface-direct flipArm-1 apply-commit flipPending-1 close101 destroySurface "
+                   "unmapMemory freeMemory close102 destroySurface unmapMemory freeMemory modes-shown"));
+    CHECK(never("view-gop") && PIXEL(3, 0) == 0 && PIXEL(3, 10240u * 1439 + 2559 * 4) == 0);
+    CHECK(given_surface == DESK_VIEW(3) && given_second == DESK_VIEW(4) && given_desc.width == 2560 &&
+          given_desc.height == 1440 && given_desc.pitch == 10240 &&
+          given_desc.format == (N_SCANOUT_XRGB8888 | N_SCANOUT_DIRECT));
     const struct NvKmsKapiHeadRequestedConfig *h = head_cfg(1);
     CHECK(h->modeSetConfig.mode.timings.hVisible == 2560 && h->modeSetConfig.mode.timings.refreshRate == 144000);
-    CHECK(h->layerRequestedConfig[0].config.surface == SURF(2) && h->layerRequestedConfig[0].config.srcWidth == 2560 &&
+    CHECK(h->layerRequestedConfig[0].config.surface == SURF(3) && h->layerRequestedConfig[0].config.srcWidth == 2560 &&
           h->layerRequestedConfig[0].config.dstWidth == 2560 && h->layerRequestedConfig[0].config.srcHeight == 1440);
-    CHECK(scr.desk.width == 2560 && scr.desk.height == 1440 && scr.desk.pitch == 10240 && mem_freed == 1);
+    CHECK(scr.desk[0].width == 2560 && scr.desk[0].height == 1440 && scr.desk[0].pitch == 10240 && mem_freed == 2);
+    calls[0] = 0;
+    take_flips();
+    CHECK(never("flipArm-1") && never("apply-commit") && scr.desk_on == 0);
     CHECK(modes_seen.shown.width == 2560 && modes_seen.shown.refresh_mhz == 144000 && modes_seen.done == screen.mode_serial);
     CHECK(strstr(logs, "the desktop is shown on display 0x00000002 (head 1) at 2560x1440 at 144.000 Hz"));
 
@@ -995,7 +1089,7 @@ static void modes_from_the_system(void) {
     follow_screen();
     CHECK(strstr(logs, "display 0x00000002 cannot show 1280x720 at 144.000 Hz"));
     CHECK(in_order("modes-shown allocateMemory apply-check give-surface-direct apply-commit modes-shown"));
-    CHECK(screen.mode.width == W && screen.mode.refresh_mhz == 120000 && scr.desk.width == W &&
+    CHECK(screen.mode.width == W && screen.mode.refresh_mhz == 120000 && scr.desk[0].width == W &&
           modes_seen.shown.width == W && modes_seen.shown.refresh_mhz == 120000 && modes_seen.done == screen.mode_serial);
     CHECK(refused_count == 1 && refused_modes[0].width == 1280);
     /* A mode the display does not have at all: the same. */
@@ -1006,18 +1100,23 @@ static void modes_from_the_system(void) {
     CHECK(screen.mode.width == W && modes_seen.done == screen.mode_serial);
 
     /* The commit of a new size fails: the head shows what it showed, and the system draws into
-       the surface it drew into before (never into the new one, which is freed); the mode is
-       refused. */
-    uint32_t desk_memory = mem_used - 1;
+       the buffers it drew into before (never into the new ones, which are freed), the one on the
+       head first; the mode is refused. */
+    uint32_t desk_memory = mem_used - 2;
+    system_flips(1);
+    take_flips();
+    CHECK(scr.desk_shown == 1);
     system_wants(2560, 1440, 144000);
     commit_failures = 1;
     calls[0] = 0;
     follow_screen();
-    char seq[160];
+    char seq[200];
     snprintf(seq, sizeof seq, "give-surface-direct apply-commit give-surface-direct close%d destroySurface unmapMemory "
-             "freeMemory modes-shown", DESK_VIEW(mem_used - 1));
+             "freeMemory close%d destroySurface unmapMemory freeMemory modes-shown", DESK_VIEW(mem_used - 2),
+             DESK_VIEW(mem_used - 1));
     CHECK(in_order(seq));
-    CHECK(given_surface == DESK_VIEW(desk_memory) && given_desc.width == W && scr.desk.width == W && scr.head_on);
+    CHECK(given_surface == DESK_VIEW(desk_memory + 1) && given_second == DESK_VIEW(desk_memory) && given_desc.width == W &&
+          scr.desk[0].width == W && scr.head_on && scr.desk_shown == 0 && scr.desk_on == 0);
     CHECK(strstr(logs, "display 0x00000002 shows what it showed before") && screen.mode.width == W &&
           modes_seen.shown.width == W);
 
@@ -1044,7 +1143,7 @@ static void users_mode_at_start(void) {
     user_mode = (struct n_screen_mode){ 2560, 1440, 144000, 0 };
     CHECK(nvrm_display_start());
     CHECK(never("view-gop") && head_cfg(1)->modeSetConfig.mode.timings.hVisible == 2560);
-    CHECK(given_desc.width == 2560 && given_desc.pitch == 10240 && PIXEL(1, 0) == 0 && mem_used == 2);
+    CHECK(given_desc.width == 2560 && given_desc.pitch == 10240 && PIXEL(1, 0) == 0 && mem_used == 3);
     nvrm_display_stop();
 
     /* NVKMS refuses the preferred mode: the system's next best, the preferred size at 60 Hz. */
@@ -1061,10 +1160,11 @@ static void users_mode_at_start(void) {
     reset();
     commit_failures = 1;
     CHECK(nvrm_display_start());
-    CHECK(in_order("give-surface-direct apply-commit give-boot close101 destroySurface unmapMemory freeMemory modes-shown "
-                   "allocateMemory give-surface-direct apply-commit modes-shown"));
+    CHECK(in_order("give-surface-direct apply-commit give-boot close101 destroySurface unmapMemory freeMemory close102 "
+                   "destroySurface unmapMemory freeMemory modes-shown allocateMemory give-surface-direct apply-commit "
+                   "modes-shown"));
     CHECK(strstr(logs, "display 0x00000002 stays dark") && scr.head_on && scr.given &&
-          given_surface == DESK_VIEW(2) && modes_seen.shown.refresh_mhz == 60000);
+          given_surface == DESK_VIEW(3) && modes_seen.shown.refresh_mhz == 60000);
     nvrm_display_stop();
 }
 
@@ -1163,14 +1263,16 @@ static void monitors_come_and_go(void) {
     calls[0] = 0;
     rescan();
     CHECK(in_order("unregisterVblank-1 apply-check apply-commit modes-offered allocateMemory mapMemory view-desk "
-                   "createSurface apply-check give-surface-direct flipArm-0 apply-commit flipPending-0 close101 "
-                   "destroySurface unmapMemory freeMemory registerVblank-0 modes-shown"));
+                   "createSurface allocateMemory mapMemory view-desk createSurface apply-check give-surface-direct "
+                   "registerVblank-0 flipArm-0 apply-commit flipPending-0 close101 destroySurface unmapMemory "
+                   "freeMemory close102 destroySurface unmapMemory freeMemory modes-shown"));
     CHECK(never("give-boot") && last_request.headsMask == 0x1 && !scr.flipping);
     const struct NvKmsKapiHeadRequestedConfig *h = head_cfg(0);
     CHECK(h->modeSetConfig.displays[0] == 0x4 && h->modeSetConfig.mode.timings.hVisible == 3840);
     CHECK(h->layerRequestedConfig[0].config.srcWidth == 3840 && h->layerRequestedConfig[0].config.dstWidth == 3840 &&
           h->layerRequestedConfig[0].config.dstHeight == 2160);
-    CHECK(given_surface == DESK_VIEW(2) && given_desc.width == 3840 && given_desc.pitch == 15360);
+    CHECK(given_surface == DESK_VIEW(3) && given_second == DESK_VIEW(4) && given_desc.width == 3840 &&
+          given_desc.pitch == 15360);
     CHECK(scr.display == 0x4 && scr.head == 0 && scr.head_on && !strcmp(modes_seen.monitor, "DEL1204-00c0ffee"));
 
     /* 0x4 goes too: dark, the modes withdrawn, the surface still the system's. */
@@ -1189,8 +1291,8 @@ static void monitors_come_and_go(void) {
     displays[1].connected = true;
     calls[0] = 0;
     rescan();
-    CHECK(in_order("modes-offered allocateMemory apply-check give-surface-direct flipArm-1 apply-commit flipPending-1 "
-                   "close102 registerVblank-1 modes-shown"));
+    CHECK(in_order("modes-offered allocateMemory apply-check give-surface-direct registerVblank-1 flipArm-1 apply-commit "
+                   "flipPending-1 close103 close104 modes-shown"));
     CHECK(last_request.headsMask == 0x2 && head_cfg(1)->modeSetConfig.mode.timings.refreshRate == 120000);
     CHECK(head_cfg(1)->layerRequestedConfig[0].config.dstWidth == W && given_desc.width == W);
 
@@ -1199,8 +1301,8 @@ static void monitors_come_and_go(void) {
     displays[2].connected = true;
     calls[0] = 0;
     rescan();
-    CHECK(in_order("unregisterVblank-1 apply-commit modes-offered apply-check give-surface-direct flipArm-0 apply-commit "
-                   "flipPending-0 registerVblank-0"));
+    CHECK(in_order("unregisterVblank-1 apply-commit modes-offered apply-check give-surface-direct registerVblank-0 "
+                   "flipArm-0 apply-commit flipPending-0"));
     CHECK(scr.head_on && scr.display == 0x4 && !scr.flipping &&
           strstr(logs, "the desktop is shown on display 0x00000004 (head 0) at 3840x2160 at 60.000 Hz"));
 
@@ -1213,8 +1315,8 @@ static void monitors_come_and_go(void) {
     pending_polls = 1;
     calls[0] = 0;
     rescan();
-    CHECK(in_order("unregisterVblank-0 apply-check apply-commit modes-offered apply-check give-surface-direct flipArm-0 "
-                   "apply-commit flipPending-0 flipPending-0 registerVblank-0"));
+    CHECK(in_order("unregisterVblank-0 apply-check apply-commit modes-offered apply-check give-surface-direct "
+                   "registerVblank-0 flipArm-0 apply-commit flipPending-0 flipPending-0"));
     CHECK(scr.head_on && scr.head == 0 && scr.display == 0x2 && !scr.flipping && strstr(logs, "turning the head off failed"));
 
     /* 0x4 again while flips are never seen to complete: the mode set's flip is awaited
@@ -1227,12 +1329,13 @@ static void monitors_come_and_go(void) {
     calls[0] = 0;
     uint64_t before = clock_ns;
     rescan();
-    CHECK(in_order("unregisterVblank-0 apply-commit modes-offered apply-check give-surface-direct flipArm-0 apply-commit "
-                   "flipPending-0 flipWords-0 give-boot releaseOwnership modes-shown"));
-    CHECK(never("registerVblank-0") && never("modes-withdrawn") && times("modes-shown") == 1 && never("grabOwnership") &&
+    CHECK(in_order("unregisterVblank-0 apply-commit modes-offered apply-check give-surface-direct registerVblank-0 "
+                   "flipArm-0 apply-commit flipPending-0 flipWords-0 give-boot unregisterVblank-0 releaseOwnership "
+                   "modes-shown"));
+    CHECK(never("modes-withdrawn") && times("modes-shown") == 1 && never("grabOwnership") &&
           clock_ns - before >= (uint64_t)FLIP_TIMEOUT_MS * 1000000u);
-    CHECK(!scr.owner && !scr.head_on && !scr.display && !scr.flipping && !scr.direct && !scr.desk.surface &&
-          given_surface == N_SCANOUT_BOOT && mem_freed == mem_used && surf_destroyed == surf_used);
+    CHECK(!scr.owner && !scr.head_on && !scr.display && !scr.flipping && !scr.direct && !scr.desk[0].surface &&
+          given_surface == GIVEN_BOOT && mem_freed == mem_used && surf_destroyed == surf_used);
     CHECK(modes_seen.count == 1 && offered.count == 1 && scr.target == 0x4 && refused_count == 1 &&
           refused_modes[0].width == 3840 && screen.mode.width == 0);
     CHECK(strstr(logs, "the display engine has not performed the flip on head 0 3000 ms after its commit"));
@@ -1244,8 +1347,8 @@ static void monitors_come_and_go(void) {
     calls[0] = 0;
     rescan();
     CHECK(in_order("modes-offered grabOwnership allocateMemory mapMemory createSurface allocateMemory mapMemory "
-                   "view-desk createSurface apply-check give-surface-direct flipArm-0 apply-commit flipPending-0 "
-                   "registerVblank-0 modes-shown"));
+                   "view-desk createSurface allocateMemory mapMemory view-desk createSurface apply-check "
+                   "give-surface-direct registerVblank-0 flipArm-0 apply-commit flipPending-0 modes-shown"));
     CHECK(scr.owner && scr.head_on && scr.head == 0 && scr.display == 0x2 && scr.direct && given_desc.width == W &&
           modes_seen.shown.refresh_mhz == 120000 && modes_seen.done == screen.mode_serial);
 
@@ -1260,7 +1363,7 @@ static void monitors_come_and_go(void) {
 /* ---------------------------------------------------------------- direct scanout */
 #define APP 77u
 #define OTHER_APP 78u
-/* Memory 0 is the cursor, 1 the desktop's surface, 2... apps' images. */
+/* Memory 0 is the cursor, 1 and 2 the desktop's buffers, 3... apps' images. */
 
 static uint32_t scanout(void *file, uint32_t app, struct nvrm_scanout_request *r) {
     CHECK(nvrm_display_scanout(file, app, r, sizeof *r) == 0);
@@ -1296,13 +1399,13 @@ static void direct_scanout(void) {
           never("unmapMemory") && never("apply-commit"));
     CHECK(panic_images() == 1 && panic_desc.width == W && panic_desc.height == H && panic_desc.pitch == 7680 &&
           panic_desc.format == N_SCANOUT_XBGR8888 && panic_desc.offset == 0);
-    CHECK(mem_used == 3 && alloc_log[2].type == NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT &&
-          alloc_log[2].layout == NvKmsSurfaceMemoryLayoutPitch && alloc_log[2].useVideoMemory &&
-          alloc_log[2].size == 7680ull * H);
-    CHECK(surface_log[2].format == NvKmsSurfaceMemoryFormatX8B8G8R8 && surface_log[2].planes[0].pitch == 7680 &&
-          surface_log[2].width == W && surface_log[2].height == H &&
-          surface_log[2].planes[0].memory == (struct NvKmsKapiMemory *)&mem_pool[2]);
-    CHECK(PIXEL(2, 0) == 0 && PIXEL(2, 7680u * H - 4) == 0);
+    CHECK(mem_used == 4 && alloc_log[3].type == NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT &&
+          alloc_log[3].layout == NvKmsSurfaceMemoryLayoutPitch && alloc_log[3].useVideoMemory &&
+          alloc_log[3].size == 7680ull * H);
+    CHECK(surface_log[3].format == NvKmsSurfaceMemoryFormatX8B8G8R8 && surface_log[3].planes[0].pitch == 7680 &&
+          surface_log[3].width == W && surface_log[3].height == H &&
+          surface_log[3].planes[0].memory == (struct NvKmsKapiMemory *)&mem_pool[3]);
+    CHECK(PIXEL(3, 0) == 0 && PIXEL(3, 7680u * H - 4) == 0);
     uint32_t a = r.image;
     uint32_t b = create_image(APP_FILE, APP);
     CHECK(b && b != a && image_count() == 2);
@@ -1337,7 +1440,7 @@ static void direct_scanout(void) {
           h->modeSetConfig.displays[0] == 0x2 && h->modeSetConfig.mode.timings.refreshRate == 120000);
     CHECK(!h->flags.activeChanged && !h->flags.displaysChanged && !h->flags.modeChanged);
     const struct NvKmsKapiLayerRequestedConfig *p = &h->layerRequestedConfig[0];
-    CHECK(p->flags.surfaceChanged && p->config.surface == SURF(2) && p->config.srcWidth == W &&
+    CHECK(p->flags.surfaceChanged && p->config.surface == SURF(3) && p->config.srcWidth == W &&
           p->config.srcHeight == H && p->config.dstWidth == W && p->config.dstHeight == H);
     CHECK(!h->layerRequestedConfig[1].flags.surfaceChanged);
     const struct NvKmsKapiCursorRequestedConfig *c = &h->cursorRequestedConfig;
@@ -1355,7 +1458,7 @@ static void direct_scanout(void) {
     calls[0] = 0;
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, b) == NV_OK);
     CHECK(in_order("flipPending-1 flipPending-1 flipPending-1 flipArm-1 apply-commit"));
-    CHECK(head_cfg(1)->layerRequestedConfig[0].config.surface == SURF(3) &&
+    CHECK(head_cfg(1)->layerRequestedConfig[0].config.surface == SURF(4) &&
           !head_cfg(1)->cursorRequestedConfig.flags.surfaceChanged && !head_cfg(1)->cursorRequestedConfig.flags.dstXYChanged);
     CHECK(scr.shown->number == b && scr.leaving && scr.leaving->number == a);
 
@@ -1419,19 +1522,19 @@ static void direct_scanout(void) {
 
     /* IMPORT: only the image's app; NVKMS's memory shared with the client named for DUP_OBJECT,
        duplicated by the app's own RM file, the share revoked at once. */
-    uint32_t i4 = create_image(APP_FILE, APP); /* memory 4 */
+    uint32_t i4 = create_image(APP_FILE, APP); /* memory 5 */
     struct nvrm_scanout_request imp = { .op = NVRM_SCANOUT_IMPORT, .image = i4, .client = 0xc100, .parent = 0xc101 };
     calls[0] = 0;
     CHECK(scanout(OTHER_FILE, OTHER_APP, &imp) == NV_ERR_INVALID_OBJECT_HANDLE);
     CHECK(never("rm-share") && never("rm-dup") && imp.object == 0);
     CHECK(scanout(APP_FILE, APP, &imp) == NV_OK);
     CHECK(in_order("rm-share rm-dup rm-unshare") && shares == 2 && !shared_with);
-    CHECK(last_share[0].hObject == NVKMS_MEMORY(4) && last_share[0].sharePolicy.target == 0xc100 &&
+    CHECK(last_share[0].hObject == NVKMS_MEMORY(5) && last_share[0].sharePolicy.target == 0xc100 &&
           !(last_share[0].sharePolicy.action & RS_SHARE_ACTION_FLAG_REVOKE));
-    CHECK(last_share[1].hObject == NVKMS_MEMORY(4) && last_share[1].sharePolicy.target == 0xc100 &&
+    CHECK(last_share[1].hObject == NVKMS_MEMORY(5) && last_share[1].sharePolicy.target == 0xc100 &&
           (last_share[1].sharePolicy.action & RS_SHARE_ACTION_FLAG_REVOKE));
     CHECK(dup_file == APP_FILE && last_dup.hClient == 0xc100 && last_dup.hParent == 0xc101 && last_dup.hObject == 0 &&
-          last_dup.hClientSrc == NVKMS_CLIENT && last_dup.hObjectSrc == NVKMS_MEMORY(4));
+          last_dup.hClientSrc == NVKMS_CLIENT && last_dup.hObjectSrc == NVKMS_MEMORY(5));
     CHECK(imp.object == 0xd0000001u);
     /* The handle the app chose is kept; RM's refusal is the reply, the share revoked all the same. */
     imp.object = 0x5555;
@@ -1446,8 +1549,8 @@ static void direct_scanout(void) {
 
     /* The connection's end: its images go, the one shown off the screen first; another
        connection's stay. */
-    uint32_t i5 = create_image(APP_FILE, APP);           /* memory 5 */
-    uint32_t i6 = create_image(OTHER_FILE, OTHER_APP);   /* memory 6 */
+    uint32_t i5 = create_image(APP_FILE, APP);           /* memory 6 */
+    uint32_t i6 = create_image(OTHER_FILE, OTHER_APP);   /* memory 7 */
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, i5) == NV_OK);
     unsigned destroyed = surf_destroyed;
     calls[0] = 0;
@@ -1458,7 +1561,7 @@ static void direct_scanout(void) {
     (void)i4;
 
     /* A commit NVKMS refuses flips nothing: no completion is awaited after it. */
-    uint32_t i7 = create_image(APP_FILE, APP); /* memory 7 */
+    uint32_t i7 = create_image(APP_FILE, APP); /* memory 8 */
     commit_failures = 1;
     calls[0] = 0;
     uint64_t t0 = clock_ns;
@@ -1477,7 +1580,7 @@ static void direct_scanout(void) {
     CHECK(head_cfg(1)->layerRequestedConfig[0].config.surface == SURF(1) && !scr.lost && !scr.shown &&
           strstr(logs, "is still shown"));
     /* When that fails too, the next change of the screen's state shows the desktop. */
-    uint32_t i8 = create_image(APP_FILE, APP); /* memory 8 */
+    uint32_t i8 = create_image(APP_FILE, APP); /* memory 9 */
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, i8) == NV_OK);
     commit_failures = 2;
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_DESTROY, i8) == NV_OK);
@@ -1499,13 +1602,13 @@ static void direct_scanout(void) {
     panic_refused = -N_ERR_DENIED;
     calls[0] = 0;
     r = (struct nvrm_scanout_request){ .op = NVRM_SCANOUT_CREATE };
-    CHECK(scanout(APP_FILE, APP, &r) == NV_ERR_INSUFFICIENT_RESOURCES && !r.image); /* memory 9 */
+    CHECK(scanout(APP_FILE, APP, &r) == NV_ERR_INSUFFICIENT_RESOURCES && !r.image); /* memory 10 */
     CHECK(in_order("mapMemory view-image panic-image close50 unmapMemory destroySurface freeMemory"));
     CHECK(image_count() == images && strstr(logs, "cannot draw its panic screen"));
     panic_refused = 0;
     mapping_not_bar = true; /* RM's mapping is not one stretch of a BAR */
     calls[0] = 0;
-    CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_CREATE, 0) == NV_ERR_INSUFFICIENT_RESOURCES); /* memory 10 */
+    CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_CREATE, 0) == NV_ERR_INSUFFICIENT_RESOURCES); /* memory 11 */
     CHECK(never("view-image") && never("panic-image") && in_order("mapMemory unmapMemory destroySurface freeMemory"));
     CHECK(image_count() == images);
     mapping_not_bar = false;
@@ -1528,21 +1631,21 @@ static void direct_scanout(void) {
 static void direct_scanout_and_displays(void) {
     reset();
     CHECK(nvrm_display_start());
-    uint32_t a = create_image(APP_FILE, APP); /* memory and surface 2 */
+    uint32_t a = create_image(APP_FILE, APP); /* memory and surface 3 */
     screen_pointer_image(1);
     screen_says(APP, true, 100, 50);
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, a) == NV_OK && scr.shown);
 
     displays[1].connected = false; /* 0x2 unplugged; 0x4, 3840x2160, takes the desktop */
     rescan();
-    CHECK(!scr.shown && !scr.leaving && !scr.cursor_on && scr.display == 0x4 && scr.desk.width == 3840);
-    CHECK(head_cfg(0)->layerRequestedConfig[0].config.surface == SURF(3));
+    CHECK(!scr.shown && !scr.leaving && !scr.cursor_on && scr.display == 0x4 && scr.desk[0].width == 3840);
+    CHECK(head_cfg(0)->layerRequestedConfig[0].config.surface == SURF(4));
     calls[0] = 0;
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, a) == NV_OK);
     const struct NvKmsKapiHeadRequestedConfig *h = head_cfg(0);
     CHECK(last_request.headsMask == 0x1 && h->modeSetConfig.displays[0] == 0x4 &&
           h->modeSetConfig.mode.timings.hVisible == 3840 && !h->flags.modeChanged);
-    CHECK(h->layerRequestedConfig[0].config.surface == SURF(2) && h->layerRequestedConfig[0].config.srcWidth == W &&
+    CHECK(h->layerRequestedConfig[0].config.surface == SURF(3) && h->layerRequestedConfig[0].config.srcWidth == W &&
           h->layerRequestedConfig[0].config.dstWidth == 3840 && h->layerRequestedConfig[0].config.dstHeight == 2160);
     CHECK(h->cursorRequestedConfig.dstX == 92 && h->cursorRequestedConfig.dstY == 42);
     /* An image made now has the desktop's new size. */
@@ -1578,15 +1681,15 @@ static void flips_not_seen(void) {
     CHECK(in_order("flipPending-1 flipWords-1 give-boot unregisterVblank-1 releaseOwnership "
                    "destroySurface unmapMemory freeMemory close101 destroySurface unmapMemory freeMemory"));
     CHECK(never("flipArm-1") && never("apply-commit") && never("modes-withdrawn"));
-    CHECK(!scr.owner && !scr.head_on && !scr.flipping && !scr.shown && !scr.leaving && !scr.direct && !scr.desk.surface);
-    CHECK(given_surface == N_SCANOUT_BOOT && panic_images() == 0 && modes_seen.count == 4 && offered.count == 4);
+    CHECK(!scr.owner && !scr.head_on && !scr.flipping && !scr.shown && !scr.leaving && !scr.direct && !scr.desk[0].surface);
+    CHECK(given_surface == GIVEN_BOOT && panic_images() == 0 && modes_seen.count == 4 && offered.count == 4);
     CHECK(strstr(logs, "the display engine has not performed the flip on head 1 3000 ms after its commit") &&
           strstr(logs, "the primary layer's completion notifier 1, of words 00000000 00000000 00000001 00000000 and "
                        "00000000 00000000 00000001 00000000, does not read begun"));
     /* What the head showed, read back before it was handed back. */
     CHECK(in_order("flipWords-1 getCRC32-1 give-boot") &&
           strstr(logs, "head 1 as the screen is handed back: display 0x00000002 at 1920x1080 at 120.000 Hz"));
-    CHECK(strstr(logs, "nvrm's surface is not seen on the display; the boot screen goes back to the system and the "
+    CHECK(strstr(logs, "nvrm's buffer is not seen on the display; the boot screen goes back to the system and the "
                        "display to NVKMS's console"));
     /* An app's flip is no wish of the system's: nothing is said back. */
     CHECK(never("modes-shown") && refused_count == 0);
@@ -1615,9 +1718,9 @@ static void flips_not_seen(void) {
     calls[0] = 0;
     follow_screen();
     CHECK(in_order("grabOwnership allocateMemory mapMemory createSurface allocateMemory mapMemory view-desk createSurface "
-                   "apply-check give-surface-direct flipArm-1 apply-commit flipPending-1 registerVblank-1 getCRC32-1 "
+                   "apply-check give-surface-direct registerVblank-1 flipArm-1 apply-commit flipPending-1 getCRC32-1 "
                    "view-image panic-image close50 modes-shown"));
-    CHECK(scr.owner && scr.head_on && scr.direct && scr.desk.width == 2560 && given_desc.width == 2560 &&
+    CHECK(scr.owner && scr.head_on && scr.direct && scr.desk[0].width == 2560 && given_desc.width == 2560 &&
           given_desc.format == (N_SCANOUT_XRGB8888 | N_SCANOUT_DIRECT) && panic_images() == 1);
     CHECK(modes_seen.done == screen.mode_serial && modes_seen.shown.width == 2560 && refused_count == 0);
     CHECK(strstr(logs, "display ownership taken again for the system's wish"));
@@ -1652,19 +1755,21 @@ static void screen_handed_back_at_start(void) {
     uint64_t before = clock_ns;
     CHECK(nvrm_display_start());
     CHECK(clock_ns - before >= 2ull * FLIP_TIMEOUT_MS * 1000000u);
-    CHECK(in_order("give-surface-direct flipArm-1 apply-commit flipPending-1 flipWords-1 give-boot releaseOwnership "
-                   "destroySurface unmapMemory freeMemory close101 destroySurface unmapMemory freeMemory modes-shown "
-                   "grabOwnership give-surface-direct flipArm-1 apply-commit flipWords-1 give-boot releaseOwnership "
-                   "thread thread"));
-    CHECK(never("registerVblank-1") && never("modes-withdrawn") && times("modes-shown") == 1 &&
+    CHECK(in_order("give-surface-direct registerVblank-1 flipArm-1 apply-commit flipPending-1 flipWords-1 give-boot "
+                   "unregisterVblank-1 releaseOwnership destroySurface unmapMemory freeMemory close101 destroySurface "
+                   "unmapMemory freeMemory close102 destroySurface unmapMemory freeMemory modes-shown grabOwnership "
+                   "give-surface-direct registerVblank-1 flipArm-1 apply-commit flipWords-1 give-boot "
+                   "unregisterVblank-1 releaseOwnership thread thread thread"));
+    CHECK(times("registerVblank-1") == 2 && times("unregisterVblank-1") == 2 && never("modes-withdrawn") &&
+          times("modes-shown") == 1 &&
           times("grabOwnership") == 2 && times("flipWords-1") == 2);
     CHECK(refused_count == 1 && refused_modes[0].refresh_mhz == 120000 && screen.mode.width == W &&
           screen.mode.refresh_mhz == 60000 && modes_seen.count == 4 && offered.count == 4);
     CHECK(strstr(logs, "the display engine has not performed the flip on head 1 3000 ms after its commit") &&
-          strstr(logs, "nvrm's surface is not seen on the display; the boot screen goes back to the system") &&
+          strstr(logs, "nvrm's buffer is not seen on the display; the boot screen goes back to the system") &&
           logged("the screen stays handed back: the system is not told that 1920x1080 at 60.000 Hz was not shown") == 1 &&
           strstr(logs, "the screen stays with the firmware's framebuffer for now; display 0x00000002's modes stay offered"));
-    CHECK(given_surface == N_SCANOUT_BOOT && !scr.owner && !scr.direct && scr.state_running && scr.thread_running &&
+    CHECK(given_surface == GIVEN_BOOT && !scr.owner && !scr.direct && scr.state_running && scr.thread_running &&
           mem_freed == mem_used && surf_destroyed == surf_used);
     /* Nothing is tried again by nvrm itself: not on a state that changes nothing, nor on monitor
        events with the same modes. */
@@ -1678,7 +1783,7 @@ static void screen_handed_back_at_start(void) {
     system_wants(2560, 1440, 144000);
     calls[0] = 0;
     follow_screen();
-    CHECK(in_order("grabOwnership apply-check give-surface-direct flipArm-1 apply-commit flipPending-1 registerVblank-1 "
+    CHECK(in_order("grabOwnership apply-check give-surface-direct registerVblank-1 flipArm-1 apply-commit flipPending-1 "
                    "modes-shown"));
     CHECK(scr.owner && scr.head_on && modes_seen.shown.width == 2560 && modes_seen.done == screen.mode_serial);
     calls[0] = 0;
@@ -1689,10 +1794,10 @@ static void screen_handed_back_at_start(void) {
     /* Handed back with no state thread: nothing would take the display again, so start fails. */
     reset();
     flip_pending_forever = true;
-    thread_fails = true;
+    thread_fails = flip_thread_starts = true;
     CHECK(!nvrm_display_start());
-    CHECK(in_order("give-boot releaseOwnership modes-shown grabOwnership give-boot releaseOwnership thread-fails "
-                   "modes-withdrawn declareEventInterest-0 freeDevice"));
+    CHECK(in_order("give-boot releaseOwnership modes-shown grabOwnership give-boot releaseOwnership thread thread-fails "
+                   "join modes-withdrawn declareEventInterest-0 freeDevice"));
     CHECK(strstr(logs, "without the state thread no wish of the system's would take it again") &&
           mem_freed == mem_used && surf_destroyed == surf_used);
 }
@@ -1722,7 +1827,7 @@ static void screen_taken_again(void) {
                    "apply-commit flipWords-1 give-boot releaseOwnership"));
     CHECK(times("grabOwnership") == 2 && times("modes-shown") == 1 && times("flipWords-1") == 2 && never("modes-withdrawn"));
     CHECK(refused_count == 1 && refused_modes[0].width == 2560 && screen.mode.width == W &&
-          screen.mode.refresh_mhz == 120000 && !scr.owner && !scr.desk.surface && modes_seen.count == 4);
+          screen.mode.refresh_mhz == 120000 && !scr.owner && !scr.desk[0].surface && modes_seen.count == 4);
     CHECK(logged("display ownership taken again for the system's wish") == 2 &&
           logged("the screen stays handed back: the system is not told that 1920x1080 at 120.000 Hz was not shown") == 1);
     /* Not tried again by nvrm itself. */
@@ -1737,7 +1842,7 @@ static void screen_taken_again(void) {
     system_wants(W, H, 60000);
     calls[0] = 0;
     follow_screen();
-    CHECK(in_order("grabOwnership apply-commit flipPending-1 registerVblank-1 modes-shown") && times("modes-shown") == 1);
+    CHECK(in_order("grabOwnership registerVblank-1 apply-commit flipPending-1 modes-shown") && times("modes-shown") == 1);
     CHECK(scr.owner && scr.head_on && modes_seen.shown.refresh_mhz == 60000 && !scr.unshown_said);
 
     /* A performed flip since: a mode the display engine does not flip to is said back once again,
@@ -1774,21 +1879,21 @@ static void screen_taken_again(void) {
 }
 
 static void no_direct_scanout(void) {
-    /* No cursor the size of the system's pointer: the surface given without N_SCANOUT_DIRECT
-       (memory 0 is the desktop's surface then). The state thread still follows the system's
-       mode. */
+    /* No cursor the size of the system's pointer: the buffers given without N_SCANOUT_DIRECT
+       (memory 0 and 1 are the desktop's buffers then). The state thread still follows the
+       system's mode. */
     reset();
     cursor_caps_missing = true;
     CHECK(nvrm_display_start());
-    CHECK(given_desc.format == N_SCANOUT_XRGB8888 && given_surface == DESK_VIEW(0) && never("give-surface-direct") &&
-          mem_used == 1);
+    CHECK(given_desc.format == N_SCANOUT_XRGB8888 && given_surface == DESK_VIEW(0) && given_second == DESK_VIEW(1) &&
+          never("give-surface-direct") && mem_used == 2);
     CHECK(!scr.direct && scr.state_running && strstr(logs, "cannot show apps' X8B8G8R8 images"));
-    CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_CREATE, 0) == NV_ERR_NOT_SUPPORTED && mem_used == 1);
+    CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_CREATE, 0) == NV_ERR_NOT_SUPPORTED && mem_used == 2);
     nvrm_display_connection_end(APP_FILE);
     system_wants(2560, 1440, 144000);
     calls[0] = 0;
     follow_screen();
-    CHECK(in_order("allocateMemory apply-check give-surface flipArm-1 apply-commit close100 modes-shown") &&
+    CHECK(in_order("allocateMemory apply-check give-surface flipArm-1 apply-commit close100 close101 modes-shown") &&
           never("give-surface-direct"));
     CHECK(given_desc.width == 2560 && given_desc.format == N_SCANOUT_XRGB8888);
     calls[0] = 0;
@@ -1799,8 +1904,8 @@ static void no_direct_scanout(void) {
     reset();
     direct_refused = true;
     CHECK(nvrm_display_start());
-    CHECK(in_order("give-surface-direct give-surface destroySurface unmapMemory freeMemory apply-commit registerVblank-1 "
-                   "modes-shown thread thread"));
+    CHECK(in_order("give-surface-direct give-surface destroySurface unmapMemory freeMemory registerVblank-1 apply-commit "
+                   "modes-shown thread thread thread"));
     CHECK(given_desc.format == N_SCANOUT_XRGB8888 && !scr.direct && scr.state_running && mem_freed == 1);
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_CREATE, 0) == NV_ERR_NOT_SUPPORTED);
     nvrm_display_stop();
@@ -1808,9 +1913,9 @@ static void no_direct_scanout(void) {
 
     /* No state thread: the screen keeps its mode, and windows are not shown directly. */
     reset();
-    thread_fails = true;
+    thread_fails = flip_thread_starts = true;
     CHECK(nvrm_display_start());
-    CHECK(in_order("give-surface-direct apply-commit modes-shown thread-fails give-surface thread-fails"));
+    CHECK(in_order("give-surface-direct apply-commit modes-shown thread thread-fails give-surface thread-fails"));
     CHECK(!scr.direct && !scr.state_running && given_desc.format == N_SCANOUT_XRGB8888 && !scr.cursor_surface);
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_CREATE, 0) == NV_ERR_NOT_SUPPORTED);
     nvrm_display_stop();
@@ -1818,9 +1923,10 @@ static void no_direct_scanout(void) {
     /* ...and the system keeps the surface with N_SCANOUT_DIRECT: it would hand fullscreen
        windows to nvrm, which shows none. The boot screen back, nothing kept. */
     reset();
-    thread_fails = plain_refused = true;
+    thread_fails = flip_thread_starts = plain_refused = true;
     CHECK(!nvrm_display_start());
-    CHECK(in_order("give-surface-direct thread-fails give-surface modes-withdrawn give-boot releaseOwnership freeDevice"));
+    CHECK(in_order("give-surface-direct thread thread-fails give-surface join modes-withdrawn give-boot releaseOwnership "
+                   "freeDevice"));
     CHECK(!scr.direct && !scr.given && mem_freed == mem_used && surf_destroyed == surf_used);
 
     /* The system does not say what the screen shows: logged once, nothing presented. */

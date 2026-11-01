@@ -69,11 +69,8 @@ int main(int argc,char **argv) {
         if (check_client(pixels,gw,gw,gh,16,x,y)) goto cleanup;
     }
     /* Reallocation frees the previous source immediately after join. */
-    long address=__syscall(SYS_WIN_RESIZE,wins[15]->handle,width-37,height-29,0,0);
-    if (address<0) goto cleanup;
-    wins[15]->w=width-37;wins[15]->h=height-29;
-    gfx_init(&wins[15]->c,(uint32_t *)address,wins[15]->w,wins[15]->h,wins[15]->w);
-    paint(wins[15],16);n_sleep_until(n_clock_after(100 * N_NS_PER_MS));
+    if (win_resize(wins[15],width-37,height-29)<0) goto cleanup;
+    paint(wins[15],16);n_sleep_until(n_clock_after((uint64_t)(100) * N_NS_PER_MS));
     if (check_client(pixels,gw,gw,gh,16,x,y)) goto cleanup;
     cpu_info(&after);
     if (after.worker_cpus && after.parallel_jobs<=before.parallel_jobs) {

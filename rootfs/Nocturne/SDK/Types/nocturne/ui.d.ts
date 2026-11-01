@@ -370,17 +370,19 @@ export const desktop: {
     setVolume(volume: number): SoundOutput | null;
     /** Mutes or unmutes, keeping the volume, and returns how the sound stands then. */
     setMuted(muted: boolean): SoundOutput | null;
-    /** The monitor's modes; null when the desktop is not running. */
-    modes(): ScreenModes | null;
-    /** Shows mode (one of modes().modes) on trial: it goes back to the mode before unless
-        keepMode() comes within 15 seconds (backMode(): at once). False when no display driver
-        offers modes or the monitor has no such mode. */
-    tryMode(mode: ScreenModeChoice): boolean;
-    /** Keeps the mode on trial as the user's choice for this monitor (ScreenModes.chosen), shown
-        whenever the monitor is driven and offers it, after a restart too. */
-    keepMode(): boolean;
+    /** A screen's monitor and its modes (screen 0, the one with the taskbar, without the
+        argument; ScreenModes.screens says how many there are); null when the desktop is not
+        running or there is no such screen. */
+    modes(screen?: number): ScreenModes | null;
+    /** Shows mode (one of modes(screen).modes) on trial on that screen: it goes back to the mode
+        before unless keepMode(screen) comes within 15 seconds (backMode(screen): at once). False
+        when no display driver offers modes there or the monitor has no such mode. */
+    tryMode(mode: ScreenModeChoice, screen?: number): boolean;
+    /** Keeps the mode on trial as the user's choice for that screen's monitor (ScreenModes.chosen),
+        shown whenever the monitor is driven and offers it, after a restart too. */
+    keepMode(screen?: number): boolean;
     /** Goes back to the mode before the trial now. */
-    backMode(): boolean;
+    backMode(screen?: number): boolean;
     /** Calls listener after something get(), modes() or sound() reports changed, whoever changed it
         (this program, another, the taskbar), with what changed. Returns the function that stops
         it. Watching alone does not keep the program running: its windows, timers or requests do. */
@@ -399,6 +401,9 @@ export interface ScreenModeChoice {
 export interface ScreenMode extends ScreenModeChoice {
     /** The monitor's own preferred mode (its EDID's). */
     readonly preferred: boolean;
+    /** Shown at a variable refresh: a frame as soon as it is ready, from refreshMillihertz down to
+        ScreenModes.variableRefreshMinMillihertz. */
+    readonly variableRefresh: boolean;
 }
 
 /** What decides the desktop's size:
@@ -410,9 +415,14 @@ export interface ScreenMode extends ScreenModeChoice {
     - "remote": a Remote Desktop window. */
 export type ScreenSource = "firmware" | "driver" | "handedBack" | "driverStopped" | "remote";
 
-/** The monitor and its modes, as the display driver offers them. */
+/** A screen's monitor and its modes, as the display driver offers them. */
 export interface ScreenModes {
+    /** The screen these are of, and how many screens there are (0 to screens - 1). */
+    readonly screen: number;
+    readonly screens: number;
     readonly source: ScreenSource;
+    /** The lowest refresh of the monitor's variable refresh range, 0 without one. */
+    readonly variableRefreshMinMillihertz: number;
     /** The monitor, told apart by its EDID's maker, product and serial number ("" without one).
         What the system knows it by, not a name for people. */
     readonly monitor: string;

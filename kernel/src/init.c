@@ -5,6 +5,7 @@
 #include "dev/input.h"
 #include "dev/fbcon.h"
 #include "dev/fb.h"
+#include "dev/gpu.h"
 #include "dev/pci.h"
 #include "dev/iommu.h"
 #include "dev/pm.h"
@@ -35,7 +36,9 @@ void kmain_late(void) {
     pm_init(); /* the power thread: every shutdown and restart goes through it */
     vm_init(); /* only in a VM: its own bus and the devices on it */
     pci_init();
+    vm_display_init(); /* only in a VM: its emulated displays become screens of their own buffers */
     fb_pm_init(); /* the display joins the power changes once its PCI identity is known */
+    gpu_init();   /* the offscreen GPU, which never shows a screen */
     iommu_init(); /* before any driver turns an interrupt on: their messages may be remapped */
     usb_init();
     net_init();

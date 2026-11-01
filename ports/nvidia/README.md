@@ -319,13 +319,15 @@ plane、connector のオブジェクトや atomic の状態）は真似ず、KMS
    `N_SCREEN_MODE_PREFERRED` を付けて、`n_pci_screen_modes` でシステムへ出す。モニターの識別子は EDID の製造者・製品・
    製造番号（例 `ACR0A2B-12345678`）、名前は EDID のモニター名。出せるモードが無ければ渡さない。
 7. システムが望むモード（`n_pci_screen_state` の `mode`、`mode_serial`）をすぐ読み、出す（`mode_follow_now`。望みが変わり
-   続ける間 4 回まで）。`validateDisplayMode` で確かめ、大きさが今の面と違えば、その大きさの面を作る：pitch を NVKMS の
-   pitch の整列に揃えた pitch linear の X8R8G8B8 を `allocateMemory`（vidmem、SCANOUT、noDisplayCaching）→
-   `mapMemory`（KERNEL）→ view → `createSurface`。最初の面が起動画面と同じ大きさで 32 bpp なら GOP の画面を行ごとに写し、
-   それ以外は黒。リフレッシュだけの変更は同じ面のままモード設定だけをする。
-8. `applyModeSetConfig`（commit=FALSE で検査 → 新しい面を `n_pci_give_screen` で渡す → TRUE で確定 → 前の面を解放）。
-   システムは head がそのモードを出す時には新しい大きさで描いている。確定に失敗すれば head は前のものを出し続け、
-   前の面を渡し直す（面がまだ無ければ起動画面を返す）。どの失敗でも解放した memory へシステムが描くことはない。
+   続ける間 4 回まで）。`validateDisplayMode` で確かめ、大きさが今の面と違えば、その大きさのデスクトップの面を二枚
+   （`DESK_BUFFERS`）作る：一枚ずつ、pitch を NVKMS の pitch の整列に揃えた pitch linear の X8R8G8B8 を
+   `allocateMemory`（vidmem、SCANOUT、noDisplayCaching）→ `mapMemory`（KERNEL）→ view → `createSurface`。最初の
+   デスクトップの一枚目が起動画面と同じ大きさで 32 bpp なら GOP の画面を行ごとに写し、それ以外は黒。二枚目は、システムが
+   全部を描いてからフリップを求める。リフレッシュだけの変更は同じ面のままモード設定だけをする。
+8. `applyModeSetConfig`（commit=FALSE で検査 → 新しい二枚を `n_pci_give_screen` で渡す → vblank のコールバックを登録 →
+   TRUE で確定 → 前の二枚を解放）。モード設定は渡した一枚目を主層へ載せる。システムは head がそのモードを出す時には新しい
+   大きさで描いている。確定に失敗すれば head は前のものを出し続け、前の二枚を、head が出している一枚を先にして渡し直す
+   （面がまだ無ければ起動画面を返す）。どの失敗でも解放した memory へシステムが描くことはない。
    出したモード（出せなければ head が出しているもの）を `done`＝`mode_serial` で知らせ直す。望まれたものと違えば、
    システムはそのモードを拒否として覚え、次の候補を望む。モード設定も、デスクトップの面を主層へ載せるフリップとして
    その完了を待つ（下）。
@@ -338,6 +340,8 @@ plane、connector のオブジェクトや atomic の状態）は真似ず、KMS
    `surfaceChanged` かモード設定なら通知を指定し、面があれば通知の番号を進める。NVKMS は `nvkms-hw-flip.c` の
    `nvAssignCompletionNotifierEvoHwState` で表示エンジンに書かせる）。だから待つのは面を載せるすべての commit
    （モード設定、面の差し替え、失った head へデスクトップを戻すフリップ）で、面を外す commit と失敗した commit は待たない。
+   待つ間は眠り、head の vblank のコールバックが起こすたびに通知を読む（`flip_completed`）。vblank の割り込みが無い head では、
+   モードの一周期ごとに読む。
    待ったフリップが 3 秒（`FLIP_TIMEOUT_MS`）で完了しなければ、表示エンジンが nvrm の面を出していない（何も出ていない
    かもしれない）とみなし、画面を手放す（下の「手放す」）。その前に、最後の commit が名指した通知の番号と、二つの通知の
    生の 4 語（語 0 が状態、語 2・3 が時刻）と、commit に NVKMS がかかった時間をログに出す（`nvrm_nvkms_flip_words`）。
@@ -345,10 +349,12 @@ plane、connector のオブジェクトや atomic の状態）は真似ず、KMS
    0a1d812a は「点けるモード設定では通知が書かれない」としてこの待ちを外し、待てなかったフリップの後も画面を渡したままに
    した。その根拠は NVKMS のソースと合わず（上）、実機 6・7 回目はモニターが暗いまま戻らなかった（5 回目は待ちが失敗し、
    手放して起動画面が出ていた）。この待ちと手放しを戻した。
-9. 渡すのは `n_pci_give_screen(view, {幅, 高さ, pitch, XRGB8888 | N_SCANOUT_DIRECT, offset})`。カーソルが無いか、システムが
-   `N_SCANOUT_DIRECT` を断れば、カーソルを解放して `N_SCANOUT_DIRECT` 無しで渡し直す（直接表示は無し、合成のみ）。
-   head を点けたら `registerVblankIntrCallback`。
-10. 画面の状態を追う状態スレッド（システムが望むモードと直接表示。常に起動）→ 抜き差しを追う作業スレッドを起動する。
+9. 渡すのは `n_pci_give_screen(0, {幅, 高さ, pitch, XRGB8888 | N_SCANOUT_DIRECT, 2, {view0, offset0}, {view1, offset1}})`
+   （出力 0 は画面 0）。戻り値はそれより前のシステムのフリップの番号で、それ以下のフリップは前の面のものなので捨てる。
+   カーソルが無いか、システムが `N_SCANOUT_DIRECT` を断れば、カーソルを解放して `N_SCANOUT_DIRECT` 無しで渡し直す
+   （直接表示は無し、合成のみ）。
+10. フリップのスレッド → 画面の状態を追う状態スレッド（システムが望むモードと直接表示。常に起動）→ 抜き差しを追う作業
+   スレッドを起動する。フリップのスレッドが起動できなければ、システムのコマが一つも出ないので、立ち上げを失敗にする。
    状態スレッドが起動できなければ、モードはそのまま、直接表示もやめる。立ち上げ中に画面を手放していた（上の 8）なら、
    状態スレッドが無いと次の望みで取り戻せないので、その時は立ち上げを失敗にする。
 
@@ -361,8 +367,15 @@ BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の�
 中で連続していることを確かめ、`nvrm_bar_view`（写像の型 WC）で共有オブジェクトを作る。RM の写像と同じ範囲を WC で写すので、
 同じページに違う型の写像を作らない（C42）。
 
-垂直同期：NVKMS が head の vblank ごとに（nvkms の lock の下で）呼ぶコールバックで、渡している間だけ回数を進めて
-`n_pci_screen_vblank(回数, 時刻)` を呼ぶ。重い処理はしない。時刻は NVKMS の値（無ければ `nvrm_now_ns`）。
+フリップ：システムはコマを head が出していない方の面へ描き、`n_pci_screen_flips` でその面のフリップを求める。フリップの
+スレッドが受け取り、head がデスクトップを出していれば、その面を主層へ載せる commit をする（`desk_flip`、モード設定ではない）。
+アプリの絵を直接出している間と head が消えている間は、その面を次にデスクトップへ戻すときの面として覚えるだけにする。
+
+垂直同期：NVKMS が head の vblank ごとに（nvkms の lock の下で）呼ぶコールバックで回数を進め、待っているフリップがあれば、
+その完了通知が書かれていれば（デスクトップが head に無ければすぐ）表示されたとし、`n_pci_screen_vblank({出力 0, 出している
+面, 回数, 時刻, 最後に表示したフリップの番号})` を渡している間だけ呼ぶ。フリップを待つ者を起こす。KAPI は呼ばない。時刻は
+NVKMS の値（GPU の時計をシステムの単調時計へ合わせたもの。無ければ `nvrm_now_ns`）。vblank の割り込みが無い head では、
+フリップのスレッドが commit の完了を見てから自分で表示を知らせる。
 
 抜き差し：イベントは作業スレッドへ起こすだけ。表示中のディスプレイが繋がったままなら、モードの一覧が変わったときだけ
 出し直す（出しているモードが残っていればそのまま）。抜けたら vblank を外して head を止めるが、カーネルの画面は渡したままに
@@ -372,10 +385,10 @@ BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の�
 
 ### 手放す（`hand_back`）と取り戻す
 
-`n_pci_give_screen(N_SCANOUT_BOOT)`（カーネルは GOP の面へ戻り、その大きさで描く。アプリの絵の非常画面用の保持も
+`n_pci_give_screen(0, NULL)`（カーネルは GOP の面へ戻り、その大きさで描く。アプリの絵の非常画面用の保持も
 カーネルが離す）→ vblank を外す → `releaseOwnership`（NVKMS が `nvEvoRestoreConsole` で起動画面を復元する。
 コンソールの面が無いか復元に失敗したときは RM 側の復元に任せる）→ 直接表示をやめてカーソルを解放 → デスクトップの面を
-解放。モードは取り下げず、状態スレッドと作業スレッドも続ける（設定アプリはモードを出し続け、`SCREEN_SOURCE_HANDED_BACK`
+二枚とも解放。モードは取り下げず、状態スレッドと作業スレッドも続ける（設定アプリはモードを出し続け、`SCREEN_SOURCE_HANDED_BACK`
 と示す）。待ったフリップが 3 秒で行われないとき（上の 8）に起きる。起動中でも `nvrm_display_start` は成功を返し、
 画面は GOP のまま、次の望みを待つ。
 
@@ -465,9 +478,9 @@ nvrm は終了時に起動画面へ戻すので、起動コンソールを捨て
 | `nvidia-drm-priv.h` | 装置ごとの状態 | `display.c` の `scr` | 済 |
 | `nvidia-drm-connector.c／.h` | 接続の検出、モードの列挙と検査、EDID | `choose_display`、`pick_mode`、`edid_text` | 済 |
 | `nvidia-drm-encoder.c／.h` | ディスプレイと head の対応、抜き差しのイベント | `choose_display`、`kapi_event`、`rescan` | 済 |
-| `nvidia-drm-crtc.c／.h` | head と層の要求、面、vblank、カーソル、CRC、色 | `head_request`／`primary_request`（PRIMARY 層）、`surface_create`、`vblank_on／off`、カーソル（`cursor_create`、`show`）。オーバーレイ・CRC は無し | 一部 |
+| `nvidia-drm-crtc.c／.h` | head と層の要求、面、vblank、カーソル、CRC、色 | `head_request`／`primary_request`（PRIMARY 層）、`desks_create`、`vblank_on／off`、`desk_flip`、カーソル（`cursor_create`、`show`）。オーバーレイ・CRC は無し | 一部 |
 | `nvidia-drm-modeset.c／.h` | 設定の確定、フリップ、表示のセマフォ | `apply`、`flip_completed`、フリップは `show`。セマフォは次 | 一部 |
-| `nvidia-drm-fb.c／.h` | gem から走査面を作る | `surface_create`（デスクトップ）、`image_create`（アプリの絵、画面の大きさ） | 一部 |
+| `nvidia-drm-fb.c／.h` | gem から走査面を作る | `desks_create`（デスクトップの二枚）、`image_create`（アプリの絵、画面の大きさ） | 一部 |
 | `nvidia-drm-format.c／.h` | DRM の画素形式と NVKMS の形式の変換 | デスクトップは X8R8G8B8（`N_SCANOUT_XRGB8888`）、アプリの絵は X8B8G8R8、カーソルは A8R8G8B8 | 一部 |
 | `nvidia-drm-utils.c／.h` | コネクター情報、モードの変換 | `mode_text`。KAPI のモードをそのまま使うので変換は要らない | 済 |
 | `nvidia-drm-color-pipeline.c／.h` | DRM の色処理の段 | 無し（csc は IDENTITY） | 次 |

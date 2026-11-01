@@ -26,7 +26,8 @@ if (!current) {
     exit(1);
 }
 let settings: DesktopSettings = current;
-let screen: ScreenModes | null = desktop.modes();
+let screenIndex = 0; /* the screen whose modes are shown (0: the one with the taskbar) */
+let screen: ScreenModes | null = desktop.modes(screenIndex);
 let sound: SoundOutput | null = desktop.sound();
 let section: Section = SECTIONS.find(s => s.id === args[0])?.id ?? "display";
 let status = "", statusError = false;
@@ -74,20 +75,20 @@ function tryMode(m: ScreenModeChoice) {
     /* While the driver shows its own mode, the one it shows already is no trial; after it handed the
        screen back, any mode asks it to show one again. */
     if (screen?.source === "driver" && sameMode(m, screen.wanted)) return;
-    if (desktop.tryMode(m)) {
+    if (desktop.tryMode(m, screenIndex)) {
         tried = m;
         status = "";
         statusError = false;
     } else refused("that mode");
-    screen = desktop.modes() ?? screen;
+    screen = desktop.modes(screenIndex) ?? screen;
     countDown();
 }
 
 /* A size chosen: its preferred mode if the monitor prefers one there, else the rate nearest the
    one shown now (the higher of two as near). */
 function trySize(modes: readonly ScreenMode[], size: ScreenModeChoice) {
-    const now = screen?.wanted?.refreshMillihertz ?? 60000;
     const at = modes.filter(m => sameSize(m, size));
+    const now = screen?.wanted?.refreshMillihertz ?? Math.max(...at.map(m => m.refreshMillihertz));
     const best = at.find(m => m.preferred) ?? at.reduce((a, b) => {
         const da = Math.abs(a.refreshMillihertz - now), db = Math.abs(b.refreshMillihertz - now);
         return db < da || (db === da && b.refreshMillihertz > a.refreshMillihertz) ? b : a;
@@ -97,16 +98,16 @@ function trySize(modes: readonly ScreenMode[], size: ScreenModeChoice) {
 
 /* The mode on trial becomes the user's choice for this monitor, which the system keeps. */
 function keepMode() {
-    if (!desktop.keepMode()) {
+    if (!desktop.keepMode(screenIndex)) {
         status = "The mode had already gone back.";
         statusError = true;
-    } else screen = desktop.modes() ?? screen;
+    } else screen = desktop.modes(screenIndex) ?? screen;
     tried = null;
     countDown();
 }
 
 function backMode() {
-    if (!desktop.backMode()) {
+    if (!desktop.backMode(screenIndex)) {
         status = "The mode had already gone back.";
         statusError = true;
     } else {
@@ -114,7 +115,17 @@ function backMode() {
         statusError = false;
     }
     tried = null;
-    screen = desktop.modes() ?? screen;
+    screen = desktop.modes(screenIndex) ?? screen;
+    countDown();
+}
+
+/* Another screen's modes shown; a trial from this window stays on the screen it began on. */
+function pickScreen(index: number) {
+    if (index === screenIndex) return;
+    screenIndex = index;
+    tried = null;
+    status = "";
+    screen = desktop.modes(screenIndex);
     countDown();
 }
 
@@ -139,14 +150,18 @@ const REASONS: Record<ScreenSource, string> = {
 function screenCard(): Child {
     const s = screen, source: ScreenSource = s?.source ?? "firmware", modes = s?.modes ?? [];
     const listed = source !== "remote" && modes.length > 0;
-    const shown = source === "remote" || !s?.shown ? `${settings.screenWidth} × ${settings.screenHeight}`
-                                                   : modeName(s.shown, modes);
+    const shown = s?.shown && source !== "remote" ? modeName(s.shown, modes)
+                : screenIndex === 0 ? `${settings.screenWidth} × ${settings.screenHeight}` : "Off";
     const why = source === "driver" && listed ? "The monitor's own preferred mode is marked recommended."
               : source === "handedBack" && listed ? `${REASONS.handedBack} Pick a resolution to try again.`
+              : source === "driver" && s?.name ? "The display driver offers only this mode for this monitor."
               : REASONS[source];
+    const range = s?.variableRefreshMinMillihertz && s.shown?.variableRefresh
+        ? caption(`Variable refresh from ${Math.round(s.variableRefreshMinMillihertz / 1000)} Hz.`) : null;
     const words = column({gap: 4},
-        heading(s?.name || "Screen"),
+        heading(s?.name || (screenIndex === 0 ? "Screen" : `Screen ${screenIndex + 1}`)),
         text(shown),
+        range,
         caption(why),
         !listed && s?.chosen && source !== "remote" &&
             caption(`Kept for this monitor: ${modeName(s.chosen, [])}, used when a display driver runs.`));
@@ -190,9 +205,20 @@ function trialCard(s: ScreenModes): Child {
             caption(`Going back in ${Math.ceil(s.trialMs / 1000)} s`)));
 }
 
+/* Which screen's modes are shown, when there is more than one. */
+function screenPicker(): Child {
+    const count = screen?.screens ?? 1;
+    if (count < 2) return null;
+    const items = Array.from({length: count}, (_, i) => ({label: i === 0 ? "Screen 1 (taskbar)" : `Screen ${i + 1}`,
+                                                           value: i}));
+    return setting("Screen", caption("The screen whose resolution and refresh rate are shown below."),
+                   segmented(items, screenIndex, pickScreen), true);
+}
+
 function displayPage(): Child {
     const s = settings;
     return [
+        screenPicker(),
         screenCard(),
         s.smoothGradientsAvailable &&
             setting("Smooth gradients",
@@ -258,7 +284,12 @@ const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 function rereadScreen(): boolean {
     const now = desktop.get();
     if (!now) return false;
-    const next = desktop.modes();
+    let next = desktop.modes(screenIndex);
+    if (!next && screenIndex) { /* that screen is gone: back to the first */
+        screenIndex = 0;
+        tried = null;
+        next = desktop.modes(0);
+    }
     let changed = false;
     if (!same(now, settings)) {
         settings = now;

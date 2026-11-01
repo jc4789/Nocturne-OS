@@ -72,6 +72,10 @@ void vm_audio_init(void) {
     if (machine != VM_NONE) ac97_init();
 }
 
+void vm_display_init(void) {
+    if (machine != VM_NONE) vbe_display_init();
+}
+
 void vm_display_pm(struct pm_device *display) {
     if (machine != VM_NONE) vbe_display_pm(display);
 }
