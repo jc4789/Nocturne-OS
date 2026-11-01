@@ -292,6 +292,7 @@ uint64_t n_clock_monotonic(void);
 uint64_t n_clock_boot(void);
 int64_t n_clock_wall(void);
 uint64_t n_clock_after(uint64_t ns); /* the deadline ns from now (N_CLOCK_NEVER past the clock's end) */
+uint64_t n_app_cpu_ns(void); /* the CPU time this app's threads have used, ended ones too (SYS_APP_CPU_TIME) */
 void n_sleep_until(uint64_t deadline);
 n_result n_random(void *buf, size_t n); /* n bytes from the system entropy pool */
 /* The launch settings ("name=value"), NULL-terminated. */

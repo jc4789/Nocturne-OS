@@ -44,11 +44,12 @@
 #define N_RESULT_CODES 34
 
 /* System call numbers. The ABI keeps no older form of a call: a program is built against the
-   abi.h of the system it runs on. 1-18, 20-25, 30-32, 35-37, 44, 51-52, 60-63, 90 and 203-206
+   abi.h of the system it runs on. 1-18, 21-25, 30-32, 35-37, 44, 51-52, 60-63, 90 and 203-206
    are unassigned. */
 enum {
     SYS_EXIT = 0,
     SYS_SLEEP = 19, /* (deadline): until the monotonic clock reaches it (§8) */
+    SYS_APP_CPU_TIME, /* (): ns the calling app's threads have run, the ended ones too (§8) */
     SYS_PROCLIST = 26, SYS_SYSINFO, SYS_YIELD, SYS_POWER,
     SYS_SYSTEM_LOG = 33, SYS_PCILIST,
     SYS_CPU_INFO = 38, SYS_GPU_INFO, SYS_GPU_RENDER, SYS_AUDIO_FLUSH,

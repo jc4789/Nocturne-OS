@@ -16,6 +16,7 @@ struct process {
     char name[32];
     struct thread *main;      /* its first thread: its end ends the process (process_end) */
     struct thread *threads;   /* its other threads whose records are kept (sys/thread.c; thread_lock) */
+    uint64_t retired_ns;      /* the CPU time of its other threads whose records are gone (thread_lock) */
     bool exiting;             /* its end has begun: no new thread, no new app record (thread_lock) */
     bool ended;               /* its threads, handles and space are gone (thread_lock) */
     int exit_code;
