@@ -3,6 +3,7 @@
 #include <stdbool.h>
 struct pci_reset;
 struct irq;
+struct iommu_guest;
 struct pci_device {
     uint8_t bus, dev, func;
     uint16_t vendor, device;
@@ -25,6 +26,7 @@ struct pci_device {
     struct irq **msi_irqs, **msix_irqs;
     uint8_t msi_count;
     bool kernel_owned; /* a kernel driver enabled it (pci_enable_busmaster): no app may claim it */
+    const struct iommu_guest *guest; /* that driver's way out of a claim of its group (dev/iommu.h), or NULL */
     bool claimed;      /* an app drives it (dev/pciuser.c) */
     bool iommu_blocked; /* in an ended claim's group: the IOMMU drops what it sends (dev/iommu.c) */
     bool needs_reset; /* stopped state unconfirmed, or residual state from an ended multi-function group */

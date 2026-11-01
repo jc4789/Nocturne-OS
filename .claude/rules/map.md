@@ -30,7 +30,7 @@
 | `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console と system log の stream、profiler。 |
 | `sys/keep.c` | wm・audio・screenmode の設定を `AppData\Nocturne\` の `.conf` に保存し、init の前に読み戻す。 |
 | `fs/` | C: の store の実行側。mount とパスの操作は `store.c`、開いた文書は `document.c`、block cache は `cache.c`、変更の watch は `watch.c`。書式のエンジンは `common/store/`。 |
-| `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（USB HID）、`serial`、`refclock`（HPET か ACPI PM timer と、RTC）、電源と hibernate。 |
+| `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音（`audio` が流れ・混合・出口の選択、`hda`・`hda_codec` が High Definition Audio）、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（USB HID）、`serial`、`refclock`（HPET か ACPI PM timer と、RTC）、電源と hibernate。 |
 | `net/` | `net.c`（Ethernet から TCP・DHCP・DNS まで）と `rtl8125.c`（実機の NIC）。 |
 | `gui/` | `wm.c`（窓管理と、画面ごとの合成のスレッド）、`desktop.c`、`screenmode.c`（画面ごとのモードの選択）。 |
 | `vm/` | VM だけの処理。下の「境界」を見る。 |
@@ -63,7 +63,7 @@
 | `boot/limine.conf` | 起動の項目は desktop と `nogui` の二つ。 |
 | `rootfs/` | C: にそのまま入るもの（`Nocturne\`、`Users\User\`）。 |
 | `scripts/` | ビルド、媒体、試験、生成、Hyper-V の道具。 |
-| `tests/` | ゲストの試験（`runtests.c`）、WPT の runner、ホストの検査 `check_*.py`。 |
+| `tests/` | ゲストの試験（`runtests.c`）、WPT の runner、ホストの検査 `check_*.py`（`check_hda_codec.py` は codec の表で widget の木を試す）。 |
 | `docs/` | 仕様 `nocturne-native-abi.md`、台帳 `*/LEDGER.md`、日付入りの報告。 |
 | `build/`・`tools/`・`hyperv/`・`local/`・`.codegraph/` | git の外。ビルドの出力、同梱の道具、Hyper-V のディスク、GSP の firmware、codegraph の索引。 |
 

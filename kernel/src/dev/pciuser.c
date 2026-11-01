@@ -498,6 +498,7 @@ static void claim_release(struct object *o) {
     shared_revoke_claim(c); /* no process reaches the registers any more */
     interrupts_off(c);
     mutex_lock(&claim_mutex); /* no claim forms a group with these functions meanwhile */
+    if (c->domain) iommu_guests_stop(c->domain);
     bool left_running;
     bool stopped = pci_disable_busmaster(d, &left_running);
     if (c->domain && c->domain->nmembers > 1) {
@@ -664,7 +665,7 @@ static bool bus_reset(struct pci_claim *c, struct pci_device *m) {
         struct pci_device *f = pci_at(i);
         if (!pci_below(port, f)) continue;
         bool ours = claim_owns(c, m, f);
-        const char *why = f->kernel_owned              ? "a kernel driver runs it"
+        const char *why = !ours && f->kernel_owned     ? "a kernel driver runs it"
                           : screen_bar(f) >= 0         ? "the boot screen is drawn through it"
                           : !ours && f->claimed        ? "it is claimed"
                           : !ours && iommu_in_use(f)   ? "it is in another claim's domain"
@@ -798,6 +799,7 @@ static int64_t claim_form(struct pci_claim *c, struct handle **out) {
         d->claimed = false;
         return -N_ERR_NO_MEMORY;
     }
+    if (c->domain) iommu_guests_start(c->domain, true);
     *out = h;
     return 0;
 }
