@@ -1074,7 +1074,7 @@ static int64_t interrupts_on(struct pci_claim *c, uint32_t count) {
     struct irq_spec specs[CLAIM_VECTORS];
     for (unsigned i = 0; i < count; i++) {
         c->messages[i] = (struct claim_message){c, i};
-        specs[i] = (struct irq_spec){.name = "app driver", .handler = claim_isr, .context = &c->messages[i], .node = -1};
+        specs[i] = (struct irq_spec){.name = "app driver", .handler = claim_isr, .context = &c->messages[i], .node = d->node};
     }
     /* on before the messages are: one may come as soon as its entry is written */
     uint64_t irq = spin_lock(&c->irq_lock);

@@ -15,6 +15,7 @@ struct pci_device {
     bool bridge;                  /* a PCI-to-PCI bridge (header type 1) */
     uint8_t secondary, subordinate; /* a bridge's buses: those below it, as enumeration found them */
     struct pci_device *upstream;  /* the bridge whose secondary bus this function is on, or NULL */
+    int node; /* the NUMA node it sits on (topology's index, from the firmware's _PXM), -1 when unknown */
     uint16_t msix_entries;      /* the MSI-X table's size, once mapped (pci_irq_enable) */
     volatile uint32_t *msix_table; /* mapped MSI-X table, 16 bytes per entry */
     /* The irqs its messages deliver (pci_irq_enable): MSI's msi_count from the first, each MSI-X

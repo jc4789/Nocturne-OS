@@ -420,7 +420,7 @@ static void start(struct hba *h) {
     hba_take(h);
     uint32_t cap = hba_rd(h, CAP), implemented = hba_rd(h, PI);
     h->s64 = cap & CAP_S64A;
-    pci_irq_enable(pci, &(struct irq_spec){.name = "AHCI", .handler = ahci_isr, .context = h, .node = -1}, 1, &h->irq);
+    pci_irq_enable(pci, &(struct irq_spec){.name = "AHCI", .handler = ahci_isr, .context = h, .node = pci->node}, 1, &h->irq);
     kprintf("ahci%d: %04x:%04x, version %x, ports %x, %s\n", h->index, pci->vendor, pci->device, hba_rd(h, VS),
             implemented, h->irq ? "MSI" : "polled");
     /* staggered spin-up: every port's link first, so the disks spin up together */

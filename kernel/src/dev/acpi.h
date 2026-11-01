@@ -207,6 +207,10 @@ bool acpi_reset(void);
 struct pci_device;
 void *acpi_pci_node(const struct pci_device *d);
 void *acpi_pci_host(const struct pci_device *d);
+/* The proximity domain the firmware gives d (_PXM, ACPI 6.5 6.2.14), which holds for a device and
+   what is below it: on the function's node or the nearest above it, its host bridge's at the
+   latest. False without one, or without AML. Sleeps. */
+bool acpi_pci_proximity(const struct pci_device *d, uint32_t *domain);
 /* The GSI a function's INTx reaches (ACPI 6.5 6.2.13, _PRT): its Interrupt Pin, swizzled at each
    bridge without a _PRT of its own, looked up in the nearest _PRT above it, a GSI there or the
    current interrupt of the link device it names; its signal told to the IOAPICs

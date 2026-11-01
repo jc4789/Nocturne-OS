@@ -883,11 +883,11 @@ static void tables_free(void) {
    drains every unit. */
 static void event_interrupts_enable(void) {
     struct irq_spec specs[32]; /* the message number has 5 bits */
-    for (unsigned i = 0; i < 32; i++)
-        specs[i] = (struct irq_spec){.name = "AMD-Vi events", .handler = event_isr, .node = -1};
     for (size_t i = 0; i < nunits; i++) {
         struct pci_device *fn = units[i].fn;
         if (!fn) continue;
+        for (unsigned k = 0; k < 32; k++)
+            specs[k] = (struct irq_spec){.name = "AMD-Vi events", .handler = event_isr, .node = fn->node};
         bool seen = false;
         unsigned top = 0;
         for (size_t j = 0; j < i; j++) seen |= units[j].fn == fn;
