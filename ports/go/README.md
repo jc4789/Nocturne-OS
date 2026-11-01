@@ -75,21 +75,13 @@ Nocturne は UNIX でも POSIX でもないので、Go 側を Nocturne の API �
 
 ## 確認したこと（QEMU、WHPX、4 CPU）
 
-`ports/go/apps/gotest` を端末から実行し、画面で確認しました。出力、時刻、`time.Sleep`、
-8 本の goroutine（`GOMAXPROCS=1` で 517ms、4 で 152ms）、文書の作成・追記・読み戻し・`Stat`、
-`C:\Nocturne\System` の一覧、作業フォルダー、存在しない名前のエラー、チャンネルと `select`、GC、
-`os/exec` でのアプリ起動、`panic` のトレース表示、パイプからの標準入力。
+2026-11-01、ゲストの Terminal から：
 
-`gotest net` で、インターフェース一覧、`example.com` の解決（21ms）、存在しない名前、
-Go の DNS クライアントでの MX、TCP 接続、読み取り期限（300ms で期限切れ）、
-HTTP と HTTPS（TLS 1.3、証明書の検証）を確認しました。
-
-`gotest listen` で、`127.0.0.1:0` の HTTP サーバーへの GET（11ms）、並列 64 本（34ms）、
-32 MiB の転送と `CloseWrite`（74ms、約 434 MiB/s）、`Accept` の期限（200ms）、`Close` で
-起きる `Accept`、同じポートの二重待受け（address in use）、閉じたポートへの接続の拒否、
-`127.0.0.1` だけの待受けにインターフェースのアドレスから接続できないことを確認しました。
-`gotest serve`（`:8080`）にはホストから QEMU のポート転送で curl（20 本並列）、
-Nocturne のブラウザーから `http://127.0.0.1:8080/` で接続し、ページが表示されました。
+- `gotest`：出力、時刻、`time.Sleep` の 250 ms が 250 ms、goroutine、文書の作成・追記・読み戻し・`Stat`、
+  `C:\Nocturne\System` の一覧、作業フォルダー、存在しない名前のエラー、チャンネル、GC、`os/exec`。
+- `gotest net`：インターフェース一覧、`example.com` の解決（17 ms）、存在しない名前、MX、TCP 接続、
+  読み取り期限（300 ms で期限切れ）、HTTP と HTTPS（TLS 1.3）。
+- `calc`（`C:\Programs\Calculator`）が窓を開く。`tsc --version` が `Version 7.1.0-dev`。
 
 ## まだできないこと
 

@@ -110,39 +110,22 @@ C++ の例外は使えます（`-fexceptions` は C++ の既定です）。libc+
 | エラー | errno の値は ABI の `N_ERR_*`（正の数）。`std::error_code` に対応付け、文言は `n_result_text`。 |
 | 標準出力・エラー（`raw_ostream.cpp`、`ErrorHandling.cpp`） | 端末なら出力をためずに書く。メモリー不足の報告は C ライブラリーのバッファーの無い `stderr` で、確保せずに書く。 |
 
+## libc++ の Nocturne の形
+
+- C の `FILE` は名前でだけ開き、裏の handle を出さない。だから `basic_filebuf` と各 `fstream` は
+  C++26 の `native_handle`・`native_handle_type` を持たず、`__cpp_lib_fstream_native_handle` も無い。
+  handle で開く内部の `__open(int)` も無い（`std::filesystem::copy_file` は一時の文書と
+  `n_entry_replace` で書く）。
+- 待ちの期限は単調時計の ns（`n_clock_after`、`wait_on_address`・`wait_on_address64`）。
+
 ## 確認したこと
 
-2026-10-23、QEMU（WHPX、4 CPU、4096 MiB、起動ディスクは AHCI、1920×1080）で。Hyper-V と実機では
-まだ確認していません。
+2026-11-01、QEMU（WHPX、4 CPU、4096 MiB、NVMe、2560×1440）で、ゲストの Terminal から：
 
-- `python scripts/test.py --accel whpx --memory 4096 --cpus 4 clang tcc cxx threads fs sh tools nativeabi mem
-  sharedpages gui`：46 件成功、失敗 0（tcc/self-host は `--full` が要るので飛ばす）。clang 群は、C の
-  プログラム（`tests/ctest.c`）、エラーの報告、C++23 のプログラム（`tests/cxxtest.cpp`：例外、スレッド、
-  `sleep_for` と時計、`<format>`、`<regex>`、`<filesystem>`、ストリーム、`std::exception_ptr`）、スレッド
-  （`tests/threadtest.c`）、OS の全アプリを clang でコンパイルしてリンクすること。
-- 端末で：`clang --version`（`Nocturne clang version 23.1.3`、`Target: x86_64-unknown-nocturne`）。
-  `clang -O2` で作った `tetris.c` と `mandel.c` が窓を開いて動く。`clang++ -std=c++23` の `std::println`
-  と、`std::vector::at` が投げた `std::out_of_range` を捕まえるプログラムが動く。`tcc -run` も前のとおり動く。
-- `llvm` は 92 MB で、一回のコンパイルで三度起動する（ドライバー、`-cc1`、`ld.lld`）。カーネルは
-  プログラムの読み取り専用のセグメントを、それを走らせるタスクと、最近走ったプログラムの次の起動で
-  共有する（`kernel/src/sys/syscall.c` の `program_get`/`program_map`/`program_put`）。プログラムは
-  文書の中身で見分ける（`store_document_identity`：大きさ、ブロックとその CRC-32C）。測った値：
-  ディスクからの最初の起動 576 ms、二度目からの起動 1 ms。`clang -O2` で mandel.c が 271 ms
-  （共有の前は 857 ms）、tetris.c が 285 ms（878 ms）、小さな C++23 のプログラムが約 2.0 s（4.2 s）。
-  共有するセグメントは起動のときに全部は読まず、初めて触れた頁を含む 16 頁の塊をディスクから読む
-  （`program_fill`）。走らせるタスクの無いプログラムのフレームは、メモリーを求めるアプリへ返す
-  （`frames_free`）ので、`sysinfo` の `free_mem` はその分も数える。
-- 走っているプログラムを入れ替えた次の起動は新しい中身を読む：大きさの違う入れ替え（echo を date に）
-  と、同じ大きさの入れ替え（true と false、どちらも 20552 バイト）。
-- `sleep_for(20ms)` が `steady_clock` で 19 ms と測れることがあった（C++ と ISO C は「少なくとも」を
-  求める）。アプリの時計（`n_clockinfo` の基準の組）とカーネルの数え方が同じ時刻から数えるように
-  し、待ちの期限を最新の時刻から取るようにした（`kernel/src/dev/timer.c`）。後は 20 ms が 20〜21 ms、
-  5 ms が 5〜6 ms。
-
-2026-10-24、同じ条件で、必要時の読み込みを入れた後に：
-
-- `python scripts/test.py --accel whpx --memory 4096 --cpus 4 clang tcc cxx threads fs sh tools nativeabi mem
-  sharedpages gui parallel wasm wasmworker`：50 件成功、失敗 0、飛ばし 1。ディスクの検査は問題 0。
-- 端末で：`clang -v` が `Thread model: nocturne` を出す。`echo` で書いた C を `clang -O2` でコンパイルして
-  走らせる。同じ起動で、Web ブラウザーの Firefox in WebAssembly（developer.puter.com/labs/firefox-wasm）
-  が Firefox を起動してページを描く。
+- `clang --version` は `Nocturne clang version 23.1.3`、`Thread model: nocturne`。
+- C：`timespec_get(TIME_MONOTONIC)` と `thrd_sleep` の 250 ms が「slept 250 ms」、`ctime` が `date` と同じ時刻。
+- C++23：`sleep_for(20ms)` が 20 ms、`condition_variable::wait_for(30ms)` が 30 ms、
+  `std::atomic::wait`・`notify_one`、`fstream` の書き読み、`std::println` と `system_clock` の書式。
+- C++ の例外は、SDK の `libc.a` が持つ libunwind の部材に巻き戻しの表が無いので、
+  そのままでは捕まらず `std::terminate` になる（`scripts/mksdk.sh` の `strip_obj` が `.eh_frame` を消す）。
+  `-lunwind` を入力の前に置くと `libunwind.a` の部材が使われ、`throw` が捕まる。
