@@ -311,6 +311,7 @@ void ac97_init(void) {
     nam = (uint16_t)(d->bar[0] & ~3u);
     nabm = (uint16_t)(d->bar[1] & ~3u);
     pci_enable_busmaster(d);
+    pci_enable_io(d);
 
     /* descriptors and buffers, below 4 GiB for the 32-bit addresses */
     uint64_t bdl = pmm_alloc_contig(1, 32);

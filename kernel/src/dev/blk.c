@@ -69,6 +69,9 @@ static void leave(void) {
     if (wake) wq_wake_all(&gate_wq);
 }
 
+void blk_busy_begin(void) { enter(); }
+void blk_busy_end(void) { leave(); }
+
 /* A failed request is counted, and the first few are logged: a dying disk must not flood the log.
    Drivers fail with -1 or a code of their own; callers see N_ERR_IO, or N_ERR_TIMEOUT. */
 static int failed(struct blkdev *d, const char *what, uint64_t lba, uint32_t n, int r) {
@@ -109,9 +112,16 @@ int blk_by_blocks(struct blkdev *d, bool write, uint64_t lba, uint32_t count, ui
         if (whole && direct) {
             if (move(ctx, write, first, n, p) < 0) return -N_ERR_IO;
         } else if (write) {
-            if (!whole && move(ctx, false, first, n, bounce) < 0) return -N_ERR_IO;
-            memcpy(bounce + off, p, take);
-            if (move(ctx, true, first, n, bounce) < 0) return -N_ERR_IO;
+            /* another part of the same block being written is not written back as it was; a write
+               of a whole block beside this one is the caller's to keep apart, as any two that overlap */
+            if (!whole) mutex_lock(&d->partial);
+            int r = whole ? 0 : move(ctx, false, first, n, bounce);
+            if (r >= 0) {
+                memcpy(bounce + off, p, take);
+                r = move(ctx, true, first, n, bounce);
+            }
+            if (!whole) mutex_unlock(&d->partial);
+            if (r < 0) return -N_ERR_IO;
         } else {
             if (move(ctx, false, first, n, bounce) < 0) return -N_ERR_IO;
             memcpy(p, bounce + off, take);
@@ -123,19 +133,28 @@ int blk_by_blocks(struct blkdev *d, bool write, uint64_t lba, uint32_t count, ui
     return 0;
 }
 
+static void count_up_to(uint64_t *count, uint64_t upto) {
+    uint64_t was = __atomic_load_n(count, __ATOMIC_SEQ_CST);
+    while (was < upto &&
+           !__atomic_compare_exchange_n(count, &was, upto, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
+}
+
 /* Nothing written since a persist that ended began: the medium has it all already. Persists on
    other CPUs at once each flush what they found unpersisted; the device's driver puts them one
-   after the other. */
+   after the other. A flush covers the commands over before it began (NVMe 2.4, 7.2), which `ended`
+   is read for. A loss of its cache is looked at after the flush, which may have waited for the
+   device to come back. */
 int blk_persist(struct blkdev *d) {
     if (!d->persist) return 0;
     enter();
     uint64_t upto = __atomic_load_n(&d->written, __ATOMIC_SEQ_CST);
+    uint64_t ended = __atomic_load_n(&d->ended, __ATOMIC_SEQ_CST);
     int r = 0;
     if (__atomic_load_n(&d->persisted, __ATOMIC_SEQ_CST) < upto && !(r = d->persist(d))) {
-        uint64_t was = __atomic_load_n(&d->persisted, __ATOMIC_SEQ_CST);
-        while (was < upto && !__atomic_compare_exchange_n(&d->persisted, &was, upto, false, __ATOMIC_SEQ_CST,
-                                                          __ATOMIC_SEQ_CST)) {}
+        count_up_to(&d->persisted, upto);
+        count_up_to(&d->flushed, ended);
     }
+    if (!r && __atomic_load_n(&d->cache_lost, __ATOMIC_SEQ_CST)) r = -N_ERR_IO;
     leave();
     return r ? failed(d, "cache flush", 0, 0, r) : 0;
 }
@@ -155,4 +174,20 @@ void blk_release(void) {
     holder = NULL;
     spin_unlock(&gate_lock, f);
     wq_wake_all(&gate_wq);
+}
+
+struct thread *blk_holder(void) {
+    uint64_t f = spin_lock(&gate_lock);
+    struct thread *t = holder;
+    spin_unlock(&gate_lock, f);
+    return t;
+}
+
+void blk_write_given(struct blkdev *d) { __atomic_add_fetch(&d->given, 1, __ATOMIC_SEQ_CST); }
+
+void blk_write_ended(struct blkdev *d) { __atomic_add_fetch(&d->ended, 1, __ATOMIC_SEQ_CST); }
+
+void blk_cache_lost(struct blkdev *d) {
+    if (__atomic_load_n(&d->flushed, __ATOMIC_SEQ_CST) < __atomic_load_n(&d->given, __ATOMIC_SEQ_CST))
+        __atomic_store_n(&d->cache_lost, true, __ATOMIC_SEQ_CST);
 }

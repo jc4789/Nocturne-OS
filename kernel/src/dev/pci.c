@@ -282,8 +282,13 @@ struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls) {
 void pci_enable_busmaster(struct pci_device *d) {
     d->kernel_owned = true;
     uint16_t cmd = pci_read16(d->bus, d->dev, d->func, PCI_COMMAND);
-    cmd |= PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
+    cmd |= PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
     pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, cmd);
+}
+
+void pci_enable_io(struct pci_device *d) {
+    uint16_t cmd = pci_read16(d->bus, d->dev, d->func, PCI_COMMAND);
+    pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, cmd | PCI_COMMAND_IO);
 }
 
 int pci_list(struct n_pciinfo *out, int max) {
@@ -804,8 +809,9 @@ static uint64_t flr_time_ns(const struct pci_device *d) {
 
 /* Owned by its enumerated device, not the app performing recovery. A cancelled or failed attempt
    must not lose the pre-FLR BARs/ACS, and a later one must not save over them what an FLR left.
-   Its caller reserves d->claimed across the attempt (dev/pciuser.c), so only that caller resets
-   d; resets of different functions go one at a time under reset_mutex, as they share the ports
+   Only one caller resets d: an app's, which reserves d->claimed across the attempt and never takes
+   up a function a kernel driver owns (dev/pciuser.c), or that kernel driver, under its lock (dev/nvme.c);
+   resets of different functions go one at a time under reset_mutex, as they share the ports
    above (RRS holds, link retraining, the times since a port's reset). A sleep does not start
    while one runs (pci_suspend). A bus reset holds the configuration of each function below its
    port the same way (pci_bus_reset), until the function answers after it. AML's accesses
@@ -835,6 +841,23 @@ static struct mutex reset_mutex;
 /* Taken by pci_function_reset and pci_bus_reset for their whole run: a sleep is refused while
    one is counted (pci_suspend). reset_lock. */
 static unsigned resets_running;
+
+/* An FLR leaves every entry of the MSI-X table masked (7.7.2.8) and its message undefined (7.7.2.5
+   to 7.7.2.7), and the table is not in what a reset saves: the entries with an irq get their
+   messages again and open. */
+static void msix_entries_again(struct pci_device *d) {
+    if (!d->msix_table || !d->msix_irqs) return;
+    for (unsigned i = 0; i < d->msix_entries; i++) {
+        if (!d->msix_irqs[i]) continue;
+        if (!irq_msi_rewrite(d->msix_irqs[i])) {
+            kprintf("pci: %02x:%02x.%u: MSI-X entry %u could not be written after its reset\n", d->bus, d->dev, d->func, i);
+            continue;
+        }
+        volatile uint32_t *vc = d->msix_table + i * 4 + 3;
+        mmio_write32(vc, mmio_read32(vc) & ~1u);
+    }
+    (void)mmio_read32(d->msix_table + 3);
+}
 
 /* reset_lock taken around a record change AML's accesses read. */
 static void reset_phase_set(struct pci_reset *r, enum reset_phase phase) {
@@ -1021,6 +1044,7 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
     links_retrain(true);
     /* still mastering: the next attempt finds it ready and writes the configuration again */
     if (!present(d) || (pci_read16(d->bus, d->dev, d->func, PCI_COMMAND) & PCI_COMMAND_MASTER)) return false;
+    msix_entries_again(d);
     reset_free(d);
     return true;
 }
@@ -1051,7 +1075,19 @@ bool pci_function_reset(struct pci_device *d) {
     return done;
 }
 
-bool pci_reset_stuck(const struct pci_device *d) { return d->reset && d->reset->stuck; }
+bool pci_reset_stuck(const struct pci_device *d) {
+    uint64_t f = spin_lock(&reset_lock);
+    bool stuck = d->reset && d->reset->stuck;
+    spin_unlock(&reset_lock, f);
+    return stuck;
+}
+
+bool pci_reset_left(const struct pci_device *d) {
+    uint64_t f = spin_lock(&reset_lock);
+    bool left = d->reset != NULL;
+    spin_unlock(&reset_lock, f);
+    return left;
+}
 
 /* Software performing an FLR keeps the other software that may access the function from it
    until the FLR is done (6.6.2), and a Request reaching it meanwhile may be discarded: so while

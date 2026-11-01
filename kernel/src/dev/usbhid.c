@@ -17,9 +17,11 @@
 #define HID_SET_PROTOCOL 0x0B
 #define REPEAT_DELAY (500 * NS_PER_MS)
 #define REPEAT_RATE (33 * NS_PER_MS)
+/* A report's bits at most, its ID byte beside them: Get_Report's wLength has 16 bits (HID 7.2.1). */
+#define REPORT_BITS_MOST (0xFFFEull * 8)
 
 struct value { /* one parsed input value */
-    uint16_t bit, size;
+    uint32_t bit, size;
     int32_t min, max;
     uint8_t report;
     bool present, relative;
@@ -28,7 +30,7 @@ struct value { /* one parsed input value */
 struct keyfield {
     uint8_t report;
     bool variable;
-    uint16_t bit, size, count;
+    uint32_t bit, size, count;
     int32_t min;
     uint16_t usage_min, usage_max;
 };
@@ -44,17 +46,28 @@ struct hid {
     bool ids;             /* reports start with a report ID byte */
     bool keyboard, mouse;
     /* keyboard */
-    struct keyfield keys[16];
-    int nkeys;
+    struct keyfield *keys;
+    size_t nkeys, keys_room;
     uint32_t down[8];     /* usages currently pressed */
     uint16_t repeat_usage;
     uint64_t repeat_at;
     struct alarm repeat;  /* the held key's next repeat */
-    bool leds;            /* has a boot LED output report */
+    bool leds;            /* has an output report with the Caps Lock LED (HID 7.2.2, HUT 11) */
+    uint8_t led_report;   /* its ID, 0 without */
+    uint32_t led_bit, led_len; /* the LED's bit in the report's data, and the data's bytes */
     unsigned leds_seen;   /* the leds_gen its lights show (its worker's) */
+    unsigned longest;     /* bytes of its longest input report, with the ID; 0: not known */
+    uint16_t report_bytes[256]; /* of each input report by its ID, with the ID; 0: not known */
+    /* Under lock, what has come of a report that takes more than one packet: a USB transfer holds one
+       report, which may take several (HID 8.4). The endpoint's TDs are a packet each, of `packet`
+       bytes, so a report that is whole does not wait for the next one's. */
+    uint8_t *partial;
+    unsigned partial_len, packet;
     /* pointer */
     struct value x, y, wheel, button[8];
     uint8_t buttons;
+    int last_x, last_y;   /* an absolute pointer's place, kept through a value out of range (HID 5.10) */
+    bool x_known, y_known;
 };
 
 /* Every HID interface, under hids_lock: a caps lock press on one keyboard asks every keyboard's
@@ -106,6 +119,12 @@ static int32_t signed_at(const uint8_t *data, unsigned len, unsigned bit, unsign
 
 /* ---- keyboard ---- */
 
+/* The values of the field that lie in the `len` bytes that came. */
+static unsigned values_in(const struct keyfield *k, unsigned len) {
+    unsigned bits = len * 8;
+    return k->bit >= bits ? 0 : MIN(k->count, (bits - k->bit) / k->size);
+}
+
 /* The held key repeats while nothing newer is pressed and it is not let go. */
 static void repeat_fire(struct alarm *a, struct regs *r) {
     (void)r;
@@ -126,7 +145,7 @@ static bool key_report(struct hid *h, uint8_t report, const uint8_t *data, unsig
     uint32_t now_down[8], covered[8] = {0};
     memcpy(now_down, h->down, sizeof now_down);
     bool any = false;
-    for (int i = 0; i < h->nkeys; i++) {
+    for (size_t i = 0; i < h->nkeys; i++) {
         struct keyfield *k = &h->keys[i];
         if (k->report != report) continue;
         any = true;
@@ -135,32 +154,34 @@ static bool key_report(struct hid *h, uint8_t report, const uint8_t *data, unsig
     if (!any) return false;
     for (int w = 0; w < 8; w++) now_down[w] &= ~covered[w];
     uint32_t bitmap[8] = {0}; /* usages the variable (bitmap) fields of this report decide */
-    for (int i = 0; i < h->nkeys; i++) {
+    for (size_t i = 0; i < h->nkeys; i++) {
         struct keyfield *k = &h->keys[i];
         if (k->report != report || !k->variable) continue;
-        for (unsigned e = 0; e < k->count; e++) {
+        for (unsigned e = 0, n = values_in(k, len); e < n; e++) {
             unsigned u = k->usage_min + e;
             if (u >= 256) break;
             bitmap[u >> 5] |= 1u << (u & 31);
             if (bits_at(data, len, k->bit + e * k->size, k->size)) set_down(now_down, u);
         }
     }
-    for (int i = 0; i < h->nkeys; i++) {
+    for (size_t i = 0; i < h->nkeys; i++) {
         struct keyfield *k = &h->keys[i];
         if (k->report != report || k->variable) continue;
         bool phantom = false;
-        for (unsigned e = 0; e < k->count && !phantom; e++) {
+        unsigned values = values_in(k, len);
+        for (unsigned e = 0; e < values && !phantom; e++) {
             int32_t v = signed_at(data, len, k->bit + e * k->size, k->size, k->min < 0);
-            phantom = v >= k->min && k->usage_min + (v - k->min) == 1;
+            /* ErrorRollOver, POSTFail, ErrorUndefined: each says there are no keys to read (HUT 10) */
+            unsigned code = (unsigned)(k->usage_min + (v - k->min));
+            phantom = v >= k->min && code >= 1 && code <= 3;
         }
         if (phantom) {
-            /* ErrorRollOver: too many keys held to tell which (HID Usage Tables 10). The array
-             * keeps its previous keys, while the modifier bitmap beside it is still exact. */
+            /* The array keeps its previous keys, while the modifier bitmap beside it is still exact. */
             for (unsigned u = k->usage_min; u <= k->usage_max && u < 256; u++)
                 if (!is_down(bitmap, u) && is_down(h->down, u)) set_down(now_down, u);
             continue;
         }
-        for (unsigned e = 0; e < k->count; e++) {
+        for (unsigned e = 0; e < values; e++) {
             int32_t v = signed_at(data, len, k->bit + e * k->size, k->size, k->min < 0);
             unsigned u = (unsigned)(k->usage_min + (v - k->min));
             if (v >= k->min && u >= 4 && u <= k->usage_max && u < 256) set_down(now_down, u);
@@ -200,7 +221,7 @@ static void caps_toggled(void) {
     __atomic_fetch_add(&leds_gen, 1, __ATOMIC_RELEASE);
     uint64_t f = spin_lock(&hids_lock);
     for (struct hid *h = hids; h; h = h->next)
-        if (h->keyboard && h->leds && !h->ids) usb_note_work(h->dev);
+        if (h->keyboard && h->leds) usb_note_work(h->dev);
     spin_unlock(&hids_lock, f);
 }
 
@@ -210,60 +231,101 @@ static int32_t value_of(const struct value *v, const uint8_t *data, unsigned len
     return signed_at(data, len, v->bit, v->size, v->min < 0);
 }
 
+/* A value outside the item's logical range says the control has no value now (HID 5.10, 6.2.2.5). */
+static bool in_range(const struct value *v, int32_t raw) {
+    return v->max <= v->min || (raw >= v->min && raw <= v->max);
+}
+
 static int scale_abs(const struct value *v, int32_t raw) {
     if (v->max <= v->min) return 0;
-    if (raw < v->min) raw = v->min;
-    if (raw > v->max) raw = v->max;
     return (int)((int64_t)(raw - v->min) * MOUSE_ABS_MAX / (v->max - v->min));
 }
 
-/* Buttons, motion and wheel may each come in a report of their own (HID 1.11 5.6): a report
- * updates what it carries, and buttons it does not carry keep their last state. */
+/* The value is in this report: of its ID, and whole in the `len` bytes that came (a short packet ends
+   a report, HID 8.4). */
+static bool value_came(const struct value *v, uint8_t report, unsigned len) {
+    return v->present && v->report == report && v->bit + v->size <= len * 8;
+}
+
+/* Buttons, each axis and wheel may each come in a report of their own (HID 1.11 5.6): a report
+ * updates what it carries, and what it does not carry keeps its last state. */
 static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, unsigned len, uint64_t at) {
     struct mouse_event e = {.time_ns = at};
     bool any = false;
     uint8_t buttons = h->buttons;
     for (int i = 0; i < 8; i++) {
-        if (!h->button[i].present || h->button[i].report != report) continue;
+        if (!value_came(&h->button[i], report, len)) continue;
         any = true;
         if (bits_at(data, len, h->button[i].bit, 1)) buttons |= 1u << i;
         else buttons &= ~(1u << i);
     }
     e.buttons = buttons & 7;
-    if (h->x.present && h->x.report == report) {
+    bool x_came = value_came(&h->x, report, len), y_came = value_came(&h->y, report, len);
+    if (x_came || y_came) {
         any = true;
-        bool has_y = h->y.present && h->y.report == report;
-        int32_t x = value_of(&h->x, data, len), y = has_y ? value_of(&h->y, data, len) : 0;
-        if (h->x.relative) {
-            e.dx = x;
-            e.dy = y;
-        } else {
+        int32_t x = x_came ? value_of(&h->x, data, len) : 0, y = y_came ? value_of(&h->y, data, len) : 0;
+        bool x_good = x_came && in_range(&h->x, x), y_good = y_came && in_range(&h->y, y);
+        if (x_good && h->x.relative) e.dx = x;
+        if (y_good && h->y.relative) e.dy = y;
+        if (x_good && !h->x.relative) {
+            h->last_x = scale_abs(&h->x, x);
+            h->x_known = true;
+        }
+        if (y_good && !h->y.relative) {
+            h->last_y = scale_abs(&h->y, y);
+            h->y_known = true;
+        }
+        /* a place only with both axes absolute, each of which has said where: only those become known */
+        if (h->x_known && h->y_known) {
             e.absolute = true;
-            e.x = scale_abs(&h->x, x);
-            e.y = has_y ? scale_abs(&h->y, y) : 0;
+            e.x = h->last_x;
+            e.y = h->last_y;
         }
     }
-    if (h->wheel.present && h->wheel.report == report) {
+    if (value_came(&h->wheel, report, len)) {
         any = true;
-        e.wheel = -value_of(&h->wheel, data, len);
+        int32_t w = value_of(&h->wheel, data, len);
+        e.wheel = in_range(&h->wheel, w) ? -w : 0;
     }
     if (!any) return;
     h->buttons = buttons;
     input_mouse(&e);
 }
 
-static void hid_report(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len, uint64_t at) {
-    (void)d;
-    struct hid *h = ctx;
+/* A report whole, h->lock held. True when it pressed caps lock. */
+static bool report_whole(struct hid *h, const uint8_t *data, unsigned len, uint64_t at) {
     uint8_t report = 0;
     if (h->ids) {
-        if (!len) return;
+        if (!len) return false;
         report = *data++;
         len--;
     }
-    uint64_t f = spin_lock(&h->lock);
     bool caps = h->keyboard && key_report(h, report, data, len, at);
     if (h->mouse) mouse_report(h, report, data, len, at);
+    return caps;
+}
+
+/* A packet of the interrupt endpoint, after those kept of its report. A short packet ends the report
+   (HID 8.4), and so does its size in the descriptor, of a report that need not end short; what lies
+   beyond that size in the packet is padding. A report of no known size is all that came. After a
+   recovery dropped the transfers (no data) a report begun is lost. */
+static void hid_report(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len, uint64_t at) {
+    (void)d;
+    struct hid *h = ctx;
+    bool caps = false;
+    uint64_t f = spin_lock(&h->lock);
+    if (data) {
+        memcpy(h->partial + h->partial_len, data, len);
+        unsigned have = h->partial_len + len;
+        unsigned want = have ? h->report_bytes[h->ids ? h->partial[0] : 0] : 0;
+        if (have && (!want || have >= want || len < h->packet)) {
+            caps = report_whole(h, h->partial, want && want < have ? want : have, at);
+            have = 0;
+        }
+        h->partial_len = have;
+    } else {
+        h->partial_len = 0;
+    }
     spin_unlock(&h->lock, f);
     if (caps) caps_toggled();
 }
@@ -273,25 +335,40 @@ static void hid_report(struct usb_device *d, void *ctx, const uint8_t *data, uns
 struct globals { /* the global items Push and Pop save */
     uint16_t page;
     int32_t lmin, lmax;
-    uint16_t size, count;
+    uint32_t size, count;
     uint8_t report;
 };
 
-struct parse {
-    struct globals g, stack[4];
-    int sp;
-    uint32_t usages[16]; /* full page << 16 | id, resolved when each Usage item is read */
-    int nusages;
-    uint32_t umin, umax;
-    bool have_range;
-    uint32_t app; /* usage of the enclosing top-level application collection, 0 outside one */
-    int depth, app_depth;
-    uint16_t offset[256];
+/* A Usage item as it was written: 4 bytes name their page, others take the Usage Page in force at the
+   main item that uses them (HID 6.2.2.8). */
+struct usage {
+    uint32_t value;
+    bool extended;
 };
 
+struct parse {
+    struct globals g, *stack;
+    size_t sp, stack_room;
+    struct usage *usages;
+    size_t nusages, usages_room;
+    struct usage umin, umax;
+    bool have_range;
+    bool in_delimiter, delimiter_used; /* of a Delimiter's aliases the first is used (HID 6.2.2.8) */
+    uint32_t app; /* usage of the enclosing top-level application collection, 0 outside one */
+    int depth, app_depth;
+    uint32_t offset[256], out_offset[256]; /* bits of each report so far */
+};
+
+static uint32_t usage_full(const struct parse *p, struct usage u) {
+    return u.extended ? u.value : (uint32_t)p->g.page << 16 | (uint16_t)u.value;
+}
+
 static uint32_t usage_at(struct parse *p, unsigned i) {
-    if (p->have_range) return p->umin + i <= p->umax ? p->umin + i : p->umax;
-    if (p->nusages) return p->usages[i < (unsigned)p->nusages ? i : (unsigned)p->nusages - 1];
+    if (p->have_range) {
+        uint32_t lo = usage_full(p, p->umin), hi = usage_full(p, p->umax);
+        return lo + i <= hi ? lo + i : hi;
+    }
+    if (p->nusages) return usage_full(p, p->usages[i < p->nusages ? i : p->nusages - 1]);
     return 0;
 }
 
@@ -311,7 +388,23 @@ static void set_value(struct value *v, struct parse *p, unsigned bit, bool relat
 
 static void add_keyfield(struct hid *h, struct keyfield k) {
     if (k.usage_max > 255) k.usage_max = 255;
-    if (h->nkeys < 16 && k.usage_max >= k.usage_min) h->keys[h->nkeys++] = k;
+    if (k.usage_max < k.usage_min) return;
+    struct keyfield *at = kappend(&h->keys, &h->nkeys, &h->keys_room, sizeof *h->keys);
+    if (at) *at = k;
+}
+
+/* An Output item: where its Caps Lock LED is, in the report that has one. */
+static void output_item(struct hid *h, struct parse *p, uint32_t flags) {
+    unsigned base = p->out_offset[p->g.report];
+    p->out_offset[p->g.report] += p->g.size * p->g.count;
+    if (flags & 1 || !(flags & 2) || !keyboard_app(p->app) || h->leds) return;
+    for (unsigned i = 0; i < p->g.count; i++) {
+        if (usage_at(p, i) != 0x00080002) continue;
+        h->leds = true;
+        h->led_report = p->g.report;
+        h->led_bit = base + i * p->g.size;
+        return;
+    }
 }
 
 static void input_item(struct hid *h, struct parse *p, uint32_t flags) {
@@ -326,13 +419,13 @@ static void input_item(struct hid *h, struct parse *p, uint32_t flags) {
         if (!variable) { /* an array of key codes */
             k.bit = base;
             k.count = p->g.count;
-            k.usage_min = p->have_range ? p->umin & 0xFFFF : first & 0xFFFF;
-            k.usage_max = p->have_range ? p->umax & 0xFFFF : (uint16_t)(k.usage_min + (p->g.lmax - p->g.lmin));
+            k.usage_min = first & 0xFFFF;
+            k.usage_max = p->have_range ? usage_full(p, p->umax) & 0xFFFF : (uint16_t)(k.usage_min + (p->g.lmax - p->g.lmin));
             add_keyfield(h, k);
             return;
         }
         /* one bit per key; a usage list need not be contiguous, so each run becomes its own field */
-        unsigned n = p->have_range ? p->g.count : (p->g.count < (unsigned)p->nusages ? p->g.count : (unsigned)p->nusages);
+        unsigned n = p->have_range ? p->g.count : (p->g.count < p->nusages ? p->g.count : (unsigned)p->nusages);
         for (unsigned i = 0; i < n;) {
             uint32_t u = usage_at(p, i);
             unsigned j = i + 1;
@@ -364,6 +457,7 @@ static bool parse_report_descriptor(struct hid *h, const uint8_t *d, unsigned le
     struct parse *p = kzalloc(sizeof *p);
     if (!p) return false;
     p->app_depth = -1;
+    bool fits = true;
     for (unsigned i = 0; i < len;) {
         uint8_t prefix = d[i];
         if (prefix == 0xFE) { /* long item */
@@ -382,21 +476,46 @@ static bool parse_report_descriptor(struct hid *h, const uint8_t *d, unsigned le
             case 0: p->g.page = (uint16_t)u; break;
             case 1: p->g.lmin = s; break;
             case 2: p->g.lmax = s; break;
-            case 7: p->g.size = (uint16_t)u; break;
+            case 7: p->g.size = u; break;
             case 8: p->g.report = (uint8_t)u; h->ids = true; break;
-            case 9: p->g.count = (uint16_t)u; break;
-            case 10: if (p->sp < 4) p->stack[p->sp++] = p->g; break;
+            case 9: p->g.count = u; break;
+            case 10: {
+                struct globals *top = kappend(&p->stack, &p->sp, &p->stack_room, sizeof *p->stack);
+                if (top) *top = p->g;
+                break;
+            }
             case 11: if (p->sp > 0) p->g = p->stack[--p->sp]; break;
             }
             if (tag == 2 && p->g.lmin >= 0 && p->g.lmax < p->g.lmin) p->g.lmax = (int32_t)u; /* unsigned maximum */
         } else if (type == 2) { /* local */
-            uint32_t full = size == 4 ? u : (uint32_t)p->g.page << 16 | (uint16_t)u;
-            if (tag == 0 && p->nusages < 16) p->usages[p->nusages++] = full;
-            else if (tag == 1) { p->umin = full; p->have_range = true; }
-            else if (tag == 2) { p->umax = full; p->have_range = true; }
+            struct usage us = {u, size == 4};
+            bool alias = p->in_delimiter && p->delimiter_used; /* not the first of the set */
+            if (tag == 0 && !alias) {
+                struct usage *at = kappend(&p->usages, &p->nusages, &p->usages_room, sizeof *p->usages);
+                if (at) *at = us;
+                p->delimiter_used = p->in_delimiter;
+            } else if (tag == 1 && !alias) {
+                p->umin = us;
+                p->have_range = true;
+            } else if (tag == 2 && !alias) {
+                p->umax = us;
+                p->have_range = true;
+                p->delimiter_used = p->in_delimiter;
+            } else if (tag == 10) {
+                p->in_delimiter = u == 1;
+                p->delimiter_used = false;
+            }
         } else if (type == 0) { /* main */
-            if (tag == 8) {
-                input_item(h, p, u);
+            if (tag == 8 || tag == 9) {
+                uint32_t have = (tag == 8 ? p->offset : p->out_offset)[p->g.report];
+                uint64_t bits = (uint64_t)p->g.size * p->g.count;
+                if (have + bits > REPORT_BITS_MOST) {
+                    fits = false;
+                    break;
+                }
+                /* an item of no bits has no field to read (6.2.2.7) */
+                if (bits && tag == 8) input_item(h, p, u);
+                else if (bits) output_item(h, p, u);
             } else if (tag == 10) { /* collection */
                 if (u == 1 && p->app_depth < 0) {
                     p->app = usage_at(p, 0);
@@ -409,26 +528,49 @@ static bool parse_report_descriptor(struct hid *h, const uint8_t *d, unsigned le
                     p->app = 0;
                     p->app_depth = -1;
                 }
-            } else if (tag == 9 && usage_at(p, 0) >> 16 == 0x08 && keyboard_app(p->app)) {
-                h->leds = true;
             }
             p->nusages = 0;
             p->have_range = false;
-            p->umin = p->umax = 0;
+            p->umin = p->umax = (struct usage){0};
         }
     }
+    for (unsigned r = 0; fits && r < 256; r++) {
+        unsigned bytes = (p->offset[r] + 7) / 8 + (h->ids ? 1u : 0);
+        if (!p->offset[r]) continue;
+        h->report_bytes[r] = (uint16_t)bytes;
+        if (bytes > h->longest) h->longest = bytes;
+    }
+    if (h->leds) h->led_len = (p->out_offset[h->led_report] + 7) / 8;
+    kfree(p->stack);
+    kfree(p->usages);
     kfree(p);
-    return true;
+    return fits;
+}
+
+/* What a report descriptor said is forgotten: it was refused, or the boot format takes over. */
+static void descriptor_forget(struct hid *h) {
+    kfree(h->keys);
+    h->keys = NULL;
+    h->nkeys = h->keys_room = 0;
+    h->x = h->y = h->wheel = (struct value){0};
+    memset(h->button, 0, sizeof h->button);
+    memset(h->report_bytes, 0, sizeof h->report_bytes);
+    h->ids = h->leds = false;
+    h->longest = 0;
 }
 
 /* the fixed boot keyboard format: modifier byte, reserved byte, six key codes */
 static void boot_keyboard(struct hid *h) {
     h->ids = false;
     h->keyboard = true;
-    h->nkeys = 2;
-    h->keys[0] = (struct keyfield){.variable = true, .bit = 0, .size = 1, .count = 8, .usage_min = 0xE0, .usage_max = 0xE7};
-    h->keys[1] = (struct keyfield){.variable = false, .bit = 16, .size = 8, .count = 6, .usage_min = 0, .usage_max = 255};
-    h->leds = true;
+    h->nkeys = 0;
+    add_keyfield(h, (struct keyfield){.variable = true, .bit = 0, .size = 1, .count = 8, .usage_min = 0xE0, .usage_max = 0xE7});
+    add_keyfield(h, (struct keyfield){.variable = false, .bit = 16, .size = 8, .count = 6, .usage_min = 0, .usage_max = 255});
+    h->longest = h->report_bytes[0] = 8;
+    h->leds = true; /* its LED report (HID B.1): one byte, bit 1 Caps Lock */
+    h->led_report = 0;
+    h->led_bit = 1;
+    h->led_len = 1;
 }
 
 /* On the worker, after the device's last report (usb_remove): its held keys and buttons let go. */
@@ -443,6 +585,9 @@ void usbhid_detach(struct usb_device *d) {
                 break;
             }
         spin_unlock(&hids_lock, f);
+        f = spin_lock(&h->lock);
+        h->repeat_usage = 0; /* or a repeat that is firing sets itself again */
+        spin_unlock(&h->lock, f);
         alarm_cancel(&h->repeat);
         uint64_t now = clock_now_ns();
         for (unsigned u = 0; u < 256; u++)
@@ -451,6 +596,8 @@ void usbhid_detach(struct usb_device *d) {
             struct mouse_event e = {.time_ns = now};
             input_mouse(&e);
         }
+        kfree(h->keys);
+        kfree(h->partial);
         kfree(h);
     }
 }
@@ -477,17 +624,19 @@ void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, 
         usb_control(d, 0x21, HID_SET_PROTOCOL, 0, h->interface, NULL, 0);
         boot_keyboard(h);
     } else {
-        uint8_t *rd = report_len && report_len <= 4096 ? kmalloc(report_len) : NULL;
+        uint8_t *rd = report_len ? kmalloc(report_len) : NULL;
         int got = rd ? usb_control(d, 0x81, USB_REQ_GET_DESCRIPTOR, 0x2200, h->interface, rd, report_len) : -1;
-        if (got > 0) parse_report_descriptor(h, rd, (unsigned)got);
+        if (got > 0 && !parse_report_descriptor(h, rd, (unsigned)got)) {
+            kprintf("usbhid: slot %u interface %u: its report descriptor is refused\n", d->slot, h->interface);
+            descriptor_forget(h);
+        }
         kfree(rd);
         h->mouse = h->x.present && h->y.present;
         h->keyboard = h->nkeys > 0;
         if (!h->mouse && boot && intf->protocol == 2) { /* boot mouse: buttons, X, Y */
             usb_control(d, 0x21, HID_SET_PROTOCOL, 0, h->interface, NULL, 0);
-            h->wheel = (struct value){0};
-            memset(h->button, 0, sizeof h->button);
-            h->ids = false;
+            descriptor_forget(h);
+            h->keyboard = false;
             for (int i = 0; i < 3; i++) h->button[i] = (struct value){.bit = i, .size = 1, .present = true};
             h->x = (struct value){.bit = 8, .size = 8, .min = -127, .max = 127, .present = true, .relative = true};
             h->y = (struct value){.bit = 16, .size = 8, .min = -127, .max = 127, .present = true, .relative = true};
@@ -498,6 +647,7 @@ void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, 
         if (!h->keyboard) h->nkeys = 0;
     }
     if (!h->keyboard && !h->mouse) {
+        kfree(h->keys);
         kfree(h);
         return;
     }
@@ -514,16 +664,26 @@ void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, 
     kprintf("usbhid: slot %u interface %u is a %s%s%s%s\n", d->slot, h->interface,
             h->keyboard ? "keyboard" : "", h->keyboard && h->mouse ? " and " : "",
             h->mouse ? (h->x.relative ? "mouse" : "absolute pointer") : "", h->wheel.present ? " with wheel" : "");
-    if (!usb_interrupt_start(d, ep, hid_report, h)) kprintf("usbhid: slot %u reports could not start\n", d->slot);
+    h->packet = usb_interrupt_length(d, ep, 1);
+    /* room for a report all but whole, and the packet that ends it */
+    h->partial = h->packet ? kmalloc(h->longest + h->packet) : NULL;
+    if (!h->partial || !usb_interrupt_start(d, ep, 1, hid_report, h))
+        kprintf("usbhid: slot %u reports could not start\n", d->slot);
 }
 
-/* On the worker: the device's keyboards light caps lock as it is now (the boot LED report). */
+/* On the worker: the device's keyboards light caps lock as it is now: Set_Report of its output
+   report (HID 7.2.2), led_bit in the data, after the ID if the report has one. */
 void usbhid_work(struct usb_device *d) {
     for (struct hid *h = d->hid; h; h = h->sibling) {
         unsigned gen = __atomic_load_n(&leds_gen, __ATOMIC_ACQUIRE);
-        if (!h->keyboard || !h->leds || h->ids || h->leds_seen == gen) continue;
+        if (!h->keyboard || !h->leds || h->leds_seen == gen) continue;
         h->leds_seen = gen;
-        uint8_t leds = __atomic_load_n(&caps_lock, __ATOMIC_ACQUIRE) ? 2 : 0;
-        usb_control(h->dev, 0x21, HID_SET_REPORT, 0x0200, h->interface, &leds, 1);
+        unsigned at = h->ids ? 1 : 0, len = at + h->led_len;
+        uint8_t *report = kzalloc(len);
+        if (!report) continue;
+        if (h->ids) report[0] = h->led_report;
+        if (__atomic_load_n(&caps_lock, __ATOMIC_ACQUIRE)) report[at + (h->led_bit >> 3)] |= (uint8_t)(1u << (h->led_bit & 7));
+        usb_control(h->dev, 0x21, HID_SET_REPORT, (uint16_t)(0x0200 | h->led_report), h->interface, report, (uint16_t)len);
+        kfree(report);
     }
 }

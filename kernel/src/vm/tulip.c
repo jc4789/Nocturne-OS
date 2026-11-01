@@ -118,6 +118,7 @@ bool tulip_probe(void) {
     if (!d) d = pci_find(0x1011, 0x0019);            /* 21143: QEMU */
     if (!d || !(d->bar[0] & 1)) return false;
     pci_enable_busmaster(d);
+    pci_enable_io(d);
     iobase = (uint16_t)(d->bar[0] & ~3u);
 
     csr_wr(0, 1); /* software reset */

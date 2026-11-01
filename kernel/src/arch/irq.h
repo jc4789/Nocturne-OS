@@ -83,6 +83,9 @@ struct irq_target irq_target(const struct irq *irq);
    put the new one in place (irq_msi_message, irq_target say the new target by then); false
    when it could not, the old one then kept. */
 void irq_msi_writer(struct irq *irq, bool (*write)(struct irq *irq, void *writer), void *writer);
+/* The writer puts the message in place again where it stands, its source having forgotten it. False
+   for one without a writer, and when it could not. */
+bool irq_msi_rewrite(struct irq *irq);
 /* The frame the interrupt handled on this CPU came in on (the profiler's sample), NULL outside
    a handler. */
 struct regs *irq_regs(void);
