@@ -9,7 +9,7 @@
 #include <stdio.h>
 struct request {struct request *next;struct nmsw_command c;uint8_t *bytes;uint64_t epoch;};
 struct slot_state {
-    uint64_t revision,epoch;uint32_t parsing;int64_t group_end;
+    uint64_t revision,timeline,epoch;uint32_t parsing;int64_t group_end;
     struct nmedia_info info;bool metadata,used,key_waiting;
     size_t count,capacity;struct nmedia_time_range *ranges;
 };
@@ -138,7 +138,7 @@ static void completed(nmedia_mse_worker *w){
         if(m->count>s->capacity){struct nmedia_time_range *v=nmedia_ff_realloc(s->ranges,(size_t)m->count*sizeof *v);if(!v){stop(w,"MSE range allocation failed");return;}s->ranges=v;s->capacity=m->count;}
         s->metadata=a->audio||a->video;s->info=(struct nmedia_info){.audio=a->audio,.video=a->video,.channels=(int)a->channels,.sample_rate=(int)a->sample_rate,.width=a->width,.height=a->height,.duration_ms=a->duration};
         strlcpy(s->info.audio_codec,a->audio_codec,32);strlcpy(s->info.video_codec,a->video_codec,32);strlcpy(s->info.container,a->container,32);
-        s->revision=m->revision;s->parsing=m->parsing;s->key_waiting=!!m->key_waiting;s->group_end=m->group_end;s->count=m->count;if(s->count)memcpy(s->ranges,ranges,s->count*sizeof *ranges);}
+        s->revision=m->revision;s->timeline=m->timeline;s->parsing=m->parsing;s->key_waiting=!!m->key_waiting;s->group_end=m->group_end;s->count=m->count;if(s->count)memcpy(s->ranges,ranges,s->count*sizeof *ranges);}
     if(r->kind==NMEDIA_ERROR){strlcpy(w->error,r->error[0]?r->error:"native MSE worker failed",sizeof w->error);w->quota_error=r->quota_error;}
     else if(r->op==NMSW_ABORT||w->quota_error){w->error[0]=0;w->quota_error=false;if(w->output.kind==NMEDIA_ERROR)w->output_ready=false;}
     if(w->output_ready&&nmedia_mse_worker_revision(w,w->output_slot)!=w->output_revision)w->output_ready=false;
@@ -347,6 +347,7 @@ int64_t nmedia_mse_worker_deadline(uint64_t now){
 bool nmedia_mse_worker_seeking(const nmedia_mse_worker *w){if(!w)return false;for(struct request *r=w->head;r;r=r->next)if(r->c.op==NMSW_SEEK)return true;return false;}
 bool nmedia_mse_worker_key_waiting(const nmedia_mse_worker *w){if(w)for(size_t i=0;i<w->slot_count;i++)if(w->slots[i].used&&w->slots[i].key_waiting)return true;return false;}
 uint64_t nmedia_mse_worker_revision(const nmedia_mse_worker *w,unsigned slot){return w&&slot<w->slot_count?(w->slots[slot].epoch<<32)^w->slots[slot].revision:0;}
+uint64_t nmedia_mse_worker_timeline(const nmedia_mse_worker *w,unsigned slot){return w&&slot<w->slot_count?(w->slots[slot].epoch<<32)^w->slots[slot].timeline:0;}
 unsigned nmedia_mse_worker_output_slot(const nmedia_mse_worker *w){return w?w->taken_slot:0;}
 bool nmedia_mse_worker_parsing(const nmedia_mse_worker *w,unsigned slot){return w&&slot<w->slot_count&&w->slots[slot].parsing;}
 int64_t nmedia_mse_worker_group_end(const nmedia_mse_worker *w,unsigned slot){return w&&slot<w->slot_count?w->slots[slot].group_end:0;}

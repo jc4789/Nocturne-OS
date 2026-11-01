@@ -114,7 +114,7 @@ static bool metadata(struct child_slot *slots,size_t count,struct nmsw_response 
         if(nmedia_mse_error(m)[0]){r->kind=NMEDIA_ERROR;r->payload_bytes=0;r->quota_error=nmedia_mse_quota_error(m);strlcpy(r->error,nmedia_mse_error(m),sizeof r->error);}
         if(!metadata_changed(&slots[i],force))continue;
         struct nmsw_metadata *record=(void *)(*storage+at);memset(record,0,sizeof *record);
-        record->slot=(uint32_t)i;record->revision=nmedia_mse_revision(m);record->parsing=nmedia_mse_parsing(m);record->group_end=nmedia_mse_group_end(m);record->key_waiting=nmedia_mse_key_waiting(m);
+        record->slot=(uint32_t)i;record->revision=nmedia_mse_revision(m);record->timeline=nmedia_mse_timeline(m);record->parsing=nmedia_mse_parsing(m);record->group_end=nmedia_mse_group_end(m);record->key_waiting=nmedia_mse_key_waiting(m);
         struct nmedia_time_range *ranges=(void *)(*storage+at+sizeof *record);record->count=(uint32_t)nmedia_mse_ranges(m,ranges,nmedia_mse_range_capacity(m));
         if(nmedia_mse_error(m)[0]){r->kind=NMEDIA_ERROR;r->payload_bytes=0;r->quota_error=nmedia_mse_quota_error(m);strlcpy(r->error,nmedia_mse_error(m),sizeof r->error);}
         at+=sizeof *record+(size_t)record->count*sizeof *ranges;r->metadata_count++;
@@ -181,8 +181,16 @@ int main(void){
             else ok=m&&nmedia_mse_change_type(m,(char *)bytes);
             if(ok&&c.op==NMSW_ADD&&!nmedia_mse_keys(m,keys,key_bytes))ok=false;
             if(revision!=nmedia_mse_revision(m))if(slot<count)slots[slot].pending.kind=0;
-        }else if(c.op==NMSW_APPEND){uint64_t revision=nmedia_mse_revision(m);ok=nmedia_mse_append_take(m,bytes,c.bytes,c.offset,c.start,c.end,c.flags);bytes=NULL;if(revision!=nmedia_mse_revision(m)){nmedia_mse_seek(m,c.current);if(slot<count)slots[slot].pending.kind=0;}}
-        else if(c.op==NMSW_REMOVE){uint64_t revision=nmedia_mse_revision(m);ok=m&&nmedia_mse_remove(m,c.start,c.end);if(revision!=nmedia_mse_revision(m)){nmedia_mse_seek(m,c.current);if(slot<count)slots[slot].pending.kind=0;}}
+        }else if(c.op==NMSW_APPEND){
+            /* A video decoder drained and fed again needs a key frame. Sound goes on with the next packet. */
+            uint64_t revision=nmedia_mse_revision(m),timeline=nmedia_mse_timeline(m);ok=nmedia_mse_append_take(m,bytes,c.bytes,c.offset,c.start,c.end,c.flags);bytes=NULL;
+            if(revision!=nmedia_mse_revision(m)){
+                const struct nmedia_info *after=nmedia_mse_info(m);
+                if(timeline!=nmedia_mse_timeline(m)||!after||after->video)nmedia_mse_seek(m,c.current);
+                if(slot<count)slots[slot].pending.kind=0;
+            }
+        }
+        else if(c.op==NMSW_REMOVE){uint64_t revision=nmedia_mse_revision(m);ok=m&&nmedia_mse_remove(m,c.start,c.end,c.current);if(revision!=nmedia_mse_revision(m)){nmedia_mse_seek(m,c.current);if(slot<count)slots[slot].pending.kind=0;}}
         else if(c.op==NMSW_ABORT){if(m){nmedia_mse_abort(m);if(nmedia_mse_info(m))nmedia_mse_seek(m,c.current);}if(slot<count)slots[slot].pending.kind=0;}
         else if(c.op==NMSW_DROP){const struct nmedia_info *info=nmedia_mse_info(m);if(info&&info->video){video_delivered=false;video.horizon_valid=false;}nmedia_mse_close(m);if(slot<count)slots[slot].buffer=NULL;m=NULL;if(slot<count)slots[slot].pending.kind=0;}
         else if(c.op==NMSW_END){for(size_t i=0;i<count;i++)if(slots[i].buffer){uint64_t revision=nmedia_mse_revision(slots[i].buffer);if(!nmedia_mse_end(slots[i].buffer,c.flags)){m=slots[i].buffer;ok=false;break;}if(revision!=nmedia_mse_revision(slots[i].buffer)||(!c.flags&&slots[i].pending.kind==NMEDIA_END))slots[i].pending.kind=0;}}

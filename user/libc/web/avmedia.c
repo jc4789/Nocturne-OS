@@ -19,7 +19,7 @@
 #include <math.h>
 #include <limits.h>
 #include <stddef.h>
-struct web_mse_slot {uint32_t id;bool used,audio_owner;uint64_t revision_seen;};
+struct web_mse_slot {uint32_t id;bool used,audio_owner;uint64_t revision_seen,timeline_seen;};
 struct caption_span {char *text,*ruby;uint32_t flags,color;};
 struct caption_cue {
     struct caption_span *spans;size_t count;
@@ -427,7 +427,8 @@ static bool audio_open(struct web_avmedia *s) {
     s->sink = n_audio_open();
     struct n_audio_status probe;
     if (s->sink < 0 || sink_status(s,&probe)<0) { close_audio(s);strlcpy(s->error,"native audio output unavailable",sizeof s->error);return false; }
-    s->clock_hold=true;s->clock_hold_at=0;s->clock_hold_frame=s->base_ms*(double)(SOUND_RATE/1000);s->clock_hold_since=n_clock_monotonic();
+    /* A report older than this stream is about other sound. */
+    s->clock_hold=true;s->clock_hold_since=s->clock_hold_at=n_clock_monotonic();s->clock_hold_frame=s->base_ms*(double)(SOUND_RATE/1000);
     s->error[0]=0;return true;
 }
 static void range_suspend(struct web_avmedia *s,uint64_t now) {
@@ -1104,12 +1105,14 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
             s->mse_duration=highest/1000.0;s->mse_eos_duration=true;
         }
         for(size_t i=0;i<s->mse_count;i++){
-            const struct nmedia_info *info=nmedia_mse_worker_info(s->mse_worker,(unsigned)i);uint64_t revision=nmedia_mse_worker_revision(s->mse_worker,(unsigned)i);
+            const struct nmedia_info *info=nmedia_mse_worker_info(s->mse_worker,(unsigned)i);uint64_t revision=nmedia_mse_worker_revision(s->mse_worker,(unsigned)i),timeline=nmedia_mse_worker_timeline(s->mse_worker,(unsigned)i);
             if(revision!=s->mse[i].revision_seen){
                 if(s->ahead.kind&&s->ahead_slot==i&&s->ahead_revision!=revision)clear_ahead(s);
-                if(s->pending.kind&&s->mse_pending_slot==i&&s->mse_pending_revision!=revision){s->pending.kind=0;s->audio_at=0;}
-                if(s->mse[i].audio_owner||(info&&info->audio)){s->base_ms=current(s,now);s->started=now;close_audio(s);if(s->playing&&!s->mse_seeking&&!audio_open(s))s->playing=false;}
-                s->mse[i].revision_seen=revision;
+                /* Sound whose place did not move plays on, with what the decoder gave before. */
+                bool moved=timeline!=s->mse[i].timeline_seen;
+                if(s->pending.kind&&s->mse_pending_slot==i&&s->mse_pending_revision!=revision&&(moved||s->pending.kind!=NMEDIA_AUDIO)){s->pending.kind=0;s->audio_at=0;}
+                if(moved&&(s->mse[i].audio_owner||(info&&info->audio))){s->base_ms=current(s,now);s->started=now;close_audio(s);if(s->playing&&!s->mse_seeking&&!audio_open(s))s->playing=false;}
+                s->mse[i].revision_seen=revision;s->mse[i].timeline_seen=timeline;
             }s->mse[i].audio_owner=info&&info->audio;
         }
         mse_metadata_ready(s);
