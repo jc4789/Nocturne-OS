@@ -3,7 +3,7 @@
 #include <stdint.h>
 #define PACE_TAPS 8
 #define PACE_PHASE_BITS 6
-static const int16_t pace_filter[65][8] = {
+static const int32_t pace_filter[65][8] = {
     {0, 0, 0, 32768, 0, 0, 0, 0},
     {-38, 139, -435, 32758, 453, -144, 40, -5},
     {-75, 273, -853, 32720, 924, -293, 82, -10},

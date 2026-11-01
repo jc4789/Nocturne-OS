@@ -323,10 +323,10 @@ static void pace_report(uint64_t given, uint64_t heard, uint64_t at) {
    its two middle ones. */
 static void pace_frame(int32_t *to, const int32_t *x, uint32_t position) {
     uint32_t phase = position >> (32 - PACE_PHASE_BITS), part = (position >> (32 - PACE_PHASE_BITS - 15)) & 0x7fff;
-    const int16_t *a = pace_filter[phase], *b = pace_filter[phase + 1];
+    const int32_t *a = pace_filter[phase], *b = pace_filter[phase + 1];
     int64_t left = 0, right = 0;
     for (int m = 0; m < PACE_TAPS; m++) {
-        int64_t c = a[m] + (((int32_t)(b[m] - a[m]) * (int32_t)part) >> 15);
+        int64_t c = a[m] + (((int64_t)(b[m] - a[m]) * part) >> 15);
         left += c * x[m * 2];
         right += c * x[m * 2 + 1];
     }
