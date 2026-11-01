@@ -1,11 +1,14 @@
 /* USB HID keyboards and pointing devices (Device Class Definition for HID 1.11, HID Usage Tables).
  * Report descriptors are parsed so wheels, extra buttons, tablets and non-boot keyboards work;
- * keys are fed to the input layer as scancode set 1 like the PS/2 and Hyper-V keyboards. */
+ * keys are fed to the input layer as scancode set 1 like the Hyper-V keyboard. A report goes to
+ * the input layer from the drain that took its completion (dev/usb.h), with that moment. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/spin.h"
 #include "dev/input.h"
 #include "dev/usb.h"
 #include "mm/heap.h"
+#include "sys/alarm.h"
 #include "sys/clock.h"
 
 #define HID_GET_REPORT_DESC 0x06
@@ -30,9 +33,13 @@ struct keyfield {
     uint16_t usage_min, usage_max;
 };
 
+/* One HID interface. What its reports change (down, repeat, buttons) is under lock, between its
+   reports and its key repeat alarm; the rest is set at attach and stays. */
 struct hid {
-    struct hid *next;
+    struct hid *next;     /* in hids */
+    struct hid *sibling;  /* the device's other HID interfaces (its worker's) */
     struct usb_device *dev;
+    struct spinlock lock;
     uint8_t interface;
     bool ids;             /* reports start with a report ID byte */
     bool keyboard, mouse;
@@ -42,16 +49,20 @@ struct hid {
     uint32_t down[8];     /* usages currently pressed */
     uint16_t repeat_usage;
     uint64_t repeat_at;
+    struct alarm repeat;  /* the held key's next repeat */
     bool leds;            /* has a boot LED output report */
+    unsigned leds_seen;   /* the leds_gen its lights show (its worker's) */
     /* pointer */
     struct value x, y, wheel, button[8];
     uint8_t buttons;
 };
 
-/* Everything in this file runs on the usb thread (dev/usb.h): the list, the lock keys' state and
- * each device's state are its alone. The input layer takes its own lock. */
+/* Every HID interface, under hids_lock: a caps lock press on one keyboard asks every keyboard's
+   worker to light it. caps_lock and leds_gen are atomic. */
+static struct spinlock hids_lock;
 static struct hid *hids;
-static bool caps_lock, leds_dirty;
+static uint8_t caps_lock;
+static unsigned leds_gen;
 
 /* HID usage (keyboard page) to scancode set 1; 0xE0xx marks the extended prefix */
 static const uint16_t usage_set1[256] = {
@@ -68,10 +79,10 @@ static const uint16_t usage_set1[256] = {
     [0xE0] = 0x1D, 0x2A, 0x38, 0xE05B, 0xE01D, 0x36, 0xE038, 0xE05C,
 };
 
-static void send_usage(uint16_t usage, bool pressed) {
+static void send_usage(uint16_t usage, bool pressed, uint64_t at) {
     uint16_t sc = usage < 256 ? usage_set1[usage] : 0;
     if (!sc) return;
-    input_key_set1((uint8_t)((sc & 0x7F) | (pressed ? 0 : 0x80)), sc >> 8); /* one key, its 0xE0 with it */
+    input_key_set1((uint8_t)((sc & 0x7F) | (pressed ? 0 : 0x80)), sc >> 8, at); /* one key, its 0xE0 with it */
 }
 
 static bool is_down(const uint32_t *set, unsigned u) { return set[u >> 5] & (1u << (u & 31)); }
@@ -95,7 +106,23 @@ static int32_t signed_at(const uint8_t *data, unsigned len, unsigned bit, unsign
 
 /* ---- keyboard ---- */
 
-static void key_report(struct hid *h, uint8_t report, const uint8_t *data, unsigned len) {
+/* The held key repeats while nothing newer is pressed and it is not let go. */
+static void repeat_fire(struct alarm *a, struct regs *r) {
+    (void)r;
+    struct hid *h = (struct hid *)((char *)a - offsetof(struct hid, repeat));
+    spin_take(&h->lock);
+    uint64_t now = clock_now_ns();
+    if (h->repeat_usage && now >= h->repeat_at) {
+        send_usage(h->repeat_usage, true, now);
+        h->repeat_at += REPEAT_RATE;
+        if (h->repeat_at <= now) h->repeat_at = now + REPEAT_RATE;
+    }
+    if (h->repeat_usage) alarm_set(a, h->repeat_at);
+    spin_give(&h->lock);
+}
+
+/* h->lock held. True when it pressed caps lock. */
+static bool key_report(struct hid *h, uint8_t report, const uint8_t *data, unsigned len, uint64_t now) {
     uint32_t now_down[8], covered[8] = {0};
     memcpy(now_down, h->down, sizeof now_down);
     bool any = false;
@@ -105,7 +132,7 @@ static void key_report(struct hid *h, uint8_t report, const uint8_t *data, unsig
         any = true;
         for (unsigned u = k->usage_min; u <= k->usage_max && u < 256; u++) covered[u >> 5] |= 1u << (u & 31);
     }
-    if (!any) return;
+    if (!any) return false;
     for (int w = 0; w < 8; w++) now_down[w] &= ~covered[w];
     uint32_t bitmap[8] = {0}; /* usages the variable (bitmap) fields of this report decide */
     for (int i = 0; i < h->nkeys; i++) {
@@ -142,30 +169,39 @@ static void key_report(struct hid *h, uint8_t report, const uint8_t *data, unsig
     /* a modifier pressed in the same report as a key applies to it, and one released in the same
      * report as a key still applied to it: modifier presses first, then key releases and key
      * presses, then modifier releases */
-    uint64_t now = clock_now_ns();
+    bool caps = false;
     for (unsigned u = 0xE0; u < 0xE8; u++)
-        if (!is_down(h->down, u) && is_down(now_down, u)) send_usage(u, true);
+        if (!is_down(h->down, u) && is_down(now_down, u)) send_usage(u, true, now);
     for (unsigned u = 0; u < 256; u++)
         if (u < 0xE0 || u >= 0xE8)
             if (is_down(h->down, u) && !is_down(now_down, u)) {
-                send_usage(u, false);
+                send_usage(u, false, now);
                 if (u == h->repeat_usage) h->repeat_usage = 0;
             }
     for (unsigned u = 0; u < 256; u++)
         if ((u < 0xE0 || u >= 0xE8) && !is_down(h->down, u) && is_down(now_down, u)) {
-            send_usage(u, true);
-            if (u == 0x39) {
-                caps_lock = !caps_lock;
-                leds_dirty = true;
-            }
+            send_usage(u, true, now);
+            if (u == 0x39) caps = true;
             if (u < 0xE0 && u != 0x39 && u != 0x53 && u != 0x47) {
                 h->repeat_usage = u;
                 h->repeat_at = now + REPEAT_DELAY;
+                alarm_set(&h->repeat, h->repeat_at);
             }
         }
     for (unsigned u = 0xE0; u < 0xE8; u++)
-        if (is_down(h->down, u) && !is_down(now_down, u)) send_usage(u, false);
+        if (is_down(h->down, u) && !is_down(now_down, u)) send_usage(u, false, now);
     memcpy(h->down, now_down, sizeof now_down);
+    return caps;
+}
+
+/* Caps lock changed: every keyboard's worker lights it (usbhid_work). */
+static void caps_toggled(void) {
+    __atomic_xor_fetch(&caps_lock, 1, __ATOMIC_ACQ_REL);
+    __atomic_fetch_add(&leds_gen, 1, __ATOMIC_RELEASE);
+    uint64_t f = spin_lock(&hids_lock);
+    for (struct hid *h = hids; h; h = h->next)
+        if (h->keyboard && h->leds && !h->ids) usb_note_work(h->dev);
+    spin_unlock(&hids_lock, f);
 }
 
 /* ---- pointer ---- */
@@ -183,8 +219,8 @@ static int scale_abs(const struct value *v, int32_t raw) {
 
 /* Buttons, motion and wheel may each come in a report of their own (HID 1.11 5.6): a report
  * updates what it carries, and buttons it does not carry keep their last state. */
-static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, unsigned len) {
-    struct mouse_event e = {0};
+static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, unsigned len, uint64_t at) {
+    struct mouse_event e = {.time_ns = at};
     bool any = false;
     uint8_t buttons = h->buttons;
     for (int i = 0; i < 8; i++) {
@@ -216,7 +252,7 @@ static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, uns
     input_mouse(&e);
 }
 
-static void hid_report(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len) {
+static void hid_report(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len, uint64_t at) {
     (void)d;
     struct hid *h = ctx;
     uint8_t report = 0;
@@ -225,8 +261,11 @@ static void hid_report(struct usb_device *d, void *ctx, const uint8_t *data, uns
         report = *data++;
         len--;
     }
-    if (h->keyboard) key_report(h, report, data, len);
-    if (h->mouse) mouse_report(h, report, data, len);
+    uint64_t f = spin_lock(&h->lock);
+    bool caps = h->keyboard && key_report(h, report, data, len, at);
+    if (h->mouse) mouse_report(h, report, data, len, at);
+    spin_unlock(&h->lock, f);
+    if (caps) caps_toggled();
 }
 
 /* ---- report descriptors ---- */
@@ -392,20 +431,26 @@ static void boot_keyboard(struct hid *h) {
     h->leds = true;
 }
 
+/* On the worker, after the device's last report (usb_remove): its held keys and buttons let go. */
 void usbhid_detach(struct usb_device *d) {
-    for (struct hid **pp = &hids; *pp;) {
-        struct hid *h = *pp;
-        if (h->dev != d) {
-            pp = &h->next;
-            continue;
-        }
+    while (d->hid) {
+        struct hid *h = d->hid;
+        d->hid = h->sibling;
+        uint64_t f = spin_lock(&hids_lock);
+        for (struct hid **pp = &hids; *pp; pp = &(*pp)->next)
+            if (*pp == h) {
+                *pp = h->next;
+                break;
+            }
+        spin_unlock(&hids_lock, f);
+        alarm_cancel(&h->repeat);
+        uint64_t now = clock_now_ns();
         for (unsigned u = 0; u < 256; u++)
-            if (is_down(h->down, u)) send_usage(u, false);
+            if (is_down(h->down, u)) send_usage(u, false, now);
         if (h->mouse && h->buttons) {
-            struct mouse_event e = {0};
+            struct mouse_event e = {.time_ns = now};
             input_mouse(&e);
         }
-        *pp = h->next;
         kfree(h);
     }
 }
@@ -417,6 +462,7 @@ void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, 
     struct hid *h = kzalloc(sizeof *h);
     if (!h) return;
     h->dev = d;
+    alarm_init(&h->repeat, repeat_fire);
     h->interface = intf->number;
     bool boot = intf->subcls == 1;
     unsigned report_len = 0;
@@ -456,32 +502,28 @@ void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, 
         return;
     }
     usb_control(d, 0x21, HID_SET_IDLE, 0, h->interface, NULL, 0); /* report changes only */
+    h->leds_seen = __atomic_load_n(&leds_gen, __ATOMIC_ACQUIRE) - 1; /* its lights set on the worker's next look */
+    h->sibling = d->hid;
+    d->hid = h;
+    uint64_t f = spin_lock(&hids_lock);
     h->next = hids;
     hids = h;
+    spin_unlock(&hids_lock, f);
     if (h->mouse) input_mouse_attach();
-    if (h->keyboard) leds_dirty = true;
+    if (h->keyboard) usb_note_work(d);
     kprintf("usbhid: slot %u interface %u is a %s%s%s%s\n", d->slot, h->interface,
             h->keyboard ? "keyboard" : "", h->keyboard && h->mouse ? " and " : "",
             h->mouse ? (h->x.relative ? "mouse" : "absolute pointer") : "", h->wheel.present ? " with wheel" : "");
     if (!usb_interrupt_start(d, ep, hid_report, h)) kprintf("usbhid: slot %u reports could not start\n", d->slot);
 }
 
-uint64_t usbhid_tick(uint64_t now) {
-    if (leds_dirty) {
-        leds_dirty = false;
-        uint8_t leds = caps_lock ? 2 : 0;
-        for (struct hid *h = hids; h; h = h->next)
-            if (h->keyboard && h->leds && !h->ids)
-                usb_control(h->dev, 0x21, HID_SET_REPORT, 0x0200, h->interface, &leds, 1);
+/* On the worker: the device's keyboards light caps lock as it is now (the boot LED report). */
+void usbhid_work(struct usb_device *d) {
+    for (struct hid *h = d->hid; h; h = h->sibling) {
+        unsigned gen = __atomic_load_n(&leds_gen, __ATOMIC_ACQUIRE);
+        if (!h->keyboard || !h->leds || h->ids || h->leds_seen == gen) continue;
+        h->leds_seen = gen;
+        uint8_t leds = __atomic_load_n(&caps_lock, __ATOMIC_ACQUIRE) ? 2 : 0;
+        usb_control(h->dev, 0x21, HID_SET_REPORT, 0x0200, h->interface, &leds, 1);
     }
-    uint64_t next = CLOCK_NEVER;
-    for (struct hid *h = hids; h; h = h->next) {
-        if (!h->repeat_usage) continue;
-        if (now >= h->repeat_at) {
-            send_usage(h->repeat_usage, true);
-            h->repeat_at = now + REPEAT_RATE;
-        }
-        next = MIN(next, h->repeat_at);
-    }
-    return next;
 }

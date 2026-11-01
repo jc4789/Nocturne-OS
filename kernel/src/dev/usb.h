@@ -1,7 +1,14 @@
 #pragma once
 /* USB devices as the host controller driver (xhci.c) hands them to the class drivers
- * (usbhid.c, usbhub.c, usbmsc.c, usbnet.c). Everything here runs on the single "usb" kernel
- * thread, except usb_run and usb_send, which other tasks use to reach it. */
+ * (usbhid.c, usbhub.c, usbmsc.c, usbnet.c).
+ *
+ * Contexts. Each controller has a worker thread: it enumerates, so a class driver's attach,
+ * detach and work functions run there, one device of that controller at a time, and may sleep.
+ * A report function (usb_report_fn) runs in the drain of the event ring that took the completion:
+ * an interrupt, or a polled controller's alarm, with interrupts off. It never sleeps, takes no
+ * mutex and keeps short; whatever needs the worker it asks for with usb_note_work. usb_control,
+ * usb_bulk and usb_clear_halt sleep until their transfer completes and run in any thread, on a
+ * device that is not removed meanwhile (its class driver's detach waits for its users). */
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -47,8 +54,9 @@ struct usb_device {
     uint32_t route;
     uint8_t tt_slot, tt_port; /* transaction translator for full/low speed behind a high-speed hub */
     struct usb_device_desc desc;
-    bool removed;
+    bool removed; /* atomic: set once by usb_remove, after which no report function runs for it */
     void *hub; /* usbhub.c state when the device is a hub */
+    void *hid; /* usbhid.c state: its HID interfaces */
     void *msc; /* usbmsc.c state */
     void *net; /* usbnet.c state */
 };
@@ -60,9 +68,11 @@ struct usb_ep_info {
     uint16_t esit;                               /* SuperSpeed bytes per service interval, 0 if none */
 };
 
-typedef void (*usb_report_fn)(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len);
+/* A transfer that finished, in the drain that took it (see above): its bytes, and `at`, the
+   moment on the monotonic clock (clock_now_ns) its completion was taken from the event ring. */
+typedef void (*usb_report_fn)(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len, uint64_t at);
 
-/* A control transfer; returns the bytes moved, or -1 (stall, error, timeout). */
+/* A control transfer; returns the bytes moved, or -1 (stall, error, timeout, removal). */
 int usb_control(struct usb_device *d, uint8_t type, uint8_t request, uint16_t value, uint16_t index,
                 void *buffer, uint16_t length);
 /* Keep the interrupt IN endpoint polled, handing each service interval's data to `fn`. The
@@ -77,41 +87,46 @@ bool usb_open_endpoints(struct usb_device *d, const struct usb_ep_info *eps, int
 /* Keep `count` (at most 16) transfers of `len` bytes queued on a bulk or interrupt IN endpoint,
  * handing each one that finishes to `fn` with the bytes that arrived. */
 bool usb_stream_start(struct usb_device *d, uint8_t address, unsigned len, unsigned count, usb_report_fn fn, void *ctx);
-/* One bulk transfer of up to 64 KiB, waited for; usb thread only. Returns the bytes moved,
- * USB_STALL, or -1 (error or timeout: the endpoint then needs usb_clear_halt too). */
+/* One bulk transfer of up to 64 KiB, waited for. One caller at a time on an endpoint (the class
+ * driver's lock). Returns the bytes moved, USB_STALL, or -1 (error, timeout or removal: the
+ * endpoint then needs usb_clear_halt too). */
 int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, unsigned timeout_ms);
 /* Reset a pipe on both sides: the controller's endpoint state and data toggle, then
  * CLEAR_FEATURE(ENDPOINT_HALT) on the device. */
 int usb_clear_halt(struct usb_device *d, uint8_t address);
 /* A bulk OUT endpoint for sending from other tasks: `slots` copies of up to `size` bytes in
- * flight; `done` runs on the usb thread whenever one finishes. */
+ * flight; `done` runs whenever one finishes (as a report function), and on the worker after a
+ * recovery dropped them all (data NULL). */
 bool usb_send_open(struct usb_device *d, uint8_t address, unsigned size, unsigned slots, usb_report_fn done, void *ctx);
 /* Queue `a` followed by `b` as one transfer (with the zero-length packet that ends a transfer
- * of whole packets). 1: queued, 0: every slot busy, -1: cannot send. Any task on any CPU, not from
- * interrupts, holding no spinlock: it takes the controller's send lock. The caller keeps the device
- * from being removed meanwhile (its class driver's detach waits for it). */
+ * of whole packets). 1: queued, 0: every slot busy, -1: cannot send. Any task on any CPU,
+ * holding no spinlock: it takes the endpoint's lock. The caller keeps the device from being
+ * removed meanwhile (its class driver's detach waits for it). */
 int usb_send(struct usb_device *d, uint8_t address, const void *a, unsigned alen, const void *b, unsigned blen);
-/* Run fn(arg) on the usb thread and wait for it: how other tasks reach a device. Sleeps. */
-void usb_run(void (*fn)(void *arg), void *arg);
 /* The devices there at start are still being looked at: their disks may yet appear. */
 bool usb_enumerating(void);
 
-/* hub support */
+/* hub support, on the worker */
 struct usb_device *usb_attach_child(struct usb_device *hub, unsigned port, unsigned speed);
 void usb_remove(struct usb_device *d);
 void usb_hub_info(struct usb_device *d, unsigned ports, unsigned think_time, bool multi_tt);
-void usb_note_work(void); /* a report callback queued work: run the class work functions soon */
+/* Any context: run the class work functions (usbhub_work, usbhid_work) for d on its worker soon. */
+void usb_note_work(struct usb_device *d);
+/* On the worker, for an event a report function notes (usb_note_work): read usb_kicks, look at
+   the condition, then usb_wait_kick sleeps unless a note came after that read, or until the
+   deadline. */
+uint64_t usb_kicks(struct usb_device *d);
+void usb_wait_kick(struct usb_device *d, uint64_t seen, uint64_t deadline);
 
 /* class drivers: does the interface belong to us (and which interrupt IN endpoint does it need)? */
 bool usbhid_claims(const struct usb_interface_desc *intf);
 void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, const uint8_t *extra,
                    unsigned extra_len, const struct usb_endpoint_desc *ep);
-bool usbhub_prepare(struct usb_device *d); /* reads the hub descriptor and calls usb_hub_info */
+void usbhid_work(struct usb_device *d);       /* the keyboard lights asked for */
+bool usbhub_prepare(struct usb_device *d);    /* reads the hub descriptor and calls usb_hub_info */
 void usbhub_attach(struct usb_device *d, const struct usb_endpoint_desc *ep);
-void usbhub_work(void);                    /* port changes noticed by the hub interrupt endpoints */
-bool usbhub_pending(void);                 /* port changes not handled yet */
-/* key repeat at now (clock_now_ns); returns the next deadline (CLOCK_NEVER = none) */
-uint64_t usbhid_tick(uint64_t now);
+void usbhub_work(struct usb_device *d);       /* port changes noticed by its interrupt endpoint */
+bool usbhub_pending(struct usb_device *d);    /* port changes not handled yet */
 /* class drivers that read the whole configuration: does one of its interfaces suit them, and
  * take the device once it is configured */
 bool usbmsc_claims(const struct usb_interface_desc *intf);

@@ -37,10 +37,11 @@ struct usbnet {
 };
 
 /* The adapter the stack uses. Sends come from the stack on any CPU (under its lock, one at a
-   time), arrival and removal from the usb thread: usbnet_lock (a mutex, as usb_send is a call
-   that may take the host controller's locks) guards adapter and its dev, so a removed device is
-   never sent to. Order: the stack's net_lock, then usbnet_lock, then the host controller's
-   locks; net_register is called without usbnet_lock. */
+   time), arrival and removal from the controllers' workers: usbnet_lock (a mutex, as usb_send is
+   a call that may take the host controller's locks) guards adapter and its dev, so a removed
+   device is never sent to. Order: the stack's net_lock, then usbnet_lock, then the host
+   controller's locks; net_register is called without usbnet_lock. Frames arrive and sends finish
+   in the drains (rx, notify, tx_done: dev/usb.h), which only queue and wake (net_rx). */
 static struct mutex usbnet_lock;
 static struct usbnet *adapter;
 static int usbnet_send(const void *frame, size_t len);
@@ -98,8 +99,8 @@ static int usbnet_send(const void *frame, size_t len) {
     return r;
 }
 
-static void tx_done(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len) {
-    (void)d, (void)ctx, (void)data, (void)len;
+static void tx_done(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len, uint64_t at) {
+    (void)d, (void)ctx, (void)data, (void)len, (void)at;
     net_rx_notify(); /* a sender held back by full slots may go on */
 }
 
@@ -127,16 +128,16 @@ static void ncm_input(struct usbnet *n, const uint8_t *b, unsigned len) {
     }
 }
 
-static void rx(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len) {
-    (void)d;
+static void rx(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len, uint64_t at) {
+    (void)d, (void)at;
     struct usbnet *n = ctx;
     if (!len) return; /* the zero-length packet after a frame of whole packets */
     if (n->ncm) ncm_input(n, data, len);
     else if (len >= 14) net_rx(data, len); /* ECM 3.4: no CRC */
 }
 
-static void notify(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len) {
-    (void)d;
+static void notify(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len, uint64_t at) {
+    (void)d, (void)at;
     struct usbnet *n = ctx;
     if (len < 8 || data[0] != 0xA1) return; /* the start of a notification (CDC 6.3) */
     if (data[1] == NOTIFY_NETWORK_CONNECTION) {

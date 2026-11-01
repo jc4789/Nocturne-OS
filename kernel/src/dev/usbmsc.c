@@ -1,7 +1,8 @@
 /* USB mass storage: the Bulk-Only Transport (USB MSC BOT 1.0) carrying SCSI commands, the set
  * the USB MSC bootability spec says every device answers plus READ CAPACITY(16) and the 16-byte
  * READ/WRITE for large disks. Each logical unit with a medium becomes a block device. Its reads
- * and writes run on the usb thread (usb_run); the block device outlives an unplug and then fails. */
+ * and writes run in the thread that asks for them, one command at a time under the device's
+ * lock; the block device outlives an unplug and then fails. */
 #include "kernel.h"
 #include "dev/blk.h"
 #include "dev/usb.h"
@@ -15,8 +16,15 @@
 #define MAX_LUNS 8
 #define BOT_FAILED (-1)      /* the command failed (CHECK CONDITION): sense data waits */
 #define BOT_BROKEN (-2)      /* the transport broke; reset recovery ran */
+/* How long a command's data and status may take: a medium error retried inside the device, or a
+   unit that spins up for START STOP UNIT (whose status comes once it has started). */
+#define CMD_MS 10000
+#define START_MS 30000
 
+/* A storage function. lock: one command at a time, and dev, which detach clears under it, so no
+   command runs on an unplugged device. */
 struct msc {
+    struct mutex lock;
     struct usb_device *dev; /* NULL once unplugged */
     uint8_t intf, in, out;
     uint32_t tag;
@@ -32,8 +40,8 @@ struct lun {
     uint64_t blocks;
 };
 
-static unsigned disks;
-static unsigned attached; /* storage devices plugged in now (they do not survive a sleep) */
+static unsigned disks;    /* atomic: the names given */
+static unsigned attached; /* atomic: storage devices plugged in now (they do not survive a sleep) */
 
 static void put32(uint8_t *p, uint32_t v) {
     for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
@@ -48,10 +56,12 @@ bool usbmsc_claims(const struct usb_interface_desc *intf) {
     return intf->cls == 8 && intf->protocol == 0x50 && intf->alternate == 0;
 }
 
+static bool gone(const struct usb_device *d) { return !d || __atomic_load_n(&d->removed, __ATOMIC_ACQUIRE); }
+
 /* BOT 5.3.4: Bulk-Only Mass Storage Reset, then clear both bulk endpoints' halts. */
 static void reset_recovery(struct msc *m) {
     struct usb_device *d = m->dev;
-    if (!d || d->removed) return;
+    if (gone(d)) return;
     usb_control(d, 0x21, 0xFF, 0, m->intf, NULL, 0);
     usb_clear_halt(d, m->in);
     usb_clear_halt(d, m->out);
@@ -61,7 +71,7 @@ static void reset_recovery(struct msc *m) {
 static int bot(struct msc *m, unsigned lun, const uint8_t *cdb, unsigned cdb_len, void *data, unsigned len, bool in,
                unsigned timeout) {
     struct usb_device *d = m->dev;
-    if (!d || d->removed) return BOT_BROKEN;
+    if (gone(d)) return BOT_BROKEN;
     uint8_t cbw[31] = {0}, csw[13];
     uint32_t tag = ++m->tag;
     put32(cbw, CBW_SIG);
@@ -102,8 +112,9 @@ static int bot(struct msc *m, unsigned lun, const uint8_t *cdb, unsigned cdb_len
 }
 
 /* A command, and on CHECK CONDITION the sense data right away (any other command loses it). */
-static int scsi(struct msc *m, unsigned lun, const uint8_t *cdb, unsigned cdb_len, void *data, unsigned len, bool in) {
-    int r = bot(m, lun, cdb, cdb_len, data, len, in, 10000);
+static int scsi_waiting(struct msc *m, unsigned lun, const uint8_t *cdb, unsigned cdb_len, void *data, unsigned len,
+                        bool in, unsigned timeout) {
+    int r = bot(m, lun, cdb, cdb_len, data, len, in, timeout);
     if (r != BOT_FAILED) return r;
     uint8_t sense[18] = {0}, rs[6] = {0x03, 0, 0, 0, sizeof sense, 0};
     m->sense_key = m->asc = m->ascq = 0;
@@ -115,23 +126,33 @@ static int scsi(struct msc *m, unsigned lun, const uint8_t *cdb, unsigned cdb_le
     return BOT_FAILED;
 }
 
-/* Wait for the unit to become ready (TEST UNIT READY). False when it has no medium or fails. */
+static int scsi(struct msc *m, unsigned lun, const uint8_t *cdb, unsigned cdb_len, void *data, unsigned len, bool in) {
+    return scsi_waiting(m, lun, cdb, cdb_len, data, len, in, CMD_MS);
+}
+
+/* Is the unit ready (TEST UNIT READY)? Each answer says what to wait for (SPC sense data):
+   a unit attention (power on, reset, medium changed) is reported once and cleared by the
+   sense data that reported it, so the unit is asked again at once; a unit not ready but becoming
+   so, or wanting its initializing command, gets START STOP UNIT with IMMED clear, whose status
+   comes once the unit has started (SBC), and is asked once more. No medium, a transport that
+   breaks twice, or a unit still not ready after its start is false. The attentions a unit has
+   to report end; a unit that keeps reporting them is let go at the start's deadline. */
 static bool unit_ready(struct msc *m, unsigned lun) {
     static const uint8_t tur[6] = {0}, start[6] = {0x1B, 0, 0, 0, 1, 0};
-    bool started = false;
-    for (int tries = 0; tries < 40; tries++) {
+    bool started = false, broke = false;
+    for (uint64_t deadline = clock_after(START_MS * NS_PER_MS); clock_now_ns() < deadline && !gone(m->dev);) {
         int r = scsi(m, lun, tur, 6, NULL, 0, false);
         if (r == 0) return true;
-        if (r == BOT_BROKEN && !m->dev) return false;
-        if (r == BOT_FAILED) {
-            if (m->sense_key == 6) continue; /* unit attention: power on, reset, medium changed */
-            if (m->sense_key == 2 && m->asc == 0x3A) return false; /* no medium */
-            if (m->sense_key == 2 && m->asc == 0x04 && m->ascq == 0x02 && !started) {
-                scsi(m, lun, start, 6, NULL, 0, false); /* "initializing command required": spin up */
-                started = true;
-            }
+        if (r == BOT_BROKEN) { /* reset recovery ran: once more */
+            if (broke) return false;
+            broke = true;
+            continue;
         }
-        sleep_until(clock_after(250 * NS_PER_MS));
+        if (r != BOT_FAILED) return false;
+        if (m->sense_key == 6) continue;
+        if (m->sense_key != 2 || m->asc != 0x04 || started) return false; /* 3A: no medium */
+        started = true;
+        if (scsi_waiting(m, lun, start, 6, NULL, 0, false, START_MS) < 0 && m->sense_key != 6) return false;
     }
     return false;
 }
@@ -186,57 +207,44 @@ static int transfer(void *ctx, bool write, uint64_t first, unsigned n, uint8_t *
     return -1;
 }
 
-struct io {
-    struct lun *l;
-    bool write;
-    uint64_t lba;
-    uint32_t count;
-    uint8_t *buf;
-    int result;
-};
-
 /* 512-byte sectors over the unit's logical blocks: whole blocks straight from and to the caller's
  * memory, the others through the bounce buffer. */
-static void do_io(void *arg) {
-    struct io *io = arg;
-    struct lun *l = io->l;
-    io->result = l->m->dev ? blk_by_blocks(&l->blk, io->write, io->lba, io->count, io->buf, l->m->bounce,
-                                           XFER / l->block, true, transfer, l)
-                           : -1;
+static int msc_io(struct lun *l, bool write, uint64_t lba, uint32_t count, uint8_t *buf) {
+    struct msc *m = l->m;
+    mutex_lock(&m->lock);
+    int r = m->dev ? blk_by_blocks(&l->blk, write, lba, count, buf, m->bounce, XFER / l->block, true, transfer, l) : -1;
+    mutex_unlock(&m->lock);
+    return r;
 }
 
 static int msc_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf) {
-    struct io io = {b->priv, false, lba, count, buf, -1};
-    usb_run(do_io, &io);
-    return io.result;
+    return msc_io(b->priv, false, lba, count, buf);
 }
 
 static int msc_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf) {
-    struct io io = {b->priv, true, lba, count, (uint8_t *)buf, -1};
-    usb_run(do_io, &io);
-    return io.result;
+    return msc_io(b->priv, true, lba, count, (uint8_t *)buf);
 }
 
 /* SYNCHRONIZE CACHE(10) over the whole unit (SBC). A unit without a write cache may refuse it
    (ILLEGAL REQUEST): then nothing was waiting. */
-static void do_flush(void *arg) {
-    struct io *io = arg;
+static int msc_flush(struct blkdev *b) {
     static const uint8_t cdb[10] = {0x35};
-    struct msc *m = io->l->m;
-    io->result = -1;
+    struct lun *l = b->priv;
+    struct msc *m = l->m;
+    int result = -1;
+    mutex_lock(&m->lock);
     /* a unit attention (a reset, the power) or a moment's trouble is tried again, like a read */
     for (int tries = 0; tries < 3 && m->dev; tries++) {
-        int r = scsi(m, io->l->lun, cdb, 10, NULL, 0, false);
-        if (r >= 0 || (r == BOT_FAILED && m->sense_key == 5)) { io->result = 0; return; } /* 5: no cache to flush */
+        int r = scsi(m, l->lun, cdb, 10, NULL, 0, false);
+        if (r >= 0 || (r == BOT_FAILED && m->sense_key == 5)) { /* 5: no cache to flush */
+            result = 0;
+            break;
+        }
         if (r == BOT_FAILED && m->sense_key != 6)
-            kprintf("usbmsc: %s flush failed (sense %x/%02x/%02x)\n", io->l->blk.name, m->sense_key, m->asc, m->ascq);
+            kprintf("usbmsc: %s flush failed (sense %x/%02x/%02x)\n", l->blk.name, m->sense_key, m->asc, m->ascq);
     }
-}
-
-static int msc_flush(struct blkdev *b) {
-    struct io io = {b->priv, false, 0, 0, NULL, -1};
-    usb_run(do_flush, &io);
-    return io.result;
+    mutex_unlock(&m->lock);
+    return result;
 }
 
 static void probe_lun(struct msc *m, unsigned lun) {
@@ -280,7 +288,7 @@ static void probe_lun(struct msc *m, unsigned lun) {
     l->lun = (uint8_t)lun;
     l->block = block;
     l->blocks = blocks;
-    ksnprintf(l->blk.name, sizeof l->blk.name, "usb%u", disks++);
+    ksnprintf(l->blk.name, sizeof l->blk.name, "usb%u", __atomic_fetch_add(&disks, 1, __ATOMIC_RELAXED));
     strlcpy(l->blk.model, model, sizeof l->blk.model);
     l->blk.sectors = blocks * (block / 512);
     l->blk.read = msc_read;
@@ -318,23 +326,27 @@ void usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
     m->in = eps[0].address;
     m->out = eps[1].address;
     d->msc = m;
-    attached++;
+    __atomic_fetch_add(&attached, 1, __ATOMIC_RELAXED);
     /* BOT 3.2: Get Max LUN; a device with one unit may stall it */
     uint8_t max = 0;
     if (usb_control(d, 0xA1, 0xFE, 0, m->intf, &max, 1) < 1) max = 0;
     if (max >= MAX_LUNS) max = MAX_LUNS - 1;
     kprintf("usbmsc: slot %u bulk-only storage, %u unit%s\n", d->slot, max + 1u, max ? "s" : "");
+    mutex_lock(&m->lock);
     for (unsigned lun = 0; lun <= max && m->dev; lun++) probe_lun(m, lun);
+    mutex_unlock(&m->lock);
 }
 
 /* The block devices stay registered (a mounted filesystem may still hold them); they fail from
- * now on. */
+ * now on. The command running ends first: usb_remove ended its transfers. */
 void usbmsc_detach(struct usb_device *d) {
     struct msc *m = d->msc;
     if (!m) return;
+    mutex_lock(&m->lock);
     m->dev = NULL;
+    mutex_unlock(&m->lock);
     d->msc = NULL;
-    attached--;
+    __atomic_fetch_sub(&attached, 1, __ATOMIC_RELAXED);
 }
 
-bool usbmsc_attached(void) { return attached > 0; }
+bool usbmsc_attached(void) { return __atomic_load_n(&attached, __ATOMIC_RELAXED) > 0; }

@@ -3,6 +3,7 @@
    its report descriptor to find the buttons, X, Y and wheel. */
 #include "kernel.h"
 #include "dev/input.h"
+#include "sys/clock.h"
 #include "vm/hv/vmbus.h"
 
 static const struct guid kbd_guid =
@@ -49,13 +50,13 @@ static void kbd_callback(struct vmbus_channel *ch) {
             kbd_answered = true;
         } else if (m->type == KBD_EVENT) {
             if (m->key.info & KBD_IS_UNICODE) { /* typed text (e.g. VMConnect's "Type clipboard text") */
-                input_unicode(m->key.make_code, !(m->key.info & KBD_IS_BREAK));
+                input_unicode(m->key.make_code, !(m->key.info & KBD_IS_BREAK), clock_now_ns());
                 continue;
             }
             /* one key in one call, its 0xE0 with it; one after 0xE1 (KBD_IS_E1, Pause) goes as the
                plain key, set 1 has nothing else for it */
             input_key_set1((uint8_t)(m->key.make_code | ((m->key.info & KBD_IS_BREAK) ? 0x80 : 0)),
-                           (m->key.info & KBD_IS_E0) != 0);
+                           (m->key.info & KBD_IS_E0) != 0, clock_now_ns());
         }
     }
 }
@@ -203,7 +204,7 @@ static void mouse_report(const uint8_t *r, uint32_t len) {
         len--;
     }
     if (!ms.x.present || ms.x.report_id != id) return;
-    struct mouse_event e = {0};
+    struct mouse_event e = {.time_ns = clock_now_ns()};
     for (int i = 0; i < 5; i++)
         if (ms.buttons[i].present && field_value(&ms.buttons[i], r, len)) e.buttons |= 1 << i;
     e.buttons &= 7;
