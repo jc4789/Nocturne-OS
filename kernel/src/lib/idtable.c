@@ -60,6 +60,15 @@ struct id_link *id_table_find(const struct id_table *t, uint64_t id) {
     return NULL;
 }
 
+uint64_t id_table_scan(const struct id_table *t, uint64_t cursor, void (*fn)(struct id_link *l, void *arg), void *arg) {
+    if (!t->size) return 0;
+    uint64_t mask = t->size - 1;
+    for (struct id_link *l = t->bucket[cursor & mask]; l; l = l->next) fn(l, arg);
+    /* the next index in reverse binary order: the cursor's high bits count up from the top bit down */
+    cursor |= ~mask;
+    return __builtin_bitreverse64(__builtin_bitreverse64(cursor) + 1);
+}
+
 struct id_link *id_table_next(const struct id_link *l) {
     for (struct id_link *n = l->next; n; n = n->next)
         if (n->id == l->id) return n;

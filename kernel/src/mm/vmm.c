@@ -779,6 +779,11 @@ uint64_t vmm_user_pages(struct vmm_space *s) { return __atomic_load_n(&s->owned,
 
 void vmm_user_pages_split(struct vmm_space *s, uint64_t out[6]) {
     for (int i = 0; i < 6; i++) out[i] = 0;
+    uint64_t f = spin_lock(&s->lock); /* its tables stay: vmm_space_end frees them after dead */
+    if (s->dead) {
+        spin_unlock(&s->lock, f);
+        return;
+    }
     uint64_t *l4 = tbl(s->pml4);
     for (unsigned a = 0; a < 256; a++) {
         if (!(l4[a] & PTE_P)) continue;
@@ -800,6 +805,7 @@ void vmm_user_pages_split(struct vmm_space *s, uint64_t out[6]) {
             }
         }
     }
+    spin_unlock(&s->lock, f);
 }
 
 static uint64_t prot_flags(int prot) {

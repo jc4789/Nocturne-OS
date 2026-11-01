@@ -27,3 +27,9 @@ void id_table_drop(struct id_table *t, struct id_link *l);
 /* The first link with id (NULL: none), and the next one with the same id after l. */
 struct id_link *id_table_find(const struct id_table *t, uint64_t id);
 struct id_link *id_table_next(const struct id_link *l);
+/* A walk over every link in steps, with the owner's lock let go between them: one bucket a step,
+   from cursor (0 to begin), fn called on each of its links (fn changes nothing in t). Returns the
+   cursor of the next step, 0 when the walk is over. The buckets go in reverse binary order of
+   their index, which doubling keeps: a link in t for the whole walk is seen exactly once, one
+   added or dropped meanwhile at most once. */
+uint64_t id_table_scan(const struct id_table *t, uint64_t cursor, void (*fn)(struct id_link *l, void *arg), void *arg);

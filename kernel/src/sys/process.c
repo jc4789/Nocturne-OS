@@ -109,16 +109,17 @@ int process_kill_tree(int pid, bool include_self) {
     return killed;
 }
 
+/* thread_walk: an app's main thread is killed, and counted while the app has not ended. */
+static void stop_one(struct thread *t, void *arg) {
+    struct process *p = t->process;
+    if (!p || p->main != t || p->ended) return;
+    ++*(int *)arg;
+    if (!t->killed) thread_kill_locked(t);
+}
+
 int process_stop_all(void) {
     int alive = 0;
-    uint64_t f = spin_lock(&thread_lock);
-    for (struct thread *t = thread_list; t; t = t->all_next) {
-        struct process *p = t->process;
-        if (!p || p->main != t || p->ended) continue;
-        alive++;
-        if (!t->killed) thread_kill_locked(t);
-    }
-    spin_unlock(&thread_lock, f);
+    thread_walk(stop_one, &alive);
     return alive;
 }
 

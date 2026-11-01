@@ -43,19 +43,22 @@ struct thread {
     struct sched_entity sched; /* sys/sched.h */
     struct thread_wait wait;   /* sys/wait.h */
     struct id_link id;         /* in the registry by tid (thread_lock) */
-    struct thread *all_next, **all_prev;         /* thread_list (thread_lock) */
     struct thread *process_next, **process_prev; /* its process's threads list (thread_lock) */
 };
 
 static inline struct thread *thread_current(void) { return this_cpu(sched_thread); }
 
-/* The registry of threads: every thread whose record exists, by tid and in thread_list (the newest
-   first). thread_lock guards it, each process's list of its other threads and the family links of
-   processes (sys/process.h); a thread leaves them, and is freed, only under it. It comes before a
-   wait queue's lock. Each operation under it is O(1) or walks one process's threads or children,
-   but for the reports that read every thread (the app list, the memory report). */
+/* The registry of threads: every thread whose record exists, by tid. thread_lock guards it, each
+   process's list of its other threads and the family links of processes (sys/process.h); a thread
+   leaves them, and is freed, only under it. It comes before a wait queue's lock. Each operation
+   under it is O(1) or walks one process's threads or children; what reads every thread walks the
+   registry in steps (thread_walk). */
 extern struct spinlock thread_lock;
-extern struct thread *thread_list;
+/* Every thread in the registry: fn(t, arg) on each with thread_lock held, a few at a time, the lock
+   let go between the steps, so a walk over thousands of threads keeps interrupts off for a few at
+   once. A thread listed for the whole walk is seen once, one that comes or goes meanwhile at most
+   once. fn neither sleeps nor changes the registry. */
+void thread_walk(void (*fn)(struct thread *t, void *arg), void *arg);
 /* thread_lock held: the thread with that id (an ended one too, until its record goes), or NULL. */
 struct thread *thread_find(int tid);
 size_t thread_count(void); /* threads listed now (a hint) */

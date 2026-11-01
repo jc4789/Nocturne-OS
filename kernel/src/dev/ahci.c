@@ -675,9 +675,11 @@ static void add_port(struct hba *h, unsigned no) {
     p->blk.write = blk_ahci_write;
     if (p->cache) p->blk.persist = blk_ahci_persist;
     p->blk.priv = p;
-    kprintf("ahci%d: port %u: %s, %s\n", h->index, no, model,
-            p->ncq ? "queued commands" : "one command at a time");
-    if (p->ncq) kprintf("ahci%d: port %u: %u commands at once\n", h->index, no, (unsigned)__builtin_popcount(p->all));
+    if (p->ncq)
+        kprintf("ahci%d: port %u: %s, %u queued commands at once\n", h->index, no, model,
+                (unsigned)__builtin_popcount(p->all));
+    else
+        kprintf("ahci%d: port %u: %s, one command at a time\n", h->index, no, model);
     blk_register(&p->blk);
 }
 
