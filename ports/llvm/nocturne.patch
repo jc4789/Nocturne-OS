@@ -402,6 +402,19 @@ index 00000000..85ce6dc1
 +} // end namespace clang
 +
 +#endif // LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_NOCTURNE_H
+diff --git a/clang/lib/Frontend/PrecompiledPreamble.cpp b/clang/lib/Frontend/PrecompiledPreamble.cpp
+index 9bf18b4d..f2f65ca6 100644
+--- a/clang/lib/Frontend/PrecompiledPreamble.cpp
++++ b/clang/lib/Frontend/PrecompiledPreamble.cpp
+@@ -43,7 +43,7 @@ namespace {
+ StringRef getInMemoryPreamblePath() {
+ #if defined(LLVM_ON_UNIX)
+   return "/__clang_tmp/___clang_inmemory_preamble___";
+-#elif defined(_WIN32)
++#elif defined(_WIN32) || defined(__nocturne__)
+   return "C:\\__clang_tmp\\___clang_inmemory_preamble___";
+ #else
+ #warning "Unknown platform. Defaulting to UNIX-style paths for in-memory PCHs"
 diff --git a/clang/lib/Lex/InitHeaderSearch.cpp b/clang/lib/Lex/InitHeaderSearch.cpp
 index e894086b..72e003f7 100644
 --- a/clang/lib/Lex/InitHeaderSearch.cpp
@@ -3198,6 +3211,32 @@ index 40a5c447..6e2bb228 100644
  using namespace llvm;
  
  Expected<FileCache> llvm::localCache(const Twine &CacheNameRef,
+diff --git a/llvm/lib/Support/Chrono.cpp b/llvm/lib/Support/Chrono.cpp
+index 13dd7cd4..d17284ec 100644
+--- a/llvm/lib/Support/Chrono.cpp
++++ b/llvm/lib/Support/Chrono.cpp
+@@ -37,6 +37,10 @@ static inline struct tm getStructTM(TimePoint<> TP) {
+   assert(!Error);
+   (void)Error;
+ #endif
++#if defined(__nocturne__)
++  // ISO C's localtime: one result the C library reuses, copied out at once.
++  Storage = *::localtime(&OurTime);
++#endif
+ 
+   return Storage;
+ }
+@@ -55,6 +59,10 @@ static inline struct tm getStructTMUtc(UtcTime<> TP) {
+   assert(!Error);
+   (void)Error;
+ #endif
++#if defined(__nocturne__)
++  // ISO C's gmtime: one result the C library reuses, copied out at once.
++  Storage = *::gmtime(&OurTime);
++#endif
+ 
+   return Storage;
+ }
 diff --git a/llvm/lib/Support/CrashRecoveryContext.cpp b/llvm/lib/Support/CrashRecoveryContext.cpp
 index 493ba951..5608857e 100644
 --- a/llvm/lib/Support/CrashRecoveryContext.cpp
