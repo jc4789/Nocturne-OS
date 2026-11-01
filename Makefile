@@ -430,7 +430,7 @@ $(BUILD)/host/tsc.exe: $(TS_SRC)
 	@cd $(TYPESCRIPT)/tsc && GOOS= GOARCH= CGO_ENABLED=0 "$(GO)" build -trimpath -o "$(CURDIR)/$@" ./cmd/tsc
 $(BUILD)/apps-ts.stamp: $(BUILD)/host/tsc.exe user/apps/tsconfig.json $(wildcard user/apps/*.ts) $(wildcard rootfs/Nocturne/SDK/Types/nocturne/*.d.ts)
 	@echo "  TSC  user/apps"
-	@$(BUILD)/host/tsc.exe -p user/apps/tsconfig.json --pretty false
+	@$(BUILD)/host/tsc.exe -p user/apps/tsconfig.json --outDir $(BUILD)/apps-ts --pretty false
 	@touch $@
 $(TS_BINS): $(PROGRAMS)/%.js: $(BUILD)/apps-ts.stamp
 	@mkdir -p $(dir $@)
