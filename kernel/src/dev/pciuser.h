@@ -16,9 +16,10 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct handle **o
    group is blocked. BME clear alone does not let remaining DMA pages return to the allocator.
    hold and the reads take no lock; drop of the last reference frees the claim's IOMMU domain
    (dev/iommu.c locks, the heap). revoked turns true before the claim's end calls
-   shared_revoke_claim (syscall.c), which then finds every BAR mapping made before it: making a
-   BAR mapping and that revocation must exclude each other under syscall.c's own lock. */
+   shared_revoke_claim (mm/shared.c), which then finds every BAR mapping made before it, or the
+   mapping being made finds revoked true. shared: what mm/shared.c keeps for the claim. */
 struct pci_claim *pci_user_hold(struct handle *h);
+struct shared_claim *pci_user_shared(struct pci_claim *c);
 void pci_user_drop(struct pci_claim *c);
 bool pci_user_revoked(const struct pci_claim *c);
 bool pci_user_dma_reusable(const struct pci_claim *c);

@@ -201,8 +201,8 @@ static void resource_worker(void *arg) {
         }
         char record[RECORD_SIZE]; memset(record, (int)id + 1, sizeof record);
         if (n_document_append(resource_path, record, sizeof record) < 0) resource_failed(id, RC_RECORD_APPEND, -1);
-        uint64_t first = n_clock_monotonic(), second = n_clock_monotonic();
-        if (second < first || n_clock_boot() < second) resource_failed(id, RC_CLOCK, (long)(first - second));
+        uint64_t earlier = n_clock_monotonic(), later = n_clock_monotonic();
+        if (later < earlier || n_clock_boot() < later) resource_failed(id, RC_CLOCK, (long)(earlier - later));
         void *page;
         n_memory_reserve(4096, N_MEMORY_READ_WRITE, &page);
         unsigned char *map = page;

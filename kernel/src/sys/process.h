@@ -32,12 +32,12 @@ struct process {
     struct handle_table handles; /* sys/object.h */
     struct vmm_space *vmm_space; /* its app's page tables (a reference, mm/vmm.c); NULL once it ended,
                                     cleared under thread_lock: a space read under it stays meanwhile */
-    /* Its address-space layout (sys/syscall.c, until mm takes it over). space's lock guards the
-       reservation regions' frontiers (mmap_next, low_next) and holes, the ranges its threads are
-       changing (space_ops) and space_ended; space holds the threads waiting for such a range. It
-       comes before shared_lock (syscall.c), the page tables' locks and pmm's, and no two
-       processes' are held at once. shared_mappings changes with both space's lock and shared_lock
-       held: either is enough to read it. low_base is set before the process runs. */
+    /* Its address-space layout (mm/space.c). space's lock guards the reservation regions' frontiers
+       (mmap_next, low_next) and holes, the ranges its threads are changing (space_ops) and
+       space_ended; space holds the threads waiting for such a range. It comes before the shared
+       objects' locks (mm/shared.c), the page tables' locks and pmm's, and no two processes' are
+       held at once. shared_mappings changes with both space's lock and mappings_lock held: either
+       is enough to read it. low_base is set before the process runs. */
     struct wait_queue space;
     struct space_op *space_ops;
     bool space_ended;         /* its mappings went at its end: nothing is reserved or freed again */
@@ -50,6 +50,7 @@ struct process {
     /* The shared pages this app has mapped (struct shared_mapping, also being built), by their
        ranges, which never overlap: the mapping at an address is found in O(log n). */
     struct span_tree shared_mappings;
+    struct spinlock mappings_lock;
     /* The bytes of the messages it sent that wait in a channel (sys/channel.c), atomic. Each such
        message keeps a reference to the record. */
     uint64_t messages;
@@ -80,3 +81,14 @@ NORETURN void process_exit(int code);
 NORETURN void process_end(struct process *p, int code);
 /* A reference to p's record goes (sys/thread.c, thread_left): the last frees it. */
 void process_put(struct process *p);
+/* thread_lock held: the app whose main thread t is, or NULL (a kernel thread, another thread of an
+   app). Its space stays while the lock is held: its end drops it under the lock. */
+static inline struct process *process_of_main(struct thread *t) {
+    struct process *p = t->process;
+    return p && p->main == t ? p : NULL;
+}
+/* thread_lock held: the app's private pages now. */
+uint64_t process_pages(struct process *p);
+/* Physical memory ran out under who's request for inc more bytes: the largest apps are named, once
+   per interval. No lock held. */
+void process_memory_report(struct process *who, int64_t inc);

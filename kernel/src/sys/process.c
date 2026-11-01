@@ -3,12 +3,15 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "mm/heap.h"
+#include "mm/pmm.h"
+#include "mm/shared.h"
 #include "mm/vmm.h"
 #include "sys/object.h"
 #include "sys/proc.h"
 #include "sys/process.h"
+#include "sys/clock.h"
+#include "sys/log.h"
 #include "sys/sched.h"
-#include "sys/syscall.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
 
@@ -17,6 +20,7 @@ struct process *process_new(const char *name) {
     if (!p) return NULL;
     strlcpy(p->name, name, sizeof p->name);
     p->refs = 1; /* until it has ended */
+    p->mappings_lock.rank = SPIN_SHARED_MAPPINGS;
     handle_table_init(&p->handles);
     struct thread *t = thread_new(name, p);
     if (!t) {
@@ -48,7 +52,7 @@ void process_start(struct process *p, struct process *parent, struct object *app
    ends it leaves it first. */
 static void process_space_end(struct process *p) {
     if (!p->vmm_space) return;
-    sys_shared_cleanup(p);
+    shared_process_end(p);
     struct vmm_space *old = p->vmm_space;
     /* under thread_lock: one who read the space under it is done with its tables */
     uint64_t f = spin_lock(&thread_lock);
@@ -71,6 +75,75 @@ void process_put(struct process *p) {
     if (__atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL)) return;
     thread_free(p->main);
     kfree(p);
+}
+
+uint64_t process_pages(struct process *p) { return p->vmm_space ? vmm_user_pages(p->vmm_space) : 0; }
+
+#define REPORT_TOP 8
+struct memory_report {
+    struct { int pid; char name[32]; uint64_t kb, messages; } top[REPORT_TOP];
+    int n, apps;
+    uint64_t kb, messages; /* every app's together */
+};
+
+/* thread_walk: an app counted, and kept among the largest. */
+static void report_one(struct thread *t, void *arg) {
+    struct memory_report *r = arg;
+    struct process *p = process_of_main(t);
+    if (!p) return;
+    uint64_t kb = process_pages(p) * 4, messages = __atomic_load_n(&p->messages, __ATOMIC_RELAXED);
+    r->apps++;
+    r->kb += kb;
+    r->messages += messages;
+    int at = r->n < REPORT_TOP ? r->n++ : REPORT_TOP;
+    while (at > 0 && r->top[at - 1].kb < kb) {
+        if (at < REPORT_TOP) r->top[at] = r->top[at - 1];
+        at--;
+    }
+    if (at < REPORT_TOP) {
+        r->top[at].pid = p->pid;
+        strlcpy(r->top[at].name, p->name, sizeof r->top[at].name);
+        r->top[at].kb = kb;
+        r->top[at].messages = messages;
+    }
+}
+
+/* The largest apps, so the owner of the memory is visible, with where their private pages sit; and
+   every app's together, since many middling ones can outweigh the largest. */
+void process_memory_report(struct process *who, int64_t inc) {
+    static uint64_t last_report; /* any CPU: the one that moves it on reports */
+    uint64_t now = clock_now_ns(), last = __atomic_load_n(&last_report, __ATOMIC_RELAXED);
+    if (last && now - last < 10 * NS_PER_S) return;
+    if (!__atomic_compare_exchange_n(&last_report, &last, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    struct memory_report r = {0};
+    thread_walk(report_one, &r);
+    kprintf("[memory] pid %d (%s): no pages for %ld more bytes, %lu pages free; %d apps, %luK, %luK in messages; largest:",
+            who->pid, who->name, (long)inc, (unsigned long)pmm_free_pages(), r.apps, (unsigned long)r.kb,
+            (unsigned long)(r.messages / 1024));
+    for (int i = 0; i < r.n; i++) kprintf(" %d/%s %luK", r.top[i].pid, r.top[i].name, (unsigned long)r.top[i].kb);
+    kprintf("\n");
+    /* each of the largest looked up again by pid, its page tables walked without the lock */
+    for (int i = 0; i < r.n; i++) {
+        uint64_t flags = spin_lock(&thread_lock);
+        struct process *p = process_find(r.top[i].pid);
+        struct vmm_space *space = p ? p->vmm_space : NULL;
+        unsigned threads = 0;
+        if (space) {
+            vmm_space_get(space);
+            for (struct thread *q = p->threads; q; q = q->process_next)
+                if (q->sched.state != THREAD_ZOMBIE) threads++;
+        }
+        spin_unlock(&thread_lock, flags);
+        if (!space) continue;
+        uint64_t s[6];
+        vmm_user_pages_split(space, s);
+        vmm_space_put(space);
+        kprintf("[memory]  %d/%s image %luK low %luK reserved %luK stack %luK shared %luK tables %luK messages %luK "
+                "threads %u\n",
+                r.top[i].pid, r.top[i].name, (unsigned long)s[0] * 4, (unsigned long)s[1] * 4, (unsigned long)s[2] * 4,
+                (unsigned long)s[3] * 4, (unsigned long)s[4] * 4, (unsigned long)s[5] * 4,
+                (unsigned long)(r.top[i].messages / 1024), threads);
+    }
 }
 
 struct process *process_find(int pid) {

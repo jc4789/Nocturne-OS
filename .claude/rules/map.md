@@ -23,6 +23,8 @@
 | `lib/` | `span`（区間の AVL 木）、`avl`、`idtable`、`lz`、`printf`、`sort`、`string`。 |
 | `sys/proc.c` | `proc_launch` が ELF のアプリを起こす。 |
 | `sys/clock.c`・`alarm.c` | TSC による三つの時計（monotonic、boot、wall）と、CPU ごとの期限の heap。 |
+| `mm/vmm.c`・`pmm.c`・`heap.c`・`vmalloc.c` | 頁表と TLB、frame、heap、核の番地の区間。 |
+| `mm/shared.c`・`pager.c`・`program.c`・`space.c` | 共有 object（frame、写像の一覧、fault、revoke、DMA の型、device の pin、scanout）、pager、program の text、アプリの配置（穴、`n_memory_*`）。口は `mm/shared.h`・`mm/space.h`、錠の順は `mm/shared.c` の頭。 |
 | `sys/object.c`・`channel.c`・`events.c`・`watch.c` | object と handle の表、channel、event queue、watch。 |
 | `sys/syscall.c` | syscall の受け口 `syscall_dispatch`。 |
 | `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console と system log の stream、profiler。 |

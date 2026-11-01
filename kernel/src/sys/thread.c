@@ -12,6 +12,7 @@
 #include "sys/object.h"
 #include "sys/process.h"
 #include "sys/sched.h"
+#include "mm/space.h"
 #include "sys/syscall.h"
 #include "sys/thread.h"
 #include "sys/wait.h"

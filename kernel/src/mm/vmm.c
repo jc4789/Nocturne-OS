@@ -5,9 +5,9 @@
    lock; no one holds two tables locks, and pmm's locks come after either. Hardware and the
    lockless walks (walk) see a table only once it is zeroed: an entry is published with one store.
    The kernel half's tables are never freed. A space's go when it ends (vmm_space_end), once no
-   CPU holds it; a lockless walk of a space is its own process's threads', or one under thread_lock
-   while it is still its process's (sys/process.c takes it from the process under thread_lock
-   before it ends it).
+   CPU holds it; a lockless walk of a space is its own process's threads', its starter's while the
+   process does not run yet, or one under thread_lock while it is still its process's
+   (sys/process.c takes it from the process under thread_lock before it ends it).
    A lower-half entry above the leaves is made P|W|U and never changes, and the lower half has no
    large pages: the leaves alone say what a page allows. The kernel half's leaves are global.
 
@@ -44,7 +44,7 @@
 #include "sys/clock.h"
 #include "sys/process.h"
 #include "sys/sched.h"
-#include "sys/syscall.h"
+#include "mm/shared.h"
 #include "limine.h"
 
 uint64_t kernel_pml4;
@@ -828,27 +828,6 @@ static bool grant(uint64_t *leaf, int prot) {
    the same table, so ascending first touches fault once per 64 KiB. */
 #define DEMAND_AROUND 16
 
-/* s's lock held: a first touch of the reserved page at va (write: a write), and the reserved pages
-   after it in its table (while memory is not short): 1 when va's page is present now, 0 when it is
-   no reserved page it may touch so, -N_ERR_NO_MEMORY when no frame came for it. */
-static int demand_fill(struct vmm_space *s, uint64_t va, bool write) {
-    uint64_t page = ALIGN_DOWN(va, PAGE_SIZE), next, *l1 = leaves_of(s, page, &next);
-    if (!l1) return 0;
-    int result = 0;
-    for (unsigned i = idx(page, 1), n = 0; i < 512 && n < DEMAND_AROUND; i++, n++) {
-        uint64_t e = l1[i];
-        if (!n && (e & PTE_P)) return 1; /* a sibling filled it first */
-        if ((e & (PTE_P | PTE_DEMAND)) != PTE_DEMAND || (!n && write && !(e & PTE_W))) break;
-        uint64_t frame = !n || pmm_free_pages() >= 4096 ? pmm_alloc_zeroed() : 0;
-        if (!frame) return n ? result : -N_ERR_NO_MEMORY;
-        uint64_t now = frame | (e & ~PTE_DEMAND) | PTE_P;
-        __atomic_store_n(&l1[i], now, __ATOMIC_RELEASE);
-        count(s, e, now);
-        result = 1;
-    }
-    return result;
-}
-
 /* Fresh zeroed pages. Pages that are already mapped keep their contents and gain the requested
    access (two ELF segments can share a page); reserved ones are filled. */
 int vmm_user_alloc(struct vmm_space *s, uint64_t va, uint64_t size, int prot) {
@@ -859,10 +838,6 @@ int vmm_user_alloc(struct vmm_space *s, uint64_t va, uint64_t size, int prot) {
         uint64_t *leaf = s->dead ? NULL : leaf_of(s, a, true);
         if (!leaf) {
             result = s->dead ? -N_ERR_CLOSED : -N_ERR_NO_MEMORY;
-            break;
-        }
-        if ((*leaf & (PTE_P | PTE_DEMAND)) == PTE_DEMAND && demand_fill(s, a, false) < 0) {
-            result = -N_ERR_NO_MEMORY;
             break;
         }
         if (*leaf & PTE_P) {
@@ -877,11 +852,11 @@ int vmm_user_alloc(struct vmm_space *s, uint64_t va, uint64_t size, int prot) {
             if (!frame) result = -N_ERR_NO_MEMORY;
             continue;
         }
-        uint64_t old = *leaf, now = frame | prot_flags(prot) | PTE_P;
+        /* a reserved page keeps the access it was reserved with, and gains prot's (above) */
+        uint64_t old = *leaf, now = frame | (old & PTE_DEMAND ? old & ~PTE_DEMAND : prot_flags(prot)) | PTE_P;
         __atomic_store_n(leaf, now, __ATOMIC_RELEASE);
         count(s, old, now);
         frame = 0;
-        a += PAGE_SIZE;
     }
     spin_unlock(&s->lock, f);
     if (frame) pmm_free(frame);
@@ -921,11 +896,43 @@ int vmm_user_reserve(struct vmm_space *s, uint64_t va, uint64_t size, int prot) 
     return result;
 }
 
+/* A first touch of the reserved page at va (write: a write), and the reserved pages after it in
+   its table (while memory is not short). The frames are made and zeroed with no lock held, from a
+   lockless look at the leaves; each leaf is looked at again under the lock, and a frame no leaf
+   took goes back. */
 int vmm_demand_fault(struct vmm_space *s, uint64_t va, bool write) {
     if (va >= USER_TOP) return 0;
+    uint64_t page = ALIGN_DOWN(va, PAGE_SIZE), size, *leaf = walk(s->pml4, page, &size), frames[DEMAND_AROUND];
+    if (!leaf) return 0;
+    unsigned n = 0, room = MIN(512 - idx(page, 1), (unsigned)DEMAND_AROUND);
+    for (; n < room; n++) {
+        uint64_t e = __atomic_load_n(&leaf[n], __ATOMIC_ACQUIRE);
+        if (!n && (e & PTE_P)) return 1; /* a sibling filled it first */
+        if ((e & (PTE_P | PTE_DEMAND)) != PTE_DEMAND || (!n && write && !(e & PTE_W))) break;
+        frames[n] = !n || pmm_free_pages() >= 4096 ? pmm_alloc_zeroed() : 0;
+        if (!frames[n]) {
+            if (!n) return -N_ERR_NO_MEMORY;
+            break;
+        }
+    }
+    if (!n) return 0;
+    int result = 0;
     uint64_t f = spin_lock(&s->lock);
-    int result = s->dead ? 0 : demand_fill(s, va, write);
+    for (unsigned i = 0; i < n && !s->dead; i++) {
+        uint64_t e = leaf[i];
+        if ((e & (PTE_P | PTE_DEMAND)) != PTE_DEMAND || (!i && write && !(e & PTE_W))) {
+            if (!i && (e & PTE_P)) result = 1;
+            continue;
+        }
+        uint64_t now = frames[i] | (e & ~PTE_DEMAND) | PTE_P;
+        __atomic_store_n(&leaf[i], now, __ATOMIC_RELEASE);
+        count(s, e, now);
+        frames[i] = 0;
+        if (!i) result = 1;
+    }
     spin_unlock(&s->lock, f);
+    for (unsigned i = 0; i < n; i++)
+        if (frames[i]) pmm_free(frames[i]);
     return result;
 }
 
@@ -1072,9 +1079,9 @@ bool vmm_handle_user_fault(uint64_t addr, uint64_t err) {
     if (!p || !p->vmm_space || addr >= USER_TOP) return false;
     if (vmm_fault_spurious(addr, err)) return true;
     /* A protection violation is final, except a write to a page a pager gave read access to:
-       its pager may give write access (shared_demand_fault decides). */
-    if (err & 1) return (err & 2) && !(err & 16) && shared_demand_fault(addr, true);
+       its pager may give write access (shared_fault decides). */
+    if (err & 1) return (err & 2) && !(err & 16) && shared_fault(addr, true, NULL);
     if (addr >= USER_STACK_TOP - USER_STACK_MAX && addr < USER_STACK_TOP)
         return vmm_user_alloc(p->vmm_space, ALIGN_DOWN(addr, PAGE_SIZE), PAGE_SIZE, VM_W) == 0;
-    return shared_demand_fault(addr, err & 2);
+    return shared_fault(addr, err & 2, NULL);
 }
