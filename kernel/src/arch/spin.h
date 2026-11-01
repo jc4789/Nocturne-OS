@@ -1,13 +1,18 @@
 /* Spinlocks: the kernel's short exclusion between CPUs (and with interrupt handlers on the
-   holder's own CPU, whose interrupts stay off while it holds the lock).
+   holder's own CPU, whose interrupts stay off while it holds the lock: spin_lock).
+
+   A lock may be held with interrupts on (spin_take alone) when no interrupt's handler takes it,
+   its rank is below every ranked lock a handler takes, and no one who holds a lock a handler takes
+   waits for it. Its holder and those who wait for it keep answering interrupts. The ranks below
+   SPIN_THREAD are such locks.
 
    A queued lock (MCS): a CPU that has to wait joins the lock's queue and spins on a word of its
    own node, so the CPUs waiting take the lock in the order they came and none of them pulls the
    lock's line from the others while it waits. Only the CPU at the head of the queue watches the
    lock itself (holder), for the moment it is given back; once it has taken it, it hands the head
    on to the next node and is done with its own. A node is therefore in use only while its CPU
-   waits, and a CPU waits on more than one lock at a time only where an NMI or a machine check
-   came in during a wait and takes a lock itself: SPIN_NODES nodes a CPU.
+   waits, and a CPU waits on more than one lock at a time only where an interrupt, an NMI or a
+   machine check came in during a wait and takes a lock itself: SPIN_NODES nodes a CPU.
 
    Holders never sleep and never wait for another CPU: a TLB shootdown, which waits for the
    others, is never sent under a spinlock (spins_held counts the ones this CPU holds), and its
@@ -30,8 +35,11 @@
    has no rank; nor has a wait queue's, taken under nearly anything. */
 enum spin_rank {
     SPIN_UNRANKED,      /* not checked */
+    SPIN_SHARED_MAPPINGS, /* a process's mappings_lock (mm/shared.c): its tree of shared mappings */
+    SPIN_SHARED_OBJECT, /* a shared object's lock (mm/shared.c): one at a time */
+    SPIN_PAGER,         /* a pager's lock (mm/pager.c): its faults, its memory's entries */
+    SPIN_DEVICE_PINS,   /* device memory's pinned types (mm/shared.c) */
     SPIN_THREAD,        /* thread_lock (sys/thread.c): the registry, processes' threads and families */
-    SPIN_SHARED,        /* shared_lock (sys/syscall.c): shared objects and their mappings */
     SPIN_ADDRESS_SPACE, /* a struct vmm_space's lock, an app's or the kernel's half (mm/vmm.c) */
     SPIN_PAGE_CACHE,    /* a CPU's cache of frames (mm/pmm.c) */
     SPIN_PAGE_NODE,     /* a node's free frames (mm/pmm.c) */
@@ -47,7 +55,7 @@ struct spinlock {
 };
 
 #define SPIN_NODE_BITS 2
-#define SPIN_NODES (1u << SPIN_NODE_BITS) /* a wait, and an NMI's and a machine check's in it, and one spare */
+#define SPIN_NODES (1u << SPIN_NODE_BITS) /* a wait, and in it an interrupt's, an NMI's and a machine check's */
 #define SPIN_RANK_WORDS ((SPIN_RANKS + 63) / 64)
 
 struct spin_node {

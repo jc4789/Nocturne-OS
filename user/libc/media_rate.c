@@ -1,7 +1,6 @@
 /* PCM tempo is a separate responsibility from packet decoding and GUI timing.
  * Pitch-preserving playback uses upstream LGPL WSOLA (atempo); pitch-changing
- * playback uses its native resampler by changing the source's sample rate.
- * nmedia_trim is the same resampler's soft compensation. */
+ * playback uses its native resampler by changing the source's sample rate. */
 #include <errno.h>
 #include "media_rate_private.h"
 #include "media_alloc_private.h"
@@ -98,26 +97,3 @@ int nmedia_rate_pull(nmedia_rate *r,struct nmedia_output *o){
 }
 bool nmedia_rate_end(nmedia_rate *r){if(!r)return false;if(r->ended)return true;r->ended=true;return !r->source||av_buffersrc_add_frame_flags(r->source,NULL,0)>=0;}
 void nmedia_rate_close(nmedia_rate *r){if(!r)return;swr_free(&r->resampler);av_frame_free(&r->frame);avfilter_graph_free(&r->graph);nmedia_ff_free(r->converted);nmedia_ff_free(r);}
-/* A compensation lasts for its distance in output frames: 10 s, longer than any two calls apart,
-   and fine enough for 2 ppm steps. */
-#define NMEDIA_TRIM_DISTANCE 480000
-struct nmedia_trim { SwrContext *resampler; };
-nmedia_trim *nmedia_trim_create(void){
-    nmedia_trim *t=nmedia_ff_mallocz(sizeof *t);if(!t)return NULL;
-    AVChannelLayout stereo=AV_CHANNEL_LAYOUT_STEREO;
-    if(swr_alloc_set_opts2(&t->resampler,&stereo,AV_SAMPLE_FMT_S16,48000,&stereo,AV_SAMPLE_FMT_S16,48000,0,NULL)<0||
-       swr_init(t->resampler)<0||swr_set_compensation(t->resampler,0,NMEDIA_TRIM_DISTANCE)<0){nmedia_trim_close(t);return NULL;}
-    return t;
-}
-bool nmedia_trim_set(nmedia_trim *t,int ppm){
-    return swr_set_compensation(t->resampler,(int)lround(-(double)ppm*NMEDIA_TRIM_DISTANCE/1000000),NMEDIA_TRIM_DISTANCE)>=0;
-}
-int nmedia_trim_convert(nmedia_trim *t,const int16_t *in,size_t frames,int16_t *out,size_t capacity){
-    uint8_t *output=(uint8_t *)out;const uint8_t *input=(const uint8_t *)in;
-    return swr_convert(t->resampler,&output,(int)capacity,in?&input:NULL,in?(int)frames:0);
-}
-int64_t nmedia_trim_delay(const nmedia_trim *t){
-    int64_t delay=swr_get_delay((SwrContext *)t->resampler,48000);
-    return delay>0?delay:0;
-}
-void nmedia_trim_close(nmedia_trim *t){if(!t)return;swr_free(&t->resampler);nmedia_ff_free(t);}

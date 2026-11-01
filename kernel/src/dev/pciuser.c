@@ -1,7 +1,7 @@
 /* Drivers in apps (docs/nocturne-native-abi.md §9). Only init claims a PCI function; the claim
    is an object whose handle init passes to the driver app it launches. The app reads config space
    (its device, the bridges above it with their devices, the host bridges), writes its own, maps BARs as
-   shared objects (syscall.c) and waits for its message-signalled interrupts on the handle.
+   shared objects (mm/shared.c) and waits for its message-signalled interrupts on the handle.
    The kernel keeps what decides where memory and interrupts go: BAR registers and the MSI and
    MSI-X capabilities are written here only. Where an IOMMU is on (dev/iommu.h) the function's
    DMA reaches only the DMA objects made through its claim. The last handle's close stops the
@@ -34,6 +34,7 @@
 #include "sys/proc.h"
 #include "sys/object.h"
 #include "sys/process.h"
+#include "mm/shared.h"
 #include "sys/syscall.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
@@ -67,6 +68,7 @@ struct pci_claim {
     struct pci_device *d;
     struct object object; /* what the claim's handle reaches */
     struct wait_queue wq;
+    struct shared_claim shared; /* its BAR objects */
     /* Its handlers, pending and vectors as they read them. They wake and notify under it, so once
        vectors is 0 no handler still reaches the claim. Before the wait queue and event locks. */
     struct spinlock irq_lock;
@@ -496,6 +498,7 @@ static void claim_release(struct object *o) {
     shared_revoke_claim(c); /* no process reaches the registers any more */
     interrupts_off(c);
     mutex_lock(&claim_mutex); /* no claim forms a group with these functions meanwhile */
+    if (c->domain) iommu_guests_stop(c->domain);
     bool left_running;
     bool stopped = pci_disable_busmaster(d, &left_running);
     if (c->domain && c->domain->nmembers > 1) {
@@ -557,6 +560,7 @@ struct pci_claim *pci_user_hold(struct handle *h) {
     return c;
 }
 void pci_user_drop(struct pci_claim *c) { if (c) claim_drop(c); }
+struct shared_claim *pci_user_shared(struct pci_claim *c) { return &c->shared; }
 bool pci_user_revoked(const struct pci_claim *c) { return c && __atomic_load_n(&c->released, __ATOMIC_SEQ_CST); }
 bool pci_user_dma_reusable(const struct pci_claim *c) { return !c || !__atomic_load_n(&c->dma_unsafe, __ATOMIC_ACQUIRE); }
 unsigned pci_user_dma_bits(const struct pci_claim *c) { return iommu_dma_bits(c->domain); }
@@ -661,7 +665,7 @@ static bool bus_reset(struct pci_claim *c, struct pci_device *m) {
         struct pci_device *f = pci_at(i);
         if (!pci_below(port, f)) continue;
         bool ours = claim_owns(c, m, f);
-        const char *why = f->kernel_owned              ? "a kernel driver runs it"
+        const char *why = !ours && f->kernel_owned     ? "a kernel driver runs it"
                           : screen_bar(f) >= 0         ? "the boot screen is drawn through it"
                           : !ours && f->claimed        ? "it is claimed"
                           : !ours && iommu_in_use(f)   ? "it is in another claim's domain"
@@ -795,6 +799,7 @@ static int64_t claim_form(struct pci_claim *c, struct handle **out) {
         d->claimed = false;
         return -N_ERR_NO_MEMORY;
     }
+    if (c->domain) iommu_guests_start(c->domain, true);
     *out = h;
     return 0;
 }

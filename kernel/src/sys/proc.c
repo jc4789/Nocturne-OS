@@ -5,6 +5,7 @@
 #include "sys/clock.h"
 #include "sys/proc.h"
 #include "sys/process.h"
+#include "mm/shared.h"
 #include "sys/syscall.h"
 #include "sys/object.h"
 #include "sys/stream.h"
