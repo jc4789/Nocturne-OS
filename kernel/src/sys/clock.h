@@ -14,8 +14,8 @@
    (arch/tsc_rate.h), else measured against a rate reference before the clock begins. A CPU's
    stated rate is nominal (spread spectrum may lower it, the crystal is off by its tolerance), and
    a first measure is short: unless a hypervisor stated it, a rate reference (the HPET or the ACPI
-   PM timer, dev/refclock.h) measures it again and again over windows that double, each new rate taken from the clock's
-   present reading on (its slope changes, the clock never steps or goes back), each with the bound
+   PM timer, dev/refclock.h) measures it again and again over windows that double, each new rate
+   taken from the clock's present reading on (its slope changes, the clock never steps or goes back), each with the bound
    of its error that the measurement proves. The CPUs' TSCs are compared as they start
    (clock_cpus_compare); what one is seen behind by is added to its readings. A reading never goes
    back on one CPU, nor across CPUs by more than the comparison can see (a cache line's crossing).

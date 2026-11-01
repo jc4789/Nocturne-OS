@@ -1,8 +1,8 @@
 /* The CPUs and the memory nodes (arch/topology.h). An APIC ID is hierarchical: its low bits name
    the thread within a core, the next the core, and so on up to the package, each level's ID
    being the APIC ID shifted right past the levels below it (Intel SDM vol. 3A 11.9, CPUID leaves
-   0x1F and 0xB; AMD APM vol. 2 7.6.5, and vol. 3 E.4.24's 0x80000026 for the die). The shifts are the first CPU's; every CPU of the machine
-   has the same, which each one checks when it starts. The last-level cache is shared by the IDs
+   0x1F and 0xB; AMD APM vol. 2 7.6.5, and vol. 3 E.4.24's 0x80000026 for the die). The shifts are
+   the first CPU's; every CPU of the machine has the same, which each one checks when it starts. The last-level cache is shared by the IDs
    that agree above the shift its sharing count rounds up to (leaf 4, AMD's 0x8000001D). The
    nodes are the SRAT's proximity domains (ACPI 6.5 5.2.16), the distances the SLIT's (5.2.17).
    Everything is boot memory, sized by what the tables hold. */

@@ -5,8 +5,8 @@
 
 /* The idle task's wait (sys/sched.c), interrupts off on the way in and on the way back: until an
    interrupt, or until another CPU tells it through cpu_idle_wake. With MWAIT it waits on a word of
-   its own, asking for C1; without it, in HLT. The caller
-   looks at its queue again after each return, whatever ended the wait. */
+   its own, asking for C1; without it, in HLT. The caller looks at its queue again after each
+   return, whatever ended the wait. */
 void cpu_idle(void);
 /* Another CPU, whose queue just got a task: true when it was waiting on its word and has been
    told by this write (no IPI is needed), false when it has to be interrupted. */

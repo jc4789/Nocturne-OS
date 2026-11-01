@@ -22,9 +22,8 @@
    manual at hand covers or a hypervisor that says nothing. A CPU's stated rate is nominal: spread
    spectrum may lower it (PPR 56713, the glossary's CoreCOF) and the crystal is off by its
    tolerance. So wherever no hypervisor stated it a rate reference measures what the TSC really
-   counts. Its owner
-   (dev/refclock.c: the HPET, or the ACPI PM timer) reads its count between two TSC readings (a sample: the count was
-   taken in that span) and gives the sample to clock_rate_sample, which answers when it wants the
+   counts. Its owner (dev/refclock.c: the HPET, or the ACPI PM timer) reads its count between two
+   TSC readings (a sample: the count was taken in that span) and gives the sample to clock_rate_sample, which answers when it wants the
    next. A sample's TSC readings less their CPU's offset are on the clock's one count, whatever
    CPU took them. Two samples give the ratio of TSC counts to reference counts, and with it ns per
    TSC count. Its error is bounded by what the samples cannot tell: up to `half` of each sample's
