@@ -46,8 +46,6 @@ div_t div(int a, int b);
 ldiv_t ldiv(long a, long b);
 lldiv_t lldiv(long long a, long long b);
 void *bsearch(const void *key, const void *base, size_t n, size_t size, int (*cmp)(const void *, const void *));
-int setenv(const char *name, const char *value, int overwrite);
-int unsetenv(const char *name);
 int mblen(const char *s, size_t n);
 int mbtowc(wchar_t *pwc, const char *s, size_t n);
 int wctomb(char *s, wchar_t wc);

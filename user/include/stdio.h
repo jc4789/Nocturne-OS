@@ -14,7 +14,6 @@ NOCTURNE_BEGIN_DECLS
 typedef struct FILE FILE;
 extern FILE *stdin, *stdout, *stderr;
 FILE *fopen(const char *path, const char *mode);
-FILE *fdopen(int fd, const char *mode);
 FILE *freopen(const char *path, const char *mode, FILE *f);
 int fclose(FILE *f);
 size_t fread(void *buf, size_t size, size_t n, FILE *f);
@@ -33,7 +32,6 @@ int fflush(FILE *f);
 int feof(FILE *f);
 int ferror(FILE *f);
 void clearerr(FILE *f);
-int fileno(FILE *f);
 int fseek(FILE *f, long off, int whence);
 long ftell(FILE *f);
 void rewind(FILE *f);

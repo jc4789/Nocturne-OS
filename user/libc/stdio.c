@@ -206,10 +206,6 @@ static FILE *stream_new(n_handle h, int kind, bool append) {
     return f;
 }
 
-FILE *fdopen(int fd, const char *mode) {
-    return stream_new(fd, 0, mode && mode[0] == 'a');
-}
-
 FILE *fopen(const char *path, const char *mode) {
     bool append;
     n_handle h = open_document(path, mode, &append);
@@ -510,7 +506,6 @@ int puts(const char *s) {
 int feof(FILE *f) { return f->eof; }
 int ferror(FILE *f) { return f->err; }
 void clearerr(FILE *f) { f->eof = f->err = false; }
-int fileno(FILE *f) { return f->h; }
 
 /* ---- wide characters: UTF-8 in the stream, one UTF-32 code unit each ---- */
 

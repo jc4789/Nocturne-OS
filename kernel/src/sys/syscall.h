@@ -12,17 +12,6 @@ static inline uint64_t syscall_deadline(int64_t timeout_ms) {
     if (timeout_ms < 0 || (uint64_t)timeout_ms >= CLOCK_NEVER / NS_PER_MS) return CLOCK_NEVER;
     return clock_after((uint64_t)timeout_ms * NS_PER_MS);
 }
-/* The address waits' timeout: unsigned milliseconds, UINT32_MAX for no limit (the ABI's §7). */
-static inline uint64_t address_deadline(unsigned timeout_ms) {
-    return syscall_deadline(timeout_ms == UINT32_MAX ? -1 : (int64_t)timeout_ms);
-}
-/* The calling app's memory. A sibling thread on another CPU may unmap or protect any page of it at
-   any time, so the kernel reads and writes it only through these copies, never through the app's
-   pointer itself: a page that went meanwhile ends the copy with -N_ERR_BAD_ADDRESS instead of a
-   fault. A page not there yet is made present first (a growing stack, a reserved page, a pager's
-   page), which may sleep: never with a spinlock held. */
-int copy_from_user(void *dst, const void *usrc, size_t n);
-int copy_to_user(void *udst, const void *src, size_t n);
 /* Whether [p, p+n) is memory the app may read (or, with _w, also write) now, its pages made
    present: a check before long work, which the copies after it still make again. */
 bool user_ok(const void *p, size_t n);

@@ -1,23 +1,18 @@
-# Nocturne ネイティブABI（UNIX型ABIの置き換え）
+# Nocturne ネイティブABI
 
-Nocturneは独自OSであり、UNIX／POSIX／Linuxではない。以前の `common/abi.h` は、
-整数fdへの汎用 `read`／`write`／`lseek`／`fcntl`／`dup2`／`poll`、`open` フラグ、
-`chdir`／`getcwd`、`spawn`＋`waitpid`／`kill`、`pipe`、`sbrk`／`mmap`、
-`ENOENT` 型のエラー名という、UNIXの骨格を持っていた。名前を変えても骨格が同じなら
-UNIXのままなので、この文書は**骨格そのもの**をNocturne独自の方式へ置き換えた仕様を定める
-（旧ABIは §10 の段階5で削除済み）。
+Nocturne のカーネルとアプリの間の約束。番号と型は `common/abi.h`、画面と GPU は
+`common/display_abi.h` と `common/gpu_abi.h` にある。
 
 ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`、`time.h`、
 `threads.h`、`fenv.h`、`setjmp.h`、`errno.h` の `EDOM`／`ERANGE`／`EILSEQ`）は
-C言語の一部として、この新ABIの上に実装して残す。POSIXの拡張（`strings.h`、
-`fcntl.h`、`unistd.h`、`sys/*.h`、`alloca.h`、`*_r`、`asprintf` 等）は提供しない。
+C言語の一部として、このABIの上に実装する。ISO C の外の関数・定数・型は提供しない。
 移植物（ffmpeg、QuickJS、Mesa、tcc、lexbor、FreeType、wabt、BearSSL、libc++）は
 互換ヘッダーを置かず、各ソースを直接このABIへ書き換える。
 
 ## 0. 呼出しの形
 
-- 命令は `SYSCALL`。番号は `rax`、引数は `rdi`・`rsi`・`rdx`・`r10`・`r8`、結果は `rax`
-  （負の値は §2 の `N_ERR_*`）。`rcx` と `r11` は命令そのものが使い、戻ったときの中身は
+- 命令は `SYSCALL`。番号は `rax`、引数は `rdi`・`rsi`・`rdx`・`r10`・`r8`、結果は `rax`。
+  `rcx` と `r11` は命令そのものが使い、戻ったときの中身は
   決まらない。ほかのレジスター、フラグ（`rflags` の利用者の部分）、拡張の状態は保たれる。
   `int $0x80` の入口は無い（一般保護例外でアプリが終わる）。libc の `__syscall` がこの形。
 - スレッドの FS と GS の基底はアプリのもの：`WRFSBASE`・`WRGSBASE` で直に書き、
@@ -25,8 +20,6 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   libc は FS を自分の TLS（x86-64 の variant II、`%fs:0` が自分の制御の塊）に使う。
 - `RDPID` は、そのスレッドが今走っている CPU の番号（0 から数える）を返す。
   読んだ直後に別の CPU へ移ることがあるので、目安にだけ使う（libc の `cpu_index`）。
-- 51（CPU の番号）と 52（スレッドの TLS の基底）は、入口を `SYSCALL` に移したときに
-  `RDPID`・`WRFSBASE` へ置き換えて消した。欠番のまま再利用しない。
 
 ## 1. ハンドル
 
@@ -49,26 +42,18 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   - 見張りでないハンドルの取り出しは `N_ERR_WRONG_KIND`。見張りはイベント待ち行列（§6）に入れて待つ。
     中身（値や内容）は運ばず、知らせを受けた側が持ち主の読み出し（`n_entry_info`、`n_document_load`、
     `n_audio_output` など）で読み直す。
-- 複製（`dup`／`dup2`）と、番号を指定した付け替えはない。子アプリへ渡す資源は
+- ハンドルの複製と、番号を指定した付け替えはない。子アプリへ渡す資源は
   起動時の引渡し表（§5）で明示する。
 
 ## 2. 結果コード
 
-- 失敗は `errno` ではなく負の `n_result` を直接返す。
-  `N_ERR_NOT_FOUND`、`N_ERR_EXISTS`、`N_ERR_DENIED`、`N_ERR_NO_MEMORY`、
-  `N_ERR_INVALID`、`N_ERR_WRONG_KIND`、`N_ERR_BUSY`、`N_ERR_NOT_READY`、
-  `N_ERR_CLOSED`、`N_ERR_TIMEOUT`、`N_ERR_CANCELLED`、`N_ERR_TOO_LARGE`、
-  `N_ERR_NOT_EMPTY`、`N_ERR_IO`、`N_ERR_UNSUPPORTED`。
-- `n_result_text(r)` が表示用の文を返す。ISO Cの関数が失敗理由を残す必要がある場合、
-  libcは `errno` に `n_result` の正の値を入れる（名前は `N_ERR_*` のみ）。
-- `nocturne.h`／`gpu.h`／`display.h` のlibc関数も同じで、`errno` は触らない：
-  ネットワーク（`net_*`、`udp_*`、`tcp_*`。ソケットは `n_handle`）、窓と画面
-  （`win_*`、`screen_*`、`clipboard_*`、`gui_launch`）、GPU（`gpu_*`、`gfx_render3d*`）、
-  `proclist`、`sysinfo`、`thread_stack_bounds`、`poweroff`／`reboot`。何かを作って渡す関数は
+- 結果コードの体系は無い。この文書の各所に残る `N_ERR_*` の名は、消した体系の名で、
+  `common/abi.h` には無い。
+- `nocturne.h`／`gpu.h`／`display.h` のlibc関数は `errno` を触らない。何かを作って渡す関数は
   出力引数に置いて `n_result` を返す（`win_open(w, h, title, flags, &win)`、
   `n_memory_reserve`。失敗では出力は NULL）。
 
-## 3. 文書とフォルダー（`open`／`lseek`／`readdir`／`chdir` の置き換え）
+## 3. 文書とフォルダー
 
 - ファイルシステムは一つ、ドライブも `C:` の一つだけ（ボリュームの形式は
   `common/store_format.h`、実装は `kernel/src/fs`。二台目のドライブや装置ごとの別の
@@ -80,8 +65,7 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   区別せずに比べ（Unicode の単純な畳み込み。表はボリュームが持つので、どのカーネルでも同じ）、
   付けられた形のまま保存・表示する。`n_entry_move` で同じ項目の大文字・小文字だけを変えられる。
 - 作業ディレクトリはない。カーネルは完全なパスだけを受け付け、`C:` だけ、`C:a`、`a` は
-  `N_ERR_INVALID`。シェルは自分の「現在のフォルダー」を持ち、起動するアプリへ設定
-  `FOLDER=` として渡す（§5）。
+  `N_ERR_INVALID`。
 - libc のパスの関数（`nocturne.h`）：
   - `n_path_is_complete(path)`：ドライブの後（無ければ先頭）に区切りがあるか。`C:\…`、`\…`、
     `/…` は完全。`C:` と `C:a` は現在のフォルダーとその中の `a`。
@@ -89,16 +73,12 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     `C:\`）の中で取る。完全な `name` はそれだけで決まる。結果は常に `C:\a\b` の形
     （大文字のドライブ、`\` 区切り、`.`／`..` 解決済み）。長さを返し、収まらなければ
     `N_ERR_TOO_LARGE`。
-  - 利用者が打った名前は `n_path_complete(name, out, cap)` で完全指定にする：設定 `FOLDER`
-    （無いか完全でなければ `C:\`）の中で `n_path_join` する。ISO Cの `fopen`／`remove`／
-    `rename` もこれを使う。
+  - 利用者が打った名前は `n_path_complete(name, out, cap)` で完全指定にする：`C:\` の中で
+    `n_path_join` する。ISO Cの `fopen`／`remove`／`rename` もこれを使う。
   - `n_path_name(path)`：最後の名前（根では `""`）。
   - `n_path_from_url(url, out, cap)`／`n_path_to_url(path, out, cap)`：`file:` URL と
     パスの変換（`file:///C:/Users/User/a%20b.html` ⇔ `C:\Users\User\a b.html`。ドライブの
     無い `file:///Users/User` も C:）。
-- アプリが自分の現在のフォルダーを変えるのは `n_folder_set(name)`：名前を完全指定にし、
-  フォルダーであることを確かめてから（違えば `N_ERR_NOT_FOLDER`）、自分の設定 `FOLDER` を
-  置き換える（以後の `n_path_complete` と、libcが起動するアプリへ渡す `FOLDER` に効く）。
 - C: の構成（`common/abi.h` の `N_FOLDER_*`）：
   - `C:\Nocturne`：システム。属性 SYSTEM の項目は、アプリは読めるが、それ自体も中身も
     変えられない（作成・削除・名前変更・書込みは `N_ERR_DENIED`）。`System`（システムの
@@ -106,12 +86,10 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     `Agent`、`Firmware` 等。`C:\Nocturne\Temp` はカーネルだけが使う（差し替え中の内容）。
   - `C:\Programs`：アプリ（`N_FOLDER_PROGRAMS`）。アプリごとに一つのフォルダー。利用者は
     アプリを入れられる。システムと一緒に入るアプリのフォルダーは SYSTEM。
-  - `C:\Users\<名前>`：利用者のフォルダー（設定 `USERFOLDER`、`n_user_folder()`）。アプリは
-    ここで始まる。`Desktop`、`Documents`、`Downloads`、`Music`、`Pictures`、`Videos`、
-    `AppData`。アプリのデータは `n_app_data_folder(name, out, cap)` が作って返す
-    `AppData\<name>`。`AppData\Temp` は一時フォルダー（設定 `TEMP`、`n_temp_folder()`）で、
-    起動のたびに空になる。
-  - UNIX の `/bin`、`/etc`、`/usr`、`/home`、`/tmp`、`/data` と、探索パス `PATH`、`HOME` は無い。
+  - `C:\Users\<名前>`：利用者のフォルダー。`Desktop`、`Documents`、`Downloads`、`Music`、
+    `Pictures`、`Videos`、`AppData`。アプリのデータは `n_app_data_folder(name, out, cap)` が
+    作って返す `AppData\<name>`。`AppData\Temp` は一時フォルダーで、起動のたびに空になる。
+    libc の `n_user_folder()`・`n_temp_folder()` は、アプリに渡る値が無いので `C:\` を返す。
 - 丸ごとの操作（通常の用途）：
   - `n_document_load(path, void **data, size_t *size)`：内容を新しい `n_memory` ページで
     受け取る。`n_memory_release(*data, *size)` で返す。
@@ -206,11 +184,11 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   閉じたのと同じで、文書のストリームは書き出してから保存する（`N_COMMIT_START`：次に開く
   アプリはその内容を読み、終了は媒体を待たない）。
 
-## 4. チャンネル（`pipe`／標準入出力fd の置き換え）
+## 4. チャンネル
 
 - チャンネルは**メッセージ単位**の双方向路。一回の送信が一つのメッセージになり、
   受信側は境界を保ったまま受け取る。大きな塊は共有ページを添付して送る。
-- `n_channel_pair(n_handle out[2])`：無名の対（現行 `pipe` の置き換え）。
+- `n_channel_pair(n_handle out[2])`：無名の対。
 - 名前付きの合流点：`n_channel_listen(key)` が鍵を（ハンドルが閉じるまで）占有し、
   `n_channel_connect(key)` はメッセージチャンネルの片端を返す。もう一端は合流点で
   待ち（`N_EVENT_RECEIVABLE`）、`n_channel_accept(listener)` で受け取る（無ければ
@@ -246,17 +224,10 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - ISO Cの入力は、`cap` より大きいメッセージを `N_CHANNEL_PEEK` で測り、バッファーを
   広げて丸ごと受け取る。長さ0のメッセージは読む内容が無いので次を待つ。
 - 端末は、子アプリの「入力」「出力」チャンネルとメッセージをやり取りする一つの
-  アプリにすぎない。ハンドルから端末かどうかを調べる手段（`isatty`）は無く、起動元が
-  設定 `TERMINAL` に端末へつながるハンドル番号を並べて伝える（例 `TERMINAL=0 1 2`）。
-  `n_terminal(h)` がこれを読む。端末はキー入力をそのまま送るので、行の編集と表示は
-  アプリ側（libcの `readline`）が行う。ISO Cの `stdout`／`stderr`／
-  `stdin` は、起動時に渡された出力／入力チャンネル（無ければ記録先のログ）に結び付く。
+  アプリにすぎない。ISO Cの `stdout`／`stderr`／`stdin` は、起動時に渡された出力／入力
+  チャンネル（無ければ記録先のログ）に結び付く。
   アプリが例外（ページフォルト等）で止められると、カーネルはその報告文を一つの
   メッセージとして記録先のログ（ハンドル2）へ送る。待ち行列が満杯なら待たずに捨てる。
-- Ctrl+C：端末はシェルにハンドル3として「割込み」チャンネルを渡し（設定
-  `INTERRUPTS=3`）、Ctrl+C ごとにメッセージを一つ送る。シェルは前面のジョブを
-  `n_app_stop(h, N_APP_STOP_TREE)` で止め、プロンプトでは入力中の行を取り消す。
-  シグナルは無い。
 - システムログ：`n_system_log_open()` は、送ったメッセージがシステムログ（カーネルの記録の輪。
   シリアルポートと、デスクトップが画面を取るまでの起動の画面が読む）へ加わるハンドルを返す。
   同じハンドルを `n_channel_receive` で読むと、ログの文字が来る：ハンドルごとに読んだ所を持ち、
@@ -266,42 +237,34 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   `n_system_log(buf, cap)` は最新のログを読む。C: への保存は init の仕事
   （`AppData\Nocturne\System.log`、前の起動の分は `System-previous.log`）。
 
-## 5. アプリ（`spawn`／`waitpid`／`kill`／`getpid` の置き換え）
+## 5. アプリ
 
 - `n_app_launch(path, const struct n_launch *)` がアプリハンドルを返す。
-  `n_launch` は引数列、設定の組（ISO Cの `getenv` が読む。`environ` は無い）、
-  引き渡すハンドルの表（入力・出力・ログのチャンネル、共有ページ等）を持つ。
-  - 設定は `"名前=値"` の形（`=` が無ければ `N_ERR_INVALID`）。起動されたアプリでは
-    `n_settings`（NULL終端）として読め、`getenv` もこれを引く。
-  - 引数と設定の文字列（各 nul を含む。カーネルが加える設定も数える）と、二つの NULL 終端
-    ポインター配列（1 個 8 バイト）は、合わせて `N_LAUNCH_MAX_BYTES`（4 MiB）まで。
-    超えると `N_ERR_TOO_MANY_ARGUMENTS`。
+  `n_launch` は引数列と、引き渡すハンドルの表（入力・出力・ログのチャンネル、共有ページ等）を持つ。
+  - 引数の文字列（各 nul を含む）と、その NULL 終端のポインター配列（1 個 8 バイト）は、
+    合わせて `N_LAUNCH_MAX_BYTES`（4 MiB）まで。カーネルは引数の数を `rdi`、配列を `rsi` に
+    入れてアプリを始める。
   - 引き渡すハンドルは、表の順に子アプリの 0, 1, 2, … 番になる（-1 は空き）。
   - `path` は完全指定（§3）。名前だけのプログラムは libc の `find_program(name, out, n)` が
-    `N_FOLDER_SYSTEM`、次に `N_FOLDER_PROGRAMS` の各アプリのフォルダーで探す（`PATH` は無い）。
+    `N_FOLDER_SYSTEM`、次に `N_FOLDER_PROGRAMS` の各アプリのフォルダーで探す。
     それ以外の名前は `n_path_complete` で完全指定にする。
-  - 起動されたアプリは作業フォルダーを持たない。利用者の名前を受け取るアプリのために、
-    起動元は自分の現在のフォルダーを設定 `FOLDER=C:\…` で渡す（§3の `n_path_complete`）。
-    子アプリは起動元と同じ利用者のために働く：libc の `n_app_launch` は、起動が名指さなければ
-    起動元自身の `USERFOLDER` と `TEMP` を渡す（ブラウザーの窓と、その Worker・保存・設定の窓が
-    同じ profile を使う）。どちらも無い起動には、カーネルがシステムの利用者のものを加える。
+  - 起動されたアプリは作業フォルダーを持たない。
 - 終了はアプリハンドルのイベント（§6）で届く。`n_app_result(h, timeout_ms, int *status)` で
-  直接待つこともできる（-1 は無期限、0 は待たずに `N_ERR_NOT_READY`、期限切れは
-  `N_ERR_TIMEOUT`）。ゾンビの回収は無く、最後のハンドルを閉じれば記録は消える。
-- `n_app_stop(h, N_APP_STOP_TREE か 0)`：停止要求。シグナルは無い。
+  直接待つこともできる（-1 は無期限、0 は待たない）。最後のハンドルを閉じれば記録は消える。
+- `n_app_stop(h, 0)`：停止要求。
 - スレッド：`thread_create(fn, arg)` は 256 KiB、`thread_create_sized(fn, arg, bytes)` は
   少なくとも `bytes` のスタック（ページは初めて触れたときに割り当てる）で `fn` を動かし、
   0 にならない識別子を返す。終わったスレッドは `thread_join` か `thread_detach` まで残る。
   `thread_detach` 後は終わり次第カーネルが解放し、join はできない（`N_ERR_INVALID`）。
   アプリの終了は全スレッドを止めて回収する。
-- `n_app_self()`、`n_app_parent()`：アプリ識別子（共有ページの受渡しの許可判定用）。
+- `n_app_self()`：アプリ識別子（共有ページの受渡しの許可判定用）。
 - `n_app_open(id)`：アプリ一覧の識別子から、動作中のアプリのハンドルを得る（タスク
   マネージャーや `kill` が `n_app_stop` するため）。`n_app_id(h)`：ハンドルの識別子
   （終了後も同じ。識別子は 2^31 個を配り終えるまで再利用しない）。
 - `n_app_list`、`n_system_info` 等の状態取得は現行の `proclist`（件数）／`sysinfo`（0）を
   引き継ぐ。どちらも失敗では負の `n_result`。
 
-## 6. イベント待ち行列（`poll`／`O_NONBLOCK`／`fcntl` の置き換え）
+## 6. イベント待ち行列
 
 - `n_events_create()` が待ち行列を作る。各スレッドは任意の数を持てる。
 - `n_events_watch(q, h, interest, token)`：ハンドルの関心事を登録。
@@ -311,16 +274,13 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   待ち行列を待ち行列に入れることはできない（`N_ERR_WRONG_KIND`）。
 - 報告は状態に基づく（レベル）。準備ができたままのハンドルは毎回の待ちで報告される。
 - 監視はハンドルを保持しない。ハンドルが最後に閉じられると監視も消える。
-- 現行のアドレス監視はこの待ち行列へ統合した：`n_events_watch_address(q, address,
-  expected, token)`。値が既に違えば `N_ERR_NOT_READY`。通知されると `N_EVENT_ADDRESS`。
 - タイマー：`n_events_timer(q, ms, repeat, token)`。`N_EVENT_TIMER` で届く。繰返しの
   タイマーは遅れた分をまとめて報告せず、周期を保つ。
-- `n_events_unwatch(q, token)`：その token の監視・タイマー・アドレス監視を外す。
-  0＝無かった、1＝外した、2＝アドレスの通知が既に届いていた（取り消した）。
+- `n_events_unwatch(q, token)`：その token の監視・タイマーを外す。0＝無かった、1＝外した。
 - `n_events_wait(q, struct n_event *out, max, timeout_ms)`：届いた分を一括で返す
   （一回に最大64件。残りは次の待ちで返る）。-1 は無期限、0 は待たない。
 
-## 7. メモリ（`sbrk`／`mmap`／`mprotect` の置き換え）
+## 7. メモリ
 
 - `n_memory_reserve(bytes, n_memory_access, &memory)`：ゼロ初期化の領域を確保し、
   `memory` に置く（失敗では NULL と負の `n_result`）。大きさの独自上限は無い：
@@ -392,7 +352,7 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     書込み権を外したページは、`n_memory_protect` で書込みに戻しても、次の書込みでまたページャーに
     尋ねる。
   - CUDA の統合メモリ（NVIDIA UVM、`ports/nvidia/README.md`）はこれで CPU 側の写像を作る。
-    UNIX 系の HMM が前提とする仕組みのうち、無いものは次のとおり：アプリの普通のメモリ
+    無いものは次のとおり：アプリの普通のメモリ
     （`n_memory_reserve`、プログラムの像、スタック）を GPU が直接共有すること（ページャー付き
     メモリとして作った範囲だけが GPU と CPU で同じアドレスを持つ）、アプリのページ表の変化を
     ドライバーへ通知する仕組み（ページャー付きメモリでは中身をページャー自身が決めるので要らない）、
@@ -403,16 +363,12 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   領域の大きさはヒープの1/16（256KiB〜8MiB）。最新の領域だけ末尾の空きを一つ分温存し、
   それ以外の領域の末尾の空きはページ単位で返し、全部空いた古い領域は丸ごと返す。
   1MiB以上のブロックは専用の領域で、解放すれば即座に返る。
-- アドレス待ち：`wait_on_address(addr, expected, ms)`／`wait_on_address64` は起こされると0、
-  語が `expected` でなければ `-N_ERR_NOT_READY`、期限で `-N_ERR_TIMEOUT`、アプリ停止中は
-  `-N_ERR_STOPPED` を直接返す（`errno` は触らない）。`wake_address(addr, count)` は起こした数
-  （`count == 0` は全員）。`ms == UINT32_MAX` は無期限。共有ページ上でもアプリをまたいで働く。
 
 ## 8. 時間
 
 - `n_clock_uptime_ms()`、`n_clock_wall()`（壁時計の秒）、`n_sleep_ms(ms)`（結果は無い。
   旧 `msleep` は削除した。ISO Cの `thrd_sleep` はこれの上に作る）。
-- `n_random(buf, n)`：システムのエントロピーから `n` バイト（`/dev/urandom` の置き換え）。
+- `n_random(buf, n)`：システムのエントロピーから `n` バイト。
 - `gettimeofday`、`struct timeval` は無い。ISO Cの `time`／`timespec_get`／`localtime` は
   これらの上に実装する。
 
@@ -806,27 +762,13 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     map 構築も取消対象として追跡し、取消済み範囲に後から PTE を設置しない。
     まだ返却していない構築中 VA へ別 thread が release/protect を要求した場合は `N_ERR_NOT_READY`。
 
-## 10. 移行の段階
+## 10. 番号と、ほかの節に無い呼出し
 
-1. この文書。新システムコールを旧ABIと並べてカーネルへ追加し、`nocturne.h` に宣言する
-   （番号は128から。`tests/nativeabitest.c` がゲスト内で実カーネルを確かめる）。
-2. libc（stdio、malloc、time、getenv）を新ABIへ移す。
-3. OS自身のアプリ（ブラウザー、端末、シェル、ファイル、coreutils 等）を新ABIへ移す。
-4. 移植物のソースを新ABIへ直接書き換える。tcc がゲスト内でコンパイルする
-   プログラム用のヘッダーも新ABIだけにする。
-5. 旧システムコールと `fcntl.h`／`unistd.h`／`sys/*.h`／`alloca.h`、`O_*`、`F_*`、
-   `N_POLL*`、POSIX型（`ssize_t`、`pid_t`、`off_t`、`mode_t`）を削除する。
+欠番：1〜18、22〜25、30〜32、35〜37、48〜49、51〜52、57、60〜63、89、90、99〜106、
+109〜110、113〜116、151、155、203〜206。ハンドルの種類 12 も欠番。欠番は再利用せず、
+残る番号は意味を変えない（OS内で tcc 等が作ったプログラムのため）。
 
-各段階で `make qemu-image` によるビルドと、QEMU実画面でのブラウザー・端末・
-ファイル操作の確認を行う。旧ABIの削除は、全利用箇所が新ABIへ移った後に限る。
-
-段階5で削除した番号（1〜18、22〜25、30〜32、35〜37、57、59〜63、90）は欠番のまま
-再利用しない。残る番号は意味を変えない（OS内で tcc 等が作ったプログラムのため）。
-旧番号を使って作ったプログラムは作り直しが要る。カーネルが利用者の設定を持った a51c4398 の
-203〜206（`SYS_USER_SETTINGS_WATCH`、`SYS_USER_SETTINGS_CHANGES`、`SYS_USER_LANGUAGES`、
-`SYS_USER_LANGUAGES_SET`）とハンドルの種類 12（`N_KIND_USER_SETTINGS`）も、設定の持ち主の作り直し
-（`docs/settings-ownership-20261027.md`：値を効かせる者が自分の文書に保存する）で欠番にした。振り分けと
-宣言は消してあり（カーネルは `N_ERR_UNSUPPORTED` を返す）、番号は再利用しない。新たに加えたもの：
+ほかの節に無い呼出し：
 
 - `SYS_WIN_RECEIVE`（窓、`struct gui_event *out`、最大数、`timeout_ms`）：待ち行列から
   入るだけ一度に受け取る。件数、期限で0、閉じた窓が最後のイベントを渡し終えると

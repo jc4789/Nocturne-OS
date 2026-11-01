@@ -750,12 +750,6 @@ static struct udp_dgram *udp_wait(int i, uint64_t deadline, int *err) {
     }
 }
 
-static struct udp_sock *user_udp(int h) {
-    if(h<0 || (size_t)h>=udp_capacity)return NULL;
-    struct udp_sock *s=udp_socks[h];
-    return s && s->used && !s->internal && s->pid==process_current()->pid?s:NULL;
-}
-
 /* ---------------------------------------------------------------- DHCP */
 
 enum { DHCP_IDLE, DHCP_DISCOVER, DHCP_REQUEST, DHCP_BOUND };
@@ -2059,76 +2053,6 @@ static uint16_t tcp_local_port(uint32_t ip,uint16_t remote) {
     return 0;
 }
 
-static bool tcp_port_listening(uint32_t ip, uint16_t port) {
-    for(size_t i=0;i<tcp_capacity;i++)
-        if(tcbs[i] && tcbs[i]->state==T_LISTEN && tcbs[i]->lport==port &&
-           (!ip || !tcbs[i]->lip || tcbs[i]->lip==ip))return true;
-    return false;
-}
-
-static int64_t sys_tcp_listen(uint32_t ip, uint16_t port, int backlog) {
-    if (ip && !ip_is_local(ip)) return -N_ERR_INVALID;
-    if (!port) {
-        /* an ephemeral port no listener or connection is using */
-        for (unsigned attempt=0;attempt<16384 && !port;attempt++) {
-            uint16_t candidate=ephemeral_port();
-            bool used=false;
-            for (size_t i=0;i<tcp_capacity && !used;i++)
-                used=tcbs[i] && tcbs[i]->state!=T_FREE && tcbs[i]->lport==candidate;
-            if (!used) port=candidate;
-        }
-        if (!port) return -N_ERR_ADDRESS_IN_USE;
-    } else if (tcp_port_listening(ip, port)) return -N_ERR_ADDRESS_IN_USE;
-    int h=tcp_alloc_slot();if(h<0)return h;
-    struct tcb *t=tcbs[h];
-    tcb_clear(t);
-    t->pid=process_current()->pid;
-    if(++tcp_generation==0)++tcp_generation;
-    t->generation=tcp_generation;
-    t->user_open=true;
-    t->lip=ip;
-    t->lport=port;
-    t->backlog=backlog>0?backlog:TCP_BACKLOG_DEFAULT;
-    t->state=T_LISTEN;
-    return h;
-}
-
-static struct tcb *tcp_next_accept(const struct tcb *listener) {
-    struct tcb *best=NULL;
-    for (size_t i=0;i<tcp_capacity;i++) {
-        struct tcb *c=tcbs[i];
-        if (!c || !c->accept_pending || c->listener!=listener->generation) continue;
-        if (c->state!=T_ESTABLISHED && c->state!=T_CLOSE_WAIT) continue;
-        if (!best || c->accept_order<best->accept_order) best=c;
-    }
-    return best;
-}
-
-static int64_t sys_tcp_accept(int h, uint64_t deadline, struct n_sockaddr *remote) {
-    struct tcb *l=user_tcb(h);
-    if (!l) return -N_ERR_NO_HANDLE;
-    if (l->state!=T_LISTEN && l->state!=T_CLOSED) return -N_ERR_INVALID;
-    if (remote && !user_ok_w(remote,sizeof *remote)) return -N_ERR_BAD_ADDRESS; /* before the wait */
-    uint64_t generation=l->generation;
-    for (;;) {
-        if (l->generation!=generation || !l->user_open) return -N_ERR_NO_HANDLE;
-        if (l->state!=T_LISTEN) return l->err?l->err:-N_ERR_CLOSED;
-        struct tcb *c=tcp_next_accept(l);
-        if (c) {
-            /* a sibling thread may have revoked the page while this one slept:
-               the connection then stays for a later accept */
-            struct n_sockaddr peer={.ip=c->rip,.port=c->rport};
-            if (remote && copy_to_user(remote,&peer,sizeof peer)<0) return -N_ERR_BAD_ADDRESS;
-            c->accept_pending=false;
-            c->user_open=true;
-            for (size_t i=0;i<tcp_capacity;i++) if (tcbs[i]==c) return (int64_t)i;
-        }
-        if (thread_current()->killed) return -N_ERR_STOPPED;
-        if (clock_now_ns()>=deadline) return -N_ERR_NOT_READY;
-        net_sleep(&l->progress, deadline, false);
-    }
-}
-
 /* An active open, the address resolution and the handshake both by deadline: the connection's
    number, or an error. */
 static int64_t tcp_connect_until(uint32_t ip, uint16_t port, uint64_t deadline) {
@@ -2567,10 +2491,9 @@ static bool owner_hold(void) {
     return r >= 0;
 }
 
-/* The calls that give the app sockets of its own, or set its fault settings. */
+/* The calls that set the app's fault settings or run its lookups. */
 static bool owner_needed(int num) {
-    return num == SYS_UDP_SOCKET || num == SYS_TCP_CONNECT || num == SYS_TCP_LISTEN || num == SYS_NET_TEST ||
-           num == SYS_NET_DNS || num == SYS_NET_DNS_ALL;
+    return num == SYS_NET_TEST || num == SYS_NET_DNS || num == SYS_NET_DNS_ALL;
 }
 
 bool net_config(uint8_t mac[6], uint32_t *ip, uint32_t *mask, uint32_t *gw, uint32_t *dns) {
@@ -2637,64 +2560,9 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
             (n && copy_to_user((void *)b,answer.ips,n*sizeof(uint32_t))<0)) result=-N_ERR_BAD_ADDRESS;
         kfree(answer.ips);return result;
     }
-    case SYS_UDP_SOCKET:
-        if (!nif) return -N_ERR_NETWORK_DOWN;
-        return udp_alloc((uint16_t)a, process_current()->pid);
-    case SYS_UDP_SEND: {
-        struct udp_sock *s = user_udp((int)a);
-        if (!s) return -N_ERR_NO_HANDLE;
-        if (e > 1472) return -N_ERR_INVALID;
-        uint8_t tmp[1472];
-        if (copy_from_user(tmp, (const void *)d, e) < 0) return -N_ERR_BAD_ADDRESS;
-        uint8_t mac[6];
-        uint64_t generation=s->generation;
-        int r = arp_resolve((uint32_t)b, mac);
-        if (r < 0) return r;
-        if(!s->used || s->generation!=generation)return -N_ERR_NO_HANDLE;
-        r = udp_output(s->port, ip_source((uint32_t)b), (uint32_t)b, (uint16_t)c, mac, tmp, e);
-        return r < 0 ? r : (int64_t)e;
     }
-    case SYS_UDP_RECV: {
-        struct udp_sock *s = user_udp((int)a);
-        if (!s) return -N_ERR_NO_HANDLE;
-        if (!user_ok_w((void *)b, c)) return -N_ERR_BAD_ADDRESS;
-        struct n_sockaddr *from = (struct n_sockaddr *)e;
-        if (from && !user_ok_w(from, sizeof *from)) return -N_ERR_BAD_ADDRESS;
-        int err = 0;
-        struct udp_dgram *dg = udp_wait((int)a, syscall_deadline((int)d), &err);
-        if (!dg) return err;
-        /* The datagram is out of the queue: its slot stays as it is while net_lock is held. */
-        size_t n = MIN(c, dg->len);
-        struct n_sockaddr source = {.ip = dg->src, .port = dg->sport};
-        if (copy_to_user((void *)b, dg->data, n) < 0 || (from && copy_to_user(from, &source, sizeof source) < 0))
-            return -N_ERR_BAD_ADDRESS;
-        return (int64_t)n;
     }
-    case SYS_UDP_CLOSE: {
-        struct udp_sock *s = user_udp((int)a);
-        if (!s) return -N_ERR_NO_HANDLE;
-        udp_release(s);
-        return 0;
     }
-    case SYS_TCP_CONNECT:
-        if (!nif) return -N_ERR_NETWORK_DOWN;
-        return tcp_connect_until((uint32_t)a, (uint16_t)b,
-                                 clock_after((uint64_t)((int)c > 0 ? (int)c : TCP_CONNECT_DEFAULT) * NS_PER_MS));
-    case SYS_TCP_SEND: return tcp_send_data((int)a, (const uint8_t *)b, c, CLOCK_NEVER, true, false);
-    case SYS_TCP_SEND_UNTIL:
-        /* d: the ms since boot it gives up at (on the clock's axis), 0 for none */
-        if(e&~(uint64_t)N_TCP_SEND_NONBLOCK)return -N_ERR_INVALID;
-        return tcp_send_data((int)a, (const uint8_t *)b, c,
-                             !d || d > CLOCK_NEVER / NS_PER_MS ? CLOCK_NEVER : d * NS_PER_MS, true,
-                             (e&N_TCP_SEND_NONBLOCK)!=0);
-    case SYS_TCP_CANCEL: {
-        struct tcb *t = user_tcb((int)a);
-        if (!t) return -N_ERR_NO_HANDLE;
-        tcp_reset(t, -N_ERR_CANCELLED);
-        /* Aborted bytes are never exposed by a later receive and unsent
-           prefixes are never emitted after cancellation. */
-        t->rx_len=t->tx_len=0;t->nooo=0;
-        return 0;
     }
     case SYS_NET_STATS: {
         struct n_netstats stats = {0};
@@ -2706,7 +2574,6 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         if (nif && nif->get_stats) nif->get_stats(&stats);
         return copy_to_user((void *)a, &stats, sizeof stats);
     }
-    case SYS_TCP_RECV: return tcp_recv_data((int)a, (uint8_t *)b, c, syscall_deadline((int)d), true);
     case SYS_NET_TEST: {
         /* a: fault settings for this process's TCP connections (or NULL); b: counters out (or NULL) */
         if (a) {
@@ -2721,36 +2588,8 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         }
         return 0;
     }
-    case SYS_TCP_CLOSE: {
-        struct tcb *t = user_tcb((int)a);
-        if (!t) return -N_ERR_NO_HANDLE;
-        tcp_close(t);
-        return 0;
     }
-    case SYS_TCP_LISTEN:
-        if (!nif) return -N_ERR_NETWORK_DOWN;
-        if (a > UINT32_MAX || b > UINT16_MAX) return -N_ERR_INVALID;
-        return sys_tcp_listen((uint32_t)a, (uint16_t)b, (int)c);
-    case SYS_TCP_ACCEPT: return sys_tcp_accept((int)a, syscall_deadline((int)b), (struct n_sockaddr *)c);
-    case SYS_TCP_ADDRESS: {
-        struct tcb *t = user_tcb((int)a);
-        if (!t) return -N_ERR_NO_HANDLE;
-        struct n_sockaddr local = {.ip = t->state == T_LISTEN ? t->lip : ip_source(t->rip), .port = t->lport};
-        struct n_sockaddr remote = {.ip = t->rip, .port = t->rport};
-        if ((b && copy_to_user((void *)b, &local, sizeof local) < 0) ||
-            (c && copy_to_user((void *)c, &remote, sizeof remote) < 0))
-            return -N_ERR_BAD_ADDRESS;
-        return 0;
     }
-    case SYS_TCP_FINISH: {
-        struct tcb *t = user_tcb((int)a);
-        if (!t) return -N_ERR_NO_HANDLE;
-        if (t->fin_pending) return 0;
-        if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT)
-            return t->state == T_CLOSED && t->err ? t->err : -N_ERR_NOT_CONNECTED;
-        t->fin_pending = true; /* tcp_push sends the FIN once the queued data is out */
-        tcp_push(t, false);
-        return 0;
     }
     }
     return -N_ERR_UNSUPPORTED;

@@ -15,19 +15,14 @@
 | `boot.c`・`init.c` | 起動の流れ。`kmain` から `kmain_late` へ進み、`C:\Nocturne\System\init` を起こす。 |
 | `arch/cpu.c` | CPUID の唯一の読み手。下限 Zen 4 を照らし、任意の機能（PCID、MWAIT など）の有無と TSC の周波数を持つ。どの CPU も `cpu_setup` で同じ初期化をする。 |
 | `arch/topology.c` | MADT・SRAT・SLIT から CPU・core・LLC・NUMA node と node の距離を数える。CPU の数に上限は無い。 |
-| `arch/percpu.h`・`cpuset.h` | per-CPU 変数（`PERCPU`、`this_cpu`、`per_cpu`）と CPU の集合。 |
 | `arch/smp.c`・`wake.c` | AP の起動、panic のときの NMI による停止、S3 からの復帰。 |
-| `arch/spin.h`・`preempt.h` | MCS spinlock と、CPU ごとの `preempt_count`。 |
-| `arch/irq.c`・`apic.c`・`ioapic.c`・`lapic_timer.c` | CPU ごとの vector の表、x2APIC と IPI、IOAPIC、TSC-deadline timer。 |
+| `arch/spin.h` | MCS spinlock。 |
+| `arch/irq.c`・`apic.c`・`ioapic.c`・`lapic_timer.c` | CPU ごとの vector の表、x2APIC と IPI、IOAPIC、LAPIC の timer（CPU に TSC-deadline があればそれ、無ければ one-shot）。 |
 | `arch/idt.c`・`gdt.c`・`isr.asm` | IDT・GDT・TSS と、syscall・例外・割り込みの入口。 |
 | `arch/fpu.c`・`idle.c`・`pat.c` | XSAVES による FPU の保存、MWAIT か HLT による idle、PAT。 |
-| `mm/` | `bootmem`（初期の確保）、`pmm`（NUMA node ごとの buddy と per-CPU の頁の cache）、`vmm`（4 段の page table、PCID、TLB shootdown）、`vmalloc`（カーネルの仮想番地）、`heap`（`kmalloc` と slab）。 |
 | `lib/` | `span`（区間の AVL 木）、`avl`、`idtable`、`lz`、`printf`、`sort`、`string`。 |
-| `sys/process.c`・`thread.c`・`proc.c` | process と thread。`proc_launch` が ELF のアプリを起こす。 |
-| `sys/sched.c` | preemptive な scheduler。CPU ごとの run queue を持ち、級は実時間と公平（EEVDF）の二つ。 |
-| `sys/wait.c`・`address_wait.c` | wait queue、mutex、`sleep_until`、`SYS_WAIT_ADDRESS` の番地の待ち。 |
+| `sys/proc.c` | `proc_launch` が ELF のアプリを起こす。 |
 | `sys/clock.c`・`alarm.c` | TSC による三つの時計（monotonic、boot、wall）と、CPU ごとの期限の heap。 |
-| `sys/epoch.c` | lock を取らずに読むものの遅延解放。grace period は LLC の群ごとに数える。 |
 | `sys/object.c`・`channel.c`・`events.c`・`watch.c` | object と handle の表、channel、event queue、watch。 |
 | `sys/syscall.c` | syscall の受け口 `syscall_dispatch`。 |
 | `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console と system log の stream、profiler。 |
@@ -93,8 +88,7 @@
 ```
 user/libc/sys.c の SYSCALL
   → arch/isr.asm の syscall_entry（thread のカーネル stack へ移る）
-  → sys/syscall.c の syscall_dispatch（アプリのメモリーは copy_from_user・copy_to_user だけで触る）
-  → sys/sched.c の sched_user_return（ring 3 へ戻る前の切り替えの点）
+  → sys/syscall.c の syscall_dispatch
   → SYSRET
 例外は arch/idt.c の isr_exception。NMI・#DB・#MC・#DF は CPU ごとの IST の stack で受ける。
 割り込みは arch/irq.c の isr_interrupt。CPU ごとの割り込みの stack で受け、眠らない。

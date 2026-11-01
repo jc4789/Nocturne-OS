@@ -142,14 +142,6 @@ static const char *program_name(const char *path) {
     return name;
 }
 
-/* Whether the launcher gave the setting name ("NAME=..."). */
-static bool setting_given(const struct proc_launch *l, const char *name) {
-    size_t n = strlen(name);
-    for (int i = 0; i < l->setting_count; i++)
-        if (!strncmp(l->settings[i], name, n) && l->settings[i][n] == '=') return true;
-    return false;
-}
-
 /* n bytes of the program document doc from offset into p's memory at va, through buf
    (LOAD_CHUNK bytes): a program is never read whole into the kernel's memory. */
 #define LOAD_CHUNK (256 * 1024)
@@ -246,30 +238,13 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     p->mmap_next = USER_MMAP_BASE;
     p->low_base = p->low_next = MAX(USER_LOW_BASE, ALIGN_UP(top, PAGE_SIZE)); /* above the program image */
 
-    /* The settings: the launcher's, then those of the system it did not give: the user's folder
-       and temporary folder. */
-    char user[sizeof "USERFOLDER=C:\\Users\\" + 255], temp[sizeof user + sizeof "\\AppData\\Temp"];
-    const char *own[2];
-    int owned = 0;
-    if (!setting_given(l, "USERFOLDER")) {
-        ksnprintf(user, sizeof user, "USERFOLDER=%s", store_user_folder());
-        own[owned++] = user;
-    }
-    if (!setting_given(l, "TEMP")) {
-        ksnprintf(temp, sizeof temp, "TEMP=%s", store_user_temp());
-        own[owned++] = temp;
-    }
-#define SETTING(i) ((i) < l->setting_count ? l->settings[i] : own[(i) - l->setting_count])
-
-    /* User stack: the argument and setting strings, then their two
-       null-terminated pointer arrays. They must fit well inside the stack. */
+    /* User stack: the argument strings, then their null-terminated pointer
+       array. They must fit well inside the stack. */
     _Static_assert(N_LAUNCH_MAX_BYTES <= USER_STACK_MAX / 2, "launch strings must leave the stack room");
-    int settings = l->setting_count + owned;
     size_t strings = 0;
     for (int i = 0; i < argc; i++) strings += strlen(argv[i]) + 1;
-    for (int i = 0; i < settings; i++) strings += strlen(SETTING(i)) + 1;
-    size_t pointer_bytes = ((size_t)argc + 1 + (size_t)settings + 1) * 8;
-    if (strings + pointer_bytes > N_LAUNCH_MAX_BYTES) { r = -N_ERR_TOO_MANY_ARGUMENTS; goto fail; }
+    size_t pointer_bytes = ((size_t)argc + 1) * 8;
+    if (strings + pointer_bytes > N_LAUNCH_MAX_BYTES) goto fail;
     pointers = kmalloc(pointer_bytes);
     if (!pointers) { r = -N_ERR_NO_MEMORY; goto fail; }
     /* pre-fault what the start needs plus 64 KiB; the rest grows on demand */
@@ -282,13 +257,6 @@ int proc_launch(const char *path, const struct proc_launch *l) {
             goto fail;
         }
     uint64_t sp = USER_STACK_TOP;
-    for (int i = settings - 1; i >= 0; i--) {
-        size_t n = strlen(SETTING(i)) + 1;
-        sp -= n;
-        if (vmm_copy_to_space(p->vmm_space, sp, SETTING(i), n) < 0) goto fail;
-        pointers[argc + 1 + i] = sp;
-    }
-#undef SETTING
     for (int i = argc - 1; i >= 0; i--) {
         size_t n = strlen(argv[i]) + 1;
         sp -= n;
@@ -296,12 +264,11 @@ int proc_launch(const char *path, const struct proc_launch *l) {
         pointers[i] = sp;
     }
     pointers[argc] = 0;
-    pointers[argc + 1 + settings] = 0;
     sp = ALIGN_DOWN(sp, 16);
     sp -= pointer_bytes;
     sp = ALIGN_DOWN(sp, 16);
     if (vmm_copy_to_space(p->vmm_space, sp, pointers, pointer_bytes) < 0) goto fail;
-    uint64_t argv_ptr = sp, settings_ptr = sp + ((uint64_t)argc + 1) * 8;
+    uint64_t argv_ptr = sp;
     kfree(pointers);
     pointers = NULL;
     sp -= 8; /* fake return address slot keeps the ABI alignment */
@@ -316,7 +283,6 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     frame.ss = USER_DS;
     frame.rdi = argc;
     frame.rsi = argv_ptr;
-    frame.rdx = settings_ptr;
     thread_enter_user(p->main, &frame);
 
     /* Its pid is its main thread's tid; once it runs it may end, and its record go, at any time. */
@@ -329,7 +295,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
         rec->pid = pid;
         spin_unlock(&rec->wait.lock, f);
     }
-    process_start(p, l->parent, l->app);
+    process_start(p, l->app);
     return pid;
 
 fail:
@@ -347,11 +313,7 @@ int proc_spawn_simple(const char *path, const char *arg1) {
     char *argv[3] = {(char *)path, (char *)arg1, NULL};
     struct handle *nul = stream_null_open();
     struct handle *handles[3] = {nul, nul, nul};
-    char folder[sizeof "FOLDER=C:\\Users\\" + 255];
-    ksnprintf(folder, sizeof folder, "FOLDER=%s", store_user_folder());
-    char *settings[] = {folder};
-    struct proc_launch l = {.argc = arg1 ? 2 : 1, .argv = argv, .setting_count = 1, .settings = settings,
-                            .handles = handles, .handle_count = 3};
+    struct proc_launch l = {.argc = arg1 ? 2 : 1, .argv = argv, .handles = handles, .handle_count = 3};
     int r = proc_launch(path, &l);
     handle_close(nul);
     return r;

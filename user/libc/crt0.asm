@@ -1,5 +1,4 @@
-; Nocturne user entry point: kernel passes argc in rdi, argv in rsi and the
-; NULL-terminated launch settings in rdx.
+; Nocturne user entry point: kernel passes argc in rdi and argv in rsi.
 bits 64
 section .text._start progbits alloc exec nowrite align=16
 global _start
