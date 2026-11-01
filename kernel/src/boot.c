@@ -179,7 +179,7 @@ void kmain(void) {
        software-disabled holds every entry masked, APM vol. 2 16.4.7). */
     irq_init();
     cpu_mca_interrupt_on();
-    clock_init(); /* the TSC at the P0 P-state's rate (measured on against the HPET) or a hypervisor's */
+    clock_init(); /* the TSC's rate: stated or measured, and held to a rate reference */
     sched_init();
     address_wait_init();
     epoch_init(); /* its workers, which free what readers might still see */

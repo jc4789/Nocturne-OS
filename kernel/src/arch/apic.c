@@ -23,7 +23,6 @@
 #define LAPIC_LDR 0xD0     /* the logical x2APIC ID, read-only (13.12.10.2) */
 #define LAPIC_SVR 0xF0
 #define LAPIC_ESR 0x280
-#define LAPIC_LVT_CMCI 0x2F0
 #define LAPIC_LVT_THERMAL 0x330
 #define LAPIC_LVT_PERF 0x340
 #define LAPIC_LVT_LINT0 0x350
@@ -32,8 +31,6 @@
 #define IA32_APIC_BASE 0x1B
 #define APIC_BASE_ENABLE (1ULL << 11)
 #define APIC_BASE_X2 (1ULL << 10)
-#define IA32_MCG_CAP 0x179
-#define MCG_CMCI_P (1ULL << 10)
 /* ICR and LVT fields (13.6.1, 13.5.1): delivery mode 10:8, logical destination 11, level assert
    14 (to be 1 but for INIT de-assert), polarity 13 (LINTn: 1 active low) */
 #define DELIVER_NMI (4u << 8)
@@ -57,7 +54,6 @@ struct lint_nmi {
 };
 static struct lint_nmi *nmis;
 static unsigned nnmis;
-static bool cmci; /* Intel's CMCI LVT entry: IA32_MCG_CAP's MCG_CMCI_P (SDM Vol. 3B 18.2.1); AMD reserves the bit */
 PERCPU static uint32_t logical_id; /* this CPU's LDR */
 
 static enum irq_result apic_error(void *context) {
@@ -68,7 +64,6 @@ static enum irq_result apic_error(void *context) {
 }
 
 void apic_init(void) {
-    cmci = cpu_features.vendor == CPU_VENDOR_INTEL && (rdmsr(IA32_MCG_CAP) & MCG_CMCI_P);
     const struct acpi_sdt *madt = acpi_find("APIC", 0);
     const struct acpi_entry *e;
     for (int pass = 0; pass < 2; pass++) {
@@ -107,7 +102,7 @@ static bool x2apic_enter(void) {
 
 /* The registers but the APIC ID are not kept across a mode transition (13.12.5): all written.
    Every architectural LVT entry the APIC has is masked first (13.4.8: Max LVT Entry; CMCI where
-   IA32_MCG_CAP lists it), with a vector of 16 or above, as 0 to 15 in a Fixed entry may raise an
+   the CPU has it, cpu_features.cmci), with a vector of 16 or above, as 0 to 15 in a Fixed entry may raise an
    illegal vector error even masked (13.5.2). AMD's extended LVT (APM 16.4.5) is not touched here.
    Then the spurious-interrupt register, written whole (13.9): VEC_SPURIOUS, the APIC enabled, EOI
    broadcasts to the IOAPICs kept (the level pins need them), focus checking. Only an enabled
@@ -123,7 +118,7 @@ bool apic_init_cpu(void) {
     lapic_write(LAPIC_LVT_LINT1, LVT_UNUSED);
     if (max_lvt >= 4) lapic_write(LAPIC_LVT_PERF, LVT_UNUSED);
     if (max_lvt >= 5) lapic_write(LAPIC_LVT_THERMAL, LVT_UNUSED);
-    if (max_lvt >= 6 && cmci) lapic_write(LAPIC_LVT_CMCI, LVT_UNUSED);
+    if (max_lvt >= 6 && cpu_features.cmci) lapic_write(LAPIC_LVT_CMCI, LVT_UNUSED);
     lapic_write(LAPIC_SVR, SVR_ENABLE | VEC_SPURIOUS);
     lapic_write(LAPIC_ESR, 0);
     lapic_write(LAPIC_LVT_ERROR, VEC_APIC_ERROR);

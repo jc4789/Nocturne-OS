@@ -1,7 +1,7 @@
 /* The CPUs and the memory nodes (arch/topology.h). An APIC ID is hierarchical: its low bits name
    the thread within a core, the next the core, and so on up to the package, each level's ID
    being the APIC ID shifted right past the levels below it (Intel SDM vol. 3A 11.9, CPUID leaves
-   0x1F and 0xB; AMD APM vol. 2 7.6.5). The shifts are the first CPU's; every CPU of the machine
+   0x1F and 0xB; AMD APM vol. 2 7.6.5, and vol. 3 E.4.24's 0x80000026 for the die). The shifts are the first CPU's; every CPU of the machine
    has the same, which each one checks when it starts. The last-level cache is shared by the IDs
    that agree above the shift its sharing count rounds up to (leaf 4, AMD's 0x8000001D). The
    nodes are the SRAT's proximity domains (ACPI 6.5 5.2.16), the distances the SLIT's (5.2.17).
@@ -61,11 +61,25 @@ static void read_levels(void) {
         below = a & 0x1F;
     }
     shift.package = below;
+
+    /* AMD names its die in leaf 8000_0026h, where 0xB has no such level (APM vol. 3 E.4.24): level
+       type 3, its own width the shift to the die's ID ("all logical processors with the same next
+       level ID share current level", PPR 57238). */
+    uint32_t leaf = 0, ext;
+    cpuid(0x80000000, 0, &ext, &b, &c, &d);
+    if (!die && cpu_features.vendor == CPU_VENDOR_AMD && ext >= 0x80000026)
+        for (uint32_t m = 0; m < 256; m++) {
+            cpuid(0x80000026, m, &a, &b, &c, &d);
+            unsigned type = (c >> 8) & 0xFF;
+            if (!type || !(b & 0xFFFF)) break;
+            if (type == 3) {
+                shift.die = a & 0x1F;
+                die = true;
+            }
+        }
     if (!die) shift.die = shift.package;
 
     /* the highest cache level's sharing; its field and its subleaves: 8 levels of 4 types at most */
-    uint32_t leaf = 0, ext;
-    cpuid(0x80000000, 0, &ext, &b, &c, &d);
     if (cpu_features.vendor == CPU_VENDOR_AMD) {
         if (cpu_features.topology_extensions && ext >= 0x8000001D) leaf = 0x8000001D;
     } else if (max >= 4) leaf = 4;

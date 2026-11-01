@@ -5,6 +5,7 @@
 /* The local APIC (arch/apic.c), in x2APIC mode only (SDM Vol. 3A 13.12, APM Vol. 2 16.11): its
    registers are the MSRs 800h + offset / 16. The timer's registers are arch/lapic_timer.c's. */
 
+#define LAPIC_LVT_CMCI 0x2F0
 #define LAPIC_LVT_TIMER 0x320
 #define LVT_MASKED (1u << 16)
 #define LVT_UNUSED (LVT_MASKED | 0xFE) /* masked, with a vector a Fixed entry may hold (apic_init_cpu) */

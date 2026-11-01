@@ -1131,14 +1131,27 @@ static int dvc_open_display(struct rdp *c) {
     return vc_send(c, c->out, c->dvc, m, sizeof m);
 }
 
+/* The sizes this desktop offers a viewer's window (the display channel's caps say the largest). */
+#define VIEWER_MIN_W 640
+#define VIEWER_MIN_H 480
+#define VIEWER_MAX_W 3840
+#define VIEWER_MAX_H 2160
+
+/* A size a client asked for, within them; 0 keeps meaning none. */
+static void viewer_size(int *w, int *h) {
+    if (*w <= 0 || *h <= 0) return;
+    *w = MAX(VIEWER_MIN_W, MIN(*w, VIEWER_MAX_W));
+    *h = MAX(VIEWER_MIN_H, MIN(*h, VIEWER_MAX_H));
+}
+
 static int disp_caps(struct rdp *c) {
     uint8_t m[2 + 20] = {DVC_DATA << 4, DISP_CHANNEL_ID};
     struct wbuf w = {m + 2, 0, 20};
     w32(&w, DISP_CAPS);
     w32(&w, 20);
     w32(&w, 1);    /* monitors */
-    w32(&w, 3840); /* the largest area, as wm_remote_resize allows it */
-    w32(&w, 2160);
+    w32(&w, VIEWER_MAX_W);
+    w32(&w, VIEWER_MAX_H);
     return vc_send(c, c->out, c->dvc, m, sizeof m);
 }
 
@@ -1195,6 +1208,7 @@ static int apply_resize(struct rdp *c) {
     if (!c->want_w || !c->active || clock_now_ns() < c->resize_at) return 0;
     int w = c->want_w & ~1, h = c->want_h, ow = c->width, oh = c->height;
     c->want_w = c->want_h = 0;
+    viewer_size(&w, &h);
     wm_remote_resize(&w, &h);
     if (w == ow && h == oh) return 0;
     int tx = (w + TILE - 1) / TILE, ty = (h + TILE - 1) / TILE;
@@ -1724,6 +1738,7 @@ static void session(void *arg) {
     if ((len = read_pdu(c, clock_after(10 * NS_PER_S))) <= 0 || c->in[0] != 3 || connect_initial(c, len)) goto out;
 
     /* the desktop takes the size of the client's window */
+    viewer_size(&c->width, &c->height);
     if (!wm_remote_attach(&c->width, &c->height)) {
         kprintf("rdp: no desktop to show\n");
         goto out;

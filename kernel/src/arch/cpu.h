@@ -96,21 +96,20 @@ struct cpu_features {
     unsigned phys_bits;      /* physical address width */
     unsigned clflush_bytes;  /* the line CLFLUSH and CLFLUSHOPT act on */
     unsigned invlpgb_pages;  /* most pages one INVLPGB names, beyond the first */
-    /* The TSC's rate on the hardware: it counts at the P0 P-state's frequency, which PStateDef[0]
-       gives as these two IDs: exactly CPU_COF_UNIT_HZ * p0_fid / p0_did a second (arch/cpu.c).
-       Both 0 under a hypervisor, which states its guest's TSC rate itself (vm/). */
-    unsigned p0_fid, p0_did;
-    bool hypervisor, mwait, pcid, tsc_deadline, invariant_tsc, aperf_mperf, cppc, invlpgb, tme,
+    /* The TSC's rate as the CPU's own registers state it (arch/cpu.c): tsc_num / tsc_den a second,
+       named by tsc_by. tsc_num 0: they state none here (a model no manual at hand covers, a
+       hypervisor's guest), tsc_by saying why, and the clock measures it (sys/clock.c). */
+    uint64_t tsc_num, tsc_den;
+    const char *tsc_by;
+    bool hypervisor, mwait, pcid, tsc_deadline, invariant_tsc, aperf_mperf, cppc, hwp, hwp_epp, invlpgb, tme,
         arch_capabilities, topology_extensions, umip, scalable_mca, lfence_serializing;
     bool arat; /* the LAPIC timer goes on counting in every C-state */
+    bool cmci; /* the banks' corrected errors have Intel's LVT entry (SDM vol. 3B 18.5) */
     /* speculation controls (AMD APM vol. 2 3.2.9, 3.1.7; Intel SDM vol. 2A CPUID leaf 7) */
     bool ibpb, ibrs, stibp, ibrs_always_on, stibp_always_on, auto_ibrs;
     char brand[49];
 };
 extern struct cpu_features cpu_features;
-/* A P-state's frequency from its IDs: CpuFid / CpuDfsId * 200 MHz (PPR 56713, the glossary's
-   CoreCOF). */
-#define CPU_COF_UNIT_HZ 200000000ull
 void cpu_features_init(void); /* the first CPU, first: stops when a required feature is missing */
 bool cpu_features_same(void); /* another CPU as it starts: true when it has what the first one has */
 /* The state every CPU runs in, set by each one the same way: CPU 0 at boot (after idt_init and
@@ -121,9 +120,10 @@ bool cpu_features_same(void); /* another CPU as it starts: true when it has what
    reporting; the performance request (arch/idle.h). Interrupts off, the CPU's page tables still
    the bootloader's or the wake page's. False when this CPU cannot hold what the first one holds. */
 bool cpu_setup(unsigned index);
-/* Machine checks (AMD APM vol. 2 ch. 9). cpu_mca_interrupt_on: this CPU, once its LAPIC is
-   enabled (an LVT entry written before that stays masked, APM 16.4.7): its corrected errors are
-   told through an interrupt as they happen. cpu_machine_check: the #MC handler, on its IST stack:
+/* Machine checks (AMD APM vol. 2 ch. 9, Intel SDM vol. 3B ch. 18). cpu_mca_interrupt_on: this CPU,
+   once its LAPIC is enabled (an LVT entry written before that stays masked, APM 16.4.7): its
+   corrected errors are told through an interrupt as they happen, by whichever way its vendor
+   gives. cpu_machine_check: the #MC handler, on its IST stack:
    it logs every bank's error, returns where all of them were corrected, panics otherwise. */
 void cpu_mca_interrupt_on(void);
 struct regs;

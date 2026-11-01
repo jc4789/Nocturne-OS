@@ -13,13 +13,13 @@
 | 場所 | 役目 |
 |---|---|
 | `boot.c`・`init.c` | 起動の流れ。`kmain` から `kmain_late` へ進み、`C:\Nocturne\System\init` を起こす。 |
-| `arch/cpu.c` | CPUID の唯一の読み手。下限 Zen 4 を照らし、任意の機能（PCID、MWAIT など）の有無と TSC の周波数を持つ。どの CPU も `cpu_setup` で同じ初期化をする。 |
+| `arch/cpu.c`・`tsc_rate.h` | CPUID の唯一の読み手。下限 Zen 4 を照らし、任意の機能（PCID、MWAIT など）の有無と、CPU が申告する TSC の周波数を持つ（書式は社と family ごとに `tsc_rate.h`）。申告が無ければ `sys/clock.c` が測る。どの CPU も `cpu_setup` で同じ初期化をする。 |
 | `arch/topology.c` | MADT・SRAT・SLIT から CPU・core・LLC・NUMA node と node の距離を数える。CPU の数に上限は無い。 |
 | `arch/smp.c`・`wake.c` | AP の起動、panic のときの NMI による停止、S3 からの復帰。 |
 | `arch/spin.h` | MCS spinlock。 |
 | `arch/irq.c`・`apic.c`・`ioapic.c`・`lapic_timer.c` | CPU ごとの vector の表、x2APIC と IPI、IOAPIC、LAPIC の timer（CPU に TSC-deadline があればそれ、無ければ one-shot）。 |
 | `arch/idt.c`・`gdt.c`・`isr.asm` | IDT・GDT・TSS と、syscall・例外・割り込みの入口。 |
-| `arch/fpu.c`・`idle.c`・`pat.c` | XSAVES による FPU の保存、MWAIT か HLT による idle、PAT。 |
+| `arch/fpu.c`・`idle.c`・`pat.c` | XSAVES による FPU の保存、MWAIT か HLT による idle と性能の要求（AMD の CPPC、Intel の HWP）、PAT。 |
 | `lib/` | `span`（区間の AVL 木）、`avl`、`idtable`、`lz`、`printf`、`sort`、`string`。 |
 | `sys/proc.c` | `proc_launch` が ELF のアプリを起こす。 |
 | `sys/clock.c`・`alarm.c` | TSC による三つの時計（monotonic、boot、wall）と、CPU ごとの期限の heap。 |
@@ -28,7 +28,7 @@
 | `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console と system log の stream、profiler。 |
 | `sys/keep.c` | wm・audio・screenmode の設定を `AppData\Nocturne\` の `.conf` に保存し、init の前に読み戻す。 |
 | `fs/` | C: の store の実行側。mount とパスの操作は `store.c`、開いた文書は `document.c`、block cache は `cache.c`、変更の watch は `watch.c`。書式のエンジンは `common/store/`。 |
-| `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（USB HID）、`serial`、`refclock`（HPET と RTC）、電源と hibernate。 |
+| `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（USB HID）、`serial`、`refclock`（HPET か ACPI PM timer と、RTC）、電源と hibernate。 |
 | `net/` | `net.c`（Ethernet から TCP・DHCP・DNS まで）と `rtl8125.c`（実機の NIC）。 |
 | `gui/` | `wm.c`（窓管理と、画面ごとの合成のスレッド）、`desktop.c`、`screenmode.c`（画面ごとのモードの選択）。 |
 | `vm/` | VM だけの処理。下の「境界」を見る。 |

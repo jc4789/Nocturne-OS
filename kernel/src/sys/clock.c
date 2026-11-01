@@ -16,12 +16,14 @@
    at a TSC the new one may already cover: it can lead the new line by the change of slope times
    the write's length, a fraction of a ns for the few stores of a write.)
 
-   The rate. Stated, and in use from the first reading: on the hardware the P0 P-state's
-   (arch/cpu.h: 200 MHz * FID / DID, exact), under a hypervisor the one it registers
-   (clock_register_tsc_hz). A hypervisor's rate is used as it states it. The P0 rate is nominal:
-   spread spectrum lowers it (PPR 56713, the glossary's CoreCOF) and the crystal is off by its
-   tolerance, so on the hardware a rate reference measures what the TSC really counts. Its owner
-   (the HPET's, dev/refclock.c) reads its count between two TSC readings (a sample: the count was
+   The rate. In use from the first reading, from the first of: what a hypervisor registers
+   (clock_register_tsc_hz), used as it states it; what the CPU's registers state (arch/tsc_rate.h);
+   a first measure against the rate reference, spun here before the clock begins, for a CPU no
+   manual at hand covers or a hypervisor that says nothing. A CPU's stated rate is nominal: spread
+   spectrum may lower it (PPR 56713, the glossary's CoreCOF) and the crystal is off by its
+   tolerance. So wherever no hypervisor stated it a rate reference measures what the TSC really
+   counts. Its owner
+   (dev/refclock.c: the HPET, or the ACPI PM timer) reads its count between two TSC readings (a sample: the count was
    taken in that span) and gives the sample to clock_rate_sample, which answers when it wants the
    next. A sample's TSC readings less their CPU's offset are on the clock's one count, whatever
    CPU took them. Two samples give the ratio of TSC counts to reference counts, and with it ns per
@@ -29,7 +31,8 @@
    span on the TSC's side and the count's quantum (one count, and each reading's jitter) on the
    reference's, together within (h/T + q/R) * R/(R - q) of the true ratio (T TSC counts, R
    reference counts, h and q the two ends' sums). That bound is against the reference; the
-   reference's own accuracy is its own (the HPET's: 500 ppm over any 1 ms, IA-PC HPET 1.0a 2.4.1).
+   reference's own accuracy is its own (the HPET's: 500 ppm over any 1 ms, IA-PC HPET 1.0a 2.4.1;
+   ACPI states none for the PM timer's).
    The samples come at windows from the first one (the anchor) that double. The first window is
    as long as makes each part of its bound under 2^-12, so a stated rate off by more than twice
    that (a spread spectrum's few thousand ppm) is caught in it, within a few ms where the
@@ -42,7 +45,8 @@
    devices are set again (alarm_clock_changed). The error in the clock's reading this leaves (each
    rate's bound times the time it was in use; the stated rate's, from the TSC's start, what the
    first window shows it off by, and that window's bound) is summed and logged with each new rate.
-   Hardware without an HPET keeps the P0 rate as stated, and says so.
+   A machine with no reference that counts keeps the rate its CPU states, and says so; with neither
+   there is no clock, and the boot stops saying so.
 
    The CPUs. Their TSCs are compared as they start (clock_cpus_compare), all at once: each reads
    its TSC against the highest reading any of them has published and publishes its own when
@@ -87,8 +91,7 @@ static struct n_clock before;   /* the header as it was before the write in prog
 static int64_t before_offset;      /* and the writer's own offset */
 static bool stopped;               /* clock_stop: a write in progress may never end */
 
-static enum { RATE_P0, RATE_REGISTERED } rate_kind; /* where the stated rate came from */
-static const char *rate_source;
+static const char *rate_source; /* where the first rate came from */
 static struct {
     uint64_t hz;
     const char *source;
@@ -318,6 +321,18 @@ static uint64_t first_window(const struct sample *s) {
     return counts;
 }
 
+/* ns per count of ref, times 2^32, false when the windows' arithmetic does not hold it. */
+static bool reference_scale(const struct clock_rate_reference *ref, uint64_t *ns_q32) {
+    return ref->hz_den <= UINT64_MAX / NS_PER_S && clock_muldiv(ref->hz_den * NS_PER_S, ONE_Q32, ref->hz_num, ns_q32) &&
+           *ns_q32 && !(*ns_q32 >> (64 - (SHIFT - 32)));
+}
+
+static struct sample sample_of(const struct clock_rate_sample *in, int64_t offset) {
+    uint64_t width = in->tsc_b - in->tsc_a;
+    return (struct sample){.tsc = in->tsc_a - (uint64_t)offset + width / 2, .half = width - width / 2,
+                           .count = in->count, .jitter = in->jitter};
+}
+
 /* What a sample's log lines say (built under the lock, written after it). */
 struct rate_report {
     bool begun, changed, moved;
@@ -363,16 +378,12 @@ static void report_rate(const struct rate_report *rep) {
 /* Under clock_lock: a sample of ref into the windows; when the next one is wanted. */
 static uint64_t discipline(const struct clock_rate_reference *ref, const struct clock_rate_sample *in,
                            struct rate_report *rep) {
-    if (rate_kind != RATE_P0 || in->tsc_b < in->tsc_a || in->cpu >= data->cpus) return CLOCK_NEVER;
-    uint64_t width = in->tsc_b - in->tsc_a;
-    struct sample s = {.tsc = in->tsc_a - (uint64_t)data->offset[in->cpu] + width / 2,
-                       .half = width - width / 2, .count = in->count, .jitter = in->jitter};
+    if (in->tsc_b < in->tsc_a || in->cpu >= data->cpus) return CLOCK_NEVER;
+    struct sample s = sample_of(in, data->offset[in->cpu]);
     uint64_t now = clock_now_ns();
     if (ref != disc.ref) {
         uint64_t ns_q32;
-        if (ref->hz_den > UINT64_MAX / NS_PER_S || !clock_muldiv(ref->hz_den * NS_PER_S, ONE_Q32, ref->hz_num, &ns_q32) ||
-            !ns_q32 || ns_q32 >> (64 - (SHIFT - 32)))
-            return CLOCK_NEVER; /* no rate the windows' arithmetic holds */
+        if (!reference_scale(ref, &ns_q32)) return CLOCK_NEVER;
         disc.ref = ref;
         disc.ns_q32 = ns_q32;
         disc.begin = rep->begun = true;
@@ -776,6 +787,25 @@ static void wall_init(void) {
 
 /* ---- boot ---- */
 
+/* The rate where nothing states it: the reference's count over as long as makes each part of the
+   bound under 2^-FIRST_SHIFT, the windows' first, spinning before the clock begins. Its reference
+   was seen counting; one that stops is told by the TSC's going on (2^36 counts: 7 s at 10 GHz). */
+#define MEASURE_MOST (1ull << 36)
+static void first_measure(const struct clock_rate_reference *ref, uint64_t *mult, uint32_t *bound) {
+    if (!reference_scale(ref, &disc.ns_q32)) panic("clock: %s's rate is past the arithmetic", ref->name);
+    struct clock_rate_sample at;
+    ref->read(&at);
+    struct sample a = sample_of(&at, 0), b;
+    uint64_t counts = (1 + 2 * (uint64_t)at.jitter) << FIRST_SHIFT;
+    do {
+        ref->read(&at);
+        b = sample_of(&at, 0);
+        if (b.count - a.count >= counts && b.tsc - a.tsc >= (a.half + b.half) << FIRST_SHIFT && estimate(&a, &b, mult, bound))
+            return;
+    } while (b.tsc - a.tsc < MEASURE_MOST);
+    panic("clock: %s stopped counting while the TSC was measured against it", ref->name);
+}
+
 void clock_init(void) {
     unsigned cpus = topology.cpus;
     size_t bytes = sizeof(struct n_clock) + (size_t)cpus * sizeof(int64_t);
@@ -787,39 +817,39 @@ void clock_init(void) {
     memset(d, 0, data_count * PAGE_SIZE);
     d->cpus = cpus;
     d->shift = SHIFT;
-    /* The rate as stated: a registered one (a hypervisor's guest's TSC is the hypervisor's to set,
-       and a TSC ratio may scale it), else the P0 P-state's (arch/cpu.c reads it where no hypervisor
-       runs the CPU, and stops the boot where it cannot) */
-    uint64_t num, den, mult;
-    if (registered.hz) {
-        num = registered.hz;
-        den = 1;
-        rate_kind = RATE_REGISTERED;
+    /* The first rate. A registered one needs nothing more (a hypervisor's guest's TSC is the
+       hypervisor's to set, and a TSC ratio may scale it). Any other is held to the reference. */
+    const struct clock_rate_reference *ref = NULL;
+    uint64_t mult = 0, hz = 0;
+    uint32_t bound = CLOCK_RATE_UNMEASURED;
+    if (registered.hz && mult_of(registered.hz, 1, &mult)) {
         rate_source = registered.source;
-    } else if (cpu_features.p0_did) {
-        num = CPU_COF_UNIT_HZ * cpu_features.p0_fid;
-        den = cpu_features.p0_did;
-        rate_kind = RATE_P0;
-        rate_source = "the P0 P-state";
+        hz = registered.hz;
     } else {
-        panic("clock: no TSC rate: the hypervisor registers none");
+        if (registered.hz) kprintf("clock: %s's TSC rate of %lu Hz cannot be used\n", registered.source, registered.hz);
+        ref = refclock_rate_reference();
+        if (cpu_features.tsc_num && mult_of(cpu_features.tsc_num, cpu_features.tsc_den, &mult)) {
+            rate_source = cpu_features.tsc_by;
+            hz = cpu_features.tsc_num / cpu_features.tsc_den;
+        } else if (ref) {
+            kprintf("clock: the CPU states no TSC rate here: %s\n", cpu_features.tsc_by);
+            first_measure(ref, &mult, &bound);
+            rate_source = ref->name;
+            hz = hz_of(mult);
+        } else {
+            panic("clock: no TSC rate: %s, and no reference counts to measure it against", cpu_features.tsc_by);
+        }
     }
-    if (!mult_of(num, den, &mult)) panic("clock: %s gives the TSC no usable rate (%lu / %lu Hz)", rate_source, num, den);
     /* the monotonic clock from the TSC's 0 (the CPU's reset) */
     d->mult = mult;
-    d->rate_bound = CLOCK_RATE_UNMEASURED;
-    d->tsc_hz = num / den;
-    disc.bound = CLOCK_RATE_UNMEASURED;
+    d->rate_bound = bound;
+    d->tsc_hz = hz;
+    disc.bound = bound;
     __atomic_store_n(&data, d, __ATOMIC_RELEASE);
-    uint64_t hz = d->tsc_hz;
-    if (rate_kind == RATE_P0) {
-        kprintf("clock: TSC %lu.%06lu MHz by the P0 P-state (FID %xh, DID %xh)\n", hz / 1000000, hz % 1000000,
-                cpu_features.p0_fid, cpu_features.p0_did);
-        if (!refclock_hpet_start())
-            kprintf("clock: no HPET to measure the TSC against; it keeps the P0 P-state's nominal rate\n");
-    } else {
-        kprintf("clock: TSC %lu.%06lu MHz by %s\n", hz / 1000000, hz % 1000000, rate_source);
-    }
+    kprintf("clock: TSC %lu.%06lu MHz by %s%s\n", hz / 1000000, hz % 1000000, rate_source,
+            bound == CLOCK_RATE_UNMEASURED ? "" : ", a first measure");
+    if (ref) ref->begin();
+    else if (!registered.hz) kprintf("clock: no reference to measure the TSC against; it keeps the nominal rate\n");
     wall_init();
 }
 
@@ -887,7 +917,7 @@ int64_t clock_resume(void) {
         slept = clock_wall_proof(sa * (int64_t)NS_PER_S, b);
         edge_start(sa, a, b);
     }
-    if (ref) ref->resume();
+    if (ref) ref->begin();
     return slept / (int64_t)NS_PER_S;
 }
 

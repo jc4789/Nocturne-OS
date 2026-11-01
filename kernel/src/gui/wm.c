@@ -2598,7 +2598,7 @@ static bool on_desktop(int x, int y) {
 static void handle_mouse(const struct mouse_event *m, uint64_t at) {
     int dx = m->dx, dy = m->dy;
     if (m->absolute) {
-        /* a tablet-style pointer (a hypervisor's): exactly where the host's cursor is, over screen 0 */
+        /* a tablet-style pointer (a USB tablet's, a hypervisor's): exactly where it says, over screen 0 */
         dx = (int)((int64_t)m->x * (sw - 1) / MOUSE_ABS_MAX) - mx;
         dy = (int)((int64_t)m->y * (sh - 1) / MOUSE_ABS_MAX) - my;
     } else {
@@ -2892,8 +2892,8 @@ static void remote_size(int *w, int *h) {
     if (!ws) return;
     wm_lock();
     if (*w > 0 && *h > 0) {
-        ws->remote_w = MAX(640, MIN(*w, 3840));
-        ws->remote_h = MAX(480, MIN(*h, 2160));
+        ws->remote_w = *w;
+        ws->remote_h = *h;
     }
     int tw = remote_users ? ws->remote_w : 0, th = remote_users ? ws->remote_h : 0;
     wm_unlock();
