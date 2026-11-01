@@ -1420,6 +1420,7 @@ static int snd_start(struct rdp *c) {
         return 0;
     }
     c->snd_state = SND_PLAYING;
+    c->snd_remote.blocks = ARRAY_SIZE(c->snd_sent);
     audio_remote_attach(&c->snd_remote);
     c->snd_task = kthread_create("rdpsnd", snd_thread, c);
     if (!c->snd_task) {

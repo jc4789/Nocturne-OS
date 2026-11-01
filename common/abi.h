@@ -572,7 +572,7 @@ struct n_audio_status {
 /* n_audio_output: the sound's way out. With set's N_AUDIO_SET_VOLUME the master volume becomes
    volume (0 to 100; it also unmutes), with N_AUDIO_SET_MUTED muting becomes muted (both: in that
    order); then *io is filled with how things stand. device names what plays the sound for people
-   ("Remote desktop" while a remote viewer takes it, else the sound card), "" when nothing does:
+   ("Remote desktop" while a remote viewer takes it, else the output that plays: a jack, a display's name), "" when nothing does:
    the volume is kept for when something does, but nothing is heard. */
 #define N_AUDIO_SET_VOLUME 1u
 #define N_AUDIO_SET_MUTED 2u

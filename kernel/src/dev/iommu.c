@@ -643,7 +643,7 @@ static int group_check(const struct pci_device *d, const struct fns *g, struct i
     *fixed = true;
     for (size_t i = 0; i < g->n; i++) {
         const struct pci_device *m = g->at[i];
-        if (m->kernel_owned) {
+        if (m->kernel_owned && !m->guest) {
             cannot_isolate(d, m, "a kernel driver runs it");
             return -N_ERR_BUSY;
         }
@@ -837,6 +837,22 @@ static int unisolated(const struct pci_device *d, const struct fns *g, int r) {
     return r;
 }
 
+static void guests_stop(const struct iommu_domain *dom) {
+    for (unsigned i = 0; i < dom->nmembers; i++) {
+        const struct iommu_guest *guest = dom->members[i]->guest;
+        if (guest) guest->stop(guest->ctx);
+    }
+}
+
+void iommu_guests_stop(const struct iommu_domain *dom) { guests_stop(dom); }
+
+void iommu_guests_start(struct iommu_domain *dom, bool formed) {
+    for (unsigned i = 0; i < dom->nmembers; i++) {
+        const struct iommu_guest *guest = dom->members[i]->guest;
+        if (guest) guest->start(formed ? dom : NULL, guest->ctx);
+    }
+}
+
 static int attach(struct pci_device *d, struct iommu_domain **out, struct pci_device **resetting);
 
 int iommu_attach(struct pci_device *d, struct iommu_domain **out, struct pci_device **resetting) {
@@ -900,10 +916,14 @@ static int attach(struct pci_device *d, struct iommu_domain **out, struct pci_de
         }
     }
     if (r && fixed) r = unisolated(d, &g, r);
+    if (dom) guests_stop(dom);
     if (dom && !hw->attach(dom)) {
         kprintf("iommu: %02x:%02x.%u: the units did not confirm its domain\n", d->bus, d->dev, d->func);
-        if (!dom->written) acs_undo(&acs);
-        iommu_domain_free(dom); /* what was written is blocked first */
+        if (!dom->written) {
+            acs_undo(&acs);
+            iommu_guests_start(dom, false);
+        }
+        iommu_domain_free(dom); /* what was written is blocked first, its guests staying stopped */
         dom = NULL;
         r = -N_ERR_IO;
     } else if (!dom) {

@@ -6,11 +6,12 @@
    its interrupt messages reach only the vectors the claim was given. The functions that could
    reach it, or that it could reach, without passing the units (its group: a shared requester ID,
    a device or switch without ACS between them) join the domain, and none of them may be the
-   kernel's, claimed, or in another domain. Every other function passes through untranslated, as
-   on a machine without an IOMMU. When the claim ends its group is blocked: nothing they send
-   reaches memory or a CPU until one is claimed again. That holds for the other members too: the
-   driver reached them through the claimed function's peer-to-peer requests, so they may hold
-   addresses it gave them, and no kernel driver uses them meanwhile (none runs a group member).
+   kernel's unless it can be a guest (below), claimed, or in another domain. Every other function
+   passes through untranslated, as on a machine without an IOMMU. When the claim ends its group is
+   blocked: nothing they send reaches memory or a CPU until one is claimed again. That holds for the
+   other members too: the driver reached them through the claimed function's peer-to-peer requests,
+   so they may hold addresses it gave them, and no kernel driver uses them meanwhile (a guest stays
+   stopped).
    A block the units did not confirm keeps the group out of every claim until a later attempt
    confirms it. Claims require isolation unless the administrator explicitly selected
    appdrivers-unisolated at boot; that opt-in never overrides a previous domain's quarantine. */
@@ -21,6 +22,21 @@
 struct pci_device;
 struct iommu_domain;
 
+/* A function the kernel drives that may share a group with one an app claims (a graphics card's sound
+   function with its display function): its driver lets go of the group's isolation changing and comes
+   back into the claim's domain, so the claim is not refused for it.
+   stop: before its group joins a domain or a claim of it ends: nothing it sends goes out any more, and
+   its interrupts are off. It may sleep, and nothing it holds waits for the claim.
+   start: once the claim is formed, dom being its domain, in which the function's memory is then to be
+   mapped (iommu_map, at its own addresses), and whose interrupt messages are the claimed function's: it
+   uses its INTx or none. NULL: the domain did not come about, and its group is as it was.
+   A group whose claim ended stays blocked, so the function stays stopped until the next claim. */
+struct iommu_guest {
+    void (*stop)(void *ctx);
+    void (*start)(struct iommu_domain *dom, void *ctx);
+    void *ctx;
+};
+
 void iommu_init(void); /* after pci_init, before a driver enables an interrupt */
 bool iommu_active(void); /* the units translate DMA: claims can be isolated */
 /* false: unconfirmed hardware state, or units that did not come back from a sleep, forbid
@@ -29,7 +45,7 @@ bool iommu_power_ready(void);
 /* A new domain for d with nothing of the app's mapped yet, attached to every requester ID of its
    group: 0 with *out set. Only with appdrivers-unisolated, 0 with *out NULL when no unit
    translates, no unit sees one of its requester IDs, its group holds a function the kernel
-   drives or that sends as the platform, or the bus was not all enumerated. Without that explicit
+   drives (not a guest) or that sends as the platform, or the bus was not all enumerated. Without that explicit
    opt-in these are errors, not a downgrade. Never when the units block a function of its group (an earlier
    claim's): -N_ERR_UNSUPPORTED (a unit does not see an ID, the group is unknown) or -N_ERR_BUSY
    (the kernel's or the platform's function) then. -N_ERR_BUSY when a function of the group is
@@ -39,6 +55,10 @@ bool iommu_power_ready(void);
    which only its reset may access: the group is formed once that is done. ACS controls the
    attempt turned on are put back as they were when no domain comes of it. */
 int iommu_attach(struct pci_device *d, struct iommu_domain **out, struct pci_device **resetting);
+/* The guests among dom's members: stopped before a claim of them ends (iommu_attach stops them before
+   the domain is attached); started with dom once the claim is formed (formed), or NULL. */
+void iommu_guests_stop(const struct iommu_domain *dom);
+void iommu_guests_start(struct iommu_domain *dom, bool formed);
 /* Whether d is in a domain: attached, or blocked without the units' confirmation. */
 bool iommu_in_use(const struct pci_device *d);
 /* Whether d is a member of dom (its claimed function or the rest of its group). */
