@@ -551,6 +551,7 @@ static bool read_controller(struct nvme *c) {
         return false;
     }
     const uint8_t *id = c->ident;
+    c->rtd3e = *(const uint32_t *)(id + 88); /* what its shutdown takes, whichever device it is */
     /* Not the device it was: its namespaces are not the ones here, and nothing is written to it. */
     if (c->discovered && (memcmp(c->identity, id, sizeof c->identity) || memcmp(c->nqn, id + 768, sizeof c->nqn))) {
         kprintf("nvme%d: another device is here than before, turned off\n", c->index);
@@ -574,7 +575,6 @@ static bool read_controller(struct nvme *c) {
     if (mdts && mdts < 20 && (PAGE_SIZE << mdts) < most) most = PAGE_SIZE << mdts;
     __atomic_store_n(&c->max_xfer, most, __ATOMIC_RELEASE); /* a reset's read beside the callers' */
     c->vwc = id[525] & 1;
-    c->rtd3e = *(const uint32_t *)(id + 88);
     c->namespaces = *(const uint32_t *)(id + 516);
     unsigned sqes = id[512], cqes = id[513];
     if ((sqes & 0xF) > SQES || (sqes >> 4) < SQES || (cqes & 0xF) > CQES || (cqes >> 4) < CQES) {

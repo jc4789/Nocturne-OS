@@ -17,8 +17,8 @@
    a sleep.
 
    A failure goes down the steps of 10.4: the command list engine stopped and started again, a
-   COMRESET when the device stays busy or a queued command was in it, an HBA reset when the
-   engines do not stop, and bus mastering turned off when even that does not end. A caller
+   COMRESET when the device stays busy, a queued command was in it or an overflow came, an HBA reset
+   when the engines do not stop, and bus mastering turned off when even that does not end. A caller
    gets its failure only once one of these has ended the port's DMA, so it may take its memory
    back; or at a task file error, after which the adapter issues no new command and acknowledges
    no DMA Setup until PxCMD.ST is cleared (6.2.2). */
@@ -290,8 +290,8 @@ static void wake_slots(struct port *p, uint32_t which) {
    ended well and the others have not, the one that failed and those the disk aborted with it
    (6.2.2.2; SATA 3.3 13.6.3.2): they are given again after the reset. A fault of the adapter's or
    the bus's says neither that its DMA ended nor which command's data it hit (6.1.1, 5.3.16.6), and
-   an overflow asks for the recovery of a fatal error (6.1.5): from that report until the engines
-   stop (halt), the registers end no command, and every one in the port fails and is given again.
+   an overflow asks for the recovery of a fatal error, and for a COMRESET on a write (6.1.5): from
+   that report until the engine stops (halt), the registers end no command, and every one in the port fails and is given again.
    Such a report is looked for after PxSACT and PxCI are read, and not cleared: what they show
    ended before it. Returns the slots to wake. */
 static uint32_t settle(struct port *p, uint32_t is) {
@@ -547,7 +547,7 @@ static bool port_up_failed(struct port *p) {
 
 /* PxCMD.ST set, which needs a working device (10.1.2). After a non-queued command's error the
    engine is stopped alone (6.2.2.1); a COMRESET is for a device that stays busy or has no
-   link, a queued command's error, and the start. h->reset held where a thread may sleep, the port
+   link, a queued command's error, an overflow, and the start. h->reset held where a thread may sleep, the port
    to the caller (sole), no command in it. A reset asked for meanwhile (a link change) is left asked
    for, the port not live. False leaves it not live. */
 static bool port_up(struct port *p) {
@@ -786,8 +786,8 @@ static void leave(struct port *p, int slot, bool alone) {
 }
 
 /* A command of the caller's (`bit`) ran out of time, or the port went on through something it should
-   not: the engines stopped, so nothing in the port moves data into memory its callers are about to
-   give back, and every command still in it failed. What had ended before the engines stopped ended
+   not: the command list engine stopped, so nothing in the port moves data into memory its callers
+   are about to give back, and every command still in it failed. What had ended before the engines stopped ended
    well: the stop clears PxCI and PxSACT, so they are read first (5.3.2.10, 6.2.2.2), and reap reads
    them no more until it is over. The first caller to find it so does it; the others wait for
    their own commands to fail. */
