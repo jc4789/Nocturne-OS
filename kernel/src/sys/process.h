@@ -2,6 +2,7 @@
    (sys/process.c). */
 #pragma once
 #include "kernel.h"
+#include "lib/span.h"
 #include "sys/object.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
@@ -40,12 +41,17 @@ struct process {
     struct space_op *space_ops;
     bool space_ended;         /* its mappings went at its end: nothing is reserved or freed again */
     uint64_t mmap_next;
-    struct mmap_hole *mmap_holes; /* freed anonymous ranges below mmap_next, by address */
+    struct span_tree mmap_holes; /* freed ranges below mmap_next (struct mmap_hole), by address */
     /* The low region [low_base, USER_LOW_TOP): native memory reserved with
        N_MEMORY_LOW for code that holds 32-bit absolute addresses. */
     uint64_t low_base, low_next;
-    struct mmap_hole *low_holes;
-    struct shared_mapping *shared_mappings; /* shared pages this app has mapped, also being built */
+    struct span_tree low_holes;
+    /* The shared pages this app has mapped (struct shared_mapping, also being built), by their
+       ranges, which never overlap: the mapping at an address is found in O(log n). */
+    struct span_tree shared_mappings;
+    /* The bytes of the messages it sent that wait in a channel (sys/channel.c), atomic. Each such
+       message keeps a reference to the record. */
+    uint64_t messages;
 };
 
 /* The calling thread's process; NULL in a kernel thread. */

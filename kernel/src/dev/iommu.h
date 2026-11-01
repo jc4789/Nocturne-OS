@@ -110,8 +110,10 @@ struct iommu_domain {
 /* The calls below come from any CPU: attach and block with dev/iommu.c's attach_mutex held,
    flush with the domain's map mutex, ioapic under arch/ioapic.c's lock, msi and msi_clear from
    a driver's thread or the sleep path, start, resume and shutdown from the power paths. Each back
-   end puts its units' queues and tables under one spinlock of its own, taken after all of those
-   and taken in its fault or event interrupt handler (on whichever CPU that is) too. */
+   end puts each unit's queue and registers under a spinlock of that unit's, taken after all of
+   those and in its fault or event interrupt handler (on whichever CPU that is) too, and waits for
+   the unit's completion of its invalidations outside it: asleep where the caller may sleep and the
+   unit interrupts at completion, else spinning on the unit's status write. */
 struct iommu_hw {
     const char *name;
     bool interrupt_remapping_required; /* stopped units cannot deliver plain interrupts (VT-d IRREQ) */

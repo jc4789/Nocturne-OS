@@ -212,6 +212,9 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - `n_channel_send(h, data, n, attach)`、`n_channel_receive(h, buf, cap, flags, &attached)`。
   - 流量制御：受け手が未だ受け取っていない量が1MiBに達している間、送信は待つ
     （`N_EVENT_SENDABLE` で送れることを知れる）。空の待ち行列へは大きさに関係なく送れる。
+  - 送ったメッセージは受け取られるまでカーネルの記憶にあり、送ったアプリの分として数える。
+    一つのアプリが全部のチャンネルに待たせているメッセージの合計は、送るときの空きメモリーの
+    半分まで。超える送信は `N_ERR_NO_MEMORY` で、送られない。
   - `N_CHANNEL_WAIT` で待つ。待たない場合は `N_ERR_NOT_READY`。相手が閉じて
     残りも無ければ `N_ERR_CLOSED`。
   - `N_CHANNEL_PEEK` は次のメッセージの大きさだけを返し、取り出さない。
@@ -754,9 +757,11 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     無ければ `N_ERR_NOT_FOUND`。
   - `n_pci_bar(pci, i)` はメモリ BAR を装置メモリの共有オブジェクト（既定は非キャッシュ）にする。
     1 ページ未満や境界の合わない BAR、I/O ポートは扱わない。
-  - `n_pci_interrupts(pci, count)` は MSI-X（無ければ MSI）を最大 32 本つなぎ、本数を返す。
-    INTx はアプリへ渡さない。届いた割り込みは番号のビットを立て、ビットがある間ハンドルは
-    `N_EVENT_RECEIVABLE`。`n_pci_interrupt_take(pci, deadline)` がビットを取り出して消す（期限は §8）。
+  - `n_pci_interrupts(pci, count)` は MSI-X（無ければ MSI）を、機能と系が出せる本数まで
+    つなぎ、本数を返す。INTx はアプリへ渡さない。届いた割り込みは番号のビットを立て、ビットが
+    ある間ハンドルは `N_EVENT_RECEIVABLE`。`n_pci_interrupt_take(pci, bits, words, deadline)` は
+    先頭 `64 × words` 本のどれかが届くまで待ち（期限は §8）、それらのビットを `bits` へ書いて
+    消し、書いた語の数を返す。番号 n は `bits[n / 64]` のビット `n % 64`。後ろの番号のビットは残る。
   - `n_dma_create(pci, bytes, flags)` は装置が DMA で読み書きできる 0 埋めの RAM（共有
     オブジェクト）。`N_DMA_CONTIGUOUS` は物理的に一続き、`N_DMA_32BIT` は 4GiB 未満。
     `n_dma_addresses` が各ページのバスアドレスを返す（物理アドレス。IOMMU が隔離していても

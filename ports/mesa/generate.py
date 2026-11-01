@@ -1,4 +1,4 @@
-"""Run Mesa's own code generators into build/mesa/gen.
+"""Run Mesa's own code generators into make's $(MESA_GEN), the one argument.
 
 Each output lands in the directory Meson would use for it (the build
 directory of the meson.build that declares it), so Mesa's quoted includes
@@ -13,7 +13,6 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 MESA = ROOT / 'third_party' / 'mesa'
 SRC = MESA / 'src'
-OUT = ROOT / 'build' / 'mesa' / 'gen'
 SHA1 = '745709a000'
 
 GL_ES_API = 'src/mesa/glapi/glapi/gen/gl_and_es_API.xml'
@@ -224,15 +223,15 @@ def store(path, data):
     os.replace(temporary, path)
 
 
-def main():
+def main(out):
     env = dict(os.environ)
     modules = str(ROOT / 'third_party' / 'python-build')
     env['PYTHONPATH'] = modules + (os.pathsep + env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
     env['PYTHONDONTWRITEBYTECODE'] = '1'
     # The Rust generators pipe their output through rustfmt as text: UTF-8, not the host's code page.
     env['PYTHONUTF8'] = '1'
-    store(OUT / 'src' / 'git_sha1.h', f'#define MESA_GIT_SHA1 " (git-{SHA1})"\n'.encode())
-    scratch = OUT / '.scratch'
+    store(out / 'src' / 'git_sha1.h', f'#define MESA_GIT_SHA1 " (git-{SHA1})"\n'.encode())
+    scratch = out / '.scratch'
     scratch.mkdir(parents=True, exist_ok=True)
     for directory, command, outputs in multi_jobs():
         paths = {token: scratch / name for token, name in outputs.items()}
@@ -240,10 +239,10 @@ def main():
         if subprocess.run([sys.executable, *args], cwd=MESA, env=env).returncode:
             raise SystemExit(f'Mesa generator failed: {directory}/{list(outputs.values())[0]}')
         for token, name in outputs.items():
-            store(OUT / directory / name, paths[token].read_bytes())
+            store(out / directory / name, paths[token].read_bytes())
             paths[token].unlink()
     for output, command, captured in jobs():
-        target = OUT / output
+        target = out / output
         written = scratch / Path(output).name
         args = [str(written) if arg == '@OUT' else arg for arg in command]
         result = subprocess.run([sys.executable, *args], cwd=MESA, env=env,
@@ -259,5 +258,7 @@ if __name__ == '__main__':
     if sys.argv[1:] == ['nv-classes']:
         # nvk.mk compiles one nv_push_<class>.c per class
         print(' '.join(NV_CLASSES))
+    elif len(sys.argv) == 2:
+        main((ROOT / sys.argv[1]).resolve())
     else:
-        main()
+        raise SystemExit('usage: generate.py <output directory> | nv-classes')

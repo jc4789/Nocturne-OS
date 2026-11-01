@@ -83,7 +83,7 @@ uint64_t vmm_get_leaf(struct vmm_space *s, uint64_t va);  /* the raw 4 KiB leaf,
 uint64_t vmm_user_pages(struct vmm_space *s); /* present, non-shared lower-half 4K leaves */
 /* Diagnostic split of the private pages: [0] program image and sbrk heap, [1] low reservations,
    [2] the reservation region, [3] main stack, [4] shared leaves mapped, [5] page-table frames. A
-   full walk: only for the rare out-of-memory report. */
+   full walk under the space's lock: only for the rare out-of-memory report. Zero once it ended. */
 void vmm_user_pages_split(struct vmm_space *s, uint64_t out[6]);
 /* Fresh zeroed pages; present ones keep their contents and gain prot. Any context. */
 int vmm_user_alloc(struct vmm_space *s, uint64_t va, uint64_t size, int prot);

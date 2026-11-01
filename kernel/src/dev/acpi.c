@@ -622,6 +622,20 @@ void *acpi_pci_host(const struct pci_device *d) {
     return s.found;
 }
 
+bool acpi_pci_proximity(const struct pci_device *d, uint32_t *domain) {
+    uacpi_namespace_node *node = acpi_pci_node(d);
+    if (!node) node = acpi_pci_host(d);
+    for (uacpi_namespace_node *root = uacpi_namespace_root(); node && node != root;
+         node = uacpi_namespace_node_parent(node)) {
+        uacpi_u64 pxm;
+        if (uacpi_eval_simple_integer(node, "_PXM", &pxm) == UACPI_STATUS_OK) {
+            *domain = (uint32_t)pxm;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* The device under parent whose _ADR is the function (dev << 16 | func), else one that stands
    for all of the device's functions (func 0xFFFF). */
 static uacpi_namespace_node *child_at(uacpi_namespace_node *parent, uint8_t dev, uint8_t func) {

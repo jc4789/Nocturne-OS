@@ -29,8 +29,8 @@ NVK_RS_H := $(NV_GEN)/nil/nil.h $(NV_GEN)/vulkan/nvk_rust.h
 # bundled into one static library; the procedural macros (paste, NAK's derives) are host DLLs
 # from ports/mesa/rust-host, built offline with cargo.
 RUST_HOST := $(BUILD)/mesa/rust-host/release
-NVK_RUSTC := RUSTC_BOOTSTRAP=1 rustc --edition 2021 -Zunstable-options --target ports/rust/x86_64-unknown-nocturne.json \
-    --sysroot tools/rust/sysroot -C opt-level=2 -C panic=abort -C debuginfo=0 -C codegen-units=1 --cap-lints allow \
+NVK_RUSTC = RUSTC_BOOTSTRAP=1 rustc --edition 2021 -Zunstable-options --target ports/rust/x86_64-unknown-nocturne.json \
+    --sysroot $(RUST_SYSROOT) -C opt-level=2 -C panic=abort -C debuginfo=0 -C codegen-units=1 --cap-lints allow \
     -L dependency=$(NVK_RS)
 nvk_rlib = $(NVK_RS)/lib$(1).rlib
 nvk_extern = $(foreach c,$(1),--extern $(c)=$(call nvk_rlib,$(c)))
@@ -186,6 +186,12 @@ $(NVK_RS_LIB): ports/mesa/nvk_rs.rs $(foreach c,nak nil nvk_rs,$(call nvk_rlib,$
 	@echo "  RUSTC $@"
 	@$(NVK_RUSTC) --crate-type staticlib --crate-name nvk_mesa_rs $< $(call nvk_extern,nak nil nvk_rs) $(NVK_PROC_EXTERN) \
 	    --emit=link=$@,dep-info=$(@:.a=.d)
+
+# Every crate is built against the sysroot's std: a std built again makes them all stale.
+NVK_RS_CRATES := compiler rustc_hash mesa_util nvidia_headers nv_push_rs nak_latencies nak_bindings nak \
+    nil_rs_bindings nil nvk_bindings_rs nvk_rs
+$(foreach c,$(NVK_RS_CRATES),$(call nvk_rlib,$(c))) $(NVK_RS_LIB): \
+    $(wildcard $(RUST_SYSROOT)/lib/rustlib/x86_64-unknown-nocturne/lib/*.rlib)
 
 -include $(wildcard $(NVK_RS)/*.d)
 

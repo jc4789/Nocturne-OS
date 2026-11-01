@@ -156,10 +156,18 @@ struct unit {
     uint64_t handoff; /* owned replacement for an inherited queue, followed by its status page */
     unsigned handoff_config; /* inherited IQA.QS/DW: offsets stay valid during the live IQA change */
     uint32_t handoff_tail, handoff_token;
+    /* The unit's queue, registers, fault records, the flags below and its root and context tables:
+       a leaf, taken in the fault handler too. A caller's descriptors and the wait after them go
+       in under one hold; the wait for its status write is outside it, except in the power paths
+       (units_hold) and a recovery, which hold it. */
+    struct spinlock lock;
     uint32_t tail;
-    uint32_t token; /* the status data of its last sync's wait, or of a recovery's (queue_recover) */
+    /* The status data of the waits: each sync's wait writes the next token into the unit's word
+       (sems), the unit completing them in order, so a word at or past a sync's token says its
+       descriptors are done. restarted: the last token given before a recovery, which voids the
+       waits up to it that had not completed. */
+    uint32_t token, restarted;
     bool queue_on;  /* the queue on is ours (queue_start), not one the firmware left on */
-    bool waiting;   /* a sync's wait descriptor went in */
     bool recovering; /* re-synchronizing after a queue error: another error is final */
     bool failed;   /* completion is uncertain, and no recovery confirmed it: never reuse its semaphore or
                       report a later sync successful */
@@ -183,15 +191,12 @@ static unsigned iec_mask = 15; /* the largest IEC invalidation mask every unit t
 static struct iommu_domain *identity; /* units without pass-through */
 static uint64_t sems, irt;
 static size_t sem_pages;
-static uint32_t token;
 static struct irq *fault_irq; /* the fault events' (fault_isr) */
 static const struct pci_device *msi_owner[MSI_BLOCKS];
-/* The units and what they read: every unit's queue, registers and records, the status words
-   and token, the interrupt remapping table and msi_owner, the root and context tables. Every
-   call of the common part (struct iommu_hw) and the fault handler work under it; it is
-   taken after the common part's locks and arch/ioapic.c's, and only iommu_fault_report's and
-   the page allocator's are taken under it. */
-static struct spinlock units_lock;
+/* The interrupt remapping table's entries and msi_owner: a leaf, never held while a unit's lock
+   is taken. Each entry's units are told by a sync on every unit after it is let go. It is taken
+   after the common part's locks and arch/ioapic.c's. */
+static struct spinlock tables_lock;
 
 static struct iommu_hw intel;
 static bool queue_check(struct unit *u);
@@ -434,11 +439,13 @@ static bool write_buffers_flush(void) {
     bool ok = true;
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
+        uint64_t f = spin_lock(&u->lock);
         if (!queue_check(u)) ok = false;
         else if (write_buffers && u->cap & CAP_RWBF && !command(u, GCMD_WBF, true)) {
             u->failed = true;
             ok = false;
         }
+        spin_unlock(&u->lock, f);
     }
     return ok;
 }
@@ -506,7 +513,7 @@ static bool queue_check(struct unit *u) {
     return false;
 }
 
-/* A descriptor for one unit: false, and failed, when it had no room for it in time.
+/* A descriptor for one unit, u->lock held: false, and failed, when it had no room for it in time.
    IOTLB invalidations ask for the draining a version 1 unit does only when asked (6.5.4). */
 static bool submit(struct unit *u, uint64_t lo, uint64_t hi) {
     if (!u->queue_on || !queue_check(u)) return false;
@@ -529,22 +536,16 @@ static bool submit(struct unit *u, uint64_t lo, uint64_t hi) {
     return true;
 }
 
+/* Every unit's lock held (units_hold): a descriptor to each. */
 static void send(uint64_t lo) {
     for (size_t i = 0; i < nunits; i++) submit(&units[i], lo, 0);
 }
 
-/* Interrupt entries first..first + 2^log2 - 1 (first aligned to that), in descriptors whose
-   mask every unit takes. */
-static void send_iec(unsigned first, unsigned log2) {
-    unsigned mask = log2 < iec_mask ? log2 : iec_mask;
-    for (unsigned at = first; at < first + (1u << log2); at += 1u << mask) send(INV_IEC(at, mask));
-}
-
 /* A change of root or context entries: the context caches, then the IOTLBs, both whole (6.5.2.1:
-   a global context invalidation is followed by a global IOTLB one). */
-static void send_context_flush(void) {
-    send(INV_CONTEXT_GLOBAL);
-    send(INV_IOTLB_GLOBAL);
+   a global context invalidation is followed by a global IOTLB one). u->lock held. */
+static void context_flush(struct unit *u) {
+    submit(u, INV_CONTEXT_GLOBAL, 0);
+    submit(u, INV_IOTLB_GLOBAL, 0);
 }
 
 static void fault_show(const struct unit *u, uint64_t lo, uint64_t hi) {
@@ -575,63 +576,113 @@ static void faults_drain(struct unit *u) {
 }
 
 /* An ICE is cleared here. IQE and ITE wait for the queue's next user (queue_check), whose
-   recovery submits and waits; no fault event comes while they are set (7.3). A wait under
-   units_lock on another CPU drains the records itself; this one waits for it. */
+   recovery submits and waits; no fault event comes while they are set (7.3). A unit whose lock
+   another CPU holds is drained when it is let go. */
 static enum irq_result fault_isr(void *context) {
     (void)context;
-    spin_take(&units_lock);
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
+        spin_take(&u->lock);
         if (rd32(u, R_FSTS) & FSTS_ICE) {
             queue_errors_show(u, FSTS_ICE, rd64(u, R_IQERCD));
             wr32(u, R_FSTS, FSTS_ICE);
         }
         faults_drain(u);
+        spin_give(&u->lock);
     }
-    spin_give(&units_lock);
     return IRQ_HANDLED;
 }
 
-static uint32_t token_next(void) {
-    if (!++token) token++;
-    return token;
+/* The unit's next status data (never 0, the word's value before any wait). u->lock held. */
+static uint32_t token_next(struct unit *u) {
+    if (!++u->token) u->token++;
+    return u->token;
 }
 
-/* Waits until units first..first + n - 1 have done every descriptor sent since their last sync,
-   the last one a wait that completed (u->token; a recovery on the way puts its own wait there):
-   false when one was lost or rejected, or a unit did not finish them in time. */
-static bool sync_units(size_t first, size_t n) {
-    volatile uint32_t *word = phys_to_virt(sems);
-    uint32_t data = token_next();
-    for (size_t i = first; i < first + n; i++) {
-        struct unit *u = &units[i];
-        if (!queue_check(u)) {
-            u->waiting = false;
-            continue;
+/* u->lock held: the wait that ends the caller's descriptors. Its token, 0 when the queue failed or
+   took no more. */
+static uint32_t wait_post(struct unit *u) {
+    if (!queue_check(u)) return 0;
+    uint32_t data = token_next(u);
+    return submit(u, INV_WAIT(data), sems + (size_t)(u - units) * sizeof(uint32_t)) ? data : 0;
+}
+
+/* Waits for the unit to write a sync's token: held, with u->lock (the power paths, a recovery),
+   else outside it, the queue's errors looked at under it. False when a recovery voided the wait,
+   the queue failed, or the unit did not finish in time. The records it logged are said after. */
+static bool wait_done(struct unit *u, uint32_t data, bool held) {
+    volatile uint32_t *word = (volatile uint32_t *)phys_to_virt(sems) + (u - units);
+    bool ok = data != 0;
+    for (uint64_t t = clock_after(100 * NS_PER_MS); ok && (int32_t)(*word - data) < 0; pause()) {
+        uint64_t f = held ? 0 : spin_lock(&u->lock);
+        if (!queue_check(u) || (int32_t)(u->restarted - data) >= 0) ok = false;
+        else if (clock_now_ns() >= t) {
+            kprintf("iommu: VT-d unit at %lx did not finish its commands\n", u->base);
+            u->failed = true;
+            ok = false;
         }
-        word[i] = 0;
-        if ((u->waiting = submit(u, INV_WAIT(data), sems + i * 4))) u->token = data;
+        if (!held) spin_unlock(&u->lock, f);
     }
-    for (size_t i = first; i < first + n; i++) {
-        struct unit *u = &units[i];
-        for (uint64_t t = clock_after(100 * NS_PER_MS); u->waiting && word[i] != u->token; pause()) {
-            if (!queue_check(u)) break;
-            if (clock_now_ns() >= t) {
-                kprintf("iommu: VT-d unit at %lx did not finish its commands\n", u->base);
-                u->failed = true;
-                break;
-            }
-        }
-    }
+    uint64_t f = held ? 0 : spin_lock(&u->lock);
+    faults_drain(u);
+    ok = ok && queue_check(u);
+    if (!held) spin_unlock(&u->lock, f);
+    return ok;
+}
+
+/* Units first..first + n - 1 have done every descriptor sent before this sync: each given its
+   wait, a group at a time before the group is waited for. held: the caller holds their locks. */
+#define UNITS_AT_ONCE 16
+static bool sync_units(size_t first, size_t n, bool held) {
     bool ok = true;
-    for (size_t i = first; i < first + n; i++) {
-        faults_drain(&units[i]);
-        ok &= units[i].waiting && queue_check(&units[i]);
+    for (size_t from = first; from < first + n; from += UNITS_AT_ONCE) {
+        size_t count = MIN(first + n - from, (size_t)UNITS_AT_ONCE);
+        uint32_t data[UNITS_AT_ONCE];
+        for (size_t i = 0; i < count; i++) {
+            struct unit *u = &units[from + i];
+            uint64_t f = held ? 0 : spin_lock(&u->lock);
+            data[i] = wait_post(u);
+            if (!held) spin_unlock(&u->lock, f);
+        }
+        for (size_t i = 0; i < count; i++) ok &= wait_done(&units[from + i], data[i], held);
     }
     return ok;
 }
 
-static bool sync(void) { return sync_units(0, nunits); }
+/* Every unit's lock held (units_hold). */
+static bool sync_held(void) { return sync_units(0, nunits, true); }
+
+/* fill's descriptors to every unit under its lock, then a sync on every unit. */
+static bool on_every_unit(void (*fill)(struct unit *u, const void *arg), const void *arg) {
+    for (size_t i = 0; i < nunits; i++) {
+        uint64_t f = spin_lock(&units[i].lock);
+        fill(&units[i], arg);
+        spin_unlock(&units[i].lock, f);
+    }
+    return sync_units(0, nunits, false);
+}
+
+/* Interrupt entries first..first + 2^log2 - 1 (first aligned to that), in descriptors whose
+   mask every unit takes. */
+struct iec_range {
+    unsigned first, log2;
+};
+static void iec_flush(struct unit *u, const void *arg) {
+    const struct iec_range *r = arg;
+    unsigned mask = r->log2 < iec_mask ? r->log2 : iec_mask;
+    for (unsigned at = r->first; at < r->first + (1u << r->log2); at += 1u << mask) submit(u, INV_IEC(at, mask), 0);
+}
+
+/* The power paths' (start, resume, shutdown): every unit's lock, in their order. */
+static uint64_t units_hold(void) {
+    uint64_t f = irq_save();
+    for (size_t i = 0; i < nunits; i++) spin_take(&units[i].lock);
+    return f;
+}
+static void units_release(uint64_t f) {
+    for (size_t i = nunits; i--;) spin_give(&units[i].lock);
+    irq_restore(f);
+}
 
 /* The OS's own queue after an IQE/ITE (6.5.2.11): what is ahead of the head completes as normal,
    nothing from the head on is fetched until the error is cleared, then the unit fetches from the
@@ -661,8 +712,9 @@ static bool queue_recover(struct unit *u, uint32_t errors, uint64_t record) {
     }
     wr32(u, R_FSTS, errors); /* only now may the unit fetch again */
     u->recovering = true;
+    u->restarted = u->token; /* the waits already sent confirm nothing now */
     bool ok = submit(u, INV_CONTEXT_GLOBAL, 0) && submit(u, INV_IOTLB_GLOBAL, 0) &&
-              (!remap || submit(u, INV_IEC_GLOBAL, 0)) && sync_units((size_t)(u - units), 1);
+              (!remap || submit(u, INV_IEC_GLOBAL, 0)) && sync_units((size_t)(u - units), 1, true);
     u->recovering = false;
     if (ok) kprintf("iommu: VT-d unit at %lx: its invalidation queue recovered, every cache invalidated\n", u->base);
     return ok;
@@ -699,9 +751,15 @@ static void context_write(volatile uint64_t *e, uint64_t lo, uint64_t hi) {
     if (!intel.coherent) iommu_cache_flush(e, 16);
 }
 
-static void contexts_write(const struct iommu_domain *dom, uint64_t lo, uint64_t hi) {
-    for (size_t i = 0; i < nunits; i++)
-        for (unsigned n = 0; n < dom->nids; n++) context_write(context_entry(&units[i], dom->ids[n], false), lo, hi);
+/* u->lock held: the domain's entries in the unit, then the unit's context caches. */
+struct contexts {
+    const struct iommu_domain *dom;
+    uint64_t lo, hi;
+};
+static void contexts_flush(struct unit *u, const void *arg) {
+    const struct contexts *c = arg;
+    for (unsigned n = 0; n < c->dom->nids; n++) context_write(context_entry(u, c->dom->ids[n], false), c->lo, c->hi);
+    context_flush(u);
 }
 
 /* ---- interrupts ---- */
@@ -750,21 +808,25 @@ static int msi_block(const struct pci_device *d, bool create) {
     return free;
 }
 
-/* units_lock held. */
 static bool msi_release(const struct pci_device *d) {
+    uint64_t f = spin_lock(&tables_lock);
     int b = msi_block(d, false);
+    unsigned first = IOAPIC_ENTRIES + (unsigned)(b < 0 ? 0 : b) * MSI_BLOCK;
+    for (unsigned i = 0; b >= 0 && i < MSI_BLOCK; i++) irte_write(first + i, 0, 0);
+    spin_unlock(&tables_lock, f);
     if (b < 0) return true;
-    unsigned first = IOAPIC_ENTRIES + (unsigned)b * MSI_BLOCK;
-    for (unsigned i = 0; i < MSI_BLOCK; i++) irte_write(first + i, 0, 0);
-    send_iec(first, MSI_BLOCK_LOG2);
-    bool ok = sync();
-    if (ok) msi_owner[b] = NULL; /* else kept: an entry may still be cached */
+    bool ok = on_every_unit(iec_flush, &(struct iec_range){first, MSI_BLOCK_LOG2});
+    if (ok) { /* else kept: an entry may still be cached */
+        f = spin_lock(&tables_lock);
+        msi_owner[b] = NULL;
+        spin_unlock(&tables_lock, f);
+    }
     return ok;
 }
 
 /* Message n of d's block arrives through entry block + index + n: the address carries the
    block entry of message 0, the data the subhandle the function adds the message number to.
-   The entries' source is worked out (an allocation) before units_lock. */
+   The entries' source is worked out (an allocation) before tables_lock. */
 static bool intel_msi(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
                       uint32_t *address, uint32_t *data) {
     if (!remap) {
@@ -775,32 +837,20 @@ static bool intel_msi(struct pci_device *d, unsigned index, unsigned count, uint
     }
     uint64_t source = irte_source(d);
     if (!source || index + count > MSI_BLOCK) return false;
-    uint64_t f = spin_lock(&units_lock);
+    uint64_t f = spin_lock(&tables_lock);
     int b = msi_block(d, true);
-    bool ok = b >= 0;
-    unsigned at = 0;
-    if (ok) {
-        unsigned first = IOAPIC_ENTRIES + (unsigned)b * MSI_BLOCK;
-        at = first + index;
-        for (unsigned i = 0; i < count; i++)
-            irte_write(at + i, IRTE_P | IRTE_VECTOR(vector + i) | irte_dest(dest), source);
-        send_iec(first, MSI_BLOCK_LOG2);
-        ok = sync();
-    }
-    spin_unlock(&units_lock, f);
+    unsigned first = IOAPIC_ENTRIES + (unsigned)(b < 0 ? 0 : b) * MSI_BLOCK, at = first + index;
+    for (unsigned i = 0; b >= 0 && i < count; i++)
+        irte_write(at + i, IRTE_P | IRTE_VECTOR(vector + i) | irte_dest(dest), source);
+    spin_unlock(&tables_lock, f);
     if (b < 0) return false;
+    bool ok = on_every_unit(iec_flush, &(struct iec_range){first, MSI_BLOCK_LOG2});
     *address = 0xFEE00000u | (at & 0x7FFF) << 5 | 1u << 4 | 1u << 3 | (at >> 15 & 1) << 2; /* remappable, SHV */
     *data = 0;
     return ok;
 }
 
-static bool intel_msi_clear(struct pci_device *d) {
-    if (!remap) return true;
-    uint64_t f = spin_lock(&units_lock);
-    bool ok = msi_release(d);
-    spin_unlock(&units_lock, f);
-    return ok;
-}
+static bool intel_msi_clear(struct pci_device *d) { return !remap || msi_release(d); }
 
 /* Pin `gsi` is entry gsi; the IRTE takes what the plain entry said (delivery mode, logical
    destination, trigger, vector) and the 32-bit destination dest, the pin keeps polarity, trigger,
@@ -818,13 +868,11 @@ static bool intel_ioapic(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_
         kprintf("iommu: IOAPIC %u is under no VT-d unit: GSI %u left masked\n", ioapic_id, gsi);
         return false;
     }
-    uint64_t f = spin_lock(&units_lock);
+    uint64_t f = spin_lock(&tables_lock);
     irte_write(gsi, IRTE_P | (v >> 11 & 1 ? IRTE_DM : 0) | (v >> 15 & 1 ? IRTE_TM : 0) | IRTE_DLM(v >> 8 & 7) |
                         IRTE_VECTOR(v) | irte_dest(dest), source);
-    send_iec(gsi, 0);
-    bool ok = sync();
-    spin_unlock(&units_lock, f);
-    if (!ok) {
+    spin_unlock(&tables_lock, f);
+    if (!on_every_unit(iec_flush, &(struct iec_range){gsi, 0})) {
         kprintf("iommu: the units did not confirm the entry of GSI %u: left masked\n", gsi);
         return false;
     }
@@ -855,57 +903,41 @@ static bool dma_draining(void) {
 /* A present context entry does not change in place: it goes not present, the caches drop it,
    then it comes back pointing at the domain. */
 static bool intel_attach(struct iommu_domain *dom) {
-    uint64_t f = spin_lock(&units_lock);
     if (!dma_draining()) {
-        spin_unlock(&units_lock, f);
         kprintf("iommu: VT-d lacks DMA read/write draining: an app domain cannot be isolated safely\n");
         return false; /* no context published: the common layer can release this unused domain */
     }
-    for (size_t i = 0; i < nunits; i++) /* memory first: nothing changes for the group when there is none */
-        for (unsigned n = 0; n < dom->nids; n++)
-            if (!context_entry(&units[i], dom->ids[n], true)) {
-                spin_unlock(&units_lock, f);
-                kprintf("iommu: no memory for a context table\n");
-                return false;
-            }
-    dom->written = true;
-    contexts_write(dom, 0, 0);
-    send_context_flush();
-    bool ok = sync();
-    if (ok) {
-        contexts_write(dom, CTX_P | dom->root, (uint64_t)(dom->levels - 2) | (uint64_t)dom->id << 8);
-        send_context_flush();
-        ok = sync();
+    for (size_t i = 0; i < nunits; i++) { /* memory first: nothing changes for the group when there is none */
+        uint64_t f = spin_lock(&units[i].lock);
+        bool made = true;
+        for (unsigned n = 0; made && n < dom->nids; n++) made = context_entry(&units[i], dom->ids[n], true) != NULL;
+        spin_unlock(&units[i].lock, f);
+        if (!made) {
+            kprintf("iommu: no memory for a context table\n");
+            return false;
+        }
     }
-    spin_unlock(&units_lock, f);
-    return ok;
+    dom->written = true;
+    if (!on_every_unit(contexts_flush, &(struct contexts){dom, 0, 0})) return false;
+    return on_every_unit(contexts_flush,
+                         &(struct contexts){dom, CTX_P | dom->root, (uint64_t)(dom->levels - 2) | (uint64_t)dom->id << 8});
 }
 
 static bool intel_block(struct iommu_domain *dom) {
-    uint64_t f = spin_lock(&units_lock);
     bool ok = !remap || msi_release(dom->d);
-    contexts_write(dom, 0, 0);
-    send_context_flush();
-    ok &= sync();
-    ok = ok && dma_draining(); /* otherwise retain the domain and its DMA pages in quarantine */
-    spin_unlock(&units_lock, f);
-    return ok;
+    ok &= on_every_unit(contexts_flush, &(struct contexts){dom, 0, 0});
+    return ok && dma_draining(); /* otherwise retain the domain and its DMA pages in quarantine */
+}
+
+static void iotlb_flush(struct unit *u, const void *arg) {
+    submit(u, INV_IOTLB_DOMAIN(((const struct iommu_domain *)arg)->id), 0);
 }
 
 /* New entries need no invalidation but where the units cache not-present ones (CAP.CM); then
    only the write buffers are flushed, which an invalidation does itself (6.8). */
 static bool intel_flush(struct iommu_domain *dom, bool unmapped) {
-    uint64_t f = spin_lock(&units_lock);
-    bool ok;
-    if (!unmapped && !caching_mode) {
-        ok = write_buffers_flush();
-    } else {
-        send(INV_IOTLB_DOMAIN(dom->id));
-        ok = sync();
-    }
-    ok = ok && (!unmapped || dma_draining());
-    spin_unlock(&units_lock, f);
-    return ok;
+    bool ok = !unmapped && !caching_mode ? write_buffers_flush() : on_every_unit(iotlb_flush, dom);
+    return ok && (!unmapped || dma_draining());
 }
 
 /* ---- the units ---- */
@@ -967,7 +999,7 @@ static bool queue_quiet(struct unit *u) {
         if (u->queue_on && tail != u->tail) { u->failed = true; return false; }
         u->queue_on = true; /* retained OS allocation, not an address/used-bit guess after S3 */
         u->tail = (uint32_t)tail;
-        if (!sync_units((size_t)(u - units), 1)) return false;
+        if (!sync_units((size_t)(u - units), 1, true)) return false;
         /* Status writes precede all effects being visible in the head register. */
         for (uint64_t t = clock_after(100 * NS_PER_MS); rd64(u, R_IQH) != u->tail; pause())
             if (!queue_check(u) || clock_now_ns() >= t) {
@@ -995,7 +1027,7 @@ static bool queue_quiet(struct unit *u) {
     for (unsigned at = 0; at < bytes; at += width) *(volatile uint64_t *)(queue + at) = INV_FENCE;
     volatile uint64_t *slot = (volatile uint64_t *)(queue + tail);
     volatile uint32_t *word = phys_to_virt(u->handoff + bytes);
-    u->handoff_token = token_next();
+    u->handoff_token = token_next(u);
     slot[0] = INV_WAIT(u->handoff_token);
     slot[1] = u->handoff + bytes;
     if (!intel.coherent) iommu_cache_flush(queue, bytes + sizeof *word);
@@ -1130,7 +1162,7 @@ static bool units_on(void) {
     send(INV_CONTEXT_GLOBAL);
     send(INV_IOTLB_GLOBAL);
     if (remap) send(INV_IEC_GLOBAL);
-    bool ok = sync();
+    bool ok = sync_held();
     for (size_t i = 0; ok && remap && i < nunits; i++)
         ok = command(&units[i], GCMD_IRE, true);
     if (ok && intel.translating) ok = translation_on(false) && translation_on(true);
@@ -1158,9 +1190,9 @@ static bool units_off(void) {
 /* Off as on a machine without VT-d (what units_plain_safe takes as plain): the protected memory
    ranges too, once every unit confirmed it is off. */
 static bool intel_shutdown(void) {
-    uint64_t f = spin_lock(&units_lock);
+    uint64_t f = units_hold();
     bool ok = units_off() && pmrs_release();
-    spin_unlock(&units_lock, f);
+    units_release(f);
     return ok;
 }
 
@@ -1169,10 +1201,10 @@ static bool intel_resume(void) {
        reprogrammed by wake firmware: the old software producer state is not evidence
        that this is still our queue. Treat any active queue as inherited, retaining all
        uncertainty latches and the memory a late status write could still address. */
-    uint64_t f = spin_lock(&units_lock);
+    uint64_t f = units_hold();
     for (size_t i = 0; i < nunits; i++) units[i].queue_on = false;
     bool ok = units_on();
-    spin_unlock(&units_lock, f);
+    units_release(f);
     if (!ok) kprintf("iommu: VT-d did not come back after sleep\n");
     return ok;
 }
@@ -1217,7 +1249,7 @@ static bool intel_start(bool translate) {
         kprintf("iommu: an inherited VT-d queue overlaps OS-managed or unclassified RAM; not touched\n");
         return false;
     }
-    sem_pages = ALIGN_UP(nunits * 4, PAGE_SIZE) / PAGE_SIZE;
+    sem_pages = ALIGN_UP(nunits * sizeof(uint32_t), PAGE_SIZE) / PAGE_SIZE;
     sems = iommu_alloc_pages(sem_pages);
     irt = remap ? iommu_alloc_pages(IRT_ENTRIES * 16 / PAGE_SIZE) : 0;
     bool ok = sems && (irt || !remap), pass_all = true;
@@ -1263,13 +1295,13 @@ static bool intel_start(bool translate) {
     /* any CPU the unit's message can name: a 32-bit destination with remapping (unit_tables) */
     if (!fault_irq)
         fault_irq = irq_request_msi(&(struct irq_spec){.name = "VT-d faults", .handler = fault_isr, .node = -1}, IRQ_CPU_ANY);
-    uint64_t f = spin_lock(&units_lock);
+    uint64_t f = units_hold();
     ok = units_start(translate);
     if (!ok && translate && irreq) {
         kprintf("iommu: VT-d did not start translating; a unit requires interrupt remapping: trying that alone\n");
         ok = units_start(false);
     }
-    spin_unlock(&units_lock, f);
+    units_release(f);
     if (!ok) {
         if (irreq) kprintf("iommu: a VT-d unit that requires interrupt remapping is off: it blocks every interrupt message\n");
         return false; /* the tables stay: a unit may still read them */

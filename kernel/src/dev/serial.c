@@ -9,10 +9,10 @@
    keeps what is written to it.
 
    How it sends: from the log's rings (sys/log.h) through a cursor of its own, a FIFO's worth at a
-   time. The UART interrupts when its transmit holding register empties (IER bit 1), and the
-   interrupt fills the FIFO again from the cursor; when the cursor has nothing more the port stays
-   quiet, and the next records' telling (serial_log_ready, from sys/log.c's interrupt) fills it
-   again if the holding register is empty. No writer waits for the line: what a ring overwrites
+   time, in the log's thread (serial_drain), at the line's rate: one fill, then none until the FIFO
+   has had its time on the line, whatever the rounds between. A UART is touched no oftener than it
+   can send, and no interrupt is asked of it. When the cursor has nothing more the port stays quiet,
+   and the next records' round fills it again. No writer waits for the line: what a ring overwrites
    before the port sends it, the cursor says it lost.
 
    The waits on the line's status (LSR) are where nothing else may run: a panic, the power going
@@ -23,8 +23,6 @@
    to hold it back, which this never does. */
 #include "kernel.h"
 #include "arch/cpu.h"
-#include "arch/ioapic.h"
-#include "arch/irq.h"
 #include "arch/spin.h"
 #include "dev/acpi.h"
 #include "dev/serial.h"
@@ -43,14 +41,6 @@ enum {
     REG_MSR = 6,
     REG_SCR = 7,
 };
-#define IER_THRE 0x02    /* interrupt when the transmit holding register is empty */
-#define IIR_NONE 0x01    /* no interrupt pending */
-#define IIR_CAUSE 0x0E
-#define IIR_LINE 0x06    /* line status: read LSR */
-#define IIR_DATA 0x04    /* received data: read RBR */
-#define IIR_TIMEOUT 0x0C /* received data, timed out: read RBR */
-#define IIR_THRE 0x02    /* holding register empty: cleared by reading IIR or writing THR */
-#define IIR_MODEM 0x00   /* modem status: read MSR */
 #define IIR_FIFOS 0xC0   /* both set: the FIFOs are on */
 #define FCR_ON 0x07      /* FIFOs on, both emptied */
 #define LCR_8N1 0x03     /* 8 data bits, no parity, 1 stop bit */
@@ -62,7 +52,6 @@ enum {
 #define CHAR_BITS 10     /* 8N1: a start bit, 8 data bits, a stop bit */
 #define UART_CLOCK 1843200 /* the PC's UART clock, Hz: 115200 baud at divisor 1 */
 #define COM1_PORT 0x3F8
-#define COM1_IRQ 4
 #define LOG_BAUD 115200
 
 /* The SPCR (see above). A field past h.length is not there (revision 2 ends before uart_clock,
@@ -95,15 +84,15 @@ struct uart {
     unsigned depth;          /* the bytes the transmitter takes at once */
     uint32_t clock, divisor;
     uint64_t char_ns;        /* a character's time on the line */
-    bool has_irq;
-    uint32_t gsi; /* its signal is the IOAPICs' to know (arch/ioapic.h) */
 };
 
 static struct uart uart;
-static struct spinlock serial_lock; /* the port and the cursor: a leaf */
+/* The port's transmitter and the cursor: a leaf. The log's thread takes it with interrupts on (no
+   interrupt handler takes it), the polled paths with them off. */
+static struct spinlock serial_lock;
 static struct log_cursor *cursor;   /* from serial_start */
 static bool started;
-static struct irq *irq;             /* its interrupt, NULL for none */
+static uint64_t next_fill;          /* the log's thread: no fill before this */
 static unsigned room;               /* polled sending: the bytes the FIFO still takes */
 
 static uint8_t reg_in(unsigned reg) {
@@ -198,13 +187,6 @@ static bool spcr_port(struct uart *u) {
     }
     if (SPCR_HAS(t, uart_clock) && t->uart_clock) u->clock = t->uart_clock;
     if (SPCR_HAS(t, precise_baud) && t->precise_baud) u->divisor = divisor_for(u->clock, t->precise_baud);
-    if (t->interrupt_type & 2) {
-        u->has_irq = true;
-        u->gsi = t->gsi;
-    } else if (t->interrupt_type & 1) {
-        u->has_irq = true;
-        u->gsi = ioapic_isa_gsi(t->irq);
-    }
     return true;
 }
 
@@ -215,26 +197,6 @@ static bool fill(void) {
     size_t n = log_read(cursor, piece, uart.depth);
     for (size_t i = 0; i < n; i++) reg_out(REG_DATA, (uint8_t)piece[i]);
     return n != 0;
-}
-
-/* Its interrupt's handler: IRQ_NONE when the UART had no cause (a shared line's other device). */
-static enum irq_result serial_isr(void *context) {
-    (void)context;
-    enum irq_result mine = IRQ_NONE;
-    spin_take(&serial_lock);
-    for (uint8_t iir; uart.present && !((iir = reg_in(REG_IIR)) & IIR_NONE);) {
-        mine = IRQ_HANDLED;
-        switch (iir & IIR_CAUSE) {
-        case IIR_LINE: reg_in(REG_LSR); break;
-        case IIR_DATA:
-        case IIR_TIMEOUT: reg_in(REG_DATA); break;
-        case IIR_MODEM: reg_in(REG_MSR); break;
-        case IIR_THRE: fill(); break; /* reading IIR cleared it: nothing more until the next fill empties */
-        default: break;
-        }
-    }
-    spin_give(&serial_lock);
-    return mine;
 }
 
 void serial_start(void) {
@@ -248,31 +210,32 @@ void serial_start(void) {
         uart.present = true;
     } else if (uart.present) {
         from = "COM1";
-        uart.has_irq = true;
-        uart.gsi = ioapic_isa_gsi(COM1_IRQ);
     } else {
         kprintf("serial: no port (no SPCR, and nothing answers at COM1)\n");
         return;
     }
     if (!(cursor = log_cursor_new(LOG_CURSOR_CONSOLE | LOG_CURSOR_CRLF))) panic("serial: no memory for its cursor");
-    if (uart.has_irq)
-        irq = irq_request_gsi(&(struct irq_spec){.name = "serial", .handler = serial_isr, .node = -1}, uart.gsi);
-    char where[40], how[64];
+    char where[40];
     if (uart.mmio) ksnprintf(where, sizeof where, "memory %p", (void *)uart.base);
     else ksnprintf(where, sizeof where, "I/O %x", uart.port);
-    if (irq) ksnprintf(how, sizeof how, "its interrupt on GSI %u", uart.gsi);
-    else strlcpy(how, "no interrupt: it sends as records are written", sizeof how);
-    kprintf("serial: %s at %s, %u baud, a %u-byte FIFO, %s\n", from, where, uart.clock / (16 * uart.divisor),
-            uart.depth, how);
+    kprintf("serial: %s at %s, %u baud, a %u-byte FIFO\n", from, where, uart.clock / (16 * uart.divisor), uart.depth);
     started = true;
-    if (irq) reg_out(REG_IER, IER_THRE);
 }
 
-void serial_log_ready(void) {
-    if (!started) return;
+uint64_t serial_drain(void) {
+    if (!started) return CLOCK_NEVER;
+    uint64_t now = clock_now_ns();
     spin_take(&serial_lock);
-    if (uart.present && (reg_in(REG_LSR) & LSR_THRE)) fill();
+    bool sending = uart.present;
+    if (sending && now >= next_fill && (reg_in(REG_LSR) & LSR_THRE)) {
+        sending = fill() && log_pending(cursor);
+        next_fill = now + uart.depth * uart.char_ns; /* a FIFO's time on the line */
+    } else if (sending && now >= next_fill) {
+        next_fill = now + uart.char_ns; /* it is still sending its last: a character's time more */
+    }
+    uint64_t again = sending ? next_fill : CLOCK_NEVER;
     spin_give(&serial_lock);
+    return again;
 }
 
 /* Interrupts off: until the line status shows bit (see the top). False, the port given up, when it
@@ -335,12 +298,8 @@ void serial_suspend(void) {
 void serial_resume(void) {
     if (!started) return;
     spin_take(&serial_lock);
-    if (uart.present) {
-        setup();
-        if (irq) reg_out(REG_IER, IER_THRE); /* empty: it interrupts at once */
-        else fill();
-    }
-    spin_give(&serial_lock);
+    if (uart.present) setup();
+    spin_give(&serial_lock); /* log_resume owes the log's thread a round, which fills it */
 }
 
 /* The report, ahead of what the port had not sent of the log: a line far behind the log

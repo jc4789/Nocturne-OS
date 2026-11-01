@@ -9,11 +9,11 @@
 # draw's structures, is the same in every Mesa object. Sets LLVMPIPE (empty when not built),
 # LLVMPIPE_SRC, LLVMPIPE_DEFS, LLVMPIPE_INC and LLVM_JIT_LIBS, the LLVM libraries a program
 # that draws with OpenGL is linked against after the libc's objects (Makefile).
-LLVM_BUILD ?= tools/llvm/build-nocturne
-LLVM_SRC ?= tools/llvm/src
-LLVM_HOST ?= tools/llvm/host
-LLVM_SYSROOT ?= tools/llvm/sysroot
-LLVM_RUNTIMES ?= tools/llvm/runtimes
+LLVM_BUILD ?= $(TOOLS)/llvm/build-nocturne
+LLVM_SRC ?= $(TOOLS)/llvm/src
+LLVM_HOST ?= $(TOOLS)/llvm/host
+LLVM_SYSROOT ?= $(TOOLS)/llvm/sysroot
+LLVM_RUNTIMES ?= $(TOOLS)/llvm/runtimes
 LLVMPIPE := $(if $(wildcard $(LLVM_BUILD)/lib/libLLVMMCJIT.a),yes)
 ifneq ($(LLVMPIPE),)
 LLVMPIPE_SRC := $(wildcard $(MESA)/src/gallium/drivers/llvmpipe/*.c) \

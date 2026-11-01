@@ -16,8 +16,7 @@
 #include "sys/thread.h"
 #include "sys/wait.h"
 
-struct spinlock thread_lock;
-struct thread *thread_list;
+struct spinlock thread_lock = {.rank = SPIN_THREAD};
 static struct id_table thread_ids;
 /* The next id looked at. Ids go round the positive int32 range (the ABI's), skipping those held:
    an id comes back only after every other id was given since, so a stale one (a message's sender,
@@ -63,6 +62,35 @@ struct thread *thread_find(int tid) {
 }
 
 size_t thread_count(void) { return __atomic_load_n(&thread_ids.count, __ATOMIC_RELAXED); }
+
+/* A step of thread_walk: at most this many threads, or buckets looked at. */
+#define WALK_THREADS 32
+#define WALK_BUCKETS 256
+
+struct walk {
+    void (*fn)(struct thread *t, void *arg);
+    void *arg;
+    unsigned seen;
+};
+
+static void walk_one(struct id_link *l, void *arg) {
+    struct walk *w = arg;
+    w->fn((struct thread *)((char *)l - __builtin_offsetof(struct thread, id)), w->arg);
+    w->seen++;
+}
+
+void thread_walk(void (*fn)(struct thread *t, void *arg), void *arg) {
+    struct walk w = {fn, arg, 0};
+    uint64_t cursor = 0;
+    do {
+        uint64_t f = spin_lock(&thread_lock);
+        w.seen = 0;
+        unsigned buckets = 0;
+        do cursor = id_table_scan(&thread_ids, cursor, walk_one, &w);
+        while (cursor && w.seen < WALK_THREADS && ++buckets < WALK_BUCKETS);
+        spin_unlock(&thread_lock, f);
+    } while (cursor);
+}
 
 /* thread_lock held, the registry with room for one more: an id no thread holds, 0 when every one
    is held. Of count + 1 ids in a row at most count are held, so the look ends within that many. */
@@ -111,10 +139,6 @@ static struct thread *thread_listed(const char *name, struct process *p, uint8_t
     }
     t->id.id = (uint64_t)t->tid;
     id_table_add(&thread_ids, &t->id);
-    t->all_next = thread_list;
-    t->all_prev = &thread_list;
-    if (thread_list) thread_list->all_prev = &t->all_next;
-    thread_list = t;
     if (p && p->main) { /* one of p's other threads, whose record keeps p's */
         t->process_next = p->threads;
         t->process_prev = &p->threads;
@@ -130,8 +154,6 @@ static struct thread *thread_listed(const char *name, struct process *p, uint8_t
 static void thread_release(struct thread *t) {
     uint64_t f = spin_lock(&thread_lock);
     id_table_drop(&thread_ids, &t->id);
-    *t->all_prev = t->all_next;
-    if (t->all_next) t->all_next->all_prev = t->all_prev;
     if (t->process_prev) process_unlist(t);
     spin_unlock(&thread_lock, f);
     kstack_free(t->kstack);

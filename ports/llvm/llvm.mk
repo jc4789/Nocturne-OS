@@ -1,5 +1,5 @@
 # The LLVM toolchain (ports/llvm/README.md), on the disk when its Nocturne build
-# exists in tools/llvm/nocturne (python ports/llvm/build.py nocturne). clang,
+# exists in $(TOOLS)/llvm/nocturne (python ports/llvm/build.py nocturne). clang,
 # lld and the binary tools are one program, llvm, in C:\Nocturne\System, with
 # the launcher ports/llvm/tool.c under each tool's name beside it; their part of
 # the SDK (clang's headers and runtime, libc++, libc++abi and libunwind) goes
@@ -11,8 +11,8 @@
 # after the libc link rules and mesa.mk, adds $(LLVM_FILES) to what goes on the
 # disk (DISK_FILES) and gives mksdk.sh $(LLVM_SDK), whose files the SDK is made
 # from ($(LLVM_SDK_FILES)).
-LLVM_DIST ?= tools/llvm/nocturne
-LLVM_SRC ?= tools/llvm/src
+LLVM_DIST ?= $(TOOLS)/llvm/nocturne
+LLVM_SRC ?= $(TOOLS)/llvm/src
 # The licence of every part of llvm-project in the programs and the SDK, and
 # the notices of the code in them under licences of its own, by their place
 # in llvm-project.

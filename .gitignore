@@ -1,4 +1,6 @@
 tools/
+# wabt's wasm2c driver (scripts/build_cxx.py vendor-wabt) is a source, not the tools above
+!third_party/wabt/src/tools/
 build/
 *.vhd
 *.vhdx

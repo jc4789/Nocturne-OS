@@ -23,9 +23,9 @@
    memory and the CPUs. Until then the records go to a ring of the boot's own. */
 void log_init(void);
 /* CPU 0 at boot, after the APIC, the IOAPIC and the scheduler and before another CPU starts: from
-   now on a writer tells the readers by an interrupt to itself, the boot screen draws in its own
-   thread and the serial port sends from its interrupt. Until then the boot screen draws as each
-   record is written (one CPU, interrupts off). */
+   now on a writer tells the "log" thread (sys/log.c, the top), which fills the serial port and
+   wakes the readers; the boot screen draws in its own thread. Until then the boot screen draws as
+   each record is written (one CPU, interrupts off). */
 void log_start(void);
 /* A sleep (dev/pm.c), CPU 0 with interrupts off and the other CPUs parked. log_suspend, before
    the interrupt controllers go down: the writers stop telling the readers (no interrupt to itself

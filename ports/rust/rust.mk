@@ -1,5 +1,5 @@
 # Rust programs (ports/rust/README.md), built when the standard library for
-# x86_64-unknown-nocturne exists in tools/rust/sysroot (ports/rust/build-std.sh).
+# x86_64-unknown-nocturne exists in $(TOOLS)/rust/sysroot (ports/rust/build-std.sh).
 # Every ports/rust/apps/<name>/main.rs becomes the system program <name>, in
 # C:\Nocturne\System. Without the sysroot nothing here is built, so a normal
 # `make` is unchanged.
@@ -7,8 +7,7 @@
 # Needs PROGRAMS, LICENSES, LIBC_RSP and the crt0 object of the libc (Makefile),
 # so the Makefile includes this file after the libc link rules and adds
 # $(RUST_FILES) to what goes on the disk (DISK_FILES).
-RUST_SYSROOT ?= tools/rust/sysroot
-RUST_LICENSES ?= tools/rust/licenses
+RUST_LICENSES ?= $(TOOLS)/rust/licenses
 ifneq ($(wildcard $(RUST_SYSROOT)/lib/rustlib/x86_64-unknown-nocturne/lib),)
 RUST_APPS  := $(notdir $(wildcard ports/rust/apps/*))
 RUST_BINS  := $(addprefix $(PROGRAMS)/,$(RUST_APPS))

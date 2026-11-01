@@ -129,9 +129,11 @@ n_handle n_pci_bar(n_handle pci, uint32_t bar);
 /* Turn on `count` message-signalled interrupts (MSI-X if offered, else MSI; count is rounded
    down to what the function and the system give) and return how many. Each one that arrives
    sets its bit until n_pci_interrupt_take returns it; the handle is N_EVENT_RECEIVABLE while a
-   bit is set. take waits until deadline (N_CLOCK_NEVER: no limit; N_ERR_TIMEOUT). */
+   bit is set. take waits until a message among the first 64 * words has arrived, or deadline
+   (N_CLOCK_NEVER: no limit; N_ERR_TIMEOUT), then writes their bits (message n: bit n % 64 of
+   bits[n / 64]), clears them and returns how many words it wrote; later messages' bits stay. */
 n_result n_pci_interrupts(n_handle pci, uint32_t count);
-n_result n_pci_interrupt_take(n_handle pci, uint64_t deadline);
+n_result n_pci_interrupt_take(n_handle pci, uint64_t *bits, uint32_t words, uint64_t deadline);
 /* While the driver changes how the CPU reaches the boot screen in the function's BAR (as
    n_pci_info reports it), the system must not write there. hold true returns once nothing is
    being written and keeps the screen untouched; holds nest, and the last false (or the end of

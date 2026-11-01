@@ -3,6 +3,7 @@
 #include "arch/cpu.h"
 #include "arch/irq.h"
 #include "arch/spin.h"
+#include "arch/topology.h"
 #include "dev/pci.h"
 #include "dev/acpi.h"
 #include "dev/iommu.h"
@@ -252,6 +253,18 @@ void pci_init(void) {
         for (size_t k = 0; k < ndevices && !devices[i].upstream; k++)
             if (k != i && devices[k].bridge && devices[k].secondary == devices[i].bus)
                 devices[i].upstream = &devices[k];
+    /* each function's node, for its memory and the CPUs its interrupts go to. Finding a function's
+       ACPI object evaluates its neighbours' _ADR: with one node there is nothing to choose. */
+    for (size_t i = 0; i < ndevices; i++) {
+        uint32_t domain;
+        devices[i].node = -1;
+        if (topology.nodes < 2 || !acpi_pci_proximity(&devices[i], &domain)) continue;
+        for (unsigned n = 0; n < topology.nodes; n++)
+            if (topology.node[n].domain == domain) {
+                devices[i].node = (int)n;
+                break;
+            }
+    }
 }
 
 struct pci_device *pci_find(uint16_t vendor, uint16_t device) {

@@ -96,7 +96,8 @@ static int irq_thread(void *unused) {
     while (!__atomic_load_n(&irq_stop, __ATOMIC_ACQUIRE)) {
         bool delivered = false;
         if (!irq_polling) {
-            n_result r = n_pci_interrupt_take(nvrm_dev.pci, n_clock_after(IRQ_WAKE_MS * N_NS_PER_MS));
+            uint64_t bits;
+            n_result r = n_pci_interrupt_take(nvrm_dev.pci, &bits, 1, n_clock_after(IRQ_WAKE_MS * N_NS_PER_MS));
             if (r >= 0) {
                 delivered = true;
                 __atomic_add_fetch(&irq_delivered, 1, __ATOMIC_RELAXED);

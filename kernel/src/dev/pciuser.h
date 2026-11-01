@@ -37,7 +37,7 @@ int64_t pci_user_config_write(struct handle *h, uint32_t offset, uint32_t width,
 int64_t pci_user_bar(struct handle *h, uint32_t bar, uint64_t *address, uint64_t *size);
 bool pci_user_bar_prefetchable(struct handle *h, uint32_t bar);
 int64_t pci_user_interrupts(struct handle *h, uint32_t count);
-int64_t pci_user_interrupt_take(struct handle *h, uint64_t deadline);
+int64_t pci_user_interrupt_take(struct handle *h, uint64_t deadline, uint64_t *ubits, uint32_t words);
 /* n_pci_hold_screen: only for the function whose BAR the boot screen is drawn through, or one
    whose buffers a screen is drawn into. */
 int64_t pci_user_hold_screen(struct handle *h, bool hold);

@@ -14,6 +14,8 @@
 #include "mm/pmm.h"
 #include "sys/object.h"
 #include "sys/thread.h"
+#include "arch/percpu.h"
+#include "arch/topology.h"
 
 #define WRITE_DELAY_NS (5 * NS_PER_S) /* the first change waits this long for more to commit with it */
 #define FIND_NS (10 * NS_PER_S)       /* how long the disk the system started from may take to appear */
@@ -327,8 +329,6 @@ int64_t store_now(void) { return clock_wall_ns(); }
 
 /* ---- mounting ---- */
 
-static void cursors_init(void);
-
 void store_init(void) {
     device_find();
     /* clean blocks kept: a 16th of memory for a disk */
@@ -339,7 +339,6 @@ void store_init(void) {
     if (r >= 0) r = ns_mount(v);
     if (r < 0) panic("store: C: on %s cannot be mounted (%d)", medium_name(), r);
     store.v = v;
-    cursors_init();
     char label[sizeof v->super.label + 1] = {0};
     memcpy(label, v->super.label, sizeof v->super.label);
     kprintf("store: C: \"%s\" on %s, %lu MiB, %lu MiB free\n", label, medium_name(),
@@ -686,46 +685,50 @@ int store_entry_info(const char *path, bool user, struct n_entry *out) {
 }
 
 /* Where listings stopped: one that goes on from where another stopped needs no walk from the
-   start. About two for each CPU are kept (no more list at once), the least recently used first. */
+   start. Each is kept in a shard its folder, index and caller choose, a shard in each CPU's memory,
+   each with its own lock and room for CURSORS_PER_SHARD (no more listings go on at once than
+   CPUs, about two each), the least recently kept going first: a look is one shard's few. */
+#define CURSORS_PER_SHARD 2
 struct cursor {
     uint64_t folder, index; /* the entries listed before it */
     bool user;
     struct ns_entry last;
 };
 
-static struct {
+struct cursor_shard {
     struct spinlock lock;
-    struct cursor *c; /* oldest first */
-    size_t n, room;
-} cursors;
+    unsigned n;
+    struct cursor c[CURSORS_PER_SHARD]; /* oldest first */
+};
+PERCPU static struct cursor_shard cursor_shards;
 
-static void cursors_init(void) {
-    cursors.room = 2 * (size_t)cpu_online_count();
-    if (!(cursors.c = kmalloc(cursors.room * sizeof *cursors.c))) cursors.room = 0;
+static struct cursor_shard *cursor_shard(uint64_t folder, uint64_t index, bool user) {
+    uint64_t h = (folder * 0x9e3779b97f4a7c15ull ^ index) * 0xc2b2ae3d27d4eb4full ^ user;
+    return &per_cpu(cursor_shards, (unsigned)((h >> 32) % topology.cpus));
 }
 
 /* The cursor where a listing of folder stopped after index entries, taken out (false: none). */
 static bool cursor_take(uint64_t folder, uint64_t index, bool user, struct ns_entry *last) {
-    uint64_t flags = spin_lock(&cursors.lock);
-    size_t i = 0;
-    while (i < cursors.n && !(cursors.c[i].folder == folder && cursors.c[i].index == index && cursors.c[i].user == user)) i++;
-    bool found = i < cursors.n;
+    struct cursor_shard *s = cursor_shard(folder, index, user);
+    uint64_t flags = spin_lock(&s->lock);
+    unsigned i = 0;
+    while (i < s->n && !(s->c[i].folder == folder && s->c[i].index == index && s->c[i].user == user)) i++;
+    bool found = i < s->n;
     if (found) {
-        *last = cursors.c[i].last;
-        memmove(&cursors.c[i], &cursors.c[i + 1], (cursors.n - i - 1) * sizeof *cursors.c);
-        cursors.n--;
+        *last = s->c[i].last;
+        memmove(&s->c[i], &s->c[i + 1], (s->n - i - 1) * sizeof *s->c);
+        s->n--;
     }
-    spin_unlock(&cursors.lock, flags);
+    spin_unlock(&s->lock, flags);
     return found;
 }
 
 static void cursor_keep(uint64_t folder, uint64_t index, bool user, const struct ns_entry *last) {
-    uint64_t flags = spin_lock(&cursors.lock);
-    if (cursors.room) {
-        if (cursors.n == cursors.room) memmove(&cursors.c[0], &cursors.c[1], --cursors.n * sizeof *cursors.c);
-        cursors.c[cursors.n++] = (struct cursor){.folder = folder, .index = index, .user = user, .last = *last};
-    }
-    spin_unlock(&cursors.lock, flags);
+    struct cursor_shard *s = cursor_shard(folder, index, user);
+    uint64_t flags = spin_lock(&s->lock);
+    if (s->n == CURSORS_PER_SHARD) memmove(&s->c[0], &s->c[1], --s->n * sizeof *s->c);
+    s->c[s->n++] = (struct cursor){.folder = folder, .index = index, .user = user, .last = *last};
+    spin_unlock(&s->lock, flags);
 }
 
 int64_t store_folder_list(const char *path, uint64_t start, void *out, size_t max, size_t bytes, bool user) {

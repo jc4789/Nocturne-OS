@@ -88,7 +88,7 @@ static struct section *sections;
 static uint64_t nsections;
 static struct node **nodes;
 static unsigned nnodes, nbands;
-PERCPU static struct cache cpu_cache;
+PERCPU static struct cache cpu_cache = {.lock = {.rank = SPIN_PAGE_CACHE}};
 static uint64_t page_count, usable_frames;
 static uint64_t low_base, low_pages; /* usable below 1 MiB; never allocated */
 
@@ -617,6 +617,7 @@ void pmm_init(struct limine_memmap_response *mm) {
     uint64_t *keys = bootmem_alloc(nnodes * sizeof *keys, _Alignof(uint64_t));
     for (unsigned i = 0; i < nnodes; i++) {
         struct node *n = bootmem_alloc_node(sizeof *n + nbands * sizeof(struct band), 64, i);
+        n->lock = (struct spinlock){.rank = SPIN_PAGE_NODE};
         n->index = i;
         for (unsigned j = 0; j < nnodes; j++) keys[j] = (uint64_t)topology.distance[i * nnodes + j] << 32 | j;
         sort(keys, nnodes, sizeof *keys, by_key);

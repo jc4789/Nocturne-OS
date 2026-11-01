@@ -431,7 +431,9 @@ n_result n_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, uint3
 }
 n_handle n_pci_bar(n_handle pci, uint32_t bar) { return (n_handle)NC5(SYS_PCI_BAR, pci, bar, 0, 0, 0); }
 n_result n_pci_interrupts(n_handle pci, uint32_t count) { return NC5(SYS_PCI_INTERRUPTS, pci, count, 0, 0, 0); }
-n_result n_pci_interrupt_take(n_handle pci, uint64_t deadline) { return NC5(SYS_PCI_INTERRUPT_TAKE, pci, deadline, 0, 0, 0); }
+n_result n_pci_interrupt_take(n_handle pci, uint64_t *bits, uint32_t words, uint64_t deadline) {
+    return NC5(SYS_PCI_INTERRUPT_TAKE, pci, deadline, bits, words, 0);
+}
 n_result n_pci_hold_screen(n_handle pci, bool hold) { return NC5(SYS_PCI_HOLD_SCREEN, pci, hold ? 1 : 0, 0, 0, 0); }
 n_result n_pci_give_screen(n_handle pci, uint32_t output, const struct n_screen_buffers *buffers) {
     return NC5(SYS_PCI_GIVE_SCREEN, pci, output, buffers, 0, 0);
@@ -589,48 +591,73 @@ int system(const char *cmd) {
     return run_wait("sh", argv);
 }
 
-/* Environment: there is no inherited environment, just the launch settings plus the FOLDER that
-   n_folder_set gives this app. */
-static char **env_names, **env_vals;
-static int env_n;
+/* Settings: there is no inherited environment, just the launch settings (n_settings, never
+   changed) plus the ones this app sets itself (n_folder_set's FOLDER). Those are a list read
+   without a lock by any thread: an entry, once in, stays, and its value is swapped whole. A value
+   is kept for the app's life once set, so that a pointer getenv gave another thread never
+   dangles; a value set again that equals one kept is that one again. */
+struct own_setting {
+    struct own_setting *next;
+    char *value;          /* swapped with release, read with acquire */
+    struct kept *kept;    /* the values it has had */
+    char name[];
+};
+struct kept {
+    struct kept *next;
+    char value[];
+};
+static struct own_setting *own_settings;
+static uint32_t own_settings_lock; /* the writers' */
 
-static int env_find(const char *name) {
-    for (int i = 0; i < env_n; i++)
-        if (!strcmp(env_names[i], name)) return i;
-    return -1;
+static void own_lock(void) {
+    while (__atomic_exchange_n(&own_settings_lock, 1, __ATOMIC_ACQUIRE))
+        if (wait_on_address(&own_settings_lock, 1, UINT32_MAX) < 0) yield();
+}
+static void own_unlock(void) {
+    __atomic_store_n(&own_settings_lock, 0, __ATOMIC_RELEASE);
+    wake_address(&own_settings_lock, 1);
+}
+
+static struct own_setting *own_find(const char *name) {
+    for (struct own_setting *s = __atomic_load_n(&own_settings, __ATOMIC_ACQUIRE); s; s = s->next)
+        if (!strcmp(s->name, name)) return s;
+    return NULL;
 }
 
 /* Sets this app's own setting name to value: n_folder_set's FOLDER, which getenv and the
    apps it launches then see. */
 static int setting_set(const char *name, const char *value) {
-    int i = env_find(name);
-    char *v = strdup(value);
-    if (!v) return -1;
-    if (i >= 0) {
-        free(env_vals[i]);
-        env_vals[i] = v;
-        return 0;
+    int r = -1;
+    own_lock();
+    struct own_setting *s = own_find(name);
+    if (!s && (s = malloc(sizeof *s + strlen(name) + 1))) {
+        *s = (struct own_setting){.next = own_settings};
+        strcpy(s->name, name);
+        __atomic_store_n(&own_settings, s, __ATOMIC_RELEASE);
     }
-    char **nn = realloc(env_names, sizeof(char *) * (size_t)(env_n + 1));
-    if (nn) env_names = nn;
-    char **nv = realloc(env_vals, sizeof(char *) * (size_t)(env_n + 1));
-    if (nv) env_vals = nv;
-    char *n = strdup(name);
-    if (!nn || !nv || !n) {
-        free(v);
-        free(n);
-        return -1;
+    if (s) {
+        struct kept *k = s->kept;
+        while (k && strcmp(k->value, value)) k = k->next;
+        if (!k && (k = malloc(sizeof *k + strlen(value) + 1))) {
+            strcpy(k->value, value);
+            k->next = s->kept;
+            s->kept = k;
+        }
+        if (k) {
+            __atomic_store_n(&s->value, k->value, __ATOMIC_RELEASE);
+            r = 0;
+        }
     }
-    env_names[env_n] = n;
-    env_vals[env_n++] = v;
-    return 0;
+    own_unlock();
+    return r;
 }
 
 char *const *n_settings = (char *const[]){NULL};
 
 char *getenv(const char *name) {
-    int i = env_find(name);
-    if (i >= 0) return env_vals[i];
+    struct own_setting *own = own_find(name);
+    char *value = own ? __atomic_load_n(&own->value, __ATOMIC_ACQUIRE) : NULL;
+    if (value) return value;
     size_t len = strlen(name);
     for (char *const *s = n_settings; *s; s++)
         if (!strncmp(*s, name, len) && (*s)[len] == '=') return *s + len + 1;

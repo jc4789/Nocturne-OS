@@ -1,34 +1,47 @@
 #include "kernel.h"
 #include "dev/blk.h"
+#include "mm/heap.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
 
-/* The devices, in the order their drivers found them (a USB disk at any time), never removed.
-   devs_lock serializes the appends; a reader reads ndevs with acquire, then the entries below it,
-   each whole before ndevs counts it. */
-#define MAX_BLK 16
-static struct spinlock devs_lock;
-static struct blkdev *devs[MAX_BLK];
-static int ndevs;
+/* The devices, in the order their drivers found them (a USB disk at any time), never removed, any
+   number of them. devs_lock (a mutex: an append may allocate) serializes the appends. The table
+   grows by doubling into a new one, published before ndevs counts its new entry; a reader reads
+   ndevs with acquire, then the table, whose every entry below ndevs is there. An old table stays,
+   since a reader may still be in it: all of them together are at most the size of the last. */
+static struct mutex devs_lock;
+static struct blkdev **devs;
+static int ndevs, room;
 
 void blk_register(struct blkdev *d) {
     if (!d->block) d->block = 512;
-    uint64_t f = spin_lock(&devs_lock);
+    mutex_lock(&devs_lock);
     int n = ndevs;
-    if (n < MAX_BLK) {
-        d->index = n;
-        devs[n] = d;
-        __atomic_store_n(&ndevs, n + 1, __ATOMIC_RELEASE);
+    if (n == room) {
+        int grown = room ? 2 * room : 8;
+        struct blkdev **table = kmalloc((size_t)grown * sizeof *table);
+        if (!table) {
+            mutex_unlock(&devs_lock);
+            kprintf("blk: %s: no memory to list it\n", d->name);
+            return;
+        }
+        if (n) memcpy(table, devs, (size_t)n * sizeof *table);
+        __atomic_store_n(&devs, table, __ATOMIC_RELEASE);
+        room = grown;
     }
-    spin_unlock(&devs_lock, f);
-    if (n == MAX_BLK) return;
+    d->index = n;
+    devs[n] = d;
+    __atomic_store_n(&ndevs, n + 1, __ATOMIC_RELEASE);
+    mutex_unlock(&devs_lock);
     kprintf("blk: %s: %s, %lu MiB, %u-byte blocks%s\n", d->name, d->model, d->sectors / 2048, d->block,
             d->persist ? "" : ", no write cache");
 }
 
 int blk_count(void) { return __atomic_load_n(&ndevs, __ATOMIC_ACQUIRE); }
 
-struct blkdev *blk_get(int i) { return i >= 0 && i < blk_count() ? devs[i] : NULL; }
+struct blkdev *blk_get(int i) {
+    return i >= 0 && i < blk_count() ? __atomic_load_n(&devs, __ATOMIC_ACQUIRE)[i] : NULL;
+}
 
 /* The power gate: holder (the one thread that reaches the disks while it is set) and inflight
    (the requests under way), under gate_lock. A request waits for holder, and blk_hold for

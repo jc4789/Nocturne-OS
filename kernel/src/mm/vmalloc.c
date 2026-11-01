@@ -32,7 +32,7 @@ struct area {
 };
 #define AREA(s) ((struct area *)((char *)(s) - offsetof(struct area, span)))
 
-static struct spinlock lock;
+static struct spinlock lock = {.rank = SPIN_VMALLOC};
 static struct span_tree busy, space;
 static struct area *retired;
 static uint64_t retired_pages, retired_most;
