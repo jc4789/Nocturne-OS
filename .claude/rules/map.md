@@ -79,6 +79,7 @@
 | `js_intl.js`、`js_segmenter.js`、`js_collator.js` | `scripts/build_intl.py`、`scripts/build_segmenter.py`、`scripts/build_collator.py` |
 | `unicode_grapheme_data.h`、`wctype_data.h`、`unicode_bidi_data.h` | `scripts/unicode_grapheme.py`、`scripts/unicode_wctype.py`、`scripts/unicode_bidi.py` |
 | `common/unifont.bin` | `scripts/unifont2bin.py` |
+| `kernel/src/dev/audio_pace.h` | `scripts/audio_pace_table.py` |
 
 ## 境界
 

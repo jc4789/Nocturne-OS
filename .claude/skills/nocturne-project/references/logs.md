@@ -63,8 +63,10 @@ fps を直接出す行は無い。一組（wall ≈ 2000 ms）の `draw` の回�
 
 ## 動画と音（avmedia.c）
 
-- `Native media timing: generation G, input MSE|Range|buffer, clock C ms, presented P at T ms, decoded D/drop X, window-published W; audio open|closed, queued Q frames, written/silence …, end/played-estimate … ms, pending …/ahead …, starved S/ended E, window-unpublished <理由>@<行>`
+- `Native media timing: generation G, input MSE|Range|buffer, clock C ms, presented P at T ms, decoded D/drop X, window-published W; audio open|closed, queued Q frames, underrun N/T ms, written/silence …, end/played-estimate … ms, pending …/ahead …, starved S/ended E, window-unpublished <理由>@<行>`
   - 再生中は 2 秒ごと、止まったら一度。**旗は要らない**（F12 の Console と Trace の札には常に。serial へは `--log-console`）。
+  - `underrun N/T ms`：音切れ。音の出口が流れの音を全部鳴らし終えた後に次の音が来た回数と、その間の時間の合計（カーネルが数える `n_audio_status`）。音のある再生の時計はこの間止まるので、時計の遅れはこの T で読める。`starved` は今の状態で、回数ではない。
+  - `sync`：`sound L..H/filtered F ms` は装置の報告の位置から時計を引いた値（行の間の最小・最大と、濾した値）、`pace P ppm` は混ぜ場が出口の水晶に合わせている比（`n_audio_status` の `pace_ppb`）、`picture L..H ms` は載せたコマの時計に対する遅れ（行の間の最小・最大）、`hold N/T ms` は時計が音を待った回数と時間の合計、`resync N/T ms` は装置が時計から離れたままで時計を装置の位置へ移した回数と、移した幅の合計。
   - `written/silence`：音の出口へ書いたフレーム数のうち、PTS の隙間を埋めた無音の数。連続した音なら silence はほとんど増えない。増えるなら PTS の丸めを隙間と見ている。
   - かくつきは `drop` の増え方と `starved`。`presented` が `decoded` よりずっと少なければ、解読は追い付いて提示が追い付いていない。`window-unpublished` は窓へ直接出せなかった理由と avmedia.c の行番号。
 - `Native media transition: reason …, generation a->b, …`、`Native audio sink: …`、`Native media supply: …`：`--debug-js` のときだけ。

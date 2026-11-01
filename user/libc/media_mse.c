@@ -42,7 +42,9 @@ struct nmedia_mse {
     int64_t seek_target;
     bool webm,ended,quota_error,video_key,sequence,sequence_group,configuration_boundary,retain_cursor,input_waiting,key_waiting;
     char mime[256],error[160];
-    uint64_t revision;
+    uint64_t revision; /* outputs of an older one are not this decoder's */
+    uint64_t timeline; /* what plays moved: a seek, new data where it played. A decoder that only goes on
+                          from where it stood (a new configuration, more input) changes revision alone */
     uint64_t video_decoded,video_dropped;
 };
 static bool bad(nmedia_mse *m,const char *message,bool quota){
@@ -86,6 +88,7 @@ size_t nmedia_mse_quota(const nmedia_mse *m){
 }
 const struct nmedia_info *nmedia_mse_info(const nmedia_mse *m){return m?nmedia_get_info(m->decoder):NULL;}
 uint64_t nmedia_mse_revision(const nmedia_mse *m){return m?m->revision:0;}
+uint64_t nmedia_mse_timeline(const nmedia_mse *m){return m?m->timeline:0;}
 bool nmedia_mse_parsing(const nmedia_mse *m){return m&&m->staged!=0;}
 int64_t nmedia_mse_group_end(const nmedia_mse *m){return m?m->end_ms:0;}
 int64_t nmedia_mse_duration(const nmedia_mse *m){const struct nmedia_info *info=nmedia_mse_info(m);return !m?-1:m->init_duration>=0?m->init_duration:info?info->duration_ms:-1;}
@@ -347,7 +350,7 @@ done:
             /* Publishing a later init does not invalidate borrowed output or
              * seek the active decoder. Old samples keep their configuration;
              * replace_decoder publishes a revision at the real boundary. */
-            if(!m->decoder){m->decoder=candidate;candidate=NULL;configuration_ref(m->configuration);m->decode_configuration=m->configuration;m->revision++;}
+            if(!m->decoder){m->decoder=candidate;candidate=NULL;configuration_ref(m->configuration);m->decode_configuration=m->configuration;m->revision++;m->timeline++;}
         }
         bool initial=!m->frames,replaced=false;int64_t lo[2]={INT64_MAX,INT64_MAX},hi[2]={INT64_MIN,INT64_MIN};
         for(struct coded_frame *f=new_frames;f;f=f->next){int t=f->video;lo[t]=MIN(lo[t],f->start);hi[t]=MAX(hi[t],f->end);}
@@ -460,15 +463,16 @@ bool nmedia_mse_seek(nmedia_mse *m,int64_t ms){
     if(!m||!m->decoder||ms<0)return false;m->seek_target=ms;m->configuration_boundary=false;
     if(!packet_seek(m,ms))return false;
     if(m->cursor&&!replace_decoder(m,m->cursor->configuration))return false;
-    if(!nmedia_seek(m->decoder,ms))return false;m->revision++;return true;
+    if(!nmedia_seek(m->decoder,ms))return false;m->revision++;m->timeline++;return true;
 }
-bool nmedia_mse_remove(nmedia_mse *m,int64_t start,int64_t end){
+bool nmedia_mse_remove(nmedia_mse *m,int64_t start,int64_t end,int64_t current){
     if(!m||start<0||end<=start)return false;struct coded_frame **p=&m->frames;bool need_key=false,changed=false;m->tail=NULL;
     while(*p){struct coded_frame *f=*p;bool drop=f->start>=start&&f->start<end;
         if(f->video&&drop)need_key=true;if(f->video&&need_key){if(f->start>=end&&f->key)need_key=false;else drop=true;}
-        if(drop){if(m->cursor==f)m->cursor=f->next;*p=f->next;release_frame(m,f);changed=true;}
+        if(drop){if(f->end>current)changed=true;if(m->cursor==f)m->cursor=f->next;*p=f->next;release_frame(m,f);}
         else {m->tail=f;p=&f->next;}}
     m->end_ms=0;for(struct coded_frame *f=m->frames;f;f=f->next)m->end_ms=MAX(m->end_ms,f->end);
+    /* What has played going from the buffer changes nothing for what plays. */
     if(changed&&m->decoder){
         if(!nmedia_mse_seek(m,m->play_ms))return false;
         /* remove already invalidates pending output and needs GOP preroll.
@@ -492,7 +496,7 @@ bool nmedia_mse_change_type(nmedia_mse *m,const char *type){
     if(!strcmp(m->mime,type)){nmedia_mse_abort(m);return true;}
     if(m->frames)return bad(m,"remove retained coded frames before changing MSE codec",false);
     nmedia_close(m->decoder);m->decoder=NULL;configuration_unref(m->decode_configuration);m->decode_configuration=NULL;configuration_unref(m->configuration);m->configuration=NULL;
-    nmedia_ff_free(m->init);m->init=NULL;m->init_size=0;m->staged=0;release_empty_staging(m);m->init_duration=-1;m->seek_target=-1;m->configuration_boundary=false;m->revision++;
+    nmedia_ff_free(m->init);m->init=NULL;m->init_size=0;m->staged=0;release_empty_staging(m);m->init_duration=-1;m->seek_target=-1;m->configuration_boundary=false;m->revision++;m->timeline++;
     nmedia_ff_free(m->init_sizes);m->init_sizes=NULL;m->init_size_count=0;
     strlcpy(m->mime,type,sizeof m->mime);m->webm=!strncasecmp(type,"video/webm",10)||!strncasecmp(type,"audio/webm",10);m->error[0]=0;m->video_key=true;return true;
 }

@@ -18,9 +18,11 @@
    is armed: a stream that gets PCM starts an idle sink at once, on any CPU. No sink sums PCM with the
    mixer's lock held, or with interrupts off.
 
-   Every frame mixed for a sink has an ordinal, the count of frames mixed for sinks before it. A
-   sink reports which it has played (audio_played), and a stream's played frames are its frames
-   before the last ordinal reported, at the clock time of that report. */
+   Every frame a sink is given has an ordinal, the count of frames given to sinks before it. A sink
+   reports which it has played (audio_played), and a stream's played frames are its frames before
+   that place, at the clock time of the report. Its position and clock are what the mixer needs to
+   play every stream at AUDIO_RATE frames per second of the clock, whatever its device's crystal
+   does (the pace, audio.c): ordinals are the device's frames, and a stream's are the clock's. */
 
 #define AUDIO_RATE  48000 /* of the streams and the mix; an output's own format is its device's to say */
 #define AUDIO_FRAME 4     /* bytes of a stream's frame */

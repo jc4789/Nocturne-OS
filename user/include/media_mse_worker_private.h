@@ -32,7 +32,7 @@ struct nmsw_response {
 /* Each record is followed by count ranges. Records are ordered by slot. */
 struct nmsw_metadata {
     uint32_t slot,count,parsing,key_waiting;
-    uint64_t revision;int64_t group_end;
+    uint64_t revision,timeline;int64_t group_end;
     struct nmsw_info info;
 };
 /* The VIDEO channel carries headers only. Raster bytes reside in native shared
@@ -68,7 +68,7 @@ _Static_assert(sizeof(struct nmsw_command)==72,"MSE command wire v3");
 _Static_assert(sizeof(struct nmsw_video)==136,"MSE VIDEO wire v8");
 _Static_assert(sizeof(struct nmsw_info)==128,"MSE info wire");
 _Static_assert(sizeof(struct nmsw_response)==272,"MSE response wire v7");
-_Static_assert(sizeof(struct nmsw_metadata)==160,"MSE metadata wire v2");
+_Static_assert(sizeof(struct nmsw_metadata)==168,"MSE metadata wire");
 typedef struct nmedia_mse_worker nmedia_mse_worker;
 nmedia_mse_worker *nmedia_mse_worker_open(uint32_t,char *,size_t);
 bool nmedia_mse_worker_command(nmedia_mse_worker *,unsigned,unsigned,const void *,size_t,int64_t,int64_t,int64_t,bool);
@@ -107,6 +107,7 @@ void nmedia_mse_worker_close(nmedia_mse_worker *);
 
 bool nmedia_mse_worker_seeking(const nmedia_mse_worker *);
 uint64_t nmedia_mse_worker_revision(const nmedia_mse_worker *,unsigned);
+uint64_t nmedia_mse_worker_timeline(const nmedia_mse_worker *,unsigned);
 unsigned nmedia_mse_worker_output_slot(const nmedia_mse_worker *);
 bool nmedia_mse_worker_parsing(const nmedia_mse_worker *,unsigned);
 bool nmedia_mse_worker_key_waiting(const nmedia_mse_worker *);

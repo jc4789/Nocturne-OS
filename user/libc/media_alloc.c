@@ -1,5 +1,5 @@
 /* プロセス単位の生存メディア割当を課金する。
- * 単一 BSP / single-owner 契約。全プロセス RAM や RSS 上限ではない。
+ * どのスレッドからも呼べる。全プロセス RAM や RSS 上限ではない。
  * 元 FFmpeg 原文を変更せず、既存 MALLOC_PREFIX に接続する。
  * free はこの allocator の有効 pointer または NULL のみを受ける。
  */
@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 #ifndef NMEDIA_ALLOC_LIMIT_BYTES
 #define NMEDIA_ALLOC_LIMIT_BYTES NMEDIA_ALLOC_DEFAULT_BYTES
 #endif
@@ -26,10 +27,12 @@ struct allocation {
     size_t requested, charge;
 };
 static struct nmedia_alloc_stats totals = { .limit = NMEDIA_ALLOC_LIMIT_BYTES };
+static mtx_t totals_lock = { .type = mtx_plain }; /* totals */
 static bool worker_restricted;
 static void increment(size_t *counter) {
     if (*counter != SIZE_MAX) ++*counter;
 }
+/* totals_lock held. */
 static void rejected(enum nmedia_alloc_failure why) {
     increment(&totals.rejects);
     totals.last_failure = why;
@@ -41,8 +44,12 @@ size_t nmedia_alloc_charge(size_t requested) {
     return (bytes + overhead + 15) & ~(size_t)15;
 }
 void nmedia_alloc_snapshot(struct nmedia_alloc_stats *out) {
-    if (out) *out = totals;
+    if (!out) return;
+    mtx_lock(&totals_lock);
+    *out = totals;
+    mtx_unlock(&totals_lock);
 }
+/* totals_lock held. */
 static bool admit_charge(size_t charge) {
     /* SIZE_MAX means no artificial quota, not permission to wrap current,
        current or peak. Explicit finite user limits are checked separately. */
@@ -56,31 +63,43 @@ static bool admit_charge(size_t charge) {
     return true;
 }
 bool nmedia_alloc_reserve_worker(void) {
-    if(totals.reserved==SIZE_MAX){rejected(NMEDIA_ALLOC_OVERFLOW);return false;}
-    totals.reserved++;
-    return true;
+    mtx_lock(&totals_lock);
+    bool room=totals.reserved!=SIZE_MAX;
+    if(room)totals.reserved++;
+    else rejected(NMEDIA_ALLOC_OVERFLOW);
+    mtx_unlock(&totals_lock);
+    return room;
 }
-void nmedia_alloc_release_worker(void) { if(totals.reserved)totals.reserved--; }
+void nmedia_alloc_release_worker(void) {
+    mtx_lock(&totals_lock);
+    if(totals.reserved)totals.reserved--;
+    mtx_unlock(&totals_lock);
+}
 bool nmedia_alloc_restrict_worker(void) {
-    if(worker_restricted||totals.current||totals.blocks||totals.reserved||totals.peak)return false;
-    worker_restricted=true;
-    return true;
+    mtx_lock(&totals_lock);
+    bool first=!worker_restricted&&!totals.current&&!totals.blocks&&!totals.reserved&&!totals.peak;
+    if(first)worker_restricted=true;
+    mtx_unlock(&totals_lock);
+    return first;
 }
 /* alignment は 2 の冪。16 を超える分は slack として課金する。FFmpeg の x86 SIMD
  * (mova ymm) は av_malloc の 32 byte 境界を前提にするため、この経路で満たす。 */
 static void *allocate_aligned(size_t size, size_t alignment) {
     size_t charge = nmedia_alloc_charge(size);
-    if (!charge) { rejected(NMEDIA_ALLOC_OVERFLOW); return NULL; }
     if (alignment < 16) alignment = 16;
-    if (alignment > 16) {
-        if (alignment - 16 > SIZE_MAX - charge) { rejected(NMEDIA_ALLOC_OVERFLOW); return NULL; }
-        charge += alignment - 16;
-    }
-    if (!admit_charge(charge)) return NULL;
+    mtx_lock(&totals_lock);
+    bool representable = charge && (alignment == 16 || alignment - 16 <= SIZE_MAX - charge);
+    if (!representable) rejected(NMEDIA_ALLOC_OVERFLOW);
+    if (representable) charge += alignment - 16;
+    bool admitted = representable && admit_charge(charge);
+    mtx_unlock(&totals_lock);
+    if (!admitted) return NULL;
     void *base = NMEDIA_BASE_MALLOC(charge);
     if (!base) {
+        mtx_lock(&totals_lock);
         increment(&totals.backend_ooms);
         totals.last_failure = NMEDIA_ALLOC_BACKEND_OOM;
+        mtx_unlock(&totals_lock);
         return NULL;
     }
     uintptr_t aligned = ((uintptr_t)base + sizeof(struct allocation) + alignment - 1)
@@ -89,9 +108,11 @@ static void *allocate_aligned(size_t size, size_t alignment) {
     a->base = base;
     a->requested = size;
     a->charge = charge;
+    mtx_lock(&totals_lock);
     totals.current += charge;
     ++totals.blocks;
     if (totals.peak < totals.current) totals.peak = totals.current;
+    mtx_unlock(&totals_lock);
     return (void *)aligned;
 }
 void *nmedia_ff_malloc(size_t size) { return allocate_aligned(size, 16); }
@@ -111,8 +132,10 @@ void nmedia_ff_free(void *pointer) {
     struct allocation *a = (struct allocation *)
         ((unsigned char *)pointer - sizeof(struct allocation));
     void *base = a->base;
+    mtx_lock(&totals_lock);
     totals.current -= a->charge;
     --totals.blocks;
+    mtx_unlock(&totals_lock);
     NMEDIA_BASE_FREE(base);
 }
 void *nmedia_ff_realloc(void *pointer, size_t size) {

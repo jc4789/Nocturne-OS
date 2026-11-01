@@ -15,6 +15,7 @@
 #include "sys/watch.h"
 #include "abi.h"
 #include "vm/vm.h"
+#include "dev/audio_pace.h"
 
 #define MAX_STREAMS 8
 #define QUEUE_BYTES (8192 * AUDIO_FRAME) /* 170 ms: what a writer may be ahead of the sink (SOUND_QUEUE) */
@@ -48,6 +49,8 @@ struct stream {
     uint32_t retained; /* the last of device_pending, still in the ring before tail */
     uint32_t held;     /* being summed outside the lock */
     bool clock_error;
+    uint64_t dry_since; /* when its sink had played all it had, while no PCM has come since; or 0 */
+    uint64_t underruns, underrun_ns;
     struct thread *writer; /* the one submit copying past head; another waits for it */
     struct object object; /* an app's stream: what its handle reaches */
 };
@@ -62,9 +65,9 @@ static struct mutex sink_mutex;
    a wait queue's (an object's waiters', object_notify), an alarm's lock (alarm_set) and a driver's
    lock around its engine (unissue). */
 static struct spinlock audio_lock;
-/* Every frame mixed for a sink has an ordinal: sink_mixed is the next one, and the sink has heard
-   those before sink_played, at the clock time sink_played_at (the time every stream's played
-   frames hold for). */
+/* Every frame of the streams' timeline mixed for a sink has an ordinal: sink_mixed is the next one,
+   and the sink has heard those before sink_played, at the clock time sink_played_at (the time every
+   stream's played frames hold for). */
 static uint64_t sink_mixed, sink_played, sink_played_at;
 
 /* the last slot is the system's own stream, which no app owns */
@@ -195,28 +198,200 @@ static void mix_pack(const struct audio_format *format, uint8_t *to, const int32
     }
 }
 
+/* ---- the pace ----
+   The streams' timeline runs on the monotonic clock whatever crystal the device that plays it has:
+   every stream, whoever writes it, is played at AUDIO_RATE frames per second of clock_now_ns, so no
+   stream can part from the clock or from another. A device counts its own frames (the ordinals a sink
+   gets and reports). Each report, a pair of device position and clock time, says how far the timeline
+   is from the clock; a slow closed loop sets how many of the timeline's frames one device frame takes,
+   and the block is interpolated to that. Nothing is skipped or played twice. Crystals differ by parts
+   per million: under any hearing's limit of pitch. A device far off (a virtual one) is measured over a
+   growing window and followed directly. Where a device has lost time for good, or played all it was
+   given, the loop begins again from there: the streams' clocks wait, and their underruns count it.
+   The interpolation holds back PACE_DELAY frames: the last ones of a sound come out with the block after
+   it, and sink_mixed runs on through that block. */
+#define PACE_ONE (1ULL << 32)
+#define PACE_DELAY (PACE_TAPS - 3)                  /* a block's first frame is centred on its window's fourth */
+#define PACE_MOST ((int64_t)(PACE_ONE / 8))         /* of the ratio: a device further off stays off */
+#define PACE_FAR ((int64_t)(PACE_ONE / 500))        /* no crystal is this far off: 2000 ppm */
+#define PACE_FILTER_MS 2048                         /* over a device's reports, which step with its transfers */
+#define PACE_LOST_Q8 ((int64_t)(AUDIO_RATE / 20) << 8) /* 50 ms: not for the loop to catch up */
+#define PACE_SETTLE_NS NS_PER_S                     /* a device's first burst and its transfers' steps average out */
+#define PACE_WINDOW_NS (2 * NS_PER_S)
+#define PACE_WINDOW_MOST_NS (64 * NS_PER_S)
+/* The loop's gains, for an error in 1/256 frames and a ratio in 1/2^32: Kp 0.1 per second, and
+   Ki 0.0025 per second squared (Kp squared over 4, no overshoot). */
+#define PACE_KP 35
+#define PACE_KI_NUM 7
+#define PACE_KI_DEN 8000
+static struct {
+    bool running;
+    uint64_t begin_at, begin_stream, last_at;
+    int64_t settle_sum_q8, settle_reports; /* over the first second: where its line lies */
+    bool settled;
+    int64_t error_q8, integral, far;
+    uint64_t window_at, window_device, window_ns;
+    int64_t ratio;         /* timeline frames per device frame, less 1, in 1/2^32 */
+    uint32_t fraction;     /* of the next timeline frame */
+    uint64_t given;        /* the next device ordinal */
+    uint64_t mark_given, mark_mixed; /* after the last block: device ordinal, and sink_mixed */
+    int64_t mark_ratio;
+    bool ringing;          /* the history holds sound not out yet */
+    int32_t history[PACE_TAPS * 2]; /* the last frames of the timeline, summed */
+} pace;
+
+/* The frames that play in ns at AUDIO_RATE (rounded down). */
+static uint64_t frames_in(uint64_t ns) { return ns / NS_PER_S * AUDIO_RATE + ns % NS_PER_S * AUDIO_RATE / NS_PER_S; }
+
+/* audio_lock held: another device, or none: nothing known about its crystal. */
+static void pace_reset(void) {
+    pace.running = false;
+    pace.integral = pace.far = pace.ratio = 0;
+    pace.window_ns = PACE_WINDOW_NS;
+    pace.fraction = 0;
+    pace.ringing = false;
+    memset(pace.history, 0, sizeof pace.history);
+}
+/* The timeline frames of `device` frames back from the last block's end. */
+static uint64_t pace_back(uint64_t device) {
+    return device + (uint64_t)(((__int128)device * pace.mark_ratio) >> 32);
+}
+/* audio_lock held: where the frames from device ordinal `given` on start, on the timeline. */
+static uint64_t pace_unissued(uint64_t given) {
+    if (given >= pace.mark_given) return sink_mixed;
+    uint64_t back = pace_back(pace.mark_given - given);
+    return pace.mark_mixed > back ? pace.mark_mixed - back : 0;
+}
+/* audio_lock held: what has been heard when a device reached ordinal `given`. When all a device was
+   given is heard, all of it is. */
+static uint64_t pace_heard(uint64_t given) {
+    if (given >= pace.mark_given) return sink_mixed;
+    uint64_t at = pace_unissued(given);
+    return at > PACE_DELAY ? at - PACE_DELAY : 0;
+}
+/* audio_lock held: a sink's report, a pair. */
+static void pace_report(uint64_t given, uint64_t heard, uint64_t at) {
+    if (heard >= sink_mixed) { pace.running = false; return; } /* it stops, or stands dry */
+    if (!pace.running || at <= pace.last_at) {
+        if (pace.running) return;
+        pace.running = true;
+        pace.begin_at = pace.last_at = pace.window_at = at;
+        pace.begin_stream = heard;
+        pace.window_device = given;
+        pace.error_q8 = pace.settle_sum_q8 = pace.settle_reports = 0;
+        pace.settled = false;
+        return;
+    }
+    int64_t error = ((int64_t)(heard - pace.begin_stream) - (int64_t)frames_in(at - pace.begin_at)) * 256;
+    if (error > PACE_LOST_Q8 || error < -PACE_LOST_Q8) {
+        /* A pair is one instant: a device this far off has lost that time for good. It goes on from
+           here, and the window that measures its crystal goes on. */
+        pace.begin_at = pace.last_at = at;
+        pace.begin_stream = heard;
+        pace.error_q8 = pace.settle_sum_q8 = pace.settle_reports = 0;
+        pace.settled = false;
+        return;
+    }
+    if (!pace.settled) {
+        pace.settle_sum_q8 += error;
+        pace.settle_reports++;
+        if (at - pace.begin_at < PACE_SETTLE_NS) { pace.last_at = at; return; }
+        pace.begin_stream += (uint64_t)(pace.settle_sum_q8 / pace.settle_reports / 256);
+        pace.settled = true;
+        pace.last_at = at;
+        return;
+    }
+    uint64_t ms = MIN((at - pace.last_at) / NS_PER_MS, PACE_FILTER_MS);
+    pace.last_at = at;
+    pace.error_q8 += (error - pace.error_q8) * (int64_t)ms / PACE_FILTER_MS;
+    pace.integral -= pace.error_q8 * (int64_t)ms * PACE_KI_NUM / PACE_KI_DEN;
+    pace.integral = MAX(-PACE_MOST, MIN(PACE_MOST, pace.integral));
+    if (at - pace.window_at >= pace.window_ns) {
+        int64_t nominal = (int64_t)frames_in(at - pace.window_at), moved = (int64_t)(given - pace.window_device);
+        int64_t off = moved >= 0 && moved < 2 * nominal ? (nominal - moved) * (int64_t)PACE_ONE / nominal : 0;
+        off = off > PACE_FAR || off < -PACE_FAR ? off : 0;
+        pace.integral -= off - pace.far; /* what the loop has found of it so far is in the measure now */
+        pace.far = off;
+        pace.window_at = at;
+        pace.window_device = given;
+        pace.window_ns = MIN(pace.window_ns * 2, PACE_WINDOW_MOST_NS);
+    }
+    pace.ratio = MAX(-PACE_MOST, MIN(PACE_MOST, pace.far + pace.integral - pace.error_q8 * PACE_KP));
+}
+
+/* One device frame from the window of PACE_TAPS timeline frames at x, `position` of the way between
+   its two middle ones. */
+static void pace_frame(int32_t *to, const int32_t *x, uint32_t position) {
+    uint32_t phase = position >> (32 - PACE_PHASE_BITS), part = (position >> (32 - PACE_PHASE_BITS - 15)) & 0x7fff;
+    const int32_t *a = pace_filter[phase], *b = pace_filter[phase + 1];
+    int64_t left = 0, right = 0;
+    for (int m = 0; m < PACE_TAPS; m++) {
+        int64_t c = a[m] + (((int64_t)(b[m] - a[m]) * part) >> 15);
+        left += c * x[m * 2];
+        right += c * x[m * 2 + 1];
+    }
+    to[0] = (int32_t)(left >> 15);
+    to[1] = (int32_t)(right >> 15);
+}
+
 /* audio_lock held, flags f, given back here: a block for a sink, the lock held only for the positions.
-   *end, written under it: the ordinal after the block. Silence where a stream had too little. False,
-   and out untouched, when no stream had anything. */
+   *end, written under it: the device ordinal after the block. Silence where a stream had too little.
+   False, and out untouched, when no stream had anything. */
 static bool mix_unlock(uint64_t f, void *out, const struct audio_format *format, int frames, bool keep, uint64_t *end) {
     struct mix_part parts[MAX_STREAMS + 1];
-    unsigned n = mix_claim(parts, frames, keep);
-    if (!n) {
+    uint64_t step = (uint64_t)((int64_t)PACE_ONE + pace.ratio), position = pace.fraction;
+    uint64_t after = position + (uint64_t)frames * step;
+    uint32_t taken = (uint32_t)(after >> 32);
+    unsigned n = mix_claim(parts, (int)taken, keep);
+    if (!n && !pace.ringing) {
+        pace.fraction = 0; /* what comes next has nothing to do with it */
         spin_unlock(&audio_lock, f);
         return false;
     }
-    *end = sink_mixed;
+    if (!n) sink_mixed += taken;
+    pace.ringing = n != 0;
+    pace.fraction = (uint32_t)after;
+    pace.given += (uint64_t)frames;
+    pace.mark_given = pace.given;
+    pace.mark_mixed = sink_mixed;
+    pace.mark_ratio = pace.ratio;
+    *end = pace.given;
     int32_t scale = gain;
+    int32_t window[(PACE_TAPS + MIX_CHUNK) * 2];
+    memcpy(window, pace.history, sizeof pace.history);
     spin_unlock(&audio_lock, f);
+    uint32_t filled = PACE_TAPS, read = 0;
     int32_t sum[MIX_CHUNK * 2];
     uint8_t *to = out;
     size_t frame = (size_t)format->channels * format->container;
-    for (uint32_t at = 0; at < (uint32_t)frames; at += MIX_CHUNK) {
-        uint32_t count = MIN((uint32_t)frames - at, MIX_CHUNK);
-        mix_sum(sum, parts, n, at, count, scale);
-        mix_pack(format, to + at * frame, sum, count);
+    for (int done = 0; done < frames;) {
+        uint32_t count = 0;
+        while (done + (int)count < frames && count < MIX_CHUNK) {
+            uint32_t at = (uint32_t)(position >> 32);
+            if (at + PACE_TAPS > filled) break;
+            pace_frame(sum + count * 2, window + at * 2, (uint32_t)position);
+            position += step;
+            count++;
+        }
+        if (count) {
+            mix_pack(format, to + (size_t)done * frame, sum, count);
+            done += (int)count;
+            continue;
+        }
+        uint32_t at = (uint32_t)(position >> 32), left = filled - at, more = MIN(taken - read, MIX_CHUNK);
+        memmove(window, window + at * 2, left * 2 * sizeof *window);
+        position -= (uint64_t)at << 32;
+        mix_sum(window + left * 2, parts, n, read, more, scale);
+        filled = left + more;
+        read += more;
     }
+    /* The next block's window starts at position: what is left here, then what of the block was not
+       read yet, PACE_TAPS frames in all. */
+    uint32_t at = (uint32_t)(position >> 32), left = filled - at;
+    memmove(window, window + at * 2, left * 2 * sizeof *window);
+    if (read < taken) mix_sum(window + left * 2, parts, n, read, taken - read, scale);
     f = spin_lock(&audio_lock);
+    memcpy(pace.history, window, sizeof pace.history);
     for (unsigned p = 0; p < n; p++) parts[p].s->held -= parts[p].frames;
     streams_changed();
     spin_unlock(&audio_lock, f);
@@ -250,17 +425,21 @@ static void played_locked(uint64_t ordinal,uint64_t at){
             s->issued_head=(at_run+1)&(s->runs_room-1);s->issued_count--;
         }
         if(s->retained>s->device_pending)s->retained=s->device_pending; /* played: the writer may reuse it */
+        if(!s->dry_since&&s->committed_bytes&&s->head==s->tail&&!s->device_pending)s->dry_since=at;
     }
     streams_changed();
 }
 void audio_played(uint64_t ordinal,uint64_t at){
     uint64_t f=spin_lock(&audio_lock);
-    played_locked(ordinal,at);
+    uint64_t heard=pace_heard(ordinal);
+    pace_report(ordinal,heard,at);
+    played_locked(heard,at);
     spin_unlock(&audio_lock,f);
 }
 
 /* audio_lock held. */
 static bool pending_locked(void) {
+    if (pace.ringing) return true;
     for (int i = 0; i <= MAX_STREAMS; i++)
         if (streams[i]&&!streams[i]->clock_error&&streams[i]->head-streams[i]->tail>=AUDIO_FRAME&&
             streams[i]->head-streams[i]->tail<=RING_BYTES) return true;
@@ -277,15 +456,16 @@ bool audio_pending(void) {
 /* audio_lock held. */
 static bool ready_locked(int frames, bool low) {
     bool any = false, whole = true;
+    uint32_t takes = (uint32_t)((pace.fraction + (uint64_t)frames * (uint64_t)((int64_t)PACE_ONE + pace.ratio)) >> 32);
     for (int i = 0; i <= MAX_STREAMS; i++) {
         struct stream *s = streams[i];
         if (!s || s->clock_error || s->head - s->tail > RING_BYTES) continue;
         uint32_t have = (s->head - s->tail) / AUDIO_FRAME;
         if (!have) continue;
         any = true;
-        if (have < (uint32_t)frames) whole = false;
+        if (have < takes) whole = false;
     }
-    return any && (whole || low);
+    return any ? whole || low : low && pace.ringing;
 }
 
 bool audio_ready(int frames, bool low) {
@@ -306,8 +486,7 @@ static struct alarm null_alarm;
 static bool null_running;
 static uint64_t null_start, null_base; /* when it began to play, and sink_mixed then */
 
-/* The frames that play in ns at AUDIO_RATE (rounded down), and the ns that frames take (up). */
-static uint64_t frames_in(uint64_t ns) { return ns / NS_PER_S * AUDIO_RATE + ns % NS_PER_S * AUDIO_RATE / NS_PER_S; }
+/* The ns that frames take (rounded up). */
 static uint64_t ns_for(uint64_t frames) {
     return frames / AUDIO_RATE * NS_PER_S + (frames % AUDIO_RATE * NS_PER_S + AUDIO_RATE - 1) / AUDIO_RATE;
 }
@@ -442,6 +621,7 @@ static void outputs_update(void) {
         if (active) active->ops->close(active);
         uint64_t now = clock_now_ns(), f = spin_lock(&audio_lock);
         __atomic_store_n(&active, to, __ATOMIC_RELEASE);
+        pace_reset();
         if (to) null_stop(now);
         else if (!remotes && !null_running && pending_locked()) null_begin(now);
         spin_unlock(&audio_lock, f);
@@ -558,6 +738,7 @@ void audio_remote_attach(struct audio_remote *r) {
     bool first = p == &remotes;
     if (first) {
         null_stop(clock_now_ns());
+        pace_reset();
         __atomic_store_n(&remotes, r, __ATOMIC_RELAXED);
     } else {
         *p = r;
@@ -575,7 +756,8 @@ void audio_remote_detach(struct audio_remote *r) {
         else *p = r->next;
     }
     if (playing) {
-        played_locked(r->given, clock_now_ns()); /* its client will not say it played them */
+        played_locked(pace_heard(r->given), clock_now_ns()); /* its client will not say it played them */
+        pace_reset();
         if (remotes) remote_wake(remotes);     /* the sound goes to the next one */
         else if (pending_locked()) sink_fed_locked();
     }
@@ -740,13 +922,14 @@ static uint32_t frames_from(const struct stream *s, uint64_t at) {
    output, just before its tail. sink_mutex (no fill() is under way) and audio_lock held. */
 static bool take_back(struct stream *s) {
     if (!active || remotes) return false;
-    uint64_t at = active->ops->unissue(active, false);
+    uint64_t at = pace_unissued(active->ops->unissue(active, false));
     if (at >= sink_mixed || !frames_from(s, at)) return false;
     for (int i = 0; i <= MAX_STREAMS; i++) {
         struct stream *o = streams[i];
         if (o && !stream_broken(o) && frames_from(o, at) > o->retained) return false;
     }
-    at = active->ops->unissue(active, true); /* the engine only moved on since: never an earlier ordinal */
+    uint64_t given = active->ops->unissue(active, true); /* the engine only moved on since: never an earlier ordinal */
+    at = pace_unissued(given);
     for (int i = 0; i <= MAX_STREAMS; i++) {
         struct stream *o = streams[i];
         if (!o || stream_broken(o)) continue;
@@ -763,6 +946,25 @@ static bool take_back(struct stream *s) {
         o->retained -= back;
     }
     sink_mixed = at;
+    pace.given = pace.mark_given = given;
+    pace.mark_mixed = at;
+    pace.fraction = 0;
+    /* The frames before `at` of the streams that go on, for the window of what is mixed next. */
+    memset(pace.history, 0, sizeof pace.history);
+    pace.ringing = false;
+    uint64_t from = at > PACE_TAPS ? at - PACE_TAPS : 0;
+    for (int i = 0; i <= MAX_STREAMS; i++) {
+        struct stream *o = streams[i];
+        if (!o || o == s || stream_broken(o)) continue;
+        uint32_t count = MIN(frames_from(o, from), o->retained);
+        for (uint32_t k = 0; k < count; k++) {
+            const int16_t *in = (const int16_t *)(o->ring + (o->tail - (count - k) * AUDIO_FRAME) % RING_BYTES);
+            int32_t *to = pace.history + (PACE_TAPS - count + k) * 2;
+            to[0] += (int32_t)(((int64_t)in[0] * gain) >> 16);
+            to[1] += (int32_t)(((int64_t)in[1] * gain) >> 16);
+            pace.ringing = true;
+        }
+    }
     return true;
 }
 
@@ -776,6 +978,7 @@ static void stream_drop(struct stream *s) {
     s->tail = s->head;
     s->committed_bytes = 0; s->issued_head = s->issued_count = 0; s->device_pending = 0; s->retained = 0;
     s->generation++; s->clock_error = false;
+    s->dry_since = s->underruns = s->underrun_ns = 0;
     streams_changed();
     spin_unlock(&audio_lock, f);
     mutex_unlock(&sink_mutex);
@@ -895,6 +1098,12 @@ int64_t audio_stream_submit(struct handle *h, const void *frames, size_t count, 
         if (!bad) bad = copy_from_user(s->ring, p + done + first, c - first);
         fl = spin_lock(&audio_lock);
         if (bad) { error = -N_ERR_BAD_ADDRESS; break; }
+        if (s->dry_since) {
+            uint64_t now = clock_now_ns();
+            s->underruns++;
+            s->underrun_ns += now > s->dry_since ? now - s->dry_since : 0;
+            s->dry_since = 0;
+        }
         s->head += c;
         s->committed_bytes += c;
         done += c;
@@ -907,15 +1116,16 @@ int64_t audio_stream_submit(struct handle *h, const void *frames, size_t count, 
 }
 
 /* How far ahead of the sink the stream is, and how much of it was played: its frames before the
-   last ordinal its sink reported, heard at sink_played_at (the ABI has no field for that time
-   yet). */
+   last ordinal its sink reported, heard at sink_played_at. */
 static struct n_audio_status status_of(const struct stream *s) {
     uint32_t software=(s->head-s->tail)/AUDIO_FRAME;
     uint64_t committed=s->committed_bytes/AUDIO_FRAME;
     uint64_t remaining=(uint64_t)software+s->device_pending;
     return (struct n_audio_status){.queued_frames=software,.device_pending_frames=s->device_pending,
         .played_frames=committed>=remaining?committed-remaining:0,.committed_frames=committed,
-        .generation=s->generation,.flags=remotes?N_AUDIO_CLOCK_REMOTE:active?N_AUDIO_CLOCK_DEVICE:N_AUDIO_CLOCK_ESTIMATED};
+        .generation=s->generation,.flags=remotes?N_AUDIO_CLOCK_REMOTE:active?N_AUDIO_CLOCK_DEVICE:N_AUDIO_CLOCK_ESTIMATED,
+        .underruns=s->underruns,.underrun_ns=s->underrun_ns,.played_at_ns=sink_played_at,
+        .pace_ppb=pace.ratio*1000000000/(int64_t)PACE_ONE};
 }
 
 /* Any CPU. */

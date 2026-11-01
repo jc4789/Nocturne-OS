@@ -20,7 +20,7 @@ paths:
 
 - 口は二つ：ホストの serial.log（QEMU の `-serial file:`）と、ゲストの F12。F12 の Console の札は全部の行（頁の行とブラウザー自身の計測）、Trace の札は計測（`WEB_CONSOLE_TRACE`）だけ。計測を Trace の札だけに置くと、要る行が隠れる。どちらも `console_add`（browser.c）から出る。serial へ出るのは `--log-console` か `--debug-js` のときだけ。GUI からは旗を付けられない：ゲストの Terminal で `browser --debug-js <URL>` を打つ。
 - 行の形は `[browser log @秒.ミリ秒] 本文`（`warn`・`error` も同じ形）。計測の行は `[browser trace @…]`。秒はゲストの起動からの時間。カーネルの行には時刻が無い。
-- 動画のかくつき・落ちるコマ・音：`Native media timing:` の `decoded N/drop M`、`presented`、`queued`、`starved`、`silence`。再生中は 2 秒ごとに出る。旗なしでも F12 の Console と Trace の札には出る。
+- 動画のかくつき・落ちるコマ・音：`Native media timing:` の `decoded N/drop M`、`presented`、`queued`、`underrun`、`starved`、`silence`、`sync`。再生中は 2 秒ごとに出る。旗なしでも F12 の Console と Trace の札には出る。
 - 頁が try/catch で握りつぶした例外は `JavaScript caught exception:`、Promise の拒否は `JavaScript promise rejected:`（`trace` の水準。Console と Trace の札の両方）。欠けた API を探す入口。
 - 描画と待ち（`--debug-js`、2 秒ごと）：`Browser loop profile:`（wall・ticks・draw・wait）、`Browser damage profile:`（部分描画）、`Native paint profile:`（walk・video probe）、`Document tick profile:`、`Script deadline profile:`。fps を直接出す行は無い。全面の `draw` と部分の `partial draw` の回数を wall で割る。
 - JS の重い関数：`JavaScript profile:`（標本の JS 時間が 1000 ms たまるごと）。`JavaScript heap census` は heap 全体を歩き、主スレッドの半分を使うことがあるので計測を歪める（`--debug-js` の回の数字を製品の速さにしない理由）。通信は `Net #N …`。
