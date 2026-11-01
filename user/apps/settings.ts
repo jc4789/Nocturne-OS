@@ -154,6 +154,7 @@ function screenCard(): Child {
                 : screenIndex === 0 ? `${settings.screenWidth} × ${settings.screenHeight}` : "Off";
     const why = source === "driver" && listed ? "The monitor's own preferred mode is marked recommended."
               : source === "handedBack" && listed ? `${REASONS.handedBack} Pick a resolution to try again.`
+              : source === "driver" && s?.name ? "The display driver offers only this mode for this monitor."
               : REASONS[source];
     const range = s?.variableRefreshMinMillihertz && s.shown?.variableRefresh
         ? caption(`Variable refresh from ${Math.round(s.variableRefreshMinMillihertz / 1000)} Hz.`) : null;

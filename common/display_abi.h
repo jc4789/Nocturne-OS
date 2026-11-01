@@ -67,7 +67,7 @@ struct desktop_settings {
 #define SCREEN_MODE_TRIAL_MS 15000u /* a mode tried and not kept goes back after this */
 enum {
     SCREEN_SOURCE_FIRMWARE,       /* the firmware's mode: no display driver has run */
-    SCREEN_SOURCE_DRIVER,         /* a display driver's mode (count 0: it finds no monitor) */
+    SCREEN_SOURCE_DRIVER,         /* a display driver's mode (count 0: it offers no list; a monitor in offered, or none found) */
     /* The firmware's mode again while the display driver still runs: it gave the screen back
        (a mode its display was not seen to show), or has not shown its own yet.
        While its modes are offered (count), a mode tried asks it to show that one again. */
