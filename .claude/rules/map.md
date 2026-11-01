@@ -1,103 +1,147 @@
 # Nocturne の地図
 
-探す前に読み、ここに無い所だけを codegraph・grep で探す。README と docs の報告より、この表と今のコードを先に信じる。違いを見つけたらその場で直す。確かめた: 2026-10-30 `5f2fabd9`＋未コミット（段①の 13-2：空間と TLB）。カーネルの arch・mm・sys・dev の行と syscall の道は 2026-10-31 `0f0ff8a5`（波 1：A1・A2・B・D、段 1-B2・2a）、sys の thread・sched・wait・address_wait と syscall の道の横取りは `dd22aac3`（段 2b-S・2b-W）、sys の epoch・object・events・channel と番地の見張り・panic は `24b67066`（段 2b-O）。
+今のリポジトリの地図。どこに何があるかを短く書く。
 
-## 置き場所（K=カーネル、L=libc、A=アプリ、P=移植・上流、H=ホストの道具）
+- 探す前に読む。ここに無い所は codegraph と rg で探す。
+- 地図とコードが違えば、コードが正しい。気づいたら、その場で地図の行を書き直す。
+- 書くのは今の形だけ。日付、コミット、作業の段、変更の経緯、付録は書かない。経緯は git にある。
+- 新しい場所ができたら行を足す。消えた場所の行は消す。
+- README と docs の日付入りの報告は古いことがある。
 
-| 場所 | 役目 | 主 |
-|---|---|---|
-| `kernel/src/arch/` | CPU の機能（`cpu.c`：CPUID の機能の葉の唯一の読み手、下限 Zen 4 の照らし、hypervisor が隠しうる機能の印（不変 TSC は hypervisor の印が無ければ要件）、実機の TSC の速さ（HWCR の TscFreqSel と PStateDef[0] の FID・DID：`cpu_features.p0_fid`・`p0_did`、速さは 200 MHz×FID÷DID、PPR 56713）。葉 0xD は `fpu.c`、topology の葉は `topology.c`、0x4000xxxx は vm/）、`topology.c`（起動時にある CPU の数え（MADT）・各 CPU の core・LLC・die・socket・node の密な番号（APIC ID の shift）・NUMA の node と記憶の範囲（SRAT、記憶だけの node も）と距離（SLIT）・各 CPU の home（記憶を先に取る node：自分の node か、記憶のある一番近い node。`cpu_place.home`、node の `homed`）。上限なし、起動の記憶に置く。CPU の番号は topology の番号）、CPU ごとの変数（`percpu.h`：`PERCPU` の変数は節 `.percpu` が型で、各 CPU の写しをその node に `smp.c` の `percpu_init` が置き、GS の基が写しを指す。`this_cpu(v)`・`this_cpu_ptr(v)`・`per_cpu(v, cpu)`。CPU の数の上限は無い）、CPU の集合（`cpuset.h`、64 bit の語の列）、CPU の状態（`cpu.c` の `cpu_setup`：どの CPU も起動・起こし・S3 の後に同じ一つの道。MCA、投機の対策）、錠（`spin.h`：MCS の列の spinlock、持ち主の語、rank の照らし。待つ間は TLB の受け箱を見ない）、横取りの数（`preempt.h`：CPU ごとの `preempt_count`、割り込みと NMI・#MC の深さも持つ。`in_interrupt()`）、idle（`idle.c`：MWAIT か HLT、`cpu_idle_wake`、CPPC）、GDT・TSS（`gdt.h`）・IDT・`isr.asm`、割り込みの層（`irq.h`・`irq.c`：vector の表は CPU ごと、装置の vector は node の中の CPU へ `irq_request_msi`・`irq_request_gsi`、系の vector は全 CPU で同じ `irq_request_system`（VEC_LOG・VEC_MCE_THRESHOLD・VEC_TIMER・VEC_RESCHED・VEC_TLB_SHOOTDOWN・VEC_APIC_ERROR）。EOI は処理の後、thread つきの処理。8259 は覆うだけ）、LAPIC（`apic.c`：x2APIC だけ、IPI は CPU の番号で `apic_send_*`）、IOAPIC（`ioapic.c`：GSI の唯一の持ち主、信号の形は MADT から）、LAPIC の timer を起こしの装置にする `lapic_timer.c`（TSC-deadline、無ければ遅れない one-shot）、SMP（`smp.c`：AP は自前の INIT・STARTUP で一斉に起こし、締め切りは一つ。間に合わない CPU は外す。panic は NMI で他を止める `smp_panic_enter`・`smp_nmi`。S3・休止の後は `wake.c` の頁の APIC ID の表 `struct wake_cpu` から一斉に。各 CPU の idle thread は他の thread と同じ守りの頁つきの核の stack（CPU 0 がその CPU の home に取る、`sched_cpu_stack`）で走り、CPU は bootloader の stack から入口で移る（`cpu_switch_stack`。AP は `ap_entry` で核の頁表を載せてから、CPU 0 は `sched_init` の後）。TSC は起きた CPU の全部が一度に比べる `clock_cpus_compare`）、FPU（XSAVES の詰めた形、AVX-512 まで、大きさは起動で決まる）、PAT、S3 復帰 | K |
-| `kernel/src/mm/` | `bootmem`（頁の確保より前の確保：memmap の usable を node の境で割った区画の頂から切り、使わなかった区画を頁の確保へ渡す。`bootmem_alloc_node`）・`pmm`（頁ごとの記録 `struct frame` を 1 GiB の節ごとにその node へ、node ごとの buddy を番地の bit の幅の帯ごとに、CPU ごとの頁の溜め（その CPU の home の node から）。DMA の幅は bit で `pmm_alloc_contig(count, bits)`、続き頁は大きさの 2 の冪に揃う、返すのは `pmm_free_contig`。`pmm_alloc_run(count, node)` は溜めを吐き出させない続き頁、`pmm_alloc_node(node)` はその node から先の一頁。使用中の frame の持ち主の印 `pmm_mark`・`pmm_marked`）・`vmm`（4 段ページ表。アプリの空間 `struct vmm_space` は参照を数え（process の `vmm_space` と窓が持つ）、空間ごとの lock。核の半分は `kernel_space`、葉は G。TLB：CPU ごとに PCID の枠 8 つ（空間の gen で古さを知る。Zen 4 に PCID は無い）、核の thread は前の空間を CR3 に残し（lazy）その空間の撃ち落としで離れる。撃ち落としは送り手の CPU の要求と受け手の受け箱（送り手ごとの bit）、答えは LLC ごとの行で数え、送り手は待つ間も自分の受け箱に答える（`vmm_tlb_poll`）。広げる変更は撃たず、古い訳の頁違反は `vmm_fault_spurious` が流す。狭める変更は集め `struct vmm_gather` で lock を放してから撃ち、frame はその後に返す。spinlock の下で撃たない（`spins_held`））・`vmalloc`（核の仮想の番地 [VMALLOC_BASE, VMALLOC_END)：使用中と空きの span の木、守りの頁、`vfree` は頁表に触れず退いた list へ、RAM の 1/1024 で thread「vmalloc」が一度に外して撃ってから番地と frame を返す。`vmalloc_node` は frame を指定の node から。`vmalloc_map_phys`・`vmalloc_map_frames`／`vunmap` は frame を持たない）・`heap`（`kmalloc`：3584 byte までは 27 の大きさの slab（直写像、frame に `pmm_mark` の印、記録は slab の余りか記録の大きさの物）、CPU ごとの鎖（物の最初の語で繋ぐ。今の・前の・よその node の物を返す鎖）、home の node ごとの depot（lock は入れ子にせず、頁の確保は lock の外）。それより大きい物は home の続いた frame `pmm_alloc_run`、無ければ vmalloc。`kfree` は frame の印で引き、自分が渡していない番地は panic。止まった CPU の鎖は `heap_cpu_gone`） | K |
-| `kernel/src/lib/` | 核の中の部品：`span`（区間の AVL の木、部分木の最長を持ち、一番低い当てはまりを O(log n)。侵入型で確保しない）、`idtable`、`lz`、`printf`、`sort`、`string` | K |
-| `kernel/src/sys/` | `proc`（ELF、アプリの起動 `proc_launch`）、`process`（`struct process`：pid（主 thread の tid）・handle の表・空間の参照と配置（波 3 で mm へ）・親子・アプリの記録。最後の thread が終わると handle の表を閉じ、各持ち主の後片付けはその object の close）、`thread`（`struct thread`：核の stack・FPU・`struct sched_entity`・`struct thread_wait`。核の thread は process を持たない。tid は `lib/idtable` の登録で O(1)、上限なし、2^31 を巡るまで使い回さない。核の stack は vmalloc から、CPU ごとに 2 つまで溜める。登録と親子は大域の `thread_lock`、終わった thread は切り替えの後にその CPU が `thread_left` で解く（`sched_post_switch`）。`thread_join` は ended の印を待つ）、`sched`（横取りする核。CPU ごとの実行キューと idle thread。級は二つ：実時間（固定の優先度、同じ優先度は来た順、周期 10 ms ごとの予算 8 ms、使い切ると周期の残りは公平の級。`sched_set_policy`・`sched_realtime`：irq の thread・合成・xhci の入力・RDP）と公平（EEVDF、`lib/avl` の木で O(log n)）。切り替えの点は `preempt_enable`・`irq_restore`・割り込みから核への出口・`sched_user_return` で、旗は CPU ごとの `sched_resched`。slice の期限は自分の CPU の alarm で、runnable が 2 以上の時だけ。均しは SMT の兄弟 → LLC → node → 全体の群の idle・busy の印（起こしは前の CPU の LLC の idle の CPU へ、idle に入る CPU が引く、忙しい CPU は slice の期限に兄弟を見る）。FPU は利用者の thread から離れる時に XSAVES、戻る時に要れば XRSTORS。切り替えの頭・ring 3 への戻り・idle の輪の頭が epoch の静かな点。`kthread_create_on`・`sched_thread_bind` は一つの CPU に縛る）、`wait`（待ち行列は FIFO の項目（thread か callback、排他の印）：`wq_wake(n)`・`wq_wake_all`、callback の契約は `wait.h`。mutex は持ち主の語と FIFO の手渡し、持ち主が走っている間だけ回る。読み書きの mutex `rwmutex_*`（格納庫の門）。眠り `sleep_until`（monotonic）・`sleep_until_boot`（boot の時計、眠った時を足すと `wait_boot_clock_moved` が立て直す）。kill は killable な待ちを一つ終える）、`address_wait`（`SYS_WAIT_ADDRESS` の番地の待ち：物理の番地の hash で 64×CPU の数の bucket、thread と事象の行列の見張り（callback の項目、`address_watch_arm`）が同じ FIFO）、`clock`（TSC だけの三つの時計：monotonic・boot・wall。速さは起動から、実機は P0 の名目、VM は hypervisor が登録した値（`clock_register_tsc_hz`）。実機では速さの参照（`struct clock_rate_reference`、今は `dev/refclock.c` の HPET）が標本を `clock_rate_sample` へ渡し、倍の窓で直し続ける。壁の時刻の参照は `clock_wall_proof`（今は RTC の秒の境の探り）。どちらも後で NTP が入る口。頁の上の seqlock、`clock_stop` は panic 用）、`alarm`（CPU ごとの期限の heap、範囲の期限 `alarm_set_range`。周期の拍は無い。眠りの間の CPU 0 は `alarm_suspend`／`alarm_resume`）、`epoch`（錠なしで読む物の記憶を返す：LLC の群ごとの QSBR、静かな点は sched の三か所、10 ms を過ぎても払わない CPU は旗と kick、群ごとの worker の thread が返す。`epoch_enter`・`epoch_defer`）、`syscall`、`object`（object と handle。handle の表は錠なしで読み（epoch）、変更は表ごとの錠。番号は 23 bit の場所と 8 bit の世代、空いた場所は FIFO で使い回し、伸ばした古い配列と閉じた handle は epoch で返す。object の `waiters` は待ち行列で、`object_notify` は全員を起こす）、`channel`（channel ごとの錠、伸びる名前の表、受け手ごとの信用。受け手と送り手は排他の待ちで、要る数だけ起こす）、`events`（事象の行列：源（handle の見張り・timer・番地）を token の木に持ち、変化の callback が pending の列へ入れて一人を起こす。待ちは pending の列だけを見る。timer は一つずつ alarm）、`log`（記録：CPU ごとの錠の無い輪、読み手の cursor は時刻の順に読む。読み手は serial・起動の画面 `dev/fbcon.c`・system log の stream）、`panic`（錠も確保も使わない報告：serial の報告、画面、serial の残りの記録の順。各所は一度だけ試し、一つの中で落ちても残りへ進む。`panic()` も thread と backtrace を出す）、`stream`（console・system log のハンドル）、`watch`（見張りの共通の部品 `struct watched`、`n_watch_take`）、`keep`（システムの部品の状態の保存：持ち主の wm・audio・screenmode が自分の行を出し、`AppData\Nocturne\{Desktop,Sound,Displays}.conf` へ最後の変更の 500 ms 後に書き、init より前に読み戻す。鍵は知らない）、`prof` | K |
-| `kernel/src/fs/` | C: の格納庫の実行側：`store`（C: の mount、道での操作、変更と commit の間の門、フォルダーの lock、書き手）、`document`（開いた文書：文書ごとの mutex、差し替えは一時フォルダーの文書を名へ移すか `ns_take`）、`cache`（塊の溜め `struct store_supply` の実装）、`watch`（C: の見張り `n_entry_watch`：操作が返す `struct ns_told` を出す）。書式のエンジンは `common/store/` | K |
-| `common/store/` | 格納庫の書式のエンジン（library）：`names`・`fold_table`・`catalog`（B+木、latch）・`namespace`（`NS_GIVEN`：フォルダーが与える属性は移動でフォルダーと一緒に入れ替わる）・`space`・`volume`（mount・format・commit の凍結・書く・書き終え、`volume_commit`）・`crc32c`・`latch`。lock・待ち・log・時計を持たず、`store_device`・`store_supply`・`store_env` を受ける。カーネル（`kernel/src/fs`）とホストの道具（`host/store`）が組む | K+H |
-| `kernel/src/dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（`acpi.c`：XSDT の項目を一度だけ照らした登録、表は直接の写像でその場で読む。MADT・SRAT は `acpi_entry_next` で項目を順に、形は `acpi.h`。AML は uACPI）、AHCI、NVMe、xHCI・USB、IOMMU、音、`fb`・fbcon、入力（USB HID と VM の合成装置。PS/2 は無い）、`serial`（SPCR か COM1、THRE の割り込みで記録を送る）、`refclock`（時計の基準：HPET は実機の速さの参照で、自分の alarm で時計の求める時に標本を渡す。CMOS の RTC は日付と秒の境。ACPI PM タイマーは使わない）、電源 | K |
-| `kernel/src/net/` | `net.c`（Ethernet〜TCP・DHCP・DNS）、`rtl8125.c`（実機の NIC） | K |
-| `kernel/src/gui/` | `wm.c`（窓管理と合成）、`desktop.c`、`screenmode.c` | K |
-| `kernel/src/vm/` | VM だけの処理のすべて（下の「境界」） | K |
-| `kernel/src/{boot,init}.c` | `kmain`（boot.c）→ `kmain_late`（init.c）→ `C:\Nocturne\System\init` | K |
-| `common/` | 核と libc の共有：`abi.h`、`display_abi.h`、`gpu_abi.h`、`store_format.h`、`edid.h`、`gfx.c`、Unifont | K+L |
-| `user/libc/` | ISO C と ABI の包み（`sys.c`）、`gui.c`・`ui.c`、字体・画像、`media*.c`、`net.c`・`http*.c`・`tls.c`・`webnet.c`、`webstorage.c`・`webidb*.c`・`webcache.c`・`webcookie.c`、`webprefs.c`（ブラウザーの好み `AppData\Browser\preferences`：言語の一覧、検索の履歴、サイトのデータの例外と「閉じるときに消す」。各プロセスが見張る）、`websitedata.c`（設定の窓のサイトのデータ：保存先ごとの量と消去をサイトでまとめ、閉じるときに消す。窓の数は一時フォルダーの `windows`）、`parallel.c` | L |
-| `user/libc/web/` | ブラウザーのエンジン（約 200 ファイル。下の「ブラウザーの流れ」） | L |
-| `user/include/` | 公開の見出し（`nocturne.h`、`web.h`、`webnet.h`、`weburl.h`、`ui.h` …）。SDK にも入る | L |
-| `user/apps/` | システムのプログラム（`browser*.c`（タブは `browser.c` の `struct tab`、設定の頁 `about:settings` は `browser_settings.h`）・`webfetch.c`・`uihost.c`・`init.c`・`sh.c`・`agent.c`、`*.cpp`、`*.ts`→`System\*.js`） | A |
-| `ports/<名>/` | 移植の差分・設定：ffmpeg、freetype、go、lexbor、llvm、mesa（`nocturne_gl.c`）、nvidia（RM をアプリ `nvrm` にする OS 層）、rust、tcc、typescript、virgl（ホストの QEMU の DLL だけ）、wabt | P |
-| `third_party/<名>/` | 取り込んだ上流：webref（仕様の IDL）、quickjs、lexbor、bearssl・ca、ffmpeg、freetype・brotli・img、mesa、nvidia-open（615.78.08）、tinycc、wabt、uacpi、unicode・formatjs、unifont、web_streams | P |
-| `host/` | `store/store.c`（C: を作る・詰める・検査する。`test`（模型との照合）・`tree-test`・`stress`（並行）の試験も） | H |
-| `boot/limine.conf` | 起動の項目は 2 つ（desktop と `nogui`）。解像度は持たない | H |
-| `rootfs/` | C: へそのまま入る（`Nocturne\`、`Users\User\` の見本） | — |
-| `scripts/` | ビルド・媒体・試験・Hyper-V の道具 | H |
-| `tests/`、`docs/` | 試験、仕様・台帳・日付入りの報告 | — |
-| `build/`、`tools/`、`hyperv/`、`local/`、`.codegraph/`（無視） | 出力、同梱の道具、Hyper-V のディスク、GSP の firmware、codegraph の索引 | — |
+## カーネル `kernel/src/`
 
-生成物（手で直さず生成元を直す）：`web/js_bootstrap.inc` ← `js_*.js`＋`js_embed.py`、`js_worker_runtime.inc` ← `js_worker_embed.py`（どちらも `user/libc/web/` にある）、`web/webidl_data.inc` ← `third_party/webref/idl`＋`scripts/build_webidl.py`、`js_intl.js`・`js_segmenter.js`・`js_collator.js` ← `scripts/build_*.py`、`unicode_grapheme_data.h`・`wctype_data.h`・`web/unicode_bidi_data.h`（`:dir()` の強い双方向の型）← `scripts/unicode_*.py`、`common/unifont.bin` ← `scripts/unifont2bin.py`。
+| 場所 | 役目 |
+|---|---|
+| `boot.c`・`init.c` | 起動の流れ。`kmain` から `kmain_late` へ進み、`C:\Nocturne\System\init` を起こす。 |
+| `arch/cpu.c` | CPUID の唯一の読み手。下限 Zen 4 を照らし、任意の機能（PCID、MWAIT など）の有無と TSC の周波数を持つ。どの CPU も `cpu_setup` で同じ初期化をする。 |
+| `arch/topology.c` | MADT・SRAT・SLIT から CPU・core・LLC・NUMA node と node の距離を数える。CPU の数に上限は無い。 |
+| `arch/percpu.h`・`cpuset.h` | per-CPU 変数（`PERCPU`、`this_cpu`、`per_cpu`）と CPU の集合。 |
+| `arch/smp.c`・`wake.c` | AP の起動、panic のときの NMI による停止、S3 からの復帰。 |
+| `arch/spin.h`・`preempt.h` | MCS spinlock と、CPU ごとの `preempt_count`。 |
+| `arch/irq.c`・`apic.c`・`ioapic.c`・`lapic_timer.c` | CPU ごとの vector の表、x2APIC と IPI、IOAPIC、TSC-deadline timer。 |
+| `arch/idt.c`・`gdt.c`・`isr.asm` | IDT・GDT・TSS と、syscall・例外・割り込みの入口。 |
+| `arch/fpu.c`・`idle.c`・`pat.c` | XSAVES による FPU の保存、MWAIT か HLT による idle、PAT。 |
+| `mm/` | `bootmem`（初期の確保）、`pmm`（NUMA node ごとの buddy と per-CPU の頁の cache）、`vmm`（4 段の page table、PCID、TLB shootdown）、`vmalloc`（カーネルの仮想番地）、`heap`（`kmalloc` と slab）。 |
+| `lib/` | `span`（区間の AVL 木）、`avl`、`idtable`、`lz`、`printf`、`sort`、`string`。 |
+| `sys/process.c`・`thread.c`・`proc.c` | process と thread。`proc_launch` が ELF のアプリを起こす。 |
+| `sys/sched.c` | preemptive な scheduler。CPU ごとの run queue を持ち、級は実時間と公平（EEVDF）の二つ。 |
+| `sys/wait.c`・`address_wait.c` | wait queue、mutex、`sleep_until`、`SYS_WAIT_ADDRESS` の番地の待ち。 |
+| `sys/clock.c`・`alarm.c` | TSC による三つの時計（monotonic、boot、wall）と、CPU ごとの期限の heap。 |
+| `sys/epoch.c` | lock を取らずに読むものの遅延解放。grace period は LLC の群ごとに数える。 |
+| `sys/object.c`・`channel.c`・`events.c`・`watch.c` | object と handle の表、channel、event queue、watch。 |
+| `sys/syscall.c` | syscall の受け口 `syscall_dispatch`。 |
+| `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console と system log の stream、profiler。 |
+| `sys/keep.c` | wm・audio・screenmode の設定を `AppData\Nocturne\` の `.conf` に保存し、init の前に読み戻す。 |
+| `fs/` | C: の store の実行側。mount とパスの操作は `store.c`、開いた文書は `document.c`、block cache は `cache.c`、変更の watch は `watch.c`。書式のエンジンは `common/store/`。 |
+| `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音、`fb` と `fbcon`、入力（USB HID）、`serial`、`refclock`（HPET と RTC）、電源と hibernate。 |
+| `net/` | `net.c`（Ethernet から TCP・DHCP・DNS まで）と `rtl8125.c`（実機の NIC）。 |
+| `gui/` | `wm.c`（窓管理と合成）、`desktop.c`、`screenmode.c`。 |
+| `vm/` | VM だけの処理。下の「境界」を見る。 |
+
+## 共有 `common/`
+
+| 場所 | 役目 |
+|---|---|
+| `abi.h` | syscall の番号 `SYS_*` と結果 `N_ERR_*`。仕様は `docs/nocturne-native-abi.md`。 |
+| `display_abi.h`・`gpu_abi.h` | 画面と GPU の ABI。 |
+| `store_format.h`・`store/` | C: の store の書式とエンジン（`catalog` の B+ 木、`namespace`、`space`、`volume`）。カーネルと `host/store` の両方が組む。 |
+| `edid.h`・`gfx.c`・`unifont.bin` | EDID、描画の部品、Unifont。 |
+
+## ユーザー空間 `user/`
+
+| 場所 | 役目 |
+|---|---|
+| `libc/` | ISO C、ネイティブ ABI の包み（`sys.c`）、GUI（`gui.c`、`ui.c`）、字体と画像、媒体（`media*.c`）、網（`net.c`、`http*.c`、`tls.c`、`webnet.c`）、ブラウザーの保存（`webstorage.c`、`webidb*.c`、`webcache.c`、`webcookie.c`、`webprefs.c`、`websitedata.c`）。 |
+| `libc/web/` | ブラウザーのエンジン。下の「ブラウザーの流れ」を見る。 |
+| `include/` | 公開の header（`nocturne.h`、`web.h`、`weburl.h`、`ui.h` など）。SDK にも入る。 |
+| `apps/` | システムのプログラム。ブラウザー（`browser*.c`）、`init.c`、`sh.c`、`uihost.c`、`webfetch.c`、`agent.c`、小さな道具とゲーム、TypeScript のアプリ（`*.ts`）。 |
+
+## その他
+
+| 場所 | 役目 |
+|---|---|
+| `ports/<名>/` | 移植の差分と設定。expat、ffmpeg、freetype、go、lexbor、llvm、mesa、nvidia、rust、tcc、typescript、virgl、wabt。 |
+| `third_party/<名>/` | 取り込んだ上流のソース。 |
+| `host/store/store.c` | ホストの道具。C: を作り、詰め、検査する。 |
+| `boot/limine.conf` | 起動の項目は desktop と `nogui` の二つ。 |
+| `rootfs/` | C: にそのまま入るもの（`Nocturne\`、`Users\User\`）。 |
+| `scripts/` | ビルド、媒体、試験、生成、Hyper-V の道具。 |
+| `tests/` | ゲストの試験（`runtests.c`）、WPT の runner、ホストの検査 `check_*.py`。 |
+| `docs/` | 仕様 `nocturne-native-abi.md`、台帳 `*/LEDGER.md`、日付入りの報告。 |
+| `build/`・`tools/`・`hyperv/`・`local/`・`.codegraph/` | git の外。ビルドの出力、同梱の道具、Hyper-V のディスク、GSP の firmware、codegraph の索引。 |
+
+## 生成物
+
+手で直さず、生成元を直す。
+
+| 生成物 | 生成元 |
+|---|---|
+| `user/libc/web/js_bootstrap.inc` | `user/libc/web/js_*.js` と `user/libc/web/js_embed.py` |
+| `user/libc/web/js_worker_runtime.inc` | `user/libc/web/js_worker_embed.py` |
+| `user/libc/web/webidl_data.inc` | `third_party/webref/idl` と `scripts/build_webidl.py` |
+| `js_intl.js`、`js_segmenter.js`、`js_collator.js` | `scripts/build_intl.py`、`scripts/build_segmenter.py`、`scripts/build_collator.py` |
+| `unicode_grapheme_data.h`、`wctype_data.h`、`unicode_bidi_data.h` | `scripts/unicode_grapheme.py`、`scripts/unicode_wctype.py`、`scripts/unicode_bidi.py` |
+| `common/unifont.bin` | `scripts/unifont2bin.py` |
 
 ## 境界
 
-- syscall の番号：`common/abi.h` の enum `SYS_*`（結果は `N_ERR_*`）。仕様は `docs/nocturne-native-abi.md`。画面・GPU は `display_abi.h`（`struct screen_format`）、`gpu_abi.h`（OpenGL の ABI ではない）。
-- アプリのドライバー：`SYS_PCI_*`・`SYS_DMA_*` → `dev/pciuser.c`。claim するのは init だけで、NVIDIA の表示機能を `nvrm` へ渡す（`user/apps/init.c`）。
-- syscall の道（対称のカーネル：どの CPU も同じ道。CPU 0 だけの持ち物は無い）：
+- syscall の番号と型は `common/abi.h`。画面と GPU は `display_abi.h` と `gpu_abi.h`。
+- アプリのドライバーは `SYS_PCI_*`・`SYS_DMA_*` から `dev/pciuser.c` へ。claim するのは init だけで、NVIDIA の表示を `nvrm` に渡す（`user/apps/init.c`）。
+- VM の処理は `kernel/src/vm/vm.h` が唯一の入口。実機では何もせずに戻る。裏に `hyperv.c`、`hv/`（VMBus、storvsc、netvsc）、`rdp.c`、VM の装置（ata、ac97、e1000、tulip、vbe）、`virtio_gpu.c` がある。`vm/` の外は `vm/vm.h` だけを include する。
+- syscall の道：
 
 ```
-user/libc/sys.c SYSCALL → arch/isr.asm の syscall_entry：起きた CPU で（swapgs、TSS の rsp0 の thread の核の stack へ）
-  → syscall_dispatch (sys/syscall.c)：その thread の核の stack の上で。眠りは待ち行列（sys/wait.c の sleep_in → schedule）、
-    起こされた thread は空いた CPU へ（sys/sched.c）。利用者のメモリーは copy_from_user／copy_to_user だけ
-  → sched_user_return (sys/sched.c)：ring 3 へ戻る前の切り替えの点（核も横取りされる：preempt_enable・irq_restore・割り込みの出口）→ SYSRET（できないときは IRET）
-例外（0〜31）→ isr_exception (arch/idt.c)：起きた stack の上で（アプリからなら thread の stack、眠れる）。
-  NMI・#DB・#MC・#DF は CPU ごとの IST の stack へ。核から来たら GS を RDPID の番号で置き直す（isr_ist_kernel）
-割り込み（32〜）→ isr_interrupt (arch/irq.c)：CPU ごとの割り込みの stack の上で（眠らない、schedule しない）。
-  その CPU の vector の表で処理を引き、EOI は処理の後。装置の割り込み（IOAPIC・MSI）は装置の node の CPU へ、
-  重い仕事は irq の thread へ。系の vector（起こし・撃ち落とし・alarm・記録）はどの CPU でも同じ
-割り込みと IST の stack は各 CPU が vmalloc で自分の node に取り、下に守りの頁がある（entry_stacks_init）
+user/libc/sys.c の SYSCALL
+  → arch/isr.asm の syscall_entry（thread のカーネル stack へ移る）
+  → sys/syscall.c の syscall_dispatch（アプリのメモリーは copy_from_user・copy_to_user だけで触る）
+  → sys/sched.c の sched_user_return（ring 3 へ戻る前の切り替えの点）
+  → SYSRET
+例外は arch/idt.c の isr_exception。NMI・#DB・#MC・#DF は CPU ごとの IST の stack で受ける。
+割り込みは arch/irq.c の isr_interrupt。CPU ごとの割り込みの stack で受け、眠らない。
 ```
-
-- VM と実機：`kernel/src/vm/vm.h` が唯一の入口（`vm_detect`、`vm_hosted()`、`vm_init`・`vm_storage_init`・`vm_net_probe`・`vm_audio_init`・`vm_session_init`。実機では即座に戻る）。裏に `hyperv.c`、`hv/`（VMBus・storvsc・netvsc）、`rdp.c`（拡張セッション）、`devices.h` の装置（ata・ac97・e1000・tulip・vbe）、`virtio_gpu.c`。`vm/` の外は `vm/vm.h` しか include しない。
 
 ## ブラウザーの流れ
 
-各プログラムは libc の全部（web・QuickJS・Lexbor・FFmpeg・Mesa…）を怠惰な member として link する（Makefile の `LIBC_LINK`）。
+各プログラムは libc の全部を lazy な member として link する（Makefile の `LIBC_LINK`）。ファイルは断りが無ければ `user/libc/web/` にある。
 
-| 段 | ファイル | 入口 |
-|---|---|---|
-| 主ループ | `user/apps/browser.c` | `browser_event`（`webnet_wait`→`web_wait_events`）、`document_step`（`web_tick`→`relayout`→`web_layout`、`redraw`→`draw_page`→`web_paint`）、`webnet_pump`、`web_deadline` |
-| 取得 | browser.c → `user/libc/webnet.c` → 子 `webfetch --service` → `http.c`・`http2.c`・`tls.c` | `navigate_inner`、`host_request`→`webnet_submit`。戻りは `web_resource_loaded`（doc.c） |
-| 文書・公開 API | `web/doc.c`（`web.h` の実装） | `web_live`・`web_parse`、`web_tick`（媒体→`web_js_tick`→`web_frames_tick`）、`web_layout`（`css_cascade`→`boxes_build`→`layout_doc`） |
-| 解析 | `web/html_lexbor.c`・`html_lexbor_bridge.c`（Lexbor は木構築の状態だけ）、`html.c`（tag ID）、`html_encoding.c`（HTML の符号の嗅ぎ分け）、`xml.c`（XML の解析器、Expat。XMLDocument・DOMParser・XHR の XML と、XML の型の応答の閲覧文脈の文書（台本の終了タグで止まる、少しずつ読む）。どちらの解析器かは doc.c の `doc_parser_*` が隠し、型は `web_document_kind`。text の型（JavaScript・JSON・text/*）の応答は網の枠・Blob の枠・上位の航行のどれも doc.c の `web_live_child_response` で HTML「load a text document」の文書：`html_begin_text` が pre の開始タグの後を PLAINTEXT で読み、符号は `html_decode_text`（prescan なし、JSON は UTF-8）、装いは css.c の `text_sheet`。MIME の群は js.c の `web_javascript_mime_essence`・`web_json_mime_essence`） | `html_begin`、`html_begin_text`、`html_resume`、`html_fragment`、`html_decode_bytes`、`xml_parser_begin`、`doc_parser_resume` |
-| 符号・URL | `web/web_encoding.c`（Encoding Standard の唯一の持ち主：名札・decoder・encoder・BOM・html の誤りの形。表と手続きは Lexbor）、`web_url.c`（WHATWG URL、Lexbor。JS の URL・Location・`a.href` も、native の取得・CSS の `url()`・form の action・文書の base も、この一つの解析器。native の口 `web_url_resolve` はどのスレッドからでもよく、解析器を貸し出しの溜めから借りる。HTML の encoding-parse は doc.c の `doc_encoding_parse_url` が文書の符号を渡し、CSS・Fetch・CSP は UTF-8 の `web_resolve_url_owned`。URL を受けるどの層も、公開の見出し `user/include/weburl.h` の URL の記録 `struct web_url`（直列化と各部分の位置・host の種類・port）を `web_url_read` で受け取り、文字列を切り直さない：要求の層 http.c の `http_target_of`（host・Host の欄・port・要求の対象）、Cookie の瓶、webfetch、webnet、媒体、保存の層、エンジン。URL の origin とその直列化・same origin・保存の鍵の確かめ `web_origin_http`・Secure Contexts の `web_url_potentially_trustworthy`・URL の setter `web_url_change` もここ。same site は PSL を持つ `webcookie.c` の `webcookie_same_site`） | `web_encoding_get`、`web_decode`、`web_url_parse`、`web_url_resolve`、`doc_encoding_parse_url`、`web_url_read`、`web_url_origin` |
-| DOM | `web/dom.c`（`node_t` は文書の持ち物）、`html_serialize.c`、`elements.c`、`xpath.c`（XPath 1.0、`js_xpath.js`・`js_xpath_native.h`） | `xpath_compile`・`xpath_evaluate` |
-| CSS | `css.c`（解析・selector・cascade）、`cssprop.c`（性質と UA の表）、`cssmath.c`（単位と CSS Values 4 §10 の数式の唯一の持ち主：解析・型・単純化・計算値と使用値への解決・直列化の木 `struct css_calc`、`len_t` の式と長さの補助。長さ・数・時間・角度・形・色の成分がここを呼ぶ）、`color.c`（色の値の型 `struct css_color`：解析・計算値・直列化・色域の写像・補間。描画は装いの 8 ビットの欄、正確な値は `color_inherited`・`color_own`）、`animation.c`（CSS Transitions・CSS Animations・Web Animations の一つの時間の模型。性質ごとの補間の型は cssprop.c の表の `AN_*` の欄と `css_prop_animation`）、`cssom.c`。Anchor Positioning の値は cssprop.c（装いの外の群 `struct css_anchor`、装いの `anchor`、NULL が初期値。`anchor()`・`anchor-size()` は cssmath.c の木の葉 `N_ANCHOR`（引数の解析・直列化は cssprop.c の `css_anchor_function_*`、置き換えは `css_calc_map_anchors`）、try tactic、@position-try が受け入れる性質）、`@position-try` の規則と position fallback origin は css.c の `position_try_styles`。CSS Text と Text Decoration の値も cssprop.c：継がれる群 `struct css_text`（装いの `text`。text-shadow・overflow-wrap・word-break・line-break・hyphens・hyphenate-*・tab-size・text-underline-offset/position。子は親の群を指で借りる）と継がれない群 `struct css_decoration`（装いの `decoration`。text-decoration-color/style/thickness）。飾りを引く箱の一覧 `struct css_decorating`（装いの `decorations`、自分が先、各項は引く箱の使用値）は css.c の `style_decorations` が作る。legacy name alias（font-stretch・word-wrap・grid-*-gap）は表の `aliases` の `legacy` の欄で、宣言は正しい名で持ち（css.c の `decl_name` が `css_prop_legacy_alias` で引く）、CSSOM の口は js.c の `native_css_properties` が `css_prop_legacy_alias_at` で足す。CSS Fonts の値は cssprop.c の継がれる群 G_FONT（`struct css_font`、装いの `font`、NULL が初期値、`css_style_font`）、使う大きさと太字の合成は layout.c の `style_font`、字の指標の比は font.c の `font_aspect`。CSS Masking の mask の層は継がれない群 G_MASK（`struct css_mask`、`css_style_mask`、層があるかは `css_mask_layers_set`）。合成・3D・包含・操作の性質（mix-blend-mode・isolation・backface-visibility・perspective・transform-style・contain・will-change・touch-action・user-select）は継がれない群 G_EFFECTS（`struct css_effects`、`css_style_effects`）で、包含は layout.c の `box_containment`・`size_containment`、裏面は `box_backface_hidden`、混ぜ合わせは paint.c の `paint_blended`、user-select は `user_select_used`、style の包含の counter は counter.c の `struct contained`。mask の層の描画は paint.c の `mask_layers_state`・`mask_layer_draw`・`mask_layers_alpha`、url() の文書の中の参照は doc.c の `doc_url_local`。登録された custom property（registerProperty・@property）は css.c の `css_register_property` と置き換えの `subst`（var()・env()・attr() を一つの道で）、構文は cssprop.c の `css_syntax_parse`・`css_syntax_compute`、木を数える関数（sibling-index()・sibling-count()）は cssmath.c の葉 `N_TREE`。calc-size() と内在の大きさの語は len_t の `LK_SIZE`（cssmath.c の `N_CALC_SIZE`・`N_SIZE`・使用値 `css_calc_size_value`・補間 `css_size_mix`）で、配置で解くのは layout.c の「sizing values」の節（`size_w`・`size_h`）。要素の inline の宣言は css.c の `css_inline_set`・`css_inline_replace`・`css_inline_text`：CSSOM の変更は宣言を与えられた値のまま要素の `style_cssom` に持ち、style 属性はその直列化（指定値の直列化は丸めることがあるので、cascade は属性の文を読み直さない）。CSS Typed OM は `js_typed_om.js`（類・reify・内部の表現・StylePropertyMap）＋`js_typed_om.c`（native の口）、性質ごとの reify の規則は cssprop.c の `css_prop_reify`、色は color.c の `css_color_reify`、数の型・木は cssmath.c | `css_cascade`、`css_calc_read`・`css_numeric_read`・`css_calc_specified`、`css_color_interpolate`、`web_animations_tick`、`css_inline_set` |
-| 箱・配置 | `box.c`／`layout.c`（block・inline・table・flex・grid・abs）。文字の幾何（DOM の Text の位置と行の run・deco の往復）の唯一の持ち主は layout.c の「text geometry」の節：Range・CaretPosition の矩形、caretPositionFromPoint の位置、Element の行内の断片が読む。箱の `frag_first`・`frag_end` が自分の run・deco の範囲、処理後の文字と Text のデータのバイトの対応は box.c の `box_text_source_map`。Anchor Positioning は絶対配置の段の中で一度に解く：`layout_abs`→`anchor_layout`（anchor の箱を探す、position-area の格子、anchor-center、位置の選択）。anchor の名と参照は tree-scoped（CSS Shadow 1 §4.2）：宣言の木は css.c の束縛から `struct cx` の `tree`（`css_tree_scope`）へ入り、値が持つ。anchor-name は `anchor_named`・`tree_reference_reaches` で緩く、anchor-scope は `anchor_scope_of` で厳しく照らす。配置の間の記録 `struct box_anchor`（箱の `anchored`）を描画（`box_anchor_hidden`・`box_anchor_shift`）と getComputedStyle（`box_anchor_style`・`box_anchor_inset`）が読む。自己整列の `normal` は `AI_NORMAL`、他の配置は `ai_used` で読む。行分けの割れ目（css-text-4 §6、UAX #14 の類の近似）の唯一の持ち主は layout.c の `wrap_between`（`wrap_rules_of` が word-break・line-break・hyphens を読む）：`text_items`（語は inline の箱の境をまたぐ。`ibuild` の `word_item`）、`control_text_lines`（input・textarea）、`inline_intrinsic` が呼ぶ。overflow-wrap の非常の割れ目は `wrap_emergency`→`split_word`、soft hyphen の線は `finish_line` が run の `hyphen` に記し、字は `layout_hyphen_string`。hyphenate-limit-chars は `hyphen_limits`、hyphenate-limit-lines は `iline` の `hyphenated`。保った tab は一つの項目（`item` の `tab`）で、幅は置かれた行で `tab_advance`（box.c の `ws_process` は tab と soft hyphen を残す） | `boxes_build`・`boxes_rebuild_local`／`layout_doc`、`layout_abs`、`layout_text_rects`・`layout_inline_rects`・`layout_position_at` |
-| counter・リストの印 | 値（counter-reset・increment・set、quotes、list-style-*、content、装いの外の群 `struct css_counters`・`css_list`・`css_content`、::marker の装い `st->marker`）は cssprop.c、ol・li の presentational hint（li value → counter-set、ol reversed・start → counter-reset）は css.c。数える唯一の持ち主は `counter.c`：木の順に counter を継ぎ・作り（CSS Lists 3 §4.4.1 の Issue 5477：親の組が先、兄弟からは親に無い名だけ）、reversed() の初期値（§4.4.2）は一回目の歩きで測って二回目で書く。counter style（定義済みと symbols()）と引用の深さもここ。数える箱の印 `counter_kind`・`counter_tree` と印の箱（inside は inline の箱と字の箱、outside は `box->marker`）は box.c が作り、counter.c が `box_counter_text`・`box_counter_marker` で字を書く（変わった箱だけ配置を無効に）。ホストの検査 `tests/check_counters_native.py` | `web_counters_update`、`css_counter_text` |
-| 描画 | `paint.c`（描画・当たり・ページ内検索）。filter・backdrop-filter は paint.c の `paint_filtered`・`paint_backdrop` が私的な面に描き、画素の手順は `filter.c`（`web_filter_apply`・`web_filter_extent`）、値は cssprop.c の `parse_filter`。指の形は `web_cursor_at`（当たり判定と同じ道で要素の計算済みの cursor）→ browser.c の `pointer_service` → `ui_surface_pointer` → `SYS_WIN_POINTER`（絵と熱点の持ち主は WM、desktop.c）。当たりは文字の run も記録し、`doc_caret_at` が caretPositionFromPoint の位置を返す。input・textarea の値の置き場（`input_line_*`・`control_offset_at`・`doc_control_caret_rect`）は描画と caret が共有。文字の描画は `paint_run_text`：影（`paint_text_shadows`、ぼかしは box-shadow と同じ `shadow_gaussian`。塊ごとに全 run の影を先に描く）→下線・上線→字→取消線（`run_lines`→`decoration_line`、外の飾りの箱から） | `web_paint`、`web_hit_test`、`doc_caret_at` |
-| JS | `js.c`（QuickJS の host）＋`js_*.c`・`js_*.js`（`js_bootstrap.inc` に埋込み）。Web IDL の形（interface object・prototype・member の名と length・列挙・定数）は束縛が組み上がった後に `js_webidl.c` が `webidl_data.inc` の表から一度に与える。DOM の集まり（NodeList・HTMLCollection と派生）は `js_collections.js`（interface の member と各集まりが読むもの）＋`js_collections_native.h`（QuickJS の exotic な class：添字と名前の内部の手順、DOM の版の比べ）。窓と Worker の両方の realm に入る定義：`js_fetch.js`（Fetch の Headers・Request・Response・fetch・Body の唯一の持ち主 `fetchInterfaces(realm)`。realm が渡すのは AbortSignal の `signals`・native の `transport`・base URL・origin・referrer・data: の口だけ。窓の口は js_bootstrap.js。scheme fetch「blob」は `blobFetch` 一つで、Worker の表に無い blob: URL は `transport.obtainBlob` が親の js.c `worker_blob` に頼む。native の応答のメタ行（cors・redirected・opaque・opaqueredirect）の読み手は `js_worker_wire.h` の `njw_transport_flags` 一つ（js.c・js_worker.c）、redirect の manual の opaque-redirect は webfetch.c の `response_start`）、`js_abort.js`（AbortSignal・AbortController の唯一の持ち主 `abortInterfaces`）、`js_object_url.js`（blob URL の表 `objectURLInterfaces(realm)`）、`js_xhr.js`（XMLHttpRequest・ProgressEvent の唯一の持ち主 `xhrInterfaces(realm)`・`progressEventInterface`。要求はどれも realm の Fetch の口 `xhrFetch`・`xhrFetchSync` を通る。realm が渡すのは URL の解析（窓は文書の base と符号、Worker は API の base URL と UTF-8）・`document` の口（窓だけ。responseXML と "document" の応答、Document の本文）・同期の可否）、`js_event_source.js`（Server-sent events の EventSource の唯一の持ち主 `eventSourceInterfaces(realm)`。接続はどれも Fetch の口 `fetchBridge.eventSource`（js_fetch.js。MIME type の解析と extract も js_fetch.js が持ち、XHR が借りる））、`js_geometry.js`（DOMPoint・DOMRect・DOMQuad・DOMMatrix）、`js_typed_om.js`（CSS Typed OM の `typedOMInterfaces(options)`。窓は宣言の塊と計算値の口も渡し、Worker は値の類だけ）、`js_custom_event.js`、`js_clone.js`（`registerSerializable`）、`js_compression.c`（Compression Streams、`deflate.c`・`brotli_codec.h`）。捕まらなかった例外は js.c の `report_exception` が窓へ ErrorEvent を出し（HTML「report an exception」）、取り消されなければ console へ。Range の矩形と `caretPositionFromPoint`・`CaretPosition` は js_range.js（DOM の操作 `rangeRects`・`caretPosition`・`caretRect`、Range の木の歩きは js.c の `range_client_rects`）。programmatic な scroll（CSSOM View の perform a scroll、scrollIntoView の計画）の唯一の持ち主は `js_scroll.js` の `scrollBridge`、要素の変形の連なりは layout.c の `box_transform_chain`（GeometryUtils の `js_geometry_native.h` が読む）。DOM の dispatch の activation（activation target の選択、legacy-pre・取消し・activation behavior）は `js_activation_native.h`、form の送信は js.c の `web_form_submit` 一つ | `web_js_start`、`web_js_tick`、`web_console_eval` |
-| 枠 | `frame.c`、`frame_native.h` | `web_frames_tick`、`web_rendering_now` |
-| 媒体 | `avmedia.c` → `user/libc/media*.c` → 子 `browsermediaworker`・`browsermseworker`。`js_canvas.c`、`js_webgl.c` → `ports/mesa/nocturne_gl.c` | `web_avmedia_tick` |
-| Web Audio | `webaudio.c`、`webaudio_dsp.c`、`js_webaudio.c`・`.js`。出口は `n_audio_submit` | — |
-| Worker・WASM | `js_worker.c` → 子 `browserjsworker`／`js_wasm.cpp`（wabt）。Worker の fetch：`js_worker_runtime.js` の `workerFetchTransport` → NJW_LOAD（mode は kind の旗）・NJW_FRAME・NJW_RESUME（`user/include/js_worker_wire.h`）→ js.c の `worker_request`・`worker_fetch_frame`（作った窓の webnet の要求。opaque は js_worker.c が空にして渡す）。同期の XMLHttpRequest は `workerFetchTransport.fetchSync` → `host.requestWait`（browserjsworker.c の `loaded_wait` が主ループを止め、ほかの記録は後へ回す） | — |
-| 時間の計測 | 各要求の時刻は一つの記録 `struct http_fetch_timing`（`http.h`）：tls.c・http.c・webfetch.c が書き、私的な行で webnet.c へ運び、`webnet_response.timing` → browser.c・`frame_native.h` の `frame_host`（文書の航行）／js.c の `web_js_loaded`（資源）。Worker 自身の要求（fetch・importScripts・XHR）の記録は js.c の `worker_timing` が NJW_LOADED_TIMING で Worker へ送り、Worker の `performanceBridge.monotonicResource` が Worker の timeline に入れる。JS の項目は js.c の `timing_value` → `js_performance.js`（Performance Timeline・User Timing・Navigation・Resource・Paint・Server Timing）。first-paint・first-contentful-paint は paint.c の `paint_document` が文書に記し、js.c の `report_paint_timing` が出す | `host.navigationTiming`、`resourceTiming`・`paintTiming`・`navigationTimingQueued` の hook |
-| 保存 | `webstorage.c`、IndexedDB は `js_indexeddb.js`（realm の取引の予定 2.7.2 は `schedules`、接続の待ち行列 2.8.2 は `openQueues`）＋`js_indexeddb.c`（窓と Worker の両方の realm。Worker は `browserjsworker.c` の主ループ）→ `webidb_async.c` → 子 `browserstorageworker` → `webidb.c`（接続の表で窓と Worker の versionchange・blocked・close が出会う。閉じた接続が残す blocked の証しの行は `CLIENT_GHOST`）、`webcookie.c`（永続の Cookie は webnet.c の `cookie_sync` が `AppData\Browser\cookies` へ。窓どうしは見張りで読み直す）、`js_opfs.c`、Cache Storage は `js_cache_storage.js`（窓と Worker の realm。Fetch の記録は窓が `js_fetch.js` の `cache`、Worker が `js_worker_runtime.js` の `workerFetchBridge.cache`）＋`js_cachestorage.c` → IndexedDB と同じ `webidb_async.c` の列 → 子 `browserstorageworker` → `webcache.c`（`AppData\Browser\caches\<origin の SHA-256>`、命令ごとに origin の lock を借りて disk の状態を読む）、まとめは `websitedata.c` | — |
-| 文書の方針 | `web/html_policy.c`（CSP の方針の模型と判定、Trusted Types の方針、frame-ancestors・X-Frame-Options、meta の CSP）。判定は各所が呼ぶ：取得は js.c の `send_request`・`web_js_loaded`（転送の後）・`worker_request`・`native_socket_open`・`request_styles`、inline は `queue_script`・`js_bootstrap.js` の handler・doc.c の style 要素・dom.c の style 属性、文字列の compile は `js_html_safety_host.h`、form-action は `web_form_navigate`、base-uri は doc.c。違反の報告は窓が `js_policy_report.h` の `csp_report`、Worker が `browserjsworker.c` の `worker_csp_report` | `csp_request_allowed` |
-| F12・ログ | `user/apps/browser_devtools.h`＋`web/inspect.c`。console の行は `web_js_console`（js.c）→ `host_console`→`console_add`（browser.c）。`--log-console`／`--debug-js` で serial へ `[browser <level> @秒.ms] …` | — |
+| 段 | ファイルと入口 |
+|---|---|
+| 主ループ | `user/apps/browser.c` の `browser_event`、`document_step`、`redraw`。 |
+| 取得 | `user/libc/webnet.c` から子プロセス `webfetch --service` へ。そこから `http.c`、`http2.c`、`tls.c`。応答は `doc.c` の `web_resource_loaded` に戻る。 |
+| 文書 | `doc.c` が `web.h` を実装する。`web_parse`、`web_tick`、`web_layout`。 |
+| 解析 | HTML は `html_lexbor.c`（Lexbor）、XML は `xml.c`（Expat）。符号の判定は `html_encoding.c`。 |
+| 符号と URL | `web_encoding.c`（Encoding Standard）と `web_url.c`（WHATWG URL）。URL を受ける層は `struct web_url` を `web_url_read` で受け取る。 |
+| DOM | `dom.c`、`elements.c`、`html_serialize.c`、`xpath.c`。 |
+| CSS | `css.c`（解析、selector、cascade）、`cssprop.c`（property の表）、`cssmath.c`（単位と calc）、`color.c`、`animation.c`、`cssom.c`。 |
+| box と配置 | `box.c`（box の木）と `layout.c`（block、inline、table、flex、grid、絶対配置、Anchor Positioning、行分け）。 |
+| counter | `counter.c`（counter とリストの marker）。 |
+| 描画 | `paint.c`（描画、hit test、ページ内検索）と `filter.c`。 |
+| JS | `js.c`（QuickJS の host）と `js_*.c`・`js_*.js`。Web IDL の形は `js_webidl.c`、Fetch は `js_fetch.js`。 |
+| frame | `frame.c` と `frame_native.h`。 |
+| 媒体 | `avmedia.c` から `user/libc/media*.c`、子プロセス `browsermediaworker`・`browsermseworker` へ。canvas は `js_canvas.c`、WebGL は `js_webgl.c` から `ports/mesa/nocturne_gl.c` へ。 |
+| Web Audio | `webaudio.c`、`webaudio_dsp.c`、`js_webaudio.c`。出口は `n_audio_submit`。 |
+| Worker と WASM | `js_worker.c` から子プロセス `browserjsworker` へ。WASM は `js_wasm.cpp`（wabt）。 |
+| 時間の計測 | 要求ごとの `struct http_fetch_timing`（`user/include/http.h`）を `js.c` が受け、`js_performance.js` が Performance API に出す。 |
+| 保存 | `user/libc/webstorage.c`。IndexedDB は `js_indexeddb.js`・`js_indexeddb.c` から `user/libc/webidb_async.c`、子プロセス `browserstorageworker`、`user/libc/webidb.c` へ。Cache Storage は `js_cache_storage.js`・`js_cachestorage.c` から `user/libc/webcache.c` へ。ほかに `user/libc/webcookie.c`、`js_opfs.c`。 |
+| 方針 | `html_policy.c`（CSP、Trusted Types、frame-ancestors）。 |
+| F12 とログ | `user/apps/browser_devtools.h` と `inspect.c`。`--log-console` と `--debug-js` で serial に `[browser …]` の行を出す。 |
 
-## ビルド・媒体・試験（手順は `nocturne-project` スキル）
+## ビルド・媒体・試験
 
-- 入口 `python -X utf8 scripts/build.py -j 8 <目標>`（UCRT64 の make。目標はいつも書く）。確かめは `qemu-image`（img だけ。`build/nocturne.img` を増分で上書き）。`all`（img・vhdx・iso。起動は UEFI だけ）は Hyper-V へ渡すとき。`kernel`、`user`、`clean`。`run`（`build/run.img`）と `test`・`test-quick`・`test-full`（`build/test.img` へ写す）は窓なしで起こす作りが残る（規則は AGENTS.md「ビルドと媒体」）。
-- 出力 `build/kernel.elf`、`build/programs/`、`build/sdk/`、`build/c.list`、`build/nocturne.{img,vhdx,iso}`。C: の中身は `scripts/layout.py` → `build/c.list` → `build/host/store.exe fill`（`mkroots.py` は TLS の根の証明書で、C: とは無関係）。
-- 任意の移植は道具があるときだけ：Go `tools/go`、TypeScript `tools/TypeScript`、Rust `tools/rust`、OS の中の LLVM `tools/llvm`、NVIDIA の firmware `local/firmware/`。
-- 試験：ゲストの試験は `tests/runtests.c` の `tests[]`（117 群 227 件。例 `web/fonts`・`web/engine`・`web/javascript`）。それを回す `scripts/test.py` は `build/test.img` へ写し、q35・UEFI・NVMe の機械（`vm_machine`）を窓付きで起こす。`tests/check_*.py` はホストの検査で、まとめる runner は無い。URL を読む層を組む検査は、URL の持ち主（`web_url.c` と Lexbor）を `tests/url_owner.py` の `objects()` で結ぶ。
-- WPT：`scripts/wpt.py <path>…`（ホストの wptserve と QEMU 一台、ゲストの `tests/wptrunner.c` が枠（`--slots`）ごとにブラウザーを開き、`tests/wpt/testharnessreport.js` が結果を返す。媒体は `build/wpt/wpt.img` への写し、結果は `build/wpt/<名>/`）。機械は test.py の `vm_machine`、窓付き。QuickJS だけの test262 はホストの `tests/check_test262.py`。
-- `scripts/platform_qa.py`（`build/nocturne-platform/<label>/` の写し）と `scripts/qtest.py` は写し・窓なしの作り。画面で確かめる手順は `nocturne-project` スキル。
+規則は AGENTS.md の「ビルドと媒体」、手順は `nocturne-project` スキルにある。ここは場所だけを書く。
+
+- 入口は `python -X utf8 scripts/build.py -j 8 <目標>`。目標は Makefile の `qemu-image`、`all`、`kernel`、`user`、`clean` など。
+- 出力は `build/kernel.elf`、`build/programs/`、`build/sdk/`、`build/c.list`、`build/nocturne.img`・`.vhdx`・`.iso`。
+- C: の中身は `scripts/layout.py` が `build/c.list` を作り、`build/host/store.exe fill` が詰める。
+- 任意の移植の道具は `tools/go`、`tools/TypeScript`、`tools/rust`、`tools/llvm`、`local/firmware/`。
+- ゲストの試験の表は `tests/runtests.c` の `tests[]`。回すのは `scripts/test.py`。
+- WPT は `scripts/wpt.py <path>…`。ゲストの側は `tests/wptrunner.c`。
+- QuickJS の test262 はホストの `tests/check_test262.py`。
 
 ## 記録と道具
 
-- `docs/browser/LEDGER.md`（ブラウザーの表示と性能：基準版、退行、既知の欠陥、受入表、測定、決定）と `docs/nvidia/LEDGER.md`（RTX 4070 を RM と Mesa へつなぐ作業）は記録。今の状態は盤（`ban` スキル、`.claude/ban/`）。
-- `docs/` のそれ以外（約 250 ファイル、ほとんど名に日付）はその日の記録で、今の仕様は `nocturne-native-abi.md` だけ。
-- `.claude/oboegaki.md`：ファイルに結び付けた覚え書き。触れる前に対象の道で引く。`.claude/ban/`：会話ごとの盤（`.claude/hooks/ban.py` が圧縮・再開の後に見せる）。
-- codegraph：`codegraph.json`（third_party を外す）、`.mcp.json` が `codegraph serve --mcp` を起こす。`SYS_*` の番号の呼出しと登録の表からの呼出しは索引に出ない。
-- `scripts/hv-*.ps1`（Hyper-V はユーザーの担当）：`hv-boot`・`hv-esm`・`hv-input`・`hv-serial`・`hv-shot`・`hv-sock`。VM の作成は根の `hyperv.ps1`。
-
-## 古い記述（直すまで信じない）
-
-- README.md:274 の tools 一覧 → llvm・rust・go・TypeScript もある。README.md:664〜670 の `hv/`・`rdp/`・e1000・tulip・ATA の置き場所 → どれも `kernel/src/vm/`。README.md:674 の ports 一覧に llvm が無い。
-- `scripts/test.py:20` の群の一覧（13 群）→ `tests/runtests.c` は 117 群。
+- `docs/browser/LEDGER.md` と `docs/nvidia/LEDGER.md` は過去の記録。
+- `.claude/oboegaki.md` はファイルに結び付けた覚え書き。触れる前に対象のパスで引く。
+- `.claude/ban/` は会話ごとの盤。`.claude/hooks/ban.py` が見せる。
+- codegraph の設定は `codegraph.json`、起動は `.mcp.json`。`SYS_*` の番号での呼出しと、表からの呼出しは索引に出ない。
+- `scripts/hv-*.ps1` と根の `hyperv.ps1` は Hyper-V の道具。Hyper-V はユーザーの担当。

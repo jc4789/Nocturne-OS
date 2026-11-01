@@ -9,10 +9,6 @@ LINUX SOURCE CODE OR ANY OTHER OS'S SOURCE CODE IS NEVER ALLOWED TO BE REFERENCE
 
 Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは C。対象は実機。QEMU と Hyper-V は試験の道具で、VM で通ることは実機で動く証拠にならない。汎用の OS を目指す：CPU・メモリー・装置・プログラム・利用者の数が増えても成り立つ形で設計する。shim もスパゲッティも作らない。抽象化の層は要る所に作る。
 
-## ユーザーの意図（2026-11-01）
-
-- worktree とビルド：使ってよい。終わったら片付ける。何百 GB のビルドや何十もの worktree を残さない。理由は SSD の負担と、Windows が重くなること。
-
 ## 置き場所
 
 - 全プロジェクト共通（言葉、サブエージェント、編集、シェル、メモリー）：`~/.claude/CLAUDE.md`。
@@ -82,6 +78,7 @@ Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは
 
 - ビルドは `python -X utf8 scripts/build.py -j 8 <目標>`。目標はいつも書く。確かめは `qemu-image`（`build/nocturne.img` を増分で上書き）。`all` は Hyper-V へ渡すときだけで、VHDX を忘れない。確かめのたびに全体ビルドをしない。ユーザーが組んだビルドがあればそのまま使う。
 - 媒体は二つまで。本線 `build/nocturne.img` と、一度に一つの二つ目（`build/mae.img` か試験の道具の写し）.build の下には組みの出力だけを置き、ソース・コードを置かない。 
+- worktree とビルド：使ってよい。終わったら片付ける。何百 GB のビルドや何十もの worktree を残さない。理由は SSD の負担と、Windows が重くなること。
 - WPT は変更が触れた仕様のディレクトリーだけ `scripts/wpt.py <path>…` で。道具は窓付きに直してから使う（フックが止める）。`platform_qa.py`・`qtest.py`、make の `run` は使わない。
 - 正しい修理に共有ヘッダーが要るなら、全体の組み直しになっても直し、後回しにしない。A/B は前の写しと今を二台で並べるか、疑わしい `.c` を一つ差し替えて増分で組む。stash・revert で戻さない。
 - ビルドの規則を変えたら、空の build/ から組んでも通るか（生成物の規則、PATH に無い道具。ユーザーの PowerShell に Git の usr/bin は無い）を確かめる。ユーザーのビルドが壊れたら私の責任。
