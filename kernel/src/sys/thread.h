@@ -92,6 +92,8 @@ int thread_join(int tid);
    (N_SCHEDULE_*, abi.h) from here on, with value its weight (fair) or period ns (deadline). An app's
    fair threads weigh at most the default; its deadline threads share half a CPU (sys/thread.c). */
 int thread_schedule(int tid, uint32_t class, uint64_t value);
+/* SYS_APP_CPU_TIME: the CPU time p's threads have used, those that ended too. */
+uint64_t process_cpu_ns(struct process *p);
 /* No one will join the thread: it is freed once it has ended. */
 int thread_detach(int tid);
 /* The calling thread ends. A process's main thread ends its process with code (sys/process.c). */

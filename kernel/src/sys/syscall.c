@@ -3012,6 +3012,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_THREAD_EXIT: thread_exit(0);
     case SYS_THREAD_ID: ret = self->tid; break;
     case SYS_THREAD_SCHEDULE: ret = thread_schedule((int)a, (uint32_t)b, c); break;
+    case SYS_APP_CPU_TIME: ret = (int64_t)process_cpu_ns(self->process); break;
     case SYS_THREAD_STACK_BOUNDS: {
         /* Main stacks grow on demand within the VM's reserved interval.
            Other threads instead own the stack thread_create reserved for them. */

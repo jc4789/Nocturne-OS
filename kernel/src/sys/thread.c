@@ -103,8 +103,10 @@ static int tid_take(void) {
     return 0;
 }
 
-/* thread_lock held: t leaves its process's list of threads. */
+/* thread_lock held: t leaves its process's list of threads. What it ran stays in its process's CPU
+   time once it has ended. */
 static void process_unlist(struct thread *t) {
+    if (t->ended) t->process->retired_ns += sched_thread_cpu_ns(t);
     *t->process_prev = t->process_next;
     if (t->process_next) t->process_next->process_prev = t->process_prev;
     t->process_next = NULL;
@@ -254,6 +256,14 @@ int thread_schedule(int tid, uint32_t class, uint64_t value) {
     }
     spin_unlock(&thread_lock, f);
     return r;
+}
+
+uint64_t process_cpu_ns(struct process *p) {
+    uint64_t f = spin_lock(&thread_lock);
+    uint64_t ns = p->retired_ns + sched_thread_cpu_ns(p->main);
+    for (struct thread *t = p->threads; t; t = t->process_next) ns += sched_thread_cpu_ns(t);
+    spin_unlock(&thread_lock, f);
+    return ns;
 }
 
 void thread_left(struct thread *t) {

@@ -441,9 +441,15 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - `n_sleep_until(deadline)`（`SYS_SLEEP`、結果は無い）：期限まで眠る。ISO C の `thrd_sleep` は
   これの上に作る。
 - `n_random(buf, n)`：システムのエントロピーから `n` バイト。
-- `gettimeofday`、`struct timeval` は無い。ISO Cの `time`／`timespec_get`／`localtime` は
-  これらの上に実装する（`timespec_get` の `TIME_MONOTONIC` は単調時計、`TIME_UTC` は壁時計で、
-  どちらも ns まで）。
+- `n_app_cpu_ns()`（`SYS_APP_CPU_TIME`、引数なし）：呼んだアプリの thread が走った時間の合計（ns）。
+  終わった thread の分も入る（カーネルは thread の記録を手放すとき、その時間を process に足す）。
+  開始から今までで、ほかのアプリや子のアプリの分は入らない。ISO C の `clock()` はこれの上に作る
+  （`clock_t` は ns の数で、`CLOCKS_PER_SEC` は 1000000000）。
+- `gettimeofday`、`struct timeval` は無い。ISO Cの `time`／`timespec_get`／`localtime`／`gmtime`
+  （と C23 の `localtime_r`／`gmtime_r`）はこれらの上に実装する（`timespec_get` の
+  `TIME_MONOTONIC` は単調時計、`TIME_UTC` は壁時計で、どちらも ns まで）。時刻帯は無い。時計は
+  地方時を持つので、`localtime` は `gmtime` と同じに分解する。`tm_year` に入らない年は
+  `NULL`（`errno` は `EOVERFLOW`）。
 - `proclist` の `struct n_procinfo` の `cpu_ns`（走った時間）と `start_ns`（始まった単調時計の
   時刻）、`sysinfo` の `struct n_sysinfo` の `uptime_ns`（単調時計）も ns。
 

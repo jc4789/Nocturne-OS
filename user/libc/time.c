@@ -1,55 +1,13 @@
 #include <time.h>
 #include "nocturne.h"
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
 #include <wchar.h>
 
 static bool is_leap(long long y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
-static const int mdays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-
-struct tm *gmtime(const time_t *tp) {
-    static struct tm tm;
-    time_t t = *tp;
-    int64_t days = t / 86400, rem = t % 86400;
-    if (rem < 0) {
-        rem += 86400;
-        days--;
-    }
-    tm.tm_hour = (int)(rem / 3600);
-    tm.tm_min = (int)(rem % 3600 / 60);
-    tm.tm_sec = (int)(rem % 60);
-    tm.tm_wday = (int)((days + 4) % 7);
-    if (tm.tm_wday < 0) tm.tm_wday += 7;
-    int y = 1970;
-    for (;;) {
-        int yd = is_leap(y) ? 366 : 365;
-        if (days >= yd) {
-            days -= yd;
-            y++;
-        } else if (days < 0) {
-            y--;
-            days += is_leap(y) ? 366 : 365;
-        } else {
-            break;
-        }
-    }
-    tm.tm_year = y - 1900;
-    tm.tm_yday = (int)days;
-    int m = 0;
-    for (; m < 12; m++) {
-        int md = mdays[m] + (m == 1 && is_leap(y));
-        if (days < md) break;
-        days -= md;
-    }
-    tm.tm_mon = m;
-    tm.tm_mday = (int)days + 1;
-    tm.tm_isdst = 0;
-    return &tm;
-}
-
-/* the RTC holds local time, so localtime == gmtime */
-struct tm *localtime(const time_t *t) { return gmtime(t); }
 
 /* Days from 1970-01-01 to the first of month m (1-12) of year y in the
    proleptic Gregorian calendar, counting in 400-year eras of 146097 days with
@@ -62,8 +20,54 @@ static long long days_from_civil(long long y, int m) {
     return era * 146097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year - 719468;
 }
 
+/* The inverse of days_from_civil: the year and the month (1-12) that day number days (from
+   1970-01-01) is in, and the day of that month (1-31). */
+static long long civil_from_days(long long days, int *month, int *mday) {
+    days += 719468;
+    long long era = (days >= 0 ? days : days - 146096) / 146097;
+    long long day_of_era = days - era * 146097;
+    long long year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    long long day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    long long march_month = (5 * day_of_year + 2) / 153;
+    *mday = (int)(day_of_year - (153 * march_month + 2) / 5) + 1;
+    *month = (int)(march_month < 10 ? march_month + 3 : march_month - 9);
+    return year_of_era + era * 400 + (*month <= 2);
+}
+
+/* The clock keeps local time and no time zone is known, so a time_t is broken down the same
+   whether it is called UTC or local. A year that tm_year cannot hold is EOVERFLOW. */
+struct tm *gmtime_r(const time_t *tp, struct tm *tm) {
+    long long days = *tp / 86400, rem = *tp % 86400;
+    if (rem < 0) {
+        rem += 86400;
+        days--;
+    }
+    int month, mday;
+    long long year = civil_from_days(days, &month, &mday);
+    if (year - 1900 < INT_MIN || year - 1900 > INT_MAX) {
+        errno = EOVERFLOW;
+        return NULL;
+    }
+    tm->tm_sec = (int)(rem % 60);
+    tm->tm_min = (int)(rem % 3600 / 60);
+    tm->tm_hour = (int)(rem / 3600);
+    tm->tm_mday = mday;
+    tm->tm_mon = month - 1;
+    tm->tm_year = (int)(year - 1900);
+    tm->tm_wday = (int)((days % 7 + 11) % 7);
+    tm->tm_yday = (int)(days - days_from_civil(year, 1));
+    tm->tm_isdst = 0;
+    return tm;
+}
+struct tm *localtime_r(const time_t *tp, struct tm *tm) { return gmtime_r(tp, tm); }
+
+/* ISO C: one buffer shared by gmtime and localtime, which the next call of either reuses. */
+static struct tm broken_down;
+struct tm *gmtime(const time_t *tp) { return gmtime_r(tp, &broken_down); }
+struct tm *localtime(const time_t *tp) { return localtime_r(tp, &broken_down); }
+
 /* ISO C: the fields may lie outside their ranges; the result is normalized
-   into tm, with tm_wday and tm_yday set. */
+   into tm, with tm_wday and tm_yday set. (time_t)-1 when the time does not fit. */
 time_t mktime(struct tm *tm) {
     long long mon = tm->tm_mon, year = tm->tm_year + 1900LL + mon / 12;
     mon %= 12;
@@ -71,9 +75,11 @@ time_t mktime(struct tm *tm) {
         mon += 12;
         year--;
     }
-    time_t t = (days_from_civil(year, (int)mon + 1) + tm->tm_mday - 1) * 86400 + tm->tm_hour * 3600LL +
-               tm->tm_min * 60LL + tm->tm_sec;
-    *tm = *gmtime(&t);
+    long long days = days_from_civil(year, (int)mon + 1) + tm->tm_mday - 1;
+    time_t t;
+    if (__builtin_mul_overflow(days, 86400LL, &t) ||
+        __builtin_add_overflow(t, tm->tm_hour * 3600LL + tm->tm_min * 60LL + tm->tm_sec, &t) || !localtime_r(&t, tm))
+        return (time_t)-1;
     return t;
 }
 
@@ -233,6 +239,8 @@ size_t wcsftime(wchar_t *s, size_t max, const wchar_t *fmt, const struct tm *tm)
     s[n] = 0;
     return n;
 }
+
+clock_t clock(void) { return (clock_t)n_app_cpu_ns(); }
 
 /* ISO C timespec_get: TIME_UTC the wall clock, TIME_MONOTONIC the monotonic one, both in ns. */
 int timespec_get(struct timespec *ts, int base) {

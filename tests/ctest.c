@@ -82,6 +82,32 @@ int main(void) {
     struct tm *tm = gmtime(&now);
     CHECK(tm && tm->tm_year >= 123);
 
+    /* gmtime_r and localtime_r (no time zone: the same breakdown) */
+    struct tm bd;
+    time_t leap_day = 951782400, before = -1, far = INT64_MAX;
+    CHECK(gmtime_r(&leap_day, &bd) == &bd && bd.tm_year == 100 && bd.tm_mon == 1 && bd.tm_mday == 29 &&
+          bd.tm_hour == 0 && bd.tm_wday == 2 && bd.tm_yday == 59 && !bd.tm_isdst);
+    CHECK(gmtime_r(&before, &bd) && bd.tm_year == 69 && bd.tm_mon == 11 && bd.tm_mday == 31 && bd.tm_hour == 23 &&
+          bd.tm_min == 59 && bd.tm_sec == 59 && bd.tm_wday == 3 && bd.tm_yday == 364);
+    time_t zero = 0;
+    CHECK(localtime_r(&zero, &bd) == &bd && bd.tm_year == 70 && bd.tm_mday == 1 && bd.tm_wday == 4 && bd.tm_yday == 0);
+    errno = 0;
+    CHECK(gmtime_r(&far, &bd) == NULL && errno == EOVERFLOW);
+    struct tm round = {.tm_year = 126, .tm_mon = 10, .tm_mday = 1, .tm_hour = 12, .tm_min = 30, .tm_sec = 15};
+    time_t made = mktime(&round);
+    CHECK(made == 1793536215 && round.tm_wday == 0 && round.tm_yday == 304);
+    CHECK(gmtime(&now) && gmtime(&now) == localtime(&now) && gmtime_r(&now, &bd) && bd.tm_sec == gmtime(&now)->tm_sec);
+
+    /* clock: the app's CPU time. It grows while the app runs, by no more than the time that passed,
+       and stands still while it sleeps. */
+    clock_t c0 = clock();
+    uint64_t t0 = n_clock_monotonic(), t1;
+    while ((t1 = n_clock_monotonic()) - t0 < 20 * N_NS_PER_MS) {}
+    clock_t c1 = clock();
+    CHECK(CLOCKS_PER_SEC == 1000000000 && c1 > c0 && (uint64_t)(c1 - c0) <= t1 - t0 + N_NS_PER_MS);
+    n_sleep_until(n_clock_after(20 * N_NS_PER_MS));
+    CHECK(clock() - c1 < 10 * (clock_t)(N_NS_PER_MS));
+
     char file[4096];
     CHECK(n_path_join(n_temp_folder(), "ctest.txt", file, sizeof file) > 0);
     FILE *fp = fopen(file, "w+");

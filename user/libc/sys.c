@@ -130,6 +130,7 @@ uint64_t n_clock_after(uint64_t ns) {
     return ns >= N_CLOCK_NEVER - now ? N_CLOCK_NEVER : now + ns;
 }
 void n_sleep_until(uint64_t deadline) { SC1(SYS_SLEEP, deadline); }
+uint64_t n_app_cpu_ns(void) { return (uint64_t)SC0(SYS_APP_CPU_TIME); }
 
 /* ELF TLS (x86-64 variant II): the linked image ends at the FS control
    block. The linker defines these (user/user.ld, or TinyCC's
