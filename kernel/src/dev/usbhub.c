@@ -506,4 +506,10 @@ void usbhub_work(struct usb_device *d) {
             if (port >= 1 && port <= h->ports) hub_port(h, port);
         }
     }
+    /* its reports running, and nothing waiting for an answer any more: they tell it from here on */
+    if (ask && answered && h->reporting && !h->hub_held) {
+        bool held = false;
+        for (unsigned p = 1; p <= h->ports; p++) held = held || h->held[p];
+        h->asking = held;
+    }
 }
