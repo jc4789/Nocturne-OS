@@ -275,8 +275,8 @@ static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, uns
             h->last_y = scale_abs(&h->y, y);
             h->y_known = true;
         }
-        /* a place only with both axes absolute, each of which has said where */
-        if (h->x_known && h->y_known && !h->x.relative && !h->y.relative) {
+        /* a place only with both axes absolute, each of which has said where: only those become known */
+        if (h->x_known && h->y_known) {
             e.absolute = true;
             e.x = h->last_x;
             e.y = h->last_y;

@@ -304,8 +304,9 @@ static uint32_t settle(struct port *p, uint32_t is) {
         p->error_tfd = tfd;
         p->live = false;
         /* Only busy or asking for data does a device of non-queued commands need a COMRESET
-           (6.2.2, 6.2.2.1), which port_up reads; queued ones it may still hold (6.2.2.2). */
-        if (is == 0xFFFFFFFFu || p->queued) p->need_reset = true;
+           (6.2.2, 6.2.2.1), which port_up reads; queued ones it may still hold (6.2.2.2); an overflow
+           needs one on a write, which may hold the link (6.1.5). */
+        if (is == 0xFFFFFFFFu || is & IS_OFS || p->queued) p->need_reset = true;
         p->attention = true;
         p->fatal = true;
         return p->issued; /* each waiter looks at attention */
@@ -812,7 +813,8 @@ static void halt(struct port *p, uint32_t bit) {
     /* An adapter reset under way ends first: until GHC.HR falls (10.4.3) its engines may still move
        data. After one they are stopped, and what it set up is not this one's to stop. */
     bool held = hba_lock(p->h);
-    if (!__atomic_load_n(&p->h->lost, __ATOMIC_ACQUIRE) && !port_stop(p)) port_force_stop(p);
+    /* Its receive engine stays on: the device's last register FIS is what port_up reads (6.2.2.1, 3.3.7). */
+    if (!__atomic_load_n(&p->h->lost, __ATOMIC_ACQUIRE) && !list_stop(p)) port_force_stop(p);
     hba_unlock(p->h, held);
     f = spin_lock(&p->lock);
     woken = finish(p, p->issued, FAILED);

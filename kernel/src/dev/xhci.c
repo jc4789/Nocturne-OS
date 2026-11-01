@@ -1671,8 +1671,8 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
     /* A hub's descriptor may only be asked of it configured (USB 2.0 11.24.2.5, USB 3.2 10.16.2.3), and
        what it says goes into the Slot Context by the first Configure Endpoint after the slot's Default
        state (xHCI 4.5.2, 6.2.2.2): so a hub is configured as a function, asked, and made anew. */
-    if (configuration_has_hub(cfg, (unsigned)got) && usbhub_prepare(d) &&
-        (!device_readdress(xd) || !configure(xd, cfg, (unsigned)got))) {
+    if (configuration_has_hub(cfg, (unsigned)got) &&
+        (!usbhub_prepare(d) || !device_readdress(xd) || !configure(xd, cfg, (unsigned)got) || !usbhub_set_depth(d))) {
         kprintf("usb: slot %u could not be configured as a hub\n", slot);
         kfree(cfg);
         usbhub_detach(d);
@@ -1916,7 +1916,7 @@ static void hc_recover(struct usb_hc *hc) {
                 uint64_t f = spin_lock(&ep->lock);
                 ep->dead = true;
                 spin_unlock(&ep->lock, f);
-                usbhub_reports_lost(&xd->dev);
+                usbhub_reports_lost(&xd->dev, ep->address);
                 continue;
             }
             ep->retry_at = now + ((10 * NS_PER_MS) << ep->fails);

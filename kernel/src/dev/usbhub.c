@@ -54,8 +54,11 @@ struct hub {
     bool ss;         /* Enhanced SuperSpeed hub */
     bool hub_change; /* atomic: bit 0 of the status change report, the hub's own status changed */
     bool reporting;  /* its status change endpoint runs: a port change comes as a report */
-    bool asking;     /* it does not, for good: its ports are read on the worker's second */
+    bool asking;     /* it does not, for good: its ports are read each second, by no document's time */
     uint64_t ask_at;
+    unsigned ask_gap; /* seconds: doubled while it does not answer, to 64 */
+    uint8_t report_ep;
+    bool off;        /* wHubStatus: local power lost or over-current, every port is off and stays so */
     /* a SuperSpeedPlus hub's Sublink Speed Attributes (USB 3.2 9.6.2.5), NULL for any other */
     uint32_t *sublinks;
     unsigned nsublinks;
@@ -194,46 +197,55 @@ static void power_ports(struct hub *h) {
     usb_note_work(h->dev);
 }
 
+/* A SuperSpeed hub routes packets by its tier of the route string, which it learns here; until then
+   it takes every packet as its own (USB 3.2 10.1.3.1). */
+bool usbhub_set_depth(struct usb_device *d) {
+    struct hub *h = d->hub;
+    if (!h->ss || usb_control(d, 0x20, SET_HUB_DEPTH, d->depth, 0, NULL, 0) >= 0) return true;
+    kprintf("usbhub: slot %u refused its hub depth\n", d->slot);
+    return false;
+}
+
 void usbhub_attach(struct usb_device *d, const struct usb_endpoint_desc *ep) {
     struct hub *h = d->hub;
     if (!h) return;
-    /* a SuperSpeed hub routes packets by its tier of the route string, which it learns here;
-     * until then it takes every packet as its own (USB 3.2 10.1.3.1) */
-    if (h->ss && usb_control(d, 0x20, SET_HUB_DEPTH, d->depth, 0, NULL, 0) < 0) {
-        kprintf("usbhub: slot %u refused its hub depth\n", d->slot);
-        return;
-    }
+    h->report_ep = ep->address;
     power_ports(h);
     kprintf("usbhub: slot %u %shub with %u ports\n", d->slot, h->ss ? "SuperSpeed " : "", h->ports);
     h->reporting = usb_interrupt_start(d, ep, (h->ports + 8) / 8, hub_report, h); /* a bit a port, and the hub's */
-    if (!h->reporting) usbhub_reports_lost(d);
+    if (!h->reporting) usbhub_reports_lost(d, ep->address);
 }
 
 /* A change is known by the status change endpoint alone (USB 2.0 11.12.1): without it, the ports are asked. */
-void usbhub_reports_lost(struct usb_device *d) {
+void usbhub_reports_lost(struct usb_device *d, uint8_t address) {
     struct hub *h = d->hub;
-    if (!h) return;
+    if (!h || address != h->report_ep) return;
     kprintf("usbhub: slot %u reports no port changes: its ports are read each second\n", d->slot);
     h->reporting = false;
     h->asking = true;
+    h->ask_gap = 1;
 }
 
-/* The hub's own status: its local power supply, or an over-current across all ports, which
- * switches every port off until software powers them again. */
-static void hub_status(struct hub *h) {
+/* The hub's own status: its local power supply, or an over-current across all ports, either of
+ * which switches every port off until software powers them again (USB 2.0 11.12.5, 11.13; USB 3.2
+ * 10.13.5). False if it does not answer. */
+static bool hub_status(struct hub *h) {
     struct usb_device *d = h->dev;
     uint8_t st[4];
-    if (usb_control(d, 0xA0, USB_REQ_GET_STATUS, 0, 0, st, 4) < 4) return;
+    if (usb_control(d, 0xA0, USB_REQ_GET_STATUS, 0, 0, st, 4) < 4) return false;
     uint16_t status = st[0] | st[1] << 8, change = st[2] | st[3] << 8;
     if (change & 1) usb_control(d, 0x20, USB_REQ_CLEAR_FEATURE, C_HUB_LOCAL_POWER, 0, NULL, 0);
-    if (!(change & 2)) return;
-    usb_control(d, 0x20, USB_REQ_CLEAR_FEATURE, C_HUB_OVER_CURRENT, 0, NULL, 0);
-    if (status & 2) {
-        kprintf("usbhub: slot %u over-current, its ports are switched off\n", d->slot);
+    if (change & 2) usb_control(d, 0x20, USB_REQ_CLEAR_FEATURE, C_HUB_OVER_CURRENT, 0, NULL, 0);
+    h->off = status & 3;
+    if (!(change & 3)) return true;
+    if (h->off) {
+        kprintf("usbhub: slot %u lost its power or over-current, its ports are switched off\n", d->slot);
+        for (unsigned p = 1; p <= h->ports; p++) pending_mark(h, p); /* their devices have gone */
     } else {
-        kprintf("usbhub: slot %u over-current ended, powering its ports again\n", d->slot);
+        kprintf("usbhub: slot %u power good again, powering its ports\n", d->slot);
         power_ports(h);
     }
+    return true;
 }
 
 /* Reset a port (warm: the SuperSpeed link reset) and wait until the hub reports it done: the
@@ -287,7 +299,7 @@ static unsigned ss_speed(struct hub *h, unsigned port, unsigned *rank) {
 }
 
 /* A SuperSpeed link that needs a warm reset. During a reset the state may still be the Inactive it
-   came from; the link of a port without power is eSS.Disabled, which is not this (USB 3.2 10.3.1.1). */
+   came from; a port without power has neither state (USB 3.2 10.3.1.1, 10.3.1.10, 10.3.1.11). */
 static bool link_stuck(const struct hub *h, uint16_t status) {
     unsigned link = PS_LINK(status);
     return h->ss && !(status & PS_RESET) && (status & PS_SS_POWER) && (link == LINK_INACTIVE || link == LINK_COMPLIANCE);
@@ -337,11 +349,12 @@ static void hub_port_attach(struct hub *h, unsigned port) {
 
 static void hub_port(struct hub *h, unsigned port) {
     struct usb_device *d = h->dev;
-    struct usb_port_tries *t = &h->tries[port];
+    struct usb_port_tries *t = &h->tries[port], *power = &h->power[port];
     uint16_t status, change;
     if (!port_status(d, port, &status, &change)) {
         /* a hub that does not answer: a port being tried is not read again at once */
         if (t->at && usb_port_try(t)) usb_port_failed(t, true);
+        if (power->at && usb_port_try(power)) usb_port_failed(power, true);
         return;
     }
     clear_changes(h, port, change);
@@ -357,13 +370,14 @@ static void hub_port(struct hub *h, unsigned port) {
     if (status & PS_OVER_CURRENT) {
         if (change & CH_OVER_CURRENT) kprintf("usbhub: slot %u port %u over-current\n", d->slot, port);
         usb_port_free(t);
+        if (power->at && clock_now_ns() >= power->at) power->at = clock_after(NS_PER_S); /* not due while it lasts */
         return;
     }
-    struct usb_port_tries *power = &h->power[port];
     if (status & (h->ss ? PS_SS_POWER : PS_USB2_POWER)) {
         if (power->at && clock_now_ns() >= power->at) usb_port_free(power); /* it has stayed on */
     } else { /* over: the port was switched off and needs power again (USB 2.0 11.12.5); a short takes it again */
-        if (!usb_port_try(power)) return;
+        usb_port_free(t); /* what was tried has lost its power, and comes back as a new device (step 5) */
+        if (h->off || !usb_port_try(power)) return;
         usb_port_failed(power, true);
         if (power->count == 1) kprintf("usbhub: slot %u port %u over-current ended, powering it again\n", d->slot, port);
         port_feature(d, USB_REQ_SET_FEATURE, PORT_POWER, port);
@@ -391,7 +405,7 @@ static void hub_port(struct hub *h, unsigned port) {
    at it any more: one that went into Inactive with no connection sets no change flag leaving it. */
 static bool port_due(const struct hub *h, unsigned port) {
     uint64_t now = clock_now_ns();
-    return (h->tries[port].at && now >= h->tries[port].at) || (h->power[port].at && now >= h->power[port].at);
+    return (h->tries[port].at && now >= h->tries[port].at) || (!h->off && h->power[port].at && now >= h->power[port].at);
 }
 
 bool usbhub_pending(struct usb_device *d) {
@@ -416,11 +430,14 @@ bool usbhub_trying(struct usb_device *d) {
 void usbhub_work(struct usb_device *d) {
     struct hub *h = d->hub;
     if (!h) return;
-    if (__atomic_exchange_n(&h->hub_change, false, __ATOMIC_ACQ_REL) && !removed_hub(h)) hub_status(h);
-    bool ask = h->asking && clock_now_ns() >= h->ask_at;
-    if (ask) h->ask_at = clock_after(NS_PER_S);
+    bool ask = h->asking && clock_now_ns() >= h->ask_at, answered = true;
+    if ((__atomic_exchange_n(&h->hub_change, false, __ATOMIC_ACQ_REL) || ask) && !removed_hub(h)) answered = hub_status(h);
+    if (ask) { /* each port waits for its control transfer's time: not for one that does not answer */
+        h->ask_gap = answered ? 1 : MIN(h->ask_gap * 2, 64u);
+        h->ask_at = clock_after(h->ask_gap * NS_PER_S);
+    }
     for (unsigned p = 1; p <= h->ports; p++)
-        if (ask || port_due(h, p)) pending_mark(h, p);
+        if ((ask && answered) || port_due(h, p)) pending_mark(h, p);
     /* each port once: one that changes again waits for the worker's next round */
     for (unsigned w = 0; w < pending_words(h) && !removed_hub(h); w++) {
         uint32_t bits = __atomic_exchange_n(&h->pending[w], 0, __ATOMIC_ACQ_REL);

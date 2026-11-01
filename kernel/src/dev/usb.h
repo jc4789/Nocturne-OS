@@ -22,7 +22,8 @@
 #define USB_DEBOUNCES 5 /* the connect debounce begun again for a connection that came and went */
 struct usb_port_tries {
     uint64_t at;   /* when the next try may be; 0: none has failed; CLOCK_NEVER: left */
-    uint8_t count; /* tries in a row, this one with them */
+    uint8_t count; /* tries in a row, this one with them: how long the next waits */
+    uint8_t failed; /* of them, those with a device connected */
     bool stuck;
 };
 /* Whether to try now; a try is counted if so. */
@@ -35,13 +36,15 @@ static inline bool usb_port_try(struct usb_port_tries *t) {
 static inline void usb_port_free(struct usb_port_tries *t) {
     t->at = 0;
     t->count = 0;
+    t->failed = 0;
     t->stuck = false;
 }
 /* A try that failed. */
 static inline void usb_port_failed(struct usb_port_tries *t, bool stuck) {
-    if (t->stuck && !stuck) t->count = 1; /* a device has come at last: its tries begin */
+    if (t->stuck && !stuck) t->count = 1; /* a device has come: the waits begin again */
     t->stuck = stuck;
-    t->at = t->count >= USB_PORT_TRIES && !stuck ? CLOCK_NEVER : clock_after(NS_PER_S << (t->count ? t->count - 1 : 0));
+    if (!stuck && t->failed < USB_PORT_TRIES) t->failed++;
+    t->at = t->failed >= USB_PORT_TRIES && !stuck ? CLOCK_NEVER : clock_after(NS_PER_S << (t->count ? t->count - 1 : 0));
 }
 /* A device is there, and another try is to come. */
 static inline bool usb_port_trying(const struct usb_port_tries *t) {
@@ -171,12 +174,13 @@ void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, 
                    unsigned extra_len, const struct usb_endpoint_desc *ep);
 void usbhid_work(struct usb_device *d);       /* the keyboard lights asked for */
 bool usbhub_prepare(struct usb_device *d);    /* configured: reads the hub descriptor and calls usb_hub_info */
+bool usbhub_set_depth(struct usb_device *d);  /* configured as a hub: tells it its tier */
 bool usbhub_reset_port(struct usb_device *hub, unsigned port); /* reset the device on it; true once enabled */
 void usbhub_attach(struct usb_device *d, const struct usb_endpoint_desc *ep);
 void usbhub_work(struct usb_device *d);       /* port changes noticed by its interrupt endpoint */
 bool usbhub_pending(struct usb_device *d);    /* port changes not handled yet, or a port's next try */
 bool usbhub_trying(struct usb_device *d);     /* a device at a port is yet to get another try */
-void usbhub_reports_lost(struct usb_device *d); /* its status change endpoint was given up */
+void usbhub_reports_lost(struct usb_device *d, uint8_t address); /* endpoint `address` was given up */
 /* class drivers that read the whole configuration: does one of its interfaces suit them, and
  * take the device once it is configured */
 bool usbmsc_claims(const struct usb_interface_desc *intf);
