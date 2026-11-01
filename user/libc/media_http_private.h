@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include "http.h"
 
-/* Single-owner synchronous anonymous HTTP(S) reader. Not a browser fetch API. */
+/* Single-owner anonymous HTTP(S) reader. Not a browser fetch API. */
 #define NMEDIA_HTTP_CACHE_BYTES (256u * 1024u)
 #define NMEDIA_HTTP_COMPLETE_BYTES (16u * 1024u * 1024u)
 typedef struct nmedia_http nmedia_http;
@@ -21,6 +21,9 @@ nmedia_http *nmedia_http_open_cors(const char *url, const char *document_url,
  * Returned bytes belong to nmedia_ff_free, including the zero-length case. */
 bool nmedia_http_get_bounded_cors(const char *url, const char *document_url,
     size_t maximum, uint8_t **bytes, size_t *length, char *error, size_t error_size);
+/* From here a thread of the reader fetches ahead of the reads, as much as this rate needs (0: not
+   known). Without room for it reads go on fetching one block as they need it. */
+void nmedia_http_read_ahead(nmedia_http *reader, int64_t bytes_per_second);
 int nmedia_http_read(nmedia_http *reader, void *out, int count);
 int64_t nmedia_http_seek(nmedia_http *reader, int64_t offset, int whence);
 int64_t nmedia_http_size(const nmedia_http *reader);

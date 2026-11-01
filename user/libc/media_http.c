@@ -1,6 +1,10 @@
 /* Anonymous Range input over Nocturne's verified TLS / HTTP client.
- * One 256 KiB cache, private media quota, no FF network protocols or global
- * cookies. Refills are synchronous: this is not asynchronous streaming.
+ * One window of the resource, private media quota, no FF network protocols or
+ * global cookies. Until nmedia_http_read_ahead a read past the window fetches
+ * one 256 KiB block while it waits. After it a thread of the reader keeps one
+ * response streaming into the window ahead of the reads, so a read waits only
+ * when the network has not kept up; TCP's window holds the server back while
+ * the window is full.
  * RFC 9110 sections 13.1.5 and 14: never splice different representations. */
 #include "media_http_private.h"
 #include "media_alloc_private.h"
@@ -10,18 +14,39 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <threads.h>
+#include <time.h>
+#include <nocturne.h>
 
 #define MEDIA_HTTP_TIMEOUT_MS 5000
+/* The read-ahead: this much media time at the resource's rate, and never less
+   than AHEAD_LEAST (a rate may be unknown or too low). A demuxer steps back
+   between interleaved tracks: a quarter of it stays behind the reads. */
+#define MEDIA_HTTP_AHEAD_SECONDS 20
+#define MEDIA_HTTP_AHEAD_LEAST (4u * 1024u * 1024u)
+#define MEDIA_HTTP_ATTEMPTS 3 /* responses in a row that bring nothing before it is an error */
 struct nmedia_http {
     char *url;
     char etag[160], modified[30], error[160];
     uint8_t *complete;
     bool use_modified, need_complete;
     char *origin; /* common HTTP origin owns an exact malloc string */
-    int64_t size, position, cache_start;
-    size_t cache_len;
+    int64_t size, position;
     bool initialized, browser, cross;
-    unsigned char cache[NMEDIA_HTTP_CACHE_BYTES];
+    /* The bytes held: [held_from, held_to) of the resource, each at its offset
+       modulo capacity. */
+    uint8_t *window;
+    size_t capacity, behind;
+    int64_t held_from, held_to;
+    /* While fetching: the thread appends past held_to and the reader moves
+       position, both under lock; moved wakes either when the other has. A read
+       outside what is coming starts the next generation there. */
+    mtx_t lock;
+    cnd_t moved;
+    thrd_t thread;
+    bool fetching, stopping;
+    uint64_t generation;
+    char fetch_error[160];
 };
 struct transfer {
     nmedia_http *reader;
@@ -30,7 +55,8 @@ struct transfer {
     size_t got, expected;
     bool have_range, have_length, have_encoding, have_type, have_etag;
     bool have_date, have_modified;
-    bool checked, discard;
+    bool checked, discard, stream;
+    uint64_t generation;
     bool have_origin, have_methods, have_headers;
     char *allow_origin, *allow_methods, *allow_headers;
     char *location;
@@ -160,15 +186,15 @@ static int cors_field(struct transfer *t,const char *value,size_t length,
 }
 /* The variable document origin can exceed the old stack header arrays. Keep
  * exact request storage alive through the synchronous HTTP call only. */
-static char *request_headers(nmedia_http *r,const char *fields) {
+static char *request_headers(const nmedia_http *r,const char *fields,char *error,size_t error_size) {
     size_t field_size=strlen(fields),origin_size=r->browser?strlen(r->origin):0;
     size_t framing=r->browser?sizeof "Origin: \r\n"-1:0;
     if(origin_size>SIZE_MAX-framing-1||field_size>SIZE_MAX-origin_size-framing-1){
-        snprintf(r->error,sizeof r->error,"media request header size overflow");return NULL;
+        snprintf(error,error_size,"media request header size overflow");return NULL;
     }
     size_t length=origin_size+framing+field_size;
     char *owned=nmedia_ff_malloc(length+1);
-    if(!owned){snprintf(r->error,sizeof r->error,"media request header allocation failed");return NULL;}
+    if(!owned){snprintf(error,error_size,"media request header allocation failed");return NULL;}
     char *at=owned;
     if(r->browser){memcpy(at,"Origin: ",8);at+=8;memcpy(at,r->origin,origin_size);at+=origin_size;memcpy(at,"\r\n",2);at+=2;}
     memcpy(at,fields,field_size+1);return owned;
@@ -259,8 +285,9 @@ static int check_response(struct transfer *t) {
     nmedia_http *r = t->reader;
     if(cors(t)<0)return -1; /* before any bytes enter the decoder's cache */
     if (t->response->status == 206) {
+        /* RFC 9110 14.2: an open range may come back shorter; the next response goes on from there. */
         if (!t->have_range || t->range_first != t->first || t->range_last > t->last ||
-            t->range_last != (t->total-1 < t->last ? t->total-1 : t->last))
+            (!t->stream && t->range_last != (t->total-1 < t->last ? t->total-1 : t->last)))
             return rejected(t, "Range response does not match requested bytes");
         t->expected = (size_t)(t->range_last - t->range_first + 1);
         if ((t->have_length && t->length != (int64_t)t->expected) ||
@@ -278,20 +305,28 @@ static int check_response(struct transfer *t) {
             return rejected(t, "server ignored Range; unbounded download refused");
         t->total = t->length; t->expected = (size_t)t->length;
     } else return rejected(t, "media server did not return 200/206");
-    if (!t->expected || t->expected > NMEDIA_HTTP_CACHE_BYTES) return rejected(t, "media cache limit");
+    if (!t->expected || (!t->stream && t->expected > NMEDIA_HTTP_CACHE_BYTES)) return rejected(t, "media cache limit");
     t->checked = true;
     return 0;
+}
+static void window_put(nmedia_http *r, int64_t at, const char *bytes, size_t size) {
+    size_t offset = (size_t)((uint64_t)at % r->capacity), first = MIN(size, r->capacity-offset);
+    memcpy(r->window+offset, bytes, first); memcpy(r->window, bytes+first, size-first);
+}
+static void window_get(const nmedia_http *r, int64_t at, void *out, size_t size) {
+    size_t offset = (size_t)((uint64_t)at % r->capacity), first = MIN(size, r->capacity-offset);
+    memcpy(out, r->window+offset, first); memcpy((char *)out+first, r->window, size-first);
 }
 static int body(void *opaque, const char *bytes, size_t size) {
     struct transfer *t = opaque;
     if (redirect_status(t->response->status)) { t->discard = true; return -1; }
     if (!t->checked && check_response(t) < 0) return -1;
     if (size > t->expected - t->got) return rejected(t, "Range response body exceeds advertised bytes");
-    memcpy(t->reader->cache + t->got, bytes, size); t->got += size;
+    window_put(t->reader, t->first + (int64_t)t->got, bytes, size); t->got += size;
     return 0;
 }
 static bool refill(nmedia_http *r, int64_t at) {
-    r->cache_len = 0;
+    r->held_from = r->held_to = at;
     /* Cross-origin refills send only a safelisted single Range. Each response
      * must still match the pinned strong validator and total before body bytes
      * enter the cache. Same-origin refills additionally send If-Range. */
@@ -306,7 +341,7 @@ static bool refill(nmedia_http *r, int64_t at) {
             (long long)t.first, (long long)t.last, conditional ? "If-Range: " : "", conditional ? validator : "",
             conditional ? "\r\n" : "");
         if (n < 0 || (size_t)n >= sizeof fields) { snprintf(r->error,sizeof r->error,"media request field size overflow"); return false; }
-        char *headers=request_headers(r,fields);if(!headers)return false;
+        char *headers=request_headers(r,fields,r->error,sizeof r->error);if(!headers)return false;
         struct http_req request = { .url = r->url, .headers = headers, .timeout_ms = MEDIA_HTTP_TIMEOUT_MS,
             .on_header = header, .on_body = body, .ctx = &t };
         int result = http_request(&request, &response);
@@ -322,7 +357,7 @@ static bool refill(nmedia_http *r, int64_t at) {
         if (result == 0 && !t.checked) result = check_response(&t);
         bool ok = result == 0 && t.checked && t.got == t.expected;
         if (ok) {
-            r->size = t.total; r->cache_start = at; r->cache_len = t.got;
+            r->size = t.total; r->held_to = at + (int64_t)t.got;
             if (!r->initialized) {
                 if(strong_tag(t.etag))memcpy(r->etag,t.etag,strlen(t.etag)+1);
                 else if(strong_modified(&t)){memcpy(r->modified,t.modified,strlen(t.modified)+1);r->use_modified=true;}
@@ -379,7 +414,7 @@ bool nmedia_http_get_bounded_cors(const char *url,const char *document_url,size_
     for(unsigned redirects=0;redirects<=5;redirects++){
         struct http_resp response;
         struct download d={.t={.reader=r,.response=&response},.maximum=maximum};
-        char *headers=request_headers(r,"Accept-Encoding: identity\r\n");
+        char *headers=request_headers(r,"Accept-Encoding: identity\r\n",r->error,sizeof r->error);
         if(!headers)break;
         struct http_req request={.url=r->url,.headers=headers,.timeout_ms=MEDIA_HTTP_TIMEOUT_MS,
             .on_header=header,.on_body=download_body,.ctx=&d};
@@ -411,7 +446,9 @@ static nmedia_http *open_reader(const char *url,const char *document_url,char *e
         return NULL;
     }
     nmedia_http *r = nmedia_ff_mallocz(sizeof *r);
-    if (!r) { if(error&&error_size)snprintf(error,error_size,"media HTTP cache allocation");return NULL; }
+    if (r) r->window = nmedia_ff_malloc(NMEDIA_HTTP_CACHE_BYTES);
+    if (!r || !r->window) { nmedia_http_close(r); if(error&&error_size)snprintf(error,error_size,"media HTTP cache allocation");return NULL; }
+    r->capacity = NMEDIA_HTTP_CACHE_BYTES; mtx_init(&r->lock, mtx_plain); cnd_init(&r->moved);
     r->url=url_join(NULL,0,NULL,0,url,strlen(url));
     if(!r->url){if(error&&error_size)snprintf(error,error_size,"media URL storage allocation failed");nmedia_http_close(r);return NULL;}
     if(document_url&&!reader_origin(r,document_url)) {
@@ -435,27 +472,158 @@ nmedia_http *nmedia_http_open_cors(const char *url,const char *document_url,char
     if(!document_url){if(error&&error_size)snprintf(error,error_size,"native document origin required");return NULL;}
     return open_reader(url,document_url,error,error_size);
 }
+/* What the reader has passed by more than behind may go; the room left. Under lock. */
+static size_t window_room(nmedia_http *r) {
+    int64_t keep = r->position - (int64_t)r->behind;
+    if (keep > r->held_from) r->held_from = MIN(keep, r->held_to);
+    return r->capacity - (size_t)(r->held_to - r->held_from);
+}
+static int stream_cancelled(void *opaque) {
+    const struct transfer *t = opaque;
+    return __atomic_load_n(&t->reader->stopping, __ATOMIC_RELAXED) ||
+        __atomic_load_n(&t->reader->generation, __ATOMIC_RELAXED) != t->generation;
+}
+static int stream_body(void *opaque, const char *bytes, size_t size) {
+    struct transfer *t = opaque;
+    nmedia_http *r = t->reader;
+    if (redirect_status(t->response->status)) { t->discard = true; return -1; }
+    if (!t->checked && check_response(t) < 0) return -1;
+    if (size > t->expected - t->got) return rejected(t, "Range response body exceeds advertised bytes");
+    mtx_lock(&r->lock);
+    while (size) {
+        if (r->stopping || r->generation != t->generation) { mtx_unlock(&r->lock); t->discard = true; return -1; }
+        size_t room = window_room(r);
+        if (!room) { cnd_wait(&r->moved, &r->lock); continue; }
+        size_t take = MIN(room, size);
+        window_put(r, r->held_to, bytes, take);
+        r->held_to += (int64_t)take; bytes += take; size -= take; t->got += take;
+        cnd_broadcast(&r->moved);
+    }
+    mtx_unlock(&r->lock);
+    return 0;
+}
+/* One response from at to the end of the resource, while generation stands. */
+static void stream_from(nmedia_http *r, int64_t at, uint64_t generation, char *error, size_t error_size) {
+    struct http_resp response;
+    struct transfer t = { .reader = r, .response = &response, .first = at, .last = INT64_MAX,
+        .stream = true, .generation = generation };
+    const char *validator = r->use_modified ? r->modified : r->etag;
+    bool conditional = !r->cross && *validator;
+    char fields[320];
+    int n = snprintf(fields, sizeof fields, "Range: bytes=%lld-\r\nAccept-Encoding: identity\r\n%s%s%s",
+        (long long)at, conditional ? "If-Range: " : "", conditional ? validator : "", conditional ? "\r\n" : "");
+    if (n < 0 || (size_t)n >= sizeof fields) { snprintf(error, error_size, "media request field size overflow"); return; }
+    char *headers = request_headers(r, fields, error, error_size);
+    if (!headers) return;
+    struct http_req request = { .url = r->url, .headers = headers, .timeout_ms = MEDIA_HTTP_TIMEOUT_MS,
+        .on_header = header, .on_body = stream_body, .ctx = &t };
+    static const struct http_stream_hooks hooks = { .cancelled = stream_cancelled };
+    int result = http_request_stream(&request, &response, 0, &hooks);
+    nmedia_ff_free(headers);
+    if (result == 0 && !t.checked) result = check_response(&t);
+    if ((result != 0 || t.got != t.expected) && !t.discard)
+        snprintf(error, error_size, "%s", t.error[0] ? t.error : response.error[0] ? response.error : "media HTTP transfer failed or cut short");
+    http_resp_free(&response); transfer_free(&t);
+}
+/* A response that brought bytes and ended early (a server closes a connection the full window
+   has held back) goes on from where it stopped. One that brought none is tried again after a
+   pause; when the attempts run out it is the reader's error at the end of what is held. */
+static int fetcher(void *opaque) {
+    nmedia_http *r = opaque;
+    unsigned failures = 0;
+    mtx_lock(&r->lock);
+    while (!r->stopping) {
+        int64_t at = r->held_to;
+        uint64_t generation = r->generation;
+        if (at >= r->size || r->fetch_error[0] || !window_room(r)) { cnd_wait(&r->moved, &r->lock); continue; }
+        mtx_unlock(&r->lock);
+        char error[sizeof r->fetch_error] = {0};
+        stream_from(r, at, generation, error, sizeof error);
+        mtx_lock(&r->lock);
+        if (r->generation != generation || r->held_to != at || at >= r->size) { failures = 0; continue; }
+        if (++failures >= MEDIA_HTTP_ATTEMPTS) {
+            snprintf(r->fetch_error, sizeof r->fetch_error, "%s", error[0] ? error : "media HTTP transfer failed or cut short");
+            failures = 0;
+            cnd_broadcast(&r->moved);
+            continue;
+        }
+        struct timespec until;
+        timespec_get(&until, TIME_UTC);
+        until.tv_sec += 1;
+        while (!r->stopping && r->generation == generation && cnd_timedwait(&r->moved, &r->lock, &until) != thrd_timedout) {}
+    }
+    mtx_unlock(&r->lock);
+    return 0;
+}
+void nmedia_http_read_ahead(nmedia_http *r, int64_t bytes_per_second) {
+    if (!r || r->fetching || r->complete || r->error[0] || (r->held_from == 0 && r->held_to == r->size)) return;
+    size_t ahead = MEDIA_HTTP_AHEAD_LEAST;
+    if (bytes_per_second > 0 && (uint64_t)bytes_per_second < SIZE_MAX / 2 / MEDIA_HTTP_AHEAD_SECONDS)
+        ahead = MAX(ahead, (size_t)bytes_per_second * MEDIA_HTTP_AHEAD_SECONDS);
+    size_t behind = ahead / 4, capacity = ahead + behind;
+    if ((uint64_t)r->size < capacity) capacity = (size_t)r->size;
+    if (capacity <= r->capacity) capacity = r->capacity;
+    uint8_t *window = nmedia_ff_malloc(capacity);
+    if (!window) return; /* each read past the block fetches the next, as before this call */
+    for (int64_t at = r->held_from; at < r->held_to;) {
+        size_t from = (size_t)((uint64_t)at % r->capacity), to = (size_t)((uint64_t)at % capacity);
+        size_t take = MIN(MIN(r->capacity-from, capacity-to), (size_t)(r->held_to-at));
+        memcpy(window+to, r->window+from, take);
+        at += (int64_t)take;
+    }
+    nmedia_ff_free(r->window);
+    r->window = window; r->capacity = capacity; r->behind = behind;
+    if (thrd_create(&r->thread, fetcher, r) == thrd_success) r->fetching = true;
+}
 int nmedia_http_read(nmedia_http *r, void *out, int count) {
     if (!r || !out || count <= 0 || r->error[0]) return -1;
     if (r->position == r->size) return 0;
     if(r->complete){size_t take=(size_t)(r->size-r->position);if(take>(size_t)count)take=(size_t)count;
         memcpy(out,r->complete+r->position,take);r->position+=(int64_t)take;return (int)take;}
-    if (r->position < r->cache_start || r->position-r->cache_start >= (int64_t)r->cache_len) {
-        int64_t at = r->position / NMEDIA_HTTP_CACHE_BYTES * NMEDIA_HTTP_CACHE_BYTES;
-        if (!refill(r,at)) return -1;
+    mtx_lock(&r->lock);
+    while (r->position < r->held_from || r->position >= r->held_to) {
+        if (!r->fetching) {
+            mtx_unlock(&r->lock);
+            if (!refill(r, r->position / NMEDIA_HTTP_CACHE_BYTES * NMEDIA_HTTP_CACHE_BYTES)) return -1;
+            mtx_lock(&r->lock);
+        } else if (r->position < r->held_from || r->position - r->held_to > NMEDIA_HTTP_CACHE_BYTES) {
+            /* Not what the response on its way will bring soon. */
+            __atomic_store_n(&r->generation, r->generation + 1, __ATOMIC_RELAXED);
+            r->held_from = r->held_to = r->position;
+            r->fetch_error[0] = 0;
+            cnd_broadcast(&r->moved);
+        } else if (r->fetch_error[0]) {
+            snprintf(r->error, sizeof r->error, "%s", r->fetch_error);
+            mtx_unlock(&r->lock);
+            return -1;
+        } else cnd_wait(&r->moved, &r->lock);
     }
-    size_t offset = (size_t)(r->position-r->cache_start), take = r->cache_len-offset;
-    if (take > (size_t)count) take = (size_t)count;
-    memcpy(out,r->cache+offset,take);r->position+=(int64_t)take;return (int)take;
+    size_t take = MIN((size_t)count, (size_t)(r->held_to - r->position));
+    window_get(r, r->position, out, take);
+    r->position += (int64_t)take;
+    if (r->fetching) cnd_broadcast(&r->moved);
+    mtx_unlock(&r->lock);
+    return (int)take;
 }
 int64_t nmedia_http_seek(nmedia_http *r, int64_t offset, int whence) {
     if (!r || r->error[0]) return -1;
     int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? r->position : whence == SEEK_END ? r->size : -1;
     if (base < 0 || offset < -base || offset > r->size-base) return -1;
-    r->position=base+offset;return r->position;
+    mtx_lock(&r->lock);
+    r->position=base+offset;
+    if (r->fetching) cnd_broadcast(&r->moved);
+    mtx_unlock(&r->lock);
+    return base+offset;
 }
 int64_t nmedia_http_size(const nmedia_http *r) { return r ? r->size : -1; }
 const char *nmedia_http_error(const nmedia_http *r) { return r ? r->error : "no HTTP media reader"; }
 void nmedia_http_close(nmedia_http *r) {
-    if(r){free(r->origin);nmedia_ff_free(r->url);nmedia_ff_free(r->complete);}nmedia_ff_free(r);
+    if (r && r->fetching) {
+        mtx_lock(&r->lock);
+        __atomic_store_n(&r->stopping, true, __ATOMIC_RELAXED);
+        cnd_broadcast(&r->moved);
+        mtx_unlock(&r->lock);
+        thrd_join(r->thread, NULL);
+    }
+    if(r){free(r->origin);nmedia_ff_free(r->url);nmedia_ff_free(r->complete);nmedia_ff_free(r->window);}nmedia_ff_free(r);
 }

@@ -6,6 +6,7 @@
 #include "html_lexbor.h"
 #include "html_encoding.h"
 #include "html_policy.h"
+#include "avmedia.h"
 #include <lexbor/html/tree/insertion_mode.h>
 #include <lexbor/html/tokenizer/state.h>
 #include <lexbor/html/encoding.h>
@@ -94,6 +95,7 @@ bool html_parser_meta_encoding(struct html_parser *p,lxb_html_token_t *token){
    return its token; NULL/non-OK is a fatal parser error, not a resumable pause. */
 static lxb_html_token_t *token_done(lxb_html_tokenizer_t *tkz, lxb_html_token_t *token, void *ctx) {
     struct html_parser *p = ctx;
+    web_avmedia_checkpoint();
     lxb_html_tree_t *tree = p->lex->tree;
     lxb_dom_node_t *current = lxb_html_tree_current_node(tree);
     if (!p->fragment && token->tag_id==LXB_TAG_META && !(token->type&LXB_HTML_TOKEN_TYPE_CLOSE) &&

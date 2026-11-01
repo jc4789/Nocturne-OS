@@ -241,6 +241,10 @@ static nmedia *open_url(const char *url, const char *document_url, char *error, 
     if (!m->http) { nmedia_close(m);return NULL; }
     m->size = (size_t)nmedia_http_size(m->http);
     if (!open_input(m,error,error_size)) { nmedia_close(m);return NULL; }
+    /* A decoder must not wait for the network between two packets: the sound ahead of the sink
+       lasts a fraction of the time one fetch takes. */
+    nmedia_http_read_ahead(m->http, m->format->bit_rate > 0 ? m->format->bit_rate / 8 :
+        m->info.duration_ms > 0 ? (int64_t)m->size * 1000 / m->info.duration_ms : 0);
     return m;
 }
 nmedia *nmedia_open_url(const char *url, char *error, size_t error_size) {

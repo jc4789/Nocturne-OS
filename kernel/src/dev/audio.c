@@ -41,6 +41,8 @@ struct stream {
     uint32_t device_pending;
     uint32_t retained; /* the last of device_pending, still in the ring before tail */
     bool clock_error;
+    uint64_t dry_since; /* when its sink had played all it had, while no PCM has come since; or 0 */
+    uint64_t underruns, underrun_ns;
     struct thread *writer; /* the one submit copying past head; another waits for it */
     struct object object; /* an app's stream: what its handle reaches */
 };
@@ -256,6 +258,7 @@ static void played_locked(uint64_t ordinal,uint64_t at){
             s->issued_head=(at_run+1)&(RUNS-1);s->issued_count--;
         }
         if(s->retained>s->device_pending)s->retained=s->device_pending; /* played: the writer may reuse it */
+        if(!s->dry_since&&s->committed_bytes&&s->head==s->tail&&!s->device_pending)s->dry_since=at;
     }
     streams_changed();
 }
@@ -618,6 +621,7 @@ static void stream_drop(struct stream *s, bool flush) {
     s->tail = s->head;
     s->committed_bytes = 0; s->issued_head = s->issued_count = 0; s->device_pending = 0; s->retained = 0;
     s->generation++; s->clock_error = false;
+    s->dry_since = s->underruns = s->underrun_ns = 0;
     if (flush && audio_trace_active) for (int i = 0; i < MAX_STREAMS; i++)
         if (streams[i] == s) trace.stream[i].flushes++;
     streams_changed();
@@ -721,6 +725,12 @@ int64_t audio_stream_submit(struct handle *h, const void *frames, size_t count, 
         if (!bad) bad = copy_from_user(s->ring, p + done + first, c - first);
         fl = spin_lock(&audio_lock);
         if (bad) { error = -N_ERR_BAD_ADDRESS; break; }
+        if (s->dry_since) {
+            uint64_t now = clock_now_ns();
+            s->underruns++;
+            s->underrun_ns += now > s->dry_since ? now - s->dry_since : 0;
+            s->dry_since = 0;
+        }
         s->head += c;
         s->committed_bytes += c;
         trace_commit(s, c);
@@ -735,15 +745,15 @@ int64_t audio_stream_submit(struct handle *h, const void *frames, size_t count, 
 }
 
 /* How far ahead of the sink the stream is, and how much of it was played: its frames before the
-   last ordinal its sink reported, heard at sink_played_at (the ABI has no field for that time
-   yet). */
+   last ordinal its sink reported, heard at sink_played_at. */
 static struct n_audio_status status_of(const struct stream *s) {
     uint32_t software=(s->head-s->tail)/AUDIO_FRAME;
     uint64_t committed=s->committed_bytes/AUDIO_FRAME;
     uint64_t remaining=(uint64_t)software+s->device_pending;
     return (struct n_audio_status){.queued_frames=software,.device_pending_frames=s->device_pending,
         .played_frames=committed>=remaining?committed-remaining:0,.committed_frames=committed,
-        .generation=s->generation,.flags=remotes?N_AUDIO_CLOCK_REMOTE:card_fill?N_AUDIO_CLOCK_DEVICE:N_AUDIO_CLOCK_ESTIMATED};
+        .generation=s->generation,.flags=remotes?N_AUDIO_CLOCK_REMOTE:card_fill?N_AUDIO_CLOCK_DEVICE:N_AUDIO_CLOCK_ESTIMATED,
+        .underruns=s->underruns,.underrun_ns=s->underrun_ns,.played_at_ns=sink_played_at};
 }
 
 /* Any CPU. */

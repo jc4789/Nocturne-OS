@@ -554,7 +554,10 @@ struct n_shared_range {
 #define POWER_REBOOT 1
 
 /* n_audio_status: where a stream stands. Device time counts this stream's
- * consumed PCM only. */
+ * consumed PCM only: played_frames, heard at the monotonic clock time
+ * played_at_ns (a pair: the time the sink last reported its position).
+ * An underrun: its sink played all it had, and PCM came later; underrun_ns is
+ * the time between (both since the last flush). */
 struct n_audio_status {
     uint32_t queued_frames;
     uint32_t device_pending_frames;
@@ -562,6 +565,9 @@ struct n_audio_status {
     uint64_t committed_frames;
     uint32_t generation;
     uint32_t flags;
+    uint64_t underruns;
+    uint64_t underrun_ns;
+    uint64_t played_at_ns;
 };
 #define N_AUDIO_CLOCK_DEVICE 1u
 #define N_AUDIO_CLOCK_ESTIMATED 2u
