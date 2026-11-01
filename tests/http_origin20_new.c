@@ -15,7 +15,7 @@ static void *count_malloc(size_t n){if(fail_malloc&&! --fail_malloc)return NULL;
 static void *count_calloc(size_t n,size_t s){void*p=calloc(n,s);if(p)live++;return p;}
 static void *count_realloc(void*p,size_t n){void*q=realloc(p,n);if(q&&!p)live++;return q;}
 static void count_free(void*p){if(p){live--;free(p);}}
-static uint64_t uptime_ms(void){return 100;}
+static uint64_t n_clock_monotonic(void){return (uint64_t)(100)*1000000ULL;}
 #define malloc count_malloc
 #define calloc count_calloc
 #define realloc count_realloc

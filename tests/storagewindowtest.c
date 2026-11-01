@@ -55,8 +55,8 @@ static web_doc *document(struct tab *tab,const char *suffix){
     return web_live(page,sizeof page-1,url,"utf-8",&host);
 }
 static void pump(web_doc *a,web_doc *b,web_doc *c,web_doc *d,unsigned ms){
-    uint64_t end=uptime_ms()+ms;
-    while(uptime_ms()<end){uint64_t now=uptime_ms();if(a)web_tick(a,now);if(b)web_tick(b,now);if(c)web_tick(c,now);if(d)web_tick(d,now);n_sleep_ms(1);}
+    uint64_t end=(n_clock_monotonic() / N_NS_PER_MS)+ms;
+    while((n_clock_monotonic() / N_NS_PER_MS)<end){uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);if(a)web_tick(a,now);if(b)web_tick(b,now);if(c)web_tick(c,now);if(d)web_tick(d,now);n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}
 }
 static void eval(web_doc *d,const char *code){web_console_eval(d,code,strlen(code));}
 static volatile uint32_t lease_stage;
@@ -72,7 +72,7 @@ static bool run_child(char **argv,const char *mode,const char *argument){
     const char *child_argv[]={argv[0],mode,argument};
     struct n_launch launch={.arguments=child_argv,.argument_count=3};
     n_handle child=n_app_launch(argv[0],&launch);int status=-1;
-    bool ok=child>=0&&n_app_result(child,-1,&status)>=0&&status==0;
+    bool ok=child>=0&&n_app_result(child,N_CLOCK_NEVER,&status)>=0&&status==0;
     if(child>=0)n_handle_close(child);
     return ok;
 }
@@ -101,9 +101,9 @@ int main(int argc,char **argv){
     n_handle lease=n_document_open(lease_path,N_DOCUMENT_CREATE);check(lease>=0&&n_document_claim(lease,false)==0,"lease-owner-lock");
     n_handle other=n_document_open(lease_path,N_DOCUMENT_EDIT);check(other>=0&&n_document_release(other)<0,"lease-other-handle-cannot-release");if(other>=0)n_handle_close(other);
     int tid=thread_create(lease_waiter,NULL);check(tid>0,"lease-waiter-created");
-    uint64_t deadline=uptime_ms()+1000;while(!lease_stage&&uptime_ms()<deadline)n_sleep_ms(1);
-    n_sleep_ms(20);check(lease_stage==1,"lease-separate-open-waits");n_handle_close(lease);
-    deadline=uptime_ms()+1000;while(lease_stage==1&&uptime_ms()<deadline)n_sleep_ms(1);
+    uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+1000;while(!lease_stage&&(n_clock_monotonic() / N_NS_PER_MS)<deadline)n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
+    n_sleep_until(n_clock_after(20 * N_NS_PER_MS));check(lease_stage==1,"lease-separate-open-waits");n_handle_close(lease);
+    deadline=(n_clock_monotonic() / N_NS_PER_MS)+1000;while(lease_stage==1&&(n_clock_monotonic() / N_NS_PER_MS)<deadline)n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
     check(lease_stage==2,"lease-last-close-releases");if(lease_stage!=1&&tid>0)thread_join(tid);n_entry_remove(lease_path);
     webstorage *a=webstorage_create(),*b=webstorage_create();struct web_storage_result out={0};
     n_handle queue=n_events_create();
@@ -174,7 +174,7 @@ int main(int argc,char **argv){
     check(usage_of(a,origin,&local,&session)&&local>0&&session==2*(1+7),"usage-counts-local-and-tab-session");
     eval(da,"window.beforeClear=received.length;");
     check(run_child(argv,"--clear",domain),"other-program-clears-site");
-    struct n_event events[8];n_result n=n_events_wait(queue,events,8,2000);
+    struct n_event events[8];n_result n=n_events_wait(queue,events,8,n_clock_after(2000 * N_NS_PER_MS));
     check(n>0,"clear-reaches-window-queue");if(n>0)webstorage_events(a,events,(size_t)n);
     pump(da,db,dc,NULL,250);
     eval(da,"ck(sessionStorage.length===0&&localStorage.length===0&&received.length===window.beforeClear,'user-agent-clear-empty-maps-no-event');");

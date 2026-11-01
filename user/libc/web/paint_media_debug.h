@@ -44,7 +44,7 @@ static uint64_t paint_debug_box_hash(uint64_t hash,const box_t *b) {
 }
 static void paint_debug_finish(web_doc *d) {
     if(!paint_debug_enabled)return;
-    uint64_t now=uptime_ms();size_t count=0;
+    uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);size_t count=0;
     for(node_t *n=paint_debug_media_next(d,NULL);n;n=paint_debug_media_next(d,n))count++;
     for(node_t *n=paint_debug_media_next(d,NULL);n;n=paint_debug_media_next(d,n)) {
         struct web_paint_diagnostic *p=n->paint_diagnostic;if(!p)continue;

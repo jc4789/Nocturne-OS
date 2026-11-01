@@ -99,7 +99,7 @@ static void autorun(void) {
     n_handle log = n_system_log_open();
     n_handle app = start(SH, "sh", AUTORUN, -1, log, NULL);
     if (log >= 0) n_handle_close(log);
-    if (app >= 0) n_app_result(app, -1, NULL);
+    if (app >= 0) n_app_result(app, N_CLOCK_NEVER, NULL);
     poweroff();
 }
 
@@ -161,7 +161,7 @@ int main(void) {
         /* desktop session: the desktop is the user's from here (the system has put the user's
            settings back before this app started), opened apps come from its icons and menu */
         autorun();
-        for (;;) n_sleep_ms(60000);
+        for (;;) n_sleep_until(n_clock_after(60000 * N_NS_PER_MS));
     }
     autorun();
     /* text session: keep a shell alive on the console this app was given */
@@ -170,11 +170,11 @@ int main(void) {
         if (sh < 0) {
             printf("init: cannot start " SH " (%s)\n", n_result_text(sh));
             fflush(stdout);
-            n_sleep_ms(5000);
+            n_sleep_until(n_clock_after(5000 * N_NS_PER_MS));
             continue;
         }
         int st = 0;
-        n_app_result(sh, -1, &st);
+        n_app_result(sh, N_CLOCK_NEVER, &st);
         n_handle_close(sh);
         printf("\ninit: shell exited (%d), restarting\n", st);
         fflush(stdout);

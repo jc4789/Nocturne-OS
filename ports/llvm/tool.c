@@ -35,6 +35,6 @@ int main(int argc, char **argv) {
         return 127;
     }
     int status = 0;
-    n_result r = n_app_result(app, -1, &status);
+    n_result r = n_app_result(app, N_CLOCK_NEVER, &status);
     return r < 0 ? 127 : status;
 }

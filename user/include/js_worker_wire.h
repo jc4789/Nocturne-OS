@@ -36,7 +36,7 @@ enum { NJW_START_CREATOR_POLICY=7, NJW_START_INHERIT_POLICY=8, NJW_START_SHARED=
        NJW_START_CROSS_ORIGIN_ISOLATED=12, NJW_START_STREAMING=13 };
 /* An NJW_LOADED's (a request's, never START's) array field: Fetch's report timing of a request
    whose client is the Worker (its importScripts and fetch), the record js.c's timing_value makes,
-   its times in monotonic milliseconds (n_clock_uptime_ms) for the Worker's own time origin to
+   its times in monotonic milliseconds (n_clock_monotonic / N_NS_PER_MS) for the Worker's own time origin to
    convert (Resource Timing in the Worker's performance timeline). Absent for a request with no
    report (aborted, or not HTTP(S)). */
 enum { NJW_LOADED_TIMING=7 };

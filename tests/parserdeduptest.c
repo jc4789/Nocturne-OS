@@ -11,7 +11,7 @@ static void check(bool ok,const char *name){checks++;if(!ok){failures++;printf("
 static void log_line(void *context,int level,const char *text){(void)context;if(level==2){errors++;printf("ERROR %s\n",text);}}
 static bool checkpoint(void *context){(void)context;return true;}
 static bool eval(web_doc *d,const char *source){return web_console_eval(d,source,strlen(source));}
-static void settle(web_doc *top,unsigned count){for(unsigned i=0;i<count;i++){web_tick(top,uptime_ms());n_sleep_ms(1);}}
+static void settle(web_doc *top,unsigned count){for(unsigned i=0;i<count;i++){web_tick(top,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}}
 static node_t *find_id(node_t *n,const char *id){
     if(!n)return NULL;if(n->id&&!strcmp(n->id,id))return n;
     for(node_t *c=n->first;c;c=c->next){node_t *found=find_id(c,id);if(found)return found;}
@@ -90,7 +90,7 @@ static void cancelled_render_resume(void){
     d->native_checkpoint_count=63;control.armed=true;
     web_layout(d,320,200);
     check(!control.inside_author&&d->native_cancelled&&!d->layout_valid&&!d->root_box,"autonomous native transaction cancelled without author stack");
-    web_tick(d,uptime_ms());
+    web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     check(!d->native_cancelled&&!d->native_recovery_pending&&d->layout_valid&&find_id(d->root,"go")==go,"normal tick rebuilds coherent rendering before author callbacks");
     settle(d,65);
     check(node_attr(d->body,"data-resumed")&&!strcmp(node_attr(d->body,"data-resumed"),"yes"),"queued author timer survives native-only cancellation");
@@ -269,14 +269,14 @@ int main(int argc,char **argv){
     struct web_host host={.console=log_line,.script_checkpoint=checkpoint,.js_task_budget_ms=5000};
     web_doc *top=web_live(page,strlen(page),"https://parser.test/","utf-8",&host);
     check(top!=NULL,"live document");if(!top)goto done;
-    uint64_t deadline=uptime_ms()+10000;web_doc *d=NULL,*srcdoc=NULL;
+    uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+10000;web_doc *d=NULL,*srcdoc=NULL;
     do{
         settle(top,1);
         struct web_frame *normal_frame=web_frame_find(top,find_id(top->root,"regular"));
         struct web_frame *srcdoc_frame=web_frame_find(top,find_id(top->root,"srcdoc"));
         if(normal_frame&&!normal_frame->detached)d=normal_frame->document;
         if(srcdoc_frame&&!srcdoc_frame->detached&&srcdoc_frame->document&&srcdoc_frame->document->html_srcdoc)srcdoc=srcdoc_frame->document;
-    }while((!d||!srcdoc)&&uptime_ms()<deadline);
+    }while((!d||!srcdoc)&&(n_clock_monotonic() / N_NS_PER_MS)<deadline);
     check(d!=NULL,"live child browsing context");if(!d)goto cleanup;
     check(!d->html_srcdoc,"normal about:blank context is not srcdoc");
     check(srcdoc!=NULL,"separate live srcdoc browsing context");

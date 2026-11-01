@@ -148,7 +148,7 @@ static int read_byte(void) {
     while (pos == len) {
         if (prompt_events >= 0) {
             struct n_event ev[2];
-            if (n_events_wait(prompt_events, ev, 2, -1) < 0) return -1;
+            if (n_events_wait(prompt_events, ev, 2, N_CLOCK_NEVER) < 0) return -1;
             if (take_interrupts()) return 3;
         }
         if (!cap && !(in = malloc(cap = 4096))) return -1;
@@ -552,7 +552,7 @@ static int wait_apps(n_handle *apps, int napps) {
     for (int i = 0; i < napps; i++) running += apps[i] >= 0;
     while (running > 0) {
         struct n_event ev[17];
-        n_result got = n_events_wait(q, ev, 17, -1);
+        n_result got = n_events_wait(q, ev, 17, N_CLOCK_NEVER);
         if (got < 0) break;
         for (int k = 0; k < (int)got; k++) {
             if (ev[k].token == UINT64_MAX) {

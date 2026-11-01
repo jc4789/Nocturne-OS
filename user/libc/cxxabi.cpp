@@ -5,16 +5,12 @@
 #include <new>
 #include <exception>
 
+#include <nocturne.h>
 extern "C" {
 void *malloc(size_t);
 void free(void *);
 [[noreturn]] void abort(void);
-int thread_id(void);
 int snprintf(char *, size_t, const char *, ...);
-int64_t n_channel_send(int32_t, const void *, size_t, int32_t);
-int wait_on_address(volatile uint32_t *, uint32_t, unsigned);
-int wake_address(volatile uint32_t *, unsigned);
-void yield(void);
 }
 
 namespace {
@@ -123,7 +119,7 @@ extern "C" int __cxa_guard_acquire(uint64_t *guard) {
             return 0;
         }
         if (expected == self) abort(); /* Recursive local-static initialization. */
-        if (wait_on_address(owner, expected, UINT32_MAX) < 0) yield();
+        if (wait_on_address(owner, expected, N_CLOCK_NEVER) < 0) yield();
     }
 }
 extern "C" void __cxa_guard_release(uint64_t *guard) {

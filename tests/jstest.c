@@ -206,7 +206,7 @@ static bool request(void *opaque, const struct web_request *r) {
                !strstr(q->body,"\"script-sample\"")||q->body_len>=sizeof q->body)f->policy_report_bad++;
         }
         const struct asset *a = lookup(q->url);
-        q->due = uptime_ms() + (a ? a->delay_ms : 0);
+        q->due = (n_clock_monotonic() / N_NS_PER_MS) + (a ? a->delay_ms : 0);
         f->requests++;
         if(f->net&&!strncmp(r->url,"http://10.0.2.2:",16)){
             struct webnet_request native={.kind=r->kind==WEB_RESOURCE_REPORT?WEBNET_REPORT:r->kind==WEB_RESOURCE_FETCH?WEBNET_FETCH:
@@ -290,7 +290,7 @@ static bool history_host(void *opaque, int op, const char *url, const void *data
     return true;
 }
 static void deliver(struct fixture *f) {
-    uint64_t now = uptime_ms();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
     for (int i = 0; i < SLOTS; i++) if (f->queue[i].used && !f->queue[i].transport_id && f->queue[i].due <= now) {
         struct queued q = f->queue[i]; f->queue[i].used = false;
         const struct asset *a = lookup(q.url);
@@ -373,9 +373,9 @@ static bool wait_request(void *opaque,uint64_t id,const bool *completed) {
     bool found=false;
     for(int i=0;i<SLOTS;i++)if(f->queue[i].used&&f->queue[i].id==id)found=true;
     if(!found)return *completed;
-    uint64_t end=uptime_ms()+5000;
+    uint64_t end=(n_clock_monotonic() / N_NS_PER_MS)+5000;
     f->native_wait=true;f->preload_joins++;
-    while(!*completed&&uptime_ms()<end){deliver(f);n_sleep_ms(1);}
+    while(!*completed&&(n_clock_monotonic() / N_NS_PER_MS)<end){deliver(f);n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}
     f->native_wait=false;return *completed;
 }
 static void close_case(void);
@@ -419,8 +419,8 @@ static void step(struct fixture *f) {
         }
     }
     deliver(f);
-    if(f->net)webnet_pump(f->net,uptime_ms());
-    web_tick(f->doc, uptime_ms());
+    if(f->net)webnet_pump(f->net,(n_clock_monotonic() / N_NS_PER_MS));
+    web_tick(f->doc, (n_clock_monotonic() / N_NS_PER_MS));
     if (web_dirty(f->doc)) {
         web_layout(f->doc, VW, VH);
         canvas_t c; gfx_init(&c, pixels, VW, VH, VW);
@@ -428,13 +428,13 @@ static void step(struct fixture *f) {
     }
 }
 static bool pump(const char *marker, unsigned timeout_ms) {
-    uint64_t end = uptime_ms() + timeout_ms;
-    while (uptime_ms() < end) {
+    uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + timeout_ms;
+    while ((n_clock_monotonic() / N_NS_PER_MS) < end) {
         step(&fixture);
         if(fixture.mark_allocation_failed)return false;
         if (marker && has_mark(&fixture, marker)) return true;
         if (!marker && !queued_count(&fixture) && web_deadline(fixture.doc) < 0) return true;
-        n_sleep_ms(1);
+        n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
     }
     return false;
 }
@@ -589,7 +589,7 @@ static void test_image_invalidation(void) {
     test_check("image-src-candidate-updated",image_url);
     test_check("image-data-attribute-not-a-candidate",!data_url);
     test_check("image-picture-source-updated",picture_url);
-    for(int i=0;i<30;i++){step(&fixture);n_sleep_ms(1);}
+    for(int i=0;i<30;i++){step(&fixture);n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}
     int previous_requests=fixture.requests;
     const char *idle="requestIdleCallback(()=>{globalThis.lastIdleImage=new Image();lastIdleImage.src='last-idle-image.svg';mark('last-idle-image-set');});";
     test_check("last-idle-image-queued",web_console_eval(fixture.doc,idle,strlen(idle)));
@@ -621,9 +621,9 @@ static void test_image_invalidation(void) {
     int future=0;
     for(int i=0;i<16;i++) {
         step(&fixture);web_layout(fixture.doc,VW,VH);
-        uint64_t now=uptime_ms();int64_t deadline=web_deadline(fixture.doc);
+        uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);int64_t deadline=web_deadline(fixture.doc);
         if(i>=8 && deadline>(int64_t)now)future++;
-        n_sleep_ms(1);
+        n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
     }
     test_check("image-queue-held-deadline-waits",future==8);
     test_check("image-queue-image-blocks-load",!has_mark(&fixture,"image-queue-load"));
@@ -1100,9 +1100,9 @@ static void test_execution_budget(const char *name, const char *source) {
     test_check("budget-page-allocation", page != NULL);
     if (!page) return;
     if (open_watchdog_case(page)) {
-        uint64_t start = uptime_ms();
+        uint64_t start = (n_clock_monotonic() / N_NS_PER_MS);
         bool stopped=pump(NULL,10000);
-        uint64_t elapsed = uptime_ms() - start;
+        uint64_t elapsed = (n_clock_monotonic() / N_NS_PER_MS) - start;
         int64_t deadline=web_deadline(fixture.doc);
         printf("BUDGET-TIME %s elapsed_ms=%lu settled=%d deadline=%lld\n",name,(unsigned long)elapsed,stopped?1:0,(long long)deadline);
         test_check(name,stopped);
@@ -1520,7 +1520,7 @@ static void test_input_snapshot(void) {
 }
 
 int main(int argc, char **argv) {
-    uint64_t start = uptime_ms();
+    uint64_t start = (n_clock_monotonic() / N_NS_PER_MS);
     /* Optional selectors make a failing feature reproducible in the real OS. */
 #define RUN(name, fn) do { if (argc == 1 || !strcmp(argv[1], name)) { printf("jstest: %s\n", name); fflush(stdout); fn(); } } while (0)
     RUN("language", test_language);
@@ -1649,6 +1649,6 @@ int main(int argc, char **argv) {
 #undef RUN
     test_check("at-least-one-case", total != 0);
     close_case();free_marks(&fixture);
-    printf("jstest: %d checks, %d failed (%lu ms)\n", total, failed, (unsigned long)(uptime_ms()-start));
+    printf("jstest: %d checks, %d failed (%lu ms)\n", total, failed, (unsigned long)((n_clock_monotonic() / N_NS_PER_MS)-start));
     return failed != 0;
 }

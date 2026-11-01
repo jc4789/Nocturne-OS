@@ -43,12 +43,12 @@ static char *text_of(const char *path) {
 static bool kept(const char *rel, const char *line, unsigned ms) {
     char path[1024];
     if (!app_data(rel, path, sizeof path)) return false;
-    for (uint64_t end = n_clock_uptime_ms() + ms;; n_sleep_ms(100)) {
+    for (uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + ms;; n_sleep_until(n_clock_after(100 * N_NS_PER_MS))) {
         char *text = text_of(path);
         bool found = text && strstr(text, line);
         free(text);
         if (found) return true;
-        if (n_clock_uptime_ms() >= end) {
+        if ((n_clock_monotonic() / N_NS_PER_MS) >= end) {
             printf("systemwatchtest: %s does not say \"%s\"\n", path, line + 1);
             return false;
         }
@@ -56,9 +56,9 @@ static bool kept(const char *rel, const char *line, unsigned ms) {
 }
 
 /* Whether q has a handle ready within ms. */
-static bool ready(n_handle q, int64_t ms) {
+static bool ready(n_handle q, uint64_t ms) {
     struct n_event ev[4];
-    return n_events_wait(q, ev, 4, ms) > 0;
+    return n_events_wait(q, ev, 4, n_clock_after(ms * N_NS_PER_MS)) > 0;
 }
 
 static struct n_audio_output sound(void) {

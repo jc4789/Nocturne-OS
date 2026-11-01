@@ -206,6 +206,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
         return -N_ERR_NO_MEMORY;
     }
     if (!(p->vmm_space = vmm_space_new())) goto fail;
+    if ((r = clock_map(p->vmm_space)) < 0) goto fail; /* the app reads its clocks there (abi.h) */
 
     uint64_t top = 0;
     program = program_get(doc);

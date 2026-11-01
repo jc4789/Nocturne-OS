@@ -10,7 +10,7 @@ static unsigned connect_delay,read_delay,handshake_reads=1,application_reads=1,c
 static int failure_mode,closed,read_count,checks,failed,last_timeouts[32];
 static bool engine_closed;
 #define CHECK(c) do{checks++;if(!(c)){failed++;printf("FAIL TLS deadline:%d %s\n",__LINE__,#c);}}while(0)
-uint64_t uptime_ms(void){return clock_ms;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(clock_ms)*1000000ULL;}
 bool net_wait_up(int timeout){(void)timeout;return true;}
 n_result net_resolve(const char *host,uint32_t *ip){(void)host;*ip=0x0a000202;return 0;}
 n_result net_resolve_all(const char *host,uint32_t *ips,size_t capacity,struct n_dns_result *result){

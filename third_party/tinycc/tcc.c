@@ -280,7 +280,7 @@ static unsigned getclock_ms(void)
 #ifdef _WIN32
     return GetTickCount();
 #else
-    return (unsigned)n_clock_uptime_ms();
+    return (unsigned)(n_clock_monotonic() / N_NS_PER_MS);
 #endif
 }
 

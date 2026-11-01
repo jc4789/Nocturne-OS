@@ -39,8 +39,8 @@ static n_handle handle_new(int kind) {
 }
 static bool handle_is(n_handle h, int kind) { return h >= 0 && h < 64 && handles[h].kind == kind; }
 
-uint64_t uptime_ms(void) { return clock_ms++; }
-uint64_t n_clock_uptime_ms(void) { return clock_ms++; }
+uint64_t n_clock_monotonic(void){return (uint64_t)(clock_ms++)*1000000ULL;}
+
 n_result n_app_self(void) { return 42; }
 n_result proclist(struct n_procinfo *out, int max) {
     if (max < 1) return 0;

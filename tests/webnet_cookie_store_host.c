@@ -23,7 +23,7 @@ struct webnet {
     uint64_t cookie_due, cookie_rules;
 };
 static uint64_t clock_ms = 1000;
-uint64_t uptime_ms(void) { return clock_ms; }
+uint64_t n_clock_monotonic(void){return (uint64_t)(clock_ms)*1000000ULL;}
 
 static unsigned char *doc;
 static size_t doc_n;
@@ -103,7 +103,7 @@ static webnet *window(void) {
     n->cookie_rules = webprefs_site_generation();
     (void)cookie_sync(n, false);
     webcookie_rule_changed(n->cookies);
-    cookie_note(n, uptime_ms());
+    cookie_note(n, (n_clock_monotonic() / N_NS_PER_MS));
     return n;
 }
 static void window_free(webnet *n) {
@@ -116,7 +116,7 @@ static void window_free(webnet *n) {
 static int set(webnet *n, const char *url, const char *value) {
     struct webcookie_context c = {url, url, "GET", true, true, false};
     int r = webcookie_set(n->cookies, &c, value, strlen(value), time(NULL));
-    cookie_note(n, uptime_ms());
+    cookie_note(n, (n_clock_monotonic() / N_NS_PER_MS));
     return r;
 }
 static bool sends(webnet *n, const char *url, const char *pair) {
@@ -130,7 +130,7 @@ static bool sends(webnet *n, const char *url, const char *pair) {
 }
 static bool settled(void) { return !opened && !claims; }
 /* The pump a second later: what waits is saved. */
-static void later(webnet *n) { clock_ms += 1000; cookie_pump(n, uptime_ms()); }
+static void later(webnet *n) { clock_ms += 1000; cookie_pump(n, (n_clock_monotonic() / N_NS_PER_MS)); }
 
 int main(int argc, char **argv) {
     FILE *f = fopen(argc > 1 ? argv[1] : "rootfs/Nocturne/Web/public_suffix_list.dat", "rb");
@@ -146,10 +146,10 @@ int main(int argc, char **argv) {
     CHECK(!doc_exists && settled());
     CHECK(set(a, "https://www.a.test/", "p=1; Max-Age=3600") == 1 && set(a, "https://www.a.test/", "s=1") == 1);
     clock_ms += 999;
-    cookie_pump(a, uptime_ms());
+    cookie_pump(a, (n_clock_monotonic() / N_NS_PER_MS));
     CHECK(!saves && a->cookie_due);
     clock_ms += 1;
-    cookie_pump(a, uptime_ms());
+    cookie_pump(a, (n_clock_monotonic() / N_NS_PER_MS));
     CHECK(saves == 1 && !a->cookie_due && !webcookie_changed(a->cookies) && settled());
 
     /* Another window reads it: the persistent cookie, never the session one. */

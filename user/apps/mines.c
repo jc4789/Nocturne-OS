@@ -50,7 +50,7 @@ static void plant(int sx, int sy) {
         n++;
     }
     started = true;
-    t0 = n_clock_uptime_ms();
+    t0 = (n_clock_monotonic() / N_NS_PER_MS);
 }
 
 static void reveal(int x, int y) {
@@ -59,7 +59,7 @@ static void reveal(int x, int y) {
     nopen++;
     if (mine[y][x]) {
         lost = true;
-        t_end = n_clock_uptime_ms();
+        t_end = (n_clock_monotonic() / N_NS_PER_MS);
         sound_effect(220, 30, 160, SND_NOISE);
         return;
     }
@@ -68,7 +68,7 @@ static void reveal(int x, int y) {
             for (int dx = -1; dx <= 1; dx++) reveal(x + dx, y + dy);
     if (nopen == GW * GH - MINES && !lost) {
         won = true;
-        t_end = n_clock_uptime_ms();
+        t_end = (n_clock_monotonic() / N_NS_PER_MS);
         sound_effect(523, 523, 50, SND_TRIANGLE);
         sound_effect(659, 659, 50, SND_TRIANGLE);
         sound_effect(784, 1047, 60, SND_TRIANGLE);
@@ -76,7 +76,7 @@ static void reveal(int x, int y) {
 }
 
 static int seconds(void) {
-    int secs = started ? (int)((((lost || won) ? t_end : n_clock_uptime_ms()) - t0) / 1000) : 0;
+    int secs = started ? (int)((((lost || won) ? t_end : (n_clock_monotonic() / N_NS_PER_MS)) - t0) / 1000) : 0;
     return secs > 999 ? 999 : secs;
 }
 
@@ -164,7 +164,7 @@ static void press(int x, int y, uint32_t buttons) {
 }
 
 int main(void) {
-    srand((unsigned)n_clock_uptime_ms());
+    srand((unsigned)(n_clock_monotonic() / N_NS_PER_MS));
     struct ui_session *s = ui_session_new();
     if (!s || ui_window(s, WINDOW, BW + 2 * PAD, BH + 3 * PAD + 40, 0, "Minesweeper", NULL, NULL) < 0) return 1;
     canvas_t *board = ui_surface(s, BOARD, BW, BH, 0);

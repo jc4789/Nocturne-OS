@@ -418,7 +418,7 @@ static int audio_output(nmedia *m, struct nmedia_output *o) {
     if(!m->audio_observation.id||m->audio_observation.codec!=codec||m->audio_observation.profile!=profile||
        m->audio_observation.channels!=(uint32_t)f->ch_layout.nb_channels||m->audio_observation.rate!=(uint32_t)f->sample_rate)
         m->audio_observation=(struct nmedia_audio_observation){.id=video_measurement_next(),.codec=codec,.profile=profile,.channels=(uint32_t)f->ch_layout.nb_channels,.rate=(uint32_t)f->sample_rate};
-    uint64_t work_start=uptime_ms();
+    uint64_t work_start=(n_clock_monotonic() / N_NS_PER_MS);
     int n = 0;
     uint64_t end = (uint64_t)f->nb_samples << 32;
     uint64_t start = m->phase;
@@ -652,14 +652,14 @@ static struct nmedia_video_configuration video_configuration(nmedia *m,AVFrame *
     }
     return c;
 }
-static uint64_t video_work_elapsed(uint64_t start){uint64_t now=uptime_ms();return now>=start?video_work_add(now-start,1):UINT64_MAX;}
+static uint64_t video_work_elapsed(uint64_t start){uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);return now>=start?video_work_add(now-start,1):UINT64_MAX;}
 static int video_receive(nmedia *m,AVCodecContext *c,AVFrame *f){
-    uint64_t start=uptime_ms();int result=avcodec_receive_frame(c,f);
+    uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);int result=avcodec_receive_frame(c,f);
     uint64_t *work=c==m->video?&m->video_decode_work:&m->audio_decode_work;
     *work=video_work_add(*work,video_work_elapsed(start));return result;
 }
 static int video_send(nmedia *m,AVCodecContext *c,const AVPacket *p){
-    uint64_t start=uptime_ms();int result=avcodec_send_packet(c,p);
+    uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);int result=avcodec_send_packet(c,p);
     uint64_t *work=c==m->video?&m->video_decode_work:&m->audio_decode_work;
     *work=video_work_add(*work,video_work_elapsed(start));return result;
 }
@@ -676,7 +676,7 @@ static int video_return(nmedia *m,AVFrame *f,int64_t pts,uint64_t decode_work,st
         m->video_configuration=configuration;m->video_measurement_id=video_measurement_next();
     }
     m->video_configuration.bitrate=configuration.bitrate;
-    uint64_t start=uptime_ms();
+    uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);
     int result=video_output(m,f,pts,o);
     if(result==NMEDIA_VIDEO){
         m->video_measured_frames=video_work_add(m->video_measured_frames,1);
@@ -725,7 +725,7 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
                 AVFrame *f = m->frame;
                 if (f->sample_rate < 1000 || f->sample_rate > 384000 || f->ch_layout.nb_channels < 1 || f->ch_layout.nb_channels > 8 || f->nb_samples <= 0 || f->nb_samples > 65536 || av_get_bytes_per_sample((enum AVSampleFormat)f->format) <= 0)
                     return fail(m, "audio frame limits", AVERROR(EINVAL));
-                uint64_t mix_start=uptime_ms();int mix_result=m->audio_native?0:audio_mix(m,&f->ch_layout);
+                uint64_t mix_start=(n_clock_monotonic() / N_NS_PER_MS);int mix_result=m->audio_native?0:audio_mix(m,&f->ch_layout);
                 m->audio_decode_work=video_work_add(m->audio_decode_work,video_work_elapsed(mix_start));
                 if(mix_result<0)return NMEDIA_ERROR;
                 AVStream *s = m->format->streams[m->audio_index];

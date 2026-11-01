@@ -107,7 +107,7 @@ bad:free(bytes);free(d);*failed=true;return NULL;
 static bool dedicated_wait(struct worker*w,int timeout){
     uint32_t interest=(w->closed?N_EVENT_CLOSED:N_EVENT_RECEIVABLE)|(w->output?N_EVENT_SENDABLE:0);
     if(!watch(w,CHANNEL,INPUT_TOKEN,&w->input_watched,interest))return false;
-    struct n_event events[64];n_result n=n_events_wait(w->queue,events,64,timeout);if(n<0)return false;
+    struct n_event events[64];n_result n=n_events_wait(w->queue,events,64,timeout<0?N_CLOCK_NEVER:n_clock_after((uint64_t)timeout*N_NS_PER_MS));if(n<0)return false;
     web_atomics_events(events,(size_t)n);webprefs_events(events,(size_t)n);return true;
 }
 static bool send_client(struct worker*w,struct client*c,unsigned op,unsigned request,unsigned kind,JSValueConst value){size_t n=0;uint8_t *data=JS_WriteObject(w->ctx,&n,value,JS_WRITE_OBJ_REFERENCE);if(!data)return false;if(n>NJW_MAX_BYTES||n>SIZE_MAX-sizeof(struct njw_header)||n+sizeof(struct njw_header)>SIZE_MAX-w->output_bytes){js_free(w->ctx,data);return false;}struct outgoing*p=calloc(1,sizeof*p);if(!p){js_free(w->ctx,data);return false;}p->data=data;p->client=c;p->h=(struct njw_header){NJW_MAGIC,op,c?c->generation:w->generation,request,kind,(uint32_t)n};struct output_publication t={.worker=w,.packet=p};output_publish(&t);return true;}
@@ -198,7 +198,7 @@ static struct deferred*shared_receive(struct worker*w,int timeout){
     bool watched=watch(w,CHANNEL,INPUT_TOKEN,&w->input_watched,w->closed?0:N_EVENT_RECEIVABLE);
     for(struct client*c=w->clients;c;c=c->next)if(c->active&&!watch(w,c->channel,c->token,&c->watched,N_EVENT_RECEIVABLE|(c->wants_output?N_EVENT_SENDABLE:0)))watched=false;
     /* Atomics.waitAsync notifications wake the agent like an incoming task. */
-    struct n_event events[64];n_result ready=n_events_wait(w->queue,events,64,watched?timeout:0);
+    struct n_event events[64];n_result ready=n_events_wait(w->queue,events,64,!watched?0:timeout<0?N_CLOCK_NEVER:n_clock_after((uint64_t)timeout*N_NS_PER_MS));
     if(ready<0){w->closed=w->output_failed=true;return NULL;}
     web_atomics_events(events,(size_t)ready);webprefs_events(events,(size_t)ready);
     /* A full report (or a failed watch) may leave owners unreported: try all. */
@@ -256,7 +256,7 @@ static bool output_wait_inner(struct worker*w,struct client*client,size_t next){
     for(;;){output_flush(w);if(w->closed)return false;if(w->shared&&(!client||!client->active))return true;
         size_t flight=client?client->in_flight:w->in_flight;
         if(!flight||(flight<=NJW_TRANSPORT_WINDOW&&next<=NJW_TRANSPORT_WINDOW-flight))return true;
-        uint64_t now=n_clock_uptime_ms();if(w->until!=UINT64_MAX&&now>=w->until)return false;uint64_t remaining=w->until==UINT64_MAX?UINT64_MAX:w->until-now;int wait=remaining>(uint64_t)INT_MAX?INT_MAX:(int)remaining;struct deferred*d=NULL;
+        uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);if(w->until!=UINT64_MAX&&now>=w->until)return false;uint64_t remaining=w->until==UINT64_MAX?UINT64_MAX:w->until-now;int wait=remaining>(uint64_t)INT_MAX?INT_MAX:(int)remaining;struct deferred*d=NULL;
         /* An import wait may already have retained a private credit record. */
         struct deferred**at=&w->head;while(*at&&(*at)->h.op!=NJW_CREDIT)at=&(*at)->next;
         if(*at){d=*at;*at=d->next;w->queued-=d->h.bytes;w->tail=NULL;for(struct deferred*p=w->head;p;p=p->next)w->tail=p;d->next=NULL;}
@@ -518,7 +518,7 @@ static JSValue native_unpack(JSContext *ctx,JSValueConst thisv,int argc,JSValueC
 /* The monotonic clock in ms, coarsened to 100 microseconds (HR Time "coarsen time" outside
    cross-origin isolation) and floored, so it never decreases. js_worker_runtime.js takes this
    realm's time origin from it; the timers keep whole milliseconds of it. */
-static JSValue native_now(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;return JS_NewFloat64(ctx,(double)(uptime_us()/100)/10.0);}
+static JSValue native_now(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;return JS_NewFloat64(ctx,(double)((n_clock_monotonic() / N_NS_PER_US)/100)/10.0);}
 /* Web IDL promise reactions: no page Promise constructor or @@species lookup. */
 static JSValue native_promise_then(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
     (void)thisv;if(!argc)return JS_ThrowTypeError(ctx,"promiseThen requires a promise");
@@ -532,7 +532,7 @@ static JSValue native_promise_is_handled(JSContext *ctx,JSValueConst thisv,int a
 static JSValue native_close(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;struct worker *w=state(ctx);send_value(w,NJW_CLOSE,0,0,JS_NULL);w->closed=true;if(w->shared){n_handle_close(CHANNEL);w->input_watched=0;}return JS_UNDEFINED;}
 static JSValue native_eval(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
     (void)thisv;struct worker *w=state(ctx);if(argc<2)return JS_ThrowTypeError(ctx,"Worker source/URL required");size_t n;const char *source=JS_ToCStringLen(ctx,&n,argv[0]),*url=JS_ToCString(ctx,argv[1]);if(!source||!url){JS_FreeCString(ctx,source);JS_FreeCString(ctx,url);return JS_EXCEPTION;}
-    uint64_t saved=w->until;w->until=n_clock_uptime_ms()+NJW_TASK_MS;JSValue code=JS_Eval(ctx,source,n,url,JS_EVAL_TYPE_GLOBAL|JS_EVAL_FLAG_COMPILE_ONLY);JS_FreeCString(ctx,source);JS_FreeCString(ctx,url);w->until=saved;
+    uint64_t saved=w->until;w->until=(n_clock_monotonic() / N_NS_PER_MS)+NJW_TASK_MS;JSValue code=JS_Eval(ctx,source,n,url,JS_EVAL_TYPE_GLOBAL|JS_EVAL_FLAG_COMPILE_ONLY);JS_FreeCString(ctx,source);JS_FreeCString(ctx,url);w->until=saved;
     if(JS_IsException(code))return code;return JS_EvalFunction(ctx,code);
 }
 /* request(query, stream): a fetch, from js_fetch.js's transport query (the runtime's own record,
@@ -624,8 +624,8 @@ static JSValue native_referrer_policy(JSContext *ctx,JSValueConst self,int argc,
  * NULL with an exception when the worker closed or its channel failed. The paused time does not
  * count against the running task's deadline. */
 static struct deferred *loaded_wait(JSContext *ctx,struct worker *w,uint32_t id,uint64_t deadline,bool *timed_out){
-    uint64_t wait_start=n_clock_uptime_ms();*timed_out=false;
-    while(!w->closed){uint64_t now=n_clock_uptime_ms();if(now>=deadline){send_value(w,NJW_CANCEL,id,0,JS_NULL);*timed_out=true;return NULL;}uint64_t left=deadline-now;int timeout=left>(uint64_t)INT_MAX?INT_MAX:(int)left;struct deferred*d=NULL;
+    uint64_t wait_start=(n_clock_monotonic() / N_NS_PER_MS);*timed_out=false;
+    while(!w->closed){uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);if(now>=deadline){send_value(w,NJW_CANCEL,id,0,JS_NULL);*timed_out=true;return NULL;}uint64_t left=deadline-now;int timeout=left>(uint64_t)INT_MAX?INT_MAX:(int)left;struct deferred*d=NULL;
         if(w->shared){
             struct deferred**at=&w->head;while(*at&&((*at)->h.op!=NJW_LOADED||(*at)->h.request!=id))at=&(*at)->next;
             if(*at){d=*at;*at=d->next;w->queued-=d->h.bytes;w->tail=NULL;for(struct deferred*p=w->head;p;p=p->next)w->tail=p;d->next=NULL;}
@@ -633,13 +633,13 @@ static struct deferred *loaded_wait(JSContext *ctx,struct worker *w,uint32_t id,
             if(!d)continue;if(!shared_incoming(w,d)){deferred_free(d);continue;}
         }else{if(!dedicated_wait(w,timeout)){JS_ThrowTypeError(ctx,"Worker wait failed");return NULL;}if(w->output)output_flush(w);if(w->closed)break;bool failed=false;d=receive(w,&failed);if(failed){w->closed=true;JS_ThrowTypeError(ctx,"Worker channel closed");return NULL;}if(!d)continue;}
         if(d->h.op==NJW_CREDIT){transport_credit(w,d);deferred_free(d);continue;}
-        if(d->h.op==NJW_LOADED&&d->h.request==id){if(w->until!=UINT64_MAX)w->until+=n_clock_uptime_ms()-wait_start;return d;}
+        if(d->h.op==NJW_LOADED&&d->h.request==id){if(w->until!=UINT64_MAX)w->until+=(n_clock_monotonic() / N_NS_PER_MS)-wait_start;return d;}
         if(d->h.bytes>SIZE_MAX-w->queued){deferred_free(d);JS_ThrowRangeError(ctx,"Worker deferred message accounting overflow");return NULL;}w->queued+=d->h.bytes;if(w->tail)w->tail->next=d;else w->head=d;w->tail=d;
     }JS_ThrowTypeError(ctx,"Worker closed");return NULL;
 }
 static JSValue import_load(JSContext *ctx,JSValueConst url){
     struct worker *w=state(ctx);if(w->request==UINT32_MAX)return JS_ThrowRangeError(ctx,"Worker request identifier space exhausted");uint32_t id=++w->request;if(!send_value(w,NJW_LOAD,id,1,url))return JS_ThrowTypeError(ctx,"Worker import IPC failed");
-    bool timed_out;struct deferred*d=loaded_wait(ctx,w,id,n_clock_uptime_ms()+WEBNET_TIMEOUT_MS,&timed_out);
+    bool timed_out;struct deferred*d=loaded_wait(ctx,w,id,(n_clock_monotonic() / N_NS_PER_MS)+WEBNET_TIMEOUT_MS,&timed_out);
     if(!d)return timed_out?JS_ThrowTypeError(ctx,"Worker import deadline exceeded"):JS_EXCEPTION;
     JSValue result=JS_ReadObject(ctx,d->data,d->h.bytes,JS_READ_OBJ_REFERENCE);deferred_free(d);return result;
 }
@@ -651,7 +651,7 @@ static JSValue native_request_wait(JSContext *ctx,JSValueConst thisv,int argc,JS
     if(argc<2||JS_ToUint32(ctx,&id,argv[0])<0||JS_ToFloat64(ctx,&timeout,argv[1])<0)return JS_EXCEPTION;
     if(!id||id>w->request)return JS_ThrowTypeError(ctx,"Worker request identifier required");
     if(!(timeout>=0))return JS_ThrowRangeError(ctx,"Invalid synchronous request timeout");
-    uint64_t now=n_clock_uptime_ms(),deadline=timeout<1?UINT64_MAX:timeout>=(double)(UINT64_MAX-now)?UINT64_MAX:now+(uint64_t)timeout;
+    uint64_t now=(n_clock_monotonic() / N_NS_PER_MS),deadline=timeout<1?UINT64_MAX:timeout>=(double)(UINT64_MAX-now)?UINT64_MAX:now+(uint64_t)timeout;
     bool timed_out;struct deferred*d=loaded_wait(ctx,w,id,deadline,&timed_out);
     if(!d)return timed_out?JS_NULL:JS_EXCEPTION;
     JSValue record=JS_ReadObject(ctx,d->data,d->h.bytes,JS_READ_OBJ_REFERENCE),out=JS_IsException(record)?JS_EXCEPTION:JS_NewArray(ctx);uint32_t flags=d->h.kind;deferred_free(d);
@@ -697,7 +697,7 @@ static int interrupt(JSRuntime *rt,void *opaque){
     web_idb_pump(&w->indexed_db);
     if(w->shared&&shared_without_owners(w)){w->closed=true;return 1;}
     if(w->until==UINT64_MAX)return 0;
-    return n_clock_uptime_ms()>=w->until;
+    return (n_clock_monotonic() / N_NS_PER_MS)>=w->until;
 }
 static JSValue hook(struct worker *w,const char *name,int argc,JSValueConst *argv){JSValue fn=JS_GetPropertyStr(w->ctx,w->hooks,name);JSValue r=JS_Call(w->ctx,fn,JS_UNDEFINED,argc,argv);JS_FreeValue(w->ctx,fn);port_capture_cancel(w);return r;}
 static int wasm_poll(JSContext *ctx){struct worker*w=JS_GetContextOpaque(ctx);return !w||interrupt(JS_GetRuntime(ctx),w);}
@@ -716,7 +716,7 @@ static int wasm_can_compile(JSContext *ctx){
     }
     return allowed;
 }
-static void exception(struct worker *w){JSValue ex=JS_GetException(w->ctx);w->until=n_clock_uptime_ms()+NJW_TASK_MS;JSValue r=hook(w,"report",1,&ex);if(JS_IsException(r)){JSValue ignored=JS_GetException(w->ctx);JS_FreeValue(w->ctx,ignored);}JS_FreeValue(w->ctx,r);JS_FreeValue(w->ctx,ex);}
+static void exception(struct worker *w){JSValue ex=JS_GetException(w->ctx);w->until=(n_clock_monotonic() / N_NS_PER_MS)+NJW_TASK_MS;JSValue r=hook(w,"report",1,&ex);if(JS_IsException(r)){JSValue ignored=JS_GetException(w->ctx);JS_FreeValue(w->ctx,ignored);}JS_FreeValue(w->ctx,r);JS_FreeValue(w->ctx,ex);}
 /* HTML "notify about rejected promises": rejections still unhandled after a
    microtask checkpoint fire unhandledrejection; a later handler on a notified
    promise fires rejectionhandled. The tracker cannot run script itself. */
@@ -786,7 +786,7 @@ static void policy_task(struct worker *w){
     JSValue r=hook(w,"safetyViolation",1,&v->init);if(JS_IsException(r))exception(w);JS_FreeValue(w->ctx,r);JS_FreeValue(w->ctx,v->init);js_free(w->ctx,v);
 }
 int main(int argc,char**argv){
-    struct worker w={0};w.probe=-1;w.queue=web_atomics_queue();if(w.queue<0)return 1;w.shared=argc>1&&!strcmp(argv[1],"--shared-server");w.script_url=argc>2?argv[2]:"";w.hooks=JS_UNDEFINED;w.rt=web_js_new_runtime(NULL);if(!w.rt)return 1;JS_SetMemoryLimit(w.rt,NJW_HEAP_BYTES);JS_SetMaxStackSize(w.rt,512u*1024u);JS_SetCanBlock(w.rt,true);web_atomics_runtime_init(w.rt);JS_SetInterruptHandler(w.rt,interrupt,&w);JS_SetHostPromiseRejectionTracker(w.rt,rejection_track,NULL);w.ctx=JS_NewContext(w.rt);if(!w.ctx){JS_FreeRuntime(w.rt);return 1;}JS_SetContextOpaque(w.ctx,&w);w.until=n_clock_uptime_ms()+10000;
+    struct worker w={0};w.probe=-1;w.queue=web_atomics_queue();if(w.queue<0)return 1;w.shared=argc>1&&!strcmp(argv[1],"--shared-server");w.script_url=argc>2?argv[2]:"";w.hooks=JS_UNDEFINED;w.rt=web_js_new_runtime(NULL);if(!w.rt)return 1;JS_SetMemoryLimit(w.rt,NJW_HEAP_BYTES);JS_SetMaxStackSize(w.rt,512u*1024u);JS_SetCanBlock(w.rt,true);web_atomics_runtime_init(w.rt);JS_SetInterruptHandler(w.rt,interrupt,&w);JS_SetHostPromiseRejectionTracker(w.rt,rejection_track,NULL);w.ctx=JS_NewContext(w.rt);if(!w.ctx){JS_FreeRuntime(w.rt);return 1;}JS_SetContextOpaque(w.ctx,&w);w.until=(n_clock_monotonic() / N_NS_PER_MS)+10000;
     /* Watch the browser's preferences in this queue before the realm first reads the languages
        (languagechange); without a watch the first read takes them once. */
     (void)webprefs_watch(w.queue);w.languages_seen=webprefs_languages_generation();
@@ -814,19 +814,19 @@ int main(int argc,char**argv){
         if(w.closed){if(w.shared){output_flush(&w);if(w.output){struct deferred*d=shared_receive(&w,10);if(d)deferred_free(d);}continue;}if(!dedicated_wait(&w,-1))break;output_flush(&w);continue;}
         if(w.output)output_flush(&w);
         if(w.output_failed)break;
-        if(JS_IsJobPending(w.rt)){w.until=n_clock_uptime_ms()+NJW_TASK_MS;jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}
+        if(JS_IsJobPending(w.rt)){w.until=(n_clock_monotonic() / N_NS_PER_MS)+NJW_TASK_MS;jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}
         /* CSP events are separate tasks, after the originating microtasks. */
-        if(w.violations){w.until=n_clock_uptime_ms()+NJW_TASK_MS;policy_task(&w);jobs(&w);continue;}
+        if(w.violations){w.until=(n_clock_monotonic() / N_NS_PER_MS)+NJW_TASK_MS;policy_task(&w);jobs(&w);continue;}
         struct deferred *d=NULL;if(w.head){d=w.head;w.head=d->next;if(!w.head)w.tail=NULL;w.queued-=d->h.bytes;}
         else{
-            w.until=UINT64_MAX;JSValue deadline=hook(&w,"deadline",0,NULL);int64_t due=-1;JS_ToInt64(w.ctx,&due,deadline);JS_FreeValue(w.ctx,deadline);uint64_t now=n_clock_uptime_ms();int64_t atomics_due=web_atomics_deadline(w.ctx,now);if(atomics_due>=0&&(due<0||atomics_due<due))due=atomics_due;int wait=JS_IsJobPending(w.rt)?0:due<0?-1:due<=(int64_t)now?0:due-(int64_t)now>INT_MAX?INT_MAX:(int)(due-(int64_t)now);
+            w.until=UINT64_MAX;JSValue deadline=hook(&w,"deadline",0,NULL);int64_t due=-1;JS_ToInt64(w.ctx,&due,deadline);JS_FreeValue(w.ctx,deadline);uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);int64_t atomics_due=web_atomics_deadline(w.ctx,now);if(atomics_due>=0&&(due<0||atomics_due<due))due=atomics_due;int wait=JS_IsJobPending(w.rt)?0:due<0?-1:due<=(int64_t)now?0:due-(int64_t)now>INT_MAX?INT_MAX:(int)(due-(int64_t)now);
             /* The storage broker's answer ends this wait (its channel is watched in the queue);
                only a watch that could not be made has the loop look again soon. */
             if(web_idb_next(&w.indexed_db))wait=0;else if(web_idb_needs_poll(&w.indexed_db)&&(wait<0||wait>8))wait=8;
             if(w.shared){d=shared_receive(&w,wait);if(w.closed&&!d)continue;}
             else{if(!dedicated_wait(&w,wait))break;if(w.output)output_flush(&w);if(w.output_failed)break;bool failed=false;d=receive(&w,&failed);if(failed)break;}
         }
-        w.until=n_clock_uptime_ms()+NJW_TASK_MS;
+        w.until=(n_clock_monotonic() / N_NS_PER_MS)+NJW_TASK_MS;
         if(d&&d->h.op==NJW_CREDIT){if(!w.shared||shared_incoming(&w,d))transport_credit(&w,d);deferred_free(d);d=NULL;if(w.closed)continue;}
         bool received_task=d!=NULL;
         /* The running JS task holds current_client until its checkpoint; the
@@ -835,15 +835,15 @@ int main(int argc,char**argv){
         /* Finish the received task's microtasks before a local port/timer task. */
         if(received_task){jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}
         /* Atomics.waitAsync settlements are tasks of their own. */
-        {uint64_t at=n_clock_uptime_ms();int64_t due=web_atomics_deadline(w.ctx,at);if(due>=0&&due<=(int64_t)at){w.until=at+NJW_TASK_MS;web_atomics_run(w.ctx,at);jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}}
+        {uint64_t at=(n_clock_monotonic() / N_NS_PER_MS);int64_t due=web_atomics_deadline(w.ctx,at);if(due>=0&&due<=(int64_t)at){w.until=at+NJW_TASK_MS;web_atomics_run(w.ctx,at);jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}}
         /* HTML NavigatorLanguage: a new set of the user's languages is one task (this worker's
            event loop) that switches navigator.languages and fires languagechange at the global. */
-        if(w.languages_seen!=webprefs_languages_generation()){w.languages_seen=webprefs_languages_generation();w.until=n_clock_uptime_ms()+NJW_TASK_MS;JSValue r=hook(&w,"languageChange",0,NULL);if(JS_IsException(r))exception(&w);JS_FreeValue(w.ctx,r);jobs(&w);continue;}
+        if(w.languages_seen!=webprefs_languages_generation()){w.languages_seen=webprefs_languages_generation();w.until=(n_clock_monotonic() / N_NS_PER_MS)+NJW_TASK_MS;JSValue r=hook(&w,"languageChange",0,NULL);if(JS_IsException(r))exception(&w);JS_FreeValue(w.ctx,r);jobs(&w);continue;}
         /* An IndexedDB completion is a task of its own (its request's promise settles, then its
            microtasks run); it takes turns with the timer and port tasks below. */
-        if(w.indexed_db_turn&&web_idb_next(&w.indexed_db)){w.indexed_db_turn=false;w.until=n_clock_uptime_ms()+NJW_TASK_MS;web_idb_complete(w.ctx,&w.indexed_db);if(JS_HasException(w.ctx))exception(&w);jobs(&w);continue;}
+        if(w.indexed_db_turn&&web_idb_next(&w.indexed_db)){w.indexed_db_turn=false;w.until=(n_clock_monotonic() / N_NS_PER_MS)+NJW_TASK_MS;web_idb_complete(w.ctx,&w.indexed_db);if(JS_HasException(w.ctx))exception(&w);jobs(&w);continue;}
         w.indexed_db_turn=true;
-        JSValue now=JS_NewFloat64(w.ctx,(double)n_clock_uptime_ms());JSValue tick=hook(&w,"tick",1,&now);if(JS_IsException(tick))exception(&w);JS_FreeValue(w.ctx,tick);JS_FreeValue(w.ctx,now);jobs(&w);
+        JSValue now=JS_NewFloat64(w.ctx,(double)(n_clock_monotonic() / N_NS_PER_MS));JSValue tick=hook(&w,"tick",1,&now);if(JS_IsException(tick))exception(&w);JS_FreeValue(w.ctx,tick);JS_FreeValue(w.ctx,now);jobs(&w);
     }
 shutdown:
     while(w.violations){struct policy_violation *v=w.violations;w.violations=v->next;JS_FreeValue(w.ctx,v->init);js_free(w.ctx,v);}

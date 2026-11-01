@@ -295,7 +295,7 @@ static int resume_until(struct html_parser *p, node_t **script, struct html_inpu
     if (p->yielded && !html_bridge_export(p)) return parser_failure(p);
     p->yielded = false; p->pending_script = NULL; p->write_tail = NULL;
     size_t consumed=0; unsigned chunks=0; bool cooperative=false;
-    uint64_t slice_start=uptime_ms();
+    uint64_t slice_start=(n_clock_monotonic() / N_NS_PER_MS);
     while (p->input && !p->pending_script && (!bounded || p->input != boundary)) {
         if (!web_native_checkpoint(p->d)) { p->cancelled=true; return HTML_PARSE_CANCELLED; }
         struct html_input *in = p->input;
@@ -322,7 +322,7 @@ static int resume_until(struct html_parser *p, node_t **script, struct html_inpu
         /* Never publish the half-built token of a synchronous CE reaction.
            Outer resumption can yield only after Lexbor returned its chunk. */
         bool slice_end=consumed>=HTML_RESUME_BYTES ||
-            (!(chunks&63u) && uptime_ms()-slice_start>=HTML_RESUME_MS);
+            (!(chunks&63u) && (n_clock_monotonic() / N_NS_PER_MS)-slice_start>=HTML_RESUME_MS);
         if (!p->callback_depth && !p->pending_script && slice_end &&
             html_pending_input(p) && (!bounded || p->input!=boundary)) {
             cooperative=true;break;

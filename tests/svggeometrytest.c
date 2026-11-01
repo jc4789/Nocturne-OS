@@ -33,7 +33,7 @@ int main(void){
         "<svg id='geometry-root' width='200' height='100' viewBox='0 0 100 100'><g transform='translate(10 20) scale(2 3)'><path d='M0 0 L3 4'/></g></svg>";
     struct web_host host={.console=log_line,.debug_js=true,.js_task_budget_ms=5000};
     web_doc *doc=web_live(page,sizeof page-1,"https://svg-geometry.test/","utf-8",&host);if(!doc)return 1;
-    web_layout(doc,800,600);web_tick(doc,uptime_ms());char *source=read_source();
+    web_layout(doc,800,600);web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));char *source=read_source();
     if(!source||!web_console_eval(doc,source,source?strlen(source):0)){puts("FAIL SVG geometry execution");failures++;}
     free(source);if(!done||errors){printf("FAIL SVG geometry completion done=%d errors=%d\n",done,errors);failures++;}
     web_free(doc);printf("svggeometrytest: %d checks, %d failed\n",checks,failures);return failures?1:0;

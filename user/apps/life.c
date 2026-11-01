@@ -160,7 +160,7 @@ static bool paint(double px, double py, bool first) {
 }
 
 int main(void) {
-    srand((unsigned)n_clock_uptime_ms());
+    srand((unsigned)(n_clock_monotonic() / N_NS_PER_MS));
     struct ui_session *s = ui_session_new();
     if (!s || ui_window(s, WINDOW, W + 2 * PAD, H + 2 * PAD + 110, 0, "Game of Life", NULL, NULL) < 0) return 1;
     canvas_t *board = ui_surface(s, BOARD, W, H, 0);
@@ -168,10 +168,10 @@ int main(void) {
     gun();
     draw(board);
     show(s);
-    uint64_t next = n_clock_uptime_ms(), shown_at = next;
+    uint64_t next = (n_clock_monotonic() / N_NS_PER_MS), shown_at = next;
     bool stale = false; /* the generation counter shown is out of date */
     for (bool alive = true; alive;) {
-        uint64_t now = n_clock_uptime_ms();
+        uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
         int wait = -1;
         if (running) wait = next > now ? (int)(next - now) : 0;
         if (stale) {
@@ -221,7 +221,7 @@ int main(void) {
             if (view && e.type != UI_EVENT_POINTER) shown_at = 0; /* show it now */
         }
         if (!alive || !ui_session_open(s)) break;
-        now = n_clock_uptime_ms();
+        now = (n_clock_monotonic() / N_NS_PER_MS);
         if (running && now >= next) {
             next = now + speed;
             step();

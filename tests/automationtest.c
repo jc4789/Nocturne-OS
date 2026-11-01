@@ -147,8 +147,8 @@ static const char page[] =
     "console.log('PAGE-DONE');"
     "</script>";
 static void tick_until(web_doc *doc, const bool *flag, int ms) {
-    uint64_t deadline = uptime_ms() + (uint64_t)ms;
-    while (!*flag && uptime_ms() < deadline) { web_tick(doc, uptime_ms()); n_sleep_ms(1); }
+    uint64_t deadline = (n_clock_monotonic() / N_NS_PER_MS) + (uint64_t)ms;
+    while (!*flag && (n_clock_monotonic() / N_NS_PER_MS) < deadline) { web_tick(doc, (n_clock_monotonic() / N_NS_PER_MS)); n_sleep_until(n_clock_after(1 * N_NS_PER_MS)); }
 }
 static void realm(bool automated) {
     struct fixture f = {0};
@@ -174,13 +174,13 @@ static void realm(bool automated) {
           f.first[0].kind == WEB_AUTOMATION_MOVE && f.first[0].x == 3.5 && f.first[0].y == 4 && f.first[0].at == 0 &&
           f.first[1].kind == WEB_AUTOMATION_DOWN && f.first[1].value == 2 && f.first[1].at == 5 &&
           f.first[2].kind == WEB_AUTOMATION_KEY_DOWN && f.first[2].value == 0x61);
-    for (int i = 0; i < 20; i++) { web_tick(doc, uptime_ms()); n_sleep_ms(1); }
+    for (int i = 0; i < 20; i++) { web_tick(doc, (n_clock_monotonic() / N_NS_PER_MS)); n_sleep_until(n_clock_after(1 * N_NS_PER_MS)); }
     check("a run waits for the host", !f.resolved);
     web_automation_done(doc, f.ids[0] + 1000, NULL); /* no such run */
-    for (int i = 0; i < 20; i++) { web_tick(doc, uptime_ms()); n_sleep_ms(1); }
+    for (int i = 0; i < 20; i++) { web_tick(doc, (n_clock_monotonic() / N_NS_PER_MS)); n_sleep_until(n_clock_after(1 * N_NS_PER_MS)); }
     check("another id settles nothing", !f.resolved);
     web_automation_done(doc, f.ids[0], NULL);
-    check("done is due at once", web_deadline(doc) >= 0 && web_deadline(doc) <= (int64_t)uptime_ms());
+    check("done is due at once", web_deadline(doc) >= 0 && web_deadline(doc) <= (int64_t)(n_clock_monotonic() / N_NS_PER_MS));
     tick_until(doc, &f.resolved, 5000);
     check("done resolves the run in a task", f.resolved);
     const char *more = "__nocturne_automation([],0).then(()=>console.log('FAIL resolved'),"

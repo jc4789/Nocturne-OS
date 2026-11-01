@@ -168,6 +168,72 @@ static void thread_discard(struct thread *t) {
     process_put(p);
 }
 
+/* ---- an app's classes ---- */
+
+/* What an app's deadline threads together may reserve: half of one CPU, each an equal part of it
+   (the most its reservation takes of its period, sched_policy's share). So an app takes no CPU from
+   the others for good however many deadline threads it has, and a CPU it shares with the system's
+   own deadline threads (the compositor, input) keeps half for them: EDF meets every deadline while
+   the reservations on a CPU sum to no more than it. */
+#define APP_DEADLINE_SHARE (SCHED_SHARE_ONE / 2)
+_Static_assert(N_SCHEDULE_PERIOD_MIN_NS == SCHED_PERIOD_MIN_NS && N_SCHEDULE_PERIOD_MAX_NS == SCHED_PERIOD_MAX_NS &&
+               N_SCHEDULE_WEIGHT_DEFAULT == SCHED_WEIGHT_DEFAULT, "the ABI's classes are the scheduler's");
+
+/* thread_lock held: whether t is one of its app's deadline threads that has not ended. Only
+   thread_schedule changes an app thread's class, under thread_lock. */
+static bool app_deadline(const struct thread *t) {
+    return !t->ended && t->sched.state != THREAD_ZOMBIE && t->sched.policy.class == SCHED_DEADLINE;
+}
+
+/* thread_lock held: p's deadline threads but skip. */
+static unsigned app_deadlines(struct process *p, const struct thread *skip) {
+    unsigned n = p->main && p->main != skip && app_deadline(p->main);
+    for (struct thread *t = p->threads; t; t = t->process_next) n += t != skip && app_deadline(t);
+    return n;
+}
+
+static void app_share_set(struct thread *t, uint32_t share) {
+    if (!app_deadline(t) || t->sched.policy.share == share) return;
+    struct sched_policy policy = t->sched.policy;
+    policy.share = share;
+    sched_set_policy(t, policy);
+}
+
+/* thread_lock held: p's deadline threads each get their equal part of APP_DEADLINE_SHARE. */
+static void app_shares(struct process *p) {
+    unsigned n = app_deadlines(p, NULL);
+    if (!n) return;
+    if (p->main) app_share_set(p->main, APP_DEADLINE_SHARE / n);
+    for (struct thread *t = p->threads; t; t = t->process_next) app_share_set(t, APP_DEADLINE_SHARE / n);
+}
+
+int thread_schedule(int tid, uint32_t class, uint64_t value) {
+    struct thread *self = thread_current();
+    struct process *p = self->process;
+    struct sched_policy policy;
+    if (class == N_SCHEDULE_FAIR && value >= 1 && value <= N_SCHEDULE_WEIGHT_DEFAULT)
+        policy = sched_fair((uint32_t)value, SCHED_REQUEST_DEFAULT_NS);
+    else if (class == N_SCHEDULE_DEADLINE && value >= SCHED_PERIOD_MIN_NS && value <= SCHED_PERIOD_MAX_NS)
+        policy = sched_deadline(value);
+    else
+        return -N_ERR_INVALID;
+    uint64_t f = spin_lock(&thread_lock);
+    struct thread *t = !tid ? self : thread_find(tid);
+    int r = 0;
+    if (!t || t->process != p || t->ended || t->sched.state == THREAD_ZOMBIE) {
+        r = -N_ERR_NOT_FOUND;
+    } else {
+        if (class == N_SCHEDULE_DEADLINE) policy.share = APP_DEADLINE_SHARE / (app_deadlines(p, t) + 1);
+        const struct sched_policy *now = &t->sched.policy;
+        if (now->class != policy.class || now->weight != policy.weight || now->period_ns != policy.period_ns ||
+            now->share != policy.share)
+            sched_set_policy(t, policy);
+        app_shares(p);
+    }
+    spin_unlock(&thread_lock, f);
+    return r;
+}
+
 void thread_left(struct thread *t) {
     struct process *p = t->process;
     if (!p) { /* a kernel thread: no one joins it */
@@ -180,6 +246,7 @@ void thread_left(struct thread *t) {
     }
     uint64_t f = spin_lock(&thread_lock);
     t->ended = true;
+    if (t->sched.policy.class == SCHED_DEADLINE) app_shares(p); /* its part of the app's goes to the others */
     bool gone = t->detached;
     if (gone) process_unlist(t);
     /* its joiner, or the main thread ending p, which waits for every other thread's end */

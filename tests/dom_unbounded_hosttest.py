@@ -38,7 +38,7 @@ typedef struct node {web_doc *owner;int type,tag,elem_index;bool foreign;
 struct web_doc {web_doc *dom_family,*template_doc;node_t *parser_form_nodes;bool profile_enabled,template_owner;
     struct {uint64_t index_visits,index_ms;} profile;};
 static unsigned notices,checks,failed;
-static uint64_t uptime_ms(void){return 0;}
+static uint64_t n_clock_monotonic(void){return (uint64_t)(0)*1000000ULL;}
 static void html_bridge_native_changed(node_t*n,int flags){(void)n;(void)flags;notices++;}
 static void stylesheet_detach(node_t*n){(void)n;}
 static void textarea_changed(node_t*n){(void)n;}

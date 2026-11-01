@@ -161,7 +161,7 @@ static void run_native_form_validation_cases(int *checks, int *errors) {
     FV("static-document-rejects-physical-edit", web_key(d,&key)==0);
     const char *gui_html="<input id=length minlength=3 maxlength=6>";
     web_doc *gui=web_live(gui_html,strlen(gui_html),"http://native.fixture/gui",NULL,NULL);
-    if(gui)web_tick(gui,uptime_ms());
+    if(gui)web_tick(gui,(n_clock_monotonic() / N_NS_PER_MS));
     node_t *gui_length=gui?fv_find(gui->root,"length"):NULL;
     web_focus(gui,gui_length);
     FV("native-GUI-unicode-edit", gui_length && web_key(gui, &key) == 1);

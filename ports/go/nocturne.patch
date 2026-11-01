@@ -709,10 +709,10 @@ index 00000000..a01d29b2
 +	"time"
 +)
 +
-+// waitSlice bounds each wait in the system, in milliseconds, so that a
-+// blocked Read or Write notices Close and deadline changes. Nocturne's TCP
-+// and UDP calls take a timeout, not a cancellation handle.
-+const waitSlice = 250
++// waitSlice bounds each wait in the system, so that a blocked Read or Write
++// notices Close and deadline changes. Nocturne's TCP and UDP calls take a
++// deadline, not a cancellation handle.
++const waitSlice = 250 * time.Millisecond
 +
 +// netFD is a Nocturne TCP connection or UDP socket. Both are numbered by
 +// the network calls themselves, not handles.
@@ -764,20 +764,20 @@ index 00000000..a01d29b2
 +	return fd.pfd.Close()
 +}
 +
-+// wait returns how long the next wait in the system may last.
-+func (fd *netFD) wait(deadline *atomic.Int64) (int, error) {
++// wait returns the deadline of the next wait in the system.
++func (fd *netFD) wait(deadline *atomic.Int64) (uint64, error) {
 +	if fd.closing.Load() {
 +		return 0, poll.ErrNetClosing
 +	}
 +	d := deadline.Load()
 +	if d == 0 {
-+		return waitSlice, nil
++		return syscall.After(int64(waitSlice)), nil
 +	}
 +	left := time.Until(time.Unix(0, d))
 +	if left <= 0 {
 +		return 0, poll.ErrDeadlineExceeded
 +	}
-+	return int(min((left+time.Millisecond-1)/time.Millisecond, waitSlice)), nil
++	return syscall.After(int64(min(left, waitSlice))), nil
 +}
 +
 +func (fd *netFD) Read(b []byte) (int, error) {
@@ -791,11 +791,11 @@ index 00000000..a01d29b2
 +
 +func (fd *netFD) recv(b []byte) (int, error) {
 +	for {
-+		ms, err := fd.wait(&fd.rdeadline)
++		until, err := fd.wait(&fd.rdeadline)
 +		if err != nil {
 +			return 0, err
 +		}
-+		n, err := syscall.TCPRecv(fd.id, b, ms)
++		n, err := syscall.TCPRecv(fd.id, b, until)
 +		switch {
 +		case err == syscall.ERR_NOT_READY:
 +			continue
@@ -822,11 +822,11 @@ index 00000000..a01d29b2
 +func (fd *netFD) send(b []byte) (int, error) {
 +	done := 0
 +	for done < len(b) {
-+		ms, err := fd.wait(&fd.wdeadline)
++		until, err := fd.wait(&fd.wdeadline)
 +		if err != nil {
 +			return done, err
 +		}
-+		n, err := syscall.TCPSendUntil(fd.id, b[done:], syscall.Uptime()+uint64(ms), 0)
++		n, err := syscall.TCPSendUntil(fd.id, b[done:], until, 0)
 +		done += n
 +		if err != nil && err != syscall.ERR_TIMEOUT {
 +			return done, err
@@ -839,11 +839,11 @@ index 00000000..a01d29b2
 +func (fd *netFD) readFrom(b []byte) (n int, from syscall.Sockaddr4, err error) {
 +	n, err = fd.pfd.Read(func(b []byte) (int, error) {
 +		for {
-+			ms, err := fd.wait(&fd.rdeadline)
++			until, err := fd.wait(&fd.rdeadline)
 +			if err != nil {
 +				return 0, err
 +			}
-+			n, err = syscall.UDPRecv(fd.id, b, ms, &from)
++			n, err = syscall.UDPRecv(fd.id, b, until, &from)
 +			if err == syscall.ERR_NOT_READY {
 +				continue
 +			}
@@ -911,11 +911,11 @@ index 00000000..a01d29b2
 +	var remote syscall.Sockaddr4
 +	id, err := fd.pfd.Accept(func() (int, error) {
 +		for {
-+			ms, err := fd.wait(&fd.rdeadline)
++			until, err := fd.wait(&fd.rdeadline)
 +			if err != nil {
 +				return -1, err
 +			}
-+			id, err := syscall.TCPAccept(fd.id, ms, &remote)
++			id, err := syscall.TCPAccept(fd.id, until, &remote)
 +			if err == syscall.ERR_NOT_READY {
 +				continue
 +			}
@@ -1128,16 +1128,16 @@ index 00000000..fd52061b
 +	if err := ctx.Err(); err != nil {
 +		return -1, mapErr(err)
 +	}
-+	ms := 0 // the system's limit
++	until := syscall.CLOCK_NEVER // the system's limit
 +	if d, ok := ctx.Deadline(); ok {
 +		left := time.Until(d)
 +		if left <= 0 {
 +			return -1, errTimeout
 +		}
-+		ms = int(max(min(left/time.Millisecond, 1<<30), 1))
++		until = syscall.After(int64(left))
 +	}
 +	connect := func() (int, error) {
-+		id, err := syscall.TCPConnect(to.IP, to.Port, ms)
++		id, err := syscall.TCPConnect(to.IP, to.Port, until)
 +		if err != nil {
 +			return -1, os.NewSyscallError("connect", err)
 +		}
@@ -1952,7 +1952,7 @@ index 00000000..9849a48a
 +	}
 +	defer p.handleTransientRelease()
 +
-+	code, err := syscall.AppResult(int(h), -1)
++	code, err := syscall.AppResult(int(h), syscall.CLOCK_NEVER)
 +	if err != nil {
 +		return nil, NewSyscallError("wait", err)
 +	}
@@ -3554,7 +3554,7 @@ new file mode 100644
 index 00000000..5f226169
 --- /dev/null
 +++ b/src/runtime/os_nocturne.go
-@@ -0,0 +1,378 @@
+@@ -0,0 +1,432 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -3565,6 +3565,7 @@ index 00000000..5f226169
 +	"internal/abi"
 +	"internal/runtime/atomic"
 +	"internal/runtime/sys"
++	"math/bits"
 +	"unsafe"
 +)
 +
@@ -3572,10 +3573,7 @@ index 00000000..5f226169
 +// a negated Nocturne result code.
 +const (
 +	_SYS_SLEEP               = 19
-+	_SYS_UPTIME              = 20
-+	_SYS_TIME                = 21
 +	_SYS_CPU_INFO            = 38
-+	_SYS_CLOCK_INFO          = 44
 +	_SYS_THREAD_CREATE       = 45
 +	_SYS_WAIT_ADDRESS        = 48
 +	_SYS_WAKE_ADDRESS        = 49
@@ -3601,7 +3599,8 @@ index 00000000..5f226169
 +	_N_DOCUMENT_READ     = 1
 +	_N_CHANNEL_WAIT      = 1
 +
-+	_N_CLOCK_USER_TSC = 1
++	_N_CLOCK_ADDRESS = 0x00007FFFFFF00000
++	_N_CLOCK_NEVER   = ^uint64(0)
 +)
 +
 +// syscall5 makes Nocturne system call n.
@@ -3622,50 +3621,114 @@ index 00000000..5f226169
 +
 +// ---- clocks ----
 +
-+// struct n_clockinfo
-+type nocturneClockInfo struct {
-+	version, flags uint32
-+	tscHz          uint64
-+	tscSample      uint64
-+	uptimeMs       uint64
++// struct n_clock: the kernel's data of the clocks, mapped read-only at
++// _N_CLOCK_ADDRESS in every app, followed by offset[cpus] (int64 each).
++type nocturneClock struct {
++	seq, cpus        uint32
++	baseTSC, baseNs  uint64
++	mult             uint64
++	shift, rateBound uint32
++	tscHz, asleepNs  uint64
++	wallNs           int64
++	wallFrom         uint64
++	wallUntil        uint64
++	wallSlew         int64
++	wallSlewMult     uint64
 +}
 +
-+var nocturneClock nocturneClockInfo
++// The TSC as RDTSCP reads it, and its TSC_AUX: the CPU's index
++// (sys_nocturne_amd64.s).
++func nocturneTSC() (tsc uint64, cpu uint32)
 +
-+// nocturneWallBase is the wall clock in nanoseconds minus nanotime, taken
-+// at start: the system wall clock counts whole seconds.
-+var nocturneWallBase int64
++// nocturneRead returns the monotonic clock in ns and, in wall, the wall
++// clock's fields read with it: the reading of common/abi.h of Nocturne.
++//
++//go:nosplit
++func nocturneRead(wall *nocturneClock) uint64 {
++	c := (*nocturneClock)(unsafe.Pointer(uintptr(_N_CLOCK_ADDRESS)))
++	for {
++		seq := atomic.Load(&c.seq)
++		if seq&1 != 0 { // the kernel is writing it
++			continue
++		}
++		t, cpu := nocturneTSC()
++		baseTSC, baseNs, mult, shift := c.baseTSC, c.baseNs, c.mult, c.shift
++		var offset int64
++		if cpu < c.cpus {
++			offset = *(*int64)(unsafe.Pointer(uintptr(_N_CLOCK_ADDRESS) + unsafe.Sizeof(*c) + uintptr(cpu)*8))
++		}
++		if wall != nil {
++			wall.asleepNs, wall.wallNs, wall.wallFrom = c.asleepNs, c.wallNs, c.wallFrom
++			wall.wallUntil, wall.wallSlew, wall.wallSlewMult = c.wallUntil, c.wallSlew, c.wallSlewMult
++		}
++		if atomic.Load(&c.seq) != seq {
++			continue
++		}
++		t -= uint64(offset)
++		if t <= baseTSC {
++			return baseNs
++		}
++		hi, lo := bits.Mul64(t-baseTSC, mult)
++		return baseNs + (hi<<(64-shift) | lo>>shift)
++	}
++}
 +
 +//go:nosplit
 +func nanotime1() int64 {
-+	c := &nocturneClock
-+	if c.flags&_N_CLOCK_USER_TSC != 0 && c.tscHz >= 1e6 {
-+		now := uint64(cputicks())
-+		if now >= c.tscSample {
-+			d := now - c.tscSample
-+			return int64(c.uptimeMs)*1e6 + int64(d/c.tscHz)*1e9 + int64(d%c.tscHz*1e9/c.tscHz)
-+		}
-+	}
-+	return syscall5(_SYS_UPTIME, 0, 0, 0, 0, 0) * 1e6
++	return int64(nocturneRead(nil))
 +}
 +
 +//go:nosplit
 +func walltime() (sec int64, nsec int32) {
-+	ns := nocturneWallBase + nanotime1()
++	var h nocturneClock
++	t := nocturneRead(&h)
++	ns := h.wallNs
++	if t > h.wallFrom {
++		ns += int64(t - h.wallFrom)
++	}
++	if h.wallSlew != 0 {
++		until := min(t, h.wallUntil)
++		var ran uint64
++		if until > h.wallFrom {
++			ran = until - h.wallFrom
++		}
++		whole := uint64(h.wallSlew)
++		if h.wallSlew < 0 {
++			whole = uint64(-h.wallSlew)
++		}
++		hi, lo := bits.Mul64(ran, h.wallSlewMult)
++		done := min(hi<<32|lo>>32, whole)
++		if h.wallSlew < 0 {
++			ns -= int64(done)
++		} else {
++			ns += int64(done)
++		}
++	}
 +	return ns / 1e9, int32(ns % 1e9)
++}
++
++// nocturneAfter is the monotonic deadline ns from now.
++//
++//go:nosplit
++func nocturneAfter(ns int64) uint64 {
++	now := nocturneRead(nil)
++	if ns <= 0 {
++		return now
++	}
++	if uint64(ns) >= _N_CLOCK_NEVER-now {
++		return _N_CLOCK_NEVER
++	}
++	return now + uint64(ns)
 +}
 +
 +// ---- threads ----
 +
 +func futexsleep(addr *uint32, val uint32, ns int64) {
-+	ms := uintptr(^uint32(0)) // no time limit
++	deadline := _N_CLOCK_NEVER // no time limit
 +	if ns >= 0 {
-+		ms = uintptr((ns + 999999) / 1000000)
-+		if ms >= uintptr(^uint32(0)) {
-+			ms = uintptr(^uint32(0)) - 1
-+		}
++		deadline = nocturneAfter(ns)
 +	}
-+	syscall5(_SYS_WAIT_ADDRESS, uintptr(unsafe.Pointer(addr)), uintptr(val), ms, 0, 0)
++	syscall5(_SYS_WAIT_ADDRESS, uintptr(unsafe.Pointer(addr)), uintptr(val), uintptr(deadline), 0, 0)
 +}
 +
 +//go:nosplit
@@ -3760,16 +3823,12 @@ index 00000000..5f226169
 +	osyield()
 +}
 +
-+// usleep sleeps for at least usec microseconds. The system sleeps in whole
-+// milliseconds, so a short sleep yields the CPU instead.
++// usleep sleeps for at least usec microseconds: until the monotonic
++// deadline that far from now.
 +//
 +//go:nosplit
 +func usleep(usec uint32) {
-+	if usec < 100 {
-+		osyield()
-+		return
-+	}
-+	syscall5(_SYS_SLEEP, uintptr((usec+999)/1000), 0, 0, 0, 0)
++	syscall5(_SYS_SLEEP, uintptr(nocturneAfter(int64(usec)*1000)), 0, 0, 0, 0)
 +}
 +
 +//go:nosplit
@@ -3782,11 +3841,6 @@ index 00000000..5f226169
 +func osinit() {
 +	numCPUStartup = getCPUCount()
 +	physPageSize = 4096
-+	nocturneClock.version = 1
-+	if syscall5(_SYS_CLOCK_INFO, uintptr(unsafe.Pointer(&nocturneClock)), 0, 0, 0, 0) < 0 {
-+		nocturneClock = nocturneClockInfo{}
-+	}
-+	nocturneWallBase = syscall5(_SYS_TIME, 0, 0, 0, 0, 0)*1e9 - nanotime1()
 +}
 +
 +func goenvs() {
@@ -3994,7 +4048,7 @@ new file mode 100644
 index 00000000..4179a948
 --- /dev/null
 +++ b/src/runtime/sys_nocturne_amd64.s
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,104 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -4045,6 +4099,17 @@ index 00000000..4179a948
 +	INT	$0x80
 +	INT	$3
 +	JMP	0(PC)
++
++// func nocturneTSC() (tsc uint64, cpu uint32)
++// RDTSCP waits for the loads before it; the LFENCE holds the loads after it.
++TEXT runtime·nocturneTSC(SB),NOSPLIT,$0-12
++	RDTSCP
++	LFENCE
++	SHLQ	$32, DX
++	ORQ	DX, AX
++	MOVQ	AX, tsc+0(FP)
++	MOVL	CX, cpu+8(FP)
++	RET
 +
 +TEXT runtime·osyield(SB),NOSPLIT,$0
 +	MOVL	$SYS_YIELD, AX
@@ -4145,7 +4210,7 @@ new file mode 100644
 index 00000000..a673859b
 --- /dev/null
 +++ b/src/syscall/syscall_nocturne.go
-@@ -0,0 +1,1039 @@
+@@ -0,0 +1,1055 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -4173,8 +4238,6 @@ index 00000000..a673859b
 +const (
 +	SYS_EXIT              = 0
 +	SYS_SLEEP             = 19
-+	SYS_UPTIME            = 20
-+	SYS_TIME              = 21
 +	SYS_YIELD             = 28
 +	SYS_HANDLE_CLOSE      = 128
 +	SYS_HANDLE_KIND       = 129
@@ -4413,6 +4476,31 @@ index 00000000..a673859b
 +
 +//go:linkname runtime_exitsyscall runtime.exitsyscall
 +func runtime_exitsyscall()
++
++//go:linkname runtime_nanotime runtime.nanotime
++func runtime_nanotime() int64
++
++// Every time the calls take is a deadline: a moment in ns on the system's
++// monotonic clock (Monotonic). CLOCK_NEVER is none; one already passed
++// looks without waiting.
++const CLOCK_NEVER = ^uint64(0)
++
++// Monotonic returns the system's monotonic clock in ns.
++func Monotonic() uint64 {
++	return uint64(runtime_nanotime())
++}
++
++// After returns the deadline d from now; d <= 0 is now.
++func After(d int64) uint64 {
++	now := Monotonic()
++	if d <= 0 {
++		return now
++	}
++	if uint64(d) >= CLOCK_NEVER-now {
++		return CLOCK_NEVER
++	}
++	return now + uint64(d)
++}
 +
 +// Syscall makes Nocturne system call n, letting other goroutines run while
 +// it blocks. It returns the call's non-negative result, or its result code.
@@ -4883,11 +4971,11 @@ index 00000000..a673859b
 +	return int(r), nil
 +}
 +
-+// AppResult waits up to timeoutMs (-1: no limit, 0: not at all) for the
-+// app to end and returns its exit status.
-+func AppResult(h int, timeoutMs int64) (status int, err error) {
++// AppResult waits until the deadline for the app to end and returns its
++// exit status.
++func AppResult(h int, deadline uint64) (status int, err error) {
 +	var st int32
-+	_, e := Syscall(SYS_APP_RESULT, uintptr(h), uintptr(timeoutMs), uintptr(unsafe.Pointer(&st)), 0, 0)
++	_, e := Syscall(SYS_APP_RESULT, uintptr(h), uintptr(deadline), uintptr(unsafe.Pointer(&st)), 0, 0)
 +	return int(st), errnoErr(e)
 +}
 +
@@ -5066,30 +5154,30 @@ index 00000000..a673859b
 +	return errnoErr(e)
 +}
 +
-+// TCPConnect connects to ip:port, waiting at most timeoutMs (0: the
-+// system's limit), and returns the connection number.
-+func TCPConnect(ip uint32, port uint16, timeoutMs int) (int, error) {
-+	r, e := Syscall(SYS_TCP_CONNECT, uintptr(ip), uintptr(port), uintptr(timeoutMs), 0, 0)
++// TCPConnect connects to ip:port, waiting until the deadline, and returns
++// the connection number.
++func TCPConnect(ip uint32, port uint16, deadline uint64) (int, error) {
++	r, e := Syscall(SYS_TCP_CONNECT, uintptr(ip), uintptr(port), uintptr(deadline), 0, 0)
 +	if e != 0 {
 +		return -1, e
 +	}
 +	return int(r), nil
 +}
 +
-+// TCPSendUntil queues b, waiting for room until the uptime deadline in
-+// milliseconds (0: no deadline). It returns how much was queued.
-+func TCPSendUntil(id int, b []byte, deadlineMs uint64, flags int) (int, error) {
-+	r, e := Syscall(SYS_TCP_SEND_UNTIL, uintptr(id), bytePtr(b), uintptr(len(b)), uintptr(deadlineMs), uintptr(flags))
++// TCPSendUntil queues b, waiting for room until the deadline. It returns
++// how much was queued.
++func TCPSendUntil(id int, b []byte, deadline uint64, flags int) (int, error) {
++	r, e := Syscall(SYS_TCP_SEND_UNTIL, uintptr(id), bytePtr(b), uintptr(len(b)), uintptr(deadline), uintptr(flags))
 +	if e != 0 {
 +		return 0, e
 +	}
 +	return int(r), nil
 +}
 +
-+// TCPRecv receives into b, waiting at most timeoutMs (negative: no limit,
-+// 0: not at all, ERR_NOT_READY). 0 bytes means the peer finished sending.
-+func TCPRecv(id int, b []byte, timeoutMs int) (int, error) {
-+	r, e := Syscall(SYS_TCP_RECV, uintptr(id), bytePtr(b), uintptr(len(b)), uintptr(timeoutMs), 0)
++// TCPRecv receives into b, waiting until the deadline (passed with nothing
++// there: ERR_NOT_READY). 0 bytes means the peer finished sending.
++func TCPRecv(id int, b []byte, deadline uint64) (int, error) {
++	r, e := Syscall(SYS_TCP_RECV, uintptr(id), bytePtr(b), uintptr(len(b)), uintptr(deadline), 0)
 +	if e != 0 {
 +		return 0, e
 +	}
@@ -5122,9 +5210,9 @@ index 00000000..a673859b
 +}
 +
 +// TCPAccept takes the listener's next established connection, waiting at
-+// most timeoutMs (like TCPRecv), and reports its remote address.
-+func TCPAccept(id int, timeoutMs int, remote *Sockaddr4) (int, error) {
-+	r, e := Syscall(SYS_TCP_ACCEPT, uintptr(id), uintptr(timeoutMs), uintptr(unsafe.Pointer(remote)), 0, 0)
++// most until the deadline (like TCPRecv), and reports its remote address.
++func TCPAccept(id int, deadline uint64, remote *Sockaddr4) (int, error) {
++	r, e := Syscall(SYS_TCP_ACCEPT, uintptr(id), uintptr(deadline), uintptr(unsafe.Pointer(remote)), 0, 0)
 +	if e != 0 {
 +		return -1, e
 +	}
@@ -5163,10 +5251,10 @@ index 00000000..a673859b
 +	return int(r), nil
 +}
 +
-+// UDPRecv receives one datagram (cut to len(b)), waiting at most timeoutMs
-+// (negative: no limit), and reports its sender.
-+func UDPRecv(id int, b []byte, timeoutMs int, from *Sockaddr4) (int, error) {
-+	r, e := Syscall(SYS_UDP_RECV, uintptr(id), bytePtr(b), uintptr(len(b)), uintptr(timeoutMs), uintptr(unsafe.Pointer(from)))
++// UDPRecv receives one datagram (cut to len(b)), waiting until the
++// deadline, and reports its sender.
++func UDPRecv(id int, b []byte, deadline uint64, from *Sockaddr4) (int, error) {
++	r, e := Syscall(SYS_UDP_RECV, uintptr(id), bytePtr(b), uintptr(len(b)), uintptr(deadline), uintptr(unsafe.Pointer(from)))
 +	if e != 0 {
 +		return 0, e
 +	}
@@ -5177,13 +5265,6 @@ index 00000000..a673859b
 +func UDPClose(id int) error {
 +	_, e := RawSyscall(SYS_UDP_CLOSE, uintptr(id), 0, 0, 0, 0)
 +	return errnoErr(e)
-+}
-+
-+// Uptime returns the milliseconds since the system started, the clock of
-+// TCPSendUntil deadlines.
-+func Uptime() uint64 {
-+	r, _ := RawSyscall(SYS_UPTIME, 0, 0, 0, 0, 0)
-+	return uint64(r)
 +}
 diff --git a/src/time/sys_nocturne.go b/src/time/sys_nocturne.go
 new file mode 100644

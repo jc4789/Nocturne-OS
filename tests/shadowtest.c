@@ -22,7 +22,7 @@ static node_t *query(web_doc *d, node_t *scope, const char *selector) {
 }
 static web_doc *load(const char *markup) {
     web_doc *d = web_live(markup, strlen(markup), "https://shadow.test/page", "utf-8", NULL);
-    if (d) for (int i = 0; i < 8; i++) web_tick(d, uptime_ms());
+    if (d) for (int i = 0; i < 8; i++) web_tick(d, (n_clock_monotonic() / N_NS_PER_MS));
     return d;
 }
 static void paint(web_doc *d) {
@@ -181,7 +181,7 @@ static void css_arena_boundary(void) {
     web_doc *d = web_live(html,strlen(html),"https://shadow.test/arena","utf-8",&callbacks);
     check(d != NULL,"CSS arena boundary document"); if (!d) return;
     check(d->cssmem.limit == 0,"live CSS AST default has no fixed budget");
-    for (int i = 0; i < 8; i++) web_tick(d,uptime_ms());
+    for (int i = 0; i < 8; i++) web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     node_t *n = query(d,d->root,"#arena");
     web_layout(d,VW,VH);
     check(n && n->style && n->style->bg_color == RGB(255,0,0),"CSS before allocation boundary");
@@ -241,7 +241,7 @@ static void css_ast_expansion(void) {
     struct web_host callbacks = {.opaque=&fixture,.request=css_expansion_request,.console=css_expansion_console};
     web_doc *d = web_live(html,strlen(html),"https://shadow.test/expanded","utf-8",&callbacks);
     check(d != NULL,"expanded CSS document"); if (!d) return;
-    for (int i = 0; i < 128 && d->parser; i++) web_tick(d,uptime_ms());
+    for (int i = 0; i < 128 && d->parser; i++) web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     check(d->parser == NULL,"expanded CSS incremental HTML parsing has completed");
     check(fixture.document_request && fixture.requests == 1,"expanded document CSS request is accepted and retained");
     if (d->parser || !fixture.document_request) { web_free(d); return; }
@@ -271,7 +271,7 @@ static void css_ast_expansion(void) {
     snprintf(response.url,sizeof response.url,"https://shadow.test/expanded-doc.css");
     snprintf(response.headers,sizeof response.headers,"Content-Type: text/css\r\n");
     web_resource_loaded(d,fixture.document_request,&response);
-    web_tick(d,uptime_ms());
+    web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     check(d->css_bytes == document_n && fixture.shadow_request && fixture.requests == 2,
           "expanded document CSS body is received before the shadow request");
     if (!fixture.shadow_request) { free(css); web_free(d); return; }
@@ -280,7 +280,7 @@ static void css_ast_expansion(void) {
     response.body_len = shadow_n;
     snprintf(response.url,sizeof response.url,"https://shadow.test/expanded-shadow.css");
     web_resource_loaded(d,fixture.shadow_request,&response);
-    web_tick(d,uptime_ms());
+    web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     free(css);
     check(d->css_bytes == document_n + shadow_n && d->css_bytes < (8u << 20),
           "expanded CSS uses the unchanged shared 8 MiB source budget");

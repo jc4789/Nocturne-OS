@@ -41,6 +41,10 @@ struct sched_policy {
     uint32_t weight;    /* fair: [1, SCHED_WEIGHT_MAX], its share of a CPU against the others' */
     uint64_t request_ns; /* fair: [SCHED_REQUEST_MIN_NS, SCHED_REQUEST_MAX_NS] */
     uint64_t period_ns; /* deadline: [SCHED_PERIOD_MIN_NS, SCHED_PERIOD_MAX_NS] */
+    /* deadline: the most of each period its reservation may take, in SCHED_SHARE_ONE parts (an
+       app's deadline threads share a part of a CPU, sys/thread.c); SCHED_SHARE_ONE leaves only the
+       scheduler's own bound */
+    uint32_t share;
 };
 
 #define SCHED_WEIGHT_DEFAULT 1024u
@@ -52,13 +56,15 @@ struct sched_policy {
    (a 125 us USB microframe) to a second. */
 #define SCHED_PERIOD_MIN_NS 125000ull
 #define SCHED_PERIOD_MAX_NS 1000000000ull
+#define SCHED_SHARE_ONE (1u << 16)
 
 static inline struct sched_policy sched_fair(uint32_t weight, uint64_t request_ns) {
     return (struct sched_policy){.class = SCHED_FAIR, .weight = weight, .request_ns = request_ns};
 }
 static inline struct sched_policy sched_deadline(uint64_t period_ns) {
     return (struct sched_policy){.class = SCHED_DEADLINE, .weight = SCHED_WEIGHT_DEFAULT,
-                                 .request_ns = SCHED_REQUEST_DEFAULT_NS, .period_ns = period_ns};
+                                 .request_ns = SCHED_REQUEST_DEFAULT_NS, .period_ns = period_ns,
+                                 .share = SCHED_SHARE_ONE};
 }
 
 /* A deadline, a moment on the monotonic clock (ns); 0 is none, and comes after every deadline. */
@@ -123,7 +129,11 @@ void sched_thread_bind(struct thread *t, unsigned cpu);
    scheduler: its stacks and record may go then. */
 void sched_thread_remove(struct thread *t);
 /* Any CPU: t runs in that class from here on (a running or waiting one at once). A deadline thread
-   that states another period keeps the reservation it has measured, scaled to the new period. */
+   that states another period keeps the reservation it has measured, scaled to the new period. A
+   thread that comes to the deadline class, or states it again, keeps its job's deadline and what is
+   left of its reservation while that fits the time to the deadline at its bandwidth, else begins a
+   period (the rule of a wake, below); a throttled one stays so until its deadline. So no call gives
+   a thread more than its bandwidth. */
 void sched_set_policy(struct thread *t, struct sched_policy policy);
 /* Any CPU, t's pi lock held (sys/wait.c, priority inheritance): t's inherited deadline becomes
    boost (sched_entity's boost), at once where it runs or waits to. */

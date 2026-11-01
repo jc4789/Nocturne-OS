@@ -499,14 +499,12 @@ int main(int argc, char **argv) {
 
     size_t cap = 4096;
     char *buf = malloc(cap);
-    uint64_t last_blink = n_clock_uptime_ms();
+    uint64_t last_blink = n_clock_monotonic();
     bool alive = shell >= 0;
     for (;;) {
-        uint64_t now = n_clock_uptime_ms();
-        int timeout = (int)(500 - MIN(500, now - last_blink));
-        if (win->qi < win->qn) timeout = 0;
+        uint64_t blink = last_blink + 500 * N_NS_PER_MS;
         struct n_event ev[4];
-        n_events_wait(events, ev, 4, timeout);
+        n_events_wait(events, ev, 4, win->qi < win->qn ? 0 : blink);
 
         struct gui_event e;
         while (win_event(win, &e, 0) > 0) {
@@ -556,8 +554,8 @@ int main(int argc, char **argv) {
                 return 0;
             }
         }
-        now = n_clock_uptime_ms();
-        if (now - last_blink >= 500) {
+        uint64_t now = n_clock_monotonic();
+        if (now >= blink) {
             last_blink = now;
             blink_on = !blink_on;
             dirty[cy] = true;

@@ -15,14 +15,14 @@ static void log_line(void *unused,int level,const char *text){
     else if(level==2){errors++;printf("ERROR %s\n",text);}
 }
 static bool eval(web_doc *doc,const char *source){return web_console_eval(doc,source,strlen(source));}
-static void settle(web_doc *top,unsigned ticks){for(unsigned i=0;i<ticks;i++){web_tick(top,uptime_ms());n_sleep_ms(1);}}
+static void settle(web_doc *top,unsigned ticks){for(unsigned i=0;i<ticks;i++){web_tick(top,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}}
 int main(void){
     const char page[]="<!doctype html><iframe srcdoc='<p>initial frame</p>'></iframe>";
     struct web_host host={.console=log_line,.js_task_budget_ms=5000};
     web_doc *top=web_live(page,sizeof page-1,"https://stream.test/","utf-8",&host);
     check("live-document",top!=NULL);if(!top)goto done;
-    uint64_t deadline=uptime_ms()+10000;web_doc *child=NULL;
-    do{settle(top,1);if(top->frames&&!top->frames->detached)child=top->frames->document;}while(!child&&uptime_ms()<deadline);
+    uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+10000;web_doc *child=NULL;
+    do{settle(top,1);if(top->frames&&!top->frames->detached)child=top->frames->document;}while(!child&&(n_clock_monotonic() / N_NS_PER_MS)<deadline);
     check("live-child-context",child!=NULL);if(!child)goto cleanup;
     settle(top,20);
     /* The embedder establishes a viewport before browser geometry/style reads.

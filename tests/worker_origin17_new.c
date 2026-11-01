@@ -23,7 +23,7 @@ static JSValue JS_GetException(JSContext *ctx){(void)ctx;return 0;}
 static void JS_FreeValue(JSContext *ctx,JSValue value){(void)ctx;(void)value;}
 static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]){(void)s;(void)url;(void)module;if(!blob_available)return NULL;*length=1;snprintf(mime,128,"text/javascript");return strdup("0");}
 static uint64_t clock_now=1000;
-uint64_t uptime_ms(void){return clock_now;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(clock_now)*1000000ULL;}
 struct job {struct {uint64_t deadline;} wire;char error[160];};
 static bool fail(struct job *j,const char *message){snprintf(j->error,sizeof j->error,"%s",message);return false;}
 /* PRODUCT_TRANSFER */

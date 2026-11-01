@@ -234,30 +234,21 @@ size_t wcsftime(wchar_t *s, size_t max, const wchar_t *fmt, const struct tm *tm)
     return n;
 }
 
-/* ISO C timespec_get. The system's wall clock counts whole seconds; the
-   milliseconds come from the uptime counter through an offset that only ever
-   grows toward the true one (each whole-second reading is at most a second
-   early), so the result never goes backwards and its seconds and fraction
-   always agree. */
-static int64_t wall_offset_ms = INT64_MIN;
-static int64_t wall_ms(void) {
-    int64_t up = (int64_t)n_clock_uptime_ms();
-    int64_t seen = n_clock_wall() * 1000 - up;
-    int64_t offset = __atomic_load_n(&wall_offset_ms, __ATOMIC_RELAXED);
-    while (seen > offset &&
-           !__atomic_compare_exchange_n(&wall_offset_ms, &offset, seen, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
-    }
-    return up + (seen > offset ? seen : offset);
-}
+/* ISO C timespec_get: TIME_UTC the wall clock, TIME_MONOTONIC the monotonic one, both in ns. */
 int timespec_get(struct timespec *ts, int base) {
     if (!ts) return 0;
-    int64_t ms;
+    int64_t ns;
     switch (base) {
-    case TIME_UTC: ms = wall_ms(); break;
-    case TIME_MONOTONIC: ms = (int64_t)n_clock_uptime_ms(); break;
+    case TIME_UTC: ns = n_clock_wall(); break;
+    case TIME_MONOTONIC: ns = (int64_t)n_clock_monotonic(); break;
     default: return 0;
     }
-    ts->tv_sec = (time_t)(ms / 1000);
-    ts->tv_nsec = (long)(ms % 1000) * 1000000L;
+    int64_t sec = ns / (int64_t)N_NS_PER_S, frac = ns % (int64_t)N_NS_PER_S;
+    if (frac < 0) {
+        sec--;
+        frac += (int64_t)N_NS_PER_S;
+    }
+    ts->tv_sec = (time_t)sec;
+    ts->tv_nsec = (long)frac;
     return base;
 }

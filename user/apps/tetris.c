@@ -197,7 +197,7 @@ static void show(struct ui_session *s) {
 }
 
 int main(void) {
-    srand((unsigned)n_clock_uptime_ms());
+    srand((unsigned)(n_clock_monotonic() / N_NS_PER_MS));
     struct ui_session *s = ui_session_new();
     if (!s || ui_window(s, WINDOW, W + SIDE + 3 * PAD, H + 2 * PAD, 0, "Tetris", NULL, NULL) < 0) return 1;
     canvas_t *well = ui_surface(s, WELL, W, H, 0), *preview = ui_surface(s, PREVIEW, NW, NH, 0);
@@ -207,11 +207,11 @@ int main(void) {
     draw_next(preview);
     show(s);
     int shown_score = score, shown_lines = lines, shown_level = level, shown_best = best, shown_next = nextp;
-    uint64_t next = n_clock_uptime_ms() + 800;
+    uint64_t next = (n_clock_monotonic() / N_NS_PER_MS) + 800;
     for (bool running = true; running;) {
         int delay = 800 - (level - 1) * 70;
         if (delay < 90) delay = 90;
-        int64_t wait = (int64_t)(next - n_clock_uptime_ms());
+        int64_t wait = (int64_t)(next - (n_clock_monotonic() / N_NS_PER_MS));
         ui_session_wait(s, wait > 0 ? (int)wait : 0);
         bool redraw = false;
         struct ui_event e;
@@ -256,14 +256,14 @@ int main(void) {
                         score += 2;
                     }
                     lock_piece();
-                    next = n_clock_uptime_ms() + delay;
+                    next = (n_clock_monotonic() / N_NS_PER_MS) + delay;
                 }
             }
             redraw = true;
         }
         if (!running || !ui_session_open(s)) break;
-        if ((int64_t)(next - n_clock_uptime_ms()) <= 0) {
-            next = n_clock_uptime_ms() + delay;
+        if ((int64_t)(next - (n_clock_monotonic() / N_NS_PER_MS)) <= 0) {
+            next = (n_clock_monotonic() / N_NS_PER_MS) + delay;
             if (!over && !paused) {
                 if (fits(cur, rot, px, py + 1)) py++;
                 else lock_piece();

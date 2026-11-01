@@ -318,31 +318,31 @@ static void channels(void) {
     CHECK(n_channel_receive(c[1], buf, sizeof buf, 0, NULL) == 5);
     CHECK(n_events_wait(q, ev, 8, 0) == 0);
     CHECK(n_handle_close(c[0]) == 0);
-    CHECK(n_events_wait(q, ev, 8, 1000) == 1 && ev[0].token == 7 && (ev[0].events & N_EVENT_CLOSED));
+    CHECK(n_events_wait(q, ev, 8, n_clock_after(1000 * N_NS_PER_MS)) == 1 && ev[0].token == 7 && (ev[0].events & N_EVENT_CLOSED));
     CHECK(n_channel_receive(c[1], buf, sizeof buf, 0, NULL) == -N_ERR_CLOSED);
     CHECK(n_handle_close(c[1]) == 0); /* ends the watch */
     CHECK(n_events_wait(q, ev, 8, 0) == 0);
     CHECK(n_events_unwatch(q, 7) == 0);
 
-    uint64_t t0 = n_clock_uptime_ms();
-    CHECK(n_events_timer(q, 40, false, 99) == 0);
-    CHECK(n_events_wait(q, ev, 8, -1) == 1 && ev[0].token == 99 && ev[0].events == N_EVENT_TIMER);
-    uint64_t waited = n_clock_uptime_ms() - t0;
-    CHECK(waited >= 30 && waited < 2000);
+    uint64_t t0 = n_clock_monotonic();
+    CHECK(n_events_timer(q, t0 + 40 * N_NS_PER_MS, 0, 99) == 0);
+    CHECK(n_events_wait(q, ev, 8, N_CLOCK_NEVER) == 1 && ev[0].token == 99 && ev[0].events == N_EVENT_TIMER);
+    uint64_t waited = n_clock_monotonic() - t0;
+    CHECK(waited >= 40 * N_NS_PER_MS && waited < 2 * N_NS_PER_S && ev[0].time_ns >= t0 + 40 * N_NS_PER_MS);
     CHECK(n_events_wait(q, ev, 8, 0) == 0); /* one-shot */
-    CHECK(n_events_timer(q, 10, true, 5) == 0);
+    CHECK(n_events_timer(q, n_clock_after(10 * N_NS_PER_MS), 10 * N_NS_PER_MS, 5) == 0);
     int ticks = 0;
-    for (int i = 0; i < 3; i++) ticks += n_events_wait(q, ev, 8, 1000) == 1 && ev[0].token == 5;
+    for (int i = 0; i < 3; i++) ticks += n_events_wait(q, ev, 8, n_clock_after(1000 * N_NS_PER_MS)) == 1 && ev[0].token == 5;
     CHECK(ticks == 3);
     CHECK(n_events_unwatch(q, 5) == 1);
-    CHECK(n_events_wait(q, ev, 8, 50) == 0);
+    CHECK(n_events_wait(q, ev, 8, n_clock_after(50 * N_NS_PER_MS)) == 0);
 
     static volatile uint32_t word;
     CHECK(n_events_watch_address(q, &word, 1, 11) == -N_ERR_NOT_READY);
     CHECK(n_events_watch_address(q, &word, 0, 11) == 0);
     CHECK(n_events_wait(q, ev, 8, 0) == 0);
     CHECK(wake_address(&word, 1) == 1);
-    CHECK(n_events_wait(q, ev, 8, 1000) == 1 && ev[0].token == 11 && ev[0].events == N_EVENT_ADDRESS);
+    CHECK(n_events_wait(q, ev, 8, n_clock_after(1000 * N_NS_PER_MS)) == 1 && ev[0].token == 11 && ev[0].events == N_EVENT_ADDRESS);
     CHECK(n_events_watch_address(q, &word, 0, 12) == 0);
     CHECK(n_events_unwatch(q, 12) == 1);
     CHECK(wake_address(&word, 1) == 0);
@@ -384,8 +384,8 @@ static void apps(const char *self) {
     n_result n = n_channel_receive(c[0], buf, sizeof buf, N_CHANNEL_WAIT, NULL);
     int wn = snprintf(want, sizeof want, "pong:hi:%d", (int)n_app_self());
     CHECK(n == wn && !memcmp(buf, want, (size_t)wn));
-    CHECK(n_events_wait(q, ev, 4, 5000) == 1 && ev[0].token == 3 && ev[0].events == N_EVENT_APP_ENDED);
-    CHECK(n_app_result(app, -1, &status) == 0 && status == 7);
+    CHECK(n_events_wait(q, ev, 4, n_clock_after(5000 * N_NS_PER_MS)) == 1 && ev[0].token == 3 && ev[0].events == N_EVENT_APP_ENDED);
+    CHECK(n_app_result(app, N_CLOCK_NEVER, &status) == 0 && status == 7);
     CHECK(n_app_result(app, 0, &status) == 0 && status == 7); /* the record stays until closed */
     CHECK(n_channel_receive(c[0], buf, sizeof buf, 0, NULL) == -N_ERR_CLOSED);
     CHECK(n_handle_close(app) == 0);
@@ -399,9 +399,9 @@ static void apps(const char *self) {
     l.arguments = wait_args;
     app = n_app_launch(self, &l);
     CHECK(app >= 0);
-    CHECK(n_app_result(app, 50, &status) == -N_ERR_TIMEOUT);
+    CHECK(n_app_result(app, n_clock_after(50 * N_NS_PER_MS), &status) == -N_ERR_TIMEOUT);
     CHECK(n_app_stop(app, 0) == 0);
-    CHECK(n_app_result(app, 5000, &status) == 0 && status != 0);
+    CHECK(n_app_result(app, n_clock_after(5000 * N_NS_PER_MS), &status) == 0 && status != 0);
     CHECK(n_app_stop(app, 0) == 0); /* already ended */
     CHECK(n_app_stop(app, 2) == -N_ERR_INVALID);
     n_handle_close(app);

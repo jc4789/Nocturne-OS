@@ -13,7 +13,7 @@ static volatile uint32_t codec_lock;
 void image_codec_acquire(void) {
     uint32_t expected = 0;
     if (__atomic_compare_exchange_n(&codec_lock, &expected, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
-    while (__atomic_exchange_n(&codec_lock, 2, __ATOMIC_ACQUIRE)) wait_on_address(&codec_lock, 2, 100);
+    while (__atomic_exchange_n(&codec_lock, 2, __ATOMIC_ACQUIRE)) wait_on_address(&codec_lock, 2, n_clock_after(100 * N_NS_PER_MS));
 }
 void image_codec_release(void) {
     if (__atomic_exchange_n(&codec_lock, 0, __ATOMIC_RELEASE) == 2) wake_address(&codec_lock, 1);

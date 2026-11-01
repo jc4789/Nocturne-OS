@@ -115,11 +115,11 @@ n_result win_pointer_shape(window_t *win, uint32_t shape) {
     return win_pointer(win, &pointer);
 }
 
-/* One system call takes every queued event that fits, waiting up to timeout. */
-static n_result fetch(window_t *win, int timeout) {
+/* One system call takes every queued event that fits, waiting until deadline. */
+static n_result fetch(window_t *win, uint64_t deadline) {
     if (win->closed) return -N_ERR_CLOSED;
     n_result n = __syscall(SYS_WIN_RECEIVE, win->handle, (long)win->q,
-                           sizeof win->q / sizeof win->q[0], timeout, 0);
+                           sizeof win->q / sizeof win->q[0], (long)deadline, 0);
     if (n == 0 || n == -N_ERR_TIMEOUT || n == -N_ERR_STOPPED) return 0;
     if (n < 0) {
         win->closed = true;
@@ -130,9 +130,9 @@ static n_result fetch(window_t *win, int timeout) {
     return 1;
 }
 
-n_result win_event(window_t *win, struct gui_event *e, int timeout_ms) {
+n_result win_event(window_t *win, struct gui_event *e, uint64_t deadline) {
     if (win->qi >= win->qn) {
-        n_result r = fetch(win, timeout_ms);
+        n_result r = fetch(win, deadline);
         if (r <= 0) return r;
     }
     *e = win->q[win->qi++];

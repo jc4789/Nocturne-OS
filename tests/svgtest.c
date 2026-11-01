@@ -57,8 +57,8 @@ static void gradient_namespace(void) {
     struct web_host host = {.console = svg_dom_console};
     web_doc *d = web_live(html, strlen(html), "https://svg.test/", "utf-8", &host);
     if (d) {
-        for (int i=0;i<200 && !svg_dom_ready && !svg_dom_errors;i++) web_tick(d, uptime_ms());
-        web_tick(d, uptime_ms()); /* Finish the incremental parser after the setter task. */
+        for (int i=0;i<200 && !svg_dom_ready && !svg_dom_errors;i++) web_tick(d, (n_clock_monotonic() / N_NS_PER_MS));
+        web_tick(d, (n_clock_monotonic() / N_NS_PER_MS)); /* Finish the incremental parser after the setter task. */
     }
     check(d && svg_dom_ready && !svg_dom_errors, "gradient namespace real DOM setters");
     if (d && svg_dom_ready && !svg_dom_errors) {

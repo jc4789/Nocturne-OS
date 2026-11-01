@@ -810,7 +810,7 @@ static bool flip_completed(void) {
             hand_back("nvrm's surface is not seen on the display");
             return false;
         }
-        n_sleep_ms(1);
+        n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
     }
     scr.flipping = false;
     if (scr.flip_told || seen.status + 1 != scr.flip_status_told) flip_seen_log(&seen);
@@ -1337,14 +1337,14 @@ static int state_thread(void *unused) {
     uint64_t seen = 0;
     bool refused = false;
     while (!__atomic_load_n(&scr.state_stop, __ATOMIC_ACQUIRE)) {
-        n_result r = n_pci_screen_state(nvrm_dev.pci, seen, &state_followed, STATE_WAIT_MS);
+        n_result r = n_pci_screen_state(nvrm_dev.pci, seen, &state_followed, n_clock_after(STATE_WAIT_MS * N_NS_PER_MS));
         if (r == -N_ERR_TIMEOUT) continue;
         if (r < 0) {
             /* Not while nvrm neither shows its surface nor offers modes; looked at again later. */
             if (__atomic_load_n(&scr.state_stop, __ATOMIC_ACQUIRE)) break; /* nvrm stops */
             if (!refused) nvrm_log(LOG "the system does not say what the screen shows: %s", n_result_text(r));
             refused = true;
-            n_sleep_ms(STATE_WAIT_MS);
+            n_sleep_until(n_clock_after(STATE_WAIT_MS * N_NS_PER_MS));
             continue;
         }
         refused = false;

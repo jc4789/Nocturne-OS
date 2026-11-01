@@ -1897,7 +1897,7 @@ void web_motion_transitions(struct web_motion_site *site, const style_t *before,
 void web_motion_cancel(node_t *n, int pseudo);                  /* style canceled them; pseudo -1: all */
 void web_animations_cascading(web_doc *d, bool on);
 void web_animations_tick(web_doc *d, uint64_t now);
-int64_t web_animations_deadline(web_doc *d);                   /* absolute uptime_ms(), as web_deadline */
+int64_t web_animations_deadline(web_doc *d);                   /* absolute (n_clock_monotonic() / N_NS_PER_MS), as web_deadline */
 void web_animations_doc_free(web_doc *d);
 void web_animations_node_free(node_t *n);
 void web_animations_set_origin(web_doc *d, uint64_t origin);   /* the time origin of performance.now() */
@@ -2586,7 +2586,7 @@ struct web_doc {
     bool restyle_dirty; /* dirty, but only marked elements' own computed values (CSS animation samples) */
     bool initial_render_done;
     /* Paint Timing: when this document's first paint, and its first
-       contentful paint, ended (uptime_ms; 0 before). paint.c records each
+       contentful paint, ended (monotonic ms; 0 before). paint.c records each
        once from a real paint walk; js.c reports them to the timeline. */
     uint64_t first_paint_ms, first_contentful_paint_ms;
     uint64_t initial_render_deadline; /* paint fallback only: never cancels resources */
@@ -2912,7 +2912,7 @@ void doc_rescan(web_doc *d);
 void web_marquee_register(web_doc *d, node_t *node);
 void web_marquee_set(node_t *node, bool running);
 void web_marquee_tick(web_doc *d, uint64_t now);
-int64_t web_marquee_deadline(web_doc *d); /* absolute uptime_ms(), as web_deadline */
+int64_t web_marquee_deadline(web_doc *d); /* absolute (n_clock_monotonic() / N_NS_PER_MS), as web_deadline */
 bool web_marquee_box(const box_t *box);
 void doc_sync_tree(web_doc *d);
 node_t *doc_image_node_next(web_doc *d, node_t *previous);

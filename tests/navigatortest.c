@@ -62,16 +62,16 @@ static void run_case(const char *cases,unsigned cpus,const char *languages,int m
     if(mode){host.cookie_get=cookies_get;host.cookie_set=cookies_set;host.cookie_enabled=cookies_enabled;}
     web_doc *doc=web_live(page,strlen(page),"https://navigator.test/","utf-8",&host);free(page);
     if(!doc){webcookie_free(f.jar);failures++;return;}
-    uint64_t deadline=uptime_ms()+15000;bool toggled=mode!=1;
-    while((!f.done||!toggled)&&uptime_ms()<deadline){
-        web_tick(doc,uptime_ms());
+    uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+15000;bool toggled=mode!=1;
+    while((!f.done||!toggled)&&(n_clock_monotonic() / N_NS_PER_MS)<deadline){
+        web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));
         if(f.ready&&!toggled){
             const char *disabled="check('live-cookie-disabled',navigator.cookieEnabled===false)";
             const char *enabled="check('live-cookie-enabled',navigator.cookieEnabled===true)";
             f.enabled=false;if(!web_console_eval(doc,disabled,strlen(disabled)))f.failed++;
             f.enabled=true;if(!web_console_eval(doc,enabled,strlen(enabled)))f.failed++;toggled=true;
         }
-        n_sleep_ms(1);
+        n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
     }
     if(!f.ready||!f.done||!toggled||f.errors||f.checks!=(mode==1?120:63)){printf("FAIL navigator completion mode=%d ready=%d done=%d checks=%d errors=%d\n",mode,f.ready,f.done,f.checks,f.errors);f.failed++;}
     checks+=f.checks;failures+=f.failed;web_free(doc);webcookie_free(f.jar);
@@ -79,11 +79,11 @@ static void run_case(const char *cases,unsigned cpus,const char *languages,int m
 static void native_check(const char *name,bool yes){checks++;if(!yes)failures++;printf("%s %s\n",yes?"OK":"FAIL",name);}
 /* One turn of the browser's loop: wait on the window process's queue and hand its reports to
    web_wait_events (the preferences' watch among them), then tick the document. */
-static void turn(web_doc *doc,int ms){
+static void turn(web_doc *doc,uint64_t ms){
     n_handle queue=web_wait_queue();struct n_event events[32];
-    n_result ready=queue>=0?n_events_wait(queue,events,32,ms):0;
+    n_result ready=queue>=0?n_events_wait(queue,events,32,n_clock_after(ms*N_NS_PER_MS)):0;
     if(ready>0)web_wait_events(events,(size_t)ready);
-    if(doc)web_tick(doc,uptime_ms());
+    if(doc)web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));
 }
 /* HTML NavigatorLanguage: a change of the user's languages queues, for the window, an iframe
    and a dedicated Worker, one languagechange task each; navigator.languages stays the same
@@ -125,8 +125,8 @@ static void run_languages(void){
     web_doc *doc=web_live(languages_page,sizeof languages_page-1,"https://navigator.test/languages","utf-8",&host);
     if(!doc){native_check("languages-page",false);return;}
     bool ready=false,changed=false;
-    uint64_t deadline=uptime_ms()+15000;
-    while(!ready&&uptime_ms()<deadline){turn(doc,5);ready=f.ready;}
+    uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+15000;
+    while(!ready&&(n_clock_monotonic() / N_NS_PER_MS)<deadline){turn(doc,5);ready=f.ready;}
     native_check("languages-ready",ready);
     /* Two catalog languages the list does not start with: a list the realms have not seen. */
     char now[WEBPREFS_ACCEPT_LANGUAGE_MAX+1]="";webprefs_languages(now,sizeof now);
@@ -142,19 +142,19 @@ static void run_languages(void){
         uint64_t generation=webprefs_languages_generation();
         native_check("languages-set",webprefs_set_languages(tags,2)==0);
         /* The process's copy changes when the watch reports (no tick: no realm runs a task). */
-        uint64_t until=uptime_ms()+5000;
-        while(webprefs_languages_generation()==generation&&uptime_ms()<until)turn(NULL,20);
+        uint64_t until=(n_clock_monotonic() / N_NS_PER_MS)+5000;
+        while(webprefs_languages_generation()==generation&&(n_clock_monotonic() / N_NS_PER_MS)<until)turn(NULL,20);
         char list[WEBPREFS_ACCEPT_LANGUAGE_MAX+1]="";webprefs_languages(list,sizeof list);
         native_check("languages-copy-changed",webprefs_languages_generation()!=generation&&!strcmp(list,expected));
         /* Before the window's languagechange task begins, the same frozen array. */
         const char *kept="check('languages-kept-until-task',navigator.languages===before&&navigator.language===before[0]&&windowEvents===0)";
         if(!web_console_eval(doc,kept,strlen(kept)))f.failed++;
         expected_checks+=1+3+2+2;
-        while(!f.done&&uptime_ms()<deadline)turn(doc,5);
+        while(!f.done&&(n_clock_monotonic() / N_NS_PER_MS)<deadline)turn(doc,5);
         changed=f.done;
         /* No second task: keep the loop going a while longer. */
-        uint64_t settle=uptime_ms()+500;
-        while(uptime_ms()<settle)turn(doc,5);
+        uint64_t settle=(n_clock_monotonic() / N_NS_PER_MS)+500;
+        while((n_clock_monotonic() / N_NS_PER_MS)<settle)turn(doc,5);
         const char *once="check('languages-once',windowEvents===1&&frameEvents===1&&workerEvents===1);"
                          "check('languages-worker-matches-window',workerLanguage===navigator.language)";
         if(!web_console_eval(doc,once,strlen(once)))f.failed++;

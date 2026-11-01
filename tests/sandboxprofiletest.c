@@ -44,7 +44,7 @@ static node_t *find_id(web_doc *d,const char *id){
     return NULL;
 }
 static struct web_frame *frame(const char *id){node_t *n=find_id(top,id);return n?web_frame_find(top,n):NULL;}
-static void pump(void){for(int i=0;i<8;i++){web_tick(top,uptime_ms());n_sleep_ms(1);}}
+static void pump(void){for(int i=0;i<8;i++){web_tick(top,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}}
 static bool deliver(const char *needle,const char *url,const char *extra,const char *body){
     for(unsigned i=0;i<32;i++)if(queued[i].used&&strstr(queued[i].url,needle)){
         struct web_response r={.status=200};web_response_set_url(&r,url?url:queued[i].url);
@@ -174,7 +174,7 @@ int main(void){
     if(granted)web_dispatch(granted,find_id(granted,"top"),&click);
     check("synthetic-event-no-activation",granted&&granted->sandbox_activation_until==0);
     click.synthetic=false;if(granted)web_dispatch(granted,find_id(granted,"top"),&click);
-    check("native-trusted-event-activation",granted&&granted->sandbox_activation_until>uptime_ms());
+    check("native-trusted-event-activation",granted&&granted->sandbox_activation_until>(n_clock_monotonic() / N_NS_PER_MS));
     uint32_t saved=active?active->sandbox_flags:0;
     check("sandbox-attribute-removal-saved",safe&&doc_node_attr(top,safe->element,"sandbox",NULL));pump();
     check("active-policy-immutable-after-attribute-change",active&&safe->document==active&&active->sandbox_flags==saved&&!web_sandbox_forms_allowed(active));

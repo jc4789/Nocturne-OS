@@ -523,13 +523,13 @@ static JSValue native_webidl(JSContext *ctx, JSValueConst this_val, int argc, JS
     (void)this_val;
     const char *global = argc ? JS_ToCString(ctx, argv[0]) : NULL;
     if (!global) return JS_EXCEPTION;
-    uint64_t start = uptime_ms();
+    uint64_t start = (n_clock_monotonic() / N_NS_PER_MS);
     struct shaper s;
     bool known = shaper_open(&s, ctx, global);
     JS_FreeCString(ctx, global);
     if (!known) return JS_ThrowTypeError(ctx, "Unknown Web IDL global");
     for (unsigned k = 0; k < WEBIDL_INTERFACE_COUNT; k++) shape(&s, &webidl_interfaces[k], true);
-    s.report.milliseconds = (unsigned)(uptime_ms() - start);
+    s.report.milliseconds = (unsigned)((n_clock_monotonic() / N_NS_PER_MS) - start);
     last_report = s.report;
     shaper_close(&s);
     return JS_UNDEFINED;

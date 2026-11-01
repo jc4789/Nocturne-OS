@@ -1559,7 +1559,7 @@ void web_animations_collect(web_doc *d) {
 int64_t web_animations_deadline(web_doc *d) {
     struct web_animations *x = d ? d->animations : NULL;
     if (!x || !d->visible || __atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE)) return -1;
-    uint64_t now = uptime_ms();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
     if (__atomic_load_n(&x->added, __ATOMIC_ACQUIRE)) return (int64_t)now;
     bool running = false;
     for (struct web_animation *a = x->first; a; a = a->next) {

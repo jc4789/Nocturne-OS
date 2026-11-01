@@ -8,7 +8,7 @@
 int errno;
 static unsigned checks,failed,cookie_calls;
 #define CHECK(c) do{checks++;if(!(c)){failed++;printf("FAIL report:%d %s\n",__LINE__,#c);}}while(0)
-uint64_t uptime_ms(void){return 10;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(10)*1000000ULL;}
 long webcookie_export(webcookie_jar *jar,void *out,size_t cap,int64_t now){(void)jar;(void)out;(void)cap;(void)now;return 0;}
 long webcookie_get(webcookie_jar *jar,const struct webcookie_context *c,char *out,size_t cap,int64_t now){(void)jar;(void)c;(void)out;(void)cap;(void)now;cookie_calls++;return 0;}
 const char *http_response_headers(const struct http_resp *r){return r->headers_full?r->headers_full:r->headers;}

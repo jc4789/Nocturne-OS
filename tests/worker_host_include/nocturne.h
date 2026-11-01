@@ -25,7 +25,7 @@ int poll(struct n_pollfd *,int,int);
 int n_channel_listen(const char *);
 int n_channel_connect(const char *);
 int n_channel_accept(int);
-uint64_t uptime_ms(void);
+uint64_t n_clock_monotonic(void);
 int cpu_info(struct n_cpuinfo *);
 void yield(void);
 size_t strlcpy(char *,const char *,size_t);

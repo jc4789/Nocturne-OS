@@ -355,8 +355,8 @@ int main(void) {
         flush_keys(s, labels);
         if (view) show(s);
         bool active = any_voice();
-        if ((active && n_clock_uptime_ms() - last_scope >= 33) || active != was_active) {
-            last_scope = n_clock_uptime_ms();
+        if ((active && (n_clock_monotonic() / N_NS_PER_MS) - last_scope >= 33) || active != was_active) {
+            last_scope = (n_clock_monotonic() / N_NS_PER_MS);
             if (!active) memset(scope, 0, sizeof scope);
             draw_scope(scope_c);
             ui_surface_changed(s, S_SCOPE);

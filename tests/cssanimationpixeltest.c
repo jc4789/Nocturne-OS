@@ -17,7 +17,7 @@ static void pixel(void) {
         "<div id=target style='opacity:.2;animation:fade 1s linear -.5s both paused'></div></body></html>";
     web_doc *d=web_live(html,strlen(html),"https://css-animation.test/","utf-8",NULL);
     if(!d){check("native opacity affects raster pixels",false);return;}
-    for(int i=0;i<8;i++)web_tick(d,uptime_ms());
+    for(int i=0;i<8;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     web_layout(d,320,200);
     node_t *n=d->body?d->body->first:NULL;
     doc_node_attr(d,n,"style","opacity:.2;animation:fade 1s linear -.5s both paused;width:20px;height:20px;background:red");

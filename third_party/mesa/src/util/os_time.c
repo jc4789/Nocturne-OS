@@ -49,7 +49,7 @@
 #elif DETECT_OS_WINDOWS
 #  include <windows.h>
 #elif DETECT_OS_NOCTURNE
-#  include <nocturne.h> /* n_sleep_ms, yield */
+#  include <nocturne.h> /* n_sleep_until, yield */
 #else
 #  error Unsupported OS
 #endif
@@ -71,6 +71,10 @@ os_time_nanosleep_until(int64_t deadline)
    time.tv_sec = deadline / INT64_C(1000000000);
    time.tv_nsec = deadline % INT64_C(1000000000);
    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &time, &time) == EINTR);
+#elif DETECT_OS_NOCTURNE
+   /* os_time_get_nano is the system's monotonic clock, the one the sleep's deadline is on. */
+   if (deadline > 0)
+      n_sleep_until((uint64_t)deadline);
 #else
    int64_t duration = deadline - os_time_get_nano();
    if (duration > 0) {
@@ -99,7 +103,7 @@ os_time_sleep(int64_t usecs)
    }
 #elif DETECT_OS_NOCTURNE
    if (usecs > 0)
-      n_sleep_ms((uint64_t)((usecs + 999) / 1000));
+      n_sleep_until(n_clock_after((uint64_t)usecs * N_NS_PER_US));
 #else
 #  error Unsupported OS
 #endif

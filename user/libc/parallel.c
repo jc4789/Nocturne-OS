@@ -63,7 +63,7 @@ static void pool_acquire(void) {
     if (__atomic_compare_exchange_n(&pool_lock, &expected, 1, false,
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
     while (__atomic_exchange_n(&pool_lock, 2, __ATOMIC_ACQUIRE))
-        wait_on_address(&pool_lock, 2, 10);
+        wait_on_address(&pool_lock, 2, n_clock_after(10 * N_NS_PER_MS));
 }
 static void pool_release(void) {
     if (__atomic_exchange_n(&pool_lock, 0, __ATOMIC_RELEASE) == 2)
@@ -88,7 +88,7 @@ static void sample_cpu(struct parallel_worker *w) {
 static void run_jobs(struct parallel_worker *w, parallel_service_fn service, void *service_context) {
     struct parallel_work *work = w->work;
     w->items = w->units = w->elapsed_ms = w->cpu_mask = 0;
-    uint64_t start = work->profile ? uptime_ms() : 0;
+    uint64_t start = work->profile ? (n_clock_monotonic() / N_NS_PER_MS) : 0;
     size_t index;
     while (claim(work, &index)) {
         if (work->profile && !(w->items & 63)) sample_cpu(w);
@@ -97,7 +97,7 @@ static void run_jobs(struct parallel_worker *w, parallel_service_fn service, voi
         if (service) service(service_context);
     }
     if (work->profile && w->items) {
-        sample_cpu(w); w->elapsed_ms = uptime_ms() - start;
+        sample_cpu(w); w->elapsed_ms = (n_clock_monotonic() / N_NS_PER_MS) - start;
     }
 }
 bool parallel_get_stats(enum parallel_stage stage, struct parallel_stats *out) {
@@ -119,7 +119,7 @@ static void worker_main(void *context) {
     for (;;) {
         uint32_t now = __atomic_load_n(&w->epoch, __ATOMIC_ACQUIRE);
         if (__atomic_load_n(&stopping, __ATOMIC_ACQUIRE)) break;
-        if (now == seen) { wait_on_address(&w->epoch, seen, UINT_MAX); continue; }
+        if (now == seen) { wait_on_address(&w->epoch, seen, N_CLOCK_NEVER); continue; }
         seen = now;
         uint64_t offered = (uint64_t)now * 2;
         if (!__atomic_compare_exchange_n(&w->gate, &offered, offered + 1, false,
@@ -173,7 +173,7 @@ static bool dispatch(enum parallel_stage stage, size_t count, parallel_fn fn, vo
         (count > 1 ? (unsigned)MIN(count - 1, (size_t)worker_count) : 0);
     struct parallel_work work = { .count=count, .fn=fn, .context=context, .stage=stage,
         .profile=__atomic_load_n(&profiling, __ATOMIC_RELAXED) };
-    uint64_t start = work.profile ? uptime_ms() : 0;
+    uint64_t start = work.profile ? (n_clock_monotonic() / N_NS_PER_MS) : 0;
     if (helpers) {
         if (++epoch == 0) ++epoch;
         for (unsigned i = 0; i < helpers; i++) {
@@ -199,13 +199,13 @@ static bool dispatch(enum parallel_stage stage, size_t count, parallel_fn fn, vo
             uint32_t value = __atomic_load_n(&w->done, __ATOMIC_RELAXED);
             if (value == epoch) break;
             if (service) service(service_context);
-            wait_on_address(&w->done, value, service ? 2 : UINT_MAX);
+            wait_on_address(&w->done, value, service ? n_clock_after(2 * N_NS_PER_MS) : N_CLOCK_NEVER);
         }
     }
     thread_local_set(POOL_TLS, NULL);
     if (work.profile) {
         struct parallel_stats *s = &statistics[stage];
-        s->batches++; s->wall_ms += uptime_ms() - start;
+        s->batches++; s->wall_ms += (n_clock_monotonic() / N_NS_PER_MS) - start;
         accumulate(s, &caller, false);
         for (unsigned i = 0; i < helpers; i++) accumulate(s, &workers[i], true);
     }

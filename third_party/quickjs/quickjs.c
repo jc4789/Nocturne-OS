@@ -63303,7 +63303,7 @@ static JSValue js_atomics_wait(JSContext *ctx,
     int size_log2;
     int64_t v;
     double timeout;
-    uint64_t deadline = 0;
+    uint64_t deadline = N_CLOCK_NEVER;
     uint32_t expected;
 
     if (js_atomics_wait_args(ctx, argc, argv, &ptr, &size_log2, &v, &timeout))
@@ -63312,24 +63312,18 @@ static JSValue js_atomics_wait(JSContext *ctx,
         return JS_ThrowTypeError(ctx, "cannot block in this thread");
     if (js_atomics_wait_load(ptr, size_log2) != v)
         return JS_AtomToString(ctx, JS_ATOM_not_equal);
-    if (isfinite(timeout))
-        deadline = n_clock_uptime_ms() + (uint64_t)ceil(timeout);
+    /* The timeout is in ms; the wait ends at a monotonic deadline in ns. */
+    if (isfinite(timeout) && timeout * N_NS_PER_MS < (double)N_CLOCK_NEVER)
+        deadline = n_clock_after(timeout > 0 ? (uint64_t)ceil(timeout * N_NS_PER_MS) : 0);
     /* The kernel re-checks the word while enrolling. A BigInt64 element was
-       compared in full above and enrolls on its low word. A finite wait longer
-       than one kernel call re-enrolls with the word's current value: the agent
+       compared in full above and enrolls on its low word. A wake that leaves
+       the word changed re-enrolls with the word's current value: the agent
        stays a waiter until notified or timed out, whatever the value becomes. */
     expected = (uint32_t)v;
     for (BOOL enrolled = FALSE;; enrolled = TRUE) {
-        unsigned ms;
-        if (!isfinite(timeout)) {
-            ms = UINT32_MAX;
-        } else {
-            uint64_t now = n_clock_uptime_ms();
-            if (now >= deadline)
-                return JS_AtomToString(ctx, JS_ATOM_timed_out);
-            ms = deadline - now < UINT32_MAX ? (unsigned)(deadline - now) : UINT32_MAX - 1;
-        }
-        n_result waited = wait_on_address((volatile uint32_t *)ptr, expected, ms);
+        if (deadline != N_CLOCK_NEVER && n_clock_monotonic() >= deadline)
+            return JS_AtomToString(ctx, JS_ATOM_timed_out);
+        n_result waited = wait_on_address((volatile uint32_t *)ptr, expected, deadline);
         if (waited >= 0)
             return JS_AtomToString(ctx, JS_ATOM_ok);
         /* The first enrollment is the comparison of the spec's critical section. */
@@ -63339,8 +63333,8 @@ static JSValue js_atomics_wait(JSContext *ctx,
             expected = atomic_load((_Atomic(uint32_t) *)ptr);
             continue;
         }
-        if (waited == -N_ERR_TIMEOUT && isfinite(timeout))
-            continue;
+        if (waited == -N_ERR_TIMEOUT)
+            return JS_AtomToString(ctx, JS_ATOM_timed_out);
         /* N_ERR_STOPPED: the app is being stopped; the wait cannot complete. */
         return JS_AtomToString(ctx, JS_ATOM_timed_out);
     }

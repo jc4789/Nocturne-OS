@@ -39,7 +39,7 @@ static bool request(void *opaque,const struct web_request *r){
     (void)opaque;state.requests++;if(r->kind==WEB_RESOURCE_IMAGE)state.images++;
     for(int i=0;i<16;i++)if(!state.pending[i].used){
         struct queued *q=&state.pending[i];q->used=true;q->id=r->id;snprintf(q->url,sizeof q->url,"%s",r->url);
-        q->due=uptime_ms()+((strstr(r->url,"slow.svg")||strstr(r->url,"old.svg"))?80:2);return true;
+        q->due=(n_clock_monotonic() / N_NS_PER_MS)+((strstr(r->url,"slow.svg")||strstr(r->url,"old.svg"))?80:2);return true;
     }
     return false;
 }
@@ -50,7 +50,7 @@ static void log_message(void *opaque,int level,const char *message){
     if(!strncmp(message,"IMAGE-DONE ",11)){state.done=true;printf("%s\n",message);}
 }
 static void deliver(void){
-    for(int i=0;i<16;i++)if(state.pending[i].used&&state.pending[i].due<=uptime_ms()){
+    for(int i=0;i<16;i++)if(state.pending[i].used&&state.pending[i].due<=(n_clock_monotonic() / N_NS_PER_MS)){
         struct queued q=state.pending[i];state.pending[i].used=false;
         const char *body=strstr(q.url,"one.svg")?one:strstr(q.url,"two.svg")?two:
             (strstr(q.url,"slow.svg")||strstr(q.url,"old.svg"))?slow:"not an image";
@@ -75,8 +75,8 @@ int main(int argc,char **argv){
     struct web_host host={.request=request,.cancel=cancel,.console=log_message};
     state.doc=web_live(html,strlen(html),"http://image.fixture/index.html","utf-8",&host);free(html);
     if(!state.doc){puts("FAIL Image document allocation");return 1;}
-    uint64_t deadline=uptime_ms()+15000;
-    while(!state.done&&uptime_ms()<deadline){deliver();web_tick(state.doc,uptime_ms());web_layout(state.doc,800,600);n_sleep_ms(1);}
+    uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+15000;
+    while(!state.done&&(n_clock_monotonic() / N_NS_PER_MS)<deadline){deliver();web_tick(state.doc,(n_clock_monotonic() / N_NS_PER_MS));web_layout(state.doc,800,600);n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}
     if(!state.done){state.failures++;puts("FAIL Image test timeout");}
     if(state.images<5||state.completions<5){state.failures++;puts("FAIL detached image transport was not exercised");}
     web_free(state.doc);

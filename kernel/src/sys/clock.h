@@ -25,12 +25,14 @@
    (clock_wall_proof; the RTC now, which the clock reads itself). A network time service would be
    one of each.
 
-   All of it lives in the clock's data (struct clock_data) in pages of their own: the kernel
-   writes them, under a sequence count; readers retry while it is odd. */
+   All of it lives in the clock's data (struct n_clock, abi.h) in pages of their own: the kernel
+   writes them, under a sequence count; readers retry while it is odd. Every app has them mapped
+   read-only (clock_map) and reads its clocks there without a call. */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "abi.h"
 
 #define NS_PER_US ((uint64_t)1000)
 #define NS_PER_MS ((uint64_t)1000000)
@@ -38,31 +40,9 @@
 #define CLOCK_NEVER UINT64_MAX /* a deadline that never comes */
 #define CLOCK_RATE_UNMEASURED UINT32_MAX /* a rate's bound before any reference measured it */
 
-/* The clock's data, as its pages hold it. With t this CPU's TSC (read by RDTSCP, whose TSC_AUX
-   is the CPU's index) less offset[that index]:
-     monotonic ns = base_ns + ((t - base_tsc) * mult >> shift)   (base_ns when t <= base_tsc)
-     boot ns      = monotonic ns + asleep_ns
-     wall ns      = wall_ns + (monotonic ns - wall_from) + the slew's part: wall_slew's sign times
-                    min(|wall_slew|, (min(monotonic ns, wall_until) - wall_from) * wall_slew_mult >> 32)
-   A reader loads seq (acquire), reads the TSC, the fields, and seq again: equal and even, the
-   fields belong together; else it reads again. */
-struct clock_data {
-    uint32_t seq;
-    uint32_t cpus;          /* offset[]'s entries: the CPUs the machine has */
-    uint64_t base_tsc, base_ns;
-    uint64_t mult;          /* ns per TSC count, times 2^shift */
-    uint32_t shift;
-    uint32_t rate_bound;    /* how far mult may be from the true rate against the rate reference,
-                               in 2^-32 parts; CLOCK_RATE_UNMEASURED while it is as stated */
-    uint64_t tsc_hz;        /* the rate mult stands for */
-    uint64_t asleep_ns;
-    int64_t wall_ns;
-    uint64_t wall_from, wall_until;
-    int64_t wall_slew;
-    uint64_t wall_slew_mult;
-    int64_t offset[];       /* by CPU index: what its TSC reads more than the clock's */
-};
-
+/* The clock's data, as its pages hold it, is the ABI's struct n_clock (abi.h): every app reads
+   it at N_CLOCK_ADDRESS. Its readers here take it as the ABI says, and also while a write is in
+   progress on their own CPU (sys/clock.c). */
 /* This CPU's TSC, read once every earlier instruction is done (RDTSCP waits for them, SDM Vol.
    2B) and before any later one begins (the LFENCE after it); *cpu (when given): this CPU's index,
    its TSC_AUX (arch/smp.c percpu_load). */
@@ -169,8 +149,10 @@ static inline void clock_spin(uint64_t ns) {
    arms on it; a program's clock starts from it); false past the TSC's reach. The answer holds
    until the rate changes (alarm_clock_changed tells the wake devices). */
 bool clock_tsc_at(uint64_t ns, uint64_t *tsc);
-/* The clock's data: its first frame (physical, *first) and the count of frames. */
-size_t clock_data_pages(uint64_t *first);
+/* The clock's data into an app's space at N_CLOCK_ADDRESS, read-only (proc_launch): 0, or an
+   error. */
+struct vmm_space;
+int clock_map(struct vmm_space *s);
 /* S3 and hibernation, on CPU 0 with the others stopped: before sleeping, interrupts off; after
    waking, before anything reads the clock (the TSC may have begun again from 0, the rate
    reference's count may have stopped). The monotonic clock goes on from where it stopped, the

@@ -278,15 +278,30 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     子アプリは起動元と同じ利用者のために働く：libc の `n_app_launch` は、起動が名指さなければ
     起動元自身の `USERFOLDER` と `TEMP` を渡す（ブラウザーの窓と、その Worker・保存・設定の窓が
     同じ profile を使う）。どちらも無い起動には、カーネルがシステムの利用者のものを加える。
-- 終了はアプリハンドルのイベント（§6）で届く。`n_app_result(h, timeout_ms, int *status)` で
-  直接待つこともできる（-1 は無期限、0 は待たずに `N_ERR_NOT_READY`、期限切れは
-  `N_ERR_TIMEOUT`）。最後のハンドルを閉じれば記録は消える。
+- 終了はアプリハンドルのイベント（§6）で届く。`n_app_result(h, deadline, int *status)` で
+  直接待つこともできる（期限は §8。呼出しの時点で過ぎた期限は待たずに `N_ERR_NOT_READY`、
+  待って期限が来れば `N_ERR_TIMEOUT`）。最後のハンドルを閉じれば記録は消える。
 - `n_app_stop(h, N_APP_STOP_TREE か 0)`：停止要求。
 - スレッド：`thread_create(fn, arg)` は 256 KiB、`thread_create_sized(fn, arg, bytes)` は
   少なくとも `bytes` のスタック（ページは初めて触れたときに割り当てる）で `fn` を動かし、
   0 にならない識別子を返す。終わったスレッドは `thread_join` か `thread_detach` まで残る。
   `thread_detach` 後は終わり次第カーネルが解放し、join はできない（`N_ERR_INVALID`）。
   アプリの終了は全スレッドを止めて回収する。
+- スレッドの級：`n_thread_schedule(tid, schedule, value)`（`SYS_THREAD_SCHEDULE`）。`tid` は同じ
+  アプリのスレッド（0 は呼んだスレッド）。ほかのアプリのスレッド、終わったスレッドは
+  `N_ERR_NOT_FOUND`。範囲の外の `schedule`・`value` は `N_ERR_INVALID`。
+  - `N_SCHEDULE_FAIR`：`value` は重み（1〜`N_SCHEDULE_WEIGHT_DEFAULT`）。走りたいスレッドの間で、
+    重みに比べた CPU の分を受ける。スレッドは初め、既定の重みでこの級にいる。アプリは既定より
+    重くできない。
+  - `N_SCHEDULE_DEADLINE`：`value` は周期の ns（`N_SCHEDULE_PERIOD_MIN_NS`〜
+    `N_SCHEDULE_PERIOD_MAX_NS`）。装置の周期（画面のフレーム、音の塊）ごとに一つの仕事をする
+    スレッドのため。起きたスレッドは、周期ごとにシステムが取り置く時間の内で、公平の級のどの
+    スレッドより先に走る（締切の早いものから）。取り置きを使い切ると、次の周期まで公平の級として
+    走る。取り置きは周期ごとに測った仕事の時間で、一つのアプリの締切の級のスレッドを合わせて
+    一つの CPU の半分まで（等分）。だから一つのアプリが CPU を一つ占めることは無い。
+    呼び直しは周期の残りの取り置きを満たさない。
+  - ブラウザーは絵を作るスレッド（主ループ）を表示のフレームの周期で、Web Audio の描き手を
+    描画の量子（128 フレーム）の周期でこの級に置く。
 - `n_app_self()`、`n_app_parent()`：アプリ識別子（共有ページの受渡しの許可判定用）。
 - `n_app_open(id)`：アプリ一覧の識別子から、動作中のアプリのハンドルを得る（タスク
   マネージャーや `kill` が `n_app_stop` するため）。`n_app_id(h)`：ハンドルの識別子
@@ -306,12 +321,15 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - 監視はハンドルを保持しない。ハンドルが最後に閉じられると監視も消える。
 - アドレス監視もこの待ち行列で行う：`n_events_watch_address(q, address,
   expected, token)`。値が既に違えば `N_ERR_NOT_READY`。通知されると `N_EVENT_ADDRESS`。
-- タイマー：`n_events_timer(q, ms, repeat, token)`。`N_EVENT_TIMER` で届く。繰返しの
-  タイマーは遅れた分をまとめて報告せず、周期を保つ。
+- タイマー：`n_events_timer(q, due, period, token)`。`due` は最初の時刻（§8 の期限）、
+  `period` は繰返しの周期の ns（0 は一度だけ）。`N_EVENT_TIMER` で届く。繰返しのタイマーは
+  遅れた分をまとめて報告せず、`due` から周期の格子を保つ。
 - `n_events_unwatch(q, token)`：その token の監視・タイマー・アドレス監視を外す。
   0＝無かった、1＝外した、2＝アドレスの通知が既に届いていた（取り消した）。
-- `n_events_wait(q, struct n_event *out, max, timeout_ms)`：届いた分を一括で返す
-  （一回に最大64件。残りは次の待ちで返る）。-1 は無期限、0 は待たない。
+- `n_events_wait(q, struct n_event *out, max, deadline)`：届いた分を一括で返す
+  （一回に最大64件。残りは次の待ちで返る）。期限は §8（`N_CLOCK_NEVER` は無期限、過ぎた期限は
+  待たない）。`struct n_event {token; events; reserved; time_ns;}` の `time_ns` は単調時計の ns：
+  タイマーはその格子の上の時刻、ほかは事象をカーネルが知った時刻。
 
 ## 7. メモリ
 
@@ -347,10 +365,10 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   `N_ERR_DENIED`。
   - 結び付いていないページ、または読取りだけで結び付いたページへの書込みに触れたスレッドは
     （カーネル内のコピーも同じ）、ページャーの答えを待つ。`n_pager_take(pager, out, max,
-    timeout_ms)` は待っている触れ方を `struct n_pager_fault {offset; access; app;}` で最大 `max`
+    deadline)` は待っている触れ方を `struct n_pager_fault {offset; access; app;}` で最大 `max`
     個返す（同じページ・同じ権利への触れ方は一つにまとまる。読取りは同じページで待っている
     書込みとは別の触れ方で、読取りでの結び付けでも答えが出る。`app` は最初に触れたアプリの識別子）。
-    `timeout_ms` は -1 で無期限、0 で待たない（`N_ERR_TIMEOUT`）。触れ方が待っている間、
+    期限（§8）が来れば `N_ERR_TIMEOUT`。触れ方が待っている間、
     ハンドルは `N_EVENT_RECEIVABLE`、メモリが無くなれば（ハンドルも写像も無い）`N_EVENT_CLOSED`
     で、take は `N_ERR_CLOSED`。
   - `n_pager_supply(pager, runs, count)` は `struct n_pager_supply {offset, bytes, source_offset;
@@ -396,18 +414,35 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   領域の大きさはヒープの1/16（256KiB〜8MiB）。最新の領域だけ末尾の空きを一つ分温存し、
   それ以外の領域の末尾の空きはページ単位で返し、全部空いた古い領域は丸ごと返す。
   1MiB以上のブロックは専用の領域で、解放すれば即座に返る。
-- アドレス待ち：`wait_on_address(addr, expected, ms)`／`wait_on_address64` は起こされると0、
-  語が `expected` でなければ `-N_ERR_NOT_READY`、期限で `-N_ERR_TIMEOUT`、アプリ停止中は
+- アドレス待ち：`wait_on_address(addr, expected, deadline)`／`wait_on_address64` は起こされると0、
+  語が `expected` でなければ `-N_ERR_NOT_READY`、期限（§8）で `-N_ERR_TIMEOUT`、アプリ停止中は
   `-N_ERR_STOPPED` を直接返す（`errno` は触らない）。`wake_address(addr, count)` は起こした数
-  （`count == 0` は全員）。`ms == UINT32_MAX` は無期限。共有ページ上でもアプリをまたいで働く。
+  （`count == 0` は全員）。`N_CLOCK_NEVER` は無期限。共有ページ上でもアプリをまたいで働く。
 
 ## 8. 時間
 
-- `n_clock_uptime_ms()`、`n_clock_wall()`（壁時計の秒）、`n_sleep_ms(ms)`（結果は無い。
-  旧 `msleep` は削除した。ISO Cの `thrd_sleep` はこれの上に作る）。
+- ABI が渡す時間は全部 ns。期限は単調時計の上の時刻（ns）で、`N_CLOCK_NEVER` は期限なし、
+  呼出しの時点で過ぎた期限は待たずに見るだけ。`n_clock_after(ns)` が今から `ns` 後の期限を返す
+  （桁あふれは `N_CLOCK_NEVER`）。
+- 時計は三つ。どれも呼出しなしで、自分のメモリーで読む。
+  - `n_clock_monotonic()`：TSC が数え始めてからの ns。機械が眠る間は止まる。期限の時計。
+  - `n_clock_boot()`：単調時計に眠った時間を足したもの。
+  - `n_clock_wall()`：壁時計（1970 年からの UTC の ns、`int64_t`）。時刻合わせの差は飛ばずに
+    ゆっくり埋まる（slew）。
+- 時計のデータ：カーネルの持つ `struct n_clock`（`abi.h`）と、その後の CPU ごとの `offset[cpus]`
+  は、全アプリの `N_CLOCK_ADDRESS` に読取りだけで写る（`N_CLOCK_BYTES` まで。`n_memory_protect`
+  で書込みにすれば `N_ERR_DENIED`）。読み方は `abi.h` のとおり：`seq` を読み（奇数の間はカーネルが
+  書いている）、RDTSCP で TSC と CPU の番号（TSC_AUX、§0）を読み、欄とその CPU の offset を読み、
+  `seq` を読み直す。違えば読み直す。monotonic = `base_ns + ((t - base_tsc) * mult >> shift)`
+  （t は TSC から offset を引いたもの）。TSC は不変（invariant）であることを前提にする。
+- `n_sleep_until(deadline)`（`SYS_SLEEP`、結果は無い）：期限まで眠る。ISO C の `thrd_sleep` は
+  これの上に作る。
 - `n_random(buf, n)`：システムのエントロピーから `n` バイト。
 - `gettimeofday`、`struct timeval` は無い。ISO Cの `time`／`timespec_get`／`localtime` は
-  これらの上に実装する。
+  これらの上に実装する（`timespec_get` の `TIME_MONOTONIC` は単調時計、`TIME_UTC` は壁時計で、
+  どちらも ns まで）。
+- `proclist` の `struct n_procinfo` の `cpu_ns`（走った時間）と `start_ns`（始まった単調時計の
+  時刻）、`sysinfo` の `struct n_sysinfo` の `uptime_ns`（単調時計）も ns。
 
 ## 9. 装置
 
@@ -620,13 +655,13 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     無い間だけ許される。許可の出入りは窓へ `EV_DIRECT`（key 1 許可、0 取消し）、今の状態は
     `win_state` の `WIN_STATE_DIRECT`。取り消された窓へは描き直しの損傷も送るので、
     窓は自分の通常の面へ描き直す。
-  - `n_pci_screen_state(pci, seen, out, timeout_ms)`：画面をこの claim の面へ描かせているか、
+  - `n_pci_screen_state(pci, seen, out, deadline)`：画面をこの claim の面へ描かせているか、
     モードを出したドライバーが、出すべきモード（`mode`、`mode_serial`。上）と、直接表示を受け持つ
     なら許可された窓（`struct n_screen_state` の `app`。無ければ 0）と、その間ドライバーが
     描くポインター（位置・表示の有無・32×32 の ARGB 画像とその要点、画像が変わると
     `pointer_serial` が進む。画像は窓の管理が選んだもの：その形の絵か、窓が `SYS_WIN_POINTER`
-    で渡した画像。§10）を読む。`serial` が `seen` と同じ間は `timeout_ms` まで待つ
-    （0 は待たない。`N_ERR_TIMEOUT` でも今の状態を書く）。画面がこの claim の面でなく、
+    で渡した画像。§10）を読む。`serial` が `seen` と同じ間は期限（§8）まで待つ
+    （過ぎた期限は待たない。`N_ERR_TIMEOUT` でも今の状態を書く）。画面がこの claim の面でなく、
     モードも出していなければ `N_ERR_DENIED`。claim の終わりと起動時の
     画面への返却で直接表示は終わり、許可も取り消す。
   - `n_pci_screen_image(pci, surface, desc)`／`n_pci_screen_image_end(pci, image)`：直接表示を
@@ -685,15 +720,15 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
       上流のブリッジの独自の名前はその下の全機能（ホストブリッジなら機械全体）に効くので、そこ
       では全部断る。RM（ports/nvidia/os_acpi.c）が使う、自分の装置と上流の `_DSM`、自分の装置の
       `_ROM`・`_DOD`、子の `_ADR`・`_DDC`・`MXDS`・`MXDM` はどれも断る方法に当たらない。
-  - `n_pci_acpi_notify_take(pci, timeout_ms)`：その機能の装置へ届いた ACPI の Notify を一つ
+  - `n_pci_acpi_notify_take(pci, deadline)`：その機能の装置へ届いた ACPI の Notify を一つ
     取り出し、値を返す（最初の呼出しで受取りを始め、claim の終わりまで続く。32 個まで溜め、
-    溢れたら古いものから捨てる）。`timeout_ms` の間届かなければ `N_ERR_TIMEOUT`、装置が
+    溢れたら古いものから捨てる）。期限（§8）まで届かなければ `N_ERR_TIMEOUT`、装置が
     無ければ `N_ERR_NOT_FOUND`。
   - `n_pci_bar(pci, i)` はメモリ BAR を装置メモリの共有オブジェクト（既定は非キャッシュ）にする。
     1 ページ未満や境界の合わない BAR、I/O ポートは扱わない。
   - `n_pci_interrupts(pci, count)` は MSI-X（無ければ MSI）を最大 32 本つなぎ、本数を返す。
     INTx はアプリへ渡さない。届いた割り込みは番号のビットを立て、ビットがある間ハンドルは
-    `N_EVENT_RECEIVABLE`。`n_pci_interrupt_take(pci, timeout_ms)` がビットを取り出して消す。
+    `N_EVENT_RECEIVABLE`。`n_pci_interrupt_take(pci, deadline)` がビットを取り出して消す（期限は §8）。
   - `n_dma_create(pci, bytes, flags)` は装置が DMA で読み書きできる 0 埋めの RAM（共有
     オブジェクト）。`N_DMA_CONTIGUOUS` は物理的に一続き、`N_DMA_32BIT` は 4GiB 未満。
     `n_dma_addresses` が各ページのバスアドレスを返す（物理アドレス。IOMMU が隔離していても
@@ -801,12 +836,12 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 
 ## 10. 番号と、ほかの節に無い呼出し
 
-欠番：1〜18、22〜25、30〜32、35〜37、51〜52、57、60〜63、90、203〜206。ハンドルの種類 12 も
-欠番。欠番は再利用せず、残る番号は意味を変えない（OS内で tcc 等が作ったプログラムのため）。
+欠番：1〜18、20〜25、30〜32、35〜37、44、51〜52、60〜63、90、203〜206。ハンドルの種類 12 も
+欠番。ABI は呼出しの古い形を残さない：プログラムは動かすシステムの `abi.h` で組む。
 
 ほかの節に無い呼出し：
 
-- `SYS_WIN_RECEIVE`（窓、`struct gui_event *out`、最大数、`timeout_ms`）：待ち行列から
+- `SYS_WIN_RECEIVE`（窓、`struct gui_event *out`、最大数、期限（§8））：待ち行列から
   入るだけ一度に受け取る。件数、期限で0、閉じた窓が最後のイベントを渡し終えると
   `N_ERR_CLOSED`。窓はバイト列として読めない。
 - `SYS_MEMORY_RESERVE`／`RELEASE`／`PROTECT`：`n_memory_*` そのもの。`access` が

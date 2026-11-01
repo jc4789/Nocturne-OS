@@ -218,7 +218,7 @@ int web_presentation_request(web_doc *d,node_t *n,int kind,const struct web_host
     if(kind==2&&d->pip_element==n)return WEB_PRESENT_OK;
     if(kind==2&&d->pip_session==UINT64_MAX)return WEB_PRESENT_BACKEND;
     bool consume_activation=kind==1||!d->pip_element;
-    if(consume_activation&&d->sandbox_activation_until<=uptime_ms())return WEB_PRESENT_ACTIVATION;
+    if(consume_activation&&d->sandbox_activation_until<=(n_clock_monotonic() / N_NS_PER_MS))return WEB_PRESENT_ACTIVATION;
     web_doc *top=top_document(d),*previous=kind==1?top->fullscreen_owner:top->pip_owner;
     struct web_presentation_event *events=events_reserve(d,n,kind==1?1:2,kind==1);if(!events)return WEB_PRESENT_BACKEND;
     if(previous&&!web_presentation_exit(previous,kind)){events_free(events);return WEB_PRESENT_BACKEND;}

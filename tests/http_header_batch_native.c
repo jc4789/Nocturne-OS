@@ -11,7 +11,7 @@ static bool short_write;
 static char sent[8192];
 static size_t sent_n;
 static uint64_t clock_ms;
-uint64_t uptime_ms(void){return clock_ms;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(clock_ms)*1000000ULL;}
 net_stream *ns_open(const char *h,uint16_t p,bool tls,int t,char *e,size_t n) {
     (void)h;(void)p;(void)tls;(void)t;(void)e;(void)n;stream.at=0;return &stream;
 }

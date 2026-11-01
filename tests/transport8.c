@@ -6,10 +6,10 @@
 #include <errno.h>
 #ifdef _WIN32
 #include "../user/include/http.h"
-extern void n_sleep_ms(uint64_t);
+extern void n_sleep_until(uint64_t);
 extern int thread_create(void (*)(void *),void *);
 extern int thread_join(int);
-extern uint64_t uptime_ms(void);
+extern uint64_t n_clock_monotonic(void);
 #else
 #include "http.h"
 #include "nocturne.h"
@@ -42,8 +42,8 @@ static void h1_tests(void) {
     CHECK(request("eof","GET","one",&r,&result)==0&&r.body_len>0);http_resp_free(&r);
     CHECK(request("plain","GET","one",&r,&result)==0&&!result.reused&&connection(&r)!=id);http_resp_free(&r);
     CHECK(request("stale","GET","one",&r,&result)==0);id=connection(&r);http_resp_free(&r);
-    n_sleep_ms(10);CHECK(request("plain","GET","one",&r,&result)==0&&connection(&r)!=id);http_resp_free(&r);
-    CHECK(request("stale","GET","post",&r,&result)==0);http_resp_free(&r);n_sleep_ms(10);
+    n_sleep_until(n_clock_after(10 * N_NS_PER_MS));CHECK(request("plain","GET","one",&r,&result)==0&&connection(&r)!=id);http_resp_free(&r);
+    CHECK(request("stale","GET","post",&r,&result)==0);http_resp_free(&r);n_sleep_until(n_clock_after(10 * N_NS_PER_MS));
     CHECK(request("plain","POST","post",&r,&result)<0);CHECK(result.response_bytes_received==0&&result.error!=HTTP_ERR_NONE);http_resp_free(&r);
     http_pool_clear();
 }
@@ -122,24 +122,24 @@ static unsigned load_running(const volatile uint32_t *p) {
 static void publish_running(volatile uint32_t *p) {
     unsigned value=1;__asm__ volatile("movl %1, %0":"=m"(*p):"r"(value):"memory");
 }
-static int cancel_stalled(void *ctx){struct stalled_upload *s=ctx;return uptime_ms()-s->started>=300;}
+static int cancel_stalled(void *ctx){struct stalled_upload *s=ctx;return (n_clock_monotonic() / N_NS_PER_MS)-s->started>=300;}
 static int stalled_progress(void *ctx,size_t sent,size_t total){struct stalled_upload *s=ctx;(void)total;s->queued=sent;return 0;}
 static void stalled_request(void *ctx) {
     struct stalled_upload *s=ctx;char url[256];address(url,sizeof url,h2_port,"/stall-upload");
     struct http_req rq={.url=url,.method="POST",.body=s->body,.body_len=8u*1024*1024,.timeout_ms=10000,.ctx=s};
     struct http_stream_hooks hooks={.upload=stalled_progress,.cancelled=cancel_stalled};
-    s->started=uptime_ms();publish_running(&s->running);
+    s->started=(n_clock_monotonic() / N_NS_PER_MS);publish_running(&s->running);
     s->code=http_request_h2_prior_knowledge_ex(&rq,&s->response,1048576,&hooks,"h2-stall",&s->result);
-    s->elapsed=uptime_ms()-s->started;
+    s->elapsed=(n_clock_monotonic() / N_NS_PER_MS)-s->started;
 }
 static void backpressure_test(void) {
     http_pool_clear();struct stalled_upload s={0};s.body=malloc(8u*1024*1024);CHECK(s.body!=NULL);if(!s.body)return;
     memset(s.body,'b',8u*1024*1024);int tid=thread_create(stalled_request,&s);CHECK(tid>=0);if(tid<0){free(s.body);return;}
-    while(!load_running(&s.running))n_sleep_ms(1);
-    n_sleep_ms(50);char url[256];address(url,sizeof url,h2_port,"/trailers?while-upload-blocked");
+    while(!load_running(&s.running))n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
+    n_sleep_until(n_clock_after(50 * N_NS_PER_MS));char url[256];address(url,sizeof url,h2_port,"/trailers?while-upload-blocked");
     struct http_req rq={.url=url,.timeout_ms=200};struct http_resp r;struct http_transport_result result;
-    uint64_t started=uptime_ms();int code=http_request_h2_prior_knowledge_ex(&rq,&r,1048576,NULL,"h2-stall",&result);
-    uint64_t elapsed=uptime_ms()-started;thread_join(tid);
+    uint64_t started=(n_clock_monotonic() / N_NS_PER_MS);int code=http_request_h2_prior_knowledge_ex(&rq,&r,1048576,NULL,"h2-stall",&result);
+    uint64_t elapsed=(n_clock_monotonic() / N_NS_PER_MS)-started;thread_join(tid);
     printf("transport8 backpressure: other=%llu ms upload=%llu ms queued=%zu accepted=%zu other-error=%d upload-error=%d\n",
         (unsigned long long)elapsed,(unsigned long long)s.elapsed,s.queued,s.result.request_bytes_sent,result.error,s.result.error);
     CHECK(code<0&&result.error==HTTP_ERR_TIMEOUT&&elapsed>=200&&elapsed<=350);
@@ -174,19 +174,19 @@ static void h2_tests(void) {
     CHECK(h2_request("/goaway","GET",NULL,0,NULL,NULL,NULL,&r,&result)==0);http_resp_free(&r);
     CHECK(h2_request("/trailers","GET",NULL,0,NULL,NULL,NULL,&r,&result)==0&&connection(&r)!=id);http_resp_free(&r);
     CHECK(h2_request("/late-goaway","GET",NULL,0,NULL,NULL,NULL,&r,&result)==0);id=connection(&r);http_resp_free(&r);
-    n_sleep_ms(100);
+    n_sleep_until(n_clock_after(100 * N_NS_PER_MS));
     CHECK(h2_request("/trailers","GET",NULL,0,NULL,NULL,NULL,&r,&result)==0&&connection(&r)!=id);http_resp_free(&r);
     struct http_stream_hooks hooks={.cancelled=cancelled};
     CHECK(h2_request("/large","GET",NULL,0,&hooks,NULL,NULL,&r,&result)<0&&result.error==HTTP_ERR_CANCELLED&&result.request_bytes_sent==0);http_resp_free(&r);
     http_pool_clear();
 }
 static unsigned port_file(const char *path){FILE *f=fopen(path,"r");char b[64];unsigned n=0;if(f){if(fgets(b,sizeof b,f))n=(unsigned)strtoul(b,NULL,10);fclose(f);}return n;}
-static int cancel_silent_handshake(void *ctx){return uptime_ms()-*(uint64_t*)ctx>=250;}
+static int cancel_silent_handshake(void *ctx){return (n_clock_monotonic() / N_NS_PER_MS)-*(uint64_t*)ctx>=250;}
 static int tls_cancel_test(const char *peer,unsigned port) {
-    char error[160];http_pool_clear();uint64_t started=uptime_ms();
+    char error[160];http_pool_clear();uint64_t started=(n_clock_monotonic() / N_NS_PER_MS);
     net_stream *s=ns_open_http_cancelled_timed(peer,(uint16_t)port,true,30000,error,sizeof error,
         NULL,"silent-handshake",cancel_silent_handshake,&started);
-    int cause=errno;uint64_t elapsed=uptime_ms()-started;
+    int cause=errno;uint64_t elapsed=(n_clock_monotonic() / N_NS_PER_MS)-started;
     printf("transport8 TLS-cancel: elapsed=%llu ms errno=%d %s\n",(unsigned long long)elapsed,cause,s?"unexpected stream":error);
     CHECK(s==NULL&&cause==ECANCELED);CHECK(elapsed>=250&&elapsed<=400);
     if(s)ns_abort(s);printf("transport8 TLS-cancel: %u checks, %u failed\n",checks,failed);return failed!=0;
@@ -240,10 +240,10 @@ static void tls_h2_get_tests(const char *peer) {
     snprintf(g[0].url,sizeof g[0].url,"https://%s/httpbin/delay/1?transport8=one",peer);
     snprintf(g[1].url,sizeof g[1].url,"https://%s/httpbin/delay/1?transport8=two",peer);
     int first=thread_create(tls_get_request,&g[0]);CHECK(first>=0);if(first<0)return;
-    uint64_t started=uptime_ms();bool initial_wait_timed_out=false;
+    uint64_t started=(n_clock_monotonic() / N_NS_PER_MS);bool initial_wait_timed_out=false;
     while(!load_running(&g[0].request_accepted)&&!load_running(&g[0].done)) {
-        if(uptime_ms()-started>=35000){initial_wait_timed_out=true;break;}
-        n_sleep_ms(1);
+        if((n_clock_monotonic() / N_NS_PER_MS)-started>=35000){initial_wait_timed_out=true;break;}
+        n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
     }
     CHECK(load_running(&g[0].request_accepted)&&!load_running(&g[0].headers_seen));
     int second=thread_create(tls_get_request,&g[1]);CHECK(second>=0);

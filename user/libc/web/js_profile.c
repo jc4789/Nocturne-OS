@@ -59,13 +59,13 @@ static struct js_profile_function *find(struct js_profile *p, const void *functi
 }
 
 void js_profile_start(struct js_profile *profile) {
-    if (profile) profile->last_us = uptime_us();
+    if (profile) profile->last_us = (n_clock_monotonic() / N_NS_PER_US);
 }
 
 void js_profile_sample(struct js_profile **profile, JSRuntime *rt, JSContext *ctx) {
     struct js_profile *p = *profile;
     if (!p && !(p = *profile = calloc(1, sizeof *p))) return;
-    uint64_t now = uptime_us(), spent = p->last_us ? now - p->last_us : 0;
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_US), spent = p->last_us ? now - p->last_us : 0;
     p->last_us = now;
     const void *function = JS_GetRunningFunction(rt);
     struct js_profile_function *f = function && spent ? find(p, function, ctx) : NULL;

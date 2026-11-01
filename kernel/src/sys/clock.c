@@ -1,6 +1,7 @@
 /* The clocks (sys/clock.h).
 
-   The data. struct clock_data lives in pages of its own (clock_data_pages), written under
+   The data. struct n_clock lives in pages of its own, which every app has mapped read-only
+   (clock_map), written under
    clock_lock (a leaf) by a sequence count: odd while the fields change. A reader that finds it
    odd waits for the write to end, unless the write is its own CPU's (an NMI's code on top of it):
    then it reads `before` and `before_offset`, the fields and its offset as they were; so does
@@ -68,6 +69,7 @@
 #include "arch/spin.h"
 #include "dev/refclock.h"
 #include "mm/pmm.h"
+#include "mm/vmm.h"
 #include "sys/alarm.h"
 #include "sys/clock.h"
 #include "sys/wait.h"
@@ -76,12 +78,12 @@
 #define ONE_Q32 (1ull << 32) /* the bounds' unit: 2^-32 */
 #define FIRST_SHIFT 12       /* the first window: each part of its bound under 2^-12 (244 ppm) */
 
-static struct clock_data *data; /* NULL before clock_init */
+static struct n_clock *data; /* NULL before clock_init */
 static uint64_t data_first;
 static size_t data_count;
 static struct spinlock clock_lock;
 static uint32_t writer;            /* the CPU index + 1 inside a write */
-static struct clock_data before;   /* the header as it was before the write in progress */
+static struct n_clock before;   /* the header as it was before the write in progress */
 static int64_t before_offset;      /* and the writer's own offset */
 static bool stopped;               /* clock_stop: a write in progress may never end */
 
@@ -127,11 +129,11 @@ static uint64_t ppb_of(uint64_t bound) {
    three), with this CPU's offset; the TSC less the offset is the clock's reading. A write in
    progress is waited out, unless it is this CPU's own (an NMI on top of it) or the kernel has
    stopped (clock_stop): then the fields as they were before it. */
-static uint64_t consistent(const struct clock_data *d, struct clock_data *h, bool all, int64_t *offset) {
+static uint64_t consistent(const struct n_clock *d, struct n_clock *h, bool all, int64_t *offset) {
     for (;;) {
         uint32_t seq = __atomic_load_n(&d->seq, __ATOMIC_ACQUIRE), cpu;
         uint64_t raw = clock_tsc_read(&cpu);
-        const struct clock_data *from = d;
+        const struct n_clock *from = d;
         bool own = false;
         if (seq & 1) {
             own = __atomic_load_n(&writer, __ATOMIC_RELAXED) == cpu + 1;
@@ -162,16 +164,16 @@ static uint64_t consistent(const struct clock_data *d, struct clock_data *h, boo
 }
 
 uint64_t clock_now_ns(void) {
-    const struct clock_data *d = __atomic_load_n(&data, __ATOMIC_ACQUIRE);
+    const struct n_clock *d = __atomic_load_n(&data, __ATOMIC_ACQUIRE);
     if (!d) return 0;
-    struct clock_data h;
+    struct n_clock h;
     int64_t offset;
     uint64_t raw = consistent(d, &h, false, &offset);
     return ns_at(h.base_tsc, h.base_ns, h.mult, raw - (uint64_t)offset);
 }
 
 /* A consistent copy of the header, and the monotonic clock at one TSC reading of this CPU. */
-static uint64_t snapshot(struct clock_data *h) {
+static uint64_t snapshot(struct n_clock *h) {
     int64_t offset;
     uint64_t raw = consistent(data, h, true, &offset);
     return ns_at(h->base_tsc, h->base_ns, h->mult, raw - (uint64_t)offset);
@@ -179,22 +181,22 @@ static uint64_t snapshot(struct clock_data *h) {
 
 uint64_t clock_boot_ns(void) {
     if (!__atomic_load_n(&data, __ATOMIC_ACQUIRE)) return 0;
-    struct clock_data h;
+    struct n_clock h;
     uint64_t t = snapshot(&h);
     return t + h.asleep_ns;
 }
 
 uint64_t clock_tsc_hz(void) {
     if (!__atomic_load_n(&data, __ATOMIC_ACQUIRE)) return 0;
-    struct clock_data h;
+    struct n_clock h;
     snapshot(&h);
     return h.tsc_hz;
 }
 
 bool clock_tsc_at(uint64_t ns, uint64_t *tsc) {
-    const struct clock_data *d = __atomic_load_n(&data, __ATOMIC_ACQUIRE);
+    const struct n_clock *d = __atomic_load_n(&data, __ATOMIC_ACQUIRE);
     if (!d) return false;
-    struct clock_data h;
+    struct n_clock h;
     int64_t offset;
     consistent(d, &h, false, &offset);
     uint64_t ticks, t;
@@ -208,9 +210,15 @@ bool clock_tsc_at(uint64_t ns, uint64_t *tsc) {
 
 void clock_stop(void) { __atomic_store_n(&stopped, true, __ATOMIC_RELEASE); }
 
-size_t clock_data_pages(uint64_t *first) {
-    *first = data_first;
-    return data_count;
+_Static_assert(N_CLOCK_ADDRESS >= USER_STACK_TOP && N_CLOCK_ADDRESS + N_CLOCK_BYTES <= USER_TOP,
+              "the clock's data lies above the main stack, within the apps' half");
+int clock_map(struct vmm_space *s) {
+    for (size_t i = 0; i < data_count; i++) {
+        int r = vmm_map_page(s, N_CLOCK_ADDRESS + i * PAGE_SIZE, data_first + i * PAGE_SIZE,
+                             PTE_U | PTE_SHARED | PTE_SHARED_RO | PTE_NX);
+        if (r < 0) return r;
+    }
+    return 0;
 }
 
 /* ---- writing (clock_lock held, interrupts off) ---- */
@@ -688,7 +696,7 @@ static void edge_start(int64_t s, uint64_t a, uint64_t b) {
     edge_begin(s, a, b);
 }
 
-static int64_t wall_at(const struct clock_data *h, uint64_t t) {
+static int64_t wall_at(const struct n_clock *h, uint64_t t) {
     int64_t wall = h->wall_ns + (int64_t)(t > h->wall_from ? t - h->wall_from : 0);
     if (h->wall_slew) {
         uint64_t until = t < h->wall_until ? t : h->wall_until, ran = until > h->wall_from ? until - h->wall_from : 0;
@@ -702,7 +710,7 @@ static int64_t wall_at(const struct clock_data *h, uint64_t t) {
 
 int64_t clock_wall_ns(void) {
     if (!__atomic_load_n(&data, __ATOMIC_ACQUIRE)) return 0;
-    struct clock_data h;
+    struct n_clock h;
     uint64_t t = snapshot(&h);
     return wall_at(&h, t);
 }
@@ -770,11 +778,12 @@ static void wall_init(void) {
 
 void clock_init(void) {
     unsigned cpus = topology.cpus;
-    size_t bytes = sizeof(struct clock_data) + (size_t)cpus * sizeof(int64_t);
+    size_t bytes = sizeof(struct n_clock) + (size_t)cpus * sizeof(int64_t);
+    if (bytes > N_CLOCK_BYTES) panic("clock: %u CPUs' offsets do not fit the apps' window of the clock's data", cpus);
     data_count = ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE;
     data_first = pmm_alloc_contig(data_count, 64);
     if (!data_first) panic("clock: no memory for its data");
-    struct clock_data *d = phys_to_virt(data_first);
+    struct n_clock *d = phys_to_virt(data_first);
     memset(d, 0, data_count * PAGE_SIZE);
     d->cpus = cpus;
     d->shift = SHIFT;

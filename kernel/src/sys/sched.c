@@ -186,7 +186,12 @@ static bool fair(const struct sched_entity *e) { return !deadline(e) || (e->thro
 static bool reserved(const struct sched_entity *e) { return e->policy.class == SCHED_DEADLINE && !e->boost; }
 
 static uint64_t dl_least(uint64_t period) { return period >> DL_LEAST_SHIFT; }
-static uint64_t dl_most(uint64_t period) { return period - (period >> DL_SHARE_SHIFT); }
+static uint64_t dl_most(const struct sched_policy *p) {
+    uint64_t most = p->period_ns - (p->period_ns >> DL_SHARE_SHIFT), part;
+    if (p->share < SCHED_SHARE_ONE && clock_muldiv(p->period_ns, p->share, SCHED_SHARE_ONE, &part) && part < most)
+        most = part;
+    return most;
+}
 
 static void lock2(unsigned a, unsigned b) {
     spin_take(&rq(a < b ? a : b)->lock);
@@ -437,18 +442,22 @@ static void dl_measure(struct sched_entity *e, uint64_t used) {
     uint64_t period = e->policy.period_ns, decayed = e->dl_peak - (e->dl_peak >> DL_DECAY_SHIFT);
     e->dl_peak = MAX(used, decayed);
     uint64_t want = e->dl_peak > UINT64_MAX / 2 ? UINT64_MAX : 2 * e->dl_peak;
-    e->dl_reserve = MIN(MAX(want, dl_least(period)), dl_most(period));
+    e->dl_reserve = MIN(MAX(want, dl_least(period)), dl_most(&e->policy));
 }
 
-/* A deadline thread woken at now releases a job. It keeps its deadline while the reservation left
-   fits the time to it at its bandwidth (left / (due - now) <= reserve / period); else the job
-   begins a period of its own. A throttled one waits for its deadline (replenish_fire). */
+/* Whether e keeps its deadline at now: the reservation left fits the time to it at its bandwidth
+   (left / (due - now) <= reserve / period). */
+static bool dl_keeps(const struct sched_entity *e, uint64_t now) {
+    return earlier(now, e->dl_due) &&
+           (unsigned __int128)e->dl_left * e->policy.period_ns <= (unsigned __int128)(e->dl_due - now) * e->dl_reserve;
+}
+
+/* A deadline thread woken at now releases a job. It keeps its deadline while dl_keeps; else the
+   job begins a period of its own. A throttled one waits for its deadline (replenish_fire). */
 static void dl_release(struct sched_entity *e, uint64_t now) {
     e->dl_job = 0;
     if (e->throttled) return;
-    if (!earlier(now, e->dl_due) ||
-        (unsigned __int128)e->dl_left * e->policy.period_ns > (unsigned __int128)(e->dl_due - now) * e->dl_reserve)
-        dl_period(e, now);
+    if (!dl_keeps(e, now)) dl_period(e, now);
 }
 
 /* q's lock held, q charged: q's curr, a deadline thread, spent its reservation. Before its deadline
@@ -988,21 +997,25 @@ void sched_set_policy(struct thread *t, struct sched_policy policy) {
     bool running = t == curr(q), queued = e->queued, kick = false;
     charge(q);
     if (running || queued) queue_leave(q, e);
-    /* a throttled one's replenishment alarm may still come: it finds the thread not throttled */
     bool was_fair = !deadline(e), had_period = e->policy.class == SCHED_DEADLINE;
     uint64_t old_period = e->policy.period_ns;
     e->policy = policy;
-    e->throttled = false;
     if (policy.class == SCHED_DEADLINE) {
-        uint64_t reserve = dl_most(policy.period_ns), peak = 0;
+        uint64_t reserve = dl_most(&policy), peak = 0;
         if (had_period && old_period) { /* the same bandwidth at the new period */
-            if (!clock_muldiv(e->dl_reserve, policy.period_ns, old_period, &reserve)) reserve = dl_most(policy.period_ns);
+            if (!clock_muldiv(e->dl_reserve, policy.period_ns, old_period, &reserve)) reserve = dl_most(&policy);
             if (!clock_muldiv(e->dl_peak, policy.period_ns, old_period, &peak)) peak = 0;
         }
-        e->dl_reserve = MIN(MAX(reserve, dl_least(policy.period_ns)), dl_most(policy.period_ns));
+        e->dl_reserve = MIN(MAX(reserve, dl_least(policy.period_ns)), dl_most(&policy));
         e->dl_peak = peak;
-        e->dl_job = 0;
-        dl_period(e, q->stamp);
+        if (e->dl_left > e->dl_reserve) e->dl_left = e->dl_reserve;
+        /* a throttled one stays so, its replenishment alarm at its deadline */
+        if (!e->throttled && !dl_keeps(e, q->stamp)) {
+            e->dl_job = 0;
+            dl_period(e, q->stamp);
+        }
+    } else {
+        e->throttled = false; /* its replenishment alarm may still come: it finds the thread not throttled */
     }
     if (!deadline(e) != was_fair) e->lag_ns = 0;
     if (running || queued) {

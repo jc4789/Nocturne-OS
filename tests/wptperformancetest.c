@@ -188,11 +188,11 @@ static void resume(void *opaque,uint64_t id) {
    as the browser, instead of refusing every synchronous dependency import. */
 static bool wait_request(void *opaque,uint64_t id,const bool *complete) {
     struct run *r=opaque;
-    while(!*complete && uptime_ms()<r->deadline) {
+    while(!*complete && (n_clock_monotonic() / N_NS_PER_MS)<r->deadline) {
         bool found=false;
         for(struct pending *p=r->pending;p;p=p->next)if(p->native_id==id){found=true;break;}
         if(!found)return false;
-        webnet_pump(r->net,uptime_ms());if(!*complete)n_sleep_ms(1);
+        webnet_pump(r->net,(n_clock_monotonic() / N_NS_PER_MS));if(!*complete)n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
     }
     return *complete;
 }
@@ -209,7 +209,7 @@ static bool sync_request(void *opaque,const struct web_request *in,struct web_re
         .same_origin=in->same_origin,.redirect_error=in->redirect_error,.cache_mode=(enum webnet_cache)in->cache_mode};
     uint64_t id=webnet_submit(r->net,&request,sync_complete,&m);
     if(!id)return false;
-    while(!m.done && uptime_ms()<r->deadline){webnet_pump(r->net,uptime_ms());if(!m.done)n_sleep_ms(1);}
+    while(!m.done && (n_clock_monotonic() / N_NS_PER_MS)<r->deadline){webnet_pump(r->net,(n_clock_monotonic() / N_NS_PER_MS));if(!m.done)n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}
     if(!m.done||!m.valid){webnet_cancel(r->net,id);web_response_free(&m.response);return false;}
     *out=m.response;return !out->error[0]&&out->status>=200&&out->status<300;
 }
@@ -256,7 +256,7 @@ static void close_run(struct run *r) {
 }
 static bool run_case(const char *base,const struct original *original,unsigned *results,unsigned *failed) {
     struct run r={.original=original,.harness_status=-1};char *url=NULL;
-    uint64_t begin=uptime_ms();bool ok=false;
+    uint64_t begin=(n_clock_monotonic() / N_NS_PER_MS);bool ok=false;
     if(web_resolve_url_owned(base,original->path,&url)!=1||
        web_resolve_url_owned(base,originals[3].path,&r.harness_url)!=1||
        web_resolve_url_owned(base,originals[4].path,&r.report_url)!=1)goto end;
@@ -265,7 +265,7 @@ static bool run_case(const char *base,const struct original *original,unsigned *
     struct webnet_request nav={.kind=WEBNET_NAVIGATION,.generation=1,.url=url,.origin=url,
         .method="GET",.user_navigation=true,.credentials=WEBNET_CREDENTIALS_SAME_ORIGIN};
     if(!webnet_submit(r.net,&nav,navigation_complete,&r))goto end;
-    while(!r.navigation_done&&uptime_ms()-begin<CASE_MS){webnet_pump(r.net,uptime_ms());n_sleep_ms(1);}
+    while(!r.navigation_done&&(n_clock_monotonic() / N_NS_PER_MS)-begin<CASE_MS){webnet_pump(r.net,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}
     if(!r.navigation_done||r.infrastructure)goto end;
     r.deadline=begin+CASE_MS;
     struct web_host host={.opaque=&r,.request=request,.cancel=cancel,.release_request=cancel,
@@ -279,13 +279,13 @@ static bool run_case(const char *base,const struct original *original,unsigned *
     /* realm 初期化済み・HTML parser の初回 tick より前。 */
     if(!web_console_eval(r.doc,observer,sizeof observer-1))goto end;
     web_layout(r.doc,VIEW_W,VIEW_H);
-    while(!r.complete&&uptime_ms()-begin<CASE_MS){
-        uint64_t now=uptime_ms();webnet_pump(r.net,now);web_tick(r.doc,now);
+    while(!r.complete&&(n_clock_monotonic() / N_NS_PER_MS)-begin<CASE_MS){
+        uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);webnet_pump(r.net,now);web_tick(r.doc,now);
         bool dirty=web_dirty(r.doc),paint=web_paint_dirty(r.doc);
         if(dirty)web_layout(r.doc,VIEW_W,VIEW_H);
         if(dirty||paint){canvas_t canvas;gfx_init(&canvas,r.pixels,VIEW_W,VIEW_H,VIEW_W);
             web_paint(r.doc,&canvas,0,0,VIEW_W,VIEW_H,r.scroll_x,r.scroll_y);}
-        n_sleep_ms(1);
+        n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
     }
     *results+=r.result_count;*failed+=r.failed;
     ok=r.complete&&r.observer_ready&&r.harness_status==0&&
@@ -293,12 +293,12 @@ static bool run_case(const char *base,const struct original *original,unsigned *
 end:
     printf("WPT 終了 %s 完了 %d harness %d ケース %u 失敗 %u 実行基盤失敗 %u elapsed %lu ms %s\n",
         original->path,r.complete,r.harness_status,r.result_count,r.failed,r.infrastructure,
-        (unsigned long)(uptime_ms()-begin),ok?"PASS":"FAIL");fflush(stdout);
+        (unsigned long)((n_clock_monotonic() / N_NS_PER_MS)-begin),ok?"PASS":"FAIL");fflush(stdout);
     close_run(&r);free(url);return ok;
 }
 static bool render_reference(const char *base,const struct original *original,uint32_t **pixels) {
     struct run r={.original=original,.harness_status=-1};char *url=NULL;
-    uint64_t begin=uptime_ms();bool ok=false;unsigned settled=0;
+    uint64_t begin=(n_clock_monotonic() / N_NS_PER_MS);bool ok=false;unsigned settled=0;
     if(web_resolve_url_owned(base,original->path,&url)!=1||
        web_resolve_url_owned(base,originals[3].path,&r.harness_url)!=1||
        web_resolve_url_owned(base,originals[4].path,&r.report_url)!=1)goto end;
@@ -307,7 +307,7 @@ static bool render_reference(const char *base,const struct original *original,ui
     struct webnet_request nav={.kind=WEBNET_NAVIGATION,.generation=1,.url=url,.origin=url,
         .method="GET",.user_navigation=true,.credentials=WEBNET_CREDENTIALS_SAME_ORIGIN};
     if(!webnet_submit(r.net,&nav,navigation_complete,&r))goto end;
-    while(!r.navigation_done&&uptime_ms()-begin<CASE_MS){webnet_pump(r.net,uptime_ms());n_sleep_ms(1);}
+    while(!r.navigation_done&&(n_clock_monotonic() / N_NS_PER_MS)-begin<CASE_MS){webnet_pump(r.net,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}
     if(!r.navigation_done||r.infrastructure)goto end;
     r.deadline=begin+CASE_MS;
     struct web_host host={.opaque=&r,.request=request,.cancel=cancel,.release_request=cancel,
@@ -319,22 +319,22 @@ static bool render_reference(const char *base,const struct original *original,ui
     if(!r.doc)goto end;
     r.pixels=calloc((size_t)VIEW_W*VIEW_H,sizeof *r.pixels);if(!r.pixels)goto end;
     if(!web_console_eval(r.doc,reference_observer,sizeof reference_observer-1))goto end;
-    while(settled<2&&!r.infrastructure&&uptime_ms()-begin<CASE_MS){
-        uint64_t now=uptime_ms();webnet_pump(r.net,now);web_tick(r.doc,now);
+    while(settled<2&&!r.infrastructure&&(n_clock_monotonic() / N_NS_PER_MS)-begin<CASE_MS){
+        uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);webnet_pump(r.net,now);web_tick(r.doc,now);
         if(web_dirty(r.doc))web_layout(r.doc,VIEW_W,VIEW_H);
         if(r.complete&&!r.pending&&!web_render_blocked(r.doc)){
             canvas_t canvas;gfx_init(&canvas,r.pixels,VIEW_W,VIEW_H,VIEW_W);
             web_paint(r.doc,&canvas,0,0,VIEW_W,VIEW_H,0,0);
             if(!web_dirty(r.doc)&&!web_paint_dirty(r.doc))settled++;else settled=0;
         }else settled=0;
-        if(settled<2)n_sleep_ms(1);
+        if(settled<2)n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
     }
     ok=r.complete&&r.observer_ready&&settled==2&&!r.infrastructure;
     if(ok){*pixels=r.pixels;r.pixels=NULL;}
 end:
     printf("WPT 画像終了 %s load %d settled %u 実行基盤失敗 %u elapsed %lu ms %s\n",
         original->path,r.complete,settled,r.infrastructure,
-        (unsigned long)(uptime_ms()-begin),ok?"PASS":"FAIL");fflush(stdout);
+        (unsigned long)((n_clock_monotonic() / N_NS_PER_MS)-begin),ok?"PASS":"FAIL");fflush(stdout);
     close_run(&r);free(url);return ok;
 }
 static int reference_case(const char *base) {

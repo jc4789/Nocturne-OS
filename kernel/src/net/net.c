@@ -532,7 +532,6 @@ static int arp_resolve(uint32_t dst, uint8_t mac[6]) { return arp_resolve_until(
 /* ---------------------------------------------------------------- ICMP */
 
 #define PING_N 8
-#define PING_TIMEOUT_DEFAULT 1000 /* ms: SYS_NET_PING's timeout_ms of 0 or less */
 static struct ping_wait {
     bool used, done;
     uint16_t id, seq;
@@ -562,7 +561,7 @@ static void icmp_input(const uint8_t *src_mac, uint32_t src, const uint8_t *p, s
     }
 }
 
-/* SYS_NET_PING: the round trip in ms, the address resolution and the echo both by deadline. */
+/* SYS_NET_PING: the round trip in ns, the address resolution and the echo both by deadline. */
 static int64_t sys_ping(uint32_t dst, int seq, uint64_t deadline) {
     if (dst == my_ip || (dst >> 24) == 127) return 0;
     uint8_t mac[6];
@@ -595,7 +594,7 @@ static int64_t sys_ping(uint32_t dst, int seq, uint64_t deadline) {
         }
         net_sleep(&shared_progress, deadline, false);
     }
-    if (w->done) ret = (int64_t)(ns_between(sent, w->replied) / NS_PER_MS);
+    if (w->done) ret = (int64_t)ns_between(sent, w->replied);
     w->used = false;
     return ret;
 }
@@ -1231,7 +1230,6 @@ enum { T_FREE, T_SYN_SENT, T_ESTABLISHED, T_FIN_WAIT1, T_FIN_WAIT2, T_CLOSE_WAIT
    more may take to finish before it is reset. */
 #define TCP_TIME_WAIT     (2 * NS_PER_S)
 #define TCP_ORPHAN_LINGER (20 * NS_PER_S)
-#define TCP_CONNECT_DEFAULT 15000 /* ms: SYS_TCP_CONNECT's timeout_ms of 0 or less */
 
 struct tcb {
     int state, err, pid;
@@ -2605,8 +2603,7 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_NET_PING:
         if (!nif) return -N_ERR_NETWORK_DOWN;
-        return sys_ping((uint32_t)a, (int)b,
-                        clock_after((uint64_t)((int)c > 0 ? (int)c : PING_TIMEOUT_DEFAULT) * NS_PER_MS));
+        return sys_ping((uint32_t)a, (int)b, c);
     case SYS_NET_DNS: {
         if (!user_ok_w((void *)b, 4)) return -N_ERR_BAD_ADDRESS;
         char name[DNS_NAME_TEXT_BYTES + 1];
@@ -2661,7 +2658,7 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         struct n_sockaddr *from = (struct n_sockaddr *)e;
         if (from && !user_ok_w(from, sizeof *from)) return -N_ERR_BAD_ADDRESS;
         int err = 0;
-        struct udp_dgram *dg = udp_wait((int)a, syscall_deadline((int)d), &err);
+        struct udp_dgram *dg = udp_wait((int)a, d, &err);
         if (!dg) return err;
         /* The datagram is out of the queue: its slot stays as it is while net_lock is held. */
         size_t n = MIN(c, dg->len);
@@ -2678,15 +2675,12 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_TCP_CONNECT:
         if (!nif) return -N_ERR_NETWORK_DOWN;
-        return tcp_connect_until((uint32_t)a, (uint16_t)b,
-                                 clock_after((uint64_t)((int)c > 0 ? (int)c : TCP_CONNECT_DEFAULT) * NS_PER_MS));
+        return tcp_connect_until((uint32_t)a, (uint16_t)b, c);
     case SYS_TCP_SEND: return tcp_send_data((int)a, (const uint8_t *)b, c, CLOCK_NEVER, true, false);
     case SYS_TCP_SEND_UNTIL:
-        /* d: the ms since boot it gives up at (on the clock's axis), 0 for none */
+        /* d: the deadline it gives up at */
         if(e&~(uint64_t)N_TCP_SEND_NONBLOCK)return -N_ERR_INVALID;
-        return tcp_send_data((int)a, (const uint8_t *)b, c,
-                             !d || d > CLOCK_NEVER / NS_PER_MS ? CLOCK_NEVER : d * NS_PER_MS, true,
-                             (e&N_TCP_SEND_NONBLOCK)!=0);
+        return tcp_send_data((int)a, (const uint8_t *)b, c, d, true, (e&N_TCP_SEND_NONBLOCK)!=0);
     case SYS_TCP_CANCEL: {
         struct tcb *t = user_tcb((int)a);
         if (!t) return -N_ERR_NO_HANDLE;
@@ -2706,7 +2700,7 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         if (nif && nif->get_stats) nif->get_stats(&stats);
         return copy_to_user((void *)a, &stats, sizeof stats);
     }
-    case SYS_TCP_RECV: return tcp_recv_data((int)a, (uint8_t *)b, c, syscall_deadline((int)d), true);
+    case SYS_TCP_RECV: return tcp_recv_data((int)a, (uint8_t *)b, c, d, true);
     case SYS_NET_TEST: {
         /* a: fault settings for this process's TCP connections (or NULL); b: counters out (or NULL) */
         if (a) {
@@ -2731,7 +2725,7 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         if (!nif) return -N_ERR_NETWORK_DOWN;
         if (a > UINT32_MAX || b > UINT16_MAX) return -N_ERR_INVALID;
         return sys_tcp_listen((uint32_t)a, (uint16_t)b, (int)c);
-    case SYS_TCP_ACCEPT: return sys_tcp_accept((int)a, syscall_deadline((int)b), (struct n_sockaddr *)c);
+    case SYS_TCP_ACCEPT: return sys_tcp_accept((int)a, b, (struct n_sockaddr *)c);
     case SYS_TCP_ADDRESS: {
         struct tcb *t = user_tcb((int)a);
         if (!t) return -N_ERR_NO_HANDLE;

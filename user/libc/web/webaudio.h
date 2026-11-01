@@ -107,7 +107,7 @@ struct wa_context_status {
     enum wa_state state;
     uint64_t frame;
     uint64_t output_latency, output_played;
-    uint64_t played_at_us;      /* uptime_us when output_played was read */
+    uint64_t played_at_us;      /* monotonic us when output_played was read */
 };
 void wa_context_status(struct wa_context *c, struct wa_context_status *out);
 /* AudioContext: start or resume rendering (true), or suspend it. OfflineAudioContext:

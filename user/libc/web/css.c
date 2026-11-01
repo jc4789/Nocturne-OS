@@ -10297,7 +10297,7 @@ bool css_sheets_rescanned(web_doc *d) {
 }
 
 void css_cascade(web_doc *d, int vw, int vh) {
-    uint64_t profile_start = d->profile_enabled ? uptime_ms() : 0;
+    uint64_t profile_start = d->profile_enabled ? (n_clock_monotonic() / N_NS_PER_MS) : 0;
     struct web_profile profile_before = d->profile;
     /* Publish pool ownership before spawning disjoint subtree jobs. */
     if (!d->style_pool) {
@@ -10328,7 +10328,7 @@ void css_cascade(web_doc *d, int vw, int vh) {
     if (!d->sty.ctx || d->sty.index_dirty || d->sty.index_w != vw || d->sty.index_h != vh ||
         d->sty.index_scripting != scripting || d->sty.index_quirks != d->quirks) {
         index_by = !d->sty.ctx || d->sty.index_dirty ? INDEX_BY_SHEETS : INDEX_BY_ENVIRONMENT;
-        uint64_t index_start = d->profile_enabled ? uptime_ms() : 0;
+        uint64_t index_start = d->profile_enabled ? (n_clock_monotonic() / N_NS_PER_MS) : 0;
         css_ctx_free(d->sty.ctx); d->sty.ctx = NULL;
         d->sty.ctx = build_ctx(d, vw, vh);
         d->sty.index_w = vw;
@@ -10339,7 +10339,7 @@ void css_cascade(web_doc *d, int vw, int vh) {
         d->style_full_dirty = true;
         if (d->profile_enabled) {
             style_profile.indexes++; style_profile.index_by[index_by]++;
-            style_profile.index_ms += uptime_ms() - index_start;
+            style_profile.index_ms += (n_clock_monotonic() / N_NS_PER_MS) - index_start;
         }
     }
     /* Decided before the form snapshot: its lazy control initialization marks
@@ -10377,7 +10377,7 @@ void css_cascade(web_doc *d, int vw, int vh) {
     if (d->profile_enabled) {
         style_profile.cascades++; style_profile.full += full;
         if (full) style_profile.full_by[full_by]++;
-        style_profile.ms += uptime_ms() - profile_start;
+        style_profile.ms += (n_clock_monotonic() / N_NS_PER_MS) - profile_start;
         style_profile.elements += d->profile.style_visits - profile_before.style_visits;
         style_profile.kept += d->profile.style_kept - profile_before.style_kept;
         style_profile.adopted += d->profile.style_adopted - profile_before.style_adopted;

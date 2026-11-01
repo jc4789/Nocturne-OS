@@ -72,7 +72,7 @@ static void log_file_flush_locked(void) {
     if (!log_file_enabled || !log_file_fill) return;
     n_document_append(log_path, log_file_buffer, log_file_fill);
     log_file_fill = 0;
-    log_file_flushed_ms = n_clock_uptime_ms();
+    log_file_flushed_ms = (n_clock_monotonic() / N_NS_PER_MS);
 }
 
 static void log_setup(void) {
@@ -81,7 +81,7 @@ static void log_setup(void) {
     char folder[sizeof log_path];
     log_file_enabled = n_app_data_folder("NVIDIA", folder, sizeof folder) >= 0 &&
                        n_path_join(folder, "nvrm.log", log_path, sizeof log_path) >= 0;
-    log_file_flushed_ms = n_clock_uptime_ms();
+    log_file_flushed_ms = (n_clock_monotonic() / N_NS_PER_MS);
 }
 
 void nvrm_log_init(void) { call_once(&log_once, log_setup); }
@@ -112,7 +112,7 @@ static void log_emit(const char *text, size_t length, bool urgent) {
         } else {
             n_document_append(log_path, text, length);
         }
-        if (urgent || n_clock_uptime_ms() - log_file_flushed_ms >= 200) log_file_flush_locked();
+        if (urgent || (n_clock_monotonic() / N_NS_PER_MS) - log_file_flushed_ms >= 200) log_file_flush_locked();
     }
     mtx_unlock(&log_lock);
 }
@@ -271,51 +271,13 @@ NvS32 NV_API_CALL os_snprintf(char *buf, NvU32 size, const char *fmt, ...) {
 /* ------------------------------------------------------------------------------------------
  * Time
  *
- * timespec_get has millisecond resolution; RM measures microseconds. The system offers its
- * TSC rate and a (uptime, tsc) sample (clock_info); with them nvrm_now_ns is exact to the TSC.
+ * The system's monotonic clock, read in ns without a call (n_clock_monotonic), is RM's.
  * ---------------------------------------------------------------------------------------- */
-static once_flag clock_once = ONCE_FLAG_INIT;
-static struct n_clockinfo clock_base;
-static bool clock_tsc;
-static uint64_t clock_last_ns;
-
-static void clock_setup(void) {
-    memset(&clock_base, 0, sizeof clock_base);
-    if (clock_info(&clock_base) >= 0 && (clock_base.flags & N_CLOCK_USER_TSC) && clock_base.tsc_hz >= 1000000)
-        clock_tsc = true;
-}
-
-static inline uint64_t read_tsc(void) {
-    uint32_t lo, hi;
-    __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) : : "memory");
-    return (uint64_t)hi << 32 | lo;
-}
-
-uint64_t nvrm_now_ns(void) {
-    call_once(&clock_once, clock_setup);
-    uint64_t ns;
-    uint64_t tsc;
-    if (clock_tsc && (tsc = read_tsc()) >= clock_base.tsc_sample) {
-        uint64_t delta = tsc - clock_base.tsc_sample;
-        uint64_t hz = clock_base.tsc_hz;
-        ns = clock_base.uptime_ms * 1000000ull + (delta / hz) * 1000000000ull +
-             (delta % hz) * 1000000000ull / hz;
-    } else {
-        ns = n_clock_uptime_ms() * 1000000ull;
-    }
-    uint64_t last = __atomic_load_n(&clock_last_ns, __ATOMIC_RELAXED);
-    while (ns > last &&
-           !__atomic_compare_exchange_n(&clock_last_ns, &last, ns, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
-    }
-    return ns < last ? last : ns;
-}
+uint64_t nvrm_now_ns(void) { return n_clock_monotonic(); }
 
 NvU64 NV_API_CALL os_get_monotonic_time_ns(void) { return nvrm_now_ns(); }
 NvU64 NV_API_CALL os_get_monotonic_time_ns_hr(void) { return nvrm_now_ns(); }
-NvU64 NV_API_CALL os_get_monotonic_tick_resolution_ns(void) {
-    call_once(&clock_once, clock_setup);
-    return clock_tsc ? 1 : 1000000;
-}
+NvU64 NV_API_CALL os_get_monotonic_tick_resolution_ns(void) { return 1; }
 
 NV_STATUS NV_API_CALL os_get_system_time(NvU32 *seconds, NvU32 *useconds) {
     struct timespec ts;
@@ -326,8 +288,7 @@ NV_STATUS NV_API_CALL os_get_system_time(NvU32 *seconds, NvU32 *useconds) {
 }
 
 NvU64 NV_API_CALL os_get_cpu_frequency(void) {
-    call_once(&clock_once, clock_setup);
-    return clock_tsc ? clock_base.tsc_hz : 0;
+    return ((const struct n_clock *)N_CLOCK_ADDRESS)->tsc_hz; /* the TSC's, as the clock has it (abi.h) */
 }
 
 /* A delay of a few microseconds is a spin on the clock (RM calls it with locks held and from
@@ -339,7 +300,7 @@ static void delay_ns(uint64_t ns, bool may_sleep) {
         if (now >= deadline) return;
         uint64_t left = deadline - now;
         if (may_sleep && left > 2000000ull) {
-            n_sleep_ms((left - 1000000ull) / 1000000ull);
+            n_sleep_until(deadline - 1000000ull); /* the last ms spins: a sleep may end late */
         } else {
             for (int i = 0; i < 64; i++) __builtin_ia32_pause();
         }

@@ -43,7 +43,7 @@ static struct n_cpuinfo native_info;
 static int cpu_result,cpu_calls,checks,failed,capability_calls,language_calls;
 n_result cpu_info(struct n_cpuinfo *out){*out=native_info;cpu_calls++;return cpu_result;}
 /* The engine's Atomics.wait and its clock; the probe never waits. */
-uint64_t n_clock_uptime_ms(void){return 0;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(0)*1000000ULL;}
 n_result wait_on_address(volatile uint32_t *address,uint32_t expected,unsigned ms){return -N_ERR_TIMEOUT;}
 n_result wake_address(volatile uint32_t *address,unsigned count){return 0;}
 /* The browser's preferences (webprefs.h): the user's languages as webprefs_languages gives them. */

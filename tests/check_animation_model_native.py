@@ -15,7 +15,7 @@ production += css[css.index("/* ------------------------------------------------
 production += css[css.index("/* ---------------------------------------------------------------- media queries"):css.index("static bool media_chain_ok(")]
 production = production.replace("#include <nocturne.h>\n", "")
 model = (root / "user/libc/web/animation.c").read_text(encoding="utf-8").replace("#include <nocturne.h>\n", "")
-host = "#include <stdint.h>\nvoid *thread_local_get(unsigned slot);\nint display_bits_per_channel(void){return 8;}\nuint64_t uptime_ms(void);\n#define MIN(a,b) ((a)<(b)?(a):(b))\n#define MAX(a,b) ((a)>(b)?(a):(b))\n"
+host = "#include <stdint.h>\nvoid *thread_local_get(unsigned slot);\nint display_bits_per_channel(void){return 8;}\nuint64_t n_clock_monotonic(void);\n#define MIN(a,b) ((a)<(b)?(a):(b))\n#define MAX(a,b) ((a)>(b)?(a):(b))\n"
 main = r'''
 bool web_native_checkpoint(web_doc *d){(void)d;return true;}
 void css_transform_list_matrix(const struct css_transform *t,float w,float h,double m[16]){(void)t;(void)w;(void)h;memset(m,0,16*sizeof *m);m[0]=m[5]=m[10]=m[15]=1;}
@@ -23,7 +23,7 @@ void css_transform_list_matrix(const struct css_transform *t,float w,float h,dou
 void css_transform_list_matrix_3d(const struct css_transform *t,double m[16]){(void)t;(void)m;abort();}
 /* web_url.c's (Lexbor's URL parser): CSS url() resolution, not reached by these values */
 int web_resolve_url_owned(const char *base,const char *rel,char **out){(void)base;(void)rel;(void)out;abort();}
-uint64_t uptime_ms(void){return 0;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(0)*1000000ULL;}
 static int marks;
 void css_mark_style_own(web_doc *d,node_t *n){(void)d;(void)n;marks++;}
 bool css_substitute(web_doc *d,const style_t *st,node_t *node,const char *v,sbuf *out){(void)d;(void)st;(void)node;sb_puts(out,v);return true;}

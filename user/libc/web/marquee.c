@@ -28,7 +28,7 @@ void web_marquee_set(node_t *n,bool running) {
     if(!n || n->foreign || n->tag!=T_marquee)return;
     n->marquee_off=!running;
     /* Resume from the frozen position; stopped time is not accumulated. */
-    n->marquee_last=uptime_ms();
+    n->marquee_last=(n_clock_monotonic() / N_NS_PER_MS);
     if(n->owner)doc_paint_full(n->owner);
 }
 static long integer_attr(node_t *n,const char *key,long fallback) {

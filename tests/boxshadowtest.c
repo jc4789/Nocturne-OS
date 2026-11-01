@@ -34,15 +34,15 @@ static int radius_main(void){
     const char *html="<!doctype html><html><head><style>body{margin:0}#round{position:absolute;left:50px;top:50px;width:100px;height:40px;background:red;border-radius:50%}#avatar{position:absolute;left:180px;top:20px;width:40px;height:40px;border-radius:50%}#clip{position:absolute;left:10px;top:10px;width:40px;height:40px;overflow:hidden;border-radius:50%;background:blue}#child{width:40px;height:40px;background:red}#fixed{position:fixed;left:0;top:0;width:5px;height:5px;background:green}</style></head><body><div id='round'></div><img id='avatar' src='https://radius.test/image.svg'><div id='clip'><div id='child'></div><div id='fixed'></div></div></body></html>";
     struct radius_state state={0};struct web_host host={.opaque=&state,.request=radius_request,.script_checkpoint=checkpoint};
     web_doc *doc=web_live(html,strlen(html),"https://radius.test/","utf-8",&host);check(doc!=NULL,"radius live document");if(!doc)return 1;
-    uint64_t start=uptime_ms();while(doc->parser&&!doc->native_cancelled&&uptime_ms()-start<5000)web_tick(doc,uptime_ms());
-    for(int i=0;i<8;i++)web_tick(doc,uptime_ms());
+    uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);while(doc->parser&&!doc->native_cancelled&&(n_clock_monotonic() / N_NS_PER_MS)-start<5000)web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));
+    for(int i=0;i<8;i++)web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));
     node_t *round=query(doc,"#round"),*avatar=query(doc,"#avatar"),*child=query(doc,"#child"),*fixed=query(doc,"#fixed");
     check(round&&avatar&&child&&fixed,"radius parser supplies all actual targets");if(!round||!avatar||!child||!fixed){web_free(doc);return 1;}
     check(state.image_id!=0,"image uses native resource request claim");
     const char *svg="<svg xmlns='http://www.w3.org/2000/svg' width='40' height='40'><rect width='40' height='40' fill='blue'/></svg>";
     struct web_response response={.status=200,.body=(char *)svg,.body_len=strlen(svg)};snprintf(response.headers,sizeof response.headers,"Content-Type: image/svg+xml\r\n");
     if(state.image_id)web_resource_loaded(doc,state.image_id,&response);
-    for(int i=0;i<8;i++)web_tick(doc,uptime_ms());web_layout(doc,256,160);paint(doc,0);
+    for(int i=0;i<8;i++)web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));web_layout(doc,256,160);paint(doc,0);
     check(pixel(50,50)==0xffffff&&pixel(100,70)==0xff0000,"percentage ellipse background retains corner knockout and center");
     check(pixel(180,20)==0xffffff&&pixel(200,40)==0x0000ff,"native decoded image is clipped by actual circular content edge");
     check(pixel(10,10)==0xffffff&&pixel(30,30)==0xff0000,"overflow clips ordinary descendants to rounded padding edge");
@@ -63,7 +63,7 @@ static int damage_main(void){
     struct cancel_state state={0};struct web_host host={.opaque=&state,.script_checkpoint=checkpoint};
     web_doc *doc=web_live(html,strlen(html),"https://shadow.test/","utf-8",&host);
     check(doc!=NULL,"damage live document");if(!doc)return 1;
-    uint64_t start=uptime_ms();while(doc->parser&&!doc->native_cancelled&&uptime_ms()-start<5000)web_tick(doc,uptime_ms());
+    uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);while(doc->parser&&!doc->native_cancelled&&(n_clock_monotonic() / N_NS_PER_MS)-start<5000)web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));
     node_t *pane=query(doc,"#pane"),*atomic=query(doc,"#atomic");
     check(pane&&atomic&&!doc->parser,"damage normal parser supplies both actual targets");
     if(!pane||!atomic){web_free(doc);return 1;}
@@ -97,15 +97,15 @@ static int association_main(void){
     const char *html="<!doctype html><html><head><style>body{margin:0}#owner,#mask-owner{position:absolute;top:10px;width:100px;height:90px;background-image:url('/red.svg')}#owner{left:10px}#mask-owner{left:130px;mask-image:url('/red.svg');background:red}#with,#plain,#mask-child{position:absolute;top:10px;width:30px;height:30px}#with,#mask-child{left:10px;background-image:url('/blue.svg')}#plain{left:50px;background:green}#with:hover,#plain:hover,#mask-child:hover{color:lime}</style></head><body><div id='owner'><div id='with'></div><div id='plain'></div></div><div id='mask-owner'><div id='mask-child'></div></div></body></html>";
     struct image_association_state state={0};struct web_host host={.opaque=&state,.request=association_request};
     web_doc *doc=web_live(html,strlen(html),"https://image.test/","utf-8",&host);check(doc!=NULL,"image association live document");if(!doc)return 1;
-    uint64_t start=uptime_ms();while(doc->parser&&!doc->native_cancelled&&uptime_ms()-start<5000)web_tick(doc,uptime_ms());
-    web_layout(doc,256,160);for(int i=0;i<8;i++)web_tick(doc,uptime_ms());
+    uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);while(doc->parser&&!doc->native_cancelled&&(n_clock_monotonic() / N_NS_PER_MS)-start<5000)web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));
+    web_layout(doc,256,160);for(int i=0;i<8;i++)web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));
     node_t *owner=query(doc,"#owner"),*with=query(doc,"#with"),*plain=query(doc,"#plain"),*masked=query(doc,"#mask-child");
     check(owner&&with&&plain&&masked&&!doc->parser,"normal parser supplies actual hover targets");
     if(!owner||!with||!plain||!masked){web_free(doc);return 1;}
     check(state.reds&&state.blue,"native CSS images acquire both actual request claims");
     for(unsigned i=0;i<state.reds;i++)association_supply(doc,state.red[i],"red");
     association_supply(doc,state.blue,"blue");
-    for(int i=0;i<8;i++)web_tick(doc,uptime_ms());web_layout(doc,256,160);paint(doc,0);
+    for(int i=0;i<8;i++)web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));web_layout(doc,256,160);paint(doc,0);
     check(pixel(25,25)==0x0000ff&&pixel(65,25)==0x008000&&pixel(145,25)==0x0000ff,"initial decoded background/mask scene");
     doc_hover_update(doc,with);web_layout(doc,256,160);paint(doc,0);
     check(with->style->bg_img!=owner->style->bg_img&&pixel(25,25)==0x0000ff,"partial hover restyle does not substitute parent's decoded background handle");
@@ -133,7 +133,7 @@ int main(int argc,char **argv){
     struct cancel_state state={0};struct web_host host={.opaque=&state,.script_checkpoint=checkpoint};
     web_doc *doc=web_live(html,strlen(html),"https://shadow.test/","utf-8",&host);
     check(doc!=NULL,"live document");if(!doc)return 1;
-    uint64_t start=uptime_ms();while(doc->parser&&!doc->native_cancelled&&uptime_ms()-start<5000)web_tick(doc,uptime_ms());
+    uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);while(doc->parser&&!doc->native_cancelled&&(n_clock_monotonic() / N_NS_PER_MS)-start<5000)web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));
     pvec nodes={0};css_select(doc,doc->root,"#pane",&nodes);node_t *pane=nodes.n?nodes.v[0]:NULL;pv_free(&nodes);
     check(pane!=NULL&&!doc->parser,"normal parser tick and actual target");if(!pane){web_free(doc);return 1;}
     node_t *fragment=query(doc,"#fragment"),*fragment_parent=query(doc,"#fragment-parent");

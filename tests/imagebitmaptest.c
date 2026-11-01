@@ -117,7 +117,7 @@ static void native_lifetimes(void){
     bool encoded=large&&png_encode_rgba(large,128,128,128,&png,&png_size)==0&&png_size>=16384;free(large);
     struct web_host host={.script_checkpoint=checkpoint,.js_task_budget_ms=5000};
     web_doc *decode_doc=web_live("<!doctype html>",15,"https://bitmap-cancel.test/","utf-8",&host);
-    for(unsigned i=0;decode_doc&&i<8;i++){web_tick(decode_doc,uptime_ms());n_sleep_ms(1);}
+    for(unsigned i=0;decode_doc&&i<8;i++){web_tick(decode_doc,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}
     check("actual helper-decode source prepared",encoded&&decode_doc!=NULL);
     JSValue blob=encoded?JS_NewArrayBufferCopy(ctx,png,png_size):JS_UNDEFINED;free(png);
     if(decode_doc)decode_doc->native_checkpoint_count=62;
@@ -218,13 +218,13 @@ int main(int argc,char **argv){
     web_doc *d=web_live(page,sizeof page-1,"https://bitmap.test/private?private=never-logged","utf-8",&host);
     check("real web_live document allocated",d!=NULL);
     if(d){
-        for(unsigned i=0;i<8;i++){web_tick(d,uptime_ms());n_sleep_ms(1);}web_layout(d,128,128);
+        for(unsigned i=0;i<8;i++){web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}web_layout(d,128,128);
         check("new JS boundary evaluated",web_console_eval(d,source,(size_t)length));
-        uint64_t deadline=uptime_ms()+12000;
-        while(!done&&uptime_ms()<deadline){
-            web_tick(d,uptime_ms());
+        uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+12000;
+        while(!done&&(n_clock_monotonic() / N_NS_PER_MS)<deadline){
+            web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
             if(image_request){struct web_response response={.status=200,.body=(char *)png,.body_len=png_size};strcpy(response.url,"https://bitmap.test/fixture.png");web_resource_loaded(d,image_request,&response);image_request=0;}
-            n_sleep_ms(1);
+            n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
         }
         check("bounded Promise/task completion",done);
         check("no runtime exception",errors==0);
@@ -239,10 +239,10 @@ int main(int argc,char **argv){
     d=web_live("<!doctype html>",15,"https://bitmap-off.test/","utf-8",&host);
     check("debug-off document allocated",d!=NULL);
     if(d){
-        for(unsigned i=0;i<8;i++){web_tick(d,uptime_ms());n_sleep_ms(1);}
+        for(unsigned i=0;i<8;i++){web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}
         const char script[]="createImageBitmap(new ImageData(1,1)).then(bitmap=>{bitmap.close();console.log('BITMAP-OFF-DONE');});";
         check("debug-off native creation started",web_console_eval(d,script,sizeof script-1));
-        uint64_t deadline=uptime_ms()+1000;while(!off_done&&uptime_ms()<deadline){web_tick(d,uptime_ms());n_sleep_ms(1);}
+        uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+1000;while(!off_done&&(n_clock_monotonic() / N_NS_PER_MS)<deadline){web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}
         check("debug-off creates with zero diagnostic logs",off_done&&diagnostics==before);web_free(d);
     }
     printf("imagebitmap: %d checks, %d failed (JS %d)\n",checks,failures,js_checks);

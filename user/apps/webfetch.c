@@ -115,7 +115,7 @@ static int input_wait(struct job *j,int ms) {
     if(j->in.at<j->in.length)return 1;
     if(__atomic_load_n(&service_stopping,__ATOMIC_ACQUIRE))return -1;
     struct n_event e;
-    n_result got=n_events_wait(j->events,&e,1,ms);
+    n_result got=n_events_wait(j->events,&e,1,ms<0?N_CLOCK_NEVER:n_clock_after((uint64_t)ms*N_NS_PER_MS));
     if(got<0||(got&&(e.events&N_EVENT_CLOSED)))return -1;
     return got>0;
 }
@@ -163,7 +163,7 @@ static void stall_report(struct job *j,uint64_t now) {
 }
 static int request_cancelled(void *opaque) {
     struct job *j=opaque;
-    uint64_t now=n_clock_uptime_ms();
+    uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);
     if(j->live_timing)stall_report(j,now);
     if(now>=j->wire.deadline)return 1;
     if(!(j->wire.user_navigation&WEBNET_WIRE_SERVICE))return 0;
@@ -191,7 +191,7 @@ static bool backlog_drain(struct job *j,size_t keep) {
         if(!j->output_credit){
             bool wait=pending>keep;
             if(wait&&request_cancelled(j))return false;
-            int got=credit_receive(j,wait?(int)MIN(j->wire.deadline-n_clock_uptime_ms(),100u):0);
+            int got=credit_receive(j,wait?(int)MIN(j->wire.deadline-(n_clock_monotonic() / N_NS_PER_MS),100u):0);
             if(got<0)return false;
             if(!got){if(!wait)return true;continue;}
         }
@@ -226,7 +226,7 @@ static bool job_read_all(struct job *j,void *data,size_t length) {
         size_t count=MIN(length,WEBNET_SERVICE_CREDIT_STEP);
         n_result got=webnet_wire_read(j->input,&j->in,p,count,0);
         if(got<0)return false;
-        if(!got){if(input_wait(j,(int)MIN(j->wire.deadline-n_clock_uptime_ms(),100u))<0)return false;continue;}
+        if(!got){if(input_wait(j,(int)MIN(j->wire.deadline-(n_clock_monotonic() / N_NS_PER_MS),100u))<0)return false;continue;}
         p+=got;length-=(size_t)got;
         if(j->wire.user_navigation&WEBNET_WIRE_SERVICE){
             j->input_consumed+=(size_t)got;
@@ -271,7 +271,7 @@ static bool header_text(struct job *j, struct header_buffer *b, const char *p) {
     return header_append(j, b, p, strlen(p));
 }
 static int remaining(struct job *j) {
-    uint64_t now = n_clock_uptime_ms();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
     if (now >= j->wire.deadline) { fail(j, "Request deadline exceeded"); return 0; }
     uint64_t left = j->wire.deadline - now;
     /* TCP/read timeout parameters are signed int. Never turn a long positive
@@ -571,7 +571,7 @@ static size_t cache_bytes;
 static volatile uint32_t cache_lock_word;
 static void cache_lock(void) {
     while (__atomic_exchange_n(&cache_lock_word, 1, __ATOMIC_ACQUIRE))
-        wait_on_address(&cache_lock_word, 1, UINT_MAX);
+        wait_on_address(&cache_lock_word, 1, N_CLOCK_NEVER);
 }
 static void cache_unlock(void) {
     __atomic_store_n(&cache_lock_word, 0, __ATOMIC_RELEASE);
@@ -658,7 +658,7 @@ static void cache_freshness(struct cache_entry *e) {
     const char *a;size_t n;
     if(field_exists(e->headers,"Age")&&(!field_slice(e->headers,"Age",&a,&n)||!cache_decimal(a,n,&age)))age=UINT64_MAX;
     if(dated&&now>date&&(uint64_t)(now-date)>age)age=(uint64_t)(now-date);
-    e->age_seconds=age;e->stored_ms=n_clock_uptime_ms();e->lifetime_seconds=0;
+    e->age_seconds=age;e->stored_ms=(n_clock_monotonic() / N_NS_PER_MS);e->lifetime_seconds=0;
     if(cache_directive(e->headers,"max-age",&maximum))e->lifetime_seconds=maximum;
     else if(cache_date(e->headers,"Expires",&expires)){
         int64_t base=dated?date:now;if(expires>base)e->lifetime_seconds=(uint64_t)(expires-base);
@@ -670,7 +670,7 @@ static void cache_freshness(struct cache_entry *e) {
     e->must_revalidate=cache_directive(e->headers,"must-revalidate",NULL);
 }
 static uint64_t cache_age(const struct cache_entry *e) {
-    uint64_t elapsed=(n_clock_uptime_ms()-e->stored_ms)/1000;
+    uint64_t elapsed=((n_clock_monotonic() / N_NS_PER_MS)-e->stored_ms)/1000;
     return elapsed>UINT64_MAX-e->age_seconds?UINT64_MAX:e->age_seconds+elapsed;
 }
 static bool cache_vary(const struct cache_entry *e,const char *request) {
@@ -1187,7 +1187,7 @@ static void timing_hop(struct job *j, bool network, bool cached, const struct ht
    of a navigation (create and initialize a Document). */
 static void timing_finish(struct job *j) {
     struct http_fetch_timing *f = &j->timing;
-    f->end_time = uptime_ms();
+    f->end_time = (n_clock_monotonic() / N_NS_PER_MS);
     f->timing_allow_passed = !j->timing_allow_failed && !j->error[0] && j->status;
     f->redirect_same_origin = !j->origin_tainted;
     if (j->wire.kind != WEBNET_NAVIGATION) return;
@@ -1815,7 +1815,7 @@ static bool run_http(struct job *j) {
             j->redirected = true;
             /* Fetch (HTTP-redirect fetch): the redirect ends and the next hop starts. */
             j->timing.redirect_count++;
-            j->timing.redirect_end = j->timing.post_redirect_start = uptime_ms();
+            j->timing.redirect_end = j->timing.post_redirect_start = (n_clock_monotonic() / N_NS_PER_MS);
             if ((!strcmp(method, "POST") && (r.status == 301 || r.status == 302)) ||
                 (r.status == 303 && strcmp(method, "GET") && strcmp(method, "HEAD"))) {
                 drop_body = true;
@@ -1890,7 +1890,7 @@ static bool ws_grow(unsigned char **p, size_t *cap, size_t need) {
 }
 static bool ws_record(struct websocket *ws, uint32_t magic, uint32_t code, const void *data, size_t length) {
     struct webnet_wire_socket record = {magic, code, length};
-    while (__atomic_exchange_n(&ws->channel, 1, __ATOMIC_ACQUIRE)) wait_on_address(&ws->channel, 1, UINT_MAX);
+    while (__atomic_exchange_n(&ws->channel, 1, __ATOMIC_ACQUIRE)) wait_on_address(&ws->channel, 1, N_CLOCK_NEVER);
     bool ok = write_all(ws->j, &record, sizeof record) && write_all(ws->j, data, length);
     __atomic_store_n(&ws->channel, 0, __ATOMIC_RELEASE); wake_address(&ws->channel, 1);
     return ok;
@@ -1902,7 +1902,7 @@ static bool ws_write_locked(struct websocket *ws, const unsigned char *p, size_t
         long sent = ns_try_write(ws->stream, p, n);
         if (sent == -2) {
             if (__atomic_load_n(&ws->stopping, __ATOMIC_ACQUIRE)) return false;
-            mtx_unlock(&ws->engine); n_sleep_ms(1); mtx_lock(&ws->engine);
+            mtx_unlock(&ws->engine); n_sleep_until(n_clock_after(1 * N_NS_PER_MS)); mtx_lock(&ws->engine);
             continue;
         }
         if (sent <= 0) return false;
@@ -1910,7 +1910,7 @@ static bool ws_write_locked(struct websocket *ws, const unsigned char *p, size_t
     }
     while (ns_try_write(ws->stream, NULL, 0) == -2) { /* drain buffered records */
         if (__atomic_load_n(&ws->stopping, __ATOMIC_ACQUIRE)) return false;
-        mtx_unlock(&ws->engine); n_sleep_ms(1); mtx_lock(&ws->engine);
+        mtx_unlock(&ws->engine); n_sleep_until(n_clock_after(1 * N_NS_PER_MS)); mtx_lock(&ws->engine);
     }
     return true;
 }
@@ -2420,7 +2420,7 @@ int main(int argc,char **argv) {
         }
         /* The timeout only reclaims finished request threads. */
         struct n_event reports[3];
-        n_result got=n_events_wait(events,reports,3,100);
+        n_result got=n_events_wait(events,reports,3,n_clock_after(100 * N_NS_PER_MS));
         if(got<0)break;
         for(n_result i=0;i<got;i++)if(reports[i].token==1)running=false;
         webprefs_events(reports,(size_t)got);

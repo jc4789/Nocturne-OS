@@ -409,7 +409,7 @@ webnet *webnet_create(void) {
         n->cookie_rules = webprefs_site_generation();
         (void)cookie_sync(n, false);
         webcookie_rule_changed(n->cookies);
-        cookie_note(n, uptime_ms());
+        cookie_note(n, (n_clock_monotonic() / N_NS_PER_MS));
         n->worker_limit=worker_budget();
         for (int i = 0; i < WORKERS; i++) n->slots[i].channel = -1;
     }
@@ -425,7 +425,7 @@ void webnet_free(webnet *n) {
         request_free(s->rq);
     }
     while(n->parked){struct slot *s=n->parked;n->parked=s->next;slot_close(s);request_free(s->rq);free(s);}
-    if(n->service>=0){n_app_stop(n->service,0);n_app_result(n->service,-1,NULL);n_handle_close(n->service);}
+    if(n->service>=0){n_app_stop(n->service,0);n_app_result(n->service,N_CLOCK_NEVER,NULL);n_handle_close(n->service);}
     if(n->service_listener>=0)n_handle_close(n->service_listener);
     if(n->probe>=0)n_handle_close(n->probe);
     while (n->queue) { struct request *r = n->queue; n->queue = r->next; request_free(r); }
@@ -444,7 +444,7 @@ int webnet_cookie_set_site(webnet *n,const char *url,const char *top_level_url,c
     struct webcookie_context c = {url, top_level_url?top_level_url:url, "GET", false, false, false};
     if (!n || !value) return -1;
     int r = webcookie_set(n->cookies, &c, value, strlen(value), time(NULL));
-    cookie_note(n, uptime_ms());
+    cookie_note(n, (n_clock_monotonic() / N_NS_PER_MS));
     return r;
 }
 long webnet_cookie_sites(webnet *n, struct webcookie_site **out) {
@@ -457,7 +457,7 @@ long webnet_cookie_clear(webnet *n, const char *site) {
     if (!n) return -N_ERR_INVALID;
     size_t removed = webcookie_clear(n->cookies, site);
     n_result r = cookie_sync(n, true); /* at once: other windows remove theirs when they read it */
-    n->cookie_due = r < 0 && webcookie_changed(n->cookies) ? uptime_ms() + COOKIE_RETRY_MS : 0;
+    n->cookie_due = r < 0 && webcookie_changed(n->cookies) ? (n_clock_monotonic() / N_NS_PER_MS) + COOKIE_RETRY_MS : 0;
     return r < 0 ? r : (long)removed;
 }
 long webnet_cookie_associated(webnet *n, const char *url, const char *name, struct webcookie_record **out) {
@@ -473,7 +473,7 @@ long webnet_cookie_delete_associated(webnet *n, const char *url, const char *nam
     long removed = webcookie_delete_associated(n->cookies, url, name, time(NULL));
     if (removed > 0 && webcookie_changed(n->cookies)) {
         n_result r = cookie_sync(n, true);
-        n->cookie_due = r < 0 && webcookie_changed(n->cookies) ? uptime_ms() + COOKIE_RETRY_MS : 0;
+        n->cookie_due = r < 0 && webcookie_changed(n->cookies) ? (n_clock_monotonic() / N_NS_PER_MS) + COOKIE_RETRY_MS : 0;
     }
     return removed;
 }
@@ -636,7 +636,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     if (q->report_sent) flags |= WEBNET_WIRE_SENT_HEADERS;
     uint64_t id = ++n->serial;
     if (!id) id = ++n->serial;
-    uint64_t deadline = uptime_ms() + WEBNET_TIMEOUT_MS;
+    uint64_t deadline = (n_clock_monotonic() / N_NS_PER_MS) + WEBNET_TIMEOUT_MS;
     size_t len;
     char language[WEBNET_WIRE_ACCEPT_LANGUAGE_MAX + 1];
     request_language(language);
@@ -662,7 +662,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     /* Origin bookkeeping is not admission policy. Native local navigation
        and malformed URLs still reach the worker's existing intent/error
        checks and deliver their ordinary asynchronous completion. */
-    r->queued_at=uptime_ms();
+    r->queued_at=(n_clock_monotonic() / N_NS_PER_MS);
     r->credentials = q->credentials; r->top_level = q->kind == WEBNET_NAVIGATION && q->user_navigation;
     r->id = id;
     r->generation = q->generation;
@@ -843,7 +843,7 @@ uint64_t webnet_socket_open(webnet *n, const struct webnet_request *q, webnet_so
     /* The opening handshake is a fetch (WebSockets "establish a WebSocket connection"). */
     char language[WEBNET_WIRE_ACCEPT_LANGUAGE_MAX + 1];
     request_language(language);
-    s->tx = wire_request(n, q, id, uptime_ms() + WEBNET_TIMEOUT_MS, 0, language, &s->tx_len);
+    s->tx = wire_request(n, q, id, (n_clock_monotonic() / N_NS_PER_MS) + WEBNET_TIMEOUT_MS, 0, language, &s->tx_len);
     s->tx_cap = s->tx_len;
     if (!s->cookie_url || !s->cookie_site || !s->tx || (s->channel = n_channel_connect(n->service_key)) < 0) { wsock_free(s); return 0; }
     s->id = id; s->generation = q->generation; s->callback = cb; s->opaque = opaque;
@@ -1021,7 +1021,7 @@ static void complete(webnet *n, struct slot *s) {
     s->rq = NULL; s->live = false; slot_close(s); n->count--;
     if (r->tx) n->queued_bytes -= r->tx_len;
     if(n->debug){
-        uint64_t done=uptime_ms();
+        uint64_t done=(n_clock_monotonic() / N_NS_PER_MS);
         /* These are caller-visible completion intervals, including TLS,
            pipe pumping, a busy GUI/native task and helper reaping. They are
            not server latency, download speed, or summed worker CPU time. */
@@ -1038,7 +1038,7 @@ static void complete(webnet *n, struct slot *s) {
         struct webnet_response response = {0};
         response.final_url = ""; response.headers = ""; response.body = ""; response.error = r->error;
         response.event = r->streaming ? WEBNET_END : WEBNET_COMPLETE;
-        response.timing = timing_finish(r, uptime_ms());
+        response.timing = timing_finish(r, (n_clock_monotonic() / N_NS_PER_MS));
         if (!r->error[0] && r->rx) {
             char *p = (char *)r->rx;
             response.status = (int)r->head.status;
@@ -1243,7 +1243,7 @@ static bool stream_frame_valid(struct request *r) {
 /* Every stream event pauses the transport until the consumer resumes it. */
 static void deliver_stream_event(webnet *n, struct request *r, const struct webnet_response *response) {
     if (n->debug && response->event == WEBNET_CHUNK) { r->stream_frames++; r->stream_bytes += response->body_len; }
-    r->paused = true; if (n->debug) r->paused_at = uptime_ms();
+    r->paused = true; if (n->debug) r->paused_at = (n_clock_monotonic() / N_NS_PER_MS);
     r->in_callback=true;
     r->callback(n, r->id, r->generation, response, r->opaque);
     r->in_callback=false;
@@ -1285,7 +1285,7 @@ static bool merge_stream_chunk(struct request *r) {
         if (!next) return false;
         r->merge = next; r->merge_cap = cap;
     }
-    if (!r->merge_len) r->merge_at = uptime_ms();
+    if (!r->merge_len) r->merge_at = (n_clock_monotonic() / N_NS_PER_MS);
     memcpy(r->merge + r->merge_len, r->rx, n); r->merge_len += n; r->merge[r->merge_len] = 0;
     free(r->rx); r->rx = NULL; r->rx_len = r->rx_pos = r->head_pos = 0;
     memset(&r->head, 0, sizeof r->head);
@@ -1310,7 +1310,7 @@ static void dispatch_merged_chunk(webnet *n, struct request *r) {
 }
 struct pump_budget {size_t bytes;uint64_t until;bool callbacks;};
 static bool pump_room(const struct pump_budget *budget){
-    return budget->bytes && uptime_ms()<budget->until;
+    return budget->bytes && (n_clock_monotonic() / N_NS_PER_MS)<budget->until;
 }
 /* Sends to the service never wait: credits and upload bytes stay within the
    service window, well below what a channel holds before a sender waits. */
@@ -1413,7 +1413,7 @@ static void pump_slot(webnet *n,struct slot *s,uint64_t now,struct pump_budget *
                 }
                 if(!r->finishing)credit_flush(s);
             }
-            if(!r->finishing&&!r->paused&&r->merge_len&&!merge_hold(r,uptime_ms()))frame_dispatch(n,s,global);
+            if(!r->finishing&&!r->paused&&r->merge_len&&!merge_hold(r,(n_clock_monotonic() / N_NS_PER_MS)))frame_dispatch(n,s,global);
         }
         if (r->finishing && global->callbacks) { s->live = false; complete(n, s); }
 }
@@ -1444,7 +1444,7 @@ static void admit(webnet *n,struct slot *s,unsigned i,uint64_t now,struct pump_b
 static void pump(webnet *n,uint64_t now,bool callbacks){
     if(!n||n->pumping)return;
     n->pumping=true;
-    struct pump_budget budget={PUMP_TOTAL_BYTES,uptime_ms()+PUMP_TIME_MS,callbacks};
+    struct pump_budget budget={PUMP_TOTAL_BYTES,(n_clock_monotonic() / N_NS_PER_MS)+PUMP_TIME_MS,callbacks};
     if(!n->budget_at||now>=n->budget_at){n->worker_limit=worker_budget();n->budget_at=now+1000;}
     reap_retired(n);
     struct request **qp=&n->queue;
@@ -1543,7 +1543,7 @@ static bool watch(n_handle q,n_handle h,uint32_t *watched,uint32_t interest){
 }
 int webnet_wait(webnet *n,n_handle queue,int timeout_ms,struct n_event *events,size_t max){
     if(n){
-        int due=webnet_timeout(n,uptime_ms());
+        int due=webnet_timeout(n,(n_clock_monotonic() / N_NS_PER_MS));
         if(due>=0&&(timeout_ms<0||due<timeout_ms))timeout_ms=due;
         if(n->watch_queue!=queue){
             for(struct wsock *s=n->sockets;s;s=s->next)s->watched=0;
@@ -1563,7 +1563,7 @@ int webnet_wait(webnet *n,n_handle queue,int timeout_ms,struct n_event *events,s
         cookie_watch_open(n,queue);
         if(n->cookie_stale)timeout_ms=0;
     }
-    int got=(int)n_events_wait(queue,events,max,timeout_ms);
+    int got=(int)n_events_wait(queue,events,max,timeout_ms<0?N_CLOCK_NEVER:n_clock_after((uint64_t)timeout_ms*N_NS_PER_MS));
     if(n&&got>0)cookie_reports(n,events,got);
     return got;
 }
@@ -1594,7 +1594,7 @@ static void cancel(webnet *n, uint64_t key, bool generation) {
 }
 void webnet_cancel(webnet *n, uint64_t id) { cancel(n, id, false); }
 static void resume_request(webnet *n, struct request *r) {
-    if (n->debug && r->paused && r->paused_at) { r->paused_ms += uptime_ms() - r->paused_at; r->paused_at = 0; }
+    if (n->debug && r->paused && r->paused_at) { r->paused_ms += (n_clock_monotonic() / N_NS_PER_MS) - r->paused_at; r->paused_at = 0; }
     r->paused = false;
 }
 void webnet_resume(webnet *n, uint64_t id) {

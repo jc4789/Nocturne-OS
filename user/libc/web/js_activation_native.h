@@ -138,7 +138,7 @@ static void activation_hyperlink(struct activation_event *a, node_t *n) {
        is the browser's to judge (its host refuses a remote page's local file). */
     if (!script && !a->trusted && realm && !permitted_url(realm, url, false)) { free(url); return; }
     web_doc *top = d; while (top->frame_parent) top = top->frame_parent;
-    bool activated = a->trusted || d->sandbox_activation_until > uptime_ms();
+    bool activated = a->trusted || d->sandbox_activation_until > (n_clock_monotonic() / N_NS_PER_MS);
     if (!script && a->trusted && (a->ctrl || a->shift)) {
         /* The user's preference for a new top-level traversable: Ctrl a tab behind this one,
            Shift a window. A sandbox without allow-popups opens none. */
@@ -158,12 +158,12 @@ static void activation_hyperlink(struct activation_event *a, node_t *n) {
    input and change, or cancel. */
 static void activation_file(node_t *n) {
     web_doc *d = n->owner;
-    if (!d || d->sandbox_activation_until <= uptime_ms() || web_control_disabled(n)) return;
+    if (!d || d->sandbox_activation_until <= (n_clock_monotonic() / N_NS_PER_MS) || web_control_disabled(n)) return;
     web_user_activation_consume(d);
     if (!web_doc_fully_active(d)) return;
-    uint64_t started = uptime_ms();
+    uint64_t started = (n_clock_monotonic() / N_NS_PER_MS);
     bool chosen = web_input_choose_files(d, n);
-    activation_waited(d, uptime_ms() - started);
+    activation_waited(d, (n_clock_monotonic() / N_NS_PER_MS) - started);
     if (n->owner != d) return;
     if (chosen) { activation_fire(d, n, "input", true); activation_fire(d, n, "change", true); }
     else activation_fire(d, n, "cancel", true);
@@ -335,7 +335,7 @@ static node_t *activation_parent(node_t *n) {
 static bool activation_dispatch_native(web_doc *d, node_t *target, const struct web_event *event) {
     if (!d || !target || !event || !event->type || strcmp(event->type, "click")) return true;
     if (!event->synthetic && web_dialog_inert(d, target)) return false;
-    if (!event->synthetic) d->sandbox_activation_until = uptime_ms() + 5000;
+    if (!event->synthetic) d->sandbox_activation_until = (n_clock_monotonic() / N_NS_PER_MS) + 5000;
     node_t *chosen = NULL;
     for (node_t *n = target; n && !chosen; n = activation_parent(n))
         if (n->owner && activation_kind(n) != ACTIVATION_NONE) chosen = n;

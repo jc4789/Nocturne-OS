@@ -70,7 +70,8 @@ int main(void) {
         ui_session_pump(s);
         if (!give(s)) break;
         struct n_event ev[16];
-        n_events_wait(q, ev, 16, ui_session_timeout(s));
+        int t = ui_session_timeout(s);
+        n_events_wait(q, ev, 16, t < 0 ? N_CLOCK_NEVER : n_clock_after((uint64_t)t * N_NS_PER_MS));
     }
     ui_session_free(s);
     return 0;

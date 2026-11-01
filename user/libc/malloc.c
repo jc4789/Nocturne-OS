@@ -70,7 +70,7 @@ static void heap_lock(void) {
     }
     while (__atomic_exchange_n(&allocator_lock, 2, __ATOMIC_ACQUIRE)) {
 #ifndef MALLOCTRIM_MODEL
-        wait_on_address(&allocator_lock, 2, UINT32_MAX);
+        wait_on_address(&allocator_lock, 2, N_CLOCK_NEVER);
 #else
         __asm__ volatile("pause");
 #endif

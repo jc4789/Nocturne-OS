@@ -11,7 +11,7 @@
 #include <threads.h>
 #include <time.h>
 #include "http2.h"
-extern uint64_t uptime_ms(void);
+#include "../include/nocturne.h"
 
 /* Each stream may buffer as much as one HTTP/1.1 connection's TCP receive
    storage, so multiplexing never narrows a transfer below the separate
@@ -574,7 +574,7 @@ static void dispatch(struct http2_connection *c) {
             else {d->next=NULL;d->at=0;d->len=data;memcpy(d->bytes,p+start,data);
                 if(s->last)s->last->next=d;else s->first=d;s->last=d;}
         }
-        s->received+=data;s->progress=uptime_ms();
+        s->received+=data;s->progress=(n_clock_monotonic() / N_NS_PER_MS);
         if(s->result)s->result->response_bytes_received+=data;
         connection_credit(c,(uint32_t)n);
         if(start+pad)stream_credit(s,(uint32_t)(start+pad));
@@ -593,7 +593,7 @@ static void dispatch(struct http2_connection *c) {
             if(pad>n-start)goto protocol;
         }
         if(!decode_headers(c,p+start,n-start-pad))goto compression;
-        if(s){s->progress=uptime_ms();if(s->result)s->result->response_bytes_received+=n-start-pad;}
+        if(s){s->progress=(n_clock_monotonic() / N_NS_PER_MS);if(s->result)s->result->response_bytes_received+=n-start-pad;}
         if(flags&4) {
             c->continuation=0;if(!header_end(c,c->header_end))goto compression;
         }else c->continuation=id;
@@ -718,9 +718,9 @@ static void await(struct http2_connection *c) {
     if(c->dead)return;
     long slice=H2_WAIT_SLICE_MS;
     if(!c->reading) {
-        uint64_t received=c->received,since=uptime_ms();
+        uint64_t received=c->received,since=(n_clock_monotonic() / N_NS_PER_MS);
         pump(c,H2_WAIT_SLICE_MS);cnd_broadcast(&c->changed);
-        if(c->received!=received||c->dead||uptime_ms()!=since)return;
+        if(c->received!=received||c->dead||(n_clock_monotonic() / N_NS_PER_MS)!=since)return;
         slice=1; /* the transport could not be waited on (TLS records to send first): a nap */
     }
     struct timespec until;timespec_get(&until,TIME_UTC);
@@ -796,7 +796,7 @@ struct http2_stream *http2_start(struct http2_connection *c,const struct http_re
         free(name);if(!ok)goto invalid;p=end+2;
     }
     s->connection=c;s->request=rq;s->hooks=hooks;s->result=result;s->head=!strcmp(method,"HEAD");
-    s->recv_window=H2_WINDOW;s->timeout=rq->timeout_ms>0?(uint64_t)rq->timeout_ms:INT_MAX;s->progress=uptime_ms();
+    s->recv_window=H2_WINDOW;s->timeout=rq->timeout_ms>0?(uint64_t)rq->timeout_ms:INT_MAX;s->progress=(n_clock_monotonic() / N_NS_PER_MS);
     enter(c);
     /* Checkout is only a capacity hint: another caller or SETTINGS can change
        it before start. Queue admission fairly instead of failing that request.
@@ -814,7 +814,7 @@ struct http2_stream *http2_start(struct http2_connection *c,const struct http_re
         pump(c,0);leave(c);
         bool cancelled=hooks&&hooks->cancelled&&hooks->cancelled(rq->ctx);
         enter(c);
-        if(cancelled||uptime_ms()-s->progress>=s->timeout) {
+        if(cancelled||(n_clock_monotonic() / N_NS_PER_MS)-s->progress>=s->timeout) {
             if(waiting)c->header_waiters--;start_remove(c,&waiter);leave(c);errno=cancelled?ECANCELED:ETIMEDOUT;goto invalid;
         }
         await(c);
@@ -852,7 +852,7 @@ static bool check(struct http2_stream *s,bool cancelled) {
     if(cancelled) {
         cancel_output(s->connection,s,true);stream_fail(s,ECANCELED,"request cancelled");
     }
-    if(!s->error&&uptime_ms()-s->progress>=s->timeout){cancel_output(s->connection,s,true);stream_fail(s,ETIMEDOUT,"HTTP/2 stream timed out");}
+    if(!s->error&&(n_clock_monotonic() / N_NS_PER_MS)-s->progress>=s->timeout){cancel_output(s->connection,s,true);stream_fail(s,ETIMEDOUT,"HTTP/2 stream timed out");}
     return !s->error;
 }
 long http2_read(struct http2_stream *s,void *out,size_t n) {

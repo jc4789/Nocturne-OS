@@ -49,13 +49,13 @@ int main(int argc,char **argv) {
         win_move(wins[i],40+(int)(i%4)*19,30+(int)(i%5)*13);
         paint(wins[i],i+1);
     }
-    n_sleep_ms(150);
+    n_sleep_until(n_clock_after(150 * N_NS_PER_MS));
     if (many) {
         int last=(int)count-1;
         if (check_client(pixels,gw,gw,gh,count,40+(last%4)*19,30+(last%5)*13)) goto cleanup;
         printf("wmramtest: many-stage PASS real-windows=28 client-pixels=3\n");
         for (unsigned i=count;i>16;) { --i;win_close(wins[i]);wins[i]=NULL; }
-        n_sleep_ms(150);
+        n_sleep_until(n_clock_after(150 * N_NS_PER_MS));
     }
     int x=40+3*19,y=30;
     if (check_client(pixels,gw,gw,gh,16,x,y)) goto cleanup;
@@ -65,7 +65,7 @@ int main(int argc,char **argv) {
         win_move(wins[15],x,y);
         win_set_title(wins[15],round&1 ? "RAM CPU / moving, immutable title snapshot" : "RAM CPU / overlap and shadow");
         paint(wins[15],16);
-        n_sleep_ms(35);
+        n_sleep_until(n_clock_after(35 * N_NS_PER_MS));
         if (check_client(pixels,gw,gw,gh,16,x,y)) goto cleanup;
     }
     /* Reallocation frees the previous source immediately after join. */
@@ -73,7 +73,7 @@ int main(int argc,char **argv) {
     if (address<0) goto cleanup;
     wins[15]->w=width-37;wins[15]->h=height-29;
     gfx_init(&wins[15]->c,(uint32_t *)address,wins[15]->w,wins[15]->h,wins[15]->w);
-    paint(wins[15],16);n_sleep_ms(100);
+    paint(wins[15],16);n_sleep_until(n_clock_after(100 * N_NS_PER_MS));
     if (check_client(pixels,gw,gw,gh,16,x,y)) goto cleanup;
     cpu_info(&after);
     if (after.worker_cpus && after.parallel_jobs<=before.parallel_jobs) {
@@ -85,7 +85,7 @@ int main(int argc,char **argv) {
     result=0;
 cleanup:
     for (unsigned i=0;i<28;i++) if (wins[i]) win_close(wins[i]);
-    n_sleep_ms(50);free(pixels);
+    n_sleep_until(n_clock_after(50 * N_NS_PER_MS));free(pixels);
     printf(result ? "wmramtest: FAIL cleaned partial workload\n" : "wmramtest: PASS destroy after synchronous joins\n");
     return result;
 }

@@ -117,15 +117,15 @@ int main(int argc,char **argv) {
     printf("CANVAS-STAGE initial-layout\n");fflush(stdout);
     web_layout(doc,128,128);
     printf("CANVAS-STAGE tick\n");fflush(stdout);
-    uint64_t deadline=uptime_ms()+6000;
-    while (!done && uptime_ms()<deadline) {
-        web_tick(doc,uptime_ms());
+    uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+6000;
+    while (!done && (n_clock_monotonic() / N_NS_PER_MS)<deadline) {
+        web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));
         if (image_request) {
             struct web_response r={.status=200,.body=(char *)svg,.body_len=sizeof svg-1};
             strcpy(r.url,"https://canvas.test/fixture.svg");
             web_resource_loaded(doc,image_request,&r); image_request=0;
         }
-        n_sleep_ms(1);
+        n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
     }
     printf("CANVAS-STAGE final-layout-paint\n");fflush(stdout);
     canvas_t c;gfx_init(&c,pixels,128,128,128);web_layout(doc,128,128);web_paint(doc,&c,0,0,128,128,0,0);

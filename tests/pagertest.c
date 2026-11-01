@@ -34,7 +34,7 @@ static void server(void *arg){
     (void)arg;
     struct n_pager_fault f[16];
     while(!stop){
-        n_result n=n_pager_take(pager,f,16,50);
+        n_result n=n_pager_take(pager,f,16,n_clock_after(50 * N_NS_PER_MS));
         if(n==-N_ERR_TIMEOUT)continue;
         if(n<0)break;
         for(n_result i=0;i<n;i++){
@@ -112,7 +112,7 @@ static void expect_fault(const char *self,size_t page,const char *why){
     unsigned char seen=0;CHECK(receive(end,&seen,1,NULL)&&seen==pattern(PAGE+5));
     unsigned before=faults;
     CHECK(n_channel_send(end,"g",1,-1)==1);
-    int status=-1;CHECK(n_app_result(app,-1,&status)==0&&status==128+14);
+    int status=-1;CHECK(n_app_result(app,N_CLOCK_NEVER,&status)==0&&status==128+14);
     if(status==128+14)printf("pagertest: expected toucher fault status=%d (%s)\n",status,why); /* test.py lets it be */
     if(page==FAIL_PAGE)CHECK(faults==before+1&&last_page==FAIL_PAGE&&last_app==(uint32_t)n_app_id(app));
     else CHECK(faults==before); /* nobody was asked */
@@ -228,7 +228,7 @@ int main(int argc,char **argv){
     if(wapp>=0){
         CHECK(n_channel_send(wend,"mem",3,memory)==3);
         unsigned char seen=0;CHECK(receive(wend,&seen,1,NULL)&&seen=='p');
-        int status=-1;CHECK(n_app_result(wapp,-1,&status)==0&&status==128+14);
+        int status=-1;CHECK(n_app_result(wapp,N_CLOCK_NEVER,&status)==0&&status==128+14);
         if(status==128+14)printf("pagertest: expected writer fault status=%d (protected page)\n",status); /* test.py lets it be */
         CHECK(back[PROTECT_PAGE*PAGE]=='p'&&faults==before+1);
         n_handle_close(wapp);n_handle_close(wend);
@@ -259,7 +259,7 @@ int main(int argc,char **argv){
     /* Nobody else may use the pager, even holding its handle. */
     n_handle end=-1;
     n_handle app=launch(argv[0],"thief",pager,&end);CHECK(app>=0);
-    if(app>=0){int status=-1;CHECK(n_app_result(app,-1,&status)==0&&status==0);n_handle_close(app);n_handle_close(end);}
+    if(app>=0){int status=-1;CHECK(n_app_result(app,N_CLOCK_NEVER,&status)==0&&status==0);n_handle_close(app);n_handle_close(end);}
 
     /* The pager ends: bound pages stay, unbound ones are access violations at once. */
     stop=1;CHECK(thread_join(tid)==0);
@@ -277,7 +277,7 @@ int main(int argc,char **argv){
     CHECK(n_handle_close(mem2)==0);
     CHECK(n_pager_take(p2,&f,1,0)==-N_ERR_TIMEOUT); /* the mapping keeps it */
     CHECK(n_memory_release(m2,PAGE)==0);
-    CHECK(n_pager_take(p2,&f,1,-1)==-N_ERR_CLOSED);
+    CHECK(n_pager_take(p2,&f,1,N_CLOCK_NEVER)==-N_ERR_CLOSED);
     run=(struct n_pager_supply){.offset=0,.bytes=PAGE,.source=backing,.access=N_MEMORY_READ};
     CHECK(n_pager_supply(p2,&run,1)==-N_ERR_CLOSED);
     CHECK(n_handle_close(p2)==0);

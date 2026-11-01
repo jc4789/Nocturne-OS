@@ -76,7 +76,7 @@ static bool spawn_child(nmedia_mse_worker *w){
     return true;
 }
 nmedia_mse_worker *nmedia_mse_worker_open(uint32_t generation,char *error,size_t size){
-    nmedia_mse_worker_background(uptime_ms());
+    nmedia_mse_worker_background((n_clock_monotonic() / N_NS_PER_MS));
     nmedia_mse_worker *w=nmedia_ff_mallocz(sizeof *w);if(!w){if(error&&size)strlcpy(error,"MSE worker allocation failed",size);return NULL;}
     w->app=w->control=w->video=-1;w->generation=generation;w->next=live;live=w;if(error&&size)*error=0;return w;
 }
@@ -242,7 +242,7 @@ static void pump_io(nmedia_mse_worker *w,uint64_t now,bool dispatch){
     video_io(w);
 }
 void nmedia_mse_worker_pump_budget(nmedia_mse_worker *w,uint64_t now,uint64_t until){(void)until;pump_io(w,now,true);}
-void nmedia_mse_worker_collect(nmedia_mse_worker *w){uint64_t now=uptime_ms();pump_io(w,now,false);}
+void nmedia_mse_worker_collect(nmedia_mse_worker *w){uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);pump_io(w,now,false);}
 bool nmedia_mse_worker_service_due(const nmedia_mse_worker *w,uint64_t now){
     return w&&w->app>=0&&!w->stopping&&
         (w->video_ready||(w->output_ready&&w->output.kind!=NMSW_BUSY)||now>=w->service_at);
@@ -257,13 +257,13 @@ void nmedia_mse_worker_service(nmedia_mse_worker *w,uint64_t now,uint64_t until)
            16 ms is below one 48 kHz 1024-sample packet and the native PCM ring
            headroom. New APPEND/key/control work immediately clears this wait. */
         w->service_idle_ms=w->service_idle_ms?MIN(w->service_idle_ms*2,16u):1;
-        w->service_at=uptime_ms()+w->service_idle_ms;
+        w->service_at=(n_clock_monotonic() / N_NS_PER_MS)+w->service_idle_ms;
     }
 }
 bool nmedia_mse_worker_needs_service(const nmedia_mse_worker *w){return w&&w->app>=0&&!w->stopping&&
     (w->head||w->output_ready||w->video_ready||w->video_expected_sequence>w->video_sequence||!w->starving);}
 void nmedia_mse_worker_video_stats(const nmedia_mse_worker *w,uint64_t *decoded,uint64_t *dropped){if(decoded)*decoded=w?w->decoded_frames:0;if(dropped)*dropped=w?w->dropped_frames:0;}
-void nmedia_mse_worker_pump(nmedia_mse_worker *w,uint64_t now){nmedia_mse_worker_pump_budget(w,now,uptime_ms()+2);}
+void nmedia_mse_worker_pump(nmedia_mse_worker *w,uint64_t now){nmedia_mse_worker_pump_budget(w,now,(n_clock_monotonic() / N_NS_PER_MS)+2);}
 bool nmedia_mse_worker_pending(const nmedia_mse_worker *w){if(!w)return false;for(struct request *r=w->head;r;r=r->next)if(r->c.op!=NMSW_STEP&&r->c.op!=NMSW_SEEK)return true;return false;}
 bool nmedia_mse_worker_running(const nmedia_mse_worker *w){return w&&w->app>=0&&!w->stopping;}
 bool nmedia_mse_worker_quota_error(const nmedia_mse_worker *w){return w&&w->quota_error;}
@@ -326,7 +326,7 @@ static void prefetch(nmedia_mse_worker *w,uint64_t until,bool cooperative){
      * payload, dispatch exactly one STEP, and overlap decode with GUI/JS work.
      * No queue growth, extra frame buffer, wait, or new burst deadline. */
     if(!nmedia_mse_worker_command(w,NMSW_STEP,0,NULL,0,0,0,0,false)){stop(w,"MSE STEP queue allocation/size failure");return;}
-    if(cooperative)nmedia_mse_worker_service(w,uptime_ms(),until);else nmedia_mse_worker_pump_budget(w,uptime_ms(),until);
+    if(cooperative)nmedia_mse_worker_service(w,(n_clock_monotonic() / N_NS_PER_MS),until);else nmedia_mse_worker_pump_budget(w,(n_clock_monotonic() / N_NS_PER_MS),until);
 }
 void nmedia_mse_worker_prefetch(nmedia_mse_worker *w,uint64_t until){prefetch(w,until,false);}
 void nmedia_mse_worker_prefetch_service(nmedia_mse_worker *w,uint64_t until){prefetch(w,until,true);}

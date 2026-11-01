@@ -46,7 +46,7 @@ static web_doc *load(struct logs *l,bool debug) {
     web_doc *d=web_live(html,strlen(html),"https://line-clamp-predicate.test/","utf-8",&host);
     check("new predicate live document allocated",d!=NULL);
     if (d) {
-        for (int i=0;i<8;i++) web_tick(d,uptime_ms());
+        for (int i=0;i<8;i++) web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
         web_layout(d,480,240);
     }
     return d;

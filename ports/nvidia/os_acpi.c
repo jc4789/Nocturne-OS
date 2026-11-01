@@ -211,7 +211,7 @@ static int notify_loop(void *arg) {
     (void)arg;
     nvrm_thread_admin = true;
     while (!atomic_load(&notify_stop)) {
-        n_result value = n_pci_acpi_notify_take(nvrm_dev.pci, 250);
+        n_result value = n_pci_acpi_notify_take(nvrm_dev.pci, n_clock_after(250 * N_NS_PER_MS));
         if (value == -N_ERR_TIMEOUT) continue;
         if (value < 0) break;
         notify_rm(value);

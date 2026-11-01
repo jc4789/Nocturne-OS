@@ -7,7 +7,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: host name...\n");
         return 2;
     }
-    if (!net_wait_up(5000)) {
+    if (!net_wait_up(n_clock_after(5000 * N_NS_PER_MS))) {
         fprintf(stderr, "host: network is down\n");
         return 1;
     }

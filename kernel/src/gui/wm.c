@@ -602,8 +602,8 @@ static void win_destroy(struct window *w) {
     wm_unlock();
 }
 
-/* Takes every queued event that fits in out[max] (the app's memory), waiting up to timeout_ms
-   (negative: until one arrives). The count, 0 when the time ran out, or N_ERR_CLOSED once a
+/* Takes every queued event that fits in out[max] (the app's memory), waiting until deadline
+   (CLOCK_NEVER: until one arrives). The count, 0 when the time ran out, or N_ERR_CLOSED once a
    closed window has handed out its last event. Any CPU, without wm_lock: the events leave the
    mailbox under ev_lock a batch at a time, into the kernel's memory, and are copied to out after
    it (a copy may sleep). out's pages are made present first; events taken for a page another
@@ -3245,7 +3245,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
         /* Without the WM lock (ev_lock); the handle's reference keeps the window's memory. */
         handle = handle_get((int)a);
         int64_t result = !handle ? -N_ERR_NO_HANDLE : !handle_is(handle, &win_ops) ? -N_ERR_WRONG_KIND
-                       : win_receive(handle->object->priv, (struct gui_event *)b, (size_t)c, syscall_deadline((int64_t)d));
+                       : win_receive(handle->object->priv, (struct gui_event *)b, (size_t)c, d);
         handle_close(handle);
         return result;
     }

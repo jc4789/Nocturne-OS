@@ -438,7 +438,7 @@ int main(int argc, char **argv) {
     char named[1024];
     if (argc > 1 && n_path_complete(argv[1], named, sizeof named) > 0) load(named);
     push_undo();
-    srand((unsigned)n_clock_uptime_ms());
+    srand((unsigned)(n_clock_monotonic() / N_NS_PER_MS));
     touch(0, 0, CWID, CHGT);
     flush(s);
     draw_palette(palette_c);

@@ -28,7 +28,7 @@ int main(int argc, char **argv) {
         }
         path = saved;
     }
-    if (delay > 0) n_sleep_ms((uint64_t)delay * 1000);
+    if (delay > 0) n_sleep_until(n_clock_after((uint64_t)((uint64_t)delay * 1000) * N_NS_PER_MS));
     int w, h;
     uint32_t *px = NULL;
     if (screen_grab(NULL, 0, &w, &h) == 0) px = malloc((size_t)w * (size_t)h * 4);

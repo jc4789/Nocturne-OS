@@ -140,7 +140,7 @@ bool web_input_choose_files(web_doc *d, web_node *input) {
                     int index = (int)(event.node - places.first);
                     if (!multiple || !(event.mods & NMOD_CTRL)) for (int i = 0; i < picker->count; i++) if (i != index) picker->entries[i].selected = false;
                     picker->cursor = index; picker->entries[index].selected = !picker->entries[index].selected;
-                    uint64_t now = uptime_ms(); enter = index == last_index && now - last_click < 450;
+                    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS); enter = index == last_index && now - last_click < 450;
                     last_click = now; last_index = index;
                 }
             } else if (event.type == UI_EVENT_KEY && !(event.flags & UI_UP)) {

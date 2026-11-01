@@ -145,7 +145,7 @@ void web_response_free(struct web_response *response);
    performance.navigation: navigation start (the time origin), the kind of
    navigation, and the navigation response's timing record. The document
    copies it as it is created; fetch.server_timing and headers are borrowed
-   until then. All values use uptime_ms(), not wall clock time. */
+   until then. All values use (n_clock_monotonic() / N_NS_PER_MS), not wall clock time. */
 enum web_navigation_type { WEB_NAVIGATION_NAVIGATE, WEB_NAVIGATION_RELOAD, WEB_NAVIGATION_BACK_FORWARD };
 struct web_navigation_timing {
     bool valid;
@@ -359,7 +359,7 @@ void web_media_background(uint64_t now_ms);
 int64_t web_media_background_deadline(uint64_t now_ms);
 /* Native playback transitions are reported only when explicitly requested. */
 void web_avmedia_debug(bool enabled);
-/* -1: no deadline, otherwise an absolute uptime_ms() deadline. */
+/* -1: no deadline, otherwise an absolute (n_clock_monotonic() / N_NS_PER_MS) deadline. */
 int64_t web_deadline(web_doc *d);
 /* With host.display_frames, the rendering opportunities (HTML "update the rendering": animation
    frames, then the rendering observers) of d and its frames come from the embedder's display:

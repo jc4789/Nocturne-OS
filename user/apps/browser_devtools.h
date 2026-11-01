@@ -297,7 +297,7 @@ static void dt_basename(const char *url, char *out, size_t capacity) {
 }
 static void dt_refresh_side(void) {
     dt_lines_clear(&tab->dt->side);
-    tab->dt->side_at = n_clock_uptime_ms();
+    tab->dt->side_at = (n_clock_monotonic() / N_NS_PER_MS);
     struct sb s = {0};
     if (!tab->dt->selected || web_inspect_kind(tab->dt->selected) != WEB_INSPECT_ELEMENT) {
         dt_puts(&s, C_DIM, tab->dt->selected ? "Styles apply to elements only." : "Select an element in the tree, or pick one with Ctrl+Shift+C.");
@@ -380,7 +380,7 @@ static void devtools_refresh(bool force) {
     if (tab->dt->selected && !web_inspect_contains(root, tab->dt->selected)) { tab->dt->selected = NULL; tab->dt->side_at = 0; }
     if (tab->dt->hovered && !web_inspect_contains(root, tab->dt->hovered)) tab->dt->hovered = NULL;
     if (tab->dt->panel != DT_ELEMENTS) { dt_measure(); return; }
-    uint64_t now = n_clock_uptime_ms();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
     if (force || now - tab->dt->tree_at >= 250) { dt_build_tree(); tab->dt->tree_at = now; tab->console_dirty = true; }
     if (force || !tab->dt->side_at || now - tab->dt->side_at >= 1000) { dt_refresh_side(); tab->console_dirty = true; }
     dt_measure();
@@ -440,7 +440,7 @@ static uint64_t dt_net_begin(bool navigation, uint64_t gen, uint64_t resource, i
     struct dt_request *r = &tab->dt->net[tab->dt->net_n];
     memset(r, 0, sizeof *r);
     r->serial = ++tab->dt->net_serial; r->generation = gen; r->resource = resource; r->kind = kind;
-    r->navigation = navigation; r->start = n_clock_uptime_ms();
+    r->navigation = navigation; r->start = (n_clock_monotonic() / N_NS_PER_MS);
     r->method = strdup(method ? method : "GET"); r->url = strdup(url ? url : "");
     r->request_headers = headers ? strdup(headers) : NULL;
     if (!r->method || !r->url) { dt_request_free(r); return 0; }
@@ -491,7 +491,7 @@ static void dt_net_update(uint64_t serial, const struct webnet_response *result)
     if (result->event == WEBNET_CHUNK) { r->size += result->body_len; r->streamed = true; }
     if (result->event == WEBNET_COMPLETE) r->size = r->streamed ? r->size + result->body_len : result->body_len;
     if (result->event == WEBNET_COMPLETE || result->event == WEBNET_END) {
-        r->done = true; r->end = n_clock_uptime_ms();
+        r->done = true; r->end = (n_clock_monotonic() / N_NS_PER_MS);
         if (result->error && result->error[0] && !r->error) r->error = strdup(result->error);
     }
     if (tab->dt->net_selected >= 0 && &tab->dt->net[tab->dt->net_selected] == r) dt_net_detail_build();
@@ -756,7 +756,7 @@ static void dt_draw_network(canvas_t *c, int top, int h) {
     if (!tab->dt->net_n) {
         gfx_text(c, 12, y + 8, "Recording network activity. Reload the page (F5) to record its requests.", dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
     }
-    uint64_t now = n_clock_uptime_ms(), first = tab->dt->net_n ? tab->dt->net[0].start : now, last = first + 1;
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS), first = tab->dt->net_n ? tab->dt->net[0].start : now, last = first + 1;
     for (int i = 0; i < tab->dt->net_n; i++) last = MAX(last, tab->dt->net[i].done ? tab->dt->net[i].end : now);
     for (int i = 0; i < rows && tab->dt->net_top + i < tab->dt->net_n; i++) {
         const struct dt_request *r = &tab->dt->net[tab->dt->net_top + i];

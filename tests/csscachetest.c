@@ -58,7 +58,7 @@ static int font_sources_integration(void) {
     /* The no-remeasurement contract is for a committed, quiet live snapshot.
        Let the actual parser/resource scan consume its initial work; manually
        clearing dirty flags on a static document would bypass that contract. */
-    for(unsigned i=0;i<12;i++)web_tick(d,uptime_ms());
+    for(unsigned i=0;i<12;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     web_layout(d,800,600);node_t *node=font_example(d->root);
     struct web_font_resource *first=doc_font_resource(d,"https://font.test/unhinted.eot");
     struct web_font_resource *second=doc_font_resource(d,"https://font.test/fallback.ttf");
@@ -97,7 +97,7 @@ static int font_failure_noop(void) {
         ".example{font-family:Example,sans-serif}</style><div class=example id=font-example>AWi</div>";
     struct web_host host={.request=font_queue_request,.script_checkpoint=checkpoint};
     web_doc *d=web_live(html,strlen(html),"https://font.test/","utf-8",&host);
-    if(d){for(unsigned i=0;i<12;i++)web_tick(d,uptime_ms());web_layout(d,800,600);}
+    if(d){for(unsigned i=0;i<12;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));web_layout(d,800,600);}
     struct web_font_resource *first=d?doc_font_resource(d,"https://font.test/first.ttf"):NULL;
     struct web_font_resource *second=d?doc_font_resource(d,"https://font.test/second.ttf"):NULL;
     bool quiet=d&&d->live&&d->layout_valid&&!d->resources_dirty&&!d->need_style&&!d->need_boxes&&
@@ -127,7 +127,7 @@ static void css_supply_cancel(void *opaque,uint64_t id) {(void)id;((struct css_s
 static int css_supply_index(struct css_supply *s,const char *url,unsigned after) {
     for(unsigned i=after;i<s->count;i++)if(!strcmp(s->urls[i],url))return (int)i;return -1;
 }
-static void css_supply_ticks(web_doc *d){for(unsigned i=0;i<12;i++)web_tick(d,uptime_ms());}
+static void css_supply_ticks(web_doc *d){for(unsigned i=0;i<12;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));}
 static void css_supply_deliver(web_doc *d,struct css_supply *s,int index,const char *final,const char *text) {
     if(index<0 || (unsigned)index>=s->count){check(false,"supply response has dispatched identity");return;}
     struct web_response response={.status=200,.body=(char *)text,.body_len=strlen(text)};
@@ -295,7 +295,7 @@ static int initial_render_integration(void) {
         "<link rel=stylesheet href=body.css><div id=font-example>CSS</div></body></html>";
     web_doc *d=web_live(html,strlen(html),"https://render.test/","utf-8",&host);
     check(d!=NULL,"initial render document");if(!d)goto done;
-    d->initial_render_deadline=uptime_ms()+30000;
+    d->initial_render_deadline=(n_clock_monotonic() / N_NS_PER_MS)+30000;
     css_supply_ticks(d);web_layout(d,800,600);
     check(web_render_blocked(d),"pending active head CSS blocks initial paint");
     int head=css_supply_index(&supply,"https://render.test/head.css",0);
@@ -311,13 +311,13 @@ static int initial_render_integration(void) {
     d->initial_render_done=true;
     link_sheet(d,d->head,"https://render.test/later.css");web_layout(d,800,600);css_supply_ticks(d);
     check(!web_render_blocked(d),"later head insertion does not hide committed content");
-    d->initial_render_done=false;d->initial_render_deadline=uptime_ms();
+    d->initial_render_done=false;d->initial_render_deadline=(n_clock_monotonic() / N_NS_PER_MS);
     check(!web_render_blocked(d),"paint fallback releases a stalled sheet without discarding it");
     check(supply.count==5&&!supply.cancels,"fallback preserves live request ownership");
     d->paint_dirty=false;d->paint_damage_full=false;
-    web_tick(d,uptime_ms());
+    web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     check(d->initial_render_deadline==0&&web_paint_dirty(d),"fallback requests one committed repaint");
-    d->paint_damage_full=false;web_tick(d,uptime_ms());
+    d->paint_damage_full=false;web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     check(!web_paint_dirty(d),"unpainted or hidden frame does not repeatedly dirty its parent");
     web_free(d);
 done:
@@ -329,7 +329,7 @@ static int color_format_integration(void) {
     struct web_host host={.script_checkpoint=checkpoint};
     web_doc *d=web_live(html,strlen(html),"https://color-format.test/","utf-8",&host);
     check(d!=NULL,"color serialization live document");if(!d)goto done;
-    for(unsigned i=0;i<8;i++)web_tick(d,uptime_ms());
+    for(unsigned i=0;i<8;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     web_layout(d,800,600);
     static const struct {const char *input,*expected;} cases[]={
         {"#0c2238ff","rgb(12, 34, 56)"},
@@ -362,7 +362,7 @@ static int frame_viewport_integration(void) {
     struct web_host host={.script_checkpoint=checkpoint};
     web_doc *d=web_live(html,strlen(html),"https://frame-viewport.test/","utf-8",&host);
     check(d!=NULL,"frame viewport live document");if(!d)goto done;
-    for(unsigned i=0;i<24;i++)web_tick(d,uptime_ms());web_layout(d,800,600);
+    for(unsigned i=0;i<24;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));web_layout(d,800,600);
     const char *initial="var f=document.getElementById('frame'),t=f.contentDocument.getElementById('t');"
         "if(!t||f.contentWindow.innerWidth!==300||getComputedStyle(t).color!=='rgb(255, 0, 0)')throw Error('initial child viewport');";
     check(web_console_eval(d,initial,strlen(initial)),"initial child viewport and CSS media");
@@ -414,7 +414,7 @@ static int pseudo_bodies_integration(void) {
     struct web_host host={.script_checkpoint=checkpoint};
     web_doc *d=web_live(html,strlen(html),"https://pseudo-body.test/","utf-8",&host);
     check(d!=NULL,"computed pseudo body document");if(!d)goto done;
-    for(unsigned i=0;i<8;i++)web_tick(d,uptime_ms());web_layout(d,800,600);
+    for(unsigned i=0;i<8;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));web_layout(d,800,600);
     node_t *plain=selected_node(d,"#plain"),*input=selected_node(d,"#replaced"),
         *button=selected_node(d,"#button"),*object=selected_node(d,"#fallback");
     check(plain&&input&&button&&object,"all pseudo body origins exist");
@@ -475,7 +475,7 @@ int main(int argc,char **argv){
     web_doc *d=web_live(html,strlen(html),"https://cache.test/page/","utf-8",&host);
     check(d!=NULL,"document");if(!d)goto done;
     d->profile_enabled=true;parallel_profile_enable(true);
-    for(int i=0;i<8;i++)web_tick(d,uptime_ms());
+    for(int i=0;i<8;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     const char *one_url="https://cache.test/assets/one.css",*two_url="https://cache.test/assets/two.css";
     char *one_css=large_css(".value{width:40px;height:10px;color:red}"
         "@media(min-width:900px){.value{color:blue}}");

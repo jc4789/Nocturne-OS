@@ -50,7 +50,7 @@ static void check(bool value,const char *name){checks++;if(!value){errors++;prin
 static const char *web_url(web_doc *d){return d->url;}
 static const char *web_effective_url(web_doc *d){return d->effective;}
 static bool doc_node_connected(node_t *n){return n&&n->connected;}
-static uint64_t uptime_ms(void){return clock_ms;}
+static uint64_t n_clock_monotonic(void){return (uint64_t)(clock_ms)*1000000ULL;}
 static size_t webnet_response_limit(enum webnet_kind k){return UINT32_MAX;}
 static const char *web_response_headers(const struct web_response *r){return r->headers_full?r->headers_full:r->headers;}
 static void web_response_free(struct web_response *r){free(r->body);free(r->headers_full);r->body=r->headers_full=NULL;}

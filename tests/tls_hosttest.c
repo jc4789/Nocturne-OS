@@ -25,7 +25,7 @@
 /* ---- the native ABI calls tls.c makes ---- */
 static SOCKET sockets[64];
 static bool socket_used[64];
-uint64_t uptime_ms(void) { return GetTickCount64(); }
+uint64_t n_clock_monotonic(void){return (uint64_t)(GetTickCount64())*1000000ULL;}
 n_result n_random(void *buf, size_t n) {
     return BCryptGenRandom(NULL, buf, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0 ? -N_ERR_IO : (n_result)n;
 }
@@ -98,7 +98,7 @@ n_result tcp_send_until(n_handle h, const void *buf, size_t len, uint64_t deadli
         n_result r = tcp_send_some(h, (const char *)buf + done, len - done);
         if (r > 0) { done += (size_t)r; continue; }
         if (r != -N_ERR_NOT_READY) return done ? (n_result)done : r;
-        uint64_t now = uptime_ms();
+        uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
         if (deadline_ms && now >= deadline_ms) return done ? (n_result)done : -N_ERR_TIMEOUT;
         wait_socket(sockets[h], true, deadline_ms ? (int)(deadline_ms - now) : -1);
     }

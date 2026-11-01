@@ -262,7 +262,7 @@ uint64_t webstorage_session_open(webstorage *s) {
  * ones (what they hold is in the shared journal and its checkpoint) that no realm reads events
  * from. Used now is what was touched since the last sweep. */
 static void storage_sweep(webstorage *s) {
-    uint64_t now = uptime_ms();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
     for (struct storage_area **link = &s->areas; *link;) {
         struct storage_area *a = *link;
         if (a->touched) { a->touched = false; a->used_at = now; }
@@ -390,12 +390,12 @@ int webstorage_flush(webstorage *s, bool force, struct web_storage_result *out) 
     if(!out)out=&ignored;
     memset(out,0,sizeof *out);
     if(!s)return WEB_STORAGE_IO;
-    uint64_t now=uptime_ms(); int status=WEB_STORAGE_OK;
+    uint64_t now=(n_clock_monotonic() / N_NS_PER_MS); int status=WEB_STORAGE_OK;
     for(struct storage_area *a=s->areas;a;a=a->next) {
         if(!a->dirty || (!force && (now<a->retry_at || (now-a->changed_at<100 && now-a->dirty_since<1000))))continue;
         out->save_attempts++;
-        uint64_t start=uptime_ms();
-        int result=storage_shared_flush(s,a,out);out->save_ms+=uptime_ms()-start;
+        uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);
+        int result=storage_shared_flush(s,a,out);out->save_ms+=(n_clock_monotonic() / N_NS_PER_MS)-start;
         if(result==WEB_STORAGE_OK){a->dirty=false;a->unavailable=false;a->retry_at=0;}
         else {status=result;a->retry_at=now+1000;}
     }
@@ -455,7 +455,7 @@ static int storage_area_apply(struct storage_area *a, const struct web_storage_r
         free(e->value); e->value=value; e->vn=r->value_len; e->units=ku+vu;
     }
     a->units=newunits;
-    if(a->kind==WEB_STORAGE_LOCAL){uint64_t now=uptime_ms();if(!a->dirty)a->dirty_since=now;a->changed_at=now;a->dirty=true;}
+    if(a->kind==WEB_STORAGE_LOCAL){uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);if(!a->dirty)a->dirty_since=now;a->changed_at=now;a->dirty=true;}
     return WEB_STORAGE_OK;
 }
 #include "webstorage_shared.h"

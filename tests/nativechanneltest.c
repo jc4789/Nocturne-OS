@@ -18,10 +18,10 @@ static int transferred_sender(void) {
     return n_channel_send(0,"child",5,-1)==5?0:32;
 }
 /* The interest bits of h that are ready within ms, or 0. */
-static uint32_t ready(n_handle h,uint32_t interest,int64_t ms) {
+static uint32_t ready(n_handle h,uint32_t interest,uint64_t ms) {
     n_handle q=n_events_create();if(q<0)return 0;
     struct n_event e={0};
-    n_result n=n_events_watch(q,h,interest,1)<0?-1:n_events_wait(q,&e,1,ms);
+    n_result n=n_events_watch(q,h,interest,1)<0?-1:n_events_wait(q,&e,1,n_clock_after(ms*N_NS_PER_MS));
     n_handle_close(q);return n==1?e.events:0;
 }
 static int server(void) {
@@ -96,7 +96,7 @@ int main(int argc,char **argv) {
         n_result sender_id=n_app_id(sender_app);int status=-1;
         check(sender_id>0 && (uint64_t)sender_id!=self,"separate app has distinct native identity");
         check(n_channel_send(peer,"g",1,-1)==1,"release transferred sender");
-        n_result ended=n_app_result(sender_app,5000,&status);
+        n_result ended=n_app_result(sender_app,n_clock_after(5000 * N_NS_PER_MS),&status);
         check(ended==0 && status==0,"sender ends before its queued message is received");
         check(n_channel_receive_from(peer,credential_text,sizeof credential_text,0,&message)==5 &&
               !memcmp(credential_text,"child",5) && message.sender_app==(uint64_t)sender_id && message.sender_app!=self,
@@ -163,7 +163,7 @@ int main(int argc,char **argv) {
         if(ok)check(n_channel_receive(client,&byte,1,N_CHANNEL_WAIT,NULL)==-N_ERR_CLOSED,"service app closes its end when done");
         int status=-1;
         if(!ok)n_app_stop(app,0);
-        check(n_app_result(app,5000,&status)>=0 && (!ok || status==0),"service app ends");
+        check(n_app_result(app,n_clock_after(5000 * N_NS_PER_MS),&status)>=0 && (!ok || status==0),"service app ends");
         n_handle_close(app);
         if(client>=0)n_handle_close(client);
         listener=n_channel_listen(key);check(listener>=0,"the service ending returns the name");if(listener>=0)n_handle_close(listener);

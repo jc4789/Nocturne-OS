@@ -37,8 +37,8 @@ static bool script(const char *url,const char *code){
     struct web_host host={.request=request,.console=message,.storage=access_store};
     web_doc *d=web_live(html,strlen(html),url,"utf-8",&host);free(html);
     check(d!=NULL,"live document allocation");if(!d)return false;
-    uint64_t deadline=uptime_ms()+20000;
-    while(!done && uptime_ms()<deadline){web_tick(d,uptime_ms());n_sleep_ms(1);}
+    uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+20000;
+    while(!done && (n_clock_monotonic() / N_NS_PER_MS)<deadline){web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}
     web_free(d);check(done,"JS completed");return done;
 }
 static int direct(const char *origin,int kind,int op,const char *key,const char *value,struct web_storage_result *out){
@@ -76,7 +76,7 @@ static void corrupt(const char *origin,int slot){
 }
 int main(int argc,char **argv){
     if(argc!=2 || strcmp(argv[1],"--isolated-scratch")){puts("REFUSE: an isolated QEMU scratch disk is required; pass --isolated-scratch only there");return 2;}
-    snprintf(fixture_origin,sizeof fixture_origin,"https://storage-fixture-%d-%llu.invalid",(int)n_app_self(),(unsigned long long)uptime_ms());
+    snprintf(fixture_origin,sizeof fixture_origin,"https://storage-fixture-%d-%llu.invalid",(int)n_app_self(),(unsigned long long)(n_clock_monotonic() / N_NS_PER_MS));
     store=webstorage_create();check(store!=NULL,"backend allocation");if(!store)return 1;
     tab=webstorage_session_open(store);check(tab!=0,"tab session allocation");
     FILE *file=fopen("C:\\Tests\\js_storage_cases.js","rb");check(file!=NULL,"JS fixture present");
@@ -109,7 +109,7 @@ int main(int argc,char **argv){
         out.text && !memcmp(out.text,"\xed\xa0\x80\0\xed\xb0\x80",7),"persisted CESU8 includes NUL and lone surrogates");free(out.text);
     check(direct("null",WEB_STORAGE_SESSION,WEB_STORAGE_CHECK,NULL,NULL,&out)==WEB_STORAGE_SECURITY,"opaque native origin denied");
     check(direct("https://wrong.invalid/../../data",WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"x","y",&out)==WEB_STORAGE_SECURITY,"no origin path injection");
-    char corrupt_origin[160];snprintf(corrupt_origin,sizeof corrupt_origin,"https://corrupt-%d-%llu.invalid",(int)n_app_self(),(unsigned long long)uptime_ms());
+    char corrupt_origin[160];snprintf(corrupt_origin,sizeof corrupt_origin,"https://corrupt-%d-%llu.invalid",(int)n_app_self(),(unsigned long long)(n_clock_monotonic() / N_NS_PER_MS));
     check(direct(corrupt_origin,WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"key","one",&out)==WEB_STORAGE_OK,"snapshot generation one");
     check(webstorage_flush(store,true,&out)==WEB_STORAGE_OK,"flush generation one");
     check(direct(corrupt_origin,WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"key","two",&out)==WEB_STORAGE_OK,"snapshot generation two");

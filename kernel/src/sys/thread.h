@@ -85,6 +85,10 @@ struct thread *kthread_create_on(const char *name, void (*fn)(void *), void *arg
    memory and the address region do. */
 int thread_create(uint64_t entry, uint64_t function, uint64_t argument, uint64_t stack_bytes);
 int thread_join(int tid);
+/* SYS_THREAD_SCHEDULE: the calling app's thread tid (0: the calling thread) runs in class
+   (N_SCHEDULE_*, abi.h) from here on, with value its weight (fair) or period ns (deadline). An app's
+   fair threads weigh at most the default; its deadline threads share half a CPU (sys/thread.c). */
+int thread_schedule(int tid, uint32_t class, uint64_t value);
 /* No one will join the thread: it is freed once it has ended. */
 int thread_detach(int tid);
 /* The calling thread ends. A process's main thread ends its process with code (sys/process.c). */

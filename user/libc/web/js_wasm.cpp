@@ -14,7 +14,6 @@
 #include "wasm-rt-host.h"
 extern "C" {
 #include "js_atomics.h"
-uint64_t uptime_ms(void);
 }
 #include "libtcc.h"
 #include <cmath>
@@ -545,10 +544,10 @@ static bool compile(JSContext *ctx, State *s, const std::vector<uint8_t> &data,
   options.features = s->store.features();
   options.fail_on_custom_section_error = false;
   options.interrupt_callback = [s]() { return s->interrupted(); };
-  uint64_t started = uptime_ms();
+  uint64_t started = (n_clock_monotonic() / N_NS_PER_MS);
   bool ok = wabt::Succeeded(wi::ReadBinaryInterp("WebAssembly", data.data(), data.size(),
                                                  options, &errors, desc));
-  s->stats.compile_ms += uptime_ms() - started;
+  s->stats.compile_ms += (n_clock_monotonic() / N_NS_PER_MS) - started;
   if (ok) return true;
   if (!quiet) wasm_error(ctx, s, CompileError,
       errors.empty() ? "Invalid WebAssembly binary" : errors.front().message.c_str());
@@ -1595,11 +1594,11 @@ static JSValue module_value(JSContext *ctx, State *s, wi::ModuleDesc desc,
 // the same agent is given.
 static JSValue module_from_image(JSContext *ctx, State *s, std::shared_ptr<const ModuleImage> image,
                                  std::shared_ptr<NativeModule> native, bool compile_natively) {
-  uint64_t started = uptime_ms();
+  uint64_t started = (n_clock_monotonic() / N_NS_PER_MS);
   wi::ModuleDesc desc;
   bool decoded = desc_from_image(image, &desc);
   if (!decoded) return wasm_error(ctx, s, CompileError, "Invalid WebAssembly module image");
-  s->stats.image_ms += uptime_ms() - started;
+  s->stats.image_ms += (n_clock_monotonic() / N_NS_PER_MS) - started;
   s->stats.image_bytes += image->size;
   if (compile_natively) {
     native = compile_native(ctx, s, image->binary(), desc);
@@ -1619,13 +1618,13 @@ static JSValue compiled_module(JSContext *ctx, State *s, std::vector<uint8_t> bi
   s->stats.compiled_bytes += binary.size();
   // Without room for an image the module stays private; a clone tries again.
   std::shared_ptr<const ModuleImage> image;
-  uint64_t started = uptime_ms();
+  uint64_t started = (n_clock_monotonic() / N_NS_PER_MS);
   if (uses_shared_memory(desc) && (image = make_image(desc, binary))) {
     wi::ModuleDesc shared;
     if (desc_from_image(image, &shared)) {
       desc = std::move(shared);
       std::vector<uint8_t>().swap(binary);
-      s->stats.image_ms += uptime_ms() - started;
+      s->stats.image_ms += (n_clock_monotonic() / N_NS_PER_MS) - started;
       s->stats.image_bytes += image->size;
     } else {
       image.reset();

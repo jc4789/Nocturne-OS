@@ -44,11 +44,11 @@ int main(void) {
     }
     gfx_fill(&win->c, 0, 0, win->w, win->h, MAGENTA);
     win_update(win);
-    n_sleep_ms(300); /* let the compositor present it */
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS)); /* let the compositor present it */
     uint32_t *during = grab(&w, &h);
     long shown = count(during, w * h, MAGENTA) - base;
     win_close(win);
-    n_sleep_ms(300);
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
     uint32_t *after = grab(&w, &h);
     long left = count(after, w * h, MAGENTA) - base;
     if (shown < 200 * 150 * 9 / 10) {

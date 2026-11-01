@@ -266,7 +266,7 @@ static void go_typed(void) {
 }
 
 static void click_row(int idx) {
-    uint64_t now = n_clock_uptime_ms();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
     if (idx == last_click_idx && now - last_click < DOUBLE_MS) {
         open_entry(idx);
         last_click_idx = -1;

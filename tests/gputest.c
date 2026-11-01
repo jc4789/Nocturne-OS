@@ -148,7 +148,7 @@ static void benchmark(bool required) {
     check("benchmark-allocation",pixels!=NULL); if (!pixels) return;
     pixels[0]=0x12345678;pixels[count+1]=0x87654321;
     canvas_t c;gfx_init(&c,pixels+1,r.width,r.height,r.width);
-    bool ok=true;int backend=-1;uint64_t begin=uptime_ms();
+    bool ok=true;int backend=-1;uint64_t begin=(n_clock_monotonic() / N_NS_PER_MS);
     for (unsigned i=0;i<3;i++) {
         int actual=gfx_render3d(&c,&r);
         if (i==0) backend=actual;
@@ -156,7 +156,7 @@ static void benchmark(bool required) {
         if (actual<0 || actual!=backend || pixels[1]!=r.clear_argb || center==r.clear_argb ||
             (center>>24)!=255 || pixels[0]!=0x12345678 || pixels[count+1]!=0x87654321) ok=false;
     }
-    uint64_t elapsed=uptime_ms()-begin;
+    uint64_t elapsed=(n_clock_monotonic() / N_NS_PER_MS)-begin;
     check("benchmark-real-pixels",ok);
     check("benchmark-required-device",!required || backend==N_GPU_BACKEND_VIRGL);
     printf("gpu-bench: input_hash=%x output_hash=%x size=400x400 rounds=3 backend=%d elapsed_ms=%lu pixels=%s\n",

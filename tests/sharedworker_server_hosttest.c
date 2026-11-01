@@ -29,7 +29,7 @@ int n_channel_connect(const char*k){(void)k;return 9;}
 #ifndef WORKER_CANCEL_MODEL
 int n_channel_accept(int f){(void)f;errno=EAGAIN;return -1;}
 #endif
-uint64_t uptime_ms(void){return 100;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(100)*1000000ULL;}
 int cpu_info(struct n_cpuinfo*p){(void)p;return -1;}
 #ifndef WORKER_BODY_NATIVE
 void web_js_encoding_init_isolated(JSContext*c,JSValue h){(void)c;(void)h;}

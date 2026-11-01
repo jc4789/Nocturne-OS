@@ -34,7 +34,7 @@ int main(void){
         "</body></html>";
     web_doc *d=web_live(html,strlen(html),"https://translation.test/","utf-8",NULL);
     check(d!=NULL,"native document");if(!d)goto done;
-    for(int i=0;i<8;i++)web_tick(d,uptime_ms());web_layout(d,400,240);
+    for(int i=0;i<8;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));web_layout(d,400,240);
     node_t *panel=find(d->root,"panel"),*link=find(d->root,"link"),*fixed=find(d->root,"fixed"),*flow=find(d->root,"flow"),
         *scroller=find(d->root,"scroller"),*shift=find(d->root,"shift"),*wrapper=find(d->root,"wrapper"),*child=find(d->root,"child"),*inlinefixed=find(d->root,"inlinefixed");
     check(panel&&link&&fixed&&flow&&scroller&&shift&&wrapper&&child&&inlinefixed,"native nodes");

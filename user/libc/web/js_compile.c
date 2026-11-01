@@ -112,7 +112,7 @@ static struct js_bytecode *compile(JSContext *ctx, const struct js_compile *job)
     return code;
 }
 static void run(JSContext *ctx, struct js_compile *job) {
-    uint64_t start = n_clock_uptime_ms();
+    uint64_t start = (n_clock_monotonic() / N_NS_PER_MS);
     uint8_t key[32];
     if (job->origin) {
         key_of(job, key);
@@ -124,7 +124,7 @@ static void run(JSContext *ctx, struct js_compile *job) {
         mtx_lock(&lock); keep(job->code); mtx_unlock(&lock);
     }
     job->stats.bytes = job->code ? job->code->size : 0;
-    job->stats.compile_ms = n_clock_uptime_ms() - start;
+    job->stats.compile_ms = (n_clock_monotonic() / N_NS_PER_MS) - start;
 }
 static void compiler_main(void *unused) {
     (void)unused;
@@ -205,7 +205,7 @@ static void end(struct js_compile *job) {
     mtx_lock(&lock); job->dropped = true; job_release(job); mtx_unlock(&lock);
 }
 JSValue js_compile_take(JSContext *ctx, struct js_compile *job, struct js_compile_stats *stats) {
-    while (!js_compile_done(job)) wait_on_address(&job->done, 0, UINT32_MAX);
+    while (!js_compile_done(job)) wait_on_address(&job->done, 0, N_CLOCK_NEVER);
     JSValue fn = JS_UNINITIALIZED;
     if (job->code) {
         fn = JS_ReadObject(ctx, job->code->bytes, job->code->size, JS_READ_OBJ_BYTECODE);
@@ -216,7 +216,7 @@ JSValue js_compile_take(JSContext *ctx, struct js_compile *job, struct js_compil
     return fn;
 }
 uint8_t *js_compile_take_bytes(struct js_compile *job, size_t *size) {
-    while (!js_compile_done(job)) wait_on_address(&job->done, 0, UINT32_MAX);
+    while (!js_compile_done(job)) wait_on_address(&job->done, 0, N_CLOCK_NEVER);
     /* A platform job has no origin, so its bytecode was never kept: the job
        holds it alone and hands the bytes over without a copy. */
     uint8_t *bytes = NULL;

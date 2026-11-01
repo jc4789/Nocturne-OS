@@ -224,16 +224,15 @@ static NV_STATUS poll_file(struct file *f, int64_t timeout_ms, uint32_t *events)
     if (!f->f_op->poll)
         return NV_ERR_NOT_SUPPORTED;
     uint64_t wait = timeout_ms < 0 || timeout_ms > POLL_SLICE_MS ? POLL_SLICE_MS : (uint64_t)timeout_ms;
-    uint64_t deadline = n_clock_uptime_ms() + wait;
+    uint64_t deadline = n_clock_after(wait * N_NS_PER_MS);
     for (;;) {
         poll_table pt = { 0 };
         unsigned mask = f->f_op->poll(f, &pt);
-        uint64_t now = n_clock_uptime_ms();
-        if (mask || !pt.queue || now >= deadline) {
+        if (mask || !pt.queue || n_clock_monotonic() >= deadline) {
             *events = mask;
             return NV_OK;
         }
-        uvm_os_wait_queue_sleep(pt.queue, pt.sequence, (unsigned)(deadline - now));
+        uvm_os_wait_queue_sleep(pt.queue, pt.sequence, deadline);
     }
 }
 

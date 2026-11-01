@@ -14,7 +14,7 @@ int errno;
 static unsigned checks, failed;
 #define CHECK(c) do { checks++; if (!(c)) { failed++; printf("FAIL redirect-manual:%d %s\n", __LINE__, #c); } } while (0)
 /* The kernel and the jar are not reached by the steps under test; the stubs fail if they are. */
-uint64_t n_clock_uptime_ms(void) { return 10; }
+uint64_t n_clock_monotonic(void){return (uint64_t)(10)*1000000ULL;}
 n_result n_channel_send(n_handle h, const void *data, size_t n, n_handle attach) { (void)h; (void)data; (void)n; (void)attach; return -N_ERR_INVALID; }
 n_result n_events_wait(n_handle q, struct n_event *out, size_t max, int64_t timeout_ms) { (void)q; (void)out; (void)max; (void)timeout_ms; return -N_ERR_INVALID; }
 n_result n_handle_close(n_handle h) { (void)h; return 0; }

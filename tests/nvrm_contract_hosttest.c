@@ -73,7 +73,7 @@ n_result n_document_append(const char *path, const void *data, size_t size) {
     CHECK(false);
     return -N_ERR_DENIED;
 }
-uint64_t n_clock_uptime_ms(void) { return 0; }
+uint64_t n_clock_monotonic(void){return (uint64_t)(0)*1000000ULL;}
 nv_state_t *NV_API_CALL nv_get_ctl_state(void) { return &nvrm_dev.nv; }
 
 NV_STATUS NV_API_CALL rm_ioctl(nvidia_stack_t *s, nv_state_t *nv, nv_file_private_t *f,

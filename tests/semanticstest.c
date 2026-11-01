@@ -216,14 +216,14 @@ static void marquee_motion_and_hit(void) {
     struct web_host host={0};
     web_doc *d=web_live(html,strlen(html),"http://semantics.test/","utf-8",&host);
     check("marquee live document",d!=NULL);if(!d)return;
-    for(int i=0;i<8;i++)web_tick(d,uptime_ms());
+    for(int i=0;i<8;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     web_layout(d,400,240);
     node_t *moving=id(d,"moving"),*target=id(d,"target");
     check("marquee native child geometry",moving&&moving->box&&target&&target->box);
     if(!moving||!moving->box||!target||!target->box){web_free(d);return;}
     box_t *root=d->root_box,*child_box=target->box;
     float layout_x=box_abs_x(child_box),layout_y=box_abs_y(child_box);
-    uint64_t now=uptime_ms();
+    uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);
     web_marquee_tick(d,now);
     float before=box_visual_x(child_box),y=box_visual_y(child_box);
     check("marquee registered for native tick",d->marquees.n==1&&moving->marquee_initialized);

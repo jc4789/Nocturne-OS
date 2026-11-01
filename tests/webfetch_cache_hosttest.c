@@ -24,7 +24,7 @@ static bool fail_setup;
 static bool order_transport,order_deny,order_cancel;
 static unsigned order_options,order_gets;
 #define CHECK(c) do{checks++;if(!(c)){failed++;printf("FAIL cache:%d %s\n",__LINE__,#c);}}while(0)
-uint64_t uptime_ms(void){return clock_ms;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(clock_ms)*1000000ULL;}
 time_t cache_test_time(time_t *out){time_t now=784111777;if(out)*out=now;return now;}
 n_result wait_on_address(volatile uint32_t *p,uint32_t expected,unsigned timeout){(void)p;(void)expected;(void)timeout;return 0;}
 n_result wake_address(volatile uint32_t *p,unsigned count){(void)p;(void)count;return 0;}

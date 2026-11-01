@@ -16,9 +16,9 @@ uint64_t stub_clock;
 void stub_reset(const uint8_t *in, size_t len, size_t chunk, bool h2) {
     stub_in = in; stub_len = len; stub_at = 0; stub_chunk = chunk ? chunk : 1; stub_h2 = h2;
 }
-uint64_t uptime_ms(void) { return stub_clock += 1; }
+uint64_t n_clock_monotonic(void){return (uint64_t)(stub_clock += 1)*1000000ULL;}
 void yield(void) {}
-void n_sleep_ms(uint64_t ms) { stub_clock += ms; }
+void n_sleep_until(uint64_t deadline) { if (deadline / 1000000ULL > stub_clock) stub_clock = deadline / 1000000ULL; }
 
 net_stream *ns_open_http_cancelled_timed(const char *h, uint16_t p, bool t, int to, char *e, size_t el,
     struct http_transport_timing *tm, const char *part, int (*c)(void *), void *x) { return &the_stream; }

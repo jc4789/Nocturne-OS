@@ -274,7 +274,7 @@ FILE *tmpfile(void) {
     static unsigned serial;
     char leaf[40], name[4096];
     for (int tries = 0; tries < 100; tries++) {
-        uint64_t mix = n_clock_uptime_ms() * 0x9e3779b97f4a7c15ull + (uint64_t)(uintptr_t)&mix + ++serial;
+        uint64_t mix = (n_clock_monotonic() / N_NS_PER_MS) * 0x9e3779b97f4a7c15ull + (uint64_t)(uintptr_t)&mix + ++serial;
         snprintf(leaf, sizeof leaf, "temporary-%llx", (unsigned long long)(mix ^ (mix >> 29)));
         n_result joined = n_path_join(n_temp_folder(), leaf, name, sizeof name);
         if (joined < 0) {

@@ -207,7 +207,7 @@ void on_each_cpu(void (*fn)(void *info), void *info, int wait)
         uint32_t running_now = __atomic_load_n(&top_halves, __ATOMIC_SEQ_CST);
         if (!running_now)
             break;
-        wait_on_address(&top_halves, running_now, UINT32_MAX);
+        wait_on_address(&top_halves, running_now, N_CLOCK_NEVER);
     }
     fn(info);
 }

@@ -56,7 +56,7 @@ static bool map_request(void *opaque, const struct web_request *r) {
     struct fixture *f = opaque;
     if (!strcmp(r->url, "http://fixture.test/dir/order-one.js"))
         for (int i=0;i<SLOTS;i++) if (f->queue[i].used && f->queue[i].id==r->id)
-            f->queue[i].due=uptime_ms()+1000;
+            f->queue[i].due=(n_clock_monotonic() / N_NS_PER_MS)+1000;
     return true;
 }
 static bool map_open(const char *html, bool expected_errors) {

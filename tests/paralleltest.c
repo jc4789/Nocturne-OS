@@ -23,7 +23,7 @@ static void work(size_t i, void *context) {
 static void leaf(size_t i, void *context) { ((unsigned *)context)[i]++; }
 static void nested(size_t i, void *context) { parallel_for(2, leaf, (unsigned *)context + i * 2); }
 static void profiled_skew(size_t i, void *context) {
-    if (!i) n_sleep_ms(20); /* uneven duration, not a performance benchmark */
+    if (!i) n_sleep_until(n_clock_after(20 * N_NS_PER_MS)); /* uneven duration, not a performance benchmark */
     work(i,context);
     parallel_record_work(PARALLEL_GENERIC,i+1);
 }
@@ -169,7 +169,7 @@ static void cancellation(void) {
     check(d!=NULL,"cancellation live document");
     if(d) {
         /* Let the product parser finish before forcing a fresh cascade. */
-        web_tick(d,uptime_ms());
+        web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
         d->need_style=true;d->style_full_dirty=true;d->layout_valid=false;
         web_layout(d,800,600);
         printf("paralleltest: native-stop caller_checks=%u cancelled=%d wrong_thread=%u\n",

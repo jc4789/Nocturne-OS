@@ -7,7 +7,7 @@
 
 static bool wait_frame(window_t *win, unsigned submitted) {
     struct gui_event event;
-    while (win_event(win,&event,-1)>0) {
+    while (win_event(win,&event,N_CLOCK_NEVER)>0) {
         if (event.type==EV_CLOSE) return false;
         if (event.type==EV_FRAME)
             return event.key==submitted && event.x==(int)(submitted^1);
@@ -27,7 +27,7 @@ int main(int argc,char **argv) {
     uint32_t *screen=malloc((size_t)gw*gh*sizeof *screen);
     int result=1;
     if (!screen) goto done;
-    uint64_t start=uptime_ms();
+    uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);
     for (unsigned long frame=0;frame<frames;frame++) {
         if (win_begin_frame(win)<0) goto done;
         unsigned submitted=win->buffer_index;
@@ -56,7 +56,7 @@ int main(int argc,char **argv) {
         if (win_fullscreen(win,!restored)<0) goto done;
         struct gui_event event;
         do {
-            if (win_event(win,&event,-1)<=0 || event.type==EV_CLOSE) goto done;
+            if (win_event(win,&event,N_CLOCK_NEVER)<=0 || event.type==EV_CLOSE) goto done;
         } while (event.type!=EV_RESIZE);
         if (win_begin_frame(win)<0) goto done;
         unsigned submitted=win->buffer_index;
@@ -78,9 +78,9 @@ int main(int argc,char **argv) {
     n_handle_close((n_handle)fd);
     if (resized<0) goto done;
     printf("wmframetest: PASS second-only-map resize destroy\n");
-    printf("wmframetest: PASS frames=%lu elapsed_ms=%lu indexed-copy-free=1 releases=checked other-buffer=isolated screen-grab=correct\n",frames,(unsigned long)(uptime_ms()-start));
+    printf("wmframetest: PASS frames=%lu elapsed_ms=%lu indexed-copy-free=1 releases=checked other-buffer=isolated screen-grab=correct\n",frames,(unsigned long)((n_clock_monotonic() / N_NS_PER_MS)-start));
     printf("wmframetest: READY visual hold_ms=%lu\n",hold);
-    n_sleep_ms(hold);
+    n_sleep_until(n_clock_after((uint64_t)(hold) * N_NS_PER_MS));
     result=0;
 done:
     free(screen);win_close(win);

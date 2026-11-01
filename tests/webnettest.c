@@ -37,17 +37,17 @@ static void completed(webnet *n, uint64_t id, uint64_t generation,
     r->body[response->body_len] = 0; r->length = response->body_len;
 }
 static void pump_for(unsigned ms) {
-    uint64_t until = uptime_ms() + ms;
-    do { webnet_pump(net, uptime_ms()); n_sleep_ms(5); } while (uptime_ms() < until);
+    uint64_t until = (n_clock_monotonic() / N_NS_PER_MS) + ms;
+    do { webnet_pump(net, (n_clock_monotonic() / N_NS_PER_MS)); n_sleep_until(n_clock_after(5 * N_NS_PER_MS)); } while ((n_clock_monotonic() / N_NS_PER_MS) < until);
 }
 static bool wait_result(struct result *r, unsigned ms) {
-    uint64_t until = uptime_ms() + ms;
-    while (!r->calls && uptime_ms() < until) { webnet_pump(net, uptime_ms()); n_sleep_ms(5); }
+    uint64_t until = (n_clock_monotonic() / N_NS_PER_MS) + ms;
+    while (!r->calls && (n_clock_monotonic() / N_NS_PER_MS) < until) { webnet_pump(net, (n_clock_monotonic() / N_NS_PER_MS)); n_sleep_until(n_clock_after(5 * N_NS_PER_MS)); }
     return r->calls == 1;
 }
 static bool wait_idle(unsigned ms) {
-    uint64_t until = uptime_ms() + ms;
-    while (webnet_busy(net) && uptime_ms() < until) { webnet_pump(net, uptime_ms()); n_sleep_ms(5); }
+    uint64_t until = (n_clock_monotonic() / N_NS_PER_MS) + ms;
+    while (webnet_busy(net) && (n_clock_monotonic() / N_NS_PER_MS) < until) { webnet_pump(net, (n_clock_monotonic() / N_NS_PER_MS)); n_sleep_until(n_clock_after(5 * N_NS_PER_MS)); }
     return !webnet_busy(net);
 }
 static int children(void) {
@@ -293,7 +293,7 @@ static void fetch_contract_tests(void) {
     if(bad_get)webnet_cancel(net,bad_get);
     if(bad_head)webnet_cancel(net,bad_head);
 
-    unsigned long probe=(unsigned long)uptime_ms();char allowed[256],denied[256];
+    unsigned long probe=(unsigned long)(n_clock_monotonic() / N_NS_PER_MS);char allowed[256],denied[256];
     snprintf(allowed,sizeof allowed,"/api/cors?batch=put-allowed-%lu",probe);
     id=request(&r,1,allowed,WEBNET_FETCH,"PUT","Content-Type: text/plain\r\n","method upload",13,92);done=id&&wait_result(&r,40000);
     check(done&&success(&r)&&strstr(r.body,"\"method\": \"PUT\"")&&strstr(r.body,"\"body\": \"method upload\"")&&
@@ -367,7 +367,7 @@ static uint64_t cache_request(struct result *r, int port, const char *path,
 }
 static void top_partition_tests(void){
     static const char *const tops[]={"http://top-a.cache.test/document","http://top-b.cache.test/document","http://top-a.cache.test/document"};
-    unsigned long probe=(unsigned long)uptime_ms();char url[512],field[64];static struct result r;
+    unsigned long probe=(unsigned long)(n_clock_monotonic() / N_NS_PER_MS);char url[512],field[64];static struct result r;
     struct webnet_request q={.kind=WEBNET_FETCH,.generation=118,.url=url,.origin=document,
         .method="GET",.credentials=WEBNET_CREDENTIALS_OMIT};
     uint64_t id;bool done;
@@ -420,7 +420,7 @@ static void top_partition_tests(void){
 }
 static void cache_preflight_tests(void){
     static struct result r;char path[512],observation[512],key[128];
-    unsigned long probe=(unsigned long)uptime_ms();
+    unsigned long probe=(unsigned long)(n_clock_monotonic() / N_NS_PER_MS);
     for(unsigned denied=0;denied<2;denied++){
         snprintf(key,sizeof key,"cache-preflight-%lu-%u",probe,denied);
         snprintf(path,sizeof path,"/api/http-cache?key=%s&policy=fresh&preflight=%s",key,denied?"deny":"allow");
@@ -451,7 +451,7 @@ static void cache_tests(void) {
           WEBNET_WIRE_CACHE_MODE(WEBNET_WIRE_USER_NAVIGATION)==WEBNET_CACHE_DEFAULT,
           "cache policy preserves 64-byte framing and legacy zero/one flags");
     struct result r={0};char path[512],label[160],field[96];
-    unsigned long probe=(unsigned long)uptime_ms();
+    unsigned long probe=(unsigned long)(n_clock_monotonic() / N_NS_PER_MS);
     static const char *const names[]={"default","no-store","reload","no-cache","force-cache"};
     for(unsigned port=0;port<2;port++)for(unsigned mode=0;mode<5;mode++) {
         snprintf(path,sizeof path,"/api/cache?probe=%lu&port=%u&mode=%u",probe,port,mode);
@@ -652,16 +652,16 @@ static void concurrency_tests(void) {
     static struct result burst[8];
     bool submitted=true;
     for(int i=0;i<8;i++)submitted&=request(&burst[i],i%2,"/api/slow?ms=1200",WEBNET_FETCH,"GET",NULL,NULL,0,19)!=0;
-    webnet_pump(net,uptime_ms());
+    webnet_pump(net,(n_clock_monotonic() / N_NS_PER_MS));
     int started=(int)transports();
     struct n_sysinfo memory={0};sysinfo(&memory);
     uint64_t affordable=memory.free_mem/(64u*1024u*1024u);
     int expected=affordable>1?(int)MIN(7u,affordable-1):1;
     /* Admission itself now yields on the GUI time budget. Observe the burst
        before any 1200ms reply can finish, without demanding one long pump. */
-    uint64_t admitted_until=uptime_ms()+500;
-    while(started<expected&&uptime_ms()<admitted_until){
-        webnet_pump(net,uptime_ms());started=MAX(started,(int)transports());
+    uint64_t admitted_until=(n_clock_monotonic() / N_NS_PER_MS)+500;
+    while(started<expected&&(n_clock_monotonic() / N_NS_PER_MS)<admitted_until){
+        webnet_pump(net,(n_clock_monotonic() / N_NS_PER_MS));started=MAX(started,(int)transports());
         if(started<expected)net_wait(10);
     }
     check(submitted&&started>=expected,
@@ -673,15 +673,15 @@ static void concurrency_tests(void) {
     static struct result r[3]; /* large bounded response storage is not stack scratch */
     uint64_t ids[3];
     for (int i = 0; i < 3; i++) ids[i] = request(&r[i], 0, "/api/slow?ms=800", WEBNET_FETCH, "GET", NULL, NULL, 0, 20);
-    webnet_pump(net, uptime_ms());
-    admitted_until=uptime_ms()+300;
-    while(transports()<3&&uptime_ms()<admitted_until){webnet_pump(net,uptime_ms());net_wait(10);}
+    webnet_pump(net, (n_clock_monotonic() / N_NS_PER_MS));
+    admitted_until=(n_clock_monotonic() / N_NS_PER_MS)+300;
+    while(transports()<3&&(n_clock_monotonic() / N_NS_PER_MS)<admitted_until){webnet_pump(net,(n_clock_monotonic() / N_NS_PER_MS));net_wait(10);}
     check(ids[0] && ids[1] && ids[2] && transports() == 3 && children()==1, "three Fetch channels share one service and leave document dependency admission reserved");
-    bool good = true; uint64_t until = uptime_ms() + 6000;
-    while (webnet_busy(net) && uptime_ms() < until) {
-        webnet_pump(net, uptime_ms());
+    bool good = true; uint64_t until = (n_clock_monotonic() / N_NS_PER_MS) + 6000;
+    while (webnet_busy(net) && (n_clock_monotonic() / N_NS_PER_MS) < until) {
+        webnet_pump(net, (n_clock_monotonic() / N_NS_PER_MS));
         if (transports() > 4 || children()!=1) good = false;
-        n_sleep_ms(5);
+        n_sleep_until(n_clock_after(5 * N_NS_PER_MS));
     }
     for (int i = 0; i < 3; i++) good = good && success(&r[i]);
     check(good && !webnet_busy(net) && transports() == 0 && children()==1, "queued requests complete and release all request transports in the pooled service");
@@ -881,10 +881,10 @@ static void limit_tests(void) {
     check(intact, "response beyond the removed 16 MiB quota is delivered completely");
     if (!done) webnet_cancel_generation(net, 59);
     release(&r);
-    uint64_t started = uptime_ms();
+    uint64_t started = (n_clock_monotonic() / N_NS_PER_MS);
     id = request(&r, 0, "/api/slow?ms=35000", WEBNET_FETCH, "GET", NULL, NULL, 0, 60);
     done = id && wait_result(&r, 45000);
-    uint64_t elapsed = uptime_ms() - started;
+    uint64_t elapsed = (n_clock_monotonic() / N_NS_PER_MS) - started;
     check(done && success(&r) && elapsed >= 34500 && elapsed < 44000 && WEBNET_TIMEOUT_MS==UINT32_MAX,
           "a legitimate 35-second response survives the removed 30-second deadline");
     check(!webnet_busy(net) && transports() == 0 && children()==1, "long response completion leaves no request transport and retains one pooled service");
@@ -1047,7 +1047,7 @@ static void cors_boundary_regression_tests(void) {
     if(!done)webnet_cancel_generation(net,97);
     release(&r);
     check(webnet_cookie_set(net,document,"returnprobe=original; Path=/")==1,"create redirect-return cookie control");
-    char probe[128],final_path[512],middle_path[1200];unsigned long token=(unsigned long)uptime_ms();
+    char probe[128],final_path[512],middle_path[1200];unsigned long token=(unsigned long)(n_clock_monotonic() / N_NS_PER_MS);
     snprintf(probe,sizeof probe,"return-same-%lu",token);
     id=returning_request(&r,probe,WEBNET_CREDENTIALS_SAME_ORIGIN,false,final_path,sizeof final_path,middle_path,sizeof middle_path);
     done=id&&wait_result(&r,40000);
@@ -1102,7 +1102,7 @@ static void cancel_from_callback(webnet *n,uint64_t id,uint64_t generation,const
     (void)id;(void)opaque;callback_cancel_calls++;
     char original[512];strlcpy(original,response->final_url,sizeof original);
     webnet_cancel_generation(n,generation);
-    webnet_pump(n,uptime_ms()); /* reentry must not free the borrowed response */
+    webnet_pump(n,(n_clock_monotonic() / N_NS_PER_MS)); /* reentry must not free the borrowed response */
     callback_cancel_borrow=!strcmp(original,response->final_url)&&response->headers!=NULL;
 }
 static void callback_cancel_test(void){
@@ -1142,18 +1142,18 @@ static void paused_stream_transport_test(void){
     struct webnet_request q={.kind=WEBNET_FETCH,.generation=112,.url=url,.origin=document,
         .method="GET",.credentials=WEBNET_CREDENTIALS_OMIT,.stream_response=true};
     bool submitted=true;for(unsigned i=0;i<5;i++){ids[i]=webnet_submit(net,&q,paused_stream_received,&results[i]);submitted&=ids[i]!=0;}
-    uint64_t until=uptime_ms()+5000;unsigned headers=0;
-    do{webnet_pump(net,uptime_ms());headers=0;for(unsigned i=0;i<5;i++)headers+=results[i].headers;
-        if(headers==5&&!transports())break;n_sleep_ms(5);
-    }while(uptime_ms()<until);
+    uint64_t until=(n_clock_monotonic() / N_NS_PER_MS)+5000;unsigned headers=0;
+    do{webnet_pump(net,(n_clock_monotonic() / N_NS_PER_MS));headers=0;for(unsigned i=0;i<5;i++)headers+=results[i].headers;
+        if(headers==5&&!transports())break;n_sleep_until(n_clock_after(5 * N_NS_PER_MS));
+    }while((n_clock_monotonic() / N_NS_PER_MS)<until);
     check(submitted&&headers==5&&transports()==0&&children()==1,"native small paused response writers retire while their unread bounded channels remain owned");
     bool unread=webnet_busy(net);for(unsigned i=0;i<5;i++)unread&=!results[i].chunks&&!results[i].ends&&!results[i].failed;
     check(unread,"native transport retirement does not publish unread chunks or a fabricated END");
-    ids[5]=webnet_submit(net,&q,paused_stream_received,&results[5]);until=uptime_ms()+5000;
-    while(!results[5].headers&&uptime_ms()<until){webnet_pump(net,uptime_ms());n_sleep_ms(5);}
+    ids[5]=webnet_submit(net,&q,paused_stream_received,&results[5]);until=(n_clock_monotonic() / N_NS_PER_MS)+5000;
+    while(!results[5].headers&&(n_clock_monotonic() / N_NS_PER_MS)<until){webnet_pump(net,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(5 * N_NS_PER_MS));}
     check(ids[5]&&results[5].headers==1&&!results[5].failed,"sixth same-origin Fetch progresses while five response bodies remain paused");
-    until=uptime_ms()+5000;
-    while(webnet_busy(net)&&uptime_ms()<until){for(unsigned i=0;i<6;i++)if(ids[i])webnet_resume(net,ids[i]);webnet_pump(net,uptime_ms());n_sleep_ms(5);}
+    until=(n_clock_monotonic() / N_NS_PER_MS)+5000;
+    while(webnet_busy(net)&&(n_clock_monotonic() / N_NS_PER_MS)<until){for(unsigned i=0;i<6;i++)if(ids[i])webnet_resume(net,ids[i]);webnet_pump(net,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(5 * N_NS_PER_MS));}
     bool drained=!webnet_busy(net)&&transports()==0&&children()==1;
     for(unsigned i=0;i<6;i++)drained&=results[i].headers==1&&results[i].chunks>0&&results[i].ends==1&&!results[i].failed;
     check(drained,"native resume preserves ordered headers/chunks/END and reaps all transport owners");
@@ -1201,8 +1201,8 @@ static void setup_cancel_service_test(void){
        Distinct ports avoid the per-origin request admission limit. */
     int service_pid=setup_service_pid();unsigned submitted=0,entered=0,callbacks=0;
     bool admitted=service_pid>0,reclaimed=true,quiet=true;
-    uint64_t settled=uptime_ms()+150;
-    while(setup_service_threads(service_pid,false)>0&&uptime_ms()<settled)n_sleep_ms(2);
+    uint64_t settled=(n_clock_monotonic() / N_NS_PER_MS)+150;
+    while(setup_service_threads(service_pid,false)>0&&(n_clock_monotonic() / N_NS_PER_MS)<settled)n_sleep_until(n_clock_after(2 * N_NS_PER_MS));
     admitted&=setup_service_threads(service_pid,false)==0;
     for(unsigned batch=0;batch<8;batch++){
         uint64_t ids[6]={0};int previous=setup_service_threads(service_pid,true);
@@ -1212,20 +1212,20 @@ static void setup_cancel_service_test(void){
                 .method="GET",.credentials=WEBNET_CREDENTIALS_OMIT};
             ids[i]=webnet_submit(net,&q,setup_unexpected_response,&callbacks);submitted+=ids[i]!=0;
         }
-        uint64_t until=uptime_ms()+500;
-        while(transports()<6&&uptime_ms()<until){webnet_pump(net,uptime_ms());n_sleep_ms(2);}
+        uint64_t until=(n_clock_monotonic() / N_NS_PER_MS)+500;
+        while(transports()<6&&(n_clock_monotonic() / N_NS_PER_MS)<until){webnet_pump(net,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(2 * N_NS_PER_MS));}
         /* Keep the requests live after sending their prefixes, so cancellation
            exercises the worker's setup syscall, rather than an unread queue. */
         pump_for(60);
-        int active=setup_service_threads(service_pid,true);until=uptime_ms()+500;
-        while(active<previous+6&&uptime_ms()<until){webnet_pump(net,uptime_ms());n_sleep_ms(2);active=setup_service_threads(service_pid,true);}
+        int active=setup_service_threads(service_pid,true);until=(n_clock_monotonic() / N_NS_PER_MS)+500;
+        while(active<previous+6&&(n_clock_monotonic() / N_NS_PER_MS)<until){webnet_pump(net,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(2 * N_NS_PER_MS));active=setup_service_threads(service_pid,true);}
         if(previous>=0&&active>=previous+6&&transports()==6)entered+=6;else admitted=false;
         quiet&=callbacks==0;
         for(unsigned i=0;i<6;i++)if(ids[i])webnet_cancel(net,ids[i]);
-        until=uptime_ms()+150;
-        do{webnet_pump(net,uptime_ms());active=setup_service_threads(service_pid,false);
-            if(!webnet_busy(net)&&active==0)break;n_sleep_ms(2);
-        }while(uptime_ms()<until);
+        until=(n_clock_monotonic() / N_NS_PER_MS)+150;
+        do{webnet_pump(net,(n_clock_monotonic() / N_NS_PER_MS));active=setup_service_threads(service_pid,false);
+            if(!webnet_busy(net)&&active==0)break;n_sleep_until(n_clock_after(2 * N_NS_PER_MS));
+        }while((n_clock_monotonic() / N_NS_PER_MS)<until);
         reclaimed&=!webnet_busy(net)&&transports()==0&&active==0;
     }
     check(submitted==48&&entered==48&&admitted&&quiet,
@@ -1233,9 +1233,9 @@ static void setup_cancel_service_test(void){
     check(reclaimed&&callbacks==0,
           "cancelled native setups promptly retire service threads and never publish a response callback");
     static struct result healthy;
-    uint64_t begin=uptime_ms();
+    uint64_t begin=(n_clock_monotonic() / N_NS_PER_MS);
     uint64_t id=request(&healthy,0,"/api/json",WEBNET_RESOURCE,"GET",NULL,NULL,0,117);
-    bool done=id&&wait_result(&healthy,2000);uint64_t elapsed=uptime_ms()-begin;
+    bool done=id&&wait_result(&healthy,2000);uint64_t elapsed=(n_clock_monotonic() / N_NS_PER_MS)-begin;
     check(done&&success(&healthy)&&elapsed<2000&&children()==1&&setup_service_pid()==service_pid,
           "normal fixture fetch succeeds promptly in the same service after more than thirty-two cancelled setups");
     printf("network-setup-cancel: submitted=%u entered=%u callbacks=%u live-threads=%d local-ms=%lu service-pid=%d\n",
@@ -1247,8 +1247,8 @@ static void pacing_tests(void){
     struct webnet_request q={.kind=WEBNET_FETCH,.generation=114,.url=url,.origin=document,
         .method="GET",.credentials=WEBNET_CREDENTIALS_OMIT,.stream_response=true};
     struct paced_stream stream={0};uint64_t id=webnet_submit(net,&q,paced_received,&stream);
-    uint64_t until=uptime_ms()+5000;
-    while(id&&!stream.headers&&uptime_ms()<until){webnet_pump(net,uptime_ms());net_wait(20);}
+    uint64_t until=(n_clock_monotonic() / N_NS_PER_MS)+5000;
+    while(id&&!stream.headers&&(n_clock_monotonic() / N_NS_PER_MS)<until){webnet_pump(net,(n_clock_monotonic() / N_NS_PER_MS));net_wait(20);}
     check(id&&stream.headers==1&&!stream.chunks&&!stream.ends&&!stream.failed,
           "real streaming response pauses after headers without publishing body bytes");
     /* Let the worker fill its bounded ahead window. A different request must
@@ -1260,9 +1260,9 @@ static void pacing_tests(void){
           "a paused large stream cannot block another shared worker thread's complete response");
     release(&dependency);
     stream.automatic=true;webnet_resume(net,id);unsigned maximum=0,pumps=0;
-    uint64_t begin=uptime_ms();until=begin+12000;
-    while(webnet_busy(net)&&uptime_ms()<until){
-        unsigned before=stream.chunks;webnet_pump(net,uptime_ms());pumps++;
+    uint64_t begin=(n_clock_monotonic() / N_NS_PER_MS);until=begin+12000;
+    while(webnet_busy(net)&&(n_clock_monotonic() / N_NS_PER_MS)<until){
+        unsigned before=stream.chunks;webnet_pump(net,(n_clock_monotonic() / N_NS_PER_MS));pumps++;
         maximum=MAX(maximum,stream.chunks-before);
         if(webnet_busy(net))net_wait(100);
     }
@@ -1273,7 +1273,7 @@ static void pacing_tests(void){
     check(stream.chunks*4096u<stream.bytes&&pumps*4096u<stream.bytes,
           "native pumps drain ready 4KiB stream frames as gathered chunks without per-frame sleep");
     printf("network-pacing: bytes=%lu chunks=%u pumps=%u max-chunks-per-pump=%u drain-ms=%lu\n",
-        (unsigned long)stream.bytes,stream.chunks,pumps,maximum,(unsigned long)(uptime_ms()-begin));
+        (unsigned long)stream.bytes,stream.chunks,pumps,maximum,(unsigned long)((n_clock_monotonic() / N_NS_PER_MS)-begin));
     webnet_cancel_generation(net,114);webnet_cancel_generation(net,115);
     check(!webnet_busy(net)&&transports()==0&&children()==1,"stream drain retires all channels while retaining one reusable service");
     setup_cancel_service_test();
@@ -1283,10 +1283,10 @@ static int udp_wait_handle;
 static n_result udp_wait_result;
 static void udp_wait_closed(void *unused) {
     (void)unused;char byte;udp_wait_started=true;
-    udp_wait_result=udp_recvfrom(udp_wait_handle,&byte,1,3000,NULL);
+    udp_wait_result=udp_recvfrom(udp_wait_handle,&byte,1,n_clock_after(3000 * N_NS_PER_MS),NULL);
 }
 static int udp_capacity_test(void) {
-    if(!net_wait_up(20000)){puts("FAIL UDP network did not come up");return 1;}
+    if(!net_wait_up(n_clock_after(20000 * N_NS_PER_MS))){puts("FAIL UDP network did not come up");return 1;}
     int sockets[64];for(size_t i=0;i<64;i++)sockets[i]=-1;
     unsigned opened=0;
     for(size_t i=0;i<64;i++){sockets[i]=udp_socket(0);if(sockets[i]<0)break;opened++;}
@@ -1305,8 +1305,8 @@ static int udp_capacity_test(void) {
     int tid=udp_wait_handle>=0?thread_create(udp_wait_closed,NULL):-1;
     check(tid>=0,"native UDP blocked receive thread starts");
     if(tid>=0) {
-        while(!udp_wait_started)n_sleep_ms(1);
-        n_sleep_ms(30);udp_close(udp_wait_handle);
+        while(!udp_wait_started)n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
+        n_sleep_until(n_clock_after(30 * N_NS_PER_MS));udp_close(udp_wait_handle);
         int replacement=udp_socket(0);
         check(replacement==udp_wait_handle,"closed slot can be reused while its old receive is sleeping");
         thread_join(tid);
@@ -1320,7 +1320,7 @@ static int tcp_wait_handle;
 static n_result tcp_wait_result;
 static void tcp_wait_closed(void *unused) {
     (void)unused;char byte;tcp_wait_started=true;
-    tcp_wait_result=tcp_recv(tcp_wait_handle,&byte,1,3000);
+    tcp_wait_result=tcp_recv(tcp_wait_handle,&byte,1,n_clock_after(3000 * N_NS_PER_MS));
     tcp_wait_finished=true;
 }
 static int tcp_capacity_test(void) {
@@ -1329,7 +1329,7 @@ static int tcp_capacity_test(void) {
         unsigned opened=0;
         for(size_t i=0;i<24;i++)sockets[i]=-1;
         for(size_t i=0;i<24;i++) {
-            sockets[i]=tcp_connect(0x0a000202,(uint16_t)ports[0],5000);
+            sockets[i]=tcp_connect(0x0a000202,(uint16_t)ports[0],n_clock_after(5000 * N_NS_PER_MS));
             if(sockets[i]<0)break;
             opened++;
         }
@@ -1338,16 +1338,16 @@ static int tcp_capacity_test(void) {
     }
     /* A socket-local wait queue must wake its blocked sibling on close,
        without publishing bytes from a fresh connection into the old receive. */
-    tcp_wait_handle=tcp_connect(0x0a000202,(uint16_t)ports[0],5000);
+    tcp_wait_handle=tcp_connect(0x0a000202,(uint16_t)ports[0],n_clock_after(5000 * N_NS_PER_MS));
     tcp_wait_started=tcp_wait_finished=false;
     int tid=tcp_wait_handle>=0?thread_create(tcp_wait_closed,NULL):-1;
     check(tid>=0,"native TCP socket-local blocked receive starts");
     if(tid>=0) {
-        while(!tcp_wait_started)n_sleep_ms(1);
-        n_sleep_ms(30);
+        while(!tcp_wait_started)n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
+        n_sleep_until(n_clock_after(30 * N_NS_PER_MS));
         check(!tcp_wait_finished,"idle TCP receive remains pending before close");
         check(tcp_close(tcp_wait_handle)==0,"close wakes the socket-local receive queue");
-        int replacement=tcp_connect(0x0a000202,(uint16_t)ports[0],5000);
+        int replacement=tcp_connect(0x0a000202,(uint16_t)ports[0],n_clock_after(5000 * N_NS_PER_MS));
         check(replacement>=0,"fresh TCP connection progresses while old receive resumes");
         thread_join(tid);
         check(tcp_wait_finished&&tcp_wait_result==-N_ERR_NO_HANDLE,
@@ -1364,7 +1364,7 @@ int main(int argc, char **argv) {
     bool pacing=argc==2&&!strcmp(argv[1],"--network-pacing");
     if (argc > 1 && !tls&&!boundaries&&!tcp_capacity&&!pacing) { puts("usage: webnettest [--tls|--performance-boundaries|--udp-capacity|--tcp-capacity|--network-pacing]"); return 1; }
     if (tls) {
-        if (!net_wait_up(20000)) { puts("FAIL webnet network did not come up"); return 1; }
+        if (!net_wait_up(n_clock_after(20000 * N_NS_PER_MS))) { puts("FAIL webnet network did not come up"); return 1; }
         net = webnet_create();
         if (!net) { puts("FAIL webnet allocation"); return 1; }
         tls_tests(); webnet_free(net);
@@ -1380,7 +1380,7 @@ int main(int argc, char **argv) {
         puts("FAIL webnet fixture ports missing"); return 1;
     }
     fclose(f);
-    if (!net_wait_up(20000)) { puts("FAIL webnet network did not come up"); return 1; }
+    if (!net_wait_up(n_clock_after(20000 * N_NS_PER_MS))) { puts("FAIL webnet network did not come up"); return 1; }
     if(tcp_capacity)return tcp_capacity_test();
     snprintf(document, sizeof document, "http://10.0.2.2:%d/index.html", ports[0]);
     net = webnet_create();

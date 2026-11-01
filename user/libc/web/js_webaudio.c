@@ -328,7 +328,7 @@ static JSValue js_status(JSContext *ctx, JSValueConst this_val, int argc, JSValu
     if (n < 6) return JS_ThrowRangeError(ctx, "Web Audio status needs six values");
     struct wa_context_status st;
     wa_context_status(a->c, &st);
-    uint64_t now = uptime_us();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_US);
     out[0] = st.state;
     out[1] = (double)st.frame;
     out[2] = (double)st.output_latency;
@@ -909,13 +909,13 @@ static void job_decoded(struct decode_job *j) {
 
 /* One slice of the job's work on the page's thread. */
 static void job_step(struct decode_job *j) {
-    uint64_t until = uptime_ms() + DECODE_SLICE_MS;
+    uint64_t until = (n_clock_monotonic() / N_NS_PER_MS) + DECODE_SLICE_MS;
     if (j->stage == RESAMPLING) {
         if (j->threaded) {
             if (__atomic_load_n(&j->work->owner, __ATOMIC_ACQUIRE) != 1) return;
         } else {
             while (resample_chunk(j->work))
-                if (uptime_ms() >= until) return;
+                if ((n_clock_monotonic() / N_NS_PER_MS) >= until) return;
         }
         struct wa_buffer *b = j->work->out;
         j->work->out = NULL;
@@ -931,7 +931,7 @@ static void job_step(struct decode_job *j) {
         if (r == NMEDIA_ERROR) { job_finish(j, "EncodingError", NULL); return; }
         if (r == NMEDIA_END) { job_decoded(j); return; }
         /* NMEDIA_AGAIN and video frames give the buffer nothing */
-    } while (uptime_ms() < until);
+    } while ((n_clock_monotonic() / N_NS_PER_MS) < until);
 }
 
 /* A job whose next step can run now. */

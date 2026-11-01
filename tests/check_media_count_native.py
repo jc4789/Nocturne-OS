@@ -29,7 +29,7 @@ static bool service_running,service_clock_set,reenter;
 static unsigned native_depth,pumps,publishes,clock_queries,pcm_reads;
 static uint64_t service_at,fake_clock,pump_work=3,patch_work=1;
 static uint32_t pcm_queued;
-static uint64_t uptime_ms(void){clock_queries++;return fake_clock;}
+static uint64_t n_clock_monotonic(void){clock_queries++;return fake_clock*1000000ULL;}
 static int mock_read(int fd,void *p,size_t n){(void)fd;pcm_reads++;*(uint32_t *)p=pcm_queued;return (int)n;}
 #define read mock_read
 static bool nmedia_mse_worker_needs_service(void *p){return p!=NULL;}

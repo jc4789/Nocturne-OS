@@ -196,7 +196,7 @@ static JSValue h_is_terminal(JSContext *c, JSValueConst this, int argc, JSValueC
 }
 
 static JSValue h_now(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    return JS_NewFloat64(ctx, (double)n_clock_uptime_ms());
+    return JS_NewFloat64(ctx, (double)(n_clock_monotonic() / N_NS_PER_MS));
 }
 
 static JSValue h_exit(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
@@ -524,7 +524,7 @@ static JSValue h_run(JSContext *c, JSValueConst this, int argc, JSValueConst *ar
     free_strings(list, n);
     if (app < 0) return throw_result("run", full, app);
     int status = 0;
-    n_result r = n_app_result(app, -1, &status);
+    n_result r = n_app_result(app, N_CLOCK_NEVER, &status);
     n_handle_close(app);
     return r < 0 ? throw_result("run", full, r) : JS_NewInt32(ctx, status);
 }
@@ -1009,7 +1009,7 @@ static JSValue h_system_info(JSContext *c, JSValueConst this, int argc, JSValueC
     JS_SetPropertyStr(ctx, o, "system", JS_NewString(ctx, si.os));
     JS_SetPropertyStr(ctx, o, "totalMemory", JS_NewFloat64(ctx, (double)si.total_mem));
     JS_SetPropertyStr(ctx, o, "freeMemory", JS_NewFloat64(ctx, (double)si.free_mem));
-    JS_SetPropertyStr(ctx, o, "uptimeMs", JS_NewFloat64(ctx, (double)si.uptime_ms));
+    JS_SetPropertyStr(ctx, o, "uptimeMs", JS_NewFloat64(ctx, (double)si.uptime_ns / N_NS_PER_MS));
     JS_SetPropertyStr(ctx, o, "tasks", JS_NewInt32(ctx, si.ntasks));
     JS_SetPropertyStr(ctx, o, "screenWidth", JS_NewInt32(ctx, (int32_t)si.fb_w));
     JS_SetPropertyStr(ctx, o, "screenHeight", JS_NewInt32(ctx, (int32_t)si.fb_h));
@@ -1079,7 +1079,7 @@ static void wait_ui(int ms) {
     if (t < 0 || (ms >= 0 && ms < t)) t = ms;
     if (t != 0 || screen_watch >= 0) {
         struct n_event ev[16];
-        n_result n = n_events_wait(ui_session_queue(ui), ev, 16, t);
+        n_result n = n_events_wait(ui_session_queue(ui), ev, 16, t < 0 ? N_CLOCK_NEVER : n_clock_after((uint64_t)t * N_NS_PER_MS));
         for (n_result i = 0; i < n; i++) {
             if (ev[i].token == SCREEN_TOKEN) screen_signal = true;
             else if (ev[i].token == SOUND_TOKEN) sound_signal = true;
@@ -1103,7 +1103,7 @@ static void run_loop(JSValueConst until) {
         if (ui) { ui_session_pump(ui); ui_deliver(); }
         deliver_system();
         for (;;) {
-            JSValue now = JS_NewFloat64(ctx, (double)n_clock_uptime_ms());
+            JSValue now = JS_NewFloat64(ctx, (double)(n_clock_monotonic() / N_NS_PER_MS));
             JSValue fired = internal_call("fireTimer", 1, (JSValue[]){now});
             bool any = JS_ToBool(ctx, fired);
             if (JS_IsException(fired)) report_exception();
@@ -1119,7 +1119,7 @@ static void run_loop(JSValueConst until) {
         JS_FreeValue(ctx, next);
         if (JS_IsJobPending(rt)) continue;
         if (at < 0 && fetch_pending <= 0 && !ui_open()) return;
-        uint64_t ms = 1000, t = n_clock_uptime_ms();
+        uint64_t ms = 1000, t = (n_clock_monotonic() / N_NS_PER_MS);
         if (at >= 0) ms = at <= (double)t ? 0 : (uint64_t)(at - (double)t + 0.999);
         if (ms > 1000) ms = 1000;
         if (!ms) continue;
@@ -1127,8 +1127,8 @@ static void run_loop(JSValueConst until) {
         /* window events and a change the system reports end the wait; a watch alone does not keep
            the program running (the return above), but while timers or fetches do, it is heard */
         if (ui_open() || screen_watch >= 0) wait_ui(fetch_pending > 0 && ms > 10 ? 10 : (int)ms);
-        else if (fetch_pending > 0) wait_on_address(&fetch_signal, seen, (unsigned)ms);
-        else n_sleep_ms(ms);
+        else if (fetch_pending > 0) wait_on_address(&fetch_signal, seen, n_clock_after(ms * N_NS_PER_MS));
+        else n_sleep_until(n_clock_after(ms * N_NS_PER_MS));
     }
 }
 

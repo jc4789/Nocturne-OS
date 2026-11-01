@@ -162,7 +162,7 @@ static void transition(struct web_avmedia *s,const char *reason,uint32_t target)
     unsigned flags=(s->playing?1u:0u)|(s->ended?2u:0u)|(s->starved?4u:0u)|(s->error[0]?8u:0u)|((unsigned)s->ready<<4)|(s->mse_active?256u:0u)|(s->url_input?512u:0u);
     if(s->transition_reason==reason&&s->transition_generation==s->generation&&s->transition_target==target&&s->transition_flags==flags)return;
     s->transition_reason=reason;s->transition_generation=s->generation;s->transition_target=target;s->transition_flags=flags;
-    char message[320];uint64_t now=uptime_ms();
+    char message[320];uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);
     snprintf(message,sizeof message,"Native media transition: reason %s, generation %u->%u, input %s, playing %u/ready %d/starved %u/ended %u/error %u, clock %lld ms, presented %llu/decoded %llu/drop %llu, pending %d/ahead %d; wall %llu ms",
         reason,s->generation,target,s->mse_active?"MSE":s->url_input?"Range":"buffer",s->playing,s->ready,s->starved,s->ended,s->error[0]!=0,(long long)current(s,now),
         (unsigned long long)s->presented_frames,(unsigned long long)s->video_frames,(unsigned long long)s->dropped_video_frames,s->pending.kind,s->ahead.kind,(unsigned long long)now);
@@ -236,7 +236,7 @@ static struct web_avmedia *find(web_doc *d, node_t *n, bool create) {
    own, thousands of times a second, which the device advances 48 frames per
    millisecond for. A PCM write or flush changes the queue and samples anew. */
 static n_result sink_status(struct web_avmedia *s,struct n_audio_status *out){
-    uint64_t now=uptime_ms();
+    uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);
     if(!s->sink_sampled||s->sink_sampled_at!=now){
         s->sink_sample_result=n_audio_status(s->sink,&s->sink_sample);
         s->sink_sampled_at=now;s->sink_sampled=true;
@@ -436,7 +436,7 @@ static void picture_committed(struct web_avmedia *s,const struct nmedia_output *
         s->performance_configuration.bitrate=o->video_configuration.bitrate;
         s->performance_slot=slot;s->performance_revision=revision;
         s->performance_frames=o->video_measured_frames;s->performance_work_ms=o->video_work_ms;
-        s->performance_at=uptime_ms();
+        s->performance_at=(n_clock_monotonic() / N_NS_PER_MS);
     }else s->performance_frames=s->performance_work_ms=s->performance_measurement_id=0;
     bool size_changed=s->width!=o->width||s->height!=o->height;
     s->width=o->width;s->height=o->height;
@@ -576,9 +576,9 @@ static JSValue state(JSContext *ctx, struct web_avmedia *s) {
     JSValue o=JS_NewObject(ctx);
     uint64_t decoded,dropped;video_counts(s,&decoded,&dropped);
     const struct nmedia_info *info=s?information(s):NULL;
-    own_field(ctx,o,"readyState",JS_NewInt32(ctx,ready_state(s,uptime_ms())));
+    own_field(ctx,o,"readyState",JS_NewInt32(ctx,ready_state(s,(n_clock_monotonic() / N_NS_PER_MS))));
     own_field(ctx,o,"duration",JS_NewFloat64(ctx,s&&s->mse_active?s->mse_duration:info&&info->duration_ms>=0?info->duration_ms/1000.0:NAN));
-    own_field(ctx,o,"currentTime",JS_NewFloat64(ctx,s?current(s,uptime_ms())/1000.0:0));
+    own_field(ctx,o,"currentTime",JS_NewFloat64(ctx,s?current(s,(n_clock_monotonic() / N_NS_PER_MS))/1000.0:0));
     own_field(ctx,o,"paused",JS_NewBool(ctx,!s||!s->playing));
     own_field(ctx,o,"ended",JS_NewBool(ctx,s&&s->ended));
     own_field(ctx,o,"videoWidth",JS_NewInt32(ctx,info?info->width:0));
@@ -599,14 +599,14 @@ static JSValue state(JSContext *ctx, struct web_avmedia *s) {
 }
 static int mse_next(struct web_avmedia *s,struct nmedia_output *out,uint64_t until,bool cooperative){
     int r=nmedia_mse_worker_step(s->mse_worker,out);
-    if(cooperative){if(r==NMSW_BUSY){nmedia_mse_worker_service(s->mse_worker,uptime_ms(),until);r=nmedia_mse_worker_step(s->mse_worker,out);}goto completed;}
+    if(cooperative){if(r==NMSW_BUSY){nmedia_mse_worker_service(s->mse_worker,(n_clock_monotonic() / N_NS_PER_MS),until);r=nmedia_mse_worker_step(s->mse_worker,out);}goto completed;}
     /* STEP is local buffered decode, not author JS or network. Sending and
      * collecting several packets within one finite native burst avoids a
      * complete JS/CSS/paint pass between every 20 ms PCM packet. */
-    for(unsigned handoff=0;r==NMSW_BUSY&&handoff<8&&uptime_ms()<until;handoff++){
-        nmedia_mse_worker_pump_budget(s->mse_worker,uptime_ms(),until);
+    for(unsigned handoff=0;r==NMSW_BUSY&&handoff<8&&(n_clock_monotonic() / N_NS_PER_MS)<until;handoff++){
+        nmedia_mse_worker_pump_budget(s->mse_worker,(n_clock_monotonic() / N_NS_PER_MS),until);
         r=nmedia_mse_worker_step(s->mse_worker,out);
-        if(r!=NMSW_BUSY||uptime_ms()>=until)break;
+        if(r!=NMSW_BUSY||(n_clock_monotonic() / N_NS_PER_MS)>=until)break;
         yield(); /* Time is rechecked before the next pump, including slow yields. */
     }
     /* A scheduler handoff can consume the remaining 2 ms while the peer
@@ -654,11 +654,11 @@ static int range_next(struct web_avmedia *s,struct nmedia_output *out,struct nme
     nmedia_worker_step(s->worker);
     /* Decode/network runs in the existing child. Only finite nonblocking
      * dispatch/reap and scheduler handoffs run here; no new burst allowance. */
-    if(b->nonblocking){nmedia_worker_pump_budget(s->worker,uptime_ms(),b,false);return nmedia_worker_take(s->worker,out);}
-    while(nmedia_worker_pending(s->worker)&&uptime_ms()<b->until){
-        nmedia_worker_pump_budget(s->worker,uptime_ms(),b,false);
+    if(b->nonblocking){nmedia_worker_pump_budget(s->worker,(n_clock_monotonic() / N_NS_PER_MS),b,false);return nmedia_worker_take(s->worker,out);}
+    while(nmedia_worker_pending(s->worker)&&(n_clock_monotonic() / N_NS_PER_MS)<b->until){
+        nmedia_worker_pump_budget(s->worker,(n_clock_monotonic() / N_NS_PER_MS),b,false);
         r=nmedia_worker_take(s->worker,out);
-        if(r!=NMEDIA_AGAIN||!nmedia_worker_pending(s->worker)||b->handoffs>=16||uptime_ms()>=b->until)break;
+        if(r!=NMEDIA_AGAIN||!nmedia_worker_pending(s->worker)||b->handoffs>=16||(n_clock_monotonic() / N_NS_PER_MS)>=b->until)break;
         b->handoffs++;yield();
     }
     if(r==NMEDIA_AGAIN){nmedia_worker_collect(s->worker,b);r=nmedia_worker_take(s->worker,out);}
@@ -812,7 +812,7 @@ static JSValue avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *o
             audio_known=nmedia_performance_audio(audio_type,&audio_codec,&audio_profile);JS_FreeCString(ctx,audio_type);
             if(JS_ToFloat64(ctx,&channels,argv[6])<0||JS_ToFloat64(ctx,&samplerate,argv[7])<0){JS_FreeCString(ctx,type);return JS_EXCEPTION;}
         }
-        uint64_t now=uptime_ms();bool smooth=false;
+        uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);bool smooth=false;
         if(d&&(audio_requested||video_requested)&&(!video_requested||(known&&isfinite(rate)&&rate>0&&isfinite(width)&&isfinite(height)&&width>0&&height>0))){
             for(struct web_avmedia *sample=streams;sample;sample=sample->next){
                 if(sample->doc!=d)continue;
@@ -853,7 +853,7 @@ static JSValue avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *o
     }
     struct web_avmedia *s=find(d,n,strcmp(op,"state")!=0);
     if(!s)return !strcmp(op,"state")?state(ctx,NULL):JS_ThrowRangeError(ctx,"native media state allocation failed");
-    uint64_t now=uptime_ms();
+    uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);
     if(!strcmp(op,"state"))return state(ctx,s);
     if(!strcmp(op,"emeKeys")){
         if(!argc)return JS_ThrowTypeError(ctx,"native ClearKey snapshot required");
@@ -990,7 +990,7 @@ static void mse_metadata_ready(struct web_avmedia *s){
     if(initialized)s->ready=1;
 }
 static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool cooperative){
-    if(uptime_ms()>=mse_until)return;
+    if((n_clock_monotonic() / N_NS_PER_MS)>=mse_until)return;
     if(s->audio_clock_failed){audio_failed(s,now);return;}
     /* An input-starved MSE child with no command/lane/output is asleep until
        APPEND/KEYS/seek/control revives demand. Re-reading its three pipes and
@@ -1113,7 +1113,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
          * decode while the browser performs its next JS/paint phase. */
         if(budget&&s->mse_active&&!s->pending.kind){if(cooperative)nmedia_mse_worker_prefetch_service(s->mse_worker,mse_until);else nmedia_mse_worker_prefetch(s->mse_worker,mse_until);}
         if(budget&&s->worker&&!s->pending.kind)nmedia_worker_prefetch(s->worker,&range_budget);
-        if((s->mse_active||s->worker)&&budget&&uptime_ms()>=mse_until)return;
+        if((s->mse_active||s->worker)&&budget&&(n_clock_monotonic() / N_NS_PER_MS)>=mse_until)return;
         if(!s->pending.kind&&s->rate_decoder){int r=nmedia_rate_pull(s->rate_decoder,&s->pending);s->rate_owned=r==NMEDIA_AUDIO;s->audio_at=0;if(r==NMEDIA_ERROR){strlcpy(s->error,"native PCM tempo output failed",sizeof s->error);s->playing=false;close_audio(s);return;}if(r!=NMEDIA_AUDIO)s->pending.kind=0;}
         if(!s->pending.kind){int r=s->mse_active?mse_next(s,&s->pending,mse_until,cooperative):s->worker?range_next(s,&s->pending,&range_budget):nmedia_step(s->decoder,&s->pending);s->audio_at=0;s->rate_owned=false;
             if(r==NMEDIA_VIDEO)s->video_frames++;
@@ -1150,7 +1150,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
         }else if(s->pending.kind==NMEDIA_AUDIO){
             if(!s->rate_owned){const struct nmedia_audio_observation *a=&s->pending.audio_observation;
                 if(a->id&&a->frames&&a->work_ms){
-                    if(s->performance_audio.id!=a->id||s->performance_audio.frames!=a->frames)s->performance_audio_at=uptime_ms();
+                    if(s->performance_audio.id!=a->id||s->performance_audio.frames!=a->frames)s->performance_audio_at=(n_clock_monotonic() / N_NS_PER_MS);
                     s->performance_audio=*a;s->performance_audio_generation=s->generation;
                     s->performance_audio_slot=s->mse_pending_slot;s->performance_audio_revision=s->mse_pending_revision;
                 }else memset(&s->performance_audio,0,sizeof s->performance_audio);
@@ -1211,11 +1211,11 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
     if(s->worker&&!s->pending.kind)nmedia_worker_prefetch(s->worker,&range_budget);
 }
 static void pump(struct web_avmedia *s,uint64_t now,uint64_t until,bool cooperative){
-    uint64_t start=debug_transitions?uptime_ms():0;
+    uint64_t start=debug_transitions?(n_clock_monotonic() / N_NS_PER_MS):0;
     if(debug_transitions){s->profile_pumps++;s->profile_services+=cooperative;if(s->profile_pump_at&&start>=s->profile_pump_at)s->profile_pump_gap=MAX(s->profile_pump_gap,start-s->profile_pump_at);s->profile_pump_at=start;}
     bool playing=s->playing,preparing=s->mse_preparing;pump_impl(s,now,until,cooperative);
     if(s->audio_clock_failed)audio_failed(s,now);
-    if(debug_transitions)s->profile_pump_ms+=uptime_ms()-start;
+    if(debug_transitions)s->profile_pump_ms+=(n_clock_monotonic() / N_NS_PER_MS)-start;
     if(playing&&!s->playing)clear_ahead(s);
     if((playing&&!s->playing)||(preparing&&!s->mse_preparing&&s->error[0]))s->transition_pending=s->error[0]?"native-error-stop":s->ended?"native-eos-stop":"native-stop";
     /* Interrupt service never calls logging/JS/embedder callbacks. Preserve
@@ -1305,11 +1305,11 @@ void web_avmedia_tick(web_doc *d,uint64_t now){
     struct web_avmedia *prepared=NULL;
     /* Explicit play/seek gets the child ahead of passive metadata preloads. */
     for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d&&s->range_resume&&s->range_waiting&&!s->worker&&
-        (s->node->owner==d||(s->node->owner&&s->node->owner->dom_family==d))){pump(s,now,uptime_ms()+2,false);prepared=s;break;}
+        (s->node->owner==d||(s->node->owner&&s->node->owner->dom_family==d))){pump(s,now,(n_clock_monotonic() / N_NS_PER_MS)+2,false);prepared=s;break;}
     for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d){
         if(s==prepared)continue;
         if(s->node->owner!=d&&(!s->node->owner||s->node->owner->dom_family!=d)){transition(s,"owner-detach",s->generation);unload(s);}
-        else {pump(s,now,uptime_ms()+2,false);snapshot_publish(s);timing_profile(s,now);}
+        else {pump(s,now,(n_clock_monotonic() / N_NS_PER_MS)+2,false);snapshot_publish(s);timing_profile(s,now);}
     }
     web_avmedia_leave();
 }
@@ -1318,7 +1318,7 @@ void web_avmedia_service(uint64_t now){
     /* Most safepoints arrive within the same millisecond. Reject those before
        even querying a stream FD or scanning its pending metadata. */
     if(service_clock_set&&now>=service_at&&now-service_at<1)return;
-    uint64_t start=uptime_ms();
+    uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);
     /* A pending native lane/low PCM supply needs frequent bounded collection.
        A fixed 10ms throttle multiplied every STEP/metadata/video component
        round trip and could starve the ring despite readily decoded input. */
@@ -1339,7 +1339,7 @@ void web_avmedia_service(uint64_t now){
      * layer may then publish an independent patch without DOM/JS/layout. */
     uint64_t until=start+2;
     struct web_avmedia *first=service_cursor&&service_cursor->next?service_cursor->next:streams,*s=first;
-    while(s&&uptime_ms()<until){
+    while(s&&(n_clock_monotonic() / N_NS_PER_MS)<until){
         service_cursor=s;
         if((s->playing||s->mse_preparing)&&s->doc&&s->doc->live&&s->node&&
            (s->node->owner==s->doc||(s->node->owner&&s->node->owner->dom_family==s->doc))&&
@@ -1354,7 +1354,7 @@ void web_avmedia_service(uint64_t now){
        committed video patch may itself consume the interval; dating it from
        start then lets every following native-layout safepoint pump again and
        starves the caller despite each individual pump having a budget. */
-    service_at=uptime_ms();
+    service_at=(n_clock_monotonic() / N_NS_PER_MS);
     service_running=false;
 }
 void web_avmedia_checkpoint(void){
@@ -1365,7 +1365,7 @@ void web_avmedia_checkpoint(void){
        interval; a racing count only moves which safepoint reads it. */
     static unsigned skipped;
     if((++skipped&15u)!=0)return;
-    web_avmedia_service(uptime_ms());
+    web_avmedia_service((n_clock_monotonic() / N_NS_PER_MS));
 }
 void web_avmedia_snapshot_begin(web_doc *d,const canvas_t *c,int x,int y,int w,int h) {
     web_avmedia_enter();snapshot_document=d;snapshot_canvas=c;snapshot_candidate=NULL;

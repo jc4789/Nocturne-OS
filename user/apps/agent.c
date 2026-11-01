@@ -456,20 +456,20 @@ static void tool_run(struct json *args, struct jbuf *out) {
         return;
     }
     struct outcap *c = calloc(1, sizeof *c);
-    uint64_t deadline = n_clock_uptime_ms() + (uint64_t)timeout * 1000;
+    uint64_t deadline = n_clock_after((uint64_t)timeout * N_NS_PER_S);
     bool timed_out = false;
     uint8_t *message = NULL;
     size_t message_cap = 0;
     for (;;) {
-        int64_t left = (int64_t)(deadline - n_clock_uptime_ms());
-        if (left <= 0) {
+        uint64_t now = n_clock_monotonic();
+        if (now >= deadline) {
             timed_out = true;
             break;
         }
         n_result size = n_channel_receive(output[0], NULL, 0, N_CHANNEL_PEEK, NULL);
         if (size == -N_ERR_NOT_READY) {
             struct n_event event;
-            if (n_events_wait(queue, &event, 1, MIN(left, 500)) < 0) break;
+            if (n_events_wait(queue, &event, 1, MIN(deadline, now + 500 * N_NS_PER_MS)) < 0) break;
             continue;
         }
         if (size < 0) break; /* every writer has gone: the command finished */
@@ -488,7 +488,7 @@ static void tool_run(struct json *args, struct jbuf *out) {
     n_handle_close(output[0]);
     n_handle_close(queue);
     int status = 0;
-    n_app_result(app, -1, &status);
+    n_app_result(app, N_CLOCK_NEVER, &status);
     n_handle_close(app);
     struct jbuf body;
     jb_init(&body);
@@ -647,7 +647,7 @@ static char *pending_image;
 
 static void tool_screenshot(struct json *args, struct jbuf *out) {
     int delay = (int)json_getnum(args, "delay", 0);
-    if (delay > 0) n_sleep_ms((uint64_t)MIN(delay, 30) * 1000);
+    if (delay > 0) n_sleep_until(n_clock_after((uint64_t)((uint64_t)MIN(delay, 30) * 1000) * N_NS_PER_MS));
     int w, h;
     uint32_t *px = NULL;
     if (screen_grab(NULL, 0, &w, &h) == 0) px = malloc((size_t)w * (size_t)h * 4);
@@ -1015,7 +1015,7 @@ static int model_step(const char *system) {
         if (attempt) {
             int wait = attempt * attempt * 3;
             say(C_DIM "retrying in %d s..." C_RESET "\n", wait);
-            n_sleep_ms((uint64_t)wait * 1000);
+            n_sleep_until(n_clock_after((uint64_t)((uint64_t)wait * 1000) * N_NS_PER_MS));
         }
         if (st) stream_free(st);
         free(st);
@@ -1070,7 +1070,7 @@ static int model_step(const char *system) {
     for (int i = 0; i < st->ncalls; i++) {
         struct call *c = &st->calls[i];
         if (!c->name[0]) continue;
-        if (!c->id[0]) snprintf(c->id, sizeof c->id, "call_%d_%lu", i, (unsigned long)n_clock_uptime_ms());
+        if (!c->id[0]) snprintf(c->id, sizeof c->id, "call_%d_%lu", i, (unsigned long)(n_clock_monotonic() / N_NS_PER_MS));
         jb_puts(&m, ncalls ? "," : ",\"tool_calls\":[");
         jb_puts(&m, "{\"id\":");
         jb_str(&m, c->id);
@@ -1262,7 +1262,7 @@ int main(int argc, char **argv) {
         ask_key();
         if (!cf.key[0]) return 1;
     }
-    if (!net_wait_up(10000)) say(C_ERR "warning: the network is not up (no DHCP lease yet)" C_RESET "\n");
+    if (!net_wait_up(n_clock_after(10000 * N_NS_PER_MS))) say(C_ERR "warning: the network is not up (no DHCP lease yet)" C_RESET "\n");
 
     if (resume) {
         if (load_session()) say(C_DIM "resumed %d messages from %s" C_RESET "\n", nmsgs, session_path);

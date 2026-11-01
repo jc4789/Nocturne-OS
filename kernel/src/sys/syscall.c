@@ -237,9 +237,9 @@ static int64_t sys_proclist(struct n_procinfo *out, int max) {
         info->state = t->sched.state;
         info->is_user = p != NULL;
         strlcpy(info->name, t->name, sizeof info->name);
-        info->cpu_ms = sched_thread_cpu_ns(t) / NS_PER_MS;
+        info->cpu_ns = sched_thread_cpu_ns(t);
         info->mem_kb = main ? process_pages(main) * 4 : 0;
-        info->start_ms = t->start_ns / NS_PER_MS;
+        info->start_ns = t->start_ns;
         info->wait_phys = __atomic_load_n(&t->wait.item.key, __ATOMIC_RELAXED);
     }
     spin_unlock(&thread_lock, flags);
@@ -257,7 +257,7 @@ static int64_t sys_sysinfo(struct n_sysinfo *usi) {
        the frames set aside for the APs' first touches are no one's yet. */
     si->free_mem = (pmm_free_pages() + programs_idle()) * PAGE_SIZE;
     si->heap_used = heap_used_bytes();
-    si->uptime_ms = clock_now_ns() / NS_PER_MS;
+    si->uptime_ns = clock_now_ns();
     si->ntasks = thread_count();
     si->fb_w = fb.width;
     si->fb_h = fb.height;
@@ -794,8 +794,7 @@ static int64_t sys_pci_screen_image(int h,int surface,const struct n_scanout *ud
 }
 /* What the screen should show, for a driver whose scanout shows windows directly (dev/pciuser.c,
    gui/wm.c). The state is copied out even when the time ran out. */
-static int64_t sys_pci_screen_state(int h,uint64_t seen,struct n_screen_state *uout,int64_t timeout_ms) {
-    uint64_t deadline=syscall_deadline(timeout_ms);
+static int64_t sys_pci_screen_state(int h,uint64_t seen,struct n_screen_state *uout,uint64_t deadline) {
     if(!user_ok_w(uout,sizeof *uout))return -N_ERR_BAD_ADDRESS;
     struct handle *pci=handle_get(h);
     if(!pci)return -N_ERR_NO_HANDLE;
@@ -1338,13 +1337,12 @@ static int64_t sys_pager_create(size_t bytes,int32_t *umemory) {
     if(result<0)handle_remove(number);
     return result;
 }
-static int64_t sys_pager_take(int h,struct n_pager_fault *uout,size_t max,int64_t timeout_ms) {
+static int64_t sys_pager_take(int h,struct n_pager_fault *uout,size_t max,uint64_t deadline) {
     struct handle *f;int64_t r=0;
     struct pager *g=pager_get(h,&f,&r);
     if(!g)return r;
     if(!max){handle_close(f);return -N_ERR_INVALID;}
     struct n_pager_fault out[32];uint64_t ids[32];size_t k=0;
-    uint64_t deadline=syscall_deadline(timeout_ms);
     uint64_t lock=spin_lock(&shared_lock);
     for(;;){
         for(struct pager_fault *q=g->faults;q && k<MIN(max,ARRAY_SIZE(out));q=q->next){
@@ -2649,13 +2647,14 @@ out:
     return ret;
 }
 
-static int64_t sys_app_result(int h, int64_t timeout_ms, int *ustatus) {
+static int64_t sys_app_result(int h, uint64_t deadline, int *ustatus) {
     int64_t r;
     struct handle *app = handle_get_as(h, proc_app_is, &r);
     if (!app) return r;
     int status = 0;
-    r = proc_app_result(app, syscall_deadline(timeout_ms), &status);
-    if (r == -N_ERR_TIMEOUT && !timeout_ms) r = -N_ERR_NOT_READY; /* a look that does not wait */
+    uint64_t asked = clock_now_ns();
+    r = proc_app_result(app, deadline, &status);
+    if (r == -N_ERR_TIMEOUT && deadline <= asked) r = -N_ERR_NOT_READY; /* a look that does not wait */
     handle_close(app);
     if (!r && ustatus) r = copy_to_user(ustatus, &status, sizeof status);
     return r;
@@ -2797,15 +2796,12 @@ static int64_t sys_events_watch_address(int q, uint64_t address, uint32_t expect
     return r;
 }
 
-/* The ABI's timer is ms from now (repeating: every ms after); the queue's, a moment and a period
-   in ns. */
-static int64_t sys_events_timer(int q, uint64_t ms, int repeat, uint64_t token) {
-    uint64_t ns = ms < CLOCK_NEVER / NS_PER_MS ? ms * NS_PER_MS : CLOCK_NEVER;
-    if (repeat && !ns) return -N_ERR_INVALID;
+/* A timer due at a moment on the monotonic clock, then every period ns on that grid (0: once). */
+static int64_t sys_events_timer(int q, uint64_t due, uint64_t period, uint64_t token) {
     int64_t r;
     struct handle *queue = handle_get_as(q, events_is, &r);
     if (!queue) return r;
-    r = events_timer(queue, clock_after(ns), repeat ? ns : 0, token);
+    r = events_timer(queue, due, period, token);
     handle_close(queue);
     return r;
 }
@@ -2819,11 +2815,11 @@ static int64_t sys_events_unwatch(int q, uint64_t token) {
     return r;
 }
 
-static int64_t sys_events_wait(int q, struct n_event *uout, size_t max, int64_t timeout_ms) {
+static int64_t sys_events_wait(int q, struct n_event *uout, size_t max, uint64_t deadline) {
     int64_t r;
     struct handle *queue = handle_get_as(q, events_is, &r);
     if (!queue) return r;
-    r = events_wait(queue, uout, max, syscall_deadline(timeout_ms));
+    r = events_wait(queue, uout, max, deadline);
     handle_close(queue);
     return r;
 }
@@ -2838,9 +2834,7 @@ void syscall_dispatch(struct regs *r) {
     switch (r->rax) {
     case SYS_EXIT: process_exit((int)a);
     case SYS_AUDIO_FLUSH: ret = sys_audio_flush((int)a); break;
-    case SYS_SLEEP: sleep_until(syscall_deadline((int64_t)a)); ret = 0; break;
-    case SYS_UPTIME: ret = (int64_t)(clock_now_ns() / NS_PER_MS); break;
-    case SYS_TIME: ret = clock_wall_seconds(); break;
+    case SYS_SLEEP: sleep_until(a); ret = 0; break;
     case SYS_SHARED_CREATE: ret = sys_shared_create(a,false); break;
     case SYS_SHARED_RESERVE: ret = sys_shared_create(a,true); break;
     case SYS_SHARED_MAP: ret = sys_shared_map((int)a,b,(int)c); break;
@@ -2856,7 +2850,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_PCI_BAR: ret = sys_pci_bar((int)a,(uint32_t)b); break;
     case SYS_PCI_GIVE_SCREEN: ret = sys_pci_give_screen((int)a,(int)b,(const struct n_scanout *)c); break;
     case SYS_PCI_ACPI_EVAL: ret = sys_pci_acpi_eval((int)a,(const struct n_acpi_eval *)b,(void *)c,d); break;
-    case SYS_PCI_SCREEN_STATE: ret = sys_pci_screen_state((int)a,b,(struct n_screen_state *)c,(int64_t)d); break;
+    case SYS_PCI_SCREEN_STATE: ret = sys_pci_screen_state((int)a,b,(struct n_screen_state *)c,d); break;
     case SYS_PCI_SCREEN_IMAGE: ret = sys_pci_screen_image((int)a,(int)b,(const struct n_scanout *)c); break;
     case SYS_PCI_SCREEN_MODES: ret = sys_pci_screen_modes((int)a,(const struct n_screen_modes *)b); break;
     case SYS_DMA_CREATE: ret = sys_dma_create((int)a,b,(uint32_t)c); break;
@@ -2875,9 +2869,9 @@ void syscall_dispatch(struct regs *r) {
         else if (r->rax == SYS_PCI_INTERRUPTS) ret = pci_user_interrupts(f,(uint32_t)b);
         else if (r->rax == SYS_PCI_HOLD_SCREEN) ret = pci_user_hold_screen(f, b != 0);
         else if (r->rax == SYS_PCI_SCREEN_VBLANK) ret = pci_user_screen_vblank(f, b, c);
-        else if (r->rax == SYS_PCI_ACPI_NOTIFY_TAKE) ret = pci_user_acpi_notify_take(f, syscall_deadline((int64_t)b));
+        else if (r->rax == SYS_PCI_ACPI_NOTIFY_TAKE) ret = pci_user_acpi_notify_take(f, b);
         else if (r->rax == SYS_PCI_SCREEN_IMAGE_END) ret = pci_user_screen_image_end(f, (int64_t)b);
-        else ret = pci_user_interrupt_take(f,syscall_deadline((int64_t)b));
+        else ret = pci_user_interrupt_take(f,b);
         handle_close(f);
         break;
     }
@@ -2895,18 +2889,6 @@ void syscall_dispatch(struct regs *r) {
         ret = copy_to_user((void *)a, &info, sizeof info);
         break;
     }
-    case SYS_CLOCK_INFO: {
-        /* A whole millisecond of the clock and what this CPU's TSC (the clock's counter) read at
-           it: the program carries the clock on from there by itself. */
-        struct n_clockinfo info = {.version = 1};
-        info.uptime_ms = clock_now_ns() / NS_PER_MS;
-        if (clock_tsc_at(info.uptime_ms * NS_PER_MS, &info.tsc_sample)) {
-            info.flags = N_CLOCK_USER_TSC;
-            info.tsc_hz = clock_tsc_hz();
-        }
-        ret = copy_to_user((void *)a, &info, sizeof info);
-        break;
-    }
     case SYS_THREAD_CREATE:
         if (!user_ok((void *)a, 1) || !user_ok((void *)c, 1) ||
             (vmm_get_pte(self->process->vmm_space, a) & PTE_NX) ||
@@ -2917,6 +2899,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_THREAD_DETACH: ret = thread_detach((int)a); break;
     case SYS_THREAD_EXIT: thread_exit(0);
     case SYS_THREAD_ID: ret = self->tid; break;
+    case SYS_THREAD_SCHEDULE: ret = thread_schedule((int)a, (uint32_t)b, c); break;
     case SYS_THREAD_STACK_BOUNDS: {
         /* Main stacks grow on demand within the VM's reserved interval.
            Other threads instead own the stack thread_create reserved for them. */
@@ -2928,11 +2911,11 @@ void syscall_dispatch(struct regs *r) {
     }
     case SYS_WAIT_ADDRESS:
         if ((a & 3) || !user_ok((void *)a, sizeof(uint32_t))) ret = -N_ERR_BAD_ADDRESS;
-        else ret = address_wait((volatile void *)a, (uint32_t)b, false, address_deadline((unsigned)c));
+        else ret = address_wait((volatile void *)a, (uint32_t)b, false, c);
         break;
     case SYS_WAIT_ADDRESS64:
         if ((a & 7) || !user_ok((void *)a, sizeof(uint64_t))) ret = -N_ERR_BAD_ADDRESS;
-        else ret = address_wait((volatile void *)a, b, true, address_deadline((unsigned)c));
+        else ret = address_wait((volatile void *)a, b, true, c);
         break;
     case SYS_WAKE_ADDRESS:
         if ((a & 3) || !user_ok((void *)a, sizeof(uint32_t))) ret = -N_ERR_BAD_ADDRESS;
@@ -3073,7 +3056,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_CHANNEL_RECEIVE: ret = sys_channel_receive((int)a, (void *)b, c, (int)d, (void *)e, false); break;
     case SYS_CHANNEL_RECEIVE_FROM: ret = sys_channel_receive((int)a, (void *)b, c, (int)d, (void *)e, true); break;
     case SYS_APP_LAUNCH: ret = sys_app_launch((const char *)a, (const struct n_launch *)b); break;
-    case SYS_APP_RESULT: ret = sys_app_result((int)a, (int64_t)b, (int *)c); break;
+    case SYS_APP_RESULT: ret = sys_app_result((int)a, b, (int *)c); break;
     case SYS_APP_STOP: ret = sys_app_stop((int)a, (int)b); break;
     case SYS_APP_SELF: ret = self->process->pid; break;
     case SYS_APP_PARENT: {
@@ -3087,8 +3070,8 @@ void syscall_dispatch(struct regs *r) {
     case SYS_EVENTS_WATCH: ret = sys_events_watch((int)a, (int)b, (uint32_t)c, d); break;
     case SYS_EVENTS_UNWATCH: ret = sys_events_unwatch((int)a, b); break;
     case SYS_EVENTS_WATCH_ADDRESS: ret = sys_events_watch_address((int)a, b, (uint32_t)c, d); break;
-    case SYS_EVENTS_TIMER: ret = sys_events_timer((int)a, b, (int)c, d); break;
-    case SYS_EVENTS_WAIT: ret = sys_events_wait((int)a, (struct n_event *)b, c, (int64_t)d); break;
+    case SYS_EVENTS_TIMER: ret = sys_events_timer((int)a, b, c, d); break;
+    case SYS_EVENTS_WAIT: ret = sys_events_wait((int)a, (struct n_event *)b, c, d); break;
     case SYS_APP_OPEN: ret = sys_app_open((int64_t)a); break;
     case SYS_APP_ID: ret = sys_app_id((int)a); break;
     case SYS_SYSTEM_LOG_OPEN: ret = sys_system_log_open(); break;
@@ -3101,7 +3084,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_WATCH_TAKE: ret = watch_take((int)a); break;
     case SYS_ENTRY_WATCH: ret = sys_entry_watch((const char *)a, b); break;
     case SYS_PAGER_CREATE: ret = sys_pager_create(a, (int32_t *)b); break;
-    case SYS_PAGER_TAKE: ret = sys_pager_take((int)a, (struct n_pager_fault *)b, c, (int64_t)d); break;
+    case SYS_PAGER_TAKE: ret = sys_pager_take((int)a, (struct n_pager_fault *)b, c, d); break;
     case SYS_PAGER_SUPPLY: ret = sys_pager_supply((int)a, (const struct n_pager_supply *)b, c); break;
     case SYS_PAGER_REVOKE: ret = sys_pager_revoke((int)a, b, c, (uint32_t)d); break;
     case SYS_PAGER_FAIL: ret = sys_pager_fail((int)a, b, c); break;

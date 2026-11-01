@@ -97,9 +97,9 @@ int main(void) {
     read_time(&ha, &ma, &sa);
     draw_face(face, ha, ma, sa);
     show(s);
-    uint64_t now = n_clock_uptime_ms(), next = now + 1000 - now % 1000;
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS), next = now + 1000 - now % 1000;
     for (bool running = true; running;) {
-        now = n_clock_uptime_ms();
+        now = (n_clock_monotonic() / N_NS_PER_MS);
         ui_session_wait(s, next > now ? (int)(next - now) : 0);
         bool redraw = false;
         struct ui_event e;
@@ -124,7 +124,7 @@ int main(void) {
             }
         }
         if (!running || !ui_session_open(s)) break;
-        now = n_clock_uptime_ms();
+        now = (n_clock_monotonic() / N_NS_PER_MS);
         bool tick = now >= next;
         if (tick) next = now + 1000 - now % 1000;
         if (tick || redraw) {

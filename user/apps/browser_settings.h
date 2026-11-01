@@ -205,7 +205,7 @@ static bool settings_sites_stale = true;
 static n_result settings_sites_failure;
 
 static void settings_read_sites(void) {
-    uint64_t now = n_clock_uptime_ms();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
     if (!settings_sites_stale && now - settings_sites_at < 1000) return;
     settings_sites_stale = false; settings_sites_at = now;
     struct websitedata_site *rows = NULL;

@@ -262,7 +262,7 @@ static void test_filter_cancel(void) {
         "<a id=child style='display:block;width:20px;height:20px;background:blue'></a></div>";
     web_doc *d=web_live(html,strlen(html),"https://css.test/filter-cancel","utf-8",&host);
     check("filter live cancellation fixture",d!=NULL,true);if(!d)return;
-    web_tick(d,uptime_ms());web_layout(d,800,600);canvas_t canvas;filter_paint(d,&canvas);
+    web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));web_layout(d,800,600);canvas_t canvas;filter_paint(d,&canvas);
     uint32_t previous[32*32];memcpy(previous,filter_pixels,sizeof previous);
     pvec nodes={0};node_t *child=NULL;
     if(css_select(d,d->root,"#child",&nodes)&&nodes.n==1)child=nodes.v[0];pv_free(&nodes);
@@ -303,7 +303,7 @@ static void test_hover_support(void) {
         "#leaf{width:80px;height:20px;color:#ff0000}@supports selector(:hover){#leaf:hover{color:#0000ff}}</style>"
         "<div id=parent><div id=leaf></div></div>";
     web_doc *d=web_live(html,sizeof html-1,"https://css.test/hover","utf-8",NULL);
-    if(d)for(unsigned i=0;i<128&&!web_js_complete(d);i++)web_tick(d,uptime_ms());
+    if(d)for(unsigned i=0;i<128&&!web_js_complete(d);i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     check("hover real live document",d&&web_js_complete(d),true);if(!d)return;
     web_layout(d,800,600);
     pvec nodes={0};node_t *leaf=NULL,*parent=NULL;

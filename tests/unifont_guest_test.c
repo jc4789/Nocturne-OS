@@ -63,6 +63,6 @@ int main(int argc, char **argv) {
         win_update(short_title);
     }
     printf("unifont_guest: glyphs=%u narrow=%u wide=%u, 0 failures\n", total, narrow, wide);
-    n_sleep_ms(60000);
+    n_sleep_until(n_clock_after(60000 * N_NS_PER_MS));
     return 0;
 }

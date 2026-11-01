@@ -6909,7 +6909,7 @@ static void layout_profile_report(web_doc *d, box_t *root, uint64_t cycles[5], u
 
 void layout_doc(web_doc *d, int width, int height) {
     static uint32_t next_generation;
-    uint64_t profile_start = d->profile_enabled ? uptime_ms() : 0, phase_cycles[5] = {0}, phase_mark = 0;
+    uint64_t profile_start = d->profile_enabled ? (n_clock_monotonic() / N_NS_PER_MS) : 0, phase_cycles[5] = {0}, phase_mark = 0;
 #define LAYOUT_PHASE(i) do { if (d->profile_enabled) { uint64_t now_ = __builtin_ia32_rdtsc(); if (phase_mark) phase_cycles[i] += now_ - phase_mark; phase_mark = now_; } } while (0)
     struct layout_context context = {.document = d, .viewport_w = (float)width,
         .viewport_h = (float)height, .generation = ++next_generation};
@@ -6969,7 +6969,7 @@ void layout_doc(web_doc *d, int width, int height) {
     if (d->native_cancelled) goto finished;
     scroll_areas(root);
     LAYOUT_PHASE(4);
-    if (d->profile_enabled && uptime_ms() - profile_start >= 250) layout_profile_report(d, root, phase_cycles, uptime_ms() - profile_start);
+    if (d->profile_enabled && (n_clock_monotonic() / N_NS_PER_MS) - profile_start >= 250) layout_profile_report(d, root, phase_cycles, (n_clock_monotonic() / N_NS_PER_MS) - profile_start);
     if (d->native_cancelled) goto finished;
     float h = fmaxf_(root->h, max_bottom(root, 0));
     /* The containing-block overflow union already includes escaping absolute

@@ -53,7 +53,7 @@ static struct web_host frame_host(struct web_js_state *s,const struct js_pending
     struct web_host host=s->host;
     memset(&host.navigation_timing,0,sizeof host.navigation_timing);
     host.navigation_timing.valid=true;host.navigation_timing.type=WEB_NAVIGATION_NAVIGATE;
-    host.navigation_timing.navigation_start_ms=uptime_ms();
+    host.navigation_timing.navigation_start_ms=(n_clock_monotonic() / N_NS_PER_MS);
     if(p){
         const struct http_fetch_timing *t=&p->response.timing;
         host.navigation_timing.navigation_start_ms=t->valid&&t->start_time?t->start_time:p->started;
@@ -334,7 +334,7 @@ static void frame_window_close(struct web_js_state *caller,web_doc *target) {
     if(!web_doc_fully_active(target) || target->frame_parent || target->window_closing || !s || !s->host.close || !s->host.history)return;
     struct web_history history={0};
     if(!s->host.history(s->host.opaque,WEB_HISTORY_INFO,NULL,NULL,0,0,&history) || history.length!=1)return;
-    if(!web_sandbox_navigation_allowed(caller->doc,target,caller->doc->sandbox_activation_until>uptime_ms()))return;
+    if(!web_sandbox_navigation_allowed(caller->doc,target,caller->doc->sandbox_activation_until>(n_clock_monotonic() / N_NS_PER_MS)))return;
     if(s->host.close(s->host.opaque))target->window_closing=true;
 }
 /* The Window operations a realm installs as its own (js_bootstrap.js windowOperations): focus and
@@ -563,7 +563,7 @@ static JSValue frame_message_send(JSContext *ctx,struct web_js_state *s,struct w
 
 static bool frame_navigation_authorized(struct web_js_state *caller,web_doc *target) {
     if(!task_context_active(caller) || !target || !task_context_active(target->js))return false;
-    bool activated=caller->doc->sandbox_activation_until>uptime_ms();
+    bool activated=caller->doc->sandbox_activation_until>(n_clock_monotonic() / N_NS_PER_MS);
     if(!web_sandbox_navigation_allowed(caller->doc,target,activated))return false;
     if(web_frame_same_origin(caller->doc,target) || caller->doc==target->frame_parent)return true;
     /* Cross-origin ancestor escape is confined to the top-level target and

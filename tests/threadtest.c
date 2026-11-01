@@ -19,7 +19,6 @@ static const char *shared_path;
    by resource_regression before the workers start. */
 static char resource_path[512], resource_folder[512], resource_probe[640];
 static n_handle resource_window;
-static uint64_t resource_clock_page;
 static void *resource_maps[THREADS][RESOURCE_ROUNDS];
 static volatile uint32_t resource_gate, blocked_read_entered;
 /* The handle the workers probe while worker 0 closes and replaces it every round. Probes are
@@ -88,7 +87,7 @@ static void exit_racer(void *arg) {
     add(&entered, 1);
     wake_address(&entered, 0);
     while (!load_acquire(&gate))
-        wait_on_address(&gate, 0, UINT32_MAX);
+        wait_on_address(&gate, 0, N_CLOCK_NEVER);
     /* Mix already-finished, returning and still-active siblings while the
        owner enrolls in its exit wait queue. No userspace join hides the race. */
     unsigned delay = (unsigned)(uintptr_t)arg * 30000u;
@@ -103,11 +102,11 @@ static void worker(void *arg) {
     thread_local_set(7, (void *)(uintptr_t)(id + 1));
     add(&entered, 1);
     wake_address(&entered, 0);
-    while (!gate) wait_on_address(&gate, 0, UINT32_MAX);
+    while (!gate) wait_on_address(&gate, 0, N_CLOCK_NEVER);
     errno = 1000 + (int)id;
-    uint64_t until = uptime_ms() + 80;
+    uint64_t until = (n_clock_monotonic() / N_NS_PER_MS) + 80;
     unsigned sum = id + 1;
-    while (uptime_ms() < until) {
+    while ((n_clock_monotonic() / N_NS_PER_MS) < until) {
         mask_cpu(cpu_index());
         for (unsigned k = 0; k < 3000; k++) sum = sum * 1664525u + 1013904223u;
     }
@@ -131,7 +130,7 @@ static void worker(void *arg) {
 static void resource_worker(void *arg) {
     unsigned id = (unsigned)(uintptr_t)arg;
     while (!load_acquire(&resource_gate))
-        wait_on_address(&resource_gate, 0, UINT32_MAX);
+        wait_on_address(&resource_gate, 0, N_CLOCK_NEVER);
     for (unsigned round = 0; round < RESOURCE_ROUNDS; round++) {
         if (!id) {
             /* Replace the probed handle: publish the new one, then close the old one. */
@@ -202,9 +201,8 @@ static void resource_worker(void *arg) {
         }
         char record[RECORD_SIZE]; memset(record, (int)id + 1, sizeof record);
         if (n_document_append(resource_path, record, sizeof record) < 0) resource_failed(id, RC_RECORD_APPEND, -1);
-        struct n_clockinfo clock = {0};
-        if (clock_info(&clock) || clock.reference_page != resource_clock_page)
-            resource_failed(id, RC_CLOCK, (long)clock.reference_page);
+        uint64_t first = n_clock_monotonic(), second = n_clock_monotonic();
+        if (second < first || n_clock_boot() < second) resource_failed(id, RC_CLOCK, (long)(first - second));
         void *page;
         n_memory_reserve(4096, N_MEMORY_READ_WRITE, &page);
         unsigned char *map = page;
@@ -224,7 +222,7 @@ static void blocked_reader(void *unused) {
     blocked_result = n_channel_receive(blocked_read_handle, &blocked_token, 1, N_CHANNEL_WAIT, NULL);
 }
 
-static int resource_regression(const struct n_clockinfo *clock) {
+static int resource_regression(void) {
     unsigned before = failures;
     const char *folder = getenv("FOLDER");
     char saved_folder[256];
@@ -238,7 +236,6 @@ static int resource_regression(const struct n_clockinfo *clock) {
     racing = n_document_open(resource_path, N_DOCUMENT_READ);
     resource_window = (n_handle)__syscall(SYS_WIN_CREATE, 32, 32, (long)"threadtest resources", 0, 0);
     racing_window = resource_window;
-    resource_clock_page = clock->reference_page;
     if (racing < 0) return 1;
     for (unsigned i = 0; i < THREADS; i++) {
         tids[i] = thread_create(resource_worker, (void *)(uintptr_t)i);
@@ -297,8 +294,8 @@ static int resource_regression(const struct n_clockinfo *clock) {
         if (reader < 0) { resource_failed(THREADS, RC_BLOCK_CREATE, reader); n_handle_close(ends[0]); }
         else {
             while (!load_acquire(&blocked_read_entered))
-                wait_on_address(&blocked_read_entered, 0, 2000);
-            n_sleep_ms(20);
+                wait_on_address(&blocked_read_entered, 0, n_clock_after(2000 * N_NS_PER_MS));
+            n_sleep_until(n_clock_after(20 * N_NS_PER_MS));
             n_handle reused = -1;
             if (n_handle_close(ends[0]) < 0 || (reused = n_events_create()) < 0)
                 resource_failed(THREADS, RC_BLOCK_REPLACE, -1);
@@ -341,7 +338,7 @@ int main(int argc, char **argv) {
             if (thread_create(exit_racer, (void *)(uintptr_t)i) < 0) return 1;
         while (load_acquire(&entered) != THREADS) {
             unsigned before = load_acquire(&entered);
-            if (before != THREADS) wait_on_address(&entered, before, 2000);
+            if (before != THREADS) wait_on_address(&entered, before, n_clock_after(2000 * N_NS_PER_MS));
         }
         store_release(&gate, 1);
         wake_address(&gate, 0);
@@ -352,13 +349,13 @@ int main(int argc, char **argv) {
             if (thread_create(worker, (void *)(uintptr_t)i) < 0) return 1;
         while (entered != THREADS) {
             unsigned before = entered;
-            if (entered != THREADS) wait_on_address(&entered, before, 2000);
+            if (entered != THREADS) wait_on_address(&entered, before, n_clock_after(2000 * N_NS_PER_MS));
         }
         /* All siblings are asleep in address wait when root destroys process. */
         return 0;
     }
     struct n_cpuinfo info;
-    struct n_clockinfo clock;
+    const struct n_clock *clock = (const struct n_clock *)N_CLOCK_ADDRESS;
     int bad = 0;
     uintptr_t stack_low,stack_high,stack_marker=(uintptr_t)&stack_low;
     if(thread_stack_bounds(&stack_low,&stack_high) || stack_low>=stack_high ||
@@ -366,8 +363,9 @@ int main(int argc, char **argv) {
     uintptr_t unchanged=stack_marker;
     errno=0;
     if(thread_stack_bounds(&unchanged,NULL)!=-N_ERR_BAD_ADDRESS || errno!=0 || unchanged!=stack_marker)bad++;
-    if (cpu_info(&info) || clock_info(&clock)) return 1;
-    printf("threadtest: scheduler=%u online=%u clock_flags=%u\n", info.scheduler_cpus, info.online_cpus, clock.flags);
+    if (cpu_info(&info)) return 1;
+    printf("threadtest: scheduler=%u online=%u tsc_hz=%llu\n", info.scheduler_cpus, info.online_cpus,
+           (unsigned long long)clock->tsc_hz);
     static char shared_document[512];
     if (n_path_join(n_temp_folder(), "threadtest-shared.tmp", shared_document, sizeof shared_document) < 0) return 1;
     n_entry_remove(shared_document);
@@ -382,7 +380,7 @@ int main(int argc, char **argv) {
     }
     while (entered != THREADS) {
         unsigned before = entered;
-        if (entered != THREADS) wait_on_address(&entered, before, 2000);
+        if (entered != THREADS) wait_on_address(&entered, before, n_clock_after(2000 * N_NS_PER_MS));
     }
     gate = 1;
     __asm__ volatile("mfence" : : : "memory");
@@ -401,24 +399,24 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < 16; i++) if (cpu_mask & (1u << i)) active++;
     if (info.scheduler_cpus > 1 && active < 2) bad++;
     volatile uint32_t timeout_word = 0;
-    if (wait_on_address(&timeout_word, 0, 2) != -N_ERR_TIMEOUT) bad++;
+    if (wait_on_address(&timeout_word, 0, n_clock_after(2 * N_NS_PER_MS)) != -N_ERR_TIMEOUT) bad++;
     timeout_word = 1;
-    if (wait_on_address(&timeout_word, 0, 1000) != -N_ERR_NOT_READY) bad++;
-    uint64_t previous = uptime_ms();
+    if (wait_on_address(&timeout_word, 0, n_clock_after(1000 * N_NS_PER_MS)) != -N_ERR_NOT_READY) bad++;
+    uint64_t previous = n_clock_monotonic();
     for (unsigned i = 0; i < 20000; i++) {
-        uint64_t now = uptime_ms();
+        uint64_t now = n_clock_monotonic();
         if (now < previous) bad++;
         previous = now;
     }
-    bad += resource_regression(&clock);
+    bad += resource_regression();
     int status = -1;
     n_handle child = start_helper(argv[0], "--exit", NULL);
-    if (child < 0 || n_app_result(child, -1, &status) < 0 || status) bad++;
+    if (child < 0 || n_app_result(child, N_CLOCK_NEVER, &status) < 0 || status) bad++;
     if (child >= 0) n_handle_close(child);
     for (unsigned round = 0; round < 16; round++) {
         child = start_helper(argv[0], "--exit-active", NULL); status = -1;
         if (child < 0) { bad++; break; }
-        n_result result = n_app_result(child, 5000, &status);
+        n_result result = n_app_result(child, n_clock_after(5000 * N_NS_PER_MS), &status);
         if (result < 0 || status) {
             n_app_stop(child, N_APP_STOP_TREE);
             n_handle_close(child);
@@ -450,10 +448,10 @@ int main(int argc, char **argv) {
             bad++;
         }
         else {
-            uint64_t started = uptime_ms();
-            n_result result = n_app_result(child, 5000, &status);
+            uint64_t started = (n_clock_monotonic() / N_NS_PER_MS);
+            n_result result = n_app_result(child, n_clock_after(5000 * N_NS_PER_MS), &status);
             if (result < 0 || status != 134) {
-                uint64_t elapsed = uptime_ms() - started;
+                uint64_t elapsed = (n_clock_monotonic() / N_NS_PER_MS) - started;
                 n_result stopped = 0;
                 if (result < 0) stopped = n_app_stop(child, N_APP_STOP_TREE);
                 printf("threadtest: fatal-wait child=%d result=%ld status=%d elapsed=%lu stop=%ld\n",
@@ -471,10 +469,7 @@ int main(int argc, char **argv) {
             for (unsigned i = 0; i < 1024; i++) if (recorded[i] != 'd') { bad++; break; }
         n_handle_close(diag[0]);
     }
-    if (clock.flags & N_CLOCK_HV_REFERENCE) {
-        if (!clock.reference_page ||
-            n_memory_protect((void *)(uintptr_t)clock.reference_page, 4096, N_MEMORY_READ_WRITE) != -N_ERR_DENIED) bad++;
-    }
+    if (n_memory_protect((void *)(uintptr_t)N_CLOCK_ADDRESS, 4096, N_MEMORY_READ_WRITE) != -N_ERR_DENIED) bad++;
     printf("threadtest: CPU mask=%x active=%u shared malloc/TLS/handle/wait %s errors=%u\n",
            cpu_mask, active, !bad && !failures ? "PASS" : "FAIL", failures + bad);
     return bad || failures ? 1 : 0;

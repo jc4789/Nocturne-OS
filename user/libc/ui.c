@@ -2398,7 +2398,7 @@ static void pointer(struct uiwin *w, struct node *n, uint32_t action, const stru
 }
 
 static void win_input(struct uiwin *w, const struct gui_event *e) {
-    w->now = uptime_ms();
+    w->now = (n_clock_monotonic() / N_NS_PER_MS);
     switch (e->type) {
     case EV_MOUSE_MOVE: {
         w->px = (float)e->x;
@@ -2851,7 +2851,7 @@ static void paint_menus(struct uiwin *w, const float *clip) {
 
 static void render(struct uiwin *w) {
     canvas_t *c = &w->win->c;
-    w->now = uptime_ms();
+    w->now = (n_clock_monotonic() / N_NS_PER_MS);
     w->dirty = false;
     w->hold = false;
     w->animating = false;
@@ -3283,7 +3283,7 @@ n_handle ui_session_queue(struct ui_session *s) { return s->queue; }
 bool ui_session_open(struct ui_session *s) { return s->nwins > 0; }
 
 int ui_session_timeout(struct ui_session *s) {
-    uint64_t now = uptime_ms();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
     int64_t best = -1;
     for (uint32_t i = 0; i < s->nwins; i++) {
         struct uiwin *w = s->wins[i];
@@ -3319,7 +3319,7 @@ void ui_session_pump(struct ui_session *s) {
             i--;
             continue;
         }
-        uint64_t now = uptime_ms();
+        uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
         if (w->focus && now >= w->caret_at) {
             w->caret_on = !w->caret_on;
             w->caret_at = now + 530;
@@ -3336,7 +3336,7 @@ bool ui_session_wait(struct ui_session *s, int timeout) {
     if (t < 0 || (timeout >= 0 && timeout < t)) t = timeout;
     if (t != 0 && s->nwins) {
         struct n_event ev[8];
-        n_events_wait(s->queue, ev, 8, t);
+        n_events_wait(s->queue, ev, 8, t < 0 ? N_CLOCK_NEVER : n_clock_after((uint64_t)t * N_NS_PER_MS));
     }
     ui_session_pump(s);
     return s->head != NULL;

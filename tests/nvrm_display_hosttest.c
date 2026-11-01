@@ -104,7 +104,8 @@ static uint8_t gop[GOP_PITCH * H];
 static uint64_t clock_ns;
 
 uint64_t nvrm_now_ns(void) { return clock_ns; }
-void n_sleep_ms(uint64_t ms) { clock_ns += ms * 1000000u; }
+uint64_t n_clock_monotonic(void) { return clock_ns; }
+void n_sleep_until(uint64_t deadline) { if (deadline > clock_ns) clock_ns = deadline; }
 const char *n_result_text(n_result r) { (void)r; return "error"; }
 
 /* KAPI's memory and surfaces, in the order allocated: the cursor first, then the desktop's

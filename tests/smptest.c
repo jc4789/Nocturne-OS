@@ -75,7 +75,7 @@ static int child(unsigned long start, unsigned seed) {
     if (sleep_result(20)) return 2;
     unsigned long per_ms = (ticks() - t0) / 20;
     if (!per_ms) return 2;
-    unsigned long now = uptime_ms();
+    unsigned long now = (n_clock_monotonic() / N_NS_PER_MS);
     if (now < start && sleep_result((unsigned)(start - now))) return 2;
     volatile unsigned long value = seed;
     r.magic = 0x534d5031;
@@ -107,7 +107,7 @@ static n_handle start_child(const char *self, const char *const *args, uint32_t 
     return app;
 }
 static int finish_child(n_handle app, int *status) {
-    n_result r = n_app_result(app, -1, status);
+    n_result r = n_app_result(app, N_CLOCK_NEVER, status);
     n_handle_close(app);
     return r >= 0;
 }
@@ -131,7 +131,7 @@ int main(int argc, char **argv) {
     struct report r[2];
     memset(r, 0, sizeof r);
     char start[32];
-    snprintf(start, sizeof start, "%lu", (unsigned long)uptime_ms() + 200);
+    snprintf(start, sizeof start, "%lu", (unsigned long)(n_clock_monotonic() / N_NS_PER_MS) + 200);
     for (unsigned i = 0; i < 2; i++) {
         const char *args[4] = {argv[0], "--child", start, i ? "29" : "11"};
         app[i] = start_child(argv[0], args, 4, false, &reader[i]);

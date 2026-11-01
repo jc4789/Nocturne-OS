@@ -45,7 +45,7 @@ static void say(const char *fmt, ...) {
 static void stop_slot(int slot) {
     if (apps[slot] < 0) return;
     n_app_stop(apps[slot], N_APP_STOP_TREE);
-    n_app_result(apps[slot], -1, NULL);
+    n_app_result(apps[slot], N_CLOCK_NEVER, NULL);
     n_handle_close(apps[slot]);
     apps[slot] = -1;
 }
@@ -123,9 +123,9 @@ int main(void) {
     }
     fclose(f);
     for (int attempt = 0; attempt < 60 && link_handle < 0; attempt++) {
-        int s = tcp_connect(HOST, (uint16_t)port, 2000);
+        int s = tcp_connect(HOST, (uint16_t)port, n_clock_after(2000 * N_NS_PER_MS));
         if (s >= 0) link_handle = s;
-        else n_sleep_ms(1000);
+        else n_sleep_until(n_clock_after(1000 * N_NS_PER_MS));
     }
     if (link_handle < 0) {
         printf("wptrunner: cannot reach the host at 10.0.2.2:%d\n", port);
@@ -137,7 +137,7 @@ int main(void) {
     char buffer[8192];
     size_t used = 0;
     for (;;) {
-        long got = tcp_recv(link_handle, buffer + used, sizeof buffer - 1 - used, 250);
+        long got = tcp_recv(link_handle, buffer + used, sizeof buffer - 1 - used, n_clock_after(250 * N_NS_PER_MS));
         if (got == 0) break; /* the host went away */
         if (got > 0) {
             used += (size_t)got;

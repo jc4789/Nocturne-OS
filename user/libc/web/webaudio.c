@@ -1070,6 +1070,8 @@ static size_t output_frames(struct wa_context *c, int16_t *frames) {
 static void realtime(struct wa_context *c) {
     int16_t frames[2 * OUTPUT_QUANTUM];
     uint64_t clock_start = 0, clock_frames = 0, open_at = 0;
+    /* a job each render quantum: the deadline class with that period (n_thread_schedule) */
+    n_thread_schedule(0, N_SCHEDULE_DEADLINE, (uint64_t)(WA_QUANTUM * (double)N_NS_PER_S / c->rate));
     mtx_lock(&c->lock);
     for (;;) {
         while (!c->quit && c->state != WA_RUNNING) {
@@ -1077,7 +1079,7 @@ static void realtime(struct wa_context *c) {
             cnd_wait(&c->wake, &c->lock);
         }
         if (c->quit) break;
-        uint64_t now = uptime_us();
+        uint64_t now = (n_clock_monotonic() / N_NS_PER_US);
         if (c->sink < 0 && now >= open_at) {
             open_at = now + 1000000;
             mtx_unlock(&c->lock);
@@ -1105,7 +1107,7 @@ static void realtime(struct wa_context *c) {
         if (queued >= WA_OUTPUT_TARGET) {
             uint64_t ms = (queued - WA_OUTPUT_TARGET) * 1000 / WA_OUTPUT_RATE + 2;
             mtx_unlock(&c->lock);
-            n_sleep_ms(ms > 20 ? 20 : ms);
+            n_sleep_until(n_clock_after((uint64_t)(ms > 20 ? 20 : ms) * N_NS_PER_MS));
             mtx_lock(&c->lock);
             continue;
         }

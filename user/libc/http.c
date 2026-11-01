@@ -10,8 +10,7 @@
 #include "../include/http.h"
 #include "http2.h"
 #include "browser_identity.h"
-extern uint64_t uptime_ms(void);
-extern void n_sleep_ms(uint64_t);
+#include "../include/nocturne.h"
 
 /* The pool is process-local. It never coalesces certificate names or origins.
    Keys include the exact caller partition and credential header bytes; no
@@ -94,17 +93,17 @@ static struct pooled_connection *pool_acquire(const struct http_req *rq,const st
     int timeout,const char *partition,bool prior,const struct http_stream_hooks *hooks,
     struct http_transport_timing *timing,struct http_transport_result *result,char *error,size_t error_cap) {
     char *key=pool_key(rq,partition);if(!key){errno=ENOMEM;snprintf(error,error_cap,"out of memory preparing connection key");return NULL;}
-    uint64_t started=uptime_ms();
+    uint64_t started=(n_clock_monotonic() / N_NS_PER_MS);
     for(;;) {
         if(hooks&&hooks->cancelled&&hooks->cancelled(rq->ctx)){errno=ECANCELED;snprintf(error,error_cap,"request cancelled");break;}
-        if(timeout>0&&uptime_ms()-started>=(uint64_t)timeout){errno=ETIMEDOUT;snprintf(error,error_cap,"connection pool wait timed out");break;}
+        if(timeout>0&&(n_clock_monotonic() / N_NS_PER_MS)-started>=(uint64_t)timeout){errno=ETIMEDOUT;snprintf(error,error_cap,"connection pool wait timed out");break;}
         pool_enter();unsigned opening=0;uint64_t newest_open=0;
         struct pooled_connection *oldest=NULL;
         for(struct pooled_connection *p=pool;p;p=p->next) {
             if(!p->users&&(!oldest||p->idle<oldest->idle))oldest=p;
             if(p->retire||p->port!=u->port||p->tls!=u->tls||p->prior!=prior||strcmp(p->host,u->host)||strcmp(p->key,key))continue;
             if(p->opening){opening++;if(p->opened_at>newest_open)newest_open=p->opened_at;continue;}
-            if(!p->users&&uptime_ms()-p->idle>=30000){p->retire=true;continue;}
+            if(!p->users&&(n_clock_monotonic() / N_NS_PER_MS)-p->idle>=30000){p->retire=true;continue;}
             if(p->h2?http2_available(p->h2):!p->users) {
                 p->users++;pool_leave();free(key);
                 if(result){result->reused=true;result->connection_id=p->identity;result->http2=p->h2!=NULL;}
@@ -112,17 +111,17 @@ static struct pooled_connection *pool_acquire(const struct http_req *rq,const st
                 if(!p->h2)ns_set_timeout(p->stream,timeout);return p;
             }
         }
-        if(opening&&(opening>=POOL_OPEN_PER_KEY||uptime_ms()-newest_open<POOL_OPEN_PATIENCE_MS)){pool_leave();n_sleep_ms(1);continue;}
+        if(opening&&(opening>=POOL_OPEN_PER_KEY||(n_clock_monotonic() / N_NS_PER_MS)-newest_open<POOL_OPEN_PATIENCE_MS)){pool_leave();n_sleep_until(n_clock_after(1 * N_NS_PER_MS));continue;}
         if(oldest&&(oldest->retire||pool_count>=POOL_MAX)) {
             pool_unlink(oldest);pool_leave();pool_destroy(oldest);continue;
         }
-        if(pool_count>=POOL_MAX){pool_leave();n_sleep_ms(1);continue;}
+        if(pool_count>=POOL_MAX){pool_leave();n_sleep_until(n_clock_after(1 * N_NS_PER_MS));continue;}
         struct pooled_connection *p=calloc(1,sizeof *p);
         if(!p){pool_leave();errno=ENOMEM;break;}
         size_t host_len=strlen(u->host);p->host=malloc(host_len+1);
         if(!p->host){free(p);pool_leave();errno=ENOMEM;break;}
         memcpy(p->host,u->host,host_len+1);
-        p->key=key;p->port=u->port;p->tls=u->tls;p->prior=prior;p->opening=true;p->users=1;p->opened_at=uptime_ms();
+        p->key=key;p->port=u->port;p->tls=u->tls;p->prior=prior;p->opening=true;p->users=1;p->opened_at=(n_clock_monotonic() / N_NS_PER_MS);
         p->identity=++connection_identity;
         bool raced=opening!=0;
         p->next=pool;pool=p;pool_count++;pool_leave();
@@ -158,7 +157,7 @@ static void pool_release(struct pooled_connection *p,bool reusable) {
     pool_enter();if(!reusable&&!p->h2)p->retire=true;
     if(p->h2&&!http2_reusable(p->h2))p->retire=true;
     if(!p->h2)ns_set_cancel(p->stream,NULL,NULL);
-    if(p->users)p->users--;p->idle=uptime_ms();
+    if(p->users)p->users--;p->idle=(n_clock_monotonic() / N_NS_PER_MS);
     bool destroy=!p->users&&p->retire;if(destroy)pool_unlink(p);pool_leave();
     if(destroy)pool_destroy(p);
 }
@@ -222,7 +221,7 @@ static bool rd_fill(struct rd *r) {
     }
     r->pos = 0;
     r->len = (size_t)n;
-    r->filled_at = uptime_ms();
+    r->filled_at = (n_clock_monotonic() / N_NS_PER_MS);
     return true;
 }
 
@@ -509,7 +508,7 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     if(!work->connection)return -1;
     net_stream *s=work->connection->stream;
     if(!work->connection->h2)ns_set_cancel(s,hooks?hooks->cancelled:NULL,rq->ctx);
-    if(timing){timing->phase=HTTP_PHASE_HEADER;*phase_started=uptime_ms();}
+    if(timing){timing->phase=HTTP_PHASE_HEADER;*phase_started=(n_clock_monotonic() / N_NS_PER_MS);}
     struct http_transport_result *result=work->result;
     if(result) {
         /* The connection's timing info as it opened (an earlier request's
@@ -517,7 +516,7 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
            cleartext prior knowledge is h2c, HTTP/1 its response's version. */
         ns_get_connection_timing(s,&result->connection);
         if(!result->connection.protocol[0])strcpy(result->connection.protocol,prior?"h2c":"http/1.1");
-        result->request_start=uptime_ms();
+        result->request_start=(n_clock_monotonic() / N_NS_PER_MS);
     }
 
     /* One complete header block avoids a flush/TLS record and TCP send for
@@ -596,7 +595,7 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
             }
         }
     } while (status < 200);
-    if(timing)timing->first_header_ms=uptime_ms()-*phase_started;
+    if(timing)timing->first_header_ms=(n_clock_monotonic() / N_NS_PER_MS)-*phase_started;
     rs->status = status;
     const char *reason = strchr(line, ' ');
     if (reason) {
@@ -683,7 +682,7 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     }
     rs->headers_len = hl;
     if (rs->headers_full) rs->headers[0] = 0;
-    if(timing){uint64_t now=uptime_ms();timing->header_ms=now-*phase_started;
+    if(timing){uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);timing->header_ms=now-*phase_started;
         *phase_started=now;timing->phase=HTTP_PHASE_BODY;}
     if (hooks && hooks->headers) {
         int decision = hooks->headers(rq->ctx, rs);
@@ -814,8 +813,8 @@ static int request_with_limit(const struct http_req *rq, struct http_resp *rs, s
         if(work->h2)http2_release(work->h2);pool_release(work->connection,work->reusable);
     }
     if(timing){
-        if(timing->phase==HTTP_PHASE_HEADER)timing->header_ms=uptime_ms()-phase_started;
-        else if(timing->phase==HTTP_PHASE_BODY)timing->body_ms=uptime_ms()-phase_started;
+        if(timing->phase==HTTP_PHASE_HEADER)timing->header_ms=(n_clock_monotonic() / N_NS_PER_MS)-phase_started;
+        else if(timing->phase==HTTP_PHASE_BODY)timing->body_ms=(n_clock_monotonic() / N_NS_PER_MS)-phase_started;
         if(code==0)timing->phase=HTTP_PHASE_DONE;
     }
     result->phase=timing->phase;

@@ -388,27 +388,15 @@ const uint8_t *web_atomics_image_import(JSContext *ctx, JSValueConst record, siz
     return region->data;
 }
 int web_atomics_memory_wait(void *address, uint64_t expected, bool wide, int64_t timeout_ns) {
-    /* A negative timeout waits forever. Longer finite waits than one kernel
-       request (UINT32_MAX - 1 ms) continue until their own deadline. */
-    uint64_t deadline = 0;
-    if (timeout_ns >= 0) {
-        uint64_t ms = (uint64_t)timeout_ns / 1000000u + ((uint64_t)timeout_ns % 1000000u != 0);
-        uint64_t now = n_clock_uptime_ms();
-        deadline = ms > UINT64_MAX - now ? UINT64_MAX : now + ms;
-    }
+    /* A negative timeout waits forever. */
+    uint64_t deadline = timeout_ns >= 0 ? n_clock_after((uint64_t)timeout_ns) : N_CLOCK_NEVER;
     for (;;) {
-        unsigned slice = UINT32_MAX;
-        if (timeout_ns >= 0) {
-            uint64_t now = n_clock_uptime_ms();
-            uint64_t left = deadline > now ? deadline - now : 0;
-            slice = left >= UINT32_MAX ? UINT32_MAX - 1 : (unsigned)left;
-        }
-        n_result r = wide ? wait_on_address64(address, expected, slice)
-                          : wait_on_address(address, (uint32_t)expected, slice);
+        n_result r = wide ? wait_on_address64(address, expected, deadline)
+                          : wait_on_address(address, (uint32_t)expected, deadline);
         if (r == 0) return 0;
         if (r == -N_ERR_NOT_READY) return 1;
         if (r != -N_ERR_TIMEOUT) return 2; /* killed: the agent is terminating */
-        if (timeout_ns >= 0 && n_clock_uptime_ms() >= deadline) return 2;
+        if (n_clock_monotonic() >= deadline) return 2;
     }
 }
 uint32_t web_atomics_memory_notify(void *address, uint32_t count) {
@@ -476,7 +464,7 @@ static int wait_async(JSContext *ctx, void *opaque, void *address, uint32_t expe
         JS_ThrowRangeError(ctx, "Atomics.waitAsync waiter could not be enrolled");
         return -1;
     }
-    uint64_t now = n_clock_uptime_ms();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
     w->deadline = isfinite(timeout_ms) && timeout_ms < (double)(UINT64_MAX - now) ?
         now + (uint64_t)ceil(timeout_ms) : UINT64_MAX;
     w->ctx = ctx;
