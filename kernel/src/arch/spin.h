@@ -23,9 +23,20 @@
 #include "arch/smp.h"
 
 /* The ranks, lowest first: a lock is taken only while every ranked lock this CPU holds is lower.
-   Each owner names its locks here, in the order they nest. */
+   Each owner names its locks here, in the order they nest. Locks of one rank are never held two at
+   once. The check is always on: a lock taken out of order stops the system at once, on the path
+   that did it, not at the deadlock it would make some day.
+   A kind of lock with two of it held at once in an order of their own (two run queues, by CPU)
+   has no rank; nor has a wait queue's, taken under nearly anything. */
 enum spin_rank {
-    SPIN_UNRANKED, /* not checked */
+    SPIN_UNRANKED,      /* not checked */
+    SPIN_THREAD,        /* thread_lock (sys/thread.c): the registry, processes' threads and families */
+    SPIN_SHARED,        /* shared_lock (sys/syscall.c): shared objects and their mappings */
+    SPIN_ADDRESS_SPACE, /* a struct vmm_space's lock, an app's or the kernel's half (mm/vmm.c) */
+    SPIN_PAGE_CACHE,    /* a CPU's cache of frames (mm/pmm.c) */
+    SPIN_PAGE_NODE,     /* a node's free frames (mm/pmm.c) */
+    SPIN_HEAP_DEPOT,    /* a heap depot (mm/heap.c): a leaf that allocates nothing under it */
+    SPIN_VMALLOC,       /* vmalloc's ranges (mm/vmalloc.c): a leaf, vfree under any lock */
     SPIN_RANKS
 };
 

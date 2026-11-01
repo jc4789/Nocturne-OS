@@ -549,7 +549,10 @@ void heap_init(void) {
         /* the node's memory: the SRAT's, or the RAM shared out when it gives none */
         uint64_t bytes = topology.node[n].bytes ? topology.node[n].bytes : pmm_total_pages() * PAGE_SIZE / topology.nodes;
         uint64_t chain = bytes / ((uint64_t)CACHE_SHARE * cpus * CLASSES * CHAINS_PER_CPU);
-        for (unsigned k = 0; k < CLASSES; k++) d[k].most = cpus;
+        for (unsigned k = 0; k < CLASSES; k++) {
+            d[k].lock = (struct spinlock){.rank = SPIN_HEAP_DEPOT};
+            d[k].most = cpus;
+        }
         kprintf("heap: node %u: %u CPUs at home, chains of %u (%u bytes) to %u (%u bytes) objects\n", n, cpus,
                 (unsigned)MIN(MAX(chain / classes[0].size, 1), CHAIN_MOST), classes[0].size,
                 (unsigned)MIN(MAX(chain / classes[CLASSES - 1].size, 1), CHAIN_MOST), classes[CLASSES - 1].size);

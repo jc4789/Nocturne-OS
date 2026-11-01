@@ -16,7 +16,7 @@
 #include "sys/thread.h"
 #include "sys/wait.h"
 
-struct spinlock thread_lock;
+struct spinlock thread_lock = {.rank = SPIN_THREAD};
 static struct id_table thread_ids;
 /* The next id looked at. Ids go round the positive int32 range (the ABI's), skipping those held:
    an id comes back only after every other id was given since, so a stale one (a message's sender,

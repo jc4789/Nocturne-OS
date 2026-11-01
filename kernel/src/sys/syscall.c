@@ -363,16 +363,16 @@ struct shared_pages {
 };
 /* One mapping of a shared object into its owner's space, from the moment its range is reserved
    (building, while sys_shared_map installs its pages) until its pages went (leaving, while it is
-   taken down). It is in its owner's list (shared_mappings) and in shared_all, which revocations
-   walk. busy counts those working on its pages without shared_lock (shared_withdraw); it leaves
+   taken down). It is in its owner's tree (shared_mappings, by its range) and in shared_all, which
+   revocations walk. busy counts those working on its pages without shared_lock (shared_withdraw); it leaves
    shared_all only once busy is 0 (idle wakes its remover), so they find it, its range and its
    owner's space as they were. cancelled: a revocation reached it while it was built: it fails.
    access: NULL, or the leaves (frames, 0 for none yet) of one byte per page holding the access
    n_memory_protect set there (0: the mapping's own); every PTE installed later keeps to it.
-   Under shared_lock, except that its place in its owner's list, building and leaving change with
+   Under shared_lock, except that its place in its owner's tree, building and leaving change with
    the owner's space lock held too; the other fields are set before it is listed. */
 struct shared_mapping {
-    struct shared_mapping *next;              /* its owner's list */
+    struct span span;                         /* in its owner's tree: [va, va + bytes) */
     struct shared_mapping *all_next,*all_prev; /* shared_all */
     struct object *object;uint64_t va,flags;size_t bytes;
     struct process *owner;
@@ -388,7 +388,7 @@ struct shared_mapping {
    (sys/process.h) before it; after it wait queues' (an object's waiters', object_notify), the page tables' (vmm_*),
    pmm's. Held, nothing sleeps, copies user memory, waits for the disk or allocates from the heap:
    records are allocated before and freed after it. */
-static struct spinlock shared_lock;
+static struct spinlock shared_lock = {.rank = SPIN_SHARED};
 static struct wait_queue shared_typed; /* those that wait for a DMA root's type change to end */
 static struct shared_mapping *shared_all;
 static void shared_all_link(struct shared_mapping *m) {
@@ -401,11 +401,19 @@ static void shared_all_unlink(struct shared_mapping *m) {
     if(m->all_next)m->all_next->all_prev=m->all_prev;
     m->all_next=m->all_prev=NULL;
 }
-/* Its owner's space lock and shared_lock held: m leaves its owner's list. */
-static void shared_owner_unlink(struct shared_mapping *m) {
-    struct shared_mapping **link=&m->owner->shared_mappings;
-    while(*link!=m)link=&(*link)->next;
-    *link=m->next;m->next=NULL;
+/* Its owner's space lock and shared_lock held: m, its va and bytes set, joins its owner's tree. */
+static void shared_owner_link(struct shared_mapping *m) {
+    m->span.start=m->va;m->span.length=m->bytes;
+    span_insert(&m->owner->shared_mappings,&m->span);
+}
+/* Its owner's space lock and shared_lock held: m leaves its owner's tree. */
+static void shared_owner_unlink(struct shared_mapping *m) { span_remove(&m->owner->shared_mappings,&m->span); }
+static struct shared_mapping *shared_mapping_of(struct span *s) {
+    return s?(struct shared_mapping *)((char *)s-__builtin_offsetof(struct shared_mapping,span)):NULL;
+}
+/* The owner's space lock or shared_lock held: the mapping that holds va, or NULL. */
+static struct shared_mapping *shared_mapping_at(const struct process *owner,uint64_t va) {
+    return shared_mapping_of(span_at(&owner->shared_mappings,va));
 }
 static size_t shared_slots(const struct shared_pages *p) {
     return p->kind==SHARED_DEMAND?(p->count+SHARED_LEAF-1)/SHARED_LEAF:p->kind==SHARED_RAM?p->count:0;
@@ -1689,9 +1697,8 @@ int program_map(struct process *owner,struct program *prog,struct handle *doc,ui
         prog->segments=fresh;
     }
     object_ref(&p->object); /* the mapping's */
-    *m=(struct shared_mapping){.next=owner->shared_mappings,.object=&p->object,.va=start,.flags=flags,
-                               .bytes=end-start,.owner=owner};
-    owner->shared_mappings=m;shared_all_link(m);
+    *m=(struct shared_mapping){.object=&p->object,.va=start,.flags=flags,.bytes=end-start,.owner=owner};
+    shared_owner_link(m);shared_all_link(m);
     spin_give(&shared_lock);
     spin_unlock(&owner->space.lock,lock);
     return 0;
@@ -1829,8 +1836,7 @@ static bool shared_fault(uint64_t addr,bool write,bool *slept) {
 again:;
     uint64_t lock=spin_lock(&shared_lock);bool ok=false,starved=false;
     struct shared_pages *fill=NULL;struct handle *source=NULL;size_t at=0;
-    for(struct shared_mapping *m=owner->shared_mappings;m;m=m->next){
-        if(page<m->va || page-m->va>=m->bytes)continue;
+    for(struct shared_mapping *m=shared_mapping_at(owner,page);m;m=NULL){ /* the one, left by break */
         if(m->building || m->leaving)break;
         struct shared_pages *p=m->object->priv;
         if(shared_cancelled(p))break;
@@ -1911,7 +1917,17 @@ bool shared_demand_fault(uint64_t addr,bool write) { return shared_fault(addr,wr
    overlaps it waits until it is done, so a release or protection never meets a range half made,
    half gone or given out again. The space lock is held only briefly (no sleep, no copy, no page
    table work but one page's): the page tables change with it let go. */
-struct mmap_hole { struct mmap_hole *next; uint64_t va, len; };
+/* A free range of a region below its frontier, in the region's tree: a fit is found in O(log n),
+   the lowest first. next: on a list of records to free after the space lock. */
+struct mmap_hole { struct span span; struct mmap_hole *next; };
+static struct mmap_hole *hole_of(struct span *s) {
+    return s ? (struct mmap_hole *)((char *)s - __builtin_offsetof(struct mmap_hole, span)) : NULL;
+}
+static void hole_gone(struct span_tree *t, struct mmap_hole *h, struct mmap_hole **gone) {
+    span_remove(t, &h->span);
+    h->next = *gone;
+    *gone = h;
+}
 struct space_op { struct space_op *next; uint64_t va, end; };
 static void holes_free(struct mmap_hole *h) {
     while (h) { struct mmap_hole *next = h->next; kfree(h); h = next; }
@@ -1924,32 +1940,41 @@ static void hole_add_locked(struct process *owner, uint64_t va, uint64_t len, st
                             struct mmap_hole **gone) {
     if (!len || owner->space_ended) return;
     bool low = va < USER_MMAP_BASE;
-    struct mmap_hole **holes = low ? &owner->low_holes : &owner->mmap_holes;
+    struct span_tree *holes = low ? &owner->low_holes : &owner->mmap_holes;
     uint64_t *next = low ? &owner->low_next : &owner->mmap_next;
-    struct mmap_hole **link = holes, *prev = NULL;
-    while (*link && (*link)->va + (*link)->len < va) { prev = *link; link = &(*link)->next; }
-    struct mmap_hole *h = *link;
-    if (h && h->va <= va + len) {
-        /* Overlapping or adjacent: the union, swallowing later neighbours. */
-        uint64_t end = MAX(h->va + h->len, va + len);
-        h->va = MIN(h->va, va); h->len = end - h->va;
-        while (h->next && h->next->va <= h->va + h->len) {
-            struct mmap_hole *n = h->next;
-            end = MAX(h->va + h->len, n->va + n->len); h->len = end - h->va;
-            h->next = n->next; n->next = *gone; *gone = n;
+    /* the union with the holes it overlaps or touches, which go */
+    uint64_t start = va, end = va + len;
+    struct mmap_hole *h = hole_of(span_below(holes, va + 1)); /* the last starting at or below va */
+    if (!h || h->span.start + h->span.length < va) h = hole_of(span_from(holes, va));
+    struct mmap_hole *kept = NULL;
+    while (h && h->span.start <= end) {
+        struct mmap_hole *after = hole_of(span_from(holes, h->span.start + h->span.length));
+        start = MIN(start, h->span.start);
+        end = MAX(end, h->span.start + h->span.length);
+        span_remove(holes, &h->span);
+        if (kept) {
+            h->next = *gone;
+            *gone = h;
+        } else {
+            kept = h;
         }
-    } else if (*spare) {
-        struct mmap_hole *s = *spare;
-        *spare = NULL;
-        *s = (struct mmap_hole){ .next = h, .va = va, .len = len };
-        *link = h = s;
-    } else return;
-    /* The last hole simply lowers the reservation frontier. */
-    if (!h->next && h->va + h->len >= *next) {
-        *next = h->va;
-        if (prev) prev->next = NULL; else *holes = NULL;
-        h->next = *gone; *gone = h;
+        h = after;
     }
+    if (!kept) {
+        if (!*spare) return;
+        kept = *spare;
+        *spare = NULL;
+    }
+    /* the last hole simply lowers the reservation frontier */
+    if (end >= *next && !span_from(holes, end)) {
+        *next = start;
+        kept->next = *gone;
+        *gone = kept;
+        return;
+    }
+    kept->span.start = start;
+    kept->span.length = end - start;
+    span_insert(holes, &kept->span);
 }
 /* Any CPU, no lock held: [va, va+len) of owner's space is free again (a thread's stack, a
    window's buffers). */
@@ -1964,16 +1989,22 @@ void mmap_hole_add(struct process *owner, uint64_t va, uint64_t len) {
 }
 /* Space lock held: len bytes and a guard page from a region's holes (first fit), else at its
    frontier below top; 0 when neither has room. A hole used up goes to *gone. */
-static uint64_t region_take_locked(struct mmap_hole **holes, uint64_t *next, uint64_t top, uint64_t len,
+static uint64_t region_take_locked(struct span_tree *holes, uint64_t *next, uint64_t top, uint64_t len,
                                    struct mmap_hole **gone) {
     if (!len || len > top) return 0;
     uint64_t need = len + PAGE_SIZE;
-    for (struct mmap_hole **link = holes; *link; link = &(*link)->next) {
-        struct mmap_hole *h = *link;
-        if (h->len < need) continue;
-        uint64_t va = h->va;
-        h->va += need; h->len -= need;
-        if (!h->len) { *link = h->next; h->next = *gone; *gone = h; }
+    struct mmap_hole *h = hole_of(span_fit(holes, need));
+    if (h) {
+        uint64_t va = h->span.start;
+        span_remove(holes, &h->span);
+        if (h->span.length == need) {
+            h->next = *gone;
+            *gone = h;
+        } else {
+            h->span.start += need;
+            h->span.length -= need;
+            span_insert(holes, &h->span);
+        }
         return va;
     }
     uint64_t va = *next;
@@ -1999,13 +2030,13 @@ uint64_t mmap_reserve(struct process *owner, uint64_t len) {
 }
 /* The app's end: its holes go, and its space takes no reservation or hole again. */
 static void mmap_holes_free(struct process *owner) {
+    struct mmap_hole *gone = NULL;
     uint64_t lock = spin_lock(&owner->space.lock);
-    struct mmap_hole *high = owner->mmap_holes, *low = owner->low_holes;
-    owner->mmap_holes = owner->low_holes = NULL;
+    for (struct mmap_hole *h; (h = hole_of(span_from(&owner->mmap_holes, 0)));) hole_gone(&owner->mmap_holes, h, &gone);
+    for (struct mmap_hole *h; (h = hole_of(span_from(&owner->low_holes, 0)));) hole_gone(&owner->low_holes, h, &gone);
     owner->space_ended = true;
     spin_unlock(&owner->space.lock, lock);
-    holes_free(high);
-    holes_free(low);
+    holes_free(gone);
 }
 /* Space lock held: whether an operation is at part of [va, end). */
 static bool space_busy(const struct process *owner, uint64_t va, uint64_t end) {
@@ -2051,16 +2082,18 @@ static bool space_free_overlap(const struct process *owner, uint64_t va, uint64_
         uint64_t top = low ? USER_LOW_TOP : USER_STACK_TOP - USER_STACK_MAX;
         uint64_t next = low ? owner->low_next : owner->mmap_next;
         if (MAX(va, next) < MIN(end, top)) return true;
-        for (const struct mmap_hole *h = low ? owner->low_holes : owner->mmap_holes; h; h = h->next)
-            if (va < h->va + h->len && h->va < end) return true;
+        const struct span_tree *holes = low ? &owner->low_holes : &owner->mmap_holes;
+        const struct span *h = span_at(holes, va);
+        if (!h) h = span_from(holes, va);
+        if (h && h->start < end) return true;
     }
     return false;
 }
 /* Space lock held: the first mapping that overlaps [va, end), or NULL. */
 static struct shared_mapping *space_mapping(const struct process *owner, uint64_t va, uint64_t end) {
-    struct shared_mapping *m = owner->shared_mappings;
-    while (m && !(va < m->va + m->bytes && m->va < end)) m = m->next;
-    return m;
+    struct shared_mapping *m = shared_mapping_at(owner, va);
+    if (!m) m = shared_mapping_of(span_from(&owner->shared_mappings, va));
+    return m && m->va < end ? m : NULL;
 }
 
 static void shared_unmap(struct process *owner,struct shared_mapping *m,struct space_op *op,bool hole);
@@ -2101,7 +2134,7 @@ static int64_t sys_shared_map(int h,size_t bytes,int access) {
     if(va){
         shared_dma_maps(p,true);
         m->va=va;m->cancelled=shared_cancelled(p) || shared_device_gone(p,NULL);
-        m->next=owner->shared_mappings;owner->shared_mappings=m;
+        shared_owner_link(m);
         shared_all_link(m);
     }
     spin_give(&shared_lock);
@@ -2180,7 +2213,7 @@ void sys_shared_cleanup(struct process *owner) {
         struct space_op op;
         uint64_t lock=spin_lock(&owner->space.lock);
         spin_take(&shared_lock);
-        struct shared_mapping *m=owner->shared_mappings;
+        struct shared_mapping *m=shared_mapping_of(span_from(&owner->shared_mappings,0));
         if(m){
             ASSERT(!m->building && !m->leaving);
             m->leaving=true;space_op_add(owner,&op,m->va,m->va+m->bytes);
