@@ -29,7 +29,7 @@ int css_decl_set(const char *block, size_t n, const char *property, const char *
 bool css_decl_block_serialize(const char *block, size_t n, css_decl_check *check, sbuf *out, sbuf *names);
 
 /* js_webidl.c times its pass for the realm's setup trace, which the host does not print */
-uint64_t uptime_ms(void) { return 0; }
+uint64_t n_clock_monotonic(void){return (uint64_t)(0)*1000000ULL;}
 
 static void exception(JSContext *ctx) {
     JSValue e = JS_GetException(ctx), stack = JS_GetPropertyStr(ctx, e, "stack");

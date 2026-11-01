@@ -13,9 +13,9 @@
 #include "../user/include/http.h"
 struct net_stream{SOCKET socket;uint64_t sent;char error[128];int (*cancelled)(void*);void *ctx;bool h2_model;};
 static void error(net_stream *s){int e=WSAGetLastError();errno=e==WSAETIMEDOUT?ETIMEDOUT:e==WSAECONNRESET?ECONNRESET:EIO;snprintf(s->error,sizeof s->error,"winsock %d",e);}
-uint64_t uptime_ms(void){return GetTickCount64();}
+uint64_t n_clock_monotonic(void){return (uint64_t)(GetTickCount64())*1000000ULL;}
 void yield(void){SwitchToThread();}
-void n_sleep_ms(uint64_t n){Sleep((DWORD)n);}
+void n_sleep_until(uint64_t d){uint64_t now=n_clock_monotonic();if(d>now)Sleep((DWORD)((d-now+999999)/1000000));}
 struct native_thread{void (*fn)(void*);void *arg;};
 static DWORD WINAPI run_thread(void *arg){struct native_thread t=*(struct native_thread*)arg;free(arg);t.fn(t.arg);return 0;}
 int thread_create(void (*fn)(void*),void *arg){struct native_thread *t=malloc(sizeof *t);if(!t)return -1;t->fn=fn;t->arg=arg;HANDLE h=CreateThread(NULL,0,run_thread,t,0,NULL);return h?(int)(intptr_t)h:-1;}

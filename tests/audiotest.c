@@ -94,7 +94,7 @@ static int run_quiet(const char *const *args, uint32_t argc) {
     n_handle app = start_quiet(args[0], args, argc);
     if (app < 0) return -1;
     int st = -1;
-    n_app_result(app, -1, &st);
+    n_app_result(app, N_CLOCK_NEVER, &st);
     n_handle_close(app);
     return st;
 }
@@ -132,17 +132,17 @@ int main(void) {
         tone[2 * i] = (int16_t)(20000 * sin(2 * PI * 1000 * i / 48000));
         tone[2 * i + 1] = (int16_t)(20000 * sin(2 * PI * 1500 * i / 48000));
     }
-    uint64_t t0 = uptime_ms();
+    uint64_t t0 = (n_clock_monotonic() / N_NS_PER_MS);
     CHECK(submit_all(a, tone, 48000), "submitting the tone");
     struct n_audio_status st;
     CHECK(n_audio_status(a, &st) == 0 && st.queued_frames > 0 && st.queued_frames <= 8192 &&
               st.committed_frames == 48000,
           "after submitting: %u queued, %llu committed", st.queued_frames, (unsigned long long)st.committed_frames);
     n_handle_close(a);
-    uint64_t took = uptime_ms() - t0;
+    uint64_t took = (n_clock_monotonic() / N_NS_PER_MS) - t0;
     CHECK(took >= 950 && took <= 1400, "1 s of sound took %lu ms to play", (unsigned long)took);
     printf("1 s of sound played in %lu ms\n", (unsigned long)took);
-    n_sleep_ms(300);
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
 
     /* a submitter that does not wait: the stream takes 8192 frames at most */
     a = n_audio_open();
@@ -155,10 +155,10 @@ int main(void) {
     n_handle q = n_events_create();
     n_events_watch(q, a, N_EVENT_SENDABLE, 7);
     struct n_event ev;
-    t0 = uptime_ms();
-    n_result got = n_events_wait(q, &ev, 1, 1000);
-    CHECK(got == 1 && ev.token == 7 && (ev.events & N_EVENT_SENDABLE) && uptime_ms() - t0 < 500,
-          "waiting for room: %ld after %lu ms", (long)got, (unsigned long)(uptime_ms() - t0));
+    t0 = (n_clock_monotonic() / N_NS_PER_MS);
+    n_result got = n_events_wait(q, &ev, 1, n_clock_after(1000 * N_NS_PER_MS));
+    CHECK(got == 1 && ev.token == 7 && (ev.events & N_EVENT_SENDABLE) && (n_clock_monotonic() / N_NS_PER_MS) - t0 < 500,
+          "waiting for room: %ld after %lu ms", (long)got, (unsigned long)((n_clock_monotonic() / N_NS_PER_MS) - t0));
     n_handle_close(q);
     CHECK(n_audio_flush(a) == 0 && n_audio_status(a, &st) == 0 && st.queued_frames == 0, "a flushed stream holds %u",
           st.queued_frames);
@@ -170,10 +170,10 @@ int main(void) {
     for (int i = 0; i < 9; i++) as[i] = n_audio_open();
     for (int i = 0; i < 8; i++) CHECK(n_audio_submit(as[i], zero, 1200, 0) == 1200, "stream %d", i);
     CHECK(as[8] == -N_ERR_BUSY, "a ninth stream: %s", n_result_text(as[8]));
-    t0 = uptime_ms();
+    t0 = (n_clock_monotonic() / N_NS_PER_MS);
     for (int i = 0; i < 9; i++)
         if (as[i] >= 0) n_handle_close(as[i]);
-    CHECK(uptime_ms() - t0 < 400, "closing eight streams took %lu ms", (unsigned long)(uptime_ms() - t0));
+    CHECK((n_clock_monotonic() / N_NS_PER_MS) - t0 < 400, "closing eight streams took %lu ms", (unsigned long)((n_clock_monotonic() / N_NS_PER_MS) - t0));
 
     /* the master volume and muting, and what plays the sound (the card this test records) */
     struct n_audio_output out = {0};
@@ -207,9 +207,9 @@ int main(void) {
     /* a melody, at volume 0 so that the recording stays as described above */
     set_volume(0);
     const char *margs[] = {BEEP, "-l", "50", "C4", "E4", "G4", "C5:100", "R", "Bb3"};
-    t0 = uptime_ms();
+    t0 = (n_clock_monotonic() / N_NS_PER_MS);
     CHECK(run_quiet(margs, 9) == 0, "beep with a melody failed");
-    took = uptime_ms() - t0;
+    took = (n_clock_monotonic() / N_NS_PER_MS) - t0;
     CHECK(took >= 330 && took <= 700, "a 350 ms melody took %lu ms", (unsigned long)took);
     set_volume(80);
 
@@ -232,12 +232,12 @@ int main(void) {
         make_wav(wav, wavs[i].tag, wavs[i].bits, wavs[i].ch, wavs[i].rate, wavs[i].fl, wavs[i].fr, 0.5,
                  wavs[i].ext);
         const char *pargs[] = {PLAY, "-q", wav};
-        t0 = uptime_ms();
+        t0 = (n_clock_monotonic() / N_NS_PER_MS);
         int rc = run_quiet(pargs, 3);
-        took = uptime_ms() - t0;
+        took = (n_clock_monotonic() / N_NS_PER_MS) - t0;
         CHECK(rc == 0, "play %s: exit %d", wavs[i].name, rc);
         CHECK(took >= 450 && took <= 900, "play %s took %lu ms", wavs[i].name, (unsigned long)took);
-        n_sleep_ms(300);
+        n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
         n_entry_remove(wav);
     }
     in_temp(NULL, "bad.wav", wav, sizeof wav);
@@ -248,13 +248,13 @@ int main(void) {
 
     /* beep: a plain tone, bad arguments, and being stopped while it plays */
     const char *bargs[] = {BEEP, "-l", "400"};
-    t0 = uptime_ms();
+    t0 = (n_clock_monotonic() / N_NS_PER_MS);
     CHECK(run_quiet(bargs, 3) == 0, "beep failed");
-    took = uptime_ms() - t0;
+    took = (n_clock_monotonic() / N_NS_PER_MS) - t0;
     CHECK(took >= 380 && took <= 800, "beep -l 400 took %lu ms", (unsigned long)took);
     const char *nargs[] = {BEEP, "H9"};
     CHECK(run_quiet(nargs, 2) == 2, "beep H9 should be refused");
-    n_sleep_ms(300);
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
 
     /* the Sound Player plays the file it is opened with (alone in its folder, so nothing follows) */
     char ptest[4096], tone_path[4096];
@@ -264,24 +264,24 @@ int main(void) {
     make_wav(tone_path, 1, 16, 2, 32000, 1200, 750, 0.6, false);
     int id = gui_launch("player", tone_path);
     CHECK(id > 0, "the Sound Player did not start (%d)", id);
-    n_sleep_ms(1300);
+    n_sleep_until(n_clock_after(1300 * N_NS_PER_MS));
     if (id > 0) {
         n_handle player = n_app_open(id);
         CHECK(player >= 0 && n_app_stop(player, 0) == 0, "the Sound Player quit by itself");
         if (player >= 0) {
-            n_app_result(player, -1, NULL);
+            n_app_result(player, N_CLOCK_NEVER, NULL);
             n_handle_close(player);
         }
     }
-    n_sleep_ms(300);
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
     const char *largs[] = {BEEP, "-l", "10000", "-f", "300"};
     n_handle beep = start_quiet(BEEP, largs, 5);
-    n_sleep_ms(300);
-    t0 = uptime_ms();
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
+    t0 = (n_clock_monotonic() / N_NS_PER_MS);
     n_app_stop(beep, 0);
-    n_app_result(beep, -1, NULL);
+    n_app_result(beep, N_CLOCK_NEVER, NULL);
     n_handle_close(beep);
-    CHECK(uptime_ms() - t0 < 300, "a stopped beep took %lu ms to go", (unsigned long)(uptime_ms() - t0));
+    CHECK((n_clock_monotonic() / N_NS_PER_MS) - t0 < 300, "a stopped beep took %lu ms to go", (unsigned long)((n_clock_monotonic() / N_NS_PER_MS) - t0));
 
     printf("audiotest: %d failed\n", failed);
     return failed != 0;

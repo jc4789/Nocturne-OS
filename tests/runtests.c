@@ -561,19 +561,19 @@ static int run_shell(const char *cmd, int timeout_ms, struct capture *c, int *st
     }
     n_events_watch(q, app, N_EVENT_APP_ENDED, 1);
     n_events_watch(q, out[0], N_EVENT_RECEIVABLE, 2);
-    uint64_t deadline = uptime_ms() + (uint64_t)timeout_ms;
+    uint64_t deadline = (n_clock_monotonic() / N_NS_PER_MS) + (uint64_t)timeout_ms;
     int result = 0;
     for (;;) {
         drain(out[0], c);
         if (n_app_result(app, 0, status) == 0) { drain(out[0], c); result = 1; break; }
-        uint64_t now = uptime_ms();
+        uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
         if (now >= deadline) break;
         struct n_event e;
-        n_events_wait(q, &e, 1, (int64_t)(deadline - now));
+        n_events_wait(q, &e, 1, deadline * N_NS_PER_MS);
     }
     if (!result) {
         n_app_stop(app, N_APP_STOP_TREE);
-        n_app_result(app, -1, status);
+        n_app_result(app, N_CLOCK_NEVER, status);
         drain(out[0], c);
     }
     if (!c->text) c->text = strdup("");
@@ -601,7 +601,7 @@ static void show_output(const char *out) {
 
 static void run(const struct test *t) {
     int nfail_before = nfail;
-    uint64_t t0 = uptime_ms();
+    uint64_t t0 = (n_clock_monotonic() / N_NS_PER_MS);
     int timeout = (t->timeout_s ? t->timeout_s : 15) * 1000, st = 0;
     struct capture cap = {0};
     remove_tree(work_folder); /* left by a run that was stopped */
@@ -647,7 +647,7 @@ static void run(const struct test *t) {
         result("FAIL", t, why);
         nfail++;
     } else {
-        snprintf(why, sizeof why, "%lu ms", (unsigned long)(uptime_ms() - t0));
+        snprintf(why, sizeof why, "%lu ms", (unsigned long)((n_clock_monotonic() / N_NS_PER_MS) - t0));
         result("PASS", t, why);
         npass++;
     }
@@ -690,7 +690,7 @@ int main(int argc, char **argv) {
     /* the disk has LLVM when its Nocturne build was made (ports/llvm/README.md) */
     bool have_llvm = n_entry_info("C:\\Nocturne\\System\\llvm", &st) == 0;
     printf("TESTS BEGIN\n");
-    uint64_t t0 = uptime_ms();
+    uint64_t t0 = (n_clock_monotonic() / N_NS_PER_MS);
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         const struct test *t = &tests[i];
         if (nonly) {
@@ -713,11 +713,11 @@ int main(int argc, char **argv) {
         static bool net_waited;
         if (!net_waited && (!strcmp(t->group, "tcp") || !strcmp(t->group, "tcpperf") || !strcmp(t->group, "net") || !strcmp(t->name, "worker-network"))) {
             net_waited = true;
-            if (!net_wait_up(20000)) printf("runtests: the network did not come up\n");
+            if (!net_wait_up(n_clock_after(20000 * N_NS_PER_MS))) printf("runtests: the network did not come up\n");
         }
         run(t);
     }
     free(only);
-    printf("TESTS DONE pass=%d fail=%d skip=%d (%lu s)\n", npass, nfail, nskip, (unsigned long)((uptime_ms() - t0) / 1000));
+    printf("TESTS DONE pass=%d fail=%d skip=%d (%lu s)\n", npass, nfail, nskip, (unsigned long)(((n_clock_monotonic() / N_NS_PER_MS) - t0) / 1000));
     return nfail != 0;
 }

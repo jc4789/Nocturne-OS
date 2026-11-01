@@ -34,7 +34,7 @@ int main(int argc,char **argv) {
     struct web_host host={.console=receive,.scroll=scroll};
     web_doc *doc=web_live(html,length,"https://hover.invalid/",NULL,&host);free(html);
     if(!doc)return 1;
-    for(int i=0;i<200&&!ready&&!errors;i++)web_tick(doc,uptime_ms());
+    for(int i=0;i<200&&!ready&&!errors;i++)web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));
     if(!ready){printf("hovertest: bootstrap not ready\n");web_free(doc);return 1;}
     web_layout(doc,800,600);
     for(int i=0;i<32&&!done&&!errors;i++) {

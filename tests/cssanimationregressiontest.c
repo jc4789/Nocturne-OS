@@ -18,7 +18,7 @@ static web_doc *load(const char *css) {
     const char *markup="<!doctype html><html><head></head><body></body></html>";
     web_doc *d=web_live(markup,strlen(markup),"https://css-animation.test/","utf-8",NULL);
     if(!d)return NULL;
-    for(int i=0;i<8;i++)web_tick(d,uptime_ms());
+    for(int i=0;i<8;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     node_t *s=doc_node_create(d,N_ELEM,"style",NULL,0);
     if(!s || !doc_node_text(d,s,css,strlen(css))){web_free(d);return NULL;}
     doc_node_move(d,d->head,s,NULL);return d;
@@ -100,17 +100,17 @@ static void lifecycle(void) {
     node_t *a=element(d,d->body,"animation:fade 1s linear -.25s both paused");layout(d);
     struct web_animation *identity=a->owned;
     check("paused initial negative delay",opacity(a,.25));
-    n_sleep_ms(20);restyle(d,a);check("paused wall time does not advance",opacity(a,.25));
+    n_sleep_until(n_clock_after(20 * N_NS_PER_MS));restyle(d,a);check("paused wall time does not advance",opacity(a,.25));
     d->style_full_dirty=d->need_style=d->need_boxes=true;layout(d);
     check("full style rebuild retains playback",identity && a->owned==identity && opacity(a,.25));
     doc_node_attr(d,a,"style","animation:fade 1s linear -.25s both");layout(d);
     check("resume schedules native frame",web_animations_deadline(d)>=0);
     /* the pending play task at the next frame: the start time is that frame's time */
-    web_animations_tick(d,uptime_ms());layout(d);
-    n_sleep_ms(35);web_animations_tick(d,uptime_ms());layout(d);
+    web_animations_tick(d,(n_clock_monotonic() / N_NS_PER_MS));layout(d);
+    n_sleep_until(n_clock_after(35 * N_NS_PER_MS));web_animations_tick(d,(n_clock_monotonic() / N_NS_PER_MS));layout(d);
     check("resume advances actual native time",a->style->opacity>.27f && a->style->opacity<.6f);
     doc_node_attr(d,a,"style","animation:fade 1s linear -.25s both paused");layout(d);
-    n_sleep_ms(20);restyle(d,a);;
+    n_sleep_until(n_clock_after(20 * N_NS_PER_MS));restyle(d,a);;
     ;
     doc_node_attr(d,a,"style","opacity:.4;animation:none");layout(d);
     ;
@@ -122,8 +122,8 @@ static void lifecycle(void) {
     check("display restoration restarts",opacity(a,0));
     doc_node_remove(d,a);;
     doc_node_move(d,d->body,a,NULL);layout(d);check("reconnection starts fresh",opacity(a,0));
-    doc_node_attr(d,a,"style","animation:fade 40ms linear forwards");layout(d);web_animations_tick(d,uptime_ms());
-    n_sleep_ms(65);web_animations_tick(d,uptime_ms());layout(d);
+    doc_node_attr(d,a,"style","animation:fade 40ms linear forwards");layout(d);web_animations_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
+    n_sleep_until(n_clock_after(65 * N_NS_PER_MS));web_animations_tick(d,(n_clock_monotonic() / N_NS_PER_MS));layout(d);
     ;
     ;
     doc_node_attr(d,a,"style","opacity:.4;animation:fade 0s linear");layout(d);
@@ -157,7 +157,7 @@ static void cssom_scope(void) {
     const char *ordinary=".ordinary{opacity:.4}";
     (void)(cssom_insert(s,0,ordinary,strlen(ordinary),0)==CSSOM_OK);layout(d);
     check("insert rebuilt keyframes still sample",opacity(a,.45));
-    (void)(cssom_delete(s,0,1)==CSSOM_OK);layout(d);web_animations_tick(d,uptime_ms());
+    (void)(cssom_delete(s,0,1)==CSSOM_OK);layout(d);web_animations_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     check("deleted keyframe stops effect and identity",opacity(a,.1) && a->owned==NULL);
     const char *media="@media print{@keyframes same{to{opacity:.9}}}@media screen{@keyframes same{to{opacity:.35}}}"
         ".sample{opacity:.1;animation:same 0s forwards}";
@@ -182,7 +182,7 @@ static void initial_transform(void) {
     struct web_host host={.console=console,.script_checkpoint=checkpoint};
     web_doc *d=web_live(html,strlen(html),"https://css-animation.test/","utf-8",&host);
     if(!d){js_checks++;js_failures++;return;}
-    for(int i=0;i<8;i++)web_tick(d,uptime_ms());layout(d);
+    for(int i=0;i<8;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));layout(d);
     const char *script="console.log('CSSREG '+(getComputedStyle(document.getElementById('t')).transform==='none'&&CSS.supports('transform','translateX(1px)')&&!CSS.supports('transform','translateX(1deg)')?'PASS ':'FAIL ')+'initial-transform')";
     if(!web_console_eval(d,script,strlen(script)) || js_checks!=1){js_checks=1;js_failures++;}
     web_free(d);

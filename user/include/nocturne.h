@@ -21,8 +21,6 @@ typedef int64_t n_result;
 
 /* malloc's heap: bytes in its n_memory regions, and bytes in allocated blocks. */
 void malloc_usage(size_t *heap, size_t *used);
-uint64_t uptime_ms(void);
-uint64_t uptime_us(void); /* the same clock in microseconds, for timing short work */
 /* Native memory (docs/nocturne-native-abi.md §7): zero-filled pages with
  * N_MEMORY_READ, _READ_WRITE or _READ_EXECUTE access; reserve also takes
  * N_MEMORY_LOW added to the access, for pages below 2 GiB. reserve puts the
@@ -103,7 +101,7 @@ n_handle n_channel_connect(const char *key);
 n_handle n_channel_accept(n_handle listener);
 /* Apps: the handle reports the end (N_EVENT_APP_ENDED); there is no zombie to reap. */
 n_handle n_app_launch(const char *path, const struct n_launch *launch);
-n_result n_app_result(n_handle app, int64_t timeout_ms, int *status); /* -1 waits; 0 polls */
+n_result n_app_result(n_handle app, uint64_t deadline, int *status); /* a past deadline polls: N_ERR_NOT_READY */
 n_result n_app_stop(n_handle app, int flags);                         /* N_APP_STOP_TREE */
 n_result n_app_self(void);
 n_result n_app_parent(void);
@@ -131,9 +129,9 @@ n_handle n_pci_bar(n_handle pci, uint32_t bar);
 /* Turn on `count` message-signalled interrupts (MSI-X if offered, else MSI; count is rounded
    down to what the function and the system give) and return how many. Each one that arrives
    sets its bit until n_pci_interrupt_take returns it; the handle is N_EVENT_RECEIVABLE while a
-   bit is set. take waits up to timeout_ms (-1 always, 0 not at all; N_ERR_TIMEOUT). */
+   bit is set. take waits until deadline (N_CLOCK_NEVER: no limit; N_ERR_TIMEOUT). */
 n_result n_pci_interrupts(n_handle pci, uint32_t count);
-n_result n_pci_interrupt_take(n_handle pci, int64_t timeout_ms);
+n_result n_pci_interrupt_take(n_handle pci, uint64_t deadline);
 /* While the driver changes how the CPU reaches the boot screen in the function's BAR (as
    n_pci_info reports it), the system must not write there. hold true returns once nothing is
    being written and keeps the screen untouched; holds nest, and the last false (or the end of
@@ -170,10 +168,10 @@ n_result n_pci_hold_screen(n_handle pci, bool hold);
    unknown format, a range beyond the object, or nothing to give back. */
 n_result n_pci_give_screen(n_handle pci, uint32_t output, const struct n_screen_buffers *buffers);
 /* The flips the screens ask of the claim's outputs (struct n_screen_flip), at most max into out,
-   waiting up to timeout_ms (-1: no limit) for one: their count, 0 when the time ran out. A flip
+   waiting until deadline (N_CLOCK_NEVER: no limit) for one: their count, 0 at the deadline. A flip
    not taken yet is replaced by the output's next one. The driver shows the flip's buffer from the
    next vertical blank on and says so with n_pci_screen_vblank. */
-n_result n_pci_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max, int64_t timeout_ms);
+n_result n_pci_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max, uint64_t deadline);
 /* A vertical blank of an output whose buffers its screen is drawn into (struct n_screen_vblank):
    the moment the display engine measured, on the system's monotonic clock, and the flip it shows.
    The screen's next frame waits for the flip's blank; a screen without blanks reported shows
@@ -193,13 +191,13 @@ n_result n_pci_screen_vblank(n_handle pci, const struct n_screen_vblank *vblank)
    size above 65535. */
 n_result n_pci_screen_modes(n_handle pci, uint32_t output, const struct n_screen_modes *modes);
 /* For the driver whose buffers an output's screen is drawn into or whose modes on it the system
-   has: waits up to timeout_ms (-1: no limit) while the screen's state is still the one numbered
-   seen (0 never is), then writes it to out (struct n_screen_state says the mode to show, and with
+   has: waits until deadline (N_CLOCK_NEVER: no limit) while the screen's state is still the one
+   numbered seen (0 never is), then writes it to out (struct n_screen_state says the mode to show, and with
    N_SCANOUT_DIRECT what the driver shows and draws while an app's window is shown directly).
    N_ERR_TIMEOUT: out is the state numbered seen. N_ERR_DENIED: the output shows no buffers of
    this claim and it offered no modes there. */
 n_result n_pci_screen_state(n_handle pci, uint32_t output, uint64_t seen, struct n_screen_state *out,
-                            int64_t timeout_ms);
+                            uint64_t deadline);
 /* For that driver: a surface the output's display engine may show in its buffers' place (an app's
    image shown directly), given as a buffer is (format without N_SCANOUT_DIRECT; N_SCANOUT_XBGR8888
    too), of its own size (the engine may scale it to the mode's). The system never draws there but
@@ -233,7 +231,7 @@ n_result n_pci_screen_image_end(n_handle pci, n_result image);
    N_ERR_NOT_FOUND: the function has no node). */
 n_result n_pci_acpi_eval(n_handle pci, uint32_t node, const char *name, const struct n_acpi_value *args,
                          uint32_t nargs, const void *data, size_t data_size, void *out, size_t out_size);
-n_result n_pci_acpi_notify_take(n_handle pci, int64_t timeout_ms);
+n_result n_pci_acpi_notify_take(n_handle pci, uint64_t deadline);
 /* Zeroed RAM that a claimed function may read and write by DMA: a shared object (N_DMA_*
    flags), held while any handle or mapping holds it. n_dma_addresses gives the bus address of
    each page from first_page (count of them; returns how many it wrote). */
@@ -256,7 +254,7 @@ n_result n_shared_revoke(n_handle view);
    ordinary N_KIND_SHARED handle to map or to send) whose pages the creating app, its pager,
    supplies through the returned N_KIND_PAGER handle, which no other app can use or receive.
    A touch of a page without the access it needs waits until the pager answered it:
-   n_pager_take gives such faults (up to max; timeout_ms -1 waits, 0 polls: N_ERR_TIMEOUT;
+   n_pager_take gives such faults (up to max, waiting until deadline: N_ERR_TIMEOUT;
    N_ERR_CLOSED once the memory is gone), and the handle is N_EVENT_RECEIVABLE while some wait.
    n_pager_supply binds runs of pages to RAM the pager holds (write-back; a DMA object's too),
    given as a root or a view of one (not a composite), which every mapper then reaches without
@@ -266,7 +264,7 @@ n_result n_shared_revoke(n_handle view);
    touches of a run access violations. When the pager handle closes, bound pages stay and the
    others fail. Paged memory has no views; n_memory_protect holds for its unbound pages too. */
 n_handle n_pager_create(size_t bytes, n_handle *memory);
-n_result n_pager_take(n_handle pager, struct n_pager_fault *out, size_t max, int64_t timeout_ms);
+n_result n_pager_take(n_handle pager, struct n_pager_fault *out, size_t max, uint64_t deadline);
 n_result n_pager_supply(n_handle pager, const struct n_pager_supply *runs, size_t count);
 n_result n_pager_revoke(n_handle pager, uint64_t offset, uint64_t bytes, uint32_t access);
 n_result n_pager_fail(n_handle pager, uint64_t offset, uint64_t bytes);
@@ -295,13 +293,18 @@ n_result n_watch_take(n_handle watch);
 n_handle n_events_create(void);
 n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t token);
 n_result n_events_watch_address(n_handle q, volatile uint32_t *address, uint32_t expected, uint64_t token);
-n_result n_events_timer(n_handle q, uint64_t ms, bool repeat, uint64_t token);
+/* A timer due at a moment of the monotonic clock, then every period ns on its grid (0: once). */
+n_result n_events_timer(n_handle q, uint64_t due, uint64_t period, uint64_t token);
 n_result n_events_unwatch(n_handle q, uint64_t token); /* 0 unknown, 1 removed, 2 already notified */
-n_result n_events_wait(n_handle q, struct n_event *out, size_t max, int64_t timeout_ms); /* count */
-uint64_t n_clock_uptime_ms(void);
+n_result n_events_wait(n_handle q, struct n_event *out, size_t max, uint64_t deadline); /* count, 0 at the deadline */
+/* The clocks in ns (abi.h), read without a call: monotonic (stands still while the machine sleeps;
+   every deadline is on it), boot (goes on through sleep), wall (Unix time). */
+uint64_t n_clock_monotonic(void);
+uint64_t n_clock_boot(void);
+int64_t n_clock_wall(void);
+uint64_t n_clock_after(uint64_t ns); /* the deadline ns from now (N_CLOCK_NEVER past the clock's end) */
+void n_sleep_until(uint64_t deadline);
 n_result n_random(void *buf, size_t n); /* n bytes from the system entropy pool */
-int64_t n_clock_wall(void); /* seconds since 1970-01-01 UTC */
-void n_sleep_ms(uint64_t ms);
 /* The launch settings ("name=value"), NULL-terminated. */
 extern char *const *n_settings;
 /* Whether path is complete: "C:\...", "\..." or "/...". "C:" and "C:a" are not: they are in the
@@ -339,7 +342,6 @@ n_result proclist(struct n_procinfo *out, int max);
 /* 0, or a negative n_result; errno is left alone. */
 n_result sysinfo(struct n_sysinfo *si);
 n_result cpu_info(struct n_cpuinfo *info);
-n_result clock_info(struct n_clockinfo *info);
 /* Native tasks sharing this process's address space and descriptors. create
  * returns the thread's id (never 0); a process has at most 128 running threads,
  * past that N_ERR_NOT_READY. The stack is 256 KiB, or with create_sized at least
@@ -352,6 +354,9 @@ n_result thread_join(int tid);
 n_result thread_detach(int tid);
 NOCTURNE_NORETURN void thread_exit(void);
 int thread_id(void);
+/* The class (schedule, abi.h N_SCHEDULE_*) thread tid of this app (0: the calling thread) runs in: value is
+   its weight for N_SCHEDULE_FAIR, its period in ns for N_SCHEDULE_DEADLINE. */
+n_result n_thread_schedule(int tid, uint32_t schedule, uint64_t value);
 unsigned cpu_index(void);
 /* Process-library thread-local slots, independent of errno and thread identity.
  * Libraries use these instead of ELF thread-local variables, which tcc -run
@@ -366,13 +371,13 @@ void *thread_local_get(unsigned slot);
 void thread_local_set(unsigned slot, void *value);
 /* Actual reserved stack interval of the calling native task: 0, or a negative n_result. */
 n_result thread_stack_bounds(uintptr_t *low, uintptr_t *high);
-/* timeout_ms == UINT32_MAX waits indefinitely; count == 0 wakes all.
+/* The wait lasts until deadline (N_CLOCK_NEVER: no limit); count == 0 wakes all.
  * The wait returns 0 when woken, -N_ERR_NOT_READY when *address no longer
  * holds expected, -N_ERR_TIMEOUT or -N_ERR_STOPPED; wake returns how many
  * waiters it woke.  errno is left alone. */
-n_result wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms);
+n_result wait_on_address(volatile uint32_t *address, uint32_t expected, uint64_t deadline);
 /* The 8-byte form; wake_address on the same address wakes it. */
-n_result wait_on_address64(volatile uint64_t *address, uint64_t expected, unsigned timeout_ms);
+n_result wait_on_address64(volatile uint64_t *address, uint64_t expected, uint64_t deadline);
 n_result wake_address(volatile uint32_t *address, unsigned count);
 void yield(void);
 /* These return only on failure, with a negative n_result. */
@@ -398,10 +403,10 @@ int readline(const char *prompt, char *buf, size_t size, int flags);
 
 /* ---- networking (net.c) ----
    IPv4 addresses are uint32_t in host order (10.0.2.15 is 0x0A00020F). Functions return their
-   result or a negative n_result, and leave errno alone. Timeouts are in milliseconds; -1 waits
-   forever, and an expired wait is -N_ERR_NOT_READY or -N_ERR_TIMEOUT. */
+   result or a negative n_result, and leave errno alone. Waits end at a deadline of the monotonic
+   clock (N_CLOCK_NEVER: none), and an expired wait is -N_ERR_NOT_READY or -N_ERR_TIMEOUT. */
 n_result net_info(struct n_netinfo *ni);
-n_result net_ping(uint32_t ip, int seq, int timeout_ms); /* round-trip time in ms */
+n_result net_ping(uint32_t ip, int seq, uint64_t deadline); /* round-trip time in ns */
 n_result net_resolve(const char *name, uint32_t *ip);    /* DNS lookup or dotted quad */
 n_result net_resolve_all(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result);
 n_result net_resolve_at(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result,
@@ -414,30 +419,30 @@ bool ip_parse(const char *s, uint32_t *ip);
 char *ip_format(uint32_t ip, char *buf); /* buf: at least 16 bytes */
 n_result udp_socket(uint16_t port);      /* a connection handle; 0 picks an ephemeral port */
 n_result udp_sendto(n_handle s, uint32_t ip, uint16_t port, const void *buf, size_t len);
-n_result udp_recvfrom(n_handle s, void *buf, size_t len, int timeout_ms, struct n_sockaddr *from);
+n_result udp_recvfrom(n_handle s, void *buf, size_t len, uint64_t deadline, struct n_sockaddr *from);
 n_result udp_close(n_handle s);
-n_result tcp_connect(uint32_t ip, uint16_t port, int timeout_ms); /* a connection handle */
+n_result tcp_connect(uint32_t ip, uint16_t port, uint64_t deadline); /* a connection handle */
 n_result tcp_send(n_handle s, const void *buf, size_t len);
-/* Absolute uptime_ms deadline; zero waits without a deadline. A positive
-   result is the accepted prefix, never a claim that the peer acknowledged it. */
-n_result tcp_send_until(n_handle s, const void *buf, size_t len, uint64_t deadline_ms);
+/* Waits for room until deadline. A positive result is the accepted prefix, never a claim that
+   the peer acknowledged it. */
+n_result tcp_send_until(n_handle s, const void *buf, size_t len, uint64_t deadline);
 /* The accepted prefix, or -N_ERR_NOT_READY; never waits for space. */
 n_result tcp_send_some(n_handle s, const void *buf, size_t len);
 /* Abort the connection, waking send/receive waiters with -N_ERR_CANCELLED. */
 n_result tcp_cancel(n_handle s);
-n_result tcp_recv(n_handle s, void *buf, size_t len, int timeout_ms); /* 0 = connection closed */
+n_result tcp_recv(n_handle s, void *buf, size_t len, uint64_t deadline); /* 0 = connection closed */
 n_result tcp_close(n_handle s);
 /* Passive open: tcp_listen returns a listener on a local address (0: all of them, or e.g.
    127.0.0.1 for this system only; port 0 picks one; backlog <= 0 uses a default), tcp_accept
    the next established connection, ordinary for tcp_send/tcp_recv/tcp_close.
    tcp_close on the listener refuses connections not yet accepted. */
 n_result tcp_listen(uint32_t ip, uint16_t port, int backlog);
-n_result tcp_accept(n_handle listener, int timeout_ms, struct n_sockaddr *remote);
+n_result tcp_accept(n_handle listener, uint64_t deadline, struct n_sockaddr *remote);
 n_result tcp_address(n_handle s, struct n_sockaddr *local, struct n_sockaddr *remote); /* either may be NULL */
 n_result tcp_finish(n_handle s); /* stop sending (FIN after the queued data) but keep receiving; tcp_close later */
 /* simulated packet loss/reordering on this process's TCP connections, and TCP counters (either may be NULL) */
 n_result net_test(const struct n_netfault *set, struct n_tcpstats *stats);
-bool net_wait_up(int timeout_ms); /* wait for DHCP; false if no network */
+bool net_wait_up(uint64_t deadline); /* wait for DHCP; false if no network */
 
 /* ---- GUI ---- */
 typedef struct window {
@@ -497,10 +502,10 @@ n_result win_frame(window_t *win);
    N_POINTER_DEFAULT. */
 n_result win_pointer(window_t *win, const struct n_win_pointer *pointer);
 n_result win_pointer_shape(window_t *win, uint32_t shape);
-/* wait up to timeout_ms (-1 = forever) for an event; returns 1 if *e was filled, 0 on timeout,
-   negative once the window is gone. EV_RESIZE is handled before it is returned: the window has new
+/* wait until deadline (N_CLOCK_NEVER: no limit) for an event; returns 1 if *e was filled, 0 at the
+   deadline, negative once the window is gone. EV_RESIZE is handled before it is returned: the window has new
    surfaces of the size in the event, with as much of the picture shown as fits. */
-n_result win_event(window_t *win, struct gui_event *e, int timeout_ms);
+n_result win_event(window_t *win, struct gui_event *e, uint64_t deadline);
 n_result clipboard_set(const char *s, size_t n);
 n_result clipboard_get(char *buf, size_t n); /* the whole length; at most n bytes are copied */
 /* start a program (find_program: "notepad" is enough) in its own window, with arg as its one argument */

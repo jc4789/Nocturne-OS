@@ -1032,7 +1032,7 @@ new file mode 100644
 index 0000000..6d88392
 --- /dev/null
 +++ b/library/std/src/sys/pal/nocturne/abi.rs
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,184 @@
 +//! Declarations of the Nocturne native ABI as the C library exports it
 +//! (`user/include/nocturne.h`, `common/abi.h`, `docs/nocturne-native-abi.md`).
 +//!
@@ -1141,6 +1141,9 @@ index 0000000..6d88392
 +    pub tv_nsec: c_long,
 +}
 +
++/// A deadline is a moment in ns on the monotonic clock; this one is none.
++pub const N_CLOCK_NEVER: u64 = u64::MAX;
++
 +/// ISO C `timespec_get` bases.
 +pub const TIME_UTC: c_int = 1;
 +pub const TIME_MONOTONIC: c_int = 2;
@@ -1196,14 +1199,16 @@ index 0000000..6d88392
 +    pub fn n_terminal(h: n_handle) -> bool;
 +    pub static n_settings: *const *mut c_char;
 +
-+    pub fn n_sleep_ms(ms: u64);
++    pub fn n_clock_monotonic() -> u64;
++    pub fn n_clock_after(ns: u64) -> u64;
++    pub fn n_sleep_until(deadline: u64);
 +    #[link_name = "yield"]
 +    pub fn yield_now() -> ();
 +    pub fn thread_create(f: extern "C" fn(*mut c_void), arg: *mut c_void) -> n_result;
 +    pub fn thread_join(tid: c_int) -> n_result;
 +    pub fn thread_id() -> c_int;
 +    pub fn cpu_info(info: *mut n_cpuinfo) -> n_result;
-+    pub fn wait_on_address(address: *const u32, expected: u32, timeout_ms: c_uint) -> n_result;
++    pub fn wait_on_address(address: *const u32, expected: u32, deadline: u64) -> n_result;
 +    pub fn wake_address(address: *const u32, count: c_uint) -> n_result;
 +}
 +
@@ -1217,7 +1222,7 @@ new file mode 100644
 index 0000000..f4b3799
 --- /dev/null
 +++ b/library/std/src/sys/pal/nocturne/futex.rs
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,56 @@
 +//! Futex-style waits on Nocturne's address waits (`wait_on_address` /
 +//! `wake_address`, docs/nocturne-native-abi.md §7), which std's futex-based
 +//! `Mutex`, `Condvar`, `RwLock`, `Once` and thread parker are built on.
@@ -1243,23 +1248,14 @@ index 0000000..f4b3799
 +/// Returns false on timeout, and true in all other cases (a woken wait, a
 +/// value that no longer matches, or a spurious return).
 +pub fn futex_wait(futex: &Atomic<u32>, expected: u32, timeout: Option<Duration>) -> bool {
-+    // The kernel counts whole milliseconds in a u32; u32::MAX waits forever.
-+    // A longer timeout waits as long as one call can, then returns early like
-+    // a spurious wake-up (every caller re-checks its condition and clock).
-+    let ms: u32 = match timeout {
-+        None => u32::MAX,
-+        Some(dur) => {
-+            let ms = dur.as_millis() + u128::from(dur.subsec_nanos() % 1_000_000 != 0);
-+            if ms >= (u32::MAX - 1) as u128 { u32::MAX - 1 } else { ms as u32 }
-+        }
++    // The kernel waits until a deadline on the monotonic clock, in ns.
++    let deadline = match timeout {
++        None => abi::N_CLOCK_NEVER,
++        Some(dur) => unsafe { abi::n_clock_after(dur.as_nanos().min(u64::MAX as u128) as u64) },
 +    };
-+    let r = unsafe { abi::wait_on_address(futex.as_ptr(), expected, ms) };
++    let r = unsafe { abi::wait_on_address(futex.as_ptr(), expected, deadline) };
 +    if r == -(abi::N_ERR_TIMEOUT as i64) {
-+        // Only a real timeout counts as one; the clamped wait above is spurious.
-+        return match timeout {
-+            Some(d) => d.as_millis() >= (u32::MAX - 1) as u128,
-+            None => true,
-+        };
++        return false;
 +    }
 +    if r == -(abi::N_ERR_STOPPED as i64) {
 +        // The app is being stopped; do not spin the CPU until it ends.
@@ -1920,7 +1916,7 @@ new file mode 100644
 index 0000000..caaef18
 --- /dev/null
 +++ b/library/std/src/sys/thread/nocturne.rs
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,86 @@
 +//! Threads on Nocturne: the native `thread_create` / `thread_join`.
 +//!
 +//! The kernel gives every thread a fixed-size stack (256 KiB) and a process at
@@ -2004,13 +2000,8 @@ index 0000000..caaef18
 +}
 +
 +pub fn sleep(dur: Duration) {
-+    // Whole milliseconds, rounded up so it never returns early.
-+    let mut ms = dur.as_millis() + u128::from(dur.subsec_nanos() % 1_000_000 != 0);
-+    while ms > 0 {
-+        let step = ms.min(u64::MAX as u128) as u64;
-+        unsafe { abi::n_sleep_ms(step) };
-+        ms -= step as u128;
-+    }
++    // Until the monotonic deadline dur from now (past u64 ns: never).
++    unsafe { abi::n_sleep_until(abi::n_clock_after(dur.as_nanos().min(u64::MAX as u128) as u64)) };
 +}
 diff --git a/library/std/src/sys/thread_local/mod.rs b/library/std/src/sys/thread_local/mod.rs
 index d48bb1c..b7f631d 100644
@@ -2044,12 +2035,11 @@ new file mode 100644
 index 0000000..0b7d8d1
 --- /dev/null
 +++ b/library/std/src/sys/time/nocturne.rs
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,72 @@
 +//! Clocks on Nocturne.
 +//!
 +//! Both clocks come from the C library's `timespec_get`: `TIME_MONOTONIC` is
-+//! the uptime counter and `TIME_UTC` the wall clock. The C library's
-+//! resolution is one millisecond.
++//! the system's monotonic clock and `TIME_UTC` the wall clock, both in ns.
 +
 +use crate::io;
 +use crate::sys::pal::abi;

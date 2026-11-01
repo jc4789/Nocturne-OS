@@ -16,7 +16,7 @@ net_stream *ns_open(const char *host,uint16_t port,bool tls,int timeout,char *er
 }
 long ns_write(net_stream *s,const void *p,size_t n){(void)s;(void)p;return (long)n;}
 net_stream *ns_open_timed(const char *h,uint16_t p,bool tls,int t,char *e,size_t n,struct http_transport_timing *m){memset(m,0,sizeof *m);return ns_open(h,p,tls,t,e,n);}
-uint64_t uptime_ms(void){return 0;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(0)*1000000ULL;}
 long ns_read(net_stream *s,void *p,size_t n){size_t left=s->n-s->at;if(n>left)n=left;memcpy(p,s->p+s->at,n);s->at+=n;return (long)n;}
 void ns_close(net_stream *s){(void)s;}
 const char *ns_error(net_stream *s){(void)s;return "";}

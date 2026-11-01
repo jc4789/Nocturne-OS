@@ -9,7 +9,7 @@
 /* The EV_FRAME that shows present number presented. */
 static bool wait_frame(window_t *win, uint64_t presented) {
     struct gui_event event;
-    while (win_event(win, &event, -1) > 0) {
+    while (win_event(win, &event, N_CLOCK_NEVER) > 0) {
         if (event.type == EV_CLOSE) return false;
         if (event.type == EV_FRAME && event.serial >= presented) return event.serial == presented;
     }
@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
     uint32_t *screen = malloc((size_t)gw * gh * sizeof *screen);
     int result = 1;
     if (!screen) goto done;
-    uint64_t start = uptime_ms();
+    uint64_t start = (n_clock_monotonic() / N_NS_PER_MS);
     for (unsigned long frame = 0; frame < frames; frame++) {
         if (win_begin_frame(win) < 0) goto done;
         int drawn = win->current;
@@ -57,7 +57,7 @@ int main(int argc, char **argv) {
         if (win_fullscreen(win, !restored) < 0) goto done;
         struct gui_event event;
         do {
-            if (win_event(win, &event, -1) <= 0 || event.type == EV_CLOSE) goto done;
+            if (win_event(win, &event, N_CLOCK_NEVER) <= 0 || event.type == EV_CLOSE) goto done;
         } while (event.type != EV_RESIZE);
         if (win_begin_frame(win) < 0) goto done;
         uint32_t color = restored ? RGB(24, 96, 180) : RGB(180, 96, 24);
@@ -69,9 +69,9 @@ int main(int argc, char **argv) {
     }
     printf("wmframetest: PASS fullscreen-resize-restore\n");
     printf("wmframetest: PASS frames=%lu elapsed_ms=%lu surfaces=returned unpresented=hidden screen-grab=correct\n",
-           frames, (unsigned long)(uptime_ms() - start));
+           frames, (unsigned long)((n_clock_monotonic() / N_NS_PER_MS) - start));
     printf("wmframetest: READY visual hold_ms=%lu\n", hold);
-    n_sleep_ms(hold);
+    n_sleep_until(n_clock_after((uint64_t)(hold) * N_NS_PER_MS));
     result = 0;
 done:
     free(screen);

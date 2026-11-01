@@ -22,7 +22,7 @@ void *count_calloc(size_t n,size_t s){if(n&&s>SIZE_MAX/n)return NULL;void *p=cou
 void *count_realloc(void *p,size_t n){if(!p)return count_malloc(n);if((fail_next&&!--fail_next)||(fail_size&&n==fail_size)){fail_size=0;fail_hits++;return NULL;}return realloc(p,n);}
 void count_free(void *p){if(p){live--;free(p);}}
 char *count_strdup(const char *s){size_t n=strlen(s);if(n==SIZE_MAX)return NULL;char *p=count_malloc(n+1);if(p)memcpy(p,s,n+1);return p;}
-uint64_t uptime_ms(void){return 100;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(100)*1000000ULL;}
 int close(int fd){(void)fd;return 0;}
 int kill(int pid){(void)pid;return 0;}
 int waitpid(int pid,int *status,int flags){(void)status;(void)flags;return pid;}

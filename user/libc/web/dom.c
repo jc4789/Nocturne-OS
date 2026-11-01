@@ -54,7 +54,7 @@ static void indices(node_t *p, node_t *first) {
     if (!first) return;
     web_doc *d = p->owner;
     if (d && d->dom_family) d = d->dom_family;
-    uint64_t start = d && d->profile_enabled ? uptime_ms() : 0, visited = 0;
+    uint64_t start = d && d->profile_enabled ? (n_clock_monotonic() / N_NS_PER_MS) : 0, visited = 0;
     int i = 0;
     for (node_t *c = first->prev; c; c = c->prev) {
         visited++;
@@ -64,7 +64,7 @@ static void indices(node_t *p, node_t *first) {
         visited++;
         if (c->type == N_ELEM) c->elem_index = ++i;
     }
-    if (d) { d->profile.index_visits += visited; if(d->profile_enabled)d->profile.index_ms += uptime_ms() - start; }
+    if (d) { d->profile.index_visits += visited; if(d->profile_enabled)d->profile.index_ms += (n_clock_monotonic() / N_NS_PER_MS) - start; }
 }
 
 static bool under(node_t *n, node_t *ancestor) {

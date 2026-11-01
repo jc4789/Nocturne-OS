@@ -24,7 +24,7 @@ net_stream *ns_open(const char *host, uint16_t port, bool tls, int timeout, char
     opened++; stream.pos=used=0; request[0]=0; return &stream;
 }
 net_stream *ns_open_timed(const char *h,uint16_t p,bool tls,int t,char *e,size_t n,struct http_transport_timing *m){memset(m,0,sizeof *m);return ns_open(h,p,tls,t,e,n);}
-uint64_t uptime_ms(void){return 0;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(0)*1000000ULL;}
 long ns_write(net_stream *s,const void *p,size_t n) {
     (void)s; if(n>=sizeof request-used)return -1;
     memcpy(request+used,p,n); used+=n; request[used]=0; return (long)n;

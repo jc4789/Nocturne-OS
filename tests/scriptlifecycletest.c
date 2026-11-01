@@ -59,7 +59,7 @@ static const char *node_attr(node_t *node,const char *name){
 static node_t *node_ancestor(node_t *node,unsigned tag){while(node){if(node->tag==tag)return node;node=node->parent;}return NULL;}
 static void doc_sync_tree(web_doc *doc){doc->resources_dirty=false;}
 static bool html_policy_meta(web_doc *doc,const char *text,size_t length){policies++;return true;}
-static uint64_t uptime_ms(void){return 0;}
+static uint64_t n_clock_monotonic(void){return (uint64_t)(0)*1000000ULL;}
 static void exception(struct web_js_state *s){exceptions++;}
 static void frame_sync(struct web_js_state *s,node_t *node){frames++;}
 static void dynamic_inserted(struct web_js_state *s,node_t *parent,
@@ -283,13 +283,13 @@ int main(void) {
     struct web_host host={.request=request,.console=console,.js_task_budget_ms=5000};
     web_doc *doc=web_live(page,sizeof page-1,"https://lifecycle.test/","utf-8",&host);
     if (!doc) return 1;
-    uint64_t deadline=uptime_ms()+10000;
-    while (!done && uptime_ms()<deadline) {
+    uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+10000;
+    while (!done && (n_clock_monotonic() / N_NS_PER_MS)<deadline) {
         deliver(doc,&blocking_request,blocking,"https://lifecycle.test/blocking.js");
         deliver(doc,&deferred_request,deferred,"https://lifecycle.test/deferred.js");
         deliver(doc,&following_request,following,"https://lifecycle.test/following.js");
         deliver(doc,&module_request,load_module,"https://lifecycle.test/load-await.js");
-        web_tick(doc,uptime_ms()); n_sleep_ms(1);
+        web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS)); n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
     }
     if (!done || checks!=22 || errors) {
         printf("FAIL script lifecycle completion done=%d checks=%d errors=%d\n",done,checks,errors);

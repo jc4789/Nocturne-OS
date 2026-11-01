@@ -42,7 +42,7 @@ static atomic_int waiter_started;
 static n_result waiter_result;
 static int interrupt_waiter(void *arg) {
     atomic_store(&waiter_started,1);
-    waiter_result=n_pci_interrupt_take((n_handle)(intptr_t)arg,-1);
+    waiter_result=n_pci_interrupt_take((n_handle)(intptr_t)arg,N_CLOCK_NEVER);
     return 0;
 }
 static uint32_t rd32(uint32_t at) { return *(volatile uint32_t *)(regs + at); }
@@ -55,7 +55,7 @@ static int dma(n_handle pci, uint64_t ram, uint32_t count, int to_ram) {
     wr64(EDU_DMA_DST, to_ram ? ram : EDU_DMA_BUFFER);
     wr64(EDU_DMA_COUNT, count);
     wr64(EDU_DMA_CMD, 1 | (to_ram ? 2 : 0) | 4); /* start, direction, interrupt when done */
-    n_result got = n_pci_interrupt_take(pci, 2000);
+    n_result got = n_pci_interrupt_take(pci, n_clock_after(2000 * N_NS_PER_MS));
     uint32_t why = rd32(EDU_IRQ_STATUS);
     wr32(EDU_IRQ_ACK, why);
     return got > 0 && (why & 0x100);
@@ -192,7 +192,7 @@ static void composition_cases(const char *program) {
     CHECK(n_shared_revoke(ro)==0,"source view issuer cancels nested compositions");
     if(reader>=0){
         int status=0;CHECK(n_channel_send(pair[0],"x",1,-1)==1,"release nested reader after cancellation");
-        n_result result=n_app_result(reader,2000,&status);
+        n_result result=n_app_result(reader,n_clock_after(2000 * N_NS_PER_MS),&status);
         CHECK(result==0 && status==128+14,"nested existing map faults after source revoke: result=%lld status=%d",(long long)result,status);
         if(result<0)n_app_stop(reader,0);n_handle_close(reader);
     }
@@ -424,22 +424,22 @@ static n_result vblank(n_handle vga, uint64_t count, uint64_t time_ns) {
 static n_result vblanks(n_handle vga, uint64_t *count, unsigned frames) {
     n_result r = 0;
     for (unsigned i = 0; i < frames && !r; i++) {
-        r = vblank(vga, ++*count, uptime_ms() * 1000000ull);
-        n_sleep_ms(16);
+        r = vblank(vga, ++*count, n_clock_monotonic());
+        n_sleep_until(n_clock_after(16 * N_NS_PER_MS));
     }
     return r;
 }
 /* A surface given with N_SCANOUT_DIRECT: the system says which fullscreen window the driver may
    show itself (n_pci_screen_state), and that window hears of it (EV_DIRECT, WIN_STATE_DIRECT). */
 static bool screen_app(n_handle vga, struct n_screen_state *st, uint32_t app) {
-    for (uint64_t end = uptime_ms() + 2000; st->app != app && uptime_ms() < end;)
-        if (n_pci_screen_state(vga, 0, st->serial, st, 200) == -N_ERR_DENIED) return false;
+    for (uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + 2000; st->app != app && (n_clock_monotonic() / N_NS_PER_MS) < end;)
+        if (n_pci_screen_state(vga, 0, st->serial, st, n_clock_after(200 * N_NS_PER_MS)) == -N_ERR_DENIED) return false;
     return st->app == app;
 }
 static bool direct_heard(window_t *win, int key) {
     struct gui_event e;
-    for (uint64_t end = uptime_ms() + 2000; uptime_ms() < end;)
-        if (win_event(win, &e, 200) > 0 && e.type == EV_DIRECT && e.key == key) return true;
+    for (uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + 2000; (n_clock_monotonic() / N_NS_PER_MS) < end;)
+        if (win_event(win, &e, n_clock_after(200 * N_NS_PER_MS)) > 0 && e.type == EV_DIRECT && e.key == key) return true;
     return false;
 }
 /* The images such a driver shows in its scanout's place, the app's own (n_pci_screen_image): the
@@ -461,9 +461,9 @@ static void direct_cases(n_handle vga, n_handle surface, const struct n_scanout 
     struct n_screen_state st = {0};
     r = n_pci_screen_state(vga, 0, 0, &st, 0);
     CHECK(r == 0 && st.serial != 0 && st.app == 0, "no window shown directly yet: %s app %u", n_result_text(r), st.app);
-    uint64_t seen = st.serial, t0 = uptime_ms();
-    r = n_pci_screen_state(vga, 0, seen, &st, 100);
-    CHECK(r == -N_ERR_TIMEOUT && st.serial == seen && uptime_ms() - t0 >= 90, "the state waits for a change: %s",
+    uint64_t seen = st.serial, t0 = (n_clock_monotonic() / N_NS_PER_MS);
+    r = n_pci_screen_state(vga, 0, seen, &st, n_clock_after(100 * N_NS_PER_MS));
+    CHECK(r == -N_ERR_TIMEOUT && st.serial == seen && (n_clock_monotonic() / N_NS_PER_MS) - t0 >= 90, "the state waits for a change: %s",
           n_result_text(r));
     bad = image, bad.format |= N_SCANOUT_DIRECT;
     CHECK(n_pci_screen_image(vga, 0, surface, &bad) == -N_ERR_INVALID, "an image is no scanout of its own");
@@ -510,13 +510,13 @@ static void direct_cases(n_handle vga, n_handle surface, const struct n_scanout 
         show_row(dispi, (uint32_t)(second / d->pitch));
         printf("pcitest: the image in the second buffer is shown for %u s; a panic meanwhile is drawn there too\n",
                linger_s);
-        n_sleep_ms(linger_s * 1000);
+        n_sleep_until(n_clock_after((uint64_t)(linger_s * 1000) * N_NS_PER_MS));
         show_row(dispi, (uint32_t)(d->offset / d->pitch));
     }
     r = give_back(vga);
     CHECK(r == 0 && n_pci_screen_state(vga, 0, 0, &st, 0) == -N_ERR_DENIED && n_pci_screen_image_end(vga, one) == -N_ERR_INVALID,
           "the boot screen back ends direct showing and its images");
-    n_sleep_ms(300);
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
 }
 
 /* The monitor's modes (n_pci_screen_modes): the driver offers what it can show, the system wants
@@ -560,8 +560,8 @@ static n_result mode_set(uint32_t how, const struct n_screen_mode *m) {
 }
 /* The next wish (a mode_serial after *serial) within ms. */
 static bool mode_wanted(n_handle vga, struct n_screen_state *st, uint64_t *serial, int64_t ms) {
-    for (uint64_t end = uptime_ms() + (uint64_t)ms; st->mode_serial <= *serial && uptime_ms() < end;)
-        if (n_pci_screen_state(vga, 0, st->serial, st, 200) == -N_ERR_DENIED) return false;
+    for (uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + (uint64_t)ms; st->mode_serial <= *serial && (n_clock_monotonic() / N_NS_PER_MS) < end;)
+        if (n_pci_screen_state(vga, 0, st->serial, st, n_clock_after(200 * N_NS_PER_MS)) == -N_ERR_DENIED) return false;
     if (st->mode_serial <= *serial) return false;
     *serial = st->mode_serial;
     return true;
@@ -583,20 +583,20 @@ static n_result mode_show(n_handle vga, n_handle surface, const struct n_scanout
 }
 static bool desktop_width(int width) {
     int w = 0, h = 0;
-    for (uint64_t end = uptime_ms() + 1000; (screen_size(&w, &h) < 0 || w != width) && uptime_ms() < end;) n_sleep_ms(20);
+    for (uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + 1000; (screen_size(&w, &h) < 0 || w != width) && (n_clock_monotonic() / N_NS_PER_MS) < end;) n_sleep_until(n_clock_after(20 * N_NS_PER_MS));
     return w == width;
 }
 /* The screen's watch (SCREEN_WATCH) in q heard a change within ms: its changes taken. */
-static bool screen_heard(n_handle q, n_handle watch, int64_t ms) {
+static bool screen_heard(n_handle q, n_handle watch, uint64_t ms) {
     struct n_event ev[4];
-    return n_events_wait(q, ev, 4, ms) > 0 && n_watch_take(watch) > 0;
+    return n_events_wait(q, ev, 4, n_clock_after(ms * N_NS_PER_MS)) > 0 && n_watch_take(watch) > 0;
 }
 /* The user's AppData\Nocturne\Displays.conf, where the system keeps the mode kept for each monitor,
    holds line within ms (it is written a moment after the choice). */
 static bool displays_kept(const char *line, unsigned ms) {
     char path[1024];
     if (n_path_join(n_user_folder(), "AppData\\Nocturne\\Displays.conf", path, sizeof path) < 0) return false;
-    for (uint64_t end = uptime_ms() + ms;; n_sleep_ms(100)) {
+    for (uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + ms;; n_sleep_until(n_clock_after(100 * N_NS_PER_MS))) {
         void *data;
         size_t size;
         bool found = false;
@@ -611,7 +611,7 @@ static bool displays_kept(const char *line, unsigned ms) {
             if (data) n_memory_release(data, size);
         }
         if (found) return true;
-        if (uptime_ms() >= end) return false;
+        if ((n_clock_monotonic() / N_NS_PER_MS) >= end) return false;
     }
 }
 static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struct n_scanout *d, volatile uint16_t *dispi,
@@ -672,7 +672,7 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
           "the system wants the monitor's preferred mode: %ux%u at %u mHz", st.mode.width, st.mode.height, st.mode.refresh_mhz);
     r = mode_show(vga, surface, d, dispi, offer, &st, false);
     CHECK(r == 0, "the preferred mode shown: %s", n_result_text(r));
-    CHECK(n_pci_screen_state(vga, 0, st.serial, &st, 100) == -N_ERR_TIMEOUT, "a mode shown as wanted changes nothing");
+    CHECK(n_pci_screen_state(vga, 0, st.serial, &st, n_clock_after(100 * N_NS_PER_MS)) == -N_ERR_TIMEOUT, "a mode shown as wanted changes nothing");
     r = modes_get(seen);
     CHECK(r == 0 && seen->offered.count == 4 && !strcmp(seen->offered.monitor, "pcitest-vga") &&
               same_mode(&seen->offered.shown, &native) && same_mode(&seen->wanted, &native) && !seen->trial_ms && !seen->refused &&
@@ -694,10 +694,10 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     CHECK(r == 0 && seen->trial_ms > 0 && seen->trial_ms <= SCREEN_MODE_TRIAL_MS, "Settings sees the trial: %u ms left",
           seen->trial_ms);
     if (linger_s) printf("pcitest: the desktop is 1024x768 until its trial ends\n");
-    uint64_t t0 = uptime_ms();
+    uint64_t t0 = (n_clock_monotonic() / N_NS_PER_MS);
     CHECK(mode_wanted(vga, &st, &serial, SCREEN_MODE_TRIAL_MS + 3000) && same_mode(&st.mode, &native) &&
-              uptime_ms() - t0 >= SCREEN_MODE_TRIAL_MS - 2000,
-          "the trial not kept goes back after %u ms: %ux%u", (unsigned)(uptime_ms() - t0), st.mode.width, st.mode.height);
+              (n_clock_monotonic() / N_NS_PER_MS) - t0 >= SCREEN_MODE_TRIAL_MS - 2000,
+          "the trial not kept goes back after %u ms: %ux%u", (unsigned)((n_clock_monotonic() / N_NS_PER_MS) - t0), st.mode.width, st.mode.height);
     r = mode_show(vga, surface, d, dispi, offer, &st, false);
     CHECK(r == 0 && desktop_width((int)native.width), "the mode before shown again: %s", n_result_text(r));
 
@@ -717,7 +717,7 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     desktop_width(1024);
     n_watch_take(watch);
     r = mode_set(SCREEN_MODE_KEEP, NULL);
-    CHECK(r == 0 && n_pci_screen_state(vga, 0, st.serial, &st, 100) == -N_ERR_TIMEOUT && modes_get(seen) == 0 && !seen->trial_ms,
+    CHECK(r == 0 && n_pci_screen_state(vga, 0, st.serial, &st, n_clock_after(100 * N_NS_PER_MS)) == -N_ERR_TIMEOUT && modes_get(seen) == 0 && !seen->trial_ms,
           "kept: the trial ends and the mode stays: %s", n_result_text(r));
     CHECK(screen_heard(heard, watch, 1000), "the screen's watch hears the mode kept");
     CHECK(displays_kept("\nmode.pcitest-vga=1024x768@75000\n", 3000), "the system keeps the choice in Displays.conf");
@@ -804,7 +804,7 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     r = give_back(vga);
     CHECK(r == 0 && desktop_width((int)native.width) && n_pci_screen_state(vga, 0, 0, &st, 0) == -N_ERR_DENIED,
           "the boot screen back again: %s", n_result_text(r));
-    n_sleep_ms(300);
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
     n_handle_close(watch), n_handle_close(heard);
     free(offer), free(seen);
 }
@@ -896,13 +896,13 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     CHECK(r == 0 && st.app == 0 && st.mode.width == 0, "without N_SCANOUT_DIRECT or modes offered, the state shows no window and wants no mode: %s",
           n_result_text(r));
     CHECK(n_pci_screen_image(vga, 0, surface, &d) == -N_ERR_DENIED, "no image without N_SCANOUT_DIRECT");
-    n_sleep_ms(300);
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
     CHECK(marks(gop) == 0, "all of the screen is drawn again: %d marks left", marks(gop));
     uint64_t count = 0;
     r = vblanks(vga, &count, 30);
     CHECK(r == 0, "vertical blanks of the surface shown: %s", n_result_text(r));
     CHECK(n_pci_hold_screen(vga, true) == 0 && n_pci_hold_screen(vga, false) == 0, "the screen held and given back");
-    n_sleep_ms(300); /* the release draws all of the screen again: the marks below come after it */
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS)); /* the release draws all of the screen again: the marks below come after it */
 
     /* a second buffer past it, which the display then shows */
     if (second + frame <= size) {
@@ -913,7 +913,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
         r = give(vga, surface, &s2);
         CHECK(r == 0, "a second buffer past the boot screen: %s", n_result_text(r));
         show_row(dispi, second_row);
-        n_sleep_ms(300);
+        n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
         CHECK(marks(next) == 0 && marks(gop) == 64, "drawn into the second buffer only: %d %d marks", marks(next), marks(gop));
         r = vblanks(vga, &count, 30 + linger_s * 60);
         CHECK(r == 0, "vertical blanks of the second buffer: %s", n_result_text(r));
@@ -924,7 +924,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     mark(gop);
     r = give(vga, dma_wc, &at0);
     CHECK(r == 0, "DMA memory as the surface: %s", n_result_text(r));
-    n_sleep_ms(300);
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
     void *dma_map = NULL;
     if (dma_wc >= 0) n_shared_map(dma_wc, frame_pages, N_MEMORY_READ, &dma_map);
     const volatile uint32_t *drawn = dma_map;
@@ -937,7 +937,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     r = give_back(vga);
     CHECK(r == 0, "the boot screen back: %s", n_result_text(r));
     show_row(dispi, boot_row);
-    n_sleep_ms(300);
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
     CHECK(marks(gop) == 0, "the boot screen is drawn again: %d marks left", marks(gop));
     CHECK(give_back(vga) == -N_ERR_INVALID, "given back once");
     CHECK(vblank(vga, ++count, 0) == -N_ERR_DENIED, "no vertical blanks of the boot screen");
@@ -951,7 +951,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     r = give(vga, surface, &direct);
     if (!r) r = n_pci_screen_image(vga, 0, surface, &d);
     CHECK(r > 0, "a surface the claim's end gives back, with an image: %s", n_result_text(r));
-    n_sleep_ms(300);
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
     mark(gop);
     n_memory_release(whole, size);
     if (regs_map) n_memory_release(regs_map, 4096);
@@ -970,7 +970,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     n_handle view = bar >= 0 ? n_shared_view(bar, boot & ~4095ull, peek, N_CACHE_WRITE_COMBINE) : bar;
     void *again = NULL;
     if (view >= 0) n_shared_map(view, peek, N_MEMORY_READ, &again);
-    n_sleep_ms(300);
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
     const volatile uint32_t *seen =
         again ? (const volatile uint32_t *)((uint8_t *)again + (boot & 4095) + 100ull * pitch) + 100 : NULL;
     CHECK(seen && marks(seen) == 0, "the claim's end drew the boot screen again: %d marks left", seen ? marks(seen) : -1);
@@ -987,7 +987,7 @@ static int stuck_holder(void) {
     int n = pcilist(list, 128), at = find_vga(list, n);
     n_handle vga = at < 0 ? -1 : n_pci_claim(list[at].bus, list[at].dev, list[at].func);
     if (vga < 0 || n_pci_hold_screen(vga, true) != 0) return 2;
-    for (;;) n_sleep_ms(60000);
+    for (;;) n_sleep_until(n_clock_after(60000 * N_NS_PER_MS));
 }
 
 /* Booted with fbhold=<seconds>: the system stops a driver that holds the screen that long, and
@@ -1007,13 +1007,13 @@ static void stuck_holder_cases(const char *program, const struct n_pciinfo *list
     CHECK(holder >= 0, "launch the stuck holder: %s", n_result_text(holder));
     if (holder < 0) return;
     int status = 0;
-    n_result early = n_app_result(holder, (int64_t)seconds * 500, &status);
+    n_result early = n_app_result(holder, n_clock_after((uint64_t)seconds * N_NS_PER_S / 2), &status);
     CHECK(early == -N_ERR_TIMEOUT, "the holder keeps the screen before the limit: %s status %d", n_result_text(early),
           status);
     n_handle busy = n_pci_claim(list[at].bus, list[at].dev, list[at].func);
     CHECK(busy == -N_ERR_BUSY, "the VGA is still the holder's: %s", n_result_text(busy));
     if (busy >= 0) n_handle_close(busy);
-    n_result ended = n_app_result(holder, (int64_t)seconds * 1000 + 10000, &status);
+    n_result ended = n_app_result(holder, n_clock_after(((uint64_t)seconds + 10) * N_NS_PER_S), &status);
     CHECK(ended == 0 && status != 0 && status != 2, "the system stopped the holder past the limit: %s status %d",
           n_result_text(ended), status);
     if (ended < 0) n_app_stop(holder, 0);
@@ -1158,9 +1158,9 @@ static int dma_allocation_case(const char *text) {
     CHECK(result == 0 && (info.flags & N_PCI_ISOLATED), "DMA診断には隔離済みEDUが必要: %s flags=%x",
           n_result_text(result), info.flags);
     if (result < 0 || !(info.flags & N_PCI_ISOLATED)) goto done;
-    uint64_t began = uptime_ms();
+    uint64_t began = (n_clock_monotonic() / N_NS_PER_MS);
     mem = n_dma_create(pci, bytes, 0); /* CONTIGUOUS/32BITのどちらも指定しない。 */
-    uint64_t elapsed = uptime_ms() - began;
+    uint64_t elapsed = (n_clock_monotonic() / N_NS_PER_MS) - began;
     printf("pcitest dma: 要求=%llu 丸め=%llu ページ=%llu flags=0 確保=%llums 結果=%s\n",
            (unsigned long long)bytes, (unsigned long long)rounded, (unsigned long long)pages,
            (unsigned long long)elapsed, n_result_text(mem < 0 ? mem : 0));
@@ -1398,7 +1398,7 @@ int main(int argc,char **argv) {
     CHECK(n_pci_interrupt_take(pci, 0) == -N_ERR_TIMEOUT, "nothing pending yet");
     if (regs && vectors >= 1) {
         wr32(EDU_IRQ_RAISE, 0x5);
-        n_result got = n_pci_interrupt_take(pci, 2000);
+        n_result got = n_pci_interrupt_take(pci, n_clock_after(2000 * N_NS_PER_MS));
         CHECK(got == 1, "interrupt bits %lld", (long long)got);
         CHECK(rd32(EDU_IRQ_STATUS) == 0x5, "irq status %x", rd32(EDU_IRQ_STATUS));
         wr32(EDU_IRQ_ACK, 0x5);
@@ -1409,7 +1409,7 @@ int main(int argc,char **argv) {
         CHECK(created==thrd_success,"interrupt waiter thread");
         if(created==thrd_success){
             while(!atomic_load(&waiter_started))thrd_yield();
-            n_sleep_ms(1); /* let the native take enter its blocking continuation */
+            n_sleep_until(n_clock_after(1 * N_NS_PER_MS)); /* let the native take enter its blocking continuation */
             CHECK(n_pci_interrupts(pci,0)==0,"disable interrupts while take waits");
             thrd_join(waiter,NULL);
             CHECK(waiter_result==-N_ERR_NOT_READY,"disabled IRQ wakes infinite take: %s",n_result_text(waiter_result));
@@ -1505,7 +1505,7 @@ int main(int argc,char **argv) {
     if(reader>=0){
         int status=0;
         CHECK(n_channel_send(channel[0],"x",1,-1)==1,"release child to read revoked mapping");
-        n_result result=n_app_result(reader,2000,&status);
+        n_result result=n_app_result(reader,n_clock_after(2000 * N_NS_PER_MS),&status);
         CHECK(result==0 && status==128+14,"revoked existing mapping faults in child: result=%lld status=%d",(long long)result,status);
         if(result<0)n_app_stop(reader,0);
         n_handle_close(reader);

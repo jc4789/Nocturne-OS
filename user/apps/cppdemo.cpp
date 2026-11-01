@@ -41,14 +41,14 @@ struct Global {
 std::atomic<int> constructed{0};
 struct Local {
     int value;
-    Local() { ++constructed; n_sleep_ms(20); value = 91; }
+    Local() { ++constructed; n_sleep_until(n_clock_after(20 * N_NS_PER_MS)); value = 91; }
     ~Local() { ++local_destroyed; }
 };
 Local &singleton() { static Local value; return value; }
 uint32_t start_workers;
 struct Worker { Local *result = nullptr; };
 void worker(void *opaque) {
-    while (!__atomic_load_n(&start_workers, __ATOMIC_ACQUIRE)) wait_on_address(&start_workers, 0, UINT32_MAX);
+    while (!__atomic_load_n(&start_workers, __ATOMIC_ACQUIRE)) wait_on_address(&start_workers, 0, N_CLOCK_NEVER);
     static_cast<Worker *>(opaque)->result = &singleton();
 }
 void nested_exit() { exit_order = exit_order * 10 + 3; }

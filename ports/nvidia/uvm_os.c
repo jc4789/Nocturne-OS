@@ -911,7 +911,7 @@ void **radix_tree_iter_find(const struct radix_tree_root *root, struct radix_tre
 
 void msleep(unsigned ms)
 {
-    n_sleep_ms(ms);
+    n_sleep_until(n_clock_after((uint64_t)(ms) * N_NS_PER_MS));
 }
 
 void udelay(unsigned long us)
@@ -927,7 +927,7 @@ void usleep_range(unsigned long min_us, unsigned long max_us)
 {
     (void)max_us;
     if (min_us >= USEC_PER_MSEC) {
-        n_sleep_ms((min_us + USEC_PER_MSEC - 1) / USEC_PER_MSEC);
+        n_sleep_until(n_clock_after((uint64_t)((min_us + USEC_PER_MSEC - 1) / USEC_PER_MSEC) * N_NS_PER_MS));
         return;
     }
     uint64_t end = nvrm_now_ns() + (uint64_t)min_us * NSEC_PER_USEC;
@@ -1004,7 +1004,7 @@ static int kthread_main(void *arg)
         uint32_t state = __atomic_load_n(&task->run_state, __ATOMIC_ACQUIRE);
         if (state != UVM_OS_KTHREAD_CREATED)
             break;
-        wait_on_address(&task->run_state, UVM_OS_KTHREAD_CREATED, UINT32_MAX);
+        wait_on_address(&task->run_state, UVM_OS_KTHREAD_CREATED, N_CLOCK_NEVER);
     }
     int code = task->run_state == UVM_OS_KTHREAD_RUN ? task->thread_fn(task->thread_data) : -EINTR;
     task->exit_code = code;
@@ -1190,9 +1190,9 @@ void wake_up_all(wait_queue_head_t *wq)
     wake_address(&wq->sequence, 0);
 }
 
-void uvm_os_wait_queue_sleep(wait_queue_head_t *wq, uint32_t seen, unsigned timeout_ms)
+void uvm_os_wait_queue_sleep(wait_queue_head_t *wq, uint32_t seen, uint64_t deadline)
 {
-    wait_on_address(&wq->sequence, seen, timeout_ms);
+    wait_on_address(&wq->sequence, seen, deadline);
 }
 
 /* The 32 bits of the word that hold the bit (x86-64 is little-endian). */
@@ -1208,7 +1208,7 @@ int wait_on_bit_lock(unsigned long *word, int bit, unsigned mode)
         volatile uint32_t *half = bit_half(word, bit);
         uint32_t seen = __atomic_load_n(half, __ATOMIC_ACQUIRE);
         if (seen & (1u << (bit % 32)))
-            wait_on_address(half, seen, UINT32_MAX);
+            wait_on_address(half, seen, N_CLOCK_NEVER);
     }
     return 0;
 }
@@ -1247,7 +1247,7 @@ static int work_main(void *arg)
     mtx_lock(&work_lock);
     while (!work_stopping) {
         uint32_t seen = work_changes;
-        unsigned wait_ms = UINT32_MAX;
+        uint64_t until = N_CLOCK_NEVER;
         if (!list_empty(&work_queue)) {
             struct delayed_work *first = to_delayed_work(list_first_entry(&work_queue, struct work_struct, entry));
             uint64_t now = now_ms();
@@ -1264,10 +1264,10 @@ static int work_main(void *arg)
                 wake_address(&work_finished, 0);
                 continue;
             }
-            wait_ms = (unsigned)min(first->due_ms - now, (uint64_t)UINT32_MAX - 1);
+            until = first->due_ms * NSEC_PER_MSEC;
         }
         mtx_unlock(&work_lock);
-        wait_on_address(&work_changes, seen, wait_ms);
+        wait_on_address(&work_changes, seen, until);
         mtx_lock(&work_lock);
     }
     mtx_unlock(&work_lock);
@@ -1313,7 +1313,7 @@ static bool work_cancel(struct work_struct *work, bool sync)
     while (sync && work_running == work) {
         uint32_t seen = work_finished;
         mtx_unlock(&work_lock);
-        wait_on_address(&work_finished, seen, UINT32_MAX);
+        wait_on_address(&work_finished, seen, N_CLOCK_NEVER);
         mtx_lock(&work_lock);
     }
     mtx_unlock(&work_lock);
@@ -1703,7 +1703,7 @@ static void q_flush_once(nv_kthread_q_t *q)
     if (!nv_kthread_q_schedule_q_item(q, &flush.item))
         return;
     while (!__atomic_load_n(&flush.done, __ATOMIC_ACQUIRE))
-        wait_on_address(&flush.done, 0, UINT32_MAX);
+        wait_on_address(&flush.done, 0, N_CLOCK_NEVER);
 }
 
 /* Twice: the second waits for what the items of the first scheduled (nv-kthread-q.h). */

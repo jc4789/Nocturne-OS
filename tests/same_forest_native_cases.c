@@ -15,7 +15,7 @@ struct web_js_state {bool node_cache_failed,node_cache_syncing;struct web_js_sta
 static struct web_js_state *node_cache_states;
 static unsigned syncs,assignments,frame_detaches,dialog_removes;
 static bool assignment=true;
-static uint64_t uptime_ms(void){return 0;}
+static uint64_t n_clock_monotonic(void){return (uint64_t)(0)*1000000ULL;}
 static void textarea_changed(node_t *n){}
 static void web_js_nodes_changed(web_doc *d){syncs++;}
 static void web_dialog_sync(web_doc *d){}

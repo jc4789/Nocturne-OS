@@ -82,14 +82,6 @@ struct event_queue {
     struct object object;              /* its waiters: the threads in its wait, exclusive items */
 };
 
-/* An event as the kernel has it: what n_event carries, and the moment it happened (monotonic ns),
-   which n_event has no field for until the time ABI. */
-struct event {
-    uint64_t token;
-    uint32_t events;
-    uint64_t at;
-};
-
 #define SOURCE(n) ((struct event_source *)((char *)(n) - offsetof(struct event_source, node)))
 
 static bool source_before(const struct avl_node *a, const struct avl_node *b) {
@@ -360,7 +352,7 @@ int64_t events_wait(struct handle *queue, struct n_event *uout, size_t max, uint
     struct event_queue *q = queue_of(queue);
     if (!max) return -N_ERR_INVALID;
     if (max > EVENTS_BATCH) max = EVENTS_BATCH; /* the rest stays for the next wait */
-    struct event found[EVENTS_BATCH];
+    struct n_event found[EVENTS_BATCH];
     struct wait_queue *threads = &q->object.waiters;
     for (;;) {
         struct event_source *gone = NULL, *kept = NULL, **kept_tail = &kept;
@@ -381,12 +373,12 @@ int64_t events_wait(struct handle *queue, struct n_event *uout, size_t max, uint
                     /* not ready: armed; ready, but a change took it meanwhile: pending again */
                     if (!ready || !watch_disarm(s)) continue;
                 }
-                found[n++] = (struct event){.token = s->token, .events = ready, .at = s->at};
+                found[n++] = (struct n_event){.token = s->token, .events = ready, .time_ns = s->at};
                 s->next = NULL; /* stays pending, after what comes meanwhile */
                 *kept_tail = s;
                 kept_tail = &s->next;
             } else if (s->kind == SOURCE_TIMER) {
-                found[n++] = (struct event){.token = s->token, .events = N_EVENT_TIMER, .at = s->timer.due};
+                found[n++] = (struct n_event){.token = s->token, .events = N_EVENT_TIMER, .time_ns = s->timer.due};
                 if (s->timer.period) {
                     s->timer.due = timer_next(s, now);
                     if (s->timer.due != CLOCK_NEVER) alarm_set(&s->timer.alarm, s->timer.due);
@@ -395,7 +387,7 @@ int64_t events_wait(struct handle *queue, struct n_event *uout, size_t max, uint
                     gone = s;
                 }
             } else {
-                found[n++] = (struct event){.token = s->token, .events = N_EVENT_ADDRESS, .at = s->at};
+                found[n++] = (struct n_event){.token = s->token, .events = N_EVENT_ADDRESS, .time_ns = s->at};
                 if (source_unlink(q, s, NULL)) {
                     s->next = gone;
                     gone = s;
@@ -415,12 +407,7 @@ int64_t events_wait(struct handle *queue, struct n_event *uout, size_t max, uint
         spin_unlock(&q->lock, flags);
         if (left) wq_wake(threads, 1);
         sources_free(gone);
-        if (n) {
-            /* the moments stay here until n_event carries them */
-            struct n_event out[EVENTS_BATCH];
-            for (size_t i = 0; i < n; i++) out[i] = (struct n_event){.token = found[i].token, .events = found[i].events};
-            return copy_to_user(uout, out, n * sizeof *uout) < 0 ? -N_ERR_BAD_ADDRESS : (int64_t)n;
-        }
+        if (n) return copy_to_user(uout, found, n * sizeof *uout) < 0 ? -N_ERR_BAD_ADDRESS : (int64_t)n;
         if (now >= deadline) return 0;
         if (thread_current()->killed) return -N_ERR_STOPPED;
         /* Asleep unless something is pending, looked at under the threads' lock: a source told

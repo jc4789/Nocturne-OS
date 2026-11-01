@@ -7,9 +7,9 @@
 struct net_stream {size_t allowance,accepted;};
 static uint64_t clock_ms;
 static void (*sleep_hook)(void);
-uint64_t uptime_ms(void){return clock_ms;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(clock_ms)*1000000ULL;}
 void yield(void){}
-void n_sleep_ms(uint64_t n){clock_ms+=n;if(sleep_hook)sleep_hook();}
+void n_sleep_until(uint64_t d){if(d/1000000ULL>clock_ms)clock_ms=d/1000000ULL;if(sleep_hook)sleep_hook();}
 long ns_try_write(net_stream *s,const void *p,size_t n){(void)p;if(!n)return 0;
     if(!s->allowance)return -2;if(n>s->allowance)n=s->allowance;s->allowance-=n;s->accepted+=n;return (long)n;}
 long ns_try_read(net_stream *s,void *p,size_t n){(void)s;(void)p;(void)n;return -2;}

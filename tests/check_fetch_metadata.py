@@ -90,7 +90,7 @@ n_result webprefs_accept_language(char *out,size_t cap){
 /* stub：cookie の瓶の写しは空。 */
 long webcookie_export(webcookie_jar *jar,void *out,size_t cap,int64_t now){(void)jar;(void)out;(void)cap;(void)now;return 0;}
 /* stub：時計。remaining は製品の本文で、試験の要求の締切は十分に先。 */
-uint64_t n_clock_uptime_ms(void){return 1000;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(1000)*1000000ULL;}
 /* stub：preflight の転送。送った頭を写し、応答は無く失敗にする。 */
 static char preflight_sent[1024];
 static unsigned preflight_requests;

@@ -107,7 +107,7 @@ static inline int down_trylock(struct semaphore *sem)
 static inline void down(struct semaphore *sem)
 {
     while (down_trylock(sem))
-        wait_on_address(&sem->count, 0, UINT32_MAX);
+        wait_on_address(&sem->count, 0, N_CLOCK_NEVER);
 }
 /* Nothing interrupts a wait in nvrm. */
 static inline int down_interruptible(struct semaphore *sem)

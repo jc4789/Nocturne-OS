@@ -634,7 +634,7 @@ static void expat_failed(struct xml_parser *x) {
 }
 /* Run Expat in parts of slice bytes until it stops at a script's end tag,
    reaches the end, fails, or has read bytes more input or passed deadline
-   (uptime_ms; 0: none). A stopped Expat resumes in the part it stopped in. */
+   (monotonic ms; 0: none). A stopped Expat resumes in the part it stopped in. */
 static void run(struct xml_parser *x, size_t slice, size_t bytes, uint64_t deadline) {
     size_t start = x->fed;
     if (x->suspended) {
@@ -657,7 +657,7 @@ static void run(struct xml_parser *x, size_t slice, size_t bytes, uint64_t deadl
         if (status != XML_STATUS_OK) { expat_failed(x); return; }
         if (final) { x->finished = true; return; }
         if (!checkpoint(x)) return;
-        if (x->fed - start >= bytes || (deadline && uptime_ms() >= deadline)) return;
+        if (x->fed - start >= bytes || (deadline && (n_clock_monotonic() / N_NS_PER_MS) >= deadline)) return;
     }
 }
 enum xml_parse_result xml_parse_document(web_doc *d, web_doc *checkpoint_doc, const char *input, size_t length,
@@ -740,7 +740,7 @@ int xml_parser_resume(struct xml_parser *x, node_t **script) {
                             x->result == XML_PARSE_OOM ? HTML_PARSE_FAILED : HTML_PARSE_DONE;
     if (live(x)) {
         struct xml_memory *outer = enter(x);
-        if (checkpoint(x)) run(x, XML_SLICE_BYTES, XML_RESUME_BYTES, uptime_ms() + XML_RESUME_MS);
+        if (checkpoint(x)) run(x, XML_SLICE_BYTES, XML_RESUME_BYTES, (n_clock_monotonic() / N_NS_PER_MS) + XML_RESUME_MS);
         xml_memory_current = outer;
     }
     switch (x->result) {

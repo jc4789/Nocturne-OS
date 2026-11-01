@@ -857,11 +857,12 @@ static void win_destroy(struct window *w) {
     wm_unlock();
 }
 
-/* Takes every queued event that fits in out[max] (the app's memory), waiting up to deadline. The
-   count, 0 when the time ran out, or N_ERR_CLOSED once a closed window has handed out its last
-   event. Any CPU, without wm_lock: the events leave the mailbox under ev_lock a batch at a time,
-   into the kernel's memory, and are copied to out after it (a copy may sleep). Events taken for a
-   page another thread took away meanwhile are lost, with N_ERR_BAD_ADDRESS. */
+/* Takes every queued event that fits in out[max] (the app's memory), waiting until deadline
+   (CLOCK_NEVER: until one arrives). The count, 0 when the time ran out, or N_ERR_CLOSED once a
+   closed window has handed out its last event. Any CPU, without wm_lock: the events leave the
+   mailbox under ev_lock a batch at a time, into the kernel's memory, and are copied to out after
+   it (a copy may sleep). Events taken for a page another thread took away meanwhile are lost,
+   with N_ERR_BAD_ADDRESS. */
 #define RECEIVE_BATCH 16
 static int64_t win_receive(struct window *w, struct gui_event *out, size_t max, uint64_t deadline) {
     if (max == 0 || max > SIZE_MAX / sizeof *out) return -N_ERR_INVALID;
@@ -3626,13 +3627,13 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
     int64_t result;
     if (num == SYS_WIN_RECEIVE) {
         /* Without the WM lock (ev_lock); the handle's reference keeps the window's memory. */
-        result = win_receive(handle->object->priv, (struct gui_event *)b, (size_t)c, syscall_deadline((int64_t)d));
+        result = win_receive(handle->object->priv, (struct gui_event *)b, (size_t)c, d);
     } else if (num == SYS_WIN_PRESENT && !((struct window *)handle->object->priv)->queue) {
         result = e ? -N_ERR_INVALID : present_rect(handle, b, c, d);
     } else if (num == SYS_WIN_RESIZE) {
         result = win_resize(handle, (int)b, (int)c);
     } else if (num == SYS_WIN_ACQUIRE) {
-        result = win_acquire(handle, syscall_deadline((int64_t)b));
+        result = win_acquire(handle, b);
     } else {
         struct call_input in = {0};
         if (num == SYS_WIN_SET_TITLE) {

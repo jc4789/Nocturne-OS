@@ -19,9 +19,9 @@ int main(void){
     strcat(code,";runNativeMutationCases().catch(e=>console.error(e.stack||e));");
     struct web_host host={.console=console};const char *html="<!doctype html><html><head></head><body></body></html>";
     web_doc *d=web_live(html,strlen(html),"https://parallel.test/","utf-8",&host);if(!d){free(code);return 2;}
-    for(int i=0;i<10;i++)web_tick(d,uptime_ms());
+    for(int i=0;i<10;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     bool ok=web_console_eval(d,code,strlen(code));free(code);
-    for(int i=0;i<10&&!done;i++)web_tick(d,uptime_ms());
+    for(int i=0;i<10&&!done;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     if(!ok||done!=23||checks!=23){failures++;printf("FAIL paralleljs completion %d/%d\n",checks,done);}
     if(d->profile.native_calls||d->profile.native_ms){failures++;printf("FAIL paralleljs disabled profiling\n");}
     web_free(d);printf("paralleljstest: %d checks, %d failed\n",checks,failures);return failures?1:0;

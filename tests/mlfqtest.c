@@ -23,8 +23,8 @@ static unsigned long own_cpu_ms(void) {
     return 0;
 }
 static void await_start(unsigned long start) {
-    unsigned long now = (unsigned long)uptime_ms();
-    if (now < start) n_sleep_ms(start - now);
+    unsigned long now = (unsigned long)(n_clock_monotonic() / N_NS_PER_MS);
+    if (now < start) n_sleep_until(n_clock_after((uint64_t)(start - now) * N_NS_PER_MS));
 }
 /* One report is one channel message. */
 static int send_report(const struct report *r) {
@@ -34,7 +34,7 @@ static int child_burn(unsigned long start, unsigned seed) {
     struct report r = {0};
     r.magic = REPORT_MAGIC; r.kind = 1;
     await_start(start);
-    r.begin_ms = (unsigned long)uptime_ms();
+    r.begin_ms = (unsigned long)(n_clock_monotonic() / N_NS_PER_MS);
     unsigned long cpu_begin = own_cpu_ms();
     volatile unsigned long value = seed;
     /* この区画には syscall/yield/sleep がない。本物の CPU-bound user 実行。 */
@@ -42,7 +42,7 @@ static int child_burn(unsigned long start, unsigned seed) {
         for (unsigned i = 0; i < 8192; i++) value = value * 6364136223846793005UL + 1442695040888963407UL;
         r.blocks++;
     }
-    r.end_ms = (unsigned long)uptime_ms();
+    r.end_ms = (unsigned long)(n_clock_monotonic() / N_NS_PER_MS);
     r.cpu_ms = own_cpu_ms() - cpu_begin;
     r.checksum = value;
     return send_report(&r) ? 0 : 2;
@@ -57,31 +57,31 @@ static int child_interactive(unsigned long start) {
     gfx_fill(&win->c, 0, 0, win->w, win->h, RGB(32, 28, 50));
     r.present_ok = win_update(win) == 0;
     await_start(start);
-    r.begin_ms = (unsigned long)uptime_ms();
+    r.begin_ms = (unsigned long)(n_clock_monotonic() / N_NS_PER_MS);
     unsigned long cpu_begin = own_cpu_ms();
     for (unsigned i = 0; i < SAMPLES; i++) {
-        unsigned long due = (unsigned long)uptime_ms() + 20;
-        n_sleep_ms(20);
-        unsigned long woke = (unsigned long)uptime_ms();
+        unsigned long due = (unsigned long)(n_clock_monotonic() / N_NS_PER_MS) + 20;
+        n_sleep_until(n_clock_after(20 * N_NS_PER_MS));
+        unsigned long woke = (unsigned long)(n_clock_monotonic() / N_NS_PER_MS);
         r.lateness[r.count++] = woke > due ? woke - due : 0;
         r.cpu_mask |= 1UL << (cpu_index() % 64);
         gfx_fill(&win->c, 8, 8, 24, 24, (i & 1) ? RGB(170, 130, 240) : RGB(90, 190, 180));
         if (win_update_rect(win, 8, 8, 24, 24) != 0) r.present_ok = 0;
     }
-    r.end_ms = (unsigned long)uptime_ms();
+    r.end_ms = (unsigned long)(n_clock_monotonic() / N_NS_PER_MS);
     r.cpu_ms = own_cpu_ms() - cpu_begin;
     win_close(win);
     return r.present_ok && send_report(&r) ? 0 : 2;
 }
 /* Waits on an event queue until the child's report arrives or the deadline passes. */
 static int receive_until(n_handle channel, void *data, size_t bytes, unsigned long deadline) {
-    unsigned long now = (unsigned long)uptime_ms();
+    unsigned long now = (unsigned long)(n_clock_monotonic() / N_NS_PER_MS);
     if (now >= deadline) return 0;
     n_handle events = n_events_create();
     if (events < 0) return 0;
     struct n_event ev;
     int ok = n_events_watch(events, channel, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, 1) == 0 &&
-             n_events_wait(events, &ev, 1, (int64_t)(deadline - now)) == 1 &&
+             n_events_wait(events, &ev, 1, (uint64_t)deadline * N_NS_PER_MS) == 1 &&
              n_channel_receive(channel, data, bytes, 0, NULL) == (n_result)bytes;
     n_handle_close(events);
     return ok;
@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
     struct report r[CHILDREN];
     memset(r, 0, sizeof r);
     for (unsigned i = 0; i < CHILDREN; i++) app[i] = input[i] = -1;
-    unsigned long start = (unsigned long)uptime_ms() + 500, deadline = start + RUN_TIMEOUT_MS;
+    unsigned long start = (unsigned long)(n_clock_monotonic() / N_NS_PER_MS) + 500, deadline = start + RUN_TIMEOUT_MS;
     char when[32]; snprintf(when, sizeof when, "%lu", start);
     /* GUI 子を先に準備し、4 burner 全員へ同じ開始時刻を渡す。 */
     for (unsigned i = 0; i < CHILDREN; i++) {
@@ -119,7 +119,7 @@ int main(int argc, char **argv) {
             ok = 0; goto cleanup;
         }
         int status = -1;
-        if (n_app_result(app[i], -1, &status) < 0 || status) { ok = 0; goto cleanup; }
+        if (n_app_result(app[i], N_CLOCK_NEVER, &status) < 0 || status) { ok = 0; goto cleanup; }
         n_handle_close(app[i]); app[i] = -1; completed++;
         if (i && (r[i].kind != 1 || r[i].blocks != WORK_BLOCKS)) ok = 0;
     }
@@ -139,7 +139,7 @@ int main(int argc, char **argv) {
                r[i].blocks, r[i].end_ms - r[i].begin_ms, r[i].cpu_ms, r[i].checksum);
 cleanup:
     for (unsigned i = 0; i < CHILDREN; i++) {
-        if (app[i] >= 0) { int status; n_app_stop(app[i], 0); n_app_result(app[i], -1, &status); n_handle_close(app[i]); }
+        if (app[i] >= 0) { int status; n_app_stop(app[i], 0); n_app_result(app[i], N_CLOCK_NEVER, &status); n_handle_close(app[i]); }
         if (input[i] >= 0) n_handle_close(input[i]);
     }
     printf("mlfqtest: %s\n", ok ? "ok" : "FAIL incomplete/timeout/protocol");

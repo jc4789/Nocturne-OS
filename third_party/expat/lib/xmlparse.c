@@ -1118,11 +1118,11 @@ generate_hash_secret_salt(void) {
   writeRandomBytes_arc4random(&entropy, sizeof(entropy));
   return ENTROPY_DEBUG("arc4random", entropy);
 #elif defined(XML_NOCTURNE)
-  /* The system entropy pool; uptime only if the pool cannot answer. */
+  /* The system entropy pool; the monotonic clock only if the pool cannot answer. */
   if (n_random(&entropy, sizeof(entropy)) >= 0)
     return ENTROPY_DEBUG("n_random", entropy);
   entropy.k[0] = 0;
-  entropy.k[1] = (uint64_t)uptime_ms() * 2305843009213693951ULL;
+  entropy.k[1] = n_clock_monotonic() * 2305843009213693951ULL;
   return ENTROPY_DEBUG("fallback(uptime)", entropy);
 #else
   /* Try high quality providers first .. */

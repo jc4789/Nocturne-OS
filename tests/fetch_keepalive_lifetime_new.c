@@ -1,7 +1,7 @@
 /* A native completion/worker boundary fixture, not real-site acceptance. */
 static unsigned checks,failures,kills,reaps,callbacks;
 #define CHECK(name,expr) do {checks++;if(!(expr)){failures++;printf("FAIL %s\n",name);}}while(0)
-uint64_t uptime_ms(void){return 100;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(100)*1000000ULL;}
 int close(int fd){(void)fd;return 0;}
 int kill(int pid){(void)pid;kills++;return 0;}
 int waitpid(int pid,int*status,int flags){(void)status;(void)flags;reaps++;return pid;}

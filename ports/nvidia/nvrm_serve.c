@@ -237,7 +237,7 @@ static int client_thread(void *arg) {
     bool open = n_events_watch_address(c->events, &serving_ended, 0, STOP_TOKEN) >= 0;
     while (open) {
         struct n_event ev[2];
-        n_result n = n_events_wait(c->events, ev, 2, -1);
+        n_result n = n_events_wait(c->events, ev, 2, N_CLOCK_NEVER);
         if (n < 0) {
             printf("nvrm: a client's event wait failed (%s); ending the client\n", n_result_text(n));
             break;
@@ -317,7 +317,7 @@ n_result nvrm_serve(uint32_t pci_target) {
     n_result ended = 0;
     for (;;) {
         struct n_event ev[16];
-        n_result n = n_events_wait(events, ev, 16, -1);
+        n_result n = n_events_wait(events, ev, 16, N_CLOCK_NEVER);
         if (n < 0) { ended = n; break; }
         for (n_result i = 0; i < n; i++) {
             n_handle ready = ev[i].token == LISTENER_TOKEN ? listener : legacy;

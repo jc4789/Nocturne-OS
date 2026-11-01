@@ -845,7 +845,7 @@ static int fault_main(void *arg)
     n_result watching = n_events_watch_address(conn->events, &conn->stop, 0, STOP_TOKEN);
     while (watching >= 0 && !__atomic_load_n(&conn->stop, __ATOMIC_ACQUIRE)) {
         struct n_event events[16];
-        n_result n = n_events_wait(conn->events, events, ARRAY_SIZE(events), -1);
+        n_result n = n_events_wait(conn->events, events, ARRAY_SIZE(events), N_CLOCK_NEVER);
         if (n < 0) {
             printk("nvidia-uvm: app %u's fault thread cannot wait (%s); its touches of UVM memory fail\n",
                    conn->principal, n_result_text(n));

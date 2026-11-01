@@ -15,8 +15,8 @@
 #include "user/libc/web/js_webidl.h"
 
 /* The engine's Atomics.wait and its clock (and js_webidl.c's); the cases never wait. */
-uint64_t n_clock_uptime_ms(void) { return 0; }
-uint64_t uptime_ms(void) { return 0; }
+uint64_t n_clock_monotonic(void){return (uint64_t)(0)*1000000ULL;}
+
 n_result wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned ms) { (void)address; (void)expected; (void)ms; return -N_ERR_TIMEOUT; }
 n_result wake_address(volatile uint32_t *address, unsigned count) { (void)address; (void)count; return 0; }
 

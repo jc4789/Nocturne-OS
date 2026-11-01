@@ -19,4 +19,4 @@ struct web_js_state {
     struct js_posted_task *posted,*last_posted;unsigned posted_count;uint32_t next_posted;
 };
 static struct web_js_state *state(JSContext *ctx){return JS_GetContextOpaque(ctx);}
-static uint64_t uptime_ms(void){return 1234;}
+static uint64_t n_clock_monotonic(void){return (uint64_t)(1234)*1000000ULL;}

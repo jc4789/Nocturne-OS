@@ -1202,7 +1202,7 @@ bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request
     char *absolute = NULL;
     if (doc_encoding_parse_url(d, action && *action ? action : d->url, &absolute) != 1 || !strncasecmp(absolute, "javascript:", 11)) { free(absolute); return false; }
     struct form_encoding encoding = {.kind = kind, .charset = submission_charset(d, form)};
-    uint64_t stamp = uptime_ms();
+    uint64_t stamp = (n_clock_monotonic() / N_NS_PER_MS);
     for (unsigned retry = 0; retry < 64; retry++) {
         encoding.body.n = 0; encoding.collision = false;
         snprintf(encoding.boundary, sizeof encoding.boundary, "----NocturneForm%llx%llx%u", (unsigned long long)stamp, (unsigned long long)d->dom_revision, retry);

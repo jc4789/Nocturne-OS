@@ -46,7 +46,7 @@ static bool command_next(struct nmedia_worker_command *c,struct video_tx *v){
         if(r==(n_result)sizeof *c)return true;
         if(r!=-N_ERR_NOT_READY)return false;
         struct n_event e[2];
-        if(n_events_wait(events,e,2,-1)<0)return false;
+        if(n_events_wait(events,e,2,N_CLOCK_NEVER)<0)return false;
     }
 }
 static bool respond(const struct nmedia_worker_response *r,const void *payload){

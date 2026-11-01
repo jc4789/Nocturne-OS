@@ -4226,7 +4226,7 @@ void web_webgl_set_profile(bool on) { profile_on = on; }
 static void profile_add(size_t slot, uint64_t cycles) {
     profile_cycles[slot] += cycles;
     profile_calls[slot]++;
-    uint64_t now = uptime_ms(), tsc = __builtin_ia32_rdtsc();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS), tsc = __builtin_ia32_rdtsc();
     if (!profile_ms) { profile_ms = now; profile_tsc = tsc; return; }
     if (now - profile_ms < 2000) return;
     double per_ms = (double)(tsc - profile_tsc) / (double)(now - profile_ms);

@@ -73,7 +73,7 @@ static void logf_(const char *fmt, ...) {
     unlock();
 }
 
-static bool out_of_time(void) { return stop_all || n_clock_uptime_ms() >= deadline_ms; }
+static bool out_of_time(void) { return stop_all || (n_clock_monotonic() / N_NS_PER_MS) >= deadline_ms; }
 
 /* One logged call. */
 static long call(long num, const long a[5]) {
@@ -268,6 +268,7 @@ static void clamp_waits(long num, long a[5]) {
     case SYS_CHANNEL_RECEIVE: a[3] &= ~(long)N_CHANNEL_WAIT; break;
     case SYS_DOCUMENT_CLAIM: a[1] = 0; break;
     case SYS_WIN_RECEIVE: a[3] = 0; break;
+    case SYS_WIN_ACQUIRE: a[1] = 0; break;
     case SYS_APP_RESULT: a[1] = 0; break;
     case SYS_AUDIO_SUBMIT: a[3] &= ~(long)N_AUDIO_WAIT; break;
     case SYS_PCI_INTERRUPT_TAKE: a[1] = 0; break;
@@ -590,7 +591,7 @@ static void races(int rounds) {
         }
         __atomic_store_n(&race_go, 1, __ATOMIC_RELEASE);
         for (int r = 0; r < rounds * 20 && !out_of_time(); r++) {
-            n_sleep_ms(2);
+            n_sleep_until(n_clock_after(2 * N_NS_PER_MS));
             long old = race_h;
             /* close, then immediately make a new one: the number is likely reused */
             call5(SYS_HANDLE_CLOSE, old, 0, 0, 0, 0);
@@ -626,7 +627,7 @@ static void worker(void *unused) {
 
 static void finish(const char *how) {
     logf_("syscallfuzz: %s seed=%llu calls=%llu elapsed_ms=%llu", how, (unsigned long long)seed_arg,
-          (unsigned long long)calls, (unsigned long long)(n_clock_uptime_ms() - started_ms));
+          (unsigned long long)calls, (unsigned long long)((n_clock_monotonic() / N_NS_PER_MS) - started_ms));
     for (int i = 1; i < 64; i++) if (errs[i]) logf_("syscallfuzz: error %d (%s) x%u", i, n_result_text(-i), errs[i]);
     if (violations) logf_("syscallfuzz: RESULT FAIL violations=%llu", (unsigned long long)violations);
     else logf_("syscallfuzz: RESULT PASS");
@@ -641,7 +642,7 @@ int main(int argc, char **argv) {
     if (!rng_state) rng_state = 1;
     for (int i = 0; i < 8; i++) rnd();
     loghandle = n_system_log_open();
-    started_ms = n_clock_uptime_ms();
+    started_ms = (n_clock_monotonic() / N_NS_PER_MS);
     deadline_ms = started_ms + (uint64_t)seconds * 1000;
 
     void *pages, *pair = NULL;
@@ -663,10 +664,10 @@ int main(int argc, char **argv) {
 
     int tid = thread_create(worker, NULL);
     if (tid <= 0) { logf_("syscallfuzz: cannot start the worker thread"); return 1; }
-    uint64_t last = progress, last_change = n_clock_uptime_ms();
+    uint64_t last = progress, last_change = (n_clock_monotonic() / N_NS_PER_MS);
     while (!__atomic_load_n(&stop_all, __ATOMIC_ACQUIRE)) {
-        n_sleep_ms(100);
-        uint64_t now = n_clock_uptime_ms();
+        n_sleep_until(n_clock_after(100 * N_NS_PER_MS));
+        uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
         if (progress != last) { last = progress; last_change = now; }
         if (now >= deadline_ms) { logf_("syscallfuzz: time is up"); stop_all = 1; break; }
         if (now - last_change > HANG_MS) {
@@ -677,7 +678,7 @@ int main(int argc, char **argv) {
         }
     }
     /* Give the worker a moment to leave its call before the process ends. */
-    for (int i = 0; i < 20 && progress != last; i++) { last = progress; n_sleep_ms(50); }
+    for (int i = 0; i < 20 && progress != last; i++) { last = progress; n_sleep_until(n_clock_after(50 * N_NS_PER_MS)); }
     finish(stop_all == 2 ? "done" : "stopped");
     return violations ? 2 : 0;
 }

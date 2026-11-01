@@ -12,8 +12,8 @@ static bool checkpoint(void *context) { (void)context; return true; }
 static bool initialize_counted(web_doc *doc,bool count) {
     /* web_live queues the incremental parser. Exercise the same tick path as
        the browser before querying the DOM; layout is not a parser driver. */
-    uint64_t start = uptime_ms();
-    while (doc->parser && !doc->native_cancelled && uptime_ms() - start < 5000) web_tick(doc, uptime_ms());
+    uint64_t start = (n_clock_monotonic() / N_NS_PER_MS);
+    while (doc->parser && !doc->native_cancelled && (n_clock_monotonic() / N_NS_PER_MS) - start < 5000) web_tick(doc, (n_clock_monotonic() / N_NS_PER_MS));
     bool ready = !doc->parser && !doc->native_cancelled && doc->html && doc->body;
     if(count)check(ready, "normal product ticks finish initial parsing"); return ready;
 }

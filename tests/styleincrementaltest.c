@@ -19,7 +19,7 @@ static bool checkpoint(void *context) { (void)context; return true; }
 static web_doc *load_html(const char *html) {
     struct web_host host={.script_checkpoint=checkpoint};
     web_doc *d=web_live(html,strlen(html),"https://style.test/","utf-8",&host);
-    if(d) { d->profile_enabled=true; parallel_profile_enable(true); for(int i=0;i<8;i++)web_tick(d,uptime_ms()); }
+    if(d) { d->profile_enabled=true; parallel_profile_enable(true); for(int i=0;i<8;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS)); }
     return d;
 }
 /* a computed content of one string, text */

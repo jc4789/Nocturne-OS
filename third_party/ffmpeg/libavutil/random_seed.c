@@ -34,10 +34,10 @@
 #define TEST 0
 #endif
 
-/* Fallback jitter timer: the native uptime clock, in milliseconds. */
+/* Fallback jitter timer: the native monotonic clock, in ns. */
 typedef uint64_t jitter_tick_t;
-#define jitter_ticks() n_clock_uptime_ms()
-#define JITTER_TICKS_PER_SEC 1000
+#define jitter_ticks() n_clock_monotonic()
+#define JITTER_TICKS_PER_SEC N_NS_PER_S
 
 static uint32_t get_generic_seed(void)
 {

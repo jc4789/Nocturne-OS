@@ -107,7 +107,9 @@ static uint8_t gop[GOP_PITCH * H];
 static uint64_t clock_ns;
 
 uint64_t nvrm_now_ns(void) { return clock_ns; }
-void n_sleep_ms(uint64_t ms) { clock_ns += ms * 1000000u; }
+uint64_t n_clock_monotonic(void) { return clock_ns; }
+uint64_t n_clock_after(uint64_t ns) { return clock_ns + ns; }
+void n_sleep_until(uint64_t deadline) { if (deadline > clock_ns) clock_ns = deadline; }
 const char *n_result_text(n_result r) { (void)r; return "error"; }
 
 /* KAPI's memory and surfaces, in the order allocated: the cursor first, then the desktop's
@@ -239,15 +241,15 @@ n_result n_pci_screen_image_end(n_handle pci, n_result image) {
 static n_result screen_result;
 static unsigned screen_refusals;
 n_result n_pci_screen_state(n_handle pci, uint32_t output, uint64_t seen, struct n_screen_state *out,
-                            int64_t timeout_ms) {
+                            uint64_t deadline) {
     CHECK(pci == nvrm_dev.pci && output == 0);
     if (screen_result) {
-        if (timeout_ms > 0 && ++screen_refusals >= 2) __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
+        if (deadline > clock_ns && ++screen_refusals >= 2) __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
         return screen_result;
     }
     *out = screen;
     if (seen != screen.serial) return 0;
-    if (timeout_ms > 0) __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
+    if (deadline > clock_ns) __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
     return -N_ERR_TIMEOUT;
 }
 static void screen_says(uint32_t app, bool pointer, int32_t x, int32_t y) {
@@ -380,9 +382,9 @@ static uint64_t system_flips(uint32_t buffer) {
     return flip_serial;
 }
 /* With no flip waiting, a wait stops the flip thread, so the test runs flip_thread() once per flip. */
-n_result n_pci_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max, int64_t timeout_ms) {
+n_result n_pci_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max, uint64_t deadline) {
     CHECK(pci == nvrm_dev.pci && max >= 1);
-    (void)timeout_ms;
+    (void)deadline;
     if (!flip_waiting) {
         __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
         return 0;

@@ -4899,9 +4899,9 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
 void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y) {
     uint32_t memo=box_visual_memo_begin();
     bool profile=d && d->profile_enabled && !d->frame_parent;
-    uint64_t start=profile?uptime_ms():0;
+    uint64_t start=profile?(n_clock_monotonic() / N_NS_PER_MS):0;
     paint_document(d,c,x,y,w,h,doc_x,doc_y);
-    if(profile){paint_profile.paints++;paint_profile.total_ms+=uptime_ms()-start;}
+    if(profile){paint_profile.paints++;paint_profile.total_ms+=(n_clock_monotonic() / N_NS_PER_MS)-start;}
     box_visual_memo_end(memo);
 }
 static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y) {
@@ -4917,9 +4917,9 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
        overwritten. A cancelled cache build cannot leave a white viewport. */
     d->view_x=doc_x;d->view_y=doc_y;
     bool profile=d->profile_enabled && !d->frame_parent;
-    uint64_t mark=profile?uptime_ms():0;
+    uint64_t mark=profile?(n_clock_monotonic() / N_NS_PER_MS):0;
     if(!prepare_paint_order(d)){doc_paint_full(d);return;}
-    if(profile){uint64_t now=uptime_ms();paint_profile.order_ms+=now-mark;mark=now;}
+    if(profile){uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);paint_profile.order_ms+=now-mark;mark=now;}
     d->initial_render_done=true;
     paint_debug_begin(d);
     d->view_x=doc_x; d->view_y=doc_y; /* frame crops use this paint's real scroll */
@@ -4938,7 +4938,7 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
         double clip[4]={(double)doc_x+c->cx0-x,(double)doc_y+c->cy0-y,(double)doc_x+c->cx1-x,(double)doc_y+c->cy1-y};
         web_frames_prepare_paint(d,clip);web_avmedia_snapshot_begin(d,c,x,y,w,h);
     }
-    if(profile){uint64_t now=uptime_ms();paint_profile.frames_ms+=now-mark;mark=now;}
+    if(profile){uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);paint_profile.frames_ms+=now-mark;mark=now;}
     struct pctx P = {0};
     P.d = d;
     P.c = c;
@@ -4985,7 +4985,7 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
     blend_results_free(&blends);
     /* Paint Timing "mark paint timing": this rendering update's end, once each. */
     if (!P.failed && (P.painted || P.contentful)) {
-        uint64_t painted_at = uptime_ms();
+        uint64_t painted_at = (n_clock_monotonic() / N_NS_PER_MS);
         if (!d->first_paint_ms) d->first_paint_ms = painted_at;
         if (P.contentful && !d->first_contentful_paint_ms) d->first_contentful_paint_ms = painted_at;
     }
@@ -4998,7 +4998,7 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
     }
     if (P.failed) doc_paint_full(d);
     paint_debug_finish(d);
-    if(profile){uint64_t now=uptime_ms();paint_profile.walk_ms+=now-mark;mark=now;}
+    if(profile){uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);paint_profile.walk_ms+=now-mark;mark=now;}
     if(snapshot_root) {
         canvas_t probe;int px,py;
         if(!P.failed && web_avmedia_snapshot_prepare(d,c,&probe,&px,&py,doc_x,doc_y)) {
@@ -5018,7 +5018,7 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
         }
         web_avmedia_snapshot_finish();
         web_frames_finish_paint(d);
-        if(profile)paint_profile.probe_ms+=uptime_ms()-mark;
+        if(profile)paint_profile.probe_ms+=(n_clock_monotonic() / N_NS_PER_MS)-mark;
     }
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
 }

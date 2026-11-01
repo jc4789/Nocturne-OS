@@ -72,51 +72,64 @@ static const char *script_interp(const char *path, char *buf, size_t n) {
     return N_FOLDER_SYSTEM "\\sh";
 }
 
-static struct n_clockinfo user_clock;
-static unsigned clock_initialized;
-static uint64_t clock_last;
-static uint64_t user_rdtsc(void) {
-    uint32_t lo, hi;
-    __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) : : "memory");
-    return (uint64_t)hi << 32 | lo;
-}
-n_result clock_info(struct n_clockinfo *info) { return SC1(SYS_CLOCK_INFO, info); }
-/* Each clock never goes back, whichever thread reads it. */
-static uint64_t clock_publish(uint64_t *last, uint64_t value) {
-    uint64_t previous = __atomic_load_n(last, __ATOMIC_RELAXED);
-    while (value > previous && !__atomic_compare_exchange_n(last, &previous, value, false,
-                                                           __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
-    return value < previous ? previous : value;
-}
-/* Microseconds since boot from the TSC, without a system call; false when only
-   the kernel can tell. */
-static bool user_clock_us(uint64_t *us) {
-    if (__atomic_load_n(&clock_initialized, __ATOMIC_ACQUIRE) != 2) {
-        unsigned expected = 0;
-        if (!__atomic_compare_exchange_n(&clock_initialized, &expected, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            return false;
-        if (clock_info(&user_clock) < 0) memset(&user_clock, 0, sizeof user_clock);
-        __atomic_store_n(&clock_initialized, 2, __ATOMIC_RELEASE);
+/* The clocks (abi.h, docs/nocturne-native-abi.md §8), read in the kernel's data of them, which every
+   app has at N_CLOCK_ADDRESS, without a call. The data's fields in force at one reading of this
+   CPU's TSC (h: the header, when given), and the monotonic clock at it. A reading never goes back
+   on a thread, nor after one it learned of from another thread: the kernel adds to each CPU's TSC
+   what it reads behind the others. */
+static uint64_t clock_read(struct n_clock *h) {
+    const struct n_clock *c = (const struct n_clock *)N_CLOCK_ADDRESS;
+    for (;;) {
+        uint32_t seq = __atomic_load_n(&c->seq, __ATOMIC_ACQUIRE), lo, hi, cpu;
+        if (seq & 1) { /* the kernel is writing it */
+            __asm__ volatile("pause");
+            continue;
+        }
+        /* RDTSCP waits for the load of seq before it; the LFENCE holds the fields' loads after it */
+        __asm__ volatile("rdtscp; lfence" : "=a"(lo), "=d"(hi), "=c"(cpu) : : "memory");
+        uint64_t base_tsc = __atomic_load_n(&c->base_tsc, __ATOMIC_RELAXED);
+        uint64_t base_ns = __atomic_load_n(&c->base_ns, __ATOMIC_RELAXED);
+        uint64_t mult = __atomic_load_n(&c->mult, __ATOMIC_RELAXED);
+        uint32_t shift = __atomic_load_n(&c->shift, __ATOMIC_RELAXED);
+        int64_t offset = cpu < __atomic_load_n(&c->cpus, __ATOMIC_RELAXED) ? __atomic_load_n(&c->offset[cpu], __ATOMIC_RELAXED) : 0;
+        if (h) {
+            h->asleep_ns = __atomic_load_n(&c->asleep_ns, __ATOMIC_RELAXED);
+            h->wall_ns = __atomic_load_n(&c->wall_ns, __ATOMIC_RELAXED);
+            h->wall_from = __atomic_load_n(&c->wall_from, __ATOMIC_RELAXED);
+            h->wall_until = __atomic_load_n(&c->wall_until, __ATOMIC_RELAXED);
+            h->wall_slew = __atomic_load_n(&c->wall_slew, __ATOMIC_RELAXED);
+            h->wall_slew_mult = __atomic_load_n(&c->wall_slew_mult, __ATOMIC_RELAXED);
+        }
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&c->seq, __ATOMIC_RELAXED) != seq) continue;
+        uint64_t t = ((uint64_t)hi << 32 | lo) - (uint64_t)offset;
+        return t <= base_tsc ? base_ns : base_ns + (uint64_t)(((unsigned __int128)(t - base_tsc) * mult) >> shift);
     }
-    if (!(user_clock.flags & N_CLOCK_USER_TSC) || user_clock.tsc_hz < 1000000) return false;
-    uint64_t now = user_rdtsc();
-    if (now < user_clock.tsc_sample) return false;
-    /* Whole seconds first: the cycle count times a million leaves 64 bits
-       after an hour or so. */
-    uint64_t cycles = now - user_clock.tsc_sample;
-    *us = user_clock.uptime_ms * 1000 + cycles / user_clock.tsc_hz * 1000000 +
-          cycles % user_clock.tsc_hz * 1000000 / user_clock.tsc_hz;
-    return true;
 }
-uint64_t uptime_ms(void) {
-    uint64_t us;
-    return clock_publish(&clock_last, user_clock_us(&us) ? us / 1000 : (uint64_t)SC0(SYS_UPTIME));
+uint64_t n_clock_monotonic(void) { return clock_read(NULL); }
+uint64_t n_clock_boot(void) {
+    struct n_clock h;
+    uint64_t t = clock_read(&h);
+    return t + h.asleep_ns;
 }
-uint64_t uptime_us(void) {
-    static uint64_t last;
-    uint64_t us;
-    return clock_publish(&last, user_clock_us(&us) ? us : (uint64_t)SC0(SYS_UPTIME) * 1000);
+int64_t n_clock_wall(void) {
+    struct n_clock h;
+    uint64_t t = clock_read(&h);
+    int64_t wall = h.wall_ns + (int64_t)(t > h.wall_from ? t - h.wall_from : 0);
+    if (h.wall_slew) {
+        uint64_t until = t < h.wall_until ? t : h.wall_until, ran = until > h.wall_from ? until - h.wall_from : 0;
+        uint64_t whole = h.wall_slew < 0 ? -(uint64_t)h.wall_slew : (uint64_t)h.wall_slew;
+        uint64_t done = (uint64_t)(((unsigned __int128)ran * h.wall_slew_mult) >> 32);
+        if (done > whole) done = whole;
+        wall += h.wall_slew < 0 ? -(int64_t)done : (int64_t)done;
+    }
+    return wall;
 }
+uint64_t n_clock_after(uint64_t ns) {
+    uint64_t now = n_clock_monotonic();
+    return ns >= N_CLOCK_NEVER - now ? N_CLOCK_NEVER : now + ns;
+}
+void n_sleep_until(uint64_t deadline) { SC1(SYS_SLEEP, deadline); }
 
 /* ELF TLS (x86-64 variant II): the linked image ends at the FS control
    block. The linker defines these (user/user.ld, or TinyCC's
@@ -210,7 +223,8 @@ void thread_local_set(unsigned slot, void *value) {
     if (t && slot < N_TLS_SLOTS) t->slots[slot] = value;
 }
 time_t time(time_t *t) {
-    time_t v = n_clock_wall();
+    int64_t ns = n_clock_wall();
+    time_t v = ns >= 0 ? ns / (int64_t)N_NS_PER_S : -((-ns + (int64_t)N_NS_PER_S - 1) / (int64_t)N_NS_PER_S);
     if (t) *t = v;
     return v;
 }
@@ -224,11 +238,11 @@ n_result n_shared_map(n_handle shared, size_t bytes, int access, void **mapping)
 
 /* ---- native ABI: results come back as they are, errno is left alone ---- */
 #define NC5(n, a, b, c, d, e) __syscall(n, (long)(a), (long)(b), (long)(c), (long)(d), (long)(e))
-n_result wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms) {
-    return NC5(SYS_WAIT_ADDRESS, address, expected, timeout_ms, 0, 0);
+n_result wait_on_address(volatile uint32_t *address, uint32_t expected, uint64_t deadline) {
+    return NC5(SYS_WAIT_ADDRESS, address, expected, deadline, 0, 0);
 }
-n_result wait_on_address64(volatile uint64_t *address, uint64_t expected, unsigned timeout_ms) {
-    return NC5(SYS_WAIT_ADDRESS64, address, expected, timeout_ms, 0, 0);
+n_result wait_on_address64(volatile uint64_t *address, uint64_t expected, uint64_t deadline) {
+    return NC5(SYS_WAIT_ADDRESS64, address, expected, deadline, 0, 0);
 }
 n_result wake_address(volatile uint32_t *address, unsigned count) {
     return NC5(SYS_WAKE_ADDRESS, address, count, 0, 0, 0);
@@ -396,8 +410,8 @@ out:
     for (uint32_t i = 0; i < owned; i++) free(own[i]);
     return app;
 }
-n_result n_app_result(n_handle app, int64_t timeout_ms, int *status) {
-    return NC5(SYS_APP_RESULT, app, timeout_ms, status, 0, 0);
+n_result n_app_result(n_handle app, uint64_t deadline, int *status) {
+    return NC5(SYS_APP_RESULT, app, deadline, status, 0, 0);
 }
 n_result n_app_stop(n_handle app, int flags) { return NC5(SYS_APP_STOP, app, flags, 0, 0, 0); }
 n_result n_random(void *buf, size_t n) { return NC5(SYS_RANDOM, buf, n, 0, 0, 0); }
@@ -417,13 +431,13 @@ n_result n_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, uint3
 }
 n_handle n_pci_bar(n_handle pci, uint32_t bar) { return (n_handle)NC5(SYS_PCI_BAR, pci, bar, 0, 0, 0); }
 n_result n_pci_interrupts(n_handle pci, uint32_t count) { return NC5(SYS_PCI_INTERRUPTS, pci, count, 0, 0, 0); }
-n_result n_pci_interrupt_take(n_handle pci, int64_t timeout_ms) { return NC5(SYS_PCI_INTERRUPT_TAKE, pci, timeout_ms, 0, 0, 0); }
+n_result n_pci_interrupt_take(n_handle pci, uint64_t deadline) { return NC5(SYS_PCI_INTERRUPT_TAKE, pci, deadline, 0, 0, 0); }
 n_result n_pci_hold_screen(n_handle pci, bool hold) { return NC5(SYS_PCI_HOLD_SCREEN, pci, hold ? 1 : 0, 0, 0, 0); }
 n_result n_pci_give_screen(n_handle pci, uint32_t output, const struct n_screen_buffers *buffers) {
     return NC5(SYS_PCI_GIVE_SCREEN, pci, output, buffers, 0, 0);
 }
-n_result n_pci_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max, int64_t timeout_ms) {
-    return NC5(SYS_PCI_SCREEN_FLIPS, pci, out, max, timeout_ms, 0);
+n_result n_pci_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max, uint64_t deadline) {
+    return NC5(SYS_PCI_SCREEN_FLIPS, pci, out, max, deadline, 0);
 }
 n_result n_pci_screen_vblank(n_handle pci, const struct n_screen_vblank *vblank) {
     return NC5(SYS_PCI_SCREEN_VBLANK, pci, vblank, 0, 0, 0);
@@ -432,8 +446,8 @@ n_result n_pci_screen_modes(n_handle pci, uint32_t output, const struct n_screen
     return NC5(SYS_PCI_SCREEN_MODES, pci, output, modes, 0, 0);
 }
 n_result n_pci_screen_state(n_handle pci, uint32_t output, uint64_t seen, struct n_screen_state *out,
-                            int64_t timeout_ms) {
-    return NC5(SYS_PCI_SCREEN_STATE, pci, output, seen, out, timeout_ms);
+                            uint64_t deadline) {
+    return NC5(SYS_PCI_SCREEN_STATE, pci, output, seen, out, deadline);
 }
 n_result n_pci_screen_image(n_handle pci, uint32_t output, n_handle surface, const struct n_scanout *desc) {
     return NC5(SYS_PCI_SCREEN_IMAGE, pci, output, surface, desc, 0);
@@ -446,8 +460,8 @@ n_result n_pci_acpi_eval(n_handle pci, uint32_t node, const char *name, const st
     struct n_acpi_eval e = {node, nargs, name, args, data, data_size};
     return NC5(SYS_PCI_ACPI_EVAL, pci, &e, out, out_size, 0);
 }
-n_result n_pci_acpi_notify_take(n_handle pci, int64_t timeout_ms) {
-    return NC5(SYS_PCI_ACPI_NOTIFY_TAKE, pci, timeout_ms, 0, 0, 0);
+n_result n_pci_acpi_notify_take(n_handle pci, uint64_t deadline) {
+    return NC5(SYS_PCI_ACPI_NOTIFY_TAKE, pci, deadline, 0, 0, 0);
 }
 n_handle n_dma_create(n_handle pci, size_t bytes, uint32_t flags) { return (n_handle)NC5(SYS_DMA_CREATE, pci, bytes, flags, 0, 0); }
 n_result n_dma_addresses(n_handle shared, size_t first_page, uint64_t *out, size_t count) {
@@ -466,8 +480,8 @@ n_handle n_shared_compose(const struct n_shared_range *ranges, size_t count, uin
 n_handle n_pager_create(size_t bytes, n_handle *memory) {
     return (n_handle)NC5(SYS_PAGER_CREATE, bytes, memory, 0, 0, 0);
 }
-n_result n_pager_take(n_handle pager, struct n_pager_fault *out, size_t max, int64_t timeout_ms) {
-    return NC5(SYS_PAGER_TAKE, pager, out, max, timeout_ms, 0);
+n_result n_pager_take(n_handle pager, struct n_pager_fault *out, size_t max, uint64_t deadline) {
+    return NC5(SYS_PAGER_TAKE, pager, out, max, deadline, 0);
 }
 n_result n_pager_supply(n_handle pager, const struct n_pager_supply *runs, size_t count) {
     return NC5(SYS_PAGER_SUPPLY, pager, runs, count, 0, 0);
@@ -494,16 +508,16 @@ n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t toke
 n_result n_events_watch_address(n_handle q, volatile uint32_t *address, uint32_t expected, uint64_t token) {
     return NC5(SYS_EVENTS_WATCH_ADDRESS, q, address, expected, token, 0);
 }
-n_result n_events_timer(n_handle q, uint64_t ms, bool repeat, uint64_t token) {
-    return NC5(SYS_EVENTS_TIMER, q, ms, repeat, token, 0);
+n_result n_events_timer(n_handle q, uint64_t due, uint64_t period, uint64_t token) {
+    return NC5(SYS_EVENTS_TIMER, q, due, period, token, 0);
 }
 n_result n_events_unwatch(n_handle q, uint64_t token) { return NC5(SYS_EVENTS_UNWATCH, q, token, 0, 0, 0); }
-n_result n_events_wait(n_handle q, struct n_event *out, size_t max, int64_t timeout_ms) {
-    return NC5(SYS_EVENTS_WAIT, q, out, max, timeout_ms, 0);
+n_result n_events_wait(n_handle q, struct n_event *out, size_t max, uint64_t deadline) {
+    return NC5(SYS_EVENTS_WAIT, q, out, max, deadline, 0);
 }
-uint64_t n_clock_uptime_ms(void) { return uptime_ms(); }
-int64_t n_clock_wall(void) { return SC0(SYS_TIME); }
-void n_sleep_ms(uint64_t ms) { SC1(SYS_SLEEP, ms); }
+n_result n_thread_schedule(int tid, uint32_t schedule, uint64_t value) {
+    return NC5(SYS_THREAD_SCHEDULE, tid, schedule, value, 0, 0);
+}
 n_result proclist(struct n_procinfo *out, int max) { return SC2(SYS_PROCLIST, out, max); }
 n_result sysinfo(struct n_sysinfo *si) { return SC1(SYS_SYSINFO, si); }
 n_result cpu_info(struct n_cpuinfo *info) { return SC1(SYS_CPU_INFO, info); }
@@ -559,7 +573,7 @@ static int run_here(const char *full, char *const argv[]) {
     n_handle app = n_app_launch(full, &l);
     if (app < 0) return (int)app;
     int st = 0;
-    n_result r = n_app_result(app, -1, &st);
+    n_result r = n_app_result(app, N_CLOCK_NEVER, &st);
     n_handle_close(app);
     return r < 0 ? (int)r : st;
 }
@@ -799,7 +813,7 @@ static struct exit_callback *exit_callbacks;
 static uint32_t exit_callbacks_lock;
 static void exit_lock(void) {
     while (__atomic_exchange_n(&exit_callbacks_lock, 1, __ATOMIC_ACQUIRE)) {
-        if (wait_on_address(&exit_callbacks_lock, 1, UINT32_MAX) < 0) yield();
+        if (wait_on_address(&exit_callbacks_lock, 1, N_CLOCK_NEVER) < 0) yield();
     }
 }
 static void exit_unlock(void) {

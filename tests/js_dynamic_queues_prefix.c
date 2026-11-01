@@ -34,7 +34,7 @@ static unsigned checks,failed,reported,callback_count,expected_args;static bool 
 static bool force_rejection_oom;
 static void *test_rejection_allocate(JSRuntime *rt,size_t n){if(force_rejection_oom){force_rejection_oom=false;return NULL;}return js_malloc_rt(rt,n);}
 static struct web_js_state *state(JSContext *ctx){return JS_GetContextOpaque(ctx);}
-static uint64_t uptime_ms(void){return 0;}
+static uint64_t n_clock_monotonic(void){return (uint64_t)(0)*1000000ULL;}
 static uint64_t relative_time(struct web_js_state *s,uint64_t now){return now;}
 static const char *web_effective_url(web_doc *d){return d->url;}
 static bool make_origin(const char *url,char *out,size_t n){if(strlen(url)>=n)return false;strcpy(out,url);return true;}

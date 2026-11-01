@@ -149,26 +149,22 @@ int thrd_join(thrd_t thr, int *res) {
 }
 int thrd_sleep(const struct timespec *duration, struct timespec *remaining) {
     if (!duration || duration->tv_sec < 0 || duration->tv_nsec < 0 || duration->tv_nsec >= 1000000000L) return -2;
-    uint64_t ms = (uint64_t)duration->tv_sec * 1000u + (uint64_t)(duration->tv_nsec + 999999L) / 1000000u;
-    while (ms) {
-        unsigned step = ms > 0x7fffffffu ? 0x7fffffffu : (unsigned)ms;
-        n_sleep_ms(step);
-        ms -= step;
-    }
+    uint64_t ns = (uint64_t)duration->tv_sec > (N_CLOCK_NEVER - (uint64_t)duration->tv_nsec) / N_NS_PER_S
+                      ? N_CLOCK_NEVER
+                      : (uint64_t)duration->tv_sec * N_NS_PER_S + (uint64_t)duration->tv_nsec;
+    n_sleep_until(n_clock_after(ns));
     if (remaining) { remaining->tv_sec = 0; remaining->tv_nsec = 0; }
     return 0;
 }
 void thrd_yield(void) { yield(); }
 
 /* ---- time limits ---- */
-/* Milliseconds from now until the TIME_UTC deadline, for wait_on_address:
-   0 when it has passed; UINT32_MAX - 1 caps a single wait (callers loop). */
-static unsigned deadline_ms(const struct timespec *ts) {
-    struct timespec now;
-    timespec_get(&now, TIME_UTC);
-    int64_t ms = (int64_t)(ts->tv_sec - now.tv_sec) * 1000 + (ts->tv_nsec - now.tv_nsec) / 1000000;
-    if (ms <= 0) return 0;
-    return ms >= (int64_t)UINT32_MAX - 1 ? UINT32_MAX - 1 : (unsigned)ms;
+/* The TIME_UTC moment ts as a deadline of the monotonic clock, for wait_on_address: 0 when it has
+   passed. Taken again for each wait, so that a step of the wall clock moves it. */
+static uint64_t utc_deadline(const struct timespec *ts) {
+    if (ts->tv_sec > (time_t)(INT64_MAX / (int64_t)N_NS_PER_S) - 1) return N_CLOCK_NEVER;
+    int64_t at = (int64_t)ts->tv_sec * (int64_t)N_NS_PER_S + ts->tv_nsec, wall = n_clock_wall();
+    return at <= wall ? 0 : n_clock_after((uint64_t)(at - wall));
 }
 
 /* ---- mutexes ---- */
@@ -214,9 +210,9 @@ static int mtx_acquire(mtx_t *mtx, const struct timespec *timeout) {
             mtx_acquired(mtx);
             return thrd_success;
         }
-        unsigned wait = timeout ? deadline_ms(timeout) : UINT32_MAX;
-        if (timeout && !wait) return thrd_timedout;
-        n_result r = wait_on_address(&mtx->state, 2, wait);
+        uint64_t deadline = timeout ? utc_deadline(timeout) : N_CLOCK_NEVER;
+        if (!deadline) return thrd_timedout;
+        n_result r = wait_on_address(&mtx->state, 2, deadline);
         if (r < 0 && r != -N_ERR_NOT_READY && r != -N_ERR_TIMEOUT) return thrd_error;
     }
 }
@@ -274,9 +270,9 @@ static int cnd_wait_until(cnd_t *cond, mtx_t *mtx, const struct timespec *ts) {
     }
     int result = thrd_success;
     for (;;) {
-        unsigned wait = ts ? deadline_ms(ts) : UINT32_MAX;
-        if (ts && !wait) { result = thrd_timedout; break; }
-        n_result r = wait_on_address(&cond->sequence, word, wait);
+        uint64_t deadline = ts ? utc_deadline(ts) : N_CLOCK_NEVER;
+        if (!deadline) { result = thrd_timedout; break; }
+        n_result r = wait_on_address(&cond->sequence, word, deadline);
         if (r == -N_ERR_NOT_READY) {
             /* Another thread (de)registered: the word moved but no signal came. */
             uint32_t now = __atomic_load_n(&cond->sequence, __ATOMIC_ACQUIRE);
@@ -284,7 +280,7 @@ static int cnd_wait_until(cnd_t *cond, mtx_t *mtx, const struct timespec *ts) {
             word = now;
             continue;
         }
-        if (r == -N_ERR_TIMEOUT && ts && !deadline_ms(ts)) result = thrd_timedout;
+        if (r == -N_ERR_TIMEOUT && ts && !utc_deadline(ts)) result = thrd_timedout;
         break;
     }
     __atomic_sub_fetch(&cond->sequence, 1, __ATOMIC_RELEASE);
@@ -313,6 +309,6 @@ void call_once(once_flag *flag, void (*func)(void)) {
         if (s == 2) return;
         if (s == 1 && !__atomic_compare_exchange_n(&flag->state, &s, 3, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             continue;
-        wait_on_address(&flag->state, 3, UINT32_MAX);
+        wait_on_address(&flag->state, 3, N_CLOCK_NEVER);
     }
 }

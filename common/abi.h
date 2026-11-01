@@ -43,21 +43,22 @@
 #define N_ERR_PROTOCOL 33
 #define N_RESULT_CODES 34
 
-/* System call numbers. A number keeps its meaning for as long as it exists, so
-   programs built inside Nocturne keep working. 1-18, 22-25, 30-32, 35-37, 51-52,
-   57, 60-63, 90 and 203-206 stay unassigned. */
+/* System call numbers. The ABI keeps no older form of a call: a program is built against the
+   abi.h of the system it runs on. 1-18, 20-25, 30-32, 35-37, 44, 51-52, 60-63, 90 and 203-206
+   are unassigned. */
 enum {
     SYS_EXIT = 0,
-    SYS_SLEEP = 19, SYS_UPTIME, SYS_TIME,
+    SYS_SLEEP = 19, /* (deadline): until the monotonic clock reaches it (§8) */
     SYS_PROCLIST = 26, SYS_SYSINFO, SYS_YIELD, SYS_POWER,
     SYS_SYSTEM_LOG = 33, SYS_PCILIST,
     SYS_CPU_INFO = 38, SYS_GPU_INFO, SYS_GPU_RENDER, SYS_AUDIO_FLUSH,
     SYS_GPU_RENDER_BATCH,
     SYS_GPU_BLIT,
-    SYS_CLOCK_INFO, SYS_THREAD_CREATE, SYS_THREAD_JOIN, SYS_THREAD_EXIT,
+    SYS_THREAD_CREATE = 45, SYS_THREAD_JOIN, SYS_THREAD_EXIT,
     SYS_WAIT_ADDRESS, SYS_WAKE_ADDRESS, SYS_THREAD_ID,
     SYS_CHANNEL_LISTEN = 53, SYS_CHANNEL_CONNECT, SYS_CHANNEL_ACCEPT,
     SYS_SHARED_CREATE,
+    SYS_THREAD_SCHEDULE, /* (thread, N_SCHEDULE_*, weight or period ns): its class (§5) */
     SYS_THREAD_STACK_BOUNDS = 58, SYS_THREAD_DETACH,
     SYS_WIN_CREATE = 64, /* (width, height, title, flags, surfaces): the window handle */
     SYS_WIN_SURFACE,     /* (window, index): a handle to that surface of the window's size */
@@ -67,11 +68,11 @@ enum {
     SYS_WIN_RESIZE,      /* (window, width, height): new surfaces of that size (SYS_WIN_SURFACE) */
     SYS_GUI_LAUNCH,
     SYS_SCREEN_GRAB, SYS_WIN_STATE, SYS_WIN_PRESENTATION,
-    SYS_WIN_RECEIVE, /* (window, struct gui_event *out, max, timeout_ms): count, 0 on timeout */
+    SYS_WIN_RECEIVE, /* (window, struct gui_event *out, max, deadline): count, 0 at the deadline */
     SYS_WIN_DIRECT,  /* (window, wanted): ask to be shown by the display driver directly (EV_DIRECT) */
     SYS_WIN_FRAME,   /* (window): EV_FRAME at the display's next frame, presented or not (WIN_FRAME_EVENTS) */
     SYS_WIN_POINTER, /* (window, const struct n_win_pointer *, size): the pointer over the client area */
-    SYS_WIN_ACQUIRE, /* (window, timeout_ms): a surface of a WIN_FRAME_QUEUE window free to draw into */
+    SYS_WIN_ACQUIRE, /* (window, deadline): a surface of a WIN_FRAME_QUEUE window free to draw into */
     SYS_SHARED_RESERVE = 88, SYS_WAIT_ADDRESS64,
     SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
     SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
@@ -81,7 +82,7 @@ enum {
        ends it and refuses its unaccepted connections, TCP_CANCEL wakes waiters.
        LISTEN (ip, port, backlog): ip 0 takes every local address, otherwise one of
        them (127/8 or the interface's); port 0 picks one, backlog <= 0 a default.
-       ACCEPT (listener, timeout_ms like TCP_RECV, struct n_sockaddr *remote or 0).
+       ACCEPT (listener, deadline like TCP_RECV, struct n_sockaddr *remote or 0).
        ADDRESS (id, struct n_sockaddr *local, struct n_sockaddr *remote; either 0).
        FINISH (id): RFC 9293 CLOSE, the FIN after the queued data; receiving goes
        on until the peer finishes too, and the id stays the caller's until TCP_CLOSE. */
@@ -123,23 +124,23 @@ enum {
     SYS_PCI_SCREEN_VBLANK, /* (pci, const struct n_screen_vblank *): a vertical blank of an output */
     /* Paged memory and its pager (docs/nocturne-native-abi.md §7) */
     SYS_PAGER_CREATE,      /* (bytes, int32_t *memory_out): the pager handle */
-    SYS_PAGER_TAKE,        /* (pager, struct n_pager_fault *out, max, timeout_ms): count */
+    SYS_PAGER_TAKE,        /* (pager, struct n_pager_fault *out, max, deadline): count */
     SYS_PAGER_SUPPLY,      /* (pager, const struct n_pager_supply *runs, count) */
     SYS_PAGER_REVOKE,      /* (pager, offset, bytes, 0 or N_MEMORY_READ) */
     SYS_PAGER_FAIL,        /* (pager, offset, bytes) */
     /* A claimed function's part of the ACPI namespace (docs/nocturne-native-abi.md §9) */
     SYS_PCI_ACPI_EVAL,     /* (pci, const struct n_acpi_eval *, out, out_size): bytes written */
-    SYS_PCI_ACPI_NOTIFY_TAKE, /* (pci, timeout_ms): the next Notify value of the function's node */
+    SYS_PCI_ACPI_NOTIFY_TAKE, /* (pci, deadline): the next Notify value of the function's node */
     /* A display driver follows a screen: the mode it is to show, and with N_SCANOUT_DIRECT the
        window it shows directly */
-    SYS_PCI_SCREEN_STATE,  /* (pci, output, seen serial, struct n_screen_state *out, timeout_ms) */
+    SYS_PCI_SCREEN_STATE,  /* (pci, output, seen serial, struct n_screen_state *out, deadline) */
     /* What such a driver may show in its buffers' place, which the panic screen is drawn into too */
     SYS_PCI_SCREEN_IMAGE,     /* (pci, output, surface, const struct n_scanout *): the image's number */
     SYS_PCI_SCREEN_IMAGE_END, /* (pci, number) */
     /* A display driver's monitor on an output: the modes it can show and the one it shows (the
        system says which it wants in struct n_screen_state) */
     SYS_PCI_SCREEN_MODES,     /* (pci, output, const struct n_screen_modes *) */
-    SYS_PCI_SCREEN_FLIPS,     /* (pci, struct n_screen_flip *out, max, timeout_ms): count, 0 on timeout */
+    SYS_PCI_SCREEN_FLIPS,     /* (pci, struct n_screen_flip *out, max, deadline): count, 0 at the deadline */
     /* Watches (docs/nocturne-native-abi.md §1): a handle receivable once what it watches has
        changed, until SYS_WATCH_TAKE takes the count. Each call after it gives one. */
     SYS_WATCH_TAKE = 207,     /* (watch): the changes since its last take (0: none) */
@@ -242,6 +243,9 @@ struct n_event {
     uint64_t token;
     uint32_t events;
     uint32_t reserved;
+    /* when it happened, on the monotonic clock (ns): a timer's moment on its grid; for the others
+       when the kernel was told of the change the wait reports */
+    uint64_t time_ns;
 };
 
 /* n_memory_reserve / n_memory_protect access. Writable and executable are
@@ -258,28 +262,74 @@ struct n_procinfo {
     int state; /* 0 ready 1 running 2 blocked 3 ended */
     int is_user;
     char name[32];
-    uint64_t cpu_ms;
+    uint64_t cpu_ns;
     uint64_t mem_kb;
-    uint64_t start_ms;
+    uint64_t start_ns;  /* on the monotonic clock */
     uint64_t wait_phys; /* blocked in an address wait: the physical word, else 0 */
 };
 
 /* free_mem: what an app can have now, the free frames and those of programs no task runs, which
    the system gives back to an app that asks for them. */
 struct n_sysinfo {
-    uint64_t total_mem, free_mem, heap_used, uptime_ms;
+    uint64_t total_mem, free_mem, heap_used, uptime_ns; /* uptime: the monotonic clock */
     int ntasks;
     uint32_t fb_w, fb_h;
     char cpu[64];
     char os[64];
 };
 
-/* Versioned extensions keep the original n_sysinfo layout unchanged. */
-struct n_clockinfo {
-    uint32_t version, flags;
-    uint64_t tsc_hz, tsc_sample, uptime_ms;
+/* ---- time (docs/nocturne-native-abi.md §8) ----
+   Every time the ABI passes is in ns. A deadline is a moment on the monotonic clock: N_CLOCK_NEVER
+   is none, and one at or before the call's moment looks without waiting. */
+#define N_NS_PER_US 1000ULL
+#define N_NS_PER_MS 1000000ULL
+#define N_NS_PER_S 1000000000ULL
+#define N_CLOCK_NEVER UINT64_MAX
+
+/* The clocks, which every app reads in its own memory without a call: the kernel's data of them,
+   mapped read-only at N_CLOCK_ADDRESS in every app (struct n_clock, then offset[cpus]). With t
+   the TSC that RDTSCP reads (its TSC_AUX is the CPU's index, §0) less offset[that index]:
+     monotonic ns = base_ns + ((t - base_tsc) * mult >> shift)   (base_ns when t <= base_tsc)
+     boot ns      = monotonic ns + asleep_ns
+     wall ns      = wall_ns + (monotonic ns - wall_from) + the slew's part: wall_slew's sign times
+                    min(|wall_slew|, (min(monotonic ns, wall_until) - wall_from) * wall_slew_mult >> 32)
+   (each difference 0 when negative). The monotonic clock is ns since the TSC began, standing still
+   while the machine sleeps; the boot clock goes on through sleep; the wall clock is Unix time. A
+   reader loads seq (acquire), waits while it is odd (the kernel is writing), reads the TSC with
+   RDTSCP, the fields and its CPU's offset, and seq again: equal, the fields belong together; else
+   it reads again. */
+#define N_CLOCK_ADDRESS 0x00007FFFFFF00000ULL /* above the main stack */
+#define N_CLOCK_BYTES (1ULL << 20)             /* the most the data may take there */
+struct n_clock {
+    uint32_t seq;
+    uint32_t cpus;          /* offset[]'s entries: the CPUs the machine has */
+    uint64_t base_tsc, base_ns;
+    uint64_t mult;          /* ns per TSC count, times 2^shift */
+    uint32_t shift;
+    uint32_t rate_bound;    /* how far mult may be from the true rate, in 2^-32 parts (UINT32_MAX:
+                               as the CPU states it, not measured) */
+    uint64_t tsc_hz;        /* the rate mult stands for */
+    uint64_t asleep_ns;
+    int64_t wall_ns;
+    uint64_t wall_from, wall_until;
+    int64_t wall_slew;
+    uint64_t wall_slew_mult;
+    int64_t offset[];       /* by CPU index: what its TSC reads more than the clock's */
 };
-#define N_CLOCK_USER_TSC 1u
+
+/* n_thread_schedule: the class a thread of the calling app runs in.
+   N_SCHEDULE_FAIR: a share of the CPUs in proportion to weight, among the threads that want them;
+   an app's threads have [1, N_SCHEDULE_WEIGHT_DEFAULT] (lower is a smaller share).
+   N_SCHEDULE_DEADLINE: a job each period of period ns (its device's: a screen's frame, a sound
+   block), [N_SCHEDULE_PERIOD_MIN_NS, N_SCHEDULE_PERIOD_MAX_NS]: woken, it runs before every fair
+   thread, the one due first first, while its job stays within what the system reserves it each
+   period; past that it runs as a fair thread until its next period. An app's deadline threads
+   together are reserved at most half of one CPU. */
+#define N_SCHEDULE_FAIR 0u
+#define N_SCHEDULE_DEADLINE 1u
+#define N_SCHEDULE_WEIGHT_DEFAULT 1024u
+#define N_SCHEDULE_PERIOD_MIN_NS 125000ULL
+#define N_SCHEDULE_PERIOD_MAX_NS 1000000000ULL
 
 /* SYS_CPU_INFO. detected_cpus: the CPUs the firmware lists; online_cpus: those running;
    scheduler_cpus: those that run apps' threads, every online one. The kernel spreads no work of its
@@ -379,8 +429,8 @@ struct n_screen_flip {
     uint64_t serial;
 };
 /* n_pci_screen_vblank: a vertical blank of output. count is the driver's count of its blanks,
-   time_ns the moment it began on the system's monotonic clock in nanoseconds (the axis of
-   SYS_UPTIME: the driver converts the display engine's time to it), buffer the buffer shown from
+   time_ns the moment it began on the system's monotonic clock in nanoseconds (struct n_clock,
+   n_clock_monotonic: the driver converts the display engine's time to it), buffer the buffer shown from
    it on and flip_serial the last flip that blank shows (0: none yet). A driver reports each blank
    that shows a flip as the display engine signals it, and the others while a flip waits. */
 struct n_screen_vblank {
@@ -543,8 +593,8 @@ enum {
     EV_INPUT_LOST,
 };
 
-/* A window's event. time_ns is a moment on the system's monotonic clock in nanoseconds (the axis
-   of SYS_UPTIME): for input, when the device's report reached the system; for EV_FRAME, when the
+/* A window's event. time_ns is a moment on the system's monotonic clock in nanoseconds (struct
+   n_clock, n_clock_monotonic): for input, when the device's report reached the system; for EV_FRAME, when the
    frame was shown (the vertical blank the display device measured, or the copy's end on a screen
    that has none). */
 struct gui_event {

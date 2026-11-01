@@ -50,7 +50,7 @@ int main(void) {
     if (log >= 0) n_handle_close(log);
     if (app >= 0) {
         int status = -1;
-        n_result r = n_app_result(app, 60000, &status);
+        n_result r = n_app_result(app, n_clock_after(60000 * N_NS_PER_MS), &status);
         CHECK(r >= 0, "nvrm did not end within 60 s: %s", n_result_text(r));
         CHECK(status == 1, "nvrm ended with status %d (1 is RM refusing the device; 128 + n is a CPU exception)",
               status);

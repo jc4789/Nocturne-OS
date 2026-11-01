@@ -1069,24 +1069,24 @@ index 15e06921..0d9a2cfc 100644
  
 +#elif defined(__nocturne__)
 +
-+// Nocturne's kernel waits on 4- and 8-byte words. Timeouts are whole
-+// milliseconds, rounded up; UINT32_MAX would mean no timeout at all.
++// Nocturne's kernel waits on 4- and 8-byte words until a deadline: a
++// moment in ns on the monotonic clock (N_CLOCK_NEVER: none), which the
++// timeout from now becomes.
 +template <std::size_t _Size, class MaybeTimeout>
 +static void __platform_wait_on_address(void const* __ptr, void const* __val, MaybeTimeout maybe_timeout_ns) {
 +  static_assert(_Size == 4 || _Size == 8, "Can only wait on 4- or 8-byte values");
-+  unsigned __timeout_ms = UINT32_MAX;
++  uint64_t __deadline = N_CLOCK_NEVER;
 +  if constexpr (!is_same_v<MaybeTimeout, NoTimeout>) {
-+    uint64_t __ms = maybe_timeout_ns / 1'000'000 + (maybe_timeout_ns % 1'000'000 != 0);
-+    __timeout_ms  = static_cast<unsigned>(__ms < UINT32_MAX ? __ms : UINT32_MAX - 1);
++    __deadline = n_clock_after(static_cast<uint64_t>(maybe_timeout_ns));
 +  }
 +  if constexpr (_Size == 4) {
 +    uint32_t __expected;
 +    std::memcpy(&__expected, __val, _Size);
-+    wait_on_address(static_cast<volatile uint32_t*>(const_cast<void*>(__ptr)), __expected, __timeout_ms);
++    wait_on_address(static_cast<volatile uint32_t*>(const_cast<void*>(__ptr)), __expected, __deadline);
 +  } else {
 +    uint64_t __expected;
 +    std::memcpy(&__expected, __val, _Size);
-+    wait_on_address64(static_cast<volatile uint64_t*>(const_cast<void*>(__ptr)), __expected, __timeout_ms);
++    wait_on_address64(static_cast<volatile uint64_t*>(const_cast<void*>(__ptr)), __expected, __deadline);
 +  }
 +}
 +
@@ -4265,7 +4265,7 @@ index 00000000..3f83d270
 +      return EC;
 +    if (Timeout.count() == 0)
 +      break;
-+    n_sleep_ms(1);
++    n_sleep_until(n_clock_after(N_NS_PER_MS));
 +  } while (std::chrono::steady_clock::now() < End);
 +  return make_error_code(errc::no_lock_available);
 +}

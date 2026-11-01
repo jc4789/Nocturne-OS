@@ -13,7 +13,7 @@ static void log_message(void *opaque,int level,const char *message){
     else if(!strncmp(message,"MEDIA_EVENT ",12))events++;
     else if(level==2||!strncmp(message,"FAIL",4)){printf("%s\n",message);failed++;}
 }
-static void ticks(web_doc *doc,int count){for(int i=0;i<count;i++)web_tick(doc,uptime_ms());}
+static void ticks(web_doc *doc,int count){for(int i=0;i<count;i++)web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));}
 int main(void){
     const char *prefix="<!doctype html><style>#target{color:red}"
         "@media (scripting:enabled){#target{color:blue}}"

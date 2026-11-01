@@ -253,13 +253,13 @@ static n_result windows_update(bool join) {
             at += (size_t)got;
         }
         uint64_t self = (uint32_t)n_app_self(), start = 0;
-        for (int i = 0; i < count; i++) if ((uint64_t)(uint32_t)procs[i].pid == self) start = procs[i].start_ms;
+        for (int i = 0; i < count; i++) if ((uint64_t)(uint32_t)procs[i].pid == self) start = procs[i].start_ns;
         for (size_t i = 0; i + WINDOW_ROW <= n; i += WINDOW_ROW) {
             uint64_t pid = row64(rows + i), when = row64(rows + i + 8);
             if (pid == self && when == start) continue;
             bool alive = false;
             for (int k = 0; k < count && !alive; k++)
-                alive = (uint64_t)(uint32_t)procs[k].pid == pid && (!when || procs[k].start_ms == when) && procs[k].state != 3;
+                alive = (uint64_t)(uint32_t)procs[k].pid == pid && (!when || procs[k].start_ns == when) && procs[k].state != 3;
             if (alive) { memmove(rows + kept, rows + i, WINDOW_ROW); kept += WINDOW_ROW; }
         }
         r = (n_result)(kept / WINDOW_ROW);

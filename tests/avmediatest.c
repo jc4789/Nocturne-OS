@@ -23,17 +23,17 @@ static int audio_slots(void){n_handle a[8];int n=0;for(;n<8;n++){a[n]=n_audio_op
 static void console(void *opaque,int level,const char *text){
     (void)opaque;
     if(!strncmp(text,"AVMEDIA_DONE ",13))done=atoi(text+13);
-    if(!strcmp(text,"AVMEDIA_PAINT_READY")){paint_ready++;paint_started=uptime_ms();}
+    if(!strcmp(text,"AVMEDIA_PAINT_READY")){paint_ready++;paint_started=(n_clock_monotonic() / N_NS_PER_MS);}
     if(level==2||!strncmp(text,"FAIL",4)){failed++;printf("%s\n",text);}
 }
 static bool request(void *opaque,const struct web_request *r){
     (void)opaque;if(r->kind!=WEB_RESOURCE_FETCH)return false;
-    for(int i=0;i<8;i++)if(!queue[i].used){queue[i].used=true;queue[i].id=r->id;queue[i].due=uptime_ms()+20;strlcpy(queue[i].url,r->url,sizeof queue[i].url);requested++;return true;}
+    for(int i=0;i<8;i++)if(!queue[i].used){queue[i].used=true;queue[i].id=r->id;queue[i].due=(n_clock_monotonic() / N_NS_PER_MS)+20;strlcpy(queue[i].url,r->url,sizeof queue[i].url);requested++;return true;}
     return false;
 }
 static void cancel(void *opaque,uint64_t id){(void)opaque;for(int i=0;i<8;i++)if(queue[i].used&&queue[i].id==id){queue[i].used=false;cancels++;}}
 static void deliver(void){
-    for(int i=0;i<8;i++)if(queue[i].used&&queue[i].due<=uptime_ms()){
+    for(int i=0;i<8;i++)if(queue[i].used&&queue[i].due<=(n_clock_monotonic() / N_NS_PER_MS)){
         queue[i].used=false;struct web_response response={0};strlcpy(response.url,queue[i].url,sizeof response.url);
         const char *name=strrchr(queue[i].url,'/');name=name?name+1:"";
         bool overlong=!strcmp(name,"overlong.avi");char path[256];snprintf(path,sizeof path,"C:\\Tests\\media-fixtures\\%s",overlong?"mjpeg.avi":name);
@@ -53,13 +53,13 @@ static void deliver(void){
     }
 }
 static void step(void){
-    deliver();web_tick(doc,uptime_ms());
+    deliver();web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));
     if(web_dirty(doc)||paint_ready){web_layout(doc,320,240);canvas_t c;gfx_init(&c,pixels,320,240,320);web_paint(doc,&c,0,0,320,240,0,0);}
-    if(paint_ready&&uptime_ms()-paint_started<70){
+    if(paint_ready&&(n_clock_monotonic() / N_NS_PER_MS)-paint_started<70){
         bool same=true;for(int y=0;y<32;y++)if(memcmp(pixels+y*320,first_frame+y*96,96*4)){same=false;break;}
         CHECK(same);early_frames++; /* Future 100ms decoder frame must not overwrite presentation. */
     }
-    n_sleep_ms(2);
+    n_sleep_until(n_clock_after(2 * N_NS_PER_MS));
 }
 static void first_picture(void){
     char error[160];nmedia *m=nmedia_open("C:\\Tests\\media-fixtures\\" AVMEDIA_FRAME_FIXTURE,error,sizeof error);CHECK(m!=NULL);if(!m)return;
@@ -78,8 +78,8 @@ int main(void){
     size_t size=strlen(prefix)+n+strlen(tail)+100;char *page=malloc(size);CHECK(page!=NULL);if(!page){free(script);return 1;}
     snprintf(page,size,"%svar nativeAudioAvailable=%s;%s%s",prefix,slots>0?"true":"false",script,tail);free(script);
     struct web_host host={.request=request,.cancel=cancel,.console=console};doc=web_live(page,strlen(page),"https://avmedia.test/","utf-8",&host);free(page);CHECK(doc!=NULL);if(!doc)return 1;
-    web_layout(doc,320,240);uint64_t deadline=uptime_ms()+20000;
-    while(!done&&!failed&&uptime_ms()<deadline)step();
+    web_layout(doc,320,240);uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+20000;
+    while(!done&&!failed&&(n_clock_monotonic() / N_NS_PER_MS)<deadline)step();
     CHECK(done>=17);CHECK(paint_ready==1);CHECK(early_frames>=2);CHECK(requested>=4&&completed>=4);
     bool colored=false;for(int i=0;i<96*64;i++)if(pixels[(i/96)*320+i%96]!=RGB(0,0,0)&&pixels[(i/96)*320+i%96]!=RGB(255,255,255))colored=true;
     CHECK(colored);web_free(doc);doc=NULL;CHECK(audio_slots()==slots);
@@ -87,7 +87,7 @@ int main(void){
     memset(queue,0,sizeof queue);requested=0;
     const char *pending="<script>var a=document.createElement('video');a.preload='none';a.src='" AVMEDIA_FRAME_FIXTURE "';a.play().catch(()=>{});</script>";
     doc=web_live(pending,strlen(pending),"https://avmedia.test/","utf-8",&host);CHECK(doc!=NULL);
-    if(doc){deadline=uptime_ms()+3000;while(!requested&&uptime_ms()<deadline){web_tick(doc,uptime_ms());n_sleep_ms(1);}CHECK(requested==1);int before=cancels;web_free(doc);doc=NULL;CHECK(cancels==before+1);}
+    if(doc){deadline=(n_clock_monotonic() / N_NS_PER_MS)+3000;while(!requested&&(n_clock_monotonic() / N_NS_PER_MS)<deadline){web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}CHECK(requested==1);int before=cancels;web_free(doc);doc=NULL;CHECK(cancels==before+1);}
     CHECK(audio_slots()==slots);
     printf(AVMEDIA_TEST_NAME ": %d checks, %d failed; audio_slots=%d\n",checks,failed,slots);return failed!=0;
 }

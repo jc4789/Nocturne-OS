@@ -127,7 +127,7 @@ static bool web_native_checkpoint(web_doc *d) { (void)d; return checkpoints++ !=
 static void doc_mutated(web_doc *d, node_t *n) { (void)n; d->mutated++; }
 static void doc_sync_tree(web_doc *d) { d->synced++; }
 static uint64_t host_now;
-static uint64_t uptime_ms(void) { return host_now; }
+static uint64_t n_clock_monotonic(void){return (uint64_t)(host_now)*1000000ULL;}
 static bool str_ieq(const char *a, const char *b) {
     while (*a && *b && lower((unsigned char)*a) == lower((unsigned char)*b)) { a++; b++; }
     return !*a && !*b;
@@ -265,11 +265,11 @@ cases = (root / "tests/xml_parser_host_cases.c").read_text(encoding="utf-8")
 generated = out / "xml_parser.c"
 generated.write_text(prefix + types + shim + namespace_id + names + shim2 + body + cases, encoding="utf-8", newline="\n")
 # Expat on the host takes its product branch: XML_NOCTURNE, whose only system
-# need is n_random and uptime_ms, after the CRT headers have read _WIN32.
+# need is n_random and n_clock_monotonic, after the CRT headers have read _WIN32.
 (out / "nocturne.h").write_text(
     "#include <stdlib.h>\n#include <stdint.h>\n"
     "static inline int n_random(void *b, size_t n) { unsigned char *p = b; for (size_t i = 0; i < n; i++) p[i] = (unsigned char)rand(); return 0; }\n"
-    "static inline uint64_t uptime_ms(void) { return 0; }\n", encoding="utf-8", newline="\n")
+    "static inline uint64_t n_clock_monotonic(void) { return 0; }\n", encoding="utf-8", newline="\n")
 (out / "prelude.h").write_text(
     "".join("#include <%s>\n" % h for h in ("stdbool.h", "stddef.h", "string.h", "assert.h", "limits.h", "stdio.h",
                                            "stdlib.h", "stdint.h", "math.h", "errno.h", "stdarg.h", "float.h")) +

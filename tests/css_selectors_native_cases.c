@@ -37,7 +37,7 @@ void web_avmedia_checkpoint(void) {}                         /* no media element
 bool web_presentation_matches(node_t *n) { (void)n; return false; } /* nothing is fullscreen */
 bool parallel_active(void) { return false; }
 unsigned parallel_worker_index(void) { return 0; }
-uint64_t uptime_ms(void) { return 0; }
+uint64_t n_clock_monotonic(void){return (uint64_t)(0)*1000000ULL;}
 static void *thread_slots[64];
 void *thread_local_get(unsigned slot) { return slot < 64 ? thread_slots[slot] : NULL; }
 void thread_local_set(unsigned slot, void *value) { if (slot < 64) thread_slots[slot] = value; }

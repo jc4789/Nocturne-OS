@@ -16,7 +16,7 @@
 #define write test_write
 #define kill test_kill
 #define waitpid test_waitpid
-#define uptime_ms test_uptime_ms
+#define n_clock_monotonic test_clock_monotonic
 #include "../user/libc/webnet.c"
 int *__errno_location(void){static int value;return &value;}
 static uint64_t now=100;
@@ -37,7 +37,7 @@ ssize_t test_read(int fd,void *buf,size_t n){(void)fd;(void)buf;(void)n;errno=EA
 ssize_t test_write(int fd,const void *buf,size_t n){(void)fd;(void)buf;return (ssize_t)n;}
 int test_kill(int pid){(void)pid;return 0;}
 int test_waitpid(int pid,int *status,int flags){(void)status;(void)flags;return pid;}
-uint64_t test_uptime_ms(void){return now;}
+uint64_t test_clock_monotonic(void){return now*1000000ULL;}
 webcookie_jar *webcookie_create(void){return calloc(1,sizeof(webcookie_jar));}
 void webcookie_free(webcookie_jar *jar){free(jar);}
 bool webcookie_psl_load(webcookie_jar *jar,const char *text,size_t len){(void)jar;(void)text;(void)len;return true;}

@@ -187,7 +187,7 @@ static void names(void) {
 
 /* Told by a watch, a new reading reads the new content: another thread saves while this one waits. */
 static int saver(void *path) {
-    n_sleep_ms(100);
+    n_sleep_until(n_clock_after(100 * N_NS_PER_MS));
     return n_document_save(path, "fresh", 5) == 0 ? 0 : 1;
 }
 
@@ -202,7 +202,7 @@ static void told(void) {
     bool started = thrd_create(&t, saver, path) == thrd_success;
     CHECK(started);
     struct n_event ev[4];
-    CHECK(n_events_wait(q, ev, 4, 5000) == 1 && ev[0].token == 7);
+    CHECK(n_events_wait(q, ev, 4, n_clock_after(5000 * N_NS_PER_MS)) == 1 && ev[0].token == 7);
     CHECK(holds("told.txt", "fresh"));
     if (started) thrd_join(t, &done);
     CHECK(done == 0 && n_watch_take(w) == 1);
@@ -279,18 +279,18 @@ static void many(void) {
 
 static uint64_t saves(int k) {
     char text[32];
-    uint64_t t0 = n_clock_uptime_ms();
+    uint64_t t0 = (n_clock_monotonic() / N_NS_PER_MS);
     for (int i = 0; i < k; i++) {
         snprintf(text, sizeof text, "save %d", i);
         n_document_save(in("speed.txt"), text, strlen(text));
     }
-    return n_clock_uptime_ms() - t0;
+    return (n_clock_monotonic() / N_NS_PER_MS) - t0;
 }
 
 static uint64_t renames(int k) {
-    uint64_t t0 = n_clock_uptime_ms();
+    uint64_t t0 = (n_clock_monotonic() / N_NS_PER_MS);
     for (int i = 0; i < k; i++) n_entry_move(in(i % 2 ? "r1" : "r0"), in(i % 2 ? "r0" : "r1"));
-    return n_clock_uptime_ms() - t0;
+    return (n_clock_monotonic() / N_NS_PER_MS) - t0;
 }
 
 /* A save and a rename cost what they did with watches open in their folder: without, with 102 (the
@@ -329,7 +329,7 @@ static void speed(void) {
 
 int main(void) {
     char name[64];
-    snprintf(name, sizeof name, "entrywatchtest-%llu", (unsigned long long)n_clock_uptime_ms());
+    snprintf(name, sizeof name, "entrywatchtest-%llu", (unsigned long long)(n_clock_monotonic() / N_NS_PER_MS));
     if (n_path_join(n_temp_folder(), name, root, sizeof root) < 0 || n_folder_create(root) != 0) {
         printf("entrywatchtest: no folder of its own in %s\n", n_temp_folder());
         printf("entrywatchtest FAIL\n");

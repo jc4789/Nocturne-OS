@@ -40,7 +40,7 @@ static bool request(void *opaque, const struct web_request *r) {
     for (int i=0; i<16; i++) if (!state.pending[i].used) {
         struct queued *q = &state.pending[i]; q->used=true; q->id=r->id;
         snprintf(q->url, sizeof q->url, "%s", r->url);
-        q->due=uptime_ms()+(strstr(r->url,"oldlate.svg")?200:strstr(r->url,"replacement.svg")?40:2);
+        q->due=(n_clock_monotonic() / N_NS_PER_MS)+(strstr(r->url,"oldlate.svg")?200:strstr(r->url,"replacement.svg")?40:2);
         return true;
     }
     check(false, "transport queue capacity"); return false;
@@ -60,7 +60,7 @@ static void log_message(void *opaque, int level, const char *message) {
     if (!strcmp(message,"OWN-DONE")) state.done=true;
 }
 static void deliver(void) {
-    for (int i=0; i<16; i++) if (state.pending[i].used && state.pending[i].due<=uptime_ms()) {
+    for (int i=0; i<16; i++) if (state.pending[i].used && state.pending[i].due<=(n_clock_monotonic() / N_NS_PER_MS)) {
         struct queued q=state.pending[i]; state.pending[i].used=false;
         const char *body=strstr(q.url,"broken.svg")?"not an image":
             (strstr(q.url,"replacement.svg")||strstr(q.url,"latest.svg"))?blue:red;
@@ -112,9 +112,9 @@ int main(void) {
     struct web_host host={.request=request,.cancel=cancel,.console=log_message};
     state.doc=web_live(html,strlen(html),"http://image.fixture/index.html","utf-8",&host);
     if (!state.doc) { puts("FAIL image ownership allocation"); return 1; }
-    uint64_t deadline=uptime_ms()+15000;
-    while (!state.done && uptime_ms()<deadline) {
-        deliver(); web_tick(state.doc,uptime_ms()); web_layout(state.doc,64,64);
+    uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+15000;
+    while (!state.done && (n_clock_monotonic() / N_NS_PER_MS)<deadline) {
+        deliver(); web_tick(state.doc,(n_clock_monotonic() / N_NS_PER_MS)); web_layout(state.doc,64,64);
         if (state.paint) {
             canvas_t canvas; gfx_init(&canvas,pixels,64,64,64);
             web_paint(state.doc,&canvas,0,0,64,64,0,0);
@@ -122,7 +122,7 @@ int main(void) {
             check(got==want,"current image painted before property getter");
             printf("IMAGE-OWN-PAINT rgb=%06x expected=%06x\n",got,want); state.paint=0;
         }
-        n_sleep_ms(1);
+        n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
     }
     check(state.done,"asynchronous cases completed");
     check(state.first==1&&state.replacement==1&&state.detached==1&&state.broken==1&&state.old==1&&state.latest==1&&state.clone==1,"unique resource counts");

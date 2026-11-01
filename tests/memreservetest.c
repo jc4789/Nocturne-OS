@@ -71,9 +71,9 @@ int main(void) {
         check(repeated.free_mem+65536>=after.free_mem,"repeat failures do not repeatedly consume physical pages");
         check(mapped_before!=UINT64_MAX && self_mapped_kb()==mapped_before,
               "repeat failures preserve the original data-page count");
-        uint64_t began=uptime_ms();
+        uint64_t began=(n_clock_monotonic() / N_NS_PER_MS);
         saved=n_memory_reserve((size_t)1<<40,N_MEMORY_READ_WRITE,&p);
-        uint64_t elapsed=uptime_ms()-began;
+        uint64_t elapsed=(n_clock_monotonic() / N_NS_PER_MS)-began;
         sysinfo(&repeated);
         printf("large reservation: elapsed=%llu ms free=%llu\n",(unsigned long long)elapsed,(unsigned long long)repeated.free_mem);
         check(p==NULL && saved==-N_ERR_NO_MEMORY,"large valid-range request fails atomically");

@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include "nocturne.h"
 int main(int argc, char **argv) {
-    if (argc > 1) n_sleep_ms((unsigned)(atof(argv[1]) * 1000));
+    double seconds = argc > 1 ? atof(argv[1]) : 0;
+    if (seconds > 0) n_sleep_until(n_clock_after((uint64_t)(seconds * N_NS_PER_S)));
     return 0;
 }

@@ -114,7 +114,7 @@ int main(int argc,char **argv){
         int ack=imported?1:0;CHECK(n_channel_send(reader_end,&ack,sizeof ack,-1)==(n_result)sizeof ack);
         if(child_h>=0)n_handle_close(child_h);
         if(imported)CHECK(imported[8192]==0x49); /* the mapping keeps the pages after the handle closed */
-        int status=-1;CHECK(n_app_result(app,-1,&status)==0&&status==0);
+        int status=-1;CHECK(n_app_result(app,N_CLOCK_NEVER,&status)==0&&status==0);
         n_handle_close(app);n_handle_close(reader_end);
         if(imported){CHECK(imported[8192]==0x49);imported[0]=0x93;CHECK(imported[0]==0x93);CHECK(n_memory_release(imported,MAPPED)==0);}
     }
@@ -131,14 +131,14 @@ int main(int argc,char **argv){
             char r;CHECK(receive(reader_end,&r,1,NULL)&&r=='r');
             dp[100]=0x5c;
             CHECK(n_channel_send(reader_end,"g",1,-1)==1);
-            int status=-1;CHECK(n_app_result(app,-1,&status)==0&&status==0);
+            int status=-1;CHECK(n_app_result(app,N_CLOCK_NEVER,&status)==0&&status==0);
             n_handle_close(app);n_handle_close(reader_end);
         }
         /* A writer holding only a read-only mapping faults. */
         app=launch(argv[0],"writer-ro",&reader_end);CHECK(app>=0);
         if(app>=0){
             CHECK(n_channel_send(reader_end,"down",4,down)==4);
-            int status=-1;CHECK(n_app_result(app,-1,&status)==0&&status==128+14);
+            int status=-1;CHECK(n_app_result(app,N_CLOCK_NEVER,&status)==0&&status==128+14);
             if(status==128+14)printf("sharedpagetest: expected writer fault status=%d\n",status); /* test.py lets that fault be */
             n_handle_close(app);n_handle_close(reader_end);
         }

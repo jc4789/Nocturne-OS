@@ -49,9 +49,9 @@ make                         # tools/rust/sysroot があれば ports/rust/apps/*
 | メモリー（`sys/alloc`） | `malloc`/`calloc`/`realloc`/`free`。16 バイトを超える配置は多めに確保して前に元のポインターを置く。 |
 | 引数・環境（`sys/args`、`sys/env`） | 引数は `argv`。環境は std の表で、起動設定（`n_settings`、`NAME=値`）を最初の使用時に読む。`set_var`/`remove_var` はこの表だけを変える。名前が空か `=`・NUL を含むか、値が NUL を含めば `InvalidInput`。同じプログラムの C のコードは、`getenv` で起動設定と今のフォルダー（`FOLDER`）を読み、std の変更は見ない。 |
 | スレッド（`sys/thread`） | `thread_create`/`thread_join`。スタックはカーネルが決める固定 256 KiB で、`Builder::stack_size` は効かない。1 プロセス 128 本まで。終了時に Rust の TLS デストラクターを走らせる。`available_parallelism` は `cpu_info`。 |
-| ロック・条件変数・Once・RwLock・park（`sys/sync`） | Rust の futex 実装を `wait_on_address`/`wake_address` の上に置く（ミリ秒切り上げ、`u32::MAX-1` ms を超える待ちは早く戻る）。 |
+| ロック・条件変数・Once・RwLock・park（`sys/sync`） | Rust の futex 実装を `wait_on_address`/`wake_address` の上に置く。待ちの期限は単調時計の絶対の ns（`n_clock_after`）。 |
 | スレッドローカル | ネイティブの `#[thread_local]`（C ライブラリーが各スレッドの FS を設定する）。 |
-| 時刻（`sys/time`） | `timespec_get` の `TIME_MONOTONIC`（Instant）と `TIME_UTC`（SystemTime）。分解能は 1 ms。 |
+| 時刻（`sys/time`） | `timespec_get` の `TIME_MONOTONIC`（Instant）と `TIME_UTC`（SystemTime）。どちらも ns で、時計の頁から syscall なしで読む。眠りは `n_sleep_until`。 |
 | 標準入出力（`sys/stdio`） | 出力は C の `stdout`/`stderr`（チャンネルでも文書でも C ライブラリーが扱う）。入力はハンドル 0 を直接読み、チャンネルは 1 メッセージずつ、大きいメッセージの残りは次へ持ち越す。文書なら自分で位置を持つ。 |
 | ファイル（`sys/fs`） | `n_document_*`、`n_entry_*`、`n_folder_*`。共有カーソルが無いので `File` が位置を持つ。追記は排他を取って末尾へ書く。`sync_all`/`sync_data` は `n_document_commit`（`N_COMMIT_WAIT`：媒体に書かれるまで待つ）。`rename` は C ライブラリーの `rename`（既存の文書を原子的に置き換える）。パスは `n_path_complete`（`FOLDER` を基準に `.`/`..` を解決）で完全指定にしてから渡す。 |
 | パスの形（`sys/path`） | ドライブは `C:` だけで、区切りは `\`（主）と `/`。接頭辞はドライブ `X:`（`Prefix::Disk`）だけで、UNC や `\\?\` は無い。根のあるパス（`C:\a`、`\a`、`/a`）が完全指定（`is_absolute`）。根の無い `C:`、`C:a` は今のフォルダーとその中の名前。`path::absolute` は C ライブラリーの `n_path_complete`（`C:\...`、`.`/`..` を解決）。 |

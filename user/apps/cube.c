@@ -195,13 +195,13 @@ int main(void) {
     double ax = 0.5, ay = 0.3, vx = 0.011 / 16, vy = 0.017 / 16;
     bool drag = false, draw = true, quit = false;
     int lmx = 0, lmy = 0;
-    uint64_t frames = 0, t0 = n_clock_uptime_ms(), drawn = t0;
+    uint64_t frames = 0, t0 = (n_clock_monotonic() / N_NS_PER_MS), drawn = t0;
     int fps = 0;
     show(s, fps);
     while (!quit) {
         if (draw) {
             draw = false;
-            uint64_t now = n_clock_uptime_ms();
+            uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
             if (!drag) {
                 ax += vx * (double)(now - drawn);
                 ay += vy * (double)(now - drawn);

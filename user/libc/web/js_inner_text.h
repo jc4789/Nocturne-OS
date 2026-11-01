@@ -126,9 +126,9 @@ static bool inner_text_flush_owner(web_doc *d) {
             const box_t *box = owner->frame_element->box;
             int width = (double)box->w >= INT32_MAX ? INT32_MAX : box->w > 1 ? (int)box->w : 1;
             int height = (double)box->h >= INT32_MAX ? INT32_MAX : box->h > 1 ? (int)box->h : 1;
-            uint64_t start = uptime_ms(), revision = owner->layout_revision;
+            uint64_t start = (n_clock_monotonic() / N_NS_PER_MS), revision = owner->layout_revision;
             web_layout(owner, width, height);
-            s->task_layout_ms += uptime_ms() - start;
+            s->task_layout_ms += (n_clock_monotonic() / N_NS_PER_MS) - start;
             if (owner->layout_revision != revision) s->task_layout_flushes++;
         } else flush_layout(s);
     }

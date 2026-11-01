@@ -312,14 +312,14 @@ int main(int argc, char **argv) {
         }
         if (!running || !ui_session_open(s)) break;
         pump();
-        bool tick = playing && n_clock_uptime_ms() - last >= 40;
+        bool tick = playing && (n_clock_monotonic() / N_NS_PER_MS) - last >= 40;
         if (changed || playing != was_playing || cur != was_cur || loaded != was_loaded) {
-            last = n_clock_uptime_ms();
+            last = (n_clock_monotonic() / N_NS_PER_MS);
             draw_scope(wave);
             ui_surface_changed_rect(s, SCOPE, 0, 0, SCOPE_W, SCOPE_H);
             show(s);
         } else if (tick) {
-            last = n_clock_uptime_ms();
+            last = (n_clock_monotonic() / N_NS_PER_MS);
             draw_scope(wave);
             ui_surface_changed_rect(s, SCOPE, 0, 0, SCOPE_W, SCOPE_H);
             /* the widgets change only when the clock ticks over or the slider moves a step */

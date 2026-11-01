@@ -191,7 +191,7 @@ static void standard_streams(const char *self) {
     struct n_launch l = {.arguments = print_args, .handles = handles, .argument_count = 3, .handle_count = 3};
     n_handle app = n_app_launch(self, &l);
     int status = -1;
-    CHECK(app >= 0 && n_app_result(app, 10000, &status) == 0 && status == 0);
+    CHECK(app >= 0 && n_app_result(app, n_clock_after(10000 * N_NS_PER_MS), &status) == 0 && status == 0);
     n_handle_close(app);
     const char want[] = "parent:child line 0\nchild line 1\nchild line 2\nchild log\n";
     CHECK(loaded(out, want, sizeof want - 1)); /* appended after what was there */
@@ -220,7 +220,7 @@ static void standard_streams(const char *self) {
     CHECK(n_channel_send(c[0], "tail", 4, -1) == 4);
     for (int i = 0; i < 4; i++) sum += (unsigned char)"tail"[i];
     n_handle_close(c[0]);
-    CHECK(n_app_result(app, 10000, &status) == 0 && status == 0);
+    CHECK(n_app_result(app, n_clock_after(10000 * N_NS_PER_MS), &status) == 0 && status == 0);
     n_handle_close(app);
     n_handle_close(doc);
     char line[64];

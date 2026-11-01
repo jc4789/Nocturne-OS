@@ -109,7 +109,7 @@ struct web_animations {
     uint64_t sequence, transition_generation, event_order;
     uint32_t next_id;
     bool origin_set, script_dirty, cascading; /* cascading: workers run; no restyle marks */
-    uint64_t origin;                   /* uptime_ms() of the timeline's time zero */
+    uint64_t origin;                   /* (n_clock_monotonic() / N_NS_PER_MS) of the timeline's time zero */
     double now;                        /* the document timeline's current time */
     uint64_t last_update;
     struct web_animation_event *events;

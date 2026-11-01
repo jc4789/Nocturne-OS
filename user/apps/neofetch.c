@@ -24,7 +24,7 @@ int main(void) {
     sysinfo(&si);
     char lines[12][128];
     int n = 0;
-    unsigned long up = si.uptime_ms / 1000;
+    unsigned long up = si.uptime_ns / N_NS_PER_S;
     int sw = 0, sh = 0;
     screen_size(&sw, &sh);
     struct n_pciinfo pci[32];

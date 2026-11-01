@@ -27,11 +27,11 @@ int main(void){
     web_doc *d=web_live(page,sizeof page-1,"https://bitmap-promise.test/","utf-8",&host);
     check("real document allocated",d!=NULL);
     if(d){
-        for(unsigned i=0;i<8;i++){web_tick(d,uptime_ms());n_sleep_ms(1);}
+        for(unsigned i=0;i<8;i++){web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}
         web_layout(d,128,128);
         check("new scheduling boundary evaluated",web_console_eval(d,source,(size_t)length));
-        uint64_t deadline=uptime_ms()+5000;
-        while(!done&&uptime_ms()<deadline){web_tick(d,uptime_ms());n_sleep_ms(1);}
+        uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+5000;
+        while(!done&&(n_clock_monotonic() / N_NS_PER_MS)<deadline){web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}
         check("bounded new Promise checks complete",done&&js_checks==10);
         check("no runtime exception",errors==0);
         web_free(d);

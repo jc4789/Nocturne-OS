@@ -61,7 +61,7 @@ static void queue(nmedia_worker *w,unsigned op,int64_t seek) {
         .generation=w->generation,.sequence=++w->sequence,.seek_ms=seek,.epoch=w->epoch};
     nmedia_ff_free(w->tx);w->tx=NULL;w->tx_len=sizeof w->command;w->sent=false;
     memset(&w->response,0,sizeof w->response);
-    w->waiting=true;w->output_ready=w->video_taken=false;w->request_at=uptime_ms();w->stats.requests++;
+    w->waiting=true;w->output_ready=w->video_taken=false;w->request_at=(n_clock_monotonic() / N_NS_PER_MS);w->stats.requests++;
 }
 static bool credit(nmedia_worker *w){uint8_t one=1;return n_channel_send(w->video,&one,sizeof one,-1)==1;}
 static bool spawn_child(nmedia_worker *w) {
@@ -89,7 +89,7 @@ static bool open_size(size_t url,size_t document,size_t *size) {
     *size=sizeof(struct nmedia_worker_command)+url+document;return true;
 }
 nmedia_worker *nmedia_worker_open(const char *url,const char *document,uint32_t generation,char *error,size_t size) {
-    nmedia_worker_background(uptime_ms());
+    nmedia_worker_background((n_clock_monotonic() / N_NS_PER_MS));
     size_t bytes;
     if(!url||!document||!open_size(strlen(url),strlen(document),&bytes)){
         if(error&&size)snprintf(error,size,"native media OPEN URL length is not representable");return NULL;
@@ -123,7 +123,7 @@ static void completed(nmedia_worker *w) {
     struct nmedia_worker_response *r=&w->response;
     w->waiting=false;w->completed_sequence=r->sequence;
     if(r->kind==NMW_VIDEO_PENDING)w->video_expected_sequence=r->sequence;
-    uint64_t now=uptime_ms(),elapsed=now>=w->request_at?now-w->request_at:0;
+    uint64_t now=(n_clock_monotonic() / N_NS_PER_MS),elapsed=now>=w->request_at?now-w->request_at:0;
     w->stats.responses++;w->stats.request_ms+=elapsed;w->stats.max_request_ms=MAX(w->stats.max_request_ms,elapsed);
     if(r->kind==NMEDIA_ERROR){stop(w,r->error[0]?r->error:"native media worker failed");return;}
     if(r->operation==NMW_OPEN) {
@@ -164,7 +164,7 @@ static void control_io(nmedia_worker *w,uint64_t now,struct nmedia_worker_budget
        for cooperative scheduling. Do not turn their total wall time into a
        browser-invented fatal error. Child/HTTP errors, a closed channel and
        explicit cancellation still terminate this owner. */
-    if(dispatch&&uptime_ms()>=b->until)return;
+    if(dispatch&&(n_clock_monotonic() / N_NS_PER_MS)>=b->until)return;
     if(w->app<0) {if(!dispatch||!allow_spawn)return;if(!spawn_child(w))return;}
     if(!w->sent) {
         if(!dispatch)return;
@@ -206,9 +206,9 @@ void nmedia_worker_snapshot(const nmedia_worker *w,struct nmedia_worker_stats *o
     out->payload_total=w->response.payload_bytes;out->waiting=w->waiting;
 }
 void nmedia_worker_pump_budget(nmedia_worker *w,uint64_t now,struct nmedia_worker_budget *b,bool allow_spawn){pump_io(w,now,b,true,allow_spawn);}
-void nmedia_worker_collect(nmedia_worker *w,struct nmedia_worker_budget *b){pump_io(w,uptime_ms(),b,false,false);}
+void nmedia_worker_collect(nmedia_worker *w,struct nmedia_worker_budget *b){pump_io(w,(n_clock_monotonic() / N_NS_PER_MS),b,false,false);}
 void nmedia_worker_pump(nmedia_worker *w,uint64_t now){
-    struct nmedia_worker_budget b={.until=uptime_ms()+2,.tx_bytes=65536};
+    struct nmedia_worker_budget b={.until=(n_clock_monotonic() / N_NS_PER_MS)+2,.tx_bytes=65536};
     nmedia_worker_pump_budget(w,now,&b,true);
 }
 bool nmedia_worker_running(const nmedia_worker *w){return w&&w->app>=0&&!w->stopping;}
@@ -219,7 +219,7 @@ void nmedia_worker_prefetch(nmedia_worker *w,struct nmedia_worker_budget *b){
     if(w->response.kind!=NMEDIA_AUDIO&&w->response.kind!=NMW_VIDEO_PENDING)return;
     /* Caller has released the borrowed span. Queue at most one successor;
      * transport uses the same time budget and cannot spawn. */
-    nmedia_worker_step(w);nmedia_worker_pump_budget(w,uptime_ms(),b,false);
+    nmedia_worker_step(w);nmedia_worker_pump_budget(w,(n_clock_monotonic() / N_NS_PER_MS),b,false);
 }
 const struct nmedia_info *nmedia_worker_info(nmedia_worker *w){return w&&w->metadata?&w->info:NULL;}
 const char *nmedia_worker_error(nmedia_worker *w){return w?w->error:"no native worker";}

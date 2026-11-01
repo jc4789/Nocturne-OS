@@ -100,12 +100,12 @@ static struct n_procinfo *storage_processes(int *count) {
 }
 static uint64_t storage_process_start(void) {
     int count=0;struct n_procinfo *list=storage_processes(&count);uint64_t start=0;
-    for(int i=0;list && i<count;i++)if(list[i].pid==(int)n_app_self()){start=list[i].start_ms;break;}
+    for(int i=0;list && i<count;i++)if(list[i].pid==(int)n_app_self()){start=list[i].start_ns;break;}
     free(list);return start;
 }
 static bool storage_reader_alive(const uint8_t row[48],struct n_procinfo *list,int count) {
     for(int i=0;i<count;i++)if(list[i].pid==(int)storage_u64(row+8) &&
-        list[i].start_ms==storage_u64(row+16) && list[i].state!=3)return true;
+        list[i].start_ns==storage_u64(row+16) && list[i].state!=3)return true;
     return false;
 }
 static n_handle storage_readers_open(struct storage_area *a) {
@@ -360,7 +360,7 @@ static int storage_delta_publish(struct storage_area *a,struct storage_control *
     size_t at=48;if(kn){memcpy(record+at,r->key,kn);at+=kn;}if(old_len){memcpy(record+at,old,old_len);at+=old_len;}
     if(vn){memcpy(record+at,r->value,vn);at+=vn;}if(url_len)memcpy(record+at,r->url,url_len);
     bool ok=storage_io_at(a->shared_log,h->end-STORAGE_CONTROL_BYTES,record,n,true);free(record);if(!ok)return WEB_STORAGE_IO;
-    if(h->revision==h->persisted)h->dirty_since=n_clock_uptime_ms();h->changed_at=n_clock_uptime_ms();h->revision++;h->end+=n;
+    if(h->revision==h->persisted)h->dirty_since=(n_clock_monotonic() / N_NS_PER_MS);h->changed_at=(n_clock_monotonic() / N_NS_PER_MS);h->revision++;h->end+=n;
     if(!storage_control_commit(a,h))return WEB_STORAGE_IO;
     a->shared_epoch=h->epoch;a->shared_cursor=h->end;return WEB_STORAGE_OK;
 }

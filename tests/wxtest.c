@@ -57,7 +57,7 @@ static int run_probe(const char *self, const char *what) {
     n_handle app = n_app_launch(self, &l);
     if (app < 0) return -1;
     int st = 0;
-    n_result r = n_app_result(app, -1, &st);
+    n_result r = n_app_result(app, N_CLOCK_NEVER, &st);
     n_handle_close(app);
     return r < 0 ? -1 : st;
 }

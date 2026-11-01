@@ -50,11 +50,11 @@ static void deliver(web_doc *doc,uint64_t *id,const char *source,const char *url
 int main(void){
     struct web_host host={.request=request_script,.console=log_line,.js_task_budget_ms=5000};
     web_doc *doc=web_live(page,sizeof page-1,"https://current.test/","utf-8",&host);if(!doc)return 1;
-    uint64_t deadline=uptime_ms()+10000;
-    while(!done&&uptime_ms()<deadline){
+    uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+10000;
+    while(!done&&(n_clock_monotonic() / N_NS_PER_MS)<deadline){
         deliver(doc,&classic_request,classic,"https://current.test/classic.js");
         deliver(doc,&defer_request,deferred,"https://current.test/defer.js");
-        web_tick(doc,uptime_ms());n_sleep_ms(1);
+        web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));
     }
     if(!done||checks!=21||errors){printf("FAIL currentScript completion done=%d checks=%d errors=%d\n",done,checks,errors);failures++;}
     web_free(doc);printf("currentscripttest: %d checks, %d failed\n",checks,failures);return failures?1:0;

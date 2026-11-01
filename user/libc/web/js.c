@@ -523,7 +523,7 @@ static void wasm_profile_report(struct web_js_state *s) {
        current.jspi_pending!=old->jspi_pending;
     /* Call counters move on nearly every task of a wasm application: report
        them with the periodic profile rather than once per task. */
-    uint64_t now=uptime_ms();
+    uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);
     if(!structural && (!counted || now-s->wasm_reported_ms<2000))return;
     s->wasm_reported_ms=now;
     bool fallback_changed=current.native_fallbacks!=old->native_fallbacks;
@@ -619,7 +619,7 @@ void web_js_rendering_now(web_doc *d, double period_ms) {
     struct web_js_state *s = d ? d->js : NULL;
     if (!s || s->disabled || !d->visible) return;
     if (period_ms > 0 && period_ms <= 1000) s->rendering_period_ms = period_ms;
-    s->rendering_due = uptime_ms();
+    s->rendering_due = (n_clock_monotonic() / N_NS_PER_MS);
     s->rendering_next = s->rendering_due + (uint64_t)(s->rendering_period_ms + 0.5);
 }
 static bool observers_dirty(struct web_js_state *s);
@@ -731,7 +731,7 @@ static void diagnostic_excerpt(struct web_js_state *s, const char *stack) {
 }
 static void diagnostic_context(struct web_js_state *s, bool fetch_abort) {
     char message[512];
-    uint64_t now=uptime_ms(), wall=now>=s->task_started_ms?now-s->task_started_ms:0;
+    uint64_t now=(n_clock_monotonic() / N_NS_PER_MS), wall=now>=s->task_started_ms?now-s->task_started_ms:0;
     uint64_t allowance=s->task_native_wait_ms+s->task_compile_ms;
     unsigned modules=0,timers=0;
     for(struct js_module *m=s->modules;m;m=m->next)modules++;
@@ -823,7 +823,7 @@ static void report_exception(struct web_js_state *s, JSValueConst e) {
 static void exception(struct web_js_state *s) {
     report_allocation_failure(s);
     bool temporary = !s->running;
-    if (temporary) { JS_UpdateStackTop(s->rt); s->task_deadline = uptime_ms() + s->task_budget_ms; s->running = 1; }
+    if (temporary) { JS_UpdateStackTop(s->rt); s->task_deadline = (n_clock_monotonic() / N_NS_PER_MS) + s->task_budget_ms; s->running = 1; }
     JSValue e = JS_GetException(s->ctx);
     report_exception(s, e);
     JS_FreeValue(s->ctx, e);
@@ -847,14 +847,14 @@ static int interrupt(JSRuntime *rt, void *opaque) {
     if (s->disabled) return 1;
     if (s->running && !s->starting && s->host.script_checkpoint &&
         !s->host.script_checkpoint(s->host.opaque)) { s->disabled=true; return 1; }
-    uint64_t now=uptime_ms();
+    uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);
     if (s->running && now >= s->task_deadline) { s->timed_out = true; s->task_timed_out = true; s->disabled = true; return 1; }
     /* The audio device continues consuming during a long author callback.
        Service only bounded native transport/PCM state here, never author JS,
        layout or UI painting. Its time still belongs to this task's watchdog. */
     web_avmedia_service(now);
     web_idb_pump(&s->indexed_db);
-    if (s->running && uptime_ms() >= s->task_deadline) { s->timed_out = true; s->task_timed_out = true; s->disabled = true; return 1; }
+    if (s->running && (n_clock_monotonic() / N_NS_PER_MS) >= s->task_deadline) { s->timed_out = true; s->task_timed_out = true; s->disabled = true; return 1; }
     return 0;
 }
 static int wasm_poll(JSContext *ctx) {
@@ -904,14 +904,14 @@ static void begin_task(struct web_js_state *s) {
             JS_UpdateStackTop(s->rt);
             if (s->host.debug_js) js_profile_start((s->runtime_owner ? s->runtime_owner : s)->js_profile);
         }
-        s->task_deadline = uptime_ms() + s->task_budget_ms;
+        s->task_deadline = (n_clock_monotonic() / N_NS_PER_MS) + s->task_budget_ms;
         if(s->runtime_owner){
             s->runtime_previous=s->runtime_owner->runtime_active;
             if(s->runtime_previous && s->runtime_previous->running && s->runtime_previous->task_deadline<s->task_deadline)
                 s->task_deadline=s->runtime_previous->task_deadline;
             s->runtime_owner->runtime_active=s;
         }
-        s->task_started_ms=uptime_ms();s->task_native_wait_ms=0;
+        s->task_started_ms=(n_clock_monotonic() / N_NS_PER_MS);s->task_native_wait_ms=0;
         s->diagnostic_task="callback";s->diagnostic_task_id=0;
         s->task_layout_ms = 0; s->task_layout_flushes = 0;
         s->task_compile_ms = 0; s->compile_timed_out = false;
@@ -930,14 +930,14 @@ static void end_task(struct web_js_state *s) {
     if (s->running == 1 && !s->disabled && (!s->runtime_previous||!s->runtime_previous->running)) {
         signal_slots(s);
         JSContext *ctx;
-        uint64_t microtask_start = s->host.debug_js?uptime_ms():0;
+        uint64_t microtask_start = s->host.debug_js?(n_clock_monotonic() / N_NS_PER_MS):0;
         while (JS_IsJobPending(s->rt)) {
             if (interrupt(s->rt, s)) break;
             int r = JS_ExecutePendingJob(s->rt, &ctx);
             if (r < 0) exception(state(ctx)?state(ctx):s);
             if (r == 0) break;
         }
-        if(s->host.debug_js)s->task_microtask_ms += uptime_ms() - microtask_start;
+        if(s->host.debug_js)s->task_microtask_ms += (n_clock_monotonic() / N_NS_PER_MS) - microtask_start;
         /* IndexedDB's active period includes this task's microtasks, never
            the next unrelated timer/event task. No filesystem work here. */
         if(!s->disabled){
@@ -1021,7 +1021,7 @@ static void end_task(struct web_js_state *s) {
                      s->starting ? "Browser API initialization exceeded its 10 second startup budget." : message);
             s->timed_out = false;
         }
-        if (s->task_timed_out || uptime_ms()-s->task_started_ms>=250) {
+        if (s->task_timed_out || (n_clock_monotonic() / N_NS_PER_MS)-s->task_started_ms>=250) {
             storage_profile_report(s);
             if(s->host.debug_js) {
                 /* Reuse the existing randomized timing samples; never add a
@@ -1485,7 +1485,7 @@ void web_navigation_source(web_doc *d,web_node *element,struct web_navigation *o
     out->initiator=d&&!(d->sandbox_flags&SB_ORIGIN)?web_effective_url(d):"";
     out->referrer=fetch_client_referrer_source(d);
     out->referrer_policy=d?d->referrer_policy:WEBNET_REFERRER_DEFAULT;
-    out->user_activation=d&&d->sandbox_activation_until>uptime_ms();
+    out->user_activation=d&&d->sandbox_activation_until>(n_clock_monotonic() / N_NS_PER_MS);
     if(!element)return;
     /* Follow the hyperlink / form submission: the element's referrerpolicy
        replaces the document's, and the noreferrer link type means no-referrer. */
@@ -2084,8 +2084,8 @@ static JSValue style_block_access(struct web_js_state *s, node_t *n, int argc, J
 static void flush_layout(struct web_js_state *s) {
     web_doc *d = s->doc;
     if (d->width < 1 && !d->frame_parent) return;
-    web_avmedia_service(uptime_ms());
-    uint64_t start = s->host.debug_js?uptime_ms():0;
+    web_avmedia_service((n_clock_monotonic() / N_NS_PER_MS));
+    uint64_t start = s->host.debug_js?(n_clock_monotonic() / N_NS_PER_MS):0;
     /* CSSOM geometry can read a child directly from its parent realm. Flush
        the embedding chain from outside in, not only the child at its stale
        pre-paint size. Small normal chains need no heap or recursive C stack. */
@@ -2112,8 +2112,8 @@ static void flush_layout(struct web_js_state *s) {
         }
     }
 flushed:
-    if(s->host.debug_js)s->task_layout_ms += uptime_ms() - start;
-    web_avmedia_service(uptime_ms());
+    if(s->host.debug_js)s->task_layout_ms += (n_clock_monotonic() / N_NS_PER_MS) - start;
+    web_avmedia_service((n_clock_monotonic() / N_NS_PER_MS));
 }
 void web_js_flush_layout(web_doc *d) { if (d && d->js) flush_layout(d->js); }
 static JSValue rect_array(JSContext *ctx, double x, double y, double w, double h) {
@@ -4413,14 +4413,14 @@ static JSValue native_dom_magic(JSContext *ctx, JSValueConst this_val, int argc,
         random^=random<<13;random^=random>>17;random^=random<<5;
         s->profile_dom_sampling=random;sample=(random&63u)==0;
     }
-    uint64_t start=sample?uptime_ms():0;
+    uint64_t start=sample?(n_clock_monotonic() / N_NS_PER_MS):0;
     if(profiling){s->doc->profile.native_calls++;s->profile_dom_ops[opcode].calls++;}
     s->doc->native_input_depth++;
     JSValue result=native_dom_impl(ctx,this_val,argc+1,args,opcode);
     s->doc->native_input_depth--;
     if(profiling)s->profile_dom_depth--;
     if(sample) {
-        uint64_t end=uptime_ms(),elapsed=end>=start?end-start:0;
+        uint64_t end=(n_clock_monotonic() / N_NS_PER_MS),elapsed=end>=start?end-start:0;
         uint64_t estimate=elapsed>UINT64_MAX/64?UINT64_MAX:elapsed*64;
         uint64_t previous=s->doc->profile.native_ms;
         s->doc->profile.native_ms=estimate>UINT64_MAX-previous?UINT64_MAX:previous+estimate;
@@ -4756,7 +4756,7 @@ static void navigation_legacy_timing(struct web_js_state *s, uint64_t now) {
    is a whole millisecond of the same clock. */
 static JSValue native_now(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx);
-    uint64_t us = uptime_us(), origin = s->now * 1000;
+    uint64_t us = (n_clock_monotonic() / N_NS_PER_US), origin = s->now * 1000;
     return JS_NewFloat64(ctx, us > origin ? (double)((us - origin) / 100) / 10.0 : 0.0);
 }
 static JSValue native_window_state(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
@@ -5200,9 +5200,9 @@ static JSValue native_cookie_impl(JSContext *ctx, JSValueConst this_val, int arg
 static JSValue native_cookie(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if(!state(ctx)->host.debug_js)return native_cookie_impl(ctx,this_val,argc,argv);
     struct js_storage_profile *p=&profile_task(state(ctx))->storage_profile;
-    uint64_t start=uptime_ms();p->cookie_calls++;
+    uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);p->cookie_calls++;
     JSValue result=native_cookie_impl(ctx,this_val,argc,argv);
-    p->cookie_ms+=uptime_ms()-start;return result;
+    p->cookie_ms+=(n_clock_monotonic() / N_NS_PER_MS)-start;return result;
 }
 /* A realm is a source of the shared storage events only while its Window has
  * a storage listener. A reader that never polls holds back every checkpoint
@@ -5257,10 +5257,10 @@ static JSValue native_storage_impl(JSContext *ctx, JSValueConst this_val, int ar
         size_t len=0; origin=JS_ToCStringLen(ctx,&len,origin_value);
         if (!origin) goto done;
         if (len && len<2048 && len==strlen(origin) && s->host.storage) {
-            uint64_t start=s->host.debug_js?uptime_ms():0;if(s->host.debug_js)profile->backend_calls++;
+            uint64_t start=s->host.debug_js?(n_clock_monotonic() / N_NS_PER_MS):0;if(s->host.debug_js)profile->backend_calls++;
             status=s->host.storage(s->host.opaque,origin,&request,&out);
             if(status==WEB_STORAGE_OK && s->host.storage_events)s->storage_subscribed[kind]=true;
-            if(s->host.debug_js){profile->backend_ms+=uptime_ms()-start;
+            if(s->host.debug_js){profile->backend_ms+=(n_clock_monotonic() / N_NS_PER_MS)-start;
                 profile->saves+=out.save_attempts;profile->save_ms+=out.save_ms;
                 profile->snapshot_bytes+=out.snapshot_bytes;}
         }
@@ -5297,7 +5297,7 @@ static void storage_subscribe_document(struct web_js_state *s) {
     }
     /* Holders are created by their first getter. A successful native CHECK
      * registers the realm; unused storage neither reads disk nor polls. */
-    s->storage_poll_due=uptime_ms()+100;
+    s->storage_poll_due=(n_clock_monotonic() / N_NS_PER_MS)+100;
 }
 static void storage_release_document(struct web_js_state *s) {
     web_idb_release(s->ctx,&s->indexed_db);
@@ -5317,7 +5317,7 @@ static void storage_listen(struct web_js_state *s) {
         struct web_storage_request request={.kind=kind,.operation=WEB_STORAGE_SUBSCRIBE,.source=s->storage_source};
         struct web_storage_result out={0};s->host.storage(s->host.opaque,s->storage_origin,&request,&out);webstorage_result_free(&out);
     }
-    s->storage_poll_due=uptime_ms()+100;
+    s->storage_poll_due=(n_clock_monotonic() / N_NS_PER_MS)+100;
 }
 static void storage_unlisten(struct web_js_state *s) {
     if(!s->host.storage_events || !s->host.storage || !s->storage_source)return;
@@ -5368,9 +5368,9 @@ static bool storage_run_event(struct web_js_state *s,uint64_t now) {
 static JSValue native_storage(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if(!state(ctx)->host.debug_js)return native_storage_impl(ctx,this_val,argc,argv);
     struct js_storage_profile *p=&profile_task(state(ctx))->storage_profile;
-    bool outer=p->depth++==0;uint64_t start=outer?uptime_ms():0;
+    bool outer=p->depth++==0;uint64_t start=outer?(n_clock_monotonic() / N_NS_PER_MS):0;
     JSValue result=native_storage_impl(ctx,this_val,argc,argv);
-    p->depth--;if(outer)p->inclusive_ms+=uptime_ms()-start;
+    p->depth--;if(outer)p->inclusive_ms+=(n_clock_monotonic() / N_NS_PER_MS)-start;
     return result;
 }
 /* IndexedDB (js_indexeddb.c): what only the window realm knows. */
@@ -5625,7 +5625,7 @@ static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, 
     struct web_js_state *s = state(ctx);
     if(!task_context_active(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Inactive or script-disabled navigation context");
     struct web_js_state *actor=sandbox_actor(s);
-    bool activated=actor->doc->sandbox_activation_until>uptime_ms();
+    bool activated=actor->doc->sandbox_activation_until>(n_clock_monotonic() / N_NS_PER_MS);
     if(!web_sandbox_navigation_allowed(actor->doc,s->doc,activated))return history_security_error(ctx,"Sandbox denied destination navigation");
     const char *p = JS_ToCString(ctx, argv[0]); if (!p) return JS_EXCEPTION;
     if(!task_context_active(s) || !task_context_active(actor)){JS_FreeCString(ctx,p);return history_security_error(ctx,"Navigation context retired during conversion");}
@@ -5637,7 +5637,7 @@ static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, 
     if (!ok) { js_free(ctx, url); return JS_ThrowTypeError(ctx, "Navigation URL is not permitted"); }
     int32_t mode = 0;
     if (argc > 1 && JS_ToInt32(ctx, &mode, argv[1])) { js_free(ctx, url); return JS_EXCEPTION; }
-    if(!task_context_active(s) || !task_context_active(actor) || !web_sandbox_navigation_allowed(actor->doc,s->doc,actor->doc->sandbox_activation_until>uptime_ms())){js_free(ctx,url);return history_security_error(ctx,"Navigation authority changed during conversion");}
+    if(!task_context_active(s) || !task_context_active(actor) || !web_sandbox_navigation_allowed(actor->doc,s->doc,actor->doc->sandbox_activation_until>(n_clock_monotonic() / N_NS_PER_MS))){js_free(ctx,url);return history_security_error(ctx,"Navigation authority changed during conversion");}
     /* The source snapshot precedes the sandbox's consumption of activation. */
     struct web_navigation navigation={.url=url,
         .history=mode==2?WEB_NAVIGATE_REPLACE:mode==1?WEB_NAVIGATE_RELOAD:WEB_NAVIGATE_PUSH};
@@ -5761,7 +5761,7 @@ static JSValue native_timer(JSContext *ctx, JSValueConst this_val, int argc, JSV
     }
     uint32_t id = allocate_timer_id(s);
     struct js_timer *t = &s->timers[index];
-    t->id = id; t->kind = kind; t->interval = ms; t->due = uptime_ms() + timer_timeout(ms, level);
+    t->id = id; t->kind = kind; t->interval = ms; t->due = (n_clock_monotonic() / N_NS_PER_MS) + timer_timeout(ms, level);
     t->nesting = html_timer ? timer_nested(level) : 0;
     t->order=++s->next_timer_order;
     t->fn = JS_DupValue(ctx, argv[1]); t->args = JS_DupValue(ctx, argv[3]);
@@ -5844,7 +5844,7 @@ static JSValue native_idle(JSContext *ctx, JSValueConst this_val, int argc, JSVa
     uint32_t id;
     do { id = ++s->next_idle; } while (!id || idle_id_used(s, id));
     p->id = id; p->fn = JS_DupValue(ctx, argv[0]); p->next = NULL;
-    p->due = timeout ? uptime_ms() + timeout : UINT64_MAX;
+    p->due = timeout ? (n_clock_monotonic() / N_NS_PER_MS) + timeout : UINT64_MAX;
     if (s->last_idle_pending) s->last_idle_pending->next = p; else s->idle_pending = p;
     s->last_idle_pending = p; s->idle_count++;
     return JS_NewUint32(ctx, id);
@@ -5985,7 +5985,7 @@ static struct js_pending *pending_new(struct web_js_state *s, int kind, const ch
     struct js_pending *p = js_mallocz(s->ctx, sizeof *p); if (!p) return NULL;
     p->url = js_strdup(s->ctx, url);
     if (!p->url) { js_free(s->ctx, p); return NULL; }
-    p->id = ++s->runtime_owner->next_request; p->kind = kind; p->started = uptime_ms(); p->deadline = p->started + WEBNET_TIMEOUT_MS;
+    p->id = ++s->runtime_owner->next_request; p->kind = kind; p->started = (n_clock_monotonic() / N_NS_PER_MS); p->deadline = p->started + WEBNET_TIMEOUT_MS;
     p->stream_generation = s->stream_generation;
     p->resolve = p->reject = p->stream_callback = JS_UNDEFINED; p->next = s->pending; s->pending = p; s->pending_count++;
     return p;
@@ -7277,11 +7277,11 @@ static JSValue compile_source(struct web_js_state *s, const char *source, size_t
     if (interrupt(s->rt, s)) return JS_ThrowInternalError(s->ctx, "JavaScript execution was stopped");
     if (len > JS_SOURCE_LIMIT) return JS_ThrowRangeError(s->ctx, "JavaScript source length is not representable");
     bool outer = s->compiling++ == 0;
-    uint64_t before = uptime_ms(), saved = s->task_deadline, waited = s->compile_wait_ms;
+    uint64_t before = (n_clock_monotonic() / N_NS_PER_MS), saved = s->task_deadline, waited = s->compile_wait_ms;
     if (outer) s->task_deadline = before + (s->task_compile_ms < JS_COMPILE_MS ? JS_COMPILE_MS - s->task_compile_ms : 0);
     JSValue result = JS_Eval(s->ctx, source, len, url, kind | JS_EVAL_FLAG_COMPILE_ONLY);
     if (outer) {
-        uint64_t elapsed = uptime_ms() - before;
+        uint64_t elapsed = (n_clock_monotonic() / N_NS_PER_MS) - before;
         s->task_compile_ms += elapsed - (s->compile_wait_ms - waited);
         bool exceeded = interrupt(s->rt, s) != 0 || s->task_compile_ms >= JS_COMPILE_MS;
         s->task_deadline = saved + elapsed;
@@ -7505,10 +7505,10 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
         for(struct js_pending *p=s->pending;p;p=p->next)if(p->kind==P_MODULE&&p->module==m){pending=p;break;}
         /* p remains owned by this realm until the author task unwinds. The
            wait callback must not enter web_tick/process_pending or retire it. */
-        uint64_t before=uptime_ms();
+        uint64_t before=(n_clock_monotonic() / N_NS_PER_MS);
         bool joined=pending&&(pending->done || (s->host.wait_request &&
             s->host.wait_request(s->host.opaque,pending->id,&pending->done)));
-        uint64_t waited=uptime_ms()-before;
+        uint64_t waited=(n_clock_monotonic() / N_NS_PER_MS)-before;
         for(struct web_js_state *active=s;active;active=active->runtime_previous)
             if(active->running){active->task_deadline+=waited;active->task_native_wait_ms+=waited;}
         if(s->compiling)s->compile_wait_ms+=waited;
@@ -7549,7 +7549,7 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
            copies off the native stack, especially in recursive module graphs. */
         struct js_pending *diagnostic = js_mallocz(ctx, sizeof *diagnostic);
         if (!diagnostic) return NULL;
-        struct web_response *r = &diagnostic->response; uint64_t before = uptime_ms();
+        struct web_response *r = &diagnostic->response; uint64_t before = (n_clock_monotonic() / N_NS_PER_MS);
         diagnostic->kind = P_SCRIPT; diagnostic->url = (char *)url; diagnostic->started = before; diagnostic->deadline = before + WEBNET_TIMEOUT_MS;
         struct web_request request={.kind=WEB_RESOURCE_MODULE, .url=url, .method="GET",
             .origin=web_effective_url(s->doc), .credentials=1, .destination=WEBNET_DEST_SCRIPT,
@@ -7559,7 +7559,7 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
             : s->host.sync_load && s->host.sync_load(s->host.opaque, url, WEB_RESOURCE_MODULE, r);
         /* Native UI/network wait is not JavaScript execution. The synchronous
            loader is the one place this adjustment is allowed. */
-        uint64_t waited = uptime_ms() - before;
+        uint64_t waited = (n_clock_monotonic() / N_NS_PER_MS) - before;
         /* document.write can prepare a child graph inside a parent's task.
            Exclude this same native wait from every suspended task, not just
            the child's deadline (which otherwise inherits the parent's guard). */
@@ -8022,7 +8022,7 @@ static void dynamic_inserted(struct web_js_state *s,node_t *parent,
         dynamic_prepare_node(s,inserted->nodes[i],generation,true);
 }
 static void dynamic_scripts(struct web_js_state *s, node_t *n) {
-    uint64_t start = s->host.debug_js?uptime_ms():0;
+    uint64_t start = s->host.debug_js?(n_clock_monotonic() / N_NS_PER_MS):0;
     uint64_t generation=s->stream_generation;
     struct js_inserted_roots candidates={0};
     if(inserted_roots_capture(s,n,&candidates)){
@@ -8030,7 +8030,7 @@ static void dynamic_scripts(struct web_js_state *s, node_t *n) {
             dynamic_prepare_node(s,candidates.nodes[i],generation,false);
     }else exception(s);
     inserted_roots_release(s,&candidates);
-    if(s->host.debug_js)s->doc->profile.script_ms += uptime_ms() - start;
+    if(s->host.debug_js)s->doc->profile.script_ms += (n_clock_monotonic() / N_NS_PER_MS) - start;
 }
 static struct js_resource_event *script_event(struct web_js_state *s, node_t *n, bool failed) {
     if (s->disabled) return NULL;
@@ -8147,7 +8147,7 @@ static void run_script(struct web_js_state *s, struct js_script *script) {
     s->parser_write = !script->module && s->blocker == script && !s->parsing_done;
     bool guard_writes=script->external || script->module;
     if(guard_writes)s->ignore_destructive_writes_counter++;
-    uint64_t source_start = s->host.debug_js?uptime_ms():0, compiled_at = source_start;
+    uint64_t source_start = s->host.debug_js?(n_clock_monotonic() / N_NS_PER_MS):0, compiled_at = source_start;
     JSValue result;bool compilation_failed=false;
     struct js_compile_stats elsewhere={0};
     if (script->module) {
@@ -8158,18 +8158,18 @@ static void run_script(struct web_js_state *s, struct js_script *script) {
     } else {
         result = compiled_elsewhere(s, script, &elsewhere);
         if (JS_IsUninitialized(result)) result = compile_source(s, script->source, script->len, script->url, JS_EVAL_TYPE_GLOBAL);
-        compiled_at = s->host.debug_js?uptime_ms():0;
+        compiled_at = s->host.debug_js?(n_clock_monotonic() / N_NS_PER_MS):0;
         compilation_failed=JS_IsException(result);
         if (!JS_IsException(result)) result = JS_EvalFunction(s->ctx, result);
     }
-    if (s->host.debug_js&&(s->timed_out || uptime_ms() - source_start >= 250 || elsewhere.compile_ms >= 250)) {
+    if (s->host.debug_js&&(s->timed_out || (n_clock_monotonic() / N_NS_PER_MS) - source_start >= 250 || elsewhere.compile_ms >= 250)) {
         char message[256], compiler[96] = "";
         if (elsewhere.bytes)
             snprintf(compiler, sizeof compiler, " (%lu bytes of bytecode, %s %lu ms elsewhere)", (unsigned long)elsewhere.bytes,
                      elsewhere.remembered ? "remembered in" : "compiled in", (unsigned long)elsewhere.compile_ms);
         snprintf(message, sizeof message, "Script task profile: %lu bytes, compile %lu ms%s, execute %lu ms, layout %lu ms in %u reads%s",
                  (unsigned long)script->len, (unsigned long)(compiled_at - source_start), compiler,
-                 (unsigned long)(uptime_ms() - compiled_at), (unsigned long)s->task_layout_ms, s->task_layout_flushes,compilation_failed?", compilation failed":"");
+                 (unsigned long)((n_clock_monotonic() / N_NS_PER_MS) - compiled_at), (unsigned long)s->task_layout_ms, s->task_layout_flushes,compilation_failed?", compilation failed":"");
         log_text(s,WEB_CONSOLE_TRACE, message);
     }
     if (JS_IsException(result)) { exception(s); script->failed = true; }
@@ -8411,7 +8411,7 @@ static void diagnostic_resource(struct web_js_state *s, struct js_pending *p, co
     const char *kind=pending_kind_name(p);
     snprintf(message,sizeof message,"Resource #%lu %s: HTTP %d, %lu bytes, MIME %s, elapsed %lu ms, %s; %s",
         (unsigned long)p->id,kind,p->response.status,(unsigned long)p->response.body_len,mime,
-        (unsigned long)(uptime_ms()-p->started),reason,url);
+        (unsigned long)((n_clock_monotonic() / N_NS_PER_MS)-p->started),reason,url);
     /* A script that cannot run is an error, classic or module alike. */
     log_text(s,p->kind==P_SCRIPT||p->kind==P_MODULE?2:1,message);
 }
@@ -8443,7 +8443,7 @@ static void streamed_response_metadata(struct js_pending *p, bool opaque) {
     minimized_content_type(headers,p->timing_type,sizeof p->timing_type);
 }
 /* Resource Timing's "convert fetch timestamp": zero stays zero, any other
-   time is relative to the time origin, an uptime_ms value (the realm's
+   time is relative to the time origin, a monotonic ms value (the realm's
    s->now; 0 keeps monotonic times, for a Worker's own time origin). */
 static double fetch_timestamp(uint64_t origin, uint64_t at) { return at ? (double)(at >= origin ? at - origin : 0) : 0; }
 /* What a PerformanceResourceTiming or PerformanceNavigationTiming entry holds
@@ -8456,7 +8456,7 @@ static JSValue timing_value(struct web_js_state *s, uint64_t origin, const struc
                             bool opaque_timing, bool opaque_body, int status, const char *content_type) {
     JSContext *ctx=s->ctx;
     struct http_fetch_timing none={0};
-    if(!t->valid){none.start_time=none.post_redirect_start=started;none.end_time=uptime_ms();t=&none;opaque_timing=true;}
+    if(!t->valid){none.start_time=none.post_redirect_start=started;none.end_time=(n_clock_monotonic() / N_NS_PER_MS);t=&none;opaque_timing=true;}
     const struct http_connection_timing *c=&t->connection;
     double start=fetch_timestamp(origin,t->start_time),fetch_start=opaque_timing?start:fetch_timestamp(origin,t->post_redirect_start);
     /* No connection (a response from the cache): its times are the fetch's start. */
@@ -8577,7 +8577,7 @@ static void net_log_response(struct web_js_state *s, struct js_pending *p, const
     }
     char message[768];
     snprintf(message,sizeof message,"Net #%lu %s %s: HTTP %d, %lu bytes, %lu ms, %.*s%s%s%s",(unsigned long)p->id,
-             pending_kind_name(p),phase,p->response.status?p->response.status:p->streamed_status,(unsigned long)bytes,(unsigned long)(uptime_ms()-p->started),
+             pending_kind_name(p),phase,p->response.status?p->response.status:p->streamed_status,(unsigned long)bytes,(unsigned long)((n_clock_monotonic() / N_NS_PER_MS)-p->started),
              (int)MIN(type_len,(size_t)96),type?type:"",p->aborted?", aborted":p->response.error[0]?", failed: ":"",
              !p->aborted&&p->response.error[0]?p->response.error:"",hex);
     log_text(s,WEB_CONSOLE_TRACE,message);
@@ -8778,7 +8778,7 @@ static JSValue fetch_settlement(struct web_js_state *s, struct js_pending *p, bo
 }
 static bool process_pending(struct web_js_state *s) {
     struct js_pending **link = &s->pending;
-    uint64_t now = uptime_ms();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
     bool ran_task = false, imports_waiting = false;
     while (*link) {
         struct js_pending *p = *link;
@@ -8927,10 +8927,10 @@ static JSValue native_fetch_wait(JSContext *ctx, JSValueConst this_val, int argc
     while (p && !(p->id == (uint64_t)id && p->kind == P_FETCH && p->synchronous)) p = p->next;
     if (!p) return JS_ThrowTypeError(ctx, "No synchronous request has this id");
     if (!p->done) {
-        uint64_t before = uptime_ms();
+        uint64_t before = (n_clock_monotonic() / N_NS_PER_MS);
         bool completed = s->host.wait_request && s->host.wait_request(s->host.opaque, p->id, &p->done);
         /* The network wait is not JavaScript execution, as a synchronously loaded module's. */
-        uint64_t waited = uptime_ms() - before;
+        uint64_t waited = (n_clock_monotonic() / N_NS_PER_MS) - before;
         for (struct web_js_state *active = s; active; active = active->runtime_previous)
             if (active->running) { active->task_deadline += waited; active->task_native_wait_ms += waited; }
         if (s->compiling) s->compile_wait_ms += waited;
@@ -9145,7 +9145,7 @@ static bool run_timer_index(struct web_js_state *s, unsigned timer_index, uint64
     /* The callback/microtask checkpoint may grow the table, clear its interval
        or reuse a one-shot slot. Only local JSValue roots survive that boundary. */
     timer = NULL;
-    uint64_t start = s->host.debug_js?uptime_ms():0;
+    uint64_t start = s->host.debug_js?(n_clock_monotonic() / N_NS_PER_MS):0;
     struct web_profile before = s->doc->profile;
     uint64_t initial_dom_rev = s->doc ? s->doc->dom_revision : 0;
     begin_named_task(s,kind==2?"animation frame":kind==1?"interval":kind==3?"timeout":"task",timer_id);
@@ -9166,20 +9166,20 @@ static bool run_timer_index(struct web_js_state *s, unsigned timer_index, uint64
             if(JS_IsException(arg)){prepared=false;break;}args[count++]=arg;
         }
     }
-    uint64_t js_start = s->host.debug_js?uptime_ms():0;
+    uint64_t js_start = s->host.debug_js?(n_clock_monotonic() / N_NS_PER_MS):0;
     JSValue global=JS_UNDEFINED,result=JS_EXCEPTION;
     uint8_t outer_nesting = s->timer_nesting;
     s->timer_nesting = kind == 1 || kind == 3 ? level : 0;
     if(prepared&&task_context_active(s)){global=JS_GetGlobalObject(s->ctx);result=JS_Call(s->ctx,fn,global,count,args);}
     else if(prepared)result=JS_UNDEFINED;
     s->timer_nesting = outer_nesting; /* the microtask checkpoint (end_task) is not this task */
-    uint64_t js_ms = s->host.debug_js?uptime_ms() - js_start:0;
+    uint64_t js_ms = s->host.debug_js?(n_clock_monotonic() / N_NS_PER_MS) - js_start:0;
     if (JS_IsException(result)) exception(s); else JS_FreeValue(s->ctx, result);
     for (int i = 0; i < count; i++) JS_FreeValue(s->ctx, args[i]);
     if(heap_args)js_free(s->ctx,args);
     JS_FreeValue(s->ctx, global); JS_FreeValue(s->ctx, fn); JS_FreeValue(s->ctx, args_array);
     end_task(s);
-    uint64_t elapsed = s->host.debug_js?uptime_ms() - start:0;
+    uint64_t elapsed = s->host.debug_js?(n_clock_monotonic() / N_NS_PER_MS) - start:0;
     if (s->host.debug_js&&(elapsed >= 250 || s->task_timed_out)) {
         char message[768];
         uint64_t layout_ms = s->task_layout_ms >= initial_layout_ms ? s->task_layout_ms - initial_layout_ms : s->task_layout_ms;
@@ -9245,13 +9245,13 @@ static bool run_posted_task(struct web_js_state *s) {
     s->posted = p->next; if (!s->posted) s->last_posted = NULL;
     s->posted_count--;
     JSValue fn = p->fn; js_free(s->ctx, p);
-    uint64_t start = s->host.debug_js?uptime_ms():0;
+    uint64_t start = s->host.debug_js?(n_clock_monotonic() / N_NS_PER_MS):0;
     struct web_profile before = s->doc->profile;
     begin_named_task(s,"posted callback",0);
     JSValue result = JS_Call(s->ctx, fn, JS_UNDEFINED, 0, NULL);
     if (JS_IsException(result)) exception(s); else JS_FreeValue(s->ctx, result);
     JS_FreeValue(s->ctx, fn); end_task(s);
-    uint64_t elapsed = s->host.debug_js?uptime_ms() - start:0;
+    uint64_t elapsed = s->host.debug_js?(n_clock_monotonic() / N_NS_PER_MS) - start:0;
     if (s->host.debug_js&&(elapsed >= 250 || s->task_timed_out)) {
         char message[320];
         snprintf(message, sizeof message,
@@ -9363,7 +9363,7 @@ bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *event) 
     if(!target && !event->synthetic && !strncmp(event->type,"key",3) && web_dialog_top(d)) target=web_dialog_top(d);
     if(!event->synthetic && (!strcmp(event->type,"click") ||
        (!strcmp(event->type,"keydown") && !event->ctrl && !event->alt && event->key &&
-        (!strcmp(event->key,"Enter") || !strcmp(event->key," ")))))d->sandbox_activation_until=uptime_ms()+5000;
+        (!strcmp(event->key,"Enter") || !strcmp(event->key," ")))))d->sandbox_activation_until=(n_clock_monotonic() / N_NS_PER_MS)+5000;
     begin_named_task(s,"DOM event",0);
     JSValue init = event_init(s, event);
     JSValue args[] = {wrap(s, target), JS_NewString(s->ctx, event->type), init};
@@ -9638,7 +9638,7 @@ static bool run_observers(struct web_js_state *s,uint64_t now) {
 /* The opportunity is taken: the next is the display's next frame (web_js_rendering_now), else our
    clock's, a period on. */
 static void rendering_taken(struct web_js_state *s){
-    s->rendering_due=s->host.display_frames?UINT64_MAX:uptime_ms()+(uint64_t)(s->rendering_period_ms+0.5);
+    s->rendering_due=s->host.display_frames?UINT64_MAX:(n_clock_monotonic() / N_NS_PER_MS)+(uint64_t)(s->rendering_period_ms+0.5);
 }
 /* When the next rendering opportunity is expected, for an idle period to end before it: our clock's,
    else the display's next frame, or a period from now when that is late (or the window is not
@@ -9756,12 +9756,12 @@ static bool run_document_event(struct web_js_state *s) {
         begin_task(s); sync_parser_body_handlers(s); end_task(s);
         if(s->stream_generation!=generation || s->disabled || s->parsing_cancelled ||
            !s->parsing_done || unfinished_deferred(s))return true;
-        timing_record(s, JS_DOM_CONTENT_START, uptime_ms());
+        timing_record(s, JS_DOM_CONTENT_START, (n_clock_monotonic() / N_NS_PER_MS));
         s->domcontent_sent = true;
         struct web_event e = {.type="DOMContentLoaded", .bubbles=true};
         web_js_dispatch(d, d->root, &e);
         if(s->stream_generation==generation && !s->disabled && !s->parsing_cancelled)
-            timing_record(s, JS_DOM_CONTENT_END, uptime_ms());
+            timing_record(s, JS_DOM_CONTENT_END, (n_clock_monotonic() / N_NS_PER_MS));
         return true;
     }
     if (s->domcontent_sent && !s->load_sent && !unfinished_scripts(s) && !styles_busy(s) &&
@@ -9769,12 +9769,12 @@ static bool run_document_event(struct web_js_state *s) {
         for (int i = 0; i < web_image_count(d); i++) if (web_image_wanted(d, i)) return false;
         node_t *autofocus = web_autofocus_candidate(d); if (autofocus) web_js_focus_control(d, autofocus);
         if(s->stream_generation!=generation || s->disabled || s->parsing_cancelled)return true;
-        timing_record(s, JS_DOM_COMPLETE, uptime_ms());
+        timing_record(s, JS_DOM_COMPLETE, (n_clock_monotonic() / N_NS_PER_MS));
         s->load_sent = true; struct web_event e = {.type="load"};
-        timing_record(s, JS_LOAD_START, uptime_ms());
+        timing_record(s, JS_LOAD_START, (n_clock_monotonic() / N_NS_PER_MS));
         web_js_dispatch(d, NULL, &e);
         if(s->stream_generation==generation && !s->disabled && !s->parsing_cancelled) {
-            timing_record(s, JS_LOAD_END, uptime_ms());
+            timing_record(s, JS_LOAD_END, (n_clock_monotonic() / N_NS_PER_MS));
             /* HTML "the end": queue the navigation timing entry for its observers. */
             begin_named_task(s,"navigation timing",0);
             JSValue queued=custom_element_hook(s,"navigationTimingQueued",0,NULL);
@@ -9971,7 +9971,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
     /* Expired idle requests are ordinary watchdog-bounded tasks, not idle
        periods. Alternate with other task sources so even continuous fetch,
        scripts or posted/timer work cannot starve an author-supplied timeout. */
-    if (!s->disabled && s->idle_timeout_turn && run_idle_timeout(s, uptime_ms())) {
+    if (!s->disabled && s->idle_timeout_turn && run_idle_timeout(s, (n_clock_monotonic() / N_NS_PER_MS))) {
         s->idle_timeout_turn = false;
         /* Preserve the usual post-watchdog script/lifecycle cleanup even when
            this fairness turn bypasses the other task sources. */
@@ -10077,7 +10077,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
                                             "HTML parsing stopped at the document's memory limit");
                 doc_parser_stop(d);
                 s->parsing_cancelled=result==HTML_PARSE_CANCELLED;
-                if(!s->parsing_cancelled)timing_record(s, JS_DOM_INTERACTIVE, uptime_ms());
+                if(!s->parsing_cancelled)timing_record(s, JS_DOM_INTERACTIVE, (n_clock_monotonic() / N_NS_PER_MS));
                 s->parsing_done = true; break;
             }
             if (result==HTML_PARSE_SCRIPT && node && node->tag == T_script) {
@@ -10164,10 +10164,10 @@ void web_js_tick(web_doc *d, uint64_t now) {
     request_fonts(s); request_images(s);
     if (!ran) ran = run_document_event(s);
     if (report_paint_timing(s)) ran = true;
-    if(!s->disabled && run_rendering(s,uptime_ms()))ran=true;
+    if(!s->disabled && run_rendering(s,(n_clock_monotonic() / N_NS_PER_MS)))ran=true;
     if (ran) s->idle_period_stopped = true;
     else if (!s->disabled) {
-        uint64_t idle_now = uptime_ms();
+        uint64_t idle_now = (n_clock_monotonic() / N_NS_PER_MS);
         if (!run_idle_timeout(s, idle_now)) run_idle_period(s, idle_now);
     }
 }
@@ -10179,7 +10179,7 @@ static uint64_t js_deadline_profile[JD_REASONS], js_deadline_soon[JD_REASONS], j
 #define EARLIER(due, reason) do { uint64_t due_ = (due); if (due_ < deadline) { deadline = due_; *why = (reason); } } while (0)
 static int64_t js_deadline(web_doc *d, int *why) {
     struct web_js_state *s = d ? d->js : NULL; if (!s) return -1;
-    uint64_t deadline = UINT64_MAX, now = uptime_ms();
+    uint64_t deadline = UINT64_MAX, now = (n_clock_monotonic() / N_NS_PER_MS);
     if (d->scroll_input_first || d->scroll_viewport_pending) DUE_NOW();
     int64_t worker_deadline = web_worker_deadline(s->workers,now);
     if (worker_deadline >= 0) EARLIER((uint64_t)worker_deadline, JD_WORKER);
@@ -10257,7 +10257,7 @@ int64_t web_js_deadline(web_doc *d) {
     if (d && d->profile_enabled) {
         int reason = due < 0 ? JD_NONE : why;
         js_deadline_profile[reason]++;
-        if (due >= 0 && (uint64_t)due < uptime_ms() + 16) {
+        if (due >= 0 && (uint64_t)due < (n_clock_monotonic() / N_NS_PER_MS) + 16) {
             js_deadline_soon[reason]++;
             if (d->frame_parent) js_deadline_frame_soon[reason]++;
         }
@@ -10365,7 +10365,7 @@ void web_js_visibility_changed(web_doc *d) {
     if (!task_context_active(s) || s->running) return;
     begin_named_task(s, "visibilitychange", 0);
     JSValue args[] = {JS_NewString(s->ctx, d->visible ? "visible" : "hidden"),
-                      JS_NewFloat64(s->ctx, (double)relative_time(s, uptime_ms()))};
+                      JS_NewFloat64(s->ctx, (double)relative_time(s, (n_clock_monotonic() / N_NS_PER_MS)))};
     JSValue result = JS_IsException(args[0]) ? JS_EXCEPTION : custom_element_hook(s, "visibilityChange", 2, args);
     if (JS_IsException(result)) exception(s); else JS_FreeValue(s->ctx, result);
     JS_FreeValue(s->ctx, args[0]); JS_FreeValue(s->ctx, args[1]);
@@ -10399,10 +10399,10 @@ void web_js_prepare(void) {
 struct bindings_profile { uint64_t wait_ms, read_ms, run_ms; };
 static JSValue platform_run(JSContext *ctx, struct platform_program *p, struct bindings_profile *profile) {
     JSValue code;
-    uint64_t start = uptime_ms();
+    uint64_t start = (n_clock_monotonic() / N_NS_PER_MS);
     platform_prepare(p);
     if (p->job) { p->bytecode = js_compile_take_bytes(p->job, &p->bytecode_len); p->job = NULL; }
-    uint64_t ready = uptime_ms();
+    uint64_t ready = (n_clock_monotonic() / N_NS_PER_MS);
     profile->wait_ms = ready - start;
     if (p->bytecode) {
         code = JS_ReadObject(ctx, p->bytecode, p->bytecode_len, JS_READ_OBJ_BYTECODE);
@@ -10428,10 +10428,10 @@ static JSValue platform_run(JSContext *ctx, struct platform_program *p, struct b
             }
         }
     }
-    uint64_t read = uptime_ms();
+    uint64_t read = (n_clock_monotonic() / N_NS_PER_MS);
     profile->read_ms = read - ready;
     JSValue result = JS_IsException(code) ? code : JS_EvalFunction(ctx, code);
-    profile->run_ms = uptime_ms() - read;
+    profile->run_ms = (n_clock_monotonic() / N_NS_PER_MS) - read;
     return result;
 }
 /* js_locale.js's function in this realm; the bindings call it once, on the
@@ -10517,7 +10517,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     uint32_t budget = s->host.js_task_budget_ms;
     s->task_budget_ms = budget ? budget : WEB_JS_TASK_DEFAULT_MS;
     s->media_width = d->width; s->media_height = d->height;
-    uint64_t initialized = uptime_ms();
+    uint64_t initialized = (n_clock_monotonic() / N_NS_PER_MS);
     size_t heap_before = s->runtime_owner->allocation.current;
     const struct web_navigation_timing *navigation = &s->host.navigation_timing;
     /* Embedders with no navigation observations explicitly use document init.
@@ -10673,7 +10673,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
        trusted library parser/CLDR setup to a future page task disabled all JS
        under QEMU. Keep startup bounded separately from the page task watchdog. */
     s->starting = true; begin_task(s);
-    if(!s->runtime_previous)s->task_deadline = uptime_ms() + JS_STARTUP_MS;
+    if(!s->runtime_previous)s->task_deadline = (n_clock_monotonic() / N_NS_PER_MS) + JS_STARTUP_MS;
     struct bindings_profile bindings = {0};
     s->hooks = platform_run(s->ctx, &bindings_program, &bindings);
     if (JS_IsException(s->hooks)) { exception(s); s->hooks = JS_UNDEFINED; end_task(s); goto failed; }
@@ -10728,7 +10728,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     snprintf(limits,sizeof limits,"JavaScript runtime: OS-allocated heap (no page quota), dynamically allocated timers; stack guard %u KiB, task budget %u ms; "
              "realm setup %llu ms (bindings: compiler wait %llu, read %llu, run %llu, of which Web IDL shapes %u ms: %u interfaces, %u members, "
              "%u wrapped, built-in shape %u native/%u prototype, %u readonly setters dropped, %u misplaced), heap +%zu KiB",
-             JS_STACK_LIMIT/1024u,s->task_budget_ms,(unsigned long long)(uptime_ms()-initialized),
+             JS_STACK_LIMIT/1024u,s->task_budget_ms,(unsigned long long)((n_clock_monotonic() / N_NS_PER_MS)-initialized),
              (unsigned long long)bindings.wait_ms,(unsigned long long)bindings.read_ms,(unsigned long long)bindings.run_ms,
              idl->milliseconds,idl->interfaces,idl->members,idl->wrapped,idl->builtin_wrapped,idl->builtin_reprototyped,idl->setters_dropped,idl->misplaced,
              (s->runtime_owner->allocation.current>heap_before?s->runtime_owner->allocation.current-heap_before:0)/1024);

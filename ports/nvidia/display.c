@@ -1507,14 +1507,14 @@ static int state_thread(void *unused) {
     uint64_t seen = 0;
     bool refused = false;
     while (!__atomic_load_n(&scr.state_stop, __ATOMIC_ACQUIRE)) {
-        n_result r = n_pci_screen_state(nvrm_dev.pci, 0, seen, &state_followed, STATE_WAIT_MS);
+        n_result r = n_pci_screen_state(nvrm_dev.pci, 0, seen, &state_followed, n_clock_after(STATE_WAIT_MS * N_NS_PER_MS));
         if (r == -N_ERR_TIMEOUT) continue;
         if (r < 0) {
             /* Not while nvrm neither shows its buffers nor offers modes; looked at again later. */
             if (__atomic_load_n(&scr.state_stop, __ATOMIC_ACQUIRE)) break; /* nvrm stops */
             if (!refused) nvrm_log(LOG "the system does not say what the screen shows: %s", n_result_text(r));
             refused = true;
-            n_sleep_ms(STATE_WAIT_MS);
+            n_sleep_until(n_clock_after(STATE_WAIT_MS * N_NS_PER_MS));
             continue;
         }
         refused = false;
@@ -1533,12 +1533,12 @@ static int flip_thread(void *unused) {
     struct n_screen_flip flips[FLIPS_TAKEN];
     bool refused = false;
     while (!__atomic_load_n(&scr.state_stop, __ATOMIC_ACQUIRE)) {
-        n_result n = n_pci_screen_flips(nvrm_dev.pci, flips, FLIPS_TAKEN, STATE_WAIT_MS);
+        n_result n = n_pci_screen_flips(nvrm_dev.pci, flips, FLIPS_TAKEN, n_clock_after(STATE_WAIT_MS * N_NS_PER_MS));
         if (n < 0) {
             if (__atomic_load_n(&scr.state_stop, __ATOMIC_ACQUIRE)) break; /* nvrm stops */
             if (!refused) nvrm_log(LOG "the system does not give its flips: %s", n_result_text(n));
             refused = true;
-            n_sleep_ms(STATE_WAIT_MS);
+            n_sleep_until(n_clock_after(STATE_WAIT_MS * N_NS_PER_MS));
             continue;
         }
         refused = false;

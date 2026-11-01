@@ -41,8 +41,8 @@ int main(void) {
     doc = web_live(html, strlen(html), "http://metadata.test/old/index.html", "utf-8", &host);
     if (!doc) { puts("FAIL metadata document allocation"); return 1; }
     web_layout(doc, 800, 600);
-    uint64_t deadline = uptime_ms() + 10000;
-    while (!done && uptime_ms() < deadline) { web_tick(doc, uptime_ms()); n_sleep_ms(1); }
+    uint64_t deadline = (n_clock_monotonic() / N_NS_PER_MS) + 10000;
+    while (!done && (n_clock_monotonic() / N_NS_PER_MS) < deadline) { web_tick(doc, (n_clock_monotonic() / N_NS_PER_MS)); n_sleep_until(n_clock_after(1 * N_NS_PER_MS)); }
     if (!done || checks != 85) { failures++; printf("FAIL metadata completion: done=%d checks=%d\n", done, checks); }
     web_free(doc);
     printf("metadatatest: %d checks, %d failures\n", checks, failures);

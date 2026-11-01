@@ -25,7 +25,7 @@ static uint32_t row_node[MAXPROC], kill_node; /* places in the view that events 
 
 static uint64_t prev_cpu(int pid) {
     for (int i = 0; i < nprev; i++)
-        if (prev[i].pid == pid) return prev[i].cpu_ms;
+        if (prev[i].pid == pid) return prev[i].cpu_ns;
     return 0;
 }
 
@@ -33,21 +33,21 @@ static void sample(void) {
     memcpy(prev, procs, sizeof procs);
     nprev = nproc;
     nproc = proclist(procs, MAXPROC);
-    uint64_t now = n_clock_uptime_ms(), dt = now - last_t;
-    if (!last_t || !dt) dt = 1000;
+    uint64_t now = n_clock_monotonic(), dt = now - last_t;
+    if (!last_t || !dt) dt = N_NS_PER_S;
     last_t = now;
     uint64_t busy = 0;
     for (int i = 0; i < nproc; i++) {
-        uint64_t d = procs[i].cpu_ms - prev_cpu(procs[i].pid);
-        if (procs[i].cpu_ms < prev_cpu(procs[i].pid)) d = 0;
-        proc_cpu[i] = 100.0f * d / dt;
+        uint64_t d = procs[i].cpu_ns - prev_cpu(procs[i].pid);
+        if (procs[i].cpu_ns < prev_cpu(procs[i].pid)) d = 0;
+        proc_cpu[i] = 100.0f * (float)d / (float)dt;
         if (procs[i].pid != 0) busy += d;
     }
     struct n_cpuinfo ci;
     unsigned task_cpus = cpu_info(&ci) == 0 && ci.scheduler_cpus ? ci.scheduler_cpus : 1;
-    /* task cpu_msにはAP runnerの時間も含む。1CPU当たりのprocess %は維持し、
+    /* task cpu_nsにはAP runnerの時間も含む。1CPU当たりのprocess %は維持し、
        全taskグラフだけを実scheduler容量で正規化する。純計算AP jobは含まない。 */
-    float cpu = 100.0f * busy / dt / task_cpus;
+    float cpu = 100.0f * (float)busy / (float)dt / task_cpus;
     if (cpu > 100) cpu = 100;
     struct n_sysinfo si;
     sysinfo(&si);
@@ -133,7 +133,7 @@ static void show(struct ui_session *s) {
     if (cpu_info(&ci) == 0)
         snprintf(cpu_info_text, sizeof cpu_info_text, "CPU %u / %u   task CPU %u   AP workers %u   jobs %lu", ci.online_cpus,
                  ci.detected_cpus, ci.scheduler_cpus, ci.worker_cpus, (unsigned long)ci.parallel_jobs);
-    unsigned long up = si.uptime_ms / 1000;
+    unsigned long up = si.uptime_ns / N_NS_PER_S;
     snprintf(up_text, sizeof up_text, "up %lu:%02lu:%02lu", up / 3600, up / 60 % 60, up % 60);
     char tasks[24];
     snprintf(tasks, sizeof tasks, "%d tasks", nproc);
@@ -212,11 +212,11 @@ int main(void) {
     if (!cpu_c || !mem_c) return 1;
     sample();
     snprintf(status, sizeof status, "Select a process to end it");
-    uint64_t next = n_clock_uptime_ms() + 1000;
+    uint64_t next = (n_clock_monotonic() / N_NS_PER_MS) + 1000;
     draw_graphs(s, cpu_c, mem_c);
     show(s);
     for (bool running = true; running;) {
-        int64_t wait = (int64_t)(next - n_clock_uptime_ms());
+        int64_t wait = (int64_t)(next - (n_clock_monotonic() / N_NS_PER_MS));
         ui_session_wait(s, wait > 0 ? (int)wait : 0);
         bool changed = false, resample = false;
         struct ui_event e;
@@ -245,9 +245,9 @@ int main(void) {
             }
         }
         if (!running || !ui_session_open(s)) break;
-        if (n_clock_uptime_ms() >= next) {
+        if ((n_clock_monotonic() / N_NS_PER_MS) >= next) {
             sample();
-            next = n_clock_uptime_ms() + 1000;
+            next = (n_clock_monotonic() / N_NS_PER_MS) + 1000;
             resample = changed = true;
         }
         if (resample) draw_graphs(s, cpu_c, mem_c);

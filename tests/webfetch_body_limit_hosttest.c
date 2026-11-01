@@ -4,10 +4,10 @@
 #include <stdbool.h>
 #define ssize_t nocturne_test_ssize_t
 #define main static webfetch_child_entry
-#define uptime_ms body_test_uptime
+#define n_clock_monotonic body_test_clock
 #include "../user/apps/webfetch.c"
 #undef main
-uint64_t body_test_uptime(void){return 100;}
+uint64_t body_test_clock(void){return 100*1000000ULL;}
 static unsigned checks,failed;
 #define CHECK(c) do {checks++;if(!(c)){failed++;printf("FAIL child body:%d %s\n",__LINE__,#c);}}while(0)
 static void collector(unsigned kind,unsigned flags,size_t limit) {

@@ -433,22 +433,22 @@ static void fake_count(unsigned *open, unsigned *over_closed) {
 
 /* The server ends a client on its own thread: wait until the fake has seen it. */
 static bool wait_closed(uint32_t id) {
-    uint64_t end = n_clock_uptime_ms() + WAIT_MS;
+    uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + WAIT_MS;
     while (!file_record(id).closes) {
-        if (n_clock_uptime_ms() > end) return false;
-        n_sleep_ms(2);
+        if ((n_clock_monotonic() / N_NS_PER_MS) > end) return false;
+        n_sleep_until(n_clock_after(2 * N_NS_PER_MS));
     }
     return true;
 }
 
 static bool wait_all_closed(void) {
-    uint64_t end = n_clock_uptime_ms() + WAIT_MS;
+    uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + WAIT_MS;
     for (;;) {
         unsigned open;
         fake_count(&open, NULL);
         if (!open) return true;
-        if (n_clock_uptime_ms() > end) return false;
-        n_sleep_ms(2);
+        if ((n_clock_monotonic() / N_NS_PER_MS) > end) return false;
+        n_sleep_until(n_clock_after(2 * N_NS_PER_MS));
     }
 }
 
@@ -476,17 +476,17 @@ static int server_main(void *arg) {
 
 /* The server thread starts listening on its own time. */
 static struct nvrm *first_connect(void) {
-    uint64_t end = n_clock_uptime_ms() + WAIT_MS;
+    uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + WAIT_MS;
     for (;;) {
         struct nvrm *rm = NULL;
         int64_t r = nvrm_connect_device_status(TARGET, &rm);
         if (r >= 0) return rm;
-        if (n_clock_uptime_ms() > end || __atomic_load_n(&serve_returned, __ATOMIC_ACQUIRE)) {
+        if ((n_clock_monotonic() / N_NS_PER_MS) > end || __atomic_load_n(&serve_returned, __ATOMIC_ACQUIRE)) {
             CHECK(false, "no server to connect to: %s (nvrm_serve: %s)", n_result_text(r),
                   n_result_text(serve_result));
             return NULL;
         }
-        n_sleep_ms(5);
+        n_sleep_until(n_clock_after(5 * N_NS_PER_MS));
     }
 }
 
@@ -789,11 +789,11 @@ static void test_blocking(void) {
     thrd_t thread;
     bool started = thrd_create(&thread, blocked_main, &b) == thrd_success;
     CHECK(started, "blocking thread");
-    uint64_t end = n_clock_uptime_ms() + WAIT_MS;
+    uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + WAIT_MS;
     mtx_lock(&fake.lock);
-    while (started && !fake.blocked && n_clock_uptime_ms() <= end) {
+    while (started && !fake.blocked && (n_clock_monotonic() / N_NS_PER_MS) <= end) {
         mtx_unlock(&fake.lock);
-        n_sleep_ms(2);
+        n_sleep_until(n_clock_after(2 * N_NS_PER_MS));
         mtx_lock(&fake.lock);
     }
     bool blocked = fake.blocked;
@@ -849,13 +849,13 @@ static void test_thread_limit(void) {
         /* the slot comes back once the client's thread has ended, just after its file closed */
         nvrm_disconnect(conn[0]);
         CHECK(wait_closed(file[0]), "the disconnected client's file closed");
-        uint64_t end = n_clock_uptime_ms() + WAIT_MS;
+        uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + WAIT_MS;
         int64_t s;
         do {
             conn[0] = NULL;
             s = nvrm_connect_device_status(TARGET, &conn[0]);
-            if (s < 0) n_sleep_ms(2);
-        } while (s < 0 && n_clock_uptime_ms() <= end);
+            if (s < 0) n_sleep_until(n_clock_after(2 * N_NS_PER_MS));
+        } while (s < 0 && (n_clock_monotonic() / N_NS_PER_MS) <= end);
         CHECK(s >= 0, "a new client is served once one has gone: %s", n_result_text(s));
         if (s >= 0) {
             file[0] = echo(conn[0], 999, FAKE_CMD_ECHO, 0x8800);

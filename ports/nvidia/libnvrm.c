@@ -430,9 +430,9 @@ uint32_t nvrm_uvm_unmap(struct nvrm *rm, void *address) {
 }
 
 uint32_t nvrm_uvm_poll(struct nvrm *rm, int32_t file, int64_t timeout_ms, uint32_t *events) {
-    uint64_t deadline = timeout_ms < 0 ? UINT64_MAX : n_clock_uptime_ms() + (uint64_t)timeout_ms;
+    uint64_t deadline = timeout_ms < 0 ? UINT64_MAX : (n_clock_monotonic() / N_NS_PER_MS) + (uint64_t)timeout_ms;
     for (;;) {
-        uint64_t now = n_clock_uptime_ms();
+        uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
         int64_t left = timeout_ms < 0 ? -1 : now >= deadline ? 0 : (int64_t)(deadline - now);
         struct nvrm_uvm_request u = {.op = NVRM_UVM_POLL, .file = file, .timeout_ms = left};
         /* one request at a time, so other threads' calls go between the waits */

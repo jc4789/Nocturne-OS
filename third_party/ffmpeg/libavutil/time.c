@@ -28,19 +28,16 @@
 #include "time.h"
 #include "error.h"
 
-/* Wall time is the system clock's whole seconds; Nocturne has no finer wall
- * clock, and gluing a millisecond counter onto it would jump when the two
- * disagree. Callers here only stamp logs and live streams, so a second is
- * enough. */
+/* The system's wall clock, in ns since 1970 (UTC). */
 int64_t av_gettime(void)
 {
-    return n_clock_wall() * 1000000;
+    return (int64_t)(n_clock_wall() / N_NS_PER_US);
 }
 
-/* Milliseconds since boot, monotonic; the resolution of the native uptime clock. */
+/* The system's monotonic clock. */
 int64_t av_gettime_relative(void)
 {
-    return (int64_t)n_clock_uptime_ms() * 1000;
+    return (int64_t)(n_clock_monotonic() / N_NS_PER_US);
 }
 
 int av_gettime_relative_is_monotonic(void)
@@ -48,10 +45,10 @@ int av_gettime_relative_is_monotonic(void)
     return 1;
 }
 
-/* The native sleep counts milliseconds; round up so a sleep is never short. */
+/* The native sleep ends at a monotonic deadline in ns. */
 int av_usleep(unsigned usec)
 {
     if (usec)
-        n_sleep_ms(((uint64_t)usec + 999) / 1000);
+        n_sleep_until(n_clock_after((uint64_t)usec * N_NS_PER_US));
     return 0;
 }

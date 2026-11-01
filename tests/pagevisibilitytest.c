@@ -31,15 +31,14 @@ static void layout(web_doc *d){if(web_dirty(d))web_layout(d,400,300);}
 static int run_until(web_doc *d,uint64_t limit,const bool *stop){
     int wakes=0;n_handle queue=web_wait_queue();struct n_event events[32];
     while(!(stop&&*stop)){
-        uint64_t now=uptime_ms();if(now>=limit)break;
+        uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);if(now>=limit)break;
         int64_t due=web_deadline(d);
         uint64_t until=due<0||(uint64_t)due>limit?limit:(uint64_t)due;
-        int ms=until>now?(int)(until-now):0;
         n_result got=0;
-        if(queue>=0)got=n_events_wait(queue,events,32,ms);else if(ms)n_sleep_ms(ms);
+        if(queue>=0)got=n_events_wait(queue,events,32,until*N_NS_PER_MS);else n_sleep_until(until*N_NS_PER_MS);
         if(got>0)web_wait_events(events,(size_t)got);
-        if(got<=0&&uptime_ms()>=limit&&until==limit)break;
-        wakes++;web_tick(d,uptime_ms());layout(d);
+        if(got<=0&&(n_clock_monotonic() / N_NS_PER_MS)>=limit&&until==limit)break;
+        wakes++;web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));layout(d);
     }
     return wakes;
 }
@@ -90,9 +89,9 @@ int main(void){
     web_doc *doc=web_live(page,sizeof page-1,"https://page-visibility.test/","utf-8",&host);
     if(!doc){puts("FAIL pagevisibility live document");return 1;}
     web_layout(doc,400,300);
-    run_until(doc,uptime_ms()+10000,&ready);
+    run_until(doc,(n_clock_monotonic() / N_NS_PER_MS)+10000,&ready);
     check("page ready",ready);
-    run_until(doc,uptime_ms()+200,NULL);
+    run_until(doc,(n_clock_monotonic() / N_NS_PER_MS)+200,NULL);
     node_t *spin=by_id(doc,"spin");
     web_doc *child=doc->frames?doc->frames->document:NULL;
     check("visible top and frame",doc->visible&&doc->system_visible&&child&&child->visible);
@@ -101,31 +100,31 @@ int main(void){
     check("visible animation frames wanted",web_js_rendering_wanted(doc));
 
     /* The window is minimized (or the tab goes behind another): one queued task per document. */
-    float before=opacity(spin);uint64_t hidden_at=uptime_ms();
+    float before=opacity(spin);uint64_t hidden_at=(n_clock_monotonic() / N_NS_PER_MS);
     window_bits=0;web_visibility_event(doc);web_visibility_event(child);
     check("hide queues one task per document",doc->visibility_updates==1&&all_frames(doc,true,1)&&doc->visible&&!doc->system_visible);
     int64_t due=web_deadline(doc);
-    check("queued task is due now",due>=0&&(uint64_t)due<=uptime_ms());
+    check("queued task is due now",due>=0&&(uint64_t)due<=(n_clock_monotonic() / N_NS_PER_MS));
     eval(doc,"check('state kept until the task runs',document.visibilityState==='visible'&&events.length===0)");
-    web_tick(doc,uptime_ms());layout(doc);
+    web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));layout(doc);
     check("hidden after the task",!doc->visible&&!doc->visibility_updates&&all_frames(doc,false,0));
     eval(doc,"check('hidden event',events.join()==='hidden'&&handlerEvents===1&&windowEvents===1&&shapes&&document.hidden);"
              "check('frame hidden event',childEvents.join()==='hidden'&&document.getElementById('child').contentDocument.visibilityState==='hidden')");
     check("hidden CSS animation has no deadline",web_animations_deadline(doc)==-1);
     check("hidden marquee has no deadline",web_marquee_deadline(doc)==-1);
     check("hidden animation frames not wanted",!web_js_rendering_wanted(doc));
-    run_until(doc,uptime_ms()+5000,&late_ready);
+    run_until(doc,(n_clock_monotonic() / N_NS_PER_MS)+5000,&late_ready);
     check("frame created while hidden loaded",late_ready);
     /* A frame's first deadlines (its first-render fallback) pass, then the hidden page's wakes. */
     run_until(doc,hidden_at+3500,NULL);
-    int wakes=run_until(doc,uptime_ms()+2000,NULL);
+    int wakes=run_until(doc,(n_clock_monotonic() / N_NS_PER_MS)+2000,NULL);
     printf("pagevisibility hidden wakes in 2000 ms: %d\n",wakes);
     check("hidden page wakes at most a few times",wakes<=6);
 
     /* Shown again: the same tasks, and the animation where its time puts it. */
     window_bits=WEB_WINDOW_VISIBLE|WEB_WINDOW_FOCUSED;web_visibility_event(doc);
-    web_tick(doc,uptime_ms());web_layout(doc,400,300);web_tick(doc,uptime_ms());web_layout(doc,400,300);
-    float after=opacity(spin);uint64_t elapsed=uptime_ms()-hidden_at;
+    web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));web_layout(doc,400,300);web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));web_layout(doc,400,300);
+    float after=opacity(spin);uint64_t elapsed=(n_clock_monotonic() / N_NS_PER_MS)-hidden_at;
     check("visible again",doc->visible&&all_frames(doc,true,0));
     printf("pagevisibility opacity %.4f -> %.4f over %lu ms\n",before,after,(unsigned long)elapsed);
     check("CSS animation time ran while hidden",before>=0&&fabsf((after-before)-(float)elapsed/100000.0f)<0.01f);
@@ -139,16 +138,16 @@ int main(void){
              "const v=performance.getEntriesByType('visibility-state');"
              "check('visibility-state entries',v.map(e=>e.name).join()==='visible,hidden,visible'&&v[1].startTime>0&&v[2].startTime>v[1].startTime&&v[2].duration===0);"
              "window.rafsShown=rafs");
-    run_until(doc,uptime_ms()+1500,NULL);
+    run_until(doc,(n_clock_monotonic() / N_NS_PER_MS)+1500,NULL);
     eval(doc,"check('animation frames resume',rafs>=window.rafsShown+5);"
              "check('observer gets the entries',observed.join()==='hidden,visible')");
 
     /* Hidden and shown again before a task runs: both tasks run, in order. */
     window_bits=0;web_visibility_event(doc);window_bits=WEB_WINDOW_VISIBLE|WEB_WINDOW_FOCUSED;web_visibility_event(doc);
     check("two queued tasks",doc->visibility_updates==2&&doc->visible);
-    web_tick(doc,uptime_ms());check("first task hides",!doc->visible&&doc->visibility_updates==1);
-    web_tick(doc,uptime_ms());check("second task shows",doc->visible&&!doc->visibility_updates);
-    run_until(doc,uptime_ms()+100,NULL);
+    web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));check("first task hides",!doc->visible&&doc->visibility_updates==1);
+    web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));check("second task shows",doc->visible&&!doc->visibility_updates);
+    run_until(doc,(n_clock_monotonic() / N_NS_PER_MS)+100,NULL);
     eval(doc,"check('both events fire',events.join()==='hidden,visible,hidden,visible'&&childEvents.join()==='hidden,visible,hidden,visible');"
              "check('five entries',performance.getEntriesByType('visibility-state').length===5)");
 

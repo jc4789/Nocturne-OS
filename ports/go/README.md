@@ -35,7 +35,7 @@ Nocturne は UNIX でも POSIX でもないので、Go 側を Nocturne の API �
   `WRFSBASE` で FS の基底を直に書く。ロックは `SYS_WAIT_ADDRESS`／`SYS_WAKE_ADDRESS`。
 - **メモリー**：需要ゼロの共有領域（`SYS_SHARED_RESERVE`＋`SYS_SHARED_MAP`）。アドレスは
   カーネルが選ぶので、ヒープのアドレス希望は使いません。
-- **時刻**：Hyper-V の参照ページ、または TSC（`SYS_CLOCK_INFO`）。壁時計は `SYS_TIME` を基点にします。
+- **時刻**：全アプリに写る時計のデータ（`N_CLOCK_ADDRESS` の `struct n_clock`）を RDTSCP で読みます。`nanotime` は単調時計、`walltime` は壁時計。眠りとアドレス待ちは単調時計の期限（ns）で渡します。`syscall` パッケージの待つ呼出しも期限を取ります（`syscall.After`、`syscall.CLOCK_NEVER`）。
 - **文書**：共有カーソルはないので、`os.File` が自分の位置を持ちます。`O_APPEND` は書くたびに末尾。
   権限ビットはなく、`Chmod` は存在確認だけ、`Chtimes`・`Chown`・リンクは非対応を返します。
 - **パス**：ドライブは `C:` の一つだけ。区切りは `\`（`os.PathSeparator`）と `/` のどちらでもよく、

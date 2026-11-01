@@ -814,14 +814,14 @@ void wake_up_all(wait_queue_head_t *wq);
 #define wake_up(wq) wake_up_all(wq)
 #define wake_up_interruptible(wq) wake_up_all(wq)
 #define wake_up_interruptible_all(wq) wake_up_all(wq)
-/* Sleeps until the sequence differs from `seen` or timeout_ms passed (UINT32_MAX: no limit). */
-void uvm_os_wait_queue_sleep(wait_queue_head_t *wq, uint32_t seen, unsigned timeout_ms);
+/* Sleeps until the sequence differs from `seen` or the deadline (N_CLOCK_NEVER: none) passed. */
+void uvm_os_wait_queue_sleep(wait_queue_head_t *wq, uint32_t seen, uint64_t deadline);
 #define wait_event(wq, cond)                                                               \
     do {                                                                                   \
         for (;;) {                                                                         \
             uint32_t _seen = __atomic_load_n(&(wq).sequence, __ATOMIC_ACQUIRE);            \
             if (cond) break;                                                               \
-            uvm_os_wait_queue_sleep(&(wq), _seen, UINT32_MAX);                             \
+            uvm_os_wait_queue_sleep(&(wq), _seen, N_CLOCK_NEVER);                          \
         }                                                                                  \
     } while (0)
 #define wait_event_interruptible(wq, cond) ({ wait_event(wq, cond); 0; })
@@ -835,7 +835,7 @@ void uvm_os_wait_queue_sleep(wait_queue_head_t *wq, uint32_t seen, unsigned time
             if (cond) { if (_left < 1) _left = 1; break; }                                 \
             _left = (long)(_deadline - jiffies);                                           \
             if (_left <= 0) { _left = (cond) ? 1 : 0; break; }                             \
-            uvm_os_wait_queue_sleep(&(wq), _seen, (unsigned)_left);                        \
+            uvm_os_wait_queue_sleep(&(wq), _seen, n_clock_after((uint64_t)_left * N_NS_PER_MS)); \
         }                                                                                  \
         _left;                                                                             \
     })

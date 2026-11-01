@@ -117,7 +117,7 @@ static void show(struct ui_session *s) {
 }
 
 int main(void) {
-    srand((unsigned)n_clock_uptime_ms());
+    srand((unsigned)(n_clock_monotonic() / N_NS_PER_MS));
     struct ui_session *s = ui_session_new();
     if (!s || ui_window(s, WINDOW, W + 2 * PAD, H + 2 * PAD + GAP + HEADER, 0, "Snake", NULL, NULL) < 0) return 1;
     canvas_t *field = ui_surface(s, FIELD, W, H, 0);
@@ -127,11 +127,11 @@ int main(void) {
     ui_surface_changed(s, FIELD);
     show(s);
     int shown_score = score, shown_best = best;
-    uint64_t next = n_clock_uptime_ms();
+    uint64_t next = (n_clock_monotonic() / N_NS_PER_MS);
     for (bool running = true; running;) {
         int speed = 130 - (score / 50) * 8;
         if (speed < 55) speed = 55;
-        int64_t wait = (int64_t)(next - n_clock_uptime_ms());
+        int64_t wait = (int64_t)(next - (n_clock_monotonic() / N_NS_PER_MS));
         ui_session_wait(s, wait > 0 ? (int)wait : 0);
         bool redraw = false;
         struct ui_event e;
@@ -152,8 +152,8 @@ int main(void) {
             }
         }
         if (!running || !ui_session_open(s)) break;
-        if ((int64_t)(next - n_clock_uptime_ms()) <= 0) {
-            next = n_clock_uptime_ms() + speed;
+        if ((int64_t)(next - (n_clock_monotonic() / N_NS_PER_MS)) <= 0) {
+            next = (n_clock_monotonic() / N_NS_PER_MS) + speed;
             if (!dead && !paused) step();
             redraw = true;
         }

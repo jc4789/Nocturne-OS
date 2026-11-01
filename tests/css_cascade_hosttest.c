@@ -14,7 +14,7 @@
 #include "quickjs.h"
 
 void css_cascade_host_init(JSContext *ctx, JSValue host);
-uint64_t uptime_ms(void) { return 0; }
+uint64_t n_clock_monotonic(void){return (uint64_t)(0)*1000000ULL;}
 
 static void exception(JSContext *ctx) {
     JSValue e = JS_GetException(ctx), stack = JS_GetPropertyStr(ctx, e, "stack");

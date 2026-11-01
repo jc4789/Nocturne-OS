@@ -39,7 +39,7 @@ static struct fixture channels[8];
 static uint64_t clock_ms;
 static int test_errno,closed_count,killed_count,wait_count,last_timeout,watched_gui,watched_net,net_events;
 int *__errno_location(void){return &test_errno;}
-uint64_t uptime_ms(void){return clock_ms;}
+uint64_t n_clock_monotonic(void){return (uint64_t)(clock_ms)*1000000ULL;}
 int close(int fd){(void)fd;closed_count++;return 0;}
 int kill(int pid){(void)pid;killed_count++;return 0;}
 int waitpid(int pid,int *status,int flags){(void)pid;(void)status;(void)flags;wait_count++;return 0;}

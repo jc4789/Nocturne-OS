@@ -3,7 +3,7 @@
 int main(void) {
     printf("Rebooting...\n");
     fflush(stdout);
-    n_sleep_ms(300);
+    n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
     reboot();
     return 1;
 }

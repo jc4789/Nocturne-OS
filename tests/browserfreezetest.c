@@ -21,7 +21,7 @@ static web_doc *load(void) {
     const char *html = "<!doctype html><html><head></head><body></body></html>";
     struct web_host host = {.console=console, .script_checkpoint=checkpoint};
     web_doc *d = web_live(html, strlen(html), "https://freeze.test/", "utf-8", &host);
-    if (d) for (int i=0;i<8;i++) web_tick(d, uptime_ms());
+    if (d) for (int i=0;i<8;i++) web_tick(d, (n_clock_monotonic() / N_NS_PER_MS));
     return d;
 }
 static node_t *element(web_doc *d, const char *name) { return doc_node_create(d, N_ELEM, name, NULL, 0); }

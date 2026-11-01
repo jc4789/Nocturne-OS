@@ -61,7 +61,7 @@ static int boundaries(void){
     struct web_host host={.script_checkpoint=checkpoint};
     web_doc *d=web_live(html,strlen(html),"https://paint.test/boundaries","utf-8",&host);
     check(d!=NULL,"marker boundary document");if(!d)return 1;
-    for(int i=0;i<8;i++)web_tick(d,uptime_ms());web_layout(d,320,200);
+    for(int i=0;i<8;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));web_layout(d,320,200);
     node_t *li=by_id(d->root,"ordinary"),*summary=by_id(d->root,"legend"),*generated=by_id(d->root,"generated");
     check(li&&li->box&&(li->box->marker||li->box->marker_shape),"ordinary outside marker exists");
     if(li&&li->box){box_t *b=li->box;
@@ -94,7 +94,7 @@ static int boundaries(void){
     struct web_host cancellable={.script_checkpoint=boundary_checkpoint,.opaque=&state};
     d=web_live(large,strlen(large),"https://paint.test/cancel","utf-8",&cancellable);state.doc=d;
     check(d!=NULL,"sorting cancellation document");if(!d)goto done;
-    for(int i=0;i<8;i++)web_tick(d,uptime_ms());
+    for(int i=0;i<8;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     node_t *parent=by_id(d->root,"layers");check(parent!=NULL,"sorting layer parent");
     if(!parent){web_free(d);goto done;}
     for(unsigned i=0;i<state.layers;i++){
@@ -134,7 +134,7 @@ static void scroll_input_console(void *opaque,int level,const char *message){
 }
 static web_doc *scroll_input_document(const char *html,const struct web_host *host){
     web_doc *d=web_live(html,strlen(html),"https://scroll.test/","utf-8",host);
-    if(d){for(int i=0;i<32;i++)web_tick(d,uptime_ms());web_layout(d,320,200);}
+    if(d){for(int i=0;i<32;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));web_layout(d,320,200);}
     return d;
 }
 static double scroll_input_limit(node_t *n,int axis){
@@ -199,7 +199,7 @@ static int scroll_inputs(void){
         "unrelated document cannot borrow the input root");web_free(other);
     /* Drain only this new condition's earlier input notifications before
        registering listeners. No runtime source or old fixture is bypassed. */
-    for(int i=0;i<32;i++)web_tick(d,uptime_ms());
+    for(int i=0;i<32;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     const char *listen="document.getElementById('inner').addEventListener('scroll',e=>{"
         "if(!e.isTrusted||e.bubbles)console.log('scroll-input-bad-event');console.log('scroll-input-event');});";
     check(web_console_eval(d,listen,strlen(listen)),"real event listener registration");
@@ -208,11 +208,11 @@ static int scroll_inputs(void){
     check(!state.events&&d->scroll_input_first==inner&&d->scroll_input_last==inner&&
         inner->scroll_input_owner==d,"native input notification is asynchronous and intrusive-deduplicated");
     check(web_deadline(d)>=0,"pending native notification wakes an idle document");
-    for(int i=0;i<48&&!state.events;i++)web_tick(d,uptime_ms());
+    for(int i=0;i<48&&!state.events;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     check(state.events==1&&state.active_native&&state.consumed&&inner->scroll_y==16,
         "active scroll callback can commit new native input without recursive author delivery");
     check(inner->scroll_input_owner==d,"callback-time input remains queued for a later tick");
-    for(int i=0;i<48;i++)web_tick(d,uptime_ms());
+    for(int i=0;i<48;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     check(state.events==2&&!state.bad_events&&!d->scroll_input_first,
         "later tick dispatches trusted nonbubbling event and drains ownership");
     const char *shadow="const inputHost=document.createElement('div');document.body.appendChild(inputHost);"
@@ -232,7 +232,7 @@ static int scroll_inputs(void){
         x=0;y=25;check(web_scroll_input(d,assigned,&x,&y,0)&&!y&&slotport->scroll_y==25,
             "assigned light child consumes composed shadow scrollport input");
         doc_node_remove(d,assigned->parent);
-        for(int i=0;i<32;i++)web_tick(d,uptime_ms());
+        for(int i=0;i<32;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
         check(!slotport->scroll_input_owner&&!state.shadow_events,
             "detached pending shadow scrollport releases borrower without stale event");
     }
@@ -242,7 +242,7 @@ static int scroll_inputs(void){
     check(inert&&doc_node_move(inert,by_id(inert->root,"destination"),inner,NULL),
         "pending native scrollport adopts through existing family-owned DOM path");
     if(inert){
-        for(int i=0;i<32;i++)web_tick(d,uptime_ms());
+        for(int i=0;i<32;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
         check(inner->owner==inert&&!inner->scroll_input_owner&&state.events==2,
             "adopted pending node neither dispatches in old realm nor retains old queue owner");
     }
@@ -316,7 +316,7 @@ static int scroll_inputs(void){
             web_layout(child,f->viewport_w,f->viewport_h);
             y=0;check(web_scroll_input(d,fl,&x,&y,1)&&f->scroll_y==MAX(0,child->doc_h-f->viewport_h)&&
                 !frameouter->scroll_y,"End without child element overflow consumes child viewport");
-            for(int i=0;i<48;i++)web_tick(d,uptime_ms());
+            for(int i=0;i<48;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
             check(state.frame_events>0&&!child->scroll_viewport_pending,
                 "normal child tick delivers document scroll event and clears pending source");
         }
@@ -394,7 +394,7 @@ static int placeholders(void) {
     struct web_host host={.script_checkpoint=checkpoint};
     web_doc *d=web_live(html,strlen(html),"https://paint.test/placeholders","utf-8",&host);
     check(d!=NULL,"placeholder native document");if(!d)return 1;
-    for(unsigned i=0;i<8;i++)web_tick(d,uptime_ms());web_layout(d,320,200);
+    for(unsigned i=0;i<8;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));web_layout(d,320,200);
     node_t *single=by_id(d->root,"single"),*multi=by_id(d->root,"multi");
     check(single&&multi&&single->style&&multi->style,"both input and textarea have styles");
     if(!single||!multi||!single->style||!multi->style){web_free(d);return 1;}
@@ -449,7 +449,7 @@ int main(int argc,char **argv){
     struct web_host host={.script_checkpoint=checkpoint};
     web_doc *d=web_live(html,strlen(html),"https://paint.test/","utf-8",&host);
     check(d!=NULL,"document creation");if(!d)return 1;
-    for(int i=0;i<8;i++)web_tick(d,uptime_ms());
+    for(int i=0;i<8;i++)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     web_layout(d,320,200);compare_hits(d);
     check(d->hit_index!=NULL,"spatial index is native document owned");
     void *identity=d->hit_index;compare_hits(d);check(identity==d->hit_index,"unchanged mousemove reuses index storage");

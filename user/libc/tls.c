@@ -422,7 +422,7 @@ static bool resume_live(const struct resumption *r, uint64_t now) {
 /* Moves out the newest live TLS 1.3 ticket for key. */
 static bool resume_take13(const char *key, struct resumption *out) {
     if (!key) return false;
-    uint64_t now = uptime_ms(); int best = -1;
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS); int best = -1;
     session_enter();
     for (int i = 0; i < RESUME_SLOTS; i++) {
         struct resumption *r = &resumes[i];
@@ -438,7 +438,7 @@ static bool resume_take13(const char *key, struct resumption *out) {
 /* A copy of key's TLS 1.2 session (session IDs are reused, tickets are not). */
 static bool resume_get12(const char *key, struct resumption *out) {
     if (!key) return false;
-    uint64_t now = uptime_ms(); bool found = false;
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS); bool found = false;
     session_enter();
     for (int i = 0; i < RESUME_SLOTS && !found; i++) {
         struct resumption *r = &resumes[i];
@@ -560,7 +560,7 @@ struct net_stream {
     bool tls;
     bool io_limited, handshaking, closing, transport_eof;
     int transport_errno;
-    uint64_t io_deadline;
+    uint64_t io_deadline; /* on the monotonic clock (ns) */
     uint64_t bytes_sent;
     struct ns_connection_info connection;
     /* Fetch's connection timing info, recorded as the connection opened. */
@@ -607,41 +607,40 @@ static n_result transport_failed(net_stream *s, n_result r) {
    peer dribbling partial records must not renew one blocking operation. */
 static void io_begin(net_stream *s, int timeout_ms) {
     s->io_limited=timeout_ms>0; /* zero remains a nonblocking socket read */
-    if(s->io_limited) {
-        uint64_t now=uptime_ms(), delay=(uint64_t)timeout_ms;
-        s->io_deadline=delay>UINT64_MAX-now?UINT64_MAX:now+delay;
-    }
+    if(s->io_limited)s->io_deadline=n_clock_after((uint64_t)timeout_ms*N_NS_PER_MS);
 }
+/* A wait of ms (-1: no limit, 0: none) as the deadline the network calls take. */
+static uint64_t wait_until(int ms) { return ms<0?N_CLOCK_NEVER:ms?n_clock_after((uint64_t)ms*N_NS_PER_MS):0; }
 static int io_timeout(net_stream *s, int *timeout) {
     if(io_cancelled(s))return -1;
     if(!s->io_limited){*timeout=s->timeout_ms;return 0;}
-    uint64_t now=uptime_ms();
+    uint64_t now=n_clock_monotonic();
     if(now>=s->io_deadline) {
         s->transport_errno=ETIMEDOUT;errno=ETIMEDOUT;
         snprintf(s->err,sizeof s->err,"%s timed out",
                  s->handshaking?"TLS handshake":s->closing?"TLS close":"read");
         return -1;
     }
-    uint64_t left=s->io_deadline-now;
+    uint64_t left=(s->io_deadline-now+N_NS_PER_MS-1)/N_NS_PER_MS;
     *timeout=left>(uint64_t)INT_MAX?INT_MAX:(int)left;
     return 0;
 }
 static int sock_read(void *ctx, unsigned char *buf, size_t len) {
     net_stream *s = ctx;
-    uint64_t callback_started=s->handshaking&&s->timing?uptime_ms():0;
+    uint64_t callback_started=s->handshaking&&s->timing?(n_clock_monotonic() / N_NS_PER_MS):0;
     int timeout;
     if(io_timeout(s,&timeout)<0){
-        if(s->handshaking&&s->timing)s->timing->tls_io_ms+=uptime_ms()-callback_started;
+        if(s->handshaking&&s->timing)s->timing->tls_io_ms+=(n_clock_monotonic() / N_NS_PER_MS)-callback_started;
         return -1;
     }
     n_result r;
     do {
         int slice=s->cancelled&&(timeout<0||timeout>100)?100:timeout;
-        r=tcp_recv(s->sock,buf,len,slice);
+        r=tcp_recv(s->sock,buf,len,wait_until(slice));
         if(r>=0||(r!=-N_ERR_NOT_READY&&r!=-N_ERR_TIMEOUT)||slice==timeout)break;
         if(io_timeout(s,&timeout)<0)return -1;
     }while(1);
-    if(s->handshaking&&s->timing)s->timing->tls_io_ms+=uptime_ms()-callback_started;
+    if(s->handshaking&&s->timing)s->timing->tls_io_ms+=(n_clock_monotonic() / N_NS_PER_MS)-callback_started;
     if (r > 0)return (int)r;
     s->transport_errno=r<0?(int)-r:0;s->transport_eof=r==0;
     if(r<0)errno=s->transport_errno;
@@ -655,21 +654,21 @@ static int sock_read(void *ctx, unsigned char *buf, size_t len) {
 
 static int sock_write(void *ctx, const unsigned char *buf, size_t len) {
     net_stream *s = ctx;
-    uint64_t callback_started=s->handshaking&&s->timing?uptime_ms():0;
+    uint64_t callback_started=s->handshaking&&s->timing?(n_clock_monotonic() / N_NS_PER_MS):0;
     int timeout;
     if(io_timeout(s,&timeout)<0){
-        if(s->handshaking&&s->timing)s->timing->tls_io_ms+=uptime_ms()-callback_started;
+        if(s->handshaking&&s->timing)s->timing->tls_io_ms+=(n_clock_monotonic() / N_NS_PER_MS)-callback_started;
         return -1;
     }
     n_result r;
     do {
-        uint64_t deadline=s->io_limited?s->io_deadline:0;
-        if(s->cancelled){uint64_t slice=uptime_ms()+100;if(!deadline||slice<deadline)deadline=slice;}
+        uint64_t deadline=s->io_limited?s->io_deadline:N_CLOCK_NEVER;
+        if(s->cancelled){uint64_t slice=n_clock_after(100*N_NS_PER_MS);if(slice<deadline)deadline=slice;}
         r=tcp_send_until(s->sock,buf,len,deadline);
         if(r>=0||r!=-N_ERR_TIMEOUT||!s->cancelled)break;
         if(io_timeout(s,&timeout)<0)return -1;
     }while(1);
-    if(s->handshaking&&s->timing)s->timing->tls_io_ms+=uptime_ms()-callback_started;
+    if(s->handshaking&&s->timing)s->timing->tls_io_ms+=(n_clock_monotonic() / N_NS_PER_MS)-callback_started;
     if (r > 0){s->bytes_sent+=(uint64_t)r;return (int)r;}
     s->transport_errno=r<0?(int)-r:0;s->transport_eof=r==0;
     if(r<0)errno=s->transport_errno;
@@ -936,7 +935,7 @@ static bool ticket_save(net_stream *s, struct cursor *c) {
     r.version = TLS13; r.suite = s->suite->id;
     r.lifetime = lifetime > 604800 ? 604800 : lifetime; /* never kept longer than 7 days */
     r.age_add = age_add;
-    r.saved = uptime_ms();
+    r.saved = (n_clock_monotonic() / N_NS_PER_MS);
     r.secret_len = s->suite->hash_len;
     expand_label(r.secret_len, s->res_master, "resumption", nonce.p, nonce.n, r.secret, r.secret_len);
     resume_put(&r);
@@ -1233,7 +1232,7 @@ static bool client_hello(net_stream *s, struct handshake *h) {
         o_u16(o, EXT_PADDING); o_u16(o, (unsigned)pad); o_put(o, zeros, pad);
     }
     if (h->psk_offered) { /* last (§4.2.11) */
-        uint32_t age = (uint32_t)(uptime_ms() - h->psk.saved) + h->psk.age_add;
+        uint32_t age = (uint32_t)((n_clock_monotonic() / N_NS_PER_MS) - h->psk.saved) + h->psk.age_add;
         o_u16(o, EXT_PRE_SHARED_KEY); e = o_open(o, 2); l = o_open(o, 2);
         o_u16(o, (unsigned)h->psk.ticket_len); o_put(o, h->psk.ticket, h->psk.ticket_len); o_u32(o, age);
         o_close(o, l, 2);
@@ -1501,7 +1500,7 @@ static int tls12(net_stream *s, struct handshake *h, const struct server_hello *
         struct resumption r = {0};
         r.key = strdup(s->session_key);
         if (r.key) {
-            r.version = TLS12; r.suite = su->id; r.saved = uptime_ms();
+            r.version = TLS12; r.suite = su->id; r.saved = (n_clock_monotonic() / N_NS_PER_MS);
             memcpy(r.secret, master, 48); r.secret_len = 48;
             memcpy(r.session_id, sid, sid_len); r.session_id_len = sid_len;
             r.ems = sh->ems;
@@ -1751,7 +1750,7 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
                                char *err, size_t errlen, struct http_transport_timing *timing,
                                bool http,const char *partition,int (*cancelled)(void *),void *cancel_ctx) {
     uint64_t resolve_started=0,tls_started=0;
-    if(timing){memset(timing,0,sizeof *timing);timing->phase=HTTP_PHASE_RESOLVE;resolve_started=uptime_ms();}
+    if(timing){memset(timing,0,sizeof *timing);timing->phase=HTTP_PHASE_RESOLVE;resolve_started=(n_clock_monotonic() / N_NS_PER_MS);}
     if(cancelled&&cancelled(cancel_ctx)){errno=ECANCELED;snprintf(err,errlen,"request cancelled");return NULL;}
     /* host is a URL's host serialized (http.c's http_target): an IPv6 address comes in brackets,
        and the network stack (SYS_NET_*) has IPv4 only. */
@@ -1760,17 +1759,17 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
         errno=N_ERR_UNSUPPORTED;snprintf(err, errlen, "%s: the network has no IPv6", host);
         return NULL;
     }
-    if (!net_wait_up(5000)) {
-        if(timing)timing->resolve_ms=uptime_ms()-resolve_started;
+    if (!net_wait_up(n_clock_after(5000 * N_NS_PER_MS))) {
+        if(timing)timing->resolve_ms=(n_clock_monotonic() / N_NS_PER_MS)-resolve_started;
         errno=N_ERR_NETWORK_DOWN;snprintf(err, errlen, "network is down");
         return NULL;
     }
     uint32_t first[16],*ips=first;
     struct n_dns_result dns;
-    uint64_t lookup_started=uptime_ms();
+    uint64_t lookup_started=(n_clock_monotonic() / N_NS_PER_MS);
     n_result resolved=net_resolve_all(host, first,16,&dns);
     if (resolved < 0) {
-        if(timing)timing->resolve_ms=uptime_ms()-resolve_started;
+        if(timing)timing->resolve_ms=(n_clock_monotonic() / N_NS_PER_MS)-resolve_started;
         errno=(int)-resolved;
         snprintf(err, errlen, "%s: %s", host, resolved == -N_ERR_NOT_FOUND ? "host not found" : n_result_text(resolved));
         return NULL;
@@ -1791,21 +1790,21 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
        the caller's read allowance; spending TCP time must not silently reduce
        that allowance or reject a previously supported slower handshake. */
     int connect_ms=timeout_ms>0&&timeout_ms<20000?timeout_ms:20000;
-    uint64_t connect_started=uptime_ms();
+    uint64_t connect_started=(n_clock_monotonic() / N_NS_PER_MS);
     if(timing){timing->resolve_ms=connect_started-resolve_started;timing->phase=HTTP_PHASE_CONNECT;}
     uint64_t connect_deadline=connect_started+(uint64_t)connect_ms;
     n_result sock=-N_ERR_NOT_FOUND;uint32_t attempts=0,peer_ip=0;
     for(size_t i=0;i<count;i++) {
-        uint64_t now=uptime_ms();if(now>=connect_deadline){sock=-N_ERR_TIMEOUT;break;}
+        uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);if(now>=connect_deadline){sock=-N_ERR_TIMEOUT;break;}
         /* An unresponsive first address must leave later DNS candidates a
            fair share of the one connect deadline. */
         uint64_t left=connect_deadline-now,remaining=count-i;
         int allowance=(int)(left/remaining);if(allowance<1)allowance=1;
-        attempts++;sock=tcp_connect(ips[i],port,allowance);if(sock>=0){peer_ip=ips[i];break;}
+        attempts++;sock=tcp_connect(ips[i],port,wait_until(allowance));if(sock>=0){peer_ip=ips[i];break;}
         if(sock!=-N_ERR_TIMEOUT&&sock!=-N_ERR_CONNECTION_REFUSED&&sock!=-N_ERR_UNREACHABLE)break;
     }
     if(ips!=first)free(ips);
-    uint64_t connected=uptime_ms();
+    uint64_t connected=(n_clock_monotonic() / N_NS_PER_MS);
     if(timing){tls_started=connected;timing->connect_ms=tls_started-connect_started;}
     if (sock < 0) {
         errno=(int)-sock;
@@ -1842,14 +1841,14 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
            must choose an AEAD ephemeral-key suite (RFC 9113 9.2.2). */
         errno=EPROTO;snprintf(s->err,sizeof s->err,"HTTP/2 requires an AEAD ephemeral-key TLS suite");goto fail;
     }
-    s->timing_info.connect_end=uptime_ms();
-    if(timing){timing->tls_ms=uptime_ms()-tls_started;
+    s->timing_info.connect_end=(n_clock_monotonic() / N_NS_PER_MS);
+    if(timing){timing->tls_ms=(n_clock_monotonic() / N_NS_PER_MS)-tls_started;
         timing->tls_other_ms=timing->tls_ms>=timing->tls_io_ms?timing->tls_ms-timing->tls_io_ms:0;}
     s->handshaking=false;s->io_limited=false;s->timing=NULL;
     s->cancelled=NULL;s->cancel_ctx=NULL;
     return s;
 fail:
-    if(timing){timing->tls_ms=uptime_ms()-tls_started;
+    if(timing){timing->tls_ms=(n_clock_monotonic() / N_NS_PER_MS)-tls_started;
         timing->tls_other_ms=timing->tls_ms>=timing->tls_io_ms?timing->tls_ms-timing->tls_io_ms:0;}
     {
         int saved=errno;
@@ -1926,7 +1925,7 @@ long ns_read(net_stream *s, void *buf, size_t n) {
         int timeout;
         while(io_timeout(s,&timeout)==0) {
             int slice=s->cancelled&&(timeout<0||timeout>100)?100:timeout;
-            n_result r=tcp_recv(s->sock,buf,n,slice);
+            n_result r=tcp_recv(s->sock,buf,n,wait_until(slice));
             if(r<0&&(r==-N_ERR_NOT_READY||r==-N_ERR_TIMEOUT)&&slice!=timeout)continue;
             s->io_limited=false;
             if(r>=0)return r;
@@ -1968,7 +1967,7 @@ long ns_read_wait(net_stream *s,void *buf,size_t n,int timeout_ms,mtx_t *lock) {
     if(io_cancelled(s))return -1;
     if(!s->tls) {
         if(lock)mtx_unlock(lock);
-        n_result got=tcp_recv(s->sock,buf,n,timeout_ms);
+        n_result got=tcp_recv(s->sock,buf,n,wait_until(timeout_ms));
         if(lock)mtx_lock(lock);
         if(got==-N_ERR_NOT_READY||got==-N_ERR_TIMEOUT)return -2;
         if(got<0){errno=(int)-got;snprintf(s->err,sizeof s->err,"%s",n_result_text(got));return -1;}
@@ -1981,7 +1980,7 @@ long ns_read_wait(net_stream *s,void *buf,size_t n,int timeout_ms,mtx_t *lock) {
     if(s->rlen>=RECORD_IN_MAX)return -2;
     unsigned char *p=s->rbuf+s->rlen;size_t room=RECORD_IN_MAX-s->rlen;
     if(lock)mtx_unlock(lock);
-    n_result received=tcp_recv(s->sock,p,room,wait);
+    n_result received=tcp_recv(s->sock,p,room,wait_until(wait));
     if(lock)mtx_lock(lock);
     if(received==-N_ERR_NOT_READY||received==-N_ERR_TIMEOUT)return -2;
     if(received<=0) {

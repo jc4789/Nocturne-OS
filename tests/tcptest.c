@@ -22,7 +22,7 @@ static void check(bool ok, const char *what) {
 }
 
 static int conn(void) {
-    int s = tcp_connect(HOST, (uint16_t)port, 5000);
+    int s = tcp_connect(HOST, (uint16_t)port, n_clock_after(5000 * N_NS_PER_MS));
     if (s < 0) printf("connect 10.0.2.2:%d: error %d\n", port, s);
     return s;
 }
@@ -42,14 +42,14 @@ static long get(size_t n, uint32_t seed) {
     if (s < 0) return -1;
     char req[64];
     snprintf(req, sizeof req, "GET %lu %u\n", (unsigned long)n, seed);
-    uint64_t t0 = uptime_ms();
+    uint64_t t0 = (n_clock_monotonic() / N_NS_PER_MS);
     if (!send_all(s, req, strlen(req))) return tcp_close(s), -1;
     static uint8_t buf[16384];
     uint32_t x = seed;
     size_t got = 0;
     bool same = true;
     for (;;) {
-        long r = tcp_recv(s, buf, sizeof buf, 30000);
+        long r = tcp_recv(s, buf, sizeof buf, n_clock_after(30000 * N_NS_PER_MS));
         if (r <= 0) break;
         for (long i = 0; i < r; i++)
             if (buf[i] != pat_next(&x) && same) {
@@ -60,7 +60,7 @@ static long get(size_t n, uint32_t seed) {
     }
     tcp_close(s);
     if (got != n) printf("  got %lu of %lu bytes\n", (unsigned long)got, (unsigned long)n);
-    return same && got == n ? (long)(uptime_ms() - t0) : -1;
+    return same && got == n ? (long)((n_clock_monotonic() / N_NS_PER_MS) - t0) : -1;
 }
 
 /* upload n pattern bytes; the server checks them */
@@ -69,7 +69,7 @@ static long put(size_t n, uint32_t seed) {
     if (s < 0) return -1;
     char req[64];
     snprintf(req, sizeof req, "PUT %lu %u\n", (unsigned long)n, seed);
-    uint64_t t0 = uptime_ms();
+    uint64_t t0 = (n_clock_monotonic() / N_NS_PER_MS);
     if (!send_all(s, req, strlen(req))) return tcp_close(s), -1;
     static uint8_t buf[16384];
     uint32_t x = seed;
@@ -85,13 +85,13 @@ static long put(size_t n, uint32_t seed) {
     char reply[64];
     size_t rl = 0;
     long r;
-    while (rl < sizeof reply - 1 && (r = tcp_recv(s, reply + rl, sizeof reply - 1 - rl, 30000)) > 0) rl += (size_t)r;
+    while (rl < sizeof reply - 1 && (r = tcp_recv(s, reply + rl, sizeof reply - 1 - rl, n_clock_after(30000 * N_NS_PER_MS))) > 0) rl += (size_t)r;
     reply[rl] = 0;
     tcp_close(s);
     char want[64];
     snprintf(want, sizeof want, "OK %lu\n", (unsigned long)n);
     if (strcmp(reply, want)) printf("  server said: %s\n", rl ? reply : "(nothing)");
-    return strcmp(reply, want) ? -1 : (long)(uptime_ms() - t0);
+    return strcmp(reply, want) ? -1 : (long)((n_clock_monotonic() / N_NS_PER_MS) - t0);
 }
 
 static void report(const char *what, size_t n, long ms) {

@@ -204,7 +204,7 @@ static void cssom_selection(void) {
         "style='display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;width:180px'>one<br>two<br>HIDDENTAIL</div></body>";
     web_doc *d = web_live(html, strlen(html), "https://line-clamp.test/", "utf-8", &host);
     check("CSSOM live document allocated", d != NULL); if (!d) return;
-    for (int i = 0; i < 8; i++) { web_tick(d, uptime_ms()); n_sleep_ms(1); }
+    for (int i = 0; i < 8; i++) { web_tick(d, (n_clock_monotonic() / N_NS_PER_MS)); n_sleep_until(n_clock_after(1 * N_NS_PER_MS)); }
     web_layout(d, 480, 240);
     const char *script = "const a=(n,v)=>console.log((v?'OK clamp ':'FAIL clamp ')+n),e=document.getElementById('sample'),s=getComputedStyle(e);"
         "a('CSS-supports-positive',CSS.supports('-webkit-line-clamp','2'));"

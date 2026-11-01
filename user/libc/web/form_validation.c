@@ -137,7 +137,7 @@ bool web_control_will_validate(const node_t *n) {
 static int validation_interrupt(JSRuntime *rt, void *opaque) {
     (void)rt;
     struct validation_state *s = opaque;
-    return uptime_ms() >= s->deadline;
+    return (n_clock_monotonic() / N_NS_PER_MS) >= s->deadline;
 }
 static struct validation_state *validation_state(web_doc *d) {
     /* Inert/template documents share a lifetime owner and need no separate
@@ -221,7 +221,7 @@ static uint32_t utf8_next(const unsigned char **at, const unsigned char *end) {
 static bool pattern_matches(web_doc *d, const char *pattern, const char *text, size_t bytes) {
     struct validation_state *s = validation_state(d);
     if (!s || bytes > (SIZE_MAX / sizeof(uint16_t)) - 1) return false;
-    JS_UpdateStackTop(s->rt); s->deadline = uptime_ms() + VALIDATION_MATCH_MS;
+    JS_UpdateStackTop(s->rt); s->deadline = (n_clock_monotonic() / N_NS_PER_MS) + VALIDATION_MATCH_MS;
     struct validation_pattern *entry = pattern_compile(s, pattern);
     if (!entry) return false;
     if (entry->invalid) return true;

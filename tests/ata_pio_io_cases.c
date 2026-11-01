@@ -10,7 +10,7 @@ int main(void) {
     unsigned char *allocation=malloc(length+3),*bytes=allocation?allocation+1:NULL;
     if(!bytes)return 1;
     for(size_t i=0;i<length;i++)bytes[i]=(unsigned char)((i*37u+(i>>8))^0xa5u);
-    uint64_t start=uptime_ms();
+    uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);
     n_handle document=n_document_open(path,N_DOCUMENT_CREATE);
     int failed=document<0;
     for(size_t at=0;!failed&&at<length;){
@@ -33,6 +33,6 @@ int main(void) {
     if(document>=0){unsigned char extra;if(!failed&&n_document_read_at(document,count,&extra,1)!=0)failed=1;if(n_handle_close(document)<0)failed=1;}
     if(n_entry_remove(path)<0)failed=1;
     printf("ATA_PIO_NEW_BOUNDARY bytes=%lu elapsed=%lu ms result=%s\n",(unsigned long)count,
-        (unsigned long)(uptime_ms()-start),failed?"FAIL":"OK");
+        (unsigned long)((n_clock_monotonic() / N_NS_PER_MS)-start),failed?"FAIL":"OK");
     free(allocation);return failed;
 }

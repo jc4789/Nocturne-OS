@@ -32,7 +32,7 @@ int ns_get_connection_info(const net_stream *,struct ns_connection_info *);
    records as it opens: when the domain lookup started and ended, when the
    connection started, when its secure handshake started (0 on a cleartext
    connection) and when it was established, handshake included. Absolute
-   uptime_ms values. protocol is the ALPN negotiated protocol ID; an HTTP/1
+   monotonic ms values. protocol is the ALPN negotiated protocol ID; an HTTP/1
    connection that negotiated none reports "http/1.1". */
 #define HTTP_PROTOCOL_MAX 16u
 #define HTTP_CONTENT_ENCODING_MAX 16u
@@ -162,7 +162,7 @@ struct http_transport_result {
     uint64_t connection_id;
     uint32_t stream_id;
     bool http2;
-    /* This attempt's part of Fetch's timing record (absolute uptime_ms, 0 for
+    /* This attempt's part of Fetch's timing record (absolute monotonic ms, 0 for
        not reached): the timing info of the connection it used, as that
        connection recorded it when it opened (an earlier request's for a reused
        one; the caller clamps it), the protocol of this exchange, when the
@@ -181,7 +181,7 @@ struct http_transport_result {
    "fetch timing info" (start, redirect, post-redirect start, final connection
    timing info, request and response starts, end), the final response's cache
    state, "timing allow passed" flag, redirect taint and body info, and its
-   Server-Timing field values. Absolute uptime_ms values, 0 for not reached.
+   Server-Timing field values. Absolute monotonic ms values, 0 for not reached.
    The transport (webfetch) records it as the request goes, the browser's
    network layer (webnet.c) adds the start time it was asked at and clamps a
    reused connection's times, and the document builds Navigation and Resource

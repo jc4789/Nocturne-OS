@@ -664,7 +664,7 @@ static bool pending_media_matches(web_doc *d, const struct pending *p) {
    are not blockers. After first paint, resource updates remain progressive. */
 bool web_render_blocked(web_doc *d) {
     if (!d || !d->live || d->inert || d->initial_render_done ||
-        uptime_ms() >= d->initial_render_deadline) return false;
+        (n_clock_monotonic() / N_NS_PER_MS) >= d->initial_render_deadline) return false;
     if (!d->body && d->parser) return true;
     for (int i=0; i<d->pending_css.n; i++) {
         const struct pending *p=d->pending_css.v[i];
@@ -1113,7 +1113,7 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
     d->live = true;
     static uint64_t input_serial;
     d->input_identity=__atomic_add_fetch(&input_serial,1,__ATOMIC_RELAXED);
-    d->initial_render_deadline=uptime_ms()+3000;
+    d->initial_render_deadline=(n_clock_monotonic() / N_NS_PER_MS)+3000;
     d->frame_parent=parent;d->frame_element=frame;
     /* HTML "activate history entry" (and "initialize the navigable" for a new navigable's
        first document) sets the initial visibility state to the traversable's system visibility
@@ -1233,7 +1233,7 @@ void doc_sync_tree(web_doc *d) {
        every class/text/control mutation in the document. */
     if (d->metadata_valid) return;
     struct web_profile *profile = &(d->dom_family ? d->dom_family : d)->profile;
-    uint64_t start = d->profile_enabled ? uptime_ms() : 0;
+    uint64_t start = d->profile_enabled ? (n_clock_monotonic() / N_NS_PER_MS) : 0;
     profile->metadata_syncs++;
     node_t *html = NULL, *head = NULL, *body = NULL;
     for (node_t *n = d->root ? d->root->first : NULL; n; n = n->next) {
@@ -1253,7 +1253,7 @@ void doc_sync_tree(web_doc *d) {
     if (base) doc_frozen_base(d,base);
     else if (!doc_set_base(d,web_effective_url(d))) web_js_console(d,2,"Document base URL allocation failed");
     d->metadata_revision=d->dom_revision;d->metadata_valid=true;
-    if (d->profile_enabled) profile->metadata_ms += uptime_ms() - start;
+    if (d->profile_enabled) profile->metadata_ms += (n_clock_monotonic() / N_NS_PER_MS) - start;
 }
 
 void doc_rescan(web_doc *d) {
@@ -1272,7 +1272,7 @@ void doc_rescan(web_doc *d) {
             doc_image_sync(d, n);
         return;
     }
-    uint64_t profile_start = d->profile_enabled ? uptime_ms() : 0;
+    uint64_t profile_start = d->profile_enabled ? (n_clock_monotonic() / N_NS_PER_MS) : 0;
     d->metadata_valid = false;
     d->profile.rescans++;
     d->resources_dirty = false;
@@ -1342,7 +1342,7 @@ void doc_rescan(web_doc *d) {
     if(!sheets_same)d->need_style = true;
     if(base_hash!=sheet_hash(d->base,strlen(d->base)))d->need_style=d->style_full_dirty=true;
     if(!failed_arena && !d->native_cancelled){d->metadata_revision=d->dom_revision;d->metadata_valid=true;}
-    if (d->profile_enabled) d->profile.rescan_ms += uptime_ms() - profile_start;
+    if (d->profile_enabled) d->profile.rescan_ms += (n_clock_monotonic() / N_NS_PER_MS) - profile_start;
 }
 
 static struct cached_css *css_resource(web_doc *d,const char *url) {
@@ -1468,7 +1468,7 @@ int web_memory_report(web_doc *d, char *out, size_t size) {
        as a busy frame on a large page, so the profile it is part of would mostly measure it:
        only when that heap grew or shrank by an eighth, or every 30 s. */
     static size_t census_bytes; static uint64_t census_at;
-    uint64_t now = uptime_ms();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
     bool census = t.largest_js > census_bytes + census_bytes / 8 || t.largest_js + t.largest_js / 8 < census_bytes ||
                   now - census_at >= 30000;
     if (t.largest && census && n >= 0 && (size_t)n + 1 < size) {
@@ -1546,7 +1546,7 @@ void web_tick(web_doc *d, uint64_t now) {
     /* The child can complete while author JS runs. Refill before GUI paint,
        not one complete browser turn later. Both calls retain their native
        2 ms / 8 packet bounds; there are exactly two opportunities per tick. */
-    TICK_STEP(d, TICK_MEDIA, web_avmedia_tick(d, uptime_ms()));
+    TICK_STEP(d, TICK_MEDIA, web_avmedia_tick(d, (n_clock_monotonic() / N_NS_PER_MS)));
     if(d->native_cancelled)return;
     TICK_STEP(d, TICK_FRAMES, web_js_frames_sync(d));
     if(d->native_cancelled)return;
@@ -1568,9 +1568,9 @@ void web_wait_events(const struct n_event *events, size_t count) {
     web_atomics_events(events, count);
     webprefs_events(events, count);
 }
-int web_wait_report(char *out, size_t size) { return web_atomics_report(out, size, uptime_ms()); }
+int web_wait_report(char *out, size_t size) { return web_atomics_report(out, size, (n_clock_monotonic() / N_NS_PER_MS)); }
 int64_t web_deadline(web_doc *d) {
-    uint64_t now = uptime_ms();
+    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
     int64_t background = web_media_background_deadline(now);
     if (!d || !d->live) return background;
     const int64_t sources[DUE_SOURCES] = {-1, background,
@@ -2123,15 +2123,15 @@ int web_layout(web_doc *d, int width, int height) {
     web_avmedia_layout_begin(d);
     doc_viewport_update(d,width,height);
     /* debug_js only: why a slow layout ran (cascade scope, box path, passes). */
-    uint64_t slow_start=d->profile_enabled?uptime_ms():0,slow_cascade=0,slow_boxes=0;
+    uint64_t slow_start=d->profile_enabled?(n_clock_monotonic() / N_NS_PER_MS):0,slow_cascade=0,slow_boxes=0;
     unsigned slow_full=0,slow_cascades=0,slow_rebuilds=0,slow_locals=0,slow_restyles=0;
     struct web_profile slow_profile=d->profile;
 reflow:
     if (d->need_style || d->styled_w != width || d->styled_h != height || !d->root_box) {
-        uint64_t phase=d->profile_enabled?uptime_ms():0;
+        uint64_t phase=d->profile_enabled?(n_clock_monotonic() / N_NS_PER_MS):0;
         slow_full+=d->style_full_dirty;slow_cascades++;
         css_cascade(d, width, height);
-        if(d->profile_enabled){uint64_t now=uptime_ms();slow_cascade+=now-phase;phase=now;}
+        if(d->profile_enabled){uint64_t now=(n_clock_monotonic() / N_NS_PER_MS);slow_cascade+=now-phase;phase=now;}
         if (d->native_cancelled) goto cancelled;
         if (d->root) register_bg(d, d->root);
         if (!d->root_box || d->style_boxes_changed || d->need_boxes) {
@@ -2165,7 +2165,7 @@ reflow:
             css_styles_release(d);
             slow_restyles++;
         }
-        if(d->profile_enabled)slow_boxes+=uptime_ms()-phase;
+        if(d->profile_enabled)slow_boxes+=(n_clock_monotonic() / N_NS_PER_MS)-phase;
         if (d->native_cancelled) goto cancelled;
         d->need_style = false;
         d->need_boxes = false;
@@ -2227,8 +2227,8 @@ reflow:
     }
     d->layout_revision++;
 geometry_committed:
-    if(d->profile_enabled && uptime_ms()-slow_start>=250){
-        char line[400];uint64_t total=uptime_ms()-slow_start;
+    if(d->profile_enabled && (n_clock_monotonic() / N_NS_PER_MS)-slow_start>=250){
+        char line[400];uint64_t total=(n_clock_monotonic() / N_NS_PER_MS)-slow_start;
         const struct web_profile *p=&d->profile;
         snprintf(line,sizeof line,"Slow layout: %lu ms (cascade %lu ms in %u passes, full %u: %lu elements, %lu rule candidates, %lu filtered; boxes %lu ms: restyle %u, local %u, rebuild %u; geometry %lu ms; container passes %u)",
             (unsigned long)total,(unsigned long)slow_cascade,slow_cascades,slow_full,
@@ -3070,7 +3070,7 @@ static node_t *focus_descendants(web_doc *d, node_t *parent, bool autofocus) {
 /* HTML "allow focus steps": d is allowed to use "focus-without-user-activation"
    (Permissions Policy, web_presentation.c), or its Window has transient activation. */
 bool web_allow_focus(web_doc *d) {
-    return d && (web_presentation_focus_allowed(d) || d->sandbox_activation_until > uptime_ms());
+    return d && (web_presentation_focus_allowed(d) || d->sandbox_activation_until > (n_clock_monotonic() / N_NS_PER_MS));
 }
 /* The focus chain through the navigables: each ancestor document's focused area, up to until (or
    the top-level traversable's when it is NULL), is the container of the child navigable that has

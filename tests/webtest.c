@@ -30,7 +30,7 @@ static web_doc *load(const char *html) {
 
 static web_doc *load_controls(const char *html) {
     web_doc *d=web_live(html,strlen(html),BASE,NULL,NULL);
-    if(d){web_tick(d,uptime_ms());web_layout(d,VW,VH);}
+    if(d){web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));web_layout(d,VW,VH);}
     return d;
 }
 
@@ -771,9 +771,9 @@ static void test_hostile(void) {
     /* a long page: layout time is logged */
     s = repeat("<p>Lorem ipsum dolor sit amet, <b>consectetur</b> adipiscing elit, <a href=x>sed do</a> eiusmod.</p>", "", 3000);
     printf("WEB-STAGE 3000-paragraphs\n");fflush(stdout);
-    uint64_t t0 = uptime_ms();
+    uint64_t t0 = (n_clock_monotonic() / N_NS_PER_MS);
     web_doc *d = load(s);
-    printf("webtest: 3000 paragraphs laid out in %d ms, height %d\n", (int)(uptime_ms() - t0), web_doc_height(d));
+    printf("webtest: 3000 paragraphs laid out in %d ms, height %d\n", (int)((n_clock_monotonic() / N_NS_PER_MS) - t0), web_doc_height(d));
     web_free(d);
     free(s);
 }
@@ -786,8 +786,8 @@ static int test_flex_zero_basis(void) {
         "</style></head><body><div class=row><div class=main></div><div class=pane id=t></div></div></body></html>";
     web_doc *d=web_live(html,strlen(html),BASE,"utf-8",NULL);
     if(!d){fail("flex-zero-basis","document failed %d %d",0,0);return 1;}
-    uint64_t start=uptime_ms();
-    while(d->parser && uptime_ms()-start<5000)web_tick(d,uptime_ms());
+    uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);
+    while(d->parser && (n_clock_monotonic() / N_NS_PER_MS)-start<5000)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));
     total++;
     if(d->parser || !d->body)fail("flex-zero-basis-parser","unfinished %d expected %d",1,0);
     web_layout(d,VW,VH);total++;
@@ -869,7 +869,7 @@ static int test_fixed_table(void) {
         sb_puts(&html,cases[i].columns);sb_puts(&html,cases[i].rows);sb_puts(&html,"</table></body></html>");
         web_doc *d=web_live(sb_cstr(&html),html.n,BASE,"utf-8",NULL);sb_free(&html);
         if(!d){total++;fail("fixed-table-create","case %d failed %d",(int)i,1);continue;}
-        uint64_t start=uptime_ms();while(d->parser&&uptime_ms()-start<5000)web_tick(d,uptime_ms());web_layout(d,VW,VH);
+        uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);while(d->parser&&(n_clock_monotonic() / N_NS_PER_MS)-start<5000)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));web_layout(d,VW,VH);
         const char *ids[]={"#a","#b","#c","#t"};
         for(int j=0;j<4;j++) {
             if(j<3&&!cases[i].widths[j])continue;
@@ -890,7 +890,7 @@ static web_doc *overflow_document(const char *text,float width,const char *extra
         "#t{font:16px/20px monospace;width:%.4fpx;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;%s}"
         "a{color:red;text-decoration:none}</style></head><body><div id=t>%s</div></body></html>",width,extra,text);
     web_doc *d=web_live(html,strlen(html),BASE,"utf-8",NULL);
-    if(d){uint64_t start=uptime_ms();while(d->parser&&uptime_ms()-start<5000)web_tick(d,uptime_ms());web_layout(d,VW,VH);}
+    if(d){uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);while(d->parser&&(n_clock_monotonic() / N_NS_PER_MS)-start<5000)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));web_layout(d,VW,VH);}
     return d;
 }
 static box_t *overflow_box(web_doc *d) {
@@ -945,7 +945,7 @@ static int test_button_formatting(void) {
             "<svg id=icon xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M0 0H16V16H0Z'/></svg></button></body></html>",displays[i]);
         web_doc *d=web_live(html,strlen(html),BASE,"utf-8",NULL);
         overflow_check(d!=NULL,"button-formatting-document");if(!d)continue;
-        uint64_t start=uptime_ms();while(d->parser&&uptime_ms()-start<5000)web_tick(d,uptime_ms());web_layout(d,VW,VH);
+        uint64_t start=(n_clock_monotonic() / N_NS_PER_MS);while(d->parser&&(n_clock_monotonic() / N_NS_PER_MS)-start<5000)web_tick(d,(n_clock_monotonic() / N_NS_PER_MS));web_layout(d,VW,VH);
         box_t *b=overflow_box(d);
         overflow_check(b && (i&1?b->kind==B_ATOMIC:b->kind==(i<2?B_FLEX:B_GRID)),"button-preserves-author-display-formatting");
         int rect[2][4]={{0}};const char *ids[]={"#label","#icon"};
