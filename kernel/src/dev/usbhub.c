@@ -150,6 +150,7 @@ bool usbhub_prepare(struct usb_device *d) {
 static void hub_report(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len, uint64_t at) {
     (void)at;
     struct hub *h = ctx;
+    /* len 0 also after a recovery dropped its transfers: a port change in them is reported again */
     for (unsigned i = 0; i < len && i <= h->ports >> 3; i++) {
         uint32_t bits = data[i];
         if (!i && bits & 1) __atomic_store_n(&h->hub_change, true, __ATOMIC_RELEASE);
@@ -241,15 +242,23 @@ bool usbhub_reset_port(struct usb_device *hub, unsigned port) {
     return true;
 }
 
-/* A SuperSpeedPlus hub's port: the extended status's Rx Sublink Speed ID (USB 3.2 Table 10-15), and that
-   attribute's Link Protocol says which it is running (9.6.2.5). */
-static unsigned ss_speed(struct hub *h, unsigned port) {
+/* A SuperSpeedPlus hub's port: the extended status's Rx Sublink Speed ID and Lane Count (USB 3.2 Table
+   10-15), and that attribute's Link Protocol says which it is running, and its lane speed the rank
+   (9.6.2.5, 7.5.4.5.1: Gen2 is 10 Gb/s a lane). */
+static unsigned ss_speed(struct hub *h, unsigned port, unsigned *rank) {
     uint8_t st[8];
+    *rank = 0;
     if (!h->sublinks || usb_control(h->dev, 0xA3, USB_REQ_GET_STATUS, PORT_STATUS_EXT, (uint16_t)port, st, 8) < 8)
         return USB_SPEED_SUPER;
-    unsigned id = st[4] & 15;
-    for (unsigned i = 0; i < h->nsublinks; i++)
-        if ((h->sublinks[i] & 15) == id && (h->sublinks[i] >> 14 & 3) == 1) return USB_SPEED_SUPER_PLUS;
+    unsigned id = st[4] & 15, lanes = (st[5] & 15) + 1u;
+    for (unsigned i = 0; i < h->nsublinks; i++) {
+        uint32_t attribute = h->sublinks[i];
+        if ((attribute & 15) != id || (attribute >> 14 & 3) != 1) continue;
+        uint64_t rate = attribute >> 16;
+        for (unsigned e = attribute >> 4 & 3; e; e--) rate *= 1000;
+        *rank = (rate >= 10000000000ull ? 2u : 0u) + (lanes > 1 ? 1u : 0u);
+        return USB_SPEED_SUPER_PLUS;
+    }
     return USB_SPEED_SUPER;
 }
 
@@ -299,10 +308,11 @@ static void hub_port(struct hub *h, unsigned port) {
             continue;
         }
         sleep_until(clock_after(10 * NS_PER_MS)); /* reset recovery */
-        unsigned speed = h->ss ? ss_speed(h, port)
+        unsigned rank = 0;
+        unsigned speed = h->ss ? ss_speed(h, port, &rank)
                          : (status & PS_LOW_SPEED) ? USB_SPEED_LOW
                          : (status & PS_HIGH_SPEED) ? USB_SPEED_HIGH : USB_SPEED_FULL;
-        h->child[port] = usb_attach_child(d, port, speed);
+        h->child[port] = usb_attach_child(d, port, speed, rank);
     }
 }
 

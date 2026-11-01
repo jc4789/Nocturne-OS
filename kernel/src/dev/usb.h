@@ -28,6 +28,7 @@ enum { USB_SPEED_FULL = 1, USB_SPEED_LOW = 2, USB_SPEED_HIGH = 3, USB_SPEED_SUPE
 #define USB_DESC_INTERFACE 4
 #define USB_DESC_ENDPOINT  5
 #define USB_DESC_COMPANION 0x30 /* SuperSpeed endpoint companion */
+#define USB_DESC_SSP_COMPANION 0x31 /* SuperSpeedPlus isochronous endpoint companion */
 #define USB_STALL (-2)          /* a transfer the endpoint refused (it is halted until usb_clear_halt) */
 
 struct usb_device_desc {
@@ -52,8 +53,11 @@ struct usb_device {
     struct usb_hc *hc;
     struct usb_device *parent; /* hub, or NULL on a root port */
     uint8_t slot, speed, port, root_port, depth;
+    uint8_t rank; /* of an Enhanced SuperSpeed link (USB 3.2 7.5.4.5.1): 0 Gen1x1, 1 Gen1x2, 2 Gen2x1, 3 Gen2x2 */
     uint32_t route;
-    uint8_t tt_slot, tt_port; /* transaction translator for full/low speed behind a high-speed hub */
+    /* The hub and its port where the device's signaling changes: the transaction translator for full
+       or low speed behind a high-speed hub, or the hub of a higher rank (xHCI Table 6-6). */
+    uint8_t tt_slot, tt_port;
     struct usb_device_desc desc;
     bool removed; /* atomic: set once by usb_remove, after which no report function runs for it */
     void *hub; /* usbhub.c state when the device is a hub */
@@ -67,7 +71,7 @@ struct usb_ep_info {
     uint8_t address, attributes, interval, burst; /* burst: SuperSpeed companion */
     uint8_t companion_attributes;                /* its bmAttributes: Mult of an isochronous endpoint */
     uint16_t max_packet;                         /* bits 12:11: extra high-speed transactions */
-    uint16_t esit;                               /* SuperSpeed bytes per service interval, 0 if none */
+    uint32_t esit;                               /* SuperSpeed bytes per service interval, 0 if none */
 };
 
 /* A transfer that finished, in the drain that took it (see above): its bytes, and `at`, the
@@ -77,8 +81,9 @@ typedef void (*usb_report_fn)(struct usb_device *d, void *ctx, const uint8_t *da
 /* A control transfer; returns the bytes moved, or -1 (stall, error, timeout, removal). */
 int usb_control(struct usb_device *d, uint8_t type, uint8_t request, uint16_t value, uint16_t index,
                 void *buffer, uint16_t length);
-/* Keep the interrupt IN endpoint polled, handing each report of up to `longest` bytes to `fn` as it
- * comes; 0: each service interval's data. */
+/* Keep the interrupt IN endpoint polled, handing each transfer of up to `longest` bytes to `fn` as it
+ * comes; 0: each service interval's data, as usb_interrupt_length says how much that is. */
+unsigned usb_interrupt_length(struct usb_device *d, const struct usb_endpoint_desc *ep, unsigned longest);
 bool usb_interrupt_start(struct usb_device *d, const struct usb_endpoint_desc *ep, unsigned longest, usb_report_fn fn,
                          void *ctx);
 
@@ -88,7 +93,8 @@ bool usb_endpoint_info(const uint8_t *cfg, unsigned total, unsigned off, struct 
  * 4.6.6): those of alternate 0 came with the configuration. Endpoints already open are left as they are. */
 bool usb_open_endpoints(struct usb_device *d, const struct usb_ep_info *eps, int n);
 /* Keep `count` (at most 16) transfers of `len` bytes queued on a bulk or interrupt IN endpoint,
- * handing each one that finishes to `fn` with the bytes that arrived. */
+ * handing each one that finishes to `fn` with the bytes that arrived; and on the worker, before they
+ * are queued anew, after a recovery dropped them all (data NULL, len 0). */
 bool usb_stream_start(struct usb_device *d, uint8_t address, unsigned len, unsigned count, usb_report_fn fn, void *ctx);
 /* One bulk transfer of up to 64 KiB, waited for. One caller at a time on an endpoint (the class
  * driver's lock). Returns 0, USB_STALL, or -1 (error, timeout or removal: the endpoint then needs
@@ -110,7 +116,7 @@ int usb_send(struct usb_device *d, uint8_t address, const void *a, unsigned alen
 bool usb_enumerating(void);
 
 /* hub support, on the worker */
-struct usb_device *usb_attach_child(struct usb_device *hub, unsigned port, unsigned speed);
+struct usb_device *usb_attach_child(struct usb_device *hub, unsigned port, unsigned speed, unsigned rank);
 void usb_remove(struct usb_device *d);
 void usb_hub_info(struct usb_device *d, unsigned ports, unsigned think_time, bool multi_tt);
 /* Any context: run the class work functions (usbhub_work, usbhid_work) for d on its worker soon. */

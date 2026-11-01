@@ -121,8 +121,11 @@ static void stop_apps(void) {
 
 static bool flush_disks(void) {
     bool ok = true;
-    for (int i = 0; i < blk_count(); i++)
-        if (blk_persist(blk_get(i)) < 0) ok = false; /* blk logs it */
+    for (int i = 0; i < blk_count(); i++) {
+        struct blkdev *d = blk_get(i);
+        if (__atomic_load_n(&d->gone, __ATOMIC_ACQUIRE)) continue; /* what it held left with it */
+        if (blk_persist(d) < 0) ok = false; /* blk logs it */
+    }
     return ok;
 }
 
@@ -141,8 +144,10 @@ const char *pm_quiesce_devices(bool stop_at_failure) {
 
 /* The volume's saves are on the disks before (pm_thread): after a hibernation's snapshot nothing
    may be committed, the image has the machine as it was before any of it. The interrupts it turns
-   off are its own CPU's: the other CPUs still run their kernel threads while the devices stop. */
+   off are its own CPU's: the other CPUs still run their kernel threads while the devices stop, and
+   the hold keeps those from the disks. */
 static NORETURN void finish(enum pm_action action) {
+    blk_hold();
     flush_disks(); /* a disk that fails is logged: the power goes off all the same */
     if (action == PM_POWER_OFF) acpi_sleep_prepare(5); /* the firmware's _PTS(5), while interrupts still run */
     cli();

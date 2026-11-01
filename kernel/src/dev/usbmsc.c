@@ -30,11 +30,13 @@ struct msc {
     uint32_t tag;
     uint8_t sense_key, asc, ascq;
     uint8_t *bounce; /* for logical blocks larger than the 512-byte sectors */
+    struct lun *luns; /* its block devices */
 };
 
 struct lun {
     struct blkdev blk;
     struct msc *m;
+    struct lun *next;
     uint8_t lun;
     uint32_t block; /* bytes per logical block */
     uint64_t blocks;
@@ -105,18 +107,18 @@ static int bot(struct msc *m, unsigned lun, const uint8_t *cdb, unsigned cdb_len
         usb_clear_halt(d, m->in);
         r = usb_bulk(d, m->in, csw, 13, timeout, &moved);
     }
-    /* 6.3: a CSW is valid when it is 13 bytes with the signature and our tag; a phase error
-     * (status 2), a residue beyond the request, or one that claims more than moved (6.5: not
-     * meaningful) means the two sides disagree */
+    /* 6.3: a CSW is valid when it is 13 bytes with the signature and our tag, and meaningful when
+     * its status is 0 or 1 with a residue within the request; a phase error (status 2) and any
+     * other are a Reset Recovery (6.5). What is relevant of the data is the request less the
+     * residue (6.7.2), of which only what moved is there. */
     bool whole = !r && moved == 13;
     uint32_t residue = whole ? get32(csw + 8) : 0;
-    if (!whole || get32(csw) != CSW_SIG || get32(csw + 4) != tag || csw[12] > 1 || residue > len ||
-        (!csw[12] && len - residue > data_moved)) {
+    if (!whole || get32(csw) != CSW_SIG || get32(csw + 4) != tag || csw[12] > 1 || residue > len) {
         reset_recovery(m);
         return BOT_BROKEN;
     }
     if (csw[12] == 1) return BOT_FAILED;
-    return (int)(len - residue);
+    return (int)MIN(len - residue, data_moved);
 }
 
 /* A command, and on CHECK CONDITION the sense data right away (any other command loses it). */
@@ -306,6 +308,8 @@ static void probe_lun(struct msc *m, unsigned lun) {
     l->blk.persist = msc_flush;
     l->blk.block = block;
     l->blk.priv = l;
+    l->next = m->luns;
+    m->luns = l;
     blk_register(&l->blk);
 }
 
@@ -354,6 +358,7 @@ void usbmsc_detach(struct usb_device *d) {
     if (!m) return;
     mutex_lock(&m->lock);
     m->dev = NULL;
+    for (struct lun *l = m->luns; l; l = l->next) __atomic_store_n(&l->blk.gone, true, __ATOMIC_RELEASE);
     mutex_unlock(&m->lock);
     d->msc = NULL;
     __atomic_fetch_sub(&attached, 1, __ATOMIC_RELAXED);

@@ -17,8 +17,10 @@ struct blkdev {
     char name[16];  /* "ata0", "scsi1" */
     char model[41];
     uint64_t sectors;
-    uint32_t block;  /* the device's own block in bytes (512 or 4096): a write covering whole blocks
-                        needs no read-modify-write in the driver */
+    uint32_t block;  /* the device's own block in bytes, a power of two from 512: a write covering
+                        whole blocks needs no read-modify-write in the driver */
+    bool gone;       /* atomic: the device left (unplugged, its adapter dead). The device stays listed
+                        and its requests fail; a power change does not wait for what it cannot keep */
     uint32_t errors;    /* failed requests since the device appeared (atomic) */
     uint64_t written;   /* writes the device took, ever (atomic, blk.c) */
     uint64_t persisted; /* of them, the ones a persist that ended began after (atomic, blk.c) */
