@@ -211,19 +211,19 @@ index 8985651..9ae4507 100644
          pub use sgx::*;
 diff --git a/library/std/src/sys/env/nocturne.rs b/library/std/src/sys/env/nocturne.rs
 new file mode 100644
-index 0000000..3f449a3
+index 0000000..0bf7e55
 --- /dev/null
 +++ b/library/std/src/sys/env/nocturne.rs
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,103 @@
 +//! Environment variables on Nocturne.
 +//!
 +//! There is no `environ`: a program's environment is the launcher's list of
-+//! settings (`"NAME=value"`, `n_settings`), which the C library's `getenv`
-+//! reads. std keeps its own copy, filled from `n_settings` on first use, so
-+//! that `std::env::vars()` can enumerate it. `set_var`/`remove_var` change
-+//! std's copy and are mirrored into the C library's table, so C code in the
-+//! same program (and apps launched later) see them; changes made only by C
-+//! code afterwards are not seen by std.
++//! settings (`"NAME=value"`, `n_settings`). std keeps its own table of them,
++//! filled from `n_settings` on first use, and `set_var`/`remove_var` change
++//! that table only. The C library holds the launch settings and the app's
++//! current folder (`FOLDER`, which `n_folder_set` changes and
++//! `set_current_dir` brings into std's table); C code in the same program
++//! reads those through `getenv` and does not see std's changes.
 +
 +use core::slice::memchr;
 +
@@ -232,8 +232,6 @@ index 0000000..3f449a3
 +use crate::io;
 +use crate::sync::Mutex;
 +use crate::sys::abi;
-+use crate::sys::cvt;
-+use crate::sys::helpers::run_with_cstr;
 +
 +static ENV: Mutex<Option<Vec<(OsString, OsString)>>> = Mutex::new(None);
 +
@@ -290,34 +288,34 @@ index 0000000..3f449a3
 +    with_env(|vars| vars.iter().find(|(name, _)| name == k).map(|(_, v)| v.clone()))
 +}
 +
++/// Whether `k` can be the name of a setting: not empty, without '=' or NUL.
++fn valid_name(k: &OsStr) -> io::Result<()> {
++    let k = k.as_encoded_bytes();
++    if k.is_empty() || k.contains(&b'=') || k.contains(&0) {
++        return Err(io::const_error!(io::ErrorKind::InvalidInput, "invalid setting name"));
++    }
++    Ok(())
++}
++
 +pub unsafe fn setenv(k: &OsStr, v: &OsStr) -> io::Result<()> {
-+    run_with_cstr(k.as_encoded_bytes(), &|kc| {
-+        run_with_cstr(v.as_encoded_bytes(), &|vc| {
-+            with_env(|vars| {
-+                // Keep the C library's table (what `getenv` and the apps this
-+                // program launches read) in step.
-+                cvt(if unsafe { abi::setenv(kc.as_ptr(), vc.as_ptr(), 1) } < 0 {
-+                    -(abi::N_ERR_NO_MEMORY as i64)
-+                } else {
-+                    0
-+                })?;
-+                match vars.iter_mut().find(|(name, _)| name == k) {
-+                    Some((_, value)) => *value = v.to_os_string(),
-+                    None => vars.push((k.to_os_string(), v.to_os_string())),
-+                }
-+                Ok(())
-+            })
-+        })
++    valid_name(k)?;
++    if v.as_encoded_bytes().contains(&0) {
++        return Err(io::const_error!(io::ErrorKind::InvalidInput, "setting value contains NUL"));
++    }
++    with_env(|vars| {
++        match vars.iter_mut().find(|(name, _)| name == k) {
++            Some((_, value)) => *value = v.to_os_string(),
++            None => vars.push((k.to_os_string(), v.to_os_string())),
++        }
++        Ok(())
 +    })
 +}
 +
 +pub unsafe fn unsetenv(k: &OsStr) -> io::Result<()> {
-+    run_with_cstr(k.as_encoded_bytes(), &|kc| {
-+        with_env(|vars| {
-+            unsafe { abi::unsetenv(kc.as_ptr()) };
-+            vars.retain(|(name, _)| name != k);
-+            Ok(())
-+        })
++    valid_name(k)?;
++    with_env(|vars| {
++        vars.retain(|(name, _)| name != k);
++        Ok(())
 +    })
 +}
 diff --git a/library/std/src/sys/env_consts.rs b/library/std/src/sys/env_consts.rs
@@ -1031,10 +1029,10 @@ index 88d9d42..1a6fa99 100644
          pub use self::xous::*;
 diff --git a/library/std/src/sys/pal/nocturne/abi.rs b/library/std/src/sys/pal/nocturne/abi.rs
 new file mode 100644
-index 0000000..305ba59
+index 0000000..6d88392
 --- /dev/null
 +++ b/library/std/src/sys/pal/nocturne/abi.rs
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,179 @@
 +//! Declarations of the Nocturne native ABI as the C library exports it
 +//! (`user/include/nocturne.h`, `common/abi.h`, `docs/nocturne-native-abi.md`).
 +//!
@@ -1157,8 +1155,6 @@ index 0000000..305ba59
 +    pub fn abort() -> !;
 +    pub fn exit(code: c_int) -> !;
 +    pub fn getenv(name: *const c_char) -> *mut c_char;
-+    pub fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
-+    pub fn unsetenv(name: *const c_char) -> c_int;
 +    pub fn fwrite(buf: *const c_void, size: usize, count: usize, file: *mut c_void) -> usize;
 +    pub fn fflush(file: *mut c_void) -> c_int;
 +    pub fn timespec_get(ts: *mut timespec, base: c_int) -> c_int;
@@ -1459,10 +1455,10 @@ index 8880a83..97b25e6 100644
          use uefi as imp;
 diff --git a/library/std/src/sys/paths/nocturne.rs b/library/std/src/sys/paths/nocturne.rs
 new file mode 100644
-index 0000000..70f07d6
+index 0000000..5680deb
 --- /dev/null
 +++ b/library/std/src/sys/paths/nocturne.rs
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,102 @@
 +//! Folders and paths on Nocturne.
 +//!
 +//! There is no kernel working directory: an app's current folder is its
@@ -1488,7 +1484,8 @@ index 0000000..70f07d6
 +        crate::sys::cvt(unsafe { abi::n_folder_set(name.as_ptr()) })?;
 +        Ok(())
 +    })?;
-+    // `n_folder_set` changed the C library's table; bring std's copy along.
++    // `n_folder_set` changed the C library's current folder; std's table
++    // gets the same `FOLDER`.
 +    let cwd = getcwd()?;
 +    unsafe { crate::sys::env::setenv(OsStr::new("FOLDER"), cwd.as_os_str()) }
 +}

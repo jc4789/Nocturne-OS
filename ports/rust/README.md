@@ -47,7 +47,7 @@ make                         # tools/rust/sysroot があれば ports/rust/apps/*
 | --- | --- |
 | 起動（`sys/pal`） | C ライブラリーの `__libc_start` が TLS・stdio・起動設定を用意して `main` を呼ぶ。`std::rt` は `argc/argv` を受け取る。 |
 | メモリー（`sys/alloc`） | `malloc`/`calloc`/`realloc`/`free`。16 バイトを超える配置は多めに確保して前に元のポインターを置く。 |
-| 引数・環境（`sys/args`、`sys/env`） | 引数は `argv`。環境は起動設定（`n_settings`、`NAME=値`）を最初の使用時に読んだ表で、`set_var`/`remove_var` は C ライブラリーの `setenv`/`unsetenv` にも反映する（C 側だけの後の変更は見えない）。 |
+| 引数・環境（`sys/args`、`sys/env`） | 引数は `argv`。環境は std の表で、起動設定（`n_settings`、`NAME=値`）を最初の使用時に読む。`set_var`/`remove_var` はこの表だけを変える。名前が空か `=`・NUL を含むか、値が NUL を含めば `InvalidInput`。同じプログラムの C のコードは、`getenv` で起動設定と今のフォルダー（`FOLDER`）を読み、std の変更は見ない。 |
 | スレッド（`sys/thread`） | `thread_create`/`thread_join`。スタックはカーネルが決める固定 256 KiB で、`Builder::stack_size` は効かない。1 プロセス 128 本まで。終了時に Rust の TLS デストラクターを走らせる。`available_parallelism` は `cpu_info`。 |
 | ロック・条件変数・Once・RwLock・park（`sys/sync`） | Rust の futex 実装を `wait_on_address`/`wake_address` の上に置く（ミリ秒切り上げ、`u32::MAX-1` ms を超える待ちは早く戻る）。 |
 | スレッドローカル | ネイティブの `#[thread_local]`（C ライブラリーが各スレッドの FS を設定する）。 |
@@ -55,7 +55,7 @@ make                         # tools/rust/sysroot があれば ports/rust/apps/*
 | 標準入出力（`sys/stdio`） | 出力は C の `stdout`/`stderr`（チャンネルでも文書でも C ライブラリーが扱う）。入力はハンドル 0 を直接読み、チャンネルは 1 メッセージずつ、大きいメッセージの残りは次へ持ち越す。文書なら自分で位置を持つ。 |
 | ファイル（`sys/fs`） | `n_document_*`、`n_entry_*`、`n_folder_*`。共有カーソルが無いので `File` が位置を持つ。追記は排他を取って末尾へ書く。`sync_all`/`sync_data` は `n_document_commit`（`N_COMMIT_WAIT`：媒体に書かれるまで待つ）。`rename` は C ライブラリーの `rename`（既存の文書を原子的に置き換える）。パスは `n_path_complete`（`FOLDER` を基準に `.`/`..` を解決）で完全指定にしてから渡す。 |
 | パスの形（`sys/path`） | ドライブは `C:` だけで、区切りは `\`（主）と `/`。接頭辞はドライブ `X:`（`Prefix::Disk`）だけで、UNC や `\\?\` は無い。根のあるパス（`C:\a`、`\a`、`/a`）が完全指定（`is_absolute`）。根の無い `C:`、`C:a` は今のフォルダーとその中の名前。`path::absolute` は C ライブラリーの `n_path_complete`（`C:\...`、`.`/`..` を解決）。 |
-| フォルダー（`sys/paths`） | `current_dir` は設定 `FOLDER` を `n_path_complete` で完全指定にしたもの（無ければ `C:\`）、`set_current_dir` は `n_folder_set`。`temp_dir` は `n_temp_folder`（設定 `TEMP`）、`home_dir` は `n_user_folder`（設定 `USERFOLDER`）。`split_paths`/`join_paths` の区切りは `;`。`PATH` と `HOME` は無い。 |
+| フォルダー（`sys/paths`） | `current_dir` は C ライブラリーの今のフォルダー（設定 `FOLDER`）を `n_path_complete` で完全指定にしたもの（無ければ `C:\`）。`set_current_dir` は `n_folder_set` で C ライブラリーの今のフォルダーを変え、std の表の `FOLDER` も同じ値にする。`temp_dir` は `n_temp_folder`（設定 `TEMP`）、`home_dir` は `n_user_folder`（設定 `USERFOLDER`）。`split_paths`/`join_paths` の区切りは `;`。`PATH` と `HOME` は無い。 |
 | エラー（`sys/io/error`） | OS エラーの値は ABI の `N_ERR_*`（正の数）。`ErrorKind` に対応付け、文言は `n_result_text`。 |
 | 乱数（`sys/random`） | `n_random`（`HashMap` の鍵もこれ）。 |
 | プロセス | `process::id` は `n_app_self`、`process::exit` は `exit`、`abort` は `abort`。 |
@@ -63,7 +63,11 @@ make                         # tools/rust/sysroot があれば ports/rust/apps/*
 
 ## 確認したこと
 
-ホスト（Windows）での確認だけです。Nocturne 上ではまだ動かしていません。
+Nocturne 上では、QEMU（q35・UEFI・NVMe、WHPX）の Terminal から `rusttest` を走らせ、全部の項目が
+通る（`rusttest: ok (50 checks)`）。`cd Documents` の後では `current_dir` が `C:\Users\User\Documents`
+になる。実機では走らせていない。
+
+ホスト（Windows）では次を確かめた。
 
 - 標準ライブラリー（core、alloc、std、panic_abort）が警告なしにビルドできる。
 - `ports/rust/apps/rusttest` が `rustc` でコンパイルされ、`ld.lld` で `user/user.ld` と
@@ -76,7 +80,7 @@ make                         # tools/rust/sysroot があれば ports/rust/apps/*
 `rusttest` は println/eprintln、Vec/HashMap/BTreeMap/HashSet/BinaryHeap/VecDeque、8 MiB の確保、
 64 バイト配置、`OnceLock`、4 本のスレッド（`Arc<Mutex<Vec>>`、アトミック、スレッドローカル、
 `join`）、`Condvar`、`RwLock`、`thread::scope`、`park`/`unpark`、`env`（`var`、`vars`、
-`set_var`、`remove_var`、`args`）、ドライブのパス（`components`、`is_absolute`、`join`、
+`set_var`、`remove_var`、`args`、`set_current_dir` の後の `FOLDER`）、ドライブのパス（`components`、`is_absolute`、`join`、
 `current_dir`、`temp_dir`、`path::absolute`、`set_current_dir`）、一時フォルダーでの `fs`（作成、追記、
 シーク、`sync_all`、`copy`、`rename`、`read_dir`、`remove_*`、`NotFound`）、`Instant`/`SystemTime`、`CString`、`RandomState`、
 `catch_unwind` を確かめ、すべて通れば `rusttest: ok (N checks)` を出して終了コード 0 です。

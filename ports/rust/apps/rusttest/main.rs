@@ -194,6 +194,7 @@ fn main() {
             && std::env::current_dir().ok() == Some(dir.clone())
             && std::fs::metadata("sub").is_ok_and(|m| m.is_dir()),
     );
+    c.check("FOLDER follows set_current_dir", std::env::var_os("FOLDER").as_deref() == Some(dir.as_os_str()));
     let _ = std::env::set_current_dir(&cwd);
     let file = dir.join("hello.txt");
     c.check("fs::write", std::fs::write(&file, b"hello nocturne\nsecond line\n").is_ok());
