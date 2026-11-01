@@ -239,8 +239,9 @@ static void dump(void) {
     sched_get_stats(&k);
 #define SD(f) (unsigned long long)(k.f - last_sched.f)
     kprintf("prof: switches %llu, wakes %llu (to another CPU %llu), steals %llu, balances %llu, kicks %llu, yields %llu, "
-            "inherited ranks %llu\n",
-            SD(switches), SD(wakes), SD(moved_wakes), SD(steals), SD(balances), SD(kicks), SD(yields), SD(boosts));
+            "inherited deadlines %llu, throttles %llu, late jobs %llu\n",
+            SD(switches), SD(wakes), SD(moved_wakes), SD(steals), SD(balances), SD(kicks), SD(yields), SD(boosts),
+            SD(throttles), SD(late));
 #undef SD
     last_sched = k;
     for (uint32_t i = 0; i < PROF_SLOTS; i++) {

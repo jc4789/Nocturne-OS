@@ -191,6 +191,9 @@ static bool usb_kick; /* wakes whichever wait runs; nested waits consume it */
 static bool usb_more; /* work for the main loop; only the main loop clears it */
 static uint64_t usb_deadline;  /* earliest endpoint recovery retry (CLOCK_NEVER = none) */
 static struct thread *usb_task;
+/* The shortest service interval of the interrupt endpoints opened (ns), 0 before the first: the
+   period usb_thread keeps to as a deadline thread (sys/sched.h), the reports of the fastest device. */
+static uint64_t input_period_ns;
 static bool usb_settled; /* the first pass over every port and hub is done (atomic: read by others) */
 /* The endpoints that send (struct endpoint): usb_send on any task, the usb thread's completions and
    recoveries. Taken alone, never across a wait. */
@@ -736,7 +739,13 @@ static bool open_endpoints(struct xdev *xd, const struct usb_ep_info *eps, int n
         ep->mps = mps;
         ep->esit = esit;
         xd->ep[dci] = ep;
-        endpoint_context(xd, ep, endpoint_interval(xd->dev.speed, e->interval), burst);
+        unsigned interval = endpoint_interval(xd->dev.speed, e->interval);
+        endpoint_context(xd, ep, interval, burst);
+        if (type == 3) { /* the interval's exponent counts 125 us microframes (xHCI 6.2.3.6) */
+            uint64_t ns = 125000ull << interval, was = __atomic_load_n(&input_period_ns, __ATOMIC_RELAXED);
+            while ((!was || ns < was) &&
+                   !__atomic_compare_exchange_n(&input_period_ns, &was, ns, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        }
         icc[1] |= 1u << dci;
         if (dci > top) top = dci;
         added++;
@@ -1450,10 +1459,15 @@ static bool any_port_pending(void) {
 
 static void usb_thread(void *arg) {
     (void)arg;
-    sched_set_policy(thread_current(), sched_realtime(SCHED_PRIORITY_INPUT)); /* the keyboard's and the pointer's reports */
+    uint64_t period = 0; /* the deadline period it keeps to: none until an interrupt endpoint is open */
     for (int i = 0; i < ncontrollers; i++) hc_start(&controllers[i]);
     uint64_t settle_at = clock_after(500 * NS_PER_MS);
     for (;;) {
+        uint64_t shortest = __atomic_load_n(&input_period_ns, __ATOMIC_RELAXED);
+        if (shortest != period) { /* the keyboard's and the pointer's reports, each in its interval */
+            period = shortest;
+            sched_set_policy(thread_current(), sched_deadline(MIN(MAX(period, SCHED_PERIOD_MIN_NS), SCHED_PERIOD_MAX_NS)));
+        }
         uint64_t f = spin_lock(&usb_lock);
         usb_more = false;
         spin_unlock(&usb_lock, f);

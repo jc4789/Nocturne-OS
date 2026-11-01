@@ -111,7 +111,9 @@ static void hold_give(struct irq *irq) {
 static void irq_thread(void *arg) {
     struct worker w = *(struct worker *)arg;
     kfree(arg);
-    sched_set_policy(thread_current(), sched_realtime(SCHED_PRIORITY_IRQ)); /* a device waits for its run */
+    /* a device waits for its run: the shortest request, which the fair class picks first once it
+       is eligible; it never delays a deadline thread's job */
+    sched_set_policy(thread_current(), sched_fair(SCHED_WEIGHT_DEFAULT, SCHED_REQUEST_MIN_NS));
     struct irq *irq = w.irq;
     uint64_t f = spin_lock(&irq->lock);
     while (w.gen >= irq->gen && !irq->stopping) {

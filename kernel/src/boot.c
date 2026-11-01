@@ -12,6 +12,7 @@
 #include "dev/serial.h"
 #include "dev/fb.h"
 #include "dev/fbcon.h"
+#include "sys/address_wait.h"
 #include "sys/alarm.h"
 #include "sys/clock.h"
 #include "sys/log.h"
@@ -23,6 +24,7 @@
 #include "mm/heap.h"
 #include "sys/sched.h"
 #include "sys/thread.h"
+#include "sys/epoch.h"
 #include "sys/prof.h"
 #include "arch/wake.h"
 
@@ -179,5 +181,7 @@ void kmain(void) {
     cpu_mca_interrupt_on();
     clock_init(); /* the TSC at the P0 P-state's rate (measured on against the HPET) or a hypervisor's */
     sched_init();
+    address_wait_init();
+    epoch_init(); /* its workers, which free what readers might still see */
     cpu_switch_stack(sched_cpu_stack(0), kmain_scheduled, NULL); /* the bootloader's is left */
 }

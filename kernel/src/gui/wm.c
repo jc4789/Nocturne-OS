@@ -2421,7 +2421,7 @@ static void frame_started(uint64_t now) {
    wake. A vertical blank that came before the sleep makes the frame due; one after it wakes the
    thread (vblank_waiting). */
 static void wm_thread(void *arg) {
-    sched_set_policy(thread_current(), sched_realtime(SCHED_PRIORITY_COMPOSITOR)); /* each frame on time */
+    uint64_t period = 0; /* the deadline period it keeps to (sys/sched.h): the frame period */
     wm_lock();
     damage_all();
     uint64_t seen = __atomic_load_n(&wm_wakes, __ATOMIC_SEQ_CST);
@@ -2429,6 +2429,11 @@ static void wm_thread(void *arg) {
     uint64_t idle_until = CLOCK_NEVER;
     wm_unlock();
     for (;;) {
+        uint64_t frame_ns = frame_period();
+        if (frame_ns != period) { /* each frame on time: a job a frame, due by the next */
+            period = frame_ns;
+            sched_set_policy(thread_current(), sched_deadline(MIN(MAX(period, SCHED_PERIOD_MIN_NS), SCHED_PERIOD_MAX_NS)));
+        }
         bool waited = false, sleep = false;
         uint64_t until = CLOCK_NEVER, waiting = 0;
         if (!input_waiting()) {

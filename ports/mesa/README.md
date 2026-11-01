@@ -40,7 +40,7 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 | `src/util/cnd_monotonic.c/.h` | ISO C11 の条件変数で単調時計の期限待ちを作る。 |
 | `src/util/rwlock.c/.h` | ISO C11 の mutex と条件変数で読み書きロックを作る。 |
 | `src/util/os_time.c/.h` | `n_sleep_ms`／`yield` と ISO `localtime` を使う。 |
-| `src/util/os_misc.c` | 物理メモリ量などを `sysinfo` で得る。 |
+| `src/util/os_misc.c/.h` | 物理メモリ量などを `sysinfo` で得る。アプリの設定は起動した側が渡し、アプリの中では読むだけなので、`os_set_option`・`os_unset_option` は無い。 |
 | `src/util/memstream.c/.h` | メモリ上の FILE は無いので、一時文書を書き、flush／close で読み戻す。 |
 | `src/util/u_string.h` | `asprintf` 系は libc に無いので、Mesa 自身の Windows 用実装を使う。 |
 | `src/util/log.c` | 共有の一時フォルダーは無い。`MESA_LOG_FILE` だけを使う。机上から起動したアプリには stderr が無いので、既定の出力先にシステムの記録（`n_system_log_open`、`MESA_LOG=system` でも選べる）を足す。行は `MESA: warning: …` の形で、USB の C: では System.log に残る。`mesa_log_hold`／`mesa_log_release` は、呼んだスレッドの行をその間だけ書かずに預かり（同じ形の文字列で返す）、`mesa_log_write_lines` が後でまとめて書く（Nocturne GL が Zink を起こす間に使う）。 |

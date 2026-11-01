@@ -1385,7 +1385,7 @@ static void snd_thread(void *arg) {
     struct rdp *c = arg;
     struct audio_remote *r = &c->snd_remote;
     int err = 0;
-    sched_set_policy(thread_current(), sched_realtime(SCHED_PRIORITY_SOUND)); /* the client's sound, paced */
+    sched_set_policy(thread_current(), sched_deadline(SND_BLOCK_NS)); /* the client's sound, a block a period */
     for (;;) {
         uint64_t seen = __atomic_load_n(&r->signals, __ATOMIC_SEQ_CST);
         uint64_t f = spin_lock(&c->snd_lock);
@@ -1705,7 +1705,7 @@ static int mcs_pdu(struct rdp *c, int len) {
 #define LOOK_BUSY_NS (10 * NS_PER_MS) /* while the desktop keeps being redrawn */
 
 static void session(void *arg) {
-    sched_set_policy(thread_current(), sched_realtime(SCHED_PRIORITY_INPUT)); /* the client's input, and its screen's updates */
+    sched_set_policy(thread_current(), sched_deadline(LOOK_BUSY_NS)); /* the client's input, and its screen's updates at the pace it looks */
     struct rdp *c = kzalloc(sizeof *c);
     struct hvsock *s = arg;
     if (!c) goto out;

@@ -133,6 +133,7 @@ os_get_option_secure_dup(const char *name);
 const char *
 os_get_option_cached(const char *name);
 
+#if !DETECT_OS_NOCTURNE /* an app's settings come from its launcher, read only */
 /*
  * Set an option(environment variable or os property) in a platform independent way.
  * If @overwrite is true:
@@ -152,6 +153,7 @@ os_unset_option(const char *name)
 {
    os_set_option(name, NULL, true);
 }
+#endif
 
 /*
  * Get the total amount of physical memory available on the system.

@@ -407,8 +407,6 @@ static bool setting_put(const char *name, const char *value) {
     }
     free(s->value);
     s->value = v;
-    if (value) setenv(name, value, 1);
-    else unsetenv(name);
     return true;
 }
 

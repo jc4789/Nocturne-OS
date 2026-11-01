@@ -342,6 +342,7 @@ exit_mutex:
    return opt;
 }
 
+#if !DETECT_OS_NOCTURNE /* an app's settings come from its launcher, read only */
 void
 os_set_option(const char *name, const char *value, bool override)
 {
@@ -360,6 +361,7 @@ os_set_option(const char *name, const char *value, bool override)
    }
 #endif
 }
+#endif
 
 /**
  * Return the size of the total physical memory.
