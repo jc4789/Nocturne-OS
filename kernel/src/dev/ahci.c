@@ -787,7 +787,7 @@ static void leave(struct port *p, int slot, bool alone) {
 
 /* A command of the caller's (`bit`) ran out of time, or the port went on through something it should
    not: the command list engine stopped, so nothing in the port moves data into memory its callers
-   are about to give back, and every command still in it failed. What had ended before the engines stopped ended
+   are about to give back, and every command still in it failed. What had ended before the engine stopped ended
    well: the stop clears PxCI and PxSACT, so they are read first (5.3.2.10, 6.2.2.2), and reap reads
    them no more until it is over. The first caller to find it so does it; the others wait for
    their own commands to fail. */

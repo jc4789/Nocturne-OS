@@ -54,18 +54,22 @@ struct hub {
     bool ss;         /* Enhanced SuperSpeed hub */
     bool hub_change; /* atomic: bit 0 of the status change report, the hub's own status changed */
     bool reporting;  /* its status change endpoint runs: a port change comes as a report */
-    bool asking;     /* it does not, for good: its ports are read each second, by no document's time */
+    /* it does not, or a change acknowledged waits for it to answer again: its ports are read each
+       second, by no document's time */
+    bool asking;
     uint64_t ask_at;
     unsigned ask_gap; /* seconds: doubled while it does not answer, to 64 */
     uint8_t report_ep;
     bool local;      /* it has had local power: a hub without any says "lost" and runs on the bus's */
     bool off;        /* local power lost or over-current (wHubStatus): every port is off and stays so */
+    bool hub_held;   /* a change of its own acknowledged, not yet acted on */
     /* a SuperSpeedPlus hub's Sublink Speed Attributes (USB 3.2 9.6.2.5), NULL for any other */
     uint32_t *sublinks;
     unsigned nsublinks;
     struct usb_device **child; /* by port, from 1 */
     struct usb_port_tries *tries; /* by port, from 1 */
     struct usb_port_tries *power; /* by port, from 1: its power turned on again after an over-current */
+    uint16_t *held; /* by port, from 1: changes acknowledged, not yet acted on */
     uint32_t *pending; /* atomic words: bit p of the words, the ports whose status changed */
 };
 
@@ -77,6 +81,12 @@ static unsigned pending_words(const struct hub *h) { return (h->ports >> 5) + 1;
 
 static void pending_mark(struct hub *h, unsigned port) {
     __atomic_fetch_or(&h->pending[port >> 5], 1u << (port & 31), __ATOMIC_RELEASE);
+}
+
+static void hub_ask(struct hub *h) {
+    if (h->asking) return;
+    h->asking = true;
+    h->ask_gap = 1;
 }
 
 static bool removed_hub(const struct hub *h) { return __atomic_load_n(&h->dev->removed, __ATOMIC_ACQUIRE); }
@@ -108,14 +118,22 @@ static void clear_changes(struct hub *h, unsigned port, uint16_t change) {
 
 /* The port's status with its changes acknowledged: read again after that, as what happened between
    the read and that is told no more (USB 2.0 Figure 11-21, USB 3.2 Figure 10-23). *change: all it
-   read. False if the hub stops answering. */
+   read, with what the last call could not finish with. False if the hub stops answering: what it
+   acknowledged waits for the next read. */
 static bool port_changes(struct hub *h, unsigned port, uint16_t *status, uint16_t *change) {
-    *change = 0;
+    *change = h->held[port];
     for (int i = 0;; i++) {
         uint16_t now;
-        if (!port_status(h->dev, port, status, &now)) return false;
+        if (!port_status(h->dev, port, status, &now)) {
+            h->held[port] = *change;
+            if (*change) hub_ask(h);
+            return false;
+        }
         *change |= now;
-        if (!now || i == CHANGE_READS - 1) return true;
+        if (!now || i == CHANGE_READS - 1) {
+            h->held[port] = 0;
+            return true;
+        }
         clear_changes(h, port, now);
     }
 }
@@ -165,11 +183,13 @@ bool usbhub_prepare(struct usb_device *d) {
     h->child = kzalloc((h->ports + 1u) * sizeof *h->child);
     h->tries = kzalloc((h->ports + 1u) * sizeof *h->tries);
     h->power = kzalloc((h->ports + 1u) * sizeof *h->power);
+    h->held = kzalloc((h->ports + 1u) * sizeof *h->held);
     h->pending = kzalloc(pending_words(h) * sizeof *h->pending);
-    if (!h->child || !h->tries || !h->power || !h->pending) {
+    if (!h->child || !h->tries || !h->power || !h->held || !h->pending) {
         kfree(h->child);
         kfree(h->tries);
         kfree(h->power);
+        kfree(h->held);
         kfree(h->pending);
         kfree(h);
         return false;
@@ -204,6 +224,7 @@ void usbhub_detach(struct usb_device *d) {
     kfree(h->child);
     kfree(h->tries);
     kfree(h->power);
+    kfree(h->held);
     kfree(h->pending);
     kfree(h);
 }
@@ -216,7 +237,7 @@ static void power_ports(struct hub *h) {
     usb_note_work(h->dev);
 }
 
-static bool hub_status(struct hub *h);
+static bool hub_status_read(struct hub *h);
 
 /* A SuperSpeed hub routes packets by its tier of the route string, which it learns here; until then
    it takes every packet as its own (USB 3.2 10.1.3.1). */
@@ -231,16 +252,11 @@ void usbhub_attach(struct usb_device *d, const struct usb_endpoint_desc *ep) {
     struct hub *h = d->hub;
     if (!h) return;
     h->report_ep = ep->address;
-    hub_status(h); /* whether it has local power, and whether its ports can have any */
+    if (hub_status_read(h)) h->hub_held = false; /* whether it has local power, and its ports can have any */
     if (!h->off) power_ports(h);
     kprintf("usbhub: slot %u %shub with %u ports\n", d->slot, h->ss ? "SuperSpeed " : "", h->ports);
     h->reporting = usb_interrupt_start(d, ep, (h->ports + 8) / 8, hub_report, h); /* a bit a port, and the hub's */
     if (!h->reporting) usbhub_reports_lost(d, ep->address);
-}
-
-static void hub_ask(struct hub *h) {
-    h->asking = true;
-    h->ask_gap = 1;
 }
 
 /* A change is known by the status change endpoint alone (USB 2.0 11.12.1): without it, the ports are asked. */
@@ -256,27 +272,33 @@ void usbhub_reports_lost(struct usb_device *d, uint8_t address) {
  * either of which switches every port off until software powers them again (USB 2.0 11.5.1.2,
  * 11.12.5; USB 3.2 10.3.1.1, 10.13.5). Read again after a change is acknowledged, as what ended between
  * the read and that is told no more (USB 2.0 Figure 11-21, USB 3.2 Figure 10-23). False if it does
- * not answer; if that follows an acknowledgement, its status is asked for from now on. */
-static bool hub_status(struct hub *h) {
+ * not answer: what it acknowledged waits in hub_held for the next read. */
+static bool hub_status_read(struct hub *h) {
     struct usb_device *d = h->dev;
     uint16_t status, change;
-    bool changed = false;
     for (int i = 0;; i++) {
         uint8_t st[4];
         if (usb_control(d, 0xA0, USB_REQ_GET_STATUS, 0, 0, st, 4) < 4) {
-            if (changed) hub_ask(h);
+            if (h->hub_held) hub_ask(h);
             return false;
         }
         status = st[0] | st[1] << 8;
         change = st[2] | st[3] << 8;
         if (!(status & 1)) h->local = true;
         if (!(change & 3) || i == CHANGE_READS - 1) break;
-        changed = true;
+        h->hub_held = true;
         if (change & 1) usb_control(d, 0x20, USB_REQ_CLEAR_FEATURE, C_HUB_LOCAL_POWER, 0, NULL, 0);
         if (change & 2) usb_control(d, 0x20, USB_REQ_CLEAR_FEATURE, C_HUB_OVER_CURRENT, 0, NULL, 0);
     }
     h->off = (status & 2) || (h->local && (status & 1));
-    if (!changed) return true;
+    return true;
+}
+
+static bool hub_status(struct hub *h) {
+    struct usb_device *d = h->dev;
+    if (!hub_status_read(h)) return false;
+    if (!h->hub_held) return true;
+    h->hub_held = false;
     if (h->off) {
         kprintf("usbhub: slot %u lost its power or over-current, its ports are switched off\n", d->slot);
         for (unsigned p = 1; p <= h->ports; p++) pending_mark(h, p); /* their devices have gone */
@@ -391,9 +413,8 @@ static void hub_port(struct hub *h, unsigned port) {
     struct usb_port_tries *t = &h->tries[port], *power = &h->power[port];
     uint16_t status, change;
     if (!port_changes(h, port, &status, &change)) {
-        /* a hub that does not answer: a port being tried is not read again at once, and a change
-           acknowledged is looked at again */
-        if (t->at ? usb_port_try(t) : change != 0) usb_port_failed(t, true);
+        /* a hub that does not answer: a port being tried is not read again at once */
+        if (t->at && usb_port_try(t)) usb_port_failed(t, true);
         if (power->at && usb_port_try(power)) usb_port_failed(power, true);
         return;
     }
