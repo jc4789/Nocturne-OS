@@ -53,7 +53,7 @@ Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは
 - **Web の標準を満たす。** W3C と WHATWG の標準、つまり WPT（`D:\Programes\cloned repos\wpt`）が試すもの。欠けは症状に効く一部で止めず、仕様の手順と、それが触れる値を持ち主の層まで通して全部入れる。照らすのは仕様の原文と WPT。安全の規則（CORS・Mixed Content・Cookie・資格情報）を削らない。
 - **サイト専用の処理を入れない。** ホスト名・URL の分岐、特定サイトの DOM の特例、UA の偽装、注入した HTML・CSS・JS で「直った」画面を作らない。壊れているのは我々のブラウザーで、主語はブラウザーの欠陥、サイト名は「再現は◯◯」と添えるだけ。
 - **VM の処理は実機と分ける。** VM だけの処理は `kernel/src/vm/vm.h` の後ろに置き、共通コードに hypervisor の判定や VM の装置を書かない。VM の測定値で実機の既定を決めない。
-- **UNIX・POSIX・LINUX ではない。** POSIX・Linux の API をカーネルにも libc にも足さない。移植する側を Nocturne のネイティブ ABI（`common/abi.h`・`display_abi.h`・`gpu_abi.h`、仕様 `docs/nocturne-native-abi.md`）へ書き換える. 
+- **UNIX・POSIX・LINUX ではない。** POSIX・Linux・UNIX の API/ABI, NEVER ADD EVER. WE PORT PROGRAMS TO Nocturne, WE DO NOT PORT Nocturne. If our ABI OR kernel IS LACKING FUNCTION we add it natively and in a Nocturne way. Renameing POSIX・Linux・UNIX syscall/abi/api and addeding it is NEVER ALLOWED. 
 - **言語は C だけではない。** C++20、TypeScript・JavaScript（QuickJS）、Go、Rust の標準ライブラリーはネイティブ ABI の上にある。ゲストにも clang・clang++・tcc・tsc がある。性能に関わる道具は clang の最適化つきで組む。
 - **GUI が先。** 機能には窓・設定の画面・クリックの入口を作り、CLI は付け足し。システムの内部を引数や旗の起動で組まず、ユーザーにコマンドを打たせない。設定の持ち主はシステムで、変えた瞬間に効き、設定アプリは窓だけ。プログラムの設定はそのプログラムの持ち物で、カーネルや共有ファイルに持たせない。標準が利用者の選択を前提にするなら、固定値で済ませず設定とそれが効く経路まで作る。
 - **ディスクは一台。** 起動の区画と C: が同じ媒体（`C:\Nocturne`、`C:\Programs\<アプリ>`、`C:\Users\<名前>`）。二台目のディスク、`/data`、`/bin`、PATH を持ち込まない。
