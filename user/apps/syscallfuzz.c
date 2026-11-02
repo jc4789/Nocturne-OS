@@ -22,7 +22,7 @@
 
    Left out on purpose: calls that end, power off, launch or stop programs, sleep, claim
    hardware, use the network or change the volume the system keeps for the user (SYS_EXIT,
-   SYS_POWER, SYS_SLEEP, SYS_THREAD_*, SYS_APP_LAUNCH, SYS_APP_OPEN, SYS_GUI_LAUNCH,
+   SYS_POWER, SYS_SLEEP, SYS_THREAD_*, SYS_APP_LAUNCH, SYS_APP_OPEN,
    SYS_WIN_CREATE, SYS_PCI_CLAIM, SYS_AUDIO_OUTPUT, 96..127).
    Pointers into memory this program owns never reach calls that change mappings. */
 #include <stdio.h>
@@ -140,7 +140,7 @@ struct sysinfo_ { uint16_t num; uint8_t hmask; };
 static const struct sysinfo_ hinfo[] = {
     {SYS_HANDLE_CLOSE, 1}, {SYS_HANDLE_KIND, 1}, {SYS_DOCUMENT_READ_AT, 1}, {SYS_DOCUMENT_WRITE_AT, 1},
     {SYS_DOCUMENT_SIZE, 1}, {SYS_DOCUMENT_SET_SIZE, 1}, {SYS_DOCUMENT_CLAIM, 1}, {SYS_DOCUMENT_RELEASE, 1},
-    {SYS_CHANNEL_SEND, 1 | 8}, {SYS_CHANNEL_RECEIVE, 1}, {SYS_CHANNEL_ACCEPT, 1},
+    {SYS_CHANNEL_SEND, 1 | 8}, {SYS_CHANNEL_RECEIVE, 1}, 
     {SYS_APP_RESULT, 1}, {SYS_APP_STOP, 1}, {SYS_APP_ID, 1},
     {SYS_EVENTS_WATCH, 1 | 2}, {SYS_EVENTS_UNWATCH, 1}, {SYS_EVENTS_WATCH_ADDRESS, 1}, {SYS_EVENTS_TIMER, 1},
     {SYS_EVENTS_WAIT, 1}, {SYS_AUDIO_SUBMIT, 1}, {SYS_AUDIO_STATUS, 1}, {SYS_AUDIO_FLUSH, 1},
@@ -160,7 +160,7 @@ static unsigned hmask_of(long num) {
 static bool skipped(long n) {
     switch (n) {
     case SYS_EXIT: case SYS_SLEEP: case SYS_POWER: case SYS_THREAD_CREATE: case SYS_THREAD_JOIN:
-    case SYS_THREAD_EXIT: case SYS_WAIT_ADDRESS: case SYS_WAIT_ADDRESS64: case SYS_GUI_LAUNCH:
+    case SYS_THREAD_EXIT: case SYS_WAIT_ADDRESS: case SYS_WAIT_ADDRESS64:
     case SYS_APP_LAUNCH: case SYS_APP_OPEN: case SYS_WIN_CREATE: case SYS_PCI_CLAIM:
     case SYS_AUDIO_OUTPUT: /* the volume, kept on C: for the user */
         return true;
@@ -181,7 +181,7 @@ static bool badptr_only(long n) {
 
 static bool creates_handle(long n) {
     switch (n) {
-    case SYS_DOCUMENT_OPEN: case SYS_CHANNEL_LISTEN: case SYS_CHANNEL_CONNECT: case SYS_CHANNEL_ACCEPT:
+    case SYS_DOCUMENT_OPEN:
     case SYS_SHARED_CREATE: case SYS_SHARED_RESERVE: case SYS_EVENTS_CREATE: case SYS_SYSTEM_LOG_OPEN: case SYS_WIN_SURFACE:
     case SYS_AUDIO_OPEN: case SYS_PCI_BAR: case SYS_DMA_CREATE: case SYS_SHARED_VIEW: case SYS_AUDIO_OUTPUT_WATCH:
     case SYS_ENTRY_WATCH:
@@ -254,7 +254,6 @@ static void live_refill(void) {
     live_add(n_events_create());
     live_add(n_shared_create(8192));
     live_add(n_shared_reserve(65536));
-    live_add(n_channel_listen("syscallfuzz.listener"));
     live_add(n_audio_open());
     live_add(n_entry_watch(scratch, N_WATCH_NAME));
     live_add(n_entry_watch(n_temp_folder(), N_WATCH_FOLDER));
@@ -293,7 +292,7 @@ static void one_call(long num, bool use_live) {
     long r = call(num, a);
     if (r >= 3) {
         if (creates_handle(num)) {
-            if (num == SYS_CHANNEL_ACCEPT || use_live) live_add(r);
+            if (use_live) live_add(r);
             else call5(SYS_HANDLE_CLOSE, r, 0, 0, 0, 0);
         } else if (num == SYS_MEMORY_RESERVE) {
             call5(SYS_MEMORY_RELEASE, r, a[0], 0, 0, 0);
@@ -336,7 +335,6 @@ static void checks(void) {
         MUST_FAIL("entry_remove of a bad path", call5(SYS_ENTRY_REMOVE, p, 0, 0, 0, 0));
         MUST_FAIL("entry_move of a bad path", call5(SYS_ENTRY_MOVE, p, (long)(uintptr_t)"C:\\x", 0, 0, 0));
         MUST_FAIL("document_save of bad data", call5(SYS_DOCUMENT_APPEND, (long)(uintptr_t)scratch, p, 16, 0, 0));
-        MUST_FAIL("channel_listen on a bad key", call5(SYS_CHANNEL_LISTEN, p, 0, 0, 0, 0));
         MUST_FAIL("entry_watch of a bad path", call5(SYS_ENTRY_WATCH, p, N_WATCH_NAME, 0, 0, 0));
         call5(SYS_SYSTEM_LOG, p, 64, 0, 0, 0);
         MUST_FAIL("random into a bad buffer", call5(SYS_RANDOM, p, 16, 0, 0, 0));
@@ -440,7 +438,6 @@ static void checks(void) {
         long p = (long)(uintptr_t)edge - back;
         call5(SYS_ENTRY_INFO, p, (long)(uintptr_t)buf, 0, 0, 0);
         call5(SYS_DOCUMENT_OPEN, p, N_DOCUMENT_READ, 0, 0, 0);
-        call5(SYS_CHANNEL_CONNECT, p, 0, 0, 0, 0);
         call5(SYS_CLIPBOARD_SET, p, 64, 0, 0, 0);
         call5(SYS_WIN_SET_TITLE, -1, p, 0, 0, 0);
         call5(SYS_DOCUMENT_SAVE, p, p, 64, 0, 0);
@@ -461,7 +458,6 @@ static void checks(void) {
     if (n_channel_pair(pr) == 0) {
         MUST_FAIL("document_read_at on a channel", call5(SYS_DOCUMENT_READ_AT, pr[0], 0, (long)(uintptr_t)buf, 8, 0));
         MUST_FAIL("events_wait on a channel", call5(SYS_EVENTS_WAIT, pr[0], (long)(uintptr_t)buf, 4, 0, 0));
-        MUST_FAIL("channel_accept on a plain channel", call5(SYS_CHANNEL_ACCEPT, pr[0], 0, 0, 0, 0));
         MUST_FAIL("shared_map of a channel", call5(SYS_SHARED_MAP, pr[0], 4096, N_MEMORY_READ, 0, 0));
         call5(SYS_CHANNEL_SEND, pr[0], (long)(uintptr_t)buf, 1, pr[0], 0); /* a channel end attached to itself: no verdict, must not hang */
         n_handle_close(pr[0]);

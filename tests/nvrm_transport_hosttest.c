@@ -27,10 +27,8 @@ static struct nvrm_message *incoming, *outgoing;
 static size_t incoming_bytes, outgoing_bytes;
 static struct client server;
 static uint8_t shared_page[N_PAGE_SIZE];
-static char connected_name[NVRM_CHANNEL_NAME_BYTES];
-static char listened_name[NVRM_CHANNEL_NAME_BYTES];
-static int listener_calls, watches, listener_closes;
-static bool legacy_busy;
+static char connected_name[NVRM_SERVICE_NAME_BYTES];
+static int watches, listener_closes;
 FILE *stdout; /* The native FILE global is not MinGW's __acrt_iob_func(). */
 int fflush(FILE *stream) { (void)stream; return 0; }
 
@@ -51,7 +49,7 @@ int mtx_init(mtx_t *m, int type) { (void)m; (void)type; return thrd_success; }
 int mtx_lock(mtx_t *m) { (void)m; return thrd_success; }
 int mtx_unlock(mtx_t *m) { (void)m; return thrd_success; }
 void mtx_destroy(mtx_t *m) { (void)m; }
-/* The server here accepts no client (n_channel_accept is never ready), so no client thread runs;
+/* The server here accepts no client (n_connector_accept is never ready), so no client thread runs;
    requests are driven directly on this thread through server_request. */
 static int threads_started, stop_wakes;
 int cnd_init(cnd_t *c) { (void)c; return thrd_success; }
@@ -77,18 +75,12 @@ n_result n_handle_close(n_handle h) {
 }
 n_result n_events_unwatch(n_handle q, uint64_t token) { (void)q; (void)token; return 0; }
 n_result n_memory_release(void *p, size_t bytes) { (void)p; (void)bytes; return 0; }
-n_handle n_channel_connect(const char *name) { snprintf(connected_name, sizeof connected_name, "%s", name); return connect_result; }
-n_handle n_channel_listen(const char *name) {
-    listener_calls++;
-    if (!strcmp(name, NVRM_CHANNEL)) return legacy_busy ? -N_ERR_EXISTS : 30;
-    snprintf(listened_name, sizeof listened_name, "%s", name);
-    return 10;
-}
-n_handle n_channel_accept(n_handle listener) { (void)listener; return -N_ERR_NOT_READY; }
+n_handle n_service_connect(const char *name) { snprintf(connected_name, sizeof connected_name, "%s", name); return connect_result; }
+n_handle n_connector_accept(n_handle connector, char *argument, size_t cap) { (void)connector; (void)argument; (void)cap; return -N_ERR_NOT_READY; }
 n_handle n_events_create(void) { return 20; }
 n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t token) {
     (void)q; (void)interest;
-    CHECK((h == 10 && token == LISTENER_TOKEN) || (h == 30 && token == LEGACY_LISTENER_TOKEN));
+    CHECK(h == 10 && token == CONNECTOR_TOKEN);
     watches++;
     return 0;
 }
@@ -124,7 +116,7 @@ n_result pcilist(struct n_pciinfo *list, int capacity) {
 }
 void *nvrm_rm_file_open(bool admin, uint32_t principal) { CHECK(!admin && principal == sender_app); return &rm_calls; }
 bool nvrm_rm_adapter_ready(void) {
-    return fixture_adapter_ready && (!multi_gpu_ready || strcmp(connected_name, "nocturne.nvidia.rm.0321"));
+    return fixture_adapter_ready && (!multi_gpu_ready || strcmp(connected_name, "gpu:0321"));
 }
 void nvrm_rm_file_close(void *file) { (void)file; }
 /* UVM (uvm_nvrm.h), as the server sees it when nvrm runs no UVM. */
@@ -309,12 +301,12 @@ int main(void) {
        BDF, not the first daemon that wins a shared service-name race. */
     server.file = NULL;
     struct nvrm *connection = nvrm_connect();
-    CHECK(connection && !strcmp(connected_name, "nocturne.nvidia.rm.0321"));
+    CHECK(connection && !strcmp(connected_name, "gpu:0321"));
     CHECK(nvrm_device_ready(connection));
     nvrm_disconnect(connection);
     server.file = NULL; server.arena = NULL; server.arena_handle = -1;
     connection = nvrm_connect_device(N_PCI_TARGET(7, 0, 0));
-    CHECK(connection && !strcmp(connected_name, "nocturne.nvidia.rm.0700"));
+    CHECK(connection && !strcmp(connected_name, "gpu:0700"));
     CHECK(nvrm_device_ready(connection));
     nvrm_disconnect(connection);
     server.file = NULL; server.arena = NULL; server.arena_handle = -1;
@@ -344,13 +336,13 @@ int main(void) {
     override_hello = false;
     multi_gpu_ready = true;
     connection = nvrm_connect();
-    CHECK(connection && !nvrm_device_ready(connection) && !strcmp(connected_name, "nocturne.nvidia.rm.0321"));
+    CHECK(connection && !nvrm_device_ready(connection) && !strcmp(connected_name, "gpu:0321"));
     nvrm_disconnect(connection);
     connection = nvrm_connect_ready();
-    CHECK(connection && nvrm_device_ready(connection) && !strcmp(connected_name, "nocturne.nvidia.rm.0400"));
+    CHECK(connection && nvrm_device_ready(connection) && !strcmp(connected_name, "gpu:0400"));
     nvrm_disconnect(connection);
     connection = NULL;
-    CHECK(nvrm_connect_ready_status(&connection) == 0 && connection && !strcmp(connected_name, "nocturne.nvidia.rm.0400"));
+    CHECK(nvrm_connect_ready_status(&connection) == 0 && connection && !strcmp(connected_name, "gpu:0400"));
     nvrm_disconnect(connection);
     /* Why there is none: the first GPU's reason, not the last one's. */
     fixture_adapter_ready = false;
@@ -397,14 +389,11 @@ int main(void) {
     void *refused;
     CHECK(n_shared_map(42, N_PAGE_SIZE, N_MEMORY_READ_WRITE, &refused) == -N_ERR_DENIED && !refused);
 
-    legacy_busy = true;
-    CHECK(nvrm_serve(N_PCI_TARGET(2, 1, 0)) == -N_ERR_CANCELLED);
-    CHECK(listener_calls == 2 && watches == 1 && listener_closes == 2);
-    CHECK(!strcmp(listened_name, "nocturne.nvidia.rm.0208"));
-    legacy_busy = false;
-    listener_calls = watches = listener_closes = 0;
-    CHECK(nvrm_serve(N_PCI_TARGET(3, 1, 0)) == -N_ERR_CANCELLED);
-    CHECK(listener_calls == 2 && watches == 2 && listener_closes == 3);
+    CHECK(nvrm_serve(10) == -N_ERR_CANCELLED);
+    CHECK(watches == 1 && listener_closes == 1); /* 閉じるのは自分の事象の行列だけ。口は呼ぶ側のもの。 */
+    watches = listener_closes = 0;
+    CHECK(nvrm_serve(10) == -N_ERR_CANCELLED);
+    CHECK(watches == 1 && listener_closes == 1);
     CHECK(stop_wakes == 2 && threads_started == 0); /* the end is announced to client threads */
     printf("nvrm_transport_hosttest: %d failed (channel/RM fixtures; no GPU execution)\n", failures);
     return failures != 0;

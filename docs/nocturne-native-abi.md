@@ -205,10 +205,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - チャンネルは**メッセージ単位**の双方向路。一回の送信が一つのメッセージになり、
   受信側は境界を保ったまま受け取る。大きな塊は共有ページを添付して送る。
 - `n_channel_pair(n_handle out[2])`：無名の対。
-- 名前付きの合流点：`n_channel_listen(key)` が鍵を（ハンドルが閉じるまで）占有し、
-  `n_channel_connect(key)` はメッセージチャンネルの片端を返す。もう一端は合流点で
-  待ち（`N_EVENT_RECEIVABLE`）、`n_channel_accept(listener)` で受け取る（無ければ
-  `N_ERR_NOT_READY`）。合流点が閉じると、待っている接続も閉じる。
+- 名前のある相手へは `n_service_connect(name)`（§13）。親と子の私的な道は接続の口（`n_connector_connect`、`n_connector_accept`、§13）。
 - `n_channel_send(h, data, n, attach)`、`n_channel_receive(h, buf, cap, flags, &attached)`。
   - 流量制御：受け手が未だ受け取っていない量が1MiBに達している間、送信は待つ
     （`N_EVENT_SENDABLE` で送れることを知れる）。空の待ち行列へは大きさに関係なく送れる。
@@ -259,7 +256,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   最初の受け取りの時に輪が持つ一番古い記録から始まる。各行の頭は `[秒.マイクロ秒 CPU:task] `
   （重さが情報でなければ task の後に ` E`・` W`・` D`）。読む前に上書きされた分は、その所に
   `[log: … bytes …]` の一行で言う。`N_CHANNEL_WAIT` は新しい記録が来るまで待つ。
-  `n_system_log(buf, cap)` は最新のログを読む。C: への保存は init の仕事
+  `n_system_log(buf, cap)` は最新のログを読む。C: への保存はサービス `systemlog` の仕事
   （`AppData\Nocturne\System.log`、前の起動の分は `System-previous.log`）。
 
 ## 5. アプリ
@@ -1182,3 +1179,30 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   名前の配列を受け取る。`"screen"` は `desktop.get()`・`desktop.modes()` が報告するもの（画面の
   見張り）、`"sound"` は `desktop.sound()` が報告するもの（音の見張り）。`ScreenModes.chosen` が
   モニターに選んだモード。
+
+## 13. 身元、能力、サービス、利用者、セッション
+
+型は `common/authority_abi.h` と `common/services_abi.h`。libc の口は `nocturne_services.h`。
+
+- 身元：`struct n_identity`（利用者、セッション、級、プログラムの番号）はカーネルが持ち、アプリは書けない。
+  `n_identity_self` が自分の身元を、`n_channel_peer` が channel の相手の身元を返す。
+  子は親の身元を継ぐ。別の身元で起こすには `n_launch.identity` と、`identity_cap` の `N_CAP_IDENTITY_GRANT` が要る。
+- 能力：特権は handle で持つ。カーネルは最初のプロセスだけに `N_CAP_ROOT` を渡す（handle `N_ROOT_CAP_HANDLE`）。
+  `n_cap_derive` が切り出す。能力は channel の添付で運ぶ。
+- サービスの管理者：`C:\Nocturne\System\services`（`user/apps/services.c`）。カーネルが起こす最初のプロセス。
+  宣言は C の型のある表 `declared[]` で、プログラムに組み込む。項目は名前、プログラム、級、範囲（機械、セッション、PCI の機能）、
+  渡す能力、依存、失敗の扱い（起こし直す回数、間隔、健康とみなす時間）、接続してよい相手。
+  依存は表から解き、準備は相手の `N_SERVICE_CTL_READY` で知る。
+- 接続：`n_service_connect("名前")` か `n_service_connect("名前:引数")`。カーネルは新しい channel を作り、片端を呼ぶ者へ返し、
+  もう片端を `struct n_service_request` の添付で管理者へ送る。管理者は `SYS_CHANNEL_PEER` の身元を宣言に照らし、相手を起こして渡す。
+  宣言に無い相手の要求は channel を閉じる。呼ぶ側には `N_ERR_CLOSED` が見える。
+- サービスの側：handle `N_SERVICE_HANDLE_CONTROL` が管理者との channel。`n_service_begin` で能力を受け、`n_service_ready` で準備を知らせ、
+  `n_connector_accept` で相手を受ける。止める指示は `N_ERR_CANCELLED` で分かる。
+- 接続の口：channel の一通が新しい channel の片端を運ぶ。`n_connector_connect` が送り、`n_connector_accept` が受ける。
+  名前を通らないので、親と子の私的な道にも使う（ブラウザーと `webfetch`）。
+- 管理者の口：`n_service_connect("services")` の記録は `struct n_services_request` と `struct n_service_status`。
+  一覧、状態、起こし直し、止める、見張る。起こし直しと止めるは `N_CLASS_ADMIN` 以上。
+- 利用者：サービス `accounts`。私的な領域に型のある記録で一覧を持つ。合言葉は salt つきの PBKDF2-HMAC-SHA256。
+  一人目は誰が作っても admin。`n_user_folder` と `n_temp_folder` は身元から `accounts` が引く。新しい利用者のフォルダーの中身の元は `C:\Nocturne\NewUser`。
+- セッション：サービス `session`。ログインの窓を出し、選ばれた利用者の身元で `C:\Nocturne\System\desktop` を起こす。
+  `gui_launch` はセッションのデスクトップが起こし、子は利用者の身元を継ぐ。窓の管理者のメニューとアイコンは `SYS_DESKTOP_ATTACH` の channel で同じ依頼を送る。

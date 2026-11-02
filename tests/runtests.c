@@ -1,5 +1,5 @@
 /* runtests: Nocturne's in-OS test suite. scripts/test.py puts tests/ in C:\Tests on its own copy
-   of the built disk; init runs C:\Tests\autorun.sh at boot, which builds this runner with tcc and
+   of the built disk; the tests service runs C:\Tests\autorun.sh at boot, which builds this runner with tcc and
    runs it. Each test is "sh -c" in the folder <TEMP>\runtests (the TEMP setting, emptied at every
    start), so the documents a test makes by a relative name go there.
    Output goes to the system log (the serial port), one line per test:
@@ -73,7 +73,7 @@ static const struct test tests[] = {
 
     /* command-line tools */
     {"tools", "ls", "ls C:\\Nocturne\\System", 0, {"tcc", "sh", "fetch"}},
-    {"tools", "ps", "ps", 0, {"init", "runtests"}},
+    {"tools", "ps", "ps", 0, {"services", "runtests"}},
     {"tools", "uname", "uname", 0, {"Nocturne"}},
     {"tools", "wc", "echo one two three | wc", 0, {"3"}},
     {"tools", "head", "head -n 2 C:\\Nocturne\\Agent\\system.md | wc", 0, {"2"}},

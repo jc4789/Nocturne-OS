@@ -1,6 +1,7 @@
 /* Nocturne kernel <-> userland ABI: syscall numbers and shared structures. */
 #pragma once
 #include <stdint.h>
+#include "authority_abi.h"
 /* x86-64 native mapping granule: n_memory and shared pages come in these. */
 #define N_PAGE_SIZE 4096ULL
 
@@ -147,7 +148,15 @@ enum {
     SYS_WATCH_TAKE = 207,     /* (watch): the changes since its last take (0: none) */
     SYS_ENTRY_WATCH,          /* (path, N_WATCH_NAME or N_WATCH_FOLDER): a watch on C: (§3) */
     SYS_AUDIO_OUTPUT_WATCH,   /* (): a watch on what SYS_AUDIO_OUTPUT reports (§9) */
-    SYS_MAX = 210          /* above every number (what syscallfuzz tries) */
+    SYS_IDENTITY_SELF,        /* (struct n_identity *out) */
+    SYS_CHANNEL_PEER,         /* (channel, struct n_identity *out) */
+    SYS_CAP_DERIVE,           /* (cap, enum n_cap) -> handle */
+    SYS_SERVICE_REGISTER,     /* (N_CAP_SERVICE_ROOT の cap) -> 接続の要求を受ける channel */
+    SYS_SERVICE_CONNECT,      /* (name, name_len) -> channel */
+    SYS_STORE_PRIVATE_OPEN,   /* (N_CAP_STORE_PRIVATE の cap, region, ...) -> document */
+    SYS_SETTINGS_APPLY,       /* (N_CAP_SETTINGS_APPLY の cap, domain, key, value, len) */
+    SYS_DESKTOP_ATTACH,       /* (channel): wm がメニューとアイコンの起動を struct n_session_request でこの channel へ送る */
+    SYS_MAX = 218          /* above every number (what syscallfuzz tries) */
 };
 
 /* ---- native handles ---- */
@@ -171,7 +180,7 @@ enum {
 #define N_WATCH_CHANGES_MAX 0xffffffffu
 
 /* The folders of C: every app and the system know. Apps start in the user's folder, C:\Users\<name>,
-   which the setting USERFOLDER names; its AppData\Temp, emptied at every start, is the setting TEMP. */
+   which the accounts service names by the identity; its AppData\Temp is emptied at every login. */
 #define N_FOLDER_SYSTEM   "C:\\Nocturne\\System"  /* the system's programs */
 #define N_FOLDER_PROGRAMS "C:\\Programs"           /* the apps, each in a folder of its own */
 /* certificate authorities the system trusts besides the roots built into TLS (user/libc/tls.c) */
@@ -226,6 +235,10 @@ struct n_launch {
     const char *const *settings;
     const int32_t *handles;
     uint32_t argument_count, setting_count, handle_count, flags;
+    /* 子の身元。NULL なら親の身元を継ぐ。別の身元には identity_cap の N_CAP_IDENTITY_GRANT が要る。 */
+    const struct n_identity *identity;
+    int32_t identity_cap;
+    uint32_t reserved;
 };
 /* The most bytes a launch's argument and setting strings (each with its nul) and their two
    null-terminated pointer arrays (8 bytes a pointer) may take: N_ERR_TOO_MANY_ARGUMENTS past it. */

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
+#include "testrun.h"
 
 static int failed;
 #define CHECK(c, ...)                                                                                                  \
@@ -30,7 +31,7 @@ int main(void) {
         return 1;
     }
     struct n_pciinfo *e = &list[at];
-    n_handle pci = n_pci_claim(e->bus, e->dev, e->func);
+    n_handle pci = test_pci_claim(e->bus, e->dev, e->func);
     CHECK(pci >= 0, "claim: %s (boot with appdrivers=any)", n_result_text(pci));
     if (pci < 0) {
         printf("nvrmtest: %d failed\n", failed);
@@ -65,7 +66,7 @@ int main(void) {
     CHECK(got >= 0 && !strstr(text, "rm_init_rm failed"), "rm_init_rm succeeded");
 
     /* the claim ends with nvrm: the device can be claimed again */
-    n_handle again = n_pci_claim(e->bus, e->dev, e->func);
+    n_handle again = test_pci_claim(e->bus, e->dev, e->func);
     CHECK(again >= 0, "claim after nvrm ended: %s", n_result_text(again));
     if (again >= 0) n_handle_close(again);
 

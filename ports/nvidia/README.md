@@ -48,16 +48,15 @@ RM は `nv_acpi_methods_init`／`_uninit` を `rm_init_adapter`／`rm_shutdown_a
 ロックを持ったまま呼び、`rm_acpi_notify` は同じロックを取るので、そこでスレッドを join するとデッドロックしうる。
 そのため受取りスレッドの開始と join は `nvrm.c` が RM のロックの外で行い、`nv_acpi_methods_init`／`_uninit` は
 RM の取決めどおりメソッドの準備と片付けだけをする。
-init／libnvrm／NVK は共通の PCI 選別条件（NVIDIA、VGA または 3D、progif 0）を使う。
+サービスの管理者（`user/apps/services.c` の `gpu` の項目）／libnvrm／NVK は共通の PCI 選別条件（NVIDIA、VGA または 3D、progif 0）を使う。
 NVK は生の PCI 件数を GPU 数にせず、HELLO で adapter 初期化成功を確認し、接続先 RM の probed ID と PCI 情報が一致する BDF の動的 snapshot を列挙する。probed ID だけでは初期化成功を保証しない。
 
-装置ごとに `nocturne.nvidia.rm.<N_PCI_TARGETの4桁16進数>` を公開する。
+装置ごとにサービスの実例 `gpu:<N_PCI_TARGETの4桁16進数>` がある。nvrm は引数の機能を `N_CAP_PCI_CLAIM` で claim し、相手の channel をサービスの接続の口で受ける。
 `nvrm_connect_device()` は指定装置へ、従来の `nvrm_connect()` は動的 PCI 列挙から最初に接続可能な装置へつなぐ。
 描画側の `nvrm_connect_ready()` は診断専用の未初期化装置を飛ばし、後続の ready 装置も探す。旧 HELLO の echo を ready と誤認しない。
 `nvrm_connect_ready_status()` は同じ探索で、使える装置が無い理由も返す（nvrm がどの GPU も出していない `N_ERR_NOT_FOUND`、
 最初の GPU が答えたが ready でない `N_ERR_NOT_READY`、または最初の GPU へつなげなかった理由）。Mesa の GL はこれで
 softpipe へ後退した理由をシステムの記録へ書く。
-従来名 `nocturne.nvidia.rm` は一つの daemon だけが既存アプリ用 alias として公開する。
 Protocol1 の48byte header と field offset は維持し、通常応答で未使用だった hello 用領域へ
 RM 戻り値と map access を格納する。旧バイナリーにも RM 関数失敗を負の status で通知する。
 RM が引数を更新してからエラーを返した場合も、有効な応答の引数と arena 内の結果を呼出し元へ返す。

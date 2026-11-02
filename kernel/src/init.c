@@ -27,7 +27,7 @@ void ahci_init(void);
 void net_init(void);
 void nvme_init(void);
 
-#define INIT_PATH N_FOLDER_SYSTEM "\\init"
+#define INIT_PATH N_FOLDER_SYSTEM "\\services"
 
 void kmain_late(void) {
     entropy_init();

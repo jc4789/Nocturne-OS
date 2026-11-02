@@ -25,6 +25,8 @@ struct nvrm *nvrm_connect_device(uint32_t pci_target);
 /* 0 with *out set; otherwise a negative native N_ERR_* result. In particular,
    endpoint absence is not confused with OOM or an invalid protocol reply. */
 int64_t nvrm_connect_device_status(uint32_t pci_target, struct nvrm **out);
+/* 既にある channel の上で HELLO をする。channel は nvrm のものになる。 */
+int64_t nvrm_connect_channel(n_handle channel, struct nvrm **out);
 /* Adapter state confirmed by this connection's HELLO snapshot. The daemon
    starts serving only after adapter initialization finishes. False includes a
    diagnostic-only daemon and old servers that do not explicitly report state. */

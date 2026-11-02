@@ -91,14 +91,6 @@ n_result n_channel_receive(n_handle h, void *buf, size_t cap, int flags, n_handl
    of one app agree, including across connections or transferred endpoints.
    message is required. Peek reports credentials without taking an attachment. */
 n_result n_channel_receive_from(n_handle h, void *buf, size_t cap, int flags, struct n_channel_message *message);
-/* Named rendezvous, not a folder or network name: the key bytes are matched in
-   full, so callers put their own identity into it. listen owns the key until
-   its handle closes (N_ERR_EXISTS meanwhile); connect gives a message channel
-   whose other end waits in the listener (N_EVENT_RECEIVABLE) for accept, which
-   without one gives N_ERR_NOT_READY. A listener that closes closes them too. */
-n_handle n_channel_listen(const char *key);
-n_handle n_channel_connect(const char *key);
-n_handle n_channel_accept(n_handle listener);
 /* Apps: the handle reports the end (N_EVENT_APP_ENDED); there is no zombie to reap. */
 n_handle n_app_launch(const char *path, const struct n_launch *launch);
 n_result n_app_result(n_handle app, uint64_t deadline, int *status); /* a past deadline polls: N_ERR_NOT_READY */
@@ -116,7 +108,7 @@ n_result n_app_id(n_handle app); /* its identifier, also after its end (identifi
    last handle closes, which also turns the function's interrupts off. Isolation is required
    unless appdrivers-unisolated was explicitly selected at boot. A device left active needs
    recovery; n_pci_info reports N_PCI_NEEDS_RECOVERY if generic FLR was not possible. */
-n_handle n_pci_claim(uint8_t bus, uint8_t dev, uint8_t func);
+n_handle n_pci_claim(n_handle cap, uint8_t bus, uint8_t dev, uint8_t func); /* cap：N_CAP_PCI_CLAIM */
 n_result n_pci_info(n_handle pci, struct n_pci_function *out);
 /* Config space: width 1, 2 or 4 at an offset below 4096 aligned to it. Reads may name another
    function (N_PCI_TARGET, e.g. the upstream bridge) or N_PCI_SELF; writes only reach the
@@ -330,7 +322,7 @@ n_result n_path_from_url(const char *url, char *out, size_t cap);
 /* The file: URL of a path, made complete first (n_path_join): C:\Users\User\a b.html is
    file:///C:/Users/User/a%20b.html. Returns the length, or N_ERR_TOO_LARGE. */
 n_result n_path_to_url(const char *path, char *out, size_t cap);
-/* The user's folder (the launch setting USERFOLDER) and temporary folder (TEMP); "C:\" without them. */
+/* このプロセスの利用者のフォルダーと一時フォルダー（身元から accounts が引く）。システムの身元は "C:\"。 */
 const char *n_user_folder(void);
 const char *n_temp_folder(void);
 /* The folder an app keeps its data in, <user's folder>\AppData\<name>, made when missing.

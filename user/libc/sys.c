@@ -334,15 +334,6 @@ n_result n_folder_entries(const char *path, struct n_entry **out) {
     return (n_result)n;
 }
 n_result n_channel_pair(n_handle out[2]) { return NC5(SYS_CHANNEL_PAIR, out, 0, 0, 0, 0); }
-n_handle n_channel_listen(const char *key) {
-    if (!key || !*key) return -N_ERR_INVALID;
-    return (n_handle)NC5(SYS_CHANNEL_LISTEN, key, strlen(key), 0, 0, 0);
-}
-n_handle n_channel_connect(const char *key) {
-    if (!key || !*key) return -N_ERR_INVALID;
-    return (n_handle)NC5(SYS_CHANNEL_CONNECT, key, strlen(key), 0, 0, 0);
-}
-n_handle n_channel_accept(n_handle listener) { return (n_handle)NC5(SYS_CHANNEL_ACCEPT, listener, 0, 0, 0, 0); }
 n_result n_channel_send(n_handle h, const void *data, size_t n, n_handle attach) {
     return NC5(SYS_CHANNEL_SEND, h, data, n, attach, 0);
 }
@@ -352,7 +343,7 @@ n_result n_channel_receive(n_handle h, void *buf, size_t cap, int flags, n_handl
 n_result n_channel_receive_from(n_handle h, void *buf, size_t cap, int flags, struct n_channel_message *message) {
     return NC5(SYS_CHANNEL_RECEIVE_FROM, h, buf, cap, flags, message);
 }
-static n_handle launch_program(const char *path, const struct n_launch *launch) {
+n_handle n_app_launch(const char *path, const struct n_launch *launch) {
     n_handle app = (n_handle)NC5(SYS_APP_LAUNCH, path, launch, 0, 0, 0);
     if (app != -N_ERR_NOT_PROGRAM || !launch) return app;
     /* a script: its interpreter runs it, with the script's name before the rest */
@@ -373,44 +364,6 @@ static n_handle launch_program(const char *path, const struct n_launch *launch) 
     return app;
 }
 
-/* Whether the launch gives the setting name ("NAME=..."). */
-static bool launch_gives(const struct n_launch *l, const char *name) {
-    size_t n = strlen(name);
-    for (uint32_t i = 0; i < l->setting_count; i++)
-        if (l->settings[i] && !strncmp(l->settings[i], name, n) && l->settings[i][n] == '=') return true;
-    return false;
-}
-
-n_handle n_app_launch(const char *path, const struct n_launch *launch) {
-    if (!launch) return launch_program(path, launch);
-    /* A child works for this app's user: it gets this app's USERFOLDER and TEMP unless the launch
-       names its own (the kernel gives the system's to an app launched without them). */
-    static const char *const user[] = {"USERFOLDER", "TEMP"};
-    char *own[2] = {0};
-    const char **settings = NULL;
-    uint32_t owned = 0;
-    struct n_launch l = *launch;
-    n_handle app = -N_ERR_NO_MEMORY;
-    for (int i = 0; i < 2; i++) {
-        const char *v = getenv(user[i]);
-        if (!v || launch_gives(launch, user[i])) continue;
-        size_t n = strlen(user[i]) + strlen(v) + 2;
-        if (!(own[owned] = malloc(n))) goto out;
-        snprintf(own[owned++], n, "%s=%s", user[i], v);
-    }
-    if (owned) {
-        if (!(settings = malloc((launch->setting_count + owned) * sizeof *settings))) goto out;
-        for (uint32_t i = 0; i < launch->setting_count; i++) settings[i] = launch->settings[i];
-        for (uint32_t i = 0; i < owned; i++) settings[launch->setting_count + i] = own[i];
-        l.settings = settings;
-        l.setting_count += owned;
-    }
-    app = launch_program(path, &l);
-out:
-    free(settings);
-    for (uint32_t i = 0; i < owned; i++) free(own[i]);
-    return app;
-}
 n_result n_app_result(n_handle app, uint64_t deadline, int *status) {
     return NC5(SYS_APP_RESULT, app, deadline, status, 0, 0);
 }
@@ -422,7 +375,7 @@ n_result n_system_log(char *buf, size_t cap) { return NC5(SYS_SYSTEM_LOG, buf, c
 n_handle n_system_log_open(void) { return (n_handle)NC5(SYS_SYSTEM_LOG_OPEN, 0, 0, 0, 0, 0); }
 n_handle n_app_open(int64_t id) { return (n_handle)NC5(SYS_APP_OPEN, id, 0, 0, 0, 0); }
 n_result n_app_id(n_handle app) { return NC5(SYS_APP_ID, app, 0, 0, 0, 0); }
-n_handle n_pci_claim(uint8_t bus, uint8_t dev, uint8_t func) { return (n_handle)NC5(SYS_PCI_CLAIM, bus, dev, func, 0, 0); }
+n_handle n_pci_claim(n_handle cap, uint8_t bus, uint8_t dev, uint8_t func) { return (n_handle)NC5(SYS_PCI_CLAIM, bus, dev, func, cap, 0); }
 n_result n_pci_info(n_handle pci, struct n_pci_function *out) { return NC5(SYS_PCI_INFO, pci, out, 0, 0, 0); }
 n_result n_pci_config_read(n_handle pci, uint32_t target, uint32_t offset, uint32_t width) {
     return NC5(SYS_PCI_CONFIG_READ, pci, target, offset, width, 0);
@@ -773,14 +726,6 @@ n_result n_path_to_url(const char *path, char *out, size_t cap) {
     out[used] = 0;
     return (n_result)used;
 }
-
-static const char *complete_setting(const char *name) {
-    const char *s = getenv(name);
-    return s && n_path_is_complete(s) ? s : "C:\\";
-}
-
-const char *n_user_folder(void) { return complete_setting("USERFOLDER"); }
-const char *n_temp_folder(void) { return complete_setting("TEMP"); }
 
 static n_result folder_ready(const char *path) {
     n_result r = n_folder_create(path);
