@@ -236,14 +236,24 @@ struct n_channel_message {
     uint64_t sender_app;
 };
 
-/* n_app_launch. Handle i of the new app is handles[i] of the launcher (-1:
-   none); by convention 0 is its input, 1 its output and 2 its log. Settings
-   are "NAME=value" strings that ISO C getenv reads. */
+/* n_app_launch. 新しいアプリの handle i は起動元の handles[i]（-1 は無し）。慣例で 0 が入力、
+   1 が出力、2 がログ。起動の属性は型のある欄で渡す：
+     folder       今のフォルダー（NULL は起動元の今のフォルダー。起動元も持たなければ子も持たず、
+                  子は身元の利用者のフォルダーで始まる）。
+     terminals    端末へつながる handle の番号。
+     interrupts   端末の Ctrl+C の知らせを受ける channel の handle の番号（0 は無し）。
+   利用者のフォルダーは身元から accounts が引く（n_user_folder）ので渡さない。
+   environment は移植のプログラムのための "NAME=value" の列で、そのプログラムの libc の getenv だけ
+   が読む。システムの部品はこれを読まず、これで組まない。 */
 struct n_launch {
     const char *const *arguments;
-    const char *const *settings;
+    const char *const *environment;
     const int32_t *handles;
-    uint32_t argument_count, setting_count, handle_count, flags;
+    uint32_t argument_count, environment_count, handle_count, flags;
+    const char *folder;
+    const int32_t *terminals;
+    uint32_t terminal_count;
+    int32_t interrupts;
     /* 子の身元。NULL：親と同じ。cls は親を超えられない。user・session・program を親と変えるには、
        identity_grant に N_CAP_IDENTITY_GRANT の handle を渡す。identity が NULL なら読まない。
        能力は handles の列で渡す（子は SYS_CAP_FIND で引く）。 */
@@ -251,7 +261,16 @@ struct n_launch {
     int32_t identity_grant;
     uint32_t reserved;
 };
-/* The most bytes a launch's argument and setting strings (each with its nul) and their two
+/* アプリの入口の第三引数。カーネルが n_launch の欄を新しいアプリの stack に写したもの。文字列と
+   配列は同じ stack にある。folder は完全なパスか NULL。 */
+struct n_start {
+    char *const *environment; /* NULL で終わる */
+    const char *folder;
+    const int32_t *terminals;
+    uint32_t terminal_count;
+    int32_t interrupts;
+};
+/* The most bytes a launch's argument and environment strings (each with its nul) and their two
    null-terminated pointer arrays (8 bytes a pointer) may take: N_ERR_TOO_MANY_ARGUMENTS past it. */
 #define N_LAUNCH_MAX_BYTES (4ULL << 20)
 #define N_APP_STOP_TREE 1  /* n_app_stop: also stop every app it launched */

@@ -32,14 +32,12 @@ int main(void) {
     struct n_entry e;
     if (n_entry_info(AUTORUN, &e) >= 0) {
         n_handle log = n_system_log_open();
-        char folder[sizeof "FOLDER=" + N_ACCOUNT_FOLDER_MAX];
-        snprintf(folder, sizeof folder, "FOLDER=%s", reply.account.folder);
-        const char *arguments[2] = {"sh", AUTORUN}, *settings[1] = {folder};
+        const char *arguments[2] = {"sh", AUTORUN};
         int32_t handles[3 + N_CAP_COUNT] = {-1, log, log};
         size_t caps = n_caps_list(handles + 3);
         struct n_identity identity = {.user = reply.account.user, .cls = reply.account.cls};
-        struct n_launch launch = {.arguments = arguments, .settings = settings, .handles = handles, .argument_count = 2,
-                                  .setting_count = 1, .handle_count = (uint32_t)(3 + caps), .identity = &identity,
+        struct n_launch launch = {.arguments = arguments, .handles = handles, .argument_count = 2,
+                                  .handle_count = (uint32_t)(3 + caps), .folder = reply.account.folder, .identity = &identity,
                                   .identity_grant = n_cap_find(N_CAP_IDENTITY_GRANT)};
         n_handle app = n_app_launch(SH, &launch);
         if (log >= 0) n_handle_close(log);

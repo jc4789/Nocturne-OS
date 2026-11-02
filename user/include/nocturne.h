@@ -335,18 +335,16 @@ uint64_t n_clock_after(uint64_t ns); /* the deadline ns from now (N_CLOCK_NEVER 
 uint64_t n_app_cpu_ns(void); /* the CPU time this app's threads have used, ended ones too (SYS_APP_CPU_TIME) */
 void n_sleep_until(uint64_t deadline);
 n_result n_random(void *buf, size_t n); /* n bytes from the system entropy pool */
-/* The launch settings ("name=value"), NULL-terminated. */
-extern char *const *n_settings;
 /* Whether path is complete: "C:\...", "\..." or "/...". "C:" and "C:a" are not: they are in the
    current folder, like "a". */
 bool n_path_is_complete(const char *path);
 /* name taken inside folder (a complete path; the root when it is not one), written as "C:\a\b"
    with "." and ".." resolved. A complete name stands alone. Returns the length, or N_ERR_TOO_LARGE. */
 n_result n_path_join(const char *folder, const char *name, char *out, size_t cap);
-/* A complete path for a name the user typed: n_path_join inside the launch setting FOLDER (the
-   launcher's current folder, "C:\" if it gave none). */
+/* A complete path for a name the user typed: n_path_join inside the current folder (n_folder). */
 n_result n_path_complete(const char *name, char *out, size_t cap);
-n_result n_folder_set(const char *name); /* this app's FOLDER; N_ERR_NOT_FOLDER if it is not one */
+const char *n_folder(void); /* このアプリの今のフォルダー。完全なパス。 */
+n_result n_folder_set(const char *name); /* 今のフォルダーを変える。N_ERR_NOT_FOLDER if it is not one */
 /* The last name of path, inside it ("" for the root). */
 const char *n_path_name(const char *path);
 /* The complete path a file: URL names: "file:///C:/Users/User/a%20b.html" is C:\Users\User\a b.html,
@@ -364,9 +362,12 @@ const char *n_temp_folder(void);
 /* The folder an app keeps its data in, <user's folder>\AppData\<name>, made when missing.
    Returns the length of the path written to out. */
 n_result n_app_data_folder(const char *name, char *out, size_t cap);
-/* Whether handle h reaches a terminal: the launcher names such handles in the
-   setting TERMINAL, e.g. "0 1 2". */
+/* Whether handle h reaches a terminal (struct n_start の terminals). */
 bool n_terminal(n_handle h);
+/* 端末の Ctrl+C の知らせを受ける channel（struct n_start の interrupts）。無ければ -N_ERR_NOT_FOUND。 */
+n_handle n_interrupts(void);
+/* The environment of this launch (struct n_start), ended by NULL: for ported programs. */
+extern char *const *__libc_environment;
 
 /* The count of processes and threads (at most max written), or a negative n_result. */
 n_result proclist(struct n_procinfo *out, int max);

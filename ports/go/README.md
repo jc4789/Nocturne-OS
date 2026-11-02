@@ -29,7 +29,7 @@ Nocturne は UNIX でも POSIX でもないので、Go 側を Nocturne の API �
   `syscall` パッケージは Nocturne の API そのもの
   （`DocumentOpen`、`DocumentReadAt`、`FolderList`、`ChannelSend`、`AppLaunch` 等）を出し、
   標準ライブラリーが使う `ENOENT` 等の名前は Nocturne の結果コードの別名です。
-- **起動**：ELF（ET_EXEC、0x400000 から）。カーネルが渡す設定（`rdx`）を環境として読みます。
+- **起動**：ELF（ET_EXEC、0x400000 から）。カーネルが渡す `struct n_start`（`rdx`）から環境と起動の属性を読みます。
 - **スレッド**：`SYS_THREAD_CREATE` のスタック（カーネルが確保）を g0 に使い、TLS は
   `WRFSBASE` で FS の基底を直に書く。ロックは `SYS_WAIT_ADDRESS`／`SYS_WAKE_ADDRESS`。
 - **メモリー**：需要ゼロの共有領域（`SYS_SHARED_RESERVE`＋`SYS_SHARED_MAP`）。アドレスは

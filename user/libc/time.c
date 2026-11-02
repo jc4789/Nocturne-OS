@@ -1,10 +1,12 @@
 #include <time.h>
 #include "nocturne.h"
+#include "nocturne_settings.h"
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <threads.h>
 #include <wchar.h>
 
 static bool is_leap(long long y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
@@ -34,8 +36,8 @@ static long long civil_from_days(long long days, int *month, int *mday) {
     return year_of_era + era * 400 + (*month <= 2);
 }
 
-/* The clock keeps local time and no time zone is known, so a time_t is broken down the same
-   whether it is called UTC or local. A year that tm_year cannot hold is EOVERFLOW. */
+/* A time_t is broken down as it is here; local time adds the zone below. A year that tm_year cannot
+   hold is EOVERFLOW. */
 struct tm *gmtime_r(const time_t *tp, struct tm *tm) {
     long long days = *tp / 86400, rem = *tp % 86400;
     if (rem < 0) {
@@ -59,14 +61,48 @@ struct tm *gmtime_r(const time_t *tp, struct tm *tm) {
     tm->tm_isdst = 0;
     return tm;
 }
-struct tm *localtime_r(const time_t *tp, struct tm *tm) { return gmtime_r(tp, tm); }
+
+/* The zone is the user's setting N_TIME_ZONE_MINUTES. A watch keeps it current without asking the
+   service on every call. Without the service the zone is 0. */
+static once_flag zone_once = ONCE_FLAG_INIT;
+static n_handle zone_watch = -1;
+static volatile int32_t zone_minutes;
+
+static void zone_read(void) {
+    int32_t minutes;
+    if (n_setting_get_int(n_setting_at(N_DOMAIN_TIME, N_TIME_ZONE_MINUTES), &minutes) >= 0)
+        __atomic_store_n(&zone_minutes, minutes, __ATOMIC_RELAXED);
+}
+static void zone_start(void) {
+    zone_watch = n_setting_watch(N_DOMAIN_TIME, N_TIME_ZONE_MINUTES);
+    if (zone_watch >= 0) zone_read();
+}
+static long long zone_seconds(void) {
+    call_once(&zone_once, zone_start);
+    if (zone_watch >= 0) {
+        struct n_settings_changed heard;
+        bool changed = false;
+        while (n_setting_watch_take(zone_watch, &heard) >= 0) changed = true;
+        if (changed) zone_read();
+    }
+    return __atomic_load_n(&zone_minutes, __ATOMIC_RELAXED) * 60LL;
+}
+
+struct tm *localtime_r(const time_t *tp, struct tm *tm) {
+    time_t shifted;
+    if (__builtin_add_overflow(*tp, zone_seconds(), &shifted)) {
+        errno = EOVERFLOW;
+        return NULL;
+    }
+    return gmtime_r(&shifted, tm);
+}
 
 /* ISO C: one buffer shared by gmtime and localtime, which the next call of either reuses. */
 static struct tm broken_down;
 struct tm *gmtime(const time_t *tp) { return gmtime_r(tp, &broken_down); }
 struct tm *localtime(const time_t *tp) { return localtime_r(tp, &broken_down); }
 
-/* ISO C: the fields may lie outside their ranges; the result is normalized
+/* ISO C: the fields are local time and may lie outside their ranges; the result is normalized
    into tm, with tm_wday and tm_yday set. (time_t)-1 when the time does not fit. */
 time_t mktime(struct tm *tm) {
     long long mon = tm->tm_mon, year = tm->tm_year + 1900LL + mon / 12;
@@ -78,7 +114,8 @@ time_t mktime(struct tm *tm) {
     long long days = days_from_civil(year, (int)mon + 1) + tm->tm_mday - 1;
     time_t t;
     if (__builtin_mul_overflow(days, 86400LL, &t) ||
-        __builtin_add_overflow(t, tm->tm_hour * 3600LL + tm->tm_min * 60LL + tm->tm_sec, &t) || !localtime_r(&t, tm))
+        __builtin_add_overflow(t, tm->tm_hour * 3600LL + tm->tm_min * 60LL + tm->tm_sec, &t) || !gmtime_r(&t, tm) ||
+        __builtin_sub_overflow(t, zone_seconds(), &t))
         return (time_t)-1;
     return t;
 }

@@ -9,6 +9,7 @@
 #include <threads.h>
 #include "nocturne.h"
 #include "nocturne_services.h"
+#include "nocturne_settings.h"
 #include "ui.h"
 
 #define SHELL N_FOLDER_SYSTEM "\\sh"
@@ -91,12 +92,12 @@ static void desktop_session(const struct n_identity *identity) {
 }
 
 static void shell_session(const struct n_identity *identity, const struct n_account *a) {
-    char folder[sizeof "FOLDER=" + N_ACCOUNT_FOLDER_MAX];
-    snprintf(folder, sizeof folder, "FOLDER=%s", a->folder);
-    const char *arguments[1] = {"sh"}, *settings[2] = {folder, "TERMINAL=0 1 2"};
+    static const int32_t terminals[] = {0, 1, 2};
+    const char *arguments[1] = {"sh"};
     int32_t handles[3] = {0, 1, 2};
-    struct n_launch launch = {.arguments = arguments, .settings = settings, .handles = handles, .argument_count = 1,
-                              .setting_count = n_terminal(1) ? 2 : 1, .handle_count = 3, .identity = identity, .identity_grant = grant_cap};
+    struct n_launch launch = {.arguments = arguments, .handles = handles, .argument_count = 1, .handle_count = 3,
+                              .folder = a->folder, .terminals = terminals, .terminal_count = n_terminal(1) ? 3 : 0,
+                              .identity = identity, .identity_grant = grant_cap};
     n_handle app = n_app_launch(SHELL, &launch);
     if (app < 0) {
         printf("session: cannot start " SHELL " (%s)\n", n_result_text(app));
@@ -130,6 +131,12 @@ static void session_run(const struct n_account *a, bool windows) {
     mtx_lock(&current_lock);
     current.session = identity.session;
     mtx_unlock(&current_lock);
+    /* その人の利用者の値を効かせる。設定が届かなくても入れる：既定の値で動く。 */
+    r = n_setting_session(a->user);
+    if (r < 0) {
+        printf("session: %s's settings are not applied (%s)\n", a->name, n_result_text(r));
+        fflush(stdout);
+    }
     if (windows) desktop_session(&identity);
     else shell_session(&identity, a);
     mtx_lock(&current_lock);

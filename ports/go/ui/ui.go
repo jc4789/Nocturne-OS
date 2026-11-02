@@ -532,7 +532,7 @@ func start() (*session, error) {
 			sessErr = err
 			return
 		}
-		app, err := syscall.AppLaunch(syscall.FOLDER_SYSTEM+`\uihost`, nil, nil, []int{-1, -1, -1, b})
+		app, err := syscall.AppLaunch(syscall.FOLDER_SYSTEM+`\uihost`, nil, nil, []int{-1, -1, -1, b}, "")
 		syscall.Close(b)
 		if err != nil {
 			syscall.Close(a)

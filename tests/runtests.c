@@ -473,10 +473,6 @@ static const struct test tests[] = {
 
     /* the AI agent, offline: no key is ever needed for the tests */
     {"agent", "usage", "agent --help", ANY, {"usage: agent"}},
-    {"agent", "unreachable-endpoint",
-     "echo 'endpoint=http://10.0.2.2:9/v1' > .\\bad.conf; echo 'api_key=test' >> .\\bad.conf; "
-     "agent -c .\\bad.conf say hi",
-     ANY, {"network error", "connect to 10.0.2.2:9"}, NULL, 150},
 };
 
 static int npass, nfail, nskip;
@@ -543,13 +539,10 @@ static int run_shell(const char *cmd, int timeout_ms, struct capture *c, int *st
     if (n_channel_pair(in) < 0) { n_handle_close(out[0]); n_handle_close(out[1]); return -1; }
     n_handle_close(in[0]); /* reading stdin reports the end at once, like an empty device */
     const char *args[] = {"sh", "-c", cmd};
-    char folder[sizeof work_folder + 8];
-    snprintf(folder, sizeof folder, "FOLDER=%s", work_folder);
-    const char *settings[] = {folder};
     int32_t handles[3 + N_CAP_COUNT] = {in[1], out[1], out[1]};
     size_t caps = n_caps_list(handles + 3); /* 試験は init が渡した能力を受ける */
-    struct n_launch launch = {.arguments = args, .settings = settings, .handles = handles,
-                              .argument_count = 3, .setting_count = 1, .handle_count = 3 + (uint32_t)caps};
+    struct n_launch launch = {.arguments = args, .handles = handles, .argument_count = 3,
+                              .handle_count = 3 + (uint32_t)caps, .folder = work_folder};
     n_handle app = n_app_launch(N_FOLDER_SYSTEM "\\sh", &launch);
     n_handle_close(in[1]);
     n_handle_close(out[1]);

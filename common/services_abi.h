@@ -66,6 +66,7 @@ enum n_accounts_op {
     N_ACCOUNTS_SELF,     /* 相手自身の n_account。システムの身元は N_ERR_NOT_FOUND。 */
     N_ACCOUNTS_CREATE,   /* 一人目は誰が頼んでも admin になる。二人目からは N_CLASS_ADMIN 以上。 */
     N_ACCOUNTS_VERIFY,   /* name と password が合えば、その n_account。N_CLASS_SYSTEM。 */
+    N_ACCOUNTS_SET_CLASS, /* user の級を cls にする。N_CLASS_ADMIN 以上。最後の admin は下げられない。 */
     N_ACCOUNTS_PREPARE,  /* user のフォルダーと一時フォルダーを用意する。N_CLASS_SYSTEM。 */
 };
 struct n_account {

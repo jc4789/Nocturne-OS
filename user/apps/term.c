@@ -469,13 +469,10 @@ int main(int argc, char **argv) {
     }
     char path[1024];
     if (!find_program(prog, path, sizeof path)) strlcpy(path, prog, sizeof path);
-    const char *f = getenv("FOLDER");
-    char folder[4104];
-    snprintf(folder, sizeof folder, "FOLDER=%s", f && n_path_is_complete(f) ? f : n_user_folder());
-    const char *settings[] = {folder, "TERMINAL=0 1 2", "INTERRUPTS=3"};
+    static const int32_t terminals[] = {0, 1, 2};
     int32_t handles[4] = {input[1], output[1], output[1], intr[1]};
-    struct n_launch l = {.arguments = args, .settings = settings, .handles = handles, .argument_count = nargs,
-                         .setting_count = 3, .handle_count = 4};
+    struct n_launch l = {.arguments = args, .handles = handles, .argument_count = nargs, .handle_count = 4,
+                         .terminals = terminals, .terminal_count = 3, .interrupts = 3};
     shell = n_app_launch(path, &l);
     n_handle_close(input[1]);
     n_handle_close(output[1]);

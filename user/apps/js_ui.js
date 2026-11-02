@@ -385,28 +385,6 @@ function run(options) {
     return new App(options);
 }
 
-/* What desktop.get(), modes() and sound() report is kept by the part of the system that applies
-   it (the desktop, the display modes, the sound), which says when it changed: the program watches
-   the screen and the sound (js.c's systemWatch), and listeners hear which changed, whoever changed
-   it. */
-const systemListeners = new Set();
-internal.systemChanged = (screen, sound) => {
-    const changed = Object.freeze([...(screen ? ['screen'] : []), ...(sound ? ['sound'] : [])]);
-    if (!changed.length) return;
-    for (const listener of [...systemListeners]) {
-        try { listener(changed); }
-        catch (e) { internal.reportError?.(e); }
-    }
-};
-function watchSystem(listener) {
-    if (typeof listener !== 'function') throw new TypeError('desktop.watch() needs a function');
-    if (!systemListeners.size && !host.systemWatch(true)) throw new Error('the system does not tell of changes');
-    systemListeners.add(listener);
-    return () => {
-        if (systemListeners.delete(listener) && !systemListeners.size) host.systemWatch(false);
-    };
-}
-
 internal.ui = Object.freeze({
     run, theme, mix, withAlpha,
     column, row, scroll, card, text, heading, title, caption, button, toggle, checkbox, slider, segmented,
@@ -414,25 +392,4 @@ internal.ui = Object.freeze({
     /* The computer: processor, memory, uptime and running tasks (null if the system will not say). */
     systemInfo: () => host.systemInfo(),
     launch: (path, arg) => host.uiLaunch(String(path), arg === undefined ? undefined : String(arg)),
-    /* The desktop, the monitor's modes and the sound (what Settings changes): each change goes to
-       the part of the system that applies it, which keeps it. */
-    desktop: Object.freeze({
-        get: () => host.desktop(),
-        set: s => host.desktopSet(s.pointerSpeed | 0, !!s.smoothGradients),
-        /* The sound's way out (n_audio_output): what plays it, the master volume and muting. */
-        sound: () => host.sound(),
-        setVolume: volume => host.sound(Math.round(Number(volume))),
-        setMuted: muted => host.sound(undefined, !!muted),
-        /* A screen's monitor and its modes (struct screen_modes, display_abi.h); screen 0 has the
-           taskbar. */
-        modes: (screen = 0) => host.screenModes(screen >>> 0),
-        tryMode: (m, screen = 0) =>
-            host.screenModeSet('try', m.width >>> 0, m.height >>> 0, m.refreshMillihertz >>> 0, screen >>> 0),
-        keepMode: (screen = 0) => host.screenModeSet('keep', 0, 0, 0, screen >>> 0),
-        backMode: (screen = 0) => host.screenModeSet('back', 0, 0, 0, screen >>> 0),
-        /* listener(changed: "screen", "sound") after what get(), modes() or sound() report changed,
-           whoever changed it; returns the function that stops it. A watch alone does not keep the
-           program running. */
-        watch: watchSystem,
-    }),
 });

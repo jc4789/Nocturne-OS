@@ -224,9 +224,8 @@ static void blocked_reader(void *unused) {
 
 static int resource_regression(void) {
     unsigned before = failures;
-    const char *folder = getenv("FOLDER");
     char saved_folder[256];
-    snprintf(saved_folder, sizeof saved_folder, "%s", folder && n_path_is_complete(folder) ? folder : "C:\\");
+    snprintf(saved_folder, sizeof saved_folder, "%s", n_folder());
     if (n_path_join(n_temp_folder(), ".", resource_folder, sizeof resource_folder) < 0 ||
         n_path_join(resource_folder, "threadtest-resources.tmp", resource_path, sizeof resource_path) < 0 ||
         n_path_join(resource_folder, "probe", resource_probe, sizeof resource_probe) < 0)

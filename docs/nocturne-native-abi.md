@@ -75,8 +75,8 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   区別せずに比べ（Unicode の単純な畳み込み。表はボリュームが持つので、どのカーネルでも同じ）、
   付けられた形のまま保存・表示する。`n_entry_move` で同じ項目の大文字・小文字だけを変えられる。
 - 作業ディレクトリはない。カーネルは完全なパスだけを受け付け、`C:` だけ、`C:a`、`a` は
-  `N_ERR_INVALID`。シェルは自分の「現在のフォルダー」を持ち、起動するアプリへ設定
-  `FOLDER=` として渡す（§5）。
+  `N_ERR_INVALID`。シェルは自分の「現在のフォルダー」を持ち、起動するアプリへ
+  `struct n_launch` の `folder` で渡す（§5）。
 - libc のパスの関数（`nocturne.h`）：
   - `n_path_is_complete(path)`：ドライブの後（無ければ先頭）に区切りがあるか。`C:\…`、`\…`、
     `/…` は完全。`C:` と `C:a` は現在のフォルダーとその中の `a`。
@@ -84,16 +84,16 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     `C:\`）の中で取る。完全な `name` はそれだけで決まる。結果は常に `C:\a\b` の形
     （大文字のドライブ、`\` 区切り、`.`／`..` 解決済み）。長さを返し、収まらなければ
     `N_ERR_TOO_LARGE`。
-  - 利用者が打った名前は `n_path_complete(name, out, cap)` で完全指定にする：設定 `FOLDER`
-    （無いか完全でなければ `C:\`）の中で `n_path_join` する。ISO Cの `fopen`／`remove`／
+  - 利用者が打った名前は `n_path_complete(name, out, cap)` で完全指定にする：今のフォルダー
+    （`n_folder()`）の中で `n_path_join` する。ISO Cの `fopen`／`remove`／
     `rename` もこれを使う。
   - `n_path_name(path)`：最後の名前（根では `""`）。
   - `n_path_from_url(url, out, cap)`／`n_path_to_url(path, out, cap)`：`file:` URL と
     パスの変換（`file:///C:/Users/User/a%20b.html` ⇔ `C:\Users\User\a b.html`。ドライブの
     無い `file:///Users/User` も C:）。
 - アプリが自分の現在のフォルダーを変えるのは `n_folder_set(name)`：名前を完全指定にし、
-  フォルダーであることを確かめてから（違えば `N_ERR_NOT_FOLDER`）、自分の設定 `FOLDER` を
-  置き換える（以後の `n_path_complete` と、libcが起動するアプリへ渡す `FOLDER` に効く）。
+  フォルダーであることを確かめてから（違えば `N_ERR_NOT_FOLDER`）、今のフォルダーを
+  置き換える（以後の `n_path_complete` と、libc が起動するアプリへ渡す `folder` に効く）。
 - C: の構成（`common/abi.h` の `N_FOLDER_*`）：
   - `C:\Nocturne`：システム。`System`（システムのプログラム、`N_FOLDER_SYSTEM`）、`Fonts`、
     `Licenses`、`SDK`、`Certificates`、`Web`、`Agent`、`Firmware` 等。`C:\Nocturne\Temp` は
@@ -102,7 +102,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   - `C:\Users\<名前>`：利用者のフォルダー（`n_user_folder()`、身元から `accounts` が引く。§15）。アプリは
     ここで始まる。`Desktop`、`Documents`、`Downloads`、`Music`、`Pictures`、`Videos`、
     `AppData`。アプリのデータは `n_app_data_folder(name, out, cap)` が作って返す
-    `AppData\<name>`。`AppData\Temp` は一時フォルダー（設定 `TEMP`、`n_temp_folder()`）で、
+    `AppData\<name>`。`AppData\Temp` は一時フォルダー（`n_temp_folder()`）で、
     起動のたびに空になる。
 - パスの権限は `kernel/src/fs/store.c` の入口の一か所で決まる。決めるのは呼ぶ側の身元（§13）で、
   パスの文字列でなく項目の番号で比べる。誤りは `N_ERR_DENIED`。
@@ -269,15 +269,15 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - ISO Cの入力は、`cap` より大きいメッセージを `N_CHANNEL_PEEK` で測り、バッファーを
   広げて丸ごと受け取る。長さ0のメッセージは読む内容が無いので次を待つ。
 - 端末は、子アプリの「入力」「出力」チャンネルとメッセージをやり取りする一つの
-  アプリにすぎない。起動元は、端末へつながるハンドル番号を設定 `TERMINAL` に並べて
-  伝える（例 `TERMINAL=0 1 2`）。
+  アプリにすぎない。起動元は、端末へつながるハンドル番号を `struct n_launch` の
+  `terminals` に並べて伝える。
   `n_terminal(h)` がこれを読む。端末はキー入力をそのまま送るので、行の編集と表示は
   アプリ側（libcの `readline`）が行う。ISO Cの `stdout`／`stderr`／
   `stdin` は、起動時に渡された出力／入力チャンネル（無ければ記録先のログ）に結び付く。
   アプリが例外（ページフォルト等）で止められると、カーネルはその報告文を一つの
   メッセージとして記録先のログ（ハンドル2）へ送る。待ち行列が満杯なら待たずに捨てる。
-- Ctrl+C：端末はシェルにハンドル3として「割込み」チャンネルを渡し（設定
-  `INTERRUPTS=3`）、Ctrl+C ごとにメッセージを一つ送る。シェルは前面のジョブを
+- Ctrl+C：端末はシェルに「割込み」チャンネルを渡し（`struct n_launch` の
+  `interrupts` がそのハンドル番号、`n_interrupts()` が読む）、Ctrl+C ごとにメッセージを一つ送る。シェルは前面のジョブを
   `n_app_stop(h, N_APP_STOP_TREE)` で止め、プロンプトでは入力中の行を取り消す。
 - システムログ：`n_system_log_open()` は、送ったメッセージがシステムログ（カーネルの記録の輪。
   シリアルポートと、デスクトップが画面を取るまでの起動の画面が読む）へ加わるハンドルを返す。
@@ -291,22 +291,27 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 ## 5. アプリ
 
 - `n_app_launch(path, const struct n_launch *)` がアプリハンドルを返す。
-  `n_launch` は引数列、設定の組（ISO Cの `getenv` が読む）、
-  引き渡すハンドルの表（入力・出力・ログのチャンネル、共有ページ、能力等）と、子の身元を持つ。
+  `n_launch` は引数列、引き渡すハンドルの表（入力・出力・ログのチャンネル、共有ページ、能力等）、
+  起動の属性、子の身元を持つ。起動の属性は型のある欄で、文字列の組ではない：
+  - `folder`：今のフォルダー。
+    `terminals`・`terminal_count`：端末へつながるハンドル番号。`interrupts`：Ctrl+C の知らせを受ける
+    チャンネルのハンドル番号（0 は無し）。
+  - カーネルはこれを新しいアプリの stack に写し、入口の第三引数 `const struct n_start *` で渡す。
+    libc が `n_folder()`、`n_terminal(h)`、`n_interrupts()` で読ませる。
+  - `environment`・`environment_count`：移植のプログラムのための `"名前=値"` の列
+    （`=` が無ければ `N_ERR_INVALID`）。ISO C の `getenv` と `__libc_environment` だけが読む。
+    システムの部品はこれを読まず、これで組まない。
   - `identity` が NULL なら、子の身元は親と同じ。`identity` を渡すときの規則は §13。
-  - 設定は `"名前=値"` の形（`=` が無ければ `N_ERR_INVALID`）。起動されたアプリでは
-    `n_settings`（NULL終端）として読め、`getenv` もこれを引く。
-  - 引数と設定の文字列（各 nul を含む。カーネルが加える設定も数える）と、二つの NULL 終端
-    ポインター配列（1 個 8 バイト）は、合わせて `N_LAUNCH_MAX_BYTES`（4 MiB）まで。
-    超えると `N_ERR_TOO_MANY_ARGUMENTS`。
+  - 引数と環境の文字列（各 nul を含む）と、二つの NULL 終端ポインター配列（1 個 8 バイト）は、
+    合わせて `N_LAUNCH_MAX_BYTES`（4 MiB）まで。超えると `N_ERR_TOO_MANY_ARGUMENTS`。
   - 引き渡すハンドルは、表の順に子アプリの 0, 1, 2, … 番になる（-1 は空き）。
   - `path` は完全指定（§3）。名前だけのプログラムは libc の `find_program(name, out, n)` が
     `N_FOLDER_SYSTEM`、次に `N_FOLDER_PROGRAMS` の各アプリのフォルダーで探す。
     それ以外の名前は `n_path_complete` で完全指定にする。
   - 起動されたアプリは作業フォルダーを持たない。利用者の名前を受け取るアプリのために、
-    起動元は自分の現在のフォルダーを設定 `FOLDER=C:\…` で渡す（§3の `n_path_complete`）。
-    子アプリは起動元の身元を継ぐ（§13）。ブラウザーの窓と、その Worker・保存・設定の窓は同じ利用者の
-    同じ profile を使う。
+    libc の `n_app_launch` は `folder` が NULL なら起動元の今のフォルダーを入れる（§3 の `n_path_complete`）。
+    起動元が持たなければ子も持たず、子は身元の利用者のフォルダーで始まる。
+    子アプリは起動元の身元を継ぐ（§13）。ブラウザーの窓と、その Worker・保存の窓は同じ profile を使う。
 - 終了はアプリハンドルのイベント（§6）で届く。`n_app_result(h, deadline, int *status)` で
   直接待つこともできる（期限は §8。呼出しの時点で過ぎた期限は待たずに `N_ERR_NOT_READY`、
   待って期限が来れば `N_ERR_TIMEOUT`）。最後のハンドルを閉じれば記録は消える。
@@ -1184,10 +1189,24 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   効くのは次の起動から（`N_SETTING_AT_START`）。`SYS_SETTINGS_EFFECTIVE` は記録の値を返す。
 - 起動の引数は製品の値を決めない。`kernel/src/boot.c` の `test_flag` などの読み手は試験の組み
   （`make kernel-test`、`NOCTURNE_TEST_FLAGS`）だけにある。
-- プログラムの設定はプログラムの持ち物：`n_app_data_folder(name, out, cap)` の `AppData\<name>`
-  （§3）に自分の形式で置き、自分で読む。原子的な保存は `n_document_save`・`n_entry_replace`、
-  ほかのプロセスの変更は C: の見張り（`n_entry_watch`、§3）で知る。カーネルも共有の文書も
-  通らない（移植したプログラムは自分の profile をそのまま使える）。
+- 設定のサービス `settings`（`user/apps/settingsd.c`）：選択の保存、宣言の表、型と範囲の確かめ、権限の
+  確かめ、見張りを持つ。領域の意味を持たない。呼ぶ側の口は `nocturne_settings.h`（`user/libc/settings.c`）、
+  channel の文は `common/settings_abi.h` の `enum n_settings_op`。
+  - `n_setting_get`・`n_setting_get_int`：値。`n_setting_set`・`n_setting_set_int`：検証、適用、保存、見張りへの
+    知らせ。適用が断られれば何も変えず、保存に失敗すれば適用を戻す。理由は `enum n_setting_reason` で返る。
+    `n_setting_set_if`：今の値が読んだ値と同じときだけ書く。
+  - `n_setting_try`・`n_setting_commit`・`n_setting_revert`：`N_APPLY_TRIAL` の鍵（画面のモード）の期限つきの試し。
+    期限はサービスが数える。試した者が死んでも値は戻る。戻す先は適用より先に保存の版へ書くので、
+    サービスが試しの最中に落ちても、起き直したサービスが前の値へ戻す。
+  - `n_setting_watch`・`n_setting_watch_take`：見張り。`struct n_settings_changed` が届く。
+  - `n_setting_list`：見える宣言の一覧。設定の窓（`user/apps/settings.c`）はこれで頁を組む。
+  - `n_setting_declare`：宣言を足す。プログラムの設定は `N_SCOPE_PROGRAM`（利用者ごと、プログラムごと）で
+    宣言し、読み書きするのはそのプログラムだけ。編むファイルを置かない。
+  - 権限：機械と装置の値（`N_SCOPE_MACHINE`・`N_SCOPE_DEVICE`）を変えるのは `N_CLASS_ADMIN` 以上。利用者の値は
+    本人。身元は `n_channel_peer` で確かめる。
+  - 保存は私的な領域 `N_REGION_SETTINGS` の一つの文書で、版つきの二進。頭に二つの版の記録があり、新しい本体を
+    古い版の場所へ書いて、媒体へ届いてから記録を書く。壊れていれば前の版へ戻る。
+  - 時刻の鍵 `N_TIME_ZONE_MINUTES`（`N_DOMAIN_TIME`）はカーネルに持ち主が無く、libc の `localtime`・`mktime` が読む。
 - 見張り（`N_KIND_WATCH`、§1）：見張るものが変わると `N_EVENT_RECEIVABLE`（レベル：
   `n_watch_take(watch)` が取るまで）。`n_watch_take` は前の取り出しの後の変化の数を返し（無ければ
   0、上限 `N_WATCH_CHANGES_MAX`）、数を消す。見張りは開いた時から数える。誰が変えても（その

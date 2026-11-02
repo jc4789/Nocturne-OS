@@ -205,8 +205,8 @@ LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
     jmp_buf main_jb;
 
 #if CONFIG_TCC_NOCTURNE
-    /* there is no inherited environment; the program sees the launch settings */
-    char **envp = (char **)n_settings;
+    /* there is no inherited environment; the program sees the environment of its launch */
+    char **envp = (char **)__libc_environment;
 #elif defined(__APPLE__)
     extern char ***_NSGetEnviron(void);
     char **envp = *_NSGetEnviron();
