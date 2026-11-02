@@ -1,7 +1,7 @@
 /* USB Ethernet adapters of the standard communications classes: CDC ECM (one frame per bulk
  * transfer) and CDC NCM (frames inside Network Transfer Blocks), per CDC 1.2, ECM 1.2 and
- * NCM 1.1. The protocol stack uses one adapter; the first one that arrives becomes it, also
- * after boot, and a replugged adapter takes its place again. */
+ * NCM 1.1. Each is an adapter of its own to the protocol stack, from when it arrives to when it
+ * is unplugged. */
 #include "kernel.h"
 #include "dev/usb.h"
 #include "mm/heap.h"
@@ -25,6 +25,9 @@
 #define TX_SLOTS 16
 
 struct usbnet {
+    struct netif nif; /* first: self is the adapter */
+    struct mutex lock; /* a mutex, as usb_send is a call that may take the host controller's locks */
+    struct usbnet *gone_next;
     struct usb_device *dev; /* NULL once unplugged */
     bool ncm, link;
     uint8_t comm, data, alt; /* interface numbers and the data interface's working setting */
@@ -36,16 +39,15 @@ struct usbnet {
     unsigned header; /* NTH16, padding, NDP16 and padding before the datagram */
 };
 
-/* The adapter the stack uses. Sends come from the stack on any CPU (under its lock, one at a
-   time), arrival and removal from the controllers' workers: usbnet_lock (a mutex, as usb_send is
-   a call that may take the host controller's locks) guards adapter and its dev, so a removed
-   device is never sent to. Order: the stack's net_lock, then usbnet_lock, then the host
-   controller's locks; net_register is called without usbnet_lock. Frames arrive and sends finish
-   in the drains (rx, notify, tx_done: dev/usb.h), which only queue and wake (net_rx). */
-static struct mutex usbnet_lock;
-static struct usbnet *adapter;
-static int usbnet_send(const void *frame, size_t len);
-static struct netif usb_netif = {.send = usbnet_send};
+/* Sends come from the stack on any CPU (under its lock, one at a time), arrival and removal from
+   the controllers' workers: an adapter's lock guards its dev, so a removed device is never sent
+   to. Order: the stack's net_lock, then an adapter's lock, then the host controller's locks;
+   net_register and net_unregister are called without an adapter's lock. Frames arrive and sends
+   finish in the drains (rx, notify, tx_done: dev/usb.h), which only queue and wake (net_rx). An
+   adapter's memory goes when the next one arrives: a drain of its controller may still hold it
+   while the slot is released. */
+static struct mutex gone_lock;
+static struct usbnet *gone;
 
 static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t get32(const uint8_t *p) { return get16(p) | (uint32_t)get16(p + 2) << 16; }
@@ -64,7 +66,7 @@ bool usbnet_claims(const struct usb_interface_desc *intf) {
 
 /* ---- data path ---- */
 
-/* usbnet_lock held, n->dev there. */
+/* n's lock held, n->dev there. */
 static int usbnet_queue(struct usbnet *n, const void *frame, size_t len) {
     int r;
     if (!n->ncm) {
@@ -88,14 +90,14 @@ static int usbnet_queue(struct usbnet *n, const void *frame, size_t len) {
     return r > 0 ? 0 : r == 0 ? -N_ERR_NOT_READY : -N_ERR_IO;
 }
 
-static int usbnet_send(const void *frame, size_t len) {
-    mutex_lock(&usbnet_lock);
-    struct usbnet *n = adapter;
+static int usbnet_send(struct netif *self, const void *frame, size_t len) {
+    struct usbnet *n = (struct usbnet *)self;
+    mutex_lock(&n->lock);
     int r;
-    if (!n || !n->dev) r = -N_ERR_NETWORK_DOWN;
+    if (!n->dev) r = -N_ERR_NETWORK_DOWN;
     else if (len > n->max_segment) r = -N_ERR_INVALID;
     else r = usbnet_queue(n, frame, len);
-    mutex_unlock(&usbnet_lock);
+    mutex_unlock(&n->lock);
     return r;
 }
 
@@ -120,7 +122,7 @@ static void ncm_input(struct usbnet *n, const uint8_t *b, unsigned len) {
             unsigned at = get16(b + e), size = get16(b + e + 2);
             if (!at || !size) break; /* the first null entry ends the list (3.7) */
             if (at < header || at + size > limit || size < 14 + crc) continue;
-            if (size - crc <= n->max_segment) net_rx(b + at, size - crc);
+            if (size - crc <= n->max_segment) net_rx(&n->nif, b + at, size - crc);
         }
         unsigned next = get16(b + ndp + 6); /* reserved in NCM 1.0, a link in Figure 3-1 */
         if (next <= ndp) return;
@@ -133,7 +135,7 @@ static void rx(struct usb_device *d, void *ctx, const uint8_t *data, unsigned le
     struct usbnet *n = ctx;
     if (!len) return; /* the zero-length packet after a frame of whole packets */
     if (n->ncm) ncm_input(n, data, len);
-    else if (len >= 14) net_rx(data, len); /* ECM 3.4: no CRC */
+    else if (len >= 14) net_rx(&n->nif, data, len); /* ECM 3.4: no CRC */
 }
 
 static void notify(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len, uint64_t at) {
@@ -249,12 +251,14 @@ void usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
         kprintf("usbnet: slot %u CDC function incomplete (data interface, MAC string)\n", d->slot);
         return;
     }
-    mutex_lock(&usbnet_lock);
-    bool busy = adapter && adapter->dev;
-    mutex_unlock(&usbnet_lock);
-    if (busy) {
-        kprintf("usbnet: slot %u ignored, another USB adapter is in use\n", d->slot);
-        return;
+    mutex_lock(&gone_lock);
+    struct usbnet *old = gone;
+    gone = NULL;
+    mutex_unlock(&gone_lock);
+    while (old) {
+        struct usbnet *next = old->gone_next;
+        kfree(old);
+        old = next;
     }
     struct usbnet *n = kzalloc(sizeof *n);
     if (!n) return;
@@ -303,16 +307,10 @@ void usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
     }
     kprintf("usbnet: slot %u CDC %s adapter %02x:%02x:%02x:%02x:%02x:%02x\n", d->slot, n->ncm ? "NCM" : "ECM", mac[0],
             mac[1], mac[2], mac[3], mac[4], mac[5]);
-    mutex_lock(&usbnet_lock);
-    struct usbnet *old = adapter;
-    adapter = n;
-    /* only net_register reads these, after this */
-    memcpy(usb_netif.mac, mac, 6);
-    usb_netif.driver = n->ncm ? "usb-ncm" : "usb-ecm";
-    mutex_unlock(&usbnet_lock);
-    kfree(old);
-    /* the first adapter of the system, or this one again with another address */
-    net_register(&usb_netif);
+    memcpy(n->nif.mac, mac, 6);
+    n->nif.driver = n->ncm ? "usb-ncm" : "usb-ecm";
+    n->nif.send = usbnet_send;
+    net_register(&n->nif);
     return;
 fail:
     kfree(n);
@@ -322,8 +320,13 @@ void usbnet_detach(struct usb_device *d) {
     struct usbnet *n = d->net;
     if (!n) return;
     d->net = NULL;
-    mutex_lock(&usbnet_lock);
-    n->dev = NULL; /* sends fail until an adapter comes back; none is inside usb_send now */
-    mutex_unlock(&usbnet_lock);
+    mutex_lock(&n->lock);
+    n->dev = NULL; /* sends fail from here on; none is inside usb_send now */
+    mutex_unlock(&n->lock);
+    net_unregister(&n->nif);
+    mutex_lock(&gone_lock);
+    n->gone_next = gone;
+    gone = n;
+    mutex_unlock(&gone_lock);
     kprintf("usbnet: adapter unplugged\n");
 }

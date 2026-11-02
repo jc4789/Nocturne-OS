@@ -61,7 +61,7 @@ Nocturne は UNIX でも POSIX でもないので、Go 側を Nocturne の API �
   （`TCPConnect`、`TCPRecv`、`TCPSendUntil`、`UDPSocket` 等）を直接使います。待ちは
   250ms ごとに区切り、その間に `Close` や期限（`SetDeadline`）の変更を見ます。`Close` は
   使用中の呼出しが終わってから接続を渡すので、送信待ちのデータも送られます（FIN）。
-  アドレスの解決はシステムの解決器（`NetDNSAll`、全アプリ共通のキャッシュ）、それ以外の
+  アドレスの解決はシステムの解決器（`NetResolve`、サービス `network` の全アプリ共通のキャッシュ）、それ以外の
   レコード（MX、TXT、SRV 等）と `PreferGo` は Go の DNS クライアントで同じ解決器へ問い合わせます。
   名前の固定表（hosts）はありません。IPv4 のみです。
 - **待受け**：`net.Listen("tcp", ...)` はカーネルの受動オープン（RFC 9293、`TCPListen`・

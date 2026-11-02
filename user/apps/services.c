@@ -81,6 +81,12 @@ static const struct declared_service declared[] = {
     {.name = "session", .program = "session", .cls = N_CLASS_SYSTEM, .at_boot = true, .console = true,
      CAPS(N_CAP_IDENTITY_GRANT, N_CAP_SHELL), .needs = NAMES("accounts", "tests"),
      .on_failure = {5, 1000, 60000}, .clients_from = N_CLASS_USER},
+    /* 住所の決め方、経路、名前引き。カーネルの網の口を変える能力はここにだけ渡す。 */
+    {.name = "network", .program = "network", .cls = N_CLASS_SYSTEM, .at_boot = true,
+     CAPS(N_CAP_NETWORK), .needs = NAMES("settings"), .on_failure = {5, 500, 60000}, .clients_from = N_CLASS_USER},
+    /* 時計を網で合わせる。時計と RTC を変える能力はここにだけ渡す。 */
+    {.name = "timesync", .program = "timesync", .cls = N_CLASS_SYSTEM, .at_boot = true,
+     CAPS(N_CAP_CLOCK), .needs = NAMES("settings", "network"), .on_failure = {5, 1000, 60000}, .clients_from = CLIENTS_NONE},
 };
 #define DECLARED (sizeof declared / sizeof *declared)
 #define STOP_GRACE_MS 5000u /* 閉じた後、これだけ待って強制的に止める */

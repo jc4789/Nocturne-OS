@@ -66,7 +66,7 @@ build-and-test loops are cheap.
     (n_document_load/save/open/read_at, n_folder_list, n_entry_info; paths: n_path_join,
     n_path_complete, n_user_folder, n_temp_folder, n_app_data_folder), apps (n_app_launch,
     n_app_result, n_app_stop, run_wait), channels, time (n_clock_monotonic, n_clock_wall, n_sleep_until; every time is ns, a deadline is a monotonic ns),
-    networking (net_resolve, tcp_connect/tcp_send/tcp_recv, udp_*), GUI windows
+    networking (tcp_connect/tcp_send/tcp_recv, udp_*; net_resolve in nocturne_services.h), GUI windows
     (`win_open(w, h, title, flags, &win)`, win_event, win_update), readline, the clipboard,
     screen_grab.
   - `ui.h`: the UI engine every GUI app uses (widgets, text in Noto Sans and Maple Mono, themes).

@@ -41,8 +41,8 @@ void kmain_late(void) {
     fb_pm_init(); /* the display joins the power changes once its PCI identity is known */
     gpu_init();   /* the offscreen GPU, which never shows a screen */
     iommu_init(); /* before any driver turns an interrupt on: their messages may be remapped */
-    usb_init();
     net_init();
+    usb_init();
     audio_init();
     ahci_init();
     nvme_init();

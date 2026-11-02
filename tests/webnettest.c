@@ -1,5 +1,6 @@
 /* Real Nocturne worker/pipe/network tests against the runner's two HTTP fixture origins. */
 #include "nocturne.h"
+#include "nocturne_services.h"
 #include "webnet.h"
 #include "webnet_wire.h"
 #include <stdio.h>

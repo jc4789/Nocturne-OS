@@ -41,6 +41,7 @@ const char *n_result_text(n_result r) {
     }
     return "error";
 }
+bool net_proxy_for(const char *host,char *proxy,size_t cap,uint16_t *port){(void)host;(void)proxy;(void)cap;(void)port;return false;}
 bool net_wait_up(int timeout_ms) { (void)timeout_ms; return true; }
 n_result net_resolve_all(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result) {
     struct addrinfo hints = {0}, *list;

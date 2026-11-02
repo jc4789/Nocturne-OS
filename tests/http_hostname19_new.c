@@ -27,7 +27,7 @@ static void count_free(void*p){if(p){live--;free(p);}}
 #undef free
 #define kmalloc count_malloc
 #define kfree count_free
-#include "../kernel/src/net/dns_name.h"
+#include "../common/dns_name.h"
 #undef kmalloc
 #undef kfree
 struct net_stream {size_t at;};

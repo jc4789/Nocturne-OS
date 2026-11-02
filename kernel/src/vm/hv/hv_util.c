@@ -104,12 +104,6 @@ static void shutdown(struct service *s, struct ic_header *h, uint8_t *body, uint
     else h->status = IC_E_FAIL; /* no hibernation on this machine */
 }
 
-/* The RTC on Hyper-V holds the host's local time and Nocturne has no time zones, so the clock
-   runs in local time. The host sends UTC: we measure the host's offset from UTC once (rounded to
-   15 minutes) and use the host's time through it, which corrects drift but keeps the zone. */
-static bool tz_known;
-static int64_t tz_offset;
-
 static void timesync(struct service *s, struct ic_header *h, uint8_t *body, uint32_t len) {
     (void)h;
     uint64_t parent;
@@ -125,13 +119,8 @@ static void timesync(struct service *s, struct ic_header *h, uint8_t *body, uint
     }
     /* 100 ns units since 1601 */
     int64_t utc = ((int64_t)parent - 116444736000000000LL) * 100;
-    if (!tz_known) {
-        int64_t d = clock_wall_seconds() - utc / (int64_t)NS_PER_S;
-        tz_offset = (d >= 0 ? d + 450 : d - 450) / 900 * 900;
-        tz_known = true;
-    }
     if (flags & 3) { /* SYNC (after boot or resume) or SAMPLE */
-        int64_t want = utc + tz_offset * (int64_t)NS_PER_S, diff = want - clock_wall_ns();
+        int64_t want = utc, diff = want - clock_wall_ns();
         /* SYNC sets it to the host's time; a SAMPLE moves it only when it is a second off */
         if ((flags & 1) || diff > (int64_t)NS_PER_S || diff < -(int64_t)NS_PER_S) {
             clock_set_wall(want);
@@ -183,13 +172,13 @@ static bool auto_item(uint32_t index, const char **key, char *value, size_t n) {
     if (index >= ARRAY_SIZE(keys)) return false;
     *key = keys[index];
     uint8_t mac[6];
-    uint32_t ip, mask, gw, dns;
+    uint32_t ip, mask;
     value[0] = 0;
     switch (index) {
     case 0: strlcpy(value, "nocturne", n); break;
     case 1: strlcpy(value, "3.1", n); break;
     case 2:
-        if (net_config(mac, &ip, &mask, &gw, &dns)) ipstr(value, n, ip);
+        if (net_adapter_info(0, mac, &ip, &mask) && ip) ipstr(value, n, ip);
         break;
     case 3: break;
     case 4: strlcpy(value, OS_VERSION, n); break;
@@ -218,8 +207,10 @@ static bool same_mac(const uint16_t *id, const uint8_t mac[6]) {
 
 static void get_ip_info(struct ic_header *h, struct kvp_ip *m) {
     uint8_t mac[6];
-    uint32_t ip, mask, gw, dns;
-    if (!net_config(mac, &ip, &mask, &gw, &dns) || !same_mac(m->adapter_id, mac)) {
+    uint32_t ip = 0, mask = 0;
+    bool found = false;
+    for (size_t i = 0; !found && net_adapter_info(i, mac, &ip, &mask); i++) found = same_mac(m->adapter_id, mac);
+    if (!found || !ip) {
         h->status = IC_E_FAIL;
         return;
     }
@@ -230,10 +221,6 @@ static void get_ip_info(struct ic_header *h, struct kvp_ip *m) {
     to_utf16(m->ip, ARRAY_SIZE(m->ip), s);
     ipstr(s, sizeof s, mask);
     to_utf16(m->mask, ARRAY_SIZE(m->mask), s);
-    ipstr(s, sizeof s, gw);
-    to_utf16(m->gateway, ARRAY_SIZE(m->gateway), s);
-    ipstr(s, sizeof s, dns);
-    to_utf16(m->dns, ARRAY_SIZE(m->dns), s);
 }
 
 static void kvp(struct service *s, struct ic_header *h, uint8_t *body, uint32_t len) {

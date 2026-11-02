@@ -400,6 +400,7 @@ unsigned cpu_index(void);
 #define N_TLS_GL_DISPATCH 5  /* Mesa's current dispatch table */
 #define N_TLS_GL_CURRENT 6   /* Mesa's current gl_context; slot 7 is C11 threads */
 #define N_TLS_CALL_ONCE 8    /* Mesa's call-once-with-data argument */
+#define N_TLS_NET_CANCEL 9   /* net_set_setup_cancel_channel's channel, plus 1 */
 void *thread_local_get(unsigned slot);
 void thread_local_set(unsigned slot, void *value);
 /* Actual reserved stack interval of the calling native task: 0, or a negative n_result. */
@@ -440,15 +441,23 @@ int readline(const char *prompt, char *buf, size_t size, int flags);
    IPv4 addresses are uint32_t in host order (10.0.2.15 is 0x0A00020F). Functions return their
    result or a negative n_result, and leave errno alone. Waits end at a deadline of the monotonic
    clock (N_CLOCK_NEVER: none), and an expired wait is -N_ERR_NOT_READY or -N_ERR_TIMEOUT. */
-n_result net_info(struct n_netinfo *ni);
+/* The adapters: how many there are, the first max of them in out. */
+n_result n_net_adapters(struct n_net_adapter *out, size_t max);
+/* An adapter's driver's name: its whole length, what fits in out (not terminated). */
+n_result n_net_adapter_name(uint32_t adapter, char *out, size_t cap);
+/* The routes: how many there are, the first max of them in out. */
+n_result n_net_routes(struct n_net_route *out, size_t max);
+/* A watch (n_watch_take) of the adapters, their addresses and the routes. */
+n_handle n_net_watch(void);
+/* The service network's own: an adapter's address (ip 0: none), the whole route table, and a UDP
+   socket on one adapter. cap: N_CAP_NETWORK. */
+n_result n_net_address_set(n_handle cap, uint32_t adapter, uint32_t ip, uint32_t mask);
+n_result n_net_routes_set(n_handle cap, const struct n_net_route *routes, size_t count);
+n_result udp_socket_on(n_handle cap, uint32_t adapter, uint16_t port);
 n_result net_ping(uint32_t ip, int seq, uint64_t deadline); /* round-trip time in ns */
-n_result net_resolve(const char *name, uint32_t *ip);    /* DNS lookup or dotted quad */
-n_result net_resolve_all(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result);
-n_result net_resolve_at(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result,
-                        const struct n_sockaddr *resolver);
 n_result net_stats(struct n_netstats *stats);
-/* Calling thread only: abort DNS/ARP/connect if this request channel's peer
-   closes. -1 clears the context. Established/shared TCP I/O is unaffected. */
+/* Calling thread only: abort name lookups, ARP, connects and UDP waits if this request channel's
+   peer closes. -1 clears the context. Established/shared TCP I/O is unaffected. */
 n_result net_set_setup_cancel_channel(n_handle channel);
 bool ip_parse(const char *s, uint32_t *ip);
 char *ip_format(uint32_t ip, char *buf); /* buf: at least 16 bytes */
@@ -477,7 +486,7 @@ n_result tcp_address(n_handle s, struct n_sockaddr *local, struct n_sockaddr *re
 n_result tcp_finish(n_handle s); /* stop sending (FIN after the queued data) but keep receiving; tcp_close later */
 /* simulated packet loss/reordering on this process's TCP connections, and TCP counters (either may be NULL) */
 n_result net_test(const struct n_netfault *set, struct n_tcpstats *stats);
-bool net_wait_up(uint64_t deadline); /* wait for DHCP; false if no network */
+bool net_wait_up(uint64_t deadline); /* wait until an adapter has an address; false if there is no adapter, or at the deadline */
 
 /* ---- GUI ---- */
 typedef struct window {

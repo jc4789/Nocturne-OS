@@ -65,4 +65,28 @@ n_result n_machine_choose(uint32_t op);
 /* 画面の画素の新しい配列（free する）。 */
 n_result n_machine_screen(uint32_t **pixels, int *width, int *height);
 
+/* ---- 網 ---- */
+/* 名前を住所へ。数字の住所と localhost はサービスを通らない。net_set_setup_cancel_channel の相手が閉じると
+   -N_ERR_CANCELLED で戻る。結果は 0 か負の N_ERR_*、ips には capacity まで。result->count は全部の数。 */
+n_result net_resolve(const char *name, uint32_t *ip);
+n_result net_resolve_all(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result);
+n_result net_resolve_at(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result,
+                        const struct n_sockaddr *resolver);
+/* host への HTTP の接続が通る proxy（設定 network.proxy-*）。無ければ false。proxy の名前は cap まで。 */
+bool net_proxy_for(const char *host, char *proxy, size_t cap, uint16_t *port);
+/* adapter ごとの構成の新しい塊（free する）。数を返す。次の記録は n_network_link_next。 */
+n_result n_network_links(struct n_network_link **out);
+static inline const uint32_t *n_network_link_addresses(const struct n_network_link *link) {
+    return (const uint32_t *)(link + 1);
+}
+static inline struct n_network_link *n_network_link_next(struct n_network_link *link) {
+    return (struct n_network_link *)((uint32_t *)(link + 1) + link->dns_count + link->ntp_count);
+}
+
+/* ---- 時計 ---- */
+/* サービス timesync の口。cap：N_CAP_CLOCK。カーネルは UTC だけを持つ。 */
+n_result n_clock_wall_step(n_handle cap, int64_t unix_ns);
+n_result n_clock_wall_slew(n_handle cap, int64_t offset_ns, uint32_t ppm);
+n_result n_rtc_write(n_handle cap, int64_t unix_seconds);
+
 NOCTURNE_END_DECLS

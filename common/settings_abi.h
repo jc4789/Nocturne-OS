@@ -69,7 +69,6 @@ enum n_power_key {
 
 /* N_DOMAIN_NETWORK：net/net */
 enum n_network_key {
-    N_NETWORK_DNS_SERVER,       /* N_SETTING_ENDPOINT：既定の resolver。ip 0 は DHCP の言うもの */
     N_NETWORK_TCP_RX_BYTES,     /* N_SETTING_INT：これから開く接続の受信の容量 */
     N_NETWORK_TCP_TX_BYTES,     /* N_SETTING_INT：これから開く接続の送信の容量 */
     N_NETWORK_KEY_COUNT
@@ -138,6 +137,20 @@ enum n_private_region {
 /* カーネルの持ち主の無い時刻の鍵。読む者が見張る。 */
 enum n_time_setting_key {
     N_TIME_ZONE_MINUTES,        /* N_SETTING_INT：時計の時刻に足す分 */
+    N_TIME_SYNC,                /* N_SETTING_BOOL：サービス timesync が時計を合わせる */
+    N_TIME_SERVER,              /* N_SETTING_STRING：DHCP が NTP のサーバーを言わないときの名前 */
+};
+
+/* サービス network の鍵。カーネルに持ち主は無い。サービスが見張る。 */
+enum n_network_setting_key {
+    N_NETWORK_DNS_SERVER = N_NETWORK_KEY_COUNT, /* N_SETTING_ENDPOINT：resolver。ip 0 は DHCP の言うもの */
+    N_NETWORK_FIXED_ADDRESS,    /* N_SETTING_IPV4：adapter ごと（device は MAC の文字列の番号）。ip 0 は DHCP */
+    N_NETWORK_PROXY_HOST,       /* N_SETTING_STRING：HTTP proxy の名前か住所。空は proxy なし */
+    N_NETWORK_PROXY_PORT,       /* N_SETTING_INT */
+};
+/* adapter の固定の住所。host byte order。 */
+struct n_setting_ipv4 {
+    uint32_t ip, mask, gateway;
 };
 
 #define N_DOMAIN_PROGRAM 0xffffffffu /* プログラムの scope の鍵の領域。適用の相手が無い。 */
@@ -145,6 +158,7 @@ enum n_time_setting_key {
 /* 宣言の型は enum n_setting_type にこの二つを足したもの。 */
 #define N_SETTING_ENUM 16u   /* int32_t：選択肢の番号 */
 #define N_SETTING_STRING 17u /* UTF-8 のバイト列（終端なし） */
+#define N_SETTING_IPV4 18u   /* struct n_setting_ipv4 */
 
 enum n_setting_scope {
     N_SCOPE_MACHINE, /* 機械に一つ。変えるのは N_CLASS_ADMIN 以上。 */

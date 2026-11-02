@@ -185,11 +185,11 @@ static int send_rndis(const void *msg, uint32_t len, bool control) {
 
 /* ---- receive path (the net thread, or the probe before registration) ---- */
 
-static void receive_frame(const void *frame, uint32_t len, void (*input)(const void *, size_t)) {
+static void receive_frame(const void *frame, uint32_t len, void (*input)(struct netif *, const void *, size_t)) {
     if (input) {
         /* The stack consumes this borrow before returning. Do not return the
            transfer's host credit until every frame in it has been consumed. */
-        input(frame, len);
+        input(&nif, frame, len);
         return;
     }
     /* The packet filter can become active just before its setup reply. Keep
@@ -210,7 +210,7 @@ static void receive_frame(const void *frame, uint32_t len, void (*input)(const v
     nv.setup_last = saved;
 }
 
-static void rndis_receive(const uint8_t *p, uint32_t len, void (*input)(const void *, size_t)) {
+static void rndis_receive(const uint8_t *p, uint32_t len, void (*input)(struct netif *, const void *, size_t)) {
     if (len < sizeof(struct rndis_hdr)) { nv.rx_invalid++; return; }
     const struct rndis_hdr *h = (const void *)p;
     if (h->len < sizeof *h || h->len > len) { nv.rx_invalid++; return; }
@@ -352,7 +352,8 @@ static void netvsc_shutdown(void) {
     vmbus_release(ch);
 }
 
-static bool netvsc_rx_pending(void) {
+static bool netvsc_rx_pending(struct netif *self) {
+    (void)self;
     /* Once shut down nothing is left to do, also when a rescind racing the shutdown on CPU 0
        set detaching again. */
     if (!nv.ch) return false;
@@ -371,7 +372,7 @@ static bool netvsc_rx_pending(void) {
     return false;
 }
 
-static size_t netvsc_poll_rx(void (*input)(const void *, size_t)) {
+static size_t netvsc_poll_rx(struct netif *self, void (*input)(struct netif *, const void *, size_t)) {
     if (nv.detaching || (nv.ch && nv.ch->rescinded)) { netvsc_shutdown(); return 0; }
     if (!nv.ch || !nv.rx_packet) return 0;
     uint64_t started = clock_now_ns();
@@ -393,7 +394,7 @@ static size_t netvsc_poll_rx(void (*input)(const void *, size_t)) {
             struct setup_frame *saved = nv.setup_first;
             nv.setup_first = saved->next;
             if (!nv.setup_first) nv.setup_last = NULL;
-            input(saved->data, saved->len);
+            input(&nif, saved->data, saved->len);
             bytes += saved->len;
             frames++;
             messages++;
@@ -501,7 +502,7 @@ static size_t netvsc_poll_rx(void (*input)(const void *, size_t)) {
        event_pending before it wakes the net thread, so either the check below
        sees the arrival or the callback's wake comes after it. A blocked
        completion waits for host progress. */
-    bool pending = netvsc_rx_pending();
+    bool pending = netvsc_rx_pending(&nif);
     if (pending) {
         if (budget_exhausted) nv.rx_budget_yields++;
         net_rx_notify();
@@ -509,7 +510,8 @@ static size_t netvsc_poll_rx(void (*input)(const void *, size_t)) {
     return frames;
 }
 
-static void netvsc_get_stats(struct n_netstats *stats) {
+static void netvsc_get_stats(struct netif *self, struct n_netstats *stats) {
+    (void)self;
     stats->rx_dropped = nv.rx_dropped;
     stats->rx_invalid = nv.rx_invalid;
     stats->rx_budget_yields = nv.rx_budget_yields;
@@ -526,7 +528,7 @@ static bool netvsc_wait(volatile bool *flag, uint64_t deadline) {
     while (!*flag) {
         if (!nv.ch || nv.ch->rescinded || clock_now_ns() >= deadline) return false;
         uint64_t seen = __atomic_load_n(&nv.signals, __ATOMIC_SEQ_CST);
-        netvsc_poll_rx(NULL);
+        netvsc_poll_rx(&nif, NULL);
         if (*flag || !nv.ch) break;
         if ((nv.rx_borrowed && !nv.completion_wait) || vmbus_rx_pending(nv.ch) ||
             (nv.completion_wait && vmbus_write_ready(nv.ch, sizeof(struct vmpacket_desc) + NVSP_MSG_SIZE)))
@@ -648,7 +650,8 @@ static bool rndis_set(uint32_t oid, const void *val, uint32_t len) {
     return rndis_request(buf, sizeof *s + len);
 }
 
-static int netvsc_send(const void *frame, size_t len) {
+static int netvsc_send(struct netif *self, const void *frame, size_t len) {
+    (void)self;
     if (!nv.ch || nv.detaching || nv.ch->rescinded) return -N_ERR_NETWORK_DOWN;
     if (len > 1514 || sizeof(struct rndis_packet) + len > nv.section_size) return -N_ERR_INVALID;
     uint32_t sec = section_alloc();

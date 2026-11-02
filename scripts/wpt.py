@@ -5,7 +5,7 @@ The host serves a WPT checkout with WPT's own server (tools/serve on 127.0.0.1, 
 http 8000/8001, https 8443/8444, h2 9000, ws 8888, wss 8889 ...) and answers the guest's DNS for
 the WPT host names (web-platform.test, its www/www1/... subdomains, not-web-platform.test) with
 10.0.2.2, QEMU's address for the host; every other name is NXDOMAIN. A copy of build/nocturne.img
-boots headless in QEMU, the test build of the kernel with its flag dns-server=10.0.2.2:<port>, and tests/wptrunner.c in
+boots headless in QEMU, with the setting network.dns-server at 10.0.2.2:<port>, and tests/wptrunner.c in
 C:\\Tests, which the tests service runs. The guest runner keeps one browser per slot as this script says over
 one TCP connection. Each browser goes from test to test by itself: tests/wpt/testharnessreport.js
 (served in place of WPT's) posts a top-level test document's results to /_nocturne/harness.py,
@@ -410,7 +410,6 @@ def prepare_disk(a, test, disk, dns_port, control_port):
     with tempfile.TemporaryDirectory(prefix="wpt-", dir=BUILD) as scratch:
         if not a.skip_build_check:
             test.system_payload(disk, scratch)
-        test.edit_boot_entry(disk, scratch, "dns-server=%s:%d" % (GUEST_HOST, dns_port))
         files = []
 
         def note(name, text):
@@ -424,6 +423,7 @@ def prepare_disk(a, test, disk, dns_port, control_port):
             files.append(("C:\\Nocturne\\Certificates\\web-platform-tests.pem",
                           os.path.join(a.wpt, "tools", "certs", "cacert.pem")))
         note("wptport", "%d\n" % control_port)
+        note("dns-server", "%s:%d\n" % (GUEST_HOST, dns_port))  # tests/testrun.c gives it to the setting network.dns-server
         note("autorun.sh", "tcc -o C:\\Tests\\wptrunner C:\\Tests\\wptrunner.c && C:\\Tests\\wptrunner\n")
         print("wpt: C:\\Tests: " + test.put_tests(disk, files, scratch), flush=True)
     test.write_to_larger_disk(disk, os.path.getsize(disk) + test.TEST_ROOM)

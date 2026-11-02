@@ -117,11 +117,12 @@ static enum irq_result e1000_irq(void *context) {
     return icr ? IRQ_HANDLED : IRQ_NONE; /* its INTx line may be shared */
 }
 
-static bool e1000_rx_pending(void) {
+static bool e1000_rx_pending(struct netif *self) {
+    (void)self;
     return rx_irq_pending || (rx[rx_cur].status & DESC_DD);
 }
 
-static size_t e1000_poll_rx(void (*input)(const void *, size_t)) {
+static size_t e1000_poll_rx(struct netif *self, void (*input)(struct netif *, const void *, size_t)) {
     wr(REG_IMC, RX_IRQS);
     size_t consumed = 0;
     int returned = -1;
@@ -135,7 +136,7 @@ static size_t e1000_poll_rx(void (*input)(const void *, size_t)) {
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         uint16_t len = rx[rx_cur].len;
         if ((rx[rx_cur].status & RX_EOP) && !rx[rx_cur].errors && len <= BUFSZ)
-            input(rxbuf[rx_cur], len);
+            input(self, rxbuf[rx_cur], len);
         rx[rx_cur].status = 0;
         returned = rx_cur;
         rx_cur = (rx_cur + 1) % NRX;
@@ -160,7 +161,8 @@ static size_t e1000_poll_rx(void (*input)(const void *, size_t)) {
     return consumed;
 }
 
-static int e1000_send(const void *frame, size_t len) {
+static int e1000_send(struct netif *self, const void *frame, size_t len) {
+    (void)self;
     if (len > BUFSZ) return -N_ERR_INVALID;
     while (tx_clean != tx_cur && (tx[tx_clean].status & DESC_DD))
         tx_clean = (tx_clean + 1) % NTX;

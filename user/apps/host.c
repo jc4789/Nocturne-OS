@@ -1,6 +1,7 @@
 /* host: DNS lookup */
 #include <stdio.h>
 #include "nocturne.h"
+#include "nocturne_services.h"
 
 int main(int argc, char **argv) {
     if (argc < 2) {

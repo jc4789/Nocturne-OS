@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
+#include "nocturne_services.h"
 
 int main(int argc, char **argv) {
     int count = 4;

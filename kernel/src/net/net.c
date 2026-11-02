@@ -1,19 +1,21 @@
-/* Nocturne network stack: Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS and a small TCP client.
+/* Nocturne network stack: Ethernet, ARP, IPv4, ICMP, UDP and a TCP with passive and active opens,
+   over any number of adapters. No names, no leases, no choices here: the address of each adapter
+   and the route table come from the service "network" (SYS_NET_ADDRESS_SET, SYS_NET_ROUTES_SET).
 
    Any CPU. Received frames wait in the NIC's own ring (poll_rx) or in the receive queue below,
    filled from interrupt handlers and driver threads; the "net" kernel thread takes them in.
    System calls run the protocol themselves in the calling task, and sleep on their socket's
-   progress (or shared_progress for link, ARP, DNS and UDP state) until a change or their
-   deadline. Every time here is on the clock's axis (sys/clock.h): a moment is clock_now_ns, a
-   deadline the moment it ends (CLOCK_NEVER: none). Nothing polls: the net thread sleeps until a
-   frame, a driver's notice or one of its timers (struct net_timer) wakes it.
+   progress (or shared_progress for link, ARP and UDP state) until a change or their deadline.
+   Every time here is on the clock's axis (sys/clock.h): a moment is clock_now_ns, a deadline the
+   moment it ends (CLOCK_NEVER: none). Nothing polls: the net thread sleeps until a frame, a
+   driver's notice or one of its timers (struct net_timer) wakes it.
 
    Locks, the first before the later ones:
-   - net_lock (a mutex): every piece of protocol state (sockets and their rings, ARP, DHCP, DNS,
-     pings, the output frame, the timers' moments, the counters) and every call into the adapter
+   - net_lock (a mutex): every piece of protocol state (sockets and their rings, ARP, routes,
+     pings, the output frame, the timers' moments, the counters) and every call into an adapter
      (struct netif). Held by a system call from entry to return, given back while it sleeps; held
      by the net thread for one batch at a time. Allocations, copies of the app's memory and the
-     adapter's own locks happen under it. Never taken by an interrupt handler or an alarm's fire.
+     adapters' own locks happen under it. Never taken by an interrupt handler or an alarm's fire.
    - a NIC driver's own lock (its rings and its interrupt state; see the driver).
    - rxq_lock, config_lock (spinlocks): leaves, nothing but a wait queue's lock under them, so an
      interrupt handler, an alarm's fire or any driver context may take them. */
@@ -36,7 +38,7 @@
 #include "../sys/wait.h"
 #include "../vm/vm.h"
 #include "../sys/channel.h"
-#include "dns_name.h"
+#include "../sys/watch.h"
 #include "sys/authority.h"
 
 static struct mutex net_lock;
@@ -54,20 +56,39 @@ static void progress_wake(struct net_progress *p) {
     wq_wake_all(&p->wq);
 }
 
-/* The adapter, its address and the IPv4 configuration: written under both net_lock and
-   config_lock, read under either (net_config, from any context, takes config_lock). */
+/* An adapter as the stack keeps it: for good, once it has been seen, so a socket, a route or a
+   queued frame can always name it; dev is NULL while the device is gone. The list and each ip and
+   mask are written under both net_lock and config_lock, read under either (net_adapter_info, from
+   any context, takes config_lock). dev and the rest belong to net_lock. */
+struct arp_entry {
+    uint32_t ip;
+    uint8_t mac[6];
+    uint64_t time; /* when it was learnt */
+    bool valid;
+};
+struct net_adapter {
+    struct net_adapter *next;
+    uint32_t id;
+    struct netif *dev;
+    uint8_t mac[6];
+    const char *driver; /* a driver's constant */
+    uint32_t ip, mask; /* ip 0: no address yet */
+    uint64_t rx_packets, tx_packets;
+    struct arp_entry *arp; /* as many as the link has spoken to this system */
+    size_t arp_count;
+};
 static struct spinlock config_lock;
-static struct netif *nif;
-static uint8_t link_mac[6];
-static const char *link_driver;
-static uint32_t my_ip, my_mask, my_gw, my_dns;
-static bool configured;
-static uint64_t dns_chosen; /* N_NETWORK_DNS_SERVER, ip << 16 | port (atomic); 0: what DHCP said */
-static struct n_sockaddr dns_default_resolver(void);
+static struct net_adapter *adapters, **adapters_end = &adapters;
+static uint32_t adapter_ids;
+/* The whole table from the service: destination & mask matches, to gateway (0: on the link) by
+   adapter; the longest mask first, then the lowest metric. An adapter's own network is a route of
+   its own with metric 0. */
+static struct n_net_route *routes;
+static size_t route_count;
+static struct watched net_watch; /* the adapters, their addresses, the routes */
 
-static uint64_t rx_packets, tx_packets;
 static uint64_t net_service_bytes; /* wire bytes in and out: the net thread's service window */
-static struct net_progress shared_progress; /* link/ARP/DNS/UDP progress */
+static struct net_progress shared_progress; /* link/ARP/UDP progress */
 static bool receive_batch; /* the net thread is taking in a batch: socket wakes wait for its end */
 
 /* Tasks other than the net thread that wait for net_lock, and the net thread's wish for one of
@@ -244,19 +265,20 @@ struct tcp_hdr {
 
 /* Frames copied in by interrupt handlers, driver threads and the loopback output, taken in by
    the net thread, which reads the slot at the tail in place (a producer never writes it) and
-   gives it back after. rxq_lock guards head, tail, the counters, the fired timers' queue below
+   gives it back after. A slot's adapter is NULL for this system's own datagrams to itself. rxq_lock guards head, tail, the counters, the fired timers' queue below
    and net_work_pending, the net thread's wake latch (the conditions it sleeps on, rxq_wq). */
 #define RXQ 64
 static uint8_t rxq_buf[RXQ][1536];
 static uint16_t rxq_len[RXQ];
+static struct net_adapter *rxq_from[RXQ];
 static int rxq_head, rxq_tail;
 static struct spinlock rxq_lock;
 static struct wait_queue rxq_wq;
 static bool net_work_pending;
 static uint64_t rxq_dropped, rxq_invalid, rxq_high_water;
 
-/* Work the net thread does at a moment of the clock: a TCP connection's next look, DHCP's next
-   message, a held-back test segment. Its alarm (sys/alarm.h) fires in a timer interrupt, where
+/* Work the net thread does at a moment of the clock: a TCP connection's next look, a held-back
+   test segment. Its alarm (sys/alarm.h) fires in a timer interrupt, where
    net_lock, a mutex, cannot be taken: the fire queues it and wakes the thread, which runs it under
    net_lock. A timer is armed for no more than the earliest moment it is wanted by and only ever
    moved earlier (net_timer_at); one that fires before its work is due makes the thread look and
@@ -325,28 +347,31 @@ void net_rx_notify(void) {
 }
 
 /* rxq_lock held: the frame into the queue, and the net thread told; false when it is full. */
-static bool rxq_put_locked(const void *frame, size_t len) {
+static bool rxq_put_locked(struct net_adapter *from, const void *frame, size_t len) {
     int next = (rxq_head + 1) % RXQ;
     if (next == rxq_tail) return false;
     memcpy(rxq_buf[rxq_head], frame, len);
     rxq_len[rxq_head] = (uint16_t)len;
+    rxq_from[rxq_head] = from;
     rxq_head = next;
     rxq_high_water = MAX(rxq_high_water, (uint64_t)((rxq_head - rxq_tail + RXQ) % RXQ));
     net_work_pending = true;
     return true;
 }
 
-void net_rx(const void *frame, size_t len) {
+void net_rx(struct netif *dev, const void *frame, size_t len) {
+    struct net_adapter *from = __atomic_load_n(&dev->adapter, __ATOMIC_ACQUIRE);
+    if (!from) return; /* it has not been registered yet: as if the frame came a moment earlier */
     uint64_t flags = spin_lock(&rxq_lock);
     bool queued = false;
     if (len < 14 || len > 1536) rxq_invalid++;
-    else if (!(queued = rxq_put_locked(frame, len))) rxq_dropped++;
+    else if (!(queued = rxq_put_locked(from, frame, len))) rxq_dropped++;
     spin_unlock(&rxq_lock, flags);
     if (queued) wq_wake_all(&rxq_wq);
 }
 
 /* The net thread, net_lock held: every queued frame, including those queued meanwhile. */
-static void eth_input(const void *packet, size_t len);
+static void eth_input(struct net_adapter *from, const void *packet, size_t len);
 static void rxq_drain(void) {
     for (;;) {
         uint64_t flags = spin_lock(&rxq_lock);
@@ -354,7 +379,7 @@ static void rxq_drain(void) {
         bool empty = at == rxq_head;
         spin_unlock(&rxq_lock, flags);
         if (empty) return;
-        eth_input(rxq_buf[at], rxq_len[at]);
+        eth_input(rxq_from[at], rxq_buf[at], rxq_len[at]);
         flags = spin_lock(&rxq_lock);
         rxq_tail = (at + 1) % RXQ;
         spin_unlock(&rxq_lock, flags);
@@ -368,48 +393,54 @@ static uint8_t frame[1600];
 #define L4 (frame + 14 + 20) /* transport payload area */
 static uint16_t ip_ident;
 
-static int eth_output(const uint8_t dst[6], uint16_t type, size_t len) {
-    if (!nif) return -N_ERR_NETWORK_DOWN;
+static int eth_output(struct net_adapter *a, const uint8_t dst[6], uint16_t type, size_t len) {
+    if (!a->dev) return -N_ERR_NETWORK_DOWN;
     struct eth_hdr *e = (struct eth_hdr *)frame;
     memcpy(e->dst, dst, 6);
-    memcpy(e->src, link_mac, 6);
+    memcpy(e->src, a->mac, 6);
     e->type = htons(type);
     size_t total = 14 + len;
     if (total < 60) {
         memset(frame + total, 0, 60 - total);
         total = 60;
     }
-    int result = nif->send(frame, total);
-    if (!result) {tx_packets++;net_service_bytes+=total;}
+    int result = a->dev->send(a->dev, frame, total);
+    if (!result) {a->tx_packets++;net_service_bytes+=total;}
     return result;
 }
 
-/* This system's own addresses: the loopback network 127/8 and the interface
-   address. Their datagrams never reach the wire. */
-static bool ip_is_local(uint32_t dst) { return (dst >> 24) == 127 || (configured && dst == my_ip); }
-/* A datagram to 127/8 comes from that same loopback address, so both ends of
-   a local connection name each other alike; everything else is from my_ip. */
-static uint32_t ip_source(uint32_t dst) { return (dst >> 24) == 127 ? dst : my_ip; }
+/* This system's own addresses: the loopback network 127/8 and every adapter's address. Their
+   datagrams never reach a wire. */
+static bool ip_is_local(uint32_t dst) {
+    if ((dst >> 24) == 127) return true;
+    for (struct net_adapter *a = adapters; a; a = a->next)
+        if (a->ip && a->ip == dst) return true;
+    return false;
+}
 
-/* Enter a local datagram in the receive queue as if the card had delivered it.
+/* How a datagram leaves: by which adapter (NULL: it stays in this system), to which link address,
+   with which source address. A connection keeps its own. */
+struct net_path {
+    struct net_adapter *via;
+    uint32_t src;
+    uint8_t mac[6];
+};
+
+/* Enter a local datagram in the receive queue as if a card had delivered it.
    A full queue is backpressure (the caller retries), not a lost packet. */
 static int ip_loopback(size_t len) {
-    if (!nif) return -N_ERR_NETWORK_DOWN;
     struct eth_hdr *e = (struct eth_hdr *)frame;
-    memcpy(e->dst, link_mac, 6);
-    memcpy(e->src, link_mac, 6);
+    memset(e, 0, sizeof *e);
     e->type = htons(0x0800);
     uint64_t flags = spin_lock(&rxq_lock);
-    bool queued = rxq_put_locked(frame, 14 + len);
+    bool queued = rxq_put_locked(NULL, frame, 14 + len);
     spin_unlock(&rxq_lock, flags);
     if (!queued) return -N_ERR_BUSY;
     wq_wake_all(&rxq_wq);
-    tx_packets++;
     return 0;
 }
 
-/* src is the datagram's source address: ip_source(dst), or 0 for a DHCP client's broadcast. */
-static int ip_output(uint32_t src, uint32_t dst, const uint8_t mac[6], uint8_t proto, size_t len) {
+static int ip_output(const struct net_path *path, uint32_t dst, uint8_t proto, size_t len) {
     struct ip_hdr *ip = (struct ip_hdr *)(frame + 14);
     ip->vihl = 0x45;
     ip->tos = 0;
@@ -419,116 +450,196 @@ static int ip_output(uint32_t src, uint32_t dst, const uint8_t mac[6], uint8_t p
     ip->ttl = 64;
     ip->proto = proto;
     ip->csum = 0;
-    ip_put(ip->src, src);
+    ip_put(ip->src, path->src);
     ip_put(ip->dst, dst);
     ip->csum = htons(csum_fold(csum_add(0, ip, 20)));
-    if (ip_is_local(dst)) return ip_loopback(20 + len);
-    return eth_output(mac, 0x0800, 20 + len);
+    if (!path->via) return ip_loopback(20 + len);
+    return eth_output(path->via, path->mac, 0x0800, 20 + len);
 }
 
 /* ---------------------------------------------------------------- ARP */
 
-#define ARP_N 16
 #define ARP_LIFETIME (600 * NS_PER_S) /* a learnt address is asked for again after this */
 #define ARP_RETRY    NS_PER_S         /* a request unanswered this long is sent again */
-static struct arp_entry {
-    uint32_t ip;
-    uint8_t mac[6];
-    uint64_t time; /* when it was learnt */
-    bool valid;
-} arp_tab[ARP_N];
 
-static bool arp_lookup(uint32_t ip, uint8_t mac[6]) {
-    uint64_t now = clock_now_ns();
-    for (int i = 0; i < ARP_N; i++)
-        if (arp_tab[i].valid && arp_tab[i].ip == ip && now < arp_tab[i].time + ARP_LIFETIME) {
-            memcpy(mac, arp_tab[i].mac, 6);
-            return true;
-        }
-    return false;
+static struct arp_entry *arp_entry_of(const struct net_adapter *a, uint32_t ip) {
+    for (size_t i = 0; i < a->arp_count; i++)
+        if (a->arp[i].valid && a->arp[i].ip == ip) return &a->arp[i];
+    return NULL;
 }
 
-static void arp_store(uint32_t ip, const uint8_t mac[6]) {
-    int slot = 0;
-    for (int i = 0; i < ARP_N; i++) {
-        if (arp_tab[i].valid && arp_tab[i].ip == ip) {
-            slot = i;
-            break;
-        }
-        if (!arp_tab[i].valid || arp_tab[i].time < arp_tab[slot].time) slot = i;
+static bool arp_lookup(const struct net_adapter *a, uint32_t ip, uint8_t mac[6]) {
+    const struct arp_entry *e = arp_entry_of(a, ip);
+    if (!e || clock_now_ns() >= e->time + ARP_LIFETIME) return false;
+    memcpy(mac, e->mac, 6);
+    return true;
+}
+
+/* RFC 826, "Packet Reception": what is known is brought up to date; a new pair is learnt only from
+   a packet for this system, so the table holds who speaks to it, not the whole link. An entry past
+   its lifetime gives its place; a table that cannot grow gives up its oldest. */
+static void arp_store(struct net_adapter *a, uint32_t ip, const uint8_t mac[6], bool for_us) {
+    struct arp_entry *e = arp_entry_of(a, ip);
+    if (!e && !for_us) return;
+    if (!e) {
+        uint64_t now = clock_now_ns();
+        for (size_t i = 0; i < a->arp_count && !e; i++)
+            if (!a->arp[i].valid || now >= a->arp[i].time + ARP_LIFETIME) e = &a->arp[i];
     }
-    arp_tab[slot].ip = ip;
-    memcpy(arp_tab[slot].mac, mac, 6);
-    arp_tab[slot].time = clock_now_ns();
-    arp_tab[slot].valid = true;
+    if (!e) {
+        size_t grown = a->arp_count ? a->arp_count * 2 : 4; /* what a link with a gateway and a few peers uses */
+        struct arp_entry *table = kzalloc(grown * sizeof *table);
+        if (table) {
+            if (a->arp_count) memcpy(table, a->arp, a->arp_count * sizeof *table);
+            kfree(a->arp);
+            a->arp = table;
+            e = &table[a->arp_count];
+            a->arp_count = grown;
+        } else {
+            for (size_t i = 0; i < a->arp_count; i++)
+                if (!e || a->arp[i].time < e->time) e = &a->arp[i];
+            if (!e) return;
+        }
+    }
+    e->ip = ip;
+    memcpy(e->mac, mac, 6);
+    e->time = clock_now_ns();
+    e->valid = true;
     progress_wake(&shared_progress);
 }
 
-static void arp_send(uint16_t op, const uint8_t tha[6], uint32_t tpa, const uint8_t dst[6]) {
+static void arp_send(struct net_adapter *ad, uint16_t op, const uint8_t tha[6], uint32_t tpa, const uint8_t dst[6]) {
     struct arp_pkt *a = (struct arp_pkt *)(frame + 14);
     a->htype = htons(1);
     a->ptype = htons(0x0800);
     a->hlen = 6;
     a->plen = 4;
     a->op = htons(op);
-    memcpy(a->sha, link_mac, 6);
-    ip_put(a->spa, my_ip);
+    memcpy(a->sha, ad->mac, 6);
+    ip_put(a->spa, ad->ip);
     memcpy(a->tha, tha, 6);
     ip_put(a->tpa, tpa);
-    eth_output(dst, 0x0806, sizeof *a);
+    eth_output(ad, dst, 0x0806, sizeof *a);
 }
 
-static void arp_input(const uint8_t *p, size_t len) {
+static void arp_input(struct net_adapter *ad, const uint8_t *p, size_t len) {
     if (len < sizeof(struct arp_pkt)) return;
     const struct arp_pkt *a = (const struct arp_pkt *)p;
     if (ntohs(a->htype) != 1 || ntohs(a->ptype) != 0x0800 || a->hlen != 6 || a->plen != 4) return;
     uint32_t spa = ip_get(a->spa), tpa = ip_get(a->tpa);
-    if (spa) arp_store(spa, a->sha);
-    if (ntohs(a->op) == 1 && configured && tpa == my_ip) {
+    if (spa) arp_store(ad, spa, a->sha, ad->ip && tpa == ad->ip);
+    if (ntohs(a->op) == 1 && ad->ip && tpa == ad->ip) {
         uint8_t sha[6];
         memcpy(sha, a->sha, 6);
-        arp_send(2, sha, spa, sha);
+        arp_send(ad, 2, sha, spa, sha);
     }
 }
 
-static uint32_t next_hop(uint32_t dst) { return ((dst ^ my_ip) & my_mask) == 0 ? dst : my_gw; }
+static struct net_adapter *adapter_of(uint32_t id) {
+    for (struct net_adapter *a = adapters; a; a = a->next)
+        if (a->id == id) return a;
+    return NULL;
+}
 
-/* Resolve the link address (system call context: may block): three requests ARP_RETRY apart,
-   all of it by deadline (the caller's budget; CLOCK_NEVER: the requests alone bound it). */
-static int arp_resolve_until(uint32_t dst, uint8_t mac[6], uint64_t deadline) {
-    if (!nif) return -N_ERR_NETWORK_DOWN;
-    if(net_setup_cancelled())return -N_ERR_CANCELLED;
-    if (ip_is_local(dst)) { /* delivered by ip_loopback */
-        memcpy(mac, link_mac, 6);
+/* The adapter and next hop for dst, by adapter only when it is not NULL: the longest mask among the
+   adapters' own networks and the routes, then the lowest metric. NULL: no way there. */
+static struct net_adapter *route_find(uint32_t dst, struct net_adapter *only, uint32_t *hop) {
+    struct net_adapter *best = NULL;
+    int best_bits = -1;
+    uint32_t best_metric = 0;
+    for (struct net_adapter *a = adapters; a; a = a->next) {
+        if (!a->dev || !a->ip || (only && a != only) || ((dst ^ a->ip) & a->mask)) continue;
+        int bits = __builtin_popcount(a->mask);
+        if (bits > best_bits) {
+            best = a;
+            best_bits = bits;
+            best_metric = 0;
+            *hop = dst;
+        }
+    }
+    for (size_t i = 0; i < route_count; i++) {
+        const struct n_net_route *r = &routes[i];
+        if ((dst ^ r->destination) & r->mask) continue;
+        struct net_adapter *a = adapter_of(r->adapter);
+        if (!a || !a->dev || !a->ip || (only && a != only)) continue;
+        int bits = __builtin_popcount(r->mask);
+        if (bits > best_bits || (bits == best_bits && r->metric < best_metric)) {
+            best = a;
+            best_bits = bits;
+            best_metric = r->metric;
+            *hop = r->gateway ? r->gateway : dst;
+        }
+    }
+    return best;
+}
+
+/* The link address of dst by a, its next hop hop (system call context: may block): three requests
+   ARP_RETRY apart, all of it by deadline (the caller's budget; CLOCK_NEVER: the requests alone
+   bound it). */
+static int path_on_link(struct net_adapter *a, uint32_t dst, uint32_t hop, struct net_path *path, uint64_t deadline) {
+    path->via = a;
+    path->src = a->ip;
+    if (dst == 0xFFFFFFFF || (a->ip && dst == (a->ip | ~a->mask))) {
+        memcpy(path->mac, bcast_mac, 6);
         return 0;
     }
-    if (dst == 0xFFFFFFFF || dst == (my_ip | ~my_mask)) {
-        memcpy(mac, bcast_mac, 6);
-        return 0;
-    }
-    if (!configured) return -N_ERR_NETWORK_DOWN;
-    uint32_t hop = next_hop(dst);
-    if (!hop) return -N_ERR_UNREACHABLE;
+    if (!a->ip) return -N_ERR_NETWORK_DOWN;
     for (int tries = 0; tries < 3; tries++) {
         if (thread_current()->killed) return -N_ERR_STOPPED;
         if(net_setup_cancelled())return -N_ERR_CANCELLED;
         if (clock_now_ns() >= deadline) return -N_ERR_TIMEOUT;
-        if (arp_lookup(hop, mac)) return 0;
-        arp_send(1, (const uint8_t *)"\0\0\0\0\0\0", hop, bcast_mac);
+        if (!a->dev) return -N_ERR_NETWORK_DOWN;
+        if (arp_lookup(a, hop, path->mac)) return 0;
+        arp_send(a, 1, (const uint8_t *)"\0\0\0\0\0\0", hop, bcast_mac);
         uint64_t until = MIN(clock_after(ARP_RETRY), deadline);
         for (;;) {
             if (thread_current()->killed) return -N_ERR_STOPPED;
             if(net_setup_cancelled())return -N_ERR_CANCELLED;
             uint64_t now = clock_now_ns();
             if (now >= deadline) return -N_ERR_TIMEOUT;
-            if (arp_lookup(hop, mac)) return 0;
+            if (arp_lookup(a, hop, path->mac)) return 0;
             if (now >= until) break;
             net_sleep(&shared_progress, until, true);
         }
     }
     return -N_ERR_UNREACHABLE;
 }
-static int arp_resolve(uint32_t dst, uint8_t mac[6]) { return arp_resolve_until(dst, mac, CLOCK_NEVER); }
+
+/* The path to dst, which may be this system itself. A datagram to 127/8 comes from that same
+   address, and so does one to an adapter's address, so both ends of a local connection name each
+   other alike. */
+static int path_to(uint32_t dst, struct net_path *path, uint64_t deadline) {
+    if(net_setup_cancelled())return -N_ERR_CANCELLED;
+    if (ip_is_local(dst)) {
+        *path = (struct net_path){.src = dst};
+        return 0;
+    }
+    uint32_t hop = dst;
+    /* the limited broadcast goes where the default route goes */
+    struct net_adapter *a = route_find(dst == 0xFFFFFFFF ? 0 : dst, NULL, &hop);
+    if (!a) {
+        for (a = adapters; a; a = a->next)
+            if (a->dev && a->ip) return dst == 0xFFFFFFFF ? path_on_link(a, dst, dst, path, deadline) : -N_ERR_UNREACHABLE;
+        return -N_ERR_NETWORK_DOWN;
+    }
+    return path_on_link(a, dst, hop, path, deadline);
+}
+
+/* The path by the one adapter a socket is bound to, which may have no address yet. */
+static int path_by(struct net_adapter *a, uint32_t dst, struct net_path *path) {
+    if (!a->dev) return -N_ERR_NETWORK_DOWN;
+    uint32_t hop = dst;
+    if (dst != 0xFFFFFFFF && !route_find(dst, a, &hop)) return a->ip ? -N_ERR_UNREACHABLE : -N_ERR_NETWORK_DOWN;
+    return path_on_link(a, dst, hop, path, CLOCK_NEVER);
+}
+
+/* The way back for what came in by from (NULL: from this system) addressed to dst: the frame's
+   sender is the next hop. */
+static struct net_path path_back(struct net_adapter *from, const uint8_t *mac, uint32_t dst) {
+    struct net_path path = {.via = from, .src = from && dst != from->ip ? from->ip : dst};
+    if (from) memcpy(path.mac, mac, 6);
+    return path;
+}
 
 /* ---------------------------------------------------------------- ICMP */
 
@@ -539,18 +650,17 @@ static struct ping_wait {
     uint64_t replied; /* the moment the echo reply came in */
 } pings[PING_N];
 
-static void icmp_input(const uint8_t *src_mac, uint32_t src, const uint8_t *p, size_t len) {
+static void icmp_input(struct net_adapter *from, const uint8_t *src_mac, uint32_t src, uint32_t dst, const uint8_t *p, size_t len) {
     if (len < 8 || csum_fold(csum_add(0, p, len)) != 0) return;
     const struct icmp_hdr *h = (const struct icmp_hdr *)p;
-    if (h->type == 8 && configured && len <= 1400) {
-        uint8_t mac[6];
-        memcpy(mac, src_mac, 6);
+    if (h->type == 8 && (!from || from->ip) && len <= 1400) {
+        struct net_path back = path_back(from, src_mac, dst);
         memcpy(L4, p, len);
         struct icmp_hdr *r = (struct icmp_hdr *)L4;
         r->type = 0;
         r->csum = 0;
         r->csum = htons(csum_fold(csum_add(0, L4, len)));
-        ip_output(ip_source(src), src, mac, 1, len);
+        ip_output(&back, src, 1, len);
     } else if (h->type == 0) {
         uint64_t now = clock_now_ns();
         for (int i = 0; i < PING_N; i++)
@@ -564,9 +674,9 @@ static void icmp_input(const uint8_t *src_mac, uint32_t src, const uint8_t *p, s
 
 /* SYS_NET_PING: the round trip in ns, the address resolution and the echo both by deadline. */
 static int64_t sys_ping(uint32_t dst, int seq, uint64_t deadline) {
-    if (dst == my_ip || (dst >> 24) == 127) return 0;
-    uint8_t mac[6];
-    int r = arp_resolve_until(dst, mac, deadline);
+    if (ip_is_local(dst)) return 0;
+    struct net_path path;
+    int r = path_to(dst, &path, deadline);
     if (r < 0) return r;
     int slot = -1;
     for (int i = 0; i < PING_N; i++)
@@ -586,7 +696,7 @@ static int64_t sys_ping(uint32_t dst, int seq, uint64_t deadline) {
     memcpy(L4 + 8, "Nocturne says hello to the night.", 32);
     h->csum = htons(csum_fold(csum_add(0, L4, 40)));
     uint64_t sent = clock_now_ns();
-    ip_output(ip_source(dst), dst, mac, 1, 40);
+    ip_output(&path, dst, 1, 40);
     int64_t ret = -N_ERR_TIMEOUT;
     while (!w->done && clock_now_ns() < deadline) {
         if (thread_current()->killed) {
@@ -610,16 +720,17 @@ struct udp_dgram {
     uint8_t data[1472];
 };
 struct udp_sock {
-    bool used, internal;
+    bool used;
     int pid;
     uint16_t port;
+    struct net_adapter *bound; /* NULL: every adapter. Bound: this one only, with or without an address. */
     uint64_t generation;
     struct udp_dgram *q;
     int qh, qt;
 };
 /* Socket metadata must stay at a stable address across a blocking receive.
    The pointer table grows, while queues exist only for live sockets. The
-   initial capacity is not a global concurrency limit for DNS or user UDP. */
+   initial capacity is not a global concurrency limit. */
 static struct udp_sock udp_initial[UDP_INITIAL];
 static struct udp_sock *udp_initial_slots[UDP_INITIAL]={
     &udp_initial[0],&udp_initial[1],&udp_initial[2],&udp_initial[3],
@@ -635,7 +746,7 @@ static uint16_t ephemeral_port(void) {
     return next_port++;
 }
 
-static int udp_output(uint16_t sport, uint32_t src, uint32_t dst, uint16_t dport, const uint8_t mac[6],
+static int udp_output(uint16_t sport, const struct net_path *path, uint32_t dst, uint16_t dport,
                       const void *data, size_t len) {
     if (len > 1472) return -N_ERR_INVALID;
     struct udp_hdr *u = (struct udp_hdr *)L4;
@@ -644,43 +755,45 @@ static int udp_output(uint16_t sport, uint32_t src, uint32_t dst, uint16_t dport
     u->len = htons((uint16_t)(8 + len));
     u->csum = 0;
     memcpy(L4 + 8, data, len);
-    uint16_t c = l4_csum(src, dst, 17, L4, 8 + len);
+    uint16_t c = l4_csum(path->src, dst, 17, L4, 8 + len);
     u->csum = htons(c ? c : 0xFFFF);
-    return ip_output(src, dst, mac, 17, 8 + len);
+    return ip_output(path, dst, 17, 8 + len);
 }
 
-static void dhcp_input(const uint8_t *p, size_t len);
+/* A socket bound to the adapter the datagram came in by goes before one on every adapter. */
+static struct udp_sock *udp_of(struct net_adapter *from, uint16_t port) {
+    struct udp_sock *any = NULL;
+    for (size_t i = 0; i < udp_capacity; i++) {
+        struct udp_sock *s = udp_socks[i];
+        if (!s || !s->used || s->port != port) continue;
+        if (from && s->bound == from) return s;
+        if (!s->bound) any = s;
+    }
+    return any;
+}
 
-static void udp_input(uint32_t src, uint32_t dst, const uint8_t *p, size_t len) {
+static void udp_input(struct net_adapter *from, uint32_t src, uint32_t dst, const uint8_t *p, size_t len) {
     if (len < 8) return;
     const struct udp_hdr *u = (const struct udp_hdr *)p;
     size_t ulen = ntohs(u->len);
     if (ulen < 8 || ulen > len) return;
     if (u->csum && l4_csum(src, dst, 17, p, ulen) != 0) return;
-    uint16_t dport = ntohs(u->dport);
-    if (dport == 68) {
-        dhcp_input(p + 8, ulen - 8);
-        return;
-    }
-    for (size_t i = 0; i < udp_capacity; i++) {
-        struct udp_sock *s = udp_socks[i];
-        if (!s || !s->used || s->port != dport) continue;
-        int next = (s->qh + 1) % UDP_Q;
-        if (next == s->qt || ulen - 8 > sizeof s->q[0].data) return;
-        struct udp_dgram *d = &s->q[s->qh];
-        d->src = src;
-        d->sport = ntohs(u->sport);
-        d->len = (uint16_t)(ulen - 8);
-        memcpy(d->data, p + 8, ulen - 8);
-        s->qh = next;
-        progress_wake(&shared_progress);
-        return;
-    }
+    struct udp_sock *s = udp_of(from, ntohs(u->dport));
+    if (!s) return;
+    int next = (s->qh + 1) % UDP_Q;
+    if (next == s->qt || ulen - 8 > sizeof s->q[0].data) return;
+    struct udp_dgram *d = &s->q[s->qh];
+    d->src = src;
+    d->sport = ntohs(u->sport);
+    d->len = (uint16_t)(ulen - 8);
+    memcpy(d->data, p + 8, ulen - 8);
+    s->qh = next;
+    progress_wake(&shared_progress);
 }
 
-static bool udp_port_used(uint16_t port) {
+static bool udp_port_used(uint16_t port, const struct net_adapter *bound) {
     for(size_t i=0;i<udp_capacity;i++)
-        if(udp_socks[i] && udp_socks[i]->used && udp_socks[i]->port==port)return true;
+        if(udp_socks[i] && udp_socks[i]->used && udp_socks[i]->port==port && udp_socks[i]->bound==bound)return true;
     return false;
 }
 static void udp_release(struct udp_sock *s) {
@@ -688,12 +801,12 @@ static void udp_release(struct udp_sock *s) {
     s->used=false;kfree(s->q);s->q=NULL;s->qh=s->qt=0;
     progress_wake(&shared_progress);
 }
-static int udp_alloc(uint16_t port, int pid) {
-    if(port) {if(udp_port_used(port))return -N_ERR_ADDRESS_IN_USE;}
+static int udp_alloc(uint16_t port, int pid, struct net_adapter *bound) {
+    if(port) {if(udp_port_used(port,bound))return -N_ERR_ADDRESS_IN_USE;}
     else {
         /* There are exactly 16384 ephemeral UDP ports, not eight sockets. */
         unsigned attempts=0;
-        do {port=ephemeral_port();if(!udp_port_used(port))break;}while(++attempts<16384);
+        do {port=ephemeral_port();if(!udp_port_used(port,bound))break;}while(++attempts<16384);
         if(attempts==16384)return -N_ERR_ADDRESS_IN_USE;
     }
     size_t slot=0;
@@ -717,14 +830,15 @@ static int udp_alloc(uint16_t port, int pid) {
     }
     struct udp_dgram *queue=kmalloc(UDP_Q*sizeof *queue);
     if(!queue)return -N_ERR_NO_MEMORY;
-    memset(s,0,sizeof *s);s->q=queue;s->used=true;s->pid=pid;s->port=port;
+    memset(s,0,sizeof *s);s->q=queue;s->used=true;s->pid=pid;s->port=port;s->bound=bound;
     if(++udp_generation==0)++udp_generation;
     s->generation=udp_generation;
     return (int)slot;
 }
 
 /* Wait for a datagram on socket i until deadline: the datagram, or NULL with *err set
-   (-N_ERR_NOT_READY once the deadline has come). */
+   (-N_ERR_NOT_READY once the deadline has come; the calling thread's cancel channel ends it too,
+   as it does every setup wait). */
 static struct udp_dgram *udp_wait(int i, uint64_t deadline, int *err) {
     struct udp_sock *s = udp_socks[i];
     uint64_t generation=s->generation;
@@ -732,7 +846,7 @@ static struct udp_dgram *udp_wait(int i, uint64_t deadline, int *err) {
         /* A sibling thread can close/reuse this handle while we sleep. Never
            consume another socket generation or touch its freed queue. */
         if(!s->used || s->generation!=generation){*err=-N_ERR_NO_HANDLE;return NULL;}
-        if(s->internal && net_setup_cancelled()){*err=-N_ERR_CANCELLED;return NULL;}
+        if(net_setup_cancelled()){*err=-N_ERR_CANCELLED;return NULL;}
         if (s->qt != s->qh) {
             struct udp_dgram *d = &s->q[s->qt];
             s->qt = (s->qt + 1) % UDP_Q;
@@ -746,414 +860,14 @@ static struct udp_dgram *udp_wait(int i, uint64_t deadline, int *err) {
             *err = -N_ERR_NOT_READY;
             return NULL;
         }
-        net_sleep(&shared_progress, deadline, s->internal);
+        net_sleep(&shared_progress, deadline, true);
     }
 }
 
 static struct udp_sock *user_udp(int h) {
     if(h<0 || (size_t)h>=udp_capacity)return NULL;
     struct udp_sock *s=udp_socks[h];
-    return s && s->used && !s->internal && s->pid==process_current()->pid?s:NULL;
-}
-
-/* ---------------------------------------------------------------- DHCP */
-
-enum { DHCP_IDLE, DHCP_DISCOVER, DHCP_REQUEST, DHCP_BOUND };
-static int dhcp_state;
-static uint32_t dhcp_xid, dhcp_offer, dhcp_server;
-static uint64_t dhcp_next; /* the moment of the next message (a retry, or the renewal) */
-static int dhcp_tries;
-static struct net_timer dhcp_timer;
-
-static void dhcp_at(uint64_t at) {
-    dhcp_next = at;
-    net_timer_at(&dhcp_timer, at);
-}
-
-static void dhcp_send(int type) {
-    uint8_t b[300];
-    memset(b, 0, sizeof b);
-    b[0] = 1; /* BOOTREQUEST */
-    b[1] = 1;
-    b[2] = 6;
-    b[4] = (uint8_t)(dhcp_xid >> 24);
-    b[5] = (uint8_t)(dhcp_xid >> 16);
-    b[6] = (uint8_t)(dhcp_xid >> 8);
-    b[7] = (uint8_t)dhcp_xid;
-    b[10] = 0x80; /* broadcast replies please */
-    memcpy(b + 28, link_mac, 6);
-    static const uint8_t magic[4] = {99, 130, 83, 99};
-    memcpy(b + 236, magic, 4);
-    int o = 240;
-    b[o++] = 53;
-    b[o++] = 1;
-    b[o++] = (uint8_t)type;
-    b[o++] = 61; /* client id */
-    b[o++] = 7;
-    b[o++] = 1;
-    memcpy(b + o, link_mac, 6);
-    o += 6;
-    if (type == 3) {
-        b[o++] = 50;
-        b[o++] = 4;
-        ip_put(b + o, dhcp_offer);
-        o += 4;
-        if (dhcp_server) {
-            b[o++] = 54;
-            b[o++] = 4;
-            ip_put(b + o, dhcp_server);
-            o += 4;
-        }
-    }
-    b[o++] = 12; /* host name */
-    b[o++] = 8;
-    memcpy(b + o, "nocturne", 8);
-    o += 8;
-    b[o++] = 55; /* parameter request list */
-    b[o++] = 4;
-    b[o++] = 1;
-    b[o++] = 3;
-    b[o++] = 6;
-    b[o++] = 51;
-    b[o++] = 255;
-    udp_output(68, 0, 0xFFFFFFFF, 67, bcast_mac, b, sizeof b); /* from 0.0.0.0, also while bound */
-}
-
-static void dhcp_start(void) {
-    dhcp_state = DHCP_DISCOVER;
-    dhcp_xid = rnd();
-    dhcp_tries = 0;
-    dhcp_at(clock_now_ns());
-}
-
-static void dhcp_input(const uint8_t *p, size_t len) {
-    if (len < 240 || p[0] != 2 || ip_get(p + 4) != dhcp_xid) return;
-    if (p[236] != 99 || p[237] != 130 || p[238] != 83 || p[239] != 99) return;
-    int type = 0;
-    uint32_t mask = 0xFFFFFF00, router = 0, dns = 0, server = 0, lease = 86400;
-    for (size_t i = 240; i < len;) {
-        uint8_t opt = p[i];
-        if (opt == 255) break;
-        if (opt == 0) {
-            i++;
-            continue;
-        }
-        if (i + 1 >= len) break;
-        uint8_t l = p[i + 1];
-        const uint8_t *v = p + i + 2;
-        if (i + 2 + l > len) break;
-        if (opt == 53 && l >= 1) type = v[0];
-        else if (opt == 1 && l >= 4) mask = ip_get(v);
-        else if (opt == 3 && l >= 4) router = ip_get(v);
-        else if (opt == 6 && l >= 4) dns = ip_get(v);
-        else if (opt == 54 && l >= 4) server = ip_get(v);
-        else if (opt == 51 && l >= 4) lease = ip_get(v);
-        i += 2 + l;
-    }
-    uint32_t yiaddr = ip_get(p + 16);
-    if (dhcp_state == DHCP_DISCOVER && type == 2) {
-        dhcp_offer = yiaddr;
-        dhcp_server = server;
-        dhcp_state = DHCP_REQUEST;
-        dhcp_tries = 0;
-        dhcp_send(3);
-        dhcp_at(clock_after(2 * NS_PER_S));
-    } else if (dhcp_state == DHCP_REQUEST && type == 5) {
-        uint64_t flags = spin_lock(&config_lock);
-        my_ip = yiaddr;
-        my_mask = mask;
-        my_gw = router;
-        my_dns = dns;
-        configured = true;
-        spin_unlock(&config_lock, flags);
-        dhcp_state = DHCP_BOUND;
-        if (lease < 60) lease = 60;
-        dhcp_at(clock_after((uint64_t)lease * (NS_PER_S / 2))); /* renew at half the lease */
-        struct n_sockaddr resolver=dns_default_resolver();
-        kprintf("net: %u.%u.%u.%u/%d gateway %u.%u.%u.%u dns %u.%u.%u.%u:%u (DHCP)\n", my_ip >> 24, (my_ip >> 16) & 255,
-                (my_ip >> 8) & 255, my_ip & 255, __builtin_popcount(my_mask), my_gw >> 24, (my_gw >> 16) & 255,
-                (my_gw >> 8) & 255, my_gw & 255, resolver.ip >> 24, (resolver.ip >> 16) & 255, (resolver.ip >> 8) & 255,
-                resolver.ip & 255, resolver.port);
-        progress_wake(&shared_progress);
-    } else if (type == 6) {
-        dhcp_start();
-    }
-}
-
-/* dhcp_timer's work: the message whose moment has come, and the moment of the next. */
-static void dhcp_timer_run(struct net_timer *nt, uint64_t now) {
-    if (dhcp_state == DHCP_IDLE) return;
-    if (now < dhcp_next) { /* fired for a moment that has moved later since */
-        net_timer_at(nt, dhcp_next);
-        return;
-    }
-    if (dhcp_state == DHCP_BOUND) {
-        /* renew: re-request the same address */
-        dhcp_offer = my_ip;
-        dhcp_state = DHCP_REQUEST;
-        dhcp_tries = 0;
-    }
-    if (dhcp_state == DHCP_REQUEST && dhcp_tries >= 4) {
-        dhcp_start();
-        if (configured) {
-            dhcp_offer = my_ip;
-            dhcp_state = DHCP_REQUEST;
-        }
-    }
-    dhcp_send(dhcp_state == DHCP_DISCOVER ? 1 : 3);
-    dhcp_tries++;
-    dhcp_at(now + (dhcp_tries < 4 ? 2 : dhcp_tries < 10 ? 5 : 30) * NS_PER_S);
-}
-
-/* ---------------------------------------------------------------- DNS */
-
-static bool parse_ip(const char *s, uint32_t *out) {
-    uint32_t ip = 0;
-    for (int part = 0; part < 4; part++) {
-        if (*s < '0' || *s > '9') return false;
-        uint32_t v = 0;
-        while (*s >= '0' && *s <= '9') {
-            v = v * 10 + (uint32_t)(*s++ - '0');
-            if (v > 255) return false;
-        }
-        ip = ip << 8 | v;
-        if (part < 3 && *s++ != '.') return false;
-    }
-    if (*s) return false;
-    *out = ip;
-    return true;
-}
-
-static struct n_sockaddr dns_default_resolver(void) {
-    uint64_t chosen = __atomic_load_n(&dns_chosen, __ATOMIC_RELAXED);
-    if (chosen) return (struct n_sockaddr){.ip = (uint32_t)(chosen >> 16), .port = (uint16_t)chosen};
-    return (struct n_sockaddr){.ip = my_dns, .port = 53};
-}
-
-int dns_setting_put(uint32_t key, const void *value) {
-    const struct n_sockaddr *s = value;
-    if (s->ip && !s->port) return -N_ERR_INVALID;
-    __atomic_store_n(&dns_chosen, s->ip ? (uint64_t)s->ip << 16 | s->port : 0, __ATOMIC_RELAXED);
-    settings_changed(N_DOMAIN_NETWORK);
-    return 0;
-}
-
-int64_t dns_setting_get(uint32_t key, void *out, size_t cap) {
-    struct n_sockaddr s = dns_default_resolver();
-    if (cap >= sizeof s) memcpy(out, &s, sizeof s);
-    return sizeof s;
-}
-
-/* The cache has a byte budget and exact-size names/candidate vectors. Its
-   capacity is not a hostname length or answer-count restriction. */
-#define DNS_CACHE_BYTES (256u*1024u)
-#define DNS_ATTEMPT (2 * NS_PER_S) /* a query unanswered this long is sent again, three times in all */
-struct dns_cache_entry {
-    struct dns_cache_entry *next;
-    uint64_t expires, used; /* moments: its TTL's end, its last use */
-    size_t bytes;
-    uint32_t count, resolver;
-    uint16_t port;
-    char *name;
-    uint32_t *ips;
-};
-static struct dns_cache_entry *dns_cache;
-static size_t dns_cache_bytes;
-struct dns_answer { uint32_t *ips, count, ttl, status; };
-static int dns_tcp_exchange(uint32_t resolver,uint16_t port,uint64_t deadline,
-                            const uint8_t *query,size_t query_len,uint8_t **reply,size_t *reply_len);
-
-static uint32_t dns_hash(const char *s) {
-    uint32_t hash=2166136261u;
-    while (*s) { hash^=(uint8_t)*s++; hash*=16777619u; }
-    return hash;
-}
-static int dns_failure(struct dns_answer *answer, unsigned status) {
-    answer->status=status;
-    answer->count=answer->ttl=0;
-    switch(status) {
-    case N_DNS_NXDOMAIN: case N_DNS_NODATA: return -N_ERR_NOT_FOUND;
-    case N_DNS_SERVFAIL: return -N_ERR_NOT_READY;
-    case N_DNS_REFUSED: return -N_ERR_CONNECTION_REFUSED;
-    case N_DNS_TIMEOUT: return -N_ERR_TIMEOUT;
-    case N_DNS_CANCELLED: return -N_ERR_STOPPED;
-    case N_DNS_UNREACHABLE: return -N_ERR_UNREACHABLE;
-    case N_DNS_RESOURCE: return -N_ERR_NO_MEMORY;
-    default: return -N_ERR_PROTOCOL;
-    }
-}
-static unsigned dns_error_status(int error) {
-    return error==-N_ERR_NO_MEMORY?N_DNS_RESOURCE:error==-N_ERR_TIMEOUT||error==-N_ERR_NOT_READY?N_DNS_TIMEOUT:
-           error==-N_ERR_STOPPED||error==-N_ERR_CANCELLED?N_DNS_CANCELLED:error==-N_ERR_PROTOCOL?N_DNS_FORMAT:N_DNS_UNREACHABLE;
-}
-static void dns_cache_store(const char *name,uint32_t resolver,uint16_t port,const struct dns_answer *answer) {
-    size_t namesz=strlen(name)+1, name_storage=(size_t)ALIGN_UP(namesz,sizeof(uint32_t));
-    size_t bytes=sizeof(struct dns_cache_entry)+name_storage+(size_t)answer->count*4;
-    if (!answer->ttl || bytes>DNS_CACHE_BYTES) return;
-    while (dns_cache && dns_cache_bytes+bytes>DNS_CACHE_BYTES) {
-        struct dns_cache_entry **oldest=&dns_cache;
-        for (struct dns_cache_entry **at=&dns_cache;*at;at=&(*at)->next)
-            if ((*at)->used<(*oldest)->used) oldest=at;
-        struct dns_cache_entry *old=*oldest;
-        *oldest=old->next; dns_cache_bytes-=old->bytes; kfree(old);
-    }
-    struct dns_cache_entry *entry=kmalloc(bytes);
-    if (!entry) return; /* cache allocation never fails an already valid answer */
-    entry->name=(char *)(entry+1);
-    entry->ips=(uint32_t *)((uint8_t *)(entry+1)+name_storage);
-    memcpy(entry->name,name,namesz); memcpy(entry->ips,answer->ips,(size_t)answer->count*4);
-    entry->count=answer->count; entry->bytes=bytes; entry->used=clock_now_ns();
-    entry->resolver=resolver;entry->port=port;
-    uint64_t duration=(uint64_t)answer->ttl*NS_PER_S;
-    entry->expires=duration>UINT64_MAX-entry->used?UINT64_MAX:entry->used+duration;
-    entry->next=dns_cache; dns_cache=entry; dns_cache_bytes+=bytes;
-}
-
-/* Hash each answer owner once. Following a CNAME chain then visits only the
-   matching owners; unrelated additional A records cannot redirect a query. */
-static int dns_parse_reply(const uint8_t *p,size_t len,const char *name,struct dns_answer *answer) {
-    if (len<12 || !(p[2]&0x80) || (p[2]&0x7a) || p[4] || p[5]!=1) return dns_failure(answer,N_DNS_FORMAT);
-    char decoded[DNS_NAME_TEXT_BYTES+1];
-    size_t offset=dns_name_decode(p,len,12,decoded);
-    if (!offset || offset+4>len || strcmp(decoded,name) || p[offset] || p[offset+1]!=1 || p[offset+2] || p[offset+3]!=1)
-        return dns_failure(answer,N_DNS_FORMAT);
-    offset+=4;
-    switch (p[3]&15) {
-    case 0: break;
-    case 2: return dns_failure(answer,N_DNS_SERVFAIL);
-    case 3: return dns_failure(answer,N_DNS_NXDOMAIN);
-    case 5: return dns_failure(answer,N_DNS_REFUSED);
-    default: return dns_failure(answer,N_DNS_FORMAT);
-    }
-    size_t an=((size_t)p[6]<<8)|p[7];
-    if (an>(len-offset)/11) return dns_failure(answer,N_DNS_FORMAT);
-    if (!an) return dns_failure(answer,N_DNS_NODATA);
-    struct dns_record { char owner[DNS_NAME_TEXT_BYTES+1], target[DNS_NAME_TEXT_BYTES+1]; uint32_t ip,ttl,next; uint16_t type; };
-    struct dns_record *records=kmalloc(MAX(an,1)*sizeof *records);
-    size_t buckets=1;
-    while (buckets<an*2+1) buckets*=2;
-    uint32_t *heads=kmalloc(buckets*sizeof *heads);
-    uint32_t *ips=kmalloc(MAX(an,1)*sizeof *ips);
-    if (!records || !heads || !ips) { kfree(records);kfree(heads);kfree(ips);return dns_failure(answer,N_DNS_RESOURCE); }
-    memset(heads,0,buckets*sizeof *heads);
-    size_t count=0;
-    int result=-N_ERR_PROTOCOL;
-    for (size_t i=0;i<an;i++) {
-        offset=dns_name_decode(p,len,offset,decoded);
-        if (!offset || offset+10>len) goto malformed;
-        unsigned type=(unsigned)p[offset]<<8|p[offset+1], cls=(unsigned)p[offset+2]<<8|p[offset+3];
-        uint32_t ttl=ip_get(p+offset+4);
-        size_t bytes=(size_t)p[offset+8]<<8|p[offset+9]; offset+=10;
-        if (bytes>len-offset) goto malformed;
-        if (cls==1 && (type==1 || type==5)) {
-            struct dns_record *rr=&records[count];
-            strcpy(rr->owner,decoded); rr->type=(uint16_t)type; rr->ttl=ttl;
-            if (type==1) { if (bytes!=4) goto malformed; rr->ip=ip_get(p+offset); }
-            else if (dns_name_decode(p,len,offset,rr->target)!=offset+bytes) goto malformed;
-            uint32_t bucket=dns_hash(rr->owner)&(buckets-1);
-            rr->next=heads[bucket]; heads[bucket]=(uint32_t)++count;
-        }
-        offset+=bytes;
-    }
-    strcpy(decoded,name);
-    answer->ttl=UINT32_MAX;
-    for (size_t steps=0;steps<=count;steps++) {
-        const char *target=NULL;
-        for (uint32_t index=heads[dns_hash(decoded)&(buckets-1)];index;index=records[index-1].next) {
-            struct dns_record *rr=&records[index-1];
-            if (strcmp(rr->owner,decoded)) continue;
-            answer->ttl=MIN(answer->ttl,rr->ttl);
-            if (rr->type==1) {
-                bool duplicate=false;
-                for (uint32_t i=0;i<answer->count;i++) if (ips[i]==rr->ip) {duplicate=true;break;}
-                if (!duplicate) ips[answer->count++]=rr->ip;
-            } else {
-                if (target && strcmp(target,rr->target)) goto malformed;
-                target=rr->target;
-            }
-        }
-        if (answer->count) {
-            if (target) goto malformed; /* CNAME cannot coexist with A */
-            answer->ips=ips;ips=NULL;answer->status=N_DNS_OK;result=0;goto done;
-        }
-        if (!target) { result=dns_failure(answer,N_DNS_NODATA);goto done; }
-        strcpy(decoded,target);
-    }
-malformed:
-    result=dns_failure(answer,N_DNS_FORMAT);
-done:
-    kfree(records);kfree(heads);kfree(ips);return result;
-}
-
-static int dns_query(const char *source,uint32_t resolver,uint16_t port,struct dns_answer *answer) {
-    memset(answer,0,sizeof *answer);
-    answer->status=N_DNS_FORMAT;
-    if(net_setup_cancelled()){dns_failure(answer,N_DNS_CANCELLED);return -N_ERR_CANCELLED;}
-    uint32_t literal;
-    char name[DNS_NAME_TEXT_BYTES+1];
-    size_t textlen=strlen(source);
-    if (textlen>DNS_NAME_TEXT_BYTES) return -N_ERR_NAME_TOO_LONG;
-    uint8_t validation[DNS_NAME_WIRE_BYTES];size_t encoded=0;
-    if(!dns_name_encode(source,textlen,validation,sizeof validation,&encoded)) return dns_failure(answer,N_DNS_FORMAT);
-    for (size_t i=0;i<=textlen;i++) name[i]=(char)tolower((uint8_t)source[i]);
-    if (textlen && name[textlen-1]=='.') name[--textlen]=0;
-    if (parse_ip(name,&literal) || (!strcmp(name,"localhost") && (literal=0x7f000001))) {
-        answer->ips=kmalloc(4);if (!answer->ips) return dns_failure(answer,N_DNS_RESOURCE);
-        answer->ips[0]=literal;answer->count=1;answer->status=N_DNS_OK;return 0;
-    }
-    uint64_t now=clock_now_ns();
-    for (struct dns_cache_entry **at=&dns_cache;*at;) {
-        struct dns_cache_entry *entry=*at;
-        if (entry->expires<=now) { *at=entry->next;dns_cache_bytes-=entry->bytes;kfree(entry);continue; }
-        if (entry->resolver==resolver && entry->port==port && !strcmp(entry->name,name)) {
-            answer->ips=kmalloc((size_t)entry->count*4);if (!answer->ips) return dns_failure(answer,N_DNS_RESOURCE);
-            memcpy(answer->ips,entry->ips,(size_t)entry->count*4);answer->count=entry->count;
-            uint64_t left=entry->expires-now; /* whole seconds, rounded up */
-            answer->ttl=(uint32_t)MIN(left/NS_PER_S+(left%NS_PER_S!=0),(uint64_t)UINT32_MAX);
-            answer->status=N_DNS_OK;entry->used=now;return 0;
-        }
-        at=&entry->next;
-    }
-    if (!configured || !resolver || !port) return dns_failure(answer,N_DNS_UNREACHABLE);
-    uint8_t query[12+DNS_NAME_WIRE_BYTES+4];
-    memset(query,0,12);uint16_t id=(uint16_t)rnd();
-    query[0]=(uint8_t)(id>>8);query[1]=(uint8_t)id;query[2]=1;query[5]=1;
-    size_t bytes=0;
-    if (!dns_name_encode(name,textlen,query+12,sizeof query-16,&bytes)) return dns_failure(answer,N_DNS_FORMAT);
-    size_t query_len=12+bytes;query[query_len++]=0;query[query_len++]=1;query[query_len++]=0;query[query_len++]=1;
-    uint8_t mac[6];int result=arp_resolve(resolver,mac);
-    if (result<0) {dns_failure(answer,dns_error_status(result));return result;}
-    int sock=udp_alloc(0,process_current()->pid);if (sock<0) {dns_failure(answer,sock==-N_ERR_NO_MEMORY?N_DNS_RESOURCE:N_DNS_UNREACHABLE);return sock;}
-    udp_socks[sock]->internal=true;uint64_t generation=udp_socks[sock]->generation;
-    result=dns_failure(answer,N_DNS_TIMEOUT);
-    for (unsigned attempt=0;attempt<3 && result==-N_ERR_TIMEOUT;attempt++) {
-        if(net_setup_cancelled()){result=-N_ERR_CANCELLED;dns_failure(answer,N_DNS_CANCELLED);break;}
-        int sent=udp_output(udp_socks[sock]->port,ip_source(resolver),resolver,port,mac,query,query_len);
-        if (sent<0) {result=sent;dns_failure(answer,N_DNS_UNREACHABLE);break;}
-        uint64_t until=clock_after(DNS_ATTEMPT);
-        while (clock_now_ns()<until) {
-            int err=0;
-            struct udp_dgram *packet=udp_wait(sock,until,&err);
-            if (!packet) {if (err && err!=-N_ERR_NOT_READY) {result=err;dns_failure(answer,dns_error_status(err));}break;}
-            const uint8_t *p=packet->data;size_t length=packet->len;
-            if (packet->src!=resolver || packet->sport!=port || length<12 || !(p[2]&0x80) || p[0]!=query[0] || p[1]!=query[1]) continue;
-            uint8_t *tcp_reply=NULL;
-            if (p[2]&2) {
-                result=dns_tcp_exchange(resolver,port,until,query,query_len,&tcp_reply,&length);
-                if (result<0) {dns_failure(answer,dns_error_status(result));break;}
-                p=tcp_reply;
-                if (length<12 || p[0]!=query[0] || p[1]!=query[1] || (p[2]&2)) {kfree(tcp_reply);result=dns_failure(answer,N_DNS_FORMAT);break;}
-            }
-            if(net_setup_cancelled()){result=-N_ERR_CANCELLED;dns_failure(answer,N_DNS_CANCELLED);}
-            else result=dns_parse_reply(p,length,name,answer);
-            kfree(tcp_reply);
-            goto finished;
-        }
-    }
-finished:
-    if (udp_socks[sock]->generation==generation) udp_release(udp_socks[sock]);
-    if (!result) dns_cache_store(name,resolver,port,answer);
-    return result;
+    return s && s->used && s->pid==process_current()->pid?s:NULL;
 }
 
 /* ---------------------------------------------------------------- TCP */
@@ -1201,7 +915,7 @@ struct tcb {
     unsigned ack_segments;
     uint32_t rip;
     uint16_t lport, rport, mss;
-    uint8_t mac[6];
+    struct net_path path;
     /* send side. tx[tx_head] is the byte at snd_una; snd_nxt is the next byte to (re)send, snd_max the
        highest ever sent (they differ after a timeout, when we go back to snd_una) */
     uint32_t iss, snd_una, snd_nxt, snd_max, snd_wnd, snd_wl1, snd_wl2, fin_seq;
@@ -1238,7 +952,7 @@ struct tcb {
     /* Last, and kept by tcb_clear: the slot's progress outlives each connection it holds, so a
        task that read its generation for an earlier one and sleeps without net_lock is woken,
        not lost. Stable metadata owns its progress waiters: one socket's ACK/data must not
-       reschedule every DNS/TCP helper that is waiting on another socket. So does its timer,
+       reschedule every TCP helper that is waiting on another socket. So does its timer,
        which the alarm and the thread's queue may still hold for the connection before. */
     struct net_progress progress;
     struct net_timer timer; /* the connection's next look at rto_at and linger_until */
@@ -1379,8 +1093,8 @@ static int tcp_output(struct tcb *t, uint8_t flags, uint32_t seq, size_t len) {
         }
     }
     if (len) tcp_ring_read(L4+hl,t->tx,t->tx_capacity,t->tx_head+(seq-t->snd_una),(uint32_t)len);
-    h->csum = htons(l4_csum(ip_source(t->rip), t->rip, 6, L4, hl + len));
-    int result = ip_output(ip_source(t->rip), t->rip, t->mac, 6, hl+len);
+    h->csum = htons(l4_csum(t->path.src, t->rip, 6, L4, hl + len));
+    int result = ip_output(&t->path, t->rip, 6, hl+len);
     if (result == -N_ERR_NOT_READY || result == -N_ERR_BUSY) {
         t->tx_retry = true;
         if (flags&F_ACK) t->ack_pending = true;
@@ -1552,7 +1266,7 @@ static int tcp_alloc_slot(void);
 
 /* A reset that belongs to no connection: replies to segments for a port with
    no listener (RFC 9293 3.10.7.1) and to ACKs a listener cannot accept. */
-static void tcp_output_reset(uint32_t dst, const uint8_t mac[6], uint16_t sport, uint16_t dport,
+static void tcp_output_reset(const struct net_path *path, uint32_t dst, uint16_t sport, uint16_t dport,
                              uint32_t seq, uint32_t ack, uint8_t flags) {
     struct tcp_hdr *h = (struct tcp_hdr *)L4;
     h->sport = htons(sport);
@@ -1564,16 +1278,16 @@ static void tcp_output_reset(uint32_t dst, const uint8_t mac[6], uint16_t sport,
     h->win = 0;
     h->csum = 0;
     h->urg = 0;
-    h->csum = htons(l4_csum(ip_source(dst), dst, 6, L4, 20));
-    if (!ip_output(ip_source(dst), dst, mac, 6, 20)) tcp_stats.segs_out++;
+    h->csum = htons(l4_csum(path->src, dst, 6, L4, 20));
+    if (!ip_output(path, dst, 6, 20)) tcp_stats.segs_out++;
 }
 
-static void tcp_reset_unknown(uint32_t src, const uint8_t mac[6], const struct tcp_hdr *h, size_t len) {
+static void tcp_reset_unknown(const struct net_path *path, uint32_t src, const struct tcp_hdr *h, size_t len) {
     if (h->flags & F_RST) return; /* never answer a reset */
     size_t hl = (size_t)(h->off >> 4) * 4;
     uint32_t seg_len = (uint32_t)(len - hl) + ((h->flags & F_SYN) ? 1 : 0) + ((h->flags & F_FIN) ? 1 : 0);
-    if (h->flags & F_ACK) tcp_output_reset(src, mac, ntohs(h->dport), ntohs(h->sport), ntohl(h->ack), 0, F_RST);
-    else tcp_output_reset(src, mac, ntohs(h->dport), ntohs(h->sport), 0, ntohl(h->seq) + seg_len, F_RST | F_ACK);
+    if (h->flags & F_ACK) tcp_output_reset(path, src, ntohs(h->dport), ntohs(h->sport), ntohl(h->ack), 0, F_RST);
+    else tcp_output_reset(path, src, ntohs(h->dport), ntohs(h->sport), 0, ntohl(h->seq) + seg_len, F_RST | F_ACK);
 }
 
 /* MSS and Window Scale of a <SYN> or <SYN,ACK> (RFC 9293 3.7.1, RFC 7323 2) */
@@ -1616,12 +1330,12 @@ static struct tcb *tcp_listener_of(const struct tcb *t) {
 
 /* RFC 9293 3.10.7.2, LISTEN: a <SYN> makes a connection in SYN-RECEIVED that
    answers <SYN,ACK>; it waits for SYS_TCP_ACCEPT once its handshake ends. */
-static void tcp_listen_input(struct tcb *l, uint32_t src, const uint8_t mac[6], const uint8_t *p, size_t len) {
+static void tcp_listen_input(struct tcb *l, const struct net_path *path, uint32_t src, const uint8_t *p, size_t len) {
     const struct tcp_hdr *h = (const struct tcp_hdr *)p;
     size_t hl = (size_t)(h->off >> 4) * 4;
     if (h->flags & F_RST) return;
     if (h->flags & F_ACK) {
-        tcp_output_reset(src, mac, l->lport, ntohs(h->sport), ntohl(h->ack), 0, F_RST);
+        tcp_output_reset(path, src, l->lport, ntohs(h->sport), ntohl(h->ack), 0, F_RST);
         return;
     }
     if (!(h->flags & F_SYN)) return;
@@ -1649,7 +1363,7 @@ static void tcp_listen_input(struct tcb *l, uint32_t src, const uint8_t mac[6], 
     t->rip = src;
     t->rport = ntohs(h->sport);
     t->lport = l->lport;
-    memcpy(t->mac, mac, 6);
+    t->path = *path;
     tcp_syn_options(t, p, hl);
     uint32_t irs = ntohl(h->seq);
     t->rcv_nxt = irs + 1; /* data carried by the <SYN> is not kept; the peer resends it */
@@ -1666,7 +1380,7 @@ static void tcp_listen_input(struct tcb *l, uint32_t src, const uint8_t mac[6], 
     }
 }
 
-static void tcp_input(uint32_t src, uint32_t dst, const uint8_t *src_mac, const uint8_t *p, size_t len) {
+static void tcp_input(struct net_adapter *from, uint32_t src, uint32_t dst, const uint8_t *src_mac, const uint8_t *p, size_t len) {
     if (len < 20 || l4_csum(src, dst, 6, p, len) != 0) return;
     const struct tcp_hdr *h = (const struct tcp_hdr *)p;
     size_t hl = (size_t)(h->off >> 4) * 4;
@@ -1683,11 +1397,10 @@ static void tcp_input(uint32_t src, uint32_t dst, const uint8_t *src_mac, const 
         else if(c->rip==src && c->rport==sport && c->lport==dport && (!t || t->state==T_CLOSED)) t=c;
     }
     if (!t || (t->state == T_CLOSED && listener && (h->flags & (F_SYN|F_ACK|F_RST)) == F_SYN)) {
-        uint8_t mac[6];
-        memcpy(mac, src_mac, 6); /* the frame's sender is the next hop back */
+        struct net_path back = path_back(from, src_mac, dst);
         tcp_stats.segs_in++;
-        if (listener) tcp_listen_input(listener, src, mac, p, len);
-        else if (!t) tcp_reset_unknown(src, mac, h, len);
+        if (listener) tcp_listen_input(listener, &back, src, p, len);
+        else if (!t) tcp_reset_unknown(&back, src, h, len);
         return;
     }
     if (t->state == T_CLOSED) return;
@@ -1766,7 +1479,7 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
         }
         if (!(fl & F_ACK)) return;
         if (!SEQ_LT(t->snd_una, ack) || !SEQ_LEQ(ack, t->snd_max)) {
-            tcp_output_reset(t->rip, t->mac, t->lport, t->rport, ack, 0, F_RST);
+            tcp_output_reset(&t->path, t->rip, t->lport, t->rport, ack, 0, F_RST);
             return;
         }
         t->state = T_ESTABLISHED;
@@ -2093,8 +1806,8 @@ static int64_t sys_tcp_accept(int h, uint64_t deadline, struct n_sockaddr *remot
    number, or an error. */
 static int64_t tcp_connect_until(uint32_t ip, uint16_t port, uint64_t deadline) {
     if(net_setup_cancelled())return -N_ERR_CANCELLED;
-    uint8_t mac[6];
-    int r = arp_resolve_until(ip, mac, deadline);
+    struct net_path path;
+    int r = path_to(ip, &path, deadline);
     if (r < 0) return r;
     if(thread_current()->killed)return -N_ERR_STOPPED;
     if(net_setup_cancelled())return -N_ERR_CANCELLED;
@@ -2122,7 +1835,7 @@ static int64_t tcp_connect_until(uint32_t ip, uint16_t port, uint64_t deadline) 
     t->rip = ip;
     t->rport = port;
     t->lport=local;
-    memcpy(t->mac, mac, 6);
+    t->path = path;
     t->iss = rnd();
     t->snd_una = t->iss;
     t->snd_nxt = t->snd_max = t->iss;
@@ -2158,14 +1871,13 @@ static int64_t tcp_connect_until(uint32_t ip, uint16_t port, uint64_t deadline) 
 
 /* Queue len bytes for sending, waiting for room until deadline (CLOCK_NEVER: no limit): how many
    were queued, or an error when none were. */
-static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t deadline, bool user, bool nonblock) {
+static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t deadline, bool nonblock) {
     struct tcb *t = user_tcb(h);
     if (!t) return -N_ERR_NO_HANDLE;
     uint64_t generation=t->generation;
     size_t done = 0;
     while (done < len) {
         if(t->generation!=generation || !t->user_open)return done?(int64_t)done:-N_ERR_NO_HANDLE;
-        if(!user && net_setup_cancelled())return done?(int64_t)done:-N_ERR_CANCELLED;
         if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT) return done ? (int64_t)done : (t->err ? t->err : -N_ERR_CLOSED);
         if (t->fin_pending) return done ? (int64_t)done : -N_ERR_CLOSED;
         if (thread_current()->killed) return done ? (int64_t)done : -N_ERR_STOPPED;
@@ -2173,7 +1885,7 @@ static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t dea
         uint32_t space = t->tx_capacity - t->tx_len;
         if (!space) {
             if(nonblock)return done?(int64_t)done:-N_ERR_NOT_READY;
-            net_sleep(&t->progress, deadline, !user);
+            net_sleep(&t->progress, deadline, false);
             continue;
         }
         /* A nonblocking call enqueues one chunk at once; a blocking one goes on chunk by chunk. */
@@ -2182,8 +1894,7 @@ static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t dea
            on every iteration. A late fault preserves the completed prefix. */
         if ((uint64_t)buf>UINT64_MAX-done) return done?(int64_t)done:-N_ERR_BAD_ADDRESS;
         uint32_t at = t->tx_head+t->tx_len;
-        if (!user) tcp_ring_write(t->tx,t->tx_capacity,at,buf+done,n);
-        else if (tcp_ring_write_user(t->tx,t->tx_capacity,at,buf+done,n)<0) return done?(int64_t)done:-N_ERR_BAD_ADDRESS;
+        if (tcp_ring_write_user(t->tx,t->tx_capacity,at,buf+done,n)<0) return done?(int64_t)done:-N_ERR_BAD_ADDRESS;
         t->tx_len += n;
         done += n;
         tcp_push(t, false);
@@ -2194,32 +1905,27 @@ static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t dea
 
 /* Take up to len received bytes, waiting for some until deadline (-N_ERR_NOT_READY once it has
    come): how many, 0 at the end of the stream. */
-static int64_t tcp_recv_data(int h, uint8_t *buf, size_t len, uint64_t deadline, bool user) {
+static int64_t tcp_recv_data(int h, uint8_t *buf, size_t len, uint64_t deadline) {
     struct tcb *t = user_tcb(h);
     if (!t) return -N_ERR_NO_HANDLE;
     if (t->state == T_LISTEN) return -N_ERR_INVALID; /* a listener carries no data */
     if (!len) return 0;
     uint64_t generation=t->generation;
-    if(!user && net_setup_cancelled())return -N_ERR_CANCELLED;
     while (t->rx_len == 0) {
         if(t->generation!=generation || !t->user_open)return -N_ERR_NO_HANDLE;
-        if(!user && net_setup_cancelled())return -N_ERR_CANCELLED;
         if (t->rx_fin) return 0;
         if (t->state == T_CLOSED) return t->err ? t->err : 0;
         if (thread_current()->killed) return -N_ERR_STOPPED;
         if (clock_now_ns() >= deadline) return -N_ERR_NOT_READY;
-        net_sleep(&t->progress, deadline, !user);
+        net_sleep(&t->progress, deadline, false);
     }
     if(t->generation!=generation || !t->user_open)return -N_ERR_NO_HANDLE;
     /* At most one chunk a call (a short read is ordinary TCP), so net_lock never stays held
        across a long copy. A page that went keeps the bytes it did not take for a later read. */
     uint32_t n = (uint32_t)MIN(MIN(len, (size_t)t->rx_len), (size_t)TCP_COPY_CHUNK);
-    if (!user) tcp_ring_read(buf,t->rx,t->rx_capacity,t->rx_head,n);
-    else {
-        int64_t got = tcp_ring_read_user(buf,t->rx,t->rx_capacity,t->rx_head,n);
-        if (got < 0) return got;
-        n = (uint32_t)got;
-    }
+    int64_t got = tcp_ring_read_user(buf,t->rx,t->rx_capacity,t->rx_head,n);
+    if (got < 0) return got;
+    n = (uint32_t)got;
     t->rx_head = (t->rx_head + n) % t->rx_capacity;
     t->rx_len -= n;
     /* window update if we had been squeezing the sender */
@@ -2256,52 +1962,22 @@ static void tcp_close(struct tcb *t) {
 
 /* RFC 1035 TCP framing: two-byte length followed by exactly that many bytes.
    Both prefix and payload share one budget; short reads are ordinary TCP. */
-static int dns_tcp_exchange(uint32_t resolver,uint16_t port,uint64_t deadline,
-                            const uint8_t *query,size_t query_len,uint8_t **reply,size_t *reply_len) {
-    *reply=NULL;*reply_len=0;
-    if(clock_now_ns()>=deadline)return -N_ERR_TIMEOUT;
-    int handle=(int)tcp_connect_until(resolver,port,deadline);
-    if (handle<0) return handle;
-    uint8_t prefix[2]={(uint8_t)(query_len>>8),(uint8_t)query_len};
-    int result=0;
-    long n=tcp_send_data(handle,prefix,2,deadline,false,false);
-    if (n!=2) {result=n<0?(int)n:net_setup_cancelled()?-N_ERR_CANCELLED:-N_ERR_TIMEOUT;goto close;}
-    n=tcp_send_data(handle,query,query_len,deadline,false,false);
-    if (n!=(long)query_len) {result=n<0?(int)n:net_setup_cancelled()?-N_ERR_CANCELLED:-N_ERR_TIMEOUT;goto close;}
-    size_t done=0;
-    while (done<2) {
-        if (clock_now_ns()>=deadline) {result=-N_ERR_TIMEOUT;goto close;}
-        n=tcp_recv_data(handle,prefix+done,2-done,deadline,false);
-        if (n<=0) {result=n<0?(int)n:-N_ERR_PROTOCOL;goto close;} done+=(size_t)n;
-    }
-    size_t length=(size_t)prefix[0]<<8|prefix[1];
-    if (length<12) {result=-N_ERR_PROTOCOL;goto close;}
-    uint8_t *response=kmalloc(length);if (!response) {result=-N_ERR_NO_MEMORY;goto close;}
-    done=0;
-    while (done<length) {
-        if (clock_now_ns()>=deadline) {result=-N_ERR_TIMEOUT;break;}
-        n=tcp_recv_data(handle,response+done,length-done,deadline,false);
-        if (n<=0) {result=n<0?(int)n:-N_ERR_PROTOCOL;break;} done+=(size_t)n;
-    }
-    if (!result) {*reply=response;*reply_len=length;} else kfree(response);
-close:
-    if (result) tcp_reset(tcbs[handle],result);
-    tcp_close(tcbs[handle]);
-    return result;
-}
-
 /* ---------------------------------------------------------------- input dispatch, thread, syscalls */
 
-static void eth_input(const void *packet, size_t len) {
+static void eth_input(struct net_adapter *from, const void *packet, size_t len) {
     const uint8_t *p = packet;
     if (len<sizeof(struct eth_hdr)) return;
     const struct eth_hdr *e = (const struct eth_hdr *)p;
-    if (memcmp(e->dst, link_mac, 6) != 0 && !(e->dst[0] & 1)) return; /* not for us (promiscuous NICs) */
-    rx_packets++;
+    if (from) {
+        if (!from->dev) return; /* it went after the frame was queued */
+        if (memcmp(e->dst, from->mac, 6) != 0 && !(e->dst[0] & 1)) return; /* not for us (promiscuous NICs) */
+        from->rx_packets++;
+    }
     net_service_bytes+=len;
     uint16_t type = ntohs(e->type);
-    if (type == 0x0806) arp_input(p + 14, len - 14);
-    else if (type == 0x0800) {
+    if (type == 0x0806) {
+        if (from) arp_input(from, p + 14, len - 14);
+    } else if (type == 0x0800) {
         const uint8_t *ipp = p + 14;
         size_t iplen = len - 14;
         const struct ip_hdr *ip = (const struct ip_hdr *)ipp;
@@ -2311,15 +1987,20 @@ static void eth_input(const void *packet, size_t len) {
         if (csum_fold(csum_add(0, ip, hl)) != 0) return;
         if (ntohs(ip->frag) & 0x3FFF) return; /* fragments are not supported */
         uint32_t src = ip_get(ip->src), dst = ip_get(ip->dst);
-        /* 127/8 is only ever this system talking to itself (ip_loopback), never the wire */
-        bool loopback = (dst >> 24) == 127;
-        if (loopback && memcmp(e->src, link_mac, 6) != 0) return;
-        if (configured && dst != my_ip && !loopback && dst != 0xFFFFFFFF && dst != (my_ip | ~my_mask)) return;
-        if (ip->proto == 1) icmp_input(e->src, src, ipp + hl, tl - hl);
-        else if (ip->proto == 17) udp_input(src, dst, ipp + hl, tl - hl);
-        else if (ip->proto == 6 && (configured || loopback)) tcp_input(src, dst, e->src, ipp + hl, tl - hl);
+        if (from) {
+            /* 127/8 is only ever this system talking to itself (ip_loopback), never a wire. An
+               adapter with no address yet takes what comes: its offer may be addressed to it. */
+            if ((dst >> 24) == 127) return;
+            if (from->ip && dst != from->ip && dst != 0xFFFFFFFF && dst != (from->ip | ~from->mask)) return;
+        }
+        if (ip->proto == 1) icmp_input(from, e->src, src, dst, ipp + hl, tl - hl);
+        else if (ip->proto == 17) udp_input(from, src, dst, ipp + hl, tl - hl);
+        else if (ip->proto == 6 && (!from || from->ip)) tcp_input(from, src, dst, e->src, ipp + hl, tl - hl);
     }
 }
+
+/* What an adapter's poll_rx hands over. */
+static void device_input(struct netif *dev, const void *frame, size_t len) { eth_input(dev->adapter, frame, len); }
 
 /* The output that waited: ACKs held for the end of a batch, segments the adapter had no room
    for, retransmissions it refused. */
@@ -2361,7 +2042,9 @@ static void net_thread(void *arg) {
     bool serviced=false;
     mutex_lock(&net_lock);
     for (;;) {
-        bool device_ready = nif->rx_pending && nif->rx_pending();
+        bool device_ready = false;
+        for (struct net_adapter *a = adapters; a && !device_ready; a = a->next)
+            device_ready = a->dev && a->dev->rx_pending && a->dev->rx_pending(a->dev);
         uint64_t service_bytes = net_service_bytes;
         mutex_unlock(&net_lock);
         /* Every producer, and every timer's fire, sets net_work_pending under rxq_lock before it
@@ -2395,7 +2078,8 @@ static void net_thread(void *arg) {
         }
         mutex_lock(&net_lock);
         receive_batch = true;
-        if (nif->poll_rx) nif->poll_rx(eth_input);
+        for (struct net_adapter *a = adapters; a; a = a->next)
+            if (a->dev && a->dev->poll_rx) a->dev->poll_rx(a->dev, device_input);
         rxq_drain();
         /* End-of-drain ACK and per-socket readiness, once per connection.
            Resource-blocked sends retry on NIC completion, not a fictitious
@@ -2411,38 +2095,67 @@ static void net_thread(void *arg) {
     }
 }
 
-static bool net_initialized, net_running;
+static bool net_initialized;
 
-/* net_lock held: once both net_init has run and an adapter is there, the stack starts (true:
-   the caller makes its thread, without the lock). */
-static bool net_start_locked(void) {
-    if (!nif || !net_initialized || net_running) return false;
-    net_running = true;
-    dhcp_start();
-    return true;
+/* A connection that has lost its source address has nothing more to say to anyone. */
+static void address_gone(struct net_adapter *a, uint32_t ip) {
+    for (size_t i = 0; i < tcp_capacity; i++) {
+        struct tcb *t = tcbs[i];
+        if (t && t->state != T_FREE && t->state != T_CLOSED && t->state != T_LISTEN && t->path.via == a && t->path.src == ip)
+            tcp_reset(t, -N_ERR_NETWORK_DOWN);
+    }
 }
 
-/* Adapters found by net_init's probes register before it starts the stack; a USB adapter may
-   arrive later, and when it is the first one the stack starts with it. The adapter already in
-   use registering again has a new address (another USB adapter in its place): the stack takes
-   it, and asks DHCP again when it changed. */
-void net_register(struct netif *n) {
+/* net_lock held. */
+static void adapter_address(struct net_adapter *a, uint32_t ip, uint32_t mask) {
+    uint32_t old = a->ip;
+    uint64_t flags = spin_lock(&config_lock);
+    a->ip = ip;
+    a->mask = mask;
+    spin_unlock(&config_lock, flags);
+    if (old && old != ip) address_gone(a, old);
+    if (old != ip) {
+        kfree(a->arp);
+        a->arp = NULL;
+        a->arp_count = 0;
+    }
+    watched_changed(&net_watch);
+    progress_wake(&shared_progress);
+}
+
+void net_register(struct netif *dev) {
     net_enter();
-    bool arrived = false, start = false;
-    if (!nif || nif == n) {
-        bool changed = !nif || memcmp(link_mac, n->mac, 6) != 0;
-        arrived = !nif && net_initialized;
+    struct net_adapter *a = adapters;
+    while (a && (a->dev || memcmp(a->mac, dev->mac, 6))) a = a->next;
+    if (!a && (a = kzalloc(sizeof *a))) {
+        a->id = ++adapter_ids;
+        memcpy(a->mac, dev->mac, 6);
         uint64_t flags = spin_lock(&config_lock);
-        nif = n;
-        memcpy(link_mac, n->mac, 6);
+        *adapters_end = a;
+        adapters_end = &a->next;
         spin_unlock(&config_lock, flags);
-        link_driver = n->driver;
-        if (changed && net_running) dhcp_start();
-        start = net_start_locked();
+    }
+    if (a) {
+        a->driver = dev->driver;
+        __atomic_store_n(&dev->adapter, a, __ATOMIC_RELEASE);
+        a->dev = dev;
+        watched_changed(&net_watch);
+    }
+    bool late = net_initialized;
+    net_leave();
+    if (!a) kprintf("net: no memory for the %s adapter\n", dev->driver);
+    else if (late) kprintf("net: %s adapter arrived\n", dev->driver);
+}
+
+void net_unregister(struct netif *dev) {
+    net_enter();
+    struct net_adapter *a = dev->adapter;
+    if (a) {
+        a->dev = NULL;
+        __atomic_store_n(&dev->adapter, NULL, __ATOMIC_RELEASE);
+        adapter_address(a, 0, 0);
     }
     net_leave();
-    if (arrived) kprintf("net: %s adapter arrived\n", n->driver);
-    if (start) kthread_create("net", net_thread, NULL);
 }
 
 /* What new connections take from now on. Physical allocation rounds to pages; RFC 7323's maximum
@@ -2462,19 +2175,18 @@ int64_t tcp_buffer_setting_get(uint32_t key, void *out, size_t cap) {
 }
 
 void net_init(void) {
-    net_timer_init(&dhcp_timer, dhcp_timer_run);
     net_timer_init(&fault_timer, fault_timer_run);
-    if (!rtl8125_probe()) vm_net_probe();
+    rtl8125_probe();
+    vm_net_probe();
     net_enter();
     net_initialized = true;
-    bool none = !nif, start = net_start_locked();
+    bool none = !adapters;
     net_leave();
     if (none) kprintf("net: no supported network card yet\n");
-    if (start) kthread_create("net", net_thread, NULL);
+    kthread_create("net", net_thread, NULL);
 }
 
-/* An app's sockets (its UDP sockets, its TCP connections and listeners, those of its name
-   lookups) and its fault settings are its process's, found by its pid: they end when its handle
+/* An app's sockets (its UDP sockets, its TCP connections and listeners) and its fault settings are its process's, found by its pid: they end when its handle
    table closes at its end, through this object, which the app holds with no number
    (sys/object.h). */
 struct net_owner {
@@ -2517,88 +2229,112 @@ static bool owner_hold(void) {
 
 /* The calls that give the app sockets of its own, or set its fault settings. */
 static bool owner_needed(int num) {
-    return num == SYS_UDP_SOCKET || num == SYS_TCP_CONNECT || num == SYS_TCP_LISTEN || num == SYS_NET_TEST ||
-           num == SYS_NET_DNS || num == SYS_NET_DNS_ALL;
+    return num == SYS_UDP_SOCKET || num == SYS_UDP_SOCKET_ON || num == SYS_TCP_CONNECT || num == SYS_TCP_LISTEN ||
+           num == SYS_NET_TEST;
 }
 
-bool net_config(uint8_t mac[6], uint32_t *ip, uint32_t *mask, uint32_t *gw, uint32_t *dns) {
+bool net_adapter_info(size_t index, uint8_t mac[6], uint32_t *ip, uint32_t *mask) {
     uint64_t flags = spin_lock(&config_lock);
-    bool present = nif != NULL, up = configured;
-    memcpy(mac, link_mac, 6);
-    *ip = my_ip;
-    *mask = my_mask;
-    *gw = my_gw;
-    *dns = dns_default_resolver().ip;
+    struct net_adapter *a = adapters;
+    while (a && index--) a = a->next;
+    if (a) {
+        memcpy(mac, a->mac, 6);
+        *ip = a->ip;
+        *mask = a->mask;
+    }
     spin_unlock(&config_lock, flags);
-    return present && up;
+    return a != NULL;
+}
+
+/* SYS_NET_ROUTES_SET: the whole table at once. */
+static bool mask_whole(uint32_t mask) { return !(mask & (~mask >> 1)) && (!mask || (mask >> 31)); }
+static int64_t routes_set(const struct n_net_route *from, size_t count) {
+    if (count > SIZE_MAX / sizeof *routes) return -N_ERR_INVALID;
+    struct n_net_route *table = count ? kmalloc(count * sizeof *table) : NULL;
+    if (count && !table) return -N_ERR_NO_MEMORY;
+    if (count && copy_from_user(table, from, count * sizeof *table) < 0) {
+        kfree(table);
+        return -N_ERR_BAD_ADDRESS;
+    }
+    for (size_t i = 0; i < count; i++)
+        if (!mask_whole(table[i].mask) || (table[i].destination & ~table[i].mask) || !adapter_of(table[i].adapter)) {
+            kfree(table);
+            return -N_ERR_INVALID;
+        }
+    kfree(routes);
+    routes = table;
+    route_count = count;
+    watched_changed(&net_watch);
+    progress_wake(&shared_progress);
+    return 0;
 }
 
 static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
     switch (num) {
-    case SYS_NET_INFO: {
-        struct n_netinfo ni = {0};
-        if (nif) {
-            ni.present = 1;
-            ni.up = configured;
-            memcpy(ni.mac, link_mac, 6);
-            ip_put(ni.ip, my_ip);
-            ip_put(ni.mask, my_mask);
-            ip_put(ni.gateway, my_gw);
-            ip_put(ni.dns, dns_default_resolver().ip);
-            ni.rx_packets = rx_packets;
-            ni.tx_packets = tx_packets;
-            strlcpy(ni.driver, link_driver, sizeof ni.driver);
+    case SYS_NET_ADAPTERS: {
+        struct n_net_adapter *out = (struct n_net_adapter *)a;
+        size_t count = 0;
+        for (struct net_adapter *ad = adapters; ad; ad = ad->next, count++) {
+            if (count >= b) continue;
+            struct n_net_adapter info = {.id = ad->id, .present = ad->dev != NULL, .ip = ad->ip, .mask = ad->mask,
+                                         .rx_packets = ad->rx_packets, .tx_packets = ad->tx_packets};
+            memcpy(info.mac, ad->mac, 6);
+            if (copy_to_user(&out[count], &info, sizeof info) < 0) return -N_ERR_BAD_ADDRESS;
         }
-        return copy_to_user((void *)a, &ni, sizeof ni);
+        return (int64_t)count;
+    }
+    case SYS_NET_ADAPTER_NAME: {
+        struct net_adapter *ad = adapter_of((uint32_t)a);
+        if (!ad) return -N_ERR_NOT_FOUND;
+        size_t length = strlen(ad->driver);
+        if (c && copy_to_user((void *)b, ad->driver, MIN(length, (size_t)c)) < 0) return -N_ERR_BAD_ADDRESS;
+        return (int64_t)length;
+    }
+    case SYS_NET_ADDRESS_SET: {
+        int r = cap_check((int)a, N_CAP_NETWORK);
+        if (r < 0) return r;
+        struct net_adapter *ad = adapter_of((uint32_t)b);
+        if (!ad) return -N_ERR_NOT_FOUND;
+        if (c > UINT32_MAX || d > UINT32_MAX || !mask_whole((uint32_t)d) || (!c && d)) return -N_ERR_INVALID;
+        if ((c >> 24) == 127 || c == UINT32_MAX) return -N_ERR_INVALID;
+        if (c && !ad->dev) return -N_ERR_NETWORK_DOWN;
+        adapter_address(ad, (uint32_t)c, (uint32_t)d);
+        return 0;
+    }
+    case SYS_NET_ROUTES_SET: {
+        int r = cap_check((int)a, N_CAP_NETWORK);
+        if (r < 0) return r;
+        return routes_set((const struct n_net_route *)b, c);
+    }
+    case SYS_NET_ROUTES: {
+        size_t n = MIN(b, route_count);
+        if (n && copy_to_user((void *)a, routes, n * sizeof *routes) < 0) return -N_ERR_BAD_ADDRESS;
+        return (int64_t)route_count;
+    }
+    case SYS_UDP_SOCKET_ON: {
+        int r = cap_check((int)a, N_CAP_NETWORK);
+        if (r < 0) return r;
+        struct net_adapter *ad = adapter_of((uint32_t)b);
+        if (!ad) return -N_ERR_NOT_FOUND;
+        if (!ad->dev) return -N_ERR_NETWORK_DOWN;
+        return udp_alloc((uint16_t)c, process_current()->pid, ad);
     }
     case SYS_NET_PING:
-        if (!nif) return -N_ERR_NETWORK_DOWN;
         return sys_ping((uint32_t)a, (int)b, c);
-    case SYS_NET_DNS: {
-        if (!user_ok_w((void *)b, 4)) return -N_ERR_BAD_ADDRESS;
-        char name[DNS_NAME_TEXT_BYTES + 1];
-        int r = user_str(name, (const char *)a, sizeof name);
-        if (r < 0) return r;
-        struct dns_answer answer;
-        struct n_sockaddr resolver=dns_default_resolver();
-        int64_t ret = dns_query(name, resolver.ip, resolver.port, &answer);
-        if (ret == 0 && copy_to_user((void *)b, &answer.ips[0], sizeof answer.ips[0]) < 0) ret = -N_ERR_BAD_ADDRESS;
-        kfree(answer.ips);
-        return ret;
-    }
-    case SYS_NET_DNS_ALL: {
-        struct n_dns_result *out=(struct n_dns_result *)d;
-        if (!user_ok_w(out,sizeof *out) || c>SIZE_MAX/sizeof(uint32_t) || !user_ok_w((void *)b,c*sizeof(uint32_t))) return -N_ERR_BAD_ADDRESS;
-        struct n_dns_result summary={.version=1,.status=N_DNS_FORMAT};
-        if (copy_to_user(out,&summary,sizeof summary)<0) return -N_ERR_BAD_ADDRESS;
-        char name[DNS_NAME_TEXT_BYTES + 1];
-        int result=user_str(name,(const char *)a,sizeof name);
-        if (result<0) return result;
-        struct n_sockaddr resolver=dns_default_resolver();
-        if (e && copy_from_user(&resolver,(const void *)e,sizeof resolver)<0) return -N_ERR_BAD_ADDRESS;
-        struct dns_answer answer;
-        result=dns_query(name,resolver.ip,resolver.port,&answer);
-        summary=(struct n_dns_result){.version=1,.status=answer.status,.count=answer.count,.ttl=answer.ttl};
-        size_t n=result?0:MIN(c,(size_t)answer.count);
-        if (copy_to_user(out,&summary,sizeof summary)<0 ||
-            (n && copy_to_user((void *)b,answer.ips,n*sizeof(uint32_t))<0)) result=-N_ERR_BAD_ADDRESS;
-        kfree(answer.ips);return result;
-    }
     case SYS_UDP_SOCKET:
-        if (!nif) return -N_ERR_NETWORK_DOWN;
-        return udp_alloc((uint16_t)a, process_current()->pid);
+        return udp_alloc((uint16_t)a, process_current()->pid, NULL);
     case SYS_UDP_SEND: {
         struct udp_sock *s = user_udp((int)a);
         if (!s) return -N_ERR_NO_HANDLE;
         if (e > 1472) return -N_ERR_INVALID;
         uint8_t tmp[1472];
         if (copy_from_user(tmp, (const void *)d, e) < 0) return -N_ERR_BAD_ADDRESS;
-        uint8_t mac[6];
+        struct net_path path;
         uint64_t generation=s->generation;
-        int r = arp_resolve((uint32_t)b, mac);
+        int r = s->bound ? path_by(s->bound, (uint32_t)b, &path) : path_to((uint32_t)b, &path, CLOCK_NEVER);
         if (r < 0) return r;
         if(!s->used || s->generation!=generation)return -N_ERR_NO_HANDLE;
-        r = udp_output(s->port, ip_source((uint32_t)b), (uint32_t)b, (uint16_t)c, mac, tmp, e);
+        r = udp_output(s->port, &path, (uint32_t)b, (uint16_t)c, tmp, e);
         return r < 0 ? r : (int64_t)e;
     }
     case SYS_UDP_RECV: {
@@ -2624,13 +2360,12 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         return 0;
     }
     case SYS_TCP_CONNECT:
-        if (!nif) return -N_ERR_NETWORK_DOWN;
         return tcp_connect_until((uint32_t)a, (uint16_t)b, c);
-    case SYS_TCP_SEND: return tcp_send_data((int)a, (const uint8_t *)b, c, CLOCK_NEVER, true, false);
+    case SYS_TCP_SEND: return tcp_send_data((int)a, (const uint8_t *)b, c, CLOCK_NEVER, false);
     case SYS_TCP_SEND_UNTIL:
         /* d: the deadline it gives up at */
         if(e&~(uint64_t)N_TCP_SEND_NONBLOCK)return -N_ERR_INVALID;
-        return tcp_send_data((int)a, (const uint8_t *)b, c, d, true, (e&N_TCP_SEND_NONBLOCK)!=0);
+        return tcp_send_data((int)a, (const uint8_t *)b, c, d, (e&N_TCP_SEND_NONBLOCK)!=0);
     case SYS_TCP_CANCEL: {
         struct tcb *t = user_tcb((int)a);
         if (!t) return -N_ERR_NO_HANDLE;
@@ -2647,10 +2382,11 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         stats.rx_invalid = rxq_invalid;
         stats.rx_ring_high_water = rxq_high_water;
         spin_unlock(&rxq_lock, flags);
-        if (nif && nif->get_stats) nif->get_stats(&stats);
+        for (struct net_adapter *ad = adapters; ad; ad = ad->next)
+            if (ad->dev && ad->dev->get_stats) ad->dev->get_stats(ad->dev, &stats);
         return copy_to_user((void *)a, &stats, sizeof stats);
     }
-    case SYS_TCP_RECV: return tcp_recv_data((int)a, (uint8_t *)b, c, d, true);
+    case SYS_TCP_RECV: return tcp_recv_data((int)a, (uint8_t *)b, c, d);
     case SYS_NET_TEST: {
         if (!identity_at_least(N_CLASS_ADMIN)) return -N_ERR_DENIED; /* 接続を壊す試験の入口 */
         /* a: fault settings for this process's TCP connections (or NULL); b: counters out (or NULL) */
@@ -2673,14 +2409,13 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         return 0;
     }
     case SYS_TCP_LISTEN:
-        if (!nif) return -N_ERR_NETWORK_DOWN;
         if (a > UINT32_MAX || b > UINT16_MAX) return -N_ERR_INVALID;
         return sys_tcp_listen((uint32_t)a, (uint16_t)b, (int)c);
     case SYS_TCP_ACCEPT: return sys_tcp_accept((int)a, b, (struct n_sockaddr *)c);
     case SYS_TCP_ADDRESS: {
         struct tcb *t = user_tcb((int)a);
         if (!t) return -N_ERR_NO_HANDLE;
-        struct n_sockaddr local = {.ip = t->state == T_LISTEN ? t->lip : ip_source(t->rip), .port = t->lport};
+        struct n_sockaddr local = {.ip = t->state == T_LISTEN ? t->lip : t->path.src, .port = t->lport};
         struct n_sockaddr remote = {.ip = t->rip, .port = t->rport};
         if ((b && copy_to_user((void *)b, &local, sizeof local) < 0) ||
             (c && copy_to_user((void *)c, &remote, sizeof remote) < 0))
@@ -2722,6 +2457,7 @@ static int64_t net_setup_cancel_channel(int index) {
 
 int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
     if (num == SYS_NET_SETUP_CANCEL_CHANNEL) return net_setup_cancel_channel((int)a);
+    if (num == SYS_NET_WATCH) return watched_open(&net_watch);
     if (owner_needed(num) && !owner_hold()) return -N_ERR_NO_MEMORY;
     net_enter();
     int64_t result = net_syscall_inner(num, a, b, c, d, e);

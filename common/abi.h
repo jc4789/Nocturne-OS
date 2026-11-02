@@ -81,9 +81,16 @@ enum {
     SYS_SHELL_WATCH,   /* (cap): 窓の一覧と焦点の watch */
     SYS_SHELL_HOTKEY,  /* (cap, window, key, mods): その鍵の押下を EV_HOTKEY で受ける */
     SYS_SHARED_RESERVE = 88, SYS_WAIT_ADDRESS64,
-    SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
+    SYS_NET_FIRST = 96,
+    /* The stack's adapters and routes. ADAPTERS (struct n_net_adapter *out, max) -> how many there
+       are. ADDRESS_SET (N_CAP_NETWORK, adapter, ip, mask): ip 0 takes the address away.
+       ROUTES_SET (N_CAP_NETWORK, const struct n_net_route *, count): the whole table.
+       ROUTES (struct n_net_route *out, max) -> how many there are. WATCH (): a watch of all of it.
+       UDP_SOCKET_ON (N_CAP_NETWORK, adapter, port): a socket on one adapter, which may have no
+       address yet; its datagrams go first to it and leave by that adapter. */
+    SYS_NET_ADAPTERS = SYS_NET_FIRST, SYS_NET_PING, SYS_NET_ADDRESS_SET, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
     SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
-    SYS_NET_DNS_ALL, SYS_TCP_SEND_UNTIL, SYS_TCP_CANCEL, SYS_NET_STATS,
+    SYS_NET_ROUTES_SET, SYS_TCP_SEND_UNTIL, SYS_TCP_CANCEL, SYS_NET_STATS,
     SYS_NET_SETUP_CANCEL_CHANNEL,
     /* Passive open (RFC 9293). A listener shares the TCP id space: TCP_CLOSE
        ends it and refuses its unaccepted connections, TCP_CANCEL wakes waiters.
@@ -94,6 +101,8 @@ enum {
        FINISH (id): RFC 9293 CLOSE, the FIN after the queued data; receiving goes
        on until the peer finishes too, and the id stays the caller's until TCP_CLOSE. */
     SYS_TCP_LISTEN, SYS_TCP_ACCEPT, SYS_TCP_ADDRESS, SYS_TCP_FINISH,
+    SYS_NET_ROUTES, SYS_NET_WATCH, SYS_UDP_SOCKET_ON,
+    SYS_NET_ADAPTER_NAME, /* (adapter, char *out, cap) -> its driver's name's whole length; what fits is copied */
     SYS_NET_LIMIT = 128,
     /* Native ABI (docs/nocturne-native-abi.md): typed handles, documents and
        folders by full path, message channels, apps and event queues. */
@@ -169,6 +178,9 @@ enum {
     SYS_POWER_STATE,          /* (N_CAP_SHELL の cap, struct n_power_state *out, size): 電源の段取りの今 */
     SYS_POWER_WATCH,          /* (N_CAP_SHELL の cap): SYS_POWER_STATE が報告するものの watch */
     SYS_SESSION_STOP,         /* (N_CAP_IDENTITY_GRANT の cap, session): その身元のアプリを止める。まだ終わっていない数 */
+    SYS_CLOCK_WALL_STEP,      /* (N_CAP_CLOCK の cap, unix_ns): 壁時計（UTC）を飛ばす */
+    SYS_CLOCK_WALL_SLEW,      /* (N_CAP_CLOCK の cap, offset_ns, ppm): 壁時計をゆっくり動かす */
+    SYS_RTC_WRITE,            /* (N_CAP_CLOCK の cap, unix_seconds): RTC へ UTC を書く */
     SYS_MAX                   /* above every number (what syscallfuzz tries) */
 };
 
@@ -831,20 +843,23 @@ enum {
 #define NMOD_ALT 4
 
 /* networking */
-struct n_netinfo {
-    uint8_t present, up;
+/* An adapter. It keeps its id for as long as the system runs, also unplugged (present 0). ip and
+   mask are in host byte order (a.b.c.d is a<<24 | b<<16 | c<<8 | d); ip 0: no address yet. */
+struct n_net_adapter {
+    uint32_t id;
+    uint8_t present;
+    uint8_t reserved;
     uint8_t mac[6];
-    uint8_t ip[4], mask[4], gateway[4], dns[4];
+    uint32_t ip, mask;
     uint64_t rx_packets, tx_packets;
-    char driver[32];
 };
-/* DNS count is the complete candidate count, even when caller capacity is
-   smaller. A second call may retrieve the cached complete result. */
-enum n_dns_status {
-    N_DNS_OK, N_DNS_NXDOMAIN, N_DNS_NODATA, N_DNS_SERVFAIL, N_DNS_REFUSED,
-    N_DNS_FORMAT, N_DNS_TIMEOUT, N_DNS_UNREACHABLE, N_DNS_CANCELLED, N_DNS_RESOURCE,
+/* The route to destination & mask: by adapter, to gateway (0: on the link). The longest mask goes
+   first, then the lowest metric. An adapter's own network needs no route. */
+struct n_net_route {
+    uint32_t destination, mask, gateway;
+    uint32_t adapter;
+    uint32_t metric;
 };
-struct n_dns_result { uint32_t version, status, count, ttl; };
 #define N_TCP_SEND_NONBLOCK 1u /* SYS_TCP_SEND_UNTIL final flags argument */
 struct n_netstats {
     uint64_t rx_dropped, rx_invalid, rx_budget_yields;
@@ -859,6 +874,12 @@ struct n_tcpstats { /* since boot, all connections */
     uint64_t segs_out, segs_in, retransmits, fast_retransmits, timeouts, dupacks_in, ooo_in;
     uint64_t faults_dropped, faults_reordered;
 };
+/* DNS representation bounds, not hostname quotas. RFC 1035 2.3.4: labels <=63 octets, name including
+   label lengths/root <=255 wire octets. The longest unescaped textual form has 254 bytes including
+   its final dot. */
+#define DNS_NAME_WIRE_BYTES 255u
+#define DNS_NAME_TEXT_BYTES 254u
+
 struct n_sockaddr {
     uint32_t ip; /* host byte order: a.b.c.d is a<<24 | b<<16 | c<<8 | d */
     uint16_t port;

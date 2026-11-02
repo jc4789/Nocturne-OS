@@ -165,7 +165,7 @@ static bool skipped(long n) {
     case SYS_AUDIO_OUTPUT: /* the volume, kept on C: for the user */
         return true;
     }
-    return n >= SYS_NET_INFO && n < SYS_NET_LIMIT;
+    return n >= SYS_NET_FIRST && n < SYS_NET_LIMIT;
 }
 
 /* Calls that change this program's mappings or drive the screen or the GPU never get a pointer into

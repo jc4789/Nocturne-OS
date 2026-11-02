@@ -375,6 +375,8 @@ def test_files(a, tcp_port, web_ports, scratch):
 
     note("tcpport", "%d\n" % tcp_port)
     note("webports", "%d %d\n" % tuple(web_ports))
+    if getattr(a, "dns_port", None):  # tests/testrun.c gives it to the setting network.dns-server
+        note("dns-server", "10.0.2.2:%d\n" % a.dns_port)
     if getattr(a, "h2_port", None):
         note("h2port", "%d\n" % a.h2_port)
     if getattr(a, "tls_silent_port", None):
@@ -468,9 +470,6 @@ def prepare_disk(a, tcp_port, web_ports):
     with tempfile.TemporaryDirectory(prefix="test-", dir=BUILD) as scratch:
         # The same bytes as a preserved baseline's boot image: the same payload.
         payload = a.baseline_payload or system_payload(DISK, scratch)
-        dns_endpoint = "10.0.2.2:%d" % a.dns_port if getattr(a, "dns_port", None) else None
-        if dns_endpoint:
-            edit_boot_entry(DISK, scratch, "dns-server=" + dns_endpoint)
         print("test: C:\\Tests: " + put_tests(DISK, test_files(a, tcp_port, web_ports, scratch), scratch),
               flush=True)
     write_to_larger_disk(DISK, os.path.getsize(DISK) + TEST_ROOM)

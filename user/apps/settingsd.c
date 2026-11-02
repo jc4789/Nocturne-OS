@@ -164,6 +164,7 @@ static uint32_t fixed_size(uint32_t type) {
     case N_SETTING_BOOL: case N_SETTING_INT: case N_SETTING_ENUM: return sizeof(int32_t);
     case N_SETTING_ENDPOINT: return sizeof(struct n_sockaddr);
     case N_SETTING_MONITOR_MODE: return sizeof(struct n_setting_monitor_mode);
+    case N_SETTING_IPV4: return sizeof(struct n_setting_ipv4);
     default: return 0;
     }
 }
@@ -198,6 +199,7 @@ static bool decl_valid(const struct n_setting_decl *d) {
         return d->max >= 0 && d->max <= N_SETTING_VALUE_MAX && (int64_t)strlen(d->fallback_text) <= d->max;
     case N_SETTING_ENDPOINT:
     case N_SETTING_MONITOR_MODE:
+    case N_SETTING_IPV4:
         return true;
     default:
         return false;
