@@ -152,8 +152,12 @@ enum {
     SYS_CAP_DERIVE,           /* (cap, enum n_cap) -> handle */
     SYS_SERVICE_REGISTER,     /* (N_CAP_SERVICE_ROOT の cap) -> 接続の要求を受ける channel */
     SYS_SERVICE_CONNECT,      /* (name, name_len) -> channel */
-    SYS_STORE_PRIVATE_OPEN,   /* (N_CAP_STORE_PRIVATE の cap, region, ...) -> document */
+    SYS_STORE_PRIVATE_OPEN,   /* (N_CAP_STORE_PRIVATE の cap, region, user, access) -> document（§3） */
     SYS_SETTINGS_APPLY,       /* (N_CAP_SETTINGS_APPLY の cap, domain, key, value, len) */
+    SYS_SETTINGS_EFFECTIVE,   /* (domain, key, out, cap): 今の値のバイト数（§12） */
+    SYS_SETTINGS_DESCRIBE,    /* (domain, key, struct n_setting_desc *out)（§12） */
+    SYS_SETTINGS_WATCH,       /* (domain): その領域の今の値の watch（§12） */
+    SYS_ENTRY_SET_OWNER,      /* (path, user): C: の名前の持ち主の利用者。admin 以上（§3） */
     SYS_CAP_KIND,             /* (cap) -> enum n_cap */
     SYS_CAP_FIND,             /* (enum n_cap) -> その能力を持つ自分の handle */
     SYS_SESSION_IDENTITY,     /* (N_CAP_IDENTITY_GRANT の cap, const struct n_identity *):
@@ -217,6 +221,8 @@ struct n_entry {
     uint64_t size;
     int64_t modified;     /* wall seconds */
     uint64_t id;
+    uint32_t owner;       /* the user the name belongs to (0: the system) */
+    uint32_t reserved;
 };
 #define N_ENTRY_FIRST_BYTES 280 /* the first struct n_entry: name to modified */
 
@@ -619,13 +625,10 @@ struct n_audio_status {
 #define N_AUDIO_RATE 48000     /* n_audio_submit: frames of two int16_t, left first */
 #define N_AUDIO_WAIT 1u        /* n_audio_submit: wait for room instead of N_ERR_NOT_READY */
 
-/* n_audio_output: the sound's way out. With set's N_AUDIO_SET_VOLUME the master volume becomes
-   volume (0 to 100; it also unmutes), with N_AUDIO_SET_MUTED muting becomes muted (both: in that
-   order); then *io is filled with how things stand. device names what plays the sound for people
+/* n_audio_output: the sound's way out as it stands. The volume and muting change by
+   SYS_SETTINGS_APPLY (N_AUDIO_VOLUME, N_AUDIO_MUTED, settings_abi.h). device names what plays the sound for people
    ("Remote desktop" while a remote viewer takes it, else the output that plays: a jack, a display's name), "" when nothing does:
    the volume is kept for when something does, but nothing is heard. */
-#define N_AUDIO_SET_VOLUME 1u
-#define N_AUDIO_SET_MUTED 2u
 struct n_audio_output {
     int32_t volume;  /* 0 to 100 */
     uint32_t muted;  /* 0 or 1 */

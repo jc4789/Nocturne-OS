@@ -1,34 +1,29 @@
 /*
  * The monitors' modes (screenmode.h). A display driver knows what its monitor and display engine
  * can show; which of it a screen shows is the system's to say, and the user's: by default the
- * monitor's preferred mode (its native resolution), the user's choice for that monitor once made,
- * and a mode the user tries goes back by itself unless it is kept, so a mode the monitor cannot
- * show never leaves the screen dark. The driver shows each wish at its size and gives the screen
- * buffers of that size (n_pci_give_screen; the desktop follows it), and says what it showed: a
- * wish it could not show is refused, and the next best one comes instead.
+ * monitor's preferred mode (its native resolution), the user's choice for that monitor once made.
+ * The driver shows each wish at its size and gives the screen buffers of that size
+ * (n_pci_give_screen; the desktop follows it), and says what it showed: a wish it could not show is
+ * refused, and the next best one comes instead.
  *
  * A driver may give screen 0 back while it runs (a mode its display did not show): the firmware's
- * mode is shown again, and while its modes stay offered a mode tried asks it to show that one
- * again. What decides a screen's size, as the Settings app is told it (struct screen_modes
+ * mode is shown again, and while its modes stay offered a mode applied asks it to show that one
+ * again. What decides a screen's size, as the Settings window is told it (struct screen_modes
  * source), tells that apart from a driver that ended.
  *
- * Each screen has its own choice (struct choice): the modes offered, the wish, the refusals and a
- * trial. The mode the user keeps for each monitor is kept in the user's
- * AppData\Nocturne\Displays.conf (displays_keep, sys/keep.c) and read back before the first program
- * starts, so a display driver's first offer already finds it. Every change of what SYS_SCREEN_INFO
- * reports of the modes tells its watches (wm_screen_info_changed).
+ * Each screen has its own choice (struct choice): the modes offered, the wish and the refusals. The
+ * mode applied for each monitor is held here until the machine stops, by the one door
+ * (N_DOMAIN_DISPLAY, sys/settings.h). Trying a mode for a while and going back is the settings
+ * service's: it applies the mode, then the one before. Every change of what SYS_SCREEN_INFO reports
+ * of the modes tells its watches (wm_screen_info_changed).
  *
  * Under lock (a mutex, any CPU; the WM's lock and a screen's use come after it): everything below.
- * The trials' ends are watched by a kernel thread of its own, which sleeps until the first of them
- * while trial_changes still reads the same.
  */
 #include "gui/screenmode.h"
 #include "gui/wm.h"
 #include "arch/cpu.h"
 #include "dev/fb.h"
-#include "sys/clock.h"
-#include "sys/keep.h"
-#include "sys/thread.h"
+#include "sys/settings.h"
 #include "sys/wait.h"
 #include "sys/syscall.h"
 #include "mm/heap.h"
@@ -45,10 +40,7 @@ struct choice {
     uint64_t wish_serial;           /* its number (struct n_screen_state mode_serial) */
     struct n_screen_mode refused[REFUSED_MAX];
     unsigned nrefused;
-    bool refused_last;              /* the mode tried last could not be shown */
-    bool trial_on;                  /* trial_from comes back at trial_until (clock ns) unless it is kept */
-    uint64_t trial_until;
-    struct n_screen_mode trial_from;
+    bool refused_last;              /* the mode applied last could not be shown */
 };
 
 static struct mutex lock;
@@ -60,9 +52,6 @@ struct kept {
 };
 static struct kept *kept;            /* the user's choice for each monitor */
 static size_t nkept, kept_room;
-static uint64_t trial_changes;       /* atomic: moves on under lock with each trial's change, before trial_wq's wake */
-static struct wait_queue trial_wq;
-static bool watch_started;
 
 /* Screen id's choice, made when it is not there yet. lock held; NULL without memory. */
 static struct choice *choice_of(unsigned id) {
@@ -148,7 +137,7 @@ static const struct n_screen_mode *nearest(struct choice *c, uint32_t width, uin
     return best;
 }
 
-/* The mode screen id shows when nothing is on trial: the user's choice for the monitor, else the
+/* The mode screen id shows: the user's choice for the monitor, else the
    monitor's preferred mode, else its preferred size at another refresh, else its largest size
    at the refresh nearest the preferred one (the highest without a preferred mode); screen 0 without the desktop (the text console keeps the firmware's size) the
    firmware's size first. All 0 when every mode was refused. */
@@ -194,45 +183,6 @@ static void publish(unsigned id) {
     wm_screen_info_changed();
 }
 
-/* lock held: c's trial off, or on until until. */
-static void trial_set(struct choice *c, bool on, uint64_t until) {
-    c->trial_on = on;
-    c->trial_until = until;
-    __atomic_add_fetch(&trial_changes, 1, __ATOMIC_SEQ_CST);
-    wq_wake_all(&trial_wq);
-}
-
-static void trial_watch(void *arg) {
-    (void)arg;
-    for (;;) {
-        mutex_lock(&lock);
-        uint64_t now = clock_now_ns(), next = CLOCK_NEVER;
-        size_t n = nchoices;
-        bool *back = kzalloc(n ? n : 1);
-        for (size_t id = 0; id < n; id++) {
-            struct choice *c = choices[id];
-            if (!c->trial_on) continue;
-            if (now < c->trial_until) {
-                next = MIN(next, c->trial_until);
-                continue;
-            }
-            if (!back) { /* no memory to say whom: look again soon */
-                next = MIN(next, clock_after(NS_PER_MS * 100));
-                continue;
-            }
-            trial_set(c, false, 0);
-            wish((unsigned)id, c, &c->trial_from, "the mode on trial was not kept; back to");
-            back[id] = true;
-        }
-        uint64_t seen = __atomic_load_n(&trial_changes, __ATOMIC_SEQ_CST);
-        mutex_unlock(&lock);
-        for (size_t id = 0; back && id < n; id++)
-            if (back[id]) publish((unsigned)id);
-        kfree(back);
-        wq_wait_unless(&trial_wq, &trial_changes, seen, next);
-    }
-}
-
 /* The driver's refresh of the mode it shows on the screen, when it shows the screen's size. */
 static void refresh_from(unsigned id, const struct n_screen_modes *m) {
     struct screen *s = screen_get(id);
@@ -251,7 +201,6 @@ void screen_modes_offer(unsigned id, const struct n_screen_modes *m) {
     if (!m->count) {
         if (c->offered.count) kprintf("screen %u: the display driver drives no monitor there any more\n", id);
         c->offered.count = 0;
-        if (c->trial_on) trial_set(c, false, 0);
         c->nrefused = 0;
         if (c->wanted.width) wish(id, c, &(struct n_screen_mode){0}, "no display driver offers modes");
         mutex_unlock(&lock);
@@ -270,7 +219,6 @@ void screen_modes_offer(unsigned id, const struct n_screen_modes *m) {
             kprintf("screen %u: monitor %s%s%s, %u modes\n", id, c->offered.monitor, c->offered.name[0] ? ", " : "",
                     c->offered.name, c->offered.count);
             c->nrefused = 0;
-            if (c->trial_on) trial_set(c, false, 0);
             c->refused_last = false;
         }
         bool keep = !new_monitor && c->wanted.width && offered_mode(c, &c->wanted) && !is_refused(c, &c->wanted);
@@ -280,19 +228,14 @@ void screen_modes_offer(unsigned id, const struct n_screen_modes *m) {
             wish(id, c, &p, "the monitor shows");
         }
     } else if (m->done == c->wish_serial && c->wanted.width && !same(&m->shown, &c->wanted)) {
-        /* The driver could not show the wish: the one before a trial comes back, else the next best. */
+        /* The driver could not show the wish: the next best. */
         char text[48];
         mode_text(&c->wanted, text, sizeof text);
         kprintf("screen %u: the display driver could not show %s\n", id, text);
         refuse(c, &c->wanted);
         c->refused_last = true;
-        if (c->trial_on) {
-            trial_set(c, false, 0);
-            wish(id, c, &c->trial_from, "back to");
-        } else {
-            struct n_screen_mode p = pick(id, c);
-            wish(id, c, p.width ? &p : &m->shown, "instead it shows");
-        }
+        struct n_screen_mode p = pick(id, c);
+        wish(id, c, p.width ? &p : &m->shown, "instead it shows");
     }
     /* A result of the wish (or of an older one: the driver acts on the newer one next) changes nothing. */
     mutex_unlock(&lock);
@@ -330,15 +273,9 @@ void screen_modes_shown(unsigned id, struct screen_mode_desc *desc) {
     mutex_unlock(&lock);
 }
 
-/* ---- the modes the user kept, in Displays.conf ---- */
+/* ---- the modes the user chose ---- */
 
-static bool displays_line(const char *key, const char *value, bool apply);
-static size_t displays_text(char *out, size_t cap);
-static struct keep displays_keep = {.name = "Displays", .line = displays_line, .text = displays_text};
-
-void screen_modes_init(void) { keep_register(&displays_keep); }
-
-/* The user's choice of mode for a monitor, read back: shown on each screen that monitor is
+/* The user's choice of mode for a monitor, applied: shown on each screen that monitor is
    offered on and offers it (now, if it is). */
 static void choose(const char *monitor, const struct n_screen_mode *mode) {
     char name[sizeof kept[0].monitor] = {0};
@@ -352,8 +289,9 @@ static void choose(const char *monitor, const struct n_screen_mode *mode) {
     for (size_t id = 0; wished && id < n; id++) {
         struct choice *c = choices[id];
         const struct n_screen_mode *m = c->offered.count && !strcmp(c->offered.monitor, name) ? offered_mode(c, mode) : NULL;
-        if (m && !c->trial_on && !same(m, &c->wanted)) {
+        if (m && !same(m, &c->wanted)) {
             unrefuse(c, m);
+            c->refused_last = false;
             wish((unsigned)id, c, m, "the user's choice for this monitor");
             wished[id] = true;
         }
@@ -367,59 +305,33 @@ static void choose(const char *monitor, const struct n_screen_mode *mode) {
         }
     kfree(wished);
     if (!any && differs) wm_screen_info_changed(); /* chosen */
+    settings_changed(N_DOMAIN_DISPLAY);
 }
 
-/* "<width>x<height>@<millihertz>", none of them 0. */
-static bool mode_value(const char *s, struct n_screen_mode *m) {
-    uint32_t v[3] = {0};
-    for (int i = 0; i < 3; i++) {
-        int digits = 0;
-        for (; *s >= '0' && *s <= '9'; s++) {
-            if (++digits > 7) return false;
-            v[i] = v[i] * 10 + (uint32_t)(*s - '0');
-        }
-        if (!v[i] || *s != (i == 0 ? 'x' : i == 1 ? '@' : 0)) return false;
-        if (i < 2) s++;
-    }
-    *m = (struct n_screen_mode){v[0], v[1], v[2], 0};
-    return true;
+int screen_modes_setting_put(uint32_t key, const void *value) {
+    const struct n_setting_monitor_mode *m = value;
+    if (strlen(m->monitor) >= sizeof kept[0].monitor) return -N_ERR_INVALID;
+    struct n_screen_mode mode = {m->width, m->height, m->refresh_mhz, 0};
+    choose(m->monitor, &mode);
+    return 0;
 }
 
-/* Whether a monitor's text reads back as the same key: not empty, no '=' or line end in it, no
-   space or tab around it. */
-static bool monitor_writable(const char *s) {
-    size_t n = strlen(s);
-    if (!n || s[0] == ' ' || s[0] == '\t' || s[n - 1] == ' ' || s[n - 1] == '\t') return false;
-    for (size_t i = 0; i < n; i++)
-        if (s[i] == '=' || s[i] == '\n' || s[i] == '\r') return false;
-    return true;
-}
-
-/* Displays.conf: mode.<monitor>=<width>x<height>@<millihertz>, a line for each monitor. */
-static bool displays_line(const char *key, const char *value, bool apply) {
-    if (strncmp(key, "mode.", 5)) return false;
-    const char *monitor = key + 5;
-    struct n_screen_mode m;
-    if (apply && *monitor && strlen(monitor) < sizeof kept[0].monitor && mode_value(value, &m)) choose(monitor, &m);
-    return true;
-}
-
-static size_t displays_text(char *out, size_t cap) {
-    size_t n = 0;
-    keep_put(out, cap, &n, "# The mode kept for each monitor. Nocturne keeps this: change it in Settings.\n");
+int64_t screen_modes_setting_get(uint32_t key, void *out, size_t cap) {
+    struct n_setting_monitor_mode *list = out;
     mutex_lock(&lock);
-    for (size_t i = 0; i < nkept; i++) {
-        const struct n_screen_mode *m = &kept[i].mode;
-        if (monitor_writable(kept[i].monitor))
-            keep_put(out, cap, &n, "mode.%s=%ux%u@%u\n", kept[i].monitor, m->width, m->height, m->refresh_mhz);
+    size_t n = nkept, fits = cap / sizeof *list;
+    for (size_t i = 0; i < n && i < fits; i++) {
+        memset(&list[i], 0, sizeof list[i]);
+        strlcpy(list[i].monitor, kept[i].monitor, sizeof list[i].monitor);
+        list[i].width = kept[i].mode.width;
+        list[i].height = kept[i].mode.height;
+        list[i].refresh_mhz = kept[i].mode.refresh_mhz;
     }
     mutex_unlock(&lock);
-    return n;
+    return (int64_t)(n * sizeof *list);
 }
 
-_Static_assert(offsetof(struct screen_modes, chosen) == SCREEN_MODES_FIRST_BYTES, "the first struct screen_modes");
-
-/* What the Settings app is shown of a screen without a driver's modes, or while the firmware's
+/* What the Settings window is shown of a screen without a driver's modes, or while the firmware's
    mode is shown: the screen's monitor and mode as its buffers have it (the refresh its driver or
    the firmware's EDID says, 0 when not known). */
 static void screen_part(struct n_screen_modes *m, struct screen *s, bool boot) {
@@ -438,90 +350,35 @@ static void screen_part(struct n_screen_modes *m, struct screen *s, bool boot) {
 
 int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op) {
     unsigned id = (unsigned)(op >> 8);
-    op &= 0xff;
     struct screen *s = screen_get(id);
     if (!s) return -N_ERR_NOT_FOUND;
-    if (op == SCREEN_MODES_GET) {
-        /* the struct of the caller's build: with chosen or without */
-        if (size != sizeof(struct screen_modes) && size != SCREEN_MODES_FIRST_BYTES) return -N_ERR_INVALID;
-        struct screen_modes *out = kzalloc(sizeof *out);
-        if (!out) return -N_ERR_NO_MEMORY;
-        bool remote = id == 0 && wm_remote_viewing(), boot = screen_boot(s);
-        struct screen_mode_desc d;
-        bool on = screen_mode(s, &d);
-        mutex_lock(&lock);
-        struct choice *c = choice_of(id);
-        if (c) {
-            out->offered = c->offered;
-            out->wanted = c->wanted;
-            uint64_t now = clock_now_ns();
-            /* the ABI's ms, rounded up: 0 says no trial */
-            out->trial_ms = c->trial_on && c->trial_until > now ? (uint32_t)((c->trial_until - now + NS_PER_MS - 1) / NS_PER_MS) : 0;
-            out->refused = c->refused_last;
-        }
-        out->source = remote             ? SCREEN_SOURCE_REMOTE
-                      : on && !boot      ? SCREEN_SOURCE_DRIVER
-                      : !c               ? SCREEN_SOURCE_FIRMWARE
-                      : c->driver == DRIVER_RUNNING ? SCREEN_SOURCE_HANDED_BACK
-                      : c->driver == DRIVER_ENDED   ? SCREEN_SOURCE_DRIVER_STOPPED
-                                                    : SCREEN_SOURCE_FIRMWARE;
-        out->screens = screen_count();
-        mutex_unlock(&lock);
-        screen_part(&out->offered, s, boot || !on);
-        mutex_lock(&lock);
-        const struct n_screen_mode *chosen = out->offered.monitor[0] ? kept_for(out->offered.monitor) : NULL;
-        if (chosen) out->chosen = *chosen;
-        mutex_unlock(&lock);
-        int64_t r = copy_to_user(user, out, size);
-        kfree(out);
-        return r;
-    }
-    if (op != SCREEN_MODE_SET || size != sizeof(struct screen_mode_set)) return -N_ERR_INVALID;
-    struct screen_mode_set set;
-    if (copy_from_user(&set, user, sizeof set)) return -N_ERR_BAD_ADDRESS;
-    set.monitor[sizeof set.monitor - 1] = 0;
-    int64_t r = 0;
-    bool changed = false, chose = false, ended = false;
+    if (size != sizeof(struct screen_modes)) return -N_ERR_INVALID;
+    struct screen_modes *out = kzalloc(sizeof *out);
+    if (!out) return -N_ERR_NO_MEMORY;
+    bool remote = id == 0 && wm_remote_viewing(), boot = screen_boot(s);
+    struct screen_mode_desc d;
+    bool on = screen_mode(s, &d);
     mutex_lock(&lock);
     struct choice *c = choice_of(id);
-    if (!c) r = -N_ERR_NO_MEMORY;
-    else if (set.how == SCREEN_MODE_TRY) {
-        const struct n_screen_mode *m = c->offered.count ? offered_mode(c, &set.mode) : NULL;
-        if (!c->offered.count) r = -N_ERR_NOT_FOUND;
-        else if (!m) r = -N_ERR_INVALID;
-        else {
-            if (!c->trial_on) c->trial_from = c->wanted;
-            trial_set(c, true, clock_after((uint64_t)SCREEN_MODE_TRIAL_MS * NS_PER_MS));
-            c->refused_last = false;
-            unrefuse(c, m);
-            wish(id, c, m, "on trial");
-            changed = true;
-            if (!watch_started) {
-                watch_started = true;
-                kthread_create("screen mode", trial_watch, NULL);
-            }
-        }
-    } else if (set.how == SCREEN_MODE_KEEP || set.how == SCREEN_MODE_BACK) {
-        if (!c->offered.count || !c->trial_on) r = -N_ERR_NOT_FOUND;
-        else {
-            trial_set(c, false, 0);
-            ended = true;
-            if (set.how == SCREEN_MODE_KEEP) {
-                const struct n_screen_mode *before = kept_for(c->offered.monitor);
-                chose = !before || !same(before, &c->wanted);
-                if (!keep_for(c->offered.monitor, &c->wanted)) r = -N_ERR_NO_MEMORY;
-                char text[48];
-                mode_text(&c->wanted, text, sizeof text);
-                kprintf("screen %u: the user keeps %s\n", id, text);
-            } else {
-                wish(id, c, &c->trial_from, "the user goes back to");
-                changed = true;
-            }
-        }
-    } else r = -N_ERR_INVALID;
+    if (c) {
+        out->offered = c->offered;
+        out->wanted = c->wanted;
+        out->refused = c->refused_last;
+    }
+    out->source = remote             ? SCREEN_SOURCE_REMOTE
+                  : on && !boot      ? SCREEN_SOURCE_DRIVER
+                  : !c               ? SCREEN_SOURCE_FIRMWARE
+                  : c->driver == DRIVER_RUNNING ? SCREEN_SOURCE_HANDED_BACK
+                  : c->driver == DRIVER_ENDED   ? SCREEN_SOURCE_DRIVER_STOPPED
+                                                : SCREEN_SOURCE_FIRMWARE;
+    out->screens = screen_count();
     mutex_unlock(&lock);
-    if (changed) publish(id);
-    if (chose) keep_changed(&displays_keep); /* the user's choice for this monitor, kept */
-    if (ended && !changed) wm_screen_info_changed(); /* the trial ended, and chosen */
+    screen_part(&out->offered, s, boot || !on);
+    mutex_lock(&lock);
+    const struct n_screen_mode *chosen = out->offered.monitor[0] ? kept_for(out->offered.monitor) : NULL;
+    if (chosen) out->chosen = *chosen;
+    mutex_unlock(&lock);
+    int64_t r = copy_to_user(user, out, size);
+    kfree(out);
     return r;
 }

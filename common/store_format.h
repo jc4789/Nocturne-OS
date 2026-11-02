@@ -37,6 +37,11 @@
    Names compare by their simple case folding, through the table the volume carries (document
    STORE_ID_FOLD), so every kernel that mounts the volume names its entries alike.
 
+   Private regions live in the folder STORE_ID_REGIONS, which no folder names: no path leads there,
+   no listing shows it, and only SYS_STORE_PRIVATE_OPEN reaches a region, by its number and its
+   user's. Each region is an ordinary document of that folder (its name is the two numbers,
+   store_region_name), so a region is replaced whole as any document is.
+
    Every block but the superblocks carries a CRC-32C seeded from the volume's identity (a block of
    another volume never passes for one of this), its own address and the generation that wrote it;
    a branch names a child by address and generation. Contents carry a CRC-32C per block in their
@@ -45,7 +50,7 @@
 #include <stdint.h>
 
 #define STORE_BLOCK 4096u
-#define STORE_VERSION 1u
+#define STORE_VERSION 2u
 #define STORE_SIGNATURE "Nocturne"
 
 /* GPT partition type of a Nocturne volume, df8027d2-685d-4511-a682-fed55b9b8c7f, in GPT's byte
@@ -155,16 +160,20 @@ struct store_child {
 
 #define STORE_ID_ROOT 1  /* C:\ (its own parent) */
 #define STORE_ID_FOLD 2  /* the case-folding table: a document no folder names */
+#define STORE_ID_REGIONS 3 /* the private regions: a folder no folder names */
 #define STORE_ID_FIRST 16
 
 #define STORE_DOCUMENT 1
 #define STORE_FOLDER 2
 
 /* attributes */
-#define STORE_SYSTEM 1u    /* apps read it but cannot change it or anything in it (C:\Nocturne) */
-#define STORE_TEMPORARY 2u /* a temporary folder of the system (C:\Nocturne\Temp, the user's AppData\Temp):
+#define STORE_TEMPORARY 1u /* a temporary folder of the system (C:\Nocturne\Temp, the user's AppData\Temp):
                               the kernel empties it whenever it mounts the volume */
-#define STORE_PRIVATE 4u   /* only the kernel reaches it (the hibernation image) */
+#define STORE_PRIVATE 2u   /* only the kernel reaches it (the hibernation image) */
+
+/* owner: the user a name belongs to (0: the system). A new name has its folder's. */
+#define STORE_OWNER_SYSTEM 0u
+#define STORE_OWNER_FIRST 1u /* the user of a volume as it is made */
 
 /* flags */
 #define STORE_INLINE 1u    /* the content follows the record; no extents */
@@ -179,6 +188,8 @@ struct store_record {
     uint16_t attributes;
     uint16_t flags;
     uint16_t reserved;
+    uint32_t owner;    /* STORE_OWNER_*, or a user's number */
+    uint32_t reserved2;
 };
 #define STORE_INLINE_MAX (STORE_VALUE_MAX - sizeof(struct store_record))
 
@@ -196,6 +207,16 @@ struct store_extent {
     uint32_t check[];
 };
 #define STORE_EXTENT_CHECKS 128u
+
+/* The name of a private region in STORE_ID_REGIONS: 16 hexadecimal digits of the user, then of the
+   region. out holds 17 bytes; its length. */
+static inline unsigned store_region_name(uint32_t user, uint32_t region, char *out) {
+    static const char digits[] = "0123456789abcdef";
+    uint64_t v = (uint64_t)user << 32 | region;
+    for (int i = 0; i < 16; i++) out[i] = digits[(v >> (60 - 4 * i)) & 15];
+    out[16] = 0;
+    return 16;
+}
 
 /* The case-folding table (document STORE_ID_FOLD): pairs of code points, sorted by the first, for
    every code point whose simple case folding is another. */

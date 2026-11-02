@@ -20,6 +20,7 @@
 #include "dev/blk.h"
 #include "dev/fb.h"
 #include "dev/hibernate.h"
+#include "fs/bootrecord.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
@@ -597,8 +598,8 @@ void hibernate_restore(void) {
     uint64_t total = pmm_page_count(), t0 = clock_now_ns();
     uint8_t *raw = NULL, *packed = NULL;
     const char *why = "it cannot be read";
-    if (cmdline_has("noresume")) {
-        why = "noresume";
+    if (!boot_setting(N_BOOT_RESUME)) {
+        why = "the boot record says not to";
         goto drop;
     }
     if (found < 0 || !(h.stage = kmalloc(STAGE_BYTES)) || disk_at(0, h.stage, PAGE_SIZE, false) < 0) goto drop;

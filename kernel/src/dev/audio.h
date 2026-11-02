@@ -166,9 +166,10 @@ bool audio_remote_mix(struct audio_remote *r, int16_t *out, int frames, uint64_t
    output; NULL when nothing does (the volume then changes nothing that is heard). */
 const char *audio_output(void);
 
-/* The master volume, 0-100 (setting it also unmutes), and mute: the user's. Sound keeps them in
-   the user's AppData\Nocturne\Sound.conf (sys/keep.c) and reads them back at the start. Any CPU;
-   a read may be a moment old, and the watches hear of every change. */
+/* The master volume, 0-100 (setting it also unmutes), and mute: the user's. Sound holds them and
+   does not save them: the settings service hears of each change (N_DOMAIN_AUDIO, sys/settings.h)
+   and applies them back at the start. Any CPU; a read may be a moment old, and the watches hear of
+   every change. */
 int audio_volume(void);
 void audio_set_volume(int percent);
 bool audio_muted(void);

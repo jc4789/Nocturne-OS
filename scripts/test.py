@@ -136,6 +136,11 @@ def edit_boot_entry(disk, scratch, cmdline):
     entries stay as they are. The screen's size is the virtual monitor's (vm_display), never the
     boot entry's."""
     part = esp(disk)
+    if cmdline:
+        # only the test build of the kernel reads the command line (kernel.h)
+        subprocess.run([sys.executable, "-X", "utf8", os.path.join(ROOT, "scripts", "build.py"), "-j", "8", "kernel-test"],
+                       check=True)
+        mtools("mcopy", "-o", "-i", part, mtools_name(os.path.join(CORE_BUILD, "kernel-test.elf")), "::/boot/kernel.elf")
     conf = os.path.join(scratch, "limine.conf")
     mtools("mcopy", "-n", "-o", "-i", part, "::/boot/limine/limine.conf", mtools_name(conf))
     with open(conf, encoding="utf-8") as f:
