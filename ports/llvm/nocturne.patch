@@ -1428,7 +1428,7 @@ index 9c279c45..126e5625 100644
 +}
 +
 +// The complete path the native API takes for p: a path that is not complete
-+// is inside the app's FOLDER setting. An empty path names nothing.
++// is inside the app's current folder. An empty path names nothing.
 +inline n_result complete_path(const path& p, string& out) {
 +  if (p.empty())
 +    return -N_ERR_NOT_FOUND;
@@ -1875,7 +1875,7 @@ index cd55b797..5ed7ab6f 100644
  
 -#if defined(_LIBCPP_WIN32API) || defined(__GLIBC__) || defined(__APPLE__)
 +#if defined(__nocturne__)
-+  // The app's FOLDER setting, which holds the paths that are not complete.
++  // The app's current folder, which holds the paths that are not complete.
 +  string full;
 +  n_result r = detail::complete_path(".", full);
 +  if (r < 0)
@@ -3755,7 +3755,7 @@ index 00000000..3f83d270
 +//
 +// This file implements the Path API on Nocturne's documents and folders.
 +// Nocturne takes complete paths ("C:\a\b"); a name is taken inside the app's
-+// folder (its setting FOLDER). Names compare without regard to case and are
++// folder (n_folder). Names compare without regard to case and are
 +// kept as they were given. There are no links, owners or permissions, and an
 +// entry's id identifies it for as long as it exists, wherever it moves.
 +//
@@ -4079,8 +4079,8 @@ index 00000000..3f83d270
 +}
 +
 +void expand_tilde(const Twine &Path, SmallVectorImpl<char> &Dest) {
-+  // "~" is a name like any other: the user's folder is the setting
-+  // USERFOLDER (path::home_directory).
++  // "~" is a name like any other: the user's folder is n_user_folder
++  // (path::home_directory).
 +  Dest.clear();
 +  Path.toVector(Dest);
 +}
@@ -4581,9 +4581,9 @@ index 00000000..8feae661
 +//
 +//===----------------------------------------------------------------------===//
 +//
-+// An app reads its launch settings with getenv and is handed its input and
-+// output as handles 0, 1 and 2. The launcher names in the setting TERMINAL the
-+// handles that reach a terminal, which understands ANSI escape codes.
++// An app reads its environment with getenv and is handed its input and
++// output as handles 0, 1 and 2. The launcher names in the launch's terminals
++// the handles that reach a terminal, which understands ANSI escape codes.
 +//
 +//===----------------------------------------------------------------------===//
 +
@@ -4688,7 +4688,7 @@ new file mode 100644
 index 00000000..c9410c28
 --- /dev/null
 +++ b/llvm/lib/Support/Nocturne/Program.inc
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,230 @@
 +//===- Nocturne/Program.inc - Nocturne Program Implementation --*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -4698,9 +4698,9 @@ index 00000000..c9410c28
 +//===----------------------------------------------------------------------===//
 +//
 +// An app is launched with n_app_launch from its program's complete path, with
-+// its arguments, its settings and the handles it gets as 0, 1 and 2. Nothing
-+// is inherited: the launcher passes its folder (FOLDER) and names the handles
-+// that reach a terminal (TERMINAL). The app handle reports its end and result.
++// its arguments, its environment and the handles it gets as 0, 1 and 2. The C
++// library passes the launcher's folder, and the launcher names the handles that
++// reach a terminal (terminals). The app handle reports its end and result.
 +//
 +//===----------------------------------------------------------------------===//
 +
@@ -4789,7 +4789,7 @@ index 00000000..c9410c28
 +      if (H != fs::kInvalidFile)
 +        fs::closeFile(H);
 +  });
-+  std::string Terminal;
++  std::vector<int32_t> Terminals;
 +  for (int I = 0; I < 3; ++I) {
 +    if (!Redirects.empty() && Redirects[I]) {
 +      Expected<fs::file_t> H = openRedirect(*Redirects[I], I);
@@ -4805,28 +4805,14 @@ index 00000000..c9410c28
 +    }
 +    Handles[I] = n_handle_kind(I) >= 0 ? I : -1;
 +    if (Handles[I] >= 0 && n_terminal(I))
-+      Terminal += (Terminal.empty() ? "" : " ") + std::to_string(I);
++      Terminals.push_back(I);
 +  }
 +
 +  std::vector<std::string> Settings;
 +  if (Env)
 +    for (StringRef Setting : *Env)
 +      Settings.push_back(Setting.str());
-+  auto Given = [&](StringRef Name) {
-+    return any_of(Settings, [&](StringRef Setting) {
-+      return Setting.size() > Name.size() && Setting.starts_with(Name) &&
-+             Setting[Name.size()] == '=';
-+    });
-+  };
-+  if (!Given("FOLDER")) {
-+    SmallString<256> Folder;
-+    if (!nocturne::completePath(".", Folder))
-+      Settings.push_back(("FOLDER=" + Folder).str());
-+  }
-+  // A detached app is not part of this app's terminal session.
-+  if (!DetachProcess && !Terminal.empty() && !Given("TERMINAL"))
-+    Settings.push_back("TERMINAL=" + Terminal);
-+
+
 +  std::vector<std::string> ArgStrings(Args.begin(), Args.end());
 +  std::vector<const char *> Arguments, SettingPointers;
 +  for (const std::string &Arg : ArgStrings)
@@ -4836,11 +4822,16 @@ index 00000000..c9410c28
 +
 +  struct n_launch Launch = {};
 +  Launch.arguments = Arguments.data();
-+  Launch.settings = SettingPointers.data();
++  Launch.environment = SettingPointers.data();
 +  Launch.handles = Handles;
 +  Launch.argument_count = static_cast<uint32_t>(Arguments.size());
-+  Launch.setting_count = static_cast<uint32_t>(SettingPointers.size());
++  Launch.environment_count = static_cast<uint32_t>(SettingPointers.size());
 +  Launch.handle_count = 3;
++  // A detached app is not part of this app's terminal session.
++  if (!DetachProcess) {
++    Launch.terminals = Terminals.data();
++    Launch.terminal_count = static_cast<uint32_t>(Terminals.size());
++  }
 +  n_handle App = n_app_launch(Path.c_str(), &Launch);
 +  if (App < 0) {
 +    nocturne::setErrMsg(ErrMsg, "cannot launch '" + Program + "'",
