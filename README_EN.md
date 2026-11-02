@@ -114,7 +114,7 @@ This is Nocturne as a program sees it (`user/include/nocturne.h`, `common/abi.h`
 
 - **Handles**: every resource is a typed handle (document, folder, channel, window, shared pages, app, events,
   device, connection). Failures return a negative `N_ERR_*`, and `n_result_text` describes it.
-- **Documents and folders** are always named by a complete path (`C:\Users\User\a.txt`; `\` and `/` are the same,
+- **Documents and folders** are always named by a complete path (`C:\Users\<name>\a.txt`; `\` and `/` are the same,
   and `\a` is `C:\a`). Names are not case-sensitive and keep the case they were written in. The kernel has no
   working folder and no file position. The shell's current folder reaches apps as the setting `FOLDER=`. There are whole-document
   load, atomic save and append, reads and writes at a given offset, and exclusive claims.
@@ -361,7 +361,7 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
 | Shift+PgUp / PgDn, mouse wheel | Terminal scrollback |
 | Ctrl+C | Stop the running command |
 
-The terminal and apps start in the user's folder, `C:\Users\User`. `Documents` has a few sample files; try
+The terminal and apps start in the user's folder, `C:\Users\<name>`. `Documents` has a few sample files; try
 `sh Documents\hello.sh`. `Documents\JavaScript` has samples for `js`.
 
 ### Drive C: and saving
@@ -372,7 +372,7 @@ and files saved on it survive reboots.
   change it.
 - `C:\Programs`: the desktop apps, a folder each (`Browser`, `Notepad` and so on). The folders of the apps that come
   with the system cannot be changed either; your own apps get their folders here.
-- `C:\Users\User`: the user's files (`Documents`, `Desktop`, `Downloads`, `Music`, `Pictures`, `Videos`). An app's
+- `C:\Users\<name>`: the user's files (`Documents`, `Desktop`, `Downloads`, `Music`, `Pictures`, `Videos`). An app's
   data goes in `AppData\<app>`, temporary files in `AppData\Temp` (emptied on every boot).
 - What is written is committed about 5 seconds after the first change, or when the document is closed. If the power
   goes in the middle of a write, everything up to the last commit stays.
@@ -384,7 +384,7 @@ Where C: lives:
 - **Real hardware**: the USB stick's C:.
 - The live ISO's C: is in memory, and changes to it are lost at power-off.
 
-From the host, `build\host\store.exe` looks into C: (`store list build\run.img C:\Users\User`, `store get`, `store put`).
+From the host, `build\host\store.exe` looks into C: (`store list build\run.img C:\Users\<name>`, `store get`, `store put`).
 
 The shell looks up a bare command name in `C:\Nocturne\System` and then in each folder of `C:\Programs` (there is no
 `PATH`), so a program put in `C:\Programs\<Name>` runs by name.
@@ -401,7 +401,7 @@ The shell looks up a bare command name in `C:\Nocturne\System` and then in each 
 - **Media Player:** plays MP3, FLAC, AAC and Ogg (Vorbis, Opus) audio and MP4, WebM, AVI and MOV video (H.264,
   HEVC, VP8, VP9 and more) through FFmpeg. Double-clicking audio or video in Files opens it. Space plays or pauses,
   Left and Right jump 5 seconds, and Ctrl+O opens a file or URL.
-- **Music:** `C:\Users\User\Music` has three short pieces made for Nocturne (synthesized at build time by `scripts/mksounds.py`).
+- **Music:** `C:\Users\<name>\Music` has three short pieces made for Nocturne (synthesized at build time by `scripts/mksounds.py`).
 - **Piano** plays two octaves from the mouse or the keyboard (Z S X D C V G B H N J M for the lower octave,
   Q 2 W 3 E R 5 T 6 Y 7 U I for the upper), in three sounds (Tab), with Left and Right to change octave.
 - Snake, Tetris and Minesweeper have sound effects.
@@ -431,7 +431,7 @@ a second or two after the desktop appears.
 ping -c 3 example.com
 host example.com
 fetch -i http://example.com
-fetch -o C:\Users\User\Downloads\1mb.zip http://speedtest.tele2.net/1MB.zip
+fetch -o C:\Users\<name>\Downloads\1mb.zip http://speedtest.tele2.net/1MB.zip
 ```
 
 - **TCP/IP** (`kernel/src/net/`): Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS and TCP.
@@ -614,7 +614,7 @@ It writes C, compiles it with `tcc`, runs it and fixes what breaks.
 
 ```
 agent                                   # interactive session (type /help)
-agent write a tetris clone in C:\Users\User\Documents\tetris and install it as C:\Programs\Tet\tet
+agent write a tetris clone in C:\Users\<name>\Documents\tetris and install it as C:\Programs\Tet\tet
 agent -r                                # resume the previous session
 ```
 

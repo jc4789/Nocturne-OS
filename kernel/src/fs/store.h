@@ -33,11 +33,6 @@ struct volume;
 void store_init(void);
 /* From now on C: changes: its system folders are made ready and its writer starts. */
 void store_start(void);
-/* C:\Users\<name>, the folder of the person using the machine: the first in C:\Users, "User" made
-   when there is none. Apps start in it. Its AppData\Temp is the user's temporary folder, emptied by
-   every store_start. Both are "C:\" until then, or when they cannot be made. */
-const char *store_user_folder(void);
-const char *store_user_temp(void);
 /* Everything changed so far is on the medium (power changes, hibernation). */
 int store_sync(void);
 

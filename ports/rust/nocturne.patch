@@ -1459,8 +1459,8 @@ index 0000000..5680deb
 +//! There is no kernel working directory: an app's current folder is the C
 +//! library's (`n_folder`), which `n_path_complete` uses to complete relative
 +//! names and which is passed on to the apps it launches. The user's folder and
-+//! the temporary folder are fields of the launch, which the C library holds.
-+//! Path lists are separated by `;`.
++//! the temporary folder come from the accounts service through the C library,
++//! by the app's identity. Path lists are separated by `;`.
 +
 +use crate::ffi::{OsStr, OsString};
 +use crate::io;
@@ -1549,7 +1549,7 @@ index 0000000..5680deb
 +}
 +
 +pub fn home_dir() -> Option<PathBuf> {
-+    // SAFETY: a NUL-terminated complete path.
++    // SAFETY: a NUL-terminated path ("C:\" for the system's identity).
 +    Some(unsafe { c_path(abi::n_user_folder()) })
 +}
 diff --git a/library/std/src/sys/process/mod.rs b/library/std/src/sys/process/mod.rs

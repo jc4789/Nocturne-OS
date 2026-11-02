@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <display.h>
-#include <services_abi.h>
+#include <nocturne_services.h>
 #include <nocturne_settings.h>
 #include "ui.h"
 #include "display_abi.h"
@@ -223,45 +223,22 @@ static const char *service_state_text(uint32_t state) {
     }
 }
 
-/* 管理者に問い、応答の後の count 通を受ける。 */
-static n_result services_ask(const struct n_services_request *q, bool list) {
-    n_handle h = n_service_connect(N_SERVICE_MANAGER);
-    if (h < 0) return h;
-    struct n_services_reply a;
-    n_result r = n_channel_send(h, q, sizeof *q, -1);
-    if (r >= 0) r = n_channel_receive(h, &a, sizeof a, N_CHANNEL_WAIT, NULL);
-    if (r >= 0) r = (n_result)a.result;
-    if (r >= 0 && list) {
-        struct n_service_status *grown = a.count ? calloc(a.count, sizeof *grown) : NULL;
-        if (a.count && !grown) r = -N_ERR_NO_MEMORY;
-        for (uint32_t i = 0; r >= 0 && i < a.count; i++) {
-            n_result got = n_channel_receive(h, &grown[i], sizeof *grown, N_CHANNEL_WAIT, NULL);
-            if (got < 0) r = got;
-        }
-        if (r >= 0) {
-            free(services);
-            services = grown;
-            service_count = a.count;
-        } else free(grown);
-    }
-    n_handle_close(h);
-    return r;
-}
 static void services_load(void) {
-    struct n_services_request q = {.op = N_SERVICES_LIST};
-    n_result r = services_ask(&q, true);
+    struct n_service_status *list;
+    n_result r = n_services_list(&list);
     if (r < 0) {
         snprintf(status, sizeof status, "サービスの管理者に届きません（%s）。", n_result_text(r));
         status_bad = true;
+        return;
     }
+    free(services);
+    services = list;
+    service_count = (uint32_t)r;
 }
 static void service_do(uint32_t index, uint32_t op) {
     if (index >= service_count) return;
     const struct n_service_status *st = &services[index];
-    struct n_services_request q = {.op = op, .session = st->session};
-    strlcpy(q.name, st->name, sizeof q.name);
-    strlcpy(q.argument, st->argument, sizeof q.argument);
-    n_result r = services_ask(&q, false);
+    n_result r = n_services_control(op, st->name, st->argument);
     if (r < 0) snprintf(status, sizeof status, "%s：%s", st->name, n_result_text(r)), status_bad = true;
     else say("", false);
     services_load();
@@ -286,41 +263,23 @@ static uint32_t account_count;
 static char new_name[N_ACCOUNT_NAME_MAX], new_password[N_ACCOUNT_PASSWORD_MAX];
 static bool new_admin;
 
-static n_result accounts_ask(const struct n_accounts_request *q, bool list) {
-    n_handle h = n_service_connect("accounts");
-    if (h < 0) return h;
-    struct n_accounts_reply a;
-    n_result r = n_channel_send(h, q, sizeof *q, -1);
-    if (r >= 0) r = n_channel_receive(h, &a, sizeof a, N_CHANNEL_WAIT, NULL);
-    if (r >= 0) r = (n_result)a.result;
-    if (r >= 0 && list) {
-        struct n_account *grown = a.count ? calloc(a.count, sizeof *grown) : NULL;
-        if (a.count && !grown) r = -N_ERR_NO_MEMORY;
-        for (uint32_t i = 0; r >= 0 && i < a.count; i++) {
-            n_result got = n_channel_receive(h, &grown[i], sizeof *grown, N_CHANNEL_WAIT, NULL);
-            if (got < 0) r = got;
-        }
-        if (r >= 0) {
-            free(accounts);
-            accounts = grown;
-            account_count = a.count;
-        } else free(grown);
-    }
-    n_handle_close(h);
-    return r;
-}
 static void accounts_load(void) {
-    struct n_accounts_request q = {.op = N_ACCOUNTS_LIST};
-    n_result r = accounts_ask(&q, true);
+    struct n_account *list;
+    n_result r = n_accounts_list(&list);
     if (r < 0) {
         snprintf(status, sizeof status, "利用者のサービスに届きません（%s）。", n_result_text(r));
         status_bad = true;
+        return;
     }
+    free(accounts);
+    accounts = list;
+    account_count = (uint32_t)r;
 }
 static void account_class(uint32_t index, uint32_t cls) {
     if (index >= account_count) return;
     struct n_accounts_request q = {.op = N_ACCOUNTS_SET_CLASS, .user = accounts[index].user, .cls = cls};
-    n_result r = accounts_ask(&q, false);
+    struct n_accounts_reply a;
+    n_result r = n_accounts_call(&q, &a);
     if (r < 0) snprintf(status, sizeof status, "級を変えられません（%s）。", n_result_text(r)), status_bad = true;
     else say("", false);
     accounts_load();
@@ -333,7 +292,8 @@ static void account_create(void) {
     struct n_accounts_request q = {.op = N_ACCOUNTS_CREATE, .cls = new_admin ? N_CLASS_ADMIN : N_CLASS_USER};
     strlcpy(q.name, new_name, sizeof q.name);
     strlcpy(q.password, new_password, sizeof q.password);
-    n_result r = accounts_ask(&q, false);
+    struct n_accounts_reply a;
+    n_result r = n_accounts_call(&q, &a);
     memset(&q, 0, sizeof q);
     if (r < 0) {
         snprintf(status, sizeof status, "作れません（%s）。", n_result_text(r));

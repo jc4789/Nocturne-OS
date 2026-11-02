@@ -11,6 +11,7 @@
    が本体の場所と CRC を持つ。新しい本体は古い版の場所へ書き、media へ届いてから古い版の記録を書き換える。
    途中で切れても新しい方の版が残り、読むときは世代の新しい順に確かめて、壊れていれば前の版へ戻る。 */
 #include <nocturne.h>
+#include <nocturne_services.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,7 +84,7 @@ struct change {
     uint64_t deadline;
 };
 
-static n_handle queue, inlet;
+static n_handle queue;
 static n_handle store = -1, apply_cap = -1;
 static n_handle store_cap = -1;
 static n_handle kernel_watch[N_DOMAIN_COUNT];
@@ -1164,7 +1165,7 @@ static void kernel_domain_changed(uint32_t domain) {
 /* 受け口に来た相手を全部受ける。false は管理者が名前を閉じた知らせで、止まる。 */
 static bool accept_connections(void) {
     for (;;) {
-        n_handle end = n_inlet_accept(inlet, 0);
+        n_handle end = n_inlet_accept(N_SERVICE_HANDLE_CONTROL, 0);
         if (end == -N_ERR_NOT_READY) return true;
         if (end == -N_ERR_CLOSED) return false;
         if (end >= 0) conn_add(end);
@@ -1218,9 +1219,9 @@ int main(void) {
     }
     apply_machine_values();
     left_trials_back();
-    /* 値を読み終え、カーネルへ適用した後で名前を持つ。名前があることが準備の済んだ証拠。 */
-    inlet = n_service_listen(N_SETTINGS_SERVICE);
-    if (inlet < 0 || n_events_watch(queue, inlet, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, TOKEN_INLET) < 0) return 1;
+    if (n_events_watch(queue, N_SERVICE_HANDLE_CONTROL, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, TOKEN_INLET) < 0) return 1;
+    /* 値を読み終え、カーネルへ適用した後で相手を受ける。 */
+    n_service_ready();
     for (;;) {
         struct n_event events[32];
         n_result n = n_events_wait(queue, events, sizeof events / sizeof *events, next_deadline());

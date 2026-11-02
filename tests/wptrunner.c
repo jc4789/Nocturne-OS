@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
+#include "testrun.h"
 
 #define HOST 0x0A000202 /* 10.0.2.2 */
 #define MAX_SLOTS 64
@@ -68,21 +69,28 @@ static void remove_tree(const char *path) {
    cookies, storage and preferences do not pass between slots or from one browser to the next. */
 static void open_slot(int slot, char **words, int count) {
     stop_slot(slot);
-    char user[64], temp[80], user_setting[96], temp_setting[96];
-    snprintf(user, sizeof user, "C:\\Tests\\profiles\\slot%d", slot);
-    snprintf(temp, sizeof temp, "%s\\Temp", user);
-    remove_tree(user);
-    n_folder_create("C:\\Tests\\profiles");
-    n_folder_create(user);
-    n_folder_create(temp);
+    /* 枠ごとの試験の利用者。profile は毎回空から。 */
+    char name[32], appdata[N_ACCOUNT_FOLDER_MAX + 32];
+    snprintf(name, sizeof name, "Wpt%d", slot);
+    struct n_account user;
+    n_result made = test_account(name, &user);
+    if (made < 0) {
+        say("failed %d %s\n", slot, n_result_text(made));
+        return;
+    }
+    remove_tree(user.folder);
+    n_folder_create(user.folder);
+    snprintf(appdata, sizeof appdata, "%s\\AppData", user.folder);
+    n_folder_create(appdata);
+    snprintf(appdata, sizeof appdata, "%s\\AppData\\Temp", user.folder);
+    n_folder_create(appdata);
     const char *args[MAX_WORDS + 2];
     args[0] = "browser";
     args[1] = "--wpt-automation";
     for (int i = 0; i < count; i++) args[i + 2] = words[i];
     int32_t handles[] = {-1, -1, -1};
-    struct n_launch launch = {.arguments = args, .handles = handles, .argument_count = (uint32_t)count + 2, .handle_count = 3,
-                              .user_folder = user, .temp_folder = temp};
-    n_handle app = n_app_launch(N_FOLDER_PROGRAMS "\\Browser\\browser", &launch);
+    struct n_launch launch = {.arguments = args, .handles = handles, .argument_count = (uint32_t)count + 2, .handle_count = 3};
+    n_handle app = test_launch_as(&user, N_FOLDER_PROGRAMS "\\Browser\\browser", &launch);
     if (app < 0) {
         say("failed %d %s\n", slot, n_result_text(app));
         return;

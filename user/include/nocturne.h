@@ -63,6 +63,8 @@ n_result n_document_append(const char *path, const void *data, size_t size);
 n_result n_document_load(const char *path, void **data, size_t *size);
 n_result n_entry_info(const char *path, struct n_entry *out);
 n_result n_entry_remove(const char *path);
+/* パスの持ち主の利用者を変える。N_CLASS_ADMIN 以上（§3）。 */
+n_result n_entry_set_owner(const char *path, uint32_t user);
 n_result n_entry_move(const char *from, const char *to); /* never replaces: N_ERR_EXISTS */
 /* n_entry_move that lets document from take the name of a document, which goes in the same commit
    (as n_entry_remove takes it: its open handles keep it). Any other entry there: N_ERR_EXISTS. */
@@ -309,8 +311,6 @@ n_result n_settings_apply(n_handle cap, uint32_t domain, uint32_t key, const voi
 n_result n_settings_effective(uint32_t domain, uint32_t key, void *out, size_t cap);
 n_result n_settings_describe(uint32_t domain, uint32_t key, struct n_setting_desc *out);
 n_handle n_settings_watch(uint32_t domain);
-/* 名前の木の外の私的な領域（enum n_private_region）の文書。user 0 は機械。access は n_document_open と同じ。 */
-n_handle n_store_private_open(n_handle cap, uint32_t region, uint32_t user, int access);
 /* A watch on what n_audio_output reports: the volume, muting and what plays the sound. */
 n_handle n_audio_output_watch(void);
 /* Watches (N_KIND_WATCH, docs/nocturne-native-abi.md §1): N_EVENT_RECEIVABLE once what the watch
@@ -355,7 +355,8 @@ n_result n_path_from_url(const char *url, char *out, size_t cap);
 /* The file: URL of a path, made complete first (n_path_join): C:\Users\User\a b.html is
    file:///C:/Users/User/a%20b.html. Returns the length, or N_ERR_TOO_LARGE. */
 n_result n_path_to_url(const char *path, char *out, size_t cap);
-/* The user's folder and temporary folder (struct n_start). */
+/* この process の利用者のフォルダーと一時フォルダー。身元から accounts が引く（libc/services.c）。
+   システムの身元には無く、"C:\" を返す。 */
 const char *n_user_folder(void);
 const char *n_temp_folder(void);
 /* The folder an app keeps its data in, <user's folder>\AppData\<name>, made when missing.

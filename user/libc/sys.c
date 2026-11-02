@@ -429,7 +429,7 @@ n_result n_channel_receive(n_handle h, void *buf, size_t cap, int flags, n_handl
 n_result n_channel_receive_from(n_handle h, void *buf, size_t cap, int flags, struct n_channel_message *message) {
     return NC5(SYS_CHANNEL_RECEIVE_FROM, h, buf, cap, flags, message);
 }
-static n_handle launch_program(const char *path, const struct n_launch *launch) {
+n_handle n_app_launch(const char *path, const struct n_launch *launch) {
     n_handle app = (n_handle)NC5(SYS_APP_LAUNCH, path, launch, 0, 0, 0);
     if (app != -N_ERR_NOT_PROGRAM || !launch) return app;
     /* a script: its interpreter runs it, with the script's name before the rest */
@@ -452,17 +452,16 @@ static n_handle launch_program(const char *path, const struct n_launch *launch) 
 
 /* 起動の属性（struct n_start）。今のフォルダーはこのアプリが n_folder_set で変える。一度渡したフォルダーの文字列は
    アプリの寿命の間残るので、別のスレッドが持つ指は消えない。 */
-static const struct n_start no_start = {.environment = (char *const[]){NULL}, .folder = "C:\\", .user_folder = "C:\\",
-                                         .temp_folder = "C:\\"};
+static const struct n_start no_start = {.environment = (char *const[]){NULL}};
 static const struct n_start *start_info = &no_start;
+static const char *own_folder(void);
 
-/* 子は起動元の利用者のために働く：起動元の今のフォルダー、利用者のフォルダー、一時フォルダーを渡す。 */
+/* 子は起動元の今のフォルダーを受ける。起動元が持たなければ子も持たない：身元の利用者のフォルダーを
+   引くのは accounts への接続で、サービスの管理者は accounts を起こす前にここを通る。 */
 n_handle n_app_launch(const char *path, const struct n_launch *launch) {
     if (!launch) return launch_program(path, launch);
     struct n_launch l = *launch;
-    if (!l.folder) l.folder = n_folder();
-    if (!l.user_folder) l.user_folder = start_info->user_folder;
-    if (!l.temp_folder) l.temp_folder = start_info->temp_folder;
+    if (!l.folder) l.folder = own_folder();
     return launch_program(path, &l);
 }
 
@@ -567,9 +566,6 @@ n_result n_settings_describe(uint32_t domain, uint32_t key, struct n_setting_des
     return NC5(SYS_SETTINGS_DESCRIBE, domain, key, out, 0, 0);
 }
 n_handle n_settings_watch(uint32_t domain) { return (n_handle)NC5(SYS_SETTINGS_WATCH, domain, 0, 0, 0, 0); }
-n_handle n_store_private_open(n_handle cap, uint32_t region, uint32_t user, int access) {
-    return (n_handle)NC5(SYS_STORE_PRIVATE_OPEN, cap, region, user, access, 0);
-}
 n_result n_entry_set_owner(const char *path, uint32_t user) { return NC5(SYS_ENTRY_SET_OWNER, path, user, 0, 0, 0); }
 n_handle n_audio_output_watch(void) { return (n_handle)NC5(SYS_AUDIO_OUTPUT_WATCH, 0, 0, 0, 0, 0); }
 n_result n_watch_take(n_handle watch) { return NC5(SYS_WATCH_TAKE, watch, 0, 0, 0, 0); }
@@ -658,9 +654,13 @@ static struct kept_folder *kept_folders;
 static const char *current_folder;
 static uint32_t folder_lock;
 
-const char *n_folder(void) {
+static const char *own_folder(void) {
     const char *f = __atomic_load_n(&current_folder, __ATOMIC_ACQUIRE);
     return f ? f : start_info->folder;
+}
+const char *n_folder(void) {
+    const char *f = own_folder();
+    return f ? f : n_user_folder();
 }
 
 static int folder_keep(const char *path) {
@@ -737,7 +737,10 @@ n_result n_path_join(const char *folder, const char *name, char *out, size_t cap
 }
 
 n_result n_path_complete(const char *name, char *out, size_t cap) {
-    return n_path_join(n_folder(), name, out, cap);
+    const char *folder = own_folder();
+    /* 持たなければ利用者のフォルダーで始まる。完全なパスには引かない：引くのは接続だから。 */
+    if (!folder) folder = n_path_is_complete(name) ? "C:\\" : n_user_folder();
+    return n_path_join(folder, name, out, cap);
 }
 
 const char *n_path_name(const char *path) {
@@ -800,9 +803,6 @@ n_result n_path_to_url(const char *path, char *out, size_t cap) {
     out[used] = 0;
     return (n_result)used;
 }
-
-const char *n_user_folder(void) { return start_info->user_folder; }
-const char *n_temp_folder(void) { return start_info->temp_folder; }
 
 static n_result folder_ready(const char *path) {
     n_result r = n_folder_create(path);

@@ -146,7 +146,7 @@ fn main() {
     c.check("park/unpark", parked.join().unwrap() == 42);
 
     // Environment: the launch settings, set_var, remove_var.
-    for name in ["FOLDER", "USERFOLDER", "TEMP"] {
+    for name in ["FOLDER"] {
         println!("{name}={:?}", std::env::var_os(name));
     }
     println!("vars: {}", std::env::vars().count());

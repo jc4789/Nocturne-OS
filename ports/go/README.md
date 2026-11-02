@@ -54,8 +54,8 @@ Nocturne は UNIX でも POSIX でもないので、Go 側を Nocturne の API �
   `C:\Nocturne\System`、次に `C:\Programs` の各アプリのフォルダーで探します（`syscall.FindProgram`、
   `exec.LookPath` と `os.Executable` が使います）。
 - **シグナルはありません**：`os/signal.Notify` は何も届けません。非同期プリエンプションも使いません。
-- **フォルダーの既定**：`os.UserHomeDir` は設定 `USERFOLDER`（`C:\Users\<名前>`）、
-  `UserCacheDir` と `UserConfigDir` はその `AppData`、`os.TempDir` は設定 `TEMP`。`HOME` はありません。
+- **フォルダーの既定**：`os.UserHomeDir` は身元から `accounts` が引く利用者のフォルダー（`C:\Users\<名前>`）、
+  `UserCacheDir` と `UserConfigDir` はその `AppData`、`os.TempDir` はその `AppData\Temp`。`HOME` はありません。
 - **書込みの確定**：`File.Sync` は `DocumentCommit`（`COMMIT_WAIT`）で文書をディスクまで確定します。
 - **通信**：TCP・UDP の番号はハンドルではないので、`net` は Nocturne の通信呼出し
   （`TCPConnect`、`TCPRecv`、`TCPSendUntil`、`UDPSocket` 等）を直接使います。待ちは

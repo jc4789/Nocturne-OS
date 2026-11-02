@@ -186,8 +186,8 @@ enum {
 /* SYS_WATCH_TAKE counts up to this and stays there until the count is taken */
 #define N_WATCH_CHANGES_MAX 0xffffffffu
 
-/* The folders of C: every app and the system know. Apps start in the user's folder, C:\Users\<name>
-   (struct n_start の user_folder); its AppData\Temp, emptied at every start, is temp_folder. */
+/* The folders of C: every app and the system know. Apps start in the user's folder, C:\Users\<name>,
+   which n_user_folder names from the identity; its AppData\Temp, emptied at every login, is n_temp_folder's. */
 #define N_FOLDER_SYSTEM   "C:\\Nocturne\\System"  /* the system's programs */
 #define N_FOLDER_PROGRAMS "C:\\Programs"           /* the apps, each in a folder of its own */
 /* certificate authorities the system trusts besides the roots built into TLS (user/libc/tls.c) */
@@ -238,11 +238,11 @@ struct n_channel_message {
 
 /* n_app_launch. 新しいアプリの handle i は起動元の handles[i]（-1 は無し）。慣例で 0 が入力、
    1 が出力、2 がログ。起動の属性は型のある欄で渡す：
-     folder       今のフォルダー（NULL は起動元の libc が自分の今のフォルダーを入れる）。
-     user_folder、temp_folder  利用者のフォルダーと一時フォルダー（NULL は起動元のもの。起動元も
-                  持たなければカーネルが身元の利用者のものを入れる）。
+     folder       今のフォルダー（NULL は起動元の今のフォルダー。起動元も持たなければ子も持たず、
+                  子は身元の利用者のフォルダーで始まる）。
      terminals    端末へつながる handle の番号。
      interrupts   端末の Ctrl+C の知らせを受ける channel の handle の番号（0 は無し）。
+   利用者のフォルダーは身元から accounts が引く（n_user_folder）ので渡さない。
    environment は移植のプログラムのための "NAME=value" の列で、そのプログラムの libc の getenv だけ
    が読む。システムの部品はこれを読まず、これで組まない。 */
 struct n_launch {
@@ -251,8 +251,6 @@ struct n_launch {
     const int32_t *handles;
     uint32_t argument_count, environment_count, handle_count, flags;
     const char *folder;
-    const char *user_folder;
-    const char *temp_folder;
     const int32_t *terminals;
     uint32_t terminal_count;
     int32_t interrupts;
@@ -264,12 +262,10 @@ struct n_launch {
     uint32_t reserved;
 };
 /* アプリの入口の第三引数。カーネルが n_launch の欄を新しいアプリの stack に写したもの。文字列と
-   配列は同じ stack にある。folder・user_folder・temp_folder はいつも完全なパスを指す。 */
+   配列は同じ stack にある。folder は完全なパスか NULL。 */
 struct n_start {
     char *const *environment; /* NULL で終わる */
     const char *folder;
-    const char *user_folder;
-    const char *temp_folder;
     const int32_t *terminals;
     uint32_t terminal_count;
     int32_t interrupts;

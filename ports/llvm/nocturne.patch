@@ -2257,7 +2257,7 @@ index cd55b797..5ed7ab6f 100644
  
 -#if defined(_LIBCPP_WIN32API)
 +#if defined(__nocturne__)
-+  // The setting TEMP, or C:\ without it.
++  // The user's temporary folder, or C:\ for the system's identity.
 +  path p(n_temp_folder());
 +#elif defined(_LIBCPP_WIN32API)
    wchar_t buf[MAX_PATH];
@@ -4079,8 +4079,8 @@ index 00000000..3f83d270
 +}
 +
 +void expand_tilde(const Twine &Path, SmallVectorImpl<char> &Dest) {
-+  // "~" is a name like any other: the user's folder is n_user_folder
-+  // (path::home_directory).
++  // "~" is a name like any other: the user's folder comes from the
++  // accounts service (path::home_directory).
 +  Dest.clear();
 +  Path.toVector(Dest);
 +}

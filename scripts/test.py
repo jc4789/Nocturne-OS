@@ -6,7 +6,7 @@ The built disk (build/nocturne.img, `make qemu-image`) is one GPT disk: the EFI 
 copy's kernel and system programs are the current build's, and puts tests/ and an autorun.sh in
 C:\\Tests with build/host/store.exe. The copy is the VM's only disk, on NVMe (the VM is a q35 booted
 through UEFI, like the real machine) and without a snapshot, 4 GiB larger than the image: C: grows
-into that on its first start. init runs C:\\Tests\\autorun.sh at boot: it compiles tests/runtests.c with the in-OS tcc
+into that on its first start. The tests service (tests/testrun.c, put in C:\\Nocturne\\System on this copy only) runs C:\\Tests\\autorun.sh at boot: it compiles tests/runtests.c with the in-OS tcc
 and runs it, then powers off. Results come back over the serial port. Afterwards the host checks
 the volume the OS just wrote to with `store check`, and deletes the copy (it is kept only when the
 check finds problems, for looking into them). For the TCP tests the host also runs a small server
@@ -180,6 +180,8 @@ def put_tests(disk, entries, scratch):
             if any(c in path + host for c in "\t\r\n"):
                 sys.exit("a test file's name cannot be listed: %r" % host)
             f.write("%s\t%s\n" % (path, host))
+        # 製品の媒体に無いサービスの本体。C:\\Nocturne\\System を書けるのはシステムだけ。
+        f.write("C:\\Nocturne\\System\\testrun\t%s\n" % os.path.join(CORE_BUILD, "tests", "testrun"))
     done = store("fill", disk, listing).stdout.strip()
     os.remove(listing)
     return done

@@ -2081,7 +2081,7 @@ index 764ce12c..de68d1d8 100644
 +		// Apps keep what they cache in a folder of their own in AppData.
 +		dir = syscall.UserFolder()
 +		if dir == "" {
-+			return "", errors.New("the user's folder is not defined")
++			return "", errors.New("this app has no user folder")
 +		}
 +		dir += `\AppData`
 +
@@ -2093,22 +2093,25 @@ index 764ce12c..de68d1d8 100644
  		dir += "/lib"
  
 +	case "nocturne":
-+		// A ported program keeps its files in a folder of its own in AppData.
++		// Apps keep their settings in a folder of their own in AppData.
 +		dir = syscall.UserFolder()
 +		if dir == "" {
-+			return "", errors.New("the user's folder is not defined")
++			return "", errors.New("this app has no user folder")
 +		}
 +		dir += `\AppData`
 +
  	default: // Unix
  		dir = Getenv("XDG_CONFIG_HOME")
  		if dir == "" {
-@@ -609,6 +625,8 @@ func UserHomeDir() (string, error) {
+@@ -609,6 +625,11 @@ func UserHomeDir() (string, error) {
  		env, enverr = "USERPROFILE", "%userprofile%"
  	case "plan9":
  		env, enverr = "home", "$home"
 +	case "nocturne":
-+		return syscall.UserFolder(), nil
++		if dir := syscall.UserFolder(); dir != "" {
++			return dir, nil
++		}
++		return "", errors.New("this app has no user folder")
  	}
  	if v := Getenv(env); v != "" {
  		return v, nil
@@ -2193,7 +2196,7 @@ new file mode 100644
 index 00000000..29a1b1da
 --- /dev/null
 +++ b/src/os/file_nocturne.go
-@@ -0,0 +1,702 @@
+@@ -0,0 +1,706 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -2811,9 +2814,13 @@ index 00000000..29a1b1da
 +	return &PathError{Op: "chown", Path: f.name, Err: syscall.ENOTSUP}
 +}
 +
-+// tempDir is the user's temporary folder, emptied at every start.
++// tempDir is the user's temporary folder, emptied at every login.
 +func tempDir() string {
-+	return syscall.TempFolder()
++	dir := syscall.UserFolder()
++	if dir == "" {
++		return `C:\`
++	}
++	return dir + `\AppData\Temp`
 +}
 +
 +// Chdir changes the current folder to the file,
@@ -3200,7 +3207,7 @@ new file mode 100644
 index 00000000..e536822f
 --- /dev/null
 +++ b/src/os/user/lookup_nocturne.go
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,56 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -3213,9 +3220,8 @@ index 00000000..e536822f
 +	"syscall"
 +)
 +
-+// Nocturne has one person at the machine and no user or group database.
-+// Current describes them by their folder, syscall.UserFolder
-+// (C:\Users\<name>); Lookup and the group calls are not supported.
++// The accounts service owns the users. Current describes this app's user by
++// their folder (C:\Users\<name>); Lookup and the group calls are not supported.
 +
 +func init() {
 +	userImplemented = false
@@ -3544,7 +3550,7 @@ new file mode 100644
 index 00000000..5f226169
 --- /dev/null
 +++ b/src/runtime/os_nocturne.go
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,446 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -3606,19 +3612,20 @@ index 00000000..5f226169
 +var nocturneStart *struct {
 +	environment   **byte
 +	folder        *byte
-+	userFolder    *byte
-+	tempFolder    *byte
 +	terminals     *int32
 +	terminalCount uint32
 +	interrupts    int32
 +}
 +
-+// The launch's folders and terminals, for package syscall.
++// The launch's folder and terminals, for package syscall.
 +//
 +//go:linkname syscall_runtime_start syscall.runtime_start
-+func syscall_runtime_start() (folder, userFolder, tempFolder string, terminals []int32) {
++func syscall_runtime_start() (folder string, terminals []int32) {
 +	s := nocturneStart
-+	return gostring(s.folder), gostring(s.userFolder), gostring(s.tempFolder), unsafe.Slice(s.terminals, s.terminalCount)
++	if s.folder != nil {
++		folder = gostring(s.folder)
++	}
++	return folder, unsafe.Slice(s.terminals, s.terminalCount)
 +}
 +
 +type mOS struct {
@@ -4210,7 +4217,7 @@ new file mode 100644
 index 00000000..a673859b
 --- /dev/null
 +++ b/src/syscall/syscall_nocturne.go
-@@ -0,0 +1,1119 @@
+@@ -0,0 +1,1164 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -4229,6 +4236,7 @@ index 00000000..a673859b
 +	"internal/bytealg"
 +	"internal/oserror"
 +	"internal/strconv"
++	"sync"
 +	"unsafe"
 +)
 +
@@ -4262,6 +4270,7 @@ index 00000000..a673859b
 +	SYS_CHANNEL_SEND      = 145
 +	SYS_CHANNEL_RECEIVE   = 146
 +	SYS_APP_LAUNCH        = 147
++	SYS_SERVICE_CONNECT   = 214
 +	SYS_APP_RESULT        = 148
 +	SYS_APP_STOP          = 149
 +	SYS_APP_SELF          = 150
@@ -4701,33 +4710,27 @@ index 00000000..a673859b
 +}
 +
 +// The fields of the launch, which the runtime holds.
-+func runtime_start() (folder, userFolder, tempFolder string, terminals []int32)
++func runtime_start() (folder string, terminals []int32)
 +
 +var (
 +	folderLock sync.RWMutex
 +	folderNow  string // set by Chdir
 +)
 +
-+// Folder returns the app's current folder.
++// Folder returns the app's current folder: its user's folder until it has one.
 +func Folder() string {
 +	folderLock.RLock()
 +	folder := folderNow
 +	folderLock.RUnlock()
 +	if folder == "" {
-+		folder, _, _, _ = runtime_start()
++		folder, _ = runtime_start()
 +	}
-+	return folder
-+}
-+
-+// UserFolder returns the folder of the user the app works for.
-+func UserFolder() string {
-+	_, folder, _, _ := runtime_start()
-+	return folder
-+}
-+
-+// TempFolder returns the user's temporary folder.
-+func TempFolder() string {
-+	_, _, folder, _ := runtime_start()
++	if folder == "" {
++		folder = UserFolder()
++	}
++	if folder == "" {
++		folder = `C:\`
++	}
 +	return folder
 +}
 +
@@ -4941,6 +4944,60 @@ index 00000000..a673859b
 +	return int(r), int(a), errnoErr(e)
 +}
 +
++// ---- the user ----
++
++// The accounts service's records (common/services_abi.h).
++const (
++	accountsOpSelf       = 2
++	accountsRequestBytes = 336 // struct n_accounts_request
++	accountsReplyBytes   = 192 // struct n_accounts_reply
++	accountsFolderAt     = 96  // account.folder in the reply
++	accountsFolderBytes  = 96
++)
++
++var userFolder struct {
++	once sync.Once
++	path string
++}
++
++// UserFolder is this app's user's folder, which the accounts service names
++// from the kernel's identity of the app, or "" for the system's identity.
++func UserFolder() string {
++	userFolder.once.Do(func() {
++		name := []byte("accounts")
++		r, e := Syscall(SYS_SERVICE_CONNECT, uintptr(unsafe.Pointer(&name[0])), uintptr(len(name)), 0, 0, 0)
++		if e != 0 {
++			return
++		}
++		h := int(r)
++		defer Close(h)
++		var request [accountsRequestBytes]byte
++		request[0] = accountsOpSelf
++		var reply [accountsReplyBytes]byte
++		if _, err := ChannelSend(h, request[:], -1); err != nil {
++			return
++		}
++		n, _, err := ChannelReceive(h, reply[:], 1) // N_CHANNEL_WAIT
++		if err != nil || n != len(reply) {
++			return
++		}
++		for _, b := range reply[:8] { // result: 0 when the user is known
++			if b != 0 {
++				return
++			}
++		}
++		folder := reply[accountsFolderAt : accountsFolderAt+accountsFolderBytes]
++		for i, b := range folder {
++			if b == 0 {
++				folder = folder[:i]
++				break
++			}
++		}
++		userFolder.path = string(folder)
++	})
++	return userFolder.path
++}
++
 +// ---- apps ----
 +
 +// struct n_launch
@@ -4953,8 +5010,6 @@ index 00000000..a673859b
 +	handleLen   uint32
 +	flags       uint32
 +	folder      *byte
-+	userFolder  *byte
-+	tempFolder  *byte
 +	terminals   *int32
 +	terminalLen uint32
 +	interrupts  int32
@@ -4978,8 +5033,8 @@ index 00000000..a673859b
 +// AppLaunch starts the program at path. Handle i of the new app is
 +// handles[i] (-1: none); by convention 0 is its input, 1 its output and
 +// 2 its log. env holds "NAME=value" strings for a program's getenv, folder
-+// its current folder ("": this app's). It works for this app's user and
-+// reaches this app's terminals. It returns an app handle.
++// its current folder ("": this app's). It reaches this app's terminals.
++// It returns an app handle.
 +func AppLaunch(path string, args, env []string, handles []int, folder string) (int, error) {
 +	p, err := pathPtr(path)
 +	if err != nil {
@@ -4993,21 +5048,20 @@ index 00000000..a673859b
 +	if err != nil {
 +		return -1, err
 +	}
-+	_, user, temp, terminals := runtime_start()
++	here, terminals := runtime_start()
++	folderLock.RLock()
 +	if folder == "" {
-+		folder = Folder()
++		folder = folderNow
 +	}
-+	f, err := pathPtr(folder)
-+	if err != nil {
-+		return -1, err
++	folderLock.RUnlock()
++	if folder == "" {
++		folder = here
 +	}
-+	u, err := pathPtr(user)
-+	if err != nil {
-+		return -1, err
-+	}
-+	t, err := pathPtr(temp)
-+	if err != nil {
-+		return -1, err
++	var f *byte
++	if folder != "" {
++		if f, err = pathPtr(folder); err != nil {
++			return -1, err
++		}
 +	}
 +	hs := make([]int32, len(handles)+1)
 +	for i, h := range handles {
@@ -5021,8 +5075,6 @@ index 00000000..a673859b
 +		envLen:      uint32(len(env)),
 +		handleLen:   uint32(len(handles)),
 +		folder:      f,
-+		userFolder:  u,
-+		tempFolder:  t,
 +		terminalLen: uint32(len(terminals)),
 +	}
 +	if len(terminals) != 0 {
