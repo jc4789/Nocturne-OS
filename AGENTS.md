@@ -8,7 +8,7 @@ LINUX SOURCE CODE OR ANY OTHER OS'S SOURCE CODE IS NEVER ALLOWED TO BE REFERENCE
  Nocturne OS'S NATIVE ABI MUST NOT BE BYPASSED, YOU MUST RESPECT, USE AND IMPROVE WHEN NEEDED: common/abi.h`・`display_abi.h`・`gpu_abi.h`、仕様 `docs/nocturne-native-abi.md!
  ハードウェアと仕様の事実は、ユーザーの言葉と公式の文書だけが正であり、自分でもサブエージェントでも確かめ直さず、推測で疑わず、そのまま使う。 
 
-
+"EVERYTHING IS NOT A FILE. THAT IS STUPID AND WRONG. THERE ARE BOUNDARIES. THE UI. THE SYSTEM PROCESSES. KERNEL. THERE ARE NOT FILES TO EDIT. THERE ARE SETTINGS TO CHANGE AND APPLY."
 
 Nocturne は GUI が先の独自の OS。カーネルと C ライブラリーは C。対象は実機。QEMU と Hyper-V は試験の道具で、VM で通ることは実機で動く証拠にならない。汎用の OS を目指す：CPU・メモリー・装置・プログラム・利用者の数が増えても成り立つ形で設計する。shim もスパゲッティも作らない。抽象化の層は要る所に作る。
 
