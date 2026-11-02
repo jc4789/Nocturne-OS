@@ -18,7 +18,6 @@
 #include <string.h>
 #include <threads.h>
 #include "nocturne.h"
-#include "nocturne_services.h"
 #include "nvrm.h"
 #include "nvrm_protocol.h"
 #include "../ports/nvidia/nvrm_serve.h"
@@ -30,8 +29,8 @@
 #include "nv_escape.h"
 #include "nv-unix-nvos-params-wrappers.h"
 
-/* サーバーの接続の口はこの試験のもの。ends[0] をサーバーが受け、ends[1] からつなぐ。 */
-static n_handle connector_ends[2];
+/* A PCI function no GPU of the test machine is: the server's channel is this test's own. */
+#define TARGET N_PCI_TARGET(0xfe, 0x1f, 7)
 #define WAIT_MS 5000u
 #define FAKE_CMD_ECHO 0x7e570001u
 #define FAKE_CMD_BLOCK 0x7e570002u
@@ -470,22 +469,17 @@ static int serve_returned;
 
 static int server_main(void *arg) {
     (void)arg;
-    serve_result = nvrm_serve(connector_ends[0]);
+    serve_result = nvrm_serve(TARGET);
     __atomic_store_n(&serve_returned, 1, __ATOMIC_RELEASE);
     return 0;
 }
 
-static int64_t serve_connect(struct nvrm **out) {
-    n_handle channel = n_connector_connect(connector_ends[1], NULL);
-    return channel < 0 ? channel : nvrm_connect_channel(channel, out);
-}
-
-/* The server thread starts on its own time. */
+/* The server thread starts listening on its own time. */
 static struct nvrm *first_connect(void) {
     uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + WAIT_MS;
     for (;;) {
         struct nvrm *rm = NULL;
-        int64_t r = serve_connect(&rm);
+        int64_t r = nvrm_connect_device_status(TARGET, &rm);
         if (r >= 0) return rm;
         if ((n_clock_monotonic() / N_NS_PER_MS) > end || __atomic_load_n(&serve_returned, __ATOMIC_ACQUIRE)) {
             CHECK(false, "no server to connect to: %s (nvrm_serve: %s)", n_result_text(r),
@@ -573,7 +567,7 @@ static void test_single(struct nvrm *rm) {
 
     fake_set(&fake.not_ready, true);
     rm = NULL;
-    int64_t s = serve_connect(&rm);
+    int64_t s = nvrm_connect_device_status(TARGET, &rm);
     CHECK(s >= 0 && !nvrm_device_ready(rm), "HELLO reports an adapter that is not ready: %s",
           n_result_text(s));
     uint32_t unready = rm ? echo(rm, 1, FAKE_CMD_ECHO, 0x44) : 0;
@@ -586,13 +580,13 @@ static void test_single(struct nvrm *rm) {
     unsigned opened = fake.open_calls;
     mtx_unlock(&fake.lock);
     rm = NULL;
-    s = serve_connect(&rm);
+    s = nvrm_connect_device_status(TARGET, &rm);
     CHECK(s == -N_ERR_NO_MEMORY && !rm, "RM's failed open is the client's: %s", n_result_text(s));
     mtx_lock(&fake.lock);
     unsigned tried = fake.open_calls - opened;
     mtx_unlock(&fake.lock);
     CHECK(tried == 1, "one open was tried (%u)", tried);
-    s = serve_connect(&rm);
+    s = nvrm_connect_device_status(TARGET, &rm);
     CHECK(s >= 0, "the server serves the next client: %s", n_result_text(s));
     if (rm) nvrm_disconnect(rm);
 }
@@ -606,7 +600,7 @@ static unsigned uvm_ends(void) {
 
 static void test_uvm(void) {
     struct nvrm *rm = NULL;
-    int64_t s = serve_connect(&rm);
+    int64_t s = nvrm_connect_device_status(TARGET, &rm);
     CHECK(s >= 0, "UVM client: %s", n_result_text(s));
     if (!rm) return;
     uint32_t id = echo(rm, 1, FAKE_CMD_ECHO, 0x99);
@@ -661,7 +655,7 @@ static void test_uvm(void) {
 
 static void test_scanout(void) {
     struct nvrm *rm = NULL;
-    int64_t s = serve_connect(&rm);
+    int64_t s = nvrm_connect_device_status(TARGET, &rm);
     CHECK(s >= 0, "scanout client: %s", n_result_text(s));
     if (!rm) return;
     uint32_t id = echo(rm, 1, FAKE_CMD_ECHO, 0x5c);
@@ -734,7 +728,7 @@ static void workers_run(struct worker *w, unsigned n) {
 static void test_concurrent(void) {
     struct worker w[WORKERS] = {0};
     for (unsigned i = 0; i < WORKERS; i++) {
-        int64_t s = serve_connect(&w[i].rm);
+        int64_t s = nvrm_connect_device_status(TARGET, &w[i].rm);
         CHECK(s >= 0, "client %u: %s", i, n_result_text(s));
         w[i].owner = 100 + i;
         w[i].first_tag = (i + 1) << 16;
@@ -749,7 +743,7 @@ static void test_concurrent(void) {
     /* one connection, several threads: libnvrm orders them, the server keeps one file */
     struct worker s[SHARERS] = {0};
     struct nvrm *shared = NULL;
-    int64_t r = serve_connect(&shared);
+    int64_t r = nvrm_connect_device_status(TARGET, &shared);
     CHECK(r >= 0, "shared client: %s", n_result_text(r));
     if (shared) {
         for (unsigned i = 0; i < SHARERS; i++) {
@@ -784,7 +778,7 @@ static int blocked_main(void *arg) {
 
 static void test_blocking(void) {
     struct nvrm *slow = NULL, *other = NULL;
-    CHECK(serve_connect(&slow) >= 0 && serve_connect(&other) >= 0,
+    CHECK(nvrm_connect_device_status(TARGET, &slow) >= 0 && nvrm_connect_device_status(TARGET, &other) >= 0,
           "two clients");
     if (!slow || !other) {
         if (slow) nvrm_disconnect(slow);
@@ -829,7 +823,7 @@ static void test_thread_limit(void) {
     CHECK(!open, "no client left from earlier checks (%u)", open);
     for (unsigned i = 0; i < LIMIT_TRIES; i++) {
         struct nvrm *rm = NULL;
-        int64_t s = serve_connect(&rm);
+        int64_t s = nvrm_connect_device_status(TARGET, &rm);
         if (s >= 0) {
             late |= refused != 0;
             conn[accepted++] = rm;
@@ -859,7 +853,7 @@ static void test_thread_limit(void) {
         int64_t s;
         do {
             conn[0] = NULL;
-            s = serve_connect(&conn[0]);
+            s = nvrm_connect_device_status(TARGET, &conn[0]);
             if (s < 0) n_sleep_until(n_clock_after(2 * N_NS_PER_MS));
         } while (s < 0 && (n_clock_monotonic() / N_NS_PER_MS) <= end);
         CHECK(s >= 0, "a new client is served once one has gone: %s", n_result_text(s));
@@ -867,7 +861,7 @@ static void test_thread_limit(void) {
             file[0] = echo(conn[0], 999, FAKE_CMD_ECHO, 0x8800);
             CHECK(file[0], "the new client works");
             struct nvrm *extra = NULL;
-            s = serve_connect(&extra);
+            s = nvrm_connect_device_status(TARGET, &extra);
             CHECK(s == -N_ERR_CLOSED, "at the limit again, the next client is refused: %s", n_result_text(s));
             if (extra) nvrm_disconnect(extra);
         } else {
@@ -886,10 +880,6 @@ int main(void) {
         return 1;
     }
     thrd_t server;
-    if (n_channel_pair(connector_ends) < 0) {
-        printf("nvrm_servetest: no connector\nnvrm_servetest: 1 failed\n");
-        return 1;
-    }
     if (thrd_create(&server, server_main, NULL) != thrd_success) {
         printf("nvrm_servetest: no server thread\nnvrm_servetest: 1 failed\n");
         return 1;

@@ -329,29 +329,19 @@ static void client_serve(void *arg) {
 }
 
 int main(void) {
-    n_result r = n_service_begin();
-    if (r >= 0) r = mtx_init(&lock, mtx_plain) == thrd_success ? 0 : -N_ERR_NO_MEMORY;
-    if (r >= 0) r = region = n_store_private_open(n_service_cap(N_CAP_STORE_PRIVATE), REGION);
+    n_result r = mtx_init(&lock, mtx_plain) == thrd_success ? 0 : -N_ERR_NO_MEMORY;
+    if (r >= 0) r = region = n_store_private_open(n_cap_find(N_CAP_STORE_PRIVATE), REGION);
     if (r >= 0) r = records_load();
     if (r < 0) {
         printf("accounts: the records cannot be read (%s)\n", n_result_text(r));
         return 1;
     }
     n_service_ready();
-    n_handle queue = n_events_create();
-    if (queue < 0) return 1;
-    n_events_watch(queue, N_SERVICE_HANDLE_CONTROL, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, 1);
     for (;;) {
-        struct n_event report;
-        n_result got = n_events_wait(queue, &report, 1, N_CLOCK_NEVER);
-        if (got < 0) return 1;
-        for (;;) {
-            n_handle channel = n_connector_accept(N_SERVICE_HANDLE_CONTROL, NULL, 0);
-            if (channel == -N_ERR_NOT_READY) break;
-            if (channel < 0) return 0;
-            n_result thread = thread_create(client_serve, (void *)(intptr_t)channel);
-            if (thread < 0) n_handle_close(channel);
-            else thread_detach((int)thread);
-        }
+        n_handle channel = n_inlet_accept(N_SERVICE_HANDLE_CONTROL, N_CHANNEL_WAIT);
+        if (channel < 0) return 0;
+        n_result thread = thread_create(client_serve, (void *)(intptr_t)channel);
+        if (thread < 0) n_handle_close(channel);
+        else thread_detach((int)thread);
     }
 }

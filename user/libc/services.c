@@ -1,4 +1,4 @@
-/* サービスの仕組みの libc の側：身元、能力、接続、サービスの起動の手順、利用者のフォルダー。 */
+/* システムのサービスの libc の側：準備の知らせ、利用者、管理者の口、機械、このプロセスの利用者のフォルダー。 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,95 +7,17 @@
 n_handle n_store_private_open(n_handle cap, const char *region) {
     return (n_handle)__syscall(SYS_STORE_PRIVATE_OPEN, cap, (long)region, strlen(region), 0, 0);
 }
-n_result n_identity_self(struct n_identity *out) { return __syscall(SYS_IDENTITY_SELF, (long)out, 0, 0, 0, 0); }
-n_result n_channel_peer(n_handle channel, struct n_identity *out) {
-    return __syscall(SYS_CHANNEL_PEER, channel, (long)out, 0, 0, 0);
-}
-n_handle n_cap_derive(n_handle cap, enum n_cap what) { return (n_handle)__syscall(SYS_CAP_DERIVE, cap, what, 0, 0, 0); }
-
-n_handle n_service_connect(const char *name) {
-    if (!name || !*name) return -N_ERR_INVALID;
-    size_t n = strlen(name);
-    if (n >= N_SERVICE_TEXT_MAX) return -N_ERR_NAME_TOO_LONG;
-    return (n_handle)__syscall(SYS_SERVICE_CONNECT, (long)name, n, 0, 0, 0);
-}
-
-n_handle n_connector_connect(n_handle connector, const char *argument) {
-    struct n_service_control message = {.kind = N_SERVICE_CTL_CONNECTION};
-    if (argument && strlen(argument) >= sizeof message.argument) return -N_ERR_NAME_TOO_LONG;
-    if (argument) strcpy(message.argument, argument);
-    n_handle ends[2];
-    n_result r = n_channel_pair(ends);
-    if (r < 0) return (n_handle)r;
-    r = n_channel_send(connector, &message, sizeof message, ends[1]);
-    n_handle_close(ends[1]);
-    if (r < 0) {
-        n_handle_close(ends[0]);
-        return (n_handle)r;
-    }
-    return ends[0];
-}
-
-n_handle n_connector_accept(n_handle connector, char *argument, size_t cap) {
-    for (;;) {
-        struct n_service_control message;
-        n_handle attached = -1;
-        n_result r = n_channel_receive(connector, &message, sizeof message, 0, &attached);
-        if (r < 0) return (n_handle)r;
-        if (r == sizeof message && message.kind == N_SERVICE_CTL_STOP) {
-            if (attached >= 0) n_handle_close(attached);
-            return -N_ERR_CANCELLED;
-        }
-        if (r != sizeof message || message.kind != N_SERVICE_CTL_CONNECTION || attached < 0) {
-            if (attached >= 0) n_handle_close(attached);
-            continue;
-        }
-        message.argument[sizeof message.argument - 1] = 0;
-        if (argument && cap) strlcpy(argument, message.argument, cap);
-        return attached;
-    }
-}
-
-/* 能力は起動の最初に一度だけ書き、以後は読むだけ。 */
-static n_handle service_caps[N_CAP_COUNT];
-static bool service_begun;
-
-n_result n_service_begin(void) {
-    for (int i = 0; i < N_CAP_COUNT; i++) service_caps[i] = -N_ERR_DENIED;
-    service_begun = true;
-    for (;;) {
-        struct n_service_control message;
-        n_handle attached = -1;
-        n_result r = n_channel_receive(N_SERVICE_HANDLE_CONTROL, &message, sizeof message, N_CHANNEL_WAIT, &attached);
-        if (r < 0) return r;
-        if (r != sizeof message) {
-            if (attached >= 0) n_handle_close(attached);
-            return -N_ERR_PROTOCOL;
-        }
-        if (message.kind == N_SERVICE_CTL_CAPS_DONE) return 0;
-        if (message.kind != N_SERVICE_CTL_CAP || message.value >= N_CAP_COUNT || attached < 0) {
-            if (attached >= 0) n_handle_close(attached);
-            return -N_ERR_PROTOCOL;
-        }
-        service_caps[message.value] = attached;
-    }
-}
-
-n_handle n_service_cap(enum n_cap what) {
-    if (!service_begun || (unsigned)what >= N_CAP_COUNT) return -N_ERR_DENIED;
-    return service_caps[what];
-}
 
 n_result n_service_ready(void) {
-    struct n_service_control message = {.kind = N_SERVICE_CTL_READY};
+    struct n_service_ready_message message = {.kind = N_SERVICE_READY};
     n_result r = n_channel_send(N_SERVICE_HANDLE_CONTROL, &message, sizeof message, -1);
     return r < 0 ? r : 0;
 }
 
-static n_result call_on(n_handle channel, const void *request, size_t request_bytes, void *reply, size_t reply_bytes) {
+static n_result call_on(n_handle channel, const void *request, size_t request_bytes, void *reply, size_t reply_bytes, n_handle *attached) {
     n_result r = n_channel_send(channel, request, request_bytes, -1);
     if (r < 0) return r;
-    r = n_channel_receive(channel, reply, reply_bytes, N_CHANNEL_WAIT, NULL);
+    r = n_channel_receive(channel, reply, reply_bytes, N_CHANNEL_WAIT, attached);
     if (r < 0) return r;
     return (size_t)r == reply_bytes ? 0 : -N_ERR_PROTOCOL;
 }
@@ -103,7 +25,7 @@ static n_result call_on(n_handle channel, const void *request, size_t request_by
 n_result n_accounts_call(const struct n_accounts_request *request, struct n_accounts_reply *reply) {
     n_handle channel = n_service_connect("accounts");
     if (channel < 0) return channel;
-    n_result r = call_on(channel, request, sizeof *request, reply, sizeof *reply);
+    n_result r = call_on(channel, request, sizeof *request, reply, sizeof *reply, NULL);
     n_handle_close(channel);
     return r < 0 ? r : reply->result;
 }
@@ -128,7 +50,7 @@ n_result n_accounts_list(struct n_account **out) {
     if (channel < 0) return channel;
     struct n_accounts_request request = {.op = N_ACCOUNTS_LIST};
     struct n_accounts_reply reply;
-    n_result r = call_on(channel, &request, sizeof request, &reply, sizeof reply);
+    n_result r = call_on(channel, &request, sizeof request, &reply, sizeof reply, NULL);
     if (r >= 0) r = reply.result;
     if (r >= 0) r = receive_records(channel, reply.count, sizeof **out, (void **)out);
     n_handle_close(channel);
@@ -140,23 +62,62 @@ n_result n_services_list(struct n_service_status **out) {
     if (channel < 0) return channel;
     struct n_services_request request = {.op = N_SERVICES_LIST};
     struct n_services_reply reply;
-    n_result r = call_on(channel, &request, sizeof request, &reply, sizeof reply);
+    n_result r = call_on(channel, &request, sizeof request, &reply, sizeof reply, NULL);
     if (r >= 0) r = reply.result;
     if (r >= 0) r = receive_records(channel, reply.count, sizeof **out, (void **)out);
     n_handle_close(channel);
     return r;
 }
 
-n_result n_services_control(uint32_t op, const char *name, const char *argument, uint32_t session) {
-    struct n_services_request request = {.op = op, .session = session};
+n_result n_services_control(uint32_t op, const char *name, const char *argument) {
+    struct n_services_request request = {.op = op};
     if (name) strlcpy(request.name, name, sizeof request.name);
     if (argument) strlcpy(request.argument, argument, sizeof request.argument);
     n_handle channel = n_service_connect(N_SERVICE_MANAGER);
     if (channel < 0) return channel;
     struct n_services_reply reply;
-    n_result r = call_on(channel, &request, sizeof request, &reply, sizeof reply);
+    n_result r = call_on(channel, &request, sizeof request, &reply, sizeof reply, NULL);
     n_handle_close(channel);
     return r < 0 ? r : reply.result;
+}
+
+n_result n_machine_power(uint32_t op) {
+    n_handle channel = n_service_connect("machine");
+    if (channel < 0) return channel;
+    struct n_machine_request request = {.op = op};
+    struct n_machine_reply reply;
+    n_result r = call_on(channel, &request, sizeof request, &reply, sizeof reply, NULL);
+    n_handle_close(channel);
+    return r < 0 ? r : reply.result;
+}
+
+n_result n_machine_screen(uint32_t **pixels, int *width, int *height) {
+    n_handle channel = n_service_connect("machine");
+    if (channel < 0) return channel;
+    struct n_machine_request request = {.op = N_MACHINE_SCREEN};
+    struct n_machine_reply reply;
+    n_handle shared = -1;
+    n_result r = call_on(channel, &request, sizeof request, &reply, sizeof reply, &shared);
+    n_handle_close(channel);
+    if (r >= 0) r = reply.result;
+    if (r >= 0 && shared < 0) r = -N_ERR_PROTOCOL;
+    if (r < 0) {
+        if (shared >= 0) n_handle_close(shared);
+        return r;
+    }
+    size_t bytes = (size_t)reply.width * (size_t)reply.height * 4;
+    void *view;
+    r = n_shared_map(shared, bytes, N_MEMORY_READ, &view);
+    n_handle_close(shared);
+    if (r < 0) return r;
+    uint32_t *copy = malloc(bytes);
+    if (copy) memcpy(copy, view, bytes);
+    n_memory_release(view, bytes);
+    if (!copy) return -N_ERR_NO_MEMORY;
+    *pixels = copy;
+    *width = reply.width;
+    *height = reply.height;
+    return 0;
 }
 
 /* このプロセスの利用者のフォルダーは、身元から accounts が引く。一度引けば変わらない。

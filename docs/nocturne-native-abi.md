@@ -28,8 +28,8 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - カーネル資源はすべて**種類つきハンドル**（`n_handle`、非負の `int32_t`）で表す。
 - 種類：`N_KIND_DOCUMENT`、`N_KIND_FOLDER`、`N_KIND_CHANNEL`、`N_KIND_WINDOW`、
   `N_KIND_SHARED`、`N_KIND_APP`、`N_KIND_EVENTS`、`N_KIND_DEVICE`（音声等）、
-  `N_KIND_CONNECTION`（TCP／UDP）、`N_KIND_PCI`、`N_KIND_PAGER`、`N_KIND_WATCH`（見張り。下）。
-  12 は欠番（§10）。
+  `N_KIND_CONNECTION`（TCP／UDP）、`N_KIND_PCI`、`N_KIND_PAGER`、`N_KIND_WATCH`（見張り。下）、
+  `N_KIND_CAPABILITY`（能力。§13）。12 は欠番（§10）。
 - 汎用操作は `n_handle_close(h)` と `n_handle_kind(h)` だけ。読み書きは種類ごとの
   専用関数で行い、種類の違うハンドルを渡すと `N_ERR_WRONG_KIND`。
 - 見張り（`N_KIND_WATCH`）は、見ている物が変わったことを知らせるハンドル。開く口は見る物ごとに
@@ -59,7 +59,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - `nocturne.h`／`gpu.h`／`display.h` のlibc関数も同じで、`errno` は触らない：
   ネットワーク（`net_*`、`udp_*`、`tcp_*`。ソケットは `n_handle`）、窓と画面
   （`win_*`、`screen_*`、`clipboard_*`、`gui_launch`）、GPU（`gpu_*`、`gfx_render3d*`）、
-  `proclist`、`sysinfo`、`thread_stack_bounds`、`poweroff`／`reboot`。何かを作って渡す関数は
+  `proclist`、`sysinfo`、`thread_stack_bounds`、`poweroff(cap)`／`reboot(cap)`（`N_CAP_POWER`）。何かを作って渡す関数は
   出力引数に置いて `n_result` を返す（`win_open(w, h, title, flags, &win)`、
   `n_memory_reserve`。失敗では出力は NULL）。
 
@@ -205,7 +205,12 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - チャンネルは**メッセージ単位**の双方向路。一回の送信が一つのメッセージになり、
   受信側は境界を保ったまま受け取る。大きな塊は共有ページを添付して送る。
 - `n_channel_pair(n_handle out[2])`：無名の対。
-- 名前のある相手へは `n_service_connect(name)`（§13）。親と子の私的な道は接続の口（`n_connector_connect`、`n_connector_accept`、§13）。
+- 受け口：各メッセージが新しいチャンネルの端を一つ運ぶチャンネル。`n_inlet_connect(inlet)` は
+  対を作って一方の端を受け口へ送り、もう一方を返す。`n_inlet_accept(inlet, flags)` は次の端を
+  受ける（無ければ `N_ERR_NOT_READY`、`N_CHANNEL_WAIT` で待つ。送る側が全部閉じれば `N_ERR_CLOSED`）。
+  受ける側が閉じると、待っている端も閉じる。
+- 名前で相手を引くのはサービスだけ（§14）。カーネルにチャンネルの名前は無い。
+- `n_channel_peer(h, &identity)`：もう一端の身元。カーネルが証明する（§13）。
 - `n_channel_send(h, data, n, attach)`、`n_channel_receive(h, buf, cap, flags, &attached)`。
   - 流量制御：受け手が未だ受け取っていない量が1MiBに達している間、送信は待つ
     （`N_EVENT_SENDABLE` で送れることを知れる）。空の待ち行列へは大きさに関係なく送れる。
@@ -220,9 +225,11 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   - `N_CHANNEL_DISCARD` は次のメッセージの先頭 `cap` バイトだけを写してから捨て（添付も閉じる）、その大きさを
     返す。受け取る場所を確保できない大きなメッセージを断るため。`PEEK` とは併用できず、
     未知のフラグと共に `N_ERR_INVALID`。
-  - `attach` は文書または共有ページのハンドル（無ければ -1）。メッセージと一緒に運ばれ、
-    受信側で新しいハンドルとして `attached` に入る（無ければ -1）。チャンネル自身を
-    運ぶと参照の循環になるので `N_ERR_WRONG_KIND`。
+  - `attach` は文書、共有ページ、能力、チャンネルの端のハンドル（無ければ -1）。ほかの種類は
+    `N_ERR_WRONG_KIND`。メッセージと一緒に運ばれ、受信側で新しいハンドルとして `attached` に入る
+    （無ければ -1）。送った側のハンドルは開いたまま残る。
+  - チャンネルの端を運ぶとき、自分のチャンネルの端と、運ばれている途中の端へ送るものと、別の端を
+    運んでいる端は `N_ERR_BUSY`。端が端を運ぶ輪はできない。
 - アプリの入出力に渡される文字装置（コンソール、カーネルログ、null）にも
   `n_channel_send`／`receive` が使える。ただし境界と添付は無く、`N_CHANNEL_PEEK` は
   `N_ERR_UNSUPPORTED`。バイト列のパイプは無い。
@@ -263,7 +270,8 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 
 - `n_app_launch(path, const struct n_launch *)` がアプリハンドルを返す。
   `n_launch` は引数列、設定の組（ISO Cの `getenv` が読む）、
-  引き渡すハンドルの表（入力・出力・ログのチャンネル、共有ページ等）を持つ。
+  引き渡すハンドルの表（入力・出力・ログのチャンネル、共有ページ、能力等）と、子の身元を持つ。
+  - `identity` が NULL なら、子の身元は親と同じ。`identity` を渡すときの規則は §13。
   - 設定は `"名前=値"` の形（`=` が無ければ `N_ERR_INVALID`）。起動されたアプリでは
     `n_settings`（NULL終端）として読め、`getenv` もこれを引く。
   - 引数と設定の文字列（各 nul を含む。カーネルが加える設定も数える）と、二つの NULL 終端
@@ -303,10 +311,11 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     描画の量子（128 フレーム）の周期でこの級に置く。
 - `n_app_self()`、`n_app_parent()`：アプリ識別子（共有ページの受渡しの許可判定用）。
 - `n_app_open(id)`：アプリ一覧の識別子から、動作中のアプリのハンドルを得る（タスク
-  マネージャーや `kill` が `n_app_stop` するため）。`n_app_id(h)`：ハンドルの識別子
+  マネージャーや `kill` が `n_app_stop` するため）。触れてよい相手だけ（§13）で、ほかは
+  `N_ERR_DENIED`。`n_app_id(h)`：ハンドルの識別子
   （終了後も同じ。識別子は 2^31 個を配り終えるまで再利用しない）。
 - `n_app_list`、`n_system_info` 等の状態取得は現行の `proclist`（件数）／`sysinfo`（0）を
-  引き継ぐ。どちらも失敗では負の `n_result`。
+  引き継ぐ。`proclist` に出るのは核の thread、SYSTEM のアプリ、触れてよいアプリ（§13）。どちらも失敗では負の `n_result`。
 
 ## 6. イベント待ち行列
 
@@ -500,7 +509,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     機能と、既に権利のある機能は `N_ERR_BUSY`。同じ group の機能をカーネルのドライバーが使って
     いても、それが手放せるもの（`struct iommu_guest`：GPU の音の機能）なら、その機能は止まり、
     権利ができた後に domain の中で動き直す。権利が終わると、次の権利まで止まったまま。
-    起動オプション `noappdrivers` で全部断る。最後のハンドルが閉じると、カーネルは
+    最後のハンドルが閉じると、カーネルは
     (1) その権利の BAR オブジェクトの写像を全アプリから外し（その範囲は予約のまま、触れると
     全 1 が読める読取り専用のページ。バスから消えた装置と同じ）、(2) 割り込みとバスマスターを
     止め、(3) IOMMUの遮断を確認する。終了処理内で装置の回復を待たず、FLRもしない。
@@ -1179,29 +1188,93 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   見張り）、`"sound"` は `desktop.sound()` が報告するもの（音の見張り）。`ScreenModes.chosen` が
   モニターに選んだモード。
 
-## 13. 身元、能力、サービス、利用者、セッション
+## 13. 身元と能力
 
-型は `common/authority_abi.h` と `common/services_abi.h`。libc の口は `nocturne_services.h`。
+書式は `common/authority_abi.h`。
 
-- 身元：`struct n_identity`（利用者、セッション、級、プログラムの番号）はカーネルが持ち、アプリは書けない。
-  `n_identity_self` が自分の身元を、`n_channel_peer` が channel の相手の身元を返す。
-  子は親の身元を継ぐ。別の身元で起こすには `n_launch.identity` と、`identity_cap` の `N_CAP_IDENTITY_GRANT` が要る。
-- 能力：特権は handle で持つ。カーネルは最初のプロセスだけに `N_CAP_ROOT` を渡す（handle `N_ROOT_CAP_HANDLE`）。
-  `n_cap_derive` が切り出す。能力は channel の添付で運ぶ。
+- どのプロセスも身元（`struct n_identity`：`user`、`session`、`cls`、`program`）を持つ。起動の時に
+  決まり、変わらない。アプリは書けない。`n_identity_self(&out)` で読む。
+- 級（`cls`）は `N_CLASS_USER`、`N_CLASS_ADMIN`、`N_CLASS_SYSTEM`。上の級ほど広い。
+- 子の身元（`struct n_launch` の `identity`）：
+  - NULL なら親と同じ。
+  - `cls` は親を超えられない。超えれば `N_ERR_DENIED`。
+  - `user`・`session`・`program` を親と変えるには、`identity_grant` に `N_CAP_IDENTITY_GRANT` の能力を
+    渡す。無ければ `N_ERR_DENIED`。
+- 触れてよい相手：SYSTEM は全部。ADMIN は SYSTEM 以外。USER は同じ `user` で同じ `session` の USER。
+  `n_app_open`、`proclist`、`clipboard_get` がこの規則に従う。
+- 能力（`N_KIND_CAPABILITY`）は特権を一つ持つハンドル。持つことが権限の証明で、渡すことが委譲。
+  起動の表か、メッセージの添付で渡す。
+  - 種類：`N_CAP_ROOT`、`N_CAP_SERVICE_ROOT`、`N_CAP_IDENTITY_GRANT`、`N_CAP_PCI_CLAIM`、`N_CAP_POWER`、
+    `N_CAP_SCREEN_READ`、`N_CAP_SETTINGS_APPLY`、`N_CAP_STORE_PRIVATE`。
+  - カーネルが作るのは `N_CAP_ROOT` を一つだけで、最初のプロセスがハンドル `N_INITIAL_ROOT_HANDLE`
+    （3）で受ける。最初のプロセスの身元は `user` 0、`session` 0、`N_CLASS_SYSTEM`、`program` 0。
+  - `n_cap_derive(cap, kind)`：`N_CAP_ROOT` は全部の種類を、ほかの能力は同じ種類だけを切り出す。
+    ほかは `N_ERR_DENIED`。
+  - `n_cap_kind(cap)`：種類。`n_cap_find(kind)`：自分が持つその種類のハンドル（無ければ
+    `N_ERR_NOT_FOUND`）。`n_caps_list(out)`：自分が持つ能力の全部。
+  - 特権の呼出しは種類の合う能力を引数に取る。`N_CAP_ROOT` でも種類が違えば `N_ERR_DENIED`。
+
+| 呼出し | 要るもの |
+|---|---|
+| `n_pci_claim` | `N_CAP_PCI_CLAIM` |
+| `poweroff`、`reboot` | `N_CAP_POWER` |
+| `screen_grab` | `N_CAP_SCREEN_READ` |
+| `n_service_register` | `N_CAP_SERVICE_ROOT` |
+| `n_session_identity` | `N_CAP_IDENTITY_GRANT` |
+| `n_system_log`、`n_system_log_open` の受信 | 級が ADMIN 以上（書くのは誰でも） |
+| `SYS_NET_TEST` | 級が ADMIN 以上 |
+
+- チャンネルの端の身元：`n_channel_peer` が読む値。
+  - `n_channel_pair` の両端は作った者の身元で始まる。カーネルが作る端はシステムの身元で始まる。
+  - 端が別のアプリの手に渡ると（起動の表、添付の受信）、受け手が今の身元を超えないときだけ、受け手の
+    身元へ下がる。渡した者も端を持ち続けられるので、上がる向きには動かない。報告される身元は、端を
+    持つ者の権限を超えない。
+- `n_session_identity(cap, &identity)`：カーネルの窓の系（スタートメニュー）が起こすアプリの身元を
+  決める。`cls` は呼ぶ側を超えられない。決まる前は `user` 0、`session` 0、`N_CLASS_USER`、`program` 0。
+  `gui_launch` が起こすアプリの身元は呼ぶ側と同じ。
+
+## 14. サービス
+
+名前で相手を引く道はこれだけ。カーネルは名前を解かず、覚えない。名前の持ち主はサービスの管理者。
+
+- `n_service_register(cap)`（`N_CAP_SERVICE_ROOT`）：接続の要求を受けるチャンネルを返す。管理者は
+  一度に一つで、開いている間は `N_ERR_EXISTS`。閉じれば次の登録が替わる。
+- `n_service_connect(name)`：カーネルがチャンネルの対を作り、一方の端を返す。もう一方の端を添付した
+  要求を管理者のチャンネルへ送る。管理者がいなければ `N_ERR_NOT_FOUND`。管理者の列が満ちていれば待つ。
+  要求の大きさは呼ぶ側に課金する（§4）。
+- 要求のメッセージは `struct n_service_request`（`from`：カーネルが書く依頼者の身元、`name_length`）の
+  後ろに名前のバイト列が続く形。管理者は要求を次のどれかにする：
+  - 受け付ける：同じメッセージをサービスの受け口へ送る（添付の端も一緒に）。
+  - 断る：添付の端を閉じる。依頼者のチャンネルは `N_ERR_CLOSED` になる。
+- `n_service_listen(name)`：名前 `N_SERVICE_BIND`（`"Nocturne.Service.Bind"`）のサービスへつなぎ、名前を
+  本文に、受け口へ送る端を添付にしたメッセージを送る。管理者は `int32_t` を一つ返す（0 か
+  `-N_ERR_*`、使われている名前は `-N_ERR_EXISTS`）。成功すると受け口の受ける側を返す。
+  - `N_SERVICE_BIND` を受けるのは管理者自身。誰にどの名前を許すか、同じ名前を利用者やセッションで
+    分けるかは、管理者が `from` で決める。
+  - 受け口へ送る端に `N_EVENT_CLOSED` が来たら、管理者はその名前を消す。
+- サービスは `n_inlet_accept(inlet, flags)` で端を受け、`n_channel_peer` で依頼者の身元を読む。
+
+## 15. サービスの管理者、利用者、セッション
+
+型は `common/services_abi.h`。libc の口は `nocturne_services.h`。
+
 - サービスの管理者：`C:\Nocturne\System\services`（`user/apps/services.c`）。カーネルが起こす最初のプロセス。
-  宣言は C の型のある表 `declared[]` で、プログラムに組み込む。項目は名前、プログラム、級、範囲（機械、セッション、PCI の機能）、
+  宣言は C の型のある表 `declared[]` で、プログラムに組み込む。項目は名前、プログラム、級、範囲（機械か PCI の機能）、
   渡す能力、依存、失敗の扱い（起こし直す回数、間隔、健康とみなす時間）、接続してよい相手。
-  依存は表から解き、準備は相手の `N_SERVICE_CTL_READY` で知る。
-- 接続：`n_service_connect("名前")` か `n_service_connect("名前:引数")`。カーネルは新しい channel を作り、片端を呼ぶ者へ返し、
-  もう片端を `struct n_service_request` の添付で管理者へ送る。管理者は `SYS_CHANNEL_PEER` の身元を宣言に照らし、相手を起こして渡す。
-  宣言に無い相手の要求は channel を閉じる。呼ぶ側には `N_ERR_CLOSED` が見える。
-- サービスの側：handle `N_SERVICE_HANDLE_CONTROL` が管理者との channel。`n_service_begin` で能力を受け、`n_service_ready` で準備を知らせ、
-  `n_connector_accept` で相手を受ける。止める指示は `N_ERR_CANCELLED` で分かる。
-- 接続の口：channel の一通が新しい channel の片端を運ぶ。`n_connector_connect` が送り、`n_connector_accept` が受ける。
-  名前を通らないので、親と子の私的な道にも使う（ブラウザーと `webfetch`）。
-- 管理者の口：`n_service_connect("services")` の記録は `struct n_services_request` と `struct n_service_status`。
+  起動の順は依存から解き、準備は相手の知らせ（`n_service_ready`）で知る。決まった時間を待たない。
+- 宣言のサービスは handle `N_SERVICE_HANDLE_CONTROL`（3）に管理者との channel を受け、能力は `n_cap_find` で引く。
+  受ける向きは受け口で、`n_inlet_accept(N_SERVICE_HANDLE_CONTROL, flags)` が相手の端を返す。
+  送る向きは準備の知らせ一通。管理者がこの channel を閉じると `N_ERR_CLOSED` になる。これが止める指示で、
+  5 秒の後に `n_app_stop` で止める。
+- 名前の範囲：宣言のプログラム（`program` が 0 でない）か `N_CLASS_SYSTEM` が申し込んだ名前は機械全体で引ける。
+  ほかは申し込んだ者と同じ `user` と `session` の相手にだけ見える。別の利用者は同じ名前を別に申し込める。
+  宣言の名前と管理者の名前は申し込めない（`N_ERR_DENIED`）。
+- 管理者の口：`n_service_connect(N_SERVICE_MANAGER)` の記録は `struct n_services_request` と `struct n_service_status`。
   一覧、状態、起こし直し、止める、見張る。起こし直しと止めるは `N_CLASS_ADMIN` 以上。
 - 利用者：サービス `accounts`。私的な領域に型のある記録で一覧を持つ。合言葉は salt つきの PBKDF2-HMAC-SHA256。
-  一人目は誰が作っても admin。`n_user_folder` と `n_temp_folder` は身元から `accounts` が引く。新しい利用者のフォルダーの中身の元は `C:\Nocturne\NewUser`。
-- セッション：サービス `session`。ログインの窓を出し、選ばれた利用者の身元で `C:\Nocturne\System\desktop` を起こす。
-  `gui_launch` はセッションのデスクトップが起こし、子は利用者の身元を継ぐ。窓の管理者のメニューとアイコンは `SYS_DESKTOP_ATTACH` の channel で同じ依頼を送る。
+  一人目は誰が作っても admin。`n_user_folder` と `n_temp_folder` は身元から `accounts` が引く。
+  新しい利用者のフォルダーの中身の元は `C:\Nocturne\NewUser`。
+- セッション：サービス `session`。ログインの窓を出し、選ばれた利用者の身元を `n_session_identity` でカーネルの窓の系に決める。
+  コンソールの起動は同じ身元で `sh` を起こす。`N_SESSION_END` でセッションを終え、ログインの窓へ戻る。
+- 機械：サービス `machine`。`N_CAP_POWER` と `N_CAP_SCREEN_READ` を持ち、利用者のアプリの電源と画面の依頼を受ける
+  （`n_machine_power`、`n_machine_screen`）。能力をアプリへ配らない。

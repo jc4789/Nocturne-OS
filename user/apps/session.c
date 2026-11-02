@@ -1,7 +1,8 @@
-/* セッションのサービス：ログインの窓を出し、選ばれた利用者の身元でデスクトップのプロセスを起こす。
-   一度に一つのセッション。デスクトップが結果 0 で終わるとログアウトで、窓へ戻る。
-   落ちたら同じセッションのまま起こし直す。
-   画面の無い起動（nogui）では、窓の代わりにコンソールで聞いて、シェルを起こす。 */
+/* セッションのサービス：ログインの窓を出し、選ばれた利用者の身元をセッションに決める。
+   一度に一つのセッション。デスクトップはカーネルの窓の系で、利用者の身元でアプリを起こす。
+   N_SESSION_END でセッションを終え、窓へ戻る。
+   画面の無い起動（nogui）では、窓の代わりにコンソールで聞いて、利用者の身元でシェルを起こす。 */
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,148 +11,106 @@
 #include "nocturne_services.h"
 #include "ui.h"
 
-#define DESKTOP N_FOLDER_SYSTEM "\\desktop"
 #define SHELL N_FOLDER_SYSTEM "\\sh"
 #define WINDOW 1u
-#define REQUEST_MAX (sizeof(struct n_session_request) + 2 * N_SESSION_PATH_MAX)
 
 static n_handle grant_cap;
 static mtx_t current_lock;
 /* 今のセッション。session が 0 なら無い。 */
 static struct {
     uint32_t session;
-    n_handle desktop;    /* app */
-    n_handle to_desktop; /* デスクトップへの起動の依頼の channel */
-} current = {.desktop = -1, .to_desktop = -1};
+    n_handle shell; /* コンソールのセッションのシェル。無ければ -1。 */
+} current = {.shell = -1};
+static volatile uint32_t session_over;
 
-/* ---- セッションの口 ---- */
-static void reply_and_close(n_handle channel, n_result result) {
-    struct n_session_reply reply = {.result = result};
-    n_channel_send(channel, &reply, sizeof reply, -1);
-    n_handle_close(channel);
+/* カーネルの窓の系が起こすアプリの身元。セッションの外は user 0、N_CLASS_USER。 */
+static void desktop_identity(const struct n_identity *identity) {
+    struct n_identity none = {.cls = N_CLASS_USER};
+    n_result r = n_session_identity(grant_cap, identity ? identity : &none);
+    if (r < 0) {
+        printf("session: the desktop's identity is not set (%s)\n", n_result_text(r));
+        fflush(stdout);
+    }
 }
 
+static void end_current(void) {
+    if (current.shell >= 0) n_app_stop(current.shell, N_APP_STOP_TREE);
+    __atomic_store_n(&session_over, 1, __ATOMIC_RELEASE);
+    wake_address(&session_over, INT_MAX);
+}
+
+/* ---- セッションの口 ---- */
 static void client_serve(void *arg) {
     n_handle channel = (n_handle)(intptr_t)arg;
     struct n_identity peer;
-    char *message = malloc(REQUEST_MAX);
-    if (!message || n_channel_peer(channel, &peer) < 0) {
-        free(message);
+    if (n_channel_peer(channel, &peer) < 0) {
         n_handle_close(channel);
         return;
     }
-    n_result got = n_channel_receive(channel, message, REQUEST_MAX, N_CHANNEL_WAIT, NULL);
-    const struct n_session_request *q = (const void *)message;
-    if (got < (n_result)sizeof *q || q->path_bytes >= N_SESSION_PATH_MAX || q->argument_bytes >= N_SESSION_PATH_MAX ||
-        (size_t)got != sizeof *q + q->path_bytes + q->argument_bytes) {
-        free(message);
-        reply_and_close(channel, -N_ERR_PROTOCOL);
-        return;
+    for (;;) {
+        struct n_session_request q;
+        n_result got = n_channel_receive(channel, &q, sizeof q, N_CHANNEL_WAIT, NULL);
+        if (got < 0 || got != sizeof q) break;
+        struct n_session_reply reply = {.result = -N_ERR_INVALID};
+        if (q.op == N_SESSION_END) {
+            mtx_lock(&current_lock);
+            reply.result = current.session && peer.session == current.session ? 0 : -N_ERR_DENIED;
+            if (reply.result == 0) end_current();
+            mtx_unlock(&current_lock);
+        }
+        if (n_channel_send(channel, &reply, sizeof reply, -1) < 0) break;
     }
-    mtx_lock(&current_lock);
-    bool own = current.session && peer.session == current.session;
-    n_result result = own ? 0 : -N_ERR_DENIED;
-    n_handle forwarded = -1;
-    if (own && q->op == N_SESSION_LAUNCH) {
-        /* 相手の channel ごとデスクトップへ渡す。答えるのはデスクトップ。 */
-        n_result sent = n_channel_send(current.to_desktop, message, (size_t)got, channel);
-        if (sent >= 0) forwarded = channel;
-        else result = sent;
-    } else if (own && q->op == N_SESSION_END) {
-        n_app_stop(current.desktop, N_APP_STOP_TREE);
-    } else if (own) {
-        result = -N_ERR_INVALID;
-    }
-    mtx_unlock(&current_lock);
-    free(message);
-    if (forwarded >= 0) n_handle_close(forwarded);
-    else reply_and_close(channel, result);
+    n_handle_close(channel);
 }
 
 static void connections_serve(void *arg) {
     (void)arg;
-    n_handle queue = n_events_create();
-    if (queue < 0) return;
-    n_events_watch(queue, N_SERVICE_HANDLE_CONTROL, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, 1);
     for (;;) {
-        struct n_event report;
-        if (n_events_wait(queue, &report, 1, N_CLOCK_NEVER) < 0) exit(1);
-        for (;;) {
-            n_handle channel = n_connector_accept(N_SERVICE_HANDLE_CONTROL, NULL, 0);
-            if (channel == -N_ERR_NOT_READY) break;
-            if (channel < 0) {
-                mtx_lock(&current_lock);
-                if (current.desktop >= 0) n_app_stop(current.desktop, N_APP_STOP_TREE);
-                mtx_unlock(&current_lock);
-                exit(0);
-            }
-            n_result thread = thread_create(client_serve, (void *)(intptr_t)channel);
-            if (thread < 0) n_handle_close(channel);
-            else thread_detach((int)thread);
+        n_handle channel = n_inlet_accept(N_SERVICE_HANDLE_CONTROL, N_CHANNEL_WAIT);
+        if (channel < 0) {
+            /* 管理者が閉じた：セッションを片付けて終わる */
+            mtx_lock(&current_lock);
+            end_current();
+            mtx_unlock(&current_lock);
+            desktop_identity(NULL);
+            exit(0);
         }
+        n_result thread = thread_create(client_serve, (void *)(intptr_t)channel);
+        if (thread < 0) n_handle_close(channel);
+        else thread_detach((int)thread);
     }
 }
 
 /* ---- セッションの始めと終わり ---- */
 static uint32_t next_session;
 
-/* デスクトップが結果 0 で終わるまで。 */
-static void desktop_session(const struct n_account *a, uint32_t session) {
-    struct n_identity identity = {.user = a->user, .session = session, .cls = a->cls};
-    char folder[sizeof "FOLDER=" + N_ACCOUNT_FOLDER_MAX];
-    snprintf(folder, sizeof folder, "FOLDER=%s", a->folder);
-    const char *arguments[1] = {"desktop"}, *settings[1] = {folder};
-    for (;;) {
-        n_handle ends[2];
-        if (n_channel_pair(ends) < 0) return;
-        n_handle log = n_system_log_open();
-        int32_t handles[4] = {-1, log, log, ends[1]};
-        struct n_launch launch = {.arguments = arguments, .settings = settings, .handles = handles, .argument_count = 1,
-                                  .setting_count = 1, .handle_count = 4, .identity = &identity, .identity_cap = grant_cap};
-        n_handle app = n_app_launch(DESKTOP, &launch);
-        if (log >= 0) n_handle_close(log);
-        n_handle_close(ends[1]);
-        if (app < 0) {
-            printf("session: cannot start " DESKTOP " (%s)\n", n_result_text(app));
-            fflush(stdout);
-            n_handle_close(ends[0]);
-            return;
-        }
-        mtx_lock(&current_lock);
-        current.session = session;
-        current.desktop = app;
-        current.to_desktop = ends[0];
-        mtx_unlock(&current_lock);
-        int status = 0;
-        n_result r = n_app_result(app, N_CLOCK_NEVER, &status);
-        mtx_lock(&current_lock);
-        current.session = 0;
-        current.desktop = current.to_desktop = -1;
-        mtx_unlock(&current_lock);
-        n_handle_close(ends[0]);
-        n_handle_close(app);
-        if (r >= 0 && status == 0) return;
-        printf("session: the desktop ended (%d); starting it again\n", status);
-        fflush(stdout);
-    }
+static void desktop_session(const struct n_identity *identity) {
+    desktop_identity(identity);
+    while (!__atomic_load_n(&session_over, __ATOMIC_ACQUIRE)) wait_on_address(&session_over, 0, N_CLOCK_NEVER);
+    desktop_identity(NULL);
 }
 
-static void shell_session(const struct n_account *a, uint32_t session) {
-    struct n_identity identity = {.user = a->user, .session = session, .cls = a->cls};
+static void shell_session(const struct n_identity *identity, const struct n_account *a) {
     char folder[sizeof "FOLDER=" + N_ACCOUNT_FOLDER_MAX];
     snprintf(folder, sizeof folder, "FOLDER=%s", a->folder);
     const char *arguments[1] = {"sh"}, *settings[2] = {folder, "TERMINAL=0 1 2"};
     int32_t handles[3] = {0, 1, 2};
     struct n_launch launch = {.arguments = arguments, .settings = settings, .handles = handles, .argument_count = 1,
-                              .setting_count = n_terminal(1) ? 2 : 1, .handle_count = 3, .identity = &identity, .identity_cap = grant_cap};
+                              .setting_count = n_terminal(1) ? 2 : 1, .handle_count = 3, .identity = identity, .identity_grant = grant_cap};
     n_handle app = n_app_launch(SHELL, &launch);
     if (app < 0) {
         printf("session: cannot start " SHELL " (%s)\n", n_result_text(app));
         fflush(stdout);
         return;
     }
+    mtx_lock(&current_lock);
+    current.shell = app;
+    mtx_unlock(&current_lock);
     int status = 0;
     n_app_result(app, N_CLOCK_NEVER, &status);
+    mtx_lock(&current_lock);
+    current.shell = -1;
+    mtx_unlock(&current_lock);
     n_handle_close(app);
     printf("\nsession: the shell ended (%d)\n", status);
     fflush(stdout);
@@ -165,10 +124,17 @@ static void session_run(const struct n_account *a, bool windows) {
         printf("session: %s's folder is not ready (%s)\n", a->name, n_result_text(r));
         fflush(stdout);
     }
-    uint32_t session = ++next_session;
-    if (windows) desktop_session(a, session);
-    else shell_session(a, session);
-    n_services_control(N_SERVICES_STOP_SESSION, NULL, NULL, session);
+    if (!++next_session) ++next_session;
+    struct n_identity identity = {.user = a->user, .session = next_session, .cls = a->cls};
+    __atomic_store_n(&session_over, 0, __ATOMIC_RELEASE);
+    mtx_lock(&current_lock);
+    current.session = identity.session;
+    mtx_unlock(&current_lock);
+    if (windows) desktop_session(&identity);
+    else shell_session(&identity, a);
+    mtx_lock(&current_lock);
+    current.session = 0;
+    mtx_unlock(&current_lock);
 }
 
 /* 起動のときに自動で入る利用者。 */
@@ -342,9 +308,8 @@ static bool console_login(struct n_account *out) {
 }
 
 int main(void) {
-    n_result r = n_service_begin();
-    if (r >= 0 && mtx_init(&current_lock, mtx_plain) != thrd_success) r = -N_ERR_NO_MEMORY;
-    if (r >= 0) r = grant_cap = n_service_cap(N_CAP_IDENTITY_GRANT);
+    n_result r = mtx_init(&current_lock, mtx_plain) == thrd_success ? 0 : -N_ERR_NO_MEMORY;
+    if (r >= 0) r = grant_cap = n_cap_find(N_CAP_IDENTITY_GRANT);
     n_result thread = r >= 0 ? thread_create(connections_serve, NULL) : r;
     if (thread < 0) {
         printf("session: cannot begin (%s)\n", n_result_text(thread));

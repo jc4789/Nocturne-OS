@@ -334,6 +334,92 @@ n_result n_folder_entries(const char *path, struct n_entry **out) {
     return (n_result)n;
 }
 n_result n_channel_pair(n_handle out[2]) { return NC5(SYS_CHANNEL_PAIR, out, 0, 0, 0, 0); }
+n_result n_identity_self(struct n_identity *out) { return NC5(SYS_IDENTITY_SELF, out, 0, 0, 0, 0); }
+n_result n_channel_peer(n_handle channel, struct n_identity *out) { return NC5(SYS_CHANNEL_PEER, channel, out, 0, 0, 0); }
+n_handle n_cap_derive(n_handle cap, enum n_cap kind) { return (n_handle)NC5(SYS_CAP_DERIVE, cap, kind, 0, 0, 0); }
+n_result n_cap_kind(n_handle cap) { return NC5(SYS_CAP_KIND, cap, 0, 0, 0, 0); }
+n_handle n_cap_find(enum n_cap kind) { return (n_handle)NC5(SYS_CAP_FIND, kind, 0, 0, 0, 0); }
+size_t n_caps_list(int32_t *out) {
+    size_t n = 0;
+    for (int kind = 0; kind < N_CAP_COUNT; kind++) {
+        n_handle cap = n_cap_find((enum n_cap)kind);
+        if (cap >= 0) out[n++] = cap;
+    }
+    return n;
+}
+n_result n_session_identity(n_handle identity_grant, const struct n_identity *identity) {
+    return NC5(SYS_SESSION_IDENTITY, identity_grant, identity, 0, 0, 0);
+}
+
+n_handle n_inlet_connect(n_handle inlet) {
+    n_handle pair[2];
+    n_result r = n_channel_pair(pair);
+    if (r < 0) return (n_handle)r;
+    r = n_channel_send(inlet, "", 0, pair[1]);
+    n_handle_close(pair[1]);
+    if (r < 0) {
+        n_handle_close(pair[0]);
+        return (n_handle)r;
+    }
+    return pair[0];
+}
+
+n_handle n_inlet_accept(n_handle inlet, int flags) {
+    char small[512], *buf = small;
+    size_t cap = sizeof small;
+    n_handle end = -1;
+    n_result r;
+    /* 本文（サービスの要求）は読み捨てる。依頼者の身元は n_channel_peer で読む。 */
+    while ((r = n_channel_receive(inlet, buf, cap, flags, &end)) == -N_ERR_TOO_LARGE) {
+        n_result size = n_channel_receive(inlet, NULL, 0, N_CHANNEL_PEEK, NULL);
+        if (size < 0) {
+            r = size;
+            break;
+        }
+        if (buf != small) free(buf);
+        buf = malloc((size_t)size);
+        cap = (size_t)size;
+        if (!buf) return -N_ERR_NO_MEMORY;
+    }
+    if (buf != small) free(buf);
+    if (r < 0) return (n_handle)r;
+    if (end < 0) return -N_ERR_WRONG_KIND;
+    if (n_handle_kind(end) != N_KIND_CHANNEL) {
+        n_handle_close(end);
+        return -N_ERR_WRONG_KIND;
+    }
+    return end;
+}
+
+n_handle n_service_connect(const char *name) {
+    if (!name) return -N_ERR_BAD_ADDRESS;
+    return (n_handle)NC5(SYS_SERVICE_CONNECT, name, strlen(name), 0, 0, 0);
+}
+
+n_handle n_service_listen(const char *name) {
+    if (!name) return -N_ERR_BAD_ADDRESS;
+    n_handle manager = n_service_connect(N_SERVICE_BIND);
+    if (manager < 0) return manager;
+    n_handle pair[2];
+    n_result r = n_channel_pair(pair);
+    if (r < 0) {
+        n_handle_close(manager);
+        return (n_handle)r;
+    }
+    r = n_channel_send(manager, name, strlen(name), pair[1]);
+    n_handle_close(pair[1]);
+    int32_t reply = -N_ERR_CLOSED;
+    if (r >= 0) r = n_channel_receive(manager, &reply, sizeof reply, N_CHANNEL_WAIT, NULL);
+    if (r >= 0) r = reply;
+    n_handle_close(manager);
+    if (r < 0) {
+        n_handle_close(pair[0]);
+        return (n_handle)r;
+    }
+    return pair[0];
+}
+
+n_handle n_service_register(n_handle service_root) { return (n_handle)NC5(SYS_SERVICE_REGISTER, service_root, 0, 0, 0, 0); }
 n_result n_channel_send(n_handle h, const void *data, size_t n, n_handle attach) {
     return NC5(SYS_CHANNEL_SEND, h, data, n, attach, 0);
 }
@@ -375,7 +461,7 @@ n_result n_system_log(char *buf, size_t cap) { return NC5(SYS_SYSTEM_LOG, buf, c
 n_handle n_system_log_open(void) { return (n_handle)NC5(SYS_SYSTEM_LOG_OPEN, 0, 0, 0, 0, 0); }
 n_handle n_app_open(int64_t id) { return (n_handle)NC5(SYS_APP_OPEN, id, 0, 0, 0, 0); }
 n_result n_app_id(n_handle app) { return NC5(SYS_APP_ID, app, 0, 0, 0, 0); }
-n_handle n_pci_claim(n_handle cap, uint8_t bus, uint8_t dev, uint8_t func) { return (n_handle)NC5(SYS_PCI_CLAIM, bus, dev, func, cap, 0); }
+n_handle n_pci_claim(n_handle cap, uint8_t bus, uint8_t dev, uint8_t func) { return (n_handle)NC5(SYS_PCI_CLAIM, cap, bus, dev, func, 0); }
 n_result n_pci_info(n_handle pci, struct n_pci_function *out) { return NC5(SYS_PCI_INFO, pci, out, 0, 0, 0); }
 n_result n_pci_config_read(n_handle pci, uint32_t target, uint32_t offset, uint32_t width) {
     return NC5(SYS_PCI_CONFIG_READ, pci, target, offset, width, 0);
@@ -478,8 +564,8 @@ n_result proclist(struct n_procinfo *out, int max) { return SC2(SYS_PROCLIST, ou
 n_result sysinfo(struct n_sysinfo *si) { return SC1(SYS_SYSINFO, si); }
 n_result cpu_info(struct n_cpuinfo *info) { return SC1(SYS_CPU_INFO, info); }
 void yield(void) { SC0(SYS_YIELD); }
-n_result poweroff(void) { return SC1(SYS_POWER, POWER_OFF); }
-n_result reboot(void) { return SC1(SYS_POWER, POWER_REBOOT); }
+n_result poweroff(n_handle cap) { return NC5(SYS_POWER, cap, POWER_OFF, 0, 0, 0); }
+n_result reboot(n_handle cap) { return NC5(SYS_POWER, cap, POWER_REBOOT, 0, 0, 0); }
 n_result pcilist(struct n_pciinfo *out, int max) { return SC2(SYS_PCILIST, out, max); }
 
 static bool is_document(const char *path) {

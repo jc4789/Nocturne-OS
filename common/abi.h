@@ -45,7 +45,7 @@
 #define N_RESULT_CODES 34
 
 /* System call numbers. The ABI keeps no older form of a call: a program is built against the
-   abi.h of the system it runs on. 1-18, 21-25, 30-32, 35-37, 44, 51-52, 60-63, 90 and 203-206
+   abi.h of the system it runs on. 1-18, 21-25, 30-32, 35-37, 44, 51-55, 60-63, 90 and 203-206
    are unassigned. */
 enum {
     SYS_EXIT = 0,
@@ -58,8 +58,7 @@ enum {
     SYS_GPU_BLIT,
     SYS_THREAD_CREATE = 45, SYS_THREAD_JOIN, SYS_THREAD_EXIT,
     SYS_WAIT_ADDRESS, SYS_WAKE_ADDRESS, SYS_THREAD_ID,
-    SYS_CHANNEL_LISTEN = 53, SYS_CHANNEL_CONNECT, SYS_CHANNEL_ACCEPT,
-    SYS_SHARED_CREATE,
+    SYS_SHARED_CREATE = 56,
     SYS_THREAD_SCHEDULE, /* (thread, N_SCHEDULE_*, weight or period ns): its class (§5) */
     SYS_THREAD_STACK_BOUNDS = 58, SYS_THREAD_DETACH,
     SYS_WIN_CREATE = 64, /* (width, height, title, flags, surfaces): the window handle */
@@ -155,8 +154,11 @@ enum {
     SYS_SERVICE_CONNECT,      /* (name, name_len) -> channel */
     SYS_STORE_PRIVATE_OPEN,   /* (N_CAP_STORE_PRIVATE の cap, region, ...) -> document */
     SYS_SETTINGS_APPLY,       /* (N_CAP_SETTINGS_APPLY の cap, domain, key, value, len) */
-    SYS_DESKTOP_ATTACH,       /* (channel): wm がメニューとアイコンの起動を struct n_session_request でこの channel へ送る */
-    SYS_MAX = 218          /* above every number (what syscallfuzz tries) */
+    SYS_CAP_KIND,             /* (cap) -> enum n_cap */
+    SYS_CAP_FIND,             /* (enum n_cap) -> その能力を持つ自分の handle */
+    SYS_SESSION_IDENTITY,     /* (N_CAP_IDENTITY_GRANT の cap, const struct n_identity *):
+                                 カーネルの窓の系が起こすアプリの身元 */
+    SYS_MAX                   /* above every number (what syscallfuzz tries) */
 };
 
 /* ---- native handles ---- */
@@ -172,6 +174,7 @@ enum {
 #define N_KIND_PCI 10       /* the right to drive one PCI function */
 #define N_KIND_PAGER 11     /* the right to supply one paged memory object; never sent */
 #define N_KIND_WATCH 13     /* a watch (SYS_WATCH_TAKE): receivable once what it watches changed */
+#define N_KIND_CAPABILITY 14 /* 特権を一つ持つ（enum n_cap、SYS_CAP_KIND）。持つことが権限の証明。 */
 
 /* SYS_ENTRY_WATCH: what is watched on C: */
 #define N_WATCH_NAME 1u   /* the last name of the path in its folder, whether an entry has it or not */
@@ -180,7 +183,7 @@ enum {
 #define N_WATCH_CHANGES_MAX 0xffffffffu
 
 /* The folders of C: every app and the system know. Apps start in the user's folder, C:\Users\<name>,
-   which the accounts service names by the identity; its AppData\Temp is emptied at every login. */
+   which the setting USERFOLDER names; its AppData\Temp, emptied at every start, is the setting TEMP. */
 #define N_FOLDER_SYSTEM   "C:\\Nocturne\\System"  /* the system's programs */
 #define N_FOLDER_PROGRAMS "C:\\Programs"           /* the apps, each in a folder of its own */
 /* certificate authorities the system trusts besides the roots built into TLS (user/libc/tls.c) */
@@ -235,9 +238,11 @@ struct n_launch {
     const char *const *settings;
     const int32_t *handles;
     uint32_t argument_count, setting_count, handle_count, flags;
-    /* 子の身元。NULL なら親の身元を継ぐ。別の身元には identity_cap の N_CAP_IDENTITY_GRANT が要る。 */
+    /* 子の身元。NULL：親と同じ。cls は親を超えられない。user・session・program を親と変えるには、
+       identity_grant に N_CAP_IDENTITY_GRANT の handle を渡す。identity が NULL なら読まない。
+       能力は handles の列で渡す（子は SYS_CAP_FIND で引く）。 */
     const struct n_identity *identity;
-    int32_t identity_cap;
+    int32_t identity_grant;
     uint32_t reserved;
 };
 /* The most bytes a launch's argument and setting strings (each with its nul) and their two
@@ -279,7 +284,6 @@ struct n_procinfo {
     uint64_t cpu_ns;
     uint64_t mem_kb;
     uint64_t start_ns;  /* on the monotonic clock */
-    uint64_t wait_phys; /* blocked in an address wait: the physical word, else 0 */
 };
 
 /* free_mem: what an app can have now, the free frames and those of programs no task runs, which

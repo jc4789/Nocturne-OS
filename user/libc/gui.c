@@ -4,7 +4,6 @@
 #include <string.h>
 #include "nocturne.h"
 #include "display.h"
-#include "nocturne_services.h"
 
 bool gui_available(void) {
     struct screen_info si;
@@ -194,34 +193,14 @@ n_result win_event(window_t *win, struct gui_event *e, uint64_t deadline) {
 
 n_result clipboard_set(const char *s, size_t n) { return __syscall(SYS_CLIPBOARD_SET, (long)s, n, 0, 0, 0); }
 n_result clipboard_get(char *buf, size_t n) { return __syscall(SYS_CLIPBOARD_GET, (long)buf, n, 0, 0, 0); }
-/* プログラムは呼ぶ者のセッションのデスクトップが起こす。子は利用者の身元を継ぐ。 */
 n_result gui_launch(const char *path, const char *arg) {
-    char full[N_SESSION_PATH_MAX];
+    char full[4096];
     if (!find_program(path, full, sizeof full)) return -N_ERR_NOT_FOUND;
-    size_t path_bytes = strlen(full), arg_bytes = arg ? strlen(arg) : 0;
-    if (arg_bytes >= N_SESSION_PATH_MAX) return -N_ERR_TOO_LARGE;
-    size_t bytes = sizeof(struct n_session_request) + path_bytes + arg_bytes;
-    struct n_session_request *request = malloc(bytes);
-    if (!request) return -N_ERR_NO_MEMORY;
-    *request = (struct n_session_request){.op = N_SESSION_LAUNCH, .path_bytes = (uint32_t)path_bytes,
-                                          .argument_bytes = (uint32_t)arg_bytes};
-    memcpy(request + 1, full, path_bytes);
-    if (arg_bytes) memcpy((char *)(request + 1) + path_bytes, arg, arg_bytes);
-    n_handle session = n_service_connect("session");
-    n_result r = session;
-    if (session >= 0) {
-        r = n_channel_send(session, request, bytes, -1);
-        struct n_session_reply reply;
-        if (r >= 0) r = n_channel_receive(session, &reply, sizeof reply, N_CHANNEL_WAIT, NULL);
-        if (r >= 0) r = r == sizeof reply ? reply.result : -N_ERR_PROTOCOL;
-        n_handle_close(session);
-    }
-    free(request);
-    return r;
+    return __syscall(SYS_GUI_LAUNCH, (long)full, (long)arg, 0, 0, 0);
 }
 
-n_result screen_grab(uint32_t *buf, size_t bytes, int *w, int *h) {
-    n_result r = __syscall(SYS_SCREEN_GRAB, (long)buf, (long)bytes, 0, 0, 0);
+n_result screen_grab(n_handle cap, uint32_t *buf, size_t bytes, int *w, int *h) {
+    n_result r = __syscall(SYS_SCREEN_GRAB, cap, (long)buf, (long)bytes, 0, 0);
     if (r < 0) return r;
     *w = (int)(r >> 16);
     *h = (int)(r & 0xFFFF);

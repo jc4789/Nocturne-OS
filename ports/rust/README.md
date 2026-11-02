@@ -55,7 +55,7 @@ make                         # tools/rust/sysroot があれば ports/rust/apps/*
 | 標準入出力（`sys/stdio`） | 出力は C の `stdout`/`stderr`（チャンネルでも文書でも C ライブラリーが扱う）。入力はハンドル 0 を直接読み、チャンネルは 1 メッセージずつ、大きいメッセージの残りは次へ持ち越す。文書なら自分で位置を持つ。 |
 | ファイル（`sys/fs`） | `n_document_*`、`n_entry_*`、`n_folder_*`。共有カーソルが無いので `File` が位置を持つ。追記は排他を取って末尾へ書く。`sync_all`/`sync_data` は `n_document_commit`（`N_COMMIT_WAIT`：媒体に書かれるまで待つ）。`rename` は C ライブラリーの `rename`（既存の文書を原子的に置き換える）。パスは `n_path_complete`（`FOLDER` を基準に `.`/`..` を解決）で完全指定にしてから渡す。 |
 | パスの形（`sys/path`） | ドライブは `C:` だけで、区切りは `\`（主）と `/`。接頭辞はドライブ `X:`（`Prefix::Disk`）だけで、UNC や `\\?\` は無い。根のあるパス（`C:\a`、`\a`、`/a`）が完全指定（`is_absolute`）。根の無い `C:`、`C:a` は今のフォルダーとその中の名前。`path::absolute` は C ライブラリーの `n_path_complete`（`C:\...`、`.`/`..` を解決）。 |
-| フォルダー（`sys/paths`） | `current_dir` は C ライブラリーの今のフォルダー（設定 `FOLDER`）を `n_path_complete` で完全指定にしたもの（無ければ `C:\`）。`set_current_dir` は `n_folder_set` で C ライブラリーの今のフォルダーを変え、std の表の `FOLDER` も同じ値にする。`temp_dir` は `n_temp_folder`（設定 `TEMP`）、`home_dir` は `n_user_folder`（設定 `USERFOLDER`）。`split_paths`/`join_paths` の区切りは `;`。`PATH` と `HOME` は無い。 |
+| フォルダー（`sys/paths`） | `current_dir` は C ライブラリーの今のフォルダー（設定 `FOLDER`）を `n_path_complete` で完全指定にしたもの（無ければ `C:\`）。`set_current_dir` は `n_folder_set` で C ライブラリーの今のフォルダーを変え、std の表の `FOLDER` も同じ値にする。`temp_dir` は `n_temp_folder`、`home_dir` は `n_user_folder`（どちらも身元から `accounts` が引く）。`split_paths`/`join_paths` の区切りは `;`。`PATH` と `HOME` は無い。 |
 | エラー（`sys/io/error`） | OS エラーの値は ABI の `N_ERR_*`（正の数）。`ErrorKind` に対応付け、文言は `n_result_text`。 |
 | 乱数（`sys/random`） | `n_random`（`HashMap` の鍵もこれ）。 |
 | プロセス | `process::id` は `n_app_self`、`process::exit` は `exit`、`abort` は `abort`。 |

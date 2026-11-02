@@ -31,7 +31,7 @@ Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`�
 | `nvkms.mk`、`nvkms_os.c／.h`、`nvkms_kapi_rm.c` | NVIDIA の画面設定ドライバー NVKMS（nvidia-modeset）を nvrm に入れるビルド規則、その OS 層と RM との接続、KAPI の memory の RM ハンドル（下の「NVKMS」「直接表示」） |
 | `display.c／.h` | nvrm が画面を持つ：KAPI の唯一のクライアントとしてモニターの接続を張り直し、カーネルの画面を走査面へ移す。全画面のアプリの絵の直接表示（下の「画面」） |
 
-起動手順（`nvrm.c`）：init が `N_KIND_PCI` をハンドル 3 で渡す → `n_pci_info` → `nv_state_t` を埋めて BAR0 を写す →
+起動手順（`nvrm.c`）：サービスの管理者が `N_CAP_PCI_CLAIM` を渡して起こす → 引数の機能を claim する → `n_pci_info` → `nv_state_t` を埋めて BAR0 を写す →
 `NVRM_REGISTRY_DWORDS`（環境変数、任意）を `rm_parse_option_string` へ → `rm_init_rm` → `rm_is_supported_device`
 → `rm_init_private_state` → `rm_init_event_locks` → `rm_init_dynamic_power_management`
 → `rm_set_rm_firmware_requested` → 除外の確かめ → `rm_enable_dynamic_power_management` → 割り込みスレッド
@@ -51,7 +51,7 @@ RM の取決めどおりメソッドの準備と片付けだけをする。
 サービスの管理者（`user/apps/services.c` の `gpu` の項目）／libnvrm／NVK は共通の PCI 選別条件（NVIDIA、VGA または 3D、progif 0）を使う。
 NVK は生の PCI 件数を GPU 数にせず、HELLO で adapter 初期化成功を確認し、接続先 RM の probed ID と PCI 情報が一致する BDF の動的 snapshot を列挙する。probed ID だけでは初期化成功を保証しない。
 
-装置ごとにサービスの実例 `gpu:<N_PCI_TARGETの4桁16進数>` がある。nvrm は引数の機能を `N_CAP_PCI_CLAIM` で claim し、相手の channel をサービスの接続の口で受ける。
+装置ごとにサービスの実例 `gpu` がある（引数は `N_PCI_TARGET` の 4 桁の 16 進数）。nvrm は引数の機能を `N_CAP_PCI_CLAIM` で claim し、名前 `nocturne.nvidia.rm.<4桁>` を `n_service_listen` で申し込む。
 `nvrm_connect_device()` は指定装置へ、従来の `nvrm_connect()` は動的 PCI 列挙から最初に接続可能な装置へつなぐ。
 描画側の `nvrm_connect_ready()` は診断専用の未初期化装置を飛ばし、後続の ready 装置も探す。旧 HELLO の echo を ready と誤認しない。
 `nvrm_connect_ready_status()` は同じ探索で、使える装置が無い理由も返す（nvrm がどの GPU も出していない `N_ERR_NOT_FOUND`、

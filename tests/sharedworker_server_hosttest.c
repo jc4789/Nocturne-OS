@@ -24,9 +24,10 @@ ssize_t write(int f,const void*p,size_t n){if(n==sizeof last_wire){struct njw_he
 int poll(struct n_pollfd*p,int n,int t){(void)p;(void)n;(void)t;return 0;}
 #endif
 int fcntl(int f,int c,...){(void)f;(void)c;return 0;}
+int n_service_listen(const char*k){(void)k;return 8;}
 int n_service_connect(const char*k){(void)k;return 9;}
 #ifndef WORKER_CANCEL_MODEL
-int n_connector_accept(int f,char*a,size_t c){(void)f;(void)a;(void)c;errno=EAGAIN;return -1;}
+int n_inlet_accept(int f,int flags){(void)f;(void)flags;errno=EAGAIN;return -1;}
 #endif
 uint64_t n_clock_monotonic(void){return (uint64_t)(100)*1000000ULL;}
 int cpu_info(struct n_cpuinfo*p){(void)p;return -1;}

@@ -1,9 +1,11 @@
 #include <stdio.h>
 #include "nocturne.h"
+#include "nocturne_services.h"
 int main(void) {
     printf("Rebooting...\n");
     fflush(stdout);
     n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
-    reboot();
+    n_result r = n_machine_power(N_MACHINE_REBOOT);
+    fprintf(stderr, "reboot: %s\n", n_result_text(r));
     return 1;
 }

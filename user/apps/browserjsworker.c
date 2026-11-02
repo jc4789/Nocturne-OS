@@ -1,7 +1,6 @@
 /* Dedicated QuickJS realm in a native Nocturne child task. The only author
  * capabilities are data-only IPC to the browser; no libc/native modules. */
 #include <nocturne.h>
-#include "nocturne_services.h"
 #include <quickjs.h>
 #include <js_worker_wire.h>
 #include <stdlib.h>
@@ -28,7 +27,7 @@
 #include "../libc/web/html_policy.h"
 #include "../libc/web/js_html_safety_native.h"
 /* Records travel as channel messages, one record each. A dedicated worker's
- * page channel is handle CHANNEL; a shared server's CHANNEL is its connector (sharedworkers が channel を送る)
+ * page channel is handle CHANNEL; a shared server's CHANNEL is its inlet
  * and every owner page is a client with a channel of its own. All are watched
  * in one queue with the Atomics.waitAsync memory words. */
 #define CHANNEL 0
@@ -171,10 +170,10 @@ static bool shared_connect_url(struct worker*w,struct client*c,const struct defe
 }
 /* Native-only endpoint ownership. The interrupt path may use this helper:
  * never deserialize bytes, allocate JS values or dispatch an author task.
- * The count of owners accepted, or -1 when the listener failed. */
+ * The count of owners accepted, or -1 when the inlet failed. */
 static int shared_accept(struct worker*w,unsigned quantum){
     int accepted=0;
-    for(unsigned i=0;i<quantum;i++){n_handle h=n_connector_accept(CHANNEL,NULL,0);if(h==-N_ERR_NOT_READY)break;if(h<0){w->closed=w->output_failed=true;return -1;}
+    for(unsigned i=0;i<quantum;i++){n_handle h=n_inlet_accept(CHANNEL,0);if(h==-N_ERR_NOT_READY)break;if(h<0){w->closed=w->output_failed=true;return -1;}
         struct client*c=calloc(1,sizeof*c);if(!c){n_handle_close(h);w->closed=w->output_failed=true;return -1;}
         c->channel=h;c->token=CLIENT_TOKEN|++w->next_client;c->active=true;c->next=w->clients;w->clients=c;w->had_client=true;accepted++;
     }return accepted;

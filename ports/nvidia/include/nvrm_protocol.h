@@ -11,9 +11,10 @@
    no app reaches into another's memory (docs/nvidia/LEDGER.md D4). The reply is the header and
    the argument struct as RM left it. A reply to NV_ESC_RM_MAP_MEMORY carries the mapped memory as
    an attached shared object: `offset` is where the mapping starts in it, `bytes` its length. */
-/* サービスの名前。引数は N_PCI_TARGET の 4 桁の 16 進数（services.c の gpu の項目）。 */
-#define NVRM_SERVICE_FORMAT "gpu:%04x"
-#define NVRM_SERVICE_NAME_BYTES (sizeof "gpu:" + 2 * sizeof(uint16_t))
+#define NVRM_CHANNEL "nocturne.nvidia.rm" /* サービスの名前の頭（n_service_connect） */
+#define NVRM_CHANNEL_FORMAT NVRM_CHANNEL ".%04x"
+/* Domain zero PCI BDF is a 16-bit N_PCI_TARGET. Include the dot, hex digits and NUL. */
+#define NVRM_CHANNEL_NAME_BYTES (sizeof(NVRM_CHANNEL) + 1 + 2 * sizeof(uint16_t))
 #define NVRM_PROTOCOL 1
 #define NVRM_HELLO 0x1000u   /* escapes below 0x1000 are RM's NV_ESC_* numbers */
 /* HELLO reply capabilities in access (arena_bytes on the request). Old arena

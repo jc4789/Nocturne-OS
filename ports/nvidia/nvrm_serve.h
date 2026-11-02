@@ -27,5 +27,5 @@ void *nvrm_user_translate(const void *user, size_t n);
 n_handle nvrm_user_view(const void *user, size_t n, size_t *offset);
 /* The current client's arena as the client maps it; false when no request is being served. */
 bool nvrm_user_arena(uint64_t *address, uint64_t *bytes);
-/* 接続の口 connector の相手に、止める指示か口の終わりまで仕える。その理由を返す。 */
-n_result nvrm_serve(n_handle connector);
+/* Serve clients until the channel cannot be listened on; returns the reason. */
+n_result nvrm_serve(uint32_t pci_target);

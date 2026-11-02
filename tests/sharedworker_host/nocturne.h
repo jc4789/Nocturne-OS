@@ -22,6 +22,9 @@ ssize_t write(int,const void*,size_t);
 int poll(struct n_pollfd*,int,int);
 int fcntl(int,int,...);
 int open(const char*,int,...);
+int n_service_listen(const char*);
+int n_service_connect(const char*);
+int n_inlet_accept(int,int);
 uint64_t n_clock_monotonic(void);
 int cpu_info(struct n_cpuinfo*);
 #ifndef F_SETFL

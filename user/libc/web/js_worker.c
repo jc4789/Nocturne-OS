@@ -3,7 +3,6 @@
 #include "js_worker_wire.h"
 #include "js_atomics.h"
 #include <nocturne.h>
-#include "nocturne_services.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -165,26 +164,24 @@ static bool spawn_child(web_workers *w,struct child *c){
     c->app=app;c->task=n_app_id(app);c->channel=pair[0];active_children++;
     JSValue log=JS_NewObject(w->ctx);JS_SetPropertyStr(w->ctx,log,"message",JS_NewString(w->ctx,"native dedicated task; heap grows on demand (no configured ceiling)"));event(w,c,NJW_CONSOLE,log);JS_FreeValue(w->ctx,log);return true;
 }
-/* 鍵（起源、URL か名前）全部で worker を選ぶのは sharedworkers のサービス。応答の後、この channel が
- * worker との双方向の道になる。 */
+/* 名前のサービス：全部の鍵を名前にしてサービスの管理者に申し込む。管理者が利用者とセッションごとに
+ * 分ける。Every returned duplex endpoint has its own queue. */
 static bool shared_transport(web_workers*w,struct child*c,bool*created){
-    (void)w;const char*identity_url=c->name_len?"":c->url;size_t a=strlen(c->origin),b=strlen(identity_url),n=c->name_len,u=strlen(c->url);
+    (void)w;const char*identity_url=c->name_len?"":c->url;size_t a=strlen(c->origin),b=strlen(identity_url),n=c->name_len;
     if(a>SIZE_MAX-b-96||a+b+96>SIZE_MAX-n||a+b+96+n>SIZE_MAX-n)return false;
-    size_t capacity=a+b+96+n*2;if(capacity>SIZE_MAX-u-sizeof(struct n_sharedworker_request))return false;
-    char*message=malloc(sizeof(struct n_sharedworker_request)+capacity+u);if(!message)return false;
-    char*key=message+sizeof(struct n_sharedworker_request);
+    size_t capacity=a+b+96+n*2;char*key=malloc(capacity);if(!key)return false;
     int prefix=snprintf(key,capacity,"Nocturne.SharedWorker:%zu:%s:%zu:%s:%zu:",a,c->origin,b,identity_url,n);
-    if(prefix<0||(size_t)prefix>=capacity){free(message);return false;}
-    static const char hex[]="0123456789abcdef";size_t at=(size_t)prefix;for(size_t i=0;i<n;i++){unsigned v=(unsigned char)c->name[i];key[at++]=hex[v>>4];key[at++]=hex[v&15];}
-    memcpy(key+at,c->url,u);
-    *(struct n_sharedworker_request*)message=(struct n_sharedworker_request){.key_bytes=(uint32_t)at,.url_bytes=(uint32_t)u};
-    n_handle channel=n_service_connect("sharedworkers");
-    n_result sent=channel<0?channel:n_channel_send(channel,message,sizeof(struct n_sharedworker_request)+at+u,-1);
-    free(message);
-    struct n_sharedworker_reply reply;
-    if(sent>=0)sent=n_channel_receive(channel,&reply,sizeof reply,N_CHANNEL_WAIT,NULL);
-    if(sent!=(n_result)sizeof reply||reply.result<0){if(channel>=0)n_handle_close(channel);return false;}
-    *created=reply.created!=0;c->channel=channel;return true;
+    if(prefix<0||(size_t)prefix>=capacity){free(key);return false;}
+    static const char hex[]="0123456789abcdef";size_t at=(size_t)prefix;for(size_t i=0;i<n;i++){unsigned v=(unsigned char)c->name[i];key[at++]=hex[v>>4];key[at++]=hex[v&15];}key[at]=0;
+    n_handle listener=n_service_listen(key);*created=listener>=0;
+    if(listener<0&&listener!=-N_ERR_EXISTS){free(key);return false;}
+    /* The server's only handle is its inlet: no input, output or log. It
+       ends itself once every connected owner has gone. */
+    if(*created){const char*args[]={"browserjsworker","--shared-server",c->url};const int32_t handles[]={listener};
+        struct n_launch launch={.arguments=args,.argument_count=3,.handles=handles,.handle_count=1};
+        n_handle app=n_app_launch(WORKER_PROGRAM,&launch);if(app<0){n_handle_close(listener);free(key);return false;}n_handle_close(app);}
+    n_handle channel=n_service_connect(key);if(listener>=0)n_handle_close(listener);free(key);if(channel<0)return false;
+    c->channel=channel;return true;
 }
 web_workers *web_worker_new(JSContext *ctx,uint32_t generation,web_worker_loader load,void *opaque){web_workers *w=calloc(1,sizeof *w);if(!w)return NULL;w->ctx=ctx;w->generation=generation;w->callback=JS_UNDEFINED;w->load=load;w->opaque=opaque;w->next=managers;managers=w;return w;}
 bool web_worker_set_policy(web_workers *w,const char *headers,int referrer_policy){if(!w||referrer_policy<0||referrer_policy>8)return false;char *copy=policy_copy(headers);if(!copy)return false;free(w->creator_policy);w->creator_policy=copy;w->creator_referrer_policy=referrer_policy;return true;}

@@ -1,4 +1,4 @@
-/* 試験の媒体のサービス "tests"（tests/testrun.c）の口。試験のプログラムが能力を借りる。 */
+/* 試験のプログラムの利用者の道具。能力は試験の媒体のサービス "tests"（tests/testrun.c）からシェルを通って継ぐ。 */
 #ifndef TESTS_TESTRUN_H
 #define TESTS_TESTRUN_H
 #include <stdlib.h>
@@ -6,21 +6,6 @@
 #include "nocturne.h"
 #include "nocturne_services.h"
 
-struct testrun_request { uint32_t cap; }; /* enum n_cap。答えは int64 の結果で、添付が能力。 */
-
-/* 試験の媒体の外では負の結果になる。 */
-static inline n_handle test_cap(enum n_cap what) {
-    n_handle channel = n_service_connect("tests");
-    if (channel < 0) return channel;
-    struct testrun_request q = {.cap = what};
-    int64_t result = -N_ERR_CLOSED;
-    n_handle cap = -1;
-    n_result r = n_channel_send(channel, &q, sizeof q, -1);
-    if (r >= 0) r = n_channel_receive(channel, &result, sizeof result, N_CHANNEL_WAIT, &cap);
-    n_handle_close(channel);
-    if (r < 0) return (n_handle)r;
-    return result < 0 ? (n_handle)result : cap;
-}
 /* 名前の試験の利用者（無ければ作る）。呼ぶ者は試験の利用者で admin。 */
 static inline n_result test_account(const char *name, struct n_account *out) {
     struct n_accounts_request q = {.op = N_ACCOUNTS_CREATE, .cls = N_CLASS_USER};
@@ -49,19 +34,11 @@ static inline n_handle test_launch_as(const struct n_account *a, const char *pat
     struct n_identity self, identity;
     if (n_identity_self(&self) < 0) return -N_ERR_DENIED;
     identity = (struct n_identity){.user = a->user, .session = self.session, .cls = a->cls};
-    n_handle cap = test_cap(N_CAP_IDENTITY_GRANT);
+    n_handle cap = n_cap_find(N_CAP_IDENTITY_GRANT);
     if (cap < 0) return cap;
     struct n_launch l = *launch;
     l.identity = &identity;
-    l.identity_cap = cap;
-    n_handle app = n_app_launch(path, &l);
-    n_handle_close(cap);
-    return app;
-}
-/* 試験のプログラムの n_pci_claim。 */
-static inline n_handle test_pci_claim(uint8_t bus, uint8_t dev, uint8_t func) {
-    static n_handle cap = -1;
-    if (cap < 0) cap = test_cap(N_CAP_PCI_CLAIM);
-    return n_pci_claim(cap, bus, dev, func);
+    l.identity_grant = cap;
+    return n_app_launch(path, &l);
 }
 #endif

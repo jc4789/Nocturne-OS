@@ -5,7 +5,6 @@
 #include <string.h>
 #include <threads.h>
 #include "nocturne.h"
-#include "nocturne_services.h"
 #include "nvrm.h"
 #include "nvrm_protocol.h"
 #include "nvtypes.h"
@@ -37,15 +36,19 @@ struct nvrm {
     uint64_t hello_capabilities;
 };
 
-int64_t nvrm_connect_channel(n_handle channel, struct nvrm **out) {
+int64_t nvrm_connect_device_status(uint32_t pci_target, struct nvrm **out) {
     if (!out) return -N_ERR_INVALID;
     *out = NULL;
+    if (pci_target > UINT16_MAX) return -N_ERR_INVALID;
+    char channel[NVRM_CHANNEL_NAME_BYTES];
+    snprintf(channel, sizeof channel, NVRM_CHANNEL_FORMAT, (unsigned)pci_target);
     struct nvrm *rm = calloc(1, sizeof *rm);
-    if (!rm) { n_handle_close(channel); return -N_ERR_NO_MEMORY; }
+    if (!rm) return -N_ERR_NO_MEMORY;
     n_result result;
     bool lock_ready = false;
-    rm->channel = channel;
+    rm->channel = n_service_connect(channel);
     rm->arena_handle = -1;
+    if (rm->channel < 0) { result = rm->channel; goto fail; }
     rm->arena_handle = n_shared_reserve(ARENA_BYTES);
     if (rm->arena_handle < 0) { result = rm->arena_handle; goto fail; }
     void *arena;
@@ -70,6 +73,7 @@ int64_t nvrm_connect_channel(n_handle channel, struct nvrm **out) {
     *out = rm;
     return 0;
 fail:
+    if (result == -N_ERR_CLOSED) result = -N_ERR_NOT_FOUND; /* 名前を受ける nvrm がいない：管理者が端を閉じた */
     if (lock_ready) mtx_destroy(&rm->lock);
     if (rm->arena) n_memory_release(rm->arena, ARENA_BYTES);
     if (rm->arena_handle >= 0) n_handle_close(rm->arena_handle);
@@ -123,19 +127,6 @@ static int64_t connect_any(bool ready_only, struct nvrm **out) {
     }
     free(list);
     return *out ? 0 : why;
-}
-
-int64_t nvrm_connect_device_status(uint32_t pci_target, struct nvrm **out) {
-    if (!out) return -N_ERR_INVALID;
-    *out = NULL;
-    if (pci_target > UINT16_MAX) return -N_ERR_INVALID;
-    char name[NVRM_SERVICE_NAME_BYTES];
-    snprintf(name, sizeof name, NVRM_SERVICE_FORMAT, (unsigned)pci_target);
-    n_handle channel = n_service_connect(name);
-    if (channel < 0) return channel;
-    int64_t result = nvrm_connect_channel(channel, out);
-    /* 閉じたのは、この機能に宣言の実例が無いか、ドライバーを諦めたとき */
-    return result == -N_ERR_CLOSED ? -N_ERR_NOT_FOUND : result;
 }
 
 struct nvrm *nvrm_connect(void) {

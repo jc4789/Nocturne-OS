@@ -1,6 +1,6 @@
 /* nvrm: NVIDIA's Resource Manager as a user-space driver app (C:\Nocturne\System\nvrm).
  *
- * init claims the GPU's PCI function and starts this app with the N_KIND_PCI right as handle 3
+ * サービスの管理者が PCI の機能ごとに起こし、nvrm が N_CAP_PCI_CLAIM で自分の機能を claim する
  * (docs/nocturne-native-abi.md, section 9). nvrm brings RM up on it the way NVIDIA's kernel
  * interface layer does when a device is probed and first opened, then serves RM's client API
  * (nvrm_serve.c) to other apps:
@@ -387,13 +387,12 @@ int main(int argc, char **argv) {
     nvrm_log("NVRM: Nocturne user-space RM %s", NVRM_FIRMWARE_VERSION);
     /* 引数は N_PCI_TARGET の 16 進数（services.c の gpu の項目）。claim はこの app の持ち物で、
        装置の DMA ごとこの app と一緒に終わる。 */
-    n_result begun = n_service_begin();
-    if (begun < 0 || argc < 2) {
-        nvrm_log("NVRM: not started as a service: %s", n_result_text(begun));
+    if (argc < 2) {
+        nvrm_log("NVRM: started without a PCI function");
         return 1;
     }
     unsigned long target = strtoul(argv[1], NULL, 16);
-    nvrm_dev.pci = n_pci_claim(n_service_cap(N_CAP_PCI_CLAIM), (uint8_t)(target >> 8), (uint8_t)(target >> 3 & 31), (uint8_t)(target & 7));
+    nvrm_dev.pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), (uint8_t)(target >> 8), (uint8_t)(target >> 3 & 31), (uint8_t)(target & 7));
     if (nvrm_dev.pci < 0) {
         nvrm_log("NVRM: cannot claim %s: %s", argv[1], n_result_text(nvrm_dev.pci));
         return 1;
@@ -404,7 +403,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     n_service_ready();
-    n_result r = nvrm_serve(N_SERVICE_HANDLE_CONTROL);
+    n_result r = nvrm_serve((uint32_t)target);
     nvrm_log("NVRM: request server ended: %s", n_result_text(r));
     tear_down();
     return 0;

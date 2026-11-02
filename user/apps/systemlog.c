@@ -17,9 +17,7 @@
 static void keep_note(const char *text) { n_document_append(LOG_NOW, text, strlen(text)); }
 
 int main(void) {
-    n_result r = n_service_begin();
-    if (r < 0) return 1;
-    n_result made = n_folder_create(LOG_FOLDER);
+    n_result r, made = n_folder_create(LOG_FOLDER);
     if (made < 0 && made != -N_ERR_EXISTS) {
         printf("systemlog: no folder for the log (%s)\n", n_result_text(made));
         return 1;
@@ -43,8 +41,9 @@ int main(void) {
         if (got < 0) return 1;
         for (n_result i = 0; i < got; i++) {
             if (reports[i].token == CONTROL_TOKEN) {
-                n_handle stranger = n_connector_accept(N_SERVICE_HANDLE_CONTROL, NULL, 0);
-                if (stranger == -N_ERR_CANCELLED || stranger == -N_ERR_CLOSED) return 0;
+                /* 受ける相手はいない。閉じられたら終わる。 */
+                n_handle stranger = n_inlet_accept(N_SERVICE_HANDLE_CONTROL, 0);
+                if (stranger == -N_ERR_CLOSED) return 0;
                 if (stranger >= 0) n_handle_close(stranger);
                 continue;
             }

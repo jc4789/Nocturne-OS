@@ -3,13 +3,12 @@
    BAR 0 and runs rm_init_rm (RM's CPU, registry and OS objects, all before the GPU is touched),
    then RM must refuse the device and nvrm end with status 1. A crash there (status 128 + the
    CPU exception, e.g. 141 for "mov %cr4" in user mode) is what real hardware hit first.
-   Booted with appdrivers=any so this app may claim; compiled inside Nocturne with tcc. Prints
+   It claims with the N_CAP_PCI_CLAIM capability the test disk gives it; compiled inside Nocturne with tcc. Prints
    "nvrmtest: N failed". */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
-#include "testrun.h"
 
 static int failed;
 #define CHECK(c, ...)                                                                                                  \
@@ -31,8 +30,8 @@ int main(void) {
         return 1;
     }
     struct n_pciinfo *e = &list[at];
-    n_handle pci = test_pci_claim(e->bus, e->dev, e->func);
-    CHECK(pci >= 0, "claim: %s (boot with appdrivers=any)", n_result_text(pci));
+    n_handle pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), e->bus, e->dev, e->func);
+    CHECK(pci >= 0, "claim: %s", n_result_text(pci));
     if (pci < 0) {
         printf("nvrmtest: %d failed\n", failed);
         return 1;
@@ -66,7 +65,7 @@ int main(void) {
     CHECK(got >= 0 && !strstr(text, "rm_init_rm failed"), "rm_init_rm succeeded");
 
     /* the claim ends with nvrm: the device can be claimed again */
-    n_handle again = test_pci_claim(e->bus, e->dev, e->func);
+    n_handle again = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), e->bus, e->dev, e->func);
     CHECK(again >= 0, "claim after nvrm ended: %s", n_result_text(again));
     if (again >= 0) n_handle_close(again);
 

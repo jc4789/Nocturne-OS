@@ -36,6 +36,7 @@
 #include "../vm/vm.h"
 #include "../sys/channel.h"
 #include "dns_name.h"
+#include "sys/authority.h"
 
 static struct mutex net_lock;
 
@@ -2702,6 +2703,7 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_TCP_RECV: return tcp_recv_data((int)a, (uint8_t *)b, c, d, true);
     case SYS_NET_TEST: {
+        if (!identity_at_least(N_CLASS_ADMIN)) return -N_ERR_DENIED; /* 接続を壊す試験の入口 */
         /* a: fault settings for this process's TCP connections (or NULL); b: counters out (or NULL) */
         if (a) {
             struct n_netfault settings;

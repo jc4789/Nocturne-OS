@@ -10,7 +10,7 @@ static void received(webnet *n,uint64_t id,uint64_t generation,const struct webn
     if(slow_callback)clock_ms+=PUMP_TIME_MS;
 }
 static void reset(webnet *n){
-    memset(n,0,sizeof *n);n->worker_limit=WORKERS;n->service_listener=-1;
+    memset(n,0,sizeof *n);n->worker_limit=WORKERS;n->service_inlet=-1;
     for(unsigned i=0;i<WORKERS;i++)n->slots[i].in=n->slots[i].out=-1;
     memset(channels,0,sizeof channels);clock_ms=100;callbacks=chunks=ends=0;resume_immediately=true;slow_callback=false;
     closed_count=killed_count=wait_count=0;

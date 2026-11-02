@@ -4,7 +4,6 @@
 #include "webstorage.h"
 #include "http.h"
 #include "nocturne.h"
-#include "nocturne_services.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -115,7 +114,7 @@ struct webnet {
     unsigned worker_limit;
     unsigned pump_cursor;
     uint64_t budget_at;
-    n_handle service, service_connector;
+    n_handle service, service_inlet; /* webfetch の子と、その受け口へ送る端 */
     /* probe: retirement of paused transports and room to send, checked
        without touching the caller's queue. watch_queue: the queue the
        watched interests below are registered in. */
@@ -396,7 +395,7 @@ static bool sendable(webnet *n, n_handle h) {
 webnet *webnet_create(void) {
     webnet *n = calloc(1, sizeof *n);
     if (n) {
-        n->service = n->service_connector = n->probe = n->watch_queue = -1;
+        n->service = n->service_inlet = n->probe = n->watch_queue = -1;
         n->cookie_watch = n->cookie_queue = -1;
         n->cookies = webcookie_create();
         if (!n->cookies) { free(n); return NULL; }
@@ -426,7 +425,7 @@ void webnet_free(webnet *n) {
     }
     while(n->parked){struct slot *s=n->parked;n->parked=s->next;slot_close(s);request_free(s->rq);free(s);}
     if(n->service>=0){n_app_stop(n->service,0);n_app_result(n->service,N_CLOCK_NEVER,NULL);n_handle_close(n->service);}
-    if(n->service_connector>=0)n_handle_close(n->service_connector);
+    if(n->service_inlet>=0)n_handle_close(n->service_inlet);
     if(n->probe>=0)n_handle_close(n->probe);
     while (n->queue) { struct request *r = n->queue; n->queue = r->next; request_free(r); }
     while(n->sockets){struct wsock *s=n->sockets;n->sockets=s->next;wsock_free(s);}
@@ -744,25 +743,25 @@ static n_result service_start(webnet *n) {
     if(n->service>=0){
         if(n_app_result(n->service,0,NULL)==-N_ERR_NOT_READY)return 0;
         n_handle_close(n->service);n->service=-1;
-        n_handle_close(n->service_connector);n->service_connector=-1;
+        n_handle_close(n->service_inlet);n->service_inlet=-1;
     }
-    /* 接続の口は親と子だけが持つ：別のブラウザーはこのプロセスの cache と安全の区画に入れない。 */
-    n_handle ends[2];
-    n_result r=n_channel_pair(ends);
+    /* 受け口はこの process と子だけが持つ。別のブラウザーはこのキャッシュと安全の区画へ入れない。 */
+    n_handle inlet[2];
+    n_result r=n_channel_pair(inlet);
     if(r<0)return r;
     const char *args[]={"webfetch","--service"};
-    const int32_t handles[]={ends[1]};
+    const int32_t handles[]={inlet[1]};
     struct n_launch launch={.arguments=args,.argument_count=2,.handles=handles,.handle_count=1};
     n_handle app=n_app_launch(N_FOLDER_SYSTEM "\\webfetch",&launch);
-    n_handle_close(ends[1]);
-    if(app<0){n_handle_close(ends[0]);return app;}
-    n->service=app;n->service_connector=ends[0];
+    n_handle_close(inlet[1]);
+    if(app<0){n_handle_close(inlet[0]);return app;}
+    n->service=app;n->service_inlet=inlet[0];
     return 0;
 }
 static bool start(webnet *n,struct slot *s,struct request *r) {
     *s=(struct slot){.rq=r,.channel=-1};
     n_result connected=service_start(n);
-    if(connected>=0)connected=n_connector_connect(n->service_connector,NULL);
+    if(connected>=0)connected=n_inlet_connect(n->service_inlet);
     if(connected>=0){s->channel=(n_handle)connected;s->live=true;return true;}
     r->finishing=true;
     snprintf(r->error,sizeof r->error,"Cannot connect webfetch service: %s",n_result_text(connected));
@@ -841,7 +840,7 @@ uint64_t webnet_socket_open(webnet *n, const struct webnet_request *q, webnet_so
     request_language(language);
     s->tx = wire_request(n, q, id, (n_clock_monotonic() / N_NS_PER_MS) + WEBNET_TIMEOUT_MS, 0, language, &s->tx_len);
     s->tx_cap = s->tx_len;
-    if (!s->cookie_url || !s->cookie_site || !s->tx || (s->channel = n_connector_connect(n->service_connector, NULL)) < 0) { wsock_free(s); return 0; }
+    if (!s->cookie_url || !s->cookie_site || !s->tx || (s->channel = n_inlet_connect(n->service_inlet)) < 0) { wsock_free(s); return 0; }
     s->id = id; s->generation = q->generation; s->callback = cb; s->opaque = opaque;
     struct wsock **tail = &n->sockets;
     while (*tail) tail = &(*tail)->next;

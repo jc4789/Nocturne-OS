@@ -1,4 +1,4 @@
-/* nvrm's request server: clients come through the service's connector (nocturne_services.h), each with an
+/* nvrm's request server: clients connect to the service NVRM_CHANNEL_FORMAT names (include/nvrm_protocol.h), each with an
    argument arena both sides map. Every client is served by a thread of its own, so a request that
    waits on the GPU (a GSP control call, an idle wait, a fence) holds up only its own client; RM
    orders concurrent requests with its own locks (the API lock and the GPU locks), as it does for
@@ -9,7 +9,6 @@
 #include <string.h>
 #include <threads.h>
 #include "nocturne.h"
-#include "nocturne_services.h"
 #include "nvrm_protocol.h"
 #include "nvrm_serve.h"
 #include "display.h"
@@ -20,7 +19,7 @@
 #include "nv_escape.h"
 #include "nv-unix-nvos-params-wrappers.h"
 
-#define CONNECTOR_TOKEN 0
+#define LISTENER_TOKEN 0
 /* A client thread's own event queue */
 #define CHANNEL_TOKEN 0
 #define STOP_TOKEN 1
@@ -288,35 +287,38 @@ static void client_start(n_handle channel) {
     client_end(c);
 }
 
-n_result nvrm_serve(n_handle connector) {
+n_result nvrm_serve(uint32_t pci_target) {
+    if (pci_target > UINT16_MAX) return -N_ERR_INVALID;
     if (mtx_init(&threads_lock, mtx_plain) != thrd_success) return -N_ERR_NO_MEMORY;
     if (cnd_init(&thread_ended) != thrd_success) { mtx_destroy(&threads_lock); return -N_ERR_NO_MEMORY; }
     __atomic_store_n(&serving_ended, 0, __ATOMIC_RELEASE);
+    char name[NVRM_CHANNEL_NAME_BYTES];
+    snprintf(name, sizeof name, NVRM_CHANNEL_FORMAT, (unsigned)pci_target);
+    n_handle listener = n_service_listen(name);
+    if (listener < 0) { cnd_destroy(&thread_ended); mtx_destroy(&threads_lock); return listener; }
     n_handle events = n_events_create();
-    if (events < 0) { cnd_destroy(&thread_ended); mtx_destroy(&threads_lock); return events; }
-    n_result watched = n_events_watch(events, connector, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, CONNECTOR_TOKEN);
+    if (events < 0) { n_handle_close(listener); cnd_destroy(&thread_ended); mtx_destroy(&threads_lock); return events; }
+    n_result watched = n_events_watch(events, listener, N_EVENT_RECEIVABLE, LISTENER_TOKEN);
     if (watched < 0) {
-        n_handle_close(events);
+        n_handle_close(events); n_handle_close(listener);
         cnd_destroy(&thread_ended); mtx_destroy(&threads_lock);
         return watched;
     }
-    printf("nvrm: serving clients\n");
+    printf("nvrm: serving clients on \"%s\"\n", name);
     fflush(stdout);
     n_result ended = 0;
-    while (!ended) {
+    for (;;) {
         struct n_event ev[16];
         n_result n = n_events_wait(events, ev, 16, N_CLOCK_NEVER);
         if (n < 0) { ended = n; break; }
-        for (;;) {
-            n_handle ch = n_connector_accept(connector, NULL, 0);
-            if (ch == -N_ERR_NOT_READY) break;
-            if (ch < 0) { ended = ch; break; }
-            client_start(ch);
-        }
+        n_handle ch;
+        while ((ch = n_inlet_accept(listener, 0)) >= 0) client_start(ch);
+        if (ch != -N_ERR_NOT_READY) { ended = ch; break; } /* サービスの管理者が去った */
     }
     /* RM is about to shut down: no new client, and every client frees what it still holds in RM
        first. A thread in the middle of a request finishes it (RM's own work) before it looks. */
     n_handle_close(events);
+    n_handle_close(listener);
     __atomic_store_n(&serving_ended, 1, __ATOMIC_RELEASE);
     wake_address(&serving_ended, 0);
     mtx_lock(&threads_lock);

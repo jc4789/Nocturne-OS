@@ -31,8 +31,9 @@ int kill(int p){(void)p;return 0;}
 int pipe(int*p){(void)p;return -1;}
 int spawn(const char*p,char*const*a,const int*f,int n){(void)p;(void)a;(void)f;return n==SPAWN_DETACH?500:-1;}
 int open(const char*p,int f,...){(void)p;(void)f;return 7;}
+int n_service_listen(const char*k){(void)k;return 8;}
 int n_service_connect(const char*k){(void)k;return 9;}
-int n_connector_accept(int f,char*a,size_t c){(void)f;(void)a;(void)c;errno=EAGAIN;return -1;}
+int n_inlet_accept(int f,int flags){(void)f;(void)flags;errno=EAGAIN;return -1;}
 int close(int f){(void)f;return 0;}
 ssize_t read(int f,void*p,size_t n){(void)f;(void)p;(void)n;return -1;}
 ssize_t write(int f,const void*p,size_t n){(void)f;(void)p;(void)n;return -1;}

@@ -21,6 +21,7 @@
 #include "gui/screenmode.h"
 #include "mm/heap.h"
 #include "mm/vmalloc.h"
+#include "sys/authority.h"
 
 void acpi_init(void);
 void ahci_init(void);
@@ -62,15 +63,19 @@ void kmain_late(void) {
 
     /* its input, output and log are the console */
     struct handle *con = stream_console_open();
-    struct handle *handles[3] = {con, con, con};
+    /* 根の能力は最初の process だけが受ける。身元はシステム。 */
+    _Static_assert(N_INITIAL_ROOT_HANDLE == 3, "the handles below");
+    struct handle *root = NULL;
+    if (cap_new(N_CAP_ROOT, &root) < 0) kprintf("init: no memory for the root capability\n");
+    struct handle *handles[4] = {con, con, con, root};
     char folder[sizeof "FOLDER=C:\\Users\\" + 255];
     ksnprintf(folder, sizeof folder, "FOLDER=%s", store_user_folder());
     char *argv[] = {INIT_PATH, NULL};
     char *settings[] = {folder, "TERMINAL=0 1 2"};
     struct proc_launch l = {.argc = 1, .argv = argv, .setting_count = 2, .settings = settings,
-                            .handles = handles, .handle_count = 3};
+                            .handles = handles, .handle_count = 4, .identity = identity_kernel};
     int pid = proc_launch(INIT_PATH, &l);
-    if (pid > 0) init_pid = pid;
     if (pid < 0) kprintf("init: failed to start %s (%d)\n", INIT_PATH, pid);
     if (con) handle_close(con);
+    if (root) handle_close(root);
 }
