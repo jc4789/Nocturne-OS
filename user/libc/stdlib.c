@@ -9,6 +9,9 @@
 #include <inttypes.h>
 #include <wchar.h>
 #include <wctype.h>
+#include "locale_private.h"
+
+char __decimal_point = '.'; /* setlocale の LC_NUMERIC */
 
 int abs(int x) { return x < 0 ? -x : x; }
 long labs(long x) { return x < 0 ? -x : x; }
@@ -128,12 +131,12 @@ long double strtold(const char *s, char **end) {
     int digits = 0, exp = 0;
     bool any = false;
     if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X') &&
-        (isxdigit((unsigned char)p[2]) || (p[2] == '.' && isxdigit((unsigned char)p[3])))) {
+        (isxdigit((unsigned char)p[2]) || (p[2] == __decimal_point && isxdigit((unsigned char)p[3])))) {
         p += 2;
         bool dot = false;
         for (;; p++) {
             int d;
-            if (*p == '.' && !dot) {
+            if (*p == __decimal_point && !dot) {
                 dot = true;
                 continue;
             }
@@ -170,7 +173,7 @@ long double strtold(const char *s, char **end) {
     }
     bool dot = false;
     for (;; p++) {
-        if (*p == '.' && !dot) {
+        if (*p == __decimal_point && !dot) {
             dot = true;
             continue;
         }

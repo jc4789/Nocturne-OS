@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <threads.h>
+#include "locale_private.h"
 #include <wchar.h>
 
 static bool is_leap(long long y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
@@ -176,8 +177,10 @@ static int iso_week(const struct tm *tm, long long *year) {
     return week;
 }
 
-/* Every ISO C conversion in the "C" locale. The E and O modifiers select
-   alternative forms that the "C" locale does not have. No time zone is known
+const struct __time_names *__time_names;
+
+/* Every ISO C conversion, in the LC_TIME that setlocale chose (__time_names; NULL is "C"). The E and O
+   modifiers select alternative forms that no locale here has. No time zone is known
    (the clock keeps local time), so %z and %Z give no characters. */
 static void format_time(struct time_text *o, const char *fmt, const struct tm *tm) {
     for (const char *p = fmt; *p; p++) {
@@ -188,17 +191,24 @@ static void format_time(struct time_text *o, const char *fmt, const struct tm *t
         p++;
         if ((*p == 'E' || *p == 'O') && p[1]) p++;
         long long year = tm->tm_year + 1900LL, iso_year;
+        const struct __time_names *t = __time_names;
         switch (*p) {
-        case 'a': put_text(o, name_of(wdays, tm->tm_wday, 7), 3); break;
-        case 'A': put_text(o, name_of(wdays, tm->tm_wday, 7), SIZE_MAX); break;
+        case 'a':
+            if (t) put_text(o, name_of(t->weekday_short, tm->tm_wday, 7), SIZE_MAX);
+            else put_text(o, name_of(wdays, tm->tm_wday, 7), 3);
+            break;
+        case 'A': put_text(o, name_of(t ? t->weekday : wdays, tm->tm_wday, 7), SIZE_MAX); break;
         case 'b':
-        case 'h': put_text(o, name_of(months, tm->tm_mon, 12), 3); break;
-        case 'B': put_text(o, name_of(months, tm->tm_mon, 12), SIZE_MAX); break;
-        case 'c': format_time(o, "%a %b %e %H:%M:%S %Y", tm); break;
+        case 'h':
+            if (t) put_text(o, name_of(t->month_short, tm->tm_mon, 12), SIZE_MAX);
+            else put_text(o, name_of(months, tm->tm_mon, 12), 3);
+            break;
+        case 'B': put_text(o, name_of(t ? t->month : months, tm->tm_mon, 12), SIZE_MAX); break;
+        case 'c': format_time(o, t ? t->date_time : "%a %b %e %H:%M:%S %Y", tm); break;
         case 'C': put_number(o, year / 100, 2, false); break;
         case 'd': put_number(o, tm->tm_mday, 2, false); break;
-        case 'D':
-        case 'x': format_time(o, "%m/%d/%y", tm); break;
+        case 'D': format_time(o, "%m/%d/%y", tm); break;
+        case 'x': format_time(o, t ? t->date : "%m/%d/%y", tm); break;
         case 'e': put_number(o, tm->tm_mday, 2, true); break;
         case 'F': format_time(o, "%Y-%m-%d", tm); break;
         case 'g': iso_week(tm, &iso_year); put_number(o, iso_year % 100 < 0 ? -(iso_year % 100) : iso_year % 100, 2, false); break;
@@ -209,13 +219,16 @@ static void format_time(struct time_text *o, const char *fmt, const struct tm *t
         case 'm': put_number(o, tm->tm_mon + 1, 2, false); break;
         case 'M': put_number(o, tm->tm_min, 2, false); break;
         case 'n': put_text(o, "\n", 1); break;
-        case 'p': put_text(o, tm->tm_hour < 12 ? "AM" : "PM", 2); break;
-        case 'r': format_time(o, "%I:%M:%S %p", tm); break;
+        case 'p':
+            if (t) put_text(o, tm->tm_hour < 12 ? t->am : t->pm, SIZE_MAX);
+            else put_text(o, tm->tm_hour < 12 ? "AM" : "PM", 2);
+            break;
+        case 'r': format_time(o, t ? t->time : "%I:%M:%S %p", tm); break;
         case 'R': format_time(o, "%H:%M", tm); break;
         case 'S': put_number(o, tm->tm_sec, 2, false); break;
         case 't': put_text(o, "\t", 1); break;
-        case 'T':
-        case 'X': format_time(o, "%H:%M:%S", tm); break;
+        case 'T': format_time(o, "%H:%M:%S", tm); break;
+        case 'X': format_time(o, t ? t->time : "%H:%M:%S", tm); break;
         case 'u': put_number(o, tm->tm_wday ? tm->tm_wday : 7, 1, false); break;
         case 'U': put_number(o, (tm->tm_yday + 7 - tm->tm_wday) / 7, 2, false); break;
         case 'V': put_number(o, iso_week(tm, &iso_year), 2, false); break;

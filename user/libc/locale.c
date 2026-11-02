@@ -1,31 +1,9 @@
-#include <locale.h>
 #include <uchar.h>
 #include <wchar.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <limits.h>
 #include <errno.h>
-
-/* Nocturne's one locale, "C" (<locale.h>): numbers, money and times as ISO C
-   defines them for "C", and UTF-8 multibyte characters. */
-
-char *setlocale(int category, const char *locale) {
-    static char name[] = "C";
-    if (category < LC_ALL || category > LC_TIME) return NULL;
-    if (locale && *locale && strcmp(locale, "C") != 0 && strcmp(locale, "C.UTF-8") != 0) return NULL;
-    return name;
-}
-
-struct lconv *localeconv(void) {
-    static char point[] = ".", none[] = "";
-    static struct lconv c = {
-        point, none, none, none, none, none, none, none, none, none,
-        CHAR_MAX, CHAR_MAX, CHAR_MAX, CHAR_MAX, CHAR_MAX, CHAR_MAX, CHAR_MAX,
-        CHAR_MAX, CHAR_MAX, CHAR_MAX, CHAR_MAX, CHAR_MAX, CHAR_MAX, CHAR_MAX,
-    };
-    return &c;
-}
 
 /* UTF-8 as Unicode defines it: the shortest form only, no surrogates, nothing
    above U+10FFFF. A lead byte fixes how many bytes follow and the range the

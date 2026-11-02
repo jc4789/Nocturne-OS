@@ -2,10 +2,11 @@
 #include <stddef.h>
 #include <cdefs.h>
 NOCTURNE_BEGIN_DECLS
-/* ISO C <locale.h>. Nocturne has one locale, "C": its multibyte characters
-   are UTF-8 (MB_CUR_MAX is 4), and it writes numbers, money and times as ISO C
-   defines for "C". setlocale also knows it as "" (the user's locale) and
-   "C.UTF-8", and returns its name "C". */
+/* ISO C <locale.h>. A program starts in "C". setlocale(category, "") selects the user's language and
+   region (nocturne_language.h), by the name of its tag, for that category. "C.UTF-8" is "C". Multibyte
+   characters are UTF-8 in every locale (MB_CUR_MAX is 4). Another language's name is not known: NULL.
+   A selection takes the values of its moment. Asked with NULL, a mix of categories gives the names joined
+   by ';', which setlocale(LC_ALL, ...) takes back. */
 #define LC_ALL 0
 #define LC_COLLATE 1
 #define LC_CTYPE 2

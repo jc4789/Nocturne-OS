@@ -7,4 +7,8 @@
     /* @include js_intl.js */
     /* @include js_segmenter.js */
     /* @include js_collator.js */
+    /* ECMA-402 DefaultLocale: the user's language (settings' N_LANGUAGE_UI). */
+    for (const service of [Intl.NumberFormat, Intl.DateTimeFormat, Intl.PluralRules, Intl.RelativeTimeFormat,
+                           Intl.ListFormat, Intl.DisplayNames, Intl.Segmenter, Intl.Collator])
+        if (service && Object.hasOwn(service, '__defaultLocale')) service.__defaultLocale = host.intlLocale;
 })

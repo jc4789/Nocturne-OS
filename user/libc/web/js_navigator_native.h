@@ -4,6 +4,7 @@
 #include <browser_identity.h>
 #include <quickjs.h>
 #include <webprefs.h>
+#include <nocturne_language.h>
 
 static inline unsigned web_js_hardware_concurrency(void) {
     struct n_cpuinfo info = {0};
@@ -31,4 +32,5 @@ static inline void web_js_navigator_init(JSContext *ctx, JSValueConst host) {
     JS_SetPropertyStr(ctx, host, "platform", JS_NewString(ctx, NOCTURNE_PLATFORM));
     JS_SetPropertyStr(ctx, host, "hardwareConcurrency", JS_NewUint32(ctx, web_js_hardware_concurrency()));
     JS_SetPropertyStr(ctx, host, "languages", JS_NewCFunction(ctx, web_js_native_languages, "languages", 0));
+    JS_SetPropertyStr(ctx, host, "intlLocale", JS_NewString(ctx, n_locale_intl()));
 }

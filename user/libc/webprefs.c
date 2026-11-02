@@ -4,6 +4,7 @@
    二つの錠。io は読みと変更と見張りを一つの順にする。state は今持っているものを守り、どのスレッドの読み手も
    取る。io を先に取り、後では取らない。 */
 #include <webprefs.h>
+#include <nocturne_language.h>
 #include <nocturne_settings.h>
 #include <webcookie.h>
 #include <weburl.h>
@@ -11,7 +12,6 @@
 #include <string.h>
 #include <threads.h>
 
-#define DEFAULT_LANGUAGES WEBPREFS_DEFAULT_LANGUAGES
 #define ACCEPT_MAX WEBPREFS_ACCEPT_LANGUAGE_MAX
 /* What each tag after the first adds to the Accept-Language: a comma and ";q=0.N". */
 #define WEIGHT_BYTES (sizeof ",;q=0.1" - 1)
@@ -205,8 +205,7 @@ struct prefs {
 };
 
 static void prefs_default(struct prefs *p) {
-    memcpy(p->languages, DEFAULT_LANGUAGES, sizeof DEFAULT_LANGUAGES);
-    p->languages_length = sizeof DEFAULT_LANGUAGES - 1;
+    p->languages_length = n_locale_languages(p->languages, sizeof p->languages);
     p->search_history = p->clear_on_close = false;
     p->sites = NULL;
     p->site_count = 0;
@@ -354,8 +353,8 @@ static void languages_read(const char *value, size_t n, struct prefs *p) {
 enum { KEY_LANGUAGES, KEY_SEARCH_HISTORY, KEY_CLEAR_ON_CLOSE, KEY_SITE_EXCEPTIONS };
 static const struct n_setting_decl declarations[] = {
     {.domain = N_DOMAIN_PROGRAM, .key = KEY_LANGUAGES, .type = N_SETTING_STRING, .scope = N_SCOPE_PROGRAM,
-     .apply = N_APPLY_NONE, .max = ACCEPT_MAX, .fallback_text = DEFAULT_LANGUAGES, .name = "browser.languages",
-     .label = "優先する言語", .about = "タグをコンマで区切った一覧です。"},
+     .apply = N_APPLY_NONE, .max = ACCEPT_MAX, .name = "browser.languages",
+     .label = "優先する言語", .about = "タグをコンマで区切った一覧です。空ならシステムの言語に従います。"},
     {.domain = N_DOMAIN_PROGRAM, .key = KEY_SEARCH_HISTORY, .type = N_SETTING_BOOL, .scope = N_SCOPE_PROGRAM,
      .apply = N_APPLY_NONE, .max = 1, .name = "browser.search-history", .label = "検索の履歴",
      .about = "検索の入力を候補のために残します。"},
@@ -376,7 +375,7 @@ static bool declared;
 
 /* state の下。valid と generation は錠なしでも読む。seen：読み手に一覧を渡した。valid：持っているものが settings の
    値で、欠けた見張りが無い。 */
-static struct prefs current = {.languages = DEFAULT_LANGUAGES, .languages_length = sizeof DEFAULT_LANGUAGES - 1};
+static struct prefs current;
 static bool seen, valid;
 static uint64_t generation, site_generation;
 
@@ -437,7 +436,7 @@ static void refresh_locked(void) {
 
 /* queue に見張りを置く（読む前に：その間の変更を落とさない）。io の下。 */
 static n_result watch_open_locked(void) {
-    n_handle w = n_setting_watch(N_DOMAIN_PROGRAM, N_SETTING_ANY);
+    n_handle w = n_setting_watch(N_SETTING_ANY, N_SETTING_ANY);
     if (w == -N_ERR_NOT_FOUND) queue = -1;
     if (w < 0) return w;
     n_result r = n_events_watch(queue, w, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, WEBPREFS_TOKEN);
@@ -463,7 +462,8 @@ static void take_locked(bool closed) {
     if (watch >= 0) {
         struct n_settings_changed change;
         n_result r;
-        while ((r = n_setting_watch_take(watch, &change)) >= 0) any = true;
+        while ((r = n_setting_watch_take(watch, &change)) >= 0)
+            if (change.id.domain == N_DOMAIN_PROGRAM || change.id.domain == N_DOMAIN_LANGUAGE) any = true;
         if (r == -N_ERR_CLOSED) closed = true;
     }
     if (closed && watch >= 0) {
@@ -541,9 +541,10 @@ n_result webprefs_languages(char *out, size_t cap) {
 /* A languages line with a bad value leaves the default too, so this asks what the process holds. */
 bool webprefs_languages_default(void) {
     ensure();
+    char system[sizeof current.languages];
+    size_t n = n_locale_languages(system, sizeof system);
     mtx_lock(&state);
-    bool same = current.languages_length == sizeof DEFAULT_LANGUAGES - 1 &&
-                !memcmp(current.languages, DEFAULT_LANGUAGES, sizeof DEFAULT_LANGUAGES - 1);
+    bool same = current.languages_length == n && !memcmp(current.languages, system, n);
     mtx_unlock(&state);
     return same;
 }
@@ -608,7 +609,7 @@ n_result webprefs_set_languages(const char *const *tags, size_t count) {
     return r < 0 ? r : set_key(KEY_LANGUAGES, l.text, l.length);
 }
 
-n_result webprefs_reset_languages(void) { return set_key(KEY_LANGUAGES, DEFAULT_LANGUAGES, sizeof DEFAULT_LANGUAGES - 1); }
+n_result webprefs_reset_languages(void) { return set_key(KEY_LANGUAGES, "", 0); }
 
 n_result webprefs_set_search_history(bool on) {
     int32_t v = on;
