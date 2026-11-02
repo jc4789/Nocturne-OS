@@ -387,7 +387,7 @@ def state_files(scratch):
     start takes over into each part's own document and then removes (docs/settings-ownership-20261027.md
     §7). The desktop's own document wins over the older one: the pointer's speed starts at 1, not -2.
     The volume is the one the system starts with (tests/audiotest.c expects 80)."""
-    user = "C:\\Users\\User"  # the image's one user (rootfs\\Users\\User)
+    user = "C:\\Users\\Test"  # the test account (tests/testrun.c)
     out = [(user + "\\AppData", "-"), (user + "\\AppData\\Nocturne", "-"), (user + "\\AppData\\Settings", "-")]
     for rel, text in (("Nocturne\\Desktop.conf", "# placed by scripts/test.py\npointer_speed=9\npointer_speed=1\n"),
                       ("Settings\\desktop.conf", "pointer_speed=-2\nvolume=80\nmuted=off\nrefresh=60\n")):

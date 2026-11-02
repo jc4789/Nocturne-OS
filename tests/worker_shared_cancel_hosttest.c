@@ -8,7 +8,7 @@ static bool live_fd[256],connect_during_scan;
 static int pending[128];static unsigned pending_at,pending_count,polls,accepts,reads,writes;
 ssize_t read(int fd,void*p,size_t n){(void)fd;(void)p;(void)n;reads++;errno=EAGAIN;return -1;}
 ssize_t write(int fd,const void*p,size_t n){(void)fd;(void)p;writes++;return n;}
-int n_channel_accept(int fd){(void)fd;if(!pending_count){errno=EAGAIN;return -1;}accepts++;int result=pending[pending_at++];pending_count--;return result;}
+int n_connector_accept(int fd,char*a,size_t c){(void)fd;(void)a;(void)c;if(!pending_count){errno=EAGAIN;return -1;}accepts++;int result=pending[pending_at++];pending_count--;return result;}
 int poll(struct n_pollfd*p,int n,int timeout){(void)timeout;polls++;int ready=0;for(int i=0;i<n;i++){p[i].revents=0;if(p[i].fd==0){if(pending_count)p[i].revents|=N_POLLIN;}else if(p[i].fd>0&&p[i].fd<256&&!live_fd[p[i].fd])p[i].revents|=N_POLLHUP;if(p[i].revents)ready++;}
  if(connect_during_scan&&n&&p[0].fd!=0){connect_during_scan=false;pending[0]=100;pending_at=0;pending_count=1;live_fd[100]=true;}return ready;
 }

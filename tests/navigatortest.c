@@ -1,8 +1,9 @@
 /* Real web_live + actual cookie jar + isolated Worker process. Offline API
  * acceptance only; this is never evidence that an external website renders.
- * The browser's preferences are a test user's (USERFOLDER is a folder of its
+ * The browser's preferences are a test user's (an account of its
  * own under TEMP), never the real user's. */
 #include <nocturne.h>
+#include "testrun.h"
 #include <web.h>
 #include <webcookie.h>
 #include <webprefs.h>
@@ -165,15 +166,13 @@ static void run_languages(void){
     if(f.errors||f.checks!=expected_checks){printf("FAIL languagechange completion checks=%d expected=%d errors=%d\n",f.checks,expected_checks,f.errors);f.failed++;}
     checks+=f.checks;failures+=f.failed;web_free(doc);
 }
-/* The test runs again as an app launched with the test user's folder as its USERFOLDER (the
-   launch setting is how an app gets one), with this one's input and output. */
-static int run_as_test_user(const char *self,const char *user){
-    char path[1024],setting[1100];
+/* この試験は試験の利用者の身元で起こし直す。入出力はこのプロセスのもの。 */
+static int run_as_test_user(const char *self,const struct n_account *user){
+    char path[1024];
     if(n_path_complete(self,path,sizeof path)<0)return -1;
-    snprintf(setting,sizeof setting,"USERFOLDER=%s",user);
-    const char *args[]={self},*settings[]={setting};int32_t handles[3]={0,1,2};
-    struct n_launch l={.arguments=args,.settings=settings,.handles=handles,.argument_count=1,.setting_count=1,.handle_count=3};
-    n_handle app=n_app_launch(path,&l);int status=1;
+    const char *args[]={self};int32_t handles[3]={0,1,2};
+    struct n_launch l={.arguments=args,.handles=handles,.argument_count=1,.handle_count=3};
+    n_handle app=test_launch_as(user,path,&l);int status=1;
     if(app<0||n_app_result(app,-1,&status)<0)return -1;
     n_handle_close(app);return status;
 }
@@ -181,15 +180,13 @@ int main(int argc,char **argv){
     struct n_cpuinfo info={0};
     if(cpu_info(&info)<0||info.version!=1||!info.scheduler_cpus||info.scheduler_cpus>info.online_cpus){puts("FAIL actual scheduler metadata");return 1;}
     printf("Navigator native identity=%s scheduler=%u online=%u detected=%u\n",NOCTURNE_USER_AGENT,info.scheduler_cpus,info.online_cpus,info.detected_cpus);
-    /* A test user's folder, before anything reads the browser's profile folder (it is kept for
-       the process): the preferences this test writes are never the real user's. */
-    /* TEMP is emptied at every start, and the language test puts the default back at its end. */
-    char user[1024];n_result made=n_path_join(n_temp_folder(),"NavigatorTestUser",user,sizeof user);
-    if(made>=0&&(made=n_folder_create(user))==-N_ERR_EXISTS)made=0;
-    if(made<0){puts("FAIL test user folder");return 1;}
-    if(strcmp(n_user_folder(),user)){
-        int status=argc>0?run_as_test_user(argv[0],user):-1;
-        if(status<0)puts("FAIL test user folder");
+    /* 試験の利用者。ブラウザーの profile のフォルダーを読む前に（プロセスの間は保持される）。
+       この試験が書く設定は本物の利用者のものにならない。言語の試験は終わりに既定へ戻す。 */
+    struct n_account user;
+    if(test_account("NavigatorTestUser",&user)<0){puts("FAIL test user");return 1;}
+    if(strcmp(n_user_folder(),user.folder)){
+        int status=argc>0?run_as_test_user(argv[0],&user):-1;
+        if(status<0)puts("FAIL test user");
         return status<0?1:status;
     }
     /* navigator.languages is the list the browser's preferences hold (tags and commas only). */

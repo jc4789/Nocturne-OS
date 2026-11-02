@@ -101,11 +101,11 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     `Agent`、`Firmware` 等。`C:\Nocturne\Temp` はカーネルだけが使う（差し替え中の内容）。
   - `C:\Programs`：アプリ（`N_FOLDER_PROGRAMS`）。アプリごとに一つのフォルダー。利用者は
     アプリを入れられる。システムと一緒に入るアプリのフォルダーは SYSTEM。
-  - `C:\Users\<名前>`：利用者のフォルダー（設定 `USERFOLDER`、`n_user_folder()`）。アプリは
+  - `C:\Users\<名前>`：利用者のフォルダー（`n_user_folder()`、身元から `accounts` が引く。§13）。アプリは
     ここで始まる。`Desktop`、`Documents`、`Downloads`、`Music`、`Pictures`、`Videos`、
     `AppData`。アプリのデータは `n_app_data_folder(name, out, cap)` が作って返す
-    `AppData\<name>`。`AppData\Temp` は一時フォルダー（設定 `TEMP`、`n_temp_folder()`）で、
-    起動のたびに空になる。
+    `AppData\<name>`。`AppData\Temp` は一時フォルダー（`n_temp_folder()`）で、
+    ログインのたびに空になる。
 - 丸ごとの操作（通常の用途）：
   - `n_document_load(path, void **data, size_t *size)`：内容を新しい `n_memory` ページで
     受け取る。`n_memory_release(*data, *size)` で返す。
@@ -275,9 +275,8 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     それ以外の名前は `n_path_complete` で完全指定にする。
   - 起動されたアプリは作業フォルダーを持たない。利用者の名前を受け取るアプリのために、
     起動元は自分の現在のフォルダーを設定 `FOLDER=C:\…` で渡す（§3の `n_path_complete`）。
-    子アプリは起動元と同じ利用者のために働く：libc の `n_app_launch` は、起動が名指さなければ
-    起動元自身の `USERFOLDER` と `TEMP` を渡す（ブラウザーの窓と、その Worker・保存・設定の窓が
-    同じ profile を使う）。どちらも無い起動には、カーネルがシステムの利用者のものを加える。
+    子アプリは起動元の身元を継ぐ（§13）。ブラウザーの窓と、その Worker・保存・設定の窓は同じ利用者の
+    同じ profile を使う。
 - 終了はアプリハンドルのイベント（§6）で届く。`n_app_result(h, deadline, int *status)` で
   直接待つこともできる（期限は §8。呼出しの時点で過ぎた期限は待たずに `N_ERR_NOT_READY`、
   待って期限が来れば `N_ERR_TIMEOUT`）。最後のハンドルを閉じれば記録は消える。
@@ -496,8 +495,8 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - システムログ：`n_system_log(buf, cap)` か `n_system_log_open()` のハンドルの
   `n_channel_receive` で読み、そのハンドルへ `n_channel_send` で書く（§4）。
 - アプリの中の装置ドライバー（例：NVIDIA の資源管理 `C:\Nocturne\System\nvrm`、`docs/nvidia/LEDGER.md`）：
-  - `n_pci_claim(bus, dev, func)` は PCI 機能を動かす権利（`N_KIND_PCI`）を返す。呼べるのは
-    init だけで、init は起動するドライバーアプリへハンドルを渡す。カーネルのドライバーが使う
+  - `n_pci_claim(cap, bus, dev, func)` は PCI 機能を動かす権利（`N_KIND_PCI`）を返す。`cap` は
+    `N_CAP_PCI_CLAIM`（§13）で、サービスの管理者が宣言のあるドライバーアプリにだけ渡す。カーネルのドライバーが使う
     機能と、既に権利のある機能は `N_ERR_BUSY`。同じ group の機能をカーネルのドライバーが使って
     いても、それが手放せるもの（`struct iommu_guest`：GPU の音の機能）なら、その機能は止まり、
     権利ができた後に domain の中で動き直す。権利が終わると、次の権利まで止まったまま。
