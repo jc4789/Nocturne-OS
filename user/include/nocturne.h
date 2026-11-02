@@ -309,6 +309,8 @@ n_result n_settings_apply(n_handle cap, uint32_t domain, uint32_t key, const voi
 n_result n_settings_effective(uint32_t domain, uint32_t key, void *out, size_t cap);
 n_result n_settings_describe(uint32_t domain, uint32_t key, struct n_setting_desc *out);
 n_handle n_settings_watch(uint32_t domain);
+/* 名前の木の外の私的な領域（enum n_private_region）の文書。user 0 は機械。access は n_document_open と同じ。 */
+n_handle n_store_private_open(n_handle cap, uint32_t region, uint32_t user, int access);
 /* A watch on what n_audio_output reports: the volume, muting and what plays the sound. */
 n_handle n_audio_output_watch(void);
 /* Watches (N_KIND_WATCH, docs/nocturne-native-abi.md §1): N_EVENT_RECEIVABLE once what the watch

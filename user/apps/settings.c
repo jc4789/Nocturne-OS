@@ -643,7 +643,7 @@ static void page_open(enum page p) {
     if (p == P_SERVICES) services_load();
     if (p == P_USERS) accounts_load();
     if (p == P_DISPLAY) screen_read();
-    if (p == P_AUDIO) n_audio_output(&sound, 0);
+    if (p == P_AUDIO) n_audio_output(&sound);
 }
 
 static void set_number(struct shown *s, int32_t v) {
@@ -804,7 +804,7 @@ int main(void) {
                 break;
             case TOKEN_SOUND:
                 n_watch_take(sound_watch);
-                n_audio_output(&sound, 0);
+                n_audio_output(&sound);
                 redraw = true;
                 break;
             case TOKEN_SERVICES: {

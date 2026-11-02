@@ -53,9 +53,6 @@ param(
     [switch]$NoStart,
     [switch]$NoNetwork,
     [string]$Switch = "Default Switch",
-    [string]$ApiKeyFile,
-    [string]$Endpoint = "https://hyper.charm.land/v1",
-    [string]$Model = "glm-5.3-flash",
     [switch]$DeleteDisk
 )
 

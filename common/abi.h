@@ -162,9 +162,6 @@ enum {
     SYS_CAP_FIND,             /* (enum n_cap) -> その能力を持つ自分の handle */
     SYS_SESSION_IDENTITY,     /* (N_CAP_IDENTITY_GRANT の cap, const struct n_identity *):
                                  カーネルの窓の系が起こすアプリの身元 */
-    SYS_SETTINGS_EFFECTIVE,   /* (domain, key, out, cap): 今の値のバイト数（§12） */
-    SYS_SETTINGS_DESCRIBE,    /* (domain, key, struct n_setting_desc *out)（§12） */
-    SYS_SETTINGS_WATCH,       /* (domain): その領域の今の値の watch（§12） */
     SYS_MAX                   /* above every number (what syscallfuzz tries) */
 };
 

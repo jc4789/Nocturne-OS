@@ -18,6 +18,9 @@
 #include "settings_abi.h"
 #include "settings_table.h"
 
+/* 試しの間は「戻す先」も保存の版に入る。適用より先に media へ届くので、試しの最中に settings が
+   落ちても、起き直した settings が前の値へ戻す。 */
+
 #define NS_PER_MS 1000000ull
 #define APPLY_ANSWER_MS 5000u     /* ユーザー空間の持ち主が答える期限 */
 #define TRIAL_MS_MOST 120000u     /* 試しの期限の上限 */
@@ -73,6 +76,8 @@ struct change {
     struct n_setting_id id;
     struct bytes wanted, before;
     uint32_t trial_ms;
+    bool new_trial;          /* この変更が試しを始めた */
+    uint64_t trial_deadline; /* 続きの試しの、答えを待つ間止めた期限 */
     struct conn *owner;
     uint32_t apply_serial;
     uint64_t deadline;
@@ -297,7 +302,8 @@ struct version {
     uint32_t magic, format;
     uint64_t generation;
     uint64_t offset, capacity, length;
-    uint32_t count;
+    uint32_t count;       /* 値の数 */
+    uint32_t trial_count; /* 値の後に続く「戻す先」の数 */
     uint32_t body_crc;
     uint32_t check; /* この欄の前までの CRC */
 };
@@ -308,6 +314,9 @@ struct record {
 };
 static struct version versions[2];
 static int newest = -1;
+/* 前の命の試しの戻す先。起動の時に当てて捨てる。 */
+static struct value *left_trials;
+static uint32_t left_trial_count;
 
 static uint32_t crc32_of(const void *data, size_t n) {
     const uint8_t *p = data;
@@ -342,56 +351,68 @@ static n_result store_write(uint64_t offset, const void *data, size_t n) {
     return 0;
 }
 
+static void value_list_free(struct value *list, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) free(list[i].bytes);
+    free(list);
+}
+/* body の at から count 個の記録を新しい表にする。sorted は id の順を確かめる。 */
+static bool records_load(const uint8_t *body, size_t length, size_t *at, uint32_t count, bool sorted, struct value **out) {
+    struct value *list = count ? calloc(count, sizeof *list) : NULL;
+    if (count && !list) return false;
+    for (uint32_t i = 0; i < count; i++) {
+        struct record r;
+        bool good = length - *at >= sizeof r;
+        if (good) {
+            memcpy(&r, body + *at, sizeof r);
+            *at += sizeof r;
+        }
+        size_t padded = good ? ((size_t)r.length + 7) & ~(size_t)7 : 0;
+        good = good && r.length <= N_SETTING_VALUE_MAX && length - *at >= padded &&
+               (list[i].bytes = malloc(r.length ? r.length : 1)) != NULL;
+        if (good) {
+            list[i].id = r.id;
+            list[i].length = r.length;
+            memcpy(list[i].bytes, body + *at, r.length);
+            *at += padded;
+            good = !sorted || !i || id_compare(&list[i - 1].id, &list[i].id) < 0;
+        }
+        if (!good) {
+            value_list_free(list, count);
+            return false;
+        }
+    }
+    *out = list;
+    return true;
+}
+
 /* 本体を値の表にする。すべて確かめてから入れ替える。 */
 static bool body_load(const struct version *v) {
     uint8_t *body = malloc(v->length ? v->length : 1);
     if (!body) return false;
-    bool good = store_read(v->offset, body, v->length) >= 0 && crc32_of(body, v->length) == v->body_crc;
-    struct value *list = NULL;
-    uint32_t made = 0;
-    if (good && v->count) {
-        list = calloc(v->count, sizeof *list);
-        good = list != NULL;
-    }
     size_t at = 0;
-    for (uint32_t i = 0; good && i < v->count; i++) {
-        struct record r;
-        if (v->length - at < sizeof r) {
-            good = false;
-            break;
-        }
-        memcpy(&r, body + at, sizeof r);
-        at += sizeof r;
-        size_t padded = ((size_t)r.length + 7) & ~(size_t)7;
-        if (r.length > N_SETTING_VALUE_MAX || v->length - at < padded || (list[i].bytes = malloc(r.length ? r.length : 1)) == NULL) {
-            good = false;
-            break;
-        }
-        list[i].id = r.id;
-        list[i].length = r.length;
-        memcpy(list[i].bytes, body + at, r.length);
-        at += padded;
-        made++;
-        if (i && id_compare(&list[i - 1].id, &list[i].id) >= 0) good = false; /* 表の順が崩れている */
+    struct value *list = NULL, *left = NULL;
+    bool good = store_read(v->offset, body, v->length) >= 0 && crc32_of(body, v->length) == v->body_crc &&
+                records_load(body, v->length, &at, v->count, true, &list);
+    if (good && !records_load(body, v->length, &at, v->trial_count, false, &left)) {
+        value_list_free(list, v->count);
+        good = false;
     }
     free(body);
-    if (!good) {
-        for (uint32_t i = 0; i < made; i++) free(list[i].bytes);
-        free(list);
-        return false;
-    }
+    if (!good) return false;
     values = list;
     value_count = value_capacity = v->count;
+    left_trials = left;
+    left_trial_count = v->trial_count;
     return true;
 }
 
 static void store_load(void) {
-    n_result r = store_cap >= 0 ? __syscall(SYS_STORE_PRIVATE_OPEN, store_cap, N_REGION_SETTINGS, 0, 0, 0) : -N_ERR_DENIED;
+    n_handle r = store_cap >= 0 ? n_store_private_open(store_cap, N_REGION_SETTINGS, 0, N_DOCUMENT_EDIT) : -N_ERR_DENIED;
     if (r < 0) {
         say("cannot open the store", r);
         return;
     }
-    store = (n_handle)r;
+    store = r;
     bool ok[2];
     for (int i = 0; i < 2; i++)
         ok[i] = store_read((uint64_t)i * VERSION_SLOT, &versions[i], sizeof versions[i]) >= 0 && version_valid(&versions[i]);
@@ -409,25 +430,31 @@ static void store_load(void) {
     memset(versions, 0, sizeof versions);
 }
 
+static size_t record_put(uint8_t *at, const struct n_setting_id *id, const void *data, uint32_t length) {
+    struct record r = {.id = *id, .length = length};
+    memcpy(at, &r, sizeof r);
+    if (length) memcpy(at + sizeof r, data, length);
+    return sizeof r + (((size_t)length + 7) & ~(size_t)7);
+}
+
 /* 全部を次の版として書く。0 か、保存の答え。 */
 static n_result store_save(void) {
     if (store < 0) return -N_ERR_NOT_READY;
     size_t need = 0;
+    uint32_t trial_count = 0;
     for (size_t i = 0; i < value_count; i++) need += sizeof(struct record) + (((size_t)values[i].length + 7) & ~(size_t)7);
+    for (const struct trial *t = trials; t; t = t->next, trial_count++)
+        need += sizeof(struct record) + (((size_t)t->before.length + 7) & ~(size_t)7);
     uint8_t *body = calloc(1, need ? need : 1);
     if (!body) return -N_ERR_NO_MEMORY;
     size_t at = 0;
-    for (size_t i = 0; i < value_count; i++) {
-        struct record r = {.id = values[i].id, .length = values[i].length};
-        memcpy(body + at, &r, sizeof r);
-        at += sizeof r;
-        if (values[i].length) memcpy(body + at, values[i].bytes, values[i].length);
-        at += ((size_t)values[i].length + 7) & ~(size_t)7;
-    }
+    for (size_t i = 0; i < value_count; i++) at += record_put(body + at, &values[i].id, values[i].bytes, values[i].length);
+    for (const struct trial *t = trials; t; t = t->next) at += record_put(body + at, &t->id, t->before.data, t->before.length);
     int old = newest < 0 ? 0 : !newest;
     const struct version *now = newest < 0 ? NULL : &versions[newest];
     struct version next = {.magic = VERSION_MAGIC, .format = VERSION_FORMAT,
-                           .generation = (now ? now->generation : 0) + 1, .length = need, .count = (uint32_t)value_count};
+                           .generation = (now ? now->generation : 0) + 1, .length = need, .count = (uint32_t)value_count,
+                           .trial_count = trial_count};
     /* 古い版の場所に入ればそこへ。入らなければ全部の後へ、余裕を持たせて。今の版の場所には触れない。 */
     const struct version *free_place = &versions[old];
     if (free_place->magic == VERSION_MAGIC && free_place->capacity >= need) {
@@ -600,7 +627,7 @@ static uint32_t value_check(const struct known *k, const void *data, uint32_t le
 static n_result apply_start(struct known *k, const struct n_setting_id *id, const void *data, uint32_t length, uint32_t serial) {
     if (k->d.apply == N_APPLY_NONE) return 0;
     if (k->d.scope == N_SCOPE_USER && id->user != active_user) return 0; /* 前面に来たときに当てる */
-    if (k->kernel) return __syscall(SYS_SETTINGS_APPLY, apply_cap, k->d.domain, k->d.key, (long)data, length);
+    if (k->kernel) return n_settings_apply(apply_cap, k->d.domain, k->d.key, data, length);
     if (!k->owner) return -N_ERR_NOT_FOUND;
     struct n_settings_request m = {.op = N_SETTINGS_APPLY, .serial = serial, .length = length, .id = *id};
     conn_queue(k->owner, &m, sizeof m, data, length);
@@ -623,6 +650,19 @@ static void trial_free(struct trial *t) {
     free(t);
 }
 
+/* 試しが終わった。保存の版から戻す先を消す。書けなければ次の保存まで残り、落ちても確定の値へ戻るだけ。 */
+static void trial_forgotten(void) {
+    n_result r = store_save();
+    if (r < 0) say("cannot take the trial out of the store", r);
+}
+/* 試しの終わり：前の値へ戻す。 */
+static void trial_back(struct trial *t) {
+    apply_start(t->known, &t->id, t->before.data, t->before.length, 0);
+    notify(t->known, &t->id, N_SETTING_REVERTED, 0);
+    trial_free(t);
+    trial_forgotten();
+}
+
 /* 値を保存する。失敗すれば表を元へ戻す。 */
 static n_result store_value(const struct n_setting_id *id, const void *data, uint32_t length, const struct bytes *before,
                             bool had_before) {
@@ -640,6 +680,13 @@ static void change_finish(struct change *ch, n_result applied) {
     struct known *k = ch->known;
     if (applied < 0) {
         uint32_t reason = applied == -N_ERR_TIMEOUT || applied == -N_ERR_NOT_FOUND ? N_SETTING_APPLY_GONE : N_SETTING_APPLY_REFUSED;
+        struct trial *t = ch->op == N_SETTINGS_TRY ? trial_find(&ch->id) : NULL;
+        if (t && ch->new_trial) {
+            trial_free(t);
+            trial_forgotten();
+        } else if (t) {
+            t->deadline = ch->trial_deadline;
+        }
         reply(ch->client, ch->op, ch->serial, applied, reason, 0, NULL, 0);
         change_free(ch);
         return;
@@ -656,24 +703,14 @@ static void change_finish(struct change *ch, n_result applied) {
         }
     } else { /* N_SETTINGS_TRY */
         struct trial *t = trial_find(&ch->id);
-        if (!t) {
-            t = calloc(1, sizeof *t);
-            if (!t || !bytes_set(&t->before, ch->before.data, ch->before.length)) {
-                free(t);
-                apply_start(k, &ch->id, ch->before.data, ch->before.length, 0);
-                reply(ch->client, ch->op, ch->serial, -N_ERR_NO_MEMORY, N_SETTING_APPLY_REFUSED, 0, NULL, 0);
-                change_free(ch);
-                return;
-            }
-            t->known = k;
-            t->id = ch->id;
-            t->next = trials;
-            trials = t;
+        if (!bytes_set(&t->wanted, ch->wanted.data, ch->wanted.length)) {
+            trial_back(t);
+            reply(ch->client, ch->op, ch->serial, -N_ERR_NO_MEMORY, N_SETTING_APPLY_REFUSED, 0, NULL, 0);
+        } else {
+            t->deadline = n_clock_monotonic() + ch->trial_ms * NS_PER_MS;
+            reply(ch->client, ch->op, ch->serial, 0, N_SETTING_OK, ch->trial_ms, NULL, 0);
+            notify(k, &ch->id, N_SETTING_ON_TRIAL, ch->trial_ms);
         }
-        bytes_set(&t->wanted, ch->wanted.data, ch->wanted.length);
-        t->deadline = n_clock_monotonic() + ch->trial_ms * NS_PER_MS;
-        reply(ch->client, ch->op, ch->serial, 0, N_SETTING_OK, ch->trial_ms, NULL, 0);
-        notify(k, &ch->id, N_SETTING_ON_TRIAL, ch->trial_ms);
     }
     change_free(ch);
 }
@@ -698,7 +735,7 @@ static void change_begin(struct conn *c, uint32_t op, uint32_t serial, struct kn
     ch->known = k;
     ch->id = *id;
     ch->trial_ms = trial_ms;
-    const struct trial *on = trial_find(id);
+    struct trial *on = trial_find(id);
     const struct value *v = value_find(id);
     bool kept = true;
     if (on) kept = bytes_set(&ch->before, on->before.data, on->before.length);
@@ -713,6 +750,33 @@ static void change_begin(struct conn *c, uint32_t op, uint32_t serial, struct kn
         change_free(ch);
         return;
     }
+    if (op == N_SETTINGS_TRY && on) {
+        ch->trial_deadline = on->deadline;
+        on->deadline = N_CLOCK_NEVER;
+    } else if (op == N_SETTINGS_TRY) {
+        struct trial *t = calloc(1, sizeof *t);
+        if (!t || !bytes_set(&t->before, ch->before.data, ch->before.length) ||
+            !bytes_set(&t->wanted, ch->before.data, ch->before.length)) {
+            if (t) bytes_free(&t->before);
+            free(t);
+            reply(c, op, serial, -N_ERR_NO_MEMORY, N_SETTING_APPLY_REFUSED, 0, NULL, 0);
+            change_free(ch);
+            return;
+        }
+        t->known = k;
+        t->id = *id;
+        t->deadline = N_CLOCK_NEVER;
+        t->next = trials;
+        trials = t;
+        n_result saved = store_save();
+        if (saved < 0) {
+            trial_free(t);
+            reply(c, op, serial, saved, N_SETTING_SAVE_FAILED, 0, NULL, 0);
+            change_free(ch);
+            return;
+        }
+        ch->new_trial = true;
+    }
     uint32_t apply_serial = next_apply_serial++;
     if (!next_apply_serial) next_apply_serial = 1;
     n_result r = apply_start(k, id, data, length, apply_serial);
@@ -725,13 +789,6 @@ static void change_begin(struct conn *c, uint32_t op, uint32_t serial, struct kn
         return;
     }
     change_finish(ch, r);
-}
-
-/* 試しの終わり：前の値へ戻す。 */
-static void trial_back(struct trial *t) {
-    apply_start(t->known, &t->id, t->before.data, t->before.length, 0);
-    notify(t->known, &t->id, N_SETTING_REVERTED, 0);
-    trial_free(t);
 }
 
 /* ---- 文の処理 ---- */
@@ -751,7 +808,7 @@ static const void *current_bytes(const struct known *k, const struct n_setting_i
     /* カーネルの鍵は今の値。一覧の鍵は装置ごとの選択が無ければ既定（全部 0）。 */
     if (k->kernel && k->d.type != N_SETTING_MONITOR_MODE) {
         uint32_t size = fixed_size(k->d.type);
-        n_result r = __syscall(SYS_SETTINGS_EFFECTIVE, k->d.domain, k->d.key, (long)scratch, SCRATCH_BYTES, 0);
+        n_result r = n_settings_effective(k->d.domain, k->d.key, scratch, SCRATCH_BYTES);
         if (r >= 0 && (uint32_t)r == size) {
             *length = size;
             return scratch;
@@ -842,6 +899,22 @@ static void apply_machine_values(void) {
         n_result r = apply_start(k, &v->id, v->bytes, v->length, 0);
         if (r < 0) say("a kept setting was refused", r);
     }
+}
+
+/* 前の命が試しの最中に落ちた：確定の値を当てた後で、保存された戻す先へ戻し、版から消す。 */
+static void left_trials_back(void) {
+    if (!left_trial_count) return;
+    for (uint32_t i = 0; i < left_trial_count; i++) {
+        const struct value *v = &left_trials[i];
+        struct known *k = known_find(v->id.domain, v->id.key, 0);
+        if (!k) continue;
+        n_result r = apply_start(k, &v->id, v->bytes, v->length, 0);
+        if (r < 0) say("a trial left by the last run could not go back", r);
+    }
+    value_list_free(left_trials, left_trial_count);
+    left_trials = NULL;
+    left_trial_count = 0;
+    trial_forgotten();
 }
 
 static void on_request(struct conn *c, const struct n_settings_request *m, size_t size) {
@@ -935,8 +1008,16 @@ static void on_request(struct conn *c, const struct n_settings_request *m, size_
             reply(c, m->op, m->serial, -N_ERR_NO_MEMORY, N_SETTING_SAVE_FAILED, 0, NULL, 0);
             return;
         }
+        /* 値と戻す先の消去は一つの版。 */
+        for (struct trial **p = &trials; *p; p = &(*p)->next)
+            if (*p == t) {
+                *p = t->next;
+                break;
+            }
         n_result saved = store_value(&id, t->wanted.data, t->wanted.length, &before, had);
         bytes_free(&before);
+        t->next = trials;
+        trials = t;
         if (saved < 0) {
             trial_back(t);
             reply(c, m->op, m->serial, saved, N_SETTING_SAVE_FAILED, 0, NULL, 0);
@@ -1062,7 +1143,7 @@ static void kernel_domain_changed(uint32_t domain) {
             id.user = active_user;
         }
         if (trial_find(&id) || change_pending(&id)) continue;
-        n_result r = __syscall(SYS_SETTINGS_EFFECTIVE, domain, k->d.key, (long)now, sizeof now, 0);
+        n_result r = n_settings_effective(domain, k->d.key, now, sizeof now);
         uint32_t size = fixed_size(k->d.type);
         if (r < 0 || (uint32_t)r != size) continue;
         const struct value *v = value_find(&id);
@@ -1132,10 +1213,11 @@ int main(void) {
     }
     store_load();
     for (uint32_t domain = 0; domain < N_DOMAIN_COUNT; domain++) {
-        kernel_watch[domain] = (n_handle)__syscall(SYS_SETTINGS_WATCH, domain, 0, 0, 0, 0);
+        kernel_watch[domain] = n_settings_watch(domain);
         if (kernel_watch[domain] >= 0) n_events_watch(queue, kernel_watch[domain], N_EVENT_RECEIVABLE, TOKEN_WATCH_BASE + domain);
     }
     apply_machine_values();
+    left_trials_back();
     /* 値を読み終え、カーネルへ適用した後で名前を持つ。名前があることが準備の済んだ証拠。 */
     inlet = n_service_listen(N_SETTINGS_SERVICE);
     if (inlet < 0 || n_events_watch(queue, inlet, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, TOKEN_INLET) < 0) return 1;

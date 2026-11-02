@@ -42,6 +42,8 @@
 |---|---|
 | `abi.h` | syscall の番号 `SYS_*` と結果 `N_ERR_*`。仕様は `docs/nocturne-native-abi.md`。 |
 | `authority_abi.h` | 身元 `struct n_identity`、能力 `enum n_cap`、サービスの要求の形。 |
+| `settings_abi.h` | 領域と鍵の番号、値の型、起動の記録、設定のサービスの宣言と channel の文。 |
+| `services_abi.h` | サービスの管理者、利用者、セッションの口の型。 |
 | `display_abi.h`・`gpu_abi.h` | 画面と GPU の ABI。 |
 | `store_format.h`・`store/` | C: の store の書式とエンジン（`catalog` の B+ 木、`namespace`、`space`、`volume`）。カーネルと `host/store` の両方が組む。 |
 | `edid.h`・`gfx.c`・`unifont.bin` | EDID、描画の部品、Unifont。 |
@@ -54,6 +56,9 @@
 | `libc/web/` | ブラウザーのエンジン。下の「ブラウザーの流れ」を見る。 |
 | `include/` | 公開の header（`nocturne.h`、`web.h`、`weburl.h`、`ui.h` など）。SDK にも入る。 |
 | `apps/` | システムのプログラム。ブラウザー（`browser*.c`）、`init.c`、`sh.c`、`uihost.c`、`webfetch.c`、`agent.c`、小さな道具とゲーム、TypeScript のアプリ（`*.ts`）。 |
+| `apps/settingsd.c`・`settings_table.h` | サービス `settings`：選択の保存、宣言の表、型と範囲と権限の確かめ、見張り、期限つきの試し。領域の意味を持たない。 |
+| `apps/settings.c` | 設定の窓。宣言の表から頁を組む。音、画面、窓、入力、電源、網、時刻、サービス、利用者。 |
+| `libc/settings.c`・`include/nocturne_settings.h` | 設定の口 `n_setting_*`。プログラムの設定は `N_SCOPE_PROGRAM` の鍵（`libc/webprefs.c`、`apps/agent.c`）。 |
 
 ## その他
 

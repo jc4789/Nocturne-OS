@@ -567,6 +567,9 @@ n_result n_settings_describe(uint32_t domain, uint32_t key, struct n_setting_des
     return NC5(SYS_SETTINGS_DESCRIBE, domain, key, out, 0, 0);
 }
 n_handle n_settings_watch(uint32_t domain) { return (n_handle)NC5(SYS_SETTINGS_WATCH, domain, 0, 0, 0, 0); }
+n_handle n_store_private_open(n_handle cap, uint32_t region, uint32_t user, int access) {
+    return (n_handle)NC5(SYS_STORE_PRIVATE_OPEN, cap, region, user, access, 0);
+}
 n_result n_entry_set_owner(const char *path, uint32_t user) { return NC5(SYS_ENTRY_SET_OWNER, path, user, 0, 0, 0); }
 n_handle n_audio_output_watch(void) { return (n_handle)NC5(SYS_AUDIO_OUTPUT_WATCH, 0, 0, 0, 0, 0); }
 n_result n_watch_take(n_handle watch) { return NC5(SYS_WATCH_TAKE, watch, 0, 0, 0, 0); }

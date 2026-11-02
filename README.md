@@ -234,7 +234,6 @@ RDP サーバーにつながり、デスクトップは選んだ大きさにな�
 | `hyperv.ps1 -NoNetwork` | ネットワークアダプターなしで作ります。 |
 | `hyperv.ps1 -Switch "名前"` | 別の仮想スイッチにつなぎます。 |
 | `hyperv.ps1 -Name Foo -MemoryMB 4096` | VM の名前とメモリーを変えます。 |
-| `hyperv.ps1 -Update -ApiKeyFile KEYFILE` | AI エージェントの API キーを VM のディスクの C: へ書きます（`-Endpoint`、`-Model` も指定可）。 |
 
 手で第 2 世代の VM を作るなら、セキュアブートを切って `build\nocturne.vhdx` を SCSI ディスクとしてつなぎ、
 拡張セッションには `Set-VM -EnhancedSessionTransportType HvSocket` を設定します。第 1 世代の VM では起動しません
@@ -622,21 +621,15 @@ agent write a tetris clone in C:\Users\User\Documents\tetris and install it as C
 agent -r                                # 前回の続き
 ```
 
-モデルへの指示は `C:\Nocturne\Agent\system.md` です。設定（`agent.conf`）、会話（`session.json`）、
-エージェントのメモ（`NOTES.md`）はユーザーのフォルダーの `AppData\Agent` にあります。
+モデルへの指示は `C:\Nocturne\Agent\system.md` です。会話（`session.json`）とエージェントのメモ（`NOTES.md`）は
+ユーザーのフォルダーの `AppData\Agent` にあります。設定は `agent` のプログラムの設定で、サービス `settings` が持ちます：
 - `endpoint` と `model`。
 - `max_tokens` と `context_limit`。
-- `reasoning`、`show_thinking`、`vision`。画像を受け取れないモデルでは `vision=0` にします。
+- `reasoning`、`show_thinking`、`vision`。
 
-**API キー**：キーは使うディスクの C: の `AppData\Agent\agent.conf` にだけ保存し、リポジトリーやビルドした
-`nocturne.img` には入れません。
-- QEMU：`python scripts\setkey.py KEYFILE [--endpoint URL] [--model NAME]`（`build\run.img` に書きます。
-  先に `build.ps1 run` で作ってください。別のディスクは `--img`）
-- Hyper-V：`hyperv.ps1 -Update -ApiKeyFile KEYFILE`
-- または `agent` を起動し、尋ねられたときに貼り付けます（`/key` で入れ直せます）。
+**API キー**：`agent` を起動し、尋ねられたときに貼り付けます（`/key` で入れ直せます）。キーはプログラムの設定に
+入り、リポジトリーやビルドした `nocturne.img` には入りません。
 
-`KEYFILE` はキーだけか、`api key: ...` という行を含むファイルです。既定は `https://hyper.charm.land/v1` と
-`glm-5.3-flash` です。キーのファイルはこのフォルダーの外に置いてください。
 
 ## 制約
 
@@ -676,7 +669,7 @@ rootfs/       C: へ入れるファイル（Nocturne\ はシステムの文書�
 host/         ホストの道具（store：C: の作成・読み書き・検査）
 ports/        Nocturne への移植の設定と差分（tcc、go、rust、typescript、lexbor、freetype、ffmpeg、mesa、nvidia、wabt、virgl）
 third_party/  取り込んだソース（下のクレジット）
-scripts/      起動ディスク（mkimage.sh、layout.py）と SDK（mksdk.sh）の作成、test.py、qtest.py、setkey.py、hv-*.ps1
+scripts/      起動ディスク（mkimage.sh、layout.py）と SDK（mksdk.sh）の作成、test.py、qtest.py、hv-*.ps1
 tests/        OS の中の試験（runtests.c とそれがコンパイルするプログラム）、ホストの検査、試験用の素材
 docs/         README の画像、設計の文書、作業の記録
 build.ps1     ビルドの入口

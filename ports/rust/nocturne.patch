@@ -214,16 +214,14 @@ new file mode 100644
 index 0000000..0bf7e55
 --- /dev/null
 +++ b/library/std/src/sys/env/nocturne.rs
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,101 @@
 +//! Environment variables on Nocturne.
 +//!
-+//! There is no `environ`: a program's environment is the launcher's list of
-+//! settings (`"NAME=value"`, `n_settings`). std keeps its own table of them,
-+//! filled from `n_settings` on first use, and `set_var`/`remove_var` change
-+//! that table only. The C library holds the launch settings and the app's
-+//! current folder (`FOLDER`, which `n_folder_set` changes and
-+//! `set_current_dir` brings into std's table); C code in the same program
-+//! reads those through `getenv` and does not see std's changes.
++//! A program's environment is the launcher's list of `"NAME=value"` strings
++//! (`__libc_environment`). std keeps its own table of them, filled from that
++//! list on first use, and `set_var`/`remove_var` change that table only. C code
++//! in the same program reads the list through `getenv` and does not see std's
++//! changes.
 +
 +use core::slice::memchr;
 +
@@ -242,7 +240,7 @@ index 0000000..0bf7e55
 +        return None;
 +    }
 +    let pos = memchr::memchr(b'=', &input[1..]).map(|p| p + 1)?;
-+    // SAFETY: Nocturne settings are plain bytes, like the encoded bytes of an OsString.
++    // SAFETY: environment strings are plain bytes, like the encoded bytes of an OsString.
 +    unsafe {
 +        Some((
 +            OsString::from_encoded_bytes_unchecked(input[..pos].to_vec()),
@@ -253,10 +251,10 @@ index 0000000..0bf7e55
 +
 +fn load() -> Vec<(OsString, OsString)> {
 +    let mut vars = Vec::new();
-+    // SAFETY: `n_settings` is a NULL-terminated array of C strings set up by
++    // SAFETY: `__libc_environment` is a NULL-terminated array of C strings set up by
 +    // the C library's start-up code and never freed.
 +    unsafe {
-+        let mut p: *const *mut c_char = abi::n_settings;
++        let mut p: *const *mut c_char = abi::__libc_environment;
 +        if !p.is_null() {
 +            while !(*p).is_null() {
 +                if let Some(kv) = parse(CStr::from_ptr(*p).to_bytes()) {
@@ -274,7 +272,7 @@ index 0000000..0bf7e55
 +    f(guard.get_or_insert_with(load))
 +}
 +
-+/// Reads the launch settings now rather than at the first access.
++/// Reads the environment now rather than at the first access.
 +pub fn init() {
 +    with_env(|_| ());
 +}
@@ -380,7 +378,7 @@ index 0000000..ba61989
 +//! A file is a document handle (`n_document_open`). The kernel has no shared
 +//! cursor, so `File` keeps its own position; append-style files claim the
 +//! document and write at its end each time. Paths are completed against the
-+//! app's `FOLDER` setting before they reach the kernel. There are no
++//! app's current folder before they reach the kernel. There are no
 +//! permissions, symbolic links or hard links: permissions are always writable
 +//! and links are unsupported; timestamps are whole wall seconds.
 +
@@ -1032,7 +1030,7 @@ new file mode 100644
 index 0000000..6d88392
 --- /dev/null
 +++ b/library/std/src/sys/pal/nocturne/abi.rs
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,185 @@
 +//! Declarations of the Nocturne native ABI as the C library exports it
 +//! (`user/include/nocturne.h`, `common/abi.h`, `docs/nocturne-native-abi.md`).
 +//!
@@ -1197,7 +1195,8 @@ index 0000000..6d88392
 +    pub fn n_random(buf: *mut c_void, n: usize) -> n_result;
 +    pub fn n_app_self() -> n_result;
 +    pub fn n_terminal(h: n_handle) -> bool;
-+    pub static n_settings: *const *mut c_char;
++    pub fn n_folder() -> *const c_char;
++    pub static __libc_environment: *const *mut c_char;
 +
 +    pub fn n_clock_monotonic() -> u64;
 +    pub fn n_clock_after(ns: u64) -> u64;
@@ -1308,7 +1307,7 @@ index 0000000..ad549ff
 +// NOTE: this is not guaranteed to run, for example when Rust code is called externally.
 +pub unsafe fn init(argc: isize, argv: *const *const u8, _sigpipe: u8) {
 +    // The C library's start-up (`__libc_start`) already set up the main
-+    // thread's TLS block, stdio and the launch settings before `main`.
++    // thread's TLS block, stdio and the launch's fields before `main`.
 +    unsafe {
 +        crate::sys::args::init(argc, argv);
 +        crate::sys::env::init();
@@ -1339,7 +1338,7 @@ index 0000000..ad549ff
 +}
 +
 +/// Runs `f` with the complete, normalised form of `path` (`n_path_complete`:
-+/// `C:\...`, relative names are taken inside the `FOLDER` setting, `.` and
++/// `C:\...`, relative names are taken inside the current folder, `.` and
 +/// `..` are resolved by name). Every call that names a document or folder goes
 +/// through here because the kernel only accepts complete paths.
 +pub fn with_complete_path<T>(
@@ -1425,7 +1424,7 @@ index 0000000..b4f9e45
 +
 +pub const HAS_PREFIXES: bool = true;
 +
-+/// `C:\...` inside the `FOLDER` setting, with `.` and `..` resolved.
++/// `C:\...` inside the current folder, with `.` and `..` resolved.
 +pub(crate) fn absolute(path: &Path) -> io::Result<PathBuf> {
 +    // SAFETY: `with_complete_path` gives a NUL-terminated path.
 +    with_complete_path(path, &|full| Ok(unsafe { c_path(full) }))
@@ -1454,14 +1453,14 @@ new file mode 100644
 index 0000000..5680deb
 --- /dev/null
 +++ b/library/std/src/sys/paths/nocturne.rs
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,98 @@
 +//! Folders and paths on Nocturne.
 +//!
-+//! There is no kernel working directory: an app's current folder is its
-+//! `FOLDER` setting, which `n_path_complete` uses to complete relative names
-+//! and which is passed on to the apps it launches. The user's folder and the
-+//! temporary folder are the settings `USERFOLDER` and `TEMP`, which the C
-+//! library reads. Path lists are separated by `;`.
++//! There is no kernel working directory: an app's current folder is the C
++//! library's (`n_folder`), which `n_path_complete` uses to complete relative
++//! names and which is passed on to the apps it launches. The user's folder and
++//! the temporary folder are fields of the launch, which the C library holds.
++//! Path lists are separated by `;`.
 +
 +use crate::ffi::{OsStr, OsString};
 +use crate::io;
@@ -1471,19 +1470,15 @@ index 0000000..5680deb
 +use crate::{fmt, vec};
 +
 +pub fn getcwd() -> io::Result<PathBuf> {
-+    // `FOLDER` completed, or "C:\" when it is missing or not complete.
-+    crate::sys::path::absolute(Path::new("."))
++    // SAFETY: a NUL-terminated complete path that lives as long as the app.
++    Ok(unsafe { c_path(abi::n_folder()) })
 +}
 +
 +pub fn chdir(p: &Path) -> io::Result<()> {
 +    crate::sys::helpers::run_path_with_cstr(p, &|name| {
 +        crate::sys::cvt(unsafe { abi::n_folder_set(name.as_ptr()) })?;
 +        Ok(())
-+    })?;
-+    // `n_folder_set` changed the C library's current folder; std's table
-+    // gets the same `FOLDER`.
-+    let cwd = getcwd()?;
-+    unsafe { crate::sys::env::setenv(OsStr::new("FOLDER"), cwd.as_os_str()) }
++    })
 +}
 +
 +pub struct SplitPaths<'a> {
@@ -1549,12 +1544,12 @@ index 0000000..5680deb
 +}
 +
 +pub fn temp_dir() -> PathBuf {
-+    // SAFETY: a NUL-terminated path ("C:\" without a complete `TEMP`).
++    // SAFETY: a NUL-terminated complete path.
 +    unsafe { c_path(abi::n_temp_folder()) }
 +}
 +
 +pub fn home_dir() -> Option<PathBuf> {
-+    // SAFETY: a NUL-terminated path ("C:\" without a complete `USERFOLDER`).
++    // SAFETY: a NUL-terminated complete path.
 +    Some(unsafe { c_path(abi::n_user_folder()) })
 +}
 diff --git a/library/std/src/sys/process/mod.rs b/library/std/src/sys/process/mod.rs

@@ -236,7 +236,6 @@ Other options:
 | `hyperv.ps1 -NoNetwork` | Create the VM without a network adapter. |
 | `hyperv.ps1 -Switch "Name"` | Connect to a different virtual switch. |
 | `hyperv.ps1 -Name Foo -MemoryMB 4096` | Use a different VM name and memory size. |
-| `hyperv.ps1 -Update -ApiKeyFile KEYFILE` | Write the AI agent's API key to C: on the VM's disk (`-Endpoint` and `-Model` too). |
 
 To create a Gen 2 VM by hand, turn Secure Boot off, attach `build\nocturne.vhdx` as a SCSI disk, and set
 `Set-VM -EnhancedSessionTransportType HvSocket` for the Enhanced Session. Nocturne does not boot on a Generation 1
@@ -619,21 +618,15 @@ agent write a tetris clone in C:\Users\User\Documents\tetris and install it as C
 agent -r                                # resume the previous session
 ```
 
-The model's instructions are in `C:\Nocturne\Agent\system.md`. The settings (`agent.conf`), the session
-(`session.json`) and the agent's notes (`NOTES.md`) are in `AppData\Agent` in the user's folder. The settings:
+The model's instructions are in `C:\Nocturne\Agent\system.md`. The session (`session.json`) and the agent's notes
+(`NOTES.md`) are in `AppData\Agent` in the user's folder. The settings are the program settings of `agent`, held by the
+service `settings`:
 - `endpoint` and `model`.
 - `max_tokens` and `context_limit`.
-- `reasoning`, `show_thinking` and `vision`. Set `vision=0` for models that cannot take images.
+- `reasoning`, `show_thinking` and `vision`.
 
-**API key.** The key is stored only in `AppData\Agent\agent.conf` on the C: of the disk you use, never in the
-repository or the built `nocturne.img`:
-- QEMU: `python scripts\setkey.py KEYFILE [--endpoint URL] [--model NAME]` (writes to `build\run.img`; make it
-  first with `build.ps1 run`. `--img` names another disk.)
-- Hyper-V: `hyperv.ps1 -Update -ApiKeyFile KEYFILE`
-- Or start `agent` and paste the key when it asks (`/key` enters it again).
-
-`KEYFILE` holds just the key, or contains a line like `api key: ...`. The defaults are `https://hyper.charm.land/v1`
-and `glm-5.3-flash`. Keep key files outside this folder.
+**API key.** Start `agent` and paste the key when it asks (`/key` enters it again). The key goes into the program's
+settings, never into the repository or the built `nocturne.img`.
 
 ## Limits
 
@@ -673,7 +666,7 @@ rootfs/       files put on C: (Nocturne\: the system's documents, fonts and type
 host/         host tools (store: makes, reads, writes and checks C:)
 ports/        build settings and patches for ported code (tcc, go, rust, typescript, lexbor, freetype, ffmpeg, mesa, nvidia, wabt, virgl)
 third_party/  vendored sources (see Credits)
-scripts/      boot disk (mkimage.sh, layout.py) and SDK (mksdk.sh) builders, test.py, qtest.py, setkey.py, hv-*.ps1
+scripts/      boot disk (mkimage.sh, layout.py) and SDK (mksdk.sh) builders, test.py, qtest.py, hv-*.ps1
 tests/        the in-OS test suite (runtests.c and the programs it compiles), host-side checks, test material
 docs/         README pictures, design documents and work logs
 build.ps1     build entry point

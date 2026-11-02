@@ -445,8 +445,8 @@ $(LICENSES)/typescript/LICENSE.txt: $(TYPESCRIPT)/LICENSE.txt $(TYPESCRIPT)/NOTI
 	    ls $(dir $@)$$path | grep -q . || { echo "no licence for $$path" >&2; exit 1; }; done
 # The desktop apps written in TypeScript (user/apps/*.ts, the toolkit in
 # "nocturne/ui") are type-checked and compiled on the build host, so starting
-# one does not wait for tsc: user/apps/settings.ts -> C:\Nocturne\System\settings.js,
-# run as "js C:\Nocturne\System\settings.js".
+# one does not wait for tsc: user/apps/about.ts -> C:\Nocturne\System\about.js,
+# run as "js C:\Nocturne\System\about.js".
 TS_APPS := $(notdir $(basename $(wildcard user/apps/*.ts)))
 TS_BINS := $(addprefix $(PROGRAMS)/,$(addsuffix .js,$(TS_APPS)))
 GO_FILES += $(TS_BINS)
