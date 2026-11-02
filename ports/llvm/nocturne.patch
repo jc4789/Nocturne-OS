@@ -4688,7 +4688,7 @@ new file mode 100644
 index 00000000..c9410c28
 --- /dev/null
 +++ b/llvm/lib/Support/Nocturne/Program.inc
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,231 @@
 +//===- Nocturne/Program.inc - Nocturne Program Implementation --*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -4812,7 +4812,7 @@ index 00000000..c9410c28
 +  if (Env)
 +    for (StringRef Setting : *Env)
 +      Settings.push_back(Setting.str());
-
++
 +  std::vector<std::string> ArgStrings(Args.begin(), Args.end());
 +  std::vector<const char *> Arguments, SettingPointers;
 +  for (const std::string &Arg : ArgStrings)
