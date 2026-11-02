@@ -4919,6 +4919,9 @@ index 00000000..a673859b
 +	settingLen  uint32
 +	handleLen   uint32
 +	flags       uint32
++	identity    *byte
++	grant       int32
++	reserved    uint32
 +}
 +
 +func stringPtrs(ss []string) ([]*byte, error) {

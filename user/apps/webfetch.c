@@ -2404,7 +2404,7 @@ static void service_request(void *opaque) {
 }
 int main(int argc,char **argv) {
     if(argc!=2||strcmp(argv[1],"--service"))return run_one(0,1);
-    /* Handle 0 is the browser's listener. The service ends with the browser. */
+    /* Handle 0 is the browser's inlet. The service ends with the browser. */
     n_handle events=n_events_create();
     if(events<0||n_events_watch(events,0,N_EVENT_RECEIVABLE,0)<0)return 1;
     n_handle parent=n_app_open(n_app_parent());
@@ -2425,7 +2425,7 @@ int main(int argc,char **argv) {
         for(n_result i=0;i<got;i++)if(reports[i].token==1)running=false;
         webprefs_events(reports,(size_t)got);
         while(running){
-            n_handle channel=n_channel_accept(0);
+            n_handle channel=n_inlet_accept(0,0);
             if(channel==-N_ERR_NOT_READY)break;
             if(channel<0){running=false;break;}
             struct service_slot *slot=calloc(1,sizeof *slot);

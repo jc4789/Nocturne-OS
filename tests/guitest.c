@@ -8,9 +8,9 @@
 #define MAGENTA RGB(255, 0, 255)
 
 static uint32_t *grab(int *w, int *h) {
-    if (screen_grab(NULL, 0, w, h) < 0) return NULL;
+    if (screen_grab(n_cap_find(N_CAP_SCREEN_READ), NULL, 0, w, h) < 0) return NULL;
     uint32_t *px = malloc((size_t)*w * (size_t)*h * 4);
-    if (px && screen_grab(px, (size_t)*w * (size_t)*h * 4, w, h) < 0) {
+    if (px && screen_grab(n_cap_find(N_CAP_SCREEN_READ), px, (size_t)*w * (size_t)*h * 4, w, h) < 0) {
         free(px);
         return NULL;
     }

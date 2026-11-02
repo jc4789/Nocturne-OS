@@ -284,6 +284,18 @@ bool handle_held(const struct object_ops *ops) {
     return held;
 }
 
+int handle_find(bool (*match)(struct handle *h, void *arg), void *arg) {
+    struct handle_table *t = own_table();
+    int number = -1;
+    uint64_t flags = spin_lock(&t->lock);
+    for (uint32_t at = 0; at < t->frontier && number < 0; at++) {
+        const struct handle_slot *s = &t->slots->slot[at];
+        if (s->handle && match(s->handle, arg)) number = handle_number(at, s->generation);
+    }
+    spin_unlock(&t->lock, flags);
+    return number;
+}
+
 int handle_table_put(struct handle_table *t, uint32_t index, struct handle *h) {
     uint64_t flags = spin_lock(&t->lock);
     ASSERT(index >= t->frontier);

@@ -26,6 +26,7 @@
 | `mm/vmm.c`・`pmm.c`・`heap.c`・`vmalloc.c` | 頁表と TLB、frame、heap、核の番地の区間。 |
 | `mm/shared.c`・`pager.c`・`program.c`・`space.c` | 共有 object（frame、写像の一覧、fault、revoke、DMA の型、device の pin、scanout）、pager、program の text、アプリの配置（穴、`n_memory_*`）。口は `mm/shared.h`・`mm/space.h`、錠の順は `mm/shared.c` の頭。 |
 | `sys/object.c`・`channel.c`・`events.c`・`watch.c` | object と handle の表、channel、event queue、watch。 |
+| `sys/authority.c`・`service.c` | process の身元と能力の handle（`common/authority_abi.h`）、サービスの管理者への接続の道。カーネルに名前は無い。 |
 | `sys/syscall.c` | syscall の受け口 `syscall_dispatch`。 |
 | `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console と system log の stream、profiler。 |
 | `sys/keep.c` | wm・audio・screenmode の設定を `AppData\Nocturne\` の `.conf` に保存し、init の前に読み戻す。 |
@@ -40,6 +41,7 @@
 | 場所 | 役目 |
 |---|---|
 | `abi.h` | syscall の番号 `SYS_*` と結果 `N_ERR_*`。仕様は `docs/nocturne-native-abi.md`。 |
+| `authority_abi.h` | 身元 `struct n_identity`、能力 `enum n_cap`、サービスの要求の形。 |
 | `display_abi.h`・`gpu_abi.h` | 画面と GPU の ABI。 |
 | `store_format.h`・`store/` | C: の store の書式とエンジン（`catalog` の B+ 木、`namespace`、`space`、`volume`）。カーネルと `host/store` の両方が組む。 |
 | `edid.h`・`gfx.c`・`unifont.bin` | EDID、描画の部品、Unifont。 |
@@ -84,7 +86,8 @@
 ## 境界
 
 - syscall の番号と型は `common/abi.h`。画面と GPU は `display_abi.h` と `gpu_abi.h`。
-- アプリのドライバーは `SYS_PCI_*`・`SYS_DMA_*` から `dev/pciuser.c` へ。claim するのは init だけで、NVIDIA の表示を `nvrm` に渡す（`user/apps/init.c`）。
+- アプリのドライバーは `SYS_PCI_*`・`SYS_DMA_*` から `dev/pciuser.c` へ。claim は `N_CAP_PCI_CLAIM` の能力で行う。init が NVIDIA の表示を claim して `nvrm` に渡す（`user/apps/init.c`）。
+- 特権は能力の handle か身元の級で確かめる（`sys/authority.h`）。境界の検査は `tests/check_boundaries.py`。
 - VM の処理は `kernel/src/vm/vm.h` が唯一の入口。実機では何もせずに戻る。裏に `hyperv.c`、`hv/`（VMBus、storvsc、netvsc）、`rdp.c`、VM の装置（ata、ac97、e1000、tulip、vbe）、`virtio_gpu.c` がある。`vm/` の外は `vm/vm.h` だけを include する。
 - syscall の道：
 

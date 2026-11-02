@@ -58,6 +58,7 @@ struct object {
 /* A handle's rights: what its opening may do with the object, as its users check them. */
 #define HANDLE_WRITE (1u << 0) /* change it: a document opened to edit or replace; shared pages (or
                                   a document) mapped for writing, or scanned out as a screen */
+#define HANDLE_READ (1u << 1)  /* 中身を読む：system log の本文 */
 
 struct handle {
     struct object *object;
@@ -132,6 +133,9 @@ int handle_remove(int number);
 int handle_hold(struct handle *h);
 /* Whether the calling app holds a handle with no number to an object of ops. */
 bool handle_held(const struct object_ops *ops);
+
+/* 呼ぶ側のアプリの表で match が真になる最初の handle の番号、無ければ -1。match は表の錠の下で走る。 */
+int handle_find(bool (*match)(struct handle *h, void *arg), void *arg);
 
 /* A process not started yet (sys/proc.c), its handles put in rising order: h, a reference of its
    own, as number index (the slot's first generation: the number is index). */
