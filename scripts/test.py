@@ -599,6 +599,8 @@ def run_vm(a, tcp_port, web_ports, processes):
         problems.append("timed out after %d s (the VM did not power off)" % a.timeout)
     if q.returncode != 0:
         problems.append("QEMU exit status %s" % q.returncode)
+    # A kernel log line starts with its time and CPU: what the runner printed follows them.
+    log = re.sub(r"(?m)^\[ *\d+\.\d+ \d+:\d+\] ", "", log)
     if "TESTS DONE" not in log:
         problems.append("the in-OS runner did not finish (did tcc fail to build it?)")
     for m in re.finditer(r"(?im)^.*(panic|kernel fault|double fault).*$", log):
@@ -656,7 +658,9 @@ def run_vm(a, tcp_port, web_ports, processes):
                     store_check_passed=check.returncode == 0, disk_kept=a.keep_disk)
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
-    fails = re.findall(r"^FAIL ", log, re.M)
+    fails = re.findall(r"^FAIL \S+/.*$", log, re.M)
+    for f in fails:
+        print(f[:200])
     for p in problems:
         print("PROBLEM", p)
     ok = not fails and not problems
