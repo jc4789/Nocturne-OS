@@ -1,6 +1,6 @@
 ---
 name: nocturne-project
-description: Nocturne OS の実物を動かして確かめる手順：ビルドと媒体、窓付きの QEMU の起動・窓の確認・HMP での撮影とキーとマウス、serial.log と F12 の console の読み方（行の一覧は references/logs.md、起動と落とし穴は references/qemu-visual.md）、WPT と試験の道具の使い方、撮影と操作の受入。カーネル・GUI・ブラウザー・ドライバーのどれを直すときも、ビルドする前、QEMU を起動するとき、ログを読むとき、画面を撮るとき、「直った」「速くなった」「退行ではない」と書く前に使う。性能・かくつき・落ちるコマ・固まる・白い画面の報告を受けたときは、推測の前にこの手順でログを読んで層を絞る。
+description: Nocturne OS の実物を動かして確かめる手順：ビルドと媒体、窓付きの QEMU の起動・窓の確認・HMP での撮影とキーとマウス、serial.log と F12 の console の読み方（行の一覧は references/logs.md、起動と落とし穴は references/qemu-visual.md）、撮影と操作の受入。カーネル・GUI・ブラウザー・ドライバーのどれを直すときも、ビルドする前、QEMU を起動するとき、ログを読むとき、画面を撮るとき、「直った」「速くなった」「退行ではない」と書く前に使う。性能・かくつき・落ちるコマ・固まる・白い画面の報告を受けたときは、推測の前にこの手順でログを読んで層を絞る。
 ---
 
 # Nocturne：実物を動かして確かめる
@@ -14,8 +14,8 @@ description: Nocturne OS の実物を動かして確かめる手順：ビルド�
   - `qemu-image`：img だけ。`build/nocturne.img` を増分で上書きする。確かめはこれ。
   - `all`：vhdx・iso も作る（起動は UEFI だけ）。Hyper-V へ渡すときと、頼まれたときだけ。
   - `kernel`、`user`：その部分だけ。
-  - `test`・`test-quick`・`test-full`（`build/test.img` へ写す）は窓付きの QEMU で試験を回す（下の「試験の道具」）。`run`（`build/run.img`）は `QEMU_ACCEL` の既定が tcg で、Zen 4 の下限を満たす CPU にならないので使わない。
-- 二つ目の媒体は一度に一つ：変える前の写し `build/mae.img` か、試験の道具の写し（`build/wpt/wpt.img`・`build/test.img`）。要らなくなったら同じ名で上書きして使い回す。
+  - `run`（`build/run.img`）は `QEMU_ACCEL` の既定が tcg で、Zen 4 の下限を満たす CPU にならないので使わない。
+- 二つ目の媒体は一度に一つ：変える前の写し `build/mae.img`。要らなくなったら同じ名で上書きして使い回す。
 - 媒体の中身：`scripts/layout.py` が `build/c.list` を書き、`build/host/store.exe fill` が C: に詰める。ソースを戻しても媒体は戻らない。
 - 撮った画像と serial.log は、この会話の作業場（システムプロンプトにある scratchpad の場所）。build の下ではない。残す値は `docs/` に文章と数字で書く。
 - ログの行の一覧と取り方：[references/logs.md](references/logs.md)。QEMU の起動・窓の確認・HMP・落とし穴：[references/qemu-visual.md](references/qemu-visual.md)。
@@ -25,7 +25,7 @@ description: Nocturne OS の実物を動かして確かめる手順：ビルド�
 1. **症状の層をログで絞る。** 不具合の報告（遅い、かくつく、固まる、白い、落ちる）を受けたら、推測の前に serial.log と F12 の console の行を読む。動画なら `Native media timing` の `drop`・`starved`、描画なら `Browser loop profile`・`Browser damage profile`、カーネルなら `prof:` と `[memory]`。行の意味は logs.md。層が分かったら、ログを読み足さない。コードで欠陥が見えているなら（`rg` で当たる、仕様と違う手順）、この段も次の段も飛ばして 3 へ。
 2. **性能や退行を言うなら、変える前に今の媒体で見て書き残す。** 同じ組・同じ条件（2560×1440、F12 を開いたまま、QEMU は窓付き一台、計測の旗なし）の画面とログを作業場に置き、値と行を報告に書く。前の回の記録が無ければ、退行かどうかは未確認。前の値が手元にあるなら、前の版を組み直して測り直さない。
 3. **読んで直す。これが仕事の本体。** `rg`・codegraph で場所を絞り、原文を読む。照らすのは仕様の原文（W3C・WHATWG、`D:\Programes\OS DEV INFO` の仕様書、`docs/nocturne-native-abi.md`）。欠陥が見えたら、ログや撮影で確かめ直さず直す。
-4. **直した後に一度、増分ビルドして同じ条件で確かめる。** `qemu-image` が同じ img を上書きする。動いている QEMU を HMP の `quit` で止め、同じ命令で起動し直し、同じ組を撮って同じ行を並べる。前の写し（`build/mae.img`）があれば二台目で並べる。WPT はブラウザーの仕事のときだけ、変更が触れた仕様のディレクトリーに絞って走らせる。ブラウザーの照合と速さの比べ方は `browser-hikaku` スキル。直っていなければ 3 へ戻る。もう一度撮り直すのではない。
+4. **直した後に一度、増分ビルドして同じ条件で確かめる。** `qemu-image` が同じ img を上書きする。動いている QEMU を HMP の `quit` で止め、同じ命令で起動し直し、同じ組を撮って同じ行を並べる。前の写し（`build/mae.img`）があれば二台目で並べる。ブラウザーの照合と速さの比べ方は `browser-hikaku` スキル。直っていなければ 3 へ戻る。もう一度撮り直すのではない。
 5. ホストの検査（`tests/check_*.py`）で要るものだけ走らせる。合格は、その検査が通る範囲の証拠にしかならない。
 
 計測の旗（`--debug-js`）は原因を探す回に使う。製品の速さは旗なし（または `--log-console` だけ）の回で測る。計測を足したら、その道具自身の費用も測る。
@@ -55,12 +55,11 @@ description: Nocturne OS の実物を動かして確かめる手順：ビルド�
 - `snapshot=on` なので媒体は汚れず、ゲストの変更も残らない。再起動をまたぐ保存の確認は qemu-visual.md。
 - 自分が起動したものは、終わりに HMP の `quit` で止める。
 
-## 試験の道具
+## 試験
 
-- **WPT。** `python -X utf8 scripts/wpt.py --label <名> <WPT の path>…`（`dom/`、`fetch/api/basic/`、`css/css-anchor-position/` のように、変更が触れた仕様のディレクトリー。`--limit` も可）。結果は `build/wpt/<名>/`（results.jsonl・summary.txt・failures.txt・serial.log）。前後を比べるなら、同じ path を前の写し（`--boot-image build/mae.img --skip-build-check --runner-source <その版の tests/wptrunner.c>`）と今の媒体で順に走らせ、通った数と failures.txt の形を並べる。もう一台 QEMU が動いているなら `--cpus 4 --memory 4096`。WPT の全部を回すのは、ユーザーが頼んだときだけ。
-- **道具の QEMU は窓付き。** `scripts/wpt.py` と `scripts/test.py` は q35・UEFI・NVMe の機械（test.py の `vm_machine`）を QEMU の窓で起こし、WHPX では `-cpu host`。写し（`build/wpt/wpt.img`・`build/test.img`）は二つ目の媒体として許される。`--accel` の既定は tcg なので、`--accel whpx` を付ける。`--slots`・`--cpus`・`--memory` は一台の中のブラウザーの数と大きさで、台数ではない。窓なしの起動、三つ目の媒体、三台目の QEMU は使わない。
-- `scripts/platform_qa.py`（ラベルごとに `build/nocturne-platform/<label>/` へ写す）と `qtest.py` は使わない。写しが増え、固定秒数の一発の代用になる。
-- ゲストの試験（`tests/runtests.c`）は、test.py が始まった時点の作業木のヘッダーで組まれる。媒体を作った後にヘッダーを変えてから走らせると構造体の形が食い違う（覚え書き「guest の試験は作業木のヘッダーで組まれる」）。
+- 動くかどうかを決めるのはスクリプトではない。OS を窓付きの QEMU で直接使って確かめる。
+- `qtest.py` は使わない。写しが増え、固定秒数の一発の代用になる。
+- ゲストの試験のソースは `tests/` にある。OS の中で組んで走らせる。
 
 ## 撮影と操作の受入
 

@@ -156,7 +156,7 @@ static bool spawn_child(web_workers *w,struct child *c){
     /* Records travel both ways on one channel. The worker reports a runtime
        abort on the page owner's diagnostic stream, else in the system log. */
     const char *args[]={"browserjsworker"};int32_t handles[]={pair[1],pair[1],2};
-    struct n_launch launch={.arguments=args,.argument_count=1,.handles=handles,.handle_count=3};
+    struct n_launch launch={.arguments=args,.argument_count=1,.handles=handles,.handle_count=3,.flags=N_LAUNCH_SAME_PROGRAM};
     n_handle app=n_app_launch(WORKER_PROGRAM,&launch);
     if(app==-N_ERR_NO_HANDLE){handles[2]=-1;app=n_app_launch(WORKER_PROGRAM,&launch);}
     n_handle_close(pair[1]);
@@ -178,7 +178,7 @@ static bool shared_transport(web_workers*w,struct child*c,bool*created){
     /* The server's only handle is its inlet: no input, output or log. It
        ends itself once every connected owner has gone. */
     if(*created){const char*args[]={"browserjsworker","--shared-server",c->url};const int32_t handles[]={listener};
-        struct n_launch launch={.arguments=args,.argument_count=3,.handles=handles,.handle_count=1};
+        struct n_launch launch={.arguments=args,.argument_count=3,.handles=handles,.handle_count=1,.flags=N_LAUNCH_SAME_PROGRAM};
         n_handle app=n_app_launch(WORKER_PROGRAM,&launch);if(app<0){n_handle_close(listener);free(key);return false;}n_handle_close(app);}
     n_handle channel=n_service_connect(key);if(listener>=0)n_handle_close(listener);free(key);if(channel<0)return false;
     c->channel=channel;return true;

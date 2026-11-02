@@ -75,9 +75,9 @@ Nocturne は GUI が先の独自の OS。実機で動き、普通の人がター
 ## ビルドと媒体
 
 - ビルドは `python -X utf8 scripts/build.py -j 8 <目標>`。目標はいつも書く。確かめは `qemu-image`（`build/nocturne.img` を増分で上書き）。`all` は Hyper-V へ渡すときだけで、VHDX を忘れない。確かめのたびに全体ビルドをしない。ユーザーが組んだビルドがあればそのまま使う。
-- 媒体は二つまで。本線 `build/nocturne.img` と、一度に一つの二つ目（`build/mae.img` か試験の道具の写し）.build の下には組みの出力だけを置き、ソース・コードを置かない。 
+- 媒体は二つまで。本線 `build/nocturne.img` と、一度に一つの二つ目（`build/mae.img`）.build の下には組みの出力だけを置き、ソース・コードを置かない。 
 - worktree とビルド：使ってよい。終わったら片付ける。何百 GB のビルドや何十もの worktree を残さない。理由は SSD の負担と、Windows が重くなること。
-- WPT は変更が触れた仕様のディレクトリーだけ `scripts/wpt.py <path>…` で。道具は窓付きに直してから使う（フックが止める）。`platform_qa.py`・`qtest.py`、make の `run` は使わない。
+- 動くかどうかを決めるのはスクリプトではない。OS を窓付きの QEMU で直接使って確かめる。組みの中の検査（`tests/check_*.py`）と、OS の中で走らせるネイティブの試験はよい。`qtest.py`、make の `run` は使わない。
 - 正しい修理に共有ヘッダーが要るなら、全体の組み直しになっても直し、後回しにしない。A/B は前の写しと今を二台で並べるか、疑わしい `.c` を一つ差し替えて増分で組む。stash・revert で戻さない。
 - ビルドの規則を変えたら、空の build/ から組んでも通るか（生成物の規則、PATH に無い道具。ユーザーの PowerShell に Git の usr/bin は無い）を確かめる。ユーザーのビルドが壊れたら私の責任。
 - 渡す媒体に今のソースの kernel と C: が入っていることを確かめる。

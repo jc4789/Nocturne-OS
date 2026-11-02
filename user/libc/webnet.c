@@ -751,7 +751,7 @@ static n_result service_start(webnet *n) {
     if(r<0)return r;
     const char *args[]={"webfetch","--service"};
     const int32_t handles[]={inlet[1]};
-    struct n_launch launch={.arguments=args,.argument_count=2,.handles=handles,.handle_count=1};
+    struct n_launch launch={.arguments=args,.argument_count=2,.handles=handles,.handle_count=1,.flags=N_LAUNCH_SAME_PROGRAM};
     n_handle app=n_app_launch(N_FOLDER_SYSTEM "\\webfetch",&launch);
     n_handle_close(inlet[1]);
     if(app<0){n_handle_close(inlet[0]);return app;}

@@ -964,6 +964,8 @@ static void stream_flush(struct stream *s) {
 }
 
 /* 流れを作る。輪は触れた頁だけが実の記憶になる。 */
+static uint32_t open_streams; /* N_AUDIO_OP_OUTPUTS が言う数 */
+
 static n_result stream_open(struct client *c, const struct n_audio_request *q, n_handle *memory, uint64_t *bytes_out) {
     const struct n_audio_format *f = &q->format;
     if (c->stream) return -N_ERR_BUSY;
@@ -1005,6 +1007,7 @@ static n_result stream_open(struct client *c, const struct n_audio_request *q, n
     ring->data_offset = offset;
     stream_publish(s, n_clock_monotonic());
     c->stream = s;
+    open_streams++;
     *memory = h;
     *bytes_out = bytes;
     return 0;
@@ -1027,6 +1030,7 @@ static void client_end(struct client *c) {
     struct stream *s = c->stream;
     if (!s) return;
     c->stream = NULL;
+    open_streams--;
     s->closing = true;
     uint64_t head = head_of(s);
     /* 残りを鳴らしてから消える */
@@ -1039,7 +1043,7 @@ static void outputs_answer(struct client *c) {
     size_t bytes = 0;
     LIST_EACH(d) bytes += sizeof(struct n_audio_output) + d->bytes;
     uint8_t *message = bytes ? malloc(bytes) : NULL;
-    struct n_audio_reply reply = {.result = bytes && !message ? -N_ERR_NO_MEMORY : 0, .bytes = message ? bytes : 0};
+    struct n_audio_reply reply = {.result = bytes && !message ? -N_ERR_NO_MEMORY : 0, .streams = open_streams, .bytes = message ? bytes : 0};
     n_channel_send(c->channel, &reply, sizeof reply, -1);
     if (!message) return;
     uint8_t *at = message;

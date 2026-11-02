@@ -55,7 +55,7 @@ $(BUILD)/k/third_party/uacpi/%.o: third_party/uacpi/%.c
 	@$(CC) $(filter-out -W%,$(KCFLAGS)) -w -c $< -o $@
 
 # The test build of the kernel: the same sources with the test flags of the kernel command line
-# (kernel.h's test_flag). Only scripts/test.py and scripts/wpt.py put it on their disks.
+# (kernel.h's test_flag).
 KTOBJ := $(patsubst $(BUILD)/k/%,$(BUILD)/kt/%,$(KOBJ))
 $(BUILD)/kt/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -546,7 +546,7 @@ $(BUILD)/sdk.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC
 	@touch $@
 
 # ---------------------------------------------------------------- images
-.PHONY: all kernel kernel-test user cxx lexbor image qemu-image run clean test test-quick test-full
+.PHONY: all kernel kernel-test user cxx lexbor image qemu-image run clean
 .SECONDARY:
 all: image
 
@@ -572,7 +572,7 @@ $(NVIDIA_FW_STATE): nvidia-firmware-check scripts/layout.py
 	@$(PY) scripts/layout.py --firmware-state "$@" --firmware-source "$(NVIDIA_FIRMWARE)" --firmware-version "$(NVIDIA_FW_VERSION)"
 
 # everything scripts/layout.py puts on C:
-# tests/testrun は媒体に入れない（scripts/test.py が試験の写しにだけ置く）が、一緒に組む。
+# tests/testrun は媒体に入れないが、一緒に組む。
 DISK_FILES := $(BUILD)/tests/testrun $(APP_BINS) $(GO_FILES) $(RUST_FILES) $(LLVM_FILES) $(NVRM_FILES) $(PROGRAMS)/tcc $(LICENSE_FILES) $(BUILD)/sdk.stamp \
     $(BUILD)/sounds.stamp $(NVIDIA_FW_STATE) $(shell find rootfs -type f) third_party/ca/ca-bundle.crt
 
@@ -607,15 +607,6 @@ run: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(DISK_FILES)
 		-netdev user,id=net -device e1000,netdev=net \
 		-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
 		-audiodev dsound,id=snd -device AC97,audiodev=snd
-
-# the in-OS test suite on its own copy of build/nocturne.img (build/test.img, deleted after its store check;
-# see scripts/test.py)
-test: qemu-image
-	@$(PY) scripts/test.py
-test-quick: qemu-image
-	@$(PY) scripts/test.py --quick
-test-full: qemu-image
-	@$(PY) scripts/test.py --full
 
 # keeps build/run.img: `make run`'s disk, with C:\Users (your files, and the agent's key)
 clean:

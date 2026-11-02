@@ -311,34 +311,7 @@ python -X utf8 scripts/build.py -j 8 cxx                    # Makefile の任意
 
 ## 試験
 
-```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1 test        # 全体の試験（時間がかかります）
-powershell -ExecutionPolicy Bypass -File build.ps1 test-quick  # 全アプリのコンパイルと tcc の自己ビルドを省く
-powershell -ExecutionPolicy Bypass -File build.ps1 test-full   # OS の中で tcc が自分をビルドし直す試験も行う
-```
-
-`scripts/test.py` は `build\nocturne.img` のコピー（`build\test.img`）の `C:\Tests` に `tests/` を入れ、
-画面なしの QEMU で起動します。コピーのカーネルとプログラムが今のビルドのものかを先に確かめ、`run.img` には触れません。
-OS の中の `tcc` が試験の実行役（`tests/runtests.c`）をコンパイルし、約 110 の群・約 220 の試験を走らせ、
-終了状態と出力を確かめます。結果はシリアルで返り、最後にホストが `store check` で OS が書いた C: を検査します
-（問題があったときだけコピーを残します）。主な対象は次のとおりです。
-- シェルとコマンド、`malloc`、ネイティブ ABI、スレッドと並列処理。
-- W^X：コードや読込み専用データへの書込み、スタックやヒープの実行がアプリを止めること。
-- ドライブ C:：4 KiB のブロックの境目をまたぐさまざまな大きさ、置換・追記・大きさの変更・位置を指定した書込み、
-  移動、長い名前、大文字と小文字、入れ子のフォルダー、一覧、削除。
-- `tcc`：printf と数学関数、全アプリのコンパイル、自己ビルド。C++。
-- GUI：窓が画面に現れ、閉じると消えること。
-- 音：ストリーム、待つ書込みと待たない書込み、8 本同時、音量、`beep`、各種 WAV の `play`。QEMU が AC'97 の出力を
-  `build/test-audio.wav` に録り、ホストが各音の高さ・左右・長さを確かめます。媒体の復号も試します。
-- Web エンジン：要素の位置、描いた画素、CSS、フォーム、文字コード、URL、Worker、IndexedDB、WebAssembly、
-  WPT と html5lib の一部。壊れた・深く入れ子のページで落ちないこと。
-- ネットワーク：DHCP、ping、DNS、HTTP、HTTPS、不正な証明書の拒否、HTTP/2、TLS の再開。
-- TCP：ホストのサーバーとの 14 MiB の送受信（損失と順序の入替えの模擬あり）、全バイトの照合。
-- エージェント：オフラインで、API キーは要りません。
-
-ネットワークの試験はホストからインターネットへ出られる必要があります。出られないときは
-`python scripts/test.py --no-net` を使います。`--accel whpx`、`--cpus`、`--memory`、群の名前
-（`python scripts/test.py web tcp`）も指定できます。
+ビルドの中の検査は `tests/check_*.py` です。OS の中で走らせる試験のソースは `tests/` にあります。
 
 `scripts/qtest.py` は `build\nocturne.img` を `snapshot=on` で起動し（C: への書込みは終了で捨てられます）、
 打鍵・マウス・画面の撮影で操作します。
@@ -547,7 +520,7 @@ tcc -o C:\Programs\Hello\hello hello.c          # プログラムを作る。以
 - `threads.h`、`parallel.h`。
 - `http.h`（HTTP と HTTPS）、`json.h`、`png.h`、BearSSL。
 
-tcc は自分自身もコンパイルでき、そのソースから OS の中で使えるコンパイラーを作り直せます（`build.ps1 test-full`）。
+tcc は自分自身もコンパイルでき、そのソースから OS の中で使えるコンパイラーを作り直せます。
 
 ### C++
 
@@ -669,7 +642,7 @@ rootfs/       C: へ入れるファイル（Nocturne\ はシステムの文書�
 host/         ホストの道具（store：C: の作成・読み書き・検査）
 ports/        Nocturne への移植の設定と差分（tcc、go、rust、typescript、lexbor、freetype、ffmpeg、mesa、nvidia、wabt、virgl）
 third_party/  取り込んだソース（下のクレジット）
-scripts/      起動ディスク（mkimage.sh、layout.py）と SDK（mksdk.sh）の作成、test.py、qtest.py、hv-*.ps1
+scripts/      起動ディスク（mkimage.sh、layout.py）と SDK（mksdk.sh）の作成、qtest.py、hv-*.ps1
 tests/        OS の中の試験（runtests.c とそれがコンパイルするプログラム）、ホストの検査、試験用の素材
 docs/         README の画像、設計の文書、作業の記録
 build.ps1     ビルドの入口

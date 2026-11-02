@@ -48,7 +48,7 @@ struct conn {
 /* 宣言。指は寿命の間ずっと有効。 */
 struct known {
     struct n_setting_decl d;
-    uint32_t program;   /* N_SCOPE_PROGRAM の持ち主 */
+    uint64_t program;   /* N_SCOPE_PROGRAM の持ち主 */
     bool kernel;        /* カーネルの領域の鍵 */
     struct conn *owner; /* ユーザー空間の領域の持ち主 */
 };
@@ -121,13 +121,13 @@ static void bytes_free(struct bytes *b) {
 }
 
 /* ---- 宣言の表：(domain, key, program) の順 ---- */
-static int known_compare(uint32_t domain, uint32_t key, uint32_t program, const struct known *k) {
+static int known_compare(uint32_t domain, uint32_t key, uint64_t program, const struct known *k) {
     if (domain != k->d.domain) return domain < k->d.domain ? -1 : 1;
     if (program != k->program) return program < k->program ? -1 : 1;
     if (key != k->d.key) return key < k->d.key ? -1 : 1;
     return 0;
 }
-static size_t known_place(uint32_t domain, uint32_t key, uint32_t program, bool *found) {
+static size_t known_place(uint32_t domain, uint32_t key, uint64_t program, bool *found) {
     size_t lo = 0, hi = known_count;
     *found = false;
     while (lo < hi) {
@@ -142,7 +142,7 @@ static size_t known_place(uint32_t domain, uint32_t key, uint32_t program, bool 
     }
     return lo;
 }
-static struct known *known_find(uint32_t domain, uint32_t key, uint32_t program) {
+static struct known *known_find(uint32_t domain, uint32_t key, uint64_t program) {
     bool found;
     size_t at = known_place(domain, key, program, &found);
     return found ? knowns[at] : NULL;
@@ -215,7 +215,7 @@ static bool decl_valid(const struct n_setting_decl *d) {
 }
 
 /* 宣言を足すか置き換える。 */
-static struct known *known_add(const struct n_setting_decl *d, uint32_t program) {
+static struct known *known_add(const struct n_setting_decl *d, uint64_t program) {
     bool found;
     size_t at = known_place(d->domain, d->key, program, &found);
     if (found) {
@@ -879,7 +879,7 @@ static void answer_declare(struct conn *c, const struct n_settings_request *m, c
         reply(c, m->op, m->serial, -N_ERR_INVALID, N_SETTING_BAD_DECLARATION, 0, NULL, 0);
         return;
     }
-    uint32_t program = 0;
+    uint64_t program = 0;
     if (d.scope == N_SCOPE_PROGRAM) {
         if (!who->program) {
             reply(c, m->op, m->serial, -N_ERR_DENIED, N_SETTING_NOT_ALLOWED, 0, NULL, 0);
@@ -992,7 +992,7 @@ static void on_request(struct conn *c, const struct n_settings_request *m, size_
     default: break;
     }
     struct n_setting_id id = m->id;
-    uint32_t program = id.domain == N_DOMAIN_PROGRAM ? who.program : 0;
+    uint64_t program = id.domain == N_DOMAIN_PROGRAM ? who.program : 0;
     struct known *k = known_find(id.domain, id.key, program);
     if (!k) {
         reply(c, m->op, m->serial, -N_ERR_NOT_FOUND, N_SETTING_UNKNOWN_KEY, 0, NULL, 0);

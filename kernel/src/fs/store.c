@@ -656,6 +656,26 @@ fail:
 
 void place_free(struct place *p) { path_free(&env, &p->path); }
 
+int store_path_number(const char *path, uint64_t *out) {
+    struct path p;
+    int r = path_parse(&env, path, &p);
+    if (r < 0) return r;
+    uint8_t *folded = kmalloc(STORE_KEY_MAX);
+    if (!folded) r = -N_ERR_NO_MEMORY;
+    uint64_t number = 0xcbf29ce484222325ull; /* FNV-1a */
+    for (size_t i = 0; r >= 0 && i < p.count; i++) {
+        int n = name_fold(&store.v->fold, p.part[i].name, p.part[i].n, folded, STORE_KEY_MAX);
+        if (n < 0) r = n;
+        for (int at = 0; at <= n; at++) /* and a byte no folded name has, between the names */
+            number = (number ^ (at < n ? folded[at] : 0)) * 0x100000001b3ull;
+    }
+    kfree(folded);
+    path_free(&env, &p);
+    if (r < 0) return r;
+    *out = number ? number : 1;
+    return 0;
+}
+
 int place_lock(struct place *p, bool user, struct folder_lock **out) {
     struct volume *v = store.v;
     if (!(*out = folder_lock(p->folder))) return -N_ERR_NO_MEMORY;

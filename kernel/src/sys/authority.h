@@ -19,7 +19,7 @@ bool identity_covers(const struct n_identity *holder, const struct n_identity *o
 bool identity_may_reach(const struct n_identity *who, const struct n_identity *target);
 
 /* 子の身元を決める：n_launch の identity と identity_grant を見て親の身元から作る。 */
-int identity_for_child(const struct n_launch *launch, struct n_identity *child);
+int identity_for_child(const struct n_launch *launch, const char *path, struct n_identity *child);
 
 /* 新しい能力（根を最初の process へ渡すためにだけカーネルが作る）。 */
 int cap_new(enum n_cap kind, struct handle **out);

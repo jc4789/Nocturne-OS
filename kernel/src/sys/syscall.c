@@ -816,9 +816,9 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
     int64_t ret = copy_from_user(&l, ul, sizeof l);
     const size_t limit = USER_STACK_MAX / 2; /* what the new app's stack can hold */
     if (ret < 0) goto out;
-    if (l.flags || l.reserved) { ret = -N_ERR_INVALID; goto out; }
+    if ((l.flags & ~N_LAUNCH_SAME_PROGRAM) || l.reserved) { ret = -N_ERR_INVALID; goto out; }
     struct n_identity identity;
-    if ((r = identity_for_child(&l, &identity)) < 0) { ret = r; goto out; }
+    if ((r = identity_for_child(&l, path, &identity)) < 0) { ret = r; goto out; }
     if (l.argument_count > limit / 8 || l.environment_count > limit / 8 ||
         l.handle_count > 4096 || l.terminal_count > 4096) {
         l = (struct n_launch){0};

@@ -242,8 +242,9 @@ struct n_setting_decl {
 struct n_setting_id {
     uint32_t domain, key;
     uint64_t device;  /* N_SCOPE_DEVICE の装置（n_setting_device）。ほかは 0。 */
+    uint64_t program;
     uint32_t user;
-    uint32_t program;
+    uint32_t reserved;
 };
 #define N_SETTING_ANY 0xffffffffu /* N_SETTINGS_WATCH の id：領域か鍵の全部 */
 

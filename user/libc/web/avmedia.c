@@ -1419,7 +1419,7 @@ void web_avmedia_service(uint64_t now){
     uint64_t interval=5;
     for(struct web_avmedia *p=streams;p;p=p->next)if(p->playing&&p->rate&&(!p->mse_active||p->pending.kind||p->ahead.kind||nmedia_mse_worker_needs_service(p->mse_worker))&&(!p->mse_audio_wait||nmedia_mse_worker_pending(p->mse_worker))){
         struct n_audio_status status;
-        if((p->sink>=0&&sink_status(p,&status)==0&&status.queued_frames<1440)||p->pending.kind||nmedia_mse_worker_pending(p->mse_worker)){
+        if((p->sink!=NULL&&sink_status(p,&status)==0&&status.queued_frames<1440)||p->pending.kind||nmedia_mse_worker_pending(p->mse_worker)){
             interval=1;break;
         }
     }

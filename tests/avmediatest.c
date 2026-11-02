@@ -19,8 +19,21 @@ static uint32_t first_frame[96*32];
 static uint64_t paint_started;
 static int early_frames;
 #define CHECK(x) do{checks++;if(!(x)){failed++;printf("FAIL avmediatest:%d %s\n",__LINE__,#x);}}while(0)
-/* 頁が流れを持ったまま終わると、音を鳴らす流れが増える。流れの数に上限は無いので、開けるかだけを見る。 */
-static int audio_slots(void){n_audio_stream *a=NULL;n_result r=n_audio_open(&SOUND_FORMAT,&a);if(r<0)return 0;n_audio_close(a);return 1;}
+static bool audio_opens(void){n_audio_stream *a=NULL;if(n_audio_open(&SOUND_FORMAT,&a)<0)return false;n_audio_close(a);return true;}
+/* 頁が流れを持ったまま終わると、サービスの開いている流れが増える。閉じる知らせは後から届くので、want になるまで待つ。 */
+static int audio_streams(int want){
+    uint64_t until=n_clock_monotonic()+2000*N_NS_PER_MS;
+    for(;;){
+        int streams=-1;
+        n_handle h=n_service_connect(N_AUDIO_SERVICE);
+        struct n_audio_request q={.op=N_AUDIO_OP_OUTPUTS};
+        struct n_audio_reply a;
+        if(h>=0&&n_channel_send(h,&q,sizeof q,-1)>=0&&n_channel_receive(h,&a,sizeof a,N_CHANNEL_WAIT,NULL)==sizeof a&&a.result>=0)streams=(int)a.streams;
+        if(h>=0)n_handle_close(h);
+        if(streams==want||want<0||n_clock_monotonic()>=until)return streams;
+        n_sleep_until(n_clock_after(10*N_NS_PER_MS));
+    }
+}
 static void console(void *opaque,int level,const char *text){
     (void)opaque;
     if(!strncmp(text,"AVMEDIA_DONE ",13))done=atoi(text+13);
@@ -70,25 +83,25 @@ static void first_picture(void){
     if(r==NMEDIA_VIDEO)nmedia_draw(&c,out.pixels,out.width,out.height,0,0,96,32);nmedia_close(m);
 }
 int main(void){
-    int slots=audio_slots();first_picture();
+    int streams=audio_streams(-1);CHECK(streams>=0);bool opens=audio_opens();first_picture();
     FILE *f=fopen(AVMEDIA_CASES_SCRIPT,"rb");CHECK(f!=NULL);if(!f)return 1;
     char *script=malloc(32768);CHECK(script!=NULL);if(!script){fclose(f);return 1;}
     size_t n=fread(script,1,32767,f);script[n]=0;fclose(f);
     const char *prefix="<!doctype html><style>body{margin:0;background:white}video{display:block;width:96px;height:64px}canvas{position:absolute;left:0;top:0;width:96px;height:32px;pointer-events:none}</style><body><video id=visible controls></video><canvas></canvas><script>";
     const char *tail=";runAvmediaCases().catch(e=>console.error('FAIL '+e+' '+e.stack));</script>";
     size_t size=strlen(prefix)+n+strlen(tail)+100;char *page=malloc(size);CHECK(page!=NULL);if(!page){free(script);return 1;}
-    snprintf(page,size,"%svar nativeAudioAvailable=%s;%s%s",prefix,slots>0?"true":"false",script,tail);free(script);
+    snprintf(page,size,"%svar nativeAudioAvailable=%s;%s%s",prefix,opens?"true":"false",script,tail);free(script);
     struct web_host host={.request=request,.cancel=cancel,.console=console};doc=web_live(page,strlen(page),"https://avmedia.test/","utf-8",&host);free(page);CHECK(doc!=NULL);if(!doc)return 1;
     web_layout(doc,320,240);uint64_t deadline=(n_clock_monotonic() / N_NS_PER_MS)+20000;
     while(!done&&!failed&&(n_clock_monotonic() / N_NS_PER_MS)<deadline)step();
     CHECK(done>=17);CHECK(paint_ready==1);CHECK(early_frames>=2);CHECK(requested>=4&&completed>=4);
     bool colored=false;for(int i=0;i<96*64;i++)if(pixels[(i/96)*320+i%96]!=RGB(0,0,0)&&pixels[(i/96)*320+i%96]!=RGB(255,255,255))colored=true;
-    CHECK(colored);web_free(doc);doc=NULL;CHECK(audio_slots()==slots);
+    CHECK(colored);web_free(doc);doc=NULL;CHECK(audio_streams(streams)==streams);
     /* Free while fetch is pending: cancellation, then never deliver to dead doc. */
     memset(queue,0,sizeof queue);requested=0;
     const char *pending="<script>var a=document.createElement('video');a.preload='none';a.src='" AVMEDIA_FRAME_FIXTURE "';a.play().catch(()=>{});</script>";
     doc=web_live(pending,strlen(pending),"https://avmedia.test/","utf-8",&host);CHECK(doc!=NULL);
     if(doc){deadline=(n_clock_monotonic() / N_NS_PER_MS)+3000;while(!requested&&(n_clock_monotonic() / N_NS_PER_MS)<deadline){web_tick(doc,(n_clock_monotonic() / N_NS_PER_MS));n_sleep_until(n_clock_after(1 * N_NS_PER_MS));}CHECK(requested==1);int before=cancels;web_free(doc);doc=NULL;CHECK(cancels==before+1);}
-    CHECK(audio_slots()==slots);
-    printf(AVMEDIA_TEST_NAME ": %d checks, %d failed; audio_slots=%d\n",checks,failed,slots);return failed!=0;
+    CHECK(audio_streams(streams)==streams);
+    printf(AVMEDIA_TEST_NAME ": %d checks, %d failed; audio_streams=%d\n",checks,failed,streams);return failed!=0;
 }

@@ -63,6 +63,10 @@ int store_private_open(uint32_t region, uint32_t user, int access, struct handle
    already keeps the number it has. */
 int store_entry_set_owner(const char *path, uint32_t owner, bool user);
 
+/* A number for the name path gives an entry: the same for every way of writing that path, whatever
+   the case, and across boots. Never 0. It says nothing of whether the entry exists. */
+int store_path_number(const char *path, uint64_t *out);
+
 /* Whole documents. store_save replaces the content and returns once it is on the medium;
    store_append adds to the end, making the document when there is none, and does not wait for the
    medium. */

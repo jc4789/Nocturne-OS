@@ -285,13 +285,15 @@ struct n_launch {
     const int32_t *terminals;
     uint32_t terminal_count;
     int32_t interrupts;
-    /* 子の身元。NULL：親と同じ。cls は親を超えられない。user・session・program を親と変えるには、
+    /* 子の身元。NULL：親と同じ user・session・cls。cls は親を超えられない。user・session を親と変えるには、
        identity_grant に N_CAP_IDENTITY_GRANT の handle を渡す。identity が NULL なら読まない。
-       能力は handles の列で渡す（子は SYS_CAP_FIND で引く）。 */
+       program は書けない（0）：カーネルが path から決める。能力は handles の列で渡す（子は SYS_CAP_FIND で引く）。 */
     const struct n_identity *identity;
     int32_t identity_grant;
     uint32_t reserved;
 };
+/* n_launch の flags：子を呼ぶ側と同じプログラムにする。プログラムの部品が親の N_SCOPE_PROGRAM の設定を読むため。 */
+#define N_LAUNCH_SAME_PROGRAM 1
 /* アプリの入口の第三引数。カーネルが n_launch の欄を新しいアプリの stack に写したもの。文字列と
    配列は同じ stack にある。folder は完全なパスか NULL。 */
 struct n_start {

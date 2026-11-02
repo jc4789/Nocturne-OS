@@ -424,12 +424,12 @@ static n_result settings_read(struct prefs *p) {
     return r < 0 ? r : n < 0 ? n : 0;
 }
 
-/* 読んでプロセスのものにする。サービスが無ければ既定で動き、読み直さない（見張りが戻れば読む）。ほかの失敗は次の
+/* 読んでプロセスのものにする。サービスに届かなければ今の値を保ち、まだ値が無ければ既定で動く。サービスが無ければ読み直さない（見張りが戻れば読む）。ほかの失敗は次の
    使用で読み直す。io の下。 */
 static void refresh_locked(void) {
     struct prefs p;
     n_result r = settings_read(&p);
-    if (r >= 0 || r == -N_ERR_NOT_FOUND) apply(&p);
+    if (r >= 0 || r == -N_ERR_NOT_FOUND || !current.languages_length) apply(&p);
     else free(p.sites);
     __atomic_store_n(&valid, (r >= 0 || r == -N_ERR_NOT_FOUND) && (queue < 0 || watch >= 0), __ATOMIC_RELEASE);
 }

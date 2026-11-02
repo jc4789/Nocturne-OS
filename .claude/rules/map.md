@@ -80,7 +80,7 @@
 | `host/store/store.c` | ホストの道具。C: を作り、詰め、検査する。 |
 | `boot/limine.conf` | 起動の項目は一つ。起動の記録 `settings.rec` を module で持ち込む。 |
 | `rootfs/` | C: にそのまま入るもの（`Nocturne\`）と、新しい利用者のフォルダーの元（`NewUser\`、C: の `Nocturne\NewUser`）。 |
-| `scripts/` | ビルド、媒体、試験、生成、Hyper-V の道具。 |
+| `scripts/` | ビルド、媒体、生成、Hyper-V の道具。 |
 | `tests/` | ゲストの試験（`runtests.c`）、試験の媒体のサービス（`testrun.c`）、WPT の runner、ホストの検査 `check_*.py`（`check_hda_codec.py` は codec の表で widget の木を試す）。 |
 | `docs/` | 仕様 `nocturne-native-abi.md`、台帳 `*/LEDGER.md`、日付入りの報告。 |
 | `build/`・`tools/`・`hyperv/`・`local/`・`.codegraph/` | git の外。ビルドの出力、同梱の道具、Hyper-V のディスク、GSP の firmware、codegraph の索引。 |
@@ -149,9 +149,8 @@ user/libc/sys.c の SYSCALL
 - 出力は `build/kernel.elf`、`build/programs/`、`build/sdk/`、`build/c.list`、`build/nocturne.img`・`.vhdx`・`.iso`。
 - C: の中身は `scripts/layout.py` が `build/c.list` を作り、`build/host/store.exe fill` が詰める。
 - 任意の移植の道具は `tools/go`、`tools/TypeScript`、`tools/rust`、`tools/llvm`、`local/firmware/`。
-- ゲストの試験の表は `tests/runtests.c` の `tests[]`。回すのは `scripts/test.py`。
+- ゲストの試験の表は `tests/runtests.c` の `tests[]`。
 - 試験の旗を読むカーネルは `make kernel-test`（`build/kernel-test.elf`、`NOCTURNE_TEST_FLAGS`）。製品のカーネルは起動の引数を読まない。
-- WPT は `scripts/wpt.py <path>…`。ゲストの側は `tests/wptrunner.c`。
 - QuickJS の test262 はホストの `tests/check_test262.py`。
 
 ## 記録と道具

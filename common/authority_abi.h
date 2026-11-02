@@ -8,7 +8,8 @@ struct n_identity {
     uint32_t user;    /* 利用者の番号。0 はシステム。 */
     uint32_t session; /* セッションの番号。0 はセッションの外。 */
     uint32_t cls;     /* enum n_class */
-    uint32_t program; /* サービスの管理者が割り当てるプログラムの番号。 */
+    uint32_t reserved;
+    uint64_t program; /* プログラムの番号。カーネルが起こした文書のパスから決める。0 は最初のプロセスだけ。 */
 };
 /* 能力。特権は handle で持つ。 */
 enum n_cap {

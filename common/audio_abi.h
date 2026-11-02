@@ -107,7 +107,7 @@ struct n_audio_request {
 };
 struct n_audio_reply {
     int32_t result;    /* 0 か -N_ERR_* */
-    uint32_t reserved;
+    uint32_t streams;  /* OUTPUTS：アプリが開いている流れの数（閉じて残りを鳴らしているものは数えない）。 */
     uint64_t bytes;    /* OPEN：輪の共有 object の大きさ。OUTPUTS：続く一通の大きさ。 */
 };
 

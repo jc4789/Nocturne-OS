@@ -248,7 +248,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     返す。受け取る場所を確保できない大きなメッセージを断るため。`PEEK` とは併用できず、
     未知のフラグと共に `N_ERR_INVALID`。
   - `attach` は文書、共有ページ、能力、チャンネルの端のハンドル（無ければ -1）。ほかの種類は
-    `N_ERR_WRONG_KIND`。メッセージと一緒に運ばれ、受信側で新しいハンドルとして `attached` に入る
+    `N_ERR_WRONG_KIND`。自分の channel の端は運べず `N_ERR_BUSY`。メッセージと一緒に運ばれ、受信側で新しいハンドルとして `attached` に入る
     （無ければ -1）。送った側のハンドルは開いたまま残る。
   - チャンネルの端を運ぶとき、自分のチャンネルの端と、運ばれている途中の端へ送るものと、別の端を
     運んでいる端は `N_ERR_BUSY`。端が端を運ぶ輪はできない。
@@ -1248,10 +1248,16 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   決まり、変わらない。アプリは書けない。`n_identity_self(&out)` で読む。
 - 級（`cls`）は `N_CLASS_USER`、`N_CLASS_ADMIN`、`N_CLASS_SYSTEM`。上の級ほど広い。
 - 子の身元（`struct n_launch` の `identity`）：
-  - NULL なら親と同じ。
+  - NULL なら親と同じ `user`・`session`・`cls`。
   - `cls` は親を超えられない。超えれば `N_ERR_DENIED`。
-  - `user`・`session`・`program` を親と変えるには、`identity_grant` に `N_CAP_IDENTITY_GRANT` の能力を
+  - `user`・`session` を親と変えるには、`identity_grant` に `N_CAP_IDENTITY_GRANT` の能力を
     渡す。無ければ `N_ERR_DENIED`。
+- プログラムの番号（`program`）はカーネルが決める。起こす文書のパスから作り、パスの書き方と大小によらず、
+  起動をまたいで同じ。`identity` の `program` は 0 で渡す（ほかは `N_ERR_INVALID`）。
+  - `n_launch` の `flags` の `N_LAUNCH_SAME_PROGRAM`：子を呼ぶ側と同じ番号にする。プログラムの部品（ブラウザーの
+    `webfetch`、`browserjsworker`）が親の設定を読むために付ける。呼ぶ側が自分の番号を渡すだけなので、能力は要らない。
+  - スクリプトの番号は、それを走らせる解釈系の文書から決まる。
+  - この番号は設定の名前の範囲で、同じ利用者のプログラムどうしの権限の壁ではない。
 - 触れてよい相手：SYSTEM は全部。ADMIN は SYSTEM 以外。USER は同じ `user` で同じ `session` の USER。
   `n_app_open`、`proclist`、`clipboard_get` がこの規則に従う。
 - 能力（`N_KIND_CAPABILITY`）は特権を一つ持つハンドル。持つことが権限の証明で、渡すことが委譲。
@@ -1320,7 +1326,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   受ける向きは受け口で、`n_inlet_accept(N_SERVICE_HANDLE_CONTROL, flags)` が相手の端を返す。
   送る向きは準備の知らせ一通。管理者がこの channel を閉じると `N_ERR_CLOSED` になる。これが止める指示で、
   5 秒の後に `n_app_stop` で止める。
-- 名前の範囲：宣言のプログラム（`program` が 0 でない）か `N_CLASS_SYSTEM` が申し込んだ名前は機械全体で引ける。
+- 名前の範囲：サービスの管理者が起こしたプログラム（`user` が 0）か `N_CLASS_SYSTEM` が申し込んだ名前は機械全体で引ける。
   ほかは申し込んだ者と同じ `user` と `session` の相手にだけ見える。別の利用者は同じ名前を別に申し込める。
   宣言の名前と管理者の名前は申し込めない（`N_ERR_DENIED`）。
 - 管理者の口：`n_service_connect(N_SERVICE_MANAGER)` の記録は `struct n_services_request` と `struct n_service_status`。

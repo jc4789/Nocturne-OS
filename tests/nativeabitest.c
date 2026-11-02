@@ -298,7 +298,10 @@ static void channels(void) {
     CHECK(got >= 0 && n_handle_kind(got) == N_KIND_DOCUMENT);
     CHECK(n_document_read_at(got, 0, buf, sizeof buf) == 8 && !memcmp(buf, "attached", 8));
     n_handle_close(got);
-    CHECK(n_channel_send(c[0], "x", 1, c[1]) == -N_ERR_WRONG_KIND);
+    CHECK(n_channel_send(c[0], "x", 1, c[1]) == -N_ERR_BUSY); /* a channel does not carry its own end */
+    n_handle queue = n_events_create();
+    CHECK(queue >= 0 && n_channel_send(c[0], "x", 1, queue) == -N_ERR_WRONG_KIND);
+    n_handle_close(queue);
     CHECK(n_channel_send(c[0], "plain", 5, -1) == 5);
     got = 7;
     CHECK(n_channel_receive(c[1], buf, sizeof buf, 0, &got) == 5 && got == -1);

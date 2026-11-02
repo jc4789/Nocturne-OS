@@ -311,34 +311,7 @@ TypeScript, so a complete desktop needs both; toolchains in `tools/go` and `tool
 
 ## Tests
 
-```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1 test        # the full suite (takes a while)
-powershell -ExecutionPolicy Bypass -File build.ps1 test-quick  # skips compiling every app and tcc rebuilding itself
-powershell -ExecutionPolicy Bypass -File build.ps1 test-full   # adds tcc rebuilding itself inside the OS
-```
-
-`scripts/test.py` copies `build\nocturne.img` to `build\test.img`, puts `tests/` in its `C:\Tests` and boots it
-headless in QEMU. It first checks that the copy's kernel and programs are the current build's; your `run.img` is
-not touched. The in-OS `tcc` compiles the test runner (`tests/runtests.c`), which runs about 220 tests in about
-110 groups and checks each one's exit status and output. Results come back over the serial port, and afterwards
-the host checks the C: the OS wrote with `store check` (the copy is kept only when that finds problems). The tests cover:
-- The shell and commands, `malloc`, the native ABI, threads and parallel work.
-- W^X: writing code or read-only data, and running the stack or heap, must stop the app.
-- The store (drive C:): documents of many sizes around the edges of 4 KiB blocks, replace, append, resize and positional
-  writes, move, long names, names in any case, nested folders, listing and removal.
-- `tcc`: printf and math, compiling every app, and self-hosting. C++.
-- The GUI: a window appears on screen and is gone after it closes.
-- Sound: streams, waiting and non-waiting writes, eight streams at once, the volume, `beep`, and `play` with many
-  WAV formats. QEMU records the AC'97 output to `build/test-audio.wav`, and the host checks each tone's pitch,
-  channel and length. Media decoding is tested too.
-- The web engine: element positions, painted pixels, CSS, forms, charsets, URLs, Workers, IndexedDB, WebAssembly,
-  and parts of WPT and html5lib. Broken and deeply nested pages must not crash it.
-- Network: DHCP, ping, DNS, HTTP, HTTPS, a rejected bad certificate, HTTP/2 and TLS resumption.
-- TCP: 14 MiB to and from a host-side server, with simulated loss and reordering, checking every byte.
-- The agent, offline: it never needs an API key.
-
-The network tests need internet access from the host. Without it, use `python scripts/test.py --no-net`.
-`--accel whpx`, `--cpus`, `--memory` and group names (`python scripts/test.py web tcp`) can also be given.
+The checks made during the build are `tests/check_*.py`. The sources of the tests that run inside the OS are in `tests/`.
 
 `scripts/qtest.py` boots `build\nocturne.img` with `snapshot=on` (whatever is written to C: is dropped when QEMU
 stops) and drives it with keystrokes, mouse moves and screenshots:
@@ -544,7 +517,7 @@ Programs are linked statically against Nocturne's libc; the headers and librarie
 - `threads.h`, `parallel.h`.
 - `http.h` (HTTP and HTTPS), `json.h`, `png.h` and BearSSL.
 
-tcc can also compile itself: its own source rebuilds inside the OS into a working compiler (`build.ps1 test-full`).
+tcc can also compile itself: its own source rebuilds inside the OS into a working compiler.
 
 ### C++
 
@@ -666,7 +639,7 @@ rootfs/       files put on C: (Nocturne\: the system's documents, fonts and type
 host/         host tools (store: makes, reads, writes and checks C:)
 ports/        build settings and patches for ported code (tcc, go, rust, typescript, lexbor, freetype, ffmpeg, mesa, nvidia, wabt, virgl)
 third_party/  vendored sources (see Credits)
-scripts/      boot disk (mkimage.sh, layout.py) and SDK (mksdk.sh) builders, test.py, qtest.py, hv-*.ps1
+scripts/      boot disk (mkimage.sh, layout.py) and SDK (mksdk.sh) builders, qtest.py, hv-*.ps1
 tests/        the in-OS test suite (runtests.c and the programs it compiles), host-side checks, test material
 docs/         README pictures, design documents and work logs
 build.ps1     build entry point

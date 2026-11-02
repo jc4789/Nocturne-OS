@@ -1,6 +1,7 @@
 /* 身元と能力の持ち主（sys/authority.h）。 */
 #include "kernel.h"
 #include "arch/spin.h"
+#include "fs/store.h"
 #include "mm/heap.h"
 #include "sys/authority.h"
 #include "sys/object.h"
@@ -30,20 +31,24 @@ bool identity_may_reach(const struct n_identity *who, const struct n_identity *t
     return target->cls == N_CLASS_USER && target->user == who->user && target->session == who->session;
 }
 
-int identity_for_child(const struct n_launch *l, struct n_identity *child) {
+int identity_for_child(const struct n_launch *l, const char *path, struct n_identity *child) {
     const struct n_identity *self = identity_current();
     *child = *self;
-    if (!l->identity) return 0;
-    struct n_identity wanted;
-    int r = copy_from_user(&wanted, l->identity, sizeof wanted);
-    if (r < 0) return r;
-    if (wanted.cls > self->cls) return -N_ERR_DENIED;
-    if (wanted.user != self->user || wanted.session != self->session || wanted.program != self->program) {
-        r = cap_check(l->identity_grant, N_CAP_IDENTITY_GRANT);
+    if (l->identity) {
+        struct n_identity wanted;
+        int r = copy_from_user(&wanted, l->identity, sizeof wanted);
         if (r < 0) return r;
+        if (wanted.program || wanted.reserved) return -N_ERR_INVALID;
+        if (wanted.cls > self->cls) return -N_ERR_DENIED;
+        if (wanted.user != self->user || wanted.session != self->session) {
+            r = cap_check(l->identity_grant, N_CAP_IDENTITY_GRANT);
+            if (r < 0) return r;
+        }
+        *child = wanted;
     }
-    *child = wanted;
-    return 0;
+    child->program = self->program;
+    if (l->flags & N_LAUNCH_SAME_PROGRAM) return 0;
+    return store_path_number(path, &child->program);
 }
 
 /* ---- 能力：object の中身は種類だけ。持つことが権限で、渡すことが委譲。 ---- */

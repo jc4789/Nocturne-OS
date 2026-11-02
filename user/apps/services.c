@@ -105,7 +105,6 @@ static const struct declared_service *declared_named(const char *name) {
 }
 
 /* プログラムの番号は表の位置から。0 は宣言に無いプログラム。 */
-static uint32_t program_number(const struct declared_service *d) { return (uint32_t)(d - declared) + 1; }
 
 /* ---- 受け口へ送る列 ---- */
 struct pending_request {
@@ -359,7 +358,7 @@ static void start(struct instance *in) {
     }
     const char *arguments[2] = {d->program, in->argument};
     static const int32_t terminals[] = {0, 1, 2};
-    struct n_identity identity = {.user = 0, .session = 0, .cls = (uint32_t)d->cls, .program = program_number(d)};
+    struct n_identity identity = {.user = 0, .session = 0, .cls = (uint32_t)d->cls};
     struct n_launch launch = {.arguments = arguments, .handles = handles, .argument_count = in->argument[0] ? 2 : 1,
                               .folder = "C:\\", .terminals = terminals, .terminal_count = d->console && n_terminal(1) ? 3 : 0,
                               .handle_count = handle_count, .identity = &identity, .identity_grant = grant_cap};
@@ -537,7 +536,7 @@ static void bind_serve(void *arg) {
         else if (strlen(name) != (size_t)size || name_is_ours(name)) result = -N_ERR_DENIED;
         else if (bound_find(name, &client->from)) result = -N_ERR_EXISTS;
         else {
-            b->machine_wide = client->from.program != 0 || client->from.cls >= N_CLASS_SYSTEM;
+            b->machine_wide = client->from.user == 0 || client->from.cls >= N_CLASS_SYSTEM;
             b->user = client->from.user;
             b->session = client->from.session;
             b->name = name;
