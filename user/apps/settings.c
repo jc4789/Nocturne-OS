@@ -499,11 +499,10 @@ static void services_page(struct ui_msg *m) {
     if (!service_count) text_node(m, "サービスの一覧がありません。", "caption", 0);
     for (uint32_t i = 0; i < service_count; i++) {
         const struct n_service_status *st = &services[i];
-        char name[N_SERVICE_TEXT_MAX + 8], key[N_SERVICE_TEXT_MAX + 16], line[160];
+        char name[N_SERVICE_NAME_MAX + N_SERVICE_ARGUMENT_MAX + 1], line[160];
         snprintf(name, sizeof name, st->argument[0] ? "%s:%s" : "%s", st->name, st->argument);
-        snprintf(key, sizeof key, "%s/%u", name, st->session);
         snprintf(line, sizeof line, "%s。起こし直し %u 回。", service_state_text(st->state), st->restarts);
-        ui_node(m, "card"); ui_num(m, "gap", 8); ui_str(m, "key", key);
+        ui_node(m, "card"); ui_num(m, "gap", 8); ui_str(m, "key", name);
             ui_node(m, "row"); ui_num(m, "gap", 10);
                 ui_node(m, "column"); ui_num(m, "gap", 4); ui_num(m, "grow", 1);
                     text_node(m, name, "heading", 0);

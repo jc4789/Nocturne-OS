@@ -429,7 +429,7 @@ n_result n_channel_receive(n_handle h, void *buf, size_t cap, int flags, n_handl
 n_result n_channel_receive_from(n_handle h, void *buf, size_t cap, int flags, struct n_channel_message *message) {
     return NC5(SYS_CHANNEL_RECEIVE_FROM, h, buf, cap, flags, message);
 }
-n_handle n_app_launch(const char *path, const struct n_launch *launch) {
+static n_handle launch_program(const char *path, const struct n_launch *launch) {
     n_handle app = (n_handle)NC5(SYS_APP_LAUNCH, path, launch, 0, 0, 0);
     if (app != -N_ERR_NOT_PROGRAM || !launch) return app;
     /* a script: its interpreter runs it, with the script's name before the rest */
