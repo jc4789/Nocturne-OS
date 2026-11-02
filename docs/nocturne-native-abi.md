@@ -480,8 +480,8 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   （`clock_t` は ns の数で、`CLOCKS_PER_SEC` は 1000000000）。
 - `gettimeofday`、`struct timeval` は無い。ISO Cの `time`／`timespec_get`／`localtime`／`gmtime`
   （と C23 の `localtime_r`／`gmtime_r`）はこれらの上に実装する（`timespec_get` の
-  `TIME_MONOTONIC` は単調時計、`TIME_UTC` は壁時計で、どちらも ns まで）。時刻帯は無い。時計は
-  地方時を持つので、`localtime` は `gmtime` と同じに分解する。`tm_year` に入らない年は
+  `TIME_MONOTONIC` は単調時計、`TIME_UTC` は壁時計で、どちらも ns まで）。時計は UTC を持つ。
+  `localtime` は設定 `N_TIME_ZONE_MINUTES` を足して分解する。`tm_year` に入らない年は
   `NULL`（`errno` は `EOVERFLOW`）。
 - `proclist` の `struct n_procinfo` の `cpu_ns`（走った時間）と `start_ns`（始まった単調時計の
   時刻）、`sysinfo` の `struct n_sysinfo` の `uptime_ns`（単調時計）も ns。
@@ -1171,7 +1171,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   | `N_DOMAIN_WINDOW` | `N_WINDOW_SMOOTH_GRADIENTS` | `gui/wm.c` |
   | `N_DOMAIN_INPUT` | `N_INPUT_POINTER_SPEED`（-2〜2） | `gui/wm.c` |
   | `N_DOMAIN_POWER` | `N_POWER_PERFORMANCE_PREFERENCE`（0〜255） | `arch/idle.c` |
-  | `N_DOMAIN_NETWORK` | `N_NETWORK_DNS_SERVER`、`N_NETWORK_TCP_RX_BYTES`、`N_NETWORK_TCP_TX_BYTES` | `net/net.c` |
+  | `N_DOMAIN_NETWORK` | `N_NETWORK_TCP_RX_BYTES`、`N_NETWORK_TCP_TX_BYTES` | `net/net.c` |
 
 - `n_settings_apply(cap, domain, key, value, size)`（`SYS_SETTINGS_APPLY`）：持ち主へ渡す。`cap` は
   `N_CAP_SETTINGS_APPLY` の能力（§13）で、持つのは設定のサービス。プログラムはサービスへ頼む。
@@ -1242,7 +1242,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 - 能力（`N_KIND_CAPABILITY`）は特権を一つ持つハンドル。持つことが権限の証明で、渡すことが委譲。
   起動の表か、メッセージの添付で渡す。
   - 種類：`N_CAP_ROOT`、`N_CAP_SERVICE_ROOT`、`N_CAP_IDENTITY_GRANT`、`N_CAP_PCI_CLAIM`、`N_CAP_POWER`、
-    `N_CAP_SCREEN_READ`、`N_CAP_SETTINGS_APPLY`、`N_CAP_STORE_PRIVATE`、`N_CAP_SHELL`。
+    `N_CAP_SCREEN_READ`、`N_CAP_SETTINGS_APPLY`、`N_CAP_STORE_PRIVATE`、`N_CAP_SHELL`、`N_CAP_NETWORK`、`N_CAP_CLOCK`。
   - カーネルが作るのは `N_CAP_ROOT` を一つだけで、最初のプロセスがハンドル `N_INITIAL_ROOT_HANDLE`
     （3）で受ける。最初のプロセスの身元は `user` 0、`session` 0、`N_CLASS_SYSTEM`、`program` 0。
   - `n_cap_derive(cap, kind)`：`N_CAP_ROOT` は全部の種類を、ほかの能力は同じ種類だけを切り出す。
@@ -1260,6 +1260,8 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 | `n_shell_*`、`n_power_state`、`n_power_watch` | `N_CAP_SHELL` |
 | `n_system_log`、`n_system_log_open` の受信 | 級が ADMIN 以上（書くのは誰でも） |
 | `SYS_NET_TEST` | 級が ADMIN 以上 |
+| `n_net_address_set`、`n_net_routes_set`、`udp_socket_on` | `N_CAP_NETWORK` |
+| `n_clock_wall_step`、`n_clock_wall_slew`、`n_rtc_write` | `N_CAP_CLOCK` |
 
 - チャンネルの端の身元：`n_channel_peer` が読む値。
   - `n_channel_pair` の両端は作った者の身元で始まる。カーネルが作る端はシステムの身元で始まる。
@@ -1312,6 +1314,14 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 - セッション：サービス `session`。ログインの窓を出し、選ばれた利用者の身元と `N_CAP_SHELL` でシェル
   `C:\Nocturne\System\shell`（§16）を起こす。シェルが落ちたら起こし直す。コンソールの起動は同じ身元で `sh` を起こす。
   `n_session_end`（`N_SESSION_END`）でセッションのプログラムを止め、ログインの窓へ戻る。
+- 網：サービス `network`（`user/apps/network.c`）。DHCP（RFC 2131）、固定の住所、経路の表、名前引きと cache を持つ。
+  カーネルは adapter の一覧（`n_net_adapters`、`n_net_adapter_name`、見張りは `n_net_watch`）、IP、TCP、UDP を持つ。
+  `net_resolve*` は `N_NETWORK_RESOLVE`、`n_network_links` は `N_NETWORK_LINKS` の記録を送る。数字の住所と `localhost` は libc が答える。
+  `net_set_setup_cancel_channel` の相手が閉じると、接続を閉じて `N_ERR_CANCELLED` で戻る。同じ名前の要求は一つの問いを待ち、
+  待つ者が全部消えると問いは止まる。設定は `N_NETWORK_DNS_SERVER`、`N_NETWORK_FIXED_ADDRESS`（adapter ごと、`struct n_setting_ipv4`）、
+  `N_NETWORK_PROXY_HOST`、`N_NETWORK_PROXY_PORT`。proxy は HTTP の接続に効き、平文の HTTP は absolute-form、ほかは CONNECT で通る。
+- 時刻：サービス `timesync`（`user/apps/timesync.c`）。SNTP（RFC 4330）で時計と RTC を合わせる。聞く先は DHCP の言う NTP のサーバー、
+  無ければ `N_TIME_SERVER`。入切は `N_TIME_SYNC`。差が 128 ms 以上なら step、未満は 500 ppm の slew。カーネルの時計は UTC だけ。
 - 機械：サービス `machine`。`N_CAP_POWER` と `N_CAP_SCREEN_READ` を持ち、利用者のアプリの電源と画面の依頼を受ける
   （`n_machine_power`、`n_machine_screen`）。能力をアプリへ配らない。`n_machine_choose(op)` は利用者がメニューで
   選んだ操作で、`N_MACHINE_SLEEP`・`N_MACHINE_HIBERNATE` も受ける。結果を待たずに戻り、段取りは `n_power_state`（§16）で届く。

@@ -1,28 +1,42 @@
-/* ifconfig: show the network interface */
+/* ifconfig: show the network adapters */
 #include <stdio.h>
+#include <stdlib.h>
 #include "nocturne.h"
+#include "nocturne_services.h"
 
-static void addr(const char *label, const uint8_t *a) { printf("  %-9s %u.%u.%u.%u\n", label, a[0], a[1], a[2], a[3]); }
-
+/* The kernel's list, and what the service network says of each adapter. */
 int main(void) {
-    struct n_netinfo ni;
-    if (net_info(&ni) < 0 || !ni.present) {
-        printf("no network interface\n");
+    n_result count = n_net_adapters(NULL, 0);
+    struct n_net_adapter *list = count > 0 ? malloc((size_t)count * sizeof *list) : NULL;
+    if (list) count = n_net_adapters(list, (size_t)count);
+    if (!list || count <= 0) {
+        printf("no network adapter\n");
         return 1;
     }
-    int prefix = 0;
-    for (int i = 0; i < 4; i++)
-        for (int b = 7; b >= 0; b--) prefix += (ni.mask[i] >> b) & 1;
-    printf("\033[1;35meth0\033[0m: %s  driver %s\n", ni.up ? "\033[32mUP\033[0m" : "\033[33mwaiting for DHCP\033[0m",
-           ni.driver);
-    printf("  ether     %02x:%02x:%02x:%02x:%02x:%02x\n", ni.mac[0], ni.mac[1], ni.mac[2], ni.mac[3], ni.mac[4],
-           ni.mac[5]);
-    if (ni.up) {
-        printf("  inet      %u.%u.%u.%u/%d\n", ni.ip[0], ni.ip[1], ni.ip[2], ni.ip[3], prefix);
-        addr("gateway", ni.gateway);
-        addr("dns", ni.dns);
+    struct n_network_link *links = NULL;
+    n_result link_count = n_network_links(&links);
+    for (n_result i = 0; i < count; i++) {
+        const struct n_net_adapter *a = &list[i];
+        char driver[64] = "";
+        n_result named = n_net_adapter_name(a->id, driver, sizeof driver - 1);
+        if (named > 0) driver[named < (n_result)sizeof driver ? named : (n_result)sizeof driver - 1] = 0;
+        printf("\033[1;35madapter %u\033[0m: %s  driver %s\n", (unsigned)a->id,
+               !a->present ? "\033[31mabsent\033[0m" : a->ip ? "\033[32mUP\033[0m" : "\033[33mno address\033[0m", driver);
+        printf("  ether     %02x:%02x:%02x:%02x:%02x:%02x\n", a->mac[0], a->mac[1], a->mac[2], a->mac[3], a->mac[4], a->mac[5]);
+        char text[16];
+        if (a->ip) printf("  inet      %s/%d\n", ip_format(a->ip, text), __builtin_popcount(a->mask));
+        struct n_network_link *link = links;
+        for (n_result l = 0; l < link_count; l++, link = n_network_link_next(link)) {
+            if (link->adapter != a->id) continue;
+            if (link->gateway) printf("  gateway   %s\n", ip_format(link->gateway, text));
+            const uint32_t *addresses = n_network_link_addresses(link);
+            for (uint32_t d = 0; d < link->dns_count; d++) printf("  dns       %s\n", ip_format(addresses[d], text));
+            for (uint32_t d = 0; d < link->ntp_count; d++) printf("  ntp       %s\n", ip_format(addresses[link->dns_count + d], text));
+        }
+        printf("  packets   rx %lu  tx %lu\n", (unsigned long)a->rx_packets, (unsigned long)a->tx_packets);
     }
-    printf("  packets   rx %lu  tx %lu\n", (unsigned long)ni.rx_packets, (unsigned long)ni.tx_packets);
+    free(links);
+    free(list);
     struct n_netstats stats;
     if (net_stats(&stats)==0) {
         printf("  receive   dropped %lu  invalid %lu  budget yields %lu\n",

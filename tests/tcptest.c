@@ -136,14 +136,6 @@ int main(int argc, char **argv) {
             printf("TCPPERF sample=%d bytes=4194304 download_ms=%ld upload_ms=%ld\n", i + 1, down, up);
             check(down >= 0 && up >= 0, "clean repeated payload and server validation");
         }
-#ifdef N_TCP_SEND_NONBLOCK
-        /* Read existing counters after all timed transfers, never in a hot loop. */
-        struct n_netstats counters;
-        if (net_stats(&counters) == 0) for (unsigned cpu = 1; cpu < 16; cpu++)
-            if (counters.ap_calls[cpu]) printf("TCPPERF cpu=%u calls=%lu fallback=%lu tx=%lu rx=%lu\n", cpu,
-                (unsigned long)counters.ap_calls[cpu], (unsigned long)counters.ap_fallbacks[cpu],
-                (unsigned long)counters.ap_send_bytes[cpu], (unsigned long)counters.ap_recv_bytes[cpu]);
-#endif
         printf("tcptest: %d failed\n", failed);
         return failed != 0;
     }

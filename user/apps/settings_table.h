@@ -1,7 +1,9 @@
-/* 設定の宣言の表：カーネルの領域の鍵と、持ち主の無い時刻の鍵。settingsd が読み、tests/check_settings.py
-   が調べる。ユーザー空間のサービスとプログラムの鍵は、それぞれが N_SETTINGS_DECLARE で足す。 */
+/* 設定の宣言の表：カーネルの領域の鍵と、適用の無い鍵（N_APPLY_NONE）。適用の無い鍵は持ち主のサービスが
+   見張りで読む。settingsd が読み、tests/check_settings.py が調べる。プログラムの鍵は、それぞれが
+   N_SETTINGS_DECLARE で足す。 */
 #pragma once
 #include "settings_abi.h"
+#include "abi.h"
 
 #define BOOL_SETTING(dom, k, sc, how, nm, lb, ab, def) \
     {.domain = dom, .key = k, .type = N_SETTING_BOOL, .scope = sc, .apply = how, .min = 0, .max = 1, .fallback = def, \
@@ -44,8 +46,16 @@ static const struct n_setting_decl settings_table[] = {
                 "CPU の性能の好み", "0 が性能、255 が省電力です。", 0, 255, 128),
     /* 網 */
     {.domain = N_DOMAIN_NETWORK, .key = N_NETWORK_DNS_SERVER, .type = N_SETTING_ENDPOINT, .scope = N_SCOPE_MACHINE,
-     .apply = N_APPLY_NOW, .name = "network.dns-server", .label = "DNS のサーバー",
-     .about = "既定の resolver です。0.0.0.0 は DHCP の言うものを使います。"},
+     .apply = N_APPLY_NONE, .name = "network.dns-server", .label = "DNS のサーバー",
+     .about = "名前を引く先です。0.0.0.0 は DHCP の言うものを使います。"},
+    {.domain = N_DOMAIN_NETWORK, .key = N_NETWORK_FIXED_ADDRESS, .type = N_SETTING_IPV4, .scope = N_SCOPE_DEVICE,
+     .apply = N_APPLY_NONE, .flags = N_SETTING_DECL_CUSTOM, .name = "network.fixed-address", .label = "固定の住所",
+     .about = "adapter ごとの住所、マスク、ゲートウェイです。住所 0.0.0.0 は DHCP を使います。"},
+    {.domain = N_DOMAIN_NETWORK, .key = N_NETWORK_PROXY_HOST, .type = N_SETTING_STRING, .scope = N_SCOPE_MACHINE,
+     .apply = N_APPLY_NONE, .max = DNS_NAME_TEXT_BYTES, .name = "network.proxy-host", .label = "HTTP proxy",
+     .about = "HTTP と HTTPS の接続が通る proxy の名前か住所です。空なら直接つなぎます。"},
+    INT_SETTING(N_DOMAIN_NETWORK, N_NETWORK_PROXY_PORT, N_SCOPE_MACHINE, N_APPLY_NONE, "network.proxy-port",
+                "HTTP proxy のポート", "proxy の TCP のポートです。", 1, 65535, 8080),
     INT_SETTING(N_DOMAIN_NETWORK, N_NETWORK_TCP_RX_BYTES, N_SCOPE_MACHINE, N_APPLY_NOW, "network.tcp-receive",
                 "TCP の受信の容量", "これから開く接続の受信の容量（バイト）です。", 4096, INT32_MAX, 1048576),
     INT_SETTING(N_DOMAIN_NETWORK, N_NETWORK_TCP_TX_BYTES, N_SCOPE_MACHINE, N_APPLY_NOW, "network.tcp-send",
@@ -53,6 +63,11 @@ static const struct n_setting_decl settings_table[] = {
     /* 時刻 */
     INT_SETTING(N_DOMAIN_TIME, N_TIME_ZONE_MINUTES, N_SCOPE_USER, N_APPLY_NONE, "time.zone-minutes",
                 "時間帯", "時計の時刻に足す分です。localtime がこの値を読みます。", -720, 840, 0),
+    BOOL_SETTING(N_DOMAIN_TIME, N_TIME_SYNC, N_SCOPE_MACHINE, N_APPLY_NONE, "time.sync", "時刻を網で合わせる",
+                 "NTP のサーバーに聞いて時計と RTC を合わせます。", 1),
+    {.domain = N_DOMAIN_TIME, .key = N_TIME_SERVER, .type = N_SETTING_STRING, .scope = N_SCOPE_MACHINE,
+     .apply = N_APPLY_NONE, .max = DNS_NAME_TEXT_BYTES, .fallback_text = "pool.ntp.org", .name = "time.server",
+     .label = "NTP のサーバー", .about = "DHCP が NTP のサーバーを言わないときに聞く名前です。"},
 };
 #undef BOOL_SETTING
 #undef INT_SETTING

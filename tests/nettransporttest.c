@@ -6,6 +6,8 @@
 #include <string.h>
 #include <errno.h>
 #include "nocturne.h"
+#include "nocturne_services.h"
+#include "nocturne_settings.h"
 #include "http.h"
 
 #define HOST 0x0a000202u
@@ -294,8 +296,8 @@ static void parallel_transfers(void) {
     check(correct,"parallel native TCP connections preserve every byte");
 }
 static bool stream_default_dns(void){
-    struct n_netinfo info;bool configured=net_info(&info)==0&&info.up&&
-        info.dns[0]==10&&info.dns[1]==0&&info.dns[2]==2&&info.dns[3]==2;
+    struct n_sockaddr resolver={0};bool configured=n_setting_get(n_setting_at(N_DOMAIN_NETWORK,N_NETWORK_DNS_SERVER),&resolver,sizeof resolver)==sizeof resolver&&
+        resolver.ip==HOST;
     check(configured,"native stream uses the isolated boot-configured default resolver");return configured;
 }
 static void stream_candidates(void){

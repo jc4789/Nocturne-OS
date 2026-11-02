@@ -80,9 +80,8 @@ int main(int argc, char **argv) {
     f = fopen("C:\\Tests\\webports", "r");
     if (f) { fgets(line, sizeof line, f); fclose(f); web_port = atoi(line); }
     if (!tcp_port || !web_port || !net_wait_up(n_clock_after(5000 * N_NS_PER_MS))) { puts("FAIL tcp capacity fixture/configuration missing"); return 1; }
-    struct n_netinfo ni;
-    bool isolated = net_info(&ni) == 0 && ni.ip[0] == 10 && ni.ip[1] == 0 && ni.ip[2] == 2 &&
-        ni.mask[0] == 255 && ni.mask[1] == 255 && ni.mask[2] == 255 && ni.mask[3] == 0;
+    struct n_net_adapter adapter;
+    bool isolated = n_net_adapters(&adapter, 1) >= 1 && adapter.ip >> 8 == 0x0a0002 && adapter.mask == 0xffffff00u;
     if (isolated) {
         /* A fresh ARP miss honors the connect's own deadline. */
         uint64_t before = (n_clock_monotonic() / N_NS_PER_MS);

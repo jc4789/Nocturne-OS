@@ -18,6 +18,7 @@
 #define TOKEN_SCREEN (TOKEN_SETTINGS + 1)
 #define TOKEN_SOUND (TOKEN_SETTINGS + 2)
 #define TOKEN_SERVICES (TOKEN_SETTINGS + 3)
+#define TOKEN_NETWORK (TOKEN_SETTINGS + 4)
 
 enum page { P_AUDIO, P_DISPLAY, P_WINDOW, P_INPUT, P_POWER, P_NETWORK, P_TIME, P_BOOT, P_SERVICES, P_USERS, P_COUNT };
 static const struct {
@@ -38,7 +39,8 @@ static const struct {
 
 enum act {
     A_PAGE = 1, A_BOOL, A_NUMBER, A_ENUM, A_TEXT, A_SCREEN, A_SIZE, A_RATE, A_KEEP, A_BACK,
-    A_SERVICE_RESTART, A_SERVICE_STOP, A_USER_CLASS, A_NEW_NAME, A_NEW_PASSWORD, A_NEW_ADMIN, A_NEW_CREATE
+    A_SERVICE_RESTART, A_SERVICE_STOP, A_USER_CLASS, A_NEW_NAME, A_NEW_PASSWORD, A_NEW_ADMIN, A_NEW_CREATE,
+    A_LINK_IP, A_LINK_MASK, A_LINK_GATEWAY, A_LINK_FIXED, A_LINK_DHCP
 };
 struct action {
     uint32_t node, arg;
@@ -255,6 +257,103 @@ static void services_watch_open(n_handle queue) {
         return;
     }
     services_watch = h;
+}
+
+/* ---- 網 ---- */
+/* adapter ごとの打ちかけ。a.b.c.d の字数で足りる。 */
+struct link_view {
+    struct n_net_adapter adapter;
+    char name[64];
+    struct n_setting_id fixed_id;
+    struct n_setting_ipv4 fixed;
+    char ip[16], mask[16], gateway[16];
+};
+static struct link_view *link_views;
+static size_t link_view_count;
+static struct n_network_link *link_records;
+static n_result link_record_count;
+
+static void address_text(uint32_t ip, char *out) {
+    if (ip) ip_format(ip, out);
+    else out[0] = 0;
+}
+
+static void link_view_read(struct link_view *v) {
+    static const char digits[] = "0123456789abcdef";
+    char mac[18];
+    for (int i = 0; i < 6; i++) {
+        mac[i * 3] = digits[v->adapter.mac[i] >> 4];
+        mac[i * 3 + 1] = digits[v->adapter.mac[i] & 15];
+        mac[i * 3 + 2] = i < 5 ? ':' : 0;
+    }
+    v->fixed_id = n_setting_at(N_DOMAIN_NETWORK, N_NETWORK_FIXED_ADDRESS);
+    v->fixed_id.device = n_setting_device(mac);
+    memset(&v->fixed, 0, sizeof v->fixed);
+    if (n_setting_get(v->fixed_id, &v->fixed, sizeof v->fixed) != sizeof v->fixed) memset(&v->fixed, 0, sizeof v->fixed);
+    address_text(v->fixed.ip, v->ip);
+    address_text(v->fixed.mask, v->mask);
+    address_text(v->fixed.gateway, v->gateway);
+}
+
+/* 一覧を読み直す。打ちかけは残す。 */
+static void network_load(void) {
+    n_result count = n_net_adapters(NULL, 0);
+    struct link_view *views = count > 0 ? calloc((size_t)count, sizeof *views) : NULL;
+    struct n_net_adapter *list = count > 0 ? malloc((size_t)count * sizeof *list) : NULL;
+    size_t kept = 0;
+    if (views && list) {
+        count = n_net_adapters(list, (size_t)count);
+        for (n_result i = 0; i < count; i++, kept++) {
+            struct link_view *v = &views[i];
+            v->adapter = list[i];
+            n_result named = n_net_adapter_name(list[i].id, v->name, sizeof v->name - 1);
+            if (named > 0) v->name[named < (n_result)sizeof v->name ? named : (n_result)sizeof v->name - 1] = 0;
+            const struct link_view *before = NULL;
+            for (size_t b = 0; b < link_view_count && !before; b++)
+                if (link_views[b].adapter.id == list[i].id) before = &link_views[b];
+            if (before) {
+                v->fixed_id = before->fixed_id;
+                v->fixed = before->fixed;
+                memcpy(v->ip, before->ip, sizeof v->ip);
+                memcpy(v->mask, before->mask, sizeof v->mask);
+                memcpy(v->gateway, before->gateway, sizeof v->gateway);
+            } else {
+                link_view_read(v);
+            }
+        }
+    }
+    free(list);
+    free(link_views);
+    link_views = views;
+    link_view_count = kept;
+    free(link_records);
+    link_records = NULL;
+    link_record_count = n_network_links(&link_records);
+    if (link_record_count < 0) link_records = NULL;
+}
+
+static void link_fixed_apply(struct link_view *v) {
+    struct n_setting_ipv4 value = {0};
+    if (!ip_parse(v->ip, &value.ip) || !ip_parse(v->mask, &value.mask) || (v->gateway[0] && !ip_parse(v->gateway, &value.gateway))) {
+        say("住所とマスクは a.b.c.d の形で入れてください。", true);
+        return;
+    }
+    if (!value.ip || ~value.mask & (~value.mask + 1)) {
+        say("マスクは上の位から続く 1 の形で入れてください。", true);
+        return;
+    }
+    uint32_t reason = N_SETTING_OK;
+    n_result r = n_setting_set(v->fixed_id, &value, sizeof value, &reason);
+    said(r, reason);
+    if (r >= 0) v->fixed = value;
+}
+
+static void link_dhcp_apply(struct link_view *v) {
+    struct n_setting_ipv4 value = {0};
+    uint32_t reason = N_SETTING_OK;
+    n_result r = n_setting_set(v->fixed_id, &value, sizeof value, &reason);
+    said(r, reason);
+    if (r >= 0) link_view_read(v);
 }
 
 /* ---- 利用者 ---- */
@@ -495,6 +594,74 @@ static void screen_card(struct ui_msg *m) {
     ui_end(m);
 }
 
+static const char *link_state_text(uint32_t state) {
+    switch (state) {
+    case N_LINK_ABSENT: return "装置がありません";
+    case N_LINK_SEARCHING: return "DHCP の答えを待っています";
+    case N_LINK_LEASED: return "DHCP の住所を使っています";
+    case N_LINK_FIXED: return "固定の住所を使っています";
+    default: return "";
+    }
+}
+
+static void link_field(struct ui_msg *m, const char *label, const char *value, enum act act, uint32_t index) {
+    ui_node(m, "column"); ui_num(m, "gap", 4); ui_num(m, "grow", 1);
+        text_node(m, label, "caption", 0);
+        act_at(ui_node(m, "field"), act, index);
+        ui_str(m, "value", value); ui_str(m, "width", "fill");
+        ui_end(m);
+    ui_end(m);
+}
+
+static void link_card(struct ui_msg *m, uint32_t index) {
+    const struct link_view *v = &link_views[index];
+    const struct n_network_link *record = NULL;
+    struct n_network_link *walk = link_records;
+    for (n_result i = 0; i < link_record_count; i++, walk = n_network_link_next(walk))
+        if (walk->adapter == v->adapter.id) record = walk;
+    char line[160], text[16], text2[16];
+    const uint8_t *mac = v->adapter.mac;
+    snprintf(line, sizeof line, "%s  %02x:%02x:%02x:%02x:%02x:%02x", v->name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    char key[24];
+    snprintf(key, sizeof key, "adapter %u", (unsigned)v->adapter.id);
+    ui_node(m, "card"); ui_num(m, "gap", 10); ui_str(m, "key", key);
+        text_node(m, line, "heading", 0);
+        text_node(m, record ? link_state_text(record->state) : v->adapter.present ? "サービス network に届きません" : link_state_text(N_LINK_ABSENT), "caption", 0);
+        if (v->adapter.ip) {
+            snprintf(line, sizeof line, "住所 %s  マスク %s", ip_format(v->adapter.ip, text), ip_format(v->adapter.mask, text2));
+            text_node(m, line, "caption", 0);
+        }
+        if (record) {
+            if (record->gateway) {
+                snprintf(line, sizeof line, "ゲートウェイ %s", ip_format(record->gateway, text));
+                text_node(m, line, "caption", 0);
+            }
+            const uint32_t *addresses = n_network_link_addresses(record);
+            for (uint32_t i = 0; i < record->dns_count; i++) {
+                snprintf(line, sizeof line, "DNS %s", ip_format(addresses[i], text));
+                text_node(m, line, "caption", 0);
+            }
+            for (uint32_t i = 0; i < record->ntp_count; i++) {
+                snprintf(line, sizeof line, "NTP %s", ip_format(addresses[record->dns_count + i], text));
+                text_node(m, line, "caption", 0);
+            }
+            if (record->state == N_LINK_LEASED && record->lease_seconds) {
+                snprintf(line, sizeof line, "借りた住所の残り %u 秒", (unsigned)record->lease_seconds);
+                text_node(m, line, "caption", 0);
+            }
+        }
+        ui_node(m, "row"); ui_num(m, "gap", 10);
+            link_field(m, "固定の住所", v->ip, A_LINK_IP, index);
+            link_field(m, "マスク", v->mask, A_LINK_MASK, index);
+            link_field(m, "ゲートウェイ", v->gateway, A_LINK_GATEWAY, index);
+        ui_end(m);
+        ui_node(m, "row"); ui_num(m, "gap", 10);
+            act_at(ui_node(m, "button"), A_LINK_FIXED, index); ui_str(m, "text", "固定の住所を使う"); ui_end(m);
+            act_at(ui_node(m, "button"), A_LINK_DHCP, index); ui_str(m, "text", "DHCP を使う"); ui_end(m);
+        ui_end(m);
+    ui_end(m);
+}
+
 static void services_page(struct ui_msg *m) {
     if (!service_count) text_node(m, "サービスの一覧がありません。", "caption", 0);
     for (uint32_t i = 0; i < service_count; i++) {
@@ -578,6 +745,10 @@ static void show(struct ui_session *ui) {
                 else if (page == P_USERS) users_page(&m);
                 else {
                     if (page == P_DISPLAY) screen_card(&m);
+                    if (page == P_NETWORK) {
+                        if (!link_view_count) text_node(&m, "網の装置がありません。", "caption", 0);
+                        for (uint32_t i = 0; i < link_view_count; i++) link_card(&m, i);
+                    }
                     if (page == P_AUDIO) {
                         char line[80];
                         snprintf(line, sizeof line, sound.device[0] ? "%s で鳴らします。" : "音の装置がありません。", sound.device);
@@ -603,6 +774,7 @@ static void page_open(enum page p) {
     if (p == P_USERS) accounts_load();
     if (p == P_DISPLAY) screen_read();
     if (p == P_AUDIO) n_audio_output(&sound);
+    if (p == P_NETWORK) network_load();
 }
 
 static void set_number(struct shown *s, int32_t v) {
@@ -709,6 +881,18 @@ static bool on_event(const struct ui_event *e) {
     case A_NEW_PASSWORD: if (e->type == UI_EVENT_TEXT) strlcpy(new_password, e->text ? e->text : "", sizeof new_password); break;
     case A_NEW_ADMIN: if (e->type == UI_EVENT_TOGGLE) new_admin = e->a != 0; break;
     case A_NEW_CREATE: account_create(); break;
+    case A_LINK_IP:
+    case A_LINK_MASK:
+    case A_LINK_GATEWAY:
+        if (a->arg < link_view_count) {
+            struct link_view *v = &link_views[a->arg];
+            char *draft = a->act == A_LINK_IP ? v->ip : a->act == A_LINK_MASK ? v->mask : v->gateway;
+            if (e->type == UI_EVENT_TEXT) strlcpy(draft, e->text ? e->text : "", sizeof v->ip);
+            else if (e->type == UI_EVENT_SUBMIT) link_fixed_apply(v);
+        }
+        break;
+    case A_LINK_FIXED: if (a->arg < link_view_count && e->type == UI_EVENT_CLICK) link_fixed_apply(&link_views[a->arg]); break;
+    case A_LINK_DHCP: if (a->arg < link_view_count && e->type == UI_EVENT_CLICK) link_dhcp_apply(&link_views[a->arg]); break;
     }
     return true;
 }
@@ -724,6 +908,8 @@ int main(void) {
     n_handle sound_watch = n_audio_output_watch();
     if (sound_watch >= 0) n_events_watch(queue, sound_watch, N_EVENT_RECEIVABLE, TOKEN_SOUND);
     services_watch_open(queue);
+    n_handle network_watch = n_net_watch();
+    if (network_watch >= 0) n_events_watch(queue, network_watch, N_EVENT_RECEIVABLE, TOKEN_NETWORK);
     shown_load();
     page_open(P_AUDIO);
     show(ui);
@@ -759,6 +945,11 @@ int main(void) {
             case TOKEN_SCREEN:
                 n_watch_take(screen_watch);
                 screen_read();
+                redraw = true;
+                break;
+            case TOKEN_NETWORK:
+                n_watch_take(network_watch);
+                if (page == P_NETWORK) network_load();
                 redraw = true;
                 break;
             case TOKEN_SOUND:

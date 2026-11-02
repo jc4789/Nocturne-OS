@@ -1263,7 +1263,7 @@ int main(int argc, char **argv) {
         ask_key();
         if (!cf.key[0]) return 1;
     }
-    if (!net_wait_up(n_clock_after(10000 * N_NS_PER_MS))) say(C_ERR "warning: the network is not up (no DHCP lease yet)" C_RESET "\n");
+    if (!net_wait_up(n_clock_after(10000 * N_NS_PER_MS))) say(C_ERR "warning: the network is not up (no adapter has an address)" C_RESET "\n");
 
     if (resume) {
         if (load_session()) say(C_DIM "resumed %d messages from %s" C_RESET "\n", nmsgs, session_path);

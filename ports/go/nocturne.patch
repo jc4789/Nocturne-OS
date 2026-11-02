@@ -693,7 +693,7 @@ new file mode 100644
 index 00000000..a01d29b2
 --- /dev/null
 +++ b/src/net/fd_nocturne.go
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,304 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -976,11 +976,13 @@ index 00000000..a01d29b2
 +
 +// localIP is this system's address, for a connection's local address.
 +func localIP() IP {
-+	var ni syscall.NetInfo
-+	if syscall.GetNetInfo(&ni) != nil || ni.Present == 0 {
-+		return IPv4zero
++	list, _ := syscall.NetAdapters()
++	for i := range list {
++		if list[i].IP != 0 {
++			return ipFromUint32(list[i].IP)
++		}
 +	}
-+	return IPv4(ni.IP[0], ni.IP[1], ni.IP[2], ni.IP[3])
++	return IPv4zero
 +}
 +
 +func wrapSyscallError(name string, err error) error {
@@ -1001,7 +1003,7 @@ new file mode 100644
 index 00000000..1409f1fd
 --- /dev/null
 +++ b/src/net/interface_nocturne.go
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,71 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -1009,59 +1011,65 @@ index 00000000..1409f1fd
 +package net
 +
 +import (
++	"internal/itoa"
 +	"os"
 +	"syscall"
 +)
 +
-+// Nocturne has at most one network interface, index 1.
++// An interface's index is its adapter's number, and its name net and that
++// number: the adapters are as many as the machine has.
 +
-+func netInfo() (*syscall.NetInfo, error) {
-+	ni := new(syscall.NetInfo)
-+	if err := syscall.GetNetInfo(ni); err != nil {
-+		return nil, os.NewSyscallError("netinfo", err)
++func netAdapters() ([]syscall.NetAdapter, error) {
++	list, err := syscall.NetAdapters()
++	if err != nil {
++		return nil, os.NewSyscallError("netadapters", err)
 +	}
-+	if ni.Present == 0 {
-+		return nil, nil
-+	}
-+	return ni, nil
++	return list, nil
 +}
 +
 +func interfaceTable(ifindex int) ([]Interface, error) {
-+	ni, err := netInfo()
-+	if ni == nil || (ifindex != 0 && ifindex != 1) {
++	list, err := netAdapters()
++	if err != nil {
 +		return nil, err
 +	}
-+	name := "net0"
-+	for i, c := range ni.Driver {
-+		if c == 0 {
-+			if i > 0 {
-+				name = string(ni.Driver[:i])
-+			}
-+			break
++	var table []Interface
++	for i := range list {
++		a := &list[i]
++		if a.Present == 0 || (ifindex != 0 && ifindex != int(a.ID)) {
++			continue
 +		}
++		ifi := Interface{
++			Index:        int(a.ID),
++			MTU:          1500,
++			Name:         "net" + itoa.Itoa(int(a.ID)),
++			HardwareAddr: HardwareAddr(append([]byte(nil), a.MAC[:]...)),
++			Flags:        FlagBroadcast,
++		}
++		if a.IP != 0 {
++			ifi.Flags |= FlagUp | FlagRunning
++		}
++		table = append(table, ifi)
 +	}
-+	ifi := Interface{
-+		Index:        1,
-+		MTU:          1500,
-+		Name:         name,
-+		HardwareAddr: HardwareAddr(append([]byte(nil), ni.MAC[:]...)),
-+		Flags:        FlagBroadcast,
-+	}
-+	if ni.Up != 0 {
-+		ifi.Flags |= FlagUp | FlagRunning
-+	}
-+	return []Interface{ifi}, nil
++	return table, nil
 +}
 +
 +func interfaceAddrTable(ifi *Interface) ([]Addr, error) {
-+	ni, err := netInfo()
-+	if ni == nil || (ifi != nil && ifi.Index != 1) || ni.IP == [4]byte{} {
++	list, err := netAdapters()
++	if err != nil {
 +		return nil, err
 +	}
-+	return []Addr{&IPNet{
-+		IP:   IPv4(ni.IP[0], ni.IP[1], ni.IP[2], ni.IP[3]),
-+		Mask: IPv4Mask(ni.Mask[0], ni.Mask[1], ni.Mask[2], ni.Mask[3]),
-+	}}, nil
++	var addrs []Addr
++	for i := range list {
++		a := &list[i]
++		if a.IP == 0 || (ifi != nil && ifi.Index != int(a.ID)) {
++			continue
++		}
++		addrs = append(addrs, &IPNet{
++			IP:   ipFromUint32(a.IP),
++			Mask: IPv4Mask(byte(a.Mask>>24), byte(a.Mask>>16), byte(a.Mask>>8), byte(a.Mask)),
++		})
++	}
++	return addrs, nil
 +}
 +
 +func interfaceMulticastAddrTable(ifi *Interface) ([]Addr, error) {
@@ -1172,7 +1180,7 @@ new file mode 100644
 index 00000000..08b06369
 --- /dev/null
 +++ b/src/net/lookup_nocturne.go
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,150 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -1181,12 +1189,13 @@ index 00000000..08b06369
 +
 +import (
 +	"context"
++	"internal/itoa"
 +	"syscall"
 +	"time"
 +)
 +
-+// Nocturne resolves addresses in the system (NetDNSAll, IPv4, with one
-+// cache for every app). Other records go through Go's DNS client to the
++// Nocturne resolves addresses at the service network (NetResolve, IPv4, with
++// one cache for every app). Other records go through Go's DNS client to the
 +// same resolver (dnsconfig_nocturne.go), as do all lookups of a Resolver
 +// with PreferGo or Dial.
 +
@@ -1250,24 +1259,16 @@ index 00000000..08b06369
 +
 +// systemLookupIP asks the system resolver for host's IPv4 addresses.
 +func systemLookupIP(host string) ([]IPAddr, error) {
-+	var small [16]uint32
-+	ips := small[:]
-+	var res syscall.DNSResult
-+	err := syscall.NetDNSAll(host, ips, &res, nil)
-+	if err == nil && int(res.Count) > len(ips) {
-+		// The complete answer is cached; ask again with room for it.
-+		ips = make([]uint32, res.Count)
-+		err = syscall.NetDNSAll(host, ips, &res, nil)
-+	}
-+	if err == nil && res.Status == syscall.DNS_OK && res.Count > 0 {
-+		addrs := make([]IPAddr, min(int(res.Count), len(ips)))
++	ips, res, err := syscall.NetResolve(host)
++	if err == nil && res.Status == syscall.DNS_OK && len(ips) > 0 {
++		addrs := make([]IPAddr, len(ips))
 +		for i := range addrs {
 +			addrs[i] = IPAddr{IP: ipFromUint32(ips[i])}
 +		}
 +		return addrs, nil
 +	}
 +	switch {
-+	case res.Version == 0 && err == syscall.ERR_INVALID:
++	case res.Status == syscall.DNS_FORMAT:
 +		return nil, newDNSError(errNoSuchHost, host, "")
 +	case res.Status == syscall.DNS_OK, res.Status == syscall.DNS_NXDOMAIN, res.Status == syscall.DNS_NODATA:
 +		return nil, newDNSError(errNoSuchHost, host, "")
@@ -1313,19 +1314,19 @@ index 00000000..08b06369
 +	return r.goLookupPTR(ctx, addr, hostLookupDNS, getSystemDNSConfig())
 +}
 +
-+// dnsReadConfig describes the system resolver for Go's DNS client; Nocturne
-+// has no resolver file, so the name is ignored.
++// dnsReadConfig describes the system resolver for Go's DNS client: the servers
++// the service network uses. Nocturne has no resolver file, so the name is ignored.
 +func dnsReadConfig(string) *dnsConfig {
 +	conf := &dnsConfig{
 +		ndots:    1,
 +		timeout:  5 * time.Second,
 +		attempts: 2,
 +	}
-+	var ni syscall.NetInfo
-+	if syscall.GetNetInfo(&ni) == nil && ni.Present != 0 && ni.Resolver != [4]byte{} {
-+		ip := IPv4(ni.Resolver[0], ni.Resolver[1], ni.Resolver[2], ni.Resolver[3])
-+		conf.servers = []string{JoinHostPort(ip.String(), "53")}
-+	} else {
++	servers, err := syscall.NetworkResolvers()
++	for _, server := range servers {
++		conf.servers = append(conf.servers, JoinHostPort(ipFromUint32(server.IP).String(), itoa.Itoa(int(server.Port))))
++	}
++	if err != nil || len(conf.servers) == 0 {
 +		conf.servers = defaultNS
 +	}
 +	return conf
@@ -4217,7 +4218,7 @@ new file mode 100644
 index 00000000..a673859b
 --- /dev/null
 +++ b/src/syscall/syscall_nocturne.go
-@@ -0,0 +1,1164 @@
+@@ -0,0 +1,1262 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -5190,8 +5191,7 @@ index 00000000..a673859b
 +// Network system call numbers. TCP and UDP connections are numbered on
 +// their own, not handles.
 +const (
-+	SYS_NET_INFO       = 96
-+	SYS_NET_DNS_ALL    = 108
++	SYS_NET_ADAPTERS   = 96
 +	SYS_UDP_SOCKET     = 99
 +	SYS_UDP_SEND       = 100
 +	SYS_UDP_RECV       = 101
@@ -5213,19 +5213,35 @@ index 00000000..a673859b
 +// UDPMaxPayload is the largest datagram UDPSend takes.
 +const UDPMaxPayload = 1472
 +
-+// NetInfo describes the network interface.
-+type NetInfo struct {
-+	Present, Up                 uint8
-+	MAC                         [6]byte
-+	IP, Mask, Gateway, Resolver [4]byte
-+	RxPackets, TxPackets        uint64
-+	Driver                      [32]byte
++// NetAdapter is a network adapter as the kernel lists it. Addresses are in
++// host byte order; IP 0 is no address.
++type NetAdapter struct {
++	ID                   uint32
++	Present, reserved    uint8
++	MAC                  [6]byte
++	IP, Mask             uint32
++	RxPackets, TxPackets uint64
 +}
 +
-+// GetNetInfo reports the interface; Present is 0 when there is none.
-+func GetNetInfo(ni *NetInfo) error {
-+	_, e := RawSyscall(SYS_NET_INFO, uintptr(unsafe.Pointer(ni)), 0, 0, 0, 0)
-+	return errnoErr(e)
++// NetAdapters lists the adapters, as many as there are.
++func NetAdapters() ([]NetAdapter, error) {
++	for {
++		n, e := RawSyscall(SYS_NET_ADAPTERS, 0, 0, 0, 0, 0)
++		if e != 0 {
++			return nil, e
++		}
++		if n == 0 {
++			return nil, nil
++		}
++		list := make([]NetAdapter, n)
++		m, e := RawSyscall(SYS_NET_ADAPTERS, uintptr(unsafe.Pointer(&list[0])), n, 0, 0, 0)
++		if e != 0 {
++			return nil, e
++		}
++		if m <= n {
++			return list[:m], nil
++		}
++	}
 +}
 +
 +// Sockaddr4 is an IPv4 address (host byte order, a.b.c.d is a<<24|b<<16|c<<8|d) and port.
@@ -5248,26 +5264,109 @@ index 00000000..a673859b
 +	DNS_RESOURCE
 +)
 +
-+// DNSResult describes a NetDNSAll answer; Count is the complete number of
-+// addresses even when fewer fit.
++// DNSResult describes a NetResolve answer.
 +type DNSResult struct {
-+	Version, Status, Count, TTL uint32
++	Status, Count, TTL uint32
 +}
 +
-+// NetDNSAll resolves name to IPv4 addresses with the system resolver
-+// (or resolver, when not nil).
-+func NetDNSAll(name string, ips []uint32, res *DNSResult, resolver *Sockaddr4) error {
-+	p, err := BytePtrFromString(name)
++// The service "network" (common/services_abi.h).
++const (
++	networkResolve = 1 + iota
++	networkLinks
++	networkResolvers
++)
++
++const (
++	networkRequestBytes = 16
++	networkReplyBytes   = 16
++	dnsNameTextBytes    = 254 // RFC 1035 2.3.4
++)
++
++func get32(b []byte) uint32 {
++	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
++}
++
++// networkCall asks the service once. It returns the reply's status, count
++// and TTL, and what follows them.
++func networkCall(op uint32, name string) (DNSResult, []byte, error) {
++	var res DNSResult
++	service := []byte("network")
++	r, e := Syscall(SYS_SERVICE_CONNECT, uintptr(unsafe.Pointer(&service[0])), uintptr(len(service)), 0, 0, 0)
++	if e != 0 {
++		res.Status = DNS_UNREACHABLE
++		return res, nil, e
++	}
++	h := int(r)
++	defer Close(h)
++	q := make([]byte, networkRequestBytes+len(name))
++	q[0] = byte(op)
++	q[4], q[5] = byte(len(name)), byte(len(name)>>8)
++	copy(q[networkRequestBytes:], name)
++	if _, err := ChannelSend(h, q, -1); err != nil {
++		res.Status = DNS_UNREACHABLE
++		return res, nil, err
++	}
++	size, _, err := ChannelReceive(h, nil, CHANNEL_PEEK|CHANNEL_WAIT)
++	if err == nil && size < networkReplyBytes {
++		err = ERR_PROTOCOL
++	}
 +	if err != nil {
-+		return err
++		res.Status = DNS_UNREACHABLE
++		return res, nil, err
 +	}
-+	var ip uintptr
-+	if len(ips) > 0 {
-+		ip = uintptr(unsafe.Pointer(&ips[0]))
++	m := make([]byte, size)
++	if _, _, err := ChannelReceive(h, m, CHANNEL_WAIT); err != nil {
++		res.Status = DNS_UNREACHABLE
++		return res, nil, err
 +	}
-+	_, e := Syscall(SYS_NET_DNS_ALL, uintptr(unsafe.Pointer(p)), ip, uintptr(len(ips)),
-+		uintptr(unsafe.Pointer(res)), uintptr(unsafe.Pointer(resolver)))
-+	return errnoErr(e)
++	res = DNSResult{Status: get32(m[4:]), Count: get32(m[8:]), TTL: get32(m[12:])}
++	if result := int32(get32(m)); result < 0 {
++		return res, nil, Errno(-result)
++	}
++	return res, m[networkReplyBytes:], nil
++}
++
++// NetResolve resolves name to IPv4 addresses at the service network. A
++// dotted quad and localhost ask nobody, as in libc.
++func NetResolve(name string) ([]uint32, DNSResult, error) {
++	if len(name) > dnsNameTextBytes {
++		return nil, DNSResult{Status: DNS_FORMAT}, ERR_NAME_TOO_LONG
++	}
++	plain := name
++	if len(plain) > 0 && plain[len(plain)-1] == '.' {
++		plain = plain[:len(plain)-1]
++	}
++	if plain == "localhost" {
++		return []uint32{0x7f000001}, DNSResult{Status: DNS_OK, Count: 1}, nil
++	}
++	res, tail, err := networkCall(networkResolve, name)
++	if err != nil {
++		return nil, res, err
++	}
++	if len(tail) != int(res.Count)*4 {
++		return nil, res, ERR_PROTOCOL
++	}
++	ips := make([]uint32, res.Count)
++	for i := range ips {
++		ips[i] = get32(tail[i*4:])
++	}
++	return ips, res, nil
++}
++
++// NetworkResolvers lists the servers the system's lookups go to.
++func NetworkResolvers() ([]Sockaddr4, error) {
++	res, tail, err := networkCall(networkResolvers, "")
++	if err != nil {
++		return nil, err
++	}
++	if len(tail) != int(res.Count)*8 {
++		return nil, ERR_PROTOCOL
++	}
++	list := make([]Sockaddr4, res.Count)
++	for i := range list {
++		list[i] = Sockaddr4{IP: get32(tail[i*8:]), Port: uint16(get32(tail[i*8+4:]))}
++	}
++	return list, nil
 +}
 +
 +// TCPConnect connects to ip:port, waiting until the deadline, and returns

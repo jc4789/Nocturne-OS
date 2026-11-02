@@ -8,6 +8,10 @@ n_handle n_store_private_open(n_handle cap, uint32_t region, uint32_t user, int 
     return (n_handle)__syscall(SYS_STORE_PRIVATE_OPEN, cap, region, user, access, 0);
 }
 
+n_result n_clock_wall_step(n_handle cap, int64_t unix_ns) { return __syscall(SYS_CLOCK_WALL_STEP, cap, unix_ns, 0, 0, 0); }
+n_result n_clock_wall_slew(n_handle cap, int64_t offset_ns, uint32_t ppm) { return __syscall(SYS_CLOCK_WALL_SLEW, cap, offset_ns, ppm, 0, 0); }
+n_result n_rtc_write(n_handle cap, int64_t unix_seconds) { return __syscall(SYS_RTC_WRITE, cap, unix_seconds, 0, 0, 0); }
+
 n_result n_service_ready(void) {
     struct n_service_ready_message message = {.kind = N_SERVICE_READY};
     n_result r = n_channel_send(N_SERVICE_HANDLE_CONTROL, &message, sizeof message, -1);

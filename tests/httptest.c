@@ -11,6 +11,7 @@ static int failure_mode,closed,read_count,checks,failed,last_timeouts[32];
 static bool engine_closed;
 #define CHECK(c) do{checks++;if(!(c)){failed++;printf("FAIL TLS deadline:%d %s\n",__LINE__,#c);}}while(0)
 uint64_t n_clock_monotonic(void){return (uint64_t)(clock_ms)*1000000ULL;}
+bool net_proxy_for(const char *host,char *proxy,size_t cap,uint16_t *port){(void)host;(void)proxy;(void)cap;(void)port;return false;}
 bool net_wait_up(int timeout){(void)timeout;return true;}
 n_result net_resolve(const char *host,uint32_t *ip){(void)host;*ip=0x0a000202;return 0;}
 n_result net_resolve_all(const char *host,uint32_t *ips,size_t capacity,struct n_dns_result *result){

@@ -5,10 +5,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include "testrun.h"
+#include "nocturne_settings.h"
 
 #define SH N_FOLDER_SYSTEM "\\sh"
 #define AUTORUN "C:\\Tests\\autorun.sh"
 #define TEST_USER "Test"
+#define DNS_SERVER "C:\\Tests\\dns-server"
+
+/* 試験の道具の resolver（a.b.c.d:port）を機械の設定にする。 */
+static void dns_server_set(void) {
+    FILE *f = fopen(DNS_SERVER, "r");
+    if (!f) return;
+    char line[64] = "";
+    unsigned a, b, c, d, port;
+    bool read = fgets(line, sizeof line, f) && sscanf(line, "%u.%u.%u.%u:%u", &a, &b, &c, &d, &port) == 5;
+    fclose(f);
+    if (!read) return;
+    struct n_sockaddr resolver = {.ip = a << 24 | b << 16 | c << 8 | d, .port = (uint16_t)port};
+    n_result r = n_setting_set(n_setting_at(N_DOMAIN_NETWORK, N_NETWORK_DNS_SERVER), &resolver, sizeof resolver, NULL);
+    if (r < 0) printf("testrun: the DNS server was not set (%s)\n", n_result_text(r));
+}
 
 int main(void) {
     struct n_accounts_request q = {.op = N_ACCOUNTS_CREATE, .cls = N_CLASS_ADMIN, .auto_login = 1};
@@ -29,6 +45,7 @@ int main(void) {
     struct n_accounts_reply prepared;
     n_accounts_call(&prepare, &prepared);
     n_service_ready();
+    dns_server_set();
     struct n_entry e;
     if (n_entry_info(AUTORUN, &e) >= 0) {
         n_handle log = n_system_log_open();

@@ -17,6 +17,7 @@
 #include "bearssl.h"
 #include "http.h"
 #include "nocturne.h"
+#include "nocturne_services.h"
 
 extern const br_x509_trust_anchor tls_trust_anchors[];
 extern const size_t tls_trust_anchors_num;
@@ -1746,15 +1747,52 @@ static int handshake(net_stream *s, const char *host) {
     return tls13(s, h, resumed);
 }
 
+/* RFC 9110 9.3.6：proxy に host:port までの通り道を頼む。2xx の頭の後ろは host との話になるので、頭の
+   終わりより先を読まない。 */
+static n_result proxy_tunnel(n_handle sock,const char *host,uint16_t port,uint64_t deadline,char *err,size_t errlen) {
+    size_t length=2*strlen(host)+64;
+    char *ask=malloc(length);
+    if(!ask)return -N_ERR_NO_MEMORY;
+    int n=snprintf(ask,length,"CONNECT %s:%u HTTP/1.1\r\nHost: %s:%u\r\n\r\n",host,port,host,port);
+    n_result sent=tcp_send_until(sock,ask,(size_t)n,deadline);
+    free(ask);
+    if(sent<0)return sent;
+    if(sent!=n)return -N_ERR_TIMEOUT;
+    char line[13];
+    size_t got=0;
+    unsigned ending=0;
+    while(ending<4) {
+        char c;
+        n_result r=tcp_recv(sock,&c,1,deadline);
+        if(r<0)return r;
+        if(!r)return -N_ERR_PROTOCOL;
+        if(got<sizeof line)line[got++]=c;
+        ending=c==(ending&1?'\n':'\r')?ending+1:c=='\r'?1:0;
+    }
+    /* "HTTP/1.1 200" */
+    if(got<sizeof line-1||memcmp(line,"HTTP/1.",7)||line[8]!=' '||line[9]<'1'||line[9]>'5') return -N_ERR_PROTOCOL;
+    if(line[9]!='2') {
+        snprintf(err,errlen,"proxy refused %s:%u: %.3s",host,port,line+9);
+        return -N_ERR_DENIED;
+    }
+    return 0;
+}
+
 static net_stream *open_stream(const char *host, uint16_t port, bool tls, int timeout_ms,
                                char *err, size_t errlen, struct http_transport_timing *timing,
                                bool http,const char *partition,int (*cancelled)(void *),void *cancel_ctx) {
     uint64_t resolve_started=0,tls_started=0;
     if(timing){memset(timing,0,sizeof *timing);timing->phase=HTTP_PHASE_RESOLVE;resolve_started=(n_clock_monotonic() / N_NS_PER_MS);}
     if(cancelled&&cancelled(cancel_ctx)){errno=ECANCELED;snprintf(err,errlen,"request cancelled");return NULL;}
+    if(!host){errno=N_ERR_INVALID;snprintf(err,errlen,"no host");return NULL;}
+    char proxy[DNS_NAME_TEXT_BYTES+1];
+    uint16_t proxy_port=0;
+    bool proxied=net_proxy_for(host,proxy,sizeof proxy,&proxy_port);
+    const char *peer=proxied?proxy:host;
+    uint16_t peer_port=proxied?proxy_port:port;
     /* host is a URL's host serialized (http.c's http_target): an IPv6 address comes in brackets,
        and the network stack (SYS_NET_*) has IPv4 only. */
-    if (host && host[0] == '[') {
+    if (peer[0] == '[') {
         if(timing)timing->resolve_ms=0;
         errno=N_ERR_UNSUPPORTED;snprintf(err, errlen, "%s: the network has no IPv6", host);
         return NULL;
@@ -1767,11 +1805,11 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     uint32_t first[16],*ips=first;
     struct n_dns_result dns;
     uint64_t lookup_started=(n_clock_monotonic() / N_NS_PER_MS);
-    n_result resolved=net_resolve_all(host, first,16,&dns);
+    n_result resolved=net_resolve_all(peer, first,16,&dns);
     if (resolved < 0) {
         if(timing)timing->resolve_ms=(n_clock_monotonic() / N_NS_PER_MS)-resolve_started;
         errno=(int)-resolved;
-        snprintf(err, errlen, "%s: %s", host, resolved == -N_ERR_NOT_FOUND ? "host not found" : n_result_text(resolved));
+        snprintf(err, errlen, "%s: %s", peer, resolved == -N_ERR_NOT_FOUND ? "host not found" : n_result_text(resolved));
         return NULL;
     }
     size_t count=dns.count;
@@ -1779,10 +1817,10 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
         if(count>SIZE_MAX/sizeof *ips || !(ips=malloc(count*sizeof *ips))) {
             errno=ENOMEM;snprintf(err,errlen,"out of memory resolving host");return NULL;
         }
-        resolved=net_resolve_all(host,ips,count,&dns);
+        resolved=net_resolve_all(peer,ips,count,&dns);
         if(resolved<0){
             free(ips);errno=(int)-resolved;
-            snprintf(err,errlen,"%s: %s",host,n_result_text(resolved));return NULL;
+            snprintf(err,errlen,"%s: %s",peer,n_result_text(resolved));return NULL;
         }
         if(dns.count<count)count=dns.count;
     }
@@ -1800,7 +1838,7 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
            fair share of the one connect deadline. */
         uint64_t left=connect_deadline-now,remaining=count-i;
         int allowance=(int)(left/remaining);if(allowance<1)allowance=1;
-        attempts++;sock=tcp_connect(ips[i],port,wait_until(allowance));if(sock>=0){peer_ip=ips[i];break;}
+        attempts++;sock=tcp_connect(ips[i],peer_port,wait_until(allowance));if(sock>=0){peer_ip=ips[i];break;}
         if(sock!=-N_ERR_TIMEOUT&&sock!=-N_ERR_CONNECTION_REFUSED&&sock!=-N_ERR_UNREACHABLE)break;
     }
     if(ips!=first)free(ips);
@@ -1808,8 +1846,20 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     if(timing){tls_started=connected;timing->connect_ms=tls_started-connect_started;}
     if (sock < 0) {
         errno=(int)-sock;
-        snprintf(err, errlen, "connect to %s:%d: %s", host, port, n_result_text(sock));
+        snprintf(err, errlen, "connect to %s:%d: %s", peer, peer_port, n_result_text(sock));
         return NULL;
+    }
+    /* A plain HTTP request goes to the proxy as it is, with its target in absolute form (http.c).
+       Everything else asks for a way through. */
+    if(proxied&&(tls||!http)) {
+        err[0]=0;
+        n_result through=proxy_tunnel((n_handle)sock,host,port,wait_until(connect_ms),err,errlen);
+        if(through<0) {
+            tcp_close((n_handle)sock);
+            errno=(int)-through;
+            if(!err[0])snprintf(err,errlen,"proxy %s:%d: %s",peer,peer_port,n_result_text(through));
+            return NULL;
+        }
     }
     net_stream *s = calloc(1, tls ? sizeof *s : TLS_FIELDS);
     if (!s) {

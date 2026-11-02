@@ -3,6 +3,7 @@
 #ifndef COMMON_SERVICES_ABI_H
 #define COMMON_SERVICES_ABI_H
 #include <stdint.h>
+#include "abi.h"
 #include "authority_abi.h"
 
 #define N_SERVICE_NAME_MAX 64u
@@ -114,4 +115,44 @@ struct n_machine_reply {
     int64_t result;
     int32_t width, height;
 };
+
+/* ---- 網（"network"）：DHCP、名前引きと cache、固定の住所、経路の選択。 ---- */
+enum n_network_op {
+    N_NETWORK_RESOLVE = 1, /* 要求の後ろに名前が name_length バイト。応答の後ろに uint32_t の住所が count 個。 */
+    N_NETWORK_LINKS,       /* 応答の後ろに struct n_network_link が count 個、それぞれ可変長。 */
+    N_NETWORK_RESOLVERS,   /* 応答の後ろに struct n_sockaddr が count 個：機械の名前引きが聞くサーバー */
+};
+struct n_network_request {
+    uint32_t op;
+    uint32_t name_length;
+    struct n_sockaddr resolver; /* ip 0 は機械の resolver */
+};
+enum n_dns_status {
+    N_DNS_OK, N_DNS_NXDOMAIN, N_DNS_NODATA, N_DNS_SERVFAIL, N_DNS_REFUSED,
+    N_DNS_FORMAT, N_DNS_TIMEOUT, N_DNS_UNREACHABLE, N_DNS_CANCELLED, N_DNS_RESOURCE,
+};
+struct n_network_reply {
+    int32_t result;  /* 0 か、負の N_ERR_* */
+    uint32_t status; /* enum n_dns_status */
+    uint32_t count;
+    uint32_t ttl;    /* 残りの秒 */
+};
+enum n_link_state {
+    N_LINK_ABSENT,   /* 装置が無い */
+    N_LINK_SEARCHING, /* DHCP の答えを待っている */
+    N_LINK_LEASED,   /* DHCP の住所がある */
+    N_LINK_FIXED,    /* 固定の住所 */
+};
+/* 一つの adapter の構成。後ろに uint32_t の住所が dns_count + ntp_count 個続く（DNS、NTP の順）。住所と
+   マスクはカーネルの一覧（n_net_adapters）にある。 */
+struct n_network_link {
+    uint32_t adapter;
+    uint32_t state;   /* enum n_link_state */
+    uint32_t gateway; /* 0 は無し */
+    uint32_t lease_seconds; /* N_LINK_LEASED：借りた住所の残り */
+    uint32_t dns_count, ntp_count;
+};
+
+/* ---- 名前引きの結果（net_resolve_all）。count は全部の数で、渡した場所より多いことがある。 ---- */
+struct n_dns_result { uint32_t version, status, count, ttl; };
 #endif

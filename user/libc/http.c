@@ -11,6 +11,7 @@
 #include "http2.h"
 #include "browser_identity.h"
 #include "../include/nocturne.h"
+#include "../include/nocturne_services.h"
 
 /* The pool is process-local. It never coalesces certificate names or origins.
    Keys include the exact caller partition and credential header bytes; no
@@ -466,7 +467,12 @@ static const char *request_head(const struct http_req *rq, struct http_scratch *
        other absent bodies must not become an allocated empty-body request. */
     if (rq->body || !strcmp(method, "POST") || !strcmp(method, "PUT"))
         snprintf(content_length, sizeof content_length, "Content-Length: %zu\r\n", rq->body_len);
-    const char *parts[] = {method, " ", u->path, " HTTP/1.1\r\nHost: ", u->authority,
+    /* RFC 9112 3.2.2: a request to a proxy names its target whole. Through a tunnel (TLS) the
+       origin reads it in origin form. */
+    char proxy[DNS_NAME_TEXT_BYTES+1];
+    uint16_t proxy_port;
+    bool absolute=!u->tls&&net_proxy_for(u->host,proxy,sizeof proxy,&proxy_port);
+    const char *parts[] = {method, " ", absolute?"http://":"", absolute?u->authority:"", u->path, " HTTP/1.1\r\nHost: ", u->authority,
         "\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\n", content_length,
         rq->headers ? rq->headers : "", "\r\n"};
     size_t length = 0;
