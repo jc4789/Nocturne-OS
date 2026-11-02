@@ -4,6 +4,7 @@
    一回の起動で KEEP_MOST バイトまで保存する：C: には他の用途がある。 */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "nocturne.h"
 #include "nocturne_services.h"
 
