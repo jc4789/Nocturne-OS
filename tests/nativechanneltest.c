@@ -1,4 +1,4 @@
-/* Real Nocturne named rendezvous and message channels, including a service in
+/* Real Nocturne inlets, message channels, identities and capabilities, including a service in
  * another app. This is supporting evidence, not browser/site acceptance. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,7 +26,7 @@ static uint32_t ready(n_handle h,uint32_t interest,uint64_t ms) {
 }
 static int server(void) {
     if(!(ready(0,N_EVENT_RECEIVABLE,5000)&N_EVENT_RECEIVABLE))return 21;
-    n_handle h=n_channel_accept(0);if(h<0)return 22;
+    n_handle h=n_inlet_accept(0,0);if(h<0)return 22;
     char text[8];n_result n=n_channel_receive(h,text,sizeof text,N_CHANNEL_WAIT,NULL);
     int result=n==4&&!memcmp(text,"ping",4)&&n_channel_send(h,"pong",4,-1)==4?0:23;
     n_handle_close(0);n_handle_close(h);return result;
@@ -37,18 +37,22 @@ int main(int argc,char **argv) {
     if(argc>1 && !strcmp(argv[1],"server"))return server();
     if(argc>1 && !strcmp(argv[1],"sender"))return transferred_sender();
     uint64_t self=(uint64_t)n_app_self();
-    char key[128],other[160];snprintf(key,sizeof key,"native-channel-test:%lld",(long long)n_app_self());
-    snprintf(other,sizeof other,"%s:other",key);
-    n_handle listener=n_channel_listen(key);
-    check(listener>=0,"atomic listener create");if(listener<0)return 1;
-    check(n_channel_listen(key)==-N_ERR_EXISTS,"exact existing name rejected");
-    check(n_channel_connect(other)==-N_ERR_NOT_FOUND,"full identity distinguishes suffix");
-    check(n_channel_accept(listener)==-N_ERR_NOT_READY,"empty accept does not wait");
-    check(!ready(listener,N_EVENT_RECEIVABLE,0),"idle listener is not receivable");
-    n_handle client=n_channel_connect(key);
-    check(client>=0 && (ready(listener,N_EVENT_RECEIVABLE,0)&N_EVENT_RECEIVABLE),"connection waits in the listener");
-    n_handle peer=n_channel_accept(listener);
+    struct n_identity me,seen;
+    check(n_identity_self(&me)==0,"identity of the caller");
+    n_handle derived=n_cap_derive(-1,N_CAP_POWER);
+    check(derived==-N_ERR_NO_HANDLE,"no capability from no handle");
+    n_handle inlet[2];
+    check(n_channel_pair(inlet)==0,"inlet pair");
+    n_handle listener=inlet[1];
+    check(n_cap_derive(inlet[0],N_CAP_POWER)==-N_ERR_DENIED,"a channel is no capability");
+    check(n_inlet_accept(listener,0)==-N_ERR_NOT_READY,"empty accept does not wait");
+    check(!ready(listener,N_EVENT_RECEIVABLE,0),"idle inlet is not receivable");
+    n_handle client=n_inlet_connect(inlet[0]);
+    check(client>=0 && (ready(listener,N_EVENT_RECEIVABLE,0)&N_EVENT_RECEIVABLE),"connection waits in the inlet");
+    n_handle peer=n_inlet_accept(listener,0);
     check(client>=0 && peer>=0,"connect and accept");
+    check(n_channel_peer(peer,&seen)==0 && !memcmp(&seen,&me,sizeof me),"the peer's identity is the kernel's word");
+    check(n_channel_send(peer,"",0,peer)==-N_ERR_BUSY,"an end does not travel through its own channel");
     if(client<0 || peer<0){n_handle_close(client);n_handle_close(peer);n_handle_close(listener);return 1;}
     size_t bytes=3u*1024u*1024u+17u;unsigned char *input=malloc(bytes),*output=malloc(bytes);
     check(input && output,"transfer storage");
@@ -112,14 +116,15 @@ int main(int argc,char **argv) {
     char byte;
     check(n_channel_receive(client,&byte,1,0,NULL)==-N_ERR_CLOSED,"closed peer has nothing more");
     check(n_channel_send(client,"x",1,-1)==-N_ERR_CLOSED,"closed peer rejects sending");n_handle_close(client);
-    client=n_channel_connect(key);check(client>=0,"pending peer can connect");n_handle_close(listener);
-    check(n_channel_receive(client,&byte,1,N_CHANNEL_WAIT,NULL)==-N_ERR_CLOSED,"listener close closes pending peers");n_handle_close(client);
-    listener=n_channel_listen(key);check(listener>=0,"closing the listener releases the name");
+    client=n_inlet_connect(inlet[0]);check(client>=0,"pending peer can connect");n_handle_close(listener);
+    check(n_channel_receive(client,&byte,1,N_CHANNEL_WAIT,NULL)==-N_ERR_CLOSED,"inlet close closes pending peers");n_handle_close(client);
+    n_handle_close(inlet[0]);
+    check(n_channel_pair(inlet)==0,"a new inlet");listener=inlet[1];
     enum {COUNT=96};n_handle clients[COUNT],peers[COUNT];
     memset(clients,0xff,sizeof clients);memset(peers,0xff,sizeof peers);
     bool connected=true;
     for(unsigned i=0;i<COUNT;i++) {
-        clients[i]=n_channel_connect(key);peers[i]=n_channel_accept(listener);
+        clients[i]=n_inlet_connect(inlet[0]);peers[i]=n_inlet_accept(listener,0);
         if(clients[i]<0 || peers[i]<0){connected=false;break;}
     }
     check(connected,"96 clients");
@@ -153,10 +158,10 @@ int main(int argc,char **argv) {
     for(unsigned i=0;i<COUNT;i++){if(clients[i]>=0)n_handle_close(clients[i]);if(peers[i]>=0)n_handle_close(peers[i]);}
     const char *args[]={argv[0],"server"};const n_handle handles[]={listener};
     struct n_launch launch={.arguments=args,.argument_count=2,.handles=handles,.handle_count=1};
-    n_handle app=n_app_launch(argv[0],&launch);check(app>=0,"a service app receives the listener");
+    n_handle app=n_app_launch(argv[0],&launch);check(app>=0,"a service app receives the inlet");
     n_handle_close(listener);
     if(app>=0) {
-        client=n_channel_connect(key);check(client>=0,"another app owns the listener after its creator closes it");
+        client=n_inlet_connect(inlet[0]);check(client>=0,"another app owns the inlet after its creator closes it");
         char response[8];bool ok=client>=0 && n_channel_send(client,"ping",4,-1)==4 &&
             n_channel_receive(client,response,sizeof response,N_CHANNEL_WAIT,NULL)==4 && !memcmp(response,"pong",4);
         check(ok,"service app answers one message");
@@ -166,7 +171,7 @@ int main(int argc,char **argv) {
         check(n_app_result(app,n_clock_after(5000 * N_NS_PER_MS),&status)>=0 && (!ok || status==0),"service app ends");
         n_handle_close(app);
         if(client>=0)n_handle_close(client);
-        listener=n_channel_listen(key);check(listener>=0,"the service ending returns the name");if(listener>=0)n_handle_close(listener);
     }
+    n_handle_close(inlet[0]);
     printf("nativechanneltest: %d checks, %d failures\n",checks,failed);return failed!=0;
 }

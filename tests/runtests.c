@@ -543,9 +543,10 @@ static int run_shell(const char *cmd, int timeout_ms, struct capture *c, int *st
     if (n_channel_pair(in) < 0) { n_handle_close(out[0]); n_handle_close(out[1]); return -1; }
     n_handle_close(in[0]); /* reading stdin reports the end at once, like an empty device */
     const char *args[] = {"sh", "-c", cmd};
-    int32_t handles[] = {in[1], out[1], out[1]};
-    struct n_launch launch = {.arguments = args, .handles = handles, .argument_count = 3, .handle_count = 3,
-                              .folder = work_folder};
+    int32_t handles[3 + N_CAP_COUNT] = {in[1], out[1], out[1]};
+    size_t caps = n_caps_list(handles + 3); /* 試験は init が渡した能力を受ける */
+    struct n_launch launch = {.arguments = args, .handles = handles, .argument_count = 3,
+                              .handle_count = 3 + (uint32_t)caps, .folder = work_folder};
     n_handle app = n_app_launch(N_FOLDER_SYSTEM "\\sh", &launch);
     n_handle_close(in[1]);
     n_handle_close(out[1]);

@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <display.h>
-#include <nocturne_services.h>
+#include <services_abi.h>
 #include <nocturne_settings.h>
 #include "ui.h"
 #include "display_abi.h"

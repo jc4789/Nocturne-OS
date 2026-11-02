@@ -1,6 +1,5 @@
 /* 設定の口（nocturne_settings.h）。サービス settings への一本の接続で、一度に一つの問いを送り、答えを待つ。 */
 #include <nocturne_settings.h>
-#include <nocturne_services.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>

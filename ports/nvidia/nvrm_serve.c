@@ -1,4 +1,4 @@
-/* nvrm's request server: clients connect on NVRM_CHANNEL (include/nvrm_protocol.h), each with an
+/* nvrm's request server: clients connect to the service NVRM_CHANNEL_FORMAT names (include/nvrm_protocol.h), each with an
    argument arena both sides map. Every client is served by a thread of its own, so a request that
    waits on the GPU (a GSP control call, an idle wait, a fence) holds up only its own client; RM
    orders concurrent requests with its own locks (the API lock and the GPU locks), as it does for
@@ -20,7 +20,6 @@
 #include "nv-unix-nvos-params-wrappers.h"
 
 #define LISTENER_TOKEN 0
-#define LEGACY_LISTENER_TOKEN 1
 /* A client thread's own event queue */
 #define CHANNEL_TOKEN 0
 #define STOP_TOKEN 1
@@ -295,7 +294,7 @@ n_result nvrm_serve(uint32_t pci_target) {
     __atomic_store_n(&serving_ended, 0, __ATOMIC_RELEASE);
     char name[NVRM_CHANNEL_NAME_BYTES];
     snprintf(name, sizeof name, NVRM_CHANNEL_FORMAT, (unsigned)pci_target);
-    n_handle listener = n_channel_listen(name);
+    n_handle listener = n_service_listen(name);
     if (listener < 0) { cnd_destroy(&thread_ended); mtx_destroy(&threads_lock); return listener; }
     n_handle events = n_events_create();
     if (events < 0) { n_handle_close(listener); cnd_destroy(&thread_ended); mtx_destroy(&threads_lock); return events; }
@@ -305,13 +304,6 @@ n_result nvrm_serve(uint32_t pci_target) {
         cnd_destroy(&thread_ended); mtx_destroy(&threads_lock);
         return watched;
     }
-    /* Preserve the historical default rendezvous for programs built against
-       it. Only one daemon owns this optional alias; every GPU always
-       retains its independent BDF endpoint. Alias failure never kills GPU #2. */
-    n_handle legacy = n_channel_listen(NVRM_CHANNEL);
-    if (legacy >= 0 && n_events_watch(events, legacy, N_EVENT_RECEIVABLE, LEGACY_LISTENER_TOKEN) < 0) {
-        n_handle_close(legacy); legacy = -1;
-    }
     printf("nvrm: serving clients on \"%s\"\n", name);
     fflush(stdout);
     n_result ended = 0;
@@ -319,16 +311,13 @@ n_result nvrm_serve(uint32_t pci_target) {
         struct n_event ev[16];
         n_result n = n_events_wait(events, ev, 16, N_CLOCK_NEVER);
         if (n < 0) { ended = n; break; }
-        for (n_result i = 0; i < n; i++) {
-            n_handle ready = ev[i].token == LISTENER_TOKEN ? listener : legacy;
-            n_handle ch;
-            while (ready >= 0 && (ch = n_channel_accept(ready)) >= 0) client_start(ch);
-        }
+        n_handle ch;
+        while ((ch = n_inlet_accept(listener, 0)) >= 0) client_start(ch);
+        if (ch != -N_ERR_NOT_READY) { ended = ch; break; } /* サービスの管理者が去った */
     }
     /* RM is about to shut down: no new client, and every client frees what it still holds in RM
        first. A thread in the middle of a request finishes it (RM's own work) before it looks. */
     n_handle_close(events);
-    if (legacy >= 0) n_handle_close(legacy);
     n_handle_close(listener);
     __atomic_store_n(&serving_ended, 1, __ATOMIC_RELEASE);
     wake_address(&serving_ended, 0);

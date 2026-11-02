@@ -7,7 +7,8 @@ struct process;
 /* Start a program. Handle i of the new app is handles[i] (NULL: none). Its
    settings are "NAME=value" strings, passed beside its arguments. When app is
    set, that handle record reports the app's end. parent: the app that launches
-   it, NULL for one the kernel starts. */
+   it, NULL for one the kernel starts. identity: the new app's, decided by the caller
+   (sys/authority.h). */
 struct proc_launch {
     int argc;
     char **argv;
@@ -17,10 +18,10 @@ struct proc_launch {
     size_t handle_count;
     struct process *parent;
     struct object *app;
+    struct n_identity identity;
 };
 int proc_launch(const char *path, const struct proc_launch *launch);
-extern int init_pid; /* the first app: the only one that may claim a PCI function */
-int proc_spawn_simple(const char *path, const char *arg1);
+int proc_spawn_simple(const char *path, const char *arg1, const struct n_identity *identity);
 
 /* App handles (docs/nocturne-native-abi.md §5). */
 /* A new app record and the handle that will report its end (proc_launch's app is its object). */

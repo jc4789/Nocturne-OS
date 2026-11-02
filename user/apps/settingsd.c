@@ -15,7 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "authority_abi.h"
-#include "services_abi.h"
 #include "settings_abi.h"
 #include "settings_table.h"
 
@@ -26,7 +25,7 @@
 #define LIST_PAGE 32u             /* LIST の一通の宣言の数 */
 
 /* 事象の token。接続は構造体の番地（送りの待ちはその |1）。 */
-enum { TOKEN_CONTROL = 1, TOKEN_WATCH_BASE = 16 };
+enum { TOKEN_INLET = 1, TOKEN_WATCH_BASE = 16 };
 
 struct outgoing {
     struct outgoing *next;
@@ -79,7 +78,7 @@ struct change {
     uint64_t deadline;
 };
 
-static n_handle queue, control;
+static n_handle queue, inlet;
 static n_handle store = -1, apply_cap = -1;
 static n_handle store_cap = -1;
 static n_handle kernel_watch[N_DOMAIN_COUNT];
@@ -507,7 +506,7 @@ static void reply(struct conn *c, uint32_t op, uint32_t serial, n_result result,
 
 /* ---- 権限 ---- */
 static bool peer_of(struct conn *c, struct n_identity *out) {
-    return __syscall(SYS_CHANNEL_PEER, c->handle, (long)out, 0, 0, 0) >= 0;
+    return n_channel_peer(c->handle, out) >= 0;
 }
 /* 要求の id を鍵の scope の形に揃える。呼ぶ側のものでなければ false。 */
 static bool target(const struct known *k, const struct n_identity *who, struct n_setting_id *id) {
@@ -1081,42 +1080,13 @@ static void kernel_domain_changed(uint32_t domain) {
     }
 }
 
-/* 管理者からの文。false は止まれの知らせ。 */
-static bool on_control(void) {
-    struct n_service_control m;
-    n_handle attached = -1;
-    n_result n = n_channel_receive(control, &m, sizeof m, 0, &attached);
-    if (n == -N_ERR_NOT_READY) return true;
-    if (n < 0 || (size_t)n < sizeof m) return false;
-    switch (m.kind) {
-    case N_SERVICE_CTL_CONNECTION:
-        if (attached >= 0) conn_add(attached);
-        break;
-    case N_SERVICE_CTL_STOP:
-        return false;
-    default:
-        if (attached >= 0) n_handle_close(attached);
-    }
-    return true;
-}
-
-/* 能力を全部受け取る。 */
-static void take_caps(void) {
+/* 受け口に来た相手を全部受ける。false は管理者が名前を閉じた知らせで、止まる。 */
+static bool accept_connections(void) {
     for (;;) {
-        struct n_service_control m;
-        n_handle attached = -1;
-        n_result n = n_channel_receive(control, &m, sizeof m, N_CHANNEL_WAIT, &attached);
-        if (n < 0 || (size_t)n < sizeof m) exit(1);
-        if (m.kind == N_SERVICE_CTL_CAPS_DONE) return;
-        if (m.kind == N_SERVICE_CTL_CAP) {
-            if (m.value == N_CAP_STORE_PRIVATE) store_cap = attached;
-            else if (m.value == N_CAP_SETTINGS_APPLY) apply_cap = attached;
-            else if (attached >= 0) n_handle_close(attached);
-        } else if (m.kind == N_SERVICE_CTL_CONNECTION && attached >= 0) {
-            conn_add(attached);
-        } else if (attached >= 0) {
-            n_handle_close(attached);
-        }
+        n_handle end = n_inlet_accept(inlet, 0);
+        if (end == -N_ERR_NOT_READY) return true;
+        if (end == -N_ERR_CLOSED) return false;
+        if (end >= 0) conn_add(end);
     }
 }
 
@@ -1146,11 +1116,11 @@ static void run_deadlines(void) {
 }
 
 int main(void) {
-    control = N_SERVICE_HANDLE_CONTROL;
     queue = n_events_create();
     message = malloc(N_SETTINGS_MESSAGE_MAX);
     if (queue < 0 || !message) return 1;
-    take_caps();
+    store_cap = n_cap_find(N_CAP_STORE_PRIVATE);
+    apply_cap = n_cap_find(N_CAP_SETTINGS_APPLY);
     for (size_t i = 0; i < sizeof settings_table / sizeof *settings_table; i++) {
         const struct n_setting_decl *d = &settings_table[i];
         struct known *k = decl_valid(d) ? known_add(d, 0) : NULL;
@@ -1166,17 +1136,17 @@ int main(void) {
         if (kernel_watch[domain] >= 0) n_events_watch(queue, kernel_watch[domain], N_EVENT_RECEIVABLE, TOKEN_WATCH_BASE + domain);
     }
     apply_machine_values();
-    if (n_events_watch(queue, control, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, TOKEN_CONTROL) < 0) return 1;
-    struct n_service_control ready = {.kind = N_SERVICE_CTL_READY};
-    if (n_channel_send(control, &ready, sizeof ready, -1) < 0) return 1;
+    /* 値を読み終え、カーネルへ適用した後で名前を持つ。名前があることが準備の済んだ証拠。 */
+    inlet = n_service_listen(N_SETTINGS_SERVICE);
+    if (inlet < 0 || n_events_watch(queue, inlet, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, TOKEN_INLET) < 0) return 1;
     for (;;) {
         struct n_event events[32];
         n_result n = n_events_wait(queue, events, sizeof events / sizeof *events, next_deadline());
         if (n < 0) return 1;
         for (n_result i = 0; i < n; i++) {
             uint64_t token = events[i].token;
-            if (token == TOKEN_CONTROL) {
-                if (!on_control()) return 0;
+            if (token == TOKEN_INLET) {
+                if (!accept_connections()) return 0;
             } else if (token >= TOKEN_WATCH_BASE && token < TOKEN_WATCH_BASE + N_DOMAIN_COUNT) {
                 kernel_domain_changed((uint32_t)(token - TOKEN_WATCH_BASE));
             } else {

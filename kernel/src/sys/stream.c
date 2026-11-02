@@ -84,6 +84,7 @@ static struct log_reader *log_reader_of(struct handle *h) {
 
 /* The text after the opening's cursor, as much as fits in n (at least something with wait). */
 static int64_t log_receive(struct handle *h, void *buf, size_t n, bool user, bool wait) {
+    if (!handle_allows(h, HANDLE_READ)) return -N_ERR_DENIED;
     struct log_reader *r = log_reader_of(h);
     if (!r) return -N_ERR_NO_MEMORY;
     char piece[COPY_PIECE];
@@ -114,6 +115,7 @@ static int64_t log_receive(struct handle *h, void *buf, size_t n, bool user, boo
 /* A hint (an event queue's lock held): an opening that never received has the whole log ahead. */
 static uint32_t log_ready(struct handle *h) {
     struct log_reader *r = __atomic_load_n((struct log_reader **)&h->priv, __ATOMIC_ACQUIRE);
+    if (!handle_allows(h, HANDLE_READ)) return N_EVENT_SENDABLE;
     return N_EVENT_SENDABLE | (!r || log_pending(r->cursor) ? N_EVENT_RECEIVABLE : 0);
 }
 
@@ -129,7 +131,9 @@ static const struct object_ops log_ops = {
 };
 static struct object log_object = {.ops = &log_ops};
 
-struct handle *stream_system_log_open(void) { return stream_open(&log_object); }
+struct handle *stream_system_log_open(bool read) {
+    return handle_open(&log_object, HANDLE_WRITE | (read ? HANDLE_READ : 0));
+}
 
 void stream_system_log_told(void) { object_notify(&log_object); }
 

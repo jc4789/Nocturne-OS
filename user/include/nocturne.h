@@ -91,14 +91,32 @@ n_result n_channel_receive(n_handle h, void *buf, size_t cap, int flags, n_handl
    of one app agree, including across connections or transferred endpoints.
    message is required. Peek reports credentials without taking an attachment. */
 n_result n_channel_receive_from(n_handle h, void *buf, size_t cap, int flags, struct n_channel_message *message);
-/* Named rendezvous, not a folder or network name: the key bytes are matched in
-   full, so callers put their own identity into it. listen owns the key until
-   its handle closes (N_ERR_EXISTS meanwhile); connect gives a message channel
-   whose other end waits in the listener (N_EVENT_RECEIVABLE) for accept, which
-   without one gives N_ERR_NOT_READY. A listener that closes closes them too. */
-n_handle n_channel_listen(const char *key);
-n_handle n_channel_connect(const char *key);
-n_handle n_channel_accept(n_handle listener);
+/* 身元と能力（docs/nocturne-native-abi.md §2）。 */
+n_result n_identity_self(struct n_identity *out);
+/* channel のもう一端の、カーネルが証明した身元。 */
+n_result n_channel_peer(n_handle channel, struct n_identity *out);
+/* cap から kind の能力を切り出す。根は全部を、ほかの能力は自分と同じ種類だけを。 */
+n_handle n_cap_derive(n_handle cap, enum n_cap kind);
+n_result n_cap_kind(n_handle cap);
+/* 自分が持つ kind の能力の handle。無ければ N_ERR_NOT_FOUND。 */
+n_handle n_cap_find(enum n_cap kind);
+/* 自分が持つ能力の handle を out（N_CAP_COUNT 個の場所）へ並べる：その数。子へ渡す列を作るとき。 */
+size_t n_caps_list(int32_t *out);
+/* カーネルの窓の系が起こすアプリの身元を決める。 */
+n_result n_session_identity(n_handle identity_grant, const struct n_identity *identity);
+
+/* 受け口：各メッセージが新しい channel の端を一つ運ぶ channel。connect は組を作って一方の端を
+   受け口へ送り、もう一方を返す。accept は次の端を受ける（flags は 0 か N_CHANNEL_WAIT、無ければ
+   N_ERR_NOT_READY、送る側が全部閉じれば N_ERR_CLOSED）。受け口を受ける側が閉じると待つ端も閉じる。 */
+n_handle n_inlet_connect(n_handle inlet);
+n_handle n_inlet_accept(n_handle inlet, int flags);
+
+/* サービス：名前はサービスの管理者が決める（カーネルは覚えない）。connect は名前のサービスへの
+   channel を返す。listen は名前を管理者に申し込み、受け口を返す。受け口を全部閉じると名前は消える。
+   register は管理者だけ：接続の要求（struct n_service_request）を受ける channel を返す。 */
+n_handle n_service_connect(const char *name);
+n_handle n_service_listen(const char *name);
+n_handle n_service_register(n_handle service_root);
 /* Apps: the handle reports the end (N_EVENT_APP_ENDED); there is no zombie to reap. */
 n_handle n_app_launch(const char *path, const struct n_launch *launch);
 n_result n_app_result(n_handle app, uint64_t deadline, int *status); /* a past deadline polls: N_ERR_NOT_READY */
@@ -106,17 +124,17 @@ n_result n_app_stop(n_handle app, int flags);                         /* N_APP_S
 n_result n_app_self(void);
 n_result n_app_parent(void);
 n_handle n_app_open(int64_t id); /* a running app by the identifier the app list shows */
-n_result n_system_log(char *buf, size_t cap); /* the newest system log text; its length */
-/* A handle whose messages are added to the system log, and which receives the log's text from the
-   oldest record the kernel holds at its first receive on. */
+n_result n_system_log(char *buf, size_t cap); /* the newest system log text; its length（ADMIN 以上） */
+/* A handle whose messages are added to the system log. 開いた者が ADMIN 以上なら log's text も受ける
+   (from the oldest record the kernel holds at its first receive on)。 */
 n_handle n_system_log_open(void);
 n_result n_app_id(n_handle app); /* its identifier, also after its end (identifiers are not reused) */
-/* Drivers in apps (docs/nocturne-native-abi.md §9). Only init may claim a PCI function; it
-   hands the N_KIND_PCI handle to the driver app it launches. A claim is exclusive until its
+/* Drivers in apps (docs/nocturne-native-abi.md §9). A claim takes the N_CAP_PCI_CLAIM capability;
+   its holder hands the N_KIND_PCI handle to the driver app it launches. A claim is exclusive until its
    last handle closes, which also turns the function's interrupts off. Isolation is required
    unless appdrivers-unisolated was explicitly selected at boot. A device left active needs
    recovery; n_pci_info reports N_PCI_NEEDS_RECOVERY if generic FLR was not possible. */
-n_handle n_pci_claim(uint8_t bus, uint8_t dev, uint8_t func);
+n_handle n_pci_claim(n_handle cap, uint8_t bus, uint8_t dev, uint8_t func);
 n_result n_pci_info(n_handle pci, struct n_pci_function *out);
 /* Config space: width 1, 2 or 4 at an offset below 4096 aligned to it. Reads may name another
    function (N_PCI_TARGET, e.g. the upstream bridge) or N_PCI_SELF; writes only reach the
@@ -383,8 +401,8 @@ n_result wait_on_address64(volatile uint64_t *address, uint64_t expected, uint64
 n_result wake_address(volatile uint32_t *address, unsigned count);
 void yield(void);
 /* These return only on failure, with a negative n_result. */
-n_result poweroff(void);
-n_result reboot(void);
+n_result poweroff(n_handle cap); /* N_CAP_POWER */
+n_result reboot(n_handle cap);   /* N_CAP_POWER */
 /* The count of PCI functions (at most max written), or a negative n_result. */
 n_result pcilist(struct n_pciinfo *out, int max);
 long __syscall(long n, long a, long b, long c, long d, long e);
@@ -514,7 +532,7 @@ n_result clipboard_get(char *buf, size_t n); /* the whole length; at most n byte
 n_result gui_launch(const char *path, const char *arg);
 /* copy the whole screen (taskbar included) into buf as 0xAARRGGBB pixels. bytes = 0 only reports
    the size. -N_ERR_TOO_LARGE: the buffer is too small */
-n_result screen_grab(uint32_t *buf, size_t bytes, int *w, int *h);
+n_result screen_grab(n_handle cap, uint32_t *buf, size_t bytes, int *w, int *h); /* N_CAP_SCREEN_READ */
 
 /* ---- sound (sound.c) ----
    Streams come from n_audio_open (above; up to 8 play at once) and hold about 170 ms

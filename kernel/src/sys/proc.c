@@ -4,6 +4,8 @@
 #include "arch/gdt.h"
 #include "sys/clock.h"
 #include "sys/proc.h"
+#include "sys/authority.h"
+#include "sys/channel.h"
 #include "sys/process.h"
 #include "mm/shared.h"
 #include "sys/syscall.h"
@@ -32,8 +34,6 @@ struct elf64_phdr {
 #define PT_LOAD 1
 #define PF_X    1
 #define PF_W    2
-
-int init_pid;
 
 /* ---- app handles: an app's end is an event on its handle ---- */
 
@@ -117,7 +117,8 @@ int proc_app_open(int pid, struct handle **out) {
     uint64_t flags = spin_lock(&thread_lock);
     struct process *p = process_find(pid);
     struct object *o = NULL;
-    if (p && !p->exiting) { /* once its end began, its end reads p->app (process_end) */
+    bool denied = p && !identity_may_reach(identity_current(), &p->identity);
+    if (p && !denied && !p->exiting) { /* once its end began, its end reads p->app (process_end) */
         if (!p->app) {
             ((struct app_record *)spare->priv)->pid = pid;
             object_ref(spare); /* the process's reference, as proc_launch takes */
@@ -129,6 +130,7 @@ int proc_app_open(int pid, struct handle **out) {
     }
     spin_unlock(&thread_lock, flags);
     if (spare) app_release(spare);
+    if (denied) return -N_ERR_DENIED;
     if (!o) return -N_ERR_NO_APP;
     *out = handle_open(o, 0);
     object_unref(o);
@@ -206,6 +208,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
         handle_close(doc);
         return -N_ERR_NO_MEMORY;
     }
+    p->identity = l->identity;
     if (!(p->vmm_space = vmm_space_new())) goto fail;
     if ((r = clock_map(p->vmm_space)) < 0) goto fail; /* the app reads its clocks there (abi.h) */
 
@@ -282,6 +285,8 @@ int proc_launch(const char *path, const struct proc_launch *l) {
             handle_close(l->handles[i]);
             r = -N_ERR_NO_MEMORY;
             goto fail;
+        } else if (l->handles[i] && message_channel_is(l->handles[i])) {
+            message_channel_handed(l->handles[i], &p->identity);
         }
     uint64_t sp = USER_STACK_TOP;
     for (int i = settings - 1; i >= 0; i--) {
@@ -345,7 +350,7 @@ fail:
     return r;
 }
 
-int proc_spawn_simple(const char *path, const char *arg1) {
+int proc_spawn_simple(const char *path, const char *arg1, const struct n_identity *identity) {
     char *argv[3] = {(char *)path, (char *)arg1, NULL};
     struct handle *nul = stream_null_open();
     struct handle *handles[3] = {nul, nul, nul};
@@ -353,7 +358,7 @@ int proc_spawn_simple(const char *path, const char *arg1) {
     ksnprintf(folder, sizeof folder, "FOLDER=%s", store_user_folder());
     char *settings[] = {folder};
     struct proc_launch l = {.argc = arg1 ? 2 : 1, .argv = argv, .setting_count = 1, .settings = settings,
-                            .handles = handles, .handle_count = 3};
+                            .handles = handles, .handle_count = 3, .identity = *identity};
     int r = proc_launch(path, &l);
     handle_close(nul);
     return r;

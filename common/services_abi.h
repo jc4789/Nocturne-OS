@@ -12,14 +12,6 @@
 #define N_SERVICE_PROGRAM_MAX 128u
 #define N_SERVICE_MANAGER "services" /* サービスの管理者自身の口の名前 */
 
-/* SYS_SERVICE_REGISTER の channel にカーネルが積む、SYS_SERVICE_CONNECT 一回分の要求。
-   添付は新しい channel のサービス側の端。その端の SYS_CHANNEL_PEER が要求した者の身元を返す。 */
-struct n_service_request {
-    uint32_t name_bytes;           /* nul を含まない */
-    uint32_t reserved;
-    char name[N_SERVICE_TEXT_MAX]; /* "名前" か "名前:引数" */
-};
-
 /* 管理者がサービスを起こすときの handle の番号。0、1、2 は入力、出力、ログ。
    この channel が管理者とサービスの間の唯一の道で、能力も接続もここを通る。 */
 #define N_SERVICE_HANDLE_CONTROL 3

@@ -528,8 +528,12 @@ static n_handle launch(const char *path, struct cmd *c, const int32_t handles[3]
     uint32_t terminal_count = 0;
     for (int i = 0; i < 3; i++)
         if (handles[i] == i && n_terminal(i)) terminals[terminal_count++] = i;
-    struct n_launch l = {.arguments = (const char *const *)c->argv, .handles = handles, .argument_count = (uint32_t)c->argc,
-                         .handle_count = 3, .folder = folder, .terminals = terminals, .terminal_count = terminal_count};
+    /* シェルが受けた能力は、シェルの子も受ける：能力を持つシェルは持ち主が渡したときだけある。 */
+    int32_t given[3 + N_CAP_COUNT] = {handles[0], handles[1], handles[2]};
+    size_t caps = n_caps_list(given + 3);
+    struct n_launch l = {.arguments = (const char *const *)c->argv, .handles = given, .argument_count = (uint32_t)c->argc,
+                         .handle_count = 3 + (uint32_t)caps, .folder = folder, .terminals = terminals,
+                         .terminal_count = terminal_count};
     return n_app_launch(path, &l);
 }
 
