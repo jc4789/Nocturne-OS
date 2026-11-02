@@ -147,7 +147,17 @@ enum {
     SYS_WATCH_TAKE = 207,     /* (watch): the changes since its last take (0: none) */
     SYS_ENTRY_WATCH,          /* (path, N_WATCH_NAME or N_WATCH_FOLDER): a watch on C: (§3) */
     SYS_AUDIO_OUTPUT_WATCH,   /* (): a watch on what SYS_AUDIO_OUTPUT reports (§9) */
-    SYS_MAX = 210          /* above every number (what syscallfuzz tries) */
+    SYS_IDENTITY_SELF,        /* (struct n_identity *out) */
+    SYS_CHANNEL_PEER,         /* (channel, struct n_identity *out) */
+    SYS_CAP_DERIVE,           /* (cap, enum n_cap) -> handle */
+    SYS_SERVICE_REGISTER,     /* (N_CAP_SERVICE_ROOT の cap) -> 接続の要求を受ける channel */
+    SYS_SERVICE_CONNECT,      /* (name, name_len) -> channel */
+    SYS_STORE_PRIVATE_OPEN,   /* (N_CAP_STORE_PRIVATE の cap, region, ...) -> document */
+    SYS_SETTINGS_APPLY,       /* (N_CAP_SETTINGS_APPLY の cap, domain, key, value, len) */
+    SYS_SETTINGS_EFFECTIVE,   /* (domain, key, out, cap): 今の値のバイト数（§12） */
+    SYS_SETTINGS_DESCRIBE,    /* (domain, key, struct n_setting_desc *out)（§12） */
+    SYS_SETTINGS_WATCH,       /* (domain): その領域の今の値の watch（§12） */
+    SYS_MAX                   /* above every number (what syscallfuzz tries) */
 };
 
 /* ---- native handles ---- */
@@ -170,8 +180,8 @@ enum {
 /* SYS_WATCH_TAKE counts up to this and stays there until the count is taken */
 #define N_WATCH_CHANGES_MAX 0xffffffffu
 
-/* The folders of C: every app and the system know. Apps start in the user's folder, C:\Users\<name>,
-   which the setting USERFOLDER names; its AppData\Temp, emptied at every start, is the setting TEMP. */
+/* The folders of C: every app and the system know. Apps start in the user's folder, C:\Users\<name>
+   (struct n_start の user_folder); its AppData\Temp, emptied at every start, is temp_folder. */
 #define N_FOLDER_SYSTEM   "C:\\Nocturne\\System"  /* the system's programs */
 #define N_FOLDER_PROGRAMS "C:\\Programs"           /* the apps, each in a folder of its own */
 /* certificate authorities the system trusts besides the roots built into TLS (user/libc/tls.c) */
@@ -218,16 +228,39 @@ struct n_channel_message {
     uint64_t sender_app;
 };
 
-/* n_app_launch. Handle i of the new app is handles[i] of the launcher (-1:
-   none); by convention 0 is its input, 1 its output and 2 its log. Settings
-   are "NAME=value" strings that ISO C getenv reads. */
+/* n_app_launch. 新しいアプリの handle i は起動元の handles[i]（-1 は無し）。慣例で 0 が入力、
+   1 が出力、2 がログ。起動の属性は型のある欄で渡す：
+     folder       今のフォルダー（NULL は起動元の libc が自分の今のフォルダーを入れる）。
+     user_folder、temp_folder  利用者のフォルダーと一時フォルダー（NULL は起動元のもの。起動元も
+                  持たなければカーネルが身元の利用者のものを入れる）。
+     terminals    端末へつながる handle の番号。
+     interrupts   端末の Ctrl+C の知らせを受ける channel の handle の番号（0 は無し）。
+   environment は移植のプログラムのための "NAME=value" の列で、そのプログラムの libc の getenv だけ
+   が読む。システムの部品はこれを読まず、これで組まない。 */
 struct n_launch {
     const char *const *arguments;
-    const char *const *settings;
+    const char *const *environment;
     const int32_t *handles;
-    uint32_t argument_count, setting_count, handle_count, flags;
+    uint32_t argument_count, environment_count, handle_count, flags;
+    const char *folder;
+    const char *user_folder;
+    const char *temp_folder;
+    const int32_t *terminals;
+    uint32_t terminal_count;
+    int32_t interrupts;
 };
-/* The most bytes a launch's argument and setting strings (each with its nul) and their two
+/* アプリの入口の第三引数。カーネルが n_launch の欄を新しいアプリの stack に写したもの。文字列と
+   配列は同じ stack にある。folder・user_folder・temp_folder はいつも完全なパスを指す。 */
+struct n_start {
+    char *const *environment; /* NULL で終わる */
+    const char *folder;
+    const char *user_folder;
+    const char *temp_folder;
+    const int32_t *terminals;
+    uint32_t terminal_count;
+    int32_t interrupts;
+};
+/* The most bytes a launch's argument and environment strings (each with its nul) and their two
    null-terminated pointer arrays (8 bytes a pointer) may take: N_ERR_TOO_MANY_ARGUMENTS past it. */
 #define N_LAUNCH_MAX_BYTES (4ULL << 20)
 #define N_APP_STOP_TREE 1  /* n_app_stop: also stop every app it launched */
