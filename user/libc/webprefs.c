@@ -1,20 +1,16 @@
-/* The browser's preferences (webprefs.h): the document "preferences" in the browser's profile
-   folder, read into each browser process and kept current through a watch on it.
+/* ブラウザーの設定（webprefs.h）：プログラムの scope の設定として settings が持つ。各プロセスが読んで持ち、
+   見張りで変更を聞く。
 
-   Two locks. io keeps the document's reads, its changes and the watch in one order: a read puts
-   what it read in place before another begins, and a change is claimed, read, changed and saved
-   whole under it. state guards what this process holds now, for its readers on any thread, which
-   wait for the document only until it has been read. io is taken before state, never after. */
+   二つの錠。io は読みと変更と見張りを一つの順にする。state は今持っているものを守り、どのスレッドの読み手も
+   取る。io を先に取り、後では取らない。 */
 #include <webprefs.h>
-#include <webstorage.h>
+#include <nocturne_settings.h>
 #include <webcookie.h>
 #include <weburl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
 
-#define HEADER "Nocturne browser preferences 1"
-#define DOCUMENT_MAX (64u * 1024u)
 #define DEFAULT_LANGUAGES WEBPREFS_DEFAULT_LANGUAGES
 #define ACCEPT_MAX WEBPREFS_ACCEPT_LANGUAGE_MAX
 /* What each tag after the first adds to the Accept-Language: a comma and ";q=0.N". */
@@ -354,161 +350,38 @@ static void languages_read(const char *value, size_t n, struct prefs *p) {
     p->languages_length = l.length;
 }
 
-/* The length of the first line when the document is this build's (HEADER, then a line feed or
-   its end); 0 when it is not. */
-static size_t header_of(const char *bytes, size_t n) {
-    size_t h = sizeof HEADER - 1;
-    return n >= h && !memcmp(bytes, HEADER, h) && (n == h || bytes[h] == '\n') ? h : 0;
-}
-
-/* The lines of a document from at on, each without its line feed (the last may have none). */
-struct lines {
-    const char *bytes;
-    size_t n, at;
+/* プログラムの scope の鍵。 */
+enum { KEY_LANGUAGES, KEY_SEARCH_HISTORY, KEY_CLEAR_ON_CLOSE, KEY_SITE_EXCEPTIONS };
+static const struct n_setting_decl declarations[] = {
+    {.domain = N_DOMAIN_PROGRAM, .key = KEY_LANGUAGES, .type = N_SETTING_STRING, .scope = N_SCOPE_PROGRAM,
+     .apply = N_APPLY_NONE, .max = ACCEPT_MAX, .fallback_text = DEFAULT_LANGUAGES, .name = "browser.languages",
+     .label = "優先する言語", .about = "タグをコンマで区切った一覧です。"},
+    {.domain = N_DOMAIN_PROGRAM, .key = KEY_SEARCH_HISTORY, .type = N_SETTING_BOOL, .scope = N_SCOPE_PROGRAM,
+     .apply = N_APPLY_NONE, .max = 1, .name = "browser.search-history", .label = "検索の履歴",
+     .about = "検索の入力を候補のために残します。"},
+    {.domain = N_DOMAIN_PROGRAM, .key = KEY_CLEAR_ON_CLOSE, .type = N_SETTING_BOOL, .scope = N_SCOPE_PROGRAM,
+     .apply = N_APPLY_NONE, .max = 1, .name = "browser.clear-on-close", .label = "閉じたらサイトのデータを消す",
+     .about = "ブラウザーを閉じるときに Cookie とサイトのデータを消します。"},
+    {.domain = N_DOMAIN_PROGRAM, .key = KEY_SITE_EXCEPTIONS, .type = N_SETTING_STRING, .scope = N_SCOPE_PROGRAM,
+     .apply = N_APPLY_NONE, .max = N_SETTING_VALUE_MAX, .name = "browser.site-exceptions", .label = "サイトの例外",
+     .about = "「規則:ホスト」を空白で区切った一覧です。"},
 };
-
-static bool line_next(struct lines *it, const char **line, size_t *length) {
-    if (it->at >= it->n) return false;
-    const char *start = it->bytes + it->at, *lf = memchr(start, '\n', it->n - it->at);
-    *line = start;
-    *length = lf ? (size_t)(lf - start) : it->n - it->at;
-    it->at += *length + 1;
-    return true;
-}
-
-/* Whether the line is "name=value", and its value. */
-static bool line_value(const char *line, size_t length, const char *name, const char **value, size_t *n) {
-    size_t k = strlen(name);
-    if (length <= k || line[k] != '=' || memcmp(line, name, k)) return false;
-    *value = line + k + 1;
-    *n = length - k - 1;
-    return true;
-}
-
-/* What a document says. Another first line: every default. Of the lines of a name, the first
-   counts; a bad value leaves that one's default. false: no memory (*p holds nothing to free). */
-static bool prefs_parse(const char *bytes, size_t n, struct prefs *p) {
-    prefs_default(p);
-    size_t h = header_of(bytes, n);
-    if (!h) return true;
-    bool languages = false, history = false, close = false, sites = false;
-    struct lines it = {bytes, n, h + 1};
-    const char *line, *value;
-    size_t length, vn;
-    while (line_next(&it, &line, &length)) {
-        if (!languages && line_value(line, length, "languages", &value, &vn)) {
-            languages = true;
-            languages_read(value, vn, p);
-        } else if (!history && line_value(line, length, "search-history", &value, &vn)) {
-            history = true;
-            p->search_history = vn == 2 && !memcmp(value, "on", 2); /* "off", or the default (off) */
-        } else if (!close && line_value(line, length, "clear-site-data-on-close", &value, &vn)) {
-            close = true;
-            p->clear_on_close = vn == 2 && !memcmp(value, "on", 2);
-        } else if (!sites && line_value(line, length, "site-data-exceptions", &value, &vn)) {
-            sites = true;
-            if (!sites_read(value, vn, p)) return false;
-        }
-    }
-    return true;
-}
-
-/* The document whose line of name is "name=value" (value NULL: it has none), in *out (free it) and
-   *n: the first line, then the other lines of old as they were, the new line where the first of
-   name was or at the end. When old is not this build's document, the new one starts again. 0;
-   -N_ERR_NO_MEMORY; -N_ERR_TOO_LARGE past DOCUMENT_MAX. */
-static n_result document_make(const char *old, size_t on, const char *name, const char *value, char **out, size_t *n) {
-    size_t h = header_of(old, on), k = strlen(name), vn = value ? strlen(value) : 0;
-    size_t room = sizeof HEADER + (h ? on - h : 0) + k + vn + 2;
-    char *b = malloc(room);
-    if (!b) return -N_ERR_NO_MEMORY;
-    memcpy(b, HEADER "\n", sizeof HEADER);
-    size_t at = sizeof HEADER;
-    bool placed = !value;
-    struct lines it = {old, h ? on : 0, h + 1};
-    const char *line, *v;
-    size_t length, vlength;
-    while (line_next(&it, &line, &length)) {
-        bool named = line_value(line, length, name, &v, &vlength);
-        if (named && placed) continue; /* a later line of name, or the line removed */
-        if (named) {
-            memcpy(b + at, name, k);
-            b[at + k] = '=';
-            memcpy(b + at + k + 1, value, vn);
-            at += k + 1 + vn;
-            placed = true;
-        } else {
-            memcpy(b + at, line, length);
-            at += length;
-        }
-        b[at++] = '\n';
-    }
-    if (!placed) {
-        memcpy(b + at, name, k);
-        b[at + k] = '=';
-        memcpy(b + at + k + 1, value, vn);
-        at += k + 1 + vn;
-        b[at++] = '\n';
-    }
-    if (at > DOCUMENT_MAX) {
-        free(b);
-        return -N_ERR_TOO_LARGE;
-    }
-    *out = b;
-    *n = at;
-    return 0;
-}
-
-/* The whole content of an open document of at most DOCUMENT_MAX bytes, in *bytes (free it; NULL
-   when it is empty) and *n: 1. 0 when it is longer (not a document of this build: nothing read).
-   Or the failure. */
-static n_result read_all(n_handle h, char **bytes, size_t *n) {
-    *bytes = NULL;
-    *n = 0;
-    n_result size = n_document_size(h);
-    if (size < 0) return size;
-    if ((uint64_t)size > DOCUMENT_MAX) return 0;
-    if (!size) return 1;
-    char *b = malloc((size_t)size);
-    if (!b) return -N_ERR_NO_MEMORY;
-    size_t at = 0;
-    while (at < (size_t)size) {
-        n_result got = n_document_read_at(h, at, b + at, (size_t)size - at);
-        if (got < 0) {
-            free(b);
-            return got;
-        }
-        if (!got) break; /* shorter than its size said */
-        at += (size_t)got;
-    }
-    *bytes = b;
-    *n = at;
-    return 1;
-}
+#define SITES_ATTEMPTS 8 /* 他のプロセスと競って書き直す回数 */
 
 static mtx_t io, state;
 
-/* Under io. queue: where the watch is wanted (-1: nowhere, the document is read once). */
-static char path[1024];
+/* io の下。queue：見張りを置きたい行列（-1 は無し。読むのは一度）。 */
 static n_handle watch = -1, queue = -1;
+static bool declared;
 
-/* Under state; valid and generation are read without it too. seen: a reader was given the list.
-   valid: what the process holds is the document's, and no watch is wanted and missing. */
+/* state の下。valid と generation は錠なしでも読む。seen：読み手に一覧を渡した。valid：持っているものが settings の
+   値で、欠けた見張りが無い。 */
 static struct prefs current = {.languages = DEFAULT_LANGUAGES, .languages_length = sizeof DEFAULT_LANGUAGES - 1};
 static bool seen, valid;
 static uint64_t generation, site_generation;
 
-static bool path_ready(void) {
-    if (path[0]) return true;
-    const char *folder = web_profile_folder(false);
-    if (folder && n_path_join(folder, "preferences", path, sizeof path) >= 0) return true;
-    path[0] = 0;
-    return false;
-}
-
-/* Makes p what the process holds; its exceptions become the process's (p keeps none). The list's
-   generation grows when it differs from a list a reader was given: before any was given, no
-   change can be seen. The sites' generation grows with any change of theirs. Under io. */
+/* p を今持つものにする（例外は移す）。一覧の世代は読み手に渡した一覧と違うときに進む。サイトの世代はその変更で
+   進む。io の下。 */
 static void apply(struct prefs *p) {
     mtx_lock(&state);
     if (seen && (p->languages_length != current.languages_length ||
@@ -525,38 +398,47 @@ static void apply(struct prefs *p) {
     mtx_unlock(&state);
 }
 
-/* The document as it is now, in *p (every default without it): 0, or the failure that kept it
-   from being read. Under io. */
-static n_result document_read(struct prefs *p) {
-    prefs_default(p);
-    if (!path_ready()) return 0; /* no profile folder: no document */
-    n_handle h = n_document_open(path, N_DOCUMENT_READ);
-    if (h == -N_ERR_NOT_FOUND || h == -N_ERR_NOT_FOLDER || h == -N_ERR_IS_FOLDER) return 0;
-    if (h < 0) return h;
-    char *bytes;
-    size_t n;
-    n_result r = read_all(h, &bytes, &n);
-    n_handle_close(h);
-    if (r > 0 && !prefs_parse(bytes, n, p)) r = -N_ERR_NO_MEMORY;
-    free(bytes);
-    return r < 0 ? r : 0;
+/* 宣言は一度。 */
+static n_result declare_locked(void) {
+    if (declared) return 0;
+    n_result r = n_setting_declare(declarations, sizeof declarations / sizeof *declarations, NULL);
+    if (r >= 0) declared = true;
+    return r;
 }
 
-/* Reads the document into the process. After a failed read the process keeps what it held and
-   the next use reads again, as it does while a watch is wanted and missing. Under io. */
+/* 今の値を *p へ（読めなければ既定）。0 か失敗。io の下。 */
+static n_result settings_read(struct prefs *p) {
+    prefs_default(p);
+    n_result r = declare_locked();
+    if (r < 0) return r;
+    char *text = malloc(N_SETTING_VALUE_MAX);
+    if (!text) return -N_ERR_NO_MEMORY;
+    n_result n = n_setting_get(n_setting_of_program(KEY_LANGUAGES), text, N_SETTING_VALUE_MAX);
+    if (n >= 0) languages_read(text, (size_t)n, p);
+    int32_t on = 0;
+    if ((r = n_setting_get_int(n_setting_of_program(KEY_SEARCH_HISTORY), &on)) >= 0) p->search_history = on != 0;
+    if (r >= 0 && (r = n_setting_get_int(n_setting_of_program(KEY_CLEAR_ON_CLOSE), &on)) >= 0) p->clear_on_close = on != 0;
+    if (r >= 0 && (n = n_setting_get(n_setting_of_program(KEY_SITE_EXCEPTIONS), text, N_SETTING_VALUE_MAX)) >= 0 &&
+        !sites_read(text, (size_t)n, p))
+        r = -N_ERR_NO_MEMORY;
+    free(text);
+    return r < 0 ? r : n < 0 ? n : 0;
+}
+
+/* 読んでプロセスのものにする。サービスが無ければ既定で動き、読み直さない（見張りが戻れば読む）。ほかの失敗は次の
+   使用で読み直す。io の下。 */
 static void refresh_locked(void) {
     struct prefs p;
-    bool read = document_read(&p) >= 0;
-    if (read) apply(&p);
-    __atomic_store_n(&valid, read && (queue < 0 || watch >= 0), __ATOMIC_RELEASE);
+    n_result r = settings_read(&p);
+    if (r >= 0 || r == -N_ERR_NOT_FOUND) apply(&p);
+    else free(p.sites);
+    __atomic_store_n(&valid, (r >= 0 || r == -N_ERR_NOT_FOUND) && (queue < 0 || watch >= 0), __ATOMIC_RELEASE);
 }
 
-/* Watches the document in queue (before it is read: then no change between is missed). Without
-   watches on C: or without that queue the document is read once; after other failures (the
-   profile folder removed, no memory) each use tries again. Under io. */
+/* queue に見張りを置く（読む前に：その間の変更を落とさない）。io の下。 */
 static n_result watch_open_locked(void) {
-    n_handle w = path_ready() ? n_entry_watch(path, N_WATCH_NAME) : -N_ERR_NOT_FOUND;
-    if (w == -N_ERR_UNSUPPORTED) queue = -1;
+    n_handle w = n_setting_watch(N_DOMAIN_PROGRAM, N_SETTING_ANY);
+    if (w == -N_ERR_NOT_FOUND) queue = -1;
     if (w < 0) return w;
     n_result r = n_events_watch(queue, w, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, WEBPREFS_TOKEN);
     if (r < 0) {
@@ -575,20 +457,24 @@ static void watch_drop_locked(void) {
     watch = -1;
 }
 
-/* Takes the watch's changes, and reads the document again when there were some, when the watch
-   ended (its folder was removed: watched again once there is one) or when the last read failed.
-   Under io. */
+/* 見張りの知らせを取り、あれば読み直す。サービスが起こし直されていれば見張り直す。io の下。 */
 static void take_locked(bool closed) {
-    n_result n = watch >= 0 ? n_watch_take(watch) : 0;
-    if (n == -N_ERR_CLOSED) closed = true;
+    bool any = false;
+    if (watch >= 0) {
+        struct n_settings_changed change;
+        n_result r;
+        while ((r = n_setting_watch_take(watch, &change)) >= 0) any = true;
+        if (r == -N_ERR_CLOSED) closed = true;
+    }
     if (closed && watch >= 0) {
         watch_drop_locked();
+        declared = false;
         (void)watch_open_locked();
     }
-    if (n || closed || !__atomic_load_n(&valid, __ATOMIC_ACQUIRE)) refresh_locked();
+    if (any || closed || !__atomic_load_n(&valid, __ATOMIC_ACQUIRE)) refresh_locked();
 }
 
-/* Before a reader: the document read once, and again while a read or a wanted watch failed. */
+/* 読み手の前に：一度読み、読みか見張りが欠けている間は読み直す。 */
 static void ensure(void) {
     if (__atomic_load_n(&valid, __ATOMIC_ACQUIRE)) return;
     mtx_lock(&io);
@@ -631,7 +517,7 @@ void webprefs_sync(void) {
         take_locked(false);
     } else {
         if (queue >= 0) (void)watch_open_locked();
-        refresh_locked(); /* without a watch nothing tells: read */
+        refresh_locked(); /* 見張りが無ければ何も知らせない：読む */
     }
     mtx_unlock(&io);
 }
@@ -706,117 +592,50 @@ bool webprefs_search_history(void) {
     return on;
 }
 
-/* The new value of a line, made from the document as it is when claimed (old: its on bytes, NULL
-   when there is none): malloc'd in *value, or NULL to remove the line. 0 or the failure. */
-typedef n_result (*value_of)(const char *old, size_t on, const void *arg, char **value);
-
-static n_result fixed_value(const char *old, size_t on, const void *arg, char **value) {
-    (void)old;
-    (void)on;
-    *value = NULL;
-    if (!arg) return 0;
-    size_t n = strlen(arg) + 1;
-    if (!(*value = malloc(n))) return -N_ERR_NO_MEMORY;
-    memcpy(*value, arg, n);
-    return 0;
-}
-
-/* One change, written at once: the document is opened (made when missing), claimed, read again,
-   given the line of name and saved whole, and what it now says is the process's. As
-   n_document_save keeps the document the name had, a writer waiting for the claim reads this
-   change before its own. Under io. */
-static n_result edit_locked(const char *name, value_of make, const void *arg) {
-    if (!path_ready()) return -N_ERR_NOT_FOUND;
-    n_handle h = n_document_open(path, N_DOCUMENT_EDIT);
-    if (h == -N_ERR_NOT_FOUND) {
-        char *value = NULL;
-        n_result r = make(NULL, 0, arg, &value);
-        bool none = !value;
-        free(value);
-        if (r < 0) return r;
-        if (none) {
-            refresh_locked(); /* no line to remove: the default applies */
-            return 0;
-        }
-        h = n_document_open(path, N_DOCUMENT_CREATE);
-        if (h == -N_ERR_NOT_FOUND) { /* the profile folder was removed: only it is made again */
-            const char *folder = web_profile_folder(false);
-            n_result made = folder ? n_folder_create(folder) : -N_ERR_NOT_FOUND;
-            h = made >= 0 || made == -N_ERR_EXISTS ? n_document_open(path, N_DOCUMENT_CREATE) : made;
-        }
-        if (h == -N_ERR_EXISTS) h = n_document_open(path, N_DOCUMENT_EDIT); /* made meanwhile */
-    }
-    if (h < 0) return h;
-    n_result r = n_document_claim(h, true);
-    struct prefs now;
-    bool parsed = false;
-    if (r >= 0) {
-        char *old = NULL, *next = NULL, *value = NULL;
-        size_t on = 0, nn = 0;
-        r = read_all(h, &old, &on);
-        if (r >= 0) r = make(old, on, arg, &value);
-        if (r >= 0) r = document_make(old, on, name, value, &next, &nn);
-        if (r >= 0 && (nn != on || memcmp(next, old, nn))) r = n_document_save(path, next, nn);
-        if (r >= 0) parsed = prefs_parse(next, nn, &now);
-        free(old);
-        free(next);
-        free(value);
-        n_document_release(h);
-    }
-    n_handle_close(h);
-    if (r < 0) return r;
-    if (queue >= 0 && watch < 0) (void)watch_open_locked(); /* its folder may be there again */
-    if (!parsed) { /* saved, but no memory to hold it: the next use reads it */
-        __atomic_store_n(&valid, false, __ATOMIC_RELEASE);
-        return 0;
-    }
-    apply(&now);
-    __atomic_store_n(&valid, queue < 0 || watch >= 0, __ATOMIC_RELEASE);
-    return 0;
-}
-
-static n_result edit_with(const char *name, value_of make, const void *arg) {
+/* 一つの変更をその場で settings へ渡し、今の値を読み直す。 */
+static n_result set_key(uint32_t key, const void *value, size_t length) {
     mtx_lock(&io);
-    n_result r = edit_locked(name, make, arg);
+    n_result r = declare_locked();
+    if (r >= 0) r = n_setting_set(n_setting_of_program(key), value, length, NULL);
+    if (r >= 0) refresh_locked();
     mtx_unlock(&io);
     return r;
 }
 
-static n_result edit(const char *name, const char *value) { return edit_with(name, fixed_value, value); }
-
 n_result webprefs_set_languages(const char *const *tags, size_t count) {
     struct list l;
     n_result r = list_make(tags, count, &l);
-    return r < 0 ? r : edit("languages", l.text);
+    return r < 0 ? r : set_key(KEY_LANGUAGES, l.text, l.length);
 }
 
-n_result webprefs_reset_languages(void) { return edit("languages", NULL); }
+n_result webprefs_reset_languages(void) { return set_key(KEY_LANGUAGES, DEFAULT_LANGUAGES, sizeof DEFAULT_LANGUAGES - 1); }
 
-n_result webprefs_set_search_history(bool on) { return edit("search-history", on ? "on" : "off"); }
+n_result webprefs_set_search_history(bool on) {
+    int32_t v = on;
+    return set_key(KEY_SEARCH_HISTORY, &v, sizeof v);
+}
 
-n_result webprefs_set_clear_on_close(bool on) { return edit("clear-site-data-on-close", on ? "on" : "off"); }
+n_result webprefs_set_clear_on_close(bool on) {
+    int32_t v = on;
+    return set_key(KEY_CLEAR_ON_CLOSE, &v, sizeof v);
+}
 
-/* The value of site-data-exceptions= once the document old has host's rule changed. */
-struct site_change {
-    const char *host;
-    enum webprefs_site_rule rule;
-};
-
-static n_result sites_value(const char *old, size_t on, const void *arg, char **value) {
-    const struct site_change *change = arg;
+/* old の一覧の host の規則を変えた新しい一覧（malloc）。空なら *none。 */
+static n_result sites_changed(const char *old, size_t on, const char *host, enum webprefs_site_rule rule, char **value, bool *none) {
     struct prefs p;
-    if (!prefs_parse(old, on, &p)) return -N_ERR_NO_MEMORY;
+    prefs_default(&p);
+    if (!sites_read(old, on, &p)) return -N_ERR_NO_MEMORY;
     struct webprefs_site_exception *sites = p.sites;
     size_t count = p.site_count, at = count;
     for (size_t i = 0; i < count; i++)
-        if (!strcmp(sites[i].host, change->host)) at = i;
-    if (change->rule == WEBPREFS_SITE_DEFAULT) {
+        if (!strcmp(sites[i].host, host)) at = i;
+    if (rule == WEBPREFS_SITE_DEFAULT) {
         if (at < count) {
             memmove(sites + at, sites + at + 1, (count - at - 1) * sizeof *sites);
             count--;
         }
     } else if (at < count) {
-        sites[at].rule = change->rule;
+        sites[at].rule = rule;
     } else {
         struct webprefs_site_exception *grown = realloc(sites, (count + 1) * sizeof *grown);
         if (!grown) {
@@ -825,21 +644,49 @@ static n_result sites_value(const char *old, size_t on, const void *arg, char **
         }
         sites = grown;
         memset(&sites[count], 0, sizeof *sites);
-        memcpy(sites[count].host, change->host, strlen(change->host) + 1);
-        sites[count++].rule = change->rule;
+        memcpy(sites[count].host, host, strlen(host) + 1);
+        sites[count++].rule = rule;
         qsort(sites, count, sizeof *sites, site_compare);
     }
-    bool none;
-    *value = sites_write(sites, count, &none);
+    *value = sites_write(sites, count, none);
     free(sites);
-    return *value || none ? 0 : -N_ERR_NO_MEMORY;
+    return *value || *none ? 0 : -N_ERR_NO_MEMORY;
+}
+
+/* 他のプロセスの変更を消さない：読んだ一覧のままなら書く（n_setting_set_if）。変わっていれば読み直す。 */
+static n_result sites_edit(const char *host, enum webprefs_site_rule rule) {
+    struct n_setting_id id = n_setting_of_program(KEY_SITE_EXCEPTIONS);
+    char *old = malloc(N_SETTING_VALUE_MAX);
+    if (!old) return -N_ERR_NO_MEMORY;
+    mtx_lock(&io);
+    n_result r = declare_locked();
+    for (int attempt = 0; r >= 0 && attempt < SITES_ATTEMPTS; attempt++) {
+        n_result on = n_setting_get(id, old, N_SETTING_VALUE_MAX);
+        if (on < 0) {
+            r = on;
+            break;
+        }
+        char *next = NULL;
+        bool none = false;
+        r = sites_changed(old, (size_t)on, host, rule, &next, &none);
+        if (r < 0) break;
+        uint32_t reason = N_SETTING_OK;
+        r = n_setting_set_if(id, old, (size_t)on, next ? next : "", next ? strlen(next) : 0, &reason);
+        free(next);
+        if (reason == N_SETTING_OUT_OF_RANGE) r = -N_ERR_TOO_LARGE;
+        if (r != -N_ERR_BUSY) break;
+        r = attempt + 1 < SITES_ATTEMPTS ? 0 : r;
+    }
+    if (r >= 0) refresh_locked();
+    mtx_unlock(&io);
+    free(old);
+    return r;
 }
 
 n_result webprefs_set_site_rule(const char *host, enum webprefs_site_rule rule) {
     if (!host || !host_valid(host, strlen(host)) || rule < WEBPREFS_SITE_DEFAULT || rule > WEBPREFS_SITE_BLOCK)
         return -N_ERR_INVALID;
-    struct site_change change = {host, rule};
-    return edit_with("site-data-exceptions", sites_value, &change);
+    return sites_edit(host, rule);
 }
 
 /* host as the exceptions hold hosts, in out: lowercase, without a final dot. */

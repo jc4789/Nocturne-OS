@@ -1844,7 +1844,7 @@ new file mode 100644
 index 00000000..9849a48a
 --- /dev/null
 +++ b/src/os/exec_nocturne.go
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,185 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -1871,12 +1871,13 @@ index 00000000..9849a48a
 +
 +// startProcess launches the program with AppLaunch. The new app's handle
 +// i is attr.Files[i] (none for a nil File or DevNull); attr.Dir becomes
-+// its setting FOLDER.
++// its current folder.
 +func startProcess(name string, argv []string, attr *ProcAttr) (p *Process, err error) {
 +	env := attr.Env
 +	if env == nil {
 +		env = syscall.Environ()
 +	}
++	folder := ""
 +	if attr.Dir != "" {
 +		dir := syscall.FullPath(attr.Dir)
 +		var e syscall.Entry
@@ -1886,13 +1887,7 @@ index 00000000..9849a48a
 +		if e.Kind != syscall.KIND_FOLDER {
 +			return nil, &PathError{Op: "chdir", Path: attr.Dir, Err: syscall.ENOTDIR}
 +		}
-+		kept := make([]string, 0, len(env)+1)
-+		for _, s := range env {
-+			if len(s) < 7 || s[:7] != "FOLDER=" {
-+				kept = append(kept, s)
-+			}
-+		}
-+		env = append(kept, "FOLDER="+dir)
++		folder = dir
 +	}
 +	handles := make([]int, len(attr.Files))
 +	for i, f := range attr.Files {
@@ -1901,7 +1896,7 @@ index 00000000..9849a48a
 +			handles[i] = f.sysfd
 +		}
 +	}
-+	h, e := syscall.AppLaunch(name, argv, env, handles)
++	h, e := syscall.AppLaunch(name, argv, env, handles, folder)
 +	for _, f := range attr.Files {
 +		// the handles must stay open until the launch has copied them
 +		runtime.KeepAlive(f)
@@ -3555,7 +3550,7 @@ new file mode 100644
 index 00000000..5f226169
 --- /dev/null
 +++ b/src/runtime/os_nocturne.go
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,446 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -3612,9 +3607,26 @@ index 00000000..5f226169
 +// The first instruction of a new thread (sys_nocturne_amd64.s).
 +func tstart_nocturne()
 +
-+// nocturneSettings is the program's null-terminated "NAME=value" list,
-+// recorded by _rt0_amd64_nocturne.
-+var nocturneSettings unsafe.Pointer
++// nocturneStart is the kernel's struct n_start, recorded by
++// _rt0_amd64_nocturne. It lives in the program's first stack.
++var nocturneStart *struct {
++	environment   **byte
++	folder        *byte
++	terminals     *int32
++	terminalCount uint32
++	interrupts    int32
++}
++
++// The launch's folder and terminals, for package syscall.
++//
++//go:linkname syscall_runtime_start syscall.runtime_start
++func syscall_runtime_start() (folder string, terminals []int32) {
++	s := nocturneStart
++	if s.folder != nil {
++		folder = gostring(s.folder)
++	}
++	return folder, unsafe.Slice(s.terminals, s.terminalCount)
++}
 +
 +type mOS struct {
 +	waitsema uint32 // semaphore for parking on locks
@@ -3845,17 +3857,14 @@ index 00000000..5f226169
 +}
 +
 +func goenvs() {
-+	if nocturneSettings == nil {
-+		return
-+	}
-+	settings := (**byte)(nocturneSettings)
++	environment := nocturneStart.environment
 +	n := int32(0)
-+	for argv_index(settings, n) != nil {
++	for argv_index(environment, n) != nil {
 +		n++
 +	}
 +	envs = make([]string, n)
 +	for i := int32(0); i < n; i++ {
-+		envs[i] = gostring(argv_index(settings, i))
++		envs[i] = gostring(argv_index(environment, i))
 +	}
 +}
 +
@@ -4013,10 +4022,10 @@ index 00000000..41e3160d
 +
 +#include "textflag.h"
 +
-+// Nocturne starts a program with argc in DI, argv in SI and the
-+// null-terminated settings ("NAME=value") in DX.
++// Nocturne starts a program with argc in DI, argv in SI and its struct
++// n_start in DX.
 +TEXT _rt0_amd64_nocturne(SB),NOSPLIT|NOFRAME,$0
-+	MOVQ	DX, runtime·nocturneSettings(SB)
++	MOVQ	DX, runtime·nocturneStart(SB)
 +	JMP	runtime·rt0_go(SB)
 diff --git a/src/runtime/stubs2.go b/src/runtime/stubs2.go
 index 39bde15b..a0e515fa 100644
@@ -4208,7 +4217,7 @@ new file mode 100644
 index 00000000..a673859b
 --- /dev/null
 +++ b/src/syscall/syscall_nocturne.go
-@@ -0,0 +1,1113 @@
+@@ -0,0 +1,1164 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -4227,6 +4236,7 @@ index 00000000..a673859b
 +	"internal/bytealg"
 +	"internal/oserror"
 +	"internal/strconv"
++	"sync"
 +	"unsafe"
 +)
 +
@@ -4590,15 +4600,11 @@ index 00000000..a673859b
 +}
 +
 +// FullPath makes a name complete, as the C library's n_path_complete does:
-+// a name that is not complete is in the current folder (the setting FOLDER,
-+// else C:\). It is written "C:\a\b", with "." and ".." resolved.
++// a name that is not complete is in the current folder (Folder). It is
++// written "C:\a\b", with "." and ".." resolved.
 +func FullPath(name string) string {
 +	if !PathIsComplete(name) {
-+		folder, _ := Getenv("FOLDER")
-+		if !PathIsComplete(folder) {
-+			folder = `C:\`
-+		}
-+		name = folder + `\` + name[PathDriveLength(name):]
++		name = Folder() + `\` + name[PathDriveLength(name):]
 +	}
 +	out := []byte{'C', ':'}
 +	if PathDriveLength(name) != 0 {
@@ -4686,7 +4692,7 @@ index 00000000..a673859b
 +	return FullPath("."), nil
 +}
 +
-+// Chdir changes the app's current folder: the setting FOLDER, which
++// Chdir changes the app's current folder, which
 +// FullPath reads and which the apps it launches inherit.
 +func Chdir(path string) error {
 +	var e Entry
@@ -4697,7 +4703,35 @@ index 00000000..a673859b
 +	if e.Kind != KIND_FOLDER {
 +		return ERR_NOT_FOLDER
 +	}
-+	return Setenv("FOLDER", full)
++	folderLock.Lock()
++	folderNow = full
++	folderLock.Unlock()
++	return nil
++}
++
++// The fields of the launch, which the runtime holds.
++func runtime_start() (folder string, terminals []int32)
++
++var (
++	folderLock sync.RWMutex
++	folderNow  string // set by Chdir
++)
++
++// Folder returns the app's current folder: its user's folder until it has one.
++func Folder() string {
++	folderLock.RLock()
++	folder := folderNow
++	folderLock.RUnlock()
++	if folder == "" {
++		folder, _ = runtime_start()
++	}
++	if folder == "" {
++		folder = UserFolder()
++	}
++	if folder == "" {
++		folder = `C:\`
++	}
++	return folder
 +}
 +
 +// ---- documents ----
@@ -4969,12 +5003,16 @@ index 00000000..a673859b
 +// struct n_launch
 +type launch struct {
 +	arguments   **byte
-+	settings    **byte
++	environment **byte
 +	handles     *int32
 +	argumentLen uint32
-+	settingLen  uint32
++	envLen      uint32
 +	handleLen   uint32
 +	flags       uint32
++	folder      *byte
++	terminals   *int32
++	terminalLen uint32
++	interrupts  int32
 +	identity    *byte
 +	grant       int32
 +	reserved    uint32
@@ -4994,8 +5032,10 @@ index 00000000..a673859b
 +
 +// AppLaunch starts the program at path. Handle i of the new app is
 +// handles[i] (-1: none); by convention 0 is its input, 1 its output and
-+// 2 its log. Settings are "NAME=value" strings. It returns an app handle.
-+func AppLaunch(path string, args, settings []string, handles []int) (int, error) {
++// 2 its log. env holds "NAME=value" strings for a program's getenv, folder
++// its current folder ("": this app's). It reaches this app's terminals.
++// It returns an app handle.
++func AppLaunch(path string, args, env []string, handles []int, folder string) (int, error) {
 +	p, err := pathPtr(path)
 +	if err != nil {
 +		return -1, err
@@ -5004,9 +5044,24 @@ index 00000000..a673859b
 +	if err != nil {
 +		return -1, err
 +	}
-+	s, err := stringPtrs(settings)
++	s, err := stringPtrs(env)
 +	if err != nil {
 +		return -1, err
++	}
++	here, terminals := runtime_start()
++	folderLock.RLock()
++	if folder == "" {
++		folder = folderNow
++	}
++	folderLock.RUnlock()
++	if folder == "" {
++		folder = here
++	}
++	var f *byte
++	if folder != "" {
++		if f, err = pathPtr(folder); err != nil {
++			return -1, err
++		}
 +	}
 +	hs := make([]int32, len(handles)+1)
 +	for i, h := range handles {
@@ -5014,11 +5069,16 @@ index 00000000..a673859b
 +	}
 +	l := launch{
 +		arguments:   &a[0],
-+		settings:    &s[0],
++		environment: &s[0],
 +		handles:     &hs[0],
 +		argumentLen: uint32(len(args)),
-+		settingLen:  uint32(len(settings)),
++		envLen:      uint32(len(env)),
 +		handleLen:   uint32(len(handles)),
++		folder:      f,
++		terminalLen: uint32(len(terminals)),
++	}
++	if len(terminals) != 0 {
++		l.terminals = &terminals[0]
 +	}
 +	r, e := Syscall(SYS_APP_LAUNCH, uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&l)), 0, 0, 0)
 +	if e != 0 {

@@ -244,6 +244,35 @@ static n_result account_create(const struct n_accounts_request *q, const struct 
     return r < 0 ? r : 0;
 }
 
+/* 級を変える。admin が一人もいなくなる変更は断る：級を戻せる者がいなくなるから。 */
+static n_result account_set_class(const struct n_accounts_request *q, const struct n_identity *peer, struct n_account *out) {
+    if (peer->cls < N_CLASS_ADMIN) return -N_ERR_DENIED;
+    if (q->cls != N_CLASS_USER && q->cls != N_CLASS_ADMIN) return -N_ERR_INVALID;
+    mtx_lock(&lock);
+    struct account_record *r = record_of(q->user);
+    n_result result = r ? 0 : -N_ERR_NOT_FOUND;
+    if (r && r->account.cls == N_CLASS_ADMIN && q->cls != N_CLASS_ADMIN) {
+        size_t admins = 0;
+        for (size_t i = 0; i < record_count; i++)
+            if (record_valid(&records[i]) && records[i].account.cls == N_CLASS_ADMIN) admins++;
+        if (admins < 2) result = -N_ERR_BUSY;
+    }
+    if (result >= 0) {
+        uint32_t before = r->account.cls;
+        r->account.cls = q->cls;
+        record_check(r, r->check);
+        result = record_save((size_t)(r - records));
+        if (result < 0) {
+            r->account.cls = before;
+            record_check(r, r->check);
+        } else {
+            *out = r->account;
+        }
+    }
+    mtx_unlock(&lock);
+    return result < 0 ? result : 0;
+}
+
 static n_result account_verify(const struct n_accounts_request *q, struct n_account *out) {
     mtx_lock(&lock);
     struct account_record *found = record_named(q->name);
@@ -303,6 +332,9 @@ static void client_serve(void *arg) {
         }
         case N_ACCOUNTS_CREATE:
             reply.result = account_create(&q, &peer, &reply.account);
+            break;
+        case N_ACCOUNTS_SET_CLASS:
+            reply.result = account_set_class(&q, &peer, &reply.account);
             break;
         case N_ACCOUNTS_VERIFY:
             reply.result = peer.cls >= N_CLASS_SYSTEM ? account_verify(&q, &reply.account) : -N_ERR_DENIED;

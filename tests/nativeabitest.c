@@ -367,10 +367,10 @@ static void apps(const char *self) {
     char buf[64], want[64];
     CHECK(n_channel_pair(c) == 0);
     const char *args[] = {self, "child", "talk"};
-    const char *settings[] = {"NATIVE_GREETING=hi"};
+    const char *environment[] = {"NATIVE_GREETING=hi"};
     int32_t handles[] = {c[1], 1, 2};
-    struct n_launch l = {.arguments = args, .settings = settings, .handles = handles,
-                         .argument_count = 3, .setting_count = 1, .handle_count = 3};
+    struct n_launch l = {.arguments = args, .environment = environment, .handles = handles,
+                         .argument_count = 3, .environment_count = 1, .handle_count = 3};
     n_handle app = n_app_launch(self, &l);
     CHECK(app >= 0 && n_handle_kind(app) == N_KIND_APP);
     n_handle_close(c[1]);
@@ -414,7 +414,7 @@ static void apps(const char *self) {
     CHECK(n_app_launch(N_FOLDER_SYSTEM "\\no-such-program", &l) == -N_ERR_NOT_FOUND);
     CHECK(n_app_launch("D:\\nativeabitest", &l) == -N_ERR_NOT_FOUND); /* there is no drive D: */
     const char *bad[] = {"NO_EQUALS"};
-    l.settings = bad;
+    l.environment = bad;
     CHECK(n_app_launch(self, &l) == -N_ERR_INVALID);
     CHECK(n_app_result(q, 0, &status) == -N_ERR_WRONG_KIND);
     n_handle_close(q);

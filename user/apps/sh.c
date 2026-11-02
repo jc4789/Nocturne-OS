@@ -17,7 +17,7 @@ static int last_status;
 /* The current folder: names that are not complete paths are inside it, and the
    apps the shell starts get it as their FOLDER setting. */
 static char folder[4096] = "C:\\";
-/* A channel on which the terminal sends a message for each Ctrl+C (setting INTERRUPTS). */
+/* A channel on which the terminal sends a message for each Ctrl+C (n_interrupts). */
 static n_handle interrupts = -1;
 /* Which of the shell's own input, output and log exist. */
 static bool std_open[3];
@@ -523,24 +523,17 @@ static n_handle open_output(const char *name, bool append) {
 }
 
 static n_handle launch(const char *path, struct cmd *c, const int32_t handles[3]) {
-    char setting_folder[sizeof folder + 8], setting_terminal[32] = "TERMINAL=";
-    snprintf(setting_folder, sizeof setting_folder, "FOLDER=%s", folder);
     /* the child reaches the terminal through the handles it shares with the shell */
-    bool terminal = false;
+    int32_t terminals[3];
+    uint32_t terminal_count = 0;
     for (int i = 0; i < 3; i++)
-        if (handles[i] == i && n_terminal(i)) {
-            char num[4];
-            snprintf(num, sizeof num, "%s%d", terminal ? " " : "", i);
-            strlcat(setting_terminal, num, sizeof setting_terminal);
-            terminal = true;
-        }
-    const char *settings[2] = {setting_folder, setting_terminal};
+        if (handles[i] == i && n_terminal(i)) terminals[terminal_count++] = i;
     /* シェルが受けた能力は、シェルの子も受ける：能力を持つシェルは持ち主が渡したときだけある。 */
     int32_t given[3 + N_CAP_COUNT] = {handles[0], handles[1], handles[2]};
     size_t caps = n_caps_list(given + 3);
-    struct n_launch l = {.arguments = (const char *const *)c->argv, .settings = settings, .handles = given,
-                         .argument_count = (uint32_t)c->argc, .setting_count = terminal ? 2 : 1,
-                         .handle_count = 3 + (uint32_t)caps};
+    struct n_launch l = {.arguments = (const char *const *)c->argv, .handles = given, .argument_count = (uint32_t)c->argc,
+                         .handle_count = 3 + (uint32_t)caps, .folder = folder, .terminals = terminals,
+                         .terminal_count = terminal_count};
     return n_app_launch(path, &l);
 }
 
@@ -863,8 +856,8 @@ int main(int argc, char **argv) {
         return run_script(argv[1]);
     }
     setvbuf(stdout, NULL, _IONBF, 0);
-    const char *ih = getenv("INTERRUPTS");
-    if (ih && n_handle_kind(atoi(ih)) == N_KIND_CHANNEL) interrupts = atoi(ih);
+    n_handle ih = n_interrupts();
+    if (ih >= 0 && n_handle_kind(ih) == N_KIND_CHANNEL) interrupts = ih;
     /* at the prompt, wait for a key or a Ctrl+C, whichever comes first */
     if (interrupts >= 0 && (prompt_events = n_events_create()) >= 0) {
         n_events_watch(prompt_events, 0, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, TOKEN_INPUT);

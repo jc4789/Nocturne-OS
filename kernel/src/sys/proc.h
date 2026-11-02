@@ -4,16 +4,20 @@ struct handle;
 struct object;
 struct process;
 
-/* Start a program. Handle i of the new app is handles[i] (NULL: none). Its
-   settings are "NAME=value" strings, passed beside its arguments. When app is
+/* Start a program. Handle i of the new app is handles[i] (NULL: none). The app's third entry
+   argument is a struct n_start on its stack, holding what is given here. When app is
    set, that handle record reports the app's end. parent: the app that launches
    it, NULL for one the kernel starts. identity: the new app's, decided by the caller
    (sys/authority.h). */
 struct proc_launch {
     int argc;
     char **argv;
-    int setting_count;
-    char **settings;
+    int environment_count;
+    char **environment; /* "NAME=value" strings for a ported program's C library */
+    const char *folder; /* a full path, or NULL */
+    const int32_t *terminals;
+    uint32_t terminal_count;
+    int32_t interrupts;
     struct handle **handles;
     size_t handle_count;
     struct process *parent;

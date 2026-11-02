@@ -12,6 +12,7 @@
 #include <time.h>
 #include "nocturne.h"
 #include "nocturne_services.h"
+#include "nocturne_settings.h"
 #include "display.h"
 #include "gfx.h"
 #include "settings_abi.h"
@@ -22,7 +23,7 @@
 #define MIN_OF(a, b) ((a) < (b) ? (a) : (b))
 
 enum {
-    TOKEN_WINDOWS = 1, TOKEN_SCREEN, TOKEN_SOUND, TOKEN_POWER, TOKEN_CLOCK, TOKEN_TOAST_TIME, TOKEN_LOGOUT_TIME,
+    TOKEN_WINDOWS = 1, TOKEN_SCREEN, TOKEN_SOUND, TOKEN_SOUND_SETTING, TOKEN_ZONE, TOKEN_POWER, TOKEN_CLOCK, TOKEN_TOAST_TIME, TOKEN_LOGOUT_TIME,
     TOKEN_INLET, TOKEN_BAR, TOKEN_MENU, TOKEN_VOLUME, TOKEN_TOAST,
     TOKEN_DESK = 0x1000,   /* その後ろに画面の番号 */
 };
@@ -130,7 +131,7 @@ static const struct app apps[] = {
     {"Mandelbrot", PROGRAMS "Mandelbrot\\mandel", ICON_FRACTAL, NULL, RUN},
     {"3D Cube", PROGRAMS "Cube\\cube", ICON_CUBE, NULL, RUN},
     {"Game of Life", PROGRAMS "Life\\life", ICON_LIFE, NULL, RUN},
-    {"Settings", SYSTEM "js", ICON_SETTINGS, SYSTEM "settings.js", RUN},
+    {"Settings", SYSTEM "settings", ICON_SETTINGS, NULL, RUN},
     {"About Nocturne", SYSTEM "js", ICON_ABOUT, SYSTEM "about.js", RUN},
     {"Sleep", NULL, ICON_SLEEP, NULL, SLEEP},
     {"Hibernate", NULL, ICON_HIBERNATE, NULL, HIBERNATE},
@@ -570,7 +571,8 @@ static struct rectangle slider_box(void) { return (struct rectangle){70, 60, VOL
 
 /* 音量の値の変更はここだけ。 */
 static void sound_put(uint32_t key, int32_t value) {
-    n_settings_apply(n_cap_find(N_CAP_SETTINGS_APPLY), N_DOMAIN_AUDIO, key, &value, sizeof value);
+    n_result r = n_setting_set_int(n_setting_at(N_DOMAIN_AUDIO, key), value, NULL);
+    if (r < 0) toast("The volume did not change", n_result_text(r), TOAST_MS);
 }
 
 static void volume_draw(void) {
@@ -662,8 +664,15 @@ static void volume_event(const struct gui_event *e) {
     }
 }
 
+static void sound_read(void) {
+    n_audio_output(&sound); /* 音を出す装置の名 */
+    int32_t value;
+    if (n_setting_get_int(n_setting_at(N_DOMAIN_AUDIO, N_AUDIO_VOLUME), &value) >= 0) sound.volume = value;
+    if (n_setting_get_int(n_setting_at(N_DOMAIN_AUDIO, N_AUDIO_MUTED), &value) >= 0) sound.muted = value != 0;
+}
+
 static void sound_changed(void) {
-    n_audio_output(&sound);
+    sound_read();
     bar_draw();
     if (volume) volume_draw();
 }
@@ -1002,7 +1011,12 @@ static void watch_add(n_handle watch, uint64_t token) {
     if (watch >= 0) n_events_watch(events, watch, N_EVENT_RECEIVABLE, token);
 }
 
-static n_handle windows_watch, screen_watch, sound_watch, power_watch;
+static n_handle windows_watch, screen_watch, sound_watch, sound_setting_watch, zone_watch, power_watch;
+
+static void setting_watch_drain(n_handle watch) {
+    struct n_settings_changed heard;
+    while (n_setting_watch_take(watch, &heard) >= 0) {}
+}
 
 static void dispatch(const struct n_event *ev) {
     struct gui_event e;
@@ -1030,6 +1044,15 @@ static void dispatch(const struct n_event *ev) {
     case TOKEN_SOUND:
         n_watch_take(sound_watch);
         sound_changed();
+        break;
+    case TOKEN_SOUND_SETTING:
+        setting_watch_drain(sound_setting_watch);
+        sound_changed();
+        break;
+    case TOKEN_ZONE:
+        setting_watch_drain(zone_watch);
+        clock_arm();
+        bar_draw();
         break;
     case TOKEN_POWER:
         n_watch_take(power_watch);
@@ -1063,14 +1086,18 @@ int main(void) {
     if (cap < 0 || !gui_available()) return 1;
     events = n_events_create();
     if (events < 0) return 1;
-    n_audio_output(&sound);
+    sound_read();
     windows_watch = n_shell_watch(cap);
     screen_watch = n_screen_watch();
     sound_watch = n_audio_output_watch();
+    sound_setting_watch = n_setting_watch(N_DOMAIN_AUDIO, N_SETTING_ANY);
+    zone_watch = n_setting_watch(N_DOMAIN_TIME, N_TIME_ZONE_MINUTES);
     power_watch = n_power_watch(cap);
     watch_add(windows_watch, TOKEN_WINDOWS);
     watch_add(screen_watch, TOKEN_SCREEN);
     watch_add(sound_watch, TOKEN_SOUND);
+    watch_add(sound_setting_watch, TOKEN_SOUND_SETTING);
+    watch_add(zone_watch, TOKEN_ZONE);
     watch_add(power_watch, TOKEN_POWER);
     screens_changed();
     windows_read();
