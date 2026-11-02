@@ -20,8 +20,6 @@ bool identity_may_reach(const struct n_identity *who, const struct n_identity *t
 
 /* 子の身元を決める：n_launch の identity と identity_grant を見て親の身元から作る。 */
 int identity_for_child(const struct n_launch *launch, struct n_identity *child);
-/* カーネルの窓の系が起こすアプリの身元。サービスの管理者が SYS_SESSION_IDENTITY で決める。 */
-void identity_session(struct n_identity *out);
 
 /* 新しい能力（根を最初の process へ渡すためにだけカーネルが作る）。 */
 int cap_new(enum n_cap kind, struct handle **out);
@@ -33,7 +31,6 @@ int64_t sys_identity_self(struct n_identity *out);
 int64_t sys_cap_derive(int cap, uint64_t kind);
 int64_t sys_cap_kind(int cap);
 int64_t sys_cap_find(uint64_t kind);
-int64_t sys_session_identity(int cap, const struct n_identity *identity);
 
 /* サービスの管理者への道（sys/service.c）。 */
 int64_t sys_service_register(int cap);

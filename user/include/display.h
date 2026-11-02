@@ -16,3 +16,18 @@ int display_bits_per_channel(void);
    Like win->c.px it changes with each
    win_begin_frame and resize, so ask again after either. */
 uint8_t *win_deep(window_t *win);
+
+/* ---- シェルの口（display_abi.h）。cap は N_CAP_SHELL。 ---- */
+n_result n_shell_place(n_handle cap, window_t *win, const struct n_shell_place *place);
+/* 一覧の数を返し、max 件まで out へ写す。 */
+n_result n_shell_screens(n_handle cap, struct n_shell_screen *out, size_t max);
+n_result n_shell_windows(n_handle cap, struct n_shell_window *out, size_t max);
+n_result n_shell_window(n_handle cap, uint32_t id, uint32_t op);
+n_handle n_shell_watch(n_handle cap);
+n_result n_shell_hotkey(n_handle cap, window_t *win, uint32_t key, uint32_t mods);
+/* 電源の段取りの今と、その watch（struct n_power_state、abi.h）。 */
+n_result n_power_state(n_handle cap, struct n_power_state *out);
+n_handle n_power_watch(n_handle cap);
+
+/* シェルへ通知を一通送る（サービス "shell"）。text は NULL でよい。 */
+n_result n_shell_notify(const char *title, const char *text);

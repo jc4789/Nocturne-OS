@@ -25,7 +25,6 @@ struct proc_launch {
     struct n_identity identity;
 };
 int proc_launch(const char *path, const struct proc_launch *launch);
-int proc_spawn_simple(const char *path, const char *arg1, const struct n_identity *identity);
 
 /* App handles (docs/nocturne-native-abi.md §5). */
 /* A new app record and the handle that will report its end (proc_launch's app is its object). */

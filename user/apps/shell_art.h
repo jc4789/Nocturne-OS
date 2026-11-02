@@ -1,0 +1,387 @@
+/* シェルの絵：夜空の壁紙とアプリの印。 */
+#pragma once
+#include <stdlib.h>
+#include "gfx.h"
+#include "display_abi.h"
+
+/* xorshift32 over the caller's state: each part of the wallpaper starts its own from a constant,
+   so the art is the same every time it is drawn. */
+static uint32_t rnd(uint32_t *seed) {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 17;
+    *seed ^= *seed << 5;
+    return *seed;
+}
+
+static uint32_t isqrt(uint32_t v) {
+    uint32_t r = 0, bit = 1u << 30;
+    while (bit > v) bit >>= 2;
+    while (bit) {
+        if (v >= r + bit) {
+            v -= r + bit;
+            r = (r >> 1) + bit;
+        } else {
+            r >>= 1;
+        }
+        bit >>= 2;
+    }
+    return r;
+}
+
+static uint32_t sky_at(int y, int h) {
+    /* piecewise gradient: deep navy -> indigo -> violet glow at the horizon */
+    int t = y * 1000 / h;
+    if (t < 550) return gfx_mix(RGB(6, 8, 26), RGB(24, 20, 64), t * 255 / 550);
+    if (t < 850) return gfx_mix(RGB(24, 20, 64), RGB(84, 44, 108), (t - 550) * 255 / 300);
+    return gfx_mix(RGB(84, 44, 108), RGB(140, 70, 120), (t - 850) * 255 / 150);
+}
+
+static void ridge(int *hgt, int w, int base, int amp, uint32_t s) {
+    /* midpoint displacement over a power-of-two grid, then sampled */
+    enum { N = 256 };
+    int pts[N + 1];
+    uint32_t seed = s;
+    pts[0] = base + (int)(rnd(&seed) % (amp + 1)) - amp / 2;
+    pts[N] = base + (int)(rnd(&seed) % (amp + 1)) - amp / 2;
+    for (int step = N; step > 1; step /= 2) {
+        for (int i = 0; i < N; i += step) {
+            int mid = i + step / 2;
+            int disp = amp * step / N;
+            pts[mid] = (pts[i] + pts[i + step]) / 2 + (disp ? (int)(rnd(&seed) % (2 * disp + 1)) - disp : 0);
+        }
+    }
+    for (int x = 0; x < w; x++) {
+        int fx = x * N / w;
+        int frac = (x * N) % w;
+        hgt[x] = pts[fx] + (pts[fx + 1] - pts[fx]) * frac / w;
+    }
+}
+
+/* The smooth parts of the wallpaper (sky, moon glow, far mountains) are
+ * computed in 8.8 fixed point per channel, then delivered at the display's
+ * depth: 10 bits with a deep plane, or ordered-dithered to 8 bits. Either way
+ * the long dark gradients show no bands. Crisp details stay 8-bit content. */
+struct hue { int32_t r, g, b; }; /* 8.8: 0 .. 255 << 8 */
+
+static struct hue hue_of(uint32_t c) {
+    return (struct hue){(int32_t)((c >> 16) & 0xFF) << 8, (int32_t)((c >> 8) & 0xFF) << 8, (int32_t)(c & 0xFF) << 8};
+}
+/* a + (b - a) * num / den, with 0 <= num <= den */
+static struct hue hue_mix(struct hue a, struct hue b, int64_t num, int64_t den) {
+    return (struct hue){a.r + (int32_t)((b.r - a.r) * num / den), a.g + (int32_t)((b.g - a.g) * num / den),
+                        a.b + (int32_t)((b.b - a.b) * num / den)};
+}
+static struct hue sky_hue(int y, int h) {
+    struct hue navy = hue_of(RGB(6, 8, 26)), indigo = hue_of(RGB(24, 20, 64));
+    struct hue violet = hue_of(RGB(84, 44, 108)), glow = hue_of(RGB(140, 70, 120));
+    int64_t p = (int64_t)y * 100;
+    if (p < 55LL * h) return hue_mix(navy, indigo, p, 55LL * h);
+    if (p < 85LL * h) return hue_mix(indigo, violet, p - 55LL * h, 30LL * h);
+    return hue_mix(violet, glow, p - 85LL * h, 15LL * h);
+}
+static unsigned to10(int32_t v) { return (unsigned)(((uint32_t)v * 1023u + 32640u) / 65280u); }
+static unsigned to8(int32_t v, unsigned threshold) {
+    unsigned q = ((unsigned)v + threshold * 16u + 8u) >> 8;
+    return q > 255 ? 255 : q;
+}
+static void put_hue(canvas_t *c, uint8_t *deep, int x, int y, struct hue v) {
+    size_t at = (size_t)y * c->pitch + x;
+    if (deep) {
+        unsigned r = to10(v.r), g = to10(v.g), b = to10(v.b);
+        c->px[at] = deep_pixel(r, g, b);
+        deep[at] = deep_pack(r, g, b);
+    } else {
+        unsigned t = dither_threshold((unsigned)x, (unsigned)y);
+        c->px[at] = RGB(to8(v.r, t), to8(v.g, t), to8(v.b, t));
+    }
+}
+/* An 8-bit write over the field: that pixel is no longer deep. */
+static void put_crisp(canvas_t *c, uint8_t *deep, int x, int y, uint32_t col) {
+    if (x < 0 || y < 0 || x >= c->w || y >= c->h) return;
+    size_t at = (size_t)y * c->pitch + x;
+    c->px[at] = col;
+    if (deep) deep[at] = 0;
+}
+
+static void art_wallpaper(canvas_t *c, uint8_t *deep) {
+    int w = c->w, h = c->h;
+    int mx = w * 78 / 100, my = h * 22 / 100, mr = h / 14;
+    int gr = mr * 4;
+    int *hgt = malloc(sizeof(int) * w * 2);
+    if (!hgt) return;
+    int *front = hgt + w;
+    ridge(hgt, w, h * 76 / 100, h * 16 / 100, 0x1234567);
+    ridge(front, w, h * 87 / 100, h * 10 / 100, 0x7654321);
+
+    /* sky, the moon's glow (radius in 1/16 pixel) and the far mountains */
+    struct hue moon = hue_of(RGB(200, 190, 255)), far_top = hue_of(RGB(38, 26, 70)), far_bottom = hue_of(RGB(22, 16, 46));
+    int64_t gr16 = (int64_t)gr * 16;
+    for (int y = 0; y < h; y++) {
+        struct hue sky = sky_hue(y, h);
+        bool glow_row = gr > 0 && y >= my - gr && y < my + gr;
+        for (int x = 0; x < w; x++) {
+            struct hue v = sky;
+            if (y >= hgt[x]) {
+                v = hue_mix(far_top, far_bottom, y - hgt[x], h - hgt[x] + 1);
+            } else if (glow_row && x >= mx - gr && x < mx + gr) {
+                int dx = x - mx, dy = y - my;
+                int64_t d16 = isqrt((uint32_t)(dx * dx + dy * dy) * 256u);
+                if (d16 < gr16) {
+                    int64_t t = (gr16 - d16) * 65536 / gr16; /* 0..1 in 16.16 */
+                    v = hue_mix(v, moon, t * t / 65536 * 70 / 255, 65536);
+                }
+            }
+            put_hue(c, deep, x, y, v);
+        }
+    }
+
+    /* stars, behind the far mountains */
+    uint32_t seed = 0xC0DEF00D;
+    int nstars = w * h / 2200;
+    for (int i = 0; i < nstars; i++) {
+        int x = rnd(&seed) % w, y = rnd(&seed) % (h * 80 / 100);
+        int dx = x - mx, dy = y - my;
+        if (dx * dx + dy * dy < (mr + 6) * (mr + 6)) continue;
+        int b = 70 + rnd(&seed) % 186;
+        uint32_t tint = rnd(&seed) % 3;
+        uint32_t col = tint == 0 ? RGB(b, b, b) : tint == 1 ? RGB(b * 9 / 10, b * 9 / 10, b) : RGB(b, b * 95 / 100, b * 8 / 10);
+        if (y < hgt[x]) put_crisp(c, deep, x, y, gfx_mix(c->px[y * c->pitch + x], col, 230));
+        if (b > 240 && rnd(&seed) % 3 == 0) {
+            uint32_t dim = gfx_mix(sky_at(y, h), col, 110);
+            static const int8_t arm[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+            for (int k = 0; k < 4; k++) {
+                int px = x + arm[k][0], py = y + arm[k][1];
+                if (px >= 0 && px < w && py >= 0 && py < hgt[px]) put_crisp(c, deep, px, py, dim);
+            }
+        }
+    }
+
+    /* the crescent itself */
+    int ox = mr * 45 / 100, oy = -mr * 20 / 100;
+    for (int y = my - mr - 1; y <= my + mr + 1; y++) {
+        for (int x = mx - mr - 1; x <= mx + mr + 1; x++) {
+            if (x < 0 || y < 0 || x >= w || y >= h || y >= hgt[x]) continue;
+            int dx = x - mx, dy = y - my;
+            int d2 = dx * dx + dy * dy;
+            int ex = x - (mx + ox), ey = y - (my + oy);
+            int e2 = ex * ex + ey * ey;
+            int r2 = mr * mr;
+            if (d2 <= r2 && e2 > r2 * 92 / 100) {
+                /* soft edge on the inner side */
+                int edge = e2 - r2 * 92 / 100;
+                int a = edge * 255 / (mr * 6 + 1);
+                if (a > 255) a = 255;
+                int outer = r2 - d2;
+                int a2 = outer * 255 / (mr * 2 + 1);
+                if (a2 < a) a = a2;
+                if (a > 255) a = 255;
+                put_crisp(c, deep, x, y, gfx_mix(c->px[y * c->pitch + x], RGB(246, 236, 196), a));
+            }
+        }
+    }
+
+    /* the near ridge is one flat colour */
+    for (int x = 0; x < w; x++)
+        for (int y = MAX(front[x], 0); y < h; y++) put_crisp(c, deep, x, y, RGB(12, 10, 26));
+
+    /* a few pine trees on the front ridge */
+    seed = 0xBADA55;
+    for (int i = 0; i < w / 40; i++) {
+        int x = rnd(&seed) % w;
+        int th = 10 + rnd(&seed) % 18;
+        int base = front[x] + 2;
+        gfx_triangle(c, x, base - th, x - th / 3, base, x + th / 3, base, RGB(10, 8, 20));
+        if (!deep) continue;
+        for (int y = MAX(base - th, 0); y <= MIN(base, h - 1); y++)
+            for (int tx = MAX(x - th / 3, 0); tx <= MIN(x + th / 3, w - 1); tx++)
+                if (c->px[(size_t)y * c->pitch + tx] == RGB(10, 8, 20)) deep[(size_t)y * c->pitch + tx] = 0;
+    }
+    free(hgt);
+}
+
+/* ---- icons (32x32) ---- */
+enum { ICON_TERMINAL, ICON_FILES, ICON_PAINT, ICON_CLOCK, ICON_SNAKE, ICON_FRACTAL, ICON_CUBE,
+       ICON_LIFE, ICON_MONITOR, ICON_EDITOR, ICON_ABOUT, ICON_CALC, ICON_POWER, ICON_REBOOT,
+       ICON_TETRIS, ICON_MINES, ICON_NET, ICON_PIANO, ICON_SOUND, ICON_SETTINGS, ICON_SLEEP, ICON_HIBERNATE, ICON_LOGOUT, ICON_GENERIC,
+       ICON_COUNT };
+
+static void label(canvas_t *c, int x, int y, const char *s, uint32_t col) {
+    gfx_text(c, x, y, s, col, TRANSPARENT, FONT_SMALL);
+}
+
+static void art_icon(canvas_t *c, int x, int y, int icon) {
+    switch (icon) {
+    case ICON_TERMINAL:
+        gfx_fill_round(c, x + 1, y + 3, 30, 26, 4, RGB(150, 160, 200));
+        gfx_fill_round(c, x + 2, y + 4, 28, 24, 3, RGB(18, 18, 32));
+        gfx_fill(c, x + 2, y + 4, 28, 4, RGB(70, 70, 110));
+        label(c, x + 5, y + 10, ">_", RGB(120, 240, 150));
+        break;
+    case ICON_FILES:
+        gfx_fill_round(c, x + 2, y + 6, 12, 6, 2, RGB(230, 170, 60));
+        gfx_fill_round(c, x + 2, y + 9, 28, 20, 3, RGB(245, 195, 80));
+        gfx_hline(c, x + 3, y + 12, 26, RGB(255, 225, 140));
+        break;
+    case ICON_PAINT:
+        gfx_fill_circle(c, x + 16, y + 16, 13, RGB(235, 215, 180));
+        gfx_fill_circle(c, x + 21, y + 21, 4, RGB(20, 20, 40));
+        gfx_fill_circle(c, x + 10, y + 11, 3, RGB(230, 60, 80));
+        gfx_fill_circle(c, x + 17, y + 8, 3, RGB(70, 140, 240));
+        gfx_fill_circle(c, x + 24, y + 12, 3, RGB(80, 200, 110));
+        gfx_fill_circle(c, x + 9, y + 20, 3, RGB(250, 210, 60));
+        break;
+    case ICON_CLOCK:
+        gfx_fill_circle(c, x + 16, y + 16, 14, RGB(110, 120, 190));
+        gfx_fill_circle(c, x + 16, y + 16, 12, RGB(245, 245, 255));
+        gfx_line(c, x + 16, y + 16, x + 16, y + 7, RGB(30, 30, 50));
+        gfx_line(c, x + 16, y + 16, x + 22, y + 19, RGB(30, 30, 50));
+        gfx_fill_circle(c, x + 16, y + 16, 1, RGB(220, 60, 80));
+        break;
+    case ICON_SNAKE:
+        gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(24, 40, 30));
+        for (int i = 0; i < 4; i++) gfx_fill(c, x + 4 + i * 6, y + 20, 5, 5, RGB(90, 220, 110));
+        gfx_fill(c, x + 22, y + 14, 5, 5, RGB(90, 220, 110));
+        gfx_fill(c, x + 22, y + 8, 5, 5, RGB(140, 255, 150));
+        gfx_fill(c, x + 8, y + 7, 5, 5, RGB(240, 70, 80));
+        break;
+    case ICON_FRACTAL:
+        gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(10, 8, 40));
+        gfx_fill_circle(c, x + 18, y + 16, 8, RGB(30, 20, 90));
+        gfx_fill_circle(c, x + 18, y + 16, 6, RGB(10, 5, 20));
+        gfx_fill_circle(c, x + 9, y + 16, 4, RGB(10, 5, 20));
+        gfx_circle(c, x + 18, y + 16, 9, RGB(240, 160, 60));
+        gfx_circle(c, x + 9, y + 16, 5, RGB(240, 100, 160));
+        break;
+    case ICON_CUBE: {
+        uint32_t col = RGB(120, 220, 255);
+        gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(20, 24, 50));
+        gfx_rect(c, x + 6, y + 11, 15, 15, col);
+        gfx_rect(c, x + 12, y + 5, 15, 15, col);
+        gfx_line(c, x + 6, y + 11, x + 12, y + 5, col);
+        gfx_line(c, x + 20, y + 11, x + 26, y + 5, col);
+        gfx_line(c, x + 6, y + 25, x + 12, y + 19, col);
+        gfx_line(c, x + 20, y + 25, x + 26, y + 19, col);
+        break;
+    }
+    case ICON_LIFE:
+        gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(30, 30, 40));
+        for (int j = 0; j < 5; j++)
+            for (int i = 0; i < 5; i++)
+                if ((i * 7 + j * 3 + i * j) % 3 == 0) gfx_fill(c, x + 4 + i * 5, y + 4 + j * 5, 4, 4, RGB(255, 200, 90));
+        break;
+    case ICON_MONITOR:
+        gfx_fill_round(c, x + 1, y + 3, 30, 24, 4, RGB(40, 44, 70));
+        gfx_fill(c, x + 6, y + 15, 4, 9, RGB(110, 220, 140));
+        gfx_fill(c, x + 12, y + 9, 4, 15, RGB(110, 180, 250));
+        gfx_fill(c, x + 18, y + 12, 4, 12, RGB(240, 180, 90));
+        gfx_fill(c, x + 24, y + 7, 4, 17, RGB(230, 110, 140));
+        gfx_fill(c, x + 12, y + 28, 8, 3, RGB(150, 160, 200));
+        break;
+    case ICON_EDITOR:
+        gfx_fill(c, x + 6, y + 2, 20, 28, RGB(245, 245, 250));
+        gfx_rect(c, x + 6, y + 2, 20, 28, RGB(150, 160, 190));
+        for (int i = 0; i < 5; i++) gfx_hline(c, x + 9, y + 8 + i * 4, 14 - (i % 2) * 4, RGB(120, 130, 170));
+        gfx_line(c, x + 28, y + 6, x + 18, y + 24, RGB(240, 150, 60));
+        gfx_line(c, x + 29, y + 7, x + 19, y + 25, RGB(240, 150, 60));
+        break;
+    case ICON_SETTINGS: { /* a gear: eight teeth round a wheel with a hole */
+        static const int8_t teeth[8][2] = {{0, -12}, {8, -8}, {12, 0}, {8, 8}, {0, 12}, {-8, 8}, {-12, 0}, {-8, -8}};
+        for (int i = 0; i < 8; i++) gfx_fill_round(c, x + 13 + teeth[i][0], y + 13 + teeth[i][1], 7, 7, 2, RGB(180, 188, 220));
+        gfx_fill_circle(c, x + 16, y + 16, 10, RGB(180, 188, 220));
+        gfx_fill_circle(c, x + 16, y + 16, 7, RGB(120, 128, 170));
+        gfx_fill_circle(c, x + 16, y + 16, 4, RGB(40, 34, 70));
+        break;
+    }
+    case ICON_ABOUT:
+        gfx_fill_circle(c, x + 16, y + 16, 13, RGB(246, 236, 196));
+        gfx_fill_circle(c, x + 22, y + 12, 12, RGB(40, 30, 80));
+        gfx_pixel(c, x + 27, y + 24, RGB(255, 255, 255));
+        gfx_pixel(c, x + 24, y + 28, RGB(255, 255, 255));
+        break;
+    case ICON_CALC:
+        gfx_fill_round(c, x + 4, y + 1, 24, 30, 4, RGB(60, 64, 90));
+        gfx_fill(c, x + 7, y + 4, 18, 7, RGB(170, 220, 180));
+        for (int j = 0; j < 3; j++)
+            for (int i = 0; i < 3; i++) gfx_fill(c, x + 7 + i * 6, y + 14 + j * 5, 5, 4, i == 2 && j == 2 ? RGB(240, 150, 60) : RGB(200, 200, 220));
+        break;
+    case ICON_POWER:
+        gfx_circle(c, x + 16, y + 17, 11, RGB(240, 90, 100));
+        gfx_circle(c, x + 16, y + 17, 10, RGB(240, 90, 100));
+        gfx_fill(c, x + 15, y + 3, 3, 13, RGB(240, 90, 100));
+        break;
+    case ICON_LOGOUT: /* 扉と、そこから出る矢 */
+        gfx_fill_round(c, x + 5, y + 3, 14, 26, 2, RGB(150, 160, 200));
+        gfx_fill(c, x + 7, y + 5, 10, 22, RGB(40, 40, 70));
+        gfx_fill(c, x + 13, y + 15, 14, 3, RGB(120, 240, 150));
+        gfx_triangle(c, x + 30, y + 16, x + 24, y + 10, x + 24, y + 22, RGB(120, 240, 150));
+        break;
+    case ICON_SLEEP: /* a crescent (one disc less another, on any background) and a small z */
+        for (int j = -11; j <= 11; j++)
+            for (int i = -11; i <= 11; i++)
+                if (i * i + j * j <= 121 && (i - 5) * (i - 5) + (j + 4) * (j + 4) > 100)
+                    gfx_pixel(c, x + 14 + i, y + 18 + j, RGB(200, 190, 250));
+        gfx_hline(c, x + 21, y + 3, 7, RGB(200, 190, 250));
+        gfx_line(c, x + 27, y + 4, x + 21, y + 9, RGB(200, 190, 250));
+        gfx_hline(c, x + 21, y + 10, 7, RGB(200, 190, 250));
+        break;
+    case ICON_HIBERNATE: /* the sleep crescent over a disk: the memory goes to the disk */
+        for (int j = -8; j <= 8; j++)
+            for (int i = -8; i <= 8; i++)
+                if (i * i + j * j <= 64 && (i - 4) * (i - 4) + (j + 3) * (j + 3) > 49)
+                    gfx_pixel(c, x + 12 + i, y + 9 + j, RGB(200, 190, 250));
+        gfx_fill_round(c, x + 3, y + 19, 26, 11, 3, RGB(110, 100, 170));
+        gfx_hline(c, x + 6, y + 22, 14, RGB(70, 62, 120));
+        gfx_hline(c, x + 6, y + 26, 14, RGB(70, 62, 120));
+        gfx_fill(c, x + 23, y + 23, 3, 3, RGB(120, 230, 150));
+        break;
+    case ICON_REBOOT:
+        gfx_circle(c, x + 16, y + 16, 11, RGB(120, 200, 250));
+        gfx_circle(c, x + 16, y + 16, 10, RGB(120, 200, 250));
+        gfx_triangle(c, x + 22, y + 2, x + 22, y + 12, x + 30, y + 7, RGB(120, 200, 250));
+        break;
+    case ICON_PIANO:
+        gfx_fill_round(c, x + 1, y + 4, 30, 24, 4, RGB(40, 34, 70));
+        for (int i = 0; i < 5; i++) gfx_fill(c, x + 4 + i * 5, y + 7, 4, 19, RGB(246, 244, 236));
+        for (int i = 0; i < 4; i++)
+            if (i != 2) gfx_fill(c, x + 7 + i * 5, y + 7, 3, 11, RGB(24, 22, 36));
+        gfx_fill(c, x + 4, y + 7, 24, 2, RGB(130, 110, 240));
+        break;
+    case ICON_SOUND: /* two quavers joined by a beam */
+        gfx_fill_round(c, x + 1, y + 1, 30, 30, 8, RGB(64, 44, 130));
+        gfx_fill_circle(c, x + 10, y + 23, 4, RGB(246, 236, 196));
+        gfx_fill_circle(c, x + 22, y + 20, 4, RGB(246, 236, 196));
+        gfx_fill(c, x + 13, y + 9, 2, 14, RGB(246, 236, 196));
+        gfx_fill(c, x + 25, y + 6, 2, 14, RGB(246, 236, 196));
+        for (int t = 0; t < 4; t++) gfx_line(c, x + 13, y + 9 + t, x + 26, y + 6 + t, RGB(246, 236, 196));
+        break;
+    case ICON_TETRIS:
+        gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(24, 24, 44));
+        gfx_fill(c, x + 5, y + 19, 7, 7, RGB(240, 90, 110));
+        gfx_fill(c, x + 12, y + 19, 7, 7, RGB(240, 90, 110));
+        gfx_fill(c, x + 12, y + 12, 7, 7, RGB(240, 90, 110));
+        gfx_fill(c, x + 19, y + 19, 7, 7, RGB(90, 180, 250));
+        gfx_fill(c, x + 19, y + 12, 7, 7, RGB(90, 180, 250));
+        gfx_fill(c, x + 19, y + 5, 7, 7, RGB(90, 180, 250));
+        break;
+    case ICON_MINES:
+        gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(180, 185, 200));
+        gfx_line(c, x + 7, y + 7, x + 25, y + 25, RGB(20, 20, 30));
+        gfx_line(c, x + 25, y + 7, x + 7, y + 25, RGB(20, 20, 30));
+        gfx_hline(c, x + 5, y + 16, 22, RGB(20, 20, 30));
+        gfx_vline(c, x + 16, y + 5, 22, RGB(20, 20, 30));
+        gfx_fill_circle(c, x + 16, y + 16, 7, RGB(20, 20, 30));
+        gfx_fill(c, x + 13, y + 13, 3, 3, RGB(255, 255, 255));
+        break;
+    case ICON_NET:
+        gfx_fill_circle(c, x + 16, y + 16, 13, RGB(70, 140, 230));
+        gfx_circle(c, x + 16, y + 16, 13, RGB(200, 230, 255));
+        gfx_vline(c, x + 16, y + 3, 26, RGB(200, 230, 255));
+        gfx_hline(c, x + 3, y + 16, 26, RGB(200, 230, 255));
+        gfx_circle(c, x + 16, y + 16, 6, RGB(200, 230, 255));
+        break;
+    default:
+        gfx_fill_round(c, x + 4, y + 4, 24, 24, 6, RGB(150, 120, 230));
+        break;
+    }
+}
+

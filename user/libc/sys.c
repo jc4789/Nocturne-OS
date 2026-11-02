@@ -347,10 +347,6 @@ size_t n_caps_list(int32_t *out) {
     }
     return n;
 }
-n_result n_session_identity(n_handle identity_grant, const struct n_identity *identity) {
-    return NC5(SYS_SESSION_IDENTITY, identity_grant, identity, 0, 0, 0);
-}
-
 n_handle n_inlet_connect(n_handle inlet) {
     n_handle pair[2];
     n_result r = n_channel_pair(pair);
@@ -592,6 +588,7 @@ n_result cpu_info(struct n_cpuinfo *info) { return SC1(SYS_CPU_INFO, info); }
 void yield(void) { SC0(SYS_YIELD); }
 n_result poweroff(n_handle cap) { return NC5(SYS_POWER, cap, POWER_OFF, 0, 0, 0); }
 n_result reboot(n_handle cap) { return NC5(SYS_POWER, cap, POWER_REBOOT, 0, 0, 0); }
+n_result n_power_request(n_handle cap, uint32_t action, uint32_t flags) { return NC5(SYS_POWER, cap, action, flags, 0, 0); }
 n_result pcilist(struct n_pciinfo *out, int max) { return SC2(SYS_PCILIST, out, max); }
 
 static bool is_document(const char *path) {

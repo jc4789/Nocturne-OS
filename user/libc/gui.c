@@ -196,7 +196,43 @@ n_result clipboard_get(char *buf, size_t n) { return __syscall(SYS_CLIPBOARD_GET
 n_result gui_launch(const char *path, const char *arg) {
     char full[4096];
     if (!find_program(path, full, sizeof full)) return -N_ERR_NOT_FOUND;
-    return __syscall(SYS_GUI_LAUNCH, (long)full, (long)arg, 0, 0, 0);
+    const char *arguments[2] = {full, arg};
+    struct n_launch launch = {.arguments = arguments, .argument_count = arg ? 2 : 1};
+    n_handle app = n_app_launch(full, &launch);
+    if (app < 0) return app;
+    n_result id = n_app_id(app);
+    n_handle_close(app);
+    return id;
+}
+
+n_result n_shell_place(n_handle cap, window_t *win, const struct n_shell_place *place) {
+    return __syscall(SYS_SHELL_PLACE, cap, win->handle, (long)place, sizeof *place, 0);
+}
+n_result n_shell_screens(n_handle cap, struct n_shell_screen *out, size_t max) {
+    return __syscall(SYS_SHELL_SCREENS, cap, (long)out, (long)max, 0, 0);
+}
+n_result n_shell_windows(n_handle cap, struct n_shell_window *out, size_t max) {
+    return __syscall(SYS_SHELL_WINDOWS, cap, (long)out, (long)max, 0, 0);
+}
+n_result n_shell_window(n_handle cap, uint32_t id, uint32_t op) { return __syscall(SYS_SHELL_WINDOW, cap, id, op, 0, 0); }
+n_handle n_shell_watch(n_handle cap) { return (n_handle)__syscall(SYS_SHELL_WATCH, cap, 0, 0, 0, 0); }
+n_result n_shell_hotkey(n_handle cap, window_t *win, uint32_t key, uint32_t mods) {
+    return __syscall(SYS_SHELL_HOTKEY, cap, win->handle, key, mods, 0);
+}
+n_result n_power_state(n_handle cap, struct n_power_state *out) {
+    return __syscall(SYS_POWER_STATE, cap, (long)out, sizeof *out, 0, 0);
+}
+n_handle n_power_watch(n_handle cap) { return (n_handle)__syscall(SYS_POWER_WATCH, cap, 0, 0, 0, 0); }
+
+n_result n_shell_notify(const char *title, const char *text) {
+    struct n_shell_notice notice = {0};
+    strlcpy(notice.title, title, sizeof notice.title);
+    if (text) strlcpy(notice.text, text, sizeof notice.text);
+    n_handle channel = n_service_connect(N_SHELL_SERVICE);
+    if (channel < 0) return channel;
+    n_result r = n_channel_send(channel, &notice, sizeof notice, -1);
+    n_handle_close(channel);
+    return r;
 }
 
 n_result screen_grab(n_handle cap, uint32_t *buf, size_t bytes, int *w, int *h) {

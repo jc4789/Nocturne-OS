@@ -28,7 +28,7 @@ PROGRAMS = BUILD / "programs"
 FIRMWARE_FILES = ("firmware/gsp_ga10x.bin", "firmware/ucodes_ga10x.bin", "LICENSE")
 NEW_USER = "C:\\Nocturne\\NewUser"
 
-# The desktop apps, each in its folder of C:\Programs (kernel/src/gui/wm.c starts them there).
+# The desktop apps, each in its folder of C:\Programs (user/apps/shell.c starts them there).
 APPS = {
     "browser": "Browser", "notepad": "Notepad", "paint": "Paint", "calc": "Calculator",
     "clock": "Clock", "piano": "Piano", "player": "Player", "mediaplayer": "Media Player",

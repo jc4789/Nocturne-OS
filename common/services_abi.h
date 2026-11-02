@@ -104,8 +104,12 @@ enum n_machine_op {
     N_MACHINE_POWER_OFF = 1,
     N_MACHINE_REBOOT,
     N_MACHINE_SCREEN, /* 応答の添付が 0xAARRGGBB の画素の共有ページ。 */
+    N_MACHINE_SLEEP,
+    N_MACHINE_HIBERNATE,
 };
-struct n_machine_request { uint32_t op; };
+/* 利用者が選んだ：アプリは窓を残して取りやめられ、応答はすぐ返る（N_POWER_CHOSEN、abi.h）。 */
+#define N_MACHINE_CHOSEN 1u
+struct n_machine_request { uint32_t op; uint32_t flags; };
 struct n_machine_reply {
     int64_t result;
     int32_t width, height;

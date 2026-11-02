@@ -47,7 +47,7 @@ struct desktop_settings {
    that size. source says what decides the desktop's size, chosen the mode the user chose for the
    monitor offered names (all 0: none), whether or not it is offered now.
    Each screen has its own: the third argument is the op with the screen's number in its bits
-   from 8 on (op | screen << 8; screen 0 holds the taskbar), and screens says how many there are
+   from 8 on (op | screen << 8), and screens says how many there are
    (an unknown screen: N_ERR_NOT_FOUND). */
 #define SCREEN_MODES_GET 3
 /* SYS_SCREEN_INFO with its third argument SCREEN_WATCH (the first two 0): a watch (N_KIND_WATCH,
@@ -80,6 +80,67 @@ struct screen_modes {
    after its w*h pixels. The compositor reads it only while the desktop has 10
    or more bits per channel, which can change at run time (Settings). */
 #define WIN_DEEP_COLOR 64
+
+/* ---- シェルの口 ----
+   カーネルは窓の管理者で、シェルは普通のプロセス。シェルは N_CAP_SHELL の能力で、自分の窓を層に置き、
+   画面の端を予約し、窓の一覧を読み、窓を前に出す。タスクバーもメニューも壁紙もカーネルは知らない。 */
+
+/* 窓の層。下から順に重なる。層の中では窓が前後する。 */
+enum n_window_layer {
+    N_LAYER_NORMAL,  /* アプリの窓 */
+    N_LAYER_DESKTOP, /* 全部の窓より下。焦点は押されたときだけ受ける */
+    N_LAYER_PANEL,   /* アプリの窓より上。焦点を受けない。同じ画面の全画面の窓が焦点を持つ間は隠れる */
+    N_LAYER_OVERLAY, /* 一番上。ここに窓があれば直接の表示（EV_DIRECT）をやめる */
+};
+
+/* 画面の端（n_shell_place の reserve_edge）。 */
+enum n_screen_edge { N_EDGE_NONE, N_EDGE_TOP, N_EDGE_BOTTOM, N_EDGE_LEFT, N_EDGE_RIGHT };
+
+#define N_PLACE_NO_FOCUS 1u /* 焦点を受けない（N_LAYER_OVERLAY のとき） */
+#define N_PLACE_BLEND 2u    /* 画素の alpha で下と混ぜる。隠さない所を持つ窓 */
+
+/* SYS_SHELL_PLACE：飾りの無い自分の窓（WIN_NO_DECOR）を一度に決める。予約は窓が持ち、窓の終わりで
+   消える。最大化の窓と SYS_SCREEN_INFO の作業域は予約の残りに従う。 */
+struct n_shell_place {
+    uint32_t layer;        /* enum n_window_layer */
+    uint32_t screen;       /* 画面の番号 */
+    int32_t x, y;          /* その画面の中の位置 */
+    uint32_t reserve_edge; /* enum n_screen_edge */
+    uint32_t reserve;      /* その端から予約する画素の数 */
+    uint32_t flags;        /* N_PLACE_* */
+    uint32_t reserved;
+};
+
+/* SYS_SHELL_SCREENS の一件。x、y、width、height は画面の部分。on が 0 の画面は部分を持たない。 */
+struct n_shell_screen {
+    int32_t x, y;
+    int32_t width, height;
+    uint32_t on;
+    uint32_t reserved;
+};
+
+#define N_SHELL_WINDOW_MINIMIZED 1u
+#define N_SHELL_WINDOW_FOCUSED 2u
+#define N_SHELL_WINDOW_FULLSCREEN 4u
+/* SYS_SHELL_WINDOWS の一件：アプリの飾りのある窓を、作られた順に。 */
+struct n_shell_window {
+    uint32_t id;     /* 窓の番号：使い回さない */
+    int32_t app;     /* 窓を作ったアプリの番号（SYS_APP_OPEN） */
+    uint32_t state;  /* N_SHELL_WINDOW_* */
+    uint32_t screen; /* 窓の中心がある画面の番号 */
+    char title[64];
+};
+
+/* SYS_SHELL_WINDOW の操作。 */
+enum n_shell_window_op { N_SHELL_RAISE, N_SHELL_MINIMIZE, N_SHELL_CLOSE };
+
+/* サービス "shell" のチャンネルへ送る通知。一通に一つ。text は無くてよい。 */
+#define N_SHELL_SERVICE "shell"
+struct n_shell_notice {
+    uint32_t reserved[2];
+    char title[64];
+    char text[128];
+};
 
 /* Deep byte: bit 7 says the low bits are valid, bits 5:4 R, 3:2 G, 1:0 B.
    An invalid (zero) byte means "8-bit content": the display widens the

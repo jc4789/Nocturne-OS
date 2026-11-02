@@ -110,7 +110,7 @@ int proc_app_result(struct handle *h, uint64_t deadline, int *status) {
 }
 
 /* A new handle on a running app, by the identifier the app list shows. An app
-   the kernel started (proc_spawn_simple) gets its record here. */
+   without a record yet gets its record here. */
 int proc_app_open(int pid, struct handle **out) {
     struct object *spare = app_new();
     if (!spare) return -N_ERR_NO_MEMORY;
@@ -343,16 +343,5 @@ fail:
     kfree(ph);
     if (doc) handle_close(doc);
     process_discard(p);
-    return r;
-}
-
-int proc_spawn_simple(const char *path, const char *arg1, const struct n_identity *identity) {
-    char *argv[3] = {(char *)path, (char *)arg1, NULL};
-    struct handle *nul = stream_null_open();
-    struct handle *handles[3] = {nul, nul, nul};
-    struct proc_launch l = {.argc = arg1 ? 2 : 1, .argv = argv,
-                            .handles = handles, .handle_count = 3, .identity = *identity};
-    int r = proc_launch(path, &l);
-    handle_close(nul);
     return r;
 }

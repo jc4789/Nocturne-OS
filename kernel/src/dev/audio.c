@@ -70,7 +70,7 @@ static struct spinlock audio_lock;
 static uint64_t sink_mixed, sink_played, sink_played_at;
 
 /* the last slot is the system's own stream, which no app owns */
-static struct stream *streams[MAX_STREAMS + 1];
+static struct stream *streams[MAX_STREAMS];
 /* The runs each stream has room for: the most any sink there is may hold, under audio_lock. A stream
    short of room (no memory for more, just now) skips blocks until a report frees a run. */
 static unsigned runs_most = NULL_RUNS;
@@ -88,7 +88,6 @@ static struct audio_sink *active;
 /* The remote clients, in the order they came: the first plays the sound. Changed under audio_lock;
    read without it as a hint. */
 static struct audio_remote *remotes;
-static bool tone_writing; /* audio_system_tone is copying past the system stream's head */
 
 /* The thread that fills the output that plays (audio_thread). */
 static struct thread *filler;
@@ -127,7 +126,7 @@ static unsigned mix_claim(struct mix_part *parts, int frames, bool keep) {
     if((uint64_t)frames>UINT64_MAX-sink_mixed)return 0;
     unsigned count = 0;
     bool error = false;
-    for (int i = 0; i <= MAX_STREAMS; i++) {
+    for (int i = 0; i < MAX_STREAMS; i++) {
         struct stream *s = streams[i];
         if (!s) continue;
         if(s->head-s->tail>RING_BYTES||s->issued_head>=s->runs_room||s->issued_count>s->runs_room){s->clock_error=true;error=true;continue;}
@@ -337,7 +336,7 @@ static void pace_frame(int32_t *to, const int32_t *x, uint32_t position) {
    *end, written under it: the device ordinal after the block. Silence where a stream had too little.
    False, and out untouched, when no stream had anything. */
 static bool mix_unlock(uint64_t f, void *out, const struct audio_format *format, int frames, bool keep, uint64_t *end) {
-    struct mix_part parts[MAX_STREAMS + 1];
+    struct mix_part parts[MAX_STREAMS];
     uint64_t step = (uint64_t)((int64_t)PACE_ONE + pace.ratio), position = pace.fraction;
     uint64_t after = position + (uint64_t)frames * step;
     uint32_t taken = (uint32_t)(after >> 32);
@@ -411,7 +410,7 @@ static void played_locked(uint64_t ordinal,uint64_t at){
     ordinal=MIN(ordinal,sink_mixed);
     if(ordinal<=sink_played)return;
     sink_played=ordinal;sink_played_at=at;
-    for(unsigned i=0;i<=MAX_STREAMS;i++){
+    for(unsigned i=0;i<MAX_STREAMS;i++){
         struct stream *s=streams[i];if(!s)continue;
         if(s->issued_head>=s->runs_room||s->issued_count>s->runs_room){s->clock_error=true;continue;}
         while(s->issued_count){
@@ -439,7 +438,7 @@ void audio_played(uint64_t ordinal,uint64_t at){
 /* audio_lock held. */
 static bool pending_locked(void) {
     if (pace.ringing) return true;
-    for (int i = 0; i <= MAX_STREAMS; i++)
+    for (int i = 0; i < MAX_STREAMS; i++)
         if (streams[i]&&!streams[i]->clock_error&&streams[i]->head-streams[i]->tail>=AUDIO_FRAME&&
             streams[i]->head-streams[i]->tail<=RING_BYTES) return true;
     return false;
@@ -456,7 +455,7 @@ bool audio_pending(void) {
 static bool ready_locked(int frames, bool low) {
     bool any = false, whole = true;
     uint32_t takes = (uint32_t)((pace.fraction + (uint64_t)frames * (uint64_t)((int64_t)PACE_ONE + pace.ratio)) >> 32);
-    for (int i = 0; i <= MAX_STREAMS; i++) {
+    for (int i = 0; i < MAX_STREAMS; i++) {
         struct stream *s = streams[i];
         if (!s || s->clock_error || s->head - s->tail > RING_BYTES) continue;
         uint32_t have = (s->head - s->tail) / AUDIO_FRAME;
@@ -564,7 +563,7 @@ static void runs_grow(unsigned blocks) {
     for (;;) {
         unsigned want = runs_most;
         struct stream *s = NULL;
-        for (int i = 0; i <= MAX_STREAMS && !s; i++)
+        for (int i = 0; i < MAX_STREAMS && !s; i++)
             if (streams[i] && streams[i]->runs_room < want) s = streams[i];
         if (!s) break;
         if (size == want) {
@@ -812,8 +811,6 @@ static void sound_put(int v, int m) {
 /* A moment old at most: the watches hear of every change after it is made. */
 int audio_volume(void) { return __atomic_load_n(&volume, __ATOMIC_RELAXED); }
 bool audio_muted(void) { return __atomic_load_n(&muted, __ATOMIC_RELAXED); }
-void audio_set_volume(int percent) { sound_put(MAX(0, MIN(100, percent)), false); }
-void audio_set_muted(bool m) { sound_put(KEEP, m); }
 
 int audio_setting_put(uint32_t key, const void *value) {
     int32_t v;
@@ -828,37 +825,6 @@ int64_t audio_setting_get(uint32_t key, void *out, size_t cap) {
 }
 
 int64_t audio_output_watch(void) { return watched_open(&output_watched); }
-
-static uint8_t system_ring[RING_BYTES];
-static struct stream system_stream = {.ring = system_ring};
-
-/* a triangle wave (no floating point in the kernel) that fades out, with a 2 ms start; one caller
-   at a time writes it (tone_writing), another one's tone is dropped as one that still sounds is */
-void audio_system_tone(int hz, int ms) {
-    struct stream *s = &system_stream;
-    uint64_t f = spin_lock(&audio_lock);
-    uint32_t head = s->head, queued = head - s->tail, retained = MAX(s->retained, s->held);
-    bool drop = hz <= 0 || queued >= AUDIO_FRAME || tone_writing;
-    if (!drop) tone_writing = true;
-    spin_unlock(&audio_lock, f);
-    if (drop) return;
-    /* the queue's worth at most, and never over what an output may still give back */
-    int room = (int)((RING_BYTES - retained * AUDIO_FRAME) / AUDIO_FRAME);
-    int frames = MIN(ms * (AUDIO_RATE / 1000), MIN((int)(QUEUE_BYTES / AUDIO_FRAME), room)), period = AUDIO_RATE / hz;
-    for (int k = 0; k < frames; k++) {
-        int ph = k % period, tri = ph < period / 2 ? 4 * ph - period : 3 * period - 4 * ph; /* -period..period */
-        int amp = 7000 * (frames - k) / frames;
-        if (k < 96) amp = amp * k / 96;
-        int16_t v = (int16_t)(tri * amp / period);
-        int16_t *at = (int16_t *)(s->ring + (head + (uint32_t)k * AUDIO_FRAME) % RING_BYTES);
-        at[0] = at[1] = v;
-    }
-    f = spin_lock(&audio_lock);
-    s->head += (uint32_t)frames * AUDIO_FRAME;
-    tone_writing = false;
-    if (frames > 0) sink_fed_locked();
-    spin_unlock(&audio_lock, f);
-}
 
 /* ---- the apps' streams (docs/nocturne-native-abi.md §9) ---- */
 
@@ -904,13 +870,13 @@ static bool take_back(struct stream *s) {
     if (!active || remotes) return false;
     uint64_t at = pace_unissued(active->ops->unissue(active, false));
     if (at >= sink_mixed || !frames_from(s, at)) return false;
-    for (int i = 0; i <= MAX_STREAMS; i++) {
+    for (int i = 0; i < MAX_STREAMS; i++) {
         struct stream *o = streams[i];
         if (o && !stream_broken(o) && frames_from(o, at) > o->retained) return false;
     }
     uint64_t given = active->ops->unissue(active, true); /* the engine only moved on since: never an earlier ordinal */
     at = pace_unissued(given);
-    for (int i = 0; i <= MAX_STREAMS; i++) {
+    for (int i = 0; i < MAX_STREAMS; i++) {
         struct stream *o = streams[i];
         if (!o || stream_broken(o)) continue;
         uint32_t back = frames_from(o, at);
@@ -933,7 +899,7 @@ static bool take_back(struct stream *s) {
     memset(pace.history, 0, sizeof pace.history);
     pace.ringing = false;
     uint64_t from = at > PACE_TAPS ? at - PACE_TAPS : 0;
-    for (int i = 0; i <= MAX_STREAMS; i++) {
+    for (int i = 0; i < MAX_STREAMS; i++) {
         struct stream *o = streams[i];
         if (!o || o == s || stream_broken(o)) continue;
         uint32_t count = MIN(frames_from(o, from), o->retained);
@@ -1128,10 +1094,6 @@ int audio_stream_flush(struct handle *h) {
 void audio_init(void) {
     watched_init(&output_watched, NULL); /* before an output is added */
     alarm_init(&null_alarm, null_fire);
-    system_stream.issued = kmalloc(NULL_RUNS * sizeof *system_stream.issued);
-    if (!system_stream.issued) panic("audio: no memory for its system stream");
-    system_stream.runs_room = NULL_RUNS;
-    streams[MAX_STREAMS] = &system_stream;
     filler = kthread_create("audio", audio_thread, NULL);
     if (!filler) panic("audio: no memory for its thread");
     hda_init();

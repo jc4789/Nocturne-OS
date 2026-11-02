@@ -1,4 +1,4 @@
-/* volume: show the master volume (0-100). The Settings window and the taskbar change it. */
+/* volume: show the master volume (0-100). The Settings window and the shell change it. */
 #include <stdio.h>
 #include "nocturne.h"
 

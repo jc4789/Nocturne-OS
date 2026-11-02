@@ -29,8 +29,8 @@ general-purpose OS for daily use (see [Limits](#limits)).
 
 - **Kernel**: boots from UEFI through Limine. User threads on several CPUs, the "Kei" (継) fair scheduler,
   W^X memory management and a native system-call ABI.
-- **Desktop**: a compositing window manager in the kernel, with shadows, double buffering, a taskbar, a start menu,
-  notifications, a clipboard and a night-sky wallpaper. The default resolution is 1920×1080.
+- **Desktop**: a compositing window manager in the kernel (shadows, double buffering, a clipboard) and the shell, an
+  ordinary process (a taskbar, a start menu, notifications and a night-sky wallpaper). The default resolution is 1920×1080.
 - **Web browser**: Lexbor builds the HTML tree and QuickJS runs JavaScript; the DOM, CSS, layout, painting and
   Web APIs are Nocturne's own. It has Workers, IndexedDB, WebSocket, WebGL (Mesa; on an NVIDIA GPU the GPU draws),
   WebAssembly, video (FFmpeg, MSE) and developer tools.

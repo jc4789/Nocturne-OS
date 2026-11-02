@@ -851,6 +851,18 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
         if (h < 0) continue;
         if (!(handles[i] = handle_get(h))) { ret = -N_ERR_NO_HANDLE; goto out; }
     }
+    /* 0, 1 and 2 are a program's input, output and log: what the launcher does not give reads and
+       writes nothing, and no later handle of the program takes those numbers. */
+    if (l.handle_count < 3) {
+        struct handle **room = kzalloc(3 * sizeof *room);
+        if (!room) { ret = -N_ERR_NO_MEMORY; goto out; }
+        for (size_t i = 0; i < l.handle_count; i++) room[i] = handles[i];
+        kfree(handles);
+        handles = room;
+        l.handle_count = 3;
+    }
+    for (size_t i = 0; i < 3; i++)
+        if (!handles[i] && !(handles[i] = stream_null_open())) { ret = -N_ERR_NO_MEMORY; goto out; }
     if ((r = proc_app_create(&app)) < 0) { ret = r; goto out; }
     struct proc_launch launch = {.argc = (int)argc, .argv = argv, .environment_count = (int)l.environment_count,
                                  .environment = environment, .folder = folder, .terminals = terminals,
@@ -1105,7 +1117,6 @@ void syscall_dispatch(struct regs *r) {
     case SYS_CAP_DERIVE: ret = sys_cap_derive((int)a, b); break;
     case SYS_CAP_KIND: ret = sys_cap_kind((int)a); break;
     case SYS_CAP_FIND: ret = sys_cap_find(a); break;
-    case SYS_SESSION_IDENTITY: ret = sys_session_identity((int)a, (const struct n_identity *)b); break;
     case SYS_SERVICE_REGISTER: ret = sys_service_register((int)a); break;
     case SYS_SERVICE_CONNECT: ret = sys_service_connect((const char *)a, b); break;
     case SYS_PROCLIST: ret = sys_proclist((struct n_procinfo *)a, (int)b); break;
@@ -1243,10 +1254,26 @@ void syscall_dispatch(struct regs *r) {
     case SYS_POWER:
         ret = cap_check((int)a, N_CAP_POWER);
         if (ret < 0) break;
+        if (b > POWER_HIBERNATE || (c & ~(uint64_t)N_POWER_CHOSEN)) {
+            ret = -N_ERR_INVALID;
+            break;
+        }
+        pm_request((enum pm_action)b, c & N_POWER_CHOSEN);
+        if ((c & N_POWER_CHOSEN) || b == POWER_SLEEP || b == POWER_HIBERNATE) {
+            ret = 0;
+            break;
+        }
         /* the power thread ends this app with the others */
-        pm_request(b == POWER_REBOOT ? PM_REBOOT : PM_POWER_OFF, false);
         while (!self->killed) sleep_until(CLOCK_NEVER); /* the kill wakes it */
         ret = -N_ERR_STOPPED;
+        break;
+    case SYS_POWER_STATE:
+        ret = cap_check((int)a, N_CAP_SHELL);
+        if (ret >= 0) ret = pm_state_syscall((void *)b, c);
+        break;
+    case SYS_POWER_WATCH:
+        ret = cap_check((int)a, N_CAP_SHELL);
+        if (ret >= 0) ret = pm_watch_syscall();
         break;
     case SYS_SYSTEM_LOG: ret = identity_at_least(N_CLASS_ADMIN) ? sys_system_log((char *)a, b) : -N_ERR_DENIED; break;
     case SYS_PCILIST:

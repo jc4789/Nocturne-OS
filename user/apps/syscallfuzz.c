@@ -22,7 +22,7 @@
 
    Left out on purpose: calls that end, power off, launch or stop programs, sleep, claim
    hardware, use the network or change the volume the system keeps for the user (SYS_EXIT,
-   SYS_POWER, SYS_SLEEP, SYS_THREAD_*, SYS_APP_LAUNCH, SYS_APP_OPEN, SYS_GUI_LAUNCH,
+   SYS_POWER, SYS_SLEEP, SYS_THREAD_*, SYS_APP_LAUNCH, SYS_APP_OPEN,
    SYS_WIN_CREATE, SYS_PCI_CLAIM, SYS_AUDIO_OUTPUT, 96..127).
    Pointers into memory this program owns never reach calls that change mappings. */
 #include <stdio.h>
@@ -160,7 +160,7 @@ static unsigned hmask_of(long num) {
 static bool skipped(long n) {
     switch (n) {
     case SYS_EXIT: case SYS_SLEEP: case SYS_POWER: case SYS_THREAD_CREATE: case SYS_THREAD_JOIN:
-    case SYS_THREAD_EXIT: case SYS_WAIT_ADDRESS: case SYS_WAIT_ADDRESS64: case SYS_GUI_LAUNCH:
+    case SYS_THREAD_EXIT: case SYS_WAIT_ADDRESS: case SYS_WAIT_ADDRESS64:
     case SYS_APP_LAUNCH: case SYS_APP_OPEN: case SYS_WIN_CREATE: case SYS_PCI_CLAIM:
     case SYS_AUDIO_OUTPUT: /* the volume, kept on C: for the user */
         return true;

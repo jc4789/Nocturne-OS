@@ -30,6 +30,10 @@ static n_handle screen_pixels(struct n_machine_reply *reply) {
     return shared;
 }
 
+static uint32_t power_action(uint32_t op) {
+    return op == N_MACHINE_POWER_OFF ? POWER_OFF : op == N_MACHINE_REBOOT ? POWER_REBOOT : op == N_MACHINE_SLEEP ? POWER_SLEEP : POWER_HIBERNATE;
+}
+
 static void client_serve(void *arg) {
     n_handle channel = (n_handle)(intptr_t)arg;
     struct n_identity peer;
@@ -47,10 +51,10 @@ static void client_serve(void *arg) {
         if (allowed) {
             switch (q.op) {
             case N_MACHINE_POWER_OFF:
-                reply.result = poweroff(power_cap);
-                break;
             case N_MACHINE_REBOOT:
-                reply.result = reboot(power_cap);
+            case N_MACHINE_SLEEP:
+            case N_MACHINE_HIBERNATE:
+                reply.result = q.flags & ~N_MACHINE_CHOSEN ? -N_ERR_INVALID : n_power_request(power_cap, power_action(q.op), q.flags & N_MACHINE_CHOSEN ? N_POWER_CHOSEN : 0);
                 break;
             case N_MACHINE_SCREEN:
                 attached = screen_pixels(&reply);

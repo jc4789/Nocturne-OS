@@ -45,7 +45,7 @@
 #define N_RESULT_CODES 34
 
 /* System call numbers. The ABI keeps no older form of a call: a program is built against the
-   abi.h of the system it runs on. 1-18, 21-25, 30-32, 35-37, 44, 51-55, 60-63, 90 and 203-206
+   abi.h of the system it runs on. 1-18, 21-25, 30-32, 35-37, 44, 51-55, 60-63, 73, 90 and 203-206
    are unassigned. */
 enum {
     SYS_EXIT = 0,
@@ -67,13 +67,19 @@ enum {
     SYS_WIN_SET_TITLE, SYS_SCREEN_INFO,
     SYS_WIN_MOVE, SYS_CLIPBOARD_SET, SYS_CLIPBOARD_GET,
     SYS_WIN_RESIZE,      /* (window, width, height): new surfaces of that size (SYS_WIN_SURFACE) */
-    SYS_GUI_LAUNCH,
-    SYS_SCREEN_GRAB, SYS_WIN_STATE, SYS_WIN_PRESENTATION,
+    SYS_SCREEN_GRAB = 74, SYS_WIN_STATE, SYS_WIN_PRESENTATION,
     SYS_WIN_RECEIVE, /* (window, struct gui_event *out, max, deadline): count, 0 at the deadline */
     SYS_WIN_DIRECT,  /* (window, wanted): ask to be shown by the display driver directly (EV_DIRECT) */
     SYS_WIN_FRAME,   /* (window): EV_FRAME at the display's next frame, presented or not (WIN_FRAME_EVENTS) */
     SYS_WIN_POINTER, /* (window, const struct n_win_pointer *, size): the pointer over the client area */
     SYS_WIN_ACQUIRE, /* (window, deadline): a surface of a WIN_FRAME_QUEUE window free to draw into */
+    /* シェルの口（display_abi.h）。第一引数は N_CAP_SHELL の能力。 */
+    SYS_SHELL_PLACE,   /* (cap, window, const struct n_shell_place *, size): 窓の層と位置と端の予約 */
+    SYS_SHELL_SCREENS, /* (cap, struct n_shell_screen *out, max): 画面の数 */
+    SYS_SHELL_WINDOWS, /* (cap, struct n_shell_window *out, max): 窓の数 */
+    SYS_SHELL_WINDOW,  /* (cap, 窓の番号, N_SHELL_RAISE など) */
+    SYS_SHELL_WATCH,   /* (cap): 窓の一覧と焦点の watch */
+    SYS_SHELL_HOTKEY,  /* (cap, window, key, mods): その鍵の押下を EV_HOTKEY で受ける */
     SYS_SHARED_RESERVE = 88, SYS_WAIT_ADDRESS64,
     SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
     SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
@@ -160,8 +166,8 @@ enum {
     SYS_ENTRY_SET_OWNER,      /* (path, user): C: の名前の持ち主の利用者。admin 以上（§3） */
     SYS_CAP_KIND,             /* (cap) -> enum n_cap */
     SYS_CAP_FIND,             /* (enum n_cap) -> その能力を持つ自分の handle */
-    SYS_SESSION_IDENTITY,     /* (N_CAP_IDENTITY_GRANT の cap, const struct n_identity *):
-                                 カーネルの窓の系が起こすアプリの身元 */
+    SYS_POWER_STATE,          /* (N_CAP_SHELL の cap, struct n_power_state *out, size): 電源の段取りの今 */
+    SYS_POWER_WATCH,          /* (N_CAP_SHELL の cap): SYS_POWER_STATE が報告するものの watch */
     SYS_MAX                   /* above every number (what syscallfuzz tries) */
 };
 
@@ -591,9 +597,58 @@ struct n_shared_range {
     uint64_t offset, bytes;
 };
 
-/* power */
+/* power。SYS_POWER は (N_CAP_POWER の cap, POWER_*, flags)。 */
 #define POWER_OFF 0
 #define POWER_REBOOT 1
+#define POWER_SLEEP 2
+#define POWER_HIBERNATE 3
+/* 利用者が選んだ：アプリは窓を残して取りやめられ、呼出しはすぐ戻る。無ければアプリは数秒で止まり、
+   POWER_OFF と POWER_REBOOT の呼出しは戻らない。もう一度選ぶと閉じるのを待たない。 */
+#define N_POWER_CHOSEN 1u
+
+/* 電源の段取り（SYS_POWER_STATE）。カーネルは型のある値を出し、人へ言うのは読む側。serial は変わるたびに
+   増える。読むのは最新の一つで、途中の段が飛ぶことがある。 */
+enum n_power_stage {
+    N_POWER_IDLE,
+    N_POWER_CLOSING,   /* 窓が閉じるのを待つ。detail は残っている窓の題 */
+    N_POWER_CANCELLED, /* detail の題の窓が残ったので取りやめた */
+    N_POWER_STOPPING,  /* 引き返さない：止まる */
+    N_POWER_SAVING,    /* 休止の像を C: へ書く */
+    N_POWER_REFUSED,   /* 眠りと休止に入らなかった。reason と detail */
+    N_POWER_FAILED,    /* 眠りと休止が途中で失敗した。reason と detail */
+    N_POWER_DEVICE_LOST, /* 戻って来ない装置がある。reason と detail */
+    N_POWER_AWAKE,     /* 眠りから戻った：時計が進んだ */
+};
+enum n_power_reason {
+    N_POWER_REASON_NONE,
+    N_POWER_REASON_IOMMU,         /* IOMMU の状態が確かめられないか、戻らなかった */
+    N_POWER_REASON_NO_S3,         /* ファームウェアに S3 が無い */
+    N_POWER_REASON_NO_WAKE_PAGE,  /* 1 MiB より下に起床の頁が無い */
+    N_POWER_REASON_DEVICE,        /* detail の装置は眠りから戻れない */
+    N_POWER_REASON_DEVICE_BUSY,   /* detail の装置が今は眠れない */
+    N_POWER_REASON_DEVICE_STUCK,  /* detail の装置が止まらなかった */
+    N_POWER_REASON_APP_DRIVER,    /* アプリが PCI の装置を動かしている */
+    N_POWER_REASON_DISK_FLUSH,    /* ディスクが cache を書き戻さなかった */
+    N_POWER_REASON_CPU_STOP,      /* CPU が止まらなかった */
+    N_POWER_REASON_FIRMWARE,      /* ファームウェアが眠らなかった */
+    N_POWER_REASON_LOW_ROOM,      /* 1 MiB より下に場所が無い */
+    N_POWER_REASON_NOT_ON_DISK,   /* C: がディスクに無い */
+    N_POWER_REASON_NO_MEMORY,     /* メモリーが足りない */
+    N_POWER_REASON_NO_SPACE,      /* C: の空きが足りない */
+    N_POWER_REASON_IMAGE_TOO_LARGE, /* 像がメモリーか C: に入らなかった */
+    N_POWER_REASON_STORE_WRITE,   /* C: へ書けなかった */
+    N_POWER_REASON_COUNT
+};
+struct n_power_state {
+    uint64_t serial;
+    uint32_t stage;         /* enum n_power_stage */
+    uint32_t action;        /* POWER_* */
+    uint32_t reason;        /* enum n_power_reason */
+    uint32_t forceable;     /* N_POWER_CLOSING：もう一度選ぶと待たない */
+    uint32_t can_sleep;     /* 眠りを勧めてよい */
+    uint32_t can_hibernate; /* 休止を勧めてよい */
+    char detail[64];
+};
 
 /* n_audio_status: where a stream stands. Device time counts this stream's
  * consumed PCM only: played_frames, heard at the monotonic clock time
@@ -638,6 +693,8 @@ enum {
        window that does not take them. Keys and buttons held before it are to be taken as released;
        the next events are the ones that came after. */
     EV_INPUT_LOST,
+    EV_MOUSE_LEAVE, /* 指が窓から離れた。シェルの層の窓だけが受ける */
+    EV_HOTKEY,      /* key と mods の押下（SYS_SHELL_HOTKEY） */
 };
 
 /* A window's event. time_ns is a moment on the system's monotonic clock in nanoseconds (struct
@@ -762,7 +819,8 @@ enum {
     NKEY_ESC = 0x1B, NKEY_BACKSPACE = 0x08, NKEY_TAB = 0x09, NKEY_ENTER = 0x0A,
     NKEY_UP = 0x100, NKEY_DOWN, NKEY_LEFT, NKEY_RIGHT, NKEY_HOME, NKEY_END, NKEY_PGUP, NKEY_PGDN,
     NKEY_INSERT, NKEY_DELETE, NKEY_F1, NKEY_F2, NKEY_F3, NKEY_F4, NKEY_F5, NKEY_F6, NKEY_F7, NKEY_F8,
-    NKEY_F9, NKEY_F10, NKEY_F11, NKEY_F12,
+    NKEY_F9, NKEY_F10, NKEY_F11, NKEY_F12, NKEY_LSHIFT, NKEY_RSHIFT, NKEY_LCTRL, NKEY_RCTRL,
+    NKEY_LALT, NKEY_RALT, NKEY_CAPS, NKEY_SUPER, NKEY_MENU,
 };
 #endif
 #define NMOD_SHIFT 1

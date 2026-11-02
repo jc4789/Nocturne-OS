@@ -81,11 +81,24 @@ n_result n_services_control(uint32_t op, const char *name, const char *argument)
     return r < 0 ? r : reply.result;
 }
 
-n_result n_machine_power(uint32_t op) {
+static n_result machine_power(uint32_t op, uint32_t flags) {
     n_handle channel = n_service_connect("machine");
     if (channel < 0) return channel;
-    struct n_machine_request request = {.op = op};
+    struct n_machine_request request = {.op = op, .flags = flags};
     struct n_machine_reply reply;
+    n_result r = call_on(channel, &request, sizeof request, &reply, sizeof reply, NULL);
+    n_handle_close(channel);
+    return r < 0 ? r : reply.result;
+}
+
+n_result n_machine_power(uint32_t op) { return machine_power(op, 0); }
+n_result n_machine_choose(uint32_t op) { return machine_power(op, N_MACHINE_CHOSEN); }
+
+n_result n_session_end(void) {
+    n_handle channel = n_service_connect("session");
+    if (channel < 0) return channel;
+    struct n_session_request request = {.op = N_SESSION_END};
+    struct n_session_reply reply;
     n_result r = call_on(channel, &request, sizeof request, &reply, sizeof reply, NULL);
     n_handle_close(channel);
     return r < 0 ? r : reply.result;

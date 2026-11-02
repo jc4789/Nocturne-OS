@@ -34,17 +34,21 @@
    dev/acpi.h): they may poll the clock but must not sleep. The device lost
    its state, or was only quiesced (a sleep called off); its PCI configuration
    space is already back (dev/pci.c). They return false when the device did
-   not come back, which the user is told. */
+   not come back.
+
+   Every step is typed state (struct n_power_state, abi.h) that a watch reports: the kernel says
+   no sentence, and the shell (N_CAP_SHELL) tells the user. */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
+#include "abi.h"
 
-/* What holds the windows and tells the user (gui/). Set at its start; a change of power before
-   that has no window to wait for and nobody to tell. */
+/* What holds the windows (gui/). Set at its start; a change of power before that has no window to
+   wait for. */
 struct pm_desktop {
     int (*window_count)(char *top_title, size_t n);
     void (*close_windows)(void);
-    void (*notify)(const char *title, const char *text);
     void (*repaint)(void); /* the screens lost what was on them */
 };
 void pm_set_desktop(const struct pm_desktop *desktop);
@@ -61,14 +65,14 @@ struct pm_device {
     enum pm_stage stage;
     bool (*quiesce)(void *ctx); /* NULL: nothing to stop */
     bool (*resume)(void *ctx);  /* NULL: cannot come back from sleep (no sleep while it is there) */
-    const char *(*refuse)(void *ctx); /* NULL, or why it cannot sleep right now (asked at each sleep) */
+    const char *(*refuse)(void *ctx); /* NULL, or (for the log) why it cannot sleep right now (asked at each sleep) */
     void *ctx;
     bool cold_ok; /* without resume: as it was after the next boot (hibernation) */
     bool down;    /* pm.c: quiesced, not yet resumed */
     struct pm_device *next;
 };
 
-enum pm_action { PM_POWER_OFF, PM_REBOOT, PM_SLEEP, PM_HIBERNATE };
+enum pm_action { PM_POWER_OFF = POWER_OFF, PM_REBOOT = POWER_REBOOT, PM_SLEEP = POWER_SLEEP, PM_HIBERNATE = POWER_HIBERNATE };
 
 void pm_init(void);
 void pm_register(struct pm_device *d); /* any CPU; d stays owned by the driver for good */
@@ -84,6 +88,9 @@ bool pm_stopping(void); /* a power change has passed the point of no return */
 bool pm_can_sleep(void);
 bool pm_can_hibernate(void); /* C: on a disk, room below 1 MiB, every device back after it */
 void pm_sleep_check(void);
+/* SYS_POWER_STATE and SYS_POWER_WATCH (N_CAP_SHELL checked by the caller). */
+int64_t pm_state_syscall(void *out, size_t size);
+int64_t pm_watch_syscall(void);
 /* Interrupts off: every registered device stops, stage by stage. NULL, or the first device that
    did not stop (with stop_at_failure, the ones after it are left running). */
 const char *pm_quiesce_devices(bool stop_at_failure);

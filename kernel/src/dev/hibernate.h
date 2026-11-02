@@ -20,16 +20,19 @@
    The image holds all of RAM, unencrypted: whatever an app had in memory is on the disk until the
    image is restored or dropped. */
 #include <stdbool.h>
+#include "abi.h"
 
-const char *hibernate_blocker(void); /* NULL when the machine could hibernate (devices aside) */
-/* Before the snapshot, with everything running: the image at its size, the memory for it.
-   False with *why set when there is not enough of either. */
-bool hibernate_prepare(const char **why);
+/* N_POWER_REASON_NONE when the machine could hibernate (devices aside); else why not, and *detail
+   the device of a VM's that cannot. */
+enum n_power_reason hibernate_blocker(const char **detail);
+/* Before the snapshot, with everything running: the image at its size, the memory for it. Why not
+   when there is not enough of either. */
+enum n_power_reason hibernate_prepare(void);
 /* wake_sleep's enter(): the snapshot. Interrupts off, APs halted, devices stopped. */
 void hibernate_snapshot(void);
 /* After the snapshot, the devices back, every disk held by the caller (blk_hold): the image to disk.
-   NULL when it is there and valid, else why not. */
-const char *hibernate_write(void);
+   N_POWER_REASON_NONE when it is there and valid, else why not. */
+enum n_power_reason hibernate_write(void);
 /* Back from a restore (restored) or after a hibernation that failed: the memory and the image go. */
 void hibernate_cleanup(bool restored);
 /* Boot, after store_init and before store_start: returns only when there is no image to restore or

@@ -26,9 +26,16 @@ n_result n_services_list(struct n_service_status **out);
 /* N_SERVICES_RESTART か N_SERVICES_STOP。 */
 n_result n_services_control(uint32_t op, const char *name, const char *argument);
 
+/* ---- セッション ---- */
+/* 呼ぶ側のセッションを終え、ログインの窓へ戻る。 */
+n_result n_session_end(void);
+
 /* ---- 機械 ---- */
 /* N_MACHINE_POWER_OFF か N_MACHINE_REBOOT。戻るのは失敗のときだけ。 */
 n_result n_machine_power(uint32_t op);
+/* 利用者が選んだ電源の変更（N_MACHINE_POWER_OFF、N_MACHINE_REBOOT、N_MACHINE_SLEEP、N_MACHINE_HIBERNATE）：
+   すぐ戻り、進み方はシェルが n_power_state で読む。 */
+n_result n_machine_choose(uint32_t op);
 /* 画面の画素の新しい配列（free する）。 */
 n_result n_machine_screen(uint32_t **pixels, int *width, int *height);
 

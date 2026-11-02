@@ -76,7 +76,7 @@ static const struct declared_service declared[] = {
      CAPS(N_CAP_POWER, N_CAP_PCI_CLAIM, N_CAP_SCREEN_READ, N_CAP_IDENTITY_GRANT), .needs = NAMES("accounts"),
      .clients_from = CLIENTS_NONE},
     {.name = "session", .program = "session", .cls = N_CLASS_SYSTEM, .at_boot = true, .console = true,
-     CAPS(N_CAP_IDENTITY_GRANT), .needs = NAMES("accounts", "tests"),
+     CAPS(N_CAP_IDENTITY_GRANT, N_CAP_SHELL), .needs = NAMES("accounts", "tests"),
      .on_failure = {5, 1000, 60000}, .clients_from = N_CLASS_USER},
 };
 #define DECLARED (sizeof declared / sizeof *declared)
