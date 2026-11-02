@@ -1049,7 +1049,7 @@ static int put_any(struct put *p, uint64_t folder, const char *name, size_t n, c
 }
 
 /* The folder p names, made (with its parents) when missing, with attributes at least. */
-static int folder_make(struct volume *v, const struct path *p, uint16_t attributes) {
+static int folder_make(struct volume *v, const struct path *p, uint16_t attributes, int64_t owner) {
     uint64_t folder;
     struct ns_entry e;
     struct store_record rec;
@@ -1058,12 +1058,18 @@ static int folder_make(struct volume *v, const struct path *p, uint16_t attribut
     if (r < 0) return r;
     const char *name = p->part[p->count - 1].name;
     size_t n = p->part[p->count - 1].n;
-    if ((r = ns_find(v, folder, name, n, &e)) == -N_ERR_NOT_FOUND)
-        return ns_create(v, folder, name, n, STORE_FOLDER, attributes, 0, host_now(), &e.id, NULL);
-    if (r < 0 || (r = ns_record(v, e.id, &rec, NULL)) < 0) return r;
-    if (rec.kind != STORE_FOLDER) return -N_ERR_NOT_FOLDER;
-    struct ns_amend a = {.fields = NS_ATTRIBUTES, .attributes = attributes}; /* there already: it gets them */
-    return ns_record_amend(v, e.id, &a);
+    if ((r = ns_find(v, folder, name, n, &e)) == -N_ERR_NOT_FOUND) {
+        if ((r = ns_create(v, folder, name, n, STORE_FOLDER, attributes, 0, host_now(), &e.id, NULL)) < 0) return r;
+    } else if (r < 0 || (r = ns_record(v, e.id, &rec, NULL)) < 0) {
+        return r;
+    } else if (rec.kind != STORE_FOLDER) {
+        return -N_ERR_NOT_FOLDER;
+    } else {
+        struct ns_amend a = {.fields = NS_ATTRIBUTES, .attributes = attributes}; /* there already: it gets them */
+        if ((r = ns_record_amend(v, e.id, &a)) < 0) return r;
+    }
+    if (owner < 0) return 0;
+    return ns_record_amend(v, e.id, &(struct ns_amend){.fields = NS_OWNER, .owner = (uint32_t)owner});
 }
 
 /* The entry at p and everything in it; nothing when it is not there. */
@@ -1251,14 +1257,17 @@ static long check_volume(struct volume *v, bool quiet) {
                     (unsigned long long)c.links[i].folder, (unsigned long long)s->rec.parent);
     }
     if (!seen_find(&c, STORE_ID_ROOT)) problem(&c, "there is no root folder");
+    if (!seen_find(&c, STORE_ID_REGIONS)) problem(&c, "there is no folder of the private regions");
     uint64_t documents = 0, folders = 0, bytes = 0;
     for (size_t i = 0; i < c.nrecords; i++) {
         struct seen *s = &c.records[i];
-        unsigned want = s->id == STORE_ID_ROOT || s->id == STORE_ID_FOLD ? 0 : 1;
+        unsigned want = s->id == STORE_ID_ROOT || s->id == STORE_ID_FOLD || s->id == STORE_ID_REGIONS ? 0 : 1;
         if (s->names != want) problem(&c, "%llu is named %u times", (unsigned long long)s->id, s->names);
         if (s->id == STORE_ID_ROOT && (s->rec.kind != STORE_FOLDER || s->rec.parent != STORE_ID_ROOT))
             problem(&c, "the root is not a folder of its own");
         if (s->id == STORE_ID_FOLD && s->rec.kind != STORE_DOCUMENT) problem(&c, "the case folding is no document");
+        if (s->id == STORE_ID_REGIONS && (s->rec.kind != STORE_FOLDER || !(s->rec.attributes & STORE_PRIVATE)))
+            problem(&c, "the private regions are not in a private folder");
         if (s->rec.kind == STORE_DOCUMENT) {
             documents++, bytes += s->rec.size;
             bool small = s->rec.flags & STORE_INLINE;
@@ -1575,9 +1584,8 @@ static void op_update(struct test *t, struct mnode *doc) {
 
 static void op_create(struct test *t, uint16_t kind) {
     struct mnode *folder = pick(t, STORE_FOLDER, true);
-    /* now and then a folder of the system's, or one the apps do not see: what goes into it has that too */
-    static const uint16_t gives[] = {STORE_SYSTEM, STORE_PRIVATE, STORE_SYSTEM | STORE_PRIVATE};
-    uint16_t own = kind == STORE_FOLDER && below(5) == 0 ? gives[below(3)] : 0;
+    /* now and then a folder the apps do not see: what goes into it is hidden too */
+    uint16_t own = kind == STORE_FOLDER && below(5) == 0 ? STORE_PRIVATE : 0;
     struct mnode m = {.kind = kind, .attributes = (uint16_t)(own | (folder->attributes & NS_GIVEN))};
     int want = random_name(t, m.name, &m.n, m.key, &m.klen);
     if (!want && mnode_kid(folder, m.key, m.klen)) want = -N_ERR_EXISTS;
@@ -2292,7 +2300,6 @@ static int usage(void) {
 }
 
 static uint16_t attribute_of(const char *word) {
-    if (!strcmp(word, "--system")) return STORE_SYSTEM;
     if (!strcmp(word, "--private")) return STORE_PRIVATE;
     fprintf(stderr, "store: what is %s?\n", word);
     exit(2);
@@ -2306,7 +2313,7 @@ static uint16_t attributes_of(int argc, char **argv, int from) {
 
 /* Every line of list: a path on C:, a tab, the host file or folder put there ("-" for a folder
    made empty, "!" to remove the entry there and everything in it), and, after another tab, its
-   attributes ("--system ..."). Lines starting with '#' are notes. */
+   attributes ("--private", and for a folder "--owner=<user>"). Lines starting with '#' are notes. */
 static int fill(struct volume *v, const char *list) {
     HANDLE f = host_open(list, HOST_READ);
     if (f == INVALID_HANDLE_VALUE) return -N_ERR_NOT_FOUND;
@@ -2338,8 +2345,12 @@ static int fill(struct volume *v, const char *list) {
             break;
         }
         uint16_t a = 0;
-        for (char *w = words ? strtok(words, " ") : NULL; w; w = strtok(NULL, " ")) a |= attribute_of(w);
-        r = !strcmp(host, "-") ? folder_make(v, &p, a) : !strcmp(host, "!") ? remove_at(v, &p) : put_at(&put, &p, host, a);
+        int64_t owner = -1;
+        for (char *w = words ? strtok(words, " ") : NULL; w; w = strtok(NULL, " ")) {
+            if (!strncmp(w, "--owner=", 8)) owner = strtoll(w + 8, NULL, 10);
+            else a |= attribute_of(w);
+        }
+        r = !strcmp(host, "-") ? folder_make(v, &p, a, owner) : !strcmp(host, "!") ? remove_at(v, &p) : put_at(&put, &p, host, a);
         if (r < 0)
             fprintf(stderr, "store: %s:%u: %s: %s\n", list, at, line, error_name(r));
         path_free(&env, &p);
@@ -2398,7 +2409,7 @@ static int run(int argc, char **argv) {
         return 2;
     }
     if (!strcmp(cmd, "folder")) {
-        r = folder_make(v, &p, attributes_of(argc, argv, 4));
+        r = folder_make(v, &p, attributes_of(argc, argv, 4), -1);
     } else if (!strcmp(cmd, "remove")) {
         if (argc != 4) return usage();
         r = remove_at(v, &p);
@@ -2421,10 +2432,9 @@ static int run(int argc, char **argv) {
             for (r = ns_next(v, e.id, NULL, &kid); r >= 0; r = ns_next(v, e.id, &prev, &kid)) {
                 struct store_record kr;
                 if ((r = ns_record(v, kid.id, &kr, NULL)) < 0) break;
-                printf("%s %12llu %c%c%c %.*s\n", kr.kind == STORE_FOLDER ? "folder  " : "document",
-                       (unsigned long long)kr.size, kr.attributes & STORE_SYSTEM ? 's' : '-',
-                       kr.attributes & STORE_TEMPORARY ? 't' : '-', kr.attributes & STORE_PRIVATE ? 'p' : '-',
-                       (int)kid.n, kid.name);
+                printf("%s %12llu %c%c %8u %.*s\n", kr.kind == STORE_FOLDER ? "folder  " : "document",
+                       (unsigned long long)kr.size, kr.attributes & STORE_TEMPORARY ? 't' : '-',
+                       kr.attributes & STORE_PRIVATE ? 'p' : '-', kr.owner, (int)kid.n, kid.name);
                 prev = kid;
             }
             if (r == -N_ERR_NOT_FOUND) r = 0;

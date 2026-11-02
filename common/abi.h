@@ -147,7 +147,18 @@ enum {
     SYS_WATCH_TAKE = 207,     /* (watch): the changes since its last take (0: none) */
     SYS_ENTRY_WATCH,          /* (path, N_WATCH_NAME or N_WATCH_FOLDER): a watch on C: (§3) */
     SYS_AUDIO_OUTPUT_WATCH,   /* (): a watch on what SYS_AUDIO_OUTPUT reports (§9) */
-    SYS_MAX = 210          /* above every number (what syscallfuzz tries) */
+    SYS_IDENTITY_SELF,        /* (struct n_identity *out) */
+    SYS_CHANNEL_PEER,         /* (channel, struct n_identity *out) */
+    SYS_CAP_DERIVE,           /* (cap, enum n_cap) -> handle */
+    SYS_SERVICE_REGISTER,     /* (N_CAP_SERVICE_ROOT の cap) -> 接続の要求を受ける channel */
+    SYS_SERVICE_CONNECT,      /* (name, name_len) -> channel */
+    SYS_STORE_PRIVATE_OPEN,   /* (N_CAP_STORE_PRIVATE の cap, region, ...) -> document */
+    SYS_SETTINGS_APPLY,       /* (N_CAP_SETTINGS_APPLY の cap, domain, key, value, len) */
+    SYS_SETTINGS_EFFECTIVE,   /* (domain, key, out, cap): 今の値のバイト数（§12） */
+    SYS_SETTINGS_DESCRIBE,    /* (domain, key, struct n_setting_desc *out)（§12） */
+    SYS_SETTINGS_WATCH,       /* (domain): その領域の今の値の watch（§12） */
+    SYS_ENTRY_SET_OWNER,      /* (path, user): C: の名前の持ち主の利用者。admin 以上（§3） */
+    SYS_MAX                   /* above every number (what syscallfuzz tries) */
 };
 
 /* ---- native handles ---- */

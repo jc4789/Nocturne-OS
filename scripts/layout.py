@@ -75,30 +75,31 @@ def size_of(host):
 def layout(firmware_manifest, system_only):
     """(path on C:, host file or folder, "-" for an empty folder or "!" to remove what is there,
     attributes) in order: a folder's attributes come before what goes into it."""
-    system = "--system"
     apps = sorted({APPS[program.name] for program in PROGRAMS.iterdir() if program.name in APPS})
     entries = [("C:\\Nocturne", "!", "")] + [(f"C:\\Programs\\{app}", "!", "") for app in apps]
     entries += [
-        ("C:\\Nocturne", "rootfs/Nocturne", system),
-        ("C:\\Nocturne\\Licenses", str(BUILD / "licenses"), system),
-        ("C:\\Nocturne\\SDK", str(BUILD / "sdk"), system),
-        ("C:\\Nocturne\\Certificates\\ca-bundle.crt", "third_party/ca/ca-bundle.crt", system),
-        ("C:\\Nocturne\\System", "-", system),
+        ("C:\\Nocturne", "rootfs/Nocturne", ""),
+        ("C:\\Nocturne\\Licenses", str(BUILD / "licenses"), ""),
+        ("C:\\Nocturne\\SDK", str(BUILD / "sdk"), ""),
+        ("C:\\Nocturne\\Certificates\\ca-bundle.crt", "third_party/ca/ca-bundle.crt", ""),
+        ("C:\\Nocturne\\System", "-", ""),
         ("C:\\Programs", "-", ""),
     ]
-    entries += [(f"C:\\Programs\\{app}", "-", system) for app in apps]
+    entries += [(f"C:\\Programs\\{app}", "-", "") for app in apps]
     for program in sorted(PROGRAMS.iterdir()):
         app = APPS.get(program.name)
         place = f"C:\\Programs\\{app}" if app else "C:\\Nocturne\\System"
-        entries.append((f"{place}\\{program.name}", str(program), system))
+        entries.append((f"{place}\\{program.name}", str(program), ""))
     if firmware_manifest:
         state = json.loads(Path(firmware_manifest).read_text(encoding="utf-8"))
         for name, item in sorted(state["files"].items()):
             if digest(item["source"]) != item["sha256"]:
                 raise SystemExit("firmware changed after it was chosen: " + item["source"])
-            entries.append((f"C:\\Nocturne\\Firmware\\NVIDIA\\{state['version']}\\{name}", item["source"], system))
+            entries.append((f"C:\\Nocturne\\Firmware\\NVIDIA\\{state['version']}\\{name}", item["source"], ""))
     if system_only:
         return entries
+    # the user a volume is made with owns their folder, and what goes into it from here on
+    entries += [("C:\\Users", "-", ""), (USER, "-", "--owner=1")]
     entries += [("C:\\Users", "rootfs/Users", ""), (USER + "\\Music", str(BUILD / "sounds"), "")]
     entries += [(f"{USER}\\{name}", "-", "") for name in ("Desktop", "Downloads", "Pictures", "Videos")]
     if Path("diskfiles").is_dir():
