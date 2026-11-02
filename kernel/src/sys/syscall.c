@@ -33,6 +33,11 @@
 #include "net/net.h"
 #include "dev/pm.h"
 #include "abi.h"
+#include "authority_abi.h"
+#include "settings_abi.h"
+#include "sys/settings.h"
+/* sys/object.c: whether the handle is a capability that gives want. */
+
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
 
 _Static_assert(sizeof(struct n_gpu_blit) == 32, "GPU blit ABI");
@@ -533,6 +538,26 @@ static int64_t sys_document_open(const char *upath, int access) {
     return r < 0 ? r : handle_install(h);
 }
 
+/* A private region (fs/store.h): whoever holds the right, by its number and its user's (0: the
+   machine's). access 0 is N_DOCUMENT_EDIT. */
+static int64_t sys_store_private_open(int cap, uint64_t region, uint64_t user, int access) {
+    int r = cap_check(cap, N_CAP_STORE_PRIVATE);
+    if (r < 0) return r;
+    if (region > UINT32_MAX || user > UINT32_MAX) return -N_ERR_INVALID;
+    struct handle *h;
+    r = store_private_open((uint32_t)region, (uint32_t)user, access ? access : N_DOCUMENT_EDIT, &h);
+    return r < 0 ? r : handle_install(h);
+}
+
+static int64_t sys_entry_set_owner(const char *upath, uint32_t owner) {
+    char *path;
+    int r = user_string(upath, &path);
+    if (r < 0) return r;
+    r = store_entry_set_owner(path, owner, true);
+    kfree(path);
+    return r;
+}
+
 static int64_t sys_document_io(int h, uint64_t off, void *buf, size_t n, bool write) {
     struct handle *d = handle_get(h);
     if (!d) return -N_ERR_NO_HANDLE;
@@ -920,18 +945,10 @@ static int64_t sys_audio_flush(int h) {
     return r;
 }
 
-/* The sound's way out (struct n_audio_output): the volume and muting set as set says, then all of
-   it read back. */
-static int64_t sys_audio_output(struct n_audio_output *uio, uint32_t set) {
+/* The sound's way out as it stands (struct n_audio_output). The volume and muting change by
+   SYS_SETTINGS_APPLY. */
+static int64_t sys_audio_output(struct n_audio_output *uio) {
     struct n_audio_output io = {0};
-    if (set & ~(N_AUDIO_SET_VOLUME | N_AUDIO_SET_MUTED)) return -N_ERR_INVALID;
-    if (set && copy_from_user(&io, uio, sizeof io)) return -N_ERR_BAD_ADDRESS;
-    if (((set & N_AUDIO_SET_VOLUME) && (io.volume < 0 || io.volume > 100)) ||
-        ((set & N_AUDIO_SET_MUTED) && io.muted > 1))
-        return -N_ERR_INVALID;
-    if (set & N_AUDIO_SET_VOLUME) audio_set_volume(io.volume);
-    if (set & N_AUDIO_SET_MUTED) audio_set_muted(io.muted != 0);
-    memset(&io, 0, sizeof io);
     io.volume = audio_volume();
     io.muted = audio_muted();
     const char *device = audio_output();
@@ -1278,7 +1295,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_AUDIO_OPEN: ret = sys_audio_open(); break;
     case SYS_AUDIO_SUBMIT: ret = sys_audio_submit((int)a, (const void *)b, c, (uint32_t)d); break;
     case SYS_AUDIO_STATUS: ret = sys_audio_status((int)a, (struct n_audio_status *)b); break;
-    case SYS_AUDIO_OUTPUT: ret = sys_audio_output((struct n_audio_output *)a, (uint32_t)b); break;
+    case SYS_AUDIO_OUTPUT: ret = sys_audio_output((struct n_audio_output *)a); break;
     case SYS_AUDIO_OUTPUT_WATCH: ret = audio_output_watch(); break;
     case SYS_RANDOM: ret = sys_random((void *)a, b); break;
     case SYS_WATCH_TAKE: ret = watch_take((int)a); break;
@@ -1288,6 +1305,12 @@ void syscall_dispatch(struct regs *r) {
     case SYS_PAGER_SUPPLY: ret = sys_pager_supply((int)a, (const struct n_pager_supply *)b, c); break;
     case SYS_PAGER_REVOKE: ret = sys_pager_revoke((int)a, b, c, (uint32_t)d); break;
     case SYS_PAGER_FAIL: ret = sys_pager_fail((int)a, b, c); break;
+    case SYS_STORE_PRIVATE_OPEN: ret = sys_store_private_open((int)a, b, c, (int)d); break;
+    case SYS_SETTINGS_APPLY: ret = settings_syscall_apply((int)a, (uint32_t)b, (uint32_t)c, (const void *)d, e); break;
+    case SYS_SETTINGS_EFFECTIVE: ret = settings_syscall_effective((uint32_t)a, (uint32_t)b, (void *)c, d); break;
+    case SYS_SETTINGS_DESCRIBE: ret = settings_syscall_describe((uint32_t)a, (uint32_t)b, (void *)c); break;
+    case SYS_SETTINGS_WATCH: ret = settings_watch((uint32_t)a); break;
+    case SYS_ENTRY_SET_OWNER: ret = sys_entry_set_owner((const char *)a, (uint32_t)b); break;
     default:
         if (r->rax >= SYS_WIN_CREATE && r->rax < SYS_NET_INFO) ret = wm_syscall((int)r->rax, a, b, c, d, e);
         else if (r->rax >= SYS_NET_INFO && r->rax < SYS_NET_LIMIT) ret = net_syscall((int)r->rax, a, b, c, d, e);

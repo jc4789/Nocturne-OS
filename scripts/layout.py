@@ -12,7 +12,7 @@ C:\\Nocturne holds the system (rootfs/Nocturne, the licences, the SDK, the firmw
 certificates and every system program in System); C:\\Programs a folder for each desktop app, next
 to the apps the user puts there. C:\\Nocturne\\NewUser is what a new user's folder starts with
 (rootfs/NewUser, the music made by mksounds.py, diskfiles/): the accounts service makes C:\\Users\\<name>
-and copies it there. The system's part is protected (--system) and replaced whole by a fill: what an
+and copies it there. The system's part (--system) is replaced whole by a fill: what an
 earlier one put there goes first, so a disk keeps its users' files and apps when its system is
 brought up to date. The kernel starts C:\\Nocturne\\System\\services first (user/apps/services.c).
 """
@@ -76,32 +76,31 @@ def size_of(host):
 def layout(firmware_manifest, system_only):
     """(path on C:, host file or folder, "-" for an empty folder or "!" to remove what is there,
     attributes) in order: a folder's attributes come before what goes into it."""
-    system = "--system"
     apps = sorted({APPS[program.name] for program in PROGRAMS.iterdir() if program.name in APPS})
     entries = [("C:\\Nocturne", "!", "")] + [(f"C:\\Programs\\{app}", "!", "") for app in apps]
     entries += [
-        ("C:\\Nocturne", "rootfs/Nocturne", system),
-        ("C:\\Nocturne\\Logs", "-", system),
-        ("C:\\Nocturne\\Licenses", str(BUILD / "licenses"), system),
-        ("C:\\Nocturne\\SDK", str(BUILD / "sdk"), system),
-        ("C:\\Nocturne\\Certificates\\ca-bundle.crt", "third_party/ca/ca-bundle.crt", system),
-        ("C:\\Nocturne\\System", "-", system),
+        ("C:\\Nocturne", "rootfs/Nocturne", ""),
+        ("C:\\Nocturne\\Logs", "-", ""),
+        ("C:\\Nocturne\\Licenses", str(BUILD / "licenses"), ""),
+        ("C:\\Nocturne\\SDK", str(BUILD / "sdk"), ""),
+        ("C:\\Nocturne\\Certificates\\ca-bundle.crt", "third_party/ca/ca-bundle.crt", ""),
+        ("C:\\Nocturne\\System", "-", ""),
         ("C:\\Programs", "-", ""),
     ]
-    entries += [(f"C:\\Programs\\{app}", "-", system) for app in apps]
+    entries += [(f"C:\\Programs\\{app}", "-", "") for app in apps]
     for program in sorted(PROGRAMS.iterdir()):
         app = APPS.get(program.name)
         place = f"C:\\Programs\\{app}" if app else "C:\\Nocturne\\System"
-        entries.append((f"{place}\\{program.name}", str(program), system))
+        entries.append((f"{place}\\{program.name}", str(program), ""))
     if firmware_manifest:
         state = json.loads(Path(firmware_manifest).read_text(encoding="utf-8"))
         for name, item in sorted(state["files"].items()):
             if digest(item["source"]) != item["sha256"]:
                 raise SystemExit("firmware changed after it was chosen: " + item["source"])
-            entries.append((f"C:\\Nocturne\\Firmware\\NVIDIA\\{state['version']}\\{name}", item["source"], system))
-    entries += [(NEW_USER, "rootfs/NewUser", system), (NEW_USER + "\\Music", str(BUILD / "sounds"), system)]
+            entries.append((f"C:\\Nocturne\\Firmware\\NVIDIA\\{state['version']}\\{name}", item["source"], ""))
+    entries += [(NEW_USER, "rootfs/NewUser", ""), (NEW_USER + "\\Music", str(BUILD / "sounds"), "")]
     if Path("diskfiles").is_dir():
-        entries.append((NEW_USER, "diskfiles", system))
+        entries.append((NEW_USER, "diskfiles", ""))
     if system_only:
         return entries
     return entries + [("C:\\Users", "-", "")]

@@ -37,6 +37,17 @@
    not come back, which the user is told. */
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
+
+/* What holds the windows and tells the user (gui/). Set at its start; a change of power before
+   that has no window to wait for and nobody to tell. */
+struct pm_desktop {
+    int (*window_count)(char *top_title, size_t n);
+    void (*close_windows)(void);
+    void (*notify)(const char *title, const char *text);
+    void (*repaint)(void); /* the screens lost what was on them */
+};
+void pm_set_desktop(const struct pm_desktop *desktop);
 
 enum pm_stage {
     PM_STAGE_IO,      /* network cards, audio, input, display */

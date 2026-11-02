@@ -47,8 +47,8 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
 
 ### カーネル（`kernel/`、C とアセンブリーで約 43,000 行）
 
-- **起動**：UEFI から Limine を経て、上位半分の 64 ビットカーネルへ。BIOS 起動はありません。起動メニューには
-  デスクトップと文字コンソールだけ（`nogui`）の 2 項目があり、解像度は持ちません（モニターの EDID が決めます）。
+- **起動**：UEFI から Limine を経て、上位半分の 64 ビットカーネルへ。BIOS 起動はありません。起動の項目は
+  一つで、解像度は持ちません（モニターの EDID が決めます）。起動より前の設定は起動の記録 `settings.rec` にあります。
 - **CPU**：CPU の数は機械が持つだけで、上限の定数はありません。どの CPU も同じ役目で、自分の実行キューと
   idle を持ち、システムコール・例外・割り込みは起きた CPU で処理します。下限は Zen 4（x2APIC、PCID、AVX-512 など）。
   - スケジューラー（`sys/sched.c`）：CPU ごとのキュー。級は二つで、実時間（固定の優先度、周期ごとの予算）と
@@ -114,7 +114,7 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
 
 - **ハンドル**：資源はすべて種類付きのハンドルです（文書、フォルダー、チャンネル、窓、共有ページ、アプリ、
   イベント、装置、接続）。失敗は負の `N_ERR_*` で返り、`n_result_text` で説明を得られます。
-- **文書とフォルダー**：いつも完全なパス（`C:\Users\User\a.txt`。`\` と `/` は同じで、`\a` は `C:\a`）で扱います。
+- **文書とフォルダー**：いつも完全なパス（`C:\Users\<名前>\a.txt`。`\` と `/` は同じで、`\a` は `C:\a`）で扱います。
   名前は大文字と小文字を区別せず、書いたとおりに残ります。カーネルには作業フォルダーも読み書き位置もありません。
   シェルの現在のフォルダーは設定 `FOLDER=` でアプリへ渡ります。文書全体の読込み・原子的な保存・追記、
   位置を指定した読み書き、排他の取得があります。
@@ -362,7 +362,7 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
 | Shift+PgUp / PgDn、ホイール | 端末のスクロールバック |
 | Ctrl+C | 実行中のコマンドを止める |
 
-端末とアプリはユーザーのフォルダー `C:\Users\User` で始まります。`Documents` には見本のファイルがあります。
+端末とアプリはユーザーのフォルダー `C:\Users\<名前>` で始まります。`Documents` には見本のファイルがあります。
 `sh Documents\hello.sh` を試してみてください。`Documents\JavaScript` には `js` の見本があります。
 
 ### ドライブ C: と保存
@@ -376,12 +376,12 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
 - `C:\Nocturne`：システム（`System` のプログラム、`Fonts`、`SDK`、`Licenses` など）。アプリは読めますが、変えられません。
 - `C:\Programs`：デスクトップのアプリ（`Browser`、`Notepad` など、アプリごとのフォルダー）。システムと一緒に入る
   アプリのフォルダーは `C:\Nocturne` と同じく変えられません。自分のアプリのフォルダーはここに作れます。
-- `C:\Users\User`：ユーザーのファイル（`Documents`、`Desktop`、`Downloads`、`Music`、`Pictures`、`Videos`）。
+- `C:\Users\<名前>`：ユーザーのファイル（`Documents`、`Desktop`、`Downloads`、`Music`、`Pictures`、`Videos`）。
   アプリのデータは `AppData\<アプリ>`、一時ファイルは `AppData\Temp`（起動のたびに空になります）。
 - 書き込んだ内容は、最初の変更から約 5 秒後か、アプリが保存したときにコミットされます（文書を閉じただけでは
   早まりません）。書込みの途中で電源が切れても、最後のコミットまでの内容が残ります。
 - カーネルのログ（`[browser log]` や NVIDIA ドライバーの行も含む）は、起動のたびに
-  `C:\Users\User\AppData\Nocturne\System.log` へ書かれます。前回の起動のものは `System-previous.log` です。
+  `C:\Nocturne\Logs\System.log` へ書かれます。前回の起動のものは `System-previous.log` です。
   フリーズや電源断では最後の数秒が残らないことがあります。カーネルが止まった画面には、ログの最後の行が出ます。
 
 保存先：
@@ -391,9 +391,9 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
 - **実機**：USB メモリーの C:。
 - ライブ ISO の C: はメモリー上にあり、変更は電源を切ると消えます。
 
-ホストからは `build\host\store.exe` で C: を見られます（`store list build\run.img C:\Users\User`、`store get`、`store put`）。
+ホストからは `build\host\store.exe` で C: を見られます（`store list build\run.img C:\Users\<名前>`、`store get`、`store put`）。
 Windows では円盤そのもの（`\\.\PhysicalDrive<番号>`、管理者として）も開けます。実機で使った USB メモリーのログは
-`store get \\.\PhysicalDrive<番号> C:\Users\User\AppData\Nocturne\System-previous.log <保存先>` で取り出せます。
+`store get \\.\PhysicalDrive<番号> C:\Nocturne\Logs\System-previous.log <保存先>` で取り出せます。
 `list`、`get`、`check` は読むだけで、円盤へは書きません。
 
 シェルは名前だけのコマンドを `C:\Nocturne\System` と、`C:\Programs` の各フォルダーから探します（`PATH` はありません）。
@@ -411,7 +411,7 @@ Windows では円盤そのもの（`\\.\PhysicalDrive<番号>`、管理者とし
 - **メディアプレーヤー**：MP3、FLAC、AAC、Ogg（Vorbis、Opus）の音声と、MP4・WebM・AVI・MOV の動画
   （H.264、HEVC、VP8、VP9 など）を FFmpeg で再生します。ファイルで音声・動画をダブルクリックすると開きます。
   Space で再生・一時停止、←→ で 5 秒移動、Ctrl+O でファイルや URL を開きます。
-- **音楽**：`C:\Users\User\Music` に Nocturne 用の短い曲が 3 つあります（ビルド時に `scripts/mksounds.py` が合成）。
+- **音楽**：`C:\Users\<名前>\Music` に Nocturne 用の短い曲が 3 つあります（ビルド時に `scripts/mksounds.py` が合成）。
 - **ピアノ**：マウスかキーボードで 2 オクターブを弾けます（下のオクターブは Z S X D C V G B H N J M、
   上は Q 2 W 3 E R 5 T 6 Y 7 U I）。Tab で 3 種類の音色、←→ でオクターブを変えます。
 - スネーク、テトリス、マインスイーパーには効果音があります。
@@ -441,7 +441,7 @@ Hyper-V にはサウンドカードがないので、拡張セッションが VM
 ping -c 3 example.com
 host example.com
 fetch -i http://example.com
-fetch -o C:\Users\User\Downloads\1mb.zip http://speedtest.tele2.net/1MB.zip
+fetch -o C:\Users\<名前>\Downloads\1mb.zip http://speedtest.tele2.net/1MB.zip
 ```
 
 - **TCP/IP**（`kernel/src/net/`）：Ethernet、ARP、IPv4、ICMP、UDP、DHCP、DNS、TCP。
@@ -618,7 +618,7 @@ C を書いて `tcc` でコンパイルし、実行し、壊れたところを�
 
 ```
 agent                                   # 対話（/help で命令の一覧）
-agent write a tetris clone in C:\Users\User\Documents\tetris and install it as C:\Programs\Tet\tet
+agent write a tetris clone in C:\Users\<名前>\Documents\tetris and install it as C:\Programs\Tet\tet
 agent -r                                # 前回の続き
 ```
 

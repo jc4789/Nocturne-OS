@@ -4,8 +4,8 @@
 #include <string.h>
 #include "nocturne_services.h"
 
-n_handle n_store_private_open(n_handle cap, const char *region) {
-    return (n_handle)__syscall(SYS_STORE_PRIVATE_OPEN, cap, (long)region, strlen(region), 0, 0);
+n_handle n_store_private_open(n_handle cap, uint32_t region, uint32_t user, int access) {
+    return (n_handle)__syscall(SYS_STORE_PRIVATE_OPEN, cap, region, user, access, 0);
 }
 
 n_result n_service_ready(void) {

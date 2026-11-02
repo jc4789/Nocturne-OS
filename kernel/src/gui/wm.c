@@ -42,7 +42,7 @@
 #include "sys/prof.h"
 #include "mm/shared.h"
 #include "sys/syscall.h"
-#include "sys/keep.h"
+#include "sys/settings.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
 #include "sys/watch.h"
@@ -408,7 +408,7 @@ struct wscreen {
      parts and states, the remote viewers, the clipboard. A sleeping lock, any CPU, held briefly:
      never while a frame is drawn or written, nor across a copy of a window's pixels. Reentrant: a
      window handle's last close comes from inside a WM call. gui/screenmode.c's lock,
-     dev/pciuser.c's screen lock and sys/keep.c's write lock come before it;
+     and dev/pciuser.c's screen lock come before it;
    - a surface's lock (the kernel's copy of a window presented by rectangles);
    - then one of a window's ev_lock and in_lock (the input ring): spinlocks, never two of them at
      once;
@@ -434,8 +434,7 @@ static void desk_wake(void) {
 
 /* The user's (struct desktop_settings): pointer speed with its leftover quarter steps, and smooth
    gradients as the user wants them; the desktop thread applies them while screen 0 takes them
-   (fb_dither_able). Kept in the user's AppData\Nocturne\Desktop.conf (desktop_keep, sys/keep.c).
-   Under wm_lock. */
+   (fb_dither_able). Told by sys/settings.h, and not saved here. Under wm_lock. */
 static int pointer_speed, pointer_rest_x, pointer_rest_y;
 static bool deep_wanted;
 /* What SYS_SCREEN_INFO reports changed: its watches (SCREEN_WATCH) hear of it. From wm_init on;
@@ -1168,58 +1167,53 @@ void wm_screen_info_changed(void) {
     if (screen_watchable) watched_changed(&screen_watched);
 }
 
-/* ---- the desktop's settings, kept in Desktop.conf ---- */
+/* ---- the desktop's settings (N_DOMAIN_INPUT, N_DOMAIN_WINDOW) ---- */
 
-static bool desktop_line(const char *key, const char *value, bool apply);
-static size_t desktop_text(char *out, size_t cap);
-static struct keep desktop_keep = {.name = "Desktop", .line = desktop_line, .text = desktop_text};
 
-/* The pointer's speed (-2 to 2) and smooth gradients wanted, wm_lock held; whoever changes them
-   (a program, the document read back), the watches hear of it and the change is kept. */
+/* The pointer's speed (-2 to 2) and smooth gradients wanted, wm_lock held: the watches hear of it. */
 static void desktop_settings_put(int speed, bool smooth) {
     if (speed == pointer_speed && smooth == deep_wanted) return;
-    if (speed != pointer_speed) pointer_rest_x = pointer_rest_y = 0;
+    if (speed != pointer_speed) {
+        pointer_rest_x = pointer_rest_y = 0;
+        settings_changed(N_DOMAIN_INPUT);
+    }
+    if (smooth != deep_wanted) settings_changed(N_DOMAIN_WINDOW);
     pointer_speed = speed;
     deep_wanted = smooth;
     desk_wake();
-    keep_changed(&desktop_keep);
     wm_screen_info_changed();
 }
 
-/* Desktop.conf: pointer_speed=<-2..2>, smooth_gradients=on|off. deep_colour is what an older
-   system called smooth gradients; pointer_y and refresh it kept too, and this one has them no
-   more. */
-static bool desktop_line(const char *key, const char *value, bool apply) {
-    int64_t v;
-    bool on = !strcmp(value, "on"), off = !strcmp(value, "off");
-    if (!strcmp(key, "pointer_speed")) {
-        if (apply && keep_number(value, -2, 2, &v)) {
-            wm_lock();
-            desktop_settings_put((int)v, deep_wanted);
-            wm_unlock();
-        }
-        return true;
-    }
-    if (!strcmp(key, "smooth_gradients") || !strcmp(key, "deep_colour")) {
-        if (apply && (on || off)) {
-            wm_lock();
-            desktop_settings_put(pointer_speed, on);
-            wm_unlock();
-        }
-        return true;
-    }
-    return !strcmp(key, "pointer_y") || !strcmp(key, "refresh");
+int pointer_speed_setting_put(uint32_t key, const void *value) {
+    int32_t v;
+    memcpy(&v, value, sizeof v);
+    wm_lock();
+    desktop_settings_put(v, deep_wanted);
+    wm_unlock();
+    return 0;
 }
 
-static size_t desktop_text(char *out, size_t cap) {
+int64_t pointer_speed_setting_get(uint32_t key, void *out, size_t cap) {
     wm_lock();
-    int speed = pointer_speed;
-    bool smooth = deep_wanted;
+    int v = pointer_speed;
     wm_unlock();
-    size_t n = 0;
-    keep_put(out, cap, &n, "# The desktop: the pointer's speed and smooth gradients. Nocturne keeps this: change them in Settings.\n");
-    keep_put(out, cap, &n, "pointer_speed=%d\nsmooth_gradients=%s\n", speed, smooth ? "on" : "off");
-    return n;
+    return setting_int(out, cap, v);
+}
+
+int smooth_gradients_setting_put(uint32_t key, const void *value) {
+    int32_t v;
+    memcpy(&v, value, sizeof v);
+    wm_lock();
+    desktop_settings_put(pointer_speed, v != 0);
+    wm_unlock();
+    return 0;
+}
+
+int64_t smooth_gradients_setting_get(uint32_t key, void *out, size_t cap) {
+    wm_lock();
+    bool v = deep_wanted;
+    wm_unlock();
+    return setting_int(out, cap, v);
 }
 
 static int launch(const char *path, const char *arg) {
@@ -3018,14 +3012,22 @@ uint32_t wm_pointer_image(uint32_t seen, uint32_t *px, int *hot_x, int *hot_y) {
     return serial;
 }
 
+static const struct screen_display display = {.repaint = wm_repaint, .direct = wm_screen_direct,
+                                              .modes_offer = screen_modes_offer, .modes_gone = screen_modes_gone,
+                                              .modes_shown = screen_modes_shown, .state = wm_screen_state};
+static const struct pm_desktop power_desktop = {.window_count = wm_window_count, .close_windows = wm_close_windows,
+                                                .notify = wm_notify, .repaint = wm_repaint};
+static struct settings_hearer sound_hearer = {.changed = wm_taskbar_changed};
+
 void wm_init(void) {
+    screen_display = &display;
+    pm_set_desktop(&power_desktop);
+    settings_hear(N_DOMAIN_AUDIO, &sound_hearer);
     watched_init(&screen_watched, NULL);
     seen_dither_able = fb_dither_able();
     struct screen *s0 = screen_get(0);
     seen_boot = s0 && screen_boot(s0);
     screen_watchable = true;
-    deep_wanted = fb.simulated;
-    keep_register(&desktop_keep); /* read back by keep_start (init.c), before the first program */
     wm_lock();
     unsigned n = screen_count();
     for (unsigned i = 0; i < n; i++) wscreen_get(i, true);
@@ -3543,17 +3545,10 @@ static int64_t sys_gui_launch(uint64_t a, uint64_t b) {
 /* SYS_SCREEN_INFO's settings and screen format: the reply is made under wm_lock and copied out
    after it. */
 static int64_t sys_screen_info(uint64_t a, uint64_t b, uint64_t c) {
-    if (c == SCREEN_SETTINGS_GET || c == SCREEN_SETTINGS_SET) {
+    if (c == SCREEN_SETTINGS_GET) {
         if (b != sizeof(struct desktop_settings)) return -N_ERR_INVALID;
-        struct desktop_settings ds;
-        if (c == SCREEN_SETTINGS_SET) {
-            int r = copy_from_user(&ds, (const void *)a, sizeof ds);
-            if (r < 0) return r;
-            if (ds.pointer_speed < -2 || ds.pointer_speed > 2 || ds.smooth_gradients > 1) return -N_ERR_INVALID;
-        }
         wm_lock();
-        if (c == SCREEN_SETTINGS_SET) desktop_settings_put(ds.pointer_speed, ds.smooth_gradients != 0);
-        ds = (struct desktop_settings){
+        struct desktop_settings ds = {
             .pointer_speed = (int8_t)pointer_speed,
             .smooth_gradients = deep_wanted,
             .smooth_gradients_available = fb_dither_able(),
@@ -3617,7 +3612,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
     if (num == SYS_SCREEN_INFO) {
         /* A screen's mode: its own lock, which comes before the WM's (it tells the driver through
            wm_screen_mode). The screen's number is in the op's bits from 8 on. */
-        if ((c & 0xff) == SCREEN_MODES_GET || (c & 0xff) == SCREEN_MODE_SET) return screen_modes_syscall((void *)a, b, c);
+        if ((c & 0xff) == SCREEN_MODES_GET) return screen_modes_syscall((void *)a, b, c);
         /* A watch on what all of SYS_SCREEN_INFO reports (else 5 would be read as the reply's size). */
         if (c == SCREEN_WATCH)
             return a || b ? -N_ERR_INVALID : !screen_watchable ? -N_ERR_UNSUPPORTED : watched_open(&screen_watched);

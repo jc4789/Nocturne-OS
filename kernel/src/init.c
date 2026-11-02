@@ -17,8 +17,7 @@
 #include "sys/object.h"
 #include "sys/proc.h"
 #include "sys/stream.h"
-#include "sys/keep.h"
-#include "gui/screenmode.h"
+#include "sys/settings.h"
 #include "mm/heap.h"
 #include "mm/vmalloc.h"
 #include "sys/authority.h"
@@ -31,6 +30,7 @@ void nvme_init(void);
 #define INIT_PATH N_FOLDER_SYSTEM "\\services"
 
 void kmain_late(void) {
+    settings_init();
     entropy_init();
     vmalloc_purge_start();
     acpi_init();
@@ -51,14 +51,10 @@ void kmain_late(void) {
     hibernate_restore(); /* returns only when there is no image to go back to */
     store_start();
 
-    bool gui = !cmdline_has("nogui");
-    if (gui) wm_init();
-    /* Each part's state back from its document on C: before the first program (sys/keep.c): sound
-       registered in audio_init, the desktop in wm_init, the screen's modes here. */
-    screen_modes_init();
-    keep_start();
+    wm_init();
     vm_session_init();
-    if (!gui || !wm_running()) input_set_sinks(console_key, NULL);
+    if (!wm_running()) input_set_sinks(console_key, NULL);
+    settings_test_flags();
     pm_sleep_check(); /* every driver has registered: whether the start menu offers Sleep */
 
     /* its input, output and log are the console */
@@ -68,11 +64,9 @@ void kmain_late(void) {
     struct handle *root = NULL;
     if (cap_new(N_CAP_ROOT, &root) < 0) kprintf("init: no memory for the root capability\n");
     struct handle *handles[4] = {con, con, con, root};
-    char folder[sizeof "FOLDER=C:\\Users\\" + 255];
-    ksnprintf(folder, sizeof folder, "FOLDER=%s", store_user_folder());
     char *argv[] = {INIT_PATH, NULL};
-    char *settings[] = {folder, "TERMINAL=0 1 2"};
-    struct proc_launch l = {.argc = 1, .argv = argv, .setting_count = 2, .settings = settings,
+    char *settings[] = {"TERMINAL=0 1 2"};
+    struct proc_launch l = {.argc = 1, .argv = argv, .setting_count = 1, .settings = settings,
                             .handles = handles, .handle_count = 4, .identity = identity_kernel};
     int pid = proc_launch(INIT_PATH, &l);
     if (pid < 0) kprintf("init: failed to start %s (%d)\n", INIT_PATH, pid);

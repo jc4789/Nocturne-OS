@@ -28,8 +28,7 @@
 #include "dev/iommu.h"
 #include "dev/pci.h"
 #include "dev/pciuser.h"
-#include "gui/screenmode.h"
-#include "gui/wm.h"
+#include "sys/settings.h"
 #include "mm/heap.h"
 #include "sys/proc.h"
 #include "sys/object.h"
@@ -185,8 +184,8 @@ static int screen_bar(const struct pci_device *d) {
    default: RM's waits follow one another without a bound a limit could be checked against, and
    stopping a driver that is only slow loses its GPU. */
 /* The hold the watch thread looks at: screen_holder and the three after it, under
-   screen_hold_lock (taken alone, before screen_watch_wq's lock). The hold counts themselves and
-   screen_watch_started change under screen_lock (pci_user_hold_screen). */
+   screen_hold_lock (taken alone, before screen_watch_wq's lock). The hold counts themselves change
+   under screen_lock (pci_user_hold_screen); screen_watch_started is atomic. */
 static struct spinlock screen_hold_lock;
 static struct pci_claim *screen_holder;
 static int screen_holder_app;
@@ -208,19 +207,19 @@ static bool screen_holder_stop(const char *why) {
     return true;
 }
 
-/* Started with the first hold, only when fbhold= sets a limit. */
+/* Started when N_DISPLAY_HOLD_SECONDS first sets a limit. */
 static void screen_watch(void *arg) {
     (void)arg;
-    char limit[64];
-    ksnprintf(limit, sizeof limit, "its driver has held the screen for %lu s (fbhold=)",
-              (unsigned long)(screen_hold_limit_ns / NS_PER_S));
     for (;;) {
         uint64_t irq = spin_lock(&screen_hold_lock);
-        bool holding = screen_holder && !screen_holder_stopped;
-        uint64_t until = holding ? screen_held_since + screen_hold_limit_ns : CLOCK_NEVER;
+        uint64_t limit = screen_hold_limit_ns;
+        bool holding = screen_holder && !screen_holder_stopped && limit;
+        uint64_t until = holding ? screen_held_since + limit : CLOCK_NEVER;
         if (holding && clock_now_ns() >= until) {
             spin_unlock(&screen_hold_lock, irq);
-            screen_holder_stop(limit);
+            char why[64];
+            ksnprintf(why, sizeof why, "its driver has held the screen for %lu s", (unsigned long)(limit / NS_PER_S));
+            screen_holder_stop(why);
             continue;
         }
         /* a hold that begins or ends takes screen_hold_lock first, then wakes this */
@@ -229,17 +228,28 @@ static void screen_watch(void *arg) {
     }
 }
 
+int screen_hold_setting_put(uint32_t key, const void *value) {
+    int32_t seconds;
+    memcpy(&seconds, value, sizeof seconds);
+    bool start = seconds && !__atomic_exchange_n(&screen_watch_started, true, __ATOMIC_RELAXED);
+    if (start && !kthread_create("screen hold", screen_watch, NULL)) return -N_ERR_NO_MEMORY;
+    uint64_t irq = spin_lock(&screen_hold_lock);
+    screen_hold_limit_ns = (uint64_t)seconds * NS_PER_S;
+    wq_wake_all(&screen_watch_wq);
+    spin_unlock(&screen_hold_lock, irq);
+    settings_changed(N_DOMAIN_DISPLAY);
+    return 0;
+}
+
+int64_t screen_hold_setting_get(uint32_t key, void *out, size_t cap) {
+    uint64_t irq = spin_lock(&screen_hold_lock);
+    uint64_t limit = screen_hold_limit_ns;
+    spin_unlock(&screen_hold_lock, irq);
+    return setting_int(out, cap, (int32_t)(limit / NS_PER_S));
+}
+
 /* screen_lock held. */
 static void screen_hold_begin(struct pci_claim *c) {
-    if (!screen_watch_started) {
-        screen_watch_started = true;
-        uint64_t seconds;
-        if (cmdline_number("fbhold", &seconds) && seconds) {
-            /* at most a century: the hold's end stays a moment the clock reaches */
-            screen_hold_limit_ns = MIN(seconds, (uint64_t)100 * 365 * 86400) * NS_PER_S;
-            kthread_create("screen hold", screen_watch, NULL);
-        }
-    }
     /* Said while the screen still shows it: a screen that stops changing next tells why. */
     kprintf("pci: %02x:%02x.%u: app %d holds the screen while its driver starts or stops the device\n",
             c->d->bus, c->d->dev, c->d->func, process_current()->pid);
@@ -263,7 +273,7 @@ static void screen_hold_end(struct pci_claim *c) {
 /* Whoever draws the screen (the desktop, or the text console when there is none) draws all of it
    again. */
 static void screen_repaint(void) {
-    wm_repaint();
+    screen_display->repaint();
     fbcon_repaint();
 }
 
@@ -275,7 +285,7 @@ static void screen_release(void) {
 
 /* ---- a display driver's outputs (n_pci_give_screen, dev/fb.c) ----
    A display function's driver drives outputs, each a monitor. It offers the modes of an output's
-   monitor (n_pci_screen_modes; the system chooses one, gui/screenmode.c), sets the one chosen up
+   monitor (n_pci_screen_modes; the system chooses one), sets the one chosen up
    with buffers of its size and gives them to the output's screen (n_pci_give_screen): the screen
    takes that size, its frames are drawn into the buffer the output does not show, and each is
    asked for as a flip (n_pci_screen_flips); the driver says when the flip was shown, with the
@@ -435,7 +445,7 @@ static uint64_t output_buffers(struct pci_output *o, const struct screen_mode_de
         fb_buffer_unmap(old_buf[i]);
         shared_scanout_close(&old_surface[i]);
     }
-    wm_screen_direct(screen_id(o->screen), o->direct);
+    screen_display->direct(screen_id(o->screen), o->direct);
     return last;
 }
 
@@ -468,7 +478,7 @@ static bool outputs_end(struct pci_claim *c) {
                                      "(screen 0 the boot screen again, which the display may not show: nothing sets the "
                                      "display engine back)");
         }
-        if (o->modes) screen_modes_gone(screen_id(o->screen));
+        if (o->modes) screen_display->modes_gone(screen_id(o->screen));
         kfree(o);
     }
     kfree(c->outputs);
@@ -910,7 +920,7 @@ int64_t pci_user_give_screen(struct handle *h, uint32_t output, const struct n_s
         if (b) {
             desc = (struct screen_mode_desc){.width = b->width, .height = b->height,
                                              .direct = (b->format & N_SCANOUT_DIRECT) != 0};
-            screen_modes_shown(screen_id(o->screen), &desc);
+            screen_display->modes_shown(screen_id(o->screen), &desc);
         }
         uint64_t last = output_buffers(o, &desc, surface, buf, b ? b->count : 0);
         r = (int64_t)last;
@@ -984,7 +994,7 @@ int64_t pci_user_screen_state(struct handle *h, uint32_t output, uint64_t seen, 
     int64_t screen = o && (o->count || o->modes) ? (int64_t)screen_id(o->screen) : -1;
     mutex_unlock(&screen_lock);
     if (screen < 0) return -N_ERR_DENIED;
-    return wm_screen_state((unsigned)screen, seen, out, deadline);
+    return screen_display->state((unsigned)screen, seen, out, deadline);
 }
 
 int64_t pci_user_screen_modes(struct handle *h, uint32_t output, const struct n_screen_modes *m) {
@@ -1002,7 +1012,7 @@ int64_t pci_user_screen_modes(struct handle *h, uint32_t output, const struct n_
     if (!o) r = m->count ? -N_ERR_NO_MEMORY : 0;
     else {
         o->modes = m->count != 0;
-        screen_modes_offer(screen_id(o->screen), m);
+        screen_display->modes_offer(screen_id(o->screen), m);
     }
     mutex_unlock(&screen_lock);
     return r;

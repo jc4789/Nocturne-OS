@@ -92,6 +92,7 @@ static int record_change(void *ctx, uint8_t *value, size_t n) {
     if (a->fields & NS_MODIFIED) r.modified = a->modified;
     if (a->fields & NS_ATTRIBUTES) r.attributes = (uint16_t)((r.attributes & ~a->taken) | a->attributes);
     if (a->fields & NS_FLAGS) r.flags = a->flags;
+    if (a->fields & NS_OWNER) r.owner = a->owner;
     memcpy(value, &r, sizeof r);
     if (a->fields & NS_CONTENT) {
         if (a->n > STORE_INLINE_MAX) return -N_ERR_TOO_LARGE;
@@ -187,6 +188,7 @@ int ns_create(struct volume *v, uint64_t folder, const char *name, size_t n, uin
     uint64_t new_id = __atomic_fetch_add(&v->next_id, 1, __ATOMIC_RELAXED);
     struct store_record rec = {.parent = folder, .created = now, .modified = now, .kind = kind,
                                .attributes = (uint16_t)(attributes | (parent.attributes & NS_GIVEN)),
+                               .owner = parent.owner,
                                .flags = (uint16_t)(flags | (kind == STORE_DOCUMENT ? STORE_INLINE : 0))};
     /* the record before the name: whoever finds the name finds its record */
     if ((r = ns_record_put(v, new_id, &rec, NULL, 0)) < 0) return r;
@@ -211,6 +213,7 @@ struct relink {
     uint8_t key[STORE_KEY_MAX]; /* its place in to_folder */
     struct store_record rec;
     uint16_t left, attributes;  /* what folder gave it, and its attributes in to_folder */
+    uint32_t owner;             /* to_folder's */
 };
 
 /* name in folder, to go to to_folder's to_name, and what has that name now (*over, 0: nothing). 1:
@@ -237,7 +240,10 @@ static int relink_find(struct volume *v, struct relink *m, uint64_t folder, cons
         if (at == m->e.id) return -N_ERR_INVALID;
         if ((r = ns_record(v, at, &up, NULL)) < 0) return r;
         if (at == to_folder && up.kind != STORE_FOLDER) return -N_ERR_NOT_FOLDER;
-        if (at == to_folder) m->attributes = (uint16_t)((m->rec.attributes & ~m->left) | (up.attributes & NS_GIVEN));
+        if (at == to_folder) {
+            m->attributes = (uint16_t)((m->rec.attributes & ~m->left) | (up.attributes & NS_GIVEN));
+            m->owner = up.owner;
+        }
         if (at == STORE_ID_ROOT) break;
     }
     struct store_entry there = {0};
@@ -264,8 +270,8 @@ static int relink_ready(struct volume *v, const struct relink *m) {
 static int relink_finish(struct volume *v, struct relink *m, bool old, int64_t now) {
     int r = old ? catalog_delete(v, m->e.key, m->e.klen) : 0;
     if (r >= 0)
-        r = ns_record_amend(v, m->e.id, &(struct ns_amend){.fields = NS_PARENT | NS_ATTRIBUTES, .parent = m->to_folder,
-                                                           .taken = m->left, .attributes = m->attributes});
+        r = ns_record_amend(v, m->e.id, &(struct ns_amend){.fields = NS_PARENT | NS_ATTRIBUTES | NS_OWNER, .parent = m->to_folder,
+                                                           .taken = m->left, .attributes = m->attributes, .owner = m->owner});
     if (r >= 0) r = touch(v, m->folder, now);
     if (r >= 0) r = touch(v, m->to_folder, now);
     return r;
@@ -781,12 +787,15 @@ int ns_save(struct volume *v, uint64_t id, const void *data, size_t n, int64_t n
 int ns_format(struct volume *v, int64_t now) {
     struct store_record root = {.parent = STORE_ID_ROOT, .created = now, .modified = now, .kind = STORE_FOLDER};
     struct store_record fold = {.parent = STORE_ID_ROOT, .created = now, .modified = now, .kind = STORE_DOCUMENT,
-                                .attributes = STORE_SYSTEM | STORE_PRIVATE, .flags = STORE_INLINE};
+                                .attributes = STORE_PRIVATE, .flags = STORE_INLINE};
+    struct store_record regions = {.parent = STORE_ID_ROOT, .created = now, .modified = now, .kind = STORE_FOLDER,
+                                   .attributes = STORE_PRIVATE};
     uint8_t *table;
     size_t n;
     int r = fold_document(v->env, &table, &n);
     if (r < 0) return r;
-    if ((r = ns_record_put(v, STORE_ID_ROOT, &root, NULL, 0)) >= 0 && (r = ns_record_put(v, STORE_ID_FOLD, &fold, NULL, 0)) >= 0 &&
+    if ((r = ns_record_put(v, STORE_ID_ROOT, &root, NULL, 0)) >= 0 && (r = ns_record_put(v, STORE_ID_REGIONS, &regions, NULL, 0)) >= 0 &&
+        (r = ns_record_put(v, STORE_ID_FOLD, &fold, NULL, 0)) >= 0 &&
         (r = ns_save(v, STORE_ID_FOLD, table, n, now)) >= 0)
         r = fold_load(v->env, table, n, &v->fold);
     v->env->free(table);

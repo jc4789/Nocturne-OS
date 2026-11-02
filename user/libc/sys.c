@@ -540,7 +540,18 @@ n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_
 }
 n_result n_audio_status(n_handle a, struct n_audio_status *out) { return NC5(SYS_AUDIO_STATUS, a, out, 0, 0, 0); }
 n_result n_audio_flush(n_handle a) { return NC5(SYS_AUDIO_FLUSH, a, 0, 0, 0, 0); }
-n_result n_audio_output(struct n_audio_output *io, uint32_t set) { return NC5(SYS_AUDIO_OUTPUT, io, set, 0, 0, 0); }
+n_result n_audio_output(struct n_audio_output *io) { return NC5(SYS_AUDIO_OUTPUT, io, 0, 0, 0, 0); }
+n_result n_settings_apply(n_handle cap, uint32_t domain, uint32_t key, const void *value, size_t size) {
+    return NC5(SYS_SETTINGS_APPLY, cap, domain, key, value, size);
+}
+n_result n_settings_effective(uint32_t domain, uint32_t key, void *out, size_t cap) {
+    return NC5(SYS_SETTINGS_EFFECTIVE, domain, key, out, cap, 0);
+}
+n_result n_settings_describe(uint32_t domain, uint32_t key, struct n_setting_desc *out) {
+    return NC5(SYS_SETTINGS_DESCRIBE, domain, key, out, 0, 0);
+}
+n_handle n_settings_watch(uint32_t domain) { return (n_handle)NC5(SYS_SETTINGS_WATCH, domain, 0, 0, 0, 0); }
+n_result n_entry_set_owner(const char *path, uint32_t user) { return NC5(SYS_ENTRY_SET_OWNER, path, user, 0, 0, 0); }
 n_handle n_audio_output_watch(void) { return (n_handle)NC5(SYS_AUDIO_OUTPUT_WATCH, 0, 0, 0, 0, 0); }
 n_result n_watch_take(n_handle watch) { return NC5(SYS_WATCH_TAKE, watch, 0, 0, 0, 0); }
 n_handle n_events_create(void) { return (n_handle)NC5(SYS_EVENTS_CREATE, 0, 0, 0, 0, 0); }
@@ -603,7 +614,7 @@ static int run_here(const char *full, char *const argv[]) {
     const char *settings[2];
     uint32_t ns = 0;
     const char *f = getenv("FOLDER"), *t = getenv("TERMINAL");
-    if (!f || !n_path_is_complete(f)) f = "C:\\";
+    if (!f || !n_path_is_complete(f)) f = n_user_folder();
     snprintf(folder, sizeof folder, "FOLDER=%s", f);
     settings[ns++] = folder;
     if (t) {
@@ -749,7 +760,9 @@ n_result n_path_join(const char *folder, const char *name, char *out, size_t cap
 
 n_result n_path_complete(const char *name, char *out, size_t cap) {
     const char *folder = getenv("FOLDER");
-    return n_path_join(folder && n_path_is_complete(folder) ? folder : "C:\\", name, out, cap);
+    /* 設定が無ければ利用者のフォルダーで始まる。完全なパスには引かない：引くのは接続だから。 */
+    if (!folder || !n_path_is_complete(folder)) folder = n_path_is_complete(name) ? "C:\\" : n_user_folder();
+    return n_path_join(folder, name, out, cap);
 }
 
 const char *n_path_name(const char *path) {

@@ -357,9 +357,9 @@ plane、connector のオブジェクトや atomic の状態）は真似ず、KMS
    状態スレッドが起動できなければ、モードはそのまま、直接表示もやめる。立ち上げ中に画面を手放していた（上の 8）なら、
    状態スレッドが無いと次の望みで取り戻せないので、その時は立ち上げを失敗にする。
 
-設定アプリの「Resolution and refresh rate」で選んだモードは試行として出し、15 秒以内に Keep を押さなければ前のモードへ戻る。
-Keep したモードはモニターごとの利用者の選択になり、その持ち主の `kernel/src/gui/screenmode.c` が
-`AppData\Nocturne\Displays.conf` に保存して（`kernel/src/sys/keep.c`）、次の起動でも推奨モードの代わりに使う。
+設定の窓で選んだモードは設定のサービスが試行として適用し（`N_DISPLAY_MODE`）、15 秒以内に確定しなければ前のモードを適用する。
+確定したモードはモニターごとの利用者の選択になる。カーネルは `kernel/src/gui/screenmode.c` が覚え、保存はサービスが行い、
+次の起動でも推奨モードの代わりに適用する。
 
 BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の一部を写したもの。`os_pci.c` が写像ごとに bus 番地を
 覚えておき、`nvrm_kernel_mapping_phys()`（`os_pci.c` の末尾）が写像の番地から bus 番地を返す。面の先頭と末尾がともに同じ写像の

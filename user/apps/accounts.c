@@ -10,8 +10,8 @@
 #include "bearssl.h"
 #include "nocturne.h"
 #include "nocturne_services.h"
+#include "settings_abi.h"
 
-#define REGION "accounts"
 #define RECORD_MAGIC 0x5243434eu
 #define SALT_BYTES 16u
 #define HASH_BYTES 32u
@@ -140,7 +140,7 @@ static n_result copy_tree(const char *from, const char *to) {
         result = n_document_load(source, &data, &size);
         if (result >= 0) {
             result = n_document_save(target, data, size);
-            free(data);
+            n_memory_release(data, size);
         }
     }
     free(source);
@@ -170,11 +170,12 @@ static n_result remove_tree(const char *path) {
     return result;
 }
 
-/* 利用者のフォルダーを用意し、一時フォルダーを空にする。 */
+/* 利用者のフォルダーを用意し、一時フォルダーを空にする。中身は持ち主を親から継ぐので、持ち主を先に決める。 */
 static n_result folder_prepare(const struct n_account *a, bool fresh) {
     static const char *const standard[] = {"Desktop", "Documents", "Downloads", "Music", "Pictures", "Videos", "AppData", "AppData\\Temp"};
     n_result r = folder_ready(USERS_FOLDER);
     if (r >= 0) r = folder_ready(a->folder);
+    if (r >= 0) r = n_entry_set_owner(a->folder, a->user);
     char path[N_ACCOUNT_FOLDER_MAX + 32];
     for (size_t i = 0; r >= 0 && i < sizeof standard / sizeof *standard; i++) {
         r = n_path_join(a->folder, standard[i], path, sizeof path);
@@ -330,7 +331,7 @@ static void client_serve(void *arg) {
 
 int main(void) {
     n_result r = mtx_init(&lock, mtx_plain) == thrd_success ? 0 : -N_ERR_NO_MEMORY;
-    if (r >= 0) r = region = n_store_private_open(n_cap_find(N_CAP_STORE_PRIVATE), REGION);
+    if (r >= 0) r = region = n_store_private_open(n_cap_find(N_CAP_STORE_PRIVATE), N_REGION_USERS, 0, N_DOCUMENT_EDIT);
     if (r >= 0) r = records_load();
     if (r < 0) {
         printf("accounts: the records cannot be read (%s)\n", n_result_text(r));

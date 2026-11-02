@@ -2,6 +2,7 @@
    ACPI 6.5 chapter 5. The AML is uACPI's: the second half of this file gives it the kernel
    services it asks for (uacpi/kernel_api.h). */
 #include "kernel.h"
+#include "fs/bootrecord.h"
 #include "limine.h"
 #include "arch/cpu.h"
 #include "arch/ioapic.h"
@@ -477,8 +478,8 @@ static bool aml_ok(uacpi_status st, const char *what) {
 }
 
 void acpi_aml_init(void) {
-    if (cmdline_has("noaml")) {
-        kprintf("acpi: AML off (noaml)\n");
+    if (!boot_setting(N_BOOT_ACPI_AML)) {
+        kprintf("acpi: AML off (the boot record says so)\n");
         return;
     }
     kthread_create("acpi", acpi_worker, NULL);

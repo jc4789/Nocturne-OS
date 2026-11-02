@@ -8,7 +8,17 @@
    length limit on a path.
 
    user: the call is an app's. Its buffers are the app's memory, PRIVATE entries are not there for
-   it, and it changes nothing SYSTEM (C:\Nocturne and what is in it). */
+   it, and what it may reach is what its identity (struct n_identity) may: fs/store.c's place_allows,
+   the one place that decides. N_ERR_DENIED otherwise.
+
+     C:\Nocturne       everyone reads, the system's class writes
+     C:\Programs       everyone reads, admin and above write
+     C:\Users\<name>   the user who owns it and admin and above, both reading and writing
+     C:\ and C:\Users  everyone lists them, admin and above change them
+     anything else     admin and above
+
+   Each name has the number of the user it belongs to (store_record's owner): a new name has its
+   folder's. What C:\Users\<name> says decides for everything in it. */
 #pragma once
 #include "kernel.h"
 
@@ -23,11 +33,6 @@ struct volume;
 void store_init(void);
 /* From now on C: changes: its system folders are made ready and its writer starts. */
 void store_start(void);
-/* C:\Users\<name>, the folder of the person using the machine: the first in C:\Users, "User" made
-   when there is none. Apps start in it. Its AppData\Temp is the user's temporary folder, emptied by
-   every store_start. Both are "C:\" until then, or when they cannot be made. */
-const char *store_user_folder(void);
-const char *store_user_temp(void);
 /* Everything changed so far is on the medium (power changes, hibernation). */
 int store_sync(void);
 
@@ -48,6 +53,16 @@ int store_document_claim(struct handle *h, bool wait);
 int store_document_release(struct handle *h);
 int store_document_commit(struct handle *h, int how);
 
+/* A private region (common/settings_abi.h): a document outside the names, found by the number of its
+   user (0: the machine's) and its own. access: N_DOCUMENT_READ (-N_ERR_NOT_FOUND while it has no
+   content yet), N_DOCUMENT_EDIT, or N_DOCUMENT_REPLACE, whose new content is swapped in whole when
+   saved (store_document_commit), as for any document. The caller has checked its right to it. */
+int store_private_open(uint32_t region, uint32_t user, int access, struct handle **out);
+
+/* The user a name belongs to from now on: admin and above (user: for an app). What is in a folder
+   already keeps the number it has. */
+int store_entry_set_owner(const char *path, uint32_t owner, bool user);
+
 /* Whole documents. store_save replaces the content and returns once it is on the medium;
    store_append adds to the end, making the document when there is none, and does not wait for the
    medium. */
@@ -62,6 +77,11 @@ int store_folder_create(const char *path, bool user);
 int store_entry_remove(const char *path, bool user);
 /* replace: a document may take the name of another document, which goes in the same commit. */
 int store_entry_move(const char *from, const char *to, bool replace, bool user);
+/* Where the boot loader's module was read from: disk and the first sector and sectors of the
+   partition with that GPT identity, on the disk C: is on. -N_ERR_UNSUPPORTED when C: is not on a
+   disk, -N_ERR_NOT_FOUND without the partition. */
+int store_boot_partition(const uint8_t unique[16], struct blkdev **disk, uint64_t *first, uint64_t *sectors);
+
 /* A watch on C: (n_entry_watch, fs/watch.c): what is N_WATCH_NAME (the last name of path in its
    folder) or N_WATCH_FOLDER (everything directly in the folder path names). A new handle in the
    calling app's table: its number, or an error (-N_ERR_NOT_FOUND without the folder). */

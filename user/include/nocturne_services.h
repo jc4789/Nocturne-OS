@@ -6,8 +6,9 @@
 #include <cdefs.h>
 NOCTURNE_BEGIN_DECLS
 
-/* 名前の木の外の私的な領域 region の文書（読み書き。無ければ空で作られる）。cap：N_CAP_STORE_PRIVATE。 */
-n_handle n_store_private_open(n_handle cap, const char *region);
+/* 名前の木の外の私的な領域の文書（enum n_private_region、§3）。user 0 は機械の領域。
+   access は n_document_open と同じで、0 は N_DOCUMENT_EDIT。cap：N_CAP_STORE_PRIVATE。 */
+n_handle n_store_private_open(n_handle cap, uint32_t region, uint32_t user, int access);
 
 /* ---- 宣言のサービスの側 ---- */
 /* 依存する者を起こしてよいと管理者に知らせる。相手は n_inlet_accept(N_SERVICE_HANDLE_CONTROL, ...) で受ける。 */
