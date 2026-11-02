@@ -1167,7 +1167,7 @@ void wm_screen_info_changed(void) {
     if (screen_watchable) watched_changed(&screen_watched);
 }
 
-/* ---- the desktop's settings, kept in Desktop.conf ---- */
+/* ---- the desktop's settings (N_DOMAIN_INPUT, N_DOMAIN_WINDOW) ---- */
 
 
 /* The pointer's speed (-2 to 2) and smooth gradients wanted, wm_lock held: the watches hear of it. */

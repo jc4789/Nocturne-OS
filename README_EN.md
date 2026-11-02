@@ -47,8 +47,8 @@ general-purpose OS for daily use (see [Limits](#limits)).
 
 ### Kernel (`kernel/`, about 43,000 lines of C and assembly)
 
-- **Boot**: UEFI, then Limine, into a 64-bit higher-half kernel. There is no BIOS boot. The boot menu has two
-  entries, the desktop and text console only (`nogui`); it sets no resolution (the monitor's EDID decides).
+- **Boot**: UEFI, then Limine, into a 64-bit higher-half kernel. There is no BIOS boot. There is one boot
+  entry; it sets no resolution (the monitor's EDID decides). What must be known before boot is in the record `settings.rec`.
 - **CPUs**: up to 16. CPU 0 (the BSP) owns the kernel, interrupts, drivers, the GUI and the network stack; every
   other CPU (AP) runs app threads from its own run queue.
   - The "Kei" scheduler (`sys/kei.c`, `sys/sched.c`): fair selection by weighted virtual time, one queue per AP,

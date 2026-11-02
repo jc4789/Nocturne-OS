@@ -57,8 +57,10 @@ volatile struct limine_module_request module_req = {.id = LIMINE_MODULE_REQUEST_
 __attribute__((used, section(".limine_requests")))
 volatile struct limine_rsdp_request rsdp_req = {.id = LIMINE_RSDP_REQUEST_ID, .revision = 0};
 
+#ifdef NOCTURNE_TEST_FLAGS
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_executable_cmdline_request cmdline_req = {.id = LIMINE_EXECUTABLE_CMDLINE_REQUEST_ID, .revision = 0};
+#endif
 
 __attribute__((used, section(".limine_requests_end")))
 static volatile uint64_t requests_end[] = LIMINE_REQUESTS_END_MARKER;

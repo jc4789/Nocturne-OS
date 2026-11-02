@@ -39,7 +39,7 @@ void wm_taskbar_changed(void);
    show a window's own images (N_SCANOUT_DIRECT), and what the screen should show: wm_screen_state
    waits until deadline (sys/wait.h) while the state is still numbered seen, then copies it to *out
    (kernel memory). N_ERR_TIMEOUT with *out the unchanged state; N_ERR_STOPPED when the caller is
-   stopped. They work without the desktop too (the nogui start). */
+   stopped. */
 struct n_screen_state;
 void wm_screen_direct(unsigned screen, bool able);
 int64_t wm_screen_state(unsigned screen, uint64_t seen, struct n_screen_state *out, uint64_t deadline);
