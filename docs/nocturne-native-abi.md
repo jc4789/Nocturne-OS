@@ -586,7 +586,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     システムは画面へ書かない。`true` は書込み中のものが終わってから戻り、入れ子にできる。最後の
     `false`（または claim の終わり）で画面全体を描き直す。時間切れで描画を再開することはない
     （作り直しの途中で書くことこそ保持が防ぐ競合）。claim の終わりは装置を止めて（BAR の写像の
-    取消し、割り込み、バスマスター）から保持を返す。設定 `N_DISPLAY_HOLD_SECONDS` に秒数があれば、それだけ
+    取消し、割り込み、バスマスター）から保持を返す。起動項目 `fbhold=<秒>` を付けると、それだけ
     保持したとき、保持しているドライバーのアプリをシステムが止め、claim の終わりで CPU 描画を
     再開する（scanout の復旧保証ではない。時間の既定は無し：RM の待ちは次々に続き、上限を
     決められない。遅いだけのドライバーを止めると GPU が使えなくなる）。
@@ -799,7 +799,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     モードを必須とするユニット（ECAP.EIMER）には、CPU が x2APIC で全ユニットが EIM を持つ時だけ
     x2APIC 形式の宛先を書き、そうでなければ割り込みの再マップを使わない）。再マップを必須と
     するユニット（ECAP.IRREQ）は、切れている間すべての割り込みメッセージを止める（§5.1.4）。
-    そのため `N_BOOT_IOMMU` が 0 の時、ファームウェアの記述を保持できなかった時、共通のページ表形式が
+    そのため `noiommu` の時、ファームウェアの記述を保持できなかった時、共通のページ表形式が
     無い時、DMA 変換の起動に失敗した時も、割り込みの再マップだけで起動する（DMA は変換しない）。
     再マップ自体ができなければ、その旨（割り込みが止まること）をログに出す。
     予約範囲は IVMD の読み書きの許可どおりに写す。claim の終了で装置は遮断され、ユニットが
@@ -820,7 +820,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     - 隔離できない時：グループにカーネルの装置があるか、IOAPIC・HPET の ID を含むか、どの
       ユニットにも見えない ID があるか、列挙がメモリ不足で全装置を把握していなければ、
       既定では `N_ERR_BUSY`／`N_ERR_UNSUPPORTED`で拒否する。非隔離利用には管理者が明示的に
-      起動の設定 `N_BOOT_UNISOLATED_DRIVERS` を選ぶ必要がある。IOMMU不在・`N_BOOT_IOMMU` が 0 の時にも同じ方針を適用する。
+      起動オプション `appdrivers-unisolated` を選ぶ必要がある。IOMMU不在・`noiommu`にも同じ方針を適用する。
       この設定でも無効化命令失敗、他のclaim、以前のclaimの未確定状態は迂回できない。以前のclaimの遮断がグループに
       残っていれば、その理由に応じて `N_ERR_BUSY`／`N_ERR_UNSUPPORTED`。グループに claim 済みの
       装置か、遮断が未確認の装置・他の claim のドメインの装置があれば `N_ERR_BUSY`。ユニットが
@@ -846,8 +846,8 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
       表で動いたまま）。TSC周波数が不明なら推測周波数を使わず、即座にreadyと確認できない操作を失敗にする。
     - 限界：AMD-Vi の装置表は SMI を止められない（SMI フィルターはファームウェアの SMI も止め
       うるので使わない）。claim した装置が SMI のメッセージを送れば SMM へ届く。
-    隔離されている装置は `n_pci_info` の `flags` に `N_PCI_ISOLATED`。IOMMU が無い機械、
-    `N_BOOT_IOMMU` が 0 の時、隔離できない装置は既定でclaimを拒否する。`N_BOOT_UNISOLATED_DRIVERS`を明示した
+    隔離されている装置は `n_pci_info` の `flags` に `N_PCI_ISOLATED`。IOMMU が無い機械、起動
+    オプション `noiommu`、隔離できない装置は既定でclaimを拒否する。`appdrivers-unisolated`を明示した
     非隔離claimは全メモリへ届くため、その危険をログに残す。対応幅を超す物理アドレスをPTEへ切り詰めず拒否し、
     DMA確保は実際の変換幅内へ制限する。IVMDのaccess=0/ROをDMAオブジェクトが拡大せず、解放で予約を消さない。
     S3では保存したPIC/IOAPIC経路をマスクし、復帰ファームウェアが再有効化した経路も再び止めてから
@@ -1195,7 +1195,8 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   二つの枠で、世代の大きい方の CRC-32C の合うものが効く。全部 0 は既定。`SYS_SETTINGS_APPLY` は
   古い枠へ上書きする（FAT32 の区画の中の番地を辿る。大きさは変えない）。
   効くのは次の起動から（`N_SETTING_AT_START`）。`SYS_SETTINGS_EFFECTIVE` は記録の値を返す。
-- カーネルは起動の引数を読まない。
+- 起動の引数は製品の値を決めない。`kernel/src/boot.c` の `test_flag` などの読み手は試験の組み
+  （`make kernel-test`、`NOCTURNE_TEST_FLAGS`）だけにある。
 - 設定のサービス `settings`（`user/apps/settingsd.c`）：選択の保存、宣言の表、型と範囲の確かめ、権限の
   確かめ、見張りを持つ。領域の意味を持たない。呼ぶ側の口は `nocturne_settings.h`（`user/libc/settings.c`）、
   channel の文は `common/settings_abi.h` の `enum n_settings_op`。

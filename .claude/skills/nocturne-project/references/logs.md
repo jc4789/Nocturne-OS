@@ -75,7 +75,7 @@ fps を直接出す行は無い。一組（wall ≈ 2000 ms）の `draw` の回�
 
 - 起動：`memory: N MiB usable, M MiB free`、`video: WxH, bpp …`、`video: monitor <名>, at R Hz`（EDID が決めた拍。`the firmware passed no EDID` なら EDID 無し）、`store: C: "<label>" on nvme0, N MiB, M MiB free`（SATA なら `sata0`）。`store:` の他の行（`read only from now on`、`damaged`）は C: の異常。
 - メモリー切れ：`[memory] pid P … no pages for …`（10 秒に 1 回まで）。
-- 標本（`sys/prof.c`。今は `prof_init` を呼ぶ者が無いので出ない）：
+- 標本（起動の cmdline に `prof` か `prof_ms=<n>` を付ける。Limine のメニューで項目を編集する。できなければ `boot/limine.conf` の cmdline を一時的に変えて `qemu-image` で組み、済んだら戻す。窓は既定 10 秒）：
   - `prof: ---- N ms window ----` で一組が始まる。
   - `prof: cpuN user U kernel K idle I[, MHz awake %]`：CPU ごとの配分。
   - `prof: task pid P <名>[ (thread)] total N`：仕事ごとの標本。

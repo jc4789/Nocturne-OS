@@ -47,7 +47,7 @@ tcc -run /data/tests/canvastest.c
 sleep 10
 ```
 
-カーネルに旗はありません。VM に `0x1af4:0x1050` の装置があれば、起動のときに virgl の道を起こします。
+今の `scripts/test.py` は `--qemu` と `--gpu virgl` で同じ QEMU 構成を作れますが、カーネルへの `gpu-enable gpu-timing` の指定と独自の autorun は持たず、`C:\Tests` の自分の autorun（`gui` 群の `tcc -run C:\Tests\gputest.c`、`web` 群の `canvastest.c`、どちらも `--require-gpu --bench` なし）だけを実行します。この比較はそのままでは再現できません。
 
 要求：cold 成功だけでなく **通常 2 秒 clear／triangle／readback 検査**、公開 syscall の GPU 必須試験、入力拒否・画素・canary・fence/submission、Canvas 実 paint、同入力ベンチ、全 transaction 時間、所有 PID の終了、媒体と DLL の hash。process exit 0 や trace 数だけでは受入れません。未修正／元配置の host では能力撤回と CPU fallback の画素成功を保持します。
 

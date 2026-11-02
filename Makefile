@@ -54,6 +54,28 @@ $(BUILD)/k/third_party/uacpi/%.o: third_party/uacpi/%.c
 	@echo "  CC   $<"
 	@$(CC) $(filter-out -W%,$(KCFLAGS)) -w -c $< -o $@
 
+# The test build of the kernel: the same sources with the test flags of the kernel command line
+# (kernel.h's test_flag).
+KTOBJ := $(patsubst $(BUILD)/k/%,$(BUILD)/kt/%,$(KOBJ))
+$(BUILD)/kt/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  CC   $< (test)"
+	@$(CC) $(KCFLAGS) -DNOCTURNE_TEST_FLAGS -c $< -o $@
+
+$(BUILD)/kt/third_party/uacpi/%.o: third_party/uacpi/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC   $< (test)"
+	@$(CC) $(filter-out -W%,$(KCFLAGS)) -w -c $< -o $@
+
+$(BUILD)/kt/%.asm.o: %.asm
+	@mkdir -p $(dir $@)
+	@echo "  NASM $< (test)"
+	@$(NASM) -f elf64 -g $< -o $@
+
+$(BUILD)/kernel-test.elf: $(KTOBJ) kernel/linker.ld
+	@echo "  LD   $@"
+	@$(LD) $(KLDFLAGS) $(KTOBJ) -o $@
+
 # The build host's tool for the volume (host/store/store.c), a Windows program: it makes the boot
 # disk and puts the system on drive C: with the store's own code (common/store), the library the
 # kernel's C: is built on as well; the tool gives it the program's memory and blocks of its own.
@@ -336,7 +358,7 @@ $(BUILD)/tests/nvk_contracttest: private ULDFLAGS += --gc-sections
 $(BUILD)/u/tests/nvrm_servetest.o: UCFLAGS += $(NVRM_CLIENT_INC)
 $(BUILD)/tests/nvrm_servetest: private TEST_OBJ := $(NVRM_OUT)/os/nvrm_serve.o
 $(BUILD)/tests/nvrm_servetest: $(NVRM_OUT)/os/nvrm_serve.o
-$(BUILD)/tests/media_cenc_test $(BUILD)/tests/nvk_contracttest $(BUILD)/tests/nvrm_servetest: $(BUILD)/tests/%: $(BUILD)/u/tests/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
+$(BUILD)/tests/media_cenc_test $(BUILD)/tests/nvk_contracttest $(BUILD)/tests/nvrm_servetest $(BUILD)/tests/testrun: $(BUILD)/tests/%: $(BUILD)/u/tests/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
 	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< $(TEST_OBJ) --start-lib @$(LIBC_RSP) --end-lib -o $@
 
@@ -524,13 +546,14 @@ $(BUILD)/sdk.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC
 	@touch $@
 
 # ---------------------------------------------------------------- images
-.PHONY: all kernel user cxx lexbor image qemu-image run clean
+.PHONY: all kernel kernel-test user cxx lexbor image qemu-image run clean
 .SECONDARY:
 all: image
 
 kernel: $(BUILD)/kernel.elf
 
-user: $(APP_BINS) $(NVRM_FILES) $(PROGRAMS)/tcc
+kernel-test: $(BUILD)/kernel-test.elf
+user: $(APP_BINS) $(NVRM_FILES) $(PROGRAMS)/tcc $(BUILD)/tests/testrun
 cxx: $(CPP_BINS) $(LICENSES)/libcxx/LICENSE.TXT
 lexbor: $(LXB_OBJ)
 
@@ -549,7 +572,8 @@ $(NVIDIA_FW_STATE): nvidia-firmware-check scripts/layout.py
 	@$(PY) scripts/layout.py --firmware-state "$@" --firmware-source "$(NVIDIA_FIRMWARE)" --firmware-version "$(NVIDIA_FW_VERSION)"
 
 # everything scripts/layout.py puts on C:
-DISK_FILES := $(APP_BINS) $(GO_FILES) $(RUST_FILES) $(LLVM_FILES) $(NVRM_FILES) $(PROGRAMS)/tcc $(LICENSE_FILES) $(BUILD)/sdk.stamp \
+# tests/testrun は媒体に入れないが、一緒に組む。
+DISK_FILES := $(BUILD)/tests/testrun $(APP_BINS) $(GO_FILES) $(RUST_FILES) $(LLVM_FILES) $(NVRM_FILES) $(PROGRAMS)/tcc $(LICENSE_FILES) $(BUILD)/sdk.stamp \
     $(BUILD)/sounds.stamp $(NVIDIA_FW_STATE) $(shell find rootfs -type f) third_party/ca/ca-bundle.crt
 
 # the music in the user's Music folder, made by a script

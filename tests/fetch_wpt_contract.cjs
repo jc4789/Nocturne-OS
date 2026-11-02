@@ -18,7 +18,7 @@
  * failure, and "follow", which has no network to follow to). A Worker's request for a blob: URL is answered as js.c's worker_blob answers
  * for a creating document whose store does not hold it: a network error. The realms have node's
  * URL (its createObjectURL hidden until a realm installs its own) and TextEncoder. This is not
- * the guest browser: it shows the two realms give the same results and, with
+ * the guest browser and not wptrunner: it shows the two realms give the same results and, with
  * --base=REV, that neither realm passes fewer subtests than REV's did. The checks after the WPT
  * files are the parts of DOM's AbortSignal no WPT file tests in a realm without a garbage
  * collector to call.

@@ -12,6 +12,7 @@
 #include <webidb.h>
 #include <webidb_async.h>
 #include <webprefs.h>
+#include <webcookie.h>
 #include <media.h>
 #include <quickjs.h>
 #include "webi.h"
@@ -266,6 +267,7 @@ struct web_js_state {
     web_workers *workers;
     bool worker_turn;
     struct js_socket *sockets;
+    struct js_automation *automations; /* --wpt-automation only: see native_automation */
     bool socket_turn, webaudio_turn;
     struct js_module *modules;
     struct js_import *imports;
@@ -6542,6 +6544,237 @@ static bool run_socket_event(struct web_js_state *s) {
     end_task(s);
     return true;
 }
+/* A test tool, not a product feature. With a host that drives its real input for automation
+   (web_host.automation: the browser started with --wpt-automation, which only the WPT runner
+   gives), a top-level realm has __nocturne_automation(steps, duration) for WPT's testdriver
+   (tests/wpt/testdriver-vendor.js); without it no realm has the name at all. The host puts the
+   steps into the same input queue as the user's, so their events are trusted for the reason the
+   user's are; the returned promise settles in a task after the host handled the last one. A
+   replaced or closed document takes its records with it: nothing reaches another document. */
+struct js_automation {
+    uint64_t id;
+    JSValue resolve, reject;
+    bool settled;
+    char *error;                /* settled with this failure; NULL resolves */
+    struct js_automation *next;
+};
+static const char *const automation_kinds[] = {
+    [WEB_AUTOMATION_MOVE] = "move", [WEB_AUTOMATION_DOWN] = "down", [WEB_AUTOMATION_UP] = "up",
+    [WEB_AUTOMATION_KEY_DOWN] = "keyDown", [WEB_AUTOMATION_KEY_UP] = "keyUp", [WEB_AUTOMATION_WHEEL] = "wheel",
+};
+static int automation_number(JSContext *ctx, JSValueConst step, const char *name, double *out) {
+    JSValue v = JS_GetPropertyStr(ctx, step, name);
+    if (JS_IsException(v)) return -1;
+    *out = 0;
+    int r = JS_IsUndefined(v) ? 0 : JS_ToFloat64(ctx, out, v);
+    JS_FreeValue(ctx, v);
+    if (r < 0) return -1;
+    if (!isfinite(*out)) { JS_ThrowRangeError(ctx, "Automation step %s is not finite", name); return -1; }
+    return 0;
+}
+static int automation_step(JSContext *ctx, JSValueConst step, struct web_automation_step *out) {
+    if (!JS_IsObject(step)) { JS_ThrowTypeError(ctx, "Automation step must be an object"); return -1; }
+    JSValue type = JS_GetPropertyStr(ctx, step, "type");
+    if (JS_IsException(type)) return -1;
+    const char *name = JS_ToCString(ctx, type);
+    JS_FreeValue(ctx, type);
+    if (!name) return -1;
+    int kind = -1;
+    for (int i = 0; i < (int)(sizeof automation_kinds / sizeof *automation_kinds); i++)
+        if (!strcmp(name, automation_kinds[i])) kind = i;
+    JS_FreeCString(ctx, name);
+    if (kind < 0) { JS_ThrowTypeError(ctx, "Unknown automation step type"); return -1; }
+    double at, key, button;
+    memset(out, 0, sizeof *out);
+    out->kind = (enum web_automation_kind)kind;
+    if (automation_number(ctx, step, "at", &at) < 0 || automation_number(ctx, step, "x", &out->x) < 0 ||
+        automation_number(ctx, step, "y", &out->y) < 0 || automation_number(ctx, step, "dx", &out->dx) < 0 ||
+        automation_number(ctx, step, "dy", &out->dy) < 0 || automation_number(ctx, step, "button", &button) < 0 ||
+        automation_number(ctx, step, "key", &key) < 0) return -1;
+    if (at < 0 || at > UINT32_MAX) { JS_ThrowRangeError(ctx, "Automation step time out of range"); return -1; }
+    out->at = (uint32_t)at;
+    if (kind == WEB_AUTOMATION_KEY_DOWN || kind == WEB_AUTOMATION_KEY_UP) {
+        if (key < 0 || key > 0x10FFFF || key != floor(key)) { JS_ThrowRangeError(ctx, "Automation key is not a code point"); return -1; }
+        out->value = (uint32_t)key;
+    } else if (kind == WEB_AUTOMATION_DOWN || kind == WEB_AUTOMATION_UP) {
+        if (button < 0 || button > 4 || button != floor(button)) { JS_ThrowRangeError(ctx, "Automation button out of range"); return -1; }
+        out->value = (uint32_t)button;
+    }
+    return 0;
+}
+static JSValue automation_error(JSContext *ctx, const char *message) {
+    JSValue error = JS_NewError(ctx);
+    if (!JS_IsException(error))
+        JS_DefinePropertyValueStr(ctx, error, "message", JS_NewString(ctx, message), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    return error;
+}
+static JSValue native_automation(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    static uint64_t serial;
+    struct web_js_state *s = state(ctx);
+    if (!s->host.automation || s->doc->frame_parent) return JS_ThrowTypeError(ctx, "Automation is not available");
+    if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "Automation browsing context is inactive");
+    if (argc < 1 || !JS_IsArray(ctx, argv[0])) return JS_ThrowTypeError(ctx, "Automation steps must be an array");
+    double duration = 0;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToFloat64(ctx, &duration, argv[1]) < 0) return JS_EXCEPTION;
+    if (!isfinite(duration) || duration < 0 || duration > UINT32_MAX) return JS_ThrowRangeError(ctx, "Automation duration out of range");
+    int64_t length;
+    JSValue n = JS_GetPropertyStr(ctx, argv[0], "length");
+    if (JS_IsException(n) || JS_ToInt64(ctx, &length, n) < 0) { JS_FreeValue(ctx, n); return JS_EXCEPTION; }
+    JS_FreeValue(ctx, n);
+    if (length < 0 || length > UINT32_MAX || (uint64_t)length > SIZE_MAX / sizeof(struct web_automation_step))
+        return JS_ThrowRangeError(ctx, "Too many automation steps");
+    struct web_automation_step *steps = length ? js_malloc(ctx, (size_t)length * sizeof *steps) : NULL;
+    if (length && !steps) return JS_EXCEPTION;
+    for (int64_t i = 0; i < length; i++) {
+        JSValue step = JS_GetPropertyUint32(ctx, argv[0], (uint32_t)i);
+        int r = JS_IsException(step) ? -1 : automation_step(ctx, step, &steps[i]);
+        JS_FreeValue(ctx, step);
+        if (r < 0) { js_free(ctx, steps); return JS_EXCEPTION; }
+        if (i && steps[i].at < steps[i - 1].at) { js_free(ctx, steps); return JS_ThrowRangeError(ctx, "Automation steps must be in time order"); }
+    }
+    /* A step getter may have run page script that ended the document. */
+    if (!task_context_active(s)) { js_free(ctx, steps); return JS_ThrowTypeError(ctx, "Automation browsing context is inactive"); }
+    JSValue functions[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, functions);
+    if (JS_IsException(promise)) { js_free(ctx, steps); return promise; }
+    struct js_automation *record = js_mallocz(ctx, sizeof *record);
+    if (!record) {
+        js_free(ctx, steps); JS_FreeValue(ctx, promise); JS_FreeValue(ctx, functions[0]); JS_FreeValue(ctx, functions[1]);
+        return JS_EXCEPTION;
+    }
+    record->id = ++serial; record->resolve = functions[0]; record->reject = functions[1];
+    const char *refused = s->host.automation(s->host.opaque, s->doc, record->id, steps, (size_t)length, (uint32_t)duration);
+    js_free(ctx, steps);
+    if (refused) {
+        JSValue error = automation_error(ctx, refused);
+        JSValue result = JS_IsException(error) ? JS_EXCEPTION : JS_Call(ctx, record->reject, JS_UNDEFINED, 1, (JSValueConst *)&error);
+        JS_FreeValue(ctx, result); JS_FreeValue(ctx, error);
+        JS_FreeValue(ctx, record->resolve); JS_FreeValue(ctx, record->reject); js_free(ctx, record);
+        return promise;
+    }
+    struct js_automation **link = &s->automations;
+    while (*link) link = &(*link)->next;
+    *link = record;
+    return promise;
+}
+/* The same tool's WebDriver Cookies (§14). With web_host.automation_cookies, beside
+   __nocturne_automation and only where it is, a top-level realm has
+   __nocturne_cookies(command, window, name). window is a Window of this document's tree, as a
+   realm of the tree holds one (a global, or a WindowProxy): WebDriver's current browsing context
+   is its browsing context, whose active document's associated cookies (HttpOnly ones too) "get"
+   returns serialized, name's alone when name is given, and "delete" removes (WebDriver's "delete
+   cookies"). A frame under a cross-origin parent asks through its top-level window's testdriver,
+   which knows the frame as a message's source. The jar is the host's; no cookie is logged. */
+static web_doc *automation_window_document(struct web_js_state *s, JSValueConst window) {
+    /* A global, a WindowProxy (frame_window_receiver), or a frame realm's own global, which only
+       that realm holds: a frame's testdriver passes its own window. */
+    bool brand = false;
+    web_doc *d = frame_window_receiver(s, window, &brand);
+    if (brand) return d;
+    for (struct web_js_state *realm = s->runtime_owner->runtime_realms; realm; realm = realm->runtime_next) {
+        if (!task_context_active(realm)) continue;
+        JSValue global = JS_GetGlobalObject(realm->ctx);
+        bool own = JS_StrictEq(s->ctx, global, window);
+        JS_FreeValue(s->ctx, global);
+        if (own) return realm->doc;
+    }
+    return NULL;
+}
+/* WebDriver's serialized cookies (§14, the table for cookie conversion); a session cookie has no
+   expiry. */
+static JSValue automation_serialized_cookies(JSContext *ctx, const struct webcookie_record *list, size_t count) {
+    static const char *const same_site[] = {[WEBCOOKIE_SAME_SITE_LAX] = "Lax", [WEBCOOKIE_SAME_SITE_STRICT] = "Strict",
+                                            [WEBCOOKIE_SAME_SITE_NONE] = "None"};
+    JSValue array = JS_NewArray(ctx);
+    if (JS_IsException(array)) return array;
+    for (size_t i = 0; i < count; i++) {
+        const struct webcookie_record *c = &list[i];
+        const char *policy = c->same_site < sizeof same_site / sizeof *same_site ? same_site[c->same_site] : "Lax";
+        JSValue cookie = JS_NewObject(ctx);
+        if (JS_IsException(cookie) ||
+            JS_DefinePropertyValueStr(ctx, cookie, "name", JS_NewString(ctx, c->name), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "value", JS_NewString(ctx, c->value), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "path", JS_NewString(ctx, c->path), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "domain", JS_NewString(ctx, c->domain), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "secure", JS_NewBool(ctx, c->secure), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "httpOnly", JS_NewBool(ctx, c->http_only), JS_PROP_C_W_E) < 0 ||
+            (c->persistent && JS_DefinePropertyValueStr(ctx, cookie, "expiry", JS_NewInt64(ctx, c->expires), JS_PROP_C_W_E) < 0) ||
+            JS_DefinePropertyValueStr(ctx, cookie, "sameSite", JS_NewString(ctx, policy), JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, cookie); JS_FreeValue(ctx, array);
+            return JS_EXCEPTION;
+        }
+        if (JS_DefinePropertyValueUint32(ctx, array, (uint32_t)i, cookie, JS_PROP_C_W_E) < 0) { JS_FreeValue(ctx, array); return JS_EXCEPTION; }
+    }
+    return array;
+}
+static JSValue native_automation_cookies(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s = state(ctx);
+    if (!s->host.automation || !s->host.automation_cookies || !s->host.automation_delete_cookies || s->doc->frame_parent)
+        return JS_ThrowTypeError(ctx, "Automation is not available");
+    if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "Automation browsing context is inactive");
+    if (argc < 2) return JS_ThrowTypeError(ctx, "Automation cookies need a command and a window");
+    const char *command = JS_ToCString(ctx, argv[0]);
+    if (!command) return JS_EXCEPTION;
+    int deleting = !strcmp(command, "delete") ? 1 : !strcmp(command, "get") ? 0 : -1;
+    JS_FreeCString(ctx, command);
+    if (deleting < 0) return JS_ThrowTypeError(ctx, "Unknown automation cookie command");
+    const char *name = NULL;
+    size_t name_len = 0;
+    if (argc > 2 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2]) && !(name = JS_ToCStringLen(ctx, &name_len, argv[2])))
+        return JS_EXCEPTION;
+    JSValue result;
+    /* A conversion may have run page script that ended the document or its frame. */
+    web_doc *target = task_context_active(s) ? automation_window_document(s, argv[1]) : NULL;
+    const web_doc *tree = target;
+    while (tree && tree != s->doc) tree = tree->frame_parent;
+    if (!task_context_active(s)) result = JS_ThrowTypeError(ctx, "Automation browsing context is inactive");
+    else if (!tree || !target->live) result = JS_ThrowTypeError(ctx, "no such window: not a browsing context of this window");
+    else if (name && strlen(name) != name_len) result = deleting ? JS_UNDEFINED : JS_NewArray(ctx); /* no cookie's name has U+0000 */
+    else if (deleting) {
+        long removed = s->host.automation_delete_cookies(s->host.opaque, s->doc, web_effective_url(target), name);
+        result = removed < 0 ? JS_ThrowTypeError(ctx, "unable to delete cookies") : JS_UNDEFINED;
+    } else {
+        struct webcookie_record *list = NULL;
+        long count = s->host.automation_cookies(s->host.opaque, s->doc, web_effective_url(target), name, &list);
+        result = count < 0 ? JS_ThrowTypeError(ctx, "unable to read cookies") : automation_serialized_cookies(ctx, list, (size_t)count);
+        free(list);
+    }
+    if (name) JS_FreeCString(ctx, name);
+    return result;
+}
+void web_automation_done(web_doc *d, uint64_t id, const char *error) {
+    struct web_js_state *s = d ? d->js : NULL;
+    for (struct js_automation *p = s && s->ctx ? s->automations : NULL; p; p = p->next) {
+        if (p->id != id || p->settled) continue;
+        p->settled = true;
+        if (error && !(p->error = js_strdup(s->ctx, error))) p->error = js_strdup(s->ctx, "Automation failed");
+        return;
+    }
+}
+static void automation_free(struct web_js_state *s, struct js_automation *p) {
+    JS_FreeValue(s->ctx, p->resolve); JS_FreeValue(s->ctx, p->reject);
+    js_free(s->ctx, p->error); js_free(s->ctx, p);
+}
+/* The first settled run's promise, in a task of its own. */
+static bool run_automation(struct web_js_state *s) {
+    struct js_automation **link = &s->automations;
+    while (*link && !(*link)->settled) link = &(*link)->next;
+    struct js_automation *p = *link;
+    if (!p) return false;
+    *link = p->next;
+    JSContext *ctx = s->ctx;
+    begin_named_task(s, "automation", p->id);
+    JSValue value = p->error ? automation_error(ctx, p->error) : JS_UNDEFINED;
+    if (JS_IsException(value)) exception(s);
+    else {
+        JSValue result = JS_Call(ctx, p->error ? p->reject : p->resolve, JS_UNDEFINED, 1, (JSValueConst *)&value);
+        if (JS_IsException(result)) exception(s); else JS_FreeValue(ctx, result);
+        JS_FreeValue(ctx, value);
+    }
+    automation_free(s, p);
+    end_task(s);
+    return true;
+}
 /* What the document's fetch group can still take into its inflight keepalive bytes. */
 static size_t keepalive_room(struct web_js_state *s) {
     size_t inflight = s->fetch_group && s->host.keepalive_inflight ? s->host.keepalive_inflight(s->host.opaque, s->fetch_group) : 0;
@@ -9916,6 +10149,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
         else if (run_posted_task(s)) { s->posted_turn = false; s->observer_turn = true; ran = true; }
         else if (run_atomics_waiters(s, now)) { s->posted_turn = true; s->observer_turn = true; ran = true; }
         else if (run_socket_event(s)) ran = true;
+        else if (run_automation(s)) ran = true;
         else if (run_webaudio(s)) ran = true;
         else if (JS_IsJobPending(s->rt)||s->rejections||s->handled_rejections||s->rejection_oom) { begin_task(s); end_task(s); ran = true; }
         else if (web_worker_runnable(s->workers)) {
@@ -9971,6 +10205,7 @@ static int64_t js_deadline(web_doc *d, int *why) {
         if (s->media_width != d->width || s->media_height != d->height) DUE_NOW();
         if (s->events || s->posted || s->rejections || s->handled_rejections || s->rejection_oom) DUE_NOW();
         for (struct js_socket *p = s->sockets; p; p = p->next) if (p->events) DUE_NOW();
+        for (struct js_automation *p = s->automations; p; p = p->next) if (p->settled) DUE_NOW();
         for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) DUE_NOW();
         if (JS_IsJobPending(s->rt)) DUE_NOW();
         if (paint_timing_due(s)) DUE_NOW();
@@ -10410,6 +10645,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     JS_SetPropertyStr(s->ctx,api,"noCorsFetch",JS_TRUE);
     JS_SetPropertyStr(s->ctx,api,"streamingFetch",JS_NewBool(s->ctx,s->host.resume_request != NULL));
     JS_SetPropertyStr(s->ctx,api,"syncFetch",JS_NewBool(s->ctx,s->host.wait_request != NULL)); /* fetchWait */
+    JS_SetPropertyStr(s->ctx,api,"automation",JS_NewBool(s->ctx,s->host.automation != NULL)); /* navigator.webdriver */
     /* Watch before the realm first reads the languages, so no change falls between
        (web_wait_queue watches the preferences once for the process). */
     (void)web_wait_queue();
@@ -10471,6 +10707,17 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     bool audio = web_audio_install(s->ctx, window, &webaudio_lazy);
     JS_FreeValue(s->ctx, window);
     if (!audio) { exception(s); end_task(s); goto failed; }
+    /* Only for automation, and only top-level: a frame's testdriver goes through its top window's. */
+    if (s->host.automation && !d->frame_parent) {
+        JSValue global = JS_GetGlobalObject(s->ctx);
+        int defined = JS_DefinePropertyValueStr(s->ctx, global, "__nocturne_automation",
+            JS_NewCFunction(s->ctx, native_automation, "__nocturne_automation", 2), JS_PROP_CONFIGURABLE);
+        if (defined >= 0 && s->host.automation_cookies && s->host.automation_delete_cookies)
+            defined = JS_DefinePropertyValueStr(s->ctx, global, "__nocturne_cookies",
+                JS_NewCFunction(s->ctx, native_automation_cookies, "__nocturne_cookies", 3), JS_PROP_CONFIGURABLE);
+        JS_FreeValue(s->ctx, global);
+        if (defined < 0) { exception(s); end_task(s); goto failed; }
+    }
     storage_subscribe_document(s);
     end_task(s); s->starting = false;
     /* A script-disabled sandbox realm stays active for its same-origin
@@ -10517,6 +10764,7 @@ void web_js_free(web_doc *d) {
         web_worker_free(s->workers); s->workers = NULL;
         while (s->worker_groups) { struct js_worker_group *g = s->worker_groups; s->worker_groups = g->next; js_free(s->ctx, g); }
         while (s->sockets) socket_drop(s, s->sockets);
+        while (s->automations) { struct js_automation *p = s->automations; s->automations = p->next; automation_free(s, p); }
         release_document_tasks(s);
         while (s->image_decodes) {
             struct js_image_decode *p = s->image_decodes; s->image_decodes = p->next;

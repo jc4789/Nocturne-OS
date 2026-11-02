@@ -26,6 +26,7 @@
 #include "sys/sched.h"
 #include "sys/thread.h"
 #include "sys/epoch.h"
+#include "sys/prof.h"
 #include "arch/wake.h"
 
 __attribute__((used, section(".limine_requests_start")))
@@ -56,18 +57,63 @@ volatile struct limine_module_request module_req = {.id = LIMINE_MODULE_REQUEST_
 __attribute__((used, section(".limine_requests")))
 volatile struct limine_rsdp_request rsdp_req = {.id = LIMINE_RSDP_REQUEST_ID, .revision = 0};
 
+#ifdef NOCTURNE_TEST_FLAGS
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_executable_cmdline_request cmdline_req = {.id = LIMINE_EXECUTABLE_CMDLINE_REQUEST_ID, .revision = 0};
+#endif
+
 __attribute__((used, section(".limine_requests_end")))
 static volatile uint64_t requests_end[] = LIMINE_REQUESTS_END_MARKER;
 
 uint64_t hhdm_offset;
+#ifdef NOCTURNE_TEST_FLAGS
+static const char *test_cmdline = "";
+#endif
 
 void kmain_late(void);
+
+#ifdef NOCTURNE_TEST_FLAGS
+bool test_flag(const char *word) {
+    size_t n = strlen(word);
+    for (const char *p = test_cmdline; *p; p++) {
+        if ((p == test_cmdline || p[-1] == ' ') && !strncmp(p, word, n) && (p[n] == 0 || p[n] == ' '))
+            return true;
+    }
+    return false;
+}
+
+const char *test_text(const char *key) {
+    size_t n = strlen(key);
+    for (const char *p = test_cmdline; *p; p++)
+        if ((p == test_cmdline || p[-1] == ' ') && !strncmp(p, key, n) && p[n] == '=') return p + n + 1;
+    return NULL;
+}
+
+bool test_number(const char *key, uint64_t *out) {
+    size_t n = strlen(key);
+    bool found = false;
+    for (const char *p = test_cmdline; *p; p++) {
+        if ((p != test_cmdline && p[-1] != ' ') || strncmp(p, key, n) || p[n] != '=') continue;
+        const char *q = p + n + 1;
+        uint64_t value = 0;
+        bool valid = *q >= '0' && *q <= '9';
+        while (*q >= '0' && *q <= '9') {
+            unsigned digit = *q++ - '0';
+            if (value > (UINT64_MAX - digit) / 10) valid = false;
+            if (valid) value = value * 10 + digit;
+        }
+        if (valid && (!*q || *q == ' ')) { *out = value; found = true; }
+    }
+    return found;
+}
+#endif
 
 /* CPU 0 from here on its idle thread's own stack (sys/sched.h), as each other CPU from ap_main. */
 static NORETURN void kmain_scheduled(void *unused) {
     (void)unused;
     alarm_init_cpu(); /* CPU 0's wake device: no periodic tick on any CPU */
     log_start();      /* the log's readers: the boot screen's thread, the serial port's */
+    prof_init();      /* before the other CPUs: each starts its samples as it comes up */
     smp_init();
     sti();
     input_init();
@@ -91,6 +137,9 @@ void kmain(void) {
         for (;;) hlt();
     }
     hhdm_offset = hhdm_req.response->offset;
+#ifdef NOCTURNE_TEST_FLAGS
+    if (cmdline_req.response && cmdline_req.response->cmdline) test_cmdline = cmdline_req.response->cmdline;
+#endif
     boot_record_read();
 
     /* The CPU: what it has, then its state as every other CPU's (arch/cpu.h), the memory types

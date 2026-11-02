@@ -902,3 +902,62 @@ size_t webcookie_clear(webcookie_jar *j,const char *site){
     note_clear(j,host);
     return removed;
 }
+_Static_assert(S_LAX==WEBCOOKIE_SAME_SITE_LAX&&S_STRICT==WEBCOOKIE_SAME_SITE_STRICT&&S_NONE==WEBCOOKIE_SAME_SITE_NONE,"SameSite values");
+/* An associated cookie of a document at a (webcookie_associated): the cookie-string for an HTTP
+   API holds it, and its name is name unless that is NULL. The document is taken for the
+   top-level one: a partitioned cookie is associated under its own site's key alone. */
+static bool associated(const struct cookie *c,const struct address *a,const char *name,const char *key){
+    return sent_to(c,a,true)&&partition_sent(c,key)&&(!name||!strcmp(c->name,name));
+}
+long webcookie_associated(webcookie_jar *j,const char *url,const char *name,struct webcookie_record **out,int64_t now){
+    if(!out)return -1;
+    *out=NULL;if(!j)return -1;
+    struct address a;int parsed=address(url,&a);
+    if(parsed!=1)return parsed;
+    purge(j,now);
+    long result=0;size_t count=0,bytes=0;
+    struct cookie **list=NULL;char *key=NULL;
+    if(url_site(j,url,&key)<0)result=-1;
+    else if(!(policy(j,a.host)&WEBCOOKIE_BLOCK)&&j->count){ /* the user's block: no Cookie field */
+        if(!(list=malloc(j->count*sizeof *list)))result=-1;
+        else for(size_t i=0;i<j->count;i++){
+            struct cookie *c=j->cookies[i];
+            if(associated(c,&a,name,key)){list[count++]=c;bytes+=c->nl+c->vl+c->dl+c->pl+4;}
+        }
+    }
+    free(key);
+    if(count){
+        qsort(list,count,sizeof *list,send_order);
+        struct webcookie_record *r=malloc(count*sizeof *r+bytes);
+        if(!r)result=-1;
+        else{
+            char *text=(char *)(r+count);
+            for(size_t i=0;i<count;i++){
+                struct cookie *c=list[i];
+                const char *from[4]={c->name,c->value,c->domain,c->path};
+                size_t len[4]={c->nl,c->vl,c->dl,c->pl};
+                const char **to[4]={&r[i].name,&r[i].value,&r[i].domain,&r[i].path};
+                for(int k=0;k<4;k++){memcpy(text,from[k],len[k]+1);*to[k]=text;text+=len[k]+1;}
+                r[i].host_only=c->flags&F_HOST;r[i].secure=c->flags&F_SECURE;r[i].http_only=c->flags&F_HTTP;
+                r[i].persistent=c->flags&F_PERSIST;r[i].same_site=c->same;r[i].expires=r[i].persistent?c->expires:0;
+                c->access=stamp(j,now);
+            }
+            *out=r;result=(long)count;
+        }
+    }
+    free(list);address_free(&a);
+    return result;
+}
+long webcookie_delete_associated(webcookie_jar *j,const char *url,const char *name,int64_t now){
+    if(!j)return -1;
+    struct address a;int parsed=address(url,&a);
+    if(parsed!=1)return parsed;
+    purge(j,now);
+    long removed=0;char *key=NULL;
+    if(url_site(j,url,&key)<0)removed=-1;
+    else if(!(policy(j,a.host)&WEBCOOKIE_BLOCK)){
+        for(size_t i=0;i<j->count;)if(associated(j->cookies[i],&a,name,key)){evict(j,i);removed++;}else i++;
+    }
+    free(key);address_free(&a);
+    return removed;
+}

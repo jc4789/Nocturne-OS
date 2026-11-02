@@ -55,6 +55,16 @@ void boot_record_read(void) {
         }
         if (wanted.magic) memcpy(now, wanted.value, sizeof now);
     }
+#ifdef NOCTURNE_TEST_FLAGS
+    static const struct {
+        const char *word;
+        enum n_boot_key key;
+        int32_t value;
+    } flags[] = {{"noiommu", N_BOOT_IOMMU, 0}, {"noaml", N_BOOT_ACPI_AML, 0}, {"nosmp", N_BOOT_SMP, 0},
+                 {"noresume", N_BOOT_RESUME, 0}, {"appdrivers-unisolated", N_BOOT_UNISOLATED_DRIVERS, 1}};
+    for (size_t i = 0; i < ARRAY_SIZE(flags); i++)
+        if (test_flag(flags[i].word)) now[flags[i].key] = flags[i].value;
+#endif
 }
 
 int32_t boot_setting(enum n_boot_key key) { return now[key]; }

@@ -62,6 +62,7 @@
 - 起動は serial の `store: C: "Nocturne" on nvme0` で確かめる。UEFI と Limine の待ちを含めて十数秒で出なければ、待たずに原因を見る。
 - `screendump` の保存先は**スラッシュ区切りの絶対 path**。バックスラッシュの path は黙って保存されない。
 - 同じ TCP monitor へ競合して接続しない。一回の接続で命令を順に送り、終わったら閉じる。
+- `C:\Tests\autorun.sh` があれば init がそれを走らせ、終わると電源を切る。通常の `build/nocturne.img` には無いので、デスクトップのまま操作できる。
 - `snapshot=on` ではブラウザーの profile は毎回初回訪問者になる。サイトの A/B の違いもありうるので、参照画像の部品と照合して判定する。
 - **再起動をまたぐ保存の確認**は、使い捨ての qcow2 の overlay を作業場に作って行う：`qemu-img create -f qcow2 -b "<絶対path>/build/nocturne.img" -F raw <作業場>/persist.qcow2`（`tools\msys64\ucrt64\bin\qemu-img.exe`）。`snapshot=on` を外し、`-drive id=boot,file=<作業場>/persist.qcow2,format=qcow2,if=none` で起こす。差分だけが overlay に入り、`build/nocturne.img` は変わらない。書いた直後に HMP の `quit` で切り、同じ overlay で起動し直す。nocturne.img を組み直したら overlay は捨てる。build の下には置かない。
 - WHPX では CPU の reset が戻らない：`system_reset` も S3 からの起こし（`system_wakeup`）も、stderr に `failed to get xsave state` と `WHPX: Unexpected VP exit code 4` を出して `paused` で止まり、`cont` でも戻らない。再起動は `quit` してから起動し直す。S3 からの復帰は WHPX では確かめられない（Hyper-V か実機）。

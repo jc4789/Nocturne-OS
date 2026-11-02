@@ -182,6 +182,13 @@ static int e1000_send(struct netif *self, const void *frame, size_t len) {
     return 0;
 }
 
+static uint32_t e1000_itr_ticks(void) {
+    uint64_t us;
+    if (!test_number("e1000-itr-us", &us) || us > (uint64_t)UINT16_MAX * ITR_TICK_NS / 1000)
+        return ITR_DEFAULT_TICKS;
+    return (uint32_t)((us * 1000 + ITR_TICK_NS - 1) / ITR_TICK_NS);
+}
+
 /* Power change (dev/pm.h): no more interrupts, receive or transmit DMA. */
 static bool e1000_quiesce(void *arg) {
     (void)arg;
@@ -324,8 +331,8 @@ bool e1000_probe(void) {
     rx_ring_phys = rx_ring;
     tx_ring_phys = tx_ring;
     if (d->device != 0x100C) {
-        itr_ticks = ITR_DEFAULT_TICKS;
-        kprintf("net: e1000 ITR %u x %u ns\n", itr_ticks, ITR_TICK_NS);
+        itr_ticks = e1000_itr_ticks();
+        kprintf("net: e1000 ITR %u x %u ns (e1000-itr-us=0 disables)\n", itr_ticks, ITR_TICK_NS);
     }
 
     /* its INTx, through the IOAPIC line ACPI routes it to (the models this drives have no MSI) */

@@ -1,7 +1,7 @@
 /* HTTP/1 parser fixtures replace exactly one ns_open transaction. A persistent
    pool must not retain their borrowed, rewritten static wire between cases.
-   Entering HTTP/2 in one of these HTTP/1-only mocks is a fixture error and
-   aborts immediately. */
+   HTTP/2 is exercised by transport8 over real native streams; entering it in
+   one of these HTTP/1-only mocks is a fixture error and aborts immediately. */
 #pragma once
 #include <stdlib.h>
 #include <string.h>

@@ -1,7 +1,7 @@
 """Focused actual C/QuickJS Navigator contract, with only syscall/host shims.
 
 The production realm initializer, cookie capability callback and HTTP header
-builder are executed.
+builder are executed. The same JS assertion table is used by navigatortest.c.
 This host probe is not a substitute for OS Worker or real-site acceptance.
 """
 from pathlib import Path

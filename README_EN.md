@@ -53,8 +53,8 @@ general-purpose OS for daily use (see [Limits](#limits)).
   other CPU (AP) runs app threads from its own run queue.
   - The "Kei" scheduler (`sys/kei.c`, `sys/sched.c`): fair selection by weighted virtual time, one queue per AP,
     idle APs taking waiting threads, and keeping a thread when a switch costs more than it gains.
-  - TLB shootdown by IPI, PCID, AVX state saved with XSAVE, and top performance set through CPPC or HWP on real
-    hardware.
+  - TLB shootdown by IPI, PCID, AVX state saved with XSAVE, top performance set through CPPC or HWP on real
+    hardware, and a sampling profiler (`prof`).
   - The clock is the TSC alone (an invariant TSC is required on hardware). Its rate starts at boot from the P0
     P-state's nominal frequency (PStateDef's FID and DID) on hardware, or the hypervisor's word in a VM; on hardware
     it is measured on against the HPET over windows that double (spread spectrum and the like), and stays nominal
@@ -74,7 +74,7 @@ general-purpose OS for daily use (see [Limits](#limits)).
   - Input: Hyper-V synthetic keyboard and absolute mouse, USB HID.
   - Network: Intel e1000, DEC 21140/21143 (tulip), Hyper-V's synthetic adapter, Realtek RTL8125B (2.5GbE) and
     USB Ethernet (CDC ECM/NCM).
-  - Display: the framebuffer Limine hands over. virtio-gpu (virgl) is experimental and runs only when the VM has the device.
+  - Display: the framebuffer Limine hands over. virtio-gpu (virgl) is experimental and off by default (`gpu-enable`).
     On an NVIDIA GPU (tested: RTX 4070), nvrm (a port of NVIDIA's RM 615.78.08, [ports/nvidia](ports/nvidia/README.md))
     sets modes, paces frames by the vertical blank and changes the refresh rate, and WebGL draws on the GPU with Zink and
     NVK. The GSP firmware is not distributed; whoever builds puts it on their own disk.
@@ -640,7 +640,7 @@ host/         host tools (store: makes, reads, writes and checks C:)
 ports/        build settings and patches for ported code (tcc, go, rust, typescript, lexbor, freetype, ffmpeg, mesa, nvidia, wabt, virgl)
 third_party/  vendored sources (see Credits)
 scripts/      boot disk (mkimage.sh, layout.py) and SDK (mksdk.sh) builders, qtest.py, hv-*.ps1
-tests/        test programs to compile inside the OS, host-side checks, test material
+tests/        the in-OS test suite (runtests.c and the programs it compiles), host-side checks, test material
 docs/         README pictures, design documents and work logs
 build.ps1     build entry point
 hyperv.ps1    Hyper-V VM setup

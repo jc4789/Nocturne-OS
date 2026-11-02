@@ -10,7 +10,7 @@
  * serializer, Range, Selection, MutationObserver, events and computed style are Chrome's, not
  * the product's (dom.c, js_range.js, cssom.c): this shows what the editing layer does over a
  * mature DOM, which separates the layer's own faults from the guest's DOM and CSSOM ones. It is
- * not the guest browser. The bridge's native questions are answered here as
+ * not the guest browser and not wptrunner. The bridge's native questions are answered here as
  * js_document_commands.h answers them: a color as getComputedStyle() serializes it (here through
  * a canvas's fillStyle) or null for no color and currentcolor; the font keywords' pixel sizes
  * (cssprop.c's table). A focused text control's plain-text commands (js_document_commands.h's
