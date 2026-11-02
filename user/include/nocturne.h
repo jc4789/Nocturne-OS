@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "abi.h"
+#include "settings_abi.h"
 #include "gfx.h"
 #include <cdefs.h>
 NOCTURNE_BEGIN_DECLS
@@ -281,9 +282,15 @@ n_handle n_audio_open(void); /* N_ERR_BUSY when every stream is taken */
 n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_t flags);
 n_result n_audio_status(n_handle a, struct n_audio_status *out);
 n_result n_audio_flush(n_handle a);
-/* The master volume and muting as set says (N_AUDIO_SET_VOLUME, N_AUDIO_SET_MUTED; 0 only reads),
-   then *io filled with them and what plays the sound (struct n_audio_output, abi.h). */
-n_result n_audio_output(struct n_audio_output *io, uint32_t set);
+/* *io filled with the master volume, muting and what plays the sound (struct n_audio_output, abi.h). */
+n_result n_audio_output(struct n_audio_output *io);
+/* What the kernel goes by (docs/nocturne-native-abi.md §12, settings_abi.h). Applying takes the right
+   to (N_CAP_SETTINGS_APPLY), and is the settings service's: a program asks the service. effective:
+   the bytes of the value now, however many, and what fits cap in out. */
+n_result n_settings_apply(n_handle cap, uint32_t domain, uint32_t key, const void *value, size_t size);
+n_result n_settings_effective(uint32_t domain, uint32_t key, void *out, size_t cap);
+n_result n_settings_describe(uint32_t domain, uint32_t key, struct n_setting_desc *out);
+n_handle n_settings_watch(uint32_t domain);
 /* A watch on what n_audio_output reports: the volume, muting and what plays the sound. */
 n_handle n_audio_output_watch(void);
 /* Watches (N_KIND_WATCH, docs/nocturne-native-abi.md §1): N_EVENT_RECEIVABLE once what the watch

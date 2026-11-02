@@ -152,7 +152,7 @@ enum {
     SYS_CAP_DERIVE,           /* (cap, enum n_cap) -> handle */
     SYS_SERVICE_REGISTER,     /* (N_CAP_SERVICE_ROOT の cap) -> 接続の要求を受ける channel */
     SYS_SERVICE_CONNECT,      /* (name, name_len) -> channel */
-    SYS_STORE_PRIVATE_OPEN,   /* (N_CAP_STORE_PRIVATE の cap, region, ...) -> document */
+    SYS_STORE_PRIVATE_OPEN,   /* (N_CAP_STORE_PRIVATE の cap, region, user, access) -> document（§3） */
     SYS_SETTINGS_APPLY,       /* (N_CAP_SETTINGS_APPLY の cap, domain, key, value, len) */
     SYS_SETTINGS_EFFECTIVE,   /* (domain, key, out, cap): 今の値のバイト数（§12） */
     SYS_SETTINGS_DESCRIBE,    /* (domain, key, struct n_setting_desc *out)（§12） */

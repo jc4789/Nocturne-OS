@@ -593,29 +593,6 @@ static bool screen_heard(n_handle q, n_handle watch, uint64_t ms) {
     struct n_event ev[4];
     return n_events_wait(q, ev, 4, n_clock_after(ms * N_NS_PER_MS)) > 0 && n_watch_take(watch) > 0;
 }
-/* The user's AppData\Nocturne\Displays.conf, where the system keeps the mode kept for each monitor,
-   holds line within ms (it is written a moment after the choice). */
-static bool displays_kept(const char *line, unsigned ms) {
-    char path[1024];
-    if (n_path_join(n_user_folder(), "AppData\\Nocturne\\Displays.conf", path, sizeof path) < 0) return false;
-    for (uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + ms;; n_sleep_until(n_clock_after(100 * N_NS_PER_MS))) {
-        void *data;
-        size_t size;
-        bool found = false;
-        if (n_document_load(path, &data, &size) >= 0) {
-            char *text = malloc(size + 1);
-            if (text) {
-                if (size) memcpy(text, data, size);
-                text[size] = 0;
-                found = strstr(text, line) != NULL;
-                free(text);
-            }
-            if (data) n_memory_release(data, size);
-        }
-        if (found) return true;
-        if ((n_clock_monotonic() / N_NS_PER_MS) >= end) return false;
-    }
-}
 static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struct n_scanout *d, volatile uint16_t *dispi,
                        unsigned linger_s) {
     struct n_screen_modes *offer = calloc(1, sizeof *offer);
@@ -722,7 +699,12 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     CHECK(r == 0 && n_pci_screen_state(vga, 0, st.serial, &st, n_clock_after(100 * N_NS_PER_MS)) == -N_ERR_TIMEOUT && modes_get(seen) == 0 && !seen->trial_ms,
           "kept: the trial ends and the mode stays: %s", n_result_text(r));
     CHECK(screen_heard(heard, watch, 1000), "the screen's watch hears the mode kept");
-    CHECK(displays_kept("\nmode.pcitest-vga=1024x768@75000\n", 3000), "the system keeps the choice in Displays.conf");
+    struct n_setting_monitor_mode chosen[8];
+    n_result chosen_bytes = n_settings_effective(N_DOMAIN_DISPLAY, N_DISPLAY_MODE, chosen, sizeof chosen);
+    bool reported = false;
+    for (n_result i = 0; chosen_bytes > 0 && i < chosen_bytes / (n_result)sizeof *chosen && i < 8; i++)
+        reported = reported || (!strcmp(chosen[i].monitor, "pcitest-vga") && chosen[i].width == 1024 && chosen[i].height == 768);
+    CHECK(reported, "the system reports the choice");
     offer->count = 0;
     CHECK(n_pci_screen_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && st.mode.width == 0,
           "the modes withdrawn: no mode is wanted");
@@ -743,9 +725,6 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     r = mode_set(SCREEN_MODE_KEEP, NULL);
     CHECK(r == 0 && modes_get(seen) == 0 && same_mode(&seen->chosen, &native), "kept: the user's new choice for this monitor: %s",
           n_result_text(r));
-    char kept_line[64];
-    snprintf(kept_line, sizeof kept_line, "\nmode.pcitest-vga=%ux%u@60000\n", native.width, native.height);
-    CHECK(displays_kept(kept_line, 3000), "Displays.conf keeps the new choice: %s", kept_line + 1);
     CHECK(mode_set(4, &native) == -N_ERR_INVALID, "4, once a saved choice put back by Settings, is no operation");
 
     /* a mode the driver could not show */

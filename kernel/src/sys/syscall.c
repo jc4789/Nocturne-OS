@@ -555,12 +555,14 @@ static int64_t sys_document_open(const char *upath, int access) {
     return r < 0 ? r : handle_install(h);
 }
 
-/* A private region (fs/store.h): whoever holds the right, by its number and its user's. */
-static int64_t sys_store_private_open(int cap, uint32_t user, uint32_t region, int access) {
+/* A private region (fs/store.h): whoever holds the right, by its number and its user's (0: the
+   machine's). access 0 is N_DOCUMENT_EDIT. */
+static int64_t sys_store_private_open(int cap, uint64_t region, uint64_t user, int access) {
     int r = cap_check(cap, N_CAP_STORE_PRIVATE);
     if (r < 0) return r;
+    if (region > UINT32_MAX || user > UINT32_MAX) return -N_ERR_INVALID;
     struct handle *h;
-    r = store_private_open(user, region, access, &h);
+    r = store_private_open((uint32_t)region, (uint32_t)user, access ? access : N_DOCUMENT_EDIT, &h);
     return r < 0 ? r : handle_install(h);
 }
 
@@ -1294,7 +1296,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_PAGER_SUPPLY: ret = sys_pager_supply((int)a, (const struct n_pager_supply *)b, c); break;
     case SYS_PAGER_REVOKE: ret = sys_pager_revoke((int)a, b, c, (uint32_t)d); break;
     case SYS_PAGER_FAIL: ret = sys_pager_fail((int)a, b, c); break;
-    case SYS_STORE_PRIVATE_OPEN: ret = sys_store_private_open((int)a, (uint32_t)b, (uint32_t)c, (int)d); break;
+    case SYS_STORE_PRIVATE_OPEN: ret = sys_store_private_open((int)a, b, c, (int)d); break;
     case SYS_SETTINGS_APPLY: ret = settings_syscall_apply((int)a, (uint32_t)b, (uint32_t)c, (const void *)d, e); break;
     case SYS_SETTINGS_EFFECTIVE: ret = settings_syscall_effective((uint32_t)a, (uint32_t)b, (void *)c, d); break;
     case SYS_SETTINGS_DESCRIBE: ret = settings_syscall_describe((uint32_t)a, (uint32_t)b, (void *)c); break;

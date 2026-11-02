@@ -501,7 +501,18 @@ n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_
 }
 n_result n_audio_status(n_handle a, struct n_audio_status *out) { return NC5(SYS_AUDIO_STATUS, a, out, 0, 0, 0); }
 n_result n_audio_flush(n_handle a) { return NC5(SYS_AUDIO_FLUSH, a, 0, 0, 0, 0); }
-n_result n_audio_output(struct n_audio_output *io, uint32_t set) { return NC5(SYS_AUDIO_OUTPUT, io, set, 0, 0, 0); }
+n_result n_audio_output(struct n_audio_output *io) { return NC5(SYS_AUDIO_OUTPUT, io, 0, 0, 0, 0); }
+n_result n_settings_apply(n_handle cap, uint32_t domain, uint32_t key, const void *value, size_t size) {
+    return NC5(SYS_SETTINGS_APPLY, cap, domain, key, value, size);
+}
+n_result n_settings_effective(uint32_t domain, uint32_t key, void *out, size_t cap) {
+    return NC5(SYS_SETTINGS_EFFECTIVE, domain, key, out, cap, 0);
+}
+n_result n_settings_describe(uint32_t domain, uint32_t key, struct n_setting_desc *out) {
+    return NC5(SYS_SETTINGS_DESCRIBE, domain, key, out, 0, 0);
+}
+n_handle n_settings_watch(uint32_t domain) { return (n_handle)NC5(SYS_SETTINGS_WATCH, domain, 0, 0, 0, 0); }
+n_result n_entry_set_owner(const char *path, uint32_t user) { return NC5(SYS_ENTRY_SET_OWNER, path, user, 0, 0, 0); }
 n_handle n_audio_output_watch(void) { return (n_handle)NC5(SYS_AUDIO_OUTPUT_WATCH, 0, 0, 0, 0, 0); }
 n_result n_watch_take(n_handle watch) { return NC5(SYS_WATCH_TAKE, watch, 0, 0, 0, 0); }
 n_handle n_events_create(void) { return (n_handle)NC5(SYS_EVENTS_CREATE, 0, 0, 0, 0, 0); }

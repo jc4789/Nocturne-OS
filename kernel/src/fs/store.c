@@ -17,10 +17,9 @@
 #include "arch/percpu.h"
 #include "arch/topology.h"
 #include "authority_abi.h"
-#include "sys/process.h"
 
-/* sys/process.c: what the kernel knows the process to be. */
-struct n_identity process_identity(const struct process *p);
+/* sys/authority.c: what the kernel knows the calling app to be. */
+const struct n_identity *identity_current(void);
 
 #define WRITE_DELAY_NS (5 * NS_PER_S) /* the first change waits this long for more to commit with it */
 #define FIND_NS (10 * NS_PER_S)       /* how long the disk the system started from may take to appear */
@@ -649,8 +648,6 @@ static bool place_allows(const struct place *p, const struct n_identity *who, bo
     return false;
 }
 
-static struct n_identity caller(void) { return process_identity(process_current()); }
-
 /* ---- paths ---- */
 
 int place_find(const char *text, bool user, struct place *out) {
@@ -663,8 +660,7 @@ int place_find(const char *text, bool user, struct place *out) {
     out->folder_attributes = out->record.attributes;
     out->found = true;
     out->area = AREA_TOP;
-    struct n_identity who = {0};
-    if (user) who = caller();
+    const struct n_identity *who = user ? identity_current() : NULL;
     for (size_t i = 0; i < out->path.count; i++) {
         if (out->record.kind != STORE_FOLDER) {
             r = -N_ERR_NOT_FOLDER;
@@ -680,7 +676,7 @@ int place_find(const char *text, bool user, struct place *out) {
         if (r >= 0) r = ns_record(v, out->entry.id, &out->record, NULL);
         if (r >= 0 && user && (out->record.attributes & STORE_PRIVATE)) r = -N_ERR_NOT_FOUND;
         area_step(out, i, r >= 0);
-        if (user && !place_allows(out, &who, false)) {
+        if (user && !place_allows(out, who, false)) {
             r = -N_ERR_DENIED;
             goto fail;
         }
@@ -725,10 +721,10 @@ int place_lock(struct place *p, bool user, struct folder_lock **out) {
 
 int place_may_change(const struct place *p, bool user, bool entry) {
     if (!user) return 0;
-    struct n_identity who = caller();
+    const struct n_identity *who = identity_current();
     if (entry && p->found && (p->entry.id == store.system || p->entry.id == store.programs || p->entry.id == store.users))
-        return who.cls >= N_CLASS_SYSTEM ? 0 : -N_ERR_DENIED;
-    return place_allows(p, &who, true) ? 0 : -N_ERR_DENIED;
+        return who->cls >= N_CLASS_SYSTEM ? 0 : -N_ERR_DENIED;
+    return place_allows(p, who, true) ? 0 : -N_ERR_DENIED;
 }
 
 void entry_fill(struct n_entry *out, const char *name, size_t n, uint64_t id, const struct store_record *rec) {
@@ -868,7 +864,7 @@ int store_folder_create(const char *path, bool user) {
 }
 
 int store_entry_set_owner(const char *path, uint32_t owner, bool user) {
-    if (user && caller().cls < N_CLASS_ADMIN) return -N_ERR_DENIED;
+    if (user && identity_current()->cls < N_CLASS_ADMIN) return -N_ERR_DENIED;
     struct place p;
     int r = place_find(path, user, &p);
     if (r < 0) return r;

@@ -62,7 +62,7 @@ int store_document_commit(struct handle *h, int how);
    user (0: the machine's) and its own. access: N_DOCUMENT_READ (-N_ERR_NOT_FOUND while it has no
    content yet), N_DOCUMENT_EDIT, or N_DOCUMENT_REPLACE, whose new content is swapped in whole when
    saved (store_document_commit), as for any document. The caller has checked its right to it. */
-int store_private_open(uint32_t user, uint32_t region, int access, struct handle **out);
+int store_private_open(uint32_t region, uint32_t user, int access, struct handle **out);
 
 /* The user a name belongs to from now on: admin and above (user: for an app). What is in a folder
    already keeps the number it has. */

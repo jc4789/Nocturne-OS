@@ -732,7 +732,7 @@ int store_document_open(const char *path, int access, bool user, struct handle *
     return r;
 }
 
-int store_private_open(uint32_t user, uint32_t region, int access, struct handle **out) {
+int store_private_open(uint32_t region, uint32_t user, int access, struct handle **out) {
     if ((access != N_DOCUMENT_READ && access != N_DOCUMENT_EDIT && access != N_DOCUMENT_REPLACE) || !region)
         return -N_ERR_INVALID;
     struct volume *v = store.v;
