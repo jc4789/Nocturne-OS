@@ -73,11 +73,14 @@ static const struct declared_service declared[] = {
      CAPS(N_CAP_POWER, N_CAP_SCREEN_READ), .on_failure = {3, 500, 60000}, .clients_from = N_CLASS_USER},
     /* 試験の媒体にだけあるプログラム。C:\Nocturne\System の中にあるので、アプリは置けない。 */
     {.name = "tests", .program = "testrun", .cls = N_CLASS_SYSTEM, .at_boot = true, .optional = true,
-     CAPS(N_CAP_POWER, N_CAP_PCI_CLAIM, N_CAP_SCREEN_READ, N_CAP_IDENTITY_GRANT), .needs = NAMES("accounts"),
+     CAPS(N_CAP_POWER, N_CAP_PCI_CLAIM, N_CAP_SCREEN_READ, N_CAP_IDENTITY_GRANT), .needs = NAMES("accounts", "audio"),
      .clients_from = CLIENTS_NONE},
     {.name = "session", .program = "session", .cls = N_CLASS_SYSTEM, .at_boot = true, .console = true,
-     CAPS(N_CAP_IDENTITY_GRANT, N_CAP_SHELL), .needs = NAMES("accounts", "tests"),
+     CAPS(N_CAP_IDENTITY_GRANT, N_CAP_SHELL), .needs = NAMES("accounts", "tests", "audio"),
      .on_failure = {5, 1000, 60000}, .clients_from = N_CLASS_USER},
+    /* 音の方針と混合の持ち主。カーネルの音の出口を開く能力はここにだけ渡す。 */
+    {.name = "audio", .program = "audio", .cls = N_CLASS_SYSTEM, .at_boot = true, .optional = true,
+     CAPS(N_CAP_AUDIO_DEVICE), .needs = NAMES("settings"), .on_failure = {5, 500, 60000}, .clients_from = N_CLASS_USER},
 };
 #define DECLARED (sizeof declared / sizeof *declared)
 #define STOP_GRACE_MS 5000u /* 閉じた後、これだけ待って強制的に止める */

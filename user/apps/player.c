@@ -24,7 +24,7 @@
 
 static char dir[1024], names[MAXT][128], error[160];
 static int ntracks, cur = -1;
-static n_handle stream = -1;
+static n_audio_stream *stream;
 static struct wav wav;
 static bool loaded, playing;
 static uint64_t sent;     /* frames written since the track (or the last seek) started */
@@ -56,7 +56,7 @@ static uint32_t now_frame(void) {
     if (!loaded) return 0;
     uint64_t queued = 0;
     struct n_audio_status st;
-    if (stream >= 0 && playing && n_audio_status(stream, &st) == 0)
+    if (stream && playing && n_audio_status(stream, &st) == 0)
         queued = (uint64_t)st.queued_frames + st.device_pending_frames;
     uint64_t heard = sent > queued ? sent - queued : 0;
     uint64_t f = base + heard * wav.rate / SOUND_RATE;
@@ -64,7 +64,7 @@ static uint32_t now_frame(void) {
 }
 
 static void stop(void) {
-    if (stream >= 0) n_audio_flush(stream); /* what is queued is not heard any more */
+    if (stream) n_audio_flush(stream); /* what is queued is not heard any more */
     playing = false;
     if (loaded) wav_close(&wav);
     loaded = false;
@@ -84,12 +84,12 @@ static void play_track(int i) {
         return;
     }
     loaded = true;
-    playing = stream >= 0;
+    playing = stream != NULL;
 }
 
 static void seek_to(uint32_t frame) {
     if (!loaded) return;
-    if (stream >= 0) n_audio_flush(stream); /* the old place's queued sound is not heard */
+    if (stream) n_audio_flush(stream); /* the old place's queued sound is not heard */
     wav_seek(&wav, frame);
     base = frame;
     sent = 0;
@@ -97,7 +97,7 @@ static void seek_to(uint32_t frame) {
 
 /* keep the stream AHEAD frames ahead of the speaker; at the end, go on to the next sound */
 static void pump(void) {
-    if (!playing || stream < 0) return;
+    if (!playing || !stream) return;
     uint32_t queued = 0;
     struct n_audio_status st;
     if (n_audio_status(stream, &st) < 0) return;
@@ -174,7 +174,7 @@ static void show(struct ui_session *s) {
     const char *line = info;
     uint32_t line_colour = t->textDim;
     if (error[0]) { line = error; line_colour = t->danger; }
-    else if (stream < 0) { line = "No sound: too many programs are playing."; line_colour = t->danger; }
+    else if (!stream) { line = "No sound."; line_colour = t->danger; }
     uint32_t at = now_frame(), at_ms = loaded ? wav_ms(&wav, at) : 0, total_ms = loaded ? wav_ms(&wav, wav.frames) : 0;
     clock_text(t1, at_ms);
     clock_text(t2, total_ms);
@@ -236,7 +236,7 @@ static void toggle(void) {
         uint32_t at = now_frame();
         playing = false;
         seek_to(at);
-    } else playing = stream >= 0;
+    } else playing = stream != NULL;
     if (playing && wav.eof) seek_to(0);
 }
 
@@ -257,7 +257,7 @@ int main(int argc, char **argv) {
     if (!s || ui_window(s, WINDOW, W, H, WIN_CENTER, "Sound Player", NULL, NULL) < 0) return 1;
     canvas_t *wave = ui_surface(s, SCOPE, SCOPE_W, SCOPE_H, 0);
     if (!wave) return 1;
-    stream = n_audio_open();
+    n_audio_open(&SOUND_FORMAT, &stream);
     if (start) {
         const char *base_name = n_path_name(start);
         for (int i = 0; i < ntracks; i++)

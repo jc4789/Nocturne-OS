@@ -36,7 +36,7 @@ struct voice {
 };
 static struct voice voices[NVOICES];
 static int sound = 0, octave = 4, mouse_note = -1;
-static n_handle stream = -1;
+static n_audio_stream *stream;
 static bool down[NNOTES];
 static int16_t scope[CHUNK * 2];
 static canvas_t *keys_c, *scope_c;
@@ -162,7 +162,7 @@ static void synth(int16_t *out, int frames) {
 
 /* keep the stream AHEAD frames ahead of the speaker while anything sounds */
 static void pump(void) {
-    if (stream < 0) return;
+    if (!stream) return;
     struct n_audio_status st;
     if (n_audio_status(stream, &st) < 0) return;
     uint32_t queued = st.queued_frames;
@@ -256,10 +256,10 @@ static void show(struct ui_session *s) {
                     ui_str(&m, "icon", "plus"); ui_num(&m, "compact", 1); ui_num(&m, "disabled", octave >= 6); ui_end(&m);
                 ui_end(&m);
                 ui_node(&m, "text");
-                ui_str(&m, "text", stream < 0 ? "No sound: every sound stream is taken"
+                ui_str(&m, "text", !stream ? "No sound"
                                               : "Tab: next sound   Left / Right: octave");
                 ui_str(&m, "style", "caption");
-                if (stream < 0) ui_num(&m, "colour", ui_theme.warning);
+                if (!stream) ui_num(&m, "colour", ui_theme.warning);
                 ui_end(&m);
             ui_end(&m);
             ui_node(&m, "surface"); ui_num(&m, "surface", S_SCOPE);
@@ -289,7 +289,7 @@ int main(void) {
     keys_c = ui_surface(s, S_KEYS, W, KEYS_H, 0);
     scope_c = ui_surface(s, S_SCOPE, SCOPE_W, SCOPE_H, 0);
     if (!keys_c || !scope_c) return 1;
-    stream = n_audio_open();
+    n_audio_open(&SOUND_FORMAT, &stream);
     flush_keys(s, true);
     draw_scope(scope_c);
     ui_surface_changed(s, S_SCOPE);

@@ -73,7 +73,7 @@ for domain, key, name in entries:
         problems.append(f'名前 {name}：ASCII の小文字、数字、「.」、「-」で 47 バイトまで')
 
 # カーネルの領域の鍵は全部宣言される。
-DOMAINS = {'n_boot_key': 'N_DOMAIN_BOOT', 'n_audio_key': 'N_DOMAIN_AUDIO', 'n_display_key': 'N_DOMAIN_DISPLAY',
+DOMAINS = {'n_boot_key': 'N_DOMAIN_BOOT', 'n_display_key': 'N_DOMAIN_DISPLAY',
            'n_window_key': 'N_DOMAIN_WINDOW', 'n_input_key': 'N_DOMAIN_INPUT', 'n_power_key': 'N_DOMAIN_POWER',
            'n_network_key': 'N_DOMAIN_NETWORK'}
 for enum, domain in DOMAINS.items():

@@ -312,7 +312,11 @@ static int bar_w;
 static bool speaker_hover;
 static struct n_shell_window *windows;
 static size_t windows_count, windows_room;
-static struct n_audio_output sound;
+static struct {
+    int32_t volume;
+    bool muted;
+    char *device; /* 音を出す装置の名。無ければ NULL。 */
+} sound;
 
 static window_t *menu, *volume;
 
@@ -583,7 +587,7 @@ static void volume_draw(void) {
     gfx_fill_round(c, 0, 0, VOLUME_W, VOLUME_H, 10, RGB(70, 60, 120));
     gfx_fill_round(c, 1, 1, VOLUME_W - 2, VOLUME_H - 2, 9, RGB(22, 20, 44));
     gfx_text(c, 16, 12, "Volume", RGB(245, 245, 255), TRANSPARENT, FONT_SMALL);
-    const char *device = sound.device[0] ? sound.device : "No sound device";
+    const char *device = sound.device ? sound.device : "No sound device";
     gfx_text(c, VOLUME_W - 16 - gfx_text_width(device, FONT_SMALL), 12, device, RGB(150, 150, 190), TRANSPARENT, FONT_SMALL);
     gfx_fill_round(c, m.x, m.y, m.w, m.h, 8, sound.muted ? RGB(90, 40, 60) : RGB(44, 38, 90));
     draw_speaker(c, m.x + m.w / 2 - 1, m.y + m.h / 2, sound.volume, sound.muted, RGB(235, 235, 250));
@@ -666,7 +670,8 @@ static void volume_event(const struct gui_event *e) {
 }
 
 static void sound_read(void) {
-    n_audio_output(&sound); /* 音を出す装置の名 */
+    free(sound.device);
+    sound.device = n_audio_output_name();
     int32_t value;
     if (n_setting_get_int(n_setting_at(N_DOMAIN_AUDIO, N_AUDIO_VOLUME), &value) >= 0) sound.volume = value;
     if (n_setting_get_int(n_setting_at(N_DOMAIN_AUDIO, N_AUDIO_MUTED), &value) >= 0) sound.muted = value != 0;
@@ -1044,7 +1049,7 @@ static void dispatch(const struct n_event *ev) {
         screens_changed();
         break;
     case TOKEN_SOUND:
-        n_watch_take(sound_watch);
+        n_audio_output_watch_take(sound_watch);
         sound_changed();
         break;
     case TOKEN_SOUND_SETTING:

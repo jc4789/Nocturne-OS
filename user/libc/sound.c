@@ -4,14 +4,14 @@
 
 #define PI 3.14159265358979323846
 
-static n_handle stream;
+static n_audio_stream *stream;
 static bool tried;
 static uint32_t noise_state = 0x9E3779B9;
 static int16_t buf[2 * SOUND_QUEUE];
 
 bool sound_effect(int hz, int hz2, int ms, int wave) {
-    if (!tried) { stream = n_audio_open(); tried = true; }
-    if (stream < 0 || hz <= 0 || ms <= 0) return false;
+    if (!tried) { n_audio_open(&SOUND_FORMAT, &stream); tried = true; }
+    if (!stream || hz <= 0 || ms <= 0) return false;
     int frames = ms * (SOUND_RATE / 1000);
     struct n_audio_status st;
     if (frames > SOUND_QUEUE || n_audio_status(stream, &st) < 0 || st.queued_frames + (uint32_t)frames > SOUND_QUEUE) return false;

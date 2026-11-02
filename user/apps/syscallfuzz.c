@@ -23,7 +23,7 @@
    Left out on purpose: calls that end, power off, launch or stop programs, sleep, claim
    hardware, use the network or change the volume the system keeps for the user (SYS_EXIT,
    SYS_POWER, SYS_SLEEP, SYS_THREAD_*, SYS_APP_LAUNCH, SYS_APP_OPEN,
-   SYS_WIN_CREATE, SYS_PCI_CLAIM, SYS_AUDIO_OUTPUT, 96..127).
+   SYS_WIN_CREATE, SYS_PCI_CLAIM, 96..127).
    Pointers into memory this program owns never reach calls that change mappings. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -143,7 +143,7 @@ static const struct sysinfo_ hinfo[] = {
     {SYS_CHANNEL_SEND, 1 | 8}, {SYS_CHANNEL_RECEIVE, 1}, {SYS_CHANNEL_PEER, 1},
     {SYS_APP_RESULT, 1}, {SYS_APP_STOP, 1}, {SYS_APP_ID, 1},
     {SYS_EVENTS_WATCH, 1 | 2}, {SYS_EVENTS_UNWATCH, 1}, {SYS_EVENTS_WATCH_ADDRESS, 1}, {SYS_EVENTS_TIMER, 1},
-    {SYS_EVENTS_WAIT, 1}, {SYS_AUDIO_SUBMIT, 1}, {SYS_AUDIO_STATUS, 1}, {SYS_AUDIO_FLUSH, 1},
+    {SYS_EVENTS_WAIT, 1}, {SYS_AUDIO_DEVICE_STATUS, 1}, {SYS_AUDIO_DEVICE_RUN, 1},
     {SYS_SHARED_MAP, 1}, {SYS_SHARED_VIEW, 1}, {SYS_PCI_INFO, 1}, {SYS_PCI_CONFIG_READ, 1},
     {SYS_PCI_CONFIG_WRITE, 1}, {SYS_PCI_BAR, 1}, {SYS_PCI_INTERRUPTS, 1}, {SYS_PCI_INTERRUPT_TAKE, 1},
     {SYS_DMA_CREATE, 1}, {SYS_DMA_ADDRESSES, 1},
@@ -162,7 +162,6 @@ static bool skipped(long n) {
     case SYS_EXIT: case SYS_SLEEP: case SYS_POWER: case SYS_THREAD_CREATE: case SYS_THREAD_JOIN:
     case SYS_THREAD_EXIT: case SYS_WAIT_ADDRESS: case SYS_WAIT_ADDRESS64:
     case SYS_APP_LAUNCH: case SYS_APP_OPEN: case SYS_WIN_CREATE: case SYS_PCI_CLAIM:
-    case SYS_AUDIO_OUTPUT: /* the volume, kept on C: for the user */
         return true;
     }
     return n >= SYS_NET_INFO && n < SYS_NET_LIMIT;
@@ -183,7 +182,7 @@ static bool creates_handle(long n) {
     switch (n) {
     case SYS_DOCUMENT_OPEN: case SYS_SERVICE_CONNECT: case SYS_SERVICE_REGISTER: case SYS_CAP_DERIVE:
     case SYS_SHARED_CREATE: case SYS_SHARED_RESERVE: case SYS_EVENTS_CREATE: case SYS_SYSTEM_LOG_OPEN: case SYS_WIN_SURFACE:
-    case SYS_AUDIO_OPEN: case SYS_PCI_BAR: case SYS_DMA_CREATE: case SYS_SHARED_VIEW: case SYS_AUDIO_OUTPUT_WATCH:
+    case SYS_AUDIO_DEVICE_OPEN: case SYS_PCI_BAR: case SYS_DMA_CREATE: case SYS_SHARED_VIEW: case SYS_AUDIO_DEVICE_WATCH:
     case SYS_ENTRY_WATCH:
         return true;
     }
@@ -254,10 +253,8 @@ static void live_refill(void) {
     live_add(n_events_create());
     live_add(n_shared_create(8192));
     live_add(n_shared_reserve(65536));
-    live_add(n_audio_open());
     live_add(n_entry_watch(scratch, N_WATCH_NAME));
     live_add(n_entry_watch(n_temp_folder(), N_WATCH_FOLDER));
-    live_add(n_audio_output_watch());
 }
 
 /* ---- the random call engine ---- */
@@ -269,7 +266,6 @@ static void clamp_waits(long num, long a[5]) {
     case SYS_WIN_RECEIVE: a[3] = 0; break;
     case SYS_WIN_ACQUIRE: a[1] = 0; break;
     case SYS_APP_RESULT: a[1] = 0; break;
-    case SYS_AUDIO_SUBMIT: a[3] &= ~(long)N_AUDIO_WAIT; break;
     case SYS_PCI_INTERRUPT_TAKE: a[1] = 0; break;
     /* Sizes that make the kernel reserve real memory stay small unless they are absurd
        (those must be refused); a 2 GiB request is a test of the machine, not of the check. */

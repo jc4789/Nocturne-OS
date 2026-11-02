@@ -5,7 +5,7 @@
 #include <string.h>
 #include "nocturne.h"
 
-static n_handle stream;
+static n_audio_stream *stream;
 static struct wav wav;
 
 static bool out(const int16_t *buf, int frames) {
@@ -65,13 +65,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: play [-q] file.wav ...\n");
         return 2;
     }
-    stream = n_audio_open();
-    if (stream < 0) {
-        fprintf(stderr, "play: sound: %s\n", n_result_text(stream));
+    n_result opened = n_audio_open(&SOUND_FORMAT, &stream);
+    if (opened < 0) {
+        fprintf(stderr, "play: sound: %s\n", n_result_text(opened));
         return 1;
     }
     int rc = 0;
     for (int i = first; i < argc; i++) rc |= play(argv[i], quiet);
-    n_handle_close(stream); /* lets the sound finish */
+    n_audio_close(stream); /* lets the sound finish */
     return rc;
 }

@@ -17,7 +17,7 @@
 #define WA_MAX_CHANNELS 32
 #define WA_MIN_RATE 3000.0f
 #define WA_MAX_RATE 768000.0f
-#define WA_OUTPUT_RATE 48000 /* the sound stream's rate (N_AUDIO_RATE) */
+#define WA_OUTPUT_RATE 48000 /* the rate it opens its sound stream at */
 #define WA_OUTPUT_CHANNELS 2 /* and its channels: an AudioContext destination's maxChannelCount */
 #define WA_OUTPUT_TARGET 2048 /* output frames an AudioContext keeps queued ahead of the stream */
 

@@ -419,7 +419,7 @@ Windows では円盤そのもの（`\\.\PhysicalDrive<番号>`、管理者とし
 Hyper-V にはサウンドカードがないので、拡張セッションが VMConnect へ運びます。拡張セッションの外では、
 音は再生されるのと同じ速さで捨てられます（プログラムの所要時間は音の長さどおりです）。
 
-**プログラムから**：`n_audio_open` でストリームを開き、`n_audio_submit` で 48 kHz・ステレオ・16 ビットの
+**プログラムから**：`n_audio_open` で形式を宣言してストリームを開き、`n_audio_submit` でその形式の
 フレームを送ります。約 170 ms 分がたまると待ち（`N_AUDIO_WAIT`）、`n_audio_status` で再生済みの量を知って
 画面と音を合わせられます。8 本まで同時に鳴らせます。ゲーム向けには、待たずに短い音や雑音を鳴らす
 `sound_effect(hz, hz2, ms, wave)` と、どんな WAV も 48 kHz ステレオで読む `wav_open`・`wav_read`・`wav_seek`

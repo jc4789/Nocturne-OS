@@ -410,7 +410,7 @@ Sound comes out of an Intel AC'97 card: `build.ps1 run` gives QEMU one, played t
 Hyper-V has no sound card, so the Enhanced Session carries sound to VMConnect; outside an Enhanced Session, sound
 is discarded at the speed it would play (so programs still take as long as their sound does).
 
-**For programs:** open a stream with `n_audio_open` and send 48 kHz stereo 16-bit frames with `n_audio_submit`.
+**For programs:** open a stream with `n_audio_open`, declaring its format, and send frames with `n_audio_submit`.
 It waits (`N_AUDIO_WAIT`) while about 170 ms are queued, and `n_audio_status` tells how much has played, for keeping
 a picture in step with the sound. Up to eight streams play at once. For games, `sound_effect(hz, hz2, ms, wave)`
 plays a short tone or noise without ever waiting, and `wav_open`/`wav_read`/`wav_seek` read any WAV file as 48 kHz

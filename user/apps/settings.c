@@ -38,6 +38,7 @@ static const struct {
 
 enum act {
     A_PAGE = 1, A_BOOL, A_NUMBER, A_ENUM, A_TEXT, A_SCREEN, A_SIZE, A_RATE, A_KEEP, A_BACK,
+    A_SOUND_OUTPUT, A_SOUND_RATE, A_SOUND_BITS, A_SOUND_CHANNELS,
     A_SERVICE_RESTART, A_SERVICE_STOP, A_USER_CLASS, A_NEW_NAME, A_NEW_PASSWORD, A_NEW_ADMIN, A_NEW_CREATE
 };
 struct action {
@@ -155,7 +156,13 @@ static uint32_t screen_index;
 static struct screen_modes screen;
 static bool screen_known;
 static uint64_t trial_ends_ns; /* 0：試しの中でない */
-static struct n_audio_output sound;
+/* 音の頁：サービス audio の出口の一覧と、選んだ出口の key（空は自動）。 */
+static struct n_audio_output *sound_outputs;
+static size_t sound_bytes;
+static char *sound_chosen;
+#define SOUND_EACH(o)                                                                                          \
+    for (const struct n_audio_output *o = sound_outputs; (const uint8_t *)o < (const uint8_t *)sound_outputs + sound_bytes; \
+         o = (const void *)((const uint8_t *)o + o->bytes))
 
 static void screen_read(void) {
     screen_known = __syscall(SYS_SCREEN_INFO, (long)&screen, sizeof screen, SCREEN_MODES_GET | (long)screen_index << 8, 0, 0) >= 0;
@@ -416,6 +423,103 @@ static const char *screen_reason(void) {
     }
 }
 
+static void sound_read(void) {
+    free(sound_outputs);
+    n_result r = n_audio_outputs(&sound_outputs);
+    sound_bytes = r > 0 ? (size_t)r : 0;
+    char *value = malloc(N_SETTING_VALUE_MAX + 1);
+    if (!value) return;
+    r = n_setting_get(n_setting_at(N_DOMAIN_AUDIO, N_AUDIO_OUTPUT), value, N_SETTING_VALUE_MAX);
+    value[r > 0 ? (size_t)r : 0] = 0;
+    free(sound_chosen);
+    sound_chosen = strdup(value);
+    free(value);
+}
+
+static const struct n_audio_output *sound_playing(void) {
+    SOUND_EACH(o) if (o->playing) return o;
+    return NULL;
+}
+
+/* 一つの形式の選び方：申告された値の一覧から選ぶ。 */
+static void sound_choice(struct ui_msg *m, const char *title, enum act act, const uint32_t *values, uint32_t count, uint32_t now, const char *unit) {
+    if (count < 2) return;
+    const char **names = malloc(count * sizeof *names);
+    char *labels = malloc((size_t)count * 24);
+    uint32_t selected = 0;
+    if (names && labels) {
+        for (uint32_t i = 0; i < count; i++) {
+            names[i] = labels + (size_t)i * 24;
+            snprintf(labels + (size_t)i * 24, 24, "%u %s", values[i], unit);
+            if (values[i] == now) selected = i;
+        }
+        text_node(m, title, "heading", 0);
+        act_at(ui_node(m, "segmented"), act, 0);
+        ui_strs(m, "options", names, count);
+        ui_num(m, "selected", selected);
+        ui_end(m);
+    }
+    free(names);
+    free(labels);
+}
+
+static void sound_cards(struct ui_msg *m) {
+    const struct n_audio_output *now = sound_playing();
+    ui_node(m, "card"); ui_num(m, "gap", 10); ui_str(m, "key", "sound-output");
+        text_node(m, "出口", "heading", 0);
+        if (!sound_bytes) text_node(m, "音の装置がありません。", "caption", 0);
+        else {
+            act_at(ui_node(m, "item"), A_SOUND_OUTPUT, 0);
+            ui_str(m, "text", "自動（一番良いもの）"); ui_num(m, "selected", !sound_chosen || !sound_chosen[0]); ui_str(m, "key", "sound-auto");
+            ui_end(m);
+            uint32_t at = 1;
+            SOUND_EACH(o) {
+                const struct n_audio_device *d = n_audio_output_device(o);
+                char line[160];
+                snprintf(line, sizeof line, "%s%s", n_audio_device_name(d), d->jack == N_AUDIO_JACK_EMPTY ? "（何も刺さっていません）" : !d->available ? "（使えません）" : "");
+                act_at(ui_node(m, "item"), A_SOUND_OUTPUT, at++);
+                ui_str(m, "text", line); ui_num(m, "selected", sound_chosen && !strcmp(sound_chosen, n_audio_device_key(d)));
+                ui_str(m, "key", n_audio_device_key(d));
+                ui_end(m);
+            }
+            char line[160];
+            snprintf(line, sizeof line, now ? "%s で鳴らします。" : "鳴らす出口がありません。", now ? n_audio_device_name(n_audio_output_device(now)) : "");
+            text_node(m, line, "caption", 0);
+        }
+    ui_end(m);
+    if (!now) return;
+    const struct n_audio_device *d = n_audio_output_device(now);
+    ui_node(m, "card"); ui_num(m, "gap", 10); ui_str(m, "key", "sound-format");
+        char line[120];
+        snprintf(line, sizeof line, "形式：%u Hz、%u ビット、%u チャンネル", now->format.rate, now->format.bits, now->format.channels);
+        text_node(m, line, NULL, 0);
+        sound_choice(m, "周波数", A_SOUND_RATE, n_audio_device_rates(d), d->rate_count, now->format.rate, "Hz");
+        uint32_t *bits = malloc((d->size_count + 1) * sizeof *bits);
+        if (bits) {
+            for (uint32_t i = 0; i < d->size_count; i++) bits[i] = n_audio_device_sizes(d)[i].bits;
+            sound_choice(m, "標本の大きさ", A_SOUND_BITS, bits, d->size_count, now->format.bits, "ビット");
+            free(bits);
+        }
+        uint32_t span = d->channels_high - d->channels_low + 1;
+        uint32_t *channels = malloc(span * sizeof *channels);
+        if (channels) {
+            for (uint32_t i = 0; i < span; i++) channels[i] = d->channels_low + i;
+            sound_choice(m, "チャンネル数", A_SOUND_CHANNELS, channels, span, now->format.channels, "ch");
+            free(channels);
+        }
+    ui_end(m);
+}
+
+/* 選んだ出口の形式の鍵を変える。 */
+static void sound_format_set(uint32_t key, int32_t value) {
+    const struct n_audio_output *now = sound_playing();
+    if (!now) return;
+    struct n_setting_id id = n_setting_at(N_DOMAIN_AUDIO, key);
+    id.device = n_setting_device(n_audio_device_key(n_audio_output_device(now)));
+    n_result r = n_setting_set_int(id, value, NULL);
+    if (r < 0) say(n_result_text(r), true);
+}
+
 static void screen_card(struct ui_msg *m) {
     char line[96];
     const struct ui_theme *t = &ui_theme;
@@ -578,11 +682,7 @@ static void show(struct ui_session *ui) {
                 else if (page == P_USERS) users_page(&m);
                 else {
                     if (page == P_DISPLAY) screen_card(&m);
-                    if (page == P_AUDIO) {
-                        char line[80];
-                        snprintf(line, sizeof line, sound.device[0] ? "%s で鳴らします。" : "音の装置がありません。", sound.device);
-                        text_node(&m, line, "caption", 0);
-                    }
+                    if (page == P_AUDIO) sound_cards(&m);
                     for (size_t i = 0; i < shown_count; i++)
                         if (shown[i].d.domain == pages[page].domain && !(shown[i].d.flags & N_SETTING_DECL_CUSTOM)) setting_card(&m, i);
                 }
@@ -602,7 +702,7 @@ static void page_open(enum page p) {
     if (p == P_SERVICES) services_load();
     if (p == P_USERS) accounts_load();
     if (p == P_DISPLAY) screen_read();
-    if (p == P_AUDIO) n_audio_output(&sound);
+    if (p == P_AUDIO) sound_read();
 }
 
 static void set_number(struct shown *s, int32_t v) {
@@ -667,6 +767,26 @@ static bool on_event(const struct ui_event *e) {
     struct shown *s = a->arg < shown_count ? &shown[a->arg] : NULL;
     switch (a->act) {
     case A_PAGE: page_open((enum page)(a->arg < P_COUNT ? a->arg : 0)); break;
+    case A_SOUND_OUTPUT: {
+        const char *key = "";
+        uint32_t at = 1;
+        SOUND_EACH(o) if (at++ == a->arg) key = n_audio_device_key(n_audio_output_device(o));
+        n_result r = n_setting_set(n_setting_at(N_DOMAIN_AUDIO, N_AUDIO_OUTPUT), key, strlen(key), NULL);
+        if (r < 0) say(n_result_text(r), true);
+        sound_read();
+        break;
+    }
+    case A_SOUND_RATE:
+        if (e->type == UI_EVENT_CHOOSE && sound_playing() && (uint32_t)e->a < n_audio_output_device(sound_playing())->rate_count)
+            sound_format_set(N_AUDIO_FORMAT_RATE, (int32_t)n_audio_device_rates(n_audio_output_device(sound_playing()))[(uint32_t)e->a]);
+        break;
+    case A_SOUND_BITS:
+        if (e->type == UI_EVENT_CHOOSE && sound_playing() && (uint32_t)e->a < n_audio_output_device(sound_playing())->size_count)
+            sound_format_set(N_AUDIO_FORMAT_BITS, n_audio_device_sizes(n_audio_output_device(sound_playing()))[(uint32_t)e->a].bits);
+        break;
+    case A_SOUND_CHANNELS:
+        if (e->type == UI_EVENT_CHOOSE && sound_playing()) sound_format_set(N_AUDIO_FORMAT_CHANNELS, (int32_t)(n_audio_output_device(sound_playing())->channels_low + (uint32_t)e->a));
+        break;
     case A_BOOL: if (s && e->type == UI_EVENT_TOGGLE) set_number(s, e->a != 0); break;
     case A_ENUM: if (s && e->type == UI_EVENT_CHOOSE) set_number(s, (int32_t)e->a); break;
     case A_NUMBER:
@@ -762,8 +882,8 @@ int main(void) {
                 redraw = true;
                 break;
             case TOKEN_SOUND:
-                n_watch_take(sound_watch);
-                n_audio_output(&sound);
+                n_audio_output_watch_take(sound_watch);
+                sound_read();
                 redraw = true;
                 break;
             case TOKEN_SERVICES: {
