@@ -454,16 +454,36 @@ static void acpi_worker(void *arg) {
 
 /* ---- events and sleep ---- */
 
-/* The power button asks like the menu does: apps may ask to save; a second press within a minute
-   of a cancelled request forces it. Interrupt context (fixed event) or the acpi thread (Notify). */
+/* The power button is told (dev/pm.h); the machine service says what it means. Interrupt context
+   (fixed event) or the acpi thread (Notify). */
 static uacpi_interrupt_ret power_button(uacpi_handle ctx) {
-    pm_request(PM_POWER_OFF, true);
+    pm_button_pressed();
     return UACPI_INTERRUPT_HANDLED;
 }
 
 static uacpi_status button_notify(uacpi_handle ctx, uacpi_namespace_node *node, uacpi_u64 value) {
-    if (value == 0x80) pm_request(PM_POWER_OFF, true); /* control-method power button: pressed */
+    if (value == 0x80) pm_button_pressed(); /* control-method power button: pressed */
     return UACPI_STATUS_OK;
+}
+
+/* The lid (ACPI 9.4, PNP0C0D): _LID says 0 when closed, and Notify 0x80 says it changed. The first one
+   found is the machine's. */
+static uacpi_namespace_node *lid_node;
+
+void acpi_lid_read(void) {
+    uacpi_u64 open;
+    if (lid_node && uacpi_eval_simple_integer(lid_node, "_LID", &open) == UACPI_STATUS_OK) pm_lid_is(open == 0);
+}
+
+static uacpi_status lid_notify(uacpi_handle ctx, uacpi_namespace_node *node, uacpi_u64 value) {
+    if (value == 0x80) acpi_lid_read();
+    return UACPI_STATUS_OK;
+}
+
+static uacpi_iteration_decision found_lid(void *user, uacpi_namespace_node *node, uacpi_u32 depth) {
+    if (uacpi_install_notify_handler(node, lid_notify, NULL) != UACPI_STATUS_OK) return UACPI_ITERATION_DECISION_CONTINUE;
+    lid_node = node;
+    return UACPI_ITERATION_DECISION_BREAK;
 }
 
 static uacpi_iteration_decision found_button(void *user, uacpi_namespace_node *node, uacpi_u32 depth) {
@@ -496,11 +516,13 @@ void acpi_aml_init(void) {
                  uacpi_install_fixed_event_handler(UACPI_FIXED_EVENT_POWER_BUTTON, power_button, NULL) == UACPI_STATUS_OK;
     unsigned buttons = 0;
     uacpi_find_devices("PNP0C0C", found_button, &buttons);
+    uacpi_find_devices("PNP0C0D", found_lid, NULL);
+    acpi_lid_read();
     if (!hw_reduced) aml_ok(uacpi_finalize_gpe_initialization(), "enabling GPEs");
     aml_ready = true;
-    kprintf("acpi: AML ready in %lu ms, SCI GSI %d, power button: %s%s%u in the namespace\n",
+    kprintf("acpi: AML ready in %lu ms, SCI GSI %d, power button: %s%s%u in the namespace, lid: %s\n",
             (clock_now_ns() - t0) / NS_PER_MS, sci ? (int)sci_gsi : -1, fixed ? "fixed" : "", fixed ? " + " : "",
-            buttons);
+            buttons, lid_node ? "yes" : "no");
 }
 
 bool acpi_aml_ready(void) { return aml_ready; }

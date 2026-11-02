@@ -663,32 +663,29 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     表示エンジンの知らせのとおりに、ほかの帰線はフリップを待つ間に知らせる。合成はその時刻を
     窓の `EV_FRAME` の `time_ns`（表示された時刻）にする。画面がこの claim の面でなければ
     `N_ERR_DENIED`。
-  - モニターのモード（解像度とリフレッシュレート）：選ぶのはシステムと利用者、列挙・検証・設定は
-    ドライバー。`n_pci_screen_modes(pci, output, modes)` で表示機能のドライバーが、出力ごとに、
-    駆動するモニター（`struct n_screen_modes` の `monitor`：EDID の製造者・製品・製造番号から作る
+  - モニターのモード（解像度、リフレッシュレート、色の深さと形式、可変リフレッシュ）：選ぶのはサービス `display` と利用者、
+    列挙・検証・設定はドライバー。カーネル（gui/screenmode.c）は一覧と望みを運ぶだけで、選ばない。起動の時は
+    ファームウェアの面で動き、望みが来るまでそのまま。`n_pci_screen_modes(pci, output, modes)` で表示機能のドライバーが、
+    出力ごとに、駆動するモニター（`struct n_screen_modes` の `monitor`：EDID の製造者・製品・製造番号から作る
     識別子、`name`：EDID のモニター名）と、そこで出せるモード（最大 `N_SCREEN_MODES_MAX`。EDID の
     推奨モードに `N_SCREEN_MODE_PREFERRED`、可変リフレッシュで出すモードに `N_SCREEN_MODE_VRR`。
-    `vrr_min_mhz` はモニターの可変リフレッシュの下限、無ければ 0）を知らせる。システム
-    （gui/screenmode.c）は、試行中のモード、無ければ利用者がそのモニターに選んだモード、無ければ
-    モニターの推奨モード、無ければ推奨の大きさで最も近いリフレッシュ、推奨が無ければ最大の大きさで
-    最も高いリフレッシュを選び、`struct n_screen_state` の
+    `bits_per_channel` と `format`（`N_SCANOUT_*`）はそのモードで出す色で、0 は言わない。
+    `vrr_min_mhz` はモニターの可変リフレッシュの下限、無ければ 0）を知らせる。
+    `n_screen_mode_apply(cap, screen, mode)`（`SYS_SCREEN_MODE_APPLY`、`N_CAP_DISPLAY`）が望みを渡す：提供に無いモードは
+    `N_ERR_INVALID`、提供が無ければ `N_ERR_NOT_FOUND`、全部 0 は望みなし。カーネルはこれを `struct n_screen_state` の
     `mode` と `mode_serial`（望むたびに進む。同じモードでも）でドライバーへ伝える。ドライバーは
     それを出し（その大きさで `n_pci_give_screen`）、`done` に `mode_serial`、`shown` に出せたモードを
-    入れて知らせ直す。望まれたものと違えば、システムはそのモニターでそのモードを二度と望まず、
-    別のものを選ぶ。`done` 0（開始時、モニターの変化・接続時）では選び直す。`count` 0 は、動いた
+    入れて知らせ直す。望まれたものと違えば、カーネルは `refused_serial` にその番号を入れて報告するだけで、次を決めるのは
+    サービス。`done` 0（開始時、モニターの変化・接続時）は `offer_serial` を進める。`count` 0 は、動いた
     ままモニターを駆動しなくなったこと、claim の終わりはドライバーが止まったこと。面を返した
-    （`buffers` NULL）ドライバーがモードを出したままなら、利用者の適用するモードで
+    （`buffers` NULL）ドライバーがモードを出したままなら、次の望みで
     `mode_serial` が進むので、それを見てもう一度モードを出せる。表示機能でなければ
     `N_ERR_DENIED`、件数・0 の大きさやリフレッシュ・65535 超は `N_ERR_INVALID`。
-  - 設定の窓は `SYS_SCREEN_INFO` の第3引数 `SCREEN_MODES_GET`（`struct screen_modes`：モニター、
-    モード、表示中と望まれたモード、直前に適用したモードを出せなかったか、画面の出所
-    `source`、画面の数 `screens`）で読む（display_abi.h）。画面ごとで、第3引数の 8 ビット目から
-    上が画面の番号（`op | screen << 8`。画面 0 にタスクバー）。無い画面は `N_ERR_NOT_FOUND`。
-    変える口は §12 の `N_DISPLAY_MODE` だけで、値はモニターごとの利用者の選択になる。そのモニターが
-    駆動されそのモードを出すときに使う。出せなければ次に良いモードが出る。
-    試して戻す（`SCREEN_MODE_TRIAL_MS`、15 秒）のは設定のサービスの仕事で、モードを適用し、
-    確定が来なければ前のモードを適用する。`struct screen_modes` の `chosen` は `offered` のモニターに
-    利用者が選んだモード（無ければ全部 0）。モードが 0 件のときも `monitor`・`name` は
+  - 誰でも `SYS_SCREEN_INFO` の第3引数 `SCREEN_MODES_GET`（`n_screen_modes_get`、`struct screen_modes`：モニター、
+    モード、表示中と望まれたモード、ドライバーが出せなかった最後の望み `refused_serial`（モニターが来てから無ければ 0）、
+    画面の出所 `source`、画面の数 `screens`、デスクトップの中の位置と大きさ、`placed`、`primary`、`scale_percent`）で読む
+    （display_abi.h）。画面ごとで、第3引数の 8 ビット目から上が画面の番号（`op | screen << 8`）。無い画面は `N_ERR_NOT_FOUND`。
+    モードが 0 件のときも `monitor`・`name` は
     ファームウェアが映すモニターの EDID から入り、起動時の画面が表示中なら `shown` はファームウェアの
     モード（大きさと、EDID のその大きさのタイミングから求めたリフレッシュ。分からなければ 0）。
     `source` は `SCREEN_SOURCE_FIRMWARE`（ドライバーが一度もモードを出していない）、
@@ -696,8 +693,20 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     `SCREEN_SOURCE_HANDED_BACK`（モードを出したドライバーが claim を持ったまま、起動時の画面が
     表示中：画面を返した、または自分の面をまだ出していない。モードが出ていれば適用で
     もう一度望める）、`SCREEN_SOURCE_DRIVER_STOPPED`（モードを出したドライバーの claim が
-    終わった）、`SCREEN_SOURCE_REMOTE`（遠隔デスクトップの利用者の窓の大きさ）。`monitor` は
-    設定の鍵で、人に見せる名前ではない。
+    終わった）、`SCREEN_SOURCE_REMOTE`（遠隔デスクトップの利用者の窓の大きさ）。
+  - 配置：`n_screen_arrange(cap, screen, &arrange)`（`SYS_SCREEN_ARRANGE`、`N_CAP_DISPLAY`、`struct n_screen_arrange`）。
+    `x`、`y` は負でない。`N_ARRANGE_PLACED` はそこへ置く。無ければ置かれた画面の右に続く。`N_ARRANGE_PRIMARY` は主画面にする：
+    新しい窓、`struct screen_format` の作業領域、絶対ポインターの基準がそこになる。`scale_percent` は 0 でなく、
+    `struct screen_format` と `struct n_shell_screen` でプログラムへ報告する。カーネルは倍率で描かない。
+    届く位置の上限は、部品の端が `int` に収まること（幅と高さは 65535 以下）だけが決める。
+  - サービス `display`（`user/apps/display.c`）：画面の見張りで一つのスレッドが眠り、設定の値をカーネルへ渡す。モニターは
+    `n_screen_device(screen, &device)`（EDID の身元の番号。空か、前の画面と同じなら画面の番号を足す）で引く。鍵は §12 の
+    `N_DISPLAY_MODE`・`N_DISPLAY_PLACE`・`N_DISPLAY_SCALE`・`N_DISPLAY_PRIMARY`。モードの選び方は、利用者の選択、
+    モニターの推奨、推奨の大きさで最も近いリフレッシュ、最大の大きさで推奨に最も近いリフレッシュ（推奨が無ければ最も高い）の順で、
+    出せないと言われたモードはそのモニターがつながっている間は選ばない。試しの中の断りは試しを取り消す。
+    試して戻す（`SCREEN_MODE_TRIAL_MS`、15 秒）のは設定のサービスの仕事で、`display` は適用の依頼に従うだけ。
+    申し出の無いモードの値は選択として残り、出せるようになるまで望まない。止まっている間は最後の望みと配置がそのまま残り、
+    起こし直しは今の表示を変えない。
   - デスクトップの設定は `SCREEN_SETTINGS_GET`（`struct desktop_settings`）が読む：
     ポインターの速さ（-2〜2）と、なめらかな階調（`smooth_gradients`：8 ビットの画面に、
     デスクトップをチャンネルあたり 10 ビットで合成してディザをかけて出す）。後者は利用者の望みで、
@@ -709,7 +718,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     `n_screen_watch()`、display.h）は、`SCREEN_SETTINGS_GET`・`struct screen_format` の返事・
     `SCREEN_MODES_GET` が報告するもののどれかが変わると受け取れる見張り（`N_KIND_WATCH`、§12）。
     デスクトップの大きさと設定、なめらかな階調を出せるか、申し出たモニターとモード、望まれた
-    モード、拒まれたこと、`source`、利用者の選択。第1・第2引数が 0 でなければ `N_ERR_INVALID`、
+    モード、拒まれたこと、`source`、配置と倍率。第1・第2引数が 0 でなければ `N_ERR_INVALID`、
     デスクトップが動いていなければ `N_ERR_UNSUPPORTED`。
   - コマの拍：合成は画面ごとに、その画面のリフレッシュの周期を締切にしたスレッドで描く
     （`sched_deadline`）。周期はドライバーが出しているモード（`shown`）か、起動時の画面なら
@@ -1161,16 +1170,19 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 
 - 型のある値は領域と鍵の番号で引く（`common/settings_abi.h`）：`enum n_setting_domain` と領域ごとの
   鍵。文字列は解析しない。値の型は `N_SETTING_BOOL`、`N_SETTING_INT`（`int32_t`）、`N_SETTING_ENDPOINT`
-  （`struct n_sockaddr`）、`N_SETTING_MONITOR_MODE`（`struct n_setting_monitor_mode`）。
+  （`struct n_sockaddr`）、`N_SETTING_MONITOR_MODE`（`struct n_setting_monitor_mode`）、
+  `N_SETTING_MONITOR_PLACE`（`struct n_setting_monitor_place`）、`N_SETTING_DEVICE`（`uint64_t`、`n_setting_device` の番号）。
 
   | 領域 | 鍵 | 持ち主 |
   |---|---|---|
   | `N_DOMAIN_BOOT` | `N_BOOT_IOMMU`、`N_BOOT_ACPI_AML`、`N_BOOT_SMP`、`N_BOOT_RESUME`、`N_BOOT_UNISOLATED_DRIVERS` | `fs/bootrecord.c` |
   | `N_DOMAIN_AUDIO` | `N_AUDIO_VOLUME`（0〜100。消音も解く）、`N_AUDIO_MUTED` | `dev/audio.c` |
-  | `N_DOMAIN_DISPLAY` | `N_DISPLAY_MODE`（一覧）、`N_DISPLAY_HOLD_SECONDS` | `gui/screenmode.c`、`dev/pciuser.c` |
+  | `N_DOMAIN_DISPLAY` | `N_DISPLAY_HOLD_SECONDS` | `dev/pciuser.c` |
+  | `N_DOMAIN_DISPLAY` | `N_DISPLAY_MODE`（試し）、`N_DISPLAY_PLACE`、`N_DISPLAY_SCALE`（試し）、`N_DISPLAY_PRIMARY` | サービス `display`（§9） |
   | `N_DOMAIN_WINDOW` | `N_WINDOW_SMOOTH_GRADIENTS` | `gui/wm.c` |
   | `N_DOMAIN_INPUT` | `N_INPUT_POINTER_SPEED`（-2〜2） | `gui/wm.c` |
-  | `N_DOMAIN_POWER` | `N_POWER_PERFORMANCE_PREFERENCE`（0〜255） | `arch/idle.c` |
+  | `N_DOMAIN_POWER` | `N_POWER_PERFORMANCE_PREFERENCE`（0〜255。AMD の CPPC、Intel の HWP へ渡す） | `arch/idle.c` |
+  | `N_DOMAIN_POWER` | `N_POWER_BUTTON`、`N_POWER_LID`、`N_POWER_IDLE_MINUTES`、`N_POWER_IDLE_ANSWER`、`N_POWER_ALLOW_SLEEP`、`N_POWER_ALLOW_HIBERNATE`、`N_POWER_CLOSE_SECONDS`、`N_POWER_AGAIN_SECONDS` | サービス `machine`（§15） |
   | `N_DOMAIN_NETWORK` | `N_NETWORK_DNS_SERVER`、`N_NETWORK_TCP_RX_BYTES`、`N_NETWORK_TCP_TX_BYTES` | `net/net.c` |
 
 - `n_settings_apply(cap, domain, key, value, size)`（`SYS_SETTINGS_APPLY`）：持ち主へ渡す。`cap` は
@@ -1219,11 +1231,12 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
     `struct screen_format` の返事・`SCREEN_MODES_GET` が報告するもの。
   - `n_entry_watch(path, what)`（`SYS_ENTRY_WATCH`、§3）：C: の名前とフォルダー。
   - `n_settings_watch(domain)`（`SYS_SETTINGS_WATCH`）：領域の今の値。
+  - `n_power_events_watch(cap)`（`SYS_POWER_EVENTS_WATCH`、§15）：電源の事象。
+  - `n_power_windows_watch(cap)`（`SYS_POWER_WINDOWS_WATCH`、§15）：アプリの窓の数と題。
 - 言語の一覧はシステムの状態ではない：読むプログラム（ブラウザー）の好みで、その持ち物である。
 - nocturne/ui（TypeScript・JavaScript）では `desktop.watch(listener)`：`listener` は変わったものの
   名前の配列を受け取る。`"screen"` は `desktop.get()`・`desktop.modes()` が報告するもの（画面の
-  見張り）、`"sound"` は `desktop.sound()` が報告するもの（音の見張り）。`ScreenModes.chosen` が
-  モニターに選んだモード。
+  見張り）、`"sound"` は `desktop.sound()` が報告するもの（音の見張り）。
 
 ## 13. 身元と能力
 
@@ -1242,7 +1255,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 - 能力（`N_KIND_CAPABILITY`）は特権を一つ持つハンドル。持つことが権限の証明で、渡すことが委譲。
   起動の表か、メッセージの添付で渡す。
   - 種類：`N_CAP_ROOT`、`N_CAP_SERVICE_ROOT`、`N_CAP_IDENTITY_GRANT`、`N_CAP_PCI_CLAIM`、`N_CAP_POWER`、
-    `N_CAP_SCREEN_READ`、`N_CAP_SETTINGS_APPLY`、`N_CAP_STORE_PRIVATE`、`N_CAP_SHELL`。
+    `N_CAP_SCREEN_READ`、`N_CAP_SETTINGS_APPLY`、`N_CAP_STORE_PRIVATE`、`N_CAP_SHELL`、`N_CAP_DISPLAY`。
   - カーネルが作るのは `N_CAP_ROOT` を一つだけで、最初のプロセスがハンドル `N_INITIAL_ROOT_HANDLE`
     （3）で受ける。最初のプロセスの身元は `user` 0、`session` 0、`N_CLASS_SYSTEM`、`program` 0。
   - `n_cap_derive(cap, kind)`：`N_CAP_ROOT` は全部の種類を、ほかの能力は同じ種類だけを切り出す。
@@ -1254,7 +1267,8 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 | 呼出し | 要るもの |
 |---|---|
 | `n_pci_claim` | `N_CAP_PCI_CLAIM` |
-| `poweroff`、`reboot`、`n_power_request` | `N_CAP_POWER` |
+| `poweroff`、`reboot`、`n_power_request`、`n_power_events`、`n_power_events_watch`、`n_power_windows`、`n_power_windows_watch`、`n_power_say` | `N_CAP_POWER` |
+| `n_screen_mode_apply`、`n_screen_arrange` | `N_CAP_DISPLAY` |
 | `screen_grab` | `N_CAP_SCREEN_READ` |
 | `n_service_register` | `N_CAP_SERVICE_ROOT` |
 | `n_shell_*`、`n_power_state`、`n_power_watch` | `N_CAP_SHELL` |
@@ -1315,6 +1329,15 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 - 機械：サービス `machine`。`N_CAP_POWER` と `N_CAP_SCREEN_READ` を持ち、利用者のアプリの電源と画面の依頼を受ける
   （`n_machine_power`、`n_machine_screen`）。能力をアプリへ配らない。`n_machine_choose(op)` は利用者がメニューで
   選んだ操作で、`N_MACHINE_SLEEP`・`N_MACHINE_HIBERNATE` も受ける。結果を待たずに戻り、段取りは `n_power_state`（§16）で届く。
+  電源の方針の持ち主でもある。カーネルは事象を知らせ（`n_power_events`、`struct n_power_events`：ボタンの押下、蓋の変化と今の状態、
+  起床、ホストの依頼の累積の数、最後の起床と入力の時刻、眠れるか。`n_power_events_watch` で待つ）、頼まれたことを実行する
+  （`n_power_request(cap, action)`）だけ。ボタン、蓋、放置に何で答えるか、眠りと休止を許すかは §12 の `N_DOMAIN_POWER` の鍵。
+  窓を閉じる段取りもここにある：`n_power_windows(cap, ask_to_close, title, size)` が窓の数と一番上の窓の題を返し、機械が
+  `n_power_windows_watch` で変化を待ち、`n_power_say` で `n_power_state` を言う。窓が一つも閉じないまま `N_POWER_CLOSE_SECONDS` が
+  過ぎると取りやめ、そこから `N_POWER_AGAIN_SECONDS` の間にもう一度選ぶと窓を待ち切って止まる。
+  規模：一つのスレッドが事象の行列で眠る。接続はスレッドを持たないので、接続が数百あっても待つ間の費用は行列の項目で、依頼一通の
+  仕事はその接続だけに触れる。起きるのは事象と放置の期限のときだけで、放置が 0 なら期限を持たない。電源の変更は一度に一つで、
+  待つ呼び手の全部に一度答える。
 
 ## 16. シェル
 
@@ -1344,8 +1367,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   `can_hibernate`、`detail`）。`stage` は `enum n_power_stage`、`reason` は `enum n_power_reason`。`detail` は窓の題か装置の名。
   窓の題を持つので `N_CAP_SHELL` だけが読める。
 - `n_power_watch(cap)`：`n_power_state` の変更を知らせる watch。
-- `n_power_request(cap, action, flags)`：`N_CAP_POWER` の口。`N_POWER_CHOSEN` は利用者の選択で、窓に閉じるよう頼んでから進む。
-  閉じない窓があれば `N_POWER_CLOSING` を言い、`forceable` ならもう一度の選択で強制する。アプリの電源の変更は機械のサービス（§15）を通す。
+- 閉じない窓があれば機械のサービス（§15）が `N_POWER_CLOSING` を言い、`forceable` ならもう一度の選択で強制する。アプリの電源の変更は機械のサービスを通す。
 
 通知はサービス `N_SHELL_SERVICE`（`"shell"`）のチャンネルで受ける。名前の範囲は同じ利用者の同じセッション（§14）。
 

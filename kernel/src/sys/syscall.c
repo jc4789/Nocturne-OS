@@ -30,6 +30,8 @@
 #include "dev/pciuser.h"
 #include "arch/pat.h"
 #include "gui/wm.h"
+#include "gui/screenmode.h"
+#include "display_abi.h"
 #include "net/net.h"
 #include "dev/pm.h"
 #include "abi.h"
@@ -1254,12 +1256,12 @@ void syscall_dispatch(struct regs *r) {
     case SYS_POWER:
         ret = cap_check((int)a, N_CAP_POWER);
         if (ret < 0) break;
-        if (b > POWER_HIBERNATE || (c & ~(uint64_t)N_POWER_CHOSEN)) {
+        if (b > POWER_HIBERNATE || c) {
             ret = -N_ERR_INVALID;
             break;
         }
-        pm_request((enum pm_action)b, c & N_POWER_CHOSEN);
-        if ((c & N_POWER_CHOSEN) || b == POWER_SLEEP || b == POWER_HIBERNATE) {
+        pm_request((enum pm_action)b);
+        if (b == POWER_SLEEP || b == POWER_HIBERNATE) {
             ret = 0;
             break;
         }
@@ -1275,6 +1277,45 @@ void syscall_dispatch(struct regs *r) {
         ret = cap_check((int)a, N_CAP_SHELL);
         if (ret >= 0) ret = pm_watch_syscall();
         break;
+    case SYS_POWER_EVENTS:
+        ret = cap_check((int)a, N_CAP_POWER);
+        if (ret >= 0) ret = pm_events_syscall((void *)b, c);
+        break;
+    case SYS_POWER_EVENTS_WATCH:
+        ret = cap_check((int)a, N_CAP_POWER);
+        if (ret >= 0) ret = pm_events_watch_syscall();
+        break;
+    case SYS_POWER_SAY:
+        ret = cap_check((int)a, N_CAP_POWER);
+        if (ret >= 0) ret = pm_say_syscall((const void *)b, c);
+        break;
+    case SYS_POWER_WINDOWS: {
+        ret = cap_check((int)a, N_CAP_POWER);
+        if (ret < 0) break;
+        char title[sizeof ((struct n_power_state *)0)->detail] = "";
+        if (b) wm_close_windows();
+        ret = wm_window_count(title, sizeof title);
+        if (d && copy_to_user((void *)c, title, MIN((size_t)d, sizeof title))) ret = -N_ERR_BAD_ADDRESS;
+        break;
+    }
+    case SYS_POWER_WINDOWS_WATCH:
+        ret = cap_check((int)a, N_CAP_POWER);
+        if (ret >= 0) ret = wm_windows_watch();
+        break;
+    case SYS_SCREEN_MODE_APPLY: {
+        ret = cap_check((int)a, N_CAP_DISPLAY);
+        if (ret < 0) break;
+        struct n_screen_mode mode;
+        ret = copy_from_user(&mode, (const void *)c, sizeof mode) ? -N_ERR_BAD_ADDRESS : screen_modes_apply((unsigned)b, &mode);
+        break;
+    }
+    case SYS_SCREEN_ARRANGE: {
+        ret = cap_check((int)a, N_CAP_DISPLAY);
+        if (ret < 0) break;
+        struct n_screen_arrange arrange;
+        ret = copy_from_user(&arrange, (const void *)c, sizeof arrange) ? -N_ERR_BAD_ADDRESS : wm_screen_arrange((unsigned)b, &arrange);
+        break;
+    }
     case SYS_SYSTEM_LOG: ret = identity_at_least(N_CLASS_ADMIN) ? sys_system_log((char *)a, b) : -N_ERR_DENIED; break;
     case SYS_PCILIST:
     {

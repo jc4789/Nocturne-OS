@@ -486,11 +486,15 @@ static void menu_open(void) {
     volume_close();
     struct n_power_state power = {0};
     n_power_state(cap, &power);
+    /* 機械ができて、設定が許すものだけを出す。読めなければ機械の事実に従う。 */
+    int32_t allow_sleep = 1, allow_hibernate = 1;
+    n_setting_get_int(n_setting_at(N_DOMAIN_POWER, N_POWER_ALLOW_SLEEP), &allow_sleep);
+    n_setting_get_int(n_setting_at(N_DOMAIN_POWER, N_POWER_ALLOW_HIBERNATE), &allow_hibernate);
     menu_length = 0;
     menu_first_power = -1;
     for (int i = 0; i < APP_COUNT; i++) {
-        if (apps[i].action == SLEEP && !power.can_sleep) continue;
-        if (apps[i].action == HIBERNATE && !power.can_hibernate) continue;
+        if (apps[i].action == SLEEP && (!power.can_sleep || !allow_sleep)) continue;
+        if (apps[i].action == HIBERNATE && (!power.can_hibernate || !allow_hibernate)) continue;
         if (apps[i].action != RUN && menu_first_power < 0) menu_first_power = menu_length;
         menu_items[menu_length++] = &apps[i];
     }

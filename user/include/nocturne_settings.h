@@ -44,6 +44,14 @@ n_result n_setting_list(struct n_setting_decl **out);
 /* プログラムの scope の宣言。プログラムの始めに一度。同じ宣言を繰り返してよい。 */
 n_result n_setting_declare(const struct n_setting_decl *declarations, size_t count, uint32_t *reason);
 
+/* 領域の持ち主（システムのサービス）。n_setting_owner_open は専用の接続を開いて領域の鍵を宣言し、その受け取れる
+   channel を返す。接続が閉じれば持ち主でなくなるので、サービスは止まり、起こし直されて宣言し直す。適用の依頼が
+   届くと n_setting_owner_take が取る：id と値（cap まで）を書いて serial を返し、無ければ -N_ERR_NOT_READY。
+   答えは n_setting_owner_answer。値は n_setting_get で読む（別の接続）。答える前に試しの値は読めない。 */
+n_handle n_setting_owner_open(const struct n_setting_decl *declarations, size_t count, uint32_t *reason);
+n_result n_setting_owner_take(n_handle owner, struct n_setting_id *id, void *value, size_t cap, uint32_t *length, uint32_t *serial);
+n_result n_setting_owner_answer(n_handle owner, uint32_t serial, n_result result);
+
 /* 前面の利用者が変わった。N_CLASS_SYSTEM のセッションのサービスだけが呼ぶ。 */
 n_result n_setting_session(uint32_t user);
 

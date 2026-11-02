@@ -21,6 +21,7 @@ enum n_cap {
     N_CAP_SETTINGS_APPLY,  /* カーネルが持つ領域へ設定を適用する。 */
     N_CAP_STORE_PRIVATE,   /* 名前の木の外の私的な領域を開く。 */
     N_CAP_SHELL,           /* 窓の層と画面の端の予約、窓の一覧を持つ（シェル）。 */
+    N_CAP_DISPLAY,         /* 画面のモード、配置、主画面、倍率を適用する（サービス display）。 */
     N_CAP_COUNT
 };
 

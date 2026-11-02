@@ -168,6 +168,13 @@ enum {
     SYS_CAP_FIND,             /* (enum n_cap) -> その能力を持つ自分の handle */
     SYS_POWER_STATE,          /* (N_CAP_SHELL の cap, struct n_power_state *out, size): 電源の段取りの今 */
     SYS_POWER_WATCH,          /* (N_CAP_SHELL の cap): SYS_POWER_STATE が報告するものの watch */
+    SYS_SCREEN_MODE_APPLY,    /* (N_CAP_DISPLAY の cap, 画面の番号, const struct n_screen_mode *): 出すモードをドライバーへ頼む */
+    SYS_SCREEN_ARRANGE,       /* (N_CAP_DISPLAY の cap, 画面の番号, const struct n_screen_arrange *): 画面の位置、主画面、倍率 */
+    SYS_POWER_EVENTS,         /* (N_CAP_POWER の cap, struct n_power_events *out, size): 電源の事象の今 */
+    SYS_POWER_EVENTS_WATCH,   /* (N_CAP_POWER の cap): ボタン、蓋、起床、ホストの依頼の watch */
+    SYS_POWER_WINDOWS,        /* (N_CAP_POWER の cap, 閉じるよう頼むなら 1, char *top_title, size): アプリの窓の数 */
+    SYS_POWER_SAY,            /* (N_CAP_POWER の cap, const struct n_power_state *, size): 窓を閉じる段取りを知らせる */
+    SYS_POWER_WINDOWS_WATCH,  /* (N_CAP_POWER の cap): アプリの窓の数と題の watch */
     SYS_MAX                   /* above every number (what syscallfuzz tries) */
 };
 
@@ -487,23 +494,26 @@ struct n_screen_vblank {
     uint64_t count, time_ns, flip_serial;
 };
 
-/* A display mode: the visible pixels and the vertical refresh in millihertz (59940 is 59.94 Hz).
-   N_SCREEN_MODE_PREFERRED marks the monitor's own preferred timing (its EDID's). N_SCREEN_MODE_VRR:
-   the monitor shows the mode at a variable refresh, a frame as soon as it is ready, from
-   refresh_mhz down to its n_screen_modes vrr_min_mhz. */
+/* A display mode: the visible pixels, the vertical refresh in millihertz (59940 is 59.94 Hz), the
+   bits per channel and the pixel format (N_SCANOUT_*) the driver scans out in that mode (0: it does
+   not say). N_SCREEN_MODE_PREFERRED marks the monitor's own preferred timing (its EDID's).
+   N_SCREEN_MODE_VRR: the monitor shows the mode at a variable refresh, a frame as soon as it is
+   ready, from refresh_mhz down to its n_screen_modes vrr_min_mhz. */
 #define N_SCREEN_MODE_PREFERRED 1u
 #define N_SCREEN_MODE_VRR 2u
 struct n_screen_mode {
     uint32_t width, height;
     uint32_t refresh_mhz;
     uint32_t flags;
+    uint32_t bits_per_channel;
+    uint32_t format;
 };
-/* n_pci_screen_modes: the monitor a display driver drives and what it can show there. The system
-   chooses the mode (struct n_screen_state's mode); the driver says what it showed, each time it
-   acted on one. monitor tells monitors apart (the same text for the same monitor every time:
+/* n_pci_screen_modes: the monitor a display driver drives and what it can show there. The display
+   service chooses the mode (struct n_screen_state's mode); the driver says what it showed, each time
+   it acted on one. monitor tells monitors apart (the same text for the same monitor every time:
    the EDID's maker, product and serial number), name is the monitor's for people (may be empty);
    both end with a zero. modes are the progressive modes the driver checked it can show, count of
-   them, no two alike (width, height, refresh). shown is the mode the driver shows now, all zero
+   them, no two alike (width, height, refresh, format). shown is the mode the driver shows now, all zero
    when it shows none; done is the n_screen_state mode_serial it acted on last (0: none yet).
    vrr_min_mhz is the lowest refresh of the monitor's variable refresh range (its EDID's), 0
    without one. */
@@ -520,8 +530,8 @@ struct n_screen_modes {
 /* n_pci_screen_state: what an output's screen should show, for the driver whose buffers the
    screen is drawn into or whose monitor's modes the system has. serial changes with every change
    of what follows and is never 0.
-   mode is the mode the system wants the driver to show (one of the modes it gave, all zero while
-   it wants none); mode_serial changes with every wish, even for the same mode again (a monitor
+   mode is the mode the display service wants the driver to show (one of the modes it gave, all zero
+   while it wants none: the driver keeps what is shown); mode_serial changes with every wish, even for the same mode again (a monitor
    offered anew). The driver shows it at that size (n_pci_give_screen) and gives n_pci_screen_modes
    with done = mode_serial and what it shows then.
    For a driver whose buffers have N_SCANOUT_DIRECT: app is the app (n_app_self's number) whose
@@ -597,17 +607,17 @@ struct n_shared_range {
     uint64_t offset, bytes;
 };
 
-/* power。SYS_POWER は (N_CAP_POWER の cap, POWER_*, flags)。 */
+/* power。SYS_POWER は (N_CAP_POWER の cap, POWER_*)。カーネルは言われたとおりに実行する：POWER_OFF と
+   POWER_REBOOT はアプリを止めて電源を変え、呼出しは戻らない。POWER_SLEEP と POWER_HIBERNATE は結果を
+   SYS_POWER_STATE で言い、呼出しはすぐ戻る。窓に閉じるよう頼むか、いつするかは機械のサービスが決める。 */
 #define POWER_OFF 0
 #define POWER_REBOOT 1
 #define POWER_SLEEP 2
 #define POWER_HIBERNATE 3
-/* 利用者が選んだ：アプリは窓を残して取りやめられ、呼出しはすぐ戻る。無ければアプリは数秒で止まり、
-   POWER_OFF と POWER_REBOOT の呼出しは戻らない。もう一度選ぶと閉じるのを待たない。 */
-#define N_POWER_CHOSEN 1u
 
 /* 電源の段取り（SYS_POWER_STATE）。カーネルは型のある値を出し、人へ言うのは読む側。serial は変わるたびに
-   増える。読むのは最新の一つで、途中の段が飛ぶことがある。 */
+   増える。読むのは最新の一つで、途中の段が飛ぶことがある。N_POWER_CLOSING と N_POWER_CANCELLED は機械の
+   サービスが SYS_POWER_SAY で言う。 */
 enum n_power_stage {
     N_POWER_IDLE,
     N_POWER_CLOSING,   /* 窓が閉じるのを待つ。detail は残っている窓の題 */
@@ -648,6 +658,24 @@ struct n_power_state {
     uint32_t can_sleep;     /* 眠りを勧めてよい */
     uint32_t can_hibernate; /* 休止を勧めてよい */
     char detail[64];
+};
+
+/* 電源の事象（SYS_POWER_EVENTS）。カーネルは数えて知らせるだけで、どうするかは機械のサービスが決める。
+   数は起動からの累積で、減らない。機械を眠りから起こした一押しは数えない。watch（SYS_POWER_EVENTS_WATCH）は
+   ボタン、蓋、起床、ホストの依頼で鳴る。last_input_ns は鳴らさない。時刻は monotonic の ns で、0 はまだ無い。 */
+struct n_power_events {
+    uint64_t button_presses;
+    uint64_t lid_changes;
+    uint64_t wakes;         /* 眠りと休止から戻った回数 */
+    uint64_t host_asks;     /* VM のホストの依頼の回数。最後の依頼は host_action */
+    uint64_t last_wake_ns;
+    uint64_t last_input_ns; /* キーとポインターの最後の入力 */
+    uint32_t host_action;   /* POWER_* */
+    uint32_t lid_present;   /* 蓋の装置がある */
+    uint32_t lid_closed;
+    uint32_t can_sleep;     /* 機械が眠れる：ファームウェアと装置の事実 */
+    uint32_t can_hibernate; /* 機械が休止できる：同じ */
+    uint32_t reserved;
 };
 
 /* n_audio_status: where a stream stands. Device time counts this stream's

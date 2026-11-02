@@ -42,9 +42,8 @@ enum n_audio_key {
     N_AUDIO_KEY_COUNT
 };
 
-/* N_DOMAIN_DISPLAY：gui/screenmode と dev/pciuser */
+/* N_DOMAIN_DISPLAY：dev/pciuser。モードと配置はサービス display の鍵（下の enum n_display_service_key）。 */
 enum n_display_key {
-    N_DISPLAY_MODE,             /* N_SETTING_MONITOR_MODE の一覧：モニターごとの利用者の選択。適用は一件ずつ */
     N_DISPLAY_HOLD_SECONDS,     /* N_SETTING_INT 0..：ドライバーが画面を握れる秒数。0 は上限なし */
     N_DISPLAY_KEY_COUNT
 };
@@ -85,7 +84,9 @@ enum n_setting_type {
     N_SETTING_BOOL,
     N_SETTING_INT,
     N_SETTING_ENDPOINT,     /* struct n_sockaddr（abi.h） */
-    N_SETTING_MONITOR_MODE  /* struct n_setting_monitor_mode */
+    N_SETTING_MONITOR_MODE, /* struct n_setting_monitor_mode */
+    N_SETTING_MONITOR_PLACE, /* struct n_setting_monitor_place */
+    N_SETTING_DEVICE        /* uint64_t：装置の番号（n_setting_device）。0 は無し */
 };
 
 #define N_SETTING_LIST 1u       /* SYS_SETTINGS_EFFECTIVE は size の倍数の一覧を返す */
@@ -100,12 +101,17 @@ struct n_setting_desc {
     int64_t low, high; /* BOOL と INT の範囲 */
 };
 
-/* モニターごとの選択。monitor は struct n_screen_modes の monitor と同じ。 */
+/* モニターごとの選択。モニターは struct n_setting_id の device（n_screen_device）。width 0 は選択なし。
+   format は N_SCANOUT_* で、0 はどれでも。 */
 struct n_setting_monitor_mode {
-    char monitor[32];
     uint32_t width, height;
     uint32_t refresh_mhz;
-    uint32_t reserved;
+    uint32_t format;
+};
+/* モニターごとの配置。placed 0 は自動（ほかの画面の右）。x、y はほかの画面と同じ座標で、負でもよい。 */
+struct n_setting_monitor_place {
+    int32_t x, y;
+    uint32_t placed;
 };
 
 /* ---- 起動の記録 ----
@@ -251,6 +257,26 @@ struct n_settings_changed {
     uint32_t remaining_ms;
 };
 #define N_SETTINGS_SERVICE "settings" /* サービスの名前 */
+
+/* サービス display の鍵（N_DOMAIN_DISPLAY。user/apps/display.c が宣言し、適用を受ける）。装置はモニターの身元。 */
+enum n_display_service_key {
+    N_DISPLAY_MODE = N_DISPLAY_KEY_COUNT, /* N_SETTING_MONITOR_MODE、N_SCOPE_DEVICE、試しつき */
+    N_DISPLAY_PLACE,                      /* N_SETTING_MONITOR_PLACE、N_SCOPE_DEVICE */
+    N_DISPLAY_SCALE,                      /* N_SETTING_INT、N_SCOPE_DEVICE：百分率 */
+    N_DISPLAY_PRIMARY                     /* N_SETTING_DEVICE、N_SCOPE_MACHINE：主画面のモニター。0 は画面 0 */
+};
+/* サービス machine の鍵（N_DOMAIN_POWER。user/apps/machine.c が宣言し、適用を受ける）。 */
+enum n_power_service_key {
+    N_POWER_BUTTON = N_POWER_KEY_COUNT, /* N_SETTING_ENUM（enum n_power_answer）：電源ボタン */
+    N_POWER_LID,                        /* N_SETTING_ENUM（同じ）：蓋を閉じたとき */
+    N_POWER_IDLE_MINUTES,               /* N_SETTING_INT：入力の無い時間がこれを超えたら。0 はしない */
+    N_POWER_IDLE_ANSWER,                /* N_SETTING_ENUM（同じ）：そのときにすること */
+    N_POWER_ALLOW_SLEEP,                /* N_SETTING_BOOL：眠りを許す */
+    N_POWER_ALLOW_HIBERNATE,            /* N_SETTING_BOOL：休止を許す */
+    N_POWER_CLOSE_SECONDS,              /* N_SETTING_INT：窓が一つも閉じない時間がこれを超えたら取りやめる */
+    N_POWER_AGAIN_SECONDS               /* N_SETTING_INT：取りやめからこの間にもう一度選ぶと、窓を待ち切って止まる */
+};
+enum n_power_answer { N_POWER_ANSWER_NOTHING, N_POWER_ANSWER_SLEEP, N_POWER_ANSWER_HIBERNATE, N_POWER_ANSWER_OFF };
 #define N_SETTINGS_MESSAGE_MAX \
     (sizeof(struct n_settings_request) + 2 * N_SETTING_VALUE_MAX) /* TRY は値と戻す先を運ぶ */
 #endif

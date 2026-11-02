@@ -33,7 +33,7 @@
 | `fs/` | C: の store の実行側。mount とパスの操作とパスの権限は `store.c`、開いた文書と私的な領域は `document.c`、block cache は `cache.c`、変更の watch は `watch.c`、起動の記録 `settings.rec` は `bootrecord.c`。書式のエンジンは `common/store/`。 |
 | `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音（`audio` が流れ・混合・出口の選択、`hda`・`hda_codec` が High Definition Audio）、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（USB HID）、`serial`、`refclock`（HPET か ACPI PM timer と、RTC）、電源と hibernate。 |
 | `net/` | `net.c`（Ethernet から TCP・DHCP・DNS まで）と `rtl8125.c`（実機の NIC）。 |
-| `gui/` | `wm.c`（窓管理、画面ごとの合成のスレッド、シェルの口 `SYS_SHELL_*`）、`pointer.c`（ポインターの絵）、`screenmode.c`（画面ごとのモードの選択）。文を言わず、タスクバーも壁紙も持たない。 |
+| `gui/` | `wm.c`（窓管理、画面ごとの合成のスレッド、シェルの口 `SYS_SHELL_*`、画面の配置の適用 `SYS_SCREEN_ARRANGE`）、`pointer.c`（ポインターの絵）、`screenmode.c`（画面ごとのモードの一覧と望みを運ぶ。選ばない）。文を言わず、タスクバーも壁紙も持たない。 |
 | `vm/` | VM だけの処理。下の「境界」を見る。 |
 
 ## 共有 `common/`
@@ -56,7 +56,8 @@
 | `libc/web/` | ブラウザーのエンジン。下の「ブラウザーの流れ」を見る。 |
 | `include/` | 公開の header（`nocturne.h`、`web.h`、`weburl.h`、`ui.h` など）。SDK にも入る。 |
 | `apps/shell.c`・`shell_art.h` | シェル：タスクバー、開始メニュー、音量、通知、デスクトップの絵と印。`session` が利用者の身元で起こす普通のプロセス。口は `display_abi.h`、仕様は ABI の §16。 |
-| `apps/` | システムのプログラム。サービスの管理者 `services.c`（宣言の表 `declared[]`）とサービス（`accounts.c`、`session.c`、`systemlog.c`、`machine.c`）、ブラウザー（`browser*.c`）、`sh.c`、`uihost.c`、`webfetch.c`、`agent.c`、小さな道具とゲーム、TypeScript のアプリ（`*.ts`）。 |
+| `apps/` | システムのプログラム。サービスの管理者 `services.c`（宣言の表 `declared[]`）とサービス（`accounts.c`、`session.c`、`systemlog.c`、`machine.c`（電源の方針と窓を閉じる段取り））、ブラウザー（`browser*.c`）、`sh.c`、`uihost.c`、`webfetch.c`、`agent.c`、小さな道具とゲーム、TypeScript のアプリ（`*.ts`）。 |
+| `apps/display.c` | サービス `display`：画面ごとのモードの選択、配置、主画面、倍率の持ち主（`N_CAP_DISPLAY`）。値は設定のサービスが保存する。 |
 | `apps/settingsd.c`・`settings_table.h` | サービス `settings`：選択の保存、宣言の表、型と範囲と権限の確かめ、見張り、期限つきの試し。領域の意味を持たない。 |
 | `apps/settings.c` | 設定の窓。宣言の表から頁を組む。音、画面、窓、入力、電源、網、時刻、サービス、利用者。 |
 | `libc/settings.c`・`include/nocturne_settings.h` | 設定の口 `n_setting_*`。プログラムの設定は `N_SCOPE_PROGRAM` の鍵（`libc/webprefs.c`、`apps/agent.c`）。 |

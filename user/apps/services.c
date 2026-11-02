@@ -68,9 +68,10 @@ static const struct declared_service declared[] = {
      CAPS(N_CAP_STORE_PRIVATE), .on_failure = {5, 500, 60000}, .clients_from = N_CLASS_USER},
     {.name = "settings", .program = "settingsd", .cls = N_CLASS_SYSTEM, .at_boot = true,
      CAPS(N_CAP_SETTINGS_APPLY, N_CAP_STORE_PRIVATE), .on_failure = {5, 500, 60000}, .clients_from = N_CLASS_USER},
-    /* 要るときに起こす。電源と画面の読取りの能力はここにだけ渡す。 */
-    {.name = "machine", .program = "machine", .cls = N_CLASS_SYSTEM,
-     CAPS(N_CAP_POWER, N_CAP_SCREEN_READ), .on_failure = {3, 500, 60000}, .clients_from = N_CLASS_USER},
+    /* 電源の事象を聞き、電源の方針と設定を持つ。電源と画面の読取りの能力はここにだけ渡す。 */
+    {.name = "machine", .program = "machine", .cls = N_CLASS_SYSTEM, .at_boot = true,
+     CAPS(N_CAP_POWER, N_CAP_SCREEN_READ), .needs = NAMES("settings"), .on_failure = {3, 500, 60000},
+     .clients_from = N_CLASS_USER},
     /* 試験の媒体にだけあるプログラム。C:\Nocturne\System の中にあるので、アプリは置けない。 */
     {.name = "tests", .program = "testrun", .cls = N_CLASS_SYSTEM, .at_boot = true, .optional = true,
      CAPS(N_CAP_POWER, N_CAP_PCI_CLAIM, N_CAP_SCREEN_READ, N_CAP_IDENTITY_GRANT), .needs = NAMES("accounts"),
@@ -78,6 +79,9 @@ static const struct declared_service declared[] = {
     {.name = "session", .program = "session", .cls = N_CLASS_SYSTEM, .at_boot = true, .console = true,
      CAPS(N_CAP_IDENTITY_GRANT, N_CAP_SHELL), .needs = NAMES("accounts", "tests"),
      .on_failure = {5, 1000, 60000}, .clients_from = N_CLASS_USER},
+    /* 画面のモード、配置、主画面、倍率を持つ。 */
+    {.name = "display", .program = "display", .cls = N_CLASS_SYSTEM, .at_boot = true,
+     CAPS(N_CAP_DISPLAY), .needs = NAMES("settings"), .on_failure = {5, 500, 60000}, .clients_from = CLIENTS_NONE},
 };
 #define DECLARED (sizeof declared / sizeof *declared)
 #define STOP_GRACE_MS 5000u /* 閉じた後、これだけ待って強制的に止める */

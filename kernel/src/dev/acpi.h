@@ -177,6 +177,8 @@ struct acpi_mcfg_entry {
    acpi_aml_init: load the namespace, run the devices' _INI, take the SCI, the power button
    (fixed and control-method) and the GPEs. "noaml" on the command line skips it. */
 void acpi_aml_init(void);
+/* The lid as _LID says it now, told to dev/pm.h; nothing without a lid. May run AML. */
+void acpi_lid_read(void);
 bool acpi_aml_ready(void);
 /* Sleep states are ACPI's S numbers (3 = suspend to RAM, 5 = soft off). prepare runs _PTS with
    interrupts on; enter writes SLP_TYP with interrupts off and returns only on failure (S5) or

@@ -30,7 +30,6 @@
 #include "dev/fb.h"
 #include "dev/fbcon.h"
 #include "dev/input.h"
-#include "dev/pm.h"
 #include "sys/object.h"
 #include "mm/vmalloc.h"
 #include "mm/vmm.h"
@@ -349,6 +348,10 @@ struct wscreen {
     /* Under wm_lock: */
     bool on;                  /* its part is on the desktop */
     int x, y, w, h;           /* the part: its mode's size, or (screen 0) a remote viewer's window's */
+    bool placed;              /* the display service says where the part is: place_x, place_y */
+    int place_x, place_y;
+    int was_x, was_y;         /* where it was before an arrangement */
+    uint32_t scale_percent;   /* the display service's, for the programs to draw by */
     int remote_w, remote_h;   /* screen 0 while remote_users */
     int reserved[N_EDGE_RIGHT + 1]; /* what the shell's windows keep of each edge (enum n_screen_edge) */
     struct tiles dirty;       /* what changed since its last frame */
@@ -501,13 +504,21 @@ static bool clipboard_open;               /* 核の thread が置いた（遠隔
 /* ---- the screens' parts ---- */
 static bool part_on(const struct wscreen *ws) { return ws->on && ws->w > 0 && ws->h > 0; }
 
-/* The part under a point of the desktop; screen 0's when none is. wm_lock held. */
+static struct wscreen *primary_screen; /* the display service's (SYS_SCREEN_ARRANGE); NULL: screen 0. Under wm_lock. */
+
+/* The main screen: new windows and the work area of SYS_SCREEN_INFO. wm_lock held. */
+static struct wscreen *screen_main(void) {
+    if (primary_screen && part_on(primary_screen)) return primary_screen;
+    return nwscreens ? wscreens[0] : NULL;
+}
+
+/* The part under a point of the desktop; the main screen's when none is. wm_lock held. */
 static struct wscreen *screen_at(int x, int y) {
     for (size_t i = 0; i < nwscreens; i++) {
         struct wscreen *ws = wscreens[i];
         if (part_on(ws) && in_rect(x, y, ws->x, ws->y, ws->w, ws->h)) return ws;
     }
-    return nwscreens ? wscreens[0] : NULL;
+    return screen_main();
 }
 
 /* ---- damage tracking ---- */
@@ -576,7 +587,7 @@ static struct rect part_area(struct wscreen *ws, bool fullscreen) {
     return a;
 }
 
-static struct rect work_area(void) { return part_area(nwscreens ? wscreens[0] : NULL, false); }
+static struct rect work_area(void) { return part_area(screen_main(), false); }
 
 static struct window *focused(void) {
     if (visible(focus_owner)) return focus_owner;
@@ -1609,13 +1620,21 @@ static bool wscreen_resize(struct wscreen *ws, int w, int h) {
     return true;
 }
 
-/* The parts from left to right in the screens' order; screen 0's always at the origin. wm_lock
-   held. */
+/* The parts the display service placed where it says; the others in the screens' order on their
+   right, at the top. wm_lock held. */
 static void layout(void) {
     int x = 0, h = 0;
     for (size_t i = 0; i < nwscreens; i++) {
         struct wscreen *ws = wscreens[i];
-        if (i && !part_on(ws)) continue;
+        if (!ws->placed || (i && !part_on(ws))) continue;
+        ws->x = ws->place_x;
+        ws->y = ws->place_y;
+        x = MAX(x, ws->x + ws->w);
+        h = MAX(h, ws->y + ws->h);
+    }
+    for (size_t i = 0; i < nwscreens; i++) {
+        struct wscreen *ws = wscreens[i];
+        if (ws->placed || (i && !part_on(ws))) continue;
         ws->x = x;
         ws->y = 0;
         x += ws->w;
@@ -1623,13 +1642,14 @@ static void layout(void) {
     }
     desk_w = x;
     desk_h = h;
-    if (nwscreens && wscreens[0]->w) {
-        sw = wscreens[0]->w;
-        sh = wscreens[0]->h;
+    struct wscreen *main = screen_main();
+    if (main && main->w) {
+        sw = main->w;
+        sh = main->h;
     }
 }
 
-/* A window whose centre left every part comes back onto screen 0's. wm_lock held. */
+/* A window whose centre left every part comes back onto the main screen's. wm_lock held. */
 static void windows_keep_in(void) {
     for (size_t i = 0; i < nwin; i++) {
         struct window *w = zorder[i];
@@ -1772,6 +1792,7 @@ static struct wscreen *wscreen_get(unsigned id, bool make) {
         }
         ws->id = (unsigned)(nwscreens - 1);
         ws->s = s;
+        ws->scale_percent = 100;
         ws->state.serial = 1;
         *at = ws;
         if (running) wscreen_start(ws);
@@ -2140,9 +2161,10 @@ static bool on_desktop(int x, int y) {
 static void handle_mouse(const struct mouse_event *m, uint64_t at) {
     int dx = m->dx, dy = m->dy;
     if (m->absolute) {
-        /* a tablet-style pointer (a USB tablet's, a hypervisor's): exactly where it says, over screen 0 */
-        dx = (int)((int64_t)m->x * (sw - 1) / MOUSE_ABS_MAX) - mx;
-        dy = (int)((int64_t)m->y * (sh - 1) / MOUSE_ABS_MAX) - my;
+        /* a tablet-style pointer (a USB tablet's, a hypervisor's): exactly where it says, over the main screen */
+        struct wscreen *main = screen_main();
+        dx = (main ? main->x : 0) + (int)((int64_t)m->x * (sw - 1) / MOUSE_ABS_MAX) - mx;
+        dy = (main ? main->y : 0) + (int)((int64_t)m->y * (sh - 1) / MOUSE_ABS_MAX) - my;
     } else {
         /* mild acceleration */
         if (ABS(dx) > 5) dx *= 2;
@@ -2388,6 +2410,79 @@ int64_t wm_screen_state(unsigned screen, uint64_t seen, struct n_screen_state *o
     return result;
 }
 
+/* *x, *y go as far as the part that was under cx, cy moved (was_x, was_y). wm_lock held. */
+static void moved_with_part(int cx, int cy, int *x, int *y) {
+    for (size_t i = 0; i < nwscreens; i++) {
+        struct wscreen *ws = wscreens[i];
+        if (!part_on(ws) || !in_rect(cx, cy, ws->was_x, ws->was_y, ws->w, ws->h)) continue;
+        *x += ws->x - ws->was_x;
+        *y += ws->y - ws->was_y;
+        return;
+    }
+}
+
+/* SYS_SCREEN_ARRANGE (a kernel copy): where the display service puts screen id's part, whether it is
+   the main screen, its scale. Windows and the pointer move with the part they are on. */
+int64_t wm_screen_arrange(unsigned id, const struct n_screen_arrange *a) {
+    if (!wm_running()) return -N_ERR_UNSUPPORTED;
+    /* a part is at most UINT16_MAX wide and high (pci_user_screen_modes): its end must fit an int */
+    if ((a->flags & ~(N_ARRANGE_PLACED | N_ARRANGE_PRIMARY)) || a->x < 0 || a->y < 0 || a->x > INT32_MAX - UINT16_MAX ||
+        a->y > INT32_MAX - UINT16_MAX || !a->scale_percent)
+        return -N_ERR_INVALID;
+    wm_lock();
+    struct wscreen *ws = wscreen_get(id, true);
+    if (!ws) {
+        wm_unlock();
+        return screen_get(id) ? -N_ERR_NO_MEMORY : -N_ERR_NOT_FOUND;
+    }
+    for (size_t i = 0; i < nwscreens; i++) {
+        wscreens[i]->was_x = wscreens[i]->x;
+        wscreens[i]->was_y = wscreens[i]->y;
+    }
+    ws->placed = a->flags & N_ARRANGE_PLACED;
+    ws->place_x = a->x;
+    ws->place_y = a->y;
+    ws->scale_percent = a->scale_percent;
+    if (a->flags & N_ARRANGE_PRIMARY) primary_screen = ws;
+    layout();
+    for (size_t k = 0; k < nwin; k++) {
+        struct window *w = zorder[k];
+        moved_with_part(w->x + frame_w(w) / 2, w->y + frame_h(w) / 2, &w->x, &w->y);
+    }
+    moved_with_part(mx, my, &mx, &my);
+    windows_keep_in();
+    mx = MAX(0, MIN(mx, desk_w - 1));
+    my = MAX(0, MIN(my, desk_h - 1));
+    for (size_t i = 0; i < nwscreens; i++) windows_refit(wscreens[i]);
+    damage_all();
+    direct_update();
+    wm_unlock();
+    kprintf("wm: screen %u: at %d,%d%s, scale %u%%\n", id, a->x, a->y, a->flags & N_ARRANGE_PRIMARY ? ", the main screen" : "",
+            a->scale_percent);
+    wm_screen_info_changed();
+    return 0;
+}
+
+/* What struct screen_modes says of screen id's part. */
+void wm_screen_report(unsigned id, struct screen_modes *out) {
+    wm_lock();
+    struct wscreen *ws = wscreen_get(id, false);
+    if (ws) {
+        out->on = part_on(ws);
+        out->x = ws->x;
+        out->y = ws->y;
+        out->width = (uint32_t)ws->w;
+        out->height = (uint32_t)ws->h;
+        out->placed = ws->placed;
+        out->primary = ws == screen_main();
+        out->scale_percent = ws->scale_percent;
+    } else {
+        out->primary = id == 0;
+        out->scale_percent = 100;
+    }
+    wm_unlock();
+}
+
 /* ---- remote display ---- */
 static struct wscreen *screen0(void) {
     wm_lock();
@@ -2516,12 +2611,9 @@ uint32_t wm_pointer_image(uint32_t seen, uint32_t *px, int *hot_x, int *hot_y) {
 static const struct screen_display display = {.repaint = wm_repaint, .direct = wm_screen_direct,
                                               .modes_offer = screen_modes_offer, .modes_gone = screen_modes_gone,
                                               .modes_shown = screen_modes_shown, .state = wm_screen_state};
-static const struct pm_desktop power_desktop = {.window_count = wm_window_count, .close_windows = wm_close_windows,
-                                                .repaint = wm_repaint};
 
 void wm_init(void) {
     screen_display = &display;
-    pm_set_desktop(&power_desktop);
     watched_init(&screen_watched, NULL);
     watched_init(&shell_watched, NULL);
     __atomic_store_n(&shell_watchable, true, __ATOMIC_RELEASE);
@@ -2564,6 +2656,8 @@ void wm_init(void) {
     wm_unlock();
     kprintf("wm: desktop started at %dx%d on %u screens\n", sw, sh, (unsigned)count);
 }
+
+int64_t wm_windows_watch(void) { return wm_running() ? watched_open(&shell_watched) : -N_ERR_UNSUPPORTED; }
 
 int wm_window_count(char *top_title, size_t n) {
     if (!wm_running()) return 0;
@@ -3045,6 +3139,8 @@ static int64_t sys_screen_info(uint64_t a, uint64_t b, uint64_t c) {
     si.blue_bits = fb.simulated ? 10 : fb.bsize;
     /* Without deep planes the desktop delivers 8 bits per channel. */
     si.bits_per_channel = fb.deep ? fb.bpc : MIN(fb.bpc, 8);
+    struct wscreen *main = on ? screen_main() : NULL;
+    si.scale_percent = main ? main->scale_percent : 100;
     wm_unlock();
     int r = copy_to_user((void *)a, &si, b ? sizeof si : sizeof(struct screen_info));
     if (r < 0) return r;
@@ -3148,7 +3244,8 @@ static int64_t shell_screens(struct n_shell_screen *out, size_t max) {
     size_t count = nwscreens;
     for (size_t i = 0; i < count; i++) {
         struct wscreen *ws = wscreens[i];
-        list[i] = (struct n_shell_screen){.x = ws->x, .y = ws->y, .width = ws->w, .height = ws->h, .on = part_on(ws)};
+        list[i] = (struct n_shell_screen){.x = ws->x, .y = ws->y, .width = ws->w, .height = ws->h, .on = part_on(ws),
+                                          .scale_percent = ws->scale_percent};
     }
     wm_unlock();
     return list_out(out, max, list, count, sizeof *list);

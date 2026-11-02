@@ -238,7 +238,8 @@ static bool same_mode(const struct NvKmsKapiDisplayMode *a, const struct NvKmsKa
 
 /* A mode as the system names it. */
 static struct n_screen_mode mode_of(const struct NvKmsKapiDisplayMode *m) {
-    return (struct n_screen_mode){ m->timings.hVisible, m->timings.vVisible, m->timings.refreshRate, 0 };
+    /* the desktop's buffers are XRGB8888 in every mode (the desktop's surface below) */
+    return (struct n_screen_mode){ m->timings.hVisible, m->timings.vVisible, m->timings.refreshRate, 0, 8, N_SCANOUT_XRGB8888 };
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -1382,9 +1383,9 @@ static void images_held_again(void);
 
    After hand_back a new wish takes the display again (take_again): a mode the user tries in
    Settings, a trial's end, the system's next best, a monitor offered anew. What the system is told
-   of a screen handed back follows screenmode.c (screen_modes_offer): a wish said back with
+   of a screen handed back follows the display service (user/apps/display.c): a wish said back with
    nothing shown is refused, and then a trial goes back to the mode before it at once, while
-   without a trial the system asks for its next best mode, and for the next after that one, until
+   without a trial the service asks for its next best mode, and for the next after that one, until
    none is left. Where the display engine performs no flip at all, that is each of the monitor's
    modes in turn, each dark for FLIP_TIMEOUT_MS. So such a wish (handed back as it was followed,
    its mode set's flip not performed, or not shown after it took the display again) is said back

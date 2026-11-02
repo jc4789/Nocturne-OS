@@ -14,10 +14,11 @@
    screen_format) fills this whole structure. A zero second argument keeps the
    original struct screen_info reply, so existing programs are unaffected. */
 struct screen_format {
-    uint32_t width, height;     /* the work area, as struct screen_info */
+    uint32_t width, height;     /* the main screen's work area, as struct screen_info */
     uint32_t bits_per_pixel;    /* scanout pixel size: 16, 24 or 32 */
     uint8_t red_bits, green_bits, blue_bits;
     uint8_t bits_per_channel;   /* smallest of the three: 8 or 10 (or more) */
+    uint32_t scale_percent;     /* how large the main screen's user wants things drawn: 100 is as they are */
 };
 
 /* Desktop settings as they stand: SYS_SCREEN_INFO with its third argument
@@ -36,16 +37,14 @@ struct desktop_settings {
     uint8_t reserved[5];
 };
 
-/* The monitor's mode (resolution and refresh rate), which the Settings window reads:
-   SYS_SCREEN_INFO with its third argument SCREEN_MODES_GET and its second sizeof(struct
-   screen_modes). The modes are the display driver's (n_pci_screen_modes, abi.h); the system
-   chooses among them: the user's choice for that monitor (N_DISPLAY_MODE, settings_abi.h), else the
-   monitor's preferred mode. Without a display driver's modes (count 0) the screen keeps the mode it
-   has, offered then says which (the monitor and its name from the EDID the firmware read, "" without
-   one; shown the mode of the screen shown). While the firmware's framebuffer is shown, shown is the
-   firmware's mode whether or not modes are offered, its refresh 0 where no timing of the EDID names
-   that size. source says what decides the desktop's size, chosen the mode the user chose for the
-   monitor offered names (all 0: none), whether or not it is offered now.
+/* A screen as the kernel knows it: SYS_SCREEN_INFO with its third argument SCREEN_MODES_GET and its
+   second sizeof(struct screen_modes). The modes are the display driver's (n_pci_screen_modes,
+   abi.h). The kernel chooses none of them: until the display service (N_CAP_DISPLAY,
+   SYS_SCREEN_MODE_APPLY) asks for one, the screen shows what it shows. Without a display driver's
+   modes (count 0) the screen keeps the mode it has, offered then says which (the monitor and its name
+   from the EDID the firmware read, "" without one; shown the mode of the screen shown). While the
+   firmware's framebuffer is shown, shown is the firmware's mode whether or not modes are offered, its
+   refresh 0 where no timing of the EDID names that size. source says what decides the desktop's size.
    Each screen has its own: the third argument is the op with the screen's number in its bits
    from 8 on (op | screen << 8), and screens says how many there are
    (an unknown screen: N_ERR_NOT_FOUND). */
@@ -54,7 +53,7 @@ struct desktop_settings {
    abi.h), receivable once anything SCREEN_SETTINGS_GET, the struct screen_format reply or
    SCREEN_MODES_GET reports has changed, whoever changed it: the desktop's size and settings,
    whether smooth gradients can be shown, the monitor offered and its modes, the mode wanted, a
-   a refusal, the source, the user's choice. N_ERR_INVALID when the first two are not 0, N_ERR_UNSUPPORTED without the
+   a refusal, the source, a screen's place and scale. N_ERR_INVALID when the first two are not 0, N_ERR_UNSUPPORTED without the
    desktop. */
 #define SCREEN_WATCH 5
 #define SCREEN_MODE_TRIAL_MS 15000u /* the Settings window's: a mode tried and not kept goes back after this */
@@ -70,11 +69,31 @@ enum {
 };
 struct screen_modes {
     struct n_screen_modes offered; /* the driver's monitor, the modes and the one it shows */
-    struct n_screen_mode wanted;   /* the one the system asks it to show */
-    uint32_t refused;              /* the mode applied last could not be shown: the next best is shown */
+    struct n_screen_mode wanted;   /* the one the display service asks it to show */
     uint32_t source;               /* SCREEN_SOURCE_* */
     uint32_t screens;              /* the number of screens */
-    struct n_screen_mode chosen;   /* the user's choice for offered.monitor (all 0: none) */
+    uint32_t on;                   /* the screen has a part of the desktop */
+    uint32_t reserved;
+    uint64_t offer_serial;         /* moves with each offer that waits for a wish (done 0) */
+    uint64_t wish_serial;          /* moves with each wish: the number of wanted */
+    uint64_t refused_serial;       /* the last wish the driver could not show; 0: none since the monitor came */
+    int32_t x, y;                  /* the screen's part of the desktop */
+    uint32_t width, height;
+    uint32_t placed;               /* the display service placed it; else it follows the others on the right */
+    uint32_t primary;              /* new windows and the work area of struct screen_format are here */
+    uint32_t scale_percent;
+};
+/* SYS_SCREEN_ARRANGE (N_CAP_DISPLAY). x and y are not negative: the display service moves the whole
+   arrangement so that it starts at the origin. N_ARRANGE_PLACED: at x, y; without it the part follows
+   the placed ones on the right. N_ARRANGE_PRIMARY: the main screen from now on. scale_percent, not 0,
+   is reported to the programs (struct screen_format, struct n_shell_screen), which draw by it; the kernel
+   draws nothing larger for it. */
+#define N_ARRANGE_PLACED 1u
+#define N_ARRANGE_PRIMARY 2u
+struct n_screen_arrange {
+    int32_t x, y;
+    uint32_t flags;         /* N_ARRANGE_* */
+    uint32_t scale_percent;
 };
 /* Window flag. The window buffer carries a deep plane of w*h bytes directly
    after its w*h pixels. The compositor reads it only while the desktop has 10
@@ -116,7 +135,7 @@ struct n_shell_screen {
     int32_t x, y;
     int32_t width, height;
     uint32_t on;
-    uint32_t reserved;
+    uint32_t scale_percent;
 };
 
 #define N_SHELL_WINDOW_MINIMIZED 1u

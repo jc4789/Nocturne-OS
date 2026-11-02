@@ -164,6 +164,8 @@ static uint32_t fixed_size(uint32_t type) {
     case N_SETTING_BOOL: case N_SETTING_INT: case N_SETTING_ENUM: return sizeof(int32_t);
     case N_SETTING_ENDPOINT: return sizeof(struct n_sockaddr);
     case N_SETTING_MONITOR_MODE: return sizeof(struct n_setting_monitor_mode);
+    case N_SETTING_MONITOR_PLACE: return sizeof(struct n_setting_monitor_place);
+    case N_SETTING_DEVICE: return sizeof(uint64_t);
     default: return 0;
     }
 }
@@ -198,6 +200,8 @@ static bool decl_valid(const struct n_setting_decl *d) {
         return d->max >= 0 && d->max <= N_SETTING_VALUE_MAX && (int64_t)strlen(d->fallback_text) <= d->max;
     case N_SETTING_ENDPOINT:
     case N_SETTING_MONITOR_MODE:
+    case N_SETTING_MONITOR_PLACE:
+    case N_SETTING_DEVICE:
         return true;
     default:
         return false;
@@ -806,8 +810,8 @@ static const void *current_bytes(const struct known *k, const struct n_setting_i
         *length = v->length;
         return v->bytes;
     }
-    /* カーネルの鍵は今の値。一覧の鍵は装置ごとの選択が無ければ既定（全部 0）。 */
-    if (k->kernel && k->d.type != N_SETTING_MONITOR_MODE) {
+    /* カーネルの鍵は今の値。 */
+    if (k->kernel) {
         uint32_t size = fixed_size(k->d.type);
         n_result r = n_settings_effective(k->d.domain, k->d.key, scratch, SCRATCH_BYTES);
         if (r >= 0 && (uint32_t)r == size) {
@@ -1137,7 +1141,7 @@ static void kernel_domain_changed(uint32_t domain) {
     uint8_t now[sizeof(struct n_sockaddr) + sizeof(int32_t)];
     for (size_t i = 0; i < known_count; i++) {
         struct known *k = knowns[i];
-        if (k->d.domain != domain || !k->kernel || k->d.apply == N_APPLY_RESTART || k->d.type == N_SETTING_MONITOR_MODE) continue;
+        if (k->d.domain != domain || !k->kernel || k->d.apply == N_APPLY_RESTART) continue;
         struct n_setting_id id = {.domain = domain, .key = k->d.key};
         if (k->d.scope == N_SCOPE_USER) {
             if (!active_user) continue;

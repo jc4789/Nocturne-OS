@@ -52,3 +52,5 @@ void input_key_set1(uint8_t sc, bool extended, uint64_t at);
 void input_unicode(uint16_t c, bool pressed, uint64_t at); /* a typed character, independent of layout */
 void input_mouse(const struct mouse_event *e);
 void input_mouse_attach(void);
+/* The monotonic time of the last key or pointer event; 0 before the first. Any context. */
+uint64_t input_last_ns(void);
