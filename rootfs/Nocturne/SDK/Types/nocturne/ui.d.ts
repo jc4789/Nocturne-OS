@@ -321,3 +321,64 @@ export function withAlpha(colour: Colour, alpha: number): Colour;
 /** Starts an app from the desktop, with one optional argument. The app is found by name in
     C:\Nocturne\System, then in each folder of C:\Programs ("notepad"), or by a path. */
 export function launch(path: string, argument?: string): boolean;
+
+/** The computer, as About shows it. */
+export interface SystemInfo {
+    /** The processor's name. */
+    readonly processor: string;
+    /** Processors the system runs on. */
+    readonly processors: number;
+    readonly system: string;
+    /** Bytes. */
+    readonly totalMemory: number;
+    readonly freeMemory: number;
+    /** Milliseconds since the computer started. */
+    readonly uptimeMs: number;
+    /** Programs and threads running now. */
+    readonly tasks: number;
+    readonly screenWidth: number;
+    readonly screenHeight: number;
+    readonly bitsPerChannel: number;
+}
+
+/** null when the system will not say. */
+export function systemInfo(): SystemInfo | null;
+
+/** Paints inside a canvas widget, in the widget's own coordinates. */
+export interface Painter {
+    rect(x: number, y: number, w: number, h: number, colour: Colour): void;
+    /** A rounded rectangle; with bottom, a vertical gradient from colour to bottom. */
+    round(x: number, y: number, w: number, h: number, radius: number, colour: Colour, bottom?: Colour): void;
+    stroke(x: number, y: number, w: number, h: number, radius: number, width: number, colour: Colour): void;
+    shadow(x: number, y: number, w: number, h: number, radius: number, blur: number, colour: Colour): void;
+    circle(cx: number, cy: number, r: number, colour: Colour, bottom?: Colour): void;
+    line(x0: number, y0: number, x1: number, y1: number, width: number, colour: Colour): void;
+    /** Draws text with its top at y; returns its width. */
+    text(x: number, y: number, content: string | number, options?: {size?: number; weight?: 0 | 1; mono?: boolean; colour?: Colour}): number;
+    measure(content: string | number, options?: {size?: number; weight?: 0 | 1; mono?: boolean}): number;
+    icon(name: IconName, x: number, y: number, size: number, colour?: Colour): void;
+}
+
+/** The pointer over a canvas, in its own coordinates. */
+export interface PointerEvent {
+    x: number;
+    y: number;
+    /** A button went down / came up (neither: the pointer moved). */
+    down: boolean;
+    up: boolean;
+    /** The buttons held: 1 left, 2 right, 4 middle. */
+    buttons: number;
+    shift: boolean;
+    ctrl: boolean;
+    alt: boolean;
+}
+
+export interface CanvasProps extends Common {
+    /** Moves and presses over the canvas; once a button is down there, the pointer is its until all are up. */
+    onPointer?: (event: PointerEvent) => void;
+    /** Wheel notches over the canvas (positive: towards the user). */
+    onWheel?: (notches: number) => void;
+}
+
+/** Free drawing: draw runs on every repaint with the widget's size (default 100 × 100). */
+export function canvas(draw: (painter: Painter, width: number, height: number) => void, props?: CanvasProps): Widget;
