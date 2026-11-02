@@ -4,6 +4,8 @@
 #include <string.h>
 #include "nocturne.h"
 #include "display.h"
+#include "nocturne_settings.h"
+#include <stdio.h>
 
 bool gui_available(void) {
     struct screen_info si;
@@ -219,6 +221,38 @@ n_handle n_shell_watch(n_handle cap) { return (n_handle)__syscall(SYS_SHELL_WATC
 n_result n_shell_hotkey(n_handle cap, window_t *win, uint32_t key, uint32_t mods) {
     return __syscall(SYS_SHELL_HOTKEY, cap, win->handle, key, mods, 0);
 }
+n_result n_screen_modes_get(uint32_t screen, struct screen_modes *out) {
+    return (n_result)__syscall(SYS_SCREEN_INFO, (long)out, sizeof *out, SCREEN_MODES_GET | (long)screen << 8, 0, 0);
+}
+
+n_result n_screen_device(uint32_t screen, uint64_t *out) {
+    struct screen_modes *m = malloc(sizeof *m);
+    if (!m) return -N_ERR_NO_MEMORY;
+    char mine[sizeof m->offered.monitor + sizeof "#4294967295"];
+    n_result r = n_screen_modes_get(screen, m);
+    if (r >= 0) {
+        strlcpy(mine, m->offered.monitor, sizeof mine);
+        size_t length = strlen(mine);
+        bool again = !length;
+        for (uint32_t i = 0; i < screen && !again && r >= 0; i++) {
+            r = n_screen_modes_get(i, m);
+            again = r >= 0 && !strcmp(m->offered.monitor, mine);
+        }
+        if (again) snprintf(mine + length, sizeof mine - length, "#%u", (unsigned)screen);
+        *out = n_setting_device(mine);
+    }
+    free(m);
+    return r < 0 ? r : 0;
+}
+
+n_result n_screen_mode_apply(n_handle cap, uint32_t screen, const struct n_screen_mode *mode) {
+    return (n_result)__syscall(SYS_SCREEN_MODE_APPLY, cap, screen, (long)mode, 0, 0);
+}
+
+n_result n_screen_arrange(n_handle cap, uint32_t screen, const struct n_screen_arrange *arrange) {
+    return (n_result)__syscall(SYS_SCREEN_ARRANGE, cap, screen, (long)arrange, 0, 0);
+}
+
 n_result n_power_state(n_handle cap, struct n_power_state *out) {
     return __syscall(SYS_POWER_STATE, cap, (long)out, sizeof *out, 0, 0);
 }

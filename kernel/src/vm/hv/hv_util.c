@@ -82,7 +82,7 @@ static void util_thread(void *arg) {
         kprintf("hv-util: the host asked us to %s\n",
                 a == ACT_REBOOT ? "restart" : a == ACT_HIBERNATE ? "hibernate" : "shut down");
         sleep_until(clock_after(100 * NS_PER_MS)); /* let our reply reach the host */
-        pm_request(a == ACT_REBOOT ? PM_REBOOT : a == ACT_HIBERNATE ? PM_HIBERNATE : PM_POWER_OFF, false);
+        pm_host_asks(a == ACT_REBOOT ? PM_REBOOT : a == ACT_HIBERNATE ? PM_HIBERNATE : PM_POWER_OFF);
     }
 }
 

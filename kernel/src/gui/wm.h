@@ -11,8 +11,13 @@ bool wm_running(void);
    (SCREEN_WATCH, display_abi.h) hear of it. Any CPU; it does not sleep, so the caller may hold a
    lock (watched_changed, sys/watch.c). Nothing without the desktop. */
 void wm_screen_info_changed(void);
-/* The size of screen 0's part of the desktop, which a remote viewer may have changed. */
+/* The size of the main screen's part of the desktop, which a remote viewer may have changed. */
 void wm_screen_size(uint32_t *w, uint32_t *h);
+/* SYS_SCREEN_ARRANGE (a kernel copy), and what struct screen_modes reports of a screen's part. */
+struct n_screen_arrange;
+struct screen_modes;
+int64_t wm_screen_arrange(unsigned id, const struct n_screen_arrange *a);
+void wm_screen_report(unsigned id, struct screen_modes *out);
 
 /* The UTF-8 clipboard, any CPU, under the WM lock: a call on another CPU may replace it at any
    time, so it is read as a caller-owned snapshot (release with kfree). wm_clipboard_set copies
@@ -22,9 +27,10 @@ void wm_clipboard_info(size_t *len, uint32_t *seq);
 char *wm_clipboard_snapshot(size_t *len);
 /* The window and screen calls, any CPU. */
 int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
-/* Power changes (dev/pm.c): how many app windows are open (the top one's
-   title in top_title), and ask every one of them to close. */
+/* SYS_POWER_WINDOWS: how many app windows are open (the top one's title in top_title), and ask every
+   one of them to close. */
 int wm_window_count(char *top_title, size_t n);
+int64_t wm_windows_watch(void); /* SYS_POWER_WINDOWS_WATCH */
 void wm_close_windows(void);
 void wm_repaint(void); /* the screens lost what was on them (after sleep, a hold): draw all of them again */
 /* A display driver's screen (dev/pciuser.c), by its number (dev/fb.h): whether its buffers can

@@ -602,7 +602,14 @@ n_result cpu_info(struct n_cpuinfo *info) { return SC1(SYS_CPU_INFO, info); }
 void yield(void) { SC0(SYS_YIELD); }
 n_result poweroff(n_handle cap) { return NC5(SYS_POWER, cap, POWER_OFF, 0, 0, 0); }
 n_result reboot(n_handle cap) { return NC5(SYS_POWER, cap, POWER_REBOOT, 0, 0, 0); }
-n_result n_power_request(n_handle cap, uint32_t action, uint32_t flags) { return NC5(SYS_POWER, cap, action, flags, 0, 0); }
+n_result n_power_request(n_handle cap, uint32_t action) { return NC5(SYS_POWER, cap, action, 0, 0, 0); }
+n_result n_power_events(n_handle cap, struct n_power_events *out) { return NC5(SYS_POWER_EVENTS, cap, out, sizeof *out, 0, 0); }
+n_handle n_power_events_watch(n_handle cap) { return (n_handle)NC5(SYS_POWER_EVENTS_WATCH, cap, 0, 0, 0, 0); }
+n_result n_power_windows(n_handle cap, bool ask_to_close, char *top_title, size_t size) {
+    return NC5(SYS_POWER_WINDOWS, cap, ask_to_close, top_title, size, 0);
+}
+n_result n_power_say(n_handle cap, const struct n_power_state *state) { return NC5(SYS_POWER_SAY, cap, state, sizeof *state, 0, 0); }
+n_handle n_power_windows_watch(n_handle cap) { return (n_handle)NC5(SYS_POWER_WINDOWS_WATCH, cap, 0, 0, 0, 0); }
 n_result pcilist(struct n_pciinfo *out, int max) { return SC2(SYS_PCILIST, out, max); }
 
 static bool is_document(const char *path) {

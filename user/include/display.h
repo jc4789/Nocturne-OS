@@ -6,6 +6,16 @@
 
 /* The work area and colour format. 0, or a negative n_result. */
 n_result screen_format(struct screen_format *out);
+/* A screen as the kernel knows it (SCREEN_MODES_GET, display_abi.h). */
+n_result n_screen_modes_get(uint32_t screen, struct screen_modes *out);
+/* The number the system knows a screen's monitor by, for struct n_setting_id's device: of the EDID's maker,
+   product and serial number; made unique with the screen's number where another screen before it has the
+   same, or none. */
+n_result n_screen_device(uint32_t screen, uint64_t *out);
+/* N_CAP_DISPLAY: the mode the screen is to show (one offered; all 0: none), and its place, whether it is
+   the main screen, its scale. */
+n_result n_screen_mode_apply(n_handle cap, uint32_t screen, const struct n_screen_mode *mode);
+n_result n_screen_arrange(n_handle cap, uint32_t screen, const struct n_screen_arrange *arrange);
 /* A watch (n_watch_take) on what SYS_SCREEN_INFO reports (SCREEN_WATCH, display_abi.h). */
 n_handle n_screen_watch(void);
 /* Bits per channel the desktop delivers: 8, or 10 on a deep display. */

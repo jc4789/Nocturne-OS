@@ -15,8 +15,7 @@ struct setting {
     setting_get get;
 };
 
-#define SIZE_OF(type) ((type) == N_SETTING_ENDPOINT ? sizeof(struct n_sockaddr) \
-                       : (type) == N_SETTING_MONITOR_MODE ? sizeof(struct n_setting_monitor_mode) : sizeof(int32_t))
+#define SIZE_OF(type) ((type) == N_SETTING_ENDPOINT ? sizeof(struct n_sockaddr) : sizeof(int32_t))
 
 static const struct setting settings[] = {
     {N_DOMAIN_BOOT, N_BOOT_IOMMU, N_SETTING_BOOL, N_SETTING_AT_START, 0, 1, boot_setting_put, boot_setting_get},
@@ -26,7 +25,6 @@ static const struct setting settings[] = {
     {N_DOMAIN_BOOT, N_BOOT_UNISOLATED_DRIVERS, N_SETTING_BOOL, N_SETTING_AT_START, 0, 1, boot_setting_put, boot_setting_get},
     {N_DOMAIN_AUDIO, N_AUDIO_VOLUME, N_SETTING_INT, 0, 0, 100, audio_setting_put, audio_setting_get},
     {N_DOMAIN_AUDIO, N_AUDIO_MUTED, N_SETTING_BOOL, 0, 0, 1, audio_setting_put, audio_setting_get},
-    {N_DOMAIN_DISPLAY, N_DISPLAY_MODE, N_SETTING_MONITOR_MODE, N_SETTING_LIST, 0, 0, screen_modes_setting_put, screen_modes_setting_get},
     {N_DOMAIN_DISPLAY, N_DISPLAY_HOLD_SECONDS, N_SETTING_INT, 0, 0, INT32_MAX, screen_hold_setting_put, screen_hold_setting_get},
     {N_DOMAIN_WINDOW, N_WINDOW_SMOOTH_GRADIENTS, N_SETTING_BOOL, 0, 0, 1, smooth_gradients_setting_put, smooth_gradients_setting_get},
     {N_DOMAIN_INPUT, N_INPUT_POINTER_SPEED, N_SETTING_INT, 0, -2, 2, pointer_speed_setting_put, pointer_speed_setting_get},
@@ -58,11 +56,6 @@ static int value_check(const struct setting *s, const void *value) {
         memcpy(&v, value, sizeof v);
         return v < s->low || v > s->high ? -N_ERR_INVALID : 0;
     }
-    if (s->type == N_SETTING_MONITOR_MODE) {
-        const struct n_setting_monitor_mode *m = value;
-        if (!m->monitor[0] || m->monitor[sizeof m->monitor - 1] || !m->width || !m->height || !m->refresh_mhz)
-            return -N_ERR_INVALID;
-    }
     return 0;
 }
 
@@ -80,7 +73,6 @@ int64_t settings_syscall_apply(int cap, uint32_t domain, uint32_t key, const voi
     union {
         int32_t i;
         struct n_sockaddr endpoint;
-        struct n_setting_monitor_mode mode;
     } value;
     if (copy_from_user(&value, uvalue, len)) return -N_ERR_BAD_ADDRESS;
     return apply(s, &value);

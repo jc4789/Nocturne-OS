@@ -30,9 +30,6 @@ static const struct n_setting_decl settings_table[] = {
     BOOL_SETTING(N_DOMAIN_AUDIO, N_AUDIO_MUTED, N_SCOPE_USER, N_APPLY_NOW, "audio.muted", "消音",
                  "全部の音を止めます。音量はそのままです。", 0),
     /* 画面 */
-    {.domain = N_DOMAIN_DISPLAY, .key = N_DISPLAY_MODE, .type = N_SETTING_MONITOR_MODE, .scope = N_SCOPE_DEVICE,
-     .apply = N_APPLY_TRIAL, .flags = N_SETTING_DECL_CUSTOM, .name = "display.mode", .label = "解像度と拍",
-     .about = "モニターごとの解像度とリフレッシュレートです。"},
     INT_SETTING(N_DOMAIN_DISPLAY, N_DISPLAY_HOLD_SECONDS, N_SCOPE_MACHINE, N_APPLY_NOW, "display.hold-seconds",
                 "ドライバーが画面を握る秒数", "ドライバーが画面を握れる秒数です。0 は上限なしです。", 0, 86400, 0),
     /* 窓 */
@@ -43,7 +40,7 @@ static const struct n_setting_decl settings_table[] = {
                 "ポインターの速さ", "同じマウスの動きでポインターが進む量です。", -2, 2, 0),
     /* 電源 */
     INT_SETTING(N_DOMAIN_POWER, N_POWER_PERFORMANCE_PREFERENCE, N_SCOPE_MACHINE, N_APPLY_NOW, "power.performance",
-                "CPU の性能の好み", "0 が性能、255 が省電力です。", 0, 255, 128),
+                "CPU の性能の好み", "0 が性能、255 が省電力です。CPU が CPPC か HWP を持つときに効きます。", 0, 255, 128),
     /* 網 */
     {.domain = N_DOMAIN_NETWORK, .key = N_NETWORK_DNS_SERVER, .type = N_SETTING_ENDPOINT, .scope = N_SCOPE_MACHINE,
      .apply = N_APPLY_NONE, .name = "network.dns-server", .label = "DNS のサーバー",

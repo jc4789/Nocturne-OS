@@ -521,8 +521,8 @@ static void direct_cases(n_handle vga, n_handle surface, const struct n_scanout 
     n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
 }
 
-/* The monitor's modes (n_pci_screen_modes): the driver offers what it can show, the system wants
-   the monitor's preferred mode, a mode applied (N_DISPLAY_MODE) is wanted, and a mode the driver
+/* The monitor's modes (n_pci_screen_modes): the driver offers what it can show, the display service
+   wants the monitor's preferred mode, a mode applied (N_DISPLAY_MODE) is wanted, and a mode the driver
    could not show is refused. The driver shows each mode wanted: the Bochs registers (when they
    answer) set to its size, the rows as long as the boot screen's, and its surface given at that
    size, which the desktop takes. */
@@ -554,11 +554,22 @@ static uint32_t screen_source(void) {
     free(s);
     return source;
 }
-/* The user's choice for this test's monitor, by the settings' door. */
+/* This test's monitor's choice in the settings service, whose owner is the display service. */
+static struct n_setting_id monitor_id(void) {
+    struct n_setting_id id = n_setting_at(N_DOMAIN_DISPLAY, N_DISPLAY_MODE);
+    id.device = n_setting_device("pcitest-vga");
+    return id;
+}
+/* The user's choice for this test's monitor: tried and kept, as the Settings window does. */
 static n_result mode_apply(const struct n_screen_mode *m) {
     struct n_setting_monitor_mode s = {.width = m->width, .height = m->height, .refresh_mhz = m->refresh_mhz};
-    strlcpy(s.monitor, "pcitest-vga", sizeof s.monitor);
-    return n_settings_apply(n_cap_find(N_CAP_SETTINGS_APPLY), N_DOMAIN_DISPLAY, N_DISPLAY_MODE, &s, sizeof s);
+    n_result r = n_setting_try(monitor_id(), &s, sizeof s, NULL, 0, SCREEN_MODE_TRIAL_MS, NULL);
+    return r < 0 ? r : n_setting_commit(monitor_id(), NULL);
+}
+static bool mode_kept(const struct n_screen_mode *m) {
+    struct n_setting_monitor_mode s = {0};
+    return n_setting_get(monitor_id(), &s, sizeof s) == (n_result)sizeof s && s.width == m->width && s.height == m->height &&
+           s.refresh_mhz == m->refresh_mhz;
 }
 /* The next wish (a mode_serial after *serial) within ms. */
 static bool mode_wanted(n_handle vga, struct n_screen_state *st, uint64_t *serial, int64_t ms) {
@@ -646,14 +657,14 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     CHECK(screen_heard(heard, watch, 1000), "the screen's watch hears the modes offered");
     uint64_t serial = 0;
     r = n_pci_screen_state(vga, 0, 0, &st, 0);
-    CHECK(r == 0 && same_mode(&st.mode, &native) && mode_wanted(vga, &st, &serial, 0),
-          "the system wants the monitor's preferred mode: %ux%u at %u mHz", st.mode.width, st.mode.height, st.mode.refresh_mhz);
+    CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native),
+          "the display service wants the monitor's preferred mode: %ux%u at %u mHz", st.mode.width, st.mode.height, st.mode.refresh_mhz);
     r = mode_show(vga, surface, d, dispi, offer, &st, false);
     CHECK(r == 0, "the preferred mode shown: %s", n_result_text(r));
     CHECK(n_pci_screen_state(vga, 0, st.serial, &st, n_clock_after(100 * N_NS_PER_MS)) == -N_ERR_TIMEOUT, "a mode shown as wanted changes nothing");
     r = modes_get(seen);
     CHECK(r == 0 && seen->offered.count == 4 && !strcmp(seen->offered.monitor, "pcitest-vga") &&
-              same_mode(&seen->offered.shown, &native) && same_mode(&seen->wanted, &native) && !seen->refused &&
+              same_mode(&seen->offered.shown, &native) && same_mode(&seen->wanted, &native) && !seen->refused_serial &&
               seen->source == SCREEN_SOURCE_DRIVER,
           "Settings sees the monitor, its modes and the one the driver shows: %s", n_result_text(r));
     /* a mode the monitor does not offer is held and shows nothing */
@@ -679,12 +690,7 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     mode_show(vga, surface, d, dispi, offer, &st, false);
     desktop_width(1024);
     CHECK(n_pci_screen_state(vga, 0, st.serial, &st, n_clock_after(100 * N_NS_PER_MS)) == -N_ERR_TIMEOUT, "the mode stays");
-    struct n_setting_monitor_mode chosen[8];
-    n_result chosen_bytes = n_settings_effective(N_DOMAIN_DISPLAY, N_DISPLAY_MODE, chosen, sizeof chosen);
-    bool reported = false;
-    for (n_result i = 0; chosen_bytes > 0 && i < chosen_bytes / (n_result)sizeof *chosen && i < 8; i++)
-        reported = reported || (!strcmp(chosen[i].monitor, "pcitest-vga") && chosen[i].width == 1024 && chosen[i].height == 768);
-    CHECK(reported, "the system reports the choice");
+    CHECK(mode_kept(&small), "the system reports the choice");
     offer->count = 0;
     CHECK(n_pci_screen_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && st.mode.width == 0,
           "the modes withdrawn: no mode is wanted");
@@ -693,19 +699,18 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     CHECK(n_pci_screen_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &small),
           "offered again, the monitor shows the mode kept: %ux%u", st.mode.width, st.mode.height);
     mode_show(vga, surface, d, dispi, offer, &st, false);
-    CHECK(modes_get(seen) == 0 && same_mode(&seen->chosen, &small), "Settings sees the mode kept for this monitor: %ux%u",
-          seen->chosen.width, seen->chosen.height);
+    CHECK(mode_kept(&small), "Settings sees the mode kept for this monitor");
     r = mode_apply(&native);
     CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native), "the preferred mode applied: %s",
           n_result_text(r));
     mode_show(vga, surface, d, dispi, offer, &st, false);
-    CHECK(modes_get(seen) == 0 && same_mode(&seen->chosen, &native), "the user's new choice for this monitor");
+    CHECK(mode_kept(&native), "the user's new choice for this monitor");
 
     /* a mode the driver could not show */
     r = mode_apply(&wide);
     CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000), "applied: %s", n_result_text(r));
     mode_show(vga, surface, d, dispi, offer, &st, true);
-    CHECK(mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native) && modes_get(seen) == 0 && seen->refused,
+    CHECK(mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native) && modes_get(seen) == 0 && seen->refused_serial,
           "a mode the driver could not show: the next best comes, and Settings hears it");
     mode_show(vga, surface, d, dispi, offer, &st, false);
     offer->done = 0;

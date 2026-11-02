@@ -200,7 +200,7 @@ n_result n_pci_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max,
    flips as they are asked. N_ERR_DENIED: the output shows no buffers of this claim. */
 n_result n_pci_screen_vblank(n_handle pci, const struct n_screen_vblank *vblank);
 /* A display function's driver tells the system the monitor it drives on an output and the modes
-   it can show there (struct n_screen_modes): the system chooses the one shown (a mode on trial in
+   it can show there (struct n_screen_modes): the display service chooses the one shown (a mode on trial in
    Settings, else the user's choice for that monitor, else the monitor's preferred mode, else the
    largest at the highest refresh) and says so in struct n_screen_state's mode, which
    n_pci_screen_state reads. The driver shows that mode (n_pci_give_screen at its size) and gives
@@ -417,8 +417,15 @@ void yield(void);
 /* These return only on failure, with a negative n_result. */
 n_result poweroff(n_handle cap); /* N_CAP_POWER */
 n_result reboot(n_handle cap);   /* N_CAP_POWER */
-/* N_CAP_POWER: POWER_* with N_POWER_CHOSEN or 0 (abi.h). */
-n_result n_power_request(n_handle cap, uint32_t action, uint32_t flags);
+/* N_CAP_POWER（§16）：POWER_* を実行する。n_power_events は事象の今、n_power_events_watch はその watch。
+   n_power_windows はアプリの窓の数を返し、一番上の題を top_title へ写す。ask_to_close なら全部に閉じるよう頼む。
+   n_power_windows_watch はその数と題の watch。n_power_say は窓を閉じる段取りを知らせる。 */
+n_result n_power_request(n_handle cap, uint32_t action);
+n_result n_power_events(n_handle cap, struct n_power_events *out);
+n_handle n_power_events_watch(n_handle cap);
+n_result n_power_windows(n_handle cap, bool ask_to_close, char *top_title, size_t size);
+n_result n_power_say(n_handle cap, const struct n_power_state *state);
+n_handle n_power_windows_watch(n_handle cap);
 /* The count of PCI functions (at most max written), or a negative n_result. */
 n_result pcilist(struct n_pciinfo *out, int max);
 long __syscall(long n, long a, long b, long c, long d, long e);

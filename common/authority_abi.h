@@ -23,6 +23,7 @@ enum n_cap {
     N_CAP_SHELL,           /* 窓の層と画面の端の予約、窓の一覧を持つ（シェル）。 */
     N_CAP_NETWORK,         /* adapter の住所と経路を適用し、adapter に縛った UDP を開く。 */
     N_CAP_CLOCK,           /* 壁時計と RTC を動かす。 */
+    N_CAP_DISPLAY,         /* 画面のモード、配置、主画面、倍率を適用する（サービス display）。 */
     N_CAP_COUNT
 };
 

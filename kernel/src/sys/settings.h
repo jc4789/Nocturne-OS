@@ -34,8 +34,6 @@ int64_t settings_watch(uint32_t domain);
 /* The owners. */
 int audio_setting_put(uint32_t key, const void *value);
 int64_t audio_setting_get(uint32_t key, void *out, size_t cap);
-int screen_modes_setting_put(uint32_t key, const void *value);
-int64_t screen_modes_setting_get(uint32_t key, void *out, size_t cap);
 int screen_hold_setting_put(uint32_t key, const void *value);
 int64_t screen_hold_setting_get(uint32_t key, void *out, size_t cap);
 int smooth_gradients_setting_put(uint32_t key, const void *value);

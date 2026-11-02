@@ -508,12 +508,16 @@ static void menu_open(void) {
     const struct app **items = realloc(menu_items, (size_t)(menu_app_count + POWER_ITEMS) * sizeof *items);
     if (!items) return;
     menu_items = items;
+    /* 機械ができて、設定が許すものだけを出す。読めなければ機械の事実に従う。 */
+    int32_t allow_sleep = 1, allow_hibernate = 1;
+    n_setting_get_int(n_setting_at(N_DOMAIN_POWER, N_POWER_ALLOW_SLEEP), &allow_sleep);
+    n_setting_get_int(n_setting_at(N_DOMAIN_POWER, N_POWER_ALLOW_HIBERNATE), &allow_hibernate);
     menu_length = 0;
     for (int i = 0; i < menu_app_count; i++) menu_items[menu_length++] = &menu_apps[i];
     menu_first_power = menu_length;
     for (int i = 0; i < POWER_ITEMS; i++) {
-        if (power_items[i].action == SLEEP && !power.can_sleep) continue;
-        if (power_items[i].action == HIBERNATE && !power.can_hibernate) continue;
+        if (power_items[i].action == SLEEP && (!power.can_sleep || !allow_sleep)) continue;
+        if (power_items[i].action == HIBERNATE && (!power.can_hibernate || !allow_hibernate)) continue;
         menu_items[menu_length++] = &power_items[i];
     }
     /* 画面が短ければ二列目へ続ける */

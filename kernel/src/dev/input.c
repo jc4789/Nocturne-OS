@@ -5,6 +5,7 @@
 #include "arch/cpu.h"
 #include "dev/input.h"
 #include "dev/pm.h"
+#include "sys/clock.h"
 
 static key_sink_t key_sink;     /* atomic */
 static mouse_sink_t mouse_sink; /* atomic */
@@ -29,7 +30,12 @@ static const char map_shift[128] = {
     '2', '3', '0', '.', 0, 0, '|', 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
+static uint64_t last_input; /* atomic */
+
+uint64_t input_last_ns(void) { return __atomic_load_n(&last_input, __ATOMIC_RELAXED); }
+
 static void emit_key(uint16_t key, bool pressed, uint64_t at) {
+    __atomic_store_n(&last_input, clock_now_ns(), __ATOMIC_RELAXED);
     struct key_event e = {key, __atomic_load_n(&mods, __ATOMIC_ACQUIRE), pressed, at};
     key_sink_t sink = __atomic_load_n(&key_sink, __ATOMIC_ACQUIRE);
     if (sink) sink(&e);
@@ -121,6 +127,7 @@ void input_unicode(uint16_t c, bool pressed, uint64_t at) {
 }
 
 void input_mouse(const struct mouse_event *e) {
+    __atomic_store_n(&last_input, clock_now_ns(), __ATOMIC_RELAXED);
     mouse_sink_t sink = __atomic_load_n(&mouse_sink, __ATOMIC_ACQUIRE);
     if (sink) sink(e);
 }

@@ -1,8 +1,11 @@
-/* Power lifecycle: every power change goes through one kernel thread, in one order.
+/* Power lifecycle: every power change goes through one kernel thread, in one order. The kernel
+   tells what happens (the power button, the lid, a wake, the host's request: struct n_power_events)
+   and carries out what it is asked (SYS_POWER). What a press means, whether the machine may sleep,
+   when it sleeps, and asking the windows to close and for how long is the machine service's
+   (user/apps/machine.c).
 
    Shut down, restart:
-     1. the apps: every window gets EV_CLOSE and time to save, then every app
-        that is still running is stopped;
+     1. the apps: every app still running is stopped;
      2. the disks: every block device writes its cache back;
      3. the devices: each registered device stops its DMA and interrupts,
         stage by stage (PM_STAGE_IO first, PM_STAGE_BUS last);
@@ -44,15 +47,6 @@
 #include <stdint.h>
 #include "abi.h"
 
-/* What holds the windows (gui/). Set at its start; a change of power before that has no window to
-   wait for. */
-struct pm_desktop {
-    int (*window_count)(char *top_title, size_t n);
-    void (*close_windows)(void);
-    void (*repaint)(void); /* the screens lost what was on them */
-};
-void pm_set_desktop(const struct pm_desktop *desktop);
-
 enum pm_stage {
     PM_STAGE_IO,      /* network cards, audio, input, display */
     PM_STAGE_STORAGE, /* disk controllers: shutdown notification after the flush */
@@ -76,14 +70,14 @@ enum pm_action { PM_POWER_OFF = POWER_OFF, PM_REBOOT = POWER_REBOOT, PM_SLEEP = 
 
 void pm_init(void);
 void pm_register(struct pm_device *d); /* any CPU; d stays owned by the driver for good */
-/* Ask for a power change. From a menu (interactive), apps that keep a window
-   open cancel a shut down or restart; asking again within a minute closes them
-   anyway. Otherwise (an app, the host) apps get a few seconds and are then
-   stopped. Sleep closes nothing. Never blocks: any CPU, any context, also an
-   interrupt handler or under a spinlock other than the wait queues'. */
-void pm_request(enum pm_action action, bool interactive);
-bool pm_stopping(void); /* a power change has passed the point of no return */
-/* Whether sleep can be offered: the firmware has S3, there is a wake page, every registered
+/* Carry out a power change. A sleep never replaces a change already waiting. Never blocks: any CPU,
+   any context under no spinlock other than the wait queues'. */
+void pm_request(enum pm_action action);
+/* What happened: told to the machine service through struct n_power_events. Any CPU, any context. */
+void pm_button_pressed(void);
+void pm_lid_is(bool closed);
+void pm_host_asks(enum pm_action action);
+/* Whether the machine can sleep: the firmware has S3, there is a wake page, every registered
    device can resume. pm_sleep_check logs it once all the drivers have registered. */
 bool pm_can_sleep(void);
 bool pm_can_hibernate(void); /* C: on a disk, room below 1 MiB, every device back after it */
@@ -91,6 +85,10 @@ void pm_sleep_check(void);
 /* SYS_POWER_STATE and SYS_POWER_WATCH (N_CAP_SHELL checked by the caller). */
 int64_t pm_state_syscall(void *out, size_t size);
 int64_t pm_watch_syscall(void);
+/* SYS_POWER_EVENTS, SYS_POWER_EVENTS_WATCH and SYS_POWER_SAY (N_CAP_POWER checked by the caller). */
+int64_t pm_events_syscall(void *out, size_t size);
+int64_t pm_events_watch_syscall(void);
+int64_t pm_say_syscall(const void *state, size_t size);
 /* Interrupts off: every registered device stops, stage by stage. NULL, or the first device that
    did not stop (with stop_at_failure, the ones after it are left running). */
 const char *pm_quiesce_devices(bool stop_at_failure);

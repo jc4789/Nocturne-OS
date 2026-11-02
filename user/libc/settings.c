@@ -190,6 +190,64 @@ n_result n_setting_list(struct n_setting_decl **out) {
     return r;
 }
 
+n_handle n_setting_owner_open(const struct n_setting_decl *declarations, size_t count, uint32_t *reason) {
+    n_handle h = n_service_connect(N_SETTINGS_SERVICE);
+    if (h < 0) return h;
+    size_t size = sizeof(struct n_settings_request) + sizeof *declarations;
+    uint8_t *message = malloc(size);
+    if (!message) {
+        n_handle_close(h);
+        return -N_ERR_NO_MEMORY;
+    }
+    n_result r = 0;
+    for (size_t i = 0; i < count && r >= 0; i++) {
+        struct n_settings_request m = {.op = N_SETTINGS_DECLARE, .serial = (uint32_t)i + 1, .length = sizeof *declarations};
+        memcpy(message, &m, sizeof m);
+        memcpy(message + sizeof m, &declarations[i], sizeof *declarations);
+        struct n_settings_reply a;
+        r = n_channel_send(h, message, size, -1);
+        if (r >= 0) r = n_channel_receive(h, &a, sizeof a, N_CHANNEL_WAIT, NULL);
+        if (r >= 0) r = a.result;
+        if (reason) *reason = r >= 0 ? N_SETTING_OK : a.reason;
+    }
+    free(message);
+    if (r < 0) {
+        n_handle_close(h);
+        return r;
+    }
+    return h;
+}
+
+n_result n_setting_owner_take(n_handle owner, struct n_setting_id *id, void *value, size_t cap, uint32_t *length, uint32_t *serial) {
+    size_t room = sizeof(struct n_settings_request) + cap;
+    uint8_t *message = malloc(room);
+    if (!message) return -N_ERR_NO_MEMORY;
+    n_result n = n_channel_receive(owner, message, room, 0, NULL);
+    if (n >= 0) {
+        struct n_settings_request m;
+        if ((size_t)n < sizeof m) n = -N_ERR_PROTOCOL;
+        else {
+            memcpy(&m, message, sizeof m);
+            if (m.op != N_SETTINGS_APPLY || (size_t)n != sizeof m + m.length) n = -N_ERR_PROTOCOL;
+            else {
+                memcpy(value, message + sizeof m, m.length);
+                *id = m.id;
+                *length = m.length;
+                *serial = m.serial;
+                n = 0;
+            }
+        }
+    }
+    free(message);
+    return n;
+}
+
+n_result n_setting_owner_answer(n_handle owner, uint32_t serial, n_result result) {
+    struct n_settings_reply a = {.op = N_SETTINGS_APPLY, .serial = serial, .result = (int32_t)(result < 0 ? result : 0)};
+    n_result r = n_channel_send(owner, &a, sizeof a, -1);
+    return r < 0 ? r : 0;
+}
+
 n_result n_setting_declare(const struct n_setting_decl *declarations, size_t count, uint32_t *reason) {
     n_result r = 0;
     for (size_t i = 0; i < count && r >= 0; i++) {

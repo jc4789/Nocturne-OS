@@ -39,7 +39,7 @@ static const struct {
 };
 
 enum act {
-    A_PAGE = 1, A_BOOL, A_NUMBER, A_ENUM, A_TEXT, A_SCREEN, A_SIZE, A_RATE, A_KEEP, A_BACK,
+    A_PAGE = 1, A_BOOL, A_NUMBER, A_ENUM, A_TEXT, A_SCREEN, A_SIZE, A_RATE, A_FORMAT, A_KEEP, A_BACK, A_SCALE, A_PLACE, A_MAIN,
     A_SERVICE_RESTART, A_SERVICE_STOP, A_USER_CLASS, A_NEW_NAME, A_NEW_PASSWORD, A_NEW_ADMIN, A_NEW_CREATE,
     A_PROGRAM_CHOOSE, A_PROGRAM_REMOVE, A_PROGRAM_NAME, A_PROGRAM_PATH, A_PROGRAM_TYPES, A_PROGRAM_ADD,
     A_LINK_IP, A_LINK_MASK, A_LINK_GATEWAY, A_LINK_FIXED, A_LINK_DHCP
@@ -158,15 +158,20 @@ static void shown_changed(const struct n_settings_changed *c) {
 static uint32_t screen_index;
 static struct screen_modes screen;
 static bool screen_known;
+static uint64_t screen_device_id;
+static struct n_setting_id trial_id;  /* 試しの中の鍵 */
 static uint64_t trial_ends_ns; /* 0：試しの中でない */
+static char scale_draft[16];
 static struct n_audio_output sound;
 
 static void screen_read(void) {
-    screen_known = __syscall(SYS_SCREEN_INFO, (long)&screen, sizeof screen, SCREEN_MODES_GET | (long)screen_index << 8, 0, 0) >= 0;
+    screen_known = n_screen_modes_get(screen_index, &screen) >= 0;
     if (!screen_known && screen_index) {
         screen_index = 0;
-        screen_known = __syscall(SYS_SCREEN_INFO, (long)&screen, sizeof screen, SCREEN_MODES_GET, 0, 0) >= 0;
+        screen_known = n_screen_modes_get(0, &screen) >= 0;
     }
+    if (screen_known && n_screen_device(screen_index, &screen_device_id) < 0) screen_known = false;
+    if (screen_known) snprintf(scale_draft, sizeof scale_draft, "%u", screen.scale_percent);
 }
 static bool same_size(const struct n_screen_mode *a, const struct n_screen_mode *b) {
     return a->width == b->width && a->height == b->height;
@@ -174,21 +179,25 @@ static bool same_size(const struct n_screen_mode *a, const struct n_screen_mode 
 static const struct n_screen_mode *mode_marked(void) {
     return screen.source == SCREEN_SOURCE_DRIVER && screen.wanted.width ? &screen.wanted : &screen.offered.shown;
 }
-static struct n_setting_id screen_id(void) {
-    struct n_setting_id id = n_setting_at(N_DOMAIN_DISPLAY, N_DISPLAY_MODE);
-    id.device = n_setting_device(screen.offered.monitor);
+static struct n_setting_id screen_id(uint32_t key, uint64_t device) {
+    struct n_setting_id id = n_setting_at(N_DOMAIN_DISPLAY, key);
+    id.device = device;
     return id;
 }
-static void mode_try(const struct n_screen_mode *m) {
-    struct n_setting_monitor_mode wanted = {.width = m->width, .height = m->height, .refresh_mhz = m->refresh_mhz};
-    struct n_setting_monitor_mode before = {.width = screen.offered.shown.width, .height = screen.offered.shown.height,
-                                            .refresh_mhz = screen.offered.shown.refresh_mhz};
-    strlcpy(wanted.monitor, screen.offered.monitor, sizeof wanted.monitor);
-    strlcpy(before.monitor, screen.offered.monitor, sizeof before.monitor);
+static void trial_start(struct n_setting_id id, const void *value, size_t length, const void *before, size_t before_length) {
     uint32_t reason = N_SETTING_OK;
-    n_result r = n_setting_try(screen_id(), &wanted, sizeof wanted, &before, sizeof before, TRIAL_MS, &reason);
+    n_result r = n_setting_try(id, value, length, before, before_length, TRIAL_MS, &reason);
     said(r, reason);
-    if (r >= 0) trial_ends_ns = n_clock_monotonic() + TRIAL_MS * (uint64_t)N_NS_PER_MS;
+    if (r >= 0) {
+        trial_id = id;
+        trial_ends_ns = n_clock_monotonic() + TRIAL_MS * (uint64_t)N_NS_PER_MS;
+    }
+}
+static void mode_try(const struct n_screen_mode *m) {
+    struct n_setting_monitor_mode wanted = {m->width, m->height, m->refresh_mhz, m->format};
+    const struct n_screen_mode *o = &screen.offered.shown;
+    struct n_setting_monitor_mode before = {o->width, o->height, o->refresh_mhz, o->format};
+    trial_start(screen_id(N_DISPLAY_MODE, screen_device_id), &wanted, sizeof wanted, &before, sizeof before);
 }
 /* 解像度を選んだ：その大きさのモニターの好みか、今の拍に一番近いもの。 */
 static void size_try(const struct n_screen_mode *size) {
@@ -207,6 +216,58 @@ static void size_try(const struct n_screen_mode *size) {
         if (!best || dm < db || (dm == db && m->refresh_mhz > best->refresh_mhz)) best = m;
     }
     if (best) mode_try(best);
+}
+static void scale_try(void) {
+    char *end;
+    long v = strtol(scale_draft, &end, 10);
+    if (end == scale_draft || *end || v < 0 || v > INT32_MAX) {
+        say("数を入れてください。", true);
+        return;
+    }
+    int32_t scale = (int32_t)v, before = (int32_t)screen.scale_percent;
+    trial_start(screen_id(N_DISPLAY_SCALE, screen_device_id), &scale, sizeof scale, &before, sizeof before);
+}
+
+/* 配置：全部の画面の今の位置を書き、選んだ画面だけを主画面の縁へ動かす。自動の順と食い違わないように。 */
+enum { PLACE_LEFT, PLACE_RIGHT, PLACE_ABOVE, PLACE_BELOW };
+static void place_set(uint64_t device, const struct n_setting_monitor_place *place) {
+    uint32_t reason = N_SETTING_OK;
+    n_result r = n_setting_set(screen_id(N_DISPLAY_PLACE, device), place, sizeof *place, &reason);
+    if (r < 0) said(r, reason);
+}
+static void screen_place(uint32_t where) {
+    struct screen_modes *other = malloc(sizeof *other);
+    if (!other || !screen_known) {
+        free(other);
+        return;
+    }
+    say("", false);
+    int32_t main_x = 0, main_y = 0, main_width = 0, main_height = 0;
+    for (uint32_t i = 0; i < screen.screens; i++)
+        if (n_screen_modes_get(i, other) >= 0 && other->primary) {
+            main_x = other->x, main_y = other->y;
+            main_width = (int32_t)other->width, main_height = (int32_t)other->height;
+        }
+    for (uint32_t i = 0; i < screen.screens; i++) {
+        uint64_t device;
+        if (i == screen_index || n_screen_modes_get(i, other) < 0 || !other->on || n_screen_device(i, &device) < 0) continue;
+        struct n_setting_monitor_place place = {other->x, other->y, 1};
+        place_set(device, &place);
+    }
+    free(other);
+    struct n_setting_monitor_place place = {main_x, main_y, 1};
+    switch (where) {
+    case PLACE_LEFT: place.x = main_x - (int32_t)screen.width; break;
+    case PLACE_RIGHT: place.x = main_x + main_width; break;
+    case PLACE_ABOVE: place.y = main_y - (int32_t)screen.height; break;
+    default: place.y = main_y + main_height; break;
+    }
+    place_set(screen_device_id, &place);
+}
+static void screen_make_main(void) {
+    uint32_t reason = N_SETTING_OK;
+    n_result r = n_setting_set(n_setting_at(N_DOMAIN_DISPLAY, N_DISPLAY_PRIMARY), &screen_device_id, sizeof screen_device_id, &reason);
+    said(r, reason);
 }
 
 /* ---- サービス ---- */
@@ -517,25 +578,54 @@ static const char *screen_reason(void) {
     }
 }
 
+static const char *format_name(uint32_t format) {
+    switch (format) {
+    case N_SCANOUT_XRGB2101010: return "10 ビット";
+    case N_SCANOUT_XRGB8888: case N_SCANOUT_XBGR8888: return "8 ビット";
+    default: return "";
+    }
+}
+
+/* 画面が二つ以上のとき：どの画面を見るか、配置、主画面。 */
+static void screens_card(struct ui_msg *m) {
+    uint32_t n = screen.screens;
+    const char **names = malloc(n * sizeof *names);
+    char (*labels)[24] = malloc(n * sizeof *labels);
+    if (!names || !labels) {
+        free(names), free(labels);
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        snprintf(labels[i], sizeof labels[i], "画面 %u", i + 1);
+        names[i] = labels[i];
+    }
+    ui_node(m, "card"); ui_num(m, "gap", 14); ui_str(m, "key", "screens");
+        text_node(m, "画面の選択", "heading", 0);
+        act_at(ui_node(m, "segmented"), A_SCREEN, 0);
+        ui_strs(m, "options", names, n);
+        ui_num(m, "selected", screen_index);
+        ui_end(m);
+        char line[96];
+        snprintf(line, sizeof line, "デスクトップの中の (%d, %d) にあります。%s", screen.x, screen.y, screen.primary ? "主画面です。" : "");
+        text_node(m, line, "caption", 0);
+        if (!screen.primary) {
+            text_node(m, "主画面に対する位置", NULL, 0);
+            static const char *const where[] = {"左", "右", "上", "下"};
+            ui_node(m, "row"); ui_num(m, "gap", 10);
+            for (uint32_t i = 0; i < sizeof where / sizeof *where; i++) {
+                act_at(ui_node(m, "button"), A_PLACE, i); ui_str(m, "text", where[i]); ui_end(m);
+            }
+            act_at(ui_node(m, "button"), A_MAIN, 0); ui_str(m, "text", "主画面にする"); ui_str(m, "variant", "primary"); ui_end(m);
+            ui_end(m);
+        }
+    ui_end(m);
+    free(names), free(labels);
+}
+
 static void screen_card(struct ui_msg *m) {
     char line[96];
     const struct ui_theme *t = &ui_theme;
-    if (screen_known && screen.screens > 1) {
-        ui_node(m, "card"); ui_num(m, "gap", 14);
-            text_node(m, "画面の選択", "heading", 0);
-            const char *names[16];
-            char labels[16][24];
-            uint32_t n = screen.screens < 16 ? screen.screens : 16;
-            for (uint32_t i = 0; i < n; i++) {
-                snprintf(labels[i], sizeof labels[i], "画面 %u", i + 1);
-                names[i] = labels[i];
-            }
-            act_at(ui_node(m, "segmented"), A_SCREEN, 0);
-            ui_strs(m, "options", names, n);
-            ui_num(m, "selected", screen_index);
-            ui_end(m);
-        ui_end(m);
-    }
+    if (screen_known && screen.screens > 1) screens_card(m);
     ui_node(m, "card"); ui_num(m, "gap", 14); ui_str(m, "key", "screen");
     if (!screen_known) {
         text_node(m, "画面の情報が読めません。", "caption", 0);
@@ -547,11 +637,12 @@ static void screen_card(struct ui_msg *m) {
     text_node(m, line, NULL, 0);
     bool listed = screen.source != SCREEN_SOURCE_REMOTE && screen.offered.count > 0;
     if (!listed || screen.source == SCREEN_SOURCE_HANDED_BACK) text_node(m, screen_reason(), "caption", 0);
+    if (screen.refused_serial && screen.refused_serial == screen.wish_serial - 1) text_node(m, "ドライバーが選んだモードを出せなかったので、次のものにしました。", "caption", t->warning);
     if (trial_ends_ns) {
         uint64_t now = n_clock_monotonic();
         uint32_t left = now < trial_ends_ns ? (uint32_t)((trial_ends_ns - now) / (1000 * N_NS_PER_MS)) + 1 : 0;
         char words[96];
-        snprintf(words, sizeof words, "このモードのままにしますか。あと %u 秒で前のモードへ戻ります。", left);
+        snprintf(words, sizeof words, "このままにしますか。あと %u 秒で前へ戻ります。", left);
         ui_node(m, "card"); ui_num(m, "gap", 10); ui_num(m, "background", t->sidebar); ui_str(m, "key", "trial");
             text_node(m, words, "heading", 0);
             ui_node(m, "row"); ui_num(m, "gap", 10);
@@ -584,15 +675,46 @@ static void screen_card(struct ui_msg *m) {
                 for (uint32_t i = 0; i < screen.offered.count; i++) {
                     const struct n_screen_mode *mode = &screen.offered.modes[i];
                     if (!same_size(mode, marked)) continue;
-                    snprintf(line, sizeof line, "%u.%02u Hz", mode->refresh_mhz / 1000, mode->refresh_mhz % 1000 / 10);
+                    bool first = true;
+                    for (uint32_t j = 0; j < i && first; j++)
+                        first = !same_size(&screen.offered.modes[j], mode) || screen.offered.modes[j].refresh_mhz != mode->refresh_mhz;
+                    if (!first) continue;
+                    snprintf(line, sizeof line, "%u.%02u Hz%s", mode->refresh_mhz / 1000, mode->refresh_mhz % 1000 / 10,
+                             mode->flags & N_SCREEN_MODE_VRR ? "（可変）" : "");
                     act_at(ui_node(m, "item"), A_RATE, i);
                     ui_str(m, "text", line); ui_num(m, "selected", mode->refresh_mhz == marked->refresh_mhz); ui_str(m, "key", line);
                     ui_end(m);
                 }
                 ui_end(m);
             ui_end(m);
+            /* 色の形式：同じ大きさと拍にいくつもあるときだけ */
+            bool formats = false;
+            for (uint32_t i = 0; i < screen.offered.count; i++) {
+                const struct n_screen_mode *mode = &screen.offered.modes[i];
+                formats = formats || (same_size(mode, marked) && mode->refresh_mhz == marked->refresh_mhz && mode->format != marked->format);
+            }
+            if (formats) {
+                ui_node(m, "column"); ui_num(m, "grow", 1); ui_num(m, "gap", 6);
+                    text_node(m, "色の深さ", "caption", 0);
+                    for (uint32_t i = 0; i < screen.offered.count; i++) {
+                        const struct n_screen_mode *mode = &screen.offered.modes[i];
+                        if (!same_size(mode, marked) || mode->refresh_mhz != marked->refresh_mhz) continue;
+                        act_at(ui_node(m, "item"), A_FORMAT, i);
+                        ui_str(m, "text", format_name(mode->format)); ui_num(m, "selected", mode->format == marked->format);
+                        ui_str(m, "key", format_name(mode->format));
+                        ui_end(m);
+                    }
+                ui_end(m);
+            }
         ui_end(m);
     }
+    ui_end(m);
+    ui_node(m, "card"); ui_num(m, "gap", 14); ui_str(m, "key", "scale");
+        text_node(m, "倍率（百分率）", "heading", 0);
+        text_node(m, "プログラムへ知らせる値です。描く大きさはまだ変わりません。100 が等倍です。", "caption", 0);
+        act_at(ui_node(m, "field"), A_SCALE, 0);
+        ui_str(m, "value", scale_draft); ui_str(m, "width", "fill");
+        ui_end(m);
     ui_end(m);
 }
 
@@ -1006,17 +1128,24 @@ static bool on_event(const struct ui_event *e) {
         }
         break;
     case A_SIZE: if (a->arg < screen.offered.count && e->type == UI_EVENT_CLICK) size_try(&screen.offered.modes[a->arg]); break;
-    case A_RATE: if (a->arg < screen.offered.count && e->type == UI_EVENT_CLICK) mode_try(&screen.offered.modes[a->arg]); break;
+    case A_RATE:
+    case A_FORMAT: if (a->arg < screen.offered.count && e->type == UI_EVENT_CLICK) mode_try(&screen.offered.modes[a->arg]); break;
+    case A_SCALE:
+        if (e->type == UI_EVENT_TEXT) strlcpy(scale_draft, e->text ? e->text : "", sizeof scale_draft);
+        else if (e->type == UI_EVENT_SUBMIT) scale_try();
+        break;
+    case A_PLACE: if (e->type == UI_EVENT_CLICK) screen_place(a->arg); break;
+    case A_MAIN: if (e->type == UI_EVENT_CLICK) screen_make_main(); break;
     case A_KEEP: {
         uint32_t reason = N_SETTING_OK;
-        n_result r = n_setting_commit(screen_id(), &reason);
+        n_result r = n_setting_commit(trial_id, &reason);
         said(r, reason);
         trial_ends_ns = 0;
         break;
     }
     case A_BACK: {
         uint32_t reason = N_SETTING_OK;
-        n_result r = n_setting_revert(screen_id(), &reason);
+        n_result r = n_setting_revert(trial_id, &reason);
         said(r, reason);
         trial_ends_ns = 0;
         break;
@@ -1088,11 +1217,15 @@ int main(void) {
                 struct n_settings_changed c;
                 while (n_setting_watch_take(settings_watch, &c) >= 0) {
                     shown_changed(&c);
-                    if (c.id.domain == N_DOMAIN_DISPLAY && c.id.key == N_DISPLAY_MODE) {
-                        if (c.what == N_SETTING_ON_TRIAL) trial_ends_ns = n_clock_after((uint64_t)c.remaining_ms * N_NS_PER_MS);
-                        else {
-                            if (c.what == N_SETTING_REVERTED && trial_ends_ns) say("前のモードへ戻りました。", false);
-                            trial_ends_ns = 0;
+                    if (c.id.domain == N_DOMAIN_DISPLAY) {
+                        if (c.id.key == N_DISPLAY_MODE || c.id.key == N_DISPLAY_SCALE) {
+                            if (c.what == N_SETTING_ON_TRIAL) {
+                                trial_id = c.id;
+                                trial_ends_ns = n_clock_after((uint64_t)c.remaining_ms * N_NS_PER_MS);
+                            } else {
+                                if (c.what == N_SETTING_REVERTED && trial_ends_ns) say("前へ戻りました。", false);
+                                trial_ends_ns = 0;
+                            }
                         }
                         screen_read();
                     }
