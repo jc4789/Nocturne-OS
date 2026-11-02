@@ -8,7 +8,6 @@ const navigatorBridge=(()=>{
     const invoke=Reflect.apply,has=WeakSet.prototype.has,add=WeakSet.prototype.add;
     const define=Object.defineProperty,getOwnDescriptor=Object.getOwnPropertyDescriptor,freeze=Object.freeze;
     const cookieEnabled=host.cookieEnabled,nativeLanguages=host.languages;
-    const automation=host.automation===true;
     const split=String.prototype.split,join=Array.prototype.join;
     function userLanguages(){return freeze(invoke(split,invoke(nativeLanguages,host,[]),[',']));}
     // HTML appVersion in the Gecko navigator compatibility mode: empty unless the
@@ -59,10 +58,9 @@ const navigatorBridge=(()=>{
             languages=next;return true;
         }
         if(!worker)attribute('cookieEnabled',()=>typeof cookieEnabled==='function'&&!!invoke(cookieEnabled,host,[]));
-        // WebDriver NavigatorAutomationInformation: Window-only. True only while
-        // the browser's input is driven for automation (the WPT runner starts it
-        // with --wpt-automation; see native_automation in js.c), never otherwise.
-        if(!worker)attribute('webdriver',()=>automation);
+        // WebDriver NavigatorAutomationInformation: Window-only. Nothing drives
+        // this browser's input for automation.
+        if(!worker)attribute('webdriver',()=>false);
         // Pointer Events: Window-only. The input layer turns a touch screen or
         // pen into the one system pointer (kernel usbhid.c), so pages never see
         // simultaneous touch contacts.

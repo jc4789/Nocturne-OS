@@ -122,26 +122,3 @@ int64_t settings_watch(uint32_t domain) {
     return watched_open(&watches[domain]);
 }
 
-#ifdef NOCTURNE_TEST_FLAGS
-void settings_test_flags(void) {
-    static const struct {
-        const char *word;
-        uint32_t domain, key;
-    } numbers[] = {{"tcp-rx-bytes", N_DOMAIN_NETWORK, N_NETWORK_TCP_RX_BYTES},
-                   {"tcp-tx-bytes", N_DOMAIN_NETWORK, N_NETWORK_TCP_TX_BYTES},
-                   {"fbhold", N_DOMAIN_DISPLAY, N_DISPLAY_HOLD_SECONDS}};
-    for (size_t i = 0; i < ARRAY_SIZE(numbers); i++) {
-        uint64_t v;
-        if (test_number(numbers[i].word, &v) && v <= INT32_MAX) {
-            int32_t value = (int32_t)v;
-            apply(setting_find(numbers[i].domain, numbers[i].key), &value);
-        }
-    }
-    if (test_flag("fbsim10")) {
-        int32_t on = 1;
-        apply(setting_find(N_DOMAIN_WINDOW, N_WINDOW_SMOOTH_GRADIENTS), &on);
-    }
-}
-#else
-void settings_test_flags(void) {}
-#endif

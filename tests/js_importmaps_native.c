@@ -1,5 +1,5 @@
 /* Supplemental native web_live module/import-map checks. No HTTP policy mock
-   can prove network CORS: webnettest remains the network-policy boundary. */
+   can prove network CORS. */
 #define main nocturne_jstest_main
 #include "jstest.c"
 #undef main

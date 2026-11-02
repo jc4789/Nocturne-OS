@@ -1,6 +1,6 @@
 /* jstest: the real web_live/QuickJS path, compiled by TinyCC inside Nocturne.
    The embedder serves deterministic offline resources through the public host
-   contract. HTTP workers and CORS are covered separately by webnettest. */
+   contract. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -325,8 +325,7 @@ static void deliver(struct fixture *f) {
             free(r.body); r.body = strdup(metadata); r.body_len = strlen(metadata); r.status = 200;
         }
         if(q.cache_mode==WEBNET_CACHE_ONLY_IF_CACHED){
-            /* Bridge contract only: the real persistent HTTP cache is exercised
-               by webnettest against the counted HTTP server. */
+            /* Bridge contract only, not the real persistent HTTP cache. */
             if(!strcmp(q.url,"http://fixture.test/dir/api/cache-hit")){
                 free(r.body);r.body=strdup("{\"cached\":true}");r.body_len=r.body?strlen(r.body):0;r.status=200;
             }else{r.status=0;snprintf(r.error,sizeof r.error,"No usable cached response is available");}

@@ -56,7 +56,7 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
     空いた CPU は近い階層（SMT の兄弟・キャッシュ・node・全体）から引き、忙しい CPU は slice の終わりに渡します。
   - 割り込み：x2APIC だけ。vector の表は CPU ごとにあり、装置の割り込みはその装置の NUMA node の CPU へ配ります。
   - IPI による TLB の撃ち落とし、PCID、XSAVE による AVX 状態の保存、
-    実機での CPPC による性能の要求、サンプリングによるプロファイラー（`prof`）。
+    実機での CPPC による性能の要求。
   - 時計：TSC だけ（実機では不変 TSC が要件）。速さは起動の瞬間から、実機では P0 の P-state の名目の値
     （PStateDef の FID と DID）、VM では hypervisor が伝える値。実機では HPET と倍になる窓で比べ続けて直し
     （spread spectrum などの外れ）、HPET が無ければ名目のままです。壁の時計は RTC の秒の境から合わせます。
@@ -85,7 +85,7 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
     ハートビート、Hyper-V マネージャーからの終了と再起動、時刻の同期、KVP（VM の IP アドレスと OS を表示）、
     Hyper-V ソケット、その上の拡張セッション用 RDP サーバーと音声送信。
   - エミュレーターの装置：ATA（PIO）、Intel e1000、DEC 21140／21143（tulip）、Intel AC'97、Bochs VBE
-    （スリープからの画面の復帰）、virtio-gpu（virgl。試験的で既定では使いません、`gpu-enable`）。
+    （スリープからの画面の復帰）、virtio-gpu（virgl。試験的で、VM に装置を足したときだけ動きます）。
   - QEMU・VirtualBox の電源断ポート。
 - **GUI**：ウィンドウマネージャーはカーネルのスレッドで動きます。単純で速い反面、その不具合はシステム全体を止めます。
   - 窓の画素はアプリと共有するメモリーで、変わった部分だけを描き直します。合成と画面への転送は AP にも分けます。
@@ -643,7 +643,7 @@ host/         ホストの道具（store：C: の作成・読み書き・検査�
 ports/        Nocturne への移植の設定と差分（tcc、go、rust、typescript、lexbor、freetype、ffmpeg、mesa、nvidia、wabt、virgl）
 third_party/  取り込んだソース（下のクレジット）
 scripts/      起動ディスク（mkimage.sh、layout.py）と SDK（mksdk.sh）の作成、qtest.py、hv-*.ps1
-tests/        OS の中の試験（runtests.c とそれがコンパイルするプログラム）、ホストの検査、試験用の素材
+tests/        OS の中で組む試験のプログラム、ホストの検査、試験用の素材
 docs/         README の画像、設計の文書、作業の記録
 build.ps1     ビルドの入口
 hyperv.ps1    Hyper-V の VM の作成

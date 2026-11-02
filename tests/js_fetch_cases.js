@@ -1,7 +1,7 @@
 /* One combined Fetch/Headers/Request/Response/Abort regression pass. Transport
    cases use web_live and its native host fixture, including raw byte echo.
-   HTTP worker/header/preflight checks live in webnettest; this fixture does
-   not itself perform HTTP. Site/GUI acceptance remains a separate step. */
+   This fixture does not itself perform HTTP. Site/GUI acceptance remains a
+   separate step. */
 async function runFetchCases() {
     let count=await runDataFetchCases();
     const assert=(v,label)=>{count++;if(!v)throw Error('fetch '+label);};

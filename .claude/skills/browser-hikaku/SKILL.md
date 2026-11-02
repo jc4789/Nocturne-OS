@@ -62,7 +62,7 @@ description: Nocturne のブラウザーを比べて確かめる手順。複数�
 
 ## 速さを比べる
 
-- 測るもの：毎コマ描くページは fps、読み込みは最初の本文が出るまでと参照の部品が全部出るまでの実時間、操作はスクロールや入力の応答、動画は落ちるコマ（`Native media timing` の `drop`）と `starved`。どれも CPU の使い方（カーネルの `prof: cpuN …`）も一緒に見る。
+- 測るもの：毎コマ描くページは fps、読み込みは最初の本文が出るまでと参照の部品が全部出るまでの実時間、操作はスクロールや入力の応答、動画は落ちるコマ（`Native media timing` の `drop`）と `starved`。
 - **旗の決まり。** 製品の速さは `--debug-js` なしで測る。`--debug-js` は原因を探す回に使い、その回の数字を製品の速さとして書かない（heap の census が heap 全体を歩く）。計測を足したら、その道具自身の費用（`Browser console profile` など）を分けて読む。
 - fps は `Browser loop profile` の `draw` と `Browser damage profile` の `partial draw` の回数を wall で割る（`--debug-js` の回だけ出る）。旗なしの回では、動画は `Native media timing` の `presented` の増え方、それ以外は同じ操作の実時間で比べる。
 - 前の回と今回は、同じ媒体の条件、同じ QEMU の条件、同じ秒数の範囲で測る。差が小さいときは回を重ね、ばらつきも書く。

@@ -45,7 +45,7 @@
  * preflight has no Access-Control-Allow-Headers: its subtests time out here, as Fetch's text
  * says they must. A document's destruction (js.c's
  * web_js_free) is not modeled: each file's realm is torn down after it, its timers and requests
- * cancelled. This is not the guest browser and not wptrunner. It fails when a subtest the Window
+ * cancelled. This is not the guest browser. It fails when a subtest the Window
  * passes in a file both realms run does not pass in the Worker (one definition), or when a check
  * after the WPT files fails.
  * Run: node tests/eventsource_wpt_contract.cjs [--wpt=DIR] [--verbose] [--only=FILE] */

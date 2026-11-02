@@ -19,8 +19,8 @@
  * Worker's null when the response would take longer than the timeout. Text decoding is node's TextDecoder
  * behind the native decoder's contract (decode's BOM sniffing, an unknown label as UTF-8, the
  * replacement decoder), labels from WPT's encoding/resources/encodings.js. No CORS, cookies,
- * redirects or CSP: those are webnet.c's and js.c's, not here. This is not the guest browser and
- * not wptrunner. It shows what the two realms pass, fails when a subtest the Window passes does not
+ * redirects or CSP: those are webnet.c's and js.c's, not here. This is not the guest browser.
+ * It shows what the two realms pass, fails when a subtest the Window passes does not
  * pass in the Worker (one owner; what differs the other way is listed), and, with --base=REV, fails when
  * either realm no longer passes a subtest REV's did (REV's sources through the same doubles).
  * Run: node tests/xhr_wpt_contract.cjs [--base=REV] [--wpt=DIR] [--verbose] [--only=FILE] */

@@ -76,14 +76,30 @@ serial.log の `segfault` は、この回は 0 件でした。
 
 `test.py` は、音の装置が AC'97 で、製品の HD Audio の道を通りませんでした。試験の結果を根拠にした `settingsd` の変更と、試験のサービスへの能力の追加は外しました。
 
+呼ぶ者が無くなった次の部品も、ユーザーの判断で消しました。
+
+- 試験のサービス：`tests/testrun.c`、`tests/testrun.h`、`user/apps/services.c` の `tests` の項目。
+- 試験のカーネル：`make kernel-test`、`NOCTURNE_TEST_FLAGS`、`test_flag`、`test_number`、`test_text`、`settings_test_flags`。カーネルは起動の引数を読みません。
+- WPT の道具：`tests/wptrunner.c`、`tests/wpt/`、`tests/check_testdriver_vendor.py`、`tests/automationtest.c`、`--wpt-automation`（`user/apps/browser_automation.h`、`web_host` の口、`webcookie_associated` などの cookie の口）。`navigator.webdriver` は標準の属性なので残し、常に `false` です。
+- ゲストの試験の表と host の相手を要する試験：`tests/runtests.c`、`tcptest.c`、`tcpcapacitytest.c`、`nettransporttest.c`、`transport8.c`、`webnettest.c`、`wptperformancetest.c`。`tests/navigatortest.c` は試験のサービスの能力に頼るので一緒に消しました。
+
+### 消した後に確かめたこと
+
+- `qemu-image` は通りました。空の `build/` からは組んでいません。
+- `tests/check_boundaries.py` は 0 件、`tests/check_settings.py` は宣言 31 件で失敗 0 件、`tests/check_webnet_cookie_store.py` は 39 件で失敗 0 件でした。
+- 窓付きの QEMU で、初回の利用者の作成とログイン、`ps`、サービスの頁を使って動きました。`ps` に `testrun` はありません。
+- 端末の `poweroff` で切り、同じ overlay で起動し直して、同じ利用者でログインできました。
+- `browser --wpt-automation` は `unknown or incomplete option` で止まります。
+- 百度百科「月球」は頁が出て、動画は 30 秒まで進み、復号 757 コマで落ちたのは 0 でした。F12 で `navigator.webdriver` は `false`、`typeof __nocturne_automation` は `undefined` でした。実ブラウザーとの照合はしていません。
+- 確かめていないこと：virtio-gpu の道。カーネルは装置があれば virgl を起こす形になりましたが、装置を足した起動はしていません。
+
 ## 残っているもの
 
-消した道具がなくなったので、次のものは呼ぶ者がありません。
-
-- `tests/testrun.c` と `user/apps/services.c` の `tests` の項目。
-- `make kernel-test`。
-- `tests/wptrunner.c`、`tests/wpt/`、`--wpt-automation`。
-- `tests/runtests.c` と、host の相手を要する試験（`tcptest.c`、`nettransporttest.c` など）。`tests/` のコメントに `scripts/test.py` の名が残っています。
+- `tests/` に残したゲストの試験を回す道がありません。`C:\Tests` の素材は媒体に無く、`pcitest.c`、`nvrmtest.c`、`guitest.c`、`wm*test.c`、`systemwatchtest.c` は試験のサービスがくれた能力を求めます。`jstest.c` の一部は host の相手を求めます。
+- `sys/prof.c` は `prof_init` を呼ぶ者が無く、動きません。製品のカーネルでは前も動いていませんでした。
+- `tests/check_navigator_native.py` は組めません（`wait_on_address`、`net_proxy_for` などの誤り）。誤りの名は今回の差分にありません。前の版では組んでいません。
+- Makefile の `media_cenc_test`、`nvk_contracttest`、`nvrm_servetest` の規則は、どの目標からも呼ばれません。
+- `n_account` の `auto_login` を立てる者がありません。読むのは `session` です。
 - サービス `audio` の `n_audio_reply.streams` は、`tests/avmediatest.c` だけが読みます。
 
 ## 途中で見つけた別のこと

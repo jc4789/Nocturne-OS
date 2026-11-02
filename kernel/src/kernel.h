@@ -65,18 +65,6 @@ struct regs;
 NORETURN void panic(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 NORETURN void panic_regs(const char *what, struct regs *r); /* a fault: the registers it found */
 
-/* The flags a test puts on the kernel command line. Only the test build (`make kernel-test`) has
-   them: a product kernel reads no command line, and its settings come through sys/settings.h and
-   the boot record (fs/bootrecord.h). */
-#ifdef NOCTURNE_TEST_FLAGS
-bool test_flag(const char *word);                 /* this exact word */
-bool test_number(const char *key, uint64_t *out); /* key=<decimal>: the last well-formed one */
-const char *test_text(const char *key);           /* what follows key=, to the end of the line */
-#else
-#define test_flag(word) false
-#define test_number(key, out) false
-#endif
-
 #define ASSERT(x) do { if (!(x)) panic("assertion failed: %s (%s:%d)", #x, __FILE__, __LINE__); } while (0)
 
 /* HHDM helpers */

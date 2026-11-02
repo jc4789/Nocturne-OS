@@ -19,8 +19,6 @@ static inline int64_t setting_int(void *out, size_t cap, int32_t v) {
 
 /* Before the owners may say anything changed (the start of kmain_late). */
 void settings_init(void);
-/* The test build's flags for keys (the kernel-test build only): the owners are all up. */
-void settings_test_flags(void);
 /* What SYS_SETTINGS_EFFECTIVE reports of the domain changed, whoever changed it. Any CPU, any
    context: as watched_changed (sys/watch.h). */
 void settings_changed(enum n_setting_domain domain);
