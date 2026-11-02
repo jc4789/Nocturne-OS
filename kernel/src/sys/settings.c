@@ -31,7 +31,6 @@ static const struct setting settings[] = {
     {N_DOMAIN_WINDOW, N_WINDOW_SMOOTH_GRADIENTS, N_SETTING_BOOL, 0, 0, 1, smooth_gradients_setting_put, smooth_gradients_setting_get},
     {N_DOMAIN_INPUT, N_INPUT_POINTER_SPEED, N_SETTING_INT, 0, -2, 2, pointer_speed_setting_put, pointer_speed_setting_get},
     {N_DOMAIN_POWER, N_POWER_PERFORMANCE_PREFERENCE, N_SETTING_INT, 0, 0, 255, perf_preference_setting_put, perf_preference_setting_get},
-    {N_DOMAIN_NETWORK, N_NETWORK_DNS_SERVER, N_SETTING_ENDPOINT, 0, 0, 0, dns_setting_put, dns_setting_get},
     {N_DOMAIN_NETWORK, N_NETWORK_TCP_RX_BYTES, N_SETTING_INT, 0, 1, INT32_MAX, tcp_buffer_setting_put, tcp_buffer_setting_get},
     {N_DOMAIN_NETWORK, N_NETWORK_TCP_TX_BYTES, N_SETTING_INT, 0, 1, INT32_MAX, tcp_buffer_setting_put, tcp_buffer_setting_get},
 };
@@ -116,21 +115,6 @@ int64_t settings_watch(uint32_t domain) {
 }
 
 #ifdef NOCTURNE_TEST_FLAGS
-/* dns-server=<a.b.c.d>:<port>, which a test's own resolver is at. */
-static void test_dns(void) {
-    const char *at = test_text("dns-server");
-    if (!at) return;
-    uint32_t ip = 0, part = 0;
-    for (unsigned i = 0; i < 4; i++) {
-        for (part = 0; *at >= '0' && *at <= '9'; at++) part = part * 10 + (uint32_t)(*at - '0');
-        ip = ip << 8 | part;
-        if (*at++ != (i == 3 ? ':' : '.')) return;
-    }
-    for (part = 0; *at >= '0' && *at <= '9'; at++) part = part * 10 + (uint32_t)(*at - '0');
-    struct n_sockaddr endpoint = {.ip = ip, .port = (uint16_t)part};
-    apply(setting_find(N_DOMAIN_NETWORK, N_NETWORK_DNS_SERVER), &endpoint);
-}
-
 void settings_test_flags(void) {
     static const struct {
         const char *word;
@@ -149,7 +133,6 @@ void settings_test_flags(void) {
         int32_t on = 1;
         apply(setting_find(N_DOMAIN_WINDOW, N_WINDOW_SMOOTH_GRADIENTS), &on);
     }
-    test_dns();
 }
 #else
 void settings_test_flags(void) {}

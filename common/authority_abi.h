@@ -21,6 +21,8 @@ enum n_cap {
     N_CAP_SETTINGS_APPLY,  /* カーネルが持つ領域へ設定を適用する。 */
     N_CAP_STORE_PRIVATE,   /* 名前の木の外の私的な領域を開く。 */
     N_CAP_SHELL,           /* 窓の層と画面の端の予約、窓の一覧を持つ（シェル）。 */
+    N_CAP_NETWORK,         /* adapter の住所と経路を適用し、adapter に縛った UDP を開く。 */
+    N_CAP_CLOCK,           /* 壁時計と RTC を動かす。 */
     N_CAP_COUNT
 };
 

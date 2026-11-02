@@ -28,6 +28,7 @@
    24-hour rather than 12-hour); the century at the index the FADT's CENTURY names (ACPI 6.5
    4.8.2.4 table 4.10: 0 when there is none), in the RTC's own BCD or binary. */
 #include "kernel.h"
+#include "abi.h"
 #include "arch/cpu.h"
 #include "arch/spin.h"
 #include "dev/acpi.h"
@@ -259,6 +260,7 @@ const struct clock_rate_reference *refclock_rate_reference(void) {
 #define RTC_SECONDS 0x00
 #define RTC_MINUTES 0x02
 #define RTC_HOURS 0x04
+#define RTC_WEEKDAY 0x06
 #define RTC_DAY 0x07
 #define RTC_MONTH 0x08
 #define RTC_YEAR 0x09
@@ -268,6 +270,7 @@ const struct clock_rate_reference *refclock_rate_reference(void) {
 #define RTC_BINARY 0x04
 #define RTC_24H 0x02
 #define RTC_PM 0x80              /* in the hours register, 12-hour mode */
+#define RTC_SET 0x80             /* status register B: the date is being written, no update runs */
 #define FADT_BOOT_NO_CMOS_RTC (1u << 5) /* IAPC_BOOT_ARCH, ACPI 6.5 5.2.9.3 */
 
 static struct spinlock rtc_lock; /* the index and data ports: a leaf */
@@ -277,6 +280,11 @@ static uint8_t century_index;
 static uint8_t cmos(uint8_t reg) {
     outb(0x70, reg);
     return inb(0x71);
+}
+
+static void cmos_put(uint8_t reg, uint8_t value) {
+    outb(0x70, reg);
+    outb(0x71, value);
 }
 
 static void rtc_find(void) {
@@ -333,4 +341,36 @@ enum rtc_result rtc_read(int64_t *unix_seconds) {
                             .mon = mo, .mday = d, .hour = h, .min = mi, .sec = s};
     *unix_seconds = time_from_parts(&date);
     return RTC_READ;
+}
+
+static uint8_t to_bcd(int v) { return (uint8_t)((v / 10) << 4 | (v % 10)); }
+
+int rtc_write(int64_t unix_seconds) {
+    if (rtc_state == RTC_UNKNOWN) rtc_find();
+    if (rtc_state == RTC_NONE) return -N_ERR_UNSUPPORTED;
+    struct tm_parts p;
+    time_to_parts(unix_seconds, &p);
+    if (p.year < 2000 || (!century_index && p.year > 2099) || p.year > 9999) return -N_ERR_INVALID;
+    uint64_t f = spin_lock(&rtc_lock);
+    uint8_t b = cmos(RTC_STATUS_B);
+    int hour = p.hour;
+    uint8_t pm = 0;
+    if (!(b & RTC_24H)) { /* 12, 1 .. 11, as rtc_read counts them */
+        pm = hour >= 12 ? RTC_PM : 0;
+        hour = hour % 12 ? hour % 12 : 12;
+    }
+    #define RTC_FIELD(v) ((b & RTC_BINARY) ? (uint8_t)(v) : to_bcd(v))
+    cmos_put(RTC_STATUS_B, b | RTC_SET);
+    cmos_put(RTC_SECONDS, RTC_FIELD(p.sec));
+    cmos_put(RTC_MINUTES, RTC_FIELD(p.min));
+    cmos_put(RTC_HOURS, RTC_FIELD(hour) | pm);
+    cmos_put(RTC_WEEKDAY, RTC_FIELD(p.wday + 1)); /* 1 is Sunday */
+    cmos_put(RTC_DAY, RTC_FIELD(p.mday));
+    cmos_put(RTC_MONTH, RTC_FIELD(p.mon));
+    cmos_put(RTC_YEAR, RTC_FIELD(p.year % 100));
+    if (century_index) cmos_put(century_index, RTC_FIELD(p.year / 100));
+    #undef RTC_FIELD
+    cmos_put(RTC_STATUS_B, b);
+    spin_unlock(&rtc_lock, f);
+    return 0;
 }

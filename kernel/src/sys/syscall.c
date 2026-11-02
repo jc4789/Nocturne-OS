@@ -8,6 +8,8 @@
 #include "sys/syscall.h"
 #include "sys/proc.h"
 #include "sys/authority.h"
+#include "dev/refclock.h"
+#include "sys/clock.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
 #include "sys/events.h"
@@ -1350,10 +1352,19 @@ void syscall_dispatch(struct regs *r) {
     case SYS_SETTINGS_EFFECTIVE: ret = settings_syscall_effective((uint32_t)a, (uint32_t)b, (void *)c, d); break;
     case SYS_SETTINGS_DESCRIBE: ret = settings_syscall_describe((uint32_t)a, (uint32_t)b, (void *)c); break;
     case SYS_SETTINGS_WATCH: ret = settings_watch((uint32_t)a); break;
+    case SYS_CLOCK_WALL_STEP: ret = cap_check((int)a, N_CAP_CLOCK); if (ret >= 0) { clock_set_wall((int64_t)b); ret = 0; } break;
+    case SYS_CLOCK_WALL_SLEW:
+        ret = cap_check((int)a, N_CAP_CLOCK);
+        if (ret >= 0) {
+            clock_adjust_wall((int64_t)b, (uint32_t)c);
+            ret = 0;
+        }
+        break;
+    case SYS_RTC_WRITE: ret = cap_check((int)a, N_CAP_CLOCK); if (ret >= 0) ret = rtc_write((int64_t)b); break;
     case SYS_ENTRY_SET_OWNER: ret = sys_entry_set_owner((const char *)a, (uint32_t)b); break;
     default:
-        if (r->rax >= SYS_WIN_CREATE && r->rax < SYS_NET_INFO) ret = wm_syscall((int)r->rax, a, b, c, d, e);
-        else if (r->rax >= SYS_NET_INFO && r->rax < SYS_NET_LIMIT) ret = net_syscall((int)r->rax, a, b, c, d, e);
+        if (r->rax >= SYS_WIN_CREATE && r->rax < SYS_NET_FIRST) ret = wm_syscall((int)r->rax, a, b, c, d, e);
+        else if (r->rax >= SYS_NET_FIRST && r->rax < SYS_NET_LIMIT) ret = net_syscall((int)r->rax, a, b, c, d, e);
         break;
     }
     r->rax = (uint64_t)ret;

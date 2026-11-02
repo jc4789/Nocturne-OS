@@ -1,9 +1,6 @@
-/* DNS representation bounds, not browser hostname quotas. RFC 1035 2.3.4:
-   labels <=63 octets, name including label lengths/root <=255 wire octets.
-   The longest unescaped textual form has 254 bytes including its final dot. */
+/* The wire form of DNS names. The bounds are in abi.h. */
 #pragma once
-#define DNS_NAME_WIRE_BYTES 255u
-#define DNS_NAME_TEXT_BYTES 254u
+#include "abi.h"
 
 static bool dns_name_encode(const char *name, size_t length, uint8_t *out, size_t capacity, size_t *written) {
     if (!name || !out || !written) return false;

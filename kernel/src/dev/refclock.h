@@ -1,5 +1,5 @@
 /* The platform's reference clocks (dev/refclock.c): what the clock (sys/clock.h) holds the TSC's
-   rate and the wall clock to. Only the clock uses them.
+   rate and the wall clock to. Only the clock uses them, but for SYS_RTC_WRITE.
 
    - The HPET's main counter (IA-PC HPET 1.0a), or where the platform has none the ACPI PM timer
      (ACPI 6.5 4.8.3.3): the clock's rate reference on the hardware (struct clock_rate_reference).
@@ -21,3 +21,6 @@ const struct clock_rate_reference *refclock_rate_reference(void);
    not readable yet), RTC_ABSENT when there is none or what it holds is no date. */
 enum rtc_result { RTC_ABSENT, RTC_UPDATING, RTC_READ };
 enum rtc_result rtc_read(int64_t *unix_seconds);
+/* The date the RTC holds becomes unix_seconds, in the format its status register B states. A task
+   or any context but an NMI. -N_ERR_UNSUPPORTED where there is none. */
+int rtc_write(int64_t unix_seconds);

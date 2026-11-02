@@ -76,7 +76,7 @@ static enum irq_result tulip_irq(void *context) {
         /* no error summary, first and last descriptor of the frame */
         if (!(s & (1u << 15)) && (s & (3u << 8)) == (3u << 8)) {
             uint32_t len = (s >> 16) & 0x3FFF;
-            if (len > 4) net_rx(rxbuf[rx_cur], len - 4); /* strip CRC */
+            if (len > 4) net_rx(&nif, rxbuf[rx_cur], len - 4); /* strip CRC */
         }
         rx[rx_cur].status = OWN;
         rx_cur = (rx_cur + 1) % NRX;
@@ -85,7 +85,8 @@ static enum irq_result tulip_irq(void *context) {
     return IRQ_HANDLED;
 }
 
-static int tulip_send(const void *frame, size_t len) {
+static int tulip_send(struct netif *self, const void *frame, size_t len) {
+    (void)self;
     if (len > BUFSZ) return -N_ERR_INVALID;
     struct tdesc *d = &tx[tx_cur];
     for (int i = 0; i < 1000000 && (d->status & OWN); i++) pause();
