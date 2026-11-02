@@ -19,4 +19,6 @@ struct process;
 void stream_error_printf(struct process *p, const char *fmt, ...);
 
 /* The keyboard's key events (dev/input.h's key sink) as the console's input, where no window
-   manager takes them: characters, and the terminal's sequences for the moving keys. */
+   manager takes them. */
+struct key_event;
+void console_key(const struct key_event *e);

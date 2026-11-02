@@ -208,6 +208,7 @@ enum {
 #define N_KIND_PCI 10       /* the right to drive one PCI function */
 #define N_KIND_PAGER 11     /* the right to supply one paged memory object; never sent */
 #define N_KIND_WATCH 13     /* a watch (SYS_WATCH_TAKE): receivable once what it watches changed */
+#define N_KIND_CONSOLE 15   /* the console: text goes out, struct n_console_key comes in (n_console_receive) */
 #define N_KIND_CAPABILITY 14 /* 特権を一つ持つ（enum n_cap、SYS_CAP_KIND）。持つことが権限の証明。 */
 
 /* SYS_ENTRY_WATCH: what is watched on C: */

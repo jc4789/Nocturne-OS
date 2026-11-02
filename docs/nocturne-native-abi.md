@@ -29,7 +29,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - 種類：`N_KIND_DOCUMENT`、`N_KIND_FOLDER`、`N_KIND_CHANNEL`、`N_KIND_WINDOW`、
   `N_KIND_SHARED`、`N_KIND_APP`、`N_KIND_EVENTS`、`N_KIND_DEVICE`（開いた音の出口。§17）、
   `N_KIND_CONNECTION`（TCP／UDP）、`N_KIND_PCI`、`N_KIND_PAGER`、`N_KIND_WATCH`（見張り。下）、
-  `N_KIND_CAPABILITY`（能力。§13）。12 は欠番（§10）。
+  `N_KIND_CAPABILITY`（能力。§13）、`N_KIND_CONSOLE`（コンソール。§4）。12 は欠番（§10）。
 - 汎用操作は `n_handle_close(h)` と `n_handle_kind(h)` だけ。読み書きは種類ごとの
   専用関数で行い、種類の違うハンドルを渡すと `N_ERR_WRONG_KIND`。
 - 見張り（`N_KIND_WATCH`）は、見ている物が変わったことを知らせるハンドル。開く口は見る物ごとに
@@ -255,6 +255,12 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - アプリの入出力に渡される文字装置（コンソール、カーネルログ、null）にも
   `n_channel_send`／`receive` が使える。ただし境界と添付は無く、`N_CHANNEL_PEEK` は
   `N_ERR_UNSUPPORTED`。バイト列のパイプは無い。
+- コンソール（`N_KIND_CONSOLE`）は、窓の管理が動かない機械のキーの押下を渡す。`n_channel_send` は文字を
+  出す。`n_channel_receive` は `struct n_console_key`（`common/input_abi.h`：HID の usage、host が打った文字、
+  配列の番号、修飾）を丸ごと受け取る。カーネルは文字を作らず、`cap` が一件より小さければ `N_ERR_TOO_LARGE`。
+  打ったまま読まれていない押下は 256 件まで持ち、溢れた分は落とす。
+- `n_console_receive(h,buf,cap,flags)`（libc）は同じ道を文字で読む。押下を `n_key_translate` で文字にし、
+  Ctrl と英字は制御文字に、移動のキーは `ESC [ A` などの列にして返す。`stdin` はこの道で読む。
 - `n_channel_receive_from(h,buf,cap,flags,&message)` はメッセージチャンネル専用。
   `n_channel_message` の `attached`、`reserved`（0）、`sender_app` を返す。
   `sender_app` はカーネルが実送信時に記録する `n_app_self()` と同じ識別子で、

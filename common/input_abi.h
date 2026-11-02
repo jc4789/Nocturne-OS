@@ -22,6 +22,12 @@ enum n_key_usage {
 
 /* 修飾。押されている間と Caps Lock の状態はカーネルが持つ。アプリに届くのは SHIFT・CTRL・ALT・SUPER で、
    CAPS と RIGHT_ALT は n_key_translate が読んで落とす。 */
+/* コンソールから読むキーの押下の一通（N_KIND_CONSOLE）。カーネルは usage のまま渡し、文字は読む側の libc が
+   作る（n_console_receive）。text は host が打った文字で、usage は 0。 */
+struct n_console_key {
+    uint32_t usage, text, layout, mods;
+};
+
 #define NMOD_SHIFT 1u
 #define NMOD_CTRL 2u
 #define NMOD_ALT 4u

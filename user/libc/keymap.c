@@ -1,6 +1,7 @@
 /* キーの usage から文字へ。文字を決めるのはここだけ。カーネルは HID の usage と修飾と配列の番号を渡し、
    窓の事象を取り出す win_event がここを呼ぶ。行は {押しただけ, Shift, AltGr}。0 は値が無い。 */
 #include "nocturne.h"
+#include <string.h>
 
 typedef const uint16_t layout_table[256][3];
 
@@ -74,4 +75,68 @@ void n_key_translate(struct gui_event *e) {
     bool upper = (mods & NMOD_SHIFT) != 0;
     if (letter && (mods & NMOD_CAPS)) upper = !upper;
     e->key = upper && row[1] ? row[1] : row[0];
+}
+
+/* 一つの押下から、端末の読む文字の列へ。 */
+static size_t console_bytes(const struct n_console_key *k, char out[8]) {
+    struct gui_event e = {.type = EV_KEY, .key = k->text, .usage = k->usage, .layout = k->layout, .mods = k->mods};
+    n_key_translate(&e);
+    uint32_t c = e.key;
+    if (c >= 0x110000) {
+        const char *s = NULL;
+        switch (c) {
+        case NKEY_UP: s = "\x1b[A"; break;
+        case NKEY_DOWN: s = "\x1b[B"; break;
+        case NKEY_RIGHT: s = "\x1b[C"; break;
+        case NKEY_LEFT: s = "\x1b[D"; break;
+        case NKEY_HOME: s = "\x1b[H"; break;
+        case NKEY_END: s = "\x1b[F"; break;
+        case NKEY_DELETE: s = "\x1b[3~"; break;
+        case NKEY_PGUP: s = "\x1b[5~"; break;
+        case NKEY_PGDN: s = "\x1b[6~"; break;
+        default: return 0;
+        }
+        size_t n = strlen(s);
+        memcpy(out, s, n);
+        return n;
+    }
+    if ((e.mods & NMOD_CTRL) && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) c &= 0x1F;
+    if (c < 0x80) {
+        out[0] = (char)c;
+        return 1;
+    }
+    if (c < 0x800) {
+        out[0] = (char)(0xC0 | c >> 6);
+        out[1] = (char)(0x80 | (c & 0x3F));
+        return 2;
+    }
+    if (c < 0x10000) {
+        out[0] = (char)(0xE0 | c >> 12);
+        out[1] = (char)(0x80 | (c >> 6 & 0x3F));
+        out[2] = (char)(0x80 | (c & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | c >> 18);
+    out[1] = (char)(0x80 | (c >> 12 & 0x3F));
+    out[2] = (char)(0x80 | (c >> 6 & 0x3F));
+    out[3] = (char)(0x80 | (c & 0x3F));
+    return 4;
+}
+
+/* 列の途中で cap が尽きたときの残り。コンソールを読むのはプロセスの中の一か所なので、錠は持たない。 */
+n_result n_console_receive(n_handle h, void *buf, size_t cap, uint32_t flags) {
+    static char pending[8];
+    static size_t pending_at, pending_length;
+    if (!cap) return 0;
+    while (pending_at == pending_length) {
+        struct n_console_key key;
+        n_result r = n_channel_receive(h, &key, sizeof key, flags, NULL);
+        if (r < 0) return r;
+        pending_at = 0;
+        pending_length = console_bytes(&key, pending);
+    }
+    size_t n = pending_length - pending_at < cap ? pending_length - pending_at : cap;
+    memcpy(buf, pending + pending_at, n);
+    pending_at += n;
+    return (n_result)n;
 }

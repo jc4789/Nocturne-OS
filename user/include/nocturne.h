@@ -576,6 +576,9 @@ n_result win_event(window_t *win, struct gui_event *e, uint64_t deadline);
 /* The one place a key's usage, modifiers and layout become a character (user/libc/keymap.c): sets e->key, and leaves in
    e->mods what programs read. */
 void n_key_translate(struct gui_event *e);
+/* Reads the console (N_KIND_CONSOLE) as text: each press becomes its character, in the layout of the
+   keyboard that typed it, or the terminal's sequence for a moving key. flags as n_channel_receive's. */
+n_result n_console_receive(n_handle h, void *buf, size_t cap, uint32_t flags);
 n_result clipboard_set(const char *s, size_t n);
 n_result clipboard_get(char *buf, size_t n); /* the whole length; at most n bytes are copied */
 /* Starts a program (find_program: "notepad" is enough), with arg as its one argument and without

@@ -152,7 +152,10 @@ static int read_byte(void) {
             if (take_interrupts()) return 3;
         }
         if (!cap && !(in = malloc(cap = 4096))) return -1;
-        n_result r = n_channel_receive(0, in, cap, prompt_events >= 0 ? 0 : N_CHANNEL_WAIT, NULL);
+        static n_result input_kind;
+        if (!input_kind) input_kind = n_handle_kind(0);
+        uint32_t waits = prompt_events >= 0 ? 0 : N_CHANNEL_WAIT;
+        n_result r = input_kind == N_KIND_CONSOLE ? n_console_receive(0, in, cap, waits) : n_channel_receive(0, in, cap, waits, NULL);
         if (r == -N_ERR_TOO_LARGE) {
             /* a long paste arrives as one message */
             n_result need = n_channel_receive(0, NULL, 0, N_CHANNEL_PEEK, NULL);

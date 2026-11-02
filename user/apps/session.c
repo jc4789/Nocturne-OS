@@ -321,6 +321,57 @@ static bool login_window(struct n_account *out) {
     return done;
 }
 
+/* 窓の無い機械のログイン。名前は打ったとおり見せ、合言葉は見せない。 */
+static bool console_line(const char *prompt, bool shown, char *out, size_t cap) {
+    printf("%s: ", prompt);
+    fflush(stdout);
+    size_t length = 0;
+    for (;;) {
+        int c = getchar();
+        if (c == EOF) return false;
+        if (c == '\r' || c == '\n') break;
+        if (c == '\b' || c == 0x7F) {
+            if (!length) continue;
+            length--;
+            if (shown) printf("\b \b");
+        } else if (c >= 0x20 && length + 1 < cap) {
+            out[length++] = (char)c;
+            if (shown) putchar(c);
+        }
+        fflush(stdout);
+    }
+    out[length] = 0;
+    printf("\n");
+    fflush(stdout);
+    return true;
+}
+
+static bool console_login(struct n_account *out) {
+    struct n_accounts_request q = {0};
+    struct n_accounts_reply reply;
+    struct n_account *list;
+    n_result count = n_accounts_list(&list);
+    if (count < 0) return false;
+    free(list);
+    int32_t language = N_LANGUAGE_JAPANESE;
+    n_setting_get_int(n_setting_at(N_DOMAIN_LANGUAGE, N_LANGUAGE_LOGIN), &language);
+    login_language = language >= 0 && language < N_LANGUAGE_COUNT ? (uint32_t)language : N_LANGUAGE_JAPANESE;
+    if (!count) printf("%s\n", WORD(L_FIRST_USER));
+    if (!console_line(WORD(L_NAME), true, q.name, sizeof q.name) || !console_line(WORD(L_PASSWORD), false, q.password, sizeof q.password))
+        return false;
+    q.op = count ? N_ACCOUNTS_VERIFY : N_ACCOUNTS_CREATE;
+    q.cls = N_CLASS_ADMIN;
+    n_result r = n_accounts_call(&q, &reply);
+    memset(&q, 0, sizeof q);
+    if (r < 0) {
+        printf("%s\n", WORD(count ? L_WRONG : L_CANNOT_MAKE));
+        fflush(stdout);
+        return false;
+    }
+    *out = reply.account;
+    return true;
+}
+
 int main(void) {
     n_result r = mtx_init(&current_lock, mtx_plain) == thrd_success ? 0 : -N_ERR_NO_MEMORY;
     if (r >= 0) r = grant_cap = n_cap_find(N_CAP_IDENTITY_GRANT);
@@ -339,12 +390,7 @@ int main(void) {
     struct n_account account;
     bool automatic = auto_account(&account); /* 自動で入るのは起動の一度だけ */
     for (;;) {
-        if (!automatic && !windows) {
-            /* 画面が無ければ打つ窓も無い：自動で入る利用者がいない機械はここで待つ */
-            n_sleep_until(N_CLOCK_NEVER);
-            continue;
-        }
-        if (!automatic && !login_window(&account)) continue;
+        if (!automatic && !(windows ? login_window(&account) : console_login(&account))) continue;
         automatic = false;
         session_run(&account, windows);
     }

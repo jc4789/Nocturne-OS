@@ -28,7 +28,7 @@
 | `sys/object.c`・`channel.c`・`events.c`・`watch.c` | object と handle の表、channel、event queue、watch。 |
 | `sys/authority.c`・`service.c` | process の身元と能力の handle（`common/authority_abi.h`）、サービスの管理者への接続の道。カーネルに名前は無い。 |
 | `sys/syscall.c` | syscall の受け口 `syscall_dispatch`。 |
-| `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console と system log の stream、profiler。 |
+| `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console（文字を出し、窓の管理が無い機械のキーの押下を渡す）と system log の stream、profiler。 |
 | `sys/settings.c` | 設定の門。領域と鍵の番号の表で持ち主へ渡す（`SYS_SETTINGS_*`、番号は `common/settings_abi.h`）。カーネルは保存しない。 |
 | `fs/` | C: の store の実行側。mount とパスの操作とパスの権限は `store.c`、開いた文書と私的な領域は `document.c`、block cache は `cache.c`、変更の watch は `watch.c`、起動の記録 `settings.rec` は `bootrecord.c`。書式のエンジンは `common/store/`。 |
 | `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音の出口（`audio` が一覧と一つの open、`hda`・`hda_codec` が High Definition Audio。混合と選択はサービス `audio`）、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（`input` が装置の一覧と装置ごとの値、速さと向きの適用。`usbhid` は HID の usage を渡す）、`serial`、`refclock`（HPET か ACPI PM timer と、RTC）、電源と hibernate。 |

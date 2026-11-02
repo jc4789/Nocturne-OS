@@ -102,6 +102,8 @@ static int64_t raw_read(FILE *f, char *buf, size_t cap) {
     if (kind == N_KIND_DOCUMENT) {
         r = n_document_read_at(f->h, f->pos, buf, cap);
         if (r > 0) f->pos += (uint64_t)r;
+    } else if (kind == N_KIND_CONSOLE) {
+        r = n_console_receive(f->h, buf, cap, N_CHANNEL_WAIT);
     } else if (kind > 0) {
         /* an empty message carries no bytes: wait for the next one */
         do r = n_channel_receive(f->h, buf, cap, N_CHANNEL_WAIT, NULL);

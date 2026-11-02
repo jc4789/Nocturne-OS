@@ -1011,7 +1011,7 @@ index 00000000..1409f1fd
 +package net
 +
 +import (
-+	"internal/itoa"
++	"internal/strconv"
 +	"os"
 +	"syscall"
 +)
@@ -1041,7 +1041,7 @@ index 00000000..1409f1fd
 +		ifi := Interface{
 +			Index:        int(a.ID),
 +			MTU:          1500,
-+			Name:         "net" + itoa.Itoa(int(a.ID)),
++			Name:         "net" + strconv.Itoa(int(a.ID)),
 +			HardwareAddr: HardwareAddr(append([]byte(nil), a.MAC[:]...)),
 +			Flags:        FlagBroadcast,
 +		}
@@ -1189,7 +1189,7 @@ index 00000000..08b06369
 +
 +import (
 +	"context"
-+	"internal/itoa"
++	"internal/strconv"
 +	"syscall"
 +	"time"
 +)
@@ -1324,7 +1324,7 @@ index 00000000..08b06369
 +	}
 +	servers, err := syscall.NetworkResolvers()
 +	for _, server := range servers {
-+		conf.servers = append(conf.servers, JoinHostPort(ipFromUint32(server.IP).String(), itoa.Itoa(int(server.Port))))
++		conf.servers = append(conf.servers, JoinHostPort(ipFromUint32(server.IP).String(), strconv.Itoa(int(server.Port))))
 +	}
 +	if err != nil || len(conf.servers) == 0 {
 +		conf.servers = defaultNS
@@ -2080,7 +2080,7 @@ index 764ce12c..de68d1d8 100644
  
 +	case "nocturne":
 +		// Apps keep what they cache in a folder of their own in AppData.
-+		dir = syscall.UserFolder()
++		dir = userFolder()
 +		if dir == "" {
 +			return "", errors.New("this app has no user folder")
 +		}
@@ -2095,7 +2095,7 @@ index 764ce12c..de68d1d8 100644
  
 +	case "nocturne":
 +		// Apps keep their settings in a folder of their own in AppData.
-+		dir = syscall.UserFolder()
++		dir = userFolder()
 +		if dir == "" {
 +			return "", errors.New("this app has no user folder")
 +		}
@@ -2109,13 +2109,43 @@ index 764ce12c..de68d1d8 100644
  	case "plan9":
  		env, enverr = "home", "$home"
 +	case "nocturne":
-+		if dir := syscall.UserFolder(); dir != "" {
++		if dir := userFolder(); dir != "" {
 +			return dir, nil
 +		}
 +		return "", errors.New("this app has no user folder")
  	}
  	if v := Getenv(env); v != "" {
  		return v, nil
+diff --git a/src/os/userfolder_nocturne.go b/src/os/userfolder_nocturne.go
+new file mode 100644
+--- /dev/null
++++ b/src/os/userfolder_nocturne.go
+@@ -0,0 +1,10 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package os
++
++import "syscall"
++
++// userFolder is this app's user's folder, or "" for the system's identity.
++func userFolder() string { return syscall.UserFolder() }
+diff --git a/src/os/userfolder_other.go b/src/os/userfolder_other.go
+new file mode 100644
+--- /dev/null
++++ b/src/os/userfolder_other.go
+@@ -0,0 +1,10 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build !nocturne
++
++package os
++
++// userFolder is only called for GOOS=nocturne.
++func userFolder() string { return "" }
 diff --git a/src/os/file_mutex_nocturne.go b/src/os/file_mutex_nocturne.go
 new file mode 100644
 index 00000000..ebed3d17
