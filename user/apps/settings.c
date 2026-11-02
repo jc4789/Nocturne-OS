@@ -610,7 +610,7 @@ static void screen_card(struct ui_msg *m) {
     ui_end(m);
     ui_node(m, "card"); ui_num(m, "gap", 14); ui_str(m, "key", "scale");
         text_node(m, "倍率（百分率）", "heading", 0);
-        text_node(m, "このモニターの文字と部品の大きさです。100 が等倍です。", "caption", 0);
+        text_node(m, "プログラムへ知らせる値です。描く大きさはまだ変わりません。100 が等倍です。", "caption", 0);
         act_at(ui_node(m, "field"), A_SCALE, 0);
         ui_str(m, "value", scale_draft); ui_str(m, "width", "fill");
         ui_end(m);
