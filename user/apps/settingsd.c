@@ -822,8 +822,6 @@ static const void *current_bytes(const struct known *k, const struct n_setting_i
         *length = v->length;
         return v->bytes;
     }
-    /* カーネルの鍵は今の値。 */
-    if (k->kernel) {
     /* カーネルの鍵は今の値。一覧の鍵は装置ごとの選択が無ければ既定（全部 0）。 */
     if (k->kernel && !listed_type(k->d.type)) {
         uint32_t size = fixed_size(k->d.type);
@@ -1182,7 +1180,6 @@ static void kernel_domain_changed(uint32_t domain) {
     uint8_t now[sizeof(struct n_sockaddr) + sizeof(int32_t)];
     for (size_t i = 0; i < known_count; i++) {
         struct known *k = knowns[i];
-        if (k->d.domain != domain || !k->kernel || k->d.apply == N_APPLY_RESTART) continue;
         if (k->d.domain != domain || !k->kernel || k->d.apply == N_APPLY_RESTART || listed_type(k->d.type)) continue;
         struct n_setting_id id = {.domain = domain, .key = k->d.key};
         if (k->d.scope == N_SCOPE_USER) {

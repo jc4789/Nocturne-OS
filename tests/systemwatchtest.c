@@ -3,7 +3,6 @@
  * the pointer's speed, and puts them back at the end. Prints "systemwatchtest: N checks, M failed". */
 #include "nocturne.h"
 #include "nocturne_settings.h"
-#include "display.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,53 +48,29 @@ static void watches(void) {
     CHECK(n_watch_take(0x7ffffff0) == -N_ERR_NO_HANDLE);
 
     loud = n_setting_watch(N_DOMAIN_AUDIO, N_SETTING_ANY);
-    n_handle screen = n_screen_watch();
-    n_handle qs = n_events_create();
-    CHECK(loud >= 0 && screen >= 0 && qs >= 0);
-    if (loud < 0 || screen < 0 || qs < 0) {
-        printf("systemwatchtest: the watches: %s, %s\n", n_result_text(loud), n_result_text(screen));
-        return;
-    }
-    CHECK(n_handle_kind(screen) == N_KIND_WATCH);
-    CHECK(n_events_watch(q, loud, N_EVENT_RECEIVABLE, 1) == 0 && n_events_watch(qs, screen, N_EVENT_RECEIVABLE, 2) == 0);
-    /* fresh: nothing heard yet */
-    CHECK(!ready(q, 0) && loud_take() == 0);
-    n_watch_take(screen); /* a moment of the desktop's own (a size, a scanout) is not this test's */
-
-    const int32_t before_volume = audio_setting(N_AUDIO_VOLUME), before_muted = audio_setting(N_AUDIO_MUTED);
-    struct desktop_settings ds_before;
-    CHECK(desktop(&ds_before) == 0);
-
-    /* the volume: heard by the sound's watch, not the screen's */
-    int v = before_volume == 37 ? 38 : 37;
-    CHECK(set_volume(v) == 0 && audio_setting(N_AUDIO_VOLUME) == v);
-    CHECK(ready(q, 1000));
-    CHECK(loud_take() >= 1);
-    CHECK(loud_take() == 0 && !ready(q, 0));
-    CHECK(!ready(qs, 200));
-    n_handle loud = n_audio_output_watch(), inputs = n_settings_watch(N_DOMAIN_INPUT);
+    n_handle inputs = n_settings_watch(N_DOMAIN_INPUT);
     n_handle qi = n_events_create();
     CHECK(loud >= 0 && inputs >= 0 && qi >= 0);
     if (loud < 0 || inputs < 0 || qi < 0) {
         printf("systemwatchtest: the watches: %s, %s\n", n_result_text(loud), n_result_text(inputs));
         return;
     }
-    CHECK(n_handle_kind(loud) == N_KIND_WATCH && n_handle_kind(inputs) == N_KIND_WATCH);
+    CHECK(n_handle_kind(inputs) == N_KIND_WATCH);
     CHECK(n_events_watch(q, loud, N_EVENT_RECEIVABLE, 1) == 0 && n_events_watch(qi, inputs, N_EVENT_RECEIVABLE, 2) == 0);
     /* fresh: nothing heard yet */
-    CHECK(!ready(q, 0) && n_watch_take(loud) == 0);
+    CHECK(!ready(q, 0) && loud_take() == 0);
     n_watch_take(inputs); /* a device coming or going is not this test's */
 
-    const struct n_audio_output before = sound();
+    const int32_t before_volume = audio_setting(N_AUDIO_VOLUME), before_muted = audio_setting(N_AUDIO_MUTED);
     int32_t speed_before = 0;
     CHECK(n_settings_effective(N_DOMAIN_INPUT, N_INPUT_POINTER_SPEED, &speed_before, sizeof speed_before) == sizeof speed_before);
 
     /* the volume: heard by the sound's watch, not the input's */
-    int v = before.volume == 37 ? 38 : 37;
-    CHECK(set_volume(v) == 0 && sound().volume == v);
+    int v = before_volume == 37 ? 38 : 37;
+    CHECK(set_volume(v) == 0 && audio_setting(N_AUDIO_VOLUME) == v);
     CHECK(ready(q, 1000));
-    CHECK(n_watch_take(loud) >= 1);
-    CHECK(n_watch_take(loud) == 0 && !ready(q, 0));
+    CHECK(loud_take() >= 1);
+    CHECK(loud_take() == 0 && !ready(q, 0));
     CHECK(!ready(qi, 200));
     /* the same value is no change */
     CHECK(set_volume(v) == 0 && !ready(q, 200) && loud_take() == 0);
@@ -107,15 +82,11 @@ static void watches(void) {
     /* the pointer's speed: heard by the input's watch, not the sound's */
     int speed = speed_before == 1 ? -1 : 1;
     CHECK(set_pointer_speed(speed) == 0);
-    struct desktop_settings ds;
-    CHECK(desktop(&ds) == 0 && ds.pointer_speed == speed);
-    CHECK(ready(qs, 1000) && n_watch_take(screen) >= 1);
-    CHECK(!ready(q, 200) && loud_take() == 0);
     int32_t speed_now = 0;
     CHECK(n_settings_effective(N_DOMAIN_INPUT, N_INPUT_POINTER_SPEED, &speed_now, sizeof speed_now) == sizeof speed_now &&
           speed_now == speed);
     CHECK(ready(qi, 1000) && n_watch_take(inputs) >= 1);
-    CHECK(!ready(q, 200) && n_watch_take(loud) == 0);
+    CHECK(!ready(q, 200) && loud_take() == 0);
 
     /* a watch closed is gone from the queue it was in */
     n_handle q2 = n_events_create(), gone = n_setting_watch(N_DOMAIN_AUDIO, N_SETTING_ANY);
@@ -132,8 +103,6 @@ static void watches(void) {
 
     /* back as it was */
     CHECK(set_volume(before_volume) == 0 && set_muted(before_muted != 0) == 0);
-    CHECK(set_pointer_speed(ds_before.pointer_speed) == 0);
-    CHECK(set_volume(before.volume) == 0 && (!before.muted || set_muted(true) == 0));
     CHECK(set_pointer_speed(speed_before) == 0);
     n_handle_close(loud);
     n_handle_close(inputs);

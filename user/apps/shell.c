@@ -109,51 +109,26 @@ static bool box_clip(struct rectangle *r, const canvas_t *c) {
 /* ---- 何を起こせるか ---- */
 enum action { RUN, SLEEP, HIBERNATE, LOGOUT, RESTART, SHUT_DOWN };
 struct app {
-    const char *name;
+    const char *name;                /* RUN：台帳の名前 */
+    enum shell_word word;            /* 電源の項目の文 */
     const struct n_program *program; /* RUN だけ */
-    enum shell_word name;
-    const char *path;
     int icon;
     enum action action;
 };
 static const struct app power_items[] = {
-    {"Sleep", NULL, N_ICON_SLEEP, SLEEP},
-    {"Hibernate", NULL, N_ICON_HIBERNATE, HIBERNATE},
-    {"Log Out", NULL, N_ICON_LOGOUT, LOGOUT},
-    {"Restart", NULL, N_ICON_REBOOT, RESTART},
-    {"Shut Down", NULL, N_ICON_POWER, SHUT_DOWN},
-#define SYSTEM   N_FOLDER_SYSTEM "\\"
-#define PROGRAMS N_FOLDER_PROGRAMS "\\"
-static const struct app apps[] = {
-    {S_TERMINAL, SYSTEM "term", ICON_TERMINAL, NULL, RUN},
-    {S_FILES, SYSTEM "files", ICON_FILES, NULL, RUN},
-    {S_BROWSER, PROGRAMS "Browser\\browser", ICON_NET, NULL, RUN},
-    {S_EDITOR, PROGRAMS "Notepad\\notepad", ICON_EDITOR, NULL, RUN},
-    {S_PAINT, PROGRAMS "Paint\\paint", ICON_PAINT, NULL, RUN},
-    {S_CALCULATOR, PROGRAMS "Calculator\\calc", ICON_CALC, NULL, RUN},
-    {S_CLOCK, PROGRAMS "Clock\\clock", ICON_CLOCK, NULL, RUN},
-    {S_MONITOR, SYSTEM "sysmon", ICON_MONITOR, NULL, RUN},
-    {S_PIANO, PROGRAMS "Piano\\piano", ICON_PIANO, NULL, RUN},
-    {S_PLAYER, PROGRAMS "Player\\player", ICON_SOUND, NULL, RUN},
-    {S_SNAKE, PROGRAMS "Snake\\snake", ICON_SNAKE, NULL, RUN},
-    {S_TETRIS, PROGRAMS "Tetris\\tetris", ICON_TETRIS, NULL, RUN},
-    {S_MINES, PROGRAMS "Minesweeper\\mines", ICON_MINES, NULL, RUN},
-    {S_MANDEL, PROGRAMS "Mandelbrot\\mandel", ICON_FRACTAL, NULL, RUN},
-    {S_CUBE, PROGRAMS "Cube\\cube", ICON_CUBE, NULL, RUN},
-    {S_LIFE, PROGRAMS "Life\\life", ICON_LIFE, NULL, RUN},
-    {S_SETTINGS, SYSTEM "settings", ICON_SETTINGS, NULL, RUN},
-    {S_ABOUT, SYSTEM "js", ICON_ABOUT, SYSTEM "about.js", RUN},
-    {S_SLEEP, NULL, ICON_SLEEP, NULL, SLEEP},
-    {S_HIBERNATE, NULL, ICON_HIBERNATE, NULL, HIBERNATE},
-    {S_LOGOUT, NULL, ICON_LOGOUT, NULL, LOGOUT},
-    {S_RESTART, NULL, ICON_REBOOT, NULL, RESTART},
-    {S_SHUT_DOWN, NULL, ICON_POWER, NULL, SHUT_DOWN},
+    {NULL, S_SLEEP, NULL, N_ICON_SLEEP, SLEEP},
+    {NULL, S_HIBERNATE, NULL, N_ICON_HIBERNATE, HIBERNATE},
+    {NULL, S_LOGOUT, NULL, N_ICON_LOGOUT, LOGOUT},
+    {NULL, S_RESTART, NULL, N_ICON_REBOOT, RESTART},
+    {NULL, S_SHUT_DOWN, NULL, N_ICON_POWER, SHUT_DOWN},
 };
 #define POWER_ITEMS ((int)(sizeof power_items / sizeof *power_items))
 /* 台帳の写し（サービス programs）。menu_apps と desktop_apps は programs_held を指す。 */
 static struct n_program *programs_held;
 static struct app *menu_apps, *desktop_apps;
 static int menu_app_count, desktop_app_count;
+
+static const char *app_name(const struct app *a) { return a->program ? a->name : WORD(a->word); }
 
 static void toast(const char *title, const char *text, unsigned ms);
 static void logout_begin(void);
@@ -172,7 +147,7 @@ static void programs_read(void) {
     }
     int menu_n = 0, desk_n = 0;
     for (n_result i = 0; i < count; i++) {
-        struct app a = {list[i].name, &list[i], (int)list[i].icon, RUN};
+        struct app a = {list[i].name, 0, &list[i], (int)list[i].icon, RUN};
         if (list[i].flags & N_PROGRAM_MENU) menu[menu_n++] = a;
         if (list[i].flags & N_PROGRAM_DESKTOP) desk[desk_n++] = a;
     }
@@ -198,8 +173,6 @@ static void perform(const struct app *a) {
         if (r < 0) {
             char text[128];
             snprintf(text, sizeof text, "%s (%s)", a->name, n_result_text(r));
-            toast("Could not start program", text, TOAST_MS);
-            snprintf(text, sizeof text, "%s (%s)", a->path, n_result_text(r));
             toast(WORD(S_START_FAILED), text, TOAST_MS);
         }
         return;
@@ -250,7 +223,6 @@ static void icons_draw(struct desk *d) {
             memcpy(saved + (size_t)y * box.w, c->px + (size_t)(box.y + y) * c->pitch + box.x, (size_t)box.w * 4);
         art_icon(c, cell.x + (cell.w - 32) / 2, cell.y + 8, a->icon);
         const char *label = a->name;
-        const char *label = WORD(a->name == S_ABOUT ? S_ABOUT_SHORT : a->name);
         int tx = cell.x + (cell.w - gfx_text_width(label, FONT_SMALL)) / 2;
         gfx_text(c, tx + 1, cell.y + 49, label, RGB(0, 0, 0), TRANSPARENT, FONT_SMALL);
         gfx_text(c, tx, cell.y + 48, label, RGB(235, 235, 250), TRANSPARENT, FONT_SMALL);
@@ -531,7 +503,7 @@ static void menu_draw(void) {
         if (i == menu_first_power && b.y > MENU_HEAD) gfx_hline(c, b.x + 12, b.y - 1, MENU_W - 24, RGB(60, 56, 100));
         if (i == menu_sel) gfx_fill_round(c, b.x + 6, b.y + 1, MENU_W - 12, MENU_ITEM_H - 2, 6, RGB(76, 64, 150));
         art_icon(c, b.x + 12, b.y + 2, menu_items[i]->icon);
-        gfx_text(c, b.x + 54, b.y + 10, WORD(menu_items[i]->name), RGB(230, 230, 245), TRANSPARENT, FONT_SMALL);
+        gfx_text(c, b.x + 54, b.y + 10, app_name(menu_items[i]), RGB(230, 230, 245), TRANSPARENT, FONT_SMALL);
     }
     win_update(menu);
 }
@@ -665,10 +637,8 @@ static void volume_draw(void) {
     gfx_fill(c, 0, 0, VOLUME_W, VOLUME_H, TRANSPARENT);
     gfx_fill_round(c, 0, 0, VOLUME_W, VOLUME_H, 10, RGB(70, 60, 120));
     gfx_fill_round(c, 1, 1, VOLUME_W - 2, VOLUME_H - 2, 9, RGB(22, 20, 44));
-    gfx_text(c, 16, 12, "Volume", RGB(245, 245, 255), TRANSPARENT, FONT_SMALL);
-    const char *device = sound.device ? sound.device : "No sound device";
     gfx_text(c, 16, 12, WORD(S_VOLUME), RGB(245, 245, 255), TRANSPARENT, FONT_SMALL);
-    const char *device = sound.device[0] ? sound.device : WORD(S_NO_SOUND);
+    const char *device = sound.device ? sound.device : WORD(S_NO_SOUND);
     gfx_text(c, VOLUME_W - 16 - gfx_text_width(device, FONT_SMALL), 12, device, RGB(150, 150, 190), TRANSPARENT, FONT_SMALL);
     gfx_fill_round(c, m.x, m.y, m.w, m.h, 8, sound.muted ? RGB(90, 40, 60) : RGB(44, 38, 90));
     draw_speaker(c, m.x + m.w / 2 - 1, m.y + m.h / 2, sound.volume, sound.muted, RGB(235, 235, 250));
@@ -806,11 +776,8 @@ static void bar_event(const struct gui_event *e) {
         if (in_box(e->x, e->y, speaker_box(bar->w))) volume_wheel(e->wheel);
         break;
     case EV_HOTKEY:
-        if (e->key == 't' || e->key == 'T') {
-            n_result r = gui_launch(N_FOLDER_SYSTEM "\\term", NULL);
-            if (r < 0) toast("Could not start program", n_result_text(r), TOAST_MS);
         if (e->usage == N_USAGE_T) {
-            n_result r = gui_launch(SYSTEM "term", NULL);
+            n_result r = gui_launch(N_FOLDER_SYSTEM "\\term", NULL);
             if (r < 0) toast(WORD(S_START_FAILED), n_result_text(r), TOAST_MS);
         } else if (menu) {
             menu_close();
@@ -1111,6 +1078,7 @@ static void language_changed(void) {
     language = n_language_now();
     if (menu) menu_close();
     if (volume) volume_close();
+    programs_read();
     for (size_t i = 0; i < desk_count; i++)
         if (desks[i].win) desk_paint(&desks[i], i);
     bar_draw();

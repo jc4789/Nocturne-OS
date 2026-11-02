@@ -128,6 +128,8 @@ struct n_programs_request {
     uint32_t icon; /* enum n_icon */
     uint32_t flags;
     uint32_t type_bytes, name_bytes, path_bytes, argument_bytes;
+    uint32_t language; /* N_PROGRAMS_LIST：enum n_language。システムのプログラムの名前の言葉 */
+    uint32_t reserved;
 };
 struct n_programs_reply {
     int64_t result;

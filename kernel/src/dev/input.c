@@ -17,7 +17,6 @@
 #include "mm/heap.h"
 #include "sys/settings.h"
 
-#define NS_PER_MS 1000000ull
 
 static key_sink_t key_sink;     /* atomic */
 static mouse_sink_t mouse_sink; /* atomic */
@@ -45,9 +44,6 @@ static uint64_t last_input; /* atomic */
 
 uint64_t input_last_ns(void) { return __atomic_load_n(&last_input, __ATOMIC_RELAXED); }
 
-static void emit_key(uint16_t key, bool pressed, uint64_t at) {
-    __atomic_store_n(&last_input, clock_now_ns(), __ATOMIC_RELAXED);
-    struct key_event e = {key, __atomic_load_n(&mods, __ATOMIC_ACQUIRE), pressed, at};
 static const struct choice *choice_of(const char *id) {
     for (const struct choice *c = choices; c; c = c->next)
         if (!strcmp(c->device, id)) return c;
@@ -93,6 +89,7 @@ void input_device_remove(struct input_device *d) {
 /* ---- events ---- */
 
 static void emit_key(uint16_t usage, uint32_t text, bool pressed, uint32_t layout, uint64_t at) {
+    __atomic_store_n(&last_input, clock_now_ns(), __ATOMIC_RELAXED);
     struct key_event e = {.usage = usage, .mods = __atomic_load_n(&mods, __ATOMIC_ACQUIRE), .pressed = pressed,
                           .text = text, .layout = layout, .time_ns = at};
     key_sink_t sink = __atomic_load_n(&key_sink, __ATOMIC_ACQUIRE);
@@ -162,6 +159,7 @@ static int scale(int amount, bool accel, int quarters, int *rest) {
 
 void input_mouse(struct input_device *d, const struct mouse_event *e) {
     static const int quarters[5] = {2, 3, 4, 6, 8};
+    __atomic_store_n(&last_input, clock_now_ns(), __ATOMIC_RELAXED);
     struct mouse_event out = *e;
     if (!e->absolute) {
         bool accel = __atomic_load_n(&d->accel, __ATOMIC_RELAXED);
@@ -201,10 +199,6 @@ static bool all_same(const struct values *v) {
            v->repeat_delay_ms == N_INPUT_SAME && v->repeat_interval_ms == N_INPUT_SAME && v->layout == N_INPUT_SAME;
 }
 
-void input_mouse(const struct mouse_event *e) {
-    __atomic_store_n(&last_input, clock_now_ns(), __ATOMIC_RELAXED);
-    mouse_sink_t sink = __atomic_load_n(&mouse_sink, __ATOMIC_ACQUIRE);
-    if (sink) sink(e);
 static bool in_range(int32_t v, int32_t low, int32_t high) { return v == N_INPUT_SAME || (v >= low && v <= high); }
 
 int input_device_record_put(uint32_t key, const void *record, size_t length) {

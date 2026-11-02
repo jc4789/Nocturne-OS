@@ -46,13 +46,6 @@ void input_init(void);
    mutex, and keeps its own order with its own lock. One driver's events reach it in their order. */
 void input_set_sinks(key_sink_t k, mouse_sink_t m);
 bool input_mouse_present(void);
-/* For the keyboard and mouse drivers (USB, Hyper-V, a remote viewer), any context, any CPU,
-   without sleeping; `at` and e->time_ns as in the events above. input_key_set1 is one key of scan
-   code set 1 (sc with its release bit, extended when it came after 0xE0). */
-void input_key_set1(uint8_t sc, bool extended, uint64_t at);
-void input_unicode(uint16_t c, bool pressed, uint64_t at); /* a typed character, independent of layout */
-void input_mouse(const struct mouse_event *e);
-void input_mouse_attach(void);
 /* The monotonic time of the last key or pointer event; 0 before the first. Any context. */
 uint64_t input_last_ns(void);
 

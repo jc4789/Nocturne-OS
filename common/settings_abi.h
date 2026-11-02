@@ -102,7 +102,7 @@ enum n_setting_type {
     N_SETTING_ENDPOINT,     /* struct n_sockaddr（abi.h） */
     N_SETTING_MONITOR_MODE, /* struct n_setting_monitor_mode */
     N_SETTING_MONITOR_PLACE, /* struct n_setting_monitor_place */
-    N_SETTING_DEVICE        /* uint64_t：装置の番号（n_setting_device）。0 は無し */
+    N_SETTING_DEVICE,       /* uint64_t：装置の番号（n_setting_device）。0 は無し */
     N_SETTING_INPUT_DEVICE  /* 可変長：struct n_setting_input_device の記録（input_abi.h） */
 };
 

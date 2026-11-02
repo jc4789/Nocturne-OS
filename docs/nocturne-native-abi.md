@@ -1162,13 +1162,10 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   | `N_DOMAIN_DISPLAY` | `N_DISPLAY_HOLD_SECONDS` | `dev/pciuser.c` |
   | `N_DOMAIN_DISPLAY` | `N_DISPLAY_MODE`（試し）、`N_DISPLAY_PLACE`、`N_DISPLAY_SCALE`（試し）、`N_DISPLAY_PRIMARY` | サービス `display`（§9） |
   | `N_DOMAIN_WINDOW` | `N_WINDOW_SMOOTH_GRADIENTS` | `gui/wm.c` |
-  | `N_DOMAIN_INPUT` | `N_INPUT_POINTER_SPEED`（-2〜2） | `gui/wm.c` |
   | `N_DOMAIN_POWER` | `N_POWER_PERFORMANCE_PREFERENCE`（0〜255。AMD の CPPC、Intel の HWP へ渡す） | `arch/idle.c` |
   | `N_DOMAIN_POWER` | `N_POWER_BUTTON`、`N_POWER_LID`、`N_POWER_IDLE_MINUTES`、`N_POWER_IDLE_ANSWER`、`N_POWER_ALLOW_SLEEP`、`N_POWER_ALLOW_HIBERNATE`、`N_POWER_CLOSE_SECONDS`、`N_POWER_AGAIN_SECONDS` | サービス `machine`（§15） |
   | `N_DOMAIN_NETWORK` | `N_NETWORK_TCP_RX_BYTES`、`N_NETWORK_TCP_TX_BYTES` | `net/net.c` |
   | `N_DOMAIN_INPUT` | `N_INPUT_POINTER_SPEED`（-2〜2）、`N_INPUT_POINTER_ACCEL`、`N_INPUT_SCROLL_NATURAL`、`N_INPUT_DOUBLE_CLICK_MS`、`N_INPUT_REPEAT_DELAY_MS`、`N_INPUT_REPEAT_INTERVAL_MS`、`N_INPUT_LAYOUT`（`enum n_key_layout`）、`N_INPUT_DEVICE`（装置ごとの記録） | `dev/input.c` |
-  | `N_DOMAIN_POWER` | `N_POWER_PERFORMANCE_PREFERENCE`（0〜255） | `arch/idle.c` |
-  | `N_DOMAIN_NETWORK` | `N_NETWORK_DNS_SERVER`、`N_NETWORK_TCP_RX_BYTES`、`N_NETWORK_TCP_TX_BYTES` | `net/net.c` |
   | `N_DOMAIN_LANGUAGE` | `N_LANGUAGE_UI`、`N_LANGUAGE_REGION`、`N_LANGUAGE_DATE_ORDER`、`N_LANGUAGE_CLOCK`、`N_LANGUAGE_NUMBER`、`N_LANGUAGE_LOGIN` | カーネルに無い。`libc/language.c` が読む |
 
 - 装置ごとの値 `N_INPUT_DEVICE` は `N_SETTING_INPUT_DEVICE` の記録（`struct n_setting_input_device`、`N_SETTING_RECORDS`）。
@@ -1225,7 +1222,6 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   - `n_settings_watch(domain)`（`SYS_SETTINGS_WATCH`）：領域の今の値。
   - `n_power_events_watch(cap)`（`SYS_POWER_EVENTS_WATCH`、§15）：電源の事象。
   - `n_power_windows_watch(cap)`（`SYS_POWER_WINDOWS_WATCH`、§15）：アプリの窓の数と題。
-- 言語の一覧はシステムの状態ではない：読むプログラム（ブラウザー）の好みで、その持ち物である。
 - 言語と地域は領域 `N_DOMAIN_LANGUAGE` の利用者の値で、`nocturne_language.h`（`user/libc/language.c`）が読む。
   `n_locale_now`、`n_language_now`、`n_language_changed`、`n_locale_date`・`time`・`day`・`number`、`n_locale_weekday`・`month`。
   読むプログラムだけが見張りを一つ持ち、読むたびにサービスへ頼まない。文の表はプログラムごとに持つ

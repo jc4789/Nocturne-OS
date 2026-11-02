@@ -1,8 +1,6 @@
 /* 設定の宣言の表：カーネルの領域の鍵と、適用の無い鍵（N_APPLY_NONE）。適用の無い鍵は持ち主のサービスが
    見張りで読む。settingsd が読み、tests/check_settings.py が調べる。プログラムの鍵は、それぞれが
    N_SETTINGS_DECLARE で足す。 */
-/* 設定の宣言の表：カーネルの領域の鍵と、持ち主の無い時刻と言語の鍵。settingsd が読み、tests/check_settings.py
-   が調べる。ユーザー空間のサービスとプログラムの鍵は、それぞれが N_SETTINGS_DECLARE で足す。 */
 #pragma once
 #include "settings_abi.h"
 #include "abi.h"

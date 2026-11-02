@@ -21,38 +21,17 @@
 #define TOKEN_SOUND (TOKEN_SETTINGS + 2)
 #define TOKEN_SERVICES (TOKEN_SETTINGS + 3)
 #define TOKEN_NETWORK (TOKEN_SETTINGS + 4)
-
-enum page { P_AUDIO, P_DISPLAY, P_WINDOW, P_INPUT, P_POWER, P_NETWORK, P_TIME, P_BOOT, P_SERVICES, P_USERS, P_PROGRAMS, P_COUNT };
-#define TOKEN_INPUTS (TOKEN_SETTINGS + 4)
+#define TOKEN_INPUTS (TOKEN_SETTINGS + 5)
 
 static uint32_t language; /* enum n_language：見張りが今に保つ */
 #define WORD(w) settings_words[w][language]
 
-enum page { P_AUDIO, P_DISPLAY, P_WINDOW, P_INPUT, P_POWER, P_NETWORK, P_TIME, P_LANGUAGE, P_BOOT, P_SERVICES, P_USERS, P_COUNT };
+enum page { P_AUDIO, P_DISPLAY, P_WINDOW, P_INPUT, P_POWER, P_NETWORK, P_TIME, P_LANGUAGE, P_BOOT, P_SERVICES, P_USERS, P_PROGRAMS, P_COUNT };
 static const struct {
     enum settings_word label;
     const char *icon;
     uint32_t domain;
 } pages[P_COUNT] = {
-    [P_AUDIO] = {"音", "sound", N_DOMAIN_AUDIO},
-    [P_DISPLAY] = {"画面", "display", N_DOMAIN_DISPLAY},
-    [P_WINDOW] = {"窓", "settings", N_DOMAIN_WINDOW},
-    [P_INPUT] = {"入力", "mouse", N_DOMAIN_INPUT},
-    [P_POWER] = {"電源", "settings", N_DOMAIN_POWER},
-    [P_NETWORK] = {"網", "settings", N_DOMAIN_NETWORK},
-    [P_TIME] = {"時刻", "clock", N_DOMAIN_TIME},
-    [P_BOOT] = {"起動", "settings", N_DOMAIN_BOOT},
-    [P_SERVICES] = {"サービス", "settings", N_SETTING_ANY},
-    [P_USERS] = {"利用者", "settings", N_SETTING_ANY},
-    [P_PROGRAMS] = {"アプリ", "settings", N_SETTING_ANY},
-};
-
-enum act {
-    A_PAGE = 1, A_BOOL, A_NUMBER, A_ENUM, A_TEXT, A_SCREEN, A_SIZE, A_RATE, A_FORMAT, A_KEEP, A_BACK, A_SCALE, A_PLACE, A_MAIN,
-    A_SOUND_OUTPUT, A_SOUND_RATE, A_SOUND_BITS, A_SOUND_CHANNELS,
-    A_SERVICE_RESTART, A_SERVICE_STOP, A_USER_CLASS, A_NEW_NAME, A_NEW_PASSWORD, A_NEW_ADMIN, A_NEW_CREATE,
-    A_PROGRAM_CHOOSE, A_PROGRAM_REMOVE, A_PROGRAM_NAME, A_PROGRAM_PATH, A_PROGRAM_TYPES, A_PROGRAM_ADD,
-    A_LINK_IP, A_LINK_MASK, A_LINK_GATEWAY, A_LINK_FIXED, A_LINK_DHCP
     [P_AUDIO] = {W_P_AUDIO, "sound", N_DOMAIN_AUDIO},
     [P_DISPLAY] = {W_P_DISPLAY, "display", N_DOMAIN_DISPLAY},
     [P_WINDOW] = {W_P_WINDOW, "settings", N_DOMAIN_WINDOW},
@@ -64,11 +43,15 @@ enum act {
     [P_BOOT] = {W_P_BOOT, "settings", N_DOMAIN_BOOT},
     [P_SERVICES] = {W_P_SERVICES, "settings", N_SETTING_ANY},
     [P_USERS] = {W_P_USERS, "settings", N_SETTING_ANY},
+    [P_PROGRAMS] = {W_P_PROGRAMS, "settings", N_SETTING_ANY},
 };
 
 enum act {
-    A_PAGE = 1, A_BOOL, A_NUMBER, A_ENUM, A_TEXT, A_SCREEN, A_SIZE, A_RATE, A_KEEP, A_BACK,
+    A_PAGE = 1, A_BOOL, A_NUMBER, A_ENUM, A_TEXT, A_SCREEN, A_SIZE, A_RATE, A_FORMAT, A_KEEP, A_BACK, A_SCALE, A_PLACE, A_MAIN,
+    A_SOUND_OUTPUT, A_SOUND_RATE, A_SOUND_BITS, A_SOUND_CHANNELS,
     A_SERVICE_RESTART, A_SERVICE_STOP, A_USER_CLASS, A_NEW_NAME, A_NEW_PASSWORD, A_NEW_ADMIN, A_NEW_CREATE,
+    A_PROGRAM_CHOOSE, A_PROGRAM_REMOVE, A_PROGRAM_NAME, A_PROGRAM_PATH, A_PROGRAM_TYPES, A_PROGRAM_ADD,
+    A_LINK_IP, A_LINK_MASK, A_LINK_GATEWAY, A_LINK_FIXED, A_LINK_DHCP,
     A_DEVICE_OWN, A_DEVICE_LAYOUT, A_DEVICE_DELAY, A_DEVICE_INTERVAL, A_DEVICE_SPEED, A_DEVICE_ACCEL, A_DEVICE_NATURAL
 };
 struct action {
@@ -254,7 +237,7 @@ static void scale_try(void) {
     char *end;
     long v = strtol(scale_draft, &end, 10);
     if (end == scale_draft || *end || v < 0 || v > INT32_MAX) {
-        say("数を入れてください。", true);
+        say(WORD(W_NUMBER_PLEASE), true);
         return;
     }
     int32_t scale = (int32_t)v, before = (int32_t)screen.scale_percent;
@@ -431,11 +414,11 @@ static void network_load(void) {
 static void link_fixed_apply(struct link_view *v) {
     struct n_setting_ipv4 value = {0};
     if (!ip_parse(v->ip, &value.ip) || !ip_parse(v->mask, &value.mask) || (v->gateway[0] && !ip_parse(v->gateway, &value.gateway))) {
-        say("住所とマスクは a.b.c.d の形で入れてください。", true);
+        say(WORD(W_ADDRESS_FORM), true);
         return;
     }
     if (!value.ip || ~value.mask & (~value.mask + 1)) {
-        say("マスクは上の位から続く 1 の形で入れてください。", true);
+        say(WORD(W_MASK_FORM), true);
         return;
     }
     uint32_t reason = N_SETTING_OK;
@@ -771,8 +754,8 @@ static const char *screen_reason(void) {
 
 static const char *format_name(uint32_t format) {
     switch (format) {
-    case N_SCANOUT_XRGB2101010: return "10 ビット";
-    case N_SCANOUT_XRGB8888: case N_SCANOUT_XBGR8888: return "8 ビット";
+    case N_SCANOUT_XRGB2101010: return WORD(W_BITS_10);
+    case N_SCANOUT_XRGB8888: case N_SCANOUT_XBGR8888: return WORD(W_BITS_8);
     default: return "";
     }
 }
@@ -787,26 +770,26 @@ static void screens_card(struct ui_msg *m) {
         return;
     }
     for (uint32_t i = 0; i < n; i++) {
-        snprintf(labels[i], sizeof labels[i], "画面 %u", i + 1);
+        snprintf(labels[i], sizeof labels[i], WORD(W_SCREEN_N), i + 1);
         names[i] = labels[i];
     }
     ui_node(m, "card"); ui_num(m, "gap", 14); ui_str(m, "key", "screens");
-        text_node(m, "画面の選択", "heading", 0);
+        text_node(m, WORD(W_SCREEN_CHOICE), "heading", 0);
         act_at(ui_node(m, "segmented"), A_SCREEN, 0);
         ui_strs(m, "options", names, n);
         ui_num(m, "selected", screen_index);
         ui_end(m);
         char line[96];
-        snprintf(line, sizeof line, "デスクトップの中の (%d, %d) にあります。%s", screen.x, screen.y, screen.primary ? "主画面です。" : "");
+        snprintf(line, sizeof line, WORD(W_DESKTOP_AT), screen.x, screen.y, screen.primary ? WORD(W_IS_MAIN) : "");
         text_node(m, line, "caption", 0);
         if (!screen.primary) {
-            text_node(m, "主画面に対する位置", NULL, 0);
-            static const char *const where[] = {"左", "右", "上", "下"};
+            text_node(m, WORD(W_SCREEN_WHERE), NULL, 0);
+            const char *const where[] = {WORD(W_LEFT), WORD(W_RIGHT), WORD(W_ABOVE), WORD(W_BELOW)};
             ui_node(m, "row"); ui_num(m, "gap", 10);
             for (uint32_t i = 0; i < sizeof where / sizeof *where; i++) {
                 act_at(ui_node(m, "button"), A_PLACE, i); ui_str(m, "text", where[i]); ui_end(m);
             }
-            act_at(ui_node(m, "button"), A_MAIN, 0); ui_str(m, "text", "主画面にする"); ui_str(m, "variant", "primary"); ui_end(m);
+            act_at(ui_node(m, "button"), A_MAIN, 0); ui_str(m, "text", WORD(W_MAKE_MAIN)); ui_str(m, "variant", "primary"); ui_end(m);
             ui_end(m);
         }
     ui_end(m);
@@ -856,24 +839,24 @@ static void sound_choice(struct ui_msg *m, const char *title, enum act act, cons
 static void sound_cards(struct ui_msg *m) {
     const struct n_audio_output *now = sound_playing();
     ui_node(m, "card"); ui_num(m, "gap", 10); ui_str(m, "key", "sound-output");
-        text_node(m, "出口", "heading", 0);
-        if (!sound_bytes) text_node(m, "音の装置がありません。", "caption", 0);
+        text_node(m, WORD(W_OUTPUT), "heading", 0);
+        if (!sound_bytes) text_node(m, WORD(W_NO_SOUND), "caption", 0);
         else {
             act_at(ui_node(m, "item"), A_SOUND_OUTPUT, 0);
-            ui_str(m, "text", "自動（一番良いもの）"); ui_num(m, "selected", !sound_chosen || !sound_chosen[0]); ui_str(m, "key", "sound-auto");
+            ui_str(m, "text", WORD(W_AUTO_BEST)); ui_num(m, "selected", !sound_chosen || !sound_chosen[0]); ui_str(m, "key", "sound-auto");
             ui_end(m);
             uint32_t at = 1;
             SOUND_EACH(o) {
                 const struct n_audio_device *d = n_audio_output_device(o);
                 char line[160];
-                snprintf(line, sizeof line, "%s%s", n_audio_device_name(d), d->jack == N_AUDIO_JACK_EMPTY ? "（何も刺さっていません）" : !d->available ? "（使えません）" : "");
+                snprintf(line, sizeof line, "%s%s", n_audio_device_name(d), d->jack == N_AUDIO_JACK_EMPTY ? WORD(W_JACK_EMPTY) : !d->available ? WORD(W_UNAVAILABLE) : "");
                 act_at(ui_node(m, "item"), A_SOUND_OUTPUT, at++);
                 ui_str(m, "text", line); ui_num(m, "selected", sound_chosen && !strcmp(sound_chosen, n_audio_device_key(d)));
                 ui_str(m, "key", n_audio_device_key(d));
                 ui_end(m);
             }
             char line[160];
-            snprintf(line, sizeof line, now ? "%s で鳴らします。" : "鳴らす出口がありません。", now ? n_audio_device_name(n_audio_output_device(now)) : "");
+            snprintf(line, sizeof line, now ? WORD(W_PLAYS_ON) : WORD(W_NO_OUTPUT), now ? n_audio_device_name(n_audio_output_device(now)) : "");
             text_node(m, line, "caption", 0);
         }
     ui_end(m);
@@ -881,20 +864,20 @@ static void sound_cards(struct ui_msg *m) {
     const struct n_audio_device *d = n_audio_output_device(now);
     ui_node(m, "card"); ui_num(m, "gap", 10); ui_str(m, "key", "sound-format");
         char line[120];
-        snprintf(line, sizeof line, "形式：%u Hz、%u ビット、%u チャンネル", now->format.rate, now->format.bits, now->format.channels);
+        snprintf(line, sizeof line, WORD(W_FORMAT_LINE), now->format.rate, now->format.bits, now->format.channels);
         text_node(m, line, NULL, 0);
-        sound_choice(m, "周波数", A_SOUND_RATE, n_audio_device_rates(d), d->rate_count, now->format.rate, "Hz");
+        sound_choice(m, WORD(W_RATE), A_SOUND_RATE, n_audio_device_rates(d), d->rate_count, now->format.rate, "Hz");
         uint32_t *bits = malloc((d->size_count + 1) * sizeof *bits);
         if (bits) {
             for (uint32_t i = 0; i < d->size_count; i++) bits[i] = n_audio_device_sizes(d)[i].bits;
-            sound_choice(m, "標本の大きさ", A_SOUND_BITS, bits, d->size_count, now->format.bits, "ビット");
+            sound_choice(m, WORD(W_SAMPLE_SIZE), A_SOUND_BITS, bits, d->size_count, now->format.bits, WORD(W_BIT_UNIT));
             free(bits);
         }
         uint32_t span = d->channels_high - d->channels_low + 1;
         uint32_t *channels = malloc(span * sizeof *channels);
         if (channels) {
             for (uint32_t i = 0; i < span; i++) channels[i] = d->channels_low + i;
-            sound_choice(m, "チャンネル数", A_SOUND_CHANNELS, channels, span, now->format.channels, "ch");
+            sound_choice(m, WORD(W_CHANNELS), A_SOUND_CHANNELS, channels, span, now->format.channels, "ch");
             free(channels);
         }
     ui_end(m);
@@ -914,22 +897,6 @@ static void screen_card(struct ui_msg *m) {
     char line[96];
     const struct ui_theme *t = &ui_theme;
     if (screen_known && screen.screens > 1) screens_card(m);
-    if (screen_known && screen.screens > 1) {
-        ui_node(m, "card"); ui_num(m, "gap", 14);
-            text_node(m, WORD(W_SCREEN_CHOICE), "heading", 0);
-            const char *names[16];
-            char labels[16][24];
-            uint32_t n = screen.screens < 16 ? screen.screens : 16;
-            for (uint32_t i = 0; i < n; i++) {
-                snprintf(labels[i], sizeof labels[i], WORD(W_SCREEN_N), i + 1);
-                names[i] = labels[i];
-            }
-            act_at(ui_node(m, "segmented"), A_SCREEN, 0);
-            ui_strs(m, "options", names, n);
-            ui_num(m, "selected", screen_index);
-            ui_end(m);
-        ui_end(m);
-    }
     ui_node(m, "card"); ui_num(m, "gap", 14); ui_str(m, "key", "screen");
     if (!screen_known) {
         text_node(m, WORD(W_SCREEN_UNREADABLE), "caption", 0);
@@ -941,12 +908,11 @@ static void screen_card(struct ui_msg *m) {
     text_node(m, line, NULL, 0);
     bool listed = screen.source != SCREEN_SOURCE_REMOTE && screen.offered.count > 0;
     if (!listed || screen.source == SCREEN_SOURCE_HANDED_BACK) text_node(m, screen_reason(), "caption", 0);
-    if (screen.refused_serial && screen.refused_serial == screen.wish_serial - 1) text_node(m, "ドライバーが選んだモードを出せなかったので、次のものにしました。", "caption", t->warning);
+    if (screen.refused_serial && screen.refused_serial == screen.wish_serial - 1) text_node(m, WORD(W_MODE_REFUSED), "caption", t->warning);
     if (trial_ends_ns) {
         uint64_t now = n_clock_monotonic();
         uint32_t left = now < trial_ends_ns ? (uint32_t)((trial_ends_ns - now) / (1000 * N_NS_PER_MS)) + 1 : 0;
         char words[96];
-        snprintf(words, sizeof words, "このままにしますか。あと %u 秒で前へ戻ります。", left);
         snprintf(words, sizeof words, WORD(W_KEEP_ASK), left);
         ui_node(m, "card"); ui_num(m, "gap", 10); ui_num(m, "background", t->sidebar); ui_str(m, "key", "trial");
             text_node(m, words, "heading", 0);
@@ -985,7 +951,7 @@ static void screen_card(struct ui_msg *m) {
                         first = !same_size(&screen.offered.modes[j], mode) || screen.offered.modes[j].refresh_mhz != mode->refresh_mhz;
                     if (!first) continue;
                     snprintf(line, sizeof line, "%u.%02u Hz%s", mode->refresh_mhz / 1000, mode->refresh_mhz % 1000 / 10,
-                             mode->flags & N_SCREEN_MODE_VRR ? "（可変）" : "");
+                             mode->flags & N_SCREEN_MODE_VRR ? WORD(W_VARIABLE) : "");
                     act_at(ui_node(m, "item"), A_RATE, i);
                     ui_str(m, "text", line); ui_num(m, "selected", mode->refresh_mhz == marked->refresh_mhz); ui_str(m, "key", line);
                     ui_end(m);
@@ -1000,7 +966,7 @@ static void screen_card(struct ui_msg *m) {
             }
             if (formats) {
                 ui_node(m, "column"); ui_num(m, "grow", 1); ui_num(m, "gap", 6);
-                    text_node(m, "色の深さ", "caption", 0);
+                    text_node(m, WORD(W_COLOR_DEPTH), "caption", 0);
                     for (uint32_t i = 0; i < screen.offered.count; i++) {
                         const struct n_screen_mode *mode = &screen.offered.modes[i];
                         if (!same_size(mode, marked) || mode->refresh_mhz != marked->refresh_mhz) continue;
@@ -1015,8 +981,8 @@ static void screen_card(struct ui_msg *m) {
     }
     ui_end(m);
     ui_node(m, "card"); ui_num(m, "gap", 14); ui_str(m, "key", "scale");
-        text_node(m, "倍率（百分率）", "heading", 0);
-        text_node(m, "プログラムへ知らせる値です。描く大きさはまだ変わりません。100 が等倍です。", "caption", 0);
+        text_node(m, WORD(W_SCALE), "heading", 0);
+        text_node(m, WORD(W_SCALE_ABOUT), "caption", 0);
         act_at(ui_node(m, "field"), A_SCALE, 0);
         ui_str(m, "value", scale_draft); ui_str(m, "width", "fill");
         ui_end(m);
@@ -1025,10 +991,10 @@ static void screen_card(struct ui_msg *m) {
 
 static const char *link_state_text(uint32_t state) {
     switch (state) {
-    case N_LINK_ABSENT: return "装置がありません";
-    case N_LINK_SEARCHING: return "DHCP の答えを待っています";
-    case N_LINK_LEASED: return "DHCP の住所を使っています";
-    case N_LINK_FIXED: return "固定の住所を使っています";
+    case N_LINK_ABSENT: return WORD(W_LINK_ABSENT);
+    case N_LINK_SEARCHING: return WORD(W_LINK_SEARCHING);
+    case N_LINK_LEASED: return WORD(W_LINK_LEASED);
+    case N_LINK_FIXED: return WORD(W_LINK_FIXED);
     default: return "";
     }
 }
@@ -1055,14 +1021,14 @@ static void link_card(struct ui_msg *m, uint32_t index) {
     snprintf(key, sizeof key, "adapter %u", (unsigned)v->adapter.id);
     ui_node(m, "card"); ui_num(m, "gap", 10); ui_str(m, "key", key);
         text_node(m, line, "heading", 0);
-        text_node(m, record ? link_state_text(record->state) : v->adapter.present ? "サービス network に届きません" : link_state_text(N_LINK_ABSENT), "caption", 0);
+        text_node(m, record ? link_state_text(record->state) : v->adapter.present ? WORD(W_NO_NETWORK_SERVICE) : link_state_text(N_LINK_ABSENT), "caption", 0);
         if (v->adapter.ip) {
-            snprintf(line, sizeof line, "住所 %s  マスク %s", ip_format(v->adapter.ip, text), ip_format(v->adapter.mask, text2));
+            snprintf(line, sizeof line, WORD(W_ADDRESS_LINE), ip_format(v->adapter.ip, text), ip_format(v->adapter.mask, text2));
             text_node(m, line, "caption", 0);
         }
         if (record) {
             if (record->gateway) {
-                snprintf(line, sizeof line, "ゲートウェイ %s", ip_format(record->gateway, text));
+                snprintf(line, sizeof line, WORD(W_GATEWAY_LINE), ip_format(record->gateway, text));
                 text_node(m, line, "caption", 0);
             }
             const uint32_t *addresses = n_network_link_addresses(record);
@@ -1075,18 +1041,18 @@ static void link_card(struct ui_msg *m, uint32_t index) {
                 text_node(m, line, "caption", 0);
             }
             if (record->state == N_LINK_LEASED && record->lease_seconds) {
-                snprintf(line, sizeof line, "借りた住所の残り %u 秒", (unsigned)record->lease_seconds);
+                snprintf(line, sizeof line, WORD(W_LEASE_LEFT), (unsigned)record->lease_seconds);
                 text_node(m, line, "caption", 0);
             }
         }
         ui_node(m, "row"); ui_num(m, "gap", 10);
-            link_field(m, "固定の住所", v->ip, A_LINK_IP, index);
-            link_field(m, "マスク", v->mask, A_LINK_MASK, index);
-            link_field(m, "ゲートウェイ", v->gateway, A_LINK_GATEWAY, index);
+            link_field(m, WORD(W_FIXED_ADDRESS), v->ip, A_LINK_IP, index);
+            link_field(m, WORD(W_MASK), v->mask, A_LINK_MASK, index);
+            link_field(m, WORD(W_GATEWAY), v->gateway, A_LINK_GATEWAY, index);
         ui_end(m);
         ui_node(m, "row"); ui_num(m, "gap", 10);
-            act_at(ui_node(m, "button"), A_LINK_FIXED, index); ui_str(m, "text", "固定の住所を使う"); ui_end(m);
-            act_at(ui_node(m, "button"), A_LINK_DHCP, index); ui_str(m, "text", "DHCP を使う"); ui_end(m);
+            act_at(ui_node(m, "button"), A_LINK_FIXED, index); ui_str(m, "text", WORD(W_USE_FIXED)); ui_end(m);
+            act_at(ui_node(m, "button"), A_LINK_DHCP, index); ui_str(m, "text", WORD(W_USE_DHCP)); ui_end(m);
         ui_end(m);
     ui_end(m);
 }
@@ -1209,7 +1175,7 @@ static void text_keep(char **field, const char *text) {
 
 static void program_add(void) {
     if (!program_name_text || !*program_name_text || !program_path_text || !*program_path_text) {
-        say("名前とパスを入れてください。", true);
+        say(WORD(W_NAME_PATH_PLEASE), true);
         return;
     }
     n_result id = n_program_register(program_name_text, program_path_text, NULL, N_ICON_GENERIC, N_PROGRAM_MENU);
@@ -1234,7 +1200,7 @@ static void programs_page(struct ui_msg *m) {
     while (group < total && !strcmp(claim_list[group].type, N_PROGRAM_ANY_TYPE)) group++;
     uint32_t *ids = malloc((total + 1) * sizeof *ids);
     const char **names = malloc((total + 1) * sizeof *names);
-    text_node(m, "文書の種類ごとの既定", "heading", 0);
+    text_node(m, WORD(W_TYPE_DEFAULTS), "heading", 0);
     while (ids && names && group < total) {
         size_t end = type_end(group), n = type_candidates(group, end, ids);
         uint32_t selected = 0;
@@ -1259,7 +1225,7 @@ static void programs_page(struct ui_msg *m) {
     }
     free(ids);
     free(names);
-    text_node(m, "登録したプログラム", "heading", 0);
+    text_node(m, WORD(W_REGISTERED), "heading", 0);
     for (n_result i = 0; i < program_total; i++) {
         const struct n_program *p = &program_list[i];
         if (p->flags & N_PROGRAM_SYSTEM) continue;
@@ -1269,22 +1235,22 @@ static void programs_page(struct ui_msg *m) {
                     text_node(m, p->name, "heading", 0);
                     text_node(m, p->path, "caption", 0);
                 ui_end(m);
-                act_at(ui_node(m, "button"), A_PROGRAM_REMOVE, (uint32_t)i); ui_str(m, "text", "消す"); ui_end(m);
+                act_at(ui_node(m, "button"), A_PROGRAM_REMOVE, (uint32_t)i); ui_str(m, "text", WORD(W_REMOVE)); ui_end(m);
             ui_end(m);
         ui_end(m);
     }
     ui_node(m, "card"); ui_num(m, "gap", 10); ui_str(m, "key", "new program");
-        text_node(m, "プログラムを足す", "heading", 0);
+        text_node(m, WORD(W_ADD_PROGRAM), "heading", 0);
         act_at(ui_node(m, "field"), A_PROGRAM_NAME, 0);
-        ui_str(m, "value", program_name_text ? program_name_text : ""); ui_str(m, "placeholder", "名前"); ui_str(m, "width", "fill");
+        ui_str(m, "value", program_name_text ? program_name_text : ""); ui_str(m, "placeholder", WORD(W_NAME)); ui_str(m, "width", "fill");
         ui_end(m);
         act_at(ui_node(m, "field"), A_PROGRAM_PATH, 0);
-        ui_str(m, "value", program_path_text ? program_path_text : ""); ui_str(m, "placeholder", "C:\\Programs の中のパス"); ui_str(m, "width", "fill");
+        ui_str(m, "value", program_path_text ? program_path_text : ""); ui_str(m, "placeholder", WORD(W_PROGRAMS_PATH)); ui_str(m, "width", "fill");
         ui_end(m);
         act_at(ui_node(m, "field"), A_PROGRAM_TYPES, 0);
-        ui_str(m, "value", program_types_text ? program_types_text : ""); ui_str(m, "placeholder", "開ける種類（空白で区切る）"); ui_str(m, "width", "fill");
+        ui_str(m, "value", program_types_text ? program_types_text : ""); ui_str(m, "placeholder", WORD(W_OPENS_TYPES)); ui_str(m, "width", "fill");
         ui_end(m);
-        act_at(ui_node(m, "button"), A_PROGRAM_ADD, 0); ui_str(m, "text", "足す"); ui_str(m, "variant", "primary"); ui_end(m);
+        act_at(ui_node(m, "button"), A_PROGRAM_ADD, 0); ui_str(m, "text", WORD(W_ADD)); ui_str(m, "variant", "primary"); ui_end(m);
     ui_end(m);
 }
 
@@ -1319,12 +1285,8 @@ static void show(struct ui_session *ui) {
                 else {
                     if (page == P_DISPLAY) screen_card(&m);
                     if (page == P_NETWORK) {
-                        if (!link_view_count) text_node(&m, "網の装置がありません。", "caption", 0);
+                        if (!link_view_count) text_node(&m, WORD(W_NO_ADAPTER), "caption", 0);
                         for (uint32_t i = 0; i < link_view_count; i++) link_card(&m, i);
-                    if (page == P_AUDIO) {
-                        char line[80];
-                        snprintf(line, sizeof line, sound.device[0] ? WORD(W_PLAYS_ON) : WORD(W_NO_SOUND), sound.device);
-                        text_node(&m, line, "caption", 0);
                     }
                     if (page == P_AUDIO) sound_cards(&m);
                     for (size_t i = 0; i < shown_count; i++)
@@ -1350,7 +1312,6 @@ static void page_open(enum page p) {
     if (p == P_DISPLAY) screen_read();
     if (p == P_AUDIO) sound_read();
     if (p == P_NETWORK) network_load();
-    if (p == P_AUDIO) n_audio_output(&sound);
     if (p == P_INPUT) inputs_read();
 }
 
@@ -1592,21 +1553,16 @@ int main(void) {
                 struct n_settings_changed c;
                 while (n_setting_watch_take(settings_watch, &c) >= 0) {
                     shown_changed(&c);
+                    if (c.id.domain == N_DOMAIN_LANGUAGE) language = n_language_now();
                     if (c.id.domain == N_DOMAIN_DISPLAY) {
                         if (c.id.key == N_DISPLAY_MODE || c.id.key == N_DISPLAY_SCALE) {
                             if (c.what == N_SETTING_ON_TRIAL) {
                                 trial_id = c.id;
                                 trial_ends_ns = n_clock_after((uint64_t)c.remaining_ms * N_NS_PER_MS);
                             } else {
-                                if (c.what == N_SETTING_REVERTED && trial_ends_ns) say("前へ戻りました。", false);
+                                if (c.what == N_SETTING_REVERTED && trial_ends_ns) say(WORD(W_MODE_BACK), false);
                                 trial_ends_ns = 0;
                             }
-                    if (c.id.domain == N_DOMAIN_LANGUAGE) language = n_language_now();
-                    if (c.id.domain == N_DOMAIN_DISPLAY && c.id.key == N_DISPLAY_MODE) {
-                        if (c.what == N_SETTING_ON_TRIAL) trial_ends_ns = n_clock_after((uint64_t)c.remaining_ms * N_NS_PER_MS);
-                        else {
-                            if (c.what == N_SETTING_REVERTED && trial_ends_ns) say(WORD(W_MODE_BACK), false);
-                            trial_ends_ns = 0;
                         }
                         screen_read();
                     }

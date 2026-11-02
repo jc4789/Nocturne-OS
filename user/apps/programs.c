@@ -18,30 +18,31 @@
 #define SHOWN (N_PROGRAM_MENU | N_PROGRAM_DESKTOP)
 
 static const struct {
-    const char *name, *path, *argument;
+    const char *name[N_LANGUAGE_COUNT]; /* enum n_language の順 */
+    const char *path, *argument;
     uint32_t icon, flags;
     const char *const *types;
 } system_programs[] = {
-    {"Terminal", SYSTEM "term", "", N_ICON_TERMINAL, SHOWN, NULL},
-    {"Files", SYSTEM "files", "", N_ICON_FILES, SHOWN, NULL},
-    {"Web Browser", PROGRAMS "Browser\\browser", "", N_ICON_NET, SHOWN, TYPES("html", "htm")},
-    {"Text Editor", PROGRAMS "Notepad\\notepad", "", N_ICON_EDITOR, SHOWN, TYPES(N_PROGRAM_ANY_TYPE, "txt", "sh")},
-    {"Paint", PROGRAMS "Paint\\paint", "", N_ICON_PAINT, SHOWN, TYPES("ppm")},
-    {"Calculator", PROGRAMS "Calculator\\calc", "", N_ICON_CALC, N_PROGRAM_MENU, NULL},
-    {"Clock", PROGRAMS "Clock\\clock", "", N_ICON_CLOCK, N_PROGRAM_MENU, NULL},
-    {"System Monitor", SYSTEM "sysmon", "", N_ICON_MONITOR, N_PROGRAM_MENU, NULL},
-    {"Piano", PROGRAMS "Piano\\piano", "", N_ICON_PIANO, SHOWN, NULL},
-    {"Sound Player", PROGRAMS "Player\\player", "", N_ICON_SOUND, SHOWN, TYPES("wav")},
-    {"Media Player", PROGRAMS "Media Player\\mediaplayer", "", N_ICON_SOUND, 0,
+    {{"端末", "Terminal"}, SYSTEM "term", "", N_ICON_TERMINAL, SHOWN, NULL},
+    {{"ファイル", "Files"}, SYSTEM "files", "", N_ICON_FILES, SHOWN, NULL},
+    {{"ブラウザー", "Web Browser"}, PROGRAMS "Browser\\browser", "", N_ICON_NET, SHOWN, TYPES("html", "htm")},
+    {{"メモ帳", "Text Editor"}, PROGRAMS "Notepad\\notepad", "", N_ICON_EDITOR, SHOWN, TYPES(N_PROGRAM_ANY_TYPE, "txt", "sh")},
+    {{"ペイント", "Paint"}, PROGRAMS "Paint\\paint", "", N_ICON_PAINT, SHOWN, TYPES("ppm")},
+    {{"電卓", "Calculator"}, PROGRAMS "Calculator\\calc", "", N_ICON_CALC, N_PROGRAM_MENU, NULL},
+    {{"時計", "Clock"}, PROGRAMS "Clock\\clock", "", N_ICON_CLOCK, N_PROGRAM_MENU, NULL},
+    {{"状況", "System Monitor"}, SYSTEM "sysmon", "", N_ICON_MONITOR, N_PROGRAM_MENU, NULL},
+    {{"ピアノ", "Piano"}, PROGRAMS "Piano\\piano", "", N_ICON_PIANO, SHOWN, NULL},
+    {{"音楽", "Sound Player"}, PROGRAMS "Player\\player", "", N_ICON_SOUND, SHOWN, TYPES("wav")},
+    {{"メディアプレーヤー", "Media Player"}, PROGRAMS "Media Player\\mediaplayer", "", N_ICON_SOUND, 0,
      TYPES("wav", "mp3", "flac", "aac", "m4a", "ogg", "oga", "opus", "mp4", "avi", "mov")},
-    {"Snake", PROGRAMS "Snake\\snake", "", N_ICON_SNAKE, SHOWN, NULL},
-    {"Tetris", PROGRAMS "Tetris\\tetris", "", N_ICON_TETRIS, N_PROGRAM_MENU, NULL},
-    {"Minesweeper", PROGRAMS "Minesweeper\\mines", "", N_ICON_MINES, N_PROGRAM_MENU, NULL},
-    {"Mandelbrot", PROGRAMS "Mandelbrot\\mandel", "", N_ICON_FRACTAL, SHOWN, NULL},
-    {"3D Cube", PROGRAMS "Cube\\cube", "", N_ICON_CUBE, SHOWN, NULL},
-    {"Game of Life", PROGRAMS "Life\\life", "", N_ICON_LIFE, N_PROGRAM_MENU, NULL},
-    {"Settings", SYSTEM "settings", "", N_ICON_SETTINGS, SHOWN, NULL},
-    {"About", SYSTEM "js", SYSTEM "about.js", N_ICON_ABOUT, SHOWN, NULL},
+    {{"スネーク", "Snake"}, PROGRAMS "Snake\\snake", "", N_ICON_SNAKE, SHOWN, NULL},
+    {{"テトリス", "Tetris"}, PROGRAMS "Tetris\\tetris", "", N_ICON_TETRIS, N_PROGRAM_MENU, NULL},
+    {{"地雷", "Minesweeper"}, PROGRAMS "Minesweeper\\mines", "", N_ICON_MINES, N_PROGRAM_MENU, NULL},
+    {{"フラクタル", "Mandelbrot"}, PROGRAMS "Mandelbrot\\mandel", "", N_ICON_FRACTAL, SHOWN, NULL},
+    {{"立方体", "3D Cube"}, PROGRAMS "Cube\\cube", "", N_ICON_CUBE, SHOWN, NULL},
+    {{"ライフ", "Game of Life"}, PROGRAMS "Life\\life", "", N_ICON_LIFE, N_PROGRAM_MENU, NULL},
+    {{"設定", "Settings"}, SYSTEM "settings", "", N_ICON_SETTINGS, SHOWN, NULL},
+    {{"情報", "About"}, SYSTEM "js", SYSTEM "about.js", N_ICON_ABOUT, SHOWN, NULL},
 };
 #define SYSTEM_PROGRAMS (sizeof system_programs / sizeof *system_programs)
 #define REGISTERED_FIRST ((uint32_t)SYSTEM_PROGRAMS + 1) /* 登録の番号は続きから。消しても使い回さない。 */
@@ -261,7 +262,7 @@ static n_result system_load(void) {
         if (!on_medium(system_programs[i].path)) continue;
         size_t bytes;
         struct n_program_head *m = message_make((uint32_t)i + 1, system_programs[i].icon, system_programs[i].flags | N_PROGRAM_SYSTEM,
-                                                system_programs[i].name, system_programs[i].path, system_programs[i].argument, &bytes);
+                                                system_programs[i].name[0], system_programs[i].path, system_programs[i].argument, &bytes);
         if (!m) return -N_ERR_NO_MEMORY;
         n_result r = program_add(m, bytes);
         free(m);
@@ -409,14 +410,29 @@ static n_result program_choose(uint32_t user, uint32_t id, const char *type) {
 }
 
 /* 応答の中身：全部のプログラムの一通を並べる。 */
-static n_result list_pack(char **out, size_t *out_bytes, uint32_t *count) {
+/* その言語の名前。システムのプログラムは表に言語ごとの名前があり、登録したものは登録した名前のまま。 */
+static const char *program_name(const struct program *p, uint32_t language) {
+    if (p->id >= 1 && p->id <= SYSTEM_PROGRAMS && language < N_LANGUAGE_COUNT) return system_programs[p->id - 1].name[language];
+    return (const char *)(p->message + 1);
+}
+
+static n_result list_pack(uint32_t language, char **out, size_t *out_bytes, uint32_t *count) {
     size_t total = 0;
-    for (size_t i = 0; i < program_count; i++) total += programs[i].bytes;
+    for (size_t i = 0; i < program_count; i++)
+        total += programs[i].bytes - programs[i].message->name_bytes + strlen(program_name(&programs[i], language)) + 1;
     char *all = malloc(total ? total : 1), *at = all;
     if (!all) return -N_ERR_NO_MEMORY;
     for (size_t i = 0; i < program_count; i++) {
-        memcpy(at, programs[i].message, programs[i].bytes);
-        at += programs[i].bytes;
+        struct n_program_head head = *programs[i].message;
+        const char *name = program_name(&programs[i], language), *rest = (const char *)(programs[i].message + 1) + head.name_bytes;
+        size_t rest_bytes = head.path_bytes + head.argument_bytes;
+        head.name_bytes = (uint32_t)strlen(name) + 1;
+        memcpy(at, &head, sizeof head);
+        at += sizeof head;
+        memcpy(at, name, head.name_bytes);
+        at += head.name_bytes;
+        memcpy(at, rest, rest_bytes);
+        at += rest_bytes;
     }
     *out = all;
     *out_bytes = total;
@@ -452,7 +468,7 @@ static void request_serve(const struct n_programs_request *q, const struct reque
                           struct n_programs_reply *reply, char **body, size_t *body_bytes) {
     bool admin = peer->cls >= N_CLASS_ADMIN;
     switch (q->op) {
-    case N_PROGRAMS_LIST: reply->result = list_pack(body, body_bytes, &reply->count); break;
+    case N_PROGRAMS_LIST: reply->result = list_pack(q->language, body, body_bytes, &reply->count); break;
     case N_PROGRAMS_CLAIMS: reply->result = claims_pack(peer->user, body, body_bytes, &reply->count); break;
     case N_PROGRAMS_FOR_TYPE: {
         struct program *p = type_valid(t->type) ? program_for(peer->user, t->type) : NULL;

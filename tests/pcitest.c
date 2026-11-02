@@ -10,6 +10,7 @@
 #include <stdatomic.h>
 #include <limits.h>
 #include "nocturne.h"
+#include "nocturne_settings.h"
 #include "display.h"
 
 static int failed;

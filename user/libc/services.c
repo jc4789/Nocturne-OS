@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne_services.h"
+#include "nocturne_language.h"
 
 n_handle n_store_private_open(n_handle cap, uint32_t region, uint32_t user, int access) {
     return (n_handle)__syscall(SYS_STORE_PRIVATE_OPEN, cap, region, user, access, 0);
@@ -189,7 +190,7 @@ bad:
 }
 
 n_result n_programs_list(struct n_program **out) {
-    struct n_programs_request q = {.op = N_PROGRAMS_LIST};
+    struct n_programs_request q = {.op = N_PROGRAMS_LIST, .language = n_language_now()};
     struct n_programs_reply reply;
     char *body;
     size_t bytes;

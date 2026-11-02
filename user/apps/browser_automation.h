@@ -33,7 +33,7 @@ static uint32_t automation_mods(const struct automation_device *d) {
 static const char *automation_key(uint32_t raw, uint32_t *key, unsigned *modifier) {
     *key = 0; *modifier = 0;
     if (raw >= 0xE000 && raw <= 0xE05D) {
-        static const uint16_t named[0x5E] = {
+        static const uint32_t named[0x5E] = {
             [0x03] = NKEY_BACKSPACE, [0x04] = NKEY_TAB, [0x06] = NKEY_ENTER, [0x07] = NKEY_ENTER,
             [0x0C] = NKEY_ESC, [0x0D] = ' ', [0x0E] = NKEY_PGUP, [0x0F] = NKEY_PGDN,
             [0x10] = NKEY_END, [0x11] = NKEY_HOME, [0x12] = NKEY_LEFT, [0x13] = NKEY_UP,

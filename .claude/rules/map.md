@@ -31,12 +31,9 @@
 | `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console と system log の stream、profiler。 |
 | `sys/settings.c` | 設定の門。領域と鍵の番号の表で持ち主へ渡す（`SYS_SETTINGS_*`、番号は `common/settings_abi.h`）。カーネルは保存しない。 |
 | `fs/` | C: の store の実行側。mount とパスの操作とパスの権限は `store.c`、開いた文書と私的な領域は `document.c`、block cache は `cache.c`、変更の watch は `watch.c`、起動の記録 `settings.rec` は `bootrecord.c`。書式のエンジンは `common/store/`。 |
-| `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音の出口（`audio` が一覧と一つの open、`hda`・`hda_codec` が High Definition Audio。混合と選択はサービス `audio`）、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（USB HID）、`serial`、`refclock`（HPET か ACPI PM timer と、RTC）、電源と hibernate。 |
+| `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音の出口（`audio` が一覧と一つの open、`hda`・`hda_codec` が High Definition Audio。混合と選択はサービス `audio`）、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（`input` が装置の一覧と装置ごとの値、速さと向きの適用。`usbhid` は HID の usage を渡す）、`serial`、`refclock`（HPET か ACPI PM timer と、RTC）、電源と hibernate。 |
 | `net/` | `net.c`（Ethernet から IP、UDP、TCP まで。adapter の一覧と経路の表）と `rtl8125.c`（実機の NIC）。住所の決め方と名前引きはサービス `network`。 |
 | `gui/` | `wm.c`（窓管理、画面ごとの合成のスレッド、シェルの口 `SYS_SHELL_*`、画面の配置の適用 `SYS_SCREEN_ARRANGE`）、`pointer.c`（ポインターの絵）、`screenmode.c`（画面ごとのモードの一覧と望みを運ぶ。選ばない）。文を言わず、タスクバーも壁紙も持たない。 |
-| `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音（`audio` が流れ・混合・出口の選択、`hda`・`hda_codec` が High Definition Audio）、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（`input` が装置の一覧と装置ごとの値、速さと向きの適用。`usbhid` は HID の usage を渡す）、`serial`、`refclock`（HPET か ACPI PM timer と、RTC）、電源と hibernate。 |
-| `net/` | `net.c`（Ethernet から TCP・DHCP・DNS まで）と `rtl8125.c`（実機の NIC）。 |
-| `gui/` | `wm.c`（窓管理、画面ごとの合成のスレッド、シェルの口 `SYS_SHELL_*`）、`pointer.c`（ポインターの絵）、`screenmode.c`（画面ごとのモードの選択）。文を言わず、タスクバーも壁紙も持たない。 |
 | `vm/` | VM だけの処理。下の「境界」を見る。 |
 
 ## 共有 `common/`
@@ -68,8 +65,7 @@
 | `apps/network.c`・`apps/timesync.c` | サービス `network`（DHCP、固定の住所、経路、名前引きと cache）とサービス `timesync`（SNTP、時計と RTC）。 |
 | `apps/settingsd.c`・`settings_table.h` | サービス `settings`：選択の保存、宣言の表、型と範囲と権限の確かめ、見張り、期限つきの試し。領域の意味を持たない。 |
 | `apps/audio.c` | サービス `audio`：出口と形式の選択、流れの変換と混合、音量、消音。流れの口は `libc/audio.c`。 |
-| `apps/settings.c` | 設定の窓。宣言の表から頁を組む。音、画面、窓、入力、電源、網、時刻、サービス、利用者。 |
-| `apps/settings.c` | 設定の窓。宣言の表から頁を組む。音、画面、窓、入力（つながっている装置ごとの札）、電源、網、時刻、言語と地域、起動、サービス、利用者。 |
+| `apps/settings.c` | 設定の窓。宣言の表から頁を組む。音、画面、窓、入力（つながっている装置ごとの札）、電源、網、時刻、言語と地域、起動、サービス、利用者、アプリ。 |
 | `libc/keymap.c` | 文字の持ち主。`n_key_translate` が HID の usage と配列から文字か `NKEY_*` を作る。`win_event` が呼ぶ。配列の表はここだけ。 |
 | `libc/language.c`・`include/nocturne_language.h` | 言語と地域の読み手と書式（`n_locale_*`）、ISO C の `setlocale`・`localeconv`。値は領域 `N_DOMAIN_LANGUAGE`。 |
 | `apps/shell_words.h`・`apps/settings_words.h` | シェルと設定の窓の文の表。行は `enum n_language` の順。 |
@@ -161,7 +157,5 @@ user/libc/sys.c の SYSCALL
 ## 記録と道具
 
 - `docs/browser/LEDGER.md` と `docs/nvidia/LEDGER.md` は過去の記録。
-- `.claude/oboegaki.md` はファイルに結び付けた覚え書き。触れる前に対象のパスで引く。
-- `.claude/ban/` は会話ごとの盤。`.claude/hooks/ban.py` が見せる。
 - codegraph の設定は `codegraph.json`、起動は `.mcp.json`。`SYS_*` の番号での呼出しと、表からの呼出しは索引に出ない。
 - `scripts/hv-*.ps1` と根の `hyperv.ps1` は Hyper-V の道具。Hyper-V はユーザーの担当。

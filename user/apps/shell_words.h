@@ -3,8 +3,6 @@
 #include "settings_abi.h"
 
 enum shell_word {
-    S_TERMINAL, S_FILES, S_BROWSER, S_EDITOR, S_PAINT, S_CALCULATOR, S_CLOCK, S_MONITOR, S_PIANO, S_PLAYER, S_SNAKE,
-    S_TETRIS, S_MINES, S_MANDEL, S_CUBE, S_LIFE, S_SETTINGS, S_ABOUT, S_ABOUT_SHORT,
     S_SLEEP, S_HIBERNATE, S_LOGOUT, S_RESTART, S_SHUT_DOWN,
     S_START_FAILED, S_POWER_FAILED, S_VOLUME_FAILED, S_VOLUME, S_NO_SOUND, S_LOGOUT_FAILED, S_LOGOUT_CANCELLED,
     S_WAIT_RESTART, S_WAIT_SHUT_DOWN, S_FORCE, S_RESTART_CANCELLED, S_SHUT_DOWN_CANCELLED, S_RESTARTING, S_SHUTTING_DOWN,
@@ -16,25 +14,6 @@ enum shell_word {
 };
 
 static const char *const shell_words[][N_LANGUAGE_COUNT] = {
-    [S_TERMINAL] = {"端末", "Terminal"},
-    [S_FILES] = {"ファイル", "Files"},
-    [S_BROWSER] = {"ブラウザー", "Web Browser"},
-    [S_EDITOR] = {"メモ帳", "Text Editor"},
-    [S_PAINT] = {"ペイント", "Paint"},
-    [S_CALCULATOR] = {"電卓", "Calculator"},
-    [S_CLOCK] = {"時計", "Clock"},
-    [S_MONITOR] = {"状況", "System Monitor"},
-    [S_PIANO] = {"ピアノ", "Piano"},
-    [S_PLAYER] = {"音楽", "Sound Player"},
-    [S_SNAKE] = {"スネーク", "Snake"},
-    [S_TETRIS] = {"テトリス", "Tetris"},
-    [S_MINES] = {"地雷", "Minesweeper"},
-    [S_MANDEL] = {"フラクタル", "Mandelbrot"},
-    [S_CUBE] = {"立方体", "3D Cube"},
-    [S_LIFE] = {"ライフ", "Game of Life"},
-    [S_SETTINGS] = {"設定", "Settings"},
-    [S_ABOUT] = {"Nocturne について", "About Nocturne"},
-    [S_ABOUT_SHORT] = {"情報", "About"},
     [S_SLEEP] = {"スリープ", "Sleep"},
     [S_HIBERNATE] = {"休止", "Hibernate"},
     [S_LOGOUT] = {"ログアウト", "Log Out"},

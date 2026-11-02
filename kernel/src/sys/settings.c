@@ -16,9 +16,7 @@ struct setting {
     setting_get get;
 };
 
-#define SIZE_OF(type) ((type) == N_SETTING_ENDPOINT ? sizeof(struct n_sockaddr) : sizeof(int32_t))
 #define SIZE_OF(type) ((type) == N_SETTING_ENDPOINT ? sizeof(struct n_sockaddr) \
-                       : (type) == N_SETTING_MONITOR_MODE ? sizeof(struct n_setting_monitor_mode) \
                        : (type) == N_SETTING_INPUT_DEVICE ? 0 : sizeof(int32_t))
 
 static const struct setting settings[] = {
