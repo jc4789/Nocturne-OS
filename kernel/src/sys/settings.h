@@ -24,13 +24,6 @@ void settings_test_flags(void);
 /* What SYS_SETTINGS_EFFECTIVE reports of the domain changed, whoever changed it. Any CPU, any
    context: as watched_changed (sys/watch.h). */
 void settings_changed(enum n_setting_domain domain);
-/* The kernel's own hearer of a domain (what draws the taskbar): called from settings_changed, on
-   the changer's thread, without its locks. The struct stays for good. */
-struct settings_hearer {
-    void (*changed)(void);
-    struct settings_hearer *next;
-};
-void settings_hear(enum n_setting_domain domain, struct settings_hearer *h);
 
 /* The system calls. */
 int64_t settings_syscall_apply(int cap, uint32_t domain, uint32_t key, const void *value, size_t len);

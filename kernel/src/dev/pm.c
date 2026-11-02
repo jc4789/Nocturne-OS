@@ -81,9 +81,35 @@ static const struct pm_desktop *desktop; /* atomic */
 
 void pm_set_desktop(const struct pm_desktop *d) { __atomic_store_n(&desktop, d, __ATOMIC_RELEASE); }
 
-static void tell(const char *title, const char *text) {
-    const struct pm_desktop *d = __atomic_load_n(&desktop, __ATOMIC_ACQUIRE);
-    if (d) d->notify(title, text);
+/* ---- what is told ----
+   The state the watch reports, under pm_lock. */
+static struct n_power_state told;
+static struct watched told_watched;
+
+static void say(enum n_power_stage stage, enum pm_action action, enum n_power_reason reason, const char *detail,
+                bool forceable) {
+    uint64_t f = spin_lock(&pm_lock);
+    told.serial++;
+    told.stage = stage;
+    told.action = action;
+    told.reason = reason;
+    told.forceable = forceable;
+    strlcpy(told.detail, detail ? detail : "", sizeof told.detail);
+    spin_unlock(&pm_lock, f);
+    watched_changed(&told_watched);
+}
+
+int64_t pm_watch_syscall(void) { return watched_open(&told_watched); }
+
+int64_t pm_state_syscall(void *out, size_t size) {
+    if (size != sizeof told) return -N_ERR_INVALID;
+    struct n_power_state now;
+    uint64_t f = spin_lock(&pm_lock);
+    now = told;
+    spin_unlock(&pm_lock, f);
+    now.can_sleep = pm_can_sleep();
+    now.can_hibernate = pm_can_hibernate();
+    return copy_to_user(out, &now, sizeof now);
 }
 
 /* Every window gets EV_CLOSE; an app may ask its user to save first. Returns
@@ -96,24 +122,22 @@ static bool close_windows(void) {
     if (!left) return true;
     kprintf("pm: asking %d windows to close\n", left);
     d->close_windows();
-    uint64_t start = clock_now_ns(), progress = start, told = 0;
+    uint64_t start = clock_now_ns(), progress = start;
     int last = left;
-    bool hint = false; /* the toast is narrow: the window's title and the way out take turns */
+    bool shown_forced = false;
     while ((left = d->window_count(title, sizeof title)) > 0) {
         uint64_t now = clock_now_ns();
         if (left < last) { last = left; progress = now; }
         if (is_forced() ? now - start >= GRACE_NS : now - progress >= STALL_NS) break;
-        if (now - start >= NS_PER_S && (strcmp(title, shown) || now - told >= 3 * NS_PER_S)) {
-            hint = !is_forced() && !strcmp(title, shown) && !hint;
-            tell(wanted_now() == PM_REBOOT ? "Waiting to restart" : "Waiting to shut down",
-                      hint ? "Choose again to force it" : title);
+        if (now - start >= NS_PER_S && (strcmp(title, shown) || shown_forced != is_forced())) {
+            shown_forced = is_forced();
+            say(N_POWER_CLOSING, wanted_now(), N_POWER_REASON_NONE, title, !shown_forced);
             strlcpy(shown, title, sizeof shown);
-            told = now;
         }
         sleep_until(clock_after(50 * NS_PER_MS));
     }
     if (!left || is_forced()) return true;
-    tell(wanted_now() == PM_REBOOT ? "Restart cancelled" : "Shutdown cancelled", title);
+    say(N_POWER_CANCELLED, wanted_now(), N_POWER_REASON_NONE, title, false);
     kprintf("pm: cancelled, \"%s\" kept its window\n", title);
     uint64_t f = spin_lock(&pm_lock);
     force_until = clock_after(FORCE_NS);
@@ -170,15 +194,43 @@ static NORETURN void finish(enum pm_action action) {
 }
 
 /* ---- sleep (S3) and hibernation ---- */
-static const char *sleep_blocker(bool hibernate) {
-    if (!iommu_power_ready()) return "the IOMMU's state is unconfirmed, or it did not come back from a sleep";
-    const char *why = hibernate ? hibernate_blocker() : !acpi_sleep_supported(3) ? "the firmware has no S3" : NULL;
+/* For the log. */
+static const char *reason_text(enum n_power_reason reason) {
+    switch (reason) {
+    case N_POWER_REASON_NONE: return "none";
+    case N_POWER_REASON_IOMMU: return "the IOMMU's state is unconfirmed, or it did not come back";
+    case N_POWER_REASON_NO_S3: return "the firmware has no S3";
+    case N_POWER_REASON_NO_WAKE_PAGE: return "no wake page below 1 MiB";
+    case N_POWER_REASON_DEVICE: return "a device cannot come back";
+    case N_POWER_REASON_DEVICE_BUSY: return "a device cannot sleep now";
+    case N_POWER_REASON_DEVICE_STUCK: return "a device did not stop";
+    case N_POWER_REASON_APP_DRIVER: return "an app drives one of the PCI devices";
+    case N_POWER_REASON_DISK_FLUSH: return "a disk did not write its cache back";
+    case N_POWER_REASON_CPU_STOP: return "a processor did not stop";
+    case N_POWER_REASON_FIRMWARE: return "the firmware did not sleep";
+    case N_POWER_REASON_LOW_ROOM: return "no room below 1 MiB";
+    case N_POWER_REASON_NOT_ON_DISK: return "C: is not on a disk";
+    case N_POWER_REASON_NO_MEMORY: return "not enough memory";
+    case N_POWER_REASON_NO_SPACE: return "not enough free space on C:";
+    case N_POWER_REASON_IMAGE_TOO_LARGE: return "the image did not fit in memory or on C:";
+    case N_POWER_REASON_STORE_WRITE: return "C: could not be written";
+    default: return "unknown";
+    }
+}
+
+static enum n_power_reason sleep_blocker(bool hibernate, const char **detail) {
+    *detail = NULL;
+    if (!iommu_power_ready()) return N_POWER_REASON_IOMMU;
+    enum n_power_reason why = hibernate ? hibernate_blocker(detail) : !acpi_sleep_supported(3) ? N_POWER_REASON_NO_S3 : N_POWER_REASON_NONE;
     if (why) return why;
-    if (!wake_available()) return "no wake page below 1 MiB";
+    if (!wake_available()) return N_POWER_REASON_NO_WAKE_PAGE;
     for (int s = 0; s < PM_STAGES; s++)
         for (struct pm_device *d = first_of(s); d; d = next_of(d))
-            if (!d->resume && !(hibernate && d->cold_ok)) return d->name;
-    return NULL;
+            if (!d->resume && !(hibernate && d->cold_ok)) {
+                *detail = d->name;
+                return N_POWER_REASON_DEVICE;
+            }
+    return N_POWER_REASON_NONE;
 }
 
 /* decided once by pm_sleep_check: the start menu asks on every redraw */
@@ -187,25 +239,32 @@ static bool can_sleep, can_hibernate;
 bool pm_can_sleep(void) { return can_sleep; }
 bool pm_can_hibernate(void) { return can_hibernate; }
 
+static void blocker_log(const char *what, enum n_power_reason why, const char *detail) {
+    if (why) kprintf("pm: %s unavailable (%s%s%s)\n", what, reason_text(why), detail ? ": " : "", detail ? detail : "");
+}
+
 void pm_sleep_check(void) {
-    const char *why = sleep_blocker(false);
+    const char *detail;
+    enum n_power_reason why = sleep_blocker(false, &detail);
     can_sleep = !why;
-    if (why) kprintf("pm: sleep unavailable (%s)\n", why);
-    else kprintf("pm: sleep (S3) available\n");
-    why = sleep_blocker(true);
+    blocker_log("sleep", why, detail);
+    if (!why) kprintf("pm: sleep (S3) available\n");
+    why = sleep_blocker(true, &detail);
     can_hibernate = !why;
-    if (why) kprintf("pm: hibernation unavailable (%s)\n", why);
-    else kprintf("pm: hibernation available\n");
+    blocker_log("hibernation", why, detail);
+    if (!why) kprintf("pm: hibernation available\n");
+    watched_changed(&told_watched);
 }
 
 static void enter_s3(void) { acpi_sleep_enter(3); }
 
 /* Devices, interrupt controllers and the CPU down, enter(), and all of it back. True after a real
    sleep (S3 woke up, or a hibernation image was restored), false when enter() returned or a device
-   did not stop (*why says which; enter() is then not called). On CPU 0, every other CPU parked
+   did not stop (*why and *detail say which; enter() is then not called). On CPU 0, every other CPU parked
    (smp_suspend): from the freeze to the thaw no other thread runs, the devices are down or not
    back yet. The interrupts this saves and restores are CPU 0's own. */
-static bool machine_sleep(void (*enter)(void), unsigned state, const char **why) {
+static bool machine_sleep(void (*enter)(void), unsigned state, enum pm_action action, enum n_power_reason *why,
+                          const char **detail, bool *lost_told) {
     acpi_freeze(true);
     const char *stuck = pci_suspend();
     uint64_t f = irq_save();
@@ -253,30 +312,38 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
             if (!lost) lost = d->name;
         }
     acpi_freeze(false);
-    if (units_lost) tell("The IOMMU did not come back from sleep", units_lost);
-    if (lost) tell(slept ? "A device did not wake up" : "A device did not restart", lost);
+    if (units_lost) say(N_POWER_DEVICE_LOST, action, N_POWER_REASON_IOMMU, units_lost, false);
+    if (lost) say(N_POWER_DEVICE_LOST, action, N_POWER_REASON_DEVICE, lost, false);
+    *lost_told = units_lost || lost;
     if (slept) kprintf("pm: awake after %ld s\n", (long)secs);
     if (stuck) {
-        static char msg[64];
-        ksnprintf(msg, sizeof msg, "%s did not stop", stuck);
-        *why = msg;
+        *why = N_POWER_REASON_DEVICE_STUCK;
+        *detail = stuck;
     }
     return slept;
 }
 
 static void sleep_now(bool hibernate) {
-    const char *why = sleep_blocker(hibernate);
+    enum pm_action action = hibernate ? PM_HIBERNATE : PM_SLEEP;
+    const char *detail;
+    enum n_power_reason why = sleep_blocker(hibernate, &detail);
     /* a driver in an app (dev/pciuser.c) is not told about sleep yet: its device would come back
        reset under it */
     for (int i = 0; i < pci_count() && !why; i++)
-        if (pci_at(i)->claimed) why = "An app drives one of the PCI devices";
+        if (pci_at(i)->claimed) why = N_POWER_REASON_APP_DRIVER;
     for (int s = 0; s < PM_STAGES && !why; s++)
-        for (struct pm_device *d = first_of(s); d && !why; d = next_of(d))
-            if (d->refuse) why = d->refuse(d->ctx);
-    if (!why && hibernate) hibernate_prepare(&why);
+        for (struct pm_device *d = first_of(s); d && !why; d = next_of(d)) {
+            const char *refused = d->refuse ? d->refuse(d->ctx) : NULL;
+            if (!refused) continue;
+            kprintf("pm: %s: %s\n", d->name, refused);
+            why = N_POWER_REASON_DEVICE_BUSY;
+            detail = d->name;
+        }
+    if (!why && hibernate) why = hibernate_prepare();
     if (why) {
-        kprintf("pm: not %s: %s\n", hibernate ? "hibernating" : "sleeping", why);
-        tell(hibernate ? "Cannot hibernate" : "Cannot sleep", why);
+        kprintf("pm: not %s: %s%s%s\n", hibernate ? "hibernating" : "sleeping", reason_text(why), detail ? ": " : "",
+                detail ? detail : "");
+        say(N_POWER_REFUSED, action, why, detail, false);
         return;
     }
     kprintf("pm: going to %s\n", hibernate ? "hibernate" : "sleep");
@@ -284,19 +351,19 @@ static void sleep_now(bool hibernate) {
     /* no transfer is cut off by the controllers losing their state, and after a snapshot nothing
        but the image reaches the disks */
     blk_hold();
-    bool parked = false, slept = false;
-    if (!flush_disks()) why = "A disk did not write its cache back"; /* asleep or in an image, it could be lost */
+    bool parked = false, slept = false, lost_told = false;
+    if (!flush_disks()) why = N_POWER_REASON_DISK_FLUSH; /* asleep or in an image, it could be lost */
     if (!why) {
         parked = true;
-        if (!smp_suspend()) why = "A processor did not stop";
+        if (!smp_suspend()) why = N_POWER_REASON_CPU_STOP;
     }
     if (why) {
     } else if (hibernate) {
         acpi_links_save();
-        slept = machine_sleep(hibernate_snapshot, 4, &why);
+        slept = machine_sleep(hibernate_snapshot, 4, action, &why, &detail, &lost_told);
         if (!slept && !why) {
             /* the snapshot: the machine as it is from here on never comes back */
-            tell("Hibernating", "Saving the memory to C:");
+            say(N_POWER_SAVING, action, N_POWER_REASON_NONE, NULL, false);
             if (!(why = hibernate_write())) {
                 uint64_t f = spin_lock(&pm_lock);
                 __atomic_store_n(&stopping, true, __ATOMIC_RELAXED);
@@ -305,8 +372,10 @@ static void sleep_now(bool hibernate) {
                 finish(PM_POWER_OFF);
             }
         }
-    } else if (!acpi_sleep_prepare(3) || !(slept = machine_sleep(enter_s3, 3, &why))) {
-        if (!why) why = "The firmware did not sleep";
+    } else if (!acpi_sleep_prepare(3)) {
+        why = N_POWER_REASON_FIRMWARE;
+    } else if (!(slept = machine_sleep(enter_s3, 3, action, &why, &detail, &lost_told)) && !why) {
+        why = N_POWER_REASON_FIRMWARE;
     }
     if (parked) smp_resume();
     blk_release();
@@ -314,8 +383,11 @@ static void sleep_now(bool hibernate) {
     const struct pm_desktop *d = __atomic_load_n(&desktop, __ATOMIC_ACQUIRE);
     if (d) d->repaint();
     if (!slept) {
-        kprintf("pm: %s failed: %s\n", hibernate ? "hibernation" : "sleep", why);
-        tell(hibernate ? "Hibernation failed" : "Sleep failed", why);
+        kprintf("pm: %s failed: %s%s%s\n", hibernate ? "hibernation" : "sleep", reason_text(why), detail ? ": " : "",
+                detail ? detail : "");
+        say(N_POWER_FAILED, action, why, detail, false);
+    } else if (!lost_told) {
+        say(N_POWER_AWAKE, action, N_POWER_REASON_NONE, NULL, false);
     }
 }
 
@@ -344,8 +416,8 @@ static void pm_thread(void *arg) {
             __atomic_store_n(&stopping, true, __ATOMIC_RELAXED);
             action = wanted;
             spin_unlock(&pm_lock, f);
-            tell(action == PM_REBOOT ? "Restarting" : "Shutting down",
-                      action == PM_REBOOT ? "See you in a moment..." : "Good night!");
+            say(N_POWER_STOPPING, action, N_POWER_REASON_NONE, NULL, false);
+            sleep_until(clock_after(TELL_NS)); /* whoever tells the user does, before the apps stop */
             stop_apps();
             store_sync(); /* what was saved reaches its volume first */
             finish(action);
@@ -363,4 +435,7 @@ static void pm_thread(void *arg) {
 
 /* On the first CPU: the sleep it runs (smp_suspend, wake_sleep) comes back on the CPU the firmware
    wakes. */
-void pm_init(void) { kthread_create_on("power", pm_thread, NULL, 0); }
+void pm_init(void) {
+    watched_init(&told_watched, NULL);
+    kthread_create_on("power", pm_thread, NULL, 0);
+}

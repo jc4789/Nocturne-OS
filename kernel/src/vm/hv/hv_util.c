@@ -135,7 +135,6 @@ static void timesync(struct service *s, struct ic_header *h, uint8_t *body, uint
         /* SYNC sets it to the host's time; a SAMPLE moves it only when it is a second off */
         if ((flags & 1) || diff > (int64_t)NS_PER_S || diff < -(int64_t)NS_PER_S) {
             clock_set_wall(want);
-            wm_taskbar_changed();
             if (diff >= (int64_t)NS_PER_S || diff <= -(int64_t)NS_PER_S)
                 kprintf("hv-util: clock adjusted by %ld s\n", diff / (int64_t)NS_PER_S);
         }

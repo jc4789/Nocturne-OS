@@ -1092,7 +1092,6 @@ void syscall_dispatch(struct regs *r) {
     case SYS_CAP_DERIVE: ret = sys_cap_derive((int)a, b); break;
     case SYS_CAP_KIND: ret = sys_cap_kind((int)a); break;
     case SYS_CAP_FIND: ret = sys_cap_find(a); break;
-    case SYS_SESSION_IDENTITY: ret = sys_session_identity((int)a, (const struct n_identity *)b); break;
     case SYS_SERVICE_REGISTER: ret = sys_service_register((int)a); break;
     case SYS_SERVICE_CONNECT: ret = sys_service_connect((const char *)a, b); break;
     case SYS_PROCLIST: ret = sys_proclist((struct n_procinfo *)a, (int)b); break;
@@ -1230,10 +1229,26 @@ void syscall_dispatch(struct regs *r) {
     case SYS_POWER:
         ret = cap_check((int)a, N_CAP_POWER);
         if (ret < 0) break;
+        if (b > POWER_HIBERNATE || (c & ~(uint64_t)N_POWER_CHOSEN)) {
+            ret = -N_ERR_INVALID;
+            break;
+        }
+        pm_request((enum pm_action)b, c & N_POWER_CHOSEN);
+        if ((c & N_POWER_CHOSEN) || b == POWER_SLEEP || b == POWER_HIBERNATE) {
+            ret = 0;
+            break;
+        }
         /* the power thread ends this app with the others */
-        pm_request(b == POWER_REBOOT ? PM_REBOOT : PM_POWER_OFF, false);
         while (!self->killed) sleep_until(CLOCK_NEVER); /* the kill wakes it */
         ret = -N_ERR_STOPPED;
+        break;
+    case SYS_POWER_STATE:
+        ret = cap_check((int)a, N_CAP_POWER);
+        if (ret >= 0) ret = pm_state_syscall((void *)b, c);
+        break;
+    case SYS_POWER_WATCH:
+        ret = cap_check((int)a, N_CAP_POWER);
+        if (ret >= 0) ret = pm_watch_syscall();
         break;
     case SYS_SYSTEM_LOG: ret = identity_at_least(N_CLASS_ADMIN) ? sys_system_log((char *)a, b) : -N_ERR_DENIED; break;
     case SYS_PCILIST:

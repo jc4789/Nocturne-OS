@@ -1,12 +1,13 @@
 /*
  * Nocturne's desktop: the window manager and the compositors.
  *
- * The window manager owns the windows, their stacking and focus, the pointer and the desktop's
- * own parts (the taskbar, the moon menu, the volume panel, the toasts). The desktop thread applies
- * the input drivers' events to them, the window calls change them; both under wm_lock, briefly.
+ * The window manager owns the windows, their stacking and focus and the pointer. The desktop
+ * thread applies the input drivers' events to them, the window calls change them; both under
+ * wm_lock, briefly. What the user sees of the system besides the windows' frames is the shell's, a
+ * program with windows of its own in the layers of display_abi.h (N_CAP_SHELL).
  *
  * Each screen (dev/fb.h) is a part of the desktop, laid out from left to right in the screens'
- * order (screen 0, with the taskbar, at the left), and has a compositor thread of its own with a
+ * order (screen 0 at the left), and has a compositor thread of its own with a
  * deadline at that screen's refresh (sys/sched.h). A frame takes the tiles that changed on its
  * part and a copy of the scene under wm_lock (capture), draws those tiles into the screen's
  * picture, a canvas in RAM, without it, writes them into a buffer the display does not show and
@@ -28,7 +29,6 @@
 #include "gui/screenmode.h"
 #include "dev/fb.h"
 #include "dev/fbcon.h"
-#include "dev/audio.h"
 #include "dev/input.h"
 #include "dev/pm.h"
 #include "sys/object.h"
@@ -38,7 +38,6 @@
 #include "sys/clock.h"
 #include "sys/process.h"
 #include "sys/sched.h"
-#include "sys/proc.h"
 #include "sys/prof.h"
 #include "mm/shared.h"
 #include "sys/syscall.h"
@@ -47,12 +46,12 @@
 #include "sys/wait.h"
 #include "sys/watch.h"
 #include "abi.h"
+#include "display_abi.h"
 #include "sys/authority.h"
 
 #define TITLE_H   28
 #define TITLE_RADIUS 8 /* the rounded title's corners; shared by the shadow's culling */
 #define BORDER    1
-#define TASKBAR_H 40
 #define SHADOW    10
 #define POINTER_SIZE ((int)N_SCREEN_POINTER_SIZE) /* every pointer image is this square */
 #define MIN_CW    120
@@ -62,6 +61,8 @@
 /* The events a window's mailbox keeps for an app that does not take them; beyond them input is
    lost (EV_INPUT_LOST). */
 #define MAILBOX_MAX 4096
+/* What a screen shows where no window is. */
+#define BACKGROUND RGB(12, 10, 26)
 
 struct rect {
     int x, y, w, h;
@@ -308,6 +309,12 @@ struct window {
     struct rect restore;
     struct rect fullscreen_restore;
     char title[64];
+    /* SYS_SHELL_PLACE: its layer, whether it stays out of the focus, whether its pixels blend with
+       what is under them, and the edge of screen reserve_screen it keeps from the other windows. */
+    uint32_t layer;
+    bool no_focus, blend;
+    uint32_t reserve_edge, reserve_screen;
+    int reserve;
     /* The app's mailbox, under ev_lock (any CPU, without wm_lock: SYS_WIN_RECEIVE): the input
        events in a ring of ev_room (growing up to MAILBOX_MAX), lost when it was full, the frame's
        event (the last one only) and the surfaces given back (bits), and dead's change. It comes
@@ -325,26 +332,10 @@ struct window {
 
 /* ---- screens ----
    A screen's part of the desktop and its compositor. Never freed; wscreens only grows. */
-struct taskbar_button {
-    char title[64];
-    bool minimized, focused;
-};
-/* What a frame draws of the desktop's own parts (screen 0), as capture copied it. */
-struct overlay {
-    int sw, sh;
-    bool taskbar, menu_open, vol_open, vol_hover, muted, toast, selected;
-    int menu_sel, volume;
-    char device[48];
-    char toast_title[64], toast_text[128];
-    struct rect selection;
-    struct tm_parts clock;
-    struct taskbar_button *buttons;
-    size_t nbuttons, buttons_room;
-};
 /* A window as a frame draws it, in the screen's coordinates. */
 struct layer {
     int x, y, cw, ch, fw, fh, cx, cy, flags, hover;
-    bool focus, maximized;
+    bool focus, maximized, shadow, blend;
     struct wsurf *src;  /* a reference; readers counted when it is an app's */
     bool copy;          /* src is the kernel's copy: its lock is taken while it is read */
     char title[64];
@@ -359,6 +350,7 @@ struct wscreen {
     bool on;                  /* its part is on the desktop */
     int x, y, w, h;           /* the part: its mode's size, or (screen 0) a remote viewer's window's */
     int remote_w, remote_h;   /* screen 0 while remote_users */
+    int reserved[N_EDGE_RIGHT + 1]; /* what the shell's windows keep of each edge (enum n_screen_edge) */
     struct tiles dirty;       /* what changed since its last frame */
     bool dirty_any;
     uint64_t period_ns;       /* its refresh's period, 0: not known */
@@ -372,8 +364,8 @@ struct wscreen {
     /* The compositor thread's own; the picture under back_lock (a frame, a copy for a grab or a
        remote viewer, a change of size): */
     struct mutex back_lock;
-    canvas_t back, wall;
-    uint8_t *back_deep, *wall_deep; /* deep planes (display_abi.h), pitch w; NULL at 8 bpc */
+    canvas_t back;
+    uint8_t *back_deep;              /* its deep plane (display_abi.h), pitch w; NULL at 8 bpc */
     struct tiles frame;              /* the tiles of the frame being drawn */
     struct tiles stale[SCREEN_BUFFERS_MAX]; /* what each buffer lacks of the picture */
     struct tiles remote;             /* screen 0: drawn since a remote viewer last asked */
@@ -383,7 +375,6 @@ struct wscreen {
     size_t nrects, rects_room;
     struct layer *layers;
     size_t nlayers, layers_room;
-    struct overlay ov;
     bool resize_on;
     struct rect resize;
     bool pointer_on;
@@ -405,7 +396,7 @@ struct wscreen {
    - a screen's back_lock (its picture), then dev/fb.c's screen use (a frame's begin to its end);
    - wm_mutex (wm_lock): all of the window manager's state that names no other lock: the windows,
      their stacking and focus, the damage, the pointer, the desktop's own state, the screens'
-     parts and states, the remote viewers, the clipboard. A sleeping lock, any CPU, held briefly:
+     parts and states, the remote viewers, the clipboard, the hot keys. A sleeping lock, any CPU, held briefly:
      never while a frame is drawn or written, nor across a copy of a window's pixels. Reentrant: a
      window handle's last close comes from inside a WM call. gui/screenmode.c's lock,
      and dev/pciuser.c's screen lock come before it;
@@ -423,8 +414,8 @@ static size_t nwscreens, wscreens_room;
 static int sw, sh;          /* screen 0's part */
 static int desk_w, desk_h;  /* the desktop's extent */
 
-/* The desktop thread sleeps on desk_wq unless desk_wakes moved: input, a change of what the
-   taskbar shows, a toast, a window that moved under the pointer. */
+/* The desktop thread sleeps on desk_wq unless desk_wakes moved: input, a setting, a window that
+   moved under the pointer. */
 static uint64_t desk_wakes;
 static struct wait_queue desk_wq;
 static void desk_wake(void) {
@@ -467,7 +458,7 @@ static int pointer_hx, pointer_hy;
 static int pointer_shape = -1, pointer_from;
 static uint32_t pointer_from_serial, pointer_serial = 1;
 
-enum { DRAG_NONE, DRAG_MOVE, DRAG_RESIZE, DRAG_CLIENT, DRAG_BUTTON, DRAG_VOLUME };
+enum { DRAG_NONE, DRAG_MOVE, DRAG_RESIZE, DRAG_CLIENT, DRAG_BUTTON };
 static int drag_mode;
 static struct window *drag_win;
 static int drag_dx, drag_dy, drag_btn;
@@ -477,27 +468,35 @@ static bool resize_visible;
 static struct window *hover_win;
 static int hover_btn; /* 0 none, 1 close, 2 max, 3 min */
 
-static bool menu_open;
-static int menu_sel = -1;
-static bool vol_open;         /* the volume panel above the taskbar's speaker */
-static int shown_volume = -1; /* what the speaker was last drawn showing */
-static bool shown_muted;
-static void set_volume_panel(bool open);
-static int sel_icon = -1;
 #define DOUBLE_CLICK_NS (450 * NS_PER_MS)
 static uint64_t last_click; /* clock ns of the last left press, 0 after a double click */
 static int last_click_x, last_click_y;
 
-/* The toast shown until toast_until (clock ns), 0 for none. */
-#define TOAST_NS (4 * NS_PER_S)
-static char toast_title[64], toast_text[128];
-static uint64_t toast_until;
-static int last_clock_min = -1;
+/* The window under the pointer, told EV_MOUSE_LEAVE when it leaves one of the shell's layers. */
+static struct window *pointer_over;
+
+/* SYS_SHELL_HOTKEY: the keys whose press goes to their window, whichever has the focus. held: the
+   press went there, so its release goes nowhere. */
+struct hotkey {
+    struct window *w;
+    uint32_t key, mods;
+    bool held;
+};
+static struct hotkey *hotkeys;
+static size_t nhotkeys, hotkeys_room;
+
+/* What the shell's watch reports changed (SYS_SHELL_WATCH): the windows, their order or the focus. */
+static struct watched shell_watched;
+static bool shell_watchable;
+static void windows_changed(void) {
+    if (__atomic_load_n(&shell_watchable, __ATOMIC_ACQUIRE)) watched_changed(&shell_watched);
+}
 
 static char *clipboard;
 static size_t clipboard_len;
 static uint32_t clipboard_seq; /* bumped on every change, so a remote viewer can follow it */
 static struct n_identity clipboard_owner; /* 最後に置いたアプリの身元：触れてよい者だけが読む */
+static bool clipboard_open;               /* 核の thread が置いた（遠隔の表示）：持ち主がない */
 
 /* ---- the screens' parts ---- */
 static bool part_on(const struct wscreen *ws) { return ws->on && ws->w > 0 && ws->h > 0; }
@@ -544,8 +543,14 @@ static int frame_h(struct window *w) { return decorated(w) ? w->ch + TITLE_H + B
 static int client_x(struct window *w) { return decorated(w) ? w->x + BORDER : w->x; }
 static int client_y(struct window *w) { return decorated(w) ? w->y + TITLE_H : w->y; }
 
+/* The desktop and the panels lie flat; every other window has a shadow. */
+static int shadow_of(const struct window *w) {
+    return w->layer == N_LAYER_DESKTOP || w->layer == N_LAYER_PANEL ? 0 : SHADOW;
+}
+
 static struct rect win_bounds(struct window *w) {
-    return (struct rect){w->x - SHADOW, w->y - SHADOW, frame_w(w) + 2 * SHADOW, frame_h(w) + 2 * SHADOW};
+    int s = shadow_of(w);
+    return (struct rect){w->x - s, w->y - s, frame_w(w) + 2 * s, frame_h(w) + 2 * s};
 }
 
 static void damage_window(struct window *w) {
@@ -558,17 +563,34 @@ static bool visible(struct window *w) { return w && !w->dead && w->shown && !w->
 /* The screen that paces a window's frames: the one under its centre. */
 static struct wscreen *pacing(struct window *w) { return screen_at(w->x + frame_w(w) / 2, w->y + frame_h(w) / 2); }
 
-/* The area a maximised or fullscreen window of screen ws covers (screen 0 less its taskbar). */
+/* The area a maximised or fullscreen window of screen ws covers: a maximised one leaves what the
+   shell's windows keep of its edges. */
 static struct rect part_area(struct wscreen *ws, bool fullscreen) {
     if (!ws) return (struct rect){0, 0, sw, sh};
-    return (struct rect){ws->x, ws->y, ws->w, ws->h - (ws->id == 0 && !fullscreen ? TASKBAR_H : 0)};
+    struct rect a = {ws->x, ws->y, ws->w, ws->h};
+    if (fullscreen) return a;
+    a.x += ws->reserved[N_EDGE_LEFT];
+    a.y += ws->reserved[N_EDGE_TOP];
+    a.w -= ws->reserved[N_EDGE_LEFT] + ws->reserved[N_EDGE_RIGHT];
+    a.h -= ws->reserved[N_EDGE_TOP] + ws->reserved[N_EDGE_BOTTOM];
+    return a;
 }
+
+static struct rect work_area(void) { return part_area(nwscreens ? wscreens[0] : NULL, false); }
 
 static struct window *focused(void) {
     if (visible(focus_owner)) return focus_owner;
     for (size_t i = nwin; i-- > 0;)
-        if (visible(zorder[i])) return zorder[i];
+        if (visible(zorder[i]) && !zorder[i]->no_focus) return zorder[i];
     return NULL;
+}
+
+/* Whether w is shown now: a panel hides while a fullscreen window of its screen has the focus. */
+static bool drawn(struct window *w) {
+    if (!visible(w)) return false;
+    if (w->layer != N_LAYER_PANEL) return true;
+    struct window *f = focused();
+    return !f || !f->fullscreen || pacing(f) != pacing(w);
 }
 
 /* title bar buttons: 1 close, 2 maximize, 3 minimize; returns center x */
@@ -593,7 +615,7 @@ static int hit_button(struct window *w, int x, int y) {
 static struct window *window_at(int x, int y) {
     for (size_t i = nwin; i-- > 0;) {
         struct window *w = zorder[i];
-        if (!visible(w)) continue;
+        if (!drawn(w)) continue;
         if (in_rect(x, y, w->x, w->y, frame_w(w), frame_h(w))) return w;
     }
     return NULL;
@@ -684,7 +706,21 @@ static size_t zindex(struct window *w) {
     return SIZE_MAX;
 }
 
-static void damage_taskbar(void) { damage_rect(0, sh - TASKBAR_H, sw, TASKBAR_H); }
+/* Where a window stacks: the layers from the bottom, the always-on-top windows above the others. */
+static int band_of(const struct window *w) {
+    switch (w->layer) {
+    case N_LAYER_DESKTOP: return 0;
+    case N_LAYER_PANEL: return 3;
+    case N_LAYER_OVERLAY: return 4;
+    default: return w->flags & WIN_ALWAYS_ON_TOP ? 2 : 1;
+    }
+}
+
+/* The panels show or hide as the focus moves to or from a fullscreen window. */
+static void damage_panels(void) {
+    for (size_t i = 0; i < nwin; i++)
+        if (zorder[i]->layer == N_LAYER_PANEL && visible(zorder[i])) damage_window(zorder[i]);
+}
 
 static struct window *last_focus;
 
@@ -700,26 +736,27 @@ static void update_focus(void) {
         damage_window(f);
     }
     last_focus = f;
-    damage_taskbar();
+    damage_panels();
+    windows_changed();
 }
 
-static void raise_window(struct window *w) {
+/* To the top of its band. The list stays sorted by band. */
+static void stack_top(struct window *w) {
     size_t i = zindex(w);
     if (i == SIZE_MAX) return;
     for (; i + 1 < nwin; i++) zorder[i] = zorder[i + 1];
-    size_t destination = nwin - 1;
-    if (!(w->flags & WIN_ALWAYS_ON_TOP))
-        for (size_t j = 0; j + 1 < nwin; j++)
-            if (zorder[j]->flags & WIN_ALWAYS_ON_TOP) {
-                destination = j;
-                break;
-            }
-    for (size_t j = nwin - 1; j > destination; j--) zorder[j] = zorder[j - 1];
-    zorder[destination] = w;
-    focus_owner = w;
+    size_t at = nwin - 1;
+    for (; at > 0 && band_of(zorder[at - 1]) > band_of(w); at--) zorder[at] = zorder[at - 1];
+    zorder[at] = w;
+}
+
+static void raise_window(struct window *w) {
+    if (zindex(w) == SIZE_MAX) return;
+    stack_top(w);
+    if (!w->no_focus) focus_owner = w;
     w->minimized = false;
     damage_window(w);
-    damage_taskbar();
+    windows_changed();
     update_focus();
 }
 
@@ -727,8 +764,8 @@ static void lower_to_bottom(struct window *w) {
     if (w->flags & WIN_ALWAYS_ON_TOP) return;
     size_t i = zindex(w);
     if (i == SIZE_MAX) return;
-    for (; i > 0; i--) zorder[i] = zorder[i - 1];
-    zorder[0] = w;
+    for (; i > 0 && band_of(zorder[i - 1]) >= band_of(w); i--) zorder[i] = zorder[i - 1];
+    zorder[i] = w;
     if (focus_owner == w) focus_owner = NULL;
     damage_window(w);
     update_focus();
@@ -738,22 +775,31 @@ static void minimize_window(struct window *w) {
     w->minimized = true;
     if (focus_owner == w) focus_owner = NULL;
     damage_window(w);
-    damage_taskbar();
+    windows_changed();
     update_focus();
 }
 
 /* ---- direct scanout ----
    A display driver whose buffers have N_SCANOUT_DIRECT (direct_able) shows one app's own images
    instead of its screen's part while that app's window asked for it (win_direct), is fullscreen
-   on that screen and focused, and nothing of the system is drawn over it (the moon menu, the
-   volume panel, a toast, a resize outline) or sent to a remote viewer. It then draws the pointer
+   on that screen and focused, and nothing of the system is drawn over it (a window of the overlay
+   layer, a resize outline) or sent to a remote viewer. It then draws the pointer
    itself. The part is still composited meanwhile, so it is current the moment the driver shows
    it again. Each screen's state is what its driver reads, with the mode the system wants it to
    show (gui/screenmode.c); its serial changes with every change of it, the pointer's moves
    included while a window is shown (a waiter reads the serial without the lock). Under wm_lock. */
+static bool overlay_on(const struct wscreen *ws) {
+    struct rect part = {ws->x, ws->y, ws->w, ws->h};
+    for (size_t i = nwin; i-- > 0 && zorder[i]->layer == N_LAYER_OVERLAY;) {
+        struct rect b = win_bounds(zorder[i]);
+        if (visible(zorder[i]) && rect_overlap(&b, &part)) return true;
+    }
+    return false;
+}
+
 static bool direct_eligible(struct window *w, struct wscreen *ws) {
-    return ws->direct_able && w && w->direct_wanted && w->fullscreen && visible(w) && pacing(w) == ws && !menu_open &&
-           !vol_open && !toast_until && !resize_visible && !(remote_users && ws->id == 0);
+    return ws->direct_able && w && w->direct_wanted && w->fullscreen && visible(w) && pacing(w) == ws &&
+           !resize_visible && !(remote_users && ws->id == 0) && !overlay_on(ws);
 }
 
 static void direct_event(struct window *w, bool shown) {
@@ -820,11 +866,13 @@ static void window_surfaces_drop(struct window *w) {
     w->shown_surf = -1;
 }
 
+static void reserves_update(void);
+
 static void win_destroy_locked(struct window *w) {
     if (w->dead) return;
     if (focus_owner == w) focus_owner = NULL;
     if (w->shown) damage_window(w);
-    damage_taskbar(); /* its button goes away even when focus does not change */
+    windows_changed(); /* it leaves the list even when the focus does not change */
     window_surfaces_drop(w);
     kfree(w->pointer_image);
     w->pointer_image = NULL;
@@ -845,7 +893,14 @@ static void win_destroy_locked(struct window *w) {
         resize_visible = false;
     }
     if (hover_win == w) hover_win = NULL;
+    if (pointer_over == w) pointer_over = NULL;
     if (last_focus == w) last_focus = NULL;
+    for (size_t k = nhotkeys; k-- > 0;)
+        if (hotkeys[k].w == w) hotkeys[k] = hotkeys[--nhotkeys];
+    if (w->reserve_edge != N_EDGE_NONE) {
+        w->reserve_edge = N_EDGE_NONE;
+        reserves_update();
+    }
     update_focus();
     direct_update();
     wq_wake_all(&w->wq);
@@ -987,17 +1042,6 @@ static int corner_inset(int row, int r) {
     return r - (int)isqrt32((uint32_t)(r * r - d * d));
 }
 
-static void draw_crescent(canvas_t *c, int cx, int cy, int r, uint32_t col) {
-    int ox = r * 5 / 10, oy = -r * 3 / 10;
-    for (int y = -r; y <= r; y++)
-        for (int x = -r; x <= r; x++) {
-            if (x * x + y * y > r * r) continue;
-            int ex = x - ox, ey = y - oy;
-            if (ex * ex + ey * ey < r * r * 85 / 100) continue;
-            gfx_pixel(c, cx + x, cy + y, col);
-        }
-}
-
 static void text_trunc(canvas_t *c, int x, int y, const char *s, int maxw, uint32_t col) {
     if (!canvas_hits(c, x, y, maxw, gfx_font_h(FONT_SMALL))) return;
     char tmp[96];
@@ -1035,83 +1079,6 @@ static void text_trunc(canvas_t *c, int x, int y, const char *s, int maxw, uint3
     gfx_text(c, x, y, tmp, col, TRANSPARENT, FONT_SMALL);
 }
 
-/* ---- apps / desktop ---- */
-struct app {
-    const char *name;
-    const char *path;
-    int icon;
-    const char *arg; /* the one argument, or NULL: apps written in TypeScript run as SYSTEM "js" FILE.js */
-};
-
-#define SYSTEM   N_FOLDER_SYSTEM "\\"
-#define PROGRAMS N_FOLDER_PROGRAMS "\\"
-
-static const struct app apps[] = {
-    {"Terminal", SYSTEM "term", ICON_TERMINAL, NULL},
-    {"Files", SYSTEM "files", ICON_FILES, NULL},
-    {"Web Browser", PROGRAMS "Browser\\browser", ICON_NET, NULL},
-    {"Text Editor", PROGRAMS "Notepad\\notepad", ICON_EDITOR, NULL},
-    {"Paint", PROGRAMS "Paint\\paint", ICON_PAINT, NULL},
-    {"Calculator", PROGRAMS "Calculator\\calc", ICON_CALC, NULL},
-    {"Clock", PROGRAMS "Clock\\clock", ICON_CLOCK, NULL},
-    {"System Monitor", SYSTEM "sysmon", ICON_MONITOR, NULL},
-    {"Piano", PROGRAMS "Piano\\piano", ICON_PIANO, NULL},
-    {"Sound Player", PROGRAMS "Player\\player", ICON_SOUND, NULL},
-    {"Snake", PROGRAMS "Snake\\snake", ICON_SNAKE, NULL},
-    {"Tetris", PROGRAMS "Tetris\\tetris", ICON_TETRIS, NULL},
-    {"Minesweeper", PROGRAMS "Minesweeper\\mines", ICON_MINES, NULL},
-    {"Mandelbrot", PROGRAMS "Mandelbrot\\mandel", ICON_FRACTAL, NULL},
-    {"3D Cube", PROGRAMS "Cube\\cube", ICON_CUBE, NULL},
-    {"Game of Life", PROGRAMS "Life\\life", ICON_LIFE, NULL},
-    {"Settings", SYSTEM "js", ICON_SETTINGS, SYSTEM "settings.js"},
-    {"About Nocturne", SYSTEM "js", ICON_ABOUT, SYSTEM "about.js"},
-    {"Sleep", "@sleep", ICON_SLEEP, NULL},
-    {"Hibernate", "@hibernate", ICON_HIBERNATE, NULL},
-    {"Restart", "@reboot", ICON_REBOOT, NULL},
-    {"Shut Down", "@poweroff", ICON_POWER, NULL},
-};
-#define NAPPS ((int)ARRAY_SIZE(apps))
-#define APP_SLEEP (NAPPS - 4) /* the power items close the menu: Sleep, Hibernate, Restart, Shut Down */
-
-/* the start menu leaves Sleep and Hibernate out on machines that cannot do them (dev/pm.c says which) */
-static bool menu_has(int i) {
-    if (!strcmp(apps[i].path, "@sleep")) return pm_can_sleep();
-    if (!strcmp(apps[i].path, "@hibernate")) return pm_can_hibernate();
-    return true;
-}
-static int menu_count(void) {
-    int n = 0;
-    for (int i = 0; i < NAPPS; i++) n += menu_has(i);
-    return n;
-}
-static const struct app *menu_app(int i) {
-    for (int k = 0; k < NAPPS; k++)
-        if (menu_has(k) && i-- == 0) return &apps[k];
-    return &apps[NAPPS - 1];
-}
-
-static const int desktop_apps[] = {0, 1, 2, 3, 4, 8, 9, 10, 13, 14, 16, 17};
-#define NDESK ((int)ARRAY_SIZE(desktop_apps))
-#define ICON_CELL_W 88
-#define ICON_CELL_H 82
-
-/* An icon's cell on screen 0, whose part is h high. */
-static void icon_cell(int h, int i, int *x, int *y) {
-    int per_col = (h - TASKBAR_H - 16) / ICON_CELL_H;
-    if (per_col < 1) per_col = 1;
-    *x = 12 + (i / per_col) * ICON_CELL_W;
-    *y = 12 + (i % per_col) * ICON_CELL_H;
-}
-
-static int icon_at(int x, int y) {
-    for (int i = 0; i < NDESK; i++) {
-        int cx, cy;
-        icon_cell(sh, i, &cx, &cy);
-        if (in_rect(x, y, cx, cy, ICON_CELL_W - 8, ICON_CELL_H - 6)) return i;
-    }
-    return -1;
-}
-
 /* 8-bit art drawn over a possibly deep picture: remember the pixels of its box (inside the canvas
    clip) before drawing, then mark only the pixels it changed as 8-bit content, so the picture
    around and beneath it keeps its low bits. The box must fit the caller's buffer of stride pixels
@@ -1137,30 +1104,6 @@ static void deep_mark_end(const struct deep_mark *m, const canvas_t *c, uint8_t 
         for (int col = 0; col < m->w; col++)
             if (now[col] != was[col]) d[col] = 0;
     }
-}
-
-/* Icons are 8-bit art over a possibly deep wallpaper. */
-#define ICON_AREA_PAD 16
-static void draw_desktop_icons(canvas_t *c, uint8_t *deep) {
-    const int stride = ICON_CELL_W + 2 * ICON_AREA_PAD;
-    uint32_t *saved = deep ? kmalloc((size_t)stride * ICON_CELL_H * 4) : NULL;
-    for (int i = 0; i < NDESK; i++) {
-        const struct app *a = &apps[desktop_apps[i]];
-        int x, y;
-        icon_cell(c->h, i, &x, &y);
-        struct deep_mark mark;
-        bool track = saved && deep_mark_begin(&mark, c, x - ICON_AREA_PAD, y, stride, ICON_CELL_H, saved, stride);
-        int cw = ICON_CELL_W - 8;
-        desktop_draw_icon(c, x + (cw - 32) / 2, y + 8, a->icon);
-        const char *label = a->name;
-        if (!strcmp(label, "About Nocturne")) label = "About";
-        int tw = gfx_text_width(label, FONT_SMALL);
-        int tx = x + (cw - tw) / 2;
-        gfx_text(c, tx + 1, y + 49, label, RGB(0, 0, 0), TRANSPARENT, FONT_SMALL);
-        gfx_text(c, tx, y + 48, label, RGB(235, 235, 250), TRANSPARENT, FONT_SMALL);
-        if (track) deep_mark_end(&mark, c, deep);
-    }
-    kfree(saved);
 }
 
 void wm_screen_info_changed(void) {
@@ -1216,284 +1159,6 @@ int64_t smooth_gradients_setting_get(uint32_t key, void *out, size_t cap) {
     return setting_int(out, cap, v);
 }
 
-static int launch(const char *path, const char *arg) {
-    if (!strcmp(path, "@reboot") || !strcmp(path, "@poweroff") || !strcmp(path, "@sleep") || !strcmp(path, "@hibernate")) {
-        pm_request(path[1] == 'r' ? PM_REBOOT : path[1] == 's' ? PM_SLEEP : path[1] == 'h' ? PM_HIBERNATE : PM_POWER_OFF, true);
-        return 0;
-    }
-    if (pm_stopping()) return -N_ERR_STOPPED;
-    struct n_identity identity;
-    identity_session(&identity);
-    int pid = proc_spawn_simple(path, arg, &identity);
-    if (pid < 0) {
-        char msg[128];
-        ksnprintf(msg, sizeof msg, "%s (error %d)", path, -pid);
-        wm_notify("Could not start program", msg);
-    }
-    return pid;
-}
-
-/* ---- start menu (screen 0, whose part is w x h) ---- */
-#define MENU_W      260
-#define MENU_HEAD   58
-#define MENU_ITEM_H 36
-
-/* items run down a column, and on into a second one when the screen is too short for one */
-static int menu_rows(int h) {
-    int fit = (h - TASKBAR_H - 8 - MENU_HEAD - 10) / MENU_ITEM_H;
-    int cols = fit < 1 ? menu_count() : (menu_count() + fit - 1) / fit;
-    return (menu_count() + cols - 1) / cols;
-}
-
-static struct rect menu_rect(int h) {
-    int rows = menu_rows(h), cols = (menu_count() + rows - 1) / rows;
-    int mh = MENU_HEAD + rows * MENU_ITEM_H + 10;
-    return (struct rect){4, MAX(0, h - TASKBAR_H - mh - 4), MENU_W * cols, mh};
-}
-
-static void menu_item_pos(int h, int i, int *x, int *y) {
-    struct rect m = menu_rect(h);
-    *x = m.x + i / menu_rows(h) * MENU_W;
-    *y = m.y + MENU_HEAD + i % menu_rows(h) * MENU_ITEM_H;
-}
-
-static int menu_item_at(int x, int y) {
-    struct rect m = menu_rect(sh);
-    int rows = menu_rows(sh);
-    if (!in_rect(x, y, m.x, m.y + MENU_HEAD, m.w, rows * MENU_ITEM_H)) return -1;
-    int i = (x - m.x) / MENU_W * rows + (y - m.y - MENU_HEAD) / MENU_ITEM_H;
-    return i < menu_count() ? i : -1;
-}
-
-static void set_menu(bool open) {
-    if (open) set_volume_panel(false);
-    if (menu_open == open) return;
-    menu_open = open;
-    menu_sel = -1;
-    struct rect m = menu_rect(sh);
-    damage_rect(m.x - SHADOW, m.y - SHADOW, m.w + 2 * SHADOW, m.h + 2 * SHADOW);
-    damage_rect(0, sh - TASKBAR_H, 140, TASKBAR_H);
-}
-
-static void draw_shadow(canvas_t *c, int x, int y, int w, int h) {
-    for (int i = SHADOW; i > 0; i -= 2) {
-        int a = 6 + (SHADOW - i) * 3;
-        gfx_fill_blend(c, x - i + 2, y - i + 4, w + 2 * i - 4, h + 2 * i - 4, ARGB(a, 0, 0, 10));
-    }
-}
-
-static void draw_menu(canvas_t *c, const struct overlay *o) {
-    struct rect m = menu_rect(o->sh);
-    if (!canvas_hits(c, m.x - SHADOW, m.y - SHADOW, m.w + 2 * SHADOW, m.h + 2 * SHADOW)) return;
-    draw_shadow(c, m.x, m.y, m.w, m.h);
-    gfx_fill_round(c, m.x, m.y, m.w, m.h, 10, RGB(70, 60, 120));
-    gfx_fill_round(c, m.x + 1, m.y + 1, m.w - 2, m.h - 2, 9, RGB(22, 20, 44));
-    if (canvas_hits(c, m.x, m.y, m.w, MENU_HEAD)) {
-        for (int j = 0; j < MENU_HEAD - 6; j++) {
-            int in = corner_inset(j, 9);
-            gfx_hline(c, m.x + 1 + in, m.y + 1 + j, m.w - 2 - 2 * in,
-                      gfx_mix(RGB(64, 44, 130), RGB(30, 26, 70), j * 255 / (MENU_HEAD - 6)));
-        }
-        draw_crescent(c, m.x + 30, m.y + 26, 13, RGB(246, 236, 196));
-        gfx_text(c, m.x + 54, m.y + 10, OS_NAME, RGB(255, 255, 255), TRANSPARENT, FONT_LARGE);
-    }
-    for (int i = 0, n = menu_count(); i < n; i++) {
-        int ix, iy;
-        menu_item_pos(o->sh, i, &ix, &iy);
-        /* Include the separator row above this item. */
-        if (!canvas_hits(c, ix, iy - 1, MENU_W, MENU_ITEM_H + 1)) continue;
-        if (i == APP_SLEEP && iy > m.y + MENU_HEAD) gfx_hline(c, ix + 12, iy - 1, MENU_W - 24, RGB(60, 56, 100));
-        if (i == o->menu_sel) gfx_fill_round(c, ix + 6, iy + 1, MENU_W - 12, MENU_ITEM_H - 2, 6, RGB(76, 64, 150));
-        desktop_draw_icon(c, ix + 12, iy + 2, menu_app(i)->icon);
-        gfx_text(c, ix + 54, iy + 10, menu_app(i)->name, RGB(230, 230, 245), TRANSPARENT, FONT_SMALL);
-    }
-}
-
-/* ---- volume: a speaker on the taskbar, and a panel with a slider and mute ---- */
-#define TB_START_W 128
-#define TB_CLOCK_W 100
-#define TB_VOL_W   40
-#define VOL_W      300
-#define VOL_H      96
-
-static struct rect vol_button_rect(int w, int h) {
-    return (struct rect){w - TB_CLOCK_W - TB_VOL_W, h - TASKBAR_H + 5, TB_VOL_W - 4, TASKBAR_H - 10};
-}
-static struct rect vol_rect(int w, int h) { return (struct rect){w - VOL_W - 8, h - TASKBAR_H - VOL_H - 6, VOL_W, VOL_H}; }
-static struct rect vol_mute_rect(int w, int h) {
-    struct rect v = vol_rect(w, h);
-    return (struct rect){v.x + 12, v.y + 42, 40, 40};
-}
-static struct rect vol_slider_rect(int w, int h) { /* the track; clicks a little either side still count */
-    struct rect v = vol_rect(w, h);
-    return (struct rect){v.x + 70, v.y + 60, VOL_W - 70 - 56, 4};
-}
-
-static void damage_volume(void) {
-    struct rect b = vol_button_rect(sw, sh), v = vol_rect(sw, sh);
-    damage_rect(b.x, b.y, b.w, b.h);
-    if (vol_open) damage_rect(v.x - SHADOW, v.y - SHADOW, v.w + 2 * SHADOW, v.h + 2 * SHADOW);
-}
-
-static void set_volume_panel(bool open) {
-    if (vol_open == open) return;
-    if (!open) damage_volume();
-    vol_open = open;
-    damage_volume();
-}
-
-/* a loudspeaker centred on (cx, cy), with one to three waves for the volume, or a cross when
-   muted */
-static void draw_speaker(canvas_t *c, int cx, int cy, int volume, bool muted, uint32_t col) {
-    gfx_fill(c, cx - 9, cy - 3, 4, 7, col);
-    for (int i = 0; i < 6; i++) gfx_vline(c, cx - 5 + i, cy - 3 - i, 7 + 2 * i, col);
-    if (muted) {
-        uint32_t x = RGB(240, 110, 120);
-        for (int d = 0; d < 2; d++) {
-            gfx_line(c, cx + 3 + d, cy - 4, cx + 10 + d, cy + 3, x);
-            gfx_line(c, cx + 3 + d, cy + 3, cx + 10 + d, cy - 4, x);
-        }
-        return;
-    }
-    int waves = volume == 0 ? 0 : volume < 34 ? 1 : volume < 67 ? 2 : 3;
-    for (int w = 0; w < waves; w++) {
-        int r = 4 + w * 4;
-        for (int dy = -r * 7 / 10; dy <= r * 7 / 10; dy++) {
-            int dx = 0;
-            while ((dx + 1) * (dx + 1) + dy * dy <= r * r) dx++;
-            gfx_pixel(c, cx + 1 + dx, cy + dy, col);
-            gfx_pixel(c, cx + 2 + dx, cy + dy, col);
-        }
-    }
-}
-
-static void draw_volume_button(canvas_t *c, const struct overlay *o, int y) {
-    struct rect b = vol_button_rect(o->sw, o->sh);
-    if (o->vol_open || o->vol_hover)
-        gfx_fill_round(c, b.x, b.y, b.w, b.h, 6, o->vol_open ? RGB(70, 62, 140) : RGB(40, 36, 78));
-    draw_speaker(c, b.x + b.w / 2 - 1, y + TASKBAR_H / 2, o->volume, o->muted, RGB(235, 235, 250));
-}
-
-static void draw_volume_panel(canvas_t *c, const struct overlay *o) {
-    struct rect v = vol_rect(o->sw, o->sh), m = vol_mute_rect(o->sw, o->sh), s = vol_slider_rect(o->sw, o->sh);
-    draw_shadow(c, v.x, v.y, v.w, v.h);
-    gfx_fill_round(c, v.x, v.y, v.w, v.h, 10, RGB(70, 60, 120));
-    gfx_fill_round(c, v.x + 1, v.y + 1, v.w - 2, v.h - 2, 9, RGB(22, 20, 44));
-    gfx_text(c, v.x + 16, v.y + 12, "Volume", RGB(245, 245, 255), TRANSPARENT, FONT_SMALL);
-    gfx_text(c, v.x + v.w - 16 - gfx_text_width(o->device, FONT_SMALL), v.y + 12, o->device, RGB(150, 150, 190),
-             TRANSPARENT, FONT_SMALL);
-    gfx_fill_round(c, m.x, m.y, m.w, m.h, 8, o->muted ? RGB(90, 40, 60) : RGB(44, 38, 90));
-    draw_speaker(c, m.x + m.w / 2 - 1, m.y + m.h / 2, o->volume, o->muted, RGB(235, 235, 250));
-    int fillw = s.w * o->volume / 100, kx = s.x + fillw;
-    gfx_fill_round(c, s.x, s.y, s.w, s.h, 2, RGB(60, 56, 100));
-    gfx_fill_round(c, s.x, s.y, MAX(fillw, 4), s.h, 2, o->muted ? RGB(110, 100, 140) : RGB(150, 130, 255));
-    gfx_fill_circle(c, kx, s.y + 2, 8, o->muted ? RGB(150, 146, 170) : RGB(235, 230, 255));
-    char num[8];
-    ksnprintf(num, sizeof num, "%d", o->volume);
-    gfx_text(c, v.x + v.w - 20 - gfx_text_width(num, FONT_SMALL), s.y - 6, num, RGB(235, 235, 250), TRANSPARENT,
-             FONT_SMALL);
-}
-
-static void volume_tick(void) { audio_system_tone(880, 70); }
-
-static void volume_from_mouse(void) {
-    struct rect s = vol_slider_rect(sw, sh);
-    int v = (mx - s.x) * 100 / s.w;
-    if (v != audio_volume() || audio_muted()) audio_set_volume(v);
-    damage_volume();
-}
-
-static bool over_volume(int x, int y) {
-    struct rect b = vol_button_rect(sw, sh), v = vol_rect(sw, sh);
-    return in_rect(x, y, b.x, b.y, b.w, b.h) || (vol_open && in_rect(x, y, v.x, v.y, v.w, v.h));
-}
-
-/* ---- taskbar ---- */
-/* The windows the taskbar has a button for, by id, into a list kept for it. wm_lock held. */
-static struct window **tb_list;
-static size_t tb_count, tb_room;
-static size_t taskbar_buttons(void) {
-    tb_count = 0;
-    for (size_t i = 0; i < nwin; i++) {
-        struct window *w = zorder[i];
-        if (w->dead || !w->shown || !decorated(w)) continue;
-        struct window **at = kappend(&tb_list, &tb_count, &tb_room, sizeof *at);
-        if (!at) break;
-        *at = w;
-    }
-    for (size_t i = 1; i < tb_count; i++)
-        for (size_t j = i; j > 0 && tb_list[j - 1]->id > tb_list[j]->id; j--) {
-            struct window *t = tb_list[j];
-            tb_list[j] = tb_list[j - 1];
-            tb_list[j - 1] = t;
-        }
-    return tb_count;
-}
-
-static void taskbar_button_geom(int w, size_t n, size_t i, int *x, int *bwidth) {
-    int avail = w - TB_START_W - TB_CLOCK_W - TB_VOL_W - 16;
-    int bw = n ? avail / (int)n : 0;
-    if (bw > 190) bw = 190;
-    *x = TB_START_W + 8 + (int)i * bw;
-    *bwidth = bw - 4;
-}
-
-static void draw_taskbar(canvas_t *c, const struct overlay *o) {
-    int y = o->sh - TASKBAR_H;
-    gfx_fill_blend(c, 0, y, o->sw, TASKBAR_H, ARGB(220, 14, 12, 32));
-    gfx_hline(c, 0, y, o->sw, RGB(90, 76, 160));
-    if (canvas_hits(c, 0, y, TB_START_W, TASKBAR_H)) {
-        uint32_t sb = o->menu_open ? RGB(84, 68, 170) : RGB(44, 38, 90);
-        gfx_fill_round(c, 6, y + 5, TB_START_W - 6, TASKBAR_H - 10, 8, sb);
-        draw_crescent(c, 24, y + TASKBAR_H / 2, 9, RGB(246, 236, 196));
-        gfx_text(c, 42, y + 12, OS_NAME, RGB(240, 240, 255), TRANSPARENT, FONT_SMALL);
-    }
-    for (size_t i = 0; i < o->nbuttons; i++) {
-        const struct taskbar_button *b = &o->buttons[i];
-        int bx, bw;
-        taskbar_button_geom(o->sw, o->nbuttons, i, &bx, &bw);
-        if (!canvas_hits(c, bx, y, bw, TASKBAR_H)) continue;
-        uint32_t col = b->focused ? RGB(70, 62, 140) : b->minimized ? RGB(26, 24, 48) : RGB(40, 36, 78);
-        gfx_fill_round(c, bx, y + 5, bw, TASKBAR_H - 10, 6, col);
-        if (b->focused) gfx_hline(c, bx + 8, y + TASKBAR_H - 6, bw - 16, RGB(170, 150, 255));
-        text_trunc(c, bx + 10, y + 12, b->title, bw - 20, b->minimized ? RGB(140, 140, 170) : RGB(235, 235, 250));
-    }
-    if (canvas_hits(c, o->sw - TB_CLOCK_W - TB_VOL_W, y, TB_VOL_W, TASKBAR_H)) draw_volume_button(c, o, y);
-    if (!canvas_hits(c, o->sw - TB_CLOCK_W, y, TB_CLOCK_W, TASKBAR_H)) return;
-    static const char *wd[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-    static const char *mo[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-    char t1[16], t2[24];
-    ksnprintf(t1, sizeof t1, "%02d:%02d", o->clock.hour, o->clock.min);
-    ksnprintf(t2, sizeof t2, "%s %d %s", wd[o->clock.wday % 7], o->clock.mday, mo[(o->clock.mon - 1) % 12]);
-    int cx = o->sw - TB_CLOCK_W;
-    gfx_text(c, cx + (TB_CLOCK_W - gfx_text_width(t1, FONT_SMALL)) / 2, y + 3, t1, RGB(245, 245, 255), TRANSPARENT,
-             FONT_SMALL);
-    gfx_text(c, cx + (TB_CLOCK_W - gfx_text_width(t2, FONT_SMALL)) / 2, y + 20, t2, RGB(160, 160, 200), TRANSPARENT,
-             FONT_SMALL);
-}
-
-static struct window *taskbar_window_at(int x) {
-    size_t n = taskbar_buttons();
-    for (size_t i = 0; i < n; i++) {
-        int bx, bw;
-        taskbar_button_geom(sw, n, i, &bx, &bw);
-        if (x >= bx && x < bx + bw) return tb_list[i];
-    }
-    return NULL;
-}
-
-static void draw_toast(canvas_t *c, const struct overlay *o) {
-    int w = 320, h = 64, x = o->sw - w - 16, y = 16;
-    draw_shadow(c, x, y, w, h);
-    gfx_fill_round(c, x, y, w, h, 10, RGB(90, 76, 170));
-    gfx_fill_round(c, x + 1, y + 1, w - 2, h - 2, 9, RGB(28, 24, 56));
-    draw_crescent(c, x + 26, y + 32, 11, RGB(246, 236, 196));
-    text_trunc(c, x + 48, y + 12, o->toast_title, w - 60, RGB(255, 255, 255));
-    text_trunc(c, x + 48, y + 34, o->toast_text, w - 60, RGB(180, 180, 210));
-}
-
-static struct rect toast_rect(int w) { return (struct rect){w - 336 - SHADOW, 0, 336 + 2 * SHADOW, 96}; }
-
 /* ---- window drawing ---- */
 /* The shadow, without the pixels the client area replaces after it. Rounded title corners remain
    translucent and keep every pass. */
@@ -1534,7 +1199,7 @@ static void draw_layer_shadow(canvas_t *c, const struct layer *w) {
 static void draw_layer(canvas_t *c, const struct layer *w) {
     int fx = w->x, fy = w->y, fw = w->fw, fh = w->fh;
     bool focus = w->focus;
-    draw_layer_shadow(c, w);
+    if (w->shadow) draw_layer_shadow(c, w);
     if (!(w->flags & WIN_NO_DECOR)) {
         uint32_t edge = focus ? RGB(110, 96, 200) : RGB(60, 60, 84);
         uint32_t top = focus ? RGB(66, 52, 140) : RGB(44, 44, 62);
@@ -1576,7 +1241,8 @@ static void draw_layer(canvas_t *c, const struct layer *w) {
     }
     canvas_t wc;
     gfx_init(&wc, w->src->px, w->src->w, w->src->h, w->src->w);
-    gfx_blit(c, w->cx, w->cy, &wc, 0, 0, MIN(w->cw, w->src->w), MIN(w->ch, w->src->h));
+    if (w->blend) gfx_blit_alpha(c, w->cx, w->cy, &wc, 0, 0, MIN(w->cw, w->src->w), MIN(w->ch, w->src->h));
+    else gfx_blit(c, w->cx, w->cy, &wc, 0, 0, MIN(w->cw, w->src->w), MIN(w->ch, w->src->h));
     if (w->flags & WIN_RESIZABLE && !w->maximized) {
         int gx = w->x + fw - 4, gy = w->y + fh - 4;
         for (int i = 0; i < 3; i++)
@@ -1609,7 +1275,7 @@ static size_t first_layer(const struct wscreen *ws, struct rect r, bool *covered
     int64_t right = (int64_t)r.x + r.w, bottom = (int64_t)r.y + r.h;
     for (size_t at = ws->nlayers; at; at--) {
         const struct layer *l = &ws->layers[at - 1];
-        if (r.x >= l->cx && r.y >= l->cy && right <= (int64_t)l->cx + MIN(l->cw, l->src->w) &&
+        if (!l->blend && r.x >= l->cx && r.y >= l->cy && right <= (int64_t)l->cx + MIN(l->cw, l->src->w) &&
             bottom <= (int64_t)l->cy + MIN(l->ch, l->src->h)) {
             *covered = true;
             return at - 1;
@@ -1625,16 +1291,9 @@ static void compose_rect(struct wscreen *ws, struct rect r) {
     uint8_t *deep = ws->back_deep;
     bool covered;
     size_t first = first_layer(ws, r, &covered);
-    const struct overlay *o = &ws->ov;
-    bool primary = ws->id == 0;
     if (!covered) {
-        gfx_blit(&c, r.x, r.y, &ws->wall, r.x, r.y, r.w, r.h);
-        if (deep) deep_copy(deep, &c, r.x, r.y, ws->wall_deep + (size_t)r.y * c.pitch + r.x, c.pitch, r.w, r.h);
-        if (primary && o->selected) {
-            struct rect a = o->selection;
-            gfx_fill_blend(&c, a.x, a.y, a.w, a.h, ARGB(70, 150, 140, 255));
-            if (deep) deep_clear(deep, &c, a.x, a.y, a.w, a.h);
-        }
+        gfx_fill(&c, r.x, r.y, r.w, r.h, BACKGROUND);
+        if (deep) deep_clear(deep, &c, r.x, r.y, r.w, r.h);
     }
     for (size_t i = first; i < ws->nlayers; i++) {
         const struct layer *l = &ws->layers[i];
@@ -1643,7 +1302,7 @@ static void compose_rect(struct wscreen *ws, struct rect r) {
         draw_layer(&c, l);
         if (deep) {
             deep_clear(deep, &c, l->bounds.x, l->bounds.y, l->bounds.w, l->bounds.h);
-            if (l->src->deep)
+            if (l->src->deep && !l->blend)
                 deep_copy(deep, &c, l->cx, l->cy, (const uint8_t *)(l->src->px + (size_t)l->src->w * l->src->h), l->src->w,
                           MIN(l->cw, l->src->w), MIN(l->ch, l->src->h));
         }
@@ -1654,28 +1313,6 @@ static void compose_rect(struct wscreen *ws, struct rect r) {
         gfx_rect(&c, q.x, q.y, q.w, q.h, RGB(180, 160, 255));
         gfx_rect(&c, q.x + 1, q.y + 1, q.w - 2, q.h - 2, RGB(90, 70, 200));
         if (deep) deep_clear(deep, &c, q.x, q.y, q.w, q.h);
-    }
-    if (primary) {
-        bool taskbar = o->taskbar && r.y + r.h > o->sh - TASKBAR_H;
-        if (taskbar) draw_taskbar(&c, o);
-        if (o->menu_open) draw_menu(&c, o);
-        if (o->vol_open) draw_volume_panel(&c, o);
-        if (o->toast) draw_toast(&c, o);
-        if (deep) { /* the shell's own drawing is 8-bit content */
-            if (taskbar) deep_clear(deep, &c, 0, o->sh - TASKBAR_H, o->sw, TASKBAR_H);
-            if (o->menu_open) {
-                struct rect m = menu_rect(o->sh);
-                deep_clear(deep, &c, m.x - SHADOW, m.y - SHADOW, m.w + 2 * SHADOW, m.h + 2 * SHADOW);
-            }
-            if (o->vol_open) {
-                struct rect v = vol_rect(o->sw, o->sh);
-                deep_clear(deep, &c, v.x - SHADOW, v.y - SHADOW, v.w + 2 * SHADOW, v.h + 2 * SHADOW);
-            }
-            if (o->toast) {
-                struct rect t = toast_rect(o->sw);
-                deep_clear(deep, &c, t.x, t.y, t.w, t.h);
-            }
-        }
     }
     if (ws->pointer_on) {
         struct deep_mark mark;
@@ -1709,7 +1346,7 @@ static void queue_advance(struct window *w) {
 
 /* What screen ws's frame draws, taken under wm_lock (and its back_lock): the windows paced by it
    whose next present is due, its changed tiles, the layers (with references to their pixels), the
-   pointer and the desktop's own parts. */
+   pointer. */
 static void capture(struct wscreen *ws) {
     for (size_t i = 0; i < nwin; i++) {
         struct window *w = zorder[i];
@@ -1720,7 +1357,7 @@ static void capture(struct wscreen *ws) {
     ws->nlayers = 0;
     for (size_t i = 0; i < nwin; i++) {
         struct window *w = zorder[i];
-        if (!visible(w)) continue;
+        if (!drawn(w)) continue;
         struct wsurf *src = w->queue ? (w->shown_surf >= 0 ? w->surf[w->shown_surf] : NULL) : w->stable;
         struct rect b = win_bounds(w);
         if (!src || !rect_overlap(&b, &part)) continue;
@@ -1733,7 +1370,8 @@ static void capture(struct wscreen *ws) {
                             .cx = client_x(w) - ws->x, .cy = client_y(w) - ws->y,
                             .flags = w->flags | (w->fullscreen ? WIN_NO_DECOR : 0),
                             .hover = hover_win == w ? hover_btn : 0, .focus = w == f, .maximized = w->maximized,
-                            .src = wsurf_get(src), .copy = !w->queue, .bounds = bounds};
+                            .shadow = shadow_of(w) != 0, .blend = w->blend, .src = wsurf_get(src),
+                            .copy = !w->queue, .bounds = bounds};
         if (w->queue) src->readers++;
         memcpy(l->title, w->title, sizeof l->title);
         l->title[sizeof l->title - 1] = 0;
@@ -1757,40 +1395,6 @@ static void capture(struct wscreen *ws) {
     if (ws->pointer_serial != pointer_serial) {
         memcpy(ws->pointer_px, pointer_px, sizeof ws->pointer_px);
         ws->pointer_serial = pointer_serial;
-    }
-    if (ws->id == 0) {
-        struct overlay *o = &ws->ov;
-        o->sw = sw;
-        o->sh = sh;
-        o->taskbar = !f || !f->fullscreen || menu_open || vol_open;
-        o->menu_open = menu_open;
-        o->menu_sel = menu_sel;
-        o->vol_open = vol_open;
-        struct rect vb = vol_button_rect(sw, sh);
-        o->vol_hover = in_rect(mx, my, vb.x, vb.y, vb.w, vb.h) && drag_mode == DRAG_NONE;
-        o->volume = shown_volume = audio_volume();
-        o->muted = shown_muted = audio_muted();
-        strlcpy(o->device, audio_output() ? audio_output() : "No sound device", sizeof o->device);
-        o->toast = toast_until != 0;
-        memcpy(o->toast_title, toast_title, sizeof o->toast_title);
-        memcpy(o->toast_text, toast_text, sizeof o->toast_text);
-        o->selected = sel_icon >= 0;
-        if (o->selected) {
-            int x, y;
-            icon_cell(sh, sel_icon, &x, &y);
-            o->selection = (struct rect){x, y, ICON_CELL_W - 8, ICON_CELL_H - 6};
-        }
-        time_to_parts(clock_wall_seconds(), &o->clock);
-        size_t n = taskbar_buttons();
-        o->nbuttons = 0;
-        for (size_t i = 0; i < n; i++) {
-            struct taskbar_button *b = kappend(&o->buttons, &o->nbuttons, &o->buttons_room, sizeof *b);
-            if (!b) break;
-            memcpy(b->title, tb_list[i]->title, sizeof b->title);
-            b->title[sizeof b->title - 1] = 0;
-            b->minimized = tb_list[i]->minimized;
-            b->focused = tb_list[i] == f;
-        }
     }
     memcpy(ws->frame.bits, ws->dirty.bits, tiles_words(&ws->dirty) * sizeof *ws->dirty.bits);
     tiles_clear(&ws->dirty);
@@ -1901,10 +1505,38 @@ static bool frame(struct wscreen *ws) {
 static void layout(void);
 static void windows_keep_in(void);
 
-/* The wallpaper (and on screen 0 the icons) of a part w x h, into a new canvas. */
-static void draw_wall(struct wscreen *ws, canvas_t *wall, uint8_t *wall_deep) {
-    desktop_draw_wallpaper(wall, wall_deep);
-    if (ws->id == 0) draw_desktop_icons(wall, wall_deep);
+/* The maximised and fullscreen windows ws paces take their area again: it moved or changed size.
+   wm_lock held. */
+static void windows_refit(struct wscreen *ws) {
+    for (size_t i = 0; i < nwin; i++) {
+        struct window *win = zorder[i];
+        if (pacing(win) != ws || (!win->fullscreen && !win->maximized)) continue;
+        struct rect a = part_area(ws, win->fullscreen);
+        damage_window(win);
+        win->x = a.x;
+        win->y = a.y;
+        damage_window(win);
+        struct gui_event e = {.type = EV_RESIZE, .x = win->fullscreen ? a.w : a.w - 2 * BORDER,
+                              .y = win->fullscreen ? a.h : a.h - TITLE_H - BORDER};
+        if (e.x != win->cw || e.y != win->ch) push_event(win, &e);
+    }
+}
+
+/* What the shell's windows keep of each screen's edges, again. wm_lock held. */
+static void reserves_update(void) {
+    for (size_t k = 0; k < nwscreens; k++) {
+        struct wscreen *ws = wscreens[k];
+        int edges[N_EDGE_RIGHT + 1] = {0};
+        for (size_t i = 0; i < nwin; i++) {
+            struct window *w = zorder[i];
+            if (w->reserve_edge != N_EDGE_NONE && w->reserve_screen == ws->id)
+                edges[w->reserve_edge] = MAX(edges[w->reserve_edge], w->reserve);
+        }
+        if (!memcmp(edges, ws->reserved, sizeof edges)) continue;
+        memcpy(ws->reserved, edges, sizeof edges);
+        windows_refit(ws);
+        wm_screen_info_changed();
+    }
 }
 
 /* Screen ws's part becomes w x h: a new picture, its tiles, the windows that fill it told. Any
@@ -1913,25 +1545,21 @@ static bool wscreen_resize(struct wscreen *ws, int w, int h) {
     size_t pages = ALIGN_UP((uint64_t)w * h * 4, PAGE_SIZE) / PAGE_SIZE;
     size_t deep_pages = ALIGN_UP((uint64_t)w * h, PAGE_SIZE) / PAGE_SIZE;
     bool deep = fb.deep;
-    uint32_t *bb = vmalloc(pages), *wp = vmalloc(pages);
-    uint8_t *bd = deep ? vmalloc(deep_pages) : NULL, *wd = deep ? vmalloc(deep_pages) : NULL;
+    uint32_t *bb = vmalloc(pages);
+    uint8_t *bd = deep ? vmalloc(deep_pages) : NULL;
     struct tiles dirty = {0}, frame = {0}, remote = {0}, both = {0}, stale[SCREEN_BUFFERS_MAX] = {0};
-    bool ok = bb && wp && (!deep || (bd && wd)) && tiles_new(&dirty, w, h) && tiles_new(&frame, w, h) &&
+    bool ok = bb && (!deep || bd) && tiles_new(&dirty, w, h) && tiles_new(&frame, w, h) &&
               tiles_new(&remote, w, h) && tiles_new(&both, w, h);
     for (unsigned b = 0; ok && b < SCREEN_BUFFERS_MAX; b++) ok = tiles_new(&stale[b], w, h);
     if (ok) {
-        canvas_t wall;
-        gfx_init(&wall, wp, w, h, w);
-        if (wd) memset(wd, 0, (size_t)w * h);
-        draw_wall(ws, &wall, wd);
-        memcpy(bb, wp, (size_t)w * h * 4);
-        if (bd) memcpy(bd, wd, (size_t)w * h);
+        canvas_t back;
+        gfx_init(&back, bb, w, h, w);
+        gfx_fill(&back, 0, 0, w, h, BACKGROUND);
+        if (bd) memset(bd, 0, (size_t)w * h);
     }
     if (!ok) {
         if (bb) vfree(bb, pages);
-        if (wp) vfree(wp, pages);
         if (bd) vfree(bd, deep_pages);
-        if (wd) vfree(wd, deep_pages);
         kfree(dirty.bits);
         kfree(frame.bits);
         kfree(remote.bits);
@@ -1940,14 +1568,12 @@ static bool wscreen_resize(struct wscreen *ws, int w, int h) {
         return false;
     }
     mutex_lock(&ws->back_lock);
-    canvas_t old_back = ws->back, old_wall = ws->wall;
-    uint8_t *old_bd = ws->back_deep, *old_wd = ws->wall_deep;
+    canvas_t old_back = ws->back;
+    uint8_t *old_bd = ws->back_deep;
     struct tiles old_frame = ws->frame, old_remote = ws->remote, old_both = ws->both, old_stale[SCREEN_BUFFERS_MAX];
     memcpy(old_stale, ws->stale, sizeof old_stale);
     gfx_init(&ws->back, bb, w, h, w);
-    gfx_init(&ws->wall, wp, w, h, w);
     ws->back_deep = bd;
-    ws->wall_deep = wd;
     ws->frame = frame;
     ws->remote = remote;
     ws->both = both;
@@ -1964,16 +1590,7 @@ static bool wscreen_resize(struct wscreen *ws, int w, int h) {
     windows_keep_in();
     mx = MAX(0, MIN(mx, desk_w - 1));
     my = MAX(0, MIN(my, desk_h - 1));
-    for (size_t i = 0; i < nwin; i++) {
-        struct window *win = zorder[i];
-        if (pacing(win) != ws || (!win->fullscreen && !win->maximized)) continue;
-        struct rect a = part_area(ws, win->fullscreen);
-        win->x = a.x;
-        win->y = a.y;
-        struct gui_event e = {.type = EV_RESIZE, .x = win->fullscreen ? a.w : a.w - 2 * BORDER,
-                              .y = win->fullscreen ? a.h : a.h - TITLE_H - BORDER};
-        push_event(win, &e);
-    }
+    windows_refit(ws);
     damage_all();
     direct_update();
     wm_unlock();
@@ -1982,9 +1599,7 @@ static bool wscreen_resize(struct wscreen *ws, int w, int h) {
     size_t old_pages = ALIGN_UP((uint64_t)old_back.w * old_back.h * 4, PAGE_SIZE) / PAGE_SIZE;
     size_t old_deep_pages = ALIGN_UP((uint64_t)old_back.w * old_back.h, PAGE_SIZE) / PAGE_SIZE;
     if (old_back.px) vfree(old_back.px, old_pages);
-    if (old_wall.px) vfree(old_wall.px, old_pages);
     if (old_bd) vfree(old_bd, old_deep_pages);
-    if (old_wd) vfree(old_wd, old_deep_pages);
     kfree(old_dirty.bits);
     kfree(old_frame.bits);
     kfree(old_remote.bits);
@@ -2023,10 +1638,11 @@ static void windows_keep_in(void) {
         for (size_t j = 0; j < nwscreens && !in; j++)
             in = part_on(wscreens[j]) && in_rect(cx, cy, wscreens[j]->x, wscreens[j]->y, wscreens[j]->w, wscreens[j]->h);
         if (in) continue;
-        if (w->x + frame_w(w) > sw) w->x = MAX(0, sw - frame_w(w));
-        if (w->y + frame_h(w) > sh - TASKBAR_H) w->y = MAX(0, sh - TASKBAR_H - frame_h(w));
-        w->x = MAX(w->x, 0);
-        w->y = MAX(w->y, 0);
+        struct rect a = work_area();
+        if (w->x + frame_w(w) > a.x + a.w) w->x = MAX(a.x, a.x + a.w - frame_w(w));
+        if (w->y + frame_h(w) > a.y + a.h) w->y = MAX(a.y, a.y + a.h - frame_h(w));
+        w->x = MAX(w->x, a.x);
+        w->y = MAX(w->y, a.y);
     }
 }
 
@@ -2313,7 +1929,7 @@ static void cycle_windows(void) {
     if (!f) {
         /* restore the most recent minimized window */
         for (size_t i = nwin; i-- > 0;)
-            if (zorder[i]->shown && !zorder[i]->dead) {
+            if (zorder[i]->shown && !zorder[i]->dead && zorder[i]->layer == N_LAYER_NORMAL) {
                 raise_window(zorder[i]);
                 return;
             }
@@ -2321,19 +1937,42 @@ static void cycle_windows(void) {
     }
     int count = 0;
     for (size_t i = 0; i < nwin; i++)
-        if (visible(zorder[i])) count++;
+        if (visible(zorder[i]) && zorder[i]->layer == N_LAYER_NORMAL) count++;
+    if (f->layer != N_LAYER_NORMAL) {
+        for (size_t i = nwin; i-- > 0;)
+            if (visible(zorder[i]) && zorder[i]->layer == N_LAYER_NORMAL) {
+                raise_window(zorder[i]);
+                return;
+            }
+        return;
+    }
     if (count < 2) return;
     lower_to_bottom(f);
 }
 
+/* The hot key's window takes a press that is one (and its release goes with it). */
+static bool hotkey_take(const struct key_event *k) {
+    uint32_t mods = k->mods & (MOD_SHIFT | MOD_CTRL | MOD_ALT);
+    for (size_t i = 0; i < nhotkeys; i++) {
+        struct hotkey *h = &hotkeys[i];
+        if (h->key != k->key) continue;
+        if (!k->pressed && h->held) {
+            h->held = false;
+            return true;
+        }
+        if (!k->pressed || h->mods != mods) continue;
+        h->held = true;
+        push_event(h->w, &(struct gui_event){.type = EV_HOTKEY, .key = k->key, .mods = mods, .pressed = 1});
+        return true;
+    }
+    return false;
+}
+
 static void handle_key(const struct key_event *k) {
+    if (hotkey_take(k)) return;
     struct window *f = focused();
     if (k->pressed) {
-        bool ctrl = k->mods & MOD_CTRL, alt = k->mods & MOD_ALT;
-        if (k->key == KEY_SUPER || (ctrl && k->key == KEY_ESC)) {
-            set_menu(!menu_open);
-            return;
-        }
+        bool alt = k->mods & MOD_ALT;
         if (alt && k->key == KEY_TAB) {
             cycle_windows();
             return;
@@ -2342,43 +1981,17 @@ static void handle_key(const struct key_event *k) {
             if (f) send_simple(f, EV_CLOSE);
             return;
         }
-        if (ctrl && alt && (k->key == 't' || k->key == 'T')) {
-            launch(SYSTEM "term", NULL);
-            return;
-        }
-        if (vol_open && k->key == KEY_ESC) {
-            set_volume_panel(false);
-            return;
-        }
-        if (menu_open) {
-            if (k->key == KEY_ESC) set_menu(false);
-            else if (k->key == KEY_UP || k->key == KEY_DOWN) {
-                int d = k->key == KEY_UP ? -1 : 1;
-                int n = menu_count();
-                menu_sel = menu_sel < 0 ? (d > 0 ? 0 : n - 1) : (menu_sel + d + n) % n;
-                struct rect m = menu_rect(sh);
-                damage_rect(m.x, m.y, m.w, m.h);
-            } else if (k->key == KEY_ENTER && menu_sel >= 0) {
-                int s = menu_sel;
-                set_menu(false);
-                launch(menu_app(s)->path, menu_app(s)->arg);
-            }
-            return;
-        }
     }
-    if (k->key == KEY_SUPER) return;
     if (f) {
         struct gui_event e = {.type = EV_KEY, .key = k->key, .mods = k->mods, .pressed = k->pressed};
         push_event(f, &e);
-    } else if (k->pressed && sel_icon >= 0 && k->key == KEY_ENTER) {
-        launch(apps[desktop_apps[sel_icon]].path, apps[desktop_apps[sel_icon]].arg);
     }
 }
 
 static void damage_cursor(void) { damage_rect(mx - pointer_hx, my - pointer_hy, POINTER_SIZE, POINTER_SIZE); }
 
 /* What the pointer is over decides what it shows: the WM's own shapes over what the WM draws (a
-   menu, the volume panel, a toast, the taskbar, a frame, the resize band) and during its drags, the
+   frame, the resize band) and during its drags, the
    window's wish (SYS_WIN_POINTER) over its client area and while a drag that started there goes on.
    *from is that window, NULL for one of the WM's shapes. */
 static int pointer_choose(struct window **from) {
@@ -2390,12 +2003,6 @@ static int pointer_choose(struct window **from) {
         return (int)drag_win->pointer_shape;
     }
     if (drag_mode != DRAG_NONE) return N_POINTER_DEFAULT;
-    struct rect r;
-    if (menu_open && (r = menu_rect(sh), in_rect(mx, my, r.x, r.y, r.w, r.h))) return N_POINTER_DEFAULT;
-    if (vol_open && (r = vol_rect(sw, sh), in_rect(mx, my, r.x, r.y, r.w, r.h))) return N_POINTER_DEFAULT;
-    if (toast_until && (r = toast_rect(sw), in_rect(mx, my, r.x, r.y, r.w, r.h))) return N_POINTER_DEFAULT;
-    struct window *f = focused();
-    if (mx < sw && my >= sh - TASKBAR_H && (!f || !f->fullscreen || menu_open || vol_open)) return N_POINTER_DEFAULT;
     struct window *w = window_at(mx, my);
     if (!w || in_resize_grip(w, mx, my)) return w ? N_POINTER_NWSE_RESIZE : N_POINTER_DEFAULT;
     if (!in_rect(mx, my, client_x(w), client_y(w), w->cw, w->ch)) return N_POINTER_DEFAULT;
@@ -2420,7 +2027,7 @@ static void pointer_update(void) {
         pointer_hx = w->pointer_hx;
         pointer_hy = w->pointer_hy;
     } else {
-        memcpy(pointer_px, desktop_pointer(shape, &pointer_hx, &pointer_hy), sizeof pointer_px);
+        memcpy(pointer_px, pointer_art(shape, &pointer_hx, &pointer_hy), sizeof pointer_px);
     }
     pointer_shape = shape;
     pointer_from = from;
@@ -2432,6 +2039,10 @@ static void pointer_update(void) {
 static void update_hover(void) {
     struct window *w = window_at(mx, my);
     int b = w ? hit_button(w, mx, my) : 0;
+    if (w != pointer_over) {
+        if (pointer_over && pointer_over->layer != N_LAYER_NORMAL) send_simple(pointer_over, EV_MOUSE_LEAVE);
+        pointer_over = w;
+    }
     if (w != hover_win || b != hover_btn) {
         if (hover_win && hover_btn) damage_rect(hover_win->x + frame_w(hover_win) - 80, hover_win->y, 80, TITLE_H);
         hover_win = b ? w : NULL;
@@ -2449,61 +2060,9 @@ static void left_press(uint64_t at) {
     last_click_x = mx;
     last_click_y = my;
 
-    if (vol_open) {
-        struct rect v = vol_rect(sw, sh), mr = vol_mute_rect(sw, sh), s = vol_slider_rect(sw, sh), b = vol_button_rect(sw, sh);
-        if (in_rect(mx, my, v.x, v.y, v.w, v.h)) {
-            if (in_rect(mx, my, mr.x, mr.y, mr.w, mr.h)) {
-                audio_set_muted(!audio_muted());
-                damage_volume();
-                volume_tick();
-            } else if (in_rect(mx, my, s.x - 10, s.y - 14, s.w + 20, s.h + 28)) {
-                drag_mode = DRAG_VOLUME;
-                volume_from_mouse();
-            }
-            return;
-        }
-        set_volume_panel(false);
-        if (in_rect(mx, my, b.x, b.y, b.w, b.h)) return; /* clicking the speaker again closes */
-    }
-    if (menu_open) {
-        struct rect m = menu_rect(sh);
-        if (in_rect(mx, my, m.x, m.y, m.w, m.h)) {
-            int i = menu_item_at(mx, my);
-            if (i >= 0) {
-                set_menu(false);
-                launch(menu_app(i)->path, menu_app(i)->arg);
-            }
-            return;
-        }
-        set_menu(false);
-        if (my >= sh - TASKBAR_H && mx < TB_START_W) return; /* clicking start again closes */
-    }
-    if (mx < sw && my >= sh - TASKBAR_H && (!focused() || !focused()->fullscreen)) {
-        if (mx < TB_START_W) {
-            set_menu(true);
-            return;
-        }
-        struct rect vb = vol_button_rect(sw, sh);
-        if (in_rect(mx, my, vb.x, vb.y, vb.w, vb.h)) {
-            set_volume_panel(true);
-            return;
-        }
-        struct window *w = taskbar_window_at(mx);
-        if (w) {
-            if (w == focused()) minimize_window(w);
-            else raise_window(w);
-        }
-        return;
-    }
     struct window *w = window_at(mx, my);
     if (w) {
-        if (sel_icon >= 0) {
-            int x, y;
-            icon_cell(sh, sel_icon, &x, &y);
-            damage_rect(x, y, ICON_CELL_W, ICON_CELL_H);
-            sel_icon = -1;
-        }
-        if (w != focused()) raise_window(w);
+        if (w != focused() && !w->no_focus) raise_window(w);
         int b = hit_button(w, mx, my);
         if (b) {
             drag_mode = DRAG_BUTTON;
@@ -2539,21 +2098,6 @@ static void left_press(uint64_t at) {
         }
         return;
     }
-    /* desktop */
-    int ic = icon_at(mx, my);
-    if (ic != sel_icon) {
-        int x, y;
-        if (sel_icon >= 0) {
-            icon_cell(sh, sel_icon, &x, &y);
-            damage_rect(x, y, ICON_CELL_W, ICON_CELL_H);
-        }
-        sel_icon = ic;
-        if (ic >= 0) {
-            icon_cell(sh, ic, &x, &y);
-            damage_rect(x, y, ICON_CELL_W, ICON_CELL_H);
-        }
-    }
-    if (ic >= 0 && dbl) launch(apps[desktop_apps[ic]].path, apps[desktop_apps[ic]].arg);
 }
 
 static void left_release(void) {
@@ -2561,7 +2105,6 @@ static void left_release(void) {
     int mode = drag_mode;
     drag_mode = DRAG_NONE;
     drag_win = NULL;
-    if (mode == DRAG_VOLUME) volume_tick(); /* let the new level be heard */
     if (!w) return;
     switch (mode) {
     case DRAG_BUTTON:
@@ -2657,22 +2200,9 @@ static void handle_mouse(const struct mouse_event *m, uint64_t at) {
             damage_rect(resize_rect.x, resize_rect.y, resize_rect.w, resize_rect.h);
         } else if (drag_mode == DRAG_CLIENT && drag_win) {
             send_mouse(drag_win, EV_MOUSE_MOVE, mbuttons);
-        } else if (drag_mode == DRAG_VOLUME) {
-            volume_from_mouse();
         } else if (drag_mode == DRAG_NONE) {
-            struct rect vb = vol_button_rect(sw, sh);
-            if (in_rect(mx, my, vb.x, vb.y, vb.w, vb.h) != in_rect(ox, oy, vb.x, vb.y, vb.w, vb.h))
-                damage_rect(vb.x, vb.y, vb.w, vb.h); /* hover highlight */
             struct window *w = window_at(mx, my);
             if (w && in_rect(mx, my, client_x(w), client_y(w), w->cw, w->ch)) send_mouse(w, EV_MOUSE_MOVE, mbuttons);
-            if (menu_open) {
-                int s = menu_item_at(mx, my);
-                if (s != menu_sel) {
-                    menu_sel = s;
-                    struct rect r = menu_rect(sh);
-                    damage_rect(r.x, r.y, r.w, r.h);
-                }
-            }
         }
         update_hover();
     }
@@ -2687,15 +2217,11 @@ static void handle_mouse(const struct mouse_event *m, uint64_t at) {
         /* right / middle buttons go straight to the window under the cursor */
         struct window *w = drag_mode == DRAG_CLIENT ? drag_win : window_at(mx, my);
         if (w && in_rect(mx, my, client_x(w), client_y(w), w->cw, w->ch)) {
-            if (w != focused() && (mbuttons & 6)) raise_window(w);
+            if (w != focused() && !w->no_focus && (mbuttons & 6)) raise_window(w);
             send_mouse(w, (mbuttons & changed & 6) ? EV_MOUSE_DOWN : EV_MOUSE_UP, mbuttons);
         }
     }
-    if (m->wheel && over_volume(mx, my)) { /* scrolling over the speaker or its panel */
-        audio_set_volume(audio_volume() - m->wheel * 5);
-        damage_volume();
-        volume_tick();
-    } else if (m->wheel) {
+    if (m->wheel) {
         struct window *w = window_at(mx, my);
         if (!w) w = focused();
         if (w) {
@@ -2706,10 +2232,9 @@ static void handle_mouse(const struct mouse_event *m, uint64_t at) {
 }
 
 /* ---- the desktop thread ----
-   Each pass applies the input waiting, the keys whose releases the ring kept, and what the
-   desktop shows by itself (the taskbar's clock and volume, a toast's end, the pointer's image,
-   the screens' states), and then sleeps until the next of those changes by itself while
-   desk_wakes still reads the same. Its deadline is the fastest screen's refresh: input reaches
+   Each pass applies the input waiting, the keys whose releases the ring kept, and what follows
+   from them (the pointer's image, the screens' states), and then sleeps while desk_wakes still
+   reads the same. Its deadline is the fastest screen's refresh: input reaches
    the windows within a frame. */
 static void desktop_thread(void *arg) {
     (void)arg;
@@ -2733,25 +2258,9 @@ static void desktop_thread(void *arg) {
             handle_key(&(struct key_event){.key = key, .pressed = false, .time_ns = input_at});
         }
         input_at = 0;
-        struct tm_parts tp;
-        int64_t wall = clock_wall_ns();
-        time_to_parts(wall / (int64_t)NS_PER_S, &tp);
-        if (tp.min != last_clock_min) {
-            last_clock_min = tp.min;
-            damage_rect(sw - TB_CLOCK_W, sh - TASKBAR_H, TB_CLOCK_W, TASKBAR_H);
-        }
-        /* when the minute shown changes next (a wall clock set meanwhile tells, wm_taskbar_changed) */
-        uint64_t minute_at = clock_after(60 * NS_PER_S - (uint64_t)wall % (60 * NS_PER_S));
-        if (audio_volume() != shown_volume || audio_muted() != shown_muted) damage_volume();
-        if (toast_until && clock_now_ns() >= toast_until) {
-            toast_until = 0;
-            struct rect t = toast_rect(sw);
-            damage_rect(t.x, t.y, t.w, t.h);
-        }
         pointer_update();
         direct_update();
         bool smooth = deep_wanted && fb_dither_able();
-        uint64_t until = MIN(minute_at, toast_until ? toast_until : CLOCK_NEVER);
         wm_unlock();
         if (fastest != policy) {
             policy = fastest;
@@ -2772,7 +2281,7 @@ static void desktop_thread(void *arg) {
         uint64_t lost = __atomic_exchange_n(&in_lost, 0, __ATOMIC_RELAXED);
         if (lost) kprintf("wm: the input ring was full: %lu key presses lost\n", (unsigned long)lost);
         if (__atomic_load_n(&in_head, __ATOMIC_ACQUIRE) != in_tail || __atomic_load_n(&any_released, __ATOMIC_RELAXED)) continue;
-        wq_wait_unless(&desk_wq, &desk_wakes, seen, until);
+        wq_wait_unless(&desk_wq, &desk_wakes, seen, CLOCK_NEVER);
     }
 }
 
@@ -2791,8 +2300,8 @@ static void clipboard_put(char *nb, size_t n) {
     kfree(clipboard);
     clipboard = nb;
     clipboard_len = n;
-    if (process_current()) clipboard_owner = *identity_current();
-    else identity_session(&clipboard_owner); /* 核の thread が置いた：今のセッションのもの */
+    clipboard_open = !process_current();
+    if (!clipboard_open) clipboard_owner = *identity_current();
     clipboard_seq++;
     wm_unlock();
 }
@@ -2951,14 +2460,6 @@ void wm_repaint(void) {
     wm_unlock();
 }
 
-/* Each desktop pass compares the volume, the muting and the wall clock's minute with what the
-   taskbar shows and draws what differs; it sleeps until the minute's next change counted from the
-   wall clock as it read it. The owners of those (dev/audio.c, whoever sets the wall clock) call
-   this after a change. */
-void wm_taskbar_changed(void) {
-    if (wm_running()) desk_wake();
-}
-
 /* Whether a remote viewer has the desktop at its window's size now. Read without wm_lock, so a
    caller holding another lock (or a spinlock) may ask. */
 bool wm_remote_viewing(void) { return __atomic_load_n(&remote_users, __ATOMIC_RELAXED) > 0; }
@@ -3016,14 +2517,14 @@ static const struct screen_display display = {.repaint = wm_repaint, .direct = w
                                               .modes_offer = screen_modes_offer, .modes_gone = screen_modes_gone,
                                               .modes_shown = screen_modes_shown, .state = wm_screen_state};
 static const struct pm_desktop power_desktop = {.window_count = wm_window_count, .close_windows = wm_close_windows,
-                                                .notify = wm_notify, .repaint = wm_repaint};
-static struct settings_hearer sound_hearer = {.changed = wm_taskbar_changed};
+                                                .repaint = wm_repaint};
 
 void wm_init(void) {
     screen_display = &display;
     pm_set_desktop(&power_desktop);
-    settings_hear(N_DOMAIN_AUDIO, &sound_hearer);
     watched_init(&screen_watched, NULL);
+    watched_init(&shell_watched, NULL);
+    __atomic_store_n(&shell_watchable, true, __ATOMIC_RELEASE);
     seen_dither_able = fb_dither_able();
     struct screen *s0 = screen_get(0);
     seen_boot = s0 && screen_boot(s0);
@@ -3062,22 +2563,6 @@ void wm_init(void) {
         if (!wscreens[i]->thread) wscreen_start(wscreens[i]);
     wm_unlock();
     kprintf("wm: desktop started at %dx%d on %u screens\n", sw, sh, (unsigned)count);
-    wm_notify("Welcome to " OS_NAME, "Double-click an icon or open the moon menu.");
-}
-
-void wm_notify(const char *title, const char *text) {
-    if (!wm_running()) {
-        kprintf("[%s] %s\n", title, text);
-        return;
-    }
-    wm_lock();
-    strlcpy(toast_title, title, sizeof toast_title);
-    strlcpy(toast_text, text, sizeof toast_text);
-    toast_until = clock_after(TOAST_NS);
-    struct rect t = toast_rect(sw);
-    damage_rect(t.x, t.y, t.w, t.h);
-    desk_wake();
-    wm_unlock();
 }
 
 int wm_window_count(char *top_title, size_t n) {
@@ -3085,7 +2570,7 @@ int wm_window_count(char *top_title, size_t n) {
     int count = 0;
     wm_lock();
     for (size_t i = nwin; i-- > 0;) {
-        if (zorder[i]->dead) continue;
+        if (zorder[i]->dead || zorder[i]->layer != N_LAYER_NORMAL) continue;
         if (!count++ && top_title) strlcpy(top_title, zorder[i]->title, n);
     }
     wm_unlock();
@@ -3096,7 +2581,7 @@ void wm_close_windows(void) {
     if (!wm_running()) return;
     wm_lock();
     for (size_t i = 0; i < nwin; i++)
-        if (!zorder[i]->dead) send_simple(zorder[i], EV_CLOSE);
+        if (!zorder[i]->dead && zorder[i]->layer == N_LAYER_NORMAL) send_simple(zorder[i], EV_CLOSE);
     wm_unlock();
 }
 
@@ -3175,9 +2660,12 @@ static bool surfaces_new(struct wsurf **surf, unsigned n, struct wsurf **stable,
 static void show_if_needed(struct window *w) {
     if (w->shown) return;
     w->shown = true;
-    raise_window(w);
+    /* the desktop and the panels come up behind what has the focus */
+    if (w->layer == N_LAYER_DESKTOP) stack_top(w);
+    else raise_window(w);
     damage_window(w);
-    damage_taskbar();
+    windows_changed();
+    update_focus();
     desk_wake();
 }
 
@@ -3230,16 +2718,18 @@ static int64_t sys_win_create(int cw, int ch, const char *title, int flags, uint
     w->vmm_space = process_current()->vmm_space;
     vmm_space_get(w->vmm_space);
     zorder[nwin++] = w;
+    stack_top(w);
+    struct rect a = work_area();
     if (flags & WIN_CENTER) {
-        w->x = (sw - frame_w(w)) / 2;
-        w->y = (sh - TASKBAR_H - frame_h(w)) / 2;
+        w->x = a.x + (a.w - frame_w(w)) / 2;
+        w->y = a.y + (a.h - frame_h(w)) / 2;
     } else {
         static int cascade;
         w->x = 140 + (cascade % 8) * 30;
         w->y = 40 + (cascade % 8) * 26;
         cascade++;
-        if (w->x + frame_w(w) > sw) w->x = MAX(0, sw - frame_w(w));
-        if (w->y + frame_h(w) > sh - TASKBAR_H) w->y = MAX(0, sh - TASKBAR_H - frame_h(w));
+        if (w->x + frame_w(w) > a.x + a.w) w->x = MAX(a.x, a.x + a.w - frame_w(w));
+        if (w->y + frame_h(w) > a.y + a.h) w->y = MAX(a.y, a.y + a.h - frame_h(w));
     }
     /* Use the ordinary WM transition and resize event. */
     if (flags & WIN_START_MAXIMIZED) toggle_maximize(w);
@@ -3479,7 +2969,8 @@ static int64_t wm_syscall_locked(int num, uint64_t b, uint64_t c, uint64_t e, st
         }
         push_event(w, &resize);
         damage_window(w);
-        damage_taskbar();
+        damage_panels();
+        windows_changed();
         desk_wake();
         return 0;
     }
@@ -3511,7 +3002,7 @@ static int64_t wm_syscall_locked(int num, uint64_t b, uint64_t c, uint64_t e, st
         memcpy(w->title, in->title, sizeof w->title);
         if (w->shown) {
             damage_rect(w->x, w->y, frame_w(w), TITLE_H);
-            damage_taskbar();
+            windows_changed();
         }
         return 0;
     case SYS_WIN_MOVE:
@@ -3524,22 +3015,6 @@ static int64_t wm_syscall_locked(int num, uint64_t b, uint64_t c, uint64_t e, st
         return 0;
     default: return -N_ERR_UNSUPPORTED;
     }
-}
-
-/* Starts the program at path a (with the one argument b, or none), without wm_lock. */
-static int64_t sys_gui_launch(uint64_t a, uint64_t b) {
-    char *path, *arg = NULL;
-    int r = user_string((const char *)a, &path);
-    if (r < 0) return r;
-    if (b && (r = user_string((const char *)b, &arg)) < 0) {
-        kfree(path);
-        return r;
-    }
-    /* 呼ぶ側の身元のまま：窓の系を通って権限が上がらない */
-    r = proc_spawn_simple(path, arg, identity_current());
-    kfree(path);
-    kfree(arg);
-    return r;
 }
 
 /* SYS_SCREEN_INFO's settings and screen format: the reply is made under wm_lock and copied out
@@ -3563,7 +3038,7 @@ static int64_t sys_screen_info(uint64_t a, uint64_t b, uint64_t c) {
     wm_lock();
     bool on = wm_running();
     si.width = on ? (uint32_t)sw : fb.width;
-    si.height = on ? (uint32_t)(sh - TASKBAR_H) : fb.height;
+    si.height = on ? (uint32_t)work_area().h : fb.height;
     si.bits_per_pixel = fb.bpp;
     si.red_bits = fb.simulated ? 10 : fb.rsize;
     si.green_bits = fb.simulated ? 10 : fb.gsize;
@@ -3596,8 +3071,9 @@ static int64_t sys_clipboard_set(uint64_t a, uint64_t b) {
 static int64_t sys_clipboard_get(uint64_t a, uint64_t b) {
     wm_lock();
     struct n_identity owner = clipboard_owner;
+    bool open = clipboard_open;
     wm_unlock();
-    if (clipboard && !identity_may_reach(identity_current(), &owner)) return -N_ERR_DENIED;
+    if (clipboard && !open && !identity_may_reach(identity_current(), &owner)) return -N_ERR_DENIED;
     size_t len;
     char *text = wm_clipboard_snapshot(&len);
     if (!text) return -N_ERR_NO_MEMORY;
@@ -3607,8 +3083,164 @@ static int64_t sys_clipboard_get(uint64_t a, uint64_t b) {
     return r < 0 ? r : (int64_t)len;
 }
 
+/* ---- the shell (display_abi.h) ---- */
+
+/* SYS_SHELL_PLACE. */
+static int64_t shell_place(int window, const void *uplace, size_t size) {
+    struct n_shell_place p;
+    if (size != sizeof p) return -N_ERR_INVALID;
+    int r = copy_from_user(&p, uplace, sizeof p);
+    if (r < 0) return r;
+    if (p.layer > N_LAYER_OVERLAY || p.reserve_edge > N_EDGE_RIGHT || p.reserve > (uint32_t)N_WIN_SIZE_MAX ||
+        (p.flags & ~(N_PLACE_NO_FOCUS | N_PLACE_BLEND)) || p.reserved)
+        return -N_ERR_INVALID;
+    struct handle *handle = handle_get(window);
+    if (!handle) return -N_ERR_NO_HANDLE;
+    int64_t result = -N_ERR_WRONG_KIND;
+    if (handle_is(handle, &win_ops)) {
+        wm_lock();
+        struct window *w = own_window(handle, &result);
+        if (w && !(w->flags & WIN_NO_DECOR)) result = -N_ERR_INVALID;
+        else if (w && p.screen >= nwscreens) result = -N_ERR_NOT_FOUND;
+        else if (w) {
+            struct wscreen *ws = wscreens[p.screen];
+            damage_window(w);
+            w->layer = p.layer;
+            w->no_focus = p.layer == N_LAYER_PANEL || (p.flags & N_PLACE_NO_FOCUS);
+            w->blend = p.flags & N_PLACE_BLEND;
+            w->x = ws->x + p.x;
+            w->y = ws->y + p.y;
+            w->reserve_edge = p.reserve_edge;
+            w->reserve_screen = p.screen;
+            w->reserve = (int)p.reserve;
+            if (w->no_focus && focus_owner == w) focus_owner = NULL;
+            stack_top(w);
+            damage_window(w);
+            reserves_update();
+            windows_changed();
+            update_focus();
+            direct_update();
+            desk_wake();
+        }
+        wm_unlock();
+    }
+    handle_close(handle);
+    return result;
+}
+
+/* A list of count items (the kernel's memory, freed here) to the app: the count there is. */
+static int64_t list_out(void *out, size_t max, void *list, size_t count, size_t item) {
+    int r = 0;
+    if (MIN(max, count)) r = copy_to_user(out, list, MIN(max, count) * item);
+    kfree(list);
+    return r < 0 ? r : (int64_t)count;
+}
+
+/* SYS_SHELL_SCREENS. */
+static int64_t shell_screens(struct n_shell_screen *out, size_t max) {
+    if (max > SIZE_MAX / sizeof *out) return -N_ERR_INVALID;
+    wm_lock();
+    struct n_shell_screen *list = kzalloc(MAX(nwscreens, (size_t)1) * sizeof *list);
+    if (!list) {
+        wm_unlock();
+        return -N_ERR_NO_MEMORY;
+    }
+    size_t count = nwscreens;
+    for (size_t i = 0; i < count; i++) {
+        struct wscreen *ws = wscreens[i];
+        list[i] = (struct n_shell_screen){.x = ws->x, .y = ws->y, .width = ws->w, .height = ws->h, .on = part_on(ws)};
+    }
+    wm_unlock();
+    return list_out(out, max, list, count, sizeof *list);
+}
+
+/* SYS_SHELL_WINDOWS: the apps' framed windows that have been shown, oldest first. */
+static int64_t shell_windows(struct n_shell_window *out, size_t max) {
+    if (max > SIZE_MAX / sizeof *out) return -N_ERR_INVALID;
+    wm_lock();
+    struct n_shell_window *list = kzalloc(MAX(nwin, (size_t)1) * sizeof *list);
+    if (!list) {
+        wm_unlock();
+        return -N_ERR_NO_MEMORY;
+    }
+    struct window *f = focused();
+    size_t count = 0;
+    for (size_t i = 0; i < nwin; i++) {
+        struct window *w = zorder[i];
+        if (w->dead || !w->shown || !decorated(w) || w->layer != N_LAYER_NORMAL) continue;
+        struct wscreen *ws = pacing(w);
+        struct n_shell_window item = {.id = (uint32_t)w->id, .app = w->pid, .screen = ws ? ws->id : 0,
+                                      .state = (w->minimized ? N_SHELL_WINDOW_MINIMIZED : 0) |
+                                               (w == f ? N_SHELL_WINDOW_FOCUSED : 0)};
+        memcpy(item.title, w->title, sizeof item.title);
+        item.title[sizeof item.title - 1] = 0;
+        size_t at = count++;
+        for (; at > 0 && list[at - 1].id > item.id; at--) list[at] = list[at - 1];
+        list[at] = item;
+    }
+    wm_unlock();
+    return list_out(out, max, list, count, sizeof *list);
+}
+
+/* SYS_SHELL_WINDOW. */
+static int64_t shell_window(uint64_t id, uint64_t op) {
+    if (op > N_SHELL_CLOSE) return -N_ERR_INVALID;
+    int64_t result = -N_ERR_NOT_FOUND;
+    wm_lock();
+    for (size_t i = 0; i < nwin; i++) {
+        struct window *w = zorder[i];
+        if ((uint64_t)w->id != id || w->dead || w->layer != N_LAYER_NORMAL) continue;
+        if (op == N_SHELL_RAISE) raise_window(w);
+        else if (op == N_SHELL_MINIMIZE) minimize_window(w);
+        else send_simple(w, EV_CLOSE);
+        direct_update();
+        desk_wake();
+        result = 0;
+        break;
+    }
+    wm_unlock();
+    return result;
+}
+
+/* SYS_SHELL_HOTKEY. */
+static int64_t shell_hotkey(int window, uint64_t key, uint64_t mods) {
+    if (mods & ~(uint64_t)(MOD_SHIFT | MOD_CTRL | MOD_ALT)) return -N_ERR_INVALID;
+    struct handle *handle = handle_get(window);
+    if (!handle) return -N_ERR_NO_HANDLE;
+    int64_t result = -N_ERR_WRONG_KIND;
+    if (handle_is(handle, &win_ops)) {
+        wm_lock();
+        struct window *w = own_window(handle, &result);
+        if (w) {
+            bool taken = false;
+            for (size_t i = 0; i < nhotkeys; i++)
+                taken |= hotkeys[i].key == key && hotkeys[i].mods == mods;
+            struct hotkey *h = taken ? NULL : kappend(&hotkeys, &nhotkeys, &hotkeys_room, sizeof *h);
+            if (h) *h = (struct hotkey){.w = w, .key = (uint32_t)key, .mods = (uint32_t)mods};
+            result = taken ? -N_ERR_EXISTS : h ? 0 : -N_ERR_NO_MEMORY;
+        }
+        wm_unlock();
+    }
+    handle_close(handle);
+    return result;
+}
+
+static int64_t shell_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    int denied = cap_check((int)a, N_CAP_SHELL);
+    if (denied < 0) return denied;
+    if (!wm_running()) return -N_ERR_UNSUPPORTED;
+    switch (num) {
+    case SYS_SHELL_PLACE: return shell_place((int)b, (const void *)c, d);
+    case SYS_SHELL_SCREENS: return shell_screens((struct n_shell_screen *)b, c);
+    case SYS_SHELL_WINDOWS: return shell_windows((struct n_shell_window *)b, c);
+    case SYS_SHELL_WINDOW: return shell_window(b, c);
+    case SYS_SHELL_WATCH: return watched_open(&shell_watched);
+    default: return shell_hotkey((int)b, c, d);
+    }
+}
+
 int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
-    if (num == SYS_GUI_LAUNCH) return sys_gui_launch(a, b);
+    if (num >= SYS_SHELL_PLACE && num <= SYS_SHELL_HOTKEY) return shell_syscall(num, a, b, c, d);
     if (num == SYS_SCREEN_INFO) {
         /* A screen's mode: its own lock, which comes before the WM's (it tells the driver through
            wm_screen_mode). The screen's number is in the op's bits from 8 on. */

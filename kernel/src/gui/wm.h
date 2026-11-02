@@ -11,8 +11,7 @@ bool wm_running(void);
    (SCREEN_WATCH, display_abi.h) hear of it. Any CPU; it does not sleep, so the caller may hold a
    lock (watched_changed, sys/watch.c). Nothing without the desktop. */
 void wm_screen_info_changed(void);
-/* The size of screen 0's part of the desktop (the one with the taskbar), which a remote viewer may
-   have changed. */
+/* The size of screen 0's part of the desktop, which a remote viewer may have changed. */
 void wm_screen_size(uint32_t *w, uint32_t *h);
 
 /* The UTF-8 clipboard, any CPU, under the WM lock: a call on another CPU may replace it at any
@@ -24,17 +23,11 @@ void wm_clipboard_info(size_t *len, uint32_t *seq);
 char *wm_clipboard_snapshot(size_t *len);
 /* The window and screen calls, any CPU. */
 int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
-void wm_notify(const char *title, const char *text); /* desktop toast */
 /* Power changes (dev/pm.c): how many app windows are open (the top one's
    title in top_title), and ask every one of them to close. */
 int wm_window_count(char *top_title, size_t n);
 void wm_close_windows(void);
 void wm_repaint(void); /* the screens lost what was on them (after sleep, a hold): draw all of them again */
-/* What the taskbar shows of state the desktop does not own changed by another's hand: the volume or
-   the muting (dev/audio.c), the wall clock set (sys/clock.c). The desktop looks at them again;
-   without this call it would see them only at the next minute. Any CPU, any context, without
-   sleeping; nothing without the desktop. */
-void wm_taskbar_changed(void);
 /* A display driver's screen (dev/pciuser.c), by its number (dev/fb.h): whether its buffers can
    show a window's own images (N_SCANOUT_DIRECT), and what the screen should show: wm_screen_state
    waits until deadline (sys/wait.h) while the state is still numbered seen, then copies it to *out
@@ -69,14 +62,8 @@ bool wm_remote_copy(uint32_t *dst, int pitch, int x, int y, int w, int h);
    *hot_x, *hot_y, under the WM lock. */
 uint32_t wm_pointer_image(uint32_t seen, uint32_t *px, int *hot_x, int *hot_y);
 
-/* desktop.c */
-void desktop_draw_wallpaper(canvas_t *c, uint8_t *deep); /* deep plane (display_abi.h) or NULL */
-void desktop_draw_icon(canvas_t *c, int x, int y, int icon);
+/* pointer.c */
 /* The art of a pointer shape (N_POINTER_*, abi.h; another number is N_POINTER_DEFAULT): a square
    of N_SCREEN_POINTER_SIZE pixels of 0xAARRGGBB not premultiplied, and its hot spot. Drawn the
    first time it is asked for and kept. Under the WM lock. */
-const uint32_t *desktop_pointer(int shape, int *hot_x, int *hot_y);
-enum { ICON_TERMINAL, ICON_FILES, ICON_PAINT, ICON_CLOCK, ICON_SNAKE, ICON_FRACTAL, ICON_CUBE,
-       ICON_LIFE, ICON_MONITOR, ICON_EDITOR, ICON_ABOUT, ICON_CALC, ICON_POWER, ICON_REBOOT,
-       ICON_TETRIS, ICON_MINES, ICON_NET, ICON_PIANO, ICON_SOUND, ICON_SETTINGS, ICON_SLEEP, ICON_HIBERNATE, ICON_GENERIC,
-       ICON_COUNT };
+const uint32_t *pointer_art(int shape, int *hot_x, int *hot_y);

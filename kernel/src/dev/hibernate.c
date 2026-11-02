@@ -144,12 +144,15 @@ static void describe(struct header *hd) {
     hd->data_off = ALIGN_UP(PAGE_SIZE + 2 * hd->map_bytes, PAGE_SIZE);
 }
 
-const char *hibernate_blocker(void) {
-    if (!wake_available() || !wake_spare_page()) return "no room below 1 MiB";
+enum n_power_reason hibernate_blocker(const char **detail) {
+    if (!wake_available() || !wake_spare_page()) return N_POWER_REASON_LOW_ROOM;
     const char *vm = vm_hibernate_blocker();
-    if (vm) return vm;
-    if (!store_raw_possible()) return "C: is not on a disk";
-    return NULL;
+    if (vm) {
+        *detail = vm;
+        return N_POWER_REASON_DEVICE;
+    }
+    if (!store_raw_possible()) return N_POWER_REASON_NOT_ON_DISK;
+    return N_POWER_REASON_NONE;
 }
 
 /* ---- the image's blocks ---- */
@@ -351,8 +354,8 @@ static void put(struct writer *w, const void *src, size_t n) {
     }
 }
 
-const char *hibernate_write(void) {
-    if (h.overflow) return "The image did not fit in memory or on C:";
+enum n_power_reason hibernate_write(void) {
+    if (h.overflow) return N_POWER_REASON_IMAGE_TOO_LARGE;
     uint64_t t0 = clock_now_ns(), maps = 2 * h.map_bytes;
     struct header hd;
     describe(&hd);
@@ -370,15 +373,15 @@ const char *hibernate_write(void) {
         put(&w, phys_to_virt(h.pool[page / 512][page % 512]), MIN(PAGE_SIZE, h.stream - at));
     }
     writer_flush(&w);
-    if (w.err || !disk_flush()) return "C: could not be written";
+    if (w.err || !disk_flush()) return N_POWER_REASON_STORE_WRITE;
     /* the header last: until it is on the disk, the file is no image */
     hd.check = hash_words(HASH_START, &hd, sizeof hd);
     memset(h.stage, 0, PAGE_SIZE);
     memcpy(h.stage, &hd, sizeof hd);
-    if (disk_at(0, h.stage, PAGE_SIZE, true) < 0 || !disk_flush()) return "C: could not be written";
+    if (disk_at(0, h.stage, PAGE_SIZE, true) < 0 || !disk_flush()) return N_POWER_REASON_STORE_WRITE;
     kprintf("hibernate: %lu frames saved, %lu of zeros left out, %lu MiB written in %lu ms\n", h.saved, h.zero,
             (unsigned long)((h.data_off + h.stream) >> 20), (clock_now_ns() - t0) / NS_PER_MS);
-    return NULL;
+    return N_POWER_REASON_NONE;
 }
 
 void hibernate_cleanup(bool restored) {

@@ -50,12 +50,6 @@ int identity_for_child(const struct n_launch *l, struct n_identity *child) {
     return 0;
 }
 
-void identity_session(struct n_identity *out) {
-    uint64_t f = spin_lock(&session_lock);
-    *out = session_identity;
-    spin_unlock(&session_lock, f);
-}
-
 /* ---- 能力：object の中身は種類だけ。持つことが権限で、渡すことが委譲。 ---- */
 
 struct capability {
@@ -123,17 +117,4 @@ int64_t sys_cap_find(uint64_t kind) {
     enum n_cap wanted = (enum n_cap)kind;
     int number = handle_find(cap_of_kind, &wanted);
     return number < 0 ? -N_ERR_NOT_FOUND : number;
-}
-
-int64_t sys_session_identity(int cap, const struct n_identity *uidentity) {
-    int r = cap_check(cap, N_CAP_IDENTITY_GRANT);
-    if (r < 0) return r;
-    struct n_identity wanted;
-    r = copy_from_user(&wanted, uidentity, sizeof wanted);
-    if (r < 0) return r;
-    if (wanted.cls > identity_current()->cls) return -N_ERR_DENIED;
-    uint64_t f = spin_lock(&session_lock);
-    session_identity = wanted;
-    spin_unlock(&session_lock, f);
-    return 0;
 }
