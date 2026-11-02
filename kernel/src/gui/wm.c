@@ -3256,7 +3256,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
     if (num == SYS_WIN_CREATE) {
         char title[sizeof ((struct window *)0)->title];
         if (!c) strlcpy(title, thread_current()->name, sizeof title);
-        else if (user_title(title, (const char *)c, sizeof title) < 0) strcpy(title, "window");
+        else if (user_title(title, (const char *)c, sizeof title) < 0) title[0] = 0;
         return sys_win_create((int)a, (int)b, title, (int)d, e);
     }
     struct handle *handle = handle_get((int)a);

@@ -202,7 +202,7 @@ static void art_wallpaper(canvas_t *c, uint8_t *deep) {
 /* ---- icons (32x32) ---- */
 enum { ICON_TERMINAL, ICON_FILES, ICON_PAINT, ICON_CLOCK, ICON_SNAKE, ICON_FRACTAL, ICON_CUBE,
        ICON_LIFE, ICON_MONITOR, ICON_EDITOR, ICON_ABOUT, ICON_CALC, ICON_POWER, ICON_REBOOT,
-       ICON_TETRIS, ICON_MINES, ICON_NET, ICON_PIANO, ICON_SOUND, ICON_SETTINGS, ICON_SLEEP, ICON_HIBERNATE, ICON_GENERIC,
+       ICON_TETRIS, ICON_MINES, ICON_NET, ICON_PIANO, ICON_SOUND, ICON_SETTINGS, ICON_SLEEP, ICON_HIBERNATE, ICON_LOGOUT, ICON_GENERIC,
        ICON_COUNT };
 
 static void label(canvas_t *c, int x, int y, const char *s, uint32_t col) {
@@ -308,6 +308,12 @@ static void art_icon(canvas_t *c, int x, int y, int icon) {
         gfx_circle(c, x + 16, y + 17, 11, RGB(240, 90, 100));
         gfx_circle(c, x + 16, y + 17, 10, RGB(240, 90, 100));
         gfx_fill(c, x + 15, y + 3, 3, 13, RGB(240, 90, 100));
+        break;
+    case ICON_LOGOUT: /* 扉と、そこから出る矢 */
+        gfx_fill_round(c, x + 5, y + 3, 14, 26, 2, RGB(150, 160, 200));
+        gfx_fill(c, x + 7, y + 5, 10, 22, RGB(40, 40, 70));
+        gfx_fill(c, x + 13, y + 15, 14, 3, RGB(120, 240, 150));
+        gfx_triangle(c, x + 30, y + 16, x + 24, y + 10, x + 24, y + 22, RGB(120, 240, 150));
         break;
     case ICON_SLEEP: /* a crescent (one disc less another, on any background) and a small z */
         for (int j = -11; j <= 11; j++)

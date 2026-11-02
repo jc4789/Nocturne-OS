@@ -166,8 +166,8 @@ enum {
     SYS_ENTRY_SET_OWNER,      /* (path, user): C: の名前の持ち主の利用者。admin 以上（§3） */
     SYS_CAP_KIND,             /* (cap) -> enum n_cap */
     SYS_CAP_FIND,             /* (enum n_cap) -> その能力を持つ自分の handle */
-    SYS_POWER_STATE,          /* (N_CAP_POWER の cap, struct n_power_state *out, size): 電源の段取りの今 */
-    SYS_POWER_WATCH,          /* (N_CAP_POWER の cap): SYS_POWER_STATE が報告するものの watch */
+    SYS_POWER_STATE,          /* (N_CAP_SHELL の cap, struct n_power_state *out, size): 電源の段取りの今 */
+    SYS_POWER_WATCH,          /* (N_CAP_SHELL の cap): SYS_POWER_STATE が報告するものの watch */
     SYS_MAX                   /* above every number (what syscallfuzz tries) */
 };
 
@@ -193,7 +193,7 @@ enum {
 #define N_WATCH_CHANGES_MAX 0xffffffffu
 
 /* The folders of C: every app and the system know. Apps start in the user's folder, C:\Users\<name>,
-   which the setting USERFOLDER names; its AppData\Temp, emptied at every start, is the setting TEMP. */
+   which n_user_folder names from the identity; its AppData\Temp, emptied at every login, is n_temp_folder's. */
 #define N_FOLDER_SYSTEM   "C:\\Nocturne\\System"  /* the system's programs */
 #define N_FOLDER_PROGRAMS "C:\\Programs"           /* the apps, each in a folder of its own */
 /* certificate authorities the system trusts besides the roots built into TLS (user/libc/tls.c) */
@@ -800,7 +800,8 @@ enum {
     NKEY_ESC = 0x1B, NKEY_BACKSPACE = 0x08, NKEY_TAB = 0x09, NKEY_ENTER = 0x0A,
     NKEY_UP = 0x100, NKEY_DOWN, NKEY_LEFT, NKEY_RIGHT, NKEY_HOME, NKEY_END, NKEY_PGUP, NKEY_PGDN,
     NKEY_INSERT, NKEY_DELETE, NKEY_F1, NKEY_F2, NKEY_F3, NKEY_F4, NKEY_F5, NKEY_F6, NKEY_F7, NKEY_F8,
-    NKEY_F9, NKEY_F10, NKEY_F11, NKEY_F12,
+    NKEY_F9, NKEY_F10, NKEY_F11, NKEY_F12, NKEY_LSHIFT, NKEY_RSHIFT, NKEY_LCTRL, NKEY_RCTRL,
+    NKEY_LALT, NKEY_RALT, NKEY_CAPS, NKEY_SUPER, NKEY_MENU,
 };
 #endif
 #define NMOD_SHIFT 1

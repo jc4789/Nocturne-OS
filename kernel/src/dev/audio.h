@@ -171,13 +171,8 @@ const char *audio_output(void);
    and applies them back at the start. Any CPU; a read may be a moment old, and the watches hear of
    every change. */
 int audio_volume(void);
-void audio_set_volume(int percent);
 bool audio_muted(void);
-void audio_set_muted(bool muted);
 /* SYS_AUDIO_OUTPUT_WATCH: a watch (sys/watch.h) on the volume, muting and audio_output(), whoever
    changes them. */
 int64_t audio_output_watch(void);
 
-/* A short tone from the system itself (the volume control's tick), mixed in like a stream. It is
-   dropped while the last one still sounds. */
-void audio_system_tone(int hz, int ms);

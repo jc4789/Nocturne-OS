@@ -842,6 +842,18 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
         if (h < 0) continue;
         if (!(handles[i] = handle_get(h))) { ret = -N_ERR_NO_HANDLE; goto out; }
     }
+    /* 0, 1 and 2 are a program's input, output and log: what the launcher does not give reads and
+       writes nothing, and no later handle of the program takes those numbers. */
+    if (l.handle_count < 3) {
+        struct handle **room = kzalloc(3 * sizeof *room);
+        if (!room) { ret = -N_ERR_NO_MEMORY; goto out; }
+        for (size_t i = 0; i < l.handle_count; i++) room[i] = handles[i];
+        kfree(handles);
+        handles = room;
+        l.handle_count = 3;
+    }
+    for (size_t i = 0; i < 3; i++)
+        if (!handles[i] && !(handles[i] = stream_null_open())) { ret = -N_ERR_NO_MEMORY; goto out; }
     if ((r = proc_app_create(&app)) < 0) { ret = r; goto out; }
     struct proc_launch launch = {.argc = (int)argc, .argv = argv, .setting_count = (int)l.setting_count,
                                  .settings = settings, .handles = handles, .handle_count = l.handle_count,
@@ -1243,11 +1255,11 @@ void syscall_dispatch(struct regs *r) {
         ret = -N_ERR_STOPPED;
         break;
     case SYS_POWER_STATE:
-        ret = cap_check((int)a, N_CAP_POWER);
+        ret = cap_check((int)a, N_CAP_SHELL);
         if (ret >= 0) ret = pm_state_syscall((void *)b, c);
         break;
     case SYS_POWER_WATCH:
-        ret = cap_check((int)a, N_CAP_POWER);
+        ret = cap_check((int)a, N_CAP_SHELL);
         if (ret >= 0) ret = pm_watch_syscall();
         break;
     case SYS_SYSTEM_LOG: ret = identity_at_least(N_CLASS_ADMIN) ? sys_system_log((char *)a, b) : -N_ERR_DENIED; break;

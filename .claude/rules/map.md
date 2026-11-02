@@ -12,7 +12,7 @@
 
 | 場所 | 役目 |
 |---|---|
-| `boot.c`・`init.c` | 起動の流れ。`kmain` から `kmain_late` へ進み、`C:\Nocturne\System\init` を起こす。 |
+| `boot.c`・`init.c` | 起動の流れ。`kmain` から `kmain_late` へ進み、`C:\Nocturne\System\services` を根の能力つきで起こす。 |
 | `arch/cpu.c`・`tsc_rate.h` | CPUID の唯一の読み手。下限 Zen 4 を照らし、任意の機能（PCID、MWAIT など）の有無と、CPU が申告する TSC の周波数を持つ（書式は社と family ごとに `tsc_rate.h`）。申告が無ければ `sys/clock.c` が測る。どの CPU も `cpu_setup` で同じ初期化をする。 |
 | `arch/topology.c` | MADT・SRAT・SLIT から CPU・core・LLC・NUMA node と node の距離を数える。CPU の数に上限は無い。 |
 | `arch/smp.c`・`wake.c` | AP の起動、panic のときの NMI による停止、S3 からの復帰。 |
@@ -41,7 +41,8 @@
 | 場所 | 役目 |
 |---|---|
 | `abi.h` | syscall の番号 `SYS_*` と結果 `N_ERR_*`。仕様は `docs/nocturne-native-abi.md`。 |
-| `authority_abi.h` | 身元 `struct n_identity`、能力 `enum n_cap`、サービスの要求の形。 |
+| `authority_abi.h` | 身元 `struct n_identity`、級 `enum n_class`、能力 `enum n_cap`、サービスの要求の形。 |
+| `services_abi.h` | 管理者・`accounts`・`session`・`machine` の口の型。 |
 | `display_abi.h`・`gpu_abi.h` | 画面と GPU の ABI。 |
 | `store_format.h`・`store/` | C: の store の書式とエンジン（`catalog` の B+ 木、`namespace`、`space`、`volume`）。カーネルと `host/store` の両方が組む。 |
 | `edid.h`・`gfx.c`・`unifont.bin` | EDID、描画の部品、Unifont。 |
@@ -50,10 +51,10 @@
 
 | 場所 | 役目 |
 |---|---|
-| `libc/` | ISO C、ネイティブ ABI の包み（`sys.c`）、GUI（`gui.c`、`ui.c`）、字体と画像、媒体（`media*.c`）、網（`net.c`、`http*.c`、`tls.c`、`webnet.c`）、ブラウザーの保存（`webstorage.c`、`webidb*.c`、`webcache.c`、`webcookie.c`、`webprefs.c`、`websitedata.c`）。 |
+| `libc/` | ISO C、ネイティブ ABI の包み（`sys.c`）、システムのサービスの口（`services.c`、見出しは `nocturne_services.h`）、GUI（`gui.c`、`ui.c`）、字体と画像、媒体（`media*.c`）、網（`net.c`、`http*.c`、`tls.c`、`webnet.c`）、ブラウザーの保存（`webstorage.c`、`webidb*.c`、`webcache.c`、`webcookie.c`、`webprefs.c`、`websitedata.c`）。 |
 | `libc/web/` | ブラウザーのエンジン。下の「ブラウザーの流れ」を見る。 |
 | `include/` | 公開の header（`nocturne.h`、`web.h`、`weburl.h`、`ui.h` など）。SDK にも入る。 |
-| `apps/` | システムのプログラム。ブラウザー（`browser*.c`）、`init.c`、`sh.c`、`uihost.c`、`webfetch.c`、`agent.c`、小さな道具とゲーム、TypeScript のアプリ（`*.ts`）。 |
+| `apps/` | システムのプログラム。サービスの管理者 `services.c`（宣言の表 `declared[]`）とサービス（`accounts.c`、`session.c`、`systemlog.c`、`machine.c`）、ブラウザー（`browser*.c`）、`sh.c`、`uihost.c`、`webfetch.c`、`agent.c`、小さな道具とゲーム、TypeScript のアプリ（`*.ts`）。 |
 
 ## その他
 
@@ -63,9 +64,9 @@
 | `third_party/<名>/` | 取り込んだ上流のソース。 |
 | `host/store/store.c` | ホストの道具。C: を作り、詰め、検査する。 |
 | `boot/limine.conf` | 起動の項目は一つ。起動の記録 `settings.rec` を module で持ち込む。 |
-| `rootfs/` | C: にそのまま入るもの（`Nocturne\`、`Users\User\`）。 |
+| `rootfs/` | C: にそのまま入るもの（`Nocturne\`）と、新しい利用者のフォルダーの元（`NewUser\`、C: の `Nocturne\NewUser`）。 |
 | `scripts/` | ビルド、媒体、試験、生成、Hyper-V の道具。 |
-| `tests/` | ゲストの試験（`runtests.c`）、WPT の runner、ホストの検査 `check_*.py`（`check_hda_codec.py` は codec の表で widget の木を試す）。 |
+| `tests/` | ゲストの試験（`runtests.c`）、試験の媒体のサービス（`testrun.c`）、WPT の runner、ホストの検査 `check_*.py`（`check_hda_codec.py` は codec の表で widget の木を試す）。 |
 | `docs/` | 仕様 `nocturne-native-abi.md`、台帳 `*/LEDGER.md`、日付入りの報告。 |
 | `build/`・`tools/`・`hyperv/`・`local/`・`.codegraph/` | git の外。ビルドの出力、同梱の道具、Hyper-V のディスク、GSP の firmware、codegraph の索引。 |
 
@@ -86,7 +87,7 @@
 ## 境界
 
 - syscall の番号と型は `common/abi.h`。画面と GPU は `display_abi.h` と `gpu_abi.h`。
-- アプリのドライバーは `SYS_PCI_*`・`SYS_DMA_*` から `dev/pciuser.c` へ。claim は `N_CAP_PCI_CLAIM` の能力で行う。init が NVIDIA の表示を claim して `nvrm` に渡す（`user/apps/init.c`）。
+- アプリのドライバーは `SYS_PCI_*`・`SYS_DMA_*` から `dev/pciuser.c` へ。claim は `N_CAP_PCI_CLAIM` の能力で行う。`user/apps/services.c` の `gpu` の項目が NVIDIA の表示の機能ごとに `nvrm` を起こし、`nvrm` が自分で claim する。
 - 特権は能力の handle か身元の級で確かめる（`sys/authority.h`）。境界の検査は `tests/check_boundaries.py`。
 - VM の処理は `kernel/src/vm/vm.h` が唯一の入口。実機では何もせずに戻る。裏に `hyperv.c`、`hv/`（VMBus、storvsc、netvsc）、`rdp.c`、VM の装置（ata、ac97、e1000、tulip、vbe）、`virtio_gpu.c` がある。`vm/` の外は `vm/vm.h` だけを include する。
 - syscall の道：

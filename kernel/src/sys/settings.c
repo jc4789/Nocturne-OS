@@ -37,7 +37,6 @@ static const struct setting settings[] = {
 };
 
 static struct watched watches[N_DOMAIN_COUNT];
-static struct settings_hearer *hearers[N_DOMAIN_COUNT];
 
 static const struct setting *setting_find(uint32_t domain, uint32_t key) {
     for (size_t i = 0; i < ARRAY_SIZE(settings); i++)
@@ -51,12 +50,6 @@ void settings_init(void) {
 
 void settings_changed(enum n_setting_domain domain) {
     watched_changed(&watches[domain]);
-    for (struct settings_hearer *h = __atomic_load_n(&hearers[domain], __ATOMIC_ACQUIRE); h; h = h->next) h->changed();
-}
-
-void settings_hear(enum n_setting_domain domain, struct settings_hearer *h) {
-    h->next = __atomic_load_n(&hearers[domain], __ATOMIC_RELAXED);
-    while (!__atomic_compare_exchange_n(&hearers[domain], &h->next, h, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
 }
 
 /* value in the kernel, of s's type: within its range. */

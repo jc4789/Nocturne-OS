@@ -37,7 +37,7 @@
    not come back.
 
    Every step is typed state (struct n_power_state, abi.h) that a watch reports: the kernel says
-   no sentence, and whoever holds N_CAP_POWER tells the user. */
+   no sentence, and the shell (N_CAP_SHELL) tells the user. */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -88,7 +88,7 @@ bool pm_stopping(void); /* a power change has passed the point of no return */
 bool pm_can_sleep(void);
 bool pm_can_hibernate(void); /* C: on a disk, room below 1 MiB, every device back after it */
 void pm_sleep_check(void);
-/* SYS_POWER_STATE and SYS_POWER_WATCH (N_CAP_POWER checked by the caller). */
+/* SYS_POWER_STATE and SYS_POWER_WATCH (N_CAP_SHELL checked by the caller). */
 int64_t pm_state_syscall(void *out, size_t size);
 int64_t pm_watch_syscall(void);
 /* Interrupts off: every registered device stops, stage by stage. NULL, or the first device that

@@ -6,7 +6,7 @@ The built disk (build/nocturne.img, `make qemu-image`) is one GPT disk: the EFI 
 copy's kernel and system programs are the current build's, and puts tests/ and an autorun.sh in
 C:\\Tests with build/host/store.exe. The copy is the VM's only disk, on NVMe (the VM is a q35 booted
 through UEFI, like the real machine) and without a snapshot, 4 GiB larger than the image: C: grows
-into that on its first start. init runs C:\\Tests\\autorun.sh at boot: it compiles tests/runtests.c with the in-OS tcc
+into that on its first start. The tests service (tests/testrun.c, put in C:\\Nocturne\\System on this copy only) runs C:\\Tests\\autorun.sh at boot: it compiles tests/runtests.c with the in-OS tcc
 and runs it, then powers off. Results come back over the serial port. Afterwards the host checks
 the volume the OS just wrote to with `store check`, and deletes the copy (it is kept only when the
 check finds problems, for looking into them). For the TCP tests the host also runs a small server
@@ -180,6 +180,8 @@ def put_tests(disk, entries, scratch):
             if any(c in path + host for c in "\t\r\n"):
                 sys.exit("a test file's name cannot be listed: %r" % host)
             f.write("%s\t%s\n" % (path, host))
+        # 製品の媒体に無いサービスの本体。C:\\Nocturne\\System を書けるのはシステムだけ。
+        f.write("C:\\Nocturne\\System\\testrun\t%s\n" % os.path.join(CORE_BUILD, "tests", "testrun"))
     done = store("fill", disk, listing).stdout.strip()
     os.remove(listing)
     return done
@@ -382,6 +384,97 @@ def test_files(a, tcp_port, web_ports, scratch):
     args = (["-quick"] if a.quick else []) + (["-nonet"] if a.no_net else []) + a.groups
     note("autorun.sh", "tcc -o C:\\Tests\\runtests C:\\Tests\\runtests.c && C:\\Tests\\runtests %s\n" % " ".join(args))
     return [("C:\\Tests\\" + name, host) for name, host in files]
+
+
+# what tests/audiotest.c plays, in order: (left Hz, right Hz, seconds); the last one is killed early
+AUDIO_TONES = [(1000, 1500, 1.0), (600, 600, 0.5), (700, 900, 0.5), (800, 800, 0.5), (500, 1100, 0.5),
+               (440, 440, 0.4), (1200, 750, 0.6), (300, 300, None)]
+
+
+def check_audio(path):
+    """find the test tones in the card's recording -> (ok, message)"""
+    if not os.path.exists(path):
+        return False, "no recording"
+    d = open(path, "rb").read()
+    at = d.find(b"data")
+    if d[:4] != b"RIFF" or at < 0:
+        return False, "the recording is not a WAV file"
+    rate = int.from_bytes(d[24:28], "little")
+    pcm = memoryview(d[at + 8:at + 8 + (len(d) - at - 8) // 4 * 4]).cast("h")
+    left, right = pcm[0::2], pcm[1::2]
+    # 10 ms blocks with sound in them, joined into runs across gaps under 60 ms
+    blk = rate // 100
+    loud = [max(map(abs, left[i:i + blk]), default=0) > 1000 or max(map(abs, right[i:i + blk]), default=0) > 1000
+            for i in range(0, len(left), blk)]
+    runs = []
+    for i, on in enumerate(loud):
+        if not on:
+            continue
+        if runs and i - runs[-1][1] <= 6:
+            runs[-1][1] = i + 1
+        else:
+            runs.append([i, i + 1])
+
+    def hz(ch, a, b):  # rising zero crossings per second over the middle of the run
+        a, b = a + (b - a) // 10, b - (b - a) // 10
+        x = ch[a:b]
+        n = sum(1 for i in range(1, len(x)) if x[i - 1] < 0 <= x[i])
+        return n * rate / max(1, len(x))
+
+    # QEMU's wav backend records only while the card plays, and the sink stops the card while no
+    # stream has sound (audio.h), so the silence between two tones may not be in the recording.
+    # Split runs where the pitch changes as well (measured over 50 ms around each block).
+    def pitch(i, r0, r1):
+        a, b = max(r0, i - 2), min(r1, i + 3)
+        x, y = left[a * blk:b * blk], right[a * blk:b * blk]
+        return tuple(sum(1 for k in range(1, len(c)) if c[k - 1] < 0 <= c[k]) * rate / max(1, len(c)) for c in (x, y))
+
+    def same(p, q):
+        return all(abs(x - y) <= max(x, y) * 0.08 for x, y in zip(p, q))
+
+    split = []
+    for r0, r1 in runs:
+        start = r0
+        ref = pitch(min(r1 - 1, start + 3), r0, r1)
+        for i in range(r0 + 6, r1 - 6):
+            p, q = pitch(i, r0, r1), pitch(i + 4, r0, r1)  # a lasting change, not the blend at a seam
+            if i - start >= 6 and not same(p, ref) and same(p, q):
+                split.append([start, i])
+                start, ref = i, q
+        split.append([start, r1])
+    runs = split
+
+    found = []
+    for r0, r1 in runs:
+        a, b = r0 * blk, r1 * blk
+        found.append((round(hz(left, a, b)), round(hz(right, a, b)), (b - a) / rate))
+    desc = ", ".join("%d/%d Hz %.2f s" % f for f in found)
+    if len(found) != len(AUDIO_TONES):
+        return False, "%d sounds instead of %d: %s" % (len(found), len(AUDIO_TONES), desc)
+    for (fl, fr, secs), (gl, gr, gs) in zip(AUDIO_TONES, found):
+        if abs(gl - fl) > fl * 0.02 or abs(gr - fr) > fr * 0.02:
+            return False, "expected %d/%d Hz, heard %d/%d Hz: %s" % (fl, fr, gl, gr, desc)
+        if secs and abs(gs - secs) > 0.08 or not secs and gs > 0.7:
+            return False, "a %d Hz tone lasted %.2f s: %s" % (fl, gs, desc)
+    return True, desc
+
+
+def prepare_disk(a, tcp_port, web_ports):
+    """The run's own disk: a copy of the boot image, checked against the build, with its boot entry
+    set for the run and the tests in C:\\Tests -> (sha256 of the boot image, of its payload)"""
+    image_hash = a.boot_hash or file_sha256(a.boot_image)
+    shutil.copyfile(a.boot_image, DISK)
+    a.disk_made = True
+    with tempfile.TemporaryDirectory(prefix="test-", dir=BUILD) as scratch:
+        # The same bytes as a preserved baseline's boot image: the same payload.
+        payload = a.baseline_payload or system_payload(DISK, scratch)
+        dns_endpoint = "10.0.2.2:%d" % a.dns_port if getattr(a, "dns_port", None) else None
+        if dns_endpoint:
+            edit_boot_entry(DISK, scratch, "dns-server=" + dns_endpoint)
+        print("test: C:\\Tests: " + put_tests(DISK, test_files(a, tcp_port, web_ports, scratch), scratch),
+              flush=True)
+    write_to_larger_disk(DISK, os.path.getsize(DISK) + TEST_ROOM)
+    return image_hash, payload
 
 
 # The image carries little room beyond what is put on it (scripts/mkimage.sh): like an image written

@@ -7,6 +7,8 @@
 #include "arch/apic.h"
 #include "arch/spin.h"
 #include "dev/pm.h"
+#include "sys/syscall.h"
+#include "sys/watch.h"
 #include "dev/acpi.h"
 #include "dev/blk.h"
 #include "fs/store.h"
@@ -28,6 +30,7 @@
 void power_off(void);
 void power_reboot(void);
 
+#define TELL_NS (200 * NS_PER_MS) /* the shell tells of a stop before the apps stop */
 #define GRACE_NS   (5 * NS_PER_S)  /* not from a menu: time the apps get to close */
 #define STALL_NS   (15 * NS_PER_S) /* from a menu: no window closed for this long cancels */
 #define FORCE_NS   (60 * NS_PER_S) /* from a menu, after a cancel: asking again closes them anyway */

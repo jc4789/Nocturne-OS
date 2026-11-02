@@ -27,7 +27,7 @@ void ahci_init(void);
 void net_init(void);
 void nvme_init(void);
 
-#define INIT_PATH N_FOLDER_SYSTEM "\\init"
+#define INIT_PATH N_FOLDER_SYSTEM "\\services"
 
 void kmain_late(void) {
     settings_init();
@@ -64,11 +64,9 @@ void kmain_late(void) {
     struct handle *root = NULL;
     if (cap_new(N_CAP_ROOT, &root) < 0) kprintf("init: no memory for the root capability\n");
     struct handle *handles[4] = {con, con, con, root};
-    char folder[sizeof "FOLDER=C:\\Users\\" + 255];
-    ksnprintf(folder, sizeof folder, "FOLDER=%s", store_user_folder());
     char *argv[] = {INIT_PATH, NULL};
-    char *settings[] = {folder, "TERMINAL=0 1 2"};
-    struct proc_launch l = {.argc = 1, .argv = argv, .setting_count = 2, .settings = settings,
+    char *settings[] = {"TERMINAL=0 1 2"};
+    struct proc_launch l = {.argc = 1, .argv = argv, .setting_count = 1, .settings = settings,
                             .handles = handles, .handle_count = 4, .identity = identity_kernel};
     int pid = proc_launch(INIT_PATH, &l);
     if (pid < 0) kprintf("init: failed to start %s (%d)\n", INIT_PATH, pid);

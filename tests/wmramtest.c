@@ -31,7 +31,7 @@ int main(int argc,char **argv) {
     if (argc>1 && !many) return 1;
     int sw,sh;
     if (screen_size(&sw,&sh)<0 || sw<640 || sh<400) return 1;
-    /* screen_size excludes the 40px taskbar; grab reports the complete screen. */
+    /* screen_size excludes what the shell's windows keep; grab reports the complete screen. */
     int gw,gh;if (screen_grab(n_cap_find(N_CAP_SCREEN_READ), NULL,0,&gw,&gh)<0) return 1;
     uint32_t *pixels=malloc((size_t)gw*gh*4);
     if (!pixels) return 1;

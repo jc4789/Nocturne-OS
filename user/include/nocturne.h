@@ -63,6 +63,8 @@ n_result n_document_append(const char *path, const void *data, size_t size);
 n_result n_document_load(const char *path, void **data, size_t *size);
 n_result n_entry_info(const char *path, struct n_entry *out);
 n_result n_entry_remove(const char *path);
+/* パスの持ち主の利用者を変える。N_CLASS_ADMIN 以上（§3）。 */
+n_result n_entry_set_owner(const char *path, uint32_t user);
 n_result n_entry_move(const char *from, const char *to); /* never replaces: N_ERR_EXISTS */
 /* n_entry_move that lets document from take the name of a document, which goes in the same commit
    (as n_entry_remove takes it: its open handles keep it). Any other entry there: N_ERR_EXISTS. */
@@ -104,7 +106,6 @@ n_handle n_cap_find(enum n_cap kind);
 /* 自分が持つ能力の handle を out（N_CAP_COUNT 個の場所）へ並べる：その数。子へ渡す列を作るとき。 */
 size_t n_caps_list(int32_t *out);
 /* カーネルの窓の系が起こすアプリの身元を決める。 */
-n_result n_session_identity(n_handle identity_grant, const struct n_identity *identity);
 
 /* 受け口：各メッセージが新しい channel の端を一つ運ぶ channel。connect は組を作って一方の端を
    受け口へ送り、もう一方を返す。accept は次の端を受ける（flags は 0 か N_CHANNEL_WAIT、無ければ
@@ -355,7 +356,8 @@ n_result n_path_from_url(const char *url, char *out, size_t cap);
 /* The file: URL of a path, made complete first (n_path_join): C:\Users\User\a b.html is
    file:///C:/Users/User/a%20b.html. Returns the length, or N_ERR_TOO_LARGE. */
 n_result n_path_to_url(const char *path, char *out, size_t cap);
-/* The user's folder (the launch setting USERFOLDER) and temporary folder (TEMP); "C:\" without them. */
+/* この process の利用者のフォルダーと一時フォルダー。身元から accounts が引く（libc/services.c）。
+   システムの身元には無く、"C:\" を返す。 */
 const char *n_user_folder(void);
 const char *n_temp_folder(void);
 /* The folder an app keeps its data in, <user's folder>\AppData\<name>, made when missing.
@@ -411,6 +413,8 @@ void yield(void);
 /* These return only on failure, with a negative n_result. */
 n_result poweroff(n_handle cap); /* N_CAP_POWER */
 n_result reboot(n_handle cap);   /* N_CAP_POWER */
+/* N_CAP_POWER: POWER_* with N_POWER_CHOSEN or 0 (abi.h). */
+n_result n_power_request(n_handle cap, uint32_t action, uint32_t flags);
 /* The count of PCI functions (at most max written), or a negative n_result. */
 n_result pcilist(struct n_pciinfo *out, int max);
 long __syscall(long n, long a, long b, long c, long d, long e);
@@ -536,7 +540,9 @@ n_result win_pointer_shape(window_t *win, uint32_t shape);
 n_result win_event(window_t *win, struct gui_event *e, uint64_t deadline);
 n_result clipboard_set(const char *s, size_t n);
 n_result clipboard_get(char *buf, size_t n); /* the whole length; at most n bytes are copied */
-/* start a program (find_program: "notepad" is enough) in its own window, with arg as its one argument */
+/* Starts a program (find_program: "notepad" is enough), with arg as its one argument and without
+   input, output or log: an ordinary launch with the caller's identity. Its identifier, or a negative
+   n_result. */
 n_result gui_launch(const char *path, const char *arg);
 /* copy the whole screen (taskbar included) into buf as 0xAARRGGBB pixels. bytes = 0 only reports
    the size. -N_ERR_TOO_LARGE: the buffer is too small */

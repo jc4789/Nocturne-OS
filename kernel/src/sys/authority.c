@@ -9,10 +9,6 @@
 
 const struct n_identity identity_kernel = {.cls = N_CLASS_SYSTEM};
 
-/* 窓の系が起こすアプリの身元。決まるまでは何の権限も無い級。 */
-static struct spinlock session_lock;
-static struct n_identity session_identity = {.cls = N_CLASS_USER};
-
 const struct n_identity *identity_current(void) {
     struct process *p = process_current();
     return p ? &p->identity : &identity_kernel;

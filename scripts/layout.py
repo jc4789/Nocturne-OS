@@ -10,10 +10,11 @@
 
 C:\\Nocturne holds the system (rootfs/Nocturne, the licences, the SDK, the firmware, the trusted
 certificates and every system program in System); C:\\Programs a folder for each desktop app, next
-to the apps the user puts there; C:\\Users\\User the user's folder (rootfs/Users, the music made by
-mksounds.py, diskfiles/). The system's part is protected (--system) and replaced whole by a fill:
-what an earlier one put there goes first, so a disk keeps its user's files and apps when its system
-is brought up to date.
+to the apps the user puts there. C:\\Nocturne\\NewUser is what a new user's folder starts with
+(rootfs/NewUser, the music made by mksounds.py, diskfiles/): the accounts service makes C:\\Users\\<name>
+and copies it there. The system's part (--system) is replaced whole by a fill: what an
+earlier one put there goes first, so a disk keeps its users' files and apps when its system is
+brought up to date. The kernel starts C:\\Nocturne\\System\\services first (user/apps/services.c).
 """
 import argparse
 import hashlib
@@ -25,9 +26,9 @@ from pathlib import Path
 BUILD = Path("build")
 PROGRAMS = BUILD / "programs"
 FIRMWARE_FILES = ("firmware/gsp_ga10x.bin", "firmware/ucodes_ga10x.bin", "LICENSE")
-USER = "C:\\Users\\User"
+NEW_USER = "C:\\Nocturne\\NewUser"
 
-# The desktop apps, each in its folder of C:\Programs (kernel/src/gui/wm.c starts them there).
+# The desktop apps, each in its folder of C:\Programs (user/apps/shell.c starts them there).
 APPS = {
     "browser": "Browser", "notepad": "Notepad", "paint": "Paint", "calc": "Calculator",
     "clock": "Clock", "piano": "Piano", "player": "Player", "mediaplayer": "Media Player",
@@ -79,6 +80,7 @@ def layout(firmware_manifest, system_only):
     entries = [("C:\\Nocturne", "!", "")] + [(f"C:\\Programs\\{app}", "!", "") for app in apps]
     entries += [
         ("C:\\Nocturne", "rootfs/Nocturne", ""),
+        ("C:\\Nocturne\\Logs", "-", ""),
         ("C:\\Nocturne\\Licenses", str(BUILD / "licenses"), ""),
         ("C:\\Nocturne\\SDK", str(BUILD / "sdk"), ""),
         ("C:\\Nocturne\\Certificates\\ca-bundle.crt", "third_party/ca/ca-bundle.crt", ""),
@@ -96,15 +98,12 @@ def layout(firmware_manifest, system_only):
             if digest(item["source"]) != item["sha256"]:
                 raise SystemExit("firmware changed after it was chosen: " + item["source"])
             entries.append((f"C:\\Nocturne\\Firmware\\NVIDIA\\{state['version']}\\{name}", item["source"], ""))
+    entries += [(NEW_USER, "rootfs/NewUser", ""), (NEW_USER + "\\Music", str(BUILD / "sounds"), "")]
+    if Path("diskfiles").is_dir():
+        entries.append((NEW_USER, "diskfiles", ""))
     if system_only:
         return entries
-    # the user a volume is made with owns their folder, and what goes into it from here on
-    entries += [("C:\\Users", "-", ""), (USER, "-", "--owner=1")]
-    entries += [("C:\\Users", "rootfs/Users", ""), (USER + "\\Music", str(BUILD / "sounds"), "")]
-    entries += [(f"{USER}\\{name}", "-", "") for name in ("Desktop", "Downloads", "Pictures", "Videos")]
-    if Path("diskfiles").is_dir():
-        entries.append((USER, "diskfiles", ""))
-    return entries
+    return entries + [("C:\\Users", "-", "")]
 
 
 def main():

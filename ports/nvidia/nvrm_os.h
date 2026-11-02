@@ -25,8 +25,6 @@
 
 #define NVRM_FIRMWARE_VERSION "615.78.08"
 
-/* Handle numbers of an app launched by init: 0 input, 1 output, 2 log, 3 the PCI right. */
-#define NVRM_PCI_HANDLE 3
 
 /* ------------------------------------------------------------------------------------------
  * The device (one GPU per nvrm process)

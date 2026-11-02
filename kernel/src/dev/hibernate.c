@@ -200,9 +200,11 @@ static void free_nosave(void) {
     h.nosave = NULL;
 }
 
-bool hibernate_prepare(const char **why) {
+enum n_power_reason hibernate_prepare(void) {
     memset(&h, 0, sizeof h);
-    if ((*why = hibernate_blocker())) return false;
+    const char *detail;
+    enum n_power_reason why = hibernate_blocker(&detail);
+    if (why) return why;
     struct header hd;
     describe(&hd);
     h.map_bytes = hd.map_bytes;
@@ -224,11 +226,11 @@ bool hibernate_prepare(const char **why) {
         if (!err) h.image_bytes = want;
     }
     if (err) {
-        *why = err == -N_ERR_NO_SPACE ? "not enough free space on C:" : "C:\\Nocturne\\Hibernate cannot be written";
+        why = err == -N_ERR_NO_SPACE ? N_POWER_REASON_NO_SPACE : N_POWER_REASON_STORE_WRITE;
         goto fail;
     }
 
-    *why = "not enough memory";
+    why = N_POWER_REASON_NO_MEMORY;
     h.stage = kmalloc(STAGE_BYTES);
     h.nosave = kzalloc(h.map_bytes);
     if (!h.stage || !h.nosave) goto fail;
@@ -256,11 +258,10 @@ bool hibernate_prepare(const char **why) {
     h.capacity = MIN(h.pool_pages * PAGE_SIZE, h.image_bytes - h.data_off);
     kprintf("hibernate: %lu MiB on C: and %lu MiB of memory for the image\n",
             (unsigned long)(h.image_bytes >> 20), (unsigned long)(h.pool_pages * PAGE_SIZE >> 20));
-    *why = NULL;
-    return true;
+    return N_POWER_REASON_NONE;
 fail:
     hibernate_cleanup(false);
-    return false;
+    return why;
 }
 
 /* ---- the snapshot ---- */

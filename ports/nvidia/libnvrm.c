@@ -73,6 +73,7 @@ int64_t nvrm_connect_device_status(uint32_t pci_target, struct nvrm **out) {
     *out = rm;
     return 0;
 fail:
+    if (result == -N_ERR_CLOSED) result = -N_ERR_NOT_FOUND; /* 名前を受ける nvrm がいない：管理者が端を閉じた */
     if (lock_ready) mtx_destroy(&rm->lock);
     if (rm->arena) n_memory_release(rm->arena, ARENA_BYTES);
     if (rm->arena_handle >= 0) n_handle_close(rm->arena_handle);
