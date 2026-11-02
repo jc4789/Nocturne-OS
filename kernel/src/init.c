@@ -55,7 +55,7 @@ void kmain_late(void) {
     vm_session_init();
     if (!wm_running()) input_set_sinks(console_key, NULL);
     settings_test_flags();
-    pm_sleep_check(); /* every driver has registered: whether the start menu offers Sleep */
+    pm_sleep_check(); /* every driver has registered: whether the machine can sleep */
 
     /* its input, output and log are the console */
     struct handle *con = stream_console_open();

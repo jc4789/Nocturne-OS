@@ -448,7 +448,7 @@ static uint64_t input_at;
 static int remote_users;
 
 /* The pointer (SYS_WIN_POINTER, abi.h). The WM owns it: it draws it at (mx, my) less its hot spot,
-   and chooses what it shows (pointer_update): one of its own shapes (desktop_pointer), or the image
+   and chooses what it shows (pointer_update): one of its own shapes (pointer_art), or the image
    the window under it gave. pointer_px is that image, pointer_shape the shape it was chosen as and
    pointer_from the id of the window whose image it is (0 for the WM's art) as of that window's
    pointer_from_serial. pointer_serial changes with the image and is never 0. Under the WM lock
