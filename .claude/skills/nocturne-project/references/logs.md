@@ -9,7 +9,7 @@
 | ホストの serial.log | 手で起動した QEMU の `-serial file:<作業場>/serial.log`（この会話の scratchpad。build の下に置かない） | カーネルの行は常に。ブラウザーの行は `--log-console` か `--debug-js` のときだけ |
 | ゲストの F12 の Console の札 | ブラウザーの窓（F12 で開閉） | 全部の行：頁の `console.*`、例外、ブラウザー自身の warn・error と計測（`trace`）。旗は要らない |
 | ゲストの F12 の Trace の札 | 同じ窓の Console の右の右（札を押す） | ブラウザー自身の計測（`WEB_CONSOLE_TRACE`）だけ：profile 群、`Net #`、媒体の timing、捕まった例外。旗は要らない（出る行の多くは旗が決める） |
-| ゲストの system log | `C:\Users\<名前>\AppData\Nocturne\System.log`（前回の起動の分は `System-previous.log`。`kernel/src/sys/stream.c`） | serial と同じ内容。ゲストの Files から読める |
+| ゲストの system log | `C:\Nocturne\Logs\System.log`（前回の起動の分は `System-previous.log`。サービス `systemlog`、`user/apps/systemlog.c`） | serial と同じ内容。ゲストの Files から読める |
 
 ブラウザーの旗は GUI からは付けられない。ゲストの Terminal で `browser --debug-js <URL>` を打つ（HMP の `sendkey` で）。
 

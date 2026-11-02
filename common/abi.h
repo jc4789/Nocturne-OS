@@ -187,7 +187,7 @@ enum {
 #define N_WATCH_CHANGES_MAX 0xffffffffu
 
 /* The folders of C: every app and the system know. Apps start in the user's folder, C:\Users\<name>,
-   which the setting USERFOLDER names; its AppData\Temp, emptied at every start, is the setting TEMP. */
+   which n_user_folder names from the identity; its AppData\Temp, emptied at every login, is n_temp_folder's. */
 #define N_FOLDER_SYSTEM   "C:\\Nocturne\\System"  /* the system's programs */
 #define N_FOLDER_PROGRAMS "C:\\Programs"           /* the apps, each in a folder of its own */
 /* certificate authorities the system trusts besides the roots built into TLS (user/libc/tls.c) */

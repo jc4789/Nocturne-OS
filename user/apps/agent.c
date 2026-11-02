@@ -20,6 +20,7 @@
 #include <string.h>
 #include <time.h>
 #include "nocturne.h"
+#include "nocturne_services.h"
 #include "http.h"
 #include "json.h"
 #include "png.h"
@@ -650,10 +651,8 @@ static void tool_screenshot(struct json *args, struct jbuf *out) {
     if (delay > 0) n_sleep_until(n_clock_after((uint64_t)((uint64_t)MIN(delay, 30) * 1000) * N_NS_PER_MS));
     int w, h;
     uint32_t *px = NULL;
-    if (screen_grab(n_cap_find(N_CAP_SCREEN_READ), NULL, 0, &w, &h) == 0) px = malloc((size_t)w * (size_t)h * 4);
-    if (!px || screen_grab(n_cap_find(N_CAP_SCREEN_READ), px, (size_t)w * (size_t)h * 4, &w, &h) < 0) {
+    if (n_machine_screen(&px, &w, &h) < 0) {
         jb_puts(out, "error: cannot read the screen (no desktop?)");
-        free(px);
         return;
     }
     int x = (int)json_getnum(args, "x", 0), y = (int)json_getnum(args, "y", 0);

@@ -99,7 +99,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     `Licenses`、`SDK`、`Certificates`、`Web`、`Agent`、`Firmware` 等。`C:\Nocturne\Temp` は
     カーネルだけが使う（差し替え中の内容）。
   - `C:\Programs`：アプリ（`N_FOLDER_PROGRAMS`）。アプリごとに一つのフォルダー。
-  - `C:\Users\<名前>`：利用者のフォルダー（設定 `USERFOLDER`、`n_user_folder()`）。アプリは
+  - `C:\Users\<名前>`：利用者のフォルダー（`n_user_folder()`、身元から `accounts` が引く。§15）。アプリは
     ここで始まる。`Desktop`、`Documents`、`Downloads`、`Music`、`Pictures`、`Videos`、
     `AppData`。アプリのデータは `n_app_data_folder(name, out, cap)` が作って返す
     `AppData\<name>`。`AppData\Temp` は一時フォルダー（設定 `TEMP`、`n_temp_folder()`）で、
@@ -285,7 +285,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   最初の受け取りの時に輪が持つ一番古い記録から始まる。各行の頭は `[秒.マイクロ秒 CPU:task] `
   （重さが情報でなければ task の後に ` E`・` W`・` D`）。読む前に上書きされた分は、その所に
   `[log: … bytes …]` の一行で言う。`N_CHANNEL_WAIT` は新しい記録が来るまで待つ。
-  `n_system_log(buf, cap)` は最新のログを読む。C: への保存は init の仕事
+  `n_system_log(buf, cap)` は最新のログを読む。C: への保存はサービス `systemlog` の仕事
   （`AppData\Nocturne\System.log`、前の起動の分は `System-previous.log`）。
 
 ## 5. アプリ
@@ -305,9 +305,8 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     それ以外の名前は `n_path_complete` で完全指定にする。
   - 起動されたアプリは作業フォルダーを持たない。利用者の名前を受け取るアプリのために、
     起動元は自分の現在のフォルダーを設定 `FOLDER=C:\…` で渡す（§3の `n_path_complete`）。
-    子アプリは起動元と同じ利用者のために働く：libc の `n_app_launch` は、起動が名指さなければ
-    起動元自身の `USERFOLDER` と `TEMP` を渡す（ブラウザーの窓と、その Worker・保存・設定の窓が
-    同じ profile を使う）。どちらも無い起動には、カーネルがシステムの利用者のものを加える。
+    子アプリは起動元の身元を継ぐ（§13）。ブラウザーの窓と、その Worker・保存・設定の窓は同じ利用者の
+    同じ profile を使う。
 - 終了はアプリハンドルのイベント（§6）で届く。`n_app_result(h, deadline, int *status)` で
   直接待つこともできる（期限は §8。呼出しの時点で過ぎた期限は待たずに `N_ERR_NOT_READY`、
   待って期限が来れば `N_ERR_TIMEOUT`）。最後のハンドルを閉じれば記録は消える。
@@ -524,7 +523,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   `n_channel_receive` で読み、そのハンドルへ `n_channel_send` で書く（§4）。
 - アプリの中の装置ドライバー（例：NVIDIA の資源管理 `C:\Nocturne\System\nvrm`、`docs/nvidia/LEDGER.md`）：
   - `n_pci_claim(cap, bus, dev, func)` は PCI 機能を動かす権利（`N_KIND_PCI`）を返す。`cap` は
-    `N_CAP_PCI_CLAIM` の能力で、持つ者は起動するドライバーアプリへ権利のハンドルを渡す。カーネルのドライバーが使う
+    `N_CAP_PCI_CLAIM`（§13）で、サービスの管理者が宣言のあるドライバーアプリにだけ渡す。カーネルのドライバーが使う
     機能と、既に権利のある機能は `N_ERR_BUSY`。同じ group の機能をカーネルのドライバーが使って
     いても、それが手放せるもの（`struct iommu_guest`：GPU の音の機能）なら、その機能は止まり、
     権利ができた後に domain の中で動き直す。権利が終わると、次の権利まで止まったまま。
@@ -1271,3 +1270,28 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
     分けるかは、管理者が `from` で決める。
   - 受け口へ送る端に `N_EVENT_CLOSED` が来たら、管理者はその名前を消す。
 - サービスは `n_inlet_accept(inlet, flags)` で端を受け、`n_channel_peer` で依頼者の身元を読む。
+
+## 15. サービスの管理者、利用者、セッション
+
+型は `common/services_abi.h`。libc の口は `nocturne_services.h`。
+
+- サービスの管理者：`C:\Nocturne\System\services`（`user/apps/services.c`）。カーネルが起こす最初のプロセス。
+  宣言は C の型のある表 `declared[]` で、プログラムに組み込む。項目は名前、プログラム、級、範囲（機械か PCI の機能）、
+  渡す能力、依存、失敗の扱い（起こし直す回数、間隔、健康とみなす時間）、接続してよい相手。
+  起動の順は依存から解き、準備は相手の知らせ（`n_service_ready`）で知る。決まった時間を待たない。
+- 宣言のサービスは handle `N_SERVICE_HANDLE_CONTROL`（3）に管理者との channel を受け、能力は `n_cap_find` で引く。
+  受ける向きは受け口で、`n_inlet_accept(N_SERVICE_HANDLE_CONTROL, flags)` が相手の端を返す。
+  送る向きは準備の知らせ一通。管理者がこの channel を閉じると `N_ERR_CLOSED` になる。これが止める指示で、
+  5 秒の後に `n_app_stop` で止める。
+- 名前の範囲：宣言のプログラム（`program` が 0 でない）か `N_CLASS_SYSTEM` が申し込んだ名前は機械全体で引ける。
+  ほかは申し込んだ者と同じ `user` と `session` の相手にだけ見える。別の利用者は同じ名前を別に申し込める。
+  宣言の名前と管理者の名前は申し込めない（`N_ERR_DENIED`）。
+- 管理者の口：`n_service_connect(N_SERVICE_MANAGER)` の記録は `struct n_services_request` と `struct n_service_status`。
+  一覧、状態、起こし直し、止める、見張る。起こし直しと止めるは `N_CLASS_ADMIN` 以上。
+- 利用者：サービス `accounts`。私的な領域に型のある記録で一覧を持つ。合言葉は salt つきの PBKDF2-HMAC-SHA256。
+  一人目は誰が作っても admin。`n_user_folder` と `n_temp_folder` は身元から `accounts` が引く。
+  新しい利用者のフォルダーの中身の元は `C:\Nocturne\NewUser`。
+- セッション：サービス `session`。ログインの窓を出し、選ばれた利用者の身元を `n_session_identity` でカーネルの窓の系に決める。
+  コンソールの起動は同じ身元で `sh` を起こす。`N_SESSION_END` でセッションを終え、ログインの窓へ戻る。
+- 機械：サービス `machine`。`N_CAP_POWER` と `N_CAP_SCREEN_READ` を持ち、利用者のアプリの電源と画面の依頼を受ける
+  （`n_machine_power`、`n_machine_screen`）。能力をアプリへ配らない。

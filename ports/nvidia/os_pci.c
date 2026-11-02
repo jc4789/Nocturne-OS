@@ -1,6 +1,6 @@
 /* NVIDIA RM on Nocturne: the PCI function, its BARs and interrupts, and system memory for the GPU.
  *
- * Everything is reached through the N_KIND_PCI right init hands to nvrm (handle 3):
+ * Everything is reached through the N_KIND_PCI right nvrm claims with its N_CAP_PCI_CLAIM (main):
  *   config space      n_pci_config_read / n_pci_config_write
  *   register BAR      n_pci_bar + n_shared_map (BAR0, mapped whole at start)
  *   other BAR ranges  n_pci_bar + n_shared_view (uncached or write-combining) + n_shared_map
@@ -343,7 +343,6 @@ void NV_API_CALL os_flush_cpu_write_combine_buffer(void) { __asm__ volatile("sfe
  * ---------------------------------------------------------------------------------------- */
 NV_STATUS nvrm_pci_attach(void) {
     struct nvrm_device *d = &nvrm_dev;
-    d->pci = NVRM_PCI_HANDLE;
     if (n_handle_kind(d->pci) != N_KIND_PCI) {
         nvrm_log("NVRM: handle %d is not a PCI right (kind %lld)", d->pci, (long long)n_handle_kind(d->pci));
         return NV_ERR_INVALID_STATE;

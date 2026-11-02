@@ -9,7 +9,7 @@
      store esp <image>                       the EFI system partition's byte offset and its
                                              512-byte sectors
      store format <image> <label>            a new empty volume
-     store folder <image> <C:\path> [--system] [--private]
+     store folder <image> <C:\path> [--private]
      store put <image> <C:\path> <host path> [--system]
                                              a host file as a document, or a host folder and
                                              everything in it
@@ -2286,7 +2286,7 @@ static int usage(void) {
     fprintf(stderr, "usage: store disk <image> <MiB> <ESP MiB>\n"
                     "       store esp <image>\n"
                     "       store format <image> <label>\n"
-                    "       store folder <image> <C:\\path> [--system] [--private]\n"
+                    "       store folder <image> <C:\\path> [--private]\n"
                     "       store put <image> <C:\\path> <host path> [--system]\n"
                     "       store fill <image> <list>\n"
                     "       store remove <image> <C:\\path>\n"

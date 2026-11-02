@@ -63,6 +63,8 @@ n_result n_document_append(const char *path, const void *data, size_t size);
 n_result n_document_load(const char *path, void **data, size_t *size);
 n_result n_entry_info(const char *path, struct n_entry *out);
 n_result n_entry_remove(const char *path);
+/* パスの持ち主の利用者を変える。N_CLASS_ADMIN 以上（§3）。 */
+n_result n_entry_set_owner(const char *path, uint32_t user);
 n_result n_entry_move(const char *from, const char *to); /* never replaces: N_ERR_EXISTS */
 /* n_entry_move that lets document from take the name of a document, which goes in the same commit
    (as n_entry_remove takes it: its open handles keep it). Any other entry there: N_ERR_EXISTS. */
@@ -355,7 +357,8 @@ n_result n_path_from_url(const char *url, char *out, size_t cap);
 /* The file: URL of a path, made complete first (n_path_join): C:\Users\User\a b.html is
    file:///C:/Users/User/a%20b.html. Returns the length, or N_ERR_TOO_LARGE. */
 n_result n_path_to_url(const char *path, char *out, size_t cap);
-/* The user's folder (the launch setting USERFOLDER) and temporary folder (TEMP); "C:\" without them. */
+/* この process の利用者のフォルダーと一時フォルダー。身元から accounts が引く（libc/services.c）。
+   システムの身元には無く、"C:\" を返す。 */
 const char *n_user_folder(void);
 const char *n_temp_folder(void);
 /* The folder an app keeps its data in, <user's folder>\AppData\<name>, made when missing.

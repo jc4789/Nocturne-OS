@@ -410,43 +410,6 @@ static int folder_clear(uint64_t folder) {
     return r;
 }
 
-static char user_folder[sizeof "C:\\Users\\" + 255] = "C:\\"; /* a name: at most 255 bytes */
-static char user_temp[sizeof user_folder + sizeof "\\AppData\\Temp"] = "C:\\";
-
-const char *store_user_folder(void) { return user_folder; }
-const char *store_user_temp(void) { return user_temp; }
-
-/* The user's folder: the first in users that is there for apps, a new one when there is none. Its
-   AppData\Temp is made ready, empty. */
-static int user_ready(uint64_t users) {
-    struct volume *v = store.v;
-    struct ns_entry *e = kmalloc(sizeof *e);
-    if (!e) return -N_ERR_NO_MEMORY;
-    int r;
-    struct store_record rec;
-    for (const struct ns_entry *after = NULL; (r = ns_next(v, users, after, e)) >= 0; after = e)
-        if ((r = ns_record(v, e->id, &rec, NULL)) < 0 || (rec.kind == STORE_FOLDER && !(rec.attributes & STORE_PRIVATE)))
-            break;
-    if (r == -N_ERR_NOT_FOUND) {
-        e->n = strlen(strcpy(e->name, "User"));
-        r = folder_at(users, e->name, 0, &e->id);
-        if (r >= 0) {
-            change_begin();
-            r = ns_record_amend(v, e->id, &(struct ns_amend){.fields = NS_OWNER, .owner = STORE_OWNER_FIRST});
-            change_end();
-        }
-    }
-    uint64_t data, temp;
-    if (r >= 0) {
-        ksnprintf(user_folder, sizeof user_folder, "C:\\Users\\%.*s", (int)e->n, e->name);
-        if ((r = folder_at(e->id, "AppData", 0, &data)) >= 0 && (r = folder_at(data, "Temp", STORE_TEMPORARY, &temp)) >= 0 &&
-            (r = folder_clear(temp)) >= 0)
-            ksnprintf(user_temp, sizeof user_temp, "%s\\AppData\\Temp", user_folder);
-    }
-    kfree(e);
-    return r;
-}
-
 static void writer(void *arg);
 
 void store_start(void) {
@@ -463,8 +426,7 @@ void store_start(void) {
     if (r < 0) kprintf("store: C:\\Nocturne\\Temp cannot be made ready (%d): nothing can be replaced\n", r);
     if ((r = folder_at(STORE_ID_ROOT, "Programs", 0, &store.programs)) < 0)
         kprintf("store: C:\\Programs cannot be made ready (%d)\n", r);
-    if ((r = folder_at(STORE_ID_ROOT, "Users", 0, &store.users)) >= 0) r = user_ready(store.users);
-    if (r < 0) kprintf("store: the user's folder in C:\\Users cannot be made ready (%d)\n", r);
+    if ((r = folder_at(STORE_ID_ROOT, "Users", 0, &store.users)) < 0) kprintf("store: C:\\Users cannot be made ready (%d)\n", r);
     if (!kthread_create("store", writer, NULL)) panic("store: no writer");
     store_dirty(false);
 }

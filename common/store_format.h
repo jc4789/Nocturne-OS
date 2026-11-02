@@ -167,7 +167,7 @@ struct store_child {
 #define STORE_FOLDER 2
 
 /* attributes */
-#define STORE_TEMPORARY 1u /* a temporary folder of the system (C:\Nocturne\Temp, the user's AppData\Temp):
+#define STORE_TEMPORARY 1u /* a temporary folder of the system (C:\Nocturne\Temp):
                               the kernel empties it whenever it mounts the volume */
 #define STORE_PRIVATE 2u   /* only the kernel reaches it (the hibernation image) */
 

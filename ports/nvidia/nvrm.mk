@@ -141,7 +141,7 @@ NVRM_CLIENT_OBJ := $(NVRM_OUT)/libnvrm.o
 # What a client's source includes: the protocol and libnvrm, and the RM SDK's parameter structures.
 NVRM_CLIENT_INC := -Iports/nvidia/include \
     $(addprefix -I$(NVRM_VENDOR)/src/,common/sdk/nvidia/inc nvidia/arch/nvalloc/unix/include)
-$(BUILD)/u/user/apps/init.o: UCFLAGS += -Iports/nvidia/include
+$(BUILD)/u/user/apps/services.o: UCFLAGS += -Iports/nvidia/include
 $(NVRM_CLIENT_OBJ): ports/nvidia/libnvrm.c
 	@mkdir -p $(dir $@)
 	@echo "  CC   $<"

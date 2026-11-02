@@ -429,7 +429,7 @@ n_result n_channel_receive(n_handle h, void *buf, size_t cap, int flags, n_handl
 n_result n_channel_receive_from(n_handle h, void *buf, size_t cap, int flags, struct n_channel_message *message) {
     return NC5(SYS_CHANNEL_RECEIVE_FROM, h, buf, cap, flags, message);
 }
-static n_handle launch_program(const char *path, const struct n_launch *launch) {
+n_handle n_app_launch(const char *path, const struct n_launch *launch) {
     n_handle app = (n_handle)NC5(SYS_APP_LAUNCH, path, launch, 0, 0, 0);
     if (app != -N_ERR_NOT_PROGRAM || !launch) return app;
     /* a script: its interpreter runs it, with the script's name before the rest */
@@ -450,44 +450,6 @@ static n_handle launch_program(const char *path, const struct n_launch *launch) 
     return app;
 }
 
-/* Whether the launch gives the setting name ("NAME=..."). */
-static bool launch_gives(const struct n_launch *l, const char *name) {
-    size_t n = strlen(name);
-    for (uint32_t i = 0; i < l->setting_count; i++)
-        if (l->settings[i] && !strncmp(l->settings[i], name, n) && l->settings[i][n] == '=') return true;
-    return false;
-}
-
-n_handle n_app_launch(const char *path, const struct n_launch *launch) {
-    if (!launch) return launch_program(path, launch);
-    /* A child works for this app's user: it gets this app's USERFOLDER and TEMP unless the launch
-       names its own (the kernel gives the system's to an app launched without them). */
-    static const char *const user[] = {"USERFOLDER", "TEMP"};
-    char *own[2] = {0};
-    const char **settings = NULL;
-    uint32_t owned = 0;
-    struct n_launch l = *launch;
-    n_handle app = -N_ERR_NO_MEMORY;
-    for (int i = 0; i < 2; i++) {
-        const char *v = getenv(user[i]);
-        if (!v || launch_gives(launch, user[i])) continue;
-        size_t n = strlen(user[i]) + strlen(v) + 2;
-        if (!(own[owned] = malloc(n))) goto out;
-        snprintf(own[owned++], n, "%s=%s", user[i], v);
-    }
-    if (owned) {
-        if (!(settings = malloc((launch->setting_count + owned) * sizeof *settings))) goto out;
-        for (uint32_t i = 0; i < launch->setting_count; i++) settings[i] = launch->settings[i];
-        for (uint32_t i = 0; i < owned; i++) settings[launch->setting_count + i] = own[i];
-        l.settings = settings;
-        l.setting_count += owned;
-    }
-    app = launch_program(path, &l);
-out:
-    free(settings);
-    for (uint32_t i = 0; i < owned; i++) free(own[i]);
-    return app;
-}
 n_result n_app_result(n_handle app, uint64_t deadline, int *status) {
     return NC5(SYS_APP_RESULT, app, deadline, status, 0, 0);
 }
@@ -652,7 +614,7 @@ static int run_here(const char *full, char *const argv[]) {
     const char *settings[2];
     uint32_t ns = 0;
     const char *f = getenv("FOLDER"), *t = getenv("TERMINAL");
-    if (!f || !n_path_is_complete(f)) f = "C:\\";
+    if (!f || !n_path_is_complete(f)) f = n_user_folder();
     snprintf(folder, sizeof folder, "FOLDER=%s", f);
     settings[ns++] = folder;
     if (t) {
@@ -798,7 +760,9 @@ n_result n_path_join(const char *folder, const char *name, char *out, size_t cap
 
 n_result n_path_complete(const char *name, char *out, size_t cap) {
     const char *folder = getenv("FOLDER");
-    return n_path_join(folder && n_path_is_complete(folder) ? folder : "C:\\", name, out, cap);
+    /* 設定が無ければ利用者のフォルダーで始まる。完全なパスには引かない：引くのは接続だから。 */
+    if (!folder || !n_path_is_complete(folder)) folder = n_path_is_complete(name) ? "C:\\" : n_user_folder();
+    return n_path_join(folder, name, out, cap);
 }
 
 const char *n_path_name(const char *path) {
@@ -861,14 +825,6 @@ n_result n_path_to_url(const char *path, char *out, size_t cap) {
     out[used] = 0;
     return (n_result)used;
 }
-
-static const char *complete_setting(const char *name) {
-    const char *s = getenv(name);
-    return s && n_path_is_complete(s) ? s : "C:\\";
-}
-
-const char *n_user_folder(void) { return complete_setting("USERFOLDER"); }
-const char *n_temp_folder(void) { return complete_setting("TEMP"); }
 
 static n_result folder_ready(const char *path) {
     n_result r = n_folder_create(path);
