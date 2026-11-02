@@ -52,9 +52,7 @@ static const struct n_setting_decl settings_table[] = {
                 "TCP の送信の容量", "これから開く接続の送信の容量（バイト）です。", 4096, INT32_MAX, 1048576),
     /* 時刻 */
     INT_SETTING(N_DOMAIN_TIME, N_TIME_ZONE_MINUTES, N_SCOPE_USER, N_APPLY_NONE, "time.zone-minutes",
-                "時間帯", "UTC からの分です。", -720, 840, 540),
-    BOOL_SETTING(N_DOMAIN_TIME, N_TIME_HOUR_24, N_SCOPE_USER, N_APPLY_NONE, "time.hour-24",
-                 "24 時間で見せる", "時刻を 24 時間で見せます。", 1),
+                "時間帯", "時計の時刻に足す分です。localtime がこの値を読みます。", -720, 840, 0),
 };
 #undef BOOL_SETTING
 #undef INT_SETTING

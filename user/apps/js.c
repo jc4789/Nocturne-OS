@@ -838,7 +838,6 @@ static void run_loop(JSValueConst until) {
         drain();
         deliver_fetches();
         if (ui) { ui_session_pump(ui); ui_deliver(); }
-        deliver_system();
         for (;;) {
             JSValue now = JS_NewFloat64(ctx, (double)(n_clock_monotonic() / N_NS_PER_MS));
             JSValue fired = internal_call("fireTimer", 1, (JSValue[]){now});
@@ -861,9 +860,8 @@ static void run_loop(JSValueConst until) {
         if (ms > 1000) ms = 1000;
         if (!ms) continue;
         fflush(stdout);
-        /* window events and a change the system reports end the wait; a watch alone does not keep
-           the program running (the return above), but while timers or fetches do, it is heard */
-        if (ui_open() || screen_watch >= 0) wait_ui(fetch_pending > 0 && ms > 10 ? 10 : (int)ms);
+        /* window events end the wait */
+        if (ui_open()) wait_ui(fetch_pending > 0 && ms > 10 ? 10 : (int)ms);
         else if (fetch_pending > 0) wait_on_address(&fetch_signal, seen, n_clock_after(ms * N_NS_PER_MS));
         else n_sleep_until(n_clock_after(ms * N_NS_PER_MS));
     }

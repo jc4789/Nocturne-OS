@@ -24,7 +24,6 @@ int main(int argc, char **argv) {
     for (int i = 0; i < argc; i++) arguments[i + 1] = argv[i];
     int32_t handles[3];
     for (int i = 0; i < 3; i++) handles[i] = n_handle_kind(i) >= 0 ? i : -1;
-    extern char *const *__libc_environment;
     uint32_t environment = 0;
     while (__libc_environment[environment]) environment++;
     struct n_launch launch = {.arguments = arguments, .environment = (const char *const *)__libc_environment,

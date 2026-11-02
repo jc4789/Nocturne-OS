@@ -450,6 +450,12 @@ static n_handle launch_program(const char *path, const struct n_launch *launch) 
     return app;
 }
 
+/* 起動の属性（struct n_start）。今のフォルダーはこのアプリが n_folder_set で変える。一度渡したフォルダーの文字列は
+   アプリの寿命の間残るので、別のスレッドが持つ指は消えない。 */
+static const struct n_start no_start = {.environment = (char *const[]){NULL}, .folder = "C:\\", .user_folder = "C:\\",
+                                         .temp_folder = "C:\\"};
+static const struct n_start *start_info = &no_start;
+
 /* 子は起動元の利用者のために働く：起動元の今のフォルダー、利用者のフォルダー、一時フォルダーを渡す。 */
 n_handle n_app_launch(const char *path, const struct n_launch *launch) {
     if (!launch) return launch_program(path, launch);
@@ -629,12 +635,6 @@ int system(const char *cmd) {
     char *argv[] = {"sh", "-c", (char *)cmd, NULL};
     return run_wait("sh", argv);
 }
-
-/* 起動の属性（struct n_start）。今のフォルダーはこのアプリが n_folder_set で変える。一度渡したフォルダーの文字列は
-   アプリの寿命の間残るので、別のスレッドが持つ指は消えない。 */
-static const struct n_start no_start = {.environment = (char *const[]){NULL}, .folder = "C:\\", .user_folder = "C:\\",
-                                         .temp_folder = "C:\\"};
-static const struct n_start *start_info = &no_start;
 
 struct kept_folder {
     struct kept_folder *next;

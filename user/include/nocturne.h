@@ -356,6 +356,8 @@ n_result n_app_data_folder(const char *name, char *out, size_t cap);
 bool n_terminal(n_handle h);
 /* 端末の Ctrl+C の知らせを受ける channel（struct n_start の interrupts）。無ければ -N_ERR_NOT_FOUND。 */
 n_handle n_interrupts(void);
+/* The environment of this launch (struct n_start), ended by NULL: for ported programs. */
+extern char *const *__libc_environment;
 
 /* The count of processes and threads (at most max written), or a negative n_result. */
 n_result proclist(struct n_procinfo *out, int max);

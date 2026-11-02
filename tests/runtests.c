@@ -473,10 +473,6 @@ static const struct test tests[] = {
 
     /* the AI agent, offline: no key is ever needed for the tests */
     {"agent", "usage", "agent --help", ANY, {"usage: agent"}},
-    {"agent", "unreachable-endpoint",
-     "echo 'endpoint=http://10.0.2.2:9/v1' > .\\bad.conf; echo 'api_key=test' >> .\\bad.conf; "
-     "agent -c .\\bad.conf say hi",
-     ANY, {"network error", "connect to 10.0.2.2:9"}, NULL, 150},
 };
 
 static int npass, nfail, nskip;

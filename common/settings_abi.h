@@ -136,8 +136,7 @@ enum n_private_region {
 
 /* カーネルの持ち主の無い時刻の鍵。読む者が見張る。 */
 enum n_time_setting_key {
-    N_TIME_ZONE_MINUTES,        /* N_SETTING_INT：UTC からの分 */
-    N_TIME_HOUR_24,             /* N_SETTING_BOOL：24 時間で見せる */
+    N_TIME_ZONE_MINUTES,        /* N_SETTING_INT：時計の時刻に足す分 */
 };
 
 #define N_DOMAIN_PROGRAM 0xffffffffu /* プログラムの scope の鍵の領域。適用の相手が無い。 */
