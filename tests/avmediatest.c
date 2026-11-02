@@ -19,7 +19,8 @@ static uint32_t first_frame[96*32];
 static uint64_t paint_started;
 static int early_frames;
 #define CHECK(x) do{checks++;if(!(x)){failed++;printf("FAIL avmediatest:%d %s\n",__LINE__,#x);}}while(0)
-static int audio_slots(void){n_handle a[8];int n=0;for(;n<8;n++){a[n]=n_audio_open();if(a[n]<0)break;}for(int i=0;i<n;i++)n_handle_close(a[i]);return n;}
+/* 頁が流れを持ったまま終わると、音を鳴らす流れが増える。流れの数に上限は無いので、開けるかだけを見る。 */
+static int audio_slots(void){n_audio_stream *a=NULL;n_result r=n_audio_open(&SOUND_FORMAT,&a);if(r<0)return 0;n_audio_close(a);return 1;}
 static void console(void *opaque,int level,const char *text){
     (void)opaque;
     if(!strncmp(text,"AVMEDIA_DONE ",13))done=atoi(text+13);

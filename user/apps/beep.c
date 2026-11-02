@@ -7,12 +7,12 @@
 #include <math.h>
 #include "nocturne.h"
 
-#define RATE N_AUDIO_RATE
+#define RATE SOUND_RATE
 #define PI 3.14159265358979323846
 
 static int wave = 0; /* 0 sine, 1 square, 2 triangle, 3 saw */
 static double amp = 0.5;
-static n_handle stream;
+static n_audio_stream *stream;
 static int16_t buf[2 * 960];
 
 static double shape(double ph) { /* ph in [0, 1) */
@@ -110,9 +110,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "beep: %s: not a note\n", argv[i]);
             return 2;
         }
-    stream = n_audio_open();
-    if (stream < 0) {
-        fprintf(stderr, "beep: sound: %s\n", n_result_text(stream));
+    n_result opened = n_audio_open(&SOUND_FORMAT, &stream);
+    if (opened < 0) {
+        fprintf(stderr, "beep: sound: %s\n", n_result_text(opened));
         return 1;
     }
     bool ok = true;
@@ -121,6 +121,6 @@ int main(int argc, char **argv) {
         const char *colon = strchr(argv[i], ':');
         ok = tone(note_hz(argv[i]), colon ? atoi(colon + 1) : ms);
     }
-    n_handle_close(stream); /* lets the sound finish */
+    n_audio_close(stream); /* lets the sound finish */
     return ok ? 0 : 1;
 }

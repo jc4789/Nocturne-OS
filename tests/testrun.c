@@ -44,6 +44,7 @@ int main(void) {
     struct n_accounts_request prepare = {.op = N_ACCOUNTS_PREPARE, .user = reply.account.user};
     struct n_accounts_reply prepared;
     n_accounts_call(&prepare, &prepared);
+    n_setting_session(reply.account.user); /* セッションの無い試験の間、試験の利用者が前面 */
     n_service_ready();
     dns_server_set();
     struct n_entry e;

@@ -77,10 +77,10 @@ static const struct declared_service declared[] = {
      CAPS(N_CAP_STORE_PRIVATE), .on_failure = {3, 500, 60000}, .clients_from = N_CLASS_USER},
     /* 試験の媒体にだけあるプログラム。C:\Nocturne\System の中にあるので、アプリは置けない。 */
     {.name = "tests", .program = "testrun", .cls = N_CLASS_SYSTEM, .at_boot = true, .optional = true,
-     CAPS(N_CAP_POWER, N_CAP_PCI_CLAIM, N_CAP_SCREEN_READ, N_CAP_IDENTITY_GRANT), .needs = NAMES("accounts"),
+     CAPS(N_CAP_POWER, N_CAP_PCI_CLAIM, N_CAP_SCREEN_READ, N_CAP_IDENTITY_GRANT), .needs = NAMES("accounts", "audio"),
      .clients_from = CLIENTS_NONE},
     {.name = "session", .program = "session", .cls = N_CLASS_SYSTEM, .at_boot = true, .console = true,
-     CAPS(N_CAP_IDENTITY_GRANT, N_CAP_SHELL), .needs = NAMES("accounts", "tests"),
+     CAPS(N_CAP_IDENTITY_GRANT, N_CAP_SHELL), .needs = NAMES("accounts", "tests", "audio"),
      .on_failure = {5, 1000, 60000}, .clients_from = N_CLASS_USER},
     /* 住所の決め方、経路、名前引き。カーネルの網の口を変える能力はここにだけ渡す。 */
     {.name = "network", .program = "network", .cls = N_CLASS_SYSTEM, .at_boot = true,
@@ -91,6 +91,9 @@ static const struct declared_service declared[] = {
     /* 画面のモード、配置、主画面、倍率を持つ。 */
     {.name = "display", .program = "display", .cls = N_CLASS_SYSTEM, .at_boot = true,
      CAPS(N_CAP_DISPLAY), .needs = NAMES("settings"), .on_failure = {5, 500, 60000}, .clients_from = CLIENTS_NONE},
+    /* 音の方針と混合の持ち主。カーネルの音の出口を開く能力はここにだけ渡す。 */
+    {.name = "audio", .program = "audio", .cls = N_CLASS_SYSTEM, .at_boot = true, .optional = true,
+     CAPS(N_CAP_AUDIO_DEVICE), .needs = NAMES("settings"), .on_failure = {5, 500, 60000}, .clients_from = N_CLASS_USER},
 };
 #define DECLARED (sizeof declared / sizeof *declared)
 #define STOP_GRACE_MS 5000u /* 閉じた後、これだけ待って強制的に止める */

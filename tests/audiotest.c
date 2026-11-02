@@ -14,6 +14,7 @@
 #include <string.h>
 #include <math.h>
 #include "nocturne.h"
+#include "nocturne_settings.h"
 
 #define PI 3.14159265358979323846
 
@@ -98,25 +99,25 @@ static int run_quiet(const char *const *args, uint32_t argc) {
     return st;
 }
 
-/* The master volume (n_audio_output): as it is, or set to percent (SYS_SETTINGS_APPLY, by the right
-   the test run gives); the error when that fails. */
+/* The master volume, a setting of the service audio. */
 static long volume(void) {
-    struct n_audio_output o;
-    n_result r = n_audio_output(&o);
-    return r < 0 ? (long)r : (long)o.volume;
+    int32_t v = -1;
+    n_result r = n_setting_get_int(n_setting_at(N_DOMAIN_AUDIO, N_AUDIO_VOLUME), &v);
+    return r < 0 ? (long)r : (long)v;
 }
-static n_result apply_sound(uint32_t key, int32_t value) {
-    static n_handle cap = -1;
-    if (cap < 0) cap = n_cap_find(N_CAP_SETTINGS_APPLY);
-    return n_settings_apply(cap, N_DOMAIN_AUDIO, key, &value, sizeof value);
+static int muted(void) {
+    int32_t v = -1;
+    n_setting_get_int(n_setting_at(N_DOMAIN_AUDIO, N_AUDIO_MUTED), &v);
+    return v;
 }
+static n_result apply_sound(uint32_t key, int32_t value) { return n_setting_set_int(n_setting_at(N_DOMAIN_AUDIO, key), value, NULL); }
 static long set_volume(int percent) {
     n_result r = apply_sound(N_AUDIO_VOLUME, percent);
     return r < 0 ? (long)r : volume();
 }
 
 /* submit all of frames, waiting for room */
-static bool submit_all(n_handle a, const int16_t *frames, size_t count) {
+static bool submit_all(n_audio_stream *a, const int16_t *frames, size_t count) {
     while (count) {
         n_result r = n_audio_submit(a, frames, count, N_AUDIO_WAIT);
         if (r <= 0) return false;
@@ -128,9 +129,9 @@ static bool submit_all(n_handle a, const int16_t *frames, size_t count) {
 
 int main(void) {
     /* the marker tone, with the time it takes to play */
-    n_handle a = n_audio_open();
-    CHECK(a >= 0, "n_audio_open: %s", n_result_text(a));
-    CHECK(n_handle_kind(a) == N_KIND_DEVICE, "a sound stream's kind: %d", (int)n_handle_kind(a));
+    n_audio_stream *a = NULL;
+    n_result opened = n_audio_open(&SOUND_FORMAT, &a);
+    CHECK(opened == 0, "n_audio_open: %s", n_result_text(opened));
     static int16_t tone[48000 * 2];
     for (int i = 0; i < 48000; i++) {
         tone[2 * i] = (int16_t)(20000 * sin(2 * PI * 1000 * i / 48000));
@@ -142,57 +143,59 @@ int main(void) {
     CHECK(n_audio_status(a, &st) == 0 && st.queued_frames > 0 && st.queued_frames <= 8192 &&
               st.committed_frames == 48000,
           "after submitting: %u queued, %llu committed", st.queued_frames, (unsigned long long)st.committed_frames);
-    n_handle_close(a);
+    n_audio_close(a);
     uint64_t took = (n_clock_monotonic() / N_NS_PER_MS) - t0;
     CHECK(took >= 950 && took <= 1400, "1 s of sound took %lu ms to play", (unsigned long)took);
     printf("1 s of sound played in %lu ms\n", (unsigned long)took);
     n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
 
     /* a submitter that does not wait: the stream takes 8192 frames at most */
-    a = n_audio_open();
+    opened = n_audio_open(&SOUND_FORMAT, &a);
+    CHECK(opened == 0, "n_audio_open: %s", n_result_text(opened));
     static int16_t zero[16384 * 2];
     n_result w = n_audio_submit(a, zero, 16384, 0);
     CHECK(w > 0 && w <= 8192, "a submit without waiting took %ld frames", (long)w);
-    n_result w2 = n_audio_submit(a, zero, 16384, 0);
+    /* what has been mixed in the meantime leaves room; the stream fills up all the same */
+    n_result w2;
+    do w2 = n_audio_submit(a, zero, 16384, 0);
+    while (w2 > 0);
     CHECK(w2 == -N_ERR_NOT_READY, "the full stream's submit: %ld", (long)w2);
     CHECK(n_audio_submit(a, zero, 1, 2) == -N_ERR_INVALID, "an unknown submit flag");
-    n_handle q = n_events_create();
-    n_events_watch(q, a, N_EVENT_SENDABLE, 7);
-    struct n_event ev;
+    /* a submit that waits comes back with the room that playing makes */
     t0 = (n_clock_monotonic() / N_NS_PER_MS);
-    n_result got = n_events_wait(q, &ev, 1, n_clock_after(1000 * N_NS_PER_MS));
-    CHECK(got == 1 && ev.token == 7 && (ev.events & N_EVENT_SENDABLE) && (n_clock_monotonic() / N_NS_PER_MS) - t0 < 500,
-          "waiting for room: %ld after %lu ms", (long)got, (unsigned long)((n_clock_monotonic() / N_NS_PER_MS) - t0));
-    n_handle_close(q);
+    n_result got = n_audio_submit(a, zero, 1, N_AUDIO_WAIT);
+    CHECK(got == 1 && (n_clock_monotonic() / N_NS_PER_MS) - t0 < 500, "waiting for room: %ld after %lu ms", (long)got,
+          (unsigned long)((n_clock_monotonic() / N_NS_PER_MS) - t0));
     CHECK(n_audio_flush(a) == 0 && n_audio_status(a, &st) == 0 && st.queued_frames == 0, "a flushed stream holds %u",
           st.queued_frames);
-    n_handle_close(a);
-    CHECK(n_audio_submit(0, zero, 1, 0) < 0, "a submit to a handle that is not a sound stream");
+    n_audio_close(a);
 
-    /* eight streams at once, then no more */
-    n_handle as[9];
-    for (int i = 0; i < 9; i++) as[i] = n_audio_open();
-    for (int i = 0; i < 8; i++) CHECK(n_audio_submit(as[i], zero, 1200, 0) == 1200, "stream %d", i);
-    CHECK(as[8] == -N_ERR_BUSY, "a ninth stream: %s", n_result_text(as[8]));
+    /* many streams at once: their number has no limit but the machine's */
+    enum { MANY = 64 };
+    n_audio_stream *as[MANY];
+    for (int i = 0; i < MANY; i++) {
+        opened = n_audio_open(&SOUND_FORMAT, &as[i]);
+        CHECK(opened == 0, "stream %d: %s", i, n_result_text(opened));
+        if (opened < 0) as[i] = NULL;
+    }
+    for (int i = 0; i < MANY; i++) CHECK(!as[i] || n_audio_submit(as[i], zero, 1200, 0) == 1200, "stream %d", i);
     t0 = (n_clock_monotonic() / N_NS_PER_MS);
-    for (int i = 0; i < 9; i++)
-        if (as[i] >= 0) n_handle_close(as[i]);
-    CHECK((n_clock_monotonic() / N_NS_PER_MS) - t0 < 400, "closing eight streams took %lu ms", (unsigned long)((n_clock_monotonic() / N_NS_PER_MS) - t0));
+    for (int i = 0; i < MANY; i++)
+        if (as[i]) n_audio_close(as[i]);
+    CHECK((n_clock_monotonic() / N_NS_PER_MS) - t0 < 400, "closing the streams took %lu ms", (unsigned long)((n_clock_monotonic() / N_NS_PER_MS) - t0));
 
     /* the master volume and muting, and what plays the sound (the card this test records) */
-    struct n_audio_output out = {0};
-    CHECK(n_audio_output(&out) == 0 && out.volume == 80 && !out.muted, "the volume starts at %d%s", (int)out.volume,
-          out.muted ? ", muted" : "");
-    CHECK(out.device[0] && memchr(out.device, 0, sizeof out.device), "no sound device is named");
+    CHECK(volume() == 80 && !muted(), "the volume starts at %ld%s", volume(), muted() ? ", muted" : "");
+    char *device = n_audio_output_name();
+    CHECK(device && device[0], "no sound device is named");
+    free(device);
     CHECK(set_volume(35) == 35 && volume() == 35, "volume after setting 35: %ld", volume());
     CHECK(apply_sound(N_AUDIO_VOLUME, 250) == -N_ERR_INVALID && volume() == 35, "setting 250: %ld", volume());
     CHECK(apply_sound(N_AUDIO_VOLUME, -1) == -N_ERR_INVALID, "setting -1");
-    CHECK(apply_sound(N_AUDIO_MUTED, 1) == 0 && n_audio_output(&out) == 0 && out.muted && out.volume == 35, "muting: %d%s",
-          (int)out.volume, out.muted ? ", muted" : "");
-    CHECK(apply_sound(N_AUDIO_VOLUME, 40) == 0 && n_audio_output(&out) == 0 && out.muted && out.volume == 40,
-          "setting the volume unmutes: %d%s", (int)out.volume, out.muted ? ", muted" : "");
+    CHECK(apply_sound(N_AUDIO_MUTED, 1) == 0 && muted() == 1 && volume() == 35, "muting: %ld, %d", volume(), muted());
+    CHECK(apply_sound(N_AUDIO_VOLUME, 40) == 0 && muted() == 1 && volume() == 40, "the volume does not unmute: %ld, %d", volume(), muted());
     CHECK(apply_sound(N_AUDIO_MUTED, 2) == -N_ERR_INVALID, "muted 2");
-    CHECK(apply_sound(N_AUDIO_MUTED, 0) == 0 && n_audio_output(&out) == 0 && !out.muted && out.volume == 40, "unmuting");
+    CHECK(apply_sound(N_AUDIO_MUTED, 0) == 0 && muted() == 0 && volume() == 40, "unmuting");
 
     /* a melody, at volume 0 so that the recording stays as described above */
     set_volume(0);

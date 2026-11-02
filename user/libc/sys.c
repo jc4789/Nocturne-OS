@@ -545,13 +545,10 @@ n_result n_pager_revoke(n_handle pager, uint64_t offset, uint64_t bytes, uint32_
 n_result n_pager_fail(n_handle pager, uint64_t offset, uint64_t bytes) {
     return NC5(SYS_PAGER_FAIL, pager, offset, bytes, 0, 0);
 }
-n_handle n_audio_open(void) { return (n_handle)NC5(SYS_AUDIO_OPEN, 0, 0, 0, 0, 0); }
-n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_t flags) {
-    return NC5(SYS_AUDIO_SUBMIT, a, frames, count, flags, 0);
+n_result n_audio_device_list(n_handle cap, void *out, size_t bytes) { return NC5(SYS_AUDIO_DEVICE_LIST, cap, out, bytes, 0, 0); }
+n_handle n_audio_device_open(n_handle cap, uint32_t id, const struct n_audio_device_format *format, struct n_audio_device_ring *ring) {
+    return (n_handle)NC5(SYS_AUDIO_DEVICE_OPEN, cap, id, format, ring, 0);
 }
-n_result n_audio_status(n_handle a, struct n_audio_status *out) { return NC5(SYS_AUDIO_STATUS, a, out, 0, 0, 0); }
-n_result n_audio_flush(n_handle a) { return NC5(SYS_AUDIO_FLUSH, a, 0, 0, 0, 0); }
-n_result n_audio_output(struct n_audio_output *io) { return NC5(SYS_AUDIO_OUTPUT, io, 0, 0, 0, 0); }
 n_result n_processes(struct n_procinfo **out) {
     for (size_t capacity = 256;; capacity *= 2) {
         struct n_procinfo *list = malloc(capacity * sizeof *list);
@@ -566,6 +563,9 @@ n_result n_processes(struct n_procinfo **out) {
         return n;
     }
 }
+n_result n_audio_device_run(n_handle device, int run) { return NC5(SYS_AUDIO_DEVICE_RUN, device, run, 0, 0, 0); }
+n_result n_audio_device_status(n_handle device, struct n_audio_device_status *out) { return NC5(SYS_AUDIO_DEVICE_STATUS, device, out, 0, 0, 0); }
+n_handle n_audio_device_watch(n_handle cap) { return (n_handle)NC5(SYS_AUDIO_DEVICE_WATCH, cap, 0, 0, 0, 0); }
 n_result n_settings_apply(n_handle cap, uint32_t domain, uint32_t key, const void *value, size_t size) {
     return NC5(SYS_SETTINGS_APPLY, cap, domain, key, value, size);
 }
@@ -577,7 +577,6 @@ n_result n_settings_describe(uint32_t domain, uint32_t key, struct n_setting_des
 }
 n_handle n_settings_watch(uint32_t domain) { return (n_handle)NC5(SYS_SETTINGS_WATCH, domain, 0, 0, 0, 0); }
 n_result n_entry_set_owner(const char *path, uint32_t user) { return NC5(SYS_ENTRY_SET_OWNER, path, user, 0, 0, 0); }
-n_handle n_audio_output_watch(void) { return (n_handle)NC5(SYS_AUDIO_OUTPUT_WATCH, 0, 0, 0, 0, 0); }
 n_result n_watch_take(n_handle watch) { return NC5(SYS_WATCH_TAKE, watch, 0, 0, 0, 0); }
 n_handle n_events_create(void) { return (n_handle)NC5(SYS_EVENTS_CREATE, 0, 0, 0, 0, 0); }
 n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t token) {

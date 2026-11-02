@@ -966,7 +966,7 @@ struct wa_context *wa_context_new(float rate, unsigned channels, uint64_t offlin
     c->channels = channels;
     c->length = offline_length;
     c->state = WA_SUSPENDED;
-    c->sink = -1;
+    c->sink = NULL;
     enum wa_error e;
     c->destination = make_node(c, WA_DESTINATION, NULL, &e);
     c->listener = make_node(c, WA_LISTENER, NULL, &e);
@@ -982,7 +982,7 @@ static void context_free(struct wa_context *c) {
     for (uint32_t i = 1; i < c->nnodes; i++) if (c->nodes[i]) free_node(c, c->nodes[i]);
     for (size_t i = 0; i < c->nevents; i++) wa_buffer_unref(c->events[i].buffer);
     wa_buffer_unref(c->rendered);
-    if (c->sink >= 0) n_handle_close(c->sink);
+    if (c->sink) n_audio_close(c->sink);
     free(c->nodes);
     free(c->order);
     free(c->events);
@@ -1080,21 +1080,22 @@ static void realtime(struct wa_context *c) {
         }
         if (c->quit) break;
         uint64_t now = (n_clock_monotonic() / N_NS_PER_US);
-        if (c->sink < 0 && now >= open_at) {
+        if (!c->sink && now >= open_at) {
             open_at = now + 1000000;
             mtx_unlock(&c->lock);
-            n_handle sink = n_audio_open();
+            n_audio_stream *sink = NULL;
+            n_audio_open(&(struct n_audio_format){.rate = WA_OUTPUT_RATE, .channels = 2, .sample = N_AUDIO_S16}, &sink);
             mtx_lock(&c->lock);
-            if (sink >= 0) { c->sink = sink; c->output_written = c->output_played = 0; }
+            if (sink) { c->sink = sink; c->output_written = c->output_played = 0; }
         }
         uint64_t queued;
-        if (c->sink >= 0) {
+        if (c->sink) {
             struct n_audio_status st;
-            n_handle sink = c->sink;
+            n_audio_stream *sink = c->sink;
             mtx_unlock(&c->lock);
             bool ok = n_audio_status(sink, &st) >= 0;
             mtx_lock(&c->lock);
-            if (!ok) { n_handle_close(c->sink); c->sink = -1; continue; }
+            if (!ok) { n_audio_close(c->sink); c->sink = NULL; continue; }
             queued = (uint64_t)st.queued_frames + st.device_pending_frames;
             c->output_played = c->output_written > queued ? c->output_written - queued : 0;
         } else {
@@ -1114,19 +1115,19 @@ static void realtime(struct wa_context *c) {
         render_quantum(c);
         size_t made = output_frames(c, frames);
         c->output_written += made;
-        if (c->sink >= 0 && made) {
-            n_handle sink = c->sink;
+        if (c->sink && made) {
+            n_audio_stream *sink = c->sink;
             mtx_unlock(&c->lock);
             n_result taken = n_audio_submit(sink, frames, made, N_AUDIO_WAIT);
             mtx_lock(&c->lock);
-            if (taken < 0) { n_handle_close(c->sink); c->sink = -1; }
+            if (taken < 0) { n_audio_close(c->sink); c->sink = NULL; }
         } else clock_frames += made;
     }
     /* Closed (close(), or the page let go of it): rendering stops and no more of its output is
        heard (Web Audio, AudioContext close(): "stop processing audio data"), so what is still
        queued is dropped, not played out. The stream goes, so another context can have it. */
-    if (c->sink >= 0) { n_audio_flush(c->sink); n_handle_close(c->sink); }
-    c->sink = -1;
+    if (c->sink) { n_audio_flush(c->sink); n_audio_close(c->sink); }
+    c->sink = NULL;
     mtx_unlock(&c->lock);
 }
 

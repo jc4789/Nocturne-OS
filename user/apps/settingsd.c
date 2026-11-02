@@ -848,6 +848,16 @@ static void answer_list(struct conn *c, const struct n_settings_request *m, cons
     free(page);
 }
 
+/* 持ち主が来た（起き直した）：保存された値を当て直す。利用者の鍵は前面の利用者の分だけ。 */
+static void owner_catch_up(struct known *k) {
+    for (size_t i = 0; i < value_count; i++) {
+        const struct value *v = &values[i];
+        if (v->id.domain != k->d.domain || v->id.key != k->d.key || v->id.program) continue;
+        n_result r = apply_start(k, &v->id, v->bytes, v->length, 0);
+        if (r < 0) say("a kept setting was refused", r);
+    }
+}
+
 static void answer_declare(struct conn *c, const struct n_settings_request *m, const struct n_identity *who, const void *data) {
     struct n_setting_decl d;
     if (m->length != sizeof d) {
@@ -882,6 +892,7 @@ static void answer_declare(struct conn *c, const struct n_settings_request *m, c
     }
     if (d.scope != N_SCOPE_PROGRAM) k->owner = c;
     reply(c, m->op, m->serial, 0, N_SETTING_OK, 0, NULL, 0);
+    if (d.scope != N_SCOPE_PROGRAM) owner_catch_up(k);
 }
 
 /* 利用者が前面になった。その人の値を持ち主へ当て直す。 */
@@ -893,6 +904,19 @@ static void session_changed(uint32_t user) {
         struct known *k = known_find(v->id.domain, v->id.key, 0);
         if (!k || k->d.scope != N_SCOPE_USER) continue;
         n_result r = apply_start(k, &v->id, v->bytes, v->length, 0);
+        if (r < 0) say("a setting of the user was refused", r);
+    }
+    /* 値を持たない利用者：サービスの鍵は既定へ戻す。前の利用者の値を持ち続けない。 */
+    for (size_t i = 0; i < known_count; i++) {
+        struct known *k = knowns[i];
+        if (k->kernel || !k->owner || k->d.scope != N_SCOPE_USER) continue;
+        struct n_setting_id id = {.domain = k->d.domain, .key = k->d.key, .user = user};
+        if (value_find(&id)) continue;
+        int32_t fallback = (int32_t)k->d.fallback;
+        bool text = k->d.type == N_SETTING_STRING;
+        if (!text && k->d.type != N_SETTING_INT && k->d.type != N_SETTING_BOOL && k->d.type != N_SETTING_ENUM) continue;
+        n_result r = apply_start(k, &id, text ? (const void *)k->d.fallback_text : (const void *)&fallback,
+                                 text ? (uint32_t)strlen(k->d.fallback_text) : (uint32_t)sizeof fallback, 0);
         if (r < 0) say("a setting of the user was refused", r);
     }
 }

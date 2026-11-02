@@ -45,7 +45,7 @@
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
 
 _Static_assert(sizeof(struct n_gpu_blit) == 32, "GPU blit ABI");
-_Static_assert(SYS_WATCH_TAKE == 207 && SYS_AUDIO_OUTPUT_WATCH < SYS_MAX, "every system call number is below SYS_MAX");
+_Static_assert(SYS_WATCH_TAKE == 207 && SYS_AUDIO_DEVICE_WATCH < SYS_MAX, "every system call number is below SYS_MAX");
 _Static_assert(sizeof(struct n_pager_fault) == 16 && sizeof(struct n_pager_supply) == 32, "pager ABI");
 
 int pci_list(struct n_pciinfo *out, int max);
@@ -945,52 +945,6 @@ static int64_t sys_system_log_open(void) {
     return h ? handle_install(h) : -N_ERR_NO_MEMORY;
 }
 
-/* A stream of its own on the sound mixer; N_ERR_BUSY when every stream is taken. */
-static int64_t sys_audio_open(void) {
-    struct handle *h;
-    int r = audio_stream_open(&h);
-    return r < 0 ? r : handle_install(h);
-}
-
-static int64_t sys_audio_submit(int h, const void *frames, uint64_t count, uint32_t flags) {
-    if (flags & ~N_AUDIO_WAIT) return -N_ERR_INVALID;
-    int64_t r;
-    struct handle *stream = handle_get_as(h, audio_stream_is, &r);
-    if (!stream) return r;
-    r = audio_stream_submit(stream, frames, count, flags & N_AUDIO_WAIT);
-    handle_close(stream);
-    return r;
-}
-
-static int64_t sys_audio_status(int h, struct n_audio_status *out) {
-    int64_t r;
-    struct handle *stream = handle_get_as(h, audio_stream_is, &r);
-    if (!stream) return r;
-    r = audio_stream_status(stream, out);
-    handle_close(stream);
-    return r;
-}
-
-static int64_t sys_audio_flush(int h) {
-    int64_t r;
-    struct handle *stream = handle_get_as(h, audio_stream_is, &r);
-    if (!stream) return r;
-    r = audio_stream_flush(stream);
-    handle_close(stream);
-    return r;
-}
-
-/* The sound's way out as it stands (struct n_audio_output). The volume and muting change by
-   SYS_SETTINGS_APPLY. */
-static int64_t sys_audio_output(struct n_audio_output *uio) {
-    struct n_audio_output io = {0};
-    io.volume = audio_volume();
-    io.muted = audio_muted();
-    const char *device = audio_output();
-    if (device) strlcpy(io.device, device, sizeof io.device);
-    return copy_to_user(uio, &io, sizeof io) ? -N_ERR_BAD_ADDRESS : 0;
-}
-
 /* Fills the buffer from the kernel's entropy pool in pieces, each copied out
    under the user-memory check. */
 static int64_t sys_random(void *ubuf, size_t n) {
@@ -1074,7 +1028,7 @@ void syscall_dispatch(struct regs *r) {
     int64_t ret = -N_ERR_UNSUPPORTED;
     switch (r->rax) {
     case SYS_EXIT: process_exit((int)a);
-    case SYS_AUDIO_FLUSH: ret = sys_audio_flush((int)a); break;
+    case SYS_AUDIO_DEVICE_RUN: ret = audio_syscall_run((int)a, b != 0); break;
     case SYS_SLEEP: sleep_until(a); ret = 0; break;
     case SYS_SHARED_CREATE: ret = sys_shared_create(a,false); break;
     case SYS_SHARED_RESERVE: ret = sys_shared_create(a,true); break;
@@ -1386,11 +1340,10 @@ void syscall_dispatch(struct regs *r) {
     case SYS_APP_OPEN: ret = sys_app_open((int64_t)a); break;
     case SYS_APP_ID: ret = sys_app_id((int)a); break;
     case SYS_SYSTEM_LOG_OPEN: ret = sys_system_log_open(); break;
-    case SYS_AUDIO_OPEN: ret = sys_audio_open(); break;
-    case SYS_AUDIO_SUBMIT: ret = sys_audio_submit((int)a, (const void *)b, c, (uint32_t)d); break;
-    case SYS_AUDIO_STATUS: ret = sys_audio_status((int)a, (struct n_audio_status *)b); break;
-    case SYS_AUDIO_OUTPUT: ret = sys_audio_output((struct n_audio_output *)a); break;
-    case SYS_AUDIO_OUTPUT_WATCH: ret = audio_output_watch(); break;
+    case SYS_AUDIO_DEVICE_OPEN: ret = audio_syscall_open((int)a, (uint32_t)b, (const struct n_audio_device_format *)c, (struct n_audio_device_ring *)d); break;
+    case SYS_AUDIO_DEVICE_LIST: ret = audio_syscall_list((int)a, (struct n_audio_device *)b, c); break;
+    case SYS_AUDIO_DEVICE_STATUS: ret = audio_syscall_status((int)a, (struct n_audio_device_status *)b); break;
+    case SYS_AUDIO_DEVICE_WATCH: ret = audio_syscall_watch((int)a); break;
     case SYS_RANDOM: ret = sys_random((void *)a, b); break;
     case SYS_WATCH_TAKE: ret = watch_take((int)a); break;
     case SYS_ENTRY_WATCH: ret = sys_entry_watch((const char *)a, b); break;

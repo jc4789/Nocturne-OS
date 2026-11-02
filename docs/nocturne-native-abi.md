@@ -27,13 +27,13 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 
 - カーネル資源はすべて**種類つきハンドル**（`n_handle`、非負の `int32_t`）で表す。
 - 種類：`N_KIND_DOCUMENT`、`N_KIND_FOLDER`、`N_KIND_CHANNEL`、`N_KIND_WINDOW`、
-  `N_KIND_SHARED`、`N_KIND_APP`、`N_KIND_EVENTS`、`N_KIND_DEVICE`（音声等）、
+  `N_KIND_SHARED`、`N_KIND_APP`、`N_KIND_EVENTS`、`N_KIND_DEVICE`（開いた音の出口。§17）、
   `N_KIND_CONNECTION`（TCP／UDP）、`N_KIND_PCI`、`N_KIND_PAGER`、`N_KIND_WATCH`（見張り。下）、
   `N_KIND_CAPABILITY`（能力。§13）。12 は欠番（§10）。
 - 汎用操作は `n_handle_close(h)` と `n_handle_kind(h)` だけ。読み書きは種類ごとの
   専用関数で行い、種類の違うハンドルを渡すと `N_ERR_WRONG_KIND`。
 - 見張り（`N_KIND_WATCH`）は、見ている物が変わったことを知らせるハンドル。開く口は見る物ごとに
-  あり（C: の `n_entry_watch`（§3）、音の `n_audio_output_watch`（§9）、画面の `n_screen_watch`）、
+  あり（C: の `n_entry_watch`（§3）、画面の `n_screen_watch`）、
   取り出しは共通の `n_watch_take(h)`（`SYS_WATCH_TAKE`）一つ。
   - 変化があると `N_EVENT_RECEIVABLE` になり、`n_watch_take` が数を取るまでそのまま（レベル）。
     `n_watch_take` は前の取り出しの後に来た変化の数を返す（無ければ 0）。数えるのはハンドルごとに
@@ -43,7 +43,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     `N_ERR_CLOSED`。
   - 見張りでないハンドルの取り出しは `N_ERR_WRONG_KIND`。見張りはイベント待ち行列（§6）に入れて待つ。
     中身（値や内容）は運ばず、知らせを受けた側が持ち主の読み出し（`n_entry_info`、`n_document_load`、
-    `n_audio_output` など）で読み直す。
+    `n_screen_info` など）で読み直す。
 - ハンドルの複製と、番号を指定した付け替えはない。子アプリへ渡す資源は
   起動時の引渡し表（§5）で明示する。
 
@@ -495,36 +495,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   動いている全部。`flags` は全 CPU が持つ機能（`N_CPU_SSE2`・`N_CPU_AVX`・`N_CPU_USER_THREADS`）。
   カーネルは自分の仕事を CPU に配らないので、`worker_cpus`・`parallel_jobs`・`worker_chunks` は 0
   で、`N_CPU_AP_WORKERS` は立たない。
-- 音声：`n_audio_open()` が混合器の上の自分専用の流れ（`N_KIND_DEVICE`）を返す。全部
-  使用中なら `N_ERR_BUSY`。形式は `N_AUDIO_RATE`（48kHz）のステレオ、1フレーム＝int16_t
-  二つ（左が先）。
-  - `n_audio_submit(a, frames, count, flags)`：入るだけ受け取り、受け取ったフレーム数を返す。
-    流れは約170ms分を持つ。`N_AUDIO_WAIT` なら空きを待ち、無ければ満杯で
-    `N_ERR_NOT_READY`（空きは `N_EVENT_SENDABLE` で分かる）。
-  - `n_audio_status(a, struct n_audio_status *)`：待っているフレーム、装置に渡したフレーム、
-    再生済み（推定を含む。`flags` が時計の出所）とそれを聞いた時刻、世代、音切れ。再生済みの
-    `played_frames` と時刻の `played_at_ns`（monotonic の時計）は一組で、出口が位置を最後に
-    報告した時の値である。流れは出口の水晶によらず monotonic の時計で毎秒 48000 フレーム進む
-    （混ぜ場が出口の位置と時計の組から比を測り、音を補間して合わせる。音は飛ばさない）。
-    `pace_ppb` は今の比で、流れのフレームを出口の一フレームが幾つ取るかの 1 との差（十億分率）。
-    音切れは、流れの音を出口が全部鳴らし終えた後に次の音が来たことで、`underruns` がその回数、`underrun_ns` がその間の時間
-    （どちらも最後の flush から）。音を渡し終えて閉じる流れの最後の無音は数えない。
-  - `n_audio_flush(a)`：待っている音を捨て、世代を進める。音の装置へ渡したが装置がまだ読み
-    始めていない分も取り戻し、他の流れだけで混ぜ直す。止めた後に聞こえるのは装置が既に持つ分
-    だけ（High Definition Audio は FIFO の分と鳴っている塊の残り、AC'97 は鳴っている塊の残りと
-    先読みの一つで最大 20 ms）。遠隔の画面の相手へ送った分は取り戻せない。
-  - `n_handle_close` は残りを鳴らし終えてから閉じる。止められたアプリの流れは待たず、flush と
-    同じに捨てる。
-  - 主音量と出力先：`n_audio_output(struct n_audio_output *io)` が読む。`io` に今の
-    音量・消音と `device`（音を鳴らしている先：音の出口の名前、遠隔デスクトップの利用者がいれば
-    "Remote desktop"。鳴らす先が無ければ空文字列。タスクバーのスピーカーと同じもの）が入る。
-    機械は幾つでも出口（codec の jack、画面への pin）を持つ。鳴らすのは一つで、既定は刺さった
-    出力が先。刺さり方が変わると、流れを切らずに移り、`device` が変わる。
-    鳴らす先が無くても音量は保たれ、後から付いた先に使われる。音量と消音は音の部品
-    （`dev/audio.c`）の持ち物で、変える口は §12 の `N_DOMAIN_AUDIO`。
-  - `n_audio_output_watch()`（`SYS_AUDIO_OUTPUT_WATCH`）：`n_audio_output` が返すもの（音量、消音、
-    `device`）が変わると受け取れる見張り（`N_KIND_WATCH`、§12）。誰が変えても知らせ、同じ値を
-    当て直すのは変化ではない。
+- 音声：サービス audio の流れで鳴らす（§17）。
 - システムログ：`n_system_log(buf, cap)` か `n_system_log_open()` のハンドルの
   `n_channel_receive` で読み、そのハンドルへ `n_channel_send` で書く（§4）。
 - アプリの中の装置ドライバー（例：NVIDIA の資源管理 `C:\Nocturne\System\nvrm`、`docs/nvidia/LEDGER.md`）：
@@ -918,7 +889,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 
 ## 10. 番号と、ほかの節に無い呼出し
 
-欠番：1〜18、20〜25、30〜32、35〜37、44、51〜52、60〜63、90、203〜206。ハンドルの種類 12 も
+欠番：1〜18、20〜25、30〜32、35〜37、44、51〜52、60〜63、90、164、203〜206。ハンドルの種類 12 も
 欠番。ABI は呼出しの古い形を残さない：プログラムは動かすシステムの `abi.h` で組む。
 
 ほかの節に無い呼出し：
@@ -1176,7 +1147,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   | 領域 | 鍵 | 持ち主 |
   |---|---|---|
   | `N_DOMAIN_BOOT` | `N_BOOT_IOMMU`、`N_BOOT_ACPI_AML`、`N_BOOT_SMP`、`N_BOOT_RESUME`、`N_BOOT_UNISOLATED_DRIVERS` | `fs/bootrecord.c` |
-  | `N_DOMAIN_AUDIO` | `N_AUDIO_VOLUME`（0〜100。消音も解く）、`N_AUDIO_MUTED` | `dev/audio.c` |
+  | `N_DOMAIN_AUDIO` | `N_AUDIO_VOLUME`（0〜100）、`N_AUDIO_MUTED`、`N_AUDIO_OUTPUT`（出口の key。空は一番良いもの）、装置ごとの `N_AUDIO_FORMAT_RATE`・`N_AUDIO_FORMAT_BITS`・`N_AUDIO_FORMAT_CHANNELS`（0 は既定） | サービス audio（§17） |
   | `N_DOMAIN_DISPLAY` | `N_DISPLAY_HOLD_SECONDS` | `dev/pciuser.c` |
   | `N_DOMAIN_DISPLAY` | `N_DISPLAY_MODE`（試し）、`N_DISPLAY_PLACE`、`N_DISPLAY_SCALE`（試し）、`N_DISPLAY_PRIMARY` | サービス `display`（§9） |
   | `N_DOMAIN_WINDOW` | `N_WINDOW_SMOOTH_GRADIENTS` | `gui/wm.c` |
@@ -1226,7 +1197,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   プログラム自身、ほかのプログラム、タスクバー、遠隔デスクトップの利用者）知らせ、同じ値を
   当て直すのは変化ではない。待ち行列（§6）に入れて待つ。窓の無い Worker やサービスでも使える。
   見張りを閉じれば、入っていた待ち行列からも消える。開く口は用途ごと：
-  - `n_audio_output_watch()`（`SYS_AUDIO_OUTPUT_WATCH`）：`n_audio_output` が返すもの。
+  - `n_audio_output_watch()`：`n_audio_outputs` が返すものが変わると一通届く channel（§17）。音量と消音は設定の見張りで受ける。
   - `n_screen_watch()`（`SYS_SCREEN_INFO` の `SCREEN_WATCH`、display.h）：`SCREEN_SETTINGS_GET`・
     `struct screen_format` の返事・`SCREEN_MODES_GET` が報告するもの。
   - `n_entry_watch(path, what)`（`SYS_ENTRY_WATCH`、§3）：C: の名前とフォルダー。
@@ -1255,7 +1226,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 - 能力（`N_KIND_CAPABILITY`）は特権を一つ持つハンドル。持つことが権限の証明で、渡すことが委譲。
   起動の表か、メッセージの添付で渡す。
   - 種類：`N_CAP_ROOT`、`N_CAP_SERVICE_ROOT`、`N_CAP_IDENTITY_GRANT`、`N_CAP_PCI_CLAIM`、`N_CAP_POWER`、
-    `N_CAP_SCREEN_READ`、`N_CAP_SETTINGS_APPLY`、`N_CAP_STORE_PRIVATE`、`N_CAP_SHELL`、`N_CAP_NETWORK`、`N_CAP_CLOCK`、`N_CAP_DISPLAY`。
+    `N_CAP_SCREEN_READ`、`N_CAP_SETTINGS_APPLY`、`N_CAP_STORE_PRIVATE`、`N_CAP_SHELL`、`N_CAP_NETWORK`、`N_CAP_CLOCK`、`N_CAP_DISPLAY`、`N_CAP_AUDIO_DEVICE`。
   - カーネルが作るのは `N_CAP_ROOT` を一つだけで、最初のプロセスがハンドル `N_INITIAL_ROOT_HANDLE`
     （3）で受ける。最初のプロセスの身元は `user` 0、`session` 0、`N_CLASS_SYSTEM`、`program` 0。
   - `n_cap_derive(cap, kind)`：`N_CAP_ROOT` は全部の種類を、ほかの能力は同じ種類だけを切り出す。
@@ -1272,6 +1243,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 | `screen_grab` | `N_CAP_SCREEN_READ` |
 | `n_service_register` | `N_CAP_SERVICE_ROOT` |
 | `n_shell_*`、`n_power_state`、`n_power_watch` | `N_CAP_SHELL` |
+| `n_audio_device_list`・`n_audio_device_open`・`n_audio_device_watch` | `N_CAP_AUDIO_DEVICE` |
 | `n_system_log`、`n_system_log_open` の受信 | 級が ADMIN 以上（書くのは誰でも） |
 | `SYS_NET_TEST` | 級が ADMIN 以上 |
 | `n_net_address_set`、`n_net_routes_set`、`udp_socket_on` | `N_CAP_NETWORK` |
@@ -1391,3 +1363,35 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 通知はサービス `N_SHELL_SERVICE`（`"shell"`）のチャンネルで受ける。名前の範囲は同じ利用者の同じセッション（§14）。
 
 - `n_shell_notify(title, text)`：`struct n_shell_notice` を一通送る。シェルは数秒の間それを出す。シェルの音量の表示は §12 の設定を読み、変更は `n_setting_set_int` で設定のサービスへ頼む。
+
+## 17. 音
+
+型は `common/audio_abi.h`。カーネルは音の方針を持たない。混合、変換、音量、消音、出口と形式の選択はサービス `audio`（`user/apps/audio.c`）が持つ。
+
+### アプリの流れ
+
+- `n_audio_open(const struct n_audio_format *, n_audio_stream **)`：形式を宣言して流れを開く。率は 0 より大きい Hz、channel は 1 以上、標本は `N_AUDIO_S16`・`N_AUDIO_S32`・`N_AUDIO_F32`。channel の順は WAVE と同じ。出口と数が違えば左右へ混ぜ、名前の無い位置は混ぜない。流れの数に上限は無く、記憶が無ければ `N_ERR_NO_MEMORY`、輪の大きさが表せなければ `N_ERR_TOO_LARGE`。
+- `n_audio_submit(s, frames, count, flags)`：共有の輪へ写す。受け取った frame の数を返す。流れは約 170 ms を持つ。`N_AUDIO_WAIT` なら空きを待ち、無ければ満杯で `N_ERR_NOT_READY`。続けて鳴る流れにはシステムコールが無い。眠った流れだけ `N_AUDIO_OP_KICK` を一通送る。
+- `n_audio_status(s, struct n_audio_status *)`：輪から読む。待っている frame、出口へ渡した frame、再生済みとそれを聞いた時刻、世代、音切れ、`flags`（`N_AUDIO_CLOCK_DEVICE`、`N_AUDIO_CLOCK_ESTIMATED`、`N_AUDIO_CLOCK_REMOTE`）、`pace_ppb`。流れは出口の水晶によらず monotonic の時計で進む。音切れは、音を全部聞かせた後に次の音が来たこと。
+- `n_audio_flush(s)`：待っている音を捨て、世代を進める。出口がまだ読まない塊まで全部の流れを戻し、他の流れだけで混ぜ直す。遠隔の相手へ送った分は取り戻せない。
+- `n_audio_close(s)`：残りを鳴らし終えてから閉じる。アプリが落ちて接続が切れても、サービスが残りを鳴らして流れを消す。
+- サービスが死ぬと、次の呼出しで接続し直し、まだ混ぜていない音を新しい輪へ写し、数と世代を続ける。死の確かめは、輪が動かない時と満杯の時だけ。その間、driver は止まらない。
+
+### 出口と設定
+
+- `n_audio_outputs(struct n_audio_output **)`：出口の並びと、今の決め（`playing`、`format`）。一件は `bytes` の長さで、`n_audio_output_device` が申告を指す。`n_audio_output_name()` は鳴らしている出口の名前。`n_audio_output_watch()` は変化ごとに 1 バイトが届く channel で、`n_audio_output_watch_take` で取る。
+- 選択：`N_AUDIO_OUTPUT` の key の出口が使えればそれ。無ければ遠隔の相手、刺さった出口、刺さり方の分からない出口の順で、同じなら HEADPHONE、SPEAKER、LINE、DISPLAY、DIGITAL、OTHER の順。同点は今のものを続ける。
+- 形式：`N_AUDIO_FORMAT_*`（`id.device` は `n_setting_device(key)`）が申告にあればそれ。無ければ 48 kHz に一番近い率、一番大きい標本、一番多い channel。申告に無い値は `N_ERR_INVALID` で断る。
+- 宣言：サービスが起動のたびに宣言し、接続を持ち主にする。settings はその時に保存された値を当て直す。利用者が替わると、その人の値か既定を当てる。音量を変えても消音は解けない。
+- 接続は流れごとか見張りごとで、音の無い流れは活動中の列に居ない。流れが数百あっても、拍の費用は鳴っている流れの数で決まる。全部が静かになって 1 秒たつと装置を止め、拍が止まる。一度も鳴らなければ出口を開かない。
+
+### カーネルの口（`N_CAP_AUDIO_DEVICE`）
+
+能力はサービス audio にだけ渡す。
+
+- `n_audio_device_list(cap, out, bytes)`：全部のバイト数を返す。足りなければ何も書かない。一件は `struct n_audio_device`（`bytes`、id、種類、刺さり方、channel の範囲）の後に率、大きさ、name、key が続き、`n_audio_device_rates`・`n_audio_device_sizes`・`n_audio_device_name`・`n_audio_device_key` で読む。
+- `n_audio_device_open(cap, id, format, ring)`：申告にある形式で開く。`ring` は望みの `block_frames` と `blocks` を渡し、答えは装置が取れる形（High Definition Audio は記述子 2〜256 個、塊は 128 バイトの倍数。AC'97 は記述子 32 個）。輪の共有 object を `ring->memory` で返す。開けるのは一つの出口に一つで、同じ controller の別の出口が開いていれば `N_ERR_BUSY`。ハンドルを閉じると装置は止まる。
+- `n_audio_device_run(device, run)`：輪の始めから流す、止める。リンクが下りていれば `N_ERR_NOT_READY`。周期の知らせでまた見る。
+- `n_audio_device_status(device, status)`：位置と時刻の組、`guard_frames`（ここまでは装置が読んだか読みかけ）、世代（電源の変化で輪の中身が失われると増える）、流れの誤りの累積。塊の終わりごとに handle が `N_EVENT_RECEIVABLE` になり、読むと消える。
+- `n_audio_device_watch(cap)`：一覧の見張り（`N_KIND_WATCH`）。
+- 新しい音の装置（USB Audio など）は `kernel/src/dev/audio.h` の `struct audio_output` を作り `audio_output_add` するだけで、サービスとアプリは変わらない。

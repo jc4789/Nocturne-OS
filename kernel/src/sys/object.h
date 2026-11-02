@@ -85,7 +85,7 @@ void object_unref(struct object *o);
 struct handle *handle_open(struct object *o, uint32_t rights);
 struct handle *handle_ref(struct handle *h);
 /* Drops one reference; the last one closes the opening and drops its object reference. It may
-   sleep (an audio stream plays out what it has): never with a spinlock held. */
+   sleep: never with a spinlock held. */
 void handle_close(struct handle *h);
 static inline int handle_kind(const struct handle *h) { return h->object->ops->kind; }
 static inline bool handle_is(const struct handle *h, const struct object_ops *ops) {

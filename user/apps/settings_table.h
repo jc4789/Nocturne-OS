@@ -24,11 +24,6 @@ static const struct n_setting_decl settings_table[] = {
                  "休止の像があれば、そこへ戻ります。次の起動から効きます。", 1),
     BOOL_SETTING(N_DOMAIN_BOOT, N_BOOT_UNISOLATED_DRIVERS, N_SCOPE_MACHINE, N_APPLY_RESTART, "boot.unisolated-drivers",
                  "隔離できない装置のドライバー", "隔離できない装置のドライバーをアプリに許します。次の起動から効きます。", 0),
-    /* 音 */
-    INT_SETTING(N_DOMAIN_AUDIO, N_AUDIO_VOLUME, N_SCOPE_USER, N_APPLY_NOW, "audio.volume", "音量",
-                "全部の音の大きさです。", 0, 100, 100),
-    BOOL_SETTING(N_DOMAIN_AUDIO, N_AUDIO_MUTED, N_SCOPE_USER, N_APPLY_NOW, "audio.muted", "消音",
-                 "全部の音を止めます。音量はそのままです。", 0),
     /* 画面 */
     INT_SETTING(N_DOMAIN_DISPLAY, N_DISPLAY_HOLD_SECONDS, N_SCOPE_MACHINE, N_APPLY_NOW, "display.hold-seconds",
                 "ドライバーが画面を握る秒数", "ドライバーが画面を握れる秒数です。0 は上限なしです。", 0, 86400, 0),

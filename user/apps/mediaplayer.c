@@ -25,7 +25,7 @@ static nmedia *media;
 static const struct nmedia_info *info;
 static struct nmedia_output pending;
 static size_t audio_at;
-static n_handle audio = -1;
+static n_audio_stream *audio;
 static bool playing, finished;
 static int64_t base_ms;
 static uint64_t started;
@@ -46,12 +46,12 @@ static int field_focus;
 static uint32_t n_play, n_seek, n_field, n_open;
 static void focus_field(bool on) { field_focus = (abs(field_focus) + 1) * (on ? 1 : -1); }
 static int64_t position(void) { return base_ms + (playing ? (int64_t)((n_clock_monotonic() / N_NS_PER_MS) - started) : 0); }
-static void clear_audio(void) { if (audio >= 0) { n_audio_flush(audio);n_handle_close(audio); } audio = -1; }
+static void clear_audio(void) { if (audio) { n_audio_flush(audio);n_audio_close(audio); } audio = NULL; }
 /* frames the stream still holds; -1 if it failed */
 static int64_t audio_queued(void) { struct n_audio_status st;return n_audio_status(audio,&st)<0?-1:(int64_t)st.queued_frames; }
 static void open_audio(void) {
-    audio=n_audio_open();
-    if(audio>=0&&audio_queued()<0)clear_audio();
+    if(n_audio_open(&SOUND_FORMAT,&audio)<0)audio=NULL;
+    if(audio&&audio_queued()<0)clear_audio();
 }
 static bool present_picture(void) {
     size_t count,bytes;
@@ -112,7 +112,7 @@ static void show(void) {
     const char *status = "Ctrl+O: input   HTTP refills wait synchronously; no cookies or login.";
     uint32_t status_colour = t->textDim;
     if (error[0]) { status = error; status_colour = t->danger; }
-    else if (playing && info && info->audio && audio < 0) { status = "Audio unavailable; video continues silently."; status_colour = t->danger; }
+    else if (playing && info && info->audio && !audio) { status = "Audio unavailable; video continues silently."; status_colour = t->danger; }
     bool seekable = info && duration > 0;
     shown_ms = at;
     shown_px = seekable ? (int)(MIN(MAX(at,0),duration)*SEEK_PX/duration) : 0;
@@ -182,7 +182,7 @@ static bool pump(void) {
             pending.kind=0;changed=true;
         } else if (pending.kind==NMEDIA_AUDIO) {
             if (pending.pts_ms>now+100) return changed;
-            if (audio>=0) {
+            if (audio) {
                 int64_t queued=audio_queued();
                 if (queued<0 || queued>=4800) return changed;
                 size_t frames=MIN(pending.frames-audio_at,(size_t)(4800-queued));
@@ -190,7 +190,7 @@ static bool pump(void) {
                 if (n==-N_ERR_NOT_READY) return changed;
                 if (n<=0) { clear_audio();strlcpy(error,"Audio output failed.",sizeof error); }
                 else audio_at+=(size_t)n;
-                if (audio>=0 && audio_at<pending.frames) return changed;
+                if (audio && audio_at<pending.frames) return changed;
             }
             pending.kind=0;
         } else if (pending.kind==NMEDIA_END) {

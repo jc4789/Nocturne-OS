@@ -25,6 +25,7 @@
 #include "gui/wm.h"
 #include "vm/hv/hvsock.h"
 #include "mm/heap.h"
+#include "mm/shared.h"
 #include "sys/clock.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
@@ -196,7 +197,12 @@ struct rdp {
     uint16_t snd_format;   /* our format's number in the client's list */
     /* the sound thread (snd_thread), from SND_PLAYING on, and what it alone uses */
     struct thread *snd_task;
-    struct audio_remote snd_remote; /* it sleeps on its wq */
+    struct audio_output snd_output; /* the sound layer's way to this client */
+    char snd_key[sizeof "remote-4294967295"];
+    struct object *snd_ring;        /* what the service writes: SND_RING_BLOCKS blocks */
+    uint8_t *snd_ring_view;
+    struct wait_queue snd_wq;       /* it sleeps here */
+    uint64_t snd_signals;
     uint8_t *snd_buf;      /* one block, with room for its headers */
     uint8_t *snd_out;      /* its PDUs are built here: out is the session thread's */
     /* Under snd_lock, between the sound thread and the session thread, which reads the client's
@@ -210,6 +216,10 @@ struct rdp {
     uint64_t snd_end;
     uint32_t snd_blocks, snd_confirmed;
     bool snd_stop, snd_done;
+    bool snd_run;           /* the service wants the ring played */
+    uint64_t snd_taken;     /* the frames taken from the ring since it began to play */
+    uint64_t snd_played;    /* of them, what the client says it has played */
+    uint64_t snd_played_at;
     int snd_err;            /* why the sound thread ended, which ends the session */
     struct mutex send_lock; /* one PDU at a time on the socket, from either thread */
     struct {               /* a channel message being reassembled, per channel */
@@ -1237,29 +1247,31 @@ static int apply_resize(struct rdp *c) {
 }
 
 /* ---- sound (MS-RDPEA) ----
-   We offer one format, the mixer's own (PCM, 48 kHz, 16-bit stereo). A client that takes it gets
-   a training round trip, then the mixed sound in 20 ms blocks from the session's sound thread, at
-   the client's pace. Each block carries its number and a time stamp, the milliseconds of our clock
-   as it was sent; the client confirms each block it has played with that stamp plus the time it
-   took (Wave Confirm), which puts on our clock the moment the client played it. From that moment
-   and the blocks sent after it, the thread knows when the client will have played everything it
-   was sent (snd_end; never sooner than the blocks could play from when they were sent), and mixes
-   the next block once that is less than SND_LEAD away. In between it sleeps until then, or, with
-   nothing to play, until a stream gets some (audio_remote_ready): nothing runs while nothing plays.
-   While the client takes the sound the card is silent (see audio.h). Windows' client starts sound
-   only once the device redirection channel has introduced itself, so that gets a minimal answer
-   too (MS-RDPEFS): every drive, printer or port it offers is turned down. */
+   We offer one format (PCM, 48 kHz, 16-bit stereo). A client that takes it gets a training round trip,
+   and becomes an output of the sound layer (dev/audio.h): a ring the service audio writes, whose blocks of
+   20 ms the session's sound thread sends at the client's pace while the service has it run. Each block
+   carries its number and a time stamp, the milliseconds of our clock as it was sent; the client
+   confirms each block it has played with that stamp plus the time it took (Wave Confirm), which puts on
+   our clock the moment the client played it: that is the output's position. From that moment and the
+   blocks sent after it, the thread knows when the client will have played everything it was sent
+   (snd_end; never sooner than the blocks could play from when they were sent), and sends the next
+   block once that is less than SND_LEAD away. In between it sleeps until then; while the ring does not
+   run, until it does: nothing runs while nothing plays. Windows' client starts sound only once the
+   device redirection channel has introduced itself, so that gets a minimal answer too (MS-RDPEFS):
+   every drive, printer or port it offers is turned down. */
 
 enum { SND_OFF, SND_WAIT, SND_FORMATS, SND_TRAINING, SND_PLAYING };
 enum { SNDC_CLOSE = 1, SNDC_WAVE, SNDC_SETVOLUME, SNDC_SETPITCH, SNDC_WAVECONFIRM, SNDC_TRAINING, SNDC_FORMATS,
        SNDC_QUALITYMODE = 0x0C, SNDC_WAVE2 = 0x0D };
 #define TSSNDCAPS_ALIVE 1
 #define SND_VERSION 8
-#define SND_BLOCK_FRAMES 960 /* 20 ms */
-#define SND_BLOCK_NS (SND_BLOCK_FRAMES * NS_PER_S / AUDIO_RATE)
+#define SND_RATE 48000
+#define SND_FRAME 4              /* bytes */
+#define SND_BLOCK_FRAMES 960     /* 20 ms */
+#define SND_BLOCK_NS (SND_BLOCK_FRAMES * NS_PER_S / SND_RATE)
+#define SND_RING_BLOCKS 16       /* more than SND_LEAD holds */
 #define SND_LEAD_NS (160 * NS_PER_MS) /* how far ahead of the client's playing the sound goes out */
-#define SND_LOW_NS (2 * SND_BLOCK_NS) /* less than this left: part of a block is worth sending */
-#define SND_BUF (16 + SND_BLOCK_FRAMES * AUDIO_FRAME)
+#define SND_BUF (16 + SND_BLOCK_FRAMES * SND_FRAME)
 
 static uint16_t snd_stamp(uint64_t ns) { return (uint16_t)(ns / NS_PER_MS); }
 
@@ -1283,9 +1295,9 @@ static int snd_offer(struct rdp *c) {
     w8(&w, 0);
     w16(&w, 1); /* WAVE_FORMAT_PCM */
     w16(&w, 2);
-    w32(&w, AUDIO_RATE);
-    w32(&w, AUDIO_RATE * AUDIO_FRAME);
-    w16(&w, AUDIO_FRAME);
+    w32(&w, SND_RATE);
+    w32(&w, SND_RATE * SND_FRAME);
+    w16(&w, SND_FRAME);
     w16(&w, 16);
     w16(&w, 0);
     c->snd_state = SND_FORMATS;
@@ -1306,7 +1318,7 @@ static int snd_client_formats(struct rdp *c, struct rbuf *r) {
         rskip(r, 4 + 2);
         uint16_t bits = r16(r), extra = r16(r);
         rskip(r, extra);
-        if (found < 0 && !r->err && tag == 1 && ch == 2 && rate == AUDIO_RATE && bits == 16) found = i;
+        if (found < 0 && !r->err && tag == 1 && ch == 2 && rate == SND_RATE && bits == 16) found = i;
     }
     if (r->err || !(flags & TSSNDCAPS_ALIVE) || found < 0) {
         kprintf("rdp: \"%s\" plays no sound we can send\n", c->client_name);
@@ -1323,26 +1335,30 @@ static int snd_client_formats(struct rdp *c, struct rbuf *r) {
     return vc_send(c, c->out, c->snd, m, w.n);
 }
 
-/* The sound thread: one block of sound, mixed and sent. Its number, when it was sent and the
-   mixer's ordinal after it are kept until the client confirms it (snd_confirm); a client that
-   leaves 255 blocks unconfirmed has the oldest taken as played, so that the 8-bit numbers stay
-   unambiguous. snd_buf has 16 bytes of room for headers before the samples. */
+/* The sound thread: the next block of the ring, sent. Its number, when it was sent and the count of
+   frames after it are kept until the client confirms it (snd_confirm); a client that leaves 255 blocks
+   unconfirmed has the oldest taken as played, so that the 8-bit numbers stay unambiguous. snd_buf has
+   16 bytes of room for headers before the samples. */
 static int snd_wave(struct rdp *c) {
     uint8_t *buf = c->snd_buf, *d = buf + 16;
-    uint32_t len = SND_BLOCK_FRAMES * AUDIO_FRAME;
-    uint64_t end, lost = 0;
-    if (!audio_remote_mix(&c->snd_remote, (int16_t *)d, SND_BLOCK_FRAMES, &end)) return 0;
+    uint32_t len = SND_BLOCK_FRAMES * SND_FRAME;
     uint64_t now = clock_now_ns();
     uint16_t stamp = snd_stamp(now);
     uint64_t f = spin_lock(&c->snd_lock);
-    if ((uint8_t)(c->snd_next - c->snd_oldest) == 255) lost = c->snd_sent[c->snd_oldest++].end;
+    uint64_t at = c->snd_taken / SND_BLOCK_FRAMES % SND_RING_BLOCKS;
+    if ((uint8_t)(c->snd_next - c->snd_oldest) == 255) {
+        c->snd_played = c->snd_sent[c->snd_oldest++].end;
+        c->snd_played_at = now;
+    }
+    c->snd_taken += SND_BLOCK_FRAMES;
     uint8_t block = c->snd_next++;
     c->snd_sent[block].sent = now;
-    c->snd_sent[block].end = end;
+    c->snd_sent[block].end = c->snd_taken;
     c->snd_end = MAX(c->snd_end, now) + SND_BLOCK_NS; /* a client cannot play it sooner */
     c->snd_blocks++;
     spin_unlock(&c->snd_lock, f);
-    if (lost) audio_played(lost, now);
+    memcpy(d, c->snd_ring_view + at * len, len);
+    audio_output_period(&c->snd_output);
     if (c->snd_version >= 8) { /* one message */
         struct wbuf w = {buf, 0, 16};
         snd_header(&w, SNDC_WAVE2, (uint16_t)(12 + len));
@@ -1350,7 +1366,7 @@ static int snd_wave(struct rdp *c) {
         w16(&w, c->snd_format);
         w8(&w, block);
         wzero(&w, 3);
-        w32(&w, (uint32_t)(now / NS_PER_MS)); /* when its samples were taken from the mixer */
+        w32(&w, (uint32_t)(now / NS_PER_MS)); /* when its samples were taken from the ring */
         return vc_send(c, c->snd_out, c->snd, buf, 16 + len);
     }
     /* older clients: a wave info message with the first four bytes, then the rest in a wave
@@ -1377,92 +1393,145 @@ static void snd_confirm(struct rdp *c, struct rbuf *r) {
     uint16_t stamp = r16(r);
     uint8_t block = r8(r);
     if (r->err) return;
-    uint64_t now = clock_now_ns(), heard = 0, ordinal = 0;
+    uint64_t now = clock_now_ns();
     int64_t off = (int16_t)(uint16_t)(stamp - snd_stamp(now));
+    bool told = false;
     uint64_t f = spin_lock(&c->snd_lock);
     uint8_t unconfirmed = (uint8_t)(c->snd_next - c->snd_oldest), place = (uint8_t)(block - c->snd_oldest);
     if (place < unconfirmed) {
-        heard = MAX(c->snd_sent[block].sent, (uint64_t)((int64_t)(now / NS_PER_MS) + off) * NS_PER_MS);
-        ordinal = c->snd_sent[block].end;
+        uint64_t heard = MAX(c->snd_sent[block].sent, (uint64_t)((int64_t)(now / NS_PER_MS) + off) * NS_PER_MS);
+        c->snd_played = MAX(c->snd_played, c->snd_sent[block].end);
+        c->snd_played_at = heard;
         c->snd_oldest = (uint8_t)(block + 1);
         c->snd_end = MAX(c->snd_end, heard + (uint64_t)(unconfirmed - place - 1) * SND_BLOCK_NS);
         c->snd_confirmed++;
+        told = true;
     }
     spin_unlock(&c->snd_lock, f);
-    if (ordinal) audio_played(ordinal, heard);
+    if (told) audio_output_period(&c->snd_output);
 }
 
-/* The sound thread. A block goes out while the client would play everything it has within
-   SND_LEAD, and every stream has a whole block (audio_ready) or the client would have played
-   everything within SND_LOW: a stream fed in small pieces (Web Audio) is not padded with silence
-   in the middle of its sound. Otherwise it sleeps until the client's queue falls to where that
-   changes, or until a stream gets the PCM it waits for; with nothing at the client and nothing
-   to play, until then alone. It ends when the session tells it to (snd_finish) or a send fails. */
+/* The sound thread. A block goes out while the ring runs and the client would play everything it has
+   within SND_LEAD. Otherwise it sleeps until the client's queue falls to where that changes; with the
+   ring not running, until it does. It ends when the session tells it to (snd_finish) or a send fails. */
 static void snd_thread(void *arg) {
     struct rdp *c = arg;
-    struct audio_remote *r = &c->snd_remote;
     int err = 0;
     sched_set_policy(thread_current(), sched_deadline(SND_BLOCK_NS)); /* the client's sound, a block a period */
     for (;;) {
-        uint64_t seen = __atomic_load_n(&r->signals, __ATOMIC_SEQ_CST);
+        uint64_t seen = __atomic_load_n(&c->snd_signals, __ATOMIC_SEQ_CST);
         uint64_t f = spin_lock(&c->snd_lock);
-        bool stop = c->snd_stop;
+        bool stop = c->snd_stop, run = c->snd_run;
         uint64_t end = c->snd_end;
         spin_unlock(&c->snd_lock, f);
         if (stop) break;
         uint64_t now = clock_now_ns(), ahead = end > now ? end - now : 0, wake = CLOCK_NEVER;
-        if (ahead >= SND_LEAD_NS) {
-            wake = end - SND_LEAD_NS;
-        } else if (audio_remote_ready(r, SND_BLOCK_FRAMES, ahead < SND_LOW_NS)) {
+        if (run && ahead < SND_LEAD_NS) {
             if ((err = snd_wave(c))) break;
             continue;
-        } else if (ahead >= SND_LOW_NS) {
-            wake = end - SND_LOW_NS; /* part of a block will do then */
         }
-        wq_wait_unless(&r->wq, &r->signals, seen, wake);
+        if (run) wake = end - SND_LEAD_NS;
+        wq_wait_unless(&c->snd_wq, &c->snd_signals, seen, wake);
     }
     uint64_t f = spin_lock(&c->snd_lock);
     c->snd_err = err;
     c->snd_done = true;
-    wq_wake_all(&r->wq); /* the session thread, in snd_finish; after this, c is not touched */
+    wq_wake_all(&c->snd_wq); /* the session thread, in snd_finish; after this, c is not touched */
     spin_unlock(&c->snd_lock, f);
 }
 
-/* The training came back: the sound comes to this client, from its own thread. */
+static void snd_signal(struct rdp *c) {
+    __atomic_add_fetch(&c->snd_signals, 1, __ATOMIC_SEQ_CST);
+    wq_wake_all(&c->snd_wq);
+}
+
+/* The sound layer's calls. */
+static int snd_output_open(struct audio_output *output, const struct n_audio_device_format *format, struct audio_ring *ring) {
+    struct rdp *c = output->priv;
+    (void)format; /* the one it declares */
+    memset(c->snd_ring_view, 0, SND_RING_BLOCKS * SND_BLOCK_FRAMES * SND_FRAME);
+    *ring = (struct audio_ring){.memory = c->snd_ring, .block_frames = SND_BLOCK_FRAMES, .blocks = SND_RING_BLOCKS};
+    return 0;
+}
+static int snd_output_run(struct audio_output *output, bool run) {
+    struct rdp *c = output->priv;
+    uint64_t f = spin_lock(&c->snd_lock);
+    if (run && !c->snd_run) {
+        c->snd_taken = c->snd_played = 0;
+        c->snd_oldest = c->snd_next;
+        c->snd_played_at = clock_now_ns();
+    }
+    c->snd_run = run;
+    spin_unlock(&c->snd_lock, f);
+    snd_signal(c);
+    return 0;
+}
+static void snd_output_close(struct audio_output *output) { snd_output_run(output, false); }
+static void snd_output_status(struct audio_output *output, struct n_audio_device_status *status) {
+    struct rdp *c = output->priv;
+    uint64_t f = spin_lock(&c->snd_lock);
+    status->position = c->snd_played;
+    status->at_ns = c->snd_played_at;
+    /* what went out cannot be changed */
+    status->guard_frames = (uint32_t)(c->snd_taken - c->snd_played);
+    status->running = c->snd_run;
+    spin_unlock(&c->snd_lock, f);
+}
+static const struct audio_output_ops snd_output_ops = {.open = snd_output_open, .close = snd_output_close,
+                                                       .run = snd_output_run, .status = snd_output_status};
+
+/* The training came back: the sound layer has one more output, and this thread sends what it plays. */
 static int snd_start(struct rdp *c) {
     c->snd_buf = kmalloc(SND_BUF);
     c->snd_out = kmalloc(MAX_PDU);
-    if (!c->snd_buf || !c->snd_out) {
+    void *view = NULL;
+    c->snd_ring = shared_kernel_new(SND_RING_BLOCKS * SND_BLOCK_FRAMES * SND_FRAME, &view);
+    c->snd_ring_view = view;
+    if (!c->snd_buf || !c->snd_out || !c->snd_ring) {
         c->snd_state = SND_OFF;
         return 0;
     }
     c->snd_state = SND_PLAYING;
-    c->snd_remote.blocks = ARRAY_SIZE(c->snd_sent);
-    audio_remote_attach(&c->snd_remote);
     c->snd_task = kthread_create("rdpsnd", snd_thread, c);
     if (!c->snd_task) {
-        audio_remote_detach(&c->snd_remote);
         c->snd_state = SND_OFF;
         return 0;
     }
+    static uint32_t sessions;
+    static const uint32_t rates[] = {SND_RATE};
+    static const struct n_audio_size sizes[] = {{16, SND_FRAME / 2}};
+    ksnprintf(c->snd_key, sizeof c->snd_key, "remote-%u", __atomic_add_fetch(&sessions, 1, __ATOMIC_RELAXED));
+    c->snd_output.ops = &snd_output_ops;
+    c->snd_output.priv = c;
+    c->snd_output.kind = N_AUDIO_KIND_REMOTE;
+    c->snd_output.jack = N_AUDIO_JACK_PLUGGED;
+    c->snd_output.name = "Remote desktop";
+    c->snd_output.key = c->snd_key;
+    c->snd_output.rates = rates;
+    c->snd_output.rate_count = 1;
+    c->snd_output.sizes = sizes;
+    c->snd_output.size_count = 1;
+    c->snd_output.channels_low = c->snd_output.channels_high = 2;
+    audio_output_add(&c->snd_output);
     kprintf("rdp: sound goes to \"%s\" (version %u)\n", c->client_name, c->snd_version);
     return 0;
 }
 
-/* The session ends: its sound thread ends first, then the sound leaves this client. */
+/* The session ends: the sound layer forgets this client first, then its sound thread ends. */
 static void snd_finish(struct rdp *c) {
     if (!c->snd_task) return;
-    struct audio_remote *r = &c->snd_remote;
+    audio_output_remove(&c->snd_output);
     uint64_t f = spin_lock(&c->snd_lock);
     c->snd_stop = true;
-    __atomic_add_fetch(&r->signals, 1, __ATOMIC_SEQ_CST);
-    wq_wake_all(&r->wq);
+    __atomic_add_fetch(&c->snd_signals, 1, __ATOMIC_SEQ_CST);
+    wq_wake_all(&c->snd_wq);
     while (!c->snd_done) {
-        wq_wait_locked(&r->wq, &c->snd_lock);
+        wq_wait_locked(&c->snd_wq, &c->snd_lock);
         spin_take(&c->snd_lock);
     }
     spin_unlock(&c->snd_lock, f);
-    audio_remote_detach(r);
+    shared_kernel_end(c->snd_ring, c->snd_ring_view);
+    c->snd_ring = NULL;
 }
 
 static int snd_message(struct rdp *c, const uint8_t *m, uint32_t n) {

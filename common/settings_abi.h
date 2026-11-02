@@ -35,10 +35,14 @@ enum n_boot_key {
     N_BOOT_KEY_COUNT
 };
 
-/* N_DOMAIN_AUDIO：dev/audio */
+/* N_DOMAIN_AUDIO：サービス audio */
 enum n_audio_key {
     N_AUDIO_VOLUME,             /* N_SETTING_INT 0..100 */
     N_AUDIO_MUTED,              /* N_SETTING_BOOL */
+    N_AUDIO_OUTPUT,             /* N_SETTING_STRING：選んだ出口の key（n_audio_device_key）。空は一番良いもの */
+    N_AUDIO_FORMAT_RATE,        /* N_SETTING_INT、N_SCOPE_DEVICE（n_setting_device(key)）：Hz。0 は既定 */
+    N_AUDIO_FORMAT_BITS,        /* 同じ：標本のビット数。0 は既定 */
+    N_AUDIO_FORMAT_CHANNELS,    /* 同じ：channel の数。0 は既定 */
     N_AUDIO_KEY_COUNT
 };
 

@@ -222,7 +222,7 @@ static void desktop(void) {
     CHECK("the headphones go through the selector", phones->length == 4 && phones->path[1]->nid == 0x0F && phones->path[2]->nid == 0x0E && phones->converter->nid == 0x04);
     CHECK("S/PDIF is digital and takes the digital converter", spdif->kind == HDA_OUTPUT_DIGITAL && spdif->converter->nid == 0x06);
     CHECK("S/PDIF does not sense (no detect)", !spdif->senses);
-    CHECK("16 bits where it has them", line->bits == 16 && line->channels == 2);
+    CHECK("at first 48 kHz and 16 bits where it has them", hda_output_format(line) == 0x0011 && line->channels == 2);
 
     hda_codec_power(codec, outputs, 5);
     CHECK("the group is powered", was_set(&m, 1, VERB12(0x705, 0)));
@@ -357,8 +357,19 @@ static void formats(void) {
     struct hda_output *o = output_at(outputs, 0x11);
     if (!o) return;
     CHECK("the pin goes on to the converter that fits", o->converter->nid == 0x03);
-    CHECK("one channel, 24 bits", o->channels == 1 && o->bits == 24);
+    uint8_t bits[4];
+    CHECK("one channel, 24 bits", o->channels == 1 && hda_output_sizes(o, bits) == 1 && bits[0] == 24);
     CHECK("the format's word: 48 kHz, 24 bits, one channel", hda_output_format(o) == 0x0030);
+    /* table 53 of the specification, every rate it can say */
+    CHECK("the word of 8 kHz", hda_format_word(8000, 16, 2) == (5u << 8 | 1u << 4 | 1));
+    CHECK("the word of 11.025 kHz", hda_format_word(11025, 16, 2) == (1u << 14 | 3u << 8 | 1u << 4 | 1));
+    CHECK("the word of 44.1 kHz", hda_format_word(44100, 24, 2) == (1u << 14 | 3u << 4 | 1));
+    CHECK("the word of 32 kHz", hda_format_word(32000, 20, 1) == (1u << 11 | 2u << 8 | 2u << 4));
+    CHECK("the word of 96 kHz", hda_format_word(96000, 32, 2) == (1u << 11 | 4u << 4 | 1));
+    CHECK("the word of 176.4 kHz", hda_format_word(176400, 16, 2) == (1u << 14 | 3u << 11 | 1u << 4 | 1));
+    CHECK("the word of 192 kHz", hda_format_word(192000, 16, 2) == (3u << 11 | 1u << 4 | 1));
+    CHECK("no word for a rate the table does not have", !hda_format_word(12345, 16, 2));
+    CHECK("no word for a size it does not have", !hda_format_word(48000, 18, 2));
 }
 
 /* A codec that answers nothing at all. */

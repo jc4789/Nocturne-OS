@@ -142,18 +142,15 @@ static void drawing(void){
     CHECK(!memcmp(old,guard,sizeof old));
 }
 static void audio_flush_cases(void){
-    CHECK(n_audio_flush(-1)==-N_ERR_NO_HANDLE);
-    n_handle other=n_document_open("C:\\Tests\\media-fixtures\\stereo.wav",N_DOCUMENT_READ);CHECK(other>=0);
-    if(other>=0){CHECK(n_audio_flush(other)==-N_ERR_WRONG_KIND);n_handle_close(other);}
-    n_handle a=n_audio_open();CHECK(a>=0);if(a<0)return;
+    n_audio_stream *a=NULL;CHECK(n_audio_open(&SOUND_FORMAT,&a)==0);if(!a)return;
     struct n_audio_status st;CHECK(n_audio_status(a,&st)==0&&st.queued_frames==0);
     uint32_t generation=st.generation;
-    int16_t *silence=calloc(8192,4);CHECK(silence!=NULL);if(!silence){n_handle_close(a);return;}
+    int16_t *silence=calloc(8192,4);CHECK(silence!=NULL);if(!silence){n_audio_close(a);return;}
     CHECK(n_audio_submit(a,silence,8192,0)==8192);
     CHECK(n_audio_status(a,&st)==0&&st.queued_frames>0); /* real native ring, not a callback stub */
     CHECK(n_audio_flush(a)==0);CHECK(n_audio_status(a,&st)==0&&st.queued_frames==0&&st.generation==generation+1);
     CHECK(n_audio_submit(a,silence,4096,0)==4096);CHECK(n_audio_flush(a)==0);
-    CHECK(n_audio_status(a,&st)==0&&st.queued_frames==0);free(silence);n_handle_close(a);
+    CHECK(n_audio_status(a,&st)==0&&st.queued_frames==0);free(silence);n_audio_close(a);
 }
 int main(void){
     decode("stereo.wav",true,false,9600,9600);decode("stereo.flac",true,false,9600,9600);

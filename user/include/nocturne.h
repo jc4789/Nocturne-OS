@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "abi.h"
+#include "audio_abi.h"
 #include "settings_abi.h"
 #include "gfx.h"
 #include <cdefs.h>
@@ -290,19 +291,35 @@ n_result n_pager_take(n_handle pager, struct n_pager_fault *out, size_t max, uin
 n_result n_pager_supply(n_handle pager, const struct n_pager_supply *runs, size_t count);
 n_result n_pager_revoke(n_handle pager, uint64_t offset, uint64_t bytes, uint32_t access);
 n_result n_pager_fail(n_handle pager, uint64_t offset, uint64_t bytes);
-/* Sound: each n_audio_open is a stream of N_AUDIO_RATE stereo frames (two int16_t, left first)
-   of its own, mixed with the others and scaled by the master volume. A stream holds about
-   170 ms; n_audio_submit takes what fits and returns the frames taken (with N_AUDIO_WAIT it
-   waits for room; without, a full stream gives N_ERR_NOT_READY and N_EVENT_SENDABLE reports
-   room). Closing lets the queued sound play out; n_audio_flush drops it at once, with what the
-   sound card was given but has not begun to play (only what the device already holds is still
-   heard: on AC'97 at most 20 ms). */
-n_handle n_audio_open(void); /* N_ERR_BUSY when every stream is taken */
-n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_t flags);
-n_result n_audio_status(n_handle a, struct n_audio_status *out);
-n_result n_audio_flush(n_handle a);
-/* *io filled with the master volume, muting and what plays the sound (struct n_audio_output, abi.h). */
-n_result n_audio_output(struct n_audio_output *io);
+/* Sound: the service audio mixes the streams (docs/nocturne-native-abi.md §17). A stream has the format
+   it was opened with, at any rate and with any number of channels; the service converts it to the output
+   it has chosen. The sound goes through a ring shared with the service: a stream that keeps playing makes
+   no call per buffer. A stream holds about 170 ms; n_audio_submit takes what fits and returns the frames
+   taken (with N_AUDIO_WAIT it waits for room; without, a full stream gives N_ERR_NOT_READY). n_audio_flush
+   drops what is queued at once, with what the output was given and has not begun to play. n_audio_close
+   lets what is queued play out (it waits for that) and frees the stream. A stream outlives the service: when
+   the service starts again, the next call opens the stream there and goes on. One thread at a time. */
+typedef struct n_audio_stream n_audio_stream;
+n_result n_audio_open(const struct n_audio_format *format, n_audio_stream **out);
+n_result n_audio_submit(n_audio_stream *stream, const void *frames, size_t count, uint32_t flags);
+n_result n_audio_status(n_audio_stream *stream, struct n_audio_status *out);
+n_result n_audio_flush(n_audio_stream *stream);
+void n_audio_close(n_audio_stream *stream);
+/* The outputs and what the service has decided: a fresh array of bytes (free it), a run of struct n_audio_output
+   whose length is the result; 0 with none. */
+n_result n_audio_outputs(struct n_audio_output **out);
+/* The name of what plays the sound, fresh (free it); NULL when nothing does. */
+char *n_audio_output_name(void);
+/* What n_audio_outputs reports has changed: a byte comes on this channel for each change. Volume and muting
+   are settings (n_setting_watch, N_DOMAIN_AUDIO). Close it to stop. */
+n_handle n_audio_output_watch(void);
+n_result n_audio_output_watch_take(n_handle watch);
+/* The sound devices' way, for the one who holds N_CAP_AUDIO_DEVICE (the service; §17). */
+n_result n_audio_device_list(n_handle cap, void *out, size_t bytes);
+n_handle n_audio_device_open(n_handle cap, uint32_t id, const struct n_audio_device_format *format, struct n_audio_device_ring *ring);
+n_result n_audio_device_run(n_handle device, int run);
+n_result n_audio_device_status(n_handle device, struct n_audio_device_status *out);
+n_handle n_audio_device_watch(n_handle cap);
 /* What the kernel goes by (docs/nocturne-native-abi.md §12, settings_abi.h). Applying takes the right
    to (N_CAP_SETTINGS_APPLY), and is the settings service's: a program asks the service. effective:
    the bytes of the value now, however many, and what fits cap in out. */
@@ -310,8 +327,6 @@ n_result n_settings_apply(n_handle cap, uint32_t domain, uint32_t key, const voi
 n_result n_settings_effective(uint32_t domain, uint32_t key, void *out, size_t cap);
 n_result n_settings_describe(uint32_t domain, uint32_t key, struct n_setting_desc *out);
 n_handle n_settings_watch(uint32_t domain);
-/* A watch on what n_audio_output reports: the volume, muting and what plays the sound. */
-n_handle n_audio_output_watch(void);
 /* Watches (N_KIND_WATCH, docs/nocturne-native-abi.md §1): N_EVENT_RECEIVABLE once what the watch
    watches has changed, until n_watch_take takes the changes; it returns how many came since the
    last take (0: none, at most N_WATCH_CHANGES_MAX). N_EVENT_CLOSED once what it watches is no
@@ -568,10 +583,10 @@ n_result gui_launch(const char *path, const char *arg);
 n_result screen_grab(n_handle cap, uint32_t *buf, size_t bytes, int *w, int *h); /* N_CAP_SCREEN_READ */
 
 /* ---- sound (sound.c) ----
-   Streams come from n_audio_open (above; up to 8 play at once) and hold about 170 ms
-   (SOUND_QUEUE frames). */
+   Streams come from n_audio_open (above) and hold about 170 ms (SOUND_QUEUE frames at SOUND_RATE). */
 #define SOUND_RATE  48000
 #define SOUND_QUEUE 8192
+#define SOUND_FORMAT ((struct n_audio_format){.rate = SOUND_RATE, .channels = 2, .sample = N_AUDIO_S16})
 enum { SND_SINE, SND_SQUARE, SND_TRIANGLE, SND_SAW, SND_NOISE };
 /* A sound effect that never makes the program wait: a tone gliding from hz to hz2 over ms
    milliseconds. Effects play one after another; one that does not fit in the queue is dropped.

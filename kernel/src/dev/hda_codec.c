@@ -82,7 +82,7 @@
 #define DEVICE_SPDIF 0x4
 #define DEVICE_DIGITAL 0x5
 
-/* Supported PCM Size, Rates (7.3.4.7) */
+/* Supported PCM Size, Rates (7.3.4.7): R1 to R12 are its bits 0 to 11 */
 #define PCM_48K  (1u << 6)
 #define PCM_B16  (1u << 17)
 #define PCM_B20  (1u << 18)
@@ -206,20 +206,22 @@ static struct hda_widget *widget_of(const struct hda_group *g, unsigned nid) {
     return nid >= first && nid - first < g->nwidgets ? &g->widgets[nid - first] : NULL;
 }
 
-/* A converter's format: the rate every codec has, in the mix's 16 bits where it has them, else in the
-   narrowest wider size it has. 32-bit samples on a digital converter would be raw S/PDIF frames
-   (7.3.3.9), so never those. 0 when it plays no PCM at that rate. */
-static unsigned converter_bits(const struct hda_widget *w) {
+/* The sizes a converter plays, as bits (at most 4), narrowest first. 32-bit samples on a digital
+   converter would be raw S/PDIF frames (7.3.3.9), so never those. None when it plays no PCM at the rate
+   every codec has. */
+static unsigned converter_sizes(const struct hda_widget *w, uint8_t *bits) {
+    unsigned n = 0;
     if (!(w->formats & FORMATS_PCM) || !(w->pcm & PCM_48K)) return 0;
-    if (w->pcm & PCM_B16) return 16;
-    if (w->pcm & PCM_B20) return 20;
-    if (w->pcm & PCM_B24) return 24;
-    if ((w->pcm & PCM_B32) && !(w->caps & CAPS_DIGITAL)) return 32;
-    return 0;
+    if (w->pcm & PCM_B16) bits[n++] = 16;
+    if (w->pcm & PCM_B20) bits[n++] = 20;
+    if (w->pcm & PCM_B24) bits[n++] = 24;
+    if ((w->pcm & PCM_B32) && !(w->caps & CAPS_DIGITAL)) bits[n++] = 32;
+    return n;
 }
 
 static bool converter_fits(const struct hda_widget *converter, const struct hda_widget *pin) {
-    return !(converter->caps & CAPS_DIGITAL) == !(pin->caps & CAPS_DIGITAL) && converter_bits(converter);
+    uint8_t bits[4];
+    return !(converter->caps & CAPS_DIGITAL) == !(pin->caps & CAPS_DIGITAL) && converter_sizes(converter, bits);
 }
 
 /* The shortest way from the pin back to a converter that fits, breadth first: the graph may have
@@ -345,8 +347,10 @@ static bool output_of(struct hda_group *g, struct hda_widget *pin, struct hda_ou
     o->senses = CONFIG_PORT(pin->config) == PORT_JACK && (pin->pin_caps & PIN_PRESENCE) && !CONFIG_NO_DETECT(pin->config);
     o->announces = o->senses && (pin->caps & CAPS_UNSOLICITED);
     if (!find_path(o)) return true; /* no converter reaches it: not an output */
-    o->bits = (uint8_t)converter_bits(o->converter);
+    uint8_t bits[4];
+    converter_sizes(o->converter, bits);
     o->channels = CAPS_CHANNELS(o->converter->caps) >= 2 ? 2 : 1;
+    o->format = hda_format_word(48000, bits[0], o->channels);
     o->delay = g->output_delay;
     for (unsigned i = 0; !g->output_delay && i < o->length; i++) o->delay = (uint8_t)(o->delay + CAPS_DELAY(o->path[i]->caps));
     name_of(o, NULL);
@@ -417,10 +421,37 @@ bool hda_output_sense(struct hda_output *o) {
 
 /* ---- playing ---- */
 
-uint16_t hda_output_format(const struct hda_output *o) {
-    unsigned bits = o->bits == 16 ? 1 : o->bits == 20 ? 2 : o->bits == 24 ? 3 : 4;
-    return (uint16_t)(bits << 4 | (unsigned)(o->channels - 1));
+/* R1 to R11 of 7.3.4.7, in the stream format's words (3.7.1, table 53): BASE, MULT, DIV. */
+static const struct {
+    uint32_t rate;
+    uint8_t base, mult, div;
+} rate_words[] = {
+    {8000, 0, 0, 5},  {11025, 1, 0, 3}, {16000, 0, 0, 2}, {22050, 1, 0, 1}, {32000, 0, 1, 2}, {44100, 1, 0, 0},
+    {48000, 0, 0, 0}, {88200, 1, 1, 0}, {96000, 0, 1, 0}, {176400, 1, 3, 0}, {192000, 0, 3, 0},
+};
+
+unsigned hda_output_rates(const struct hda_output *o, uint32_t *rates) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < sizeof rate_words / sizeof *rate_words; i++)
+        if (o->converter->pcm & (1u << i)) rates[n++] = rate_words[i].rate;
+    return n;
 }
+
+unsigned hda_output_sizes(const struct hda_output *o, uint8_t *bits) { return converter_sizes(o->converter, bits); }
+
+uint16_t hda_format_word(uint32_t rate, unsigned bits, unsigned channels) {
+    unsigned size = bits == 16 ? 1 : bits == 20 ? 2 : bits == 24 ? 3 : bits == 32 ? 4 : 0;
+    if (!size || !channels || channels > 16) return 0;
+    for (unsigned i = 0; i < sizeof rate_words / sizeof *rate_words; i++)
+        if (rate_words[i].rate == rate)
+            return (uint16_t)((unsigned)rate_words[i].base << 14 | (unsigned)rate_words[i].mult << 11 | (unsigned)rate_words[i].div << 8 |
+                              size << 4 | (channels - 1));
+    return 0;
+}
+
+uint16_t hda_output_format(const struct hda_output *o) { return o->format; }
+
+void hda_output_select(struct hda_output *o, uint16_t format) { o->format = format; }
 
 /* An amplifier's word at 0 dB and open, the offset within the steps it has (7.3.4.10). */
 static uint32_t open_amp(uint32_t caps) {

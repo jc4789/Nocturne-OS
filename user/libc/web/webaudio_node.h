@@ -112,7 +112,7 @@ struct wa_context {
     bool thread_started;
     thrd_t thread;
     /* the sound stream (AudioContext) */
-    int sink;
+    struct n_audio_stream *sink;
     uint64_t output_written, output_played, played_at_us;
     double resample_phase;       /* where the next output frame falls between rendered frames */
     float last_frame[2];         /* the rendered frame before the quantum being resampled */
