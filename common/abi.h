@@ -1,6 +1,7 @@
 /* Nocturne kernel <-> userland ABI: syscall numbers and shared structures. */
 #pragma once
 #include <stdint.h>
+#include "authority_abi.h"
 /* x86-64 native mapping granule: n_memory and shared pages come in these. */
 #define N_PAGE_SIZE 4096ULL
 
@@ -44,7 +45,7 @@
 #define N_RESULT_CODES 34
 
 /* System call numbers. The ABI keeps no older form of a call: a program is built against the
-   abi.h of the system it runs on. 1-18, 21-25, 30-32, 35-37, 44, 51-52, 60-63, 90 and 203-206
+   abi.h of the system it runs on. 1-18, 21-25, 30-32, 35-37, 44, 51-55, 60-63, 90 and 203-206
    are unassigned. */
 enum {
     SYS_EXIT = 0,
@@ -57,8 +58,7 @@ enum {
     SYS_GPU_BLIT,
     SYS_THREAD_CREATE = 45, SYS_THREAD_JOIN, SYS_THREAD_EXIT,
     SYS_WAIT_ADDRESS, SYS_WAKE_ADDRESS, SYS_THREAD_ID,
-    SYS_CHANNEL_LISTEN = 53, SYS_CHANNEL_CONNECT, SYS_CHANNEL_ACCEPT,
-    SYS_SHARED_CREATE,
+    SYS_SHARED_CREATE = 56,
     SYS_THREAD_SCHEDULE, /* (thread, N_SCHEDULE_*, weight or period ns): its class (§5) */
     SYS_THREAD_STACK_BOUNDS = 58, SYS_THREAD_DETACH,
     SYS_WIN_CREATE = 64, /* (width, height, title, flags, surfaces): the window handle */
@@ -147,7 +147,18 @@ enum {
     SYS_WATCH_TAKE = 207,     /* (watch): the changes since its last take (0: none) */
     SYS_ENTRY_WATCH,          /* (path, N_WATCH_NAME or N_WATCH_FOLDER): a watch on C: (§3) */
     SYS_AUDIO_OUTPUT_WATCH,   /* (): a watch on what SYS_AUDIO_OUTPUT reports (§9) */
-    SYS_MAX = 210          /* above every number (what syscallfuzz tries) */
+    SYS_IDENTITY_SELF,        /* (struct n_identity *out) */
+    SYS_CHANNEL_PEER,         /* (channel, struct n_identity *out) */
+    SYS_CAP_DERIVE,           /* (cap, enum n_cap) -> handle */
+    SYS_SERVICE_REGISTER,     /* (N_CAP_SERVICE_ROOT の cap) -> 接続の要求を受ける channel */
+    SYS_SERVICE_CONNECT,      /* (name, name_len) -> channel */
+    SYS_STORE_PRIVATE_OPEN,   /* (N_CAP_STORE_PRIVATE の cap, region, ...) -> document */
+    SYS_SETTINGS_APPLY,       /* (N_CAP_SETTINGS_APPLY の cap, domain, key, value, len) */
+    SYS_CAP_KIND,             /* (cap) -> enum n_cap */
+    SYS_CAP_FIND,             /* (enum n_cap) -> その能力を持つ自分の handle */
+    SYS_SESSION_IDENTITY,     /* (N_CAP_IDENTITY_GRANT の cap, const struct n_identity *):
+                                 カーネルの窓の系が起こすアプリの身元 */
+    SYS_MAX                   /* above every number (what syscallfuzz tries) */
 };
 
 /* ---- native handles ---- */
@@ -163,6 +174,7 @@ enum {
 #define N_KIND_PCI 10       /* the right to drive one PCI function */
 #define N_KIND_PAGER 11     /* the right to supply one paged memory object; never sent */
 #define N_KIND_WATCH 13     /* a watch (SYS_WATCH_TAKE): receivable once what it watches changed */
+#define N_KIND_CAPABILITY 14 /* 特権を一つ持つ（enum n_cap、SYS_CAP_KIND）。持つことが権限の証明。 */
 
 /* SYS_ENTRY_WATCH: what is watched on C: */
 #define N_WATCH_NAME 1u   /* the last name of the path in its folder, whether an entry has it or not */
@@ -226,6 +238,12 @@ struct n_launch {
     const char *const *settings;
     const int32_t *handles;
     uint32_t argument_count, setting_count, handle_count, flags;
+    /* 子の身元。NULL：親と同じ。cls は親を超えられない。user・session・program を親と変えるには、
+       identity_grant に N_CAP_IDENTITY_GRANT の handle を渡す。identity が NULL なら読まない。
+       能力は handles の列で渡す（子は SYS_CAP_FIND で引く）。 */
+    const struct n_identity *identity;
+    int32_t identity_grant;
+    uint32_t reserved;
 };
 /* The most bytes a launch's argument and setting strings (each with its nul) and their two
    null-terminated pointer arrays (8 bytes a pointer) may take: N_ERR_TOO_MANY_ARGUMENTS past it. */
@@ -266,7 +284,6 @@ struct n_procinfo {
     uint64_t cpu_ns;
     uint64_t mem_kb;
     uint64_t start_ns;  /* on the monotonic clock */
-    uint64_t wait_phys; /* blocked in an address wait: the physical word, else 0 */
 };
 
 /* free_mem: what an app can have now, the free frames and those of programs no task runs, which

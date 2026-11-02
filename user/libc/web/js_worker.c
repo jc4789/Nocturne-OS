@@ -164,8 +164,8 @@ static bool spawn_child(web_workers *w,struct child *c){
     c->app=app;c->task=n_app_id(app);c->channel=pair[0];active_children++;
     JSValue log=JS_NewObject(w->ctx);JS_SetPropertyStr(w->ctx,log,"message",JS_NewString(w->ctx,"native dedicated task; heap grows on demand (no configured ceiling)"));event(w,c,NJW_CONSOLE,log);JS_FreeValue(w->ctx,log);return true;
 }
-/* Native full-key rendezvous. No filesystem packet persistence or hash-only
- * authority. Every returned duplex endpoint has its own queue. */
+/* 名前のサービス：全部の鍵を名前にしてサービスの管理者に申し込む。管理者が利用者とセッションごとに
+ * 分ける。Every returned duplex endpoint has its own queue. */
 static bool shared_transport(web_workers*w,struct child*c,bool*created){
     (void)w;const char*identity_url=c->name_len?"":c->url;size_t a=strlen(c->origin),b=strlen(identity_url),n=c->name_len;
     if(a>SIZE_MAX-b-96||a+b+96>SIZE_MAX-n||a+b+96+n>SIZE_MAX-n)return false;
@@ -173,14 +173,14 @@ static bool shared_transport(web_workers*w,struct child*c,bool*created){
     int prefix=snprintf(key,capacity,"Nocturne.SharedWorker:%zu:%s:%zu:%s:%zu:",a,c->origin,b,identity_url,n);
     if(prefix<0||(size_t)prefix>=capacity){free(key);return false;}
     static const char hex[]="0123456789abcdef";size_t at=(size_t)prefix;for(size_t i=0;i<n;i++){unsigned v=(unsigned char)c->name[i];key[at++]=hex[v>>4];key[at++]=hex[v&15];}key[at]=0;
-    n_handle listener=n_channel_listen(key);*created=listener>=0;
+    n_handle listener=n_service_listen(key);*created=listener>=0;
     if(listener<0&&listener!=-N_ERR_EXISTS){free(key);return false;}
-    /* The server's only handle is its listener: no input, output or log. It
+    /* The server's only handle is its inlet: no input, output or log. It
        ends itself once every connected owner has gone. */
     if(*created){const char*args[]={"browserjsworker","--shared-server",c->url};const int32_t handles[]={listener};
         struct n_launch launch={.arguments=args,.argument_count=3,.handles=handles,.handle_count=1};
         n_handle app=n_app_launch(WORKER_PROGRAM,&launch);if(app<0){n_handle_close(listener);free(key);return false;}n_handle_close(app);}
-    n_handle channel=n_channel_connect(key);if(listener>=0)n_handle_close(listener);free(key);if(channel<0)return false;
+    n_handle channel=n_service_connect(key);if(listener>=0)n_handle_close(listener);free(key);if(channel<0)return false;
     c->channel=channel;return true;
 }
 web_workers *web_worker_new(JSContext *ctx,uint32_t generation,web_worker_loader load,void *opaque){web_workers *w=calloc(1,sizeof *w);if(!w)return NULL;w->ctx=ctx;w->generation=generation;w->callback=JS_UNDEFINED;w->load=load;w->opaque=opaque;w->next=managers;managers=w;return w;}

@@ -199,8 +199,8 @@ n_result gui_launch(const char *path, const char *arg) {
     return __syscall(SYS_GUI_LAUNCH, (long)full, (long)arg, 0, 0, 0);
 }
 
-n_result screen_grab(uint32_t *buf, size_t bytes, int *w, int *h) {
-    n_result r = __syscall(SYS_SCREEN_GRAB, (long)buf, (long)bytes, 0, 0, 0);
+n_result screen_grab(n_handle cap, uint32_t *buf, size_t bytes, int *w, int *h) {
+    n_result r = __syscall(SYS_SCREEN_GRAB, cap, (long)buf, (long)bytes, 0, 0);
     if (r < 0) return r;
     *w = (int)(r >> 16);
     *h = (int)(r & 0xFFFF);

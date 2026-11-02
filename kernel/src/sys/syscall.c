@@ -7,6 +7,7 @@
 #include "sys/sched.h"
 #include "sys/syscall.h"
 #include "sys/proc.h"
+#include "sys/authority.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
 #include "sys/events.h"
@@ -152,35 +153,19 @@ int user_string(const char *u, char **out) {
 
 /* ---- handlers ---- */
 
-/* The key is read once, its length given: the registry never reads the app's memory again. */
-static int64_t sys_channel_named(const char *ukey,size_t length,bool listen) {
-    if(!length)return -N_ERR_INVALID;
-    char *key=kmalloc(length);if(!key)return -N_ERR_NO_MEMORY;
-    struct handle *h=NULL;
-    int result=copy_from_user(key,ukey,length);
-    if(!result)result=listen?channel_listen(key,length,&h):channel_connect(key,length,&h);
-    kfree(key);
-    return result<0?result:handle_install(h);
-}
-static int64_t sys_channel_accept(int index) {
-    struct handle *listener=handle_get(index);if(!listener)return -N_ERR_NO_HANDLE;
-    struct handle *server=NULL;
-    int result=channel_accept(listener,&server);
-    handle_close(listener);
-    return result<0?result:handle_install(server);
-}
-
 struct proc_list {
     struct n_procinfo *list;
     size_t n, room;
+    struct n_identity who; /* 一覧を求めた者：触れてよいアプリとシステムのアプリだけが見える */
 };
 
 /* thread_walk: t's line, while there is room. */
 static void proclist_one(struct thread *t, void *arg) {
     struct proc_list *l = arg;
     if (l->n == l->room) return;
-    struct n_procinfo *info = &l->list[l->n++];
     struct process *p = t->process, *main = process_of_main(t);
+    if (p && p->identity.cls != N_CLASS_SYSTEM && !identity_may_reach(&l->who, &p->identity)) return;
+    struct n_procinfo *info = &l->list[l->n++];
     info->pid = t->tid;
     /* an app's other thread is shown under its app; an app under the app that launched it */
     info->ppid = !p ? 0 : !main ? p->pid : p->parent ? p->parent->pid : 0;
@@ -190,13 +175,12 @@ static void proclist_one(struct thread *t, void *arg) {
     info->cpu_ns = sched_thread_cpu_ns(t);
     info->mem_kb = main ? process_pages(main) * 4 : 0;
     info->start_ns = t->start_ns;
-    info->wait_phys = __atomic_load_n(&t->wait.item.key, __ATOMIC_RELAXED);
 }
 
 static int64_t sys_proclist(struct n_procinfo *out, int max) {
     if (max < 0) return -N_ERR_BAD_ADDRESS;
     /* the copy may sleep: the list is read into the kernel first */
-    struct proc_list l = {.room = MIN((size_t)max, thread_count())};
+    struct proc_list l = {.room = MIN((size_t)max, thread_count()), .who = *identity_current()};
     if (!l.room) return 0;
     if (!(l.list = kzalloc(l.room * sizeof *l.list))) return -N_ERR_NO_MEMORY;
     thread_walk(proclist_one, &l);
@@ -716,9 +700,10 @@ static int64_t sys_channel_send(int h, const void *udata, size_t n, int attach) 
     if (attach >= 0) {
         att = handle_get(attach);
         if (!att) r = -N_ERR_NO_HANDLE;
-        /* documents and shared pages only: a channel end sent through its own
-           channel would keep itself alive */
-        else if (handle_kind(att) != N_KIND_DOCUMENT && handle_kind(att) != N_KIND_SHARED) r = -N_ERR_WRONG_KIND;
+        /* 文書、共有の頁、能力、channel の端だけ（端の輪は message_put が断る） */
+        else if (handle_kind(att) != N_KIND_DOCUMENT && handle_kind(att) != N_KIND_SHARED &&
+                 handle_kind(att) != N_KIND_CAPABILITY && !message_channel_is(att))
+            r = -N_ERR_WRONG_KIND;
     }
     if (r < 0) {
     } else if (message_channel_is(f)) {
@@ -758,6 +743,7 @@ static int64_t sys_channel_receive(int h, void *ubuf, size_t cap, int flags, voi
     handle_close(f);
     if (r >= 0 && uoutput && (credentials || !peek)) {
         if (att && !peek) {
+            if (message_channel_is(att)) message_channel_handed(att, identity_current());
             message.attached=(int32_t)handle_install(att);att=NULL;
             if (message.attached<0) r=message.attached;
         }
@@ -768,6 +754,19 @@ static int64_t sys_channel_receive(int h, void *ubuf, size_t cap, int flags, voi
     }
     handle_close(att); /* the caller did not ask for attachments */
     return r;
+}
+
+static int64_t sys_channel_peer(int h, struct n_identity *out) {
+    struct handle *f = handle_get(h);
+    if (!f) return -N_ERR_NO_HANDLE;
+    if (!message_channel_is(f)) {
+        handle_close(f);
+        return -N_ERR_WRONG_KIND;
+    }
+    struct n_identity who;
+    message_channel_peer(f, &who);
+    handle_close(f);
+    return copy_to_user(out, &who, sizeof who);
 }
 
 static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
@@ -781,7 +780,9 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
     int64_t ret = copy_from_user(&l, ul, sizeof l);
     const size_t limit = USER_STACK_MAX / 2; /* what the new app's stack can hold */
     if (ret < 0) goto out;
-    if (l.flags) { ret = -N_ERR_INVALID; goto out; }
+    if (l.flags || l.reserved) { ret = -N_ERR_INVALID; goto out; }
+    struct n_identity identity;
+    if ((r = identity_for_child(&l, &identity)) < 0) { ret = r; goto out; }
     if (l.argument_count > limit / 8 || l.setting_count > limit / 8 || l.handle_count > 4096) {
         l = (struct n_launch){0};
         ret = -N_ERR_TOO_MANY_ARGUMENTS;
@@ -819,7 +820,7 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
     if ((r = proc_app_create(&app)) < 0) { ret = r; goto out; }
     struct proc_launch launch = {.argc = (int)argc, .argv = argv, .setting_count = (int)l.setting_count,
                                  .settings = settings, .handles = handles, .handle_count = l.handle_count,
-                                 .parent = process_current(), .app = app->object};
+                                 .parent = process_current(), .app = app->object, .identity = identity};
     r = proc_launch(path, &launch);
     if (r < 0) ret = r;
     else { ret = handle_install(app); app = NULL; }
@@ -878,9 +879,9 @@ static int64_t sys_app_id(int h) {
 }
 
 /* A handle whose messages are added to the system log (which the serial port and the boot screen
-   show), and which receives the log's text. */
+   show). 本文を受けるのは ADMIN 以上の開いた handle だけ。 */
 static int64_t sys_system_log_open(void) {
-    struct handle *h = stream_system_log_open();
+    struct handle *h = stream_system_log_open(identity_at_least(N_CLASS_ADMIN));
     return h ? handle_install(h) : -N_ERR_NO_MEMORY;
 }
 
@@ -1031,7 +1032,9 @@ void syscall_dispatch(struct regs *r) {
     case SYS_SHARED_REVOKE: ret = sys_shared_revoke((int)a); break;
     case SYS_PCI_CLAIM: {
         struct handle *claim = NULL;
-        ret = pci_user_claim((uint8_t)a,(uint8_t)b,(uint8_t)c,&claim);
+        ret = cap_check((int)a, N_CAP_PCI_CLAIM);
+        if (ret < 0) break;
+        ret = pci_user_claim((uint8_t)b,(uint8_t)c,(uint8_t)d,&claim);
         ret = new_handle(ret,claim);
         break;
     }
@@ -1067,9 +1070,14 @@ void syscall_dispatch(struct regs *r) {
     case SYS_MEMORY_RESERVE: ret = memory_reserve(a, (int)b); break;
     case SYS_MEMORY_RELEASE: ret = memory_release(a, b); break;
     case SYS_MEMORY_PROTECT: ret = memory_protect(a, b, (int)c); break;
-    case SYS_CHANNEL_LISTEN: ret = sys_channel_named((const char *)a,b,true); break;
-    case SYS_CHANNEL_CONNECT: ret = sys_channel_named((const char *)a,b,false); break;
-    case SYS_CHANNEL_ACCEPT: ret = sys_channel_accept((int)a); break;
+    case SYS_IDENTITY_SELF: ret = sys_identity_self((struct n_identity *)a); break;
+    case SYS_CHANNEL_PEER: ret = sys_channel_peer((int)a, (struct n_identity *)b); break;
+    case SYS_CAP_DERIVE: ret = sys_cap_derive((int)a, b); break;
+    case SYS_CAP_KIND: ret = sys_cap_kind((int)a); break;
+    case SYS_CAP_FIND: ret = sys_cap_find(a); break;
+    case SYS_SESSION_IDENTITY: ret = sys_session_identity((int)a, (const struct n_identity *)b); break;
+    case SYS_SERVICE_REGISTER: ret = sys_service_register((int)a); break;
+    case SYS_SERVICE_CONNECT: ret = sys_service_connect((const char *)a, b); break;
     case SYS_PROCLIST: ret = sys_proclist((struct n_procinfo *)a, (int)b); break;
     case SYS_SYSINFO: ret = sys_sysinfo((struct n_sysinfo *)a); break;
     case SYS_CPU_INFO: {
@@ -1203,12 +1211,14 @@ void syscall_dispatch(struct regs *r) {
     }
     case SYS_YIELD: sched_yield(); ret = 0; break;
     case SYS_POWER:
+        ret = cap_check((int)a, N_CAP_POWER);
+        if (ret < 0) break;
         /* the power thread ends this app with the others */
-        pm_request(a == POWER_REBOOT ? PM_REBOOT : PM_POWER_OFF, false);
+        pm_request(b == POWER_REBOOT ? PM_REBOOT : PM_POWER_OFF, false);
         while (!self->killed) sleep_until(CLOCK_NEVER); /* the kill wakes it */
         ret = -N_ERR_STOPPED;
         break;
-    case SYS_SYSTEM_LOG: ret = sys_system_log((char *)a, b); break;
+    case SYS_SYSTEM_LOG: ret = identity_at_least(N_CLASS_ADMIN) ? sys_system_log((char *)a, b) : -N_ERR_DENIED; break;
     case SYS_PCILIST:
     {
         int room = (int)MIN(b, (uint64_t)pci_count());

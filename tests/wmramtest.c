@@ -15,7 +15,7 @@ static void paint(window_t *w,unsigned id) {
 static int check_client(uint32_t *screen,int pitch,int sw,int sh,
                         unsigned id,int x,int y) {
     const int offsets[][2]={{80,90},{113,131},{157,179}};
-    if (screen_grab(screen,(size_t)sw*sh*4,&sw,&sh)<0) return 1;
+    if (screen_grab(n_cap_find(N_CAP_SCREEN_READ), screen,(size_t)sw*sh*4,&sw,&sh)<0) return 1;
     for (unsigned i=0;i<sizeof offsets/sizeof offsets[0];i++) {
         int px=offsets[i][0],py=offsets[i][1];
         uint32_t actual=screen[(size_t)(y+28+py)*pitch+x+1+px];
@@ -32,7 +32,7 @@ int main(int argc,char **argv) {
     int sw,sh;
     if (screen_size(&sw,&sh)<0 || sw<640 || sh<400) return 1;
     /* screen_size excludes the 40px taskbar; grab reports the complete screen. */
-    int gw,gh;if (screen_grab(NULL,0,&gw,&gh)<0) return 1;
+    int gw,gh;if (screen_grab(n_cap_find(N_CAP_SCREEN_READ), NULL,0,&gw,&gh)<0) return 1;
     uint32_t *pixels=malloc((size_t)gw*gh*4);
     if (!pixels) return 1;
     struct n_cpuinfo before={0},after={0};cpu_info(&before);

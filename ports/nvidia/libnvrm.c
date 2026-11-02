@@ -46,7 +46,7 @@ int64_t nvrm_connect_device_status(uint32_t pci_target, struct nvrm **out) {
     if (!rm) return -N_ERR_NO_MEMORY;
     n_result result;
     bool lock_ready = false;
-    rm->channel = n_channel_connect(channel);
+    rm->channel = n_service_connect(channel);
     rm->arena_handle = -1;
     if (rm->channel < 0) { result = rm->channel; goto fail; }
     rm->arena_handle = n_shared_reserve(ARENA_BYTES);

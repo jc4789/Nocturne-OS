@@ -8,7 +8,7 @@ struct handle;
 
 /* A new handle to the stream (NULL: no memory). */
 struct handle *stream_console_open(void);
-struct handle *stream_system_log_open(void);
+struct handle *stream_system_log_open(bool read); /* read: 本文も受ける（HANDLE_READ） */
 struct handle *stream_null_open(void);
 /* sys/log.c's interrupt, records written: the system log's watchers look again. */
 void stream_system_log_told(void);
