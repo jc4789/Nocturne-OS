@@ -24,17 +24,16 @@ struct screen_format {
 /* Desktop settings as they stand: SYS_SCREEN_INFO with its third argument
    SCREEN_SETTINGS_GET and its second argument sizeof(struct desktop_settings). A
    program hears a change by SCREEN_WATCH. They change by SYS_SETTINGS_APPLY
-   (N_INPUT_POINTER_SPEED, N_WINDOW_SMOOTH_GRADIENTS, settings_abi.h). */
+   (N_WINDOW_SMOOTH_GRADIENTS, settings_abi.h). */
 #define SCREEN_SETTINGS_GET 1
 struct desktop_settings {
-    int8_t pointer_speed; /* -2 (slowest) .. 2 (fastest), 0 as delivered */
     /* The desktop drawn with 10 bits per channel and dithered onto a screen of 8 (less banding in
        gradients, photos and video, for some processor time). The user's wish: it is in effect
        while the screen shown takes it (smooth_gradients_available). */
     uint8_t smooth_gradients;
     /* read only: the screen shown is 8 bits per channel xRGB, the one the dither is made for */
     uint8_t smooth_gradients_available;
-    uint8_t reserved[5];
+    uint8_t reserved[6];
 };
 
 /* A screen as the kernel knows it: SYS_SCREEN_INFO with its third argument SCREEN_MODES_GET and its

@@ -150,6 +150,7 @@ enum {
 #define UI_UP 8u    /* pointer: a button came up; key: the key was let go */
 #define UI_CANCEL 16u /* focus: Escape gave the keyboard up */
 #define UI_BUTTONS(flags) ((flags) >> 8 & 0xFFu)
+#define UI_CLICKS(flags) ((flags) >> 16) /* click: how many presses in a row this one is, by the double click's time */
 
 /* The window flags an app may ask for: as for win_open. With WIN_FRAME_QUEUE each
    picture waits for a free surface (paced by the display) and is painted whole (WIN_MAILBOX:

@@ -53,7 +53,6 @@ void kmain_late(void) {
 
     wm_init();
     vm_session_init();
-    if (!wm_running()) input_set_sinks(console_key, NULL);
     settings_test_flags();
     pm_sleep_check(); /* every driver has registered: whether the machine can sleep */
 

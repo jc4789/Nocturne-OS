@@ -414,7 +414,7 @@ static void paste(void) {
 /* Whether the typed key is a character to insert (not a named key such as an arrow). */
 static bool printable(const struct ui_event *e) {
     int k = (int)e->a;
-    return e->text_n > 0 && ((k >= 32 && k < 0x100 && k != 127) || k > 0x1FF);
+    return e->text_n > 0 && N_KEY_IS_TEXT(k);
 }
 
 /* A key for the text. */

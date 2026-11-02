@@ -1,6 +1,6 @@
 /* USB HID keyboards and pointing devices (Device Class Definition for HID 1.11, HID Usage Tables).
  * Report descriptors are parsed so wheels, extra buttons, tablets and non-boot keyboards work;
- * keys are fed to the input layer as scancode set 1 like the Hyper-V keyboard. A report goes to
+ * keys go to the input layer by their usage (Keyboard page). A report goes to
  * the input layer from the drain that took its completion (dev/usb.h), with that moment. */
 #include "kernel.h"
 #include "arch/cpu.h"
@@ -15,8 +15,6 @@
 #define HID_SET_REPORT 0x09
 #define HID_SET_IDLE 0x0A
 #define HID_SET_PROTOCOL 0x0B
-#define REPEAT_DELAY (500 * NS_PER_MS)
-#define REPEAT_RATE (33 * NS_PER_MS)
 /* A report's bits at most, its ID byte beside them: Get_Report's wLength has 16 bits (HID 7.2.1). */
 #define REPORT_BITS_MOST (0xFFFEull * 8)
 
@@ -41,6 +39,8 @@ struct hid {
     struct hid *next;     /* in hids */
     struct hid *sibling;  /* the device's other HID interfaces (its worker's) */
     struct usb_device *dev;
+    struct input_device input;
+    char *input_id, *input_name;
     struct spinlock lock;
     uint8_t interface;
     bool ids;             /* reports start with a report ID byte */
@@ -71,31 +71,13 @@ struct hid {
 };
 
 /* Every HID interface, under hids_lock: a caps lock press on one keyboard asks every keyboard's
-   worker to light it. caps_lock and leds_gen are atomic. */
+   worker to light it. leds_gen is atomic. */
 static struct spinlock hids_lock;
 static struct hid *hids;
-static uint8_t caps_lock;
 static unsigned leds_gen;
 
-/* HID usage (keyboard page) to scancode set 1; 0xE0xx marks the extended prefix */
-static const uint16_t usage_set1[256] = {
-    [0x04] = 0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19,
-    0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C,
-    [0x1E] = 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
-    [0x28] = 0x1C, 0x01, 0x0E, 0x0F, 0x39, 0x0C, 0x0D, 0x1A, 0x1B, 0x2B, 0x2B, 0x27, 0x28, 0x29, 0x33, 0x34,
-    0x35, 0x3A,
-    [0x3A] = 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42, 0x43, 0x44, 0x57, 0x58,
-    [0x46] = 0xE037, 0x46, 0, 0xE052, 0xE047, 0xE049, 0xE053, 0xE04F, 0xE051, 0xE04D, 0xE04B, 0xE050, 0xE048,
-    [0x53] = 0x45, 0xE035, 0x37, 0x4A, 0x4E, 0xE01C, 0x4F, 0x50, 0x51, 0x4B, 0x4C, 0x4D, 0x47, 0x48, 0x49, 0x52,
-    0x53, 0x56, 0xE05D,
-    [0x87] = 0x73, 0x70, 0x7D, 0x79, 0x7B,
-    [0xE0] = 0x1D, 0x2A, 0x38, 0xE05B, 0xE01D, 0x36, 0xE038, 0xE05C,
-};
-
-static void send_usage(uint16_t usage, bool pressed, uint64_t at) {
-    uint16_t sc = usage < 256 ? usage_set1[usage] : 0;
-    if (!sc) return;
-    input_key_set1((uint8_t)((sc & 0x7F) | (pressed ? 0 : 0x80)), sc >> 8, at); /* one key, its 0xE0 with it */
+static void send_usage(struct hid *h, uint16_t usage, bool pressed, uint64_t at) {
+    if (usage >= N_USAGE_FIRST) input_key(&h->input, usage, pressed, at);
 }
 
 static bool is_down(const uint32_t *set, unsigned u) { return set[u >> 5] & (1u << (u & 31)); }
@@ -132,9 +114,10 @@ static void repeat_fire(struct alarm *a, struct regs *r) {
     spin_take(&h->lock);
     uint64_t now = clock_now_ns();
     if (h->repeat_usage && now >= h->repeat_at) {
-        send_usage(h->repeat_usage, true, now);
-        h->repeat_at += REPEAT_RATE;
-        if (h->repeat_at <= now) h->repeat_at = now + REPEAT_RATE;
+        send_usage(h, h->repeat_usage, true, now);
+        uint64_t interval = input_repeat_interval_ns(&h->input);
+        h->repeat_at += interval;
+        if (h->repeat_at <= now) h->repeat_at = now + interval;
     }
     if (h->repeat_usage) alarm_set(a, h->repeat_at);
     spin_give(&h->lock);
@@ -192,32 +175,31 @@ static bool key_report(struct hid *h, uint8_t report, const uint8_t *data, unsig
      * presses, then modifier releases */
     bool caps = false;
     for (unsigned u = 0xE0; u < 0xE8; u++)
-        if (!is_down(h->down, u) && is_down(now_down, u)) send_usage(u, true, now);
+        if (!is_down(h->down, u) && is_down(now_down, u)) send_usage(h, u, true, now);
     for (unsigned u = 0; u < 256; u++)
         if (u < 0xE0 || u >= 0xE8)
             if (is_down(h->down, u) && !is_down(now_down, u)) {
-                send_usage(u, false, now);
+                send_usage(h, u, false, now);
                 if (u == h->repeat_usage) h->repeat_usage = 0;
             }
     for (unsigned u = 0; u < 256; u++)
         if ((u < 0xE0 || u >= 0xE8) && !is_down(h->down, u) && is_down(now_down, u)) {
-            send_usage(u, true, now);
+            send_usage(h, u, true, now);
             if (u == 0x39) caps = true;
             if (u < 0xE0 && u != 0x39 && u != 0x53 && u != 0x47) {
                 h->repeat_usage = u;
-                h->repeat_at = now + REPEAT_DELAY;
+                h->repeat_at = now + input_repeat_delay_ns(&h->input);
                 alarm_set(&h->repeat, h->repeat_at);
             }
         }
     for (unsigned u = 0xE0; u < 0xE8; u++)
-        if (is_down(h->down, u) && !is_down(now_down, u)) send_usage(u, false, now);
+        if (is_down(h->down, u) && !is_down(now_down, u)) send_usage(h, u, false, now);
     memcpy(h->down, now_down, sizeof now_down);
     return caps;
 }
 
 /* Caps lock changed: every keyboard's worker lights it (usbhid_work). */
 static void caps_toggled(void) {
-    __atomic_xor_fetch(&caps_lock, 1, __ATOMIC_ACQ_REL);
     __atomic_fetch_add(&leds_gen, 1, __ATOMIC_RELEASE);
     uint64_t f = spin_lock(&hids_lock);
     for (struct hid *h = hids; h; h = h->next)
@@ -289,7 +271,7 @@ static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, uns
     }
     if (!any) return;
     h->buttons = buttons;
-    input_mouse(&e);
+    input_mouse(&h->input, &e);
 }
 
 /* A report whole, h->lock held. True when it pressed caps lock. */
@@ -591,15 +573,78 @@ void usbhid_detach(struct usb_device *d) {
         alarm_cancel(&h->repeat);
         uint64_t now = clock_now_ns();
         for (unsigned u = 0; u < 256; u++)
-            if (is_down(h->down, u)) send_usage(u, false, now);
+            if (is_down(h->down, u)) send_usage(h, u, false, now);
         if (h->mouse && h->buttons) {
             struct mouse_event e = {.time_ns = now};
-            input_mouse(&e);
+            input_mouse(&h->input, &e);
         }
+        if (h->input_id) input_device_remove(&h->input);
+        kfree(h->input_id);
+        kfree(h->input_name);
         kfree(h->keys);
         kfree(h->partial);
         kfree(h);
     }
+}
+
+/* The string descriptor index as a new UTF-8 string, NULL without one. USB 2.0 9.6.7: UTF-16LE of at most bLength's 253
+   bytes, in language 0x0409 or the first the device offers. Each unit takes at most three bytes in UTF-8. */
+static char *string_read(struct usb_device *d, uint8_t index) {
+    if (!index) return NULL;
+    uint8_t *raw = kmalloc(255);
+    if (!raw) return NULL;
+    int got = usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_STRING << 8, 0, raw, 4);
+    uint16_t language = got >= 4 ? (uint16_t)(raw[2] | raw[3] << 8) : 0x0409;
+    got = usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, (uint16_t)(USB_DESC_STRING << 8 | index), language, raw, 255);
+    char *out = NULL;
+    if (got >= 2 && raw[1] == USB_DESC_STRING) {
+        unsigned end = MIN((unsigned)got, (unsigned)raw[0]);
+        out = kmalloc((end / 2) * 3 + 1);
+        size_t at = 0;
+        for (unsigned i = 2; out && i + 1 < end; i += 2) {
+            uint32_t c = (uint32_t)raw[i] | (uint32_t)raw[i + 1] << 8;
+            if (c < 0x20 || (c >= 0xD800 && c <= 0xDFFF)) continue;
+            if (c < 0x80) {
+                out[at++] = (char)c;
+            } else if (c < 0x800) {
+                out[at++] = (char)(0xC0 | c >> 6);
+                out[at++] = (char)(0x80 | (c & 63));
+            } else {
+                out[at++] = (char)(0xE0 | c >> 12);
+                out[at++] = (char)(0x80 | (c >> 6 & 63));
+                out[at++] = (char)(0x80 | (c & 63));
+            }
+        }
+        if (out) out[at] = 0;
+    }
+    kfree(raw);
+    return out;
+}
+
+static uint32_t fnv(uint32_t hash, const void *data, size_t n) {
+    const uint8_t *p = data;
+    for (size_t i = 0; i < n; i++) hash = (hash ^ p[i]) * 16777619u;
+    return hash;
+}
+
+/* The interface joins the input devices: its number is the same each time it is plugged in, by its serial
+   number if it has one, else by where it is plugged in. */
+static void input_identify(struct hid *h) {
+    struct usb_device *d = h->dev;
+    char *serial = string_read(d, d->desc.serial);
+    uint32_t hash = 2166136261u;
+    if (serial) hash = fnv(hash, serial, strlen(serial));
+    else hash = fnv(fnv(hash, &d->route, sizeof d->route), &d->root_port, sizeof d->root_port);
+    kfree(serial);
+    /* "usb:", two 4-digit numbers, an 8-digit hash, a byte's interface number */
+    h->input_id = kmalloc(sizeof "usb:vvvv:pppp:xxxxxxxx:255");
+    if (!h->input_id) return;
+    ksnprintf(h->input_id, sizeof "usb:vvvv:pppp:xxxxxxxx:255", "usb:%04x:%04x:%08x:%u", d->desc.vendor, d->desc.product, hash, h->interface);
+    h->input_name = string_read(d, d->desc.product_name);
+    h->input.id = h->input_id;
+    h->input.name = h->input_name ? h->input_name : "";
+    h->input.kinds = (h->keyboard ? N_INPUT_KEYBOARD : 0) | (h->mouse ? N_INPUT_POINTER : 0);
+    input_device_add(&h->input);
 }
 
 bool usbhid_claims(const struct usb_interface_desc *intf) { return intf->cls == 3; }
@@ -659,7 +704,7 @@ void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, 
     h->next = hids;
     hids = h;
     spin_unlock(&hids_lock, f);
-    if (h->mouse) input_mouse_attach();
+    input_identify(h);
     if (h->keyboard) usb_note_work(d);
     kprintf("usbhid: slot %u interface %u is a %s%s%s%s\n", d->slot, h->interface,
             h->keyboard ? "keyboard" : "", h->keyboard && h->mouse ? " and " : "",
@@ -682,7 +727,7 @@ void usbhid_work(struct usb_device *d) {
         uint8_t *report = kzalloc(len);
         if (!report) continue;
         if (h->ids) report[0] = h->led_report;
-        if (__atomic_load_n(&caps_lock, __ATOMIC_ACQUIRE)) report[at + (h->led_bit >> 3)] |= (uint8_t)(1u << (h->led_bit & 7));
+        if (input_caps_on()) report[at + (h->led_bit >> 3)] |= (uint8_t)(1u << (h->led_bit & 7));
         usb_control(h->dev, 0x21, HID_SET_REPORT, (uint16_t)(0x0200 | h->led_report), h->interface, report, (uint16_t)len);
         kfree(report);
     }

@@ -8,7 +8,6 @@
 #define WEBPREFS_ACCEPT_LANGUAGE_MAX 128u    /* a CORS-safelisted value's bytes (Fetch) */
 /* The languages until the user chooses: Japanese, then Chinese (the user's
    choice, 2026-10-28). Catalog tags, commas between. */
-#define WEBPREFS_DEFAULT_LANGUAGES "ja,zh"
 
 /* A language the settings page offers: a valid BCP 47 tag (RFC 5646, registered subtags) in its
    usual case (§2.1.1), its own name, its name in English. The list holds only these. */

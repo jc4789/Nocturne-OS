@@ -1,10 +1,11 @@
-/* Hyper-V synthetic keyboard and mouse (VMBus). The keyboard sends scancode set 1, which goes
-   through the same decoder as PS/2. The mouse is a HID device with absolute coordinates; we read
+/* Hyper-V synthetic keyboard and mouse (VMBus). The keyboard sends scancode set 1, which
+   vm/set1.h turns into HID usages. The mouse is a HID device with absolute coordinates; we read
    its report descriptor to find the buttons, X, Y and wheel. */
 #include "kernel.h"
 #include "dev/input.h"
 #include "sys/clock.h"
 #include "vm/hv/vmbus.h"
+#include "vm/set1.h"
 
 static const struct guid kbd_guid =
     GUID_INIT(0xf912ad6d, 0x2b17, 0x48ea, 0xbd, 0x65, 0xf9, 0x27, 0xa6, 0x1c, 0x76, 0x84);
@@ -38,6 +39,8 @@ struct kbd_msg {
 static volatile bool kbd_answered;
 static uint32_t kbd_status;
 
+static struct input_device kbd_input = {.id = "hyperv:keyboard", .kinds = N_INPUT_KEYBOARD};
+
 static void kbd_callback(struct vmbus_channel *ch) {
     uint8_t pkt[256];
     int n;
@@ -50,13 +53,13 @@ static void kbd_callback(struct vmbus_channel *ch) {
             kbd_answered = true;
         } else if (m->type == KBD_EVENT) {
             if (m->key.info & KBD_IS_UNICODE) { /* typed text (e.g. VMConnect's "Type clipboard text") */
-                input_unicode(m->key.make_code, !(m->key.info & KBD_IS_BREAK), clock_now_ns());
+                input_text(&kbd_input, m->key.make_code, !(m->key.info & KBD_IS_BREAK), clock_now_ns());
                 continue;
             }
             /* one key in one call, its 0xE0 with it; one after 0xE1 (KBD_IS_E1, Pause) goes as the
                plain key, set 1 has nothing else for it */
-            input_key_set1((uint8_t)(m->key.make_code | ((m->key.info & KBD_IS_BREAK) ? 0x80 : 0)),
-                           (m->key.info & KBD_IS_E0) != 0, clock_now_ns());
+            uint16_t usage = set1_usage((uint8_t)m->key.make_code, (m->key.info & KBD_IS_E0) != 0);
+            if (usage) input_key(&kbd_input, usage, !(m->key.info & KBD_IS_BREAK), clock_now_ns());
         }
     }
 }
@@ -72,10 +75,13 @@ static bool kbd_init(void) {
                 ch->in->read_index);
         return false;
     }
+    input_device_add(&kbd_input);
     return true;
 }
 
 /* ---- mouse ---- */
+
+static struct input_device mouse_input = {.id = "hyperv:mouse", .kinds = N_INPUT_POINTER};
 
 enum { HID_PROTOCOL_REQUEST, HID_PROTOCOL_RESPONSE, HID_DEVICE_INFO, HID_DEVICE_INFO_ACK, HID_INPUT_REPORT };
 #define HID_VERSION 0x00020000 /* 2.0 */
@@ -219,7 +225,7 @@ static void mouse_report(const uint8_t *r, uint32_t len) {
         e.y = yr > 0 ? (int)((int64_t)(y - ms.y.min) * MOUSE_ABS_MAX / yr) : 0;
     }
     if (ms.wheel.present) e.wheel = -field_value(&ms.wheel, r, len); /* HID: positive is away from the user */
-    input_mouse(&e);
+    input_mouse(&mouse_input, &e);
 }
 
 static void mouse_send(uint32_t type, const void *data, uint32_t len) {
@@ -282,7 +288,7 @@ static bool mouse_init(void) {
         kprintf("hv-input: mouse report has no X axis\n");
         return false;
     }
-    input_mouse_attach();
+    input_device_add(&mouse_input);
     return true;
 }
 

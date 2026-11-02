@@ -679,11 +679,9 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     申し出の無いモードの値は選択として残り、出せるようになるまで望まない。止まっている間は最後の望みと配置がそのまま残り、
     起こし直しは今の表示を変えない。
   - デスクトップの設定は `SCREEN_SETTINGS_GET`（`struct desktop_settings`）が読む：
-    ポインターの速さ（-2〜2）と、なめらかな階調（`smooth_gradients`：8 ビットの画面に、
-    デスクトップをチャンネルあたり 10 ビットで合成してディザをかけて出す）。後者は利用者の望みで、
-    表示中の出力が 8 ビットの xRGB（ドライバーの面を含む）の間だけ効く
-    （`smooth_gradients_available`）。マウスの上下の向きはカーネルが自動で決め、設定は無い。
-    どちらもデスクトップ（`gui/wm.c`）の持ち物で、変える口は §12 の `N_INPUT_POINTER_SPEED` と
+    なめらかな階調（`smooth_gradients`：8 ビットの画面に、デスクトップをチャンネルあたり 10 ビットで合成して
+    ディザをかけて出す）。利用者の望みで、表示中の出力が 8 ビットの xRGB（ドライバーの面を含む）の間だけ効く
+    （`smooth_gradients_available`）。デスクトップ（`gui/wm.c`）の持ち物で、変える口は §12 の
     `N_WINDOW_SMOOTH_GRADIENTS`。変えるとすぐ効く。
   - 画面の見張り：`SYS_SCREEN_INFO` の第3引数 `SCREEN_WATCH`（第1・第2引数は 0。libc の
     `n_screen_watch()`、display.h）は、`SCREEN_SETTINGS_GET`・`struct screen_format` の返事・
@@ -918,6 +916,19 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     二つの画面にまたがる窓は、中心のある画面の歩調で来る。
   - `SYS_WIN_RESIZE`（72、窓、幅、高さ）は新しい大きさの面を作る。アプリは面を写し直す
     （libc の `win_resize`。`EV_RESIZE` を受けた `win_event` も同じことをする）。
+- 入力の型は `common/input_abi.h`。キーは HID の usage（HID Usage Tables の Keyboard page）で届く。
+  カーネルは文字を作らず、配列を読まない。
+  - `EV_KEY`・`EV_HOTKEY`：`usage` は押された鍵、`mods` は `NMOD_*`（`NMOD_SHIFT`・`CTRL`・`ALT`・`SUPER`・`CAPS`・
+    `RIGHT_ALT`）、`layout` はその装置の `enum n_key_layout`。カーネルにとって `layout` は意味のない数で、装置の値を
+    事象に写すだけ。
+  - 文字の持ち主は libc の `n_key_translate(&event)`（`user/libc/keymap.c`）。`win_event` がキーの事象ごとに呼び、`key` に
+    文字（Unicode）か `NKEY_*` を入れる。`NKEY_*` は Unicode の外（`0x110000` から）で、文字かどうかは
+    `N_KEY_IS_TEXT(k)` で分ける。`SYS_WIN_RECEIVE` を直に読むアプリは自分で呼ぶ。
+  - usage の無いキー事象（`usage` が 0）は host が鍵なしで打った文字で、`key` に初めから文字が入っている。
+  - `EV_MOUSE_DOWN`：`clicks` は続けて押された回数（1 から）。同じボタンを `N_INPUT_DOUBLE_CLICK_MS` の内に、ほぼ同じ場所で
+    押すと増える。数えるのは `gui/wm.c` で、アプリはダブルクリックの時間を読まない。
+  - ポインターの速さ、加速、ホイールの向きは `dev/input.c` が装置ごとの値で当てる。`EV_MOUSE_*` と `EV_WHEEL` は結果。
+  - キーの繰返しはキーボードのドライバーが装置の値で作る（USB は alarm。Hyper-V と遠隔デスクトップは host が繰り返す）。
 - `struct gui_event` の `time_ns` はシステムの単調時計（§8、ナノ秒）の時刻：入力は
   装置の報告がシステムに届いた時、`EV_FRAME` は表示された時。窓が受け取らずに入力が溜まり、
   システムが窓に持つ数を超えると、黙って捨てず `EV_INPUT_LOST` を一つ入れる：それより前に押されて
@@ -1089,7 +1100,7 @@ GUIの部品（ボタン、入力欄、一覧、スライダー等）は、libc 
 
 | 番号 | 名前 | 内容 |
 |---|---|---|
-| 1 | CLICK | ボタン、一覧の項目、`clickable` の箱、一覧（`menu`）の項目。押したボタンは `(flags >> 8) & 0xFF`（`UI_BUTTONS`。1 左、2 右、4 中。一覧の項目はどのボタンでも選ばれ、キーで選んだ時は 0）、a、b＝その部品の中のポインターの位置 |
+| 1 | CLICK | ボタン、一覧の項目、`clickable` の箱、一覧（`menu`）の項目。続けて押した回数は `flags >> 16`（`UI_CLICKS`）。押したボタンは `(flags >> 8) & 0xFF`（`UI_BUTTONS`。1 左、2 右、4 中。一覧の項目はどのボタンでも選ばれ、キーで選んだ時は 0）、a、b＝その部品の中のポインターの位置 |
 | 2 | TOGGLE | a＝新しい状態（0/1） |
 | 3 | SLIDE | a＝値。ドラッグが終わると flags に `UI_DONE`（1） |
 | 4 | CHOOSE | a＝選んだ項目の番号。`tab` では、選ばれていないタブが押された（a＝帯の中の番号） |
@@ -1155,6 +1166,16 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   | `N_DOMAIN_POWER` | `N_POWER_PERFORMANCE_PREFERENCE`（0〜255。AMD の CPPC、Intel の HWP へ渡す） | `arch/idle.c` |
   | `N_DOMAIN_POWER` | `N_POWER_BUTTON`、`N_POWER_LID`、`N_POWER_IDLE_MINUTES`、`N_POWER_IDLE_ANSWER`、`N_POWER_ALLOW_SLEEP`、`N_POWER_ALLOW_HIBERNATE`、`N_POWER_CLOSE_SECONDS`、`N_POWER_AGAIN_SECONDS` | サービス `machine`（§15） |
   | `N_DOMAIN_NETWORK` | `N_NETWORK_TCP_RX_BYTES`、`N_NETWORK_TCP_TX_BYTES` | `net/net.c` |
+  | `N_DOMAIN_INPUT` | `N_INPUT_POINTER_SPEED`（-2〜2）、`N_INPUT_POINTER_ACCEL`、`N_INPUT_SCROLL_NATURAL`、`N_INPUT_DOUBLE_CLICK_MS`、`N_INPUT_REPEAT_DELAY_MS`、`N_INPUT_REPEAT_INTERVAL_MS`、`N_INPUT_LAYOUT`（`enum n_key_layout`）、`N_INPUT_DEVICE`（装置ごとの記録） | `dev/input.c` |
+  | `N_DOMAIN_POWER` | `N_POWER_PERFORMANCE_PREFERENCE`（0〜255） | `arch/idle.c` |
+  | `N_DOMAIN_NETWORK` | `N_NETWORK_DNS_SERVER`、`N_NETWORK_TCP_RX_BYTES`、`N_NETWORK_TCP_TX_BYTES` | `net/net.c` |
+  | `N_DOMAIN_LANGUAGE` | `N_LANGUAGE_UI`、`N_LANGUAGE_REGION`、`N_LANGUAGE_DATE_ORDER`、`N_LANGUAGE_CLOCK`、`N_LANGUAGE_NUMBER`、`N_LANGUAGE_LOGIN` | カーネルに無い。`libc/language.c` が読む |
+
+- 装置ごとの値 `N_INPUT_DEVICE` は `N_SETTING_INPUT_DEVICE` の記録（`struct n_setting_input_device`、`N_SETTING_RECORDS`）。
+  頭の後ろに装置の id と名が続く可変長で、次の記録は `N_INPUT_RECORD_NEXT(size)` の先。id は `usb:vvvv:pppp:hash:i`
+  の形で、`hash` は serial か、無ければ差した場所。値の欄の `N_INPUT_SAME` は利用者の既定に従う。全部の欄が
+  `N_INPUT_SAME` の記録は選択を消す。`n_settings_effective` はつながっている装置（`N_INPUT_ATTACHED`）と、覚えている
+  選択を全部返す。装置の抜き差しは `n_settings_watch(N_DOMAIN_INPUT)` に届く。
 
 - `n_settings_apply(cap, domain, key, value, size)`（`SYS_SETTINGS_APPLY`）：持ち主へ渡す。`cap` は
   `N_CAP_SETTINGS_APPLY` の能力（§13）で、持つのは設定のサービス。プログラムはサービスへ頼む。
@@ -1205,6 +1226,14 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   - `n_power_events_watch(cap)`（`SYS_POWER_EVENTS_WATCH`、§15）：電源の事象。
   - `n_power_windows_watch(cap)`（`SYS_POWER_WINDOWS_WATCH`、§15）：アプリの窓の数と題。
 - 言語の一覧はシステムの状態ではない：読むプログラム（ブラウザー）の好みで、その持ち物である。
+- 言語と地域は領域 `N_DOMAIN_LANGUAGE` の利用者の値で、`nocturne_language.h`（`user/libc/language.c`）が読む。
+  `n_locale_now`、`n_language_now`、`n_language_changed`、`n_locale_date`・`time`・`day`・`number`、`n_locale_weekday`・`month`。
+  読むプログラムだけが見張りを一つ持ち、読むたびにサービスへ頼まない。文の表はプログラムごとに持つ
+  （`words[][N_LANGUAGE_COUNT]`）。設定の宣言の言葉は日本語で、英語は設定の窓の表（`settings_words.h`）が名から引く。
+- C の locale：プログラムは `"C"` で始まる。`setlocale(cat, "")` がそのカテゴリーを今の言語と地域にする。名はタグ（`"ja"`、
+  `"en-US"`、`"en-GB"`、`"en"`）。効くのは `printf`・`strtod` の小数点、`localeconv`、`strftime` の名と書式。
+- `Intl` の既定と `navigator.language` は同じ値から来る。ブラウザーの言語の一覧はプログラムの設定で、空なら
+  `n_locale_languages` に従う。
 - nocturne/ui（TypeScript・JavaScript）では `desktop.watch(listener)`：`listener` は変わったものの
   名前の配列を受け取る。`"screen"` は `desktop.get()`・`desktop.modes()` が報告するもの（画面の
   見張り）、`"sound"` は `desktop.sound()` が報告するもの（音の見張り）。
@@ -1298,7 +1327,8 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   一人目は誰が作っても admin。`n_user_folder` と `n_temp_folder` は身元から `accounts` が引く。
   新しい利用者のフォルダーの中身の元は `C:\Nocturne\NewUser`。
 - セッション：サービス `session`。ログインの窓を出し、選ばれた利用者の身元と `N_CAP_SHELL` でシェル
-  `C:\Nocturne\System\shell`（§16）を起こす。シェルが落ちたら起こし直す。コンソールの起動は同じ身元で `sh` を起こす。
+  `C:\Nocturne\System\shell`（§16）を起こす。シェルが落ちたら起こし直す。画面が無く、自動の利用者も無ければ待つ。
+  ログインの窓の文は機械の値 `N_LANGUAGE_LOGIN` に従う。
   `n_session_end`（`N_SESSION_END`）でセッションのプログラムを止め、ログインの窓へ戻る。
 - 網：サービス `network`（`user/apps/network.c`）。DHCP（RFC 2131）、固定の住所、経路の表、名前引きと cache を持つ。
   カーネルは adapter の一覧（`n_net_adapters`、`n_net_adapter_name`、見張りは `n_net_watch`）、IP、TCP、UDP を持つ。
@@ -1333,7 +1363,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 ## 16. シェル
 
 シェルは普通のプロセス（`user/apps/shell.c`）で、セッションが利用者の身元で起こす。タスクバー、開始メニュー、音量、通知、
-デスクトップの絵と印を持つ。窓の合成と管理はカーネル（`gui/wm.c`）が持つ。カーネルは文を言わず、絵を描かない。
+デスクトップの絵と印を持つ。文は言語の設定に従う表（`shell_words.h`）で持つ。窓の合成と管理はカーネル（`gui/wm.c`）が持つ。カーネルは文を言わず、絵を描かない。
 型は `common/display_abi.h`。`n_shell_*` は第一引数に `N_CAP_SHELL` の能力を取り、無ければ `N_ERR_DENIED`。
 
 - `n_shell_place(cap, win, &place)`：自分の枠なしの窓（`WIN_NO_DECOR`）を置く。枠つきの窓は `N_ERR_INVALID`。
@@ -1348,7 +1378,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   （`id`、アプリの番号、`N_SHELL_WINDOW_MINIMIZED`・`FOCUSED`・`FULLSCREEN`、画面、題）を `max` まで書く。
 - `n_shell_window(cap, id, op)`：`N_SHELL_RAISE`（元に戻して焦点を渡す）、`N_SHELL_MINIMIZE`、`N_SHELL_CLOSE`（`EV_CLOSE` を送る）。
 - `n_shell_watch(cap)`：窓、窓の順、焦点が変わると知らせる watch（`n_watch_take`）。
-- `n_shell_hotkey(cap, win, key, mods)`：キーと修飾の組を `win` が受ける。`mods` は `NMOD_SHIFT`・`NMOD_CTRL`・`NMOD_ALT`。
+- `n_shell_hotkey(cap, win, usage, mods)`：鍵（HID の usage、§9）と修飾の組を `win` が受ける。配列に左右されない。`mods` は `NMOD_SHIFT`・`NMOD_CTRL`・`NMOD_ALT`。
   その組はアプリへ届かず、`win` へ `EV_HOTKEY` で届く。組が既に取られていれば `N_ERR_EXISTS`。窓が閉じると組も消える。
 - 層のある窓はポインターが離れると `EV_MOUSE_LEAVE` を受ける。
 

@@ -3223,7 +3223,7 @@ static int editing_key(web_doc *d, const struct gui_event *e) {
     case NKEY_HOME: action = "caretLineStart"; break;
     case NKEY_END: action = "caretLineEnd"; break;
     default:
-        if (k < 32 || (k >= 0x100 && k < 0x200) || k > 0x10FFFF || (k >= 0xd800 && k <= 0xdfff)) return 0;
+        if (!N_KEY_IS_TEXT(k)) return 0;
         length = (size_t)utf8_put(enc, k); enc[length] = 0; text = true;
         action = "insertText";
     }
@@ -3336,9 +3336,7 @@ static int web_key_local(web_doc *d, const struct gui_event *e) {
         return 1;
     }
     if (e->mods & (NMOD_CTRL | NMOD_ALT)) return 0;
-    if (k < 32 && k != '\n') return 0;
-    if (k >= 0x100 && k < 0x200) return 0; /* other special keys */
-    if (k > 0x10FFFF || (k >= 0xd800 && k <= 0xdfff)) return 0;
+    if (k != '\n' && !N_KEY_IS_TEXT(k)) return 0;
     if(readonly(n))return 1;
     char enc[5];
     int el = utf8_put(enc, k);

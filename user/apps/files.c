@@ -18,7 +18,6 @@
 #define CHROME 150     /* window height that is not the listing: toolbar, card header, status line, padding */
 #define COL_W 84       /* the Size and Type columns */
 #define ROW_NODES 5    /* a row and its four children, counted in the view */
-#define DOUBLE_MS 400  /* two clicks on a row this close are a double click */
 
 static struct ui_session *sess;
 #define PATH_BYTES 1024
@@ -28,7 +27,6 @@ static char pathbuf[PATH_BYTES]; /* what the path field holds */
 static struct n_entry *ents;     /* the folder's entries (n_folder_entries) */
 static int nent, sel = -1, win_w = 620, win_h = 440;
 static char status[128];
-static uint64_t last_click;
 static int last_click_idx = -1;
 static int reveal = 1;           /* counts up when the keyboard moves the selection: the list shows it */
 
@@ -259,14 +257,12 @@ static void go_typed(void) {
     go(full);
 }
 
-static void click_row(int idx) {
-    uint64_t now = (n_clock_monotonic() / N_NS_PER_MS);
-    if (idx == last_click_idx && now - last_click < DOUBLE_MS) {
+static void click_row(int idx, uint32_t clicks) {
+    if (idx == last_click_idx && clicks >= 2) {
         open_entry(idx);
         last_click_idx = -1;
     } else {
         sel = idx;
-        last_click = now;
         last_click_idx = idx;
     }
 }
@@ -313,7 +309,7 @@ int main(int argc, char **argv) {
                 else if (e.node == btn_node[B_DELETE]) delete_sel();
                 else if (nent > 0 && e.node >= first_row && (e.node - first_row) % ROW_NODES == 0 &&
                          (int)((e.node - first_row) / ROW_NODES) < nent)
-                    click_row((int)((e.node - first_row) / ROW_NODES));
+                    click_row((int)((e.node - first_row) / ROW_NODES), UI_CLICKS(e.flags));
                 else break;
                 changed = true;
                 break;

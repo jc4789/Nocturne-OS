@@ -179,6 +179,7 @@ n_result win_event(window_t *win, struct gui_event *e, uint64_t deadline) {
         if (r <= 0) return r;
     }
     *e = win->q[win->qi++];
+    if (e->type == EV_KEY || e->type == EV_HOTKEY) n_key_translate(e);
     if (e->type == EV_RESIZE) {
         n_result r = win_resize(win, e->x, e->y);
         if (r < 0 && win->closed) return r;
@@ -218,8 +219,8 @@ n_result n_shell_windows(n_handle cap, struct n_shell_window *out, size_t max) {
 }
 n_result n_shell_window(n_handle cap, uint32_t id, uint32_t op) { return __syscall(SYS_SHELL_WINDOW, cap, id, op, 0, 0); }
 n_handle n_shell_watch(n_handle cap) { return (n_handle)__syscall(SYS_SHELL_WATCH, cap, 0, 0, 0, 0); }
-n_result n_shell_hotkey(n_handle cap, window_t *win, uint32_t key, uint32_t mods) {
-    return __syscall(SYS_SHELL_HOTKEY, cap, win->handle, key, mods, 0);
+n_result n_shell_hotkey(n_handle cap, window_t *win, uint32_t usage, uint32_t mods) {
+    return __syscall(SYS_SHELL_HOTKEY, cap, win->handle, usage, mods, 0);
 }
 n_result n_screen_modes_get(uint32_t screen, struct screen_modes *out) {
     return (n_result)__syscall(SYS_SCREEN_INFO, (long)out, sizeof *out, SCREEN_MODES_GET | (long)screen << 8, 0, 0);

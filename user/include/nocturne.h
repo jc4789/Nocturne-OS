@@ -570,8 +570,12 @@ n_result win_pointer(window_t *win, const struct n_win_pointer *pointer);
 n_result win_pointer_shape(window_t *win, uint32_t shape);
 /* wait until deadline (N_CLOCK_NEVER: no limit) for an event; returns 1 if *e was filled, 0 at the
    deadline, negative once the window is gone. EV_RESIZE is handled before it is returned: the window has new
-   surfaces of the size in the event, with as much of the picture shown as fits. */
+   surfaces of the size in the event, with as much of the picture shown as fits. An EV_KEY's key is its
+   character or NKEY_ in the layout of the keyboard that typed it (n_key_translate). */
 n_result win_event(window_t *win, struct gui_event *e, uint64_t deadline);
+/* The one place a key's usage, modifiers and layout become a character (user/libc/keymap.c): sets e->key, and leaves in
+   e->mods what programs read. */
+void n_key_translate(struct gui_event *e);
 n_result clipboard_set(const char *s, size_t n);
 n_result clipboard_get(char *buf, size_t n); /* the whole length; at most n bytes are copied */
 /* Starts a program (find_program: "notepad" is enough), with arg as its one argument and without

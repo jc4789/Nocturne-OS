@@ -1,6 +1,7 @@
 /* The settings' gate (sys/settings.h). */
 #include "sys/settings.h"
 #include "abi.h"
+#include "dev/input.h"
 #include "authority_abi.h"
 #include "fs/bootrecord.h"
 #include "mm/heap.h"
@@ -16,6 +17,9 @@ struct setting {
 };
 
 #define SIZE_OF(type) ((type) == N_SETTING_ENDPOINT ? sizeof(struct n_sockaddr) : sizeof(int32_t))
+#define SIZE_OF(type) ((type) == N_SETTING_ENDPOINT ? sizeof(struct n_sockaddr) \
+                       : (type) == N_SETTING_MONITOR_MODE ? sizeof(struct n_setting_monitor_mode) \
+                       : (type) == N_SETTING_INPUT_DEVICE ? 0 : sizeof(int32_t))
 
 static const struct setting settings[] = {
     {N_DOMAIN_BOOT, N_BOOT_IOMMU, N_SETTING_BOOL, N_SETTING_AT_START, 0, 1, boot_setting_put, boot_setting_get},
@@ -25,7 +29,14 @@ static const struct setting settings[] = {
     {N_DOMAIN_BOOT, N_BOOT_UNISOLATED_DRIVERS, N_SETTING_BOOL, N_SETTING_AT_START, 0, 1, boot_setting_put, boot_setting_get},
     {N_DOMAIN_DISPLAY, N_DISPLAY_HOLD_SECONDS, N_SETTING_INT, 0, 0, INT32_MAX, screen_hold_setting_put, screen_hold_setting_get},
     {N_DOMAIN_WINDOW, N_WINDOW_SMOOTH_GRADIENTS, N_SETTING_BOOL, 0, 0, 1, smooth_gradients_setting_put, smooth_gradients_setting_get},
-    {N_DOMAIN_INPUT, N_INPUT_POINTER_SPEED, N_SETTING_INT, 0, -2, 2, pointer_speed_setting_put, pointer_speed_setting_get},
+    {N_DOMAIN_INPUT, N_INPUT_POINTER_SPEED, N_SETTING_INT, 0, -2, 2, input_setting_put, input_setting_get},
+    {N_DOMAIN_INPUT, N_INPUT_POINTER_ACCEL, N_SETTING_BOOL, 0, 0, 1, input_setting_put, input_setting_get},
+    {N_DOMAIN_INPUT, N_INPUT_SCROLL_NATURAL, N_SETTING_BOOL, 0, 0, 1, input_setting_put, input_setting_get},
+    {N_DOMAIN_INPUT, N_INPUT_DOUBLE_CLICK_MS, N_SETTING_INT, 0, 1, INT32_MAX, input_setting_put, input_setting_get},
+    {N_DOMAIN_INPUT, N_INPUT_REPEAT_DELAY_MS, N_SETTING_INT, 0, 1, INT32_MAX, input_setting_put, input_setting_get},
+    {N_DOMAIN_INPUT, N_INPUT_REPEAT_INTERVAL_MS, N_SETTING_INT, 0, 1, INT32_MAX, input_setting_put, input_setting_get},
+    {N_DOMAIN_INPUT, N_INPUT_LAYOUT, N_SETTING_INT, 0, 0, INT32_MAX, input_setting_put, input_setting_get},
+    {N_DOMAIN_INPUT, N_INPUT_DEVICE, N_SETTING_INPUT_DEVICE, N_SETTING_LIST | N_SETTING_RECORDS, 0, 0, NULL, input_setting_get},
     {N_DOMAIN_POWER, N_POWER_PERFORMANCE_PREFERENCE, N_SETTING_INT, 0, 0, 255, perf_preference_setting_put, perf_preference_setting_get},
     {N_DOMAIN_NETWORK, N_NETWORK_TCP_RX_BYTES, N_SETTING_INT, 0, 1, INT32_MAX, tcp_buffer_setting_put, tcp_buffer_setting_get},
     {N_DOMAIN_NETWORK, N_NETWORK_TCP_TX_BYTES, N_SETTING_INT, 0, 1, INT32_MAX, tcp_buffer_setting_put, tcp_buffer_setting_get},
@@ -67,6 +78,15 @@ int64_t settings_syscall_apply(int cap, uint32_t domain, uint32_t key, const voi
     if (r < 0) return r;
     const struct setting *s = setting_find(domain, key);
     if (!s) return -N_ERR_NOT_FOUND;
+    if (s->flags & N_SETTING_RECORDS) {
+        /* the service's message carries it: its largest value is the bound (N_SETTING_VALUE_MAX) */
+        if (len < sizeof(uint32_t) || len > N_SETTING_VALUE_MAX) return -N_ERR_INVALID;
+        void *record = kmalloc(len);
+        if (!record) return -N_ERR_NO_MEMORY;
+        r = copy_from_user(record, uvalue, len) ? -N_ERR_BAD_ADDRESS : input_device_record_put(s->key, record, len);
+        kfree(record);
+        return r;
+    }
     if (len != SIZE_OF(s->type)) return -N_ERR_INVALID;
     union {
         int32_t i;

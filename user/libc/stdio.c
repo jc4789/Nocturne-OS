@@ -12,6 +12,7 @@
 #include <wchar.h>
 #include <wctype.h>
 #include "nocturne.h"
+#include "locale_private.h"
 
 struct FILE {
     n_handle h;
@@ -798,7 +799,7 @@ static int fmt_fixed(char *buf, struct dec *x, int prec, bool alt) {
     if (x->n == 0 || x->pt <= 0) buf[n++] = '0';
     else
         for (int i = 0; i < x->pt; i++) buf[n++] = dec_digit(x, i);
-    if (prec || alt) buf[n++] = '.';
+    if (prec || alt) buf[n++] = __decimal_point;
     for (int i = 0; i < prec; i++) buf[n++] = x->n ? dec_digit(x, x->pt + i) : '0';
     return n;
 }
@@ -808,7 +809,7 @@ static int fmt_exp(char *buf, struct dec *x, int prec, bool upper, bool alt) {
     dec_round(x, prec + 1);
     int e = x->n ? x->pt - 1 : 0, n = 0;
     buf[n++] = dec_digit(x, 0);
-    if (prec || alt) buf[n++] = '.';
+    if (prec || alt) buf[n++] = __decimal_point;
     for (int i = 1; i <= prec; i++) buf[n++] = dec_digit(x, i);
     buf[n++] = upper ? 'E' : 'e';
     buf[n++] = e < 0 ? '-' : '+';
@@ -841,7 +842,7 @@ static int fmt_hex(char *buf, uint64_t m, int e, int prec, bool upper, bool alt)
     int count = prec;
     if (count < 0)
         for (count = 0; count < 16 && frac << (4 * count); count++) {}
-    if (count || alt) buf[n++] = '.';
+    if (count || alt) buf[n++] = __decimal_point;
     for (int i = 0; i < count; i++) buf[n++] = i < 16 ? digits[frac >> (60 - 4 * i) & 15] : '0';
     buf[n++] = upper ? 'P' : 'p';
     buf[n++] = e < 0 ? '-' : '+';
@@ -884,13 +885,13 @@ static void put_float(out_t *o, const struct conv *cv, bool neg, const char *spe
             else n = fmt_fixed(buf, x, prec - 1 - ex, cv->alt);
             if (!cv->alt) {
                 /* strip trailing zeros in the fraction */
-                char *dot = memchr(buf, '.', n);
+                char *dot = memchr(buf, __decimal_point, n);
                 if (dot) {
                     char *epos = memchr(buf, upper ? 'E' : 'e', n);
                     int end = epos ? (int)(epos - buf) : n;
                     int k = end;
                     while (k > 0 && buf[k - 1] == '0') k--;
-                    if (k > 0 && buf[k - 1] == '.') k--;
+                    if (k > 0 && buf[k - 1] == __decimal_point) k--;
                     memmove(buf + k, buf + end, n - end);
                     n -= end - k;
                 }
@@ -1493,7 +1494,7 @@ static void scan_float(struct scan_input *in, size_t width, struct number_text *
         }
         for (;; c = take(in, t, c, &n, width)) {
             if (digit_value(c) < (hex ? 16 : 10)) digits = true;
-            else if (c == '.' && !dot) dot = true;
+            else if (c == __decimal_point && !dot) dot = true;
             else break;
         }
         if (digits && ascii_lower(c) == (hex ? 'p' : 'e')) {

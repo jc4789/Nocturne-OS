@@ -1,6 +1,7 @@
 /* Nocturne kernel <-> userland ABI: syscall numbers and shared structures. */
 #pragma once
 #include <stdint.h>
+#include "input_abi.h"
 #include "authority_abi.h"
 /* x86-64 native mapping granule: n_memory and shared pages come in these. */
 #define N_PAGE_SIZE 4096ULL
@@ -80,7 +81,7 @@ enum {
     SYS_SHELL_WINDOWS, /* (cap, struct n_shell_window *out, max): 窓の数 */
     SYS_SHELL_WINDOW,  /* (cap, 窓の番号, N_SHELL_RAISE など) */
     SYS_SHELL_WATCH,   /* (cap): 窓の一覧と焦点の watch */
-    SYS_SHELL_HOTKEY,  /* (cap, window, key, mods): その鍵の押下を EV_HOTKEY で受ける */
+    SYS_SHELL_HOTKEY,  /* (cap, window, usage, mods): そのキーの押下を EV_HOTKEY で受ける */
     SYS_SHARED_RESERVE = 88, SYS_WAIT_ADDRESS64,
     SYS_NET_FIRST = 96,
     /* The stack's adapters and routes. ADAPTERS (struct n_net_adapter *out, max) -> how many there
@@ -707,7 +708,7 @@ enum {
        the next events are the ones that came after. */
     EV_INPUT_LOST,
     EV_MOUSE_LEAVE, /* 指が窓から離れた。シェルの層の窓だけが受ける */
-    EV_HOTKEY,      /* key と mods の押下（SYS_SHELL_HOTKEY） */
+    EV_HOTKEY,      /* usage と mods の押下（SYS_SHELL_HOTKEY） */
 };
 
 /* A window's event. time_ns is a moment on the system's monotonic clock in nanoseconds (struct
@@ -717,13 +718,17 @@ enum {
 struct gui_event {
     uint32_t type;
     int32_t x, y;       /* mouse position in client coordinates / new size for EV_RESIZE */
-    uint32_t key;       /* KEY_* or character */
-    uint32_t mods;
+    uint32_t key;       /* EV_KEY: 文字か NKEY_（input_abi.h）。カーネルは usage を渡し、n_key_translate が決める */
+    uint32_t mods;      /* NMOD_* */
     uint32_t buttons;
     int32_t wheel;
     uint32_t pressed;
     uint64_t time_ns;
     uint64_t serial;    /* EV_FRAME: the number of the last present the frame showed */
+    uint32_t usage;     /* EV_KEY, EV_HOTKEY: HID の usage（Keyboard page）。0 は文字だけの入力で、key が文字 */
+    uint32_t layout;    /* EV_KEY, EV_HOTKEY: 打った装置の配列（enum n_key_layout） */
+    uint32_t clicks;    /* EV_MOUSE_DOWN: 同じ場所で続けて押した回数（1 から）。間隔は N_INPUT_DOUBLE_CLICK_MS */
+    uint32_t reserved;
 };
 
 /* window flags */
@@ -825,20 +830,6 @@ struct n_win_pointer {
 struct screen_info {
     uint32_t width, height;
 };
-
-/* key codes (shared with kernel/dev/input.h) */
-#ifndef KEY_UP
-enum {
-    NKEY_ESC = 0x1B, NKEY_BACKSPACE = 0x08, NKEY_TAB = 0x09, NKEY_ENTER = 0x0A,
-    NKEY_UP = 0x100, NKEY_DOWN, NKEY_LEFT, NKEY_RIGHT, NKEY_HOME, NKEY_END, NKEY_PGUP, NKEY_PGDN,
-    NKEY_INSERT, NKEY_DELETE, NKEY_F1, NKEY_F2, NKEY_F3, NKEY_F4, NKEY_F5, NKEY_F6, NKEY_F7, NKEY_F8,
-    NKEY_F9, NKEY_F10, NKEY_F11, NKEY_F12, NKEY_LSHIFT, NKEY_RSHIFT, NKEY_LCTRL, NKEY_RCTRL,
-    NKEY_LALT, NKEY_RALT, NKEY_CAPS, NKEY_SUPER, NKEY_MENU,
-};
-#endif
-#define NMOD_SHIFT 1
-#define NMOD_CTRL 2
-#define NMOD_ALT 4
 
 /* networking */
 /* An adapter. It keeps its id for as long as the system runs, also unplugged (present 0). ip and

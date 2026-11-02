@@ -17,13 +17,15 @@
 #include "gfx.h"
 #include "settings_abi.h"
 #include "shell_art.h"
+#include "shell_words.h"
+#include "nocturne_language.h"
 
 #define OS_NAME "Nocturne"
 #define MAX_OF(a, b) ((a) > (b) ? (a) : (b))
 #define MIN_OF(a, b) ((a) < (b) ? (a) : (b))
 
 enum {
-    TOKEN_WINDOWS = 1, TOKEN_SCREEN, TOKEN_SOUND, TOKEN_SOUND_SETTING, TOKEN_ZONE, TOKEN_POWER, TOKEN_CLOCK, TOKEN_TOAST_TIME, TOKEN_LOGOUT_TIME,
+    TOKEN_WINDOWS = 1, TOKEN_SCREEN, TOKEN_SOUND, TOKEN_SOUND_SETTING, TOKEN_ZONE, TOKEN_LANGUAGE, TOKEN_POWER, TOKEN_CLOCK, TOKEN_TOAST_TIME, TOKEN_LOGOUT_TIME,
     TOKEN_INLET, TOKEN_BAR, TOKEN_MENU, TOKEN_VOLUME, TOKEN_TOAST,
     TOKEN_DESK = 0x1000,   /* その後ろに画面の番号 */
 };
@@ -32,9 +34,10 @@ enum {
 #define TOAST_MS 4000u
 #define HINT_MS 3000u           /* 窓の題と抜け方が代わる代わる出る */
 #define LOGOUT_STALL_MS 15000u  /* 窓が一つも閉じないまま、これだけ経つとログアウトをやめる */
-#define DOUBLE_CLICK_NS (450 * N_NS_PER_MS)
 
 static n_handle cap, events;
+static uint32_t language; /* enum n_language：見張りが今に保つ */
+#define WORD(w) shell_words[w][language]
 
 struct rectangle { int x, y, w, h; };
 static bool in_box(int x, int y, struct rectangle r) { return x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h; }
@@ -108,6 +111,8 @@ enum action { RUN, SLEEP, HIBERNATE, LOGOUT, RESTART, SHUT_DOWN };
 struct app {
     const char *name;
     const struct n_program *program; /* RUN だけ */
+    enum shell_word name;
+    const char *path;
     int icon;
     enum action action;
 };
@@ -117,6 +122,32 @@ static const struct app power_items[] = {
     {"Log Out", NULL, N_ICON_LOGOUT, LOGOUT},
     {"Restart", NULL, N_ICON_REBOOT, RESTART},
     {"Shut Down", NULL, N_ICON_POWER, SHUT_DOWN},
+#define SYSTEM   N_FOLDER_SYSTEM "\\"
+#define PROGRAMS N_FOLDER_PROGRAMS "\\"
+static const struct app apps[] = {
+    {S_TERMINAL, SYSTEM "term", ICON_TERMINAL, NULL, RUN},
+    {S_FILES, SYSTEM "files", ICON_FILES, NULL, RUN},
+    {S_BROWSER, PROGRAMS "Browser\\browser", ICON_NET, NULL, RUN},
+    {S_EDITOR, PROGRAMS "Notepad\\notepad", ICON_EDITOR, NULL, RUN},
+    {S_PAINT, PROGRAMS "Paint\\paint", ICON_PAINT, NULL, RUN},
+    {S_CALCULATOR, PROGRAMS "Calculator\\calc", ICON_CALC, NULL, RUN},
+    {S_CLOCK, PROGRAMS "Clock\\clock", ICON_CLOCK, NULL, RUN},
+    {S_MONITOR, SYSTEM "sysmon", ICON_MONITOR, NULL, RUN},
+    {S_PIANO, PROGRAMS "Piano\\piano", ICON_PIANO, NULL, RUN},
+    {S_PLAYER, PROGRAMS "Player\\player", ICON_SOUND, NULL, RUN},
+    {S_SNAKE, PROGRAMS "Snake\\snake", ICON_SNAKE, NULL, RUN},
+    {S_TETRIS, PROGRAMS "Tetris\\tetris", ICON_TETRIS, NULL, RUN},
+    {S_MINES, PROGRAMS "Minesweeper\\mines", ICON_MINES, NULL, RUN},
+    {S_MANDEL, PROGRAMS "Mandelbrot\\mandel", ICON_FRACTAL, NULL, RUN},
+    {S_CUBE, PROGRAMS "Cube\\cube", ICON_CUBE, NULL, RUN},
+    {S_LIFE, PROGRAMS "Life\\life", ICON_LIFE, NULL, RUN},
+    {S_SETTINGS, SYSTEM "settings", ICON_SETTINGS, NULL, RUN},
+    {S_ABOUT, SYSTEM "js", ICON_ABOUT, SYSTEM "about.js", RUN},
+    {S_SLEEP, NULL, ICON_SLEEP, NULL, SLEEP},
+    {S_HIBERNATE, NULL, ICON_HIBERNATE, NULL, HIBERNATE},
+    {S_LOGOUT, NULL, ICON_LOGOUT, NULL, LOGOUT},
+    {S_RESTART, NULL, ICON_REBOOT, NULL, RESTART},
+    {S_SHUT_DOWN, NULL, ICON_POWER, NULL, SHUT_DOWN},
 };
 #define POWER_ITEMS ((int)(sizeof power_items / sizeof *power_items))
 /* 台帳の写し（サービス programs）。menu_apps と desktop_apps は programs_held を指す。 */
@@ -168,6 +199,8 @@ static void perform(const struct app *a) {
             char text[128];
             snprintf(text, sizeof text, "%s (%s)", a->name, n_result_text(r));
             toast("Could not start program", text, TOAST_MS);
+            snprintf(text, sizeof text, "%s (%s)", a->path, n_result_text(r));
+            toast(WORD(S_START_FAILED), text, TOAST_MS);
         }
         return;
     case LOGOUT: logout_begin(); return;
@@ -176,7 +209,7 @@ static void perform(const struct app *a) {
     case RESTART: r = n_machine_choose(N_MACHINE_REBOOT); break;
     case SHUT_DOWN: r = n_machine_choose(N_MACHINE_POWER_OFF); break;
     }
-    if (r < 0) toast("The power did not change", n_result_text(r), TOAST_MS);
+    if (r < 0) toast(WORD(S_POWER_FAILED), n_result_text(r), TOAST_MS);
 }
 
 /* ---- 画面ごとのデスクトップ ---- */
@@ -194,8 +227,6 @@ struct desk {
     struct rectangle under_box;
     uint32_t *under;
     uint8_t *under_deep;
-    uint64_t last_click;
-    int last_x, last_y;
 };
 static struct desk *desks;
 static size_t desk_count;
@@ -219,6 +250,7 @@ static void icons_draw(struct desk *d) {
             memcpy(saved + (size_t)y * box.w, c->px + (size_t)(box.y + y) * c->pitch + box.x, (size_t)box.w * 4);
         art_icon(c, cell.x + (cell.w - 32) / 2, cell.y + 8, a->icon);
         const char *label = a->name;
+        const char *label = WORD(a->name == S_ABOUT ? S_ABOUT_SHORT : a->name);
         int tx = cell.x + (cell.w - gfx_text_width(label, FONT_SMALL)) / 2;
         gfx_text(c, tx + 1, cell.y + 49, label, RGB(0, 0, 0), TRANSPARENT, FONT_SMALL);
         gfx_text(c, tx, cell.y + 48, label, RGB(235, 235, 250), TRANSPARENT, FONT_SMALL);
@@ -321,7 +353,9 @@ static void desk_fit(size_t i, const struct n_shell_screen *s, bool deep) {
 
 /* ---- タスクバー ---- */
 #define START_W 128
-#define CLOCK_W 100
+#define CLOCK_MARGIN 16
+
+static int clock_w; /* 時計の幅：今の書式の文が決める。bar_draw が測る */
 #define SPEAKER_W 40
 
 static window_t *bar;
@@ -358,10 +392,10 @@ static void windows_read(void) {
     }
 }
 
-static struct rectangle speaker_box(int w) { return (struct rectangle){w - CLOCK_W - SPEAKER_W, 5, SPEAKER_W - 4, BAR_H - 10}; }
+static struct rectangle speaker_box(int w) { return (struct rectangle){w - clock_w - SPEAKER_W, 5, SPEAKER_W - 4, BAR_H - 10}; }
 
 static void button_box(int w, size_t n, size_t i, int *x, int *width) {
-    int avail = w - START_W - CLOCK_W - SPEAKER_W - 16;
+    int avail = w - START_W - clock_w - SPEAKER_W - 16;
     int bw = n ? avail / (int)n : 0;
     if (bw > 190) bw = 190;
     *x = START_W + 8 + (int)i * bw;
@@ -396,6 +430,13 @@ static void bar_draw(void) {
     if (!bar) return;
     canvas_t *c = &bar->c;
     int w = bar->w;
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char t1[32], t2[64];
+    n_locale_time(t1, sizeof t1, tm, false);
+    n_locale_day(t2, sizeof t2, tm);
+    int w1 = gfx_text_width(t1, FONT_SMALL), w2 = gfx_text_width(t2, FONT_SMALL);
+    clock_w = (w1 > w2 ? w1 : w2) + CLOCK_MARGIN;
     gfx_fill(c, 0, 0, w, BAR_H, ARGB(220, 14, 12, 32));
     gfx_hline(c, 0, 0, w, RGB(90, 76, 160));
     gfx_fill_round(c, 6, 5, START_W - 6, BAR_H - 10, 8, menu ? RGB(84, 68, 170) : RGB(44, 38, 90));
@@ -413,16 +454,9 @@ static void bar_draw(void) {
     struct rectangle s = speaker_box(w);
     if (volume || speaker_hover) gfx_fill_round(c, s.x, s.y, s.w, s.h, 6, volume ? RGB(70, 62, 140) : RGB(40, 36, 78));
     draw_speaker(c, s.x + s.w / 2 - 1, BAR_H / 2, sound.volume, sound.muted, RGB(235, 235, 250));
-    static const char *const wd[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-    static const char *const mo[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-    time_t now = time(NULL);
-    struct tm *tm = localtime(&now);
-    char t1[16], t2[24];
-    snprintf(t1, sizeof t1, "%02d:%02d", tm->tm_hour, tm->tm_min);
-    snprintf(t2, sizeof t2, "%s %d %s", wd[tm->tm_wday % 7], tm->tm_mday, mo[tm->tm_mon % 12]);
-    int cx = w - CLOCK_W;
-    gfx_text(c, cx + (CLOCK_W - gfx_text_width(t1, FONT_SMALL)) / 2, 3, t1, RGB(245, 245, 255), TRANSPARENT, FONT_SMALL);
-    gfx_text(c, cx + (CLOCK_W - gfx_text_width(t2, FONT_SMALL)) / 2, 20, t2, RGB(160, 160, 200), TRANSPARENT, FONT_SMALL);
+    int cx = w - clock_w;
+    gfx_text(c, cx + (clock_w - w1) / 2, 3, t1, RGB(245, 245, 255), TRANSPARENT, FONT_SMALL);
+    gfx_text(c, cx + (clock_w - w2) / 2, 20, t2, RGB(160, 160, 200), TRANSPARENT, FONT_SMALL);
     win_update(bar);
 }
 
@@ -434,10 +468,10 @@ static void clock_arm(void) {
 }
 
 static void hotkey_keys(void) {
-    n_shell_hotkey(cap, bar, NKEY_SUPER, 0);
-    n_shell_hotkey(cap, bar, NKEY_ESC, NMOD_CTRL);
-    n_shell_hotkey(cap, bar, 't', NMOD_CTRL | NMOD_ALT);
-    n_shell_hotkey(cap, bar, 'T', NMOD_CTRL | NMOD_ALT);
+    n_shell_hotkey(cap, bar, N_USAGE_LEFT_GUI, 0);
+    n_shell_hotkey(cap, bar, N_USAGE_RIGHT_GUI, 0);
+    n_shell_hotkey(cap, bar, N_USAGE_ESC, NMOD_CTRL);
+    n_shell_hotkey(cap, bar, N_USAGE_T, NMOD_CTRL | NMOD_ALT);
 }
 
 static void bar_fit(const struct n_shell_screen *s) {
@@ -497,7 +531,7 @@ static void menu_draw(void) {
         if (i == menu_first_power && b.y > MENU_HEAD) gfx_hline(c, b.x + 12, b.y - 1, MENU_W - 24, RGB(60, 56, 100));
         if (i == menu_sel) gfx_fill_round(c, b.x + 6, b.y + 1, MENU_W - 12, MENU_ITEM_H - 2, 6, RGB(76, 64, 150));
         art_icon(c, b.x + 12, b.y + 2, menu_items[i]->icon);
-        gfx_text(c, b.x + 54, b.y + 10, menu_items[i]->name, RGB(230, 230, 245), TRANSPARENT, FONT_SMALL);
+        gfx_text(c, b.x + 54, b.y + 10, WORD(menu_items[i]->name), RGB(230, 230, 245), TRANSPARENT, FONT_SMALL);
     }
     win_update(menu);
 }
@@ -622,7 +656,7 @@ static struct rectangle slider_box(void) { return (struct rectangle){70, 60, VOL
 /* 音量の値の変更はここだけ。 */
 static void sound_put(uint32_t key, int32_t value) {
     n_result r = n_setting_set_int(n_setting_at(N_DOMAIN_AUDIO, key), value, NULL);
-    if (r < 0) toast("The volume did not change", n_result_text(r), TOAST_MS);
+    if (r < 0) toast(WORD(S_VOLUME_FAILED), n_result_text(r), TOAST_MS);
 }
 
 static void volume_draw(void) {
@@ -633,6 +667,8 @@ static void volume_draw(void) {
     gfx_fill_round(c, 1, 1, VOLUME_W - 2, VOLUME_H - 2, 9, RGB(22, 20, 44));
     gfx_text(c, 16, 12, "Volume", RGB(245, 245, 255), TRANSPARENT, FONT_SMALL);
     const char *device = sound.device ? sound.device : "No sound device";
+    gfx_text(c, 16, 12, WORD(S_VOLUME), RGB(245, 245, 255), TRANSPARENT, FONT_SMALL);
+    const char *device = sound.device[0] ? sound.device : WORD(S_NO_SOUND);
     gfx_text(c, VOLUME_W - 16 - gfx_text_width(device, FONT_SMALL), 12, device, RGB(150, 150, 190), TRANSPARENT, FONT_SMALL);
     gfx_fill_round(c, m.x, m.y, m.w, m.h, 8, sound.muted ? RGB(90, 40, 60) : RGB(44, 38, 90));
     draw_speaker(c, m.x + m.w / 2 - 1, m.y + m.h / 2, sound.volume, sound.muted, RGB(235, 235, 250));
@@ -773,6 +809,9 @@ static void bar_event(const struct gui_event *e) {
         if (e->key == 't' || e->key == 'T') {
             n_result r = gui_launch(N_FOLDER_SYSTEM "\\term", NULL);
             if (r < 0) toast("Could not start program", n_result_text(r), TOAST_MS);
+        if (e->usage == N_USAGE_T) {
+            n_result r = gui_launch(SYSTEM "term", NULL);
+            if (r < 0) toast(WORD(S_START_FAILED), n_result_text(r), TOAST_MS);
         } else if (menu) {
             menu_close();
         } else {
@@ -795,10 +834,7 @@ static void desk_event(struct desk *d, size_t screen, const struct gui_event *e)
     switch (e->type) {
     case EV_MOUSE_DOWN: {
         if (!(e->buttons & 1)) break;
-        bool twice = e->time_ns - d->last_click < DOUBLE_CLICK_NS && abs(e->x - d->last_x) < 6 && abs(e->y - d->last_y) < 6;
-        d->last_click = twice ? 0 : e->time_ns;
-        d->last_x = e->x;
-        d->last_y = e->y;
+        bool twice = e->clicks >= 2;
         int icon = icon_at(d, e->x, e->y);
         selection_set(d, icon);
         if (icon >= 0 && twice) perform(&desktop_apps[icon]);
@@ -914,22 +950,22 @@ static uint64_t power_seen;
 
 static const char *reason_text(uint32_t reason, const char *detail) {
     switch (reason) {
-    case N_POWER_REASON_IOMMU: return "The IOMMU cannot be trusted to come back";
-    case N_POWER_REASON_NO_S3: return "The firmware has no sleep state";
-    case N_POWER_REASON_NO_WAKE_PAGE: return "There is no wake page below 1 MiB";
+    case N_POWER_REASON_IOMMU: return WORD(S_R_IOMMU);
+    case N_POWER_REASON_NO_S3: return WORD(S_R_NO_S3);
+    case N_POWER_REASON_NO_WAKE_PAGE: return WORD(S_R_NO_WAKE_PAGE);
     case N_POWER_REASON_DEVICE: return detail;
     case N_POWER_REASON_DEVICE_BUSY: return detail;
     case N_POWER_REASON_DEVICE_STUCK: return detail;
-    case N_POWER_REASON_APP_DRIVER: return "An app drives one of the PCI devices";
-    case N_POWER_REASON_DISK_FLUSH: return "A disk did not write its cache back";
-    case N_POWER_REASON_CPU_STOP: return "A processor did not stop";
-    case N_POWER_REASON_FIRMWARE: return "The firmware did not sleep";
-    case N_POWER_REASON_LOW_ROOM: return "There is no room below 1 MiB";
-    case N_POWER_REASON_NOT_ON_DISK: return "C: is not on a disk";
-    case N_POWER_REASON_NO_MEMORY: return "Not enough memory";
-    case N_POWER_REASON_NO_SPACE: return "Not enough free space on C:";
-    case N_POWER_REASON_IMAGE_TOO_LARGE: return "The image did not fit in memory or on C:";
-    case N_POWER_REASON_STORE_WRITE: return "C: could not be written";
+    case N_POWER_REASON_APP_DRIVER: return WORD(S_R_APP_DRIVER);
+    case N_POWER_REASON_DISK_FLUSH: return WORD(S_R_DISK_FLUSH);
+    case N_POWER_REASON_CPU_STOP: return WORD(S_R_CPU_STOP);
+    case N_POWER_REASON_FIRMWARE: return WORD(S_R_FIRMWARE);
+    case N_POWER_REASON_LOW_ROOM: return WORD(S_R_LOW_ROOM);
+    case N_POWER_REASON_NOT_ON_DISK: return WORD(S_R_NOT_ON_DISK);
+    case N_POWER_REASON_NO_MEMORY: return WORD(S_R_NO_MEMORY);
+    case N_POWER_REASON_NO_SPACE: return WORD(S_R_NO_SPACE);
+    case N_POWER_REASON_IMAGE_TOO_LARGE: return WORD(S_R_IMAGE_TOO_LARGE);
+    case N_POWER_REASON_STORE_WRITE: return WORD(S_R_STORE_WRITE);
     default: return "";
     }
 }
@@ -941,26 +977,26 @@ static void power_changed(void) {
     bool restart = p.action == POWER_REBOOT, hibernate = p.action == POWER_HIBERNATE;
     switch (p.stage) {
     case N_POWER_CLOSING:
-        toast(restart ? "Waiting to restart" : "Waiting to shut down", p.detail, 0);
+        toast(WORD(restart ? S_WAIT_RESTART : S_WAIT_SHUT_DOWN), p.detail, 0);
         if (p.forceable) {
-            strlcpy(toast_other, "Choose again to force it", sizeof toast_other);
+            strlcpy(toast_other, WORD(S_FORCE), sizeof toast_other);
             toast_turning = true;
             toast_arm(HINT_MS);
         }
         break;
-    case N_POWER_CANCELLED: toast(restart ? "Restart cancelled" : "Shutdown cancelled", p.detail, TOAST_MS); break;
+    case N_POWER_CANCELLED: toast(WORD(restart ? S_RESTART_CANCELLED : S_SHUT_DOWN_CANCELLED), p.detail, TOAST_MS); break;
     case N_POWER_STOPPING:
-        toast(restart ? "Restarting" : "Shutting down", restart ? "See you in a moment..." : "Good night!", 0);
+        toast(WORD(restart ? S_RESTARTING : S_SHUTTING_DOWN), WORD(restart ? S_RESTART_BYE : S_SHUT_DOWN_BYE), 0);
         break;
-    case N_POWER_SAVING: toast("Hibernating", "Saving the memory to C:", 0); break;
+    case N_POWER_SAVING: toast(WORD(S_HIBERNATING), WORD(S_SAVING), 0); break;
     case N_POWER_REFUSED:
-        toast(hibernate ? "Cannot hibernate" : "Cannot sleep", reason_text(p.reason, p.detail), TOAST_MS);
+        toast(WORD(hibernate ? S_NO_HIBERNATE : S_NO_SLEEP), reason_text(p.reason, p.detail), TOAST_MS);
         break;
     case N_POWER_FAILED:
-        toast(hibernate ? "Hibernation failed" : "Sleep failed", reason_text(p.reason, p.detail), TOAST_MS);
+        toast(WORD(hibernate ? S_HIBERNATE_FAILED : S_SLEEP_FAILED), reason_text(p.reason, p.detail), TOAST_MS);
         break;
     case N_POWER_DEVICE_LOST:
-        toast(p.reason == N_POWER_REASON_IOMMU ? "The IOMMU did not come back from sleep" : "A device did not wake up", p.detail, TOAST_MS);
+        toast(WORD(p.reason == N_POWER_REASON_IOMMU ? S_IOMMU_LOST : S_DEVICE_LOST), p.detail, TOAST_MS);
         break;
     default: break;
     }
@@ -982,7 +1018,7 @@ static void logout_end(void) {
     logging_out = false;
     n_events_unwatch(events, TOKEN_LOGOUT_TIME);
     n_result r = n_session_end();
-    if (r < 0) toast("Could not log out", n_result_text(r), TOAST_MS);
+    if (r < 0) toast(WORD(S_LOGOUT_FAILED), n_result_text(r), TOAST_MS);
 }
 
 static void logout_begin(void) {
@@ -1010,7 +1046,7 @@ static void logout_follow(void) {
 static void logout_stalled(void) {
     if (!logging_out) return;
     logging_out = false;
-    toast("Log out cancelled", windows_count ? windows[windows_count - 1].title : "", TOAST_MS);
+    toast(WORD(S_LOGOUT_CANCELLED), windows_count ? windows[windows_count - 1].title : "", TOAST_MS);
 }
 
 /* ---- ほかのプログラムからの通知（サービス "shell"） ---- */
@@ -1063,11 +1099,21 @@ static void watch_add(n_handle watch, uint64_t token) {
     if (watch >= 0) n_events_watch(events, watch, N_EVENT_RECEIVABLE, token);
 }
 
-static n_handle windows_watch, screen_watch, sound_watch, sound_setting_watch, zone_watch, power_watch;
+static n_handle windows_watch, screen_watch, sound_watch, sound_setting_watch, zone_watch, language_watch, power_watch;
 
 static void setting_watch_drain(n_handle watch) {
     struct n_settings_changed heard;
     while (n_setting_watch_take(watch, &heard) >= 0) {}
+}
+
+/* 言語か書式が変わった：開いている文を描き直す。メニューと音量は閉じ、次に開くときに新しい文で組む。 */
+static void language_changed(void) {
+    language = n_language_now();
+    if (menu) menu_close();
+    if (volume) volume_close();
+    for (size_t i = 0; i < desk_count; i++)
+        if (desks[i].win) desk_paint(&desks[i], i);
+    bar_draw();
 }
 
 static void dispatch(const struct n_event *ev) {
@@ -1105,6 +1151,10 @@ static void dispatch(const struct n_event *ev) {
         setting_watch_drain(zone_watch);
         clock_arm();
         bar_draw();
+        break;
+    case TOKEN_LANGUAGE:
+        setting_watch_drain(language_watch);
+        language_changed();
         break;
     case TOKEN_POWER:
         n_watch_take(power_watch);
@@ -1144,12 +1194,15 @@ int main(void) {
     sound_watch = n_audio_output_watch();
     sound_setting_watch = n_setting_watch(N_DOMAIN_AUDIO, N_SETTING_ANY);
     zone_watch = n_setting_watch(N_DOMAIN_TIME, N_TIME_ZONE_MINUTES);
+    language_watch = n_setting_watch(N_DOMAIN_LANGUAGE, N_SETTING_ANY);
+    language = n_language_now();
     power_watch = n_power_watch(cap);
     watch_add(windows_watch, TOKEN_WINDOWS);
     watch_add(screen_watch, TOKEN_SCREEN);
     watch_add(sound_watch, TOKEN_SOUND);
     watch_add(sound_setting_watch, TOKEN_SOUND_SETTING);
     watch_add(zone_watch, TOKEN_ZONE);
+    watch_add(language_watch, TOKEN_LANGUAGE);
     watch_add(power_watch, TOKEN_POWER);
     programs_read();
     screens_changed();
@@ -1160,7 +1213,7 @@ int main(void) {
     if (n_power_state(cap, &power) >= 0) power_seen = power.serial;
     inlet = n_service_listen(N_SHELL_SERVICE);
     if (inlet >= 0) n_events_watch(events, inlet, N_EVENT_RECEIVABLE, TOKEN_INLET);
-    toast("Welcome to " OS_NAME, "Double-click an icon or open the moon menu.", TOAST_MS);
+    toast(WORD(S_WELCOME), WORD(S_WELCOME_HINT), TOAST_MS);
     for (;;) {
         struct n_event ev[16];
         n_result n = n_events_wait(events, ev, sizeof ev / sizeof *ev, N_CLOCK_NEVER);

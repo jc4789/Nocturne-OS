@@ -36,8 +36,6 @@ int screen_hold_setting_put(uint32_t key, const void *value);
 int64_t screen_hold_setting_get(uint32_t key, void *out, size_t cap);
 int smooth_gradients_setting_put(uint32_t key, const void *value);
 int64_t smooth_gradients_setting_get(uint32_t key, void *out, size_t cap);
-int pointer_speed_setting_put(uint32_t key, const void *value);
-int64_t pointer_speed_setting_get(uint32_t key, void *out, size_t cap);
 int perf_preference_setting_put(uint32_t key, const void *value);
 int64_t perf_preference_setting_get(uint32_t key, void *out, size_t cap);
 int dns_setting_put(uint32_t key, const void *value);

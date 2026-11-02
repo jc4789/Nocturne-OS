@@ -1,7 +1,6 @@
 /* The console, the system log and the null stream (sys/stream.h). */
 #include "kernel.h"
 #include "arch/cpu.h"
-#include "dev/input.h"
 #include "mm/heap.h"
 #include "sys/channel.h"
 #include "sys/log.h"
@@ -137,86 +136,14 @@ struct handle *stream_system_log_open(bool read) {
 
 void stream_system_log_told(void) { object_notify(&log_object); }
 
-/* ---- the console: text on the screen, keys from the keyboard ---- */
+/* ---- the console: text for the serial port and the boot screen; nothing comes from it ---- */
 
-/* The keys typed and not read yet. console_lock guards the ring: the keyboard's interrupt handler
-   (CPU 0) puts keys in and a reader on any CPU takes them, looking under it before it waits in
-   console_wait. It comes before console_wait's lock. */
-#define CONSOLE_INPUT 1024
-#define CONSOLE_PIECE 256 /* bytes a read into an app's memory takes at a time */
-static struct spinlock console_lock;
-static char console_in[CONSOLE_INPUT];
-static size_t console_head, console_tail, console_count;
-static struct wait_queue console_wait;
 static const struct object_ops console_ops;
 static struct object console_object = {.ops = &console_ops};
 
-static void console_input_char(char c) {
-    uint64_t flags = spin_lock(&console_lock);
-    if (console_count < CONSOLE_INPUT) {
-        console_in[console_head] = c;
-        console_head = (console_head + 1) % CONSOLE_INPUT;
-        console_count++;
-    }
-    spin_unlock(&console_lock, flags);
-    wq_wake_all(&console_wait);
-    object_notify(&console_object);
-}
-
-static void console_input_str(const char *s) {
-    while (*s) console_input_char(*s++);
-}
-
-void console_key(const struct key_event *e) {
-    if (!e->pressed) return;
-    uint16_t k = e->key;
-    if (k < 0x80) {
-        char c = (char)k;
-        if ((e->mods & MOD_CTRL) && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) c &= 0x1F;
-        console_input_char(c);
-        return;
-    }
-    switch (k) {
-    case KEY_UP: console_input_str("\x1b[A"); break;
-    case KEY_DOWN: console_input_str("\x1b[B"); break;
-    case KEY_RIGHT: console_input_str("\x1b[C"); break;
-    case KEY_LEFT: console_input_str("\x1b[D"); break;
-    case KEY_HOME: console_input_str("\x1b[H"); break;
-    case KEY_END: console_input_str("\x1b[F"); break;
-    case KEY_DELETE: console_input_str("\x1b[3~"); break;
-    case KEY_PGUP: console_input_str("\x1b[5~"); break;
-    case KEY_PGDN: console_input_str("\x1b[6~"); break;
-    default: break;
-    }
-}
-
-/* An app's read takes at most CONSOLE_PIECE bytes, into the kernel under the lock and then out to
-   its memory, which is looked at first: only a sibling unmapping the buffer meanwhile loses them. */
 static int64_t console_read(struct handle *h, void *buf, size_t n, bool user, bool wait) {
-    (void)h;
-    char piece[CONSOLE_PIECE];
-    if (!n) return 0;
-    if (user && !user_ok_w(buf, MIN(n, sizeof piece))) return -N_ERR_BAD_ADDRESS;
-    for (;;) {
-        uint64_t flags = spin_lock(&console_lock);
-        if (console_count) {
-            size_t got = MIN(n, console_count);
-            if (user) got = MIN(got, sizeof piece);
-            char *out = user ? piece : buf;
-            size_t first = MIN(got, CONSOLE_INPUT - console_tail);
-            memcpy(out, console_in + console_tail, first);
-            memcpy(out + first, console_in, got - first);
-            console_tail = (console_tail + got) % CONSOLE_INPUT;
-            console_count -= got;
-            spin_unlock(&console_lock, flags);
-            if (user && copy_to_user(buf, piece, got) < 0) return -N_ERR_BAD_ADDRESS;
-            return (int64_t)got;
-        }
-        if (!wait) { spin_unlock(&console_lock, flags); return -N_ERR_NOT_READY; }
-        if (thread_current()->killed) { spin_unlock(&console_lock, flags); return -N_ERR_STOPPED; }
-        wq_wait_locked(&console_wait, &console_lock);
-        irq_restore(flags);
-    }
+    (void)h; (void)buf; (void)n; (void)user; (void)wait;
+    return 0;
 }
 
 /* The console's text goes into the log as text of its own, which the serial port and the boot
@@ -228,7 +155,7 @@ static int64_t console_write(struct handle *h, const void *buf, size_t n, bool u
 }
 static uint32_t console_ready(struct handle *h) {
     (void)h;
-    return N_EVENT_SENDABLE | (console_count ? N_EVENT_RECEIVABLE : 0);
+    return N_EVENT_SENDABLE | N_EVENT_RECEIVABLE;
 }
 static const struct object_ops console_ops = {
     .kind = N_KIND_DEVICE, .read = console_read, .write = console_write, .ready = console_ready,

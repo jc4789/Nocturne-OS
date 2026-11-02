@@ -22252,6 +22252,10 @@ static const char js_locale[] =
 "    Object.defineProperty(String.prototype, 'localeCompare', {value: methods.localeCompare, writable: true, configurable: true});\n"
 "})();\n"
 "\n"
+"    /* ECMA-402 DefaultLocale: the user's language (settings' N_LANGUAGE_UI). */\n"
+"    for (const service of [Intl.NumberFormat, Intl.DateTimeFormat, Intl.PluralRules, Intl.RelativeTimeFormat,\n"
+"                           Intl.ListFormat, Intl.DisplayNames, Intl.Segmenter, Intl.Collator])\n"
+"        if (service && Object.hasOwn(service, '__defaultLocale')) service.__defaultLocale = host.intlLocale;\n"
 "})\n";
 static const char js_webaudio[] =
 "/* The Web Audio API (https://webaudio.github.io/web-audio-api/) over the browser's own\n"

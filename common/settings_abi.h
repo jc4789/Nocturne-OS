@@ -11,6 +11,7 @@
 #ifndef COMMON_SETTINGS_ABI_H
 #define COMMON_SETTINGS_ABI_H
 #include <stdint.h>
+#include "input_abi.h"
 
 enum n_setting_domain {
     N_DOMAIN_BOOT,
@@ -21,6 +22,7 @@ enum n_setting_domain {
     N_DOMAIN_POWER,
     N_DOMAIN_NETWORK,
     N_DOMAIN_TIME,
+    N_DOMAIN_LANGUAGE,
     N_DOMAIN_COUNT
 };
 
@@ -58,11 +60,22 @@ enum n_window_key {
     N_WINDOW_KEY_COUNT
 };
 
-/* N_DOMAIN_INPUT：gui/wm のポインター */
+/* N_DOMAIN_INPUT：dev/input。既定は利用者ごと。N_INPUT_DEVICE は装置ごとの選択で、欄が既定より勝つ。 */
 enum n_input_key {
     N_INPUT_POINTER_SPEED,      /* N_SETTING_INT -2..2 */
+    N_INPUT_POINTER_ACCEL,      /* N_SETTING_BOOL：速く動かすと大きく進む */
+    N_INPUT_SCROLL_NATURAL,     /* N_SETTING_BOOL：ホイールの向きを逆にする */
+    N_INPUT_DOUBLE_CLICK_MS,    /* N_SETTING_INT：続けて押して一続きとみなす間隔 */
+    N_INPUT_REPEAT_DELAY_MS,    /* N_SETTING_INT：押し続けて繰返しが始まるまで */
+    N_INPUT_REPEAT_INTERVAL_MS, /* N_SETTING_INT：繰返しの間隔 */
+    N_INPUT_LAYOUT,             /* N_SETTING_ENUM：enum n_key_layout。カーネルは事象に写すだけ */
+    N_INPUT_DEVICE,             /* N_SETTING_INPUT_DEVICE の記録の並び。適用は一件ずつ */
     N_INPUT_KEY_COUNT
 };
+/* 既定の値。時間は 1 以上。 */
+#define N_INPUT_REPEAT_DELAY_DEFAULT 500
+#define N_INPUT_REPEAT_INTERVAL_DEFAULT 33
+#define N_INPUT_DOUBLE_CLICK_DEFAULT 450
 
 /* N_DOMAIN_POWER：arch/idle */
 enum n_power_key {
@@ -90,15 +103,17 @@ enum n_setting_type {
     N_SETTING_MONITOR_MODE, /* struct n_setting_monitor_mode */
     N_SETTING_MONITOR_PLACE, /* struct n_setting_monitor_place */
     N_SETTING_DEVICE        /* uint64_t：装置の番号（n_setting_device）。0 は無し */
+    N_SETTING_INPUT_DEVICE  /* 可変長：struct n_setting_input_device の記録（input_abi.h） */
 };
 
 #define N_SETTING_LIST 1u       /* SYS_SETTINGS_EFFECTIVE は size の倍数の一覧を返す */
 #define N_SETTING_AT_START 2u   /* 適用は次の起動から効く */
+#define N_SETTING_RECORDS 4u    /* 一つの値の大きさが無い：値は自分の長さを持つ記録 */
 
 /* SYS_SETTINGS_DESCRIBE の答え。 */
 struct n_setting_desc {
     uint32_t type;   /* enum n_setting_type */
-    uint32_t size;   /* 一つの値のバイト数 */
+    uint32_t size;   /* 一つの値のバイト数。N_SETTING_RECORDS は 0 */
     uint32_t flags;  /* N_SETTING_* */
     uint32_t reserved;
     int64_t low, high; /* BOOL と INT の範囲 */
@@ -162,6 +177,21 @@ enum n_network_setting_key {
 struct n_setting_ipv4 {
     uint32_t ip, mask, gateway;
 };
+
+/* N_DOMAIN_LANGUAGE：カーネルに持ち主が無い。読むのは libc（nocturne_language.h）。 */
+enum n_language_setting_key {
+    N_LANGUAGE_UI,           /* N_SETTING_ENUM：enum n_language。文の言葉と Intl の言語 */
+    N_LANGUAGE_REGION,       /* N_SETTING_ENUM：enum n_region */
+    N_LANGUAGE_DATE_ORDER,   /* N_SETTING_ENUM：enum n_date_order */
+    N_LANGUAGE_CLOCK,        /* N_SETTING_ENUM：enum n_clock_style */
+    N_LANGUAGE_NUMBER,       /* N_SETTING_ENUM：enum n_number_style */
+    N_LANGUAGE_LOGIN,        /* N_SETTING_ENUM：enum n_language。機械の値で、ログインの窓の言葉 */
+};
+enum n_language { N_LANGUAGE_JAPANESE, N_LANGUAGE_ENGLISH, N_LANGUAGE_COUNT };
+enum n_region { N_REGION_JAPAN, N_REGION_US, N_REGION_UK, N_REGION_COUNT };
+enum n_date_order { N_DATE_OF_REGION, N_DATE_YMD, N_DATE_MDY, N_DATE_DMY };
+enum n_clock_style { N_CLOCK_OF_REGION, N_CLOCK_24, N_CLOCK_12 };
+enum n_number_style { N_NUMBER_OF_REGION, N_NUMBER_COMMA_POINT, N_NUMBER_POINT_COMMA, N_NUMBER_SPACE_COMMA };
 
 #define N_DOMAIN_PROGRAM 0xffffffffu /* プログラムの scope の鍵の領域。適用の相手が無い。 */
 

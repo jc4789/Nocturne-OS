@@ -1,7 +1,6 @@
 /* セッションのサービス：ログインの窓を出し、選ばれた利用者の身元でデスクトップのシェルを起こす。
    シェルの名前の口はそのセッションの中でだけ引ける（§14）。一度に一つのセッション。
-   シェルが落ちたら起こし直す。N_SESSION_END でシェルとその子を止め、窓へ戻る。
-   画面の無い起動（nogui）では、窓の代わりにコンソールで聞いて、利用者の身元で sh を起こす。 */
+   シェルが落ちたら起こし直す。N_SESSION_END でシェルとその子を止め、窓へ戻る。 */
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,11 +9,29 @@
 #include "nocturne.h"
 #include "nocturne_services.h"
 #include "nocturne_settings.h"
+#include "settings_abi.h"
 #include "ui.h"
 
 #define CONSOLE N_FOLDER_SYSTEM "\\sh"
 #define DESKTOP N_FOLDER_SYSTEM "\\shell"
 #define WINDOW 1u
+
+/* ログインの窓の文。行は enum n_language の順。 */
+enum login_word { L_WELCOME, L_LOG_IN, L_FIRST_USER, L_NAME, L_PASSWORD, L_PASSWORD_AGAIN, L_CREATE, L_DIFFER, L_CANNOT_MAKE, L_WRONG };
+static const char *const login_words[][N_LANGUAGE_COUNT] = {
+    [L_WELCOME] = {"Nocturne へようこそ", "Welcome to Nocturne"},
+    [L_LOG_IN] = {"ログイン", "Log in"},
+    [L_FIRST_USER] = {"最初の利用者を作ります。この利用者が機械を管理します。", "Make the first user. This user manages the machine."},
+    [L_NAME] = {"名前", "Name"},
+    [L_PASSWORD] = {"合言葉", "Password"},
+    [L_PASSWORD_AGAIN] = {"合言葉をもう一度", "Password again"},
+    [L_CREATE] = {"作る", "Create"},
+    [L_DIFFER] = {"合言葉が違います", "The passwords differ"},
+    [L_CANNOT_MAKE] = {"この利用者は作れません", "This user cannot be made"},
+    [L_WRONG] = {"合言葉が合いません", "That is not the password"},
+};
+static uint32_t login_language;
+#define WORD(w) login_words[w][login_language]
 
 static n_handle grant_cap, shell_cap;
 static mtx_t current_lock;
@@ -192,10 +209,10 @@ static void login_show(struct login *l) {
     struct ui_msg m;
     ui_view(&m, WINDOW);
     ui_node(&m, "column"); ui_num(&m, "padding", 24); ui_num(&m, "gap", 12);
-    ui_node(&m, "text"); ui_str(&m, "text", first_user ? "Welcome to Nocturne" : "Log in"); ui_str(&m, "style", "heading"); ui_end(&m);
+    ui_node(&m, "text"); ui_str(&m, "text", WORD(first_user ? L_WELCOME : L_LOG_IN)); ui_str(&m, "style", "heading"); ui_end(&m);
     if (first_user) {
         ui_node(&m, "text"); ui_str(&m, "text", "Make the first user. This user administers the machine."); ui_num(&m, "wrap", 1); ui_end(&m);
-        l->name_node = ui_node(&m, "field"); ui_str(&m, "value", l->name); ui_str(&m, "placeholder", "Name"); ui_end(&m);
+        l->name_node = ui_node(&m, "field"); ui_str(&m, "value", l->name); ui_str(&m, "placeholder", WORD(L_NAME)); ui_end(&m);
     } else {
         l->first_item = m.nodes;
         for (n_result i = 0; i < l->count; i++) {
@@ -204,22 +221,22 @@ static void login_show(struct login *l) {
             ui_end(&m);
         }
     }
-    l->password_node = ui_node(&m, "field"); ui_str(&m, "value", l->password); ui_str(&m, "placeholder", "Password");
+    l->password_node = ui_node(&m, "field"); ui_str(&m, "value", l->password); ui_str(&m, "placeholder", WORD(L_PASSWORD));
     ui_num(&m, "secret", 1); ui_end(&m);
     if (first_user) {
-        l->confirm_node = ui_node(&m, "field"); ui_str(&m, "value", l->confirm); ui_str(&m, "placeholder", "Password again");
+        l->confirm_node = ui_node(&m, "field"); ui_str(&m, "value", l->confirm); ui_str(&m, "placeholder", WORD(L_PASSWORD_AGAIN));
         ui_num(&m, "secret", 1); ui_end(&m);
     }
     if (l->error[0]) {
         ui_node(&m, "text"); ui_str(&m, "text", l->error); ui_num(&m, "colour", ui_theme.danger); ui_end(&m);
     }
-    l->go_node = ui_node(&m, "button"); ui_str(&m, "text", first_user ? "Create" : "Log in"); ui_str(&m, "variant", "primary"); ui_end(&m);
+    l->go_node = ui_node(&m, "button"); ui_str(&m, "text", WORD(first_user ? L_CREATE : L_LOG_IN)); ui_str(&m, "variant", "primary"); ui_end(&m);
     ui_end(&m);
     ui_send(l->ui, &m);
 }
 
-static void login_error(struct login *l, const char *what, n_result r) {
-    snprintf(l->error, sizeof l->error, "%s: %s", what, n_result_text(r));
+static void login_error(struct login *l, const char *what) {
+    strlcpy(l->error, what, sizeof l->error);
     memset(l->password, 0, sizeof l->password);
     memset(l->confirm, 0, sizeof l->confirm);
 }
@@ -232,19 +249,19 @@ static bool login_go(struct login *l, struct n_account *out) {
     n_result r;
     if (!l->count) {
         if (strcmp(l->password, l->confirm)) {
-            login_error(l, "The passwords differ", -N_ERR_INVALID);
+            login_error(l, WORD(L_DIFFER));
             return false;
         }
         q.op = N_ACCOUNTS_CREATE;
         q.cls = N_CLASS_ADMIN;
         strlcpy(q.name, l->name, sizeof q.name);
         r = n_accounts_call(&q, &reply);
-        if (r < 0) login_error(l, "This user cannot be made", r);
+        if (r < 0) login_error(l, WORD(L_CANNOT_MAKE));
     } else {
         q.op = N_ACCOUNTS_VERIFY;
         strlcpy(q.name, l->accounts[l->chosen].name, sizeof q.name);
         r = n_accounts_call(&q, &reply);
-        if (r < 0) login_error(l, "That is not the password", r);
+        if (r < 0) login_error(l, WORD(L_WRONG));
     }
     memset(&q, 0, sizeof q);
     if (r < 0) return false;
@@ -254,6 +271,9 @@ static bool login_go(struct login *l, struct n_account *out) {
 
 static bool login_window(struct n_account *out) {
     struct login l = {.chosen = 0};
+    int32_t language;
+    login_language = n_setting_get_int(n_setting_at(N_DOMAIN_LANGUAGE, N_LANGUAGE_LOGIN), &language) >= 0 &&
+                     language >= 0 && language < N_LANGUAGE_COUNT ? (uint32_t)language : N_LANGUAGE_JAPANESE;
     l.count = n_accounts_list(&l.accounts);
     if (l.count < 0) {
         printf("session: no list of users (%s)\n", n_result_text(l.count));
@@ -301,37 +321,6 @@ static bool login_window(struct n_account *out) {
     return done;
 }
 
-/* ---- コンソールのログイン ---- */
-static bool console_line(const char *prompt, char *out, size_t cap) {
-    printf("%s", prompt);
-    fflush(stdout);
-    if (!fgets(out, (int)cap, stdin)) return false;
-    out[strcspn(out, "\r\n")] = 0;
-    return true;
-}
-
-static bool console_login(struct n_account *out) {
-    struct n_accounts_request q = {0};
-    struct n_accounts_reply reply;
-    struct n_account *list;
-    n_result count = n_accounts_list(&list);
-    if (count < 0) return false;
-    free(list);
-    if (!count) printf("Make the first user. This user administers the machine.\n");
-    if (!console_line("Name: ", q.name, sizeof q.name) || !console_line("Password: ", q.password, sizeof q.password)) return false;
-    q.op = count ? N_ACCOUNTS_VERIFY : N_ACCOUNTS_CREATE;
-    q.cls = N_CLASS_ADMIN;
-    n_result r = n_accounts_call(&q, &reply);
-    memset(&q, 0, sizeof q);
-    if (r < 0) {
-        printf("%s\n", n_result_text(r));
-        fflush(stdout);
-        return false;
-    }
-    *out = reply.account;
-    return true;
-}
-
 int main(void) {
     n_result r = mtx_init(&current_lock, mtx_plain) == thrd_success ? 0 : -N_ERR_NO_MEMORY;
     if (r >= 0) r = grant_cap = n_cap_find(N_CAP_IDENTITY_GRANT);
@@ -350,7 +339,12 @@ int main(void) {
     struct n_account account;
     bool automatic = auto_account(&account); /* 自動で入るのは起動の一度だけ */
     for (;;) {
-        if (!automatic && !(windows ? login_window(&account) : console_login(&account))) continue;
+        if (!automatic && !windows) {
+            /* 画面が無ければ打つ窓も無い：自動で入る利用者がいない機械はここで待つ */
+            n_sleep_until(N_CLOCK_NEVER);
+            continue;
+        }
+        if (!automatic && !login_window(&account)) continue;
         automatic = false;
         session_run(&account, windows);
     }

@@ -429,7 +429,6 @@ static void desk_wake(void) {
 /* The user's (struct desktop_settings): pointer speed with its leftover quarter steps, and smooth
    gradients as the user wants them; the desktop thread applies them while screen 0 takes them
    (fb_dither_able). Told by sys/settings.h, and not saved here. Under wm_lock. */
-static int pointer_speed, pointer_rest_x, pointer_rest_y;
 static bool deep_wanted;
 /* What SYS_SCREEN_INFO reports changed: its watches (SCREEN_WATCH) hear of it. From wm_init on;
    without the desktop there is none. seen_dither_able and seen_boot are screen 0 as the desktop
@@ -471,9 +470,9 @@ static bool resize_visible;
 static struct window *hover_win;
 static int hover_btn; /* 0 none, 1 close, 2 max, 3 min */
 
-#define DOUBLE_CLICK_NS (450 * NS_PER_MS)
-static uint64_t last_click; /* clock ns of the last left press, 0 after a double click */
-static int last_click_x, last_click_y;
+static uint64_t last_click;      /* clock ns of the last press */
+static int last_click_x, last_click_y, last_click_button;
+static uint32_t press_clicks = 1; /* the press being applied: how many in a row, the EV_MOUSE_DOWN's clicks */
 
 /* The window under the pointer, told EV_MOUSE_LEAVE when it leaves one of the shell's layers. */
 static struct window *pointer_over;
@@ -482,7 +481,7 @@ static struct window *pointer_over;
    press went there, so its release goes nowhere. */
 struct hotkey {
     struct window *w;
-    uint32_t key, mods;
+    uint32_t usage, mods;
     bool held;
 };
 static struct hotkey *hotkeys;
@@ -706,7 +705,8 @@ out:
 static void send_simple(struct window *w, int type) { push_event(w, &(struct gui_event){.type = (uint32_t)type}); }
 
 static void send_mouse(struct window *w, int type, int buttons) {
-    struct gui_event e = {.type = (uint32_t)type, .x = mx - client_x(w), .y = my - client_y(w), .buttons = (uint32_t)buttons};
+    struct gui_event e = {.type = (uint32_t)type, .x = mx - client_x(w), .y = my - client_y(w), .buttons = (uint32_t)buttons,
+                          .clicks = type == EV_MOUSE_DOWN ? press_clicks : 0};
     push_event(w, &e);
 }
 
@@ -1121,44 +1121,20 @@ void wm_screen_info_changed(void) {
     if (screen_watchable) watched_changed(&screen_watched);
 }
 
-/* ---- the desktop's settings (N_DOMAIN_INPUT, N_DOMAIN_WINDOW) ---- */
+/* ---- the desktop's settings (N_DOMAIN_WINDOW) ---- */
 
-
-/* The pointer's speed (-2 to 2) and smooth gradients wanted, wm_lock held: the watches hear of it. */
-static void desktop_settings_put(int speed, bool smooth) {
-    if (speed == pointer_speed && smooth == deep_wanted) return;
-    if (speed != pointer_speed) {
-        pointer_rest_x = pointer_rest_y = 0;
-        settings_changed(N_DOMAIN_INPUT);
-    }
-    if (smooth != deep_wanted) settings_changed(N_DOMAIN_WINDOW);
-    pointer_speed = speed;
-    deep_wanted = smooth;
-    desk_wake();
-    wm_screen_info_changed();
-}
-
-int pointer_speed_setting_put(uint32_t key, const void *value) {
-    int32_t v;
-    memcpy(&v, value, sizeof v);
-    wm_lock();
-    desktop_settings_put(v, deep_wanted);
-    wm_unlock();
-    return 0;
-}
-
-int64_t pointer_speed_setting_get(uint32_t key, void *out, size_t cap) {
-    wm_lock();
-    int v = pointer_speed;
-    wm_unlock();
-    return setting_int(out, cap, v);
-}
 
 int smooth_gradients_setting_put(uint32_t key, const void *value) {
     int32_t v;
     memcpy(&v, value, sizeof v);
+    bool smooth = v != 0;
     wm_lock();
-    desktop_settings_put(pointer_speed, v != 0);
+    if (smooth != deep_wanted) {
+        settings_changed(N_DOMAIN_WINDOW);
+        deep_wanted = smooth;
+        desk_wake();
+        wm_screen_info_changed();
+    }
     wm_unlock();
     return 0;
 }
@@ -1850,6 +1826,7 @@ static struct in_ev inq[INQ];
 static unsigned in_head, in_tail;
 static uint64_t released[65536 / 64];
 static bool any_released;
+static uint32_t released_layout;
 static uint64_t in_lost;
 
 static bool key_released(uint16_t key) { return released[key / 64] >> (key % 64) & 1; }
@@ -1863,9 +1840,11 @@ static unsigned ring_room(void) { return (in_tail + INQ - in_head - 1) % INQ; }
 
 static void input_put(const struct in_ev *e) {
     uint64_t f = spin_lock(&in_lock);
-    if (e->is_key && key_released(e->k.key) && ring_room() >= 2) {
-        ring_put(&(struct in_ev){.is_key = true, .k = {e->k.key, e->k.mods, false, e->k.time_ns}});
-        released[e->k.key / 64] &= ~(1ull << (e->k.key % 64));
+    if (e->is_key && key_released(e->k.usage) && ring_room() >= 2) {
+        struct key_event up = e->k;
+        up.pressed = false;
+        ring_put(&(struct in_ev){.is_key = true, .k = up});
+        released[e->k.usage / 64] &= ~(1ull << (e->k.usage % 64));
     }
     if (ring_room()) {
         ring_put(e);
@@ -1879,8 +1858,9 @@ static void input_put(const struct in_ev *e) {
             last->m.x = e->m.x;
             last->m.y = e->m.y;
             last->m.time_ns = e->m.time_ns;
-        } else if (e->is_key && !e->k.pressed) {
-            released[e->k.key / 64] |= 1ull << (e->k.key % 64);
+        } else if (e->is_key && !e->k.pressed && e->k.usage) {
+            released[e->k.usage / 64] |= 1ull << (e->k.usage % 64);
+            released_layout = e->k.layout;
             any_released = true;
         } else {
             in_lost++;
@@ -1973,17 +1953,17 @@ static void cycle_windows(void) {
 
 /* The hot key's window takes a press that is one (and its release goes with it). */
 static bool hotkey_take(const struct key_event *k) {
-    uint32_t mods = k->mods & (MOD_SHIFT | MOD_CTRL | MOD_ALT);
+    uint32_t mods = k->mods & (NMOD_SHIFT | NMOD_CTRL | NMOD_ALT);
     for (size_t i = 0; i < nhotkeys; i++) {
         struct hotkey *h = &hotkeys[i];
-        if (h->key != k->key) continue;
+        if (h->usage != k->usage) continue;
         if (!k->pressed && h->held) {
             h->held = false;
             return true;
         }
         if (!k->pressed || h->mods != mods) continue;
         h->held = true;
-        push_event(h->w, &(struct gui_event){.type = EV_HOTKEY, .key = k->key, .mods = mods, .pressed = 1});
+        push_event(h->w, &(struct gui_event){.type = EV_HOTKEY, .usage = k->usage, .layout = k->layout, .mods = mods, .pressed = 1});
         return true;
     }
     return false;
@@ -1993,18 +1973,19 @@ static void handle_key(const struct key_event *k) {
     if (hotkey_take(k)) return;
     struct window *f = focused();
     if (k->pressed) {
-        bool alt = k->mods & MOD_ALT;
-        if (alt && k->key == KEY_TAB) {
+        bool alt = k->mods & NMOD_ALT;
+        if (alt && k->usage == N_USAGE_TAB) {
             cycle_windows();
             return;
         }
-        if (alt && k->key == KEY_F4) {
+        if (alt && k->usage == N_USAGE_F4) {
             if (f) send_simple(f, EV_CLOSE);
             return;
         }
     }
     if (f) {
-        struct gui_event e = {.type = EV_KEY, .key = k->key, .mods = k->mods, .pressed = k->pressed};
+        struct gui_event e = {.type = EV_KEY, .key = k->text, .usage = k->usage, .layout = k->layout, .mods = k->mods,
+                              .pressed = k->pressed};
         push_event(f, &e);
     }
 }
@@ -2073,14 +2054,21 @@ static void update_hover(void) {
     pointer_update();
 }
 
-/* The left button went down at the clock's at: a double click when the last press was less than
-   DOUBLE_CLICK_NS before it, at about the same place. */
-static void left_press(uint64_t at) {
-    bool dbl = at - last_click < DOUBLE_CLICK_NS && ABS(mx - last_click_x) < 6 && ABS(my - last_click_y) < 6;
-    last_click = dbl ? 0 : at;
+/* A button went down at the clock's at: one more click in a row when the last press was of the same button,
+   less than the double click's time before it, at about the same place. */
+static void count_click(int button, uint64_t at) {
+    bool more = button == last_click_button && at - last_click < input_double_click_ns() &&
+                ABS(mx - last_click_x) < 6 && ABS(my - last_click_y) < 6;
+    press_clicks = more ? press_clicks + 1 : 1;
+    last_click = at;
+    last_click_button = button;
     last_click_x = mx;
     last_click_y = my;
+}
 
+/* The left button went down. */
+static void left_press(void) {
+    bool dbl = press_clicks % 2 == 0;
     struct window *w = window_at(mx, my);
     if (w) {
         if (w != focused() && !w->no_focus) raise_window(w);
@@ -2159,27 +2147,13 @@ static bool on_desktop(int x, int y) {
 
 /* A pointer move or button that came at the clock's at. */
 static void handle_mouse(const struct mouse_event *m, uint64_t at) {
-    int dx = m->dx, dy = m->dy;
+    int dx = m->dx, dy = m->dy; /* dev/input.c has scaled a relative move */
     if (m->absolute) {
         /* a tablet-style pointer (a USB tablet's, a hypervisor's): exactly where it says, over the main screen */
         struct wscreen *main = screen_main();
         dx = (main ? main->x : 0) + (int)((int64_t)m->x * (sw - 1) / MOUSE_ABS_MAX) - mx;
         dy = (main ? main->y : 0) + (int)((int64_t)m->y * (sh - 1) / MOUSE_ABS_MAX) - my;
     } else {
-        /* mild acceleration */
-        if (ABS(dx) > 5) dx *= 2;
-        if (ABS(dy) > 5) dy *= 2;
-        /* pointer speed in quarters: x0.5, x0.75, x1, x1.5, x2; slow moves keep their remainder */
-        static const int quarters[5] = {2, 3, 4, 6, 8};
-        int q = quarters[pointer_speed + 2];
-        if (q != 4) {
-            pointer_rest_x += dx * q;
-            pointer_rest_y += dy * q;
-            dx = pointer_rest_x / 4;
-            dy = pointer_rest_y / 4;
-            pointer_rest_x -= dx * 4;
-            pointer_rest_y -= dy * 4;
-        }
     }
     int ox = mx, oy = my;
     if (dx || dy) {
@@ -2231,13 +2205,18 @@ static void handle_mouse(const struct mouse_event *m, uint64_t at) {
 
     int changed = old_buttons ^ mbuttons;
     if (changed & 1) {
-        if (mbuttons & 1) left_press(at);
-        else left_release();
+        if (mbuttons & 1) {
+            count_click(1, at);
+            left_press();
+        } else {
+            left_release();
+        }
         update_hover();
     }
     if (changed & 6) {
         /* right / middle buttons go straight to the window under the cursor */
         struct window *w = drag_mode == DRAG_CLIENT ? drag_win : window_at(mx, my);
+        if (mbuttons & changed & 6) count_click(mbuttons & changed & 6, at);
         if (w && in_rect(mx, my, client_x(w), client_y(w), w->cw, w->ch)) {
             if (w != focused() && !w->no_focus && (mbuttons & 6)) raise_window(w);
             send_mouse(w, (mbuttons & changed & 6) ? EV_MOUSE_DOWN : EV_MOUSE_UP, mbuttons);
@@ -2277,7 +2256,7 @@ static void desktop_thread(void *arg) {
         uint16_t key;
         while (input_take_release(&key)) {
             input_at = clock_now_ns();
-            handle_key(&(struct key_event){.key = key, .pressed = false, .time_ns = input_at});
+            handle_key(&(struct key_event){.usage = key, .layout = released_layout, .pressed = false, .time_ns = input_at});
         }
         input_at = 0;
         pointer_update();
@@ -3121,7 +3100,6 @@ static int64_t sys_screen_info(uint64_t a, uint64_t b, uint64_t c) {
         if (b != sizeof(struct desktop_settings)) return -N_ERR_INVALID;
         wm_lock();
         struct desktop_settings ds = {
-            .pointer_speed = (int8_t)pointer_speed,
             .smooth_gradients = deep_wanted,
             .smooth_gradients_available = fb_dither_able(),
         };
@@ -3303,8 +3281,8 @@ static int64_t shell_window(uint64_t id, uint64_t op) {
 }
 
 /* SYS_SHELL_HOTKEY. */
-static int64_t shell_hotkey(int window, uint64_t key, uint64_t mods) {
-    if (mods & ~(uint64_t)(MOD_SHIFT | MOD_CTRL | MOD_ALT)) return -N_ERR_INVALID;
+static int64_t shell_hotkey(int window, uint64_t usage, uint64_t mods) {
+    if (usage < N_USAGE_FIRST || usage > 0xFFFF || mods & ~(uint64_t)(NMOD_SHIFT | NMOD_CTRL | NMOD_ALT)) return -N_ERR_INVALID;
     struct handle *handle = handle_get(window);
     if (!handle) return -N_ERR_NO_HANDLE;
     int64_t result = -N_ERR_WRONG_KIND;
@@ -3314,9 +3292,9 @@ static int64_t shell_hotkey(int window, uint64_t key, uint64_t mods) {
         if (w) {
             bool taken = false;
             for (size_t i = 0; i < nhotkeys; i++)
-                taken |= hotkeys[i].key == key && hotkeys[i].mods == mods;
+                taken |= hotkeys[i].usage == usage && hotkeys[i].mods == mods;
             struct hotkey *h = taken ? NULL : kappend(&hotkeys, &nhotkeys, &hotkeys_room, sizeof *h);
-            if (h) *h = (struct hotkey){.w = w, .key = (uint32_t)key, .mods = (uint32_t)mods};
+            if (h) *h = (struct hotkey){.w = w, .usage = (uint32_t)usage, .mods = (uint32_t)mods};
             result = taken ? -N_ERR_EXISTS : h ? 0 : -N_ERR_NO_MEMORY;
         }
         wm_unlock();
