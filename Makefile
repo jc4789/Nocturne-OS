@@ -362,7 +362,7 @@ $(BUILD)/tests/media_cenc_test $(BUILD)/tests/nvk_contracttest $(BUILD)/tests/nv
 	@mkdir -p $(dir $@)
 	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< $(TEST_OBJ) --start-lib @$(LIBC_RSP) --end-lib -o $@
 
-CXX_HEADERS := $(shell find user/include -type f) common/abi.h common/authority_abi.h common/services_abi.h common/settings_abi.h common/gfx.h
+CXX_HEADERS := $(shell find user/include -type f) common/abi.h common/authority_abi.h common/services_abi.h common/settings_abi.h common/input_abi.h common/gfx.h
 # One producer owns the archive and all generated members. A missing member
 # re-enters the incremental builder once even when its archive still exists.
 $(BUILD)/cxx/libc++.a $(CXX_RUNTIME_OBJ) &: scripts/build_cxx.py $(CXX_HEADERS)
@@ -539,7 +539,7 @@ $(BUILD)/sdk.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC
 		$(shell find user/include ports/tcc/include third_party/bearssl/inc ports/nvidia/include $(TCC_DIR)/include -name '*.h') \
 		third_party/quickjs/quickjs.h $(shell find user/libc -name '*.h' -o -name '*.inc' -o -name '*.js') \
 		$(LXB_HEADERS) ports/lexbor/include/memory.h third_party/lexbor/headers.list \
-		common/abi.h common/authority_abi.h common/services_abi.h common/settings_abi.h common/gfx.h common/gpu_abi.h common/display_abi.h user/user.ld \
+		common/abi.h common/authority_abi.h common/services_abi.h common/settings_abi.h common/input_abi.h common/gfx.h common/gpu_abi.h common/display_abi.h user/user.ld \
 		$(wildcard user/apps/*.c user/apps/*.h user/apps/*.js user/apps/*.ts) $(LLVM_SDK_FILES)
 	@echo "  SDK"
 	@BUILD="$(BUILD)" bash scripts/mksdk.sh $(SDK) $(if $(LLVM_SDK),--llvm $(LLVM_SDK)) $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ) --wasmrt $(WASM_RT_OBJ)

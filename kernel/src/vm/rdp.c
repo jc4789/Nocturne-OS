@@ -24,6 +24,7 @@
 #include "dev/input.h"
 #include "gui/wm.h"
 #include "vm/hv/hvsock.h"
+#include "vm/set1.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
 #include "sys/thread.h"
@@ -798,10 +799,12 @@ static int push_updates(struct rdp *c) {
 
 /* ---- input ---- */
 
-/* One key in one call, its 0xE0 with it. A key after 0xE1 (Pause) goes as the plain key: set 1
-   has nothing else for it (dev/input.c). */
+static struct input_device rdp_input = {.id = "rdp", .kinds = N_INPUT_KEYBOARD | N_INPUT_POINTER};
+
+/* One key in one call, its 0xE0 with it. */
 static void key(bool extended, bool release, uint8_t code) {
-    input_key_set1((uint8_t)((code & 0x7F) | (release ? 0x80 : 0)), extended, clock_now_ns());
+    uint16_t usage = set1_usage(code, extended);
+    if (usage) input_key(&rdp_input, usage, !release, clock_now_ns());
 }
 
 static void mouse(struct rdp *c, uint16_t flags, int x, int y, bool extended) {
@@ -816,7 +819,7 @@ static void mouse(struct rdp *c, uint16_t flags, int x, int y, bool extended) {
         }
         if (!e.wheel) return;
         e.buttons = (uint8_t)c->mouse_buttons;
-        input_mouse(&e);
+        input_mouse(&rdp_input, &e);
         return;
     }
     e.absolute = true;
@@ -833,7 +836,7 @@ static void mouse(struct rdp *c, uint16_t flags, int x, int y, bool extended) {
         }
     }
     e.buttons = (uint8_t)c->mouse_buttons;
-    input_mouse(&e);
+    input_mouse(&rdp_input, &e);
 }
 
 static void fastpath_input(struct rdp *c, int len) {
@@ -860,7 +863,7 @@ static void fastpath_input(struct rdp *c, int len) {
             break;
         case 4: { /* Unicode */
             uint16_t ch = r16(&r);
-            if (!r.err) input_unicode(ch, !(flags & 0x01), clock_now_ns());
+            if (!r.err) input_text(&rdp_input, ch, !(flags & 0x01), clock_now_ns());
             break;
         }
         case 6: /* QoE timestamp */
@@ -882,7 +885,7 @@ static void slowpath_input(struct rdp *c, struct rbuf *r) {
         if (r->err) return;
         switch (type) {
         case 0x0004: key(a & 0x0100, a & 0x8000, (uint8_t)b); break; /* 0x0200: after 0xE1 */
-        case 0x0005: input_unicode(b, !(a & 0x8000), clock_now_ns()); break;
+        case 0x0005: input_text(&rdp_input, b, !(a & 0x8000), clock_now_ns()); break;
         case 0x8001: mouse(c, a, b, d, false); break;
         case 0x8002: mouse(c, a, b, d, true); break;
         default: break;
@@ -1798,6 +1801,8 @@ static void on_accept(struct hvsock *s, void *arg) {
 }
 
 void rdp_init(void) {
-    if (hvsock_listen(RDP_PORT, on_accept, NULL) == 0)
+    if (hvsock_listen(RDP_PORT, on_accept, NULL) == 0) {
+        input_device_add(&rdp_input);
         kprintf("rdp: listening on Hyper-V socket port %d (enhanced session)\n", RDP_PORT);
+    }
 }
