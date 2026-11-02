@@ -65,8 +65,8 @@ void kmain_late(void) {
     if (cap_new(N_CAP_ROOT, &root) < 0) kprintf("init: no memory for the root capability\n");
     struct handle *handles[4] = {con, con, con, root};
     char *argv[] = {INIT_PATH, NULL};
-    char *settings[] = {"TERMINAL=0 1 2"};
-    struct proc_launch l = {.argc = 1, .argv = argv, .setting_count = 1, .settings = settings,
+    static const int32_t terminals[] = {0, 1, 2};
+    struct proc_launch l = {.argc = 1, .argv = argv, .terminals = terminals, .terminal_count = 3,
                             .handles = handles, .handle_count = 4, .identity = identity_kernel};
     int pid = proc_launch(INIT_PATH, &l);
     if (pid < 0) kprintf("init: failed to start %s (%d)\n", INIT_PATH, pid);

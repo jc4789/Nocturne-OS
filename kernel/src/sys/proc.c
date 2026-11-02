@@ -243,19 +243,20 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     p->mmap_next = USER_MMAP_BASE;
     p->low_base = p->low_next = MAX(USER_LOW_BASE, ALIGN_UP(top, PAGE_SIZE)); /* above the program image */
 
-    /* User stack: the argument and setting strings, then their two
-       null-terminated pointer arrays. They must fit well inside the stack. */
+    /* User stack: the argument and environment strings and the folder, the terminals, their two
+       null-terminated pointer arrays, then the struct n_start. They must fit well inside the stack. */
     _Static_assert(N_LAUNCH_MAX_BYTES <= USER_STACK_MAX / 2, "launch strings must leave the stack room");
-    int settings = l->setting_count;
-    size_t strings = 0;
+    int environment = l->environment_count;
+    size_t strings = l->folder ? strlen(l->folder) + 1 : 0;
+    size_t terminal_bytes = (size_t)l->terminal_count * sizeof *l->terminals;
     for (int i = 0; i < argc; i++) strings += strlen(argv[i]) + 1;
-    for (int i = 0; i < settings; i++) strings += strlen(l->settings[i]) + 1;
-    size_t pointer_bytes = ((size_t)argc + 1 + (size_t)settings + 1) * 8;
-    if (strings + pointer_bytes > N_LAUNCH_MAX_BYTES) { r = -N_ERR_TOO_MANY_ARGUMENTS; goto fail; }
+    for (int i = 0; i < environment; i++) strings += strlen(l->environment[i]) + 1;
+    size_t pointer_bytes = ((size_t)argc + 1 + (size_t)environment + 1) * 8;
+    if (strings + terminal_bytes + pointer_bytes + sizeof(struct n_start) > N_LAUNCH_MAX_BYTES) { r = -N_ERR_TOO_MANY_ARGUMENTS; goto fail; }
     pointers = kmalloc(pointer_bytes);
     if (!pointers) { r = -N_ERR_NO_MEMORY; goto fail; }
     /* pre-fault what the start needs plus 64 KiB; the rest grows on demand */
-    uint64_t prefault = ALIGN_UP(strings + pointer_bytes + 64 + 65536, PAGE_SIZE);
+    uint64_t prefault = ALIGN_UP(strings + terminal_bytes + pointer_bytes + sizeof(struct n_start) + 64 + 65536, PAGE_SIZE);
     if (vmm_user_alloc(p->vmm_space, USER_STACK_TOP - prefault, prefault, VM_W) < 0) { r = -N_ERR_NO_MEMORY; goto fail; }
     for (size_t i = 0; i < l->handle_count; i++)
         if (l->handles[i] && handle_table_put(&p->handles, i, handle_ref(l->handles[i])) < 0) {
@@ -266,10 +267,17 @@ int proc_launch(const char *path, const struct proc_launch *l) {
             message_channel_handed(l->handles[i], &p->identity);
         }
     uint64_t sp = USER_STACK_TOP;
-    for (int i = settings - 1; i >= 0; i--) {
-        size_t n = strlen(l->settings[i]) + 1;
+    uint64_t folder_ptr = 0;
+    if (l->folder) {
+        size_t n = strlen(l->folder) + 1;
         sp -= n;
-        if (vmm_copy_to_space(p->vmm_space, sp, l->settings[i], n) < 0) goto fail;
+        if (vmm_copy_to_space(p->vmm_space, sp, l->folder, n) < 0) goto fail;
+        folder_ptr = sp;
+    }
+    for (int i = environment - 1; i >= 0; i--) {
+        size_t n = strlen(l->environment[i]) + 1;
+        sp -= n;
+        if (vmm_copy_to_space(p->vmm_space, sp, l->environment[i], n) < 0) goto fail;
         pointers[argc + 1 + i] = sp;
     }
     for (int i = argc - 1; i >= 0; i--) {
@@ -279,14 +287,26 @@ int proc_launch(const char *path, const struct proc_launch *l) {
         pointers[i] = sp;
     }
     pointers[argc] = 0;
-    pointers[argc + 1 + settings] = 0;
+    pointers[argc + 1 + environment] = 0;
     sp = ALIGN_DOWN(sp, 16);
+    uint64_t terminals_ptr = 0;
+    if (terminal_bytes) {
+        sp = ALIGN_DOWN(sp - terminal_bytes, 16);
+        if (vmm_copy_to_space(p->vmm_space, sp, l->terminals, terminal_bytes) < 0) goto fail;
+        terminals_ptr = sp;
+    }
     sp -= pointer_bytes;
     sp = ALIGN_DOWN(sp, 16);
     if (vmm_copy_to_space(p->vmm_space, sp, pointers, pointer_bytes) < 0) goto fail;
-    uint64_t argv_ptr = sp, settings_ptr = sp + ((uint64_t)argc + 1) * 8;
+    uint64_t argv_ptr = sp;
+    struct n_start start = {.environment = (char *const *)(sp + ((uint64_t)argc + 1) * 8),
+                            .folder = (const char *)folder_ptr, .terminals = (const int32_t *)terminals_ptr,
+                            .terminal_count = l->terminal_count, .interrupts = l->interrupts};
     kfree(pointers);
     pointers = NULL;
+    sp = ALIGN_DOWN(sp - sizeof start, 16);
+    if (vmm_copy_to_space(p->vmm_space, sp, &start, sizeof start) < 0) goto fail;
+    uint64_t start_ptr = sp;
     sp -= 8; /* fake return address slot keeps the ABI alignment */
 
     /* initial interrupt frame */
@@ -299,7 +319,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     frame.ss = USER_DS;
     frame.rdi = argc;
     frame.rsi = argv_ptr;
-    frame.rdx = settings_ptr;
+    frame.rdx = start_ptr;
     thread_enter_user(p->main, &frame);
 
     /* Its pid is its main thread's tid; once it runs it may end, and its record go, at any time. */

@@ -799,7 +799,8 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
     int r = user_string(upath, &path);
     if (r < 0) return r;
     struct n_launch l = {0};
-    char **argv = NULL, **settings = NULL;
+    char **argv = NULL, **environment = NULL, *folder = NULL;
+    int32_t *terminals = NULL;
     struct handle **handles = NULL, *app = NULL;
     size_t argc = 0, bytes = 0;
     int64_t ret = copy_from_user(&l, ul, sizeof l);
@@ -808,16 +809,18 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
     if (l.flags || l.reserved) { ret = -N_ERR_INVALID; goto out; }
     struct n_identity identity;
     if ((r = identity_for_child(&l, &identity)) < 0) { ret = r; goto out; }
-    if (l.argument_count > limit / 8 || l.setting_count > limit / 8 || l.handle_count > 4096) {
+    if (l.argument_count > limit / 8 || l.environment_count > limit / 8 ||
+        l.handle_count > 4096 || l.terminal_count > 4096) {
         l = (struct n_launch){0};
         ret = -N_ERR_TOO_MANY_ARGUMENTS;
         goto out;
     }
     argc = l.argument_count ? l.argument_count : 1;
     argv = kzalloc(argc * sizeof *argv);
-    settings = kzalloc((l.setting_count + 1) * sizeof *settings);
+    environment = kzalloc((l.environment_count + 1) * sizeof *environment);
     handles = kzalloc((l.handle_count + 1) * sizeof *handles);
-    if (!argv || !settings || !handles) { ret = -N_ERR_NO_MEMORY; goto out; }
+    terminals = kzalloc((l.terminal_count + 1) * sizeof *terminals);
+    if (!argv || !environment || !handles || !terminals) { ret = -N_ERR_NO_MEMORY; goto out; }
     if (!l.argument_count) {
         argv[0] = strdup(path);
         if (!argv[0]) { ret = -N_ERR_NO_MEMORY; goto out; }
@@ -828,13 +831,19 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
         if ((r = user_string(ua, &argv[i])) < 0) { ret = r; goto out; }
         bytes += strlen(argv[i]) + 1;
     }
-    for (size_t i = 0; i < l.setting_count; i++) {
+    for (size_t i = 0; i < l.environment_count; i++) {
         const char *us;
-        if ((r = copy_from_user(&us, &l.settings[i], sizeof us)) < 0) { ret = r; goto out; }
-        if ((r = user_string(us, &settings[i])) < 0) { ret = r; goto out; }
-        bytes += strlen(settings[i]) + 1;
-        if (!strchr(settings[i], '=')) { ret = -N_ERR_INVALID; goto out; }
+        if ((r = copy_from_user(&us, &l.environment[i], sizeof us)) < 0) { ret = r; goto out; }
+        if ((r = user_string(us, &environment[i])) < 0) { ret = r; goto out; }
+        bytes += strlen(environment[i]) + 1;
+        if (!strchr(environment[i], '=')) { ret = -N_ERR_INVALID; goto out; }
     }
+    if (l.folder) {
+        if ((r = user_string(l.folder, &folder)) < 0) { ret = r; goto out; }
+        bytes += strlen(folder) + 1;
+    }
+    if (l.terminal_count &&
+        (r = copy_from_user(terminals, l.terminals, l.terminal_count * sizeof *terminals)) < 0) { ret = r; goto out; }
     if (bytes > limit) { ret = -N_ERR_TOO_MANY_ARGUMENTS; goto out; }
     for (size_t i = 0; i < l.handle_count; i++) {
         int32_t h;
@@ -843,8 +852,10 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
         if (!(handles[i] = handle_get(h))) { ret = -N_ERR_NO_HANDLE; goto out; }
     }
     if ((r = proc_app_create(&app)) < 0) { ret = r; goto out; }
-    struct proc_launch launch = {.argc = (int)argc, .argv = argv, .setting_count = (int)l.setting_count,
-                                 .settings = settings, .handles = handles, .handle_count = l.handle_count,
+    struct proc_launch launch = {.argc = (int)argc, .argv = argv, .environment_count = (int)l.environment_count,
+                                 .environment = environment, .folder = folder, .terminals = terminals,
+                                 .terminal_count = l.terminal_count, .interrupts = l.interrupts,
+                                 .handles = handles, .handle_count = l.handle_count,
                                  .parent = process_current(), .app = app->object, .identity = identity};
     r = proc_launch(path, &launch);
     if (r < 0) ret = r;
@@ -852,10 +863,12 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
 out:
     handle_close(app);
     if (argv) for (size_t i = 0; i < argc; i++) kfree(argv[i]);
-    if (settings) for (size_t i = 0; i < l.setting_count; i++) kfree(settings[i]);
+    if (environment) for (size_t i = 0; i < l.environment_count; i++) kfree(environment[i]);
     if (handles) for (size_t i = 0; i < l.handle_count; i++) handle_close(handles[i]);
     kfree(argv);
-    kfree(settings);
+    kfree(environment);
+    kfree(folder);
+    kfree(terminals);
     kfree(handles);
     kfree(path);
     return ret;

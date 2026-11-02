@@ -1063,7 +1063,7 @@ static const struct app apps[] = {
     {"Mandelbrot", PROGRAMS "Mandelbrot\\mandel", ICON_FRACTAL, NULL},
     {"3D Cube", PROGRAMS "Cube\\cube", ICON_CUBE, NULL},
     {"Game of Life", PROGRAMS "Life\\life", ICON_LIFE, NULL},
-    {"Settings", SYSTEM "js", ICON_SETTINGS, SYSTEM "settings.js"},
+    {"Settings", SYSTEM "settings", ICON_SETTINGS, NULL},
     {"About Nocturne", SYSTEM "js", ICON_ABOUT, SYSTEM "about.js"},
     {"Sleep", "@sleep", ICON_SLEEP, NULL},
     {"Hibernate", "@hibernate", ICON_HIBERNATE, NULL},
