@@ -2758,8 +2758,7 @@ static const char *event_key(uint32_t key, char text[8]) {
     case NKEY_PGDN: return "PageDown";
     default:
         if (key >= NKEY_F1 && key <= NKEY_F12) { snprintf(text, 8, "F%u", key - NKEY_F1 + 1); return text; }
-        if (key < 32 || (key >= 0x100 && key < 0x200) || key > 0x10ffff ||
-            (key >= 0xd800 && key <= 0xdfff)) { text[0] = 0; return text; }
+        if (!N_KEY_IS_TEXT(key)) { text[0] = 0; return text; }
         if (key < 0x80) { text[0] = (char)key; text[1] = 0; }
         else if (key < 0x800) { text[0] = 0xc0 | (key >> 6); text[1] = 0x80 | (key & 63); text[2] = 0; }
         else if (key < 0x10000) {
@@ -3106,7 +3105,7 @@ static void key(const struct gui_event *e) {
     web_node *target = tab->doc ? web_focused(tab->doc) : NULL;
     if (!dispatch_native("keydown", target, e, true)) return;
     if (!(e->mods & (NMOD_CTRL | NMOD_ALT)) &&
-        ((e->key >= 32 && !(e->key >= 0x100 && e->key < 0x200)) || e->key == NKEY_ENTER))
+        (N_KEY_IS_TEXT(e->key) || e->key == NKEY_ENTER))
         if (!dispatch_native("keypress", target, e, true)) return;
     if (page_clipboard_key(tab->doc ? web_focused(tab->doc) : NULL,e)) return;
     if (target && k == NKEY_DOWN && !ctrl && !alt) { open_select(target); if (tab->sel_node) return; }

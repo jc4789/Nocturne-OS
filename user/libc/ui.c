@@ -376,6 +376,7 @@ struct uiwin {
     bool selecting;          /* the pointer is dragging out a selection in the focused field */
     uint32_t keys[8], nkeys; /* keys down whose press went to the app (their release goes too) */
     uint32_t held;           /* the pointer's buttons held, as its last event said */
+    uint32_t clicks;         /* the last press's clicks in a row (struct gui_event) */
     uint64_t pressed2;       /* a node that takes the right or middle button ("buttons"), pressed with it */
     uint32_t button2;        /* and that button (2 or 4) */
     float press_x, grab;     /* where the left button went down; a dragged tab: where on it it was taken */
@@ -2038,7 +2039,7 @@ static void menu_close(struct uiwin *w, struct node *sub) {
 /* Item k was chosen (button 0: by the keys): its click, then its menu asks to be closed. */
 static void menu_choose(struct uiwin *w, struct node *k, uint32_t button, uint32_t mods) {
     float a = button ? w->px - k->x : 0, b = button ? w->py - k->y : 0;
-    emit(w, UI_EVENT_CLICK, k, mods, button << 8, a, b, NULL, 0);
+    emit(w, UI_EVENT_CLICK, k, mods, button << 8 | w->clicks << 16, a, b, NULL, 0);
     emit(w, UI_EVENT_DISMISS, menu_top(w, k), mods, UI_DONE, 0, 0, NULL, 0);
     w->menu_at = 0;
 }
@@ -2169,7 +2170,7 @@ static void other_up(struct uiwin *w, const struct gui_event *e, uint32_t bits) 
     struct hit h = hit_button(w, w->px, w->py, b);
     if (!h.n || h.id != id) return;
     if (b == 4 && h.n->kind == K_TAB) emit(w, UI_EVENT_DISMISS, h.n, e->mods, 0, h.n->ord, 0, NULL, 0);
-    else emit(w, UI_EVENT_CLICK, h.n, e->mods, b << 8, w->px - h.n->x, w->py - h.n->y, NULL, 0);
+    else emit(w, UI_EVENT_CLICK, h.n, e->mods, b << 8 | w->clicks << 16, w->px - h.n->x, w->py - h.n->y, NULL, 0);
 }
 
 static size_t utf8_put(char *out, uint32_t cp) {
@@ -2203,7 +2204,7 @@ static const char *key_name(uint32_t key, char *buf) {
         buf[3] = 0;
         return buf;
     }
-    if ((key >= 32 && key < 0x100) || (key > 0x1FF && key <= 0x10FFFF)) {
+    if (N_KEY_IS_TEXT(key)) {
         buf[utf8_put(buf, key)] = 0;
         return buf;
     }
@@ -2368,7 +2369,7 @@ static bool field_key(struct uiwin *w, struct node *n, const struct gui_event *e
             clipboard_set(s + lo, hi - lo);
             if (k == 'x') field_replace(w, n, "", 0, mods);
         } else if (ctrl && k == 'v') field_paste(w, n, mods);
-        else if (!ctrl && ((k >= 32 && k < 0x100 && k != 127) || (k > 0x1FF && k <= 0x10FFFF))) {
+        else if (!ctrl && N_KEY_IS_TEXT(k)) {
             char ch[4];
             field_replace(w, n, ch, (uint32_t)utf8_put(ch, k), mods);
         } else return false;
@@ -2456,6 +2457,7 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
         w->px = (float)e->x;
         w->py = (float)e->y;
         uint32_t went = e->buttons & ~w->held; /* the button that went down */
+        w->clicks = e->clicks;
         if (!went) went = e->buttons;
         w->held = e->buttons;
         if (w->nmenus) {
@@ -2549,7 +2551,7 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
             } else if (n->kind == K_TABS) {
                 if (h.id == part_id(n->id, PART_ADD)) emit(w, UI_EVENT_ADD, n, e->mods, 0, 0, 0, NULL, 0);
             } else if (n->kind != K_FIELD && n->kind != K_SLIDER) {
-                emit(w, UI_EVENT_CLICK, n, e->mods, 1u << 8, w->px - n->x, w->py - n->y, NULL, 0);
+                emit(w, UI_EVENT_CLICK, n, e->mods, 1u << 8 | w->clicks << 16, w->px - n->x, w->py - n->y, NULL, 0);
             }
         }
         sync_hot(w);

@@ -1,5 +1,6 @@
 /* Nocturne Terminal: a VT100-ish terminal emulator window running the shell. */
 #include <stdio.h>
+#include <uchar.h>
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
@@ -441,6 +442,9 @@ static void handle_key(struct gui_event *e) {
             char ch = (char)k;
             if (ctrl && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'))) ch &= 0x1F;
             buf[n++] = ch;
+        } else if (N_KEY_IS_TEXT(k)) {
+            char32_t c = (char32_t)k;
+            n = (int)c32rtomb(buf, c, &(mbstate_t){0});
         }
         break;
     }

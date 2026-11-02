@@ -24,7 +24,7 @@ n_result n_shell_screens(n_handle cap, struct n_shell_screen *out, size_t max);
 n_result n_shell_windows(n_handle cap, struct n_shell_window *out, size_t max);
 n_result n_shell_window(n_handle cap, uint32_t id, uint32_t op);
 n_handle n_shell_watch(n_handle cap);
-n_result n_shell_hotkey(n_handle cap, window_t *win, uint32_t key, uint32_t mods);
+n_result n_shell_hotkey(n_handle cap, window_t *win, uint32_t usage, uint32_t mods);
 /* 電源の段取りの今と、その watch（struct n_power_state、abi.h）。 */
 n_result n_power_state(n_handle cap, struct n_power_state *out);
 n_handle n_power_watch(n_handle cap);
