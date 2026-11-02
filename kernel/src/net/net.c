@@ -18,6 +18,7 @@
    - rxq_lock, config_lock (spinlocks): leaves, nothing but a wait queue's lock under them, so an
      interrupt handler, an alarm's fire or any driver context may take them. */
 #include "kernel.h"
+#include "sys/settings.h"
 #include "abi.h"
 #include "net.h"
 #include "../dev/entropy.h"
@@ -60,8 +61,7 @@ static uint8_t link_mac[6];
 static const char *link_driver;
 static uint32_t my_ip, my_mask, my_gw, my_dns;
 static bool configured;
-static struct n_sockaddr dns_boot_resolver; /* set once by net_init, before the stack starts */
-static int dns_boot_setting; /* 0=DHCP, 1=explicit, negative=rejected boot setting */
+static uint64_t dns_chosen; /* N_NETWORK_DNS_SERVER, ip << 16 | port (atomic); 0: what DHCP said */
 static struct n_sockaddr dns_default_resolver(void);
 
 static uint64_t rx_packets, tx_packets;
@@ -862,7 +862,7 @@ static void dhcp_input(const uint8_t *p, size_t len) {
         my_ip = yiaddr;
         my_mask = mask;
         my_gw = router;
-        my_dns = dns ? dns : router;
+        my_dns = dns;
         configured = true;
         spin_unlock(&config_lock, flags);
         dhcp_state = DHCP_BOUND;
@@ -923,63 +923,24 @@ static bool parse_ip(const char *s, uint32_t *out) {
     return true;
 }
 
-static bool dns_cmd_space(char c) {return c==' ' || c=='\t' || c=='\r' || c=='\n';}
-static bool dns_parse_resolver_endpoint(const char *at,const char *end,struct n_sockaddr *out) {
-    uint32_t ip=0;
-    for(unsigned part=0;part<4;part++) {
-        if(at==end || *at<'0' || *at>'9')return false;
-        unsigned octet=0;
-        do {
-            octet=octet*10+(unsigned)(*at++-'0');
-            if(octet>255)return false;
-        } while(at!=end && *at>='0' && *at<='9');
-        ip=(ip<<8)|octet;
-        if(at==end || *at++!=(part==3?':':'.'))return false;
-    }
-    if(at==end || *at<'0' || *at>'9')return false;
-    unsigned port=0;
-    do {
-        port=port*10+(unsigned)(*at++-'0');
-        if(port>UINT16_MAX)return false;
-    } while(at!=end && *at>='0' && *at<='9');
-    if(at!=end || !port)return false;
-    *out=(struct n_sockaddr){.ip=ip,.port=(uint16_t)port};
-    return true;
+static struct n_sockaddr dns_default_resolver(void) {
+    uint64_t chosen = __atomic_load_n(&dns_chosen, __ATOMIC_RELAXED);
+    if (chosen) return (struct n_sockaddr){.ip = (uint32_t)(chosen >> 16), .port = (uint16_t)chosen};
+    return (struct n_sockaddr){.ip = my_dns, .port = 53};
 }
 
-/* Parse one native dns-server=<decimal IPv4>:<decimal port> token. Absence
-   retains DHCP; malformed or repeated settings disable the default resolver
-   rather than silently sending queries to a different DHCP-supplied server.
-   An explicit per-call resolver is independent of this boot preference. */
-static int dns_parse_boot_resolver(const char *command,struct n_sockaddr *out) {
-    const char key[]="dns-server";
-    struct n_sockaddr selected={0};bool seen=false;
-    *out=selected;
-    for(const char *at=command;*at;) {
-        while(dns_cmd_space(*at))at++;
-        const char *begin=at;
-        while(*at && !dns_cmd_space(*at))at++;
-        size_t length=(size_t)(at-begin),key_length=sizeof key-1;
-        if(length<key_length || strncmp(begin,key,key_length) ||
-           (length>key_length && begin[key_length]!='='))continue;
-        if(seen || length==key_length || !dns_parse_resolver_endpoint(begin+key_length+1,at,&selected))return -N_ERR_INVALID;
-        seen=true;
-    }
-    *out=selected;
-    return seen?1:0;
+int dns_setting_put(uint32_t key, const void *value) {
+    const struct n_sockaddr *s = value;
+    if (s->ip && !s->port) return -N_ERR_INVALID;
+    __atomic_store_n(&dns_chosen, s->ip ? (uint64_t)s->ip << 16 | s->port : 0, __ATOMIC_RELAXED);
+    settings_changed(N_DOMAIN_NETWORK);
+    return 0;
 }
-static struct n_sockaddr dns_default_resolver(void) {
-    if(dns_boot_setting<0)return (struct n_sockaddr){0};
-    if(dns_boot_setting)return dns_boot_resolver;
-    return (struct n_sockaddr){.ip=my_dns,.port=53};
-}
-static void dns_configure(void) {
-    extern const char *kernel_cmdline;
-    dns_boot_setting=dns_parse_boot_resolver(kernel_cmdline,&dns_boot_resolver);
-    if(dns_boot_setting<0)kprintf("net: invalid or duplicate dns-server setting; default DNS disabled\n");
-    else if(dns_boot_setting)kprintf("net: default DNS %u.%u.%u.%u:%u (boot setting)\n",
-        dns_boot_resolver.ip>>24,(dns_boot_resolver.ip>>16)&255,(dns_boot_resolver.ip>>8)&255,
-        dns_boot_resolver.ip&255,dns_boot_resolver.port);
+
+int64_t dns_setting_get(uint32_t key, void *out, size_t cap) {
+    struct n_sockaddr s = dns_default_resolver();
+    if (cap >= sizeof s) memcpy(out, &s, sizeof s);
+    return sizeof s;
 }
 
 /* The cache has a byte budget and exact-size names/candidate vectors. Its
@@ -1670,8 +1631,8 @@ static void tcp_listen_input(struct tcb *l, uint32_t src, const uint8_t mac[6], 
     if (slot < 0) return;
     struct tcb *t = tcbs[slot];
     tcb_clear(t);
-    t->rx_capacity = tcp_rx_target;
-    t->tx_capacity = tcp_tx_target;
+    t->rx_capacity = __atomic_load_n(&tcp_rx_target, __ATOMIC_RELAXED);
+    t->tx_capacity = __atomic_load_n(&tcp_tx_target, __ATOMIC_RELAXED);
     while (!(t->rx=kmalloc(t->rx_capacity)) && t->rx_capacity>PAGE_SIZE) t->rx_capacity/=2;
     while (!(t->tx=kmalloc(t->tx_capacity)) && t->tx_capacity>PAGE_SIZE) t->tx_capacity/=2;
     if (!t->rx || !t->tx) {
@@ -2142,8 +2103,8 @@ static int64_t tcp_connect_until(uint32_t ip, uint16_t port, uint64_t deadline) 
     int h=tcp_alloc_slot();if(h<0)return h;
     struct tcb *t=tcbs[h];
     tcb_clear(t);
-    t->rx_capacity = tcp_rx_target;
-    t->tx_capacity = tcp_tx_target;
+    t->rx_capacity = __atomic_load_n(&tcp_rx_target, __ATOMIC_RELAXED);
+    t->tx_capacity = __atomic_load_n(&tcp_tx_target, __ATOMIC_RELAXED);
     /* Buffer size is real backing storage, not a transfer rejection. Allow
        a connection under memory pressure, negotiating its actual capacity. */
     while (!(t->rx=kmalloc(t->rx_capacity)) && t->rx_capacity>PAGE_SIZE) t->rx_capacity/=2;
@@ -2483,37 +2444,25 @@ void net_register(struct netif *n) {
     if (start) kthread_create("net", net_thread, NULL);
 }
 
-static void tcp_buffer_configure(void) {
-    extern const char *kernel_cmdline;
-    const char *names[] = {"tcp-rx-bytes=","tcp-tx-bytes="};
-    uint32_t *targets[] = {&tcp_rx_target,&tcp_tx_target};
-    for (size_t option=0;option<ARRAY_SIZE(names);option++) {
-        size_t prefix = strlen(names[option]);
-        for (const char *p=kernel_cmdline;*p;p++) {
-            if ((p!=kernel_cmdline && p[-1]!=' ') || strncmp(p,names[option],prefix)) continue;
-            const char *q=p+prefix;
-            uint64_t bytes=0;
-            bool valid=*q>='0' && *q<='9';
-            while (*q>='0' && *q<='9') {
-                unsigned digit=*q++-'0';
-                if (bytes>(UINT64_MAX-digit)/10) valid=false;
-                if (valid) bytes=bytes*10+digit;
-            }
-            /* Physical allocation rounds to pages. RFC 7323's maximum window
-               is also the sequence-space bound, not an invented fetch limit. */
-            if (valid && (!*q || *q==' ') && bytes && bytes<=TCP_WINDOW_MAX) {
-                *targets[option] = (uint32_t)ALIGN_UP(bytes,PAGE_SIZE);
-            } else kprintf("net: invalid %s buffer configuration\n",names[option]);
-        }
-    }
-    kprintf("net: TCP storage targets rx=%u tx=%u bytes (allocation-backed, WS negotiated)\n",tcp_rx_target,tcp_tx_target);
+/* What new connections take from now on. Physical allocation rounds to pages; RFC 7323's maximum
+   window is also the sequence-space bound, not an invented fetch limit. */
+int tcp_buffer_setting_put(uint32_t key, const void *value) {
+    int32_t bytes;
+    memcpy(&bytes, value, sizeof bytes);
+    if (bytes <= 0 || (uint64_t)bytes > TCP_WINDOW_MAX) return -N_ERR_INVALID;
+    __atomic_store_n(key == N_NETWORK_TCP_RX_BYTES ? &tcp_rx_target : &tcp_tx_target, (uint32_t)ALIGN_UP((uint64_t)bytes, PAGE_SIZE),
+                     __ATOMIC_RELAXED);
+    settings_changed(N_DOMAIN_NETWORK);
+    return 0;
+}
+
+int64_t tcp_buffer_setting_get(uint32_t key, void *out, size_t cap) {
+    return setting_int(out, cap, (int32_t)__atomic_load_n(key == N_NETWORK_TCP_RX_BYTES ? &tcp_rx_target : &tcp_tx_target, __ATOMIC_RELAXED));
 }
 
 void net_init(void) {
     net_timer_init(&dhcp_timer, dhcp_timer_run);
     net_timer_init(&fault_timer, fault_timer_run);
-    dns_configure();
-    tcp_buffer_configure();
     if (!rtl8125_probe()) vm_net_probe();
     net_enter();
     net_initialized = true;

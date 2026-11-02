@@ -17,8 +17,7 @@
 #include "sys/object.h"
 #include "sys/proc.h"
 #include "sys/stream.h"
-#include "sys/keep.h"
-#include "gui/screenmode.h"
+#include "sys/settings.h"
 #include "mm/heap.h"
 #include "mm/vmalloc.h"
 
@@ -30,6 +29,7 @@ void nvme_init(void);
 #define INIT_PATH N_FOLDER_SYSTEM "\\init"
 
 void kmain_late(void) {
+    settings_init();
     entropy_init();
     vmalloc_purge_start();
     acpi_init();
@@ -50,14 +50,10 @@ void kmain_late(void) {
     hibernate_restore(); /* returns only when there is no image to go back to */
     store_start();
 
-    bool gui = !cmdline_has("nogui");
-    if (gui) wm_init();
-    /* Each part's state back from its document on C: before the first program (sys/keep.c): sound
-       registered in audio_init, the desktop in wm_init, the screen's modes here. */
-    screen_modes_init();
-    keep_start();
+    wm_init();
     vm_session_init();
-    if (!gui || !wm_running()) input_set_sinks(console_key, NULL);
+    if (!wm_running()) input_set_sinks(console_key, NULL);
+    settings_test_flags();
     pm_sleep_check(); /* every driver has registered: whether the start menu offers Sleep */
 
     /* its input, output and log are the console */

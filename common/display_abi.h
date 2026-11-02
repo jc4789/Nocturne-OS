@@ -20,14 +20,11 @@ struct screen_format {
     uint8_t bits_per_channel;   /* smallest of the three: 8 or 10 (or more) */
 };
 
-/* Desktop settings, read and changed by the Settings app: SYS_SCREEN_INFO with
-   its third argument SCREEN_SETTINGS_GET or SCREEN_SETTINGS_SET and its second
-   argument sizeof(struct desktop_settings). A change applies at once, and the
-   desktop keeps it across restarts in the user's AppData\Nocturne\Desktop.conf,
-   which is no interface: programs read and change them here, and hear a change
-   by SCREEN_WATCH. */
+/* Desktop settings as they stand: SYS_SCREEN_INFO with its third argument
+   SCREEN_SETTINGS_GET and its second argument sizeof(struct desktop_settings). A
+   program hears a change by SCREEN_WATCH. They change by SYS_SETTINGS_APPLY
+   (N_INPUT_POINTER_SPEED, N_WINDOW_SMOOTH_GRADIENTS, settings_abi.h). */
 #define SCREEN_SETTINGS_GET 1
-#define SCREEN_SETTINGS_SET 2
 struct desktop_settings {
     int8_t pointer_speed; /* -2 (slowest) .. 2 (fastest), 0 as delivered */
     /* The desktop drawn with 10 bits per channel and dithered onto a screen of 8 (less banding in
@@ -62,7 +59,7 @@ struct desktop_settings {
    whether smooth gradients can be shown, the monitor offered and its modes, the mode wanted, a
    trial beginning or ending, a refusal, the source, the user's choice. A trial's time counting
    down is no change. N_ERR_INVALID when the first two are not 0, N_ERR_UNSUPPORTED without the
-   desktop (the nogui start). */
+   desktop. */
 #define SCREEN_WATCH 5
 #define SCREEN_MODE_TRIAL_MS 15000u /* a mode tried and not kept goes back after this */
 enum {
@@ -87,10 +84,9 @@ struct screen_modes {
 #define SCREEN_MODES_FIRST_BYTES 2176u /* the first struct screen_modes: offered to screens */
 /* TRY: mode (one offered, as listed) is shown on trial, and goes back to the mode before it
    unless KEEP comes within SCREEN_MODE_TRIAL_MS (BACK: at once). Another TRY during a trial
-   keeps the mode to go back to. KEEP makes it the user's choice for that monitor, which the
-   system keeps across restarts (in the user's AppData\Nocturne\Displays.conf, no interface) and
-   shows whenever that monitor is driven and offers it. 4 stays unassigned: it put a saved choice
-   back, which the system now does itself. */
+   keeps the mode to go back to. KEEP makes it the user's choice for that monitor, shown whenever
+   that monitor is driven and offers it. The settings service hears of it (N_DOMAIN_DISPLAY,
+   settings_abi.h), saves it and applies it back at the next start. */
 enum { SCREEN_MODE_TRY = 1, SCREEN_MODE_KEEP, SCREEN_MODE_BACK };
 struct screen_mode_set {
     uint32_t how;              /* SCREEN_MODE_* */

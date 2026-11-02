@@ -28,6 +28,7 @@
 #include "dev/iommu.h"
 #include "dev/pci.h"
 #include "dev/pciuser.h"
+#include "sys/settings.h"
 #include "gui/screenmode.h"
 #include "gui/wm.h"
 #include "mm/heap.h"
@@ -185,8 +186,8 @@ static int screen_bar(const struct pci_device *d) {
    default: RM's waits follow one another without a bound a limit could be checked against, and
    stopping a driver that is only slow loses its GPU. */
 /* The hold the watch thread looks at: screen_holder and the three after it, under
-   screen_hold_lock (taken alone, before screen_watch_wq's lock). The hold counts themselves and
-   screen_watch_started change under screen_lock (pci_user_hold_screen). */
+   screen_hold_lock (taken alone, before screen_watch_wq's lock). The hold counts themselves change
+   under screen_lock (pci_user_hold_screen); screen_watch_started is atomic. */
 static struct spinlock screen_hold_lock;
 static struct pci_claim *screen_holder;
 static int screen_holder_app;
@@ -208,19 +209,19 @@ static bool screen_holder_stop(const char *why) {
     return true;
 }
 
-/* Started with the first hold, only when fbhold= sets a limit. */
+/* Started when N_DISPLAY_HOLD_SECONDS first sets a limit. */
 static void screen_watch(void *arg) {
     (void)arg;
-    char limit[64];
-    ksnprintf(limit, sizeof limit, "its driver has held the screen for %lu s (fbhold=)",
-              (unsigned long)(screen_hold_limit_ns / NS_PER_S));
     for (;;) {
         uint64_t irq = spin_lock(&screen_hold_lock);
-        bool holding = screen_holder && !screen_holder_stopped;
-        uint64_t until = holding ? screen_held_since + screen_hold_limit_ns : CLOCK_NEVER;
+        uint64_t limit = screen_hold_limit_ns;
+        bool holding = screen_holder && !screen_holder_stopped && limit;
+        uint64_t until = holding ? screen_held_since + limit : CLOCK_NEVER;
         if (holding && clock_now_ns() >= until) {
             spin_unlock(&screen_hold_lock, irq);
-            screen_holder_stop(limit);
+            char why[64];
+            ksnprintf(why, sizeof why, "its driver has held the screen for %lu s", (unsigned long)(limit / NS_PER_S));
+            screen_holder_stop(why);
             continue;
         }
         /* a hold that begins or ends takes screen_hold_lock first, then wakes this */
@@ -229,17 +230,28 @@ static void screen_watch(void *arg) {
     }
 }
 
+int screen_hold_setting_put(uint32_t key, const void *value) {
+    int32_t seconds;
+    memcpy(&seconds, value, sizeof seconds);
+    bool start = seconds && !__atomic_exchange_n(&screen_watch_started, true, __ATOMIC_RELAXED);
+    if (start && !kthread_create("screen hold", screen_watch, NULL)) return -N_ERR_NO_MEMORY;
+    uint64_t irq = spin_lock(&screen_hold_lock);
+    screen_hold_limit_ns = (uint64_t)seconds * NS_PER_S;
+    wq_wake_all(&screen_watch_wq);
+    spin_unlock(&screen_hold_lock, irq);
+    settings_changed(N_DOMAIN_DISPLAY);
+    return 0;
+}
+
+int64_t screen_hold_setting_get(uint32_t key, void *out, size_t cap) {
+    uint64_t irq = spin_lock(&screen_hold_lock);
+    uint64_t limit = screen_hold_limit_ns;
+    spin_unlock(&screen_hold_lock, irq);
+    return setting_int(out, cap, (int32_t)(limit / NS_PER_S));
+}
+
 /* screen_lock held. */
 static void screen_hold_begin(struct pci_claim *c) {
-    if (!screen_watch_started) {
-        screen_watch_started = true;
-        uint64_t seconds;
-        if (cmdline_number("fbhold", &seconds) && seconds) {
-            /* at most a century: the hold's end stays a moment the clock reaches */
-            screen_hold_limit_ns = MIN(seconds, (uint64_t)100 * 365 * 86400) * NS_PER_S;
-            kthread_create("screen hold", screen_watch, NULL);
-        }
-    }
     /* Said while the screen still shows it: a screen that stops changing next tells why. */
     kprintf("pci: %02x:%02x.%u: app %d holds the screen while its driver starts or stops the device\n",
             c->d->bus, c->d->dev, c->d->func, process_current()->pid);
@@ -806,10 +818,10 @@ static int64_t claim_form(struct pci_claim *c, struct handle **out) {
 
 int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct handle **out) {
     struct process *t = process_current();
-    /* Boot options: noappdrivers keeps every function with the kernel; appdrivers=any lets any
-       app claim (tests drive QEMU's edu device from a program they compile) */
-    if (!t || cmdline_has("noappdrivers")) return -N_ERR_DENIED;
-    if (t->pid != init_pid && !cmdline_has("appdrivers=any")) return -N_ERR_DENIED;
+    /* the test build's appdrivers=any lets any app claim (tests drive QEMU's edu device from a
+       program they compile) */
+    if (!t) return -N_ERR_DENIED;
+    if (t->pid != init_pid && !test_flag("appdrivers=any")) return -N_ERR_DENIED;
     if (dev > 31 || func > 7) return -N_ERR_INVALID;
     struct pci_device *d = pci_find_function(bus, dev, func);
     if (!d) return -N_ERR_NOT_FOUND;

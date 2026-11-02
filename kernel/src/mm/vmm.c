@@ -646,7 +646,7 @@ void vmm_init(struct limine_memmap_response *mm, struct limine_executable_addres
                             VEC_TLB_SHOOTDOWN))
         panic("vmm: VEC_TLB_SHOOTDOWN is taken");
     write_cr3(kernel_pml4);
-    pcid_on = cpu_features.pcid && !cmdline_has("nopcid");
+    pcid_on = cpu_features.pcid && !test_flag("nopcid");
     vmm_init_cpu();
     if (pcid_on) kprintf("vmm: PCID on, %u spaces kept per CPU\n", PCID_SLOTS);
     else kprintf("vmm: PCID off, a CPU keeps no space's translations across a switch\n");

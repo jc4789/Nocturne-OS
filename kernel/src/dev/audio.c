@@ -11,7 +11,7 @@
 #include "sys/thread.h"
 #include "sys/wait.h"
 #include "sys/object.h"
-#include "sys/keep.h"
+#include "sys/settings.h"
 #include "sys/watch.h"
 #include "abi.h"
 #include "vm/vm.h"
@@ -791,15 +791,11 @@ bool audio_remote_mix(struct audio_remote *r, int16_t *out, int frames, uint64_t
     return true;
 }
 
-/* ---- the volume and muting: the user's, kept in AppData\Nocturne\Sound.conf (sys/keep.c) ---- */
-
-static bool sound_line(const char *key, const char *value, bool apply);
-static size_t sound_text(char *out, size_t cap);
-static struct keep sound_keep = {.name = "Sound", .line = sound_line, .text = sound_text};
+/* ---- the volume and muting: the user's (sys/settings.h) ---- */
 
 /* The volume and muting as v and m, KEEP for either one leaves it as it is when the change is made;
-   whoever changes them (a program, the taskbar's volume control, the document read back), the
-   watches and the taskbar hear of it and the change is kept. */
+   whoever changes them (the settings service, the taskbar's volume control), the watches and the
+   taskbar hear of it. */
 #define KEEP (-1)
 static void sound_put(int v, int m) {
     uint64_t f = spin_lock(&audio_lock);
@@ -811,7 +807,7 @@ static void sound_put(int v, int m) {
     gain = quiet ? 0 : v * v * 65536 / 10000;
     spin_unlock(&audio_lock, f);
     if (!changed) return;
-    keep_changed(&sound_keep);
+    settings_changed(N_DOMAIN_AUDIO);
     watched_changed(&output_watched);
     wm_taskbar_changed();
 }
@@ -821,30 +817,16 @@ bool audio_muted(void) { return __atomic_load_n(&muted, __ATOMIC_RELAXED); }
 void audio_set_volume(int percent) { sound_put(MAX(0, MIN(100, percent)), false); }
 void audio_set_muted(bool m) { sound_put(KEEP, m); }
 
-/* Sound.conf: volume=<0-100>, muted=on|off. */
-static bool sound_line(const char *key, const char *value, bool apply) {
-    int64_t v;
-    bool on = !strcmp(value, "on"), off = !strcmp(value, "off");
-    if (!strcmp(key, "volume")) {
-        if (apply && keep_number(value, 0, 100, &v)) sound_put((int)v, KEEP);
-        return true;
-    }
-    if (!strcmp(key, "muted")) {
-        if (apply && (on || off)) sound_put(KEEP, on);
-        return true;
-    }
-    return false;
+int audio_setting_put(uint32_t key, const void *value) {
+    int32_t v;
+    memcpy(&v, value, sizeof v);
+    if (key == N_AUDIO_VOLUME) sound_put(v, KEEP);
+    else sound_put(KEEP, v);
+    return 0;
 }
 
-static size_t sound_text(char *out, size_t cap) {
-    uint64_t f = spin_lock(&audio_lock);
-    int v = volume;
-    bool m = muted;
-    spin_unlock(&audio_lock, f);
-    size_t n = 0;
-    keep_put(out, cap, &n, "# The volume and muting. Nocturne keeps this: change them in Settings or with the taskbar's speaker.\n");
-    keep_put(out, cap, &n, "volume=%d\nmuted=%s\n", v, m ? "on" : "off");
-    return n;
+int64_t audio_setting_get(uint32_t key, void *out, size_t cap) {
+    return setting_int(out, cap, key == N_AUDIO_VOLUME ? audio_volume() : audio_muted());
 }
 
 int64_t audio_output_watch(void) { return watched_open(&output_watched); }
@@ -1147,7 +1129,6 @@ int audio_stream_flush(struct handle *h) {
 
 void audio_init(void) {
     watched_init(&output_watched, NULL); /* before an output is added */
-    keep_register(&sound_keep);          /* read back by keep_start, before the first program */
     alarm_init(&null_alarm, null_fire);
     system_stream.issued = kmalloc(NULL_RUNS * sizeof *system_stream.issued);
     if (!system_stream.issued) panic("audio: no memory for its system stream");

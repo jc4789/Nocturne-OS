@@ -13,9 +13,9 @@
  * source), tells that apart from a driver that ended.
  *
  * Each screen has its own choice (struct choice): the modes offered, the wish, the refusals and a
- * trial. The mode the user keeps for each monitor is kept in the user's
- * AppData\Nocturne\Displays.conf (displays_keep, sys/keep.c) and read back before the first program
- * starts, so a display driver's first offer already finds it. Every change of what SYS_SCREEN_INFO
+ * trial. The mode the user keeps for each monitor is held here until the machine stops: the settings
+ * service hears of each change (N_DOMAIN_DISPLAY) and keeps it, and applies it back at the start.
+ * Until then a screen shows its monitor's preferred mode. Every change of what SYS_SCREEN_INFO
  * reports of the modes tells its watches (wm_screen_info_changed).
  *
  * Under lock (a mutex, any CPU; the WM's lock and a screen's use come after it): everything below.
@@ -27,7 +27,7 @@
 #include "arch/cpu.h"
 #include "dev/fb.h"
 #include "sys/clock.h"
-#include "sys/keep.h"
+#include "sys/settings.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
 #include "sys/syscall.h"
@@ -330,15 +330,9 @@ void screen_modes_shown(unsigned id, struct screen_mode_desc *desc) {
     mutex_unlock(&lock);
 }
 
-/* ---- the modes the user kept, in Displays.conf ---- */
+/* ---- the modes the user kept ---- */
 
-static bool displays_line(const char *key, const char *value, bool apply);
-static size_t displays_text(char *out, size_t cap);
-static struct keep displays_keep = {.name = "Displays", .line = displays_line, .text = displays_text};
-
-void screen_modes_init(void) { keep_register(&displays_keep); }
-
-/* The user's choice of mode for a monitor, read back: shown on each screen that monitor is
+/* The user's choice of mode for a monitor, applied: shown on each screen that monitor is
    offered on and offers it (now, if it is). */
 static void choose(const char *monitor, const struct n_screen_mode *mode) {
     char name[sizeof kept[0].monitor] = {0};
@@ -367,54 +361,30 @@ static void choose(const char *monitor, const struct n_screen_mode *mode) {
         }
     kfree(wished);
     if (!any && differs) wm_screen_info_changed(); /* chosen */
+    settings_changed(N_DOMAIN_DISPLAY);
 }
 
-/* "<width>x<height>@<millihertz>", none of them 0. */
-static bool mode_value(const char *s, struct n_screen_mode *m) {
-    uint32_t v[3] = {0};
-    for (int i = 0; i < 3; i++) {
-        int digits = 0;
-        for (; *s >= '0' && *s <= '9'; s++) {
-            if (++digits > 7) return false;
-            v[i] = v[i] * 10 + (uint32_t)(*s - '0');
-        }
-        if (!v[i] || *s != (i == 0 ? 'x' : i == 1 ? '@' : 0)) return false;
-        if (i < 2) s++;
-    }
-    *m = (struct n_screen_mode){v[0], v[1], v[2], 0};
-    return true;
+int screen_modes_setting_put(uint32_t key, const void *value) {
+    const struct n_setting_monitor_mode *m = value;
+    if (strlen(m->monitor) >= sizeof kept[0].monitor) return -N_ERR_INVALID;
+    struct n_screen_mode mode = {m->width, m->height, m->refresh_mhz, 0};
+    choose(m->monitor, &mode);
+    return 0;
 }
 
-/* Whether a monitor's text reads back as the same key: not empty, no '=' or line end in it, no
-   space or tab around it. */
-static bool monitor_writable(const char *s) {
-    size_t n = strlen(s);
-    if (!n || s[0] == ' ' || s[0] == '\t' || s[n - 1] == ' ' || s[n - 1] == '\t') return false;
-    for (size_t i = 0; i < n; i++)
-        if (s[i] == '=' || s[i] == '\n' || s[i] == '\r') return false;
-    return true;
-}
-
-/* Displays.conf: mode.<monitor>=<width>x<height>@<millihertz>, a line for each monitor. */
-static bool displays_line(const char *key, const char *value, bool apply) {
-    if (strncmp(key, "mode.", 5)) return false;
-    const char *monitor = key + 5;
-    struct n_screen_mode m;
-    if (apply && *monitor && strlen(monitor) < sizeof kept[0].monitor && mode_value(value, &m)) choose(monitor, &m);
-    return true;
-}
-
-static size_t displays_text(char *out, size_t cap) {
-    size_t n = 0;
-    keep_put(out, cap, &n, "# The mode kept for each monitor. Nocturne keeps this: change it in Settings.\n");
+int64_t screen_modes_setting_get(uint32_t key, void *out, size_t cap) {
+    struct n_setting_monitor_mode *list = out;
     mutex_lock(&lock);
-    for (size_t i = 0; i < nkept; i++) {
-        const struct n_screen_mode *m = &kept[i].mode;
-        if (monitor_writable(kept[i].monitor))
-            keep_put(out, cap, &n, "mode.%s=%ux%u@%u\n", kept[i].monitor, m->width, m->height, m->refresh_mhz);
+    size_t n = nkept, fits = cap / sizeof *list;
+    for (size_t i = 0; i < n && i < fits; i++) {
+        memset(&list[i], 0, sizeof list[i]);
+        strlcpy(list[i].monitor, kept[i].monitor, sizeof list[i].monitor);
+        list[i].width = kept[i].mode.width;
+        list[i].height = kept[i].mode.height;
+        list[i].refresh_mhz = kept[i].mode.refresh_mhz;
     }
     mutex_unlock(&lock);
-    return n;
+    return (int64_t)(n * sizeof *list);
 }
 
 _Static_assert(offsetof(struct screen_modes, chosen) == SCREEN_MODES_FIRST_BYTES, "the first struct screen_modes");
@@ -521,7 +491,7 @@ int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op) {
     } else r = -N_ERR_INVALID;
     mutex_unlock(&lock);
     if (changed) publish(id);
-    if (chose) keep_changed(&displays_keep); /* the user's choice for this monitor, kept */
+    if (chose) settings_changed(N_DOMAIN_DISPLAY); /* the user's choice for this monitor */
     if (ended && !changed) wm_screen_info_changed(); /* the trial ended, and chosen */
     return r;
 }

@@ -11,6 +11,7 @@
 #include "arch/idle.h"
 #include "arch/irq.h"
 #include "arch/smp.h"
+#include "fs/bootrecord.h"
 #include "arch/spin.h"
 #include "arch/wake.h"
 #include "mm/bootmem.h"
@@ -300,7 +301,7 @@ static void start_cpus(unsigned count, const char *after) {
 }
 
 void smp_init(void) {
-    const char *alone = cmdline_has("nosmp")  ? "nosmp"
+    const char *alone = !boot_setting(N_BOOT_SMP) ? "the boot record says so"
                         : topology.cpus == 1  ? "the only one"
                         : !wake_available()   ? "no wake page"
                                               : NULL;

@@ -182,7 +182,7 @@ static int e1000_send(const void *frame, size_t len) {
 
 static uint32_t e1000_itr_ticks(void) {
     uint64_t us;
-    if (!cmdline_number("e1000-itr-us", &us) || us > (uint64_t)UINT16_MAX * ITR_TICK_NS / 1000)
+    if (!test_number("e1000-itr-us", &us) || us > (uint64_t)UINT16_MAX * ITR_TICK_NS / 1000)
         return ITR_DEFAULT_TICKS;
     return (uint32_t)((us * 1000 + ITR_TICK_NS - 1) / ITR_TICK_NS);
 }

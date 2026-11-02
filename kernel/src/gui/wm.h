@@ -3,8 +3,8 @@
 #include "gfx.h"
 
 /* Start the desktop: its input thread and a compositor thread for each screen (dev/fb.h). The
-   desktop's settings (the pointer's speed, smooth gradients) are the user's: the desktop registers
-   them to be kept (sys/keep.c, AppData\Nocturne\Desktop.conf), read back by keep_start. */
+   desktop's settings (the pointer's speed, smooth gradients) are the user's: they come through
+   sys/settings.h, and the kernel does not save them. */
 void wm_init(void);
 bool wm_running(void);
 /* Something SYS_SCREEN_INFO reports changed (a screen's mode, gui/screenmode.c): its watches

@@ -23,6 +23,7 @@
 #include "arch/cpu.h"
 #include "arch/cpuset.h"
 #include "arch/idle.h"
+#include "sys/settings.h"
 #include "arch/smp.h"
 #include "sys/clock.h"
 #include "sys/thread.h"
@@ -151,6 +152,18 @@ static void perf_apply(void *unused) {
     uint64_t f = irq_save();
     perf_request();
     irq_restore(f);
+}
+
+int perf_preference_setting_put(uint32_t key, const void *value) {
+    int32_t v;
+    memcpy(&v, value, sizeof v);
+    cpu_perf_set_policy((uint8_t)v);
+    settings_changed(N_DOMAIN_POWER);
+    return 0;
+}
+
+int64_t perf_preference_setting_get(uint32_t key, void *out, size_t cap) {
+    return setting_int(out, cap, __atomic_load_n(&preference, __ATOMIC_RELAXED));
 }
 
 void cpu_perf_set_policy(uint8_t value) {

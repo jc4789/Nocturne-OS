@@ -37,6 +37,10 @@ boot_install() {
     mmd -i "$esp" ::/boot ::/boot/limine ::/EFI ::/EFI/BOOT
     mcopy -i "$esp" $B/kernel.elf ::/boot/kernel.elf
     mcopy -i "$esp" boot/limine.conf ::/boot/limine/
+    # the boot record (common/settings_abi.h): all zeros say every value is its default
+    rm -f $B/settings.rec
+    truncate -s 8K $B/settings.rec
+    mcopy -i "$esp" $B/settings.rec ::/boot/settings.rec
     mcopy -i "$esp" $LIMINE/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
 }
 
@@ -54,6 +58,7 @@ iso_make() {
     rm -rf $root $ISO
     mkdir -p $root/boot/limine $root/EFI/BOOT
     cp $B/kernel.elf $root/boot/
+    truncate -s 8K $root/boot/settings.rec
     sed 's|^\( *\)path: boot():/boot/kernel.elf$|&\n\1module_path: boot():/boot/c.img\n\1module_string: C:|' \
         boot/limine.conf > $root/boot/limine/limine.conf
     cp $LIMINE/limine-uefi-cd.bin $root/boot/limine/

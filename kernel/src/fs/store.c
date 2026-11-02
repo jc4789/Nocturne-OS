@@ -16,6 +16,11 @@
 #include "sys/thread.h"
 #include "arch/percpu.h"
 #include "arch/topology.h"
+#include "authority_abi.h"
+#include "sys/process.h"
+
+/* sys/process.c: what the kernel knows the process to be. */
+struct n_identity process_identity(const struct process *p);
 
 #define WRITE_DELAY_NS (5 * NS_PER_S) /* the first change waits this long for more to commit with it */
 #define FIND_NS (10 * NS_PER_S)       /* how long the disk the system started from may take to appear */
@@ -375,6 +380,27 @@ static int folder_at(uint64_t parent, const char *name, uint16_t attributes, uin
     return r;
 }
 
+/* The partition with GPT identity unique on the disk C: is on (fs/store.h). */
+int store_boot_partition(const uint8_t unique[16], struct blkdev **disk, uint64_t *first, uint64_t *sectors) {
+    if (!medium.disk) return -N_ERR_UNSUPPORTED;
+    uint8_t *buf = kmalloc(16 * 512);
+    if (!buf) return -N_ERR_NO_MEMORY;
+    struct gpt g;
+    int r = gpt_read(medium.disk, buf, &g) > 0 ? -N_ERR_NOT_FOUND : -N_ERR_IO;
+    for (uint32_t i = 0; r == -N_ERR_NOT_FOUND && i < g.h.count; i++) {
+        const struct gpt_entry *e = gpt_entry(&g, i);
+        if (memcmp(e->unique, unique, 16)) continue;
+        uint64_t f = g.unit / 512;
+        *disk = medium.disk;
+        *first = e->first * f;
+        *sectors = (e->last + 1 - e->first) * f;
+        r = 0;
+    }
+    kfree(g.entries);
+    kfree(buf);
+    return r;
+}
+
 /* Everything in folder goes: nothing has any of it open yet (store_start). */
 static int folder_clear(uint64_t folder) {
     struct folder_lock *f = folder_lock(folder);
@@ -406,6 +432,11 @@ static int user_ready(uint64_t users) {
     if (r == -N_ERR_NOT_FOUND) {
         e->n = strlen(strcpy(e->name, "User"));
         r = folder_at(users, e->name, 0, &e->id);
+        if (r >= 0) {
+            change_begin();
+            r = ns_record_amend(v, e->id, &(struct ns_amend){.fields = NS_OWNER, .owner = STORE_OWNER_FIRST});
+            change_end();
+        }
     }
     uint64_t data, temp;
     if (r >= 0) {
@@ -428,12 +459,13 @@ void store_start(void) {
     store_grow(v);
     rwmutex_unlock_write(&store.gate);
     mutex_unlock(&store.committing);
-    uint64_t system = 0, users = 0;
-    int r = folder_at(STORE_ID_ROOT, "Nocturne", STORE_SYSTEM, &system);
-    if (r >= 0) r = folder_at(system, "Temp", STORE_SYSTEM | STORE_PRIVATE | STORE_TEMPORARY, &store.temp);
+    int r = folder_at(STORE_ID_ROOT, "Nocturne", 0, &store.system);
+    if (r >= 0) r = folder_at(store.system, "Temp", STORE_PRIVATE | STORE_TEMPORARY, &store.temp);
     if (r >= 0) r = folder_clear(store.temp);
     if (r < 0) kprintf("store: C:\\Nocturne\\Temp cannot be made ready (%d): nothing can be replaced\n", r);
-    if ((r = folder_at(STORE_ID_ROOT, "Users", 0, &users)) >= 0) r = user_ready(users);
+    if ((r = folder_at(STORE_ID_ROOT, "Programs", 0, &store.programs)) < 0)
+        kprintf("store: C:\\Programs cannot be made ready (%d)\n", r);
+    if ((r = folder_at(STORE_ID_ROOT, "Users", 0, &store.users)) >= 0) r = user_ready(store.users);
     if (r < 0) kprintf("store: the user's folder in C:\\Users cannot be made ready (%d)\n", r);
     if (!kthread_create("store", writer, NULL)) panic("store: no writer");
     store_dirty(false);
@@ -588,6 +620,37 @@ void folder_unlock(struct folder_lock *l) {
     if (last) kfree(l);
 }
 
+/* ---- who may reach what ---- */
+
+/* Which of store.h's areas the entry at depth (0: directly in C:\) makes the place. */
+static void area_step(struct place *p, size_t depth, bool found) {
+    if (depth == 0) {
+        uint64_t id = found ? p->entry.id : 0;
+        p->area = !found ? AREA_OTHER : id == store.system ? AREA_SYSTEM : id == store.programs ? AREA_PROGRAMS
+                  : id == store.users ? AREA_TOP : AREA_OTHER;
+        p->top = id;
+    } else if (depth == 1 && p->top == store.users) {
+        /* a new name in C:\Users is the list's to take: admin and above */
+        p->area = found ? AREA_HOME : AREA_TOP;
+        p->home_owner = found ? p->record.owner : 0;
+    }
+}
+
+/* The one place that says what an identity may do on C: (store.h). */
+static bool place_allows(const struct place *p, const struct n_identity *who, bool write) {
+    bool admin = who->cls >= N_CLASS_ADMIN;
+    switch (p->area) {
+    case AREA_SYSTEM: return !write || who->cls >= N_CLASS_SYSTEM;
+    case AREA_PROGRAMS: return !write || admin;
+    case AREA_HOME: return admin || who->user == p->home_owner;
+    case AREA_TOP: return !write || admin;
+    case AREA_OTHER: return admin;
+    }
+    return false;
+}
+
+static struct n_identity caller(void) { return process_identity(process_current()); }
+
 /* ---- paths ---- */
 
 int place_find(const char *text, bool user, struct place *out) {
@@ -599,6 +662,9 @@ int place_find(const char *text, bool user, struct place *out) {
     if ((r = ns_record(v, STORE_ID_ROOT, &out->record, NULL)) < 0) goto fail;
     out->folder_attributes = out->record.attributes;
     out->found = true;
+    out->area = AREA_TOP;
+    struct n_identity who = {0};
+    if (user) who = caller();
     for (size_t i = 0; i < out->path.count; i++) {
         if (out->record.kind != STORE_FOLDER) {
             r = -N_ERR_NOT_FOLDER;
@@ -613,6 +679,11 @@ int place_find(const char *text, bool user, struct place *out) {
         r = ns_find(v, out->folder, out->name, out->n, &out->entry);
         if (r >= 0) r = ns_record(v, out->entry.id, &out->record, NULL);
         if (r >= 0 && user && (out->record.attributes & STORE_PRIVATE)) r = -N_ERR_NOT_FOUND;
+        area_step(out, i, r >= 0);
+        if (user && !place_allows(out, &who, false)) {
+            r = -N_ERR_DENIED;
+            goto fail;
+        }
         if (r == -N_ERR_NOT_FOUND && last) {
             out->found = false;
             out->entry.id = 0;
@@ -654,12 +725,15 @@ int place_lock(struct place *p, bool user, struct folder_lock **out) {
 
 int place_may_change(const struct place *p, bool user, bool entry) {
     if (!user) return 0;
-    if (p->folder_attributes & STORE_SYSTEM) return -N_ERR_DENIED;
-    return entry && p->found && (p->record.attributes & STORE_SYSTEM) ? -N_ERR_DENIED : 0;
+    struct n_identity who = caller();
+    if (entry && p->found && (p->entry.id == store.system || p->entry.id == store.programs || p->entry.id == store.users))
+        return who.cls >= N_CLASS_SYSTEM ? 0 : -N_ERR_DENIED;
+    return place_allows(p, &who, true) ? 0 : -N_ERR_DENIED;
 }
 
 void entry_fill(struct n_entry *out, const char *name, size_t n, uint64_t id, const struct store_record *rec) {
     memset(out, 0, sizeof *out);
+    out->owner = rec->owner;
     if (n) memcpy(out->name, name, MIN(n, sizeof out->name - 1));
     out->kind = rec->kind == STORE_FOLDER ? N_KIND_FOLDER : N_KIND_DOCUMENT;
     if (rec->kind == STORE_DOCUMENT) {
@@ -793,6 +867,27 @@ int store_folder_create(const char *path, bool user) {
     return r;
 }
 
+int store_entry_set_owner(const char *path, uint32_t owner, bool user) {
+    if (user && caller().cls < N_CLASS_ADMIN) return -N_ERR_DENIED;
+    struct place p;
+    int r = place_find(path, user, &p);
+    if (r < 0) return r;
+    struct folder_lock *f = NULL;
+    if (!p.n) r = -N_ERR_DENIED;
+    else if ((r = place_lock(&p, user, &f)) >= 0)
+        r = !p.found ? -N_ERR_NOT_FOUND : place_may_change(&p, user, false);
+    if (r >= 0) r = volume_writable(store.v);
+    if (r >= 0) {
+        change_begin();
+        r = ns_record_amend(store.v, p.entry.id, &(struct ns_amend){.fields = NS_OWNER, .owner = owner});
+        change_end();
+    }
+    if (f) folder_unlock(f);
+    place_free(&p);
+    if (r >= 0) store_dirty(false);
+    return r < 0 ? r : 0;
+}
+
 int store_entry_remove(const char *path, bool user) {
     struct volume *v = store.v;
     struct place p;
@@ -923,7 +1018,7 @@ static int write_all(struct handle *h, uint64_t offset, const void *data, size_t
 
 int store_save(const char *path, const void *data, size_t n, bool user) {
     struct handle *h;
-    int r = document_open(path, N_DOCUMENT_REPLACE, user, &h);
+    int r = store_document_open(path, N_DOCUMENT_REPLACE, user, &h);
     if (r < 0) return r;
     r = write_all(h, 0, data, n, user);
     if (r >= 0) r = store_document_commit(h, N_COMMIT_WAIT);
@@ -933,9 +1028,9 @@ int store_save(const char *path, const void *data, size_t n, bool user) {
 
 int store_append(const char *path, const void *data, size_t n, bool user) {
     struct handle *h;
-    int r = document_open(path, N_DOCUMENT_EDIT, user, &h);
-    if (r == -N_ERR_NOT_FOUND) r = document_open(path, N_DOCUMENT_CREATE, user, &h);
-    if (r == -N_ERR_EXISTS) r = document_open(path, N_DOCUMENT_EDIT, user, &h); /* made meanwhile */
+    int r = store_document_open(path, N_DOCUMENT_EDIT, user, &h);
+    if (r == -N_ERR_NOT_FOUND) r = store_document_open(path, N_DOCUMENT_CREATE, user, &h);
+    if (r == -N_ERR_EXISTS) r = store_document_open(path, N_DOCUMENT_EDIT, user, &h); /* made meanwhile */
     if (r < 0) return r;
     if ((r = store_document_claim(h, true)) >= 0) {
         int64_t size = store_document_size(h);

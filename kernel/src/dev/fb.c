@@ -98,7 +98,6 @@ void fb_init(struct limine_framebuffer *f) {
     o->native = fb.native;
     fb_monitor(f->edid, f->edid_size);
     screens_boot();
-    fb_set_simulated(cmdline_has("fbsim10"));
 }
 
 int64_t fb_buffer_check(uint32_t width, uint32_t height, uint32_t pitch, uint32_t format, uint64_t offset,

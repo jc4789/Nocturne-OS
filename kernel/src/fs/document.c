@@ -80,7 +80,6 @@ struct opening {
     struct object object;
     struct doc *doc;          /* the table's lock; NULL once closed */
     int access;               /* N_DOCUMENT_READ, _EDIT, or _REPLACE until its replacement is saved */
-    bool user;                /* an app's: no SYSTEM document is replaced */
     struct version *version;  /* READ's */
     uint64_t saving;          /* the generation an N_COMMIT_START save waits for (0: none; savings' lock) */
     int outcome;              /* the last save's, once known */
@@ -620,10 +619,10 @@ static void opening_move(struct opening *op, struct doc *d) {
     spin_unlock(&docs.lock, flags);
 }
 
-static int opening_new(struct doc *d, int access, bool user, struct version *ver, struct handle **out) {
+static int opening_new(struct doc *d, int access, struct version *ver, struct handle **out) {
     struct opening *op = kzalloc(sizeof *op);
     if (!op) return -N_ERR_NO_MEMORY;
-    *op = (struct opening){.doc = d, .access = access, .user = user, .version = ver};
+    *op = (struct opening){.doc = d, .access = access, .version = ver};
     object_init(&op->object, &document_ops, op);
     if (!(*out = handle_open(&op->object, access != N_DOCUMENT_READ ? HANDLE_WRITE : 0))) {
         kfree(op);
@@ -633,7 +632,7 @@ static int opening_new(struct doc *d, int access, bool user, struct version *ver
 }
 
 /* a replacement for the document at p: a document of its own in the temp folder until it is saved */
-static int open_replacement(const struct place *p, bool user, struct handle **out) {
+static int open_replacement(const struct place *p, struct handle **out) {
     struct volume *v = store.v;
     char name[17];
     size_t n;
@@ -657,7 +656,7 @@ static int open_replacement(const struct place *p, bool user, struct handle **ou
     if (!(d->name = kmalloc(p->n))) r = -N_ERR_NO_MEMORY;
     else memcpy(d->name, p->name, p->n);
     bool writing = r >= 0 && (r = writer_add(d)) >= 0;
-    if (r >= 0) r = opening_new(d, N_DOCUMENT_REPLACE, user, NULL, out);
+    if (r >= 0) r = opening_new(d, N_DOCUMENT_REPLACE, NULL, out);
     if (r < 0 && writing) d->writers--;
     size_tell(d);
     mutex_unlock(&d->lock);
@@ -665,23 +664,21 @@ static int open_replacement(const struct place *p, bool user, struct handle **ou
     return r;
 }
 
-int document_open(const char *path, int access, bool user, struct handle **out) {
-    if (access < N_DOCUMENT_READ || access > N_DOCUMENT_REPLACE) return -N_ERR_INVALID;
+/* An opening of what p says, as access asks: p is the caller's to free. */
+static int open_at(struct place *p, int access, bool user, struct handle **out) {
     struct volume *v = store.v;
-    struct place p;
-    int r = place_find(path, user, &p);
-    if (r < 0) return r;
-    uint64_t id = p.entry.id, g = 0;
+    int r = 0;
+    uint64_t id = p->entry.id, g = 0;
     bool created = false;
     if (access == N_DOCUMENT_CREATE) {
         struct folder_lock *f = NULL;
-        if ((r = place_lock(&p, user, &f)) >= 0) {
-            r = p.found ? -N_ERR_EXISTS : place_may_change(&p, user, false);
+        if ((r = place_lock(p, user, &f)) >= 0) {
+            r = p->found ? -N_ERR_EXISTS : place_may_change(p, user, false);
             if (r >= 0) r = volume_writable(v);
             if (r >= 0) {
                 struct ns_told told = {0};
                 g = change_begin();
-                r = ns_create(v, p.folder, p.name, p.n, STORE_DOCUMENT, 0, 0, store_now(), &id, &told);
+                r = ns_create(v, p->folder, p->name, p->n, STORE_DOCUMENT, 0, 0, store_now(), &id, &told);
                 change_end();
                 entry_watch_publish(&told);
                 created = r >= 0;
@@ -689,20 +686,18 @@ int document_open(const char *path, int access, bool user, struct handle **out) 
             folder_unlock(f);
         }
         access = N_DOCUMENT_EDIT;
-    } else if (p.found && p.record.kind != STORE_DOCUMENT) {
+    } else if (p->found && p->record.kind != STORE_DOCUMENT) {
         r = -N_ERR_IS_FOLDER;
     } else if (access == N_DOCUMENT_REPLACE) {
-        if ((r = place_may_change(&p, user, p.found)) >= 0 && (r = volume_writable(v)) >= 0)
-            r = open_replacement(&p, user, out);
-        place_free(&p);
+        if ((r = place_may_change(p, user, p->found)) >= 0 && (r = volume_writable(v)) >= 0)
+            r = open_replacement(p, out);
         if (r >= 0) store_dirty(false);
         return r;
-    } else if (!p.found) {
+    } else if (!p->found) {
         r = -N_ERR_NOT_FOUND;
     } else if (access == N_DOCUMENT_EDIT) {
-        r = place_may_change(&p, user, true);
+        r = place_may_change(p, user, true);
     }
-    place_free(&p);
     if (r < 0) return r;
     struct doc *d = doc_get(id);
     if (!d) return -N_ERR_NO_MEMORY;
@@ -716,7 +711,7 @@ int document_open(const char *path, int access, bool user, struct handle **out) 
         if (created) d->changed_in = MAX(d->changed_in, g);
         if (access == N_DOCUMENT_READ) r = (ver = version_get(d)) ? 0 : -N_ERR_NO_MEMORY;
         else writing = (r = writer_add(d)) >= 0;
-        if (r >= 0) r = opening_new(d, access, user, ver, out);
+        if (r >= 0) r = opening_new(d, access, ver, out);
         if (r < 0 && ver) version_put(d, ver);
         if (r < 0 && writing) writer_remove(d);
     }
@@ -728,7 +723,45 @@ int document_open(const char *path, int access, bool user, struct handle **out) 
 }
 
 int store_document_open(const char *path, int access, bool user, struct handle **out) {
-    return document_open(path, access, user, out);
+    if (access < N_DOCUMENT_READ || access > N_DOCUMENT_REPLACE) return -N_ERR_INVALID;
+    struct place p;
+    int r = place_find(path, user, &p);
+    if (r < 0) return r;
+    r = open_at(&p, access, user, out);
+    place_free(&p);
+    return r;
+}
+
+int store_private_open(uint32_t user, uint32_t region, int access, struct handle **out) {
+    if ((access != N_DOCUMENT_READ && access != N_DOCUMENT_EDIT && access != N_DOCUMENT_REPLACE) || !region)
+        return -N_ERR_INVALID;
+    struct volume *v = store.v;
+    char name[17];
+    size_t n = store_region_name(user, region, name);
+    struct place p;
+    memset(&p, 0, sizeof p);
+    p.folder = STORE_ID_REGIONS;
+    p.name = name;
+    p.n = n;
+    p.area = AREA_OTHER;
+    struct folder_lock *f = folder_lock(STORE_ID_REGIONS);
+    if (!f) return -N_ERR_NO_MEMORY;
+    int r = ns_find(v, STORE_ID_REGIONS, name, n, &p.entry);
+    if (r >= 0) r = ns_record(v, p.entry.id, &p.record, NULL);
+    if (r >= 0) {
+        p.found = true;
+    } else if (r == -N_ERR_NOT_FOUND && access != N_DOCUMENT_READ && (r = volume_writable(v)) >= 0) {
+        /* made here with its user's number: a replacement then swaps its content in */
+        change_begin();
+        r = ns_create(v, STORE_ID_REGIONS, name, n, STORE_DOCUMENT, 0, 0, store_now(), &p.entry.id, NULL);
+        if (r >= 0) r = ns_record_amend(v, p.entry.id, &(struct ns_amend){.fields = NS_OWNER, .owner = user});
+        change_end();
+        if (r >= 0) r = ns_record(v, p.entry.id, &p.record, NULL);
+        p.found = r >= 0;
+    }
+    folder_unlock(f);
+    if (r < 0) return r;
+    return open_at(&p, access, false, out);
 }
 
 bool store_document_is(struct handle *h) { return opening_of(h) != NULL; }
@@ -947,7 +980,7 @@ static int replace(struct opening *op, struct doc *t, uint64_t *g, bool *moved) 
     uint64_t id = r >= 0 ? e->id : 0;
     kfree(e);
     if (r >= 0 && (r = ns_record(v, id, &rec, NULL)) >= 0)
-        r = rec.kind != STORE_DOCUMENT ? -N_ERR_IS_FOLDER : op->user && (rec.attributes & STORE_SYSTEM) ? -N_ERR_DENIED : 0;
+        r = rec.kind != STORE_DOCUMENT ? -N_ERR_IS_FOLDER : 0;
     struct doc *d = r >= 0 ? doc_get(id) : NULL;
     if (r >= 0 && !d) r = -N_ERR_NO_MEMORY;
     if (r < 0) {

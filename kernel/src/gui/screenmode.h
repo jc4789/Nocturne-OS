@@ -8,8 +8,8 @@
    mode; and tells the driver through the screen's state (wm_screen_mode, gui/wm.c). The Settings
    app lists the modes of each screen, tries one, keeps it or goes back (SYS_SCREEN_INFO,
    display_abi.h); a mode tried and not kept goes back by itself. The mode kept for each monitor
-   is the user's: it is kept in the user's AppData\Nocturne\Displays.conf (sys/keep.c), which
-   screen_modes_init registers to be read back by keep_start.
+   is the user's. The kernel holds it for as long as it runs and does not save it: the settings
+   service hears of it (N_DOMAIN_DISPLAY, sys/settings.h) and applies it back at the next start.
    screen_modes_offer: the monitor on screen's output, its modes and what it showed (a kernel
    copy); count 0: it drives none any more, though it still runs (it may have given the screen
    back). screen_modes_gone: the same, for a driver whose claim ended. screen_modes_shown: what the
@@ -17,7 +17,6 @@
    monitor), into desc, whose width and height are the buffers'. */
 struct n_screen_modes;
 struct screen_mode_desc;
-void screen_modes_init(void); /* before keep_start (kmain_late) */
 void screen_modes_offer(unsigned screen, const struct n_screen_modes *m);
 void screen_modes_gone(unsigned screen);
 void screen_modes_shown(unsigned screen, struct screen_mode_desc *desc);

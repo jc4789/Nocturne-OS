@@ -25,6 +25,7 @@ struct store {
     struct volume *v;
     struct store_supply *blocks;
     uint64_t temp;           /* C:\Nocturne\Temp: replacements not yet saved, documents removed while open */
+    uint64_t system, programs, users; /* C:\Nocturne, C:\Programs, C:\Users: place_find's areas */
     uint64_t temp_names;     /* the last name given there (atomic) */
     struct mutex moves;      /* moves from one folder to another, one at a time */
     struct mutex committing; /* commits, one at a time */
@@ -56,12 +57,23 @@ void folder_unlock(struct folder_lock *l);
 /* Where a path leads, for the kernel or (user) for an app, to which PRIVATE entries are not there:
    the folder holding its last name (depth: the names before it), and the entry when there is one
    (found). The root is found and has no name. place_find looks without a lock: what it finds may
-   change until place_lock locks the folder and looks again (-N_ERR_NOT_FOUND: the folder went). */
+   change until place_lock locks the folder and looks again (-N_ERR_NOT_FOUND: the folder went).
+   For an app, place_find says -N_ERR_DENIED for what its identity may not read (store.h). */
+enum store_area {
+    AREA_TOP,     /* C:\ itself, C:\Users itself: the lists */
+    AREA_SYSTEM,  /* C:\Nocturne */
+    AREA_PROGRAMS,/* C:\Programs */
+    AREA_HOME,    /* C:\Users\<name> */
+    AREA_OTHER,
+};
 struct place {
     struct path path;
     uint64_t folder;
     size_t depth;
     uint16_t folder_attributes;
+    enum store_area area;
+    uint32_t home_owner; /* AREA_HOME: the user C:\Users\<name> belongs to */
+    uint64_t top;        /* the entry directly in C:\ the path goes through */
     const char *name; /* into the path's text */
     size_t n;
     bool found;
@@ -71,8 +83,9 @@ struct place {
 int place_find(const char *text, bool user, struct place *out);
 void place_free(struct place *p);
 int place_lock(struct place *p, bool user, struct folder_lock **out);
-/* An app changes no SYSTEM entry and nothing in a SYSTEM folder: -N_ERR_DENIED. entry: the entry
-   itself changes, not only the folder's list. */
+/* Whether the caller may change what the place says: for an app, as its identity may (store.h),
+   -N_ERR_DENIED otherwise. entry: the entry itself changes, not only the folder's list: the three
+   folders of the system stay where they are for all but the system's class. */
 int place_may_change(const struct place *p, bool user, bool entry);
 /* out: entry id, called name (n bytes), as n_entry_info gives it from its record. */
 void entry_fill(struct n_entry *out, const char *name, size_t n, uint64_t id, const struct store_record *rec);
@@ -101,7 +114,6 @@ static inline int copy_in(void *to, const void *from, size_t n, bool user) {
 }
 
 /* fs/document.c */
-int document_open(const char *path, int access, bool user, struct handle **out);
 /* The size of document id as its writers have it now, or -N_ERR_NOT_FOUND when none is open. */
 int64_t document_size_now(uint64_t id);
 /* The document entry `name` (id) of folder goes, the folder locked: when it is open, it goes to the
