@@ -297,6 +297,7 @@ static void desk_fit(size_t i, const struct n_shell_screen *s, bool deep) {
     d->deep = deep;
     desk_place(d, i);
     desk_paint(d, i);
+    n_events_unwatch(events, TOKEN_DESK + i);
     if (old) win_close(old);
     n_events_watch(events, win->handle, N_EVENT_RECEIVABLE, TOKEN_DESK + i);
 }
@@ -984,6 +985,7 @@ static void peer_add(n_handle channel) {
 }
 
 static void peer_event(size_t at) {
+    if (at >= peer_count || peers[at] < 0) return; /* もう閉じた相手の知らせ */
     for (;;) {
         struct n_shell_notice notice;
         n_result got = n_channel_receive(peers[at], &notice, sizeof notice, 0, NULL);

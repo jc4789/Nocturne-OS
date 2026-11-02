@@ -304,7 +304,8 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   - `identity` が NULL なら、子の身元は親と同じ。`identity` を渡すときの規則は §13。
   - 引数と環境の文字列（各 nul を含む）と、二つの NULL 終端ポインター配列（1 個 8 バイト）は、
     合わせて `N_LAUNCH_MAX_BYTES`（4 MiB）まで。超えると `N_ERR_TOO_MANY_ARGUMENTS`。
-  - 引き渡すハンドルは、表の順に子アプリの 0, 1, 2, … 番になる（-1 は空き）。
+  - 引き渡すハンドルは、表の順に子アプリの 0, 1, 2, … 番になる（-1 は空き）。0, 1, 2 番が空きなら、
+    カーネルはそこへ何も読めず書いても捨てられる stream を置く。子が開くチャンネルや窓がその番号に来ない。
   - `path` は完全指定（§3）。名前だけのプログラムは libc の `find_program(name, out, n)` が
     `N_FOLDER_SYSTEM`、次に `N_FOLDER_PROGRAMS` の各アプリのフォルダーで探す。
     それ以外の名前は `n_path_complete` で完全指定にする。
@@ -520,7 +521,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     機械は幾つでも出口（codec の jack、画面への pin）を持つ。鳴らすのは一つで、既定は刺さった
     出力が先。刺さり方が変わると、流れを切らずに移り、`device` が変わる。
     鳴らす先が無くても音量は保たれ、後から付いた先に使われる。音量と消音は音の部品
-    （`dev/audio.c`）の持ち物で、変える口は §12 の `N_DOMAIN_AUDIO` とタスクバーのスピーカー。
+    （`dev/audio.c`）の持ち物で、変える口は §12 の `N_DOMAIN_AUDIO`。
   - `n_audio_output_watch()`（`SYS_AUDIO_OUTPUT_WATCH`）：`n_audio_output` が返すもの（音量、消音、
     `device`）が変わると受け取れる見張り（`N_KIND_WATCH`、§12）。誰が変えても知らせ、同じ値を
     当て直すのは変化ではない。
@@ -1241,7 +1242,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 - 能力（`N_KIND_CAPABILITY`）は特権を一つ持つハンドル。持つことが権限の証明で、渡すことが委譲。
   起動の表か、メッセージの添付で渡す。
   - 種類：`N_CAP_ROOT`、`N_CAP_SERVICE_ROOT`、`N_CAP_IDENTITY_GRANT`、`N_CAP_PCI_CLAIM`、`N_CAP_POWER`、
-    `N_CAP_SCREEN_READ`、`N_CAP_SETTINGS_APPLY`、`N_CAP_STORE_PRIVATE`。
+    `N_CAP_SCREEN_READ`、`N_CAP_SETTINGS_APPLY`、`N_CAP_STORE_PRIVATE`、`N_CAP_SHELL`。
   - カーネルが作るのは `N_CAP_ROOT` を一つだけで、最初のプロセスがハンドル `N_INITIAL_ROOT_HANDLE`
     （3）で受ける。最初のプロセスの身元は `user` 0、`session` 0、`N_CLASS_SYSTEM`、`program` 0。
   - `n_cap_derive(cap, kind)`：`N_CAP_ROOT` は全部の種類を、ほかの能力は同じ種類だけを切り出す。
@@ -1253,10 +1254,10 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 | 呼出し | 要るもの |
 |---|---|
 | `n_pci_claim` | `N_CAP_PCI_CLAIM` |
-| `poweroff`、`reboot` | `N_CAP_POWER` |
+| `poweroff`、`reboot`、`n_power_request` | `N_CAP_POWER` |
 | `screen_grab` | `N_CAP_SCREEN_READ` |
 | `n_service_register` | `N_CAP_SERVICE_ROOT` |
-| `n_session_identity` | `N_CAP_IDENTITY_GRANT` |
+| `n_shell_*`、`n_power_state`、`n_power_watch` | `N_CAP_SHELL` |
 | `n_system_log`、`n_system_log_open` の受信 | 級が ADMIN 以上（書くのは誰でも） |
 | `SYS_NET_TEST` | 級が ADMIN 以上 |
 
@@ -1265,9 +1266,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   - 端が別のアプリの手に渡ると（起動の表、添付の受信）、受け手が今の身元を超えないときだけ、受け手の
     身元へ下がる。渡した者も端を持ち続けられるので、上がる向きには動かない。報告される身元は、端を
     持つ者の権限を超えない。
-- `n_session_identity(cap, &identity)`：カーネルの窓の系（スタートメニュー）が起こすアプリの身元を
-  決める。`cls` は呼ぶ側を超えられない。決まる前は `user` 0、`session` 0、`N_CLASS_USER`、`program` 0。
-  `gui_launch` が起こすアプリの身元は呼ぶ側と同じ。
+- `gui_launch` は普通の `n_app_launch` で、起こすアプリの身元は呼ぶ側と同じ。
 
 ## 14. サービス
 
@@ -1310,7 +1309,44 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 - 利用者：サービス `accounts`。私的な領域に型のある記録で一覧を持つ。合言葉は salt つきの PBKDF2-HMAC-SHA256。
   一人目は誰が作っても admin。`n_user_folder` と `n_temp_folder` は身元から `accounts` が引く。
   新しい利用者のフォルダーの中身の元は `C:\Nocturne\NewUser`。
-- セッション：サービス `session`。ログインの窓を出し、選ばれた利用者の身元を `n_session_identity` でカーネルの窓の系に決める。
-  コンソールの起動は同じ身元で `sh` を起こす。`N_SESSION_END` でセッションを終え、ログインの窓へ戻る。
+- セッション：サービス `session`。ログインの窓を出し、選ばれた利用者の身元と `N_CAP_SHELL` でシェル
+  `C:\Nocturne\System\shell`（§16）を起こす。シェルが落ちたら起こし直す。コンソールの起動は同じ身元で `sh` を起こす。
+  `n_session_end`（`N_SESSION_END`）でセッションのプログラムを止め、ログインの窓へ戻る。
 - 機械：サービス `machine`。`N_CAP_POWER` と `N_CAP_SCREEN_READ` を持ち、利用者のアプリの電源と画面の依頼を受ける
-  （`n_machine_power`、`n_machine_screen`）。能力をアプリへ配らない。
+  （`n_machine_power`、`n_machine_screen`）。能力をアプリへ配らない。`n_machine_choose(op)` は利用者がメニューで
+  選んだ操作で、`N_MACHINE_SLEEP`・`N_MACHINE_HIBERNATE` も受ける。結果を待たずに戻り、段取りは `n_power_state`（§16）で届く。
+
+## 16. シェル
+
+シェルは普通のプロセス（`user/apps/shell.c`）で、セッションが利用者の身元で起こす。タスクバー、開始メニュー、音量、通知、
+デスクトップの絵と印を持つ。窓の合成と管理はカーネル（`gui/wm.c`）が持つ。カーネルは文を言わず、絵を描かない。
+型は `common/display_abi.h`。`n_shell_*` は第一引数に `N_CAP_SHELL` の能力を取り、無ければ `N_ERR_DENIED`。
+
+- `n_shell_place(cap, win, &place)`：自分の枠なしの窓（`WIN_NO_DECOR`）を置く。枠つきの窓は `N_ERR_INVALID`。
+  - `layer`：下から `N_LAYER_DESKTOP`、`N_LAYER_NORMAL`（アプリの窓）、`N_LAYER_PANEL`、`N_LAYER_OVERLAY`。
+    `N_LAYER_PANEL` の窓は焦点を取らず、同じ画面の全画面の窓に焦点がある間は描かれない。
+  - `screen`、`x`、`y`：画面の番号と、その画面の中の位置。無い画面は `N_ERR_NOT_FOUND`。
+  - `reserve_edge`（`N_EDGE_*`）と `reserve`：その画面の縁を、窓がある間だけ `reserve` 画素取っておく。
+    アプリの窓の最大化はその残りの中に収まる。窓の領域が変わると開いた窓を入れ直す。
+  - `flags`：`N_PLACE_NO_FOCUS` は焦点を取らない。`N_PLACE_BLEND` は窓の画素の alpha で下の絵に混ぜる。
+- `n_shell_screens(cap, out, max)`：画面の数を返し、`struct n_shell_screen` を `max` まで書く。電源の切れた画面は `on` が 0。
+- `n_shell_windows(cap, out, max)`：アプリの枠つきの窓で、一度出たものの数を返し、古い順に `struct n_shell_window`
+  （`id`、アプリの番号、`N_SHELL_WINDOW_MINIMIZED`・`FOCUSED`・`FULLSCREEN`、画面、題）を `max` まで書く。
+- `n_shell_window(cap, id, op)`：`N_SHELL_RAISE`（元に戻して焦点を渡す）、`N_SHELL_MINIMIZE`、`N_SHELL_CLOSE`（`EV_CLOSE` を送る）。
+- `n_shell_watch(cap)`：窓、窓の順、焦点が変わると知らせる watch（`n_watch_take`）。
+- `n_shell_hotkey(cap, win, key, mods)`：キーと修飾の組を `win` が受ける。`mods` は `NMOD_SHIFT`・`NMOD_CTRL`・`NMOD_ALT`。
+  その組はアプリへ届かず、`win` へ `EV_HOTKEY` で届く。組が既に取られていれば `N_ERR_EXISTS`。窓が閉じると組も消える。
+- 層のある窓はポインターが離れると `EV_MOUSE_LEAVE` を受ける。
+
+電源の段取りはカーネルが型のある値で言い、文にしない。シェルが文にする。
+
+- `n_power_state(cap, &state)`：`struct n_power_state`（`serial`、`stage`、`action`、`reason`、`forceable`、`can_sleep`、
+  `can_hibernate`、`detail`）。`stage` は `enum n_power_stage`、`reason` は `enum n_power_reason`。`detail` は窓の題か装置の名。
+  窓の題を持つので `N_CAP_SHELL` だけが読める。
+- `n_power_watch(cap)`：`n_power_state` の変更を知らせる watch。
+- `n_power_request(cap, action, flags)`：`N_CAP_POWER` の口。`N_POWER_CHOSEN` は利用者の選択で、窓に閉じるよう頼んでから進む。
+  閉じない窓があれば `N_POWER_CLOSING` を言い、`forceable` ならもう一度の選択で強制する。アプリの電源の変更は機械のサービス（§15）を通す。
+
+通知はサービス `N_SHELL_SERVICE`（`"shell"`）のチャンネルで受ける。名前の範囲は同じ利用者の同じセッション（§14）。
+
+- `n_shell_notify(title, text)`：`struct n_shell_notice` を一通送る。シェルは数秒の間それを出す。シェルの音量の表示は §12 の設定を読み、変更は `n_setting_set_int` で設定のサービスへ頼む。

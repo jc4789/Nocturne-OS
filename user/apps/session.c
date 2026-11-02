@@ -120,9 +120,7 @@ static void shell_session(const struct n_identity *identity, const struct n_acco
                               .identity = identity, .identity_grant = grant_cap};
     n_result status = session_program(CONSOLE, &launch);
     if (status < 0) return;
-    printf("
-session: the shell ended (%d)
-", (int)status);
+    printf("\nsession: the shell ended (%d)\n", (int)status);
     fflush(stdout);
 }
 
