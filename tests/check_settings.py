@@ -26,6 +26,7 @@ INT = re.compile(rf'INT_SETTING\(\s*(\w+),\s*(\w+),\s*(\w+),\s*(\w+),\s*({TEXT})
 FULL = re.compile(r'\{\s*\.domain\s*=\s*(\w+),\s*\.key\s*=\s*(\w+),\s*\.type\s*=\s*(\w+),(.*?)\n?\s*\},?', re.S)
 
 CONSTANTS = {'INT32_MAX': 2 ** 31 - 1, 'INT32_MIN': -2 ** 31}
+CONSTANTS.update((name, int(value, 0)) for name, value in re.findall(r'^#define (N_\w+_DEFAULT) (\S+)', abi, re.M))
 
 
 def number(text):
@@ -75,7 +76,7 @@ for domain, key, name in entries:
 # カーネルの領域の鍵は全部宣言される。
 DOMAINS = {'n_boot_key': 'N_DOMAIN_BOOT', 'n_audio_key': 'N_DOMAIN_AUDIO', 'n_display_key': 'N_DOMAIN_DISPLAY',
            'n_window_key': 'N_DOMAIN_WINDOW', 'n_input_key': 'N_DOMAIN_INPUT', 'n_power_key': 'N_DOMAIN_POWER',
-           'n_network_key': 'N_DOMAIN_NETWORK'}
+           'n_network_key': 'N_DOMAIN_NETWORK', 'n_language_setting_key': 'N_DOMAIN_LANGUAGE'}
 for enum, domain in DOMAINS.items():
     block = re.search(rf'enum {enum} \{{(.*?)\}};', abi, re.S)
     if not block:

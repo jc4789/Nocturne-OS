@@ -168,6 +168,9 @@ static uint32_t fixed_size(uint32_t type) {
     }
 }
 
+/* カーネルの一覧の鍵：値は装置ごとの選択で、カーネルの今の値は一つでない。 */
+static bool listed_type(uint32_t type) { return type == N_SETTING_MONITOR_MODE || type == N_SETTING_INPUT_DEVICE; }
+
 static int64_t options_count(const struct n_setting_decl *d) {
     int64_t count = 0;
     size_t at = 0;
@@ -198,6 +201,7 @@ static bool decl_valid(const struct n_setting_decl *d) {
         return d->max >= 0 && d->max <= N_SETTING_VALUE_MAX && (int64_t)strlen(d->fallback_text) <= d->max;
     case N_SETTING_ENDPOINT:
     case N_SETTING_MONITOR_MODE:
+    case N_SETTING_INPUT_DEVICE:
         return true;
     default:
         return false;
@@ -613,6 +617,12 @@ static struct trial *trial_find(const struct n_setting_id *id) {
 /* 値の確かめ。enum n_setting_reason。 */
 static uint32_t value_check(const struct known *k, const void *data, uint32_t length) {
     if (k->d.type == N_SETTING_STRING) return length > k->d.max ? N_SETTING_OUT_OF_RANGE : N_SETTING_OK;
+    if (k->d.type == N_SETTING_INPUT_DEVICE) {
+        struct n_setting_input_device r;
+        if (length < sizeof r) return N_SETTING_WRONG_TYPE;
+        memcpy(&r, data, sizeof r);
+        return r.size == length && r.id_length && r.id_length <= length - sizeof r ? N_SETTING_OK : N_SETTING_WRONG_TYPE;
+    }
     if (length != fixed_size(k->d.type)) return N_SETTING_WRONG_TYPE;
     if (k->d.type == N_SETTING_BOOL || k->d.type == N_SETTING_INT || k->d.type == N_SETTING_ENUM) {
         int32_t v;
@@ -807,7 +817,7 @@ static const void *current_bytes(const struct known *k, const struct n_setting_i
         return v->bytes;
     }
     /* カーネルの鍵は今の値。一覧の鍵は装置ごとの選択が無ければ既定（全部 0）。 */
-    if (k->kernel && k->d.type != N_SETTING_MONITOR_MODE) {
+    if (k->kernel && !listed_type(k->d.type)) {
         uint32_t size = fixed_size(k->d.type);
         n_result r = n_settings_effective(k->d.domain, k->d.key, scratch, SCRATCH_BYTES);
         if (r >= 0 && (uint32_t)r == size) {
@@ -881,12 +891,15 @@ static void answer_declare(struct conn *c, const struct n_settings_request *m, c
 /* 利用者が前面になった。その人の値を持ち主へ当て直す。 */
 static void session_changed(uint32_t user) {
     active_user = user;
-    for (size_t i = 0; i < value_count; i++) {
-        const struct value *v = &values[i];
-        if (v->id.user != user || v->id.program) continue;
-        struct known *k = known_find(v->id.domain, v->id.key, 0);
-        if (!k || k->d.scope != N_SCOPE_USER) continue;
-        n_result r = apply_start(k, &v->id, v->bytes, v->length, 0);
+    /* 持ち主の鍵の全部：値の無い鍵は既定で。前の利用者の値を残さない。 */
+    for (size_t i = 0; i < known_count; i++) {
+        struct known *k = knowns[i];
+        if (k->d.scope != N_SCOPE_USER || k->d.apply == N_APPLY_NONE) continue;
+        struct n_setting_id id = {.domain = k->d.domain, .key = k->d.key, .user = user};
+        const struct value *v = value_find(&id);
+        uint8_t fallback[N_SETTING_TEXT_MAX + sizeof(struct n_sockaddr)];
+        uint32_t length = v ? v->length : fallback_bytes(k, fallback);
+        n_result r = apply_start(k, &id, v ? v->bytes : fallback, length, 0);
         if (r < 0) say("a setting of the user was refused", r);
     }
 }
@@ -1137,7 +1150,7 @@ static void kernel_domain_changed(uint32_t domain) {
     uint8_t now[sizeof(struct n_sockaddr) + sizeof(int32_t)];
     for (size_t i = 0; i < known_count; i++) {
         struct known *k = knowns[i];
-        if (k->d.domain != domain || !k->kernel || k->d.apply == N_APPLY_RESTART || k->d.type == N_SETTING_MONITOR_MODE) continue;
+        if (k->d.domain != domain || !k->kernel || k->d.apply == N_APPLY_RESTART || listed_type(k->d.type)) continue;
         struct n_setting_id id = {.domain = domain, .key = k->d.key};
         if (k->d.scope == N_SCOPE_USER) {
             if (!active_user) continue;

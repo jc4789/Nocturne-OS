@@ -8,6 +8,7 @@
 #include <webcookie.h>
 #include <nocturne_settings.h>
 #include <threads.h>
+#include <nocturne_language.h>
 
 enum { KEYS = 8 };
 static struct { const struct n_setting_decl *decl; char *bytes; size_t length; bool held; } table[KEYS];
@@ -74,6 +75,7 @@ n_result n_setting_set_if(struct n_setting_id id, const void *expected, size_t e
     }
     return n_setting_set(id, value, length, reason);
 }
+size_t n_locale_languages(char *out, size_t cap) { return (size_t)snprintf(out, cap, "%s", "ja"); }
 n_handle n_setting_watch(uint32_t domain, uint32_t key) { (void)domain; (void)key; return -N_ERR_NOT_FOUND; }
 n_result n_setting_watch_take(n_handle watch, struct n_settings_changed *out) { (void)watch; (void)out; return -N_ERR_NOT_READY; }
 n_result n_handle_close(n_handle h) { (void)h; return 0; }
@@ -103,9 +105,9 @@ static bool host_is(const char *input, const char *expected) {
 
 static void languages(void) {
     char list[WEBPREFS_ACCEPT_LANGUAGE_MAX + 1], accept[WEBPREFS_ACCEPT_LANGUAGE_MAX + 1];
-    CHECK(webprefs_languages(list, sizeof list) > 0 && !strcmp(list, WEBPREFS_DEFAULT_LANGUAGES));
+    CHECK(webprefs_languages(list, sizeof list) > 0 && !strcmp(list, "ja"));
     CHECK(webprefs_languages_default());
-    CHECK(webprefs_accept_language(accept, sizeof accept) > 0 && !strcmp(accept, "ja,zh;q=0.9"));
+    CHECK(webprefs_accept_language(accept, sizeof accept) > 0 && !strcmp(accept, "ja"));
     uint64_t generation = webprefs_languages_generation();
     const char *tags[] = {"en-US", "de"};
     CHECK(webprefs_set_languages(tags, 2) == 0);
