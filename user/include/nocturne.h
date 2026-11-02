@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "abi.h"
+#include "audio_abi.h"
 #include "settings_abi.h"
 #include "gfx.h"
 #include <cdefs.h>

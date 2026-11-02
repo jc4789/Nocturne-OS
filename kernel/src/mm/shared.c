@@ -492,6 +492,22 @@ void shared_kernel_end(struct object *o, void *view) {
     vunmap(view, p->count);
     object_unref(o);
 }
+struct object *shared_kernel_contig(size_t pages, unsigned bits, uint64_t *base) {
+    uint64_t run = pmm_alloc_contig(pages, bits);
+    if (!run) return NULL;
+    struct shared_pages *p = shared_new(pages * PAGE_SIZE, SHARED_RANGE, 0);
+    if (!p) {
+        pmm_free_contig(run, pages);
+        return NULL;
+    }
+    memset(phys_to_virt(run), 0, pages * PAGE_SIZE);
+    p->base = run;
+    p->count = pages;
+    p->owned = true;
+    object_ref(&p->object);
+    *base = run;
+    return &p->object;
+}
 int64_t shared_kernel_handle(struct object *o) {
     struct handle *h = handle_open(o, HANDLE_WRITE);
     return h ? handle_install(h) : -N_ERR_NO_MEMORY;

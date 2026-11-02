@@ -24,8 +24,6 @@ static const struct setting settings[] = {
     {N_DOMAIN_BOOT, N_BOOT_SMP, N_SETTING_BOOL, N_SETTING_AT_START, 0, 1, boot_setting_put, boot_setting_get},
     {N_DOMAIN_BOOT, N_BOOT_RESUME, N_SETTING_BOOL, N_SETTING_AT_START, 0, 1, boot_setting_put, boot_setting_get},
     {N_DOMAIN_BOOT, N_BOOT_UNISOLATED_DRIVERS, N_SETTING_BOOL, N_SETTING_AT_START, 0, 1, boot_setting_put, boot_setting_get},
-    {N_DOMAIN_AUDIO, N_AUDIO_VOLUME, N_SETTING_INT, 0, 0, 100, audio_setting_put, audio_setting_get},
-    {N_DOMAIN_AUDIO, N_AUDIO_MUTED, N_SETTING_BOOL, 0, 0, 1, audio_setting_put, audio_setting_get},
     {N_DOMAIN_DISPLAY, N_DISPLAY_MODE, N_SETTING_MONITOR_MODE, N_SETTING_LIST, 0, 0, screen_modes_setting_put, screen_modes_setting_get},
     {N_DOMAIN_DISPLAY, N_DISPLAY_HOLD_SECONDS, N_SETTING_INT, 0, 0, INT32_MAX, screen_hold_setting_put, screen_hold_setting_get},
     {N_DOMAIN_WINDOW, N_WINDOW_SMOOTH_GRADIENTS, N_SETTING_BOOL, 0, 0, 1, smooth_gradients_setting_put, smooth_gradients_setting_get},

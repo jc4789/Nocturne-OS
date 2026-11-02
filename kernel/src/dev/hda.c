@@ -1,28 +1,22 @@
 /* Intel High Definition Audio controllers (High Definition Audio Specification 1.0a; section numbers
    are its): every PCI function of the class says it is one, whoever made it, a chipset's or a
    graphics card's. Each gets its link up, its codecs read (dev/hda_codec.c), and each output of its
-   codecs becomes an output of the sound layer (dev/audio.h).
+   codecs becomes an output of the sound layer (dev/audio.h), with the formats its converter declares.
 
    Verbs go through the CORB and come back through the RIRB one at a time, polled (one thread at a
    time waits for its answer); the RIRB's interrupt only tells the controller's thread that a pin has
    announced something (4.4.1, 7.3.3.14).
 
-   A controller plays one output at a time, as the layer does, on one output stream (or a bidirectional
-   one where it has no other), through a ring of equal blocks that the stream walks without end. Each
-   block asks for an interrupt, which wakes the audio thread. Its fill() reports where the link is,
-   silences what the link has passed (the stream does not stop by itself, and comes round to it) and
-   mixes the next blocks in. Each frame of the ring has a place on a count of frames from the stream's
-   start that never wraps: `pos` is where the link is, `written` where the mix has got to, and what lies
-   between is queued. A stream that runs out of PCM plays the silence, and stops only after a while of
-   it: starting takes time, and clicks.
+   A controller plays one output at a time on one output stream (or a bidirectional one where it has
+   no other), through a ring of equal blocks that the stream walks without end. The ring is shared
+   with the service that opened the output, which writes it. Each block asks for an interrupt, which
+   tells that service to look (audio_output_period); nothing here looks at the ring's content.
 
-   What was played is what LPIB says the link has sent, and the pin's delay behind it, read from the
-   device at each report, with the clock read right after it under `engine`: audio_played gets the
-   pair. Nothing is added up from time or from the amounts given, so no error can build up between the
-   report and the device: a turn of the ring missed or counted too many only changes which frames lie
-   where on the count, not which frame of the ring the link is at. The clock only tells how many turns a
-   report that comes very late has missed. The device's crystal runs at its own rate: whoever plays to
-   a clock follows these pairs (the browser's media clock does, in user/libc/web/avmedia.c).
+   The position is what LPIB says the link has sent, less the pin's delay, with the clock read right
+   after it under `engine`. A count of frames from the stream's start that never wraps comes of it: a
+   turn of the ring missed or counted too many only changes where on the count the frames lie, not which
+   frame of the ring the link is at. The clock only tells how many turns a report that comes very late
+   has missed.
 
    A function's memory comes from the kernel and it passes the IOMMU untranslated, as every function
    the kernel runs. A graphics card's sound function may share an isolation group with the card's
@@ -30,7 +24,7 @@
    stopped while the group changes hands, and on again with its memory mapped in the claim's domain.
 
    Locks, in order: the claim's and IOMMU's mutexes, `state` (what the controller is doing as a whole:
-   probing, stopped for a claim, sensing), the sound layer's mutex and lock, verb_lock, `engine`.
+   probing, stopped for a claim, sensing), the sound layer's mutex, verb_lock, `engine`.
    `engine` is a leaf: nothing is called under it but registers. A power change (quiesce and resume, on
    a CPU that may not wait for any of the mutexes) comes between any two steps of the threads: it
    changes up and power_gen and stops the hardware under `engine`, and each of them writes what
@@ -47,9 +41,11 @@
 #include "dev/pm.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
+#include "mm/shared.h"
 #include "mm/vmm.h"
 #include "sys/alarm.h"
 #include "sys/clock.h"
+#include "sys/object.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
 
@@ -111,15 +107,6 @@
 #define STS_FIFOE (1u << 3)
 #define STS_DESE  (1u << 4)
 
-#define BLOCK       256u               /* frames: a block ends every 5.33 ms */
-#define BLOCK_NS    (BLOCK * NS_PER_S / AUDIO_RATE)
-#define BLOCKS      32u                /* the stream's descriptors */
-#define RING_FRAMES (BLOCK * BLOCKS)
-#define WIDEST      8u                 /* bytes of a frame: two channels in containers of 4 */
-#define AHEAD_FIRST 4u                 /* blocks kept queued at first... */
-#define AHEAD_MOST  16u                /* ... and after the link has overtaken the mix again and again */
-#define GUARD_FRAMES 96u               /* how far past the FIFO the link may get while a block is written */
-#define IDLE_NS     NS_PER_S           /* of silence before the stream stops */
 #define POLL_NS     NS_PER_S           /* between looks at a jack that does not announce itself */
 #define VERB_NS     (10 * NS_PER_MS)   /* a codec silent this long is gone (until the link's next reset) */
 #define RESET_NS    (100 * NS_PER_MS)  /* the longest a controller may be given to leave or enter a reset */
@@ -127,11 +114,14 @@
 #define CODEC_WAKE_NS (521 * NS_PER_US) /* after CRST# for codecs to ask for an address (4.3) */
 #define STREAM_TAG  1u                 /* the stream's number on the link: there is one per controller */
 
-/* one page of rings: the CORB, then the RIRB; a page of descriptors; the blocks */
+/* one page of rings: the CORB, then the RIRB; a page of descriptors, as many as a stream has (3.6.2). The
+   ring of frames is an object of its own, there while an output is open. */
 #define RINGS_PAGES 1
 #define BDL_PAGES   1
-#define RING_PAGES  (ALIGN_UP(RING_FRAMES * WIDEST, PAGE_SIZE) / PAGE_SIZE)
-#define DMA_PAGES   (RINGS_PAGES + BDL_PAGES + RING_PAGES)
+#define DMA_PAGES   (RINGS_PAGES + BDL_PAGES)
+#define BDL_LOW     2u   /* entries a stream takes at the least (3.3.38) */
+#define BDL_HIGH    256u /* and at the most */
+#define BLOCK_ALIGN 128u /* of a buffer's start (3.6.3) */
 
 struct bdl_entry { /* 3.6.3 */
     uint64_t address;
@@ -141,13 +131,16 @@ struct bdl_entry { /* 3.6.3 */
 
 struct hda;
 struct hda_sink {
-    struct audio_sink sink;
+    struct audio_output output;
     struct hda *h;
     struct hda_output *out;
     struct hda_codec *codec;
     struct hda_sink *next;  /* of its controller */
     struct hda_sink *every; /* of the machine (labels) */
-    char label[32];         /* the output's name, told from its namesakes */
+    uint32_t rates[11];     /* R1 to R11 (hda_output_rates) */
+    struct n_audio_size sizes[4];
+    char key[sizeof "hda-ff:ff.7-14-65535"]; /* its PCI function, its codec's address (4.3) and its pin's node */
+    char label[sizeof(((struct hda_output *)0)->name) + sizeof " 4294967295"]; /* the output's name, told from its namesakes */
 };
 
 struct hda {
@@ -161,7 +154,11 @@ struct hda {
     uint32_t *corb;
     volatile uint64_t *rirb;
     struct bdl_entry *bdl;
-    uint8_t *ring;
+    uint8_t *ring;          /* what is open's */
+    uint64_t ring_phys;
+    size_t ring_pages;
+    struct object *ring_object;
+    struct iommu_domain *guest_dom; /* the claim's domain its memory has to be in; written with `state` */
     struct iommu_guest guest;
     struct pm_device pm;
 
@@ -191,22 +188,19 @@ struct hda {
     uint16_t codec_present;
     uint16_t sense_due;
 
-    /* the sound layer's calls', one at a time (audio_sink_ops), with fill() and open() only ever after
-       a power change seen in seen_gen */
+    /* the sound layer's calls', one at a time (audio_output_ops), with what they do only ever after a
+       power change seen in seen_gen */
+    struct hda_sink *open;          /* the output that is open; read without a lock by the interrupt */
     uint64_t seen_gen;
+    uint32_t generation;            /* of the ring's content: a power change lost it */
     bool routed, running;
+    uint32_t rate, block_frames, blocks;
     unsigned frame_bytes;
-    uint64_t pos, written, cleared; /* frames from the stream's start */
-    uint64_t given;                 /* the ordinal after the last frame given to the ring */
-    uint64_t mixed;                 /* frames given to it since the stream began */
+    uint64_t pos;                   /* frames from the stream's start */
     uint32_t last_lpib;
     uint64_t last_at;               /* when last_lpib was read */
     uint64_t started_at;
-    uint64_t idle_since;            /* when it began to play nothing, 0 while it plays */
     uint32_t guard;
-    unsigned ahead;
-    bool fed;
-    unsigned late;
     uint32_t fifo_errors;           /* the interrupt's */
 };
 
@@ -421,6 +415,11 @@ static uint32_t link_verb(struct hda_link *link, unsigned codec, unsigned nid, u
 
 /* ---- interrupts ---- */
 
+static void tell_open(struct hda *h) {
+    struct hda_sink *o = __atomic_load_n(&h->open, __ATOMIC_ACQUIRE);
+    if (o) audio_output_period(&o->output);
+}
+
 /* A block played or the stream has an error; a response came in, which is a pin's when no verb waits. */
 static enum irq_result hda_irq(void *context) {
     struct hda *h = context;
@@ -430,7 +429,7 @@ static enum irq_result hda_irq(void *context) {
         uint8_t stream = sd_read8(h, SD_STS);
         sd_write8(h, SD_STS, stream & (STS_BCIS | STS_FIFOE | STS_DESE));
         if (stream & (STS_FIFOE | STS_DESE)) __atomic_add_fetch(&h->fifo_errors, 1, __ATOMIC_RELAXED);
-        audio_sink_wake();
+        tell_open(h);
     }
     if (status & INT_CONTROLLER) {
         write8(h, RIRBSTS, read8(h, RIRBSTS) & RIRBSTS_ALL);
@@ -440,9 +439,8 @@ static enum irq_result hda_irq(void *context) {
 }
 
 static void hda_tick(struct alarm *a, struct regs *r) {
-    (void)a;
     (void)r;
-    audio_sink_wake();
+    tell_open((struct hda *)((char *)a - offsetof(struct hda, tick)));
 }
 
 /* state held: its interrupt on. A message when it may send one; a guest in a claim's domain does not:
@@ -477,68 +475,48 @@ static void irq_off(struct hda *h) {
 
 /* ---- the stream ---- */
 
-static uint8_t *ring_at(const struct hda *h, uint64_t frame) { return h->ring + frame % RING_FRAMES * h->frame_bytes; }
+static uint32_t block_bytes(const struct hda *h) { return h->block_frames * h->frame_bytes; }
+static uint32_t ring_frames(const struct hda *h) { return h->block_frames * h->blocks; }
 
-static uint32_t block_bytes(const struct hda *h) { return BLOCK * h->frame_bytes; }
-
-static void block_silence(const struct hda *h, uint64_t frame) {
-    uint8_t *at = ring_at(h, frame);
-    memset(at, 0, block_bytes(h));
-    iommu_cache_flush(at, block_bytes(h));
-}
-
-/* The count of frames starts again, on a silent ring. */
-static void ring_reset(struct hda *h) {
-    memset(h->ring, 0, RING_FRAMES * WIDEST);
-    iommu_cache_flush(h->ring, RING_FRAMES * WIDEST);
-    h->pos = h->written = h->cleared = 0;
+/* The count of frames starts again. */
+static void stream_idle(struct hda *h) {
+    h->pos = 0;
     h->last_lpib = 0;
-    h->idle_since = 0;
-    h->ahead = AHEAD_FIRST;
-    h->fed = false;
-    h->late = 0;
-    h->mixed = 0;
     h->running = false;
 }
 
-/* A stream that was running stops (RUN to 0 takes up to 40 us), its ring silent. */
-static void stream_stop(struct hda *h, const char *name) {
+/* A stream that was running stops (RUN to 0 takes up to 40 us). */
+static void stream_stop(struct hda *h) {
     if (!h->running) return;
     uint64_t f = spin_lock(&h->engine);
     if (h->up) sd_write8(h, SD_CTL, 0);
     spin_unlock(&h->engine, f);
     for (uint64_t until = clock_after(STOP_NS); (sd_read8(h, SD_CTL) & CTL_RUN) && clock_now_ns() < until;) pause();
     if (h->quiet) alarm_cancel(&h->tick);
-    uint64_t ms = (h->last_at - h->started_at) / NS_PER_MS;
-    kprintf("audio: output \"%s\" stopped: played %lu frames, link at %lu Hz, %u late, %u stream errors\n", name, h->mixed,
-            ms ? h->pos * 1000 / ms : 0, h->late,
-            __atomic_load_n(&h->fifo_errors, __ATOMIC_RELAXED));
-    ring_reset(h);
+    stream_idle(h);
 }
 
 /* The descriptors and the stream's registers for this format (4.5.3); it runs from the first frame.
    False after a power change, and it does not run. */
 static bool stream_start(struct hda *h, struct hda_sink *o, uint64_t gen) {
     uint32_t bytes = block_bytes(h);
-    for (unsigned i = 0; i < BLOCKS; i++)
-        h->bdl[i] = (struct bdl_entry){.address = h->dma_phys + (RINGS_PAGES + BDL_PAGES) * PAGE_SIZE + i * bytes,
-                                       .length = bytes, .flags = 1};
-    iommu_cache_flush(h->bdl, BLOCKS * sizeof *h->bdl);
+    for (unsigned i = 0; i < h->blocks; i++)
+        h->bdl[i] = (struct bdl_entry){.address = h->ring_phys + i * bytes, .length = bytes, .flags = 1};
+    iommu_cache_flush(h->bdl, h->blocks * sizeof *h->bdl);
     uint64_t bdl = h->dma_phys + RINGS_PAGES * PAGE_SIZE;
     sd_write8(h, SD_CTL, CTL_SRST);
     for (uint64_t until = clock_after(STOP_NS); !(sd_read8(h, SD_CTL) & CTL_SRST) && clock_now_ns() < until;) pause();
     sd_write8(h, SD_CTL, 0);
     for (uint64_t until = clock_after(STOP_NS); (sd_read8(h, SD_CTL) & CTL_SRST) && clock_now_ns() < until;) pause();
-    mmio_write32(h->sd + SD_CBL, RING_FRAMES * h->frame_bytes);
-    mmio_write16(h->sd + SD_LVI, BLOCKS - 1);
+    mmio_write32(h->sd + SD_CBL, ring_frames(h) * h->frame_bytes);
+    mmio_write16(h->sd + SD_LVI, (uint16_t)(h->blocks - 1));
     mmio_write16(h->sd + SD_FMT, hda_output_format(o->out));
     mmio_write32(h->sd + SD_BDPL, (uint32_t)bdl);
     mmio_write32(h->sd + SD_BDPU, (uint32_t)(bdl >> 32));
     sd_write8(h, SD_CTL2, CTL2_TAG(STREAM_TAG) | (h->bidirectional ? CTL2_DIR : 0));
     sd_write8(h, SD_STS, STS_BCIS | STS_FIFOE | STS_DESE);
     /* the FIFO's content is what the controller has fetched and the link has not played (3.3.41) */
-    h->guard = mmio_read16(h->sd + SD_FIFOS) / h->frame_bytes + GUARD_FRAMES;
-    h->ahead = MIN(MAX(h->ahead, h->guard / BLOCK + 2), AHEAD_MOST);
+    h->guard = mmio_read16(h->sd + SD_FIFOS) / h->frame_bytes + 1;
     uint64_t f = spin_lock(&h->engine);
     bool ok = h->up && gen == h->power_gen;
     if (ok) sd_write8(h, SD_CTL, CTL_RUN | CTL_IOCE | CTL_FEIE | CTL_DEIE);
@@ -556,32 +534,27 @@ static void position_update(struct hda *h) {
     uint32_t lpib = mmio_read32(h->sd + SD_LPIB) / h->frame_bytes;
     uint64_t now = clock_now_ns();
     spin_unlock(&h->engine, f);
-    if (lpib >= RING_FRAMES) return; /* no valid position to read */
-    uint64_t delta = (lpib + RING_FRAMES - h->last_lpib) % RING_FRAMES;
-    uint64_t elapsed = (now - h->last_at) * AUDIO_RATE / NS_PER_S;
-    if (elapsed > delta + RING_FRAMES / 2) delta += (elapsed - delta + RING_FRAMES / 2) / RING_FRAMES * RING_FRAMES;
+    uint32_t frames = ring_frames(h);
+    if (lpib >= frames) return; /* no valid position to read */
+    uint64_t delta = (lpib + frames - h->last_lpib) % frames;
+    uint64_t elapsed = (now - h->last_at) * h->rate / NS_PER_S;
+    if (elapsed > delta + frames / 2) delta += (elapsed - delta + frames / 2) / frames * frames;
     h->pos += delta;
     h->last_lpib = lpib;
     h->last_at = now;
 }
 
-/* The ordinal of the frame at `frame`, one mixed and not yet overwritten. */
-static uint64_t ordinal_at(const struct hda *h, uint64_t frame) {
-    if (frame >= h->written) return h->given;
-    uint64_t back = h->written - frame;
-    return h->given >= back ? h->given - back : 0;
-}
-
-/* Whether the link is up, *gen its generation, and whatever a power change undid is taken up again. */
-static bool fill_begin(struct hda *h, struct hda_sink *o, uint64_t *gen) {
+/* Whether the link is up, *gen its generation, and whatever a power change undid is taken up again:
+   the ring's content went with the reset, and the stream stands at its start. */
+static bool stream_sync(struct hda *h, struct hda_sink *o, uint64_t *gen) {
     uint64_t f = spin_lock(&h->engine);
     bool up = h->up;
     *gen = h->power_gen;
     spin_unlock(&h->engine, f);
-    if (*gen != h->seen_gen) { /* what it held is gone with the reset, and counts as played */
+    if (*gen != h->seen_gen) {
         h->seen_gen = *gen;
-        audio_played(h->given, clock_now_ns());
-        ring_reset(h);
+        h->generation++;
+        stream_idle(h);
         h->routed = false;
     }
     if (up && !h->routed) {
@@ -591,102 +564,99 @@ static bool fill_begin(struct hda *h, struct hda_sink *o, uint64_t *gen) {
     return up;
 }
 
-static void hda_fill(struct audio_sink *sink) {
-    struct hda_sink *o = sink->priv;
+static int hda_open(struct audio_output *output, const struct n_audio_device_format *format, struct audio_ring *ring) {
+    struct hda_sink *o = output->priv;
     struct hda *h = o->h;
-    uint64_t gen;
-    if (!fill_begin(h, o, &gen)) return;
-    if (h->running) {
-        position_update(h);
-        unsigned delay = o->out->delay;
-        audio_played(ordinal_at(h, h->pos > delay ? h->pos - delay : 0), h->last_at);
-        /* the blocks passed go silent before the stream comes round to them */
-        if (h->pos - h->cleared > RING_FRAMES) h->cleared = ALIGN_DOWN(h->pos, BLOCK) - RING_FRAMES;
-        for (; h->cleared + BLOCK <= h->pos; h->cleared += BLOCK) block_silence(h, h->cleared);
+    if (h->open) return -N_ERR_BUSY;
+    uint16_t word = hda_format_word(format->rate, format->bits, format->channels);
+    if (!word) return -N_ERR_INVALID;
+    unsigned frame_bytes = (unsigned)format->channels * format->container;
+    /* each buffer starts on the boundary, and holds whole frames */
+    unsigned step = 1;
+    while ((step * frame_bytes) % BLOCK_ALIGN) step *= 2;
+    uint64_t frames = ALIGN_UP((uint64_t)ring->block_frames, step);
+    uint32_t blocks = MAX(MIN(ring->blocks, BDL_HIGH), BDL_LOW);
+    uint64_t bytes = frames * frame_bytes * blocks;
+    if (bytes > UINT32_MAX) return -N_ERR_TOO_LARGE; /* of the cyclic buffer's length (3.3.37) */
+    size_t pages = ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE;
+    /* below 4 GiB, which every controller can reach (64OK is optional, 3.3.2) */
+    uint64_t phys;
+    struct object *memory = shared_kernel_contig(pages, 32, &phys);
+    if (!memory) return -N_ERR_NO_MEMORY;
+    if (h->guest_dom && !iommu_map(h->guest_dom, NULL, phys, pages)) {
+        object_unref(memory);
+        return -N_ERR_IO;
     }
-    bool remote = audio_remote(), pending = !remote && audio_pending();
-    if (!h->running && !pending) return; /* nothing to start: no device I/O */
-    if (h->running && pending && h->fed && h->pos >= h->written) { /* it heard silence with PCM waiting */
-        h->late++;
-        h->ahead = MIN(h->ahead + 1, AHEAD_MOST);
-    }
-    bool played_all = h->pos >= h->written;
-    if (h->running && played_all && !pending) {
-        if (!h->idle_since) h->idle_since = h->last_at;
-        if (h->last_at - h->idle_since >= IDLE_NS) {
-            stream_stop(h, sink->name);
-            return;
-        }
-    } else h->idle_since = 0;
-
-    uint64_t began = h->written;
-    while (!remote) {
-        uint64_t queued = h->written > h->pos ? h->written - h->pos : 0;
-        if (queued >= h->ahead * (uint64_t)BLOCK) break;
-        /* whole blocks while the device has enough: a stream fed a little at a time (audio_ready) */
-        if (!audio_ready(BLOCK, queued < 2 * (uint64_t)BLOCK)) break;
-        /* past what the controller may have fetched */
-        uint64_t at = h->written;
-        if (h->running && at < h->pos + h->guard) at = ALIGN_UP(h->pos + h->guard, BLOCK);
-        uint64_t end;
-        if (!audio_sink_mix(sink, ring_at(h, at), BLOCK, &end)) break;
-        iommu_cache_flush(ring_at(h, at), block_bytes(h));
-        h->written = at + BLOCK;
-        h->given = end;
-        h->mixed += BLOCK;
-    }
-    h->fed = h->written > h->pos;
-    if (!h->running && h->written > began && !stream_start(h, o, gen)) return; /* the next fill() sees the new generation */
-    if (h->running && h->quiet) alarm_set(&h->tick, clock_after(BLOCK_NS));
-}
-
-/* Where the PCM the controller has not fetched begins, at a block's start: the rest of the block the
-   link is in has its frames in the FIFO's reach, and take stops the ring short of it. The mixer's lock
-   is held: no fill() is under way. */
-static uint64_t hda_unissue(struct audio_sink *sink, bool take) {
-    struct hda_sink *o = sink->priv;
-    struct hda *h = o->h;
-    uint64_t f = spin_lock(&h->engine);
-    bool up = h->up && h->seen_gen == h->power_gen;
-    spin_unlock(&h->engine, f);
-    if (!up || !h->running) return h->given;
-    position_update(h);
-    uint64_t first = ALIGN_UP(h->pos + h->guard, BLOCK);
-    if (first >= h->written) return h->given;
-    uint64_t at = ordinal_at(h, first);
-    if (take) {
-        for (uint64_t frame = first; frame < h->written; frame += BLOCK) block_silence(h, frame);
-        h->mixed -= MIN(h->mixed, h->written - first);
-        h->given = at;
-        h->written = first;
-    }
-    return at;
-}
-
-static bool hda_open(struct audio_sink *sink) {
-    struct hda_sink *o = sink->priv;
-    struct hda *h = o->h;
-    h->frame_bytes = (unsigned)sink->format.channels * sink->format.container;
-    ring_reset(h);
+    h->ring = phys_to_virt(phys);
+    iommu_cache_flush(h->ring, pages * PAGE_SIZE);
+    h->ring_phys = phys;
+    h->ring_pages = pages;
+    h->ring_object = memory;
+    hda_output_select(o->out, word);
+    h->rate = format->rate;
+    h->frame_bytes = frame_bytes;
+    h->block_frames = (uint32_t)frames;
+    h->blocks = blocks;
+    stream_idle(h);
     uint64_t f = spin_lock(&h->engine);
     bool up = h->up;
     h->seen_gen = h->power_gen;
     spin_unlock(&h->engine, f);
     if (up) hda_output_enable(o->out, STREAM_TAG);
     h->routed = up;
-    return true;
+    __atomic_store_n(&h->open, o, __ATOMIC_RELEASE);
+    *ring = (struct audio_ring){.memory = memory, .block_frames = (uint32_t)frames, .blocks = blocks,
+                                .flush_bytes = cpu_features.clflush_bytes};
+    return 0;
 }
 
-static void hda_close(struct audio_sink *sink) {
-    struct hda_sink *o = sink->priv;
+static void hda_close(struct audio_output *output) {
+    struct hda_sink *o = output->priv;
     struct hda *h = o->h;
-    stream_stop(h, sink->name);
+    stream_stop(h);
+    __atomic_store_n(&h->open, NULL, __ATOMIC_RELEASE);
     hda_output_disable(o->out);
     h->routed = false;
-    audio_played(h->given, clock_now_ns());
+    if (h->guest_dom) iommu_unmap(h->guest_dom, NULL, h->ring_phys, h->ring_pages);
+    object_unref(h->ring_object);
+    h->ring_object = NULL;
+    h->ring = NULL;
 }
 
-static const struct audio_sink_ops hda_ops = {.open = hda_open, .close = hda_close, .fill = hda_fill, .unissue = hda_unissue};
+static int hda_run(struct audio_output *output, bool run) {
+    struct hda_sink *o = output->priv;
+    struct hda *h = o->h;
+    if (!run) {
+        stream_stop(h);
+        return 0;
+    }
+    uint64_t gen;
+    if (!stream_sync(h, o, &gen)) return -N_ERR_NOT_READY;
+    if (h->running) return 0;
+    if (!stream_start(h, o, gen)) return -N_ERR_NOT_READY;
+    if (h->quiet) alarm_set(&h->tick, clock_after(block_bytes(h) / h->frame_bytes * NS_PER_S / h->rate));
+    return 0;
+}
+
+static void hda_status(struct audio_output *output, struct n_audio_device_status *status) {
+    struct hda_sink *o = output->priv;
+    struct hda *h = o->h;
+    uint64_t gen;
+    stream_sync(h, o, &gen);
+    if (h->running) {
+        position_update(h);
+        unsigned delay = o->out->delay;
+        status->position = h->pos > delay ? h->pos - delay : 0;
+        status->at_ns = h->last_at;
+        status->guard_frames = h->guard + delay;
+        if (h->quiet) alarm_set(&h->tick, clock_after(block_bytes(h) / h->frame_bytes * NS_PER_S / h->rate));
+    } else status->at_ns = clock_now_ns();
+    status->generation = h->generation;
+    status->running = h->running;
+    status->errors = __atomic_load_n(&h->fifo_errors, __ATOMIC_RELAXED);
+}
+
+static const struct audio_output_ops hda_ops = {.open = hda_open, .close = hda_close, .run = hda_run, .status = hda_status};
 
 /* ---- the outputs ---- */
 
@@ -695,7 +665,7 @@ static void sink_label(struct hda_sink *o) {
     mutex_lock(&label_mutex);
     for (unsigned n = 1;; n++) {
         if (n == 1) strlcpy(o->label, o->out->name, sizeof o->label);
-        else ksnprintf(o->label, sizeof o->label, "%.28s %u", o->out->name, n);
+        else ksnprintf(o->label, sizeof o->label, "%s %u", o->out->name, n);
         bool taken = false;
         for (struct hda_sink *s = every_sink; s && !taken; s = s->every) taken = s != o && !strcmp(s->label, o->label);
         if (!taken) break;
@@ -703,14 +673,14 @@ static void sink_label(struct hda_sink *o) {
     mutex_unlock(&label_mutex);
 }
 
-static enum audio_jack jack_of(const struct hda_output *out) {
-    return !out->senses ? AUDIO_JACK_NONE : out->plugged ? AUDIO_JACK_PLUGGED : AUDIO_JACK_EMPTY;
+static enum n_audio_jack jack_of(const struct hda_output *out) {
+    return !out->senses ? N_AUDIO_JACK_NONE : out->plugged ? N_AUDIO_JACK_PLUGGED : N_AUDIO_JACK_EMPTY;
 }
 
 static bool sink_add(struct hda *h, struct hda_codec *codec, struct hda_output *out) {
-    static const enum audio_kind kinds[] = {[HDA_OUTPUT_SPEAKER] = AUDIO_KIND_SPEAKER, [HDA_OUTPUT_HEADPHONE] = AUDIO_KIND_HEADPHONE,
-                                            [HDA_OUTPUT_LINE] = AUDIO_KIND_LINE, [HDA_OUTPUT_DISPLAY] = AUDIO_KIND_DISPLAY,
-                                            [HDA_OUTPUT_DIGITAL] = AUDIO_KIND_DIGITAL, [HDA_OUTPUT_OTHER] = AUDIO_KIND_OTHER};
+    static const enum n_audio_kind kinds[] = {[HDA_OUTPUT_SPEAKER] = N_AUDIO_KIND_SPEAKER, [HDA_OUTPUT_HEADPHONE] = N_AUDIO_KIND_HEADPHONE,
+                                              [HDA_OUTPUT_LINE] = N_AUDIO_KIND_LINE, [HDA_OUTPUT_DISPLAY] = N_AUDIO_KIND_DISPLAY,
+                                              [HDA_OUTPUT_DIGITAL] = N_AUDIO_KIND_DIGITAL, [HDA_OUTPUT_OTHER] = N_AUDIO_KIND_OTHER};
     struct hda_sink *o = kzalloc(sizeof *o);
     if (!o) return false;
     o->h = h;
@@ -722,21 +692,27 @@ static bool sink_add(struct hda *h, struct hda_codec *codec, struct hda_output *
     every_sink = o;
     mutex_unlock(&label_mutex);
     sink_label(o);
-    o->sink.ops = &hda_ops;
-    o->sink.priv = o;
-    strlcpy(o->sink.name, o->label, sizeof o->sink.name);
-    o->sink.kind = kinds[out->kind];
-    o->sink.jack = jack_of(out);
-    unsigned container = out->bits == 16 ? 2 : 4;
-    o->sink.format = (struct audio_format){.rate = AUDIO_RATE, .channels = out->channels, .bits = out->bits, .container = (uint8_t)container};
-    o->sink.period_ns = BLOCK_NS;
-    o->sink.blocks = BLOCKS;
+    o->output.ops = &hda_ops;
+    o->output.priv = o;
+    o->output.name = o->label;
+    ksnprintf(o->key, sizeof o->key, "hda-%02x:%02x.%u-%u-%u", h->pci->bus, h->pci->dev, h->pci->func, codec->address, out->pin->nid);
+    o->output.key = o->key;
+    o->output.kind = kinds[out->kind];
+    o->output.jack = jack_of(out);
+    o->output.rates = o->rates;
+    o->output.rate_count = hda_output_rates(out, o->rates);
+    uint8_t bits[sizeof o->sizes / sizeof *o->sizes];
+    o->output.size_count = hda_output_sizes(out, bits);
+    for (uint32_t i = 0; i < o->output.size_count; i++) /* the smallest container it fits (4.5.1) */
+        o->sizes[i] = (struct n_audio_size){.bits = bits[i], .container = bits[i] == 16 ? 2 : 4};
+    o->output.sizes = o->sizes;
+    o->output.channels_low = o->output.channels_high = out->channels;
     struct hda_sink **tail = &h->sinks;
     while (*tail) tail = &(*tail)->next;
     *tail = o;
-    kprintf("audio: HD Audio codec %u pin %u: \"%s\" (%u bits, %u channels, %s)\n", codec->address, out->pin->nid, o->label,
-            out->bits, out->channels, !out->senses ? "no jack sense" : out->plugged ? "plugged in" : "nothing plugged in");
-    audio_sink_add(&o->sink);
+    kprintf("audio: HD Audio codec %u pin %u: \"%s\" (%s)\n", codec->address, out->pin->nid, o->label,
+            !out->senses ? "no jack sense" : out->plugged ? "plugged in" : "nothing plugged in");
+    audio_output_add(&o->output);
     return true;
 }
 
@@ -778,7 +754,7 @@ static void sense(struct hda *h, uint16_t codecs, bool look) {
         bool due = codecs & (1u << o->codec->address) || (look && o->out->senses && (h->quiet || !o->out->announces));
         if (!due || !hda_output_sense(o->out)) continue;
         sink_label(o);
-        audio_sink_state(&o->sink, jack_of(o->out), o->label);
+        audio_output_state(&o->output, jack_of(o->out), o->label);
     }
 }
 
@@ -840,7 +816,7 @@ static bool hda_resume(void *arg) {
     bool ok = link_up(h);
     __atomic_store_n(&h->restore, true, __ATOMIC_SEQ_CST);
     signal(h);
-    audio_sink_wake();
+    tell_open(h);
     return ok;
 }
 
@@ -849,7 +825,8 @@ static void hda_guest_stop(void *ctx) {
     struct hda *h = ctx;
     mutex_lock(&h->state);
     if (!h->stopped) {
-        for (struct hda_sink *o = h->sinks; o; o = o->next) audio_sink_available(&o->sink, false);
+        for (struct hda_sink *o = h->sinks; o; o = o->next) audio_output_available(&o->output, false);
+        h->guest_dom = NULL;
         uint64_t f = spin_lock(&h->engine);
         link_stop(h);
         h->stopped = true;
@@ -871,6 +848,7 @@ static void hda_guest_start(struct iommu_domain *dom, void *ctx) {
             kprintf("audio: HD Audio at %02x:%02x.%u: its memory cannot be mapped in its group's domain\n", h->pci->bus,
                     h->pci->dev, h->pci->func);
         } else {
+            h->guest_dom = dom;
             pci_enable_busmaster(h->pci);
             uint64_t f = spin_lock(&h->engine);
             h->stopped = false;
@@ -878,7 +856,7 @@ static void hda_guest_start(struct iommu_domain *dom, void *ctx) {
             if (link_up(h)) {
                 irq_on(h, !dom);
                 __atomic_store_n(&h->restore, true, __ATOMIC_SEQ_CST);
-                for (struct hda_sink *o = h->sinks; o; o = o->next) audio_sink_available(&o->sink, true);
+                for (struct hda_sink *o = h->sinks; o; o = o->next) audio_output_available(&o->output, true);
             } else kprintf("audio: HD Audio at %02x:%02x.%u does not come out of reset\n", h->pci->bus, h->pci->dev, h->pci->func);
             signal(h);
         }
@@ -911,8 +889,7 @@ static void controller_add(struct pci_device *d) {
     h->corb = (uint32_t *)memory;
     h->rirb = (volatile uint64_t *)(memory + PAGE_SIZE / 2);
     h->bdl = (struct bdl_entry *)(memory + RINGS_PAGES * PAGE_SIZE);
-    h->ring = memory + (RINGS_PAGES + BDL_PAGES) * PAGE_SIZE;
-    h->frame_bytes = 4;
+    h->frame_bytes = 4; /* until a format is open */
     alarm_init(&h->tick, hda_tick);
     pci_enable_busmaster(d);
     bool up = link_up(h);

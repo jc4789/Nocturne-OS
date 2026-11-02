@@ -53,7 +53,8 @@ enum {
     SYS_APP_CPU_TIME, /* (): ns the calling app's threads have run, the ended ones too (§8) */
     SYS_PROCLIST = 26, SYS_SYSINFO, SYS_YIELD, SYS_POWER,
     SYS_SYSTEM_LOG = 33, SYS_PCILIST,
-    SYS_CPU_INFO = 38, SYS_GPU_INFO, SYS_GPU_RENDER, SYS_AUDIO_FLUSH,
+    SYS_CPU_INFO = 38, SYS_GPU_INFO, SYS_GPU_RENDER,
+    SYS_AUDIO_DEVICE_RUN,     /* (device, 0 or 1): 輪の始めから流す、止める（§17） */
     SYS_GPU_RENDER_BATCH,
     SYS_GPU_BLIT,
     SYS_THREAD_CREATE = 45, SYS_THREAD_JOIN, SYS_THREAD_EXIT,
@@ -107,8 +108,10 @@ enum {
     SYS_EVENTS_CREATE, SYS_EVENTS_WATCH, SYS_EVENTS_UNWATCH, SYS_EVENTS_WATCH_ADDRESS,
     SYS_EVENTS_TIMER, SYS_EVENTS_WAIT,
     SYS_APP_OPEN, SYS_APP_ID, SYS_SYSTEM_LOG_OPEN,
-    SYS_AUDIO_OPEN, SYS_AUDIO_SUBMIT, SYS_AUDIO_STATUS, SYS_AUDIO_OUTPUT,
-    SYS_RANDOM,
+    SYS_AUDIO_DEVICE_OPEN,    /* (N_CAP_AUDIO_DEVICE の cap, id, struct n_audio_device_format *, struct n_audio_device_ring *in_out) -> device */
+    SYS_AUDIO_DEVICE_LIST,    /* (cap, void *out, bytes): 全部のバイト数。足りなければ何も書かない。struct n_audio_device の並び */
+    SYS_AUDIO_DEVICE_STATUS,  /* (device, struct n_audio_device_status *out) */
+    SYS_RANDOM = SYS_AUDIO_DEVICE_STATUS + 2,
     /* (bytes, access): N_MEMORY_* access, N_MEMORY_LOW added for pages below 2 GiB */
     SYS_MEMORY_RESERVE, SYS_MEMORY_RELEASE, SYS_MEMORY_PROTECT,
     SYS_SHARED_MAP, /* (shared handle, bytes, N_MEMORY_READ or N_MEMORY_READ_WRITE) */
@@ -152,7 +155,7 @@ enum {
        changed, until SYS_WATCH_TAKE takes the count. Each call after it gives one. */
     SYS_WATCH_TAKE = 207,     /* (watch): the changes since its last take (0: none) */
     SYS_ENTRY_WATCH,          /* (path, N_WATCH_NAME or N_WATCH_FOLDER): a watch on C: (§3) */
-    SYS_AUDIO_OUTPUT_WATCH,   /* (): a watch on what SYS_AUDIO_OUTPUT reports (§9) */
+    SYS_AUDIO_DEVICE_WATCH,   /* (cap): a watch on the list of SYS_AUDIO_DEVICE_LIST (§17) */
     SYS_IDENTITY_SELF,        /* (struct n_identity *out) */
     SYS_CHANNEL_PEER,         /* (channel, struct n_identity *out) */
     SYS_CAP_DERIVE,           /* (cap, enum n_cap) -> handle */
@@ -648,39 +651,6 @@ struct n_power_state {
     uint32_t can_sleep;     /* 眠りを勧めてよい */
     uint32_t can_hibernate; /* 休止を勧めてよい */
     char detail[64];
-};
-
-/* n_audio_status: where a stream stands. Device time counts this stream's
- * consumed PCM only: played_frames, heard at the monotonic clock time
- * played_at_ns (a pair: the time the sink last reported its position).
- * An underrun: its sink played all it had, and PCM came later; underrun_ns is
- * the time between (both since the last flush). */
-struct n_audio_status {
-    uint32_t queued_frames;
-    uint32_t device_pending_frames;
-    uint64_t played_frames;
-    uint64_t committed_frames;
-    uint32_t generation;
-    uint32_t flags;
-    uint64_t underruns;
-    uint64_t underrun_ns;
-    uint64_t played_at_ns;
-    int64_t pace_ppb;
-};
-#define N_AUDIO_CLOCK_DEVICE 1u
-#define N_AUDIO_CLOCK_ESTIMATED 2u
-#define N_AUDIO_CLOCK_REMOTE 4u
-#define N_AUDIO_RATE 48000     /* n_audio_submit: frames of two int16_t, left first */
-#define N_AUDIO_WAIT 1u        /* n_audio_submit: wait for room instead of N_ERR_NOT_READY */
-
-/* n_audio_output: the sound's way out as it stands. The volume and muting change by
-   SYS_SETTINGS_APPLY (N_AUDIO_VOLUME, N_AUDIO_MUTED, settings_abi.h). device names what plays the sound for people
-   ("Remote desktop" while a remote viewer takes it, else the output that plays: a jack, a display's name), "" when nothing does:
-   the volume is kept for when something does, but nothing is heard. */
-struct n_audio_output {
-    int32_t volume;  /* 0 to 100 */
-    uint32_t muted;  /* 0 or 1 */
-    char device[32];
 };
 
 /* ---- GUI ---- */

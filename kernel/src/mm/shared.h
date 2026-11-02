@@ -56,6 +56,10 @@ void shared_dma_frames(struct handle *h, size_t first, uint64_t *frames, size_t 
 struct object *shared_kernel_new(size_t bytes, void **view);
 void shared_kernel_end(struct object *o, void *view);
 int64_t shared_kernel_handle(struct object *o);
+/* The same for memory a driver's device reads: a contiguous run below 2^bits, zeroed, *base its first
+   frame, which the kernel reaches through the direct map. The caller holds its one reference
+   (object_unref). */
+struct object *shared_kernel_contig(size_t pages, unsigned bits, uint64_t *base);
 
 /* A display driver's surface the screen is drawn into (n_pci_give_screen, dev/pciuser.c): bytes
    from offset of a writable shared object made through claim, a BAR's (which the system writes

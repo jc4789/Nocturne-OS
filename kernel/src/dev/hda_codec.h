@@ -8,7 +8,7 @@
    default names as one, with the shortest way back through mixers and selectors to an output
    converter that takes 48 kHz PCM (the rate 7.3.4.7 says every codec has). Pins grouped by a default
    association play the channels of one stream: of those of one kind only the lowest sequence is an
-   output, as the sound here is stereo; association 15 (and 0, a default never filled in, 7.3.3.31)
+   output, as an output here is at most a front pair; association 15 (and 0, a default never filled in, 7.3.3.31)
    groups nothing, and neither headphones nor the pins to separate displays are channels of another. */
 #include <stdbool.h>
 #include <stddef.h>
@@ -81,7 +81,7 @@ struct hda_output {
     enum hda_output_kind kind;
     bool senses;       /* something plugged in can be told (presence detect that nothing overrides) */
     bool announces;    /* ... and the pin says so by itself (an unsolicited response) */
-    uint8_t bits;      /* the stream's format, from what the converter declares: 16, 20, 24 or 32 */
+    uint16_t format;   /* the stream format's word it plays (3.7.1): at first 48 kHz and its narrowest size */
     uint8_t channels;  /* 2, or 1 for a converter of one */
     uint8_t delay;     /* samples from the link to the pin: the group's, else its way's (7.3.4.5, 7.3.4.6) */
     bool plugged;      /* as last sensed, with a display's ELD valid too (figure 72) */
@@ -98,8 +98,18 @@ struct hda_output *hda_codec_outputs(struct hda_codec *codec);
 void hda_codec_power(struct hda_codec *codec, const struct hda_output *outputs, unsigned tag);
 /* What is plugged in now, kept in out->plugged, and its name; true when either changed. */
 bool hda_output_sense(struct hda_output *out);
-/* The stream format's word (3.7.1): 48 kHz PCM. */
+/* What its converter declares (7.3.4.7) that a stream format's word can say: the rates in Hz, in rising
+   order, of R1 to R11 (R12, 384 kHz, has no MULT in table 53), and the sizes in bits, in rising order, of 16,
+   20, 24 and 32 (8 bits share no container rule with them, and 32 on a digital converter would be raw
+   S/PDIF frames, 7.3.3.9). Each returns how many. */
+unsigned hda_output_rates(const struct hda_output *out, uint32_t *rates);
+unsigned hda_output_sizes(const struct hda_output *out, uint8_t *bits);
+/* The stream format's word (3.7.1) of PCM at this rate, of these bits and channels; 0 with no such word.
+   No word it can give is 0: every size's code is. */
+uint16_t hda_format_word(uint32_t rate, unsigned bits, unsigned channels);
 uint16_t hda_output_format(const struct hda_output *out);
+/* The format's word the next hda_output_enable gives the converter. */
+void hda_output_select(struct hda_output *out, uint16_t format);
 /* The stream with this tag plays on it: the converter takes the format and the tag (channel 0), the
    way is selected, its amplifiers at 0 dB and open, the other inputs of its mixers shut, the pin on. */
 void hda_output_enable(struct hda_output *out, unsigned tag);
