@@ -95,17 +95,39 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   フォルダーであることを確かめてから（違えば `N_ERR_NOT_FOLDER`）、自分の設定 `FOLDER` を
   置き換える（以後の `n_path_complete` と、libcが起動するアプリへ渡す `FOLDER` に効く）。
 - C: の構成（`common/abi.h` の `N_FOLDER_*`）：
-  - `C:\Nocturne`：システム。属性 SYSTEM の項目は、アプリは読めるが、それ自体も中身も
-    変えられない（作成・削除・名前変更・書込みは `N_ERR_DENIED`）。`System`（システムの
-    プログラム、`N_FOLDER_SYSTEM`）、`Fonts`、`Licenses`、`SDK`、`Certificates`、`Web`、
-    `Agent`、`Firmware` 等。`C:\Nocturne\Temp` はカーネルだけが使う（差し替え中の内容）。
-  - `C:\Programs`：アプリ（`N_FOLDER_PROGRAMS`）。アプリごとに一つのフォルダー。利用者は
-    アプリを入れられる。システムと一緒に入るアプリのフォルダーは SYSTEM。
+  - `C:\Nocturne`：システム。`System`（システムのプログラム、`N_FOLDER_SYSTEM`）、`Fonts`、
+    `Licenses`、`SDK`、`Certificates`、`Web`、`Agent`、`Firmware` 等。`C:\Nocturne\Temp` は
+    カーネルだけが使う（差し替え中の内容）。
+  - `C:\Programs`：アプリ（`N_FOLDER_PROGRAMS`）。アプリごとに一つのフォルダー。
   - `C:\Users\<名前>`：利用者のフォルダー（設定 `USERFOLDER`、`n_user_folder()`）。アプリは
     ここで始まる。`Desktop`、`Documents`、`Downloads`、`Music`、`Pictures`、`Videos`、
     `AppData`。アプリのデータは `n_app_data_folder(name, out, cap)` が作って返す
     `AppData\<name>`。`AppData\Temp` は一時フォルダー（設定 `TEMP`、`n_temp_folder()`）で、
     起動のたびに空になる。
+- パスの権限は `kernel/src/fs/store.c` の入口の一か所で決まる。決めるのは呼ぶ側の身元（§13）で、
+  パスの文字列でなく項目の番号で比べる。誤りは `N_ERR_DENIED`。
+
+  | 場所 | 読む | 書く |
+  |---|---|---|
+  | `C:\Nocturne` の下 | 誰でも | `N_CLASS_SYSTEM` |
+  | `C:\Programs` の下 | 誰でも | `N_CLASS_ADMIN` 以上 |
+  | `C:\Users\<名前>` の下 | 持ち主と `N_CLASS_ADMIN` 以上 | 持ち主と `N_CLASS_ADMIN` 以上 |
+  | その他（根の直下の項目） | 誰でも | `N_CLASS_ADMIN` 以上 |
+
+  `C:\Nocturne`、`C:\Programs`、`C:\Users` の三つのフォルダー自身を消す・移すのは
+  `N_CLASS_SYSTEM` だけ。`C:\Users` の直下を一覧するのは誰でも、そこに作るのは `N_CLASS_ADMIN` 以上。
+- 項目は持ち主の利用者の番号を持つ（`struct n_entry` の `owner`。`STORE_OWNER_SYSTEM` は 0）。
+  作った項目は親のフォルダーの持ち主を継ぎ、移すと行き先の持ち主になる。
+  `n_entry_set_owner(path, user)`（`SYS_ENTRY_SET_OWNER`）が変える。`N_CLASS_ADMIN` 以上。
+- 私的な領域：名前の木の外の文書。パスは無く、`n_entry_info`・`n_folder_list`・`n_entry_watch` に
+  現れない。`SYS_STORE_PRIVATE_OPEN(cap, region, user, access)` が番号で開く。
+  - `cap` は `N_CAP_STORE_PRIVATE` の能力（§13）。無ければ `N_ERR_DENIED`。
+  - `region` は領域の番号（`enum n_private_region`、`common/settings_abi.h`：`N_REGION_SETTINGS`、
+    `N_REGION_USERS`、`N_REGION_SECRETS`。`N_REGION_FIRST_FREE` から上はシステムの部品が割り当てる）。
+  - `user` は 0 なら機械の領域、それ以外はその利用者の領域。
+  - `access` は `n_document_open` と同じ。0 は `N_DOCUMENT_EDIT`。無い領域は `EDIT`・`REPLACE` が作る。
+  - 開いた文書は普通の文書で、`N_DOCUMENT_REPLACE` と保存で原子的に差し替わる。読みは
+    `READ` のハンドルが保存された版を読む。
 - 丸ごとの操作（通常の用途）：
   - `n_document_load(path, void **data, size_t *size)`：内容を新しい `n_memory` ページで
     受け取る。`n_memory_release(*data, *size)` で返す。
@@ -139,7 +161,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   `n_entry_remove(path)`（空でないフォルダーは `N_ERR_NOT_EMPTY`）、
   `n_entry_move(from, to)`、`n_folder_list(path, struct n_entry *out, max, start)`（件数を返す）。
 - `struct n_entry` は名前（保存された形）、`kind`、`size`、更新時刻（`modified` の壁時計の秒と
-  その秒の中のナノ秒 `modified_ns`）、`id` を持つ。`id` は C: 上の項目そのものの番号で、
+  その秒の中のナノ秒 `modified_ns`）、`id`、持ち主 `owner` を持つ。`id` は C: 上の項目そのものの番号で、
   `n_entry_move` で移しても変わらず、別の項目には決して使われない。リンクは無いので、
   綴り（大文字・小文字、`/` と `\`）の違う二つのパスが同じ項目かは `id` で分かる。
 - `struct n_entry` を返すシステムコールは、呼び出し側の `sizeof(struct n_entry)` を受け取り、
@@ -185,8 +207,8 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     `N_EVENT_CLOSED` になる。同じ名前で作り直したフォルダーは別のフォルダー。`N_WATCH_NAME` の
     名前がフォルダーを指していても、その中の変化は数えない。
   - 権利は `n_entry_info` と同じ：アプリに見えない（PRIVATE の）項目の変化は数えず、PRIVATE の
-    フォルダー（`C:\Nocturne\Temp`）は見張れない（`N_ERR_NOT_FOUND`）。SYSTEM のフォルダーは
-    読めるので見張れる。
+    フォルダー（`C:\Nocturne\Temp`）は見張れない（`N_ERR_NOT_FOUND`）。読めないフォルダーは
+    `N_ERR_DENIED`。
   - 同じ物を見る見張りは一つの物を共有し、数はハンドルごと。C: に見張りが一つも無ければ変化の費用は
     変わらない。見張りがあれば、変化ごとにフォルダーの番号で表を一度引き、そのフォルダーの見張りの
     数だけかかる（ほかのフォルダーの見張りの数にはよらない）。
@@ -488,17 +510,13 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     先読みの一つで最大 20 ms）。遠隔の画面の相手へ送った分は取り戻せない。
   - `n_handle_close` は残りを鳴らし終えてから閉じる。止められたアプリの流れは待たず、flush と
     同じに捨てる。
-  - 主音量と出力先：`n_audio_output(struct n_audio_output *io, set)` 一つ。`set` が 0 なら読むだけ、
-    `N_AUDIO_SET_VOLUME` で `io->volume`（0〜100。消音も解く）、`N_AUDIO_SET_MUTED` で
-    `io->muted`（0／1）を設定する（両方なら音量が先）。戻ると `io` に今の
+  - 主音量と出力先：`n_audio_output(struct n_audio_output *io)` が読む。`io` に今の
     音量・消音と `device`（音を鳴らしている先：音の出口の名前、遠隔デスクトップの利用者がいれば
     "Remote desktop"。鳴らす先が無ければ空文字列。タスクバーのスピーカーと同じもの）が入る。
     機械は幾つでも出口（codec の jack、画面への pin）を持つ。鳴らすのは一つで、既定は刺さった
     出力が先。刺さり方が変わると、流れを切らずに移り、`device` が変わる。
-    鳴らす先が無くても音量は保たれ、後から付いた先に使われる。範囲外・未知のフラグは
-    `N_ERR_INVALID`。音量と消音は音の部品（`dev/audio.c`）の持ち物で、アプリが変えても、
-    タスクバーのスピーカーで変えても、部品が利用者の `AppData\Nocturne\Sound.conf` に保ち、
-    次の起動で init より前に戻す（§12）。
+    鳴らす先が無くても音量は保たれ、後から付いた先に使われる。音量と消音は音の部品
+    （`dev/audio.c`）の持ち物で、変える口は §12 の `N_DOMAIN_AUDIO` とタスクバーのスピーカー。
   - `n_audio_output_watch()`（`SYS_AUDIO_OUTPUT_WATCH`）：`n_audio_output` が返すもの（音量、消音、
     `device`）が変わると受け取れる見張り（`N_KIND_WATCH`、§12）。誰が変えても知らせ、同じ値を
     当て直すのは変化ではない。
@@ -654,46 +672,40 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     入れて知らせ直す。望まれたものと違えば、システムはそのモニターでそのモードを二度と望まず、
     別のものを選ぶ。`done` 0（開始時、モニターの変化・接続時）では選び直す。`count` 0 は、動いた
     ままモニターを駆動しなくなったこと、claim の終わりはドライバーが止まったこと。面を返した
-    （`buffers` NULL）ドライバーがモードを出したままなら、利用者の試すモードで
+    （`buffers` NULL）ドライバーがモードを出したままなら、利用者の適用するモードで
     `mode_serial` が進むので、それを見てもう一度モードを出せる。表示機能でなければ
     `N_ERR_DENIED`、件数・0 の大きさやリフレッシュ・65535 超は `N_ERR_INVALID`。
-  - 設定アプリは `SYS_SCREEN_INFO` の第3引数 `SCREEN_MODES_GET`（`struct screen_modes`：モニター、
-    モード、表示中と望まれたモード、試行の残り時間、直前の試行を出せなかったか、画面の出所
-    `source`、画面の数 `screens`）と `SCREEN_MODE_SET`（`struct screen_mode_set`）を使う
-    （display_abi.h）。どちらも画面ごとで、第3引数の 8 ビット目から上が画面の番号
-    （`op | screen << 8`。画面 0 にタスクバー）。無い画面は `N_ERR_NOT_FOUND`。
-    `SCREEN_MODE_TRY` は一覧のモードを試行として出し、`SCREEN_MODE_TRIAL_MS`（15 秒）以内に `SCREEN_MODE_KEEP` が
-    無ければ前のモードへ戻る（`SCREEN_MODE_BACK` は即座に）。試行中の別の `TRY` は戻り先を
-    保つ。`KEEP` はそのモニターの利用者の選択にする。選択は画面のモードの部品
-    （`gui/screenmode.c`）の持ち物で、部品が利用者の `AppData\Nocturne\Displays.conf` に保ち
-    （§12）、次の起動でも、そのモニターが駆動されそのモードを出すときに使う。`struct screen_modes` の `chosen` は `offered` のモニターに
-    利用者が選んだモード（無ければ全部 0）。`chosen` より前に作ったプログラムは大きさに
-    `SCREEN_MODES_FIRST_BYTES` を渡し、その分だけ受け取る。4（以前の `SCREEN_MODE_SAVED`：
-    設定アプリが起動時に保存ファイルから戻していた）は割り当てない。
-    モードが 0 件なら `TRY`・`KEEP`・`BACK` は `N_ERR_NOT_FOUND`。そのときも `monitor`・`name` は
+  - 設定の窓は `SYS_SCREEN_INFO` の第3引数 `SCREEN_MODES_GET`（`struct screen_modes`：モニター、
+    モード、表示中と望まれたモード、直前に適用したモードを出せなかったか、画面の出所
+    `source`、画面の数 `screens`）で読む（display_abi.h）。画面ごとで、第3引数の 8 ビット目から
+    上が画面の番号（`op | screen << 8`。画面 0 にタスクバー）。無い画面は `N_ERR_NOT_FOUND`。
+    変える口は §12 の `N_DISPLAY_MODE` だけで、値はモニターごとの利用者の選択になる。そのモニターが
+    駆動されそのモードを出すときに使う。出せなければ次に良いモードが出る。
+    試して戻す（`SCREEN_MODE_TRIAL_MS`、15 秒）のは設定のサービスの仕事で、モードを適用し、
+    確定が来なければ前のモードを適用する。`struct screen_modes` の `chosen` は `offered` のモニターに
+    利用者が選んだモード（無ければ全部 0）。モードが 0 件のときも `monitor`・`name` は
     ファームウェアが映すモニターの EDID から入り、起動時の画面が表示中なら `shown` はファームウェアの
     モード（大きさと、EDID のその大きさのタイミングから求めたリフレッシュ。分からなければ 0）。
     `source` は `SCREEN_SOURCE_FIRMWARE`（ドライバーが一度もモードを出していない）、
     `SCREEN_SOURCE_DRIVER`（ドライバーの面が表示中。0 件ならモニターを見つけていない）、
     `SCREEN_SOURCE_HANDED_BACK`（モードを出したドライバーが claim を持ったまま、起動時の画面が
-    表示中：画面を返した、または自分の面をまだ出していない。モードが出ていれば `TRY` で
+    表示中：画面を返した、または自分の面をまだ出していない。モードが出ていれば適用で
     もう一度望める）、`SCREEN_SOURCE_DRIVER_STOPPED`（モードを出したドライバーの claim が
     終わった）、`SCREEN_SOURCE_REMOTE`（遠隔デスクトップの利用者の窓の大きさ）。`monitor` は
-    保存用の識別子で、人に見せる名前ではない。
-  - デスクトップの設定は `SCREEN_SETTINGS_GET`・`SCREEN_SETTINGS_SET`（`struct desktop_settings`）：
+    設定の鍵で、人に見せる名前ではない。
+  - デスクトップの設定は `SCREEN_SETTINGS_GET`（`struct desktop_settings`）が読む：
     ポインターの速さ（-2〜2）と、なめらかな階調（`smooth_gradients`：8 ビットの画面に、
     デスクトップをチャンネルあたり 10 ビットで合成してディザをかけて出す）。後者は利用者の望みで、
     表示中の出力が 8 ビットの xRGB（ドライバーの面を含む）の間だけ効く
     （`smooth_gradients_available`）。マウスの上下の向きはカーネルが自動で決め、設定は無い。
-    どちらもデスクトップ（`gui/wm.c`）の持ち物で、変えるとすぐ効き、デスクトップが利用者の
-    `AppData\Nocturne\Desktop.conf` に保つ（§12）。
+    どちらもデスクトップ（`gui/wm.c`）の持ち物で、変える口は §12 の `N_INPUT_POINTER_SPEED` と
+    `N_WINDOW_SMOOTH_GRADIENTS`。変えるとすぐ効く。
   - 画面の見張り：`SYS_SCREEN_INFO` の第3引数 `SCREEN_WATCH`（第1・第2引数は 0。libc の
     `n_screen_watch()`、display.h）は、`SCREEN_SETTINGS_GET`・`struct screen_format` の返事・
     `SCREEN_MODES_GET` が報告するもののどれかが変わると受け取れる見張り（`N_KIND_WATCH`、§12）。
     デスクトップの大きさと設定、なめらかな階調を出せるか、申し出たモニターとモード、望まれた
-    モード、試行の始まりと終わり、拒まれたこと、`source`、利用者の選択。試行の残り時間が減るのは
-    変化ではない。第1・第2引数が 0 でなければ `N_ERR_INVALID`、デスクトップの無い起動（`nogui`）では
-    `N_ERR_UNSUPPORTED`。
+    モード、拒まれたこと、`source`、利用者の選択。第1・第2引数が 0 でなければ `N_ERR_INVALID`、
+    デスクトップが動いていなければ `N_ERR_UNSUPPORTED`。
   - コマの拍：合成は画面ごとに、その画面のリフレッシュの周期を締切にしたスレッドで描く
     （`sched_deadline`）。周期はドライバーが出しているモード（`shown`）か、起動時の画面なら
     EDID のそのモードのタイミングから取る。二枚以上の面の画面では、フリップの表示（上の
@@ -1136,40 +1148,47 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 タブのドラッグは 6 ピクセル動いてから始まり、帯の端の外へ出ると帯が送られる。離すと MOVE が来て、
 アプリが新しい順の木を送るまで、エンジンはその順で見せる（タブには `key` が要る）。
 
-## 12. システムの状態の保存と見張り
+## 12. 設定と見張り
 
-値を効かせる者がその値の持ち主で、持ち主が自分の文書に保存し、自分で読み戻す。全部の設定を
-並べた表、設定のビット、全プログラムが共有する設定の文書はどこにも無い。設定アプリ
-（`C:\Nocturne\System\settings.js`）とタスクバーは持ち主へ変更を頼む操作盤で、値も文書も持たない。
-端末やコマンドで状態を当てる道は無い。
+設定はファイルではない。変えて適用する値である。カーネルは値の持ち主へ渡し、今の値を覚え、
+保存しない。保存は設定のサービスの仕事で、サービスは名前の木の外の私的な領域（§3）に自分の形式で
+置き、起動のたびに適用し直す。カーネルの中に `.conf` は無い。
 
+- 型のある値は領域と鍵の番号で引く（`common/settings_abi.h`）：`enum n_setting_domain` と領域ごとの
+  鍵。文字列は解析しない。値の型は `N_SETTING_BOOL`、`N_SETTING_INT`（`int32_t`）、`N_SETTING_ENDPOINT`
+  （`struct n_sockaddr`）、`N_SETTING_MONITOR_MODE`（`struct n_setting_monitor_mode`）。
+
+  | 領域 | 鍵 | 持ち主 |
+  |---|---|---|
+  | `N_DOMAIN_BOOT` | `N_BOOT_IOMMU`、`N_BOOT_ACPI_AML`、`N_BOOT_SMP`、`N_BOOT_RESUME`、`N_BOOT_UNISOLATED_DRIVERS` | `fs/bootrecord.c` |
+  | `N_DOMAIN_AUDIO` | `N_AUDIO_VOLUME`（0〜100。消音も解く）、`N_AUDIO_MUTED` | `dev/audio.c` |
+  | `N_DOMAIN_DISPLAY` | `N_DISPLAY_MODE`（一覧）、`N_DISPLAY_HOLD_SECONDS` | `gui/screenmode.c`、`dev/pciuser.c` |
+  | `N_DOMAIN_WINDOW` | `N_WINDOW_SMOOTH_GRADIENTS` | `gui/wm.c` |
+  | `N_DOMAIN_INPUT` | `N_INPUT_POINTER_SPEED`（-2〜2） | `gui/wm.c` |
+  | `N_DOMAIN_POWER` | `N_POWER_PERFORMANCE_PREFERENCE`（0〜255） | `arch/idle.c` |
+  | `N_DOMAIN_NETWORK` | `N_NETWORK_DNS_SERVER`、`N_NETWORK_TCP_RX_BYTES`、`N_NETWORK_TCP_TX_BYTES` | `net/net.c` |
+
+- `n_settings_apply(cap, domain, key, value, size)`（`SYS_SETTINGS_APPLY`）：持ち主へ渡す。`cap` は
+  `N_CAP_SETTINGS_APPLY` の能力（§13）で、持つのは設定のサービス。プログラムはサービスへ頼む。
+  知らない領域と鍵は `N_ERR_NOT_FOUND`、`size` が型と違うか範囲の外は `N_ERR_INVALID`。一覧の鍵は一件ずつ
+  適用する。
+- `n_settings_effective(domain, key, out, cap)`（`SYS_SETTINGS_EFFECTIVE`）：今の値。全体のバイト数を返し、
+  `cap` に入る分を写す。誰でも読める。
+- `n_settings_describe(domain, key, out)`（`SYS_SETTINGS_DESCRIBE`）：`struct n_setting_desc`（型、一つの値の
+  大きさ、旗 `N_SETTING_LIST`・`N_SETTING_AT_START`、範囲）。
+- `n_settings_watch(domain)`（`SYS_SETTINGS_WATCH`）：その領域の今の値が変わると受け取れる見張り。
+  誰が変えても知らせる（タスクバーのスピーカーも）。
+- 起動より前の値（`N_DOMAIN_BOOT`）は起動の記録に置く。起動の区画の `/boot/settings.rec`（8 KiB）が
+  Limine の module "settings" として届き、カーネルは起動の初めに読む。記録は `struct n_boot_record` の
+  二つの枠で、世代の大きい方の CRC-32C の合うものが効く。全部 0 は既定。`SYS_SETTINGS_APPLY` は
+  古い枠へ上書きする（FAT32 の区画の中の番地を辿る。大きさは変えない）。
+  効くのは次の起動から（`N_SETTING_AT_START`）。`SYS_SETTINGS_EFFECTIVE` は記録の値を返す。
+- 起動の引数は製品の値を決めない。`kernel/src/boot.c` の `test_flag` などの読み手は試験の組み
+  （`make kernel-test`、`NOCTURNE_TEST_FLAGS`）だけにある。
 - プログラムの設定はプログラムの持ち物：`n_app_data_folder(name, out, cap)` の `AppData\<name>`
   （§3）に自分の形式で置き、自分で読む。原子的な保存は `n_document_save`・`n_entry_replace`、
   ほかのプロセスの変更は C: の見張り（`n_entry_watch`、§3）で知る。カーネルも共有の文書も
   通らない（移植したプログラムは自分の profile をそのまま使える）。
-- システムの部品の状態（今はどれもカーネルの中）。文書は利用者の `AppData\Nocturne` にある：
-  - ポインターの速さとなめらかな階調：デスクトップ（`gui/wm.c`、`SCREEN_SETTINGS_SET`、§9）→
-    `Desktop.conf`（`pointer_speed`、`smooth_gradients`）。
-  - 音量と消音：音（`dev/audio.c`、`n_audio_output` とタスクバーのスピーカー、§9）→ `Sound.conf`
-    （`volume`、`muted`）。
-  - モニターごとに選んだモード：画面のモード（`gui/screenmode.c`、`SCREEN_MODE_KEEP`、§9）→
-    `Displays.conf`（`mode.<monitor>`）。
-- 部品の文書は**インターフェースではない**：形（`キー=値` の行、`#` で始まる行は注釈）も鍵も
-  持ち主が決め、版とともに変わりうる。書くのはその持ち主だけ。プログラムは値を §9 の呼出しで
-  読み・頼み、見張りで変化を知る。文書を手で直しても、動いている系には効かない（次の起動で
-  持ち主が読み、分からない行・範囲外の値は捨てる）。
-- 保存：持ち主は値が変わると保存の印を付け、保存の共通の仕組み（`sys/keep.c`。鍵を一つも
-  知らない）が最後の変化から 0.5 秒後に持ち主の文書全体を差し替える（`store_save`）。電源を
-  切る前、再起動の前、スリープと休止の前には待たずに書く。書けなかった変化は次の変化か電源の前に
-  書き直す。
-- 起動：各持ち主が登録し、C: と利用者のフォルダーが使えるようになった後（`store_start` と
-  `wm_init` の後）、init より前に、各文書を読んで持ち主へ渡す。文書の無い持ち主は既定の値の
-  まま。読み戻しと引き継ぎは `keep:` の行でシステムログに書く。
-- 以前の系からの引き継ぎ：自分の文書が無い持ち主だけが、以前の系の文書を新しい方から一つ
-  （a51c4398 の `AppData\Nocturne\Settings.conf`、無ければ以前の設定アプリの
-  `AppData\Settings\desktop.conf`）読んで自分の値にし、すぐ自分の文書を書く。文書を持つ持ち主の
-  値は以前の文書に上書きされない。以前の文書は、全部の行がどれかの持ち主のもので、読んだ
-  持ち主が全部保存できたときだけ消す（`languages=` の行がある `Settings.conf` は残る）。
 - 見張り（`N_KIND_WATCH`、§1）：見張るものが変わると `N_EVENT_RECEIVABLE`（レベル：
   `n_watch_take(watch)` が取るまで）。`n_watch_take` は前の取り出しの後の変化の数を返し（無ければ
   0、上限 `N_WATCH_CHANGES_MAX`）、数を消す。見張りは開いた時から数える。誰が変えても（その
@@ -1180,10 +1199,8 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   - `n_screen_watch()`（`SYS_SCREEN_INFO` の `SCREEN_WATCH`、display.h）：`SCREEN_SETTINGS_GET`・
     `struct screen_format` の返事・`SCREEN_MODES_GET` が報告するもの。
   - `n_entry_watch(path, what)`（`SYS_ENTRY_WATCH`、§3）：C: の名前とフォルダー。
+  - `n_settings_watch(domain)`（`SYS_SETTINGS_WATCH`）：領域の今の値。
 - 言語の一覧はシステムの状態ではない：読むプログラム（ブラウザー）の好みで、その持ち物である。
-  a51c4398 の `SYS_USER_SETTINGS_WATCH`・`SYS_USER_SETTINGS_CHANGES`・`SYS_USER_LANGUAGES`・
-  `SYS_USER_LANGUAGES_SET`（203〜206）はカーネルが受け付けず（`N_ERR_UNSUPPORTED`）、欠番のまま
-  使い直さない（§10）。
 - nocturne/ui（TypeScript・JavaScript）では `desktop.watch(listener)`：`listener` は変わったものの
   名前の配列を受け取る。`"screen"` は `desktop.get()`・`desktop.modes()` が報告するもの（画面の
   見張り）、`"sound"` は `desktop.sound()` が報告するもの（音の見張り）。`ScreenModes.chosen` が

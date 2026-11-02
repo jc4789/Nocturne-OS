@@ -1,6 +1,5 @@
 /* Sound: the apps' streams, the mixer, the outputs and the thread that feeds them (see audio.h). */
 #include "dev/audio.h"
-#include "gui/wm.h"
 #include "sys/syscall.h"
 #include "arch/cpu.h"
 #include "mm/heap.h"
@@ -809,7 +808,6 @@ static void sound_put(int v, int m) {
     if (!changed) return;
     settings_changed(N_DOMAIN_AUDIO);
     watched_changed(&output_watched);
-    wm_taskbar_changed();
 }
 /* A moment old at most: the watches hear of every change after it is made. */
 int audio_volume(void) { return __atomic_load_n(&volume, __ATOMIC_RELAXED); }

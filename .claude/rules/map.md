@@ -29,8 +29,8 @@
 | `sys/authority.c`・`service.c` | process の身元と能力の handle（`common/authority_abi.h`）、サービスの管理者への接続の道。カーネルに名前は無い。 |
 | `sys/syscall.c` | syscall の受け口 `syscall_dispatch`。 |
 | `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console と system log の stream、profiler。 |
-| `sys/keep.c` | wm・audio・screenmode の設定を `AppData\Nocturne\` の `.conf` に保存し、init の前に読み戻す。 |
-| `fs/` | C: の store の実行側。mount とパスの操作は `store.c`、開いた文書は `document.c`、block cache は `cache.c`、変更の watch は `watch.c`。書式のエンジンは `common/store/`。 |
+| `sys/settings.c` | 設定の門。領域と鍵の番号の表で持ち主へ渡す（`SYS_SETTINGS_*`、番号は `common/settings_abi.h`）。カーネルは保存しない。 |
+| `fs/` | C: の store の実行側。mount とパスの操作とパスの権限は `store.c`、開いた文書と私的な領域は `document.c`、block cache は `cache.c`、変更の watch は `watch.c`、起動の記録 `settings.rec` は `bootrecord.c`。書式のエンジンは `common/store/`。 |
 | `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音（`audio` が流れ・混合・出口の選択、`hda`・`hda_codec` が High Definition Audio）、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（USB HID）、`serial`、`refclock`（HPET か ACPI PM timer と、RTC）、電源と hibernate。 |
 | `net/` | `net.c`（Ethernet から TCP・DHCP・DNS まで）と `rtl8125.c`（実機の NIC）。 |
 | `gui/` | `wm.c`（窓管理と、画面ごとの合成のスレッド）、`desktop.c`、`screenmode.c`（画面ごとのモードの選択）。 |
@@ -62,7 +62,7 @@
 | `ports/<名>/` | 移植の差分と設定。expat、ffmpeg、freetype、go、lexbor、llvm、mesa、nvidia、rust、tcc、typescript、virgl、wabt。 |
 | `third_party/<名>/` | 取り込んだ上流のソース。 |
 | `host/store/store.c` | ホストの道具。C: を作り、詰め、検査する。 |
-| `boot/limine.conf` | 起動の項目は desktop と `nogui` の二つ。 |
+| `boot/limine.conf` | 起動の項目は一つ。起動の記録 `settings.rec` を module で持ち込む。 |
 | `rootfs/` | C: にそのまま入るもの（`Nocturne\`、`Users\User\`）。 |
 | `scripts/` | ビルド、媒体、試験、生成、Hyper-V の道具。 |
 | `tests/` | ゲストの試験（`runtests.c`）、WPT の runner、ホストの検査 `check_*.py`（`check_hda_codec.py` は codec の表で widget の木を試す）。 |
@@ -135,6 +135,7 @@ user/libc/sys.c の SYSCALL
 - C: の中身は `scripts/layout.py` が `build/c.list` を作り、`build/host/store.exe fill` が詰める。
 - 任意の移植の道具は `tools/go`、`tools/TypeScript`、`tools/rust`、`tools/llvm`、`local/firmware/`。
 - ゲストの試験の表は `tests/runtests.c` の `tests[]`。回すのは `scripts/test.py`。
+- 試験の旗を読むカーネルは `make kernel-test`（`build/kernel-test.elf`、`NOCTURNE_TEST_FLAGS`）。製品のカーネルは起動の引数を読まない。
 - WPT は `scripts/wpt.py <path>…`。ゲストの側は `tests/wptrunner.c`。
 - QuickJS の test262 はホストの `tests/check_test262.py`。
 

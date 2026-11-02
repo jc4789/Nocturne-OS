@@ -37,7 +37,6 @@
 #include "settings_abi.h"
 #include "sys/settings.h"
 /* sys/object.c: whether the handle is a capability that gives want. */
-int cap_check(int handle, enum n_cap want);
 
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
 

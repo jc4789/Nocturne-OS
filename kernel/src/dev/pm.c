@@ -12,7 +12,6 @@
 #include "fs/store.h"
 #include "dev/hibernate.h"
 #include "dev/iommu.h"
-#include "gui/wm.h"
 #include "sys/process.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
@@ -78,24 +77,35 @@ void pm_request(enum pm_action action, bool interactive) {
 
 bool pm_stopping(void) { return __atomic_load_n(&stopping, __ATOMIC_RELAXED); }
 
+static const struct pm_desktop *desktop; /* atomic */
+
+void pm_set_desktop(const struct pm_desktop *d) { __atomic_store_n(&desktop, d, __ATOMIC_RELEASE); }
+
+static void tell(const char *title, const char *text) {
+    const struct pm_desktop *d = __atomic_load_n(&desktop, __ATOMIC_ACQUIRE);
+    if (d) d->notify(title, text);
+}
+
 /* Every window gets EV_CLOSE; an app may ask its user to save first. Returns
    false when a menu request is cancelled by an app that kept its window. */
 static bool close_windows(void) {
+    const struct pm_desktop *d = __atomic_load_n(&desktop, __ATOMIC_ACQUIRE);
+    if (!d) return true;
     char title[64], shown[64] = "";
-    int left = wm_window_count(title, sizeof title);
+    int left = d->window_count(title, sizeof title);
     if (!left) return true;
     kprintf("pm: asking %d windows to close\n", left);
-    wm_close_windows();
+    d->close_windows();
     uint64_t start = clock_now_ns(), progress = start, told = 0;
     int last = left;
     bool hint = false; /* the toast is narrow: the window's title and the way out take turns */
-    while ((left = wm_window_count(title, sizeof title)) > 0) {
+    while ((left = d->window_count(title, sizeof title)) > 0) {
         uint64_t now = clock_now_ns();
         if (left < last) { last = left; progress = now; }
         if (is_forced() ? now - start >= GRACE_NS : now - progress >= STALL_NS) break;
         if (now - start >= NS_PER_S && (strcmp(title, shown) || now - told >= 3 * NS_PER_S)) {
             hint = !is_forced() && !strcmp(title, shown) && !hint;
-            wm_notify(wanted_now() == PM_REBOOT ? "Waiting to restart" : "Waiting to shut down",
+            tell(wanted_now() == PM_REBOOT ? "Waiting to restart" : "Waiting to shut down",
                       hint ? "Choose again to force it" : title);
             strlcpy(shown, title, sizeof shown);
             told = now;
@@ -103,7 +113,7 @@ static bool close_windows(void) {
         sleep_until(clock_after(50 * NS_PER_MS));
     }
     if (!left || is_forced()) return true;
-    wm_notify(wanted_now() == PM_REBOOT ? "Restart cancelled" : "Shutdown cancelled", title);
+    tell(wanted_now() == PM_REBOOT ? "Restart cancelled" : "Shutdown cancelled", title);
     kprintf("pm: cancelled, \"%s\" kept its window\n", title);
     uint64_t f = spin_lock(&pm_lock);
     force_until = clock_after(FORCE_NS);
@@ -243,8 +253,8 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
             if (!lost) lost = d->name;
         }
     acpi_freeze(false);
-    if (units_lost) wm_notify("The IOMMU did not come back from sleep", units_lost);
-    if (lost) wm_notify(slept ? "A device did not wake up" : "A device did not restart", lost);
+    if (units_lost) tell("The IOMMU did not come back from sleep", units_lost);
+    if (lost) tell(slept ? "A device did not wake up" : "A device did not restart", lost);
     if (slept) kprintf("pm: awake after %ld s\n", (long)secs);
     if (stuck) {
         static char msg[64];
@@ -266,7 +276,7 @@ static void sleep_now(bool hibernate) {
     if (!why && hibernate) hibernate_prepare(&why);
     if (why) {
         kprintf("pm: not %s: %s\n", hibernate ? "hibernating" : "sleeping", why);
-        wm_notify(hibernate ? "Cannot hibernate" : "Cannot sleep", why);
+        tell(hibernate ? "Cannot hibernate" : "Cannot sleep", why);
         return;
     }
     kprintf("pm: going to %s\n", hibernate ? "hibernate" : "sleep");
@@ -286,7 +296,7 @@ static void sleep_now(bool hibernate) {
         slept = machine_sleep(hibernate_snapshot, 4, &why);
         if (!slept && !why) {
             /* the snapshot: the machine as it is from here on never comes back */
-            wm_notify("Hibernating", "Saving the memory to C:");
+            tell("Hibernating", "Saving the memory to C:");
             if (!(why = hibernate_write())) {
                 uint64_t f = spin_lock(&pm_lock);
                 __atomic_store_n(&stopping, true, __ATOMIC_RELAXED);
@@ -301,10 +311,11 @@ static void sleep_now(bool hibernate) {
     if (parked) smp_resume();
     blk_release();
     if (hibernate) hibernate_cleanup(slept);
-    wm_repaint();
+    const struct pm_desktop *d = __atomic_load_n(&desktop, __ATOMIC_ACQUIRE);
+    if (d) d->repaint();
     if (!slept) {
         kprintf("pm: %s failed: %s\n", hibernate ? "hibernation" : "sleep", why);
-        wm_notify(hibernate ? "Hibernation failed" : "Sleep failed", why);
+        tell(hibernate ? "Hibernation failed" : "Sleep failed", why);
     }
 }
 
@@ -333,7 +344,7 @@ static void pm_thread(void *arg) {
             __atomic_store_n(&stopping, true, __ATOMIC_RELAXED);
             action = wanted;
             spin_unlock(&pm_lock, f);
-            wm_notify(action == PM_REBOOT ? "Restarting" : "Shutting down",
+            tell(action == PM_REBOOT ? "Restarting" : "Shutting down",
                       action == PM_REBOOT ? "See you in a moment..." : "Good night!");
             stop_apps();
             store_sync(); /* what was saved reaches its volume first */

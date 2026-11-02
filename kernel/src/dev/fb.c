@@ -12,6 +12,8 @@
 #include "sys/wait.h"
 #include "vm/vm.h"
 
+const struct screen_display *screen_display;
+
 struct fb_info fb;
 
 /* ---- buffers ----

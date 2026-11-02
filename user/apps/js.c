@@ -937,29 +937,10 @@ static JSValue h_screen_modes(JSContext *c, JSValueConst this, int argc, JSValue
     JS_SetPropertyStr(ctx, o, "modes", modes);
     JS_SetPropertyStr(ctx, o, "shown", screen_mode_value(&s->offered.shown));
     JS_SetPropertyStr(ctx, o, "wanted", screen_mode_value(&s->wanted));
-    JS_SetPropertyStr(ctx, o, "trialMs", JS_NewUint32(ctx, s->trial_ms));
     JS_SetPropertyStr(ctx, o, "refused", JS_NewBool(ctx, s->refused));
     JS_SetPropertyStr(ctx, o, "chosen", screen_mode_value(&s->chosen));
     free(s);
     return o;
-}
-
-/* (how: "try", "keep" or "back"; width, height, refresh in mHz; the screen, 0 without it):
-   SCREEN_MODE_SET; whether the system took it */
-static JSValue h_screen_mode_set(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    static const char *const hows[] = {[SCREEN_MODE_TRY] = "try", [SCREEN_MODE_KEEP] = "keep", [SCREEN_MODE_BACK] = "back"};
-    struct screen_mode_set s = {0};
-    const char *how = JS_ToCString(ctx, argv[0]);
-    if (!how) return JS_EXCEPTION;
-    for (uint32_t i = SCREEN_MODE_TRY; i < sizeof hows / sizeof *hows; i++)
-        if (!strcmp(how, hows[i])) s.how = i;
-    JS_FreeCString(ctx, how);
-    if (!s.how) return JS_FALSE;
-    JS_ToUint32(ctx, &s.mode.width, argv[1]);
-    JS_ToUint32(ctx, &s.mode.height, argv[2]);
-    JS_ToUint32(ctx, &s.mode.refresh_mhz, argv[3]);
-    uint64_t op = SCREEN_MODE_SET | (uint64_t)screen_argument(argc, argv, 4) << 8;
-    return JS_NewBool(ctx, __syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, op, 0, 0) == 0);
 }
 
 /* What desktop, screenModes and sound report, watched where it is kept (display_abi.h's
@@ -1445,7 +1426,6 @@ static const JSCFunctionListEntry host_functions[] = {
     JS_CFUNC_DEF("uiLaunch", 2, h_ui_launch),
     JS_CFUNC_DEF("desktop", 0, h_desktop),
     JS_CFUNC_DEF("screenModes", 1, h_screen_modes),
-    JS_CFUNC_DEF("screenModeSet", 5, h_screen_mode_set),
     JS_CFUNC_DEF("systemWatch", 1, h_system_watch),
     JS_CFUNC_DEF("sound", 0, h_sound),
     JS_CFUNC_DEF("systemInfo", 0, h_system_info),

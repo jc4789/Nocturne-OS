@@ -14,7 +14,6 @@
 #include <string.h>
 #include <math.h>
 #include "nocturne.h"
-#include "testrun.h"
 
 #define PI 3.14159265358979323846
 
@@ -108,7 +107,7 @@ static long volume(void) {
 }
 static n_result apply_sound(uint32_t key, int32_t value) {
     static n_handle cap = -1;
-    if (cap < 0) cap = test_cap(N_CAP_SETTINGS_APPLY);
+    if (cap < 0) cap = n_cap_find(N_CAP_SETTINGS_APPLY);
     return n_settings_apply(cap, N_DOMAIN_AUDIO, key, &value, sizeof value);
 }
 static long set_volume(int percent) {

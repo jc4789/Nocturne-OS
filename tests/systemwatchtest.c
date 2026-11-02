@@ -3,7 +3,6 @@
  * pointer's speed, and puts them back at the end. Prints "systemwatchtest: N checks, M failed". */
 #include "nocturne.h"
 #include "display.h"
-#include "testrun.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,7 +24,7 @@ static struct n_audio_output sound(void) {
 /* What the test run lets this test apply. */
 static n_result apply(uint32_t domain, uint32_t key, int32_t value) {
     static n_handle cap = -1;
-    if (cap < 0) cap = test_cap(N_CAP_SETTINGS_APPLY);
+    if (cap < 0) cap = n_cap_find(N_CAP_SETTINGS_APPLY);
     return n_settings_apply(cap, domain, key, &value, sizeof value);
 }
 static n_result set_volume(int v) { return apply(N_DOMAIN_AUDIO, N_AUDIO_VOLUME, v); }

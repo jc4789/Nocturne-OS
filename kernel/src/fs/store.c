@@ -17,9 +17,8 @@
 #include "arch/percpu.h"
 #include "arch/topology.h"
 #include "authority_abi.h"
+#include "sys/authority.h"
 
-/* sys/authority.c: what the kernel knows the calling app to be. */
-const struct n_identity *identity_current(void);
 
 #define WRITE_DELAY_NS (5 * NS_PER_S) /* the first change waits this long for more to commit with it */
 #define FIND_NS (10 * NS_PER_S)       /* how long the disk the system started from may take to appear */

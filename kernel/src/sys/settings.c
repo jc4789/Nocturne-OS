@@ -4,11 +4,9 @@
 #include "authority_abi.h"
 #include "fs/bootrecord.h"
 #include "mm/heap.h"
+#include "sys/authority.h"
 #include "sys/syscall.h"
 #include "sys/watch.h"
-
-/* sys/object.c: whether the handle is a capability that gives want. */
-int cap_check(int handle, enum n_cap want);
 
 struct setting {
     uint32_t domain, key, type, flags;
@@ -39,6 +37,7 @@ static const struct setting settings[] = {
 };
 
 static struct watched watches[N_DOMAIN_COUNT];
+static struct settings_hearer *hearers[N_DOMAIN_COUNT];
 
 static const struct setting *setting_find(uint32_t domain, uint32_t key) {
     for (size_t i = 0; i < ARRAY_SIZE(settings); i++)
@@ -50,7 +49,15 @@ void settings_init(void) {
     for (unsigned d = 0; d < N_DOMAIN_COUNT; d++) watched_init(&watches[d], NULL);
 }
 
-void settings_changed(enum n_setting_domain domain) { watched_changed(&watches[domain]); }
+void settings_changed(enum n_setting_domain domain) {
+    watched_changed(&watches[domain]);
+    for (struct settings_hearer *h = __atomic_load_n(&hearers[domain], __ATOMIC_ACQUIRE); h; h = h->next) h->changed();
+}
+
+void settings_hear(enum n_setting_domain domain, struct settings_hearer *h) {
+    h->next = __atomic_load_n(&hearers[domain], __ATOMIC_RELAXED);
+    while (!__atomic_compare_exchange_n(&hearers[domain], &h->next, h, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
+}
 
 /* value in the kernel, of s's type: within its range. */
 static int value_check(const struct setting *s, const void *value) {

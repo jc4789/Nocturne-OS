@@ -36,38 +36,34 @@ struct desktop_settings {
     uint8_t reserved[5];
 };
 
-/* The monitor's mode (resolution and refresh rate), read and changed by the Settings app:
+/* The monitor's mode (resolution and refresh rate), which the Settings window reads:
    SYS_SCREEN_INFO with its third argument SCREEN_MODES_GET and its second sizeof(struct
-   screen_modes), or SCREEN_MODE_SET and sizeof(struct screen_mode_set). The modes are the display
-   driver's (n_pci_screen_modes, abi.h); the system chooses among them: a mode on trial, else the
-   user's choice for that monitor, else the monitor's preferred mode. Without a display driver's
-   modes (count 0) the screen keeps the mode it has, offered then says which (the monitor and its
-   name from the EDID the firmware read, "" without one; shown the mode of the screen shown), and
-   SCREEN_MODE_SET's TRY, KEEP and BACK say N_ERR_NOT_FOUND. While the firmware's framebuffer is
-   shown, shown is the firmware's mode whether or not modes are offered, its refresh 0 where no
-   timing of the EDID names that size. source says what decides the desktop's size, chosen the
-   mode the user chose for the monitor offered names (all 0: none), whether or not it is offered
-   now. A program built before chosen passes SCREEN_MODES_FIRST_BYTES and gets that much.
+   screen_modes). The modes are the display driver's (n_pci_screen_modes, abi.h); the system
+   chooses among them: the user's choice for that monitor (N_DISPLAY_MODE, settings_abi.h), else the
+   monitor's preferred mode. Without a display driver's modes (count 0) the screen keeps the mode it
+   has, offered then says which (the monitor and its name from the EDID the firmware read, "" without
+   one; shown the mode of the screen shown). While the firmware's framebuffer is shown, shown is the
+   firmware's mode whether or not modes are offered, its refresh 0 where no timing of the EDID names
+   that size. source says what decides the desktop's size, chosen the mode the user chose for the
+   monitor offered names (all 0: none), whether or not it is offered now.
    Each screen has its own: the third argument is the op with the screen's number in its bits
    from 8 on (op | screen << 8; screen 0 holds the taskbar), and screens says how many there are
    (an unknown screen: N_ERR_NOT_FOUND). */
 #define SCREEN_MODES_GET 3
-#define SCREEN_MODE_SET 4
 /* SYS_SCREEN_INFO with its third argument SCREEN_WATCH (the first two 0): a watch (N_KIND_WATCH,
    abi.h), receivable once anything SCREEN_SETTINGS_GET, the struct screen_format reply or
    SCREEN_MODES_GET reports has changed, whoever changed it: the desktop's size and settings,
    whether smooth gradients can be shown, the monitor offered and its modes, the mode wanted, a
-   trial beginning or ending, a refusal, the source, the user's choice. A trial's time counting
-   down is no change. N_ERR_INVALID when the first two are not 0, N_ERR_UNSUPPORTED without the
+   a refusal, the source, the user's choice. N_ERR_INVALID when the first two are not 0, N_ERR_UNSUPPORTED without the
    desktop. */
 #define SCREEN_WATCH 5
-#define SCREEN_MODE_TRIAL_MS 15000u /* a mode tried and not kept goes back after this */
+#define SCREEN_MODE_TRIAL_MS 15000u /* the Settings window's: a mode tried and not kept goes back after this */
 enum {
     SCREEN_SOURCE_FIRMWARE,       /* the firmware's mode: no display driver has run */
     SCREEN_SOURCE_DRIVER,         /* a display driver's mode (count 0: it offers no list; a monitor in offered, or none found) */
     /* The firmware's mode again while the display driver still runs: it gave the screen back
        (a mode its display was not seen to show), or has not shown its own yet.
-       While its modes are offered (count), a mode tried asks it to show that one again. */
+       While its modes are offered (count), a mode applied asks it to show that one again. */
     SCREEN_SOURCE_HANDED_BACK,
     SCREEN_SOURCE_DRIVER_STOPPED, /* the firmware's mode again: the display driver ended */
     SCREEN_SOURCE_REMOTE,         /* a remote viewer's window (Remote Desktop) */
@@ -75,26 +71,11 @@ enum {
 struct screen_modes {
     struct n_screen_modes offered; /* the driver's monitor, the modes and the one it shows */
     struct n_screen_mode wanted;   /* the one the system asks it to show */
-    uint32_t trial_ms;             /* the mode on trial goes back after this; 0: none is on trial */
-    uint32_t refused;              /* the mode tried last could not be shown: the one before is back */
+    uint32_t refused;              /* the mode applied last could not be shown: the next best is shown */
     uint32_t source;               /* SCREEN_SOURCE_* */
     uint32_t screens;              /* the number of screens */
     struct n_screen_mode chosen;   /* the user's choice for offered.monitor (all 0: none) */
 };
-#define SCREEN_MODES_FIRST_BYTES 2176u /* the first struct screen_modes: offered to screens */
-/* TRY: mode (one offered, as listed) is shown on trial, and goes back to the mode before it
-   unless KEEP comes within SCREEN_MODE_TRIAL_MS (BACK: at once). Another TRY during a trial
-   keeps the mode to go back to. KEEP makes it the user's choice for that monitor, shown whenever
-   that monitor is driven and offers it. The settings service hears of it (N_DOMAIN_DISPLAY,
-   settings_abi.h), saves it and applies it back at the next start. */
-enum { SCREEN_MODE_TRY = 1, SCREEN_MODE_KEEP, SCREEN_MODE_BACK };
-struct screen_mode_set {
-    uint32_t how;              /* SCREEN_MODE_* */
-    uint32_t reserved;
-    char monitor[32];          /* unused: 0 */
-    struct n_screen_mode mode; /* TRY: width, height and refresh_mhz (flags ignored) */
-};
-
 /* Window flag. The window buffer carries a deep plane of w*h bytes directly
    after its w*h pixels. The compositor reads it only while the desktop has 10
    or more bits per channel, which can change at run time (Settings). */

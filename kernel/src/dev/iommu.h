@@ -14,7 +14,7 @@
    stopped).
    A block the units did not confirm keeps the group out of every claim until a later attempt
    confirms it. Claims require isolation unless the administrator explicitly selected
-   appdrivers-unisolated at boot; that opt-in never overrides a previous domain's quarantine. */
+   the boot setting N_BOOT_UNISOLATED_DRIVERS; that opt-in never overrides a previous domain's quarantine. */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -43,7 +43,7 @@ bool iommu_active(void); /* the units translate DMA: claims can be isolated */
    sleep/image restoration */
 bool iommu_power_ready(void);
 /* A new domain for d with nothing of the app's mapped yet, attached to every requester ID of its
-   group: 0 with *out set. Only with appdrivers-unisolated, 0 with *out NULL when no unit
+   group: 0 with *out set. Only with N_BOOT_UNISOLATED_DRIVERS, 0 with *out NULL when no unit
    translates, no unit sees one of its requester IDs, its group holds a function the kernel
    drives (not a guest) or that sends as the platform, or the bus was not all enumerated. Without that explicit
    opt-in these are errors, not a downgrade. Never when the units block a function of its group (an earlier
@@ -149,7 +149,7 @@ struct iommu_hw {
     uint64_t (*leaf)(uint64_t phys, unsigned level, unsigned access);
     bool (*is_leaf)(uint64_t entry, unsigned level); /* do not follow a large-page leaf as a table */
     /* Tables made, units on. False does not prove the units are off: the caller must confirm
-       shutdown before treating hardware-owned tables/queues as stopped. translate false (noiommu, or the firmware's
+       shutdown before treating hardware-owned tables/queues as stopped. translate false (N_BOOT_IOMMU off, or the firmware's
        descriptions not all kept): only a unit that must remap interrupts is started, remapping
        them alone, and false when there is none. */
     bool (*start)(bool translate);

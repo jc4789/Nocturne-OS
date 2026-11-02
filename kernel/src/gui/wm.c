@@ -3012,7 +3012,17 @@ uint32_t wm_pointer_image(uint32_t seen, uint32_t *px, int *hot_x, int *hot_y) {
     return serial;
 }
 
+static const struct screen_display display = {.repaint = wm_repaint, .direct = wm_screen_direct,
+                                              .modes_offer = screen_modes_offer, .modes_gone = screen_modes_gone,
+                                              .modes_shown = screen_modes_shown, .state = wm_screen_state};
+static const struct pm_desktop power_desktop = {.window_count = wm_window_count, .close_windows = wm_close_windows,
+                                                .notify = wm_notify, .repaint = wm_repaint};
+static struct settings_hearer sound_hearer = {.changed = wm_taskbar_changed};
+
 void wm_init(void) {
+    screen_display = &display;
+    pm_set_desktop(&power_desktop);
+    settings_hear(N_DOMAIN_AUDIO, &sound_hearer);
     watched_init(&screen_watched, NULL);
     seen_dither_able = fb_dither_able();
     struct screen *s0 = screen_get(0);
@@ -3602,7 +3612,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
     if (num == SYS_SCREEN_INFO) {
         /* A screen's mode: its own lock, which comes before the WM's (it tells the driver through
            wm_screen_mode). The screen's number is in the op's bits from 8 on. */
-        if ((c & 0xff) == SCREEN_MODES_GET || (c & 0xff) == SCREEN_MODE_SET) return screen_modes_syscall((void *)a, b, c);
+        if ((c & 0xff) == SCREEN_MODES_GET) return screen_modes_syscall((void *)a, b, c);
         /* A watch on what all of SYS_SCREEN_INFO reports (else 5 would be read as the reply's size). */
         if (c == SCREEN_WATCH)
             return a || b ? -N_ERR_INVALID : !screen_watchable ? -N_ERR_UNSUPPORTED : watched_open(&screen_watched);

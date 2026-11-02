@@ -105,6 +105,20 @@ struct screen *screen_new(void);
 struct screen *screen_get(unsigned id); /* NULL: no such screen */
 unsigned screen_count(void);
 unsigned screen_id(const struct screen *s);
+
+/* What shows the screens to the user. The drivers of the screens (dev/pciuser.c) say what they do
+   here and do not know who hears it; gui/ sets it at its start, before any app runs. */
+struct n_screen_modes;
+struct n_screen_state;
+struct screen_display {
+    void (*repaint)(void); /* the screens lost what was on them: draw all of them again */
+    void (*direct)(unsigned screen, bool able); /* whether the driver can show a window's own images */
+    void (*modes_offer)(unsigned screen, const struct n_screen_modes *m);
+    void (*modes_gone)(unsigned screen);
+    void (*modes_shown)(unsigned screen, struct screen_mode_desc *desc);
+    int64_t (*state)(unsigned screen, uint64_t seen, struct n_screen_state *out, uint64_t deadline);
+};
+extern const struct screen_display *screen_display;
 /* The driver owner gives s these buffers (count of them, all of desc's mode), shown by ops; the
    buffer shown now is shown (its index). count 0: the screen is off; screen 0 then shows the
    firmware's framebuffer again. Returns once no frame writes to the old buffers any more: the

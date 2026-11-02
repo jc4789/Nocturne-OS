@@ -125,7 +125,7 @@ static bool units_abandon(void) {
     return plain;
 }
 
-/* Units are found also with noiommu, or when the firmware's descriptions could not be kept: a
+/* Units are found also with the boot setting off, or when the firmware's descriptions could not be kept: a
    VT-d unit that requires interrupt remapping (ECAP.IRREQ) blocks every interrupt message while
    it is off (5.1.4), so such units are started with interrupt remapping alone. */
 void iommu_init(void) {
@@ -140,7 +140,7 @@ void iommu_init(void) {
         if (!amd_plain || !intel_plain) restore_failed = true;
         if (restore_failed)
             kprintf("iommu: firmware description unusable; hardware stop unconfirmed; app claims and new interrupt routes disabled\n");
-        else kprintf("iommu: %s: app drivers require appdrivers-unisolated to run without isolation\n",
+        else kprintf("iommu: %s: app drivers run without isolation only by the boot setting\n",
                      off ? off : acpi_find("IVRS", 0) || acpi_find("DMAR", 0)
                          ? "not used (rejected tables, all units confirmed off)"
                          : "none described (no IVRS or DMAR)");
@@ -163,9 +163,9 @@ void iommu_init(void) {
         else if (!ioapic_remap()) restore_failed = true;
         if (restore_failed)
             kprintf("iommu: initialization/interrupt delivery unconfirmed; app claims and new interrupt routes disabled\n");
-        else kprintf("iommu: %s: app drivers require appdrivers-unisolated to run without isolation\n", off ? off : "not used");
+        else kprintf("iommu: %s: app drivers run without isolation only by the boot setting\n", off ? off : "not used");
     } else if (!hw->translating) {
-        kprintf("iommu: %s remaps interrupts only: app drivers require appdrivers-unisolated\n", hw->name);
+        kprintf("iommu: %s remaps interrupts only: app drivers need the boot setting to run without isolation\n", hw->name);
     }
     irq_restore(irq);
 }

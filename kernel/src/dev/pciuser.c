@@ -29,8 +29,6 @@
 #include "dev/pci.h"
 #include "dev/pciuser.h"
 #include "sys/settings.h"
-#include "gui/screenmode.h"
-#include "gui/wm.h"
 #include "mm/heap.h"
 #include "sys/proc.h"
 #include "sys/object.h"
@@ -275,7 +273,7 @@ static void screen_hold_end(struct pci_claim *c) {
 /* Whoever draws the screen (the desktop, or the text console when there is none) draws all of it
    again. */
 static void screen_repaint(void) {
-    wm_repaint();
+    screen_display->repaint();
     fbcon_repaint();
 }
 
@@ -287,7 +285,7 @@ static void screen_release(void) {
 
 /* ---- a display driver's outputs (n_pci_give_screen, dev/fb.c) ----
    A display function's driver drives outputs, each a monitor. It offers the modes of an output's
-   monitor (n_pci_screen_modes; the system chooses one, gui/screenmode.c), sets the one chosen up
+   monitor (n_pci_screen_modes; the system chooses one), sets the one chosen up
    with buffers of its size and gives them to the output's screen (n_pci_give_screen): the screen
    takes that size, its frames are drawn into the buffer the output does not show, and each is
    asked for as a flip (n_pci_screen_flips); the driver says when the flip was shown, with the
@@ -447,7 +445,7 @@ static uint64_t output_buffers(struct pci_output *o, const struct screen_mode_de
         fb_buffer_unmap(old_buf[i]);
         shared_scanout_close(&old_surface[i]);
     }
-    wm_screen_direct(screen_id(o->screen), o->direct);
+    screen_display->direct(screen_id(o->screen), o->direct);
     return last;
 }
 
@@ -480,7 +478,7 @@ static bool outputs_end(struct pci_claim *c) {
                                      "(screen 0 the boot screen again, which the display may not show: nothing sets the "
                                      "display engine back)");
         }
-        if (o->modes) screen_modes_gone(screen_id(o->screen));
+        if (o->modes) screen_display->modes_gone(screen_id(o->screen));
         kfree(o);
     }
     kfree(c->outputs);
@@ -922,7 +920,7 @@ int64_t pci_user_give_screen(struct handle *h, uint32_t output, const struct n_s
         if (b) {
             desc = (struct screen_mode_desc){.width = b->width, .height = b->height,
                                              .direct = (b->format & N_SCANOUT_DIRECT) != 0};
-            screen_modes_shown(screen_id(o->screen), &desc);
+            screen_display->modes_shown(screen_id(o->screen), &desc);
         }
         uint64_t last = output_buffers(o, &desc, surface, buf, b ? b->count : 0);
         r = (int64_t)last;
@@ -996,7 +994,7 @@ int64_t pci_user_screen_state(struct handle *h, uint32_t output, uint64_t seen, 
     int64_t screen = o && (o->count || o->modes) ? (int64_t)screen_id(o->screen) : -1;
     mutex_unlock(&screen_lock);
     if (screen < 0) return -N_ERR_DENIED;
-    return wm_screen_state((unsigned)screen, seen, out, deadline);
+    return screen_display->state((unsigned)screen, seen, out, deadline);
 }
 
 int64_t pci_user_screen_modes(struct handle *h, uint32_t output, const struct n_screen_modes *m) {
@@ -1014,7 +1012,7 @@ int64_t pci_user_screen_modes(struct handle *h, uint32_t output, const struct n_
     if (!o) r = m->count ? -N_ERR_NO_MEMORY : 0;
     else {
         o->modes = m->count != 0;
-        screen_modes_offer(screen_id(o->screen), m);
+        screen_display->modes_offer(screen_id(o->screen), m);
     }
     mutex_unlock(&screen_lock);
     return r;
