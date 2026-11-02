@@ -271,8 +271,8 @@ uint64_t prof_window_ns(void) { return __atomic_load_n(&enabled, __ATOMIC_ACQUIR
 
 void prof_init(void) {
     uint64_t ms = 0;
-    bool timed = cmdline_number("prof_ms", &ms) && ms >= 100 && ms <= 600000;
-    if (!cmdline_has("prof") && !timed) return;
+    bool timed = test_number("prof_ms", &ms) && ms >= 100 && ms <= 600000;
+    if (!test_flag("prof") && !timed) return;
     if (timed) {
         period_ms = (unsigned)ms;
         top_count = ms >= 10000 ? 400 : 60;

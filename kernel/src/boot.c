@@ -1,5 +1,6 @@
 /* Nocturne OS kernel entry point. */
 #include "kernel.h"
+#include "fs/bootrecord.h"
 #include "limine.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
@@ -56,31 +57,43 @@ volatile struct limine_module_request module_req = {.id = LIMINE_MODULE_REQUEST_
 __attribute__((used, section(".limine_requests")))
 volatile struct limine_rsdp_request rsdp_req = {.id = LIMINE_RSDP_REQUEST_ID, .revision = 0};
 
+#ifdef NOCTURNE_TEST_FLAGS
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_executable_cmdline_request cmdline_req = {.id = LIMINE_EXECUTABLE_CMDLINE_REQUEST_ID, .revision = 0};
+#endif
 
 __attribute__((used, section(".limine_requests_end")))
 static volatile uint64_t requests_end[] = LIMINE_REQUESTS_END_MARKER;
 
 uint64_t hhdm_offset;
-const char *kernel_cmdline = "";
+#ifdef NOCTURNE_TEST_FLAGS
+static const char *test_cmdline = "";
+#endif
 
 void kmain_late(void);
 
-bool cmdline_has(const char *word) {
+#ifdef NOCTURNE_TEST_FLAGS
+bool test_flag(const char *word) {
     size_t n = strlen(word);
-    for (const char *p = kernel_cmdline; *p; p++) {
-        if ((p == kernel_cmdline || p[-1] == ' ') && !strncmp(p, word, n) && (p[n] == 0 || p[n] == ' '))
+    for (const char *p = test_cmdline; *p; p++) {
+        if ((p == test_cmdline || p[-1] == ' ') && !strncmp(p, word, n) && (p[n] == 0 || p[n] == ' '))
             return true;
     }
     return false;
 }
 
-bool cmdline_number(const char *key, uint64_t *out) {
+const char *test_text(const char *key) {
+    size_t n = strlen(key);
+    for (const char *p = test_cmdline; *p; p++)
+        if ((p == test_cmdline || p[-1] == ' ') && !strncmp(p, key, n) && p[n] == '=') return p + n + 1;
+    return NULL;
+}
+
+bool test_number(const char *key, uint64_t *out) {
     size_t n = strlen(key);
     bool found = false;
-    for (const char *p = kernel_cmdline; *p; p++) {
-        if ((p != kernel_cmdline && p[-1] != ' ') || strncmp(p, key, n) || p[n] != '=') continue;
+    for (const char *p = test_cmdline; *p; p++) {
+        if ((p != test_cmdline && p[-1] != ' ') || strncmp(p, key, n) || p[n] != '=') continue;
         const char *q = p + n + 1;
         uint64_t value = 0;
         bool valid = *q >= '0' && *q <= '9';
@@ -93,6 +106,7 @@ bool cmdline_number(const char *key, uint64_t *out) {
     }
     return found;
 }
+#endif
 
 /* CPU 0 from here on its idle thread's own stack (sys/sched.h), as each other CPU from ap_main. */
 static NORETURN void kmain_scheduled(void *unused) {
@@ -123,7 +137,10 @@ void kmain(void) {
         for (;;) hlt();
     }
     hhdm_offset = hhdm_req.response->offset;
-    if (cmdline_req.response && cmdline_req.response->cmdline) kernel_cmdline = cmdline_req.response->cmdline;
+#ifdef NOCTURNE_TEST_FLAGS
+    if (cmdline_req.response && cmdline_req.response->cmdline) test_cmdline = cmdline_req.response->cmdline;
+#endif
+    boot_record_read();
 
     /* The CPU: what it has, then its state as every other CPU's (arch/cpu.h), the memory types
        among it before any page table is built (vmm.c maps MMIO as PAT entry 3, UC, and the
@@ -158,7 +175,7 @@ void kmain(void) {
     vm_detect(); /* before the clock: a hypervisor that states the TSC's rate registers it */
     kprintf("video: %ux%u, %u bpp, %u bpc (R%u@%u G%u@%u B%u@%u)%s, pitch %u\n", fb.width, fb.height,
             fb.bpp, fb.bpc, fb.rsize, fb.rshift, fb.gsize, fb.gshift, fb.bsize, fb.bshift,
-            fb.simulated ? " simulated by fbsim10" : "", fb.pitch);
+            fb.simulated ? " simulated" : "", fb.pitch);
     if (!fb.monitor[0]) kprintf("video: the firmware passed no EDID of the monitor\n");
     else if (fb.refresh_mhz)
         kprintf("video: monitor %s%s%s, at %u.%03u Hz\n", fb.monitor, fb.monitor_name[0] ? ", " : "",

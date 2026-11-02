@@ -54,6 +54,28 @@ $(BUILD)/k/third_party/uacpi/%.o: third_party/uacpi/%.c
 	@echo "  CC   $<"
 	@$(CC) $(filter-out -W%,$(KCFLAGS)) -w -c $< -o $@
 
+# The test build of the kernel: the same sources with the test flags of the kernel command line
+# (kernel.h's test_flag). Only scripts/test.py and scripts/wpt.py put it on their disks.
+KTOBJ := $(patsubst $(BUILD)/k/%,$(BUILD)/kt/%,$(KOBJ))
+$(BUILD)/kt/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  CC   $< (test)"
+	@$(CC) $(KCFLAGS) -DNOCTURNE_TEST_FLAGS -c $< -o $@
+
+$(BUILD)/kt/third_party/uacpi/%.o: third_party/uacpi/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC   $< (test)"
+	@$(CC) $(filter-out -W%,$(KCFLAGS)) -w -c $< -o $@
+
+$(BUILD)/kt/%.asm.o: %.asm
+	@mkdir -p $(dir $@)
+	@echo "  NASM $< (test)"
+	@$(NASM) -f elf64 -g $< -o $@
+
+$(BUILD)/kernel-test.elf: $(KTOBJ) kernel/linker.ld
+	@echo "  LD   $@"
+	@$(LD) $(KLDFLAGS) $(KTOBJ) -o $@
+
 # The build host's tool for the volume (host/store/store.c), a Windows program: it makes the boot
 # disk and puts the system on drive C: with the store's own code (common/store), the library the
 # kernel's C: is built on as well; the tool gives it the program's memory and blocks of its own.
@@ -524,11 +546,13 @@ $(BUILD)/sdk.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC
 	@touch $@
 
 # ---------------------------------------------------------------- images
-.PHONY: all kernel user cxx lexbor image qemu-image run clean test test-quick test-full
+.PHONY: all kernel kernel-test user cxx lexbor image qemu-image run clean test test-quick test-full
 .SECONDARY:
 all: image
 
 kernel: $(BUILD)/kernel.elf
+
+kernel-test: $(BUILD)/kernel-test.elf
 user: $(APP_BINS) $(NVRM_FILES) $(PROGRAMS)/tcc
 cxx: $(CPP_BINS) $(LICENSES)/libcxx/LICENSE.TXT
 lexbor: $(LXB_OBJ)

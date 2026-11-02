@@ -28,7 +28,6 @@ static int failed;
     } while (0)
 
 /* the system's programs this test runs: complete paths, as n_app_launch takes them */
-#define VOLUME N_FOLDER_SYSTEM "\\volume"
 #define BEEP N_FOLDER_SYSTEM "\\beep"
 #define PLAY N_FOLDER_SYSTEM "\\play"
 
@@ -99,16 +98,21 @@ static int run_quiet(const char *const *args, uint32_t argc) {
     return st;
 }
 
-/* The master volume (n_audio_output): as it is, or set to percent; the error when that fails. */
+/* The master volume (n_audio_output): as it is, or set to percent (SYS_SETTINGS_APPLY, by the right
+   the test run gives); the error when that fails. */
 static long volume(void) {
     struct n_audio_output o;
-    n_result r = n_audio_output(&o, 0);
+    n_result r = n_audio_output(&o);
     return r < 0 ? (long)r : (long)o.volume;
 }
+static n_result apply_sound(uint32_t key, int32_t value) {
+    static n_handle cap = -1;
+    if (cap < 0) cap = n_cap_find(N_CAP_SETTINGS_APPLY);
+    return n_settings_apply(cap, N_DOMAIN_AUDIO, key, &value, sizeof value);
+}
 static long set_volume(int percent) {
-    struct n_audio_output o = {.volume = percent};
-    n_result r = n_audio_output(&o, N_AUDIO_SET_VOLUME);
-    return r < 0 ? (long)r : (long)o.volume;
+    n_result r = apply_sound(N_AUDIO_VOLUME, percent);
+    return r < 0 ? (long)r : volume();
 }
 
 /* submit all of frames, waiting for room */
@@ -177,32 +181,18 @@ int main(void) {
 
     /* the master volume and muting, and what plays the sound (the card this test records) */
     struct n_audio_output out = {0};
-    CHECK(n_audio_output(&out, 0) == 0 && out.volume == 80 && !out.muted, "the volume starts at %d%s", (int)out.volume,
+    CHECK(n_audio_output(&out) == 0 && out.volume == 80 && !out.muted, "the volume starts at %d%s", (int)out.volume,
           out.muted ? ", muted" : "");
     CHECK(out.device[0] && memchr(out.device, 0, sizeof out.device), "no sound device is named");
     CHECK(set_volume(35) == 35 && volume() == 35, "volume after setting 35: %ld", volume());
-    out.volume = 250;
-    CHECK(n_audio_output(&out, N_AUDIO_SET_VOLUME) == -N_ERR_INVALID && volume() == 35, "setting 250: %ld", volume());
-    out.volume = -1;
-    CHECK(n_audio_output(&out, N_AUDIO_SET_VOLUME) == -N_ERR_INVALID, "setting -1");
-    CHECK(n_audio_output(&out, 4) == -N_ERR_INVALID, "a flag n_audio_output does not know");
-    out.muted = 1;
-    CHECK(n_audio_output(&out, N_AUDIO_SET_MUTED) == 0 && out.muted && out.volume == 35, "muting: %d%s",
+    CHECK(apply_sound(N_AUDIO_VOLUME, 250) == -N_ERR_INVALID && volume() == 35, "setting 250: %ld", volume());
+    CHECK(apply_sound(N_AUDIO_VOLUME, -1) == -N_ERR_INVALID, "setting -1");
+    CHECK(apply_sound(N_AUDIO_MUTED, 1) == 0 && n_audio_output(&out) == 0 && out.muted && out.volume == 35, "muting: %d%s",
           (int)out.volume, out.muted ? ", muted" : "");
-    out.volume = 40;
-    CHECK(n_audio_output(&out, N_AUDIO_SET_VOLUME) == 0 && !out.muted && out.volume == 40,
-          "setting the volume does not unmute: %d%s", (int)out.volume, out.muted ? ", muted" : "");
-    out.volume = 50;
-    out.muted = 1;
-    CHECK(n_audio_output(&out, N_AUDIO_SET_VOLUME | N_AUDIO_SET_MUTED) == 0 && out.muted && out.volume == 50,
-          "the volume and then muting: %d%s", (int)out.volume, out.muted ? ", muted" : "");
-    out.muted = 2;
-    CHECK(n_audio_output(&out, N_AUDIO_SET_MUTED) == -N_ERR_INVALID, "muted 2");
-    out.muted = 0;
-    CHECK(n_audio_output(&out, N_AUDIO_SET_MUTED) == 0 && !out.muted && out.volume == 50, "unmuting");
-    set_volume(100);
-    const char *vargs[] = {VOLUME, "-30"};
-    CHECK(run_quiet(vargs, 2) == 0 && volume() == 70, "volume -30: %ld", volume());
+    CHECK(apply_sound(N_AUDIO_VOLUME, 40) == 0 && n_audio_output(&out) == 0 && out.muted && out.volume == 40,
+          "setting the volume unmutes: %d%s", (int)out.volume, out.muted ? ", muted" : "");
+    CHECK(apply_sound(N_AUDIO_MUTED, 2) == -N_ERR_INVALID, "muted 2");
+    CHECK(apply_sound(N_AUDIO_MUTED, 0) == 0 && n_audio_output(&out) == 0 && !out.muted && out.volume == 40, "unmuting");
 
     /* a melody, at volume 0 so that the recording stays as described above */
     set_volume(0);

@@ -18,6 +18,7 @@
 #include "arch/spin.h"
 #include "dev/acpi.h"
 #include "dev/iommu.h"
+#include "fs/bootrecord.h"
 #include "dev/pci.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
@@ -124,11 +125,11 @@ static bool units_abandon(void) {
     return plain;
 }
 
-/* Units are found also with noiommu, or when the firmware's descriptions could not be kept: a
+/* Units are found also with the boot setting off, or when the firmware's descriptions could not be kept: a
    VT-d unit that requires interrupt remapping (ECAP.IRREQ) blocks every interrupt message while
    it is off (5.1.4), so such units are started with interrupt remapping alone. */
 void iommu_init(void) {
-    const char *off = cmdline_has("noiommu") ? "off (noiommu)" : NULL; /* why DMA is not translated */
+    const char *off = !boot_setting(N_BOOT_IOMMU) ? "off (the boot record says so)" : NULL; /* why DMA is not translated */
     bool amd_plain = false, intel_plain = false;
     const struct iommu_hw *found = iommu_amd_probe(&amd_plain);
     if (!found) found = iommu_intel_probe(&intel_plain);
@@ -139,7 +140,7 @@ void iommu_init(void) {
         if (!amd_plain || !intel_plain) restore_failed = true;
         if (restore_failed)
             kprintf("iommu: firmware description unusable; hardware stop unconfirmed; app claims and new interrupt routes disabled\n");
-        else kprintf("iommu: %s: app drivers require appdrivers-unisolated to run without isolation\n",
+        else kprintf("iommu: %s: app drivers run without isolation only by the boot setting\n",
                      off ? off : acpi_find("IVRS", 0) || acpi_find("DMAR", 0)
                          ? "not used (rejected tables, all units confirmed off)"
                          : "none described (no IVRS or DMAR)");
@@ -162,9 +163,9 @@ void iommu_init(void) {
         else if (!ioapic_remap()) restore_failed = true;
         if (restore_failed)
             kprintf("iommu: initialization/interrupt delivery unconfirmed; app claims and new interrupt routes disabled\n");
-        else kprintf("iommu: %s: app drivers require appdrivers-unisolated to run without isolation\n", off ? off : "not used");
+        else kprintf("iommu: %s: app drivers run without isolation only by the boot setting\n", off ? off : "not used");
     } else if (!hw->translating) {
-        kprintf("iommu: %s remaps interrupts only: app drivers require appdrivers-unisolated\n", hw->name);
+        kprintf("iommu: %s remaps interrupts only: app drivers need the boot setting to run without isolation\n", hw->name);
     }
     irq_restore(irq);
 }
@@ -826,9 +827,9 @@ static void held_retry(void) {
 static int unisolated(const struct pci_device *d, const struct fns *g, int r) {
     bool blocked = d->iommu_blocked;
     for (size_t i = 0; i < g->n; i++) blocked |= g->at[i]->iommu_blocked;
-    if (!blocked && cmdline_has("appdrivers-unisolated")) return 0;
+    if (!blocked && boot_setting(N_BOOT_UNISOLATED_DRIVERS)) return 0;
     if (!blocked) {
-        kprintf("iommu: %02x:%02x.%u: refusing an unisolated app driver (no appdrivers-unisolated opt-in)\n",
+        kprintf("iommu: %02x:%02x.%u: refusing an unisolated app driver (the boot record does not allow it)\n",
                 d->bus, d->dev, d->func);
         return r;
     }
@@ -872,7 +873,7 @@ static int attach(struct pci_device *d, struct iommu_domain **out, struct pci_de
         return -N_ERR_UNSUPPORTED;
     }
     if (!iommu_active()) {
-        if (cmdline_has("appdrivers-unisolated")) return 0;
+        if (boot_setting(N_BOOT_UNISOLATED_DRIVERS)) return 0;
         kprintf("iommu: %02x:%02x.%u: isolation is required but no translating IOMMU is active\n",
                 d->bus, d->dev, d->func);
         return -N_ERR_UNSUPPORTED;

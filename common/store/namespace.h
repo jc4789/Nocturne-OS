@@ -21,8 +21,8 @@
 #pragma once
 #include "store/catalog.h"
 
-/* Makes the root folder and the case-folding table of a volume volume_format just made; loads the
-   table of a mounted one. */
+/* Makes the root folder, the folder of the private regions and the case-folding table of a volume
+   volume_format just made; loads the table of a mounted one. */
 int ns_format(struct volume *v, int64_t now);
 int ns_mount(struct volume *v);
 
@@ -33,7 +33,7 @@ int ns_record_put(struct volume *v, uint64_t id, const struct store_record *r, c
 /* What may not change a folder may not change what it holds: an entry has these attributes of its
    folder's for as long as it is in that folder (ns_create, and a move gives them up for the new
    folder's). */
-#define NS_GIVEN (STORE_SYSTEM | STORE_PRIVATE)
+#define NS_GIVEN STORE_PRIVATE
 
 /* What a record becomes: each field named in `fields` from the amend, the rest as the record has
    it at the moment of the change. */
@@ -43,8 +43,10 @@ int ns_record_put(struct volume *v, uint64_t id, const struct store_record *r, c
 #define NS_ATTRIBUTES 8u /* these attributes added, after those taken went */
 #define NS_FLAGS 16u
 #define NS_CONTENT 32u   /* the small content after the record: n bytes */
+#define NS_OWNER 64u
 struct ns_amend {
     unsigned fields;
+    uint32_t owner;
     uint64_t parent, size;
     int64_t modified;
     uint16_t attributes, taken, flags;
@@ -89,12 +91,13 @@ struct ns_told {
 int ns_lookup(struct volume *v, const struct path *p, struct ns_entry *entry, struct store_record *record);
 /* The folder entry after `after` (NULL: the first). */
 int ns_next(struct volume *v, uint64_t folder, const struct ns_entry *after, struct ns_entry *out);
-/* A new entry name in folder, naming a new record (kind, attributes, flags). */
+/* A new entry name in folder, naming a new record (kind, attributes, flags), of the folder's owner. */
 int ns_create(struct volume *v, uint64_t folder, const char *name, size_t n, uint16_t kind, uint16_t attributes,
               uint16_t flags, int64_t now, uint64_t *id, struct ns_told *told);
-/* The entry `name` of folder out of it (to_folder's to_name from then on). Never replaces an entry
-   (-N_ERR_EXISTS), and a folder never goes into itself (-N_ERR_INVALID); a new name for the same
-   entry changes only its case. A move that fails changes nothing. */
+/* The entry `name` of folder out of it (to_folder's to_name from then on), of to_folder's owner from
+   then on. Never replaces an entry (-N_ERR_EXISTS), and a folder never goes into itself
+   (-N_ERR_INVALID); a new name for the same entry changes only its case. A move that fails changes
+   nothing. */
 int ns_move(struct volume *v, uint64_t folder, const char *name, size_t n, uint64_t to_folder, const char *to_name,
             size_t to_n, int64_t now, struct ns_told *told);
 /* ns_move onto the name of a document, which goes to aside's aside_name in the same change, or not

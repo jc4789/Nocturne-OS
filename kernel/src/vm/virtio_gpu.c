@@ -237,7 +237,7 @@ static bool exchange(const void *request, size_t len, uint32_t response_type) {
      * this continuation sleeps. Timeout retires the device without freeing
      * any possibly in-flight DMA or reusing the serialized packet buffers. */
     uint64_t started=clock_now_ns();
-    uint64_t budget=(validating_runtime || (ready&&!cmdline_has("gpu-slow-test"))?2:10)*NS_PER_S,deadline=started+budget;
+    uint64_t budget=(validating_runtime || (ready&&!test_flag("gpu-slow-test"))?2:10)*NS_PER_S,deadline=started+budget;
     unsigned spins = 0;
     while (used->idx == seen_used) {
         if (clock_now_ns()>=deadline || (thread_current()->kstack && thread_current()->killed)) {
@@ -262,7 +262,7 @@ static bool exchange(const void *request, size_t len, uint32_t response_type) {
     }
     statistics.submissions++;
     reply_bytes=u->len;
-    if (cmdline_has("gpu-timing") || cmdline_has("gpu-slow-test")) {
+    if (test_flag("gpu-timing") || test_flag("gpu-slow-test")) {
         kprintf("gpu: complete request=%x ctx=%u fence=%lu stage=%s elapsed_us=%lu spins=%u\n",
             h->type,h->ctx,h->fence,validating_runtime?"validation":ready?"runtime":"init",
             (clock_now_ns()-started)/NS_PER_US,spins);
@@ -576,8 +576,8 @@ void gpu_init(void) {
     strlcpy(statistics.name,"CPU display; no verified virgl pipeline",sizeof statistics.name);
     if (!vm_hosted()) return;
     struct pci_device *d=pci_find(0x1af4,0x1050);
-    if (!d || cmdline_has("nogpu")) return;
-    if (!cmdline_has("gpu-enable") && !cmdline_has("gpu-slow-test")) {
+    if (!d || test_flag("nogpu")) return;
+    if (!test_flag("gpu-enable") && !test_flag("gpu-slow-test")) {
         kprintf("gpu: optional virgl device present; gpu-enable required (cold host fences can be slow)\n");
         return;
     }
@@ -669,7 +669,7 @@ void gpu_init(void) {
     kprintf("gpu: batch capability=%u (cold=%u runtime=%u; legacy independently revalidated)\n",
         batch_ok,cold_batch_ok,batch_ok);
     kprintf("gpu: blit capability=%u (cold=%u runtime=%u; nearest texture pixels)\n",blit_ok,cold_blit_ok,blit_ok);
-    if (cmdline_has("gpu-slow-test")) {
+    if (test_flag("gpu-slow-test")) {
         /* Same public kernel entry, but before a user task/CR3 is involved.
            This distinguishes post-initialization/repeated fences from the
            ring0-to-user transition. The ten-second budget is diagnostic only. */
