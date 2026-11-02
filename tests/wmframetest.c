@@ -18,7 +18,7 @@ static bool wait_frame(window_t *win, uint64_t presented) {
 
 static bool grab_at(uint32_t *screen, int gw, int gh, int x, int y, uint32_t want, const char *what) {
     int w = gw, h = gh;
-    if (screen_grab(screen, (size_t)gw * gh * sizeof *screen, &w, &h) < 0 || w != gw || h != gh) return false;
+    if (screen_grab(n_cap_find(N_CAP_SCREEN_READ), screen, (size_t)gw * gh * sizeof *screen, &w, &h) < 0 || w != gw || h != gh) return false;
     if (screen[(size_t)y * gw + x] == want) return true;
     printf("wmframetest: FAIL %s got=%x expected=%x\n", what, screen[(size_t)y * gw + x], want);
     return false;
@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
     unsigned long frames = strtoul(argv[1], NULL, 10), hold = strtoul(argv[2], NULL, 10);
     if (!frames) return 1;
     int sw, sh, gw, gh;
-    if (screen_size(&sw, &sh) < 0 || screen_grab(NULL, 0, &gw, &gh) < 0) return 1;
+    if (screen_size(&sw, &sh) < 0 || screen_grab(n_cap_find(N_CAP_SCREEN_READ), NULL, 0, &gw, &gh) < 0) return 1;
     window_t *win;
     if (win_open(sw / 2, sh / 2, "フレームの列: 返却・画素確認", WIN_FRAME_QUEUE, &win) < 0) return 1;
     win_move(win, sw / 4, sh / 4);

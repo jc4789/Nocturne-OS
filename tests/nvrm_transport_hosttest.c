@@ -30,7 +30,6 @@ static uint8_t shared_page[N_PAGE_SIZE];
 static char connected_name[NVRM_CHANNEL_NAME_BYTES];
 static char listened_name[NVRM_CHANNEL_NAME_BYTES];
 static int listener_calls, watches, listener_closes;
-static bool legacy_busy;
 FILE *stdout; /* The native FILE global is not MinGW's __acrt_iob_func(). */
 int fflush(FILE *stream) { (void)stream; return 0; }
 
@@ -51,7 +50,7 @@ int mtx_init(mtx_t *m, int type) { (void)m; (void)type; return thrd_success; }
 int mtx_lock(mtx_t *m) { (void)m; return thrd_success; }
 int mtx_unlock(mtx_t *m) { (void)m; return thrd_success; }
 void mtx_destroy(mtx_t *m) { (void)m; }
-/* The server here accepts no client (n_channel_accept is never ready), so no client thread runs;
+/* The server here accepts no client (n_inlet_accept is never ready), so no client thread runs;
    requests are driven directly on this thread through server_request. */
 static int threads_started, stop_wakes;
 int cnd_init(cnd_t *c) { (void)c; return thrd_success; }
@@ -77,14 +76,13 @@ n_result n_handle_close(n_handle h) {
 }
 n_result n_events_unwatch(n_handle q, uint64_t token) { (void)q; (void)token; return 0; }
 n_result n_memory_release(void *p, size_t bytes) { (void)p; (void)bytes; return 0; }
-n_handle n_channel_connect(const char *name) { snprintf(connected_name, sizeof connected_name, "%s", name); return connect_result; }
-n_handle n_channel_listen(const char *name) {
+n_handle n_service_connect(const char *name) { snprintf(connected_name, sizeof connected_name, "%s", name); return connect_result; }
+n_handle n_service_listen(const char *name) {
     listener_calls++;
-    if (!strcmp(name, NVRM_CHANNEL)) return legacy_busy ? -N_ERR_EXISTS : 30;
     snprintf(listened_name, sizeof listened_name, "%s", name);
     return 10;
 }
-n_handle n_channel_accept(n_handle listener) { (void)listener; return -N_ERR_NOT_READY; }
+n_handle n_inlet_accept(n_handle inlet, int flags) { (void)inlet; (void)flags; return -N_ERR_NOT_READY; }
 n_handle n_events_create(void) { return 20; }
 n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t token) {
     (void)q; (void)interest;
@@ -397,14 +395,12 @@ int main(void) {
     void *refused;
     CHECK(n_shared_map(42, N_PAGE_SIZE, N_MEMORY_READ_WRITE, &refused) == -N_ERR_DENIED && !refused);
 
-    legacy_busy = true;
     CHECK(nvrm_serve(N_PCI_TARGET(2, 1, 0)) == -N_ERR_CANCELLED);
-    CHECK(listener_calls == 2 && watches == 1 && listener_closes == 2);
+    CHECK(listener_calls == 1 && watches == 1);
     CHECK(!strcmp(listened_name, "nocturne.nvidia.rm.0208"));
-    legacy_busy = false;
     listener_calls = watches = listener_closes = 0;
     CHECK(nvrm_serve(N_PCI_TARGET(3, 1, 0)) == -N_ERR_CANCELLED);
-    CHECK(listener_calls == 2 && watches == 2 && listener_closes == 3);
+    CHECK(listener_calls == 1 && watches == 1);
     CHECK(stop_wakes == 2 && threads_started == 0); /* the end is announced to client threads */
     printf("nvrm_transport_hosttest: %d failed (channel/RM fixtures; no GPU execution)\n", failures);
     return failures != 0;

@@ -66,7 +66,7 @@ struct thread_wait {
     bool killable;             /* the wait it is in ends at a kill */
     bool kill_heard;           /* a kill has ended one of its waits */
     /* What it waits for, whose holder may be traced from here (priority inheritance): the mutex,
-       or in an address wait the word, item.key (0 in any other wait; n_procinfo's wait_phys). */
+       or in an address wait the word, item.key (0 in any other wait). */
     struct mutex *mutex;
     /* Priority inheritance (sys/wait.c). pi_lock guards mutex, pi_lend and pi_held, and with its
        queue's lock the thread's sched.boost. pi_held: the mutexes it holds that deadline threads

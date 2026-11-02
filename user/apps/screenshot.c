@@ -31,8 +31,8 @@ int main(int argc, char **argv) {
     if (delay > 0) n_sleep_until(n_clock_after((uint64_t)((uint64_t)delay * 1000) * N_NS_PER_MS));
     int w, h;
     uint32_t *px = NULL;
-    if (screen_grab(NULL, 0, &w, &h) == 0) px = malloc((size_t)w * (size_t)h * 4);
-    if (!px || screen_grab(px, (size_t)w * (size_t)h * 4, &w, &h) < 0) {
+    if (screen_grab(n_cap_find(N_CAP_SCREEN_READ), NULL, 0, &w, &h) == 0) px = malloc((size_t)w * (size_t)h * 4);
+    if (!px || screen_grab(n_cap_find(N_CAP_SCREEN_READ), px, (size_t)w * (size_t)h * 4, &w, &h) < 0) {
         fprintf(stderr, "screenshot: cannot read the screen (is the desktop running?)\n");
         return 1;
     }

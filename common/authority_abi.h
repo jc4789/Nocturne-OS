@@ -22,4 +22,21 @@ enum n_cap {
     N_CAP_STORE_PRIVATE,   /* 名前の木の外の私的な領域を開く。 */
     N_CAP_COUNT
 };
+
+/* 最初の process が根の能力を受ける handle の番号（0・1・2 は入力・出力・ログ）。 */
+#define N_INITIAL_ROOT_HANDLE 3
+
+/* SYS_SERVICE_CONNECT がサービスの管理者の channel へ渡す要求。後ろに名前が name_length バイト続き、
+   添付が依頼者につながる channel の端。カーネルは名前を解かず、覚えない。管理者は同じ形の
+   メッセージをサービスの受け口へ送る。 */
+struct n_service_request {
+    struct n_identity from; /* 依頼者の身元。カーネルが書く。 */
+    uint32_t name_length;
+    uint32_t reserved;
+};
+
+/* サービスの管理者が受ける名前。ここへつないだ channel に、受け付けたい名前をメッセージで送り、
+   受け口へ送る側の channel の端を添付する。管理者は int32_t を一つ返す：0 か -N_ERR_*。
+   名前を誰に許すかは管理者が from で決める。受け口の受ける側が全部閉じると名前は消える。 */
+#define N_SERVICE_BIND "Nocturne.Service.Bind"
 #endif

@@ -818,10 +818,7 @@ static int64_t claim_form(struct pci_claim *c, struct handle **out) {
 
 int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct handle **out) {
     struct process *t = process_current();
-    /* the test build's appdrivers=any lets any app claim (tests drive QEMU's edu device from a
-       program they compile) */
     if (!t) return -N_ERR_DENIED;
-    if (t->pid != init_pid && !test_flag("appdrivers=any")) return -N_ERR_DENIED;
     if (dev > 31 || func > 7) return -N_ERR_INVALID;
     struct pci_device *d = pci_find_function(bus, dev, func);
     if (!d) return -N_ERR_NOT_FOUND;

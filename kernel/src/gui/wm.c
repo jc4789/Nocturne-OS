@@ -47,6 +47,7 @@
 #include "sys/wait.h"
 #include "sys/watch.h"
 #include "abi.h"
+#include "sys/authority.h"
 
 #define TITLE_H   28
 #define TITLE_RADIUS 8 /* the rounded title's corners; shared by the shadow's culling */
@@ -496,6 +497,7 @@ static int last_clock_min = -1;
 static char *clipboard;
 static size_t clipboard_len;
 static uint32_t clipboard_seq; /* bumped on every change, so a remote viewer can follow it */
+static struct n_identity clipboard_owner; /* 最後に置いたアプリの身元：触れてよい者だけが読む */
 
 /* ---- the screens' parts ---- */
 static bool part_on(const struct wscreen *ws) { return ws->on && ws->w > 0 && ws->h > 0; }
@@ -1220,7 +1222,9 @@ static int launch(const char *path, const char *arg) {
         return 0;
     }
     if (pm_stopping()) return -N_ERR_STOPPED;
-    int pid = proc_spawn_simple(path, arg);
+    struct n_identity identity;
+    identity_session(&identity);
+    int pid = proc_spawn_simple(path, arg, &identity);
     if (pid < 0) {
         char msg[128];
         ksnprintf(msg, sizeof msg, "%s (error %d)", path, -pid);
@@ -2787,6 +2791,8 @@ static void clipboard_put(char *nb, size_t n) {
     kfree(clipboard);
     clipboard = nb;
     clipboard_len = n;
+    if (process_current()) clipboard_owner = *identity_current();
+    else identity_session(&clipboard_owner); /* 核の thread が置いた：今のセッションのもの */
     clipboard_seq++;
     wm_unlock();
 }
@@ -3368,7 +3374,9 @@ static int64_t win_acquire(struct handle *handle, uint64_t deadline) {
 /* SYS_SCREEN_GRAB: screen 0's picture, a band of rows at a time through the kernel's memory:
    the picture's lock is held only for each band's copy, never across the copy to the app. */
 #define GRAB_ROWS 64
-static int64_t screen_grab(uint32_t *dst, uint64_t bytes) {
+static int64_t screen_grab(int cap, uint32_t *dst, uint64_t bytes) {
+    int denied = cap_check(cap, N_CAP_SCREEN_READ);
+    if (denied < 0) return denied;
     if (!wm_running()) return -N_ERR_UNSUPPORTED;
     struct wscreen *ws = screen0();
     mutex_lock(&ws->back_lock);
@@ -3517,7 +3525,8 @@ static int64_t sys_gui_launch(uint64_t a, uint64_t b) {
         kfree(path);
         return r;
     }
-    r = proc_spawn_simple(path, arg);
+    /* 呼ぶ側の身元のまま：窓の系を通って権限が上がらない */
+    r = proc_spawn_simple(path, arg, identity_current());
     kfree(path);
     kfree(arg);
     return r;
@@ -3575,6 +3584,10 @@ static int64_t sys_clipboard_set(uint64_t a, uint64_t b) {
 
 /* Up to b bytes of the clipboard: its whole length. */
 static int64_t sys_clipboard_get(uint64_t a, uint64_t b) {
+    wm_lock();
+    struct n_identity owner = clipboard_owner;
+    wm_unlock();
+    if (clipboard && !identity_may_reach(identity_current(), &owner)) return -N_ERR_DENIED;
     size_t len;
     char *text = wm_clipboard_snapshot(&len);
     if (!text) return -N_ERR_NO_MEMORY;
@@ -3597,7 +3610,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
     }
     if (num == SYS_CLIPBOARD_SET) return sys_clipboard_set(a, b);
     if (num == SYS_CLIPBOARD_GET) return sys_clipboard_get(a, b);
-    if (num == SYS_SCREEN_GRAB) return screen_grab((uint32_t *)a, b);
+    if (num == SYS_SCREEN_GRAB) return screen_grab((int)a, (uint32_t *)b, c);
     if (num == SYS_WIN_CREATE) {
         char title[sizeof ((struct window *)0)->title];
         if (!c) strlcpy(title, thread_current()->name, sizeof title);

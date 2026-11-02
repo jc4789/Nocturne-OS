@@ -9,6 +9,7 @@
 #define SH      N_FOLDER_SYSTEM "\\sh"
 #define NVRM    N_FOLDER_SYSTEM "\\nvrm"
 #define AUTORUN "C:\\Tests\\autorun.sh"
+#define ROOT    N_INITIAL_ROOT_HANDLE /* 根の能力。子へは渡さず、要るものを切り出す。 */
 
 /* Launch path with up to two arguments and the given input, output and log, in
    this app's folder. Settings beyond FOLDER (such as TERMINAL) are passed in extra. */
@@ -97,10 +98,22 @@ static void autorun(void) {
     struct n_entry e;
     if (n_entry_info(AUTORUN, &e) < 0) return;
     n_handle log = n_system_log_open();
-    n_handle app = start(SH, "sh", AUTORUN, -1, log, NULL);
+    /* 試験の媒体だけ：試験が使う能力を渡す。sh はそれを子へ渡す。 */
+    int32_t handles[] = {-1, log, log, n_cap_derive(ROOT, N_CAP_PCI_CLAIM), n_cap_derive(ROOT, N_CAP_SCREEN_READ),
+                         n_cap_derive(ROOT, N_CAP_POWER)};
+    const char *f = getenv("FOLDER");
+    char folder[4104];
+    snprintf(folder, sizeof folder, "FOLDER=%s", f && n_path_is_complete(f) ? f : n_user_folder());
+    const char *settings[] = {folder};
+    const char *args[] = {"sh", AUTORUN};
+    struct n_launch l = {.arguments = args, .settings = settings, .handles = handles, .argument_count = 2,
+                         .setting_count = 1, .handle_count = sizeof handles / sizeof *handles};
+    n_handle app = n_app_launch(SH, &l);
     if (log >= 0) n_handle_close(log);
+    for (size_t i = 3; i < sizeof handles / sizeof *handles; i++)
+        if (handles[i] >= 0) n_handle_close(handles[i]);
     if (app >= 0) n_app_result(app, N_CLOCK_NEVER, NULL);
-    poweroff();
+    poweroff(n_cap_derive(ROOT, N_CAP_POWER));
 }
 
 /* Drivers in apps (docs/nocturne-native-abi.md §9): an NVIDIA display function goes to nvrm,
@@ -129,11 +142,12 @@ static void start_drivers(void) {
         if (capacity > INT_MAX / 2) { free(list); return; }
         capacity *= 2;
     }
+    n_handle claim_cap = n_cap_derive(ROOT, N_CAP_PCI_CLAIM);
     for (int i = 0; i < n; i++) {
         if (!nvrm_pci_is_gpu(list[i].vendor, list[i].cls, list[i].subcls, list[i].progif)) continue;
         char where[16];
         snprintf(where, sizeof where, "%02x:%02x.%u", list[i].bus, list[i].dev, list[i].func);
-        n_handle pci = n_pci_claim(list[i].bus, list[i].dev, list[i].func);
+        n_handle pci = n_pci_claim(claim_cap, list[i].bus, list[i].dev, list[i].func);
         if (pci < 0) {
             printf("init: cannot claim %s for nvrm (%s)\n", where, n_result_text(pci));
             continue;
@@ -148,6 +162,7 @@ static void start_drivers(void) {
         if (log >= 0) n_handle_close(log);
         n_handle_close(pci);
     }
+    if (claim_cap >= 0) n_handle_close(claim_cap);
     free(list);
     fflush(stdout);
 }
