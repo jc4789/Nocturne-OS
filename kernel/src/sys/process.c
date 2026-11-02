@@ -196,6 +196,22 @@ int process_stop_all(void) {
     return alive;
 }
 
+/* thread_walk: stop_one for the apps of one session. */
+struct session_stop {
+    uint32_t session;
+    int alive;
+};
+static void stop_session_one(struct thread *t, void *arg) {
+    struct session_stop *s = arg;
+    if (t->process && t->process->identity.session == s->session) stop_one(t, &s->alive);
+}
+
+int process_stop_session(uint32_t session) {
+    struct session_stop s = {session, 0};
+    thread_walk(stop_session_one, &s);
+    return s.alive;
+}
+
 /* thread_lock held: t, unless it is self or done already, ends with code. */
 static void kill_with(struct thread *t, struct thread *self, int code) {
     if (t == self || t->sched.state == THREAD_ZOMBIE || t->killed) return;

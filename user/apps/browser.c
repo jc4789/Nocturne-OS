@@ -3669,10 +3669,12 @@ static void report_loop_profile(uint64_t now) {
     {
         /* Private pages of this process, against what malloc holds and uses:
            the difference between process and heap is mapped memory. */
-        static struct n_procinfo processes[256];
+        struct n_procinfo *processes = NULL;
         size_t heap = 0, used = 0; unsigned long process_kb = 0;
-        int count = proclist(processes, 256), self = (int)n_app_self();
-        for (int i = 0; i < count; i++) if (processes[i].pid == self) process_kb = processes[i].mem_kb;
+        n_result count = n_processes(&processes);
+        int self = (int)n_app_self();
+        for (n_result i = 0; i < count; i++) if (processes[i].pid == self) process_kb = processes[i].mem_kb;
+        if (count >= 0) free(processes);
         malloc_usage(&heap, &used);
         snprintf(message, sizeof message, "Browser memory: process %lu KiB, malloc heap %lu KiB, in use %lu KiB",
                  process_kb, (unsigned long)(heap / 1024), (unsigned long)(used / 1024));

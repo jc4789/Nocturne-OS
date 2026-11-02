@@ -5,44 +5,106 @@
 #include <string.h>
 #include "nocturne.h"
 #include "ui.h"
+#include "authority_abi.h"
 
 #define GW 295 /* a graph, inside a card of padding 14 */
 #define GH 84
 #define W (2 * (GW + 28) + 10 + 24)
 #define H 700
 #define HIST 120
-#define MAXPROC 128
 #define WINDOW 1
 #define S_CPU 1
 #define S_MEM 2
 
-static struct n_procinfo procs[MAXPROC], prev[MAXPROC];
+/* 窓の一行：アプリ一つか、カーネルの thread 一つ。アプリの thread の分は足して見せる。 */
+enum group { G_SESSION, G_OTHER_SESSION, G_SERVICE, G_KERNEL, G_COUNT };
+struct row {
+    const struct n_procinfo *p;
+    enum group group;
+    float cpu;
+    uint32_t node; /* the place in the view that events name */
+};
+static struct n_procinfo *procs, *prev; /* pid の順 */
 static int nproc, nprev, sel_pid = -1;
-static float cpu_hist[HIST], mem_hist[HIST], proc_cpu[MAXPROC];
+static struct row *rows;
+static int nrows;
+static uint32_t own_session;
+static float cpu_hist[HIST], mem_hist[HIST];
 static uint64_t last_t;
 static char status[96];
-static uint32_t row_node[MAXPROC], kill_node; /* places in the view that events name */
+static uint32_t kill_node;
+
+static int pid_order(const void *a, const void *b) {
+    int x = ((const struct n_procinfo *)a)->pid, y = ((const struct n_procinfo *)b)->pid;
+    return (x > y) - (x < y);
+}
+
+static const struct n_procinfo *find_pid(const struct n_procinfo *list, int count, int pid) {
+    struct n_procinfo key = {.pid = pid};
+    return bsearch(&key, list, (size_t)count, sizeof *list, pid_order);
+}
 
 static uint64_t prev_cpu(int pid) {
-    for (int i = 0; i < nprev; i++)
-        if (prev[i].pid == pid) return prev[i].cpu_ns;
-    return 0;
+    const struct n_procinfo *p = prev ? find_pid(prev, nprev, pid) : NULL;
+    return p ? p->cpu_ns : 0;
+}
+
+static enum group group_of(const struct n_procinfo *p) {
+    if (!p->is_user) return G_KERNEL;
+    if (!p->session) return G_SERVICE;
+    return p->session == own_session ? G_SESSION : G_OTHER_SESSION;
+}
+
+static int row_order(const void *a, const void *b) {
+    const struct row *x = a, *y = b;
+    if (x->group != y->group) return x->group < y->group ? -1 : 1;
+    int names = strcasecmp(x->p->name, y->p->name);
+    return names ? names : (x->p->pid > y->p->pid) - (x->p->pid < y->p->pid);
+}
+
+static struct row *row_of(int pid, int count) {
+    int low = 0, high = count;
+    while (low < high) {
+        int middle = low + (high - low) / 2;
+        if (rows[middle].p->pid < pid) low = middle + 1;
+        else high = middle;
+    }
+    return low < count && rows[low].p->pid == pid ? &rows[low] : NULL;
 }
 
 static void sample(void) {
-    memcpy(prev, procs, sizeof procs);
+    struct n_procinfo *now_list;
+    n_result listed = n_processes(&now_list);
+    if (listed < 0) return;
+    qsort(now_list, (size_t)listed, sizeof *now_list, pid_order);
+    struct row *new_rows = malloc(((size_t)listed + 1) * sizeof *new_rows);
+    if (!new_rows) {
+        free(now_list);
+        return;
+    }
+    free(prev);
+    prev = procs;
     nprev = nproc;
-    nproc = proclist(procs, MAXPROC);
+    procs = now_list;
+    nproc = (int)listed;
+    free(rows);
+    rows = new_rows;
+    nrows = 0;
+    for (int i = 0; i < nproc; i++)
+        if (!procs[i].app || procs[i].pid == procs[i].app)
+            rows[nrows++] = (struct row){.p = &procs[i], .group = group_of(&procs[i])};
     uint64_t now = n_clock_monotonic(), dt = now - last_t;
     if (!last_t || !dt) dt = N_NS_PER_S;
     last_t = now;
     uint64_t busy = 0;
     for (int i = 0; i < nproc; i++) {
-        uint64_t d = procs[i].cpu_ns - prev_cpu(procs[i].pid);
-        if (procs[i].cpu_ns < prev_cpu(procs[i].pid)) d = 0;
-        proc_cpu[i] = 100.0f * (float)d / (float)dt;
+        uint64_t before = prev_cpu(procs[i].pid);
+        uint64_t d = procs[i].cpu_ns < before ? 0 : procs[i].cpu_ns - before;
+        struct row *r = row_of(procs[i].app ? procs[i].app : procs[i].pid, nrows);
+        if (r) r->cpu += 100.0f * (float)d / (float)dt;
         if (procs[i].pid != 0) busy += d;
     }
+    qsort(rows, (size_t)nrows, sizeof *rows, row_order);
     struct n_cpuinfo ci;
     unsigned task_cpus = cpu_info(&ci) == 0 && ci.scheduler_cpus ? ci.scheduler_cpus : 1;
     /* task cpu_nsにはAP runnerの時間も含む。1CPU当たりのprocess %は維持し、
@@ -105,6 +167,15 @@ static void cell(struct ui_msg *m, const char *text, int width, bool caption, bo
 
 static const int colw[] = {56, 200, 96, 64, 112, 0};
 
+static const char *group_name(enum group g) {
+    static const char *const names[G_COUNT] = {"このセッション", "ほかのセッション", "サービス", "カーネル"};
+    return names[g];
+}
+static const char *class_name(const struct n_procinfo *p) {
+    if (!p->is_user) return "kernel";
+    return p->cls >= N_CLASS_SYSTEM ? "system" : p->cls >= N_CLASS_ADMIN ? "admin" : "user";
+}
+
 /* A card with a heading and the current value on top of a graph and a meter. */
 static void meter(struct ui_msg *m, const char *name, float percent, uint32_t surface, const char *info) {
     char value[16];
@@ -135,8 +206,8 @@ static void show(struct ui_session *s) {
                  ci.detected_cpus, ci.scheduler_cpus, ci.worker_cpus, (unsigned long)ci.parallel_jobs);
     unsigned long up = si.uptime_ns / N_NS_PER_S;
     snprintf(up_text, sizeof up_text, "up %lu:%02lu:%02lu", up / 3600, up / 60 % 60, up % 60);
-    char tasks[24];
-    snprintf(tasks, sizeof tasks, "%d tasks", nproc);
+    char tasks[48];
+    snprintf(tasks, sizeof tasks, "%d 個、thread %d", nrows, nproc);
 
     struct ui_msg m;
     ui_view(&m, WINDOW);
@@ -158,11 +229,17 @@ static void show(struct ui_session *s) {
             ui_end(&m);
             ui_node(&m, "divider"); ui_end(&m);
             ui_node(&m, "scroll"); ui_num(&m, "grow", 1); ui_num(&m, "gap", 2); ui_num(&m, "key", 1);
-                for (int i = 0; i < nproc; i++) {
-                    const struct n_procinfo *p = &procs[i];
+                for (int i = 0; i < nrows; i++) {
+                    if (!i || rows[i - 1].group != rows[i].group) {
+                        int in_group = 0;
+                        while (i + in_group < nrows && rows[i + in_group].group == rows[i].group) in_group++;
+                        snprintf(b, sizeof b, "%s (%d)", group_name(rows[i].group), in_group);
+                        ui_node(&m, "text"); ui_str(&m, "text", b); ui_str(&m, "style", "heading"); ui_num(&m, "key", -1 - (int)rows[i].group); ui_end(&m);
+                    }
+                    const struct n_procinfo *p = rows[i].p;
                     bool picked = p->pid == sel_pid;
                     uint32_t fg = p->is_user ? t->text : t->textDim;
-                    row_node[i] = ui_node(&m, "row");
+                    rows[i].node = ui_node(&m, "row");
                     ui_num(&m, "key", p->pid); ui_num(&m, "clickable", 1); ui_num(&m, "radius", 6); ui_num(&m, "gap", 0);
                     ui_nums(&m, "padding", (const double[]){5, 10}, 2);
                     if (picked) { ui_num(&m, "background", t->surfaceActive); ui_num(&m, "border", t->accent); }
@@ -170,12 +247,12 @@ static void show(struct ui_session *s) {
                     cell(&m, b, colw[0], false, true, fg);
                     cell(&m, p->name, colw[1], false, true, fg);
                     cell(&m, state_name(p->state), colw[2], false, true, t->textDim);
-                    snprintf(b, sizeof b, "%.0f%%", proc_cpu[i]);
-                    cell(&m, b, colw[3], false, true, proc_cpu[i] > 20 ? t->warning : fg);
+                    snprintf(b, sizeof b, "%.0f%%", rows[i].cpu);
+                    cell(&m, b, colw[3], false, true, rows[i].cpu > 20 ? t->warning : fg);
                     if (p->is_user) snprintf(b, sizeof b, "%lu KiB", (unsigned long)p->mem_kb);
                     else b[0] = 0;
                     cell(&m, b, colw[4], false, true, fg);
-                    cell(&m, p->is_user ? "user" : "kernel", colw[5], false, true, t->textDim);
+                    cell(&m, class_name(p), colw[5], false, true, t->textDim);
                     ui_end(&m);
                 }
             ui_end(&m);
@@ -193,12 +270,12 @@ static void show(struct ui_session *s) {
 static void end_selected(void) {
     int pid = sel_pid;
     n_result res = -N_ERR_NO_APP;
-    for (int i = 0; i < nproc; i++)
-        if (procs[i].pid == pid && procs[i].is_user) {
-            n_handle app = n_app_open(pid);
-            res = app < 0 ? app : n_app_stop(app, N_APP_STOP_TREE);
-            if (app >= 0) n_handle_close(app);
-        }
+    const struct n_procinfo *p = find_pid(procs, nproc, pid);
+    if (p && p->is_user) {
+        n_handle app = n_app_open(pid);
+        res = app < 0 ? app : n_app_stop(app, N_APP_STOP_TREE);
+        if (app >= 0) n_handle_close(app);
+    }
     if (res >= 0) snprintf(status, sizeof status, "ended process %d", pid);
     else snprintf(status, sizeof status, "cannot end process %d", pid);
     sel_pid = -1;
@@ -210,6 +287,8 @@ int main(void) {
     if (!s || ui_window(s, WINDOW, W, H, 0, "System Monitor", NULL, NULL) < 0) return 1;
     canvas_t *cpu_c = ui_surface(s, S_CPU, GW, GH, 0), *mem_c = ui_surface(s, S_MEM, GW, GH, 0);
     if (!cpu_c || !mem_c) return 1;
+    struct n_identity self;
+    if (n_identity_self(&self) >= 0) own_session = self.session;
     sample();
     snprintf(status, sizeof status, "Select a process to end it");
     uint64_t next = (n_clock_monotonic() / N_NS_PER_MS) + 1000;
@@ -235,9 +314,9 @@ int main(void) {
                     resample = changed = true;
                     break;
                 }
-                for (int i = 0; i < nproc; i++)
-                    if (e.node == row_node[i]) {
-                        sel_pid = procs[i].pid;
+                for (int i = 0; i < nrows; i++)
+                    if (e.node == rows[i].node) {
+                        sel_pid = rows[i].p->pid;
                         changed = true;
                         break;
                     }

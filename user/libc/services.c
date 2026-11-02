@@ -104,6 +104,193 @@ n_result n_session_end(void) {
     return r < 0 ? r : reply.result;
 }
 
+n_result n_session_stop(n_handle cap, uint32_t session) {
+    return (n_result)__syscall(SYS_SESSION_STOP, cap, session, 0, 0, 0);
+}
+
+/* ---- プログラムの台帳 ---- */
+/* 一通の要求を送り、応答を一通受ける。*body は free する。 */
+static n_result programs_call(const struct n_programs_request *head, const char *type, const char *name, const char *path,
+                              const char *argument, struct n_programs_reply *reply, char **body, size_t *body_bytes) {
+    struct n_programs_request q = *head;
+    q.type_bytes = (uint32_t)strlen(type) + 1;
+    q.name_bytes = (uint32_t)strlen(name) + 1;
+    q.path_bytes = (uint32_t)strlen(path) + 1;
+    q.argument_bytes = (uint32_t)strlen(argument) + 1;
+    size_t bytes = sizeof q + q.type_bytes + q.name_bytes + q.path_bytes + q.argument_bytes;
+    char *message = malloc(bytes);
+    if (!message) return -N_ERR_NO_MEMORY;
+    char *at = message;
+    memcpy(at, &q, sizeof q);
+    at += sizeof q;
+    memcpy(at, type, q.type_bytes);
+    at += q.type_bytes;
+    memcpy(at, name, q.name_bytes);
+    at += q.name_bytes;
+    memcpy(at, path, q.path_bytes);
+    at += q.path_bytes;
+    memcpy(at, argument, q.argument_bytes);
+    n_handle channel = n_service_connect("programs");
+    n_result r = channel;
+    if (channel >= 0) r = n_channel_send(channel, message, bytes, -1);
+    free(message);
+    if (r >= 0) r = n_channel_receive(channel, NULL, 0, N_CHANNEL_WAIT | N_CHANNEL_PEEK, NULL);
+    char *whole = NULL;
+    if (r >= (n_result)sizeof *reply) {
+        size_t size = (size_t)r;
+        whole = malloc(size);
+        r = whole ? n_channel_receive(channel, whole, size, N_CHANNEL_WAIT, NULL) : -N_ERR_NO_MEMORY;
+    } else if (r >= 0) {
+        r = -N_ERR_PROTOCOL;
+    }
+    if (channel >= 0) n_handle_close(channel);
+    if (r < 0) {
+        free(whole);
+        return r;
+    }
+    memcpy(reply, whole, sizeof *reply);
+    if (reply->result < 0) {
+        free(whole);
+        return reply->result;
+    }
+    *body_bytes = (size_t)r - sizeof *reply;
+    memmove(whole, whole + sizeof *reply, *body_bytes);
+    *body = whole;
+    return 0;
+}
+
+/* count 個の n_program の配列の後ろに記録を置き、文字列はそこを指す。 */
+static n_result programs_unpack(const char *body, size_t bytes, uint32_t count, struct n_program **out) {
+    if (count > bytes / sizeof(struct n_program_head)) return -N_ERR_PROTOCOL;
+    struct n_program *list = malloc(count * sizeof *list + bytes + 1);
+    if (!list) return -N_ERR_NO_MEMORY;
+    char *text = (char *)(list + count);
+    memcpy(text, body, bytes);
+    size_t at = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        struct n_program_head h;
+        if (bytes - at < sizeof h) goto bad;
+        memcpy(&h, text + at, sizeof h);
+        at += sizeof h;
+        size_t size = (size_t)h.name_bytes + h.path_bytes + h.argument_bytes;
+        if (bytes - at < size || !h.name_bytes || !h.path_bytes || !h.argument_bytes) goto bad;
+        list[i] = (struct n_program){h.id, h.icon, h.flags, text + at, text + at + h.name_bytes, text + at + h.name_bytes + h.path_bytes};
+        at += size;
+    }
+    *out = list;
+    return count;
+bad:
+    free(list);
+    return -N_ERR_PROTOCOL;
+}
+
+n_result n_programs_list(struct n_program **out) {
+    struct n_programs_request q = {.op = N_PROGRAMS_LIST};
+    struct n_programs_reply reply;
+    char *body;
+    size_t bytes;
+    n_result r = programs_call(&q, "", "", "", "", &reply, &body, &bytes);
+    if (r < 0) return r;
+    r = programs_unpack(body, bytes, reply.count, out);
+    free(body);
+    return r;
+}
+
+n_result n_programs_claims(struct n_program_claim **out) {
+    struct n_programs_request q = {.op = N_PROGRAMS_CLAIMS};
+    struct n_programs_reply reply;
+    char *body;
+    size_t bytes;
+    n_result r = programs_call(&q, "", "", "", "", &reply, &body, &bytes);
+    if (r < 0) return r;
+    struct n_program_claim *list = reply.count <= bytes / sizeof(struct n_program_claim_head)
+                                       ? malloc(reply.count * sizeof *list + bytes + 1) : NULL;
+    if (!list) {
+        free(body);
+        return -N_ERR_NO_MEMORY;
+    }
+    char *text = (char *)(list + reply.count);
+    memcpy(text, body, bytes);
+    free(body);
+    size_t at = 0;
+    for (uint32_t i = 0; i < reply.count; i++) {
+        struct n_program_claim_head h;
+        if (bytes - at < sizeof h) goto bad;
+        memcpy(&h, text + at, sizeof h);
+        at += sizeof h;
+        if (bytes - at < h.type_bytes || !h.type_bytes) goto bad;
+        list[i] = (struct n_program_claim){h.id, h.current, text + at};
+        at += h.type_bytes;
+    }
+    *out = list;
+    return reply.count;
+bad:
+    free(list);
+    return -N_ERR_PROTOCOL;
+}
+
+n_result n_program_run(const struct n_program *p, const char *document) {
+    const char *arguments[2] = {p->path, document ? document : p->argument};
+    struct n_launch launch = {.arguments = arguments, .argument_count = arguments[1][0] ? 2 : 1};
+    n_handle app = n_app_launch(p->path, &launch);
+    if (app < 0) return app;
+    n_result id = n_app_id(app);
+    n_handle_close(app);
+    return id;
+}
+
+n_result n_program_open_document(const char *path) {
+    const char *end = strrchr(path, '\\'), *dot = strrchr(end ? end : path, '.');
+    char *type = dot && dot[1] ? strdup(dot + 1) : strdup(N_PROGRAM_ANY_TYPE);
+    if (!type) return -N_ERR_NO_MEMORY;
+    for (char *c = type; *c; c++)
+        if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');
+    struct n_programs_request q = {.op = N_PROGRAMS_FOR_TYPE};
+    struct n_programs_reply reply;
+    char *body;
+    size_t bytes;
+    n_result r = programs_call(&q, type, "", "", "", &reply, &body, &bytes);
+    free(type);
+    if (r < 0) return r;
+    struct n_program *one;
+    r = programs_unpack(body, bytes, reply.count, &one);
+    free(body);
+    if (r < 0) return r;
+    r = reply.count ? n_program_run(one, path) : -N_ERR_NOT_FOUND;
+    free(one);
+    return r;
+}
+
+n_result n_program_register(const char *name, const char *path, const char *argument, uint32_t icon, uint32_t flags) {
+    struct n_programs_request q = {.op = N_PROGRAMS_REGISTER, .icon = icon, .flags = flags};
+    struct n_programs_reply reply;
+    char *body;
+    size_t bytes;
+    n_result r = programs_call(&q, "", name, path, argument ? argument : "", &reply, &body, &bytes);
+    if (r < 0) return r;
+    struct n_program_head h;
+    r = bytes >= sizeof h ? 0 : -N_ERR_PROTOCOL;
+    if (r >= 0) {
+        memcpy(&h, body, sizeof h);
+        r = (n_result)h.id;
+    }
+    free(body);
+    return r;
+}
+
+static n_result programs_simple(uint32_t op, uint32_t id, const char *type) {
+    struct n_programs_request q = {.op = op, .id = id};
+    struct n_programs_reply reply;
+    char *body;
+    size_t bytes;
+    n_result r = programs_call(&q, type, "", "", "", &reply, &body, &bytes);
+    if (r >= 0) free(body);
+    return r;
+}
+n_result n_program_claim(uint32_t id, const char *type) { return programs_simple(N_PROGRAMS_CLAIM, id, type); }
+n_result n_program_choose(uint32_t id, const char *type) { return programs_simple(N_PROGRAMS_CHOOSE, id, type); }
+n_result n_program_remove(uint32_t id) { return programs_simple(N_PROGRAMS_REMOVE, id, ""); }
+
 n_result n_machine_screen(uint32_t **pixels, int *width, int *height) {
     n_handle channel = n_service_connect("machine");
     if (channel < 0) return channel;

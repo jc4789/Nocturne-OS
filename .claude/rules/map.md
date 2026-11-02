@@ -57,6 +57,7 @@
 | `include/` | 公開の header（`nocturne.h`、`web.h`、`weburl.h`、`ui.h` など）。SDK にも入る。 |
 | `apps/shell.c`・`shell_art.h` | シェル：タスクバー、開始メニュー、音量、通知、デスクトップの絵と印。`session` が利用者の身元で起こす普通のプロセス。口は `display_abi.h`、仕様は ABI の §16。 |
 | `apps/` | システムのプログラム。サービスの管理者 `services.c`（宣言の表 `declared[]`）とサービス（`accounts.c`、`session.c`、`systemlog.c`、`machine.c`）、ブラウザー（`browser*.c`）、`sh.c`、`uihost.c`、`webfetch.c`、`agent.c`、小さな道具とゲーム、TypeScript のアプリ（`*.ts`）。 |
+| `apps/programs.c` | サービス `programs`：起こせるプログラムの台帳と、文書の種類ごとの既定。開始メニュー、印、ファイルの窓の「開く」、設定の窓の「アプリ」の頁が読む。 |
 | `apps/settingsd.c`・`settings_table.h` | サービス `settings`：選択の保存、宣言の表、型と範囲と権限の確かめ、見張り、期限つきの試し。領域の意味を持たない。 |
 | `apps/settings.c` | 設定の窓。宣言の表から頁を組む。音、画面、窓、入力、電源、網、時刻、サービス、利用者。 |
 | `libc/settings.c`・`include/nocturne_settings.h` | 設定の口 `n_setting_*`。プログラムの設定は `N_SCOPE_PROGRAM` の鍵（`libc/webprefs.c`、`apps/agent.c`）。 |

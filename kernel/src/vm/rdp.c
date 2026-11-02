@@ -1045,13 +1045,16 @@ static int clip_data_request(struct rdp *c, uint32_t format) {
     return r;
 }
 
+/* 長さは遠隔の相手が言う値で、確かめないまま核で確保する：この道だけ上限を置く。 */
+#define RDP_CLIPBOARD_MAX (1u << 20)
+
 /* the client's text arrived (the answer to the request clip_message sent) */
 static void clip_data(struct rdp *c, const uint8_t *p, uint32_t n, uint32_t format) {
     char *t = NULL;
     size_t len = 0;
     if (format == CF_UNICODETEXT) {
         len = from_utf16(p, n, NULL);
-        if (len > WM_CLIPBOARD_MAX || !(t = kmalloc(len + 1))) return;
+        if (len > RDP_CLIPBOARD_MAX || !(t = kmalloc(len + 1))) return;
         from_utf16(p, n, t);
     } else {
         if (!(t = kmalloc(n + 1))) return;
@@ -1563,7 +1566,7 @@ static int vc_data(struct rdp *c, uint16_t channel, struct rbuf *r) {
     if (flags & CHANNEL_FLAG_FIRST) {
         kfree(c->vc[k].buf);
         c->vc[k].buf = NULL;
-        if (total > 4 * WM_CLIPBOARD_MAX + 64) return 0;
+        if (total > 4 * RDP_CLIPBOARD_MAX + 64) return 0;
         c->vc[k].buf = kmalloc(MAX(total, 1u));
         c->vc[k].total = total;
         c->vc[k].len = 0;

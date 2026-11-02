@@ -99,6 +99,50 @@ enum n_session_op {
 struct n_session_request { uint32_t op; };
 struct n_session_reply { int64_t result; };
 
+/* ---- プログラムの台帳（"programs"） ----
+   文の長さは決めない。要求は一通で、頭に種類、名前、パス、引数の文字列（nul 終わり、バイト数は nul を含む）が続く。
+   応答は一通で、頭に count 個の記録が続く。 */
+enum n_icon {
+    N_ICON_TERMINAL, N_ICON_FILES, N_ICON_PAINT, N_ICON_CLOCK, N_ICON_SNAKE, N_ICON_FRACTAL, N_ICON_CUBE,
+    N_ICON_LIFE, N_ICON_MONITOR, N_ICON_EDITOR, N_ICON_ABOUT, N_ICON_CALC, N_ICON_POWER, N_ICON_REBOOT,
+    N_ICON_TETRIS, N_ICON_MINES, N_ICON_NET, N_ICON_PIANO, N_ICON_SOUND, N_ICON_SETTINGS, N_ICON_SLEEP,
+    N_ICON_HIBERNATE, N_ICON_LOGOUT, N_ICON_GENERIC, N_ICON_COUNT
+};
+enum n_programs_op {
+    N_PROGRAMS_LIST = 1, /* 全部のプログラム。記録は n_program_head。 */
+    N_PROGRAMS_CLAIMS,   /* 全部の種類の組。記録は n_program_claim_head。 */
+    N_PROGRAMS_FOR_TYPE, /* 相手の利用者が種類を開くプログラム。記録は一つ。 */
+    N_PROGRAMS_CHOOSE,   /* 相手の利用者の既定を id にする。 */
+    N_PROGRAMS_REGISTER, /* C:\Programs の中のプログラムを足す。N_CLASS_ADMIN 以上。記録は足したもの。 */
+    N_PROGRAMS_CLAIM,    /* id が種類を開けると言う。N_CLASS_ADMIN 以上。 */
+    N_PROGRAMS_REMOVE,   /* 登録のプログラムを消す。N_CLASS_ADMIN 以上。 */
+};
+#define N_PROGRAM_MENU 1u    /* 開始メニューに出す */
+#define N_PROGRAM_DESKTOP 2u /* デスクトップに印を出す */
+#define N_PROGRAM_SYSTEM 4u  /* システムのプログラム。消せない。 */
+#define N_PROGRAM_ANY_TYPE "*" /* どの種類も開けるという種類。文書の種類は小文字の拡張子で点なし。 */
+struct n_programs_request {
+    uint32_t op;   /* enum n_programs_op */
+    uint32_t id;
+    uint32_t icon; /* enum n_icon */
+    uint32_t flags;
+    uint32_t type_bytes, name_bytes, path_bytes, argument_bytes;
+};
+struct n_programs_reply {
+    int64_t result;
+    uint32_t count;
+    uint32_t reserved;
+};
+/* 続けて名前、パス、引数。引数は無ければ空で、起こすときの最初の引数になる。 */
+struct n_program_head {
+    uint32_t id, icon, flags;
+    uint32_t name_bytes, path_bytes, argument_bytes;
+};
+/* 続けて種類。current はその種類を相手の利用者が今開くプログラム。 */
+struct n_program_claim_head {
+    uint32_t id, current, type_bytes;
+};
+
 /* ---- 機械（"machine"）：電源と画面の読取り。能力はこのサービスだけが持つ。 ---- */
 enum n_machine_op {
     N_MACHINE_POWER_OFF = 1,

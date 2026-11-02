@@ -127,6 +127,7 @@ enum n_private_region {
     N_REGION_SETTINGS = 1,  /* 設定のサービスの保存 */
     N_REGION_USERS,         /* 利用者とセッションのサービスの台帳 */
     N_REGION_SECRETS,       /* 利用者の秘密 */
+    N_REGION_PROGRAMS,      /* プログラムの台帳のサービスの表 */
     N_REGION_FIRST_FREE = 16
 };
 

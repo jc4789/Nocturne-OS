@@ -200,10 +200,6 @@ static void art_wallpaper(canvas_t *c, uint8_t *deep) {
 }
 
 /* ---- icons (32x32) ---- */
-enum { ICON_TERMINAL, ICON_FILES, ICON_PAINT, ICON_CLOCK, ICON_SNAKE, ICON_FRACTAL, ICON_CUBE,
-       ICON_LIFE, ICON_MONITOR, ICON_EDITOR, ICON_ABOUT, ICON_CALC, ICON_POWER, ICON_REBOOT,
-       ICON_TETRIS, ICON_MINES, ICON_NET, ICON_PIANO, ICON_SOUND, ICON_SETTINGS, ICON_SLEEP, ICON_HIBERNATE, ICON_LOGOUT, ICON_GENERIC,
-       ICON_COUNT };
 
 static void label(canvas_t *c, int x, int y, const char *s, uint32_t col) {
     gfx_text(c, x, y, s, col, TRANSPARENT, FONT_SMALL);
@@ -211,18 +207,18 @@ static void label(canvas_t *c, int x, int y, const char *s, uint32_t col) {
 
 static void art_icon(canvas_t *c, int x, int y, int icon) {
     switch (icon) {
-    case ICON_TERMINAL:
+    case N_ICON_TERMINAL:
         gfx_fill_round(c, x + 1, y + 3, 30, 26, 4, RGB(150, 160, 200));
         gfx_fill_round(c, x + 2, y + 4, 28, 24, 3, RGB(18, 18, 32));
         gfx_fill(c, x + 2, y + 4, 28, 4, RGB(70, 70, 110));
         label(c, x + 5, y + 10, ">_", RGB(120, 240, 150));
         break;
-    case ICON_FILES:
+    case N_ICON_FILES:
         gfx_fill_round(c, x + 2, y + 6, 12, 6, 2, RGB(230, 170, 60));
         gfx_fill_round(c, x + 2, y + 9, 28, 20, 3, RGB(245, 195, 80));
         gfx_hline(c, x + 3, y + 12, 26, RGB(255, 225, 140));
         break;
-    case ICON_PAINT:
+    case N_ICON_PAINT:
         gfx_fill_circle(c, x + 16, y + 16, 13, RGB(235, 215, 180));
         gfx_fill_circle(c, x + 21, y + 21, 4, RGB(20, 20, 40));
         gfx_fill_circle(c, x + 10, y + 11, 3, RGB(230, 60, 80));
@@ -230,21 +226,21 @@ static void art_icon(canvas_t *c, int x, int y, int icon) {
         gfx_fill_circle(c, x + 24, y + 12, 3, RGB(80, 200, 110));
         gfx_fill_circle(c, x + 9, y + 20, 3, RGB(250, 210, 60));
         break;
-    case ICON_CLOCK:
+    case N_ICON_CLOCK:
         gfx_fill_circle(c, x + 16, y + 16, 14, RGB(110, 120, 190));
         gfx_fill_circle(c, x + 16, y + 16, 12, RGB(245, 245, 255));
         gfx_line(c, x + 16, y + 16, x + 16, y + 7, RGB(30, 30, 50));
         gfx_line(c, x + 16, y + 16, x + 22, y + 19, RGB(30, 30, 50));
         gfx_fill_circle(c, x + 16, y + 16, 1, RGB(220, 60, 80));
         break;
-    case ICON_SNAKE:
+    case N_ICON_SNAKE:
         gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(24, 40, 30));
         for (int i = 0; i < 4; i++) gfx_fill(c, x + 4 + i * 6, y + 20, 5, 5, RGB(90, 220, 110));
         gfx_fill(c, x + 22, y + 14, 5, 5, RGB(90, 220, 110));
         gfx_fill(c, x + 22, y + 8, 5, 5, RGB(140, 255, 150));
         gfx_fill(c, x + 8, y + 7, 5, 5, RGB(240, 70, 80));
         break;
-    case ICON_FRACTAL:
+    case N_ICON_FRACTAL:
         gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(10, 8, 40));
         gfx_fill_circle(c, x + 18, y + 16, 8, RGB(30, 20, 90));
         gfx_fill_circle(c, x + 18, y + 16, 6, RGB(10, 5, 20));
@@ -252,7 +248,7 @@ static void art_icon(canvas_t *c, int x, int y, int icon) {
         gfx_circle(c, x + 18, y + 16, 9, RGB(240, 160, 60));
         gfx_circle(c, x + 9, y + 16, 5, RGB(240, 100, 160));
         break;
-    case ICON_CUBE: {
+    case N_ICON_CUBE: {
         uint32_t col = RGB(120, 220, 255);
         gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(20, 24, 50));
         gfx_rect(c, x + 6, y + 11, 15, 15, col);
@@ -263,13 +259,13 @@ static void art_icon(canvas_t *c, int x, int y, int icon) {
         gfx_line(c, x + 20, y + 25, x + 26, y + 19, col);
         break;
     }
-    case ICON_LIFE:
+    case N_ICON_LIFE:
         gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(30, 30, 40));
         for (int j = 0; j < 5; j++)
             for (int i = 0; i < 5; i++)
                 if ((i * 7 + j * 3 + i * j) % 3 == 0) gfx_fill(c, x + 4 + i * 5, y + 4 + j * 5, 4, 4, RGB(255, 200, 90));
         break;
-    case ICON_MONITOR:
+    case N_ICON_MONITOR:
         gfx_fill_round(c, x + 1, y + 3, 30, 24, 4, RGB(40, 44, 70));
         gfx_fill(c, x + 6, y + 15, 4, 9, RGB(110, 220, 140));
         gfx_fill(c, x + 12, y + 9, 4, 15, RGB(110, 180, 250));
@@ -277,14 +273,14 @@ static void art_icon(canvas_t *c, int x, int y, int icon) {
         gfx_fill(c, x + 24, y + 7, 4, 17, RGB(230, 110, 140));
         gfx_fill(c, x + 12, y + 28, 8, 3, RGB(150, 160, 200));
         break;
-    case ICON_EDITOR:
+    case N_ICON_EDITOR:
         gfx_fill(c, x + 6, y + 2, 20, 28, RGB(245, 245, 250));
         gfx_rect(c, x + 6, y + 2, 20, 28, RGB(150, 160, 190));
         for (int i = 0; i < 5; i++) gfx_hline(c, x + 9, y + 8 + i * 4, 14 - (i % 2) * 4, RGB(120, 130, 170));
         gfx_line(c, x + 28, y + 6, x + 18, y + 24, RGB(240, 150, 60));
         gfx_line(c, x + 29, y + 7, x + 19, y + 25, RGB(240, 150, 60));
         break;
-    case ICON_SETTINGS: { /* a gear: eight teeth round a wheel with a hole */
+    case N_ICON_SETTINGS: { /* a gear: eight teeth round a wheel with a hole */
         static const int8_t teeth[8][2] = {{0, -12}, {8, -8}, {12, 0}, {8, 8}, {0, 12}, {-8, 8}, {-12, 0}, {-8, -8}};
         for (int i = 0; i < 8; i++) gfx_fill_round(c, x + 13 + teeth[i][0], y + 13 + teeth[i][1], 7, 7, 2, RGB(180, 188, 220));
         gfx_fill_circle(c, x + 16, y + 16, 10, RGB(180, 188, 220));
@@ -292,30 +288,30 @@ static void art_icon(canvas_t *c, int x, int y, int icon) {
         gfx_fill_circle(c, x + 16, y + 16, 4, RGB(40, 34, 70));
         break;
     }
-    case ICON_ABOUT:
+    case N_ICON_ABOUT:
         gfx_fill_circle(c, x + 16, y + 16, 13, RGB(246, 236, 196));
         gfx_fill_circle(c, x + 22, y + 12, 12, RGB(40, 30, 80));
         gfx_pixel(c, x + 27, y + 24, RGB(255, 255, 255));
         gfx_pixel(c, x + 24, y + 28, RGB(255, 255, 255));
         break;
-    case ICON_CALC:
+    case N_ICON_CALC:
         gfx_fill_round(c, x + 4, y + 1, 24, 30, 4, RGB(60, 64, 90));
         gfx_fill(c, x + 7, y + 4, 18, 7, RGB(170, 220, 180));
         for (int j = 0; j < 3; j++)
             for (int i = 0; i < 3; i++) gfx_fill(c, x + 7 + i * 6, y + 14 + j * 5, 5, 4, i == 2 && j == 2 ? RGB(240, 150, 60) : RGB(200, 200, 220));
         break;
-    case ICON_POWER:
+    case N_ICON_POWER:
         gfx_circle(c, x + 16, y + 17, 11, RGB(240, 90, 100));
         gfx_circle(c, x + 16, y + 17, 10, RGB(240, 90, 100));
         gfx_fill(c, x + 15, y + 3, 3, 13, RGB(240, 90, 100));
         break;
-    case ICON_LOGOUT: /* 扉と、そこから出る矢 */
+    case N_ICON_LOGOUT: /* 扉と、そこから出る矢 */
         gfx_fill_round(c, x + 5, y + 3, 14, 26, 2, RGB(150, 160, 200));
         gfx_fill(c, x + 7, y + 5, 10, 22, RGB(40, 40, 70));
         gfx_fill(c, x + 13, y + 15, 14, 3, RGB(120, 240, 150));
         gfx_triangle(c, x + 30, y + 16, x + 24, y + 10, x + 24, y + 22, RGB(120, 240, 150));
         break;
-    case ICON_SLEEP: /* a crescent (one disc less another, on any background) and a small z */
+    case N_ICON_SLEEP: /* a crescent (one disc less another, on any background) and a small z */
         for (int j = -11; j <= 11; j++)
             for (int i = -11; i <= 11; i++)
                 if (i * i + j * j <= 121 && (i - 5) * (i - 5) + (j + 4) * (j + 4) > 100)
@@ -324,7 +320,7 @@ static void art_icon(canvas_t *c, int x, int y, int icon) {
         gfx_line(c, x + 27, y + 4, x + 21, y + 9, RGB(200, 190, 250));
         gfx_hline(c, x + 21, y + 10, 7, RGB(200, 190, 250));
         break;
-    case ICON_HIBERNATE: /* the sleep crescent over a disk: the memory goes to the disk */
+    case N_ICON_HIBERNATE: /* the sleep crescent over a disk: the memory goes to the disk */
         for (int j = -8; j <= 8; j++)
             for (int i = -8; i <= 8; i++)
                 if (i * i + j * j <= 64 && (i - 4) * (i - 4) + (j + 3) * (j + 3) > 49)
@@ -334,19 +330,19 @@ static void art_icon(canvas_t *c, int x, int y, int icon) {
         gfx_hline(c, x + 6, y + 26, 14, RGB(70, 62, 120));
         gfx_fill(c, x + 23, y + 23, 3, 3, RGB(120, 230, 150));
         break;
-    case ICON_REBOOT:
+    case N_ICON_REBOOT:
         gfx_circle(c, x + 16, y + 16, 11, RGB(120, 200, 250));
         gfx_circle(c, x + 16, y + 16, 10, RGB(120, 200, 250));
         gfx_triangle(c, x + 22, y + 2, x + 22, y + 12, x + 30, y + 7, RGB(120, 200, 250));
         break;
-    case ICON_PIANO:
+    case N_ICON_PIANO:
         gfx_fill_round(c, x + 1, y + 4, 30, 24, 4, RGB(40, 34, 70));
         for (int i = 0; i < 5; i++) gfx_fill(c, x + 4 + i * 5, y + 7, 4, 19, RGB(246, 244, 236));
         for (int i = 0; i < 4; i++)
             if (i != 2) gfx_fill(c, x + 7 + i * 5, y + 7, 3, 11, RGB(24, 22, 36));
         gfx_fill(c, x + 4, y + 7, 24, 2, RGB(130, 110, 240));
         break;
-    case ICON_SOUND: /* two quavers joined by a beam */
+    case N_ICON_SOUND: /* two quavers joined by a beam */
         gfx_fill_round(c, x + 1, y + 1, 30, 30, 8, RGB(64, 44, 130));
         gfx_fill_circle(c, x + 10, y + 23, 4, RGB(246, 236, 196));
         gfx_fill_circle(c, x + 22, y + 20, 4, RGB(246, 236, 196));
@@ -354,7 +350,7 @@ static void art_icon(canvas_t *c, int x, int y, int icon) {
         gfx_fill(c, x + 25, y + 6, 2, 14, RGB(246, 236, 196));
         for (int t = 0; t < 4; t++) gfx_line(c, x + 13, y + 9 + t, x + 26, y + 6 + t, RGB(246, 236, 196));
         break;
-    case ICON_TETRIS:
+    case N_ICON_TETRIS:
         gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(24, 24, 44));
         gfx_fill(c, x + 5, y + 19, 7, 7, RGB(240, 90, 110));
         gfx_fill(c, x + 12, y + 19, 7, 7, RGB(240, 90, 110));
@@ -363,7 +359,7 @@ static void art_icon(canvas_t *c, int x, int y, int icon) {
         gfx_fill(c, x + 19, y + 12, 7, 7, RGB(90, 180, 250));
         gfx_fill(c, x + 19, y + 5, 7, 7, RGB(90, 180, 250));
         break;
-    case ICON_MINES:
+    case N_ICON_MINES:
         gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(180, 185, 200));
         gfx_line(c, x + 7, y + 7, x + 25, y + 25, RGB(20, 20, 30));
         gfx_line(c, x + 25, y + 7, x + 7, y + 25, RGB(20, 20, 30));
@@ -372,7 +368,7 @@ static void art_icon(canvas_t *c, int x, int y, int icon) {
         gfx_fill_circle(c, x + 16, y + 16, 7, RGB(20, 20, 30));
         gfx_fill(c, x + 13, y + 13, 3, 3, RGB(255, 255, 255));
         break;
-    case ICON_NET:
+    case N_ICON_NET:
         gfx_fill_circle(c, x + 16, y + 16, 13, RGB(70, 140, 230));
         gfx_circle(c, x + 16, y + 16, 13, RGB(200, 230, 255));
         gfx_vline(c, x + 16, y + 3, 26, RGB(200, 230, 255));

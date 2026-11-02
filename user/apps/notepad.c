@@ -399,12 +399,14 @@ static void copy_sel(void) {
 }
 
 static void paste(void) {
-    char *buf = malloc(65536);
+    n_result need = clipboard_get(NULL, 0);
+    if (need <= 0) return;
+    char *buf = malloc((size_t)need);
     if (!buf) return;
-    int n = clipboard_get(buf, 65536);
+    n_result n = clipboard_get(buf, (size_t)need);
     if (n > 0) {
         delete_sel();
-        insert(buf, (size_t)n);
+        insert(buf, (size_t)(n < need ? n : need));
     }
     free(buf);
 }

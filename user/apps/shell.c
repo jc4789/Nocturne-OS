@@ -107,53 +107,66 @@ static bool box_clip(struct rectangle *r, const canvas_t *c) {
 enum action { RUN, SLEEP, HIBERNATE, LOGOUT, RESTART, SHUT_DOWN };
 struct app {
     const char *name;
-    const char *path;
+    const struct n_program *program; /* RUN だけ */
     int icon;
-    const char *arg; /* 引数が一つあれば。TypeScript のアプリは js FILE.js で走る */
     enum action action;
 };
-#define SYSTEM   N_FOLDER_SYSTEM "\\"
-#define PROGRAMS N_FOLDER_PROGRAMS "\\"
-static const struct app apps[] = {
-    {"Terminal", SYSTEM "term", ICON_TERMINAL, NULL, RUN},
-    {"Files", SYSTEM "files", ICON_FILES, NULL, RUN},
-    {"Web Browser", PROGRAMS "Browser\\browser", ICON_NET, NULL, RUN},
-    {"Text Editor", PROGRAMS "Notepad\\notepad", ICON_EDITOR, NULL, RUN},
-    {"Paint", PROGRAMS "Paint\\paint", ICON_PAINT, NULL, RUN},
-    {"Calculator", PROGRAMS "Calculator\\calc", ICON_CALC, NULL, RUN},
-    {"Clock", PROGRAMS "Clock\\clock", ICON_CLOCK, NULL, RUN},
-    {"System Monitor", SYSTEM "sysmon", ICON_MONITOR, NULL, RUN},
-    {"Piano", PROGRAMS "Piano\\piano", ICON_PIANO, NULL, RUN},
-    {"Sound Player", PROGRAMS "Player\\player", ICON_SOUND, NULL, RUN},
-    {"Snake", PROGRAMS "Snake\\snake", ICON_SNAKE, NULL, RUN},
-    {"Tetris", PROGRAMS "Tetris\\tetris", ICON_TETRIS, NULL, RUN},
-    {"Minesweeper", PROGRAMS "Minesweeper\\mines", ICON_MINES, NULL, RUN},
-    {"Mandelbrot", PROGRAMS "Mandelbrot\\mandel", ICON_FRACTAL, NULL, RUN},
-    {"3D Cube", PROGRAMS "Cube\\cube", ICON_CUBE, NULL, RUN},
-    {"Game of Life", PROGRAMS "Life\\life", ICON_LIFE, NULL, RUN},
-    {"Settings", SYSTEM "settings", ICON_SETTINGS, NULL, RUN},
-    {"About Nocturne", SYSTEM "js", ICON_ABOUT, SYSTEM "about.js", RUN},
-    {"Sleep", NULL, ICON_SLEEP, NULL, SLEEP},
-    {"Hibernate", NULL, ICON_HIBERNATE, NULL, HIBERNATE},
-    {"Log Out", NULL, ICON_LOGOUT, NULL, LOGOUT},
-    {"Restart", NULL, ICON_REBOOT, NULL, RESTART},
-    {"Shut Down", NULL, ICON_POWER, NULL, SHUT_DOWN},
+static const struct app power_items[] = {
+    {"Sleep", NULL, N_ICON_SLEEP, SLEEP},
+    {"Hibernate", NULL, N_ICON_HIBERNATE, HIBERNATE},
+    {"Log Out", NULL, N_ICON_LOGOUT, LOGOUT},
+    {"Restart", NULL, N_ICON_REBOOT, RESTART},
+    {"Shut Down", NULL, N_ICON_POWER, SHUT_DOWN},
 };
-#define APP_COUNT ((int)(sizeof apps / sizeof *apps))
-static const int desktop_apps[] = {0, 1, 2, 3, 4, 8, 9, 10, 13, 14, 16, 17};
-#define DESKTOP_APPS ((int)(sizeof desktop_apps / sizeof *desktop_apps))
+#define POWER_ITEMS ((int)(sizeof power_items / sizeof *power_items))
+/* 台帳の写し（サービス programs）。menu_apps と desktop_apps は programs_held を指す。 */
+static struct n_program *programs_held;
+static struct app *menu_apps, *desktop_apps;
+static int menu_app_count, desktop_app_count;
 
 static void toast(const char *title, const char *text, unsigned ms);
 static void logout_begin(void);
+static void desktop_changed(void);
+
+static void programs_read(void) {
+    struct n_program *list;
+    n_result count = n_programs_list(&list);
+    if (count < 0) return; /* 前の写しで続ける。無ければ電源の項目だけ。 */
+    struct app *menu = calloc((size_t)count + 1, sizeof *menu), *desk = calloc((size_t)count + 1, sizeof *desk);
+    if (!menu || !desk) {
+        free(menu);
+        free(desk);
+        free(list);
+        return;
+    }
+    int menu_n = 0, desk_n = 0;
+    for (n_result i = 0; i < count; i++) {
+        struct app a = {list[i].name, &list[i], (int)list[i].icon, RUN};
+        if (list[i].flags & N_PROGRAM_MENU) menu[menu_n++] = a;
+        if (list[i].flags & N_PROGRAM_DESKTOP) desk[desk_n++] = a;
+    }
+    bool same = desk_n == desktop_app_count;
+    for (int i = 0; same && i < desk_n; i++)
+        same = desk[i].program->id == desktop_apps[i].program->id && desk[i].icon == desktop_apps[i].icon && !strcmp(desk[i].name, desktop_apps[i].name);
+    free(menu_apps);
+    free(desktop_apps);
+    free(programs_held);
+    programs_held = list;
+    menu_apps = menu;
+    desktop_apps = desk;
+    menu_app_count = menu_n;
+    desktop_app_count = desk_n;
+    if (!same) desktop_changed();
+}
 
 static void perform(const struct app *a) {
     n_result r = 0;
     switch (a->action) {
     case RUN:
-        r = gui_launch(a->path, a->arg);
+        r = n_program_run(a->program, NULL);
         if (r < 0) {
             char text[128];
-            snprintf(text, sizeof text, "%s (%s)", a->path, n_result_text(r));
+            snprintf(text, sizeof text, "%s (%s)", a->name, n_result_text(r));
             toast("Could not start program", text, TOAST_MS);
         }
         return;
@@ -170,7 +183,7 @@ static void perform(const struct app *a) {
 #define BAR_H 40
 #define CELL_W 88
 #define CELL_H 82
-#define ICON_AREA_PAD 16
+#define N_ICON_AREA_PAD 16
 
 struct desk {
     window_t *win;
@@ -196,16 +209,16 @@ static struct rectangle icon_cell(int h, int i) {
 static void icons_draw(struct desk *d) {
     canvas_t *c = &d->win->c;
     uint8_t *deep = win_deep(d->win);
-    const int stride = CELL_W + 2 * ICON_AREA_PAD;
+    const int stride = CELL_W + 2 * N_ICON_AREA_PAD;
     uint32_t *saved = deep ? malloc((size_t)stride * CELL_H * 4) : NULL;
-    for (int i = 0; i < DESKTOP_APPS; i++) {
-        const struct app *a = &apps[desktop_apps[i]];
-        struct rectangle cell = icon_cell(d->h, i), box = {cell.x - ICON_AREA_PAD, cell.y, stride, CELL_H};
+    for (int i = 0; i < desktop_app_count; i++) {
+        const struct app *a = &desktop_apps[i];
+        struct rectangle cell = icon_cell(d->h, i), box = {cell.x - N_ICON_AREA_PAD, cell.y, stride, CELL_H};
         bool track = saved && box_clip(&box, c);
         for (int y = 0; track && y < box.h; y++)
             memcpy(saved + (size_t)y * box.w, c->px + (size_t)(box.y + y) * c->pitch + box.x, (size_t)box.w * 4);
         art_icon(c, cell.x + (cell.w - 32) / 2, cell.y + 8, a->icon);
-        const char *label = strcmp(a->name, "About Nocturne") ? a->name : "About";
+        const char *label = a->name;
         int tx = cell.x + (cell.w - gfx_text_width(label, FONT_SMALL)) / 2;
         gfx_text(c, tx + 1, cell.y + 49, label, RGB(0, 0, 0), TRANSPARENT, FONT_SMALL);
         gfx_text(c, tx, cell.y + 48, label, RGB(235, 235, 250), TRANSPARENT, FONT_SMALL);
@@ -254,6 +267,10 @@ static void desk_paint(struct desk *d, size_t screen) {
     d->selected = -1;
     if (screen == 0) icons_draw(d);
     win_update(d->win);
+}
+
+static void desktop_changed(void) {
+    if (desk_count) desk_paint(&desks[0], 0);
 }
 
 static n_result desk_place(struct desk *d, size_t screen) {
@@ -439,8 +456,8 @@ static void bar_fit(const struct n_shell_screen *s) {
 #define MENU_HEAD   58
 #define MENU_ITEM_H 36
 
-static const struct app *menu_items[APP_COUNT];
-static int menu_length, menu_first_power, menu_sel, menu_rows, menu_columns, screen_w, screen_h;
+static const struct app **menu_items;
+static int menu_length, menu_first_power, menu_sel, menu_rows, menu_columns, menu_scroll, screen_w, screen_h;
 
 static void menu_close(void) {
     if (!menu) return;
@@ -451,7 +468,7 @@ static void menu_close(void) {
 }
 
 static struct rectangle menu_item_box(int i) {
-    return (struct rectangle){i / menu_rows * MENU_W, MENU_HEAD + i % menu_rows * MENU_ITEM_H, MENU_W, MENU_ITEM_H};
+    return (struct rectangle){(i / menu_rows - menu_scroll) * MENU_W, MENU_HEAD + i % menu_rows * MENU_ITEM_H, MENU_W, MENU_ITEM_H};
 }
 
 static void menu_draw(void) {
@@ -472,6 +489,7 @@ static void menu_draw(void) {
     gfx_text(c, 54, 10, OS_NAME, RGB(255, 255, 255), TRANSPARENT, FONT_LARGE);
     for (int i = 0; i < menu_length; i++) {
         struct rectangle b = menu_item_box(i);
+        if (b.x < 0 || b.x >= w) continue;
         if (i == menu_first_power && b.y > MENU_HEAD) gfx_hline(c, b.x + 12, b.y - 1, MENU_W - 24, RGB(60, 56, 100));
         if (i == menu_sel) gfx_fill_round(c, b.x + 6, b.y + 1, MENU_W - 12, MENU_ITEM_H - 2, 6, RGB(76, 64, 150));
         art_icon(c, b.x + 12, b.y + 2, menu_items[i]->icon);
@@ -486,19 +504,27 @@ static void menu_open(void) {
     volume_close();
     struct n_power_state power = {0};
     n_power_state(cap, &power);
+    programs_read();
+    const struct app **items = realloc(menu_items, (size_t)(menu_app_count + POWER_ITEMS) * sizeof *items);
+    if (!items) return;
+    menu_items = items;
     menu_length = 0;
-    menu_first_power = -1;
-    for (int i = 0; i < APP_COUNT; i++) {
-        if (apps[i].action == SLEEP && !power.can_sleep) continue;
-        if (apps[i].action == HIBERNATE && !power.can_hibernate) continue;
-        if (apps[i].action != RUN && menu_first_power < 0) menu_first_power = menu_length;
-        menu_items[menu_length++] = &apps[i];
+    for (int i = 0; i < menu_app_count; i++) menu_items[menu_length++] = &menu_apps[i];
+    menu_first_power = menu_length;
+    for (int i = 0; i < POWER_ITEMS; i++) {
+        if (power_items[i].action == SLEEP && !power.can_sleep) continue;
+        if (power_items[i].action == HIBERNATE && !power.can_hibernate) continue;
+        menu_items[menu_length++] = &power_items[i];
     }
     /* 画面が短ければ二列目へ続ける */
     int fit = (screen_h - BAR_H - 8 - MENU_HEAD - 10) / MENU_ITEM_H;
     menu_columns = fit < 1 ? menu_length : (menu_length + fit - 1) / fit;
     menu_rows = (menu_length + menu_columns - 1) / menu_columns;
-    int w = MENU_W * ((menu_length + menu_rows - 1) / menu_rows), h = MENU_HEAD + menu_rows * MENU_ITEM_H + 10;
+    /* 画面に入らない列はホイールと矢印で出す */
+    menu_columns = (menu_length + menu_rows - 1) / menu_rows;
+    menu_scroll = 0;
+    int shown = MAX_OF(1, MIN_OF(menu_columns, (screen_w - 8) / MENU_W));
+    int w = MENU_W * shown, h = MENU_HEAD + menu_rows * MENU_ITEM_H + 10;
     if (win_open(w, h, "Menu", WIN_NO_DECOR, &menu) < 0) {
         menu = NULL;
         return;
@@ -513,7 +539,7 @@ static void menu_open(void) {
 
 static int menu_item_at(int x, int y) {
     if (y < MENU_HEAD || y >= MENU_HEAD + menu_rows * MENU_ITEM_H || x < 0 || x >= menu->w) return -1;
-    int i = x / MENU_W * menu_rows + (y - MENU_HEAD) / MENU_ITEM_H;
+    int i = (x / MENU_W + menu_scroll) * menu_rows + (y - MENU_HEAD) / MENU_ITEM_H;
     return i < menu_length ? i : -1;
 }
 
@@ -523,8 +549,22 @@ static void menu_choose(int i) {
     perform(a);
 }
 
+/* 選んだ項目の列を窓の中へ出す。 */
+static void menu_reveal(int i) {
+    int shown = menu->w / MENU_W, column = i / menu_rows;
+    if (column < menu_scroll) menu_scroll = column;
+    else if (column >= menu_scroll + shown) menu_scroll = column - shown + 1;
+}
+
 static void menu_event(const struct gui_event *e) {
     switch (e->type) {
+    case EV_WHEEL: {
+        int last = MAX_OF(0, menu_columns - menu->w / MENU_W);
+        menu_scroll = MAX_OF(0, MIN_OF(last, menu_scroll + (e->wheel > 0 ? -1 : 1)));
+        menu_sel = -1;
+        menu_draw();
+        break;
+    }
     case EV_UNFOCUS:
     case EV_CLOSE: menu_close(); break;
     case EV_MOUSE_MOVE: {
@@ -552,6 +592,7 @@ static void menu_event(const struct gui_event *e) {
         else if (e->key == NKEY_UP || e->key == NKEY_DOWN) {
             int d = e->key == NKEY_UP ? -1 : 1;
             menu_sel = menu_sel < 0 ? (d > 0 ? 0 : menu_length - 1) : (menu_sel + d + menu_length) % menu_length;
+            menu_reveal(menu_sel);
             menu_draw();
         } else if (e->key == NKEY_ENTER && menu_sel >= 0) {
             menu_choose(menu_sel);
@@ -721,7 +762,7 @@ static void bar_event(const struct gui_event *e) {
         break;
     case EV_HOTKEY:
         if (e->key == 't' || e->key == 'T') {
-            n_result r = gui_launch(SYSTEM "term", NULL);
+            n_result r = gui_launch(N_FOLDER_SYSTEM "\\term", NULL);
             if (r < 0) toast("Could not start program", n_result_text(r), TOAST_MS);
         } else if (menu) {
             menu_close();
@@ -735,7 +776,7 @@ static void bar_event(const struct gui_event *e) {
 
 /* ---- デスクトップの入力 ---- */
 static int icon_at(const struct desk *d, int x, int y) {
-    for (int i = 0; i < DESKTOP_APPS; i++)
+    for (int i = 0; i < desktop_app_count; i++)
         if (in_box(x, y, icon_cell(d->h, i))) return i;
     return -1;
 }
@@ -751,12 +792,12 @@ static void desk_event(struct desk *d, size_t screen, const struct gui_event *e)
         d->last_y = e->y;
         int icon = icon_at(d, e->x, e->y);
         selection_set(d, icon);
-        if (icon >= 0 && twice) perform(&apps[desktop_apps[icon]]);
+        if (icon >= 0 && twice) perform(&desktop_apps[icon]);
         break;
     }
     case EV_UNFOCUS: selection_set(d, -1); break;
     case EV_KEY:
-        if (e->pressed && e->key == NKEY_ENTER && d->selected >= 0) perform(&apps[desktop_apps[d->selected]]);
+        if (e->pressed && e->key == NKEY_ENTER && d->selected >= 0) perform(&desktop_apps[d->selected]);
         break;
     default: break;
     }
@@ -1101,6 +1142,7 @@ int main(void) {
     watch_add(sound_setting_watch, TOKEN_SOUND_SETTING);
     watch_add(zone_watch, TOKEN_ZONE);
     watch_add(power_watch, TOKEN_POWER);
+    programs_read();
     screens_changed();
     windows_read();
     bar_draw();

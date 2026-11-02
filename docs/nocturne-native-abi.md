@@ -1316,6 +1316,15 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   （`n_machine_power`、`n_machine_screen`）。能力をアプリへ配らない。`n_machine_choose(op)` は利用者がメニューで
   選んだ操作で、`N_MACHINE_SLEEP`・`N_MACHINE_HIBERNATE` も受ける。結果を待たずに戻り、段取りは `n_power_state`（§16）で届く。
 
+- プログラムの台帳 `programs`（`user/apps/programs.c`）：起こせるプログラムと、文書の種類（小文字の拡張子）ごとの既定を持つ。
+  システムのプログラムはサービスの表にある。管理者は `n_program_register` で `C:\Programs` の中のプログラムを足し、
+  `n_program_claim` で開ける種類を言う。利用者は `n_program_choose` で自分の既定を選ぶ。種類 `*` はどの種類も開ける。
+  名前、パス、一覧の長さは決まっていない。要求も応答も一通で、形は `common/services_abi.h`。
+  `n_program_open_document(path)` が文書を既定のプログラムで開く。
+- セッションの終わり：`session` はシェルが終わった後に `n_session_stop(N_CAP_IDENTITY_GRANT の cap, session)` を呼び、
+  そのセッションの身元のアプリを全部止める。親が先に終わったアプリもここで止まる。
+- `n_processes(&list)` はプロセスの一覧を全部読む。`n_procinfo` の `app` はその thread のアプリ、`user`、`session`、`cls` はアプリの身元。
+
 ## 16. シェル
 
 シェルは普通のプロセス（`user/apps/shell.c`）で、セッションが利用者の身元で起こす。タスクバー、開始メニュー、音量、通知、

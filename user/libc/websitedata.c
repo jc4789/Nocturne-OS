@@ -212,16 +212,7 @@ static void clear_transient(webstorage *store) {
 static uint64_t row64(const uint8_t *p) { uint64_t v = 0; for (unsigned i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i); return v; }
 static void put_row64(uint8_t *p, uint64_t v) { for (unsigned i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
 
-static int processes(struct n_procinfo **out) {
-    for (int capacity = 64;; capacity *= 2) {
-        struct n_procinfo *p = malloc((size_t)capacity * sizeof *p);
-        if (!p) return -N_ERR_NO_MEMORY;
-        n_result n = proclist(p, capacity);
-        if (n < 0) { free(p); return (int)n; }
-        if (n < capacity || capacity > (1 << 20)) { *out = p; return (int)n; }
-        free(p);
-    }
-}
+static int processes(struct n_procinfo **out) { return (int)n_processes(out); }
 
 /* Under the document's claim: drops the rows of ended processes and this process's, adds this
    process's with join, and saves. How many other windows live, or the failure. */

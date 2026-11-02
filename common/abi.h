@@ -168,6 +168,7 @@ enum {
     SYS_CAP_FIND,             /* (enum n_cap) -> その能力を持つ自分の handle */
     SYS_POWER_STATE,          /* (N_CAP_SHELL の cap, struct n_power_state *out, size): 電源の段取りの今 */
     SYS_POWER_WATCH,          /* (N_CAP_SHELL の cap): SYS_POWER_STATE が報告するものの watch */
+    SYS_SESSION_STOP,         /* (N_CAP_IDENTITY_GRANT の cap, session): その身元のアプリを止める。まだ終わっていない数 */
     SYS_MAX                   /* above every number (what syscallfuzz tries) */
 };
 
@@ -315,6 +316,8 @@ struct n_procinfo {
     uint64_t cpu_ns;
     uint64_t mem_kb;
     uint64_t start_ns;  /* on the monotonic clock */
+    int app;            /* the app this thread belongs to: its pid, 0 for the kernel's threads */
+    uint32_t user, session, cls; /* the app's identity (authority_abi.h) */
 };
 
 /* free_mem: what an app can have now, the free frames and those of programs no task runs, which

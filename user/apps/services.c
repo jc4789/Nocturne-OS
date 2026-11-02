@@ -71,6 +71,9 @@ static const struct declared_service declared[] = {
     /* 要るときに起こす。電源と画面の読取りの能力はここにだけ渡す。 */
     {.name = "machine", .program = "machine", .cls = N_CLASS_SYSTEM,
      CAPS(N_CAP_POWER, N_CAP_SCREEN_READ), .on_failure = {3, 500, 60000}, .clients_from = N_CLASS_USER},
+    /* 起こせるプログラムの台帳。要るときに起こす。 */
+    {.name = "programs", .program = "programs", .cls = N_CLASS_SYSTEM,
+     CAPS(N_CAP_STORE_PRIVATE), .on_failure = {3, 500, 60000}, .clients_from = N_CLASS_USER},
     /* 試験の媒体にだけあるプログラム。C:\Nocturne\System の中にあるので、アプリは置けない。 */
     {.name = "tests", .program = "testrun", .cls = N_CLASS_SYSTEM, .at_boot = true, .optional = true,
      CAPS(N_CAP_POWER, N_CAP_PCI_CLAIM, N_CAP_SCREEN_READ, N_CAP_IDENTITY_GRANT), .needs = NAMES("accounts"),

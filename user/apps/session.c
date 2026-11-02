@@ -74,6 +74,8 @@ static void connections_serve(void *arg) {
 
 /* ---- セッションの始めと終わり ---- */
 static uint32_t next_session;
+#define STOP_WAIT_NS (5 * N_NS_PER_S)
+#define STOP_POLL_NS (20 * N_NS_PER_MS)
 
 /* プログラムを current.shell にして終わりまで待つ。終わりの結果、起こせなければ負の n_result。 */
 static n_result session_program(const char *path, const struct n_launch *launch) {
@@ -146,6 +148,15 @@ static void session_run(const struct n_account *a, bool windows) {
     }
     if (windows) desktop_session(&identity, a);
     else shell_session(&identity, a);
+    /* セッションの身元のアプリを全部止める。起こし直された前のシェルの子もここで終わる。 */
+    uint64_t give_up = n_clock_after(STOP_WAIT_NS);
+    n_result left;
+    while ((left = n_session_stop(grant_cap, identity.session)) > 0 && n_clock_monotonic() < give_up)
+        n_sleep_until(n_clock_after(STOP_POLL_NS));
+    if (left != 0) {
+        printf("session: %s's apps did not end (%d left)\n", a->name, (int)left);
+        fflush(stdout);
+    }
     mtx_lock(&current_lock);
     current.session = 0;
     mtx_unlock(&current_lock);

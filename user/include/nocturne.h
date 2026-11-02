@@ -370,6 +370,8 @@ extern char *const *__libc_environment;
 
 /* The count of processes and threads (at most max written), or a negative n_result. */
 n_result proclist(struct n_procinfo *out, int max);
+/* 全部の行の新しい配列（free する）。数を返す。 */
+n_result n_processes(struct n_procinfo **out);
 /* 0, or a negative n_result; errno is left alone. */
 n_result sysinfo(struct n_sysinfo *si);
 n_result cpu_info(struct n_cpuinfo *info);

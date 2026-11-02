@@ -89,14 +89,11 @@ static bool storage_control_commit(struct storage_area *a,struct storage_control
     return true;
 }
 static struct n_procinfo *storage_processes(int *count) {
-    int capacity=32;
-    for(;;){
-        struct n_procinfo *list=malloc((size_t)capacity*sizeof *list);if(!list)return NULL;
-        int n=proclist(list,capacity);
-        if(n<0){free(list);return NULL;}
-        if(n<capacity){*count=n;return list;}
-        free(list);if(capacity>INT_MAX/2)return NULL;capacity*=2;
-    }
+    struct n_procinfo *list;
+    n_result n=n_processes(&list);
+    if(n<0)return NULL;
+    *count=(int)n;
+    return list;
 }
 static uint64_t storage_process_start(void) {
     int count=0;struct n_procinfo *list=storage_processes(&count);uint64_t start=0;

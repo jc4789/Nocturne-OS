@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
+#include "nocturne_services.h"
 #include "media.h"
 #include "ui.h"
 
@@ -208,14 +209,7 @@ static void open_entry(int i) {
         go(path);
         return;
     }
-    const char *t = type_name(&ents[i]);
-    int r;
-    if (!strcmp(t, "Program")) r = gui_launch(path, NULL);
-    else if (!strcmp(t, "Picture")) r = gui_launch("paint", path);
-    else if (!strcmp(t, "Sound")) r = gui_launch("player", path);
-    else if (!strcmp(t, "Media")) r = gui_launch("mediaplayer", path);
-    else if (!strcmp(t, "Web page")) r = gui_launch("browser", path);
-    else r = gui_launch("notepad", path);
+    n_result r = !strcmp(type_name(&ents[i]), "Program") ? gui_launch(path, NULL) : n_program_open_document(path);
     snprintf(status, sizeof status, r < 0 ? "could not open %s" : "opened %s", ents[i].name);
 }
 

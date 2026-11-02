@@ -30,6 +30,32 @@ n_result n_services_control(uint32_t op, const char *name, const char *argument)
 /* 呼ぶ側のセッションを終え、ログインの窓へ戻る。 */
 n_result n_session_end(void);
 
+/* その身元のアプリを止める（N_CAP_IDENTITY_GRANT）。まだ終わっていない数を返す。 */
+n_result n_session_stop(n_handle cap, uint32_t session);
+
+/* ---- プログラムの台帳 ---- */
+struct n_program {
+    uint32_t id, icon, flags;
+    const char *name, *path, *argument;
+};
+struct n_program_claim {
+    uint32_t id, current;
+    const char *type;
+};
+/* 新しい配列（文字列ごと一度の free で放す）。数を返す。 */
+n_result n_programs_list(struct n_program **out);
+n_result n_programs_claims(struct n_program_claim **out);
+/* プログラムを起こす。document があれば最初の引数になる。アプリの番号を返す。 */
+n_result n_program_run(const struct n_program *p, const char *document);
+/* 文書を、呼ぶ側の利用者がその種類を開くプログラムで開く。 */
+n_result n_program_open_document(const char *path);
+/* 管理者の操作。足したプログラムの番号を返す。 */
+n_result n_program_register(const char *name, const char *path, const char *argument, uint32_t icon, uint32_t flags);
+n_result n_program_claim(uint32_t id, const char *type);
+n_result n_program_remove(uint32_t id);
+/* 呼ぶ側の利用者の、種類の既定を決める。 */
+n_result n_program_choose(uint32_t id, const char *type);
+
 /* ---- 機械 ---- */
 /* N_MACHINE_POWER_OFF か N_MACHINE_REBOOT。戻るのは失敗のときだけ。 */
 n_result n_machine_power(uint32_t op);

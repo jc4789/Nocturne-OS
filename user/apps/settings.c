@@ -19,7 +19,7 @@
 #define TOKEN_SOUND (TOKEN_SETTINGS + 2)
 #define TOKEN_SERVICES (TOKEN_SETTINGS + 3)
 
-enum page { P_AUDIO, P_DISPLAY, P_WINDOW, P_INPUT, P_POWER, P_NETWORK, P_TIME, P_BOOT, P_SERVICES, P_USERS, P_COUNT };
+enum page { P_AUDIO, P_DISPLAY, P_WINDOW, P_INPUT, P_POWER, P_NETWORK, P_TIME, P_BOOT, P_SERVICES, P_USERS, P_PROGRAMS, P_COUNT };
 static const struct {
     const char *label, *icon;
     uint32_t domain;
@@ -34,11 +34,13 @@ static const struct {
     [P_BOOT] = {"起動", "settings", N_DOMAIN_BOOT},
     [P_SERVICES] = {"サービス", "settings", N_SETTING_ANY},
     [P_USERS] = {"利用者", "settings", N_SETTING_ANY},
+    [P_PROGRAMS] = {"アプリ", "settings", N_SETTING_ANY},
 };
 
 enum act {
     A_PAGE = 1, A_BOOL, A_NUMBER, A_ENUM, A_TEXT, A_SCREEN, A_SIZE, A_RATE, A_KEEP, A_BACK,
-    A_SERVICE_RESTART, A_SERVICE_STOP, A_USER_CLASS, A_NEW_NAME, A_NEW_PASSWORD, A_NEW_ADMIN, A_NEW_CREATE
+    A_SERVICE_RESTART, A_SERVICE_STOP, A_USER_CLASS, A_NEW_NAME, A_NEW_PASSWORD, A_NEW_ADMIN, A_NEW_CREATE,
+    A_PROGRAM_CHOOSE, A_PROGRAM_REMOVE, A_PROGRAM_NAME, A_PROGRAM_PATH, A_PROGRAM_TYPES, A_PROGRAM_ADD
 };
 struct action {
     uint32_t node, arg;
@@ -549,6 +551,149 @@ static void users_page(struct ui_msg *m) {
     ui_end(m);
 }
 
+/* ---- アプリ：既定と登録（サービス programs） ---- */
+static struct n_program *program_list;
+static n_result program_total;
+static struct n_program_claim *claim_list; /* 種類の順。"*" が先頭。 */
+static n_result claim_total;
+static char *program_name_text, *program_path_text, *program_types_text;
+
+static void programs_load(void) {
+    free(program_list);
+    free(claim_list);
+    program_list = NULL;
+    claim_list = NULL;
+    program_total = n_programs_list(&program_list);
+    claim_total = n_programs_claims(&claim_list);
+    if (program_total < 0 || claim_total < 0) {
+        snprintf(status, sizeof status, "%s", n_result_text(program_total < 0 ? program_total : claim_total));
+        status_bad = true;
+    }
+}
+
+static const char *program_label(uint32_t id) {
+    for (n_result i = 0; i < program_total; i++)
+        if (program_list[i].id == id) return program_list[i].name;
+    return "";
+}
+
+/* 種類の組 [group, end) を開けるプログラムの番号：名乗ったものと、何でも開くもの。 */
+static size_t type_candidates(size_t group, size_t end, uint32_t *ids) {
+    size_t n = 0;
+    for (size_t i = group; i < end; i++) ids[n++] = claim_list[i].id;
+    for (n_result i = 0; i < claim_total && !strcmp(claim_list[i].type, N_PROGRAM_ANY_TYPE); i++) {
+        bool known = false;
+        for (size_t k = 0; k < n; k++) known = known || ids[k] == claim_list[i].id;
+        if (!known) ids[n++] = claim_list[i].id;
+    }
+    return n;
+}
+
+static size_t type_end(size_t group) {
+    size_t end = group;
+    while (end < (size_t)claim_total && !strcmp(claim_list[end].type, claim_list[group].type)) end++;
+    return end;
+}
+
+static void program_type_chosen(uint32_t group, uint32_t option) {
+    if (claim_total <= 0 || group >= (uint32_t)claim_total) return;
+    uint32_t *ids = malloc((size_t)claim_total * sizeof *ids);
+    if (!ids) return;
+    size_t n = type_candidates(group, type_end(group), ids);
+    n_result r = option < n ? n_program_choose(ids[option], claim_list[group].type) : -N_ERR_INVALID;
+    free(ids);
+    said(r, N_SETTING_OK);
+    programs_load();
+}
+
+static void text_keep(char **field, const char *text) {
+    char *copy = strdup(text ? text : "");
+    if (!copy) return;
+    free(*field);
+    *field = copy;
+}
+
+static void program_add(void) {
+    if (!program_name_text || !*program_name_text || !program_path_text || !*program_path_text) {
+        say("名前とパスを入れてください。", true);
+        return;
+    }
+    n_result id = n_program_register(program_name_text, program_path_text, NULL, N_ICON_GENERIC, N_PROGRAM_MENU);
+    said(id, N_SETTING_OK);
+    for (char *t = program_types_text ? strtok(program_types_text, " ,") : NULL; id >= 0 && t; t = strtok(NULL, " ,")) {
+        if (*t == '.') t++;
+        for (char *c = t; *c; c++)
+            if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');
+        n_result claimed = n_program_claim((uint32_t)id, t);
+        if (claimed < 0) said(claimed, N_SETTING_OK);
+    }
+    if (id >= 0) {
+        text_keep(&program_name_text, "");
+        text_keep(&program_path_text, "");
+        text_keep(&program_types_text, "");
+    }
+    programs_load();
+}
+
+static void programs_page(struct ui_msg *m) {
+    size_t total = claim_total > 0 ? (size_t)claim_total : 0, group = 0;
+    while (group < total && !strcmp(claim_list[group].type, N_PROGRAM_ANY_TYPE)) group++;
+    uint32_t *ids = malloc((total + 1) * sizeof *ids);
+    const char **names = malloc((total + 1) * sizeof *names);
+    text_node(m, "文書の種類ごとの既定", "heading", 0);
+    while (ids && names && group < total) {
+        size_t end = type_end(group), n = type_candidates(group, end, ids);
+        uint32_t selected = 0;
+        for (size_t i = 0; i < n; i++) {
+            names[i] = program_label(ids[i]);
+            if (ids[i] == claim_list[group].current) selected = (uint32_t)i;
+        }
+        char heading[64];
+        snprintf(heading, sizeof heading, ".%s", claim_list[group].type);
+        ui_node(m, "card"); ui_num(m, "gap", 8); ui_str(m, "key", claim_list[group].type);
+            ui_node(m, "row"); ui_num(m, "gap", 10);
+                ui_node(m, "column"); ui_num(m, "gap", 4); ui_num(m, "grow", 1);
+                    text_node(m, heading, "heading", 0);
+                ui_end(m);
+                act_at(ui_node(m, "segmented"), A_PROGRAM_CHOOSE, (uint32_t)group);
+                ui_strs(m, "options", names, (int)n);
+                ui_num(m, "selected", selected);
+                ui_end(m);
+            ui_end(m);
+        ui_end(m);
+        group = end;
+    }
+    free(ids);
+    free(names);
+    text_node(m, "登録したプログラム", "heading", 0);
+    for (n_result i = 0; i < program_total; i++) {
+        const struct n_program *p = &program_list[i];
+        if (p->flags & N_PROGRAM_SYSTEM) continue;
+        ui_node(m, "card"); ui_num(m, "gap", 8); ui_str(m, "key", p->path);
+            ui_node(m, "row"); ui_num(m, "gap", 10);
+                ui_node(m, "column"); ui_num(m, "gap", 4); ui_num(m, "grow", 1);
+                    text_node(m, p->name, "heading", 0);
+                    text_node(m, p->path, "caption", 0);
+                ui_end(m);
+                act_at(ui_node(m, "button"), A_PROGRAM_REMOVE, (uint32_t)i); ui_str(m, "text", "消す"); ui_end(m);
+            ui_end(m);
+        ui_end(m);
+    }
+    ui_node(m, "card"); ui_num(m, "gap", 10); ui_str(m, "key", "new program");
+        text_node(m, "プログラムを足す", "heading", 0);
+        act_at(ui_node(m, "field"), A_PROGRAM_NAME, 0);
+        ui_str(m, "value", program_name_text ? program_name_text : ""); ui_str(m, "placeholder", "名前"); ui_str(m, "width", "fill");
+        ui_end(m);
+        act_at(ui_node(m, "field"), A_PROGRAM_PATH, 0);
+        ui_str(m, "value", program_path_text ? program_path_text : ""); ui_str(m, "placeholder", "C:\\Programs の中のパス"); ui_str(m, "width", "fill");
+        ui_end(m);
+        act_at(ui_node(m, "field"), A_PROGRAM_TYPES, 0);
+        ui_str(m, "value", program_types_text ? program_types_text : ""); ui_str(m, "placeholder", "開ける種類（空白で区切る）"); ui_str(m, "width", "fill");
+        ui_end(m);
+        act_at(ui_node(m, "button"), A_PROGRAM_ADD, 0); ui_str(m, "text", "足す"); ui_str(m, "variant", "primary"); ui_end(m);
+    ui_end(m);
+}
+
 static void show(struct ui_session *ui) {
     const struct ui_theme *t = &ui_theme;
     view_number++;
@@ -576,6 +721,7 @@ static void show(struct ui_session *ui) {
                 text_node(&m, pages[page].label, "title", 0);
                 if (page == P_SERVICES) services_page(&m);
                 else if (page == P_USERS) users_page(&m);
+                else if (page == P_PROGRAMS) programs_page(&m);
                 else {
                     if (page == P_DISPLAY) screen_card(&m);
                     if (page == P_AUDIO) {
@@ -601,6 +747,7 @@ static void page_open(enum page p) {
     say("", false);
     if (p == P_SERVICES) services_load();
     if (p == P_USERS) accounts_load();
+    if (p == P_PROGRAMS) programs_load();
     if (p == P_DISPLAY) screen_read();
     if (p == P_AUDIO) n_audio_output(&sound);
 }
@@ -709,6 +856,17 @@ static bool on_event(const struct ui_event *e) {
     case A_NEW_PASSWORD: if (e->type == UI_EVENT_TEXT) strlcpy(new_password, e->text ? e->text : "", sizeof new_password); break;
     case A_NEW_ADMIN: if (e->type == UI_EVENT_TOGGLE) new_admin = e->a != 0; break;
     case A_NEW_CREATE: account_create(); break;
+    case A_PROGRAM_CHOOSE: if (e->type == UI_EVENT_CHOOSE) program_type_chosen(a->arg, (uint32_t)e->a); break;
+    case A_PROGRAM_REMOVE:
+        if (a->arg < (uint32_t)(program_total > 0 ? program_total : 0)) {
+            said(n_program_remove(program_list[a->arg].id), N_SETTING_OK);
+            programs_load();
+        }
+        break;
+    case A_PROGRAM_NAME: if (e->type == UI_EVENT_TEXT) text_keep(&program_name_text, e->text); break;
+    case A_PROGRAM_PATH: if (e->type == UI_EVENT_TEXT) text_keep(&program_path_text, e->text); break;
+    case A_PROGRAM_TYPES: if (e->type == UI_EVENT_TEXT) text_keep(&program_types_text, e->text); break;
+    case A_PROGRAM_ADD: program_add(); break;
     }
     return true;
 }

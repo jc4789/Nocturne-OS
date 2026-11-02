@@ -552,6 +552,20 @@ n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_
 n_result n_audio_status(n_handle a, struct n_audio_status *out) { return NC5(SYS_AUDIO_STATUS, a, out, 0, 0, 0); }
 n_result n_audio_flush(n_handle a) { return NC5(SYS_AUDIO_FLUSH, a, 0, 0, 0, 0); }
 n_result n_audio_output(struct n_audio_output *io) { return NC5(SYS_AUDIO_OUTPUT, io, 0, 0, 0, 0); }
+n_result n_processes(struct n_procinfo **out) {
+    for (size_t capacity = 256;; capacity *= 2) {
+        struct n_procinfo *list = malloc(capacity * sizeof *list);
+        if (!list) return -N_ERR_NO_MEMORY;
+        n_result n = proclist(list, (int)capacity);
+        if (n >= 0 && (size_t)n == capacity) {
+            free(list);
+            continue;
+        }
+        if (n < 0) free(list);
+        else *out = list;
+        return n;
+    }
+}
 n_result n_settings_apply(n_handle cap, uint32_t domain, uint32_t key, const void *value, size_t size) {
     return NC5(SYS_SETTINGS_APPLY, cap, domain, key, value, size);
 }

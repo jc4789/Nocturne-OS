@@ -352,13 +352,16 @@ static void send(const char *s, int n) {
 }
 
 static void paste(void) {
-    char buf[4096];
-    int n = clipboard_get(buf, sizeof buf);
-    if (n <= 0) return;
-    if (n > (int)sizeof buf) n = sizeof buf;
-    for (int i = 0; i < n; i++)
+    n_result need = clipboard_get(NULL, 0);
+    if (need <= 0) return;
+    char *buf = malloc((size_t)need);
+    if (!buf) return;
+    n_result n = clipboard_get(buf, (size_t)need);
+    if (n > need) n = need;
+    for (n_result i = 0; i < n; i++)
         if (buf[i] == '\n') buf[i] = '\r';
-    send(buf, n);
+    if (n > 0) send(buf, (int)n);
+    free(buf);
 }
 
 static void copy_screen(void) {

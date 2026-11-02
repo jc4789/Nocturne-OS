@@ -17,7 +17,6 @@ void wm_screen_size(uint32_t *w, uint32_t *h);
 /* The UTF-8 clipboard, any CPU, under the WM lock: a call on another CPU may replace it at any
    time, so it is read as a caller-owned snapshot (release with kfree). wm_clipboard_set copies
    text (kernel memory). */
-#define WM_CLIPBOARD_MAX (1 << 20)
 bool wm_clipboard_set(const char *text, size_t n);
 void wm_clipboard_info(size_t *len, uint32_t *seq);
 char *wm_clipboard_snapshot(size_t *len);

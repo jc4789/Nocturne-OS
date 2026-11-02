@@ -1,8 +1,9 @@
 #include <stdio.h>
 #include "nocturne.h"
 int main(void) {
-    struct n_procinfo p[128];
-    int n = proclist(p, 128);
+    struct n_procinfo *p;
+    n_result n = n_processes(&p);
+    if (n < 0) return 1;
     static const char *st[] = {"ready", "run", "sleep", "zombie"};
     printf("\x1b[1m  PID  PPID STATE    CPU(ms)  MEM(K)  NAME\x1b[0m\n");
     for (int i = 0; i < n; i++) {

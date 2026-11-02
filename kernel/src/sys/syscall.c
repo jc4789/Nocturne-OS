@@ -180,6 +180,12 @@ static void proclist_one(struct thread *t, void *arg) {
     info->cpu_ns = sched_thread_cpu_ns(t);
     info->mem_kb = main ? process_pages(main) * 4 : 0;
     info->start_ns = t->start_ns;
+    if (p) {
+        info->app = p->pid;
+        info->user = p->identity.user;
+        info->session = p->identity.session;
+        info->cls = p->identity.cls;
+    }
 }
 
 static int64_t sys_proclist(struct n_procinfo *out, int max) {
@@ -1251,6 +1257,11 @@ void syscall_dispatch(struct regs *r) {
         break;
     }
     case SYS_YIELD: sched_yield(); ret = 0; break;
+    case SYS_SESSION_STOP:
+        ret = cap_check((int)a, N_CAP_IDENTITY_GRANT);
+        if (ret < 0) break;
+        ret = !b || b > UINT32_MAX ? -N_ERR_INVALID : process_stop_session((uint32_t)b);
+        break;
     case SYS_POWER:
         ret = cap_check((int)a, N_CAP_POWER);
         if (ret < 0) break;

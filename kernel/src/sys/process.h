@@ -76,6 +76,7 @@ int process_kill(int pid);
 /* Every process launched below pid's (and pid's itself with include_self) is stopped: how many. */
 int process_kill_tree(int pid, bool include_self);
 int process_stop_all(void); /* power change: stop every app; returns how many have not ended yet */
+int process_stop_session(uint32_t session); /* the same for the apps of one session */
 /* SYS_EXIT or a fatal app exception: the whole app ends with code, from any of its threads. */
 NORETURN void process_exit(int code);
 /* thread_exit in p's main thread: every other thread ends, then its handles, space and family. */

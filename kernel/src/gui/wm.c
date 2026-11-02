@@ -2306,8 +2306,11 @@ static void clipboard_put(char *nb, size_t n) {
     wm_unlock();
 }
 
+/* 中身は核の heap にある。一つのアプリが核のメモリを使い尽くさないよう、機械のメモリの 8 分の 1 までにする。 */
+static bool clipboard_fits(size_t n) { return n <= pmm_total_pages() * PAGE_SIZE / 8; }
+
 bool wm_clipboard_set(const char *text, size_t n) {
-    if (n > WM_CLIPBOARD_MAX) return false;
+    if (!clipboard_fits(n)) return false;
     char *nb = kmalloc(n + 1);
     if (!nb) return false;
     memcpy(nb, text, n);
@@ -3053,7 +3056,7 @@ static int64_t sys_screen_info(uint64_t a, uint64_t b, uint64_t c) {
 
 static int64_t sys_clipboard_set(uint64_t a, uint64_t b) {
     size_t n = b;
-    if (n > WM_CLIPBOARD_MAX) return -N_ERR_TOO_LARGE;
+    if (!clipboard_fits(n)) return -N_ERR_TOO_LARGE;
     if (!user_ok((const void *)a, n)) return -N_ERR_BAD_ADDRESS;
     char *nb = kmalloc(n + 1);
     if (!nb) return -N_ERR_NO_MEMORY;
