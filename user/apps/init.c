@@ -10,23 +10,14 @@
 #define NVRM    N_FOLDER_SYSTEM "\\nvrm"
 #define AUTORUN "C:\\Tests\\autorun.sh"
 
-/* Launch path with up to two arguments and the given input, output and log, in
-   this app's folder. Settings beyond FOLDER (such as TERMINAL) are passed in extra. */
-static n_handle start2(const char *path, const char *name, const char *arg, const char *arg2, int32_t in, int32_t out,
-                       const char *extra) {
-    const char *f = getenv("FOLDER");
-    char folder[4104];
-    snprintf(folder, sizeof folder, "FOLDER=%s", f && n_path_is_complete(f) ? f : n_user_folder());
-    const char *settings[2] = {folder, extra};
-    const char *args[3] = {name, arg, arg2};
+/* Launch path with an argument and the given input, output and log, in this app's folder. */
+static n_handle start(const char *path, const char *name, const char *arg, int32_t in, int32_t out, bool terminal) {
+    static const int32_t terminals[] = {0, 1, 2};
+    const char *args[2] = {name, arg};
     int32_t handles[3] = {in, out, out};
-    struct n_launch l = {.arguments = args, .settings = settings, .handles = handles,
-                         .argument_count = arg ? (arg2 ? 3 : 2) : 1, .setting_count = extra ? 2 : 1, .handle_count = 3};
+    struct n_launch l = {.arguments = args, .handles = handles, .argument_count = arg ? 2 : 1, .handle_count = 3,
+                         .terminals = terminal ? terminals : NULL, .terminal_count = terminal ? 3 : 0};
     return n_app_launch(path, &l);
-}
-
-static n_handle start(const char *path, const char *name, const char *arg, int32_t in, int32_t out, const char *extra) {
-    return start2(path, name, arg, NULL, in, out, extra);
 }
 
 /* The system log kept on C: in the user's AppData\Nocturne: System.log for this start, the one
@@ -97,7 +88,7 @@ static void autorun(void) {
     struct n_entry e;
     if (n_entry_info(AUTORUN, &e) < 0) return;
     n_handle log = n_system_log_open();
-    n_handle app = start(SH, "sh", AUTORUN, -1, log, NULL);
+    n_handle app = start(SH, "sh", AUTORUN, -1, log, false);
     if (log >= 0) n_handle_close(log);
     if (app >= 0) n_app_result(app, N_CLOCK_NEVER, NULL);
     poweroff();
@@ -166,7 +157,7 @@ int main(void) {
     autorun();
     /* text session: keep a shell alive on the console this app was given */
     for (;;) {
-        n_handle sh = start(SH, "sh", NULL, 0, 1, n_terminal(1) ? "TERMINAL=0 1 2" : NULL);
+        n_handle sh = start(SH, "sh", NULL, 0, 1, n_terminal(1));
         if (sh < 0) {
             printf("init: cannot start " SH " (%s)\n", n_result_text(sh));
             fflush(stdout);

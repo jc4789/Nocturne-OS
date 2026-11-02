@@ -195,7 +195,8 @@ struct n_setting_id {
 
 enum n_settings_op {
     N_SETTINGS_GET = 1, /* 値を返す。無ければ今の値か既定。 */
-    N_SETTINGS_SET,     /* 検証、適用、保存、見張りへの知らせ。失敗すれば元の値へ戻す。 */
+    N_SETTINGS_SET,     /* 検証、適用、保存、見張りへの知らせ。失敗すれば元の値へ戻す。argument が 1 なら、値の後の
+                           extra バイトが今の値と同じときだけ書く（読んで直す者が他の変更を消さない）。 */
     N_SETTINGS_TRY,     /* 検証、適用。argument はミリ秒の期限。COMMIT が来なければ settings が戻す。
                            値の後に extra バイトの「戻す先」を続けてよい（保存された値が無いときに使う）。 */
     N_SETTINGS_COMMIT,  /* 試しの値を保存して確定する。 */
@@ -219,7 +220,8 @@ enum n_setting_reason {
     N_SETTING_NO_TRIAL,       /* 試しの中でない（期限で戻った後を含む） */
     N_SETTING_NEEDS_TRIAL,    /* N_APPLY_TRIAL の鍵に SET が来た */
     N_SETTING_BUSY,           /* 同じ鍵の適用の答えを待っている */
-    N_SETTING_BAD_DECLARATION /* 宣言の型、範囲、既定、名前が正しくない */
+    N_SETTING_BAD_DECLARATION, /* 宣言の型、範囲、既定、名前が正しくない */
+    N_SETTING_NOT_THE_SAME    /* N_SETTINGS_SET の条件：今の値が読んだ値と違う */
 };
 struct n_settings_request {
     uint32_t op;       /* enum n_settings_op */

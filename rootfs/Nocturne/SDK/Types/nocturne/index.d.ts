@@ -32,18 +32,8 @@ declare namespace nocturne {
     /** Changes the current folder. A relative path is resolved against the current folder. */
     function chdir(path: string): void;
 
-    /**
-     * Returns a launch setting, or undefined when it is not set. Every app gets FOLDER (its current
-     * folder), USERFOLDER (the user's folder, C:\Users\<name>) and TEMP (the user's temporary folder,
-     * emptied at every start).
-     */
-    function getSetting(name: string): string | undefined;
 
-    /** Sets a launch setting for this app and for the apps it runs. */
-    function setSetting(name: string, value: string): void;
 
-    /** Removes a launch setting for this app and for the apps it runs. */
-    function removeSetting(name: string): void;
 
     // ---- Documents and folders ----------------------------------------
 

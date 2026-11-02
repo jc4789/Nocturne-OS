@@ -75,16 +75,13 @@ static void open_slot(int slot, char **words, int count) {
     n_folder_create("C:\\Tests\\profiles");
     n_folder_create(user);
     n_folder_create(temp);
-    snprintf(user_setting, sizeof user_setting, "USERFOLDER=%s", user);
-    snprintf(temp_setting, sizeof temp_setting, "TEMP=%s", temp);
-    const char *settings[] = {user_setting, temp_setting};
     const char *args[MAX_WORDS + 2];
     args[0] = "browser";
     args[1] = "--wpt-automation";
     for (int i = 0; i < count; i++) args[i + 2] = words[i];
     int32_t handles[] = {-1, -1, -1};
-    struct n_launch launch = {.arguments = args, .settings = settings, .handles = handles,
-                              .argument_count = (uint32_t)count + 2, .setting_count = 2, .handle_count = 3};
+    struct n_launch launch = {.arguments = args, .handles = handles, .argument_count = (uint32_t)count + 2, .handle_count = 3,
+                              .user_folder = user, .temp_folder = temp};
     n_handle app = n_app_launch(N_FOLDER_PROGRAMS "\\Browser\\browser", &launch);
     if (app < 0) {
         say("failed %d %s\n", slot, n_result_text(app));

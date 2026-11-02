@@ -198,11 +198,7 @@ static bool param_set(const struct uvm_os_param *p, const char *value)
 /* UVM_OPTIONS="name=value;name=value" (',' and ' ' separate too). */
 void uvm_os_params_init(void)
 {
-    static const char key[] = "UVM_OPTIONS=";
-    const char *options = NULL;
-    for (char *const *s = n_settings; s && *s; s++)
-        if (!strncmp(*s, key, sizeof key - 1))
-            options = *s + sizeof key - 1;
+    const char *options = getenv("UVM_OPTIONS");
     if (!options)
         return;
     while (*options) {

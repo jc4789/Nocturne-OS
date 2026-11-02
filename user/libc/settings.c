@@ -107,6 +107,13 @@ n_result n_setting_set(struct n_setting_id id, const void *value, size_t length,
 n_result n_setting_set_int(struct n_setting_id id, int32_t value, uint32_t *reason) {
     return n_setting_set(id, &value, sizeof value, reason);
 }
+n_result n_setting_set_if(struct n_setting_id id, const void *expected, size_t expected_length, const void *value,
+                          size_t length, uint32_t *reason) {
+    if (length > N_SETTING_VALUE_MAX || expected_length > N_SETTING_VALUE_MAX) return -N_ERR_TOO_LARGE;
+    struct n_settings_request m = {.op = N_SETTINGS_SET, .length = (uint32_t)length, .argument = 1,
+                                   .extra = (uint32_t)expected_length, .id = id};
+    return change(&m, value, expected, reason);
+}
 n_result n_setting_try(struct n_setting_id id, const void *value, size_t length, const void *revert_to, size_t revert_length,
                        uint32_t trial_ms, uint32_t *reason) {
     if (length > N_SETTING_VALUE_MAX || revert_length > N_SETTING_VALUE_MAX) return -N_ERR_TOO_LARGE;

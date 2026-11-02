@@ -706,9 +706,8 @@ static void change_begin(struct conn *c, uint32_t op, uint32_t serial, struct kn
     else if (v) kept = bytes_set(&ch->before, v->bytes, v->length);
     else if (revert_length) kept = bytes_set(&ch->before, revert_to, revert_length);
     else {
-        uint8_t *fallback = malloc(N_SETTING_TEXT_MAX + sizeof(struct n_setting_monitor_mode) + sizeof(struct n_sockaddr));
-        kept = fallback && bytes_set(&ch->before, fallback, fallback_bytes(k, fallback));
-        free(fallback);
+        uint8_t fallback[N_SETTING_TEXT_MAX + sizeof(struct n_setting_monitor_mode) + sizeof(struct n_sockaddr)];
+        kept = bytes_set(&ch->before, fallback, fallback_bytes(k, fallback));
     }
     if (!kept) {
         reply(c, op, serial, -N_ERR_NO_MEMORY, N_SETTING_APPLY_REFUSED, 0, NULL, 0);
@@ -737,26 +736,36 @@ static void trial_back(struct trial *t) {
 }
 
 /* ---- 文の処理 ---- */
-static void answer_get(struct conn *c, const struct n_settings_request *m, struct known *k, const struct n_setting_id *id) {
+#define SCRATCH_BYTES (N_SETTING_TEXT_MAX + sizeof(struct n_setting_monitor_mode) + sizeof(struct n_sockaddr))
+/* 今の値：試しの値、保存された値、カーネルの今の値、既定の順。scratch は SCRATCH_BYTES。 */
+static const void *current_bytes(const struct known *k, const struct n_setting_id *id, void *scratch, uint32_t *length) {
     const struct trial *t = trial_find(id);
-    const struct value *v = value_find(id);
     if (t) {
-        reply(c, m->op, m->serial, 0, N_SETTING_OK, 0, t->wanted.data, t->wanted.length);
-    } else if (v) {
-        reply(c, m->op, m->serial, 0, N_SETTING_OK, 0, v->bytes, v->length);
-    } else {
-        uint8_t scratch[N_SETTING_TEXT_MAX + sizeof(struct n_setting_monitor_mode) + sizeof(struct n_sockaddr)];
-        uint32_t size = fixed_size(k->d.type);
-        /* カーネルの鍵は今の値。一覧の鍵は装置ごとの選択が無ければ既定（全部 0）。 */
-        if (k->kernel && k->d.type != N_SETTING_MONITOR_MODE) {
-            n_result r = __syscall(SYS_SETTINGS_EFFECTIVE, k->d.domain, k->d.key, (long)scratch, sizeof scratch, 0);
-            if (r >= 0 && (uint32_t)r == size) {
-                reply(c, m->op, m->serial, 0, N_SETTING_OK, 0, scratch, size);
-                return;
-            }
-        }
-        reply(c, m->op, m->serial, 0, N_SETTING_OK, 0, scratch, fallback_bytes(k, scratch));
+        *length = t->wanted.length;
+        return t->wanted.data;
     }
+    const struct value *v = value_find(id);
+    if (v) {
+        *length = v->length;
+        return v->bytes;
+    }
+    /* カーネルの鍵は今の値。一覧の鍵は装置ごとの選択が無ければ既定（全部 0）。 */
+    if (k->kernel && k->d.type != N_SETTING_MONITOR_MODE) {
+        uint32_t size = fixed_size(k->d.type);
+        n_result r = __syscall(SYS_SETTINGS_EFFECTIVE, k->d.domain, k->d.key, (long)scratch, SCRATCH_BYTES, 0);
+        if (r >= 0 && (uint32_t)r == size) {
+            *length = size;
+            return scratch;
+        }
+    }
+    *length = fallback_bytes(k, scratch);
+    return scratch;
+}
+static void answer_get(struct conn *c, const struct n_settings_request *m, struct known *k, const struct n_setting_id *id) {
+    uint8_t scratch[SCRATCH_BYTES];
+    uint32_t length;
+    const void *data = current_bytes(k, id, scratch, &length);
+    reply(c, m->op, m->serial, 0, N_SETTING_OK, 0, data, length);
 }
 
 static void answer_list(struct conn *c, const struct n_settings_request *m, const struct n_identity *who) {
@@ -893,15 +902,25 @@ static void on_request(struct conn *c, const struct n_settings_request *m, size_
     switch (m->op) {
     case N_SETTINGS_SET:
     case N_SETTINGS_TRY: {
+        bool conditional = m->op == N_SETTINGS_SET && m->argument == 1;
         uint32_t reason = value_check(k, data, m->length);
         if (reason == N_SETTING_OK && m->op == N_SETTINGS_SET && k->d.apply == N_APPLY_TRIAL) reason = N_SETTING_NEEDS_TRIAL;
-        if (reason == N_SETTING_OK && m->extra) reason = value_check(k, data + m->length, m->extra);
+        if (reason == N_SETTING_OK && m->extra && !conditional) reason = value_check(k, data + m->length, m->extra);
         if (reason != N_SETTING_OK) {
             reply(c, m->op, m->serial, -N_ERR_INVALID, reason, 0, NULL, 0);
             return;
         }
+        if (conditional) {
+            uint8_t scratch[SCRATCH_BYTES];
+            uint32_t length;
+            const void *now = current_bytes(k, &id, scratch, &length);
+            if (length != m->extra || (length && memcmp(now, data + m->length, length))) {
+                reply(c, m->op, m->serial, -N_ERR_BUSY, N_SETTING_NOT_THE_SAME, 0, NULL, 0);
+                return;
+            }
+        }
         uint32_t ms = m->op == N_SETTINGS_TRY ? (m->argument < TRIAL_MS_MOST ? m->argument : TRIAL_MS_MOST) : 0;
-        change_begin(c, m->op, m->serial, k, &id, data, m->length, data + m->length, m->extra, ms);
+        change_begin(c, m->op, m->serial, k, &id, data, m->length, data + m->length, conditional ? 0 : m->extra, ms);
         return;
     }
     case N_SETTINGS_COMMIT: {

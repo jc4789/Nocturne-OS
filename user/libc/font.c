@@ -158,10 +158,9 @@ font_t *font_open_memory(const void *data,size_t length) {
     return f;
 }
 
-/* The complete path of a bundled face: in C:\Nocturne\Fonts unless the launch setting FONT_DIR names another folder. */
+/* The complete path of a bundled face. */
 static bool bundled_path(const char *name, char *path, size_t size) {
-    const char *dir = getenv("FONT_DIR");
-    return n_path_join(dir && *dir ? dir : "C:\\Nocturne\\Fonts", name, path, size) >= 0;
+    return n_path_join("C:\\Nocturne\\Fonts", name, path, size) >= 0;
 }
 
 static font_t *open_bundled(const char *name) {

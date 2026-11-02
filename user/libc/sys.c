@@ -373,44 +373,16 @@ static n_handle launch_program(const char *path, const struct n_launch *launch) 
     return app;
 }
 
-/* Whether the launch gives the setting name ("NAME=..."). */
-static bool launch_gives(const struct n_launch *l, const char *name) {
-    size_t n = strlen(name);
-    for (uint32_t i = 0; i < l->setting_count; i++)
-        if (l->settings[i] && !strncmp(l->settings[i], name, n) && l->settings[i][n] == '=') return true;
-    return false;
-}
-
+/* 子は起動元の利用者のために働く：起動元の今のフォルダー、利用者のフォルダー、一時フォルダーを渡す。 */
 n_handle n_app_launch(const char *path, const struct n_launch *launch) {
     if (!launch) return launch_program(path, launch);
-    /* A child works for this app's user: it gets this app's USERFOLDER and TEMP unless the launch
-       names its own (the kernel gives the system's to an app launched without them). */
-    static const char *const user[] = {"USERFOLDER", "TEMP"};
-    char *own[2] = {0};
-    const char **settings = NULL;
-    uint32_t owned = 0;
     struct n_launch l = *launch;
-    n_handle app = -N_ERR_NO_MEMORY;
-    for (int i = 0; i < 2; i++) {
-        const char *v = getenv(user[i]);
-        if (!v || launch_gives(launch, user[i])) continue;
-        size_t n = strlen(user[i]) + strlen(v) + 2;
-        if (!(own[owned] = malloc(n))) goto out;
-        snprintf(own[owned++], n, "%s=%s", user[i], v);
-    }
-    if (owned) {
-        if (!(settings = malloc((launch->setting_count + owned) * sizeof *settings))) goto out;
-        for (uint32_t i = 0; i < launch->setting_count; i++) settings[i] = launch->settings[i];
-        for (uint32_t i = 0; i < owned; i++) settings[launch->setting_count + i] = own[i];
-        l.settings = settings;
-        l.setting_count += owned;
-    }
-    app = launch_program(path, &l);
-out:
-    free(settings);
-    for (uint32_t i = 0; i < owned; i++) free(own[i]);
-    return app;
+    if (!l.folder) l.folder = n_folder();
+    if (!l.user_folder) l.user_folder = start_info->user_folder;
+    if (!l.temp_folder) l.temp_folder = start_info->temp_folder;
+    return launch_program(path, &l);
 }
+
 n_result n_app_result(n_handle app, uint64_t deadline, int *status) {
     return NC5(SYS_APP_RESULT, app, deadline, status, 0, 0);
 }
@@ -560,19 +532,8 @@ static int run_here(const char *full, char *const argv[]) {
     while (argv[argc]) argc++;
     int32_t handles[3];
     for (int i = 0; i < 3; i++) handles[i] = n_handle_kind(i) >= 0 ? i : -1;
-    char folder[4104], terminal[64];
-    const char *settings[2];
-    uint32_t ns = 0;
-    const char *f = getenv("FOLDER"), *t = getenv("TERMINAL");
-    if (!f || !n_path_is_complete(f)) f = "C:\\";
-    snprintf(folder, sizeof folder, "FOLDER=%s", f);
-    settings[ns++] = folder;
-    if (t) {
-        snprintf(terminal, sizeof terminal, "TERMINAL=%s", t);
-        settings[ns++] = terminal;
-    }
-    struct n_launch l = {.arguments = (const char *const *)argv, .settings = settings, .handles = handles,
-                         .argument_count = argc, .setting_count = ns, .handle_count = 3};
+    struct n_launch l = {.arguments = (const char *const *)argv, .handles = handles, .argument_count = argc,
+                         .handle_count = 3, .terminals = start_info->terminals, .terminal_count = start_info->terminal_count};
     n_handle app = n_app_launch(full, &l);
     if (app < 0) return (int)app;
     int st = 0;
@@ -592,75 +553,51 @@ int system(const char *cmd) {
     return run_wait("sh", argv);
 }
 
-/* Settings: there is no inherited environment, just the launch settings (n_settings, never
-   changed) plus the ones this app sets itself (n_folder_set's FOLDER). Those are a list read
-   without a lock by any thread: an entry, once in, stays, and its value is swapped whole. A value
-   is kept for the app's life once set, so that a pointer getenv gave another thread never
-   dangles; a value set again that equals one kept is that one again. */
-struct own_setting {
-    struct own_setting *next;
-    char *value;          /* swapped with release, read with acquire */
-    struct kept *kept;    /* the values it has had */
-    char name[];
+/* 起動の属性（struct n_start）。今のフォルダーはこのアプリが n_folder_set で変える。一度渡したフォルダーの文字列は
+   アプリの寿命の間残るので、別のスレッドが持つ指は消えない。 */
+static const struct n_start no_start = {.environment = (char *const[]){NULL}, .folder = "C:\\", .user_folder = "C:\\",
+                                         .temp_folder = "C:\\"};
+static const struct n_start *start_info = &no_start;
+
+struct kept_folder {
+    struct kept_folder *next;
+    char path[];
 };
-struct kept {
-    struct kept *next;
-    char value[];
-};
-static struct own_setting *own_settings;
-static uint32_t own_settings_lock; /* the writers' */
+static struct kept_folder *kept_folders;
+static const char *current_folder;
+static uint32_t folder_lock;
 
-static void own_lock(void) {
-    while (__atomic_exchange_n(&own_settings_lock, 1, __ATOMIC_ACQUIRE))
-        if (wait_on_address(&own_settings_lock, 1, UINT32_MAX) < 0) yield();
-}
-static void own_unlock(void) {
-    __atomic_store_n(&own_settings_lock, 0, __ATOMIC_RELEASE);
-    wake_address(&own_settings_lock, 1);
+const char *n_folder(void) {
+    const char *f = __atomic_load_n(&current_folder, __ATOMIC_ACQUIRE);
+    return f ? f : start_info->folder;
 }
 
-static struct own_setting *own_find(const char *name) {
-    for (struct own_setting *s = __atomic_load_n(&own_settings, __ATOMIC_ACQUIRE); s; s = s->next)
-        if (!strcmp(s->name, name)) return s;
-    return NULL;
-}
-
-/* Sets this app's own setting name to value: n_folder_set's FOLDER, which getenv and the
-   apps it launches then see. */
-static int setting_set(const char *name, const char *value) {
+static int folder_keep(const char *path) {
+    while (__atomic_exchange_n(&folder_lock, 1, __ATOMIC_ACQUIRE))
+        if (wait_on_address(&folder_lock, 1, UINT32_MAX) < 0) yield();
     int r = -1;
-    own_lock();
-    struct own_setting *s = own_find(name);
-    if (!s && (s = malloc(sizeof *s + strlen(name) + 1))) {
-        *s = (struct own_setting){.next = own_settings};
-        strcpy(s->name, name);
-        __atomic_store_n(&own_settings, s, __ATOMIC_RELEASE);
+    struct kept_folder *k = kept_folders;
+    while (k && strcmp(k->path, path)) k = k->next;
+    if (!k && (k = malloc(sizeof *k + strlen(path) + 1))) {
+        strcpy(k->path, path);
+        k->next = kept_folders;
+        kept_folders = k;
     }
-    if (s) {
-        struct kept *k = s->kept;
-        while (k && strcmp(k->value, value)) k = k->next;
-        if (!k && (k = malloc(sizeof *k + strlen(value) + 1))) {
-            strcpy(k->value, value);
-            k->next = s->kept;
-            s->kept = k;
-        }
-        if (k) {
-            __atomic_store_n(&s->value, k->value, __ATOMIC_RELEASE);
-            r = 0;
-        }
+    if (k) {
+        __atomic_store_n(&current_folder, k->path, __ATOMIC_RELEASE);
+        r = 0;
     }
-    own_unlock();
+    __atomic_store_n(&folder_lock, 0, __ATOMIC_RELEASE);
+    wake_address(&folder_lock, 1);
     return r;
 }
 
-char *const *n_settings = (char *const[]){NULL};
+/* 移植のプログラムの環境。libc の getenv と、移植の標準ライブラリーだけが読む。 */
+char *const *__libc_environment = (char *const[]){NULL};
 
 char *getenv(const char *name) {
-    struct own_setting *own = own_find(name);
-    char *value = own ? __atomic_load_n(&own->value, __ATOMIC_ACQUIRE) : NULL;
-    if (value) return value;
     size_t len = strlen(name);
-    for (char *const *s = n_settings; *s; s++)
+    for (char *const *s = __libc_environment; *s; s++)
         if (!strncmp(*s, name, len) && (*s)[len] == '=') return *s + len + 1;
     return NULL;
 }
@@ -709,8 +646,7 @@ n_result n_path_join(const char *folder, const char *name, char *out, size_t cap
 }
 
 n_result n_path_complete(const char *name, char *out, size_t cap) {
-    const char *folder = getenv("FOLDER");
-    return n_path_join(folder && n_path_is_complete(folder) ? folder : "C:\\", name, out, cap);
+    return n_path_join(n_folder(), name, out, cap);
 }
 
 const char *n_path_name(const char *path) {
@@ -774,13 +710,8 @@ n_result n_path_to_url(const char *path, char *out, size_t cap) {
     return (n_result)used;
 }
 
-static const char *complete_setting(const char *name) {
-    const char *s = getenv(name);
-    return s && n_path_is_complete(s) ? s : "C:\\";
-}
-
-const char *n_user_folder(void) { return complete_setting("USERFOLDER"); }
-const char *n_temp_folder(void) { return complete_setting("TEMP"); }
+const char *n_user_folder(void) { return start_info->user_folder; }
+const char *n_temp_folder(void) { return start_info->temp_folder; }
 
 static n_result folder_ready(const char *path) {
     n_result r = n_folder_create(path);
@@ -803,23 +734,16 @@ n_result n_folder_set(const char *name) {
     r = n_entry_info(full, &e);
     if (r < 0) return r;
     if (e.kind != N_KIND_FOLDER) return -N_ERR_NOT_FOLDER;
-    return setting_set("FOLDER", full) < 0 ? -N_ERR_NO_MEMORY : 0;
+    return folder_keep(full) < 0 ? -N_ERR_NO_MEMORY : 0;
 }
 
 bool n_terminal(n_handle h) {
-    const char *s = getenv("TERMINAL");
-    while (s && *s) {
-        char *end;
-        long v = strtol(s, &end, 10);
-        if (end == s) {
-            s++;
-            continue;
-        }
-        if (v == h) return true;
-        s = end;
-    }
+    for (uint32_t i = 0; i < start_info->terminal_count; i++)
+        if (start_info->terminals[i] == h) return true;
     return false;
 }
+
+n_handle n_interrupts(void) { return start_info->interrupts ? start_info->interrupts : -N_ERR_NOT_FOUND; }
 
 /* ---- startup / exit ---- */
 void __stdio_init(void);
@@ -911,8 +835,11 @@ void __libc_init(void) {
     tls_initialized = 1;
     __stdio_init();
 }
-void __libc_start(int argc, char **argv, char **settings) {
-    if (settings) n_settings = settings;
+void __libc_start(int argc, char **argv, const struct n_start *start) {
+    if (start) {
+        start_info = start;
+        if (start->environment) __libc_environment = start->environment;
+    }
     __libc_init();
     /* Weak symbols also keep libc usable by the in-OS C compiler, whose link
        path need not supply these sections. Empty arrays are a no-op for C. */

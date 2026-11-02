@@ -385,28 +385,6 @@ function run(options) {
     return new App(options);
 }
 
-/* What desktop.get(), modes() and sound() report is kept by the part of the system that applies
-   it (the desktop, the display modes, the sound), which says when it changed: the program watches
-   the screen and the sound (js.c's systemWatch), and listeners hear which changed, whoever changed
-   it. */
-const systemListeners = new Set();
-internal.systemChanged = (screen, sound) => {
-    const changed = Object.freeze([...(screen ? ['screen'] : []), ...(sound ? ['sound'] : [])]);
-    if (!changed.length) return;
-    for (const listener of [...systemListeners]) {
-        try { listener(changed); }
-        catch (e) { internal.reportError?.(e); }
-    }
-};
-function watchSystem(listener) {
-    if (typeof listener !== 'function') throw new TypeError('desktop.watch() needs a function');
-    if (!systemListeners.size && !host.systemWatch(true)) throw new Error('the system does not tell of changes');
-    systemListeners.add(listener);
-    return () => {
-        if (systemListeners.delete(listener) && !systemListeners.size) host.systemWatch(false);
-    };
-}
-
 internal.ui = Object.freeze({
     run, theme, mix, withAlpha,
     column, row, scroll, card, text, heading, title, caption, button, toggle, checkbox, slider, segmented,

@@ -5,21 +5,18 @@
    read/write/edit files, list directories, fetch URLs. Everything it builds lives on the
    one disk, C:; its own files are in its data folder, C:\Users\<name>\AppData\Agent.
 
-   usage: agent [-r] [-m model] [-c config] [task...]
+   usage: agent [-r] [task...]
      no task  interactive session (type /help inside)
      task     run that one task, then exit
      -r       resume the previous session (AppData\Agent\session.json)
 
-   Configuration lives in AppData\Agent\agent.conf (key=value lines):
-     endpoint=https://hyper.charm.land/v1
-     model=glm-5.3-flash
-     api_key=...            (never shown; also asked for on first run)
-     max_tokens=16384       reasoning=low|high|max   show_thinking=0|1   context_limit=200000 */
+   接続先、モデル、鍵などはプログラムの scope の設定（nocturne_settings.h）で、settings が持つ。 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "nocturne.h"
+#include "nocturne_settings.h"
 #include "http.h"
 #include "json.h"
 #include "png.h"
@@ -27,7 +24,7 @@
 #define SYSTEM_PATH  "C:\\Nocturne\\Agent\\system.md"
 
 /* the agent's own files, in its data folder (n_app_data_folder): set once by agent_files */
-static char conf_path[1024], session_path[1024], notes_path[1024];
+static char session_path[1024], notes_path[1024];
 
 #define TOOL_OUT_MAX  (24 * 1024) /* bytes of tool output the model sees */
 #define MAX_STEPS     60          /* model calls per task before asking to continue */
@@ -131,7 +128,6 @@ static int write_text(const char *name, const char *data, size_t len) {
 static void agent_files(void) {
     char dir[1024];
     if (n_app_data_folder("Agent", dir, sizeof dir) < 0) strlcpy(dir, n_user_folder(), sizeof dir);
-    n_path_join(dir, "agent.conf", conf_path, sizeof conf_path);
     n_path_join(dir, "session.json", session_path, sizeof session_path);
     n_path_join(dir, "NOTES.md", notes_path, sizeof notes_path);
 }
@@ -156,49 +152,62 @@ static size_t strip_ansi(char *s, size_t n) {
 
 /* ---------------------------------------------------------------- configuration */
 
-static void conf_load(const char *path) {
-    char *text = read_text(path, NULL);
-    if (!text) return;
-    char *save;
-    for (char *line = strtok_r(text, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-        while (*line == ' ' || *line == '\t') line++;
-        if (*line == '#' || !*line) continue;
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq = 0;
-        char *k = line, *v = eq + 1;
-        for (char *e = eq - 1; e >= k && (*e == ' ' || *e == '\t'); e--) *e = 0;
-        while (*v == ' ' || *v == '\t') v++;
-        size_t vl = strlen(v);
-        while (vl && (v[vl - 1] == '\r' || v[vl - 1] == ' ')) v[--vl] = 0;
-        if (!strcmp(k, "endpoint")) strlcpy(cf.endpoint, v, sizeof cf.endpoint);
-        else if (!strcmp(k, "model")) strlcpy(cf.model, v, sizeof cf.model);
-        else if (!strcmp(k, "api_key")) strlcpy(cf.key, v, sizeof cf.key);
-        else if (!strcmp(k, "reasoning")) strlcpy(cf.reasoning, v, sizeof cf.reasoning);
-        else if (!strcmp(k, "max_tokens")) cf.max_tokens = atoi(v);
-        else if (!strcmp(k, "context_limit")) cf.context_limit = atol(v);
-        else if (!strcmp(k, "show_thinking")) cf.show_thinking = atoi(v) != 0;
-        else if (!strcmp(k, "vision")) cf.vision = atoi(v) != 0;
+enum {
+    KEY_ENDPOINT, KEY_MODEL, KEY_API_KEY, KEY_REASONING, KEY_MAX_TOKENS, KEY_CONTEXT_LIMIT, KEY_SHOW_THINKING, KEY_VISION
+};
+#define STRING_KEY(k, nm, lb, most, how) \
+    {.domain = N_DOMAIN_PROGRAM, .key = k, .type = N_SETTING_STRING, .scope = N_SCOPE_PROGRAM, .apply = N_APPLY_NONE, \
+     .flags = how, .max = most, .name = nm, .label = lb}
+static const struct n_setting_decl declarations[] = {
+    STRING_KEY(KEY_ENDPOINT, "agent.endpoint", "接続先", sizeof cf.endpoint - 1, 0),
+    STRING_KEY(KEY_MODEL, "agent.model", "モデル", sizeof cf.model - 1, 0),
+    STRING_KEY(KEY_API_KEY, "agent.api-key", "API の鍵", sizeof cf.key - 1, N_SETTING_DECL_SECRET),
+    STRING_KEY(KEY_REASONING, "agent.reasoning", "推論の強さ", sizeof cf.reasoning - 1, 0),
+    {.domain = N_DOMAIN_PROGRAM, .key = KEY_MAX_TOKENS, .type = N_SETTING_INT, .scope = N_SCOPE_PROGRAM, .apply = N_APPLY_NONE,
+     .min = 1, .max = INT32_MAX, .fallback = 16384, .name = "agent.max-tokens", .label = "一度の応答の上限"},
+    {.domain = N_DOMAIN_PROGRAM, .key = KEY_CONTEXT_LIMIT, .type = N_SETTING_INT, .scope = N_SCOPE_PROGRAM, .apply = N_APPLY_NONE,
+     .min = 1, .max = INT32_MAX, .fallback = 200000, .name = "agent.context-limit", .label = "文脈の上限"},
+    {.domain = N_DOMAIN_PROGRAM, .key = KEY_SHOW_THINKING, .type = N_SETTING_BOOL, .scope = N_SCOPE_PROGRAM,
+     .apply = N_APPLY_NONE, .max = 1, .name = "agent.show-thinking", .label = "推論を見せる"},
+    {.domain = N_DOMAIN_PROGRAM, .key = KEY_VISION, .type = N_SETTING_BOOL, .scope = N_SCOPE_PROGRAM, .apply = N_APPLY_NONE,
+     .max = 1, .name = "agent.vision", .label = "画像を渡す"},
+};
+
+/* 文字列の設定を読む。値が無いか読めなければ今のまま。 */
+static void conf_string(uint32_t key, char *out, size_t cap) {
+    char text[1024];
+    n_result n = n_setting_get(n_setting_of_program(key), text, sizeof text - 1);
+    if (n <= 0) return;
+    text[n] = 0;
+    strlcpy(out, text, cap);
+    memset(text, 0, sizeof text);
+}
+
+static void conf_load(void) {
+    uint32_t reason = N_SETTING_OK;
+    n_result r = n_setting_declare(declarations, sizeof declarations / sizeof *declarations, &reason);
+    if (r < 0) {
+        say(C_ERR "settings: %s" C_RESET "\n", n_result_text(r));
+        return;
     }
-    memset(text, 0, strlen(text));
-    free(text);
+    int32_t v;
+    conf_string(KEY_ENDPOINT, cf.endpoint, sizeof cf.endpoint);
+    conf_string(KEY_MODEL, cf.model, sizeof cf.model);
+    conf_string(KEY_API_KEY, cf.key, sizeof cf.key);
+    conf_string(KEY_REASONING, cf.reasoning, sizeof cf.reasoning);
+    if (n_setting_get_int(n_setting_of_program(KEY_MAX_TOKENS), &v) >= 0) cf.max_tokens = v;
+    if (n_setting_get_int(n_setting_of_program(KEY_CONTEXT_LIMIT), &v) >= 0) cf.context_limit = v;
+    if (n_setting_get_int(n_setting_of_program(KEY_SHOW_THINKING), &v) >= 0) cf.show_thinking = v != 0;
+    if (n_setting_get_int(n_setting_of_program(KEY_VISION), &v) >= 0) cf.vision = v != 0;
     size_t el = strlen(cf.endpoint);
     while (el && cf.endpoint[el - 1] == '/') cf.endpoint[--el] = 0;
 }
 
-static void conf_save(const char *path) {
-    struct jbuf b;
-    jb_init(&b);
-    jb_printf(&b,
-              "# Nocturne agent settings\n"
-              "endpoint=%s\nmodel=%s\napi_key=%s\nmax_tokens=%d\ncontext_limit=%ld\nshow_thinking=%d\nvision=%d\n",
-              cf.endpoint, cf.model, cf.key, cf.max_tokens, cf.context_limit, cf.show_thinking ? 1 : 0,
-              cf.vision ? 1 : 0);
-    if (cf.reasoning[0]) jb_printf(&b, "reasoning=%s\n", cf.reasoning);
-    if (!b.oom && write_text(path, b.s, b.len) == 0) say(C_DIM "saved settings to %s" C_RESET "\n", path);
-    else say(C_ERR "could not write %s: %s" C_RESET "\n", path, n_result_text(fs_error));
-    memset(b.s, 0, b.len);
-    jb_free(&b);
+/* 文字列の設定を一つ保存する。 */
+static void conf_save_string(uint32_t key, const char *value) {
+    uint32_t reason = N_SETTING_OK;
+    n_result r = n_setting_set(n_setting_of_program(key), value, strlen(value), &reason);
+    if (r < 0) say(C_ERR "settings: %s (%u)" C_RESET "\n", n_result_text(r), reason);
 }
 
 /* ---------------------------------------------------------------- conversation */
@@ -440,12 +449,9 @@ static void tool_run(struct json *args, struct jbuf *out) {
     }
     n_handle_close(input[1]); /* the command finds its input already at the end */
     /* the command runs in the agent's folder; its output and log both come back here */
-    char folder[1032] = "FOLDER=";
-    if (n_path_complete(".", folder + 7, sizeof folder - 7) < 0) strlcpy(folder + 7, "C:\\", sizeof folder - 7);
-    const char *arguments[] = {"sh", "-c", cmd}, *settings[] = {folder};
+    const char *arguments[] = {"sh", "-c", cmd};
     int32_t handles[] = {input[0], output[1], output[1]};
-    struct n_launch launch = {.arguments = arguments, .settings = settings, .handles = handles,
-                              .argument_count = 3, .setting_count = 1, .handle_count = 3};
+    struct n_launch launch = {.arguments = arguments, .handles = handles, .argument_count = 3, .handle_count = 3};
     n_handle app = n_app_launch(N_FOLDER_SYSTEM "\\sh", &launch);
     n_handle_close(input[0]);
     n_handle_close(output[1]);
@@ -1162,7 +1168,7 @@ static void ask_key(void) {
     strlcpy(cf.key, k, sizeof cf.key);
     for (char *p = cf.key + strlen(cf.key); p > cf.key && p[-1] == ' ';) *--p = 0;
     memset(key, 0, sizeof key);
-    conf_save(conf_path);
+    conf_save_string(KEY_API_KEY, cf.key);
 }
 
 static void help(void) {
@@ -1213,7 +1219,7 @@ static bool command(const char *line) {
         while (*m == ' ') m++;
         if (*m) {
             strlcpy(cf.model, m, sizeof cf.model);
-            conf_save(conf_path);
+            conf_save_string(KEY_MODEL, cf.model);
         }
         say("model: %s\n", cf.model);
     } else if (!strcmp(line, "/models")) list_models();
@@ -1235,28 +1241,24 @@ static bool command(const char *line) {
 
 int main(int argc, char **argv) {
     agent_files();
-    const char *config = conf_path, *model = NULL;
     bool resume = false;
     static char task[8192];
     size_t tl = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-r")) resume = true;
-        else if (!strcmp(argv[i], "-c") && i + 1 < argc) config = argv[++i];
-        else if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            say("usage: agent [-r] [-m model] [-c config] [task...]\n");
+            say("usage: agent [-r] [task...]\n");
             return 0;
         } else {
             int n = snprintf(task + tl, sizeof task - tl, "%s%s", tl ? " " : "", argv[i]);
             if (n > 0 && tl + n < sizeof task) tl += n;
         }
     }
-    conf_load(config);
-    if (model) strlcpy(cf.model, model, sizeof cf.model);
+    conf_load();
 
     if (!cf.key[0]) {
         if (!n_terminal(0)) {
-            fprintf(stderr, "agent: no api_key in %s\n", config);
+            fprintf(stderr, "agent: no API key in the settings\n");
             return 1;
         }
         ask_key();

@@ -21,8 +21,6 @@
         is not signed) and a synthetic network adapter on the "Default Switch" for NAT internet access,
       * selects the Hyper-V socket transport for the Enhanced Session and turns Enhanced Session Mode
         on for the host if it is off,
-      * optionally stores an AI provider key for the agent program in the user's
-        AppData\Agent\agent.conf (-ApiKeyFile, scripts\setkey.py),
       * routes COM1 to the named pipe \\.\pipe\<name>-com1 (kernel log),
       * starts the VM and opens a VMConnect window.
 
@@ -40,7 +38,6 @@
     .\hyperv.ps1 -Iso            # boot the live system build\nocturne.iso on the virtual DVD drive instead of the disk
                                  # (its C: is in memory and its changes go with it)
 .EXAMPLE
-    .\hyperv.ps1 -Update -ApiKeyFile C:\keys\llm.txt   # also store an API key for `agent`
 .EXAMPLE
     .\hyperv.ps1 -Remove -DeleteDisk   # delete the VM and its disk
 #>
@@ -171,12 +168,6 @@ function Write-Disk {
         }
         else {
             Invoke-Build 'bash scripts/mkimage.sh --update "$NOCTURNE_WORK"'
-        }
-        if ($ApiKeyFile) {
-            $env:NOCTURNE_KEYFILE = (Resolve-Path $ApiKeyFile).Path
-            $env:NOCTURNE_ENDPOINT = $Endpoint
-            $env:NOCTURNE_MODEL = $Model
-            Invoke-Build 'python scripts/setkey.py "$NOCTURNE_KEYFILE" --endpoint "$NOCTURNE_ENDPOINT" --model "$NOCTURNE_MODEL" --img "$NOCTURNE_WORK"'
         }
         Invoke-Build 'bash scripts/mkimage.sh --hyperv "$NOCTURNE_WORK" "$NOCTURNE_NEW"'
         # copied over the old disk, which keeps the access Hyper-V gave the VM to it

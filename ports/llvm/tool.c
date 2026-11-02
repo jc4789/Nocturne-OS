@@ -24,10 +24,11 @@ int main(int argc, char **argv) {
     for (int i = 0; i < argc; i++) arguments[i + 1] = argv[i];
     int32_t handles[3];
     for (int i = 0; i < 3; i++) handles[i] = n_handle_kind(i) >= 0 ? i : -1;
-    uint32_t settings = 0;
-    while (n_settings[settings]) settings++;
-    struct n_launch launch = {.arguments = arguments, .settings = (const char *const *)n_settings,
-                              .handles = handles, .argument_count = (uint32_t)argc + 1, .setting_count = settings,
+    extern char *const *__libc_environment;
+    uint32_t environment = 0;
+    while (__libc_environment[environment]) environment++;
+    struct n_launch launch = {.arguments = arguments, .environment = (const char *const *)__libc_environment,
+                              .handles = handles, .argument_count = (uint32_t)argc + 1, .environment_count = environment,
                               .handle_count = 3};
     n_handle app = n_app_launch(llvm, &launch);
     if (app < 0) {

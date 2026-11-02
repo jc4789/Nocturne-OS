@@ -168,11 +168,10 @@ static void run_languages(void){
 /* The test runs again as an app launched with the test user's folder as its USERFOLDER (the
    launch setting is how an app gets one), with this one's input and output. */
 static int run_as_test_user(const char *self,const char *user){
-    char path[1024],setting[1100];
+    char path[1024];
     if(n_path_complete(self,path,sizeof path)<0)return -1;
-    snprintf(setting,sizeof setting,"USERFOLDER=%s",user);
-    const char *args[]={self},*settings[]={setting};int32_t handles[3]={0,1,2};
-    struct n_launch l={.arguments=args,.settings=settings,.handles=handles,.argument_count=1,.setting_count=1,.handle_count=3};
+    const char *args[]={self};int32_t handles[3]={0,1,2};
+    struct n_launch l={.arguments=args,.handles=handles,.argument_count=1,.handle_count=3,.user_folder=user};
     n_handle app=n_app_launch(path,&l);int status=1;
     if(app<0||n_app_result(app,-1,&status)<0)return -1;
     n_handle_close(app);return status;

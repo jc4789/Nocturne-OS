@@ -23,6 +23,9 @@ n_result n_setting_get(struct n_setting_id id, void *out, size_t cap);
 n_result n_setting_get_int(struct n_setting_id id, int32_t *out);
 n_result n_setting_set(struct n_setting_id id, const void *value, size_t length, uint32_t *reason);
 n_result n_setting_set_int(struct n_setting_id id, int32_t value, uint32_t *reason);
+/* 今の値が expected のときだけ書く。違えば -N_ERR_BUSY（N_SETTING_NOT_THE_SAME）。 */
+n_result n_setting_set_if(struct n_setting_id id, const void *expected, size_t expected_length, const void *value,
+                          size_t length, uint32_t *reason);
 
 /* 期限つきの試し。revert_to は保存された値が無いときに戻す先（NULL 可）。 */
 n_result n_setting_try(struct n_setting_id id, const void *value, size_t length, const void *revert_to, size_t revert_length,

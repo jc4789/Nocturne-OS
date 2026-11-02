@@ -358,7 +358,7 @@ static JSValue h_complete(JSContext *c, JSValueConst this, int argc, JSValueCons
     return JS_NewString(ctx, path);
 }
 
-/* The app's folder (the setting FOLDER), as a complete path. */
+/* The app's folder, as a complete path. */
 static JSValue h_cwd(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
     char path[PATH_CAP];
     n_result r = n_path_complete(".", path, sizeof path);
@@ -377,67 +377,6 @@ static JSValue h_chdir(JSContext *c, JSValueConst this, int argc, JSValueConst *
     return r < 0 ? throw_result("change folder", path, r) : JS_UNDEFINED;
 }
 
-/* ---------------------------------------------------------------- settings */
-
-/* Settings this app changed: a launch setting can be removed only here (getenv
-   keeps reading the launch list), and run() passes the result on. */
-struct setting { char *name, *value; struct setting *next; };
-static struct setting *settings;
-
-static struct setting *setting_find(const char *name) {
-    for (struct setting *s = settings; s; s = s->next)
-        if (!strcmp(s->name, name)) return s;
-    return NULL;
-}
-
-static const char *setting_get(const char *name) {
-    struct setting *s = setting_find(name);
-    return s ? s->value : getenv(name);
-}
-
-static bool setting_put(const char *name, const char *value) {
-    struct setting *s = setting_find(name);
-    char *v = value ? strdup(value) : NULL;
-    if (value && !v) return false;
-    if (!s) {
-        s = calloc(1, sizeof *s);
-        if (!s || !(s->name = strdup(name))) { free(s); free(v); return false; }
-        s->next = settings;
-        settings = s;
-    }
-    free(s->value);
-    s->value = v;
-    return true;
-}
-
-static JSValue h_get_setting(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    const char *name = JS_ToCString(ctx, argv[0]);
-    if (!name) return JS_EXCEPTION;
-    const char *v = setting_get(name);
-    JS_FreeCString(ctx, name);
-    return v ? JS_NewString(ctx, v) : JS_UNDEFINED;
-}
-
-static JSValue h_set_setting(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    const char *name = JS_ToCString(ctx, argv[0]);
-    const char *value = argc > 1 ? JS_ToCString(ctx, argv[1]) : NULL;
-    JSValue r = JS_UNDEFINED;
-    if (!name || (argc > 1 && !value)) r = JS_EXCEPTION;
-    else if (!*name || strchr(name, '=')) r = JS_ThrowTypeError(ctx, "invalid setting name '%s'", name);
-    else if (!setting_put(name, value)) r = JS_ThrowOutOfMemory(ctx);
-    if (name) JS_FreeCString(ctx, name);
-    if (value) JS_FreeCString(ctx, value);
-    return r;
-}
-
-static JSValue h_remove_setting(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    const char *name = JS_ToCString(ctx, argv[0]);
-    if (!name) return JS_EXCEPTION;
-    bool ok = setting_put(name, NULL);
-    JS_FreeCString(ctx, name);
-    return ok ? JS_UNDEFINED : JS_ThrowOutOfMemory(ctx);
-}
-
 /* ---------------------------------------------------------------- other apps */
 
 static void free_strings(char **v, uint32_t n) {
@@ -445,8 +384,7 @@ static void free_strings(char **v, uint32_t n) {
     free(v);
 }
 
-/* Runs a program with this app's input, output, log, folder and settings and
-   waits for it; returns its result. */
+/* Runs a program with this app's input, output, log and folder and waits for it; returns its result. */
 static JSValue h_run(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
     const char *program = JS_ToCString(ctx, argv[0]);
     if (!program) return JS_EXCEPTION;
@@ -474,54 +412,20 @@ static JSValue h_run(JSContext *c, JSValueConst this, int argc, JSValueConst *ar
         }
     }
     JS_FreeCString(ctx, program);
-    /* The launch settings as this app sees them now, then the ones it added. */
-    uint32_t nlaunch = 0, nset = 0;
-    while (n_settings[nlaunch]) nlaunch++;
-    for (struct setting *s = settings; s; s = s->next) nset++;
-    char **list = calloc(nlaunch + nset + 2, sizeof *list);
-    uint32_t n = 0;
-    bool folder = false;
-    for (uint32_t i = 0; list && i < nlaunch; i++) {
-        const char *eq = strchr(n_settings[i], '=');
-        if (!eq) continue;
-        size_t nl = (size_t)(eq - n_settings[i]);
-        char name[256];
-        if (nl >= sizeof name) continue;
-        memcpy(name, n_settings[i], nl);
-        name[nl] = 0;
-        if (setting_find(name)) continue;
-        if (!strcmp(name, "FOLDER")) continue;
-        list[n++] = strdup(n_settings[i]);
-    }
-    for (struct setting *s = settings; list && s; s = s->next) {
-        if (!s->value || !strcmp(s->name, "FOLDER")) continue;
-        size_t size = strlen(s->name) + strlen(s->value) + 2;
-        if ((list[n] = malloc(size))) snprintf(list[n++], size, "%s=%s", s->name, s->value);
-    }
-    if (list) {
-        const char *f = getenv("FOLDER");
-        if (!f || !n_path_is_complete(f)) f = "C:\\";
-        size_t size = strlen(f) + 8;
-        if ((list[n] = malloc(size))) snprintf(list[n++], size, "FOLDER=%s", f), folder = true;
-    }
-    bool complete = args && list && folder;
+    bool complete = args;
     for (uint32_t i = 0; complete && i < nargs; i++) complete = args[i] != NULL;
-    for (uint32_t i = 0; complete && i < n; i++) complete = list[i] != NULL;
     if (!complete) {
         if (args) free_strings(args, nargs);
-        if (list) free_strings(list, n);
         return JS_ThrowOutOfMemory(ctx);
     }
     int32_t handles[3];
     for (int i = 0; i < 3; i++) handles[i] = n_handle_kind(i) >= 0 ? i : -1;
-    struct n_launch launch = {.arguments = (const char *const *)args, .settings = (const char *const *)list,
-                              .handles = handles, .argument_count = nargs, .setting_count = n,
+    struct n_launch launch = {.arguments = (const char *const *)args, .handles = handles, .argument_count = nargs,
                               .handle_count = 3};
     fflush(stdout);
     fflush(stderr);
     n_handle app = n_app_launch(full, &launch);
     free_strings(args, nargs);
-    free_strings(list, n);
     if (app < 0) return throw_result("run", full, app);
     int status = 0;
     n_result r = n_app_result(app, N_CLOCK_NEVER, &status);
@@ -873,140 +777,6 @@ static JSValue h_ui_launch(JSContext *c, JSValueConst this, int argc, JSValueCon
     return JS_NewBool(ctx, r >= 0);
 }
 
-/* The desktop: its size and the compositor's settings (struct desktop_settings). */
-static JSValue h_desktop(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    struct desktop_settings s;
-    if (__syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_SETTINGS_GET, 0, 0) != 0) return JS_NULL;
-    JSValue o = JS_NewObject(ctx);
-    int sw = 0, sh = 0;
-    struct n_sysinfo si;
-    if (sysinfo(&si) == 0) sw = (int)si.fb_w, sh = (int)si.fb_h;
-    else screen_size(&sw, &sh);
-    JS_SetPropertyStr(ctx, o, "screenWidth", JS_NewInt32(ctx, sw));
-    JS_SetPropertyStr(ctx, o, "screenHeight", JS_NewInt32(ctx, sh));
-    JS_SetPropertyStr(ctx, o, "pointerSpeed", JS_NewInt32(ctx, s.pointer_speed));
-    JS_SetPropertyStr(ctx, o, "smoothGradients", JS_NewBool(ctx, s.smooth_gradients));
-    JS_SetPropertyStr(ctx, o, "smoothGradientsAvailable", JS_NewBool(ctx, s.smooth_gradients_available));
-    return o;
-}
-
-/* (pointer speed, smooth gradients): whether the desktop took them */
-static JSValue h_desktop_set(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    struct desktop_settings s;
-    if (__syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_SETTINGS_GET, 0, 0) != 0) return JS_FALSE;
-    int32_t speed = 0;
-    JS_ToInt32(ctx, &speed, argv[0]);
-    if (speed < -2 || speed > 2) return JS_FALSE;
-    s.pointer_speed = (int8_t)speed;
-    s.smooth_gradients = (uint8_t)JS_ToBool(ctx, argv[1]);
-    return JS_NewBool(ctx, __syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_SETTINGS_SET, 0, 0) == 0);
-}
-
-/* A screen's monitor and its modes (struct screen_modes): what the display driver offers, the one
-   shown, the one the system asks for and the trial. The screen is the call's argument (0 without
-   one: the one with the taskbar). */
-static JSValue screen_mode_value(const struct n_screen_mode *m) {
-    if (!m->width) return JS_NULL;
-    JSValue o = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, o, "width", JS_NewUint32(ctx, m->width));
-    JS_SetPropertyStr(ctx, o, "height", JS_NewUint32(ctx, m->height));
-    JS_SetPropertyStr(ctx, o, "refreshMillihertz", JS_NewUint32(ctx, m->refresh_mhz));
-    JS_SetPropertyStr(ctx, o, "preferred", JS_NewBool(ctx, m->flags & N_SCREEN_MODE_PREFERRED));
-    JS_SetPropertyStr(ctx, o, "variableRefresh", JS_NewBool(ctx, m->flags & N_SCREEN_MODE_VRR));
-    return o;
-}
-static uint32_t screen_argument(int argc, JSValueConst *argv, int at) {
-    uint32_t screen = 0;
-    if (argc > at && !JS_IsUndefined(argv[at])) JS_ToUint32(ctx, &screen, argv[at]);
-    return screen > 0xFFFFFF ? 0xFFFFFF : screen;
-}
-static JSValue h_screen_modes(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    uint32_t screen = screen_argument(argc, argv, 0);
-    struct screen_modes *s = malloc(sizeof *s);
-    if (!s) return JS_NULL;
-    if (__syscall(SYS_SCREEN_INFO, (long)s, sizeof *s, SCREEN_MODES_GET | (uint64_t)screen << 8, 0, 0) != 0) {
-        free(s);
-        return JS_NULL;
-    }
-    s->offered.monitor[sizeof s->offered.monitor - 1] = s->offered.name[sizeof s->offered.name - 1] = 0;
-    JSValue o = JS_NewObject(ctx), modes = JS_NewArray(ctx);
-    uint32_t count = s->offered.count < N_SCREEN_MODES_MAX ? s->offered.count : N_SCREEN_MODES_MAX;
-    for (uint32_t i = 0; i < count; i++) JS_SetPropertyUint32(ctx, modes, i, screen_mode_value(&s->offered.modes[i]));
-    static const char *const sources[] = {
-        [SCREEN_SOURCE_FIRMWARE] = "firmware",
-        [SCREEN_SOURCE_DRIVER] = "driver",
-        [SCREEN_SOURCE_HANDED_BACK] = "handedBack",
-        [SCREEN_SOURCE_DRIVER_STOPPED] = "driverStopped",
-        [SCREEN_SOURCE_REMOTE] = "remote",
-    };
-    JS_SetPropertyStr(ctx, o, "source", JS_NewString(ctx, s->source < sizeof sources / sizeof *sources
-                                                              ? sources[s->source] : "firmware"));
-    JS_SetPropertyStr(ctx, o, "screen", JS_NewUint32(ctx, screen));
-    JS_SetPropertyStr(ctx, o, "screens", JS_NewUint32(ctx, s->screens));
-    JS_SetPropertyStr(ctx, o, "variableRefreshMinMillihertz", JS_NewUint32(ctx, s->offered.vrr_min_mhz));
-    JS_SetPropertyStr(ctx, o, "monitor", JS_NewString(ctx, s->offered.monitor));
-    JS_SetPropertyStr(ctx, o, "name", JS_NewString(ctx, s->offered.name));
-    JS_SetPropertyStr(ctx, o, "modes", modes);
-    JS_SetPropertyStr(ctx, o, "shown", screen_mode_value(&s->offered.shown));
-    JS_SetPropertyStr(ctx, o, "wanted", screen_mode_value(&s->wanted));
-    JS_SetPropertyStr(ctx, o, "trialMs", JS_NewUint32(ctx, s->trial_ms));
-    JS_SetPropertyStr(ctx, o, "refused", JS_NewBool(ctx, s->refused));
-    JS_SetPropertyStr(ctx, o, "chosen", screen_mode_value(&s->chosen));
-    free(s);
-    return o;
-}
-
-/* (how: "try", "keep" or "back"; width, height, refresh in mHz; the screen, 0 without it):
-   SCREEN_MODE_SET; whether the system took it */
-static JSValue h_screen_mode_set(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    static const char *const hows[] = {[SCREEN_MODE_TRY] = "try", [SCREEN_MODE_KEEP] = "keep", [SCREEN_MODE_BACK] = "back"};
-    struct screen_mode_set s = {0};
-    const char *how = JS_ToCString(ctx, argv[0]);
-    if (!how) return JS_EXCEPTION;
-    for (uint32_t i = SCREEN_MODE_TRY; i < sizeof hows / sizeof *hows; i++)
-        if (!strcmp(how, hows[i])) s.how = i;
-    JS_FreeCString(ctx, how);
-    if (!s.how) return JS_FALSE;
-    JS_ToUint32(ctx, &s.mode.width, argv[1]);
-    JS_ToUint32(ctx, &s.mode.height, argv[2]);
-    JS_ToUint32(ctx, &s.mode.refresh_mhz, argv[3]);
-    uint64_t op = SCREEN_MODE_SET | (uint64_t)screen_argument(argc, argv, 4) << 8;
-    return JS_NewBool(ctx, __syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, op, 0, 0) == 0);
-}
-
-/* What desktop, screenModes and sound report, watched where it is kept (display_abi.h's
-   SCREEN_WATCH, n_audio_output_watch) for internal.systemChanged. Both watches sit in the
-   windows' event queue, each with its own token, so that a change ends the event loop's wait as a
-   window's event does and the loop knows which one to take (n_watch_take). */
-#define SCREEN_TOKEN (1ull << 40)
-#define SOUND_TOKEN (SCREEN_TOKEN + 1)
-static n_handle screen_watch = -1, sound_watch = -1; /* both open, or neither */
-static bool screen_signal, sound_signal;
-
-/* (on): whether the program now hears of changes */
-static JSValue h_system_watch(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    bool on = JS_ToBool(ctx, argv[0]);
-    if (on && screen_watch < 0) {
-        struct ui_session *s = ui_get();
-        if (!s) return JS_FALSE;
-        n_handle q = ui_session_queue(s), screen = n_screen_watch(), sound = n_audio_output_watch();
-        if (screen < 0 || sound < 0 || n_events_watch(q, screen, N_EVENT_RECEIVABLE, SCREEN_TOKEN) < 0 ||
-            n_events_watch(q, sound, N_EVENT_RECEIVABLE, SOUND_TOKEN) < 0) {
-            if (screen >= 0) n_handle_close(screen); /* a watch in the queue ends with its handle */
-            if (sound >= 0) n_handle_close(sound);
-            return JS_FALSE;
-        }
-        screen_watch = screen;
-        sound_watch = sound;
-    } else if (!on && screen_watch >= 0) {
-        n_handle_close(screen_watch);
-        n_handle_close(sound_watch);
-        screen_watch = sound_watch = -1;
-        screen_signal = sound_signal = false;
-    }
-    return JS_NewBool(ctx, screen_watch >= 0);
-}
-
 /* The computer: processor, memory, uptime, running tasks. */
 static JSValue h_system_info(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
     struct n_sysinfo si;
@@ -1029,30 +799,6 @@ static JSValue h_system_info(JSContext *c, JSValueConst this, int argc, JSValueC
     return o;
 }
 
-/* (volume, muted), each undefined to leave it as it is: the sound's way out (n_audio_output)
-   after, {device, volume, muted}, device null when nothing plays the sound; null on failure. */
-static JSValue h_sound(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    struct n_audio_output io = {0};
-    uint32_t set = 0;
-    if (argc > 0 && !JS_IsUndefined(argv[0])) {
-        int32_t v = 0;
-        JS_ToInt32(ctx, &v, argv[0]);
-        io.volume = v < 0 ? 0 : v > 100 ? 100 : v;
-        set |= N_AUDIO_SET_VOLUME;
-    }
-    if (argc > 1 && !JS_IsUndefined(argv[1])) {
-        io.muted = JS_ToBool(ctx, argv[1]) != 0;
-        set |= N_AUDIO_SET_MUTED;
-    }
-    if (n_audio_output(&io, set) < 0) return JS_NULL;
-    io.device[sizeof io.device - 1] = 0;
-    JSValue o = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, o, "device", io.device[0] ? JS_NewString(ctx, io.device) : JS_NULL);
-    JS_SetPropertyStr(ctx, o, "volume", JS_NewInt32(ctx, io.volume));
-    JS_SetPropertyStr(ctx, o, "muted", JS_NewBool(ctx, io.muted));
-    return o;
-}
-
 /* Hands the engine's events to js_ui.js, one at a time. */
 static void ui_deliver(void) {
     size_t n;
@@ -1069,37 +815,16 @@ static void ui_deliver(void) {
 
 static bool ui_open(void) { return ui && ui_session_open(ui); }
 
-/* Tells the program which of what the system reports changed since it last heard: the screen
-   (desktop, screenModes), the sound, or both. */
-static void deliver_system(void) {
-    if (screen_watch < 0 || (!screen_signal && !sound_signal)) return;
-    bool screen = screen_signal && n_watch_take(screen_watch) > 0;
-    bool sound = sound_signal && n_watch_take(sound_watch) > 0;
-    screen_signal = sound_signal = false;
-    if (!screen && !sound) return;
-    JSValue r = internal_call("systemChanged", 2, (JSValue[]){JS_NewBool(ctx, screen), JS_NewBool(ctx, sound)});
-    if (JS_IsException(r)) report_exception();
-    JS_FreeValue(ctx, r);
-    drain();
-}
-
-/* Waits up to ms for the windows, the engine's own timers or a change the system reports, then
-   hands on what came. While the system is watched, a window to draw now still looks (without
-   waiting) for a change that came, so that drawing does not hold it back. */
+/* Waits up to ms for the windows or the engine's own timers, then hands on what came. */
 static void wait_ui(int ms) {
     int t = ui_session_timeout(ui);
     if (t < 0 || (ms >= 0 && ms < t)) t = ms;
-    if (t != 0 || screen_watch >= 0) {
+    if (t != 0) {
         struct n_event ev[16];
-        n_result n = n_events_wait(ui_session_queue(ui), ev, 16, t < 0 ? N_CLOCK_NEVER : n_clock_after((uint64_t)t * N_NS_PER_MS));
-        for (n_result i = 0; i < n; i++) {
-            if (ev[i].token == SCREEN_TOKEN) screen_signal = true;
-            else if (ev[i].token == SOUND_TOKEN) sound_signal = true;
-        }
+        n_events_wait(ui_session_queue(ui), ev, 16, t < 0 ? N_CLOCK_NEVER : n_clock_after((uint64_t)t * N_NS_PER_MS));
     }
     ui_session_pump(ui);
     ui_deliver();
-    deliver_system();
 }
 
 /* ---------------------------------------------------------------- event loop */
@@ -1451,9 +1176,6 @@ static const JSCFunctionListEntry host_functions[] = {
     JS_CFUNC_DEF("cwd", 0, h_cwd),
     JS_CFUNC_DEF("tempFolder", 0, h_temp_folder),
     JS_CFUNC_DEF("chdir", 1, h_chdir),
-    JS_CFUNC_DEF("getSetting", 1, h_get_setting),
-    JS_CFUNC_DEF("setSetting", 2, h_set_setting),
-    JS_CFUNC_DEF("removeSetting", 1, h_remove_setting),
     JS_CFUNC_DEF("run", 2, h_run),
     JS_CFUNC_DEF("detectModule", 1, h_detect_module),
     JS_CFUNC_DEF("compileFunction", 2, h_compile_function),
@@ -1466,12 +1188,6 @@ static const JSCFunctionListEntry host_functions[] = {
     JS_CFUNC_DEF("uiSend", 1, h_ui_send),
     JS_CFUNC_DEF("uiRequest", 1, h_ui_request),
     JS_CFUNC_DEF("uiLaunch", 2, h_ui_launch),
-    JS_CFUNC_DEF("desktop", 0, h_desktop),
-    JS_CFUNC_DEF("desktopSet", 2, h_desktop_set),
-    JS_CFUNC_DEF("screenModes", 1, h_screen_modes),
-    JS_CFUNC_DEF("screenModeSet", 5, h_screen_mode_set),
-    JS_CFUNC_DEF("systemWatch", 1, h_system_watch),
-    JS_CFUNC_DEF("sound", 2, h_sound),
     JS_CFUNC_DEF("systemInfo", 0, h_system_info),
 };
 
