@@ -74,10 +74,6 @@ static void watches(void) {
     CHECK(ready(qs, 1000) && n_watch_take(screen) >= 1);
     CHECK(!ready(q, 200) && n_watch_take(loud) == 0);
 
-    /* each kept by its part, in its own document */
-    char line[64];
-    snprintf(line, sizeof line, "\nvolume=%d\n", v);
-    snprintf(line, sizeof line, "\npointer_speed=%d\n", speed);
 
     /* a watch closed is gone from the queue it was in */
     n_handle q2 = n_events_create(), gone = n_audio_output_watch();
@@ -87,11 +83,8 @@ static void watches(void) {
     CHECK(ready(q, 1000)); /* while the one still open hears it */
     n_handle_close(q2);
 
-    /* back as it was, and kept so */
     CHECK(set_volume(before.volume) == 0 && (!before.muted || set_muted(true) == 0));
     CHECK(set_pointer_speed(ds_before.pointer_speed) == 0);
-    snprintf(line, sizeof line, "\nvolume=%d\n", (int)before.volume);
-    snprintf(line, sizeof line, "\npointer_speed=%d\n", ds_before.pointer_speed);
 
     n_handle_close(loud);
     n_handle_close(screen);

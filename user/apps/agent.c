@@ -1160,7 +1160,7 @@ static void run_task(bool interactive) {
 static void ask_key(void) {
     say("No API key configured. The agent talks to an OpenAI-compatible endpoint:\n  %s (model %s)\n"
         "Paste the key with Ctrl+Shift+V. It is stored in %s and never shown.\n",
-        cf.endpoint, cf.model, conf_path);
+        cf.endpoint, cf.model);
     char key[512];
     if (readline("API key: ", key, sizeof key, RL_SECRET) <= 0) return;
     char *k = key;
