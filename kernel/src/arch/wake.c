@@ -125,7 +125,8 @@ void wake_resume_cpu(void) {
 
 bool wake_sleep(void (*enter)(void)) {
     if (!page) return false;
-    if (!fpu_storage && !(fpu_storage = kmalloc(fpu_storage_bytes()))) return false;
+    /* zeroed: XSAVES leaves the rest of the header as it is, and XRSTORS refuses it unless it is 0 */
+    if (!fpu_storage && !(fpu_storage = kzalloc(fpu_storage_bytes()))) return false;
     uint64_t fs = fs_base_read(), gs = user_gs_base_read();
     fpu_save(fpu_state_in(fpu_storage));
     vmm_leave();

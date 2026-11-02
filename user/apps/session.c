@@ -21,7 +21,7 @@ enum login_word { L_WELCOME, L_LOG_IN, L_FIRST_USER, L_NAME, L_PASSWORD, L_PASSW
 static const char *const login_words[][N_LANGUAGE_COUNT] = {
     [L_WELCOME] = {"Nocturne へようこそ", "Welcome to Nocturne"},
     [L_LOG_IN] = {"ログイン", "Log in"},
-    [L_FIRST_USER] = {"最初の利用者を作ります。この利用者が機械を管理します。", "Make the first user. This user manages the machine."},
+    [L_FIRST_USER] = {"最初の利用者（機械の管理者）を作ります。", "Make the first user. This user manages the machine."},
     [L_NAME] = {"名前", "Name"},
     [L_PASSWORD] = {"合言葉", "Password"},
     [L_PASSWORD_AGAIN] = {"合言葉をもう一度", "Password again"},
@@ -211,7 +211,7 @@ static void login_show(struct login *l) {
     ui_node(&m, "column"); ui_num(&m, "padding", 24); ui_num(&m, "gap", 12);
     ui_node(&m, "text"); ui_str(&m, "text", WORD(first_user ? L_WELCOME : L_LOG_IN)); ui_str(&m, "style", "heading"); ui_end(&m);
     if (first_user) {
-        ui_node(&m, "text"); ui_str(&m, "text", "Make the first user. This user administers the machine."); ui_num(&m, "wrap", 1); ui_end(&m);
+        ui_node(&m, "text"); ui_str(&m, "text", WORD(L_FIRST_USER)); ui_num(&m, "wrap", 1); ui_end(&m);
         l->name_node = ui_node(&m, "field"); ui_str(&m, "value", l->name); ui_str(&m, "placeholder", WORD(L_NAME)); ui_end(&m);
     } else {
         l->first_item = m.nodes;

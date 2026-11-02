@@ -1553,7 +1553,10 @@ int main(void) {
                 struct n_settings_changed c;
                 while (n_setting_watch_take(settings_watch, &c) >= 0) {
                     shown_changed(&c);
-                    if (c.id.domain == N_DOMAIN_LANGUAGE) language = n_language_now();
+                    if (c.id.domain == N_DOMAIN_LANGUAGE) {
+                        language = n_language_now();
+                        ui_window_title(ui, WINDOW, WORD(W_TITLE));
+                    }
                     if (c.id.domain == N_DOMAIN_DISPLAY) {
                         if (c.id.key == N_DISPLAY_MODE || c.id.key == N_DISPLAY_SCALE) {
                             if (c.what == N_SETTING_ON_TRIAL) {

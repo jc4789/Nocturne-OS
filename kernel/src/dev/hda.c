@@ -187,6 +187,8 @@ struct hda {
     uint16_t silent;   /* the addresses of codecs that stopped answering */
     uint16_t codec_present;
     uint16_t sense_due;
+    uint32_t answer;        /* `engine`: the answer to the verb last sent */
+    bool answered;          /* and whether it came */
 
     /* the sound layer's calls', one at a time (audio_output_ops), with what they do only ever after a
        power change seen in seen_gen */
@@ -352,10 +354,9 @@ static void link_stop(struct hda *h) {
     streams_halt(h);
 }
 
-/* engine held: what the RIRB holds. The answer to the verb being waited for in *answer, and true when
-   it is there; what pins announced is noted. */
-static bool rirb_take(struct hda *h, uint32_t *answer) {
-    bool got = false;
+/* engine held: what the RIRB holds. Whoever reads it, the waiting verb or the thread that looks for
+   what pins announced: a verb's answer is kept for the verb, and what pins announced is noted. */
+static void rirb_take(struct hda *h) {
     unsigned wp = read16(h, RIRBWP) & (h->rirb_entries - 1);
     /* A response in the count of RINTCNT stays due until this says it was seen, with or without an
        interrupt; a controller may send no more verbs meanwhile. */
@@ -367,12 +368,11 @@ static bool rirb_take(struct hda *h, uint32_t *answer) {
         uint64_t entry = h->rirb[at];
         unsigned extended = (unsigned)(entry >> 32);
         if (extended & 0x10) h->sense_due |= (uint16_t)(1u << (extended & 15));
-        else if (answer) {
-            *answer = (uint32_t)entry;
-            got = true;
+        else {
+            h->answer = (uint32_t)entry;
+            h->answered = true;
         }
     }
-    return got;
 }
 
 /* One verb (struct hda_link): written under `engine`, its answer polled for. */
@@ -383,6 +383,7 @@ static uint32_t link_verb(struct hda_link *link, unsigned codec, unsigned nid, u
     uint64_t f = spin_lock(&h->engine), gen = h->power_gen;
     bool sent = h->up && !(h->silent & (1u << codec));
     if (sent) {
+        h->answered = false;
         unsigned at = (h->corb_wp + 1) & (h->corb_entries - 1);
         h->corb[at] = (uint32_t)codec << 28 | (uint32_t)nid << 20 | command;
         iommu_cache_flush(&h->corb[at], sizeof h->corb[at]);
@@ -394,7 +395,9 @@ static uint32_t link_verb(struct hda_link *link, unsigned codec, unsigned nid, u
     for (uint64_t until = clock_after(VERB_NS); sent;) {
         f = spin_lock(&h->engine);
         bool gone = gen != h->power_gen;
-        bool got = !gone && rirb_take(h, &answer);
+        if (!gone) rirb_take(h);
+        bool got = !gone && h->answered;
+        if (got) answer = h->answer;
         announced = announced || h->sense_due;
         spin_unlock(&h->engine, f);
         if (got || gone) break;
@@ -775,7 +778,7 @@ static void hda_thread(void *arg) {
             }
             uint64_t f = spin_lock(&h->engine);
             if (h->up) {
-                rirb_take(h, NULL);
+                rirb_take(h);
                 if (!h->responses) { /* from now on they are few, and each may be a pin's */
                     write32(h, INTCTL, read32(h, INTCTL) | INT_CONTROLLER);
                     h->responses = true;
