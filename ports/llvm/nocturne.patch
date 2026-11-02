@@ -4688,7 +4688,7 @@ new file mode 100644
 index 00000000..c9410c28
 --- /dev/null
 +++ b/llvm/lib/Support/Nocturne/Program.inc
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,123 @@
 +//===- Nocturne/Program.inc - Nocturne Program Implementation --*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
