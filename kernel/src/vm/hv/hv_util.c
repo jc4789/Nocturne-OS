@@ -171,14 +171,13 @@ static bool auto_item(uint32_t index, const char **key, char *value, size_t n) {
                                        "OSMajorVersion", "OSMinorVersion", "OSVersion", "ProcessorArchitecture"};
     if (index >= ARRAY_SIZE(keys)) return false;
     *key = keys[index];
-    uint8_t mac[6];
-    uint32_t ip, mask;
+    uint32_t ip;
     value[0] = 0;
     switch (index) {
     case 0: strlcpy(value, "nocturne", n); break;
     case 1: strlcpy(value, "3.1", n); break;
     case 2:
-        if (net_adapter_info(0, mac, &ip, &mask) && ip) ipstr(value, n, ip);
+        if (netvsc_ip(&ip) && ip) ipstr(value, n, ip);
         break;
     case 3: break;
     case 4: strlcpy(value, OS_VERSION, n); break;
@@ -320,7 +319,11 @@ void hv_util_init(void) {
     char names[96] = "";
     for (size_t i = 0; i < ARRAY_SIZE(services); i++) {
         struct vmbus_channel *ch = vmbus_find(&services[i].type, 0);
-        if (!ch || vmbus_open(ch, 32 * 1024, 32 * 1024, util_callback, &services[i])) continue;
+        if (!ch) continue;
+        if (vmbus_open(ch, 32 * 1024, 32 * 1024, util_callback, &services[i])) {
+            hal_failed(&ch->hal, "hv_util", -N_ERR_IO);
+            continue;
+        }
         hal_bound(&ch->hal, "hv_util");
         if (names[0]) strlcat(names, ", ", sizeof names);
         strlcat(names, services[i].name, sizeof names);

@@ -444,7 +444,6 @@ n_handle n_power_events_watch(n_handle cap);
 n_result n_power_windows(n_handle cap, bool ask_to_close, char *top_title, size_t size);
 n_result n_power_say(n_handle cap, const struct n_power_state *state);
 n_handle n_power_windows_watch(n_handle cap);
-/* The count of PCI functions (at most max written), or a negative n_result. */
 /* 台帳（docs/hal.md）。n_hal_list は写した数でなく台帳の全部の数を返す。n_hal_snapshot は全部を malloc の記憶へ
    写し、数を返す。pcilist は PCI の機能だけを写し、写した数を返す。 */
 n_result n_hal_list(struct n_hal_device *out, size_t max);

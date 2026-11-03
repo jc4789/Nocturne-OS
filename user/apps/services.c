@@ -21,6 +21,7 @@
 #include <threads.h>
 #include "nocturne.h"
 #include "nocturne_services.h"
+#include "nvrm.h"
 
 /* ---- 宣言 ---- */
 enum service_scope {
@@ -56,15 +57,13 @@ struct declared_service {
                   .cap_count = sizeof((const enum n_cap[]){__VA_ARGS__}) / sizeof(enum n_cap)
 #define NAMES(...) (const char *const[]){__VA_ARGS__, NULL}
 
-static const struct n_pci_match nvidia_display[] = {N_PCI_VENDOR_CLASS_PROGIF(0x10DE, 0x03, 0x00, 0x00), N_PCI_VENDOR_CLASS_PROGIF(0x10DE, 0x03, 0x02, 0x00)};
-
 static const struct declared_service declared[] = {
     {.name = "systemlog", .program = "systemlog", .cls = N_CLASS_SYSTEM, .at_boot = true,
      .on_failure = {5, 1000, 60000}, .clients_from = CLIENTS_NONE},
     /* ドライバーは自分の機能だけを claim し、システムの級を持たない。相手は nvrm が申し込む名前で来る。 */
     {.name = "gpu", .program = "nvrm", .client_image = "nvk", .cls = N_CLASS_USER, .scope = SCOPE_FUNCTION, .at_boot = true, .optional = true,
      CAPS(N_CAP_PCI_CLAIM), .on_failure = {2, 2000, 60000}, .clients_from = CLIENTS_NONE,
-     .matches = nvidia_display, .match_count = sizeof nvidia_display / sizeof *nvidia_display},
+     .matches = nvrm_gpu_functions, .match_count = sizeof nvrm_gpu_functions / sizeof *nvrm_gpu_functions},
     {.name = "accounts", .program = "accounts", .cls = N_CLASS_SYSTEM, .at_boot = true,
      CAPS(N_CAP_STORE_PRIVATE), .on_failure = {5, 500, 60000}, .clients_from = N_CLASS_USER},
     {.name = "settings", .program = "settingsd", .cls = N_CLASS_SYSTEM, .at_boot = true,

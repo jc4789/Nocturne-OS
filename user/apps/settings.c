@@ -322,8 +322,12 @@ static void hardware_load(void) {
 
 /* 自分の名を言わない装置の呼び名。 */
 static const char *hardware_kind(const struct n_hal_device *d) {
-    if (d->bus == N_HAL_BUS_USB) return WORD(W_HW_USB);
-    if (d->bus != N_HAL_BUS_PCI) return WORD(W_HW_OTHER);
+    switch ((enum n_hal_bus)d->bus) {
+    case N_HAL_BUS_USB: return WORD(W_HW_USB);
+    case N_HAL_BUS_VMBUS: return WORD(W_HW_VMBUS);
+    case N_HAL_BUS_PORT: return WORD(W_HW_STORAGE);
+    case N_HAL_BUS_PCI: break;
+    }
     switch (d->at.pci.cls) { /* PCI Code and ID Assignment の基本の級 */
     case 0x01: return WORD(W_HW_STORAGE);
     case 0x02: return WORD(W_HW_NETWORK);

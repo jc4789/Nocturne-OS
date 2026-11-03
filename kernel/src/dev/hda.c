@@ -909,7 +909,7 @@ static int hda_attach(struct pci_device *d) {
         d->kernel_owned = false;
         pmm_free_contig(dma, DMA_PAGES);
         kfree(h);
-        return -N_ERR_UNSUPPORTED;
+        return up ? PCI_NOT_MINE : -N_ERR_IO;
     }
     irq_on(h, true);
     h->guest = (struct iommu_guest){.stop = hda_guest_stop, .start = hda_guest_start, .ctx = h};
@@ -917,7 +917,10 @@ static int hda_attach(struct pci_device *d) {
     h->pm = (struct pm_device){.name = "hda", .stage = PM_STAGE_IO, .quiesce = hda_quiesce, .resume = hda_resume, .ctx = h};
     pm_register(&h->pm);
     h->thread = kthread_create("hda", hda_thread, h);
-    if (!h->thread) kprintf("audio: HD Audio at %02x:%02x.%u: no memory for its thread\n", d->bus, d->dev, d->func);
+    if (!h->thread) {
+        kprintf("audio: HD Audio at %02x:%02x.%u: no memory for its thread\n", d->bus, d->dev, d->func);
+        return -N_ERR_NO_MEMORY;
+    }
     return 0;
 }
 

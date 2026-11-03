@@ -999,6 +999,7 @@ static struct endpoint *find_endpoint(struct usb_device *d, uint8_t address) {
 }
 
 static void free_device(struct xdev *xd) {
+    kfree(xd->dev.product);
     for (int i = 0; i < 32; i++) free_endpoint(xd->dev.hc, xd->ep[i]);
     if (xd->out_ctx) pmm_free(xd->out_phys);
     if (xd->in_ctx) pmm_free(xd->in_phys);
@@ -1396,6 +1397,15 @@ char *usb_string(struct usb_device *d, uint8_t index) {
     return out;
 }
 
+const char *usb_product(struct usb_device *d) {
+    if (!d->product_read) {
+        d->product_read = true;
+        d->product = usb_string(d, d->desc.product_name);
+        if (d->product) hal_name(&d->hal, d->product);
+    }
+    return d->product ? d->product : "";
+}
+
 bool usb_next_interrupt_interface(const uint8_t *cfg, unsigned total, unsigned *at, const struct usb_interface_desc **intf_out,
                                   const uint8_t **extra_out, unsigned *extra_len_out, const struct usb_endpoint_desc **ep_out) {
     for (unsigned off = *at; off + 2 <= total;) {
@@ -1702,10 +1712,7 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
             d->desc.product, d->desc.cls, hc->index, root_port, via, speed_name(speed), slot);
     d->hal.info.at.usb.vendor = d->desc.vendor;
     d->hal.info.at.usb.product = d->desc.product;
-    d->hal.info.at.usb.cls = d->desc.cls;
-    d->hal.info.at.usb.port = (uint8_t)root_port;
-    d->hal.info.at.usb.route = route;
-    hal_add(&d->hal, parent ? parent->hal.info.id : hc->pci->hal.info.id, N_HAL_BUS_USB, hc->pci->node, NULL);
+    hal_add(&d->hal, parent ? parent->hal.info.id : hc->pci->hal.info.id, N_HAL_BUS_USB);
     int got = 0;
     uint8_t *cfg = NULL;
     /* devices still busy after reset (or slow to fetch their descriptors) answer a moment later */
@@ -1717,6 +1724,7 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
     }
     if (!cfg) {
         kprintf("usb: slot %u could not be configured\n", slot);
+        hal_failed(&d->hal, xhci_driver.name, -N_ERR_IO);
         return xd; /* stays addressed so a disconnect still frees it */
     }
     /* A hub's descriptor may only be asked of it configured (USB 2.0 11.24.2.5, USB 3.2 10.16.2.3), and
@@ -1729,13 +1737,23 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
         usbhub_detach(d);
         goto fail;
     }
-    char *product = usb_string(d, d->desc.product_name);
-    if (product) hal_name(&d->hal, product);
-    kfree(product);
     if (bind_hub(d, cfg, (unsigned)got)) hal_bound(&d->hal, "usbhub");
-    for (unsigned i = 0; i < USB_DRIVERS && !removed(d); i++)
-        if (usb_drivers[i]->attach(d, cfg, (unsigned)got)) hal_bound(&d->hal, usb_drivers[i]->name);
+    const char *failed_driver = NULL;
+    int failed_why = 0;
+    for (unsigned i = 0; i < USB_DRIVERS && !removed(d); i++) {
+        int r = usb_drivers[i]->attach(d, cfg, (unsigned)got);
+        if (r == 0) {
+            hal_bound(&d->hal, usb_drivers[i]->name);
+        } else if (r < 0) {
+            failed_driver = usb_drivers[i]->name;
+            failed_why = r;
+        }
+    }
+    if (failed_driver) hal_failed(&d->hal, failed_driver, failed_why);
     kfree(cfg);
+    /* 文字に答えない装置は制御の道を壊すことがあるので、実装を結んだ後に読む。hub は読まない：下の装置を巻き添えに
+       する。 */
+    if (!d->hub) usb_product(d);
     return xd;
 fail:
     __atomic_store_n(&xd->dev.removed, true, __ATOMIC_RELEASE); /* late events for the slot are dropped */
@@ -2245,6 +2263,17 @@ static bool hc_start(struct usb_hc *hc) {
  * every device with it: reset it so it lets go of memory, have the drivers drop their devices,
  * then bring it up again and enumerate from scratch. A controller that keeps failing is left off.
  * After a sleep the same happens, without counting as a failure: the devices lost their addresses. */
+/* 立ち上げ直す。台帳は結果に従う。attach の後に、この controller の記録を書くのは worker だけである。 */
+static bool hc_start_again(struct usb_hc *hc) {
+    if (!hc_start(hc)) {
+        hal_failed(&hc->pci->hal, xhci_driver.name, -N_ERR_IO);
+        return false;
+    }
+    hc->failed = false;
+    if (hc->pci->hal.info.state == N_HAL_FAILED) hal_bound(&hc->pci->hal, xhci_driver.name);
+    return true;
+}
+
 static void hc_restart(struct usb_hc *hc, bool after_sleep) {
     hc_set_running(hc, false);
     wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~(1u | CMD_INTE));
@@ -2258,6 +2287,7 @@ static void hc_restart(struct usb_hc *hc, bool after_sleep) {
     } else {
         kprintf("usb: controller %d does not halt, turned off\n", hc->index);
         pci_disable_busmaster(hc->pci, NULL);
+        hal_failed(&hc->pci->hal, xhci_driver.name, -N_ERR_IO);
     }
     for (unsigned p = 1; p <= hc->max_ports; p++) {
         struct xdev *gone = hc->root[p];
@@ -2271,16 +2301,16 @@ static void hc_restart(struct usb_hc *hc, bool after_sleep) {
     if (!halted) return;
     if (after_sleep) {
         kprintf("usb: controller %d starting again after sleep\n", hc->index);
-        if (hc_start(hc)) hc->failed = false;
-        else kprintf("usb: controller %d did not come back after sleep\n", hc->index);
+        if (!hc_start_again(hc)) kprintf("usb: controller %d did not come back after sleep\n", hc->index);
         return;
     }
     if (++hc->restarts > 3) {
         kprintf("usb: controller %d keeps failing, left off\n", hc->index);
+        hal_failed(&hc->pci->hal, xhci_driver.name, -N_ERR_IO);
         return;
     }
     kprintf("usb: controller %d restarting (attempt %u)\n", hc->index, hc->restarts);
-    if (hc_start(hc)) hc->failed = false;
+    hc_start_again(hc);
 }
 
 bool usb_enumerating(void) { return __atomic_load_n(&unsettled, __ATOMIC_ACQUIRE) > 0; }
@@ -2297,6 +2327,7 @@ static void hc_worker(void *arg) {
     struct usb_hc *hc = arg;
     if (!hc_start(hc)) {
         hc->failed = true;
+        hal_failed(&hc->pci->hal, xhci_driver.name, -N_ERR_IO);
         hc_settled(hc);
     }
     uint64_t settle_at = clock_after(500 * NS_PER_MS);
@@ -2384,6 +2415,7 @@ static int xhci_attach(struct pci_device *d) {
     hc->pci = d;
     alarm_init(&hc->poll, poll_fire);
     *at = hc;
+    if (ncontrollers == 1) pm_register(&xhci_pm);
     /* every attach ends before C: is looked for (kmain_late), so usb_enumerating counts them all */
     __atomic_fetch_add(&unsettled, 1, __ATOMIC_ACQ_REL);
     char name[16];
@@ -2393,7 +2425,6 @@ static int xhci_attach(struct pci_device *d) {
         hc_settled(hc);
         return -N_ERR_NO_MEMORY;
     }
-    if (ncontrollers == 1) pm_register(&xhci_pm);
     return 0;
 }
 

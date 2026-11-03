@@ -111,15 +111,20 @@ static void vbe_monitor(struct vbe *v, struct screen_mode_desc *m, uint32_t *pre
 
 /* One display: its registers, its mode (the firmware's for the one it showed, else the EDID's
    preferred), its buffers, and a screen for them (screen 0 for the firmware's). */
-static int vbe_start(struct pci_device *d, bool legacy_only) {
+static int vbe_attach(struct pci_device *d) {
     struct vbe *v = kzalloc(sizeof *v);
     if (!v) return -N_ERR_NO_MEMORY;
+    int why = -N_ERR_UNSUPPORTED;
+    bool legacy_only = d->vendor == 0x80EE;
     v->d = d;
     uint64_t vram = pci_bar_address(d, 0), vram_size = pci_bar_size(d, 0);
     bool firmware = fb.addr && fb.phys >= vram && fb.phys < vram + vram_size;
     if (!legacy_only && pci_bar_size(d, 2) >= MMIO_BYTES) {
         v->mmio = vmalloc_map_phys(pci_bar_address(d, 2), MMIO_BYTES / PAGE_SIZE, PTE_W | PTE_PCD | PTE_PWT | PTE_NX);
-        if (!v->mmio) goto fail;
+        if (!v->mmio) {
+            why = -N_ERR_NO_MEMORY;
+            goto fail;
+        }
     }
     if (!v->mmio && !firmware) goto fail; /* only the shown one is reached through the ports */
     uint16_t id = vbe_read(v, VBE_ID);
@@ -147,7 +152,10 @@ static int vbe_start(struct pci_device *d, bool legacy_only) {
         vbe_write(v, VBE_YRES, (uint16_t)m.height);
         vbe_write(v, VBE_BPP, 32);
         vbe_write(v, VBE_ENABLE, VBE_ENABLED | VBE_LFB);
-        if (vbe_read(v, VBE_XRES) != m.width || vbe_read(v, VBE_YRES) != m.height) goto fail;
+        if (vbe_read(v, VBE_XRES) != m.width || vbe_read(v, VBE_YRES) != m.height) {
+            why = -N_ERR_IO;
+            goto fail;
+        }
         vbe_monitor(v, &m, &pref_w, &pref_h); /* the refresh of the mode now set */
         vbe_unblank(v);
     }
@@ -160,6 +168,7 @@ static int vbe_start(struct pci_device *d, bool legacy_only) {
     v->count = vbe_read(v, VBE_VIRT_HEIGHT) >= 2 * m.height && first + 2 * frame <= vram + vram_size ? 2 : 1;
     v->height = m.height;
     v->vram_pages = ALIGN_UP(frame * v->count, PAGE_SIZE) / PAGE_SIZE;
+    why = -N_ERR_NO_MEMORY; /* 残りの失敗は確保だけである */
     v->vram = vmalloc_map_phys(first, v->vram_pages, PTE_W | PTE_PWT | PTE_PAT4K | PTE_NX); /* write-combined */
     if (!v->vram) goto fail;
     for (unsigned i = 0; i < v->count; i++)
@@ -181,10 +190,8 @@ fail:
     if (v->vram) vunmap(v->vram, v->vram_pages);
     if (v->mmio) vunmap((void *)v->mmio, MMIO_BYTES / PAGE_SIZE);
     kfree(v);
-    return -N_ERR_UNSUPPORTED;
+    return why;
 }
-
-static int vbe_attach(struct pci_device *d) { return vbe_start(d, d->vendor == 0x80EE); }
 
 static const struct n_pci_match vbe_matches[] = {N_PCI_ID_CLASS(0x1234, 0x1111, 0x03, 0x00), N_PCI_ID_CLASS(0x80EE, 0xBEEF, 0x03, 0x00)};
 const struct pci_driver vbe_driver = {"vbe", vbe_matches, ARRAY_SIZE(vbe_matches), vbe_attach};

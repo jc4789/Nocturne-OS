@@ -157,14 +157,14 @@ static int tulip_attach(struct pci_device *d) {
     }
     /* rings must live below 4 GiB: the tulip only has 32-bit descriptor pointers */
     uint64_t ring = pmm_alloc_contig(1, 32);
-    if (!ring) return -N_ERR_UNSUPPORTED;
+    if (!ring) return -N_ERR_NO_MEMORY;
     memset(phys_to_virt(ring), 0, PAGE_SIZE);
     rx = phys_to_virt(ring);
     tx = (struct tdesc *)((uint8_t *)phys_to_virt(ring) + NRX * sizeof(struct tdesc));
     uint64_t tx_ring = ring + NRX * sizeof(struct tdesc);
     for (int i = 0; i < NRX; i += 2) {
         uint64_t p = pmm_alloc_contig(1, 32);
-        if (!p) return -N_ERR_UNSUPPORTED;
+        if (!p) return -N_ERR_NO_MEMORY;
         for (int k = 0; k < 2; k++) {
             rxbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * 2048;
             rx[i + k].buf1 = (uint32_t)(p + k * 2048);
@@ -175,7 +175,7 @@ static int tulip_attach(struct pci_device *d) {
     }
     for (int i = 0; i < NTX; i += 2) {
         uint64_t p = pmm_alloc_contig(1, 32);
-        if (!p) return -N_ERR_UNSUPPORTED;
+        if (!p) return -N_ERR_NO_MEMORY;
         for (int k = 0; k < 2; k++) {
             txbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * 2048;
             tx[i + k].buf1 = (uint32_t)(p + k * 2048);

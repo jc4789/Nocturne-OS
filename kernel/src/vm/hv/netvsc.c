@@ -675,6 +675,14 @@ static int netvsc_send(struct netif *self, const void *frame, size_t len) {
     return r;
 }
 
+bool netvsc_ip(uint32_t *ip) {
+    uint8_t mac[6];
+    uint32_t mask;
+    for (size_t i = 0; net_adapter_info(i, mac, ip, &mask); i++)
+        if (!memcmp(mac, nif.mac, 6)) return true;
+    return false;
+}
+
 bool netvsc_probe(void) {
     if (!vmbus_ready()) return false;
     struct vmbus_channel *ch = vmbus_find(&net_guid, 0);

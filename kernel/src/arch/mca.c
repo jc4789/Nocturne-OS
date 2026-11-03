@@ -14,20 +14,20 @@
 
 static const struct mca_layout both_manuals = {0x400, 4, 32};
 
-static const struct mca_layout *layout(void) {
+static const struct mca_layout *mca_bank_layout(void) {
     const struct cpu_maker *maker = cpu_features.maker;
     const struct mca_layout *l = maker->mca_layout ? maker->mca_layout() : NULL;
     return l ? l : &both_manuals;
 }
 
 uint32_t mca_msr(unsigned bank, enum mca_reg reg) {
-    const struct mca_layout *l = layout();
+    const struct mca_layout *l = mca_bank_layout();
     return l->first + l->stride * bank + reg;
 }
 
 unsigned mca_banks(void) {
     unsigned count = (unsigned)(rdmsr(MSR_MCG_CAP) & 0xFF);
-    return MIN(count, layout()->limit);
+    return MIN(count, mca_bank_layout()->limit);
 }
 
 void mca_report(unsigned bank, uint64_t status, const char *what) {

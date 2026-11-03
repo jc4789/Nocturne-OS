@@ -313,7 +313,7 @@ static void probe_lun(struct msc *m, unsigned lun) {
     blk_register(&l->blk);
 }
 
-static bool usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
+static int usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
     const struct usb_interface_desc *intf = NULL;
     struct usb_ep_info eps[2], e;
     bool have_in = false, have_out = false;
@@ -328,13 +328,13 @@ static bool usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned tot
             if (!(e.address & 0x80) && !have_out) eps[1] = e, have_out = true;
         }
     }
-    if (!intf) return false;
+    if (!intf) return USB_NOT_MINE;
     if (!have_in || !have_out) {
         kprintf("usbmsc: slot %u has no usable bulk endpoints\n", d->slot);
-        return false;
+        return -N_ERR_UNSUPPORTED;
     }
     struct msc *m = kzalloc(sizeof *m);
-    if (!m) return false;
+    if (!m) return -N_ERR_NO_MEMORY;
     m->dev = d;
     m->intf = intf->number;
     m->in = eps[0].address;
@@ -349,7 +349,7 @@ static bool usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned tot
     mutex_lock(&m->lock);
     for (unsigned lun = 0; lun <= max && m->dev; lun++) probe_lun(m, lun);
     mutex_unlock(&m->lock);
-    return true;
+    return 0;
 }
 
 /* The block devices stay registered (a mounted filesystem may still hold them); they fail from

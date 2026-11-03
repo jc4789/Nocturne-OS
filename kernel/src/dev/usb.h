@@ -103,6 +103,8 @@ struct usb_device {
     struct usb_device_desc desc;
     bool removed; /* atomic: set once by usb_remove, after which no report function runs for it */
     struct hal_device hal;
+    char *product; /* usb_product */
+    bool product_read;
     void *hub; /* usbhub.c state when the device is a hub */
     void *state[USB_DRIVERS]; /* each class driver's state, at its number */
 };
@@ -169,12 +171,14 @@ void usb_note_work(struct usb_device *d);
 uint64_t usb_kicks(struct usb_device *d);
 void usb_wait_kick(struct usb_device *d, uint64_t seen, uint64_t deadline);
 
+#define USB_NOT_MINE 1 /* struct usb_driver の attach：この設定に自分の物が無い */
 /* A class driver. xhci.c finds them by the table and knows none by name. */
 struct usb_driver {
     const char *name;
     bool (*claims)(const struct usb_interface_desc *intf); /* does the interface belong to it */
-    /* The device is configured: it takes what it claims of the whole configuration. True: it took something. */
-    bool (*attach)(struct usb_device *d, const uint8_t *cfg, unsigned total);
+    /* The device is configured: it takes what it claims of the whole configuration. 0: it took
+       something. USB_NOT_MINE: nothing here is its own. Negative: why it could not. */
+    int (*attach)(struct usb_device *d, const uint8_t *cfg, unsigned total);
     void (*detach)(struct usb_device *d); /* the device is going away: it drops whatever it holds of it */
     void (*work)(struct usb_device *d);   /* NULL, or what it asked for with usb_note_work */
     const char *(*refuse)(void);          /* NULL, or (for the log) why the machine cannot sleep right now */
@@ -182,6 +186,8 @@ struct usb_driver {
 extern const struct usb_driver *const usb_drivers[USB_DRIVERS];
 /* The string descriptor index as a new UTF-8 string, NULL without one. On the worker. */
 char *usb_string(struct usb_device *d, uint8_t index);
+/* The device's product string in full, "" without one, read once and given to the ledger. On the worker. */
+const char *usb_product(struct usb_device *d);
 /* The next interface of alternate 0 from *at that has an interrupt IN endpoint, with the descriptors between
    it and that endpoint. *at moves past the interface. False when there is no other. */
 bool usb_next_interrupt_interface(const uint8_t *cfg, unsigned total, unsigned *at, const struct usb_interface_desc **intf,

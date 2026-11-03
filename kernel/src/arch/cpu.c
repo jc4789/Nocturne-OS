@@ -65,7 +65,7 @@ static const struct {
     size_t flag;
     bool hardware;
 } optional[] = {
-    OPTIONAL(L1, ECX, 3, "MWAIT", mwait), OPTIONAL(L1, ECX, 17, "PCID", pcid),
+    OPTIONAL(L1, ECX, 3, "MWAIT", mwait), OPTIONAL(L1, ECX, 17, "PCID", pcid), OPTIONAL(L1, ECX, 28, "AVX", avx),
     OPTIONAL(L1, ECX, 24, "TSC deadline", tsc_deadline), OPTIONAL(L1, ECX, 30, "RDRAND", rdrand),
     OPTIONAL(L6, EAX, 2, "ARAT", arat), OPTIONAL(L6, EAX, 7, "HWP", hwp), OPTIONAL(L6, EAX, 10, "HWP EPP", hwp_epp),
     OPTIONAL(L6, ECX, 0, "APERF/MPERF", aperf_mperf),

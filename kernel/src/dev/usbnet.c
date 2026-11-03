@@ -205,7 +205,7 @@ static bool ncm_setup(struct usbnet *n) {
     return true;
 }
 
-static bool usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
+static int usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
     const struct usb_interface_desc *comm = NULL;
     struct usb_ep_info eps[3], e; /* notification, bulk IN, bulk OUT */
     bool have_notify = false, have_in = false, have_out = false, found_data = false;
@@ -246,10 +246,10 @@ static bool usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned tot
             }
         }
     }
-    if (!comm) return false;
+    if (!comm) return USB_NOT_MINE;
     if (!found_data || !mac_index) {
         kprintf("usbnet: slot %u CDC function incomplete (data interface, MAC string)\n", d->slot);
-        return false;
+        return -N_ERR_UNSUPPORTED;
     }
     mutex_lock(&gone_lock);
     struct usbnet *old = gone;
@@ -261,7 +261,7 @@ static bool usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned tot
         old = next;
     }
     struct usbnet *n = kzalloc(sizeof *n);
-    if (!n) return false;
+    if (!n) return -N_ERR_NO_MEMORY;
     n->dev = d;
     n->ncm = comm->subcls == CDC_NCM;
     n->comm = comm->number;
@@ -311,10 +311,10 @@ static bool usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned tot
     n->nif.driver = n->ncm ? "usb-ncm" : "usb-ecm";
     n->nif.send = usbnet_send;
     net_register(&n->nif);
-    return true;
+    return 0;
 fail:
     kfree(n);
-    return false;
+    return -N_ERR_IO;
 }
 
 static void usbnet_detach(struct usb_device *d) {

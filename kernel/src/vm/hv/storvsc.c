@@ -300,12 +300,22 @@ static int negotiate(struct storvsc *s) {
 
 static void storvsc_start(struct vmbus_channel *ch) {
     struct storvsc *s = kzalloc(sizeof *s);
-    if (!s) return;
+    if (!s) {
+        hal_failed(&ch->hal, "storvsc", -N_ERR_NO_MEMORY);
+        return;
+    }
     s->ch = ch;
     s->bounce_pa = pmm_alloc_contig(BOUNCE_PAGES, 64);
-    if (!s->bounce_pa) return;
+    if (!s->bounce_pa) {
+        kfree(s);
+        hal_failed(&ch->hal, "storvsc", -N_ERR_NO_MEMORY);
+        return;
+    }
     s->bounce = phys_to_virt(s->bounce_pa);
-    if (vmbus_open(ch, 64 * 1024, 64 * 1024, storvsc_callback, s)) return;
+    if (vmbus_open(ch, 64 * 1024, 64 * 1024, storvsc_callback, s)) {
+        hal_failed(&ch->hal, "storvsc", -N_ERR_IO);
+        return;
+    }
     mutex_lock(&s->lock);
     int r = negotiate(s);
     mutex_unlock(&s->lock);

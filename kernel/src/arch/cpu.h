@@ -101,7 +101,7 @@ struct cpu_features {
        hypervisor's guest), tsc_by saying why, and the clock measures it (sys/clock.c). */
     uint64_t tsc_num, tsc_den;
     const char *tsc_by;
-    bool mwait, pcid, tsc_deadline, invariant_tsc, aperf_mperf, cppc, hwp, hwp_epp, invlpgb, tme, rdrand,
+    bool mwait, pcid, avx, tsc_deadline, invariant_tsc, aperf_mperf, cppc, hwp, hwp_epp, invlpgb, tme, rdrand,
         arch_capabilities, topology_extensions, umip, scalable_mca, lfence_serializing;
     bool arat; /* the LAPIC timer goes on counting in every C-state */
     bool cmci; /* the banks' corrected errors have Intel's LVT entry (SDM vol. 3B 18.5) */

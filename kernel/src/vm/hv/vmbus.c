@@ -204,10 +204,7 @@ static void on_offer(const struct msg_offer *o) {
     /* claimed before anyone can release it: the hook hands it to a thread on another CPU */
     if (late && (ch->chn_flags & VMBUS_CHANNEL_SOCKET) && hook) ch->claimed = hook(ch);
     spin_give(&chan_lock);
-    if (!(ch->chn_flags & VMBUS_CHANNEL_SOCKET)) {
-        memcpy(ch->hal.info.at.vmbus.type, &ch->type, sizeof ch->hal.info.at.vmbus.type);
-        hal_add(&ch->hal, 0, N_HAL_BUS_VMBUS, -1, guid_name(&ch->type));
-    }
+    if (!(ch->chn_flags & VMBUS_CHANNEL_SOCKET)) hal_add(&ch->hal, 0, N_HAL_BUS_VMBUS);
     if (late && !(ch->chn_flags & VMBUS_CHANNEL_SOCKET)) {
         char gs[37], is[37];
         guid_format(&ch->type, gs);

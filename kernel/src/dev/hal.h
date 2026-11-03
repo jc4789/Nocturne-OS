@@ -1,5 +1,5 @@
 /* 台帳：機械で見つかった物の一覧（docs/hal.md）。記録はバスの物に埋め、寿命はその物と同じ。指す側は
-   番号を持つ。台帳は実装を呼ばず、順序を持たない。全部の操作は眠らず、どの文脈からでも呼べる。 */
+   番号を持つ。台帳は実装を呼ばず、順序を持たない。hal_add から hal_remove までは眠らず、どの文脈からでも呼べる。 */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -13,7 +13,7 @@ struct hal_device {
 };
 
 void hal_init(void);
-void hal_add(struct hal_device *d, uint32_t parent, enum n_hal_bus bus, int node, const char *name);
+void hal_add(struct hal_device *d, uint32_t parent, enum n_hal_bus bus);
 void hal_name(struct hal_device *d, const char *name);
 /* 実装が持った。一つの物を複数の実装が持つ（USB の複合装置）なら名前を並べる。 */
 void hal_bound(struct hal_device *d, const char *driver);

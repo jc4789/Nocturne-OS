@@ -606,17 +606,17 @@ static void input_identify(struct hid *h) {
     if (!h->input_id) return;
     ksnprintf(h->input_id, sizeof "usb:vvvv:pppp:xxxxxxxx:255", "usb:%04x:%04x:%08x:%u", d->desc.vendor, d->desc.product, hash, h->interface);
     h->input.id = h->input_id;
-    h->input.name = d->hal.info.name;
+    h->input.name = usb_product(d);
     h->input.kinds = (h->keyboard ? N_INPUT_KEYBOARD : 0) | (h->mouse ? N_INPUT_POINTER : 0);
     input_device_add(&h->input);
 }
 
 static bool usbhid_claims(const struct usb_interface_desc *intf) { return intf->cls == 3; }
 
-static bool interface_attach(struct usb_device *d, const struct usb_interface_desc *intf, const uint8_t *extra,
+static int interface_attach(struct usb_device *d, const struct usb_interface_desc *intf, const uint8_t *extra,
                              unsigned extra_len, const struct usb_endpoint_desc *ep) {
     struct hid *h = kzalloc(sizeof *h);
-    if (!h) return false;
+    if (!h) return -N_ERR_NO_MEMORY;
     h->dev = d;
     alarm_init(&h->repeat, repeat_fire);
     h->interface = intf->number;
@@ -658,7 +658,7 @@ static bool interface_attach(struct usb_device *d, const struct usb_interface_de
     if (!h->keyboard && !h->mouse) {
         kfree(h->keys);
         kfree(h);
-        return false;
+        return USB_NOT_MINE;
     }
     usb_control(d, 0x21, HID_SET_IDLE, 0, h->interface, NULL, 0); /* report changes only */
     h->leds_seen = __atomic_load_n(&leds_gen, __ATOMIC_ACQUIRE) - 1; /* its lights set on the worker's next look */
@@ -676,21 +676,27 @@ static bool interface_attach(struct usb_device *d, const struct usb_interface_de
     h->packet = usb_interrupt_length(d, ep, 1);
     /* room for a report all but whole, and the packet that ends it */
     h->partial = h->packet ? kmalloc(h->longest + h->packet) : NULL;
-    if (!h->partial || !usb_interrupt_start(d, ep, 1, hid_report, h))
+    if (!h->partial || !usb_interrupt_start(d, ep, 1, hid_report, h)) {
         kprintf("usbhid: slot %u reports could not start\n", d->slot);
-    return true;
+        return h->partial ? -N_ERR_IO : -N_ERR_NO_MEMORY;
+    }
+    return 0;
 }
 
-static bool usbhid_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
-    bool took = false;
+/* interface の答えの一番小さいものを返す：失敗があれば失敗、一つでも持てば 0。 */
+static int usbhid_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
+    int result = USB_NOT_MINE;
     const struct usb_interface_desc *intf;
     const struct usb_endpoint_desc *ep;
     const uint8_t *extra;
     unsigned extra_len;
     for (unsigned at = 0; !__atomic_load_n(&d->removed, __ATOMIC_ACQUIRE) &&
                           usb_next_interrupt_interface(cfg, total, &at, &intf, &extra, &extra_len, &ep);)
-        if (usbhid_claims(intf)) took |= interface_attach(d, intf, extra, extra_len, ep);
-    return took;
+        if (usbhid_claims(intf)) {
+            int r = interface_attach(d, intf, extra, extra_len, ep);
+            if (r < result) result = r;
+        }
+    return result;
 }
 
 /* On the worker: the device's keyboards light caps lock as it is now: Set_Report of its output

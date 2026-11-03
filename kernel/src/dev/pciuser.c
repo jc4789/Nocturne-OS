@@ -553,8 +553,8 @@ static void claim_release(struct object *o) {
         screen_release();
     mutex_lock(&claim_mutex);
     d->claimed = false;
-    mutex_unlock(&claim_mutex);
     hal_unbound(&d->hal);
+    mutex_unlock(&claim_mutex);
     kprintf("pci: %02x:%02x.%u released\n", d->bus, d->dev, d->func);
     claim_drop(c);
 }
@@ -830,12 +830,12 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct handle **o
     c->refs = 1;
     mutex_lock(&claim_mutex);
     int64_t r = d->kernel_owned || d->claimed ? -N_ERR_BUSY : claim_form(c, out);
+    if (r >= 0) hal_bound(&d->hal, t->name);
     mutex_unlock(&claim_mutex);
     if (r < 0) {
         kfree(c);
         return r;
     }
-    hal_bound(&d->hal, t->name);
     kprintf("pci: %02x:%02x.%u (%04x:%04x) claimed by pid %d%s\n", bus, dev, func, d->vendor, d->device, t->pid,
             c->domain ? "" : iommu_active() ? "; the IOMMU cannot isolate it: its DMA reaches all of memory"
                                             : "; no IOMMU isolates it: its DMA reaches all of memory");

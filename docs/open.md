@@ -57,7 +57,7 @@
 - S10：シェルが主画面を知らない（`list[0]`）。
 - S12：UI の事象が場所で宛先を指す。
 - S13：文の表がコンパイル時に閉じる。
-- S14：製品の宣言に試験と NVIDIA がある（`user/apps/services.c:80`、`:59`）。
+- S14：製品の宣言に試験と NVIDIA がある（`user/apps/services.c:79`、`:64`）。
 - libc S1、S2：libc が持ち主の無い束で、共有の仕組みが無い。
 - libc S3：TLS が二通りある（`user/include/nocturne.h:412`）。
 - libc S4：起動の ABI に UNIX の形がある（環境、0・1・2、`#!`）。

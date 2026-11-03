@@ -129,5 +129,7 @@ void guid_format(const struct guid *g, char *out); /* 37 bytes */
 
 void hv_input_init(void); /* hv_input.c: synthetic keyboard and mouse */
 void storvsc_init(void);  /* storvsc.c: synthetic SCSI disks */
+/* netvsc.c: the address of the synthetic adapter, which the host asks about (hv_util.c). False without one. */
+bool netvsc_ip(uint32_t *ip);
 void hv_util_init(void);  /* hv_util.c: heartbeat, shutdown, time sync */
 void hvsock_init(void);   /* hvsock.c: Hyper-V sockets */

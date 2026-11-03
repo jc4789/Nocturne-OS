@@ -114,7 +114,7 @@ static void channel_record(struct hal_device *record, uint16_t io) {
     for (int i = 0; i < ndisks; i++) any |= disks[i].io == io;
     if (!any) return;
     record->info.at.port.base = io;
-    hal_add(record, 0, N_HAL_BUS_PORT, -1, "IDE");
+    hal_add(record, 0, N_HAL_BUS_PORT);
     hal_bound(record, "ata");
 }
 

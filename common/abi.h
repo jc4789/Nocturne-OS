@@ -245,7 +245,7 @@ enum {
     X(SYS_SETTINGS_EFFECTIVE) X(SYS_SETTINGS_DESCRIBE) X(SYS_SETTINGS_WATCH)
 
 /* 世代。呼出し、構造体、システムのサービスの文の形を変えたら一つ上げる。溝を末尾へ足すだけなら上げない。 */
-#define N_ABI_GENERATION 1u
+#define N_ABI_GENERATION 2u
 
 /* プログラムの刻印：ELF の PT_NOTE の一つ（user/libc/sys.c が全プログラムに入れる）。カーネルは起こす前に
    読む。世代が違うか、溝がカーネルより多ければ、N_ERR_WRONG_GENERATION で起こさない。 */
@@ -493,14 +493,12 @@ struct n_hal_device {
     uint32_t bus;    /* enum n_hal_bus */
     uint32_t state;  /* enum n_hal_state */
     int32_t reason;  /* N_HAL_FAILED の負の N_ERR_* */
-    int32_t node;    /* NUMA の node。-1：不明 */
     union {
         struct n_pciinfo pci;
-        struct { uint16_t vendor, product; uint8_t cls, port; uint32_t route; } usb;
-        struct { uint8_t type[16]; } vmbus;
+        struct { uint16_t vendor, product; } usb;
         struct { uint32_t base; } port;
     } at;
-    char name[64];   /* 人に見せる名前。"": 無い */
+    char name[64];   /* 装置が言う名。"": 言わない */
     char driver[48]; /* 持っている実装の名。プロセスの実装はプログラムの名 */
 };
 

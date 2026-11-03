@@ -48,8 +48,9 @@ struct pci_device {
        the device below since its link trained, which takes effect once the link retrains (pci.c) */
     bool retrain;
 };
-/* カーネルの実装の一つ。attach は眠ってよい。0 で実装が機能を持つ。負は持てなかった理由で、持ち続ける物は
-   実装が持ってよい（電源を切る前に止める物など）。 */
+/* カーネルの実装の一つ。attach は眠ってよい。0 で実装が機能を持つ。PCI_NOT_MINE は持たず、次の実装に任せる。負は
+   持てなかった理由で、持ち続ける物は実装が持ってよい（電源を切る前に止める物など）。 */
+#define PCI_NOT_MINE 1
 struct pci_driver {
     const char *name;
     const struct n_pci_match *matches;

@@ -156,16 +156,16 @@ bool cpu_tlb_ipi(unsigned i) {
     return true;
 }
 
-/* The ABI's description (common/abi.h): every CPU passed the same checks (cpu_features_same),
-   which require SSE2 and AVX; apps' threads run on every online CPU. The kernel runs no work of
-   its own spread over CPUs, so no CPU is a worker and no job is counted. */
+/* The ABI's description (common/abi.h): every CPU passed the same checks (cpu_features_same), so
+   what the first has they all have; apps' threads run on every online CPU. The kernel runs no work
+   of its own spread over CPUs, so no CPU is a worker and no job is counted. */
 void smp_get_info(struct n_cpuinfo *info) {
     memset(info, 0, sizeof *info);
     info->version = 1;
     info->detected_cpus = topology.cpus;
     info->online_cpus = cpu_online_count();
     info->scheduler_cpus = info->online_cpus;
-    info->flags = N_CPU_SSE2 | N_CPU_AVX | N_CPU_USER_THREADS;
+    info->flags = N_CPU_SSE2 | N_CPU_USER_THREADS | (cpu_features.avx ? N_CPU_AVX : 0);
 }
 
 /* ---- starting the CPUs ----

@@ -532,13 +532,19 @@ static void free_dma(struct rtl8125 *c, uint64_t rx_ring, uint64_t tx_ring) {
     if (tx_ring) pmm_free(tx_ring);
 }
 
-static bool rtl_one(struct rtl8125 *c, struct pci_device *d) {
+static int rtl_attach(struct pci_device *d) {
+    struct rtl8125 *c = kzalloc(sizeof *c);
+    if (!c) {
+        kprintf("rtl8125: no memory for a device\n");
+        return -N_ERR_NO_MEMORY;
+    }
+    int r = -N_ERR_UNSUPPORTED;
     uint64_t base = 0, size = 0;
     for (unsigned i = 0; i < 6 && !base; i++)
         if ((base = pci_bar_address(d, i))) size = pci_bar_size(d, i);
     if (!base) {
         kprintf("rtl8125: no memory register window\n");
-        return false;
+        goto fail;
     }
     uint8_t pm = pci_find_cap(d, 0x01);
     if (pm) { /* the firmware may have left the function in a sleep state */
@@ -548,7 +554,10 @@ static bool rtl_one(struct rtl8125 *c, struct pci_device *d) {
             clock_spin(10 * NS_PER_MS);
         }
     }
-    if (!(c->mmio = vmm_map_mmio(base, size && size < 0x10000 ? size : 0x10000))) return false;
+    if (!(c->mmio = vmm_map_mmio(base, size && size < 0x10000 ? size : 0x10000))) {
+        r = -N_ERR_NO_MEMORY;
+        goto fail;
+    }
     pci_enable_busmaster(d);
 
     uint32_t txcfg = rd32(c, TXCFG);
@@ -556,7 +565,7 @@ static bool rtl_one(struct rtl8125 *c, struct pci_device *d) {
     if (txcfg == 0xFFFFFFFF || (c->macver != 0x64000000 && c->macver != 0x64100000)) {
         kprintf("rtl8125: chip version %08x (rev %02x) not supported yet; only the RTL8125B is\n", txcfg,
                 pci_read32(d->bus, d->dev, d->func, 8) & 0xFF);
-        return false;
+        goto fail;
     }
 
     for (int i = 0; i < 4; i++) c->nif.mac[i] = (uint8_t)(rd32(c, BACKUP_ADDR) >> (i * 8));
@@ -583,7 +592,8 @@ static bool rtl_one(struct rtl8125 *c, struct pci_device *d) {
        interrupt mask stays clear until the rings are set */
     if (!pci_irq_enable(d, &(struct irq_spec){.name = "RTL8125", .handler = rtl_irq, .context = c, .node = d->node}, 1, NULL)) {
         kprintf("rtl8125: no interrupt message could be enabled\n");
-        return false;
+        r = -N_ERR_IO;
+        goto fail;
     }
     uint64_t rx_ring = pmm_alloc_zeroed(), tx_ring = pmm_alloc_zeroed();
     if (!rx_ring || !tx_ring) goto no_dma;
@@ -621,23 +631,15 @@ static bool rtl_one(struct rtl8125 *c, struct pci_device *d) {
     start_autoneg(c);
     kprintf("net: rtl8125 (RTL8125B, %08x, PHY code %04x) mac %02x:%02x:%02x:%02x:%02x:%02x\n", txcfg, phy_code,
             c->nif.mac[0], c->nif.mac[1], c->nif.mac[2], c->nif.mac[3], c->nif.mac[4], c->nif.mac[5]);
-    return true;
+    return 0;
 no_dma:
     pci_irq_disable(d);
     free_dma(c, rx_ring, tx_ring);
     kprintf("rtl8125: DMA allocation failed\n");
-    return false;
-}
-
-static int rtl_attach(struct pci_device *d) {
-    struct rtl8125 *c = kzalloc(sizeof *c);
-    if (!c) {
-        kprintf("rtl8125: no memory for a device\n");
-        return -N_ERR_NO_MEMORY;
-    }
-    if (rtl_one(c, d)) return 0;
+    r = -N_ERR_NO_MEMORY;
+fail:
     kfree(c);
-    return -N_ERR_UNSUPPORTED;
+    return r;
 }
 
 static const struct n_pci_match rtl_matches[] = {N_PCI_ID(0x10EC, 0x8125)};

@@ -66,17 +66,22 @@ static void kbd_callback(struct vmbus_channel *ch) {
 
 static bool kbd_init(void) {
     struct vmbus_channel *ch = vmbus_find(&kbd_guid, 0);
-    if (!ch || vmbus_open(ch, RING_BYTES, RING_BYTES, kbd_callback, NULL)) return false;
+    if (!ch) return false;
+    if (vmbus_open(ch, RING_BYTES, RING_BYTES, kbd_callback, NULL)) goto failed;
     struct kbd_msg req = {.type = KBD_PROTOCOL_REQUEST, .version = KBD_VERSION};
     int st = vmbus_send(ch, VM_PKT_DATA_INBAND, VMBUS_FLAG_COMPLETION_REQUESTED, &req, 8, 1);
     if (!vmbus_wait(&kbd_answered, 2000) || !(kbd_status & KBD_ACCEPTED)) {
         kprintf("hv-input: keyboard protocol not accepted (send %d, answered %d status %x; out w%u r%u, in w%u r%u)\n",
                 st, kbd_answered, kbd_status, ch->out->write_index, ch->out->read_index, ch->in->write_index,
                 ch->in->read_index);
-        return false;
+        goto failed;
     }
     input_device_add(&kbd_input);
+    hal_bound(&ch->hal, "hv_input");
     return true;
+failed:
+    hal_failed(&ch->hal, "hv_input", -N_ERR_IO);
+    return false;
 }
 
 /* ---- mouse ---- */
@@ -273,24 +278,28 @@ static void mouse_callback(struct vmbus_channel *ch) {
 
 static bool mouse_init(void) {
     ms.ch = vmbus_find(&mouse_guid, 0);
-    if (!ms.ch || vmbus_open(ms.ch, RING_BYTES, RING_BYTES, mouse_callback, NULL)) return false;
+    if (!ms.ch) return false;
+    if (vmbus_open(ms.ch, RING_BYTES, RING_BYTES, mouse_callback, NULL)) goto failed;
     uint32_t version = HID_VERSION;
     mouse_send(HID_PROTOCOL_REQUEST, &version, 4);
     if (!vmbus_wait(&ms.answered, 2000) || !ms.approved) {
         kprintf("hv-input: mouse protocol not accepted\n");
-        return false;
+        goto failed;
     }
     if (!vmbus_wait(&ms.have_info, 2000)) {
         kprintf("hv-input: no mouse device info\n");
-        return false;
+        goto failed;
     }
     if (!ms.x.present) {
         kprintf("hv-input: mouse report has no X axis\n");
-        return false;
+        goto failed;
     }
     input_device_add(&mouse_input);
     hal_bound(&ms.ch->hal, "hv_input");
     return true;
+failed:
+    hal_failed(&ms.ch->hal, "hv_input", -N_ERR_IO);
+    return false;
 }
 
 void hv_input_init(void) {

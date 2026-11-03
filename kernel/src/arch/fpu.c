@@ -47,7 +47,7 @@ void fpu_init(void) {
     uint64_t has = a | (uint64_t)d << 32;
     if ((has & COMPONENTS_X87_SSE) != COMPONENTS_X87_SSE) panic("fpu: XSAVE lacks x87 or SSE");
     components = COMPONENTS_X87_SSE;
-    if (has & COMPONENT_AVX) {
+    if (cpu_features.avx && (has & COMPONENT_AVX)) {
         components |= COMPONENT_AVX;
         if ((has & COMPONENTS_AVX512) == COMPONENTS_AVX512) components |= COMPONENTS_AVX512;
     }

@@ -392,6 +392,7 @@ static bool controller_stop(struct nvme *c, uint64_t seen) {
                 kprintf("nvme%d: its reset was called off with its thread\n", c->index);
             } else {
                 kprintf("nvme%d: controller did not reset, turned off\n", c->index);
+                hal_failed(&c->pci->hal, nvme_driver.name, -N_ERR_IO);
                 __atomic_store_n(&c->cut, true, __ATOMIC_RELEASE);
                 for (struct ns *s = c->found; s; s = s->next) __atomic_store_n(&s->blk.gone, true, __ATOMIC_RELEASE);
             }
@@ -783,6 +784,14 @@ down:
     return false;
 }
 
+/* 動いている間の立ち上げ直し。台帳は結果に従う。reset_lock held. */
+static bool enable_recorded(struct nvme *c) {
+    bool up = enable(c);
+    if (!up) hal_failed(&c->pci->hal, nvme_driver.name, -N_ERR_IO);
+    else if (c->pci->hal.info.state == N_HAL_FAILED) hal_bound(&c->pci->hal, nvme_driver.name);
+    return up;
+}
+
 /* After a command failed with FAILED: up now, a reset has been done since. Else the controller reset
    once by whichever caller comes first (generation still `seen`), the others finding that it did not
    come up; or, if that caller's thread was killed and gave up on it, going on with it themselves. */
@@ -790,7 +799,7 @@ static bool recover(struct nvme *c, uint64_t seen) {
     mutex_lock(&c->reset_lock);
     bool moved = __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE) != seen;
     bool ready = __atomic_load_n(&c->ready, __ATOMIC_ACQUIRE);
-    bool ok = ready || (moved && !__atomic_load_n(&c->called_off, __ATOMIC_ACQUIRE) ? false : enable(c));
+    bool ok = ready || (moved && !__atomic_load_n(&c->called_off, __ATOMIC_ACQUIRE) ? false : enable_recorded(c));
     mutex_unlock(&c->reset_lock);
     return ok;
 }
@@ -801,7 +810,7 @@ static void awake(struct nvme *c) {
     mutex_lock(&c->reset_lock);
     if (c->woke) {
         c->woke = false;
-        if (enable(c)) kprintf("nvme%d: ready again after sleep\n", c->index);
+        if (enable_recorded(c)) kprintf("nvme%d: ready again after sleep\n", c->index);
         else kprintf("nvme%d: did not come back after sleep\n", c->index);
     }
     mutex_unlock(&c->reset_lock);

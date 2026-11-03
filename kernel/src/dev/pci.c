@@ -199,7 +199,7 @@ static void device_list(struct pci_device *d) {
     if (d->hal.listed) return;
     if (d->upstream) device_list(d->upstream);
     d->hal.info.at.pci = (struct n_pciinfo){d->bus, d->dev, d->func, d->cls, d->subcls, d->progif, d->vendor, d->device};
-    hal_add(&d->hal, d->upstream ? d->upstream->hal.info.id : 0, N_HAL_BUS_PCI, d->node, NULL);
+    hal_add(&d->hal, d->upstream ? d->upstream->hal.info.id : 0, N_HAL_BUS_PCI);
 }
 
 void pci_init(void) {
@@ -256,10 +256,12 @@ void pci_init(void) {
             }
         }
     }
-    /* Bus numbers stay as the firmware gave them (sleep writes them back), so the tree is found once. */
+    /* Bus numbers stay as the firmware gave them (sleep writes them back), so the tree is found once.
+       橋の二次のバスは自分のバスより大きい。firmware が設定しなかった橋は誰の親でもなく、親を辿るとバスの番号は
+       必ず下がるので、輪にならない。 */
     for (size_t i = 0; i < ndevices; i++)
         for (size_t k = 0; k < ndevices && !devices[i].upstream; k++)
-            if (k != i && devices[k].bridge && devices[k].secondary == devices[i].bus)
+            if (k != i && devices[k].bridge && devices[k].secondary > devices[k].bus && devices[k].secondary == devices[i].bus)
                 devices[i].upstream = &devices[k];
     /* each function's node, for its memory and the CPUs its interrupts go to. Finding a function's
        ACPI object evaluates its neighbours' _ADR: with one node there is nothing to choose. */

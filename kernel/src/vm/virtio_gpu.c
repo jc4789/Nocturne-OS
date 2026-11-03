@@ -571,16 +571,17 @@ static bool pixel_test(void) {
     return ok;
 }
 
-static void gpu_start(struct pci_device *d) {
-    if (test_flag("nogpu")) return;
+static int gpu_attach(struct pci_device *d) {
+    if (test_flag("nogpu")) return PCI_NOT_MINE;
     if (!test_flag("gpu-enable") && !test_flag("gpu-slow-test")) {
         kprintf("gpu: optional virgl device present; gpu-enable required (cold host fences can be slow)\n");
-        return;
+        return PCI_NOT_MINE;
     }
+    if (common) return -N_ERR_BUSY; /* one device: its state is this file's */
     if (!transport_init(d)) {
         if (common) mmio_write8(&common->device_status, mmio_read8(&common->device_status) | 128); /* FAILED */
         kprintf("gpu: virgl transport unavailable; boot framebuffer unchanged\n");
-        return;
+        return -N_ERR_IO;
     }
     /* its queues and resources would be gone after a sleep: no sleep while it is in use */
     static struct pm_device gpu_pm = {.name = "virtio-gpu", .stage = PM_STAGE_IO};
@@ -592,11 +593,11 @@ static void gpu_start(struct pci_device *d) {
     bool transfers=false;
     for (uint32_t i=0;i<capset_count;i++) {
         struct { struct header h; uint32_t index,pad; } PACKED cap={.h=hdr(CMD_CAPSET_INFO,false),.index=i};
-        if (!exchange(&cap,sizeof cap,0x1102) || reply_bytes<40) return;
+        if (!exchange(&cap,sizeof cap,0x1102) || reply_bytes<40) return -N_ERR_IO;
         uint32_t *info=(uint32_t *)(packets+PAGE_SIZE+24);
         if (info[0]!=2 || info[1]<1 || info[2]<488 || info[2]>PAGE_SIZE-24) continue;
         struct { struct header h; uint32_t id,version; } PACKED get={.h=hdr(CMD_CAPSET,false),.id=2,.version=1};
-        if (!exchange(&get,sizeof get,0x1103) || reply_bytes<24+488) return;
+        if (!exchange(&get,sizeof get,0x1103) || reply_bytes<24+488) return -N_ERR_IO;
         uint32_t bits=*(uint32_t *)(packets+PAGE_SIZE+24+392);
         transfers=(bits&(1u<<17))!=0;
         /* virgl_caps_v2: max_texture_2d_size follows the compute block/grid
@@ -614,17 +615,17 @@ static void gpu_start(struct pci_device *d) {
     }
     if (!transfers) {
         kprintf("gpu: fenced stream transfer unavailable; CPU display retained\n");
-        return;
+        return -N_ERR_UNSUPPORTED;
     }
     if (!pipeline_init() || !pixel_test()) {
         ready=false; statistics.failures++;
         kprintf("gpu: virgl pixel self-test failed; no 3D capabilities advertised\n");
-        return;
+        return -N_ERR_IO;
     }
     bool cold_batch_ok=batch_pixel_test();
-    if (broken) return; /* Failed DMA/fence retires the entire device. */
+    if (broken) return -N_ERR_IO; /* Failed DMA/fence retires the entire device. */
     bool cold_blit_ok=blit_pipeline_init() && blit_pixel_test();
-    if (broken) return;
+    if (broken) return -N_ERR_IO;
     /* A cold ten-second pixel pass is not proof that the production two-second
      * deadline is usable. Verify clear AND triangle under the actual runtime
      * budget before publishing any capability, even in a slow diagnostic boot.
@@ -655,7 +656,7 @@ static void gpu_start(struct pci_device *d) {
         ready=false;statistics.backend=N_GPU_BACKEND_NONE;statistics.capabilities=0;
         if (!broken) statistics.failures++;
         kprintf("gpu: runtime budget validation failed; no 3D capabilities advertised\n");
-        return;
+        return -N_ERR_IO;
     }
     ready=true;
     statistics.backend=N_GPU_BACKEND_VIRGL;
@@ -683,6 +684,7 @@ static void gpu_start(struct pci_device *d) {
         }
         kprintf("gpu: kernel replay passed=%u/3 (diagnostic slow budget)\n",passed);
     }
+    return ready ? 0 : -N_ERR_IO;
 }
 void gpu_get_info(struct n_gpu_info *info) { *info=statistics; }
 int gpu_render(const struct n_gpu_render *r, uint32_t *out, size_t bytes) {
@@ -731,11 +733,6 @@ int gpu_blit(const struct n_gpu_blit *r,const uint32_t *pixels,size_t source_byt
     else for (unsigned y=0;y<r->height;y++) if(!gpu_copy(out+(size_t)y*r->width,target+(size_t)y*SIDE,(size_t)r->width*4)){result=-N_ERR_STOPPED;break;}
     __atomic_store_n(&busy,0,__ATOMIC_RELEASE);
     return result;
-}
-
-static int gpu_attach(struct pci_device *d) {
-    gpu_start(d);
-    return ready ? 0 : -N_ERR_UNSUPPORTED;
 }
 
 static const struct n_pci_match gpu_matches[] = {N_PCI_ID(0x1af4, 0x1050)};

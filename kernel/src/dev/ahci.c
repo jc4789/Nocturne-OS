@@ -452,6 +452,7 @@ static void hba_unlock(struct hba *h, bool held) {
    its disks with it. */
 static void hba_kill(struct hba *h) {
     kprintf("ahci%d: the adapter is hung, turned off\n", h->index);
+    hal_failed(&h->pci->hal, ahci_driver.name, -N_ERR_IO);
     __atomic_store_n(&h->dead, true, __ATOMIC_RELEASE);
     pci_disable_busmaster(h->pci, NULL);
     for (unsigned n = 0; n < PORTS; n++)
