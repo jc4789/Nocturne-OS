@@ -140,7 +140,7 @@ struct hda_sink {
     struct hda_sink *every; /* of the machine (labels) */
     uint32_t rates[11];     /* R1 to R11 (hda_output_rates) */
     struct n_audio_size sizes[4];
-    char key[sizeof "hda-ff:ff.7-14-65535"]; /* its PCI function, its codec's address (4.3) and its pin's node */
+    char key[sizeof "hda-ffff:ff:ff.7-14-65535"]; /* its PCI function, its codec's address (4.3) and its pin's node */
     char label[sizeof(((struct hda_output *)0)->name) + sizeof " 4294967295"]; /* the output's name, told from its namesakes */
 };
 
@@ -406,8 +406,7 @@ static uint32_t link_verb(struct hda_link *link, unsigned codec, unsigned nid, u
             f = spin_lock(&h->engine);
             h->silent |= (uint16_t)(1u << codec);
             spin_unlock(&h->engine, f);
-            kprintf("audio: HD Audio codec %u at %02x:%02x.%u does not answer verb %x of node %u\n", codec, h->pci->bus,
-                    h->pci->dev, h->pci->func, command, nid);
+            kprintf("audio: HD Audio codec %u at %04x:%02x:%02x.%x does not answer verb %x of node %u\n", codec, PCI_ADDRESS_ARGS(h->pci->address), command, nid);
             break;
         }
         pause();
@@ -457,8 +456,8 @@ static void irq_on(struct hda *h, bool messages) {
     if (h->messages) return;
     uint32_t gsi;
     if (acpi_pci_gsi(d, &gsi)) {
-        pci_write16(d->bus, d->dev, d->func, PCI_COMMAND,
-                    pci_read16(d->bus, d->dev, d->func, PCI_COMMAND) & ~PCI_COMMAND_INTX_DISABLE);
+        pci_write16(d->address, PCI_COMMAND,
+                    pci_read16(d->address, PCI_COMMAND) & ~PCI_COMMAND_INTX_DISABLE);
         h->line = irq_request_gsi(&spec, gsi);
     }
     h->quiet = !h->line;
@@ -469,8 +468,8 @@ static void irq_off(struct hda *h) {
     struct pci_device *d = h->pci;
     if (h->messages) pci_irq_disable(d);
     if (h->line) {
-        pci_write16(d->bus, d->dev, d->func, PCI_COMMAND,
-                    pci_read16(d->bus, d->dev, d->func, PCI_COMMAND) | PCI_COMMAND_INTX_DISABLE);
+        pci_write16(d->address, PCI_COMMAND,
+                    pci_read16(d->address, PCI_COMMAND) | PCI_COMMAND_INTX_DISABLE);
         irq_free(h->line);
     }
     h->messages = false;
@@ -699,7 +698,7 @@ static bool sink_add(struct hda *h, struct hda_codec *codec, struct hda_output *
     o->output.ops = &hda_ops;
     o->output.priv = o;
     o->output.name = o->label;
-    ksnprintf(o->key, sizeof o->key, "hda-%02x:%02x.%u-%u-%u", h->pci->bus, h->pci->dev, h->pci->func, codec->address, out->pin->nid);
+    ksnprintf(o->key, sizeof o->key, "hda-%04x:%02x:%02x.%x-%u-%u", PCI_ADDRESS_ARGS(h->pci->address), codec->address, out->pin->nid);
     o->output.key = o->key;
     o->output.kind = kinds[out->kind];
     o->output.jack = jack_of(out);
@@ -731,8 +730,7 @@ static void probe(struct hda *h) {
         if (!(present & (1u << at))) continue;
         h->codecs[at] = hda_codec_read(&h->link, at);
         if (!h->codecs[at]) {
-            kprintf("audio: HD Audio codec %u at %02x:%02x.%u has no audio function that can be read\n", at, h->pci->bus,
-                    h->pci->dev, h->pci->func);
+            kprintf("audio: HD Audio codec %u at %04x:%02x:%02x.%x has no audio function that can be read\n", at, PCI_ADDRESS_ARGS(h->pci->address));
             continue;
         }
         h->outputs[at] = hda_codec_outputs(h->codecs[at]);
@@ -748,7 +746,7 @@ static void probe(struct hda *h) {
             if (sink_add(h, h->codecs[at], o)) found++;
     }
     h->probed = true;
-    kprintf("audio: HD Audio at %02x:%02x.%u (%04x:%04x): codecs %x, %u outputs, %s\n", h->pci->bus, h->pci->dev, h->pci->func,
+    kprintf("audio: HD Audio at %04x:%02x:%02x.%x (%04x:%04x): codecs %x, %u outputs, %s\n", PCI_ADDRESS_ARGS(h->pci->address),
             h->pci->vendor, h->pci->device, present, found, h->messages ? "message interrupts" : h->line ? "INTx" : "timed refill");
 }
 
@@ -850,8 +848,7 @@ static void hda_guest_start(struct iommu_domain *dom, void *ctx) {
     mutex_lock(&h->state);
     if (h->stopped) {
         if (dom && !iommu_map(dom, NULL, h->dma_phys, DMA_PAGES)) {
-            kprintf("audio: HD Audio at %02x:%02x.%u: its memory cannot be mapped in its group's domain\n", h->pci->bus,
-                    h->pci->dev, h->pci->func);
+            kprintf("audio: HD Audio at %04x:%02x:%02x.%x: its memory cannot be mapped in its group's domain\n", PCI_ADDRESS_ARGS(h->pci->address));
         } else {
             h->guest_dom = dom;
             pci_enable_busmaster(h->pci);
@@ -862,7 +859,7 @@ static void hda_guest_start(struct iommu_domain *dom, void *ctx) {
                 irq_on(h, !dom);
                 __atomic_store_n(&h->restore, true, __ATOMIC_SEQ_CST);
                 for (struct hda_sink *o = h->sinks; o; o = o->next) audio_output_available(&o->output, true);
-            } else kprintf("audio: HD Audio at %02x:%02x.%u does not come out of reset\n", h->pci->bus, h->pci->dev, h->pci->func);
+            } else kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not come out of reset\n", PCI_ADDRESS_ARGS(h->pci->address));
             signal(h);
         }
     }
@@ -879,7 +876,7 @@ static int hda_attach(struct pci_device *d) {
     uint64_t dma = h ? pmm_alloc_contig(DMA_PAGES, 32) : 0;
     volatile uint8_t *regs = dma ? vmm_map_mmio(base, size) : NULL;
     if (!regs) {
-        kprintf("audio: HD Audio at %02x:%02x.%u found, but no memory for it\n", d->bus, d->dev, d->func);
+        kprintf("audio: HD Audio at %04x:%02x:%02x.%x found, but no memory for it\n", PCI_ADDRESS_ARGS(d->address));
         if (dma) pmm_free_contig(dma, DMA_PAGES);
         if (h) kfree(h);
         return -N_ERR_NO_MEMORY;
@@ -901,7 +898,7 @@ static int hda_attach(struct pci_device *d) {
     uint32_t caps = up ? read16(h, GCAP) : 0;
     if (!up || (!GCAP_OSS(caps) && !GCAP_BSS(caps))) {
         /* no driver runs it: an app may */
-        kprintf("audio: HD Audio at %02x:%02x.%u %s\n", d->bus, d->dev, d->func, up ? "has no stream to play on" : "does not come out of reset");
+        kprintf("audio: HD Audio at %04x:%02x:%02x.%x %s\n", PCI_ADDRESS_ARGS(d->address), up ? "has no stream to play on" : "does not come out of reset");
         uint64_t f = spin_lock(&h->engine);
         link_stop(h);
         spin_unlock(&h->engine, f);
@@ -919,7 +916,7 @@ static int hda_attach(struct pci_device *d) {
     pm_register(&h->pm);
     h->thread = kthread_create("hda", hda_thread, h);
     if (!h->thread) {
-        kprintf("audio: HD Audio at %02x:%02x.%u: no memory for its thread\n", d->bus, d->dev, d->func);
+        kprintf("audio: HD Audio at %04x:%02x:%02x.%x: no memory for its thread\n", PCI_ADDRESS_ARGS(d->address));
         return -N_ERR_NO_MEMORY;
     }
     return 0;

@@ -245,7 +245,7 @@ enum {
     X(SYS_SETTINGS_EFFECTIVE) X(SYS_SETTINGS_DESCRIBE) X(SYS_SETTINGS_WATCH)
 
 /* 世代。呼出し、構造体、システムのサービスの文の形を変えたら一つ上げる。溝を末尾へ足すだけなら上げない。 */
-#define N_ABI_GENERATION 2u
+#define N_ABI_GENERATION 3u
 
 /* プログラムの刻印：ELF の PT_NOTE の一つ（user/libc/sys.c が全プログラムに入れる）。カーネルは起こす前に
    読む。世代が違うか、溝がカーネルより多ければ、N_ERR_WRONG_GENERATION で起こさない。 */
@@ -476,6 +476,7 @@ struct n_cpuinfo {
 #define N_CPU_USER_THREADS 8u
 
 struct n_pciinfo {
+    uint16_t segment;
     uint8_t bus, dev, func, cls, subcls, progif;
     uint16_t vendor, device;
 };
@@ -533,24 +534,32 @@ static inline bool n_pci_matches(const struct n_pci_match *m, const struct n_pci
    object at the same address, and nothing else but the firmware's reserved ranges. */
 #define N_PCI_ISOLATED 1u /* n_pci_function.flags: its DMA reaches only the claim's DMA objects */
 #define N_PCI_NEEDS_RECOVERY 2u /* previous driver ended active; native device recovery is required */
+#define N_PCI_HAS_UPSTREAM 4u /* a bridge is above it: n_pci_function.upstream */
 #define N_PCI_BAR_MEMORY 1u
 #define N_PCI_BAR_64BIT 2u
 #define N_PCI_BAR_PREFETCH 4u
 #define N_PCI_BAR_IO 8u
-#define N_PCI_NONE 0xFFFFFFFFu  /* no such function, BAR or framebuffer */
-#define N_PCI_SELF 0xFFFFFFFFu  /* n_pci_config_read: the claimed function itself */
-#define N_PCI_TARGET(bus, dev, func) ((uint32_t)(bus) << 8 | (uint32_t)(dev) << 3 | (uint32_t)(func))
+#define N_PCI_NONE 0xFFFFFFFFu  /* no such BAR or framebuffer */
+/* A function's address in one word: all 32 bits are an address. */
+#define N_PCI_TARGET(segment, bus, dev, func) \
+    ((uint32_t)(segment) << 16 | (uint32_t)(bus) << 8 | (uint32_t)(dev) << 3 | (uint32_t)(func))
+#define N_PCI_TARGET_SEGMENT(target) ((uint16_t)((target) >> 16))
+#define N_PCI_TARGET_BUS(target) ((uint8_t)((target) >> 8))
+#define N_PCI_TARGET_DEV(target) ((uint8_t)((target) >> 3 & 0x1f))
+#define N_PCI_TARGET_FUNC(target) ((uint8_t)((target) & 7))
+#define N_PCI_SELF (UINT64_C(1) << 32) /* n_pci_config_read: the claimed function itself; no N_PCI_TARGET */
 struct n_pci_bar {
     uint64_t address, size;
     uint32_t flags, reserved;
 };
 struct n_pci_function {
+    uint16_t segment;
     uint8_t bus, dev, func, revision;
     uint16_t vendor, device, subsystem_vendor, subsystem_id;
     uint8_t cls, subcls, progif, interrupt_pin;
     uint32_t msi_vectors, msix_vectors; /* what the function offers, 0 without */
-    uint32_t upstream;                  /* N_PCI_TARGET of the bridge above it, or N_PCI_NONE */
-    uint32_t flags;                     /* N_PCI_ISOLATED, N_PCI_NEEDS_RECOVERY */
+    uint32_t upstream;                  /* with N_PCI_HAS_UPSTREAM: N_PCI_TARGET of the bridge above it */
+    uint32_t flags;                     /* N_PCI_ISOLATED, N_PCI_NEEDS_RECOVERY, N_PCI_HAS_UPSTREAM */
     struct n_pci_bar bar[6];
     /* The screen the firmware set up, when its pixels lie in one of this function's BARs
        (framebuffer_bar, else N_PCI_NONE): drivers must keep that memory as it is. */

@@ -119,7 +119,8 @@ static uint64_t pci_signature(void) {
     uint64_t s = HASH_START;
     for (int i = 0; i < pci_count(); i++) {
         struct pci_device *d = pci_at(i);
-        uint64_t v[2] = {(uint64_t)d->bus << 16 | (uint64_t)d->dev << 8 | d->func,
+        uint64_t v[2] = {(uint64_t)d->address.segment << 32 | (uint64_t)d->address.bus << 16 |
+                             (uint64_t)d->address.dev << 8 | d->address.func,
                          (uint64_t)d->vendor << 32 | (uint64_t)d->device << 16 | (uint64_t)d->cls << 8 | d->subcls};
         s = hash_words(s, v, sizeof v);
     }

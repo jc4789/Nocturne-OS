@@ -107,8 +107,8 @@ nvkmd_nocturne_try_create_pdev(uint32_t pci_target,
    const char *step;
    uint32_t st = nnrm_open_device(pci_target, &rm, &gpu, &step);
    if (st != 0) {
-      mesa_logw("NVK: GPU %02x:%02x.%x: %s failed: %s (0x%x)", pci_target >> 8,
-                (pci_target >> 3) & 0x1f, pci_target & 0x7, step, nnrm_status_name(st), st);
+      mesa_logw("NVK: GPU %04x:%02x:%02x.%x: %s failed: %s (0x%x)", N_PCI_TARGET_SEGMENT(pci_target), N_PCI_TARGET_BUS(pci_target),
+                N_PCI_TARGET_DEV(pci_target), N_PCI_TARGET_FUNC(pci_target), step, nnrm_status_name(st), st);
       /* A snapshot member can disappear before it is opened. Do not turn
        * host OOM or a failing RM command into an absent/unsupported GPU. */
       if (nnrm_gpu_unavailable(st))
@@ -118,10 +118,10 @@ nvkmd_nocturne_try_create_pdev(uint32_t pci_target,
 
    if (gpu.chipset < NVKMD_NOCTURNE_MIN_CHIPSET || gpu.cls_gpfifo == 0 ||
        gpu.cls_eng3d == 0 || gpu.cls_compute == 0) {
-      mesa_logw("NVK: GPU %02x:%02x.%x is not used: chipset 0x%x, GPFIFO class 0x%x, 3D class 0x%x, "
-                "compute class 0x%x (Turing, 0x%x, or later with all three is needed)", pci_target >> 8,
-                (pci_target >> 3) & 0x1f, pci_target & 0x7, gpu.chipset, gpu.cls_gpfifo, gpu.cls_eng3d,
-                gpu.cls_compute, NVKMD_NOCTURNE_MIN_CHIPSET);
+      mesa_logw("NVK: GPU %04x:%02x:%02x.%x is not used: chipset 0x%x, GPFIFO class 0x%x, 3D class 0x%x, "
+                "compute class 0x%x (Turing, 0x%x, or later with all three is needed)", N_PCI_TARGET_SEGMENT(pci_target), N_PCI_TARGET_BUS(pci_target),
+                N_PCI_TARGET_DEV(pci_target), N_PCI_TARGET_FUNC(pci_target),
+                gpu.chipset, gpu.cls_gpfifo, gpu.cls_eng3d, gpu.cls_compute, NVKMD_NOCTURNE_MIN_CHIPSET);
       nnrm_close(rm);
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }

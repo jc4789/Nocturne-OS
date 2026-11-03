@@ -11,7 +11,7 @@
    (the kernel's own functions pass the IOMMU untranslated, dev/iommu.h, so a bus address is the
    physical one): a bounce buffer only for blocks a request covers in part, or memory that is not
    dword aligned. Every active namespace with plain blocks of any size a command can move (no
-   metadata, no protection information) becomes a block device "nvmeN". Completions are polled when
+   metadata, no protection information) becomes a block device "nvmeC.N". Completions are polled when
    the platform offers no message interrupt, and until the controller has said how many queues it
    gives. */
 #include "kernel.h"
@@ -185,7 +185,7 @@ struct ns {
 };
 
 static struct nvme *ctrls;
-static int nctrls, ndisks;
+static int nctrls;
 
 static int blk_nvme_read(struct blkdev *b, uint64_t lba, uint32_t n, void *buf);
 static int blk_nvme_write(struct blkdev *b, uint64_t lba, uint32_t n, const void *buf);
@@ -939,7 +939,6 @@ static int start(struct nvme *c) {
         kprintf("nvme%d: no memory to map its registers\n", c->index);
         return -N_ERR_NO_MEMORY;
     }
-    pci_enable_busmaster(pci);
     uint64_t cap = c->cap = rd64(c, CAP);
     c->stride = 4u << (cap >> 32 & 0xF);
     c->mqes = (uint16_t)(cap & 0xFFFF);
@@ -978,7 +977,7 @@ static int start(struct nvme *c) {
             c->vwc ? ", write cache" : "");
     __atomic_store_n(&c->in_use, true, __ATOMIC_RELEASE);
     for (struct ns *s = c->found; s; s = s->next) {
-        ksnprintf(s->blk.name, sizeof s->blk.name, "nvme%d", __atomic_fetch_add(&ndisks, 1, __ATOMIC_RELAXED));
+        ksnprintf(s->blk.name, sizeof s->blk.name, "nvme%d.%u", c->index, s->nsid);
         strlcpy(s->blk.model, c->model, sizeof s->blk.model);
         blk_register(&s->blk);
     }
@@ -1074,10 +1073,21 @@ static bool nvme_resume(void *arg) {
 static struct pm_device nvme_pm = {.name = "nvme", .stage = PM_STAGE_STORAGE, .quiesce = nvme_shutdown,
                                    .resume = nvme_resume};
 
+/* A controller's first start: CC.EN may take CAP.TO (127.5 s), and no disk beside it waits for that.
+   It counts as a request of the disks: a power change waits for it, and it waits for that. */
+static void first_start(void *arg) {
+    struct nvme *c = arg;
+    blk_busy_begin();
+    int r = start(c);
+    blk_busy_end();
+    if (r < 0) hal_failed(&c->pci->hal, nvme_driver.name, r);
+    blk_looking_end();
+}
+
 static int nvme_attach(struct pci_device *p) {
     struct nvme *c = kzalloc(sizeof *c);
     if (!c) {
-        kprintf("nvme: no memory for the controller at %02x:%02x.%u\n", p->bus, p->dev, p->func);
+        kprintf("nvme: no memory for the controller at %04x:%02x:%02x.%x\n", PCI_ADDRESS_ARGS(p->address));
         return -N_ERR_NO_MEMORY;
     }
     c->index = nctrls++;
@@ -1085,9 +1095,17 @@ static int nvme_attach(struct pci_device *p) {
     struct nvme **tail = &ctrls;
     while (*tail) tail = &(*tail)->next;
     *tail = c;
-    int r = start(c);
     if (!c->index) pm_register(&nvme_pm);
-    return r;
+    pci_enable_busmaster(p);
+    blk_looking_begin();
+    char name[16];
+    ksnprintf(name, sizeof name, "nvme%d", c->index);
+    if (!kthread_create(name, first_start, c)) {
+        kprintf("nvme%d: no thread to start it\n", c->index);
+        blk_looking_end();
+        return -N_ERR_NO_MEMORY;
+    }
+    return 0;
 }
 
 static const struct n_pci_match nvme_matches[] = {N_PCI_CLASS_PROGIF(0x01, 0x08, 0x02)};

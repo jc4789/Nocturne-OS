@@ -31,6 +31,7 @@ void kmain_late(void) {
     settings_init();
     entropy_init();
     vmalloc_purge_start();
+    pci_config_init();
     acpi_init();
     pm_init(); /* the power thread: every shutdown and restart goes through it */
     hal_init();

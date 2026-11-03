@@ -288,7 +288,6 @@ static void client_start(n_handle channel) {
 }
 
 n_result nvrm_serve(uint32_t pci_target) {
-    if (pci_target > UINT16_MAX) return -N_ERR_INVALID;
     if (mtx_init(&threads_lock, mtx_plain) != thrd_success) return -N_ERR_NO_MEMORY;
     if (cnd_init(&thread_ended) != thrd_success) { mtx_destroy(&threads_lock); return -N_ERR_NO_MEMORY; }
     __atomic_store_n(&serving_ended, 0, __ATOMIC_RELEASE);

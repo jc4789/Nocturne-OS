@@ -12,9 +12,9 @@
    the argument struct as RM left it. A reply to NV_ESC_RM_MAP_MEMORY carries the mapped memory as
    an attached shared object: `offset` is where the mapping starts in it, `bytes` its length. */
 #define NVRM_CHANNEL "nocturne.nvidia.rm" /* サービスの名前の頭（n_service_connect） */
-#define NVRM_CHANNEL_FORMAT NVRM_CHANNEL ".%04x"
-/* Domain zero PCI BDF is a 16-bit N_PCI_TARGET. Include the dot, hex digits and NUL. */
-#define NVRM_CHANNEL_NAME_BYTES (sizeof(NVRM_CHANNEL) + 1 + 2 * sizeof(uint16_t))
+#define NVRM_CHANNEL_FORMAT NVRM_CHANNEL ".%08x" /* N_PCI_TARGET */
+/* The dot and its hex digits; sizeof counts the NUL. */
+#define NVRM_CHANNEL_NAME_BYTES (sizeof(NVRM_CHANNEL) + 1 + 2 * sizeof(uint32_t))
 #define NVRM_PROTOCOL 1
 #define NVRM_HELLO 0x1000u   /* escapes below 0x1000 are RM's NV_ESC_* numbers */
 /* HELLO reply capabilities in access (arena_bytes on the request). Old arena

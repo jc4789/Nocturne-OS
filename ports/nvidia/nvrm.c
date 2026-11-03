@@ -262,8 +262,8 @@ static bool bring_up(void) {
         return false;
     }
     sp = d->sp;
-    nvrm_log("NVRM: GPU %04x:%04x at %02x:%02x.%x, BAR0 %llu MiB at 0x%llx",
-             (unsigned)d->info.vendor, (unsigned)d->info.device, (unsigned)d->info.bus,
+    nvrm_log("NVRM: GPU %04x:%04x at %04x:%02x:%02x.%x, BAR0 %llu MiB at 0x%llx",
+             (unsigned)d->info.vendor, (unsigned)d->info.device, (unsigned)d->info.segment, (unsigned)d->info.bus,
              (unsigned)d->info.dev, (unsigned)d->info.func,
              (unsigned long long)(nv->bars[0].size >> 20), (unsigned long long)nv->bars[0].cpu_address);
 
@@ -392,7 +392,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     unsigned long target = strtoul(argv[1], NULL, 16);
-    nvrm_dev.pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), (uint8_t)(target >> 8), (uint8_t)(target >> 3 & 31), (uint8_t)(target & 7));
+    nvrm_dev.pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), (uint32_t)target);
     if (nvrm_dev.pci < 0) {
         nvrm_log("NVRM: cannot claim %s: %s", argv[1], n_result_text(nvrm_dev.pci));
         return 1;

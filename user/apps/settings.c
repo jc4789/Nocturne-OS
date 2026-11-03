@@ -342,7 +342,7 @@ static const char *hardware_kind(const struct n_hal_device *d) {
 static void hardware_where(const struct n_hal_device *d, char *out, size_t cap) {
     switch ((enum n_hal_bus)d->bus) {
     case N_HAL_BUS_PCI:
-        snprintf(out, cap, "PCI %02x:%02x.%x  %04x:%04x", d->at.pci.bus, d->at.pci.dev, d->at.pci.func, d->at.pci.vendor,
+        snprintf(out, cap, "PCI %04x:%02x:%02x.%x  %04x:%04x", d->at.pci.segment, d->at.pci.bus, d->at.pci.dev, d->at.pci.func, d->at.pci.vendor,
                  d->at.pci.device);
         break;
     case N_HAL_BUS_USB: snprintf(out, cap, "USB %04x:%04x", d->at.usb.vendor, d->at.usb.product); break;

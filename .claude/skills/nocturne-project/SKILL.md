@@ -48,7 +48,7 @@ description: Nocturne OS の実物を動かして確かめる手順：ビルド�
 - 起動する前に、動いている QEMU の数を見る。二台動いていれば三台目を起動せず、どちらかを `quit` する。二台目は別の HMP と QMP のポート（`-monitor tcp:127.0.0.1:45456`、`-qmp tcp:127.0.0.1:45457`）と別名の serial（`<作業場>/serial-2.log`）と vars（`<作業場>/vars-2.fd`）で起こす（同じ img を `snapshot=on` で二台が読んでよい）。速さを測る回は一台だけ動かし、もう一台は `quit` する（RAM と CPU を取り合うと値が歪む）。
 - **窓が出たことを確かめる。** `powershell -c "Get-Process qemu-system-x86_64 | Select-Object Id,MainWindowHandle"` で MainWindowHandle が 0 でないこと。`-display none`・`-nographic` を付けない。ユーザーはその窓を見て、自分でも触る。
 - `-cpu host` は外さない。必須の機能の表は `kernel/src/arch/cpu.c` にあり、WHPX はこれで XSAVES・FSGSBASE・INVPCID・SMEP・SMAP・x2APIC を見せる。任意の機能は `-cpu host,avx512f=off` のように隠して試せる（PCID は見せない。起動の行 `cpu: cpuid …` で確かめられる）。付けないと「QEMU Virtual CPU version 2.5+」になり、下限を満たさない。
-- 起動は `serial.log` の `store: C: "…" on nvme0` で確かめる（UEFI と Limine の待ちを含めて十数秒）。数秒で出なければ待たずに異常として扱う。
+- 起動は `serial.log` の `store: C: "…" on nvme0.1` で確かめる（UEFI と Limine の待ちを含めて十数秒）。数秒で出なければ待たずに異常として扱う。
 - HMP（TCP 45454）へ一行ずつ送る：`screendump "<作業場>/now.png" -f png`（スラッシュ区切りの絶対 path）、`sendkey ctrl-l`（キーは USB のキーボードへ届く）。撮った PNG は自分で開いて見る。固定秒数の一発スクリプトや、デスクトップの computer-use の撮影で代用しない。
 - 指は USB の tablet（絶対座標）。PS/2 は無いので HMP の `mouse_move`（相対）は効かない。QMP（TCP 45455）で `qmp_capabilities` の後に `input-send-event` を送る：位置は `{"type":"abs","data":{"axis":"x","value":…}}` と y（0〜32767 に画面の画素を写す。2560×1440 なら x×32767/2560）、押しは `{"type":"btn","data":{"down":true,"button":"left"}}` と `false`。起動の直後の最初の事象は落ちることがあるので、先に一度動かしてから押す。
 - ブラウザーは最大化して使う：ゲストの Terminal で `browser --maximized <URL>`（旗は `user/apps/browser.c`）。デスクトップの印から開いて小さな窓のまま撮らない。旗を付けるのも同じ道（`browser --debug-js <URL>`、HMP の `sendkey` で打つ）。

@@ -187,13 +187,10 @@ void uacpi_kernel_log(uacpi_log_level level, const uacpi_char *msg) {
     kprintf("acpi: %s%s", level == UACPI_LOG_ERROR ? "error: " : level == UACPI_LOG_WARN ? "warning: " : "", msg);
 }
 
-struct pci_handle { uint8_t bus, dev, fn; };
-
 uacpi_status uacpi_kernel_pci_device_open(uacpi_pci_address a, uacpi_handle *out) {
-    if (a.segment) return UACPI_STATUS_UNIMPLEMENTED; /* segment 0 only, like dev/pci.c */
-    struct pci_handle *h = kmalloc(sizeof *h);
+    struct pci_address *h = kmalloc(sizeof *h);
     if (!h) return UACPI_STATUS_OUT_OF_MEMORY;
-    *h = (struct pci_handle){a.bus, a.device, a.function};
+    *h = (struct pci_address){a.segment, a.bus, a.device, a.function};
     *out = h;
     return UACPI_STATUS_OK;
 }
@@ -201,16 +198,16 @@ void uacpi_kernel_pci_device_close(uacpi_handle h) { kfree(h); }
 
 /* None goes to a function an FLR is under way on (dev/pci.h), which may discard it: a read gets
    all-ones, as from a function that does not answer, and a write is dropped. */
-static uint32_t cfg_read(struct pci_handle *h, uacpi_size off) {
+static uint32_t cfg_read(struct pci_address *h, uacpi_size off) {
     uint32_t v;
-    pci_config_firmware_read(h->bus, h->dev, h->fn, (uint16_t)off, &v);
+    pci_config_firmware_read(*h, (uint16_t)off, &v);
     return v;
 }
 
 /* Writes as wide as asked: a read-modify-write of the dword would write back the registers beside
    it, and status registers clear their bits when written with 1. */
-static void cfg_write(struct pci_handle *h, uacpi_size off, uint32_t v, unsigned bytes) {
-    pci_config_firmware_write(h->bus, h->dev, h->fn, (uint16_t)off, v, bytes);
+static void cfg_write(struct pci_address *h, uacpi_size off, uint32_t v, unsigned bytes) {
+    pci_config_firmware_write(*h, (uint16_t)off, v, bytes);
 }
 
 uacpi_status uacpi_kernel_pci_read8(uacpi_handle h, uacpi_size off, uacpi_u8 *v) {
@@ -620,18 +617,19 @@ bool acpi_reset(void) { return aml_ready && uacpi_reboot() == UACPI_STATUS_OK; }
 #define EVAL_ARGS_MAX 7   /* Arg0..Arg6 */
 
 struct host_search {
-    uint64_t bus;
+    uint64_t segment, bus;
     uacpi_namespace_node *found;
 };
 
-/* A host bridge (PNP0A03, PNP0A08) of segment 0 whose root bus (_BBN, 0 without one) is bus. */
+/* A host bridge (PNP0A03, PNP0A08) of the segment (_SEG, 0 without one) whose root bus (_BBN, 0
+   without one) is bus. */
 static uacpi_iteration_decision found_host(void *user, uacpi_namespace_node *node, uacpi_u32 depth) {
     (void)depth;
     struct host_search *s = user;
     uacpi_u64 segment = 0, bus = 0;
     if (uacpi_eval_simple_integer(node, "_SEG", &segment) != UACPI_STATUS_OK) segment = 0;
     if (uacpi_eval_simple_integer(node, "_BBN", &bus) != UACPI_STATUS_OK) bus = 0;
-    if (segment || bus != s->bus) return UACPI_ITERATION_DECISION_CONTINUE;
+    if (segment != s->segment || bus != s->bus) return UACPI_ITERATION_DECISION_CONTINUE;
     s->found = node;
     return UACPI_ITERATION_DECISION_BREAK;
 }
@@ -640,7 +638,7 @@ void *acpi_pci_host(const struct pci_device *d) {
     static const uacpi_char *const hids[] = {"PNP0A03", "PNP0A08", UACPI_NULL};
     if (!aml_ready || !d) return NULL;
     for (unsigned n = 0; d->upstream && n < PCI_DEPTH_MAX; n++) d = d->upstream;
-    struct host_search s = {d->bus, UACPI_NULL};
+    struct host_search s = {d->address.segment, d->address.bus, UACPI_NULL};
     uacpi_find_devices_at(uacpi_namespace_root(), hids, found_host, &s);
     return s.found;
 }
@@ -682,7 +680,7 @@ void *acpi_pci_node(const struct pci_device *d) {
     uacpi_namespace_node *node = n ? acpi_pci_host(d) : UACPI_NULL;
     while (node && n) {
         n--;
-        node = child_at(node, chain[n]->dev, chain[n]->func);
+        node = child_at(node, chain[n]->address.dev, chain[n]->address.func);
     }
     return node;
 }
@@ -732,19 +730,19 @@ static bool prt_gsi(const uacpi_pci_routing_table *t, uint8_t dev, unsigned pin,
 
 bool acpi_pci_gsi(const struct pci_device *d, uint32_t *gsi) {
     if (!aml_ready || !d) return false;
-    unsigned pin = (pci_read32(d->bus, d->dev, d->func, 0x3C) >> 8) & 0xFF; /* 1 = INTA .. 4 = INTD */
+    unsigned pin = (pci_read32(d->address, 0x3C) >> 8) & 0xFF; /* 1 = INTA .. 4 = INTD */
     if (pin < 1 || pin > 4) return false;
     pin--;
     for (unsigned depth = 0; d && depth < PCI_DEPTH_MAX; depth++) {
         uacpi_namespace_node *bus = d->upstream ? acpi_pci_node(d->upstream) : acpi_pci_host(d);
         uacpi_pci_routing_table *table;
         if (bus && uacpi_get_pci_routing_table(bus, &table) == UACPI_STATUS_OK) {
-            bool found = prt_gsi(table, d->dev, pin, gsi);
+            bool found = prt_gsi(table, d->address.dev, pin, gsi);
             uacpi_free_pci_routing_table(table);
             return found;
         }
         /* a bridge without a _PRT: its own pin carries it (PCI-to-PCI Bridge 1.2, 9.1) */
-        pin = (pin + d->dev) % 4;
+        pin = (pin + d->address.dev) % 4;
         d = d->upstream;
     }
     return false;

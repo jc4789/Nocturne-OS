@@ -9,7 +9,7 @@
 struct handle;
 struct n_pci_function;
 struct pci_claim;
-int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct handle **out);
+int64_t pci_user_claim(uint32_t target, struct handle **out);
 /* The claim record behind a handle, held by a BAR or DMA object for its whole life (NULL when h
    is no claim). revoked: its last handle closed, so its BARs are no longer the app's to map.
    dma_reusable: its driver still owns the live claim, or the IOMMU confirmed the ended claim's
@@ -32,7 +32,7 @@ unsigned pci_user_dma_bits(const struct pci_claim *c);
 bool pci_user_dma_map(struct pci_claim *c, const uint64_t *frames, uint64_t base, size_t count);
 bool pci_user_dma_unmap(struct pci_claim *c, const uint64_t *frames, uint64_t base, size_t count);
 int64_t pci_user_info(struct handle *h, struct n_pci_function *out);
-int64_t pci_user_config_read(struct handle *h, uint32_t target, uint32_t offset, uint32_t width);
+int64_t pci_user_config_read(struct handle *h, uint64_t target, uint32_t offset, uint32_t width);
 int64_t pci_user_config_write(struct handle *h, uint32_t offset, uint32_t width, uint32_t value);
 /* A memory BAR's bus address and size (page aligned, at least a page). */
 int64_t pci_user_bar(struct handle *h, uint32_t bar, uint64_t *address, uint64_t *size);

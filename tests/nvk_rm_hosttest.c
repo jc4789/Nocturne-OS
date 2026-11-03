@@ -252,7 +252,7 @@ static void enumeration(void) {
    uint32_t *ids=NULL,count=0;
    reset();
    CHECK(nnrm_enumerate_gpus(&ids,&count)==NV_OK && count==2 && connects==2 && connections==0);
-   CHECK(ids[0]==N_PCI_TARGET(1,1,0) && ids[1]==N_PCI_TARGET(1,2,0));
+   CHECK(ids[0]==N_PCI_TARGET(0,1,1,0) && ids[1]==N_PCI_TARGET(0,1,2,0));
    uint32_t preserved=ids[1];
    absent_target=ids[0];
    struct nnrm *missing=NULL;
@@ -262,7 +262,7 @@ static void enumeration(void) {
    CHECK(ids[1]==preserved);free(later);free(ids);
    mismatch_target=preserved;
    CHECK(nnrm_enumerate_gpus(&ids,&count)==NV_OK && count==0);free(ids);
-   reset();unready_target=N_PCI_TARGET(1,1,0);
+   reset();unready_target=N_PCI_TARGET(0,1,1,0);
    CHECK(nnrm_enumerate_gpus(&ids,&count)==NV_OK && count==1 && ids[0]==preserved && allocs==1 && connections==0);
    free(ids);
    struct nnrm *unready=NULL;const char *step=NULL;
@@ -286,7 +286,7 @@ static void enumeration(void) {
 }
 static struct nnrm *space(void) {
    struct nnrm *n=calloc(1,sizeof(*n));
-   CHECK(nvrm_connect_device_status(N_PCI_TARGET(1,1,0),&n->rm)==0);
+   CHECK(nvrm_connect_device_status(N_PCI_TARGET(0,1,1,0),&n->rm)==0);
    n->refs=1;n->info.cls_gpfifo=VOLTA_CHANNEL_GPFIFO_A;
    mtx_init(&n->usermode_lock,mtx_plain);
    atomic_init(&n->internal_va,NNRM_INTERNAL_VA);atomic_init(&n->daemon_lost,false);
@@ -363,7 +363,7 @@ static void scanout_import(void) {
    NVKの番地はGSP-RMの範囲にも、CPU側のRMが自分で写す文脈バッファーにも出会わない。 */
 static void address_space(void) {
    reset();struct nnrm *n=NULL;struct nnrm_gpu_info info;const char *step=NULL;
-   CHECK(nnrm_open_device(N_PCI_TARGET(1,1,0),&n,&info,&step)==NV_OK && n && step==NULL);
+   CHECK(nnrm_open_device(N_PCI_TARGET(0,1,1,0),&n,&info,&step)==NV_OK && n && step==NULL);
    if(!n){printf("装置を開けない：%s\n",step?step:"?");return;}
    CHECK(info.chipset==0x194 && info.cls_eng3d==ADA_A && info.gpc_count==5 && info.tpc_count==20);
    /* 各エンジンのクラスはそのエンジンの一覧から（装置の一覧ではM2MFに0xc640を拾っていた） */

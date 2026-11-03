@@ -7,7 +7,6 @@
 #include "store/space.h"
 #include "dev/blk.h"
 #include "sys/clock.h"
-#include "dev/usb.h"
 #include "lib/idtable.h"
 #include "limine.h"
 #include "mm/heap.h"
@@ -22,7 +21,9 @@
 
 #define WRITE_DELAY_NS (5 * NS_PER_S) /* the first change waits this long for more to commit with it */
 #define FIND_NS (10 * NS_PER_S)       /* how long the disk the system started from may take to appear */
-#define FIND_MOST_NS (60 * NS_PER_S)  /* ... while USB devices are still being looked at */
+/* ... while a controller still looks: past what an NVMe controller may take to stop and to be ready
+   (CAP.TO, 127.5 s, each). A disk that never answers and a USB bus that never settles end here. */
+#define FIND_MOST_NS (300 * NS_PER_S)
 #define GPT_ENTRIES_MAX (1u << 20)
 #define MEMORY_KEPT 1024u   /* blocks kept of a volume in memory: reading one again is a copy */
 
@@ -265,8 +266,9 @@ static void store_grow(struct volume *v) {
     kfree(buf);
 }
 
-/* The disk the system started from, by its GPT identity; any disk with a Nocturne partition when
-   that is unknown or never appears. Started from a CD or DVD, C: is in memory: the volume the boot
+/* The disk the system started from, by its GPT identity. When that is unknown or never appears, of
+   the disks with a Nocturne partition the one with the lowest GUID, the same one whichever
+   controller is ready first. Started from a CD or DVD, C: is in memory: the volume the boot
    loader brought as the module "C:". */
 static void device_find(void) {
     struct limine_module_response *mods = module_req.response;
@@ -278,7 +280,7 @@ static void device_find(void) {
         return;
     }
     static const uint8_t none[16];
-    uint8_t want[16] = {0};
+    uint8_t want[16] = {0}, lowest[16];
     struct limine_executable_file_response *ef = exe_file_req.response;
     if (ef && ef->executable_file && ef->executable_file->media_type == LIMINE_MEDIA_TYPE_GENERIC)
         memcpy(want, (const void *)&ef->executable_file->gpt_disk_uuid, 16);
@@ -289,6 +291,7 @@ static void device_find(void) {
     uint32_t looked = 0; /* the disks whose GPT was read; one that could not be is tried again */
     bool boot = false, said = false;
     for (;;) {
+        bool looking = blk_looking(); /* before the disks: one registered after this is read next time */
         for (int i = 0; i < blk_count() && !boot; i++) {
             struct blkdev *d = blk_get(i);
             uint8_t guid[16];
@@ -297,26 +300,30 @@ static void device_find(void) {
             int r = kept && (looked >> i & 1) ? 0 : gpt_find(d, buf, guid, &first, &n);
             if (r >= 0 && kept) looked |= 1u << i;
             if (r <= 0) continue;
-            boot = !known || !memcmp(guid, want, 16);
-            if (boot || !medium.disk) {
+            boot = known && !memcmp(guid, want, 16);
+            if (boot || !medium.disk || memcmp(guid, lowest, 16) < 0) {
                 medium.disk = d;
                 medium.first = first;
                 blocks = n;
+                memcpy(lowest, guid, 16);
             }
         }
-        /* A USB stick appears once its bus has been looked at, which can take longer than FIND_NS
-           on a machine with many devices. */
+        /* A disk appears once its controller has looked, which can take longer than FIND_NS: a disk
+           spinning up, a USB bus with many devices. */
         uint64_t waited = clock_now_ns() - start;
-        if (boot || waited >= FIND_MOST_NS || (waited >= FIND_NS && !usb_enumerating())) break;
+        bool enough = waited >= FIND_NS || (!known && medium.disk);
+        if (boot || waited >= FIND_MOST_NS || (enough && !looking)) break;
         if (waited >= FIND_NS && !said) {
             said = true;
-            kprintf("store: waiting for the disk the system started from: USB devices are still being looked at\n");
+            kprintf("store: waiting for the disk the system started from: controllers are still looking\n");
         }
         sleep_until(clock_after(100 * NS_PER_MS));
     }
     kfree(buf);
     if (!medium.disk) panic("store: no disk holds a Nocturne volume (C:)");
-    if (!boot) kprintf("store: the disk the system started from did not appear: C: is on %s\n", medium.disk->name);
+    if (!boot)
+        kprintf("store: the disk the system started from %s: C: is on %s\n", known ? "did not appear" : "is not known",
+                medium.disk->name);
     medium.dev = (struct store_device){.blocks = blocks, .read = part_read, .write = part_write, .persist = part_persist};
 }
 

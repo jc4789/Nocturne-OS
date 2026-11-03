@@ -6,9 +6,28 @@
 struct pci_reset;
 struct irq;
 struct iommu_guest;
+/* Where a function answers. A segment group has buses of its own, so a bus, device and function
+   say nothing without it (ACPI MCFG, _SEG). */
+struct pci_address {
+    uint16_t segment;
+    uint8_t bus, dev, func;
+};
+/* For "%04x:%02x:%02x.%x". */
+#define PCI_ADDRESS_ARGS(a) (a).segment, (a).bus, (a).dev, (a).func
+static inline bool pci_address_same(struct pci_address a, struct pci_address b) {
+    return a.segment == b.segment && a.bus == b.bus && a.dev == b.dev && a.func == b.func;
+}
+/* A function's requester ID, unique within its segment (PCI Express Base 6.0, 2.2.6.2), and the
+   address of the function with one. */
+static inline uint16_t pci_requester_id(struct pci_address a) {
+    return (uint16_t)(a.bus << 8 | a.dev << 3 | a.func);
+}
+static inline struct pci_address pci_address_of(uint16_t segment, uint16_t requester) {
+    return (struct pci_address){segment, (uint8_t)(requester >> 8), (requester >> 3) & 31, requester & 7};
+}
 struct pci_device {
     struct hal_device hal;
-    uint8_t bus, dev, func;
+    struct pci_address address;
     uint16_t vendor, device;
     uint8_t cls, subcls, progif, irq;
     uint32_t bar[6];
@@ -48,7 +67,8 @@ struct pci_device {
        the device below since its link trained, which takes effect once the link retrains (pci.c) */
     bool retrain;
 };
-/* カーネルの実装の一つ。attach は眠ってよい。0 で実装が機能を持つ。PCI_NOT_MINE は持たず、次の実装に任せる。負は
+/* カーネルの実装の一つ。attach は一度に一つ呼ばれ、全部の機能の起動を待たせるので、秒の単位で待たない。長い待ちは実装の
+   thread で行い、失敗は hal_failed で書く。0 で実装が機能を持つ。PCI_NOT_MINE は持たず、次の実装に任せる。負は
    持てなかった理由で、持ち続ける物は実装が持ってよい（電源を切る前に止める物など）。 */
 #define PCI_NOT_MINE 1
 struct pci_driver {
@@ -57,15 +77,16 @@ struct pci_driver {
     size_t match_count;
     int (*attach)(struct pci_device *d);
 };
+void pci_config_init(void); /* the MCFG's windows, before anything may reach another segment (AML) */
 void pci_init(void); /* 列挙して台帳に載せる。実装は結ばない */
 void pci_bind_all(void); /* dev/pci_drivers.c：iommu_init の後、実装の表の順に結ぶ */
-/* Config space access. offsets are 0..4095: below 256 CF8/CFC or ECAM, 256 and up ECAM only (an
-   unreachable register reads as 0xFFFFFFFF and ignores writes). Segment 0 only. */
-uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off);
-void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t v);
-uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off);
-void pci_write16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint16_t v);
-void pci_write8(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint8_t v);
+/* Config space access. offsets are 0..4095. Segment 0 below 256: CF8/CFC or ECAM; everything else
+   ECAM only (an unreachable register reads as 0xFFFFFFFF and ignores writes). */
+uint32_t pci_read32(struct pci_address a, uint16_t off);
+void pci_write32(struct pci_address a, uint16_t off, uint32_t v);
+uint16_t pci_read16(struct pci_address a, uint16_t off);
+void pci_write16(struct pci_address a, uint16_t off, uint16_t v);
+void pci_write8(struct pci_address a, uint16_t off, uint8_t v);
 #define PCI_COMMAND        0x04 /* Command register (7.5.1.1.3), narrow writes preserve Status */
 #define PCI_COMMAND_IO     (1u << 0)  /* I/O Space Enable */
 #define PCI_COMMAND_MEMORY (1u << 1)  /* Memory Space Enable */
@@ -84,7 +105,7 @@ void pci_enable_io(struct pci_device *d);
 bool pci_disable_busmaster(struct pci_device *d, bool *was_mastering);
 int pci_count(void);
 struct pci_device *pci_at(int index);
-struct pci_device *pci_find_function(uint8_t bus, uint8_t dev, uint8_t func);
+struct pci_device *pci_find_function(struct pci_address a);
 /* The PCI-to-PCI bridge whose secondary bus is the function's bus, or NULL on the root buses. */
 struct pci_device *pci_upstream(const struct pci_device *d);
 /* Whether o is below bridge b (on one of its buses), and whether a and b are functions of one
@@ -231,14 +252,14 @@ struct pci_device *pci_bus_reset_port(const struct pci_device *d);
    set to Enter Compliance (4.2.7.2.2). */
 bool pci_bus_reset(struct pci_device *port);
 /* A configuration access by software other than the function's reset (AML's PCI_Config regions,
-   dev/acpi.c), from any CPU: false, and nothing reaches bus:dev.func, while it is kept from such
+   dev/acpi.c), from any CPU: false, and nothing reaches the function, while it is kept from such
    software: during a reset attempt or a bus reset, up to the readiness limit of an FLR issued,
    and while it last answered RRS (until its Vendor ID read, repeated here, gives its ID). The
    check and the access are one step: a reset that begins on another CPU waits for an access
    under way. A read gives the dword at off & ~3 (all-ones when dropped); a write is bytes wide
    (1, 2 or 4) at off aligned to it. The first refusal during each reset is logged. */
-bool pci_config_firmware_read(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t *v);
-bool pci_config_firmware_write(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t v, unsigned bytes);
+bool pci_config_firmware_read(struct pci_address a, uint16_t off, uint32_t *v);
+bool pci_config_firmware_write(struct pci_address a, uint16_t off, uint32_t v, unsigned bytes);
 /* A driver's read of another function on its path (dev/pciuser.c): false while d has a reset
    record (d->reset: a reset under way, or one left to finish), checked and read in one step like
    the firmware's accesses. The dword at off & ~3. */

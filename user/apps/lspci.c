@@ -28,7 +28,7 @@ int main(void) {
     struct n_pciinfo p[64];
     int n = pcilist(p, 64);
     for (int i = 0; i < n; i++)
-        printf("%02x:%02x.%x %s: %s [%04x:%04x]\n", p[i].bus, p[i].dev, p[i].func, cls(p[i].cls, p[i].subcls),
+        printf("%04x:%02x:%02x.%x %s: %s [%04x:%04x]\n", p[i].segment, p[i].bus, p[i].dev, p[i].func, cls(p[i].cls, p[i].subcls),
                vendor(p[i].vendor), p[i].vendor, p[i].device);
     return 0;
 }

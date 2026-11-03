@@ -21,7 +21,7 @@ struct nvrm *nvrm_connect_ready(void);
    -N_ERR_NOT_READY when it answered but is not ready, or the failure to reach it
    (nvrm_connect_device_status). */
 int64_t nvrm_connect_ready_status(struct nvrm **out);
-/* Select a domain-zero PCI function, encoded by N_PCI_TARGET(bus, dev, func). */
+/* Select a PCI function, encoded by N_PCI_TARGET. */
 struct nvrm *nvrm_connect_device(uint32_t pci_target);
 /* 0 with *out set; otherwise a negative native N_ERR_* result. In particular,
    endpoint absence is not confused with OOM or an invalid protocol reply. */

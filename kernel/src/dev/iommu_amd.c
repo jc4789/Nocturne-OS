@@ -156,6 +156,7 @@ struct unit {
     uint64_t word_at; /* its physical address */
     uint64_t token, restarted;
     struct wait_queue done;
+    uint16_t segment;      /* the PCI segment group it serves (IVHD): every ID below is one of its */
     struct span *listed;   /* the IDs its IVHD names: those it may have cached entries of */
     size_t nlisted, listed_room;
 };
@@ -165,15 +166,23 @@ static bool np_cache; /* a unit caches not-present entries */
 /* The CPUs are in x2APIC mode (arch/apic.c): every unit has XTEn and GAEn (2.2.5.3), which
    select the 128-bit remapping entry with its 32-bit destination, all units using one entry size
    (2.2.5.2). */
-/* The device table and the completion words. A device table entry belongs to the domain of its
-   ID, whose attach and block the common part's attach_mutex orders; an interrupt remapping entry
-   changes in one store (irte_store). What a unit reads of them is invalidated by its own batch. */
-static uint64_t devtab, sems;
+/* The device tables, one for each segment a unit serves, an ID being unique within its segment (and
+   every unit of a segment shares its table), and the completion words. A device table entry belongs
+   to the domain of its ID, whose attach and block the common part's attach_mutex orders; an interrupt
+   remapping entry changes in one store (irte_store). What a unit reads of them is invalidated by its
+   own batch. */
+struct device_table {
+    uint16_t segment;
+    uint64_t phys;
+};
+static struct device_table *device_tables;
+static size_t ndevice_tables, device_tables_room;
+static uint64_t sems;
 static size_t sem_pages;
 
-/* IVRS: requests of first..last arrive as `as` */
+/* IVRS: requests of first..last of a segment arrive as `as` */
 struct alias {
-    uint16_t first, last, as;
+    uint16_t segment, first, last, as;
 };
 static struct alias *aliases;
 static size_t naliases, aliases_room;
@@ -193,10 +202,10 @@ static uint16_t u16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static bool engines_off(const struct unit *u, bool wait);
 
 /* ---- IVRS ---- */
-static void alias_add(uint16_t first, uint16_t last, uint16_t as) {
+static void alias_add(uint16_t segment, uint16_t first, uint16_t last, uint16_t as) {
     if (first > last) { parse_lost = true; return; }
     struct alias *a = kappend(&aliases, &naliases, &aliases_room, sizeof *a);
-    if (a) *a = (struct alias){first, last, as};
+    if (a) *a = (struct alias){segment, first, last, as};
     else parse_lost = true;
 }
 
@@ -204,7 +213,7 @@ static void alias_add(uint16_t first, uint16_t last, uint16_t as) {
    it cached of them is invalidated where it cannot invalidate everything at once */
 static void listed_add(struct unit *u, uint16_t first, uint16_t last, bool cover) {
     if (first > last) { parse_lost = true; return; }
-    if (cover) iommu_cover(first, last);
+    if (cover) iommu_cover(u->segment, first, last);
     struct span *s = kappend(&u->listed, &u->nlisted, &u->listed_room, sizeof *s);
     if (s) *s = (struct span){first, last};
     else parse_lost = true;
@@ -233,7 +242,7 @@ static void parse_devices(struct unit *u, const uint8_t *b, uint32_t at, uint32_
         case 0x42:
             listed_add(u, id, id, true);
             listed_add(u, u16(b + at + 5), u16(b + at + 5), true);
-            alias_add(id, id, u16(b + at + 5));
+            alias_add(u->segment, id, id, u16(b + at + 5));
             break;
         case 0x43:
             if (range) parse_lost = true;
@@ -244,16 +253,16 @@ static void parse_devices(struct unit *u, const uint8_t *b, uint32_t at, uint32_
             if (range) listed_add(u, first, id, true);
             if (range && alias_range) {
                 listed_add(u, as, as, true);
-                alias_add(first, id, as);
+                alias_add(u->segment, first, id, as);
             }
             range = alias_range = false;
             break;
         case 0x48:
-            iommu_kernel_id(u16(b + at + 5));
+            iommu_kernel_id((struct iommu_id){u->segment, u16(b + at + 5)});
             listed_add(u, u16(b + at + 5), u16(b + at + 5), false);
             break;
         case 0xF0:
-            iommu_kernel_id(id); /* ACPI-named platform device: not a PCI claim's requester */
+            iommu_kernel_id((struct iommu_id){u->segment, id}); /* ACPI-named platform device: not a PCI claim's requester */
             listed_add(u, id, id, false);
             break;
         }
@@ -266,7 +275,6 @@ static void parse_devices(struct unit *u, const uint8_t *b, uint32_t at, uint32_
    access its IR and IW flags give (none: not mapped), or excluded from translation (then
    reached as it is, the flags ignored). A claimed function's domain maps it as it is. */
 static void parse_memory(const uint8_t *b) {
-    if (b[0] != 0x20 && u16(b + 8)) return; /* PCI segment, Table 110 */
     unsigned flags = b[1], access = flags & 8 ? IOMMU_READ | IOMMU_WRITE
                                   : (flags & 2 ? IOMMU_READ : 0) | (flags & 4 ? IOMMU_WRITE : 0);
     uint64_t start, length;
@@ -277,7 +285,11 @@ static void parse_memory(const uint8_t *b) {
         parse_lost = true;
         return;
     }
-    if (length) iommu_reserved(first, last, ALIGN_DOWN(start, PAGE_SIZE), ALIGN_UP(start + length, PAGE_SIZE), access);
+    if (!length) return;
+    uint64_t from = ALIGN_DOWN(start, PAGE_SIZE), to = ALIGN_UP(start + length, PAGE_SIZE);
+    if (b[0] != 0x20) iommu_reserved(u16(b + 8), first, last, from, to, access); /* PCI segment, Table 110 */
+    else /* every peripheral, whichever unit serves it */
+        for (size_t i = 0; i < nunits; i++) iommu_reserved(units[i].segment, first, last, from, to, access);
 }
 
 static struct unit *unit_at(uint64_t base) {
@@ -321,7 +333,6 @@ static bool parse_ivrs(const struct acpi_sdt *h) {
             if (len < 4 || len > h->length - off) { parse_lost = true; break; }
             if (ivhd_read(h, type, ivinfo)) {
                 if (len < (type == 0x10 ? 24 : 40)) { parse_lost = true; break; }
-                if (u16(b + off + 16)) { off += len; continue; } /* this PCI layer addresses segment zero */
                 uint64_t base;
                 memcpy(&base, b + off + 8, 8);
                 struct unit *u = unit_at(base);
@@ -330,7 +341,7 @@ static bool parse_ivrs(const struct acpi_sdt *h) {
                     parse_lost = true;
                 } else if (pass == 0 && !u) {
                     if ((u = kappend(&units, &nunits, &units_room, sizeof *u)))
-                        *u = (struct unit){.base = base, .type = type};
+                        *u = (struct unit){.base = base, .type = type, .segment = u16(b + off + 16)};
                     else
                         parse_lost = true;
                 } else if (pass == 0 && type > u->type) {
@@ -345,8 +356,8 @@ static bool parse_ivrs(const struct acpi_sdt *h) {
                     u->msi_num = u16(b + off + 18) & 31;
                     if (type != 0x10) u->hat_dis = (b[off + 20] & 1) != 0;
                     u->efr = ivhd_features(b + off, ivinfo);
-                    u->fn = pci_find_function(id >> 8, (id >> 3) & 31, id & 7);
-                    iommu_kernel_id(id);
+                    u->fn = pci_find_function(pci_address_of(u->segment, id));
+                    iommu_kernel_id((struct iommu_id){u->segment, id});
                     parse_devices(u, b, off + (type == 0x10 ? 24 : 40), off + len);
                 }
             } else if (pass == 1 && type >= 0x20 && type <= 0x22) {
@@ -382,12 +393,10 @@ static bool ivrs_plain_safe(const struct acpi_sdt *h) {
             struct unit *known = unit_at(base);
             struct unit u = {.base = base, .regs = known ? known->regs : NULL};
             if (!u.regs && !(u.regs = vmm_map_mmio(base, MMIO_BYTES))) return false;
-            /* Include nonzero PCI segments: their physical register addresses are still
-               known even though this PCI layer cannot configure their functions. */
             uint16_t id = u16(b + at + 4), cap = u16(b + at + 6);
-            struct pci_device *fn = !u16(b + at + 16) && cap >= 0x40 && cap <= 0xEC && !(cap & 3)
-                ? pci_find_function(id >> 8, (id >> 3) & 31, id & 7) : NULL;
-            uint32_t header = fn ? pci_read32(fn->bus, fn->dev, fn->func, cap) : 0;
+            struct pci_device *fn = cap >= 0x40 && cap <= 0xEC && !(cap & 3)
+                ? pci_find_function(pci_address_of(u16(b + at + 16), id)) : NULL;
+            uint32_t header = fn ? pci_read32(fn->address, cap) : 0;
             u.mmio_efr = ((summary & 1) || (header & CAP_EFR)) ? rd(&u, R_EFR) : 0;
             /* neither the image nor the register may hide an existing engine */
             if (type != 0x10) memcpy(&u.efr, b + at + 24, sizeof u.efr);
@@ -497,13 +506,14 @@ static void event_show(const struct unit *u, const volatile uint32_t *e) {
     unsigned code = e[1] >> 28;
     uint16_t id = e[0] & 0xFFFF;
     uint64_t address = e[2] | (uint64_t)e[3] << 32;
+    struct pci_address a = pci_address_of(u->segment, id);
     if (!iommu_fault_report()) return;
     if (code == EVENT_PAGE_FAULT) {
         uint32_t flags = e[1] >> 16;
-        kprintf("iommu: %02x:%02x.%u: %s at %lx blocked (domain %u)\n", id >> 8, (id >> 3) & 31, id & 7,
+        kprintf("iommu: %04x:%02x:%02x.%x: %s at %lx blocked (domain %u)\n", PCI_ADDRESS_ARGS(a),
                 flags & 8 ? "interrupt" : flags & 32 ? "DMA write" : "DMA read", address, e[1] & 0xFFFF);
     } else if (code == EVENT_ILLEGAL_DTE) {
-        kprintf("iommu: %02x:%02x.%u: the unit rejected its device table entry\n", id >> 8, (id >> 3) & 31, id & 7);
+        kprintf("iommu: %04x:%02x:%02x.%x: the unit rejected its device table entry\n", PCI_ADDRESS_ARGS(a));
     } else {
         kprintf("iommu: unit at %lx reports event %u (%08x %08x %08x %08x)\n", u->base, code, e[0], e[1], e[2], e[3]);
     }
@@ -627,8 +637,17 @@ static bool on_every_unit(void (*fill)(struct unit *u, const void *arg), const v
 }
 
 /* ---- device table ---- */
-static void dte_write(uint16_t id, uint64_t q0, uint64_t q1, uint64_t q2) {
-    volatile uint64_t *e = (volatile uint64_t *)phys_to_virt(devtab) + id * 4;
+static uint64_t device_table_of(uint16_t segment) {
+    for (size_t i = 0; i < ndevice_tables; i++)
+        if (device_tables[i].segment == segment) return device_tables[i].phys;
+    return 0;
+}
+
+/* The common part attaches only IDs a unit covers (iommu_cover): a table of that segment is there. */
+static void dte_write(struct iommu_id id, uint64_t q0, uint64_t q1, uint64_t q2) {
+    uint64_t table = device_table_of(id.segment);
+    ASSERT(table);
+    volatile uint64_t *e = (volatile uint64_t *)phys_to_virt(table) + (size_t)id.requester * 4;
     e[3] = 0;
     e[2] = q2;
     e[1] = q1;
@@ -641,8 +660,9 @@ static void dte_write(uint16_t id, uint64_t q0, uint64_t q1, uint64_t q2) {
 static void entry_flush(struct unit *u, const void *arg) {
     const struct iommu_domain *dom = arg;
     for (unsigned i = 0; i < dom->nids; i++) {
-        command(u, CMD_INV_DEVTAB, dom->ids[i], 0, 0, 0);
-        command(u, CMD_INV_IRT, dom->ids[i], 0, 0, 0);
+        if (dom->ids[i].segment != u->segment) continue;
+        command(u, CMD_INV_DEVTAB, dom->ids[i].requester, 0, 0, 0);
+        command(u, CMD_INV_IRT, dom->ids[i].requester, 0, 0, 0);
     }
 }
 static void pages_flush(struct unit *u, const void *arg) { domain_flush(u, ((const struct iommu_domain *)arg)->id); }
@@ -652,7 +672,8 @@ static void block_flush(struct unit *u, const void *arg) {
 }
 static void irt_flush(struct unit *u, const void *arg) {
     const struct iommu_domain *dom = arg;
-    for (unsigned i = 0; i < dom->nids; i++) command(u, CMD_INV_IRT, dom->ids[i], 0, 0, 0);
+    for (unsigned i = 0; i < dom->nids; i++)
+        if (dom->ids[i].segment == u->segment) command(u, CMD_INV_IRT, dom->ids[i].requester, 0, 0, 0);
 }
 
 static bool amd_attach(struct iommu_domain *dom) {
@@ -695,9 +716,10 @@ static bool amd_is_leaf(uint64_t entry, unsigned level) {
     return !(entry & PTE_NEXT_LEVEL) || (entry & PTE_NEXT_LEVEL) == PTE_NEXT_LEVEL;
 }
 
-static uint16_t amd_alias(uint16_t id) {
+static struct iommu_id amd_alias(struct iommu_id id) {
     for (size_t i = 0; i < naliases; i++)
-        if (id >= aliases[i].first && id <= aliases[i].last) return aliases[i].as;
+        if (id.segment == aliases[i].segment && id.requester >= aliases[i].first && id.requester <= aliases[i].last)
+            return (struct iommu_id){id.segment, aliases[i].as};
     return id;
 }
 
@@ -782,7 +804,7 @@ static bool program(struct unit *u) {
             return false;
         }
     }
-    wr(u, R_DEVTAB, devtab | (DT_BYTES / PAGE_SIZE - 1));
+    wr(u, R_DEVTAB, device_table_of(u->segment) | (DT_BYTES / PAGE_SIZE - 1));
     wr(u, R_CMDBUF, u->cmd | RING_LEN);
     wr(u, R_EVENTLOG, u->events | RING_LEN);
     wr(u, R_CMD_HEAD, 0);
@@ -867,14 +889,15 @@ static bool amd_resume(void) {
 }
 
 static void tables_free(void) {
-    if (devtab) pmm_free_contig(devtab, DT_BYTES / PAGE_SIZE);
+    for (size_t i = 0; i < ndevice_tables; i++) pmm_free_contig(device_tables[i].phys, DT_BYTES / PAGE_SIZE);
+    ndevice_tables = 0;
     if (sems) pmm_free_contig(sems, sem_pages);
     for (size_t i = 0; i < nunits; i++) {
         if (units[i].cmd) pmm_free(units[i].cmd);
         if (units[i].events) pmm_free(units[i].events);
         units[i].cmd = units[i].events = 0;
     }
-    devtab = sems = 0;
+    sems = 0;
 }
 
 /* One PCI function may represent several units and exposes MSI or MSI-X, not necessarily MSI
@@ -920,9 +943,16 @@ static void event_interrupts_enable(void) {
 static bool amd_start(bool translate) {
     if (!translate) return false;
     sem_pages = ALIGN_UP(nunits * sizeof(uint64_t), PAGE_SIZE) / PAGE_SIZE;
-    devtab = iommu_alloc_pages(DT_BYTES / PAGE_SIZE);
     sems = iommu_alloc_pages(sem_pages);
-    bool ok = devtab && sems;
+    bool ok = sems != 0;
+    for (size_t i = 0; ok && i < nunits; i++) {
+        if (device_table_of(units[i].segment)) continue;
+        uint64_t table = iommu_alloc_pages(DT_BYTES / PAGE_SIZE);
+        struct device_table *t = table ? kappend(&device_tables, &ndevice_tables, &device_tables_room, sizeof *t) : NULL;
+        if (t) *t = (struct device_table){units[i].segment, table};
+        else if (table) pmm_free_contig(table, DT_BYTES / PAGE_SIZE);
+        ok = t != NULL;
+    }
     for (size_t i = 0; i < nunits; i++) {
         units[i].cmd = iommu_alloc_pages(1);
         units[i].events = iommu_alloc_pages(1);
@@ -933,7 +963,7 @@ static bool amd_start(bool translate) {
         tables_free();
         return false;
     }
-    if (!amd.coherent) iommu_cache_flush(phys_to_virt(devtab), DT_BYTES);
+    for (size_t i = 0; !amd.coherent && i < ndevice_tables; i++) iommu_cache_flush(phys_to_virt(device_tables[i].phys), DT_BYTES);
     for (size_t i = 0; i < nunits; i++) {
         units[i].word_at = sems + i * sizeof(uint64_t);
         units[i].word = phys_to_virt(units[i].word_at); /* zero: no token is */
@@ -1024,10 +1054,10 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
             goto rejected;
         }
         /* without its function the capability header is unknown: assume the cautious answers */
-        uint32_t header = u->fn ? pci_read32(u->fn->bus, u->fn->dev, u->fn->func, u->cap)
+        uint32_t header = u->fn ? pci_read32(u->fn->address, u->cap)
                                 : CAP_NP_CACHE | (ivinfo & 1 ? CAP_EFR : 0);
         u->mmio_efr = ((header & CAP_EFR) || (ivinfo & 1)) ? rd(u, R_EFR) : 0;
-        uint32_t info = u->fn ? pci_read32(u->fn->bus, u->fn->dev, u->fn->func, u->cap + 0x10) : ivinfo;
+        uint32_t info = u->fn ? pci_read32(u->fn->address, u->cap + 0x10) : ivinfo;
         unsigned va = (info >> 15) & 0x7F, pa = (info >> 8) & 0x7F;
         /* Only these widths are defined by Capability+10h (3.2, pp203-204). No guessed
            width is safe: a high bit could be discarded or a table address truncated. */
@@ -1042,9 +1072,10 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
         np_cache |= (header & CAP_NP_CACHE) != 0;
         amd.coherent &= (u->flags & 32) != 0;
         uint64_t control = rd(u, R_CONTROL);
-        kprintf("iommu: AMD-Vi unit at %lx (IVHD %02xh, function %02x:%02x.%u), extended features %lx "
-                "(register %lx); left with control %lx, status %lx\n", u->base, u->type, u->fn ? u->fn->bus : 0,
-                u->fn ? u->fn->dev : 0, u->fn ? u->fn->func : 0, u->efr, u->mmio_efr, control, rd(u, R_STATUS));
+        struct pci_address at = u->fn ? u->fn->address : (struct pci_address){u->segment, 0, 0, 0};
+        kprintf("iommu: AMD-Vi unit at %lx (IVHD %02xh, function %04x:%02x:%02x.%x), extended features %lx "
+                "(register %lx); left with control %lx, status %lx\n", u->base, u->type, PCI_ADDRESS_ARGS(at), u->efr,
+                u->mmio_efr, control, rd(u, R_STATUS));
         if (left_in_os_ram(u, control))
             kprintf("iommu: unit at %lx was left on with its tables in RAM the OS owns: what it read and "
                     "wrote there until now is not known\n", u->base);

@@ -156,8 +156,6 @@ bool usb_send_open(struct usb_device *d, uint8_t address, unsigned size, unsigne
  * holding no spinlock: it takes the endpoint's lock. The caller keeps the device from being
  * removed meanwhile (its class driver's detach waits for it). */
 int usb_send(struct usb_device *d, uint8_t address, const void *a, unsigned alen, const void *b, unsigned blen);
-/* The devices there at start are still being looked at: their disks may yet appear. */
-bool usb_enumerating(void);
 
 /* hub support, on the worker */
 struct usb_device *usb_attach_child(struct usb_device *hub, unsigned port, unsigned speed, unsigned rank);

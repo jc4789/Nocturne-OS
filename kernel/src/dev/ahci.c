@@ -1,6 +1,6 @@
 /* SATA disks behind AHCI host bus adapters (Serial ATA AHCI 1.3.1), the way nearly every PC
    attaches them. Every implemented port is set up, with a disk or without (10.1.2); every ATA disk
-   that is or comes on one becomes a block device "sataN"; ATAPI drives and port multipliers are
+   that is or comes on one becomes a block device "sataA.P"; ATAPI drives and port multipliers are
    skipped.
 
    A port has as many command slots as its adapter gives (CAP.NCS). A disk with native command
@@ -187,6 +187,7 @@ struct port {
     struct disk *disk; /* the last one seen; written with the port to itself */
     struct disk *disks; /* atomic: every one it has seen, newest first */
     uint64_t retry_at, retry_ns; /* a device that did not answer: its next look (the examiner's) */
+    bool looking; /* atomic: it counts in blk_looking until a look has said who is there (port_looked) */
     /* An adapter that reaches only the first 4 GiB: every transfer through this buffer below it,
        one at a time under low_lock. NULL for every other. */
     uint8_t *low;
@@ -204,8 +205,8 @@ struct port {
        port reported what it goes on through, and whoever waits must stop it; fatal: an error was
        reported of which no command is known to have ended well, until the engines stop; noted: the
        adapter's thread has this port's link change to see to; unverified: who is on the port is not
-       known since a link change, an adapter reset or a sleep, and the adapter's thread alone may
-       give it commands until it knows (port_examine). A caller waiting for room sleeps in room
+       known since a link change, an adapter reset or a sleep, and the thread looking alone may give
+       it commands until it knows (port_examine: first_look, or the adapter's thread). A caller waiting for room sleeps in room
        while freed still reads what it read before it looked. */
     struct spinlock lock;
     uint32_t taken, issued, queued, all;
@@ -215,6 +216,7 @@ struct port {
     struct wait_queue room;
     uint64_t freed;
     struct slot slots[PORTS];
+    struct mutex examining; /* one look at who is on the port at a time: its first, a link change's */
 };
 
 struct hba {
@@ -240,8 +242,8 @@ struct hba {
     struct wait_queue wq;
 };
 
-static struct hba *hbas; /* set up at boot, before anything else looks */
-static int nhbas, ndisks;
+static struct hba *hbas; /* added to in attach, before any power change */
+static int nhbas;
 
 static uint32_t hba_rd(struct hba *h, unsigned off) { return mmio_read32(h->regs + off); }
 static void hba_wr(struct hba *h, unsigned off, uint32_t v) { mmio_write32(h->regs + off, v); }
@@ -579,7 +581,16 @@ static bool port_up(struct port *p) {
     }
     wr(p, PxCMD, rd(p, PxCMD) | CMD_SUD | CMD_POD | CMD_FRE);
     if (reset && !comreset(p)) return port_up_failed(p);
-    if (!wait_reg(p, PxTFD, TFD_BSY | TFD_DRQ, 0, READY_NS)) {
+    /* The disk's own time, up to READY_NS: the ports beside it have the adapter meanwhile. An adapter
+       reset under it leaves the port to be set up again. */
+    hba_unlock(h, may_sleep());
+    bool ready = wait_reg(p, PxTFD, TFD_BSY | TFD_DRQ, 0, READY_NS);
+    hba_lock(h);
+    if (__atomic_load_n(&h->lost, __ATOMIC_ACQUIRE)) {
+        port_want_reset(p);
+        return false;
+    }
+    if (!ready) {
         kprintf("ahci%d: port %u: the disk does not become ready (status %x)\n", h->index, p->no, rd(p, PxTFD));
         return port_up_failed(p);
     }
@@ -703,7 +714,8 @@ static void port_changed(struct port *p);
 /* A slot of the live port for a command: a queued one (alone false) beside the other queued ones,
    or the port to itself (no command in it, no other let in). A port that is not live is set up
    first, by the caller that finds it so once it is empty. -1 when it cannot be. While who is on the
-   port is not known a caller waits for the adapter's thread, which ends each look in its time. When
+   port is not known a caller waits for the look (first_look, or the adapter's thread), which ends in
+   its time. When
    that look found nothing to go by, or a power change has stopped the thread, it waits as long as
    a command may take, and then it is -2. The thread that holds the disks finds out itself, the
    adapter's thread waiting for it, and where nothing may sleep it is -2 at once. examining: the one
@@ -1116,11 +1128,15 @@ static bool same_disk(const struct disk *a, const struct disk *b) {
     return !memcmp(a->serial, b->serial, sizeof a->serial) && a->blk.sectors == b->blk.sectors && a->block == b->block;
 }
 
+static void port_looked(struct port *p) {
+    if (__atomic_exchange_n(&p->looking, false, __ATOMIC_ACQ_REL)) blk_looking_end();
+}
+
 /* Who is on the port now: reset, and asked. A disk it knew goes on if it is the one there; the one it
    had, if another or nothing is there, is gone until it comes back. A device that is there and does
    not answer yet says nothing of who it is: what the port had stays, its callers kept waiting
    (unverified), and the adapter's thread looks again (retry_at), as it does after no memory. One
-   caller at a time: the start, then the adapter's thread. */
+   caller at a time: examining, or the thread holding the disks, while nothing else runs. */
 static void port_examine(struct port *p) {
     struct hba *h = p->h;
     struct disk *had = p->disk, *known = NULL, *found = kzalloc(sizeof *found);
@@ -1196,9 +1212,10 @@ static void port_examine(struct port *p) {
     }
     if (known || !is_disk) {
         kfree(found);
+        if (!again) port_looked(p);
         return;
     }
-    ksnprintf(found->blk.name, sizeof found->blk.name, "sata%d", __atomic_fetch_add(&ndisks, 1, __ATOMIC_RELAXED));
+    ksnprintf(found->blk.name, sizeof found->blk.name, "sata%d.%u", h->index, p->no);
     strlcpy(found->blk.model, model, sizeof found->blk.model);
     found->blk.block = found->block;
     found->blk.read = blk_ahci_read;
@@ -1212,11 +1229,13 @@ static void port_examine(struct port *p) {
     else
         kprintf("ahci%d: port %u: %s, one command at a time%s\n", h->index, p->no, model, cache);
     blk_register(&found->blk);
+    port_looked(p);
 }
 
 /* The port's link changed, or the adapter slept: its commands stopped, a COMRESET whichever way it
    came (6.2.2.3), its events cleared with PxSERR, and then whoever is there looked at. */
 static void port_changed(struct port *p) {
+    mutex_lock(&p->examining);
     uint64_t f = spin_lock(&p->lock);
     p->live = false;
     p->need_reset = true;
@@ -1225,15 +1244,53 @@ static void port_changed(struct port *p) {
     spin_unlock(&p->lock, f);
     halt(p, 0xFFFFFFFFu);
     port_examine(p);
+    mutex_unlock(&p->examining);
+}
+
+static int start(struct hba *h);
+
+/* The first look at a port where a device shows, beside the other ports': a disk still spinning up
+   takes its whole time, and the disks beside it do not wait for that. It counts as a request of the
+   disks, as the adapter's thread does. */
+static void first_look(void *arg) {
+    struct port *p = arg;
+    blk_busy_begin();
+    mutex_lock(&p->examining);
+    port_examine(p);
+    mutex_unlock(&p->examining);
+    blk_busy_end();
+    /* its retry time is for the adapter's thread to see */
+    __atomic_add_fetch(&p->h->kicks, 1, __ATOMIC_RELEASE);
+    wq_wake_all(&p->h->wq);
+}
+
+static void first_looks(struct hba *h) {
+    for (unsigned n = 0; n < PORTS; n++) {
+        struct port *p = h->ports[n];
+        if (!p || !(rd(p, PxSSTS) & 0xF)) continue; /* 0: nothing there yet */
+        char name[24];
+        ksnprintf(name, sizeof name, "ahci%d.%u", h->index, n);
+        p->looking = true;
+        blk_looking_begin();
+        if (!kthread_create(name, first_look, p)) hba_note(h, n); /* for the adapter's thread, in its turn */
+    }
 }
 
 /* The adapter's thread. What it does counts as a request of the disks (blk_busy_begin): a power
    change waits for it, and it waits for that. It looks again at the ports whose devices did not
    answer, once their time comes. Polled, it looks at the links itself each second. Of the ports to
    look at, the next is one where a device shows: an empty one takes its COMRESET's whole time, and a
-   disk's callers are waiting. */
+   disk's callers are waiting. It starts the adapter first: all of that can take seconds, the
+   firmware's handover and a staggered spin-up, and no disk elsewhere waits for that. */
 static void ahci_worker(void *arg) {
     struct hba *h = arg;
+    blk_busy_begin();
+    int r = start(h);
+    blk_busy_end();
+    if (r < 0) hal_failed(&h->pci->hal, ahci_driver.name, r);
+    else first_looks(h);
+    blk_looking_end();
+    if (r < 0) return;
     for (;;) {
         uint64_t seen = __atomic_load_n(&h->kicks, __ATOMIC_ACQUIRE);
         uint64_t now = clock_now_ns(), next = h->irq ? CLOCK_NEVER : now + NS_PER_S;
@@ -1285,7 +1342,6 @@ static int start(struct hba *h) {
         kprintf("ahci%d: no memory to map its registers\n", h->index);
         return -N_ERR_NO_MEMORY;
     }
-    pci_enable_busmaster(pci);
     hba_take(h);
     uint32_t cap = hba_rd(h, CAP);
     h->implemented = hba_rd(h, PI);
@@ -1304,19 +1360,7 @@ static int start(struct hba *h) {
     mutex_lock(&h->reset);
     bool up = hba_set_up(h, false);
     mutex_unlock(&h->reset);
-    if (!up) return -N_ERR_IO;
-    for (unsigned n = 0; n < PORTS; n++) {
-        struct port *p = h->ports[n];
-        if (p && rd(p, PxSSTS) & 0xF) port_examine(p); /* 0: nothing there yet */
-    }
-    char name[16];
-    ksnprintf(name, sizeof name, "ahci%d", h->index);
-    if (!kthread_create(name, ahci_worker, h)) { /* nothing would know who is on a port after a link change */
-        kprintf("ahci%d: no thread for its link changes\n", h->index);
-        hba_kill(h);
-        return -N_ERR_NO_MEMORY;
-    }
-    return 0;
+    return up ? 0 : -N_ERR_IO;
 }
 
 /* On a board that spins its disks up in turn, before the power goes away (10.10.3): a disk told to
@@ -1412,9 +1456,17 @@ static int ahci_attach(struct pci_device *p) {
     struct hba **tail = &hbas;
     while (*tail) tail = &(*tail)->next;
     *tail = h;
-    int r = start(h);
     if (!h->index) pm_register(&ahci_pm);
-    return r;
+    pci_enable_busmaster(p);
+    blk_looking_begin();
+    char name[16];
+    ksnprintf(name, sizeof name, "ahci%d", h->index);
+    if (!kthread_create(name, ahci_worker, h)) {
+        kprintf("ahci%d: no thread to start it\n", h->index);
+        blk_looking_end();
+        return -N_ERR_NO_MEMORY;
+    }
+    return 0;
 }
 
 static const struct n_pci_match ahci_matches[] = {N_PCI_CLASS_PROGIF(0x01, 0x06, 0x01)};

@@ -323,7 +323,7 @@ static void screen_cases(const struct n_pciinfo *list, int n) {
         failed++;
         return;
     }
-    n_handle vga = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), list[at].bus, list[at].dev, list[at].func);
+    n_handle vga = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[at].segment, list[at].bus, list[at].dev, list[at].func));
     CHECK(vga >= 0, "claim the VGA: %s", n_result_text(vga));
     if (vga < 0) return;
     struct n_pci_function info;
@@ -778,7 +778,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
         failed++;
         return;
     }
-    n_handle vga = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), list[at].bus, list[at].dev, list[at].func);
+    n_handle vga = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[at].segment, list[at].bus, list[at].dev, list[at].func));
     CHECK(vga >= 0, "claim the VGA to give the screen: %s", n_result_text(vga));
     if (vga < 0) return;
     struct n_pci_function info;
@@ -923,7 +923,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     n_handle_close(surface);
     if (bar >= 0) n_handle_close(bar);
     n_handle_close(vga);
-    vga = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), list[at].bus, list[at].dev, list[at].func);
+    vga = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[at].segment, list[at].bus, list[at].dev, list[at].func));
     CHECK(vga >= 0, "the VGA claimed again: %s", n_result_text(vga));
     if (vga < 0) return;
     bar = n_pci_bar(vga, 0);
@@ -946,7 +946,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
 static int stuck_holder(void) {
     struct n_pciinfo list[128];
     int n = pcilist(list, 128), at = find_vga(list, n);
-    n_handle vga = at < 0 ? -1 : n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), list[at].bus, list[at].dev, list[at].func);
+    n_handle vga = at < 0 ? -1 : n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[at].segment, list[at].bus, list[at].dev, list[at].func));
     if (vga < 0 || n_pci_hold_screen(vga, true) != 0) return 2;
     for (;;) n_sleep_until(n_clock_after(60000 * N_NS_PER_MS));
 }
@@ -971,7 +971,7 @@ static void stuck_holder_cases(const char *program, const struct n_pciinfo *list
     n_result early = n_app_result(holder, n_clock_after((uint64_t)seconds * N_NS_PER_S / 2), &status);
     CHECK(early == -N_ERR_TIMEOUT, "the holder keeps the screen before the limit: %s status %d", n_result_text(early),
           status);
-    n_handle busy = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), list[at].bus, list[at].dev, list[at].func);
+    n_handle busy = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[at].segment, list[at].bus, list[at].dev, list[at].func));
     CHECK(busy == -N_ERR_BUSY, "the VGA is still the holder's: %s", n_result_text(busy));
     if (busy >= 0) n_handle_close(busy);
     n_result ended = n_app_result(holder, n_clock_after(((uint64_t)seconds + 10) * N_NS_PER_S), &status);
@@ -979,7 +979,7 @@ static void stuck_holder_cases(const char *program, const struct n_pciinfo *list
           n_result_text(ended), status);
     if (ended < 0) n_app_stop(holder, 0);
     n_handle_close(holder);
-    n_handle vga = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), list[at].bus, list[at].dev, list[at].func);
+    n_handle vga = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[at].segment, list[at].bus, list[at].dev, list[at].func));
     CHECK(vga >= 0, "the VGA can be claimed again: %s", n_result_text(vga));
     if (vga < 0) return;
     CHECK(n_pci_hold_screen(vga, true) == 0 && n_pci_hold_screen(vga, false) == 0, "and held and given back");
@@ -1036,8 +1036,8 @@ static void reset_cases(const struct n_pciinfo *list, int n) {
         return;
     }
     const struct n_pciinfo *v = &list[at];
-    n_handle pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), v->bus, v->dev, v->func);
-    CHECK(pci >= 0, "claim the virtio function %02x:%02x.%u: %s", v->bus, v->dev, v->func, n_result_text(pci));
+    n_handle pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(v->segment, v->bus, v->dev, v->func));
+    CHECK(pci >= 0, "claim the virtio function %04x:%02x:%02x.%x: %s", v->segment, v->bus, v->dev, v->func, n_result_text(pci));
     if (pci < 0) return;
     struct n_pci_function info;
     n_result described = n_pci_info(pci, &info);
@@ -1048,7 +1048,7 @@ static void reset_cases(const struct n_pciinfo *list, int n) {
     CHECK(cmd >= 0 && n_pci_config_write(pci, 4, 2, (uint32_t)cmd | 6) == 0, "command: memory and bus master");
     CHECK(virtio_status(pci, 1) == 1, "the virtio device status takes ACKNOWLEDGE");
     n_handle_close(pci); /* bus mastering still on: the driver did not stop it */
-    pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), v->bus, v->dev, v->func);
+    pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(v->segment, v->bus, v->dev, v->func));
     if (!(info.flags & N_PCI_ISOLATED)) {
         CHECK(pci == -N_ERR_NOT_READY, "a crashed nonisolated function cannot be reopened: %s", n_result_text(pci));
         if (pci >= 0) n_handle_close(pci);
@@ -1109,7 +1109,7 @@ static int dma_allocation_case(const char *text) {
         }
         capacity *= 2;
     }
-    n_handle pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), edu.bus, edu.dev, edu.func), mem = -1, views[2] = {-1, -1};
+    n_handle pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(edu.segment, edu.bus, edu.dev, edu.func)), mem = -1, views[2] = {-1, -1};
     void *maps[2] = {NULL, NULL};
     uint64_t *addresses = NULL;
     CHECK(pci >= 0, "DMA診断のEDU claim: %s", n_result_text(pci));
@@ -1204,14 +1204,14 @@ int main(int argc,char **argv) {
         return 1;
     }
     struct n_pciinfo *e = &list[at];
-    n_handle pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), e->bus, e->dev, e->func);
+    n_handle pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
     CHECK(pci >= 0, "claim: %s", n_result_text(pci));
     if (pci < 0) {
         printf("pcitest: %d failed\n", failed);
         return 1;
     }
     CHECK(n_handle_kind(pci) == N_KIND_PCI, "kind %d", (int)n_handle_kind(pci));
-    n_handle again = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), e->bus, e->dev, e->func);
+    n_handle again = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
     CHECK(again == -N_ERR_BUSY, "second claim: %s", n_result_text(again));
     if (again >= 0) n_handle_close(again);
 
@@ -1259,8 +1259,8 @@ int main(int argc,char **argv) {
         }
     for (int i = 0; i < n; i++)
         if (list[i].cls == 0x06) {
-            n_handle bridge = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), list[i].bus, list[i].dev, list[i].func);
-            CHECK(bridge == -N_ERR_DENIED, "bridge %02x:%02x.%u cannot be claimed: %s", list[i].bus, list[i].dev,
+            n_handle bridge = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[i].segment, list[i].bus, list[i].dev, list[i].func));
+            CHECK(bridge == -N_ERR_DENIED, "bridge %04x:%02x:%02x.%x cannot be claimed: %s", list[i].segment, list[i].bus, list[i].dev,
                   list[i].func, n_result_text(bridge));
             if (bridge >= 0) n_handle_close(bridge);
             break;
@@ -1270,14 +1270,14 @@ int main(int argc,char **argv) {
     give_screen_cases(pci, list, n, 0);
     /* a function on bus 0 that is neither this device nor a bridge above it */
     for (int i = 0; i < n; i++)
-        if (i != at && list[i].bus == e->bus && list[i].dev != e->dev && list[i].cls != 0x06) {
-            n_result r = n_pci_config_read(pci, N_PCI_TARGET(list[i].bus, list[i].dev, list[i].func), 0, 4);
+        if (i != at && list[i].segment == e->segment && list[i].bus == e->bus && list[i].dev != e->dev && list[i].cls != 0x06) {
+            n_result r = n_pci_config_read(pci, N_PCI_TARGET(list[i].segment, list[i].bus, list[i].dev, list[i].func), 0, 4);
             CHECK(r == -N_ERR_DENIED, "unrelated config read: %lld", (long long)r);
             break;
         }
     /* behind a root port (QEMU -M q35 with edu on a pcie-root-port at function 1 of a
        multifunction slot): the port and function 0 of its device are readable */
-    if (info.upstream != N_PCI_NONE) {
+    if (info.flags & N_PCI_HAS_UPSTREAM) {
         uint32_t up = info.upstream;
         n_result r = n_pci_config_read(pci, up, 0x18, 4);
         CHECK(r >= 0 && ((r >> 8) & 0xFF) == e->bus, "upstream bridge read: %lld", (long long)r);
@@ -1287,7 +1287,7 @@ int main(int argc,char **argv) {
     /* a host bridge names the chipset: readable */
     for (int i = 0; i < n; i++)
         if (list[i].cls == 0x06 && list[i].subcls == 0x00) {
-            n_result r = n_pci_config_read(pci, N_PCI_TARGET(list[i].bus, list[i].dev, list[i].func), 0, 4);
+            n_result r = n_pci_config_read(pci, N_PCI_TARGET(list[i].segment, list[i].bus, list[i].dev, list[i].func), 0, 4);
             CHECK(r == (n_result)((uint32_t)list[i].device << 16 | list[i].vendor), "host bridge config read: %lld",
                   (long long)r);
             break;
@@ -1510,7 +1510,7 @@ int main(int argc,char **argv) {
         CHECK(rd32(EDU_IDENT) == 0xFFFFFFFFu, "the BAR mapping is revoked with the claim: %08x", rd32(EDU_IDENT));
         n_memory_release((void *)regs, 1 << 20);
     }
-    n_handle back = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), e->bus, e->dev, e->func);
+    n_handle back = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
     CHECK(back >= 0, "claim after release: %s", n_result_text(back));
     if (back >= 0) {
         CHECK((n_pci_config_read(back, N_PCI_SELF, 4, 2) & 4) == 0, "bus mastering stopped at release");
@@ -1522,7 +1522,7 @@ int main(int argc,char **argv) {
         CHECK(left >= 0, "dma memory of the crashed driver: %s", n_result_text(left));
         n_handle_close(back);
         if (left >= 0) n_handle_close(left);
-        back = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), e->bus, e->dev, e->func);
+        back = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
         if (info.flags & N_PCI_ISOLATED) {
             CHECK(back >= 0 && (n_pci_config_read(back, N_PCI_SELF, 4, 2) & 4) == 0,
                   "an isolated crashed driver's function has bus mastering off");

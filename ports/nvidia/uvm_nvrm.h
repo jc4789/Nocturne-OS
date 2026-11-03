@@ -85,6 +85,7 @@ void nvrm_uvm_memory_free(struct nvrm_uvm_memory *memory);
 /* The PCI function nvrm serves, as UVM's struct pci_dev describes it. */
 struct nvrm_uvm_pci {
     uint16_t vendor, device, subsystem_vendor, subsystem_device;
+    uint16_t segment;
     uint8_t bus, dev, func;
     uint64_t dma_mask;
     struct { uint64_t address, size; bool is_64bit; } bar[6];

@@ -129,7 +129,7 @@ static int vbe_attach(struct pci_device *d) {
     if (!v->mmio && !firmware) goto fail; /* only the shown one is reached through the ports */
     uint16_t id = vbe_read(v, VBE_ID);
     if (id < 0xB0C0 || id > 0xB0CF) goto fail;
-    pci_write16(d->bus, d->dev, d->func, 4, pci_read16(d->bus, d->dev, d->func, 4) | 2); /* memory space */
+    pci_write16(d->address, 4, pci_read16(d->address, 4) | 2); /* memory space */
     struct screen_mode_desc m = {0};
     uint32_t pref_w, pref_h;
     if (firmware) {
@@ -180,8 +180,7 @@ static int vbe_attach(struct pci_device *d) {
     d->kernel_owned = true; /* the kernel drives it: no app claims it */
     v->next = displays;
     displays = v;
-    kprintf("video: emulated display %02x:%02x.%u: %ux%u at %u.%03u Hz, %u buffer%s, screen %u%s%s\n", d->bus, d->dev,
-            d->func, m.width, m.height, m.refresh_mhz / 1000, m.refresh_mhz % 1000, v->count, v->count > 1 ? "s" : "",
+    kprintf("video: emulated display %04x:%02x:%02x.%x: %ux%u at %u.%03u Hz, %u buffer%s, screen %u%s%s\n", PCI_ADDRESS_ARGS(d->address), m.width, m.height, m.refresh_mhz / 1000, m.refresh_mhz % 1000, v->count, v->count > 1 ? "s" : "",
             screen_id(v->screen), m.name[0] ? ", monitor " : "", m.name);
     screen_set_buffers(v->screen, &vbe_ops, v, &m, v->buf, v->count, 0);
     return 0;

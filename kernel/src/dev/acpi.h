@@ -167,7 +167,7 @@ struct acpi_slit {
 /* ---- MCFG: PCIe enhanced configuration access regions, from byte 44 ---- */
 #define ACPI_MCFG_ENTRIES 44
 struct acpi_mcfg_entry {
-    uint64_t base; /* physical address of bus start_bus, device 0, function 0 */
+    uint64_t base; /* physical address of bus 0, device 0, function 0; start_bus..end_bus are decoded */
     uint16_t segment;
     uint8_t start_bus, end_bus;
     uint32_t reserved;
@@ -203,7 +203,7 @@ bool acpi_reset(void);
 
 /* ---- a PCI function's part of the namespace (n_pci_acpi_eval, dev/pciuser.c) ----
    A device node is uACPI's, opaque here. acpi_pci_node: the function's node, found from the host
-   bridge of its root bus (_BBN) down its bridges by _ADR; acpi_pci_host: that host bridge's. NULL
+   bridge of its segment (_SEG) and root bus (_BBN) down its bridges by _ADR; acpi_pci_host: that host bridge's. NULL
    when the firmware describes none, or AML is off. acpi_node_child: the node's device child
    number index in namespace order; NULL past the last. */
 struct pci_device;

@@ -21,6 +21,10 @@
 
 struct pci_device;
 struct iommu_domain;
+/* What a unit looks a request up by: its requester ID, unique within the segment the unit serves. */
+struct iommu_id {
+    uint16_t segment, requester;
+};
 
 /* A function the kernel drives that may share a group with one an app claims (a graphics card's sound
    function with its display function): its driver lets go of the group's isolation changing and comes
@@ -114,7 +118,7 @@ struct iommu_domain {
     struct pci_device *d;        /* the claimed function; NULL: a back end's own domain */
     struct pci_device **members; /* d and the rest of its group */
     unsigned nmembers;
-    uint16_t *ids; /* every requester ID the members' requests may arrive with */
+    struct iommu_id *ids; /* every requester ID the members' requests may arrive with */
     unsigned nids;
     uint64_t root; /* top-level page table */
     unsigned levels;
@@ -155,7 +159,7 @@ struct iommu_hw {
     bool (*start)(bool translate);
     bool translating; /* set by start: DMA passes the units' page tables, claims can be isolated */
     /* The ID the firmware says requests with this one arrive as (AMD-Vi IVRS aliases), or NULL */
-    uint16_t (*alias)(uint16_t id);
+    struct iommu_id (*alias)(struct iommu_id id);
     /* attach: true once the units confirmed the domain. dom->written says whether anything of the
        units changed for its requester IDs; after a false the common part then blocks it. */
     bool (*attach)(struct iommu_domain *dom);
@@ -176,24 +180,24 @@ struct iommu_hw {
 const struct iommu_hw *iommu_amd_probe(bool *plain_safe);
 const struct iommu_hw *iommu_intel_probe(bool *plain_safe);
 /* What the back ends find in the firmware's tables while they probe.
-   reserved: memory the functions with requester IDs first..last reach by DMA as it is (AMD-Vi
+   reserved: memory the functions of segment with requester IDs first..last reach by DMA as it is (AMD-Vi
    IVMD, VT-d RMRR) with IOMMU_READ / IOMMU_WRITE access, mapped in their domains when claimed.
    Page aligned, end exclusive. Access zero forbids mapping the range (AMD IVMD); overlapping
    restrictions intersect, and app DMA allocations cannot enlarge those permissions.
-   cover: requests with IDs first..last pass a unit (IVHD device entries, DRHD scopes); a function
+   cover: requests of segment with IDs first..last pass a unit (IVHD device entries, DRHD scopes); a function
    whose requests no unit sees cannot be isolated.
    kernel_id: requests with this ID are the platform's (IOAPIC, HPET): never in a claim's domain. */
-void iommu_reserved(uint16_t first, uint16_t last, uint64_t start, uint64_t end, unsigned access);
+void iommu_reserved(uint16_t segment, uint16_t first, uint16_t last, uint64_t start, uint64_t end, unsigned access);
 unsigned iommu_reserved_count(void);
-void iommu_cover(uint16_t first, uint16_t last);
-void iommu_kernel_id(uint16_t id);
+void iommu_cover(uint16_t segment, uint16_t first, uint16_t last);
+void iommu_kernel_id(struct iommu_id id);
 /* The back end's own domain, id 1 (the VT-d identity map): filled with iommu_map before a unit
    uses it, which then flushes nothing. */
 struct iommu_domain *iommu_domain_new(unsigned levels, unsigned leaf_levels);
 struct iommu_domain *iommu_domain_of(const struct pci_device *d); /* the claim's attached domain, or NULL */
 /* The requester IDs d's requests may arrive with, *n of them, in memory the caller frees with
    kfree; NULL without memory. */
-uint16_t *iommu_requester_ids(const struct pci_device *d, unsigned *n);
+struct iommu_id *iommu_requester_ids(const struct pci_device *d, unsigned *n);
 /* Writes a table entry the units may read, flushing it from the caches when they do not snoop. */
 void iommu_entry_write(volatile uint64_t *e, uint64_t v);
 void iommu_cache_flush(const volatile void *p, size_t bytes);

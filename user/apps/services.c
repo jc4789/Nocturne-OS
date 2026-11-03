@@ -255,9 +255,9 @@ static void instances_of(const struct declared_service *d, bool broken, const st
     }
     for (int i = 0; i < function_count; i++) {
         if (!function_matches(d, &functions[i])) continue;
-        char argument[8];
+        char argument[9];
         const struct n_pciinfo *f = &functions[i].at.pci;
-        snprintf(argument, sizeof argument, "%04x", (unsigned)N_PCI_TARGET(f->bus, f->dev, f->func));
+        snprintf(argument, sizeof argument, "%08x", (unsigned)N_PCI_TARGET(f->segment, f->bus, f->dev, f->func));
         instance_new(d, argument, broken);
     }
 }

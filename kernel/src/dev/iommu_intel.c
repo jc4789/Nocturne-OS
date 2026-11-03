@@ -146,6 +146,7 @@
 
 struct unit {
     uint64_t base;
+    uint16_t segment;   /* the PCI segment group it serves (DRHD) */
     volatile uint8_t *regs;
     uint64_t reg_bytes; /* the DRHD's complete register aperture, not a license to map beyond it */
     bool readable;      /* mapped, and its registers describe a VT-d unit inside that aperture */
@@ -176,8 +177,9 @@ struct unit {
 static struct unit *units;
 static size_t nunits, units_room;
 static struct ioapic_scope {
-    uint8_t id;   /* the MADT's */
-    uint16_t sid; /* the requester ID it sends with */
+    uint8_t id;       /* the MADT's */
+    uint16_t segment; /* of the unit it is under */
+    uint16_t sid;     /* the requester ID it sends with */
 } *ioapics;
 static size_t nioapics, ioapics_room;
 static uint8_t dmar_flags;
@@ -189,14 +191,29 @@ static bool units_incomplete; /* separate from unsupported/malformed device-scop
 static bool irreq; /* a unit requires interrupt remapping (ECAP.IRREQ) */
 static unsigned iec_mask = 15; /* the largest IEC invalidation mask every unit takes (MHMV) */
 static struct iommu_domain *identity; /* units without pass-through */
-static uint64_t sems, irt;
+static uint64_t sems;
 static size_t sem_pages;
 static struct irq *fault_irq; /* the fault events' (fault_isr) */
-static const struct pci_device *msi_owner[MSI_BLOCKS];
-/* The interrupt remapping table's entries and msi_owner: a leaf, never held while a unit's lock
-   is taken. Each entry's units are told by a sync on every unit after it is let go. It is taken
-   after the common part's locks and arch/ioapic.c's. */
+/* An interrupt remapping table, one per segment, its units sharing it: an entry checks its sender
+   by a 16-bit ID, which names a function only within its segment. */
+struct irt_table {
+    uint16_t segment;
+    uint64_t phys;
+    const struct pci_device *msi_owner[MSI_BLOCKS];
+};
+static struct irt_table *irts;
+static size_t nirts, irts_room;
+/* The tables' entries and msi_owner: a leaf, never held while a unit's lock is taken. Each entry's
+   units are told by a sync on every unit after it is let go. It is taken after the common part's
+   locks and arch/ioapic.c's. */
 static struct spinlock tables_lock;
+
+/* NULL: no unit serves the segment, so nothing remaps its interrupts. */
+static struct irt_table *irt_of(uint16_t segment) {
+    for (size_t i = 0; i < nirts; i++)
+        if (irts[i].segment == segment) return &irts[i];
+    return NULL;
+}
 
 static struct iommu_hw intel;
 static bool queue_check(struct unit *u);
@@ -213,73 +230,74 @@ static uint16_t u16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 /* ---- DMAR ---- */
 /* A device scope's requester ID: its path from the start bus, through the bridges on the way;
    -1 when a bridge on the way is not there. */
-static int scope_id(const uint8_t *s) {
+static int scope_id(uint16_t segment, const uint8_t *s) {
     unsigned bus = s[5], n = (s[1] - 6u) / 2;
     for (unsigned i = 0; i < n; i++) {
         unsigned dev = s[6 + 2 * i] & 31, func = s[7 + 2 * i] & 7;
         if (i + 1 == n) return (int)(bus << 8 | dev << 3 | func);
-        uint32_t r = pci_read32((uint8_t)bus, (uint8_t)dev, (uint8_t)func, 0x18);
+        uint32_t r = pci_read32((struct pci_address){segment, (uint8_t)bus, (uint8_t)dev, (uint8_t)func}, 0x18);
         if (r == 0xFFFFFFFF) return -1;
         bus = r >> 8 & 0xFF;
     }
     return -1;
 }
 
-/* Device scopes from `at` to `end`, each passed with its requester ID. */
-static void scopes(const uint8_t *b, unsigned at, unsigned end, void (*each)(const uint8_t *s, int id, void *arg),
-                   void *arg) {
+/* Device scopes of a segment from `at` to `end`, each passed with its requester ID. */
+static void scopes(uint16_t segment, const uint8_t *b, unsigned at, unsigned end,
+                   void (*each)(uint16_t segment, const uint8_t *s, int id, void *arg), void *arg) {
     for (; at < end; at += b[at + 1]) {
         if (end - at < 6 || b[at + 1] < 8 || b[at + 1] > end - at || (b[at + 1] - 6) % 2) {
             parse_lost = true;
             return;
         }
-        int id = scope_id(b + at);
-        if (id >= 0) each(b + at, id, arg);
+        int id = scope_id(segment, b + at);
+        if (id >= 0) each(segment, b + at, id, arg);
         else kprintf("iommu: a DMAR device scope leads through a bridge that is not there; ignored\n");
     }
 }
 
 /* The buses below a bridge with this ID, as its registers say. */
-static void bridge_buses(int id, uint16_t *first, uint16_t *last) {
-    uint32_t r = pci_read32((uint8_t)(id >> 8), (id >> 3) & 31, id & 7, 0x18);
+static void bridge_buses(uint16_t segment, int id, uint16_t *first, uint16_t *last) {
+    uint32_t r = pci_read32(pci_address_of(segment, (uint16_t)id), 0x18);
     *first = (uint16_t)((r >> 8 & 0xFF) << 8);
     *last = (uint16_t)((r >> 16 & 0xFF) << 8 | 0xFF);
 }
 
 /* DRHD scopes (8.3.1): an endpoint, a bridge with everything below it, an IOAPIC (its
    enumeration ID is the MADT's), an HPET that sends MSIs, an ACPI device. */
-static void drhd_scope(const uint8_t *s, int id, void *arg) {
+static void drhd_scope(uint16_t segment, const uint8_t *s, int id, void *arg) {
     (void)arg;
     uint16_t first, last;
+    struct iommu_id kernel = {segment, (uint16_t)id};
     switch (s[0]) {
-    case 1: iommu_cover((uint16_t)id, (uint16_t)id); break;
+    case 1: iommu_cover(segment, (uint16_t)id, (uint16_t)id); break;
     case 2:
-        iommu_cover((uint16_t)id, (uint16_t)id);
-        bridge_buses(id, &first, &last);
-        iommu_cover(first, last);
+        iommu_cover(segment, (uint16_t)id, (uint16_t)id);
+        bridge_buses(segment, id, &first, &last);
+        iommu_cover(segment, first, last);
         break;
     case 3: {
-        iommu_kernel_id((uint16_t)id);
+        iommu_kernel_id(kernel);
         struct ioapic_scope *a = kappend(&ioapics, &nioapics, &ioapics_room, sizeof *a);
-        if (a) *a = (struct ioapic_scope){s[4], (uint16_t)id};
+        if (a) *a = (struct ioapic_scope){s[4], segment, (uint16_t)id};
         else parse_lost = true;
         break;
     }
-    case 4: iommu_kernel_id((uint16_t)id); break;
+    case 4: iommu_kernel_id(kernel); break;
     }
 }
 
 /* RMRR: memory the functions in its scopes reach by DMA from the firmware's start (a USB
    controller's legacy emulation, a graphics device's stolen memory), to be mapped for reading
    and writing. A bridge's scope is everything below it too. */
-static void rmrr_scope(const uint8_t *s, int id, void *arg) {
+static void rmrr_scope(uint16_t segment, const uint8_t *s, int id, void *arg) {
     const uint64_t *range = arg;
     uint16_t first, last;
     if (s[0] != 1 && s[0] != 2) return;
-    iommu_reserved((uint16_t)id, (uint16_t)id, range[0], range[1], IOMMU_READ | IOMMU_WRITE);
+    iommu_reserved(segment, (uint16_t)id, (uint16_t)id, range[0], range[1], IOMMU_READ | IOMMU_WRITE);
     if (s[0] == 2) {
-        bridge_buses(id, &first, &last);
-        iommu_reserved(first, last, range[0], range[1], IOMMU_READ | IOMMU_WRITE);
+        bridge_buses(segment, id, &first, &last);
+        iommu_reserved(segment, first, last, range[0], range[1], IOMMU_READ | IOMMU_WRITE);
     }
 }
 
@@ -320,12 +338,7 @@ static bool parse_dmar(void) {
             if (len < 16) { parse_lost = units_incomplete = true; break; }
             uint64_t reg_bytes;
             bool aligned = drhd_registers(b + off, &base, &reg_bytes);
-            bool segment_supported = u16(b + off + 6) == 0;
-            if (!segment_supported) {
-                parse_lost = true; /* still observe this unit's registers, independently of PCI scope support */
-                kprintf("iommu: VT-d unit at %lx is on PCI segment %u, which Nocturne does not reach\n", base,
-                        u16(b + off + 6));
-            }
+            uint16_t segment = u16(b + off + 6);
             /* rejected before any mapping or read, also for a plain-safe observation */
             if (!aligned) {
                 parse_lost = units_incomplete = true;
@@ -336,11 +349,9 @@ static bool parse_dmar(void) {
                 if (!u) {
                     parse_lost = units_incomplete = true;
                 } else {
-                    *u = (struct unit){.base = base, .reg_bytes = reg_bytes};
-                    if (segment_supported) {
-                        if (b[off + 4] & 1) iommu_cover(0, 0xFFFF); /* INCLUDE_PCI_ALL: what no other unit has */
-                        scopes(b, off + 16, off + len, drhd_scope, NULL);
-                    }
+                    *u = (struct unit){.base = base, .segment = segment, .reg_bytes = reg_bytes};
+                    if (b[off + 4] & 1) iommu_cover(segment, 0, 0xFFFF); /* INCLUDE_PCI_ALL: what no other unit has */
+                    scopes(segment, b, off + 16, off + len, drhd_scope, NULL);
                 }
             }
         } else if (type == 1) { /* RMRR, 8.4: fixed header followed by one or more scopes */
@@ -355,9 +366,9 @@ static bool parse_dmar(void) {
                    Losing a mandatory reservation prevents translation, not independent
                    observation of every DRHD's stopped/plain-safe state. */
                 if (limit <= base || !end || (base | end) & (PAGE_SIZE - 1)) parse_lost = true;
-                else if (u16(b + off + 6) == 0) {
+                else {
                     uint64_t range[2] = {base, end};
-                    scopes(b, off + 24, off + len, rmrr_scope, range);
+                    scopes(u16(b + off + 6), b, off + 24, off + len, rmrr_scope, range);
                 }
             }
         } else if (type > 6) units_incomplete = true; /* skip per 8.2, but do not attest unknown state as plain-safe */
@@ -549,14 +560,14 @@ static void context_flush(struct unit *u) {
 }
 
 static void fault_show(const struct unit *u, uint64_t lo, uint64_t hi) {
-    (void)u;
-    unsigned sid = hi & 0xFFFF, reason = hi >> 32 & 0xFF;
+    unsigned reason = hi >> 32 & 0xFF;
+    struct pci_address a = pci_address_of(u->segment, (uint16_t)hi);
     if (!iommu_fault_report()) return;
     if (reason >= 0x20)
-        kprintf("iommu: %02x:%02x.%u: interrupt (entry %u) blocked, reason %02xh\n", sid >> 8, (sid >> 3) & 31,
-                sid & 7, (unsigned)(lo >> 48), reason);
+        kprintf("iommu: %04x:%02x:%02x.%x: interrupt (entry %u) blocked, reason %02xh\n", PCI_ADDRESS_ARGS(a),
+                (unsigned)(lo >> 48), reason);
     else
-        kprintf("iommu: %02x:%02x.%u: %s at %lx blocked, reason %02xh\n", sid >> 8, (sid >> 3) & 31, sid & 7,
+        kprintf("iommu: %04x:%02x:%02x.%x: %s at %lx blocked, reason %02xh\n", PCI_ADDRESS_ARGS(a),
                 hi >> 62 & 1 ? "DMA read" : "DMA write", lo & ADDR, reason);
 }
 
@@ -665,10 +676,12 @@ static bool on_every_unit(void (*fill)(struct unit *u, const void *arg), const v
 /* Interrupt entries first..first + 2^log2 - 1 (first aligned to that), in descriptors whose
    mask every unit takes. */
 struct iec_range {
+    uint16_t segment;
     unsigned first, log2;
 };
 static void iec_flush(struct unit *u, const void *arg) {
     const struct iec_range *r = arg;
+    if (u->segment != r->segment) return;
     unsigned mask = r->log2 < iec_mask ? r->log2 : iec_mask;
     for (unsigned at = r->first; at < r->first + (1u << r->log2); at += 1u << mask) submit(u, INV_IEC(at, mask), 0);
 }
@@ -758,13 +771,15 @@ struct contexts {
 };
 static void contexts_flush(struct unit *u, const void *arg) {
     const struct contexts *c = arg;
-    for (unsigned n = 0; n < c->dom->nids; n++) context_write(context_entry(u, c->dom->ids[n], false), c->lo, c->hi);
+    for (unsigned n = 0; n < c->dom->nids; n++)
+        if (c->dom->ids[n].segment == u->segment)
+            context_write(context_entry(u, c->dom->ids[n].requester, false), c->lo, c->hi);
     context_flush(u);
 }
 
 /* ---- interrupts ---- */
-static void irte_write(unsigned index, uint64_t lo, uint64_t hi) {
-    volatile uint64_t *e = (volatile uint64_t *)phys_to_virt(irt) + index * 2;
+static void irte_write(struct irt_table *t, unsigned index, uint64_t lo, uint64_t hi) {
+    volatile uint64_t *e = (volatile uint64_t *)phys_to_virt(t->phys) + index * 2;
     e[0] = 0; /* present last */
     e[1] = hi;
     e[0] = lo;
@@ -778,14 +793,14 @@ static uint64_t irte_dest(uint32_t dest) { return (uint64_t)dest << 32; }
    bridge sends its requests as its own. 0 without memory. */
 static uint64_t irte_source(const struct pci_device *d) {
     unsigned n;
-    uint16_t *ids = iommu_requester_ids(d, &n);
+    struct iommu_id *ids = iommu_requester_ids(d, &n);
     if (!ids) return 0;
-    uint64_t source = IRTE_SID(ids[0], 1);
+    uint64_t source = IRTE_SID(ids[0].requester, 1);
     if (n > 1) {
         uint8_t first = 0xFF, last = 0;
         for (unsigned i = 0; i < n; i++) {
-            if (ids[i] >> 8 < first) first = ids[i] >> 8;
-            if (ids[i] >> 8 > last) last = ids[i] >> 8;
+            if (ids[i].requester >> 8 < first) first = ids[i].requester >> 8;
+            if (ids[i].requester >> 8 > last) last = ids[i].requester >> 8;
         }
         source = IRTE_SID((uint16_t)(first << 8 | last), 2);
     }
@@ -793,32 +808,32 @@ static uint64_t irte_source(const struct pci_device *d) {
     return source;
 }
 
-static int msi_block(const struct pci_device *d, bool create) {
+static int msi_block(struct irt_table *t, const struct pci_device *d, bool create) {
     int free = -1;
     for (int b = 0; b < MSI_BLOCKS; b++) {
-        if (msi_owner[b] == d) return b;
-        if (!msi_owner[b] && free < 0) free = b;
+        if (t->msi_owner[b] == d) return b;
+        if (!t->msi_owner[b] && free < 0) free = b;
     }
     if (!create) return -1;
     if (free < 0) {
-        kprintf("iommu: no interrupt remapping entries left for %02x:%02x.%u\n", d->bus, d->dev, d->func);
+        kprintf("iommu: no interrupt remapping entries left for %04x:%02x:%02x.%x\n", PCI_ADDRESS_ARGS(d->address));
         return -1;
     }
-    msi_owner[free] = d;
+    t->msi_owner[free] = d;
     return free;
 }
 
-static bool msi_release(const struct pci_device *d) {
+static bool msi_release(struct irt_table *t, const struct pci_device *d) {
     uint64_t f = spin_lock(&tables_lock);
-    int b = msi_block(d, false);
+    int b = msi_block(t, d, false);
     unsigned first = IOAPIC_ENTRIES + (unsigned)(b < 0 ? 0 : b) * MSI_BLOCK;
-    for (unsigned i = 0; b >= 0 && i < MSI_BLOCK; i++) irte_write(first + i, 0, 0);
+    for (unsigned i = 0; b >= 0 && i < MSI_BLOCK; i++) irte_write(t, first + i, 0, 0);
     spin_unlock(&tables_lock, f);
     if (b < 0) return true;
-    bool ok = on_every_unit(iec_flush, &(struct iec_range){first, MSI_BLOCK_LOG2});
+    bool ok = on_every_unit(iec_flush, &(struct iec_range){t->segment, first, MSI_BLOCK_LOG2});
     if (ok) { /* else kept: an entry may still be cached */
         f = spin_lock(&tables_lock);
-        msi_owner[b] = NULL;
+        t->msi_owner[b] = NULL;
         spin_unlock(&tables_lock, f);
     }
     return ok;
@@ -829,7 +844,8 @@ static bool msi_release(const struct pci_device *d) {
    The entries' source is worked out (an allocation) before tables_lock. */
 static bool intel_msi(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
                       uint32_t *address, uint32_t *data) {
-    if (!remap) {
+    struct irt_table *t = remap ? irt_of(d->address.segment) : NULL;
+    if (!t) {
         if (dest > 0xFF) return false; /* the 8-bit destination of a plain message */
         *address = iommu_msi_plain(dest);
         *data = vector;
@@ -838,19 +854,22 @@ static bool intel_msi(struct pci_device *d, unsigned index, unsigned count, uint
     uint64_t source = irte_source(d);
     if (!source || index + count > MSI_BLOCK) return false;
     uint64_t f = spin_lock(&tables_lock);
-    int b = msi_block(d, true);
+    int b = msi_block(t, d, true);
     unsigned first = IOAPIC_ENTRIES + (unsigned)(b < 0 ? 0 : b) * MSI_BLOCK, at = first + index;
     for (unsigned i = 0; b >= 0 && i < count; i++)
-        irte_write(at + i, IRTE_P | IRTE_VECTOR(vector + i) | irte_dest(dest), source);
+        irte_write(t, at + i, IRTE_P | IRTE_VECTOR(vector + i) | irte_dest(dest), source);
     spin_unlock(&tables_lock, f);
     if (b < 0) return false;
-    bool ok = on_every_unit(iec_flush, &(struct iec_range){first, MSI_BLOCK_LOG2});
+    bool ok = on_every_unit(iec_flush, &(struct iec_range){t->segment, first, MSI_BLOCK_LOG2});
     *address = 0xFEE00000u | (at & 0x7FFF) << 5 | 1u << 4 | 1u << 3 | (at >> 15 & 1) << 2; /* remappable, SHV */
     *data = 0;
     return ok;
 }
 
-static bool intel_msi_clear(struct pci_device *d) { return !remap || msi_release(d); }
+static bool intel_msi_clear(struct pci_device *d) {
+    struct irt_table *t = remap ? irt_of(d->address.segment) : NULL;
+    return !t || msi_release(t, d);
+}
 
 /* Pin `gsi` is entry gsi; the IRTE takes what the plain entry said (delivery mode, logical
    destination, trigger, vector) and the 32-bit destination dest, the pin keeps polarity, trigger,
@@ -862,17 +881,21 @@ static bool intel_ioapic(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_
         return false;
     }
     uint64_t source = 0, v = *rte;
+    struct irt_table *t = NULL;
     for (size_t i = 0; i < nioapics; i++)
-        if (ioapics[i].id == ioapic_id) source = IRTE_SID(ioapics[i].sid, 1);
-    if (!source) {
+        if (ioapics[i].id == ioapic_id) {
+            source = IRTE_SID(ioapics[i].sid, 1);
+            t = irt_of(ioapics[i].segment);
+        }
+    if (!source || !t) {
         kprintf("iommu: IOAPIC %u is under no VT-d unit: GSI %u left masked\n", ioapic_id, gsi);
         return false;
     }
     uint64_t f = spin_lock(&tables_lock);
-    irte_write(gsi, IRTE_P | (v >> 11 & 1 ? IRTE_DM : 0) | (v >> 15 & 1 ? IRTE_TM : 0) | IRTE_DLM(v >> 8 & 7) |
-                        IRTE_VECTOR(v) | irte_dest(dest), source);
+    irte_write(t, gsi, IRTE_P | (v >> 11 & 1 ? IRTE_DM : 0) | (v >> 15 & 1 ? IRTE_TM : 0) | IRTE_DLM(v >> 8 & 7) |
+                           IRTE_VECTOR(v) | irte_dest(dest), source);
     spin_unlock(&tables_lock, f);
-    if (!on_every_unit(iec_flush, &(struct iec_range){gsi, 0})) {
+    if (!on_every_unit(iec_flush, &(struct iec_range){t->segment, gsi, 0})) {
         kprintf("iommu: the units did not confirm the entry of GSI %u: left masked\n", gsi);
         return false;
     }
@@ -910,7 +933,8 @@ static bool intel_attach(struct iommu_domain *dom) {
     for (size_t i = 0; i < nunits; i++) { /* memory first: nothing changes for the group when there is none */
         uint64_t f = spin_lock(&units[i].lock);
         bool made = true;
-        for (unsigned n = 0; made && n < dom->nids; n++) made = context_entry(&units[i], dom->ids[n], true) != NULL;
+        for (unsigned n = 0; made && n < dom->nids; n++)
+            if (dom->ids[n].segment == units[i].segment) made = context_entry(&units[i], dom->ids[n].requester, true) != NULL;
         spin_unlock(&units[i].lock, f);
         if (!made) {
             kprintf("iommu: no memory for a context table\n");
@@ -924,7 +948,7 @@ static bool intel_attach(struct iommu_domain *dom) {
 }
 
 static bool intel_block(struct iommu_domain *dom) {
-    bool ok = !remap || msi_release(dom->d);
+    bool ok = intel_msi_clear(dom->d);
     ok &= on_every_unit(contexts_flush, &(struct contexts){dom, 0, 0});
     return ok && dma_draining(); /* otherwise retain the domain and its DMA pages in quarantine */
 }
@@ -1130,7 +1154,7 @@ static bool unit_tables(struct unit *u) {
     wr64(u, R_RTADDR, u->root); /* legacy mode */
     bool ok = command(u, GCMD_SRTP, true) && queue_start(u);
     if (ok && remap) {
-        wr64(u, R_IRTA, irt | IRTA_EIME | IRT_S);
+        wr64(u, R_IRTA, irt_of(u->segment)->phys | IRTA_EIME | IRT_S);
         ok = command(u, GCMD_SIRTP, true);
     }
     /* the fault event message (5.1.6): with remapping in x2APIC format the destination's bits
@@ -1211,14 +1235,32 @@ static bool intel_resume(void) {
 
 static void tables_free(void) {
     if (sems) pmm_free_contig(sems, sem_pages);
-    if (irt) pmm_free_contig(irt, IRT_ENTRIES * 16 / PAGE_SIZE);
+    for (size_t i = 0; i < nirts; i++)
+        if (irts[i].phys) pmm_free_contig(irts[i].phys, IRT_ENTRIES * 16 / PAGE_SIZE);
+    nirts = 0;
     for (size_t i = 0; i < nunits; i++) {
         if (units[i].root) pmm_free(units[i].root);
         if (units[i].pass) pmm_free(units[i].pass);
         if (units[i].queue) pmm_free(units[i].queue);
         units[i].root = units[i].pass = units[i].queue = 0;
     }
-    sems = irt = 0;
+    sems = 0;
+}
+
+/* Every unit's segment gets its table, empty. */
+static bool irts_alloc(void) {
+    for (size_t i = 0; i < nunits; i++) {
+        if (irt_of(units[i].segment)) continue;
+        struct irt_table *t = kappend(&irts, &nirts, &irts_room, sizeof *t);
+        if (!t) return false;
+        memset(t, 0, sizeof *t);
+        t->segment = units[i].segment;
+        t->phys = iommu_alloc_pages(IRT_ENTRIES * 16 / PAGE_SIZE);
+        if (!t->phys) return false;
+        memset(phys_to_virt(t->phys), 0, IRT_ENTRIES * 16);
+        if (!intel.coherent) iommu_cache_flush(phys_to_virt(t->phys), IRT_ENTRIES * 16);
+    }
+    return true;
 }
 
 /* Backend start only: the common caller keeps sources masked until it publishes IOAPIC
@@ -1251,8 +1293,7 @@ static bool intel_start(bool translate) {
     }
     sem_pages = ALIGN_UP(nunits * sizeof(uint32_t), PAGE_SIZE) / PAGE_SIZE;
     sems = iommu_alloc_pages(sem_pages);
-    irt = remap ? iommu_alloc_pages(IRT_ENTRIES * 16 / PAGE_SIZE) : 0;
-    bool ok = sems && (irt || !remap), pass_all = true;
+    bool ok = sems && (!remap || irts_alloc()), pass_all = true;
     for (size_t i = 0; i < nunits; i++) {
         units[i].root = iommu_alloc_pages(1);
         units[i].pass = iommu_alloc_pages(1);
@@ -1277,7 +1318,6 @@ static bool intel_start(bool translate) {
         return false;
     }
     memset(phys_to_virt(sems), 0, sem_pages * PAGE_SIZE);
-    if (remap) memset(phys_to_virt(irt), 0, IRT_ENTRIES * 16);
     for (size_t i = 0; translate && i < nunits; i++) {
         struct unit *u = &units[i];
         uint64_t *pass = phys_to_virt(u->pass), *root = phys_to_virt(u->root);
@@ -1291,7 +1331,6 @@ static bool intel_start(bool translate) {
             iommu_cache_flush(root, PAGE_SIZE);
         }
     }
-    if (remap && !intel.coherent) iommu_cache_flush(phys_to_virt(irt), IRT_ENTRIES * 16);
     /* any CPU the unit's message can name: a 32-bit destination with remapping (unit_tables) */
     if (!fault_irq)
         fault_irq = irq_request_msi(&(struct irq_spec){.name = "VT-d faults", .handler = fault_isr, .node = -1}, IRQ_CPU_ANY);

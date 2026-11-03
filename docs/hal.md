@@ -59,6 +59,7 @@ struct n_hal_device {
 ```
 
 - 記録はバスの物に埋める（`struct pci_device`、`struct usb_device`、VMBus の channel、`vm/ata`）。寿命はその物と同じである。
+- PCI の住所は segment、bus、dev、func の四つである。カーネルは `struct pci_address`、ABI は `N_PCI_TARGET`、印字は `%04x:%02x:%02x.%x` で運ぶ。列挙は MCFG の窓ごとに行い、IOMMU の身元も `struct iommu_id`（segment と requester）である。
 - 指す側はポインターでなく番号を持つ。参照の数は持たない。番号は二度と使わないので、古い番号は何にも当たらない。
 - 文字は記録の中に持つ。だから下の表の操作はどの文脈からでも呼べる。
 - `at` はバスが `hal_add` の前に埋める。
@@ -140,20 +141,22 @@ struct usb_driver {
 ### 起動の順
 
 ```text
+pci_config_init()          MCFG の窓を読む。AML が別の segment の機能を読むので、ACPI より先に走る
 hal_init()                 台帳の下ごしらえ
 vm_init()                  VM だけ。VMBus を起こし、channel を台帳に載せ、hv_input と hv_util を起こす
-pci_init()                 列挙。記録を作り、台帳に載せる。親と node を決める
+pci_init()                 全部の segment を列挙する。記録を作り、台帳に載せる。親と node を決める
 iommu_init()               全部の機能の群を読む。実装より先に走る
 net_init() audio_init()    部品の下ごしらえ。装置を探さない
 pci_bind_all()             表の順に attach を一つずつ呼ぶ
 vm_bind_fixed()            VM だけ。固定のポートの ata と、storvsc、netvsc
 fb_pm_init()               画面が電源の変化に加わる。画面の PCI の身元が決まった後
-store_init()               C: を探す
+store_init()               C: を探す。C: のディスクが出たら進む
 ```
 
-- `pci_bind_all` は同期である。`store_init` の前に終わる。
-- 待ちが一番長い `nvme` を表の最後に置く。
-- `usb_enumerating` の数は xHCI の `attach` で足す。全部の `attach` が `store_init` の前に終わる。
+- `pci_bind_all` は同期で、`attach` を一度に一つ呼ぶ。だから `attach` は秒の単位で待たない。長い待ちは実装の thread で行い、失敗は `hal_failed` で書く。
+- ディスクの実装は、自分の thread で待つ。`nvme` は制御器ごと、`ahci` はアダプターとポートごと、xHCI は制御器ごとである。だから待ちは足し算にならない。C: の機械は、別のディスクの待ちを待たない。
+- ディスクを持ちうる実装は `blk_looking_begin` を `attach` で呼び、見終わったら `blk_looking_end` を呼ぶ。答えない装置のあるポートは、答えが出るまで見ている（`ahci.c` の `port_looked`）。`store_init` は `blk_looking` だけを見る。ファイルの層は USB も NVMe も知らない。
+- `nvme` と `ahci` の thread の仕事は `blk_busy_begin` の中で走る。眠りと電源断と休止の戻りの `blk_hold` は、それを待つ。`pm_register` は `attach` で呼ぶので、`pm_sleep_check` は thread の終わりを待たない。
 - USB の装置は、worker が抜き差しのたびに結ぶ。PCI は列挙の後に増えない。
 - VM の判定は `vm_detect` が持つ。起動の早い段で、時計より先に走る。
 
@@ -162,7 +165,7 @@ store_init()               C: を探す
 - USB：`usb_remove` は `removed` を立て、drain を止め、class の `detach` を呼び、slot を返す。`release_slot` の頭で `hal_remove` を呼ぶ。`hc_restart` はこの全部を待ってから `hc_start` する。
 - VMBus：RESCIND で `hal_remove` を呼ぶ。
 - PCI：抜き差しも AER も今は無い。だから PCI の表に `lost` は無い。作る日に足す。実装が死んだと分かったら `hal_failed` を呼ぶ。
-- 種類の物の決まりは変えない。`struct blkdev` は消えず、`gone` は戻りうる（`ahci.c:1167-1169`）。`struct screen` は消えない（`fb.h:59-60`）。
+- 種類の物の決まりは変えない。`struct blkdev` は消えず、`gone` は戻りうる（`ahci.c` の `port_examine`）。`struct screen` は消えない（`fb.h:59-60`）。
 - `gone` と `removed` は速い道の今の確かめで、増やさない。
 
 ### 読む口

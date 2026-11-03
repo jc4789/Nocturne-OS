@@ -17,6 +17,7 @@
 #include "arch/cpu.h"
 #include "arch/irq.h"
 #include "arch/spin.h"
+#include "dev/blk.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
 #include "dev/pci_drivers.h"
@@ -275,7 +276,6 @@ struct usb_hc {
 
 static struct usb_hc **controllers;
 static size_t ncontrollers, controllers_room;
-static unsigned unsettled; /* controllers whose first look at every port and hub is not done (atomic) */
 
 static inline uint32_t rd32(volatile uint8_t *b, unsigned off) { return mmio_read32(b + off); }
 static inline void wr32(volatile uint8_t *b, unsigned off, uint32_t v) { mmio_write32(b + off, v); }
@@ -2311,12 +2311,10 @@ static void hc_restart(struct usb_hc *hc, bool after_sleep) {
     hc_start_again(hc);
 }
 
-bool usb_enumerating(void) { return __atomic_load_n(&unsettled, __ATOMIC_ACQUIRE) > 0; }
-
 static void hc_settled(struct usb_hc *hc) {
     if (hc->settled) return;
     hc->settled = true;
-    __atomic_fetch_sub(&unsettled, 1, __ATOMIC_RELEASE);
+    blk_looking_end(); /* its first look at every port and hub is done */
 }
 
 /* A controller's worker: its bring-up, ports, hubs, enumeration, recoveries and restarts. A fair
@@ -2411,7 +2409,7 @@ static int xhci_attach(struct pci_device *d) {
     struct usb_hc *hc = kzalloc(sizeof *hc), **at;
     if (!hc || !(at = kappend(&controllers, &ncontrollers, &controllers_room, sizeof *controllers))) {
         kfree(hc);
-        kprintf("usb: no memory for the controller at %02x:%02x.%u\n", d->bus, d->dev, d->func);
+        kprintf("usb: no memory for the controller at %04x:%02x:%02x.%x\n", PCI_ADDRESS_ARGS(d->address));
         return -N_ERR_NO_MEMORY;
     }
     hc->index = (int)(ncontrollers - 1);
@@ -2419,8 +2417,7 @@ static int xhci_attach(struct pci_device *d) {
     alarm_init(&hc->poll, poll_fire);
     *at = hc;
     if (ncontrollers == 1) pm_register(&xhci_pm);
-    /* every attach ends before C: is looked for (kmain_late), so usb_enumerating counts them all */
-    __atomic_fetch_add(&unsettled, 1, __ATOMIC_ACQ_REL);
+    blk_looking_begin();
     char name[16];
     ksnprintf(name, sizeof name, "usb%d", hc->index);
     if (!(hc->worker = kthread_create(name, hc_worker, hc))) {

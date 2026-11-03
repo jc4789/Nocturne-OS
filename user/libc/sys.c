@@ -485,9 +485,9 @@ n_result n_system_log(char *buf, size_t cap) { return NC5(SYS_SYSTEM_LOG, buf, c
 n_handle n_system_log_open(void) { return (n_handle)NC5(SYS_SYSTEM_LOG_OPEN, 0, 0, 0, 0, 0); }
 n_handle n_app_open(int64_t id) { return (n_handle)NC5(SYS_APP_OPEN, id, 0, 0, 0, 0); }
 n_result n_app_id(n_handle app) { return NC5(SYS_APP_ID, app, 0, 0, 0, 0); }
-n_handle n_pci_claim(n_handle cap, uint8_t bus, uint8_t dev, uint8_t func) { return (n_handle)NC5(SYS_PCI_CLAIM, cap, bus, dev, func, 0); }
+n_handle n_pci_claim(n_handle cap, uint32_t target) { return (n_handle)NC5(SYS_PCI_CLAIM, cap, target, 0, 0, 0); }
 n_result n_pci_info(n_handle pci, struct n_pci_function *out) { return NC5(SYS_PCI_INFO, pci, out, 0, 0, 0); }
-n_result n_pci_config_read(n_handle pci, uint32_t target, uint32_t offset, uint32_t width) {
+n_result n_pci_config_read(n_handle pci, uint64_t target, uint32_t offset, uint32_t width) {
     return NC5(SYS_PCI_CONFIG_READ, pci, target, offset, width, 0);
 }
 n_result n_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, uint32_t value) {

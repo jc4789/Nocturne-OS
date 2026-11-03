@@ -34,7 +34,7 @@ nv_state_t *NV_API_CALL nv_get_ctl_state(void) { return &nvrm_ctl_state; }
 nv_state_t *NV_API_CALL nv_get_adapter_state(NvU32 domain, NvU8 bus, NvU8 slot) {
     nv_state_t *nv = &nvrm_dev.nv;
     if (!nvrm_dev.adapter_ready && !nv->priv) return NULL;
-    if (domain == 0 && nv->pci_info.bus == bus && nv->pci_info.slot == slot) return nv;
+    if (nv->pci_info.domain == domain && nv->pci_info.bus == bus && nv->pci_info.slot == slot) return nv;
     return NULL;
 }
 NvU32 NV_API_CALL nv_get_dev_minor(nv_state_t *nv) { (void)nv; return 0; }
@@ -46,7 +46,7 @@ NvU32 NV_API_CALL nv_get_dev_minor(nv_state_t *nv) { (void)nv; return 0; }
  * other functions (RM looks at the bridges above the GPU) can only be read.
  * ---------------------------------------------------------------------------------------- */
 struct pci_token {
-    uint32_t target;   /* N_PCI_SELF or N_PCI_TARGET(...) */
+    uint64_t target;   /* N_PCI_SELF or N_PCI_TARGET(...) */
     bool self;
     struct pci_token *next;
 };
@@ -91,15 +91,15 @@ static struct pci_token *other_token(uint32_t target, n_result *id) {
 
 void *NV_API_CALL os_pci_init_handle(NvU32 domain, NvU8 bus, NvU8 slot, NvU8 function, NvU16 *vendor,
                                      NvU16 *device) {
-    if (domain != 0 || slot > 31 || function > 7 || nvrm_dev.pci < 0) return NULL;
+    if (domain > UINT16_MAX || slot > 31 || function > 7 || nvrm_dev.pci < 0) return NULL;
     struct pci_token *t;
     n_result id;
     const struct n_pci_function *g = &nvrm_dev.info;
-    if (bus == g->bus && slot == g->dev && function == g->func) {
+    if (domain == g->segment && bus == g->bus && slot == g->dev && function == g->func) {
         t = &self_token;
         id = pci_read(t, 0, 4);
     } else {
-        t = other_token(N_PCI_TARGET(bus, slot, function), &id);
+        t = other_token(N_PCI_TARGET(domain, bus, slot, function), &id);
     }
     if (!t || !function_present(id)) return NULL;
     if (vendor) *vendor = (NvU16)(id & 0xFFFF);
@@ -359,7 +359,7 @@ NV_STATUS nvrm_pci_attach(void) {
     nv_state_t *nv = &d->nv;
     memset(nv, 0, sizeof *nv);
     nv->os_state = d;
-    nv->pci_info.domain = 0;
+    nv->pci_info.domain = g->segment;
     nv->pci_info.bus = g->bus;
     nv->pci_info.slot = g->dev;
     nv->pci_info.function = g->func;

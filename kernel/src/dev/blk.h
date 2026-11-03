@@ -16,7 +16,7 @@
 
 struct blkdev {
     int index;
-    char name[16];  /* "ata0", "scsi1" */
+    char name[24];  /* for the log: "nvme0.1" (controller, namespace), "sata0.2" (adapter, port), "usb0" */
     char model[41];
     uint64_t sectors;
     uint32_t block;  /* the device's own block in bytes, a power of two from 512: a write covering
@@ -42,6 +42,12 @@ struct blkdev {
 };
 
 void blk_register(struct blkdev *d);
+/* A controller, or one of its ports, that may yet bring a disk: from its attach until it has looked
+   (its namespaces, its bus; a port until its device has said who it is). C: is waited for while one
+   does (fs/store.c). */
+void blk_looking_begin(void);
+void blk_looking_end(void);
+bool blk_looking(void);
 int blk_count(void);
 struct blkdev *blk_get(int i);
 int blk_read(struct blkdev *d, uint64_t lba, uint32_t n, void *buf);

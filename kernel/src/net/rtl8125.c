@@ -549,9 +549,9 @@ static int rtl_attach(struct pci_device *d) {
     }
     uint8_t pm = pci_find_cap(d, 0x01);
     if (pm) { /* the firmware may have left the function in a sleep state */
-        uint32_t pmcsr = pci_read32(d->bus, d->dev, d->func, pm + 4);
+        uint32_t pmcsr = pci_read32(d->address, pm + 4);
         if (pmcsr & 3) {
-            pci_write32(d->bus, d->dev, d->func, pm + 4, pmcsr & ~3u);
+            pci_write32(d->address, pm + 4, pmcsr & ~3u);
             clock_spin(10 * NS_PER_MS);
         }
     }
@@ -565,7 +565,7 @@ static int rtl_attach(struct pci_device *d) {
     c->macver = txcfg & 0xFCF00000;
     if (txcfg == 0xFFFFFFFF || (c->macver != 0x64000000 && c->macver != 0x64100000)) {
         kprintf("rtl8125: chip version %08x (rev %02x) not supported yet; only the RTL8125B is\n", txcfg,
-                pci_read32(d->bus, d->dev, d->func, 8) & 0xFF);
+                pci_read32(d->address, 8) & 0xFF);
         goto fail;
     }
 

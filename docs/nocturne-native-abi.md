@@ -532,7 +532,11 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - システムログ：`n_system_log(buf, cap)` か `n_system_log_open()` のハンドルの
   `n_channel_receive` で読み、そのハンドルへ `n_channel_send` で書く（§4）。
 - アプリの中の装置ドライバー（例：NVIDIA の資源管理 `C:\Nocturne\System\nvrm`、`docs/records/nvidia/LEDGER.md`）：
-  - `n_pci_claim(cap, bus, dev, func)` は PCI 機能を動かす権利（`N_KIND_PCI`）を返す。`cap` は
+  - 機能の住所は `N_PCI_TARGET(segment, bus, dev, func)` で、`uint32_t` の全部が住所である。`N_PCI_SELF`
+    は `n_pci_config_read` の `target` で「claim した機能そのもの」を言い、32 bit の外にある。`struct n_pciinfo`
+    と `struct n_pci_function` は `segment` を持つ。上にブリッジがある機能は `N_PCI_HAS_UPSTREAM` が立ち、
+    `upstream` がその住所である。
+  - `n_pci_claim(cap, target)` は PCI 機能を動かす権利（`N_KIND_PCI`）を返す。`target` は `N_PCI_TARGET`。`cap` は
     `N_CAP_PCI_CLAIM`（§13）で、サービスの管理者が宣言のあるドライバーアプリにだけ渡す。カーネルのドライバーが使う
     機能と、既に権利のある機能は `N_ERR_BUSY`。同じ group の機能をカーネルのドライバーが使って
     いても、それが手放せるもの（`struct iommu_guest`：GPU の音の機能）なら、その機能は止まり、

@@ -1057,7 +1057,7 @@ void syscall_dispatch(struct regs *r) {
         struct handle *claim = NULL;
         ret = cap_check((int)a, N_CAP_PCI_CLAIM);
         if (ret < 0) break;
-        ret = pci_user_claim((uint8_t)b,(uint8_t)c,(uint8_t)d,&claim);
+        ret = pci_user_claim((uint32_t)b,&claim);
         ret = new_handle(ret,claim);
         break;
     }
@@ -1080,7 +1080,7 @@ void syscall_dispatch(struct regs *r) {
             struct n_pci_function info;
             ret = pci_user_info(f, &info);
             if (!ret) ret = copy_to_user((void *)b, &info, sizeof info);
-        } else if (r->rax == SYS_PCI_CONFIG_READ) ret = pci_user_config_read(f,(uint32_t)b,(uint32_t)c,(uint32_t)d);
+        } else if (r->rax == SYS_PCI_CONFIG_READ) ret = pci_user_config_read(f,b,(uint32_t)c,(uint32_t)d);
         else if (r->rax == SYS_PCI_CONFIG_WRITE) ret = pci_user_config_write(f,(uint32_t)b,(uint32_t)c,(uint32_t)d);
         else if (r->rax == SYS_PCI_INTERRUPTS) ret = pci_user_interrupts(f,(uint32_t)b);
         else if (r->rax == SYS_PCI_HOLD_SCREEN) ret = pci_user_hold_screen(f, b != 0);

@@ -39,7 +39,6 @@ struct nvrm {
 int64_t nvrm_connect_device_status(uint32_t pci_target, struct nvrm **out) {
     if (!out) return -N_ERR_INVALID;
     *out = NULL;
-    if (pci_target > UINT16_MAX) return -N_ERR_INVALID;
     char channel[NVRM_CHANNEL_NAME_BYTES];
     snprintf(channel, sizeof channel, NVRM_CHANNEL_FORMAT, (unsigned)pci_target);
     struct nvrm *rm = calloc(1, sizeof *rm);
@@ -117,7 +116,7 @@ static int64_t connect_any(bool ready_only, struct nvrm **out) {
     for (n_result i = 0; i < count && !*out; i++) {
         if (!nvrm_pci_is_gpu(list[i].vendor, list[i].cls, list[i].subcls, list[i].progif)) continue;
         struct nvrm *rm;
-        int64_t result = nvrm_connect_device_status(N_PCI_TARGET(list[i].bus, list[i].dev, list[i].func), &rm);
+        int64_t result = nvrm_connect_device_status(N_PCI_TARGET(list[i].segment, list[i].bus, list[i].dev, list[i].func), &rm);
         if (result >= 0 && ready_only && !nvrm_device_ready(rm)) {
             nvrm_disconnect(rm);
             result = -N_ERR_NOT_READY;

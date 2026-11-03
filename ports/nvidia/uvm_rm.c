@@ -88,6 +88,7 @@ void nvrm_uvm_pci_info(struct nvrm_uvm_pci *out)
     out->device = f->device;
     out->subsystem_vendor = f->subsystem_vendor;
     out->subsystem_device = f->subsystem_id;
+    out->segment = f->segment;
     out->bus = f->bus;
     out->dev = f->dev;
     out->func = f->func;

@@ -30,16 +30,16 @@ int main(void) {
         return 1;
     }
     struct n_pciinfo *e = &list[at];
-    n_handle pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), e->bus, e->dev, e->func);
+    n_handle pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
     CHECK(pci >= 0, "claim: %s", n_result_text(pci));
     if (pci < 0) {
         printf("nvrmtest: %d failed\n", failed);
         return 1;
     }
 
-    /* the same hand-over as init: arguments "nvrm <where>", the claim as handle 3 */
+    /* the same hand-over as init: arguments "nvrm <N_PCI_TARGET>", the claim as handle 3 */
     char where[16];
-    snprintf(where, sizeof where, "%02x:%02x.%u", e->bus, e->dev, e->func);
+    snprintf(where, sizeof where, "%08x", N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
     n_handle log = n_system_log_open();
     const char *args[2] = {"nvrm", where};
     int32_t handles[4] = {-1, log, log, pci};
@@ -65,7 +65,7 @@ int main(void) {
     CHECK(got >= 0 && !strstr(text, "rm_init_rm failed"), "rm_init_rm succeeded");
 
     /* the claim ends with nvrm: the device can be claimed again */
-    n_handle again = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), e->bus, e->dev, e->func);
+    n_handle again = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
     CHECK(again >= 0, "claim after nvrm ended: %s", n_result_text(again));
     if (again >= 0) n_handle_close(again);
 

@@ -339,7 +339,7 @@ static void gpu_pci_fill(void)
     gpu_pci.device = info.device;
     gpu_pci.subsystem_vendor = info.subsystem_vendor;
     gpu_pci.subsystem_device = info.subsystem_device;
-    gpu_pci.domain = 0;
+    gpu_pci.domain = info.segment;
     gpu_pci.bus_number = info.bus;
     gpu_pci.devfn = (unsigned char)((info.dev << 3) | (info.func & 7));
     gpu_pci.dev.dma_mask = gpu_pci.dev.coherent_dma_mask = info.dma_mask;

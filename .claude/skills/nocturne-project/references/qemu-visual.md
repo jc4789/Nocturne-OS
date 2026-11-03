@@ -59,7 +59,7 @@
 
 ## 落とし穴
 
-- 起動は serial の `store: C: "Nocturne" on nvme0` で確かめる。UEFI と Limine の待ちを含めて十数秒で出なければ、待たずに原因を見る。
+- 起動は serial の `store: C: "Nocturne" on nvme0.1` で確かめる。UEFI と Limine の待ちを含めて十数秒で出なければ、待たずに原因を見る。
 - `screendump` の保存先は**スラッシュ区切りの絶対 path**。バックスラッシュの path は黙って保存されない。
 - 同じ TCP monitor へ競合して接続しない。一回の接続で命令を順に送り、終わったら閉じる。
 - `C:\Tests\autorun.sh` があれば init がそれを走らせ、終わると電源を切る。通常の `build/nocturne.img` には無いので、デスクトップのまま操作できる。

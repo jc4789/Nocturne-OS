@@ -201,8 +201,7 @@ static bool screen_holder_stop(const char *why) {
     if (app) screen_holder_stopped = true;
     spin_unlock(&screen_hold_lock, irq);
     if (!app) return false;
-    kprintf("pci: %02x:%02x.%u: %s; stopping app %d; framebuffer writes resume at release, device recovery may be needed\n", d->bus,
-            d->dev, d->func, why, app);
+    kprintf("pci: %04x:%02x:%02x.%x: %s; stopping app %d; framebuffer writes resume at release, device recovery may be needed\n", PCI_ADDRESS_ARGS(d->address), why, app);
     if (process_kill(app) < 0) kprintf("pci: app %d cannot be stopped; the screen stays held\n", app);
     return true;
 }
@@ -251,8 +250,8 @@ int64_t screen_hold_setting_get(uint32_t key, void *out, size_t cap) {
 /* screen_lock held. */
 static void screen_hold_begin(struct pci_claim *c) {
     /* Said while the screen still shows it: a screen that stops changing next tells why. */
-    kprintf("pci: %02x:%02x.%u: app %d holds the screen while its driver starts or stops the device\n",
-            c->d->bus, c->d->dev, c->d->func, process_current()->pid);
+    kprintf("pci: %04x:%02x:%02x.%x: app %d holds the screen while its driver starts or stops the device\n",
+            PCI_ADDRESS_ARGS(c->d->address), process_current()->pid);
     int app = process_current()->pid;
     uint64_t irq = spin_lock(&screen_hold_lock);
     screen_holder = c;
@@ -297,7 +296,7 @@ static void screen_release(void) {
    engine may no longer show it: the driver that left reprogrammed it and nothing sets it back. */
 static struct mutex screen_lock; /* the outputs of every claim, output_screens and the images */
 struct output_screen {
-    uint8_t bus, dev, func;
+    struct pci_address address;
     uint32_t output;
     struct screen *screen;
 };
@@ -329,7 +328,7 @@ static struct screen_image *screen_images;
 static int64_t screen_image_last;
 
 static void screen_say(const struct pci_claim *c, uint32_t output, const char *what) {
-    kprintf("pci: %02x:%02x.%u: output %u: %s\n", c->d->bus, c->d->dev, c->d->func, output, what);
+    kprintf("pci: %04x:%02x:%02x.%x: output %u: %s\n", PCI_ADDRESS_ARGS(c->d->address), output, what);
 }
 
 /* Nothing is drawn into it any more, nor mapped or pinned. screen_lock held, out of the list. */
@@ -359,13 +358,13 @@ static struct screen *output_screen_of(struct pci_device *d, uint32_t output) {
     if (output == 0 && screen_bar(d) >= 0) return screen_get(0);
     for (size_t i = 0; i < noutput_screens; i++) {
         struct output_screen *e = &output_screens[i];
-        if (e->bus == d->bus && e->dev == d->dev && e->func == d->func && e->output == output) return e->screen;
+        if (pci_address_same(e->address, d->address) && e->output == output) return e->screen;
     }
     struct screen *s = screen_new();
     if (!s) return NULL;
     struct output_screen *e = kappend(&output_screens, &noutput_screens, &output_screens_room, sizeof *e);
     if (!e) return NULL; /* the screen stays, off: screens are never freed */
-    *e = (struct output_screen){d->bus, d->dev, d->func, output, s};
+    *e = (struct output_screen){d->address, output, s};
     return s;
 }
 
@@ -520,8 +519,8 @@ static void claim_release(struct object *o) {
             struct pci_device *peer = c->domain->members[i];
             peer->needs_reset = true;
             if (peer != d && !peer->reset && !pci_disable_busmaster(peer, NULL))
-                kprintf("pci: %02x:%02x.%u: peer bus mastering did not stop; group recovery is required\n",
-                        peer->bus, peer->dev, peer->func);
+                kprintf("pci: %04x:%02x:%02x.%x: peer bus mastering did not stop; group recovery is required\n",
+                        PCI_ADDRESS_ARGS(peer->address));
         }
     }
     bool blocked = c->domain && iommu_block(c->domain);
@@ -529,15 +528,15 @@ static void claim_release(struct object *o) {
     d->needs_reset |= running;
     __atomic_store_n(&c->dma_unsafe, !blocked, __ATOMIC_RELEASE);
     if (running)
-        kprintf("pci: %02x:%02x.%u: %s; %s%s\n", d->bus, d->dev, d->func,
+        kprintf("pci: %04x:%02x:%02x.%x: %s; %s%s\n", PCI_ADDRESS_ARGS(d->address),
                 left_running ? "its driver ended without stopping it (bus mastering was on)"
                 : !stopped   ? "it does not stop"
                              : "it still has requests in flight",
                 blocked ? "the IOMMU keeps it from memory" : "its DMA memory stays out of use",
                 "; recovery is deferred to the next driver, not process exit");
     else if (!blocked)
-        kprintf("pci: %02x:%02x.%u: bus mastering is off, but posted DMA drain is unconfirmed; remaining DMA memory stays out of use\n",
-                d->bus, d->dev, d->func);
+        kprintf("pci: %04x:%02x:%02x.%x: bus mastering is off, but posted DMA drain is unconfirmed; remaining DMA memory stays out of use\n",
+                PCI_ADDRESS_ARGS(d->address));
     mutex_unlock(&claim_mutex);
     /* Revoke CPU access before returning screen holds. Resuming CPU framebuffer writes is only
        a best-effort redraw: neither BME clear nor IOMMU blocking rebuilds a GPU's BAR/scanout. */
@@ -555,7 +554,7 @@ static void claim_release(struct object *o) {
     d->claimed = false;
     hal_unbound(&d->hal);
     mutex_unlock(&claim_mutex);
-    kprintf("pci: %02x:%02x.%u released\n", d->bus, d->dev, d->func);
+    kprintf("pci: %04x:%02x:%02x.%x released\n", PCI_ADDRESS_ARGS(d->address));
     claim_drop(c);
 }
 /* An app's claims close before its other handles and its mappings at its end: its device is
@@ -618,7 +617,7 @@ static void guards_init(struct pci_claim *c) {
     for (unsigned k = 0; k < 2; k++) {
         uint16_t rebar = pci_find_ext_cap(d, sized[k]);
         if (!rebar) continue;
-        unsigned bars = (pci_read32(d->bus, d->dev, d->func, rebar + 8) >> 5) & 7;
+        unsigned bars = (pci_read32(d->address, rebar + 8) >> 5) & 7;
         for (unsigned i = 0; i < bars && i < 6; i++) guard(c, rebar + 8 + 8 * i, 0x3F00); /* BAR Size */
     }
     uint16_t sriov = pci_find_ext_cap(d, 0x10);
@@ -641,7 +640,7 @@ static bool guarded(const struct pci_claim *c, uint32_t offset, uint32_t width, 
     for (unsigned i = 0; i < c->guard_count; i++) {
         if (c->guards[i].offset != dword) continue;
         const struct pci_device *d = c->d;
-        uint32_t old = pci_read32(d->bus, d->dev, d->func, dword);
+        uint32_t old = pci_read32(d->address, dword);
         uint32_t now = (old & ~written) | ((value << shift) & written);
         uint32_t bits = c->guards[i].bits;
         if (dword == c->pmcsr && !(now & 3)) bits &= ~3u; /* back to D0 */
@@ -682,8 +681,8 @@ static bool bus_reset(struct pci_claim *c, struct pci_device *m) {
                           : !ours && iommu_in_use(f)   ? "it is in another claim's domain"
                                                        : NULL;
         if (why) {
-            kprintf("pci: %02x:%02x.%u: no Secondary Bus Reset at %02x:%02x.%u: %02x:%02x.%u is below it and %s\n",
-                    m->bus, m->dev, m->func, port->bus, port->dev, port->func, f->bus, f->dev, f->func, why);
+            kprintf("pci: %04x:%02x:%02x.%x: no Secondary Bus Reset at %04x:%02x:%02x.%x: %04x:%02x:%02x.%x is below it and %s\n",
+                    PCI_ADDRESS_ARGS(m->address), PCI_ADDRESS_ARGS(port->address), PCI_ADDRESS_ARGS(f->address), why);
             return false;
         }
     }
@@ -756,7 +755,7 @@ static bool claim_recover(struct pci_claim *c) {
         if (!m->needs_reset) continue;
         if (!pci_irq_disable(m)) return false; /* do not preserve an old MSI Enable in FLR state */
         bool screen = screen_bar(m) >= 0;
-        bool flr = m->pcie_cap && (pci_read32(m->bus, m->dev, m->func, m->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR);
+        bool flr = m->pcie_cap && (pci_read32(m->address, m->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR);
         if (!screen && flr) {
             if (!reset_finish(c, m)) {
                 if (m != d && pci_reset_stuck(m)) continue;
@@ -766,8 +765,8 @@ static bool claim_recover(struct pci_claim *c) {
             return false;
         } else {
             if (!pci_disable_busmaster(d, NULL)) return false;
-            kprintf("pci: %02x:%02x.%u: isolated, but native driver recovery is still required%s\n",
-                    d->bus, d->dev, d->func, screen ? "; boot display is not automatically reset" : "");
+            kprintf("pci: %04x:%02x:%02x.%x: isolated, but native driver recovery is still required%s\n",
+                    PCI_ADDRESS_ARGS(d->address), screen ? "; boot display is not automatically reset" : "");
         }
     }
     /* A bus reset for one member resets the others below its port too: one it brought back
@@ -778,8 +777,8 @@ static bool claim_recover(struct pci_claim *c) {
         if (!m->reset) continue;
         if (m == d) return false;
         m->needs_reset = true;
-        kprintf("pci: %02x:%02x.%u does not answer after its resets: left as it is, bus mastering off, what it "
-                "sends kept in the domain of %02x:%02x.%u\n", m->bus, m->dev, m->func, d->bus, d->dev, d->func);
+        kprintf("pci: %04x:%02x:%02x.%x does not answer after its resets: left as it is, bus mastering off, what it "
+                "sends kept in the domain of %04x:%02x:%02x.%x\n", PCI_ADDRESS_ARGS(m->address), PCI_ADDRESS_ARGS(d->address));
     }
     return !thread_current()->killed;
 }
@@ -815,11 +814,16 @@ static int64_t claim_form(struct pci_claim *c, struct handle **out) {
     return 0;
 }
 
-int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct handle **out) {
+/* N_PCI_TARGET's function, of those enumeration found. */
+static struct pci_device *target_function(uint32_t target) {
+    return pci_find_function((struct pci_address){N_PCI_TARGET_SEGMENT(target), N_PCI_TARGET_BUS(target),
+                                                  N_PCI_TARGET_DEV(target), N_PCI_TARGET_FUNC(target)});
+}
+
+int64_t pci_user_claim(uint32_t target, struct handle **out) {
     struct process *t = process_current();
     if (!t) return -N_ERR_DENIED;
-    if (dev > 31 || func > 7) return -N_ERR_INVALID;
-    struct pci_device *d = pci_find_function(bus, dev, func);
+    struct pci_device *d = target_function(target);
     if (!d) return -N_ERR_NOT_FOUND;
     /* A bridge's registers route other devices' memory, buses and resets. */
     if (d->cls == 0x06) return -N_ERR_DENIED;
@@ -836,7 +840,7 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct handle **o
         kfree(c);
         return r;
     }
-    kprintf("pci: %02x:%02x.%u (%04x:%04x) claimed by pid %d%s\n", bus, dev, func, d->vendor, d->device, t->pid,
+    kprintf("pci: %04x:%02x:%02x.%x (%04x:%04x) claimed by pid %d%s\n", PCI_ADDRESS_ARGS(d->address), d->vendor, d->device, t->pid,
             c->domain ? "" : iommu_active() ? "; the IOMMU cannot isolate it: its DMA reaches all of memory"
                                             : "; no IOMMU isolates it: its DMA reaches all of memory");
     return 0;
@@ -847,18 +851,21 @@ int64_t pci_user_info(struct handle *h, struct n_pci_function *out) {
     if (!c) return -N_ERR_WRONG_KIND;
     struct pci_device *d = c->d;
     memset(out, 0, sizeof *out);
-    out->bus = d->bus; out->dev = d->dev; out->func = d->func;
-    out->revision = pci_read32(d->bus, d->dev, d->func, 0x08) & 0xFF;
+    out->segment = d->address.segment; out->bus = d->address.bus; out->dev = d->address.dev; out->func = d->address.func;
+    out->revision = pci_read32(d->address, 0x08) & 0xFF;
     out->vendor = d->vendor; out->device = d->device;
-    uint32_t sub = pci_read32(d->bus, d->dev, d->func, 0x2C);
+    uint32_t sub = pci_read32(d->address, 0x2C);
     out->subsystem_vendor = sub & 0xFFFF; out->subsystem_id = sub >> 16;
     out->cls = d->cls; out->subcls = d->subcls; out->progif = d->progif;
-    out->interrupt_pin = (pci_read32(d->bus, d->dev, d->func, 0x3C) >> 8) & 0xFF;
+    out->interrupt_pin = (pci_read32(d->address, 0x3C) >> 8) & 0xFF;
     out->msi_vectors = pci_msi_max_vectors(d);
     out->msix_vectors = pci_msix_max_vectors(d);
     struct pci_device *up = pci_upstream(d);
-    out->upstream = up ? N_PCI_TARGET(up->bus, up->dev, up->func) : N_PCI_NONE;
     out->flags = c->domain ? N_PCI_ISOLATED : 0;
+    if (up) {
+        out->upstream = N_PCI_TARGET(up->address.segment, up->address.bus, up->address.dev, up->address.func);
+        out->flags |= N_PCI_HAS_UPSTREAM;
+    }
     if (d->needs_reset) out->flags |= N_PCI_NEEDS_RECOVERY;
     for (unsigned i = 0; i < pci_bar_count(d); i++) {
         uint32_t raw = d->bar[i];
@@ -1202,26 +1209,30 @@ static bool config_access_ok(uint32_t offset, uint32_t width) {
      is often function 1 or later beside a host-bridge function 0;
    - the host bridges, which tell the driver what chipset the path starts at. */
 static bool is_host_bridge(const struct pci_device *d) { return d->cls == 0x06 && d->subcls == 0x00; }
+static bool same_device_number(const struct pci_device *a, const struct pci_device *b) {
+    return a->address.segment == b->address.segment && a->address.bus == b->address.bus && a->address.dev == b->address.dev;
+}
+
 static bool may_read(const struct pci_device *d, const struct pci_device *target) {
-    if (target->bus == d->bus && target->dev == d->dev) return true;
+    if (same_device_number(target, d)) return true;
     for (const struct pci_device *b = pci_upstream(d); b; b = pci_upstream(b))
-        if (target->bus == b->bus && target->dev == b->dev) return true;
+        if (same_device_number(target, b)) return true;
     return is_host_bridge(target);
 }
 
-int64_t pci_user_config_read(struct handle *h, uint32_t target, uint32_t offset, uint32_t width) {
+int64_t pci_user_config_read(struct handle *h, uint64_t target, uint32_t offset, uint32_t width) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (!config_access_ok(offset, width)) return -N_ERR_INVALID;
     struct pci_device *t = c->d;
     if (target != N_PCI_SELF) {
-        if (target > 0xFFFF) return -N_ERR_INVALID;
-        t = pci_find_function(target >> 8, (target >> 3) & 31, target & 7);
+        if (target > UINT32_MAX) return -N_ERR_INVALID;
+        t = target_function((uint32_t)target);
         if (!t) return -N_ERR_NOT_FOUND;
         if (!may_read(c->d, t)) return -N_ERR_DENIED;
     }
     uint32_t v;
-    if (t == c->d) v = pci_read32(t->bus, t->dev, t->func, offset & ~3u);
+    if (t == c->d) v = pci_read32(t->address, offset & ~3u);
     /* under an FLR (dev/pci.h): another claim's, or one an ended claim left for a later claim to
        finish; checked and read in one step against a reset beginning on another CPU */
     else if (!pci_config_read_unless_reset(t, (uint16_t)offset, &v)) return -N_ERR_NOT_READY;
@@ -1258,9 +1269,9 @@ int64_t pci_user_config_write(struct handle *h, uint32_t offset, uint32_t width,
     struct pci_device *d = c->d;
     if (kernel_register(d, offset, width) && !bar_restore(d, offset, width, value)) return -N_ERR_DENIED;
     if (guarded(c, offset, width, value)) return -N_ERR_DENIED;
-    if (width == 4) pci_write32(d->bus, d->dev, d->func, offset, value);
-    else if (width == 2) pci_write16(d->bus, d->dev, d->func, offset, value);
-    else pci_write8(d->bus, d->dev, d->func, offset, value);
+    if (width == 4) pci_write32(d->address, offset, value);
+    else if (width == 2) pci_write16(d->address, offset, value);
+    else pci_write8(d->address, offset, value);
     return 0;
 }
 

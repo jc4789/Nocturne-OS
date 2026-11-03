@@ -110,7 +110,7 @@ static uint16_t command_register;
 static bool command_ignores_writes, command_unreadable;
 static int command_writes, screen_holds, screen_calls;
 static n_result screen_result;
-n_result n_pci_config_read(n_handle pci, uint32_t target, uint32_t offset, uint32_t width) {
+n_result n_pci_config_read(n_handle pci, uint64_t target, uint32_t offset, uint32_t width) {
     (void)pci;
     CHECK(target == N_PCI_SELF && offset == PCI_COMMAND && width == 2);
     return command_unreadable ? -N_ERR_IO : command_register;

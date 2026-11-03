@@ -30,7 +30,7 @@
 #include "nv-unix-nvos-params-wrappers.h"
 
 /* A PCI function no GPU of the test machine is: the server's channel is this test's own. */
-#define TARGET N_PCI_TARGET(0xfe, 0x1f, 7)
+#define TARGET N_PCI_TARGET(0, 0xfe, 0x1f, 7)
 #define WAIT_MS 5000u
 #define FAKE_CMD_ECHO 0x7e570001u
 #define FAKE_CMD_BLOCK 0x7e570002u

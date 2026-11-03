@@ -139,12 +139,12 @@ n_result n_app_id(n_handle app); /* its identifier, also after its end (identifi
    last handle closes, which also turns the function's interrupts off. Isolation is required
    unless appdrivers-unisolated was explicitly selected at boot. A device left active needs
    recovery; n_pci_info reports N_PCI_NEEDS_RECOVERY if generic FLR was not possible. */
-n_handle n_pci_claim(n_handle cap, uint8_t bus, uint8_t dev, uint8_t func);
+n_handle n_pci_claim(n_handle cap, uint32_t target); /* N_PCI_TARGET */
 n_result n_pci_info(n_handle pci, struct n_pci_function *out);
 /* Config space: width 1, 2 or 4 at an offset below 4096 aligned to it. Reads may name another
    function (N_PCI_TARGET, e.g. the upstream bridge) or N_PCI_SELF; writes only reach the
    claimed function. A read returns the value (non-negative). */
-n_result n_pci_config_read(n_handle pci, uint32_t target, uint32_t offset, uint32_t width);
+n_result n_pci_config_read(n_handle pci, uint64_t target, uint32_t offset, uint32_t width);
 n_result n_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, uint32_t value);
 /* A memory BAR as a shared object over its device memory (uncached; n_shared_view makes
    write-combining parts or smaller windows to map or to send to another app). */

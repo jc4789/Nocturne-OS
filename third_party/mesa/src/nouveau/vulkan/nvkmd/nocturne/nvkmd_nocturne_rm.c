@@ -374,11 +374,11 @@ probed_gpu(struct nvrm *rm, uint32_t client, uint32_t target, uint32_t *gpu_id)
                         &pci, sizeof(pci));
       if (st != NV_OK)
          return st;
-      /* Native PCI targets currently have no segment field. RM's command
-       * supplies bus/slot but no function; the function remains the one
-       * selected by the native endpoint, never a fabricated RM output. */
-      if (pci.domain == 0 && pci.bus == (target >> 8) &&
-          pci.slot == ((target >> 3) & 0x1f)) {
+      /* RM's command supplies domain/bus/slot but no function; the function
+       * remains the one selected by the native endpoint, never a fabricated
+       * RM output. */
+      if (pci.domain == N_PCI_TARGET_SEGMENT(target) && pci.bus == N_PCI_TARGET_BUS(target) &&
+          pci.slot == N_PCI_TARGET_DEV(target)) {
          *gpu_id = probed.gpuIds[i];
          return NV_OK;
       }
@@ -564,7 +564,7 @@ nnrm_enumerate_gpus(uint32_t **targets_out, uint32_t *count_out)
    for (uint32_t i = 0; i < count; i++) {
       if (!nvrm_pci_is_gpu(list[i].vendor, list[i].cls, list[i].subcls, list[i].progif))
          continue;
-      uint32_t target = N_PCI_TARGET(list[i].bus, list[i].dev, list[i].func);
+      uint32_t target = N_PCI_TARGET(list[i].segment, list[i].bus, list[i].dev, list[i].func);
       struct nvrm *rm = NULL;
       st = connect_device(target, &rm);
       if (st == NV_ERR_OBJECT_NOT_FOUND)
@@ -639,9 +639,10 @@ nnrm_open_device(uint32_t target, struct nnrm **out, struct nnrm_gpu_info *info,
       return st;
    }
 
-   n->info.pci_bus = target >> 8;
-   n->info.pci_dev = (target >> 3) & 0x1f;
-   n->info.pci_func = target & 0x7;
+   n->info.pci_domain = N_PCI_TARGET_SEGMENT(target);
+   n->info.pci_bus = N_PCI_TARGET_BUS(target);
+   n->info.pci_dev = N_PCI_TARGET_DEV(target);
+   n->info.pci_func = N_PCI_TARGET_FUNC(target);
    if (info != NULL)
       *info = n->info;
    *out = n;

@@ -86,12 +86,12 @@ n_handle n_inlet_accept(n_handle inlet, int flags) { (void)inlet; (void)flags; r
 n_handle n_events_create(void) { return 20; }
 n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t token) {
     (void)q; (void)interest;
-    CHECK((h == 10 && token == LISTENER_TOKEN) || (h == 30 && token == LEGACY_LISTENER_TOKEN));
+    CHECK(h == 10 && token == LISTENER_TOKEN);
     watches++;
     return 0;
 }
-n_result n_events_wait(n_handle q, struct n_event *out, size_t max, int64_t timeout_ms) {
-    (void)q; (void)out; (void)max; (void)timeout_ms;
+n_result n_events_wait(n_handle q, struct n_event *out, size_t max, uint64_t deadline) {
+    (void)q; (void)out; (void)max; (void)deadline;
     return -N_ERR_CANCELLED;
 }
 n_handle n_shared_reserve(size_t bytes) { (void)bytes; return reserve_result; }
@@ -122,7 +122,7 @@ n_result pcilist(struct n_pciinfo *list, int capacity) {
 }
 void *nvrm_rm_file_open(bool admin, uint32_t principal) { CHECK(!admin && principal == sender_app); return &rm_calls; }
 bool nvrm_rm_adapter_ready(void) {
-    return fixture_adapter_ready && (!multi_gpu_ready || strcmp(connected_name, "nocturne.nvidia.rm.0321"));
+    return fixture_adapter_ready && (!multi_gpu_ready || strcmp(connected_name, "nocturne.nvidia.rm.00000321"));
 }
 void nvrm_rm_file_close(void *file) { (void)file; }
 /* UVM (uvm_nvrm.h), as the server sees it when nvrm runs no UVM. */
@@ -307,12 +307,12 @@ int main(void) {
        BDF, not the first daemon that wins a shared service-name race. */
     server.file = NULL;
     struct nvrm *connection = nvrm_connect();
-    CHECK(connection && !strcmp(connected_name, "nocturne.nvidia.rm.0321"));
+    CHECK(connection && !strcmp(connected_name, "nocturne.nvidia.rm.00000321"));
     CHECK(nvrm_device_ready(connection));
     nvrm_disconnect(connection);
     server.file = NULL; server.arena = NULL; server.arena_handle = -1;
-    connection = nvrm_connect_device(N_PCI_TARGET(7, 0, 0));
-    CHECK(connection && !strcmp(connected_name, "nocturne.nvidia.rm.0700"));
+    connection = nvrm_connect_device(N_PCI_TARGET(0, 7, 0, 0));
+    CHECK(connection && !strcmp(connected_name, "nocturne.nvidia.rm.00000700"));
     CHECK(nvrm_device_ready(connection));
     nvrm_disconnect(connection);
     server.file = NULL; server.arena = NULL; server.arena_handle = -1;
@@ -342,13 +342,13 @@ int main(void) {
     override_hello = false;
     multi_gpu_ready = true;
     connection = nvrm_connect();
-    CHECK(connection && !nvrm_device_ready(connection) && !strcmp(connected_name, "nocturne.nvidia.rm.0321"));
+    CHECK(connection && !nvrm_device_ready(connection) && !strcmp(connected_name, "nocturne.nvidia.rm.00000321"));
     nvrm_disconnect(connection);
     connection = nvrm_connect_ready();
-    CHECK(connection && nvrm_device_ready(connection) && !strcmp(connected_name, "nocturne.nvidia.rm.0400"));
+    CHECK(connection && nvrm_device_ready(connection) && !strcmp(connected_name, "nocturne.nvidia.rm.00000400"));
     nvrm_disconnect(connection);
     connection = NULL;
-    CHECK(nvrm_connect_ready_status(&connection) == 0 && connection && !strcmp(connected_name, "nocturne.nvidia.rm.0400"));
+    CHECK(nvrm_connect_ready_status(&connection) == 0 && connection && !strcmp(connected_name, "nocturne.nvidia.rm.00000400"));
     nvrm_disconnect(connection);
     /* Why there is none: the first GPU's reason, not the last one's. */
     fixture_adapter_ready = false;
@@ -361,7 +361,6 @@ int main(void) {
     connect_result = 12;
     CHECK(nvrm_connect_ready_status(NULL) == -N_ERR_INVALID);
     multi_gpu_ready = false;
-    CHECK(!nvrm_connect_device((uint32_t)UINT16_MAX + 1));
     CHECK(nvrm_pci_is_gpu(0x10de, 0x03, 0x02, 0x00));
     CHECK(!nvrm_pci_is_gpu(0x10de, 0x03, 0x01, 0x00));
     CHECK(!nvrm_pci_is_gpu(0x10de, 0x03, 0x00, 0x01));
@@ -395,11 +394,11 @@ int main(void) {
     void *refused;
     CHECK(n_shared_map(42, N_PAGE_SIZE, N_MEMORY_READ_WRITE, &refused) == -N_ERR_DENIED && !refused);
 
-    CHECK(nvrm_serve(N_PCI_TARGET(2, 1, 0)) == -N_ERR_CANCELLED);
+    CHECK(nvrm_serve(N_PCI_TARGET(1, 2, 1, 0)) == -N_ERR_CANCELLED);
     CHECK(listener_calls == 1 && watches == 1);
-    CHECK(!strcmp(listened_name, "nocturne.nvidia.rm.0208"));
+    CHECK(!strcmp(listened_name, "nocturne.nvidia.rm.00010208"));
     listener_calls = watches = listener_closes = 0;
-    CHECK(nvrm_serve(N_PCI_TARGET(3, 1, 0)) == -N_ERR_CANCELLED);
+    CHECK(nvrm_serve(N_PCI_TARGET(0, 3, 1, 0)) == -N_ERR_CANCELLED);
     CHECK(listener_calls == 1 && watches == 1);
     CHECK(stop_wakes == 2 && threads_started == 0); /* the end is announced to client threads */
     printf("nvrm_transport_hosttest: %d failed (channel/RM fixtures; no GPU execution)\n", failures);

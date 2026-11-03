@@ -37,6 +37,12 @@ void blk_register(struct blkdev *d) {
             d->persist ? "" : ", no write cache");
 }
 
+static unsigned looking; /* atomic */
+
+void blk_looking_begin(void) { __atomic_fetch_add(&looking, 1, __ATOMIC_ACQ_REL); }
+void blk_looking_end(void) { __atomic_fetch_sub(&looking, 1, __ATOMIC_RELEASE); }
+bool blk_looking(void) { return __atomic_load_n(&looking, __ATOMIC_ACQUIRE) > 0; }
+
 int blk_count(void) { return __atomic_load_n(&ndevs, __ATOMIC_ACQUIRE); }
 
 struct blkdev *blk_get(int i) {

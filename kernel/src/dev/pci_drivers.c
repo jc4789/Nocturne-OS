@@ -3,8 +3,7 @@
 #include "dev/pci_drivers.h"
 #include "vm/vm.h"
 
-/* 表の順に結ぶ。先に合った実装が機能を持つので、機種の行の実装を種類の行の実装より先に置く。起動の待ちが一番長い
-   nvme を最後に置く。 */
+/* 表の順に結ぶ。先に合った実装が機能を持つので、機種の行の実装を種類の行の実装より先に置く。 */
 static const struct pci_driver *const pci_driver_table[] = {
     &rtl8125_driver, &xhci_driver, &hda_driver, &ahci_driver, &nvme_driver,
 };

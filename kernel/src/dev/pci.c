@@ -15,98 +15,140 @@
 #include "sys/wait.h"
 
 /* ---- ECAM (MCFG) ----
-   Only segment 0 is used (struct pci_device has no segment). A function's 4 KiB config page is mapped
-   (uncached) once enumeration has found it, so the 256 MiB window is never mapped as a whole. Until a
-   function is active, offsets below 256 go through CF8/CFC, which is also what enumeration probes with.
-   Without an MCFG, or if an ECAM read disagrees with CF8, everything stays on CF8/CFC. */
-static const struct acpi_mcfg_entry *ecam; /* the MCFG's own entries */
-static unsigned necam;
-static bool ecam_off;
-/* One bit per bus/dev/func, set once its page is mapped, from any CPU. Two CPUs that find it clear
-   at once both map it, the same way (vmm_map_mmio), and one of them sets it. */
-static uint8_t ecam_active[65536 / 8];
+   One window for each of the MCFG's entries, over buses of one segment. A function's 4 KiB config
+   page is mapped (uncached) when it is first reached by ECAM, so a window is never mapped as a whole.
+   Segment 0 has CF8/CFC too: offsets below 256 of a function not yet found go through it, which is
+   also what enumeration probes with there, and if an ECAM read disagrees with CF8 the window stays
+   off. Every other segment has its windows alone: enumeration probes through them. */
+struct ecam_window {
+    uint64_t base; /* of bus 0, device 0, function 0, whichever bus the window starts at */
+    uint16_t segment;
+    uint8_t start_bus, end_bus;
+    bool off;
+    /* One bit per bus/dev/func from start_bus, set once its page is mapped, from any CPU. Two CPUs
+       that find it clear at once both map it, the same way (vmm_map_mmio), and one of them sets it. */
+    uint8_t *active;
+};
+static struct ecam_window *ecam;
+static size_t necam, ecam_room;
+static bool devices_lost; /* a function may exist that enumeration did not find; atomic */
 
-static volatile uint32_t *ecam_regs(uint8_t bus, uint8_t dev, uint8_t func, bool map) {
-    if (ecam_off) return NULL;
-    for (unsigned i = 0; i < necam; i++) {
-        if (ecam[i].segment != 0 || !ecam[i].base || bus < ecam[i].start_bus || bus > ecam[i].end_bus) continue;
-        unsigned bdf = (unsigned)bus << 8 | (unsigned)dev << 3 | func;
-        uint64_t phys = ecam[i].base + ((uint64_t)(bus - ecam[i].start_bus) << 20 | (uint64_t)dev << 15 |
-                                         (uint64_t)func << 12);
-        uint8_t bit = (uint8_t)(1u << (bdf & 7));
-        if (!(__atomic_load_n(&ecam_active[bdf >> 3], __ATOMIC_ACQUIRE) & bit)) {
-            if (!map || !vmm_map_mmio(phys, 4096)) return NULL;
-            __atomic_fetch_or(&ecam_active[bdf >> 3], bit, __ATOMIC_RELEASE);
+void pci_config_init(void) {
+    const struct acpi_sdt *mcfg = acpi_find("MCFG", 0);
+    if (!mcfg || mcfg->length < ACPI_MCFG_ENTRIES) {
+        kprintf("pci: no MCFG, config space via CF8/CFC only (no extended capabilities, segment 0 alone)\n");
+        return;
+    }
+    const struct acpi_mcfg_entry *entries = (const void *)((const uint8_t *)mcfg + ACPI_MCFG_ENTRIES);
+    size_t count = (mcfg->length - ACPI_MCFG_ENTRIES) / sizeof *entries;
+    for (size_t i = 0; i < count; i++) {
+        const struct acpi_mcfg_entry *e = &entries[i];
+        if (!e->base || e->start_bus > e->end_bus) continue;
+        uint8_t *active = kzalloc(((size_t)(e->end_bus - e->start_bus) + 1) * 256 / 8);
+        struct ecam_window *w = active ? kappend(&ecam, &necam, &ecam_room, sizeof *w) : NULL;
+        if (!w) {
+            kprintf("pci: no memory for the ECAM window of segment %u: its functions are not used\n", e->segment);
+            __atomic_store_n(&devices_lost, true, __ATOMIC_RELEASE);
+            kfree(active);
+            continue;
         }
-        return phys_to_virt(phys);
+        *w = (struct ecam_window){e->base, e->segment, e->start_bus, e->end_bus, false, active};
+        kprintf("pci: ECAM segment %u buses %u-%u at %lx\n", e->segment, e->start_bus, e->end_bus, e->base);
+    }
+}
+
+static struct ecam_window *ecam_window_of(struct pci_address a) {
+    for (size_t i = 0; i < necam; i++) {
+        struct ecam_window *w = &ecam[i];
+        if (!w->off && w->segment == a.segment && a.bus >= w->start_bus && a.bus <= w->end_bus) return w;
     }
     return NULL;
 }
+
+static volatile uint32_t *ecam_regs(struct pci_address a, bool map) {
+    struct ecam_window *w = ecam_window_of(a);
+    if (!w) return NULL;
+    unsigned n = (unsigned)(a.bus - w->start_bus) << 8 | (unsigned)a.dev << 3 | a.func;
+    uint64_t phys = w->base + ((uint64_t)a.bus << 20 | (uint64_t)a.dev << 15 | (uint64_t)a.func << 12);
+    uint8_t bit = (uint8_t)(1u << (n & 7));
+    if (!(__atomic_load_n(&w->active[n >> 3], __ATOMIC_ACQUIRE) & bit)) {
+        if (!map) return NULL;
+        if (!vmm_map_mmio(phys, 4096)) {
+            if (!__atomic_exchange_n(&devices_lost, true, __ATOMIC_ACQ_REL))
+                kprintf("pci: %04x:%02x:%02x.%x: no memory to map its configuration space: functions may be unknown\n",
+                        PCI_ADDRESS_ARGS(a));
+            return NULL;
+        }
+        __atomic_fetch_or(&w->active[n >> 3], bit, __ATOMIC_RELEASE);
+    }
+    return phys_to_virt(phys);
+}
+
+/* Where CF8/CFC reaches: anywhere else a register is ECAM's or none. */
+static bool cf8_reaches(struct pci_address a, uint16_t off) { return !a.segment && off < 256; }
 
 /* Mechanism #1 is an address register and a data window, one pair for the machine: another
    access between the two, on any CPU or in an interrupt handler, would redirect this one. The
    pair is one step under cf8_lock, the last lock taken (after reset_lock). */
 static struct spinlock cf8_lock;
 
-static uint32_t cf8_read32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off) {
+static void cf8_select(struct pci_address a, uint16_t off) {
+    outl(0xCF8, 0x80000000u | (uint32_t)a.bus << 16 | (uint32_t)a.dev << 11 | (uint32_t)a.func << 8 | (off & 0xFC));
+}
+
+static uint32_t cf8_read32(struct pci_address a, uint16_t off) {
     uint64_t f = spin_lock(&cf8_lock);
-    outl(0xCF8, 0x80000000u | (uint32_t)bus << 16 | (uint32_t)dev << 11 | (uint32_t)func << 8 | (off & 0xFC));
+    cf8_select(a, off);
     uint32_t v = inl(0xCFC);
     spin_unlock(&cf8_lock, f);
     return v;
 }
 
-uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off) {
-    volatile uint32_t *r = ecam_regs(bus, dev, func, off >= 256);
+uint32_t pci_read32(struct pci_address a, uint16_t off) {
+    bool cf8 = cf8_reaches(a, off);
+    volatile uint32_t *r = ecam_regs(a, !cf8);
     if (r) return mmio_read32(r + ((off & 0xFFC) >> 2));
-    if (off >= 256) return 0xFFFFFFFFu;
-    return cf8_read32(bus, dev, func, off);
+    return cf8 ? cf8_read32(a, off) : 0xFFFFFFFFu;
 }
 
-uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off) {
-    return (uint16_t)(pci_read32(bus, dev, func, off) >> ((off & 2) * 8));
-}
+uint16_t pci_read16(struct pci_address a, uint16_t off) { return (uint16_t)(pci_read32(a, off) >> ((off & 2) * 8)); }
 
 /* Narrow writes are narrow on the bus too: a read-modify-write of the whole dword would write
    back the register beside this one, and Status (beside Command) clears its error bits on a
    written 1. bytes: 1, 2 or 4, at an offset aligned to it. */
-static void config_write(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t v, unsigned bytes) {
-    volatile uint8_t *r = (volatile uint8_t *)ecam_regs(bus, dev, func, off >= 256);
+static void config_write(struct pci_address a, uint16_t off, uint32_t v, unsigned bytes) {
+    bool cf8 = cf8_reaches(a, off);
+    volatile uint8_t *r = (volatile uint8_t *)ecam_regs(a, !cf8);
     if (r) {
         if (bytes == 4) mmio_write32(r + (off & 0xFFC), v);
         else if (bytes == 2) mmio_write16(r + (off & 0xFFE), (uint16_t)v);
         else mmio_write8(r + (off & 0xFFF), (uint8_t)v);
         return;
     }
-    if (off >= 256) return;
+    if (!cf8) return;
     uint64_t f = spin_lock(&cf8_lock);
-    outl(0xCF8, 0x80000000u | (uint32_t)bus << 16 | (uint32_t)dev << 11 | (uint32_t)func << 8 | (off & 0xFC));
+    cf8_select(a, off);
     if (bytes == 4) outl(0xCFC, v);
     else if (bytes == 2) outw(0xCFC + (off & 2), (uint16_t)v);
     else outb(0xCFC + (off & 3), (uint8_t)v);
     spin_unlock(&cf8_lock, f);
 }
 
-void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t v) {
-    config_write(bus, dev, func, off, v, 4);
-}
+void pci_write32(struct pci_address a, uint16_t off, uint32_t v) { config_write(a, off, v, 4); }
 
-void pci_write16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint16_t v) {
-    config_write(bus, dev, func, off, v, 2);
-}
+void pci_write16(struct pci_address a, uint16_t off, uint16_t v) { config_write(a, off, v, 2); }
 
-void pci_write8(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint8_t v) {
-    config_write(bus, dev, func, off, v, 1);
-}
+void pci_write8(struct pci_address a, uint16_t off, uint8_t v) { config_write(a, off, v, 1); }
 
-/* Switch a found function to ECAM, checking that ECAM really reaches it (a wrong MCFG base turns it off). */
-static void ecam_activate(uint8_t bus, uint8_t dev, uint8_t func, uint32_t id) {
-    volatile uint32_t *r = ecam_regs(bus, dev, func, true);
+/* Switch a function CF8/CFC found to ECAM, checking that ECAM really reaches it (a wrong MCFG base
+   turns its window off). */
+static void ecam_activate(struct pci_address a, uint32_t id) {
+    volatile uint32_t *r = ecam_regs(a, true);
     uint32_t seen = r ? mmio_read32(r) : id;
     if (seen != id) {
-        kprintf("pci: ECAM read of %02x:%02x.%x gave %08x, expected %08x; falling back to CF8/CFC\n", bus, dev,
-                func, seen, id);
-        ecam_off = true;
+        kprintf("pci: ECAM read of %04x:%02x:%02x.%x gave %08x, expected %08x; falling back to CF8/CFC\n",
+                PCI_ADDRESS_ARGS(a), seen, id);
+        ecam_window_of(a)->off = true;
     }
 }
 
@@ -114,20 +156,19 @@ static void ecam_activate(uint8_t bus, uint8_t dev, uint8_t func, uint32_t id) {
    pointers into it from then on. */
 static struct pci_device *devices;
 static size_t ndevices, devices_room;
-static bool devices_lost;
 
 static struct pci_device *device_new(void) {
     struct pci_device *d = kappend(&devices, &ndevices, &devices_room, sizeof *d);
     if (!d) {
-        if (!devices_lost) kprintf("pci: no memory to keep more functions; the rest are not used\n");
-        devices_lost = true;
+        if (!__atomic_exchange_n(&devices_lost, true, __ATOMIC_ACQ_REL))
+            kprintf("pci: no memory to keep more functions; the rest are not used\n");
         return NULL;
     }
     memset(d, 0, sizeof *d);
     return d;
 }
 
-bool pci_all_known(void) { return !devices_lost; }
+bool pci_all_known(void) { return !__atomic_load_n(&devices_lost, __ATOMIC_ACQUIRE); }
 
 static const char *class_name(uint8_t c, uint8_t s) {
     switch (c) {
@@ -146,7 +187,7 @@ static uint64_t bar_probe(const struct pci_device *d, unsigned bar);
 /* A bridge's header has two BARs and a CardBus bridge's one; the dwords after them are bus
    numbers and windows, which must never be probed or written back as BARs. */
 unsigned pci_bar_count(const struct pci_device *d) {
-    unsigned type = (pci_read32(d->bus, d->dev, d->func, 0x0C) >> 16) & 0x7F;
+    unsigned type = (pci_read32(d->address, 0x0C) >> 16) & 0x7F;
     return type == 0 ? 6 : type == 1 ? 2 : type == 2 ? 1 : 0;
 }
 
@@ -172,12 +213,11 @@ static void rrs_show(const struct pci_device *port, bool on);
    as the platform guarantees the functions it shows are ready by then (6.6.1). rrs: the Root
    Port above, shown RRS again before each read (AML may rewrite Root Control while this sleeps),
    or NULL. */
-static uint32_t ready_id(const struct pci_device *rrs, uint8_t bus, uint8_t dev, uint8_t func, uint64_t since,
-                         bool there, bool sleeps) {
+static uint32_t ready_id(const struct pci_device *rrs, struct pci_address a, uint64_t since, bool there, bool sleeps) {
     uint64_t broken_at = since + NS_PER_S;
     for (;;) {
         if (rrs) rrs_show(rrs, true);
-        uint32_t id = pci_read32(bus, dev, func, 0);
+        uint32_t id = pci_read32(a, 0);
         if (!id_pending(id, there) || clock_now_ns() >= broken_at) return id;
         wait_step(sleeps);
     }
@@ -189,7 +229,7 @@ static uint32_t ready_id(const struct pci_device *rrs, uint8_t bus, uint8_t dev,
 static void pcie_identify(struct pci_device *d) {
     d->pcie_cap = pci_find_cap(d, 0x10);
     if (!d->pcie_cap) return;
-    uint16_t caps = pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_CAPS);
+    uint16_t caps = pci_read16(d->address, d->pcie_cap + PCIE_CAPS);
     d->pcie_type = (caps >> 4) & 0xF;
     d->pcie_v2 = (caps & 0xF) >= 2;
 }
@@ -198,71 +238,79 @@ static void pcie_identify(struct pci_device *d) {
 static void device_list(struct pci_device *d) {
     if (d->hal.listed) return;
     if (d->upstream) device_list(d->upstream);
-    d->hal.info.at.pci = (struct n_pciinfo){d->bus, d->dev, d->func, d->cls, d->subcls, d->progif, d->vendor, d->device};
+    d->hal.info.at.pci = (struct n_pciinfo){d->address.segment, d->address.bus, d->address.dev, d->address.func,
+                                            d->cls, d->subcls, d->progif, d->vendor, d->device};
     hal_add(&d->hal, d->upstream ? d->upstream->hal.info.id : 0, N_HAL_BUS_PCI);
 }
 
-void pci_init(void) {
-    uint64_t since = clock_now_ns(); /* the platform reset was before the firmware ran */
-    const struct acpi_sdt *mcfg = acpi_find("MCFG", 0);
-    if (mcfg && mcfg->length >= ACPI_MCFG_ENTRIES) {
-        ecam = (const struct acpi_mcfg_entry *)((const uint8_t *)mcfg + ACPI_MCFG_ENTRIES);
-        necam = (mcfg->length - ACPI_MCFG_ENTRIES) / sizeof *ecam;
+/* The function found at a with this ID on the list. */
+static void function_add(struct pci_address a, uint32_t id) {
+    uint32_t cls = pci_read32(a, 8);
+    if (!a.segment) ecam_activate(a, id);
+    struct pci_device *d = device_new();
+    if (!d) return;
+    d->address = a;
+    d->vendor = id & 0xFFFF;
+    d->device = id >> 16;
+    d->cls = cls >> 24;
+    d->subcls = (cls >> 16) & 0xFF;
+    d->progif = (cls >> 8) & 0xFF;
+    d->irq = pci_read32(a, 0x3C) & 0xFF;
+    unsigned bars = pci_bar_count(d);
+    for (unsigned b = 0; b < bars; b++) d->bar[b] = pci_read32(a, 0x10 + b * 4);
+    for (unsigned b = 0; b < bars; b++) {
+        d->bar_size[b] = bar_probe(d, b);
+        if (!(d->bar[b] & 1) && (d->bar[b] & 6) == 4) b++; /* the upper half is no BAR */
     }
-    for (unsigned i = 0; i < necam; i++)
-        if (ecam[i].segment == 0 && ecam[i].base && ecam[i].start_bus <= ecam[i].end_bus)
-            kprintf("pci: ECAM segment 0 buses %u-%u at %lx\n", ecam[i].start_bus, ecam[i].end_bus, ecam[i].base);
-    if (!necam) kprintf("pci: no MCFG, config space via CF8/CFC only (no extended capabilities)\n");
+    pcie_identify(d);
+    d->bridge = ((pci_read32(a, 0x0C) >> 16) & 0x7F) == 1;
+    if (d->bridge) {
+        uint32_t buses = pci_read32(a, 0x18);
+        d->secondary = buses >> 8 & 0xFF;
+        d->subordinate = buses >> 16 & 0xFF;
+    }
+    kprintf("pci: %04x:%02x:%02x.%x %04x:%04x %s\n", PCI_ADDRESS_ARGS(a), d->vendor, d->device,
+            class_name(d->cls, d->subcls));
+}
+
+/* A bus no window of the segment holds reads as empty. */
+static void segment_scan(uint16_t segment, uint64_t since) {
     for (int bus = 0; bus < 256; bus++) {
         for (int dev = 0; dev < 32; dev++) {
             for (int func = 0; func < 8; func++) {
-                uint32_t id = ready_id(NULL, bus, dev, func, since, false, false);
+                struct pci_address a = {segment, (uint8_t)bus, (uint8_t)dev, (uint8_t)func};
+                uint32_t id = ready_id(NULL, a, since, false, false);
                 if (id == PCI_CONFIG_RRS_ID)
-                    kprintf("pci: %02x:%02x.%x still initializing 1 s: not used\n", bus, dev, func);
+                    kprintf("pci: %04x:%02x:%02x.%x still initializing 1 s: not used\n", PCI_ADDRESS_ARGS(a));
                 if ((id & 0xFFFF) == 0xFFFF || id == PCI_CONFIG_RRS_ID) {
                     if (func == 0) break;
                     continue;
                 }
-                uint32_t cls = pci_read32(bus, dev, func, 8);
-                ecam_activate(bus, dev, func, id);
-                struct pci_device *d = device_new();
-                if (d) {
-                    d->bus = bus;
-                    d->dev = dev;
-                    d->func = func;
-                    d->vendor = id & 0xFFFF;
-                    d->device = id >> 16;
-                    d->cls = cls >> 24;
-                    d->subcls = (cls >> 16) & 0xFF;
-                    d->progif = (cls >> 8) & 0xFF;
-                    d->irq = pci_read32(bus, dev, func, 0x3C) & 0xFF;
-                    unsigned bars = pci_bar_count(d);
-                    for (unsigned b = 0; b < bars; b++) d->bar[b] = pci_read32(bus, dev, func, 0x10 + b * 4);
-                    for (unsigned b = 0; b < bars; b++) {
-                        d->bar_size[b] = bar_probe(d, b);
-                        if (!(d->bar[b] & 1) && (d->bar[b] & 6) == 4) b++; /* the upper half is no BAR */
-                    }
-                    pcie_identify(d);
-                    d->bridge = ((pci_read32(bus, dev, func, 0x0C) >> 16) & 0x7F) == 1;
-                    if (d->bridge) {
-                        uint32_t buses = pci_read32(bus, dev, func, 0x18);
-                        d->secondary = buses >> 8 & 0xFF;
-                        d->subordinate = buses >> 16 & 0xFF;
-                    }
-                    kprintf("pci: %02x:%02x.%x %04x:%04x %s\n", bus, dev, func, d->vendor, d->device,
-                            class_name(d->cls, d->subcls));
-                }
-                if (func == 0 && !(pci_read32(bus, dev, 0, 0x0C) & 0x00800000)) break;
+                function_add(a, id);
+                if (func == 0 && !(pci_read32(a, 0x0C) & 0x00800000)) break;
             }
         }
+    }
+}
+
+void pci_init(void) {
+    uint64_t since = clock_now_ns(); /* the platform reset was before the firmware ran */
+    segment_scan(0, since);
+    for (size_t i = 0; i < necam; i++) {
+        bool seen = !ecam[i].segment;
+        for (size_t k = 0; k < i && !seen; k++) seen = ecam[k].segment == ecam[i].segment;
+        if (!seen) segment_scan(ecam[i].segment, since);
     }
     /* Bus numbers stay as the firmware gave them (sleep writes them back), so the tree is found once.
        橋の二次のバスは自分のバスより大きい。firmware が設定しなかった橋は誰の親でもなく、親を辿るとバスの番号は
        必ず下がるので、輪にならない。 */
     for (size_t i = 0; i < ndevices; i++)
-        for (size_t k = 0; k < ndevices && !devices[i].upstream; k++)
-            if (k != i && devices[k].bridge && devices[k].secondary > devices[k].bus && devices[k].secondary == devices[i].bus)
+        for (size_t k = 0; k < ndevices && !devices[i].upstream; k++) {
+            const struct pci_device *b = &devices[k];
+            if (k != i && b->bridge && b->address.segment == devices[i].address.segment && b->secondary > b->address.bus &&
+                b->secondary == devices[i].address.bus)
                 devices[i].upstream = &devices[k];
+        }
     /* each function's node, for its memory and the CPUs its interrupts go to. Finding a function's
        ACPI object evaluates its neighbours' _ADR: with one node there is nothing to choose. */
     for (size_t i = 0; i < ndevices; i++) {
@@ -280,36 +328,37 @@ void pci_init(void) {
 
 void pci_enable_busmaster(struct pci_device *d) {
     d->kernel_owned = true;
-    uint16_t cmd = pci_read16(d->bus, d->dev, d->func, PCI_COMMAND);
+    uint16_t cmd = pci_read16(d->address, PCI_COMMAND);
     cmd |= PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
-    pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, cmd);
+    pci_write16(d->address, PCI_COMMAND, cmd);
 }
 
 void pci_enable_io(struct pci_device *d) {
-    uint16_t cmd = pci_read16(d->bus, d->dev, d->func, PCI_COMMAND);
-    pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, cmd | PCI_COMMAND_IO);
+    uint16_t cmd = pci_read16(d->address, PCI_COMMAND);
+    pci_write16(d->address, PCI_COMMAND, cmd | PCI_COMMAND_IO);
 }
 
-int pci_count(void) { return (int)ndevices; } /* at most 256 buses of 32 devices of 8 functions */
+int pci_count(void) { return (int)ndevices; }
 
 struct pci_device *pci_at(int index) { return index >= 0 && (size_t)index < ndevices ? &devices[index] : NULL; }
 
-struct pci_device *pci_find_function(uint8_t bus, uint8_t dev, uint8_t func) {
+struct pci_device *pci_find_function(struct pci_address a) {
     for (size_t i = 0; i < ndevices; i++)
-        if (devices[i].bus == bus && devices[i].dev == dev && devices[i].func == func) return &devices[i];
+        if (pci_address_same(devices[i].address, a)) return &devices[i];
     return NULL;
 }
 
 struct pci_device *pci_upstream(const struct pci_device *d) { return d->upstream; }
 
 bool pci_below(const struct pci_device *b, const struct pci_device *o) {
-    return b->bridge && o != b && o->bus >= b->secondary && o->bus <= b->subordinate;
+    return b->bridge && o != b && o->address.segment == b->address.segment && o->address.bus >= b->secondary &&
+           o->address.bus <= b->subordinate;
 }
 
 bool pci_same_device(const struct pci_device *a, const struct pci_device *b) {
-    if (a->bus != b->bus) return false;
+    if (a->address.segment != b->address.segment || a->address.bus != b->address.bus) return false;
     const struct pci_device *up = a->upstream;
-    return a->dev == b->dev || (up && up->pcie_cap && (up->pcie_type == 4 || up->pcie_type == 6));
+    return a->address.dev == b->address.dev || (up && up->pcie_cap && (up->pcie_type == 4 || up->pcie_type == 6));
 }
 
 uint64_t pci_bar_address(const struct pci_device *d, unsigned bar) {
@@ -332,23 +381,23 @@ static uint64_t bar_probe(const struct pci_device *d, unsigned bar) {
     if (!pci_bar_address(d, bar)) return 0;
     bool wide = (d->bar[bar] & 6) == 4;
     uint8_t off = 0x10 + bar * 4;
-    uint32_t cmd = pci_read32(d->bus, d->dev, d->func, 4) & 0xFFFF; /* not the write-1-to-clear status half */
+    uint32_t cmd = pci_read32(d->address, 4) & 0xFFFF; /* not the write-1-to-clear status half */
     uint64_t f = irq_save();
     /* The boot console may have drawn through this BAR: its write-combined pixels leave the CPU
        before memory decoding goes off, or the function would drop them. */
     __asm__ volatile("sfence" ::: "memory");
-    pci_write32(d->bus, d->dev, d->func, 4, cmd & ~2u);
-    pci_write32(d->bus, d->dev, d->func, off, 0xFFFFFFFFu);
-    uint64_t mask = pci_read32(d->bus, d->dev, d->func, off) & ~15u;
-    pci_write32(d->bus, d->dev, d->func, off, d->bar[bar]);
+    pci_write32(d->address, 4, cmd & ~2u);
+    pci_write32(d->address, off, 0xFFFFFFFFu);
+    uint64_t mask = pci_read32(d->address, off) & ~15u;
+    pci_write32(d->address, off, d->bar[bar]);
     if (wide) {
-        pci_write32(d->bus, d->dev, d->func, off + 4, 0xFFFFFFFFu);
-        mask |= (uint64_t)pci_read32(d->bus, d->dev, d->func, off + 4) << 32;
-        pci_write32(d->bus, d->dev, d->func, off + 4, d->bar[bar + 1]);
+        pci_write32(d->address, off + 4, 0xFFFFFFFFu);
+        mask |= (uint64_t)pci_read32(d->address, off + 4) << 32;
+        pci_write32(d->address, off + 4, d->bar[bar + 1]);
     } else {
         mask |= 0xFFFFFFFF00000000ull;
     }
-    pci_write32(d->bus, d->dev, d->func, 4, cmd);
+    pci_write32(d->address, 4, cmd);
     irq_restore(f);
     return mask ? ~mask + 1 : 0;
 }
@@ -356,10 +405,10 @@ static uint64_t bar_probe(const struct pci_device *d, unsigned bar) {
 uint64_t pci_bar_size(const struct pci_device *d, unsigned bar) { return bar < 6 ? d->bar_size[bar] : 0; }
 
 uint8_t pci_find_cap(const struct pci_device *d, uint8_t id) {
-    if (!(pci_read16(d->bus, d->dev, d->func, 6) & 0x10)) return 0;
-    uint8_t cap = pci_read32(d->bus, d->dev, d->func, 0x34) & 0xFC;
+    if (!(pci_read16(d->address, 6) & 0x10)) return 0;
+    uint8_t cap = pci_read32(d->address, 0x34) & 0xFC;
     for (int guard = 0; cap >= 0x40 && guard < 48; guard++) {
-        uint32_t h = pci_read32(d->bus, d->dev, d->func, cap);
+        uint32_t h = pci_read32(d->address, cap);
         if ((h & 0xFF) == id) return cap;
         cap = (h >> 8) & 0xFC;
     }
@@ -367,10 +416,10 @@ uint8_t pci_find_cap(const struct pci_device *d, uint8_t id) {
 }
 
 uint16_t pci_find_ext_cap(const struct pci_device *d, uint16_t id) {
-    if (!d->pcie_cap || !ecam_regs(d->bus, d->dev, d->func, true)) return 0;
+    if (!d->pcie_cap || !ecam_regs(d->address, true)) return 0;
     uint16_t off = 0x100;
     for (int guard = 0; off >= 0x100 && off <= 0xFFC && guard < 96; guard++) {
-        uint32_t h = pci_read32(d->bus, d->dev, d->func, off);
+        uint32_t h = pci_read32(d->address, off);
         if (!h || h == 0xFFFFFFFFu) return 0;
         if ((h & 0xFFFF) == id) return off;
         off = (h >> 20) & 0xFFC;
@@ -379,19 +428,19 @@ uint16_t pci_find_ext_cap(const struct pci_device *d, uint16_t id) {
 }
 
 static void intx_disable(struct pci_device *d) {
-    uint16_t cmd = pci_read16(d->bus, d->dev, d->func, PCI_COMMAND);
-    pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, cmd | PCI_COMMAND_INTX_DISABLE);
+    uint16_t cmd = pci_read16(d->address, PCI_COMMAND);
+    pci_write16(d->address, PCI_COMMAND, cmd | PCI_COMMAND_INTX_DISABLE);
 }
 
 unsigned pci_msi_max_vectors(const struct pci_device *d) {
     uint8_t cap = pci_find_cap(d, 0x05);
     if (!cap) return 0;
-    return 1u << ((pci_read32(d->bus, d->dev, d->func, cap) >> 17) & 7);
+    return 1u << ((pci_read32(d->address, cap) >> 17) & 7);
 }
 
 unsigned pci_msix_max_vectors(const struct pci_device *d) {
     uint8_t cap = pci_find_cap(d, 0x11);
-    return cap ? ((pci_read32(d->bus, d->dev, d->func, cap) >> 16) & 0x7FF) + 1 : 0;
+    return cap ? ((pci_read32(d->address, cap) >> 16) & 0x7FF) + 1 : 0;
 }
 
 /* The MSI capability's registers (PCI Local Bus 3.0, 6.8.1): the message control word at +2, the
@@ -404,14 +453,14 @@ static uint8_t msi_data_at(uint8_t cap, uint16_t ctl) { return cap + (ctl & MSI_
 /* Address and data for count messages from irq's (iommu_msi_message), with MSI off or the
    messages masked: none goes half old, half new. */
 static bool msi_write(struct pci_device *d, uint8_t cap, unsigned count, const struct irq *irq) {
-    uint16_t ctl = pci_read16(d->bus, d->dev, d->func, cap + 2);
+    uint16_t ctl = pci_read16(d->address, cap + 2);
     uint32_t address, message;
     if (!iommu_msi_message(d, 0, count, irq, &address, &message)) return false;
-    pci_write32(d->bus, d->dev, d->func, cap + 4, address);
-    if (ctl & MSI_CTL_64BIT) pci_write32(d->bus, d->dev, d->func, cap + 8, 0);
+    pci_write32(d->address, cap + 4, address);
+    if (ctl & MSI_CTL_64BIT) pci_write32(d->address, cap + 8, 0);
     uint8_t at = msi_data_at(cap, ctl);
-    uint32_t data = pci_read32(d->bus, d->dev, d->func, at);
-    pci_write32(d->bus, d->dev, d->func, at, (data & 0xFFFF0000u) | message);
+    uint32_t data = pci_read32(d->address, at);
+    pci_write32(d->address, at, (data & 0xFFFF0000u) | message);
     return true;
 }
 
@@ -442,11 +491,11 @@ static bool message_rewrite(struct irq *irq, void *writer) {
         return false;
     }
     uint8_t cap = pci_find_cap(d, 0x05);
-    uint8_t mask_at = msi_data_at(cap, pci_read16(d->bus, d->dev, d->func, cap + 2)) + 4;
-    uint32_t mask = pci_read32(d->bus, d->dev, d->func, mask_at);
-    pci_write32(d->bus, d->dev, d->func, mask_at, mask | 1);
+    uint8_t mask_at = msi_data_at(cap, pci_read16(d->address, cap + 2)) + 4;
+    uint32_t mask = pci_read32(d->address, mask_at);
+    pci_write32(d->address, mask_at, mask | 1);
     bool ok = msi_write(d, cap, 1, irq);
-    pci_write32(d->bus, d->dev, d->func, mask_at, mask);
+    pci_write32(d->address, mask_at, mask);
     return ok;
 }
 
@@ -454,7 +503,7 @@ static bool message_rewrite(struct irq *irq, void *writer) {
 static bool msix_map(struct pci_device *d, uint8_t cap) {
     unsigned entries = pci_msix_max_vectors(d);
     if (!d->msix_table) {
-        uint32_t table = pci_read32(d->bus, d->dev, d->func, cap + 4);
+        uint32_t table = pci_read32(d->address, cap + 4);
         uint64_t base = pci_bar_address(d, table & 7);
         if (!base || !(d->msix_table = vmm_map_mmio(base + (table & ~7u), entries * 16))) return false;
     }
@@ -471,11 +520,11 @@ static unsigned msix_enable(struct pci_device *d, uint8_t cap, uint8_t msi, cons
         if (!(d->msix_irqs[n] = irq_request_msi(&specs[n], IRQ_CPU_ANY))) break;
     if (!n) return 0;
     if (msi) /* never both: firmware may have left MSI on */
-        pci_write32(d->bus, d->dev, d->func, msi,
-                    pci_read32(d->bus, d->dev, d->func, msi) & ~((uint32_t)MSI_CTL_ENABLE << 16));
+        pci_write32(d->address, msi,
+                    pci_read32(d->address, msi) & ~((uint32_t)MSI_CTL_ENABLE << 16));
     /* enabled with the whole function masked, and every entry, while the entries are written */
-    uint32_t h = pci_read32(d->bus, d->dev, d->func, cap);
-    pci_write32(d->bus, d->dev, d->func, cap, (h & 0x3FFFFFFF) | 0xC0000000u);
+    uint32_t h = pci_read32(d->address, cap);
+    pci_write32(d->address, cap, (h & 0x3FFFFFFF) | 0xC0000000u);
     for (unsigned i = 0; i < d->msix_entries; i++) {
         volatile uint32_t *vc = d->msix_table + i * 4 + 3;
         mmio_write32(vc, mmio_read32(vc) | 1);
@@ -488,7 +537,7 @@ static unsigned msix_enable(struct pci_device *d, uint8_t cap, uint8_t msi, cons
         d->msix_irqs[i] = NULL;
     }
     if (!written) {
-        pci_write32(d->bus, d->dev, d->func, cap, h & 0x3FFFFFFF);
+        pci_write32(d->address, cap, h & 0x3FFFFFFF);
         return 0;
     }
     for (unsigned i = 0; i < written; i++) {
@@ -497,7 +546,7 @@ static unsigned msix_enable(struct pci_device *d, uint8_t cap, uint8_t msi, cons
         irq_msi_writer(d->msix_irqs[i], message_rewrite, d);
     }
     (void)mmio_read32(d->msix_table + 3); /* the unmasks reach the function before its mask drops */
-    pci_write32(d->bus, d->dev, d->func, cap, (h & 0x3FFFFFFF) | 0x80000000u);
+    pci_write32(d->address, cap, (h & 0x3FFFFFFF) | 0x80000000u);
     return written;
 }
 
@@ -512,20 +561,20 @@ static unsigned msi_enable(struct pci_device *d, uint8_t cap, uint8_t msix, cons
         for (unsigned i = 0; i < n; i++) irq_free(got[i]);
         return 0;
     }
-    uint16_t ctl = pci_read16(d->bus, d->dev, d->func, cap + 2);
+    uint16_t ctl = pci_read16(d->address, cap + 2);
     /* off while address and data change (firmware may have left it on) */
-    if (ctl & MSI_CTL_ENABLE) pci_write16(d->bus, d->dev, d->func, cap + 2, ctl & ~MSI_CTL_ENABLE);
+    if (ctl & MSI_CTL_ENABLE) pci_write16(d->address, cap + 2, ctl & ~MSI_CTL_ENABLE);
     if (!msi_write(d, cap, n, got[0])) {
         for (unsigned i = 0; i < n; i++) irq_free(got[i]);
         kfree(d->msi_irqs);
         d->msi_irqs = NULL;
         return 0;
     }
-    if (ctl & MSI_CTL_MASKING) pci_write32(d->bus, d->dev, d->func, msi_data_at(cap, ctl) + 4, 0); /* all open */
+    if (ctl & MSI_CTL_MASKING) pci_write32(d->address, msi_data_at(cap, ctl) + 4, 0); /* all open */
     if (msix) /* never both: firmware may have left MSI-X on */
-        pci_write32(d->bus, d->dev, d->func, msix, pci_read32(d->bus, d->dev, d->func, msix) & ~0x80000000u);
+        pci_write32(d->address, msix, pci_read32(d->address, msix) & ~0x80000000u);
     ctl = (ctl & ~0x70u) | (uint16_t)(__builtin_ctz(n) << 4) | MSI_CTL_ENABLE; /* n messages, enabled */
-    pci_write16(d->bus, d->dev, d->func, cap + 2, ctl);
+    pci_write16(d->address, cap + 2, ctl);
     intx_disable(d);
     for (unsigned i = 0; i < n; i++) d->msi_irqs[i] = got[i];
     d->msi_count = (uint8_t)n;
@@ -548,18 +597,18 @@ bool pci_irq_disable(struct pci_device *d) {
     for (unsigned i = 0; d->msix_irqs && i < d->msix_entries; i++)
         if (d->msix_irqs[i]) irq_msi_writer(d->msix_irqs[i], NULL, NULL), held++;
     uint8_t cap = pci_find_cap(d, 0x05), msix = pci_find_cap(d, 0x11);
-    if (cap) pci_write32(d->bus, d->dev, d->func, cap,
-                         pci_read32(d->bus, d->dev, d->func, cap) & ~((uint32_t)MSI_CTL_ENABLE << 16));
-    if (msix) pci_write32(d->bus, d->dev, d->func, msix,
-                          pci_read32(d->bus, d->dev, d->func, msix) & ~0x80000000u);
+    if (cap) pci_write32(d->address, cap,
+                         pci_read32(d->address, cap) & ~((uint32_t)MSI_CTL_ENABLE << 16));
+    if (msix) pci_write32(d->address, msix,
+                          pci_read32(d->address, msix) & ~0x80000000u);
     /* A stale Enable must not be saved and replayed by a later FLR, nor may its vectors
        be given again merely because interrupt-table invalidation completed. */
-    bool off = (!cap || !(pci_read32(d->bus, d->dev, d->func, cap) & ((uint32_t)MSI_CTL_ENABLE << 16))) &&
-               (!msix || !(pci_read32(d->bus, d->dev, d->func, msix) & 0x80000000u));
+    bool off = (!cap || !(pci_read32(d->address, cap) & ((uint32_t)MSI_CTL_ENABLE << 16))) &&
+               (!msix || !(pci_read32(d->address, msix) & 0x80000000u));
     bool cleared = iommu_msi_clear(d); /* still revoke its remapping entries when a device refuses */
     bool done = off && cleared;
     if (!done && held)
-        kprintf("pci: %02x:%02x.%u: its interrupt vectors stay out of use\n", d->bus, d->dev, d->func);
+        kprintf("pci: %04x:%02x:%02x.%x: its interrupt vectors stay out of use\n", PCI_ADDRESS_ARGS(d->address));
     for (unsigned i = 0; i < d->msi_count; i++)
         if (done) irq_free(d->msi_irqs[i]);
     for (unsigned i = 0; d->msix_irqs && i < d->msix_entries; i++) {
@@ -602,32 +651,32 @@ static bool pcie_ctl_has(const struct pci_device *d, unsigned j) {
 /* table: the MSI-X table's entries too, into s->msix_table (allocated once, kept); false without
    memory for it. */
 static bool state_save(const struct pci_device *d, struct pci_saved *s, bool table) {
-    for (unsigned k = 0; k < 16; k++) s->hdr[k] = pci_read32(d->bus, d->dev, d->func, k * 4);
+    for (unsigned k = 0; k < 16; k++) s->hdr[k] = pci_read32(d->address, k * 4);
     s->id = s->hdr[0];
     s->msi = pci_find_cap(d, 0x05);
     if (s->msi) {
-        uint16_t ctl = pci_read32(d->bus, d->dev, d->func, s->msi) >> 16;
+        uint16_t ctl = pci_read32(d->address, s->msi) >> 16;
         /* control, address (+ high half), data, and the mask bits when there are any */
         s->msi_dwords = 3 + !!(ctl & 0x80) + !!(ctl & 0x100);
-        for (unsigned j = 0; j < s->msi_dwords; j++) s->msi_regs[j] = pci_read32(d->bus, d->dev, d->func, s->msi + 4 * j);
+        for (unsigned j = 0; j < s->msi_dwords; j++) s->msi_regs[j] = pci_read32(d->address, s->msi + 4 * j);
     }
     s->msix = pci_find_cap(d, 0x11);
     if (s->msix) {
-        s->msix_ctl = pci_read32(d->bus, d->dev, d->func, s->msix);
+        s->msix_ctl = pci_read32(d->address, s->msix);
         if (table && d->msix_table) {
             if (!s->msix_table && !(s->msix_table = kmalloc(d->msix_entries * 16))) return false;
             for (unsigned j = 0; j < d->msix_entries * 4u; j++) s->msix_table[j] = mmio_read32(d->msix_table + j);
         }
     }
     for (unsigned j = 0; j < sizeof pcie_ctl_off; j++)
-        if (pcie_ctl_has(d, j)) s->pcie_ctl[j] = pci_read16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j]);
+        if (pcie_ctl_has(d, j)) s->pcie_ctl[j] = pci_read16(d->address, d->pcie_cap + pcie_ctl_off[j]);
     s->rebar = pci_find_ext_cap(d, 0x15);
-    s->rebars = s->rebar ? (pci_read32(d->bus, d->dev, d->func, s->rebar + 8) >> 5) & 7 : 0;
+    s->rebars = s->rebar ? (pci_read32(d->address, s->rebar + 8) >> 5) & 7 : 0;
     if (s->rebars > 6) s->rebars = 6; /* 1..6 (7.8.6.3) */
     for (unsigned j = 0; j < s->rebars; j++)
-        s->rebar_ctl[j] = pci_read32(d->bus, d->dev, d->func, s->rebar + 8 + 8 * j);
+        s->rebar_ctl[j] = pci_read32(d->address, s->rebar + 8 + 8 * j);
     s->acs = pci_find_ext_cap(d, 0x0D);
-    if (s->acs) s->acs_ctl = pci_read16(d->bus, d->dev, d->func, s->acs + 6);
+    if (s->acs) s->acs_ctl = pci_read16(d->address, s->acs + 6);
     return true;
 }
 
@@ -636,36 +685,36 @@ static void state_restore(const struct pci_device *d, const struct pci_saved *s)
        memory decoding off first (wake firmware may have turned it on) since a size written
        leaves its BAR undefined (7.8.6); then BARs and the rest of the header (bus numbers and
        windows for a bridge); command last */
-    pci_write16(d->bus, d->dev, d->func, 0x0C, s->hdr[3] & 0xFFFF);
+    pci_write16(d->address, 0x0C, s->hdr[3] & 0xFFFF);
     if (s->rebars) {
-        uint16_t cmd = pci_read16(d->bus, d->dev, d->func, PCI_COMMAND);
+        uint16_t cmd = pci_read16(d->address, PCI_COMMAND);
         if (cmd & PCI_COMMAND_MEMORY)
-            pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, cmd & ~PCI_COMMAND_MEMORY);
+            pci_write16(d->address, PCI_COMMAND, cmd & ~PCI_COMMAND_MEMORY);
         for (unsigned j = 0; j < s->rebars; j++)
-            pci_write32(d->bus, d->dev, d->func, s->rebar + 8 + 8 * j, s->rebar_ctl[j]);
+            pci_write32(d->address, s->rebar + 8 + 8 * j, s->rebar_ctl[j]);
     }
-    for (unsigned k = 4; k < 16; k++) pci_write32(d->bus, d->dev, d->func, k * 4, s->hdr[k]);
+    for (unsigned k = 4; k < 16; k++) pci_write32(d->address, k * 4, s->hdr[k]);
     /* A Common Clock Configuration a reset cleared (an FLR does not, 6.6.2) and this sets again
        takes effect when the link retrains (7.5.3.7): the Downstream Port above retrains it once
        the rest of the device is back too (links_retrain). */
     struct pci_device *up = d->upstream;
     if (d->pcie_cap && up && up->pcie_cap && (up->pcie_type == 4 || up->pcie_type == 6) &&
-        ((pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_LNKCTL) ^ s->pcie_ctl[1]) & PCIE_LNKCTL_CCC))
+        ((pci_read16(d->address, d->pcie_cap + PCIE_LNKCTL) ^ s->pcie_ctl[1]) & PCIE_LNKCTL_CCC))
         up->retrain = true;
     for (unsigned j = 0; j < sizeof pcie_ctl_off; j++)
-        if (pcie_ctl_has(d, j)) pci_write16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j], s->pcie_ctl[j]);
-    if (s->acs) pci_write16(d->bus, d->dev, d->func, s->acs + 6, s->acs_ctl); /* before bus mastering */
-    pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, s->hdr[1] & 0xFFFF);
+        if (pcie_ctl_has(d, j)) pci_write16(d->address, d->pcie_cap + pcie_ctl_off[j], s->pcie_ctl[j]);
+    if (s->acs) pci_write16(d->address, s->acs + 6, s->acs_ctl); /* before bus mastering */
+    pci_write16(d->address, PCI_COMMAND, s->hdr[1] & 0xFFFF);
     if (s->msix) {
         /* the table is memory space, which the command register has just opened */
-        pci_write32(d->bus, d->dev, d->func, s->msix, s->msix_ctl | 0xC0000000u);
+        pci_write32(d->address, s->msix, s->msix_ctl | 0xC0000000u);
         if (d->msix_table && s->msix_table)
             for (unsigned j = 0; j < d->msix_entries * 4u; j++) mmio_write32(d->msix_table + j, s->msix_table[j]);
-        pci_write32(d->bus, d->dev, d->func, s->msix, s->msix_ctl);
+        pci_write32(d->address, s->msix, s->msix_ctl);
     }
     if (s->msi) {
-        for (unsigned j = 1; j < s->msi_dwords; j++) pci_write32(d->bus, d->dev, d->func, s->msi + 4 * j, s->msi_regs[j]);
-        pci_write32(d->bus, d->dev, d->func, s->msi, s->msi_regs[0]);
+        for (unsigned j = 1; j < s->msi_dwords; j++) pci_write32(d->address, s->msi + 4 * j, s->msi_regs[j]);
+        pci_write32(d->address, s->msi, s->msi_regs[0]);
     }
 }
 
@@ -677,18 +726,18 @@ static void state_restore(const struct pci_device *d, const struct pci_saved *s)
 static struct spinlock reset_lock;
 static bool present(const struct pci_device *d) {
     /* RRS Software Visibility may return Vendor ID 0001h: that is not a ready function. */
-    return pci_read32(d->bus, d->dev, d->func, 0) == ((uint32_t)d->device << 16 | d->vendor);
+    return pci_read32(d->address, 0) == ((uint32_t)d->device << 16 | d->vendor);
 }
 
 bool pci_disable_busmaster(struct pci_device *d, bool *was_mastering) {
-    uint16_t command = pci_read16(d->bus, d->dev, d->func, PCI_COMMAND);
+    uint16_t command = pci_read16(d->address, PCI_COMMAND);
     if (was_mastering) *was_mastering = (command & PCI_COMMAND_MASTER) != 0;
-    pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, command & ~PCI_COMMAND_MASTER);
-    return present(d) && !(pci_read16(d->bus, d->dev, d->func, PCI_COMMAND) & PCI_COMMAND_MASTER);
+    pci_write16(d->address, PCI_COMMAND, command & ~PCI_COMMAND_MASTER);
+    return present(d) && !(pci_read16(d->address, PCI_COMMAND) & PCI_COMMAND_MASTER);
 }
 
 static bool transactions_pending(const struct pci_device *d) {
-    return pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVSTA) & PCIE_DEVSTA_PENDING;
+    return pci_read16(d->address, d->pcie_cap + PCIE_DEVSTA) & PCIE_DEVSTA_PENDING;
 }
 
 bool pci_requests_done(const struct pci_device *d) {
@@ -706,21 +755,21 @@ static struct pci_device *rrs_port(const struct pci_device *d) {
     for (struct pci_device *b = d->upstream; b; b = b->upstream)
         if (b->pcie_cap && b->pcie_type == 4)
             return present(b) &&
-                   (pci_read16(b->bus, b->dev, b->func, b->pcie_cap + PCIE_ROOTCAP) & PCIE_ROOTCAP_RRS_VISIBLE)
+                   (pci_read16(b->address, b->pcie_cap + PCIE_ROOTCAP) & PCIE_ROOTCAP_RRS_VISIBLE)
                        ? b : NULL;
     return NULL;
 }
 
 /* reset_lock held: Root Control is read, changed and written in one step. */
 static void rrs_show_held(const struct pci_device *port, bool on) {
-    uint16_t ctl = pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_ROOTCTL);
+    uint16_t ctl = pci_read16(port->address, port->pcie_cap + PCIE_ROOTCTL);
     uint16_t want = on ? ctl | PCIE_ROOTCTL_RRS_VISIBLE : ctl & ~PCIE_ROOTCTL_RRS_VISIBLE;
-    if (want != ctl) pci_write16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_ROOTCTL, want);
+    if (want != ctl) pci_write16(port->address, port->pcie_cap + PCIE_ROOTCTL, want);
 }
 
 static void rrs_hold_held(struct pci_device *port) {
     if (!port->rrs_holds++)
-        port->rrs_firmware = pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_ROOTCTL) &
+        port->rrs_firmware = pci_read16(port->address, port->pcie_cap + PCIE_ROOTCTL) &
                              PCIE_ROOTCTL_RRS_VISIBLE;
     rrs_show_held(port, true);
 }
@@ -765,8 +814,8 @@ static uint64_t completion_window_ns(const struct pci_device *d) {
     static const uint8_t range_longest[4] = {0x2, 0x6, 0xA, 0xE};
     unsigned value = 0, ranges = 0;
     if (d->pcie_v2) {
-        value = pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCTL2) & 0xF;
-        ranges = pci_read32(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCAP2) & 0xF;
+        value = pci_read16(d->address, d->pcie_cap + PCIE_DEVCTL2) & 0xF;
+        ranges = pci_read32(d->address, d->pcie_cap + PCIE_DEVCAP2) & 0xF;
     }
     unsigned ms = top_ms[value] ? top_ms[value] : top_ms[0xE];
     for (unsigned r = 0; r < 4; r++)
@@ -784,8 +833,8 @@ static uint64_t completion_window_ns(const struct pci_device *d) {
 #define READY_NS    NS_PER_S
 static uint64_t flr_time_ns(const struct pci_device *d) {
     uint16_t cap = pci_find_ext_cap(d, 0x22);
-    if (!cap || !(pci_read32(d->bus, d->dev, d->func, cap + 4) & (1u << 31))) return 0;
-    unsigned time = pci_read32(d->bus, d->dev, d->func, cap + 8) & 0xFFF;
+    if (!cap || !(pci_read32(d->address, cap + 4) & (1u << 31))) return 0;
+    unsigned time = pci_read32(d->address, cap + 8) & 0xFFF;
     if (time > 0xA1E) return 0;
     uint64_t ns = (uint64_t)(time & 0x1FF) << (5 * (time >> 9));
     return MAX(ns, FLR_DONE_NS);
@@ -834,7 +883,7 @@ static void msix_entries_again(struct pci_device *d) {
     for (unsigned i = 0; i < d->msix_entries; i++) {
         if (!d->msix_irqs[i]) continue;
         if (!irq_msi_rewrite(d->msix_irqs[i])) {
-            kprintf("pci: %02x:%02x.%u: MSI-X entry %u could not be written after its reset\n", d->bus, d->dev, d->func, i);
+            kprintf("pci: %04x:%02x:%02x.%x: MSI-X entry %u could not be written after its reset\n", PCI_ADDRESS_ARGS(d->address), i);
             continue;
         }
         volatile uint32_t *vc = d->msix_table + i * 4 + 3;
@@ -894,16 +943,16 @@ static void links_retrain(bool sleeps) {
         p->retrain = false;
         uint16_t status;
         for (uint64_t until = clock_after(NS_PER_S);
-             ((status = pci_read16(p->bus, p->dev, p->func, p->pcie_cap + PCIE_LNKSTA)) & PCIE_LNKSTA_TRAINING) &&
+             ((status = pci_read16(p->address, p->pcie_cap + PCIE_LNKSTA)) & PCIE_LNKSTA_TRAINING) &&
              clock_now_ns() < until;)
             wait_step(sleeps);
         if (status & PCIE_LNKSTA_TRAINING) {
-            kprintf("pci: %02x:%02x.%u: its link is still training; not retrained for the clock configuration below it\n",
-                    p->bus, p->dev, p->func);
+            kprintf("pci: %04x:%02x:%02x.%x: its link is still training; not retrained for the clock configuration below it\n",
+                    PCI_ADDRESS_ARGS(p->address));
             continue;
         }
-        uint16_t control = pci_read16(p->bus, p->dev, p->func, p->pcie_cap + PCIE_LNKCTL);
-        pci_write16(p->bus, p->dev, p->func, p->pcie_cap + PCIE_LNKCTL, control | PCIE_LNKCTL_RETRAIN);
+        uint16_t control = pci_read16(p->address, p->pcie_cap + PCIE_LNKCTL);
+        pci_write16(p->address, p->pcie_cap + PCIE_LNKCTL, control | PCIE_LNKCTL_RETRAIN);
     }
 }
 
@@ -912,8 +961,8 @@ static void links_retrain(bool sleeps) {
    Assert_INTx. No app reaches the registers any more (the caller's claim reservation). False,
    with nothing noted, when the function is gone or still masters. */
 static bool reset_quiesce(struct pci_device *d, struct pci_reset *r) {
-    pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, PCI_COMMAND_INTX_DISABLE);
-    if (!present(d) || (pci_read16(d->bus, d->dev, d->func, PCI_COMMAND) & PCI_COMMAND_MASTER)) return false;
+    pci_write16(d->address, PCI_COMMAND, PCI_COMMAND_INTX_DISABLE);
+    if (!present(d) || (pci_read16(d->address, PCI_COMMAND) & PCI_COMMAND_MASTER)) return false;
     reset_phase_set(r, RESET_QUIESCED);
     r->window = completion_window_ns(d); /* the pre-FLR value: nothing changes it from here */
     r->drained = clock_after(r->window);
@@ -925,7 +974,7 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
     struct pci_reset *r = d->reset;
     if (!r) {
         if (!d->pcie_cap || !present(d)) return false;
-        if (!(pci_read32(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR)) return false;
+        if (!(pci_read32(d->address, d->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR)) return false;
         if (!(r = kzalloc(sizeof *r))) return false;
         state_save(d, &r->state, false);
         /* Restoring configuration must never re-enable bus mastering. */
@@ -935,7 +984,7 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
         if (!reset_quiesce(d, r)) {
             /* Not reset: Command back as saved, Bus Master Enable still clear (hdr[1] is the dword
                at 04h, Command its low half), so a later attempt saves its decoding again. */
-            pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, r->state.hdr[1] & 0xFFFF);
+            pci_write16(d->address, PCI_COMMAND, r->state.hdr[1] & 0xFFFF);
             kfree(r);
             return false;
         }
@@ -944,11 +993,11 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
         /* An earlier FLR may have left it initializing, and a Configuration Write to a function
            that completes with RRS is retried by the Root Complex (2.3.2): no write goes to it,
            another FLR either, before its Vendor ID read gives its ID. */
-        uint32_t id = pci_read32(d->bus, d->dev, d->func, 0);
+        uint32_t id = pci_read32(d->address, 0);
         reset_initializing(r, id);
         if (id != r->state.id) {
             r->stuck = true;
-            kprintf("pci: %02x:%02x.%u: %s; it is reset again once it answers\n", d->bus, d->dev, d->func,
+            kprintf("pci: %04x:%02x:%02x.%x: %s; it is reset again once it answers\n", PCI_ADDRESS_ARGS(d->address),
                     r->initializing ? "still initializing" : "not answering");
             return false;
         }
@@ -957,7 +1006,7 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
             /* A bus reset's: the configuration goes back, and an FLR follows on it where the
                function has one. */
             if (!d->pcie_cap ||
-                !(pci_read32(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR)) {
+                !(pci_read32(d->address, d->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR)) {
                 state_restore(d, &r->state);
                 reset_free(d);
                 links_retrain(true);
@@ -985,10 +1034,10 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
             return false;
         }
         if (pending)
-            kprintf("pci: %02x:%02x.%u: requests still pending %u ms after it stopped issuing them; reset anyway\n",
-                    d->bus, d->dev, d->func, (unsigned)(r->window / NS_PER_MS));
+            kprintf("pci: %04x:%02x:%02x.%x: requests still pending %u ms after it stopped issuing them; reset anyway\n",
+                    PCI_ADDRESS_ARGS(d->address), (unsigned)(r->window / NS_PER_MS));
         uint64_t rtr = flr_time_ns(d); /* read before the FLR, which may discard reads (6.6.2) */
-        pci_write16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCTL,
+        pci_write16(d->address, d->pcie_cap + PCIE_DEVCTL,
                     r->state.pcie_ctl[0] | PCIE_DEVCTL_FLR);
         uint64_t f = spin_lock(&reset_lock);
         r->since = clock_now_ns(); /* allow the full delay after the initiating configuration write */
@@ -1008,7 +1057,7 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
     uint32_t id;
     for (;;) {
         if (port) rrs_show(port, true); /* AML may have rewritten Root Control during a wait */
-        id = pci_read32(d->bus, d->dev, d->func, 0);
+        id = pci_read32(d->address, 0);
         reset_initializing(r, id);
         if (!id_pending(id, true) || clock_now_ns() >= r->ready) break;
         if (!reset_wait(clock_after(NS_PER_MS))) return false;
@@ -1016,8 +1065,8 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
     /* Transactions Pending must be clear once the FLR has completed (6.6.2). Initiate Function
        Level Reset may be written again (7.5.3.4): the next attempt issues another FLR. */
     if (id != r->state.id || transactions_pending(d)) {
-        kprintf("pci: %02x:%02x.%u: %s %u ms after its FLR; its saved configuration is kept for another FLR\n",
-                d->bus, d->dev, d->func,
+        kprintf("pci: %04x:%02x:%02x.%x: %s %u ms after its FLR; its saved configuration is kept for another FLR\n",
+                PCI_ADDRESS_ARGS(d->address),
                 r->initializing ? "still initializing" : id != r->state.id ? "not answering" : "requests pending",
                 (unsigned)((r->ready - r->since) / NS_PER_MS));
         r->stuck = true;
@@ -1027,7 +1076,7 @@ static bool reset_attempt(struct pci_device *d, struct pci_device *port) {
     state_restore(d, &r->state);
     links_retrain(true);
     /* still mastering: the next attempt finds it ready and writes the configuration again */
-    if (!present(d) || (pci_read16(d->bus, d->dev, d->func, PCI_COMMAND) & PCI_COMMAND_MASTER)) return false;
+    if (!present(d) || (pci_read16(d->address, PCI_COMMAND) & PCI_COMMAND_MASTER)) return false;
     msix_entries_again(d);
     reset_free(d);
     return true;
@@ -1080,8 +1129,8 @@ bool pci_reset_left(const struct pci_device *d) {
    Complex would retry that read (2.3.2). Its Vendor ID is read again here, the Root Port showing
    RRS, so that a function that came back is not kept from it for good. reset_lock held, by the
    caller's whole access: d->reset cannot change between this check and the access it guards. */
-static bool config_blocked_held(uint8_t bus, uint8_t dev, uint8_t func) {
-    struct pci_device *d = pci_find_function(bus, dev, func);
+static bool config_blocked_held(struct pci_address a) {
+    struct pci_device *d = pci_find_function(a);
     struct pci_reset *r = d ? d->reset : NULL;
     if (!r) return false;
     bool resetting = r->phase == RESET_QUIESCED || r->phase == RESET_BUS ||
@@ -1089,42 +1138,42 @@ static bool config_blocked_held(uint8_t bus, uint8_t dev, uint8_t func) {
     struct pci_device *port = resetting || !r->initializing ? NULL : rrs_port(d);
     if (port) {
         rrs_hold_held(port);
-        r->initializing = pci_read32(bus, dev, func, 0) == PCI_CONFIG_RRS_ID;
+        r->initializing = pci_read32(a, 0) == PCI_CONFIG_RRS_ID;
         rrs_release_held(port);
     }
     if (!resetting && !r->initializing) return false;
     if (!r->refused)
-        kprintf("pci: %02x:%02x.%u is being reset: other configuration accesses to it are dropped until it is ready\n",
-                bus, dev, func);
+        kprintf("pci: %04x:%02x:%02x.%x is being reset: other configuration accesses to it are dropped until it is ready\n",
+                PCI_ADDRESS_ARGS(a));
     r->refused = true;
     return true;
 }
 
-/* An extended register's ECAM page is mapped before reset_lock, which comes before the page
+/* A register only ECAM reaches has its page mapped before reset_lock, which comes before the page
    tables' locks: the access under it then finds the page mapped. */
-bool pci_config_firmware_read(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t *v) {
-    if (off >= 256) (void)ecam_regs(bus, dev, func, true);
+bool pci_config_firmware_read(struct pci_address a, uint16_t off, uint32_t *v) {
+    if (!cf8_reaches(a, off)) (void)ecam_regs(a, true);
     uint64_t f = spin_lock(&reset_lock);
-    bool ok = !config_blocked_held(bus, dev, func);
-    *v = ok ? pci_read32(bus, dev, func, off & ~3u) : 0xFFFFFFFFu;
+    bool ok = !config_blocked_held(a);
+    *v = ok ? pci_read32(a, off & ~3u) : 0xFFFFFFFFu;
     spin_unlock(&reset_lock, f);
     return ok;
 }
 
 bool pci_config_read_unless_reset(const struct pci_device *d, uint16_t off, uint32_t *v) {
-    if (off >= 256) (void)ecam_regs(d->bus, d->dev, d->func, true);
+    if (!cf8_reaches(d->address, off)) (void)ecam_regs(d->address, true);
     uint64_t f = spin_lock(&reset_lock);
     bool ok = !d->reset;
-    if (ok) *v = pci_read32(d->bus, d->dev, d->func, off & ~3u);
+    if (ok) *v = pci_read32(d->address, off & ~3u);
     spin_unlock(&reset_lock, f);
     return ok;
 }
 
-bool pci_config_firmware_write(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t v, unsigned bytes) {
-    if (off >= 256) (void)ecam_regs(bus, dev, func, true);
+bool pci_config_firmware_write(struct pci_address a, uint16_t off, uint32_t v, unsigned bytes) {
+    if (!cf8_reaches(a, off)) (void)ecam_regs(a, true);
     uint64_t f = spin_lock(&reset_lock);
-    bool ok = !config_blocked_held(bus, dev, func);
-    if (ok) config_write(bus, dev, func, bytes == 4 ? off & ~3u : bytes == 2 ? off & ~1u : off, v, bytes);
+    bool ok = !config_blocked_held(a);
+    if (ok) config_write(a, bytes == 4 ? off & ~3u : bytes == 2 ? off & ~1u : off, v, bytes);
     spin_unlock(&reset_lock, f);
     return ok;
 }
@@ -1137,9 +1186,9 @@ bool pci_config_firmware_write(uint8_t bus, uint8_t dev, uint8_t func, uint16_t 
    1.0 s after the reset leads to no device that must still be waited for. Once that can be told,
    sets b->below and returns true. */
 static bool below_ready(struct pci_device *b) {
-    uint32_t cap = pci_read32(b->bus, b->dev, b->func, b->pcie_cap + PCIE_LNKCAP);
+    uint32_t cap = pci_read32(b->address, b->pcie_cap + PCIE_LNKCAP);
     if ((cap & PCIE_LNKCAP_SPEED) <= 2 || !(cap & PCIE_LNKCAP_DLL_REPORTING)) b->below = b->reset_end + 100 * NS_PER_MS;
-    else if (pci_read16(b->bus, b->dev, b->func, b->pcie_cap + PCIE_LNKSTA) & PCIE_LNKSTA_DLL_ACTIVE)
+    else if (pci_read16(b->address, b->pcie_cap + PCIE_LNKSTA) & PCIE_LNKSTA_DLL_ACTIVE)
         b->below = clock_after(100 * NS_PER_MS);
     else if (clock_now_ns() >= b->reset_end + NS_PER_S) b->below = CLOCK_NEVER;
     else return false;
@@ -1179,8 +1228,8 @@ struct pci_device *pci_bus_reset_port(const struct pci_device *d) {
     struct pci_device *port = d->upstream;
     if (!port || !port->pcie_cap || (port->pcie_type != 4 && port->pcie_type != 6)) return NULL;
     if (d->reset && d->reset->broken) return NULL;
-    if ((pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_CAPS) & PCIE_CAPS_SLOT) &&
-        (pci_read32(port->bus, port->dev, port->func, port->pcie_cap + PCIE_SLOTCAP) & PCIE_SLOTCAP_HOTPLUG))
+    if ((pci_read16(port->address, port->pcie_cap + PCIE_CAPS) & PCIE_CAPS_SLOT) &&
+        (pci_read32(port->address, port->pcie_cap + PCIE_SLOTCAP) & PCIE_SLOTCAP_HOTPLUG))
         return NULL;
     return port;
 }
@@ -1188,12 +1237,12 @@ struct pci_device *pci_bus_reset_port(const struct pci_device *d) {
 /* What pci_bus_reset may not do, logged: NULL when it may. */
 static const char *bus_reset_refused(const struct pci_device *port) {
     if (!port->pcie_cap || (port->pcie_type != 4 && port->pcie_type != 6)) return "it is no Downstream Port";
-    if (devices_lost) return "some functions below it may be unknown";
+    if (!pci_all_known()) return "some functions below it may be unknown";
     if (!present(port)) return "it does not answer";
-    if (pci_read16(port->bus, port->dev, port->func, PCI_BRIDGE_CONTROL) & PCI_BRIDGE_CONTROL_SBR)
+    if (pci_read16(port->address, PCI_BRIDGE_CONTROL) & PCI_BRIDGE_CONTROL_SBR)
         return "it is in reset already";
     if (port->pcie_v2 &&
-        (pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_LNKCTL2) & PCIE_LNKCTL2_COMPLIANCE))
+        (pci_read16(port->address, port->pcie_cap + PCIE_LNKCTL2) & PCIE_LNKCTL2_COMPLIANCE))
         return "its link is set to Enter Compliance";
     for (size_t i = 0; i < ndevices; i++) {
         const struct pci_device *f = &devices[i], *up = f->upstream;
@@ -1215,8 +1264,7 @@ static bool bus_reset_hold(struct pci_device *port) {
         if (!present(f)) why = "does not answer";
         else if (!(r = kzalloc(sizeof *r))) why = "has no memory to hold its configuration";
         if (why) {
-            kprintf("pci: %02x:%02x.%u: no Secondary Bus Reset: %02x:%02x.%u below it %s\n", port->bus,
-                    port->dev, port->func, f->bus, f->dev, f->func, why);
+            kprintf("pci: %04x:%02x:%02x.%x: no Secondary Bus Reset: %04x:%02x:%02x.%x below it %s\n", PCI_ADDRESS_ARGS(port->address), PCI_ADDRESS_ARGS(f->address), why);
             break;
         }
         state_save(f, &r->state, false);
@@ -1236,7 +1284,7 @@ static bool bus_reset_hold(struct pci_device *port) {
             r->state.hdr[15] &= ~((uint32_t)PCI_BRIDGE_CONTROL_SBR << 16);
         } else {
             r->state.hdr[1] &= ~PCI_COMMAND_MASTER;
-            pci_write16(f->bus, f->dev, f->func, PCI_COMMAND, r->state.hdr[1] & 0xFFFF);
+            pci_write16(f->address, PCI_COMMAND, r->state.hdr[1] & 0xFFFF);
         }
     }
     return !why;
@@ -1245,8 +1293,8 @@ static bool bus_reset_hold(struct pci_device *port) {
 /* The port's LTR Mechanism Enable, which its link going down cleared (7.5.3.16), set again
    before the configuration below it goes back: closest to the Root Port first (6.18). */
 static void ltr_enable(const struct pci_device *port) {
-    uint16_t control2 = pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_DEVCTL2);
-    pci_write16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_DEVCTL2, control2 | PCIE_DEVCTL2_LTR);
+    uint16_t control2 = pci_read16(port->address, port->pcie_cap + PCIE_DEVCTL2);
+    pci_write16(port->address, port->pcie_cap + PCIE_DEVCTL2, control2 | PCIE_DEVCTL2_LTR);
 }
 
 static bool bus_reset(struct pci_device *port);
@@ -1261,7 +1309,7 @@ bool pci_bus_reset(struct pci_device *port) {
 static bool bus_reset(struct pci_device *port) {
     const char *why = bus_reset_refused(port);
     if (why) {
-        kprintf("pci: %02x:%02x.%u: no Secondary Bus Reset: %s\n", port->bus, port->dev, port->func, why);
+        kprintf("pci: %04x:%02x:%02x.%x: no Secondary Bus Reset: %s\n", PCI_ADDRESS_ARGS(port->address), why);
         return false;
     }
     if (!bus_reset_hold(port)) return false;
@@ -1275,28 +1323,28 @@ static bool bus_reset(struct pci_device *port) {
         reset_phase_set(f->reset, RESET_BUS);
         f->below = f->reset_end = 0;
     }
-    uint16_t control = pci_read16(port->bus, port->dev, port->func, PCI_BRIDGE_CONTROL);
-    bool dll = pci_read32(port->bus, port->dev, port->func, port->pcie_cap + PCIE_LNKCAP) & PCIE_LNKCAP_DLL_REPORTING;
-    uint16_t link = pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_LNKSTA);
+    uint16_t control = pci_read16(port->address, PCI_BRIDGE_CONTROL);
+    bool dll = pci_read32(port->address, port->pcie_cap + PCIE_LNKCAP) & PCIE_LNKCAP_DLL_REPORTING;
+    uint16_t link = pci_read16(port->address, port->pcie_cap + PCIE_LNKSTA);
     bool was_up = dll && (link & PCIE_LNKSTA_DLL_ACTIVE); /* its speed and width are valid */
     bool ltr = port->pcie_v2 &&
-               (pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_DEVCTL2) & PCIE_DEVCTL2_LTR);
+               (pci_read16(port->address, port->pcie_cap + PCIE_DEVCTL2) & PCIE_DEVCTL2_LTR);
     if (rrs) rrs_hold(rrs);
-    kprintf("pci: %02x:%02x.%u: Secondary Bus Reset\n", port->bus, port->dev, port->func);
-    pci_write16(port->bus, port->dev, port->func, PCI_BRIDGE_CONTROL, control | PCI_BRIDGE_CONTROL_SBR);
+    kprintf("pci: %04x:%02x:%02x.%x: Secondary Bus Reset\n", PCI_ADDRESS_ARGS(port->address));
+    pci_write16(port->address, PCI_BRIDGE_CONTROL, control | PCI_BRIDGE_CONTROL_SBR);
     /* the times after the reset is sent are held in whole: a kill does not shorten them */
     for (uint64_t until = clock_after(NS_PER_MS); clock_now_ns() < until;) wait_step(true); /* Trst */
     if (dll) {
         uint16_t status;
         for (uint64_t until = clock_after(NS_PER_S);
-             ((status = pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_LNKSTA)) &
+             ((status = pci_read16(port->address, port->pcie_cap + PCIE_LNKSTA)) &
               PCIE_LNKSTA_DLL_ACTIVE) &&
              clock_now_ns() < until;)
             wait_step(true);
         if (status & PCIE_LNKSTA_DLL_ACTIVE)
-            kprintf("pci: %02x:%02x.%u: its link stayed up 1 s into the reset\n", port->bus, port->dev, port->func);
+            kprintf("pci: %04x:%02x:%02x.%x: its link stayed up 1 s into the reset\n", PCI_ADDRESS_ARGS(port->address));
     }
-    pci_write16(port->bus, port->dev, port->func, PCI_BRIDGE_CONTROL, control);
+    pci_write16(port->address, PCI_BRIDGE_CONTROL, control);
     for (uint64_t until = clock_after(2 * NS_PER_MS); clock_now_ns() < until;) wait_step(true);
     port->reset_end = clock_now_ns();
     port->below = 0;
@@ -1309,15 +1357,14 @@ static bool bus_reset(struct pci_device *port) {
         uint32_t id = UINT32_MAX;
         /* reached once the bridge above has its bus numbers back */
         if ((f->upstream == port || !f->upstream->reset) && below_wait(f, &reset_end, true))
-            id = ready_id(rrs, f->bus, f->dev, f->func, reset_end, true, true);
+            id = ready_id(rrs, f->address, reset_end, true, true);
         uint64_t held = spin_lock(&reset_lock);
         r->phase = RESET_IDLE;
         r->initializing = id == PCI_CONFIG_RRS_ID;
         spin_unlock(&reset_lock, held);
         r->stuck = r->broken = id != r->state.id;
         if (r->stuck) {
-            kprintf("pci: %02x:%02x.%u: %s after the Secondary Bus Reset; its configuration stays held\n", f->bus,
-                    f->dev, f->func, r->initializing ? "still initializing 1 s" : "not answering");
+            kprintf("pci: %04x:%02x:%02x.%x: %s after the Secondary Bus Reset; its configuration stays held\n", PCI_ADDRESS_ARGS(f->address), r->initializing ? "still initializing 1 s" : "not answering");
             continue;
         }
         came |= f->upstream == port;
@@ -1330,12 +1377,12 @@ static bool bus_reset(struct pci_device *port) {
         reset_free(f);
     }
     if (ltr) ltr_enable(port); /* for a function that answers later */
-    uint16_t now = pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_LNKSTA);
+    uint16_t now = pci_read16(port->address, port->pcie_cap + PCIE_LNKSTA);
     if (was_up && came &&
         ((now & PCIE_LNKSTA_SPEED) < (link & PCIE_LNKSTA_SPEED) || (now & PCIE_LNKSTA_WIDTH) < (link & PCIE_LNKSTA_WIDTH)))
-        kprintf("pci: %02x:%02x.%u: its link came back at speed %u x%u, below speed %u x%u before the reset; "
+        kprintf("pci: %04x:%02x:%02x.%x: its link came back at speed %u x%u, below speed %u x%u before the reset; "
                 "equalization (4.2.3) is left to the hardware\n",
-                port->bus, port->dev, port->func, now & PCIE_LNKSTA_SPEED, (now & PCIE_LNKSTA_WIDTH) >> 4,
+                PCI_ADDRESS_ARGS(port->address), now & PCIE_LNKSTA_SPEED, (now & PCIE_LNKSTA_WIDTH) >> 4,
                 link & PCIE_LNKSTA_SPEED, (link & PCIE_LNKSTA_WIDTH) >> 4);
     links_retrain(true);
     if (rrs) rrs_release(rrs);
@@ -1397,8 +1444,7 @@ static void state_remake(struct pci_device *d, struct pci_saved *s) {
             off = true;
         }
     }
-    if (off) kprintf("pci: %02x:%02x.%u: an interrupt message could not be made again: left off\n", d->bus, d->dev,
-                     d->func);
+    if (off) kprintf("pci: %04x:%02x:%02x.%x: an interrupt message could not be made again: left off\n", PCI_ADDRESS_ARGS(d->address));
 }
 
 /* After S3 every function has been through a Conventional Reset, whose end is not visible here:
@@ -1441,14 +1487,13 @@ void pci_resume(bool slept, bool remake) {
         if (r) reset_phase_set(r, RESET_IDLE);
         uint64_t reset_end = since;
         if (!below_wait(d, &reset_end, false)) {
-            kprintf("pci: %02x:%02x.%x is not there after sleep (the link above it is down)\n", d->bus, d->dev,
-                    d->func);
+            kprintf("pci: %04x:%02x:%02x.%x is not there after sleep (the link above it is down)\n", PCI_ADDRESS_ARGS(d->address));
             if (r) r->stuck = r->broken = true;
             continue;
         }
         struct pci_device *port = rrs_port(d);
         if (port) rrs_hold(port);
-        uint32_t id = ready_id(port, d->bus, d->dev, d->func, reset_end, true, false);
+        uint32_t id = ready_id(port, d->address, reset_end, true, false);
         if (port) rrs_release(port);
         uint32_t was = r ? r->state.id : saved[i].id;
         if (r) {
@@ -1456,7 +1501,7 @@ void pci_resume(bool slept, bool remake) {
             r->stuck = r->broken = id != was;
         }
         if (id != was) {
-            kprintf("pci: %02x:%02x.%x is %s after sleep (ID %08x, was %08x)\n", d->bus, d->dev, d->func,
+            kprintf("pci: %04x:%02x:%02x.%x is %s after sleep (ID %08x, was %08x)\n", PCI_ADDRESS_ARGS(d->address),
                     id == PCI_CONFIG_RRS_ID ? "still initializing 1 s" : "not there", id, was);
             continue;
         }

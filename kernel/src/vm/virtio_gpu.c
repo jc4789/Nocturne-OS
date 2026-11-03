@@ -119,7 +119,7 @@ static void completion_nap(uint64_t deadline) {
 
 static inline void barrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 static uint32_t config32(struct pci_device *d, unsigned off) {
-    return pci_read32(d->bus, d->dev, d->func, (uint8_t)off);
+    return pci_read32(d->address, (uint8_t)off);
 }
 static uint8_t config8(struct pci_device *d, unsigned off) {
     return (uint8_t)(config32(d, off & ~3u) >> ((off & 3u) * 8));
