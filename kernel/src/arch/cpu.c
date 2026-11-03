@@ -45,10 +45,10 @@ static const struct feature {
     {LE1, EDX, 11, "SYSCALL"}, {LE1, EDX, 29, "long mode"},
     /* the page tables and memory types (mm/vmm.c, arch/pat.c) */
     {L1, EDX, 6, "PAE"}, {L1, EDX, 12, "MTRR"}, {L1, EDX, 13, "PGE"}, {L1, EDX, 16, "PAT"}, {L1, EDX, 19, "CLFSH"},
-    {L7, EBX, 7, "SMEP"}, {L7, EBX, 10, "INVPCID"}, {L7, EBX, 20, "SMAP"},
+    {L7, EBX, 7, "SMEP"}, {L7, EBX, 20, "SMAP"},
     {LE1, EDX, 20, "NX"}, {LE1, EDX, 26, "1 GiB pages"},
     /* the entries, the per-CPU word and the clock (arch/isr.asm, kernel/entry/clock.c, user/libc/sys.c) */
-    {L1, EDX, 4, "TSC"}, {L1, EDX, 5, "MSR"}, {L7, EBX, 0, "FSGSBASE"}, {L7, ECX, 22, "RDPID"}, {LE1, EDX, 27, "RDTSCP"},
+    {L1, EDX, 4, "TSC"}, {L1, EDX, 5, "MSR"}, {L7, EBX, 0, "FSGSBASE"}, {LE1, EDX, 27, "RDTSCP"},
     /* the machine checks (arch/mca.c), the interrupts (arch/apic.c), the extended state (arch/fpu.c),
        the IOMMU's entries (dev/iommu_amd.c) */
     {L1, EDX, 7, "MCE"}, {L1, EDX, 14, "MCA"}, {L1, EDX, 9, "APIC"}, {L1, ECX, 21, "x2APIC"},
@@ -65,7 +65,8 @@ static const struct {
     size_t flag;
     bool hardware;
 } optional[] = {
-    OPTIONAL(L1, ECX, 3, "MWAIT", mwait), OPTIONAL(L1, ECX, 17, "PCID", pcid), OPTIONAL(L1, ECX, 28, "AVX", avx),
+    OPTIONAL(L1, ECX, 3, "MWAIT", mwait), OPTIONAL(L1, ECX, 17, "PCID", pcid), OPTIONAL(L7, EBX, 10, "INVPCID", invpcid),
+    OPTIONAL(L1, ECX, 28, "AVX", avx),
     OPTIONAL(L1, ECX, 24, "TSC deadline", tsc_deadline), OPTIONAL(L1, ECX, 30, "RDRAND", rdrand),
     OPTIONAL(L6, EAX, 2, "ARAT", arat), OPTIONAL(L6, EAX, 7, "HWP", hwp), OPTIONAL(L6, EAX, 10, "HWP EPP", hwp_epp),
     OPTIONAL(L6, ECX, 0, "APERF/MPERF", aperf_mperf),

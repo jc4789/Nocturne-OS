@@ -19,6 +19,8 @@ void hal_name(struct hal_device *d, const char *name);
 void hal_bound(struct hal_device *d, const char *driver);
 void hal_unbound(struct hal_device *d);
 void hal_failed(struct hal_device *d, const char *driver, int reason);
+/* 動いていた実装を立ち上げ直した結果：だめなら N_HAL_FAILED、戻ったなら失敗の記録を消す。 */
+void hal_restarted(struct hal_device *d, const char *driver, bool up);
 void hal_remove(struct hal_device *d); /* 載っていなければ何もしない */
 
 int64_t hal_syscall_list(struct n_hal_device *user_out, uint64_t max);

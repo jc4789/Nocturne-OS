@@ -784,11 +784,10 @@ down:
     return false;
 }
 
-/* 動いている間の立ち上げ直し。台帳は結果に従う。reset_lock held. */
+/* reset_lock held. */
 static bool enable_recorded(struct nvme *c) {
     bool up = enable(c);
-    if (!up) hal_failed(&c->pci->hal, nvme_driver.name, -N_ERR_IO);
-    else if (c->pci->hal.info.state == N_HAL_FAILED) hal_bound(&c->pci->hal, nvme_driver.name);
+    hal_restarted(&c->pci->hal, nvme_driver.name, up);
     return up;
 }
 

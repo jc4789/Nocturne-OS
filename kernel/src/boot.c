@@ -143,6 +143,10 @@ void kmain(void) {
     if (cmdline_req.response && cmdline_req.response->cmdline) test_cmdline = cmdline_req.response->cmdline;
 #endif
     boot_record_read();
+    if (fb_req.response && fb_req.response->framebuffer_count > 0) {
+        struct limine_framebuffer *f = fb_req.response->framebuffers[0];
+        if (f->bpp == 32) fbcon_early(f->address, (unsigned)f->width, (unsigned)f->height, (unsigned)(f->pitch / 4));
+    }
 
     /* The CPU: what it has, then its state as every other CPU's (arch/cpu.h), the memory types
        among it before any page table is built (vmm.c maps MMIO as PAT entry 3, UC, and the

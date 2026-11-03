@@ -20,6 +20,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import struct
 from pathlib import Path
 
 # make's BUILD (--build)
@@ -71,6 +73,44 @@ def size_of(host):
     if path.is_file():
         return path.stat().st_size
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+
+def program_generation(path):
+    """The generation in a 64-bit executable's program note (common/abi.h), None without a note;
+    the program's file is not one when it returns "not a program"."""
+    data = path.read_bytes()
+    if data[:5] != b"\x7fELF\x02" or struct.unpack_from("<H", data, 16)[0] not in (2, 3):
+        return "not a program"
+    phoff = struct.unpack_from("<Q", data, 32)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 54)
+    for i in range(phnum):
+        kind, _, offset, _, _, filesz = struct.unpack_from("<IIQQQQ", data, phoff + i * phentsize)
+        if kind != 4:  # PT_NOTE
+            continue
+        at, end = offset, offset + filesz
+        while at + 12 <= end:
+            name_bytes, desc_bytes, _ = struct.unpack_from("<III", data, at)
+            desc = at + 12 + ((name_bytes + 3) & ~3)
+            if data[at + 12:at + 12 + name_bytes].rstrip(b"\0") == b"Nocturne":
+                return struct.unpack_from("<I", data, desc)[0]
+            at = desc + ((desc_bytes + 3) & ~3)
+    return None
+
+
+def check_generations():
+    """The kernel starts no program of another generation (kernel/src/sys/proc.c). A program built
+    apart from make's rules (Go's linker, LLVM) falls behind when the generation changes: the build
+    says so, here, and not the first person who opens it."""
+    now = int(re.search(r"#define N_ABI_GENERATION (\d+)u", Path("common/abi.h").read_text(encoding="utf-8")).group(1))
+    behind = []
+    for folder in (PROGRAMS, BUILD / "drivers"):
+        for program in sorted(folder.iterdir() if folder.is_dir() else ()):
+            found = program_generation(program) if program.is_file() else "not a program"
+            if found != "not a program" and found != now:
+                behind.append(f"{program} (世代 {found})")
+    if behind:
+        raise SystemExit(f"C: に入るプログラムの世代が common/abi.h の {now} と違います：" + "、".join(behind) +
+                         "。ports/go/README.md、ports/llvm/README.md の手順で組み直してください。")
 
 
 def layout(firmware_manifest, system_only):
@@ -127,6 +167,7 @@ def main():
     global BUILD, PROGRAMS
     BUILD = Path(args.build)
     PROGRAMS = BUILD / "programs"
+    check_generations()
     entries = layout(args.firmware_manifest, args.system)
     lines = ["# made by scripts/layout.py: a path on C:, the host's file or folder, its attributes"]
     lines += [f"{path}\t{host}\t{attributes}" for path, host, attributes in entries]

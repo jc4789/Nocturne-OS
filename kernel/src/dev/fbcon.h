@@ -3,8 +3,12 @@
    panic screen, drawn on whatever the screen shows then. */
 #pragma once
 #include <stdbool.h>
+#include <stdint.h>
 
 struct panic_line;
+/* CPU 0, first of all: the firmware's 32-bit framebuffer, where a panic before fbcon_init tells the
+   person at the machine, who may have no serial line. */
+void fbcon_early(uint32_t *pixels, unsigned width, unsigned height, unsigned pitch_pixels);
 /* CPU 0 at boot, after fb_init and log_init: its canvas, kept for the panic screen, and what the
    log holds so far drawn. */
 void fbcon_init(void);

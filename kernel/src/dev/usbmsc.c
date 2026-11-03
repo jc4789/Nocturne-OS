@@ -279,6 +279,7 @@ static void probe_lun(struct msc *m, unsigned lun) {
     }
     while (n && model[n - 1] == ' ') n--;
     model[n] = 0;
+    if (!lun && m->dev) hal_name(&m->dev->hal, model);
     if (!unit_ready(m, lun)) {
         if (m->dev) kprintf("usbmsc: %s (unit %u) has no medium or is not ready\n", model, lun);
         return;

@@ -262,6 +262,16 @@ static void draw_some(void) {
 
 /* ---- the boot screen ---- */
 
+static uint32_t *early_pixels;
+static unsigned early_width, early_height, early_pitch;
+
+void fbcon_early(uint32_t *pixels, unsigned width, unsigned height, unsigned pitch_pixels) {
+    early_pixels = pixels;
+    early_width = width;
+    early_height = height;
+    early_pitch = pitch_pixels;
+}
+
 void fbcon_init(void) {
     uint64_t bytes = (uint64_t)fb.width * fb.height * 4;
     uint64_t phys = pmm_alloc_contig(ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE, 64);
@@ -366,7 +376,11 @@ static void log_tail(void) {
 }
 
 void fbcon_panic(const struct panic_line *lines, unsigned count) {
-    if (!ready || !fb.addr) return;
+    bool early = !ready || !fb.addr;
+    if (early) {
+        if (!early_pixels) return;
+        gfx_init(&cv, early_pixels, (int)early_width, (int)early_height, (int)early_pitch);
+    }
     static const uint32_t tones[] = {[PANIC_MESSAGE] = 0xFFFF8E9E, [PANIC_HEADING] = 0xFFE8C36A,
                                      [PANIC_DETAIL] = 0xFFC9CCE0};
     gfx_noclip(&cv);
@@ -384,6 +398,7 @@ void fbcon_panic(const struct panic_line *lines, unsigned count) {
     }
     pr_y += 10;
     pline("Restart the computer (hold the power button if it does not answer). Sweet dreams.", 0xFF8E9AC8);
+    if (early) return; /* the canvas is the screen, and the log is not there yet */
     log_tail();
     fb_drop_holds();
     fb_present_last(cv.px, cv.pitch, cv.w, cv.h);

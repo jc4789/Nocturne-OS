@@ -202,7 +202,7 @@ isr_ist:
     jmp isr_saved
 ; From the kernel the GS base in use may be either: the app's in the few instructions around a
 ; swapgs (SYSCALL's entry, the way out to the app) where these can still come. Keep it, put this
-; CPU's own in (its index from RDPID, arch/percpu.h), and put it back on the way out. Nothing
+; CPU's own in (its index from RDTSCP, arch/percpu.h), and put it back on the way out. Nothing
 ; here sleeps or switches tasks.
 isr_ist_kernel:
     SAVE_GPRS
@@ -210,7 +210,8 @@ isr_ist_kernel:
     clac
     rdgsbase rax
     push rax
-    rdpid rax
+    rdtscp ; the registers it takes are saved: the index is TSC_AUX, in ECX
+    mov eax, ecx
     mov rdx, [rel percpu_offsets]
     mov rax, [rdx + rax * 8]
     wrgsbase rax

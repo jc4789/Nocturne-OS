@@ -259,6 +259,7 @@ struct usb_hc {
     bool recover, woke;
     bool wedged; /* atomic: an aborted command's ring did not stop (4.6.1.2) */
     bool failed, settled;
+    bool gone; /* its registers read all ones: not on the bus */
     unsigned restarts;
     uint64_t retry_at; /* the earliest endpoint recovery retry (CLOCK_NEVER = none) */
     struct xdev *slots[256]; /* set and cleared by the worker, read by the drains */
@@ -1751,9 +1752,10 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
     }
     if (failed_driver) hal_failed(&d->hal, failed_driver, failed_why);
     kfree(cfg);
-    /* 文字に答えない装置は制御の道を壊すことがあるので、実装を結んだ後に読む。hub は読まない：下の装置を巻き添えに
-       する。 */
-    if (!d->hub) usb_product(d);
+    /* 文字に答えない装置は制御の道を壊すことがある。だからバスが読むのは、その道を使う実装の無い装置の名だけである。
+       実装を持つ装置の名は実装が決める（usbhid と usbnet は文字を読み、usbmsc は INQUIRY の名を使う）。hub は読まない：
+       下の装置を巻き添えにする。 */
+    if (!d->hub && d->hal.info.state != N_HAL_RUNNING) usb_product(d);
     return xd;
 fail:
     __atomic_store_n(&xd->dev.removed, true, __ATOMIC_RELEASE); /* late events for the slot are dropped */
@@ -2263,15 +2265,11 @@ static bool hc_start(struct usb_hc *hc) {
  * every device with it: reset it so it lets go of memory, have the drivers drop their devices,
  * then bring it up again and enumerate from scratch. A controller that keeps failing is left off.
  * After a sleep the same happens, without counting as a failure: the devices lost their addresses. */
-/* 立ち上げ直す。台帳は結果に従う。attach の後に、この controller の記録を書くのは worker だけである。 */
 static bool hc_start_again(struct usb_hc *hc) {
-    if (!hc_start(hc)) {
-        hal_failed(&hc->pci->hal, xhci_driver.name, -N_ERR_IO);
-        return false;
-    }
-    hc->failed = false;
-    if (hc->pci->hal.info.state == N_HAL_FAILED) hal_bound(&hc->pci->hal, xhci_driver.name);
-    return true;
+    bool up = hc_start(hc);
+    if (up) hc->failed = false;
+    hal_restarted(&hc->pci->hal, xhci_driver.name, up);
+    return up;
 }
 
 static void hc_restart(struct usb_hc *hc, bool after_sleep) {
@@ -2335,6 +2333,11 @@ static void hc_worker(void *arg) {
         uint64_t seen = __atomic_load_n(&hc->kicks, __ATOMIC_ACQUIRE);
         if (__atomic_exchange_n(&hc->woke, false, __ATOMIC_ACQ_REL)) hc_restart(hc, true);
         uint32_t sts = hc_running(hc) ? rd32(hc->op, USBSTS) : 0;
+        if ((sts == 0xFFFFFFFFu) != hc->gone) {
+            hc->gone = !hc->gone;
+            kprintf("usb: controller %d %s the bus\n", hc->index, hc->gone ? "is gone from" : "is back on");
+            hal_restarted(&hc->pci->hal, xhci_driver.name, !hc->gone);
+        }
         if ((sts & (STS_HSE | STS_HCE)) && sts != 0xFFFFFFFFu && !hc->failed) { /* all ones: gone from the bus */
             hc->failed = true;
             kprintf("usb: controller %d stopped on a %s error (status %08x)\n", hc->index,

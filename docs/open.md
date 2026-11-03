@@ -80,6 +80,8 @@
 - PCI に抜き差しと AER が無い。
 - ノート PC の内蔵キーボード（i8042、I2C の HID）の実装が無い。
 - AVX-512：カーネルは CPU が持てば有効にするが、FFmpeg は切ってある（`ports/ffmpeg/prepare.py`、`Makefile:190`）。我々のコードは実行時に選ばない。
+- PCI の segment：カーネルは segment 0 だけを列挙する（`dev/pci.c`）。`struct n_pciinfo` と `N_PCI_TARGET` にも segment が無い。別の segment の NVMe は見つからず、窓にも出ない。
+- PCI の結びつけは同期で、待ちが足し算になる（`pci_bind_all`）。NVMe の C: の機械も、AHCI の全部のポートの待ちを待つ。NVMe が多い機械は台数に比例して遅くなる。
 - 休止から戻ると xHCI が `interrupts never arrive, polling instead` で poll へ落ち、NVMe の `ready again after sleep` が約 5 秒遅れる。変える前の写し（`build/mae.img`）でも同じ。原因の見込みは、戻す callback（`dev/pm.c` の `machine_sleep`）が worker を起こす時に AP がまだ止まっており（`smp_resume` は後）、AP へ向かう MSI-X が失われること。確かめていない。S3 も同じ順である。
 - GPU：ドライバーが動作中に落ちると既定の道へ戻らない（`docs/records/audit-gpu-generic-20261102.md` の F1）。
 - virgl：製品のカーネルで起きない（`kernel/src/vm/virtio_gpu.c:579`）。

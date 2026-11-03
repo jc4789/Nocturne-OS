@@ -204,11 +204,11 @@ int thread_id(void) {
     struct libc_thread *t = libc_thread_current();
     return t ? t->tid : (int)SC0(SYS_THREAD_ID);
 }
-/* RDPID: the CPU's index, which the kernel keeps in its TSC_AUX. */
+/* The CPU's index, which the kernel keeps in its TSC_AUX. */
 unsigned cpu_index(void) {
-    uint64_t index;
-    __asm__ volatile("rdpid %0" : "=r"(index));
-    return (unsigned)index;
+    uint32_t index;
+    __asm__ volatile("rdtscp" : "=c"(index) : : "rax", "rdx");
+    return index;
 }
 n_result thread_stack_bounds(uintptr_t *low, uintptr_t *high) { return SC2(SYS_THREAD_STACK_BOUNDS, low, high); }
 /* The calling thread's C11 tss value array with room for `need` keys, or

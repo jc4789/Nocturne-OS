@@ -818,6 +818,7 @@ static bool hda_resume(void *arg) {
     struct hda *h = arg;
     if (__atomic_load_n(&h->stopped, __ATOMIC_RELAXED)) return true;
     bool ok = link_up(h);
+    hal_restarted(&h->pci->hal, hda_driver.name, ok);
     __atomic_store_n(&h->restore, true, __ATOMIC_SEQ_CST);
     signal(h);
     tell_open(h);

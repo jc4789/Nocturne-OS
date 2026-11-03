@@ -34,7 +34,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   libc は FS を自分の TLS（x86-64 の variant II）に使う。`%fs:0` は `struct n_thread_block`（`abi.h`）で、
   頭の語が自分の番地、次の語が像の番地。ドライバーの像（§7）の libc は FS を変えず、同じスレッドの区画に
   自分の区画を繋ぐ。Go は FS を自分で持ち、溝を番地で呼ぶ。
-- `RDPID` は、そのスレッドが今走っている CPU の番号（0 から数える）を返す。
+- `RDTSCP` は ECX に、そのスレッドが今走っている CPU の番号（0 から数える）を返す。CPU が `RDPID` を持つなら、それでも同じ値を読める。
   読んだ直後に別の CPU へ移ることがあるので、目安にだけ使う（libc の `cpu_index`）。
 
 ## 1. ハンドル

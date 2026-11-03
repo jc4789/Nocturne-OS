@@ -275,6 +275,7 @@ static int usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned tota
         kprintf("usbnet: slot %u MAC address string unreadable\n", d->slot);
         goto fail;
     }
+    usb_product(d);
     /* endpoints of the working alternate get contexts before SET_INTERFACE selects it; alternate
      * 0 first resets the function's network state (ECM 3.3, NCM 9.2), then the parameters,
      * which alternate 0 would reset again, then the working alternate */

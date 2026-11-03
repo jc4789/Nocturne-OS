@@ -419,6 +419,7 @@ static bool rtl_resume(void *arg) {
     wr32(c, IMR_SET, INT_MASK);
     start_autoneg(c);
     net_rx_notify();
+    hal_restarted(&c->pci->hal, rtl8125_driver.name, back);
     return back;
 }
 

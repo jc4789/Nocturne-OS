@@ -77,6 +77,18 @@ void hal_failed(struct hal_device *d, const char *driver, int reason) {
     watched_changed(&hal_changed);
 }
 
+void hal_restarted(struct hal_device *d, const char *driver, bool up) {
+    uint64_t f = spin_lock(&hal_lock);
+    bool was_failed = d->info.state == N_HAL_FAILED;
+    if (was_failed == up) {
+        d->info.state = up ? N_HAL_RUNNING : N_HAL_FAILED;
+        d->info.reason = up ? 0 : -N_ERR_IO;
+        strlcpy(d->info.driver, driver, sizeof d->info.driver);
+    }
+    spin_unlock(&hal_lock, f);
+    if (was_failed == up) watched_changed(&hal_changed);
+}
+
 void hal_remove(struct hal_device *d) {
     uint64_t f = spin_lock(&hal_lock);
     bool was = d->listed;

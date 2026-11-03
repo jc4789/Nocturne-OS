@@ -72,6 +72,7 @@ struct n_hal_device {
 | `hal_bound(d, driver)` | `N_HAL_RUNNING` にする。複合装置は実装の名を並べる |
 | `hal_unbound(d)` | `N_HAL_UNBOUND` へ戻す |
 | `hal_failed(d, driver, reason)` | `N_HAL_FAILED` にする |
+| `hal_restarted(d, driver, up)` | 動いていた実装を立ち上げ直した結果を書く。だめなら `N_HAL_FAILED`、戻ったなら失敗の記録を消す |
 | `hal_remove(d)` | 台帳から外す。載っていなければ何もしない |
 
 - 台帳は葉の spinlock を一つ持つ。実装を呼ばない。順序の仕事を持たない。
@@ -101,7 +102,7 @@ PCI：
 - 引き方は一つである。表の順に結び、先に合った実装が機能を持つ。実機の表を先に、VM の表を後に見る。点数も `probe` の関数も持たない。
 - `attach` は眠ってよい。0 は実装が持つ。`PCI_NOT_MINE` は持たず、記録は `N_HAL_UNBOUND` のまま次の実装へ回る。負は持てなかった理由で、`N_HAL_FAILED` になる。
 - 表は `attach` の前に `hal_bound` を書く。実装の thread が `attach` の戻りより先に `hal_failed` を書くことがあるからである。
-- 動いた後に死んだら、実装が `hal_failed` を書く。立ち直ったら `hal_bound` を書く（`xhci.c` の `hc_start_again`、`nvme.c` の `enable_recorded`）。
+- 動いた後に死んだら、実装が `hal_failed` を書く。立ち上げ直したら `hal_restarted` を書く（`xhci.c` の `hc_start_again`、`nvme.c` の `enable_recorded`、`hda_resume`、`rtl_resume`）。
 - 失敗した実装も、持ち続ける物を自分で持ってよい。止まらない NVMe に SHN を書く今の輪（`nvme.c` の `nvme_shutdown`）はそのまま残る。
 - 実装は `attach` の中で `pm_register` を呼ぶ。制御器ごとの `struct pm_device` でも、一つの `struct pm_device` でもよい。
 - `kernel_owned` と `claimed` は IOMMU と claim の判断の事実で、`pci.c` と `pciuser.c` が今のまま持つ。
@@ -125,7 +126,7 @@ struct usb_driver {
 - CDC の二つの interface は `usbnet` が設定の全体を読んで持つ。
 - `struct usb_device` の実装の状態は、表の番号で引く `state[]` にある（`usb_drivers.h`）。
 - 文脈の決まりは `usb.h` の頭にある。`attach`、`detach`、`work` は controller の worker で一度に一つ走り、眠ってよい。
-- product の文字は `usb_product` が一度だけ読み、全文を `struct usb_device` に持ち、`hal_name` で台帳へ渡す。読むのは実装を結んだ後である。答えない装置が制御の道を壊しても、実装を巻き添えにしない。入力の名に要る `usbhid` は自分で呼ぶ。hub は読まない。下の装置を巻き添えにするからである。
+- product の文字は `usb_product` が一度だけ読み、全文を `struct usb_device` に持ち、`hal_name` で台帳へ渡す。答えない装置は制御の道を壊すことがあるので、バスが読むのは実装の無い装置の名だけである。実装を持つ装置の名は実装が決める：`usbhid` は入力の名に要るので読み、`usbnet` は MAC の文字を読めた後に読み、`usbmsc` は文字を読まず INQUIRY の名を `hal_name` で渡す。hub は読まない。下の装置を巻き添えにするからである。
 
 ほかのバス：
 
@@ -169,7 +170,7 @@ store_init()               C: を探す
 - プログラムは `n_hal_list(out, max)` か `n_hal_snapshot(&list)` で台帳の写しを読む。戻りは全部の数である。
 - `pcilist` は台帳から PCI の機能だけを写す libc の関数である。`lspci`、`neofetch`、`libnvrm` が使う。
 - 変化は `n_hal_watch` で知る。公開の呼出しではない。
-- 設定の窓の「装置」の頁が読み手である。親の下に子を並べ、動かしている実装か、動かせない理由を見せる。
+- 設定の窓の「装置」の頁が読み手である。親の下に子を並べ、動かしている実装か、動かせない理由を見せる。同じ名の行を見分けるため、バスの住所と ID も見せる。
 - 種類の物は今の口で読む（`n_net_adapters`、`n_audio_outputs`、`n_screen_modes_get`、`N_INPUT_DEVICE`）。項目に `hal_id` を足す。
 - 起動をまたぐ鍵は種類の一覧が今のまま持つ（音の `key`、入力の `id`、網の MAC、画面のモニターの識別子）。台帳は持たない。
 - ディスクの一覧の口は今無い。読み手を作るときに足す。
@@ -259,6 +260,9 @@ GPU の契約は、この文書で決めない。次の設計 `docs/gpu.md` で�
 - 製造者を選ぶのは `cpu_features_init` で一度だけである。CPUID の leaf 0 の名で引く。表に無い製造者は、操作が全部 `NULL` の実装で動く。
 - 遅い操作だけが表を通る。TSC の読出し、EOI、IPI は直接呼ぶ。
 - 必須の表の行には、それが無いと動かないコードがある。カーネルとプログラムは `-msse2` で組むので、AVX 以上は必須に無い。
+- CPU の番号は `RDTSCP` で読む（`TSC_AUX`）。時計が要るので `RDTSCP` は必須である。`RDPID` は読まない。
+- `INVPCID` は任意である。無ければ PCID を使わず、CR3 の書き直しと `CR4.PGE` の切り替えで TLB を落とす（`mm/vmm.c`）。
+- 必須の機能が欠けた機械は、`panic` の画面で欠けた機能の名を言う。`fbcon_early` が firmware の面を覚えているからである。
 - `arch/fpu.c` は CPU が持つ状態を有効にする。x87 と SSE は必ず、AVX と AVX-512 は CPU が持てば有効にする。`N_CPU_AVX` は CPU が持つときだけ立つ。RDRAND も任意である。
 - プログラムへの CPU の申告は、入口の像の後ろの読むだけのデータに置く。置き方は時計（`common/clock_data.h`）と同じである。最初の読み手と同時に作る。
 - プログラムは申告を読んで開始時に一度だけ道を選ぶ。呼出しごとに確かめない。

@@ -3,7 +3,7 @@
    template: every CPU has a copy of the whole section, in memory on its own node (percpu_init),
    and its GS base is that copy's distance from the template, so that the GS-relative form of a
    variable's own address (clang's __seg_gs, RIP-relative) is this CPU's copy, one instruction.
-   Its TSC_AUX is its index (RDPID), from which the entries that may come in under the app's GS
+   Its TSC_AUX is its index (RDTSCP), from which the entries that may come in under the app's GS
    base (NMI, #DB, #MC, #DF; arch/isr.asm) find the distance in percpu_offsets.
 
    Before percpu_init the first CPU's GS base is 0: the template is its copy. Only its GDT and TSS

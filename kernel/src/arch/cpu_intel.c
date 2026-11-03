@@ -65,6 +65,7 @@ static const struct cpu_perf_way *intel_perf_way(void) { return cpu_features.hwp
 #define CTL2_THRESHOLD 0x7FFFULL
 static struct spinlock cmci_lock; /* a bank's claim: the check and the write. A leaf */
 PERCPU static uint32_t cmci_banks; /* the banks this CPU claimed */
+PERCPU static bool cmci_claimed;   /* it has made its claims */
 
 static enum irq_result cmci_told(void *context) {
     (void)context;
@@ -75,20 +76,26 @@ static enum irq_result cmci_told(void *context) {
 }
 
 /* 18.5.2.1: the claims, the LVT entry where any was made, then what the claimed banks hold logged
-   and cleared. The threshold is 1, so that each error is told as it happens (18.5.2.2). */
+   and cleared. The threshold is 1, so that each error is told as it happens (18.5.2.2).
+   A claim holds across a sleep, one owner for each bank: a CPU reset cleared CTL2 (18.3.2.5), while
+   the first CPU of a sleep that was called off, or back from hibernating, had no reset and finds
+   CMCI_EN set, on its own banks too. So once it has claimed, a CPU takes up its own banks again
+   and no others. */
 static void cmci_on(void) {
     if (!cpu_features.cmci) return;
     unsigned banks = mca_banks();
-    uint32_t mine = 0;
+    bool again = this_cpu(cmci_claimed);
+    uint32_t held = this_cpu(cmci_banks), mine = 0;
     uint64_t f = spin_lock(&cmci_lock);
     for (unsigned i = 0; i < banks; i++) {
         uint64_t ctl2 = rdmsr(MSR_MC_CTL2 + i);
-        if (ctl2 & CTL2_CMCI_EN) continue; /* a sibling's */
+        if (again ? !(held & (1u << i)) : (ctl2 & CTL2_CMCI_EN) != 0) continue; /* a sibling's */
         if (!wrmsr_checked(MSR_MC_CTL2 + i, (ctl2 & ~CTL2_THRESHOLD) | CTL2_CMCI_EN | 1)) continue;
         if (rdmsr(MSR_MC_CTL2 + i) & CTL2_CMCI_EN) mine |= 1u << i;
     }
     spin_unlock(&cmci_lock, f);
     this_cpu(cmci_banks) = mine;
+    this_cpu(cmci_claimed) = true;
     mca_threshold_vector(cmci_told);
     if (mine) lapic_write(LAPIC_LVT_CMCI, VEC_MCE_THRESHOLD); /* fixed, unmasked */
     for (unsigned i = 0; i < banks; i++)

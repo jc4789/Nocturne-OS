@@ -132,8 +132,13 @@ static bool is_ram(uint64_t page) {
 /* The current PCID's translations of [va, va + pages), all of them above TLB_RANGE_MAX pages,
    global ones excepted; either drops the current PCID's paging-structure caches too. */
 static void flush_local(struct tlb_cpu *me, uint64_t va, uint64_t pages) {
-    if (pages > TLB_RANGE_MAX) invpcid(INVPCID_ONE, pcid_on ? me->slot + 1 : 0, 0);
-    else for (uint64_t i = 0; i < pages; i++) invlpg(va + i * PAGE_SIZE);
+    if (pages <= TLB_RANGE_MAX) {
+        for (uint64_t i = 0; i < pages; i++) invlpg(va + i * PAGE_SIZE);
+    } else if (pcid_on) {
+        invpcid(INVPCID_ONE, me->slot + 1, 0);
+    } else {
+        write_cr3(read_cr3());
+    }
 }
 
 /* The kernel half's leaves are global: invlpg drops a global translation whatever the PCID (SDM 3A
@@ -144,7 +149,19 @@ static void flush_kernel_local(uint64_t va, uint64_t pages) {
     else for (uint64_t i = 0; i < pages; i++) invlpg(va + i * PAGE_SIZE);
 }
 
-void vmm_flush_all(void) { invpcid(INVPCID_ALL, 0, 0); }
+/* Without INVPCID a change of CR4.PGE drops everything, global translations too (SDM 3A 5.10.4.1).
+   PCIDs are off then (vmm_init). Interrupts off: this CPU's CR4 is back before anything can move on. */
+void vmm_flush_all(void) {
+    if (cpu_features.invpcid) {
+        invpcid(INVPCID_ALL, 0, 0);
+        return;
+    }
+    uint64_t f = irq_save();
+    uint64_t cr4 = read_cr4();
+    write_cr4(cr4 & ~CR4_PGE);
+    write_cr4(cr4);
+    irq_restore(f);
+}
 
 /* Interrupts off: CR3 to the kernel's tables (PCID 0, which never held a lower half), and this CPU
    out of the space's cpus after. */
@@ -646,7 +663,7 @@ void vmm_init(struct limine_memmap_response *mm, struct limine_executable_addres
                             VEC_TLB_SHOOTDOWN))
         panic("vmm: VEC_TLB_SHOOTDOWN is taken");
     write_cr3(kernel_pml4);
-    pcid_on = cpu_features.pcid && !test_flag("nopcid");
+    pcid_on = cpu_features.pcid && cpu_features.invpcid && !test_flag("nopcid"); /* flush_local drops a PCID by INVPCID */
     vmm_init_cpu();
     if (pcid_on) kprintf("vmm: PCID on, %u spaces kept per CPU\n", PCID_SLOTS);
     else kprintf("vmm: PCID off, a CPU keeps no space's translations across a switch\n");

@@ -66,7 +66,7 @@ void spin_fault(const struct spinlock *l, const char *why) {
 void percpu_load(unsigned cpu) {
     wrmsr(MSR_GS_BASE, percpu_offsets[cpu]);
     wrmsr(MSR_KERNEL_GS_BASE, 0);
-    wrmsr(MSR_TSC_AUX, cpu); /* RDPID: this CPU's index, for the entries that cannot trust GS */
+    wrmsr(MSR_TSC_AUX, cpu); /* RDTSCP: this CPU's index, for the entries that cannot trust GS */
 }
 
 void percpu_init(void) {
