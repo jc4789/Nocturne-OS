@@ -1,6 +1,6 @@
 # HAL の設計
 
-状態：設計である。まだ作っていない。作り終えたら、今の形の説明へ書き直す。
+状態：台帳、PCI の表、USB の表、CPU の分割は枝 `HAL-DEV` で動いている。網の移動、画面の口の移動、プロセスの実装の眠り、種類の一覧の `hal_id`、GPU の契約はまだ設計である。
 
 規則は `.claude/rules/architecture.md` の HAL の節にある。ここは、その形を決める。読む試験の報告は `docs/records/hal-read-test-*-20261103.md` にある。
 
@@ -37,42 +37,46 @@ HAL は三つの部品でできている。
 - 載るもの：PCI の機能、USB の装置、VMBus の channel、固定のポートの制御器。
 - USB の interface は記録にしない。キーボードは一つの記録である。
 - 実装が作る物は種類の一覧に載る：ディスク、NIC の adapter、音の出口、画面、入力の装置。一つの物は一つの台帳に載る。
-- 種類の一覧の項目は `hal_id` を持ち、元の記録を番号で指す。
+- 種類の一覧の項目は `hal_id` を持ち、元の記録を番号で指す。読み手と同時に足す。
 - 載らないもの：CPU（`arch/topology.c` の一覧）、IOMMU、割り込み、時計、`vm/rdp`、ACPI の装置。ACPI の装置は `dev/acpi.c` の中の話で、EC と電池の実装を足す日に表を作る。
 
-```c
-enum hal_bus { HAL_BUS_PCI, HAL_BUS_USB, HAL_BUS_VMBUS, HAL_BUS_PORT };
-enum hal_state { HAL_UNBOUND, HAL_RUNNING, HAL_FAILED };
+形は `common/abi.h` の `struct n_hal_device` である。プログラムが読むものと同じ形を、カーネルが `struct hal_device` の中に持つ。
 
-struct hal_device {
-    uint32_t id;                /* 起動の間、二度と使わない番号 */
-    uint32_t parent;            /* 親の番号。0：親なし */
-    enum hal_bus bus;
-    enum hal_state state;
-    int reason;                 /* HAL_FAILED の N_ERR_* */
-    int node;                   /* NUMA の node。-1：不明 */
-    union hal_identity identity; /* PCI：住所、機種、種類。USB：機種、種類、route。VMBus：GUID。ポート：番地 */
-    char *name;                 /* バスか実装が埋める。NULL：無い */
-    char *driver;               /* 持っている実装の名。プロセスの実装はプログラムの名 */
+```c
+enum n_hal_bus { N_HAL_BUS_PCI, N_HAL_BUS_USB, N_HAL_BUS_VMBUS, N_HAL_BUS_PORT };
+enum n_hal_state { N_HAL_UNBOUND, N_HAL_RUNNING, N_HAL_FAILED };
+
+struct n_hal_device {
+    uint32_t id;     /* 起動の間、二度と使わない番号 */
+    uint32_t parent; /* 親の番号。0：親なし */
+    uint32_t bus;    /* enum n_hal_bus */
+    uint32_t state;  /* enum n_hal_state */
+    int32_t reason;  /* N_HAL_FAILED の負の N_ERR_* */
+    int32_t node;    /* NUMA の node。-1：不明 */
+    union { struct n_pciinfo pci; /* USB：機種、種類、route。VMBus：GUID。ポート：番地 */ } at;
+    char name[64];   /* 装置が言う名。空：言わない */
+    char driver[48]; /* 持っている実装の名。プロセスの実装はプログラムの名 */
 };
 ```
 
 - 記録はバスの物に埋める（`struct pci_device`、`struct usb_device`、VMBus の channel、`vm/ata`）。寿命はその物と同じである。
 - 指す側はポインターでなく番号を持つ。参照の数は持たない。番号は二度と使わないので、古い番号は何にも当たらない。
+- 文字は記録の中に持つ。だから全部の操作がどの文脈からでも呼べる。
+- `at` はバスが `hal_add` の前に埋める。
 
-操作は次のとおりである。
+操作は次のとおりである（`kernel/src/dev/hal.h`）。
 
-| 操作 | 文脈 | 働き |
-|---|---|---|
-| `hal_add(d, parent, bus, &identity)` | 眠ってよい | 台帳に載せる。`HAL_UNBOUND` で始まる |
-| `hal_name(d, text)` | 眠ってよい | 名前を写して持つ |
-| `hal_bound(d, driver)` | 眠ってよい | `HAL_RUNNING` にする |
-| `hal_unbound(d)` | 眠ってよい | `HAL_UNBOUND` へ戻す |
-| `hal_failed(d, reason)` | どこでも | `HAL_FAILED` にする |
-| `hal_remove(d)` | どこでも | 台帳から外す |
+| 操作 | 働き |
+|---|---|
+| `hal_add(d, parent, bus, node, name)` | 台帳に載せる。`N_HAL_UNBOUND` で始まる |
+| `hal_name(d, name)` | 名前を写して持つ |
+| `hal_bound(d, driver)` | `N_HAL_RUNNING` にする。複合装置は実装の名を並べる |
+| `hal_unbound(d)` | `N_HAL_UNBOUND` へ戻す |
+| `hal_failed(d, driver, reason)` | `N_HAL_FAILED` にする |
+| `hal_remove(d)` | 台帳から外す。載っていなければ何もしない |
 
 - 台帳は葉の spinlock を一つ持つ。実装を呼ばない。順序の仕事を持たない。
-- 変化は `watched_changed`（`sys/watch.h`）で知らせる。これはどの文脈からでも呼べる。
+- 変化は `watched_changed`（`sys/watch.h`）で知らせる。
 - 記録を読むのは写しだけである。読み手は錠の下で写す。
 
 ### 実装の表
@@ -80,11 +84,11 @@ struct hal_device {
 結びつけはバスが行う。バスごとに型のある表を一つ持つ。実装は自分のバスの型を直接受ける。
 
 ```c
-struct pci_match { uint16_t vendor, device; uint8_t cls, subcls, progif, fields; };
+struct n_pci_match { uint16_t vendor, device; uint8_t cls, subcls, progif, fields; };
 
 struct pci_driver {
     const char *name;
-    const struct pci_match *matches;
+    const struct n_pci_match *matches;
     size_t match_count;
     int (*attach)(struct pci_device *d);
 };
@@ -93,9 +97,9 @@ struct pci_driver {
 PCI：
 
 - 表は `kernel/src/dev/pci_drivers.c` に一つ置く。VM の実装は `vm_pci_drivers()` が返す。実機では空である。
-- 行は `PCI_ID(vendor, device)`、`PCI_CLASS(cls, subcls, progif)`、`PCI_VENDOR_CLASS(vendor, cls, subcls)` で書く。`fields` が見る欄を言う。
-- 引き方は一つである。機種の行が合う実装を先に、ほかの行が合う実装を後に取る。実機の表を先に、VM の表を後に見る。点数も `probe` の関数も持たない。
-- `attach` は眠ってよい。0 を返すと `HAL_RUNNING` になる。負を返すと `HAL_FAILED` になる。
+- 行は `N_PCI_ID`、`N_PCI_ID_CLASS`、`N_PCI_CLASS`、`N_PCI_CLASS_PROGIF`、`N_PCI_VENDOR_CLASS_PROGIF` で書く（`common/abi.h`）。`fields` が見る欄を言う。サービスの宣言も同じ形を使う。
+- 引き方は一つである。表の順に結び、先に合った実装が機能を持つ。実機の表を先に、VM の表を後に見る。点数も `probe` の関数も持たない。
+- `attach` は眠ってよい。0 を返すと `N_HAL_RUNNING` になる。負を返すと `N_HAL_FAILED` になる。
 - 失敗した実装も、持ち続ける物を自分で持ってよい。止まらない NVMe に SHN を書く今の輪（`nvme.c:1022-1029`）はそのまま残る。
 - 実装は `attach` の中で `pm_register` を呼ぶ。制御器ごとの `struct pm_device` でも、一つの `struct pm_device` でもよい。
 - `kernel_owned` と `claimed` は IOMMU と claim の判断の事実で、`pci.c` と `pciuser.c` が今のまま持つ。
@@ -106,22 +110,23 @@ USB：
 struct usb_driver {
     const char *name;
     bool (*claims)(const struct usb_interface_desc *intf);
-    void (*attach)(struct usb_device *d, const uint8_t *cfg, unsigned total);
+    bool (*attach)(struct usb_device *d, const uint8_t *cfg, unsigned total);
     void (*detach)(struct usb_device *d);
     void (*work)(struct usb_device *d);
+    const char *(*refuse)(void); /* NULL か、眠りを断る理由 */
 };
 ```
 
 - 表は `kernel/src/dev/usb_drivers.c` に置く。行は `usbhid`、`usbmsc`、`usbnet` である。hub はバスの一部で、表に入らない。
-- `configuration_supported`（`xhci.c:1446`）は `claims` を順に引く。xHCI は class の名を知らなくなる。
-- `usbhid_attach` は `usbmsc_attach` と同じ形に揃える。CDC の二つの interface は、今のとおり `usbnet` が設定の全体を読んで持つ。
-- `struct usb_device` の `void *hid, *msc, *net` は、表の番号で引く `state[]` に換える。
-- 文脈の決まり（`usb.h:5-11`）は今のままである。`attach`、`detach`、`work` は controller の worker で一度に一つ走り、眠ってよい。
-- USB の装置の product の文字は、バスが読んで `hal_name` で渡す。今は `usbhid` と `usbnet` が別々に読む。
+- `configuration_supported`（`xhci.c`）は `claims` を順に引く。xHCI は class の名を知らない。
+- CDC の二つの interface は `usbnet` が設定の全体を読んで持つ。
+- `struct usb_device` の実装の状態は、表の番号で引く `state[]` にある（`usb_drivers.h`）。
+- 文脈の決まりは `usb.h` の頭にある。`attach`、`detach`、`work` は controller の worker で一度に一つ走り、眠ってよい。
+- USB の装置の product の文字は、バスが読んで `hal_name` で渡す。
 
 ほかのバス：
 
-- VMBus の実装は `vm/hv/` の中の表で GUID を引く。
+- VMBus の実装は `vmbus_find` で自分の GUID を引く。channel が一覧に載るのは `on_offer`、外れるのは RESCIND である。
 - 固定のポートの `vm/ata` は `vm_bind_fixed()` が探し、見つけたら `hal_add` と `hal_bound` を呼ぶ。
 
 実装を足すのは、バスの表に一行足すことである。プロセスの実装は、サービスの宣言に行を足す。実装の表は、ドライバーの外で製品の名を並べてよい唯一の場所である。
@@ -129,36 +134,38 @@ struct usb_driver {
 ### 起動の順
 
 ```text
-pci_init()                      列挙。記録を作る。親と node を決める
-iommu_init()                    全部の機能の群を読む。実装より先に走る
-net_init() audio_init() usb_init()   部品の下ごしらえ。装置を探さない
-pci_bind_all()                  表の順に attach を一つずつ呼ぶ
-vm_bind_fixed()                 VM の固定のポートと VMBus
-store_init()                    C: を探す
+pci_init()                 列挙。記録を作り、台帳に載せる。親と node を決める
+iommu_init()               全部の機能の群を読む。実装より先に走る
+net_init() audio_init()    部品の下ごしらえ。装置を探さない
+pci_bind_all()             表の順に attach を一つずつ呼ぶ
+vm_bind_fixed()            VM の固定のポートと VMBus
+fb_pm_init()               画面が電源の変化に加わる。画面の PCI の身元が決まった後
+store_init()               C: を探す
 ```
 
 - `pci_bind_all` は同期である。`store_init` の前に終わる。
-- 表の順は今の `init.c` の順に合わせる。待ちが一番長い `nvme` を最後に置く。
-- `usb_enumerating` の数（`xhci.c:2335`）は xHCI の `attach` で足す。全部の `attach` が `store_init` の前に終わるので、`store.c:310` はそのまま正しい。
+- 待ちが一番長い `nvme` を表の最後に置く。
+- `usb_enumerating` の数は xHCI の `attach` で足す。全部の `attach` が `store_init` の前に終わる。
 - USB の装置は、worker が抜き差しのたびに結ぶ。PCI は列挙の後に増えない。
-- 消えるもの：`ahci_init`、`nvme_init`、`rtl8125_probe`、`vm_net_probe`、`vm_storage_init`、`vm_audio_init`、`vbe_display_init` と、各実装の `pci_count` の輪。
-- 残るもの：`vm_init`。VM の判定と VMBus の起こしを持つ。
+- `vm_init` は VM の判定と VMBus の起こしを持つ。
 
 ### 抜けたとき
 
-- USB：`usb_remove`（`xhci.c:1713`）の順は今のままである。`removed` を立て、drain を止め、class の `detach` を呼び、`hal_remove` を呼び、slot を返す。`hc_restart` はこの全部を待ってから `hc_start` する。
-- VMBus：`on_rescind` で `hal_remove` を呼ぶ。実装の後始末は今のままである。
+- USB：`usb_remove` は `removed` を立て、drain を止め、class の `detach` を呼び、slot を返す。`release_slot` の頭で `hal_remove` を呼ぶ。`hc_restart` はこの全部を待ってから `hc_start` する。
+- VMBus：RESCIND で `hal_remove` を呼ぶ。
 - PCI：抜き差しも AER も今は無い。だから PCI の表に `lost` は無い。作る日に足す。実装が死んだと分かったら `hal_failed` を呼ぶ。
 - 種類の物の決まりは変えない。`struct blkdev` は消えず、`gone` は戻りうる（`ahci.c:1167-1169`）。`struct screen` は消えない（`fb.h:59-60`）。
 - `gone` と `removed` は速い道の今の確かめで、増やさない。
 
 ### 読む口
 
-- プログラムは `n_hal_list` で台帳の写しを読む。`SYS_PCILIST` を置き換える。
-- 変化は watch で知る。
+- プログラムは `n_hal_list(out, max)` か `n_hal_snapshot(&list)` で台帳の写しを読む。戻りは全部の数である。
+- `pcilist` は台帳から PCI の機能だけを写す libc の関数である。`lspci`、`neofetch`、`libnvrm` が使う。
+- 変化は `n_hal_watch` で知る。公開の呼出しではない。
+- 設定の窓の「装置」の頁が読み手である。親の下に子を並べ、動かしている実装か、動かせない理由を見せる。
 - 種類の物は今の口で読む（`n_net_adapters`、`n_audio_outputs`、`n_screen_modes_get`、`N_INPUT_DEVICE`）。項目に `hal_id` を足す。
 - 起動をまたぐ鍵は種類の一覧が今のまま持つ（音の `key`、入力の `id`、網の MAC、画面のモニターの識別子）。台帳は持たない。
-- ディスクの一覧の口は今無い。読み手（設備の頁）を作るときに足す。
+- ディスクの一覧の口は今無い。読み手を作るときに足す。
 
 ## 種類の表
 
@@ -229,29 +236,30 @@ GPU の契約は、この文書で決めない。次の設計 `docs/gpu.md` で�
 - VM の `vm/virtio_gpu` と `vm/vbe` はカーネルの実装で、PCI の機能を `attach` で持つ。
 - データの道は実装で違う。NVK は輪と doorbell を直接使う（`nvkmd_nocturne_rm.c:1354`）。virgl は `SYS_GPU_*` を通る。HAL は形を決めない。
 - `struct n_gpu_driver` は今のままである。`log_*` と `scanout_*` には読み手がある（`nocturne_gl.c:128`、`:476-626`、`js_webgl.c:760`）。代わりの道が決まるまで外さない。
-- サービスの宣言の `function_matches` は、宣言のデータに換える。`client_image` の行き先は GPU の設計で決める。
+- `client_image` の行き先は GPU の設計で決める。
 
 ### CPU
 
-CPU の処理を分ける。`arch/cpu.c` は CPUID の読出しと必須の表だけにする。
-
 | ファイル | 持つもの |
 |---|---|
-| `arch/cpu.c` | CPUID、必須の表、任意の機能の表 |
-| `arch/cpu_amd.c`、`arch/cpu_intel.c` | `struct cpu_maker` の実装：TSC の速さ、性能の要求、機械の検査の差、speculation の差 |
+| `arch/cpu.c` | CPUID、必須の表、任意の機能の表、`cpu_setup` |
+| `arch/cpu_maker.h` | `struct cpu_maker` |
+| `arch/cpu_amd.c`、`arch/cpu_intel.c` | 製造者の実装：TSC の速さ、MSR でしか分からない機能、性能の要求、機械の検査の差、キャッシュと die の読み方 |
 | `arch/mca.c` | 機械の検査の共通の部分 |
 
-- VM は製造者ではない。AMD の上の VM は AMD の実装を使う。機械の検査と speculation の設定は VM でも走り、hypervisor が断った書込みは無いものとして扱う（`cpu.c:290`）。
-- VM で違うのは二つだけである。TSC の速さの申告（`cpu.c:143`）と、CPU が隠す機能の扱い（`cpu.c:183`）である。この二つは `vm/vm.h` の関数で受ける。hypervisor の bit を読むのは `vm/` の中だけにする。
-- 製造者を選ぶのは `cpu_features_init` で一度だけである。遅い操作だけが表を通る。TSC の読出し、EOI、IPI は直接呼ぶ。
-- 必須の表の行には、それが無いと動かないコードがある。AVX-512 は任意へ移す。`arch/fpu.c` は CPU が持つ状態を有効にする。
+- VM は製造者ではない。AMD の上の VM は AMD の実装を使う。機械の検査と speculation の設定は VM でも走り、hypervisor が断った書込みは無いものとして扱う。
+- VM で違うのは二つだけである。TSC の速さの申告と、CPU が隠す機能の扱いである。どちらも `vm_cpu_guest()`（`vm/vm.h`）で受ける。hypervisor の bit を読むのは `vm/` の中だけである。
+- 製造者を選ぶのは `cpu_features_init` で一度だけである。CPUID の leaf 0 の名で引く。表に無い製造者は、操作が全部 `NULL` の実装で動く。
+- 遅い操作だけが表を通る。TSC の読出し、EOI、IPI は直接呼ぶ。
+- 必須の表の行には、それが無いと動かないコードがある。カーネルとプログラムは `-msse2` で組むので、AVX 以上は必須に無い。
+- `arch/fpu.c` は CPU が持つ状態を有効にする。x87 と SSE は必ず、AVX と AVX-512 は CPU が持てば有効にする。RDRAND も任意である。
 - プログラムへの CPU の申告は、入口の像の後ろの読むだけのデータに置く。置き方は時計（`common/clock_data.h`）と同じである。最初の読み手と同時に作る。
 - プログラムは申告を読んで開始時に一度だけ道を選ぶ。呼出しごとに確かめない。
 
 ## プロセスの実装
 
-- サービスの管理者は `n_hal_list` を読み、`HAL_UNBOUND` の PCI の機能を宣言のデータと照らして起こす。行は `pci_match` と同じ形である。実例の引数は記録の住所である（`services.c:275`）。
-- `pci_user_claim` が `hal_bound` を呼ぶ。名前はプログラムの名である。claim の終わりに `hal_unbound` を呼ぶ。だから動いている実装を二度起こさない。
+- サービスの管理者は `n_hal_snapshot` で台帳を読み、`N_HAL_UNBOUND` の PCI の機能を宣言のデータ（`struct n_pci_match`）と照らして起こす。実例の引数は記録の住所である（`user/apps/services.c`）。
+- claim の成功が `hal_bound` を呼ぶ（`dev/pciuser.c`）。名前はプログラムの名である。claim の終わりに `hal_unbound` を呼ぶ。だから動いている実装を二度起こさない。
 - 導入の形式ができたら、宣言はドライバーの包みへ移る。包みで入るのは、今はプロセスの実装の口がある PCI の機能だけである。USB の interface をプロセスで動かす口は、要る日に足す。
 - 装置が firmware を要るなら、実装はそれを読み込んで使う（`nvrm` の GSP がこの形である）。カーネルの実装が要る日も同じである。置き場は実装の持ち物にし、ほかの実装の道を塞がない。
 
@@ -279,13 +287,13 @@ CPU の処理を分ける。`arch/cpu.c` は CPUID の読出しと必須の表�
 
 HAL の部品は速い道に入らない。
 
-| 道 | 今 | この設計 |
-|---|---|---|
-| ストレージの要求 | `struct blkdev` の表を通る | 同じ |
-| 音 | 輪 | 同じ |
-| CPU の遅い操作 | 分岐 | 表を通る。速い道は通らない |
-| 装置の結びつけ | 起動に一度。USB は抜き差しのたび | 同じ |
-| 台帳の読出し | `SYS_PCILIST` | `n_hal_list` |
+| 道 | 通るもの |
+|---|---|
+| ストレージの要求 | `struct blkdev` の表 |
+| 音 | 輪 |
+| CPU の遅い操作 | `struct cpu_maker` の表。TSC、EOI、IPI は通らない |
+| 装置の結びつけ | 実装の表。起動に一度。USB は抜き差しのたび |
+| 台帳の読出し | `n_hal_list`。錠の下で写す |
 
 速い道の費用は、合成とスタックをカーネルの外へ移す決定から来る。HAL の費用ではないが、契約の形に関わるので書く。
 
@@ -324,10 +332,10 @@ HAL の部品は速い道に入らない。
 
 ### 実装できるか
 
-- できる：台帳、PCI の表、USB の表、CPU の分割、`nvme` や `hda` の `attach` への書き換え。`nvme.c` は `nvme_init` の輪を `attach` にして、表に一行足す程度である。
+- 作って動かした：台帳、PCI の表、USB の表、CPU の分割。
 - 新しい NIC の実装：今の `struct netif` で書ける。
 - 新しい GPU の実装：`docs/gpu.md` まで書けない。AMD は特権の半分を書く材料が、許された範囲に見つかっていない（`docs/open.md`）。
-- 動かして確かめられる範囲：QEMU にある NVMe、AHCI、e1000、HD Audio、USB、VGA。USB の抜き差しは HMP の `device_del` で試せる。
+- 動かして確かめられる範囲：QEMU にある NVMe、AHCI、e1000、tulip、HD Audio、AC97、USB、VGA、virtio-vga。USB の抜き差しは HMP の `device_add`、`device_del` で試せる。CPU の機能は `-cpu host,avx512f=off` のように隠して試せる。
 - 動かして確かめられない範囲：S3 は WHPX で戻れない（`qemu-visual.md:68`）。`rtl8125` と `nvrm` は実機だけである。USB のログと写真で見る。
 - virgl は QEMU の側に手で準備した DLL が要り（`ports/virgl/README.md`）、カーネルの門（`test_flag("gpu-enable")`）の後ろにある。GPU の契約を QEMU で動かせるかは確かめていない。
 
@@ -349,7 +357,7 @@ HAL の部品は速い道に入らない。
 
 ## 試す順
 
-1. 枝 `HAL-DEV` で、台帳、PCI の表、USB の表を作る。QEMU で NVMe、AHCI、e1000、HD Audio、USB のキーボードとタブレットとディスクの抜き差し、電源を切る道、休止を動かす。使い捨てにしない。受け入れられたら main へ merge する。
+1. 枝 `HAL-DEV` が受け入れられたら main へ merge する。
 2. 計測の道具：落ちたコマの数え方と時刻の列を今のカーネルに作り、実機の値を USB のログで読む。
 3. `docs/gpu.md` を書く。
 4. 手術の計画：消す範囲、建てる形、閉じる段で見ることを見せる。

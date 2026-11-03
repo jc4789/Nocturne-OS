@@ -918,6 +918,16 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     map 構築も取消対象として追跡し、取消済み範囲に後から PTE を設置しない。
     まだ返却していない構築中 VA へ別 thread が release/protect を要求した場合は `N_ERR_NOT_READY`。
 
+### 装置の台帳
+
+`SYS_HAL_LIST`（`n_hal_list(out, max)`）は、機械で見つかった物の一覧 `struct n_hal_device` を写す。戻りは写した数でなく全部の数である。PCI の機能、USB の装置、VMBus の channel、固定のポートの制御器が載る。`n_hal_snapshot(&list)` は全部を malloc の領域へ写す。
+
+`id` は起動の間、二度と使わない。`parent` は親の `id` で、0 は親なしである。`state` は `N_HAL_UNBOUND`（持っている実装が無い）、`N_HAL_RUNNING`（`driver` が持っている）、`N_HAL_FAILED`（`driver` が持てなかった。理由は `reason`）。`name` は装置が言う名で、言わないなら空である。`at` は `bus` ごとの身元である。
+
+`SYS_HAL_WATCH`（`n_hal_watch()`）は、一覧が変わると知らせる見張りの handle を返す（`n_watch_take`）。
+
+`pcilist(out, max)` は台帳から PCI の機能だけを `struct n_pciinfo` へ写す libc の関数である。戻りは写した数である。
+
 ## 10. 番号と、ほかの節に無い呼出し
 
 欠番：1〜18、20〜25、31〜32、36〜37、44、51〜52、60〜63、90、164、203〜206。ハンドルの種類 12 も

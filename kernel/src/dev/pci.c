@@ -199,7 +199,7 @@ static void device_list(struct pci_device *d) {
     if (d->hal.listed) return;
     if (d->upstream) device_list(d->upstream);
     d->hal.info.at.pci = (struct n_pciinfo){d->bus, d->dev, d->func, d->cls, d->subcls, d->progif, d->vendor, d->device};
-    hal_add(&d->hal, d->upstream ? d->upstream->hal.info.id : 0, N_HAL_BUS_PCI, d->node, class_name(d->cls, d->subcls));
+    hal_add(&d->hal, d->upstream ? d->upstream->hal.info.id : 0, N_HAL_BUS_PCI, d->node, NULL);
 }
 
 void pci_init(void) {

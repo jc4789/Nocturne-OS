@@ -8,7 +8,7 @@
 
 ## 決めたこと（未着手）
 
-- HAL：形は `docs/hal.md`。試作の後に手術の計画を見せる。
+- HAL：形は `docs/hal.md`。試作は枝 `HAL-DEV` にある。受け入れの後に手術の計画を見せる。
 - 窓の管理と合成：カーネルの外のサービスへ移す。カーネルに GPU の汎用の層を置く。
 - 網：TCP/IP を権限の無いサービスへ移す。NIC の実装はカーネルに残し、輪でつなぐ。ソケットは object にする。網の権限は能力の handle で渡す。
 - GPU：virgl と `nvrm` は同じ継ぎ目の後ろの実装にする。試験の門を外す。契約は次の設計 `docs/gpu.md` で決める。
@@ -40,7 +40,7 @@
 - K2：ソケットが object でない（`kernel/src/net/net.c`）。
 - K3：`kernel/src/sys/syscall.c` の受け口に四つの形がある。
 - K4：`kernel/src/dev/pciuser.c` に表示と ACPI の役がある。
-- K5、S1：装置の型と機械全体の一覧が無い（`kernel/src/dev/usb.h` の `void *hub` など）。
+- K5：USB の実装の状態が `void *` である（`kernel/src/dev/usb.h` の `hub`、`state[]`）。
 - K6：RDP がカーネルにある（`kernel/src/vm/rdp.c`）。
 - K8：設定の門が持ち主を名指しする（`kernel/src/sys/settings.c`）。
 - K9：電源でカーネルが郵便箱になる（`SYS_POWER_SAY`）。
@@ -57,7 +57,7 @@
 - S10：シェルが主画面を知らない（`list[0]`）。
 - S12：UI の事象が場所で宛先を指す。
 - S13：文の表がコンパイル時に閉じる。
-- S14：製品の宣言に試験と NVIDIA がある（`user/apps/services.c:65`、`:84`）。
+- S14：製品の宣言に試験と NVIDIA がある（`user/apps/services.c:80`、`:59`）。
 - libc S1、S2：libc が持ち主の無い束で、共有の仕組みが無い。
 - libc S3：TLS が二通りある（`user/include/nocturne.h:412`）。
 - libc S4：起動の ABI に UNIX の形がある（環境、0・1・2、`#!`）。
@@ -79,8 +79,8 @@
 - カーネルの機能は IOMMU を素通りする（`kernel/src/dev/iommu.h:9-10`）。絞る口が無い（`kernel/src/dev/iommu.c:647`）。
 - PCI に抜き差しと AER が無い。
 - ノート PC の内蔵キーボード（i8042、I2C の HID）の実装が無い。
-- AVX-512：必須の表にあるが、我々のコードは実行時に選ばない（`kernel/src/arch/cpu.c`、`Makefile:120` の `-msse2`）。
-- AVX-512：FFmpeg は切ってあり、理由のコメントが今の `fpu.c` と合わない（`ports/ffmpeg/prepare.py:14`、`ports/mesa/README.md:92`）。
+- AVX-512：カーネルは CPU が持てば有効にするが、FFmpeg は切ってある（`ports/ffmpeg/prepare.py`、`Makefile:190`）。我々のコードは実行時に選ばない。
+- 休止から戻ると xHCI が `interrupts never arrive, polling instead` で poll へ落ち、NVMe の `ready again after sleep` が約 5 秒遅れる。変える前の写し（`build/mae.img`）でも同じ。原因の見込みは、戻す callback（`dev/pm.c` の `machine_sleep`）が worker を起こす時に AP がまだ止まっており（`smp_resume` は後）、AP へ向かう MSI-X が失われること。確かめていない。S3 も同じ順である。
 - GPU：ドライバーが動作中に落ちると既定の道へ戻らない（`docs/records/audit-gpu-generic-20261102.md` の F1）。
 - virgl：製品のカーネルで起きない（`kernel/src/vm/virtio_gpu.c:579`）。
 - `build/programs/init` がソースの無い古い出力のまま媒体に載る。

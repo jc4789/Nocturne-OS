@@ -89,7 +89,7 @@ softpipe で描く。`nocturne_gl.c` の `cpu_screen` が llvmpipe を作り、�
   libunwind（`tools/llvm/runtimes/Lib`）を使う。LLVM の庫と compiler-rt の builtins はプログラムの
   結合（`build/libc-objects.list`）だけに入れ、SDK の `libc.a` には入れない。
 - 生成したコードは書き込みと実行を同時に許さないページに置かれ（LLVM の `Memory.inc`）、AVX まで
-  使う（カーネルは YMM を XSAVE で保つ。AVX-512 の状態は保たないので、LLVM は XCR0 を見て使わない）。
+  使う（CPU が持つ状態はカーネルが XSAVES で保つ。LLVM は CPUID と XCR0 を見て選ぶ）。
 
 ## Zink（GPU での WebGL）
 

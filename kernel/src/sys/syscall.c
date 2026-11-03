@@ -49,7 +49,6 @@ _Static_assert(sizeof(struct n_gpu_blit) == 32, "GPU blit ABI");
 _Static_assert(SYS_WATCH_TAKE == 207 && SYS_AUDIO_DEVICE_WATCH < SYS_MAX, "every system call number is below SYS_MAX");
 _Static_assert(sizeof(struct n_pager_fault) == 16 && sizeof(struct n_pager_supply) == 32, "pager ABI");
 
-int pci_list(struct n_pciinfo *out, int max);
 int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
 
 /* ---- user memory access ---- */

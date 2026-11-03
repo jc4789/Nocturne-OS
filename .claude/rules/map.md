@@ -13,7 +13,9 @@
 | 場所 | 役目 |
 |---|---|
 | `boot.c`・`init.c` | 起動の流れ。`kmain` から `kmain_late` へ進み、`C:\Nocturne\System\services` を根の能力つきで起こす。 |
-| `arch/cpu.c`・`tsc_rate.h` | CPUID の唯一の読み手。下限 Zen 4 を照らし、任意の機能（PCID、MWAIT など）の有無と、CPU が申告する TSC の周波数を持つ（書式は社と family ごとに `tsc_rate.h`）。申告が無ければ `sys/clock.c` が測る。どの CPU も `cpu_setup` で同じ初期化をする。 |
+| `arch/cpu.c` | CPUID の読み手。必須の機能の表を照らし、任意の機能（PCID、MWAIT など）の有無と、CPU が申告する TSC の周波数を持つ。申告が無ければ `sys/clock.c` が測る。どの CPU も `cpu_setup` で同じ初期化をする。 |
+| `arch/cpu_maker.h`・`cpu_amd.c`・`cpu_intel.c`・`tsc_rate.h` | 製造者ごとの実装 `struct cpu_maker`：TSC の申告（書式は `tsc_rate.h`）、性能の要求、機械の検査の差、キャッシュと die の読み方。 |
+| `arch/mca.c` | 機械の検査の共通の部分（bank、報告、#MC）。 |
 | `arch/topology.c` | MADT・SRAT・SLIT から CPU・core・LLC・NUMA node と node の距離を数える。CPU の数に上限は無い。 |
 | `arch/smp.c`・`wake.c` | AP の起動、panic のときの NMI による停止、S3 からの復帰。 |
 | `arch/spin.h` | MCS spinlock。 |
@@ -32,6 +34,8 @@
 | `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console（文字を出し、窓の管理が無い機械のキーの押下を渡す）と system log の stream、profiler。 |
 | `sys/settings.c` | 設定の門。領域と鍵の番号の表で持ち主へ渡す（`SYS_SETTINGS_*`、番号は `common/settings_abi.h`）。カーネルは保存しない。 |
 | `fs/` | C: の store の実行側。mount とパスの操作とパスの権限は `store.c`、開いた文書と私的な領域は `document.c`、block cache は `cache.c`、変更の watch は `watch.c`、起動の記録 `settings.rec` は `bootrecord.c`。書式のエンジンは `common/store/`。 |
+| `dev/hal.c` | 台帳：機械で見つかった物の一覧と、持っている実装と、失敗の理由（`SYS_HAL_LIST`、`SYS_HAL_WATCH`）。形は `docs/hal.md`。 |
+| `dev/pci_drivers.c`・`usb_drivers.c` | バスごとの実装の表。VM の実装は `vm_pci_drivers()`。 |
 | `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音の出口（`audio` が一覧と一つの open、`hda`・`hda_codec` が High Definition Audio。混合と選択はサービス `audio`）、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（`input` が装置の一覧と装置ごとの値、速さと向きの適用。`usbhid` は HID の usage を渡す）、`serial`、`refclock`（HPET か ACPI PM timer と、RTC）、電源と hibernate。 |
 | `net/` | `net.c`（Ethernet から IP、UDP、TCP まで。adapter の一覧と経路の表）と `rtl8125.c`（実機の NIC）。住所の決め方と名前引きはサービス `network`。 |
 | `gui/` | `wm.c`（窓管理、画面ごとの合成のスレッド、シェルの口 `SYS_SHELL_*`、画面の配置の適用 `SYS_SCREEN_ARRANGE`）、`pointer.c`（ポインターの絵）、`screenmode.c`（画面ごとのモードの一覧と望みを運ぶ。選ばない）。文を言わず、タスクバーも壁紙も持たない。 |
@@ -41,7 +45,7 @@
 
 | 場所 | 役目 |
 |---|---|
-| `abi.h` | syscall の番号 `SYS_*`、結果 `N_ERR_*`、入口の溝、公開の呼出し `N_PUBLIC_CALLS`、世代と刻印、スレッドの区画。仕様は `docs/nocturne-native-abi.md`。 |
+| `abi.h` | syscall の番号 `SYS_*`、結果 `N_ERR_*`、入口の溝、公開の呼出し `N_PUBLIC_CALLS`、台帳の記録 `struct n_hal_device`、世代と刻印、スレッドの区画。仕様は `docs/nocturne-native-abi.md`。 |
 | `clock_data.h` | 像の中の時計のデータの形。カーネルと `kernel/entry/clock.c` だけが読む。 |
 | `authority_abi.h` | 身元 `struct n_identity`、級 `enum n_class`、能力 `enum n_cap`、サービスの要求の形。 |
 | `services_abi.h` | 管理者・`accounts`・`session`・`machine` の口の型。 |
@@ -69,7 +73,7 @@
 | `apps/network.c`・`apps/timesync.c` | サービス `network`（DHCP、固定の住所、経路、名前引きと cache）とサービス `timesync`（SNTP、時計と RTC）。 |
 | `apps/settingsd.c`・`settings_table.h` | サービス `settings`：選択の保存、宣言の表、型と範囲と権限の確かめ、見張り、期限つきの試し。領域の意味を持たない。 |
 | `apps/audio.c` | サービス `audio`：出口と形式の選択、流れの変換と混合、音量、消音。流れの口は `libc/audio.c`。 |
-| `apps/settings.c` | 設定の窓。宣言の表から頁を組む。音、画面、窓、入力（つながっている装置ごとの札）、電源、網、時刻、言語と地域、起動、サービス、利用者、アプリ。 |
+| `apps/settings.c` | 設定の窓。宣言の表から頁を組む。音、画面、窓、入力（つながっている装置ごとの札）、電源、網、時刻、言語と地域、起動、装置（台帳）、サービス、利用者、アプリ。 |
 | `libc/keymap.c` | 文字の持ち主。`n_key_translate` が HID の usage と配列から文字か `NKEY_*` を作る。`win_event` が呼ぶ。配列の表はここだけ。 |
 | `libc/language.c`・`include/nocturne_language.h` | 言語と地域の読み手と書式（`n_locale_*`）、ISO C の `setlocale`・`localeconv`。値は領域 `N_DOMAIN_LANGUAGE`。 |
 | `apps/shell_words.h`・`apps/settings_words.h` | シェルと設定の窓の文の表。行は `enum n_language` の順。 |
@@ -106,7 +110,7 @@
 ## 境界
 
 - syscall の番号と型は `common/abi.h`。画面と GPU は `display_abi.h` と `gpu_abi.h`。
-- アプリのドライバーは `SYS_PCI_*`・`SYS_DMA_*` から `dev/pciuser.c` へ。claim は `N_CAP_PCI_CLAIM` の能力で行う。`user/apps/services.c` の `gpu` の項目が NVIDIA の表示の機能ごとに `nvrm` を起こし、`nvrm` が自分で claim する。
+- アプリのドライバーは `SYS_PCI_*`・`SYS_DMA_*` から `dev/pciuser.c` へ。claim は `N_CAP_PCI_CLAIM` の能力で行う。`user/apps/services.c` の `gpu` の項目が、台帳の空いた PCI の機能のうち宣言のデータ（`struct n_pci_match`）に合うものごとに `nvrm` を起こし、`nvrm` が自分で claim する。
 - 特権は能力の handle か身元の級で確かめる（`sys/authority.h`）。境界の検査は `tests/check_boundaries.py`。
 - VM の処理は `kernel/src/vm/vm.h` が唯一の入口。実機では何もせずに戻る。裏に `hyperv.c`、`hv/`（VMBus、storvsc、netvsc）、`rdp.c`、VM の装置（ata、ac97、e1000、tulip、vbe）、`virtio_gpu.c` がある。`vm/` の外は `vm/vm.h` だけを include する。
 - syscall の道：

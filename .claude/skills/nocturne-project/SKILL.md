@@ -14,7 +14,7 @@ description: Nocturne OS の実物を動かして確かめる手順：ビルド�
   - `qemu-image`：img だけ。`build/nocturne.img` を増分で上書きする。確かめはこれ。
   - `all`：vhdx・iso も作る（起動は UEFI だけ）。Hyper-V へ渡すときと、頼まれたときだけ。
   - `kernel`、`user`：その部分だけ。
-  - `run`（`build/run.img`）は `QEMU_ACCEL` の既定が tcg で、Zen 4 の下限を満たす CPU にならないので使わない。
+  - `run`（`build/run.img`）は `QEMU_ACCEL` の既定が tcg で、必須の機能の表（`kernel/src/arch/cpu.c`）を満たす CPU にならないので使わない。
 - 二つ目の媒体は一度に一つ：変える前の写し `build/mae.img`。要らなくなったら同じ名で上書きして使い回す。
 - 媒体の中身：`scripts/layout.py` が `build/c.list` を書き、`build/host/store.exe fill` が C: に詰める。ソースを戻しても媒体は戻らない。
 - 撮った画像と serial.log は、この会話の作業場（システムプロンプトにある scratchpad の場所）。build の下ではない。残す値は `docs/records/` に文章と数字で書く。
@@ -47,7 +47,7 @@ description: Nocturne OS の実物を動かして確かめる手順：ビルド�
 - 機械は実機の形：q35（PCIe の ECAM）、UEFI（edk2）、NVMe。`<作業場>/vars.fd` は起動の前に `C:/Program Files/qemu/share/edk2-i386-vars.fd` を写した UEFI の変数（x86_64 の版は QEMU に無い）。写す命令と `nocturne.img` を同じ行に書くとフックが媒体の写しと読んで止めるので、行を分ける。SATA の道を試すときは `-device ahci,id=ahci` と `-device ide-hd,drive=boot,bus=ahci.0,bootindex=0` を NVMe の代わりに。
 - 起動する前に、動いている QEMU の数を見る。二台動いていれば三台目を起動せず、どちらかを `quit` する。二台目は別の HMP と QMP のポート（`-monitor tcp:127.0.0.1:45456`、`-qmp tcp:127.0.0.1:45457`）と別名の serial（`<作業場>/serial-2.log`）と vars（`<作業場>/vars-2.fd`）で起こす（同じ img を `snapshot=on` で二台が読んでよい）。速さを測る回は一台だけ動かし、もう一台は `quit` する（RAM と CPU を取り合うと値が歪む）。
 - **窓が出たことを確かめる。** `powershell -c "Get-Process qemu-system-x86_64 | Select-Object Id,MainWindowHandle"` で MainWindowHandle が 0 でないこと。`-display none`・`-nographic` を付けない。ユーザーはその窓を見て、自分でも触る。
-- `-cpu host` は外さない。CPU の下限は Zen 4 で、WHPX はこれで XSAVE・AVX-512・FSGSBASE・INVPCID・SMEP・SMAP・x2APIC を見せる（PCID は見せない。起動の行 `cpu: cpuid …` で確かめられる）。付けないと「QEMU Virtual CPU version 2.5+」になり、下限を満たさない。
+- `-cpu host` は外さない。必須の機能の表は `kernel/src/arch/cpu.c` にあり、WHPX はこれで XSAVES・FSGSBASE・INVPCID・SMEP・SMAP・x2APIC を見せる。任意の機能は `-cpu host,avx512f=off` のように隠して試せる（PCID は見せない。起動の行 `cpu: cpuid …` で確かめられる）。付けないと「QEMU Virtual CPU version 2.5+」になり、下限を満たさない。
 - 起動は `serial.log` の `store: C: "…" on nvme0` で確かめる（UEFI と Limine の待ちを含めて十数秒）。数秒で出なければ待たずに異常として扱う。
 - HMP（TCP 45454）へ一行ずつ送る：`screendump "<作業場>/now.png" -f png`（スラッシュ区切りの絶対 path）、`sendkey ctrl-l`（キーは USB のキーボードへ届く）。撮った PNG は自分で開いて見る。固定秒数の一発スクリプトや、デスクトップの computer-use の撮影で代用しない。
 - 指は USB の tablet（絶対座標）。PS/2 は無いので HMP の `mouse_move`（相対）は効かない。QMP（TCP 45455）で `qmp_capabilities` の後に `input-send-event` を送る：位置は `{"type":"abs","data":{"axis":"x","value":…}}` と y（0〜32767 に画面の画素を写す。2560×1440 なら x×32767/2560）、押しは `{"type":"btn","data":{"down":true,"button":"left"}}` と `false`。起動の直後の最初の事象は落ちることがあるので、先に一度動かしてから押す。

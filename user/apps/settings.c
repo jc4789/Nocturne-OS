@@ -22,11 +22,12 @@
 #define TOKEN_SERVICES (TOKEN_SETTINGS + 3)
 #define TOKEN_NETWORK (TOKEN_SETTINGS + 4)
 #define TOKEN_INPUTS (TOKEN_SETTINGS + 5)
+#define TOKEN_HARDWARE (TOKEN_SETTINGS + 6)
 
 static uint32_t language; /* enum n_language：見張りが今に保つ */
 #define WORD(w) settings_words[w][language]
 
-enum page { P_AUDIO, P_DISPLAY, P_WINDOW, P_INPUT, P_POWER, P_NETWORK, P_TIME, P_LANGUAGE, P_BOOT, P_SERVICES, P_USERS, P_PROGRAMS, P_COUNT };
+enum page { P_AUDIO, P_DISPLAY, P_WINDOW, P_INPUT, P_POWER, P_NETWORK, P_TIME, P_LANGUAGE, P_BOOT, P_HARDWARE, P_SERVICES, P_USERS, P_PROGRAMS, P_COUNT };
 static const struct {
     enum settings_word label;
     const char *icon;
@@ -41,6 +42,7 @@ static const struct {
     [P_TIME] = {W_P_TIME, "clock", N_DOMAIN_TIME},
     [P_LANGUAGE] = {W_P_LANGUAGE, "settings", N_DOMAIN_LANGUAGE},
     [P_BOOT] = {W_P_BOOT, "settings", N_DOMAIN_BOOT},
+    [P_HARDWARE] = {W_P_HARDWARE, "settings", N_SETTING_ANY},
     [P_SERVICES] = {W_P_SERVICES, "settings", N_SETTING_ANY},
     [P_USERS] = {W_P_USERS, "settings", N_SETTING_ANY},
     [P_PROGRAMS] = {W_P_PROGRAMS, "settings", N_SETTING_ANY},
@@ -284,6 +286,77 @@ static void screen_make_main(void) {
     uint32_t reason = N_SETTING_OK;
     n_result r = n_setting_set(n_setting_at(N_DOMAIN_DISPLAY, N_DISPLAY_PRIMARY), &screen_device_id, sizeof screen_device_id, &reason);
     said(r, reason);
+}
+
+/* ---- 装置 ---- */
+/* 台帳（n_hal_list）を、親の下に子が続く順に並べたもの。 */
+struct hardware_row {
+    struct n_hal_device d;
+    unsigned depth;
+};
+static struct hardware_row *hardware;
+static size_t hardware_count;
+
+static void hardware_walk(const struct n_hal_device *list, size_t count, uint32_t parent, unsigned depth) {
+    for (size_t i = 0; i < count; i++) {
+        if (list[i].parent != parent) continue;
+        hardware[hardware_count++] = (struct hardware_row){list[i], depth};
+        hardware_walk(list, count, list[i].id, depth + 1);
+    }
+}
+
+static void hardware_load(void) {
+    struct n_hal_device *list;
+    n_result count = n_hal_snapshot(&list);
+    if (count < 0) {
+        snprintf(status, sizeof status, "%s", n_result_text(count));
+        status_bad = true;
+        return;
+    }
+    free(hardware);
+    hardware = calloc(count ? (size_t)count : 1, sizeof *hardware);
+    hardware_count = 0;
+    if (hardware) hardware_walk(list, (size_t)count, 0, 0);
+    free(list);
+}
+
+/* 自分の名を言わない装置の呼び名。 */
+static const char *hardware_kind(const struct n_hal_device *d) {
+    if (d->bus == N_HAL_BUS_USB) return WORD(W_HW_USB);
+    if (d->bus != N_HAL_BUS_PCI) return WORD(W_HW_OTHER);
+    switch (d->at.pci.cls) { /* PCI Code and ID Assignment の基本の級 */
+    case 0x01: return WORD(W_HW_STORAGE);
+    case 0x02: return WORD(W_HW_NETWORK);
+    case 0x03: return WORD(W_HW_DISPLAY);
+    case 0x04: return WORD(W_HW_MEDIA);
+    case 0x06: return WORD(W_HW_BRIDGE);
+    case 0x0C: return WORD(W_HW_SERIAL_BUS);
+    default: return WORD(W_HW_OTHER);
+    }
+}
+
+static void hardware_where(const struct n_hal_device *d, char *out, size_t cap) {
+    switch ((enum n_hal_bus)d->bus) {
+    case N_HAL_BUS_PCI:
+        snprintf(out, cap, "PCI %02x:%02x.%x  %04x:%04x", d->at.pci.bus, d->at.pci.dev, d->at.pci.func, d->at.pci.vendor,
+                 d->at.pci.device);
+        break;
+    case N_HAL_BUS_USB: snprintf(out, cap, "USB %04x:%04x", d->at.usb.vendor, d->at.usb.product); break;
+    case N_HAL_BUS_VMBUS: snprintf(out, cap, "VMBus"); break;
+    case N_HAL_BUS_PORT: snprintf(out, cap, "I/O %x", d->at.port.base); break;
+    }
+}
+
+/* 橋は動かすものが無くて当たり前なので、何も言わない。 */
+static void hardware_state(const struct n_hal_device *d, char *out, size_t cap) {
+    out[0] = 0;
+    switch ((enum n_hal_state)d->state) {
+    case N_HAL_UNBOUND:
+        if (d->bus != N_HAL_BUS_PCI || d->at.pci.cls != 0x06) snprintf(out, cap, "%s", WORD(W_HW_UNBOUND));
+        break;
+    case N_HAL_RUNNING: snprintf(out, cap, WORD(W_HW_RUNNING), d->driver); break;
+    case N_HAL_FAILED: snprintf(out, cap, WORD(W_HW_FAILED), d->driver, n_result_text(d->reason)); break;
+    }
 }
 
 /* ---- サービス ---- */
@@ -1057,6 +1130,23 @@ static void link_card(struct ui_msg *m, uint32_t index) {
     ui_end(m);
 }
 
+static void hardware_page(struct ui_msg *m) {
+    for (size_t i = 0; i < hardware_count; i++) {
+        const struct n_hal_device *d = &hardware[i].d;
+        char where[48], state[128], key[16];
+        hardware_where(d, where, sizeof where);
+        hardware_state(d, state, sizeof state);
+        snprintf(key, sizeof key, "%u", d->id);
+        ui_node(m, "column"); ui_nums(m, "padding", (double[]){0, 0, 0, 24.0 * hardware[i].depth}, 4); ui_str(m, "key", key);
+            ui_node(m, "card"); ui_num(m, "gap", 4);
+                text_node(m, d->name[0] ? d->name : hardware_kind(d), "heading", 0);
+                text_node(m, where, "caption", 0);
+                if (state[0]) text_node(m, state, "caption", d->state == N_HAL_FAILED ? ui_theme.warning : 0);
+            ui_end(m);
+        ui_end(m);
+    }
+}
+
 static void services_page(struct ui_msg *m) {
     if (!service_count) text_node(m, WORD(W_NO_SERVICES), "caption", 0);
     for (uint32_t i = 0; i < service_count; i++) {
@@ -1279,7 +1369,8 @@ static void show(struct ui_session *ui) {
             ui_node(&m, "scroll"); ui_num(&m, "grow", 1); ui_nums(&m, "padding", (double[]){26, 30}, 2); ui_num(&m, "gap", 14);
             ui_str(&m, "key", WORD(pages[page].label));
                 text_node(&m, WORD(pages[page].label), "title", 0);
-                if (page == P_SERVICES) services_page(&m);
+                if (page == P_HARDWARE) hardware_page(&m);
+                else if (page == P_SERVICES) services_page(&m);
                 else if (page == P_USERS) users_page(&m);
                 else if (page == P_PROGRAMS) programs_page(&m);
                 else {
@@ -1306,6 +1397,7 @@ static void show(struct ui_session *ui) {
 static void page_open(enum page p) {
     page = p;
     say("", false);
+    if (p == P_HARDWARE) hardware_load();
     if (p == P_SERVICES) services_load();
     if (p == P_USERS) accounts_load();
     if (p == P_PROGRAMS) programs_load();
@@ -1531,6 +1623,8 @@ int main(void) {
     n_handle sound_watch = n_audio_output_watch();
     if (sound_watch >= 0) n_events_watch(queue, sound_watch, N_EVENT_RECEIVABLE, TOKEN_SOUND);
     services_watch_open(queue);
+    n_handle hardware_watch = n_hal_watch();
+    if (hardware_watch >= 0) n_events_watch(queue, hardware_watch, N_EVENT_RECEIVABLE, TOKEN_HARDWARE);
     n_handle network_watch = n_net_watch();
     if (network_watch >= 0) n_events_watch(queue, network_watch, N_EVENT_RECEIVABLE, TOKEN_NETWORK);
     shown_load();
@@ -1576,6 +1670,11 @@ int main(void) {
             case TOKEN_INPUTS:
                 n_watch_take(inputs_watch);
                 if (page == P_INPUT) inputs_read();
+                redraw = true;
+                break;
+            case TOKEN_HARDWARE:
+                n_watch_take(hardware_watch);
+                if (page == P_HARDWARE) hardware_load();
                 redraw = true;
                 break;
             case TOKEN_SCREEN:

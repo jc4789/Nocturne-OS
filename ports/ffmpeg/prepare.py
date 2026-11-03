@@ -11,8 +11,7 @@ LEGACY_DEMUXERS='mp3,flac,wav,avi,mov,aac'
 LEGACY_PARSERS='mpegaudio,flac,mjpeg,h264,aac'
 
 # x86-64 SIMD: standalone NASM + inline asm, chosen at run time by libavutil/x86/cpu.c
-# (cpuid/xgetbv); there is no fixed -march. AVX-512 stays off because Nocturne's XCR0
-# holds only x87|SSE|AVX (no opmask/ZMM state), so those paths could never be used safely.
+# (cpuid/xgetbv); there is no fixed -march. AVX-512 is off in this configuration (docs/open.md).
 # --malloc-prefix routes libavutil/mem.c (av_malloc: posix_memalign, 32-byte SIMD alignment) to
 # Nocturne's media allocator (user/libc/media_alloc.c), the same prefix the Makefile passes to mem.o.
 SIMD_ARGS=['--enable-x86asm','--x86asmexe=nasm','--enable-runtime-cpudetect','--disable-avx512','--disable-avx512icl',
