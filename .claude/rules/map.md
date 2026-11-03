@@ -87,7 +87,7 @@
 | `rootfs/` | C: にそのまま入るもの（`Nocturne\`）と、新しい利用者のフォルダーの元（`NewUser\`、C: の `Nocturne\NewUser`）。 |
 | `scripts/` | ビルド、媒体、生成、Hyper-V の道具。 |
 | `tests/` | ゲストの試験（`runtests.c`）、試験の媒体のサービス（`testrun.c`）、WPT の runner、ホストの検査 `check_*.py`（`check_hda_codec.py` は codec の表で widget の木を試す）。 |
-| `docs/` | 仕様 `nocturne-native-abi.md`、開いている所見と決めたこと `open.md`、過去の記録 `records/`（台帳 `*/LEDGER.md`、監査、日付入りの報告）。 |
+| `docs/` | 仕様 `nocturne-native-abi.md`、HAL の設計 `hal.md`、開いている所見と決めたこと `open.md`、過去の記録 `records/`（台帳 `*/LEDGER.md`、監査、日付入りの報告）。 |
 | `build/`・`tools/`・`hyperv/`・`local/`・`.codegraph/` | git の外。ビルドの出力、同梱の道具、Hyper-V のディスク、GSP の firmware、codegraph の索引。 |
 
 ## 生成物
