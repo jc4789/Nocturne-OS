@@ -46,7 +46,7 @@ for case in json.loads((wpt / "url/resources/urltestdata.json").read_text("utf-8
     if seen.setdefault(href, entry) != entry:
         raise SystemExit(f"{href}: two different expectations")
 wpt_count = len(seen)
-# Serializations a layer was seen to refuse before it read the record (docs/browser/LEDGER.md
+# Serializations a layer was seen to refuse before it read the record (docs/records/browser/LEDGER.md
 # K80, K94): a domain with '_' (no forbidden domain code point) and '\' in a special URL's query
 # and fragment (neither percent-encode set has it), as the URL Standard serializes them.
 for entry in [("https://a_b.example.test:8443/log/web?a\\b|c#d\\e", "https://a_b.example.test:8443",

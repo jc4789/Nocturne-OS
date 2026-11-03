@@ -568,7 +568,7 @@ $(BUILD)/sdk.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC
 	@touch $@
 
 # ---------------------------------------------------------------- images
-.PHONY: all kernel kernel-test user cxx lexbor image qemu-image run clean
+.PHONY: all kernel kernel-test user cxx lexbor image qemu-image run clean check
 .SECONDARY:
 all: image
 
@@ -579,7 +579,12 @@ user: $(APP_BINS) $(NVRM_FILES) $(PROGRAMS)/tcc $(BUILD)/tests/testrun
 cxx: $(CPP_BINS) $(LICENSES)/libcxx/LICENSE.TXT
 lexbor: $(LXB_OBJ)
 
-# NVIDIA GSP firmware for nvrm (docs/nvidia/LEDGER.md D9), C:\Nocturne\Firmware\NVIDIA\<version>.
+# The checks on the sources alone. Nothing builds on them: they run when a piece of work closes.
+check:
+	@$(PY) -X utf8 tests/check_boundaries.py
+	@$(PY) -X utf8 tests/check_settings.py
+
+# NVIDIA GSP firmware for nvrm (docs/records/nvidia/LEDGER.md D9), C:\Nocturne\Firmware\NVIDIA\<version>.
 # It is never in git and never distributed: a copy unpacked into local/ (ignored) goes onto disks
 # built on this machine, and disks get none without it. NVIDIA_FIRMWARE= leaves it out explicitly.
 NVIDIA_FIRMWARE ?= $(LOCAL)/firmware/nvidia/615.78.08

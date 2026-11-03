@@ -531,7 +531,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - 音声：サービス audio の流れで鳴らす（§17）。
 - システムログ：`n_system_log(buf, cap)` か `n_system_log_open()` のハンドルの
   `n_channel_receive` で読み、そのハンドルへ `n_channel_send` で書く（§4）。
-- アプリの中の装置ドライバー（例：NVIDIA の資源管理 `C:\Nocturne\System\nvrm`、`docs/nvidia/LEDGER.md`）：
+- アプリの中の装置ドライバー（例：NVIDIA の資源管理 `C:\Nocturne\System\nvrm`、`docs/records/nvidia/LEDGER.md`）：
   - `n_pci_claim(cap, bus, dev, func)` は PCI 機能を動かす権利（`N_KIND_PCI`）を返す。`cap` は
     `N_CAP_PCI_CLAIM`（§13）で、サービスの管理者が宣言のあるドライバーアプリにだけ渡す。カーネルのドライバーが使う
     機能と、既に権利のある機能は `N_ERR_BUSY`。同じ group の機能をカーネルのドライバーが使って

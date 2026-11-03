@@ -5,7 +5,7 @@ paths:
   - "user/include/web.h"
   - "user/libc/webnet.c"
   - "user/apps/webfetch.c"
-  - "docs/browser/**"
+  - "docs/records/browser/**"
 ---
 # ブラウザーの領域に触れたとき
 
@@ -32,4 +32,4 @@ paths:
 - 仕様の原文は `fetch.spec.whatwg.org` など、WPT は `D:\Programes\cloned repos\wpt`。
 - 箱・run・deco の装い（st）は節の装いの arena を借りる。外す・入れ直す・release の前後は覚え書きを読む。
 - 描画の途中の中断点は窓の画布に描くことがある。並列の段に service を渡してよいのは私的な緩衝だけに書く段。
-- `docs/browser/LEDGER.md` は記録。今の状態は盤（`ban`）。
+- `docs/records/browser/LEDGER.md` は記録。今の状態は盤（`ban`）。

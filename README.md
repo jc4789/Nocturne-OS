@@ -432,7 +432,7 @@ fetch -o C:\Users\<名前>\Downloads\1mb.zip http://speedtest.tele2.net/1MB.zip
 
 ## Web ブラウザー
 
-![Wikipedia を表示している Web ブラウザー](docs/browser.png)
+![Wikipedia を表示している Web ブラウザー](docs/records/browser.png)
 
 デスクトップかスタートメニューの **Web ブラウザー**、または `browser URL`（`browser C:\パス\file.html`）で開きます。
 ファイルは `.html` をブラウザーで開きます。最初のページは検索欄とリンク集です。窓ごとに 1 つの処理で、
@@ -492,13 +492,13 @@ fetch -o C:\Users\<名前>\Downloads\1mb.zip http://speedtest.tele2.net/1MB.zip
 - 2026-10-13：DuckDuckGo の検索と結果のリンク、Reddit の検索、GitHub のメニュー、百度百科の表示。
 - 2026-10-14：百度百科の本文・画像・検索・戻る進む。YouTube は再生、一時停止、シーク、スクロールまで動きましたが、
   途中の停止や字幕の重なりが残りました。CNN はトップページが表示され、動画ページは黒いままでした
-  （[記録](docs/browser-wasm-delivery-20261014.md)）。
+  （[記録](docs/records/browser-wasm-delivery-20261014.md)）。
 - 2026-10-16：Puter の Firefox（WebAssembly）が既定の GPU 描画で起動しました。
 
 **まだできないこと**：TLS 1.3、Service Worker、WebRTC、Web Audio、WebGPU、モジュール Worker、
 `position: sticky`、3D の変形、`clip-path` などの多くのプロパティ、OpenType の完全な文字整形と可変フォント、
 AV1 と HDR、RSA・楕円曲線の署名、ダウンロードとブックマークの UI。重いページではレイアウトに数秒かかることがあります。
-対応の空白は [docs/browser-missing-20261012.md](docs/browser-missing-20261012.md) にまとめています
+対応の空白は [docs/records/browser-missing-20261012.md](docs/records/browser-missing-20261012.md) にまとめています
 （その後に対応したものも含みます）。
 
 ## 開発
@@ -527,7 +527,7 @@ tcc は自分自身もコンパイルでき、そのソースから OS の中で
 ホストの clang で Nocturne 向けの C++20 アプリをクロスコンパイルできます。`user/apps/*.cpp` を置き、
 `python -X utf8 scripts/build.py cxx` でビルドします。C の API はそのまま呼べます。OS の中で `cppdemo` を起動すると、
 libc++ の文字列・コンテナーと C の GUI API を使う例が動きます。例外、RTTI、iostream、スレッドなどは使えません。
-詳しくは [docs/cpp-support.md](docs/cpp-support.md) を参照してください。
+詳しくは [docs/records/cpp-support.md](docs/records/cpp-support.md) を参照してください。
 
 ### Go
 

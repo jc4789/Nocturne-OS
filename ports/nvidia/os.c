@@ -1003,7 +1003,7 @@ void NV_API_CALL nv_destroy_nano_timer(nv_state_t *nv, nv_nano_timer_t *timer) {
  * GSP firmware
  *
  * RM asks for gsp_<family>.bin, ucodes_<family>.bin and gsp_log_<family>.bin. The files are
- * not distributed with Nocturne (docs/nvidia/LEDGER.md D9); a disk built with them (the
+ * not distributed with Nocturne (docs/records/nvidia/LEDGER.md D9); a disk built with them (the
  * Makefile's NVIDIA_FIRMWARE) has them in C:\Nocturne\Firmware\NVIDIA\<version>.
  * ---------------------------------------------------------------------------------------- */
 struct nvrm_firmware {

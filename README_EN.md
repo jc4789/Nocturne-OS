@@ -426,7 +426,7 @@ Limits: no IPv6, no IP fragmentation, no TCP SACK or timestamps. One network ada
 
 ## The web browser
 
-![The web browser showing Wikipedia](docs/browser.png)
+![The web browser showing Wikipedia](docs/records/browser.png)
 
 Open **Web Browser** from the desktop or the start menu, or run `browser URL` (or `browser C:\path\file.html`).
 Files opens `.html` files in it. It starts on a page with a search box and links. Each window is one process;
@@ -490,13 +490,13 @@ not a guarantee.
 - 2026-10-13: DuckDuckGo search and result links, Reddit search, GitHub's menus, Baidu Baike pages.
 - 2026-10-14: Baidu Baike text, images, search and back/forward. YouTube played, paused, seeked and scrolled, but
   stalls and overlapping captions remained. CNN's front page showed, and its video page stayed black
-  ([record](docs/browser-wasm-delivery-20261014.md), in Japanese).
+  ([record](docs/records/browser-wasm-delivery-20261014.md), in Japanese).
 - 2026-10-16: Puter's Firefox (WebAssembly) started with its default GPU rendering.
 
 **Not there yet**: TLS 1.3, Service Workers, WebRTC, Web Audio, WebGPU, module Workers, `position: sticky`,
 3D transforms, many properties such as `clip-path`, full OpenType shaping and variable fonts, AV1 and HDR, RSA and
 elliptic-curve signatures, and download and bookmark UI. Layout can take seconds on heavy pages. The gaps are listed
-in [docs/browser-missing-20261012.md](docs/browser-missing-20261012.md) (in Japanese; some have been filled since).
+in [docs/records/browser-missing-20261012.md](docs/records/browser-missing-20261012.md) (in Japanese; some have been filled since).
 
 ## Development
 
@@ -524,7 +524,7 @@ tcc can also compile itself: its own source rebuilds inside the OS into a workin
 The host's clang cross-compiles C++20 apps for Nocturne. Put them in `user/apps/*.cpp` and build with
 `python -X utf8 scripts/build.py cxx`; they can call the C APIs directly. Run `cppdemo` inside the OS for an example
 using libc++ strings and containers together with the C GUI API. Exceptions, RTTI, iostream, threads and some other
-parts are not available. See [docs/cpp-support.md](docs/cpp-support.md) (in Japanese).
+parts are not available. See [docs/records/cpp-support.md](docs/records/cpp-support.md) (in Japanese).
 
 ### Go
 

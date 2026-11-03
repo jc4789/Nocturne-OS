@@ -8,7 +8,7 @@
    one message: the header, then the escape's argument struct exactly as RM's rm_ioctl takes it
    (NVOS21_PARAMETERS, nv_ioctl_nvos33_parameters_with_fd, ...). Pointers inside those arguments
    are client addresses inside the arena; nvrm translates them and refuses any other address, so
-   no app reaches into another's memory (docs/nvidia/LEDGER.md D4). The reply is the header and
+   no app reaches into another's memory (docs/records/nvidia/LEDGER.md D4). The reply is the header and
    the argument struct as RM left it. A reply to NV_ESC_RM_MAP_MEMORY carries the mapped memory as
    an attached shared object: `offset` is where the mapping starts in it, `bytes` its length. */
 #define NVRM_CHANNEL "nocturne.nvidia.rm" /* サービスの名前の頭（n_service_connect） */

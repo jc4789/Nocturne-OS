@@ -17,7 +17,7 @@ description: Nocturne OS の実物を動かして確かめる手順：ビルド�
   - `run`（`build/run.img`）は `QEMU_ACCEL` の既定が tcg で、Zen 4 の下限を満たす CPU にならないので使わない。
 - 二つ目の媒体は一度に一つ：変える前の写し `build/mae.img`。要らなくなったら同じ名で上書きして使い回す。
 - 媒体の中身：`scripts/layout.py` が `build/c.list` を書き、`build/host/store.exe fill` が C: に詰める。ソースを戻しても媒体は戻らない。
-- 撮った画像と serial.log は、この会話の作業場（システムプロンプトにある scratchpad の場所）。build の下ではない。残す値は `docs/` に文章と数字で書く。
+- 撮った画像と serial.log は、この会話の作業場（システムプロンプトにある scratchpad の場所）。build の下ではない。残す値は `docs/records/` に文章と数字で書く。
 - ログの行の一覧と取り方：[references/logs.md](references/logs.md)。QEMU の起動・窓の確認・HMP・落とし穴：[references/qemu-visual.md](references/qemu-visual.md)。
 
 ## 進め方

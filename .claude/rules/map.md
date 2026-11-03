@@ -87,7 +87,7 @@
 | `rootfs/` | C: にそのまま入るもの（`Nocturne\`）と、新しい利用者のフォルダーの元（`NewUser\`、C: の `Nocturne\NewUser`）。 |
 | `scripts/` | ビルド、媒体、生成、Hyper-V の道具。 |
 | `tests/` | ゲストの試験（`runtests.c`）、試験の媒体のサービス（`testrun.c`）、WPT の runner、ホストの検査 `check_*.py`（`check_hda_codec.py` は codec の表で widget の木を試す）。 |
-| `docs/` | 仕様 `nocturne-native-abi.md`、台帳 `*/LEDGER.md`、日付入りの報告。 |
+| `docs/` | 仕様 `nocturne-native-abi.md`、開いている所見と決めたこと `open.md`、過去の記録 `records/`（台帳 `*/LEDGER.md`、監査、日付入りの報告）。 |
 | `build/`・`tools/`・`hyperv/`・`local/`・`.codegraph/` | git の外。ビルドの出力、同梱の道具、Hyper-V のディスク、GSP の firmware、codegraph の索引。 |
 
 ## 生成物
@@ -150,7 +150,7 @@ user/libc/sys.c の SYSCALL
 
 規則は AGENTS.md の「ビルドと媒体」、手順は `nocturne-project` スキルにある。ここは場所だけを書く。
 
-- 入口は `python -X utf8 scripts/build.py -j 8 <目標>`。目標は Makefile の `qemu-image`、`all`、`kernel`、`user`、`clean` など。
+- 入口は `python -X utf8 scripts/build.py -j 8 <目標>`。目標は Makefile の `qemu-image`、`all`、`kernel`、`user`、`check`、`clean` など。`check` はホストの検査を走らせる。
 - 出力は `build/kernel.elf`、`build/programs/`、`build/drivers/`、`build/sdk/`、`build/c.list`、`build/nocturne.img`・`.vhdx`・`.iso`。
 - C: の中身は `scripts/layout.py` が `build/c.list` を作り、`build/host/store.exe fill` が詰める。
 - 任意の移植の道具は `tools/go`、`tools/TypeScript`、`tools/rust`、`tools/llvm`、`local/firmware/`。
@@ -160,6 +160,6 @@ user/libc/sys.c の SYSCALL
 
 ## 記録と道具
 
-- `docs/browser/LEDGER.md` と `docs/nvidia/LEDGER.md` は過去の記録。
+- `docs/records/` は過去の記録。開いている所見は `docs/open.md`。
 - codegraph の設定は `codegraph.json`、起動は `.mcp.json`。`SYS_*` の番号での呼出しと、表からの呼出しは索引に出ない。
 - `scripts/hv-*.ps1` と根の `hyperv.ps1` は Hyper-V の道具。Hyper-V はユーザーの担当。

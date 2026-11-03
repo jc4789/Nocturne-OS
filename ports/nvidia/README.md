@@ -1,13 +1,13 @@
 # ports/nvidia：NVIDIA RM を Nocturne のドライバーアプリ `C:\Nocturne\System\nvrm` にする
 
 RTX 4070（AD104、Ada）を、NVIDIA の open-gpu-kernel-modules 615.78.08 の RM（`third_party/nvidia-open`）で
-動かすための層。台帳は `docs/nvidia/LEDGER.md`。**Nocturne は Unix でも POSIX でもない。** この層は
+動かすための層。台帳は `docs/records/nvidia/LEDGER.md`。**Nocturne は Unix でも POSIX でもない。** この層は
 Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`、`timespec_get`）だけで書いてあり、
 `fork`・`ioctl`・`mmap` などの互換層は無い。修理は OS 層へ統合し、RM 本体の変更は既存の MIT
 `arch/nvalloc/unix/src/os.c` の Nocturne 条件付き user-map 寿命コールバックに限定する。
 
 状態：RM、OS 層、クライアントと NVK の接続がある。2026-10-20 の再監査修理は
-`docs/nvidia/review-87dd1e2f-map.json` で責務と検証範囲を管理する。ホスト試験は native サービスを mock にするため、
+`docs/records/nvidia/review-87dd1e2f-map.json` で責務と検証範囲を管理する。ホスト試験は native サービスを mock にするため、
 その成功から PCI、GPU DMA、キャッシュ、GSP 起動の成功を推論しない。実機（RTX 4070）では 2026-10-25 に、
 モード設定（280 Hz まで）と Zink＋NVK による WebGL が動いた（台帳の実機 11 回目）。
 
