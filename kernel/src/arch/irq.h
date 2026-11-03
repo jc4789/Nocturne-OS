@@ -21,7 +21,7 @@
 #define VEC_DEVICE_LAST   0xEF
 #define VEC_SYSTEM_FIRST  0xF0
 #define VEC_LOG           0xF0 /* a CPU's own, after it wrote a record holding a spinlock: wakes the log's thread (sys/log.c) */
-#define VEC_MCE_THRESHOLD 0xFA /* AMD's machine check threshold, through an extended LVT entry */
+#define VEC_MCE_THRESHOLD 0xFA /* the machine-check banks' corrected errors (arch/mca.h) */
 #define VEC_TIMER         0xFB /* each CPU's wake device (arch/lapic_timer.c, sys/alarm.c) */
 #define VEC_RESCHED       0xFC /* look at this CPU's run queue (sys/sched.c) */
 #define VEC_TLB_SHOOTDOWN 0xFD /* mm/vmm.c */

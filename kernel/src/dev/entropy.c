@@ -71,6 +71,7 @@ void entropy_add(uint64_t v) {
 }
 
 static bool rdrand64(uint64_t *out) {
+    if (!cpu_features.rdrand) return false;
     for (int i = 0; i < 10; i++) {
         uint8_t ok;
         __asm__ volatile("rdrand %0; setc %1" : "=r"(*out), "=qm"(ok));

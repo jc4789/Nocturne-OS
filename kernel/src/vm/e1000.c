@@ -280,17 +280,13 @@ static void e1000_free_dma(uint64_t rx_ring, uint64_t tx_ring) {
     tx = NULL;
 }
 
-bool e1000_probe(void) {
-    static const uint16_t ids[] = {0x100E, 0x100F, 0x1004, 0x100C, 0x1015, 0x10D3};
-    struct pci_device *d = NULL;
-    for (size_t i = 0; i < ARRAY_SIZE(ids) && !d; i++) {
-        d = pci_find(0x8086, ids[i]);
-        if (d) new_eerd = ids[i] == 0x10D3;
-    }
-    if (!d || (d->bar[0] & 1)) return false;
+static int e1000_attach(struct pci_device *d) {
+    if (mmio) return -N_ERR_BUSY; /* one adapter: its state is this file's */
+    if (d->bar[0] & 1) return -N_ERR_UNSUPPORTED;
+    new_eerd = d->device == 0x10D3;
     uint64_t phys = d->bar[0] & ~0xFULL;
     if ((d->bar[0] & 6) == 4) phys |= (uint64_t)d->bar[1] << 32;
-    if (!(mmio = vmm_map_mmio(phys, 0x20000))) return false;
+    if (!(mmio = vmm_map_mmio(phys, 0x20000))) return -N_ERR_NO_MEMORY;
     pci_enable_busmaster(d);
     hw_reset();
 
@@ -341,7 +337,7 @@ bool e1000_probe(void) {
         !irq_request_gsi(&(struct irq_spec){.name = "e1000", .handler = e1000_irq, .node = -1}, gsi)) {
         e1000_free_dma(rx_ring, tx_ring);
         kprintf("net: e1000 has no interrupt route\n");
-        return false;
+        return -N_ERR_UNSUPPORTED;
     }
     nif.send = e1000_send;
     nif.rx_pending = e1000_rx_pending;
@@ -351,9 +347,13 @@ bool e1000_probe(void) {
     hw_start();
     kprintf("net: e1000 (%04x) GSI %u mac %02x:%02x:%02x:%02x:%02x:%02x\n", d->device, gsi, nif.mac[0],
             nif.mac[1], nif.mac[2], nif.mac[3], nif.mac[4], nif.mac[5]);
-    return true;
+    return 0;
 no_dma:
     e1000_free_dma(rx_ring, tx_ring);
     kprintf("net: e1000 DMA allocation failed\n");
-    return false;
+    return -N_ERR_NO_MEMORY;
 }
+
+static const struct n_pci_match e1000_matches[] = {N_PCI_ID(0x8086, 0x100E), N_PCI_ID(0x8086, 0x100F), N_PCI_ID(0x8086, 0x1004),
+                                                   N_PCI_ID(0x8086, 0x100C), N_PCI_ID(0x8086, 0x1015), N_PCI_ID(0x8086, 0x10D3)};
+const struct pci_driver e1000_driver = {"e1000", e1000_matches, ARRAY_SIZE(e1000_matches), e1000_attach};

@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "arch/spin.h"
+#include "dev/hal.h"
 
 struct guid {
     uint8_t b[16];
@@ -71,6 +72,7 @@ struct vmbus_channel {
     vmbus_callback_t on_rescind; /* CPU 0's interrupt handler: the host withdrew the channel */
     void *priv;
     bool claimed;  /* a driver owns it: not freed on rescind until vmbus_release() */
+    struct hal_device hal; /* the devices' channels, not the sockets' */
     struct vmbus_channel *next;
 };
 

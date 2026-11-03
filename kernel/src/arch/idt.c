@@ -2,6 +2,7 @@
    exceptions. The interrupts (vector 32 and up) are arch/irq.c's. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/mca.h"
 #include "arch/gdt.h"
 #include "arch/preempt.h"
 #include "arch/smp.h"
@@ -197,7 +198,7 @@ void isr_exception(struct regs *r) {
     if (v == 2 || v == 18) {
         this_cpu(preempt_count) += PREEMPT_NMI_ONE;
         if (v == 2) smp_nmi(r); /* another CPU's panic stops this one; any other is reported */
-        else cpu_machine_check(r);
+        else mca_machine_check(r);
         this_cpu(preempt_count) -= PREEMPT_NMI_ONE;
         return;
     }

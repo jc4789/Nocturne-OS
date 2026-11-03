@@ -1,10 +1,13 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include "dev/hal.h"
 struct pci_reset;
 struct irq;
 struct iommu_guest;
 struct pci_device {
+    struct hal_device hal;
     uint8_t bus, dev, func;
     uint16_t vendor, device;
     uint8_t cls, subcls, progif, irq;
@@ -45,7 +48,16 @@ struct pci_device {
        the device below since its link trained, which takes effect once the link retrains (pci.c) */
     bool retrain;
 };
-void pci_init(void);
+/* カーネルの実装の一つ。attach は眠ってよい。0 で実装が機能を持つ。負は持てなかった理由で、持ち続ける物は
+   実装が持ってよい（電源を切る前に止める物など）。 */
+struct pci_driver {
+    const char *name;
+    const struct n_pci_match *matches;
+    size_t match_count;
+    int (*attach)(struct pci_device *d);
+};
+void pci_init(void); /* 列挙して台帳に載せる。実装は結ばない */
+void pci_bind_all(void); /* dev/pci_drivers.c：iommu_init の後、実装の表の順に結ぶ */
 /* Config space access. offsets are 0..4095: below 256 CF8/CFC or ECAM, 256 and up ECAM only (an
    unreachable register reads as 0xFFFFFFFF and ignores writes). Segment 0 only. */
 uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off);
@@ -63,8 +75,6 @@ void pci_write8(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint8_t v)
 #define PCI_CONFIG_RRS_ID  0xFFFF0001u /* Vendor/Device ID read with RRS Software Visibility (2.3.2) */
 #define PCI_BRIDGE_CONTROL 0x3E        /* a bridge's Bridge Control register (7.5.1.3.13) */
 #define PCI_BRIDGE_CONTROL_SBR (1u << 6) /* Secondary Bus Reset */
-struct pci_device *pci_find(uint16_t vendor, uint16_t device);
-struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls);
 /* Its memory BARs and its DMA on. The I/O space is for a driver that uses a port BAR: pci_enable_io. */
 void pci_enable_busmaster(struct pci_device *d);
 void pci_enable_io(struct pci_device *d);

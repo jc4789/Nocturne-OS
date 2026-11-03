@@ -12,6 +12,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "sys/clock.h"
+#include "dev/hal.h"
+#include "dev/usb_drivers.h"
 
 /* A port whose device does not come up, or that stays stuck, is tried one reset at a time, with the
    worker's other work in between, and less and less often: 1, 2, 4 ... 64 s apart. No document sets
@@ -100,10 +102,9 @@ struct usb_device {
     uint8_t tt_slot, tt_port;
     struct usb_device_desc desc;
     bool removed; /* atomic: set once by usb_remove, after which no report function runs for it */
+    struct hal_device hal;
     void *hub; /* usbhub.c state when the device is a hub */
-    void *hid; /* usbhid.c state: its HID interfaces */
-    void *msc; /* usbmsc.c state */
-    void *net; /* usbnet.c state */
+    void *state[USB_DRIVERS]; /* each class driver's state, at its number */
 };
 
 /* An endpoint as a class driver found it in the configuration descriptor. */
@@ -160,7 +161,7 @@ bool usb_enumerating(void);
 struct usb_device *usb_attach_child(struct usb_device *hub, unsigned port, unsigned speed, unsigned rank);
 void usb_remove(struct usb_device *d);
 void usb_hub_info(struct usb_device *d, unsigned ports, unsigned think_time, bool multi_tt);
-/* Any context: run the class work functions (usbhub_work, usbhid_work) for d on its worker soon. */
+/* Any context: run the work functions (usbhub_work, struct usb_driver's work) for d on its worker soon. */
 void usb_note_work(struct usb_device *d);
 /* On the worker, for an event a report function notes (usb_note_work): read usb_kicks, look at
    the condition, then usb_wait_kick sleeps unless a note came after that read, or until the
@@ -168,11 +169,23 @@ void usb_note_work(struct usb_device *d);
 uint64_t usb_kicks(struct usb_device *d);
 void usb_wait_kick(struct usb_device *d, uint64_t seen, uint64_t deadline);
 
-/* class drivers: does the interface belong to us (and which interrupt IN endpoint does it need)? */
-bool usbhid_claims(const struct usb_interface_desc *intf);
-void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, const uint8_t *extra,
-                   unsigned extra_len, const struct usb_endpoint_desc *ep);
-void usbhid_work(struct usb_device *d);       /* the keyboard lights asked for */
+/* A class driver. xhci.c finds them by the table and knows none by name. */
+struct usb_driver {
+    const char *name;
+    bool (*claims)(const struct usb_interface_desc *intf); /* does the interface belong to it */
+    /* The device is configured: it takes what it claims of the whole configuration. True: it took something. */
+    bool (*attach)(struct usb_device *d, const uint8_t *cfg, unsigned total);
+    void (*detach)(struct usb_device *d); /* the device is going away: it drops whatever it holds of it */
+    void (*work)(struct usb_device *d);   /* NULL, or what it asked for with usb_note_work */
+    const char *(*refuse)(void);          /* NULL, or (for the log) why the machine cannot sleep right now */
+};
+extern const struct usb_driver *const usb_drivers[USB_DRIVERS];
+/* The string descriptor index as a new UTF-8 string, NULL without one. On the worker. */
+char *usb_string(struct usb_device *d, uint8_t index);
+/* The next interface of alternate 0 from *at that has an interrupt IN endpoint, with the descriptors between
+   it and that endpoint. *at moves past the interface. False when there is no other. */
+bool usb_next_interrupt_interface(const uint8_t *cfg, unsigned total, unsigned *at, const struct usb_interface_desc **intf,
+                                  const uint8_t **extra, unsigned *extra_len, const struct usb_endpoint_desc **ep);
 bool usbhub_prepare(struct usb_device *d);    /* configured: reads the hub descriptor and calls usb_hub_info */
 bool usbhub_set_depth(struct usb_device *d);  /* configured as a hub: tells it its tier */
 bool usbhub_reset_port(struct usb_device *hub, unsigned port); /* reset the device on it; true once enabled */
@@ -181,17 +194,4 @@ void usbhub_work(struct usb_device *d);       /* port changes noticed by its int
 bool usbhub_pending(struct usb_device *d);    /* port changes not handled yet, or a port's next try */
 bool usbhub_trying(struct usb_device *d);     /* a device at a port is yet to get another try */
 void usbhub_reports_lost(struct usb_device *d, uint8_t address); /* endpoint `address` was given up */
-/* class drivers that read the whole configuration: does one of its interfaces suit them, and
- * take the device once it is configured */
-bool usbmsc_claims(const struct usb_interface_desc *intf);
-void usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned total);
-bool usbnet_claims(const struct usb_interface_desc *intf);
-void usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total);
-/* a device is going away: each class driver drops whatever it holds of it (any interface) */
-void usbhub_detach(struct usb_device *d);
-void usbhid_detach(struct usb_device *d);
-void usbmsc_detach(struct usb_device *d);
-bool usbmsc_attached(void); /* a USB disk is plugged in */
-void usbnet_detach(struct usb_device *d);
-
-void usb_init(void);
+void usbhub_detach(struct usb_device *d); /* the device is going away */

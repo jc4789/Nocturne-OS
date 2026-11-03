@@ -23,6 +23,7 @@
 #include "dev/blk.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
+#include "dev/pci_drivers.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
@@ -917,18 +918,18 @@ static void vectors_place(struct nvme *c) {
     }
 }
 
-static void start(struct nvme *c) {
+static int start(struct nvme *c) {
     struct pci_device *pci = c->pci;
     uint64_t base = pci_bar_address(pci, 0);
     if (!base) {
         kprintf("nvme%d: no register window\n", c->index);
-        return;
+        return -N_ERR_NOT_FOUND;
     }
     /* the registers and the doorbells of every queue pair it has, all in its BAR */
     c->regs = vmm_map_mmio(base, ALIGN_UP(MAX(pci_bar_size(pci, 0), (uint64_t)0x2000), PAGE_SIZE));
     if (!c->regs) {
         kprintf("nvme%d: no memory to map its registers\n", c->index);
-        return;
+        return -N_ERR_NO_MEMORY;
     }
     pci_enable_busmaster(pci);
     uint64_t cap = c->cap = rd64(c, CAP);
@@ -943,11 +944,11 @@ static void start(struct nvme *c) {
     /* one with no I/O command set has nothing to read or write (3.5.1 step 3.a) */
     if (cap & CAP_CSS_NOIO || !(cap & (CAP_CSS_NVM | CAP_CSS_SETS)) || (cap >> 48 & 0xF)) {
         kprintf("nvme%d: no NVM command set or no 4 KiB pages (capabilities %lx), skipped\n", c->index, cap);
-        return;
+        return -N_ERR_UNSUPPORTED;
     }
     if (!(c->ident_phys = pmm_alloc_node(pci->node < 0 ? 0 : (unsigned)pci->node)) ||
         !queue_alloc(&c->admin, c, 0, ADMIN_ENTRIES, pci->node < 0 ? 0 : (unsigned)pci->node))
-        return;
+        return -N_ERR_NO_MEMORY;
     c->ident = phys_to_virt(c->ident_phys);
     mutex_lock(&c->reset_lock);
     bool up = enable(c);
@@ -958,9 +959,10 @@ static void start(struct nvme *c) {
             c->found = s->next;
             kfree(s);
         }
-        return;
+        return -N_ERR_IO;
     }
     vectors_place(c);
+    hal_name(&pci->hal, c->model);
 
     kprintf("nvme%d: %s (%04x:%04x), version %x, %u namespaces, %u I/O queues of %u, %u %s%s\n", c->index, c->model,
             pci->vendor, pci->device, rd32(c, VS), c->namespaces, c->nio, c->io[0].depth, c->nvectors,
@@ -972,6 +974,7 @@ static void start(struct nvme *c) {
         strlcpy(s->blk.model, c->model, sizeof s->blk.model);
         blk_register(&s->blk);
     }
+    return 0;
 }
 
 /* The I/O queues deleted, submission queues before completion queues (3.6.1 steps 1b, 1c; 5.3.4,
@@ -1063,21 +1066,21 @@ static bool nvme_resume(void *arg) {
 static struct pm_device nvme_pm = {.name = "nvme", .stage = PM_STAGE_STORAGE, .quiesce = nvme_shutdown,
                                    .resume = nvme_resume};
 
-void nvme_init(void) {
-    struct nvme **tail = &ctrls;
-    for (int i = 0; i < pci_count(); i++) {
-        struct pci_device *p = pci_at(i);
-        if (p->cls != 0x01 || p->subcls != 0x08 || p->progif != 0x02) continue;
-        struct nvme *c = kzalloc(sizeof *c);
-        if (!c) {
-            kprintf("nvme: no memory for the controller at %02x:%02x.%u\n", p->bus, p->dev, p->func);
-            continue;
-        }
-        c->index = nctrls++;
-        c->pci = p;
-        *tail = c;
-        tail = &c->next;
-        start(c);
+static int nvme_attach(struct pci_device *p) {
+    struct nvme *c = kzalloc(sizeof *c);
+    if (!c) {
+        kprintf("nvme: no memory for the controller at %02x:%02x.%u\n", p->bus, p->dev, p->func);
+        return -N_ERR_NO_MEMORY;
     }
-    if (nctrls) pm_register(&nvme_pm);
+    c->index = nctrls++;
+    c->pci = p;
+    struct nvme **tail = &ctrls;
+    while (*tail) tail = &(*tail)->next;
+    *tail = c;
+    int r = start(c);
+    if (!c->index) pm_register(&nvme_pm);
+    return r;
 }
+
+static const struct n_pci_match nvme_matches[] = {N_PCI_CLASS_PROGIF(0x01, 0x08, 0x02)};
+const struct pci_driver nvme_driver = {"nvme", nvme_matches, ARRAY_SIZE(nvme_matches), nvme_attach};

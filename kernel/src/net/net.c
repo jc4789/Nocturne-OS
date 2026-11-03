@@ -2177,13 +2177,9 @@ int64_t tcp_buffer_setting_get(uint32_t key, void *out, size_t cap) {
 void net_init(void) {
     watched_init(&net_watch, NULL);
     net_timer_init(&fault_timer, fault_timer_run);
-    rtl8125_probe();
-    vm_net_probe();
     net_enter();
     net_initialized = true;
-    bool none = !adapters;
     net_leave();
-    if (none) kprintf("net: no supported network card yet\n");
     kthread_create("net", net_thread, NULL);
 }
 

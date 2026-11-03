@@ -1303,17 +1303,8 @@ void syscall_dispatch(struct regs *r) {
         break;
     }
     case SYS_SYSTEM_LOG: ret = identity_at_least(N_CLASS_ADMIN) ? sys_system_log((char *)a, b) : -N_ERR_DENIED; break;
-    case SYS_PCILIST:
-    {
-        int room = (int)MIN(b, (uint64_t)pci_count());
-        struct n_pciinfo *list = room ? kzalloc((size_t)room * sizeof *list) : NULL;
-        if (room && !list) { ret = -N_ERR_NO_MEMORY; break; }
-        int n = pci_list(list, room);
-        ret = copy_to_user((void *)a, list, (size_t)n * sizeof *list);
-        if (!ret) ret = n;
-        kfree(list);
-        break;
-    }
+    case SYS_HAL_LIST: ret = hal_syscall_list((struct n_hal_device *)a, b); break;
+    case SYS_HAL_WATCH: ret = hal_syscall_watch(); break;
     case SYS_HANDLE_CLOSE: ret = sys_handle_close((int)a); break;
     case SYS_HANDLE_KIND: ret = sys_handle_kind((int)a); break;
     case SYS_DOCUMENT_OPEN: ret = sys_document_open((const char *)a, (int)b); break;

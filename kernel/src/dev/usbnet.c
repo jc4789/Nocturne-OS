@@ -60,7 +60,7 @@ static void put32(uint8_t *p, uint32_t v) {
     put16(p + 2, (uint16_t)(v >> 16));
 }
 
-bool usbnet_claims(const struct usb_interface_desc *intf) {
+static bool usbnet_claims(const struct usb_interface_desc *intf) {
     return intf->cls == 2 && (intf->subcls == CDC_ECM || intf->subcls == CDC_NCM) && intf->alternate == 0;
 }
 
@@ -205,7 +205,7 @@ static bool ncm_setup(struct usbnet *n) {
     return true;
 }
 
-void usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
+static bool usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
     const struct usb_interface_desc *comm = NULL;
     struct usb_ep_info eps[3], e; /* notification, bulk IN, bulk OUT */
     bool have_notify = false, have_in = false, have_out = false, found_data = false;
@@ -246,10 +246,10 @@ void usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
             }
         }
     }
-    if (!comm) return;
+    if (!comm) return false;
     if (!found_data || !mac_index) {
         kprintf("usbnet: slot %u CDC function incomplete (data interface, MAC string)\n", d->slot);
-        return;
+        return false;
     }
     mutex_lock(&gone_lock);
     struct usbnet *old = gone;
@@ -261,7 +261,7 @@ void usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
         old = next;
     }
     struct usbnet *n = kzalloc(sizeof *n);
-    if (!n) return;
+    if (!n) return false;
     n->dev = d;
     n->ncm = comm->subcls == CDC_NCM;
     n->comm = comm->number;
@@ -292,11 +292,11 @@ void usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
     /* an IN transfer ends at a short packet, so its buffer is whole packets */
     unsigned rx_len = n->ncm ? n->ntb_in : (n->max_segment + mps - 1) / mps * mps;
     unsigned tx_len = n->ncm ? n->header + n->max_segment : n->max_segment;
-    d->net = n;
+    d->state[USB_DRIVER_NET] = n;
     if (!usb_send_open(d, n->out, tx_len, TX_SLOTS, tx_done, n) ||
         !usb_stream_start(d, n->in, rx_len, n->ncm ? 4 : 16, rx, n)) {
         kprintf("usbnet: slot %u transfers could not start\n", d->slot);
-        d->net = NULL;
+        d->state[USB_DRIVER_NET] = NULL;
         goto fail;
     }
     if (have_notify) {
@@ -311,15 +311,16 @@ void usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
     n->nif.driver = n->ncm ? "usb-ncm" : "usb-ecm";
     n->nif.send = usbnet_send;
     net_register(&n->nif);
-    return;
+    return true;
 fail:
     kfree(n);
+    return false;
 }
 
-void usbnet_detach(struct usb_device *d) {
-    struct usbnet *n = d->net;
+static void usbnet_detach(struct usb_device *d) {
+    struct usbnet *n = d->state[USB_DRIVER_NET];
     if (!n) return;
-    d->net = NULL;
+    d->state[USB_DRIVER_NET] = NULL;
     mutex_lock(&n->lock);
     n->dev = NULL; /* sends fail from here on; none is inside usb_send now */
     mutex_unlock(&n->lock);
@@ -330,3 +331,6 @@ void usbnet_detach(struct usb_device *d) {
     mutex_unlock(&gone_lock);
     kprintf("usbnet: adapter unplugged\n");
 }
+
+const struct usb_driver usbnet_driver = {.name = "usbnet", .claims = usbnet_claims, .attach = usbnet_attach,
+                                         .detach = usbnet_detach};

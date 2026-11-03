@@ -5,7 +5,7 @@
 #include "dev/input.h"
 #include "dev/fbcon.h"
 #include "dev/fb.h"
-#include "dev/gpu.h"
+#include "dev/hal.h"
 #include "dev/pci.h"
 #include "dev/iommu.h"
 #include "dev/pm.h"
@@ -23,9 +23,7 @@
 #include "sys/authority.h"
 
 void acpi_init(void);
-void ahci_init(void);
 void net_init(void);
-void nvme_init(void);
 
 #define INIT_PATH N_FOLDER_SYSTEM "\\services"
 
@@ -35,18 +33,15 @@ void kmain_late(void) {
     vmalloc_purge_start();
     acpi_init();
     pm_init(); /* the power thread: every shutdown and restart goes through it */
+    hal_init();
     vm_init(); /* only in a VM: its own bus and the devices on it */
     pci_init();
-    vm_display_init(); /* only in a VM: its emulated displays become screens of their own buffers */
-    fb_pm_init(); /* the display joins the power changes once its PCI identity is known */
-    gpu_init();   /* the offscreen GPU, which never shows a screen */
     iommu_init(); /* before any driver turns an interrupt on: their messages may be remapped */
     net_init();
-    usb_init();
     audio_init();
-    ahci_init();
-    nvme_init();
-    vm_storage_init();
+    pci_bind_all();
+    vm_bind_fixed(); /* only in a VM: the devices no PCI identity finds */
+    fb_pm_init(); /* the display joins the power changes once its PCI identity is known */
     store_init();        /* C:, from the disk the system started from (waiting for it to appear) */
     hibernate_restore(); /* returns only when there is no image to go back to */
     store_start();

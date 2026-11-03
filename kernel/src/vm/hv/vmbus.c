@@ -204,6 +204,10 @@ static void on_offer(const struct msg_offer *o) {
     /* claimed before anyone can release it: the hook hands it to a thread on another CPU */
     if (late && (ch->chn_flags & VMBUS_CHANNEL_SOCKET) && hook) ch->claimed = hook(ch);
     spin_give(&chan_lock);
+    if (!(ch->chn_flags & VMBUS_CHANNEL_SOCKET)) {
+        memcpy(ch->hal.info.at.vmbus.type, &ch->type, sizeof ch->hal.info.at.vmbus.type);
+        hal_add(&ch->hal, 0, N_HAL_BUS_VMBUS, -1, guid_name(&ch->type));
+    }
     if (late && !(ch->chn_flags & VMBUS_CHANNEL_SOCKET)) {
         char gs[37], is[37];
         guid_format(&ch->type, gs);
@@ -245,6 +249,7 @@ static void handle_message(const uint8_t *p, uint32_t len) {
         if (ch) __atomic_store_n(&ch->rescinded, true, __ATOMIC_RELEASE);
         spin_give(&chan_lock);
         if (!ch) return;
+        hal_remove(&ch->hal);
         if (!(ch->chn_flags & VMBUS_CHANNEL_SOCKET)) kprintf("vmbus: channel %u rescinded\n", relid);
         if (rescind) rescind(ch); /* a release waits for this handler before it frees what it uses */
         spin_take(&chan_lock);

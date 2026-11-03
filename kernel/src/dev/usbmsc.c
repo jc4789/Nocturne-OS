@@ -56,7 +56,7 @@ static void put_be(uint8_t *p, uint64_t v, int bytes) {
 
 /* Bulk-only, with a command set that speaks SCSI (MSC Overview Table 1): not reported 00h, RBC 01h,
    MMC-5 02h, SCSI transparent 06h. */
-bool usbmsc_claims(const struct usb_interface_desc *intf) {
+static bool usbmsc_claims(const struct usb_interface_desc *intf) {
     bool scsi = intf->subcls == 0x00 || intf->subcls == 0x01 || intf->subcls == 0x02 || intf->subcls == 0x06;
     return intf->cls == 8 && scsi && intf->protocol == 0x50 && intf->alternate == 0;
 }
@@ -313,7 +313,7 @@ static void probe_lun(struct msc *m, unsigned lun) {
     blk_register(&l->blk);
 }
 
-void usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
+static bool usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
     const struct usb_interface_desc *intf = NULL;
     struct usb_ep_info eps[2], e;
     bool have_in = false, have_out = false;
@@ -328,18 +328,18 @@ void usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
             if (!(e.address & 0x80) && !have_out) eps[1] = e, have_out = true;
         }
     }
-    if (!intf) return;
+    if (!intf) return false;
     if (!have_in || !have_out) {
         kprintf("usbmsc: slot %u has no usable bulk endpoints\n", d->slot);
-        return;
+        return false;
     }
     struct msc *m = kzalloc(sizeof *m);
-    if (!m) return;
+    if (!m) return false;
     m->dev = d;
     m->intf = intf->number;
     m->in = eps[0].address;
     m->out = eps[1].address;
-    d->msc = m;
+    d->state[USB_DRIVER_MSC] = m;
     __atomic_fetch_add(&attached, 1, __ATOMIC_RELAXED);
     /* BOT 3.2: Get Max LUN; a device with one unit may stall it */
     uint8_t max = 0;
@@ -349,19 +349,25 @@ void usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
     mutex_lock(&m->lock);
     for (unsigned lun = 0; lun <= max && m->dev; lun++) probe_lun(m, lun);
     mutex_unlock(&m->lock);
+    return true;
 }
 
 /* The block devices stay registered (a mounted filesystem may still hold them); they fail from
  * now on. The command running ends first: usb_remove ended its transfers. */
-void usbmsc_detach(struct usb_device *d) {
-    struct msc *m = d->msc;
+static void usbmsc_detach(struct usb_device *d) {
+    struct msc *m = d->state[USB_DRIVER_MSC];
     if (!m) return;
     mutex_lock(&m->lock);
     m->dev = NULL;
     for (struct lun *l = m->luns; l; l = l->next) __atomic_store_n(&l->blk.gone, true, __ATOMIC_RELEASE);
     mutex_unlock(&m->lock);
-    d->msc = NULL;
+    d->state[USB_DRIVER_MSC] = NULL;
     __atomic_fetch_sub(&attached, 1, __ATOMIC_RELAXED);
 }
 
-bool usbmsc_attached(void) { return __atomic_load_n(&attached, __ATOMIC_RELAXED) > 0; }
+static const char *usbmsc_refuse(void) {
+    return __atomic_load_n(&attached, __ATOMIC_RELAXED) > 0 ? "A USB disk is plugged in" : NULL;
+}
+
+const struct usb_driver usbmsc_driver = {.name = "usbmsc", .claims = usbmsc_claims, .attach = usbmsc_attach,
+                                         .detach = usbmsc_detach, .refuse = usbmsc_refuse};

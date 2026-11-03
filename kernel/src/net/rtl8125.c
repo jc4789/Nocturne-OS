@@ -44,6 +44,7 @@
 #include "../dev/pci.h"
 #include "../dev/entropy.h"
 #include "../dev/pm.h"
+#include "../dev/pci_drivers.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
@@ -628,15 +629,16 @@ no_dma:
     return false;
 }
 
-void rtl8125_probe(void) {
-    for (int i = 0; i < pci_count(); i++) {
-        struct pci_device *d = pci_at(i);
-        if (d->vendor != 0x10EC || d->device != 0x8125) continue;
-        struct rtl8125 *c = kzalloc(sizeof *c);
-        if (!c) {
-            kprintf("rtl8125: no memory for a device\n");
-            continue;
-        }
-        if (!rtl_one(c, d)) kfree(c);
+static int rtl_attach(struct pci_device *d) {
+    struct rtl8125 *c = kzalloc(sizeof *c);
+    if (!c) {
+        kprintf("rtl8125: no memory for a device\n");
+        return -N_ERR_NO_MEMORY;
     }
+    if (rtl_one(c, d)) return 0;
+    kfree(c);
+    return -N_ERR_UNSUPPORTED;
 }
+
+static const struct n_pci_match rtl_matches[] = {N_PCI_ID(0x10EC, 0x8125)};
+const struct pci_driver rtl8125_driver = {"rtl8125", rtl_matches, ARRAY_SIZE(rtl_matches), rtl_attach};

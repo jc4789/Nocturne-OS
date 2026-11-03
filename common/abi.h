@@ -1,5 +1,6 @@
 /* Nocturne kernel <-> userland ABI: syscall numbers and shared structures. */
 #pragma once
+#include <stdbool.h>
 #include <stdint.h>
 #include "input_abi.h"
 #include "authority_abi.h"
@@ -49,14 +50,16 @@
 /* The calls of the kernel. A program never holds the SYSCALL instruction: it calls the slot of its
    entry image (below), and each name here is that slot's index. The ABI keeps no older form of a
    call: a program is built for one generation of the system (N_ABI_GENERATION). 1-18, 21-25,
-   30-32, 35-37, 44, 51-55, 60-63, 73, 90 and 203-206 are unassigned. */
+   30-32, 36-37, 44, 51-55, 60-63, 73, 90 and 203-206 are unassigned. */
 enum {
     SYS_EXIT = 0,
     SYS_SLEEP = 19, /* (deadline): until the monotonic clock reaches it (§8) */
     SYS_APP_CPU_TIME, /* (): ns the calling app's threads have run, the ended ones too (§8) */
     SYS_PROCLIST = 26, SYS_SYSINFO, SYS_YIELD, SYS_POWER,
     SYS_IMAGE_MAP,            /* (読むために開いた文書の handle, struct n_image *out): ドライバーの像を自分へ写す */
-    SYS_SYSTEM_LOG = 33, SYS_PCILIST,
+    SYS_SYSTEM_LOG = 33,
+    SYS_HAL_LIST,             /* (struct n_hal_device *out, max): 台帳の写し。戻りは台帳の全部の数 */
+    SYS_HAL_WATCH,            /* (): 台帳が変わると受け取れる見張り */
     SYS_CPU_INFO = 38, SYS_GPU_INFO, SYS_GPU_RENDER,
     SYS_AUDIO_DEVICE_RUN,     /* (device, 0 or 1): 輪の始めから流す、止める（§17） */
     SYS_GPU_RENDER_BATCH,
@@ -217,7 +220,7 @@ enum {
    -N_ERR_DENIED を返す。C:\Nocturne の中のプログラムの像には全部の呼出しがある。表は面の広さを
    決めるだけで、呼べるかどうかの本当の検査は能力と身元で行う。 */
 #define N_PUBLIC_CALLS(X) \
-    X(SYS_EXIT) X(SYS_SLEEP) X(SYS_APP_CPU_TIME) X(SYS_SYSINFO) X(SYS_YIELD) X(SYS_CPU_INFO) X(SYS_PCILIST) \
+    X(SYS_EXIT) X(SYS_SLEEP) X(SYS_APP_CPU_TIME) X(SYS_SYSINFO) X(SYS_YIELD) X(SYS_CPU_INFO) X(SYS_HAL_LIST) \
     X(SYS_THREAD_CREATE) X(SYS_THREAD_JOIN) X(SYS_THREAD_EXIT) X(SYS_THREAD_ID) X(SYS_THREAD_SCHEDULE) \
     X(SYS_THREAD_STACK_BOUNDS) X(SYS_THREAD_DETACH) X(SYS_WAIT_ADDRESS) X(SYS_WAIT_ADDRESS64) X(SYS_WAKE_ADDRESS) \
     X(SYS_MEMORY_RESERVE) X(SYS_MEMORY_RELEASE) X(SYS_MEMORY_PROTECT) \
@@ -476,6 +479,56 @@ struct n_pciinfo {
     uint8_t bus, dev, func, cls, subcls, progif;
     uint16_t vendor, device;
 };
+
+/* 機械で見つかった物の一つ（n_hal_list、docs/hal.md の台帳）。 */
+enum n_hal_bus { N_HAL_BUS_PCI, N_HAL_BUS_USB, N_HAL_BUS_VMBUS, N_HAL_BUS_PORT };
+enum n_hal_state {
+    N_HAL_UNBOUND, /* 持っている実装が無い */
+    N_HAL_RUNNING, /* 実装が持っている */
+    N_HAL_FAILED,  /* 実装が持てなかった。理由は reason */
+};
+struct n_hal_device {
+    uint32_t id;     /* 起動の間、二度と使わない番号 */
+    uint32_t parent; /* 親の番号。0：親なし */
+    uint32_t bus;    /* enum n_hal_bus */
+    uint32_t state;  /* enum n_hal_state */
+    int32_t reason;  /* N_HAL_FAILED の負の N_ERR_* */
+    int32_t node;    /* NUMA の node。-1：不明 */
+    union {
+        struct n_pciinfo pci;
+        struct { uint16_t vendor, product; uint8_t cls, port; uint32_t route; } usb;
+        struct { uint8_t type[16]; } vmbus;
+        struct { uint32_t base; } port;
+    } at;
+    char name[64];   /* 人に見せる名前。"": 無い */
+    char driver[48]; /* 持っている実装の名。プロセスの実装はプログラムの名 */
+};
+
+/* PCI の機能の引き方の一行。fields が見る欄を言う。カーネルの実装の表とサービスの宣言が使う。 */
+enum {
+    N_PCI_MATCH_VENDOR = 1, N_PCI_MATCH_DEVICE = 2, N_PCI_MATCH_CLASS = 4, N_PCI_MATCH_SUBCLASS = 8, N_PCI_MATCH_PROGIF = 16,
+};
+struct n_pci_match {
+    uint16_t vendor, device;
+    uint8_t cls, subcls, progif, fields;
+};
+#define N_PCI_ID(v, d) {.vendor = (v), .device = (d), .fields = N_PCI_MATCH_VENDOR | N_PCI_MATCH_DEVICE}
+#define N_PCI_ID_CLASS(v, d, c, s)                                                                                 \
+    {.vendor = (v), .device = (d), .cls = (c), .subcls = (s),                                                      \
+     .fields = N_PCI_MATCH_VENDOR | N_PCI_MATCH_DEVICE | N_PCI_MATCH_CLASS | N_PCI_MATCH_SUBCLASS}
+#define N_PCI_CLASS(c, s) {.cls = (c), .subcls = (s), .fields = N_PCI_MATCH_CLASS | N_PCI_MATCH_SUBCLASS}
+#define N_PCI_CLASS_PROGIF(c, s, p)                                                                                \
+    {.cls = (c), .subcls = (s), .progif = (p), .fields = N_PCI_MATCH_CLASS | N_PCI_MATCH_SUBCLASS | N_PCI_MATCH_PROGIF}
+#define N_PCI_VENDOR_CLASS_PROGIF(v, c, s, p)                                                                      \
+    {.vendor = (v), .cls = (c), .subcls = (s), .progif = (p),                                                      \
+     .fields = N_PCI_MATCH_VENDOR | N_PCI_MATCH_CLASS | N_PCI_MATCH_SUBCLASS | N_PCI_MATCH_PROGIF}
+static inline bool n_pci_matches(const struct n_pci_match *m, const struct n_pciinfo *f) {
+    return (!(m->fields & N_PCI_MATCH_VENDOR) || m->vendor == f->vendor) &&
+           (!(m->fields & N_PCI_MATCH_DEVICE) || m->device == f->device) &&
+           (!(m->fields & N_PCI_MATCH_CLASS) || m->cls == f->cls) &&
+           (!(m->fields & N_PCI_MATCH_SUBCLASS) || m->subcls == f->subcls) &&
+           (!(m->fields & N_PCI_MATCH_PROGIF) || m->progif == f->progif);
+}
 
 /* A claimed PCI function (n_pci_info). Addresses are bus addresses, which are physical
    addresses: where an IOMMU isolates the function (N_PCI_ISOLATED) its domain maps each DMA

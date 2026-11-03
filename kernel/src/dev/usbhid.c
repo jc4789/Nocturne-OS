@@ -40,7 +40,7 @@ struct hid {
     struct hid *sibling;  /* the device's other HID interfaces (its worker's) */
     struct usb_device *dev;
     struct input_device input;
-    char *input_id, *input_name;
+    char *input_id;
     struct spinlock lock;
     uint8_t interface;
     bool ids;             /* reports start with a report ID byte */
@@ -556,10 +556,10 @@ static void boot_keyboard(struct hid *h) {
 }
 
 /* On the worker, after the device's last report (usb_remove): its held keys and buttons let go. */
-void usbhid_detach(struct usb_device *d) {
-    while (d->hid) {
-        struct hid *h = d->hid;
-        d->hid = h->sibling;
+static void usbhid_detach(struct usb_device *d) {
+    while (d->state[USB_DRIVER_HID]) {
+        struct hid *h = d->state[USB_DRIVER_HID];
+        d->state[USB_DRIVER_HID] = h->sibling;
         uint64_t f = spin_lock(&hids_lock);
         for (struct hid **pp = &hids; *pp; pp = &(*pp)->next)
             if (*pp == h) {
@@ -580,45 +580,10 @@ void usbhid_detach(struct usb_device *d) {
         }
         if (h->input_id) input_device_remove(&h->input);
         kfree(h->input_id);
-        kfree(h->input_name);
         kfree(h->keys);
         kfree(h->partial);
         kfree(h);
     }
-}
-
-/* The string descriptor index as a new UTF-8 string, NULL without one. USB 2.0 9.6.7: UTF-16LE of at most bLength's 253
-   bytes, in language 0x0409 or the first the device offers. Each unit takes at most three bytes in UTF-8. */
-static char *string_read(struct usb_device *d, uint8_t index) {
-    if (!index) return NULL;
-    uint8_t *raw = kmalloc(255);
-    if (!raw) return NULL;
-    int got = usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_STRING << 8, 0, raw, 4);
-    uint16_t language = got >= 4 ? (uint16_t)(raw[2] | raw[3] << 8) : 0x0409;
-    got = usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, (uint16_t)(USB_DESC_STRING << 8 | index), language, raw, 255);
-    char *out = NULL;
-    if (got >= 2 && raw[1] == USB_DESC_STRING) {
-        unsigned end = MIN((unsigned)got, (unsigned)raw[0]);
-        out = kmalloc((end / 2) * 3 + 1);
-        size_t at = 0;
-        for (unsigned i = 2; out && i + 1 < end; i += 2) {
-            uint32_t c = (uint32_t)raw[i] | (uint32_t)raw[i + 1] << 8;
-            if (c < 0x20 || (c >= 0xD800 && c <= 0xDFFF)) continue;
-            if (c < 0x80) {
-                out[at++] = (char)c;
-            } else if (c < 0x800) {
-                out[at++] = (char)(0xC0 | c >> 6);
-                out[at++] = (char)(0x80 | (c & 63));
-            } else {
-                out[at++] = (char)(0xE0 | c >> 12);
-                out[at++] = (char)(0x80 | (c >> 6 & 63));
-                out[at++] = (char)(0x80 | (c & 63));
-            }
-        }
-        if (out) out[at] = 0;
-    }
-    kfree(raw);
-    return out;
 }
 
 static uint32_t fnv(uint32_t hash, const void *data, size_t n) {
@@ -631,7 +596,7 @@ static uint32_t fnv(uint32_t hash, const void *data, size_t n) {
    number if it has one, else by where it is plugged in. */
 static void input_identify(struct hid *h) {
     struct usb_device *d = h->dev;
-    char *serial = string_read(d, d->desc.serial);
+    char *serial = usb_string(d, d->desc.serial);
     uint32_t hash = 2166136261u;
     if (serial) hash = fnv(hash, serial, strlen(serial));
     else hash = fnv(fnv(hash, &d->route, sizeof d->route), &d->root_port, sizeof d->root_port);
@@ -640,19 +605,18 @@ static void input_identify(struct hid *h) {
     h->input_id = kmalloc(sizeof "usb:vvvv:pppp:xxxxxxxx:255");
     if (!h->input_id) return;
     ksnprintf(h->input_id, sizeof "usb:vvvv:pppp:xxxxxxxx:255", "usb:%04x:%04x:%08x:%u", d->desc.vendor, d->desc.product, hash, h->interface);
-    h->input_name = string_read(d, d->desc.product_name);
     h->input.id = h->input_id;
-    h->input.name = h->input_name ? h->input_name : "";
+    h->input.name = d->hal.info.name;
     h->input.kinds = (h->keyboard ? N_INPUT_KEYBOARD : 0) | (h->mouse ? N_INPUT_POINTER : 0);
     input_device_add(&h->input);
 }
 
-bool usbhid_claims(const struct usb_interface_desc *intf) { return intf->cls == 3; }
+static bool usbhid_claims(const struct usb_interface_desc *intf) { return intf->cls == 3; }
 
-void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, const uint8_t *extra,
-                   unsigned extra_len, const struct usb_endpoint_desc *ep) {
+static bool interface_attach(struct usb_device *d, const struct usb_interface_desc *intf, const uint8_t *extra,
+                             unsigned extra_len, const struct usb_endpoint_desc *ep) {
     struct hid *h = kzalloc(sizeof *h);
-    if (!h) return;
+    if (!h) return false;
     h->dev = d;
     alarm_init(&h->repeat, repeat_fire);
     h->interface = intf->number;
@@ -694,12 +658,12 @@ void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, 
     if (!h->keyboard && !h->mouse) {
         kfree(h->keys);
         kfree(h);
-        return;
+        return false;
     }
     usb_control(d, 0x21, HID_SET_IDLE, 0, h->interface, NULL, 0); /* report changes only */
     h->leds_seen = __atomic_load_n(&leds_gen, __ATOMIC_ACQUIRE) - 1; /* its lights set on the worker's next look */
-    h->sibling = d->hid;
-    d->hid = h;
+    h->sibling = d->state[USB_DRIVER_HID];
+    d->state[USB_DRIVER_HID] = h;
     uint64_t f = spin_lock(&hids_lock);
     h->next = hids;
     hids = h;
@@ -714,12 +678,25 @@ void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, 
     h->partial = h->packet ? kmalloc(h->longest + h->packet) : NULL;
     if (!h->partial || !usb_interrupt_start(d, ep, 1, hid_report, h))
         kprintf("usbhid: slot %u reports could not start\n", d->slot);
+    return true;
+}
+
+static bool usbhid_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
+    bool took = false;
+    const struct usb_interface_desc *intf;
+    const struct usb_endpoint_desc *ep;
+    const uint8_t *extra;
+    unsigned extra_len;
+    for (unsigned at = 0; !__atomic_load_n(&d->removed, __ATOMIC_ACQUIRE) &&
+                          usb_next_interrupt_interface(cfg, total, &at, &intf, &extra, &extra_len, &ep);)
+        if (usbhid_claims(intf)) took |= interface_attach(d, intf, extra, extra_len, ep);
+    return took;
 }
 
 /* On the worker: the device's keyboards light caps lock as it is now: Set_Report of its output
    report (HID 7.2.2), led_bit in the data, after the ID if the report has one. */
-void usbhid_work(struct usb_device *d) {
-    for (struct hid *h = d->hid; h; h = h->sibling) {
+static void usbhid_work(struct usb_device *d) {
+    for (struct hid *h = d->state[USB_DRIVER_HID]; h; h = h->sibling) {
         unsigned gen = __atomic_load_n(&leds_gen, __ATOMIC_ACQUIRE);
         if (!h->keyboard || !h->leds || h->leds_seen == gen) continue;
         h->leds_seen = gen;
@@ -732,3 +709,6 @@ void usbhid_work(struct usb_device *d) {
         kfree(report);
     }
 }
+
+const struct usb_driver usbhid_driver = {.name = "usbhid", .claims = usbhid_claims, .attach = usbhid_attach,
+                                         .detach = usbhid_detach, .work = usbhid_work};

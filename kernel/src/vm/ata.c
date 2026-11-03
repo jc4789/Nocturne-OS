@@ -3,6 +3,7 @@
    skipped. A master and its slave share their channel's registers: a command on a channel holds
    the channel's lock from its setup to its end, whichever CPU gives it. */
 #include "kernel.h"
+#include "dev/hal.h"
 #include "vm/devices.h"
 #include "arch/cpu.h"
 #include "sys/wait.h"
@@ -107,11 +108,24 @@ static int blk_ata_write(struct blkdev *b, uint64_t lba, uint32_t n, const void 
 }
 static int blk_ata_persist(struct blkdev *b) { return ata_flush(b->priv); }
 
+/* 台帳の記録は channel に一つ。 */
+static void channel_record(struct hal_device *record, uint16_t io) {
+    bool any = false;
+    for (int i = 0; i < ndisks; i++) any |= disks[i].io == io;
+    if (!any) return;
+    record->info.at.port.base = io;
+    hal_add(record, 0, N_HAL_BUS_PORT, -1, "IDE");
+    hal_bound(record, "ata");
+}
+
 void ata_init(void) {
+    static struct hal_device records[2];
     probe(0x1F0, 0x3F6, false);
     probe(0x1F0, 0x3F6, true);
     probe(0x170, 0x376, false);
     probe(0x170, 0x376, true);
+    channel_record(&records[0], 0x1F0);
+    channel_record(&records[1], 0x170);
     for (int i = 0; i < ndisks; i++) {
         struct blkdev *b = &disks[i].blk;
         ksnprintf(b->name, sizeof b->name, "ata%d", i);

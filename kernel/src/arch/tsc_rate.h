@@ -1,6 +1,6 @@
 /* What each maker's manual says a CPU's registers state of its TSC's rate: nominal, the crystal's
    tolerance and any spread spectrum not in it, so the clock holds it to a reference where there is
-   one (sys/clock.c). arch/cpu.c reads the registers; here is only what they mean, so that
+   one (sys/clock.c). arch/cpu_amd.c and arch/cpu_intel.c read the registers; here is only what they mean, so that
    tests/check_tsc_rate.py can run the manuals' cases on the host.
 
    A rate is num / den counts a second, as the manual's arithmetic gives it, unrounded. num 0 means

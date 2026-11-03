@@ -3,13 +3,14 @@
  * PCI/queue layouts and GPU control packets: OASIS VirtIO 1.2 specification
  * (virtio-gpu device section); virgl command stream: the virgl protocol as documented.
  * The existing Limine display and Hyper-V/RDP remain independent fallbacks.
- * It is the only provider of dev/gpu.h, and only in a VM: on real hardware gpu_init looks for
- * no device and the interface reports the CPU display. */
+ * It is the only provider of dev/gpu.h, and only in a VM: on real hardware no function binds to
+ * it and the interface reports the CPU display. */
 #include "kernel.h"
 #include "dev/gpu.h"
 #include "vm/vm.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
+#include "vm/devices.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
 #include "mm/pmm.h"
@@ -78,12 +79,12 @@ static uint32_t target_id=1,source_id=3;
 static uint16_t seen_used;
 static uint32_t reply_bytes, capset_count;
 static uint64_t next_fence = 1;
-static bool attempted, ready, broken, validating_runtime;
+static bool ready, broken, validating_runtime;
 static uint32_t busy;
 static struct wait_queue completion_wait;
 static uint64_t completions; /* moved on by gpu_isr before it wakes completion_wait */
 static bool completion_irq;
-static struct n_gpu_info statistics;
+static struct n_gpu_info statistics = {.name = "CPU display; no verified virgl pipeline"};
 static bool gpu_checkpoint(void) {
     struct thread *self=thread_current();
     return !self->kstack || !self->killed;
@@ -570,13 +571,8 @@ static bool pixel_test(void) {
     return ok;
 }
 
-void gpu_init(void) {
-    if (attempted) return;
-    attempted=true;
-    strlcpy(statistics.name,"CPU display; no verified virgl pipeline",sizeof statistics.name);
-    if (!vm_hosted()) return;
-    struct pci_device *d=pci_find(0x1af4,0x1050);
-    if (!d || test_flag("nogpu")) return;
+static void gpu_start(struct pci_device *d) {
+    if (test_flag("nogpu")) return;
     if (!test_flag("gpu-enable") && !test_flag("gpu-slow-test")) {
         kprintf("gpu: optional virgl device present; gpu-enable required (cold host fences can be slow)\n");
         return;
@@ -736,3 +732,11 @@ int gpu_blit(const struct n_gpu_blit *r,const uint32_t *pixels,size_t source_byt
     __atomic_store_n(&busy,0,__ATOMIC_RELEASE);
     return result;
 }
+
+static int gpu_attach(struct pci_device *d) {
+    gpu_start(d);
+    return ready ? 0 : -N_ERR_UNSUPPORTED;
+}
+
+static const struct n_pci_match gpu_matches[] = {N_PCI_ID(0x1af4, 0x1050)};
+const struct pci_driver virtio_gpu_driver = {"virtio-gpu", gpu_matches, ARRAY_SIZE(gpu_matches), gpu_attach};

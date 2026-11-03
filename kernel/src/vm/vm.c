@@ -28,8 +28,14 @@ static bool firmware_oem(char oem[7]) {
     return true;
 }
 
+bool vm_cpu_guest(void) {
+    uint32_t a, b, c, d;
+    cpuid(1, 0, &a, &b, &c, &d);
+    return c & (1u << 31);
+}
+
 void vm_detect(void) {
-    bool hypervisor = cpu_features.hypervisor;
+    bool hypervisor = vm_cpu_guest();
     hv_detect(); /* the Hyper-V interface, wherever it is offered (WHPX offers it to QEMU too) */
     char oem[7];
     bool have_oem = firmware_oem(oem);
@@ -57,23 +63,18 @@ void vm_init(void) {
 
 /* The emulated devices are found by their PCI identity or legacy ports, in any VM; on real
    hardware none of them is looked for. */
-void vm_storage_init(void) {
+static const struct pci_driver *const emulated[] = {&vbe_driver, &virtio_gpu_driver, &e1000_driver, &tulip_driver, &ac97_driver};
+
+const struct pci_driver *const *vm_pci_drivers(size_t *count) {
+    *count = machine == VM_NONE ? 0 : ARRAY_SIZE(emulated);
+    return emulated;
+}
+
+void vm_bind_fixed(void) {
     if (machine == VM_NONE) return;
     ata_init();
     storvsc_init(); /* only with VMBus */
-}
-
-bool vm_net_probe(void) {
-    if (machine == VM_NONE) return false;
-    return netvsc_probe() || e1000_probe() || tulip_probe();
-}
-
-void vm_audio_init(void) {
-    if (machine != VM_NONE) ac97_init();
-}
-
-void vm_display_init(void) {
-    if (machine != VM_NONE) vbe_display_init();
+    netvsc_probe(); /* only with VMBus */
 }
 
 void vm_display_pm(struct pm_device *display) {

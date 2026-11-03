@@ -714,8 +714,10 @@ bool netvsc_probe(void) {
             nv.nvsp_version >> 16, nv.nvsp_version & 0xFFFF, nv.sections, nv.section_size, nif.mac[0],
             nif.mac[1], nif.mac[2], nif.mac[3], nif.mac[4], nif.mac[5], nv.link_up ? "up" : "down");
     net_register(&nif);
+    hal_bound(&ch->hal, "netvsc");
     return true;
 failed:
+    hal_failed(&ch->hal, "netvsc", -N_ERR_IO);
     netvsc_shutdown();
     return false;
 }

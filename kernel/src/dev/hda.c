@@ -39,6 +39,7 @@
 #include "dev/iommu.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
+#include "dev/pci_drivers.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/shared.h"
@@ -869,9 +870,9 @@ static void hda_guest_start(struct iommu_domain *dom, void *ctx) {
 
 /* ---- finding them ---- */
 
-static void controller_add(struct pci_device *d) {
+static int hda_attach(struct pci_device *d) {
     uint64_t base = pci_bar_address(d, 0), size = pci_bar_size(d, 0);
-    if (!base || !size) return;
+    if (!base || !size) return -N_ERR_NOT_FOUND;
     struct hda *h = kzalloc(sizeof *h);
     /* below 4 GiB, which every controller can reach (64OK is optional, 3.3.2) */
     uint64_t dma = h ? pmm_alloc_contig(DMA_PAGES, 32) : 0;
@@ -880,7 +881,7 @@ static void controller_add(struct pci_device *d) {
         kprintf("audio: HD Audio at %02x:%02x.%u found, but no memory for it\n", d->bus, d->dev, d->func);
         if (dma) pmm_free_contig(dma, DMA_PAGES);
         if (h) kfree(h);
-        return;
+        return -N_ERR_NO_MEMORY;
     }
     h->link.verb = link_verb;
     h->pci = d;
@@ -908,7 +909,7 @@ static void controller_add(struct pci_device *d) {
         d->kernel_owned = false;
         pmm_free_contig(dma, DMA_PAGES);
         kfree(h);
-        return;
+        return -N_ERR_UNSUPPORTED;
     }
     irq_on(h, true);
     h->guest = (struct iommu_guest){.stop = hda_guest_stop, .start = hda_guest_start, .ctx = h};
@@ -917,11 +918,8 @@ static void controller_add(struct pci_device *d) {
     pm_register(&h->pm);
     h->thread = kthread_create("hda", hda_thread, h);
     if (!h->thread) kprintf("audio: HD Audio at %02x:%02x.%u: no memory for its thread\n", d->bus, d->dev, d->func);
+    return 0;
 }
 
-void hda_init(void) {
-    for (int i = 0; i < pci_count(); i++) {
-        struct pci_device *d = pci_at(i);
-        if (d->cls == 0x04 && d->subcls == 0x03) controller_add(d);
-    }
-}
+static const struct n_pci_match hda_matches[] = {N_PCI_CLASS(0x04, 0x03)};
+const struct pci_driver hda_driver = {"hda", hda_matches, ARRAY_SIZE(hda_matches), hda_attach};

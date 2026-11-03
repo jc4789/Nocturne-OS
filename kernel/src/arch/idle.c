@@ -8,19 +8,11 @@
    MWAIT here asks for C1 (hint 0), the state the LAPIC timer never stops in.
 
    Performance: the hardware chooses within a range the kernel asks for, by a preference. Each
-   maker has its own registers for the same request:
-   - AMD's CPPC (CPUID 8000_0008h EBX[27]; PPR 57238 MSRC001_02B0-02B3): CPPC_CAP1 C001_02B0h
-     (highest 31:24, nominal 23:16, lowest nonlinear 15:8, lowest 7:0), CPPC_ENABLE C001_02B1h and
-     CPPC_REQ C001_02B3h (EPP 31:24, desired 23:16, minimum 15:8, maximum 7:0), the registers of
-     ACPI 6.5 8.4.6.1 in AMD's fixed hardware.
-   - Intel's HWP (CPUID 06H EAX[7]; SDM vol. 3B 17.4): IA32_PM_ENABLE 770h (bit 0, set once, for the
-     package; the others may be touched only after it), IA32_HWP_CAPABILITIES 771h (lowest 31:24,
-     most efficient 23:16, guaranteed 15:8, highest 7:0) and IA32_HWP_REQUEST 774h (EPP 31:24 where
-     CPUID 06H EAX[10] says, desired 23:16, maximum 15:8, minimum 7:0). The range is the whole of it
-     (17.4.10).
-   A CPU that refuses the enable write has neither, whatever CPUID says (a hypervisor's). */
+   maker has its own registers for the same request (struct cpu_perf_way, arch/cpu_maker.h). A CPU
+   that refuses the enable write has none, whatever CPUID says (a hypervisor's). */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/cpu_maker.h"
 #include "arch/cpuset.h"
 #include "arch/idle.h"
 #include "sys/settings.h"
@@ -67,56 +59,16 @@ bool cpu_idle_wake(unsigned cpu) {
 }
 
 /* ---- performance ---- */
-#define MSR_CPPC_CAP1   0xC00102B0u
-#define MSR_CPPC_ENABLE 0xC00102B1u
-#define MSR_CPPC_REQ    0xC00102B3u
-#define MSR_PM_ENABLE   0x770u
-#define MSR_HWP_CAPS    0x771u
-#define MSR_HWP_REQUEST 0x774u
 #define MSR_MPERF       0xE7u
 #define MSR_APERF       0xE8u
 
-/* What a CPU can be asked for: floor is the bottom of the range it is asked to keep to. */
-struct perf_caps {
-    unsigned highest, nominal, floor, lowest;
-};
-
-/* One maker's registers for the request. */
-struct perf_way {
-    const char *name;
-    uint32_t enable_msr;
-    void (*caps)(struct perf_caps *c);
-    void (*request)(const struct perf_caps *c, uint8_t preference);
-};
-
-/* The floor is the lowest nonlinear performance (ACPI 6.5 8.4.6.1.1.4, the lowest at which a lower
-   level still saves power out of proportion). */
-static void cppc_caps(struct perf_caps *c) {
-    uint64_t caps = rdmsr(MSR_CPPC_CAP1);
-    *c = (struct perf_caps){(caps >> 24) & 0xFF, (caps >> 16) & 0xFF, (caps >> 8) & 0xFF, caps & 0xFF};
-}
-static void cppc_request(const struct perf_caps *c, uint8_t preference) {
-    wrmsr(MSR_CPPC_REQ, (uint64_t)c->highest | (uint64_t)c->floor << 8 | (uint64_t)preference << 24);
-}
-static const struct perf_way cppc_way = {"CPPC", MSR_CPPC_ENABLE, cppc_caps, cppc_request};
-
-static void hwp_caps(struct perf_caps *c) {
-    uint64_t caps = rdmsr(MSR_HWP_CAPS);
-    *c = (struct perf_caps){caps & 0xFF, (caps >> 8) & 0xFF, (caps >> 24) & 0xFF, (caps >> 24) & 0xFF};
-}
-static void hwp_request(const struct perf_caps *c, uint8_t preference) {
-    wrmsr(MSR_HWP_REQUEST, (uint64_t)c->floor | (uint64_t)c->highest << 8 |
-                               (cpu_features.hwp_epp ? (uint64_t)preference << 24 : 0));
-}
-static const struct perf_way hwp_way = {"HWP", MSR_PM_ENABLE, hwp_caps, hwp_request};
-
 static uint8_t preference = CPU_PERF_PREFERENCE_DEFAULT;
-static const struct perf_way *way; /* the first CPU's finding: every CPU has the same (cpu_features_same) */
+static const struct cpu_perf_way *way; /* the first CPU's finding: every CPU has the same (cpu_features_same) */
 static bool effective, probed;
 
 /* This CPU's request: its range, the hardware choosing within it (desired 0) by the preference. */
 static void perf_request(void) {
-    struct perf_caps c;
+    struct cpu_perf_caps c;
     way->caps(&c);
     if (!c.highest) return;
     if (c.floor > c.highest) c.floor = c.highest;
@@ -124,9 +76,8 @@ static void perf_request(void) {
 }
 
 void cpu_perf_setup(void) {
-    const struct perf_way *w = cpu_features.vendor == CPU_VENDOR_AMD && cpu_features.cppc    ? &cppc_way
-                               : cpu_features.vendor == CPU_VENDOR_INTEL && cpu_features.hwp ? &hwp_way
-                                                                                             : NULL;
+    const struct cpu_maker *maker = cpu_features.maker;
+    const struct cpu_perf_way *w = maker->perf_way ? maker->perf_way() : NULL;
     bool here = w && wrmsr_checked(w->enable_msr, 1);
     /* the counters' ratio is all that is read: both may start from 0 (APM 17.3) */
     bool counters = cpu_features.aperf_mperf && wrmsr_checked(MSR_MPERF, 0) && wrmsr_checked(MSR_APERF, 0);
@@ -135,12 +86,12 @@ void cpu_perf_setup(void) {
         way = here ? w : NULL;
         effective = counters;
         if (way) {
-            struct perf_caps c;
+            struct cpu_perf_caps c;
             way->caps(&c);
             kprintf("cpu: %s highest %u nominal %u floor %u lowest %u, preference %u\n", way->name, c.highest, c.nominal,
                     c.floor, c.lowest, preference);
         } else {
-            kprintf("cpu: no CPPC or HWP: the firmware's performance policy stays\n");
+            kprintf("cpu: no way to ask for performance: the firmware's policy stays\n");
         }
     }
     if (way && here) perf_request();

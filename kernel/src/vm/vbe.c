@@ -111,9 +111,9 @@ static void vbe_monitor(struct vbe *v, struct screen_mode_desc *m, uint32_t *pre
 
 /* One display: its registers, its mode (the firmware's for the one it showed, else the EDID's
    preferred), its buffers, and a screen for them (screen 0 for the firmware's). */
-static void vbe_start(struct pci_device *d, bool legacy_only) {
+static int vbe_start(struct pci_device *d, bool legacy_only) {
     struct vbe *v = kzalloc(sizeof *v);
-    if (!v) return;
+    if (!v) return -N_ERR_NO_MEMORY;
     v->d = d;
     uint64_t vram = pci_bar_address(d, 0), vram_size = pci_bar_size(d, 0);
     bool firmware = fb.addr && fb.phys >= vram && fb.phys < vram + vram_size;
@@ -175,22 +175,19 @@ static void vbe_start(struct pci_device *d, bool legacy_only) {
             d->func, m.width, m.height, m.refresh_mhz / 1000, m.refresh_mhz % 1000, v->count, v->count > 1 ? "s" : "",
             screen_id(v->screen), m.name[0] ? ", monitor " : "", m.name);
     screen_set_buffers(v->screen, &vbe_ops, v, &m, v->buf, v->count, 0);
-    return;
+    return 0;
 fail:
     for (unsigned i = 0; i < 2; i++) fb_buffer_unmap(v->buf[i]);
     if (v->vram) vunmap(v->vram, v->vram_pages);
     if (v->mmio) vunmap((void *)v->mmio, MMIO_BYTES / PAGE_SIZE);
     kfree(v);
+    return -N_ERR_UNSUPPORTED;
 }
 
-void vbe_display_init(void) {
-    for (int i = 0; i < pci_count(); i++) {
-        struct pci_device *d = pci_at(i);
-        if (d->cls != 0x03 || d->subcls != 0x00) continue;
-        if (d->vendor == 0x1234 && d->device == 0x1111) vbe_start(d, false);
-        else if (d->vendor == 0x80EE && d->device == 0xBEEF) vbe_start(d, true);
-    }
-}
+static int vbe_attach(struct pci_device *d) { return vbe_start(d, d->vendor == 0x80EE); }
+
+static const struct n_pci_match vbe_matches[] = {N_PCI_ID_CLASS(0x1234, 0x1111, 0x03, 0x00), N_PCI_ID_CLASS(0x80EE, 0xBEEF, 0x03, 0x00)};
+const struct pci_driver vbe_driver = {"vbe", vbe_matches, ARRAY_SIZE(vbe_matches), vbe_attach};
 
 static bool vbe_quiesce(void *arg) {
     (void)arg;

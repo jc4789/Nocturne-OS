@@ -3,6 +3,7 @@
 #include "fs/bootrecord.h"
 #include "limine.h"
 #include "arch/cpu.h"
+#include "arch/mca.h"
 #include "arch/irq.h"
 #include "arch/fpu.h"
 #include "arch/smp.h"
@@ -196,7 +197,7 @@ void kmain(void) {
        CPU's APIC; the machine-check thresholds' entry in it once it is enabled (an APIC
        software-disabled holds every entry masked, APM vol. 2 16.4.7). */
     irq_init();
-    cpu_mca_interrupt_on();
+    mca_interrupt_on();
     clock_init(); /* the TSC's rate: stated or measured, and held to a rate reference */
     entry_init();
     sched_init();

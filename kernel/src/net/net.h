@@ -39,9 +39,6 @@ void net_rx(struct netif *dev, const void *frame, size_t len);
    room has come (its transmit completion). */
 void net_rx_notify(void);
 
-/* Every RTL8125 function there is, each its own adapter. */
-void rtl8125_probe(void);
-
 /* The index-th adapter (from 0): its MAC and IPv4 address, host byte order, ip 0 before it has
    one. False past the last. Any context, an interrupt handler too. */
 bool net_adapter_info(size_t index, uint8_t mac[6], uint32_t *ip, uint32_t *mask);

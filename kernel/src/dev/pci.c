@@ -194,6 +194,14 @@ static void pcie_identify(struct pci_device *d) {
     d->pcie_v2 = (caps & 0xF) >= 2;
 }
 
+/* 台帳へ。親の橋を先に載せる。 */
+static void device_list(struct pci_device *d) {
+    if (d->hal.listed) return;
+    if (d->upstream) device_list(d->upstream);
+    d->hal.info.at.pci = (struct n_pciinfo){d->bus, d->dev, d->func, d->cls, d->subcls, d->progif, d->vendor, d->device};
+    hal_add(&d->hal, d->upstream ? d->upstream->hal.info.id : 0, N_HAL_BUS_PCI, d->node, class_name(d->cls, d->subcls));
+}
+
 void pci_init(void) {
     uint64_t since = clock_now_ns(); /* the platform reset was before the firmware ran */
     const struct acpi_sdt *mcfg = acpi_find("MCFG", 0);
@@ -265,18 +273,7 @@ void pci_init(void) {
                 break;
             }
     }
-}
-
-struct pci_device *pci_find(uint16_t vendor, uint16_t device) {
-    for (size_t i = 0; i < ndevices; i++)
-        if (devices[i].vendor == vendor && devices[i].device == device) return &devices[i];
-    return NULL;
-}
-
-struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls) {
-    for (size_t i = 0; i < ndevices; i++)
-        if (devices[i].cls == cls && devices[i].subcls == subcls) return &devices[i];
-    return NULL;
+    for (size_t i = 0; i < ndevices; i++) device_list(&devices[i]);
 }
 
 void pci_enable_busmaster(struct pci_device *d) {
@@ -289,21 +286,6 @@ void pci_enable_busmaster(struct pci_device *d) {
 void pci_enable_io(struct pci_device *d) {
     uint16_t cmd = pci_read16(d->bus, d->dev, d->func, PCI_COMMAND);
     pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, cmd | PCI_COMMAND_IO);
-}
-
-int pci_list(struct n_pciinfo *out, int max) {
-    int n = 0;
-    for (size_t i = 0; i < ndevices && n < max; i++, n++) {
-        out[n].bus = devices[i].bus;
-        out[n].dev = devices[i].dev;
-        out[n].func = devices[i].func;
-        out[n].cls = devices[i].cls;
-        out[n].subcls = devices[i].subcls;
-        out[n].progif = devices[i].progif;
-        out[n].vendor = devices[i].vendor;
-        out[n].device = devices[i].device;
-    }
-    return n;
 }
 
 int pci_count(void) { return (int)ndevices; } /* at most 256 buses of 32 devices of 8 functions */

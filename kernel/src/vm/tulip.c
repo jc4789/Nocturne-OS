@@ -114,10 +114,9 @@ static bool tulip_quiesce(void *arg) {
 
 static struct pm_device tulip_pm = {.name = "tulip", .stage = PM_STAGE_IO, .quiesce = tulip_quiesce};
 
-bool tulip_probe(void) {
-    struct pci_device *d = pci_find(0x1011, 0x0009); /* 21140: Hyper-V legacy adapter */
-    if (!d) d = pci_find(0x1011, 0x0019);            /* 21143: QEMU */
-    if (!d || !(d->bar[0] & 1)) return false;
+static int tulip_attach(struct pci_device *d) {
+    if (iobase) return -N_ERR_BUSY; /* one adapter: its state is this file's */
+    if (!(d->bar[0] & 1)) return -N_ERR_UNSUPPORTED;
     pci_enable_busmaster(d);
     pci_enable_io(d);
     iobase = (uint16_t)(d->bar[0] & ~3u);
@@ -154,18 +153,18 @@ bool tulip_probe(void) {
     uint32_t gsi;
     if (!acpi_pci_gsi(d, &gsi)) {
         kprintf("net: tulip has no interrupt route\n");
-        return false;
+        return -N_ERR_UNSUPPORTED;
     }
     /* rings must live below 4 GiB: the tulip only has 32-bit descriptor pointers */
     uint64_t ring = pmm_alloc_contig(1, 32);
-    if (!ring) return false;
+    if (!ring) return -N_ERR_UNSUPPORTED;
     memset(phys_to_virt(ring), 0, PAGE_SIZE);
     rx = phys_to_virt(ring);
     tx = (struct tdesc *)((uint8_t *)phys_to_virt(ring) + NRX * sizeof(struct tdesc));
     uint64_t tx_ring = ring + NRX * sizeof(struct tdesc);
     for (int i = 0; i < NRX; i += 2) {
         uint64_t p = pmm_alloc_contig(1, 32);
-        if (!p) return false;
+        if (!p) return -N_ERR_UNSUPPORTED;
         for (int k = 0; k < 2; k++) {
             rxbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * 2048;
             rx[i + k].buf1 = (uint32_t)(p + k * 2048);
@@ -176,7 +175,7 @@ bool tulip_probe(void) {
     }
     for (int i = 0; i < NTX; i += 2) {
         uint64_t p = pmm_alloc_contig(1, 32);
-        if (!p) return false;
+        if (!p) return -N_ERR_UNSUPPORTED;
         for (int k = 0; k < 2; k++) {
             txbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * 2048;
             tx[i + k].buf1 = (uint32_t)(p + k * 2048);
@@ -201,7 +200,7 @@ bool tulip_probe(void) {
     tx[0].status = OWN;
     tx_cur = 1;
 
-    if (!irq_request_gsi(&(struct irq_spec){.name = "tulip", .handler = tulip_irq, .node = -1}, gsi)) return false;
+    if (!irq_request_gsi(&(struct irq_spec){.name = "tulip", .handler = tulip_irq, .node = -1}, gsi)) return -N_ERR_UNSUPPORTED;
     csr_wr(5, 0x1FFFF);
     csr_wr(7, (1u << 16) | (1u << 15) | (1u << 6) | (1u << 7)); /* NIS, AIS, RI, RU */
     /* store-and-forward, start TX/RX, full duplex, promiscuous (frames are filtered in software) */
@@ -213,5 +212,9 @@ bool tulip_probe(void) {
             nif.mac[1], nif.mac[2], nif.mac[3], nif.mac[4], nif.mac[5]);
     net_register(&nif);
     pm_register(&tulip_pm);
-    return true;
+    return 0;
 }
+
+/* 21140: Hyper-V's legacy adapter. 21143: QEMU. */
+static const struct n_pci_match tulip_matches[] = {N_PCI_ID(0x1011, 0x0009), N_PCI_ID(0x1011, 0x0019)};
+const struct pci_driver tulip_driver = {"tulip", tulip_matches, ARRAY_SIZE(tulip_matches), tulip_attach};

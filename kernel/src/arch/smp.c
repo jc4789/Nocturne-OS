@@ -9,6 +9,7 @@
 #include "arch/cpuset.h"
 #include "arch/gdt.h"
 #include "arch/idle.h"
+#include "arch/mca.h"
 #include "arch/irq.h"
 #include "arch/smp.h"
 #include "fs/bootrecord.h"
@@ -223,7 +224,7 @@ static NORETURN void ap_main(void *argument) {
     answer(c, START_PRESENT, true);
     /* no NMI comes before them: the panic's go to online CPUs */
     bool stacks = entry_stacks_init();
-    if (stacks) cpu_mca_interrupt_on();
+    if (stacks) mca_interrupt_on();
     __atomic_store_n(&c->start, stacks ? START_ARRIVED : START_FAILED, __ATOMIC_RELEASE);
     __atomic_fetch_add(&settled, 1, __ATOMIC_SEQ_CST);
     wq_wake_all(&start_q);
@@ -389,7 +390,7 @@ void smp_hold_in_init(void) {
 
 void smp_resume(void) {
     ASSERT(cpu_current_index() == 0);
-    cpu_mca_interrupt_on(); /* CPU 0's entry, now that its LAPIC is back (dev/pm.c) */
+    mca_interrupt_on(); /* CPU 0's entry, now that its LAPIC is back (dev/pm.c) */
     __atomic_store_n(&parking, false, __ATOMIC_RELEASE);
     unsigned count = 0;
     for (unsigned i = 1; i < topology.cpus; i++) {

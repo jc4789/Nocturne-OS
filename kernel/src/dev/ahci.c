@@ -29,6 +29,7 @@
 #include "dev/blk.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
+#include "dev/pci_drivers.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
@@ -1271,17 +1272,17 @@ static void ahci_worker(void *arg) {
     }
 }
 
-static void start(struct hba *h) {
+static int start(struct hba *h) {
     struct pci_device *pci = h->pci;
     uint64_t base = pci_bar_address(pci, 5);
     if (!base) {
         kprintf("ahci%d: no register window\n", h->index);
-        return;
+        return -N_ERR_NOT_FOUND;
     }
     h->regs = vmm_map_mmio(base, 0x100 + 0x80 * PORTS); /* the adapter's registers and those of every port */
     if (!h->regs) {
         kprintf("ahci%d: no memory to map its registers\n", h->index);
-        return;
+        return -N_ERR_NO_MEMORY;
     }
     pci_enable_busmaster(pci);
     hba_take(h);
@@ -1302,7 +1303,7 @@ static void start(struct hba *h) {
     mutex_lock(&h->reset);
     bool up = hba_set_up(h, false);
     mutex_unlock(&h->reset);
-    if (!up) return;
+    if (!up) return -N_ERR_IO;
     for (unsigned n = 0; n < PORTS; n++) {
         struct port *p = h->ports[n];
         if (p && rd(p, PxSSTS) & 0xF) port_examine(p); /* 0: nothing there yet */
@@ -1312,7 +1313,9 @@ static void start(struct hba *h) {
     if (!kthread_create(name, ahci_worker, h)) { /* nothing would know who is on a port after a link change */
         kprintf("ahci%d: no thread for its link changes\n", h->index);
         hba_kill(h);
+        return -N_ERR_NO_MEMORY;
     }
+    return 0;
 }
 
 /* On a board that spins its disks up in turn, before the power goes away (10.10.3): a disk told to
@@ -1397,21 +1400,21 @@ static bool ahci_resume(void *arg) {
 static struct pm_device ahci_pm = {.name = "ahci", .stage = PM_STAGE_STORAGE, .quiesce = ahci_quiesce,
                                    .resume = ahci_resume};
 
-void ahci_init(void) {
-    struct hba **tail = &hbas;
-    for (int i = 0; i < pci_count(); i++) {
-        struct pci_device *p = pci_at(i);
-        if (p->cls != 0x01 || p->subcls != 0x06 || p->progif != 0x01) continue;
-        struct hba *h = kzalloc(sizeof *h);
-        if (!h) {
-            kprintf("ahci: no memory for the adapter at %04x:%04x\n", p->vendor, p->device);
-            continue;
-        }
-        h->index = nhbas++;
-        h->pci = p;
-        *tail = h;
-        tail = &h->next;
-        start(h);
+static int ahci_attach(struct pci_device *p) {
+    struct hba *h = kzalloc(sizeof *h);
+    if (!h) {
+        kprintf("ahci: no memory for the adapter at %04x:%04x\n", p->vendor, p->device);
+        return -N_ERR_NO_MEMORY;
     }
-    if (hbas) pm_register(&ahci_pm);
+    h->index = nhbas++;
+    h->pci = p;
+    struct hba **tail = &hbas;
+    while (*tail) tail = &(*tail)->next;
+    *tail = h;
+    int r = start(h);
+    if (!h->index) pm_register(&ahci_pm);
+    return r;
 }
+
+static const struct n_pci_match ahci_matches[] = {N_PCI_CLASS_PROGIF(0x01, 0x06, 0x01)};
+const struct pci_driver ahci_driver = {"ahci", ahci_matches, ARRAY_SIZE(ahci_matches), ahci_attach};

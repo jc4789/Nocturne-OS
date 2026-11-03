@@ -622,7 +622,40 @@ n_result n_power_windows(n_handle cap, bool ask_to_close, char *top_title, size_
 }
 n_result n_power_say(n_handle cap, const struct n_power_state *state) { return NC5(SYS_POWER_SAY, cap, state, sizeof *state, 0, 0); }
 n_handle n_power_windows_watch(n_handle cap) { return (n_handle)NC5(SYS_POWER_WINDOWS_WATCH, cap, 0, 0, 0, 0); }
-n_result pcilist(struct n_pciinfo *out, int max) { return SC2(SYS_PCILIST, out, max); }
+n_result n_hal_list(struct n_hal_device *out, size_t max) { return SC2(SYS_HAL_LIST, out, max); }
+n_handle n_hal_watch(void) { return (n_handle)SC0(SYS_HAL_WATCH); }
+
+n_result n_hal_snapshot(struct n_hal_device **out) {
+    *out = NULL;
+    size_t capacity = 32;
+    for (;;) {
+        struct n_hal_device *grown = realloc(*out, capacity * sizeof **out);
+        if (!grown) {
+            free(*out);
+            *out = NULL;
+            return -N_ERR_NO_MEMORY;
+        }
+        *out = grown;
+        n_result total = n_hal_list(*out, capacity);
+        if (total < 0) {
+            free(*out);
+            *out = NULL;
+        }
+        if (total < 0 || (size_t)total <= capacity) return total;
+        capacity = (size_t)total;
+    }
+}
+
+n_result pcilist(struct n_pciinfo *out, int max) {
+    struct n_hal_device *list;
+    n_result total = n_hal_snapshot(&list);
+    if (total < 0) return total;
+    int n = 0;
+    for (n_result i = 0; i < total && n < max; i++)
+        if (list[i].bus == N_HAL_BUS_PCI) out[n++] = list[i].at.pci;
+    free(list);
+    return n;
+}
 
 static bool is_document(const char *path) {
     struct n_entry e;

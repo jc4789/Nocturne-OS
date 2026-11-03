@@ -19,6 +19,7 @@
 #include "arch/spin.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
+#include "dev/pci_drivers.h"
 #include "dev/usb.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
@@ -1033,6 +1034,7 @@ static void slot_quiet(struct usb_hc *hc, unsigned slot, struct xdev *xd) {
  * does, the memory stays allocated rather than handed back while the controller may still use it.
  * No drain looks at the slot once it is cleared here. */
 static void release_slot(struct usb_hc *hc, unsigned slot, struct xdev *xd) {
+    if (xd) hal_remove(&xd->dev.hal);
     __atomic_store_n(&hc->slots[slot], NULL, __ATOMIC_RELEASE);
     sync_drains(hc);
     /* a controller stopped for a restart holds nothing of its old slots any more */
@@ -1360,40 +1362,83 @@ static const char *speed_name(unsigned s) {
     }
 }
 
-/* Each interface of alternate 0 that takes an interrupt IN endpoint's reports, to its class driver,
-   with the descriptors between it and that endpoint. A device is one hub: a second hub interface
-   would share its state. */
-static void bind_classes(struct xdev *xd, uint8_t *cfg, unsigned total) {
-    struct usb_device *d = &xd->dev;
-    bool hub_taken = false;
-    for (unsigned off = 0; off + 2 <= total && !removed(d);) {
+/* The string descriptor index as a new UTF-8 string, NULL without one. USB 2.0 9.6.7: UTF-16LE of at most bLength's 253
+   bytes, in language 0x0409 or the first the device offers. Each unit takes at most three bytes in UTF-8. */
+char *usb_string(struct usb_device *d, uint8_t index) {
+    if (!index) return NULL;
+    uint8_t *raw = kmalloc(255);
+    if (!raw) return NULL;
+    int got = usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_STRING << 8, 0, raw, 4);
+    uint16_t language = got >= 4 ? (uint16_t)(raw[2] | raw[3] << 8) : 0x0409;
+    got = usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, (uint16_t)(USB_DESC_STRING << 8 | index), language, raw, 255);
+    char *out = NULL;
+    if (got >= 2 && raw[1] == USB_DESC_STRING) {
+        unsigned end = MIN((unsigned)got, (unsigned)raw[0]);
+        out = kmalloc((end / 2) * 3 + 1);
+        size_t at = 0;
+        for (unsigned i = 2; out && i + 1 < end; i += 2) {
+            uint32_t c = (uint32_t)raw[i] | (uint32_t)raw[i + 1] << 8;
+            if (c < 0x20 || (c >= 0xD800 && c <= 0xDFFF)) continue;
+            if (c < 0x80) {
+                out[at++] = (char)c;
+            } else if (c < 0x800) {
+                out[at++] = (char)(0xC0 | c >> 6);
+                out[at++] = (char)(0x80 | (c & 63));
+            } else {
+                out[at++] = (char)(0xE0 | c >> 12);
+                out[at++] = (char)(0x80 | (c >> 6 & 63));
+                out[at++] = (char)(0x80 | (c & 63));
+            }
+        }
+        if (out) out[at] = 0;
+    }
+    kfree(raw);
+    return out;
+}
+
+bool usb_next_interrupt_interface(const uint8_t *cfg, unsigned total, unsigned *at, const struct usb_interface_desc **intf_out,
+                                  const uint8_t **extra_out, unsigned *extra_len_out, const struct usb_endpoint_desc **ep_out) {
+    for (unsigned off = *at; off + 2 <= total;) {
         unsigned len = cfg[off];
         if (len < 2 || off + len > total) break;
         const struct usb_interface_desc *intf = (const void *)(cfg + off);
         off += len;
         if (cfg[off - len + 1] != USB_DESC_INTERFACE || len < 9 || intf->alternate) continue;
-        bool hub = intf->cls == 9;
-        if (!hub && !usbhid_claims(intf)) continue;
         const uint8_t *extra = cfg + off;
         unsigned extra_len = 0;
         const struct usb_endpoint_desc *ep = NULL;
-        for (unsigned at = off; at + 2 <= total && cfg[at] >= 2 && at + cfg[at] <= total && !ep; at += cfg[at]) {
-            if (cfg[at + 1] == USB_DESC_INTERFACE) break;
-            if (cfg[at + 1] == USB_DESC_ENDPOINT && cfg[at] >= 7) {
-                const struct usb_endpoint_desc *e = (const void *)(cfg + at);
-                if ((e->address & 0x80) && (e->attributes & 3) == 3) ep = e;
+        for (unsigned e = off; e + 2 <= total && cfg[e] >= 2 && e + cfg[e] <= total && !ep; e += cfg[e]) {
+            if (cfg[e + 1] == USB_DESC_INTERFACE) break;
+            if (cfg[e + 1] == USB_DESC_ENDPOINT && cfg[e] >= 7) {
+                const struct usb_endpoint_desc *found = (const void *)(cfg + e);
+                if ((found->address & 0x80) && (found->attributes & 3) == 3) ep = found;
             } else {
-                extra_len = (unsigned)(cfg + at + cfg[at] - extra);
+                extra_len = (unsigned)(cfg + e + cfg[e] - extra);
             }
         }
         if (!ep) continue;
-        if (hub) {
-            if (!hub_taken && d->hub) usbhub_attach(d, ep);
-            hub_taken = true;
-        } else {
-            usbhid_attach(d, intf, extra, extra_len, ep);
-        }
+        *at = off;
+        *intf_out = intf;
+        *extra_out = extra;
+        *extra_len_out = extra_len;
+        *ep_out = ep;
+        return true;
     }
+    return false;
+}
+
+/* A device is one hub: a second hub interface would share its state. */
+static bool bind_hub(struct usb_device *d, const uint8_t *cfg, unsigned total) {
+    const struct usb_interface_desc *intf;
+    const struct usb_endpoint_desc *ep;
+    const uint8_t *extra;
+    unsigned extra_len;
+    for (unsigned at = 0; d->hub && usb_next_interrupt_interface(cfg, total, &at, &intf, &extra, &extra_len, &ep);)
+        if (intf->cls == 9) {
+            usbhub_attach(d, ep);
+            return true;
+        }
+    return false;
 }
 
 /* Every endpoint the configuration enables: those of each interface's alternate 0 (xHCI 3.3.5), whatever
@@ -1448,9 +1493,9 @@ static bool configuration_supported(const struct usb_device *d, const uint8_t *c
     for (unsigned off = 0; off + 2 <= total && cfg[off] >= 2; off += cfg[off]) {
         if (cfg[off + 1] != USB_DESC_INTERFACE || cfg[off] < 9 || off + 9 > total) continue;
         const struct usb_interface_desc *intf = (const void *)(cfg + off);
-        if (intf->cls == 9 || usbhid_claims(intf) || usbmsc_claims(intf) ||
-            usbnet_claims(intf))
-            return true;
+        if (intf->cls == 9) return true;
+        for (unsigned i = 0; i < USB_DRIVERS; i++)
+            if (usb_drivers[i]->claims(intf)) return true;
     }
     return false;
 }
@@ -1655,6 +1700,12 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
     if (parent) ksnprintf(via, sizeof via, " (hub port %u)", port);
     kprintf("usb: %04x:%04x class %02x on controller %d port %u%s, %s speed, slot %u\n", d->desc.vendor,
             d->desc.product, d->desc.cls, hc->index, root_port, via, speed_name(speed), slot);
+    d->hal.info.at.usb.vendor = d->desc.vendor;
+    d->hal.info.at.usb.product = d->desc.product;
+    d->hal.info.at.usb.cls = d->desc.cls;
+    d->hal.info.at.usb.port = (uint8_t)root_port;
+    d->hal.info.at.usb.route = route;
+    hal_add(&d->hal, parent ? parent->hal.info.id : hc->pci->hal.info.id, N_HAL_BUS_USB, hc->pci->node, NULL);
     int got = 0;
     uint8_t *cfg = NULL;
     /* devices still busy after reset (or slow to fetch their descriptors) answer a moment later */
@@ -1678,9 +1729,12 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
         usbhub_detach(d);
         goto fail;
     }
-    bind_classes(xd, cfg, (unsigned)got);
-    if (!removed(d)) usbmsc_attach(d, cfg, (unsigned)got);
-    if (!removed(d)) usbnet_attach(d, cfg, (unsigned)got);
+    char *product = usb_string(d, d->desc.product_name);
+    if (product) hal_name(&d->hal, product);
+    kfree(product);
+    if (bind_hub(d, cfg, (unsigned)got)) hal_bound(&d->hal, "usbhub");
+    for (unsigned i = 0; i < USB_DRIVERS && !removed(d); i++)
+        if (usb_drivers[i]->attach(d, cfg, (unsigned)got)) hal_bound(&d->hal, usb_drivers[i]->name);
     kfree(cfg);
     return xd;
 fail:
@@ -1728,9 +1782,7 @@ void usb_remove(struct usb_device *d) {
     }
     kprintf("usb: slot %u (%04x:%04x) removed\n", d->slot, d->desc.vendor, d->desc.product);
     usbhub_detach(d);
-    usbhid_detach(d);
-    usbmsc_detach(d);
-    usbnet_detach(d);
+    for (unsigned i = 0; i < USB_DRIVERS; i++) usb_drivers[i]->detach(d);
     release_slot(hc, d->slot, xd);
 }
 
@@ -1946,7 +1998,8 @@ static void hc_devices(struct usb_hc *hc) {
         bool asked = __atomic_exchange_n(&xd->work, false, __ATOMIC_ACQ_REL);
         if (!asked && !usbhub_pending(&xd->dev)) continue;
         usbhub_work(&xd->dev);
-        if (hc->slots[s] == xd && !removed(&xd->dev)) usbhid_work(&xd->dev);
+        for (unsigned i = 0; i < USB_DRIVERS && hc->slots[s] == xd && !removed(&xd->dev); i++)
+            if (usb_drivers[i]->work) usb_drivers[i]->work(&xd->dev);
     }
 }
 
@@ -2310,36 +2363,39 @@ static bool xhci_resume(void *arg) {
 
 static const char *xhci_refuse(void *arg) {
     (void)arg;
-    return usbmsc_attached() ? "A USB disk is plugged in" : NULL;
+    for (unsigned i = 0; i < USB_DRIVERS; i++) {
+        const char *why = usb_drivers[i]->refuse ? usb_drivers[i]->refuse() : NULL;
+        if (why) return why;
+    }
+    return NULL;
 }
 
 static struct pm_device xhci_pm = {.name = "xhci", .stage = PM_STAGE_BUS, .quiesce = xhci_quiesce,
                                    .resume = xhci_resume, .refuse = xhci_refuse};
 
-void usb_init(void) {
-    for (int i = 0; i < pci_count(); i++) {
-        struct pci_device *d = pci_at(i);
-        if (d->cls != 0x0C || d->subcls != 0x03 || d->progif != 0x30) continue;
-        struct usb_hc *hc = kzalloc(sizeof *hc), **at;
-        if (!hc || !(at = kappend(&controllers, &ncontrollers, &controllers_room, sizeof *controllers))) {
-            kfree(hc);
-            kprintf("usb: no memory for the controller at %02x:%02x.%u\n", d->bus, d->dev, d->func);
-            continue;
-        }
-        hc->index = (int)(ncontrollers - 1);
-        hc->pci = d;
-        alarm_init(&hc->poll, poll_fire);
-        *at = hc;
+static int xhci_attach(struct pci_device *d) {
+    struct usb_hc *hc = kzalloc(sizeof *hc), **at;
+    if (!hc || !(at = kappend(&controllers, &ncontrollers, &controllers_room, sizeof *controllers))) {
+        kfree(hc);
+        kprintf("usb: no memory for the controller at %02x:%02x.%u\n", d->bus, d->dev, d->func);
+        return -N_ERR_NO_MEMORY;
     }
-    if (!ncontrollers) return;
-    __atomic_store_n(&unsettled, (unsigned)ncontrollers, __ATOMIC_RELEASE);
-    for (size_t i = 0; i < ncontrollers; i++) {
-        char name[16];
-        ksnprintf(name, sizeof name, "usb%d", controllers[i]->index);
-        if (!(controllers[i]->worker = kthread_create(name, hc_worker, controllers[i]))) {
-            kprintf("usb: no memory for controller %d's worker\n", controllers[i]->index);
-            hc_settled(controllers[i]);
-        }
+    hc->index = (int)(ncontrollers - 1);
+    hc->pci = d;
+    alarm_init(&hc->poll, poll_fire);
+    *at = hc;
+    /* every attach ends before C: is looked for (kmain_late), so usb_enumerating counts them all */
+    __atomic_fetch_add(&unsettled, 1, __ATOMIC_ACQ_REL);
+    char name[16];
+    ksnprintf(name, sizeof name, "usb%d", hc->index);
+    if (!(hc->worker = kthread_create(name, hc_worker, hc))) {
+        kprintf("usb: no memory for controller %d's worker\n", hc->index);
+        hc_settled(hc);
+        return -N_ERR_NO_MEMORY;
     }
-    pm_register(&xhci_pm);
+    if (ncontrollers == 1) pm_register(&xhci_pm);
+    return 0;
 }
+
+static const struct n_pci_match xhci_matches[] = {N_PCI_CLASS_PROGIF(0x0C, 0x03, 0x30)};
+const struct pci_driver xhci_driver = {"xhci", xhci_matches, ARRAY_SIZE(xhci_matches), xhci_attach};

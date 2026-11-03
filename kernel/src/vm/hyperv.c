@@ -3,12 +3,13 @@
 #include "arch/cpu.h"
 #include "sys/clock.h"
 #include "vm/hyperv.h"
+#include "vm/vm.h"
 
 struct hv_info hv;
 
 void hv_detect(void) {
     uint32_t a, b, c, d;
-    if (!cpu_features.hypervisor) return;
+    if (!vm_cpu_guest()) return;
     cpuid(0x40000000, 0, &a, &b, &c, &d);
     if (b != 0x7263694D || c != 0x666F736F || d != 0x76482074) return; /* "Microsoft Hv" */
     hv.max_leaf = a;

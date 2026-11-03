@@ -321,6 +321,7 @@ void hv_util_init(void) {
     for (size_t i = 0; i < ARRAY_SIZE(services); i++) {
         struct vmbus_channel *ch = vmbus_find(&services[i].type, 0);
         if (!ch || vmbus_open(ch, 32 * 1024, 32 * 1024, util_callback, &services[i])) continue;
+        hal_bound(&ch->hal, "hv_util");
         if (names[0]) strlcat(names, ", ", sizeof names);
         strlcat(names, services[i].name, sizeof names);
     }

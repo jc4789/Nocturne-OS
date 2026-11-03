@@ -289,6 +289,7 @@ static bool mouse_init(void) {
         return false;
     }
     input_device_add(&mouse_input);
+    hal_bound(&ms.ch->hal, "hv_input");
     return true;
 }
 

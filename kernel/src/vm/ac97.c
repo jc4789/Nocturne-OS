@@ -275,11 +275,9 @@ static struct pm_device ac97_pm = {.name = "ac97", .stage = PM_STAGE_IO, .quiesc
 
 static const struct audio_output_ops ac97_ops = {.open = ac97_open, .close = ac97_close, .run = ac97_run, .status = ac97_status};
 
-void ac97_init(void) {
-    static const uint16_t ids[] = {0x2415, 0x2425, 0x2445, 0x2485, 0x24C5, 0x24D5, 0x266E, 0x27DE, 0x7195};
-    struct pci_device *d = NULL;
-    for (size_t i = 0; i < ARRAY_SIZE(ids) && !d; i++) d = pci_find(0x8086, ids[i]);
-    if (!d || !(d->bar[0] & 1) || !(d->bar[1] & 1)) return;
+static int ac97_attach(struct pci_device *d) {
+    if (hw_ready) return -N_ERR_BUSY; /* one codec: its state is this file's */
+    if (!(d->bar[0] & 1) || !(d->bar[1] & 1)) return -N_ERR_UNSUPPORTED;
     nam = (uint16_t)(d->bar[0] & ~3u);
     nabm = (uint16_t)(d->bar[1] & ~3u);
     pci_enable_busmaster(d);
@@ -289,7 +287,7 @@ void ac97_init(void) {
     uint64_t bdl = pmm_alloc_contig(1, 32);
     if (!bdl) {
         kprintf("audio: AC'97 found, but no memory below 4 GiB for its descriptors\n");
-        return;
+        return -N_ERR_NO_MEMORY;
     }
     memset(phys_to_virt(bdl), 0, PAGE_SIZE);
     bdl_view = phys_to_virt(bdl);
@@ -317,4 +315,10 @@ void ac97_init(void) {
     pm_register(&ac97_pm);
     kprintf("audio: AC'97 (%04x) at ports %#x/%#x, %s, 48 kHz stereo\n", d->device, nam, nabm,
             line ? "interrupt" : "no interrupt (timed refill)");
+    return 0;
 }
+
+static const struct n_pci_match ac97_matches[] = {N_PCI_ID(0x8086, 0x2415), N_PCI_ID(0x8086, 0x2425), N_PCI_ID(0x8086, 0x2445),
+                                                  N_PCI_ID(0x8086, 0x2485), N_PCI_ID(0x8086, 0x24C5), N_PCI_ID(0x8086, 0x24D5),
+                                                  N_PCI_ID(0x8086, 0x266E), N_PCI_ID(0x8086, 0x27DE), N_PCI_ID(0x8086, 0x7195)};
+const struct pci_driver ac97_driver = {"ac97", ac97_matches, ARRAY_SIZE(ac97_matches), ac97_attach};

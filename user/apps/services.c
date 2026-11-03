@@ -21,12 +21,11 @@
 #include <threads.h>
 #include "nocturne.h"
 #include "nocturne_services.h"
-#include "nvrm.h"
 
 /* ---- 宣言 ---- */
 enum service_scope {
     SCOPE_MACHINE,  /* 機械に一つ。 */
-    SCOPE_FUNCTION, /* 宣言の function_matches に合う PCI の機能ごとに一つ。引数は N_PCI_TARGET の 16 進数。 */
+    SCOPE_FUNCTION, /* 宣言の matches に合う、実装の無い PCI の機能ごとに一つ。引数は N_PCI_TARGET の 16 進数。 */
 };
 /* 失敗したときの扱い。結果 0 で終わるのは失敗ではない。 */
 struct failure_rule {
@@ -49,14 +48,15 @@ struct declared_service {
     const char *const *needs; /* 先に準備が済んでいなければならないサービス。NULL 終わり。 */
     struct failure_rule on_failure;
     int clients_from;         /* この級以上は接続してよい。CLIENTS_NONE は誰も。 */
-    bool (*function_matches)(const struct n_pciinfo *f); /* SCOPE_FUNCTION だけ */
+    const struct n_pci_match *matches; /* SCOPE_FUNCTION だけ */
+    size_t match_count;
 };
 
 #define CAPS(...) .caps = (const enum n_cap[]){__VA_ARGS__}, \
                   .cap_count = sizeof((const enum n_cap[]){__VA_ARGS__}) / sizeof(enum n_cap)
 #define NAMES(...) (const char *const[]){__VA_ARGS__, NULL}
 
-static bool nvidia_display(const struct n_pciinfo *f) { return nvrm_pci_is_gpu(f->vendor, f->cls, f->subcls, f->progif); }
+static const struct n_pci_match nvidia_display[] = {N_PCI_VENDOR_CLASS_PROGIF(0x10DE, 0x03, 0x00, 0x00), N_PCI_VENDOR_CLASS_PROGIF(0x10DE, 0x03, 0x02, 0x00)};
 
 static const struct declared_service declared[] = {
     {.name = "systemlog", .program = "systemlog", .cls = N_CLASS_SYSTEM, .at_boot = true,
@@ -64,7 +64,7 @@ static const struct declared_service declared[] = {
     /* ドライバーは自分の機能だけを claim し、システムの級を持たない。相手は nvrm が申し込む名前で来る。 */
     {.name = "gpu", .program = "nvrm", .client_image = "nvk", .cls = N_CLASS_USER, .scope = SCOPE_FUNCTION, .at_boot = true, .optional = true,
      CAPS(N_CAP_PCI_CLAIM), .on_failure = {2, 2000, 60000}, .clients_from = CLIENTS_NONE,
-     .function_matches = nvidia_display},
+     .matches = nvidia_display, .match_count = sizeof nvidia_display / sizeof *nvidia_display},
     {.name = "accounts", .program = "accounts", .cls = N_CLASS_SYSTEM, .at_boot = true,
      CAPS(N_CAP_STORE_PRIVATE), .on_failure = {5, 500, 60000}, .clients_from = N_CLASS_USER},
     {.name = "settings", .program = "settingsd", .cls = N_CLASS_SYSTEM, .at_boot = true,
@@ -242,42 +242,28 @@ static struct instance *instance_find(const struct declared_service *d, const ch
 /* ---- 表から実例を作る。解けない項目は壊れた実例になり、理由をログへ書く。 ---- */
 enum { VISIT_NEW, VISIT_OPEN, VISIT_DONE };
 
-static void pci_functions(struct n_pciinfo **out, int *count) {
-    *out = NULL;
-    *count = 0;
-    struct n_pciinfo *list = NULL;
-    size_t capacity = 16;
-    for (;;) {
-        if (capacity > INT_MAX / 2) break;
-        struct n_pciinfo *grown = realloc(list, capacity * sizeof *list);
-        if (!grown) break;
-        list = grown;
-        int n = pcilist(list, (int)capacity);
-        if (n < 0) break;
-        if ((size_t)n < capacity) {
-            *out = list;
-            *count = n;
-            return;
-        }
-        capacity *= 2;
-    }
-    free(list);
+static bool function_matches(const struct declared_service *d, const struct n_hal_device *f) {
+    if (f->bus != N_HAL_BUS_PCI || f->state != N_HAL_UNBOUND) return false;
+    for (size_t i = 0; i < d->match_count; i++)
+        if (n_pci_matches(&d->matches[i], &f->at.pci)) return true;
+    return false;
 }
 
-static void instances_of(const struct declared_service *d, bool broken, const struct n_pciinfo *functions, int function_count) {
+static void instances_of(const struct declared_service *d, bool broken, const struct n_hal_device *functions, int function_count) {
     if (d->scope == SCOPE_MACHINE) {
         instance_new(d, NULL, broken);
         return;
     }
     for (int i = 0; i < function_count; i++) {
-        if (!d->function_matches(&functions[i])) continue;
+        if (!function_matches(d, &functions[i])) continue;
         char argument[8];
-        snprintf(argument, sizeof argument, "%04x", (unsigned)N_PCI_TARGET(functions[i].bus, functions[i].dev, functions[i].func));
+        const struct n_pciinfo *f = &functions[i].at.pci;
+        snprintf(argument, sizeof argument, "%04x", (unsigned)N_PCI_TARGET(f->bus, f->dev, f->func));
         instance_new(d, argument, broken);
     }
 }
 
-static bool visit(const struct declared_service *d, unsigned char *marks, const struct n_pciinfo *functions, int function_count) {
+static bool visit(const struct declared_service *d, unsigned char *marks, const struct n_hal_device *functions, int function_count) {
     size_t i = (size_t)(d - declared);
     if (marks[i] == VISIT_DONE) return true;
     if (marks[i] == VISIT_OPEN) {
@@ -302,9 +288,9 @@ static bool visit(const struct declared_service *d, unsigned char *marks, const 
 
 static void instances_from_table(void) {
     unsigned char marks[DECLARED] = {VISIT_NEW};
-    struct n_pciinfo *functions;
-    int function_count;
-    pci_functions(&functions, &function_count);
+    struct n_hal_device *functions;
+    n_result function_count = n_hal_snapshot(&functions);
+    if (function_count < 0) function_count = 0;
     for (size_t i = 0; i < DECLARED; i++) visit(&declared[i], marks, functions, function_count);
     free(functions);
 }

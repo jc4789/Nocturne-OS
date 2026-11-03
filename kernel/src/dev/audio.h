@@ -13,7 +13,6 @@
    closed like any handle: the device stops, the driver stays, and the next service opens it again. */
 
 void audio_init(void);
-void hda_init(void); /* dev/hda.c: every High Definition Audio controller's outputs */
 
 struct audio_output;
 struct audio_open;

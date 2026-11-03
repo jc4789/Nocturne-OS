@@ -8,8 +8,10 @@
    never decide how real hardware is driven. */
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
+struct pci_driver;
 struct pm_device;
 
 /* Whose machine Nocturne runs in: its emulated devices and firmware. */
@@ -25,15 +27,18 @@ enum vm_machine {
    and signature, and the ACPI firmware's OEM ID. A hypervisor that states the TSC's rate gives it
    to the clock (clock_register_tsc_hz). */
 void vm_detect(void);
+/* Whether a hypervisor runs this CPU (CPUID leaf 1 ECX[31]), which arch/cpu.c asks before vm_detect:
+   what the CPU's own registers state of its TSC is not its TSC's, and it may hide what the hardware
+   has to have. */
+bool vm_cpu_guest(void);
 enum vm_machine vm_machine(void);
 static inline bool vm_hosted(void) { return vm_machine() != VM_NONE; }
 
 /* ---- devices, at the places the kernel looks for each kind ---- */
 void vm_init(void);              /* the hypervisor's own bus (VMBus) and what rides on it; before PCI */
-void vm_storage_init(void);      /* the emulated disks */
-bool vm_net_probe(void);         /* an emulated or synthetic network adapter, when no real one */
-void vm_audio_init(void);        /* emulated sound */
-void vm_display_init(void);      /* the emulated displays: screens with buffers of their own (dev/fb.h) */
+/* The drivers of the emulated PCI devices, after the real ones in dev/pci_drivers.c's table. None on real hardware. */
+const struct pci_driver *const *vm_pci_drivers(size_t *count);
+void vm_bind_fixed(void);        /* what no PCI identity finds: the legacy disk ports, VMBus's disks and network */
 void vm_display_pm(struct pm_device *display); /* how the emulated display comes back from sleep */
 void vm_session_init(void);      /* the host's enhanced session, once the desktop runs */
 

@@ -86,12 +86,12 @@ static inline void wrmsr(uint32_t msr, uint64_t v) {
 /* A write the manuals allow but a model's own document says faults (arch/apic.c): false where
    it raised #GP, which isr_exception resumes past (arch/isr.asm). */
 bool wrmsr_checked(uint32_t msr, uint64_t v);
-enum cpu_vendor { CPU_VENDOR_OTHER, CPU_VENDOR_INTEL, CPU_VENDOR_AMD };
+struct cpu_maker;
 /* What the CPUs have (arch/cpu.c): set by cpu_features_init on the first CPU, before anything
    reads it, and the same on every CPU after (cpu_features_same). The features Nocturne requires
    have no field: every CPU has them. The flags are the optional ones. */
 struct cpu_features {
-    enum cpu_vendor vendor;
+    const struct cpu_maker *maker; /* arch/cpu_maker.h */
     unsigned family, model, stepping;
     unsigned phys_bits;      /* physical address width */
     unsigned clflush_bytes;  /* the line CLFLUSH and CLFLUSHOPT act on */
@@ -101,7 +101,7 @@ struct cpu_features {
        hypervisor's guest), tsc_by saying why, and the clock measures it (sys/clock.c). */
     uint64_t tsc_num, tsc_den;
     const char *tsc_by;
-    bool hypervisor, mwait, pcid, tsc_deadline, invariant_tsc, aperf_mperf, cppc, hwp, hwp_epp, invlpgb, tme,
+    bool mwait, pcid, tsc_deadline, invariant_tsc, aperf_mperf, cppc, hwp, hwp_epp, invlpgb, tme, rdrand,
         arch_capabilities, topology_extensions, umip, scalable_mca, lfence_serializing;
     bool arat; /* the LAPIC timer goes on counting in every C-state */
     bool cmci; /* the banks' corrected errors have Intel's LVT entry (SDM vol. 3B 18.5) */
@@ -120,14 +120,6 @@ bool cpu_features_same(void); /* another CPU as it starts: true when it has what
    reporting; the performance request (arch/idle.h). Interrupts off, the CPU's page tables still
    the bootloader's or the wake page's. False when this CPU cannot hold what the first one holds. */
 bool cpu_setup(unsigned index);
-/* Machine checks (AMD APM vol. 2 ch. 9, Intel SDM vol. 3B ch. 18). cpu_mca_interrupt_on: this CPU,
-   once its LAPIC is enabled (an LVT entry written before that stays masked, APM 16.4.7): its
-   corrected errors are told through an interrupt as they happen, by whichever way its vendor
-   gives. cpu_machine_check: the #MC handler, on its IST stack:
-   it logs every bank's error, returns where all of them were corrected, panics otherwise. */
-void cpu_mca_interrupt_on(void);
-struct regs;
-void cpu_machine_check(struct regs *r);
 
 #define MSR_EFER  0xC0000080u
 #define EFER_SCE  (1u << 0)

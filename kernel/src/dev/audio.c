@@ -273,6 +273,4 @@ int64_t audio_syscall_watch(int cap) {
 
 void audio_init(void) {
     watched_init(&list_watched, NULL); /* before an output is added */
-    hda_init();
-    vm_audio_init();
 }

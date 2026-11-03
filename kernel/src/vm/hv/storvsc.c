@@ -309,7 +309,11 @@ static void storvsc_start(struct vmbus_channel *ch) {
     mutex_lock(&s->lock);
     int r = negotiate(s);
     mutex_unlock(&s->lock);
-    if (r) return;
+    if (r) {
+        hal_failed(&ch->hal, "storvsc", -N_ERR_IO);
+        return;
+    }
+    hal_bound(&ch->hal, "storvsc");
     for (int lun = 0; lun < 64; lun++) probe_lun(s, (uint8_t)lun);
 }
 
