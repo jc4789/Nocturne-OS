@@ -70,7 +70,7 @@ $(BUILD)/kt/third_party/uacpi/%.o: third_party/uacpi/%.c
 $(BUILD)/kt/%.asm.o: %.asm
 	@mkdir -p $(dir $@)
 	@echo "  NASM $< (test)"
-	@$(NASM) -f elf64 -g $< -o $@
+	@$(NASM) -f elf64 -g $(ENTRY_INC) $< -o $@
 
 $(BUILD)/kernel-test.elf: $(KTOBJ) kernel/linker.ld
 	@echo "  LD   $@"
@@ -89,7 +89,22 @@ $(BUILD)/host/store.exe: $(STORE_C) $(wildcard common/store/*.h) common/store_fo
 $(BUILD)/k/%.asm.o: %.asm
 	@mkdir -p $(dir $@)
 	@echo "  NASM $<"
-	@$(NASM) -f elf64 -g $< -o $@
+	@$(NASM) -f elf64 -g $(ENTRY_INC) $< -o $@
+
+# The entry image's code (kernel/src/sys/entry.c): built apart from the kernel, a flat file without
+# relocations, which runs in every program at any address.
+ENTRY_CODE := $(BUILD)/k/entry/entry_code.bin
+ENTRY_INC := -I$(dir $(ENTRY_CODE))
+$(BUILD)/k/entry/clock.o: kernel/entry/clock.c common/clock_data.h
+	@mkdir -p $(dir $@)
+	@echo "  CC   $<"
+	@$(CC) --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector -fPIC -fvisibility=hidden -mno-red-zone \
+	    -O2 -std=gnu11 -fno-asynchronous-unwind-tables -mgeneral-regs-only -Icommon -c $< -o $@
+$(ENTRY_CODE): $(BUILD)/k/entry/clock.o kernel/entry/entry.ld
+	@echo "  LD   $@"
+	@$(LD) -m elf_x86_64 -nostdlib -static -e 0 -T kernel/entry/entry.ld $< -o $@.elf
+	@llvm-objcopy -O binary $@.elf $@
+$(BUILD)/k/kernel/src/sys/entry_code.asm.o $(BUILD)/kt/kernel/src/sys/entry_code.asm.o: $(ENTRY_CODE)
 
 $(BUILD)/kernel.elf: $(KOBJ) kernel/linker.ld
 	@echo "  LD   $@"
@@ -105,6 +120,8 @@ UCFLAGS := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector 
            -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections \
            -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Iuser/include -Icommon -MMD -MP
 ULDFLAGS := -m elf_x86_64 -s -nostdlib -static -z max-page-size=0x1000 -T user/user.ld --no-dynamic-linker
+# What a driver image links as well as a program (ports/mesa/nvk.mk): it lands at any address.
+IMAGE_CFLAGS := -fPIC -fvisibility=hidden
 
 LIBC_C   := $(shell find user/libc -name '*.c') common/gfx.c
 LIBC_ASM := $(shell find user/libc -name '*.asm') common/unifont.asm
@@ -258,10 +275,13 @@ CPP_APPS := $(notdir $(basename $(wildcard user/apps/*.cpp)))
 CPP_BINS := $(addprefix $(PROGRAMS)/,$(CPP_APPS))
 APP_BINS := $(addprefix $(PROGRAMS)/,$(APPS)) $(CPP_BINS)
 
+# The libc outside the browser is such code. A target's flags come after UCFLAGS, and the last of
+# -fno-pic and -fPIC holds.
+$(filter-out $(BUILD)/u/user/libc/web/%,$(LIBC_OBJ)): OBJECT_CFLAGS := $(IMAGE_CFLAGS)
 $(BUILD)/u/%.o: %.c
 	@mkdir -p $(dir $@)
 	@echo "  CC   $<"
-	@$(CC) $(UCFLAGS) -c $< -o $@
+	@$(CC) $(UCFLAGS) $(OBJECT_CFLAGS) -c $< -o $@
 
 # The checked-in copy permits in-OS linking without Python; regenerate on host edits.
 user/libc/web/js_bootstrap.inc: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json \
@@ -323,10 +343,10 @@ include ports/mesa/mesa.mk
 # has both: the C++ compiled here with libc++ 18's headers uses only what libc++ 23 still provides.
 CXX_RUNTIME_LINK := $(if $(LLVMPIPE),$(LLVM_RUNTIMES)/Lib/libc++.a $(LLVM_RUNTIMES)/Lib/libunwind.a,\
     $(BUILD)/u/user/libc/cxxabi.cpp.o $(CXX_RUNTIME_OBJ))
-# Zink and NVK (with its Rust archive and libnvrm) are lazy members like the rest: only a program
-# that draws with OpenGL pulls them in.
+# Zink is a lazy member like the rest: only a program that draws with OpenGL pulls it in. Vulkan's
+# driver is not a member: it is an image (common/gpu_abi.h).
 LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(EXPAT_OBJ) $(FF_OBJ) $(FT_OBJ) $(WASM_LINK) \
-    $(CXX_RUNTIME_LINK) $(MESA_OBJ) $(ZINK_OBJ) $(NVK_OBJ) $(NVRM_CLIENT_OBJ)
+    $(CXX_RUNTIME_LINK) $(MESA_OBJ) $(ZINK_OBJ) $(VK_CLIENT_OBJ)
 # Programs are linked from the libc's members and, with llvmpipe, LLVM's libraries. The SDK's
 # libc.a is made from the same list: a program linked inside Nocturne reaches llvmpipe through
 # the same members and needs what they need.
@@ -337,7 +357,7 @@ $(LIBC_RSP): $(LIBC_LINK) $(LLVM_JIT_LIBS) Makefile
 	@$(file >$@,$(LIBC_LINK) $(LLVM_JIT_LIBS))
 
 # A unit's check (scripts/link_unit.py) reads the symbols of every other member.
-$(NVK_UNIT): | $(filter-out $(NVK_UNIT),$(LIBC_LINK))
+$(NVK_UNIT): | $(LIBC_LINK) $(NVRM_CLIENT_OBJ)
 
 # A program keeps its symbol table beside the build (build/symbols/<name>), so that the address
 # of a fault in a serial log maps to a function (llvm-symbolizer --obj=build/symbols/<name>); the
@@ -354,6 +374,8 @@ $(BUILD)/u/tests/media_cenc_test.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_pa
 $(BUILD)/u/tests/media_cenc_test.o: user/libc/media_mse.c
 $(BUILD)/u/tests/nvk_contracttest.o: UCFLAGS += -Ithird_party/mesa/include
 $(BUILD)/tests/nvk_contracttest: private ULDFLAGS += --gc-sections
+$(BUILD)/tests/nvk_contracttest: private TEST_OBJ := $(NVK_OBJ) $(NVRM_CLIENT_OBJ)
+$(BUILD)/tests/nvk_contracttest: $(NVK_OBJ) $(NVRM_CLIENT_OBJ)
 # nvrm's request server exactly as nvrm links it, against the test's fake RM OS layer.
 $(BUILD)/u/tests/nvrm_servetest.o: UCFLAGS += $(NVRM_CLIENT_INC)
 $(BUILD)/tests/nvrm_servetest: private TEST_OBJ := $(NVRM_OUT)/os/nvrm_serve.o
@@ -573,7 +595,7 @@ $(NVIDIA_FW_STATE): nvidia-firmware-check scripts/layout.py
 
 # everything scripts/layout.py puts on C:
 # tests/testrun は媒体に入れないが、一緒に組む。
-DISK_FILES := $(BUILD)/tests/testrun $(APP_BINS) $(GO_FILES) $(RUST_FILES) $(LLVM_FILES) $(NVRM_FILES) $(PROGRAMS)/tcc $(LICENSE_FILES) $(BUILD)/sdk.stamp \
+DISK_FILES := $(BUILD)/tests/testrun $(APP_BINS) $(GO_FILES) $(RUST_FILES) $(LLVM_FILES) $(NVRM_FILES) $(NVK_IMAGE) $(PROGRAMS)/tcc $(LICENSE_FILES) $(BUILD)/sdk.stamp \
     $(BUILD)/sounds.stamp $(NVIDIA_FW_STATE) $(shell find rootfs -type f) third_party/ca/ca-bundle.crt
 
 # the music in the user's Music folder, made by a script

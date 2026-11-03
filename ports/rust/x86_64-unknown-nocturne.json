@@ -31,11 +31,11 @@
       "--no-dynamic-linker"
     ]
   },
-  "relocation-model": "static",
+  "relocation-model": "pic",
   "relro-level": "off",
   "stack-probes": { "kind": "inline" },
   "static-position-independent-executables": false,
   "target-pointer-width": 64,
-  "tls-model": "local-exec",
+  "tls-model": "global-dynamic",
   "vendor": "unknown"
 }

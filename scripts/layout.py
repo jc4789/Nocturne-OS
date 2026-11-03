@@ -85,6 +85,7 @@ def layout(firmware_manifest, system_only):
         ("C:\\Nocturne\\SDK", str(BUILD / "sdk"), ""),
         ("C:\\Nocturne\\Certificates\\ca-bundle.crt", "third_party/ca/ca-bundle.crt", ""),
         ("C:\\Nocturne\\System", "-", ""),
+        ("C:\\Nocturne\\Drivers", str(BUILD / "drivers"), ""),
         ("C:\\Programs", "-", ""),
     ]
     entries += [(f"C:\\Programs\\{app}", "-", "") for app in apps]

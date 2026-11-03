@@ -354,7 +354,6 @@ int main(int argc, char **argv) {
         return 0;
     }
     struct n_cpuinfo info;
-    const struct n_clock *clock = (const struct n_clock *)N_CLOCK_ADDRESS;
     int bad = 0;
     uintptr_t stack_low,stack_high,stack_marker=(uintptr_t)&stack_low;
     if(thread_stack_bounds(&stack_low,&stack_high) || stack_low>=stack_high ||
@@ -364,7 +363,7 @@ int main(int argc, char **argv) {
     if(thread_stack_bounds(&unchanged,NULL)!=-N_ERR_BAD_ADDRESS || errno!=0 || unchanged!=stack_marker)bad++;
     if (cpu_info(&info)) return 1;
     printf("threadtest: scheduler=%u online=%u tsc_hz=%llu\n", info.scheduler_cpus, info.online_cpus,
-           (unsigned long long)clock->tsc_hz);
+           (unsigned long long)n_clock_tsc_hz());
     static char shared_document[512];
     if (n_path_join(n_temp_folder(), "threadtest-shared.tmp", shared_document, sizeof shared_document) < 0) return 1;
     n_entry_remove(shared_document);
@@ -468,7 +467,6 @@ int main(int argc, char **argv) {
             for (unsigned i = 0; i < 1024; i++) if (recorded[i] != 'd') { bad++; break; }
         n_handle_close(diag[0]);
     }
-    if (n_memory_protect((void *)(uintptr_t)N_CLOCK_ADDRESS, 4096, N_MEMORY_READ_WRITE) != -N_ERR_DENIED) bad++;
     printf("threadtest: CPU mask=%x active=%u shared malloc/TLS/handle/wait %s errors=%u\n",
            cpu_mask, active, !bad && !failures ? "PASS" : "FAIL", failures + bad);
     return bad || failures ? 1 : 0;

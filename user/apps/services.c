@@ -38,6 +38,7 @@ struct failure_rule {
 struct declared_service {
     const char *name;
     const char *program; /* N_FOLDER_SYSTEM の中の名前 */
+    const char *client_image; /* サービスを使う者が読み込む像（struct n_service_status）。無ければ NULL。 */
     enum n_class cls;
     enum service_scope scope;
     bool at_boot;  /* 要求を待たずに起こす */
@@ -61,7 +62,7 @@ static const struct declared_service declared[] = {
     {.name = "systemlog", .program = "systemlog", .cls = N_CLASS_SYSTEM, .at_boot = true,
      .on_failure = {5, 1000, 60000}, .clients_from = CLIENTS_NONE},
     /* ドライバーは自分の機能だけを claim し、システムの級を持たない。相手は nvrm が申し込む名前で来る。 */
-    {.name = "gpu", .program = "nvrm", .cls = N_CLASS_USER, .scope = SCOPE_FUNCTION, .at_boot = true, .optional = true,
+    {.name = "gpu", .program = "nvrm", .client_image = "nvk", .cls = N_CLASS_USER, .scope = SCOPE_FUNCTION, .at_boot = true, .optional = true,
      CAPS(N_CAP_PCI_CLAIM), .on_failure = {2, 2000, 60000}, .clients_from = CLIENTS_NONE,
      .function_matches = nvidia_display},
     {.name = "accounts", .program = "accounts", .cls = N_CLASS_SYSTEM, .at_boot = true,
@@ -591,6 +592,7 @@ static void status_of(const struct instance *in, struct n_service_status *out) {
     strlcpy(out->name, d->name, sizeof out->name);
     strlcpy(out->argument, in->argument, sizeof out->argument);
     strlcpy(out->program, d->program, sizeof out->program);
+    if (d->client_image) strlcpy(out->client_image, d->client_image, sizeof out->client_image);
 }
 
 /* 錠の下で写す。送るのは錠の外。newer_than より後に変わった実例だけ。-1 は全部。 */

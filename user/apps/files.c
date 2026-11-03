@@ -21,6 +21,7 @@
 
 static struct ui_session *sess;
 #define PATH_BYTES 1024
+#define ASKED_TOKEN (1ull << 32)
 static char cwd[PATH_BYTES];     /* the folder shown, a complete path (set by main) */
 static bool in_programs;         /* it holds programs: the system's folder, or an app's folder in C:\Programs */
 static char pathbuf[PATH_BYTES]; /* what the path field holds */
@@ -28,6 +29,11 @@ static struct n_entry *ents;     /* the folder's entries (n_folder_entries) */
 static int nent, sel = -1, win_w = 620, win_h = 440;
 static char status[128];
 static int last_click_idx = -1;
+/* Asked for a document by another program (common/services_abi.h): 0 when it is the plain window. */
+static uint32_t asked;
+static char asked_name[256];              /* the name field of a save */
+static bool asked_replace, asked_done;    /* the name is taken: the window asks first; answered */
+static uint32_t name_node, accept_node, refuse_node;
 static int reveal = 1;           /* counts up when the keyboard moves the selection: the list shows it */
 
 /* where the widgets of the last view are (events name them by place) */
@@ -64,7 +70,7 @@ static void load(void) {
     qsort(ents, nent, sizeof ents[0], cmp);
     snprintf(status, sizeof status, "%d item%s", nent, nent == 1 ? "" : "s");
     char t[PATH_BYTES + 16];
-    snprintf(t, sizeof t, "Files - %s", cwd);
+    snprintf(t, sizeof t, "%s - %s", asked == N_DOCUMENT_WINDOW_OPEN ? "Open" : asked == N_DOCUMENT_WINDOW_SAVE ? "Save as" : "Files", cwd);
     ui_window_title(sess, WINDOW, t);
 }
 
@@ -160,6 +166,34 @@ static void show_row(struct ui_msg *m, int idx) {
     ui_end(m);
 }
 
+/* What a window asked for a document has at its foot. */
+static void asked_bar(struct ui_msg *m) {
+    if (asked == N_DOCUMENT_WINDOW_SAVE) {
+        name_node = ui_node(m, "field");
+        ui_str(m, "value", asked_name);
+        ui_str(m, "placeholder", "Name");
+        ui_str(m, "width", "fill");
+        ui_num(m, "minWidth", 80);
+        ui_end(m);
+    }
+    if (asked_replace) {
+        char question[300];
+        snprintf(question, sizeof question, "Replace %s?", asked_name);
+        caption(m, question, 0, false);
+    } else {
+        caption(m, status, asked == N_DOCUMENT_WINDOW_SAVE ? COL_W : 0, false);
+    }
+    accept_node = ui_node(m, "button");
+    ui_str(m, "text", asked_replace ? "Replace" : asked == N_DOCUMENT_WINDOW_SAVE ? "Save" : "Open");
+    ui_str(m, "variant", "primary");
+    ui_num(m, "compact", 1);
+    ui_end(m);
+    refuse_node = ui_node(m, "button");
+    ui_str(m, "text", "Cancel");
+    ui_num(m, "compact", 1);
+    ui_end(m);
+}
+
 static void show(void) {
     struct ui_msg m;
     ui_view(&m, WINDOW);
@@ -171,8 +205,10 @@ static void show(void) {
             ui_node(&m, "field"); ui_str(&m, "value", pathbuf); ui_str(&m, "placeholder", "Folder");
             ui_str(&m, "width", "fill"); ui_num(&m, "minWidth", 80); ui_end(&m);
             toolbar_button(&m, B_NEWDIR, "New folder", "plus", false);
-            toolbar_button(&m, B_NEWFILE, "New file", "plus", false);
-            toolbar_button(&m, B_DELETE, "Delete", NULL, sel < 0);
+            if (!asked) {
+                toolbar_button(&m, B_NEWFILE, "New file", "plus", false);
+                toolbar_button(&m, B_DELETE, "Delete", NULL, sel < 0);
+            }
         ui_end(&m);
         ui_node(&m, "card"); ui_num(&m, "padding", 0); ui_num(&m, "gap", 0); ui_str(&m, "height", "fill");
             ui_node(&m, "row"); ui_nums(&m, "padding", (double[]){8, 26, 8, 20}, 4); ui_num(&m, "gap", 10);
@@ -192,11 +228,36 @@ static void show(void) {
             ui_end(&m);
         ui_end(&m);
         ui_node(&m, "row"); ui_nums(&m, "padding", (double[]){0, 4}, 2); ui_num(&m, "gap", 12);
+            if (asked) {
+                asked_bar(&m);
+            } else {
             caption(&m, status, 0, false);
             caption(&m, "Enter: open  Del: delete", 0, true);
+            }
         ui_end(&m);
     ui_end(&m);
     ui_send(sess, &m);
+}
+
+/* The answer to the program that asked. A name that is taken is asked about once. */
+static void asked_answer(const char *path) {
+    struct n_entry st;
+    if (asked == N_DOCUMENT_WINDOW_SAVE && !asked_replace && n_entry_info(path, &st) >= 0) {
+        asked_replace = true;
+        return;
+    }
+    n_channel_send(N_DOCUMENT_WINDOW_HANDLE, path, strlen(path), -1);
+    asked_done = true;
+}
+
+/* A program is a program by what it holds, wherever it lies and whatever its name. */
+static bool holds_program(const char *path) {
+    n_handle doc = n_document_open(path, N_DOCUMENT_READ);
+    if (doc < 0) return false;
+    char head[4];
+    n_result got = n_document_read_at(doc, 0, head, sizeof head);
+    n_handle_close(doc);
+    return got == (n_result)sizeof head && !memcmp(head, "\x7f" "ELF", sizeof head);
 }
 
 static void open_entry(int i) {
@@ -207,8 +268,47 @@ static void open_entry(int i) {
         go(path);
         return;
     }
-    n_result r = !strcmp(type_name(&ents[i]), "Program") ? gui_launch(path, NULL) : n_program_open_document(path);
-    snprintf(status, sizeof status, r < 0 ? "could not open %s" : "opened %s", ents[i].name);
+    if (asked) {
+        if (asked == N_DOCUMENT_WINDOW_SAVE) strlcpy(asked_name, ents[i].name, sizeof asked_name);
+        asked_answer(path);
+        return;
+    }
+    n_result r = holds_program(path) ? gui_launch(path, NULL) : n_program_open_document(path);
+    if (r < 0) snprintf(status, sizeof status, "could not open %s: %s", ents[i].name, n_result_text(r));
+    else snprintf(status, sizeof status, "opened %s", ents[i].name);
+}
+
+/* The window's button of a program's question: Open, or Save, and Enter. */
+static void asked_accept(void) {
+    asked_replace = asked_replace && asked == N_DOCUMENT_WINDOW_SAVE;
+    if (asked == N_DOCUMENT_WINDOW_OPEN) {
+        open_entry(sel);
+        return;
+    }
+    char path[PATH_BYTES];
+    struct n_entry st;
+    if (!asked_name[0]) snprintf(status, sizeof status, "name the document first");
+    else if (!entry_path(path, asked_name)) return;
+    else if (n_entry_info(path, &st) >= 0 && st.kind == N_KIND_FOLDER) go(path);
+    else asked_answer(path);
+}
+
+/* The question of the program that started this window, and where the window starts. */
+static bool asked_begin(char *start) {
+    if (n_handle_kind(N_DOCUMENT_WINDOW_HANDLE) != N_KIND_CHANNEL) return false;
+    struct n_document_window_request q;
+    n_handle attached = -1;
+    n_result got = n_channel_receive(N_DOCUMENT_WINDOW_HANDLE, &q, sizeof q, N_CHANNEL_WAIT, &attached);
+    if (attached >= 0) n_handle_close(attached);
+    if (got != (n_result)sizeof q || (q.kind != N_DOCUMENT_WINDOW_OPEN && q.kind != N_DOCUMENT_WINDOW_SAVE)) exit(1);
+    asked = q.kind;
+    q.start[sizeof q.start - 1] = 0;
+    bool whole = n_path_is_complete(q.start);
+    if (q.kind == N_DOCUMENT_WINDOW_SAVE) strlcpy(asked_name, whole ? n_path_name(q.start) : q.start, sizeof asked_name);
+    if (!whole || n_path_join(q.start, "..", start, PATH_BYTES) < 0) {
+        if (n_path_join(n_user_folder(), "Documents", start, PATH_BYTES) < 0) strlcpy(start, n_user_folder(), PATH_BYTES);
+    }
+    return true;
 }
 
 static void make_new(bool dir) {
@@ -264,6 +364,10 @@ static void click_row(int idx, uint32_t clicks) {
     } else {
         sel = idx;
         last_click_idx = idx;
+        if (asked == N_DOCUMENT_WINDOW_SAVE && ents[idx].kind != N_KIND_FOLDER) {
+            strlcpy(asked_name, ents[idx].name, sizeof asked_name);
+            asked_replace = false;
+        }
     }
 }
 
@@ -277,9 +381,11 @@ static bool key(const struct ui_event *e) {
     else if (!strcmp(k, "End")) sel = nent - 1;
     else if (!strcmp(k, "PageDown")) sel = MIN(nent - 1, sel + vis);
     else if (!strcmp(k, "PageUp")) sel = MAX(0, sel - vis);
-    else if (!strcmp(k, "Enter")) open_entry(sel);
-    else if (!strcmp(k, "Backspace")) go_up();
-    else if (!strcmp(k, "Delete")) delete_sel();
+    else if (!strcmp(k, "Enter")) {
+        if (asked) asked_accept();
+        else open_entry(sel);
+    } else if (!strcmp(k, "Backspace")) go_up();
+    else if (!strcmp(k, "Delete") && !asked) delete_sel();
     else if (!strcmp(k, "F5")) load();
     else return false;
     reveal++;
@@ -287,10 +393,15 @@ static bool key(const struct ui_event *e) {
 }
 
 int main(int argc, char **argv) {
-    sess = ui_session_new();
-    if (!sess || ui_window(sess, WINDOW, win_w, win_h, WIN_RESIZABLE, "Files", &win_w, &win_h) < 0) return 1;
     char start[PATH_BYTES]; /* the named folder, else the one Files was started in */
-    if (n_path_complete(argc > 1 ? argv[1] : ".", start, sizeof start) < 0) strlcpy(start, n_user_folder(), sizeof start);
+    if (!asked_begin(start) && n_path_complete(argc > 1 ? argv[1] : ".", start, sizeof start) < 0)
+        strlcpy(start, n_user_folder(), sizeof start);
+    sess = ui_session_new();
+    if (!sess || ui_window(sess, WINDOW, win_w, win_h, WIN_RESIZABLE,
+                           asked == N_DOCUMENT_WINDOW_OPEN ? "Open" : asked == N_DOCUMENT_WINDOW_SAVE ? "Save as" : "Files",
+                           &win_w, &win_h) < 0)
+        return 1;
+    if (asked) n_events_watch(ui_session_queue(sess), N_DOCUMENT_WINDOW_HANDLE, N_EVENT_CLOSED, ASKED_TOKEN);
     go(start);
     show();
     for (bool running = true; running;) {
@@ -301,12 +412,17 @@ int main(int argc, char **argv) {
         while (ui_next_event(sess, &e, text, sizeof text)) {
             switch (e.type) {
             case UI_EVENT_CLICK:
-                if (e.node == btn_node[B_UP]) go_up();
+                if (asked && e.node == accept_node) asked_accept();
+                else if (asked && e.node == refuse_node) {
+                    if (asked_replace) asked_replace = false;
+                    else asked_done = true;
+                }
+                else if (e.node == btn_node[B_UP]) go_up();
                 else if (e.node == btn_node[B_HOME]) go(n_user_folder());
                 else if (e.node == btn_node[B_ROOT]) go("C:\\");
                 else if (e.node == btn_node[B_NEWDIR]) make_new(true);
-                else if (e.node == btn_node[B_NEWFILE]) make_new(false);
-                else if (e.node == btn_node[B_DELETE]) delete_sel();
+                else if (!asked && e.node == btn_node[B_NEWFILE]) make_new(false);
+                else if (!asked && e.node == btn_node[B_DELETE]) delete_sel();
                 else if (nent > 0 && e.node >= first_row && (e.node - first_row) % ROW_NODES == 0 &&
                          (int)((e.node - first_row) / ROW_NODES) < nent)
                     click_row((int)((e.node - first_row) / ROW_NODES), UI_CLICKS(e.flags));
@@ -314,11 +430,17 @@ int main(int argc, char **argv) {
                 changed = true;
                 break;
             case UI_EVENT_TEXT:
-                strlcpy(pathbuf, e.text, sizeof pathbuf);
+                if (asked == N_DOCUMENT_WINDOW_SAVE && e.node == name_node) {
+                    strlcpy(asked_name, e.text, sizeof asked_name);
+                    asked_replace = false;
+                } else {
+                    strlcpy(pathbuf, e.text, sizeof pathbuf);
+                }
                 changed = true;
                 break;
             case UI_EVENT_SUBMIT:
-                go_typed();
+                if (asked == N_DOCUMENT_WINDOW_SAVE && e.node == name_node) asked_accept();
+                else go_typed();
                 changed = true;
                 break;
             case UI_EVENT_KEY:
@@ -334,7 +456,9 @@ int main(int argc, char **argv) {
                 break;
             }
         }
-        if (!running || !ui_session_open(sess)) break;
+        if (!running || asked_done || !ui_session_open(sess)) break;
+        n_handle unused = -1;
+        if (asked && n_channel_receive(N_DOCUMENT_WINDOW_HANDLE, NULL, 0, N_CHANNEL_PEEK, &unused) == -N_ERR_CLOSED) break;
         if (changed) show();
     }
     ui_session_free(sess);

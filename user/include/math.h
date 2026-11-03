@@ -74,6 +74,8 @@ double hypot(double x, double y);
 double sinh(double x);
 double cosh(double x);
 double tanh(double x);
+double erf(double x);
+double erfc(double x);
 float sqrtf(float x);
 float sinf(float x);
 float cosf(float x);

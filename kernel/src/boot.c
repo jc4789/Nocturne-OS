@@ -27,6 +27,7 @@
 #include "sys/thread.h"
 #include "sys/epoch.h"
 #include "sys/prof.h"
+#include "sys/entry.h"
 #include "arch/wake.h"
 
 __attribute__((used, section(".limine_requests_start")))
@@ -197,6 +198,7 @@ void kmain(void) {
     irq_init();
     cpu_mca_interrupt_on();
     clock_init(); /* the TSC's rate: stated or measured, and held to a rate reference */
+    entry_init();
     sched_init();
     address_wait_init();
     epoch_init(); /* its workers, which free what readers might still see */

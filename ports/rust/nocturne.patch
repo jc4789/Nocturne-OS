@@ -976,7 +976,7 @@ index 0000000..daeb4f5
 +        N_ERR_EXISTS => ErrorKind::AlreadyExists,
 +        N_ERR_DENIED | N_ERR_READ_ONLY => ErrorKind::PermissionDenied,
 +        N_ERR_NO_MEMORY => ErrorKind::OutOfMemory,
-+        N_ERR_INVALID | N_ERR_BAD_ADDRESS | N_ERR_WRONG_KIND | N_ERR_NOT_PROGRAM
++        N_ERR_INVALID | N_ERR_BAD_ADDRESS | N_ERR_WRONG_KIND | N_ERR_NOT_PROGRAM | N_ERR_WRONG_GENERATION
 +        | N_ERR_PROTOCOL => ErrorKind::InvalidInput,
 +        N_ERR_BUSY | N_ERR_NOT_READY => ErrorKind::WouldBlock,
 +        N_ERR_CLOSED => ErrorKind::BrokenPipe,
@@ -1030,7 +1030,7 @@ new file mode 100644
 index 0000000..6d88392
 --- /dev/null
 +++ b/library/std/src/sys/pal/nocturne/abi.rs
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,188 @@
 +//! Declarations of the Nocturne native ABI as the C library exports it
 +//! (`user/include/nocturne.h`, `common/abi.h`, `docs/nocturne-native-abi.md`).
 +//!
@@ -1080,6 +1080,7 @@ index 0000000..6d88392
 +pub const N_ERR_NOT_CONNECTED: i32 = 31;
 +pub const N_ERR_UNREACHABLE: i32 = 32;
 +pub const N_ERR_PROTOCOL: i32 = 33;
++pub const N_ERR_WRONG_GENERATION: i32 = 34;
 +
 +// ---- handle kinds ----
 +pub const N_KIND_DOCUMENT: u32 = 1;
@@ -1111,11 +1112,13 @@ index 0000000..6d88392
 +    pub size: u64,
 +    pub modified: i64,
 +    pub id: u64,
++    pub owner: u32,
++    pub reserved: u32,
 +}
 +
 +impl n_entry {
 +    pub const fn zeroed() -> n_entry {
-+        n_entry { name: [0; 256], kind: 0, modified_ns: 0, size: 0, modified: 0, id: 0 }
++        n_entry { name: [0; 256], kind: 0, modified_ns: 0, size: 0, modified: 0, id: 0, owner: 0, reserved: 0 }
 +    }
 +}
 +

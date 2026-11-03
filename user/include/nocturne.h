@@ -32,6 +32,8 @@ void malloc_usage(size_t *heap, size_t *used);
 n_result n_memory_reserve(size_t bytes, int access, void **memory);
 n_result n_memory_release(void *addr, size_t bytes);
 n_result n_memory_protect(void *addr, size_t bytes, int access);
+/* A driver image (abi.h) from a document opened to read, into this process. Nothing of it runs yet. */
+n_result n_image_map(n_handle document, struct n_image *out);
 /* Shared pages: a handle is a private capability that travels to another app
  * only as a channel attachment (n_channel_send). A mapping keeps the pages
  * after the handle closes; n_memory_release of the whole mapping ends it. */
@@ -345,6 +347,7 @@ n_result n_events_wait(n_handle q, struct n_event *out, size_t max, uint64_t dea
 uint64_t n_clock_monotonic(void);
 uint64_t n_clock_boot(void);
 int64_t n_clock_wall(void);
+uint64_t n_clock_tsc_hz(void); /* how many TSC counts make a second */
 uint64_t n_clock_after(uint64_t ns); /* the deadline ns from now (N_CLOCK_NEVER past the clock's end) */
 uint64_t n_app_cpu_ns(void); /* the CPU time this app's threads have used, ended ones too (SYS_APP_CPU_TIME) */
 void n_sleep_until(uint64_t deadline);
@@ -444,6 +447,8 @@ n_handle n_power_windows_watch(n_handle cap);
 /* The count of PCI functions (at most max written), or a negative n_result. */
 n_result pcilist(struct n_pciinfo *out, int max);
 long __syscall(long n, long a, long b, long c, long d, long e);
+/* Where a slot of this program's entry image is (abi.h). For a language runtime with its own calls. */
+uintptr_t n_entry_slot(unsigned slot);
 
 /* run a program (find_program) and wait for it; returns exit status or negative error */
 int run_wait(const char *path, char *const argv[]);

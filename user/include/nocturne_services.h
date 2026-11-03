@@ -33,6 +33,12 @@ n_result n_session_end(void);
 /* その身元のアプリを止める（N_CAP_IDENTITY_GRANT）。まだ終わっていない数を返す。 */
 n_result n_session_stop(n_handle cap, uint32_t session);
 
+/* ---- 文書を選ぶ窓 ---- */
+/* システムの窓で利用者に文書を選ばせ、完全なパスを out に入れる。start は窓の初めの場所（文書の完全なパス、
+   新しい名前、NULL）。利用者がやめたら -N_ERR_CANCELLED。呼んだ thread は窓が閉じるまで待つ。 */
+n_result n_document_ask_open(const char *start, char *out, size_t n);
+n_result n_document_ask_save(const char *start, char *out, size_t n);
+
 /* ---- プログラムの台帳 ---- */
 struct n_program {
     uint32_t id, icon, flags;

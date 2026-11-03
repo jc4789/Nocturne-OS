@@ -1,7 +1,7 @@
 #!/bin/bash
 # Stage the SDK, C:\Nocturne\SDK: the C development files for TinyCC and clang running inside
 # Nocturne.
-#   Include              libc, Nocturne, BearSSL, QuickJS and libnvrm headers (+ stdint.h, limits.h)
+#   Include              libc, Nocturne, BearSSL, QuickJS and Vulkan headers (+ stdint.h, limits.h)
 #   Lib\tcc\include      TinyCC's own headers (stdarg.h, stddef.h, float.h, ...)
 #   Lib\tcc              libtcc1.a (compiler runtime), runmain.o (for tcc -run)
 #   Lib                  crt1.o crti.o crtn.o libc.a (every member programs are linked from:
@@ -47,9 +47,12 @@ cp common/abi.h common/authority_abi.h common/services_abi.h common/settings_abi
 cp ports/tcc/include/*.h "$S/Include/"
 cp third_party/bearssl/inc/*.h "$S/Include/"
 cp ports/lexbor/include/*.h "$S/Include/"
-# QuickJS and libnvrm are libc.a members like BearSSL and Lexbor
+# QuickJS is a libc.a member like BearSSL and Lexbor
 cp third_party/quickjs/quickjs.h "$S/Include/"
-cp ports/nvidia/include/*.h "$S/Include/"
+# Vulkan's commands are the libc's loader and the driver image it maps (user/libc/vulkan.c)
+mkdir -p "$S/Include/vulkan" "$S/Include/vk_video"
+cp third_party/mesa/include/vulkan/*.h "$S/Include/vulkan/"
+cp third_party/mesa/include/vk_video/*.h "$S/Include/vk_video/"
 # wasm2c's regular-memory runtime uses Nocturne-native trap/TLS/stack handling.
 # Its compiler-host symbol binder is not a member of the standalone runtime.
 cp third_party/wabt/wasm2c/wasm-rt.h third_party/wabt/wasm2c/wasm-rt-impl.h "$S/Include/"

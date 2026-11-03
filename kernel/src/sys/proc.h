@@ -25,6 +25,8 @@ struct proc_launch {
     struct n_identity identity;
 };
 int proc_launch(const char *path, const struct proc_launch *launch);
+/* SYS_IMAGE_MAP (common/abi.h): the driver image doc holds, into the calling process. */
+int proc_image_map(struct handle *doc, struct n_image *out);
 
 /* App handles (docs/nocturne-native-abi.md §5). */
 /* A new app record and the handle that will report its end (proc_launch's app is its object). */

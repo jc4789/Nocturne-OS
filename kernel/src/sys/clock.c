@@ -75,6 +75,7 @@
 #include "mm/vmm.h"
 #include "sys/alarm.h"
 #include "sys/clock.h"
+#include "clock_data.h"
 #include "sys/wait.h"
 
 #define SHIFT 48             /* mult's fixed point: 2^-46 of a 4 GHz TSC's ns per count */
@@ -212,11 +213,10 @@ bool clock_tsc_at(uint64_t ns, uint64_t *tsc) {
 
 void clock_stop(void) { __atomic_store_n(&stopped, true, __ATOMIC_RELEASE); }
 
-_Static_assert(N_CLOCK_ADDRESS >= USER_STACK_TOP && N_CLOCK_ADDRESS + N_CLOCK_BYTES <= USER_TOP,
-              "the clock's data lies above the main stack, within the apps' half");
-int clock_map(struct vmm_space *s) {
+size_t clock_data_pages(void) { return data_count; }
+int clock_map(struct vmm_space *s, uint64_t va) {
     for (size_t i = 0; i < data_count; i++) {
-        int r = vmm_map_page(s, N_CLOCK_ADDRESS + i * PAGE_SIZE, data_first + i * PAGE_SIZE,
+        int r = vmm_map_page(s, va + i * PAGE_SIZE, data_first + i * PAGE_SIZE,
                              PTE_U | PTE_SHARED | PTE_SHARED_RO | PTE_NX);
         if (r < 0) return r;
     }
@@ -808,7 +808,6 @@ static void first_measure(const struct clock_rate_reference *ref, uint64_t *mult
 void clock_init(void) {
     unsigned cpus = topology.cpus;
     size_t bytes = sizeof(struct n_clock) + (size_t)cpus * sizeof(int64_t);
-    if (bytes > N_CLOCK_BYTES) panic("clock: %u CPUs' offsets do not fit the apps' window of the clock's data", cpus);
     data_count = ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE;
     data_first = pmm_alloc_contig(data_count, 64);
     if (!data_first) panic("clock: no memory for its data");

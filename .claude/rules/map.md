@@ -19,9 +19,10 @@
 | `arch/spin.h` | MCS spinlock。 |
 | `arch/irq.c`・`apic.c`・`ioapic.c`・`lapic_timer.c` | CPU ごとの vector の表、x2APIC と IPI、IOAPIC、LAPIC の timer（CPU に TSC-deadline があればそれ、無ければ one-shot）。 |
 | `arch/idt.c`・`gdt.c`・`isr.asm` | IDT・GDT・TSS と、syscall・例外・割り込みの入口。 |
+| `sys/entry.c`・`entry_code.asm`・`kernel/entry/` | 入口の像：全プロセスへ写す溝の並びと、像の中の時計（`clock.c`。別に組み、平らなファイルで埋め込む）。公開の面と、溝から来た呼出しの確かめ。 |
 | `arch/fpu.c`・`idle.c`・`pat.c` | XSAVES による FPU の保存、MWAIT か HLT による idle と性能の要求（AMD の CPPC、Intel の HWP）、PAT。 |
 | `lib/` | `span`（区間の AVL 木）、`avl`、`idtable`、`lz`、`printf`、`sort`、`string`。 |
-| `sys/proc.c` | `proc_launch` が ELF のアプリを起こす。 |
+| `sys/proc.c` | `proc_launch` が ELF のアプリを起こし、`proc_image_map` がドライバーの像を呼ぶ者へ写す。 |
 | `sys/clock.c`・`alarm.c` | TSC による三つの時計（monotonic、boot、wall）と、CPU ごとの期限の heap。 |
 | `mm/vmm.c`・`pmm.c`・`heap.c`・`vmalloc.c` | 頁表と TLB、frame、heap、核の番地の区間。 |
 | `mm/shared.c`・`pager.c`・`program.c`・`space.c` | 共有 object（frame、写像の一覧、fault、revoke、DMA の型、device の pin、scanout）、pager、program の text、アプリの配置（穴、`n_memory_*`）。口は `mm/shared.h`・`mm/space.h`、錠の順は `mm/shared.c` の頭。 |
@@ -40,13 +41,14 @@
 
 | 場所 | 役目 |
 |---|---|
-| `abi.h` | syscall の番号 `SYS_*` と結果 `N_ERR_*`。仕様は `docs/nocturne-native-abi.md`。 |
+| `abi.h` | syscall の番号 `SYS_*`、結果 `N_ERR_*`、入口の溝、公開の呼出し `N_PUBLIC_CALLS`、世代と刻印、スレッドの区画。仕様は `docs/nocturne-native-abi.md`。 |
+| `clock_data.h` | 像の中の時計のデータの形。カーネルと `kernel/entry/clock.c` だけが読む。 |
 | `authority_abi.h` | 身元 `struct n_identity`、級 `enum n_class`、能力 `enum n_cap`、サービスの要求の形。 |
 | `services_abi.h` | 管理者・`accounts`・`session`・`machine` の口の型。 |
 | `audio_abi.h` | 音の出口の申告、輪、流れの形式、サービス `audio` の文（ABI の §17）。 |
 | `input_abi.h` | HID の usage、`NMOD_*`、`NKEY_*`、配列の番号、装置の記録 `struct n_setting_input_device`。 |
 | `settings_abi.h` | 領域と鍵の番号、値の型、起動の記録、設定のサービスの宣言と channel の文。 |
-| `display_abi.h`・`gpu_abi.h` | 画面と GPU の ABI。 |
+| `display_abi.h`・`gpu_abi.h` | 画面と GPU の ABI。GPU のドライバーの像の表 `struct n_gpu_driver` も `gpu_abi.h`。 |
 | `store_format.h`・`store/` | C: の store の書式とエンジン（`catalog` の B+ 木、`namespace`、`space`、`volume`）。カーネルと `host/store` の両方が組む。 |
 | `dns_name.h` | DNS の名前の書式。サービス `network` が使う。 |
 | `edid.h`・`gfx.c`・`unifont.bin` | EDID、描画の部品、Unifont。 |
@@ -55,9 +57,11 @@
 
 | 場所 | 役目 |
 |---|---|
+| `libc/vulkan.c`・`libc/driver_image.c`・`include/nocturne_gpu.h` | プログラムの Vulkan ローダー（サービスの一覧 `client_image` から像を選び、写し、入口を呼ぶ）と、像の中の libc の起動（自分の再配置、TLS、構築子）。結合の規則は `ports/mesa/nvk.mk`、`user/image.map`。 |
 | `libc/` | ISO C、ネイティブ ABI の包み（`sys.c`）、システムのサービスの口（`services.c`、見出しは `nocturne_services.h`）、GUI（`gui.c`、`ui.c`）、字体と画像、媒体（`media*.c`）、網（`net.c`、`http*.c`、`tls.c`、`webnet.c`）、ブラウザーの保存（`webstorage.c`、`webidb*.c`、`webcache.c`、`webcookie.c`、`webprefs.c`、`websitedata.c`）。 |
 | `libc/web/` | ブラウザーのエンジン。下の「ブラウザーの流れ」を見る。 |
 | `include/` | 公開の header（`nocturne.h`、`web.h`、`weburl.h`、`ui.h` など）。SDK にも入る。 |
+| `apps/files.c` | ファイルの窓。呼ぶ者の身元で子として起こされると開く窓か保存の窓になる（`libc/services.c` の `n_document_ask_*`）。 |
 | `apps/shell.c`・`shell_art.h` | シェル：タスクバー、開始メニュー、音量、通知、デスクトップの絵と印。`session` が利用者の身元で起こす普通のプロセス。口は `display_abi.h`、仕様は ABI の §16。 |
 | `apps/` | システムのプログラム。サービスの管理者 `services.c`（宣言の表 `declared[]`）とサービス（`accounts.c`、`session.c`、`systemlog.c`、`machine.c`（電源の方針と窓を閉じる段取り））、ブラウザー（`browser*.c`）、`sh.c`、`uihost.c`、`webfetch.c`、`agent.c`、小さな道具とゲーム、TypeScript のアプリ（`*.ts`）。 |
 | `apps/display.c` | サービス `display`：画面ごとのモードの選択、配置、主画面、倍率の持ち主（`N_CAP_DISPLAY`）。値は設定のサービスが保存する。 |
@@ -75,10 +79,11 @@
 
 | 場所 | 役目 |
 |---|---|
-| `ports/<名>/` | 移植の差分と設定。expat、ffmpeg、freetype、go、lexbor、llvm、mesa、nvidia、rust、tcc、typescript、virgl、wabt。 |
+| `ports/<名>/` | 移植の差分と設定。expat、ffmpeg、freetype、go、lexbor、llvm、mesa、nvidia、rust、tcc、typescript、virgl、wabt。GPU のドライバーの像の接着は `ports/nvidia/nvk_image.c`。 |
 | `third_party/<名>/` | 取り込んだ上流のソース。 |
 | `host/store/store.c` | ホストの道具。C: を作り、詰め、検査する。 |
 | `boot/limine.conf` | 起動の項目は一つ。起動の記録 `settings.rec` を module で持ち込む。 |
+| `C:\Nocturne\Drivers` | ドライバーの像（`build/drivers/`、今は `nvk`）。`scripts/layout.py` が入れる。 |
 | `rootfs/` | C: にそのまま入るもの（`Nocturne\`）と、新しい利用者のフォルダーの元（`NewUser\`、C: の `Nocturne\NewUser`）。 |
 | `scripts/` | ビルド、媒体、生成、Hyper-V の道具。 |
 | `tests/` | ゲストの試験（`runtests.c`）、試験の媒体のサービス（`testrun.c`）、WPT の runner、ホストの検査 `check_*.py`（`check_hda_codec.py` は codec の表で widget の木を試す）。 |
@@ -146,7 +151,7 @@ user/libc/sys.c の SYSCALL
 規則は AGENTS.md の「ビルドと媒体」、手順は `nocturne-project` スキルにある。ここは場所だけを書く。
 
 - 入口は `python -X utf8 scripts/build.py -j 8 <目標>`。目標は Makefile の `qemu-image`、`all`、`kernel`、`user`、`clean` など。
-- 出力は `build/kernel.elf`、`build/programs/`、`build/sdk/`、`build/c.list`、`build/nocturne.img`・`.vhdx`・`.iso`。
+- 出力は `build/kernel.elf`、`build/programs/`、`build/drivers/`、`build/sdk/`、`build/c.list`、`build/nocturne.img`・`.vhdx`・`.iso`。
 - C: の中身は `scripts/layout.py` が `build/c.list` を作り、`build/host/store.exe fill` が詰める。
 - 任意の移植の道具は `tools/go`、`tools/TypeScript`、`tools/rust`、`tools/llvm`、`local/firmware/`。
 - ゲストの試験の表は `tests/runtests.c` の `tests[]`。

@@ -1,0 +1,3 @@
+/* What a driver image exports: nothing. Its loader calls its entry, which returns a table
+   (user/libc/driver_image.c), so every reference stays inside the image and only what is used stays in it. */
+{ local: *; };

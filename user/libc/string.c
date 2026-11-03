@@ -432,6 +432,7 @@ char *strerror(int e) {
     case N_ERR_NOT_FOUND: return "not found";
     case N_ERR_EXISTS: return "already exists";
     case N_ERR_DENIED: return "not permitted";
+    case N_ERR_WRONG_GENERATION: return "built for another generation of Nocturne";
     case N_ERR_NO_MEMORY: return "out of memory";
     case N_ERR_INVALID: return "invalid argument";
     case N_ERR_WRONG_KIND: return "wrong kind of handle";

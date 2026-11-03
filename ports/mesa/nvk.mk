@@ -239,6 +239,8 @@ NVK_SRC := $(NOUVEAU)/headers/nv_push.c $(patsubst %,$(NV_GEN)/headers/nv_push_%
     $(NVK_VK_GEN)/nvk_entrypoints.c $(NVK_VK_GEN)/nvk_drirc.c $(MESA_PREGEN)/src/nouveau/vulkan/nvkcl.cpp \
     $(COMPILER_RS_GEN)/bindings.c $(COMPILER_RS)/rust_helpers.c $(NVK_VK_GEN)/nvk_inline_wrappers.c
 NVK_C_OBJ := $(patsubst %,$(BUILD)/mesa/o/%.o,$(VK_SRC) $(NVK_SRC))
+# What a Vulkan client uses of the common code: Zink, in the programs, has it as lazy members.
+VK_CLIENT_OBJ := $(patsubst %,$(BUILD)/mesa/o/%.o,$(VK)/util/vk_format.c $(addprefix $(VK_GEN)/util/,vk_dispatch_table.c vk_enum_to_str.c))
 # -I. for the bindgen wrappers, which name their header from the repository root
 NVK_FLAGS := $(NVK_INC) $(NVK_DEFS) -I.
 $(NVK_C_OBJ): MESA_CFLAGS += $(NVK_FLAGS)
@@ -255,18 +257,36 @@ $(filter-out $(COMPILER_RS_GEN)/bindings.c $(NVK_VK_GEN)/nvk_inline_wrappers.c,\
 	@:
 
 # The runtime, WSI and NVK are one unit, linked whole as upstream's shared driver is: the dispatch
-# tables name every entrypoint weakly, and a weak reference does not pull a lazy member of the libc
-# link in (scripts/link_unit.py). The unit itself is one lazy member, so only a program that draws
-# with OpenGL links it.
+# tables name every entrypoint weakly, and a weak reference does not pull a lazy member of the image's
+# link in (scripts/link_unit.py).
 NVK_UNIT := $(BUILD)/mesa/vulkan_nouveau.o
 $(NVK_UNIT): $(NVK_C_OBJ) ports/mesa/nvk.mk scripts/link_unit.py
 	@echo "  LD   $@"
 	@$(file >$@.members,$(NVK_C_OBJ))
-	@$(file >$@.others,$(filter-out $(NVK_UNIT),$(LIBC_LINK)))
+	@$(file >$@.others,$(LIBC_LINK) $(NVRM_CLIENT_OBJ))
 	@$(PY) scripts/link_unit.py $@ $@.members $@.others $(NM) $(LD) -m elf_x86_64
 
-# Everything a program that uses NVK links: the unit and the Rust archive.
+# The unit and the Rust archive.
 NVK_OBJ := $(NVK_UNIT) $(NVK_RS_LIB)
 
+# The driver image, C:\Nocturne\Drivers\nvk (common/gpu_abi.h): NVK, libnvrm, the part of Mesa they use
+# and a C library of its own, as lazy members, without the browser's part of the libc. The C++ runtime
+# is scripts/build_cxx.py's, whatever the programs link: LLVM's libc++ is not position-independent.
+# -z defs: every symbol being local (user/image.map), an undefined name would otherwise be address 0.
+NVK_IMAGE := $(BUILD)/drivers/nvk
+NVK_IMAGE_OBJ := $(BUILD)/mesa/o/ports/nvidia/nvk_image.c.o
+# (beside the objects: every file of build/drivers goes onto C:)
+NVK_IMAGE_LIST := $(BUILD)/mesa/nvk_image.members
+NVK_IMAGE_MEMBERS := $(filter-out $(BUILD)/u/user/libc/web/% %crt0.asm.o,$(LIBC_OBJ)) $(MESA_OBJ) $(NVRM_CLIENT_OBJ) \
+    $(NVK_UNIT) $(BUILD)/u/user/libc/cxxabi.cpp.o $(CXX_RUNTIME_OBJ)
+$(NVK_IMAGE_OBJ): MESA_CFLAGS += -Iports/nvidia/include -Ithird_party/nvidia-open/src/common/sdk/nvidia/inc
+$(NVK_IMAGE): $(NVK_IMAGE_OBJ) $(NVK_IMAGE_MEMBERS) $(NVK_RS_LIB) user/image.map
+	@mkdir -p $(@D)
+	@echo "  LD   $@"
+	@$(file >$(NVK_IMAGE_LIST),$(NVK_IMAGE_MEMBERS))
+	@$(LD) -m elf_x86_64 -shared -Bsymbolic -s -nostdlib --gc-sections --version-script=user/image.map \
+	    -e __libc_image_start -z defs -z now -z norelro -z nodynamic-undefined-weak -z max-page-size=0x1000 \
+	    $(NVK_IMAGE_OBJ) --start-lib @$(NVK_IMAGE_LIST) --end-lib $(NVK_RS_LIB) -o $@
+
 .PHONY: nvk
-nvk: $(NVK_OBJ) $(NVK_RS_LIB) $(ZINK_OBJ)
+nvk: $(NVK_IMAGE) $(ZINK_OBJ)

@@ -84,6 +84,74 @@ index 2088e13b..ff873b23 100644
  		objabi.Hsolaris:
  		asmbElf(ctxt)
  	}
+diff --git a/src/cmd/link/internal/ld/elf.go b/src/cmd/link/internal/ld/elf.go
+index 949ca6a3..eb12fdd7 100644
+--- a/src/cmd/link/internal/ld/elf.go
++++ b/src/cmd/link/internal/ld/elf.go
+@@ -755,6 +755,38 @@ func elfwritenetbsdsig(out *OutBuf) int {
+ 	return int(sh.Size)
+ }
+ 
++// The Nocturne program note (common/abi.h of Nocturne): the generation of the
++// system and the entry image's slots this program is built for. The kernel
++// starts no program without it.
++const (
++	ELF_NOTE_NOCTURNE_NAMESZ     = 9
++	ELF_NOTE_NOCTURNE_DESCSZ     = 8
++	ELF_NOTE_NOCTURNE_TAG        = 1
++	ELF_NOTE_NOCTURNE_GENERATION = 1
++	ELF_NOTE_NOCTURNE_SLOTS      = 240
++)
++
++var ELF_NOTE_NOCTURNE_NAME = []byte("Nocturne\x00")
++
++func elfnocturnesig(sh *ElfShdr, startva uint64, resoff uint64) int {
++	n := int(Rnd(ELF_NOTE_NOCTURNE_NAMESZ, 4) + Rnd(ELF_NOTE_NOCTURNE_DESCSZ, 4))
++	return elfnote(sh, startva, resoff, n)
++}
++
++func elfwritenocturnesig(out *OutBuf) int {
++	sh := elfwritenotehdr(out, ".note.nocturne", ELF_NOTE_NOCTURNE_NAMESZ, ELF_NOTE_NOCTURNE_DESCSZ, ELF_NOTE_NOCTURNE_TAG)
++	if sh == nil {
++		return 0
++	}
++	out.Write(ELF_NOTE_NOCTURNE_NAME)
++	out.Write8(0)
++	out.Write8(0)
++	out.Write8(0)
++	out.Write32(ELF_NOTE_NOCTURNE_GENERATION)
++	out.Write32(ELF_NOTE_NOCTURNE_SLOTS)
++	return int(sh.Size)
++}
++
+ // The race detector can't handle ASLR (address space layout randomization).
+ // ASLR is on by default for NetBSD, so we turn the ASLR off explicitly
+ // using a magic elf Note when building race binaries.
+@@ -1869,9 +1901,13 @@ func asmbElf(ctxt *Link) {
+ 		phsh(ph, sh)
+ 	}
+ 
+-	if ctxt.HeadType == objabi.Hnetbsd || ctxt.HeadType == objabi.Hopenbsd || ctxt.HeadType == objabi.Hfreebsd {
++	if ctxt.HeadType == objabi.Hnetbsd || ctxt.HeadType == objabi.Hopenbsd || ctxt.HeadType == objabi.Hfreebsd || ctxt.HeadType == objabi.Hnocturne {
+ 		var sh *ElfShdr
+ 		switch ctxt.HeadType {
++		case objabi.Hnocturne:
++			sh = elfshname(".note.nocturne")
++			resoff -= int64(elfnocturnesig(sh, uint64(startva), uint64(resoff)))
++
+ 		case objabi.Hnetbsd:
+ 			sh = elfshname(".note.netbsd.ident")
+ 			resoff -= int64(elfnetbsdsig(sh, uint64(startva), uint64(resoff)))
+@@ -2286,6 +2322,9 @@ elfobj:
+ 		if ctxt.HeadType == objabi.Hfreebsd {
+ 			a += int64(elfwritefreebsdsig(ctxt.Out))
+ 		}
++		if ctxt.HeadType == objabi.Hnocturne {
++			a += int64(elfwritenocturnesig(ctxt.Out))
++		}
+ 		if len(buildinfo) > 0 {
+ 			a += int64(elfwritebuildinfo(ctxt.Out))
+ 		}
 diff --git a/src/cmd/link/internal/ld/sym.go b/src/cmd/link/internal/ld/sym.go
 index 6ae11060..4a4ea059 100644
 --- a/src/cmd/link/internal/ld/sym.go
@@ -690,7 +758,7 @@ index 0fcf2c6c..011938ef 100644
  
 diff --git a/src/net/fd_nocturne.go b/src/net/fd_nocturne.go
 new file mode 100644
-index 00000000..a01d29b2
+index 00000000..4a7aff63
 --- /dev/null
 +++ b/src/net/fd_nocturne.go
 @@ -0,0 +1,304 @@
@@ -1000,7 +1068,7 @@ index 00000000..a01d29b2
 +}
 diff --git a/src/net/interface_nocturne.go b/src/net/interface_nocturne.go
 new file mode 100644
-index 00000000..1409f1fd
+index 00000000..6e28803a
 --- /dev/null
 +++ b/src/net/interface_nocturne.go
 @@ -0,0 +1,71 @@
@@ -1103,7 +1171,7 @@ index 8a2fc353..867f5dd6 100644
  
 diff --git a/src/net/ipsock_nocturne.go b/src/net/ipsock_nocturne.go
 new file mode 100644
-index 00000000..fd52061b
+index 00000000..850c806f
 --- /dev/null
 +++ b/src/net/ipsock_nocturne.go
 @@ -0,0 +1,68 @@
@@ -1177,7 +1245,7 @@ index 00000000..fd52061b
 +}
 diff --git a/src/net/lookup_nocturne.go b/src/net/lookup_nocturne.go
 new file mode 100644
-index 00000000..08b06369
+index 00000000..c7f17638
 --- /dev/null
 +++ b/src/net/lookup_nocturne.go
 @@ -0,0 +1,150 @@
@@ -1842,7 +1910,7 @@ index 00000000..1d134b9c
 +}
 diff --git a/src/os/exec_nocturne.go b/src/os/exec_nocturne.go
 new file mode 100644
-index 00000000..9849a48a
+index 00000000..e7780f39
 --- /dev/null
 +++ b/src/os/exec_nocturne.go
 @@ -0,0 +1,185 @@
@@ -2071,7 +2139,7 @@ index 00000000..6a31ed50
 +	return full, nil
 +}
 diff --git a/src/os/file.go b/src/os/file.go
-index 764ce12c..de68d1d8 100644
+index 764ce12c..d45401f7 100644
 --- a/src/os/file.go
 +++ b/src/os/file.go
 @@ -525,6 +525,14 @@ func UserCacheDir() (string, error) {
@@ -2116,36 +2184,6 @@ index 764ce12c..de68d1d8 100644
  	}
  	if v := Getenv(env); v != "" {
  		return v, nil
-diff --git a/src/os/userfolder_nocturne.go b/src/os/userfolder_nocturne.go
-new file mode 100644
---- /dev/null
-+++ b/src/os/userfolder_nocturne.go
-@@ -0,0 +1,10 @@
-+// Copyright 2026 The Go Authors. All rights reserved.
-+// Use of this source code is governed by a BSD-style
-+// license that can be found in the LICENSE file.
-+
-+package os
-+
-+import "syscall"
-+
-+// userFolder is this app's user's folder, or "" for the system's identity.
-+func userFolder() string { return syscall.UserFolder() }
-diff --git a/src/os/userfolder_other.go b/src/os/userfolder_other.go
-new file mode 100644
---- /dev/null
-+++ b/src/os/userfolder_other.go
-@@ -0,0 +1,10 @@
-+// Copyright 2026 The Go Authors. All rights reserved.
-+// Use of this source code is governed by a BSD-style
-+// license that can be found in the LICENSE file.
-+
-+//go:build !nocturne
-+
-+package os
-+
-+// userFolder is only called for GOOS=nocturne.
-+func userFolder() string { return "" }
 diff --git a/src/os/file_mutex_nocturne.go b/src/os/file_mutex_nocturne.go
 new file mode 100644
 index 00000000..ebed3d17
@@ -2224,7 +2262,7 @@ index 00000000..ebed3d17
 +}
 diff --git a/src/os/file_nocturne.go b/src/os/file_nocturne.go
 new file mode 100644
-index 00000000..29a1b1da
+index 00000000..8b4711c5
 --- /dev/null
 +++ b/src/os/file_nocturne.go
 @@ -0,0 +1,706 @@
@@ -3235,7 +3273,7 @@ index 1b90a5a1..ab91db66 100644
  
 diff --git a/src/os/user/lookup_nocturne.go b/src/os/user/lookup_nocturne.go
 new file mode 100644
-index 00000000..e536822f
+index 00000000..53350123
 --- /dev/null
 +++ b/src/os/user/lookup_nocturne.go
 @@ -0,0 +1,56 @@
@@ -3308,6 +3346,38 @@ index 89dfe455..b926ddd8 100644
  
  package user
  
+diff --git a/src/os/userfolder_nocturne.go b/src/os/userfolder_nocturne.go
+new file mode 100644
+index 00000000..d2f769f0
+--- /dev/null
++++ b/src/os/userfolder_nocturne.go
+@@ -0,0 +1,10 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package os
++
++import "syscall"
++
++// userFolder is this app's user's folder, or "" for the system's identity.
++func userFolder() string { return syscall.UserFolder() }
+diff --git a/src/os/userfolder_other.go b/src/os/userfolder_other.go
+new file mode 100644
+index 00000000..21cc8dfe
+--- /dev/null
++++ b/src/os/userfolder_other.go
+@@ -0,0 +1,10 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build !nocturne
++
++package os
++
++// userFolder is only called for GOOS=nocturne.
++func userFolder() string { return "" }
 diff --git a/src/path/filepath/match.go b/src/path/filepath/match.go
 index 3c1c22bb..6801a2d5 100644
 --- a/src/path/filepath/match.go
@@ -3578,10 +3648,10 @@ index dc5d708b..c2fda249 100644
  
 diff --git a/src/runtime/os_nocturne.go b/src/runtime/os_nocturne.go
 new file mode 100644
-index 00000000..5f226169
+index 00000000..b541c796
 --- /dev/null
 +++ b/src/runtime/os_nocturne.go
-@@ -0,0 +1,446 @@
+@@ -0,0 +1,377 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -3592,7 +3662,6 @@ index 00000000..5f226169
 +	"internal/abi"
 +	"internal/runtime/atomic"
 +	"internal/runtime/sys"
-+	"math/bits"
 +	"unsafe"
 +)
 +
@@ -3626,8 +3695,7 @@ index 00000000..5f226169
 +	_N_DOCUMENT_READ     = 1
 +	_N_CHANNEL_WAIT      = 1
 +
-+	_N_CLOCK_ADDRESS = 0x00007FFFFFF00000
-+	_N_CLOCK_NEVER   = ^uint64(0)
++	_N_CLOCK_NEVER = ^uint64(0)
 +)
 +
 +// syscall5 makes Nocturne system call n.
@@ -3635,12 +3703,20 @@ index 00000000..5f226169
 +//go:noescape
 +func syscall5(n, a1, a2, a3, a4, a5 uintptr) int64
 +
++// nocturneEntry is where this process's entry image is: every call to the
++// system is a call to a slot of it (common/abi.h of Nocturne). Assembly in
++// this package and in package syscall reads it.
++//
++//go:linkname nocturneEntry
++var nocturneEntry uintptr
++
 +// The first instruction of a new thread (sys_nocturne_amd64.s).
 +func tstart_nocturne()
 +
 +// nocturneStart is the kernel's struct n_start, recorded by
 +// _rt0_amd64_nocturne. It lives in the program's first stack.
 +var nocturneStart *struct {
++	entry         uintptr
 +	environment   **byte
 +	folder        *byte
 +	terminals     *int32
@@ -3665,89 +3741,14 @@ index 00000000..5f226169
 +
 +// ---- clocks ----
 +
-+// struct n_clock: the kernel's data of the clocks, mapped read-only at
-+// _N_CLOCK_ADDRESS in every app, followed by offset[cpus] (int64 each).
-+type nocturneClock struct {
-+	seq, cpus        uint32
-+	baseTSC, baseNs  uint64
-+	mult             uint64
-+	shift, rateBound uint32
-+	tscHz, asleepNs  uint64
-+	wallNs           int64
-+	wallFrom         uint64
-+	wallUntil        uint64
-+	wallSlew         int64
-+	wallSlewMult     uint64
-+}
-+
-+// The TSC as RDTSCP reads it, and its TSC_AUX: the CPU's index
-+// (sys_nocturne_amd64.s).
-+func nocturneTSC() (tsc uint64, cpu uint32)
-+
-+// nocturneRead returns the monotonic clock in ns and, in wall, the wall
-+// clock's fields read with it: the reading of common/abi.h of Nocturne.
-+//
-+//go:nosplit
-+func nocturneRead(wall *nocturneClock) uint64 {
-+	c := (*nocturneClock)(unsafe.Pointer(uintptr(_N_CLOCK_ADDRESS)))
-+	for {
-+		seq := atomic.Load(&c.seq)
-+		if seq&1 != 0 { // the kernel is writing it
-+			continue
-+		}
-+		t, cpu := nocturneTSC()
-+		baseTSC, baseNs, mult, shift := c.baseTSC, c.baseNs, c.mult, c.shift
-+		var offset int64
-+		if cpu < c.cpus {
-+			offset = *(*int64)(unsafe.Pointer(uintptr(_N_CLOCK_ADDRESS) + unsafe.Sizeof(*c) + uintptr(cpu)*8))
-+		}
-+		if wall != nil {
-+			wall.asleepNs, wall.wallNs, wall.wallFrom = c.asleepNs, c.wallNs, c.wallFrom
-+			wall.wallUntil, wall.wallSlew, wall.wallSlewMult = c.wallUntil, c.wallSlew, c.wallSlewMult
-+		}
-+		if atomic.Load(&c.seq) != seq {
-+			continue
-+		}
-+		t -= uint64(offset)
-+		if t <= baseTSC {
-+			return baseNs
-+		}
-+		hi, lo := bits.Mul64(t-baseTSC, mult)
-+		return baseNs + (hi<<(64-shift) | lo>>shift)
-+	}
-+}
-+
-+//go:nosplit
-+func nanotime1() int64 {
-+	return int64(nocturneRead(nil))
-+}
++// The clocks are code of the entry image: the monotonic one and the wall
++// clock, in ns (sys_nocturne_amd64.s).
++func nanotime1() int64
++func nocturneWall() int64
 +
 +//go:nosplit
 +func walltime() (sec int64, nsec int32) {
-+	var h nocturneClock
-+	t := nocturneRead(&h)
-+	ns := h.wallNs
-+	if t > h.wallFrom {
-+		ns += int64(t - h.wallFrom)
-+	}
-+	if h.wallSlew != 0 {
-+		until := min(t, h.wallUntil)
-+		var ran uint64
-+		if until > h.wallFrom {
-+			ran = until - h.wallFrom
-+		}
-+		whole := uint64(h.wallSlew)
-+		if h.wallSlew < 0 {
-+			whole = uint64(-h.wallSlew)
-+		}
-+		hi, lo := bits.Mul64(ran, h.wallSlewMult)
-+		done := min(hi<<32|lo>>32, whole)
-+		if h.wallSlew < 0 {
-+			ns -= int64(done)
-+		} else {
-+			ns += int64(done)
-+		}
-+	}
++	ns := nocturneWall()
 +	return ns / 1e9, int32(ns % 1e9)
 +}
 +
@@ -3755,7 +3756,7 @@ index 00000000..5f226169
 +//
 +//go:nosplit
 +func nocturneAfter(ns int64) uint64 {
-+	now := nocturneRead(nil)
++	now := uint64(nanotime1())
 +	if ns <= 0 {
 +		return now
 +	}
@@ -4043,10 +4044,10 @@ index b8d4d150..897f4b5b 100644
  	return false
 diff --git a/src/runtime/rt0_nocturne_amd64.s b/src/runtime/rt0_nocturne_amd64.s
 new file mode 100644
-index 00000000..41e3160d
+index 00000000..516921df
 --- /dev/null
 +++ b/src/runtime/rt0_nocturne_amd64.s
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,13 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -4057,6 +4058,8 @@ index 00000000..41e3160d
 +// n_start in DX.
 +TEXT _rt0_amd64_nocturne(SB),NOSPLIT|NOFRAME,$0
 +	MOVQ	DX, runtime·nocturneStart(SB)
++	MOVQ	0(DX), AX	// struct n_start's entry
++	MOVQ	AX, runtime·nocturneEntry(SB)
 +	JMP	runtime·rt0_go(SB)
 diff --git a/src/runtime/stubs2.go b/src/runtime/stubs2.go
 index 39bde15b..a0e515fa 100644
@@ -4086,20 +4089,21 @@ index c3749f34..d39d3f1f 100644
  
 diff --git a/src/runtime/sys_nocturne_amd64.s b/src/runtime/sys_nocturne_amd64.s
 new file mode 100644
-index 00000000..914069f6
+index 00000000..0383e9c7
 --- /dev/null
 +++ b/src/runtime/sys_nocturne_amd64.s
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,130 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
 +
 +//
 +// System calls for AMD64, Nocturne.
-+// A call is SYSCALL with the number in AX and the arguments in
-+// DI, SI, DX, R10 and R8; the result (or a negated Nocturne result code)
-+// comes back in AX. The instruction itself uses CX and R11; every other
-+// register is preserved.
++// A call is a C call of a slot of the entry image, N_ENTRY_SLOT_BYTES each,
++// in the order of the calls' numbers (common/abi.h of Nocturne): the
++// arguments in DI, SI, DX, CX and R8, the result (or a negated Nocturne
++// result code) in AX. A slot that enters the kernel uses CX, R10 and R11, and
++// of the stack only its return address.
 +//
 +
 +#include "go_asm.h"
@@ -4110,51 +4114,80 @@ index 00000000..914069f6
 +#define SYS_YIELD		28
 +#define SYS_THREAD_EXIT		47
 +#define SYS_THREAD_ID		50
++#define N_ENTRY_CLOCK_MONOTONIC	236
++#define N_ENTRY_CLOCK_WALL	238
++
++// The address of a slot, into a register.
++#define SLOT(n, reg) \
++	MOVQ	runtime·nocturneEntry(SB), reg \
++	ADDQ	$((n)*16), reg
 +
 +// func syscall5(n, a1, a2, a3, a4, a5 uintptr) int64
 +TEXT runtime·syscall5(SB),NOSPLIT,$0-56
 +	MOVQ	n+0(FP), AX
++	SHLQ	$4, AX
++	ADDQ	runtime·nocturneEntry(SB), AX
 +	MOVQ	a1+8(FP), DI
 +	MOVQ	a2+16(FP), SI
 +	MOVQ	a3+24(FP), DX
-+	MOVQ	a4+32(FP), R10
++	MOVQ	a4+32(FP), CX
 +	MOVQ	a5+40(FP), R8
-+	SYSCALL
++	CALL	AX
 +	MOVQ	AX, ret+48(FP)
 +	RET
 +
 +// Ends the whole app, from any of its threads.
 +TEXT runtime·exit(SB),NOSPLIT,$0-4
 +	MOVL	code+0(FP), DI
-+	MOVL	$SYS_EXIT, AX
-+	SYSCALL
++	SLOT(SYS_EXIT, AX)
++	CALL	AX
 +	INT	$3
 +	JMP	0(PC)
 +
 +// func exitThread(wait *atomic.Uint32)
 +TEXT runtime·exitThread(SB),NOSPLIT,$0-8
 +	MOVQ	wait+0(FP), AX
-+	// We're done using the stack.
++	SLOT(SYS_THREAD_EXIT, BX)
++	// We're done using the stack: a jump, as a call would write to it.
++	// The slot's SYSCALL does not come back.
 +	MOVL	$0, (AX)
-+	MOVL	$SYS_THREAD_EXIT, AX
-+	SYSCALL
-+	INT	$3
-+	JMP	0(PC)
++	JMP	BX
 +
-+// func nocturneTSC() (tsc uint64, cpu uint32)
-+// RDTSCP waits for the loads before it; the LFENCE holds the loads after it.
-+TEXT runtime·nocturneTSC(SB),NOSPLIT,$0-12
-+	RDTSCP
-+	LFENCE
-+	SHLQ	$32, DX
-+	ORQ	DX, AX
-+	MOVQ	AX, tsc+0(FP)
-+	MOVL	CX, cpu+8(FP)
++// A clock of the entry image in AX, returning in AX. It is C code: it runs on
++// the scheduler's stack, as it may want more than a goroutine's can spare,
++// with that stack aligned. C keeps R12.
++TEXT runtime·nocturneClockCall(SB),NOSPLIT|NOFRAME,$0
++	MOVQ	SP, R12
++	get_tls(CX)
++	MOVQ	g(CX), BX
++	MOVQ	g_m(BX), DX
++	CMPQ	BX, m_curg(DX)
++	JNE	onstack
++	MOVQ	m_g0(DX), DX
++	MOVQ	(g_sched+gobuf_sp)(DX), SP
++onstack:
++	ANDQ	$~15, SP
++	CALL	AX
++	MOVQ	R12, SP
++	RET
++
++// func nanotime1() int64
++TEXT runtime·nanotime1(SB),NOSPLIT,$0-8
++	SLOT(N_ENTRY_CLOCK_MONOTONIC, AX)
++	CALL	runtime·nocturneClockCall(SB)
++	MOVQ	AX, ret+0(FP)
++	RET
++
++// func nocturneWall() int64
++TEXT runtime·nocturneWall(SB),NOSPLIT,$0-8
++	SLOT(N_ENTRY_CLOCK_WALL, AX)
++	CALL	runtime·nocturneClockCall(SB)
++	MOVQ	AX, ret+0(FP)
 +	RET
 +
 +TEXT runtime·osyield(SB),NOSPLIT,$0
-+	MOVL	$SYS_YIELD, AX
-+	SYSCALL
++	SLOT(SYS_YIELD, AX)
++	CALL	AX
 +	RET
 +
 +// set tls base to DI
@@ -4173,8 +4206,8 @@ index 00000000..914069f6
 +	LEAQ	m_tls(R13), DI
 +	CALL	runtime·settls(SB)
 +
-+	MOVL	$SYS_THREAD_ID, AX
-+	SYSCALL
++	SLOT(SYS_THREAD_ID, AX)
++	CALL	AX
 +	MOVQ	AX, m_procid(R13)
 +
 +	MOVQ	m_g0(R13), R9
@@ -4186,8 +4219,8 @@ index 00000000..914069f6
 +	CALL	R12
 +
 +	// mstart returns when an M on a system stack exits.
-+	MOVL	$SYS_THREAD_EXIT, AX
-+	SYSCALL
++	SLOT(SYS_THREAD_EXIT, AX)
++	CALL	AX
 +	INT	$3
 +	JMP	0(PC)
 diff --git a/src/runtime/timestub2.go b/src/runtime/timestub2.go
@@ -4205,10 +4238,10 @@ index 336bac4b..64875a18 100644
  
 diff --git a/src/syscall/asm_nocturne_amd64.s b/src/syscall/asm_nocturne_amd64.s
 new file mode 100644
-index 00000000..dd9dbda9
+index 00000000..90d56bd5
 --- /dev/null
 +++ b/src/syscall/asm_nocturne_amd64.s
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,23 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -4216,18 +4249,20 @@ index 00000000..dd9dbda9
 +#include "textflag.h"
 +
 +// func rawSyscall(n, a1, a2, a3, a4, a5 uintptr) int64
-+// A Nocturne system call: SYSCALL with the number in AX and the
-+// arguments in DI, SI, DX, R10 and R8. AX returns the result, or a
-+// negated Nocturne result code. The instruction itself uses CX and R11;
-+// every other register is preserved.
++// A Nocturne system call: a C call of slot n of the entry image, 16 bytes
++// each, with the arguments in DI, SI, DX, CX and R8. AX returns the result,
++// or a negated Nocturne result code. The slot uses CX, R10 and R11, and of
++// the stack only its return address.
 +TEXT ·rawSyscall(SB),NOSPLIT,$0-56
 +	MOVQ	n+0(FP), AX
++	SHLQ	$4, AX
++	ADDQ	runtime·nocturneEntry(SB), AX
 +	MOVQ	a1+8(FP), DI
 +	MOVQ	a2+16(FP), SI
 +	MOVQ	a3+24(FP), DX
-+	MOVQ	a4+32(FP), R10
++	MOVQ	a4+32(FP), CX
 +	MOVQ	a5+40(FP), R8
-+	SYSCALL
++	CALL	AX
 +	MOVQ	AX, ret+48(FP)
 +	RET
 diff --git a/src/syscall/env_unix.go b/src/syscall/env_unix.go
@@ -4245,7 +4280,7 @@ index e1d7e213..0e83e7d9 100644
  
 diff --git a/src/syscall/syscall_nocturne.go b/src/syscall/syscall_nocturne.go
 new file mode 100644
-index 00000000..a673859b
+index 00000000..4ecc3d10
 --- /dev/null
 +++ b/src/syscall/syscall_nocturne.go
 @@ -0,0 +1,1262 @@

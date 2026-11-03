@@ -11,12 +11,12 @@
     },
     {
       "path": "config.asm",
-      "sha256": "37f8832fb3688bf0a6387ae0a1fbcfbe0c7df83e391aba82cb6036c02742b8bd",
+      "sha256": "4bb741cdeeae1a712a634ebbbce4bb491435d9f511cb84be9a1b1db76c830918",
       "origin": "configure-generated"
     },
     {
       "path": "config.h",
-      "sha256": "2bc8d6464a8db22ec58f5eecbf2b3c99b4a76b35ab92d0b1063732d7627261d2",
+      "sha256": "288cc4260be11d60b3582025e752b7f77f6a0170050c04d9e2ffe89d0c3b787f",
       "origin": "configure-generated"
     },
     {

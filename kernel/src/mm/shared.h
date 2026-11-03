@@ -126,14 +126,15 @@ int64_t pager_fail(struct handle *h, uint64_t offset, uint64_t bytes);
    Programs whose read-only segments every process running them shares. A start holds the program
    its READ opening doc reads: the cached one when that content was read before, else a new one
    (NULL: the content has no identity to share it by, or no memory). program_map maps the segment
-   at va, filesz bytes of doc from offset, into p from the program's frames: 0 when it is mapped,
+   at base + va (base page-aligned: a driver image's place differs by process, the frames do not),
+   filesz bytes of doc from offset, into p from the program's frames: 0 when it is mapped,
    its pages read from doc (which the program holds on to) when a process first touches them; < 0
    when it is not shared (the start copies it). program_put ends the start's hold: a new program a
    start mapped completely joins the cache. */
 struct program;
 struct program *program_get(struct handle *doc);
-int program_map(struct process *p, struct program *prog, struct handle *doc, uint64_t offset, uint64_t va,
-                uint64_t filesz, uint64_t memsz, bool exec);
+int program_map(struct process *p, struct program *prog, struct handle *doc, uint64_t offset, uint64_t base,
+                uint64_t va, uint64_t filesz, uint64_t memsz, bool exec);
 void program_put(struct program *p, bool complete);
 /* The frames of all idle programs: free for the asking. */
 uint64_t programs_idle(void);

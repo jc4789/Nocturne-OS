@@ -66,6 +66,8 @@ int store_entry_set_owner(const char *path, uint32_t owner, bool user);
 /* A number for the name path gives an entry: the same for every way of writing that path, whatever
    the case, and across boots. Never 0. It says nothing of whether the entry exists. */
 int store_path_number(const char *path, uint64_t *out);
+/* Whether the path names something in C:\Nocturne, where only the system writes. */
+int store_path_is_system(const char *path, bool *out);
 
 /* Whole documents. store_save replaces the content and returns once it is on the medium;
    store_append adds to the end, making the document when there is none, and does not wait for the

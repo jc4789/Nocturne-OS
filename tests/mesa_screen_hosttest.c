@@ -19,12 +19,17 @@ void _simple_mtx_plain_init_once(simple_mtx_t *m) { (void)m; }
 void util_call_once_data_slow(once_flag *flag, util_call_once_data_func func, const void *data) {
     (void)flag; func(data);
 }
-struct nvrm *nvrm_connect_ready(void) {
-    probes++; return daemon_present && daemon_ready ? (struct nvrm *)&daemon_ready : NULL;
+/* 偽のドライバーの像：サービスが名を言うのは daemon_present の間、描けるのは daemon_ready の間。 */
+static const struct n_gpu_driver fake_driver;
+n_result n_gpu_driver_get(const struct n_gpu_driver **out) {
+    *out = daemon_present ? &fake_driver : NULL;
+    return daemon_present ? 0 : -N_ERR_NOT_FOUND;
 }
-int64_t nvrm_connect_ready_status(struct nvrm **out) {
-    *out = nvrm_connect_ready();
-    return *out ? 0 : daemon_present ? -N_ERR_NOT_READY : -N_ERR_NOT_FOUND;
+static int64_t fake_ready(void) {
+    probes++;
+    if (!daemon_ready) return -N_ERR_NOT_READY;
+    closes++;
+    return 0;
 }
 const char *n_result_text(n_result r) { return r == -N_ERR_NOT_READY ? "not ready" : "?"; }
 static unsigned logs, line_writes;
@@ -52,7 +57,10 @@ void mesa_log_write_lines(const char *lines) {
     CHECK(!holding);
     if (lines && *lines) { snprintf(written, sizeof written, "%s", lines); line_writes++; }
 }
-void nvrm_disconnect(struct nvrm *rm) { CHECK(rm == (struct nvrm *)&daemon_ready); closes++; }
+static const char *driver_lines;
+static void fake_log_hold(void) {}
+static char *fake_log_release(void) { return driver_lines ? strdup(driver_lines) : NULL; }
+static void fake_log_free(char *lines) { free(lines); }
 struct pipe_screen *softpipe_create_screen(struct sw_winsys *ws) {
     CHECK(ws == &mem_winsys); cpu_attempts++; return &software;
 }
@@ -77,21 +85,31 @@ static void unmap(struct pipe_context *pipe, struct pipe_transfer *transfer) { (
 
 /* 直接表示の画像：8x4、行は64バイト、1ページ。 */
 static unsigned scanout_creates, scanout_destroys, scanout_presents, imports, destroyed, buffer_clears, copies, flushes;
-static uint32_t present_status, last_presented;
+static int64_t present_status;
+static uint32_t last_presented;
 static unsigned copy_offset, copy_stride;
 static struct pipe_resource imported[3];
-uint32_t nvrm_scanout_create(struct nvrm *rm, uint32_t *image, uint32_t *width, uint32_t *height,
-                             uint32_t *pitch, uint64_t *bytes) {
-    CHECK(rm == (struct nvrm *)&daemon_ready);
+static struct n_gpu_scanout *fake_open(void) {
+    probes++; return daemon_present && daemon_ready ? (struct n_gpu_scanout *)&daemon_ready : NULL;
+}
+static void fake_close(struct n_gpu_scanout *rm) { CHECK(rm == (struct n_gpu_scanout *)&daemon_ready); closes++; }
+static int64_t fake_create(struct n_gpu_scanout *rm, uint32_t *image, uint32_t *width, uint32_t *height,
+                           uint32_t *pitch, uint64_t *bytes) {
+    CHECK(rm == (struct n_gpu_scanout *)&daemon_ready);
     *image = 0x100 + scanout_creates++; *width = 8; *height = 4; *pitch = 64; *bytes = 4096;
-    return NV_OK;
+    return 0;
 }
-uint32_t nvrm_scanout_destroy(struct nvrm *rm, uint32_t image) {
-    CHECK(rm == (struct nvrm *)&daemon_ready && image >= 0x100 && image < 0x103); scanout_destroys++; return NV_OK;
+static void fake_destroy(struct n_gpu_scanout *rm, uint32_t image) {
+    CHECK(rm == (struct n_gpu_scanout *)&daemon_ready && image >= 0x100 && image < 0x103); scanout_destroys++;
 }
-uint32_t nvrm_scanout_present(struct nvrm *rm, uint32_t image) {
+static int64_t fake_present(struct n_gpu_scanout *rm, uint32_t image) {
     (void)rm; last_presented = image; scanout_presents++; return present_status;
 }
+static const struct n_gpu_driver fake_driver = {
+    .abi = N_GPU_DRIVER_ABI, .ready = fake_ready, .log_hold = fake_log_hold, .log_release = fake_log_release,
+    .log_free = fake_log_free, .scanout_open = fake_open, .scanout_close = fake_close, .scanout_create = fake_create,
+    .scanout_destroy = fake_destroy, .scanout_present = fake_present,
+};
 static struct pipe_resource *from_handle(struct pipe_screen *screen, const struct pipe_resource *templ,
                                          struct winsys_handle *handle, unsigned usage) {
     CHECK(handle->type == WINSYS_HANDLE_TYPE_NOCTURNE_SCANOUT && handle->handle == 0x100 + imports);
@@ -145,17 +163,17 @@ static void scanout_cases(struct ngl_context *cpu, struct ngl_context *gpu) {
     CHECK(ngl_scanout_present(s, gpu, 1, 0, 8, 4) == -1 && ngl_scanout_present(s, gpu, 0, 0, 0, 4) == -1);
     CHECK(scanout_presents == 0 && buffer_clears == 0);
     /* 何も描かれていない：画像を黒で埋めて提示し、次の画像へ進む。 */
-    present_status = NV_OK;
+    present_status = 1;
     CHECK(ngl_scanout_present(s, gpu, 0, 0, 8, 4) == 1 && last_presented == 0x100 && buffer_clears == 1 && flushes == 1);
     /* 系が直接表示をやめた直後：0を返し、同じ画像を次も使う。 */
-    present_status = NV_ERR_INVALID_STATE;
+    present_status = 0;
     CHECK(ngl_scanout_present(s, gpu, 0, 0, 8, 4) == 0 && last_presented == 0x101 && buffer_clears == 2);
     /* 描画バッファーと同じ大きさ：位置(2,1)へ行の間隔64で写し、場所の変わった画像は先に黒で埋める。 */
     struct pipe_resource color = {.target = PIPE_TEXTURE_2D, .width0 = 4, .height0 = 2};
     gpu->textures[ST_ATTACHMENT_BACK_LEFT] = &color;
     gpu->width = gpu->tex_width = 4;
     gpu->height = gpu->tex_height = 2;
-    present_status = NV_OK;
+    present_status = 1;
     CHECK(ngl_scanout_present(s, gpu, 2, 1, 4, 2) == 1 && last_presented == 0x101 && buffer_clears == 3);
     CHECK(copies == 1 && copy_offset == 1 * 64 + 2 * 4 && copy_stride == 64);
     /* 同じ場所なら黒で埋め直さない（三枚目は初めてなので埋める）。 */
@@ -163,7 +181,7 @@ static void scanout_cases(struct ngl_context *cpu, struct ngl_context *gpu) {
     CHECK(ngl_scanout_present(s, gpu, 2, 1, 4, 2) == 1 && last_presented == 0x100 && buffer_clears == 5);
     CHECK(ngl_scanout_present(s, gpu, 2, 1, 4, 2) == 1 && last_presented == 0x101 && buffer_clears == 5 && copies == 4);
     /* ドライバーの失敗は-1：呼出し側はこの文脈の直接表示をやめる。 */
-    present_status = NV_ERR_GENERIC;
+    present_status = -N_ERR_IO;
     CHECK(ngl_scanout_present(s, gpu, 2, 1, 4, 2) == -1 && last_presented == 0x102);
     gpu->textures[ST_ATTACHMENT_BACK_LEFT] = NULL;
     ngl_scanout_destroy(s);
@@ -196,8 +214,11 @@ int main(void) {
     CHECK(get_screen() == first && gpu_attempts == 3 && line_writes == 1 && logs == 3);
     /* 理由が変われば、同じ失敗でも書き直す。 */
     zink_reason = "ZINK: vkCreateDevice failed (VK_ERROR_INITIALIZATION_FAILED)";
+    driver_lines = "NVK: a line the driver's image held\n"; /* 像の預かった行は、プログラムの行の後ろ。 */
     CHECK(get_screen() == first && gpu_attempts == 4 && line_writes == 2 && logs == 4);
-    CHECK(strstr(written, "vkCreateDevice failed") && strstr(logged, "why is in the lines before"));
+    CHECK(strstr(written, "vkCreateDevice failed") && strstr(written, "a line the driver's image held"));
+    CHECK(strstr(logged, "why is in the lines before"));
+    driver_lines = NULL;
     /* 理由が消えれば「理由なし」を書き直す。 */
     zink_reason = NULL;
     CHECK(get_screen() == first && gpu_attempts == 5 && line_writes == 2 && logs == 5);

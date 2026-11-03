@@ -145,7 +145,7 @@ $(BUILD)/u/user/apps/services.o: UCFLAGS += -Iports/nvidia/include
 $(NVRM_CLIENT_OBJ): ports/nvidia/libnvrm.c
 	@mkdir -p $(dir $@)
 	@echo "  CC   $<"
-	@$(CC) $(UCFLAGS) $(NVRM_CLIENT_INC) -c $< -o $@
+	@$(CC) $(UCFLAGS) $(IMAGE_CFLAGS) $(NVRM_CLIENT_INC) -c $< -o $@
 
 # ---------------------------------------------------------------- targets
 .PHONY: nvrm-objs nvrm-rm nvrm-os nvrm-undefined

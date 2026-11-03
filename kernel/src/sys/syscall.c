@@ -40,6 +40,7 @@
 #include "authority_abi.h"
 #include "settings_abi.h"
 #include "sys/settings.h"
+#include "sys/entry.h"
 /* sys/object.c: whether the handle is a capability that gives want. */
 
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
@@ -576,6 +577,17 @@ static int64_t sys_document_io(int h, uint64_t off, void *buf, size_t n, bool wr
     return r;
 }
 
+static int64_t sys_image_map(int h, struct n_image *uout) {
+    struct handle *doc = handle_get(h);
+    if (!doc) return -N_ERR_NO_HANDLE;
+    struct n_image image;
+    int64_t r = handle_kind(doc) != N_KIND_DOCUMENT ? -N_ERR_WRONG_KIND : doc->rights & HANDLE_WRITE ? -N_ERR_DENIED :
+                proc_image_map(doc, &image);
+    handle_close(doc);
+    if (r >= 0 && copy_to_user(uout, &image, sizeof image)) r = -N_ERR_BAD_ADDRESS;
+    return r;
+}
+
 static int64_t sys_document_size(int h) {
     struct handle *d = handle_get(h);
     if (!d) return -N_ERR_NO_HANDLE;
@@ -1024,6 +1036,12 @@ void syscall_dispatch(struct regs *r) {
     struct thread *self = thread_current();
     if (self->killed) thread_exit(self->kill_code);
     sti();
+    if (!entry_came_from(self->process, r->rip, r->rax)) {
+        /* The number belongs to the entry image: a program that holds its own SYSCALL ends. */
+        kprintf("[crash] pid %d (%s): call %lu entered the kernel at rip=%p, not by its slot of the entry image\n",
+                self->tid, self->name, r->rax, (void *)r->rip);
+        process_exit(128 + 13);
+    }
     uint64_t a = r->rdi, b = r->rsi, c = r->rdx, d = r->r10, e = r->r8;
     int64_t ret = -N_ERR_UNSUPPORTED;
     switch (r->rax) {
@@ -1215,6 +1233,7 @@ void syscall_dispatch(struct regs *r) {
         break;
     }
     case SYS_YIELD: sched_yield(); ret = 0; break;
+    case SYS_IMAGE_MAP: ret = sys_image_map((int)a, (struct n_image *)b); break;
     case SYS_SESSION_STOP:
         ret = cap_check((int)a, N_CAP_IDENTITY_GRANT);
         if (ret < 0) break;

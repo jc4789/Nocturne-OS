@@ -43,16 +43,19 @@
 #define N_ERR_NOT_CONNECTED 31
 #define N_ERR_UNREACHABLE 32
 #define N_ERR_PROTOCOL 33
-#define N_RESULT_CODES 34
+#define N_ERR_WRONG_GENERATION 34  /* the program was built for another generation of the system */
+#define N_RESULT_CODES 35
 
-/* System call numbers. The ABI keeps no older form of a call: a program is built against the
-   abi.h of the system it runs on. 1-18, 21-25, 30-32, 35-37, 44, 51-55, 60-63, 73, 90 and 203-206
-   are unassigned. */
+/* The calls of the kernel. A program never holds the SYSCALL instruction: it calls the slot of its
+   entry image (below), and each name here is that slot's index. The ABI keeps no older form of a
+   call: a program is built for one generation of the system (N_ABI_GENERATION). 1-18, 21-25,
+   30-32, 35-37, 44, 51-55, 60-63, 73, 90 and 203-206 are unassigned. */
 enum {
     SYS_EXIT = 0,
     SYS_SLEEP = 19, /* (deadline): until the monotonic clock reaches it (§8) */
     SYS_APP_CPU_TIME, /* (): ns the calling app's threads have run, the ended ones too (§8) */
     SYS_PROCLIST = 26, SYS_SYSINFO, SYS_YIELD, SYS_POWER,
+    SYS_IMAGE_MAP,            /* (読むために開いた文書の handle, struct n_image *out): ドライバーの像を自分へ写す */
     SYS_SYSTEM_LOG = 33, SYS_PCILIST,
     SYS_CPU_INFO = 38, SYS_GPU_INFO, SYS_GPU_RENDER,
     SYS_AUDIO_DEVICE_RUN,     /* (device, 0 or 1): 輪の始めから流す、止める（§17） */
@@ -195,6 +198,83 @@ enum {
     SYS_MAX                   /* above every number (what syscallfuzz tries) */
 };
 
+/* ---- 入口の像（kernel/src/sys/entry.c、docs/nocturne-native-abi.md §0） ----
+   カーネルは全プロセスに読取り専用の像を一つ写す。番地はプロセスごとに違い、struct n_start の entry が
+   教える。溝の番号 i の関数は entry + i * N_ENTRY_SLOT_BYTES にあり、C の呼び方で呼ぶ
+   （引数は rdi、rsi、rdx、rcx、r8、結果は rax）。溝の順は呼出しの名前の値のとおり。
+   カーネルは、syscall がその番号の溝から来たことを確かめ、違えばプロセスを止める。 */
+#define N_ENTRY_SLOT_BYTES 16u
+enum {
+    /* 溝のうち SYS_MAX から上は、カーネルへ入らない像の中のコード */
+    N_ENTRY_CLOCK_MONOTONIC = SYS_MAX, /* uint64_t (void)：単調時計の ns */
+    N_ENTRY_CLOCK_BOOT,                /* uint64_t (void)：眠りも数える時計の ns */
+    N_ENTRY_CLOCK_WALL,                /* int64_t (void)：壁時計（UTC）の ns */
+    N_ENTRY_CLOCK_TSC_HZ,              /* uint64_t (void)：TSC の周波数 */
+    N_ENTRY_SLOTS
+};
+
+/* 公開の呼出し。C:\Nocturne の外のプログラムの像には、これだけがカーネルへ入る溝になる。ほかの溝は
+   -N_ERR_DENIED を返す。C:\Nocturne の中のプログラムの像には全部の呼出しがある。表は面の広さを
+   決めるだけで、呼べるかどうかの本当の検査は能力と身元で行う。 */
+#define N_PUBLIC_CALLS(X) \
+    X(SYS_EXIT) X(SYS_SLEEP) X(SYS_APP_CPU_TIME) X(SYS_SYSINFO) X(SYS_YIELD) X(SYS_CPU_INFO) X(SYS_PCILIST) \
+    X(SYS_THREAD_CREATE) X(SYS_THREAD_JOIN) X(SYS_THREAD_EXIT) X(SYS_THREAD_ID) X(SYS_THREAD_SCHEDULE) \
+    X(SYS_THREAD_STACK_BOUNDS) X(SYS_THREAD_DETACH) X(SYS_WAIT_ADDRESS) X(SYS_WAIT_ADDRESS64) X(SYS_WAKE_ADDRESS) \
+    X(SYS_MEMORY_RESERVE) X(SYS_MEMORY_RELEASE) X(SYS_MEMORY_PROTECT) \
+    X(SYS_SHARED_CREATE) X(SYS_SHARED_RESERVE) X(SYS_SHARED_MAP) \
+    X(SYS_WIN_CREATE) X(SYS_WIN_SURFACE) X(SYS_WIN_PRESENT) X(SYS_WIN_SET_TITLE) X(SYS_WIN_MOVE) X(SYS_WIN_RESIZE) \
+    X(SYS_WIN_STATE) X(SYS_WIN_PRESENTATION) X(SYS_WIN_RECEIVE) X(SYS_WIN_DIRECT) X(SYS_WIN_FRAME) \
+    X(SYS_WIN_POINTER) X(SYS_WIN_ACQUIRE) X(SYS_SCREEN_INFO) X(SYS_CLIPBOARD_SET) X(SYS_CLIPBOARD_GET) \
+    X(SYS_NET_ADAPTERS) X(SYS_NET_ADAPTER_NAME) X(SYS_NET_WATCH) X(SYS_NET_SETUP_CANCEL_CHANNEL) \
+    X(SYS_UDP_SOCKET) X(SYS_UDP_SEND) X(SYS_UDP_RECV) X(SYS_UDP_CLOSE) \
+    X(SYS_TCP_CONNECT) X(SYS_TCP_SEND) X(SYS_TCP_SEND_UNTIL) X(SYS_TCP_RECV) X(SYS_TCP_CLOSE) X(SYS_TCP_CANCEL) \
+    X(SYS_TCP_LISTEN) X(SYS_TCP_ACCEPT) X(SYS_TCP_ADDRESS) X(SYS_TCP_FINISH) \
+    X(SYS_HANDLE_CLOSE) X(SYS_HANDLE_KIND) \
+    X(SYS_DOCUMENT_OPEN) X(SYS_DOCUMENT_READ_AT) X(SYS_DOCUMENT_WRITE_AT) X(SYS_DOCUMENT_SIZE) X(SYS_DOCUMENT_SET_SIZE) \
+    X(SYS_DOCUMENT_CLAIM) X(SYS_DOCUMENT_RELEASE) X(SYS_DOCUMENT_SAVE) X(SYS_DOCUMENT_APPEND) X(SYS_DOCUMENT_COMMIT) \
+    X(SYS_DOCUMENT_INFO) X(SYS_ENTRY_INFO) X(SYS_ENTRY_INFO_SIZED) X(SYS_ENTRY_REMOVE) X(SYS_ENTRY_MOVE) \
+    X(SYS_ENTRY_REPLACE) X(SYS_ENTRY_WATCH) X(SYS_FOLDER_CREATE) X(SYS_FOLDER_LIST) X(SYS_FOLDER_LIST_SIZED) \
+    X(SYS_CHANNEL_PAIR) X(SYS_CHANNEL_SEND) X(SYS_CHANNEL_RECEIVE) X(SYS_CHANNEL_RECEIVE_FROM) X(SYS_CHANNEL_PEER) \
+    X(SYS_APP_LAUNCH) X(SYS_APP_RESULT) X(SYS_APP_STOP) X(SYS_APP_SELF) X(SYS_APP_PARENT) X(SYS_APP_OPEN) X(SYS_APP_ID) \
+    X(SYS_EVENTS_CREATE) X(SYS_EVENTS_WATCH) X(SYS_EVENTS_UNWATCH) X(SYS_EVENTS_WATCH_ADDRESS) X(SYS_EVENTS_TIMER) \
+    X(SYS_EVENTS_WAIT) X(SYS_WATCH_TAKE) \
+    X(SYS_SYSTEM_LOG_OPEN) X(SYS_RANDOM) X(SYS_IDENTITY_SELF) X(SYS_SERVICE_CONNECT) X(SYS_IMAGE_MAP) \
+    X(SYS_SETTINGS_EFFECTIVE) X(SYS_SETTINGS_DESCRIBE) X(SYS_SETTINGS_WATCH)
+
+/* 世代。呼出し、構造体、システムのサービスの文の形を変えたら一つ上げる。溝を末尾へ足すだけなら上げない。 */
+#define N_ABI_GENERATION 1u
+
+/* プログラムの刻印：ELF の PT_NOTE の一つ（user/libc/sys.c が全プログラムに入れる）。カーネルは起こす前に
+   読む。世代が違うか、溝がカーネルより多ければ、N_ERR_WRONG_GENERATION で起こさない。 */
+#define N_PROGRAM_NOTE_NAME "Nocturne"
+#define N_PROGRAM_NOTE_TYPE 1u
+struct n_program_note {
+    uint32_t name_bytes, desc_bytes, type; /* 9、8、N_PROGRAM_NOTE_TYPE */
+    char name[12];                         /* N_PROGRAM_NOTE_NAME と nul、4 バイトへ詰める */
+    uint32_t generation;                   /* 組んだときの N_ABI_GENERATION */
+    uint32_t slots;                        /* 組んだときの N_ENTRY_SLOTS */
+};
+
+/* スレッドの区画。FS の基底はここを指し、頭の語は自分の番地（%fs:0）。C ライブラリーが作る。 */
+struct n_thread_block {
+    struct n_thread_block *self;
+    uintptr_t entry; /* struct n_start の entry */
+    /* ドライバーの像は自分の C ライブラリーを持つ。一つのスレッドは、触れた写しごとに区画を一つ持つ。
+       FS が指すのはスレッドを作った写しの区画で、他の写しの区画はその others に繋がる。 */
+    const void *owner;              /* この区画を持つ写しの目印 */
+    struct n_thread_block *others;
+    void (*leave)(struct n_thread_block *self); /* スレッドの終わり：写しが片付け、others から外れる */
+};
+
+/* ドライバーの像（SYS_IMAGE_MAP）：番地 0 から組んだ ET_DYN の ELF で、プログラムと同じ刻印を持つ。カーネルは
+   読み込み可能な節を写すだけで、再配置もコードの実行もしない。読み取り専用の節は同じ文書を使う全プロセスで
+   frame を共有し、書ける節はプロセスごとの写しになる。像はプロセスの終わりまで残る。呼ぶ者が entry を呼ぶ。
+   権限はプログラムと同じで、像が使える溝もプログラムと同じ。 */
+struct n_image {
+    uint64_t base;  /* 像の番地 0 が写った番地 */
+    uint64_t entry; /* 像の入口 */
+};
+
 /* ---- native handles ---- */
 #define N_KIND_DOCUMENT 1
 #define N_KIND_FOLDER 2
@@ -297,6 +377,7 @@ struct n_launch {
 /* アプリの入口の第三引数。カーネルが n_launch の欄を新しいアプリの stack に写したもの。文字列と
    配列は同じ stack にある。folder は完全なパスか NULL。 */
 struct n_start {
+    uintptr_t entry;          /* 入口の像の番地（上の「入口の像」） */
     char *const *environment; /* NULL で終わる */
     const char *folder;
     const int32_t *terminals;
@@ -363,37 +444,6 @@ struct n_sysinfo {
 #define N_NS_PER_MS 1000000ULL
 #define N_NS_PER_S 1000000000ULL
 #define N_CLOCK_NEVER UINT64_MAX
-
-/* The clocks, which every app reads in its own memory without a call: the kernel's data of them,
-   mapped read-only at N_CLOCK_ADDRESS in every app (struct n_clock, then offset[cpus]). With t
-   the TSC that RDTSCP reads (its TSC_AUX is the CPU's index, §0) less offset[that index]:
-     monotonic ns = base_ns + ((t - base_tsc) * mult >> shift)   (base_ns when t <= base_tsc)
-     boot ns      = monotonic ns + asleep_ns
-     wall ns      = wall_ns + (monotonic ns - wall_from) + the slew's part: wall_slew's sign times
-                    min(|wall_slew|, (min(monotonic ns, wall_until) - wall_from) * wall_slew_mult >> 32)
-   (each difference 0 when negative). The monotonic clock is ns since the TSC began, standing still
-   while the machine sleeps; the boot clock goes on through sleep; the wall clock is Unix time. A
-   reader loads seq (acquire), waits while it is odd (the kernel is writing), reads the TSC with
-   RDTSCP, the fields and its CPU's offset, and seq again: equal, the fields belong together; else
-   it reads again. */
-#define N_CLOCK_ADDRESS 0x00007FFFFFF00000ULL /* above the main stack */
-#define N_CLOCK_BYTES (1ULL << 20)             /* the most the data may take there */
-struct n_clock {
-    uint32_t seq;
-    uint32_t cpus;          /* offset[]'s entries: the CPUs the machine has */
-    uint64_t base_tsc, base_ns;
-    uint64_t mult;          /* ns per TSC count, times 2^shift */
-    uint32_t shift;
-    uint32_t rate_bound;    /* how far mult may be from the true rate, in 2^-32 parts (UINT32_MAX:
-                               as the CPU states it, not measured) */
-    uint64_t tsc_hz;        /* the rate mult stands for */
-    uint64_t asleep_ns;
-    int64_t wall_ns;
-    uint64_t wall_from, wall_until;
-    int64_t wall_slew;
-    uint64_t wall_slew_mult;
-    int64_t offset[];       /* by CPU index: what its TSC reads more than the clock's */
-};
 
 /* n_thread_schedule: the class a thread of the calling app runs in.
    N_SCHEDULE_FAIR: a share of the CPUs in proportion to weight, among the threads that want them;

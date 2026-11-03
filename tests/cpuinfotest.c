@@ -7,13 +7,13 @@
    noinline整数関数の通常call ABIでSIMD caller-saveを表し、固定GPRで命令を符号化する。 */
 static __attribute__((noinline)) long avx_sleep_round(const unsigned long *in, unsigned long *out) {
     long result;
-    __asm__ volatile(".byte 0xc5,0xfe,0x6f,0x06\n" /* vmovdqu (%rsi), %ymm0 */
-                     ".byte 0x0f,0x05\n"         /* syscall */
-                     ".byte 0xc5,0xfe,0x7f,0x02\n" /* vmovdqu %ymm0, (%rdx) */
+    __asm__ volatile(".byte 0xc5,0xfe,0x6f,0x06\n" /* vmovdqu (%%rsi), %%ymm0 */
+                     "call *%%rax\n"             /* the slot of the entry image */
+                     ".byte 0xc5,0xfe,0x7f,0x02\n" /* vmovdqu %%ymm0, (%%rdx) */
                      ".byte 0xc5,0xf8,0x77\n"     /* vzeroupper */
                      : "=a"(result)
-                     : "0"((long)SYS_SLEEP), "D"(2L), "S"(in), "d"(out)
-                     : "rcx", "r11", "memory", "cc");
+                     : "0"(n_entry_slot(SYS_SLEEP)), "D"(2L), "S"(in), "d"(out)
+                     : "rcx", "r8", "r9", "r10", "r11", "memory", "cc");
     return result;
 }
 

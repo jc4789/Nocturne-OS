@@ -13,13 +13,27 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 
 ## 0. 呼出しの形
 
-- 命令は `SYSCALL`。番号は `rax`、引数は `rdi`・`rsi`・`rdx`・`r10`・`r8`、結果は `rax`
-  （負の値は §2 の `N_ERR_*`）。`rcx` と `r11` は命令そのものが使い、戻ったときの中身は
-  決まらない。ほかのレジスター、フラグ（`rflags` の利用者の部分）、拡張の状態は保たれる。
-  `int $0x80` の入口は無い（一般保護例外でアプリが終わる）。libc の `__syscall` がこの形。
+- カーネルへ入る道は入口の像だけ。プログラムは `SYSCALL` を書かない（`tests/check_boundaries.py` が見る）。
+  カーネルは全プロセスに読取り専用の像を一つ写す。frame は全プロセスで共有し、番地はプロセスごとに違う。
+  番地は `struct n_start` と `struct n_thread_block` の `entry` が教える。
+- 番号 n の呼出しは `entry + n × N_ENTRY_SLOT_BYTES`（16 バイト）の関数で、C の呼び方で呼ぶ。引数は
+  `rdi`・`rsi`・`rdx`・`rcx`・`r8`、結果は `rax`（負の値は §2 の `N_ERR_*`）。libc の `__syscall` がこの形で、
+  `n_entry_slot(n)` が番地を返す。`rcx` と `r11` の戻ったときの中身は決まらない。
+  `int $0x80` の入口は無い（一般保護例外でアプリが終わる）。
+- カーネルは、`SYSCALL` がその番号の溝から来たことを確かめる。違えばプロセスを結果 `128 + 13` で終わらせ、
+  serial に `[crash]` の行を書く。
+- `C:\Nocturne` の中のプログラムの像では、全部の溝がカーネルへ入る。ほかのプログラムの像では、`abi.h` の
+  `N_PUBLIC_CALLS` の溝だけが入り、ほかは `-N_ERR_DENIED` を返す。表は面の広さを決めるだけで、呼べるかどうかの
+  本当の検査は能力と身元で行う（§13）。
+- 溝のうち `SYS_MAX` から上はカーネルへ入らない像の中のコードで、今は時計（§8）。
+- 刻印：プログラムと像は ELF の PT_NOTE に、組んだときの `N_ABI_GENERATION` と `N_ENTRY_SLOTS` を持つ（`struct
+  n_program_note`。`user/libc/sys.c` が全プログラムに入れ、Go はリンカーが入れる）。世代が違うか、溝がカーネルより
+  多ければ、起こさずに `N_ERR_WRONG_GENERATION` を返す。起こした側が理由を言う。
 - スレッドの FS と GS の基底はアプリのもの：`WRFSBASE`・`WRGSBASE` で直に書き、
   `RDFSBASE`・`RDGSBASE` で読む。カーネルはスレッドごとに保ち、切り替えのたびに戻す。
-  libc は FS を自分の TLS（x86-64 の variant II、`%fs:0` が自分の制御の塊）に使う。
+  libc は FS を自分の TLS（x86-64 の variant II）に使う。`%fs:0` は `struct n_thread_block`（`abi.h`）で、
+  頭の語が自分の番地、次の語が像の番地。ドライバーの像（§7）の libc は FS を変えず、同じスレッドの区画に
+  自分の区画を繋ぐ。Go は FS を自分で持ち、溝を番地で呼ぶ。
 - `RDPID` は、そのスレッドが今走っている CPU の番号（0 から数える）を返す。
   読んだ直後に別の CPU へ移ることがあるので、目安にだけ使う（libc の `cpu_index`）。
 
@@ -53,7 +67,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   `N_ERR_NOT_FOUND`、`N_ERR_EXISTS`、`N_ERR_DENIED`、`N_ERR_NO_MEMORY`、
   `N_ERR_INVALID`、`N_ERR_WRONG_KIND`、`N_ERR_BUSY`、`N_ERR_NOT_READY`、
   `N_ERR_CLOSED`、`N_ERR_TIMEOUT`、`N_ERR_CANCELLED`、`N_ERR_TOO_LARGE`、
-  `N_ERR_NOT_EMPTY`、`N_ERR_IO`、`N_ERR_UNSUPPORTED`。
+  `N_ERR_NOT_EMPTY`、`N_ERR_IO`、`N_ERR_UNSUPPORTED`、`N_ERR_WRONG_GENERATION`（§0）。
 - `n_result_text(r)` が表示用の文を返す。ISO Cの関数が失敗理由を残す必要がある場合、
   libcは `errno` に `n_result` の正の値を入れる。ISO C++ の `<cerrno>` の名は同じ値を指す。
 - `nocturne.h`／`gpu.h`／`display.h` のlibc関数も同じで、`errno` は触らない：
@@ -222,6 +236,13 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   閉じたのと同じで、文書のストリームは書き出してから保存する（`N_COMMIT_START`：次に開く
   アプリはその内容を読み、終了は媒体を待たない）。
 
+- 文書を選ぶ窓：`n_document_ask_open(start, out, n)`、`n_document_ask_save(start, out, n)`（`nocturne_services.h`）。
+  `start` は最初に見せるフォルダーか、保存のときは提案の名を含むパス。結果は完全なパス一通で、取り消しは
+  `-N_ERR_CANCELLED`。libc は呼ぶ者の身元で `C:\Nocturne\System\files` を子として起こし、channel の片端を
+  handle `N_DOCUMENT_WINDOW_HANDLE`（3）で渡す。文は `struct n_document_window_request` と、パスの一通。窓は
+  サービスではない：宣言のサービスは利用者 0 の身元で動き、他の利用者のファイルを見せてしまう。結果を handle に
+  しないのは、`n_document_save` がパスで atomic に置き換えるから。
+
 ## 4. チャンネル
 
 - チャンネルは**メッセージ単位**の双方向路。一回の送信が一つのメッセージになり、
@@ -389,6 +410,13 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   写像は `N_ERR_CLOSED`）。権利はページごとに
   覚え、まだ写っていないページ（最初に触れたとき割り当てるページ、ページャー付きメモリの
   結び付いていないページ、装置が消えた範囲）にも効く：後で触れて写すときもその権利を超えない。
+- ドライバーの像：`n_image_map(document, &image)`（`SYS_IMAGE_MAP`、公開）。読むために開いた文書の handle から、
+  番地 0 から組んだ ET_DYN の ELF を呼ぶ者へ写す。`image.base` が番地 0 の写った先、`image.entry` が入口。節は
+  番地の順に並び、頁を共有せず、書込みと実行を同時に持たない。そうでなければ `N_ERR_NOT_PROGRAM`。刻印は
+  プログラムと同じ（§0）。読取りだけの節は同じ文書を使う全プロセスで frame を共有し、最初に触れたときに読む。
+  カーネルは再配置もコードの実行もしない：入口を呼ぶのは呼ぶ者で、像は自分で再配置する（`user/libc/driver_image.c`）。
+  像はプロセスの終わりまで残り、その権限はプロセスと同じで、使える溝もプロセスと同じ。GPU のドライバーの表は
+  `gpu_abi.h` の `struct n_gpu_driver`、読み込むのは libc の Vulkan ローダー（`nocturne_gpu.h`、§15）。
 - 確保時だけ `access` に `N_MEMORY_LOW` を足せる：2GiB未満の低位領域（1GiB〜2GiB、
   プログラム像がそれより大きければ像の直後から）に置く。命令に符号拡張32ビットの
   絶対アドレスを持つ生成コード（`tcc -run` が結合する非PICのlibc等）のため。
@@ -466,17 +494,16 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - ABI が渡す時間は全部 ns。期限は単調時計の上の時刻（ns）で、`N_CLOCK_NEVER` は期限なし、
   呼出しの時点で過ぎた期限は待たずに見るだけ。`n_clock_after(ns)` が今から `ns` 後の期限を返す
   （桁あふれは `N_CLOCK_NEVER`）。
-- 時計は三つ。どれも呼出しなしで、自分のメモリーで読む。
+- 時計は三つ。どれもカーネルへ入らず、入口の像の溝（§0、`N_ENTRY_CLOCK_*`）が読む。
   - `n_clock_monotonic()`：TSC が数え始めてからの ns。機械が眠る間は止まる。期限の時計。
   - `n_clock_boot()`：単調時計に眠った時間を足したもの。
   - `n_clock_wall()`：壁時計（1970 年からの UTC の ns、`int64_t`）。時刻合わせの差は飛ばずに
     ゆっくり埋まる（slew）。
-- 時計のデータ：カーネルの持つ `struct n_clock`（`abi.h`）と、その後の CPU ごとの `offset[cpus]`
-  は、全アプリの `N_CLOCK_ADDRESS` に読取りだけで写る（`N_CLOCK_BYTES` まで。`n_memory_protect`
-  で書込みにすれば `N_ERR_DENIED`）。読み方は `abi.h` のとおり：`seq` を読み（奇数の間はカーネルが
-  書いている）、RDTSCP で TSC と CPU の番号（TSC_AUX、§0）を読み、欄とその CPU の offset を読み、
-  `seq` を読み直す。違えば読み直す。monotonic = `base_ns + ((t - base_tsc) * mult >> shift)`
-  （t は TSC から offset を引いたもの）。TSC は不変（invariant）であることを前提にする。
+- 時計のコードとデータは像の中で、プログラムはデータの形を知らない（`kernel/entry/clock.c`、形は
+  `common/clock_data.h`）。像は `seq` を読み（奇数の間はカーネルが書いている）、RDTSCP で TSC と CPU の番号
+  （TSC_AUX、§0）を読み、欄とその CPU の offset を読み、`seq` を読み直す。違えば読み直す。
+  monotonic = `base_ns + ((t - base_tsc) * mult >> shift)`（t は TSC から offset を引いたもの）。TSC は不変
+  （invariant）であることを前提にする。
 - `n_sleep_until(deadline)`（`SYS_SLEEP`、結果は無い）：期限まで眠る。ISO C の `thrd_sleep` は
   これの上に作る。
 - `n_random(buf, n)`：システムのエントロピーから `n` バイト。
@@ -893,7 +920,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 
 ## 10. 番号と、ほかの節に無い呼出し
 
-欠番：1〜18、20〜25、30〜32、35〜37、44、51〜52、60〜63、90、164、203〜206。ハンドルの種類 12 も
+欠番：1〜18、20〜25、31〜32、35〜37、44、51〜52、60〜63、90、164、203〜206。ハンドルの種類 12 も
 欠番。ABI は呼出しの古い形を残さない：プログラムは動かすシステムの `abi.h` で組む。
 
 ほかの節に無い呼出し：
@@ -1322,6 +1349,10 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   宣言は C の型のある表 `declared[]` で、プログラムに組み込む。項目は名前、プログラム、級、範囲（機械か PCI の機能）、
   渡す能力、依存、失敗の扱い（起こし直す回数、間隔、健康とみなす時間）、接続してよい相手。
   起動の順は依存から解き、準備は相手の知らせ（`n_service_ready`）で知る。決まった時間を待たない。
+- 宣言の項目 `client_image` は、サービスを使う者が自分の中へ読み込む像の名（`C:\Nocturne\Drivers` の中）で、
+  `struct n_service_status` に出る。`gpu` の項目の `nvrm` は特権の半分で、`nvk` が利用者側の半分。libc の Vulkan
+  ローダー（`user/libc/vulkan.c`）が一覧からこの名を読み、初めて要るときに写して入口を呼ぶ。一プロセスに一つ。
+  呼ぶ者の身元で動くので、NVK は公開の溝と `nvrm` への channel だけを使う。
 - 宣言のサービスは handle `N_SERVICE_HANDLE_CONTROL`（3）に管理者との channel を受け、能力は `n_cap_find` で引く。
   受ける向きは受け口で、`n_inlet_accept(N_SERVICE_HANDLE_CONTROL, flags)` が相手の端を返す。
   送る向きは準備の知らせ一通。管理者がこの channel を閉じると `N_ERR_CLOSED` になる。これが止める指示で、

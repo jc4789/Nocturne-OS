@@ -56,3 +56,34 @@ struct n_gpu_info {
     uint64_t submissions, failures;
     char name[48];
 };
+
+/* ---- GPU のドライバーの像 ----
+   Vulkan のドライバーはプログラムに結合せず、N_DRIVER_FOLDER の中の像（common/abi.h の SYS_IMAGE_MAP）として、
+   使うプロセスが自分の身元で読み込む。特権の半分は別プロセスのサービスに残る。サービスの宣言が像の名を言い
+   （struct n_service_status の client_image）、C ライブラリーの Vulkan ローダーがそれを読み込む。
+   像の入口は const struct n_gpu_driver *(*)(const struct n_start *) で、下の表を返す。 */
+#define N_DRIVER_FOLDER "C:\\Nocturne\\Drivers"
+#define N_GPU_DRIVER_ABI 1u
+struct n_gpu_scanout;
+struct n_gpu_driver {
+    uint32_t abi; /* N_GPU_DRIVER_ABI */
+    uint32_t reserved;
+    /* Vulkan のローダーとドライバーの間の三つ */
+    int32_t (*negotiate)(uint32_t *version);
+    void (*(*get_instance_proc_addr)(void *instance, const char *name))(void);
+    void (*(*get_device_proc_addr)(void *device, const char *name))(void);
+    /* 今、描ける装置があるか。0 か -N_ERR_*（-N_ERR_NOT_FOUND はこのドライバーの装置が無い）。 */
+    int64_t (*ready)(void);
+    /* ドライバーの書く記録を預かる。release は預かった行を返す（無ければ NULL）。行は log_free で返す。 */
+    void (*log_hold)(void);
+    char *(*log_release)(void);
+    void (*log_free)(char *lines);
+    /* 画面へ直接出す。image の番号は Vulkan の import でドライバーへ戻る。
+       present は 1：出した、0：今は出せない、負：失敗。 */
+    struct n_gpu_scanout *(*scanout_open)(void);
+    void (*scanout_close)(struct n_gpu_scanout *s);
+    int64_t (*scanout_create)(struct n_gpu_scanout *s, uint32_t *image, uint32_t *width, uint32_t *height, uint32_t *pitch,
+                              uint64_t *bytes);
+    void (*scanout_destroy)(struct n_gpu_scanout *s, uint32_t image);
+    int64_t (*scanout_present)(struct n_gpu_scanout *s, uint32_t image);
+};

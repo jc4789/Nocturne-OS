@@ -799,7 +799,7 @@ void vmm_user_pages_split(struct vmm_space *s, uint64_t out[6]) {
                 uint64_t *l1 = tbl(l2[c]);
                 uint64_t va = ((uint64_t)a << 39) | ((uint64_t)b << 30) | ((uint64_t)c << 21);
                 int region = va < USER_LOW_BASE ? 0 : va < USER_MMAP_BASE ? 1
-                           : va < USER_STACK_TOP - USER_STACK_MAX ? 2 : 3;
+                           : va < USER_MMAP_TOP ? 2 : 3;
                 out[5]++;
                 for (unsigned d = 0; d < 512; d++)
                     if (l1[d] & PTE_P) out[l1[d] & PTE_SHARED ? 4 : region]++;

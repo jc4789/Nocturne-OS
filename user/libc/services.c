@@ -234,6 +234,39 @@ bad:
     return -N_ERR_PROTOCOL;
 }
 
+static n_result document_window(uint32_t kind, const char *start, char *out, size_t n) {
+    struct n_document_window_request q = {.kind = kind};
+    if (start) strlcpy(q.start, start, sizeof q.start);
+    n_handle ends[2];
+    n_result r = n_channel_pair(ends);
+    if (r < 0) return r;
+    const char *arguments[] = {N_DOCUMENT_WINDOW_PROGRAM};
+    const int32_t handles[N_DOCUMENT_WINDOW_HANDLE + 1] = {-1, -1, -1, ends[1]};
+    struct n_launch launch = {.arguments = arguments, .argument_count = 1, .handles = handles, .handle_count = N_DOCUMENT_WINDOW_HANDLE + 1};
+    n_handle app = n_app_launch(N_DOCUMENT_WINDOW_PROGRAM, &launch);
+    n_handle_close(ends[1]);
+    if (app < 0) {
+        n_handle_close(ends[0]);
+        return app;
+    }
+    n_handle_close(app);
+    r = n_channel_send(ends[0], &q, sizeof q, -1);
+    if (r >= 0) {
+        n_handle attached = -1;
+        r = n_channel_receive(ends[0], out, n ? n - 1 : 0, N_CHANNEL_WAIT, &attached);
+        if (attached >= 0) n_handle_close(attached);
+        if (r == -N_ERR_CLOSED) r = -N_ERR_CANCELLED;
+        else if (r >= 0) {
+            out[r] = 0;
+            r = 0;
+        }
+    }
+    n_handle_close(ends[0]);
+    return r;
+}
+n_result n_document_ask_open(const char *start, char *out, size_t n) { return document_window(N_DOCUMENT_WINDOW_OPEN, start, out, n); }
+n_result n_document_ask_save(const char *start, char *out, size_t n) { return document_window(N_DOCUMENT_WINDOW_SAVE, start, out, n); }
+
 n_result n_program_run(const struct n_program *p, const char *document) {
     const char *arguments[2] = {p->path, document ? document : p->argument};
     struct n_launch launch = {.arguments = arguments, .argument_count = arguments[1][0] ? 2 : 1};

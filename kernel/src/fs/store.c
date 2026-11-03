@@ -656,6 +656,15 @@ fail:
 
 void place_free(struct place *p) { path_free(&env, &p->path); }
 
+int store_path_is_system(const char *path, bool *out) {
+    struct place p;
+    int r = place_find(path, false, &p);
+    if (r < 0) return r;
+    *out = p.found && p.area == AREA_SYSTEM;
+    place_free(&p);
+    return 0;
+}
+
 int store_path_number(const char *path, uint64_t *out) {
     struct path p;
     int r = path_parse(&env, path, &p);

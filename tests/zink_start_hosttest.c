@@ -1,5 +1,5 @@
 /* Zinkの起動の初めと、起動できない理由の記録を、製品のコードのまま検査する：
-   u_dl.c（NocturneでVulkanのローダーを務める部分）、生成されたzink_instance.c（インスタンスの作成）、
+   u_dl.c（Nocturneで「vulkan」を開く部分）、user/libc/vulkan.c（Vulkanのローダー）、生成されたzink_instance.c（インスタンスの作成）、
    log.c（Nocturne GLがZinkの理由を預かる仕組み）、vk_log.c（預かり中はNVKのvk_error*()も記録へ出す）。
    ICDは偽物だが、大域コマンドはNVKと同じにしてある：vkEnumerateInstanceVersion、
    vkEnumerateInstanceExtensionProperties、vkCreateInstanceは有り、vkEnumerateInstanceLayerPropertiesは無い
@@ -8,6 +8,10 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <nocturne.h>
+#include <nocturne_gpu.h>
+#include <nocturne_services.h>
+#include <string.h>
+#include <threads.h>
 #include "util/log.h"
 #include "util/u_debug.h"
 #include "util/u_dl.h"
@@ -139,6 +143,42 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_common_GetDeviceProcAddr(VkDevice de
     (void)device; (void)name; return (PFN_vkVoidFunction)device_proc;
 }
 
+/* ドライバーの像とその読み込みの偽物：表の入口は上の偽のICD。 */
+static const struct n_gpu_driver fake_driver = {.abi = N_GPU_DRIVER_ABI};
+static struct n_gpu_driver started;
+static VKAPI_ATTR VkResult VKAPI_CALL fake_negotiate(uint32_t *version) { (void)version; return VK_SUCCESS; }
+static const struct n_gpu_driver *fake_start(const struct n_start *start) {
+    (void)start;
+    started = fake_driver;
+    started.negotiate = (int32_t (*)(uint32_t *))fake_negotiate;
+    started.get_instance_proc_addr = (void (*(*)(void *, const char *))(void))vk_icdGetInstanceProcAddr;
+    started.get_device_proc_addr = (void (*(*)(void *, const char *))(void))vk_common_GetDeviceProcAddr;
+    return &started;
+}
+const struct n_start *__libc_start_info(void) { return NULL; }
+n_result n_services_list(struct n_service_status **out) {
+    *out = calloc(1, sizeof **out);
+    strcpy((*out)->client_image, "nvk");
+    return 1;
+}
+n_result n_path_join(const char *folder, const char *name, char *out, size_t cap) {
+    snprintf(out, cap, "%s\\%s", folder, name);
+    return 0;
+}
+n_handle n_document_open(const char *path, int access) {
+    CHECK(!strcmp(path, "C:\\Nocturne\\Drivers\\nvk") && access == N_DOCUMENT_READ);
+    return 5;
+}
+n_result n_image_map(n_handle document, struct n_image *out) {
+    CHECK(document == 5);
+    out->base = 0;
+    out->entry = (uint64_t)(uintptr_t)fake_start;
+    return 0;
+}
+n_result n_handle_close(n_handle h) { CHECK(h == 5); return 0; }
+int mtx_lock(mtx_t *m) { (void)m; return thrd_success; }
+int mtx_unlock(mtx_t *m) { (void)m; return thrd_success; }
+
 static VkInstance create(struct zink_screen *screen, struct zink_instance_info *info, char **lines) {
     memset(info, 0, sizeof *info);
     info->loader_version = VK_API_VERSION_1_3;
@@ -157,7 +197,8 @@ int main(void) {
     CHECK(lib != NULL);
     PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)util_dl_get_proc_address(lib, "vkGetInstanceProcAddr");
     CHECK(gipa != NULL && gipa(NULL, "vkGetInstanceProcAddr") == (PFN_vkVoidFunction)gipa);
-    CHECK(util_dl_get_proc_address(lib, "vkGetDeviceProcAddr") == (util_dl_proc)vk_common_GetDeviceProcAddr);
+    PFN_vkGetDeviceProcAddr gdpa = (PFN_vkGetDeviceProcAddr)util_dl_get_proc_address(lib, "vkGetDeviceProcAddr");
+    CHECK(gdpa != NULL && gdpa(NULL, "vkAny") == (PFN_vkVoidFunction)device_proc);
     CHECK(util_dl_get_proc_address(lib, "vkCreateInstance") == (util_dl_proc)icd_create_instance);
     CHECK(gipa(NULL, "vkEnumerateInstanceVersion") == (PFN_vkVoidFunction)icd_enumerate_version);
     CHECK(gipa(NULL, NULL) == NULL && gipa(NULL, "vkNoSuchCommand") == NULL);

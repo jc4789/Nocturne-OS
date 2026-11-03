@@ -23,6 +23,9 @@ make                         # tools/rust/sysroot があれば ports/rust/apps/*
 
 - 安定版の `rustc` / `cargo` 1.98.1 が要ります。`RUSTC_BOOTSTRAP=1` で `-Zbuild-std` を使います
   （スクリプトが設定します）。ネットワークは要りません（依存クレートは rust-src の `library/vendor`）。
+- ターゲットは位置に依らない形（`relocation-model: pic`、`tls-model: global-dynamic`）です。Mesa の crate がドライバーの像に
+  入るからです（`ports/mesa/nvk.mk`）。プログラムへ結合するときは `ld.lld` が普通の形に緩めます。ターゲットの形か差分を変えたら
+  `build-std.sh` を走らせ直します。ソースの木は `RUST_SRC` で変えられます。木は `nocturne.patch` と同じ中身でなければいけません。
 - `build-std.sh` の結果は `tools/rust/target`（cargo のビルド）と `tools/rust/sysroot`
   （`lib/rustlib/x86_64-unknown-nocturne/lib/*.rlib`）です。`tools/` は git の管理外です。
 - 一つのプログラムだけ作るとき：`make build/programs/rusttest`、または
@@ -48,7 +51,7 @@ make                         # tools/rust/sysroot があれば ports/rust/apps/*
 | 起動（`sys/pal`） | C ライブラリーの `__libc_start` が TLS・stdio・起動設定を用意して `main` を呼ぶ。`std::rt` は `argc/argv` を受け取る。 |
 | メモリー（`sys/alloc`） | `malloc`/`calloc`/`realloc`/`free`。16 バイトを超える配置は多めに確保して前に元のポインターを置く。 |
 | 引数・環境（`sys/args`、`sys/env`） | 引数は `argv`。環境は std の表で、起動の環境（`__libc_environment`、`NAME=値`）を最初の使用時に読む。`set_var`/`remove_var` はこの表だけを変える。名前が空か `=`・NUL を含むか、値が NUL を含めば `InvalidInput`。同じプログラムの C のコードは、`getenv` で起動の環境を読み、std の変更は見ない。 |
-| スレッド（`sys/thread`） | `thread_create`/`thread_join`。スタックはカーネルが決める固定 256 KiB で、`Builder::stack_size` は効かない。1 プロセス 128 本まで。終了時に Rust の TLS デストラクターを走らせる。`available_parallelism` は `cpu_info`。 |
+| スレッド（`sys/thread`） | `thread_create`/`thread_join`。スタックは `thread_create` の既定の 256 KiB で、`Builder::stack_size` は効かない（`thread_create_sized` へはつないでいない）。終了時に Rust の TLS デストラクターを走らせる。`available_parallelism` は `cpu_info`。 |
 | ロック・条件変数・Once・RwLock・park（`sys/sync`） | Rust の futex 実装を `wait_on_address`/`wake_address` の上に置く。待ちの期限は単調時計の絶対の ns（`n_clock_after`）。 |
 | スレッドローカル | ネイティブの `#[thread_local]`（C ライブラリーが各スレッドの FS を設定する）。 |
 | 時刻（`sys/time`） | `timespec_get` の `TIME_MONOTONIC`（Instant）と `TIME_UTC`（SystemTime）。どちらも ns で、時計の頁から syscall なしで読む。眠りは `n_sleep_until`。 |
@@ -64,7 +67,7 @@ make                         # tools/rust/sysroot があれば ports/rust/apps/*
 ## 確認したこと
 
 Nocturne 上では、QEMU（q35・UEFI・NVMe、WHPX）の Terminal から `rusttest` を走らせ、全部の項目が
-通る（`rusttest: ok (50 checks)`）。`cd Documents` の後では `current_dir` が `C:\Users\User\Documents`
+通る（`rusttest: ok (49 checks)`）。`cd Documents` の後では `current_dir` が `C:\Users\User\Documents`
 になる。実機では走らせていない。
 
 ホスト（Windows）では次を確かめた。

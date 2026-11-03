@@ -288,7 +288,7 @@ NV_STATUS NV_API_CALL os_get_system_time(NvU32 *seconds, NvU32 *useconds) {
 }
 
 NvU64 NV_API_CALL os_get_cpu_frequency(void) {
-    return ((const struct n_clock *)N_CLOCK_ADDRESS)->tsc_hz; /* the TSC's, as the clock has it (abi.h) */
+    return n_clock_tsc_hz();
 }
 
 /* A delay of a few microseconds is a spin on the clock (RM calls it with locks held and from

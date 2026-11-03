@@ -4,7 +4,7 @@
 
 enum shell_word {
     S_SLEEP, S_HIBERNATE, S_LOGOUT, S_RESTART, S_SHUT_DOWN,
-    S_START_FAILED, S_POWER_FAILED, S_VOLUME_FAILED, S_VOLUME, S_NO_SOUND, S_LOGOUT_FAILED, S_LOGOUT_CANCELLED,
+    S_START_FAILED, S_OTHER_GENERATION, S_POWER_FAILED, S_VOLUME_FAILED, S_VOLUME, S_NO_SOUND, S_LOGOUT_FAILED, S_LOGOUT_CANCELLED,
     S_WAIT_RESTART, S_WAIT_SHUT_DOWN, S_FORCE, S_RESTART_CANCELLED, S_SHUT_DOWN_CANCELLED, S_RESTARTING, S_SHUTTING_DOWN,
     S_RESTART_BYE, S_SHUT_DOWN_BYE, S_HIBERNATING, S_SAVING, S_NO_HIBERNATE, S_NO_SLEEP, S_HIBERNATE_FAILED, S_SLEEP_FAILED,
     S_IOMMU_LOST, S_DEVICE_LOST,
@@ -20,6 +20,7 @@ static const char *const shell_words[][N_LANGUAGE_COUNT] = {
     [S_RESTART] = {"再起動", "Restart"},
     [S_SHUT_DOWN] = {"電源を切る", "Shut Down"},
     [S_START_FAILED] = {"プログラムを起こせません", "Could not start program"},
+    [S_OTHER_GENERATION] = {"別の世代の Nocturne のためのプログラムです", "Built for another generation of Nocturne"},
     [S_POWER_FAILED] = {"電源を変えられません", "The power did not change"},
     [S_VOLUME_FAILED] = {"音量を変えられません", "The volume did not change"},
     [S_VOLUME] = {"音量", "Volume"},

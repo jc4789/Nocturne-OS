@@ -28,6 +28,7 @@ Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`�
 | `spdm_crypto.c` | libspdm の暗号バックエンド 71 個（libspdm_*.c の移植）。BearSSL で SHA-2、HMAC、HKDF、AES-GCM、ECDH／ECDSA（P-256／P-384）、RSA-PSS、X.509 の検証、乱数は `n_random` |
 | `nvrm.c` | `main`、割り込みスレッド、起動手順 |
 | `nvrm_serve.c／.h`、`libnvrm.c`、`include/` | リクエストサーバー、クライアント側ライブラリー、通信規約 |
+| `nvk_image.c` | ドライバーの像 `C:\Nocturne\Drivers\nvk` の表（`struct n_gpu_driver`）。libnvrm と NVK はこの像に入り、プログラムには入らない（`ports/mesa/nvk.mk`）。 |
 | `nvkms.mk`、`nvkms_os.c／.h`、`nvkms_kapi_rm.c` | NVIDIA の画面設定ドライバー NVKMS（nvidia-modeset）を nvrm に入れるビルド規則、その OS 層と RM との接続、KAPI の memory の RM ハンドル（下の「NVKMS」「直接表示」） |
 | `display.c／.h` | nvrm が画面を持つ：KAPI の唯一のクライアントとしてモニターの接続を張り直し、カーネルの画面を走査面へ移す。全画面のアプリの絵の直接表示（下の「画面」） |
 
@@ -595,7 +596,7 @@ Linux では UVM のファイルを `mmap` すると、CPU のページフォー
 - UVM の引数の `rmCtrlFd` は、上流でも RM のファイルの照合に使われていない（Bug 1624521 の TODO）。RM のオブジェクトは
   `hClient` などのハンドルで引かれるので、ある接続の UVM が別の接続の RM クライアントのハンドルを名指しできるかは RM の
   検査次第で、nvrm では未確認。
-- フォールトスレッドは接続ごとに 1 本で、アプリのスレッド上限（128）に数えられる。
+- フォールトスレッドは接続ごとに 1 本。
 
 未確認：CUDA のクライアントが Nocturne に無く、実機の GPU でも UVM を動かしていない。確かめたのはビルド、未定義シンボルの照合、
 入口を残した試験リンク、ページャーの GPU 無しの試験（`pagertest`）、要求サーバーの偽 UVM 層での試験（`nvrm_servetest`、
@@ -603,9 +604,8 @@ Linux では UVM のファイルを `mmap` すると、CPU のページフォー
 
 ## 既知のリスク・不確かなこと
 
-- 4 KiB を超えるページサイズの連続確保は、余分に取って整列する。非連続の大きなページも連続を強いるので、大きな確保は失敗しうる。
+- 4 KiB を超えるページサイズの連続確保は、余分に取って整列する。非連続の大きなページも連続を強いるので、RM へ大きなページで頼むと失敗しうる。NVK は 4 KiB のページで頼むので、この道を通らない。
 - RM はクライアントの写像を、map が返した番地だけで探す（unmap、RM 自身の失敗時の後始末、番地を含む写像の検索）。bus 番地を返すと同じ範囲の二つの写像が同じ名になり、片方の unmap が生きている他方を失効させる。そこで写像ごとに 64 ビット空間の上半分（bus 番地の無い所）から重ならない番地の範囲を割当て、それを RM の番地にする（`nvrm_user_mapping_new`、system memory は `nv_alloc_user_mapping`、BAR は `osMapPciMemoryAreaUser` の `NVRM_NOCTURNE` 部）。範囲は再利用しない（nvrm の起動から 2^63 バイト分で尽き、尽きたら map は失敗してログに出る）。
-- 再配置可能な BAR（Resizable BAR）で BAR1／BAR2 が 16 GiB のとき、カーネル側の写しが失敗しうる。
 - 非連続 BAR range は順序を保持して native `n_shared_compose` で一つの VA へ並べる。範囲数に人工的な上限は無く、ページ境界・整数幅・実資源を検証する。各範囲の cache、RO 上限、source view の取消、PCI claim の寿命を合成・派生 view へ引き継ぐ。
 - `os_is_efi_enabled` は常に真。`os_disable_console_access` は何もしない（表示の乗っ取りは GSP 初期化の間にありうる。D8）。
 - memory BAR の有効索引と64bit幅から RM aperture を割当てる。register／doorbell は UC、prefetchable な FB／IMEM は RM の WC 要求を尊重する。RM が設定する USERD 範囲と重なるページは UC、`rm_disable_iomap_wc()` は user／kernel 両経路へ反映する。BAR0 全体の UC 写像と矛盾する cache alias は作らない。

@@ -1,5 +1,5 @@
-/* Text editor: the toolbar (New, Open, Save, Save as, the file name or the name
-   prompt) and the status line are widgets of the interface engine (libc/ui.c); the
+/* Text editor: the toolbar (New, Open, Save, Save as, the file name) and the status
+   line are widgets of the interface engine (libc/ui.c); the
    text area is a surface the editor draws itself - line numbers, the selection, the
    caret - and a pointer surface, so the mouse and the wheel come to the app.
    Text is UTF-8 in Noto Sans (CJK included); Tab is four spaces when typed and a
@@ -11,6 +11,7 @@
 #include <ctype.h>
 #include <math.h>
 #include "nocturne.h"
+#include "nocturne_services.h"
 #include "ui.h"
 
 #define WINDOW 1
@@ -27,17 +28,14 @@ static size_t len, cap, cur;
 static long anc = -1; /* selection anchor, -1 = none */
 static int top;       /* the first line shown */
 static float left;    /* how far the text is scrolled sideways, in pixels */
-static bool modified, prompt_open, dragging;
-static char path[1024], prompt_buf[1024], status[128];
+static bool modified, dragging;
+static char path[1024], status[128];
 static float want_x = -1; /* where Up/Down keep the caret sideways, -1 = not set */
 static int cur_line, total;
 
 enum { B_NEW, B_OPEN, B_SAVE, B_SAVEAS, NBTN };
 static const char *btn_label[NBTN] = {"New", "Open", "Save", "Save as"};
 static uint32_t btn_node[NBTN]; /* where the buttons are in the last view */
-static int prompt_kind;         /* B_OPEN or B_SAVEAS */
-static int prompt_focus;        /* the field's "focus": counts up each time the prompt opens */
-static uint32_t prompt_field;   /* its place in the last view */
 /* Closing with unsaved changes (the close button, or the system shutting down) asks first. */
 enum { A_SAVE, A_DISCARD, A_CANCEL, NASK };
 static const char *ask_label[NASK] = {"Save", "Don't save", "Cancel"};
@@ -233,12 +231,21 @@ static bool save_file(const char *name) {
     return true;
 }
 
-static void open_prompt(int kind) {
-    prompt_open = true;
-    prompt_kind = kind;
-    prompt_focus++;
-    if (path[0]) strlcpy(prompt_buf, path, sizeof prompt_buf);
-    else if (n_path_join(n_user_folder(), "Documents", prompt_buf, sizeof prompt_buf) >= 0) strlcat(prompt_buf, "\\", sizeof prompt_buf);
+/* The system's window chooses the document. */
+static bool ask_open(void) {
+    char p[sizeof path];
+    n_result r = n_document_ask_open(path[0] ? path : NULL, p, sizeof p);
+    if (r >= 0) return load_file(p);
+    if (r != -N_ERR_CANCELLED) snprintf(status, sizeof status, "cannot ask: %s", n_result_text(r));
+    return false;
+}
+
+static bool ask_save(void) {
+    char p[sizeof path];
+    n_result r = n_document_ask_save(path[0] ? path : "untitled.txt", p, sizeof p);
+    if (r >= 0) return save_file(p);
+    if (r != -N_ERR_CANCELLED) snprintf(status, sizeof status, "cannot ask: %s", n_result_text(r));
+    return false;
 }
 
 static void new_text(void) {
@@ -251,10 +258,7 @@ static void new_text(void) {
     want_x = -1;
 }
 
-static void save(void) {
-    if (path[0]) save_file(path);
-    else open_prompt(B_SAVEAS);
-}
+static bool save(void) { return path[0] ? save_file(path) : ask_save(); }
 
 /* ---- drawing the text area ---- */
 /* The text of one line (ls..le) from x origin ox, only what shows between vis_l and vis_r. */
@@ -319,7 +323,7 @@ static void draw_editor(void) {
             ui_round_fill(&clip, tx + x0 - left, y + 1, x1 - x0, (float)lh - 2, 3, pick);
         }
         draw_line(&clip, ls, le, tx - left, y + ty_off, (float)gut + 1, (float)sw);
-        if (cur >= ls && cur <= le && !prompt_open && ln == cur_line)
+        if (cur >= ls && cur <= le && ln == cur_line)
             ui_round_fill(&clip, tx + line_x(ls, cur) - left - 1, y + 3, 2, (float)lh - 6, 1, t->accent);
         p = le + 1;
     }
@@ -347,7 +351,7 @@ static void show(void) {
                 ui_num(&m, "compact", 1);
                 ui_end(&m);
             }
-            if (closing && !prompt_open) {
+            if (closing) {
                 ui_node(&m, "text"); ui_str(&m, "text", "Save changes?");
                 ui_num(&m, "colour", ui_theme.accent); ui_num(&m, "weight", 1); ui_num(&m, "ellipsis", 1);
                 ui_num(&m, "grow", 1); ui_nums(&m, "padding", (double[]){0, 8}, 2); ui_end(&m);
@@ -357,13 +361,6 @@ static void show(void) {
                     ui_num(&m, "compact", 1);
                     ui_end(&m);
                 }
-            } else if (prompt_open) {
-                ui_node(&m, "text"); ui_str(&m, "text", prompt_kind == B_OPEN ? "Open:" : "Save as:");
-                ui_num(&m, "colour", ui_theme.accent); ui_num(&m, "weight", 1); ui_nums(&m, "padding", (double[]){0, 4}, 2);
-                ui_end(&m);
-                prompt_field = ui_node(&m, "field"); ui_str(&m, "value", prompt_buf); ui_num(&m, "focus", prompt_focus);
-                ui_str(&m, "placeholder", "Documents\\file.txt");
-                ui_str(&m, "width", "fill"); ui_num(&m, "minWidth", 80); ui_end(&m);
             } else {
                 ui_node(&m, "text"); ui_str(&m, "text", path[0] ? path : "(not saved yet)"); ui_num(&m, "ellipsis", 1);
                 ui_num(&m, "colour", ui_theme.textDim);
@@ -424,7 +421,7 @@ static void key(const struct ui_event *e) {
     if (ctrl && k < 128) k = tolower(k);
     if (ctrl) {
         if (k == 's') save();
-        else if (k == 'o') open_prompt(B_OPEN);
+        else if (k == 'o') ask_open();
         else if (k == 'n') new_text();
         else if (k == 'a') {
             anc = 0;
@@ -530,44 +527,25 @@ int main(int argc, char **argv) {
             switch (e.type) {
             case UI_EVENT_KEY:
                 if (e.flags & UI_UP) break;
-                if (prompt_open) break; /* the name field has the keyboard; other keys wait for it to close */
                 key(&e);
-                redraw = follow = true;
-                break;
-            case UI_EVENT_FOCUS: /* the prompt lasts while its field has the keyboard (Escape or a click away ends it) */
-                if (prompt_open && e.node == prompt_field && !e.a) {
-                    prompt_open = false;
-                    redraw = true;
-                }
-                break;
-            case UI_EVENT_TEXT: /* the name field */
-                strlcpy(prompt_buf, e.text, sizeof prompt_buf);
-                break;
-            case UI_EVENT_SUBMIT:
-                strlcpy(prompt_buf, e.text, sizeof prompt_buf);
-                prompt_open = false;
-                if (prompt_kind == B_OPEN) load_file(prompt_buf);
-                else if (save_file(prompt_buf) && closing) running = false;
                 redraw = follow = true;
                 break;
             case UI_EVENT_CLICK:
                 if (closing && e.node == ask_node[A_SAVE]) {
-                    if (!path[0]) open_prompt(B_SAVEAS);
-                    else if (save_file(path)) running = false;
+                    if (save()) running = false;
                 } else if (closing && e.node == ask_node[A_DISCARD]) {
                     running = false;
                 } else if (closing && e.node == ask_node[A_CANCEL]) {
                     closing = false;
                 } else if (e.node == btn_node[B_NEW]) new_text();
-                else if (e.node == btn_node[B_OPEN]) open_prompt(B_OPEN);
+                else if (e.node == btn_node[B_OPEN]) ask_open();
                 else if (e.node == btn_node[B_SAVE]) save();
-                else if (e.node == btn_node[B_SAVEAS]) open_prompt(B_SAVEAS);
+                else if (e.node == btn_node[B_SAVEAS]) ask_save();
                 redraw = true;
                 break;
             case UI_EVENT_POINTER:
                 if (e.flags & UI_DOWN) {
                     if (!(UI_BUTTONS(e.flags) & 1)) break;
-                    prompt_open = false;
                     cur = hit_pos((float)e.a, (float)e.b);
                     anc = (long)cur;
                     want_x = -1;
@@ -610,8 +588,7 @@ int main(int argc, char **argv) {
         char now[2400];
         char right[96];
         right_status(right, sizeof right);
-        snprintf(now, sizeof now, "%d|%d|%d|%d|%d|%d|%s|%s|%s|%s", win_w, win_h, closing, prompt_open, prompt_kind,
-                 prompt_focus, prompt_buf, path, status, right);
+        snprintf(now, sizeof now, "%d|%d|%d|%s|%s|%s", win_w, win_h, closing, path, status, right);
         if (strcmp(now, shown)) {
             strlcpy(shown, now, sizeof shown);
             show();

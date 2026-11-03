@@ -16,6 +16,7 @@ struct process {
     int pid;                  /* its main thread's tid once it started (process_find finds it then) */
     char name[32];
     struct n_identity identity; /* 起動の前に決まり、変わらない（sys/authority.h）。錠なしで読む。 */
+    uint64_t entry_base;      /* its entry image's address (sys/entry.c); set before it runs */
     struct thread *main;      /* its first thread: its end ends the process (process_end) */
     struct thread *threads;   /* its other threads whose records are kept (sys/thread.c; thread_lock) */
     uint64_t retired_ns;      /* the CPU time of its other threads whose records are gone (thread_lock) */

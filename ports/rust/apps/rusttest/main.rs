@@ -145,10 +145,7 @@ fn main() {
     parked.thread().unpark();
     c.check("park/unpark", parked.join().unwrap() == 42);
 
-    // Environment: the launch settings, set_var, remove_var.
-    for name in ["FOLDER"] {
-        println!("{name}={:?}", std::env::var_os(name));
-    }
+    // Environment: the launcher's list, set_var, remove_var.
     println!("vars: {}", std::env::vars().count());
     unsafe { std::env::set_var("RUSTTEST_VAR", "value 1") };
     c.check("env set_var", std::env::var("RUSTTEST_VAR").as_deref() == Ok("value 1"));
@@ -194,7 +191,6 @@ fn main() {
             && std::env::current_dir().ok() == Some(dir.clone())
             && std::fs::metadata("sub").is_ok_and(|m| m.is_dir()),
     );
-    c.check("FOLDER follows set_current_dir", std::env::var_os("FOLDER").as_deref() == Some(dir.as_os_str()));
     let _ = std::env::set_current_dir(&cwd);
     let file = dir.join("hello.txt");
     c.check("fs::write", std::fs::write(&file, b"hello nocturne\nsecond line\n").is_ok());

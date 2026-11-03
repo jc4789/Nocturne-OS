@@ -17,13 +17,7 @@
 #ifdef GALLIUM_ZINK
 #include "frontend/winsys_handle.h"
 #include "zink/zink_public.h"
-#include "nvrm.h"
-#include "nvstatus.h"
-
-/* Zink opens "vulkan" through util/u_dl.c, which only refers weakly to the Vulkan driver's entry
- * point; this reference is what links the driver (NVK) into a program that draws with OpenGL. */
-extern void *vk_icdGetInstanceProcAddr(void *instance, const char *name);
-__attribute__((used)) static void *(*const vulkan_driver)(void *, const char *) = vk_icdGetInstanceProcAddr;
+#include "nocturne_gpu.h"
 #endif
 #include "state_tracker/st_context.h"
 #include "util/format/u_format.h"
@@ -33,49 +27,10 @@ __attribute__((used)) static void *(*const vulkan_driver)(void *, const char *) 
 #include "util/u_memory.h"
 #include "util/simple_mtx.h"
 
-#include "util/os_file.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
-
-/* ---- the Mesa util/os_file.c services the GL state tracker and driconf use ---- */
-
-/* A whole file in a buffer the caller frees, followed by a NUL (driconf reads the program file
-   with it to hash it). */
-char *os_read_file(const char *filename, size_t *size) {
-    void *data = NULL;
-    size_t length = 0;
-    if (n_document_load(filename, &data, &length) < 0) return NULL;
-    char *copy = length < SIZE_MAX ? malloc(length + 1) : NULL;
-    if (copy) {
-        if (length) memcpy(copy, data, length);
-        copy[length] = 0;
-        if (size) *size = length;
-    }
-    if (data) n_memory_release(data, length);
-    return copy;
-}
-
-/* A new folder, 0, or -1 when it cannot be made (it may already be there); Nocturne has no use for
-   the permissions in mode. llvmpipe's GALLIVM_DEBUG=symbols writes each shader's NIR into one. */
-int os_mkdir(const char *pathname, int mode) {
-    (void)mode;
-    return n_folder_create(pathname) < 0 ? -1 : 0;
-}
-
-/* Shader capture (MESA_SHADER_CAPTURE_PATH) writes each program to a new
-   file and never replaces an existing one. Plain C stdio: a name that
-   already opens is taken. */
-FILE *os_file_create_unique(const char *filename, int filemode) {
-    (void)filemode;
-    FILE *existing = fopen(filename, "rb");
-    if (existing) {
-        fclose(existing);
-        return NULL;
-    }
-    return fopen(filename, "w");
-}
 
 /* ---- memory winsys: display targets are plain heap allocations ---- */
 
@@ -167,6 +122,19 @@ static struct pipe_screen *cpu_screen(void) {
     return softpipe_create_screen(&mem_winsys);
 }
 
+#ifdef GALLIUM_ZINK
+/* What this program's Mesa held, with what the driver's image held after it: this program's memory. */
+static char *held_lines(char *lines, const struct n_gpu_driver *driver) {
+    char *theirs = driver->log_release();
+    if (!theirs) return lines;
+    size_t ours = lines ? strlen(lines) : 0;
+    char *all = realloc(lines, ours + strlen(theirs) + 1);
+    if (all) strcpy(all + ours, theirs);
+    driver->log_free(theirs);
+    return all ? all : lines;
+}
+#endif
+
 static struct pipe_frontend_screen *get_screen(void) {
     simple_mtx_lock(&screen_lock);
 #ifdef GALLIUM_ZINK
@@ -176,20 +144,22 @@ static struct pipe_frontend_screen *get_screen(void) {
          * the helper also searches past unready GPUs. Vulkan revalidates its
          * own snapshot, and failure here keeps existing CPU contexts alive. */
         /* Why, an n_result or ZINK_FAILED, goes to Mesa's log (the system log) when it is not
-           the one told before, not at every context; where nvrm serves no NVIDIA GPU, the CPU
-           draws without a word. What Zink and the Vulkan driver say while the screen starts is
-           held (mesa_log_hold) and written before it, likewise only when it changed. */
+           the one told before, not at every context; where no driver has a GPU, the CPU draws
+           without a word. What Zink and the Vulkan driver say while the screen starts is held
+           (mesa_log_hold, in this program and in the driver's image) and written before it,
+           likewise only when it changed. */
         enum { ZINK_FAILED = 1 };
         static int64_t told = -N_ERR_NOT_FOUND;
         static char *told_lines;
-        struct nvrm *ready;
-        int64_t why = nvrm_connect_ready_status(&ready);
+        const struct n_gpu_driver *driver;
+        int64_t why = n_gpu_driver_get(&driver);
+        if (why >= 0) why = driver->ready();
         char *lines = NULL;
-        if (ready) {
-            nvrm_disconnect(ready);
+        if (why >= 0) {
+            driver->log_hold();
             mesa_log_hold();
             gpu_fscreen = frontend_screen(zink_create_screen(&mem_winsys, NULL));
-            lines = mesa_log_release();
+            lines = held_lines(mesa_log_release(), driver);
             why = gpu_fscreen ? 0 : ZINK_FAILED;
         }
         if (why != told || !lines != !told_lines || (lines && strcmp(lines, told_lines))) {
@@ -197,12 +167,12 @@ static struct pipe_frontend_screen *get_screen(void) {
             if (!why)
                 mesa_logi("Nocturne GL: drawing on the GPU with %s", gpu_fscreen->screen->get_name(gpu_fscreen->screen));
             else if (why == ZINK_FAILED)
-                mesa_logw("Nocturne GL: nvrm's GPU is ready, but Zink did not start on it (%s): drawing on the CPU",
+                mesa_logw("Nocturne GL: the GPU is ready, but Zink did not start on it (%s): drawing on the CPU",
                           lines ? "why is in the lines before" : "it gave no reason");
             else if (why == -N_ERR_NOT_FOUND)
-                mesa_logw("Nocturne GL: nvrm serves no NVIDIA GPU any more: drawing on the CPU");
+                mesa_logw("Nocturne GL: no driver serves a GPU any more: drawing on the CPU");
             else
-                mesa_logw("Nocturne GL: nvrm's GPU cannot be used (%s): drawing on the CPU", n_result_text(why));
+                mesa_logw("Nocturne GL: the GPU cannot be used (%s): drawing on the CPU", n_result_text(why));
             told = why;
             free(told_lines);
             told_lines = lines;
@@ -498,12 +468,13 @@ uint64_t ngl_dirty_serial(const struct ngl_context *c) { return c->dirty; }
 /* ---- direct scanout ---- */
 
 #ifdef GALLIUM_ZINK
-/* Three images in turn: once nvrm_scanout_present returns, the image presented
+/* Three images in turn: once scanout_present returns, the image presented
    two before is no longer read by the display and can be drawn again. */
 #define SCANOUT_IMAGES 3
 
 struct ngl_scanout {
-    struct nvrm *rm; /* the images live as long as this connection */
+    const struct n_gpu_driver *driver;
+    struct n_gpu_scanout *rm; /* the images live as long as this connection */
     struct pipe_screen *screen;
     unsigned width, height, pitch;
     unsigned next;
@@ -522,9 +493,9 @@ void ngl_scanout_destroy(struct ngl_scanout *s) {
     pipe_resource_reference(&s->scaled, NULL);
     for (unsigned i = 0; i < SCANOUT_IMAGES; i++) {
         pipe_resource_reference(&s->images[i].buffer, NULL);
-        if (s->images[i].image) nvrm_scanout_destroy(s->rm, s->images[i].image);
+        if (s->images[i].image) s->driver->scanout_destroy(s->rm, s->images[i].image);
     }
-    nvrm_disconnect(s->rm);
+    s->driver->scanout_close(s->rm);
     FREE(s);
 }
 
@@ -532,17 +503,20 @@ struct ngl_scanout *ngl_scanout_create(struct ngl_context *c) {
     if (!c || !c->on_gpu) return NULL;
     struct pipe_screen *screen = c->base.fscreen->screen;
     if (!screen->resource_from_handle) return NULL;
+    const struct n_gpu_driver *driver;
+    if (n_gpu_driver_get(&driver) < 0) return NULL;
     struct ngl_scanout *s = CALLOC_STRUCT(ngl_scanout);
     if (!s) return NULL;
+    s->driver = driver;
     s->screen = screen;
-    if (!(s->rm = nvrm_connect_ready())) {
+    if (!(s->rm = driver->scanout_open())) {
         FREE(s);
         return NULL;
     }
     for (unsigned i = 0; i < SCANOUT_IMAGES; i++) {
         uint32_t image = 0, width = 0, height = 0, pitch = 0;
         uint64_t bytes = 0;
-        if (nvrm_scanout_create(s->rm, &image, &width, &height, &pitch, &bytes) != 0 || !image) goto fail;
+        if (driver->scanout_create(s->rm, &image, &width, &height, &pitch, &bytes) < 0 || !image) goto fail;
         s->images[i].image = image;
         if (i == 0) {
             s->width = width;
@@ -649,8 +623,8 @@ int ngl_scanout_present(struct ngl_scanout *s, struct ngl_context *c, int x, int
     s->images[index].y = y;
     s->images[index].width = width;
     s->images[index].height = height;
-    uint32_t status = nvrm_scanout_present(s->rm, s->images[index].image);
-    if (status != NV_OK) return status == NV_ERR_INVALID_STATE ? 0 : -1;
+    int64_t shown = s->driver->scanout_present(s->rm, s->images[index].image);
+    if (shown <= 0) return shown == 0 ? 0 : -1;
     s->next = (index + 1) % SCANOUT_IMAGES;
     return 1;
 }

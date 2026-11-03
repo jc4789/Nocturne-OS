@@ -112,12 +112,21 @@ static uint64_t region_take_locked(struct span_tree *holes, uint64_t *next, uint
 uint64_t space_take_locked(struct process *owner, bool low, uint64_t len, struct mmap_hole **gone) {
     if (owner->space_ended) return 0;
     return low ? region_take_locked(&owner->low_holes, &owner->low_next, USER_LOW_TOP, len, gone)
-               : region_take_locked(&owner->mmap_holes, &owner->mmap_next, USER_STACK_TOP - USER_STACK_MAX, len, gone);
+               : region_take_locked(&owner->mmap_holes, &owner->mmap_next, USER_MMAP_TOP, len, gone);
 }
 uint64_t mmap_reserve(struct process *owner, uint64_t len) {
     struct mmap_hole *gone = NULL;
     uint64_t lock = spin_lock(&owner->space.lock);
     uint64_t va = space_take_locked(owner, false, len, &gone);
+    spin_unlock(&owner->space.lock, lock);
+    holes_free(gone);
+    return va;
+}
+uint64_t mmap_reserve_changing(struct process *owner, uint64_t len, struct space_op *op) {
+    struct mmap_hole *gone = NULL;
+    uint64_t lock = spin_lock(&owner->space.lock);
+    uint64_t va = space_take_locked(owner, false, len, &gone);
+    if (va) space_op_add(owner, op, va, va + len + PAGE_SIZE);
     spin_unlock(&owner->space.lock, lock);
     holes_free(gone);
     return va;
@@ -154,9 +163,7 @@ void space_op_remove(struct process *owner, struct space_op *op) {
     while (*link != op) link = &(*link)->next;
     *link = op->next;
 }
-/* No lock held: the operation is done, [va, va+len) going back to its region with it (len 0:
-   nothing), and the threads waiting for its range look again. */
-static void space_op_finish(struct process *owner, struct space_op *op, uint64_t va, uint64_t len) {
+void space_op_finish(struct process *owner, struct space_op *op, uint64_t va, uint64_t len) {
     struct mmap_hole *spare = len ? hole_spare() : NULL, *gone = NULL;
     uint64_t lock = spin_lock(&owner->space.lock);
     hole_add_locked(owner, va, len, &spare, &gone);
@@ -171,7 +178,7 @@ static void space_op_finish(struct process *owner, struct space_op *op, uint64_t
 static bool space_free_overlap(const struct process *owner, uint64_t va, uint64_t end) {
     for (int low = 0; low < 2; low++) {
         if (low && !owner->low_base) continue;
-        uint64_t top = low ? USER_LOW_TOP : USER_STACK_TOP - USER_STACK_MAX;
+        uint64_t top = low ? USER_LOW_TOP : USER_MMAP_TOP;
         uint64_t next = low ? owner->low_next : owner->mmap_next;
         if (MAX(va, next) < MIN(end, top)) return true;
         const struct span_tree *holes = low ? &owner->low_holes : &owner->mmap_holes;
@@ -240,7 +247,7 @@ int64_t memory_reserve(size_t len, int access) {
 int64_t memory_release(uint64_t va, size_t len) {
     struct process *t = process_current();
     bool low = va < USER_MMAP_BASE;
-    uint64_t base = low ? t->low_base : USER_MMAP_BASE, top = low ? USER_LOW_TOP : USER_STACK_TOP - USER_STACK_MAX;
+    uint64_t base = low ? t->low_base : USER_MMAP_BASE, top = low ? USER_LOW_TOP : USER_MMAP_TOP;
     if (len > SIZE_MAX - (PAGE_SIZE - 1)) return -N_ERR_INVALID;
     uint64_t end = va + ALIGN_UP(len, PAGE_SIZE);
     if (va & (PAGE_SIZE - 1) || va < base || end > top || end < va) return -N_ERR_INVALID;

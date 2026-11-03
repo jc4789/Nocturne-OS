@@ -7,6 +7,7 @@
 #include "arch/spin.h"
 #include "lib/span.h"
 #include "mm/shared.h"
+#include "mm/space.h"
 #include "mm/vmm.h"
 #include "sys/object.h"
 #include "sys/process.h"
@@ -226,11 +227,6 @@ void programs_trim(uint64_t need);
 /* ---- mm/space.c ---- */
 
 struct mmap_hole;
-/* An operation over a range: another change of a range that overlaps it waits until it is done. */
-struct space_op {
-    struct space_op *next;
-    uint64_t va, end;
-};
 /* Space lock held: len bytes and a guard page from the low region or the mmap region; 0 when it
    has no room or the space ended. A hole used up goes to *gone. */
 uint64_t space_take_locked(struct process *owner, bool low, uint64_t len, struct mmap_hole **gone);

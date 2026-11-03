@@ -165,6 +165,11 @@ static void programs_read(void) {
     if (!same) desktop_changed();
 }
 
+/* Why a program did not start, for a toast. */
+static const char *start_failure(n_result r) {
+    return r == -N_ERR_WRONG_GENERATION ? WORD(S_OTHER_GENERATION) : n_result_text(r);
+}
+
 static void perform(const struct app *a) {
     n_result r = 0;
     switch (a->action) {
@@ -172,7 +177,7 @@ static void perform(const struct app *a) {
         r = n_program_run(a->program, NULL);
         if (r < 0) {
             char text[128];
-            snprintf(text, sizeof text, "%s (%s)", a->name, n_result_text(r));
+            snprintf(text, sizeof text, "%s (%s)", a->name, start_failure(r));
             toast(WORD(S_START_FAILED), text, TOAST_MS);
         }
         return;
@@ -778,7 +783,7 @@ static void bar_event(const struct gui_event *e) {
     case EV_HOTKEY:
         if (e->usage == N_USAGE_T) {
             n_result r = gui_launch(N_FOLDER_SYSTEM "\\term", NULL);
-            if (r < 0) toast(WORD(S_START_FAILED), n_result_text(r), TOAST_MS);
+            if (r < 0) toast(WORD(S_START_FAILED), start_failure(r), TOAST_MS);
         } else if (menu) {
             menu_close();
         } else {

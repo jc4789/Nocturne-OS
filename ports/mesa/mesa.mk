@@ -78,7 +78,7 @@ MESA_PREGEN_SRC := $(addprefix $(MESA_PREGEN)/src/,compiler/glsl/glsl_parser.cpp
     mesa/program/lex.yy.c)
 
 # Nocturne's own frontend: a CPU screen (llvmpipe or softpipe) on a memory winsys and GL contexts.
-MESA_PORT_SRC := ports/mesa/nocturne_gl.c
+MESA_PORT_SRC := ports/mesa/nocturne_gl.c ports/mesa/nocturne_os.c
 
 MESA_SRC := $(MESA_UTIL_SRC) $(MESA_COMPILER_SRC) $(MESA_GL_SRC) $(MESA_GALLIUM_SRC) $(MESA_GEN_SRC) \
     $(MESA_PREGEN_SRC) $(MESA_PORT_SRC) $(LLVMPIPE_SRC)
@@ -109,7 +109,8 @@ MESA_DEFS := -DHAVE_OPENGL=1 -DHAVE_OPENGL_ES_1=0 -DHAVE_OPENGL_ES_2=1 -DHAVE_SO
     -DXXH_FORCE_ALIGN_CHECK=0 -DXXH_FORCE_MEMORY_ACCESS=0 -DYY_NO_UNISTD_H -DMAPI_MODE_SHARED_GLAPI \
     -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0 \
     -DENABLE_ST_OMX_BELLAGIO=0 -DENABLE_ST_OMX_TIZONIA=0 -DHAVE_COMPRESSION=0 -DNOCTURNE
-MESA_COMMON := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+# Position-independent: the same objects go into programs and into the driver image (nvk.mk).
+MESA_COMMON := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector -fPIC -fvisibility=hidden \
     -mno-red-zone -msse2 -O2 -g0 -fno-strict-aliasing -fno-math-errno -fno-trapping-math -fomit-frame-pointer \
     -ffunction-sections -fdata-sections -fno-addrsig -w -MMD -MP $(MESA_DEFS) $(MESA_INC)
 MESA_CFLAGS := $(MESA_COMMON) -std=gnu11 -Iuser/include -Icommon
@@ -126,6 +127,8 @@ endif
 WEBGL_OBJ := $(BUILD)/u/user/libc/web/js_webgl.o
 $(WEBGL_OBJ): UCFLAGS += $(MESA_DEFS) -I$(MESA)/include -I$(MESA)/src -Iports/mesa
 $(WEBGL_OBJ): user/libc/web/js_webgl_constants.inc $(MESA_FLAGS_RECORD)
+# The Vulkan loader of the C library, which the SDK's headers declare.
+$(BUILD)/u/user/libc/vulkan.o: UCFLAGS += -I$(MESA)/include
 user/libc/web/js_webgl_constants.inc: user/libc/web/js_webgl_constants.py $(MESA)/include/GLES2/gl2.h $(MESA)/include/GLES3/gl3.h
 	@$(PY) user/libc/web/js_webgl_constants.py
 	@touch $@

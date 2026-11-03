@@ -17,6 +17,21 @@
 struct n_service_ready_message { uint32_t kind; };
 #define N_SERVICE_READY 1u
 
+/* ---- 文書を選ぶ窓 ---- */
+/* サービスではなく、呼ぶ者が自分の身元で起こすプログラム。窓に見える文書は呼ぶ者に見える文書だけ。
+   呼ぶ者は channel の片端を handle 3 に渡して起こし、要求を一通送る。窓は選ばれた文書の完全なパスを一通返す。
+   返さずに閉じたら取り消し。呼ぶ者が先に閉じたら窓も閉じる。 */
+#define N_DOCUMENT_WINDOW_PROGRAM N_FOLDER_SYSTEM "\\files"
+#define N_DOCUMENT_WINDOW_HANDLE 3
+enum n_document_window_kind {
+    N_DOCUMENT_WINDOW_OPEN = 1, /* あるものを選ぶ */
+    N_DOCUMENT_WINDOW_SAVE,     /* あるものか新しい名前を選ぶ。上書きは窓が確かめる */
+};
+struct n_document_window_request {
+    uint32_t kind;
+    char start[1024]; /* 文書の完全なパス、新しい名前、空（利用者の Documents）のどれか */
+};
+
 /* ---- サービスの管理者の口（N_SERVICE_MANAGER） ---- */
 enum n_services_op {
     N_SERVICES_LIST = 1, /* 全部の実例。応答の後に count 通の n_service_status。 */
@@ -49,6 +64,7 @@ struct n_service_status {
     char name[N_SERVICE_NAME_MAX];
     char argument[N_SERVICE_ARGUMENT_MAX];
     char program[N_SERVICE_PROGRAM_MAX];
+    char client_image[N_SERVICE_PROGRAM_MAX]; /* 使う者が読み込む像、N_DRIVER_FOLDER の中の名前（gpu_abi.h）。無ければ空。 */
     uint32_t cls;      /* enum n_class */
     uint32_t state;    /* enum n_service_state */
     uint32_t restarts; /* 今の健康な期間に起こし直した回数 */

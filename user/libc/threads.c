@@ -61,6 +61,8 @@ static void tss_run_dtors(void) {
     }
 }
 
+/* The end of a thread in this copy of the libc, when another copy made it (sys.c). */
+void __libc_tss_end(void) { tss_run_dtors(); }
 int tss_create(tss_t *key, tss_dtor_t dtor) {
     mtx_lock(&tss_lock);
     size_t i = 0;

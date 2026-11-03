@@ -5,6 +5,7 @@
   3. dev/ から UI を呼ばない：gui/ の include と wm_・desktop_・screen_modes_ の呼出しを拒む。
   4. VM の処理は vm/vm.h の後ろ：kernel/src/vm の外から vm/vm.h 以外の vm/ を include しない。
   5. カーネルの gui/ に利用者への言葉を置かない：kprintf の外の文字列と、シェルの部品の語を拒む。
+  6. プログラムは入口の像の溝からカーネルへ入る：user・tests・ports のコードの SYSCALL 命令を拒む。
 
   python -X utf8 tests/check_boundaries.py
 """
@@ -89,6 +90,29 @@ for path in sorted([*kernel.rglob("*.c"), *kernel.rglob("*.h")]):
         included = VM_INCLUDE.search(line)
         if included and not relative.startswith("vm/") and included.group(2) != "vm.h":
             report(path, number, "vm/ の外の VM", line)
+
+SYSCALL_C = re.compile(r"\b(__asm__|__asm|asm)\b[^;]*?(\bsyscall\b|0x0[fF]\s*,\s*0x05)", re.S)
+SYSCALL_ASM = re.compile(r"^\s*syscall\b", re.M | re.I)
+SYSCALL_PATCH = re.compile(r"^\+\s*(SYSCALL\b|.*\basm!\([^)]*\"syscall\")", re.M)
+
+for folder in ("user", "tests", "ports"):
+    for path in sorted((root / folder).rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix in (".c", ".h", ".cpp", ".cc"):
+            text = code_of(path)
+            found = SYSCALL_C.search(text)
+        elif path.suffix in (".asm", ".s", ".S"):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            found = SYSCALL_ASM.search(text)
+        elif path.suffix == ".patch":
+            text = path.read_text(encoding="utf-8", errors="replace")
+            found = SYSCALL_PATCH.search(text)
+        else:
+            continue
+        if found:
+            number = text.count("\n", 0, found.end()) + 1
+            report(path, number, "入口の外の SYSCALL", text.split("\n")[number - 1])
 
 for line in broken:
     print(line)

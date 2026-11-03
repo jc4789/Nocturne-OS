@@ -172,10 +172,11 @@ void program_put(struct program *p, bool complete) {
     if (replaced) program_free(replaced);
     if (gone) program_free(p);
 }
-/* owner is a process being started (sys/proc.c): no thread of it runs yet. */
-int program_map(struct process *owner, struct program *prog, struct handle *doc, uint64_t offset, uint64_t va,
-                uint64_t filesz, uint64_t memsz, bool exec) {
-    uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + memsz, PAGE_SIZE);
+/* owner is a process being started, or one mapping a driver image in a range it holds under an
+   operation (sys/proc.c): no thread of it touches the range yet. */
+int program_map(struct process *owner, struct program *prog, struct handle *doc, uint64_t offset, uint64_t base,
+                uint64_t va, uint64_t filesz, uint64_t memsz, bool exec) {
+    uint64_t start = base + ALIGN_DOWN(va, PAGE_SIZE), end = base + ALIGN_UP(va + memsz, PAGE_SIZE);
     struct shared_pages *p = NULL;
     struct program_segment *fresh = NULL;
     for (struct program_segment *s = prog->segments; s; s = s->next)
@@ -194,7 +195,7 @@ int program_map(struct process *owner, struct program *prog, struct handle *doc,
         }
         p->source_offset = offset;
         p->source_bytes = filesz;
-        p->source_skip = va - start;
+        p->source_skip = va - ALIGN_DOWN(va, PAGE_SIZE);
     }
     struct shared_mapping *m = kzalloc(sizeof *m);
     if (!m) {

@@ -26,7 +26,7 @@
    (clock_wall_proof; the RTC now, which the clock reads itself). A network time service would be
    one of each.
 
-   All of it lives in the clock's data (struct n_clock, abi.h) in pages of their own: the kernel
+   All of it lives in the clock's data (struct n_clock, clock_data.h) in pages of their own: the kernel
    writes them, under a sequence count; readers retry while it is odd. Every app has them mapped
    read-only (clock_map) and reads its clocks there without a call. */
 #pragma once
@@ -41,8 +41,8 @@
 #define CLOCK_NEVER UINT64_MAX /* a deadline that never comes */
 #define CLOCK_RATE_UNMEASURED UINT32_MAX /* a rate's bound before any reference measured it */
 
-/* The clock's data, as its pages hold it, is the ABI's struct n_clock (abi.h): every app reads
-   it at N_CLOCK_ADDRESS. Its readers here take it as the ABI says, and also while a write is in
+/* The clock's data, as its pages hold it, is struct n_clock (clock_data.h): the entry image's code
+   reads it in every app. Its readers here take it as that header says, and also while a write is in
    progress on their own CPU (sys/clock.c). */
 /* This CPU's TSC, read once every earlier instruction is done (RDTSCP waits for them, SDM Vol.
    2B) and before any later one begins (the LFENCE after it); *cpu (when given): this CPU's index,
@@ -155,10 +155,11 @@ static inline void clock_spin(uint64_t ns) {
    arms on it; a program's clock starts from it); false past the TSC's reach. The answer holds
    until the rate changes (alarm_clock_changed tells the wake devices). */
 bool clock_tsc_at(uint64_t ns, uint64_t *tsc);
-/* The clock's data into an app's space at N_CLOCK_ADDRESS, read-only (proc_launch): 0, or an
-   error. */
+/* The clock's data into an app's space at va, read-only, after the entry image's code that reads
+   it (sys/entry.c): 0, or an error. */
 struct vmm_space;
-int clock_map(struct vmm_space *s);
+size_t clock_data_pages(void);
+int clock_map(struct vmm_space *s, uint64_t va);
 /* S3 and hibernation, on CPU 0 with the others stopped: before sleeping, interrupts off; after
    waking, before anything reads the clock (the TSC may have begun again from 0, the rate
    reference's count may have stopped). The monotonic clock goes on from where it stopped, the

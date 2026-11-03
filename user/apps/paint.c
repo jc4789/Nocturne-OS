@@ -7,6 +7,7 @@
 #include <math.h>
 #include <ctype.h>
 #include "nocturne.h"
+#include "nocturne_services.h"
 #include "ui.h"
 
 #define CWID 824 /* the picture */
@@ -43,10 +44,10 @@ static bool drawing;
 static int sx0, sy0, lx, ly;
 static uint32_t dcol;
 static char status[1100];
-static char save_path[1024]; /* where Save writes: painting.ppm in the user's Pictures folder */
+static char save_path[1024]; /* where Save writes: the picture opened or saved, or what the system's window chooses */
 static int hot_swatch = -1;
 /* places in the view that events name */
-static uint32_t tool_node[NTOOL], size_node, undo_node, clear_node, save_node, canvas_node, palette_node;
+static uint32_t tool_node[NTOOL], size_node, undo_node, clear_node, open_node, save_node, canvas_node, palette_node;
 /* the part of the picture that changed since the surface was updated, and where the shape being dragged lies */
 static int dirty_x0 = CWID, dirty_y0 = CHGT, dirty_x1, dirty_y1;
 static int box[4];
@@ -236,6 +237,18 @@ static void save(const char *path) {
     else snprintf(status, sizeof status, "saved %s", path);
 }
 
+static void save_asked(void) {
+    char path[sizeof save_path];
+    n_result r = save_path[0] ? 0 : n_document_ask_save("painting.ppm", path, sizeof path);
+    if (r == -N_ERR_CANCELLED) return;
+    if (r < 0) {
+        snprintf(status, sizeof status, "cannot ask: %s", n_result_text(r));
+        return;
+    }
+    if (!save_path[0]) strlcpy(save_path, path, sizeof save_path);
+    save(save_path);
+}
+
 static int read_num(const uint8_t *d, size_t n, size_t *i) {
     while (*i < n && (isspace(d[*i]) || d[*i] == '#')) {
         if (d[*i] == '#')
@@ -357,6 +370,7 @@ static void show(struct ui_session *s) {
                 ui_node(&m, "divider"); ui_end(&m);
                 undo_node = ui_node(&m, "button"); ui_str(&m, "text", "Undo"); ui_str(&m, "icon", "chevron-left"); ui_end(&m);
                 clear_node = ui_node(&m, "button"); ui_str(&m, "text", "Clear"); ui_str(&m, "icon", "close"); ui_end(&m);
+                open_node = ui_node(&m, "button"); ui_str(&m, "text", "Open"); ui_str(&m, "icon", "folder"); ui_end(&m);
                 save_node = ui_node(&m, "button"); ui_str(&m, "text", "Save"); ui_str(&m, "variant", "primary");
                 ui_str(&m, "icon", "folder"); ui_end(&m);
             ui_end(&m);
@@ -433,10 +447,11 @@ int main(int argc, char **argv) {
     gfx_init(&img, pix, CWID, CHGT, CWID);
     gfx_init(&snap_c, snap, CWID, CHGT, CWID);
     gfx_fill(&img, 0, 0, CWID, CHGT, bg);
-    n_path_join(n_user_folder(), "Pictures\\painting.ppm", save_path, sizeof save_path);
-    snprintf(status, sizeof status, "Save writes %s", save_path);
     char named[1024];
-    if (argc > 1 && n_path_complete(argv[1], named, sizeof named) > 0) load(named);
+    if (argc > 1 && n_path_complete(argv[1], named, sizeof named) > 0) {
+        load(named);
+        strlcpy(save_path, named, sizeof save_path);
+    }
     push_undo();
     srand((unsigned)(n_clock_monotonic() / N_NS_PER_MS));
     touch(0, 0, CWID, CHGT);
@@ -459,7 +474,17 @@ int main(int argc, char **argv) {
                     if (e.node == tool_node[i]) tool = i, view = true;
                 if (e.node == undo_node) do_undo();
                 else if (e.node == clear_node) do_clear();
-                else if (e.node == save_node) save(save_path), view = true;
+                else if (e.node == save_node) save_asked(), view = true;
+                else if (e.node == open_node) {
+                    char path[sizeof save_path];
+                    if (n_document_ask_open(save_path[0] ? save_path : NULL, path, sizeof path) >= 0) {
+                        load(path);
+                        strlcpy(save_path, path, sizeof save_path);
+                        push_undo();
+                        touch(0, 0, CWID, CHGT);
+                    }
+                    view = true;
+                }
                 break;
             case UI_EVENT_SLIDE:
                 if (e.node == size_node) size = MAX(1, MIN(32, (int)lround(e.a))), view = true;
@@ -485,7 +510,7 @@ int main(int argc, char **argv) {
                 if (e.flags & UI_UP) break;
                 int k = (int)e.a;
                 if ((e.mods & NMOD_CTRL) && (k == 'z' || k == 'Z')) do_undo();
-                else if ((e.mods & NMOD_CTRL) && (k == 's' || k == 'S')) save(save_path), view = true;
+                else if ((e.mods & NMOD_CTRL) && (k == 's' || k == 'S')) save_asked(), view = true;
                 else if (k == '[') size = MAX(1, size - 1), view = true;
                 else if (k == ']') size = MIN(32, size + 1), view = true;
                 else if (k >= '1' && k <= '9' && k - '1' < NTOOL) tool = k - '1', view = true;

@@ -12,20 +12,24 @@
 #undef errno
 int errno;
 struct libc_thread {
-    struct libc_thread *self;
+    struct n_thread_block block; /* first: FS points here (abi.h) */
     int tid, error;
     void *slots[N_TLS_SLOTS];
     void **tss;      /* C11 tss values, grown on demand (threads.c) */
     size_t tss_cap;
     void *malloc_cache; /* this thread's small free blocks (malloc.c) */
+    void *area;         /* where this record and the TLS block were put */
 };
 static unsigned char main_thread_area[sizeof(struct libc_thread) * 2] __attribute__((aligned(64)));
 static unsigned tls_initialized;
+/* Its address tells this copy of the libc from a driver image's in a thread's blocks (abi.h). */
+static const char libc_copy;
+static struct libc_thread *libc_thread_other(struct n_thread_block *first);
 static struct libc_thread *libc_thread_current(void) {
     struct libc_thread *t;
     if (!tls_initialized) return NULL;
     __asm__ volatile("movq %%fs:0, %0" : "=r"(t));
-    return t;
+    return __builtin_expect(t->block.owner == &libc_copy, 1) ? t : libc_thread_other(&t->block);
 }
 int *__errno_location(void) {
     struct libc_thread *t = libc_thread_current();
@@ -33,15 +37,17 @@ int *__errno_location(void) {
 }
 #define errno (*__errno_location())
 
-/* SYSCALL (docs/nocturne-native-abi.md): the number in rax, the arguments in rdi, rsi, rdx, r10
-   and r8, the result in rax; the instruction itself takes rcx and r11. */
+/* The entry image (abi.h): its address, and a call of slot n. */
+static uintptr_t entry_image;
+uintptr_t n_entry_slot(unsigned slot) { return entry_image + (uintptr_t)slot * N_ENTRY_SLOT_BYTES; }
 long __syscall(long n, long a, long b, long c, long d, long e) {
-    long r;
-    register long r10 __asm__("r10") = d;
-    register long r8 __asm__("r8") = e;
-    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8) : "rcx", "r11", "memory");
-    return r;
+    return ((long (*)(long, long, long, long, long))(entry_image + (uintptr_t)n * N_ENTRY_SLOT_BYTES))(a, b, c, d, e);
 }
+
+/* The stamp every program carries (abi.h). */
+__attribute__((section(".note.nocturne"), used, aligned(4))) static const struct n_program_note program_note = {
+    .name_bytes = sizeof N_PROGRAM_NOTE_NAME, .desc_bytes = 2 * sizeof(uint32_t), .type = N_PROGRAM_NOTE_TYPE,
+    .name = N_PROGRAM_NOTE_NAME, .generation = N_ABI_GENERATION, .slots = N_ENTRY_SLOTS};
 
 #define SC0(n) __syscall(n, 0, 0, 0, 0, 0)
 #define SC1(n, a) __syscall(n, (long)(a), 0, 0, 0, 0)
@@ -72,59 +78,12 @@ static const char *script_interp(const char *path, char *buf, size_t n) {
     return N_FOLDER_SYSTEM "\\sh";
 }
 
-/* The clocks (abi.h, docs/nocturne-native-abi.md §8), read in the kernel's data of them, which every
-   app has at N_CLOCK_ADDRESS, without a call. The data's fields in force at one reading of this
-   CPU's TSC (h: the header, when given), and the monotonic clock at it. A reading never goes back
-   on a thread, nor after one it learned of from another thread: the kernel adds to each CPU's TSC
-   what it reads behind the others. */
-static uint64_t clock_read(struct n_clock *h) {
-    const struct n_clock *c = (const struct n_clock *)N_CLOCK_ADDRESS;
-    for (;;) {
-        uint32_t seq = __atomic_load_n(&c->seq, __ATOMIC_ACQUIRE), lo, hi, cpu;
-        if (seq & 1) { /* the kernel is writing it */
-            __asm__ volatile("pause");
-            continue;
-        }
-        /* RDTSCP waits for the load of seq before it; the LFENCE holds the fields' loads after it */
-        __asm__ volatile("rdtscp; lfence" : "=a"(lo), "=d"(hi), "=c"(cpu) : : "memory");
-        uint64_t base_tsc = __atomic_load_n(&c->base_tsc, __ATOMIC_RELAXED);
-        uint64_t base_ns = __atomic_load_n(&c->base_ns, __ATOMIC_RELAXED);
-        uint64_t mult = __atomic_load_n(&c->mult, __ATOMIC_RELAXED);
-        uint32_t shift = __atomic_load_n(&c->shift, __ATOMIC_RELAXED);
-        int64_t offset = cpu < __atomic_load_n(&c->cpus, __ATOMIC_RELAXED) ? __atomic_load_n(&c->offset[cpu], __ATOMIC_RELAXED) : 0;
-        if (h) {
-            h->asleep_ns = __atomic_load_n(&c->asleep_ns, __ATOMIC_RELAXED);
-            h->wall_ns = __atomic_load_n(&c->wall_ns, __ATOMIC_RELAXED);
-            h->wall_from = __atomic_load_n(&c->wall_from, __ATOMIC_RELAXED);
-            h->wall_until = __atomic_load_n(&c->wall_until, __ATOMIC_RELAXED);
-            h->wall_slew = __atomic_load_n(&c->wall_slew, __ATOMIC_RELAXED);
-            h->wall_slew_mult = __atomic_load_n(&c->wall_slew_mult, __ATOMIC_RELAXED);
-        }
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        if (__atomic_load_n(&c->seq, __ATOMIC_RELAXED) != seq) continue;
-        uint64_t t = ((uint64_t)hi << 32 | lo) - (uint64_t)offset;
-        return t <= base_tsc ? base_ns : base_ns + (uint64_t)(((unsigned __int128)(t - base_tsc) * mult) >> shift);
-    }
-}
-uint64_t n_clock_monotonic(void) { return clock_read(NULL); }
-uint64_t n_clock_boot(void) {
-    struct n_clock h;
-    uint64_t t = clock_read(&h);
-    return t + h.asleep_ns;
-}
-int64_t n_clock_wall(void) {
-    struct n_clock h;
-    uint64_t t = clock_read(&h);
-    int64_t wall = h.wall_ns + (int64_t)(t > h.wall_from ? t - h.wall_from : 0);
-    if (h.wall_slew) {
-        uint64_t until = t < h.wall_until ? t : h.wall_until, ran = until > h.wall_from ? until - h.wall_from : 0;
-        uint64_t whole = h.wall_slew < 0 ? -(uint64_t)h.wall_slew : (uint64_t)h.wall_slew;
-        uint64_t done = (uint64_t)(((unsigned __int128)ran * h.wall_slew_mult) >> 32);
-        if (done > whole) done = whole;
-        wall += h.wall_slew < 0 ? -(int64_t)done : (int64_t)done;
-    }
-    return wall;
-}
+/* The clocks (docs/nocturne-native-abi.md §8), read by the entry image's code without entering the kernel. */
+#define ENTRY_CLOCK(type, slot) ((type (*)(void))(entry_image + (uintptr_t)(slot) * N_ENTRY_SLOT_BYTES))()
+uint64_t n_clock_monotonic(void) { return ENTRY_CLOCK(uint64_t, N_ENTRY_CLOCK_MONOTONIC); }
+uint64_t n_clock_boot(void) { return ENTRY_CLOCK(uint64_t, N_ENTRY_CLOCK_BOOT); }
+int64_t n_clock_wall(void) { return ENTRY_CLOCK(int64_t, N_ENTRY_CLOCK_WALL); }
+uint64_t n_clock_tsc_hz(void) { return ENTRY_CLOCK(uint64_t, N_ENTRY_CLOCK_TSC_HZ); }
 uint64_t n_clock_after(uint64_t ns) {
     uint64_t now = n_clock_monotonic();
     return ns >= N_CLOCK_NEVER - now ? N_CLOCK_NEVER : now + ns;
@@ -134,34 +93,80 @@ uint64_t n_app_cpu_ns(void) { return (uint64_t)SC0(SYS_APP_CPU_TIME); }
 
 /* ELF TLS (x86-64 variant II): the linked image ends at the FS control
    block. The linker defines these (user/user.ld, or TinyCC's
-   set_tls_layout()); a program without TLS leaves them 0. */
+   set_tls_layout()); a program without TLS leaves them 0. __libc_init reads
+   them; a driver image has no such symbols, and its start reads its PT_TLS. */
 extern char __tls_image[] __attribute__((weak)), __tls_image_end[] __attribute__((weak));
 extern char __tls_memsz[] __attribute__((weak)), __tls_align[] __attribute__((weak));
+static const char *tls_image, *tls_image_end;
+static size_t tls_memsz, tls_align;
 /* The thread pointer's alignment: the block's and the control block's. */
 static size_t libc_tls_align(void) {
-    size_t align = (size_t)__tls_align;
-    return align < _Alignof(struct libc_thread) ? _Alignof(struct libc_thread) : align;
+    return tls_align < _Alignof(struct libc_thread) ? _Alignof(struct libc_thread) : tls_align;
 }
 /* The block as the linker addresses it back from the thread pointer: its
    size rounded to its own alignment, not the control block's. */
 static size_t libc_tls_size(void) {
-    size_t align = __tls_align ? (size_t)__tls_align : 1;
-    return ((size_t)__tls_memsz + align - 1) & ~(align - 1);
+    size_t align = tls_align ? tls_align : 1;
+    return (tls_memsz + align - 1) & ~(align - 1);
 }
 /* Bytes a thread needs for its TLS block plus control block. */
 static size_t libc_thread_area(void) { return libc_tls_size() + libc_tls_align() + sizeof(struct libc_thread); }
-static struct libc_thread *libc_thread_init(void *area) {
-    size_t align = libc_tls_align(), size = libc_tls_size(), image = (size_t)(__tls_image_end - __tls_image);
+/* This copy's TLS block and record for the calling thread, in area. */
+static struct libc_thread *libc_thread_block(void *area) {
+    size_t align = libc_tls_align(), size = libc_tls_size(), image = (size_t)(tls_image_end - tls_image);
     uintptr_t tp = ((uintptr_t)area + size + align - 1) & ~(uintptr_t)(align - 1);
     unsigned char *block = (unsigned char *)tp - size;
-    if (image) memcpy(block, __tls_image, image);
+    if (image) memcpy(block, tls_image, image);
     memset(block + image, 0, size - image);
     struct libc_thread *t = (struct libc_thread *)tp;
     memset(t, 0, sizeof *t);
-    t->self = t;
+    t->block.self = &t->block;
+    t->block.entry = entry_image;
+    t->block.owner = &libc_copy;
+    t->area = area;
     t->tid = (int)SC0(SYS_THREAD_ID);
+    return t;
+}
+static struct libc_thread *libc_thread_init(void *area) {
+    struct libc_thread *t = libc_thread_block(area);
     __asm__ volatile("wrfsbase %0" : : "r"(t) : "memory"); /* the thread's own FS base */
     return t;
+}
+void __malloc_thread_exit(void);
+void __libc_tss_end(void) __attribute__((weak)); /* threads.c, if the program has it */
+/* The end of a thread another copy of the libc made, as far as this copy knows it. */
+static void libc_thread_leave(struct n_thread_block *block) {
+    struct libc_thread *t = (struct libc_thread *)block;
+    if (__libc_tss_end) __libc_tss_end();
+    free(t->tss);
+    __malloc_thread_exit();
+    struct n_thread_block *first;
+    __asm__ volatile("movq %%fs:0, %0" : "=r"(first));
+    struct n_thread_block **link = &first->others;
+    while (*link != block) link = &(*link)->others;
+    *link = block->others;
+    SC2(SYS_MEMORY_RELEASE, t->area, libc_thread_area());
+}
+/* This copy's record of a thread another copy made, the first time this copy runs on it: its own
+   memory, since no copy can size or free another's. NULL without memory, as before __libc_init. */
+static struct libc_thread *libc_thread_other(struct n_thread_block *first) {
+    for (struct n_thread_block *b = first->others; b; b = b->others)
+        if (b->owner == &libc_copy) return (struct libc_thread *)b;
+    long r = SC2(SYS_MEMORY_RESERVE, libc_thread_area(), N_MEMORY_READ_WRITE);
+    if (r < 0 && r > -4096) return NULL;
+    struct libc_thread *t = libc_thread_block((void *)r);
+    t->block.leave = libc_thread_leave;
+    t->block.others = first->others;
+    first->others = &t->block;
+    return t;
+}
+/* Position-independent code's way to its thread-local block, which a driver image keeps; in a program
+   the linker turned it into an offset from FS. A copy of the libc has one block: the module's
+   number says nothing. */
+void *__tls_get_addr(const size_t *module_and_offset) {
+    struct libc_thread *t = libc_thread_current();
+    if (!t) _Exit(127);
+    return (char *)t - libc_tls_size() + module_and_offset[1];
 }
 static _Noreturn void libc_thread_entry(void (*fn)(void *), void *arg) {
     unsigned char area[libc_thread_area()] __attribute__((aligned(16)));
@@ -180,8 +185,16 @@ n_result thread_create_sized(void (*fn)(void *), void *arg, size_t stack_bytes) 
 n_result thread_create(void (*fn)(void *), void *arg) { return thread_create_sized(fn, arg, 0); }
 n_result thread_join(int tid) { return SC1(SYS_THREAD_JOIN, tid); }
 n_result thread_detach(int tid) { return SC1(SYS_THREAD_DETACH, tid); }
-void __malloc_thread_exit(void);
-_Noreturn void thread_exit(void) { __malloc_thread_exit(); SC0(SYS_THREAD_EXIT); for (;;) {} }
+_Noreturn void thread_exit(void) {
+    if (tls_initialized) {
+        struct n_thread_block *first;
+        __asm__ volatile("movq %%fs:0, %0" : "=r"(first));
+        while (first->others) first->others->leave(first->others);
+    }
+    __malloc_thread_exit();
+    SC0(SYS_THREAD_EXIT);
+    for (;;) {}
+}
 /* The allocator's per-thread slot; NULL before this thread has TLS. */
 void **__libc_malloc_cache(void) {
     struct libc_thread *t = libc_thread_current();
@@ -932,7 +945,28 @@ _Noreturn void abort(void) {
     exit(134);
 }
 
+/* A driver image's libc in a process that runs (driver_image.c): its first thread goes on with the block
+   of the libc that made it, and FS stays. */
+void __libc_image_init(const struct n_start *start, const char *image, const char *image_end, size_t memsz, size_t align) {
+    __asm__ volatile("movq %%fs:%c1, %0" : "=r"(entry_image) : "i"(__builtin_offsetof(struct n_thread_block, entry)));
+    start_info = start;
+    if (start->environment) __libc_environment = start->environment;
+    tls_image = image;
+    tls_image_end = image_end;
+    tls_memsz = memsz;
+    tls_align = align;
+    tls_initialized = 1;
+    __stdio_init();
+}
+const struct n_start *__libc_start_info(void) { return start_info; }
+
 void __libc_init(void) {
+    /* `tcc -run` links a libc of its own into tcc's process and starts here: tcc's block has the image. */
+    if (!entry_image) __asm__ volatile("movq %%fs:%c1, %0" : "=r"(entry_image) : "i"(__builtin_offsetof(struct n_thread_block, entry)));
+    tls_image = __tls_image;
+    tls_image_end = __tls_image_end;
+    tls_memsz = (size_t)__tls_memsz;
+    tls_align = (size_t)__tls_align;
     void *area = main_thread_area;
     if (libc_thread_area() > sizeof main_thread_area) {
         long r = __syscall(SYS_MEMORY_RESERVE, (long)libc_thread_area(), N_MEMORY_READ_WRITE, 0, 0, 0);
@@ -945,6 +979,7 @@ void __libc_init(void) {
 }
 void __libc_start(int argc, char **argv, const struct n_start *start) {
     if (start) {
+        entry_image = start->entry;
         start_info = start;
         if (start->environment) __libc_environment = start->environment;
     }
@@ -973,6 +1008,7 @@ void __libc_fini_array(void) {
 }
 
 /* ---- native memory: zero-filled pages, never writable and executable at once ---- */
+n_result n_image_map(n_handle document, struct n_image *out) { return SC2(SYS_IMAGE_MAP, document, out); }
 n_result n_memory_reserve(size_t bytes, int access, void **memory) {
     long r = SC2(SYS_MEMORY_RESERVE, bytes, access);
     *memory = r < 0 ? NULL : (void *)r;

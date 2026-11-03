@@ -41,40 +41,12 @@
 #include "u_string.h"
 
 #if DETECT_OS_NOCTURNE
-#include <stdint.h>
 #include <string.h>
 
-/* Nocturne programs are linked whole: there are no libraries to load. The one library a Mesa
- * driver opens there is "vulkan" (Zink's VK_LIBNAME), which stands for the Vulkan driver linked
- * into the same program and answers like a Vulkan loader, through the driver's ICD entry point.
- * Both entry points are weak, so a program without a Vulkan driver opens nothing. */
-extern util_dl_proc vk_icdGetInstanceProcAddr(void *instance, const char *name) __attribute__((weak));
-extern util_dl_proc vk_common_GetDeviceProcAddr(void *device, const char *name) __attribute__((weak));
+/* Nocturne has no libraries to open. The one a Mesa driver opens there is "vulkan" (Zink's
+ * VK_LIBNAME), which stands for the Vulkan loader of the C library (user/libc/vulkan.c). */
+extern util_dl_proc vkGetInstanceProcAddr(void *instance, const char *name);
 static const char nocturne_vulkan[] = "vulkan";
-
-/* Layers are the loader's, not a driver's: an ICD has no vkEnumerateInstanceLayerProperties
- * (NVK's entry point is weak and absent). Nocturne loads no layers, so the loader's answer is
- * none, VK_SUCCESS. */
-static int32_t
-nocturne_vulkan_enumerate_instance_layers(uint32_t *count, void *properties)
-{
-   (void)properties;
-   *count = 0;
-   return 0;
-}
-
-/* vkGetInstanceProcAddr as the loader answers it: its own commands first, then the driver's */
-static util_dl_proc
-nocturne_vulkan_get_instance_proc_addr(void *instance, const char *name)
-{
-   if (!name)
-      return NULL;
-   if (!strcmp(name, "vkGetInstanceProcAddr"))
-      return (util_dl_proc)nocturne_vulkan_get_instance_proc_addr;
-   if (!instance && !strcmp(name, "vkEnumerateInstanceLayerProperties"))
-      return (util_dl_proc)nocturne_vulkan_enumerate_instance_layers;
-   return vk_icdGetInstanceProcAddr(instance, name);
-}
 #endif
 
 
@@ -86,8 +58,7 @@ util_dl_open(const char *filename)
 #elif DETECT_OS_WINDOWS
    return (struct util_dl_library *)LoadLibraryA(filename);
 #elif DETECT_OS_NOCTURNE
-   if (filename && !strcmp(filename, nocturne_vulkan) && vk_icdGetInstanceProcAddr &&
-       vk_common_GetDeviceProcAddr)
+   if (filename && !strcmp(filename, nocturne_vulkan))
       return (struct util_dl_library *)nocturne_vulkan;
    return NULL;
 #else
@@ -107,11 +78,7 @@ util_dl_get_proc_address(struct util_dl_library *library,
 #elif DETECT_OS_NOCTURNE
    if ((const char *)library != nocturne_vulkan)
       return NULL;
-   if (!strcmp(procname, "vkGetDeviceProcAddr"))
-      return (util_dl_proc)vk_common_GetDeviceProcAddr;
-   /* vkGetInstanceProcAddr and the global commands a loader exports (vkCreateInstance,
-    * vkEnumerate...) */
-   return nocturne_vulkan_get_instance_proc_addr(NULL, procname);
+   return vkGetInstanceProcAddr(NULL, procname);
 #else
    return (util_dl_proc)NULL;
 #endif

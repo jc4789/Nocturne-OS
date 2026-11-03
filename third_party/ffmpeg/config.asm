@@ -275,7 +275,7 @@
 %define HAVE_CBRTF 1
 %define HAVE_COPYSIGN 1
 %define HAVE_COSF 1
-%define HAVE_ERF 0
+%define HAVE_ERF 1
 %define HAVE_EXP2 1
 %define HAVE_EXP2F 1
 %define HAVE_EXPF 1

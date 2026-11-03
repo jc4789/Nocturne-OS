@@ -14,8 +14,8 @@ nvk = (root / "ports/mesa/nvk.mk").read_text(encoding="utf-8").replace("\\\n", "
 def words(text, name):
     return re.search(r"^" + name + r" := (.+)$", text, re.MULTILINE).group(1).split()
 dirs = words(mesa, "MESA_DIRS") + words(nvk, "NVK_DIRS")
-defines = words(mesa, "MESA_DEFS")
-defines = [d.replace('\\"', '"') for d in defines]
+# makeの式の語（llvmpipeの有無）は除く。ホストの試験にllvmpipeは無い
+defines = [d.replace('\\"', '"') for d in words(mesa, "MESA_DEFS") if "$(" not in d] + ["-DDRAW_LLVM_AVAILABLE=0"]
 common = [str(cc), "-std=gnu11", "-O2", "-ffreestanding", "-ffunction-sections", "-fdata-sections",
            "-U_WIN32", "-U_WIN64", *defines,
            *("-Ithird_party/mesa/" + d for d in dirs),
@@ -24,14 +24,13 @@ common = [str(cc), "-std=gnu11", "-O2", "-ffreestanding", "-ffunction-sections",
 for name, prefix, extras in [
     ("nvk_sync", [], ["third_party/mesa/src/util/u_dynarray.c", "third_party/mesa/src/util/ralloc.c"]),
     ("nvk_ctx", [], ["third_party/mesa/src/util/u_dynarray.c", "third_party/mesa/src/util/ralloc.c"]),
-    ("mesa_screen", [], ["-DGALLIUM_ZINK", "-Iports/mesa", "-Iports/nvidia/include",
-                     "-Ithird_party/nvidia-open/src/common/sdk/nvidia/inc"]),
+    ("mesa_screen", [], ["-DGALLIUM_ZINK", "-Iports/mesa"]),
     ("nvk_rm", ["-Iports/nvidia/include", "-Ithird_party/nvidia-open/src/common/sdk/nvidia/inc",
                 "-Ithird_party/nvidia-open/src/nvidia/arch/nvalloc/unix/include"], []),
     # 製品のソースをそれぞれ一つの翻訳単位として（zink_instance.cはgenerate.pyの生成物、全体ビルドと同じもの）
     ("zink_start", [], ["-DGALLIUM_ZINK", "-DMESA_VK_LOG=0", "-Ithird_party/mesa/src/gallium/drivers/zink",
                          "-Ibuild/mesa/gen/src/gallium/drivers/zink", "-Ithird_party/mesa/src/vulkan/util",
-                         "-Ibuild/mesa/gen/src/vulkan/util", "third_party/mesa/src/util/u_dl.c",
+                         "-Ibuild/mesa/gen/src/vulkan/util", "third_party/mesa/src/util/u_dl.c", "user/libc/vulkan.c",
                          "third_party/mesa/src/util/log.c", "third_party/mesa/src/vulkan/runtime/vk_log.c",
                          "build/mesa/gen/src/gallium/drivers/zink/zink_instance.c",
                          "build/mesa/gen/src/vulkan/util/vk_enum_to_str.c", "third_party/mesa/src/util/ralloc.c"]),

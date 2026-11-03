@@ -3,11 +3,13 @@
 #include "arch/cpu.h"
 #include "arch/gdt.h"
 #include "sys/clock.h"
+#include "sys/entry.h"
 #include "sys/proc.h"
 #include "sys/authority.h"
 #include "sys/channel.h"
 #include "sys/process.h"
 #include "mm/shared.h"
+#include "mm/space.h"
 #include "sys/syscall.h"
 #include "sys/object.h"
 #include "sys/stream.h"
@@ -32,6 +34,7 @@ struct elf64_phdr {
 } PACKED;
 
 #define PT_LOAD 1
+#define PT_NOTE 4
 #define PF_X    1
 #define PF_W    2
 
@@ -166,6 +169,115 @@ static int read_exactly(struct handle *doc, uint64_t offset, void *buf, size_t n
     return got < 0 ? (int)got : (size_t)got != n ? -N_ERR_NOT_PROGRAM : 0;
 }
 
+/* The program's stamp (abi.h): a PT_NOTE with the generation it was built for and the slots it
+   knows. 0, or N_ERR_WRONG_GENERATION for a program without one or for another generation. */
+static int program_note_check(struct handle *doc, const struct elf64_phdr *ph, unsigned count, uint64_t size) {
+    for (unsigned i = 0; i < count; i++) {
+        if (ph[i].type != PT_NOTE || ph[i].offset > size || ph[i].filesz > size - ph[i].offset) continue;
+        for (uint64_t at = ph[i].offset, end = at + ph[i].filesz; end - at >= sizeof(struct n_program_note);) {
+            struct n_program_note note;
+            int r = read_exactly(doc, at, &note, sizeof note);
+            if (r < 0) return r;
+            if (note.type == N_PROGRAM_NOTE_TYPE && note.name_bytes == sizeof N_PROGRAM_NOTE_NAME &&
+                note.desc_bytes == 2 * sizeof(uint32_t) && !memcmp(note.name, N_PROGRAM_NOTE_NAME, sizeof N_PROGRAM_NOTE_NAME))
+                return note.generation == N_ABI_GENERATION && note.slots <= N_ENTRY_SLOTS ? 0 : -N_ERR_WRONG_GENERATION;
+            uint64_t name = ALIGN_UP((uint64_t)note.name_bytes, 4), desc = ALIGN_UP((uint64_t)note.desc_bytes, 4);
+            at += 3 * sizeof(uint32_t) + name + desc;
+        }
+    }
+    return -N_ERR_WRONG_GENERATION;
+}
+
+/* The ELF header and the program headers of a document of this ELF type, and its size; the stamp
+   is checked. *ph is the caller's to free, also on failure. */
+static int program_headers(struct handle *doc, uint16_t type, struct elf64_ehdr *eh, struct elf64_phdr **ph, uint64_t *bytes) {
+    *ph = NULL;
+    int64_t size = store_document_size(doc);
+    int r = 0;
+    if (size < 0) r = (int)size;
+    else if ((uint64_t)size < sizeof *eh) r = -N_ERR_NOT_PROGRAM;
+    else r = read_exactly(doc, 0, eh, sizeof *eh);
+    if (r >= 0 && (memcmp(eh->ident, "\x7f" "ELF", 4) || eh->ident[4] != 2 || eh->machine != 0x3E || eh->type != type ||
+                   eh->phentsize != sizeof **ph || eh->phoff > (uint64_t)size ||
+                   (uint64_t)eh->phnum * sizeof **ph > (uint64_t)size - eh->phoff))
+        r = -N_ERR_NOT_PROGRAM;
+    if (r >= 0 && !(*ph = kmalloc(eh->phnum ? eh->phnum * sizeof **ph : 1))) r = -N_ERR_NO_MEMORY;
+    if (r >= 0) r = read_exactly(doc, eh->phoff, *ph, eh->phnum * sizeof **ph);
+    if (r >= 0) r = program_note_check(doc, *ph, eh->phnum, (uint64_t)size);
+    *bytes = (uint64_t)size;
+    return r;
+}
+
+/* Loadable segment i at base + its address. A read-only segment whose pages no other segment
+   touches is shared with every process running the document, its pages read when first touched.
+   Otherwise the file's bytes are copied now; the zero tail (.bss) gets frames on first touch. */
+static int segment_map(struct process *p, struct handle *doc, struct program *program, const struct elf64_phdr *ph,
+                       unsigned count, unsigned i, uint64_t base, int prot, uint8_t *buf) {
+    bool alone = program && !(prot & VM_W);
+    uint64_t first = ALIGN_DOWN(ph[i].vaddr, PAGE_SIZE), last = ALIGN_UP(ph[i].vaddr + ph[i].memsz, PAGE_SIZE);
+    for (unsigned j = 0; alone && j < count; j++)
+        if (j != i && ph[j].type == PT_LOAD && ph[j].memsz &&
+            ALIGN_DOWN(ph[j].vaddr, PAGE_SIZE) < last && ALIGN_UP(ph[j].vaddr + ph[j].memsz, PAGE_SIZE) > first)
+            alone = false;
+    if (alone && program_map(p, program, doc, ph[i].offset, base, ph[i].vaddr, ph[i].filesz, ph[i].memsz, prot & VM_X) == 0)
+        return 0;
+    int r = vmm_user_reserve(p->vmm_space, base + ph[i].vaddr, ph[i].memsz, prot);
+    return r < 0 ? r : load_bytes(p, doc, ph[i].offset, base + ph[i].vaddr, ph[i].filesz, buf);
+}
+
+/* An image's segments come in rising order and share no page, so its range is theirs and the gaps.
+   It goes back from the top: a release may take the page after it as its guard. */
+static void image_release(const struct elf64_phdr *ph, unsigned count, uint64_t base, uint64_t span) {
+    uint64_t end = span;
+    for (unsigned i = count; i-- > 0;) {
+        if (ph[i].type != PT_LOAD || !ph[i].memsz) continue;
+        uint64_t first = ALIGN_DOWN(ph[i].vaddr, PAGE_SIZE), last = ALIGN_UP(ph[i].vaddr + ph[i].memsz, PAGE_SIZE);
+        if (last < end) memory_release(base + last, end - last);
+        memory_release(base + first, last - first);
+        end = first;
+    }
+    if (end) memory_release(base, end);
+}
+
+int proc_image_map(struct handle *doc, struct n_image *out) {
+    struct process *p = process_current();
+    struct elf64_ehdr eh;
+    struct elf64_phdr *ph;
+    uint64_t size, span = 0;
+    uint8_t *buf = NULL;
+    int r = program_headers(doc, 3, &eh, &ph, &size);
+    bool entry_runs = false;
+    for (unsigned i = 0; r >= 0 && i < eh.phnum; i++) {
+        if (ph[i].type != PT_LOAD || !ph[i].memsz) continue;
+        if (ph[i].vaddr < span || ph[i].memsz > USER_MMAP_TOP || ph[i].vaddr > USER_MMAP_TOP - ph[i].memsz ||
+            ph[i].filesz > ph[i].memsz || ph[i].offset > size || ph[i].filesz > size - ph[i].offset ||
+            ((ph[i].flags & PF_W) && (ph[i].flags & PF_X)))
+            r = -N_ERR_NOT_PROGRAM;
+        if ((ph[i].flags & PF_X) && eh.entry >= ph[i].vaddr && eh.entry - ph[i].vaddr < ph[i].memsz) entry_runs = true;
+        span = ALIGN_UP(ph[i].vaddr + ph[i].memsz, PAGE_SIZE);
+    }
+    if (r >= 0 && !entry_runs) r = -N_ERR_NOT_PROGRAM;
+    if (r >= 0 && !(buf = kmalloc(LOAD_CHUNK))) r = -N_ERR_NO_MEMORY;
+    struct space_op op;
+    uint64_t base = r >= 0 ? mmap_reserve_changing(p, span, &op) : 0;
+    if (r >= 0 && !base) r = -N_ERR_NO_MEMORY;
+    if (r >= 0) {
+        struct program *program = program_get(doc);
+        for (unsigned i = 0; r >= 0 && i < eh.phnum; i++) {
+            if (ph[i].type != PT_LOAD || !ph[i].memsz) continue;
+            int prot = (ph[i].flags & PF_W ? VM_W : 0) | (ph[i].flags & PF_X ? VM_X : 0);
+            r = segment_map(p, doc, program, ph, eh.phnum, i, base, prot, buf);
+        }
+        program_put(program, r >= 0);
+        space_op_finish(p, &op, 0, 0);
+        if (r < 0) image_release(ph, eh.phnum, base, span);
+    }
+    if (r >= 0) *out = (struct n_image){.base = base, .entry = base + eh.entry};
+    kfree(buf);
+    kfree(ph);
+    return r;
+}
+
 int proc_launch(const char *path, const struct proc_launch *l) {
     int argc = l->argc;
     char **argv = l->argv;
@@ -174,19 +286,14 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     uint8_t *buf = NULL;
     struct program *program = NULL;
     struct handle *doc;
+    uint64_t size_bytes = 0;
     int r =store_document_open(path, N_DOCUMENT_READ, false, &doc);
     if (r < 0) return r;
     struct elf64_ehdr eh;
-    int64_t size = store_document_size(doc);
-    if (size < 0) r = (int)size;
-    else if ((uint64_t)size < sizeof eh) r = -N_ERR_NOT_PROGRAM;
-    else r = read_exactly(doc, 0, &eh, sizeof eh);
-    if (r >= 0 && (memcmp(eh.ident, "\x7f" "ELF", 4) || eh.ident[4] != 2 || eh.machine != 0x3E || eh.type != 2 ||
-                   eh.phentsize != sizeof *ph || eh.phoff > (uint64_t)size ||
-                   (uint64_t)eh.phnum * sizeof *ph > (uint64_t)size - eh.phoff))
-        r = -N_ERR_NOT_PROGRAM;
-    if (r >= 0 && !(ph = kmalloc(eh.phnum ? eh.phnum * sizeof *ph : 1))) r = -N_ERR_NO_MEMORY;
-    if (r >= 0) r = read_exactly(doc, eh.phoff, ph, eh.phnum * sizeof *ph);
+    r = program_headers(doc, 2, &eh, &ph, &size_bytes);
+    int64_t size = (int64_t)size_bytes;
+    bool all_calls = false;
+    if (r >= 0) r = store_path_is_system(path, &all_calls);
     if (r >= 0 && !(buf = kmalloc(LOAD_CHUNK))) r = -N_ERR_NO_MEMORY;
     if (r < 0) {
         kfree(ph);
@@ -202,7 +309,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     }
     p->identity = l->identity;
     if (!(p->vmm_space = vmm_space_new())) goto fail;
-    if ((r = clock_map(p->vmm_space)) < 0) goto fail; /* the app reads its clocks there (abi.h) */
+    if ((r = entry_map(p, all_calls)) < 0) goto fail; /* the only way it reaches the kernel (abi.h) */
 
     uint64_t top = 0;
     program = program_get(doc);
@@ -218,19 +325,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
             prot |= VM_X;
         }
         if (ph[i].vaddr + ph[i].memsz > top) top = ph[i].vaddr + ph[i].memsz;
-        /* A read-only segment whose pages no other segment touches is shared
-           with every process running the program, its pages read when first touched. */
-        bool alone = program && !(prot & VM_W);
-        uint64_t first = ALIGN_DOWN(ph[i].vaddr, PAGE_SIZE), last = ALIGN_UP(ph[i].vaddr + ph[i].memsz, PAGE_SIZE);
-        for (int j = 0; alone && j < eh.phnum; j++)
-            if (j != i && ph[j].type == PT_LOAD && ph[j].memsz &&
-                ALIGN_DOWN(ph[j].vaddr, PAGE_SIZE) < last && ALIGN_UP(ph[j].vaddr + ph[j].memsz, PAGE_SIZE) > first)
-                alone = false;
-        if (alone && program_map(p, program, doc, ph[i].offset, ph[i].vaddr, ph[i].filesz, ph[i].memsz, prot & VM_X) == 0)
-            continue;
-        /* Otherwise the file's bytes are copied now; the zero tail (.bss) gets frames on first touch. */
-        if (vmm_user_reserve(p->vmm_space, ph[i].vaddr, ph[i].memsz, prot) < 0) goto fail;
-        if ((r = load_bytes(p, doc, ph[i].offset, ph[i].vaddr, ph[i].filesz, buf)) < 0) goto fail;
+        if ((r = segment_map(p, doc, program, ph, eh.phnum, i, 0, prot, buf)) < 0) goto fail;
     }
     program_put(program, true);
     program = NULL;
@@ -299,7 +394,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     sp = ALIGN_DOWN(sp, 16);
     if (vmm_copy_to_space(p->vmm_space, sp, pointers, pointer_bytes) < 0) goto fail;
     uint64_t argv_ptr = sp;
-    struct n_start start = {.environment = (char *const *)(sp + ((uint64_t)argc + 1) * 8),
+    struct n_start start = {.entry = p->entry_base, .environment = (char *const *)(sp + ((uint64_t)argc + 1) * 8),
                             .folder = (const char *)folder_ptr, .terminals = (const int32_t *)terminals_ptr,
                             .terminal_count = l->terminal_count, .interrupts = l->interrupts};
     kfree(pointers);

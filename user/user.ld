@@ -2,6 +2,7 @@ ENTRY(_start)
 SECTIONS
 {
     . = 0x400000;
+    .note.nocturne : { KEEP(*(.note.nocturne)) }
     .text : { *(.text._start) *(.text .text.*) }
     . = ALIGN(4096);
     .rodata : { *(.rodata .rodata.*) }
@@ -37,6 +38,8 @@ SECTIONS
         KEEP(*(.fini_array))
         __fini_array_end = .;
     }
+    /* The linker's table for position-independent objects: of the sections it keeps together. */
+    .got : { *(.got .got.*) }
     /* ELF thread-local storage: libc copies this image below each thread's
        FS-based control block (x86-64 variant II). */
     .tdata : { *(.tdata .tdata.*) }

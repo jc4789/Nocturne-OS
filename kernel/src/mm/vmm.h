@@ -29,6 +29,10 @@
 #define USER_STACK_TOP 0x00007FFFFFF00000ULL
 #define USER_STACK_MAX (8ULL << 20)
 #define USER_MMAP_BASE 0x0000600000000000ULL
+/* The entry image (sys/entry.c) lies somewhere in the span below the main stack, at a place of its
+   own in each process; the mmap region ends under it. */
+#define USER_ENTRY_SPAN (1ULL << 40)
+#define USER_MMAP_TOP  (USER_STACK_TOP - USER_STACK_MAX - USER_ENTRY_SPAN)
 /* The low region ends at 2 GiB, the reach of sign-extended 32-bit addresses;
    the program image and its sbrk heap stay below USER_LOW_BASE. */
 #define USER_LOW_BASE  0x0000000040000000ULL

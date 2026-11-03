@@ -24,17 +24,19 @@ make GO=<Go のソース>/bin/go.exe                                  # ports/go
 Nocturne は UNIX でも POSIX でもないので、Go 側を Nocturne の API に合わせています
 （`internal/syslist` の `UnixOS` には入れていません）。
 
-- **システムコール**：`SYSCALL`、番号は AX、引数は DI・SI・DX・R10・R8、結果は AX
-  （負なら結果コード）。CX と R11 は命令が使う（`docs/nocturne-native-abi.md` §0）。
+- **システムコール**：入口の像の溝を C の呼び方で呼ぶ。番地は `struct n_start` の `entry` + 番号 × 16、
+  引数は DI・SI・DX・CX・R8、結果は AX（負なら結果コード）。溝は CX・R10・R11 を使い、stack は
+  戻りの番地だけを使う（`docs/nocturne-native-abi.md` §0）。番号は `common/abi.h` の値を差分の中に書く。
   `syscall` パッケージは Nocturne の API そのもの
   （`DocumentOpen`、`DocumentReadAt`、`FolderList`、`ChannelSend`、`AppLaunch` 等）を出し、
   標準ライブラリーが使う `ENOENT` 等の名前は Nocturne の結果コードの別名です。
-- **起動**：ELF（ET_EXEC、0x400000 から）。カーネルが渡す `struct n_start`（`rdx`）から環境と起動の属性を読みます。
+- **起動**：ELF（ET_EXEC、0x400000 から）。カーネルが渡す `struct n_start`（`rdx`）から入口の番地、環境、起動の属性を読みます。
+  リンカーが刻印 `.note.nocturne`（世代と溝の数、`cmd/link/internal/ld/elf.go`）を入れます。`common/abi.h` の `N_ABI_GENERATION` か `N_ENTRY_SLOTS` が変わったら差分の定数を合わせて組み直します。
 - **スレッド**：`SYS_THREAD_CREATE` のスタック（カーネルが確保）を g0 に使い、TLS は
   `WRFSBASE` で FS の基底を直に書く。ロックは `SYS_WAIT_ADDRESS`／`SYS_WAKE_ADDRESS`。
 - **メモリー**：需要ゼロの共有領域（`SYS_SHARED_RESERVE`＋`SYS_SHARED_MAP`）。アドレスは
   カーネルが選ぶので、ヒープのアドレス希望は使いません。
-- **時刻**：全アプリに写る時計のデータ（`N_CLOCK_ADDRESS` の `struct n_clock`）を RDTSCP で読みます。`nanotime` は単調時計、`walltime` は壁時計。眠りとアドレス待ちは単調時計の期限（ns）で渡します。`syscall` パッケージの待つ呼出しも期限を取ります（`syscall.After`、`syscall.CLOCK_NEVER`）。
+- **時刻**：入口の像の時計の溝を呼びます。そこは C のコードなので、scheduler の stack へ移って揃えて呼びます（`sys_nocturne_amd64.s`）。`nanotime` は単調時計、`walltime` は壁時計。眠りとアドレス待ちは単調時計の期限（ns）で渡します。`syscall` パッケージの待つ呼出しも期限を取ります（`syscall.After`、`syscall.CLOCK_NEVER`）。
 - **文書**：共有カーソルはないので、`os.File` が自分の位置を持ちます。`O_APPEND` は書くたびに末尾。
   権限ビットはなく、`Chmod` は存在確認だけ、`Chtimes`・`Chown`・リンクは非対応を返します。
 - **パス**：ドライブは `C:` の一つだけ。区切りは `\`（`os.PathSeparator`）と `/` のどちらでもよく、
@@ -90,3 +92,4 @@ Nocturne は UNIX でも POSIX でもないので、Go 側を Nocturne の API �
   例外をアプリへ渡す仕組みがまだありません）。
 - 解放したヒープのページは OS へ返しません（`sysUnused` は何もしません）。
 - cgo、プロファイラーのシグナル、`runtime/debug.SetCrashOutput`（ハンドルの複製がないため）。
+- GPU のドライバーの像は呼べません。Go は FS の基底を自分で持ち、`struct n_thread_block` を置かないからです。
