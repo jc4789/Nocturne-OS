@@ -8,10 +8,10 @@
 
 ## 決めたこと（未着手）
 
-- HAL：形は `docs/hal.md`。読む試験と試作の後に手術の計画を見せる。
+- HAL：形は `docs/hal.md`。試作の後に手術の計画を見せる。
 - 窓の管理と合成：カーネルの外のサービスへ移す。カーネルに GPU の汎用の層を置く。
 - 網：TCP/IP を権限の無いサービスへ移す。NIC の実装はカーネルに残し、輪でつなぐ。ソケットは object にする。網の権限は能力の handle で渡す。
-- GPU：virgl と `nvrm` は同じ継ぎ目の後ろの実装にする。試験の門を外す。
+- GPU：virgl と `nvrm` は同じ継ぎ目の後ろの実装にする。試験の門を外す。契約は次の設計 `docs/gpu.md` で決める。
 - UVM：ソースを残し、組みと毎回の起動から外す。選んで入れる形にする。
 - プログラムの形式：我々の形式を作る。ELF は組みの中間物と、Limine が読むカーネルの像にだけ残す。
 - 導入の形式：宣言と中身だけを持つ我々の形式を作る。任意の機能とドライバーも同じ形式で入れる。
@@ -21,7 +21,7 @@
 
 ## 未決
 
-- 装置の台帳：`docs/hal.md` はカーネルが記録を持ち、名前と見せ方はサービスが持つ案を書く。サービスの形は未決。
+- AMD の GPU：特権の半分を書く材料が、許された範囲に見つからない（`freebsd-src/sys/dev` に無い。GPUOpen の文書の頁は ISA と MES だけ）。AMD を作る日にユーザーの判断が要る。
 
 ## 作る道具
 
@@ -74,6 +74,11 @@
 - HD Audio：`link_down` の戻りを捨てて DMA の頁を返す（`kernel/src/dev/hda.c:906`）。
 - PCI：segment 0 だけを使う（`kernel/src/dev/pci.c:18`）。
 - 共通コードに hypervisor の判定がある（`kernel/src/arch/cpu.c:143`）。
+- IBPB：`cpu_ibpb` に呼ぶ者が無いのに、起動のログは "IBPB between apps" と書く（`kernel/src/arch/cpu.c:514`）。
+- `nvrm` の帰線とフリップの糸が fair 級である（`ports/nvidia` に `n_thread_schedule` が無い）。
+- カーネルの機能は IOMMU を素通りする（`kernel/src/dev/iommu.h:9-10`）。絞る口が無い（`kernel/src/dev/iommu.c:647`）。
+- PCI に抜き差しと AER が無い。
+- ノート PC の内蔵キーボード（i8042、I2C の HID）の実装が無い。
 - AVX-512：必須の表にあるが、我々のコードは実行時に選ばない（`kernel/src/arch/cpu.c`、`Makefile:120` の `-msse2`）。
 - AVX-512：FFmpeg は切ってあり、理由のコメントが今の `fpu.c` と合わない（`ports/ffmpeg/prepare.py:14`、`ports/mesa/README.md:92`）。
 - GPU：ドライバーが動作中に落ちると既定の道へ戻らない（`docs/records/audit-gpu-generic-20261102.md` の F1）。
