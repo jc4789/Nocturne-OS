@@ -8,8 +8,9 @@
     (C:\Programs) and the user's files (C:\Users). The VM's disk is .\hyperv\<Name>.vhdx, the VM's
     own: -Update replaces only the system on it (the boot part, C:\Nocturne and the desktop apps'
     folders, scripts\mkimage.sh --update), so the user's files and the apps the user put in
-    C:\Programs stay. A new VM's disk is a copy of build\nocturne.img; one left by -Remove is taken
-    up again.
+    C:\Programs stay. A new VM's disk is a copy of build\nocturne.img of the size -DiskGB (dynamic:
+    its file holds only what is written; C: takes the rest on the next start); one left by -Remove
+    is taken up again.
 
     The VM is a Generation 2 machine, the native Hyper-V one: UEFI, VMBus and only synthetic
     devices, which Nocturne drives (keyboard, mouse, SCSI disks, network, heartbeat, shutdown, time
@@ -17,8 +18,9 @@
     desktop takes the size of the window. A Generation 1 VM is not one Nocturne boots on; the
     script stops at one. This script:
       * writes the disk (above) and attaches it on SCSI 0:0 as the first boot device,
-      * creates the VM with static memory (-MemoryMB, 4096), four CPUs (-Cpus), no checkpoints, Secure Boot off (the boot loader
-        is not signed) and a synthetic network adapter on the "Default Switch" for NAT internet access,
+      * creates the VM with static memory (-MemoryMB, 4096), four CPUs (-Cpus) with their x2APIC on (Nocturne requires it and
+        Hyper-V's default mode hides it), no checkpoints, Secure Boot off (the boot loader is not signed) and a synthetic
+        network adapter on the "Default Switch" for NAT internet access,
       * selects the Hyper-V socket transport for the Enhanced Session and turns Enhanced Session Mode
         on for the host if it is off,
       * routes COM1 to the named pipe \\.\pipe\<name>-com1 (kernel log),
@@ -47,6 +49,8 @@ param(
     # CPU and 512 MB a video page runs out of memory and per-frame WebGL runs at a third of its speed.
     [int]$MemoryMB = 4096,
     [ValidateRange(1, 240)][int]$Cpus = 4,
+    # Room for the user's files and for -Update, which writes the new system before it frees the old.
+    [ValidateRange(2, 65536)][int]$DiskGB = 64,
     [switch]$Update,
     [switch]$Remove,
     [switch]$Iso,
@@ -170,6 +174,10 @@ function Write-Disk {
         # copied over the old disk, which keeps the access Hyper-V gave the VM to it
         Say "writing $Disk"
         Copy-Item $new $Disk -Force
+        if ((Get-VHD -Path $Disk).Size -lt $DiskGB * 1GB) {
+            Say "making the disk $DiskGB GiB"
+            Resize-VHD -Path $Disk -SizeBytes ($DiskGB * 1GB)
+        }
     }
     finally {
         foreach ($f in @($work, $new)) { if (Test-Path $f) { Remove-Item $f -Force } }
@@ -212,6 +220,7 @@ New-Item -ItemType Directory -Force $VmDir | Out-Null
 
 if ($existing -and $Update) {
     Stop-IfRunning $existing
+    Set-VMProcessor -VM $existing -ApicMode x2Apic
     # an older Nocturne's second disk: Nocturne keeps everything on its one disk now
     $old = Get-VMHardDiskDrive -VM $existing | Where-Object { $_.Path -eq $OldDataVhd }
     if ($old) {
@@ -236,7 +245,7 @@ else {
     Say "creating VM '$Name' ($MemoryMB MB, $Cpus CPUs)"
     $vm = New-VM -Name $Name -Generation 2 -MemoryStartupBytes ($MemoryMB * 1MB) -VHDPath $Disk -Path $VmDir
     Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
-    Set-VMProcessor -VM $vm -Count ([Math]::Min($Cpus, [Environment]::ProcessorCount))
+    Set-VMProcessor -VM $vm -Count ([Math]::Min($Cpus, [Environment]::ProcessorCount)) -ApicMode x2Apic
     Get-VMNetworkAdapter -VM $vm | Remove-VMNetworkAdapter
     Add-Nic $vm
     try { Set-VM -VM $vm -AutomaticCheckpointsEnabled $false -CheckpointType Disabled } catch { }

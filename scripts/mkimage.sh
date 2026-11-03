@@ -44,6 +44,14 @@ boot_install() {
     mcopy -i "$esp" $LIMINE/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
 }
 
+# What the list $2 says, on the disk $1. Not inside the echo: a substitution in its arguments would
+# hide a failure from set -e.
+fill() {
+    local said
+    said=$($STORE fill "$1" "$2")
+    echo "  C:   $said"
+}
+
 # Hyper-V's disk $2 from the raw disk $1: a dynamic VHDX (Generation 2) of the raw disk's size.
 # Made larger in Hyper-V, the disk takes C: with it on the next start.
 hyperv_disk() {
@@ -65,7 +73,7 @@ iso_make() {
     cp $LIMINE/BOOTX64.EFI $root/EFI/BOOT/
     truncate -s "$1M" $root/boot/c.img
     $STORE format $root/boot/c.img Nocturne
-    echo "  C:   $($STORE fill $root/boot/c.img $B/c.list)"
+    fill $root/boot/c.img $B/c.list
     xorriso -as mkisofs -R -r -J -hfsplus -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \
         -efi-boot-part --efi-boot-image --protective-msdos-label $root -o $ISO 2>/dev/null
     rm -rf $root
@@ -75,7 +83,7 @@ iso_make() {
 update() {
     python scripts/layout.py --build $B --firmware-manifest $FIRMWARE --system $B/system.list >/dev/null
     boot_install "$1"
-    echo "  C:   $($STORE fill "$1" $B/system.list)"
+    fill "$1" $B/system.list
 }
 
 if [ "$1" = --update ]; then
@@ -99,7 +107,7 @@ rm -f $IMG
 $STORE disk $IMG $SIZE_MB $ESP_MB
 boot_install $IMG
 $STORE format $IMG Nocturne
-echo "  C:   $($STORE fill $IMG $B/c.list)"
+fill $IMG $B/c.list
 
 case "$1" in
 --raw-only)
