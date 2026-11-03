@@ -142,9 +142,6 @@ void kmain(void) {
     if (cmdline_req.response && cmdline_req.response->cmdline) test_cmdline = cmdline_req.response->cmdline;
 #endif
     boot_record_read();
-    /* The firmware's framebuffer before anything that can stop the start: a panic shows on it
-       (dev/fbcon.c), which is all a machine without a serial port has to say. */
-    if (fb_req.response && fb_req.response->framebuffer_count > 0) fb_init(fb_req.response->framebuffers[0]);
 
     /* The CPU: what it has, then its state as every other CPU's (arch/cpu.h), the memory types
        among it before any page table is built (vmm.c maps MMIO as PAT entry 3, UC, and the
@@ -172,7 +169,10 @@ void kmain(void) {
     log_init(); /* every CPU's ring of the log, sized from the memory and the CPUs */
     wake_init(); /* the real-mode page the other CPUs start through and S3 wakes into */
 
-    if (fb.addr) fbcon_init();
+    if (fb_req.response && fb_req.response->framebuffer_count > 0) {
+        fb_init(fb_req.response->framebuffers[0]);
+        fbcon_init();
+    }
     vm_detect(); /* before the clock: a hypervisor that states the TSC's rate registers it */
     kprintf("video: %ux%u, %u bpp, %u bpc (R%u@%u G%u@%u B%u@%u)%s, pitch %u\n", fb.width, fb.height,
             fb.bpp, fb.bpc, fb.rsize, fb.rshift, fb.gsize, fb.gshift, fb.bsize, fb.bshift,

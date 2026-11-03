@@ -366,14 +366,7 @@ static void log_tail(void) {
 }
 
 void fbcon_panic(const struct panic_line *lines, unsigned count) {
-    if (!fb.addr) return;
-    /* Before fbcon_init there is no memory for the canvas: the framebuffer itself is the canvas,
-       when its pixels are the canvas's. */
-    bool direct = !ready;
-    if (direct) {
-        if (!fb.native) return;
-        gfx_init(&cv, (uint32_t *)fb.addr, fb.width, fb.height, fb.pitch / 4);
-    }
+    if (!ready || !fb.addr) return;
     static const uint32_t tones[] = {[PANIC_MESSAGE] = 0xFFFF8E9E, [PANIC_HEADING] = 0xFFE8C36A,
                                      [PANIC_DETAIL] = 0xFFC9CCE0};
     gfx_noclip(&cv);
@@ -392,7 +385,6 @@ void fbcon_panic(const struct panic_line *lines, unsigned count) {
     pr_y += 10;
     pline("Restart the computer (hold the power button if it does not answer). Sweet dreams.", 0xFF8E9AC8);
     log_tail();
-    if (direct) return;
     fb_drop_holds();
     fb_present_last(cv.px, cv.pitch, cv.w, cv.h);
 }
