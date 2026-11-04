@@ -174,19 +174,6 @@ Nocturne は GUI が先の独自の OS。実機で動き、普通の人がター
 - codegraph（`codegraph explore`・`callers`・`impact`、MCP の `codegraph_explore`）：どこを読むかを探す。番号で引く呼出しと表からの呼出しは索引に出ない。
 - PATH に無い道具は、ダウンロードする前に `tools/` と `C:\Program Files`、`C:\Users\cesta\AppData\Local` を探す。
 
-## 参照
-
-参照の目的は、OS に何が要り、Nocturne に何が欠けているかを忘れないこと。置き場は `D:\Programes\cloned repos`。
-
-- 問いに答えるときに読む。答えが出たら止める。
-- FreeBSD（`freebsd-src`）は良い例。
-- FreeBSD のドライバーは、要る理由が言えるときに移植してよい。
-- 移植は Nocturne の口へ書き直し、著作権表示を残す。FreeBSD の口の代役（shim）を作らない。
-- GPL のファイルは読まない。`sys/compat/linuxkpi` は shim なので手本にしない。
-- macOS は Apple の公式の文書で読む。
-- Haiku（`haiku`）と Fuchsia（`fuchsia`）は手本ではない。何が足りずに使われないのか、どこが扱いにくいのかを学ぶ。設計もコードも写さない。
-- 参照は UNIX の形を持ち込む理由にならない。形は Nocturne の目的から決める。
-
 ## 書き方
 
 - フックは日本語の無い返事を書き直させる。
