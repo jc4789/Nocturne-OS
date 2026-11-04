@@ -33,8 +33,53 @@ struct blkdev {
     bool cache_lost;    /* blk_cache_lost: for good, every persist fails (atomic) */
     struct mutex partial; /* parts of a block written at once: each one's read, change and write
                              whole, so none writes back another's bytes as they were */
+    /* What the driver declares before blk_register. A request it gets stays within these: blk.c
+       splits what is larger, and turns a write of part of a block into its read, change and write,
+       so a driver only ever moves whole blocks. */
+    uint32_t max_sectors;    /* in one request; 0: no limit */
+    uint32_t max_segments;   /* in one request; 0: no limit */
+    uint32_t segment_align;  /* a segment's physical address and length are multiples of this; 0: 512 */
+    bool has_cache;          /* the device may keep a volatile cache: BLK_PERSIST reaches it */
+    const struct blk_ops *ops;
     void *priv;
 };
+
+/* A request: chained through next into a batch, so one submit can fill a device's queue with one
+   doorbell. A segment is physical memory; blk.c gives the driver bus-ready lists, and no request
+   goes through a copy here. done runs exactly once per request, in any context (an interrupt
+   handler too), never sleeps, and status is 0 or a negative N_ERR_*. BLK_PERSIST moves no data:
+   everything whose done ran before it was submitted is on the medium when its done runs. */
+enum blk_op { BLK_READ, BLK_WRITE, BLK_PERSIST };
+struct blk_segment {
+    uint64_t phys;
+    uint32_t bytes;
+};
+struct blk_request {
+    struct blk_request *next;
+    enum blk_op op;
+    uint64_t lba;
+    uint32_t sectors;
+    const struct blk_segment *segments;
+    uint32_t segment_count;
+    void (*done)(struct blk_request *r, int status);
+    void *context;
+    struct blkdev *device; /* blk.c's */
+    void *owned;           /* blk.c's */
+};
+/* The data path: called directly by blk.c from a thread that may sleep, any CPU, several at once on
+   one device. submit starts all of the chain and returns: it may wait for room in a queue, never
+   for a request to end. A driver with queues per CPU uses the calling CPU's. */
+struct blk_ops {
+    void (*submit)(struct blkdev *d, struct blk_request *chain);
+};
+/* Submit a chain from any thread that may sleep, the power gate waiting at blk_hold. The way for
+   anything that has more than one request to give (the block cache's read-ahead and write-back). */
+void blk_submit(struct blkdev *d, struct blk_request *chain);
+/* A device that does one thing at a time (a port's PIO, a USB bulk pipe): its driver gives transfer,
+   and sets blk_serial_ops as ops. blk.c runs the requests one by one on a thread of that device's. */
+typedef int (*blk_transfer_fn)(struct blkdev *d, const struct blk_request *r);
+extern const struct blk_ops blk_serial_ops;
+void blk_serial_start(struct blkdev *d, blk_transfer_fn transfer);
 
 void blk_register(struct blkdev *d);
 int blk_count(void);
