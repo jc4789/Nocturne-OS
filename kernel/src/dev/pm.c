@@ -34,9 +34,6 @@ void power_reboot(void);
 
 #define STOP_NS (3 * NS_PER_S) /* stopped apps get this long to end */
 
-/* Each stage's list only grows: a device joins at its end with a release store, and the walks
-   (any CPU, any time) follow the links with acquire loads, never under pm_lock. */
-static struct pm_device *stages[PM_STAGES];
 static struct wait_queue pm_wq;
 /* The request and the power thread's progress (requested, busy, stopping, wanted), the state told and
    the events; also the appends to the stages' lists. Taken from tasks on any CPU and from the power
@@ -44,18 +41,6 @@ static struct wait_queue pm_wq;
 static struct spinlock pm_lock;
 static bool requested, busy, stopping, napping;
 static enum pm_action wanted;
-
-static struct pm_device *first_of(int stage) { return __atomic_load_n(&stages[stage], __ATOMIC_ACQUIRE); }
-static struct pm_device *next_of(const struct pm_device *d) { return __atomic_load_n(&d->next, __ATOMIC_ACQUIRE); }
-
-void pm_register(struct pm_device *d) {
-    d->next = NULL;
-    uint64_t f = spin_lock(&pm_lock);
-    struct pm_device **pp = &stages[d->stage];
-    while (*pp) pp = &(*pp)->next;
-    __atomic_store_n(pp, d, __ATOMIC_RELEASE);
-    spin_unlock(&pm_lock, f);
-}
 
 void pm_request(enum pm_action action) {
     uint64_t f = spin_lock(&pm_lock);
@@ -184,19 +169,6 @@ static bool flush_disks(void) {
     return ok;
 }
 
-const char *pm_quiesce_devices(bool stop_at_failure) {
-    const char *stuck = NULL;
-    for (int s = 0; s < PM_STAGES; s++)
-        for (struct pm_device *d = first_of(s); d; d = next_of(d)) {
-            d->down = true; /* reached: resumed after a sleep, also one called off from here */
-            if (!d->quiesce || d->quiesce(d->ctx)) continue;
-            kprintf("pm: %s did not stop\n", d->name);
-            if (!stuck) stuck = d->name;
-            if (stop_at_failure) return stuck;
-        }
-    return stuck;
-}
-
 /* The volume's saves are on the disks before (pm_thread): after a hibernation's snapshot nothing
    may be committed, the image has the machine as it was before any of it. The interrupts it turns
    off are its own CPU's: the other CPUs still run their kernel threads while the devices stop, and
@@ -245,12 +217,6 @@ static enum n_power_reason sleep_blocker(bool hibernate, const char **detail) {
     enum n_power_reason why = hibernate ? hibernate_blocker(detail) : !acpi_sleep_supported(3) ? N_POWER_REASON_NO_S3 : N_POWER_REASON_NONE;
     if (why) return why;
     if (!wake_available()) return N_POWER_REASON_NO_WAKE_PAGE;
-    for (int s = 0; s < PM_STAGES; s++)
-        for (struct pm_device *d = first_of(s); d; d = next_of(d))
-            if (!d->resume && !(hibernate && d->cold_ok)) {
-                *detail = d->name;
-                return N_POWER_REASON_DEVICE;
-            }
     return N_POWER_REASON_NONE;
 }
 
@@ -324,14 +290,6 @@ static bool machine_sleep(void (*enter)(void), unsigned state, enum pm_action ac
     if (state == 3 || slept) acpi_wake(state);
     else acpi_links_forget();
     const char *lost = NULL;
-    for (int s = PM_STAGES - 1; s >= 0; s--)
-        for (struct pm_device *d = first_of(s); d; d = next_of(d)) {
-            if (!d->down) continue; /* after a device that did not stop: it never stopped */
-            d->down = false;
-            if (!d->resume || d->resume(d->ctx)) continue;
-            kprintf("pm: %s did not come back\n", d->name);
-            if (!lost) lost = d->name;
-        }
     acpi_freeze(false);
     if (units_lost) say(N_POWER_DEVICE_LOST, action, N_POWER_REASON_IOMMU, units_lost, false);
     if (lost) say(N_POWER_DEVICE_LOST, action, N_POWER_REASON_DEVICE, lost, false);
@@ -352,14 +310,6 @@ static void sleep_now(bool hibernate) {
        reset under it */
     for (int i = 0; i < pci_count() && !why; i++)
         if (pci_at(i)->claimed) why = N_POWER_REASON_APP_DRIVER;
-    for (int s = 0; s < PM_STAGES && !why; s++)
-        for (struct pm_device *d = first_of(s); d && !why; d = next_of(d)) {
-            const char *refused = d->refuse ? d->refuse(d->ctx) : NULL;
-            if (!refused) continue;
-            kprintf("pm: %s: %s\n", d->name, refused);
-            why = N_POWER_REASON_DEVICE_BUSY;
-            detail = d->name;
-        }
     if (!why && hibernate) why = hibernate_prepare();
     if (why) {
         kprintf("pm: not %s: %s%s%s\n", hibernate ? "hibernating" : "sleeping", reason_text(why), detail ? ": " : "",

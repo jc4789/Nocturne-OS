@@ -2,7 +2,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include "dev/hal.h"
 struct pci_reset;
 struct irq;
 struct iommu_guest;
@@ -26,7 +25,6 @@ static inline struct pci_address pci_address_of(uint16_t segment, uint16_t reque
     return (struct pci_address){segment, (uint8_t)(requester >> 8), (requester >> 3) & 31, requester & 7};
 }
 struct pci_device {
-    struct hal_device hal;
     struct pci_address address;
     uint16_t vendor, device;
     uint8_t cls, subcls, progif, irq;
@@ -67,19 +65,8 @@ struct pci_device {
        the device below since its link trained, which takes effect once the link retrains (pci.c) */
     bool retrain;
 };
-/* カーネルの実装の一つ。attach は一度に一つ呼ばれ、全部の機能の起動を待たせるので、秒の単位で待たない。長い待ちは実装の
-   thread で行い、失敗は hal_failed で書く。0 で実装が機能を持つ。PCI_NOT_MINE は持たず、次の実装に任せる。負は
-   持てなかった理由で、持ち続ける物は実装が持ってよい（電源を切る前に止める物など）。 */
-#define PCI_NOT_MINE 1
-struct pci_driver {
-    const char *name;
-    const struct n_pci_match *matches;
-    size_t match_count;
-    int (*attach)(struct pci_device *d);
-};
 void pci_config_init(void); /* the MCFG's windows, before anything may reach another segment (AML) */
 void pci_init(void); /* 列挙して台帳に載せる。実装は結ばない */
-void pci_bind_all(void); /* dev/pci_drivers.c：iommu_init の後、実装の表の順に結ぶ */
 /* Config space access. offsets are 0..4095. Segment 0 below 256: CF8/CFC or ECAM; everything else
    ECAM only (an unreachable register reads as 0xFFFFFFFF and ignores writes). */
 uint32_t pci_read32(struct pci_address a, uint16_t off);

@@ -14,11 +14,6 @@ struct net_adapter;
 struct netif {
     const char *driver;
     uint8_t mac[6];
-    int (*send)(struct netif *self, const void *frame, size_t len); /* frame without FCS, >= 60 bytes */
-    /* Optional DMA receive path, called by the net thread only. input consumes the borrowed
-       frame before it returns (poll_rx gives the buffer back to the NIC after). */
-    bool (*rx_pending)(struct netif *self);
-    size_t (*poll_rx)(struct netif *self, void (*input)(struct netif *self, const void *frame, size_t len));
     void (*get_stats)(struct netif *self, struct n_netstats *stats);
     struct net_adapter *adapter; /* the stack's, from net_register */
 };

@@ -4,7 +4,6 @@
 #include "arch/cpu.h"
 #include "limine.h"
 #include "vm/vm.h"
-#include "vm/devices.h"
 #include "vm/hyperv.h"
 #include "vm/hv/hv.h"
 #include "vm/hv/vmbus.h"
@@ -59,26 +58,6 @@ void vm_init(void) {
     hv_input_init();
     hv_util_init();
     hvsock_init();
-}
-
-/* The emulated devices are found by their PCI identity or legacy ports, in any VM; on real
-   hardware none of them is looked for. */
-static const struct pci_driver *const emulated[] = {&vbe_driver, &virtio_gpu_driver, &e1000_driver, &tulip_driver, &ac97_driver};
-
-const struct pci_driver *const *vm_pci_drivers(size_t *count) {
-    *count = machine == VM_NONE ? 0 : ARRAY_SIZE(emulated);
-    return emulated;
-}
-
-void vm_bind_fixed(void) {
-    if (machine == VM_NONE) return;
-    ata_init();
-    storvsc_init(); /* only with VMBus */
-    netvsc_probe(); /* only with VMBus */
-}
-
-void vm_display_pm(struct pm_device *display) {
-    if (machine != VM_NONE) vbe_display_pm(display);
 }
 
 void vm_session_init(void) {

@@ -181,10 +181,6 @@ static bool input_resume(void *arg) {
     return true;
 }
 
-static struct pm_device input_pm = {.name = "input", .stage = PM_STAGE_IO, .resume = input_resume};
-
-void input_init(void) { pm_register(&input_pm); }
-
 void input_set_sinks(key_sink_t k, mouse_sink_t m) {
     __atomic_store_n(&key_sink, k, __ATOMIC_RELEASE);
     __atomic_store_n(&mouse_sink, m, __ATOMIC_RELEASE);

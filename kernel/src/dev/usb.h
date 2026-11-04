@@ -12,8 +12,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "sys/clock.h"
-#include "dev/hal.h"
-#include "dev/usb_drivers.h"
 
 /* A port whose device does not come up, or that stays stuck, is tried one reset at a time, with the
    worker's other work in between, and less and less often: 1, 2, 4 ... 64 s apart. No document sets
@@ -102,11 +100,9 @@ struct usb_device {
     uint8_t tt_slot, tt_port;
     struct usb_device_desc desc;
     bool removed; /* atomic: set once by usb_remove, after which no report function runs for it */
-    struct hal_device hal;
     char *product; /* usb_product */
     bool product_read;
     void *hub; /* usbhub.c state when the device is a hub */
-    void *state[USB_DRIVERS]; /* each class driver's state, at its number */
 };
 
 /* An endpoint as a class driver found it in the configuration descriptor. */
@@ -169,19 +165,6 @@ void usb_note_work(struct usb_device *d);
 uint64_t usb_kicks(struct usb_device *d);
 void usb_wait_kick(struct usb_device *d, uint64_t seen, uint64_t deadline);
 
-#define USB_NOT_MINE 1 /* struct usb_driver の attach：この設定に自分の物が無い */
-/* A class driver. xhci.c finds them by the table and knows none by name. */
-struct usb_driver {
-    const char *name;
-    bool (*claims)(const struct usb_interface_desc *intf); /* does the interface belong to it */
-    /* The device is configured: it takes what it claims of the whole configuration. 0: it took
-       something. USB_NOT_MINE: nothing here is its own. Negative: why it could not. */
-    int (*attach)(struct usb_device *d, const uint8_t *cfg, unsigned total);
-    void (*detach)(struct usb_device *d); /* the device is going away: it drops whatever it holds of it */
-    void (*work)(struct usb_device *d);   /* NULL, or what it asked for with usb_note_work */
-    const char *(*refuse)(void);          /* NULL, or (for the log) why the machine cannot sleep right now */
-};
-extern const struct usb_driver *const usb_drivers[USB_DRIVERS];
 /* The string descriptor index as a new UTF-8 string, NULL without one. On the worker. */
 char *usb_string(struct usb_device *d, uint8_t index);
 /* The device's product string in full, "" without one, read once and given to the ledger. On the worker. */

@@ -5,7 +5,6 @@
 #include "dev/input.h"
 #include "dev/fbcon.h"
 #include "dev/fb.h"
-#include "dev/hal.h"
 #include "dev/pci.h"
 #include "dev/iommu.h"
 #include "dev/pm.h"
@@ -34,15 +33,11 @@ void kmain_late(void) {
     pci_config_init();
     acpi_init();
     pm_init(); /* the power thread: every shutdown and restart goes through it */
-    hal_init();
     vm_init(); /* only in a VM: its own bus and the devices on it */
     pci_init();
     iommu_init(); /* before any driver turns an interrupt on: their messages may be remapped */
     net_init();
     audio_init();
-    pci_bind_all();
-    vm_bind_fixed(); /* only in a VM: the devices no PCI identity finds */
-    fb_pm_init(); /* the display joins the power changes once its PCI identity is known */
     store_init();        /* C:, from the disk the system started from (waiting for it to appear) */
     hibernate_restore(); /* returns only when there is no image to go back to */
     store_start();

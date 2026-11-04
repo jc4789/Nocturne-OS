@@ -47,9 +47,6 @@ void fb_drop_holds(void);
    every buffer of every screen and every image a driver may show in a buffer's place, at the top
    left, the rest of a larger one black. */
 void fb_present_last(const uint32_t *src, int src_pitch, int w, int h);
-/* Sleep (dev/pm.h): the display registers once PCI is known; it resumes only where the mode can
-   be set again (in a VM, vm/vbe.c). */
-void fb_pm_init(void);
 
 /* ---- screens ----
    A screen is one display the desktop is shown on: a mode (width x height at a refresh, or at a

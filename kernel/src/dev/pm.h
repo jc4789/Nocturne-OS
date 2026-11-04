@@ -47,29 +47,9 @@
 #include <stdint.h>
 #include "abi.h"
 
-enum pm_stage {
-    PM_STAGE_IO,      /* network cards, audio, input, display */
-    PM_STAGE_STORAGE, /* disk controllers: shutdown notification after the flush */
-    PM_STAGE_BUS,     /* controllers other devices sit behind (USB) */
-    PM_STAGES
-};
-
-struct pm_device {
-    const char *name;
-    enum pm_stage stage;
-    bool (*quiesce)(void *ctx); /* NULL: nothing to stop */
-    bool (*resume)(void *ctx);  /* NULL: cannot come back from sleep (no sleep while it is there) */
-    const char *(*refuse)(void *ctx); /* NULL, or (for the log) why it cannot sleep right now (asked at each sleep) */
-    void *ctx;
-    bool cold_ok; /* without resume: as it was after the next boot (hibernation) */
-    bool down;    /* pm.c: quiesced, not yet resumed */
-    struct pm_device *next;
-};
-
 enum pm_action { PM_POWER_OFF = POWER_OFF, PM_REBOOT = POWER_REBOOT, PM_SLEEP = POWER_SLEEP, PM_HIBERNATE = POWER_HIBERNATE };
 
 void pm_init(void);
-void pm_register(struct pm_device *d); /* any CPU; d stays owned by the driver for good */
 /* Carry out a power change. A sleep never replaces a change already waiting. Never blocks: any CPU,
    any context under no spinlock other than the wait queues'. */
 void pm_request(enum pm_action action);

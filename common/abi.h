@@ -475,59 +475,7 @@ struct n_cpuinfo {
 #define N_CPU_AVX 4u
 #define N_CPU_USER_THREADS 8u
 
-struct n_pciinfo {
-    uint16_t segment;
-    uint8_t bus, dev, func, cls, subcls, progif;
-    uint16_t vendor, device;
-};
 
-/* 機械で見つかった物の一つ（n_hal_list、docs/hal.md の台帳）。 */
-enum n_hal_bus { N_HAL_BUS_PCI, N_HAL_BUS_USB, N_HAL_BUS_VMBUS, N_HAL_BUS_PORT };
-enum n_hal_state {
-    N_HAL_UNBOUND, /* 持っている実装が無い */
-    N_HAL_RUNNING, /* 実装が持っている */
-    N_HAL_FAILED,  /* 実装が持てなかった。理由は reason */
-};
-struct n_hal_device {
-    uint32_t id;     /* 起動の間、二度と使わない番号 */
-    uint32_t parent; /* 親の番号。0：親なし */
-    uint32_t bus;    /* enum n_hal_bus */
-    uint32_t state;  /* enum n_hal_state */
-    int32_t reason;  /* N_HAL_FAILED の負の N_ERR_* */
-    union {
-        struct n_pciinfo pci;
-        struct { uint16_t vendor, product; } usb;
-        struct { uint32_t base; } port;
-    } at;
-    char name[64];   /* 装置が言う名。"": 言わない */
-    char driver[48]; /* 持っている実装の名。プロセスの実装はプログラムの名 */
-};
-
-/* PCI の機能の引き方の一行。fields が見る欄を言う。カーネルの実装の表とサービスの宣言が使う。 */
-enum {
-    N_PCI_MATCH_VENDOR = 1, N_PCI_MATCH_DEVICE = 2, N_PCI_MATCH_CLASS = 4, N_PCI_MATCH_SUBCLASS = 8, N_PCI_MATCH_PROGIF = 16,
-};
-struct n_pci_match {
-    uint16_t vendor, device;
-    uint8_t cls, subcls, progif, fields;
-};
-#define N_PCI_ID(v, d) {.vendor = (v), .device = (d), .fields = N_PCI_MATCH_VENDOR | N_PCI_MATCH_DEVICE}
-#define N_PCI_ID_CLASS(v, d, c, s)                                                                                 \
-    {.vendor = (v), .device = (d), .cls = (c), .subcls = (s),                                                      \
-     .fields = N_PCI_MATCH_VENDOR | N_PCI_MATCH_DEVICE | N_PCI_MATCH_CLASS | N_PCI_MATCH_SUBCLASS}
-#define N_PCI_CLASS(c, s) {.cls = (c), .subcls = (s), .fields = N_PCI_MATCH_CLASS | N_PCI_MATCH_SUBCLASS}
-#define N_PCI_CLASS_PROGIF(c, s, p)                                                                                \
-    {.cls = (c), .subcls = (s), .progif = (p), .fields = N_PCI_MATCH_CLASS | N_PCI_MATCH_SUBCLASS | N_PCI_MATCH_PROGIF}
-#define N_PCI_VENDOR_CLASS_PROGIF(v, c, s, p)                                                                      \
-    {.vendor = (v), .cls = (c), .subcls = (s), .progif = (p),                                                      \
-     .fields = N_PCI_MATCH_VENDOR | N_PCI_MATCH_CLASS | N_PCI_MATCH_SUBCLASS | N_PCI_MATCH_PROGIF}
-static inline bool n_pci_matches(const struct n_pci_match *m, const struct n_pciinfo *f) {
-    return (!(m->fields & N_PCI_MATCH_VENDOR) || m->vendor == f->vendor) &&
-           (!(m->fields & N_PCI_MATCH_DEVICE) || m->device == f->device) &&
-           (!(m->fields & N_PCI_MATCH_CLASS) || m->cls == f->cls) &&
-           (!(m->fields & N_PCI_MATCH_SUBCLASS) || m->subcls == f->subcls) &&
-           (!(m->fields & N_PCI_MATCH_PROGIF) || m->progif == f->progif);
-}
 
 /* A claimed PCI function (n_pci_info). Addresses are bus addresses, which are physical
    addresses: where an IOMMU isolates the function (N_PCI_ISOLATED) its domain maps each DMA

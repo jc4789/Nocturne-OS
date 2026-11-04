@@ -11,8 +11,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-struct pci_driver;
-struct pm_device;
 
 /* Whose machine Nocturne runs in: its emulated devices and firmware. */
 enum vm_machine {
@@ -36,10 +34,6 @@ static inline bool vm_hosted(void) { return vm_machine() != VM_NONE; }
 
 /* ---- devices, at the places the kernel looks for each kind ---- */
 void vm_init(void);              /* the hypervisor's own bus (VMBus) and what rides on it; before PCI */
-/* The drivers of the emulated PCI devices, after the real ones in dev/pci_drivers.c's table. None on real hardware. */
-const struct pci_driver *const *vm_pci_drivers(size_t *count);
-void vm_bind_fixed(void);        /* what no PCI identity finds: the legacy disk ports, VMBus's disks and network */
-void vm_display_pm(struct pm_device *display); /* how the emulated display comes back from sleep */
 void vm_session_init(void);      /* the host's enhanced session, once the desktop runs */
 
 /* ---- quirks of the emulated devices ---- */

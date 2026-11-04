@@ -626,17 +626,3 @@ void fb_present_last(const uint32_t *src, int src_pitch, int w, int h) {
     __atomic_sub_fetch(&presenting, 1, __ATOMIC_RELEASE);
 }
 
-/* ---- sleep ----
-   The firmware set the display mode at boot; after a sleep nothing sets it again. No driver for
-   real hardware sets it yet, so there the display has no resume and sleep is not offered. In a
-   VM the emulated display may (vm/vbe.c).
-   The firmware sets the same mode again on the next boot (a hibernation image checks it does).
-   A driver's buffers live only while its claim does, and no sleep or hibernation starts while
-   an app drives a PCI function (dev/pm.c): neither ever sees one. */
-static struct pm_device display_pm = {.name = "display", .stage = PM_STAGE_IO, .cold_ok = true};
-
-void fb_pm_init(void) {
-    if (!fb.addr) return;
-    vm_display_pm(&display_pm);
-    pm_register(&display_pm);
-}
